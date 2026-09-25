@@ -17,12 +17,18 @@ defmodule Tightbeam.HomesTest do
     File.mkdir_p!(Path.dirname(auth))
     File.write!(auth, ~S({"token":"machine-a"}))
 
-    coder = Homes.project(base_dir, %{machine: "machine-a", harness: :codex, rails: "v1"})
-    reviewer = Homes.project(base_dir, %{machine: "machine-a", harness: :codex, rails: "v1"})
+    coder =
+      Homes.project(base_dir, %{machine: "machine-a", harness: :codex, rails: codex_rails("v1")})
+
+    reviewer =
+      Homes.project(base_dir, %{machine: "machine-a", harness: :codex, rails: codex_rails("v1")})
 
     assert coder.home_path == Path.join([base_dir, "homes", "machine-a", "codex"])
     assert reviewer.home_path == coder.home_path
-    assert File.read!(Path.join(coder.home_path, "hooks.json")) == "v1"
+
+    assert File.read!(Path.join(coder.home_path, "hooks.json")) ==
+             Tightbeam.Harness.CodexIdentity.hook_settings(codex_rails("v1"))
+
     assert File.lstat!(auth).type == :regular
     assert File.read!(auth) == ~S({"token":"machine-a"})
     refute File.exists?(Path.join(base_dir, "auth"))
@@ -44,7 +50,9 @@ defmodule Tightbeam.HomesTest do
     File.mkdir_p!(Path.dirname(auth))
     File.write!(auth, "old")
 
-    projected = Homes.project(base_dir, %{machine: "eezo", harness: :codex, rails: "v1"})
+    projected =
+      Homes.project(base_dir, %{machine: "eezo", harness: :codex, rails: codex_rails("v1")})
+
     File.mkdir_p!(Path.join(projected.home_path, "sessions"))
     File.write!(Path.join(projected.home_path, "sessions/rollout.jsonl"), "rollout")
     File.write!(Path.join(projected.home_path, "history.jsonl"), "history")
@@ -57,7 +65,7 @@ defmodule Tightbeam.HomesTest do
     File.write!(Path.join(projected.home_path, "auth.json"), "runtime-rotated")
 
     regenerated =
-      Homes.project(base_dir, %{machine: "eezo", harness: :codex, rails: "v2"})
+      Homes.project(base_dir, %{machine: "eezo", harness: :codex, rails: codex_rails("v2")})
 
     assert File.read!(Path.join(regenerated.home_path, "sessions/rollout.jsonl")) == "rollout"
     assert File.read!(Path.join(regenerated.home_path, "history.jsonl")) == "history"
@@ -69,7 +77,10 @@ defmodule Tightbeam.HomesTest do
              "memory"
 
     assert File.read!(Path.join(regenerated.home_path, "config.toml")) == "runtime-config"
-    assert File.read!(Path.join(regenerated.home_path, "hooks.json")) == "v2"
+
+    assert File.read!(Path.join(regenerated.home_path, "hooks.json")) ==
+             Tightbeam.Harness.CodexIdentity.hook_settings(codex_rails("v2"))
+
     assert File.read!(auth) == "runtime-rotated"
     assert File.lstat!(auth).type == :regular
     refute File.exists?(Path.join(base_dir, "auth"))
@@ -84,7 +95,9 @@ defmodule Tightbeam.HomesTest do
     File.mkdir_p!(auth_dir)
     File.write!(auth, "old")
 
-    projected = Homes.project(base_dir, %{machine: "eezo", harness: :codex, rails: "v1"})
+    projected =
+      Homes.project(base_dir, %{machine: "eezo", harness: :codex, rails: codex_rails("v1")})
+
     entry = Path.join(projected.home_path, "auth.json")
     File.write!(entry, "runtime-rotated")
     File.write!(auth, "fresh-onboarding")
@@ -100,7 +113,7 @@ defmodule Tightbeam.HomesTest do
       %{
         harness: :codex,
         machine: "eezo",
-        rails: "v1",
+        rails: codex_rails("v1"),
         credential_home: projected.home_path
       }
     )
@@ -149,7 +162,7 @@ defmodule Tightbeam.HomesTest do
     end
 
     before = snapshot_files(home)
-    Homes.project(base_dir, %{machine: "eezo", harness: :codex, rails: "new-rails"})
+    Homes.project(base_dir, %{machine: "eezo", harness: :codex, rails: codex_rails("new-rails")})
     after_snapshot = snapshot_files(home)
 
     changed =
@@ -184,7 +197,7 @@ defmodule Tightbeam.HomesTest do
     desired = %{
       harness: :codex,
       machine: "worker",
-      rails: "v1",
+      rails: codex_rails("v1"),
       auth_dir: "/remote/tb/auth/codex"
     }
 
@@ -343,7 +356,7 @@ defmodule Tightbeam.HomesTest do
     desired = %{
       harness: :codex,
       machine: "worker",
-      rails: "v1",
+      rails: codex_rails("v1"),
       auth_dir: "/remote/tb/auth/codex"
     }
 
@@ -390,6 +403,16 @@ defmodule Tightbeam.HomesTest do
     after
       0 -> Enum.reverse(acc)
     end
+  end
+
+  defp codex_rails(marker) do
+    JSON.encode!(%{
+      "hooks" => %{
+        "PreToolUse" => [
+          %{"matcher" => marker, "hooks" => [%{"type" => "command", "command" => "true"}]}
+        ]
+      }
+    })
   end
 
   defp run_local_ssh(command) do

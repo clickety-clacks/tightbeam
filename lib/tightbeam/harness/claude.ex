@@ -23,8 +23,6 @@ defmodule Tightbeam.Harness.Claude do
 
   @api_base "https://api.anthropic.com"
 
-  @adapter_replacements []
-
   @doc false
   def adapter_version, do: @adapter_version
 
@@ -128,11 +126,6 @@ defmodule Tightbeam.Harness.Claude do
   # the subscription one is ever handed to the harness as a file.
   @impl true
   def ensure_adapter(target) do
-    target =
-      target
-      |> Map.put_new(:patch_adapter, &patch_local/1)
-      |> Map.put_new(:remote_patch, &patch_remote(target, &1, &2))
-
     Tightbeam.Spinup.ensure_adapter(target, __MODULE__, adapter_binary(target))
   end
 
@@ -506,7 +499,7 @@ defmodule Tightbeam.Harness.Claude do
 
   @impl true
   def conformance_vectors do
-    source = Enum.map_join(@adapter_replacements, "\n", &elem(&1, 0))
+    source = "stock claude adapter fixture"
 
     valid_entry = %{
       family: "claude-vector",
@@ -558,8 +551,9 @@ defmodule Tightbeam.Harness.Claude do
       adapter_bundle: @adapter_bundle,
       adapter_version: @adapter_version,
       source: source,
-      patched: patch_adapter_source(source),
-      remote_patch_detail: "; claude native ACP",
+      patched: source,
+      remote_patch_detail: "",
+      stock_adapter: true,
       session_meta: %{
         systemPrompt: %{
           type: "preset",
@@ -836,49 +830,5 @@ defmodule Tightbeam.Harness.Claude do
         ".bin",
         "claude-agent-acp"
       ])
-  end
-
-  defp patch_remote(target, path, detail) do
-    script = "node -e #{Support.shell_quote(remote_patch_script(path))}"
-
-    case target.sh.(
-           ["ssh" | Support.ssh_opts()] ++
-             [target.host_config.ssh, "sh", "-c", Support.shell_quote(script)]
-         ) do
-      {_output, 0} -> {:ok, detail <> "; claude native ACP"}
-      {output, _exit} -> {:error, %{code: "host_unready", message: String.trim(output)}}
-    end
-  end
-
-  @doc false
-  def patch_adapter_source(source) do
-    Tightbeam.Harness.AdapterPatch.patch(
-      source,
-      @adapter_replacements,
-      wire_name(),
-      @adapter_version
-    )
-  end
-
-  defp patch_local(path) do
-    Tightbeam.Harness.AdapterPatch.ensure!(
-      path,
-      @adapter_package,
-      @adapter_bundle,
-      @adapter_version,
-      @adapter_replacements,
-      wire_name()
-    )
-  end
-
-  defp remote_patch_script(path) do
-    Tightbeam.Harness.AdapterPatch.remote_script(
-      path,
-      @adapter_package,
-      @adapter_bundle,
-      @adapter_replacements,
-      wire_name(),
-      version: @adapter_version
-    )
   end
 end

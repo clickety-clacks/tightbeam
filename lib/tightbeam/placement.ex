@@ -1466,6 +1466,19 @@ defmodule Tightbeam.Placement do
       env: []
     ]
 
+    base =
+      if function_exported?(module, :project_session_identity, 3) do
+        base
+        |> Keyword.put(:on_guidance, fn session_id, guidance ->
+          module.project_session_identity(target, session_id, guidance)
+        end)
+        |> Keyword.put(:on_guidance_verified, fn session_id ->
+          module.verify_session_identity_hook(target, session_id)
+        end)
+      else
+        base
+      end
+
     with {:ok, plan} <- Harness.prepare_launch(module, target, home, launch_opts) do
       {:ok, Keyword.merge(base, plan)}
     end

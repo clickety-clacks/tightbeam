@@ -80,6 +80,10 @@ defmodule Tightbeam.Harness do
   @callback prepare_launch(target(), String.t(), keyword()) :: launch_plan() | launch_result()
   @callback ensure_adapter(target()) :: ensure_result()
   @callback session_config(map(), binary()) :: map()
+  @doc "Optional per-thread guidance projection before the first model turn."
+  @callback project_session_identity(target(), String.t(), binary()) :: :ok | {:error, term()}
+  @doc "Optional verification that the projected hook ran during an adapter gate."
+  @callback verify_session_identity_hook(target(), String.t()) :: :ok | {:error, term()}
   @doc "The harness-owned leaf entries of a projected home."
   @callback owned_home_entries() :: [String.t()]
   @callback reconcile_home(target(), String.t(), desired_home()) :: map()
@@ -118,7 +122,9 @@ defmodule Tightbeam.Harness do
 
   @optional_callbacks preflight_launch: 3,
                       warm_home: 2,
-                      local_client_model_authority?: 1
+                      local_client_model_authority?: 1,
+                      project_session_identity: 3,
+                      verify_session_identity_hook: 2
 
   @spec preflight_launch(module(), target(), String.t(), keyword()) :: preflight_result()
   def preflight_launch(module, target, home, opts) do

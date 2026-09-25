@@ -597,6 +597,18 @@ defmodule Tightbeam.Acp.AdapterTest do
         end
       end)
       |> then(fn adapter_opts ->
+        case Keyword.get(opts, :on_guidance) do
+          nil -> adapter_opts
+          project -> Keyword.put(adapter_opts, :on_guidance, project)
+        end
+      end)
+      |> then(fn adapter_opts ->
+        case Keyword.get(opts, :on_guidance_verified) do
+          nil -> adapter_opts
+          verify -> Keyword.put(adapter_opts, :on_guidance_verified, verify)
+        end
+      end)
+      |> then(fn adapter_opts ->
         case Keyword.get(opts, :on_subagent_event) do
           nil -> adapter_opts
           handler -> Keyword.put(adapter_opts, :on_subagent_event, handler)
@@ -1442,14 +1454,14 @@ defmodule Tightbeam.Acp.AdapterTest do
              Enum.filter(captured_requests(capture_path), &(&1["method"] == "initialize"))
   end
 
-  test "bounded continuity guidance uses the harness-accurate metadata channel on new and load" do
+  test "bounded continuity guidance uses the supported harness channel on new and load" do
     guidance =
       "served guidance\n\n" <>
         "Run `tightbeam transcript --session \"same-key\" --limit 50`. " <>
         "Do not replay or inject earlier messages."
 
     for {harness, expected} <- [
-          {:codex, %{"developerInstructions" => guidance}},
+          {:codex, %{}},
           {:claude,
            %{
              "systemPrompt" => %{
@@ -1460,7 +1472,16 @@ defmodule Tightbeam.Acp.AdapterTest do
            }},
           {:fixture, %{"instructions" => guidance}}
         ] do
-      {adapter, capture_path} = start_adapter(harness: harness)
+      parent = self()
+
+      {adapter, capture_path} =
+        start_adapter(
+          harness: harness,
+          on_guidance: fn sid, rendered ->
+            send(parent, {:projected_guidance, harness, sid, rendered})
+            :ok
+          end
+        )
 
       assert {:ok, "sess-1"} =
                Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], guidance)
@@ -1476,7 +1497,25 @@ defmodule Tightbeam.Acp.AdapterTest do
                )
 
       assert Enum.all?(session_requests(capture_path), &(&1["meta"] == expected))
+
+      assert_receive {:projected_guidance, ^harness, "sess-1", ^guidance}
+      assert_receive {:projected_guidance, ^harness, "sess-1", ^guidance}
     end
+  end
+
+  test "a missing Codex developer carrier refuses load before dispatch" do
+    {adapter, capture_path} =
+      start_adapter(
+        harness: :codex,
+        on_guidance: fn _sid, _guidance ->
+          {:error, {:codex_identity_projection_failed, "snapshot unavailable"}}
+        end
+      )
+
+    assert {:error, {:codex_identity_projection_failed, "snapshot unavailable"}} =
+             Adapter.load_session(adapter, "sess-1", Model.new("haiku"), "/tmp", [], "guidance")
+
+    refute Enum.any?(session_requests(capture_path), &(&1["method"] == "session/load"))
   end
 
   test "surfaced codex account update reaches the credential callback" do
@@ -2642,6 +2681,20 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert log =~ "[gate-drift] raw_updates="
     assert log =~ ~s("sessionUpdate":"drifted_shape")
     assert byte_size(log) < 5_000
+  end
+
+  test "gate refuses a marker response when the Codex identity hook was not observed" do
+    {adapter, _capture_path} =
+      start_adapter(
+        harness: :codex,
+        gate_mode: "pass-message",
+        on_guidance_verified: fn _sid -> {:error, :codex_identity_hook_not_observed} end
+      )
+
+    monitor = Process.monitor(adapter)
+
+    assert assert_down(adapter, monitor) ==
+             {:gate_attestation_failed, :codex_identity_hook_not_observed}
   end
 
   test "gate log is omitted without real stderr and honors an explicit path" do

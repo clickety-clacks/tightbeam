@@ -1148,10 +1148,9 @@ defmodule Tightbeam.PlacementTest do
     assert is_function(opts[:on_auth_event], 2)
     assert {"TIGHTBEAM_LINEAGE", "tb1-Y29kZXhAdGVzdGhvc3Q"} in opts[:env]
 
-    # No law: no wiring-check probe. The trust seed is present regardless, because
-    # the reserved observation entry is projected regardless.
-    refute Keyword.has_key?(opts, :probe_cwd)
-    refute Keyword.has_key?(opts, :probe_model)
+    # The identity hook is mandatory even when this org has no statutes.
+    assert opts[:probe_cwd] == Path.join(base_dir, "work/gate-probe")
+    assert opts[:probe_model] == Model.new("gpt-5.6-sol", effort: "medium")
     assert {"CODEX_CONFIG", ~s({"bypass_hook_trust":true})} in opts[:env]
     refute Enum.any?(opts[:env], fn {key, _value} -> key == "CODEX_PATH" end)
     refute_receive {:unexpected_sh, _}
@@ -1692,16 +1691,13 @@ defmodule Tightbeam.PlacementTest do
     refute Enum.any?(claude_opts[:cmd], &String.starts_with?(&1, "CODEX_CONFIG="))
     refute Keyword.has_key?(claude_opts, :probe_cwd)
 
-    # Withdrawing the law withdraws the PROBE — nothing can deny any more, so
-    # nothing is worth failing a boot over. The trust seed stays: the substrate's
-    # reserved observation entry is still projected, and on codex a hook only arms
-    # when trust is bypassed.
+    # Withdrawing statutes retains the identity witness gate and trust seed.
     File.rm_rf!(Path.join([base_dir, "identity", "rails"]))
     Rails.load!(base_dir)
     lawless_opts = Placement.adapter_opts!(config, {:codex, "default", "worker"})
     assert ~s(CODEX_CONFIG='{"bypass_hook_trust":true}') in lawless_opts[:cmd]
-    refute Keyword.has_key?(lawless_opts, :probe_cwd)
-    refute Keyword.has_key?(lawless_opts, :probe_model)
+    assert lawless_opts[:probe_cwd] == "/srv/tb/work/gate-probe"
+    assert lawless_opts[:probe_model] == Model.new("gpt-5.6-sol", effort: "medium")
   end
 
   test "adapter lineage identifies the shared harness runtime", %{base_dir: base_dir, db: db} do
@@ -1756,15 +1752,17 @@ defmodule Tightbeam.PlacementTest do
     # and no law at all.
     hooks = File.read!(Path.join(home, "hooks.json")) |> JSON.decode!()
 
-    assert hooks == %{
-             "hooks" => %{
-               "PreToolUse" => [
-                 Rails.github_auth_entry(),
-                 Rails.observation_entry(),
-                 Rails.probe_entry()
-               ]
-             }
-           }
+    assert hooks["hooks"]["PreToolUse"] == [
+             Rails.github_auth_entry(),
+             Rails.observation_entry(),
+             Rails.probe_entry()
+           ]
+
+    assert Map.keys(hooks["hooks"]) |> Enum.sort() == ["PreToolUse", "SessionStart"]
+    assert [%{"hooks" => [handler]}] = hooks["hooks"]["SessionStart"]
+    assert handler["type"] == "command"
+    assert handler["additionalContextLimit"] == 0
+    assert String.starts_with?(handler["command"], "node -e ")
   end
 
   test "local Cursor projection uses the dedicated account's real home" do

@@ -382,9 +382,8 @@ defmodule Tightbeam.Harness.Support do
         common_env: [{"COMMON", "1"}],
         remote_env: ["REMOTE=1"],
         lineage: "tb-vector",
-        # The projected map is unconditional now — the substrate's own observation
-        # entry rides in it — so the railed/lawless axis is org LAW, which is what
-        # the probe follows.
+        # The projected map is unconditional. The railed/lawless axis is org
+        # law; Codex also gates without law to witness its identity hook.
         rails: %{"hooks" => %{"PreToolUse" => []}},
         statutes: rails == :railed,
         credential_kind: kind,
@@ -451,7 +450,7 @@ defmodule Tightbeam.Harness.Support do
       end
 
     plan =
-      if railed? and profile.railed_probe do
+      if profile.railed_probe and (railed? or Map.get(profile, :always_probe, false)) do
         Keyword.merge(plan,
           probe_cwd: Path.join(base, "work/gate-probe"),
           probe_model:
@@ -592,9 +591,13 @@ defmodule Tightbeam.Harness.Support do
           ssh: if(locality == :local, do: nil, else: "vector@remote")
         },
         adapter_binary: adapter,
-        remote_patch: patch,
         sh: sh
       }
+
+      target =
+        if Map.get(profile, :stock_adapter),
+          do: target,
+          else: Map.put(target, :remote_patch, patch)
 
       result = Tightbeam.Harness.ensure_adapter(module, target)
       commands = drain_commands(ref, [])

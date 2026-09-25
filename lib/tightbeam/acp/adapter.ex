@@ -53,6 +53,8 @@ defmodule Tightbeam.Acp.Adapter do
     :cwd,
     :stderr_path,
     :on_auth_event,
+    :on_guidance,
+    :on_guidance_verified,
     :on_subagent_event,
     stderr_offset: 0,
     chunks: %{},
@@ -414,6 +416,8 @@ defmodule Tightbeam.Acp.Adapter do
       stderr_path: stderr_path,
       stderr_offset: offset,
       on_auth_event: Keyword.get(opts, :on_auth_event),
+      on_guidance: Keyword.get(opts, :on_guidance),
+      on_guidance_verified: Keyword.get(opts, :on_guidance_verified),
       on_subagent_event: Keyword.get(opts, :on_subagent_event)
     }
 
@@ -721,7 +725,8 @@ defmodule Tightbeam.Acp.Adapter do
         # option list, so the session/new options must be remembered first.
         state = remember_config_options(state, sid, result)
 
-        with {:ok, applied_model} <-
+        with :ok <- project_guidance(state, sid, guidance),
+             {:ok, applied_model} <-
                establish_new_session_model(state, sid, model, result, request_timeout),
              :ok <- verify_candidate_model(report_cleanup?, model, applied_model),
              :ok <- set_mode(state, sid, request_timeout) do
@@ -772,49 +777,53 @@ defmodule Tightbeam.Acp.Adapter do
   defp verify_candidate_model(_report_cleanup?, _requested, _actual), do: :ok
 
   defp load_session_reply(state, sid, model, cwd, mcp_servers, guidance, request_timeout) do
-    case Conn.request(
-           state.conn,
-           "session/load",
-           %{
-             sessionId: sid,
-             cwd: cwd,
-             mcpServers: mcp_servers,
-             _meta: Harness.module!(state.harness).session_config(%{}, guidance).meta
-           },
-           timeout: request_timeout
-         ) do
-      {:ok, result} ->
-        with :ok <- set_mode(state, sid, request_timeout) do
-          state =
-            state
-            |> put_in([Access.key(:known)], MapSet.put(state.known, sid))
-            |> put_in([Access.key(:models)], Map.delete(state.models, sid))
-            |> put_in([Access.key(:unprompted)], MapSet.delete(state.unprompted, sid))
-            |> remember_switchable_models(sid, result)
-            |> remember_config_options(sid, result)
-            |> put_in([Access.key(:chunks), sid], [])
+    with :ok <- project_guidance(state, sid, guidance) do
+      case Conn.request(
+             state.conn,
+             "session/load",
+             %{
+               sessionId: sid,
+               cwd: cwd,
+               mcpServers: mcp_servers,
+               _meta: Harness.module!(state.harness).session_config(%{}, guidance).meta
+             },
+             timeout: request_timeout
+           ) do
+        {:ok, result} ->
+          with :ok <- set_mode(state, sid, request_timeout) do
+            state =
+              state
+              |> put_in([Access.key(:known)], MapSet.put(state.known, sid))
+              |> put_in([Access.key(:models)], Map.delete(state.models, sid))
+              |> put_in([Access.key(:unprompted)], MapSet.delete(state.unprompted, sid))
+              |> remember_switchable_models(sid, result)
+              |> remember_config_options(sid, result)
+              |> put_in([Access.key(:chunks), sid], [])
 
-          case model do
-            %Model{} = model ->
-              case apply_model_to_session(state, sid, model, request_timeout) do
-                {:ok, applied_model} ->
-                  {:reply, {:ok, applied_model}, put_in(state.models[sid], applied_model)}
+            case model do
+              %Model{} = model ->
+                case apply_model_to_session(state, sid, model, request_timeout) do
+                  {:ok, applied_model} ->
+                    {:reply, {:ok, applied_model}, put_in(state.models[sid], applied_model)}
 
-                {:error, reason} ->
-                  {:reply, {:error, {:model_apply_failed, reason}},
-                   drop_model_residency(state, sid)}
-              end
+                  {:error, reason} ->
+                    {:reply, {:error, {:model_apply_failed, reason}},
+                     drop_model_residency(state, sid)}
+                end
 
-            _unknown ->
-              {:reply, {:ok, :unknown}, state}
+              _unknown ->
+                {:reply, {:ok, :unknown}, state}
+            end
+          else
+            {:error, reason} ->
+              {:reply, {:error, reason}, state}
           end
-        else
-          {:error, reason} ->
-            {:reply, {:error, reason}, state}
-        end
 
-      {:error, error} ->
-        {:reply, {:error, error}, state}
+        {:error, error} ->
+          {:reply, {:error, error}, state}
+      end
+    else
+      {:error, error} -> {:reply, {:error, error}, state}
     end
   end
 
@@ -839,7 +848,8 @@ defmodule Tightbeam.Acp.Adapter do
            timeout: request_timeout
          ) do
       {:ok, %{"sessionId" => new_sid} = result} when new_sid != sid ->
-        with {:ok, applied_model} <-
+        with :ok <- project_guidance(state, new_sid, guidance),
+             {:ok, applied_model} <-
                apply_fork_model(state, new_sid, model, result, request_timeout),
              :ok <- set_mode(state, new_sid, request_timeout) do
           state =
@@ -852,6 +862,10 @@ defmodule Tightbeam.Acp.Adapter do
 
           {:reply, {:ok, new_sid}, state}
         else
+          {:error, {:codex_identity_projection_failed, _} = reason} ->
+            close_failed_fork(state, new_sid)
+            {:reply, {:error, reason}, state}
+
           {:error, reason} ->
             close_failed_fork(state, new_sid)
             {:reply, {:error, {:model_apply_failed, reason}}, state}
@@ -1822,17 +1836,33 @@ defmodule Tightbeam.Acp.Adapter do
 
     with {:ok, result} <- request.("session/new", %{cwd: probe_cwd, mcpServers: []}),
          sid = result["sessionId"],
+         :ok <- project_guidance(state, sid, "Tightbeam adapter wiring-check session"),
          {:ok, _applied_model} <- apply_model_to_session(state, sid, probe_model, request),
          {:ok, _} <-
            request.("session/set_mode", %{
              sessionId: sid,
              modeId: state.preset.permission_mode
            }) do
-      gate_prompt(state.conn, sid)
+      case gate_prompt(state.conn, sid) do
+        {:ok, output} ->
+          case verify_guidance_hook(state, sid) do
+            :ok -> {:ok, output}
+            {:error, reason} -> {:error, reason, output, []}
+          end
+
+        other ->
+          other
+      end
     else
       {:error, _error} -> {:error, :turn_error, "", []}
     end
   end
+
+  defp project_guidance(%{on_guidance: nil}, _sid, _guidance), do: :ok
+  defp project_guidance(state, sid, guidance), do: state.on_guidance.(sid, guidance)
+
+  defp verify_guidance_hook(%{on_guidance_verified: nil}, _sid), do: :ok
+  defp verify_guidance_hook(state, sid), do: state.on_guidance_verified.(sid)
 
   defp gate_prompt(conn, sid) do
     parent = self()

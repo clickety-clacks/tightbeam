@@ -66,7 +66,13 @@ defmodule Tightbeam.Group2HomeTruthTest do
     assert Bitwise.band(File.stat!(metadata).mode, 0o777) == 0o600
     File.write!(Path.join(home, "history.jsonl"), "synthetic-history")
     before_metadata = File.read!(metadata)
-    Homes.project(base, %{machine: "fixture-host", harness: :codex, rails: "new-generic-hooks"})
+
+    Homes.project(base, %{
+      machine: "fixture-host",
+      harness: :codex,
+      rails: JSON.encode!(%{"hooks" => %{"PreToolUse" => []}})
+    })
+
     assert File.read!(credential) == bytes
     assert File.read!(metadata) == before_metadata
     assert File.read!(Path.join(home, "history.jsonl")) == "synthetic-history"

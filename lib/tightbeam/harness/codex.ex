@@ -63,17 +63,6 @@ defmodule Tightbeam.Harness.Codex do
   @probe_model %Tightbeam.Model{family: "gpt-5.6-sol", effort: "medium", context: nil}
 
   @adapter_bundle "index.js"
-  @adapter_replacements [
-    {
-      "      modelProvider: this.getModelProvider(),\n      cwd: request.cwd\n",
-      "      modelProvider: this.getModelProvider(),\n      cwd: request.cwd,\n      developerInstructions: request._meta?.developerInstructions\n"
-    },
-    {
-      "      modelProvider: await this.getResumeModelProvider(),\n      threadId: request.sessionId\n",
-      "      modelProvider: await this.getResumeModelProvider(),\n      threadId: request.sessionId,\n      developerInstructions: request._meta?.developerInstructions\n",
-      global: true
-    }
-  ]
 
   @doc false
   def adapter_version, do: @adapter_version
@@ -122,67 +111,48 @@ defmodule Tightbeam.Harness.Codex do
   @impl true
   def prepare_launch(target, home, opts) do
     binary = adapter_binary(target)
-    # Two different questions. `rails?` — is a PreToolUse map projected at all —
-    # decides the trust seed, and is now always true because the substrate's own
-    # observation entry rides in that map; seeding an env var costs nothing and
-    # can fail nothing. `statutes?` — is there org LAW — decides the wiring-check
-    # probe, which FAILS THE BOOT when hooks are not arming. Only a denial is
-    # worth refusing to boot over; an observation that silently degrades to a
-    # weaker evidence class is not, and gating the probe on the map would have
-    # turned a hook-trust regression into a dead adapter for orgs with no law.
-    rails? = Keyword.fetch!(opts, :rails) != nil
-    statutes? = Keyword.fetch!(opts, :statutes)
+    # The SessionStart identity carrier is required even in an org with no
+    # statutes, so the existing gate must witness it before any Codex session
+    # is admitted. The reserved probe hook is projected in either case.
+    probe_cwd = Path.join(target.host_config.base_dir, "work/gate-probe")
 
-    probe =
-      if statutes? do
-        probe_cwd = Path.join(target.host_config.base_dir, "work/gate-probe")
+    if Support.local?(target) do
+      File.rm_rf!(probe_cwd)
+    else
+      Support.run!(
+        target,
+        ["ssh" | Support.ssh_opts()] ++
+          [target.host_config.ssh, "rm", "-rf", probe_cwd]
+      )
+    end
 
-        if Support.local?(target) do
-          File.rm_rf!(probe_cwd)
-        else
-          Support.run!(
-            target,
-            ["ssh" | Support.ssh_opts()] ++
-              [target.host_config.ssh, "rm", "-rf", probe_cwd]
-          )
-        end
+    ensure_opts = [base_dir: target.base_dir, sh: target.sh]
 
-        ensure_opts = [base_dir: target.base_dir, sh: target.sh]
-
-        ensure_opts =
-          case Keyword.fetch!(opts, :sh_out) do
-            nil -> Keyword.put(ensure_opts, :sh_out, target.sh)
-            sh_out -> Keyword.put(ensure_opts, :sh_out, sh_out)
-          end
-
-        Keyword.fetch!(opts, :ensure_workdir).(
-          target.host_config,
-          probe_cwd,
-          "",
-          ensure_opts
-        )
-
-        [probe_cwd: probe_cwd, probe_model: @probe_model]
-      else
-        []
+    ensure_opts =
+      case Keyword.fetch!(opts, :sh_out) do
+        nil -> Keyword.put(ensure_opts, :sh_out, target.sh)
+        sh_out -> Keyword.put(ensure_opts, :sh_out, sh_out)
       end
+
+    Keyword.fetch!(opts, :ensure_workdir).(
+      target.host_config,
+      probe_cwd,
+      "",
+      ensure_opts
+    )
+
+    probe = [probe_cwd: probe_cwd, probe_model: @probe_model]
 
     launch =
       if Support.local?(target) do
-        config =
-          if rails?,
-            do: [{"CODEX_CONFIG", ~s({"bypass_hook_trust":true})}],
-            else: []
+        config = [{"CODEX_CONFIG", ~s({"bypass_hook_trust":true})}]
 
         [
           cmd: [binary],
           env: [{"CODEX_HOME", home} | Keyword.fetch!(opts, :common_env) ++ config]
         ]
       else
-        config =
-          if rails?,
-            do: ["CODEX_CONFIG='#{~s({"bypass_hook_trust":true})}'"],
-            else: []
+        config = ["CODEX_CONFIG='#{~s({"bypass_hook_trust":true})}'"]
 
         remote_env =
           ["CODEX_HOME=#{home}" | Keyword.fetch!(opts, :remote_env)] ++ config
@@ -200,11 +170,6 @@ defmodule Tightbeam.Harness.Codex do
 
   @impl true
   def ensure_adapter(target) do
-    target =
-      target
-      |> Map.put_new(:patch_adapter, &patch_local/1)
-      |> Map.put_new(:remote_patch, &patch_remote(target, &1, &2))
-
     Tightbeam.Spinup.ensure_adapter(target, __MODULE__, adapter_binary(target))
   end
 
@@ -221,7 +186,7 @@ defmodule Tightbeam.Harness.Codex do
 
     %{
       guidance: guidance,
-      meta: %{developerInstructions: guidance},
+      meta: %{},
       permission_mode: "agent-full-access",
       effort_config: "reasoning_effort",
       resident_model_switch: :in_place,
@@ -249,10 +214,22 @@ defmodule Tightbeam.Harness.Codex do
           |> JSON.encode!()
       end
 
+    rails = Tightbeam.Harness.CodexIdentity.hook_settings(rails)
+
     Tightbeam.Homes.reconcile(target, home, %{desired | rails: rails},
       rails_filename: "hooks.json"
     )
   end
+
+  @doc false
+  @impl true
+  def project_session_identity(target, session_id, guidance),
+    do: Tightbeam.Harness.CodexIdentity.project(target, session_id, guidance)
+
+  @doc false
+  @impl true
+  def verify_session_identity_hook(target, session_id),
+    do: Tightbeam.Harness.CodexIdentity.verify_hook(target, session_id)
 
   @impl true
   def materialize_skills(target, cwd, snapshot) do
@@ -617,7 +594,7 @@ defmodule Tightbeam.Harness.Codex do
 
   @impl true
   def conformance_vectors do
-    source = Enum.map_join(@adapter_replacements, "\n", &elem(&1, 0))
+    source = "stock codex adapter fixture"
     levels = [%{"effort" => "medium"}]
 
     valid_entry = %{
@@ -652,14 +629,16 @@ defmodule Tightbeam.Harness.Codex do
       remote_prefix: fn _base, home, _kind -> ["CODEX_HOME=#{home}"] end,
       remote_rails_env: "CODEX_CONFIG='#{~s({"bypass_hook_trust":true})}'",
       railed_probe: true,
+      always_probe: true,
       adapter_bin: "codex-acp",
       adapter_package: @adapter_package,
       adapter_bundle: @adapter_bundle,
       adapter_version: @adapter_version,
       source: source,
-      patched: patch_adapter_source(source),
-      remote_patch_detail: "; codex adapter patched",
-      session_meta: %{developerInstructions: "vector guidance"},
+      patched: source,
+      remote_patch_detail: "",
+      stock_adapter: true,
+      session_meta: %{},
       cli_name: "codex",
       cli_version: "codex vector 1.0",
       probe_path: :discovered,
@@ -945,49 +924,5 @@ defmodule Tightbeam.Harness.Codex do
         ".bin",
         "codex-acp"
       ])
-  end
-
-  defp patch_remote(target, path, detail) do
-    script = "node -e #{Support.shell_quote(remote_patch_script(path))}"
-
-    case target.sh.(
-           ["ssh" | Support.ssh_opts()] ++
-             [target.host_config.ssh, "sh", "-c", Support.shell_quote(script)]
-         ) do
-      {_output, 0} -> {:ok, detail <> "; codex adapter patched"}
-      {output, _exit} -> {:error, %{code: "host_unready", message: String.trim(output)}}
-    end
-  end
-
-  @doc false
-  def patch_adapter_source(source) do
-    Tightbeam.Harness.AdapterPatch.patch(
-      source,
-      @adapter_replacements,
-      wire_name(),
-      @adapter_version
-    )
-  end
-
-  defp patch_local(path) do
-    Tightbeam.Harness.AdapterPatch.ensure!(
-      path,
-      @adapter_package,
-      @adapter_bundle,
-      @adapter_version,
-      @adapter_replacements,
-      wire_name()
-    )
-  end
-
-  defp remote_patch_script(path) do
-    Tightbeam.Harness.AdapterPatch.remote_script(
-      path,
-      @adapter_package,
-      @adapter_bundle,
-      @adapter_replacements,
-      wire_name(),
-      version: @adapter_version
-    )
   end
 end

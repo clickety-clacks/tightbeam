@@ -55,7 +55,7 @@ defmodule Tightbeam.Spinup do
   def ensure_adapter(target, module, path) do
     if Support.local?(target) do
       if File.exists?(path) do
-        target.patch_adapter.(path)
+        maybe_patch_local(target, path)
         {:ok, "adapters present"}
       else
         provision_adapter(target, module, path, :local)
@@ -65,7 +65,7 @@ defmodule Tightbeam.Spinup do
 
       case target.sh.(check) do
         {_output, 0} ->
-          target.remote_patch.(path, "adapters present")
+          maybe_patch_remote(target, path, "adapters present")
 
         {_output, _exit} ->
           provision_adapter(target, module, path, {:remote, check})
@@ -156,7 +156,7 @@ defmodule Tightbeam.Spinup do
 
   defp confirm_adapter(target, module, path, :local) do
     if File.exists?(path) do
-      target.patch_adapter.(path)
+      maybe_patch_local(target, path)
       {:ok, "deployed adapters"}
     else
       {:error, host_unready(still_missing(target, module, path, ""))}
@@ -166,10 +166,24 @@ defmodule Tightbeam.Spinup do
   defp confirm_adapter(target, module, path, {:remote, check}) do
     case target.sh.(check) do
       {_output, 0} ->
-        target.remote_patch.(path, "deployed adapters")
+        maybe_patch_remote(target, path, "deployed adapters")
 
       {output, _exit} ->
         {:error, host_unready(still_missing(target, module, path, String.trim(output)))}
+    end
+  end
+
+  defp maybe_patch_local(target, path) do
+    case Map.get(target, :patch_adapter) do
+      nil -> :ok
+      patch -> patch.(path)
+    end
+  end
+
+  defp maybe_patch_remote(target, path, detail) do
+    case Map.get(target, :remote_patch) do
+      nil -> {:ok, detail}
+      patch -> patch.(path, detail)
     end
   end
 
