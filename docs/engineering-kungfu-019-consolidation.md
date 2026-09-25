@@ -117,21 +117,21 @@ underlying evidence. Message reduction must not hide a consequential failure.
 
 Canonical names and selection mechanics live in guidance/preferred-models.md.
 Engineering activity orders and capability floors live in the bundle's preferred-models.md.
-The initial policy covers mixed, Codex-only and Claude-only organizations, with complete
-single-family fallback orders. Family restrictions apply before availability fallback.
-A missing credential does not authorize another family.
+Use the current activity table for exact candidates, efforts, capability floors and
+availability fallback. It specifies gpt-6-sol/low for PDO and orchestration,
+gpt-6-luna/max for ordinary implementation with stronger-model discretion, and
+Claude Opus 5.5/high for specification. Preserve historical evaluation results as
+actually run; they do not override current defaults.
 
-Use Sol for bounded or sustained familiar delivery, Astra/Fable for deep planning and
-product judgment, and Luna xhigh for well-scoped coding with stronger independent review.
-Choose a stronger coder directly when architecture, critical behavior or difficult bugs
-require it. Astra low is not a sustained-work fallback. A quality failure requires
-reassessment; availability fallback is not a prescription to use a weaker model.
-
-Mixed-mode review prefers the other provider family among qualified candidates in its
-review row, preserving each family's internal order. Same-family independent review
-remains eligible, including single-family organizations. Provider diversity is not a
-new completion gate. When both families materially produced the work, use the ordinary
-ordered row with fresh independent authorship.
+The complete workflow requires both Codex and Claude. Claude-only operation cannot
+supply the current Codex orchestration/implementation choices or Codex review of
+Claude-authored work. Codex-only operation cannot supply Claude specification or
+Claude review of Codex-authored work. Useful single-harness tasks remain possible;
+they do not establish end-to-end support. Review uses the harness opposite the actual
+producer: Opus 5.5/high for Codex-produced work and Astra 6/high for Claude-produced
+work. A missing credential does not authorize a same-harness substitute or a new
+model choice. Apply the shared selection guidance's mixed-producer rule when both
+harnesses authored work.
 
 Model choices remain decisions performed by the assigning agent through supported
 spawn/tune operations. Archetype preference metadata does not automatically execute
@@ -722,6 +722,8 @@ mechanism names; independent guidance review judges the resulting instructions.
 | A qualified existing Tightbeam session accepts helper output. | Reconcile active writes and record exactly what that owner accepts under an assignment on the same work item. Verify session, archetype, spawnedBy, holder and opener. Adoption is current custody, not retroactive authorship, new spawning ancestry or independent acceptance of helper self-report. |
 | A PO decides a team or recommends a guidance correction; another assignment authors/publishes policy and a third reviews it. | Use coordination for bounded consultation, evidence for findings-only assessment, policy for authoritative guidance changes, and review with applicable producer linkage for independent review. Route historical mismatches to their owner; do not invent reviews or relabel history. |
 | The same authorized request arrives through Main, PO or PDO. | Preserve its full facts, scope and intended start time; reach the same accountable PDO and item. A file-only backlog request does not start delivery. |
+| A product has an existing PO and no PDO; delivery arrives through PO, Main or external intake. | Preserve the full request and same item through agent-owned bootstrap and explicit acceptance by one delivery owner. No repeated user confirmation, duplicate PO, PO/Main production staffing or loss of existing obligations; reuse covered judgment. File-only intake creates no production team. |
+| Only one harness is permitted under the current engineering model policy. | Identify the specific unmet activity/review requirement for either Claude-only or Codex-only operation, preserve useful permitted tasks and evidence, and claim no complete-workflow support or invented fallback. |
 | A worker needs an intent answer while another reports routine progress. | The substantive question can reach the PO directly. Routine progress and recovery stay with the worker's delivery owner. |
 | An owner must be replaced or a retained worker adopted. | Accept output and unresolved obligations through supported custody operations; verify holder, opener and recovery route. Preserve historical ancestry and avoid competing producers. |
 | A concise wake points at a title-only assignment. | The brief is incomplete. Supply the facts, constraints and completion condition in readable durable context before expecting execution; do not rely on transcript scavenging. |

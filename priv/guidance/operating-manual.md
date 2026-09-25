@@ -110,7 +110,7 @@ does not establish independent review. Internal helper steps need no separate as
 
 Start a new session:
 
-    tightbeam spawn --display "Helper — auth check" --name helper:auth-check --harness codex --model gpt-6-sol --effort low
+    tightbeam spawn --display "Helper — auth check" --name helper:auth-check --harness <harness> --model <model> --effort <effort>
 
 `--display` is the human label; `--name` registers a role bound to the new session so you can
 address it. Add `--archetype <name>` to give the session that archetype's identity — its
@@ -166,6 +166,9 @@ only when the choice changes the product or requires authority you do not have.
 
 ## Track work: work-items, assignments, facts
 Work is tracked as durable records, not in chat.
+
+Keep every applicable user-specified invariant in the governing work item and any associated spec, regardless of whether it came through chat, a document, or another source. Preserve the user's meaning.
+
 Treat work items, assignments, attests, artifacts, and decision requests as durable,
 org-readable records. Name a credential by its kind and location when evidence requires it;
 never paste credential bytes into a durable record.

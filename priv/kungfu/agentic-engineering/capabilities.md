@@ -13,7 +13,8 @@ accountable PDO and addressed PO; delivery lanes use orchestrators as needed.
 - Focused role craft: pdo, product-owner, orchestrator, spec-writer, coder, reviewer-code,
   reviewer-spec and recon; team-planner for bounded planning, guidance-writer and
   guidance-reviewer for policy work, and integrator for separately owned reconciliation.
-  Activity-based model selection supports mixed, Codex-only and Claude-only organizations.
+  The complete workflow requires both Codex and Claude under the current model policy.
+  Use preferred-models.md for activity choices, family limitations and useful partial work.
 - Protected coordination: explicit responsibility, useful recovery, effect-based
   completion review and destructive-git protection.
 
