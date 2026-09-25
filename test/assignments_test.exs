@@ -121,8 +121,7 @@ defmodule Tightbeam.AssignmentsTest do
       end
     end
 
-    test "active exact-item delegated opener receives routine and review notices without crossing to a sibling item",
-         ctx do
+    test "terminal completion reaches its opener while sibling cannot-proceed stays open", ctx do
       {delegated, sibling, _delegation} = terminal_delegated_fixture(ctx)
 
       for {assignment, expected, wake_id} <- [
@@ -155,16 +154,18 @@ defmodule Tightbeam.AssignmentsTest do
                  attest_call({:session, "holder"}, delegated.id, "completion")
                )
 
-      assert %{assignment: %{outcome: "surrendered"}} =
-               handle(
-                 ctx,
-                 "attest",
-                 attest_call({:session, "holder"}, sibling.id, "surrender")
-               )
+      blocked =
+        attest_call({:session, "holder"}, sibling.id, "cannot-proceed")
+        |> put_in([:params, :note], "needs input")
+        |> then(&handle(ctx, "attest", &1))
+
+      assert blocked.assignment.state == "open"
+      assert blocked.assignment.outcome == nil
+      assert blocked.cannotProceed.state == "standing"
 
       notices = Map.new(terminal_notices(ctx.db), &{&1.assignment_id, &1})
       assert notices[delegated.id].session_key == "notice-parent"
-      assert notices[sibling.id].session_key == "delivery-owner"
+      refute Map.has_key?(notices, sibling.id)
     end
 
     test "human opener without a work item admits to its durable owner's main", ctx do
@@ -201,39 +202,35 @@ defmodule Tightbeam.AssignmentsTest do
       assert wake.prompt =~ "opened_by_id=\"notice-parent\""
     end
 
-    for {kind, outcome} <- [{"completion", "completed"}, {"surrender", "surrendered"}] do
-      @successor_kind kind
-      @successor_outcome outcome
-      test "#{kind} and review notices reach the current accountable successor after transfer",
-           ctx do
-        {assignment, _item} = terminal_successor_fixture(ctx)
+    test "completion and review notices reach the current accountable successor after transfer",
+         ctx do
+      {assignment, _item} = terminal_successor_fixture(ctx)
 
-        assert {:ok,
-                {:ok,
-                 %{
-                   session_key: "delivery-successor",
-                   owner_user_id: "flynn",
-                   work_item_id: work_item_id
-                 }}} =
-                 DB.transaction(
-                   ctx.db,
-                   &Gateway.review_notice_recipient_in_txn(&1, assignment.id)
-                 )
+      assert {:ok,
+              {:ok,
+               %{
+                 session_key: "delivery-successor",
+                 owner_user_id: "flynn",
+                 work_item_id: work_item_id
+               }}} =
+               DB.transaction(
+                 ctx.db,
+                 &Gateway.review_notice_recipient_in_txn(&1, assignment.id)
+               )
 
-        assert work_item_id == assignment.workItemId
+      assert work_item_id == assignment.workItemId
 
-        closed =
-          handle(
-            ctx,
-            "attest",
-            attest_call({:session, "holder"}, assignment.id, @successor_kind)
-          )
+      closed =
+        handle(
+          ctx,
+          "attest",
+          attest_call({:session, "holder"}, assignment.id, "completion")
+        )
 
-        assert closed.assignment.outcome == @successor_outcome
-        assert [wake] = terminal_notices(ctx.db)
-        assert wake.session_key == "delivery-successor"
-        assert wake.prompt =~ "opened_by_id=\"notice-parent\""
-      end
+      assert closed.assignment.outcome == "completed"
+      assert [wake] = terminal_notices(ctx.db)
+      assert wake.session_key == "delivery-successor"
+      assert wake.prompt =~ "opened_by_id=\"notice-parent\""
     end
 
     test "conflicting persisted payload or immutable relation refuses without mutation", ctx do
