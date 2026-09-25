@@ -228,11 +228,14 @@ defmodule Tightbeam.Wire.Router do
   end
 
   post "/agent/terminal" do
-    with {:ok, {:session, session}} <- terminal_session_auth(conn),
-         :ok <- terminal_version_supported(conn),
-         {:ok, body, conn} <- read_json(conn),
-         {:ok, call} <- terminal_surrender_call(session, body) do
-      dispatch_response(conn, call, 200, &%{"result" => &1})
+    with {:ok, {:session, _session}} <- terminal_session_auth(conn),
+         :ok <- terminal_version_supported(conn) do
+      error(
+        conn,
+        410,
+        "terminal_surrender_removed",
+        "terminal surrender was removed; file a typed cannot-proceed attest through /agent"
+      )
     else
       {:error, status, code, message} -> error(conn, status, code, message)
     end
@@ -1361,40 +1364,6 @@ defmodule Tightbeam.Wire.Router do
         {:error, 400, "unsupported_terminal_protocol", "terminal protocol version 1 is required"}
     end
   end
-
-  defp terminal_surrender_call(session, body) when is_map(body) do
-    with :ok <- exact_terminal_body(body),
-         {:ok, assignment_id} <- required_string(body["assignmentId"]),
-         :ok <- terminal_disposition(body["disposition"]),
-         {:ok, note} <- required_string(body["note"]) do
-      {:ok,
-       %{
-         verb: "attest",
-         origin: "agent:terminal",
-         principal: {:session, session.session_key},
-         session_key: nil,
-         params: %{assignment_id: assignment_id, kind: "surrender", note: note},
-         terminal_surrender: true
-       }}
-    end
-  end
-
-  defp terminal_surrender_call(_session, _body),
-    do: {:error, 400, "invalid_terminal_request", "terminal request must be a JSON object"}
-
-  defp exact_terminal_body(body) do
-    if Map.keys(body) |> Enum.sort() == ["assignmentId", "disposition", "note"] do
-      :ok
-    else
-      {:error, 400, "invalid_terminal_request",
-       "terminal surrender accepts assignmentId, disposition, and note only"}
-    end
-  end
-
-  defp terminal_disposition("surrender"), do: :ok
-
-  defp terminal_disposition(_),
-    do: {:error, 400, "invalid_terminal_request", "disposition must be surrender"}
 
   defp device_auth(conn) do
     token =

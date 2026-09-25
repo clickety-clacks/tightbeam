@@ -15,7 +15,7 @@ defmodule Tightbeam.O2SchemaMigrationTest do
 
   test "fresh O2 bootstrap and restart preserve nullable notice state", %{db: db} do
     assert :ok = Schema.ensure_all(db)
-    assert stamp(db) == "cursor-provider-addressed-po-v1-020"
+    assert stamp(db) == "cannot-proceed-v1-019"
     seed_episode(db)
     assert rows(db, "SELECT noticeState FROM rail_remedy_episodes") == [[nil]]
     assert :ok = Schema.ensure_all(db)
@@ -30,6 +30,7 @@ defmodule Tightbeam.O2SchemaMigrationTest do
   } do
     load_old(db)
     seed_episode(db)
+    seed_historical_surrender(db)
     wake(db, "legacy")
 
     assert {:ok, :ok} =
@@ -49,9 +50,20 @@ defmodule Tightbeam.O2SchemaMigrationTest do
     before_episode = rows(db, "SELECT * FROM rail_remedy_episodes")
     before_triggers = triggers(db)
     assert :ok = Schema.ensure_all(db)
-    assert stamp(db) == "cursor-provider-addressed-po-v1-020"
+    assert stamp(db) == "cannot-proceed-v1-019"
     assert rows(db, "SELECT * FROM wake_cancellations") == before_rows
     assert rows(db, "SELECT * FROM wakes ORDER BY wakeId") == before_wakes
+
+    assert rows(
+             db,
+             "SELECT a.state,a.outcome,t.kind,t.note FROM assignments a JOIN attests t ON t.id=a.closingAttestId WHERE a.id='asg_historical_surrender'"
+           ) == [["closed", "surrendered", "surrender", "historical surrender"]]
+
+    assert rows(
+             db,
+             "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('assignment_cannot_proceed','assignment_cannot_proceed_release_observations') ORDER BY name"
+           ) ==
+             [["assignment_cannot_proceed"]]
 
     assert rows(db, "SELECT * FROM rail_remedy_episodes") ==
              Enum.map(before_episode, &(&1 ++ [nil]))
@@ -101,6 +113,12 @@ defmodule Tightbeam.O2SchemaMigrationTest do
     assert rows(db, "PRAGMA foreign_keys") == [[1]]
     assert :ok = Schema.ensure_all(db)
     assert rows(db, "SELECT * FROM wake_cancellations") == before_rows
+    assert stamp(db) == "cannot-proceed-v1-019"
+
+    assert rows(db, "SELECT kind FROM attests WHERE id='att_historical_surrender'") == [
+             ["surrender"]
+           ]
+
     assert_two_shapes(db)
   end
 
@@ -243,7 +261,7 @@ defmodule Tightbeam.O2SchemaMigrationTest do
     assert rows(db, "SELECT name FROM sqlite_master WHERE name='wake_cancellations'") == []
     :ok = DB.execute(db, "DROP TRIGGER o2_test_refuse_activation")
     assert :ok = Schema.ensure_all(db)
-    assert stamp(db) == "cursor-provider-addressed-po-v1-020"
+    assert stamp(db) == "cannot-proceed-v1-019"
     assert rows(db, "SELECT noticeState FROM rail_remedy_episodes") == [[nil]]
     assert_two_shapes(db)
   end
@@ -260,6 +278,34 @@ defmodule Tightbeam.O2SchemaMigrationTest do
         db,
         "INSERT INTO rail_remedy_episodes (statute,subject,status,occurrence,rewakeCount,claimToken,openedAt) VALUES ('fixture','subject','closed',1,0,'claim',1)"
       )
+  end
+
+  defp seed_historical_surrender(db) do
+    :ok =
+      DB.execute(db, """
+      INSERT INTO users(userId,isAdmin,createdAt) VALUES ('historical-owner',0,1);
+      INSERT INTO sessions(
+        sessionKey,displayName,ownerUserId,origin,archetype,harness,provider,model,host,createdAt,updatedAt
+      ) VALUES (
+        'historical-holder','Historical holder','historical-owner','user:historical-owner',
+        'default','fixture','fixture_provider','fixture','local',1,1
+      );
+      INSERT INTO assignments(
+        id,subject,holderKey,openedByUser,openedAt
+      ) VALUES (
+        'asg_historical_surrender','historical surrender','historical-holder',
+        'historical-owner',1
+      );
+      INSERT INTO attests(id,assignmentId,kind,note,bySession,ts)
+      VALUES (
+        'att_historical_surrender','asg_historical_surrender','surrender',
+        'historical surrender','historical-holder',2
+      );
+      UPDATE assignments
+      SET state='closed',outcome='surrendered',closedAt=2,
+          closedBySession='historical-holder',closingAttestId='att_historical_surrender'
+      WHERE id='asg_historical_surrender';
+      """)
   end
 
   defp wake(db, id) do

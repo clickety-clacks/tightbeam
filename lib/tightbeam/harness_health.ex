@@ -40,14 +40,9 @@ defmodule Tightbeam.HarnessHealth do
   @other_max_validity_ms 900_000
   @harness_health_schema_stamp "harness-health-other-v1-019"
   # Schema.ensure_all invokes module bootstraps before the repository's final
-  # stamp is installed. HarnessHealth migrates only at the protected branch's
-  # reviewed predecessor or PR31's final successor. The latter admits an
-  # existing PR31 database to the same exact object-set migration.
-  @harness_health_predecessor_stamps [
-    "addressed-po-consultation-v1-019",
-    "cursor-provider-v1-020",
-    "cursor-provider-addressed-po-v1-020"
-  ]
+  # stamp is installed. HarnessHealth must not migrate at any intermediate
+  # stamp: this one exact stamp is the reviewed execution-time predecessor.
+  @harness_health_predecessor_stamp "cannot-proceed-v1-019"
   @legacy_object_set_sha256 "97ec5ee389c4f1b8d1b932dcfbc9fc59472a9c721a82968b013f63f54b52ebaf"
   @legacy_two_class_object_set_sha256 "be16933e4a429970358325fe941e258e6838e0e0b789a5d0b470bdb1269dcc3e"
   @target_object_set_sha256 "c811a7a0584197a7111e317f128b1bd9c08b21450511654b84f691ecc325a150"
@@ -513,7 +508,7 @@ defmodule Tightbeam.HarnessHealth do
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
   def ensure_schema(db \\ DB) do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
-      {:ok, [[stamp]]} when stamp in @harness_health_predecessor_stamps ->
+      {:ok, [[@harness_health_predecessor_stamp]]} ->
         ensure_current_schema(db)
 
       {:ok, [[@harness_health_schema_stamp]]} ->
@@ -590,7 +585,7 @@ defmodule Tightbeam.HarnessHealth do
   defp migrate_predecessor!(db) do
     {:ok, [[predecessor_stamp]]} = DB.query(db, "SELECT shape FROM schema_stamp")
 
-    unless predecessor_stamp in @harness_health_predecessor_stamps do
+    unless predecessor_stamp == @harness_health_predecessor_stamp do
       raise_schema_conflict!("unknown predecessor stamp #{inspect(predecessor_stamp)}")
     end
 
@@ -757,8 +752,7 @@ defmodule Tightbeam.HarnessHealth do
   end
 
   defp validate_predecessor_objects!(txn) do
-    expected =
-      MapSet.new(~w(
+    expected = MapSet.new(~w(
         harness_health_observations harness_health_observation_window
         harness_health_observation_incident harness_health_incidents
         harness_health_one_open_class harness_health_incident_history
@@ -1988,8 +1982,7 @@ defmodule Tightbeam.HarnessHealth do
   @doc "List currently open incidents, oldest first."
   @spec active(DB.server()) :: [map()]
   def active(db \\ DB) do
-    {:ok, rows} =
-      DB.query(db, incident_sql() <> " WHERE state='open' ORDER BY openedAt,id")
+    {:ok, rows} = DB.query(db, incident_sql() <> " WHERE state='open' ORDER BY openedAt,id")
 
     Enum.map(rows, &(incident(&1) |> ordinary_incident() |> with_repair_guidance()))
   end
@@ -2765,8 +2758,7 @@ defmodule Tightbeam.HarnessHealth do
     accepted_at =
       integer_or_default(Map.get(input, :accepted_at), System.system_time(:millisecond))
 
-    observed_at =
-      integer_or_default(Map.get(input, :observed_at), accepted_at)
+    observed_at = integer_or_default(Map.get(input, :observed_at), accepted_at)
 
     exact_probe = required_bounded_string!(input, :exact_probe, 4_000)
     observed_state = required_bounded_string!(input, :observed_state, 2_000)
@@ -3524,8 +3516,7 @@ defmodule Tightbeam.HarnessHealth do
         lifecycle_detail(input, input.correlation_id)
       )
 
-      {:appended, marker} =
-        Projection.append_substrate_in_txn(txn, target_ref, message, :high)
+      {:appended, marker} = Projection.append_substrate_in_txn(txn, target_ref, message, :high)
 
       wake_id = "other-review:#{incident_id}:#{target_ref}"
 
@@ -3539,8 +3530,7 @@ defmodule Tightbeam.HarnessHealth do
           prompt: message
         })
 
-      [[owner]] =
-        Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [target_ref])
+      [[owner]] = Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [target_ref])
 
       Txn.q(
         txn,

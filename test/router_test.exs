@@ -6,7 +6,6 @@ defmodule Tightbeam.Wire.RouterTest do
 
   alias Tightbeam.{
     Assignments,
-    ConditionFacts,
     Credentials,
     DB,
     Devices,
@@ -1101,7 +1100,7 @@ defmodule Tightbeam.Wire.RouterTest do
     assert non_cli.status == 200
   end
 
-  test "terminal v1 permits only an authenticated holder's fixed surrender while ordinary mismatch stays closed",
+  test "retired terminal endpoint preserves auth and protocol gates without mutating assignments",
        ctx do
     holder = create_session(ctx.db, "terminal-holder", ctx.device.user_id)
     handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir, wake_tick_ms: 1_000})
@@ -1118,85 +1117,48 @@ defmodule Tightbeam.Wire.RouterTest do
         params: %{subject: "terminal path", idempotency_key: nil, work_item_id: nil}
       })
 
-    ordinary =
-      conn(
-        :post,
-        "/agent/dispatch",
-        JSON.encode!(%{verb: "attest", params: %{assignmentId: assignment.id, kind: "surrender"}})
-      )
-      |> put_req_header("authorization", "Bearer #{holder.cli_token}")
-      |> put_req_header("x-tightbeam-cli-version", "0.0.0")
+    unauthenticated =
+      conn(:post, "/agent/terminal", "not-json")
+      |> put_req_header("x-tightbeam-terminal-version", "1")
       |> Router.call(Router.init(opts))
 
-    assert ordinary.status == 426
-    assert ConditionFacts.standing?(ctx.db, "cli-incompatible", holder.session_key)
+    assert unauthenticated.status == 401
 
-    recovered =
-      conn(
-        :post,
-        "/agent/dispatch",
-        JSON.encode!(%{
-          verb: "attests",
-          asUser: ctx.device.user_id,
-          params: %{assignmentId: assignment.id}
-        })
-      )
+    unsupported =
+      conn(:post, "/agent/terminal", "not-json")
       |> put_req_header("authorization", "Bearer #{holder.cli_token}")
-      |> put_req_header("x-tightbeam-cli-version", Tightbeam.CliCompatibility.required_version())
+      |> put_req_header("x-tightbeam-terminal-version", "2")
       |> Router.call(Router.init(opts))
 
-    assert recovered.status == 200
-    refute ConditionFacts.standing?(ctx.db, "cli-incompatible", holder.session_key)
+    assert unsupported.status == 400
+    assert JSON.decode!(unsupported.resp_body)["error"]["code"] == "unsupported_terminal_protocol"
 
-    surrendered =
-      terminal_surrender(ctx, opts, holder.cli_token, %{
+    removed =
+      terminal_request(opts, holder.cli_token, %{
         "assignmentId" => assignment.id,
         "disposition" => "surrender",
         "note" => "version mismatch"
       })
 
-    assert surrendered.status == 200
-    body = JSON.decode!(surrendered.resp_body)["result"]
-    assert body["assignment"]["outcome"] == "surrendered"
-    assert body["attest"]["kind"] == "surrender"
+    assert removed.status == 410
 
-    replay =
-      terminal_surrender(ctx, opts, holder.cli_token, %{
-        "assignmentId" => assignment.id,
-        "disposition" => "surrender",
-        "note" => "version mismatch"
-      })
+    assert JSON.decode!(removed.resp_body) == %{
+             "error" => %{
+               "code" => "terminal_surrender_removed",
+               "message" =>
+                 "terminal surrender was removed; file a typed cannot-proceed attest through /agent"
+             }
+           }
 
-    assert replay.status == 200
-    replay_body = JSON.decode!(replay.resp_body)["result"]
-    assert replay_body["replayed"] == true
-    assert replay_body["attest"]["id"] == body["attest"]["id"]
-    assert Assignments.attest_count(ctx.db, assignment.id) == 1
+    assert Assignments.attest_count(ctx.db, assignment.id) == 0
 
-    rejected =
-      terminal_surrender(ctx, opts, holder.cli_token, %{
-        "assignmentId" => assignment.id,
-        "disposition" => "completion",
-        "note" => "no"
-      })
-
-    assert rejected.status == 400
-    assert JSON.decode!(rejected.resp_body)["error"]["code"] == "invalid_terminal_request"
-
-    forged =
-      terminal_surrender(ctx, opts, holder.cli_token, %{
-        "assignmentId" => assignment.id,
-        "disposition" => "surrender",
-        "note" => "no",
-        "asUser" => ctx.device.user_id
-      })
-
-    assert forged.status == 400
-    assert JSON.decode!(forged.resp_body)["error"]["code"] == "invalid_terminal_request"
+    assert {:ok, [["open", nil]]} =
+             DB.query(ctx.db, "SELECT state,outcome FROM assignments WHERE id=?1", [assignment.id])
   end
 
-  test "concurrent same-holder terminal surrenders replay the committed winner", ctx do
-    holder = create_session(ctx.db, "terminal-race-holder", ctx.device.user_id)
+  test "concurrent cannot-proceed reports replay the committed route winner", ctx do
+    create_session(ctx.db, Org.personal_session_key(ctx.device.user_id), ctx.device.user_id)
+    holder = create_session(ctx.db, "cannot-proceed-race-holder", ctx.device.user_id)
     handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir, wake_tick_ms: 1_000})
 
     {:ok, assignment} =
@@ -1207,39 +1169,32 @@ defmodule Tightbeam.Wire.RouterTest do
         session_key: holder.session_key,
         target_role: nil,
         role_fallback: false,
-        params: %{subject: "terminal race", idempotency_key: nil, work_item_id: nil}
+        params: %{subject: "cannot-proceed race", idempotency_key: nil, work_item_id: nil}
       })
 
     parent = self()
     real_attest = Map.fetch!(handlers, "attest")
 
     barrier_attest = fn call ->
-      send(parent, {:terminal_surrender_ready, self()})
+      send(parent, {:cannot_proceed_ready, self()})
 
       receive do
-        :terminal_surrender_go -> real_attest.(call)
+        :cannot_proceed_go -> real_attest.(call)
       end
     end
 
     handlers = Map.put(handlers, "attest", barrier_attest)
 
-    db_pid = GenServer.whereis(ctx.db)
-    :erlang.trace_pattern({Tightbeam.Wakes, :row_commit_in_txn, 2}, true, [:local])
-    :erlang.trace_pattern({Assignments, :notify, 4}, true, [:local])
-    :erlang.trace(db_pid, true, [:call, {:tracer, parent}])
-
-    on_exit(fn ->
-      :erlang.trace_pattern({Tightbeam.Wakes, :row_commit_in_txn, 2}, false, [:local])
-      :erlang.trace_pattern({Assignments, :notify, 4}, false, [:local])
-    end)
-
     call = %{
       verb: "attest",
-      origin: "agent:terminal",
+      origin: "agent:#{holder.session_key}",
       principal: {:session, holder.session_key},
       session_key: nil,
-      params: %{assignment_id: assignment.id, kind: "surrender", note: "version mismatch"},
-      terminal_surrender: true
+      params: %{
+        assignment_id: assignment.id,
+        kind: "cannot-proceed",
+        note: "one durable reason"
+      }
     }
 
     tasks = for _ <- 1..2, do: Task.async(fn -> Dispatch.dispatch(ctx.db, handlers, call) end)
@@ -1247,53 +1202,28 @@ defmodule Tightbeam.Wire.RouterTest do
     pids =
       for _ <- 1..2 do
         receive do
-          {:terminal_surrender_ready, pid} -> pid
+          {:cannot_proceed_ready, pid} -> pid
         end
       end
 
-    Enum.each(pids, &:erlang.trace(&1, true, [:call, {:tracer, parent}]))
-    Enum.each(pids, &send(&1, :terminal_surrender_go))
+    Enum.each(pids, &send(&1, :cannot_proceed_go))
     results = Task.await_many(tasks, 5_000)
 
     assert Enum.all?(results, &match?({:ok, _}, &1))
     assert Enum.count(results, fn {:ok, result} -> result[:replayed] == true end) == 1
     assert Assignments.attest_count(ctx.db, assignment.id) == 1
 
-    for {:ok, result} <- results do
-      assert Map.has_key?(result.attest, :artifactId)
-      assert Map.has_key?(result.attest, :contentSha256)
-      assert Map.has_key?(result.attest, :waitId)
-    end
-
-    delivered = :erlang.trace_delivered(db_pid)
-    assert_receive {:trace_delivered, ^db_pid, ^delivered}
-    traces = drain_terminal_traces([])
-
-    transitions =
-      for {:trace, ^db_pid, :call, {Tightbeam.Wakes, :row_commit_in_txn, [_txn, rows]}} <- traces,
-          row <- List.wrap(rows),
-          do: row
-
-    assert Enum.count(transitions, &(&1.domain == "attest")) == 1
-
-    assert Enum.count(transitions, &(&1.domain == "assignment" and &1.row_id == assignment.id)) ==
-             1
-
-    notifications =
-      for {:trace, _pid, :call, {Assignments, :notify, [_call, :on_assignment_change, id, _from]}} <-
-            traces,
-          id == assignment.id,
-          do: id
-
-    assert length(notifications) == 1
-  end
-
-  defp drain_terminal_traces(acc) do
-    receive do
-      {:trace, _, :call, _} = trace -> drain_terminal_traces([trace | acc])
-    after
-      0 -> acc
-    end
+    assert {:ok, [["open", nil, 1, 1]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT a.state,a.outcome,
+                 (SELECT count(*) FROM assignment_cannot_proceed cp WHERE cp.assignmentId=a.id),
+                 (SELECT count(*) FROM decision_requests dr WHERE dr.assignmentId=a.id)
+               FROM assignments a WHERE a.id=?1
+               """,
+               [assignment.id]
+             )
   end
 
   test "kungfu scaffold crosses the closed CLI verb router with its attributed name", ctx do
@@ -2914,7 +2844,7 @@ defmodule Tightbeam.Wire.RouterTest do
     |> Router.call(Router.init(ctx.opts))
   end
 
-  defp terminal_surrender(_ctx, opts, bearer, body) do
+  defp terminal_request(opts, bearer, body) do
     conn(:post, "/agent/terminal", JSON.encode!(body))
     |> put_req_header("authorization", "Bearer #{bearer}")
     |> put_req_header("x-tightbeam-cli-version", "0.0.0")

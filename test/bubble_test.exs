@@ -1,7 +1,17 @@
 defmodule Tightbeam.Productions.BubbleTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{ConditionFacts, ConnRegistry, DB, HarnessHealth, Ledger, Model, Org}
+  alias Tightbeam.{
+    Assignments,
+    ConditionFacts,
+    ConnRegistry,
+    DB,
+    HarnessHealth,
+    Ledger,
+    Model,
+    Org
+  }
+
   alias Tightbeam.Productions.Bubble
 
   defmodule LaneDoorbell do
@@ -74,6 +84,21 @@ defmodule Tightbeam.Productions.BubbleTest do
     {:ok, turn} = Ledger.claim_next(db, session_key, "test-lane")
     :ok = Ledger.finish(db, turn.seq, terminal, error)
     turn.seq
+  end
+
+  defp fail_assigned_turn!(db, session_key, assignment_id) do
+    {:ok, seq} =
+      Ledger.enqueue(db, %{
+        session_key: session_key,
+        message_id: "assigned-cause-#{System.unique_integer([:positive])}",
+        origin: "user:flynn",
+        prompt: "assigned work",
+        assignment_id: assignment_id
+      })
+
+    assert {:ok, _turn} = Ledger.claim_next(db, session_key, "assigned-cause")
+    assert :ok = Ledger.finish(db, seq, "failed", "assigned failure")
+    seq
   end
 
   defp notice_turn(db, session_key) do
@@ -515,5 +540,189 @@ defmodule Tightbeam.Productions.BubbleTest do
       end)
 
     assert {:error, %{code: "reserved_kind"}} = refused
+  end
+
+  test "an ordinary assignment failure does not displace the cannot-proceed opener", ctx do
+    assignment =
+      Assignments.__handle__(ctx.db, "assign", %{
+        verb: "assign",
+        origin: "agent:#{ctx.main.session_key}",
+        principal: {:session, ctx.main.session_key},
+        session_key: "holder",
+        target_role: nil,
+        role_fallback: false,
+        supervision_interval_ms: 1_000,
+        params: %{subject: "running bubble disposer", idempotency_key: nil, work_item_id: nil}
+      })
+
+    blocked =
+      Assignments.__handle__(ctx.db, "attest", %{
+        verb: "attest",
+        origin: "agent:holder",
+        principal: {:session, "holder"},
+        session_key: nil,
+        params: %{
+          assignment_id: assignment.id,
+          kind: "cannot-proceed",
+          note: "the opener cannot act"
+        }
+      })
+
+    cause_seq = fail_assigned_turn!(ctx.db, ctx.holder.session_key, assignment.id)
+    assert :ok = Bubble.recognize_terminal(ctx.db, cause_seq)
+
+    assert {:ok, notice} = Ledger.claim_next(ctx.db, ctx.supervisor.session_key, "assigned-cause")
+
+    expected_disposer = "session:" <> ctx.main.session_key
+
+    assert {:ok, [[^expected_disposer]]} =
+             DB.query(
+               ctx.db,
+               "SELECT disposerRef FROM assignment_cannot_proceed WHERE id=?1",
+               [blocked.cannotProceed.id]
+             )
+
+    assert {:ok, [["running"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [notice.seq])
+
+    assert %{outcome: "revoked"} =
+             Assignments.__handle__(ctx.db, "revoke-assignment", %{
+               verb: "revoke-assignment",
+               origin: "agent:#{ctx.main.session_key}",
+               principal: {:session, ctx.main.session_key},
+               session_key: nil,
+               params: %{
+                 assignment_id: assignment.id,
+                 reason: "ordinary failure does not transfer authority"
+               }
+             })
+  end
+
+  test "a running decision bubble recipient becomes the current cannot-proceed disposer", ctx do
+    assignment =
+      Assignments.__handle__(ctx.db, "assign", %{
+        verb: "assign",
+        origin: "agent:#{ctx.supervisor.session_key}",
+        principal: {:session, ctx.supervisor.session_key},
+        session_key: "holder",
+        target_role: nil,
+        role_fallback: false,
+        supervision_interval_ms: 1_000,
+        params: %{subject: "decision bubble disposer", idempotency_key: nil, work_item_id: nil}
+      })
+
+    blocked =
+      Assignments.__handle__(ctx.db, "attest", %{
+        verb: "attest",
+        origin: "agent:holder",
+        principal: {:session, "holder"},
+        session_key: nil,
+        params: %{
+          assignment_id: assignment.id,
+          kind: "cannot-proceed",
+          note: "the opener must decide"
+        }
+      })
+
+    decision_wake = blocked.decisionWake
+
+    assert :appended =
+             Tightbeam.Gateway.deliver_prompt(
+               decision_wake.session_key,
+               decision_wake.origin,
+               decision_wake.prompt,
+               db: ctx.db,
+               wake_id: decision_wake.wake_id,
+               sender: decision_wake.origin,
+               device_id: "test",
+               client_message_id: decision_wake.wake_id,
+               target_gate: decision_wake,
+               fire_wake_in_txn: true
+             )
+
+    assert {:ok, decision_turn} =
+             Ledger.claim_next(ctx.db, ctx.supervisor.session_key, "decision-wake")
+
+    assert :ok = Ledger.finish(ctx.db, decision_turn.seq, "failed", "decision wake failed")
+    assert :ok = Bubble.recognize_terminal(ctx.db, decision_turn.seq)
+    assert {:ok, notice} = Ledger.claim_next(ctx.db, ctx.main.session_key, "assigned-cause")
+
+    expected_disposer = "session:" <> ctx.main.session_key
+
+    assert {:ok, [[^expected_disposer]]} =
+             DB.query(
+               ctx.db,
+               "SELECT disposerRef FROM assignment_cannot_proceed WHERE id=?1",
+               [blocked.cannotProceed.id]
+             )
+
+    assert {:ok, [["running"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [notice.seq])
+
+    assert %{outcome: "revoked"} =
+             Assignments.__handle__(ctx.db, "revoke-assignment", %{
+               verb: "revoke-assignment",
+               origin: "agent:#{ctx.main.session_key}",
+               principal: {:session, ctx.main.session_key},
+               session_key: nil,
+               params: %{assignment_id: assignment.id, reason: "decision recipient disposition"}
+             })
+  end
+
+  test "terminal lineage exhaustion transfers cannot-proceed disposition to the alerted user",
+       ctx do
+    assignment =
+      Assignments.__handle__(ctx.db, "assign", %{
+        verb: "assign",
+        origin: "agent:#{ctx.main.session_key}",
+        principal: {:session, ctx.main.session_key},
+        session_key: "holder",
+        target_role: nil,
+        role_fallback: false,
+        supervision_interval_ms: 1_000,
+        params: %{subject: "terminal disposer transfer", idempotency_key: nil, work_item_id: nil}
+      })
+
+    blocked =
+      Assignments.__handle__(ctx.db, "attest", %{
+        verb: "attest",
+        origin: "agent:holder",
+        principal: {:session, "holder"},
+        session_key: nil,
+        params: %{
+          assignment_id: assignment.id,
+          kind: "cannot-proceed",
+          note: "the opener lineage is exhausted"
+        }
+      })
+
+    cause_seq = fail_assigned_turn!(ctx.db, ctx.holder.session_key, assignment.id)
+    assert :ok = Bubble.recognize_terminal(ctx.db, cause_seq)
+
+    assert {:ok, supervisor_notice} =
+             Ledger.claim_next(ctx.db, ctx.supervisor.session_key, "assigned-cause")
+
+    assert :ok = Ledger.finish(ctx.db, supervisor_notice.seq, "failed", "assigned failure")
+    assert :ok = Bubble.recognize_terminal(ctx.db, supervisor_notice.seq)
+
+    assert {:ok, main_notice} = Ledger.claim_next(ctx.db, ctx.main.session_key, "assigned-cause")
+    assert :ok = Ledger.finish(ctx.db, main_notice.seq, "failed", "assigned failure")
+    assert :ok = Bubble.recognize_terminal(ctx.db, main_notice.seq)
+
+    assert {:ok, [["user:flynn"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT disposerRef FROM assignment_cannot_proceed WHERE id=?1",
+               [blocked.cannotProceed.id]
+             )
+
+    assert %{outcome: "revoked"} =
+             Assignments.__handle__(ctx.db, "revoke-assignment", %{
+               verb: "revoke-assignment",
+               origin: "user:flynn",
+               principal: {:user, "flynn"},
+               session_key: nil,
+               params: %{assignment_id: assignment.id, reason: "terminal disposition"}
+             })
   end
 end

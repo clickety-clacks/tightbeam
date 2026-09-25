@@ -331,7 +331,7 @@ defmodule Tightbeam.StateResources do
     {"work items", "state"} => ~w(open iceboxed closed failed),
     {"assignments", "state"} => ~w(open closed),
     {"assignments", "outcome"} => ~w(completed surrendered revoked),
-    {"attests", "kind"} => ~w(progress completion surrender verdict),
+    {"attests", "kind"} => ~w(progress completion surrender cannot-proceed verdict),
     {"wakes", "state"} => ~w(pending fired canceled),
     {"wakes", "deliveryStatus"} => ~w(queued running delivered canceled failed failed_unknown),
     {"wakes", "reresolve"} => ~w(lineage),

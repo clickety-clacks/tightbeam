@@ -1297,18 +1297,19 @@ defmodule Tightbeam.Supervision do
   state only — rows, never process state. Conjuncts, in evaluation order:
 
     1. an open assignment obligation exists for the holder;
-    2. this terminal seq was not already evaluated — the
+    2. no typed cannot-proceed condition is standing for that assignment;
+    3. this terminal seq was not already evaluated — the
        `supervision_watermarks` dedupe (`:terminal_already_evaluated`) — and
        is not older than the one that was (`:terminal_coalesced`);
-    3. no running or queued turn for the holder: a pending turn means the
+    4. no running or queued turn for the holder: a pending turn means the
        strand is moving;
-    4. the holder session is active, not retired;
-    5. no standing harness-health incident for the holder's shared
+    5. the holder session is active, not retired;
+    6. no standing harness-health incident for the holder's shared
        `(harness, host)` process: the substrate suppresses this harness while
        healthy harnesses continue;
-    6. a terminal exists at all — the sweep also asks about strands that
+    7. a terminal exists at all — the sweep also asks about strands that
        have never ended a turn;
-    7. no standing `work-blocked` fact for the holder: an agent with
+    8. no standing `work-blocked` fact for the holder: an agent with
        authority decided this session is not to be treated as stalled, and
        the production simply does not match — the same absence-of-match as
        a session with no open assignment.
@@ -1334,7 +1335,12 @@ defmodule Tightbeam.Supervision do
             SELECT a.id,a.subject,a.holderKey,p.lastEvaluatedTerminal
             FROM assignments a LEFT JOIN supervision_watermarks p
               ON p.assignmentId=a.id AND p.sessionKey=a.holderKey
-            WHERE a.holderKey=?1 AND a.state='open' ORDER BY a.openedAt,a.id
+            WHERE a.holderKey=?1 AND a.state='open'
+              AND NOT EXISTS (
+                SELECT 1 FROM assignment_cannot_proceed cp
+                WHERE cp.assignmentId=a.id AND cp.state='standing'
+              )
+            ORDER BY a.openedAt,a.id
             """,
             [session_key]
           )
@@ -3302,6 +3308,9 @@ defmodule Tightbeam.Supervision do
 
   defp gate_reason_in_txn(txn, assignment_id, holder) do
     cond do
+      Tightbeam.Assignments.cannot_proceed_standing_in_txn?(txn, assignment_id) ->
+        "cannot_proceed"
+
       Wakes.covering_continuation_in_txn?(txn, assignment_id) ->
         "pending_turn"
 
@@ -3922,8 +3931,7 @@ defmodule Tightbeam.Supervision do
 
             obligation_ref = idle_cleanup_obligation_ref(group_digest, due_members, metadata)
 
-            prompt =
-              idle_cleanup_prompt(parent_group, snapshot_at, due_members, n, actual_depth)
+            prompt = idle_cleanup_prompt(parent_group, snapshot_at, due_members, n, actual_depth)
 
             result =
               case HarnessHealth.prod_shape_gate_in_txn(
@@ -5462,7 +5470,7 @@ defmodule Tightbeam.Supervision do
 
   defp prod_prompt(id, subject, k, n) do
     "Your turn ended with no qualifying receipt or admitted continuation covering assignment #{id} — \"#{subject}\". " <>
-      "File a qualifying receipt, register an obligation-scoped continuation, or file truthful completion or surrender. This is prod #{k} of #{n}; " <>
+      "File a qualifying receipt, register an obligation-scoped continuation, or file truthful completion or typed cannot-proceed with a reason. This is prod #{k} of #{n}; " <>
       "a reply without a row escalates to your spawner."
   end
 

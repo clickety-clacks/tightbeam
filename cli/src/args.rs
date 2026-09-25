@@ -423,6 +423,9 @@ pub enum Command {
         artifact_id: Option<String>,
         content_sha256: Option<String>,
         wait_id: Option<String>,
+        release_fact_kind: Option<String>,
+        release_fact_scope: Option<String>,
+        release_fact_principal_ref: Option<String>,
     },
     Attests {
         identity: Identity,
@@ -843,13 +846,16 @@ COMMANDS:
       Append one canonical commitRef correction to a CLOSED historical
       assignment. This does not create an attest, change the assignment outcome,
       or rewrite lifecycle history.
-  attest <assignmentId> --kind progress|completion|surrender|verdict
+  attest <assignmentId> --kind progress|completion|cannot-proceed|verdict
       [--commit-refs '[{"repo":"host:/abs/path","commit":"<commit>"}]']
       [--artifact <artifactId> --sha256 <hash>]
          [--verdict <kind>] [--wait <wakeId>] [--note "..."]
+         [--release-fact-kind <kind> --release-fact-scope <scope>
+          --release-fact-principal-ref <principal>]
       File against an assignment. Verdicts on review cards require the review
-      holder; producer-card verdicts may be filed by any session or user. A
-      surrender requires --note and uses the session's implicit identity.
+      holder; producer-card verdicts may be filed by any session or user.
+      cannot-proceed requires a non-empty --note, keeps the assignment open,
+      and accepts the three release-fact flags only as one complete tuple.
   attests <assignmentId>
       List every attest filed against an assignment.
   assignments [--session <key> | --role <name>] [--state open|closed|all]
@@ -2637,11 +2643,28 @@ fn parse_with_optional_catalog(
                         .map_err(|_| "--commit-refs must be a JSON array".to_owned())
                 })
                 .transpose()?;
-            if kind == "surrender" && nonempty(flags, "note").is_none() {
-                return Err("--note is required when --kind is surrender".to_owned());
+            let release_fact_kind = nonempty(flags, "release-fact-kind");
+            let release_fact_scope = nonempty(flags, "release-fact-scope");
+            let release_fact_principal_ref = nonempty(flags, "release-fact-principal-ref");
+            let release_count = [
+                release_fact_kind.as_ref(),
+                release_fact_scope.as_ref(),
+                release_fact_principal_ref.as_ref(),
+            ]
+            .iter()
+            .filter(|value| value.is_some())
+            .count();
+            if release_count != 0 && release_count != 3 {
+                return Err("--release-fact-kind, --release-fact-scope, and --release-fact-principal-ref must be supplied together".to_owned());
             }
-            if kind == "surrender" && commit_refs.is_some() {
-                return Err("--commit-refs is not valid when --kind is surrender".to_owned());
+            if kind != "cannot-proceed" && release_count != 0 {
+                return Err(
+                    "release fact flags are only valid when --kind is cannot-proceed".to_owned(),
+                );
+            }
+            let note = nonempty(flags, "note");
+            if kind == "cannot-proceed" && note.is_none() {
+                return Err("--note is required when --kind is cannot-proceed".to_owned());
             }
             let artifact_id = nonempty(flags, "artifact");
             let content_sha256 = nonempty(flags, "sha256");
@@ -2662,11 +2685,14 @@ fn parse_with_optional_catalog(
                 assignment_id,
                 kind,
                 verdict,
-                note: nonempty(flags, "note"),
+                note,
                 commit_refs,
                 artifact_id,
                 content_sha256,
                 wait_id,
+                release_fact_kind,
+                release_fact_scope,
+                release_fact_principal_ref,
             })
         }
         "attests" => {
@@ -5208,21 +5234,38 @@ mod tests {
             Err("--verdict is only valid when --kind is verdict".to_owned())
         );
         assert_eq!(
-            parse(strings(&["attest", "asg_1", "--kind", "surrender"])),
-            Err("--note is required when --kind is surrender".to_owned())
+            parse(strings(&["attest", "asg_1", "--kind", "cannot-proceed"])),
+            Err("--note is required when --kind is cannot-proceed".to_owned())
         );
-        assert_eq!(
+        assert!(
             parse(strings(&[
                 "attest",
                 "asg_1",
                 "--kind",
-                "surrender",
+                "cannot-proceed",
                 "--note",
-                "done",
-                "--commit-refs",
-                "[]",
-            ])),
-            Err("--commit-refs is not valid when --kind is surrender".to_owned())
+                "waiting",
+                "--release-fact-kind",
+                "ready",
+            ]))
+            .unwrap_err()
+            .contains("must be supplied together")
+        );
+        assert!(
+            parse(strings(&[
+                "attest",
+                "asg_1",
+                "--kind",
+                "progress",
+                "--release-fact-kind",
+                "ready",
+                "--release-fact-scope",
+                "asg_1",
+                "--release-fact-principal-ref",
+                "session:holder",
+            ]))
+            .unwrap_err()
+            .contains("only valid when --kind is cannot-proceed")
         );
     }
 

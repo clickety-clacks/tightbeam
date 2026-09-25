@@ -141,8 +141,9 @@ try do
 
     assert rows.(reopened, "SELECT priorClosedByProcess FROM assignment_reopenings") == [[nil]]
 
-    assert rows.(reopened, "SELECT shape FROM schema_stamp") ==
-             [["cursor-provider-addressed-po-v1-020"]]
+    assert rows.(reopened, "SELECT shape FROM schema_stamp") == [
+             ["cannot-proceed-v1-019"]
+           ]
 
     assert rows.(reopened, "PRAGMA foreign_key_check") == []
     assert File.read!(Path.join(base, "build-owner.json")) == marker

@@ -509,7 +509,7 @@ defmodule Tightbeam.EscalationDeliveryFixture do
     # in-transaction prompt arm each one owes.
     request_sites = [
       {"lib/tightbeam/escalation.ex", "escalate/4"},
-      {"lib/tightbeam/escalation.ex", "file_agent_request/2"},
+      {"lib/tightbeam/escalation.ex", "file_agent_request_in_txn/2"},
       {"lib/tightbeam/escalation.ex", "insert_operator_request_in_txn/7"},
       {"lib/tightbeam/effort_checkin.ex", "open_request_in_txn/4"},
       {"lib/tightbeam/effort_checkin.ex", "deadline_in_txn/3"}
@@ -531,11 +531,12 @@ defmodule Tightbeam.EscalationDeliveryFixture do
              {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt/4",
               "execute_assignment_repair/6"} => 1,
              {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt/4", "notify_session/4"} => 1,
-             # The fault bubble's notice enqueue (production-machine-v1): a
+             # The fault bubble's transactional notice enqueue: a
              # substrate-authored turn to the failing session's nearest active
-             # ancestor, deduped by deterministic wakeId.
-             {"lib/tightbeam/productions/bubble.ex", "Gateway.deliver_prompt/4",
-              "enqueue_notice/4"} => 1,
+             # ancestor, deduped by deterministic wakeId and committed with
+             # the current cannot-proceed disposer.
+             {"lib/tightbeam/productions/bubble.ex", "Gateway.deliver_prompt_in_txn/5",
+              "deliver_bubble_notice/5"} => 1,
              {"lib/tightbeam/productions/bubble.ex", "Gateway.deliver_prompt_in_txn/5",
               "route_patrol_escalation/2"} => 1,
              {"lib/tightbeam/supervision.ex", "Gateway.deliver_prompt/4",

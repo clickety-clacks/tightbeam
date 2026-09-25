@@ -204,18 +204,17 @@ defmodule Tightbeam.RowDrivenWaitsTest do
 
     assert {:ok, [[2]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
 
-    assert %{assignment: %{outcome: "surrendered"}} =
-             attest(ctx.db, "R", "resolver", "surrender")
+    assert %{outcome: "revoked"} = revoke(ctx.db, "R")
 
     recognized = Wakes.get(ctx.db, wake.wake_id)
     assert recognized.recognition_path == "reconsideration"
     assert recognized.recognition_reason == "resolver-terminal"
-    assert recognized.recognition_disposition == "surrendered"
+    assert recognized.recognition_disposition == "revoked"
     assert recognized.recognition_transition["domain"] == "assignment"
     assert recognized.recognition_transition["row_id"] == "R"
 
     assert recognized.recognition_transition["fields"] == %{
-             "outcome" => %{"new" => "surrendered", "old" => nil},
+             "outcome" => %{"new" => "revoked", "old" => nil},
              "state" => %{"new" => "closed", "old" => "open"}
            }
 
@@ -274,15 +273,14 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assert prompt =~ "[woke: wait #{wake.wake_id}; assignment A; path reconsideration;"
     assert prompt =~ "assignment:R"
     assert prompt =~ "outcome"
-    assert prompt =~ "surrendered"
-    assert prompt =~ "disposition surrendered"
+    assert prompt =~ "revoked"
+    assert prompt =~ "disposition revoked"
     assert prompt =~ "predicate {"
     assert String.ends_with?(prompt, "Continue from durable state without rewriting this prompt.")
   end
 
   test "registration evaluates success and terminal resolver paths before returning", ctx do
-    assert %{assignment: %{outcome: "surrendered"}} =
-             attest(ctx.db, "R", "resolver", "surrender")
+    assert %{outcome: "revoked"} = revoke(ctx.db, "R")
 
     terminal = register_wait(ctx.db, due_after(), predicate("R"))
     assert terminal.recognition_path == "reconsideration"
@@ -518,6 +516,45 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assert turn_count(ctx.db, wake.wake_id) == 1
   end
 
+  test "cannot-proceed release settlement publishes its decision row transition", ctx do
+    session(ctx.db, Org.personal_session_key("owner-a"), "owner-a")
+
+    blocked = cannot_proceed(ctx.db, true)
+
+    wait =
+      register_wait(ctx.db, due_after(), decision_predicate(blocked.decisionRequest.id, "ruled"))
+
+    assert %{kind: "dependency-ready"} =
+             ConditionFacts.file(ctx.db, ctx.scheduler, %{
+               kind: "dependency-ready",
+               scope: "A",
+               origin: "user:owner-a"
+             })
+
+    recognized = Wakes.get(ctx.db, wait.wake_id)
+    assert recognized.recognition_path == "reconsideration"
+    assert recognized.recognition_disposition == "withdrawn"
+    assert recognized.recognition_transition["domain"] == "decision_request"
+    assert recognized.recognition_transition["row_id"] == blocked.decisionRequest.id
+  end
+
+  test "cannot-proceed disposition publishes its decision row transition", ctx do
+    session(ctx.db, Org.personal_session_key("owner-a"), "owner-a")
+
+    blocked = cannot_proceed(ctx.db, false)
+
+    wait =
+      register_wait(ctx.db, due_after(), decision_predicate(blocked.decisionRequest.id, "ruled"))
+
+    assert %{outcome: "revoked"} = revoke(ctx.db, "A")
+
+    recognized = Wakes.get(ctx.db, wait.wake_id)
+    assert recognized.recognition_path == "reconsideration"
+    assert recognized.recognition_disposition == "withdrawn"
+    assert recognized.recognition_transition["domain"] == "decision_request"
+    assert recognized.recognition_transition["row_id"] == blocked.decisionRequest.id
+  end
+
   test "terminal assignment, decision and work-item dispositions use the two firing paths", ctx do
     assignment(ctx.db, "R-revoked", "resolver")
     revoked_wait = register_wait(ctx.db, due_after(), predicate("R-revoked"))
@@ -627,7 +664,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     refute response.eligible
     assert Wakes.get(ctx.db, response.wake_id).owner_user_id == "owner-a"
 
-    assert %{assignment: %{outcome: "surrendered"}} = attest(ctx.db, "R", "resolver", "surrender")
+    assert %{outcome: "revoked"} = revoke(ctx.db, "R")
     assert %{assignment: %{outcome: "completed"}} = attest(ctx.db, "A", "holder", "completion")
 
     assert {:accepted_in_txn, _event_id, %{canceled: true}} =
@@ -780,7 +817,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
   test "terminal verifier and fallback end provisional waiting without inventing confirmation",
        ctx do
     verifier_terminal = register_wait(ctx.db, due_after(), predicate("R"))
-    assert %{assignment: %{outcome: "surrendered"}} = attest(ctx.db, "V", "verifier", "surrender")
+    assert %{outcome: "revoked"} = revoke(ctx.db, "V")
 
     terminal = Wakes.get(ctx.db, verifier_terminal.wake_id)
     assert terminal.recognition_path == "reconsideration"
@@ -802,8 +839,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assert fired.recognition_transition["label"] == "fallback-silence"
     assert turn_count(ctx.db, fallback.wake_id) == 1
 
-    assert %{assignment: %{outcome: "surrendered"}} =
-             attest(ctx.db, "R", "resolver", "surrender")
+    assert %{outcome: "revoked"} = revoke(ctx.db, "R")
 
     assert Wakes.get(ctx.db, fallback.wake_id).recognition_path == "fallback"
     assert turn_count(ctx.db, fallback.wake_id) == 1
@@ -1290,7 +1326,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
           assert %{assignment: _} = attest(ctx.db, resolver, "resolver", "completion")
 
         "terminal" ->
-          assert %{assignment: _} = attest(ctx.db, resolver, "resolver", "surrender")
+          assert %{outcome: "revoked"} = revoke(ctx.db, resolver)
 
         "fallback" ->
           assert :ok = Wakes.fire_due(ctx.scheduler)
@@ -1428,6 +1464,43 @@ defmodule Tightbeam.RowDrivenWaitsTest do
       "necessity" => "The named resolver owns the prerequisite output.",
       "verificationRef" => %{"kind" => "assignment", "id" => verifier_id}
     }
+  end
+
+  defp cannot_proceed(db, release?) do
+    assert {:ok, :armed} =
+             DB.transaction(db, fn txn ->
+               Supervision.transition_in_txn(txn, %{
+                 kind: "assignment_open",
+                 assignment_id: "A",
+                 opened_at: 1,
+                 principal: "user:owner-a",
+                 supervision_interval_ms: 1_000
+               })
+             end)
+
+    params = %{
+      assignment_id: "A",
+      kind: "cannot-proceed",
+      note: "fixture cannot proceed"
+    }
+
+    params =
+      if release?,
+        do:
+          Map.merge(params, %{
+            release_fact_kind: "dependency-ready",
+            release_fact_scope: "A",
+            release_fact_principal_ref: "user:owner-a"
+          }),
+        else: params
+
+    Assignments.__handle__(db, "attest", %{
+      verb: "attest",
+      origin: "agent:holder",
+      principal: {:session, "holder"},
+      session_key: nil,
+      params: params
+    })
   end
 
   defp policy(name) do

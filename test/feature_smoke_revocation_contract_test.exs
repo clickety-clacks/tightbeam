@@ -14,7 +14,7 @@ defmodule Tightbeam.FeatureSmokeRevocationContractTest do
           {node, calls}
       end)
 
-    assert length(calls) == 3
+    assert length(calls) == 4
 
     reasons =
       Enum.map(calls, fn fields ->
@@ -28,6 +28,7 @@ defmodule Tightbeam.FeatureSmokeRevocationContractTest do
 
     assert Enum.sort(reasons) ==
              Enum.sort([
+               "smoke opener disposed the blocked card",
                "Effort smoke replaces the first assignment to verify request supersession",
                "Effort smoke completed the replacement assignment checks",
                "Smoke setup clears an open assignment left by a previous run"

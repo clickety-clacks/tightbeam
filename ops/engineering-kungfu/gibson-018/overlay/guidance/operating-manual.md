@@ -144,7 +144,7 @@ Work is tracked as durable records, not in chat.
 
     tightbeam attest <assignmentId> --kind progress   --note "identified the missing authority row"
     tightbeam attest <assignmentId> --kind completion --note "delivered the requested result"
-    tightbeam attest <assignmentId> --kind surrender  --note "the required approval is absent"
+    tightbeam attest <assignmentId> --kind cannot-proceed --note "the exact reason this card cannot move"
 
 - Record a judgment — an assessment, a verification outcome, the user's decision — as a verdict:
 

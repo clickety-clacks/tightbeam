@@ -1143,39 +1143,10 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             artifact_id,
             content_sha256,
             wait_id,
+            release_fact_kind,
+            release_fact_scope,
+            release_fact_principal_ref,
         } => {
-            // A surrender is the sole terminal operation a stale session may make.
-            // Keep its wire shape apart from generic dispatch: that endpoint remains
-            // release-gated, and this one must never accept an asserted identity or
-            // ordinary attest fields.
-            if kind == "surrender" {
-                if !matches!(identity, Identity::Session) {
-                    return Err(
-                        "terminal surrender must use the session's implicit identity".to_owned(),
-                    );
-                }
-                let note = note
-                    .as_deref()
-                    .ok_or_else(|| "--note is required when --kind is surrender".to_owned())?;
-                if verdict.is_some()
-                    || commit_refs.is_some()
-                    || artifact_id.is_some()
-                    || content_sha256.is_some()
-                    || wait_id.is_some()
-                {
-                    return Err(
-                        "terminal surrender accepts only --kind surrender and --note".to_owned(),
-                    );
-                }
-                return Ok(RequestSpec {
-                    path: "/agent/terminal",
-                    body_json: object(vec![
-                        string_field("assignmentId", assignment_id),
-                        string_field("disposition", "surrender"),
-                        string_field("note", note),
-                    ]),
-                });
-            }
             let mut params = vec![
                 string_field("assignmentId", assignment_id),
                 string_field("kind", kind),
@@ -1200,6 +1171,15 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             }
             if let Some(value) = wait_id {
                 params.push(string_field("waitId", value));
+            }
+            if let Some(value) = release_fact_kind {
+                params.push(string_field("releaseFactKind", value));
+            }
+            if let Some(value) = release_fact_scope {
+                params.push(string_field("releaseFactScope", value));
+            }
+            if let Some(value) = release_fact_principal_ref {
+                params.push(string_field("releaseFactPrincipalRef", value));
             }
             Ok(request(identity, "attest", vec![], params))
         }
@@ -2538,7 +2518,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_surrender_has_its_own_fixed_request_shape() {
+    fn surrender_no_longer_uses_the_terminal_protocol() {
         let request = build_request(&parse(&[
             "attest",
             "asg_1",
@@ -2548,23 +2528,10 @@ mod tests {
             "incompatible client",
         ]))
         .unwrap();
-        assert_eq!(request.path, "/agent/terminal");
+        assert_eq!(request.path, "/agent/dispatch");
         assert_eq!(
             request.body_json,
-            r#"{"assignmentId":"asg_1","disposition":"surrender","note":"incompatible client"}"#
-        );
-        assert_eq!(
-            build_request(&parse(&[
-                "attest",
-                "asg_1",
-                "--kind",
-                "surrender",
-                "--note",
-                "no",
-                "--as",
-                "coder",
-            ])),
-            Err("terminal surrender must use the session's implicit identity".to_owned())
+            r#"{"verb":"attest","params":{"assignmentId":"asg_1","kind":"surrender","note":"incompatible client"}}"#
         );
     }
 
@@ -3143,6 +3110,25 @@ mod tests {
 
     #[test]
     fn builds_byte_exact_attest_bodies() {
+        assert_eq!(
+            body(&[
+                "attest",
+                "asg_1",
+                "--kind",
+                "cannot-proceed",
+                "--note",
+                "waiting",
+                "--release-fact-kind",
+                "dependency-ready",
+                "--release-fact-scope",
+                "asg_1",
+                "--release-fact-principal-ref",
+                "session:holder",
+                "--as",
+                "builder",
+            ]),
+            r#"{"as":"builder","verb":"attest","params":{"assignmentId":"asg_1","kind":"cannot-proceed","note":"waiting","releaseFactKind":"dependency-ready","releaseFactScope":"asg_1","releaseFactPrincipalRef":"session:holder"}}"#
+        );
         assert_eq!(
             body(&[
                 "attest",

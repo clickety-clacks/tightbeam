@@ -40,7 +40,7 @@ registered artifacts — preservation is a consequence of custody, never of effo
 written into an attest is a pointer, not custody: the row survives, the bytes do not.
 
 So finishing has a fixed last step, not a judgment call. Before you file completion or
-surrender — and before you go quiet on a card you may not hold again — record every
+cannot-proceed — and before you go quiet on a card you may not hold again — record every
 document you produced that anyone might need again:
 
 `tightbeam artifact-record --kind <kind> --title "<title>" --path <originPath>

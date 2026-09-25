@@ -184,7 +184,12 @@ never paste credential bytes into a durable record.
 
     tightbeam attest <assignmentId> --kind progress   --note "identified the missing authority row"
     tightbeam attest <assignmentId> --kind completion --note "delivered the requested result"
-    tightbeam attest <assignmentId> --kind surrender  --note "the required approval is absent"
+    tightbeam attest <assignmentId> --kind cannot-proceed --note "the exact reason this card cannot move"
+
+`cannot-proceed` leaves the assignment and its custody open, pauses effort prodding only
+for that assignment, and routes one decision to its opener. When an observable condition
+can release the block, supply the complete release-fact tuple; the exact later fact resumes
+the card. Its current disposer may instead revoke it through the lawful assignment path.
 
 - Record a judgment — an assessment, a verification outcome, the user's decision — as a verdict:
 

@@ -17,7 +17,7 @@ try do
   marker = File.read!(Path.join(base, "build-owner.json"))
   alias Tightbeam.DeployReadiness, as: Ready
 
-  assert {:ok, [["cursor-provider-addressed-po-v1-020"]]} =
+  assert {:ok, [["cannot-proceed-v1-019"]]} =
            DB.query(db, "SELECT shape FROM schema_stamp")
 
   :ok =

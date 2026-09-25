@@ -331,10 +331,10 @@ defmodule Tightbeam.WorkItemBracketsTest do
     assert item_id == item.id
   end
 
-  ## Proof 4 — last-close of a non-terminal item arms the slate wake in the close txn
-  ## (all four close paths); next assign cancels it; re-arms on the next last-close.
+  ## Proof 4 — last-close of a non-terminal item arms the slate wake in the close txn;
+  ## cannot-proceed alone stays open; next assign cancels; re-arms on the next last-close.
 
-  test "Proof 4: every close path arms bracket 2 durably; next assign cancels; re-arms", ctx do
+  test "Proof 4: every close path arms bracket 2 while cannot-proceed stays open", ctx do
     # Completion path + the full assign/cancel/re-arm cycle.
     item = create(ctx, {:user, "flynn"}, %{title: "Slate"})
     {:ok, a} = disp_assign(ctx, {:user, "flynn"}, "holder", "w", item.id)
@@ -358,11 +358,13 @@ defmodule Tightbeam.WorkItemBracketsTest do
     assert is_binary(slate2)
     assert slate2 != slate
 
-    # Surrender path.
-    surrender_item = create(ctx, {:user, "flynn"}, %{title: "Surrendered"})
-    {:ok, sa} = disp_assign(ctx, {:user, "flynn"}, "holder", "sw", surrender_item.id)
-    surrender(ctx, "holder", sa.id)
-    assert is_binary(slate_wake_id(ctx.db, surrender_item.id))
+    # Cannot-proceed keeps the assignment and item open; disposer revocation then closes it.
+    paused_item = create(ctx, {:user, "flynn"}, %{title: "Paused"})
+    {:ok, paused} = disp_assign(ctx, {:user, "flynn"}, "holder", "paused", paused_item.id)
+    cannot_proceed(ctx, "holder", paused.id)
+    assert slate_wake_id(ctx.db, paused_item.id) == nil
+    revoke(ctx, paused.id)
+    assert is_binary(slate_wake_id(ctx.db, paused_item.id))
 
     # Revoke path.
     revoke_item = create(ctx, {:user, "flynn"}, %{title: "Revoked"})
@@ -874,7 +876,20 @@ defmodule Tightbeam.WorkItemBracketsTest do
   end
 
   defp complete(ctx, holder, assignment_id), do: attest(ctx, holder, assignment_id, "completion")
-  defp surrender(ctx, holder, assignment_id), do: attest(ctx, holder, assignment_id, "surrender")
+
+  defp cannot_proceed(ctx, holder, assignment_id) do
+    Assignments.__handle__(ctx.db, "attest", %{
+      verb: "attest",
+      origin: "agent:#{holder}",
+      principal: {:session, holder},
+      session_key: nil,
+      params: %{
+        assignment_id: assignment_id,
+        kind: "cannot-proceed",
+        note: "fixture requires opener disposition"
+      }
+    })
+  end
 
   defp attest(ctx, holder, assignment_id, kind) do
     Assignments.__handle__(ctx.db, "attest", %{

@@ -292,6 +292,7 @@ defmodule Tightbeam.Schema do
   @cursor_provider_shape "cursor-provider-addressed-po-v1-020"
   @cursor_provider_previous_shape @addressed_po_shape
   @liveness_progress_receipts_previous_shape "identity-universal-root-render-v1-019"
+  @cannot_proceed_shape "cannot-proceed-v1-019"
   @identity_render_stamp_previous_shape "effort-request-exit-v1-019"
   @effort_request_exit_shape "effort-request-exit-v1-019"
   @effort_request_exit_previous_shape "notice-batching-v1-019"
@@ -1279,9 +1280,51 @@ defmodule Tightbeam.Schema do
                            object
                        end)
 
+  # The current successor widens only the typed cancellation carrier. Keep the
+  # O2 list byte-exact for every historical predecessor and select this list
+  # only after the cannot-proceed stamp has landed.
+  @cannot_proceed_liveness_objects Enum.map(@o2_liveness_objects, fn
+                                     %{name: "wake_cancellations", sql: sql} = object ->
+                                       old_reason =
+                                         "'requester_withdrew','superseded','obligation_disposed',"
+
+                                       new_reason =
+                                         "'requester_withdrew','superseded','obligation_disposed','cannot_proceed_released',"
+
+                                       old_requester =
+                                         ~r/\(requesterId = 'tightbeam:assignments' AND\s+reasonKind = 'obligation_disposed' AND causalSourceKind = 'assignment_transition' AND\s+outcomeKind = 'disposition'\)/
+
+                                       new_requester = """
+                                           (requesterId = 'tightbeam:assignments' AND
+                                            ((reasonKind = 'obligation_disposed' AND
+                                              causalSourceKind = 'assignment_transition' AND outcomeKind = 'disposition')
+                                             OR
+                                             (reasonKind = 'cannot_proceed_released' AND
+                                              causalSourceKind = 'condition_fact' AND outcomeKind = 'no_replacement')))
+                                       """
+
+                                       true = String.contains?(sql, old_reason)
+                                       true = Regex.match?(old_requester, sql)
+
+                                       sql =
+                                         sql
+                                         |> String.replace(old_reason, new_reason, global: false)
+                                         |> then(
+                                           &Regex.replace(old_requester, &1, new_requester,
+                                             global: false
+                                           )
+                                         )
+
+                                       %{object | sql: sql}
+
+                                     object ->
+                                       object
+                                   end)
+
   @doc false
   def guard_compatible_stamps do
     [
+      @cannot_proceed_shape,
       @cursor_provider_shape,
       @legacy_cursor_provider_shape,
       @addressed_po_shape,
@@ -1347,7 +1390,8 @@ defmodule Tightbeam.Schema do
             @pi_shape,
             @addressed_po_shape,
             @legacy_cursor_provider_shape,
-            @cursor_provider_shape
+            @cursor_provider_shape,
+            @cannot_proceed_shape
           ]
         )
     end)
@@ -1389,6 +1433,8 @@ defmodule Tightbeam.Schema do
     :ok = Tightbeam.QueuedMessageSuppression.ensure_schema(db)
     Enum.each(@schema_modules, fn module -> :ok = module.ensure_schema(db) end)
     :ok = upgrade_cursor_provider_v1_020(db)
+    :ok = upgrade_cannot_proceed(db)
+    Enum.each(@schema_modules, fn module -> :ok = module.ensure_schema(db) end)
     :ok = Tightbeam.ReadMarkers.ensure_schema(db)
 
     case DB.finish_schema(db) do
@@ -1413,12 +1459,19 @@ defmodule Tightbeam.Schema do
   @spec ensure_supervision_liveness_v1_in_txn(Txn.t(), non_neg_integer(), keyword()) :: :ok
   def ensure_supervision_liveness_v1_in_txn(%Txn{} = txn, activated_at, opts)
       when is_integer(activated_at) and activated_at >= 0 and is_list(opts) do
-    present = Enum.filter(@o2_liveness_objects, &owned_object_present?(txn, &1))
+    [[shape]] = Txn.q(txn, "SELECT shape FROM schema_stamp")
+
+    liveness_objects =
+      if shape == @cannot_proceed_shape,
+        do: @cannot_proceed_liveness_objects,
+        else: @o2_liveness_objects
+
+    present = Enum.filter(liveness_objects, &owned_object_present?(txn, &1))
     Enum.each(present, &validate_owned_object!(txn, &1))
 
     case length(present) do
       0 ->
-        @o2_liveness_objects
+        liveness_objects
         |> Enum.with_index(1)
         |> Enum.each(fn {object, index} ->
           :ok = Txn.exec(txn, object.sql)
@@ -1436,14 +1489,14 @@ defmodule Tightbeam.Schema do
           [activated_at]
         )
 
-        maybe_interrupt_activation!(opts, length(@o2_liveness_objects) + 1)
+        maybe_interrupt_activation!(opts, length(liveness_objects) + 1)
 
-      count when count == length(@o2_liveness_objects) ->
+      count when count == length(liveness_objects) ->
         :ok
 
       _count ->
         missing =
-          @o2_liveness_objects
+          liveness_objects
           |> Kernel.--(present)
           |> Enum.map_join(", ", & &1.name)
 
@@ -1452,8 +1505,6 @@ defmodule Tightbeam.Schema do
 
     validate_activation_epoch!(txn)
 
-    [[shape]] = Txn.q(txn, "SELECT shape FROM schema_stamp")
-
     enforcement_objects =
       if shape in [
            @reparent_shape,
@@ -1461,7 +1512,8 @@ defmodule Tightbeam.Schema do
            @pi_shape,
            @addressed_po_shape,
            @legacy_cursor_provider_shape,
-           @cursor_provider_shape
+           @cursor_provider_shape,
+           @cannot_proceed_shape
          ],
          do: reparent_liveness_enforcement_objects(),
          else: @supervision_liveness_enforcement_objects
@@ -1977,6 +2029,9 @@ defmodule Tightbeam.Schema do
 
   defp check_shape(db) do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
+      {:ok, [[@cannot_proceed_shape]]} ->
+        :ok
+
       {:ok, [[@cursor_provider_shape]]} ->
         :ok
 
@@ -2074,7 +2129,7 @@ defmodule Tightbeam.Schema do
         this Tightbeam database was written by a different build.
 
           stamped: #{found}
-          this build: #{@cursor_provider_shape}
+          this build: #{@cannot_proceed_shape}
 
         This build can migrate #{@model_identity_shape} or #{@operator_decision_shape}
         to #{@terminal_decision_liveness_shape}, then #{@effort_request_exit_previous_shape}.
@@ -2098,7 +2153,7 @@ defmodule Tightbeam.Schema do
         this Tightbeam database carries MORE THAN ONE shape stamp.
 
           stamped: #{rows |> List.flatten() |> Enum.join(", ")}
-          this build: #{@cursor_provider_shape}
+          this build: #{@cannot_proceed_shape}
 
         Nothing in Tightbeam writes a second stamp, so this database was
         assembled by something else. Move it aside and let it be recreated.
@@ -2121,6 +2176,7 @@ defmodule Tightbeam.Schema do
 
              [[stamp]]
              when stamp in [
+                    @cannot_proceed_shape,
                     @addressed_po_shape,
                     @pi_shape,
                     @durability_shape,
@@ -2177,6 +2233,13 @@ defmodule Tightbeam.Schema do
   defp bootstrap_module(db, Tightbeam.AdminProjection, _current?),
     do: Tightbeam.AdminProjection.ensure_storage(db)
 
+  defp bootstrap_module(db, Tightbeam.Assignments, _current?) do
+    case DB.query(db, "SELECT shape FROM schema_stamp") do
+      {:ok, [[@cannot_proceed_shape]]} -> Tightbeam.Assignments.ensure_schema(db)
+      {:ok, [[_predecessor]]} -> Tightbeam.Assignments.ensure_pre_cannot_proceed_schema(db)
+    end
+  end
+
   defp bootstrap_module(db, module, _current?), do: module.ensure_schema(db)
 
   @doc false
@@ -2190,6 +2253,7 @@ defmodule Tightbeam.Schema do
 
       {:ok, [[stamp]]}
       when stamp in [
+             @cannot_proceed_shape,
              @addressed_po_shape,
              @pi_shape,
              @durability_shape,
@@ -2275,6 +2339,9 @@ defmodule Tightbeam.Schema do
              [[@legacy_cursor_provider_shape]] ->
                :ok
 
+             [[@cannot_proceed_shape]] ->
+               :ok
+
              [[@addressed_po_shape]] ->
                :ok
 
@@ -2331,6 +2398,9 @@ defmodule Tightbeam.Schema do
                validate_artifact_content_schema!(txn)
 
              [[@legacy_cursor_provider_shape]] ->
+               validate_artifact_content_schema!(txn)
+
+             [[@cannot_proceed_shape]] ->
                validate_artifact_content_schema!(txn)
 
              [[@addressed_po_shape]] ->
@@ -2417,6 +2487,9 @@ defmodule Tightbeam.Schema do
         :ok
 
       {:ok, [[@legacy_cursor_provider_shape]]} ->
+        :ok
+
+      {:ok, [[@cannot_proceed_shape]]} ->
         :ok
 
       {:ok, [[@addressed_po_shape]]} ->
@@ -3445,6 +3518,7 @@ defmodule Tightbeam.Schema do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
       {:ok, [[@cursor_provider_shape]]} -> :ok
       {:ok, [[@legacy_cursor_provider_shape]]} -> :ok
+      {:ok, [[@cannot_proceed_shape]]} -> :ok
       {:ok, [[@addressed_po_shape]]} -> :ok
       {:ok, [[@pi_shape]]} -> :ok
       {:ok, [[@durability_shape]]} -> migrate_sessions_provider_shape(db, @durability_shape)
@@ -3457,15 +3531,18 @@ defmodule Tightbeam.Schema do
       {:ok, [[@cursor_provider_shape]]} ->
         :ok
 
+      {:ok, [[@cannot_proceed_shape]]} ->
+        :ok
+
+      {:ok, [[@addressed_po_shape]]} ->
+        :ok
+
       {:ok, [[@legacy_cursor_provider_shape]]} ->
         migrate_addressed_po_consultation(
           db,
           @legacy_cursor_provider_shape,
           @cursor_provider_shape
         )
-
-      {:ok, [[@addressed_po_shape]]} ->
-        :ok
 
       {:ok, [[@pi_shape]]} ->
         migrate_addressed_po_consultation(db, @pi_shape, @addressed_po_shape)
@@ -3541,6 +3618,113 @@ defmodule Tightbeam.Schema do
       do:
         raise(ShapeError,
           message: "migration #{source_shape} -> #{target_shape} lost its exact stamp transition"
+        )
+
+    :ok
+  end
+
+  defp upgrade_cannot_proceed(db) do
+    case DB.query(db, "SELECT shape FROM schema_stamp") do
+      {:ok, [[@cannot_proceed_shape]]} ->
+        :ok
+
+      {:ok, [[@cursor_provider_shape]]} ->
+        {:ok, [[foreign_keys]]} = DB.query(db, "PRAGMA foreign_keys")
+        {:ok, [[legacy_alter_table]]} = DB.query(db, "PRAGMA legacy_alter_table")
+        :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
+        :ok = DB.execute(db, "PRAGMA legacy_alter_table = ON")
+
+        try do
+          case DB.transaction(db, &migrate_cannot_proceed_in_txn/1) do
+            {:ok, :ok} ->
+              :ok
+
+            {:error, %ShapeError{} = error} ->
+              raise error
+
+            {:error, error} ->
+              raise ShapeError,
+                message:
+                  "migration #{@cursor_provider_shape} -> #{@cannot_proceed_shape} failed and was rolled back: #{Exception.message(error)}"
+          end
+        after
+          :ok = DB.execute(db, "PRAGMA legacy_alter_table = #{legacy_alter_table}")
+          :ok = DB.execute(db, "PRAGMA foreign_keys = #{foreign_keys}")
+        end
+
+      rows ->
+        raise ShapeError,
+          message: "incompatible cannot-proceed predecessor: #{inspect(rows)}"
+    end
+  end
+
+  defp migrate_cannot_proceed_in_txn(%Txn{} = txn) do
+    [[@cursor_provider_shape]] = Txn.q(txn, "SELECT shape FROM schema_stamp")
+    [[cancellation_count]] = Txn.q(txn, "SELECT COUNT(*) FROM wake_cancellations")
+
+    for name <- ~w(wakes_typed_cancellation_required wake_cancellations_pending_insert) do
+      :ok = Txn.exec(txn, "DROP TRIGGER #{name}")
+    end
+
+    :ok =
+      Txn.exec(
+        txn,
+        "ALTER TABLE wake_cancellations RENAME TO wake_cancellations_before_cannot_proceed"
+      )
+
+    cancellation_table =
+      Enum.find(@cannot_proceed_liveness_objects, &(&1.name == "wake_cancellations"))
+
+    :ok = Txn.exec(txn, cancellation_table.sql)
+
+    columns =
+      "wakeId,wakeState,canceledAt,requesterKind,requesterId,reasonKind," <>
+        "causalSourceKind,causalSourceId,outcomeKind,replacementWakeId," <>
+        "dispositionKind,dispositionId,primaryWorkKind,primaryWorkId,workImpactKind," <>
+        "livenessTriggerKind,livenessTriggerId,actionNeeded"
+
+    :ok =
+      Txn.exec(
+        txn,
+        "INSERT INTO wake_cancellations (#{columns}) SELECT #{columns} FROM wake_cancellations_before_cannot_proceed"
+      )
+
+    if Txn.changes(txn) != cancellation_count do
+      raise ShapeError,
+        message:
+          "cannot-proceed migration copied #{Txn.changes(txn)} of #{cancellation_count} wake cancellations"
+    end
+
+    [[^cancellation_count]] = Txn.q(txn, "SELECT COUNT(*) FROM wake_cancellations")
+    :ok = Txn.exec(txn, "DROP TABLE wake_cancellations_before_cannot_proceed")
+
+    for name <- ~w(wake_cancellations_pending_insert wakes_typed_cancellation_required) do
+      object = Enum.find(@o2_liveness_objects, &(&1.name == name))
+      :ok = Txn.exec(txn, object.sql)
+    end
+
+    :ok = Tightbeam.Assignments.migrate_cannot_proceed_v1_in_txn(txn)
+
+    case Txn.q(txn, "PRAGMA foreign_key_check") do
+      [] ->
+        :ok
+
+      rows ->
+        raise ShapeError,
+          message: "cannot-proceed migration left invalid foreign keys: #{inspect(rows)}"
+    end
+
+    Txn.q(txn, "UPDATE schema_stamp SET shape=?1,stampedAt=?2 WHERE shape=?3", [
+      @cannot_proceed_shape,
+      System.system_time(:millisecond),
+      @cursor_provider_shape
+    ])
+
+    if Txn.changes(txn) != 1,
+      do:
+        raise(ShapeError,
+          message:
+            "migration #{@cursor_provider_shape} -> #{@cannot_proceed_shape} lost its exact stamp transition"
         )
 
     :ok
@@ -3681,6 +3865,9 @@ defmodule Tightbeam.Schema do
 
   defp upgrade_cursor_provider_v1_020(db) do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
+      {:ok, [[@cannot_proceed_shape]]} ->
+        :ok
+
       {:ok, [[@cursor_provider_shape]]} ->
         :ok
 

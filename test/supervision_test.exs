@@ -3006,7 +3006,7 @@ defmodule Tightbeam.SupervisionTest do
     expected_prod =
       "[from process:tightbeam]\n\n" <>
         "Your turn ended with no qualifying receipt or admitted continuation covering assignment asg_1 — \"ship it\". " <>
-        "File a qualifying receipt, register an obligation-scoped continuation, or file truthful completion or surrender. This is prod 1 of 3; " <>
+        "File a qualifying receipt, register an obligation-scoped continuation, or file truthful completion or typed cannot-proceed with a reason. This is prod 1 of 3; " <>
         "a reply without a row escalates to your spawner."
 
     assert {:ok, [[^expected_prod]]} =

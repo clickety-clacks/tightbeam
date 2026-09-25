@@ -30,6 +30,7 @@ defmodule Tightbeam.Productions.Bubble do
   """
 
   alias Tightbeam.{
+    Assignments,
     ConditionFacts,
     ConnRegistry,
     DB,
@@ -202,15 +203,7 @@ defmodule Tightbeam.Productions.Bubble do
         "#{cause.error || "reason unrecorded"}. You are the nearest ancestor " <>
         "shown able to run a turn. What to do about it is your judgment."
 
-    result =
-      Gateway.deliver_prompt(recipient, "process:tightbeam", prompt,
-        db: db,
-        sender: "process:tightbeam",
-        device_id: "process:tightbeam",
-        client_message_id: "bubble:#{turn.cause_seq}:#{recipient}",
-        wake_id: "bubble:#{turn.cause_seq}:#{recipient}",
-        request_ref: "bubble:#{turn.cause_seq}"
-      )
+    result = deliver_bubble_notice(db, recipient, prompt, turn, cause)
 
     case result do
       # :duplicate is the dedupe working — a crash between recognition and
@@ -221,6 +214,46 @@ defmodule Tightbeam.Productions.Bubble do
       # will terminalize and continue the climb — do it now.
       :skipped -> climb(db, %{turn | session_key: recipient, notice?: true})
       _ -> :ok
+    end
+  end
+
+  defp deliver_bubble_notice(db, recipient, prompt, turn, cause) do
+    case DB.transaction(db, fn txn ->
+           delivery =
+             Gateway.deliver_prompt_in_txn(
+               txn,
+               recipient,
+               "process:tightbeam",
+               prompt,
+               sender: "process:tightbeam",
+               device_id: "process:tightbeam",
+               client_message_id: "bubble:#{turn.cause_seq}:#{recipient}",
+               wake_id: "bubble:#{turn.cause_seq}:#{recipient}",
+               request_ref: "bubble:#{turn.cause_seq}"
+             )
+
+           if match?({:appended, ^recipient, _, _}, delivery) do
+             Assignments.transfer_cannot_proceed_disposer_to_session_in_txn(
+               txn,
+               cause.assignment_id,
+               recipient,
+               turn.cause_seq,
+               cause.wake_id
+             )
+           end
+
+           delivery
+         end) do
+      {:ok, delivery} ->
+        Gateway.complete_delivery(db, delivery)
+
+      {:error, %{message: message}} when is_binary(message) ->
+        if String.contains?(message, "UNIQUE"),
+          do: :duplicate,
+          else: raise(DB.Error, message: message)
+
+      {:error, error} ->
+        raise error
     end
   end
 
@@ -452,6 +485,14 @@ defmodule Tightbeam.Productions.Bubble do
             "cause_seq=#{turn.cause_seq} session=#{cause.session_key}"
           )
 
+          :ok =
+            Assignments.transfer_cannot_proceed_disposer_to_user_in_txn(
+              txn,
+              cause.assignment_id,
+              turn.owner,
+              turn.cause_seq
+            )
+
           fact =
             ConditionFacts.file_in_txn(txn, %{
               kind: "user-alerted",
@@ -627,7 +668,7 @@ defmodule Tightbeam.Productions.Bubble do
       DB.query(
         db,
         """
-        SELECT t.sessionKey,t.error,s.harness,s.host,t.wakeId
+        SELECT t.sessionKey,t.error,s.harness,s.host,t.assignmentId,t.wakeId
         FROM turns t JOIN sessions s ON s.sessionKey=t.sessionKey
         WHERE t.seq=?1
         """,
@@ -635,9 +676,16 @@ defmodule Tightbeam.Productions.Bubble do
       )
 
     case rows do
-      [[session_key, error, harness, host, wake_id]] ->
+      [[session_key, error, harness, host, assignment_id, wake_id]] ->
         {:ok,
-         %{session_key: session_key, error: error, harness: harness, host: host, wake_id: wake_id}}
+         %{
+           session_key: session_key,
+           error: error,
+           harness: harness,
+           host: host,
+           assignment_id: assignment_id,
+           wake_id: wake_id
+         }}
 
       [] ->
         :missing

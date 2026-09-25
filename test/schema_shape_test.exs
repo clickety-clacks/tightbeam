@@ -13,7 +13,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
   alias Tightbeam.{Assignments, ConnRegistry, DB, Schema, SessionPoAssociations, Wakes}
 
-  @shape "cursor-provider-addressed-po-v1-020"
+  @shape "cannot-proceed-v1-019"
   @legacy_cursor_provider_shape "cursor-provider-v1-020"
   @cursor_provider_previous_shape "addressed-po-consultation-v1-019"
   @row_driven_rules_shape "row-driven-rules-v1-019"

@@ -159,27 +159,30 @@ defmodule Tightbeam.EffortCheckinTest do
 
     assert %{consumer: "effort_probe", state: "pending"} = Wakes.get(ctx.db, wake_id)
 
-    for kind <- ["completion", "surrender"] do
-      item = dispatch(ctx, {:session, "parent"}, "holder", kind)
-      open = escalate(ctx, item.id)
-      assignment(ctx, "attest", {:session, "holder"}, nil, %{assignment_id: item.id, kind: kind})
-      assert bracket_state(ctx.db, item.id) == "canceled"
-      assert request(ctx.db, open.id).status == "superseded"
-      assert Wakes.get(ctx.db, open.deadline_wake_id).state == "canceled"
+    completed = dispatch(ctx, {:session, "parent"}, "holder", "completion")
+    open = escalate(ctx, completed.id)
 
-      assert %{
-               requester: "tightbeam:assignments",
-               reason: "obligation_disposed",
-               source_kind: "assignment_transition",
-               source_id: source_assignment_id,
-               outcome: "disposition",
-               disposition_kind: "assignment_transition",
-               disposition_id: disposition_assignment_id
-             } = cancellation(ctx.db, open.deadline_wake_id)
+    assignment(ctx, "attest", {:session, "holder"}, nil, %{
+      assignment_id: completed.id,
+      kind: "completion"
+    })
 
-      assert source_assignment_id == item.id
-      assert disposition_assignment_id == item.id
-    end
+    assert bracket_state(ctx.db, completed.id) == "canceled"
+    assert request(ctx.db, open.id).status == "superseded"
+    assert Wakes.get(ctx.db, open.deadline_wake_id).state == "canceled"
+
+    assert %{
+             requester: "tightbeam:assignments",
+             reason: "obligation_disposed",
+             source_kind: "assignment_transition",
+             source_id: source_assignment_id,
+             outcome: "disposition",
+             disposition_kind: "assignment_transition",
+             disposition_id: disposition_assignment_id
+           } = cancellation(ctx.db, open.deadline_wake_id)
+
+    assert source_assignment_id == completed.id
+    assert disposition_assignment_id == completed.id
 
     revoked = dispatch(ctx, {:session, "parent"}, "holder", "revoked")
 

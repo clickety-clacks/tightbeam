@@ -220,6 +220,14 @@ defmodule Tightbeam.ConditionFacts do
     scope = Map.get(input, :scope)
     owner_user_id = Map.get(input, :owner_user_id) || owner_for_origin_in_txn(txn, origin)
 
+    if kind == "user-alerted" and is_binary(scope) do
+      :ok =
+        Tightbeam.Assignments.transfer_retired_cannot_proceed_disposers_to_user_in_txn(
+          txn,
+          scope
+        )
+    end
+
     if payload = input[:payload] do
       Txn.q(
         txn,
@@ -250,13 +258,6 @@ defmodule Tightbeam.ConditionFacts do
       ])
     end
 
-    EventLog.lifecycle_in_txn(
-      txn,
-      "condition_fact_filed",
-      to_string(fact_id),
-      "kind=#{kind} scope=#{scope || "nil"} by=#{origin}"
-    )
-
     fact = %{
       fact_id: fact_id,
       ts: ts,
@@ -265,6 +266,15 @@ defmodule Tightbeam.ConditionFacts do
       origin: origin,
       payload: input[:payload]
     }
+
+    :ok = Tightbeam.Assignments.release_cannot_proceed_in_txn(txn, fact)
+
+    EventLog.lifecycle_in_txn(
+      txn,
+      "condition_fact_filed",
+      to_string(fact_id),
+      "kind=#{kind} scope=#{scope || "nil"} by=#{origin}"
+    )
 
     DB.record_row_commit(txn, condition_transition(fact, owner_user_id))
     fact
@@ -284,8 +294,7 @@ defmodule Tightbeam.ConditionFacts do
              key = Map.get(input, :idempotency_key)
              origin = Map.fetch!(input, :origin)
 
-             prior =
-               if is_binary(key), do: Idempotency.get_in_txn(txn, origin, "condition", key)
+             prior = if is_binary(key), do: Idempotency.get_in_txn(txn, origin, "condition", key)
 
              outcome =
                if prior do
@@ -309,8 +318,7 @@ defmodule Tightbeam.ConditionFacts do
                  {result, false}
                else
                  # Typed semantic replay can return an existing fact without a wire key.
-                 [[before_id]] =
-                   Txn.q(txn, "SELECT COALESCE(MAX(id), 0) FROM condition_facts")
+                 [[before_id]] = Txn.q(txn, "SELECT COALESCE(MAX(id), 0) FROM condition_facts")
 
                  case file_in_txn(txn, input) do
                    %{fact_id: fact_id} = fact ->

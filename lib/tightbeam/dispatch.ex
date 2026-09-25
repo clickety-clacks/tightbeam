@@ -123,23 +123,10 @@ defmodule Tightbeam.Dispatch do
     end
   end
 
-  # The replay/terminal hoist is the one structural change: for an assign or
-  # dispatch, the idempotency replay lookup and the terminal guard are resolved
-  # before the rail so both the guard and Rules.decide see the replay outcome.
+  # Assignment idempotency is resolved before the rail so both the guard and
+  # Rules.decide see the replay outcome.
   defp bracket_precheck(db, call, verb) when verb in ["assign", "dispatch"] do
     Assignments.dispatch_precheck(db, call)
-  end
-
-  defp bracket_precheck(
-         db,
-         %{terminal_surrender: true, principal: {:session, holder}, params: params},
-         "attest"
-       ) do
-    case Assignments.terminal_surrender_precheck(db, params.assignment_id, holder) do
-      :proceed -> :proceed
-      {:replay, result} -> {:terminal_replay, result}
-      {:refuse, error} -> {:refuse, error}
-    end
   end
 
   defp bracket_precheck(_db, _call, _verb), do: :proceed
