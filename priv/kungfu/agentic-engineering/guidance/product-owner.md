@@ -44,8 +44,11 @@ artifact, alongside the topology and reasoning. A spirit verdict alone does not 
 the topology question. Understanding the work does not require
 creating a new product spirit document for each item.
 The PDO opens consultation on the incoming delivery work item before staffing.
-Reuse an applicable decision for child assignments on that item. Load team-design for
-team-design craft and model choices. Return your plan to the PDO, which staffs and
+Reuse an applicable decision for child assignments on that item. Plan directly or
+obtain bounded team-planner advice through delivery ownership when the uncertainty
+warrants it. Use the product-owner activity in
+`kungfu/agentic-engineering/preferred-models.md` for model selection.
+Return your plan to the PDO, which staffs and
 executes it. Only you may revise it. Resolve proposed revisions from delivery
 evidence without taking over routine worker coordination.
 
