@@ -6972,6 +6972,22 @@ defmodule Tightbeam.GatewayTest do
     )
   end
 
+  # Error fidelity (wi_3b4a20ce): an open adapter circuit tells the caller why it
+  # opened -- count, dying generation and redacted exit -- through the real runner,
+  # lifecycle record and health observation, never the raw secret.
+  @tag :cold_gateway
+  @tag :gateway_checkout_refusal
+  @tag :tmp_dir
+  test "a degraded checkout names the circuit's failure count and redacted cause", ctx do
+    File.write!(Path.join(ctx.tmp_dir, "checkout-case.txt"), "degraded-cause")
+
+    Tightbeam.GuardRuntimeFixture.run!(
+      ctx.tmp_dir,
+      "live_base_gateway_checkout_refusal.exs",
+      "guarded-gateway-checkout-refusal: ok"
+    )
+  end
+
   # AC6 / I7 (spec 1ae8fa52 §O6), the r4.2 narrowing guard: I7 refuses ONLY on `:missing`
   # (the credential store AFFIRMATIVELY answering "absent"), NEVER on the wildcard
   # `{:needs_onboarding, _}`. The `:credential_server_unavailable` transient means "could

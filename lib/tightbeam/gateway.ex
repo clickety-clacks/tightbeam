@@ -3545,6 +3545,21 @@ defmodule Tightbeam.Gateway do
     )
   end
 
+  # The coordinator names why the circuit opened; the refusal carries its count and
+  # the last failure's redacted evidence so a caller need not read /version to learn it.
+  defp degraded_sentence(session, node) do
+    "adapter for #{session.harness}/#{session.identity_name} on host #{session.host} is degraded " <>
+      degraded_detail(node) <> "; see /version"
+  end
+
+  defp degraded_detail(%{"consecutiveFailures" => failures, "cause" => cause}),
+    do: "after #{failures} consecutive failures (last failure: #{JSON.encode!(cause)})"
+
+  defp degraded_detail(%{"consecutiveFailures" => failures}),
+    do: "after #{failures} consecutive failures (last failure unknown)"
+
+  defp degraded_detail(_node), do: "(host unreachable or adapter failing; cause unknown)"
+
   defp checkout_adapter(session, config) do
     key = {Harness.parse!(session.harness).id(), "shared", session.host}
     coordinator = Map.get(config, :adapter_coordinator, Tightbeam.AdapterCoordinator)
@@ -3554,9 +3569,10 @@ defmodule Tightbeam.Gateway do
         {:ok, adapter, generation}
 
       {:error, :degraded} ->
-        {:error,
-         "adapter for #{session.harness}/#{session.identity_name} on host #{session.host} is degraded " <>
-           "(host unreachable or adapter failing); see /version"}
+        {:error, degraded_sentence(session, nil)}
+
+      {:error, {:diagnosed, :degraded, node}} ->
+        {:error, degraded_sentence(session, node)}
 
       {:error, {:parked, detail}} ->
         {:error,

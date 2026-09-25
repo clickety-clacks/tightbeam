@@ -5,7 +5,7 @@ defmodule Tightbeam.Harness.Codex do
   require Logger
 
   alias Tightbeam.Harness.Support
-  alias Tightbeam.{Model, Placement}
+  alias Tightbeam.{ErrorDiagnostic, Model, Placement}
 
   @adapter_version "1.12.0"
   @adapter_package "codex-acp"
@@ -562,16 +562,39 @@ defmodule Tightbeam.Harness.Codex do
   # repair it would imply (re-onboard) is both wrong and destructive of a working
   # login. The extraction step exits on a distinct code per state so the three
   # cannot collapse into one opaque failure.
+  #
+  # The classification rests entirely on the exit status, so the status and the
+  # probe's (redacted) output ride beside it: a misclassification stays
+  # diagnosable. `ErrorDiagnostic.classified/1` recovers the bare class.
   defp classify_extraction(
-         {:error, {:probe_failed, 69, _output}},
-         :subscription,
-         _auth,
-         {:bound, path}
-       ),
-       do: {:error, {:codex_path_unusable, path}}
+         {:error, {:probe_failed, status, output}} = result,
+         kind,
+         auth,
+         executable
+       ) do
+    case extraction_class(status, kind, auth, executable) do
+      nil ->
+        result
 
-  defp classify_extraction({:error, {:probe_failed, 66, _output}}, _kind, auth, _executable),
-    do: {:error, {:missing_credential, auth}}
+      class ->
+        evidence =
+          ErrorDiagnostic.new("probe_failed",
+            operation: "codex_credential_extraction",
+            origin: "catalog_probe",
+            exit_status: status,
+            output: output
+          )
+
+        {:error, ErrorDiagnostic.diagnosed(class, evidence)}
+    end
+  end
+
+  defp classify_extraction(result, _kind, _auth, _executable), do: result
+
+  defp extraction_class(69, :subscription, _auth, {:bound, path}),
+    do: {:codex_path_unusable, path}
+
+  defp extraction_class(66, _kind, auth, _executable), do: {:missing_credential, auth}
 
   # 75 is structurally near-impossible on an api-key host, and the branch stays
   # anyway. A torn read needs a concurrent in-place REWRITER, and an API key has
@@ -579,34 +602,19 @@ defmodule Tightbeam.Harness.Codex do
   # same fact that removes codex's shared-runtime anchor on such a host. A
   # hand-run `codex login` is still a writer, so the state stays reachable and
   # stays retryable.
-  defp classify_extraction(
-         {:error, {:probe_failed, 75, _output}},
-         _kind,
-         _auth,
-         _executable
-       ),
-       do: {:error, {:credential_read_torn, :retry_next_refresh}}
+  defp extraction_class(75, _kind, _auth, _executable),
+    do: {:credential_read_torn, :retry_next_refresh}
 
   # The 67 reason names the field the host was supposed to hold. An api-key host
   # has no `access_token` to be missing, and saying it did would send the
   # operator hunting the wrong key in the right file.
-  defp classify_extraction(
-         {:error, {:probe_failed, 67, _output}},
-         :subscription,
-         auth,
-         _executable
-       ),
-       do: {:error, {:credential_missing_access_token, auth}}
+  defp extraction_class(67, :subscription, auth, _executable),
+    do: {:credential_missing_access_token, auth}
 
-  defp classify_extraction(
-         {:error, {:probe_failed, 67, _output}},
-         :api_key,
-         auth,
-         _executable
-       ),
-       do: {:error, {:credential_missing_api_key, auth}}
+  defp extraction_class(67, :api_key, auth, _executable),
+    do: {:credential_missing_api_key, auth}
 
-  defp classify_extraction(result, _kind, _auth, _executable), do: result
+  defp extraction_class(_status, _kind, _auth, _executable), do: nil
 
   # `client_version` is a SILENT filter ON THIS BRANCH ONLY: every model carries
   # a `minimal_client_version` and the account route drops the ones the caller is

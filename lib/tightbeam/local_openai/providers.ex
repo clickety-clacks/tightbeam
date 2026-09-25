@@ -1,6 +1,7 @@
 defmodule Tightbeam.LocalOpenAi.Providers do
   @moduledoc false
 
+  alias Tightbeam.ErrorDiagnostic
   alias Tightbeam.Harness.Support
 
   @reserved_names ~w(opencode-go)
@@ -214,10 +215,21 @@ defmodule Tightbeam.LocalOpenAi.Providers do
   # The remote command must never put a descriptor in the error tuple. A failed
   # parser can leave stdout populated in a test double or in a shell diagnostic,
   # and that output may contain the provider's apiKey.
+  #
+  # Every other reason is Tightbeam's own text (a decode or shape refusal of the
+  # already-redacted record, a timeout) or a transport failure term. Neither is
+  # remote stdout, so it is kept, redacted, instead of erased.
   defp redaction_failure({:exit, status, _output}), do: {:exit, status}
   defp redaction_failure({:error, reason}) when is_atom(reason), do: reason
   defp redaction_failure(reason) when is_atom(reason), do: reason
-  defp redaction_failure(_reason), do: :redaction_failed
+  # remote_run already reduced its transport reason.
+  defp redaction_failure({:transport, _reduced} = reason), do: reason
+  defp redaction_failure(reason) when is_binary(reason), do: ErrorDiagnostic.redact_text(reason)
+
+  defp redaction_failure({:transport_exception, message}) when is_binary(message),
+    do: {:transport_exception, ErrorDiagnostic.redact_text(message)}
+
+  defp redaction_failure(reason), do: ErrorDiagnostic.encode_term(reason)
 
   defp remote_node(target, ssh) do
     configured =

@@ -341,6 +341,50 @@ defmodule Tightbeam.LocalOpenAiRuntimeTest do
     refute inspect(result) =~ secret
   end
 
+  test "remote provider refusals that are not stdout keep their reason" do
+    remote = fn redactor ->
+      %{
+        base_dir: "/remote/tightbeam",
+        options: %{
+          find_executable: fn "ssh" -> "/usr/bin/ssh" end,
+          sh: fn command ->
+            joined = Enum.join(command, " ")
+
+            cond do
+              String.contains?(joined, "/bin/ls -1") -> {"spark.json\n", 0}
+              String.contains?(joined, "/bin/test") -> {"", 0}
+              String.contains?(joined, "JSON.parse") -> redactor.()
+              true -> {"", 0}
+            end
+          end
+        },
+        host_config: %{ssh: "fixture@remote", base_dir: "/remote/tightbeam"}
+      }
+    end
+
+    # The redacted record decodes but fails its shape check: the refusal is
+    # Tightbeam's own sentence and names the field.
+    empty_endpoint = fn ->
+      {~s({"name":"spark","type":"local-openai","endpoint":""}) <>
+         "\n__TIGHTBEAM_API_KEY_ABSENT__\n", 0}
+    end
+
+    assert {:error, {:remote_provider_read_failed, "spark", reason}} =
+             Providers.read_all_target(remote.(empty_endpoint))
+
+    assert reason ==
+             "the local-openai provider record at /remote/tightbeam/auth/pi-local/providers/spark.json is invalid: endpoint is empty"
+
+    # A transport exception keeps its message instead of becoming a bare atom.
+    raised = fn -> raise "ssh transport broke for sk-fixture-SENTINEL-0123456789abcdef" end
+
+    assert {:error,
+            {:remote_provider_read_failed, "spark", {:transport, {:transport_exception, message}}}} =
+             Providers.read_all_target(remote.(raised))
+
+    assert message == "ssh transport broke for [REDACTED:token]"
+  end
+
   test "unproven local models receive conservative capabilities" do
     body = ~s({"data":[{"id":"mystery-model","max_model_len":8192}]})
     record = %{name: "lab", endpoint: "https://lab.example/v1", api_key: nil}

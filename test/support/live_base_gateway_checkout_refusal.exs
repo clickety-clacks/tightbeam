@@ -14,6 +14,7 @@ defmodule GuardCheckoutRefusal do
   alias Tightbeam.{
     ConnRegistry,
     DB,
+    ErrorDiagnostic,
     EventLog,
     Gateway,
     Ledger,
@@ -28,7 +29,7 @@ defmodule GuardCheckoutRefusal do
   def run do
     Tightbeam.GuardGatewayFixture.run!(fn %{base: base, db: db, config: config} ->
       mode = Path.join(Path.dirname(base), "checkout-case.txt") |> File.read!()
-      assert mode in ["missing", "fresh", "transient", "cursor", "pi-local"]
+      assert mode in ["missing", "fresh", "transient", "cursor", "pi-local", "degraded-cause"]
 
       {harness, provider, model} =
         if mode == "pi-local" do
@@ -60,7 +61,26 @@ defmodule GuardCheckoutRefusal do
 
           fn _key -> {:error, {:launch_refused, refusal}} end
         else
-          fn _key -> {:error, :degraded} end
+          if mode == "degraded-cause" do
+            # The coordinator's own shape: an open circuit carrying its count and the
+            # last death, whose raw text holds a synthetic secret.
+            cause =
+              ErrorDiagnostic.with_facts(
+                {:exit, "adapter died holding sk-fixture-SENTINEL-0123456789abcdef"},
+                generation: 4
+              )
+
+            node =
+              ErrorDiagnostic.new("circuit_open",
+                origin: "adapter_coordinator",
+                consecutive_failures: 5,
+                cause: cause
+              )
+
+            fn _key -> {:error, ErrorDiagnostic.diagnosed(:degraded, node)} end
+          else
+            fn _key -> {:error, :degraded} end
+          end
         end
 
       {:ok, coordinator} = CoordinatorStub.start_link({checkout, self()})
@@ -128,7 +148,8 @@ defmodule GuardCheckoutRefusal do
                   "fresh" => "o6-pbu",
                   "transient" => "o6-transient",
                   "cursor" => "cursor-refusal-wire",
-                  "pi-local" => "o6-pi-local"
+                  "pi-local" => "o6-pi-local",
+                  "degraded-cause" => "degraded-cause"
                 },
                 mode
               )
@@ -290,6 +311,58 @@ defmodule GuardCheckoutRefusal do
     assert reason =~ "is degraded"
     refute reason =~ "tightbeam onboard"
     refute reason =~ "--as-user"
+  end
+
+  defp prove("degraded-cause", db, lane, exact_registry, runner) do
+    assert {_entries, :fresh} = ModelCatalog.get("testhost", "claude", ModelCatalog)
+
+    assert :appended =
+             Gateway.deliver_prompt("k1", "user:flynn", "hi",
+               db: db,
+               conn_registry: exact_registry,
+               lane_manager: lane,
+               device_id: "degraded-cause",
+               client_message_id: "c_degraded_cause"
+             )
+
+    assert {:ok, turn} = Ledger.claim_next(db, "k1", "test")
+
+    assert {:error, %{reason: reason, terminal_publish: publish, record_in_txn: record}} =
+             runner.(Map.put(turn, :session_key, "k1"))
+
+    # The caller learns why the circuit opened without reading /version: the count,
+    # the generation that died and its redacted exit reason.
+    assert reason =~ "on host testhost is degraded after 5 consecutive failures"
+    assert reason =~ ~s("generation":4)
+    assert reason =~ "adapter died holding [REDACTED:token]"
+    refute reason =~ "SENTINEL"
+
+    assert {:ok, true} =
+             DB.transaction(db, fn txn ->
+               assert Ledger.finish_in_txn(txn, turn.seq, "failed", reason)
+               record.(txn)
+               true
+             end)
+
+    publish.("failed")
+
+    lifecycle =
+      Enum.find(EventLog.lifecycle_events(db), fn event ->
+        event.kind == "harness_turn_error" and event.subject == "k1"
+      end)
+
+    assert lifecycle.detail =~ "consecutive failures"
+    refute lifecycle.detail =~ "SENTINEL"
+
+    # Health still classifies the refusal as an adapter fault.
+    assert {:ok, [[failure_class, cause]]} =
+             DB.query(
+               db,
+               "SELECT failureClass, cause FROM harness_health_observations WHERE sessionKey = 'k1' ORDER BY observedAt DESC LIMIT 1"
+             )
+
+    assert failure_class == "adapter_unavailable"
+    refute cause =~ "SENTINEL"
   end
 
   defp prove("transient", db, lane, exact_registry, runner) do

@@ -744,13 +744,26 @@ defmodule Tightbeam.AdapterCoordinatorTest do
              1_500
            )
 
-    assert {:error, :degraded} =
+    # The refusal names why the circuit opened: its count and the last death,
+    # attributed to the generation that died.
+    assert {:error,
+            {:diagnosed, :degraded,
+             %{
+               "kind" => "circuit_open",
+               "origin" => "adapter_coordinator",
+               "consecutiveFailures" => refused_after,
+               "cause" => %{"generation" => died_generation} = cause
+             }}} =
              AdapterCoordinator.adapter_for(coordinator, {:claude, "default", "testhost"})
+
+    assert is_binary(cause["kind"])
+    assert is_integer(died_generation) and died_generation >= 1
 
     assert %{"claude:default@testhost" => %{consecutive_failures: failures}} =
              AdapterCoordinator.health(coordinator)
 
     assert failures >= 5
+    assert refused_after == failures
   end
 
   # THE INCIDENT TEST (2026-08-14). A latched circuit vetoed the credential
@@ -797,7 +810,8 @@ defmodule Tightbeam.AdapterCoordinatorTest do
 
     # An ordinary checkout is still refused -- the circuit keeps doing its real
     # job, which this change does not touch.
-    assert {:error, :degraded} = AdapterCoordinator.adapter_for(coordinator, key)
+    assert {:error, {:diagnosed, :degraded, %{"kind" => "circuit_open"}}} =
+             AdapterCoordinator.adapter_for(coordinator, key)
 
     # The credential lifecycle's call is NOT refused. Before the fix this
     # returned {:error, :degraded}, which is the entire deadlock.
@@ -1011,7 +1025,14 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     # public checkout must not observe a generation started by an automatic
     # restart while the latch is open.
     refute wait_until(fn -> :atomics.get(boot_attempt, 1) > 1 end, 100)
-    assert {:error, :degraded} = AdapterCoordinator.adapter_for(coordinator, key)
+
+    assert {:error,
+            {:diagnosed, :degraded,
+             %{
+               "kind" => "circuit_open",
+               "consecutiveFailures" => 1,
+               "cause" => %{"generation" => 1}
+             }}} = AdapterCoordinator.adapter_for(coordinator, key)
 
     # Credential lifecycle recovery is the authoritative boundary: it may
     # start a replacement while ordinary checkout remains degraded.
@@ -1021,7 +1042,9 @@ defmodule Tightbeam.AdapterCoordinatorTest do
       end)
 
     assert_receive {:recovery_boot_started, readiness_task, [credential_kind: :subscription]}
-    assert {:error, :degraded} = AdapterCoordinator.adapter_for(coordinator, key)
+
+    assert {:error, {:diagnosed, :degraded, %{"consecutiveFailures" => 1}}} =
+             AdapterCoordinator.adapter_for(coordinator, key)
 
     send(readiness_task, {:release_recovery_boot, readiness_task})
     assert {:ok, recovery_adapter, 2} = Task.await(recovery)
