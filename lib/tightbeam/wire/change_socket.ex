@@ -4,11 +4,14 @@ defmodule Tightbeam.Wire.ChangeSocket do
   alias Tightbeam.Firehose.{Hub, Publisher}
   alias Tightbeam.StateVisibility
   alias Tightbeam.Devices
+  alias Tightbeam.Org
   @max_subscriptions 100
   @filter_keys ~w(classes sessionKey workItemId origin principal)
   defstruct phase: :unauthed,
             user_id: nil,
             device_id: nil,
+            principal_kind: nil,
+            principal_id: nil,
             credential_digest: nil,
             is_admin: false,
             subscriptions: %{},
@@ -38,12 +41,7 @@ defmodule Tightbeam.Wire.ChangeSocket do
     await_delivery_release(state, notice)
     Hub.delivered(hub(state), self())
 
-    if StateVisibility.visible?(
-         state.deps[:db],
-         notice,
-         state.user_id,
-         state.is_admin
-       ) do
+    if StateVisibility.visible?(state.deps[:db], notice, visibility_principal(state)) do
       try do
         push(notice, state)
       rescue
@@ -98,26 +96,51 @@ defmodule Tightbeam.Wire.ChangeSocket do
   defp authenticate(message, state) do
     token = string(message["token"])
 
-    case Devices.by_token(db(state), token) do
-      nil ->
-        known = Devices.by_id(db(state), string(message["deviceId"]))
+    cond do
+      token == Map.get(state.deps, :cli_token) ->
+        stop_with(auth_failure("org_token_read_forbidden"), 1008, state)
 
-        reason =
-          case known do
-            %{status: "pending"} -> "device_not_approved"
-            %{status: "allowlisted"} -> "token_revoked"
-            _ -> "auth_failed"
-          end
+      session = active_session(state, token) ->
+        :ok =
+          Hub.register(hub(state), self(), %{
+            mode: :filtered,
+            db: db(state),
+            user_id: session.owner_user_id,
+            principal_kind: :session,
+            principal_id: session.session_key,
+            is_admin: false
+          })
 
-        stop_with(auth_failure(reason), 1008, state)
+        state = %{
+          state
+          | phase: :live,
+            user_id: session.owner_user_id,
+            principal_kind: :session,
+            principal_id: session.session_key,
+            credential_digest: credential_digest(token),
+            is_admin: false
+        }
 
-      device ->
+        push(
+          %{
+            "type" => "auth_result",
+            "success" => true,
+            "sessionKey" => session.session_key,
+            "userId" => session.owner_user_id,
+            "isAdmin" => false
+          },
+          schedule_heartbeat(state)
+        )
+
+      device = Devices.by_token(db(state), token) ->
         :ok =
           Hub.register(hub(state), self(), %{
             mode: :filtered,
             db: db(state),
             user_id: device.user_id,
             device_id: device.device_id,
+            principal_kind: :user,
+            principal_id: device.user_id,
             is_admin: device.is_admin
           })
 
@@ -126,6 +149,8 @@ defmodule Tightbeam.Wire.ChangeSocket do
           | phase: :live,
             user_id: device.user_id,
             device_id: device.device_id,
+            principal_kind: :user,
+            principal_id: device.user_id,
             credential_digest: credential_digest(token),
             is_admin: device.is_admin
         }
@@ -139,6 +164,18 @@ defmodule Tightbeam.Wire.ChangeSocket do
           },
           schedule_heartbeat(state)
         )
+
+      true ->
+        known = Devices.by_id(db(state), string(message["deviceId"]))
+
+        reason =
+          case known do
+            %{status: "pending"} -> "device_not_approved"
+            %{status: "allowlisted"} -> "token_revoked"
+            _ -> "auth_failed"
+          end
+
+        stop_with(auth_failure(reason), 1008, state)
     end
   end
 
@@ -146,8 +183,8 @@ defmodule Tightbeam.Wire.ChangeSocket do
     id = message["subscriptionId"]
 
     cond do
-      message["protocolVersion"] != 1 ->
-        invalid("protocolVersion must be 1", state)
+      not canonical_subscribe_shape?(message) ->
+        invalid("subscribe contains an unsupported key", state)
 
       not (is_binary(id) and id != "") ->
         invalid("subscriptionId is required", state)
@@ -161,9 +198,15 @@ defmodule Tightbeam.Wire.ChangeSocket do
       true ->
         case normalize_filters(message["filters"]) do
           {:ok, filters} ->
-            :ok = Hub.subscribe(hub(state), self(), id, filters)
-            state = %{state | subscriptions: Map.put(state.subscriptions, id, filters)}
-            push(%{"type" => "subscription_ready", "subscriptionId" => id}, state)
+            case authorized_filters(state, filters) do
+              :ok ->
+                :ok = Hub.subscribe(hub(state), self(), id, filters)
+                state = %{state | subscriptions: Map.put(state.subscriptions, id, filters)}
+                push(%{"type" => "subscription_ready", "subscriptionId" => id}, state)
+
+              {:error, message} ->
+                invalid(message, state)
+            end
 
           :error ->
             invalid("invalid filters", state)
@@ -199,6 +242,24 @@ defmodule Tightbeam.Wire.ChangeSocket do
   end
 
   defp normalize_filters(_filters), do: :error
+
+  defp canonical_subscribe_shape?(message) do
+    Enum.all?(
+      Map.keys(message),
+      &(&1 in ["type", "protocolVersion", "subscriptionId", "filters"])
+    ) and
+      (not Map.has_key?(message, "protocolVersion") or message["protocolVersion"] == 1)
+  end
+
+  defp authorized_filters(%{principal_kind: :session, principal_id: session_key}, filters) do
+    if filters["sessionKey"] == session_key do
+      :ok
+    else
+      {:error, "sessionKey must match authenticated session"}
+    end
+  end
+
+  defp authorized_filters(_state, _filters), do: :ok
 
   defp schedule_heartbeat(state) do
     cancel_timer(state.heartbeat_timer)
@@ -237,19 +298,47 @@ defmodule Tightbeam.Wire.ChangeSocket do
   defp db(state), do: Map.get(state.deps, :db, Tightbeam.DB)
   defp heartbeat_ms(state), do: Map.get(state.deps, :firehose_heartbeat_ms, 15_000)
 
+  defp active_session(state, token) do
+    case Org.active_session_key_by_cli_token(db(state), token) do
+      nil -> nil
+      session_key -> Org.get(db(state), session_key)
+    end
+  end
+
   # The revocation notice is best-effort. Heartbeats also compare the exact
   # credential generation so a lost notice cannot leave a revoked socket live.
   defp credential_current?(state) do
-    case Devices.by_id(db(state), state.device_id) do
-      %{status: "allowlisted", token: token} when is_binary(token) ->
-        Plug.Crypto.secure_compare(credential_digest(token), state.credential_digest)
+    case state.principal_kind do
+      :session ->
+        case Org.get(db(state), state.principal_id) do
+          %{state: "active", cli_token: token} when is_binary(token) ->
+            Plug.Crypto.secure_compare(credential_digest(token), state.credential_digest)
 
-      _other ->
-        false
+          _other ->
+            false
+        end
+
+      _ ->
+        case Devices.by_id(db(state), state.device_id) do
+          %{status: "allowlisted", token: token} when is_binary(token) ->
+            Plug.Crypto.secure_compare(credential_digest(token), state.credential_digest)
+
+          _other ->
+            false
+        end
     end
   end
 
   defp credential_digest(token), do: :crypto.hash(:sha256, token)
+
+  defp visibility_principal(%{principal_kind: :session, principal_id: session_key}),
+    do: %{kind: "session", id: session_key}
+
+  defp visibility_principal(%{principal_kind: :user, principal_id: user_id, is_admin: is_admin}),
+    do: %{kind: "user", id: user_id, is_admin: is_admin}
+
+  defp visibility_principal(state),
+    do: %{kind: "user", id: state.user_id, is_admin: state.is_admin}
 
   defp await_delivery_release(state, notice) do
     case Map.get(state.deps, :firehose_delivery_barrier) do

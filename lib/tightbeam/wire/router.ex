@@ -352,7 +352,25 @@ defmodule Tightbeam.Wire.Router do
   end
 
   get "/api/sessions/:session_key" do
-    core_detail(conn, Map.fetch!(@core_detail_specs, :sessions), session_key)
+    session_detail(conn, session_key)
+  end
+
+  get "/api/sessions/:session_key/messages" do
+    session_collection(
+      conn,
+      session_key,
+      "transcript messages",
+      :query_messages_for_session,
+      :message
+    )
+  end
+
+  get "/api/sessions/:session_key/wakes" do
+    session_collection(conn, session_key, "wakes", :query_wakes_for_session, :wake)
+  end
+
+  get "/api/sessions/:session_key/turns" do
+    session_collection(conn, session_key, "turns", :query_turns_for_session, :turn)
   end
 
   get "/api/devices/:device_id" do
@@ -622,6 +640,197 @@ defmodule Tightbeam.Wire.Router do
       state_error(conn, spec.resource, 500, "projection_invalid", nil)
   end
 
+  defp session_collection(conn, session_key, resource, query_fun, serializer) do
+    with {:ok, auth} <- selected_session_auth(conn),
+         {:ok, request} <- decode_state_query(conn),
+         {:ok, principal} <- selected_session_principal(auth, request),
+         :ok <- session_collection_request(request, session_key),
+         session when not is_nil(session) <-
+           StateResources.query_session(db(conn), %{key: session_key, principal: principal}),
+         rows <- apply(StateResources, query_fun, [db(conn), session_key]),
+         items <- Enum.map(rows, &apply(StateResources, serializer, [&1])),
+         {:ok, page_items, page} <- state_session_page(items, request) do
+      body = %{
+        "schemaVersion" => 1,
+        "resource" => resource,
+        "items" => page_items,
+        "page" => page
+      }
+
+      state_send(conn, 200, JSON.encode!(body))
+    else
+      nil -> state_error(conn, resource, 404, "not_found", nil)
+      {:error, status, code, message} -> state_error(conn, resource, status, code, message)
+    end
+  rescue
+    _error in [ArgumentError, KeyError, MatchError] ->
+      state_error(conn, resource, 500, "projection_invalid", nil)
+  end
+
+  defp session_collection_request(query, session_key) do
+    valid_keys? =
+      Enum.all?(Map.keys(query), &(&1 in ["sessionKey", "limit", "after"]))
+
+    selected? = Map.get(query, "sessionKey", []) in [[], [session_key]]
+
+    if valid_keys? and selected?, do: :ok, else: {:error, 400, "invalid_filter", nil}
+  end
+
+  defp state_session_page(items, request) do
+    with {:ok, limit} <- session_collection_limit(Map.get(request, "limit", [])),
+         {:ok, offset} <- session_collection_offset(Map.get(request, "after", [])) do
+      page_items = items |> Enum.drop(offset) |> Enum.take(limit)
+      next_offset = offset + length(page_items)
+      has_more = next_offset < length(items)
+
+      {:ok, page_items,
+       %{
+         "oldestCursor" =>
+           if(offset > 0, do: Integer.to_string(max(offset - limit, 0)), else: nil),
+         "newestCursor" => if(page_items != [], do: Integer.to_string(next_offset), else: nil),
+         "hasMoreBefore" => offset > 0,
+         "hasMoreAfter" => has_more
+       }}
+    end
+  end
+
+  defp session_collection_limit([]), do: {:ok, 500}
+
+  defp session_collection_limit([value]) do
+    case Integer.parse(value) do
+      {limit, ""} when limit > 0 and limit <= 500 -> {:ok, limit}
+      _ -> {:error, 400, "invalid_limit", nil}
+    end
+  end
+
+  defp session_collection_limit(_), do: {:error, 400, "invalid_limit", nil}
+
+  defp session_collection_offset([]), do: {:ok, 0}
+
+  defp session_collection_offset([value]) do
+    case Integer.parse(value) do
+      {offset, ""} when offset >= 0 -> {:ok, offset}
+      _ -> {:error, 400, "invalid_cursor", nil}
+    end
+  end
+
+  defp session_collection_offset(_), do: {:error, 400, "invalid_cursor", nil}
+
+  defp session_detail(conn, session_key) do
+    spec = Map.fetch!(@core_detail_specs, :sessions)
+    started_at = System.monotonic_time(:microsecond)
+
+    with {:ok, auth} <-
+           core_detail_operation(conn, spec.resource, :bearer_auth, fn ->
+             selected_session_auth(conn)
+           end),
+         {:ok, query} <-
+           core_detail_operation(conn, spec.resource, :query_decode, fn ->
+             decode_state_query(conn)
+           end),
+         {:ok, principal} <-
+           core_detail_operation(
+             conn,
+             spec.resource,
+             :principal_resolution,
+             fn -> selected_session_principal(auth, query) end
+           ),
+         :ok <-
+           core_detail_operation(
+             conn,
+             spec.resource,
+             :request_validation,
+             fn -> selected_session_detail_request(query) end
+           ),
+         {:ok, key} <-
+           core_detail_operation(
+             conn,
+             spec.resource,
+             :key_decode,
+             fn -> core_detail_key(spec.resource, session_key) end
+           ),
+         :ok <- core_detail_probe(conn, spec.resource, :lookup),
+         row <-
+           core_detail_operation(
+             conn,
+             spec.resource,
+             :row_lookup,
+             fn ->
+               core_detail_row(conn, spec, key, core_detail_trace_principal(conn, principal))
+             end
+           ),
+         true <- not is_nil(row),
+         :ok <- core_detail_probe(conn, spec.resource, :schema),
+         :ok <- core_detail_probe(conn, spec.resource, :serializer),
+         item <- core_detail_serialize(conn, spec, row),
+         :ok <- core_detail_probe(conn, spec.resource, :encoder),
+         item_bytes <- core_detail_encode(conn, spec.resource, item),
+         :ok <- core_detail_probe(conn, spec.resource, :envelope) do
+      core_detail_trace(conn, {:envelope, spec.resource})
+      state_send(conn, 200, state_detail_envelope(spec.resource, item_bytes))
+    else
+      false -> state_not_found(conn, spec.resource, started_at)
+      {:error, :not_found} -> state_not_found(conn, spec.resource, started_at)
+      {:error, status, code, message} -> state_error(conn, spec.resource, status, code, message)
+    end
+  rescue
+    _error in [ArgumentError, KeyError, MatchError] ->
+      state_error(conn, "sessions", 500, "projection_invalid", nil)
+  end
+
+  defp selected_session_detail_request(query) do
+    cond do
+      Map.has_key?(query, "asUser") -> {:error, 400, "invalid_as_user", nil}
+      query == %{} -> :ok
+      true -> {:error, 400, "invalid_filter", nil}
+    end
+  end
+
+  defp selected_session_auth(conn) do
+    case bearer_token(conn) do
+      nil ->
+        {:error, 401, "auth_failed", nil}
+
+      token ->
+        cond do
+          token == deps(conn).cli_token ->
+            {:ok, :org}
+
+          session_key = Org.active_session_key_by_cli_token(db(conn), token) ->
+            {:ok, {:session, session_key}}
+
+          true ->
+            case Devices.by_token(db(conn), token) do
+              %{user_id: user_id, is_admin: is_admin} ->
+                {:ok, {:device, user_id, is_admin}}
+
+              nil ->
+                {:error, 401, "auth_failed", nil}
+            end
+        end
+    end
+  end
+
+  defp selected_session_principal(:org, _query) do
+    {:error, 403, "org_token_read_forbidden", nil}
+  end
+
+  defp selected_session_principal({:session, session_key}, query) do
+    if Map.has_key?(query, "asUser") do
+      {:error, 400, "invalid_as_user", nil}
+    else
+      {:ok, %{kind: "session", id: session_key, is_admin: false}}
+    end
+  end
+
+  defp selected_session_principal({:device, user_id, is_admin}, query) do
+    if Map.has_key?(query, "asUser") do
+      {:error, 400, "invalid_as_user", nil}
+    else
+      {:ok, %{kind: "user", id: user_id, is_admin: is_admin}}
+    end
+  end
+
   defp core_detail_serialize(conn, spec, row) do
     core_detail_trace(conn, {:serializer, spec.resource, spec.serializer})
     apply(StateResources, spec.serializer, [row])
@@ -699,11 +908,7 @@ defmodule Tightbeam.Wire.Router do
   defp core_detail_key(_resource, raw_key) when is_binary(raw_key), do: {:ok, raw_key}
 
   defp state_bearer_auth(conn) do
-    token =
-      case Plug.Conn.get_req_header(conn, "authorization") do
-        ["Bearer " <> token] when token != "" -> token
-        _ -> nil
-      end
+    token = bearer_token(conn)
 
     cond do
       is_nil(token) ->
@@ -712,8 +917,8 @@ defmodule Tightbeam.Wire.Router do
       token == deps(conn).cli_token ->
         {:ok, :org}
 
-      session = Org.by_cli_token(db(conn), token) ->
-        {:ok, {:session, session}}
+      session_key = Org.active_session_key_by_cli_token(db(conn), token) ->
+        {:ok, {:session, Org.get(db(conn), session_key)}}
 
       device = Devices.by_token(db(conn), token) ->
         {:ok, {:device, device}}
@@ -953,13 +1158,20 @@ defmodule Tightbeam.Wire.Router do
   end
 
   defp d1_bearer_auth(conn) do
-    case Plug.Conn.get_req_header(conn, "authorization") do
-      ["Bearer " <> token] when token != "" ->
+    case bearer_token(conn) do
+      token when is_binary(token) ->
         cond do
-          token == deps(conn).cli_token -> {:ok, :org}
-          session = Org.by_cli_token(db(conn), token) -> {:ok, {:session, session}}
-          device = Devices.by_token(db(conn), token) -> {:ok, {:device, device}}
-          true -> {:error, 401, "auth_failed", nil}
+          token == deps(conn).cli_token ->
+            {:ok, :org}
+
+          session_key = Org.active_session_key_by_cli_token(db(conn), token) ->
+            {:ok, {:session, Org.get(db(conn), session_key)}}
+
+          device = Devices.by_token(db(conn), token) ->
+            {:ok, {:device, device}}
+
+          true ->
+            {:error, 401, "auth_failed", nil}
         end
 
       _ ->
@@ -1275,6 +1487,13 @@ defmodule Tightbeam.Wire.Router do
   defp db(conn), do: deps(conn)[:db] || Tightbeam.DB
   defp handlers(conn), do: Map.fetch!(deps(conn), :handlers)
 
+  defp bearer_token(conn) do
+    case Plug.Conn.get_req_header(conn, "authorization") do
+      ["Bearer " <> token] when token != "" -> token
+      _ -> nil
+    end
+  end
+
   defp session_status(conn),
     do: deps(conn)[:session_status] || (&Tightbeam.Gateway.session_status/1)
 
@@ -1334,9 +1553,14 @@ defmodule Tightbeam.Wire.Router do
       end
 
     cond do
-      token == deps(conn).cli_token -> {:ok, :org}
-      session = token && Org.by_cli_token(db(conn), token) -> {:ok, {:session, session}}
-      true -> {:error, 401, "auth_failed", nil}
+      token == deps(conn).cli_token ->
+        {:ok, :org}
+
+      session_key = token && Org.active_session_key_by_cli_token(db(conn), token) ->
+        {:ok, {:session, Org.get(db(conn), session_key)}}
+
+      true ->
+        {:error, 401, "auth_failed", nil}
     end
   end
 

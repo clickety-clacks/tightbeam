@@ -121,7 +121,8 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
         | Command::Doctor { .. }
         | Command::GithubAuthCheck
         | Command::UpdateClients { .. }
-        | Command::Assimilate(_) => {
+        | Command::Assimilate(_)
+        | Command::SessionConnect { .. } => {
             Err("command does not dispatch through /agent/dispatch".to_owned())
         }
         Command::Wake {
@@ -1792,6 +1793,87 @@ pub fn send(request: &RequestSpec) -> Result<Option<Value>, String> {
     send_to(&endpoint, request)
 }
 
+pub(crate) enum SessionSendError {
+    Transport(String),
+    Response { code: String, message: String },
+}
+
+/// Send an ordinary wake while preserving the distinction between a transport
+/// failure (the gateway may have committed it) and a decoded gateway refusal.
+pub(crate) fn send_to_for_session(
+    endpoint: &Endpoint,
+    request: &RequestSpec,
+) -> Result<Option<Value>, SessionSendError> {
+    let call = gateway_request(
+        "POST",
+        endpoint,
+        request.path,
+        Some(Duration::from_secs(15)),
+    )
+    .set("content-type", "application/json")
+    .send_string(&request.body_json);
+
+    let (status, response) = match call {
+        Ok(response) => (response.status(), response),
+        Err(ureq::Error::Status(status, response)) => (status, response),
+        Err(ureq::Error::Transport(error)) => {
+            return Err(SessionSendError::Transport(error.to_string()));
+        }
+    };
+    let encoded = response
+        .into_string()
+        .map_err(|error| SessionSendError::Transport(error.to_string()))?;
+    parse_session_response(status, &encoded)
+}
+
+fn parse_session_response(status: u16, encoded: &str) -> Result<Option<Value>, SessionSendError> {
+    let json: Value = serde_json::from_str(encoded).map_err(|_| SessionSendError::Response {
+        code: "server_error".to_owned(),
+        message: "gateway returned an invalid response".to_owned(),
+    })?;
+
+    if !(200..300).contains(&status) {
+        return Err(session_gateway_error(json.get("error").unwrap_or(&json)));
+    }
+
+    if let Some(error) = json.get("error").filter(|error| !error.is_null()) {
+        return Err(session_gateway_error(error));
+    }
+
+    if let Some(pending) = json.get("decisionPending") {
+        return Err(SessionSendError::Response {
+            code: pending
+                .get("code")
+                .and_then(Value::as_str)
+                .unwrap_or("decision_pending")
+                .to_owned(),
+            message: pending
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("this action needs an owner decision")
+                .to_owned(),
+        });
+    }
+
+    Ok(json.get("result").cloned())
+}
+
+fn session_gateway_error(error: &Value) -> SessionSendError {
+    SessionSendError::Response {
+        code: error
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or("server_error")
+            .to_owned(),
+        message: error
+            .get("message")
+            .and_then(Value::as_str)
+            .filter(|message| !message.is_empty())
+            .unwrap_or("gateway refused the wake")
+            .to_owned(),
+    }
+}
+
 pub(crate) fn send_to(endpoint: &Endpoint, request: &RequestSpec) -> Result<Option<Value>, String> {
     send_to_with_deadline(endpoint, request, None)
 }
@@ -1956,6 +2038,14 @@ pub(crate) fn parse_response(status: u16, encoded: &str) -> Result<Option<Value>
 }
 
 pub fn run(command: Command) -> Result<(), String> {
+    if let Command::SessionConnect {
+        identity,
+        session_key,
+    } = command
+    {
+        return crate::session_connect::run(session_key, identity);
+    }
+
     // `tool-call-observed` carries no identity flag, so it is not in
     // `command_identity`; it is nonetheless a session call and only a session
     // call, and saying so here makes a run from outside a workdir fail with the
@@ -2179,6 +2269,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::Tune { identity, .. }
         | Command::SessionReparent { identity, .. }
         | Command::SessionPoSet { identity, .. }
+        | Command::SessionConnect { identity, .. }
         | Command::Assign { identity, .. }
         | Command::Dispatch { identity, .. }
         | Command::EffortRule { identity, .. }
@@ -4741,6 +4832,23 @@ mod tests {
             parse_response(403, r#"{"error":{"code":"denied","message":"no"}}"#),
             Err("denied: no".to_owned())
         );
+    }
+
+    #[test]
+    fn session_wake_response_preserves_the_gateway_refusal_code_and_message() {
+        let refusal = parse_session_response(
+            403,
+            r#"{"error":{"code":"identity_not_yours","message":"selected session is not yours"}}"#,
+        )
+        .unwrap_err();
+
+        match refusal {
+            SessionSendError::Response { code, message } => {
+                assert_eq!(code, "identity_not_yours");
+                assert_eq!(message, "selected session is not yours");
+            }
+            _ => panic!("expected structured gateway refusal"),
+        }
     }
 
     #[test]

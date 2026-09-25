@@ -18,6 +18,7 @@ mod preflight;
 mod probe;
 mod process_tree;
 mod rail_action;
+mod session_connect;
 mod users;
 
 fn main() {
@@ -175,7 +176,7 @@ fn main() {
         Ok(command) => {
             if let Err(error) = dispatch::run(command) {
                 eprintln!("{error}");
-                std::process::exit(1);
+                std::process::exit(session_connect::exit_status(&error).unwrap_or(1));
             }
         }
         Err(error) => {

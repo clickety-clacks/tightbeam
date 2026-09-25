@@ -4341,6 +4341,19 @@ defmodule Tightbeam.Wakes do
     Enum.map(rows, &to_wake/1)
   end
 
+  @doc "All wakes targeting one session, in stable creation order."
+  @spec list_for_session(db(), String.t()) :: [wake()]
+  def list_for_session(db \\ Tightbeam.DB, session_key) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        select_wake_sql() <> " WHERE sessionKey = ?1 ORDER BY createdAt ASC, wakeId ASC",
+        [session_key]
+      )
+
+    Enum.map(rows, &to_wake/1)
+  end
+
   @doc "Count pending wakes resolved to a session key."
   @spec pending_count(db(), String.t()) :: non_neg_integer()
   def pending_count(db \\ Tightbeam.DB, session_key) do

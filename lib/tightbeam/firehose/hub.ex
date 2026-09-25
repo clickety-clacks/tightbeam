@@ -11,6 +11,8 @@ defmodule Tightbeam.Firehose.Hub do
               db: nil,
               user_id: nil,
               device_id: nil,
+              principal_kind: nil,
+              principal_id: nil,
               is_admin: false,
               subscriptions: %{},
               seq: 0,
@@ -61,7 +63,21 @@ defmodule Tightbeam.Firehose.Hub do
       {:reply, :ok, state}
     else
       socket = state.sockets[pid] || %Socket{monitor: Process.monitor(pid)}
-      socket = struct(socket, Map.take(opts, [:mode, :db, :user_id, :device_id, :is_admin]))
+
+      socket =
+        struct(
+          socket,
+          Map.take(opts, [
+            :mode,
+            :db,
+            :user_id,
+            :device_id,
+            :principal_kind,
+            :principal_id,
+            :is_admin
+          ])
+        )
+
       {:reply, :ok, put_in(state.sockets[pid], socket)}
     end
   end
@@ -137,8 +153,7 @@ defmodule Tightbeam.Firehose.Hub do
   end
 
   defp deliver_visible_notice(socket, pid, notice, limit) do
-    if not secret_payload?(notice["payload"]) and
-         StateVisibility.visible?(socket.db, notice, socket.user_id, socket.is_admin) do
+    if not secret_payload?(notice["payload"]) and visible?(socket, notice) do
       {frames, seq} =
         if socket.mode == :all,
           do: {[notice], socket.seq},
@@ -174,13 +189,7 @@ defmodule Tightbeam.Firehose.Hub do
         socket = %{socket | queue: queue, queued: socket.queued - 1}
 
         cond do
-          socket.mode == :pending or
-              not StateVisibility.visible?(
-                socket.db,
-                frame,
-                socket.user_id,
-                socket.is_admin
-              ) ->
+          socket.mode == :pending or not visible?(socket, frame) ->
             dispatch_next(socket, pid)
 
           true ->
@@ -236,10 +245,27 @@ defmodule Tightbeam.Firehose.Hub do
   defp revoked?(%{"class" => "session.retired"} = notice, socket) do
     payload = notice["payload"] || %{}
     refs = notice["refs"] || %{}
-    payload["ownerUserId"] == socket.user_id or refs["ownerUserId"] == socket.user_id
+
+    if socket.principal_kind == :session do
+      refs["sessionKey"] == socket.principal_id or payload["sessionKey"] == socket.principal_id
+    else
+      payload["ownerUserId"] == socket.user_id or refs["ownerUserId"] == socket.user_id
+    end
   end
 
   defp revoked?(_notice, _socket), do: false
+
+  defp visible?(%{principal_kind: :session, principal_id: session_key, db: db}, notice),
+    do: StateVisibility.visible?(db, notice, %{kind: "session", id: session_key})
+
+  defp visible?(
+         %{principal_kind: :user, principal_id: user_id, db: db, is_admin: is_admin},
+         notice
+       ),
+       do: StateVisibility.visible?(db, notice, user_id, is_admin)
+
+  defp visible?(socket, notice),
+    do: StateVisibility.visible?(socket.db, notice, socket.user_id, socket.is_admin)
 
   defp secret_payload?(payload) when is_map(payload) do
     Enum.any?(payload, fn {key, value} ->

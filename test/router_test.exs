@@ -182,6 +182,53 @@ defmodule Tightbeam.Wire.RouterTest do
     }
   end
 
+  test "selected session REST routes use only the credential-derived read principal", ctx do
+    session = create_session(ctx.db, "selected-session", ctx.device.user_id)
+    other = create_session(ctx.db, "other-session", ctx.device.user_id)
+
+    catalog = %{
+      {"testhost", "claude"} => [
+        %{family: "fable", context: nil, efforts: ["medium"], provider: :anthropic}
+      ]
+    }
+
+    opts = ctx.opts ++ [model_catalog: catalog]
+
+    request = fn path, token ->
+      conn(:get, path)
+      |> put_req_header("authorization", "Bearer " <> token)
+      |> Router.call(Router.init(opts))
+    end
+
+    for suffix <- ["", "/messages", "/wakes", "/turns"] do
+      path = "/api/sessions/#{session.session_key}#{suffix}"
+      denied = request.(path, "tbc_test")
+      attributed = request.(path <> "?asUser=#{ctx.device.user_id}", "tbc_test")
+
+      assert denied.status == 403
+      assert attributed.status == 403
+      assert JSON.decode!(denied.resp_body)["error"]["code"] == "org_token_read_forbidden"
+      refute denied.resp_body =~ session.session_key
+    end
+
+    own = request.("/api/sessions/#{session.session_key}", session.cli_token)
+    assert own.status == 200
+    assert JSON.decode!(own.resp_body)["item"]["sessionKey"] == session.session_key
+
+    foreign = request.("/api/sessions/#{other.session_key}", session.cli_token)
+    assert foreign.status == 404
+    refute foreign.resp_body =~ other.session_key
+
+    messages =
+      request.(
+        "/api/sessions/#{session.session_key}/messages?sessionKey=#{session.session_key}",
+        ctx.device.token
+      )
+
+    assert messages.status == 200
+    assert JSON.decode!(messages.resp_body)["resource"] == "transcript messages"
+  end
+
   test "core device detail preserves authorization order and canonical envelope", ctx do
     opts = ctx.opts ++ [model_catalog: %{}]
 
@@ -447,12 +494,19 @@ defmodule Tightbeam.Wire.RouterTest do
 
       assert get_resp_header(missing, "cache-control") == ["no-store"]
 
-      for {query, token, status, code} <- [
-            {"?bad=%ZZ", "invalid", 401, "auth_failed"},
-            {"?bad=%ZZ", ctx.device.token, 400, "malformed_query"},
-            {"?filter=unknown", ctx.device.token, 400, "invalid_filter"},
-            {"?asUser=flynn&asUser=other", "tbc_test", 400, "invalid_as_user"}
-          ] do
+      invalid_requests =
+        [
+          {"?bad=%ZZ", "invalid", 401, "auth_failed"},
+          {"?bad=%ZZ", ctx.device.token, 400, "malformed_query"},
+          {"?filter=unknown", ctx.device.token, 400, "invalid_filter"}
+        ] ++
+          if resource == "sessions" do
+            [{"?asUser=flynn&asUser=other", "tbc_test", 403, "org_token_read_forbidden"}]
+          else
+            [{"?asUser=flynn&asUser=other", "tbc_test", 400, "invalid_as_user"}]
+          end
+
+      for {query, token, status, code} <- invalid_requests do
         refusal = request.(url <> query, token, guarded)
         assert refusal.status == status
         assert JSON.decode!(refusal.resp_body)["error"]["code"] == code
