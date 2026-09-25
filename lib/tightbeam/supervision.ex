@@ -1844,7 +1844,8 @@ defmodule Tightbeam.Supervision do
             # gets armed: the deadline path (liveness_cycle -> claim_due_in_txn)
             # joins entitlements, assignments and sessions and never reads
             # supervision_watermarks, so whichever site inserts the armed row,
-            # the next tick claims it with no new terminal required. The sibling
+            # that path can claim it once it comes due and is otherwise
+            # eligible, with no new terminal required. The sibling
             # branches below have relied on that all along — :not_due watermarks
             # an obligation that is still owed its prod.
             #
