@@ -92,6 +92,13 @@ defmodule Tightbeam.HarnessAdapterPatchTest do
     assert hook_result(handler, base, "session-A", transcript) == %{}
     assert :ok = CodexIdentity.verify_hook(target, "session-A")
 
+    File.write!(transcript, "{unreadable rollout row\n", [:append])
+
+    assert get_in(hook_result(handler, base, "session-A", transcript), [
+             "hookSpecificOutput",
+             "additionalContext"
+           ]) == snapshot_a
+
     File.rm!(transcript)
 
     assert get_in(hook_result(handler, base, "session-A", transcript), [
