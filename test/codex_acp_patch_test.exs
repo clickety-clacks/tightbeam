@@ -11,6 +11,12 @@ defmodule Tightbeam.HarnessAdapterPatchTest do
 
     assert :ok = CodexIdentity.project(target, "session-A", guidance_a)
     assert :ok = CodexIdentity.project(target, "session-B", guidance_b)
+    snapshot_a = CodexIdentity.superseding_snapshot(guidance_a)
+    snapshot_b = CodexIdentity.superseding_snapshot(guidance_b)
+
+    assert snapshot_a =~ "supersedes every earlier Tightbeam identity snapshot"
+    assert snapshot_a =~ "Earlier Tightbeam identity clauses absent below are no longer active"
+    assert snapshot_a =~ guidance_a
 
     rails = JSON.encode!(%{"hooks" => %{"PreToolUse" => [%{"hooks" => []}]}})
     settings = CodexIdentity.hook_settings(rails) |> JSON.decode!()
@@ -21,14 +27,14 @@ defmodule Tightbeam.HarnessAdapterPatchTest do
     assert hook_result(handler, base, "session-A") == %{
              "hookSpecificOutput" => %{
                "hookEventName" => "SessionStart",
-               "additionalContext" => guidance_a
+               "additionalContext" => snapshot_a
              }
            }
 
     assert hook_result(handler, base, "session-B") == %{
              "hookSpecificOutput" => %{
                "hookEventName" => "SessionStart",
-               "additionalContext" => guidance_b
+               "additionalContext" => snapshot_b
              }
            }
 
@@ -37,6 +43,49 @@ defmodule Tightbeam.HarnessAdapterPatchTest do
 
     assert Bitwise.band(File.stat!(Path.join([base, "codex-context", "session-A"])).mode, 0o777) ==
              0o600
+  end
+
+  test "a persisted delivered snapshot suppresses an unchanged resume but a revision injects" do
+    base = scratch_dir()
+    target = %{base_dir: base, host_config: %{base_dir: base, ssh: nil}}
+
+    [handler] =
+      CodexIdentity.hook_settings(nil)
+      |> JSON.decode!()
+      |> get_in(["hooks", "SessionStart", Access.at(0), "hooks"])
+
+    transcript = Path.join(base, "rollout.jsonl")
+    assert :ok = CodexIdentity.project(target, "session-A", "rule A\nremoved rule")
+    snapshot_a = CodexIdentity.superseding_snapshot("rule A\nremoved rule")
+
+    assert get_in(hook_result(handler, base, "session-A", transcript), [
+             "hookSpecificOutput",
+             "additionalContext"
+           ]) == snapshot_a
+
+    File.write!(transcript, delivered_row(snapshot_a))
+    assert hook_result(handler, base, "session-A", transcript) == %{}
+
+    assert :ok = CodexIdentity.project(target, "session-A", "rule B")
+    snapshot_b = CodexIdentity.superseding_snapshot("rule B")
+
+    assert get_in(hook_result(handler, base, "session-A", transcript), [
+             "hookSpecificOutput",
+             "additionalContext"
+           ]) == snapshot_b
+
+    refute snapshot_b =~ "removed rule"
+
+    File.write!(transcript, delivered_row(snapshot_b), [:append])
+    assert hook_result(handler, base, "session-A", transcript) == %{}
+    assert :ok = CodexIdentity.verify_hook(target, "session-A")
+
+    File.rm!(transcript)
+
+    assert get_in(hook_result(handler, base, "session-A", transcript), [
+             "hookSpecificOutput",
+             "additionalContext"
+           ]) == snapshot_b
   end
 
   test "missing or oversized Codex developer carrier stops before a model turn" do
@@ -130,8 +179,27 @@ defmodule Tightbeam.HarnessAdapterPatchTest do
     end
   end
 
-  defp hook_result(handler, base, session_id) do
-    input = JSON.encode!(%{session_id: session_id, hook_event_name: "SessionStart"})
+  defp delivered_row(snapshot) do
+    JSON.encode!(%{
+      type: "response_item",
+      payload: %{
+        type: "message",
+        role: "developer",
+        content: [%{type: "input_text", text: snapshot}],
+        internal_chat_message_metadata_passthrough: %{
+          content_item_kinds: ["hooks.additional_context"]
+        }
+      }
+    }) <> "\n"
+  end
+
+  defp hook_result(handler, base, session_id, transcript_path \\ nil) do
+    input =
+      JSON.encode!(%{
+        session_id: session_id,
+        hook_event_name: "SessionStart",
+        transcript_path: transcript_path
+      })
 
     command =
       "printf '%s' #{Tightbeam.Harness.Support.shell_quote(input)} | #{handler["command"]}"

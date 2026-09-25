@@ -27,12 +27,14 @@ defmodule Tightbeam.Harness.CodexIdentity do
   @doc "Project the complete composed guidance before a Codex thread can run a turn."
   def project(target, session_id, guidance)
       when is_binary(session_id) and is_binary(guidance) do
+    snapshot = superseding_snapshot(guidance)
+
     with :ok <- valid_session_id(session_id),
-         :ok <- valid_guidance(guidance) do
+         :ok <- valid_guidance(snapshot) do
       if Support.local?(target) do
-        project_local(target.host_config.base_dir, session_id, guidance)
+        project_local(target.host_config.base_dir, session_id, snapshot)
       else
-        project_remote(target, session_id, guidance)
+        project_remote(target, session_id, snapshot)
       end
     end
   rescue
@@ -41,6 +43,20 @@ defmodule Tightbeam.Harness.CodexIdentity do
 
   def project(_target, _session_id, _guidance),
     do: {:error, {:codex_identity_projection_failed, "invalid session ID or guidance"}}
+
+  @doc "A complete current snapshot supersedes only earlier Tightbeam identity snapshots."
+  def superseding_snapshot(guidance) when is_binary(guidance) do
+    digest = Base.encode16(:crypto.hash(:sha256, guidance), case: :lower)
+
+    """
+    Tightbeam identity snapshot SHA-256: #{digest}
+    This complete current Tightbeam identity snapshot supersedes every earlier Tightbeam identity snapshot in this Codex thread. Earlier Tightbeam identity clauses absent below are no longer active. This statement applies only to Tightbeam-owned identity; it does not override higher-priority instructions, user authorization, unrelated developer instructions, or other product and security constraints.
+
+    <tightbeam-current-identity>
+    #{guidance}
+    </tightbeam-current-identity>
+    """
+  end
 
   @doc "The adapter gate must observe the hook, not just a successful model turn."
   def verify_hook(target, session_id) do
@@ -150,9 +166,25 @@ defmodule Tightbeam.Harness.CodexIdentity do
 
   defp hook_script do
     """
-    const fs=require("node:fs"),path=require("node:path"),crypto=require("node:crypto");
+    const fs=require("node:fs"),path=require("node:path"),crypto=require("node:crypto"),readline=require("node:readline");
     const fail=(why)=>process.stdout.write(JSON.stringify({continue:false,stopReason:"Tightbeam Codex developer instructions unavailable: "+why}));
-    try {
+    const previouslyDelivered=async(transcript,snapshot)=>{
+      if(typeof transcript!=="string"||!transcript) return false;
+      const stream=fs.createReadStream(transcript,{encoding:"utf8"});
+      const lines=readline.createInterface({input:stream,crlfDelay:Infinity});
+      try {
+        for await(const line of lines) {
+          let row;
+          try {row=JSON.parse(line);} catch(_) {continue;}
+          const item=row.type==="response_item"?row.payload:null;
+          const kinds=item?.internal_chat_message_metadata_passthrough?.content_item_kinds;
+          if(item?.role==="developer"&&Array.isArray(kinds)&&kinds.includes("hooks.additional_context")&&item.content?.some(part=>part.type==="input_text"&&part.text===snapshot)) return true;
+        }
+      } catch(_) {return false;}
+      finally {lines.close();stream.destroy();}
+      return false;
+    };
+    (async()=>{try {
       const event=JSON.parse(fs.readFileSync(0,"utf8"));
       const sid=event.session_id,base=process.env.TIGHTBEAM_HOME;
       if(typeof sid!=="string"||! /^[A-Za-z0-9_-]{1,128}$/.test(sid)||!base) fail("invalid session or home");
@@ -161,10 +193,12 @@ defmodule Tightbeam.Harness.CodexIdentity do
         if(bytes.length>#{@max_bytes}) fail("snapshot exceeds #{@max_bytes} bytes");
         else {
           fs.writeFileSync(path.join(base,"#{@relative_dir}",sid+".seen"),crypto.createHash("sha256").update(bytes).digest("hex"),{mode:0o600});
-          process.stdout.write(JSON.stringify({hookSpecificOutput:{hookEventName:"SessionStart",additionalContext:bytes.toString("utf8")}}));
+          const snapshot=bytes.toString("utf8");
+          if(await previouslyDelivered(event.transcript_path,snapshot)) process.stdout.write("{}");
+          else process.stdout.write(JSON.stringify({hookSpecificOutput:{hookEventName:"SessionStart",additionalContext:snapshot}}));
         }
       }
-    } catch(error) {fail(error.code||error.message||"snapshot missing");}
+    } catch(error) {fail(error.code||error.message||"snapshot missing");}})();
     """
     |> String.replace("\n", "")
   end
