@@ -163,6 +163,8 @@ defmodule Tightbeam.SessionPoAssociationsTest do
 
     refute expected =~ "adopt"
     refute expected =~ "amend"
+    refute expected =~ "recommend"
+    refute expected =~ "team shape"
     refute expected =~ "current parent"
     refute expected =~ "accountable PDO"
     refute expected =~ "staff"

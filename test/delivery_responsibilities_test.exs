@@ -117,6 +117,11 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
     assert %{code: "cross_scope_session"} =
              assign(db, {:session, "pdo-a"}, "lane-a", "wi_b1", true)
 
+    # A target in the item's actual scope must not mask that the claimant owns
+    # a different PO office for the same human.
+    assert %{code: "not_authorized"} =
+             assign(db, {:session, "pdo-a"}, "lane-b", "wi_b1", true)
+
     assert %{code: "cross_owner_scope"} =
              bind_scope(
                db,
