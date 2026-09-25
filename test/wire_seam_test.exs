@@ -25,7 +25,8 @@ defmodule Tightbeam.Wire.SeamTest do
     Gateway,
     Org,
     Roles,
-    Rules
+    Rules,
+    Wakes
   }
 
   alias Tightbeam.Wire.Router
@@ -58,6 +59,72 @@ defmodule Tightbeam.Wire.SeamTest do
         session_status: fn _ -> nil end
       ]
     }
+  end
+
+  test "authenticated wake cancellation crosses the wire with exact envelopes", ctx do
+    wake =
+      Wakes.schedule(ctx.db, %{
+        session_key: "wire-cancel",
+        origin: "user:flynn",
+        prompt: "cancel through the wire",
+        due_at: 1_000
+      })
+
+    wrong_origin =
+      Wakes.schedule(ctx.db, %{
+        session_key: "wire-cancel",
+        origin: "user:other",
+        prompt: "do not cancel through the wire",
+        due_at: 2_000
+      })
+
+    assert ok!(
+             dispatch_cli(ctx, "tbc_wire_seam", %{
+               verb: "wake",
+               asUser: "flynn",
+               params: %{"cancelWakeId" => wake.wake_id}
+             })
+           ) == %{"canceled" => true}
+
+    assert {:ok, [[event_id, causal_source_id]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT e.id, c.causalSourceId
+               FROM events e
+               JOIN wake_cancellations c ON c.causalSourceId=CAST(e.id AS TEXT)
+               WHERE c.wakeId=?1 AND e.kind='verb' AND e.verb='wake'
+               """,
+               [wake.wake_id]
+             )
+
+    assert event_id > 0
+    assert causal_source_id == Integer.to_string(event_id)
+
+    assert ok!(
+             dispatch_cli(ctx, "tbc_wire_seam", %{
+               verb: "wake",
+               asUser: "flynn",
+               params: %{"cancelWakeId" => wrong_origin.wake_id}
+             })
+           ) == %{"canceled" => false}
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wake_cancellations WHERE wakeId=?1",
+               [wake.wake_id]
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wake_cancellations WHERE wakeId=?1",
+               [wrong_origin.wake_id]
+             )
+
+    assert Wakes.get(ctx.db, wake.wake_id).state == "canceled"
+    assert Wakes.get(ctx.db, wrong_origin.wake_id).state == "pending"
   end
 
   test "authenticated session-po-set dispatch returns and inspects the exact association", ctx do
