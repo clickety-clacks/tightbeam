@@ -10,6 +10,8 @@ defmodule Tightbeam.EngineeringIdentityEvidence do
   @harnesses [:claude, :codex]
   @bundle_docs ~w(capabilities.md intake.md manifest.toml preferred-models.md)
 
+  @shared_user_invariant "Keep every applicable user-specified invariant in the governing work item and any associated spec, regardless of whether it came through chat, a document, or another source. Preserve the user's meaning."
+
   @neutral_patterns [
     {"worktree", ~r/\bworktrees?\b/i},
     {"branch", ~r/\bbranch(es)?\b/i},
@@ -251,6 +253,7 @@ defmodule Tightbeam.EngineeringIdentityEvidence do
 
     write!(Path.join(output, "substrate/operating-manual.md"), operating_manual)
     assert!(String.contains?(operating_manual, "# Operating tightbeam"), "operating manual")
+    assert!(occurrences(operating_manual, @shared_user_invariant) == 1, "shared user invariant")
 
     facts = available_bundle_facts(source_root)
 
@@ -268,8 +271,15 @@ defmodule Tightbeam.EngineeringIdentityEvidence do
           "\n"
         )
 
+      assert!(
+        occurrences(corpus, @shared_user_invariant) == 1,
+        "neutral #{harness} shared invariant"
+      )
+
+      remaining = String.replace(corpus, @shared_user_invariant, "", global: false)
+
       for {concept, pattern} <- @neutral_patterns do
-        assert!(not Regex.match?(pattern, corpus), "neutral #{harness} contains #{concept}")
+        assert!(not Regex.match?(pattern, remaining), "neutral #{harness} contains #{concept}")
       end
     end
   end

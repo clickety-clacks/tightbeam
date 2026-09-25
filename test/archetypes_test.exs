@@ -237,8 +237,17 @@ defmodule Tightbeam.ArchetypesTest do
           "\n"
         )
 
+      # The user's shared work-record invariant legitimately names an associated
+      # spec. Require that exact sentence once, then keep all eight vocabulary
+      # checks on the rest of the neutral identity.
+      invariant =
+        "Keep every applicable user-specified invariant in the governing work item and any associated spec, regardless of whether it came through chat, a document, or another source. Preserve the user's meaning."
+
+      assert length(:binary.matches(served, invariant)) == 1
+      remaining = String.replace(served, invariant, "", global: false)
+
       for {concept, pattern} <- forbidden do
-        refute Regex.match?(pattern, served),
+        refute Regex.match?(pattern, remaining),
                "neutral default/#{harness} guidance contains engineering concept #{concept}"
       end
     end
