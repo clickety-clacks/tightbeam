@@ -324,6 +324,23 @@ defmodule Tightbeam.RailRemedyTest do
     assert {:ok, [[^before_count]]} = DB.query(ctx.db, "SELECT count(*) FROM wakes")
   end
 
+  test "a vanished assignment is recorded as missing, not as a missing owner", ctx do
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO rail_remedy_episodes
+          (statute,subject,status,producerKey,occurrence,rewakeCount,claimToken,openedAt)
+        VALUES ('completion-requires-review','asg-vanished','live',NULL,1,0,'claim-vanished',1)
+        """
+      )
+
+    assert {:ok, :ok} = RailRemedy.reconcile_pending_episodes(ctx.db, 1_000)
+
+    state = RailRemedy.episode(ctx.db, "completion-requires-review", "asg-vanished").notice_state
+    assert state["blocked"] == "missing_assignment"
+  end
+
   test "failed recovery advances once to an active ancestor and never cycles", ctx do
     parent = session(ctx.db, "accountable-parent", "flynn", "claude", "orchestrator")
 
@@ -2179,6 +2196,9 @@ defmodule Tightbeam.RailRemedyTest do
     assert RailRemedy.episode(ctx.db, "completion-needs-review", assignment.id) == nil
     assert List.last(remedy_events(ctx.db))["outcome"] == "unbound"
 
+    assert %{"kind" => "term", "reason" => %{"$type" => "atom", "value" => "unbound_role"}} =
+             List.last(remedy_events(ctx.db))["diagnostic"]
+
     put_rules(
       ctx,
       String.replace(review_gate(), "review {assignment_id}", "review {work_item_id}")
@@ -2190,6 +2210,8 @@ defmodule Tightbeam.RailRemedyTest do
              Dispatch.dispatch(ctx.db, ctx.handlers, completion_call(assignment.id))
 
     assert List.last(remedy_events(ctx.db))["outcome"] == "unbound"
+    assert List.last(remedy_events(ctx.db))["diagnostic"]["kind"] == "term"
+    refute List.last(remedy_events(ctx.db))["diagnostic"]["reason"] == nil
   end
 
   test "assign remedy principal is rejected by every non-assign assignment verb", ctx do

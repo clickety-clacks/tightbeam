@@ -24,7 +24,7 @@ defmodule Tightbeam.Artifacts do
   through `recorded_kinds/3`, which reads neither column.
   """
 
-  alias Tightbeam.{ArtifactContent, DB, TurnObservations}
+  alias Tightbeam.{ArtifactContent, DB, ErrorDiagnostic, TurnObservations}
   alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.Publisher
 
@@ -178,7 +178,7 @@ defmodule Tightbeam.Artifacts do
       when is_binary(session_key) and is_binary(work_item_id) ->
         artifact_id = "art_" <> (:crypto.strong_rand_bytes(4) |> Base.encode16(case: :lower))
         parent_session = parent_session(db, session_key)
-        {recorded_message_id, evidence} = turn_evidence(db, session_key)
+        {recorded_message_id, evidence, evidence_diagnostic} = turn_evidence(db, session_key)
         now = now()
         producer_id = call.params[:produced_by_assignment_id]
 
@@ -252,8 +252,16 @@ defmodule Tightbeam.Artifacts do
                  end
                end
              ) do
-          {:ok, result} -> result
-          {:error, error} -> raise error
+          # The row still lands on the weaker class; when that class came from
+          # an unreachable observation writer, the caller learns why.
+          {:ok, %{artifact_id: _} = artifact} ->
+            ErrorDiagnostic.put(artifact, evidence_diagnostic)
+
+          {:ok, result} ->
+            result
+
+          {:error, error} ->
+            raise error
         end
 
       {{:session, session_key}, session_key, _work_item_id} when is_binary(session_key) ->

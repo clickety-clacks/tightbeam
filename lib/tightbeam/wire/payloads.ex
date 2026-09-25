@@ -138,11 +138,17 @@ defmodule Tightbeam.Wire.Payloads do
   @spec ack(String.t()) :: payload()
   def ack(client_message_id), do: %{"type" => "ack", "id" => client_message_id}
 
-  @spec wire_error(error_code(), String.t() | nil, String.t() | nil) :: payload()
-  def wire_error(code, message \\ nil, message_id \\ nil) do
+  @doc """
+  A wire error frame. `diagnostic` is the optional structured node documented in
+  `Tightbeam.ErrorDiagnostic`; it is absent when there is nothing beyond code and
+  message.
+  """
+  @spec wire_error(error_code(), String.t() | nil, String.t() | nil, map() | nil) :: payload()
+  def wire_error(code, message \\ nil, message_id \\ nil, diagnostic \\ nil) do
     %{"type" => "error", "code" => code}
     |> put_if_present("message", message)
     |> put_if_present("messageId", message_id)
+    |> put_if_present("diagnostic", diagnostic)
   end
 
   @spec assistant_typing(String.t(), boolean()) :: payload()

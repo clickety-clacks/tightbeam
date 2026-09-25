@@ -23,9 +23,19 @@ defmodule Tightbeam.Acp.Conn do
   - Port exit fails all pending with {:error, :closed} and emits
     {:acp_exit, status} to the subscriber. Stderr goes to a file via sh
     redirection — never merged into the ndjson stream.
+  - A stdout line that is not JSON cannot be routed; it is counted, logged
+    without its content, and reported on later transport failures.
+
+  A caller that passes `diagnostic: true` receives a transport failure as
+  `{:error, {:diagnosed, :closed | :timeout, node}}` (see
+  `Tightbeam.ErrorDiagnostic`): the method, the adapter's exit status or the
+  client close, the timeout, and any undecodable output. Every other caller
+  receives the bare classification it always did.
   """
 
   use GenServer
+  require Logger
+  alias Tightbeam.ErrorDiagnostic
 
   defstruct port: nil,
             buf: "",
@@ -33,7 +43,11 @@ defmodule Tightbeam.Acp.Conn do
             # id => %{from, monitor, session_id, method, orphaned}
             pending: %{},
             subscriber: nil,
-            closed: false
+            closed: false,
+            # why the transport closed: {:exit, status} | :closed_by_client | :send_failed
+            closed_by: nil,
+            malformed_lines: 0,
+            last_malformed: nil
 
   ## Client
 
@@ -56,7 +70,11 @@ defmodule Tightbeam.Acp.Conn do
   """
   @spec request(conn(), String.t(), map(), keyword()) :: {:ok, term()} | {:error, term()}
   def request(conn, method, params, opts \\ []) do
-    GenServer.call(conn, {:request, method, params, opts}, :infinity)
+    reply = GenServer.call(conn, {:request, method, params, opts}, :infinity)
+
+    if Keyword.get(opts, :diagnostic, false),
+      do: reply,
+      else: ErrorDiagnostic.classified(reply)
   end
 
   @doc "Fire-and-forget JSON-RPC notification (no id, no reply)."
@@ -106,7 +124,7 @@ defmodule Tightbeam.Acp.Conn do
   def handle_call({:request, method, params, opts}, {pid, _} = from, state) do
     if state.closed do
       notify_not_dispatched(opts, :closed)
-      {:reply, {:error, :closed}, state}
+      {:reply, {:error, transport_failure(state, :closed, method, nil)}, state}
     else
       id = state.next_id
 
@@ -128,6 +146,7 @@ defmodule Tightbeam.Acp.Conn do
           monitor: Process.monitor(pid),
           session_id: Keyword.get(opts, :session_id),
           method: method,
+          timeout: timeout,
           orphaned: false,
           replied: false
         }
@@ -135,7 +154,8 @@ defmodule Tightbeam.Acp.Conn do
         {:noreply, %{state | next_id: id + 1, pending: Map.put(state.pending, id, entry)}}
       else
         notify_not_dispatched(opts, :closed)
-        {:reply, {:error, :closed}, %{state | closed: true}}
+        state = %{state | closed: true, closed_by: :send_failed}
+        {:reply, {:error, transport_failure(state, :closed, method, nil)}, state}
       end
     end
   end
@@ -149,8 +169,15 @@ defmodule Tightbeam.Acp.Conn do
   end
 
   def handle_cast(:close, state) do
-    if state.port && !state.closed, do: Port.close(state.port)
-    {:noreply, fail_all(%{state | closed: true}, {:error, :closed})}
+    state =
+      if state.port && !state.closed do
+        Port.close(state.port)
+        %{state | closed_by: :closed_by_client}
+      else
+        state
+      end
+
+    {:noreply, fail_all(%{state | closed: true})}
   end
 
   @impl true
@@ -161,13 +188,17 @@ defmodule Tightbeam.Acp.Conn do
 
   def handle_info({port, {:exit_status, status}}, %{port: port} = state) do
     emit(state, {:acp_exit, status})
-    {:noreply, fail_all(%{state | closed: true}, {:error, :closed})}
+    {:noreply, fail_all(%{state | closed: true, closed_by: {:exit, status}})}
   end
 
   def handle_info({:req_timeout, id}, state) do
     case state.pending[id] do
       %{replied: false} = entry ->
-        GenServer.reply(entry.from, {:error, :timeout})
+        GenServer.reply(
+          entry.from,
+          {:error, transport_failure(state, :timeout, entry.method, entry.timeout)}
+        )
+
         # KEEP the entry (unresolved at the adapter) for quiescence accounting.
         {:noreply, put_in(state.pending[id], %{entry | replied: true})}
 
@@ -198,8 +229,18 @@ defmodule Tightbeam.Acp.Conn do
 
   defp handle_line(line, state) do
     case safe_decode(line) do
-      {:ok, msg} -> route(msg, state)
-      :error -> state
+      {:ok, msg} ->
+        route(msg, state)
+
+      {:error, reason} ->
+        malformed = malformed_fact(reason, line)
+
+        Logger.warning(
+          "acp undecodable stdout line dropped: #{malformed["error"]} " <>
+            "at byte #{malformed["byteOffset"] || "?"} of #{malformed["lineBytes"]}"
+        )
+
+        %{state | malformed_lines: state.malformed_lines + 1, last_malformed: malformed}
     end
   end
 
@@ -244,9 +285,53 @@ defmodule Tightbeam.Acp.Conn do
 
   ## Helpers
 
-  defp fail_all(state, reply) do
-    for {_id, %{replied: false} = e} <- state.pending, do: GenServer.reply(e.from, reply)
+  defp fail_all(state) do
+    for {_id, %{replied: false} = e} <- state.pending,
+        do: GenServer.reply(e.from, {:error, transport_failure(state, :closed, e.method, nil)})
+
     %{state | pending: %{}}
+  end
+
+  defp transport_failure(state, reason, method, timeout) do
+    {exit_status, closed_by} =
+      case state.closed_by do
+        {:exit, status} -> {status, "adapter_exit"}
+        nil -> {nil, nil}
+        other -> {nil, Atom.to_string(other)}
+      end
+
+    node =
+      ErrorDiagnostic.new(Atom.to_string(reason),
+        operation: method,
+        origin: "acp_transport",
+        closed_by: if(reason == :closed, do: closed_by),
+        exit_status: if(reason == :closed, do: exit_status),
+        timeout_ms: timeout,
+        malformed_lines: if(state.malformed_lines > 0, do: state.malformed_lines),
+        last_malformed: state.last_malformed && {:node, state.last_malformed}
+      )
+
+    ErrorDiagnostic.diagnosed(reason, node)
+  end
+
+  # Only the parser's own verdict and position: the line itself may carry
+  # conversation or credential text and is never retained.
+  defp malformed_fact(reason, line) do
+    base = %{"lineBytes" => byte_size(line)}
+
+    case reason do
+      {:invalid_byte, offset, _byte} ->
+        Map.merge(base, %{"error" => "invalid_byte", "byteOffset" => offset})
+
+      {:unexpected_end, offset} ->
+        Map.merge(base, %{"error" => "unexpected_end", "byteOffset" => offset})
+
+      {:unexpected_sequence, offset, _bytes} ->
+        Map.merge(base, %{"error" => "unexpected_sequence", "byteOffset" => offset})
+
+      _ ->
+        Map.put(base, "error", "undecodable")
+    end
   end
 
   defp emit(%{subscriber: nil}, _msg), do: :ok
@@ -293,9 +378,9 @@ defmodule Tightbeam.Acp.Conn do
   end
 
   defp safe_decode(line) do
-    {:ok, JSON.decode!(line)}
+    JSON.decode(line)
   rescue
-    _ -> :error
+    _ -> {:error, :undecodable}
   end
 
   defp pick_allow(params) do

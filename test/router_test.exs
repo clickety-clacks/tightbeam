@@ -3144,7 +3144,14 @@ defmodule Tightbeam.Wire.RouterTest do
              "error" => %{
                "code" => "unknown_host",
                "message" =>
-                 "host eurisko is not configured for codex; run tightbeam assimilate <ssh-dest> --name eurisko --as-user <adminUserId>"
+                 "host eurisko is not configured for codex; run tightbeam assimilate <ssh-dest> --name eurisko --as-user <adminUserId>",
+               "diagnostic" => %{
+                 "kind" => "denial",
+                 "operation" => "spawn",
+                 "origin" => "placement",
+                 "host" => "eurisko",
+                 "harness" => "codex"
+               }
              }
            }
   end

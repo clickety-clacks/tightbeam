@@ -21,7 +21,7 @@ defmodule Tightbeam.Acp.Adapter do
 
   use GenServer
   require Logger
-  alias Tightbeam.{Harness, Model}
+  alias Tightbeam.{ErrorDiagnostic, Harness, Model}
   alias Tightbeam.Acp.Conn
 
   # Boot may spend 60s initializing ACP before the separate 120s gate
@@ -114,8 +114,15 @@ defmodule Tightbeam.Acp.Adapter do
   def new_candidate_session(adapter, model, cwd, mcp_servers, guidance),
     do: call(adapter, {:new_candidate_session, model, cwd, mcp_servers, guidance}, 30_000)
 
+  # The turn path renders its failure reason as text that the health and
+  # supervision classifiers read, so it receives each reason exactly as it was
+  # before diagnostics existed. Diagnostics reach callers through the tune
+  # and wire paths, which carry a structured `diagnostic`.
   def new_session_for_turn(adapter, model, cwd, mcp_servers, guidance),
-    do: call(adapter, {:new_session, model, cwd, mcp_servers, guidance, :infinity}, :infinity)
+    do:
+      adapter
+      |> call({:new_session, model, cwd, mcp_servers, guidance, :infinity}, :infinity)
+      |> ErrorDiagnostic.classified()
 
   @doc "Adopt an existing harness session and push the canonical model when it is known."
   @spec load_session(adapter(), String.t(), model_ref() | nil, String.t(), [map()], String.t()) ::
@@ -125,11 +132,12 @@ defmodule Tightbeam.Acp.Adapter do
 
   def load_session_for_turn(adapter, session_id, model, cwd, mcp_servers, guidance),
     do:
-      call(
-        adapter,
+      adapter
+      |> call(
         {:load_session, session_id, model, cwd, mcp_servers, guidance, :infinity},
         :infinity
       )
+      |> ErrorDiagnostic.classified()
 
   @doc """
   Move a resident session to a new model without losing its conversation.
@@ -181,10 +189,14 @@ defmodule Tightbeam.Acp.Adapter do
   def apply_fast(adapter, session_id, value) when value in ["on", "off"],
     do: call(adapter, {:apply_fast, session_id, value}, @boot_boundary_timeout)
 
-  @doc "Best-effort ACP teardown for one harness session; adapter failures never escape the caller."
-  @spec close_session(adapter(), String.t()) :: :ok | {:error, term()}
-  def close_session(adapter, session_id) do
-    GenServer.call(adapter, {:close_session, session_id}, 65_000)
+  @doc """
+  Best-effort ACP teardown for one harness session; adapter failures never
+  escape the caller. `diagnostic: true` returns a failed close as a
+  `Tightbeam.ErrorDiagnostic` carrier instead of the bare reason.
+  """
+  @spec close_session(adapter(), String.t(), keyword()) :: :ok | {:error, term()}
+  def close_session(adapter, session_id, opts \\ []) do
+    GenServer.call(adapter, {:close_session, session_id, opts}, 65_000)
   rescue
     reason -> {:error, {:adapter_unavailable, reason}}
   catch
@@ -264,7 +276,10 @@ defmodule Tightbeam.Acp.Adapter do
     do: GenServer.call(adapter, {:apply_model, session_id, model}, 30_000)
 
   def apply_model_for_turn(adapter, session_id, model),
-    do: call(adapter, {:apply_model, session_id, model, :infinity}, :infinity)
+    do:
+      adapter
+      |> call({:apply_model, session_id, model, :infinity}, :infinity)
+      |> ErrorDiagnostic.classified()
 
   @doc """
   Run a turn: sends session/prompt, accumulates agent_message_chunk text while
@@ -531,8 +546,13 @@ defmodule Tightbeam.Acp.Adapter do
     end
   end
 
-  def handle_call({:close_session, sid}, _from, state) do
-    case Conn.request(state.conn, "session/close", %{sessionId: sid}) do
+  def handle_call({:close_session, sid}, from, state),
+    do: handle_call({:close_session, sid, []}, from, state)
+
+  def handle_call({:close_session, sid, opts}, _from, state) do
+    diagnostic? = Keyword.get(opts, :diagnostic, false)
+
+    case Conn.request(state.conn, "session/close", %{sessionId: sid}, diagnostic: diagnostic?) do
       {:ok, _result} ->
         state = %{
           state
@@ -619,22 +639,32 @@ defmodule Tightbeam.Acp.Adapter do
              state.conn,
              "session/set_config_option",
              %{sessionId: sid, configId: option_id(option), value: wire_value},
-             timeout: 30_000
+             timeout: 30_000,
+             diagnostic: true
            ) do
         {:ok, result} ->
           state = remember_config_options(state, sid, result)
 
           reply =
             case canonical_fast_status(state, sid) do
-              {:ok, %{fast: ^requested} = actual} -> {:ok, actual}
-              {:ok, %{fast: actual}} -> {:error, {:runtime_config_mismatch, actual}}
-              {:error, _reason} -> {:error, :runtime_config_unknown}
+              {:ok, %{fast: ^requested} = actual} ->
+                {:ok, actual}
+
+              {:ok, %{fast: actual}} ->
+                {:error, {:runtime_config_mismatch, actual}}
+
+              {:error, reason} ->
+                {:error,
+                 ErrorDiagnostic.diagnosed(
+                   :runtime_config_unknown,
+                   readback_node(result, option_id(option), wire_value, "fast", reason)
+                 )}
             end
 
           {:reply, reply, state}
 
         {:error, reason} ->
-          {:reply, {:error, reason}, state}
+          {:reply, {:error, config_failure(reason, "fast", option_id(option), wire_value)}, state}
       end
     else
       {:error, reason} -> {:reply, {:error, reason}, state}
@@ -658,11 +688,12 @@ defmodule Tightbeam.Acp.Adapter do
       {:error, {:runtime_config_mismatch, %Model{} = actual}} = error ->
         {:reply, error, put_in(state.models[sid], actual)}
 
-      {:error, :model_unavailable} = error ->
-        {:reply, error, state}
-
-      {:error, reason} ->
-        {:reply, {:error, {:runtime_config_unknown, reason}}, drop_model_residency(state, sid)}
+      {:error, reason} = error ->
+        if ErrorDiagnostic.classified(reason) == :model_unavailable,
+          do: {:reply, error, state},
+          else:
+            {:reply, {:error, {:runtime_config_unknown, reason}},
+             drop_model_residency(state, sid)}
     end
   end
 
@@ -674,13 +705,15 @@ defmodule Tightbeam.Acp.Adapter do
              state.conn,
              "session/set_config_option",
              %{sessionId: sid, configId: "model", value: value},
-             timeout: request_timeout
-           )
+             timeout: request_timeout,
+             diagnostic: true
+           ),
+           value
          ) do
       {:ok, model_result} ->
         cond do
           not read_back?(model_result, "model", value) ->
-            verified_model_mismatch(model_result, state.preset)
+            verified_model_mismatch(model_result, state.preset, "model", value)
 
           true ->
             case apply_verified_effort(
@@ -718,7 +751,8 @@ defmodule Tightbeam.Acp.Adapter do
              mcpServers: mcp_servers,
              _meta: Harness.module!(state.harness).session_config(%{}, guidance).meta
            },
-           timeout: request_timeout
+           timeout: request_timeout,
+           diagnostic: true
          ) do
       {:ok, %{"sessionId" => sid} = result} when is_binary(sid) ->
         # The apply below resolves wire-by-name candidates from the cached
@@ -757,12 +791,12 @@ defmodule Tightbeam.Acp.Adapter do
         {:reply, {:error, {:invalid_new_session_response, result}}, state}
 
       {:error, error} ->
-        {:reply, {:error, error}, state}
+        {:reply, {:error, request_failure(error, "session/new")}, state}
     end
   end
 
   defp close_failed_new_session(state, sid) do
-    case Conn.request(state.conn, "session/close", %{sessionId: sid}) do
+    case Conn.request(state.conn, "session/close", %{sessionId: sid}, diagnostic: true) do
       {:ok, _result} -> %{status: "verified", reason: nil}
       {:error, reason} -> %{status: "unverified", reason: reason}
     end
@@ -787,7 +821,8 @@ defmodule Tightbeam.Acp.Adapter do
                mcpServers: mcp_servers,
                _meta: Harness.module!(state.harness).session_config(%{}, guidance).meta
              },
-             timeout: request_timeout
+             timeout: request_timeout,
+             diagnostic: true
            ) do
         {:ok, result} ->
           with :ok <- set_mode(state, sid, request_timeout) do
@@ -820,7 +855,7 @@ defmodule Tightbeam.Acp.Adapter do
           end
 
         {:error, error} ->
-          {:reply, {:error, error}, state}
+          {:reply, {:error, request_failure(error, "session/load")}, state}
       end
     else
       {:error, error} -> {:reply, {:error, error}, state}
@@ -845,7 +880,8 @@ defmodule Tightbeam.Acp.Adapter do
              mcpServers: mcp_servers,
              _meta: Harness.module!(state.harness).session_config(%{}, guidance).meta
            },
-           timeout: request_timeout
+           timeout: request_timeout,
+           diagnostic: true
          ) do
       {:ok, %{"sessionId" => new_sid} = result} when new_sid != sid ->
         with :ok <- project_guidance(state, new_sid, guidance),
@@ -863,12 +899,12 @@ defmodule Tightbeam.Acp.Adapter do
           {:reply, {:ok, new_sid}, state}
         else
           {:error, {:codex_identity_projection_failed, _} = reason} ->
-            close_failed_fork(state, new_sid)
-            {:reply, {:error, reason}, state}
+            cleanup = close_failed_fork(state, new_sid)
+            {:reply, {:error, with_cleanup(reason, cleanup)}, state}
 
           {:error, reason} ->
-            close_failed_fork(state, new_sid)
-            {:reply, {:error, {:model_apply_failed, reason}}, state}
+            cleanup = close_failed_fork(state, new_sid)
+            {:reply, {:error, {:model_apply_failed, with_cleanup(reason, cleanup)}}, state}
         end
 
       {:ok, %{"sessionId" => ^sid}} ->
@@ -898,18 +934,19 @@ defmodule Tightbeam.Acp.Adapter do
   defp apply_fork_model_candidates(state, sid, model, offered, request_timeout) do
     state.preset
     |> model_value_candidates(offered, model)
-    |> try_fork_model_candidates(state, sid, model, request_timeout)
+    |> try_fork_model_candidates(state, sid, model, request_timeout, [])
   end
 
-  defp try_fork_model_candidates([], _state, _sid, _model, _request_timeout),
-    do: {:error, :model_unavailable}
+  defp try_fork_model_candidates([], _state, _sid, _model, _request_timeout, attempts),
+    do: {:error, refused_all(attempts)}
 
   defp try_fork_model_candidates(
          [value | remaining],
          state,
          sid,
          model,
-         request_timeout
+         request_timeout,
+         attempts
        ) do
     result =
       map_switch_model_refusal(
@@ -917,8 +954,10 @@ defmodule Tightbeam.Acp.Adapter do
           state.conn,
           "session/set_config_option",
           %{sessionId: sid, configId: "model", value: value},
-          timeout: request_timeout
-        )
+          timeout: request_timeout,
+          diagnostic: true
+        ),
+        value
       )
 
     case result do
@@ -926,14 +965,22 @@ defmodule Tightbeam.Acp.Adapter do
         if readback_confirms_model?(model_result, state.preset, model) do
           {:ok, model_result}
         else
-          {:error, :model_readback_unavailable}
+          unconfirmed = readback_node(model_result, "model", value, "readback")
+
+          {:error,
+           with_attempts(
+             ErrorDiagnostic.diagnosed(:model_readback_unavailable, unconfirmed),
+             attempts
+           )}
         end
 
-      {:error, :model_unavailable} ->
-        try_fork_model_candidates(remaining, state, sid, model, request_timeout)
-
-      {:error, _reason} = error ->
-        error
+      {:error, reason} ->
+        if ErrorDiagnostic.classified(reason) == :model_unavailable,
+          do:
+            try_fork_model_candidates(remaining, state, sid, model, request_timeout, [
+              ErrorDiagnostic.with_facts(reason, []) | attempts
+            ]),
+          else: {:error, with_attempts(reason, attempts)}
     end
   end
 
@@ -941,51 +988,78 @@ defmodule Tightbeam.Acp.Adapter do
     do: {:ok, model_result}
 
   defp apply_verified_effort(state, sid, effort, _model_result, request_timeout) do
+    config_id = state.preset.effort_config
+
     case Conn.request(
            state.conn,
            "session/set_config_option",
-           %{sessionId: sid, configId: state.preset.effort_config, value: effort},
-           timeout: request_timeout
+           %{sessionId: sid, configId: config_id, value: effort},
+           timeout: request_timeout,
+           diagnostic: true
          ) do
       {:ok, effort_result} ->
-        if read_back?(effort_result, state.preset.effort_config, effort),
+        if read_back?(effort_result, config_id, effort),
           do: {:ok, effort_result},
-          else: verified_model_mismatch(effort_result, state.preset)
-
-      {:error, _reason} = error ->
-        error
-    end
-  end
-
-  defp verified_model_mismatch(result, preset) do
-    case model_ref_from_config(result, preset.effort_config) do
-      {:ok, actual} -> {:error, {:runtime_config_mismatch, actual}}
-      :error -> {:error, :model_readback_unavailable}
-    end
-  end
-
-  defp map_fork_error(%{"code" => -32_002}), do: :fork_requires_prompted_session
-  defp map_fork_error(error), do: error
-
-  defp map_switch_model_refusal({:error, %{"code" => -32_602}}),
-    do: {:error, :model_unavailable}
-
-  defp map_switch_model_refusal({:error, %{"message" => message}} = error)
-       when is_binary(message) do
-    if String.contains?(String.downcase(message), "invalid value for config option model"),
-      do: {:error, :model_unavailable},
-      else: error
-  end
-
-  defp map_switch_model_refusal(result), do: result
-
-  defp close_failed_fork(state, sid) do
-    case Conn.request(state.conn, "session/close", %{sessionId: sid}) do
-      {:ok, _result} ->
-        :ok
+          else: verified_model_mismatch(effort_result, state.preset, config_id, effort)
 
       {:error, reason} ->
-        Logger.warning("failed to close rejected fork #{sid}: #{inspect(reason)}")
+        {:error, config_failure(reason, "effort", config_id, effort)}
+    end
+  end
+
+  # A mismatch names the runtime that is actually live and is never wrapped:
+  # callers project that model. Only an unreadable result carries evidence.
+  defp verified_model_mismatch(result, preset, config_id, expected) do
+    case model_ref_from_config(result, preset.effort_config) do
+      {:ok, actual} ->
+        {:error, {:runtime_config_mismatch, actual}}
+
+      :error ->
+        {:error,
+         ErrorDiagnostic.diagnosed(
+           :model_readback_unavailable,
+           readback_node(result, config_id, expected, "readback")
+         )}
+    end
+  end
+
+  defp map_fork_error(%{"code" => -32_002} = error),
+    do:
+      ErrorDiagnostic.diagnosed(
+        :fork_requires_prompted_session,
+        ErrorDiagnostic.from_reason(error, operation: "session/fork", origin: "acp_adapter")
+      )
+
+  defp map_fork_error(error), do: request_failure(error, "session/fork")
+
+  defp map_switch_model_refusal({:error, %{"code" => -32_602} = error}, value),
+    do: {:error, refusal(error, value)}
+
+  defp map_switch_model_refusal({:error, %{"message" => message} = error}, value)
+       when is_binary(message) do
+    if String.contains?(String.downcase(message), "invalid value for config option model"),
+      do: {:error, refusal(error, value)},
+      else: {:error, config_failure(error, "model", "model", value)}
+  end
+
+  defp map_switch_model_refusal({:error, reason}, value),
+    do: {:error, config_failure(reason, "model", "model", value)}
+
+  defp map_switch_model_refusal(result, _value), do: result
+
+  # The rejected fork is closed best-effort; the caller's failure records
+  # whether that close was confirmed.
+  defp close_failed_fork(state, sid) do
+    case Conn.request(state.conn, "session/close", %{sessionId: sid}, diagnostic: true) do
+      {:ok, _result} ->
+        {:verified, sid}
+
+      {:error, reason} ->
+        Logger.warning(
+          "failed to close rejected fork #{sid}: #{inspect(ErrorDiagnostic.classified(reason))}"
+        )
+
+        {:unverified, sid, reason}
     end
   end
 
@@ -1326,27 +1400,38 @@ defmodule Tightbeam.Acp.Adapter do
   defp apply_model_to_session(state, sid, model_ref, request_timeout)
        when is_integer(request_timeout) or request_timeout == :infinity do
     apply_model_to_session(state, sid, model_ref, fn method, params ->
-      Conn.request(state.conn, method, params, timeout: request_timeout)
+      Conn.request(state.conn, method, params, timeout: request_timeout, diagnostic: true)
     end)
   end
 
   defp apply_model_to_session(state, sid, %Model{} = model_ref, request) do
     effort = model_ref.effort
+    effort_config = state.preset.effort_config
 
     with {:ok, base_result} <- apply_model_value(state, sid, model_ref, request),
          {:ok, effort_result} <-
-           (if effort && state.preset.effort_config do
-              request.("session/set_config_option", %{
-                sessionId: sid,
-                configId: state.preset.effort_config,
-                value: effort
-              })
+           (if effort && effort_config do
+              case request.("session/set_config_option", %{
+                     sessionId: sid,
+                     configId: effort_config,
+                     value: effort
+                   }) do
+                {:error, reason} ->
+                  {:error, config_failure(reason, "effort", effort_config, effort)}
+
+                ok ->
+                  ok
+              end
             else
               {:ok, base_result}
             end) do
-      case model_ref_from_config(effort_result, state.preset.effort_config) do
-        {:ok, applied_model} -> {:ok, applied_model}
-        :error -> {:error, :model_readback_unavailable}
+      case model_ref_from_config(effort_result, effort_config) do
+        {:ok, applied_model} ->
+          {:ok, applied_model}
+
+        :error ->
+          unconfirmed = readback_node(effort_result, "model", Model.to_ref(model_ref), "readback")
+          {:error, ErrorDiagnostic.diagnosed(:model_readback_unavailable, unconfirmed)}
       end
     end
   end
@@ -1363,30 +1448,44 @@ defmodule Tightbeam.Acp.Adapter do
 
     candidates = Enum.uniq([canonical | aliases] ++ wire_candidates)
 
-    Enum.reduce_while(candidates, {:error, :model_unavailable}, fn value, _acc ->
+    candidates
+    |> Enum.reduce_while({:error, []}, fn value, {:error, attempts} ->
       result =
         map_model_refusal(
           request.("session/set_config_option", %{
             sessionId: sid,
             configId: "model",
             value: value
-          })
+          }),
+          value
         )
 
       case result do
         {:ok, response} ->
           if Harness.local_client_model_authority?(to_string(state.harness), model_ref) or
-               read_back?(response, "model", value),
-             do: {:halt, {:ok, response}},
-             else: {:halt, {:error, :model_verification_failed}}
+               read_back?(response, "model", value) do
+            {:halt, {:ok, response}}
+          else
+            unconfirmed = readback_node(response, "model", value, "readback")
 
-        {:error, :model_unavailable} ->
-          {:cont, {:error, :model_unavailable}}
+            {:halt,
+             {:error,
+              with_attempts(
+                ErrorDiagnostic.diagnosed(:model_verification_failed, unconfirmed),
+                attempts
+              )}}
+          end
 
-        {:error, _reason} = error ->
-          {:halt, error}
+        {:error, reason} ->
+          if ErrorDiagnostic.classified(reason) == :model_unavailable,
+            do: {:cont, {:error, [ErrorDiagnostic.with_facts(reason, []) | attempts]}},
+            else: {:halt, {:error, with_attempts(reason, attempts)}}
       end
     end)
+    |> case do
+      {:error, attempts} when is_list(attempts) -> {:error, refused_all(attempts)}
+      result -> result
+    end
   end
 
   # The adapter's own refusal of a model value — JSON-RPC -32602 Invalid params,
@@ -1397,8 +1496,13 @@ defmodule Tightbeam.Acp.Adapter do
   # instead of passing the raw envelope through to be recorded as an
   # unclassifiable harness error. Every other shape keeps the fail-loud raw
   # passthrough.
-  defp map_model_refusal({:error, %{"code" => -32602}}), do: {:error, :model_unavailable}
-  defp map_model_refusal(result), do: result
+  defp map_model_refusal({:error, %{"code" => -32602} = error}, value),
+    do: {:error, refusal(error, value)}
+
+  defp map_model_refusal({:error, reason}, value),
+    do: {:error, config_failure(reason, "model", "model", value)}
+
+  defp map_model_refusal(result, _value), do: result
 
   defp strict_apply(state, sid, %Model{} = model_ref, deadline) do
     canonical = Model.to_ref(model_ref)
@@ -1413,48 +1517,80 @@ defmodule Tightbeam.Acp.Adapter do
     [canonical | aliases]
     |> Kernel.++(wire_candidates)
     |> Enum.uniq()
-    |> Enum.reduce_while({:error, :model_unavailable}, fn value, _acc ->
+    |> Enum.reduce_while({:error, []}, fn value, {:error, attempts} ->
       case strict_apply_value(state, sid, model_ref, value, deadline) do
-        {:error, :model_unavailable} -> {:cont, {:error, :model_unavailable}}
-        other -> {:halt, other}
+        :ok ->
+          {:halt, :ok}
+
+        {:error, reason} ->
+          if ErrorDiagnostic.classified(reason) == :model_unavailable,
+            do: {:cont, {:error, [ErrorDiagnostic.with_facts(reason, []) | attempts]}},
+            else: {:halt, {:error, with_attempts(reason, attempts)}}
       end
     end)
+    |> case do
+      {:error, attempts} when is_list(attempts) -> {:error, refused_all(attempts)}
+      result -> result
+    end
   end
 
   defp strict_apply_value(state, sid, %Model{} = model_ref, model, deadline) do
     effort = model_ref.effort
 
-    case map_model_refusal(strict_model_request(state, sid, "model", model, deadline)) do
+    effort_config = state.preset.effort_config
+
+    case map_model_refusal(strict_model_request(state, sid, "model", model, deadline), model) do
       {:ok, base_result} ->
         effort_result =
-          if effort && state.preset.effort_config do
-            strict_model_request(
-              state,
-              sid,
-              state.preset.effort_config,
-              effort,
-              deadline
-            )
+          if effort && effort_config do
+            strict_model_request(state, sid, effort_config, effort, deadline)
           else
             {:ok, base_result}
           end
 
-        if read_back?(base_result, "model", model) and
-             match?({:ok, _}, effort_result) and
-             (is_nil(effort) or
-                read_back?(elem(effort_result, 1), state.preset.effort_config, effort)) do
-          :ok
-        else
-          {:error, :partial_apply}
+        cond do
+          not read_back?(base_result, "model", model) ->
+            partial_apply(readback_node(base_result, "model", model, "readback"))
+
+          match?({:error, _}, effort_result) ->
+            partial_apply(
+              failure_node(elem(effort_result, 1), "session/set_config_option",
+                phase: "effort",
+                config_id: effort_config,
+                value: effort
+              )
+            )
+
+          not (is_nil(effort) or read_back?(elem(effort_result, 1), effort_config, effort)) ->
+            partial_apply(
+              readback_node(elem(effort_result, 1), effort_config, effort, "readback")
+            )
+
+          true ->
+            :ok
         end
 
-      {:error, reason} when reason in [:closed, :timeout] ->
-        {:error, :model_transport_failure}
+      {:error, reason} ->
+        case ErrorDiagnostic.classified(reason) do
+          transport when transport in [:closed, :timeout] ->
+            {:error,
+             ErrorDiagnostic.diagnosed(
+               :model_transport_failure,
+               ErrorDiagnostic.with_facts(reason, [])
+             )}
 
-      {:error, _reason} ->
-        {:error, :model_unavailable}
+          :model_unavailable ->
+            {:error, reason}
+
+          _other ->
+            {:error,
+             ErrorDiagnostic.diagnosed(:model_unavailable, ErrorDiagnostic.with_facts(reason, []))}
+        end
     end
   end
+
+  defp partial_apply(node),
+    do: {:error, ErrorDiagnostic.diagnosed(:partial_apply, node)}
 
   defp strict_model_request(state, sid, config_id, value, deadline) do
     case deadline - System.monotonic_time(:millisecond) do
@@ -1463,11 +1599,21 @@ defmodule Tightbeam.Acp.Adapter do
           state.conn,
           "session/set_config_option",
           %{sessionId: sid, configId: config_id, value: value},
-          timeout: remaining
+          timeout: remaining,
+          diagnostic: true
         )
 
       _expired ->
-        {:error, :timeout}
+        # The caller's own deadline ran out before this request was sent.
+        {:error,
+         ErrorDiagnostic.diagnosed(
+           :timeout,
+           ErrorDiagnostic.new("timeout",
+             operation: "session/set_config_option",
+             origin: "caller_deadline",
+             sent: false
+           )
+         )}
     end
   end
 
@@ -1816,11 +1962,135 @@ defmodule Tightbeam.Acp.Adapter do
              sessionId: sid,
              modeId: state.preset.permission_mode
            },
-           timeout: request_timeout
+           timeout: request_timeout,
+           diagnostic: true
          ) do
-      {:ok, _result} -> :ok
-      {:error, reason} -> {:error, {:mode_apply_failed, reason}}
+      {:ok, _result} ->
+        :ok
+
+      {:error, reason} ->
+        {:error, {:mode_apply_failed, request_failure(reason, "session/set_mode")}}
     end
+  end
+
+  ## Failure evidence
+  #
+  # Each helper keeps the classification its callers already branch on and adds
+  # a `Tightbeam.ErrorDiagnostic` node naming what failed. Callers compare
+  # `ErrorDiagnostic.classified/1`; the turn entry points strip carriers.
+
+  # The adapter's own refusal of a model value: still `:model_unavailable`,
+  # now with the refusal it made.
+  defp refusal(error, value),
+    do:
+      ErrorDiagnostic.diagnosed(
+        :model_unavailable,
+        failure_node(error, "session/set_config_option",
+          phase: "model",
+          config_id: "model",
+          value: value
+        )
+      )
+
+  defp config_failure(reason, phase, config_id, value),
+    do:
+      ErrorDiagnostic.diagnosed(
+        ErrorDiagnostic.classified(reason),
+        failure_node(reason, "session/set_config_option",
+          phase: phase,
+          config_id: config_id,
+          value: value
+        )
+      )
+
+  defp request_failure(reason, operation),
+    do:
+      ErrorDiagnostic.diagnosed(
+        ErrorDiagnostic.classified(reason),
+        failure_node(reason, operation, [])
+      )
+
+  # A JSON-RPC error object came from the ACP adapter process; a transport
+  # carrier already names its own origin; anything else has no known origin.
+  defp failure_node(reason, operation, facts) do
+    origin =
+      case ErrorDiagnostic.classified(reason) do
+        %{"code" => _} -> "acp_adapter"
+        %{"message" => _} -> "acp_adapter"
+        _ -> nil
+      end
+
+    ErrorDiagnostic.with_facts(reason, [operation: operation, origin: origin] ++ facts)
+  end
+
+  # The request succeeded but its result did not show the value asked for.
+  # Only the identifying fields of the reported option are kept.
+  defp readback_node(result, config_id, expected, phase, reason \\ nil) do
+    reported =
+      case result do
+        %{"configOptions" => options} when is_list(options) ->
+          case Enum.find(options, &(is_map(&1) and option_id(&1) == config_id)) do
+            nil -> "option_absent"
+            option -> Map.take(option, ["id", "configId", "currentValue", "value"])
+          end
+
+        _ ->
+          "configOptions_absent"
+      end
+
+    ErrorDiagnostic.new("unconfirmed",
+      operation: "session/set_config_option",
+      phase: phase,
+      origin: "acp_adapter",
+      config_id: config_id,
+      expected: expected,
+      reported: reported,
+      reason: reason
+    )
+  end
+
+  # Every candidate value was refused: the last refusal, with the earlier ones.
+  defp refused_all([]), do: :model_unavailable
+
+  defp refused_all([last | earlier]),
+    do: ErrorDiagnostic.diagnosed(:model_unavailable, put_attempts(last, earlier))
+
+  defp with_attempts(reason, []), do: reason
+
+  defp with_attempts(reason, attempts),
+    do:
+      ErrorDiagnostic.diagnosed(
+        ErrorDiagnostic.classified(reason),
+        put_attempts(ErrorDiagnostic.with_facts(reason, []), attempts)
+      )
+
+  # `attempts` is accumulated newest first; the node lists them oldest first.
+  defp put_attempts(node, []), do: node
+  defp put_attempts(node, attempts), do: Map.put(node, "attempts", Enum.reverse(attempts))
+
+  defp with_cleanup(reason, cleanup) do
+    node =
+      case cleanup do
+        {:verified, sid} ->
+          ErrorDiagnostic.new("cleanup",
+            operation: "session/close",
+            session_id: sid,
+            status: "verified"
+          )
+
+        {:unverified, sid, close_reason} ->
+          ErrorDiagnostic.new("cleanup",
+            operation: "session/close",
+            session_id: sid,
+            status: "unverified",
+            cause: ErrorDiagnostic.with_facts(close_reason, [])
+          )
+      end
+
+    ErrorDiagnostic.diagnosed(
+      ErrorDiagnostic.classified(reason),
+      Map.put(ErrorDiagnostic.with_facts(reason, []), "cleanup", node)
+    )
   end
 
   defp adapter_ready(opts) do

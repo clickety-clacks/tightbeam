@@ -27,6 +27,7 @@ defmodule Tightbeam.Dispatch do
   alias Tightbeam.{
     Assignments,
     DB,
+    ErrorDiagnostic,
     Escalation,
     EventLog,
     Firehose.Publisher,
@@ -270,6 +271,10 @@ defmodule Tightbeam.Dispatch do
 
         case invoke(handler, handler_call) do
           {:returned, %{code: _} = error} ->
+            # A denial's diagnostic is caller evidence, like a crash's stack below:
+            # the audit row and the firehose keep the denial's existing shape.
+            recorded = Map.delete(error, :diagnostic)
+
             :ok =
               EventLog.append_event_with_handoff(
                 db,
@@ -277,9 +282,9 @@ defmodule Tightbeam.Dispatch do
                 verb,
                 origin,
                 session_key,
-                error,
+                recorded,
                 principal,
-                &Publisher.denied_in_txn(&1, publisher_call, error)
+                &Publisher.denied_in_txn(&1, publisher_call, recorded)
               )
 
             {:error, error}
@@ -303,7 +308,7 @@ defmodule Tightbeam.Dispatch do
               Publisher.accepted_after_handler(
                 db,
                 Map.put(publisher_call, :firehose_changed, changed?),
-                result
+                caller_only_stripped(result)
               )
 
             {:ok, result}
@@ -332,13 +337,13 @@ defmodule Tightbeam.Dispatch do
                   session_key,
                   payload,
                   principal,
-                  &Publisher.accepted_in_txn(&1, publisher_call, result)
+                  &Publisher.accepted_in_txn(&1, publisher_call, caller_only_stripped(result))
                 )
             end
 
             {:ok, result}
 
-          {:raised, exception} ->
+          {:raised, exception, stacktrace} ->
             error = %{code: "server_error", message: Exception.message(exception)}
             payload = outcome_payload(verb, call, {:raised, exception})
 
@@ -354,7 +359,14 @@ defmodule Tightbeam.Dispatch do
                 &Publisher.denied_in_txn(&1, publisher_call, error)
               )
 
-            {:error, error}
+            # The exception's type and stack go to the caller only. The audit row and
+            # the firehose keep their existing shape: a stack is caller evidence for
+            # this call, not an org-wide observation, and elided verbs must not grow
+            # a second copy of what they deliberately keep out of the log.
+            diagnostic =
+              ErrorDiagnostic.exception(exception, stacktrace, operation: verb, origin: "handler")
+
+            {:error, ErrorDiagnostic.put(error, diagnostic)}
         end
     end
   end
@@ -412,11 +424,16 @@ defmodule Tightbeam.Dispatch do
       end
     else
       case outcome do
-        {:returned, result} -> result
+        # A diagnostic on a successful result (cancel's unconfirmed harness leg,
+        # an artifact's evidence fallback) is caller evidence, like a denial's.
+        {:returned, result} -> caller_only_stripped(result)
         {:raised, exception} -> %{code: "server_error", message: Exception.message(exception)}
       end
     end
   end
+
+  defp caller_only_stripped(result) when is_map(result), do: Map.delete(result, :diagnostic)
+  defp caller_only_stripped(result), do: result
 
   # An elided read returns a page, and the page is the only top-level list it
   # carries — so the count needs no per-verb knowledge of which key holds it. See
@@ -461,10 +478,19 @@ defmodule Tightbeam.Dispatch do
     {:returned, handler.(call)}
   rescue
     exception in Placement.Refusal ->
-      {:returned, %{code: exception.code, message: exception.message}}
+      diagnostic =
+        ErrorDiagnostic.new("denial",
+          operation: call.verb,
+          origin: "placement",
+          host: exception.host,
+          harness: exception.harness
+        )
+
+      {:returned,
+       ErrorDiagnostic.put(%{code: exception.code, message: exception.message}, diagnostic)}
 
     exception ->
-      {:raised, exception}
+      {:raised, exception, __STACKTRACE__}
   end
 
   defp gated_ref(call) do
