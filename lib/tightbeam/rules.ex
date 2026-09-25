@@ -1177,7 +1177,7 @@ defmodule Tightbeam.Rules do
       do: fail.("check effects must map every declared return and no others")
 
     unless Enum.all?(effects, fn {_token, effect} -> effect in ~w(allow deny remedy escalate) end),
-      do: fail.("check effects must be one of allow, deny, remedy, escalate")
+           do: fail.("check effects must be one of allow, deny, remedy, escalate")
 
     %{script: script, returns: returns, timeout_ms: timeout_ms, effects: effects}
   end
