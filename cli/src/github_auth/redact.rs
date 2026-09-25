@@ -29,29 +29,48 @@ impl std::ops::Deref for Scrubbed {
     }
 }
 
+/// Held to the same output as `Tightbeam.GithubAuth.scrub_detail/1`: tokens and
+/// credentialed URL userinfo are redacted in place, the text's own whitespace and
+/// line breaks are kept, and only the ends are trimmed.
 pub(super) fn scrub_detail(detail: &str) -> String {
     let detail = redact_token_sequences(detail);
-    let mut redacted = String::new();
-    for word in detail.split_whitespace() {
-        let cleaned = if let Some((scheme, rest)) = word.split_once("://") {
-            if let Some((userinfo, host_path)) = rest.split_once('@') {
-                if userinfo.contains(':') || userinfo.contains("[redacted]") {
-                    format!("{scheme}://[redacted]@{host_path}")
-                } else {
-                    word.to_owned()
-                }
-            } else {
-                word.to_owned()
+    let mut redacted = String::with_capacity(detail.len());
+    let mut word_start = None;
+    for (index, ch) in detail.char_indices() {
+        match (ch.is_whitespace(), word_start) {
+            (true, Some(start)) => {
+                redacted.push_str(&redact_userinfo(&detail[start..index]));
+                redacted.push(ch);
+                word_start = None;
             }
-        } else {
-            word.to_owned()
-        };
-        if !redacted.is_empty() {
-            redacted.push(' ');
+            (true, None) => redacted.push(ch),
+            (false, None) => word_start = Some(index),
+            (false, Some(_)) => {}
         }
-        redacted.push_str(&cleaned);
     }
-    redacted
+    if let Some(start) = word_start {
+        redacted.push_str(&redact_userinfo(&detail[start..]));
+    }
+    redacted.trim().to_owned()
+}
+
+fn redact_userinfo(word: &str) -> String {
+    if let Some((scheme, rest)) = word.split_once("://") {
+        if let Some((userinfo, host_path)) = rest.split_once('@') {
+            // As the Elixir pattern: a user part without `/` or `:`, then a
+            // non-empty password. A token-as-username is already `[redacted]`.
+            let credentialed = match userinfo.split_once(':') {
+                Some((user, password)) => {
+                    !user.is_empty() && !user.contains('/') && !password.is_empty()
+                }
+                None => false,
+            };
+            if credentialed || userinfo.contains("[redacted]") {
+                return format!("{scheme}://[redacted]@{host_path}");
+            }
+        }
+    }
+    word.to_owned()
 }
 
 fn redact_token_sequences(detail: &str) -> String {
@@ -113,6 +132,19 @@ mod tests {
         let embedded =
             scrub_detail("provider_error=ghp_fixture_EMBEDDED, token=github_pat_11ABC_def");
         assert_eq!(embedded, "provider_error=[redacted], token=[redacted]");
+    }
+
+    #[test]
+    fn scrub_detail_keeps_the_layout_of_multi_line_output() {
+        assert_eq!(
+            scrub_detail("see https://github.com/o/r:1@x"),
+            "see https://github.com/o/r:1@x"
+        );
+        let detail = "  remote: denied\n\tfatal: https://u:ghp_fixture_LAYOUT@github.com/o/r.git\n\nhint:  retry  ";
+        assert_eq!(
+            scrub_detail(detail),
+            "remote: denied\n\tfatal: https://[redacted]@github.com/o/r.git\n\nhint:  retry"
+        );
     }
 
     #[test]

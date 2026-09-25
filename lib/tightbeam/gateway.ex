@@ -7746,8 +7746,10 @@ defmodule Tightbeam.Gateway do
 
   # A cut is marked with the length it came from, so a reader can tell the
   # phrase is partial instead of taking the prefix for the whole reason.
+  # Redact before cutting: a length bound is not a redaction, and cutting first
+  # could leave a secret's prefix that no longer matches a redaction pattern.
   defp bounded_inspect(reason, limit) do
-    text = inspect(reason)
+    text = reason |> inspect() |> ErrorDiagnostic.redact_text()
     length = String.length(text)
 
     if length > limit,

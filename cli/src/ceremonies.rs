@@ -811,20 +811,19 @@ fn validate_local_openai_endpoint_with_timeout(
         request = request.set("authorization", &format!("Bearer {key}"));
     }
     match request.call() {
-        Ok(response) => {
-            let body = response
-                .into_string()
-                .unwrap_or_else(|_| "<unreadable response body>".to_owned());
-            parse_local_openai_models_body(&body)
-        }
+        Ok(response) => match response.into_string() {
+            Ok(body) => parse_local_openai_models_body(&body),
+            Err(error) => Err(format!(
+                "the local-openai endpoint on {host} answered /models but its body could not be \
+                 read: {error}. Nothing was banked -- the local-openai credential on {host} is \
+                 unchanged."
+            )),
+        },
         Err(ureq::Error::Status(status, response)) => {
-            let body = response
-                .into_string()
-                .unwrap_or_else(|_| "<unreadable response body>".to_owned());
+            let body = rejected_body_text(response.into_string(), api_key.unwrap_or(""));
             Err(format!(
-                "the local-openai endpoint was rejected on {host}: HTTP {status} {}. Nothing was \
-                 banked -- the local-openai credential on {host} is unchanged.",
-                body.trim()
+                "the local-openai endpoint was rejected on {host}: HTTP {status} {body}. Nothing \
+                 was banked -- the local-openai credential on {host} is unchanged."
             ))
         }
         Err(ureq::Error::Transport(error)) => Err(unvalidated_api_key(
@@ -1109,16 +1108,14 @@ fn validate_api_key_with_timeout(
         Ok(_response) => Ok(()),
         Err(ureq::Error::Status(status, response)) => {
             let body = match response.into_string() {
-                Ok(body) => body,
                 Err(error) if error.kind() == io::ErrorKind::TimedOut => {
                     return Err(unvalidated_api_key(provider, &error.to_string(), host));
                 }
-                Err(_) => "<unreadable response body>".to_owned(),
+                read => rejected_body_text(read, key),
             };
             Err(format!(
-                "the {provider} API key was rejected on {host}: HTTP {status} {}. Nothing was \
-                 banked -- the {provider} credential on {host} is unchanged.",
-                body.trim()
+                "the {provider} API key was rejected on {host}: HTTP {status} {body}. Nothing was \
+                 banked -- the {provider} credential on {host} is unchanged."
             ))
         }
         Err(ureq::Error::Transport(error)) => {
@@ -1784,13 +1781,12 @@ fn validate_setup_token_with_timeout(
         Ok(_response) => Ok(()),
         Err(ureq::Error::Status(status, response)) => {
             let body = match response.into_string() {
-                Ok(body) => body,
                 Err(error) if error.kind() == io::ErrorKind::TimedOut => {
                     return Err(unvalidated_setup_token(&error.to_string(), host));
                 }
-                Err(_) => "<unreadable response body>".to_owned(),
+                read => rejected_body_text(read, token),
             };
-            Err(rejected_setup_token(status, body.trim(), host))
+            Err(rejected_setup_token(status, &body, host))
         }
         Err(ureq::Error::Transport(error)) => {
             Err(unvalidated_setup_token(&error.to_string(), host))
@@ -1830,6 +1826,53 @@ fn unvalidated_api_key(provider: &str, error: &str, host: &str) -> String {
 /// was refused is far more likely to be the wrong bytes than the wrong account. It
 /// must also not read as `unsupported (no subscription)` -- `onboard` classifies the
 /// cancel phase off that exact phrase, and this is not that.
+/// A rejected response body is the provider's own account of the refusal, so the
+/// operator sees it. It answers a request that carried a secret, though, and some
+/// providers echo the presented key or a prefix of it; those runs are masked. A
+/// body that could not be read says why instead of standing in a placeholder.
+fn rejected_body_text(read: io::Result<String>, secret: &str) -> String {
+    match read {
+        Ok(body) => presented_secret_redacted(body.trim(), secret),
+        Err(error) => format!("<unreadable response body: {error}>"),
+    }
+}
+
+/// Masks every run of at least eight characters (or the whole secret, when it is
+/// shorter) that matches the start of `secret`.
+fn presented_secret_redacted(text: &str, secret: &str) -> String {
+    const MIN_ECHO: usize = 8;
+    let secret = secret.trim();
+    if secret.is_empty() {
+        return text.to_owned();
+    }
+    let threshold = MIN_ECHO.min(secret.len());
+    let (bytes, key) = (text.as_bytes(), secret.as_bytes());
+    let mut redacted = String::with_capacity(text.len());
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        let mut matched = bytes[cursor..]
+            .iter()
+            .zip(key)
+            .take_while(|(a, b)| a == b)
+            .count();
+        while !text.is_char_boundary(cursor + matched) {
+            matched -= 1;
+        }
+        if matched >= threshold {
+            redacted.push_str("[REDACTED:presented_secret]");
+            cursor += matched;
+        } else {
+            let ch = text[cursor..]
+                .chars()
+                .next()
+                .expect("cursor is inside text");
+            redacted.push(ch);
+            cursor += ch.len_utf8();
+        }
+    }
+    redacted
+}
+
 fn rejected_setup_token(status: u16, body: &str, host: &str) -> String {
     format!(
         "the Anthropic setup token was rejected on {host}: HTTP {status} {body}. \
@@ -1859,6 +1902,51 @@ fn validate_harnesses(harnesses: &[String], catalog: &HarnessCatalog) -> Result<
         }
     }
     Ok(())
+}
+
+/// What a reader thread got from one child pipe. A read that failed keeps the
+/// bytes it had and the error, so the output is never presented as complete.
+struct PipeOutput {
+    stream: &'static str,
+    text: String,
+    read_error: Option<String>,
+}
+
+impl PipeOutput {
+    fn partial_note(&self) -> String {
+        match &self.read_error {
+            Some(error) => format!(
+                "; {} is partial: reading it failed after {} bytes: {error}",
+                self.stream,
+                self.text.len()
+            ),
+            None => String::new(),
+        }
+    }
+}
+
+fn drain_pipe(pipe: &mut impl Read) -> (Vec<u8>, Option<io::Error>) {
+    let mut bytes = Vec::new();
+    let error = pipe.read_to_end(&mut bytes).err();
+    (bytes, error)
+}
+
+fn joined_pipe(
+    reader: thread::JoinHandle<(Vec<u8>, Option<io::Error>)>,
+    stream: &'static str,
+) -> PipeOutput {
+    match reader.join() {
+        Ok((bytes, error)) => PipeOutput {
+            stream,
+            text: String::from_utf8_lossy(&bytes).into_owned(),
+            read_error: error.map(|error| error.to_string()),
+        },
+        Err(_) => PipeOutput {
+            stream,
+            text: String::new(),
+            read_error: Some("the reader thread panicked".to_owned()),
+        },
+    }
 }
 
 #[derive(Debug)]
@@ -1932,16 +2020,8 @@ impl CeremonyIo for SystemIo {
         }
         let mut stdout = child.stdout.take().expect("stdout was piped");
         let mut stderr = child.stderr.take().expect("stderr was piped");
-        let stdout_reader = thread::spawn(move || {
-            let mut bytes = Vec::new();
-            let _ = stdout.read_to_end(&mut bytes);
-            bytes
-        });
-        let stderr_reader = thread::spawn(move || {
-            let mut bytes = Vec::new();
-            let _ = stderr.read_to_end(&mut bytes);
-            bytes
-        });
+        let stdout_reader = thread::spawn(move || drain_pipe(&mut stdout));
+        let stderr_reader = thread::spawn(move || drain_pipe(&mut stderr));
         let started = Instant::now();
         let status = loop {
             match exited_without_reaping(&child) {
@@ -1956,12 +2036,17 @@ impl CeremonyIo for SystemIo {
                         libc::killpg(pgid, libc::SIGKILL);
                     }
                     let _ = child.wait();
-                    let stdout = stdout_reader.join().unwrap_or_default();
-                    let stderr = stderr_reader.join().unwrap_or_default();
+                    let stdout = joined_pipe(stdout_reader, "stdout");
+                    let stderr = joined_pipe(stderr_reader, "stderr");
                     return Err(ExecFailure {
-                        message: format!("command timed out after {} seconds", timeout.as_secs()),
-                        stdout: String::from_utf8_lossy(&stdout).into_owned(),
-                        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+                        message: format!(
+                            "command timed out after {} seconds{}{}",
+                            timeout.as_secs(),
+                            stdout.partial_note(),
+                            stderr.partial_note()
+                        ),
+                        stdout: stdout.text,
+                        stderr: stderr.text,
                         status: None,
                         timed_out: true,
                     });
@@ -1985,15 +2070,21 @@ impl CeremonyIo for SystemIo {
                 }
             }
         };
-        let stdout = stdout_reader.join().unwrap_or_default();
-        let stderr = stderr_reader.join().unwrap_or_default();
-        if status.success() {
-            Ok(String::from_utf8_lossy(&stdout).into_owned())
+        let stdout = joined_pipe(stdout_reader, "stdout");
+        let stderr = joined_pipe(stderr_reader, "stderr");
+        // Success output that could not be read whole is not the child's output,
+        // so it is a failure that says so rather than a truncated `Ok`.
+        if status.success() && stdout.read_error.is_none() {
+            Ok(stdout.text)
         } else {
             Err(ExecFailure {
-                message: format!("process exited with status {status}"),
-                stdout: String::from_utf8_lossy(&stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&stderr).into_owned(),
+                message: format!(
+                    "process exited with status {status}{}{}",
+                    stdout.partial_note(),
+                    stderr.partial_note()
+                ),
+                stdout: stdout.text,
+                stderr: stderr.text,
                 status: status.code(),
                 timed_out: false,
             })
@@ -2617,6 +2708,107 @@ fn target_from_probe(output: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Synthetic sentinel only; it never names a real credential.
+    const SENTINEL_KEY: &str = "sk-fixture-SENTINEL-0123456789abcdef";
+
+    fn serve_once(status_line: &'static str, body: String) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request);
+            let response = format!(
+                "HTTP/1.1 {status_line}\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn local_openai_rejection_keeps_the_body_and_masks_an_echoed_key() {
+        let echoed = format!(
+            r#"{{"error":{{"message":"Incorrect API key provided: {}****. See docs.","code":"invalid_api_key"}}}}"#,
+            &SENTINEL_KEY[..14]
+        );
+        let endpoint = serve_once("401 Unauthorized", echoed);
+        let error = validate_local_openai_endpoint_with_timeout(
+            &endpoint,
+            Some(SENTINEL_KEY),
+            "fixture-host",
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(error.contains("HTTP 401"), "{error}");
+        assert!(error.contains("\"code\":\"invalid_api_key\""), "{error}");
+        assert!(
+            error.contains("Incorrect API key provided: [REDACTED:presented_secret]****"),
+            "{error}"
+        );
+        assert!(!error.contains(&SENTINEL_KEY[..8]), "{error}");
+        assert!(error.contains("Nothing was banked"), "{error}");
+    }
+
+    #[test]
+    fn presented_secret_redaction_masks_whole_and_prefix_echoes_only() {
+        let text = format!(
+            "full {SENTINEL_KEY} prefix {} short sk-fix end",
+            &SENTINEL_KEY[..10]
+        );
+        assert_eq!(
+            presented_secret_redacted(&text, SENTINEL_KEY),
+            "full [REDACTED:presented_secret] prefix [REDACTED:presented_secret] short sk-fix end"
+        );
+        assert_eq!(
+            presented_secret_redacted("naïve body", "abcdefghij"),
+            "naïve body"
+        );
+        assert_eq!(presented_secret_redacted("no secret", ""), "no secret");
+    }
+
+    #[test]
+    fn an_unreadable_rejection_body_names_the_read_error() {
+        let read = Err(io::Error::new(io::ErrorKind::UnexpectedEof, "fixture eof"));
+        assert_eq!(
+            rejected_body_text(read, SENTINEL_KEY),
+            "<unreadable response body: fixture eof>"
+        );
+    }
+
+    struct FailsAfter(&'static [u8]);
+
+    impl Read for FailsAfter {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if self.0.is_empty() {
+                return Err(io::Error::new(io::ErrorKind::Other, "fixture pipe fault"));
+            }
+            let count = self.0.len().min(buffer.len());
+            buffer[..count].copy_from_slice(&self.0[..count]);
+            self.0 = &self.0[count..];
+            Ok(count)
+        }
+    }
+
+    #[test]
+    fn a_failed_pipe_read_is_reported_partial_with_its_bytes() {
+        let reader = thread::spawn(|| drain_pipe(&mut FailsAfter(b"partial")));
+        let output = joined_pipe(reader, "stdout");
+        assert_eq!(output.text, "partial");
+        assert_eq!(
+            output.partial_note(),
+            "; stdout is partial: reading it failed after 7 bytes: fixture pipe fault"
+        );
+
+        let whole = joined_pipe(thread::spawn(|| drain_pipe(&mut &b"whole"[..])), "stderr");
+        assert_eq!(
+            (whole.text.as_str(), whole.partial_note()),
+            ("whole", String::new())
+        );
+    }
 
     #[test]
     fn cursor_prerequisite_refuses_before_the_gateway_begins_or_reads_a_key() {
