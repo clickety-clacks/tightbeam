@@ -38,6 +38,17 @@ package/source identity alongside the emitted lifecycle IDs and retirement
 result. No real-harness proof is implied by unit tests. Harness parity below
 still applies; narrowed runs are incomplete for skipped harnesses.
 
+### 0.1.9 release acceptance: retired failed-turn session (GH #15)
+
+In an authorized disposable org, create a throwaway agent using a model the
+selected harness rejects, and record its session key, parent, turn count and
+parent notifications. Retire that agent, then observe beyond the failed-turn
+retry interval. PASS: the retired agent gets no new turns or re-enqueued work,
+and its parent gets no new retry or escalation notice from that agent. Record
+the exact installed 0.1.9 revision, harness/version, retirement time, observation
+interval and before/after counts. This is an acceptance check for the installer;
+do not run it against the live org.
+
 ## Harness parity (normative for every run)
 
 This runbook is a MATRIX, not a list: one full pass PER HARNESS the org
