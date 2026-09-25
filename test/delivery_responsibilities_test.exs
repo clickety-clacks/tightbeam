@@ -504,7 +504,7 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
     for caller <- [Org.personal_session_key("owner"), "po-a"] do
       assert {:error,
               %{
-                rule: "engineering-assign-production-needs-responsibility",
+                rule: "engineering-assign-production-needs-delivery-owner",
                 message: message
               }} =
                Dispatch.dispatch(
@@ -513,11 +513,16 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
                  production_call("assign", caller, "worker-a", "wi_a1")
                )
 
-      assert message =~ "Current accountable owner: none"
-      assert message =~ "Route the request through that owner"
+      assert message =~ "No accountable delivery owner is recorded"
+      assert message =~ "Establish the work item's delivery scope and accountable owner"
+      refute message =~ "Route the request through that owner"
     end
 
-    assert {:error, %{rule: "engineering-dispatch-production-needs-responsibility"}} =
+    assert {:error,
+            %{
+              rule: "engineering-dispatch-production-needs-delivery-owner",
+              message: dispatch_message
+            }} =
              Dispatch.dispatch(
                db,
                assignment_handlers,
@@ -528,6 +533,28 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
                  "wi_a1"
                )
              )
+
+    assert dispatch_message =~ "No accountable delivery owner is recorded"
+    assert dispatch_message =~ "Establish the work item's delivery scope and accountable owner"
+
+    assert {:error,
+            %{
+              rule: "engineering-dispatch-labeled-coordination-needs-delivery-owner",
+              message: labeled_dispatch_message
+            }} =
+             Dispatch.dispatch(
+               db,
+               assignment_handlers,
+               production_call(
+                 "dispatch",
+                 Org.personal_session_key("owner"),
+                 "worker-a",
+                 "wi_a1",
+                 effect_kind: "coordination"
+               )
+             )
+
+    assert labeled_dispatch_message =~ "No accountable delivery owner is recorded"
 
     assert {:error, %{rule: "engineering-assign-staffing-needs-work-item"}} =
              Dispatch.dispatch(
@@ -590,8 +617,8 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
              )
 
     for {misleading_effect, rule} <- [
-          {"coordination", "engineering-assign-labeled-coordination-needs-responsibility"},
-          {"review", "engineering-assign-production-needs-responsibility"}
+          {"coordination", "engineering-assign-labeled-coordination-needs-delivery-owner"},
+          {"review", "engineering-assign-production-needs-delivery-owner"}
         ] do
       assert {:error, %{rule: ^rule}} =
                Dispatch.dispatch(
@@ -630,12 +657,16 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
                spawn_call(Org.personal_session_key("owner"), "orchestrator", "wi_missing")
              )
 
-    assert {:error, %{rule: "engineering-spawn-staffing-needs-responsibility"}} =
+    assert {:error,
+            %{rule: "engineering-spawn-staffing-needs-delivery-owner", message: spawn_message}} =
              Dispatch.dispatch(
                db,
                spawn_handlers,
                spawn_call(Org.personal_session_key("owner"), nil, "wi_a1")
              )
+
+    assert spawn_message =~ "No accountable delivery owner is recorded"
+    assert spawn_message =~ "Establish the work item's delivery scope and accountable owner"
 
     assert {:ok, %{archetype: "product-owner"}} =
              Dispatch.dispatch(

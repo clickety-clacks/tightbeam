@@ -24,6 +24,17 @@ deny_when = [
 ]
 
 [[rule]]
+name = "engineering-spawn-staffing-needs-delivery-owner"
+verb = "spawn"
+text = "Worker staffing requires an explicit delivery scope and accountable owner for this exact work item. No accountable delivery owner is recorded. Establish the work item's delivery scope and accountable owner before retrying."
+edges = ["verb"]
+effect = "deny"
+deny_when = [
+  { fact = "work_item.reference_state", op = "eq", value = "known" },
+  { fact = "work_item.has_delivery_owner", op = "ne", value = true },
+]
+
+[[rule]]
 name = "engineering-spawn-staffing-needs-responsibility"
 verb = "spawn"
 text = "Worker staffing requires accountable or explicitly delegated responsibility for this exact work item. Current accountable owner: {delivery_owner_ref}. Route the request through that owner or obtain an active exact-item delegation before retrying."
@@ -82,6 +93,18 @@ deny_when = [
 ]
 
 [[rule]]
+name = "engineering-assign-production-needs-delivery-owner"
+verb = "assign"
+text = "Production staffing requires an explicit delivery scope and accountable owner for this exact work item. No accountable delivery owner is recorded. Establish the work item's delivery scope and accountable owner before retrying."
+edges = ["verb"]
+effect = "deny"
+deny_when = [
+  { fact = "assign.is_linked_review", op = "ne", value = true },
+  { fact = "assign.effect_kind", op = "ne", value = "coordination" },
+  { fact = "work_item.has_delivery_owner", op = "ne", value = true },
+]
+
+[[rule]]
 name = "engineering-assign-production-needs-responsibility"
 verb = "assign"
 text = "Production staffing requires accountable or explicitly delegated responsibility for this exact work item. Current accountable owner: {delivery_owner_ref}. Route the request through that owner or obtain an active exact-item delegation before retrying."
@@ -91,6 +114,20 @@ deny_when = [
   { fact = "assign.is_linked_review", op = "ne", value = true },
   { fact = "assign.effect_kind", op = "ne", value = "coordination" },
   { fact = "caller.delivery_responsibility", op = "not_in", value = ["accountable", "delegated"] },
+]
+
+[[rule]]
+name = "engineering-assign-labeled-coordination-needs-delivery-owner"
+verb = "assign"
+text = "A coordination label does not grant production custody. No accountable delivery owner is recorded. Establish the work item's delivery scope and accountable owner before retrying."
+edges = ["verb"]
+effect = "deny"
+deny_when = [
+  { fact = "assign.is_linked_review", op = "ne", value = true },
+  { fact = "assign.effect_kind", op = "eq", value = "coordination" },
+  { fact = "target.archetype", op = "not_in", value = ["product-owner", "pdo"] },
+  { fact = "target.delivery_responsibility", op = "ne", value = "accountable" },
+  { fact = "work_item.has_delivery_owner", op = "ne", value = true },
 ]
 
 [[rule]]
@@ -170,6 +207,17 @@ deny_when = [
 ]
 
 [[rule]]
+name = "engineering-dispatch-production-needs-delivery-owner"
+verb = "dispatch"
+text = "Production staffing requires an explicit delivery scope and accountable owner for this exact work item. No accountable delivery owner is recorded. Establish the work item's delivery scope and accountable owner before retrying."
+edges = ["verb"]
+effect = "deny"
+deny_when = [
+  { fact = "assign.effect_kind", op = "ne", value = "coordination" },
+  { fact = "work_item.has_delivery_owner", op = "ne", value = true },
+]
+
+[[rule]]
 name = "engineering-dispatch-production-needs-responsibility"
 verb = "dispatch"
 text = "Production staffing requires accountable or explicitly delegated responsibility for this exact work item. Current accountable owner: {delivery_owner_ref}. Route the request through that owner or obtain an active exact-item delegation before retrying."
@@ -178,6 +226,19 @@ effect = "deny"
 deny_when = [
   { fact = "assign.effect_kind", op = "ne", value = "coordination" },
   { fact = "caller.delivery_responsibility", op = "not_in", value = ["accountable", "delegated"] },
+]
+
+[[rule]]
+name = "engineering-dispatch-labeled-coordination-needs-delivery-owner"
+verb = "dispatch"
+text = "A coordination label does not grant production custody. No accountable delivery owner is recorded. Establish the work item's delivery scope and accountable owner before retrying."
+edges = ["verb"]
+effect = "deny"
+deny_when = [
+  { fact = "assign.effect_kind", op = "eq", value = "coordination" },
+  { fact = "target.archetype", op = "not_in", value = ["product-owner", "pdo"] },
+  { fact = "target.delivery_responsibility", op = "ne", value = "accountable" },
+  { fact = "work_item.has_delivery_owner", op = "ne", value = true },
 ]
 
 [[rule]]
