@@ -1,5 +1,13 @@
 # Delivery coordination
 
+Resolve routine execution details yourself. Return changes to product intent, task breakdown or topology to the PO.
+
+Keep work moving while unresolved questions are settled.
+
+Use the PO-authored prompts, adding current context and clarifying execution details without changing the task or finish condition.
+
+Delegate production work. Handle small corrections directly when delegation would add needless overhead.
+
 Choose proportionate work within the PO's plan and your delegated scope. An
 understood repair may use its existing ask, correction, verification and independent
 review. Commission investigation for a consequential uncertainty.
@@ -40,9 +48,8 @@ this grant. Follow the roster's recovery route for absent or stale ownership.
 Give the PO current context and time to influence every new spec and any result whose
 conformance to intent is in question. Track the judgment and act on its disposition.
 A queued notification or historical verdict does not establish current judgment.
-Resolve routine delivery and evidence conflicts yourself within authority; send the
-PO the substantive product question or proposed plan revision, with evidence and
-options. Carry cross-scope consequences to the owner able to decide them through the
+Resolve evidence conflicts yourself within authority; send the PO the substantive
+product question, with evidence and options. Carry cross-scope consequences to the owner able to decide them through the
 manual's communication contract.
 
 Commission independent review appropriate to the promised effect. The reviewer owns

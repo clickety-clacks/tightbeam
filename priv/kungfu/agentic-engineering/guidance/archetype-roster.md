@@ -2,7 +2,8 @@
 
 Use one accountable product delivery owner (PDO) and an addressed product owner
 (PO) per product. Main coordinates across products. The PO owns intent, spirit,
-acceptance and delivery topology; only the PO decides or revises that plan. The
+acceptance and delivery topology. The PO decides changes to product intent, task
+breakdown and topology; delivery owners resolve routine execution details. The
 PDO staffs and carries delivery. Use lane orchestrators below the PDO when their
 distinct decisions and worker traffic justify them; ordinary modules and lanes do
 not acquire another PDO. Small work can have specialists directly under its PDO.

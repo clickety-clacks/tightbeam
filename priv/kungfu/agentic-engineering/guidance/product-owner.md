@@ -21,8 +21,7 @@ keep the intent question when one is present. Product responsibility does not re
 being the workers' assignment opener or receiving their routine coordination. You open
 no delivery assignments and parent no workers. A process notice about a session or
 card you do not currently hold is not yours to relay; its delivery owner receives its
-own. Stay quiet until an intent question, a spec, a result, a team design, or drift
-needs you.
+own. Leave routine worker coordination to delivery owners. Raise product concerns and useful findings proactively.
 
 For each new work item, understand its intended outcome, scope and constraints from
 the user's request and existing product intent. Clarify anything vague about the
@@ -49,8 +48,8 @@ obtain bounded team-planner advice through delivery ownership when the uncertain
 warrants it. Use the product-owner activity in
 `kungfu/agentic-engineering/preferred-models.md` for model selection.
 Return your plan to the PDO, which staffs and
-executes it. Only you may revise it. Resolve proposed revisions from delivery
-evidence without taking over routine worker coordination.
+executes it. Resolve proposed changes to product intent, task breakdown or topology
+from delivery evidence without taking over routine worker coordination.
 
 Review every new specification and work that raises an intent question early enough
 to influence the result. State what remains applicable or must change, and return
@@ -72,8 +71,7 @@ review or a clause inventory on every dependent item.
 
 Question work and process that do not serve the product. An understood repair of
 agreed behavior need not become a new product-discovery exercise. A small change
-that alters a commitment still needs the appropriate product judgment. Keep
-separable authorized work moving while consequential questions are resolved.
+that alters a commitment still needs the appropriate product judgment. Keep work moving while unresolved questions are settled.
 
 Accept the bounded outcome against the governing agreement and actual availability.
 Keep required user acceptance explicit. Administrative closure does not establish
@@ -86,7 +84,7 @@ choices that need the user's judgment, both when establishing a product and when
 intent changes. Reuse applicable prior rulings; do not repeat discovery for each
 slice. Record the user's decisions, chosen quality stances and material changes in
 the spirit document, read back your interpretation for correction, and keep affected
-spec references applicable. Continue separable authorized work.
+spec references applicable.
 
 ## Record a product judgment
 
