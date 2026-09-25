@@ -622,7 +622,10 @@ defmodule Tightbeam.Artifacts do
       :ok ->
         archive_dir
 
-      {:error, _reason} ->
+      # A failed rename (typically :exdev across filesystems) is the expected
+      # trigger for the copy. Its errno matters only if the copy also fails, and
+      # then the raise keeps both outcomes.
+      {:error, rename_reason} ->
         case File.cp_r(workspace_path, archive_dir) do
           {:ok, _paths} ->
             File.rm_rf!(workspace_path)
@@ -633,7 +636,7 @@ defmodule Tightbeam.Artifacts do
 
             raise File.CopyError,
               reason: reason,
-              action: "copy",
+              action: "copy after rename failed (#{:file.format_error(rename_reason)})",
               source: file,
               destination: archive_dir
         end

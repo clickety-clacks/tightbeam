@@ -149,7 +149,7 @@ defmodule Tightbeam.LocalOpenAi.Providers do
   end
 
   defp decode_record(bytes, expected_name, path) do
-    with {:ok, decoded} <- JSON.decode(bytes),
+    with {:ok, decoded} <- decode_json(bytes),
          {:ok, record} <- normalize_record(decoded, expected_name) do
       {:ok, record}
     else
@@ -158,6 +158,21 @@ defmodule Tightbeam.LocalOpenAi.Providers do
         {:error, "the local-openai provider record#{label} is invalid: #{reason}"}
     end
   end
+
+  # JSON.decode reasons are tuples, which cannot be interpolated. Keep the
+  # parser's offset but not the offending bytes: the record carries an apiKey.
+  defp decode_json(bytes) do
+    case JSON.decode(bytes) do
+      {:ok, decoded} -> {:ok, decoded}
+      {:error, reason} -> {:error, "not valid JSON: #{json_error_text(reason)}"}
+    end
+  end
+
+  defp json_error_text({:invalid_byte, offset, _byte}), do: "invalid byte at offset #{offset}"
+  defp json_error_text({:unexpected_end, offset}), do: "unexpected end at offset #{offset}"
+
+  defp json_error_text({:unexpected_sequence, offset, _bytes}),
+    do: "unexpected sequence at offset #{offset}"
 
   defp remote_provider_files(target, ssh, dir) do
     script =

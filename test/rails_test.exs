@@ -83,7 +83,8 @@ defmodule Tightbeam.RailsTest do
       {%{"name" => :omit}, ~r/statute is missing "name"/},
       {%{"name" => ~s("Bad_Name")}, ~r/invalid statute name/},
       {%{"sevrity" => "1"}, ~r/unknown statute keys.*sevrity/},
-      {%{"pattern" => ~s{"("}}, ~r/invalid gate pattern/}
+      # The compiler's own reason and byte offset survive, not only "invalid".
+      {%{"pattern" => ~s{"("}}, ~r/invalid gate pattern: "\(": \S.* at byte \d+$/}
     ]
 
     for {overrides, error} <- cases do

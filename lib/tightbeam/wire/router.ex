@@ -182,7 +182,11 @@ defmodule Tightbeam.Wire.Router do
       |> Plug.Conn.put_resp_content_type("application/json")
       |> Plug.Conn.send_resp(200, bytes)
     else
-      {:error, status, code, message} -> error(conn, status, code, message)
+      {:error, status, code, message} ->
+        error(conn, status, code, message)
+
+      {:error, status, code, message, diagnostic} ->
+        error(conn, status, code, message, diagnostic)
     end
   end
 
@@ -266,7 +270,11 @@ defmodule Tightbeam.Wire.Router do
           json(conn, 200, %{"observed" => false, "diagnostic" => diagnostic})
       end
     else
-      {:error, status, code, message} -> error(conn, status, code, message)
+      {:error, status, code, message} ->
+        error(conn, status, code, message)
+
+      {:error, status, code, message, diagnostic} ->
+        error(conn, status, code, message, diagnostic)
     end
   end
 
@@ -1346,8 +1354,13 @@ defmodule Tightbeam.Wire.Router do
            required,
            conn.request_path
          ) do
-      {:error, _reason} ->
-        {:error, 503, "mismatch_state_unavailable", "CLI mismatch state could not be recorded"}
+      {:error, reason} ->
+        {:error, 503, "mismatch_state_unavailable", "CLI mismatch state could not be recorded",
+         ErrorDiagnostic.from_reason(reason,
+           operation: "observe_cli_compatibility",
+           origin: "gateway",
+           cli_state: state
+         )}
 
       _ ->
         :ok

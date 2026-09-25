@@ -1,6 +1,9 @@
 defmodule Tightbeam.PiProvider do
   @moduledoc false
 
+  require Logger
+
+  alias Tightbeam.ErrorDiagnostic
   alias Tightbeam.LocalOpenAi.Providers
   alias Tightbeam.PiProvider.LocalOpenAi
   alias Tightbeam.PiProvider.OpenCodeGo
@@ -75,18 +78,26 @@ defmodule Tightbeam.PiProvider do
   end
 
   @doc false
+  # Materialization still proceeds without the named providers when they cannot
+  # be read, but the record says why instead of reading as "none configured".
   def named_local_providers(base_dir) when is_binary(base_dir) do
     case Providers.read_all(base_dir) do
       {:ok, records} -> records
-      {:error, _} -> []
+      {:error, reason} -> unreadable_providers(reason)
     end
   end
 
   def named_local_providers(%{host_config: _} = target) do
     case Providers.read_all_target(target) do
       {:ok, records} -> records
-      {:error, _} -> []
+      {:error, reason} -> unreadable_providers(reason)
     end
+  end
+
+  defp unreadable_providers(reason) do
+    node = ErrorDiagnostic.from_reason(reason, operation: "read_local_providers")
+    Logger.warning("local-openai providers could not be read: #{JSON.encode!(node)}")
+    []
   end
 
   @doc false

@@ -38,6 +38,46 @@ defmodule Tightbeam.LocalOpenAiRuntimeTest do
     end
   end
 
+  describe "malformed provider records" do
+    @sentinel "sk-fixture-SENTINEL-0123456789abcdef"
+
+    setup do
+      base =
+        Path.join(System.tmp_dir!(), "tb-local-openai-bad-#{System.unique_integer([:positive])}")
+
+      File.mkdir_p!(Providers.providers_dir(base))
+
+      File.write!(
+        Providers.provider_path(base, "spark"),
+        ~s({"name":"spark","apiKey":"#{@sentinel}" x})
+      )
+
+      on_exit(fn -> File.rm_rf(base) end)
+      %{base: base}
+    end
+
+    test "a JSON parse failure is a named reason, not a crash, and omits the bytes", %{base: base} do
+      assert {:error, reason} = Providers.read(base, "spark")
+      assert reason =~ "is invalid: not valid JSON: invalid byte at offset"
+      refute reason =~ @sentinel
+
+      bytes = File.read!(Providers.provider_path(base, "spark"))
+      assert Providers.hollow_reason(bytes) =~ "not valid JSON: invalid byte at offset"
+    end
+
+    test "materialization proceeds without them but logs why", %{base: base} do
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert PiProvider.named_local_providers(base) == []
+        end)
+
+      assert log =~ "local-openai providers could not be read"
+      assert log =~ "read_local_providers"
+      assert log =~ "not valid JSON"
+      refute log =~ @sentinel
+    end
+  end
+
   describe "Pi models.json materialization" do
     test "a keyless named provider uses Pi's non-secret local sentinel" do
       record = %{
