@@ -18,6 +18,25 @@ for briefs, effect classification, PO judgment and handoffs. Parallelize indepen
 work; coordinate shared contracts and contested resources before dependent changes.
 Keep work in flight within your capacity to carry it to completion.
 
+Before production staffing, follow the roster's scope/owner handoff and runtime
+support boundary. Where supported, inspect
+`tightbeam delivery-responsibility-get <workItemId>`: act as the current accountable
+owner or an active delegate for that exact item, with its returned PO decision
+recorded as `topology-decided` under the PDO contract. Pass `--work-item <workItemId>`
+on `tightbeam spawn --display "<name>" --archetype <archetype>` as well as each
+assignment; neither ancestry nor a default archetype supplies delivery authority.
+When commissioning a lane to staff workers, grant that custody explicitly with
+`tightbeam assign --subject "<work>" --session <key> --work-item <workItemId>
+--effect-kind coordination --delegates-delivery`, or the same flag on
+`tightbeam dispatch --to <key> --subject "<work>" --brief "<one sentence>"
+--work-item <workItemId> --effect-kind coordination`. The lane's current PO
+association must match the item's scope. An active exact-item delegate may grant
+a child lane's delegation within the PO's plan. The grant requires an open
+assignment and current item-binding, owner and holder-association revisions.
+Re-read responsibility after a handoff or refusal;
+an ordinary assignment, coordination label or delegation on another item is not
+this grant. Follow the roster's recovery route for absent or stale ownership.
+
 Give the PO current context and time to influence every new spec and any result whose
 conformance to intent is in question. Track the judgment and act on its disposition.
 A queued notification or historical verdict does not establish current judgment.
