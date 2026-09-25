@@ -3572,6 +3572,9 @@ defmodule Tightbeam.Gateway do
                       {:error, {:adapter_unavailable, _reason}} = error ->
                         error
 
+                      {:error, {:codex_identity_projection_failed, _reason}} = error ->
+                        error
+
                       {:error, lost} ->
                         # Spec §pointer chain: reason "fallback" — the harness lost
                         # the session; start fresh, on the record, model context

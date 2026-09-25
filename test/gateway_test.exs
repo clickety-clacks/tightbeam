@@ -6685,6 +6685,15 @@ defmodule Tightbeam.GatewayTest do
     )
   end
 
+  @tag cold_gateway: true, gateway_reattach_projection_failure: true, tmp_dir: true
+  test "Codex projection refusal on reattach preserves the pointer", %{tmp_dir: tmp} do
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "live_base_gateway_reattach_projection_failure.exs",
+      "guarded-gateway-reattach-projection-failure: ok"
+    )
+  end
+
   @tag cold_gateway: true, gateway_unknown_default: true, tmp_dir: true
   test "unknown new-session paths keep and capture the harness default", %{tmp_dir: tmp} do
     Tightbeam.GuardRuntimeFixture.run!(
