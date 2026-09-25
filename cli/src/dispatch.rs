@@ -1749,33 +1749,57 @@ fn send_to_with_timeout(
     let (status, response) = match call {
         Ok(response) => (response.status(), response),
         Err(ureq::Error::Status(status, response)) => (status, response),
-        Err(ureq::Error::Transport(error)) => return Err(error.to_string()),
+        Err(ureq::Error::Transport(error)) => return Err(transport_failure(&error)),
     };
-    let encoded = response.into_string().map_err(|error| error.to_string())?;
-    if !(200..300).contains(&status) && request.body_json.contains(r#""verb":"tune""#) {
-        return Err(tune_refusal_json(&encoded));
+    let tune = is_tune(request);
+    let encoded = match response.into_string() {
+        Ok(encoded) => encoded,
+        Err(error) => {
+            return Err(if tune {
+                machine_line(flattened(unreadable_error(status, &error)))
+            } else {
+                unreadable_response(status, &error)
+            });
+        }
+    };
+    if !(200..300).contains(&status) && tune {
+        return Err(tune_refusal_json(status, &encoded));
     }
     parse_response(status, &encoded)
 }
 
-fn tune_refusal_json(encoded: &str) -> String {
+/// Read from the verb the body actually names, not from a substring of it: any other
+/// field that happened to contain `"verb":"tune"` would otherwise re-route the reply.
+fn is_tune(request: &RequestSpec) -> bool {
+    serde_json::from_str::<Value>(&request.body_json)
+        .ok()
+        .and_then(|body| {
+            body.get("verb")
+                .and_then(Value::as_str)
+                .map(|verb| verb == "tune")
+        })
+        .unwrap_or(false)
+}
+
+/// `tune` refusals are one JSON object on stderr, the whole error envelope flattened
+/// with `ok: false`. Undecodable replies keep that shape so a caller parsing tune output
+/// never meets prose in its place.
+fn tune_refusal_json(status: u16, encoded: &str) -> String {
     let parsed: Value = match serde_json::from_str(encoded) {
         Ok(parsed) => parsed,
-        Err(error) => return error.to_string(),
+        Err(error) => return machine_line(flattened(undecodable_error(status, encoded, &error))),
     };
     let error = parsed.get("error").unwrap_or(&parsed);
     let mut refusal = match error.as_object() {
         Some(fields) => fields.clone(),
         None => {
-            return serde_json::to_string(&serde_json::json!({
-                "ok": false,
-                "code": "undefined",
-                "message": ""
-            }))
-            .expect("JSON value serializes");
+            let mut fields = serde_json::Map::new();
+            fields.insert("body".to_owned(), parsed.clone());
+            fields
         }
     };
     refusal.insert("ok".to_owned(), Value::Bool(false));
+    refusal.insert("httpStatus".to_owned(), Value::from(status));
 
     serde_json::to_string(&Value::Object(refusal)).expect("JSON value serializes")
 }
@@ -1824,28 +1848,28 @@ fn ceremony_expired() -> String {
     "gateway request refused because the onboarding lease expired".to_owned()
 }
 
+/// Every gateway failure the CLI reports carries two readings. Its first line is the
+/// sentence a person acts on; a line of its own, the last one unless a caller appends
+/// later context on further lines, is one JSON object beginning `{"ok":false` for a
+/// script. That object keeps the HTTP status and the gateway's whole `error`
+/// envelope (code, message, requestId, diagnostic and any other field), so nothing the
+/// gateway said is lost to the rendering. A reply that could not be read or decoded
+/// names that as its own code and keeps a bounded, redacted copy of what arrived.
+/// Errors raised by the CLI itself, before any request, stay plain prose.
 pub(crate) fn parse_response(status: u16, encoded: &str) -> Result<Option<Value>, String> {
-    let json: Value = serde_json::from_str(encoded).map_err(|error| error.to_string())?;
+    let json: Value = match serde_json::from_str(encoded) {
+        Ok(json) => json,
+        Err(error) => return Err(undecodable_response(status, encoded, &error)),
+    };
 
     if !(200..300).contains(&status) {
-        let code = json
-            .pointer("/error/code")
-            .and_then(Value::as_str)
-            .unwrap_or("undefined");
-        let message = json.pointer("/error/message").and_then(Value::as_str);
-        let request_id = json.pointer("/error/requestId").and_then(Value::as_str);
-        let rendered = match message {
-            Some(message) if !message.is_empty() => format!("{code}: {message}"),
-            _ => code.to_owned(),
-        };
-        return Err(match request_id {
-            Some(request_id) if !request_id.is_empty() => format!("{rendered} ({request_id})"),
-            _ => rendered,
-        });
+        return Err(refused_response(status, &json));
     }
 
+    // A 2xx whose body still carries an error is a failure: the status must not be the
+    // only thing a caller reads.
     if json.get("error").is_some_and(|error| !error.is_null()) {
-        return Err(serde_json::to_string_pretty(&json).expect("JSON value serializes"));
+        return Err(refused_response(status, &json));
     }
 
     // The third outcome (202). It is not a result: the verb HALTED and its
@@ -1853,7 +1877,8 @@ pub(crate) fn parse_response(status: u16, encoded: &str) -> Result<Option<Value>
     // agent the action happened. It is not the error envelope either, so it
     // needs its own branch or it falls through to `result` -- absent -- and
     // becomes a silent success. Rendered like a refusal because that is what
-    // the caller must do about it: the action did not take effect.
+    // the caller must do about it: the action did not take effect. Its machine
+    // line carries `decisionPending`, never `error`, so it stays distinct.
     if let Some(pending) = json.get("decisionPending") {
         let id = pending
             .get("decisionRequestId")
@@ -1863,10 +1888,217 @@ pub(crate) fn parse_response(status: u16, encoded: &str) -> Result<Option<Value>
             .get("message")
             .and_then(Value::as_str)
             .unwrap_or("this action needs an owner decision");
-        return Err(format!("decision_pending: {message} ({id})"));
+        let mut machine = serde_json::Map::new();
+        machine.insert("httpStatus".to_owned(), Value::from(status));
+        machine.insert("decisionPending".to_owned(), pending.clone());
+        return Err(two_readings(
+            format!("decision_pending: {message} ({id})"),
+            machine,
+        ));
     }
 
     Ok(json.get("result").cloned())
+}
+
+fn refused_response(status: u16, json: &Value) -> String {
+    let mut machine = serde_json::Map::new();
+    machine.insert("httpStatus".to_owned(), Value::from(status));
+    let human = match json.get("error") {
+        Some(Value::Object(fields)) => {
+            machine.insert("error".to_owned(), Value::Object(fields.clone()));
+            refusal_sentence(status, fields)
+        }
+        _ => {
+            machine.insert("body".to_owned(), json.clone());
+            format!(
+                "gateway answered HTTP {status} without an error object: {}",
+                bounded_body(&json.to_string())
+            )
+        }
+    };
+    two_readings(human, machine)
+}
+
+fn refusal_sentence(status: u16, fields: &serde_json::Map<String, Value>) -> String {
+    let text = |key: &str| {
+        fields
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+    };
+    let code = match text("code") {
+        Some(code) => code.to_owned(),
+        None => format!("HTTP {status} error without a code"),
+    };
+    let rendered = match text("message") {
+        Some(message) => format!("{code}: {message}"),
+        None => code,
+    };
+    match text("requestId") {
+        Some(request_id) => format!("{rendered} ({request_id})"),
+        None => rendered,
+    }
+}
+
+fn undecodable_response(status: u16, encoded: &str, error: &serde_json::Error) -> String {
+    let fields = undecodable_error(status, encoded, error);
+    let human = format!(
+        "gateway reply (HTTP {status}) is not JSON: {error}; received: {}",
+        fields["error"]["body"].as_str().unwrap_or_default()
+    );
+    two_readings(human, fields)
+}
+
+fn undecodable_error(
+    status: u16,
+    encoded: &str,
+    error: &serde_json::Error,
+) -> serde_json::Map<String, Value> {
+    let mut detail = serde_json::Map::new();
+    detail.insert("code".to_owned(), Value::from("response_undecodable"));
+    detail.insert("message".to_owned(), Value::from(error.to_string()));
+    detail.insert("line".to_owned(), Value::from(error.line()));
+    detail.insert("column".to_owned(), Value::from(error.column()));
+    detail.insert("bodyBytes".to_owned(), Value::from(encoded.len()));
+    detail.insert("body".to_owned(), Value::from(bounded_body(encoded)));
+    let mut fields = serde_json::Map::new();
+    fields.insert("httpStatus".to_owned(), Value::from(status));
+    fields.insert("error".to_owned(), Value::Object(detail));
+    fields
+}
+
+fn unreadable_response(status: u16, error: &std::io::Error) -> String {
+    let fields = unreadable_error(status, error);
+    two_readings(
+        format!("gateway reply (HTTP {status}) could not be read: {error}"),
+        fields,
+    )
+}
+
+fn unreadable_error(status: u16, error: &std::io::Error) -> serde_json::Map<String, Value> {
+    let mut detail = serde_json::Map::new();
+    detail.insert("code".to_owned(), Value::from("response_unreadable"));
+    detail.insert("message".to_owned(), Value::from(error.to_string()));
+    detail.insert(
+        "kind".to_owned(),
+        Value::from(format!("{:?}", error.kind())),
+    );
+    let mut fields = serde_json::Map::new();
+    fields.insert("httpStatus".to_owned(), Value::from(status));
+    fields.insert("error".to_owned(), Value::Object(detail));
+    fields
+}
+
+/// No status: the request never got a reply.
+fn transport_failure(error: &ureq::Transport) -> String {
+    let mut detail = serde_json::Map::new();
+    detail.insert("code".to_owned(), Value::from("transport_failed"));
+    detail.insert(
+        "kind".to_owned(),
+        Value::from(format!("{:?}", error.kind())),
+    );
+    detail.insert("message".to_owned(), Value::from(error.to_string()));
+    let mut fields = serde_json::Map::new();
+    fields.insert("error".to_owned(), Value::Object(detail));
+    two_readings(error.to_string(), fields)
+}
+
+/// The tune shape: the `error` object's fields at the top level beside the status.
+fn flattened(mut fields: serde_json::Map<String, Value>) -> serde_json::Map<String, Value> {
+    if let Some(Value::Object(error)) = fields.remove("error") {
+        fields.extend(error);
+    }
+    fields
+}
+
+fn two_readings(human: String, machine: serde_json::Map<String, Value>) -> String {
+    format!("{human}\n{}", machine_line(machine))
+}
+
+fn machine_line(mut machine: serde_json::Map<String, Value>) -> String {
+    machine.insert("ok".to_owned(), Value::Bool(false));
+    serde_json::to_string(&Value::Object(machine)).expect("JSON value serializes")
+}
+
+const BODY_LIMIT: usize = 2048;
+
+/// What arrived, cut to a bound on a character boundary, with token-prefixed and bearer
+/// credentials masked by the same prefixes and marker as
+/// `Tightbeam.ErrorDiagnostic.redact_text/1`. A reply the CLI could not decode was not
+/// shaped by the gateway's own redaction, so its copy is masked here.
+fn bounded_body(encoded: &str) -> String {
+    let redacted = redact_body(encoded);
+    if redacted.len() <= BODY_LIMIT {
+        return redacted;
+    }
+    let mut end = BODY_LIMIT;
+    while !redacted.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...[truncated]", &redacted[..end])
+}
+
+fn redact_body(text: &str) -> String {
+    const PREFIXES: [&str; 17] = [
+        "github_pat_",
+        "gho_",
+        "ghp_",
+        "ghu_",
+        "ghs_",
+        "ghr_",
+        "sk-",
+        "sk_",
+        "xoxa-",
+        "xoxb-",
+        "xoxp-",
+        "xoxr-",
+        "xoxs-",
+        "tbc_",
+        "tbs_",
+        "tbt_",
+        "tbp_",
+    ];
+    let token_char = |ch: char| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-';
+    let mut redacted = String::with_capacity(text.len());
+    let mut index = 0;
+    while index < text.len() {
+        let rest = &text[index..];
+        let at_boundary = text[..index].chars().next_back().map_or(true, |before| {
+            !(before.is_ascii_alphanumeric() || before == '_')
+        });
+        let prefix = PREFIXES
+            .iter()
+            .find(|prefix| at_boundary && rest.starts_with(**prefix));
+        if let Some(prefix) = prefix {
+            let value = rest[prefix.len()..]
+                .find(|ch: char| !token_char(ch))
+                .unwrap_or(rest.len() - prefix.len());
+            if value >= 8 {
+                redacted.push_str("[REDACTED:token]");
+                index += prefix.len() + value;
+                continue;
+            }
+        }
+        if at_boundary
+            && rest
+                .get(..7)
+                .is_some_and(|scheme| scheme.eq_ignore_ascii_case("bearer "))
+        {
+            let token = rest[7..]
+                .find(|ch: char| ch.is_whitespace() || ch == '"' || ch == '\'')
+                .unwrap_or(rest.len() - 7);
+            if token >= 12 {
+                redacted.push_str(&rest[..7]);
+                redacted.push_str("[REDACTED:token]");
+                index += 7 + token;
+                continue;
+            }
+        }
+        let ch = rest.chars().next().expect("index is inside text");
+        redacted.push(ch);
+        index += ch.len_utf8();
+    }
+    redacted
 }
 
 pub fn run(command: Command) -> Result<(), String> {
@@ -2420,14 +2652,37 @@ mod tests {
     #[test]
     fn tune_refusals_remain_machine_readable_json() {
         assert_eq!(
-            tune_refusal_json(r#"{"error":{"code":"same_harness","message":"omit --harness"}}"#),
-            r#"{"code":"same_harness","message":"omit --harness","ok":false}"#
+            tune_refusal_json(
+                409,
+                r#"{"error":{"code":"same_harness","message":"omit --harness"}}"#
+            ),
+            r#"{"code":"same_harness","httpStatus":409,"message":"omit --harness","ok":false}"#
+        );
+    }
+
+    #[test]
+    fn an_undecodable_tune_refusal_stays_one_json_object() {
+        let refusal: Value = serde_json::from_str(&tune_refusal_json(
+            502,
+            "upstream sk-fixture-SENTINEL-0123456789abcdef",
+        ))
+        .unwrap();
+        assert_eq!(refusal["ok"], false);
+        assert_eq!(refusal["httpStatus"], 502);
+        assert_eq!(refusal["code"], "response_undecodable");
+        assert_eq!(refusal["body"], "upstream [REDACTED:token]");
+
+        let refusal: Value = serde_json::from_str(&tune_refusal_json(500, r#""down""#)).unwrap();
+        assert_eq!(
+            refusal,
+            serde_json::json!({"ok": false, "httpStatus": 500, "body": "down"})
         );
     }
 
     #[test]
     fn tune_refusals_preserve_verified_runtime_and_cleanup_fields() {
         let refusal = tune_refusal_json(
+            409,
             r#"{"error":{"code":"runtime_config_mismatch","message":"readback differed","model":"gpt-5.6-sol","effort":"high","projectionCommitted":false,"cleanupStatus":"unverified","lifecycleEventId":"le_123","warnings":["candidate close unverified"]}}"#,
         );
 
@@ -2435,6 +2690,7 @@ mod tests {
             serde_json::from_str::<Value>(&refusal).unwrap(),
             serde_json::json!({
                 "ok": false,
+                "httpStatus": 409,
                 "code": "runtime_config_mismatch",
                 "message": "readback differed",
                 "model": "gpt-5.6-sol",
@@ -4452,26 +4708,50 @@ mod tests {
         assert!(error.contains("onboarding lease expired"), "{error}");
     }
 
+    /// The human sentence and the JSON line of one rendered gateway failure.
+    fn readings(error: &str) -> (String, Value) {
+        let (human, machine) = error.rsplit_once('\n').expect("two readings");
+        (
+            human.to_owned(),
+            serde_json::from_str(machine).expect("machine line is JSON"),
+        )
+    }
+
     #[test]
     fn the_third_outcome_renders_named_and_keeps_the_other_two_intact() {
         // 202 + decisionPending: not a result, not an error. Without its own
         // branch it falls through to an absent "result" and becomes Ok(None) --
         // a silent exit 0 telling an agent the action happened.
+        let pending = parse_response(
+            202,
+            r#"{"decisionPending":{"decisionRequestId":"dr_7","code":"decision_pending","message":"this action needs an owner decision; request dr_7 is open"}}"#,
+        )
+        .unwrap_err();
+        let (human, machine) = readings(&pending);
         assert_eq!(
-            parse_response(
-                202,
-                r#"{"decisionPending":{"decisionRequestId":"dr_7","code":"decision_pending","message":"this action needs an owner decision; request dr_7 is open"}}"#
-            ),
-            Err(
-                "decision_pending: this action needs an owner decision; request dr_7 is open (dr_7)"
-                    .to_owned()
-            )
+            human,
+            "decision_pending: this action needs an owner decision; request dr_7 is open (dr_7)"
         );
+        assert_eq!(
+            machine,
+            serde_json::json!({
+                "ok": false,
+                "httpStatus": 202,
+                "decisionPending": {
+                    "decisionRequestId": "dr_7",
+                    "code": "decision_pending",
+                    "message": "this action needs an owner decision; request dr_7 is open"
+                }
+            })
+        );
+        assert!(machine.get("error").is_none(), "{machine}");
 
         // A malformed pending envelope still names itself rather than vanishing.
+        let (human, _machine) =
+            readings(&parse_response(202, r#"{"decisionPending":{}}"#).unwrap_err());
         assert_eq!(
-            parse_response(202, r#"{"decisionPending":{}}"#),
-            Err("decision_pending: this action needs an owner decision (undefined)".to_owned())
+            human,
+            "decision_pending: this action needs an owner decision (undefined)"
         );
 
         // The two shapes that already worked are untouched.
@@ -4479,35 +4759,174 @@ mod tests {
             parse_response(200, r#"{"result":{"id":"asg_1"}}"#),
             Ok(Some(serde_json::json!({"id": "asg_1"})))
         );
-        assert_eq!(
-            parse_response(403, r#"{"error":{"code":"denied","message":"no"}}"#),
-            Err("denied: no".to_owned())
+        let (human, _machine) = readings(
+            &parse_response(403, r#"{"error":{"code":"denied","message":"no"}}"#).unwrap_err(),
+        );
+        assert_eq!(human, "denied: no");
+        let (human, _machine) = readings(
+            &parse_response(
+                500,
+                r#"{"error":{"code":"decision_request_integrity_invalid","message":"decision request integrity check failed","requestId":"dr_exact"}}"#,
+            )
+            .unwrap_err(),
         );
         assert_eq!(
-            parse_response(
-                500,
-                r#"{"error":{"code":"decision_request_integrity_invalid","message":"decision request integrity check failed","requestId":"dr_exact"}}"#
-            ),
-            Err(
-                "decision_request_integrity_invalid: decision request integrity check failed (dr_exact)"
-                    .to_owned()
-            )
+            human,
+            "decision_request_integrity_invalid: decision request integrity check failed (dr_exact)"
         );
     }
 
     #[test]
     fn successful_error_envelopes_are_visible_failures() {
+        let (human, machine) = readings(
+            &parse_response(200, r#"{"error":{"code":"denied","message":"no"}}"#).unwrap_err(),
+        );
+        assert_eq!(human, "denied: no");
         assert_eq!(
-            parse_response(200, r#"{"error":{"code":"denied","message":"no"}}"#),
-            Err(
-                "{\n  \"error\": {\n    \"code\": \"denied\",\n    \"message\": \"no\"\n  }\n}"
-                    .to_owned()
-            )
+            machine,
+            serde_json::json!({
+                "ok": false,
+                "httpStatus": 200,
+                "error": {"code": "denied", "message": "no"}
+            })
+        );
+    }
+
+    #[test]
+    fn a_refusal_keeps_its_status_and_every_field_of_the_error_envelope() {
+        let body = serde_json::json!({
+            "error": {
+                "code": "adapter_unavailable",
+                "message": "adapter for codex/luna on host racter is degraded",
+                "requestId": "req_9",
+                "diagnostic": {
+                    "kind": "circuit_open",
+                    "origin": "adapter_coordinator",
+                    "consecutiveFailures": 3,
+                    "cause": {"kind": "exit", "reason": "boom", "generation": 4},
+                    "unknownUpstreamField": {"nested": [1, 2]}
+                },
+                "foreignField": true
+            }
+        });
+        let error = parse_response(503, &body.to_string()).unwrap_err();
+        let (human, machine) = readings(&error);
+
+        assert_eq!(
+            human,
+            "adapter_unavailable: adapter for codex/luna on host racter is degraded (req_9)"
+        );
+        assert_eq!(machine["httpStatus"], 503);
+        assert_eq!(machine["ok"], false);
+        assert_eq!(machine["error"], body["error"]);
+    }
+
+    #[test]
+    fn a_refusal_without_a_code_says_so_instead_of_inventing_one() {
+        let (human, machine) =
+            readings(&parse_response(500, r#"{"error":{"message":"it broke"}}"#).unwrap_err());
+        assert_eq!(human, "HTTP 500 error without a code: it broke");
+        assert!(!human.contains("undefined"), "{human}");
+        assert_eq!(machine["error"], serde_json::json!({"message": "it broke"}));
+
+        let (human, machine) = readings(&parse_response(502, r#"{"detail":"bad"}"#).unwrap_err());
+        assert_eq!(
+            human,
+            r#"gateway answered HTTP 502 without an error object: {"detail":"bad"}"#
         );
         assert_eq!(
-            parse_response(403, r#"{"error":{"code":"denied","message":"no"}}"#),
-            Err("denied: no".to_owned())
+            machine,
+            serde_json::json!({"ok": false, "httpStatus": 502, "body": {"detail": "bad"}})
         );
+    }
+
+    #[test]
+    fn an_undecodable_reply_is_its_own_failure_and_keeps_what_arrived() {
+        let body = "<html>502 Bad Gateway token=sk-fixture-SENTINEL-0123456789abcdef</html>";
+        let error = parse_response(502, body).unwrap_err();
+        let (human, machine) = readings(&error);
+
+        assert!(
+            human.starts_with("gateway reply (HTTP 502) is not JSON: expected value"),
+            "{human}"
+        );
+        assert!(human.contains("<html>502 Bad Gateway"), "{human}");
+        assert!(!error.contains("SENTINEL"), "{error}");
+        assert_eq!(machine["httpStatus"], 502);
+        assert_eq!(machine["error"]["code"], "response_undecodable");
+        assert_eq!(machine["error"]["line"], 1);
+        assert_eq!(machine["error"]["column"], 1);
+        assert_eq!(machine["error"]["bodyBytes"], body.len());
+        assert_eq!(
+            machine["error"]["body"],
+            "<html>502 Bad Gateway token=[REDACTED:token]</html>"
+        );
+
+        // A reply cut off mid-body names where decoding stopped.
+        let (_human, machine) =
+            readings(&parse_response(200, r#"{"result":{"id":"asg_"#).unwrap_err());
+        assert_eq!(machine["httpStatus"], 200);
+        assert_eq!(machine["error"]["code"], "response_undecodable");
+        assert_eq!(machine["error"]["body"], r#"{"result":{"id":"asg_"#);
+        assert!(
+            machine["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("EOF"),
+            "{machine}"
+        );
+    }
+
+    #[test]
+    fn an_undecodable_copy_is_bounded_on_a_character_boundary() {
+        let body = format!("{}é{}", "x".repeat(BODY_LIMIT - 1), "y".repeat(100));
+        let copy = bounded_body(&body);
+        assert_eq!(
+            copy,
+            format!("{}...[truncated]", "x".repeat(BODY_LIMIT - 1))
+        );
+
+        assert_eq!(
+            redact_body("Authorization: Bearer abcdefghijklmnop rest ghp_short"),
+            "Authorization: Bearer [REDACTED:token] rest ghp_short"
+        );
+        assert_eq!(redact_body("mask-sk-abcdefgh"), "mask-[REDACTED:token]");
+        assert_eq!(redact_body("task_abcdefghij"), "task_abcdefghij");
+    }
+
+    #[test]
+    fn an_unreachable_gateway_is_a_transport_failure_without_a_status() {
+        let endpoint = Endpoint {
+            base: "http://127.0.0.1:1".to_owned(),
+            token: "tbc_test".to_owned(),
+            origin: Origin::Provisioned,
+        };
+        let request = RequestSpec {
+            path: "/dispatch",
+            body_json: r#"{"verb":"list","params":{}}"#.to_owned(),
+        };
+        let error = send_to(&endpoint, &request).unwrap_err();
+        let (human, machine) = readings(&error);
+
+        assert!(!human.is_empty());
+        assert_eq!(machine["error"]["code"], "transport_failed");
+        assert_eq!(machine["error"]["kind"], "ConnectionFailed");
+        assert!(machine.get("httpStatus").is_none(), "{machine}");
+    }
+
+    #[test]
+    fn only_the_tune_verb_routes_to_the_tune_refusal_shape() {
+        let tune = RequestSpec {
+            path: "/dispatch",
+            body_json: r#"{"verb":"tune","params":{}}"#.to_owned(),
+        };
+        let mention = RequestSpec {
+            path: "/dispatch",
+            body_json: r#"{"verb":"wake","params":{"prompt":"{\"verb\":\"tune\"}"}}"#.to_owned(),
+        };
+        assert!(is_tune(&tune));
+        assert!(mention.body_json.contains(r#"verb\":\"tune"#));
+        assert!(!is_tune(&mention));
     }
 
     #[test]

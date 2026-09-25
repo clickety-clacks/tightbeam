@@ -669,6 +669,125 @@ defmodule Tightbeam.CliIntegrationTest do
     assert network =~ "Connection refused" or network =~ "connection refused"
   end
 
+  test "real CLI keeps a gateway reply's status and whole envelope on its machine line", ctx do
+    session_file = Path.join(ctx.base_dir, "work/session/.tightbeam-session")
+    sentinel = "sk-fixture-SENTINEL-0123456789abcdef"
+
+    replies = [
+      {502, "text/html", "<html>bad gateway key=#{sentinel}</html>"},
+      {409, "application/json",
+       JSON.encode!(%{
+         "error" => %{
+           "code" => "upstream_refused",
+           "message" => "provider said no",
+           "requestId" => "req_fixture",
+           "diagnostic" => %{"cause" => %{"code" => "rate_limited", "phase" => "turn"}},
+           "unknownUpstreamField" => %{"kept" => true}
+         }
+       })},
+      {200, "application/json", ~s({"result":)}
+    ]
+
+    {:ok, listener} =
+      :gen_tcp.listen(0, [:binary, ip: {127, 0, 0, 1}, active: false, reuseaddr: true])
+
+    {:ok, {_address, port}} = :inet.sockname(listener)
+    peer = Task.async(fn -> Enum.each(replies, &serve_one(listener, &1)) end)
+
+    File.write!(
+      session_file,
+      JSON.encode!(%{
+        url: "http://127.0.0.1:#{port}",
+        token: ctx.session.cli_token,
+        sessionKey: ctx.session.session_key
+      })
+    )
+
+    [html, nested, truncated] =
+      Enum.map(replies, fn _reply ->
+        {output, status} =
+          System.cmd(ctx.binary, ["list"], cd: ctx.workdir, stderr_to_stdout: true)
+
+        assert status != 0, output
+        output
+      end)
+
+    Task.await(peer)
+    :gen_tcp.close(listener)
+
+    # The secret in a non-JSON body never reaches either reading.
+    refute html =~ sentinel
+    assert html =~ "gateway reply (HTTP 502) is not JSON"
+    html_machine = machine_line!(html)
+    assert html_machine["ok"] == false
+    assert html_machine["httpStatus"] == 502
+    assert html_machine["error"]["code"] == "response_undecodable"
+    assert html_machine["error"]["body"] =~ "[REDACTED:token]"
+    assert html_machine["error"]["body"] =~ "bad gateway"
+
+    # A refusal keeps every field the peer sent, including ones the CLI does not know.
+    assert nested =~ "upstream_refused: provider said no (req_fixture)"
+
+    assert machine_line!(nested) == %{
+             "ok" => false,
+             "httpStatus" => 409,
+             "error" => %{
+               "code" => "upstream_refused",
+               "message" => "provider said no",
+               "requestId" => "req_fixture",
+               "diagnostic" => %{"cause" => %{"code" => "rate_limited", "phase" => "turn"}},
+               "unknownUpstreamField" => %{"kept" => true}
+             }
+           }
+
+    # A cut-off 2xx body is a decode failure, not a success with no result.
+    truncated_machine = machine_line!(truncated)
+    assert truncated_machine["httpStatus"] == 200
+    assert truncated_machine["error"]["code"] == "response_undecodable"
+    assert truncated_machine["error"]["body"] == ~s({"result":)
+  end
+
+  defp serve_one(listener, {status, content_type, body}) do
+    {:ok, socket} = :gen_tcp.accept(listener, 10_000)
+    :ok = read_request(socket, "")
+
+    :ok =
+      :gen_tcp.send(socket, [
+        "HTTP/1.1 #{status} Fixture\r\n",
+        "content-type: #{content_type}\r\n",
+        "content-length: #{byte_size(body)}\r\n",
+        "connection: close\r\n\r\n",
+        body
+      ])
+
+    :gen_tcp.close(socket)
+  end
+
+  defp read_request(socket, acc) do
+    complete? =
+      case String.split(acc, "\r\n\r\n", parts: 2) do
+        [head, rest] ->
+          case Regex.run(~r/content-length:\s*(\d+)/i, head) do
+            [_, length] -> byte_size(rest) >= String.to_integer(length)
+            nil -> true
+          end
+
+        [_partial] ->
+          false
+      end
+
+    if complete? do
+      :ok
+    else
+      {:ok, data} = :gen_tcp.recv(socket, 0, 10_000)
+      read_request(socket, acc <> data)
+    end
+  end
+
+  defp machine_line!(output) do
+    output |> String.trim_trailing() |> String.split("\n") |> List.last() |> JSON.decode!()
+  end
+
   test "real CLI discovers a session token, dispatches, and loses access at retire", ctx do
     {listed, 0} = System.cmd(ctx.binary, ["list"], cd: ctx.workdir, stderr_to_stdout: true)
     assert listed =~ "cli-holder"
@@ -1392,6 +1511,16 @@ defmodule Tightbeam.CliIntegrationTest do
     assert refused =~ "unknown work item: wi_absent"
     refute refused =~ "no match of right hand side"
     refute refused =~ "FOREIGN KEY"
+
+    # The machine line carries the real gateway's status and envelope.
+    assert %{
+             "ok" => false,
+             "httpStatus" => 404,
+             "error" => %{
+               "code" => "unknown_work_item",
+               "message" => "unknown work item: wi_absent"
+             }
+           } = machine_line!(refused)
   end
 
   # O2 keeps its code-evidence edge active even when the org has no learned
@@ -1877,8 +2006,20 @@ defmodule Tightbeam.CliIntegrationTest do
 
     assert exit_status != 0
 
-    assert String.trim(refusal) ==
+    assert [human, _machine] = refusal |> String.trim() |> String.split("\n")
+
+    assert human ==
              "decision_request_integrity_invalid: decision request integrity check failed (#{request.id})"
+
+    assert machine_line!(refusal) == %{
+             "ok" => false,
+             "httpStatus" => 500,
+             "error" => %{
+               "code" => "decision_request_integrity_invalid",
+               "message" => "decision request integrity check failed",
+               "requestId" => request.id
+             }
+           }
   end
 
   test "real CLI creates and gets work items and enforces spec-ref pairing", ctx do

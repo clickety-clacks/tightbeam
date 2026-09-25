@@ -483,8 +483,9 @@ where
         // improved, this arm stops matching and the fall-through below drops the cancel
         // failure from the operator's message without failing anything. Both ends are
         // commented; neither is enforced.
+        // A new line, not "; ", so a gateway failure's JSON line in `reason` stays whole.
         Err(cancel_reason) if cancel_reason.contains("onboarding lease expired") => {
-            format!("{reason}; {cancel_reason}")
+            format!("{reason}\n{cancel_reason}")
         }
         _ => reason.to_owned(),
     }

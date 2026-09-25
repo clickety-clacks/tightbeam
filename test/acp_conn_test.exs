@@ -101,7 +101,18 @@ defmodule Tightbeam.Acp.ConnTest do
     true = Port.close(port)
     :ok = :sys.resume(conn)
 
-    assert_receive {^call_ref, {:error, :closed}}
+    # The raw call skips Conn.request/4, so it sees the carrier that request/4
+    # strips for every caller that did not ask for `diagnostic: true`.
+    assert_receive {^call_ref, {:error, {:diagnosed, :closed, node}} = reply}
+
+    assert node == %{
+             "kind" => "closed",
+             "operation" => "echo",
+             "origin" => "acp_transport",
+             "closedBy" => "send_failed"
+           }
+
+    assert Tightbeam.ErrorDiagnostic.classified(reply) == {:error, :closed}
     assert_receive {:acp_request_not_dispatched, ^dispatched, :closed}
     refute_receive {:acp_request_dispatched, ^dispatched, _request_id}
 

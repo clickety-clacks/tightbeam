@@ -87,7 +87,7 @@ defmodule Tightbeam.LiveBaseGuardTest do
             %{
               code: "invalid_build_transition",
               expected: "valid JSON",
-              observed: %{"kind" => "decode", "error" => "invalid_byte", "byteOffset" => 8}
+              observed: {:invalid_byte, 8, ?x}
             }} = Guard.decode_transition(~s({"a": 1 x}))
   end
 

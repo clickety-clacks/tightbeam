@@ -25,10 +25,12 @@ const CANONICAL_ENTRIES: [&str; 10] = [
     "work",
 ];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `Failed` keeps what went wrong (spawn error, pipe read error, exit status), so a
+/// note says why a command failed instead of only that it did.
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum CommandFailure {
     Timeout,
-    Failed,
+    Failed(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,9 +105,15 @@ impl ProbeIo for SystemIo {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|_| CommandFailure::Failed)?;
-        let mut stdout = child.stdout.take().ok_or(CommandFailure::Failed)?;
-        let mut stderr = child.stderr.take().ok_or(CommandFailure::Failed)?;
+            .map_err(|error| CommandFailure::Failed(format!("spawn: {error}")))?;
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| CommandFailure::Failed("stdout pipe unavailable".to_owned()))?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| CommandFailure::Failed("stderr pipe unavailable".to_owned()))?;
         let stdout_reader = thread::spawn(move || {
             let mut bytes = Vec::new();
             stdout.read_to_end(&mut bytes).map(|_| bytes)
@@ -120,16 +128,20 @@ impl ProbeIo for SystemIo {
                 Ok(Some(status)) => {
                     let output = stdout_reader
                         .join()
-                        .map_err(|_| CommandFailure::Failed)?
-                        .map_err(|_| CommandFailure::Failed)?;
+                        .map_err(|_| CommandFailure::Failed("stdout reader panicked".to_owned()))?
+                        .map_err(|error| {
+                            CommandFailure::Failed(format!("reading stdout: {error}"))
+                        })?;
                     stderr_reader
                         .join()
-                        .map_err(|_| CommandFailure::Failed)?
-                        .map_err(|_| CommandFailure::Failed)?;
+                        .map_err(|_| CommandFailure::Failed("stderr reader panicked".to_owned()))?
+                        .map_err(|error| {
+                            CommandFailure::Failed(format!("reading stderr: {error}"))
+                        })?;
                     return if status.success() {
                         Ok(output)
                     } else {
-                        Err(CommandFailure::Failed)
+                        Err(CommandFailure::Failed(status.to_string()))
                     };
                 }
                 Ok(None) if started.elapsed() < deadline => {
@@ -142,12 +154,12 @@ impl ProbeIo for SystemIo {
                     let _ = stderr_reader.join();
                     return Err(CommandFailure::Timeout);
                 }
-                Err(_) => {
+                Err(error) => {
                     let _ = child.kill();
                     let _ = child.wait();
                     let _ = stdout_reader.join();
                     let _ = stderr_reader.join();
-                    return Err(CommandFailure::Failed);
+                    return Err(CommandFailure::Failed(format!("waiting: {error}")));
                 }
             }
         }
@@ -756,11 +768,14 @@ fn parse_etime_output(bytes: &[u8]) -> BTreeMap<u32, u64> {
 }
 
 fn note_failure(notes: &mut Vec<String>, command: &str, failure: CommandFailure) {
-    let suffix = match failure {
-        CommandFailure::Timeout => "timed out",
-        CommandFailure::Failed => "failed",
-    };
-    notes.push(format!("{command} {suffix}"));
+    notes.push(format!("{command} {}", failure_suffix(&failure)));
+}
+
+fn failure_suffix(failure: &CommandFailure) -> String {
+    match failure {
+        CommandFailure::Timeout => "timed out".to_owned(),
+        CommandFailure::Failed(detail) => format!("failed ({detail})"),
+    }
 }
 
 fn note_unparseable_rows(notes: &mut Vec<String>, command: &str, count: usize) {
@@ -774,11 +789,8 @@ fn note_identity_failure(notes: &mut Vec<String>, pid: u32) {
     notes.push(format!("sysctl identity failed for pid {pid}"));
 }
 
-fn darwin_enumeration_error(failure: CommandFailure) -> &'static str {
-    match failure {
-        CommandFailure::Timeout => "probe: ps enumeration timed out",
-        CommandFailure::Failed => "probe: ps enumeration failed",
-    }
+fn darwin_enumeration_error(failure: &CommandFailure) -> String {
+    format!("probe: ps enumeration {}", failure_suffix(failure))
 }
 
 fn collect_darwin(
@@ -852,10 +864,7 @@ fn collect_darwin(
                 }
             }
             Err(failure) => {
-                let failure = match failure {
-                    CommandFailure::Timeout => format!("probe: {MACOS_LSOF_PATH} timed out"),
-                    CommandFailure::Failed => format!("probe: {MACOS_LSOF_PATH} failed"),
-                };
+                let failure = format!("probe: {MACOS_LSOF_PATH} {}", failure_suffix(&failure));
                 notes.push(failure.clone());
                 collection_failure = Some(failure);
             }
@@ -1517,8 +1526,8 @@ pub fn run(json: bool, base_dir: Option<String>) -> Result<(), String> {
                 let failure = raw.collection_failure.clone();
                 (raw, failure)
             }
-            Err(CommandFailure::Failed) => {
-                let failure = darwin_enumeration_error(CommandFailure::Failed).to_owned();
+            Err(failed @ CommandFailure::Failed(_)) => {
+                let failure = darwin_enumeration_error(&failed);
                 (
                     RawFacts {
                         platform: "macos",
@@ -1531,7 +1540,7 @@ pub fn run(json: bool, base_dir: Option<String>) -> Result<(), String> {
                     Some(failure),
                 )
             }
-            Err(failure) => return Err(darwin_enumeration_error(failure).to_owned()),
+            Err(failure) => return Err(darwin_enumeration_error(&failure)),
         },
         _ => return Err("probe: unsupported platform".to_owned()),
     };
@@ -2131,7 +2140,7 @@ mod tests {
             commands: std::cell::RefCell::new(vec![
                 Ok(pass1.clone()),
                 Err(CommandFailure::Timeout),
-                Err(CommandFailure::Failed),
+                Err(CommandFailure::Failed("exit status: 1".to_owned())),
             ]),
             ..FakeIo::default()
         };
@@ -2142,11 +2151,14 @@ mod tests {
         assert_eq!(raw.processes[0].cwd, None);
         assert_eq!(
             raw.notes,
-            vec!["ps pass 2 timed out", "probe: /usr/sbin/lsof failed"]
+            vec![
+                "ps pass 2 timed out",
+                "probe: /usr/sbin/lsof failed (exit status: 1)"
+            ]
         );
         assert_eq!(
             raw.collection_failure.as_deref(),
-            Some("probe: /usr/sbin/lsof failed")
+            Some("probe: /usr/sbin/lsof failed (exit status: 1)")
         );
         assert_eq!(
             io.programs.borrow().as_slice(),
@@ -2266,17 +2278,20 @@ mod tests {
     fn darwin_pass1_timeout_and_failure_are_fatal() {
         for (failure, expected) in [
             (CommandFailure::Timeout, "probe: ps enumeration timed out"),
-            (CommandFailure::Failed, "probe: ps enumeration failed"),
+            (
+                CommandFailure::Failed("spawn: No such file or directory (os error 2)".to_owned()),
+                "probe: ps enumeration failed (spawn: No such file or directory (os error 2))",
+            ),
         ] {
             let io = FakeIo {
-                commands: std::cell::RefCell::new(vec![Err(failure)]),
+                commands: std::cell::RefCell::new(vec![Err(failure.clone())]),
                 ..FakeIo::default()
             };
             assert_eq!(
                 collect_darwin(&io, 999, Some(&crate::harnesses::catalog().unwrap())).unwrap_err(),
                 failure
             );
-            assert_eq!(darwin_enumeration_error(failure), expected);
+            assert_eq!(darwin_enumeration_error(&failure), expected);
         }
     }
 
