@@ -332,6 +332,7 @@ defmodule Tightbeam.CredentialsTest do
         name: nil,
         base_dir: ctx.base,
         machine: "eezo",
+        sh: Tightbeam.CredentialWarmFixture.runner(ctx.base, "eezo"),
         now: fn -> 100 end,
         onboarders: %{
           anthropic: fn _ ->

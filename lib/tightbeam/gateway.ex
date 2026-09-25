@@ -1179,6 +1179,7 @@ defmodule Tightbeam.Gateway do
           end)
         )
       end,
+      {"breathing", []} => fn call -> Tightbeam.Breathing.handle(db, call) end,
       {"work-item-get", []} => fn call -> WorkItems.__handle__(db, "work-item-get", call) end,
       {"work-item-delivery-scope-set", []} => fn call ->
         DeliveryResponsibilities.handle(db, call)

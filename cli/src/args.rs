@@ -365,6 +365,11 @@ pub enum Command {
         identity: Identity,
         high: bool,
     },
+    Breathing {
+        identity: Identity,
+        target_kind: String,
+        target_id: String,
+    },
     Transcript {
         identity: Identity,
         session: Option<String>,
@@ -750,6 +755,8 @@ COMMANDS:
       also what electing nothing gives you. Those two, no others: `low` is in
       the same vocabulary but is the substrate's election over its own ambient
       notices, never something a reply asks for.
+  breathing session|assignment|work-item <id>
+      Compute physical breathing from one durable snapshot. Both answers exit 0.
   transcript (--session <key> | --name <displayName>)
              [--before <messageId> | --after <messageId>] [--limit <n>]
       Read a session's conversation from the substrate's own rows. --name is a
@@ -2426,6 +2433,20 @@ fn parse_with_optional_catalog(
                 high: flags.contains_key("high"),
             })
         }
+        "breathing" => {
+            let usage = "usage: tightbeam breathing session|assignment|work-item <id>";
+            if parsed.positional.len() != 3
+                || !["session", "assignment", "work-item"].contains(&parsed.positional[1].as_str())
+                || parsed.positional[2].is_empty()
+            {
+                return Err(usage.to_owned());
+            }
+            Ok(Command::Breathing {
+                identity: identity(flags)?,
+                target_kind: parsed.positional[1].clone(),
+                target_id: parsed.positional[2].clone(),
+            })
+        }
         "transcript" => {
             if parsed.positional.len() != 1 {
                 return Err("usage: tightbeam transcript (--session <key> | --name <displayName>) [--before <messageId> | --after <messageId>] [--limit <n>]".to_owned());
@@ -2827,7 +2848,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-update, work-item-get, work-item-delivery-scope-set, delivery-scope-owner-set, delivery-responsibility-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, cancel-wake, attest, attests, breathing, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-update, work-item-get, work-item-delivery-scope-set, delivery-scope-owner-set, delivery-responsibility-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -4087,6 +4108,7 @@ mod tests {
                 "attest",
                 "attests",
                 "add-user",
+                "breathing",
                 "cancel-wake",
                 "condition",
                 "config",
@@ -4855,7 +4877,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-update, work-item-get, work-item-delivery-scope-set, delivery-scope-owner-set, delivery-responsibility-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned()),
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, cancel-wake, attest, attests, breathing, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-update, work-item-get, work-item-delivery-scope-set, delivery-scope-owner-set, delivery-responsibility-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned()),
         );
     }
 
@@ -5588,6 +5610,28 @@ mod tests {
             strings(&["topline-placement-list", "--history", "--as-user", "flynn"]),
         ] {
             assert!(parse(args).unwrap_err().contains("does not accept"));
+        }
+    }
+
+    #[test]
+    fn breathing_accepts_exactly_three_typed_targets() {
+        for kind in ["session", "assignment", "work-item"] {
+            assert!(matches!(
+                parse(strings(&["breathing", kind, "target", "--as-user", "owner"])),
+                Ok(Command::Breathing { target_kind, target_id, .. })
+                    if target_kind == kind && target_id == "target"
+            ));
+        }
+        for args in [
+            strings(&["breathing", "session"]),
+            strings(&["breathing", "turn", "target"]),
+            strings(&["breathing", "session", ""]),
+            strings(&["breathing", "session", "target", "extra"]),
+        ] {
+            assert_eq!(
+                parse(args),
+                Err("usage: tightbeam breathing session|assignment|work-item <id>".to_owned())
+            );
         }
     }
 }

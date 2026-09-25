@@ -986,6 +986,19 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             };
             Ok(request(identity, "attend", vec![], params))
         }
+        Command::Breathing {
+            identity,
+            target_kind,
+            target_id,
+        } => Ok(request(
+            identity,
+            "breathing",
+            vec![],
+            vec![
+                string_field("targetKind", target_kind),
+                string_field("targetId", target_id),
+            ],
+        )),
         Command::Transcript {
             identity,
             session,
@@ -2073,6 +2086,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::DeliveryResponsibilityGet { identity, .. }
         | Command::WorkItemTrace { identity, .. }
         | Command::Attend { identity, .. }
+        | Command::Breathing { identity, .. }
         | Command::Transcript { identity, .. }
         | Command::Toplines { identity, .. }
         | Command::Topline { identity, .. }
@@ -4533,5 +4547,13 @@ mod tests {
             Provisioned::Absent
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn breathing_serializes_typed_non_session_target_params() {
+        assert_eq!(
+            body(&["breathing", "assignment", "asg_1", "--as-user", "flynn"]),
+            r#"{"asUser":"flynn","verb":"breathing","params":{"targetKind":"assignment","targetId":"asg_1"}}"#
+        );
     }
 }
