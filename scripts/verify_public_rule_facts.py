@@ -9,6 +9,12 @@ from pathlib import Path
 
 SOURCE = Path("lib/tightbeam/rules.ex")
 COMPATIBILITY_BASELINE = "6c13efcbe9e1ae247b8aa7e91a374015c74dc947"
+LAST_SHIPPED_SOURCE = "e28880d6a2980c4ca5a7a983a707f83d504da960"
+# This fact existed only in unshipped 0.1.9 candidates. It encoded engineering
+# role policy in neutral runtime and was withdrawn before the 0.1.9 release.
+UNSHIPPED_WITHDRAWN_FACTS = {
+    "assign.admission_context": "27f74c1a2353cdee7ded640b8142ea98bfbae0cd^"
+}
 FACTS = re.compile(r'@facts %\{\n(.*?)\n  \}', re.DOTALL)
 FACT_NAME = re.compile(r'^\s*"([^"]+)"\s*=>', re.MULTILINE)
 
@@ -57,10 +63,20 @@ def source_at(ref: str) -> str:
     )
 
 
+def ancestor_of(ref: str, ancestor_tip: str) -> bool:
+    return subprocess.run(
+        ["git", "merge-base", "--is-ancestor", ref, ancestor_tip],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        check=False,
+    ).returncode == 0
+
+
 def main() -> int:
     try:
         history = history_refs()
-        previous = set().union(*(fact_names(source_at(ref)) for ref in history))
+        historical_facts = {ref: fact_names(source_at(ref)) for ref in history}
+        previous = set().union(*historical_facts.values())
     except (subprocess.CalledProcessError, ValueError) as error:
         print(
             f"public rule-fact compatibility: cannot inspect complete history: {error}",
@@ -69,7 +85,18 @@ def main() -> int:
         return 1
 
     current = fact_names(SOURCE.read_text())
-    removed = sorted(previous - current)
+    shipped = fact_names(source_at(LAST_SHIPPED_SOURCE))
+    withdrawn = {
+        fact
+        for fact, withdrawal_parent in UNSHIPPED_WITHDRAWN_FACTS.items()
+        if fact not in shipped
+        and all(
+            ancestor_of(ref, withdrawal_parent)
+            for ref, facts in historical_facts.items()
+            if fact in facts
+        )
+    }
+    removed = sorted(previous - current - withdrawn)
     if removed:
         print("public rule facts cannot be removed:", *removed, sep="\n", file=sys.stderr)
         return 1
