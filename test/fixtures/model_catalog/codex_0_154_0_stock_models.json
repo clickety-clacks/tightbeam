@@ -1,0 +1,122 @@
+{
+  "engineVersion": "0.154.0",
+  "models": [
+    {
+      "id": "gpt-6-astra",
+      "model": "gpt-6-astra",
+      "upgrade": null,
+      "upgradeInfo": null,
+      "availabilityNux": null,
+      "displayName": "GPT-6-Astra",
+      "description": "Our most capable model for complex, demanding work.",
+      "modelSpecialty": null,
+      "hidden": false,
+      "supportedReasoningEfforts": [
+        {
+          "reasoningEffort": "low",
+          "description": "Fast responses with lighter reasoning"
+        },
+        {
+          "reasoningEffort": "medium",
+          "description": "Balances speed and reasoning depth for everyday tasks"
+        },
+        {
+          "reasoningEffort": "high",
+          "description": "Greater reasoning depth for complex problems"
+        },
+        {
+          "reasoningEffort": "xhigh",
+          "description": "Extra high reasoning depth for complex problems"
+        },
+        {
+          "reasoningEffort": "max",
+          "description": "Maximum reasoning depth for the hardest problems"
+        },
+        {
+          "reasoningEffort": "ultra",
+          "description": "Maximum reasoning with automatic task delegation"
+        }
+      ],
+      "defaultReasoningEffort": "low",
+      "inputModalities": [
+        "text",
+        "image"
+      ],
+      "supportsPersonality": false,
+      "multiAgentVersion": "v2",
+      "additionalSpeedTiers": [
+        "fast"
+      ],
+      "serviceTiers": [
+        {
+          "id": "priority",
+          "name": "Fast",
+          "description": "2x speed, increased usage"
+        }
+      ],
+      "defaultServiceTier": null,
+      "isDefault": true
+    },
+    {
+      "id": "gpt-5.6-sol",
+      "model": "gpt-5.6-sol",
+      "upgrade": null,
+      "upgradeInfo": null,
+      "availabilityNux": null,
+      "displayName": "GPT-5.6-Sol",
+      "description": "Latest frontier agentic coding model.",
+      "modelSpecialty": null,
+      "hidden": false,
+      "supportedReasoningEfforts": [
+        {
+          "reasoningEffort": "low",
+          "description": "Fast responses with lighter reasoning"
+        },
+        {
+          "reasoningEffort": "medium",
+          "description": "Balances speed and reasoning depth for everyday tasks"
+        },
+        {
+          "reasoningEffort": "high",
+          "description": "Greater reasoning depth for complex problems"
+        },
+        {
+          "reasoningEffort": "xhigh",
+          "description": "Extra high reasoning depth for complex problems"
+        },
+        {
+          "reasoningEffort": "max",
+          "description": "Maximum reasoning depth for the hardest problems"
+        },
+        {
+          "reasoningEffort": "ultra",
+          "description": "Maximum reasoning with automatic task delegation"
+        }
+      ],
+      "defaultReasoningEffort": "low",
+      "inputModalities": [
+        "text",
+        "image"
+      ],
+      "supportsPersonality": false,
+      "multiAgentVersion": "v2",
+      "additionalSpeedTiers": [
+        "fast"
+      ],
+      "serviceTiers": [
+        {
+          "id": "priority",
+          "name": "Fast",
+          "description": "1.5x speed, increased usage"
+        },
+        {
+          "id": "ultrafast",
+          "name": "Ultrafast",
+          "description": "The fastest available responses for latency-sensitive work."
+        }
+      ],
+      "defaultServiceTier": null,
+      "isDefault": false
+    }
+  ]
+}

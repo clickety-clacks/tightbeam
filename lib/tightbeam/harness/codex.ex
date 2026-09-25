@@ -31,10 +31,10 @@ defmodule Tightbeam.Harness.Codex do
   # `@adapter_selectable_models` below.
   @api_models_url "https://api.openai.com/v1/models"
 
-  # Model values codex-acp @adapter_version accepts at `session/set_config_option
-  # {configId: "model"}` — the API-KEY catalog is filtered to this set, because
-  # the platform route lists the account's whole model universe and the adapter
-  # accepts almost none of it.
+  # Candidate values for the API-key catalog. The platform route lists the
+  # account's whole model universe; the stock adapter accepts only models its
+  # selected Codex engine returns from ordinary `model/list`. Astra is checked
+  # against that exact executable at discovery time before it is advertised.
   #
   # RECORDED LIVE 2026-07-28 (the #89 api-key exercise, throwaway org,
   # codex-acp 1.1.4): GET /v1/models answered 125 bare ids; the adapter REFUSED
@@ -44,19 +44,12 @@ defmodule Tightbeam.Harness.Codex do
   # anyway, so a platform id is NOT translatable into the adapter's vocabulary
   # by any mapping this repo can compute from spelling — substituting a
   # near-miss would be the silent-downgrade `harness/claude.ex` refuses. Hence a
-  # FILTER to the demonstrably-selectable set for the platform route.
+  # FILTER to the bounded candidate set for the platform route.
   #
   # Injectable (`codex_selectable_models` in the catalog's options, `:all` to
-  # disable): the accepted set is the ADAPTER VERSION's, and an operator on a
-  # newer adapter — or with acceptance evidence for more slugs — must be able to
-  # widen it without editing code.
-  #
-  # WHEN THIS ROTS (a new codex model ships, or an accepted slug stops being
-  # accepted): re-probe codex-acp rather than editing from a changelog — boot
-  # the adapter, `initialize`, `session/new`, then confirm each candidate with
-  # `session/set_config_option {configId: "model"}`. Update this table and
-  # `@adapter_version` together.
-  @adapter_selectable_models ~w(gpt-5.6-sol)
+  # disable) for the existing catalog tests. This is a scope filter, not a claim
+  # that every selected engine offers both values.
+  @adapter_selectable_models ~w(gpt-5.6-sol gpt-6-astra)
 
   # The gate probe's own model, as fields — it crosses the adapter seam like any
   # other selection.
@@ -68,11 +61,8 @@ defmodule Tightbeam.Harness.Codex do
   def adapter_version, do: @adapter_version
 
   @doc """
-  Model values this adapter version accepts at `session/set_config_option`.
-
-  Narrower than the platform-derived api-key catalog — see the note above the
-  attribute. Anything outside this list is refused by the adapter; it is never
-  silently substituted.
+  Bounded API-key candidates. Astra still needs a matching selected-engine
+  `model/list` result before `fetch_catalog/1` admits it.
   """
   def adapter_selectable_models, do: @adapter_selectable_models
 
@@ -389,6 +379,7 @@ defmodule Tightbeam.Harness.Codex do
         with {:ok, models} <- decode_catalog(kind, body),
              {:ok, entries} <- derive_catalog_entries(kind, models),
              entries <- keep_selectable(entries, selectable_models(state, kind)),
+             {:ok, entries} <- qualify_api_key_astra(state, kind, entries),
              entries when entries != [] <- entries do
           {:ok, entries}
         else
@@ -432,14 +423,11 @@ defmodule Tightbeam.Harness.Codex do
     |> classify_extraction(kind, auth, executable)
   end
 
-  # codex-acp receives the exact host/harness environment overlay when it
-  # launches, so subscription discovery must derive `client_version` from that
-  # same executable selection. Without a stored CODEX_PATH, retain the existing
-  # non-login PATH lookup. API-key discovery does not ask for a client version
-  # at all and deliberately never consults this binding.
-  defp catalog_executable(_state, :api_key), do: :bare_path
-
-  defp catalog_executable(state, :subscription) do
+  # codex-acp receives this same host/harness CODEX_PATH overlay when it
+  # launches. The account route uses its version for `client_version`; the API
+  # route uses it for a separate native model/list capability check. Without an
+  # overlay both use the adapter's host-local PATH selection.
+  defp catalog_executable(state, _kind) do
     with {:ok, db} <- Map.fetch(state.options, :db),
          host <- Map.get(state, :host_name, Placement.local_host_name()),
          %{value: path} <-
@@ -447,6 +435,121 @@ defmodule Tightbeam.Harness.Codex do
       {:bound, path}
     else
       _ -> :bare_path
+    end
+  end
+
+  # Query the same native model/list visibility that stock codex-acp 1.12.0
+  # queries. It does not pass includeHidden, and its set_config_option rejects
+  # any model absent from that result. The provider's /v1/models IDs establish
+  # entitlement separately; they cannot establish this client capability.
+  @engine_model_list_js ~S"""
+  const {spawn} = require("node:child_process");
+  const binary = process.argv[1];
+  const home = process.argv[2];
+  const child = spawn(binary, ["app-server"], {
+    env: {...process.env, CODEX_HOME: home},
+    stdio: ["pipe", "pipe", "ignore"]
+  });
+  let done = false, buffer = "", requestId = 2, version = "unknown";
+  let pages = 0;
+  const cursors = new Set();
+  const models = [];
+  const timer = setTimeout(() => finish({error: "timeout"}), 30000);
+  function finish(result) {
+    if (done) return;
+    done = true;
+    clearTimeout(timer);
+    child.kill();
+    process.stdout.write(JSON.stringify(result), () => process.exit(0));
+  }
+  function send(message) { child.stdin.write(JSON.stringify(message) + "\n"); }
+  function list(cursor) {
+    send({id: requestId, method: "model/list", params: {cursor, limit: null}});
+  }
+  child.on("error", () => finish({error: "spawn_failed"}));
+  child.on("exit", () => finish({error: "engine_exited"}));
+  child.stdout.on("data", chunk => {
+    buffer += chunk;
+    if (buffer.length > 2000000) return finish({error: "response_too_large"});
+    let end;
+    while ((end = buffer.indexOf("\n")) >= 0 && !done) {
+      const line = buffer.slice(0, end);
+      buffer = buffer.slice(end + 1);
+      let reply;
+      try { reply = JSON.parse(line); }
+      catch { return finish({error: "malformed_response"}); }
+      if (reply.id === 1) {
+        if (!reply.result) return finish({error: "initialize_failed"});
+        const match = String(reply.result.userAgent || "").match(/\/([0-9]+\.[0-9]+\.[0-9]+)/);
+        if (match) version = match[1];
+        send({method: "initialized"});
+        list(null);
+      } else if (reply.id === requestId) {
+        if (!reply.result || !Array.isArray(reply.result.data))
+          return finish({error: "model_list_failed"});
+        models.push(...reply.result.data.filter(model =>
+          model && (model.id === "gpt-6-astra" || model.id === "gpt-5.6-sol")));
+        const cursor = reply.result.nextCursor;
+        if (cursor === null || cursor === undefined)
+          return finish({models, engineVersion: version});
+        if (typeof cursor !== "string" || cursors.has(cursor) || ++pages > 100)
+          return finish({error: "invalid_cursor"});
+        cursors.add(cursor);
+        requestId++;
+        list(cursor);
+      }
+    }
+  });
+  send({id: 1, method: "initialize", params: {
+    clientInfo: {name: "tightbeam-catalog", title: "Tightbeam Catalog", version: "1"}
+  }});
+  """
+
+  defp probe_engine_models(state) do
+    sh = Map.get(state.options, :sh, &Support.system_cmd_out/1)
+    executable = catalog_executable(state, :api_key)
+    host = Map.get(state, :host_name, Placement.local_host_name())
+    home = Tightbeam.Homes.home_path(state.base_dir, host, :codex)
+
+    path =
+      case Map.fetch(state.options, :db) do
+        {:ok, db} ->
+          Placement.toolchain_path_preview(%{base_dir: state.base_dir, db: db}, host)
+
+        :error ->
+          System.get_env("PATH") || ""
+      end
+
+    path_assignment =
+      if String.ends_with?(path, ":$PATH") do
+        "PATH=#{Support.shell_quote(String.trim_trailing(path, ":$PATH"))}:$PATH"
+      else
+        "PATH=#{Support.shell_quote(path)}"
+      end
+
+    binary = if match?({:bound, _}, executable), do: elem(executable, 1), else: "codex"
+
+    script =
+      "#{path_assignment} exec node -e #{Support.shell_quote(@engine_model_list_js)} " <>
+        "#{Support.shell_quote(binary)} #{Support.shell_quote(home)}"
+
+    argv = Support.catalog_probe_argv(Map.get(state, :host_config, %{ssh: nil}).ssh, script)
+
+    case sh.(argv) do
+      {output, 0} ->
+        case JSON.decode(output) do
+          {:ok, %{"models" => models, "engineVersion" => version}} when is_list(models) ->
+            {:ok, models, version}
+
+          {:ok, %{"error" => reason}} when is_binary(reason) ->
+            {:error, {:selected_engine_model_list_failed, reason}}
+
+          _ ->
+            {:error, :malformed_selected_engine_model_list}
+        end
+
+      {_output, exit} ->
+        {:error, {:selected_engine_model_list_failed, {:exit, exit}}}
     end
   end
 
@@ -867,14 +970,73 @@ defmodule Tightbeam.Harness.Codex do
     end)
   end
 
-  # The catalog must not advertise what the adapter will refuse (#99, the #41
-  # problem's codex/api-key edition). The platform route returns the whole
-  # account's model universe — 125 ids observed live 2026-07-28 — and codex-acp
-  # refuses almost all of it at `session/set_config_option` (-32602 for
-  # `gpt-5.1-codex`, recorded on the same adapter+auth that accepted and ran
-  # `gpt-5.6-sol`). So the api-key kind defaults to the pinned
-  # `@adapter_selectable_models` set — a PURE FILTER over the already-derived
-  # entries: no probe, no extra fetch, nothing at boot, and never a substitution.
+  defp qualify_api_key_astra(_state, :subscription, entries), do: {:ok, entries}
+
+  defp qualify_api_key_astra(state, :api_key, entries) do
+    if Enum.any?(entries, &(&1.family == "gpt-6-astra")) do
+      with {:ok, models, version} <- probe_engine_models(state),
+           {:ok, levels} <- selected_astra_efforts(models, version) do
+        efforts = Enum.map(levels, & &1["reasoningEffort"])
+
+        {:ok,
+         Enum.map(entries, fn
+           %{family: "gpt-6-astra"} = entry ->
+             %{entry | efforts: efforts, capabilities: %{"supported_reasoning_levels" => levels}}
+
+           entry ->
+             entry
+         end)}
+      else
+        {:error, {:astra_not_selectable_on_selected_engine, _version} = reason} ->
+          # A provider entitlement is not a stock ACP option when the selected
+          # engine omits Astra from ordinary model/list. Preserve existing Sol
+          # if it remains available, but make the rejected Astra fact explicit.
+          Logger.warning("codex catalog: provider lists gpt-6-astra but #{inspect(reason)}")
+          remaining = Enum.reject(entries, &(&1.family == "gpt-6-astra"))
+          if remaining == [], do: {:error, reason}, else: {:ok, remaining}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    else
+      {:ok, entries}
+    end
+  end
+
+  defp selected_astra_efforts(models, version) do
+    case Enum.filter(models, &(is_map(&1) and &1["id"] == "gpt-6-astra")) do
+      [] ->
+        {:error, {:astra_not_selectable_on_selected_engine, version}}
+
+      [%{"hidden" => false, "supportedReasoningEfforts" => levels}] when is_list(levels) ->
+        efforts =
+          Enum.map(levels, fn
+            %{"reasoningEffort" => effort} when is_binary(effort) and effort != "" ->
+              effort
+
+            _ ->
+              nil
+          end)
+
+        if efforts != [] and Enum.all?(efforts, &is_binary/1) and
+             length(efforts) == length(Enum.uniq(efforts)) do
+          {:ok, levels}
+        else
+          {:error, :malformed_selected_engine_model_list}
+        end
+
+      [%{"hidden" => true}] ->
+        {:error, {:astra_not_selectable_on_selected_engine, version}}
+
+      _ ->
+        {:error, :malformed_selected_engine_model_list}
+    end
+  end
+
+  # The platform route lists the account's full model universe, most of which
+  # stock ACP refuses. This bounded filter preserves Sol and considers Astra;
+  # qualify_api_key_astra/3 additionally requires a selected-engine model/list
+  # result with exact ID and effort metadata before admitting Astra.
   #
   # The SUBSCRIPTION kind stays unfiltered: its catalog comes from the account
   # route the CLI itself consults, so the two vocabularies share one source

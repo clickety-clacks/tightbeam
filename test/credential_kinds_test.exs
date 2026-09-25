@@ -66,6 +66,13 @@ defmodule Tightbeam.CredentialKindsTest do
     |> Enum.join("\n")
   end
 
+  defp stock_codex_models_body do
+    # Trimmed from Racter's unauthenticated stock Codex 0.154.0 model/list
+    # capture, evidence/pr103-stock-model-list.json SHA-256 28fecba310f7a634.
+    Path.join([__DIR__, "fixtures", "model_catalog", "codex_0_154_0_stock_models.json"])
+    |> File.read!()
+  end
+
   # ------------------------------------------------------------------
   # The store: one authority, and it is the metadata
   # ------------------------------------------------------------------
@@ -502,6 +509,215 @@ defmodule Tightbeam.CredentialKindsTest do
       # The catalog must not advertise what the adapter will refuse: spawns
       # validated against `gpt-5.1-codex` and then -32602'd at model apply.
       assert Enum.map(entries, & &1.family) == ["gpt-5.6-sol"]
+    end
+
+    test "API-key Astra is admitted only with exact selected-engine efforts", ctx do
+      stage!(ctx.base, "codex", "auth.json", ~s({"OPENAI_API_KEY":"fixture-key"}))
+      owner = self()
+
+      sh = fn command ->
+        script = Enum.join(command, " ")
+
+        if String.contains?(script, "model/list") do
+          send(owner, {:stock_engine_probe, script})
+          {stock_codex_models_body(), 0}
+        else
+          {~s({"data":[{"id":"gpt-5.6-sol"},{"id":"gpt-6-astra"},{"id":"gpt-5.1-codex"}]}) <>
+             "\n200", 0}
+        end
+      end
+
+      assert {:ok, [sol, astra]} =
+               Codex.fetch_catalog(%{
+                 base_dir: ctx.base,
+                 credential_kind: :api_key,
+                 options: %{sh: sh, db: ctx.db}
+               })
+
+      assert {sol.family, sol.efforts} == {"gpt-5.6-sol", []}
+      assert astra.family == "gpt-6-astra"
+      assert astra.efforts == ~w(low medium high xhigh max ultra)
+      assert Tightbeam.ModelCatalog.offers_effort?(astra, "high")
+      refute Tightbeam.ModelCatalog.offers_effort?(astra, "invented")
+      assert_receive {:stock_engine_probe, script}
+      assert script =~ "CODEX_HOME"
+      assert script =~ "model/list"
+      refute script =~ "includeHidden"
+      refute script =~ "fixture-key"
+    end
+
+    test "no provider Astra leaves Sol available without a native capability call", ctx do
+      stage!(ctx.base, "codex", "auth.json", ~s({"OPENAI_API_KEY":"fixture-key"}))
+      owner = self()
+
+      sh = fn command ->
+        send(owner, {:catalog_command, Enum.join(command, " ")})
+        {~s({"data":[{"id":"gpt-5.6-sol"}]}) <> "\n200", 0}
+      end
+
+      assert {:ok, [%{family: "gpt-5.6-sol", efforts: []}]} =
+               Codex.fetch_catalog(%{
+                 base_dir: ctx.base,
+                 credential_kind: :api_key,
+                 options: %{sh: sh}
+               })
+
+      assert_receive {:catalog_command, script}
+      refute script =~ "model/list"
+      refute_receive {:catalog_command, _}
+    end
+
+    test "Astra effort choices follow selected engine metadata rather than a compiled ladder",
+         ctx do
+      stage!(ctx.base, "codex", "auth.json", ~s({"OPENAI_API_KEY":"fixture-key"}))
+      engine = stock_codex_models_body() |> JSON.decode!()
+
+      models =
+        Enum.map(engine["models"], fn
+          %{"id" => "gpt-6-astra"} = model ->
+            %{model | "supportedReasoningEfforts" => [%{"reasoningEffort" => "high"}]}
+
+          model ->
+            model
+        end)
+
+      sh = fn command ->
+        if String.contains?(Enum.join(command, " "), "model/list"),
+          do: {JSON.encode!(%{engine | "models" => models}), 0},
+          else: {~s({"data":[{"id":"gpt-6-astra"}]}) <> "\n200", 0}
+      end
+
+      assert {:ok, [%{family: "gpt-6-astra", efforts: ["high"]}]} =
+               Codex.fetch_catalog(%{
+                 base_dir: ctx.base,
+                 credential_kind: :api_key,
+                 options: %{sh: sh}
+               })
+    end
+
+    test "provider Astra absent from selected stock ACP is withheld with its cause", ctx do
+      stage!(ctx.base, "codex", "auth.json", ~s({"OPENAI_API_KEY":"fixture-key"}))
+      engine = stock_codex_models_body() |> JSON.decode!()
+      engine = %{engine | "models" => Enum.reject(engine["models"], &(&1["id"] == "gpt-6-astra"))}
+
+      sh = fn command ->
+        if String.contains?(Enum.join(command, " "), "model/list") do
+          {JSON.encode!(engine), 0}
+        else
+          {~s({"data":[{"id":"gpt-5.6-sol"},{"id":"gpt-6-astra"}]}) <> "\n200", 0}
+        end
+      end
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert {:ok, [%{family: "gpt-5.6-sol"}]} =
+                   Codex.fetch_catalog(%{
+                     base_dir: ctx.base,
+                     credential_kind: :api_key,
+                     options: %{sh: sh}
+                   })
+        end)
+
+      assert log =~ "astra_not_selectable_on_selected_engine"
+      refute log =~ "fixture-key"
+
+      hidden = stock_codex_models_body() |> JSON.decode!()
+
+      hidden_models =
+        Enum.map(hidden["models"], fn
+          %{"id" => "gpt-6-astra"} = model -> %{model | "hidden" => true}
+          model -> model
+        end)
+
+      hidden_sh = fn command ->
+        if String.contains?(Enum.join(command, " "), "model/list"),
+          do: {JSON.encode!(%{hidden | "models" => hidden_models}), 0},
+          else: {~s({"data":[{"id":"gpt-5.6-sol"},{"id":"gpt-6-astra"}]}) <> "\n200", 0}
+      end
+
+      assert {:ok, [%{family: "gpt-5.6-sol"}]} =
+               Codex.fetch_catalog(%{
+                 base_dir: ctx.base,
+                 credential_kind: :api_key,
+                 options: %{sh: hidden_sh}
+               })
+
+      assert {:error, {:astra_not_selectable_on_selected_engine, "0.154.0"}} =
+               Codex.fetch_catalog(%{
+                 base_dir: ctx.base,
+                 credential_kind: :api_key,
+                 options: %{
+                   sh: fn command ->
+                     if String.contains?(Enum.join(command, " "), "model/list"),
+                       do: {JSON.encode!(engine), 0},
+                       else: {~s({"data":[{"id":"gpt-6-astra"}]}) <> "\n200", 0}
+                   end
+                 }
+               })
+    end
+
+    test "Astra capability errors are not converted to provider absence", ctx do
+      stage!(ctx.base, "codex", "auth.json", ~s({"OPENAI_API_KEY":"fixture-key"}))
+      provider = ~s({"data":[{"id":"gpt-6-astra"}]}) <> "\n200"
+
+      for {engine, expected} <- [
+            {~s({"error":"spawn_failed"}), {:selected_engine_model_list_failed, "spawn_failed"}},
+            {~s({"models":"invalid","engineVersion":"0.154.0"}),
+             :malformed_selected_engine_model_list}
+          ] do
+        sh = fn command ->
+          if String.contains?(Enum.join(command, " "), "model/list"),
+            do: {engine, 0},
+            else: {provider, 0}
+        end
+
+        assert {:error, ^expected} =
+                 Codex.fetch_catalog(%{
+                   base_dir: ctx.base,
+                   credential_kind: :api_key,
+                   options: %{sh: sh}
+                 })
+      end
+    end
+
+    test "Astra native probe selects CODEX_PATH rather than an unrelated global binary", ctx do
+      stage!(ctx.base, "codex", "auth.json", ~s({"OPENAI_API_KEY":"fixture-key"}))
+      host = Tightbeam.Placement.local_host_name()
+
+      assert {:ok, _} =
+               Tightbeam.Placement.set_env_overlay(
+                 ctx.db,
+                 host,
+                 "codex",
+                 "CODEX_PATH",
+                 "/selected/codex",
+                 "test"
+               )
+
+      owner = self()
+
+      sh = fn command ->
+        script = Enum.join(command, " ")
+
+        if String.contains?(script, "model/list") do
+          send(owner, {:selected_engine, script})
+          {stock_codex_models_body(), 0}
+        else
+          {~s({"data":[{"id":"gpt-6-astra"}]}) <> "\n200", 0}
+        end
+      end
+
+      assert {:ok, [%{family: "gpt-6-astra"}]} =
+               Codex.fetch_catalog(%{
+                 base_dir: ctx.base,
+                 credential_kind: :api_key,
+                 options: %{sh: sh, db: ctx.db}
+               })
+
+      assert_receive {:selected_engine, script}
+      assert script =~ "/selected/codex"
+      refute script =~ "codex --version"
+      refute script =~ "fixture-key"
     end
 
     test "the injectable seam lifts the api-key selectable pin", ctx do
