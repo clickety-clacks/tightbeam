@@ -2231,7 +2231,30 @@ defmodule Tightbeam.GatewayTest do
       {"gpt-6-luna", ["max"], :openai}
     ])
 
-    spawn = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["spawn"]
+    handlers = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))
+    spawn = handlers["spawn"]
+
+    assert %{setting: "default-archetype", value: "pdo"} =
+             handlers["config"].(%{
+               origin: "user:flynn",
+               params: %{action: "set", setting: "default-archetype", value: "pdo"}
+             })
+
+    assert %{session_key: default_pdo_key} =
+             spawn.(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{
+                 display_name: "Fresh default PDO",
+                 idempotency_key: "fresh-default-pdo"
+               }
+             })
+
+    assert %{archetype: "pdo", harness: "codex", provider: "openai"} =
+             Org.get(ctx.db, default_pdo_key)
+
+    assert Org.get(ctx.db, default_pdo_key).model ==
+             Model.new("gpt-6-sol", effort: "low")
 
     for archetype <- ["pdo", "orchestrator"] do
       assert %{session_key: key} =
