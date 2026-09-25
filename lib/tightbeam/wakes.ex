@@ -3151,7 +3151,7 @@ defmodule Tightbeam.Wakes do
   def cancel_in_txn(%Txn{} = txn, command), do: cancel_in_txn(txn, command, &now/0)
 
   @doc false
-  @spec cancel_in_txn(Txn.t(), map(), (() -> non_neg_integer())) :: cancellation_result()
+  @spec cancel_in_txn(Txn.t(), map(), (-> non_neg_integer())) :: cancellation_result()
   def cancel_in_txn(%Txn{} = txn, command, clock)
       when is_map(command) and is_function(clock, 0) do
     with {:ok, wake} <- pending_wake(txn, command),
@@ -4787,7 +4787,9 @@ defmodule Tightbeam.Wakes do
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
-    GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, Tightbeam.WakeScheduler))
+    GenServer.start_link(__MODULE__, opts,
+      name: Keyword.get(opts, :name, Tightbeam.WakeScheduler)
+    )
   end
 
   @doc """
