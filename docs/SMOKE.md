@@ -42,11 +42,13 @@ still applies; narrowed runs are incomplete for skipped harnesses.
 
 In an authorized disposable org, create a throwaway agent using a model the
 selected harness rejects, and record its session key, parent, turn count and
-parent notifications. Retire that agent, then observe beyond the failed-turn
-retry interval. PASS: the retired agent gets no new turns or re-enqueued work,
-and its parent gets no new retry or escalation notice from that agent. Record
-the exact installed 0.1.9 revision, harness/version, retirement time, observation
-interval and before/after counts. This is an acceptance check for the installer;
+parent notifications. Wake it and confirm a failed turn with a pending retry;
+without that pre-retirement failure, this check cannot pass. Retire that agent,
+then observe beyond the failed-turn retry interval. PASS: the retired agent
+gets no new turns or re-enqueued work, and its parent gets no new retry or
+escalation notice from that agent. Record the exact installed 0.1.9 revision,
+harness/version, retirement time, observation interval and before/after counts.
+This is an acceptance check for the installer;
 do not run it against the live org.
 
 ## Harness parity (normative for every run)
