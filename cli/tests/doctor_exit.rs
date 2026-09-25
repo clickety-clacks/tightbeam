@@ -116,12 +116,12 @@ fn doctor_reports_banked_oauth_corruption_after_ps_failure() {
         ])
     );
     if cfg!(target_os = "macos") {
+        let notes = report["epistemics"]["notes"].as_array().unwrap();
         assert!(
-            report["epistemics"]["notes"]
-                .as_array()
-                .unwrap()
+            notes
                 .iter()
-                .any(|note| note == "probe: ps enumeration failed")
+                .any(|note| note == "probe: ps enumeration failed (exit status: 1)"),
+            "notes: {notes:?}"
         );
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -156,14 +156,17 @@ fn doctor_reports_ordinary_ps_failure_as_structured_data_and_fails() {
         report["credential_health"]["anthropic"]["status"],
         "not_banked"
     );
+    let notes = report["epistemics"]["notes"].as_array().unwrap();
     assert!(
-        report["epistemics"]["notes"]
-            .as_array()
-            .unwrap()
+        notes
             .iter()
-            .any(|note| note == "probe: ps enumeration failed")
+            .any(|note| note == "probe: ps enumeration failed (exit status: 1)"),
+        "notes: {notes:?}"
     );
-    assert!(String::from_utf8_lossy(&output.stderr).contains("probe: ps enumeration failed"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("probe: ps enumeration failed (exit status: 1)")
+    );
 
     fs::remove_dir_all(root).unwrap();
 }
@@ -204,14 +207,17 @@ fn doctor_uses_absolute_lsof_and_fails_closed_when_it_cannot_collect() {
         "doctor invoked the PATH lsof instead of /usr/sbin/lsof"
     );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let notes = report["epistemics"]["notes"].as_array().unwrap();
     assert!(
-        report["epistemics"]["notes"]
-            .as_array()
-            .unwrap()
+        notes
             .iter()
-            .any(|note| note == "probe: /usr/sbin/lsof failed")
+            .any(|note| note == "probe: /usr/sbin/lsof failed (exit status: 1)"),
+        "notes: {notes:?}"
     );
-    assert!(String::from_utf8_lossy(&output.stderr).contains("probe: /usr/sbin/lsof failed"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("probe: /usr/sbin/lsof failed (exit status: 1)")
+    );
 
     fs::remove_dir_all(root).unwrap();
 }
