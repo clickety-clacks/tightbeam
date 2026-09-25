@@ -1327,6 +1327,18 @@ defmodule Tightbeam.GatewayTest do
 
     assert %{ok: false, code: "repair_failed"} = first = handler.(call)
     assert handler.(call) == first
+
+    # The coordinator's own reason rides beside the unchanged message, and the
+    # replay returns it too.
+    assert first.message == ":still_wedged"
+
+    assert %{
+             "kind" => "term",
+             "operation" => "close_adapter",
+             "phase" => "repair_restart",
+             "reason" => %{"$type" => "atom", "value" => "still_wedged"}
+           } = first.diagnostic
+
     assert_receive {:repair_close_adapter, {:claude, "shared", "testhost"}}
     refute_receive {:repair_close_adapter, _}, 50
 

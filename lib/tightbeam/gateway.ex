@@ -617,14 +617,35 @@ defmodule Tightbeam.Gateway do
         try do
           Placement.provision_endpoint(config.base_dir, name, host, opts)
         rescue
-          error -> {:error, Exception.message(error)}
+          error ->
+            {:error,
+             ErrorDiagnostic.exception(error, __STACKTRACE__,
+               operation: "provision_endpoint",
+               origin: "gateway"
+             )}
         end
 
       with {:error, reason} <- result do
-        EventLog.lifecycle(db, "endpoint_not_provisioned", name, to_string(reason))
+        EventLog.lifecycle(db, "endpoint_not_provisioned", name, provision_detail(name, reason))
       end
     end)
   end
+
+  # A raised provisioning step keeps its exception type in the durable detail
+  # and its redacted stack in the log, instead of the bare message alone.
+  defp provision_detail(name, %{"exception" => %{"type" => type} = raised} = node) do
+    Logger.warning("endpoint #{name} was not provisioned: #{JSON.encode!(node)}")
+
+    case raised["message"] do
+      message when is_binary(message) -> "#{message} (#{type})"
+      message -> "#{JSON.encode!(message)} (#{type})"
+    end
+  end
+
+  defp provision_detail(_name, reason) when is_binary(reason) or is_atom(reason),
+    do: to_string(reason)
+
+  defp provision_detail(_name, reason), do: inspect(reason)
 
   defp harness_binary_readiness(cli_bin) do
     results =
@@ -1492,7 +1513,10 @@ defmodule Tightbeam.Gateway do
         }
 
       {:error, error} ->
-        %{ok: false, code: "repair_state_failed", message: inspect(error)}
+        ErrorDiagnostic.put(
+          %{ok: false, code: "repair_state_failed", message: inspect(error)},
+          ErrorDiagnostic.for_reason(error, operation: "assignment_repair", phase: "claim")
+        )
 
       {:error, code, message} ->
         %{ok: false, code: code, message: message}
@@ -1534,18 +1558,34 @@ defmodule Tightbeam.Gateway do
         {:error, code, message} -> {%{ok: false, code: code, message: message}, nil}
       end
 
+    # The persisted outcome keeps its diagnostic so an exact replay returns the
+    # original result; the published lifecycle row keeps its existing shape.
+    recorded = Map.delete(result, :diagnostic)
+
     case Ledger.finish_assignment_repair(db, attempt_id, result) do
       :ok ->
-        if incident, do: record_repair_result(db, call, assignment, incident, result)
+        if incident, do: record_repair_result(db, call, assignment, incident, recorded)
         result
 
       {:error, reason} ->
-        %{
-          ok: false,
-          code: "repair_state_failed",
-          message:
-            "repair effect outcome could not be persisted; attempt #{attempt_id} remains claimed: #{inspect(reason)}"
-        }
+        # The effect already ran; its own outcome rides beside the persistence
+        # failure that replaced it.
+        ErrorDiagnostic.put(
+          %{
+            ok: false,
+            code: "repair_state_failed",
+            message:
+              "repair effect outcome could not be persisted; attempt #{attempt_id} remains claimed: #{inspect(reason)}"
+          },
+          ErrorDiagnostic.new("term",
+            reason: reason,
+            operation: "assignment_repair",
+            phase: "persist_outcome",
+            attempt_id: attempt_id,
+            effect_result: recorded,
+            cause: Map.get(result, :diagnostic)
+          )
+        )
     end
   end
 
@@ -1684,7 +1724,7 @@ defmodule Tightbeam.Gateway do
         rerun_latest(db, call, assignment, incident)
 
       {:error, reason} ->
-        %{ok: false, code: "repair_failed", message: inspect(reason)}
+        repair_failed(reason, operation: "close_adapter", phase: "repair_#{action}")
     end
   end
 
@@ -1721,7 +1761,7 @@ defmodule Tightbeam.Gateway do
              lane_manager: Map.get(call, :lane_manager, Tightbeam.LaneManager)
            ) do
         :appended -> %{ok: true, action: "relaunch", assignmentId: assignment.id}
-        result -> %{ok: false, code: "repair_failed", message: inspect(result)}
+        result -> repair_failed(result, operation: "deliver_prompt", phase: "repair_relaunch")
       end
     else
       %{
@@ -1784,9 +1824,18 @@ defmodule Tightbeam.Gateway do
             }
 
           {:error, reason} ->
-            %{ok: false, code: "repair_failed", message: inspect(reason)}
+            repair_failed(reason, operation: "repair_terminal", phase: "repair_rerun")
         end
     end
+  end
+
+  # The public message stays the inspected classification; the reason's own
+  # structure and any carried node ride in the diagnostic.
+  defp repair_failed(reason, facts) do
+    ErrorDiagnostic.put(
+      %{ok: false, code: "repair_failed", message: inspect(ErrorDiagnostic.classified(reason))},
+      ErrorDiagnostic.with_facts(reason, facts)
+    )
   end
 
   defp record_repair_result(db, call, assignment, incident, result) do
@@ -3984,12 +4033,15 @@ defmodule Tightbeam.Gateway do
         error
 
       {:released, {:marker_failed, error}} ->
-        %{
-          state: "unlearn-failed",
-          code: "identity_marker_failed",
-          message: Exception.message(error),
-          live_revision: Identity.live_revision!(config.base_dir)
-        }
+        ErrorDiagnostic.put(
+          %{
+            state: "unlearn-failed",
+            code: "identity_marker_failed",
+            message: Exception.message(error),
+            live_revision: Identity.live_revision!(config.base_dir)
+          },
+          marker_failure(error)
+        )
     end
   end
 
@@ -4067,9 +4119,17 @@ defmodule Tightbeam.Gateway do
           end
       end
     else
-      {:error, error} -> %{code: "identity_marker_failed", message: Exception.message(error)}
+      {:error, error} ->
+        ErrorDiagnostic.put(
+          %{code: "identity_marker_failed", message: Exception.message(error)},
+          marker_failure(error)
+        )
     end
   end
+
+  # The transaction already consumed the stack; the exception's type is kept.
+  defp marker_failure(error),
+    do: ErrorDiagnostic.from_reason(error, operation: "begin_identity_publication")
 
   defp unlearn_referenced_result(name, references) do
     sessions = Enum.filter(references, &(&1.kind == "session"))
@@ -4148,10 +4208,13 @@ defmodule Tightbeam.Gateway do
         }
 
       {:error, reason} ->
-        %{
-          code: "identity_repoint_failed",
-          message: "session #{call.session_key} could not change archetype: #{inspect(reason)}"
-        }
+        ErrorDiagnostic.put(
+          %{
+            code: "identity_repoint_failed",
+            message: "session #{call.session_key} could not change archetype: #{inspect(reason)}"
+          },
+          ErrorDiagnostic.for_reason(reason, operation: "repoint_archetype")
+        )
     end
   end
 
@@ -4378,7 +4441,7 @@ defmodule Tightbeam.Gateway do
     stamp_session_identity(db, session.session_key, snapshot)
     :applied
   rescue
-    error -> {:error, identity_apply_failed(session, error)}
+    error -> {:error, identity_apply_raised(session, error, __STACKTRACE__)}
   end
 
   # An ordinary prompt, submitted and never waited on: the session re-reads its
@@ -4404,7 +4467,7 @@ defmodule Tightbeam.Gateway do
       _submitted -> :applied
     end
   rescue
-    error -> {:error, identity_apply_failed(session, error)}
+    error -> {:error, identity_apply_raised(session, error, __STACKTRACE__)}
   end
 
   defp identity_apply_prompt(revision) do
@@ -4413,8 +4476,12 @@ defmodule Tightbeam.Gateway do
       "reload your current model context."
   end
 
-  defp identity_apply_failed(session, error) when is_exception(error),
-    do: identity_apply_failed(session, Exception.message(error))
+  defp identity_apply_raised(session, error, stacktrace) do
+    ErrorDiagnostic.put(
+      identity_apply_failed(session, Exception.message(error)),
+      ErrorDiagnostic.exception(error, stacktrace, operation: "identity_apply")
+    )
+  end
 
   defp identity_apply_failed(session, reason) when is_binary(reason) do
     %{
@@ -4566,7 +4633,7 @@ defmodule Tightbeam.Gateway do
         }
 
       {:error, reason} ->
-        %{code: "needs_onboarding", message: inspect(reason)}
+        onboard_failed(inspect(reason), reason, provider, machine, "begin")
     end
   end
 
@@ -4594,7 +4661,7 @@ defmodule Tightbeam.Gateway do
         }
 
       {:error, reason} ->
-        %{code: "needs_onboarding", message: inspect(reason)}
+        onboard_failed(inspect(reason), reason, provider, machine, "begin_daemon")
     end
   end
 
@@ -4624,10 +4691,13 @@ defmodule Tightbeam.Gateway do
         %{provider: provider, credential_kind: wire_credential_kind(kind), status: "onboarded"}
 
       {:error, reason} ->
-        %{
-          code: "needs_onboarding",
-          message: "#{provider} #{kind} credential on #{machine}: #{inspect(reason)}"
-        }
+        onboard_failed(
+          "#{provider} #{kind} credential on #{machine}: #{inspect(reason)}",
+          reason,
+          provider,
+          machine,
+          "finish"
+        )
     end
   end
 
@@ -4641,6 +4711,14 @@ defmodule Tightbeam.Gateway do
          reason,
          _source
        ) do
+    # The store records only the classified failure it acts on; the caller's
+    # own reason is kept here instead of vanishing at the classification.
+    if is_binary(reason) do
+      Logger.info(
+        "onboarding cancel for #{provider} on #{machine}: #{ErrorDiagnostic.redact_text(reason)}"
+      )
+    end
+
     case Tightbeam.Credentials.cancel_onboard(
            provider,
            lease_id,
@@ -4650,9 +4728,23 @@ defmodule Tightbeam.Gateway do
       :ok ->
         %{provider: provider, status: "canceled"}
 
-      {:error, reason} ->
-        %{code: "needs_onboarding", message: inspect(reason)}
+      {:error, failure} ->
+        onboard_failed(inspect(failure), failure, provider, machine, "cancel",
+          cancel_reason: reason
+        )
     end
+  end
+
+  # Every onboarding phase shares one public code; the phase and the native
+  # reason ride in the diagnostic so they stay distinguishable.
+  defp onboard_failed(message, reason, provider, machine, phase, facts \\ []) do
+    ErrorDiagnostic.put(
+      %{code: "needs_onboarding", message: message},
+      ErrorDiagnostic.with_facts(
+        reason,
+        [operation: "onboard", phase: phase, provider: provider, machine: machine] ++ facts
+      )
+    )
   end
 
   # The begin reply carries the OWNER user id so the CLI can wake THAT user with the
@@ -6342,8 +6434,17 @@ defmodule Tightbeam.Gateway do
                     case Placement.move_workdir(config, call.session_key, session.host, host) do
                       :ok ->
                         case commit_host_rearm(config, db, session, host, 8) do
-                          :ok -> %{ok: true, host: host}
-                          {:error, message} -> %{code: "workspace_move_race", message: message}
+                          :ok ->
+                            %{ok: true, host: host}
+
+                          {:error, reason} ->
+                            ErrorDiagnostic.put(
+                              %{
+                                code: "workspace_move_race",
+                                message: ErrorDiagnostic.classified(reason)
+                              },
+                              ErrorDiagnostic.of(reason)
+                            )
                         end
 
                       {:error, message} ->
@@ -7641,8 +7742,17 @@ defmodule Tightbeam.Gateway do
   # ACP error map in an operator's chat (G3). Atoms and short tuples read plainly.
   defp credential_reason_phrase(reason) when is_atom(reason), do: to_string(reason)
 
-  defp credential_reason_phrase(reason) do
-    reason |> inspect() |> String.slice(0, 200)
+  defp credential_reason_phrase(reason), do: bounded_inspect(reason, 200)
+
+  # A cut is marked with the length it came from, so a reader can tell the
+  # phrase is partial instead of taking the prefix for the whole reason.
+  defp bounded_inspect(reason, limit) do
+    text = inspect(reason)
+    length = String.length(text)
+
+    if length > limit,
+      do: String.slice(text, 0, limit) <> "… [truncated from #{length} characters]",
+      else: text
   end
 
   # A credential failure at the turn seam, named through the one shared remedy function.
@@ -8479,8 +8589,13 @@ defmodule Tightbeam.Gateway do
       {:ok, :placement_changed} ->
         {:error, "holder placement changed concurrently"}
 
+      # The transaction consumed the stack; the exception's type is kept.
       {:error, error} ->
-        {:error, Exception.message(error)}
+        {:error,
+         ErrorDiagnostic.diagnosed(
+           Exception.message(error),
+           ErrorDiagnostic.from_reason(error, operation: "commit_host_rearm")
+         )}
     end
   end
 
@@ -8530,7 +8645,7 @@ defmodule Tightbeam.Gateway do
   # inspect only when it has no readable text.
   defp error_sentence(reason) when is_map(reason) do
     case error_map_text(reason) do
-      "" -> reason |> inspect() |> String.slice(0, 300)
+      "" -> bounded_inspect(reason, 300)
       text -> text
     end
   end
