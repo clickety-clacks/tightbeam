@@ -177,6 +177,7 @@ defmodule Tightbeam.Harness.CodexIdentity do
         for await(const line of lines) {
           let row;
           try {row=JSON.parse(line);} catch(_) {return false;}
+          if(row.type==="compacted") {latest=undefined;continue;}
           const item=row.type==="response_item"?row.payload:null;
           const kinds=item?.internal_chat_message_metadata_passthrough?.content_item_kinds;
           if(item?.role==="developer"&&Array.isArray(kinds)&&kinds.includes("hooks.additional_context")&&Array.isArray(item.content)) {

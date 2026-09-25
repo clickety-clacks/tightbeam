@@ -107,6 +107,35 @@ defmodule Tightbeam.HarnessAdapterPatchTest do
            ]) == snapshot_a
   end
 
+  test "compaction requires redelivery before an unchanged snapshot can be suppressed" do
+    base = scratch_dir()
+    target = %{base_dir: base, host_config: %{base_dir: base, ssh: nil}}
+
+    [handler] =
+      CodexIdentity.hook_settings(nil)
+      |> JSON.decode!()
+      |> get_in(["hooks", "SessionStart", Access.at(0), "hooks"])
+
+    transcript = Path.join(base, "rollout.jsonl")
+    assert :ok = CodexIdentity.project(target, "session-A", "rule A")
+    snapshot_a = CodexIdentity.superseding_snapshot("rule A")
+
+    File.write!(transcript, delivered_row(snapshot_a))
+    assert hook_result(handler, base, "session-A", transcript) == %{}
+
+    File.write!(transcript, JSON.encode!(%{type: "compacted"}) <> "\n", [:append])
+
+    assert get_in(hook_result(handler, base, "session-A", transcript), [
+             "hookSpecificOutput",
+             "additionalContext"
+           ]) == snapshot_a
+
+    assert :ok = CodexIdentity.verify_hook(target, "session-A")
+
+    File.write!(transcript, delivered_row(snapshot_a), [:append])
+    assert hook_result(handler, base, "session-A", transcript) == %{}
+  end
+
   test "missing or oversized Codex developer carrier stops before a model turn" do
     base = scratch_dir()
     settings = CodexIdentity.hook_settings(nil) |> JSON.decode!()
