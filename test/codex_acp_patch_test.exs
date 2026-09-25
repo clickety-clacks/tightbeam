@@ -45,7 +45,7 @@ defmodule Tightbeam.HarnessAdapterPatchTest do
              0o600
   end
 
-  test "a persisted delivered snapshot suppresses an unchanged resume but a revision injects" do
+  test "only the latest persisted Tightbeam snapshot suppresses an unchanged resume" do
     base = scratch_dir()
     target = %{base_dir: base, host_config: %{base_dir: base, ssh: nil}}
 
@@ -80,12 +80,24 @@ defmodule Tightbeam.HarnessAdapterPatchTest do
     assert hook_result(handler, base, "session-A", transcript) == %{}
     assert :ok = CodexIdentity.verify_hook(target, "session-A")
 
+    File.write!(transcript, delivered_row("unrelated developer context"), [:append])
+    assert :ok = CodexIdentity.project(target, "session-A", "rule A\nremoved rule")
+
+    assert get_in(hook_result(handler, base, "session-A", transcript), [
+             "hookSpecificOutput",
+             "additionalContext"
+           ]) == snapshot_a
+
+    File.write!(transcript, delivered_row(snapshot_a), [:append])
+    assert hook_result(handler, base, "session-A", transcript) == %{}
+    assert :ok = CodexIdentity.verify_hook(target, "session-A")
+
     File.rm!(transcript)
 
     assert get_in(hook_result(handler, base, "session-A", transcript), [
              "hookSpecificOutput",
              "additionalContext"
-           ]) == snapshot_b
+           ]) == snapshot_a
   end
 
   test "missing or oversized Codex developer carrier stops before a model turn" do

@@ -172,17 +172,22 @@ defmodule Tightbeam.Harness.CodexIdentity do
       if(typeof transcript!=="string"||!transcript) return false;
       const stream=fs.createReadStream(transcript,{encoding:"utf8"});
       const lines=readline.createInterface({input:stream,crlfDelay:Infinity});
+      let latest;
       try {
         for await(const line of lines) {
           let row;
           try {row=JSON.parse(line);} catch(_) {continue;}
           const item=row.type==="response_item"?row.payload:null;
           const kinds=item?.internal_chat_message_metadata_passthrough?.content_item_kinds;
-          if(item?.role==="developer"&&Array.isArray(kinds)&&kinds.includes("hooks.additional_context")&&item.content?.some(part=>part.type==="input_text"&&part.text===snapshot)) return true;
+          if(item?.role==="developer"&&Array.isArray(kinds)&&kinds.includes("hooks.additional_context")&&Array.isArray(item.content)) {
+            for(const part of item.content) {
+              if(part?.type==="input_text"&&typeof part.text==="string"&&part.text.startsWith("Tightbeam identity snapshot SHA-256:")) latest=part.text;
+            }
+          }
         }
       } catch(_) {return false;}
       finally {lines.close();stream.destroy();}
-      return false;
+      return latest===snapshot;
     };
     (async()=>{try {
       const event=JSON.parse(fs.readFileSync(0,"utf8"));
