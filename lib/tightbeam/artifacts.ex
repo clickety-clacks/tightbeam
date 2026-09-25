@@ -705,8 +705,14 @@ defmodule Tightbeam.Artifacts do
       {:ok, _stat} ->
         canonical_components!(candidate, rest, symlink_hops)
 
-      {:error, _reason} ->
+      {:error, :enoent} ->
         raise ArgumentError, "artifact origin is missing from its session workspace"
+
+      # A path that exists but cannot be examined is not "missing"; name the errno.
+      {:error, reason} ->
+        raise ArgumentError,
+              "artifact origin cannot be examined in its session workspace: " <>
+                "#{reason} (#{:file.format_error(reason)})"
     end
   end
 

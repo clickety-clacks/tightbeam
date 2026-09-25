@@ -1046,7 +1046,7 @@ defmodule Tightbeam.Supervision do
   def transition_in_txn(%Txn{}, _observation), do: :duplicate
 
   @spec liveness_trigger_in_txn(Txn.t(), {:assignment | :work_item, String.t()}) ::
-          {:ok, %{kind: String.t(), id: String.t()}} | :none | {:error, atom()}
+          {:ok, %{kind: String.t(), id: String.t()}} | :none | {:error, term()}
   def liveness_trigger_in_txn(txn, {:assignment, assignment_id}) do
     assignment_trigger_in_txn(txn, assignment_id)
   end
@@ -1155,8 +1155,10 @@ defmodule Tightbeam.Supervision do
           :none ->
             :none
 
-          {:error, _reason} ->
-            {:error, :incompatible_supervision_liveness_v1}
+          # Keep the transfer check's own refusal beside the classification, so
+          # the raise names the failed check instead of a bare contract atom.
+          {:error, reason} ->
+            {:error, {:incompatible_supervision_liveness_v1, {:accepted_transfer, reason}}}
         end
     end
   end

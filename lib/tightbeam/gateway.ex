@@ -5050,7 +5050,7 @@ defmodule Tightbeam.Gateway do
             error in Tightbeam.Identity.IncludeError ->
               denial = %{code: "identity_include_invalid", message: Exception.message(error)}
 
-              {:ok, _marker} =
+              {:ok, marker} =
                 AdminProjection.deny_identity_validation(
                   db,
                   invocation_id,
@@ -5061,7 +5061,9 @@ defmodule Tightbeam.Gateway do
                   denial
                 )
 
-              denial
+              # Answer from the stored marker so a retried invocation replays the
+              # identical denial, diagnostic included.
+              identity_denial_result(marker)
           end
 
         %{state: "accepted"} = marker ->
@@ -5112,7 +5114,28 @@ defmodule Tightbeam.Gateway do
     |> put_present(:message, marker.denial_message)
     |> put_present(:expected, marker.denial_expected)
     |> put_present(:actual, marker.denial_actual)
+    |> ErrorDiagnostic.put(include_denial_diagnostic(marker))
   end
+
+  # The include refusal's cause, candidate fingerprint and expected prior are
+  # stored as their own columns; the message carries path, line and chain as
+  # text. The "none" and all-zero values are the marker's placeholders for an
+  # unknown prior or fingerprint, so they are left out rather than reported.
+  @unknown_fingerprint String.duplicate("0", 64)
+  defp include_denial_diagnostic(%{denial_code: "identity_include_invalid"} = marker) do
+    details =
+      %{"cause" => marker.cause}
+      |> put_known("treeFingerprint", marker.tree_fingerprint, @unknown_fingerprint)
+      |> put_known("expectedPrior", marker.expected_prior, "none")
+
+    ErrorDiagnostic.new("denial", details: {:node, details})
+  end
+
+  defp include_denial_diagnostic(_marker), do: nil
+
+  defp put_known(map, _key, placeholder, placeholder), do: map
+  defp put_known(map, _key, nil, _placeholder), do: map
+  defp put_known(map, key, value, _placeholder), do: Map.put(map, key, value)
 
   defp put_present(result, _key, nil), do: result
   defp put_present(result, key, value), do: Map.put(result, key, value)
@@ -7533,11 +7556,16 @@ defmodule Tightbeam.Gateway do
         :ok
 
       {:needs_onboarding, reason} ->
+        # The sentence names the remedy; the diagnostic keeps the reason that
+        # chose it, e.g. which check found the plan unsupported.
         {:error,
          %{
            code: "needs_onboarding",
            message: credential_remedy(reason, provider, machine)
-         }}
+         }
+         |> ErrorDiagnostic.put(
+           ErrorDiagnostic.from_reason(reason, operation: "credential_status", provider: provider)
+         )}
     end
   end
 

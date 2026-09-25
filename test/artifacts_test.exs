@@ -607,6 +607,47 @@ defmodule Tightbeam.ArtifactsTest do
     refute File.exists?(archive_root)
   end
 
+  test "an origin that exists but cannot be examined names its errno instead of claiming it is missing",
+       ctx do
+    workspace =
+      Path.join(System.tmp_dir!(), "artifact-workspace-#{System.unique_integer([:positive])}")
+
+    archive_root =
+      Path.join(System.tmp_dir!(), "artifact-archive-#{System.unique_integer([:positive])}")
+
+    locked = Path.join(workspace, "reports/locked")
+    File.mkdir_p!(locked)
+    File.write!(Path.join(locked, "result.md"), "unreachable result")
+    File.chmod!(locked, 0o000)
+
+    on_exit(fn ->
+      File.chmod(locked, 0o755)
+      File.rm_rf(workspace)
+      File.rm_rf(archive_root)
+    end)
+
+    row =
+      record(ctx.db, ctx.child.session_key, %{
+        kind: "report",
+        title: "Locked",
+        origin_path: "reports/locked/result.md"
+      })
+
+    error =
+      assert_raise ArgumentError, fn ->
+        Artifacts.archive_session(ctx.db, ctx.child.session_key, workspace, archive_root)
+      end
+
+    assert error.message ==
+             "artifact origin cannot be examined in its session workspace: " <>
+               "eacces (permission denied)"
+
+    unchanged = Artifacts.get(ctx.db, row.artifact_id)
+    assert unchanged.state == "in-workspace"
+    assert unchanged.home == nil
+    refute File.exists?(archive_root)
+  end
+
   test "acceptance 7: an origin outside the workspace is external — released, and nothing raises",
        ctx do
     workspace =

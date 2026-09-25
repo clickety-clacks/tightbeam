@@ -884,6 +884,28 @@ defmodule Tightbeam.ArchetypesTest do
       assert detail =~ message
     end
 
+    # The include refusal's structured fields ride beside the sentence.
+    assert {:error,
+            %{
+              code: "invalid_overrides",
+              diagnostic: %{
+                "kind" => "denial",
+                "details" => %{"cause" => "missing_fragment", "paths" => paths} = details
+              }
+            }} =
+             Archetypes.normalize_overrides(ctx.base_dir, archetype, %{
+               "guidance_extra" => ~s(#include "missing.md")
+             })
+
+    assert Enum.any?(paths, &(&1 =~ "missing.md"))
+    assert Map.has_key?(details, "origin")
+
+    # A plain validation refusal has no include fields to carry: none are invented.
+    assert {:error, %{code: "invalid_overrides"} = refusal} =
+             Archetypes.normalize_overrides(ctx.base_dir, archetype, %{"guidance_extra" => 42})
+
+    refute Map.has_key?(refusal, :diagnostic)
+
     assert {:ok,
             %{
               "skills_add" => ["alpha", "zeta"],

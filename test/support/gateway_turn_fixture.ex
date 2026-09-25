@@ -94,6 +94,9 @@ defmodule Tightbeam.GatewayTurnFixture do
         ),
         do: handle_call({:load_session, sid, model, cwd, mcp_servers, guidance}, from, parent)
 
+    def handle_call({:close_session, sid, _opts}, from, state),
+      do: handle_call({:close_session, sid}, from, state)
+
     def handle_call({:close_session, sid}, _from, parent) do
       send(parent, {:close_session, sid})
       {:reply, :ok, parent}

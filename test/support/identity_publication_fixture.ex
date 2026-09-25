@@ -101,6 +101,12 @@ defmodule Tightbeam.IdentityPublicationFixture do
     assert %{code: "identity_include_invalid", message: message} = denial = handler.(call)
     assert message =~ "missing.md"
 
+    # The stored cause and candidate fingerprint reach the caller as fields.
+    assert %{"kind" => "denial", "details" => %{"cause" => "missing_fragment"} = details} =
+             denial.diagnostic
+
+    assert details["treeFingerprint"] =~ ~r/\A[0-9a-f]{64}\z/
+
     assert %{
              state: "denied",
              cause: "missing_fragment",

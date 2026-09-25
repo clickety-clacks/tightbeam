@@ -229,6 +229,9 @@ defmodule Tightbeam.GatewayTest do
     def handle_call({:fast_status, _sid}, _from, state),
       do: {:reply, {:error, :fast_unsupported}, state}
 
+    def handle_call({:close_session, sid, _opts}, from, state),
+      do: handle_call({:close_session, sid}, from, state)
+
     def handle_call({:close_session, sid}, _from, {parent, models}) do
       send(parent, {:candidate_closed, sid})
       {:reply, :ok, {parent, Map.delete(models, sid)}}
@@ -255,6 +258,9 @@ defmodule Tightbeam.GatewayTest do
     use GenServer
     def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
     def init(parent), do: {:ok, parent}
+
+    def handle_call({:close_session, sid, _opts}, from, state),
+      do: handle_call({:close_session, sid}, from, state)
 
     def handle_call({:close_session, sid}, _from, parent) do
       send(parent, {:close_session_failed, sid})
@@ -285,6 +291,9 @@ defmodule Tightbeam.GatewayTest do
 
     def handle_call({:current_model, _sid}, _from, {_parent, opts} = state),
       do: {:reply, {:ok, Keyword.get(opts, :current_model, Model.new("fable"))}, state}
+
+    def handle_call({:close_session, sid, _opts}, from, state),
+      do: handle_call({:close_session, sid}, from, state)
 
     def handle_call({:close_session, sid}, _from, {parent, _opts} = state) do
       send(parent, {:tune_session_closed, sid})
@@ -362,6 +371,9 @@ defmodule Tightbeam.GatewayTest do
 
     # A resident session: the adapter still holds it and answers a bounce.
     def handle_call({:knows_session?, _sid}, _from, parent), do: {:reply, true, parent}
+
+    def handle_call({:close_session, sid, _opts}, from, state),
+      do: handle_call({:close_session, sid}, from, state)
 
     def handle_call({:close_session, sid}, _from, parent) do
       send(parent, {:identity_apply_close, sid})
@@ -2881,6 +2893,52 @@ defmodule Tightbeam.GatewayTest do
 
     assert message =~ "local_openai"
     refute message =~ "opencode_go"
+  end
+
+  test "a credential refusal keeps the reason that chose its remedy sentence", ctx do
+    base_dir = role_test_base("spawn-pi-unsupported-detail", false)
+    Archetypes.load!(base_dir)
+
+    put_host_catalog("testhost", "pi", [
+      {"spark/qwen3.5-35b", [], :local_openai}
+    ])
+
+    config =
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.put(:default_harness, :pi)
+      |> Map.put(:default_model, Model.new("spark/qwen3.5-35b"))
+      |> Map.put(:credential_status, fn
+        :local_openai, "testhost" -> {:needs_onboarding, {:unsupported, :no_subscription}}
+      end)
+
+    assert %{
+             code: "placement_denied",
+             message: message,
+             detail: %{code: "needs_onboarding", diagnostic: diagnostic}
+           } =
+             Gateway.handlers(config)["spawn"].(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{
+                 display_name: "Spark unsupported plan",
+                 idempotency_key: "spawn-pi-unsupported-detail"
+               }
+             })
+
+    # The sentence is unchanged; the check that said "unsupported" is now named.
+    assert message =~ "no supported subscription"
+
+    assert %{
+             "kind" => "term",
+             "operation" => "credential_status",
+             "reason" => %{
+               "$type" => "tuple",
+               "items" => [
+                 %{"$type" => "atom", "value" => "unsupported"},
+                 %{"$type" => "atom", "value" => "no_subscription"}
+               ]
+             }
+           } = diagnostic
   end
 
   test "spawn uses the next where host when the first cannot run the requested harness", ctx do
