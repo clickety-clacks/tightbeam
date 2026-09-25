@@ -119,8 +119,7 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
 
     # A target in the item's actual scope must not mask that the claimant owns
     # a different PO office for the same human.
-    assert %{code: "not_authorized"} =
-             assign(db, {:session, "pdo-a"}, "lane-b", "wi_b1", true)
+    assert %{code: "not_authorized"} = assign(db, {:session, "pdo-a"}, "lane-b", "wi_b1", true)
 
     assert %{code: "cross_owner_scope"} =
              bind_scope(
@@ -794,6 +793,46 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
 
     assert {:ok, %{archetype: "coder"}} =
              Dispatch.dispatch(db, spawn_handlers, spawn_call("lane-a", "coder", "wi_a1"))
+
+    assert %{"association" => %{"revision" => 2}} =
+             associate(
+               db,
+               {:user, "owner"},
+               "pdo-a",
+               "product-owner:b",
+               "stale-owner-policy"
+             )
+
+    assert DeliveryResponsibilities.current_owner(db, "wi_a1")["deliveryState"] == "stale"
+
+    stale_owner_calls = [
+      {spawn_handlers, spawn_call(Org.personal_session_key("owner"), "coder", "wi_a1"),
+       "engineering-spawn-staffing-needs-current-delivery-owner"},
+      {assignment_handlers,
+       production_call("assign", Org.personal_session_key("owner"), "worker-a", "wi_a1"),
+       "engineering-assign-production-needs-current-delivery-owner"},
+      {assignment_handlers,
+       production_call("assign", Org.personal_session_key("owner"), "worker-a", "wi_a1",
+         effect_kind: "coordination"
+       ), "engineering-assign-labeled-coordination-needs-current-delivery-owner"},
+      {assignment_handlers,
+       production_call("dispatch", Org.personal_session_key("owner"), "worker-a", "wi_a1"),
+       "engineering-dispatch-production-needs-current-delivery-owner"},
+      {assignment_handlers,
+       production_call("dispatch", Org.personal_session_key("owner"), "worker-a", "wi_a1",
+         effect_kind: "coordination"
+       ), "engineering-dispatch-labeled-coordination-needs-current-delivery-owner"}
+    ]
+
+    for {handlers, call, expected_rule} <- stale_owner_calls do
+      assert {:error, %{rule: ^expected_rule, message: message}} =
+               Dispatch.dispatch(db, handlers, call)
+
+      assert message =~ "recorded delivery owner is stale or unavailable"
+      assert message =~ "actual Main must explicitly recover the delivery scope"
+      refute message =~ "Current accountable owner: session:pdo-a"
+      refute message =~ "Route the request through that owner"
+    end
   end
 
   test "schema is additive and every authority history is immutable", %{db: db} do
