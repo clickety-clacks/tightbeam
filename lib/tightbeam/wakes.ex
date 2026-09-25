@@ -5923,7 +5923,7 @@ defmodule Tightbeam.Wakes do
       txn,
       "wake_unresolved",
       wake.wake_id,
-      "firedBy=#{cause}#{matched} target=#{target} reason=unresolvable"
+      "firedBy=#{cause}#{matched} target=#{target} reason=delivery_skipped"
     )
   end
 

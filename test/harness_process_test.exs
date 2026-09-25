@@ -235,4 +235,10 @@ defmodule Tightbeam.HarnessProcessTest do
   } do
     Tightbeam.HarnessProcessFixture.run!(tmp, 31)
   end
+
+  test "an unreadable boot identity keeps the fence and records the helper's answer", %{
+    tmp_dir: tmp
+  } do
+    Tightbeam.HarnessProcessFixture.run!(tmp, 32)
+  end
 end

@@ -2394,6 +2394,14 @@ defmodule Tightbeam.SupervisionTest do
     assert log =~ "refusing a turn addressed to agent:main:clawline:nobody:main"
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
 
+    # The refusal's cause outlives the log line, distinct from deliberate skips.
+    assert [event] =
+             Enum.filter(EventLog.lifecycle_events(ctx.db), &(&1.kind == "turn_undeliverable"))
+
+    assert event.subject == "agent:main:clawline:nobody:main"
+    assert event.detail =~ "reason=no_session_row"
+    assert event.detail =~ "origin=process:tightbeam"
+
     assert {:ok, [[0]]} =
              DB.query(ctx.db, "SELECT COUNT(*) FROM messages WHERE sessionKey = ?1", [
                "agent:main:clawline:nobody:main"

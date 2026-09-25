@@ -1145,6 +1145,59 @@ defmodule Tightbeam.HarnessProcessFixture do
     assert HarnessProcess.fenced?(ctx.db, key)
   end
 
+  defp scenario(32, ctx) do
+    helper = Path.join(ctx.test_dir, "boot-unreadable-helper")
+
+    File.write!(
+      helper,
+      """
+      #!/bin/sh
+      if [ "$1" = "boot-identity" ]; then
+        echo "boot id source unreadable"
+        exit 3
+      fi
+      exit 64
+      """
+    )
+
+    File.chmod!(helper, 0o755)
+    key = {:claude, "shared", "boot-unreadable"}
+
+    opts =
+      HarnessProcess.prepare_launch(
+        [cmd: ["unused"], process_identity_dir: ctx.test_dir, process_helper: helper],
+        ctx.db,
+        key
+      )
+
+    launch_id = Keyword.fetch!(opts, :harness_process_launch_id)
+    [row] = HarnessProcess.list(ctx.db)
+    File.write!(row.identity_path, "999999124\t999999124\tboot-marker\t#{launch_id}\n")
+    assert :ok = HarnessProcess.capture_identity(ctx.db, launch_id)
+
+    assert {:error, {:kill_failed, _reason}} = HarnessProcess.reconcile_key(ctx.db, key)
+
+    # An unreadable boot identity keeps the fence; it is not reported as a live process
+    # or a reboot orphan, and the helper's own answer is kept.
+    assert HarnessProcess.fenced?(ctx.db, key)
+
+    refute Enum.any?(
+             EventLog.lifecycle_events(ctx.db),
+             &(&1.kind == "harness_launch_reboot_orphan")
+           )
+
+    assert [event] =
+             Enum.filter(
+               EventLog.lifecycle_events(ctx.db),
+               &(&1.kind == "harness_boot_identity_unknown")
+             )
+
+    assert event.subject == "claude:shared@boot-unreadable"
+    assert event.detail =~ launch_id
+    assert event.detail =~ "boot_identity_unavailable"
+    assert event.detail =~ "boot id source unreadable"
+  end
+
   defp scenario(30, ctx) do
     helper = grouped_helper(ctx, "boot-mismatch.sh", "while :; do sleep 60; done")
     {port, row} = launch(ctx, {:claude, "shared", "boot-mismatch"}, [helper])

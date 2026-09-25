@@ -1987,7 +1987,14 @@ defmodule Tightbeam.Gateway do
 
     case delivery_target(txn, session_key, opts[:target_gate]) do
       nil ->
-        cancel_unavailable_supervision_controller_in_txn(txn, opts, session_key)
+        case cancel_unavailable_supervision_controller_in_txn(txn, opts, session_key) do
+          :canceled ->
+            :ok
+
+          :ordinary ->
+            record_undeliverable_in_txn(txn, session_key, origin, opts, "no_delivery_target")
+        end
+
         :skipped
 
       {target, role_ref, role_fallback} when not is_nil(target) ->
@@ -2092,7 +2099,21 @@ defmodule Tightbeam.Gateway do
         "(origin=#{origin} wake=#{opts[:wake_id] || "none"} sender=#{opts[:sender] || "none"})"
     )
 
+    record_undeliverable_in_txn(txn, target, origin, opts, "no_session_row")
     :skipped
+  end
+
+  # `:skipped` is shared with deliberate non-delivery (a canceled controller, a
+  # withdrawn remedy), so the failure's own cause is kept as a durable event.
+  defp record_undeliverable_in_txn(txn, target, origin, opts, reason) do
+    :ok =
+      EventLog.lifecycle_in_txn(
+        txn,
+        "turn_undeliverable",
+        opts[:wake_id] || target || "none",
+        "reason=#{reason} target=#{target || "none"} origin=#{origin} " <>
+          "sender=#{opts[:sender] || "none"}"
+      )
   end
 
   defp fire_wake_in_txn(txn, opts) do
@@ -3706,23 +3727,33 @@ defmodule Tightbeam.Gateway do
 
     # ATTEMPT-SCOPED: ask only for the death of the generation this turn checked
     # out. If the coordinator has not yet processed that :DOWN — or the record
-    # belongs to a PREVIOUS attempt — we get nil and report the generic reason.
+    # belongs to a PREVIOUS attempt — we get nil and say the cause is unrecorded.
     # Mislabelling a new death with its predecessor's reason would be worse than
     # saying less (cross-review F4).
     reason =
       case AdapterCoordinator.last_failure(coordinator, key, generation) do
-        nil -> "adapter is not running"
+        nil -> "adapter is not running; no failure is recorded for this attempt"
         failure -> Adapter.failure_text(failure)
       end
 
     {:error, {:adapter_unavailable, reason}}
   rescue
-    _ -> {:error, {:adapter_unavailable, "adapter is not running"}}
+    exception -> unreadable_adapter_failure(:error, exception, __STACKTRACE__)
   catch
-    :exit, _ -> {:error, {:adapter_unavailable, "adapter is not running"}}
+    :exit, reason -> unreadable_adapter_failure(:exit, reason, __STACKTRACE__)
   end
 
   defp enrich_adapter_unavailable(_config, result, _key, _generation), do: result
+
+  # `:noproc` already proves the adapter is not running; only the lookup of WHY
+  # failed, so both facts are kept rather than reading as a clean "no record".
+  defp unreadable_adapter_failure(kind, reason, stacktrace) do
+    node = ErrorDiagnostic.caught(kind, reason, stacktrace, operation: "last_failure")
+
+    {:error,
+     {:adapter_unavailable,
+      "adapter is not running; its failure record could not be read: " <> JSON.encode!(node)}}
+  end
 
   defp new_harness_session(db, adapter, session, cwd, mcp_servers, guidance) do
     with {:ok, sid} <-
@@ -8286,9 +8317,9 @@ defmodule Tightbeam.Gateway do
 
     :ok
   rescue
-    _ -> :ok
+    exception -> best_effort_failed("reap_retired_sessions", :error, exception, __STACKTRACE__)
   catch
-    :exit, _ -> :ok
+    :exit, reason -> best_effort_failed("reap_retired_sessions", :exit, reason, __STACKTRACE__)
   end
 
   defp archive_retired_workspace(config, db, session_key) do
@@ -8310,9 +8341,10 @@ defmodule Tightbeam.Gateway do
       )
     end
   rescue
-    _ -> :ok
+    exception ->
+      best_effort_failed("archive_retired_workspace", :error, exception, __STACKTRACE__)
   catch
-    _, _ -> :ok
+    kind, reason -> best_effort_failed("archive_retired_workspace", kind, reason, __STACKTRACE__)
   end
 
   defp reap_adapter_sessions(db, coordinator, key, retired) do
@@ -8340,9 +8372,9 @@ defmodule Tightbeam.Gateway do
       end
     end
   rescue
-    _ -> :ok
+    exception -> best_effort_failed("reap_adapter_sessions", :error, exception, __STACKTRACE__)
   catch
-    :exit, _ -> :ok
+    :exit, reason -> best_effort_failed("reap_adapter_sessions", :exit, reason, __STACKTRACE__)
   end
 
   defp live_session_on_adapter?(db, {harness, "shared", host}) do
@@ -8688,10 +8720,18 @@ defmodule Tightbeam.Gateway do
     try do
       fun.()
     rescue
-      _ -> :ok
+      exception -> best_effort_failed("best_effort", :error, exception, __STACKTRACE__)
     catch
-      _, _ -> :ok
+      kind, reason -> best_effort_failed("best_effort", kind, reason, __STACKTRACE__)
     end
+  end
+
+  # Best-effort work stays best-effort: the caller still gets :ok. What failed is
+  # logged with its type, message and stack instead of vanishing.
+  defp best_effort_failed(site, kind, reason, stacktrace) do
+    node = ErrorDiagnostic.caught(kind, reason, stacktrace, operation: site, origin: "gateway")
+    Logger.warning("#{site} failed; continuing: " <> JSON.encode!(node))
+    :ok
   end
 
   defp deliver(pid, payload), do: send(pid, {:push, payload})
