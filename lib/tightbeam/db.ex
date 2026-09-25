@@ -19,6 +19,7 @@ defmodule Tightbeam.DB do
 
   use GenServer
   alias Exqlite.Sqlite3
+  alias Tightbeam.DBObservation
 
   @typedoc "The DB owner process (name or pid) — pass a test-local name to isolate."
   @type server :: GenServer.server()
@@ -29,6 +30,21 @@ defmodule Tightbeam.DB do
   defmodule Error do
     @moduledoc "SQLite failure surfaced as an exception (exqlite returns tuples; we raise)."
     defexception [:message]
+  end
+
+  defmodule Timeout do
+    @moduledoc "A sanitized caller timeout; never contains SQL, params or the DB message."
+    defexception [
+      :request_id,
+      :db_call_id,
+      :operation,
+      :effect_kind,
+      :elapsed_ms,
+      :budget_ms,
+      timeout_source: "otp_db_call",
+      effect_state: "unknown",
+      message: "database operation timed out"
+    ]
   end
 
   defmodule ReferenceFenceError do
@@ -94,7 +110,16 @@ defmodule Tightbeam.DB do
   end
 
   def query(server, sql, params) do
-    GenServer.call(server, {:query, sql, params}, call_timeout())
+    DBObservation.call(server, {:query, sql, params}, "db.query", call_timeout())
+  end
+
+  @doc false
+  def query_for(server, operation, sql, params)
+      when operation in ["auth.session_by_cli_token", "wake.due_scan"] do
+    case server do
+      %{__struct__: Tightbeam.DB.Txn} -> query(server, sql, params)
+      _ -> DBObservation.call(server, {:query, sql, params}, operation, call_timeout())
+    end
   end
 
   @doc """
@@ -113,7 +138,7 @@ defmodule Tightbeam.DB do
 
       timeout ->
         try do
-          GenServer.call(server, {:query, sql, params}, timeout)
+          DBObservation.call(server, {:query, sql, params}, "db.query", timeout, :deadline)
         catch
           :exit, {:timeout, _} -> {:error, %DeadlineExceeded{}}
           :exit, reason -> {:error, reason}
@@ -130,7 +155,7 @@ defmodule Tightbeam.DB do
   @doc "Execute DDL / statements without results."
   @spec execute(server(), String.t()) :: :ok | {:error, term()}
   def execute(server \\ __MODULE__, sql) do
-    GenServer.call(server, {:execute, sql}, call_timeout())
+    DBObservation.call(server, {:execute, sql}, "db.execute", call_timeout())
   end
 
   @doc """
@@ -143,7 +168,7 @@ defmodule Tightbeam.DB do
           {:ok, result} | {:error, Exception.t()}
         when result: term()
   def transaction(server \\ __MODULE__, fun) when is_function(fun, 1) do
-    GenServer.call(server, {:transaction, fun}, call_timeout())
+    DBObservation.call(server, {:transaction, fun}, "db.transaction", call_timeout())
   end
 
   @doc """
@@ -164,7 +189,13 @@ defmodule Tightbeam.DB do
       {:error, %DeadlineExceeded{}}
     else
       try do
-        GenServer.call(server, {:transaction_until, fun, deadline}, remaining + 50)
+        DBObservation.call(
+          server,
+          {:transaction_until, fun, deadline},
+          "db.transaction",
+          remaining + 50,
+          :deadline
+        )
       catch
         :exit, {:timeout, _} -> {:error, %DeadlineExceeded{}}
         :exit, reason -> {:error, reason}
@@ -186,7 +217,7 @@ defmodule Tightbeam.DB do
 
   def transaction_then(server, prepare, after_commit)
       when is_function(prepare, 1) and is_function(after_commit, 1) do
-    case GenServer.call(server, {:transaction, prepare}, call_timeout()) do
+    case DBObservation.call(server, {:transaction, prepare}, "db.transaction", call_timeout()) do
       {:ok, result} -> run_after_commit(after_commit, result, MapSet.new())
       {:error, error} -> {:error, error}
     end
@@ -194,7 +225,12 @@ defmodule Tightbeam.DB do
 
   def transaction_then(server, prepare, after_commit)
       when is_function(prepare, 1) and is_function(after_commit, 2) do
-    GenServer.call(server, {:transaction_then, prepare, after_commit}, call_timeout())
+    DBObservation.call(
+      server,
+      {:transaction_then, prepare, after_commit},
+      "db.transaction",
+      call_timeout()
+    )
   end
 
   @doc "Atomically check references and hold a monitored archetype-release fence."
@@ -205,9 +241,10 @@ defmodule Tightbeam.DB do
         ) :: {:ok, reference(), term()} | {:error, term()}
   def begin_reference_fence(server \\ __MODULE__, archetypes, check)
       when is_list(archetypes) and is_function(check, 1) do
-    GenServer.call(
+    DBObservation.call(
       server,
       {:begin_reference_fence, Enum.uniq(archetypes), check, self()},
+      "db.reference_fence",
       call_timeout()
     )
   end
@@ -215,7 +252,12 @@ defmodule Tightbeam.DB do
   @doc "Release a fence previously returned by begin_reference_fence/3."
   @spec end_reference_fence(server(), reference()) :: :ok
   def end_reference_fence(server \\ __MODULE__, token) when is_reference(token) do
-    GenServer.call(server, {:end_reference_fence, token}, call_timeout())
+    DBObservation.call(
+      server,
+      {:end_reference_fence, token},
+      "db.reference_fence",
+      call_timeout()
+    )
   end
 
   ## Txn handle passed to transaction callbacks (runs inside the owner process)
@@ -314,7 +356,7 @@ defmodule Tightbeam.DB do
 
     @doc "Execute a statement without results inside the transaction."
     @spec exec(t(), String.t()) :: :ok
-    def exec(%__MODULE__{conn: conn}, sql), do: :ok = Sqlite3.execute(conn, sql)
+    def exec(%__MODULE__{conn: conn}, sql), do: Tightbeam.DB.execute_sql!(conn, sql)
 
     @doc "Rows changed by the last statement — the CAS check for guarded UPDATEs."
     @spec changes(t()) :: non_neg_integer()
@@ -342,14 +384,21 @@ defmodule Tightbeam.DB do
   ## Server
 
   @doc false
-  def prepare_schema(server), do: GenServer.call(server, :prepare_schema, call_timeout())
+  def prepare_schema(server),
+    do: DBObservation.call(server, :prepare_schema, "schema.ensure", call_timeout())
 
   @doc false
-  def finish_schema(server), do: GenServer.call(server, :finish_schema, call_timeout())
+  def finish_schema(server),
+    do: DBObservation.call(server, :finish_schema, "schema.ensure", call_timeout())
 
   @doc false
   def assert_base_admitted!(server, base) do
-    case GenServer.call(server, {:assert_base_admitted, base}, call_timeout()) do
+    case DBObservation.call(
+           server,
+           {:assert_base_admitted, base},
+           "schema.ensure",
+           call_timeout()
+         ) do
       :ok -> :ok
       {:error, error} -> raise error
     end
@@ -379,7 +428,7 @@ defmodule Tightbeam.DB do
             "PRAGMA synchronous=NORMAL",
             "PRAGMA busy_timeout=5000"
           ] do
-        :ok = Sqlite3.execute(conn, pragma)
+        execute_sql!(conn, pragma)
       end
 
       :ok = load_topline_unicode(conn)
@@ -419,6 +468,12 @@ defmodule Tightbeam.DB do
   end
 
   @impl true
+  def handle_call({:db_call, envelope, payload}, from, state) do
+    # Delegate to the existing handler so admission, fences, deadlines and all
+    # state transitions retain their current owner and ordering (R2/R3).
+    DBObservation.server(envelope, 5_000, fn -> handle_call(payload, from, state) end)
+  end
+
   def handle_call({:assert_base_admitted, base}, _from, state) do
     unless state.admission && Tightbeam.LiveBaseAdmission.canonical!(base) == state.admission.base,
       do: raise(ArgumentError, "startup requires this base's persistent DB admission")
@@ -441,7 +496,7 @@ defmodule Tightbeam.DB do
   end
 
   def handle_call(:prepare_schema, _from, %{conn: conn, admission: admission} = state) do
-    :ok = Sqlite3.execute(conn, "BEGIN IMMEDIATE")
+    execute_sql!(conn, "BEGIN IMMEDIATE")
 
     try do
       if admission && admission.stamp != :fresh do
@@ -455,18 +510,18 @@ defmodule Tightbeam.DB do
       end
 
       :ok =
-        Sqlite3.execute(conn, """
+        execute_sql!(conn, """
         CREATE TABLE IF NOT EXISTS schema_stamp (
           shape TEXT PRIMARY KEY,
           stampedAt INTEGER NOT NULL
         );
         """)
 
-      :ok = Sqlite3.execute(conn, "COMMIT")
+      execute_sql!(conn, "COMMIT")
       {:reply, :ok, state}
     rescue
       error ->
-        :ok = Sqlite3.execute(conn, "ROLLBACK")
+        execute_sql!(conn, "ROLLBACK")
         {:reply, {:error, error}, state}
     end
   end
@@ -478,7 +533,7 @@ defmodule Tightbeam.DB do
   end
 
   def handle_call({:execute, sql}, _from, %{conn: conn} = state) do
-    {:reply, Sqlite3.execute(conn, sql), state}
+    {:reply, execute_sql(conn, sql), state}
   end
 
   def handle_call({:transaction, fun}, _from, %{conn: conn} = state) do
@@ -495,16 +550,19 @@ defmodule Tightbeam.DB do
     remaining = deadline - System.monotonic_time(:millisecond)
 
     if remaining <= 0 do
+      DBObservation.sqlite_budget(nil)
       {:reply, {:error, %DeadlineExceeded{}}, state}
     else
-      :ok = Sqlite3.execute(conn, "PRAGMA busy_timeout=#{max(remaining, 1)}")
+      DBObservation.sqlite_budget(max(remaining, 1))
+      execute_sql!(conn, "PRAGMA busy_timeout=#{max(remaining, 1)}")
       Process.put(row_commit_key(conn), [])
 
       try do
         {:reply, commit_phase(conn, fun, fenced_archetypes(state), deadline), state}
       after
         Process.delete(row_commit_key(conn))
-        _ = Sqlite3.execute(conn, "PRAGMA busy_timeout=5000")
+        restored = execute_sql(conn, "PRAGMA busy_timeout=5000")
+        if restored != :ok, do: DBObservation.cleanup_failure(restored)
       end
     end
   end
@@ -615,12 +673,12 @@ defmodule Tightbeam.DB do
         # This raise is why the outer rescue below exists: there is nothing to
         # roll back yet.
         Txn.ensure_before_deadline(txn)
-        :ok = Sqlite3.execute(conn, "BEGIN IMMEDIATE")
+        execute_sql!(conn, "BEGIN IMMEDIATE")
 
         try do
-          result = fun.(txn)
+          result = DBObservation.callback(fn -> fun.(txn) end)
           Txn.ensure_before_deadline(txn)
-          :ok = Sqlite3.execute(conn, "COMMIT")
+          execute_sql!(conn, "COMMIT")
           {:committed, result, Enum.reverse(Process.get(key))}
         rescue
           error ->
@@ -632,9 +690,13 @@ defmodule Tightbeam.DB do
             # that learns the connection was not restored, and the tuple below
             # asserts a rollback that may not have happened. Say so, and still
             # return the real error.
-            case Sqlite3.execute(conn, "ROLLBACK") do
-              :ok -> :ok
-              other -> Logger.error("transaction rollback failed: #{inspect(other)}")
+            case execute_sql(conn, "ROLLBACK") do
+              :ok ->
+                :ok
+
+              other ->
+                DBObservation.cleanup_failure(other)
+                Logger.error("transaction rollback failed: #{inspect(other)}")
             end
 
             {:rolled_back, error}
@@ -697,41 +759,58 @@ defmodule Tightbeam.DB do
   end
 
   defp fence_check_phase(conn, check, fenced_archetypes) do
-    :ok = Sqlite3.execute(conn, "BEGIN IMMEDIATE")
+    execute_sql!(conn, "BEGIN IMMEDIATE")
 
     try do
       result =
-        check.(%Txn{conn: conn, fenced_archetypes: fenced_archetypes})
+        DBObservation.callback(fn ->
+          check.(%Txn{conn: conn, fenced_archetypes: fenced_archetypes})
+        end)
 
       case result do
         {:ok, value} ->
-          :ok = Sqlite3.execute(conn, "COMMIT")
+          execute_sql!(conn, "COMMIT")
           {:ok, value}
 
         {:error, reason} ->
-          :ok = Sqlite3.execute(conn, "ROLLBACK")
+          execute_sql!(conn, "ROLLBACK")
           {:error, reason}
 
         other ->
-          :ok = Sqlite3.execute(conn, "ROLLBACK")
+          execute_sql!(conn, "ROLLBACK")
           {:error, {:invalid_reference_fence_check, other}}
       end
     rescue
       error ->
-        :ok = Sqlite3.execute(conn, "ROLLBACK")
+        execute_sql!(conn, "ROLLBACK")
         {:error, error}
     end
   end
 
   @doc false
   def run_query(conn, sql, params) do
+    DBObservation.sqlite(fn -> run_query_measured(conn, sql, params) end)
+  end
+
+  @doc false
+  def execute_sql(conn, sql), do: DBObservation.sqlite(fn -> Sqlite3.execute(conn, sql) end)
+
+  @doc false
+  def execute_sql!(conn, sql),
+    do: DBObservation.sqlite(fn -> :ok = Sqlite3.execute(conn, sql) end)
+
+  defp run_query_measured(conn, sql, params) do
     {:ok, stmt} = Sqlite3.prepare(conn, sql)
 
     try do
-      case Sqlite3.bind(stmt, params) do
-        :ok -> :ok
-        {:error, reason} -> raise Error, message: to_string(reason)
-      end
+      bound = Sqlite3.bind(stmt, params)
+
+      DBObservation.sqlite_error(bound, fn ->
+        case bound do
+          :ok -> :ok
+          {:error, reason} -> raise Error, message: to_string(reason)
+        end
+      end)
 
       collect(conn, stmt, [])
     after
@@ -740,11 +819,15 @@ defmodule Tightbeam.DB do
   end
 
   defp collect(conn, stmt, acc) do
-    case Sqlite3.step(conn, stmt) do
-      {:row, row} -> collect(conn, stmt, [row | acc])
-      :done -> Enum.reverse(acc)
-      {:error, reason} -> raise Error, message: to_string(reason)
-    end
+    result = Sqlite3.step(conn, stmt)
+
+    DBObservation.sqlite_error(result, fn ->
+      case result do
+        {:row, row} -> collect(conn, stmt, [row | acc])
+        :done -> Enum.reverse(acc)
+        {:error, reason} -> raise Error, message: to_string(reason)
+      end
+    end)
   end
 
   defp load_topline_unicode(conn) do

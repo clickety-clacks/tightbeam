@@ -1287,6 +1287,7 @@ defmodule Tightbeam.Assignments do
          :ok <- valid_effect_kind(call.params[:effect_kind]),
          {:ok, _files} <- assignment_files(verb, call.params) do
       key = call.params[:idempotency_key]
+      if is_binary(key), do: Tightbeam.RequestContext.mark_idempotent()
       replay = if is_binary(key), do: replayed_assignment(db, call), else: nil
 
       case replay do

@@ -1,8 +1,8 @@
 defmodule Tightbeam.Application do
   @moduledoc """
   The supervision tree — the reliability posture in structure (port spec §
-  Process architecture). Ordering is `rest_for_one`: the DB is first and
-  everything depends on it, so a DB restart deliberately restarts its
+  Process architecture). Ordering is `rest_for_one`: diagnostics precede the DB,
+  then everything that depends on it, so a DB restart deliberately restarts its
   dependents rather than leaving them holding a dead connection.
 
   Restart intensities are explicit and deliberate: the root tolerates few
@@ -162,7 +162,11 @@ defmodule Tightbeam.Application do
     # all startup writes; Boot loads Identity/law before schema/business recovery.
 
     [
-      # DB owner first — the serialization seam everything writes through.
+      # R6: init performs no filesystem work, and later sink errors cannot
+      # restart the DB. The DB admission still precedes startup writes.
+      {Tightbeam.Diagnostics,
+       path: Path.join(base_dir, "diagnostics/db-gateway-v1.log"), name: Tightbeam.Diagnostics},
+      # The database remains the first domain-state owner.
       {Tightbeam.DB,
        path: db_path, name: Tightbeam.DB, guard_inputs: Map.get(config, :guard_inputs, [])},
       # Schema + boot epoch as a transient one-shot after the DB is up.

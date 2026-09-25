@@ -111,13 +111,18 @@ defmodule Tightbeam.Wire.Router do
 
   @impl Plug
   def call(conn, opts) do
-    conn
-    |> Plug.Conn.put_private(:tightbeam_deps, Map.new(opts))
-    |> super(opts)
+    Tightbeam.Wire.RequestObservation.call(conn, fn conn ->
+      conn
+      |> Plug.Conn.put_private(:tightbeam_deps, Map.new(opts))
+      |> super(opts)
+    end)
   end
 
   plug(:match)
+  plug(:observe_match)
   plug(:dispatch)
+
+  defp observe_match(conn, _opts), do: Tightbeam.Wire.RequestObservation.matched(conn)
 
   # The TS reference upgrades WebSocket on ANY path (bare WebSocketServer);
   # the client connects at "/". Upgrade wherever the upgrade header appears,
@@ -167,8 +172,21 @@ defmodule Tightbeam.Wire.Router do
       "build" => Tightbeam.BuildStamp.build(),
       "sha" => Tightbeam.BuildStamp.sha(),
       "features" => ["stale-turn-settlement-v1"],
-      "adapters" => health
+      "adapters" => health,
+      "diagnostics" => diagnostic_health()
+      "features" => ["stale-turn-settlement-v1"]
     })
+  end
+
+  defp diagnostic_health do
+    health = Tightbeam.Diagnostics.health()
+
+    %{
+      "writeFailures" => health.write_failures,
+      "lastFailureAt" => health.last_failure_at,
+      "droppedRecords" => health.dropped_records,
+      "lastDropAt" => health.last_drop_at
+    }
   end
 
   get "/harnesses" do
@@ -848,9 +866,11 @@ defmodule Tightbeam.Wire.Router do
         {:ok, :org}
 
       session_key = Org.active_session_key_by_cli_token(db(conn), token) ->
+        Tightbeam.RequestContext.resolve_principal("session", session_key)
         {:ok, {:session, Org.get(db(conn), session_key)}}
 
       device = Devices.by_token(db(conn), token) ->
+        Tightbeam.RequestContext.resolve_principal("user", device.user_id)
         {:ok, {:device, device}}
 
       true ->
@@ -900,6 +920,8 @@ defmodule Tightbeam.Wire.Router do
   end
 
   defp state_user_principal(user_id, conn) do
+    Tightbeam.RequestContext.resolve_principal("user", user_id)
+
     is_admin =
       case Devices.user(db(conn), user_id) do
         %{is_admin: true} -> true
@@ -1095,9 +1117,11 @@ defmodule Tightbeam.Wire.Router do
             {:ok, :org}
 
           session_key = Org.active_session_key_by_cli_token(db(conn), token) ->
+            Tightbeam.RequestContext.resolve_principal("session", session_key)
             {:ok, {:session, Org.get(db(conn), session_key)}}
 
           device = Devices.by_token(db(conn), token) ->
+            Tightbeam.RequestContext.resolve_principal("user", device.user_id)
             {:ok, {:device, device}}
 
           true ->
@@ -1145,6 +1169,7 @@ defmodule Tightbeam.Wire.Router do
   end
 
   defp d1_user_principal(user_id, conn) do
+    Tightbeam.RequestContext.resolve_principal("user", user_id)
     is_admin = match?(%{is_admin: true}, Devices.user(db(conn), user_id))
     %{kind: "user", id: user_id, is_admin: is_admin}
   end
@@ -1487,6 +1512,7 @@ defmodule Tightbeam.Wire.Router do
         {:ok, :org}
 
       session_key = token && Org.active_session_key_by_cli_token(db(conn), token) ->
+        Tightbeam.RequestContext.resolve_principal("session", session_key)
         {:ok, {:session, Org.get(db(conn), session_key)}}
 
       true ->
@@ -1528,8 +1554,12 @@ defmodule Tightbeam.Wire.Router do
       end
 
     case token && Devices.by_token(db(conn), token) do
-      nil -> {:error, 401, "auth_failed", nil}
-      device -> {:ok, device}
+      nil ->
+        {:error, 401, "auth_failed", nil}
+
+      device ->
+        Tightbeam.RequestContext.resolve_principal("user", device.user_id)
+        {:ok, device}
     end
   end
 

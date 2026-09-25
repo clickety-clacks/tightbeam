@@ -5137,7 +5137,16 @@ defmodule Tightbeam.Wakes do
   # Deliver-then-mark (see moduledoc — never reorder): a raising deliver
   # leaves its wake pending for the next tick; a crash between deliver and
   # mark redelivers, deduped by turns.wakeId.
-  defp deliver_due(%{db: db, deliver: deliver, internal_consumers: consumers} = state) do
+  defp deliver_due(state) do
+    # R1/B1: one real scheduler entry owns the context of all DB calls in this
+    # scan. The bind restores even when delivery raises; the next scan gets a
+    # fresh ID. No context is implicitly inherited by a spawned process.
+    Tightbeam.RequestContext.bind_internal("wake_scheduler", fn ->
+      deliver_due_in_context(state)
+    end)
+  end
+
+  defp deliver_due_in_context(%{db: db, deliver: deliver, internal_consumers: consumers} = state) do
     if Map.has_key?(consumers, "review_remedy_reconcile") do
       {:ok, :ok} =
         Tightbeam.RailRemedy.reconcile_pending_episodes(db, state.review_remedy_interval_ms)
@@ -5152,8 +5161,9 @@ defmodule Tightbeam.Wakes do
     materialize_digests(db)
 
     {:ok, rows} =
-      DB.query(
+      DB.query_for(
         db,
+        "wake.due_scan",
         select_wake_sql(
           ", (SELECT routingWakeId FROM work_items WHERE id=wakes.work_item_id), (SELECT slateWakeId FROM work_items WHERE id=wakes.work_item_id)"
         ) <>

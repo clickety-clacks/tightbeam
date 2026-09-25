@@ -53,7 +53,11 @@ defmodule Tightbeam.DBHandoffTest do
         end)
       end)
 
-    assert_receive {:trace, ^db_pid, :receive, {:"$gen_call", _from, {:transaction, _fun}}}
+    assert_receive {:trace, ^db_pid, :receive,
+                    {:"$gen_call", _from,
+                     {:db_call, %{operation: "db.transaction", effect_kind: "write"},
+                      {:transaction, _fun}}}}
+
     :erlang.trace(db_pid, false, [:receive])
     send(db_pid, :release_first)
 

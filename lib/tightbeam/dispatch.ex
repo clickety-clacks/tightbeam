@@ -79,6 +79,14 @@ defmodule Tightbeam.Dispatch do
     principal = Map.get(call, :principal)
     session_key = Map.get(call, :session_key)
 
+    case principal do
+      {kind, subject} when kind in [:session, :user, :process] and is_binary(subject) ->
+        Tightbeam.RequestContext.resolve_principal(Atom.to_string(kind), subject)
+
+      _ ->
+        :ok
+    end
+
     case bracket_precheck(db, call, verb) do
       :proceed ->
         dispatch_through_rail(db, handlers, call, verb, origin, principal, session_key)
@@ -478,6 +486,9 @@ defmodule Tightbeam.Dispatch do
   defp invoke(handler, call) do
     {:returned, handler.(call)}
   rescue
+    exception in DB.Timeout ->
+      reraise exception, __STACKTRACE__
+
     exception in Placement.Refusal ->
       {:returned, %{code: exception.code, message: exception.message}}
 

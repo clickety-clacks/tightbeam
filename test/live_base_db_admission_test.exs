@@ -49,7 +49,11 @@ defmodule Tightbeam.LiveBaseDBAdmissionTest do
     base = Path.join(tmp, "children-only")
     config = %{base_dir: base, guard_inputs: []}
     children = Tightbeam.Application.children(config)
-    assert [{DB, options}, {Tightbeam.Boot, ^config} | _] = children
+
+    assert [{Tightbeam.Diagnostics, diagnostics}, {DB, options}, {Tightbeam.Boot, ^config} | _] =
+             children
+
+    assert diagnostics[:path] == Path.join(base, "diagnostics/db-gateway-v1.log")
     assert options[:guard_inputs] == config.guard_inputs
     refute File.exists?(base)
   end
