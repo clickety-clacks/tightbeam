@@ -196,7 +196,7 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
     authorize_assignment(txn, actor, supplied)
     |> case do
       {:ok, _context} -> {:ok, supplied}
-      {:error, _error} -> {:error, error("unknown_assignment", "unknown assignment: #{supplied}")}
+      {:error, _error} = refused -> refused
     end
   end
 

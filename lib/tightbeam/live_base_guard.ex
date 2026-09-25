@@ -143,8 +143,8 @@ defmodule Tightbeam.LiveBaseGuard do
       {:ok, value} ->
         if validator.(value), do: {:ok, value}, else: refuse(code, nil, "strict object")
 
-      {:error, _} ->
-        refuse(code, nil, "valid JSON")
+      {:error, reason} ->
+        refuse(code, Tightbeam.ErrorDiagnostic.json_decode(reason), "valid JSON")
     end
   end
 

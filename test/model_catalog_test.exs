@@ -527,7 +527,8 @@ defmodule Tightbeam.ModelCatalogTest do
     for {label, opts, harness, reason} <- [
           {:failed, [claude_fetch: fn _, _ -> {:error, :network_down} end], "claude",
            :network_down},
-          {:malformed, [claude_fetch: fn _, _ -> {:ok, "{"} end], "claude", :malformed_json},
+          {:malformed, [claude_fetch: fn _, _ -> {:ok, "{"} end], "claude",
+           {:malformed_json, {:unexpected_end, 1}}},
           # The vendor's own sentence, verbatim — this is the 401 body the live
           # endpoint returns for a grant that needs signing in again.
           {:refused_grant,

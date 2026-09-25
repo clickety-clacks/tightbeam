@@ -184,7 +184,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             let mut params = vec![string_field("kind", kind)];
             if let Some(encoded) = payload {
                 let value: Value = serde_json::from_str(encoded)
-                    .map_err(|_| "--payload requires a JSON object".to_owned())?;
+                    .map_err(|error| format!("--payload requires a JSON object: {error}"))?;
                 if !value.is_object() {
                     return Err("--payload requires a JSON object".to_owned());
                 }

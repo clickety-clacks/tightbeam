@@ -81,6 +81,14 @@ defmodule Tightbeam.LiveBaseGuardTest do
     end
 
     assert {:error, _} = Guard.decode_marker("{")
+
+    # Malformed bytes keep the decoder's own location instead of a bare "not JSON".
+    assert {:error,
+            %{
+              code: "invalid_build_transition",
+              expected: "valid JSON",
+              observed: %{"kind" => "decode", "error" => "invalid_byte", "byteOffset" => 8}
+            }} = Guard.decode_transition(~s({"a": 1 x}))
   end
 
   test "payload identity is ordered by path and binds exact bytes and complete set" do

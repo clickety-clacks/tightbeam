@@ -839,8 +839,10 @@ fn validate_local_openai_endpoint_with_timeout(
 /// non-empty model id. Pure so malformed, empty, and positive bodies pin without
 /// a live HTTP server.
 fn parse_local_openai_models_body(body: &str) -> Result<(), String> {
-    let value: serde_json::Value = serde_json::from_str(body).map_err(|_| {
-        "the local-openai endpoint returned a /models response that is not valid JSON".to_owned()
+    let value: serde_json::Value = serde_json::from_str(body).map_err(|error| {
+        format!(
+            "the local-openai endpoint returned a /models response that is not valid JSON: {error}"
+        )
     })?;
     if local_openai_model_ids(&value).is_empty() {
         Err(
@@ -2766,7 +2768,8 @@ mod tests {
         assert_eq!(
             parse_local_openai_models_body("not json"),
             Err(
-                "the local-openai endpoint returned a /models response that is not valid JSON"
+                "the local-openai endpoint returned a /models response that is not valid JSON: \
+                 expected ident at line 1 column 2"
                     .to_owned()
             )
         );
