@@ -426,6 +426,14 @@ defmodule Tightbeam.ArtifactsTest do
              message: "artifact-record requires provenance edges"
            }
 
+    # An absent work item is named as such, not leaked as a foreign-key MatchError,
+    # and nothing is recorded.
+    assert handlers["artifact-record"].(%{
+             call
+             | params: %{call.params | work_item_id: "wi_absent"}
+           }) ==
+             %{code: "unknown_work_item", message: "unknown work item: wi_absent"}
+
     assert Artifacts.list(ctx.db, %{session_key: ctx.child.session_key}) == [row]
   end
 

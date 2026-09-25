@@ -1366,6 +1366,32 @@ defmodule Tightbeam.CliIntegrationTest do
 
     assert %{status: "closed"} =
              RailRemedy.episode(ctx.db, "completion-requires-results-artifact", work_id)
+
+    # An absent work item is refused by name over the real wire, never as the
+    # insert's foreign-key MatchError.
+    {refused, status} =
+      System.cmd(
+        ctx.binary,
+        [
+          "artifact-record",
+          "--kind",
+          "report",
+          "--title",
+          "stray",
+          "--path",
+          "results.txt",
+          "--work-item",
+          "wi_absent"
+        ],
+        cd: coder_dir,
+        stderr_to_stdout: true
+      )
+
+    assert status != 0
+    assert refused =~ "unknown_work_item"
+    assert refused =~ "unknown work item: wi_absent"
+    refute refused =~ "no match of right hand side"
+    refute refused =~ "FOREIGN KEY"
   end
 
   # O2 keeps its code-evidence edge active even when the org has no learned

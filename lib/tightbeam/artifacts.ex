@@ -185,43 +185,40 @@ defmodule Tightbeam.Artifacts do
         case DB.transaction_then(
                db,
                fn txn ->
-                 case validate_producer_in_txn(txn, producer_id, session_key, work_item_id) do
-                   :ok ->
-                     reserve_version_in_txn(txn, artifact_id)
+                 with :ok <- validate_work_item_in_txn(txn, work_item_id),
+                      :ok <- validate_producer_in_txn(txn, producer_id, session_key, work_item_id) do
+                   reserve_version_in_txn(txn, artifact_id)
 
-                     Txn.q(
-                       txn,
-                       """
-                       INSERT INTO artifacts
-                         (artifactId, kind, title, description, createdBySession, workItemId,
-                          producedByAssignmentId, parentSession, originPath, contentSha256,
-                          recordedMessageId, recordedTurnEvidence, state, home, createdAt, updatedAt)
-                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                               'in-workspace', NULL, ?13, ?13)
-                       """,
-                       [
-                         artifact_id,
-                         call.params.kind,
-                         call.params.title,
-                         call.params[:description],
-                         session_key,
-                         work_item_id,
-                         producer_id,
-                         parent_session,
-                         call.params.origin_path,
-                         call.params[:content_sha256],
-                         recorded_message_id,
-                         evidence,
-                         now
-                       ]
-                     )
+                   Txn.q(
+                     txn,
+                     """
+                     INSERT INTO artifacts
+                       (artifactId, kind, title, description, createdBySession, workItemId,
+                        producedByAssignmentId, parentSession, originPath, contentSha256,
+                        recordedMessageId, recordedTurnEvidence, state, home, createdAt, updatedAt)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                             'in-workspace', NULL, ?13, ?13)
+                     """,
+                     [
+                       artifact_id,
+                       call.params.kind,
+                       call.params.title,
+                       call.params[:description],
+                       session_key,
+                       work_item_id,
+                       producer_id,
+                       parent_session,
+                       call.params.origin_path,
+                       call.params[:content_sha256],
+                       recorded_message_id,
+                       evidence,
+                       now
+                     ]
+                   )
 
-                     Publisher.maybe_observed_accepted_in_txn(txn, call)
-                     publish_in_txn(txn, "artifact.recorded", artifact_id, call)
-                     {:created, artifact_in_txn(txn, artifact_id)}
-
-                   error ->
-                     error
+                   Publisher.maybe_observed_accepted_in_txn(txn, call)
+                   publish_in_txn(txn, "artifact.recorded", artifact_id, call)
+                   {:created, artifact_in_txn(txn, artifact_id)}
                  end
                end,
                fn txn, result ->
@@ -269,6 +266,15 @@ defmodule Tightbeam.Artifacts do
 
       _ ->
         %{code: "invalid", message: "artifact-record requires a session caller"}
+    end
+  end
+
+  # Checked in the recording transaction, so the refusal names the absent work item
+  # instead of leaking the insert's foreign-key failure.
+  defp validate_work_item_in_txn(txn, work_item_id) do
+    case Txn.q(txn, "SELECT 1 FROM work_items WHERE id=?1", [work_item_id]) do
+      [[1]] -> :ok
+      [] -> %{code: "unknown_work_item", message: "unknown work item: #{work_item_id}"}
     end
   end
 

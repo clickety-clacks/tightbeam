@@ -224,6 +224,7 @@ defmodule Tightbeam.LocalOpenAi.Providers do
   defp redaction_failure(reason) when is_atom(reason), do: reason
   # remote_run already reduced its transport reason.
   defp redaction_failure({:transport, _reduced} = reason), do: reason
+  defp redaction_failure({:timeout, ms} = reason) when is_integer(ms), do: reason
   defp redaction_failure(reason) when is_binary(reason), do: ErrorDiagnostic.redact_text(reason)
 
   defp redaction_failure({:transport_exception, message}) when is_binary(message),

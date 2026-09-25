@@ -82,6 +82,27 @@ defmodule Tightbeam.PlacementTest do
                run: fn _ -> Process.sleep(100) end,
                timeout: 10
              )
+
+    # A run that raises is reported as the exception it was, and neither it nor the
+    # probe output carries a secret onward.
+    assert {:error, {:exec_failed, "raised: exec saw [REDACTED:token]"}} =
+             Placement.harness_binary_probe(:claude, cli_bin,
+               find_executable: fn "claude" -> "/fake/claude" end,
+               run: fn _ -> raise "exec saw sk-fixture-SENTINEL-0123456789abcdef" end
+             )
+
+    assert {:error, {:exec_failed, detail}} =
+             Placement.harness_binary_probe(:claude, cli_bin,
+               find_executable: fn "claude" -> "/fake/claude" end,
+               run: fn _ -> {"bad key sk-fixture-SENTINEL-0123456789abcdef\n", 3} end
+             )
+
+    assert detail == ~s(exit=3 output="bad key [REDACTED:token]")
+  end
+
+  test "a bounded run that outlives its budget is a tagged timeout" do
+    assert {:error, {:timeout, 10}} =
+             Tightbeam.Harness.Support.bounded_run(fn _ -> Process.sleep(100) end, [], 10)
   end
 
   test "hosts registers the gateway machine under its real name; nothing redefines it", %{
