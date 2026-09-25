@@ -83,7 +83,7 @@ defmodule Tightbeam.StateResources do
     "attests" =>
       ~w(id assignmentId kind verdictKind note bySession byUser producer producerCommand byHarness byProvider commitRefs ts rowVersion),
     "wakes" =>
-      ~w(wakeId sessionKey targetRole origin prompt consumer dueAt state createdAt firedAt reresolve reresolveSeed reresolveRung conditionKind conditionScope conditionAfterId firedBy creatorSessionKey rumination workItemId assignmentId canceledAt targetGate class classElection deliveryRule digest summon rowVersion),
+      ~w(wakeId sessionKey targetRole origin prompt consumer dueAt state createdAt firedAt reresolve reresolveSeed reresolveRung conditionKind conditionScope conditionAfterId firedBy creatorSessionKey rumination workItemId assignmentId canceledAt targetGate class classElection deliveryRule digest summon deliveryStatus rowVersion),
     "turns" =>
       ~w(seq sessionKey messageId wakeId origin prompt roleRef roleFallback assignmentId jobRef model thinkingLevel modelContext harness replyAttention status owner adapterGen requestRef error createdAt startedAt endedAt publishedAt rowVersion),
     "decision requests" =>
@@ -147,12 +147,12 @@ defmodule Tightbeam.StateResources do
     },
     "wakes" => %{
       strings:
-        ~w(wakeId sessionKey targetRole origin prompt consumer state reresolve reresolveSeed conditionKind conditionScope firedBy creatorSessionKey workItemId assignmentId class classElection deliveryRule),
+        ~w(wakeId sessionKey targetRole origin prompt consumer state reresolve reresolveSeed conditionKind conditionScope firedBy creatorSessionKey workItemId assignmentId class classElection deliveryRule deliveryStatus),
       integers:
         ~w(dueAt createdAt firedAt reresolveRung conditionAfterId canceledAt targetGate rowVersion),
       booleans: ~w(rumination digest summon),
       nullable:
-        ~w(targetRole prompt firedAt reresolve reresolveSeed reresolveRung conditionKind conditionScope conditionAfterId firedBy creatorSessionKey workItemId assignmentId canceledAt class classElection deliveryRule)
+        ~w(targetRole prompt firedAt reresolve reresolveSeed reresolveRung conditionKind conditionScope conditionAfterId firedBy creatorSessionKey workItemId assignmentId canceledAt class classElection deliveryRule deliveryStatus)
     },
     "turns" => %{
       strings:
@@ -333,6 +333,7 @@ defmodule Tightbeam.StateResources do
     {"assignments", "outcome"} => ~w(completed surrendered revoked),
     {"attests", "kind"} => ~w(progress completion surrender verdict),
     {"wakes", "state"} => ~w(pending fired canceled),
+    {"wakes", "deliveryStatus"} => ~w(queued running delivered canceled failed failed_unknown),
     {"wakes", "reresolve"} => ~w(lineage),
     {"wakes", "firedBy"} => ~w(condition fallback),
     {"wakes", "classElection"} => ~w(sender classifier batcher),
@@ -477,10 +478,18 @@ defmodule Tightbeam.StateResources do
   end
 
   def query_wake(db, %{key: id, principal: principal}) do
-    detail_selection(db, "wakes", principal, &Wakes.get_in_txn(&1, id))
+    detail_selection(db, "wakes", principal, &wake_projection_in_txn(&1, id))
   end
 
-  def query_wake(db, id), do: Wakes.get(db, id)
+  def query_wake(db, id) do
+    case DB.transaction(db, &wake_projection_in_txn(&1, id)) do
+      {:ok, wake} -> wake
+      {:error, error} -> raise error
+    end
+  end
+
+  defp wake_projection_in_txn(txn, id),
+    do: Wakes.delivery_projection_in_txn(txn, id)
 
   def query_session(
         db,
@@ -1152,6 +1161,12 @@ defmodule Tightbeam.StateResources do
 
   def wake(row) do
     reject_public_shape_drift!(row, "wakes")
+
+    row =
+      if Enum.any?(Map.keys(row), &is_atom/1),
+        do: Map.put_new(row, :delivery_status, nil),
+        else: row
+
     row |> public() |> closed_projection("wakes")
   end
 

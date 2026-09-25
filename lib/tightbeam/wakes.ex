@@ -4182,6 +4182,128 @@ defmodule Tightbeam.Wakes do
   @spec get_in_txn(Txn.t(), String.t()) :: wake() | nil
   def get_in_txn(%Txn{} = txn, wake_id), do: wait_in_txn(txn, wake_id)
 
+  @doc "Project the carrier's recorded delivery status without changing wake admission state."
+  def delivery_projection_in_txn(%Txn{} = txn, wake_id) when is_binary(wake_id) do
+    # One fixed selection for both absent and hidden wakes: a second lookup
+    # conditional on finding the wake would disclose its existence in the trace.
+    carrier_columns =
+      ", (SELECT status FROM turns WHERE turns.wakeId=wakes.wakeId)" <>
+        ", (SELECT createdAt FROM turns WHERE turns.wakeId=wakes.wakeId)" <>
+        ", (SELECT startedAt FROM turns WHERE turns.wakeId=wakes.wakeId)" <>
+        ", (SELECT endedAt FROM turns WHERE turns.wakeId=wakes.wakeId)"
+
+    case Txn.q(txn, select_wake_sql(carrier_columns) <> " WHERE wakeId=?1", [wake_id]) do
+      [] ->
+        nil
+
+      [row] ->
+        {wake_columns, [status, created_at, started_at, ended_at]} = Enum.split(row, -4)
+        wake = to_wake(wake_columns)
+
+        # Keep the existing maximum-durable-timestamp version convention, now
+        # including the row from which this additive projection is derived.
+        version =
+          [wake.created_at, wake.fired_at, wake.canceled_at, created_at, started_at, ended_at]
+          |> Enum.filter(&is_integer/1)
+          |> Enum.max()
+
+        wake |> Map.put(:delivery_status, status) |> Map.put(:row_version, version)
+    end
+  end
+
+  @doc "Record a failed carrier's outcome in its sender's existing transcript, without a turn."
+  def report_failed_delivery(db, seq) do
+    result =
+      transaction!(db, fn txn ->
+        case Txn.q(
+               txn,
+               """
+               SELECT w.wakeId,w.creatorSessionKey,w.origin,t.status,t.error
+               FROM turns t JOIN wakes w ON w.wakeId=t.wakeId
+               WHERE t.seq=?1 AND t.status IN ('failed','failed_unknown')
+                 AND w.consumer='prompt' AND w.digest=0 AND COALESCE(w.targetGate,1)!=0
+               """,
+               [seq]
+             ) do
+          [[wake_id, creator, origin, status, error]] ->
+            # This is the same closed classification used by supervision. Its
+            # rate-limit retry may not yet have run: the two recognizers are async.
+            retry_safe? =
+              status == "failed" and
+                Tightbeam.HarnessHealth.classify_turn_failure(error) == "rate-limit-dead"
+
+            if retry_safe? do
+              :retry_owned
+            else
+              record_sender_failure_in_txn(txn, seq, wake_id, creator, origin, status)
+            end
+
+          [] ->
+            :not_applicable
+        end
+      end)
+
+    case result do
+      {:notice, recipient, owner, marker} ->
+        Tightbeam.ConnRegistry.publish_message(
+          Tightbeam.ConnRegistry,
+          recipient,
+          owner,
+          marker.seq,
+          Tightbeam.Wire.Payloads.server_message(marker),
+          fn pid, payload -> send(pid, {:push_message, recipient, marker.seq, payload}) end
+        )
+
+      _ ->
+        :ok
+    end
+
+    :ok
+  end
+
+  defp record_sender_failure_in_txn(txn, seq, wake_id, creator, origin, status) do
+    # Stored creator identity is the sender, not the receiver's ancestry. A
+    # substrate marker is readable even if that sender session has retired.
+    recipient =
+      case {creator, origin} do
+        {key, _} when is_binary(key) -> key
+        {nil, "user:" <> user} -> Tightbeam.Org.personal_session_key(user)
+        _ -> nil
+      end
+
+    case Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [recipient]) do
+      [[owner]] when is_binary(owner) ->
+        uncertainty =
+          if status == "failed_unknown",
+            do: " Delivery outcome is unknown; prior effects must be reconciled before retry.",
+            else: " The carrier failed; this notice does not authorize a retry."
+
+        # Use the existing transcript dedupe key. No new wake, obligation,
+        # notification registry, or second failure-prone inference is admitted.
+        {disposition, marker} =
+          Tightbeam.Projection.append_in_txn(txn, %{
+            session_key: recipient,
+            role: "assistant",
+            content:
+              "Wake #{wake_id} undelivered: carrier turn #{seq} is #{status}." <> uncertainty,
+            sender: "process:tightbeam",
+            message_type: "substrate",
+            attention_tier: Tightbeam.Projection.attention_tier(:high),
+            device_id: "process:tightbeam",
+            client_message_id: "wake-undelivered:#{seq}"
+          })
+
+        if disposition in [:appended, :duplicate],
+          do: {:notice, recipient, owner, marker},
+          else: raise("wake undelivered notice conflicts with carrier #{seq}")
+
+      _ ->
+        # There is no lawful transcript to write. The durable carrier and the
+        # authorized wake projection still expose the incomplete outcome.
+        :no_sender_stream
+    end
+  end
+
   @doc "All pending wakes, soonest first (inspect filters to owned sessions)."
   @spec list_pending(db()) :: [wake()]
   def list_pending(db \\ Tightbeam.DB) do
@@ -5775,7 +5897,7 @@ defmodule Tightbeam.Wakes do
 
   @doc false
   def publish_change_in_txn(%Txn{} = txn, class, wake_id) do
-    case get_in_txn(txn, wake_id) do
+    case delivery_projection_in_txn(txn, wake_id) do
       nil ->
         :ok
 

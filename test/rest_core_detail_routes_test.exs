@@ -33,7 +33,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     "assignments" =>
       ~w(id subject holderKey holderRole holderFallback openedByUser openedBySession openedAt state outcome closedAt closedByUser closedBySession closedByProcess closingAttestId revocationReason workItemId reviewsAssignmentId holderHarness holderProvider files effectKind derivedStatus rowVersion),
     "wakes" =>
-      ~w(wakeId sessionKey targetRole origin prompt consumer dueAt state createdAt firedAt reresolve reresolveSeed reresolveRung conditionKind conditionScope conditionAfterId firedBy creatorSessionKey rumination workItemId assignmentId canceledAt targetGate class classElection deliveryRule digest summon rowVersion),
+      ~w(wakeId sessionKey targetRole origin prompt consumer dueAt state createdAt firedAt reresolve reresolveSeed reresolveRung conditionKind conditionScope conditionAfterId firedBy creatorSessionKey rumination workItemId assignmentId canceledAt targetGate class classElection deliveryRule digest summon deliveryStatus rowVersion),
     "turns" =>
       ~w(seq sessionKey messageId wakeId origin prompt roleRef roleFallback assignmentId jobRef model thinkingLevel modelContext harness replyAttention status owner adapterGen requestRef error createdAt startedAt endedAt publishedAt rowVersion),
     "decision requests" =>
@@ -52,7 +52,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     "assignments" =>
       ~w(holderRole openedByUser openedBySession outcome closedAt closedByUser closedBySession closedByProcess closingAttestId revocationReason workItemId reviewsAssignmentId holderHarness holderProvider),
     "wakes" =>
-      ~w(targetRole prompt firedAt reresolve reresolveSeed reresolveRung conditionKind conditionScope conditionAfterId firedBy creatorSessionKey workItemId assignmentId canceledAt class classElection deliveryRule),
+      ~w(targetRole prompt firedAt reresolve reresolveSeed reresolveRung conditionKind conditionScope conditionAfterId firedBy creatorSessionKey workItemId assignmentId canceledAt class classElection deliveryRule deliveryStatus),
     "turns" =>
       ~w(messageId wakeId roleRef roleFallback assignmentId jobRef model thinkingLevel modelContext harness owner adapterGen requestRef error startedAt endedAt publishedAt),
     "decision requests" =>
@@ -96,6 +96,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     {"assignments", "state"} => ~w(open closed),
     {"assignments", "outcome"} => ~w(completed surrendered revoked),
     {"wakes", "state"} => ~w(pending fired canceled),
+    {"wakes", "deliveryStatus"} => ~w(queued running delivered canceled failed failed_unknown),
     {"wakes", "reresolve"} => ~w(lineage),
     {"wakes", "firedBy"} => ~w(condition fallback),
     {"wakes", "classElection"} => ~w(sender classifier batcher),
@@ -1327,6 +1328,69 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       response = get(ctx, "/api/work-items" <> suffix, token)
       message = if code == "identity_not_yours", do: "this session belongs to flynn", else: nil
       assert_error(response, status, "work items", code, message)
+    end
+  end
+
+  for terminal <- ["delivered", "failed", "failed_unknown", "canceled"] do
+    @carrier_terminal terminal
+    test "wake HTTP projection exposes #{@carrier_terminal} without changing admission state",
+         ctx do
+      path = "/api/wakes/#{ctx.wake.wake_id}"
+      response = get(ctx, path)
+      assert response.status == 200
+      initial = JSON.decode!(response.resp_body)["item"]
+      assert initial["state"] == "pending"
+      assert initial["deliveryStatus"] == nil
+
+      # Finish the setup's earlier real FIFO turn; do not force a later claim.
+      assert {:ok, earlier} =
+               Ledger.claim_next(ctx.db, ctx.admin_session.session_key, "projection")
+
+      assert earlier.seq == ctx.turn_seq
+      assert :ok = Ledger.finish(ctx.db, earlier.seq, "delivered")
+
+      assert {:ok, {:appended, _, _, _}} =
+               DB.transaction(ctx.db, fn txn ->
+                 Tightbeam.Gateway.deliver_prompt_in_txn(
+                   txn,
+                   ctx.wake.session_key,
+                   ctx.wake.origin,
+                   ctx.wake.prompt,
+                   wake_id: ctx.wake.wake_id,
+                   fire_wake_in_txn: true
+                 )
+               end)
+
+      queued = JSON.decode!(get(ctx, path).resp_body)["item"]
+      assert queued["state"] == "fired"
+      assert queued["deliveryStatus"] == "queued"
+      assert {:ok, carrier} = Ledger.claim_next(ctx.db, ctx.wake.session_key, "projection")
+      assert JSON.decode!(get(ctx, path).resp_body)["item"]["deliveryStatus"] == "running"
+
+      assert :ok =
+               Ledger.finish(ctx.db, carrier.seq, @carrier_terminal, "private terminal detail")
+
+      terminal_response = get(ctx, path)
+      assert terminal_response.status == 200
+      item = JSON.decode!(terminal_response.resp_body)["item"]
+      assert item["state"] == "fired"
+      assert item["deliveryStatus"] == @carrier_terminal
+      assert item["rowVersion"] >= queued["rowVersion"]
+      refute terminal_response.resp_body =~ "private terminal detail"
+      assert Enum.sort(Map.keys(item)) == Enum.sort(@r7_fields["wakes"])
+
+      call = %{verb: "wake", origin: "user:flynn", principal: {:user, "flynn"}, params: %{}}
+      notice = Publisher.state_notice(ctx.db, call, ctx.wake)
+      assert notice["payload"]["deliveryStatus"] == @carrier_terminal
+      assert notice["payload"]["rowVersion"] == item["rowVersion"]
+
+      # Wrong principal still gets absence, not even the carrier's status.
+      assert StateResources.query_wake(ctx.db, %{
+               key: ctx.wake.wake_id,
+               principal: %{kind: "session", id: "unrelated", is_admin: false}
+             }) == nil
+
+      assert Tightbeam.Wakes.get(ctx.db, ctx.wake.wake_id).state == "fired"
     end
   end
 

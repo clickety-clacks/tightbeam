@@ -87,6 +87,108 @@ defmodule Tightbeam.Productions.BubbleTest do
     rows
   end
 
+  defp fail_wake!(ctx, status, error \\ "private provider detail") do
+    sender = session(ctx.db, "wake-sender", ctx.main.session_key)
+
+    wake =
+      Tightbeam.Wakes.schedule(ctx.db, %{
+        session_key: ctx.holder.session_key,
+        creator_session_key: sender.session_key,
+        origin: "user:flynn",
+        prompt: "private carried intent",
+        due_at: 0
+      })
+
+    assert :appended =
+             Tightbeam.Gateway.deliver_prompt(ctx.holder.session_key, wake.origin, wake.prompt,
+               db: ctx.db,
+               wake_id: wake.wake_id,
+               fire_wake_in_txn: true
+             )
+
+    assert {:ok, turn} = Ledger.claim_next(ctx.db, ctx.holder.session_key, "wake-fixture")
+    assert :ok = Ledger.finish(ctx.db, turn.seq, status, error)
+    {wake, turn, sender}
+  end
+
+  for status <- ["failed", "failed_unknown"] do
+    @delivery_status status
+    test "#{status} names the carried wake and records one sender result without retry", ctx do
+      {wake, turn, sender} = fail_wake!(ctx, @delivery_status)
+      assert :ok = Bubble.recognize_terminal(ctx.db, turn.seq)
+      assert :ok = Bubble.recognize_terminal(ctx.db, turn.seq)
+
+      assert [[_, _, _, _, prompt]] = notice_turn(ctx.db, ctx.supervisor.session_key)
+      assert prompt =~ "carrying wake #{wake.wake_id}"
+
+      assert {:ok, [[content, "substrate", "process:tightbeam", 1]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT content,messageType,sender,attentionTier FROM messages WHERE sessionKey=?1 AND clientMessageId=?2",
+                 [sender.session_key, "wake-undelivered:#{turn.seq}"]
+               )
+
+      assert content =~ wake.wake_id
+      assert content =~ @delivery_status
+      refute content =~ "private provider detail"
+      refute content =~ wake.prompt
+
+      if @delivery_status == "failed_unknown",
+        do: assert(content =~ "prior effects must be reconciled")
+
+      assert Ledger.pending_count(ctx.db, sender.session_key) == 0
+      assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM wake_retry_attempts")
+      assert Tightbeam.Wakes.get(ctx.db, wake.wake_id).state == "fired"
+
+      # Exhaust the actual ancestor climb. Every rung keeps the original wake,
+      # not the synthetic bubble-notice transport identity.
+      assert {:ok, parent_notice} =
+               Ledger.claim_next(ctx.db, ctx.supervisor.session_key, "fixture")
+
+      assert :ok = Ledger.finish(ctx.db, parent_notice.seq, "failed", "notice failed")
+      assert :ok = Bubble.recognize_terminal(ctx.db, parent_notice.seq)
+      assert {:ok, main_notice} = Ledger.claim_next(ctx.db, ctx.main.session_key, "fixture")
+      assert :ok = Ledger.finish(ctx.db, main_notice.seq, "failed", "notice failed")
+      assert :ok = Bubble.recognize_terminal(ctx.db, main_notice.seq)
+
+      assert {:ok, [[alert]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT content FROM messages WHERE sessionKey=?1 AND content LIKE '[no agent can act]%'",
+                 [ctx.main.session_key]
+               )
+
+      assert alert =~ "carrying wake #{wake.wake_id}"
+    end
+  end
+
+  test "typed rate-limit retry ownership is not mistaken for a non-retryable sender result",
+       ctx do
+    error = JSON.encode!(%{data: %{errorKind: "rate_limit"}})
+    {_wake, turn, sender} = fail_wake!(ctx, "failed", error)
+    assert :ok = Bubble.recognize_terminal(ctx.db, turn.seq)
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "SELECT id FROM messages WHERE sessionKey=?1 AND clientMessageId=?2",
+               [sender.session_key, "wake-undelivered:#{turn.seq}"]
+             )
+  end
+
+  test "delivered carriers do not produce an undelivered sender result", ctx do
+    {_wake, turn, sender} = fail_wake!(ctx, "delivered")
+    assert :ok = Bubble.recognize_terminal(ctx.db, turn.seq)
+    assert notice_turn(ctx.db, ctx.supervisor.session_key) == []
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "SELECT id FROM messages WHERE sessionKey=?1 AND clientMessageId=?2",
+               [sender.session_key, "wake-undelivered:#{turn.seq}"]
+             )
+  end
+
   test "a spawned session's failed turn produces one deduped notice to its parent", ctx do
     seq = fail_turn!(ctx.db, "holder")
 
