@@ -47,6 +47,7 @@ defmodule Tightbeam.Rules do
     Artifacts,
     Assignments,
     DB,
+    DeliveryResponsibilities,
     Devices,
     Escalation,
     EventLog,
@@ -106,7 +107,7 @@ defmodule Tightbeam.Rules do
                  "on_rule_denied",
                  "params"
                ])
-  @binding_tokens ~w(assignment_id work_item_id holder_key holder_role holder_archetype caller_origin)
+  @binding_tokens ~w(assignment_id work_item_id holder_key holder_role holder_archetype caller_origin delivery_owner_ref)
   @embedded_fields ~w(subject prompt display)
   @whole_fields ~w(target_role target_session reviews work_item name harness model effort context archetype host after at)
   @verdict_facts ~w(
@@ -126,11 +127,14 @@ defmodule Tightbeam.Rules do
     "caller.user" => :string,
     "caller.is_admin" => :bool,
     "caller.roles" => {:list, :string},
+    "caller.delivery_responsibility" => :string,
     "target.owner" => :string,
     "target.archetype" => :string,
     "target.host" => :string,
     "target.kind" => :string,
     "target.state" => :string,
+    "target.delivery_responsibility" => :string,
+    "spawn.archetype" => :string,
     "org.live_sessions_owned_by_caller" => :int,
     "caller.verb_count_24h" => :int,
     "attest.kind" => :string,
@@ -151,9 +155,16 @@ defmodule Tightbeam.Rules do
     "work_item.has_topline" => :bool,
     "work_item.has_spec_ref" => :bool,
     "work_item.verdict_kinds" => {:list, :string},
+    "work_item.reference_state" => :string,
+    "work_item.has_delivery_owner" => :bool,
+    "work_item.delivery_owner_ref" => :string,
+    "work_item.delivery_owner_state" => :string,
     "assignment.review_verdict_count" => :int,
     "assignment.prior_completed_fix_count" => :int,
+    "assign.is_linked_review" => :bool,
+    "assign.effect_kind" => :string,
     "assign.declared_files_overlap_open" => :bool,
+    "assign.delegates_delivery" => :bool,
     "decision_request.status" => :string,
     "artifact.present" => :bool,
     "artifact.content_sha256" => :string,
@@ -711,14 +722,22 @@ defmodule Tightbeam.Rules do
         _ -> nil
       end
 
+    work_item_id = (assignment && assignment.work_item_id) || Map.get(call.params, :work_item_id)
+
+    delivery_owner_ref =
+      case work_item_id && DeliveryResponsibilities.current_owner(db, work_item_id) do
+        %{"accountableSessionKey" => session_key} -> "session:" <> session_key
+        _ -> "none"
+      end
+
     %{
       assignment_id: assignment && assignment.id,
-      work_item_id:
-        (assignment && assignment.work_item_id) || Map.get(call.params, :work_item_id),
+      work_item_id: work_item_id,
       holder_key: assignment && assignment.holder_key,
       holder_role: assignment && assignment[:holder_role],
       holder_archetype: assignment && assignment.holder_archetype,
-      caller_origin: call.origin
+      caller_origin: call.origin,
+      delivery_owner_ref: delivery_owner_ref
     }
   end
 
@@ -903,6 +922,7 @@ defmodule Tightbeam.Rules do
 
     text = Map.get(rule, "text")
     unless is_binary(text) and String.trim(text) != "", do: fail.("missing or blank text")
+    validate_tokens!(text, fail)
 
     conditions = validate_conditions!(Map.get(rule, "deny_when"), fail)
     check = validate_check!(Map.get(rule, "check"), base_dir, fail)
@@ -1157,7 +1177,7 @@ defmodule Tightbeam.Rules do
       do: fail.("check effects must map every declared return and no others")
 
     unless Enum.all?(effects, fn {_token, effect} -> effect in ~w(allow deny remedy escalate) end),
-           do: fail.("check effects must be one of allow, deny, remedy, escalate")
+      do: fail.("check effects must be one of allow, deny, remedy, escalate")
 
     %{script: script, returns: returns, timeout_ms: timeout_ms, effects: effects}
   end
@@ -1642,8 +1662,8 @@ defmodule Tightbeam.Rules do
     )
   end
 
-  defp fold_effect("deny", rule, _rest, _db, call, _cache, to_close, to_consume, exit_class) do
-    error = denial_error(rule, call, "rule_denied", exit_class)
+  defp fold_effect("deny", rule, _rest, db, call, _cache, to_close, to_consume, exit_class) do
+    error = denial_error(rule, call, "rule_denied", exit_class, notice_bindings(db, call))
     {{:deny, error}, Enum.reverse(to_close), Enum.reverse(to_consume)}
   end
 
@@ -1696,7 +1716,7 @@ defmodule Tightbeam.Rules do
       "#{exit_class}. A malfunction may bound a call; it may never be the last word on work."
   end
 
-  defp denial_error(rule, call, reason, script_exit_class) do
+  defp denial_error(rule, call, reason, script_exit_class, bindings \\ %{}) do
     %{
       code: "rule_denied",
       rule: rule.name,
@@ -1706,8 +1726,18 @@ defmodule Tightbeam.Rules do
       ref: gated_ref(call),
       producer: nil,
       identity_manifest_sha: rule.identity_manifest_sha,
-      message: "#{rule.name}: #{rule.text}"
+      message: "#{rule.name}: #{render_rule_text(rule.text, bindings)}"
     }
+  end
+
+  defp render_rule_text(text, bindings) do
+    Regex.replace(~r/\{([^{}]+)\}/, text, fn _match, token ->
+      case Map.get(bindings, String.to_existing_atom(token)) do
+        nil -> "none"
+        value when is_binary(value) -> value
+        value -> to_string(value)
+      end
+    end)
   end
 
   defp enrich_denial(error, rule, call, reason, script_exit_class) do
@@ -1841,12 +1871,59 @@ defmodule Tightbeam.Rules do
     end
   end
 
+  defp compute_fact("caller.delivery_responsibility", db, call, cache) do
+    with_dependency("$work_item_id", db, call, cache, fn
+      nil, cache ->
+        {nil, cache}
+
+      work_item_id, cache ->
+        value =
+          case Map.get(call, :principal) do
+            {:session, session_key} ->
+              DeliveryResponsibilities.responsibility(db, session_key, work_item_id)
+
+            _ ->
+              "none"
+          end
+
+        {value, cache}
+    end)
+  end
+
+  defp compute_fact("target.delivery_responsibility", db, call, cache) do
+    with_dependency("$work_item_id", db, call, cache, fn
+      nil, cache ->
+        {nil, cache}
+
+      work_item_id, cache ->
+        value =
+          case Map.get(call, :session_key) do
+            session_key when is_binary(session_key) ->
+              DeliveryResponsibilities.responsibility(db, session_key, work_item_id)
+
+            _ ->
+              nil
+          end
+
+        {value, cache}
+    end)
+  end
+
   defp compute_fact("target." <> field, db, call, cache) do
     with_dependency("$target", db, call, cache, fn target, cache ->
       key = if field == "owner", do: :owner_user_id, else: String.to_existing_atom(field)
       value = if target, do: Map.fetch!(target, key), else: nil
       {value, cache}
     end)
+  end
+
+  defp compute_fact("spawn.archetype", db, call, cache) do
+    value =
+      if call.verb == "spawn" do
+        Map.get(call.params, :archetype) || Org.get_setting(db, "default-archetype") || "default"
+      end
+
+    {value, cache}
   end
 
   defp compute_fact("org.live_sessions_owned_by_caller", db, call, cache) do
@@ -2050,6 +2127,65 @@ defmodule Tightbeam.Rules do
           case DB.query(db, sql, params) do
             {:ok, [[state]]} -> state
             {:ok, []} -> nil
+          end
+
+        {value, cache}
+    end)
+  end
+
+  defp compute_fact("work_item.reference_state", db, call, cache) do
+    with_dependency("$work_item_id", db, call, cache, fn
+      nil, cache ->
+        {"missing", cache}
+
+      work_item_id, cache ->
+        value =
+          case DB.query(db, "SELECT 1 FROM work_items WHERE id=?1", [work_item_id]) do
+            {:ok, [[1]]} -> "known"
+            {:ok, []} -> "unknown"
+          end
+
+        {value, cache}
+    end)
+  end
+
+  defp compute_fact("work_item.has_delivery_owner", db, call, cache) do
+    with_dependency("$work_item_id", db, call, cache, fn
+      nil, cache ->
+        {false, cache}
+
+      work_item_id, cache ->
+        value = not is_nil(DeliveryResponsibilities.current_owner(db, work_item_id))
+        {value, cache}
+    end)
+  end
+
+  defp compute_fact("work_item.delivery_owner_ref", db, call, cache) do
+    with_dependency("$work_item_id", db, call, cache, fn
+      nil, cache ->
+        {nil, cache}
+
+      work_item_id, cache ->
+        value =
+          case DeliveryResponsibilities.current_owner(db, work_item_id) do
+            %{"accountableSessionKey" => session_key} -> "session:" <> session_key
+            nil -> nil
+          end
+
+        {value, cache}
+    end)
+  end
+
+  defp compute_fact("work_item.delivery_owner_state", db, call, cache) do
+    with_dependency("$work_item_id", db, call, cache, fn
+      nil, cache ->
+        {nil, cache}
+
+      work_item_id, cache ->
+        value =
+          case DeliveryResponsibilities.current_owner(db, work_item_id) do
+            %{"deliveryState" => state} -> state
+            nil -> nil
           end
 
         {value, cache}
@@ -2385,6 +2521,53 @@ defmodule Tightbeam.Rules do
 
         _ ->
           nil
+      end
+
+    {value, cache}
+  end
+
+  defp compute_fact("assign.effect_kind", _db, %{verb: verb} = call, cache)
+       when verb in ["assign", "dispatch"] do
+    review = if verb == "assign", do: call.params[:reviews_assignment_id]
+    {Assignments.effective_effect_kind(review, call.params[:effect_kind]), cache}
+  end
+
+  defp compute_fact("assign.effect_kind", _db, _call, cache), do: {nil, cache}
+
+  defp compute_fact("assign.is_linked_review", db, %{verb: "assign"} = call, cache) do
+    review_assignment_id =
+      Map.get(call.params, :reviews_assignment_id) ||
+        Map.get(call.params, "reviews_assignment_id")
+
+    with_dependency("$work_item_id", db, call, cache, fn
+      work_item_id, cache
+      when is_binary(review_assignment_id) and is_binary(work_item_id) ->
+        linked =
+          match?(
+            {:ok, [[1]]},
+            DB.query(
+              db,
+              "SELECT 1 FROM assignments WHERE id=?1 AND workItemId=?2 LIMIT 1",
+              [review_assignment_id, work_item_id]
+            )
+          )
+
+        {linked, cache}
+
+      _work_item_id, cache ->
+        {false, cache}
+    end)
+  end
+
+  defp compute_fact("assign.is_linked_review", _db, _call, cache), do: {false, cache}
+
+  defp compute_fact("assign.delegates_delivery", _db, call, cache) do
+    value =
+      if call.verb in ["assign", "dispatch"] do
+        case Map.get(call.params, :delegates_delivery, false) do
+          value when is_boolean(value) -> value
+          _ -> nil
+        end
       end
 
     {value, cache}

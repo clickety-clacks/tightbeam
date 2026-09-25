@@ -343,12 +343,16 @@ defmodule Tightbeam.VerificationPapertrailTest do
 
     loaded = Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
 
-    assert Enum.map(loaded, & &1.name) == [
-             "completion-requires-review",
-             @verification_rule,
-             @artifact_rule,
-             "wake-obligation-registration-authority"
-           ]
+    expected = [
+      "completion-requires-review",
+      @verification_rule,
+      @artifact_rule,
+      "wake-obligation-registration-authority"
+    ]
+
+    assert loaded
+           |> Enum.map(& &1.name)
+           |> Enum.filter(&(&1 in expected)) == expected
 
     # F1/F2 accept the shipped pair: the verdict gate is remedy-covered, and the
     # artifact gate loads with no `produces` at all (D2).

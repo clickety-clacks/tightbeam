@@ -1,7 +1,20 @@
 defmodule Tightbeam.ImplementationRequiresPostureTest do
   use Tightbeam.TestCase, async: false
   alias Tightbeam.Model
-  alias Tightbeam.{Archetypes, DB, Dispatch, Gateway, Identity, Rules, WorkItems}
+
+  alias Tightbeam.{
+    Archetypes,
+    Assignments,
+    DB,
+    DeliveryResponsibilities,
+    Dispatch,
+    Gateway,
+    Identity,
+    Roles,
+    Rules,
+    SessionPoAssociations,
+    WorkItems
+  }
 
   setup do
     db = :"proportionate_dispatch_db_#{System.unique_integer([:positive])}"
@@ -22,6 +35,33 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
     coder = session(db, "proportionate-coder", "coder")
     orchestrator = session(db, "proportionate-orchestrator", "orchestrator")
     reviewer = session(db, "proportionate-reviewer", "reviewer-spec")
+    po = session(db, "proportionate-po", "product-owner")
+
+    Roles.create!(db, "product-owner:posture", "flynn", po.session_key)
+
+    assert %{"changed" => true} =
+             SessionPoAssociations.handle(db, %{
+               principal: {:user, "flynn"},
+               params: %{
+                 session_key: orchestrator.session_key,
+                 po_role: "product-owner:posture",
+                 idempotency_key: "associate-posture-owner"
+               }
+             })
+
+    assert %{"changed" => true} =
+             DeliveryResponsibilities.handle(db, %{
+               verb: "delivery-scope-owner-set",
+               origin: "user:flynn",
+               principal: {:user, "flynn"},
+               params: %{
+                 session_key: orchestrator.session_key,
+                 association_revision: 1,
+                 expected_owner_session_key: nil,
+                 expected_owner_revision: 0,
+                 idempotency_key: "set-posture-owner"
+               }
+             })
 
     base_dir =
       Path.join(
@@ -65,16 +105,25 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
              Dispatch.dispatch(
                ctx.db,
                ctx.handlers,
-               assign_call(ctx.coder.session_key, item.id, "implement the bounded repair")
+               session_assign_call(
+                 ctx.orchestrator.session_key,
+                 ctx.coder.session_key,
+                 item.id,
+                 "implement the bounded repair"
+               )
              )
 
     assert assigned.subject == "implement the bounded repair"
 
     assert {:ok, dispatched} =
-             Dispatch.dispatch(
-               ctx.db,
-               ctx.handlers,
-               dispatch_call(ctx.coder.session_key, item.id, "implement the follow-up")
+             dispatch_after_rumination(
+               ctx,
+               dispatch_call(
+                 ctx.orchestrator.session_key,
+                 ctx.coder.session_key,
+                 item.id,
+                 "implement the follow-up"
+               )
              )
 
     assert dispatched.subject == "implement the follow-up"
@@ -87,7 +136,9 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
              Dispatch.dispatch(
                ctx.db,
                ctx.handlers,
-               assign_call(ctx.orchestrator.session_key, item.id, "coordinate the repair")
+               user_assign_call(ctx.orchestrator.session_key, item.id, "coordinate the repair",
+                 effect_kind: "coordination"
+               )
              )
 
     assert {:ok, %{attest: %{verdictKind: "posture-light"}}} =
@@ -101,7 +152,12 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
              Dispatch.dispatch(
                ctx.db,
                ctx.handlers,
-               assign_call(ctx.coder.session_key, item.id, "implement after judgment")
+               session_assign_call(
+                 ctx.orchestrator.session_key,
+                 ctx.coder.session_key,
+                 item.id,
+                 "implement after judgment"
+               )
              )
 
     assert implementation.subject == "implement after judgment"
@@ -114,7 +170,12 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
              Dispatch.dispatch(
                ctx.db,
                ctx.handlers,
-               assign_call(ctx.orchestrator.session_key, item.id, "coordinate consequential work")
+               user_assign_call(
+                 ctx.orchestrator.session_key,
+                 item.id,
+                 "coordinate consequential work",
+                 effect_kind: "coordination"
+               )
              )
 
     assert {:ok, %{attest: %{verdictKind: "posture-heavy"}}} =
@@ -125,10 +186,14 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
              )
 
     assert {:ok, implementation} =
-             Dispatch.dispatch(
-               ctx.db,
-               ctx.handlers,
-               dispatch_call(ctx.coder.session_key, item.id, "implement the authorized slice")
+             dispatch_after_rumination(
+               ctx,
+               dispatch_call(
+                 ctx.orchestrator.session_key,
+                 ctx.coder.session_key,
+                 item.id,
+                 "implement the authorized slice"
+               )
              )
 
     assert implementation.subject == "implement the authorized slice"
@@ -137,11 +202,25 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
   test "a non-coder assignment remains admitted without a posture receipt", ctx do
     item = work_item(ctx)
 
+    assert {:ok, producer} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               session_assign_call(
+                 ctx.orchestrator.session_key,
+                 ctx.coder.session_key,
+                 item.id,
+                 "produce the specification"
+               )
+             )
+
     assert {:ok, review} =
              Dispatch.dispatch(
                ctx.db,
                ctx.handlers,
-               assign_call(ctx.reviewer.session_key, item.id, "review the specification")
+               user_assign_call(ctx.reviewer.session_key, item.id, "review the specification",
+                 reviews_assignment_id: producer.id
+               )
              )
 
     assert review.subject == "review the specification"
@@ -155,7 +234,9 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
              Dispatch.dispatch(
                ctx.db,
                ctx.handlers,
-               assign_call(ctx.orchestrator.session_key, other.id, "coordinate another item")
+               user_assign_call(ctx.orchestrator.session_key, other.id, "coordinate another item",
+                 effect_kind: "coordination"
+               )
              )
 
     assert {:ok, _} =
@@ -169,20 +250,81 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
              Dispatch.dispatch(
                ctx.db,
                ctx.handlers,
-               assign_call(ctx.coder.session_key, item.id, "implement independently")
+               session_assign_call(
+                 ctx.orchestrator.session_key,
+                 ctx.coder.session_key,
+                 item.id,
+                 "implement independently"
+               )
              )
 
     assert implementation.subject == "implement independently"
   end
 
   defp work_item(ctx) do
-    WorkItems.__handle__(ctx.db, "work-item-create", %{
-      principal: {:user, "flynn"},
-      params: %{title: "Proportionate work #{System.unique_integer([:positive])}"}
-    })
+    item =
+      WorkItems.__handle__(ctx.db, "work-item-create", %{
+        principal: {:user, "flynn"},
+        params: %{title: "Proportionate work #{System.unique_integer([:positive])}"}
+      })
+
+    establish_delivery(ctx, item)
+    item
   end
 
-  defp assign_call(holder_key, item_id, subject) do
+  defp establish_delivery(ctx, item) do
+    assert %{"changed" => true} =
+             DeliveryResponsibilities.handle(ctx.db, %{
+               verb: "work-item-delivery-scope-set",
+               origin: "user:flynn",
+               principal: {:user, "flynn"},
+               params: %{
+                 work_item_id: item.id,
+                 association_session_key: ctx.orchestrator.session_key,
+                 association_revision: 1,
+                 expected_binding_revision: 0,
+                 idempotency_key: "bind-posture-#{item.id}"
+               }
+             })
+
+    topology =
+      Assignments.__handle__(ctx.db, "assign", %{
+        verb: "assign",
+        origin: "agent:#{ctx.orchestrator.session_key}",
+        principal: {:session, ctx.orchestrator.session_key},
+        session_key: ctx.orchestrator.session_key,
+        target_role: nil,
+        role_fallback: false,
+        supervision_interval_ms: 1_000,
+        params: %{
+          subject: "return topology",
+          work_item_id: item.id,
+          effect_kind: "coordination"
+        }
+      })
+
+    assert %{attest: %{verdictKind: "topology-decided"}} =
+             Assignments.__handle__(ctx.db, "attest", %{
+               verb: "attest",
+               origin: "agent:#{ctx.orchestrator.session_key}",
+               principal: {:session, ctx.orchestrator.session_key},
+               params: %{
+                 assignment_id: topology.id,
+                 kind: "verdict",
+                 verdict_kind: "topology-decided"
+               }
+             })
+
+    assert %{assignment: %{state: "closed"}} =
+             Assignments.__handle__(ctx.db, "attest", %{
+               verb: "attest",
+               origin: "agent:#{ctx.orchestrator.session_key}",
+               principal: {:session, ctx.orchestrator.session_key},
+               params: %{assignment_id: topology.id, kind: "completion"}
+             })
+  end
+
+  defp user_assign_call(holder_key, item_id, subject, options) do
     %{
       verb: "assign",
       origin: "user:flynn",
@@ -190,20 +332,53 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
       session_key: holder_key,
       target_role: nil,
       role_fallback: false,
+      params: %{
+        subject: subject,
+        work_item_id: item_id,
+        effect_kind: options[:effect_kind],
+        reviews_assignment_id: options[:reviews_assignment_id]
+      }
+    }
+  end
+
+  defp session_assign_call(caller_key, holder_key, item_id, subject) do
+    %{
+      verb: "assign",
+      origin: "agent:#{caller_key}",
+      principal: {:session, caller_key},
+      session_key: holder_key,
+      target_role: nil,
+      role_fallback: false,
       params: %{subject: subject, work_item_id: item_id}
     }
   end
 
-  defp dispatch_call(holder_key, item_id, subject) do
+  defp dispatch_call(caller_key, holder_key, item_id, subject) do
     %{
       verb: "dispatch",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
+      origin: "agent:#{caller_key}",
+      principal: {:session, caller_key},
       session_key: holder_key,
       target_role: nil,
       role_fallback: false,
       params: %{subject: subject, brief: "Implement #{subject}.", work_item_id: item_id}
     }
+  end
+
+  defp dispatch_after_rumination(ctx, call) do
+    assert {:ok, %{rumination_required: true}} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               """
+               UPDATE wakes SET state = 'fired'
+               WHERE rumination = 1 AND work_item_id = ?1 AND creatorSessionKey = ?2
+               """,
+               [call.params.work_item_id, elem(call.principal, 1)]
+             )
+
+    Dispatch.dispatch(ctx.db, ctx.handlers, call)
   end
 
   defp verdict_call(session_key, assignment_id, kind) do

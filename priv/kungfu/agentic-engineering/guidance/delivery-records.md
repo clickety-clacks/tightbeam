@@ -2,9 +2,15 @@
 
 Keep related assignments on the work item. Bind an authoritative spec by name and content hash when work relies on it. Use tightbeam-dispatching for effect classification when opening assignments and the operating manual for dispatch mechanics. Plain dispatch opens an assignment and wakes its holder; linked review uses assign with --reviews pointing to the producer assignment, followed by a wake carrying the review assignment.
 
-Apply the cycle selected in the orchestrator kernel. An adequate existing ask or spec needs no replacement ceremony. Pass the actual delivery standard and relevant evidence to each specialist.
+Apply the work selected under delivery-coordination. An adequate existing ask or spec needs no replacement ceremony. Pass the actual delivery standard and relevant evidence to each specialist.
 
-For PO judgment, use the addressed product role from the delegation context. Provide the current spec or result, its revision, the product spirit reference and the product question on a bounded assignment on the same item. Wake the PO under the kernel's opportunity duty. Reuse an open PO judgment assignment for unchanged scope. If a completed judgment needs a successor, keep it on the same item and reference the earlier assignment and changed context. Do not use --reviews merely to mark succession. The PO records and completes its own intent judgment.
+Before dispatch, put the full task, supplied facts, constraints, authority, governing
+PO decision, addressed owners and completion condition in the assignment or a durable
+referenced artifact. Verify that its intended recipient can read it. A title and
+pointer wake do not supply omitted context; do not make a worker reconstruct the
+request from an ancestor's transcript. Preserve exact supplied wording when required.
+
+For PO judgment, use the addressed product role from the delegation context. Provide the current spec or result, its revision, the product spirit reference and the product question on a bounded assignment on the same item. Wake the PO under the shared opportunity duty. Reuse an open PO judgment assignment for unchanged scope. If a completed judgment needs a successor, keep it on the same item and reference the earlier assignment and changed context. Do not use --reviews merely to mark succession. The PO records and completes its own intent judgment.
 
 Link independent technical review to its producer. Use reviewer-spec for specifications and reviewer-code for implementation. Preserve the latest attributable review conclusion and the subject it covers. Use the shared engineering expectations for review admission and proof. Use recon for a bounded diagnostic question when that is the useful assignment. Do not file producer completion to summon review.
 

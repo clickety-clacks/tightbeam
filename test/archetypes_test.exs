@@ -237,8 +237,17 @@ defmodule Tightbeam.ArchetypesTest do
           "\n"
         )
 
+      # The user's shared work-record invariant legitimately names an associated
+      # spec. Require that exact sentence once, then keep all eight vocabulary
+      # checks on the rest of the neutral identity.
+      invariant =
+        "Keep every applicable user-specified invariant in the governing work item and any associated spec, regardless of whether it came through chat, a document, or another source. Preserve the user's meaning."
+
+      assert length(:binary.matches(served, invariant)) == 1
+      remaining = String.replace(served, invariant, "", global: false)
+
       for {concept, pattern} <- forbidden do
-        refute Regex.match?(pattern, served),
+        refute Regex.match?(pattern, remaining),
                "neutral default/#{harness} guidance contains engineering concept #{concept}"
       end
     end
@@ -273,7 +282,6 @@ defmodule Tightbeam.ArchetypesTest do
     end
 
     assert role_guidance.("product-owner") =~ "Prioritize outcomes and propose ready work"
-    assert role_guidance.("orchestrator") =~ "Carry returned work"
 
     for role <- ~w(product-owner orchestrator) do
       refute role_guidance.(role) =~ heading
@@ -289,6 +297,7 @@ defmodule Tightbeam.ArchetypesTest do
 
       assert length(String.split(served, heading)) == 2
       assert served =~ "Reuse capable integration custody; create it when needed"
+      if role == "orchestrator", do: assert(served =~ "Carry returned work")
       refute Regex.match?(~r/^#include/m, served)
     end
   end
@@ -302,10 +311,10 @@ defmodule Tightbeam.ArchetypesTest do
     loaded = Archetypes.load!(ctx.base_dir)
 
     assert Map.keys(loaded) |> Enum.sort() ==
-             ~w(coder default guidance-reviewer guidance-writer integrator orchestrator product-owner recon reviewer-code reviewer-spec spec-writer team-planner)
+             ~w(coder default guidance-reviewer guidance-writer integrator orchestrator pdo product-owner recon reviewer-code reviewer-spec spec-writer team-planner)
 
     engineering_roles =
-      ~w(coder orchestrator product-owner reviewer-code reviewer-spec recon spec-writer team-planner guidance-writer guidance-reviewer integrator)
+      ~w(coder orchestrator pdo product-owner reviewer-code reviewer-spec recon spec-writer team-planner guidance-writer guidance-reviewer integrator)
 
     assert loaded["product-owner"].skills ==
              ["repository-retirement", "tightbeam-dispatching"]
@@ -321,8 +330,11 @@ defmodule Tightbeam.ArchetypesTest do
              )
     end
 
-    assert Enum.all?(loaded, fn {_role, archetype} ->
-             "human-communication" not in archetype.skills
+    assert loaded["pdo"].skills == ["repository-retirement", "human-communication"]
+
+    assert Enum.all?(loaded, fn
+             {"pdo", _archetype} -> true
+             {_role, archetype} -> "human-communication" not in archetype.skills
            end)
 
     refute Map.has_key?(loaded, "reviewer")
@@ -757,6 +769,50 @@ defmodule Tightbeam.ArchetypesTest do
     assert_raise ArgumentError, ~r/model_preferences entry is missing model/, fn ->
       Archetypes.load!(ctx.base_dir)
     end
+  end
+
+  test "the engineering bundle resolves current defaults and actual-producer review policy",
+       ctx do
+    Identity.init!(ctx.base_dir)
+    assert {:ok, _revision} = learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
+    loaded = Archetypes.load!(ctx.base_dir)
+
+    for {role, harness, family, effort} <- [
+          {"pdo", :codex, "gpt-6-sol", "low"},
+          {"orchestrator", :codex, "gpt-6-sol", "low"},
+          {"coder", :codex, "gpt-6-luna", "max"},
+          {"spec-writer", :claude, "claude-opus-5-5", "high"},
+          {"reviewer-code", :claude, "claude-opus-5-5", "high"},
+          {"reviewer-spec", :codex, "gpt-6-astra", "high"}
+        ] do
+      model = Tightbeam.Model.new(family, effort: effort)
+      assert loaded[role].defaults == %{harness: harness, model: model}
+      assert loaded[role].model_preferences == [model]
+    end
+
+    policy =
+      Identity.snapshot_at!(
+        ctx.base_dir,
+        Identity.live_revision!(ctx.base_dir),
+        "pdo",
+        :codex
+      ).guidance
+
+    activities =
+      Application.app_dir(:tightbeam, "priv/kungfu/agentic-engineering/preferred-models.md")
+      |> File.read!()
+
+    [mixed_family, codex_only] =
+      String.split(activities, "## Codex-only PDO activity", parts: 2)
+
+    assert mixed_family =~ "Product delivery orchestration | gpt-6-sol[low]"
+    assert codex_only =~ "Product delivery orchestration | gpt-6-sol[low]"
+    assert activities =~ "Executive or delegated lane orchestration | gpt-6-sol[low]"
+    assert policy =~ "Codex-authored work uses Claude claude-opus-5-5/high"
+    assert policy =~ "Claude-authored work uses Codex gpt-6-astra/high"
+    assert policy =~ "including producer model overrides"
+    assert policy =~ "Expand nicknames to canonical models above"
+    assert policy =~ "Catalog presence alone does not establish access"
   end
 
   test "where wildcard must stand alone and where must be non-empty", ctx do

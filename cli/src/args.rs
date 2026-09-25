@@ -185,6 +185,7 @@ pub enum Command {
         context: Option<Option<String>>,
         handle: Option<String>,
         host: Option<String>,
+        work_item_id: Option<String>,
     },
     List {
         identity: Identity,
@@ -222,6 +223,7 @@ pub enum Command {
         effect_kind: Option<String>,
         files: Option<Vec<String>>,
         succeeds: Option<String>,
+        delegates_delivery: bool,
     },
     Dispatch {
         identity: Identity,
@@ -233,6 +235,7 @@ pub enum Command {
         brief: String,
         idempotency_key: Option<String>,
         succeeds: Option<String>,
+        delegates_delivery: bool,
     },
     EffortRule {
         identity: Identity,
@@ -331,6 +334,26 @@ pub enum Command {
         priority: Option<String>,
     },
     WorkItemGet {
+        identity: Identity,
+        work_item_id: String,
+    },
+    WorkItemDeliveryScopeSet {
+        identity: Identity,
+        work_item_id: String,
+        association_session_key: String,
+        association_revision: u64,
+        expected_binding_revision: u64,
+        idempotency_key: String,
+    },
+    DeliveryScopeOwnerSet {
+        identity: Identity,
+        session_key: String,
+        association_revision: u64,
+        expected_owner_session_key: Option<String>,
+        expected_owner_revision: u64,
+        idempotency_key: String,
+    },
+    DeliveryResponsibilityGet {
         identity: Identity,
         work_item_id: String,
     },
@@ -653,7 +676,8 @@ COMMANDS:
 
   spawn --display "<name>" [--name <role>] [--archetype <a>]
         [--harness {{HARNESSES_PIPE}}] [--model <model>] [--effort <level>]
-        [--context <variant>] [--host <host>] [--key <idempotencyKey>]
+        [--context <variant>] [--host <host>] [--work-item <workItemId>]
+        [--key <idempotencyKey>]
       Hire a new session (a worker). --display is its human label; --name
       registers a role bound to the new session — do NOT confuse it with --as,
       which is YOUR identity. --key makes the spawn idempotent
@@ -706,6 +730,16 @@ COMMANDS:
       stay unchanged; --clear-spec-ref clears both spec-ref fields. Open cards
       inherit priority changes.
   work-item-get <workItemId>
+  work-item-delivery-scope-set <workItemId> --association-session <key>
+      --association-revision <n> --expected-revision <n> --key <idempotencyKey>
+      Bind an item to the explicit addressed-PO office carried by one exact
+      current session association. Initial binding expects revision 0.
+  delivery-scope-owner-set --session <key> --association-revision <n>
+      [--expected-owner <key>] --expected-revision <n> --key <idempotencyKey>
+      Set or succeed the one accountable owner for the target session's
+      addressed-PO scope. Initial ownership expects revision 0 and no owner.
+  delivery-responsibility-get <workItemId>
+      Inspect the item's scope, accountable succession history, and exact-item delegates.
   work-item-trace <workItemId>
   attend [--high]
       Elect the attention tier of the reply you are about to give, during your
@@ -766,13 +800,14 @@ COMMANDS:
          [--key <key>] [--work-item <workItemId>]
          [--reviews <assignmentId>] [--effect-kind <kind>]
          [--files '["lib/a.ex","test/a_test.exs"]'] [--succeeds <assignmentId>]
+         [--delegates-delivery]
       Open an obligation held by a session; a work item is the durable thread
       across assignments. --files is an advisory suggestion that others can see;
       it reserves no path and does not limit the assignment's work.
   dispatch (--to <sessionKey> | --holder <sessionKey>) --subject "<work>"
            --brief "<one sentence>" [--work-item <workItemId>]
            [--effect-kind <kind>] [--workdir-root <relativePath>] [--key <key>]
-           [--succeeds <assignmentId>]
+           [--succeeds <assignmentId>] [--delegates-delivery]
       Atomically open an assignment and wake its holder with the card id.
   effort-rule --request <decisionRequestId> --action continue|dismiss
       Rule an effort-without-effect check-in whose complete id you hold. The
@@ -995,6 +1030,7 @@ const BOOLEAN_FLAGS: &[&str] = &[
     "api-key",
     "clear-spec-ref",
     "daemon-credential",
+    "delegates-delivery",
     "dry-run",
     "help",
     "history",
@@ -1046,6 +1082,13 @@ fn split_args(args: Vec<String>) -> Flags {
 
 fn nonempty(flags: &HashMap<String, String>, name: &str) -> Option<String> {
     flags.get(name).filter(|value| !value.is_empty()).cloned()
+}
+
+fn unsigned_flag(flags: &HashMap<String, String>, name: &str) -> Result<u64, String> {
+    let value = nonempty(flags, name).ok_or_else(|| format!("--{name} is required"))?;
+    value
+        .parse::<u64>()
+        .map_err(|_| format!("--{name} must be a non-negative integer"))
 }
 
 fn complete_decision_request_id(value: &str) -> bool {
@@ -1918,6 +1961,7 @@ fn parse_with_optional_catalog(
                 context: named(flags, "context"),
                 handle: nonempty(flags, "name"),
                 host: nonempty(flags, "host"),
+                work_item_id: nonempty(flags, "work-item"),
             })
         }
         "list" => Ok(Command::List {
@@ -2000,6 +2044,7 @@ fn parse_with_optional_catalog(
                 effect_kind: nonempty(flags, "effect-kind"),
                 files,
                 succeeds: nonempty(flags, "succeeds"),
+                delegates_delivery: flags.contains_key("delegates-delivery"),
             })
         }
         "dispatch" => {
@@ -2023,6 +2068,7 @@ fn parse_with_optional_catalog(
                 brief,
                 idempotency_key: nonempty(flags, "key"),
                 succeeds: nonempty(flags, "succeeds"),
+                delegates_delivery: flags.contains_key("delegates-delivery"),
             })
         }
         "effort-rule" => {
@@ -2316,6 +2362,42 @@ fn parse_with_optional_catalog(
                 return Err("usage: tightbeam work-item-get <workItemId>".to_owned());
             }
             Ok(Command::WorkItemGet {
+                identity: identity(flags)?,
+                work_item_id: parsed.positional[1].clone(),
+            })
+        }
+        "work-item-delivery-scope-set" => {
+            if parsed.positional.len() != 2 {
+                return Err("usage: tightbeam work-item-delivery-scope-set <workItemId> --association-session <key> --association-revision <n> --expected-revision <n> --key <idempotencyKey>".to_owned());
+            }
+            Ok(Command::WorkItemDeliveryScopeSet {
+                identity: identity(flags)?,
+                work_item_id: parsed.positional[1].clone(),
+                association_session_key: nonempty(flags, "association-session")
+                    .ok_or("--association-session is required")?,
+                association_revision: unsigned_flag(flags, "association-revision")?,
+                expected_binding_revision: unsigned_flag(flags, "expected-revision")?,
+                idempotency_key: nonempty(flags, "key").ok_or("--key is required")?,
+            })
+        }
+        "delivery-scope-owner-set" => {
+            if parsed.positional.len() != 1 {
+                return Err("usage: tightbeam delivery-scope-owner-set --session <key> --association-revision <n> [--expected-owner <key>] --expected-revision <n> --key <idempotencyKey>".to_owned());
+            }
+            Ok(Command::DeliveryScopeOwnerSet {
+                identity: identity(flags)?,
+                session_key: nonempty(flags, "session").ok_or("--session is required")?,
+                association_revision: unsigned_flag(flags, "association-revision")?,
+                expected_owner_session_key: nonempty(flags, "expected-owner"),
+                expected_owner_revision: unsigned_flag(flags, "expected-revision")?,
+                idempotency_key: nonempty(flags, "key").ok_or("--key is required")?,
+            })
+        }
+        "delivery-responsibility-get" => {
+            if parsed.positional.len() != 2 {
+                return Err("usage: tightbeam delivery-responsibility-get <workItemId>".to_owned());
+            }
+            Ok(Command::DeliveryResponsibilityGet {
                 identity: identity(flags)?,
                 work_item_id: parsed.positional[1].clone(),
             })
@@ -2719,7 +2801,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-update, work-item-get, work-item-delivery-scope-set, delivery-scope-owner-set, delivery-responsibility-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -3984,6 +4066,7 @@ mod tests {
                 "config",
                 "decision-request",
                 "decision-requests",
+                "delivery-responsibility-get",
                 "dispatch",
                 "doctor",
                 "effort-rule",
@@ -4016,6 +4099,8 @@ mod tests {
                 "wake",
                 "work-item-close",
                 "work-item-create",
+                "work-item-delivery-scope-set",
+                "delivery-scope-owner-set",
                 "work-item-fail",
                 "work-item-get",
                 "work-item-update",
@@ -4744,7 +4829,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned()),
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-update, work-item-get, work-item-delivery-scope-set, delivery-scope-owner-set, delivery-responsibility-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned()),
         );
     }
 
@@ -5229,6 +5314,7 @@ mod tests {
                     context: Some(Some("1m".to_owned())),
                     handle: Some("reviewer".to_owned()),
                     host: Some("eezo".to_owned()),
+                    work_item_id: None,
                 },
             ),
             (

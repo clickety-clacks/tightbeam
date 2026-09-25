@@ -28,6 +28,7 @@ defmodule Tightbeam.Wakes do
   alias Tightbeam.{
     ConditionFacts,
     DB,
+    DeliveryResponsibilities,
     Escalation,
     EventLog,
     Gateway,
@@ -381,8 +382,7 @@ defmodule Tightbeam.Wakes do
   def terminal_notification(event, existing_wake) when is_map(event) do
     event = Map.take(event, @terminal_notice_fields)
 
-    strings =
-      ~w(source_token assignment_id child_session_key owner_user_id opened_by_id)a
+    strings = ~w(source_token assignment_id child_session_key owner_user_id opened_by_id)a
 
     valid? =
       Enum.all?(strings, fn key ->
@@ -1089,13 +1089,33 @@ defmodule Tightbeam.Wakes do
   defp terminal_notice_recipient_in_txn(txn, event) do
     personal = Tightbeam.Org.personal_session_key(event.owner_user_id)
 
+    current =
+      DeliveryResponsibilities.current_accountable_recipient_in_txn(
+        txn,
+        event.work_item_id,
+        event.owner_user_id
+      )
+
+    delegated_opener =
+      if event.opened_by_kind == "session" and
+           DeliveryResponsibilities.responsibility_in_txn(
+             txn,
+             event.opened_by_id,
+             event.work_item_id
+           ) == "delegated",
+         do: event.opened_by_id,
+         else: nil
+
     candidates =
       if event.opened_by_kind == "session",
-        do: [event.opened_by_id, personal],
-        else: [personal]
+        do: [delegated_opener, current, event.opened_by_id, personal],
+        else: [current, personal]
 
     recipient =
-      Enum.find(candidates, fn key ->
+      candidates
+      |> Enum.reject(&is_nil/1)
+      |> Enum.uniq()
+      |> Enum.find(fn key ->
         Txn.q(
           txn,
           "SELECT 1 FROM sessions WHERE sessionKey=?1 AND ownerUserId=?2 AND state='active'",
@@ -1153,8 +1173,7 @@ defmodule Tightbeam.Wakes do
     created_at = now()
     {class, class_election} = elected_class(input)
 
-    {delivery_rule, due_at} =
-      apply_delivery_policy(txn, input, class, created_at, condition_kind)
+    {delivery_rule, due_at} = apply_delivery_policy(txn, input, class, created_at, condition_kind)
 
     wake = %{
       wake_id: Map.get(input, :wake_id, "w_" <> Tightbeam.Id.uuid4()),
@@ -1398,8 +1417,7 @@ defmodule Tightbeam.Wakes do
       evidence,
       %{delivered: [], outstanding: [], terminal: [], inconsistencies: []},
       fn item, acc ->
-        statuses =
-          Enum.map(item.turns, &Enum.at(&1, 1)) ++ Enum.map(item.repairs, & &1.status)
+        statuses = Enum.map(item.turns, &Enum.at(&1, 1)) ++ Enum.map(item.repairs, & &1.status)
 
         acc =
           if "delivered" in statuses,
@@ -3133,7 +3151,7 @@ defmodule Tightbeam.Wakes do
   def cancel_in_txn(%Txn{} = txn, command), do: cancel_in_txn(txn, command, &now/0)
 
   @doc false
-  @spec cancel_in_txn(Txn.t(), map(), (-> non_neg_integer())) :: cancellation_result()
+  @spec cancel_in_txn(Txn.t(), map(), (() -> non_neg_integer())) :: cancellation_result()
   def cancel_in_txn(%Txn{} = txn, command, clock)
       when is_map(command) and is_function(clock, 0) do
     with {:ok, wake} <- pending_wake(txn, command),
@@ -4769,9 +4787,7 @@ defmodule Tightbeam.Wakes do
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
-    GenServer.start_link(__MODULE__, opts,
-      name: Keyword.get(opts, :name, Tightbeam.WakeScheduler)
-    )
+    GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, Tightbeam.WakeScheduler))
   end
 
   @doc """

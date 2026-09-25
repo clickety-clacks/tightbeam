@@ -231,9 +231,9 @@ defmodule Tightbeam.SessionPoAssociations do
 
   defp notice_prompt(po_role, revision) do
     "Your addressed PO is `#{po_role}` (association revision `#{revision}`). " <>
-      "Read the current association and consult that PO about team shape. " <>
-      "The PO recommends; you adopt or amend the recommendation, staff, and retain delivery custody. " <>
-      "This notice does not block otherwise authorized staffing."
+      "Read the current association and your applicable role guidance before acting. " <>
+      "Preserve your current assignment custody and route substantive product questions to the addressed PO. " <>
+      "This notice grants no delivery authority and requires no acknowledgement."
   end
 
   defp principal_session({:session, session_key}), do: session_key

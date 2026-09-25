@@ -89,6 +89,7 @@ defmodule Tightbeam.Gateway do
     Roles,
     Schema,
     SessionPoAssociations,
+    DeliveryResponsibilities,
     Spinup,
     StateResources,
     SubagentMarkers,
@@ -1179,6 +1180,15 @@ defmodule Tightbeam.Gateway do
         )
       end,
       {"work-item-get", []} => fn call -> WorkItems.__handle__(db, "work-item-get", call) end,
+      {"work-item-delivery-scope-set", []} => fn call ->
+        DeliveryResponsibilities.handle(db, call)
+      end,
+      {"delivery-scope-owner-set", []} => fn call ->
+        DeliveryResponsibilities.handle(db, call)
+      end,
+      {"delivery-responsibility-get", []} => fn call ->
+        DeliveryResponsibilities.handle(db, call)
+      end,
       {"work-item-trace", []} => fn call -> WorkItems.__handle__(db, "work-item-trace", call) end,
       {"transcript", []} => fn call -> Tightbeam.Transcript.read(db, call) end,
       {"attend", []} => fn call -> attend_result(db, call) end,
@@ -5272,8 +5282,7 @@ defmodule Tightbeam.Gateway do
       session_key when is_binary(session_key) ->
         due_at = p[:at] || System.system_time(:millisecond) + (p[:after_ms] || 0)
 
-        result =
-          DB.transaction(db, fn txn -> wake_result_in_txn(config, txn, call) end)
+        result = DB.transaction(db, fn txn -> wake_result_in_txn(config, txn, call) end)
 
         wake =
           case result do
@@ -5416,6 +5425,13 @@ defmodule Tightbeam.Gateway do
            [assignment_id]
          ) do
       [[opened_by_user, opened_by_session, work_item_id, owner]] ->
+        current =
+          DeliveryResponsibilities.current_accountable_recipient_in_txn(
+            txn,
+            work_item_id,
+            owner
+          )
+
         opener =
           cond do
             is_binary(opened_by_user) and opened_by_user == owner ->
@@ -5435,17 +5451,33 @@ defmodule Tightbeam.Gateway do
               nil
           end
 
-        recipient = opener || Org.personal_session_key(owner)
+        delegated_opener =
+          if is_binary(opener) and is_binary(opened_by_session) and
+               DeliveryResponsibilities.responsibility_in_txn(
+                 txn,
+                 opened_by_session,
+                 work_item_id
+               ) == "delegated",
+             do: opener,
+             else: nil
 
-        case DB.Txn.q(
-               txn,
-               "SELECT 1 FROM sessions WHERE sessionKey=?1 AND ownerUserId=?2 AND state='active'",
-               [recipient, owner]
-             ) do
-          [[1]] ->
+        recipient =
+          [delegated_opener, current, opener, Org.personal_session_key(owner)]
+          |> Enum.reject(&is_nil/1)
+          |> Enum.uniq()
+          |> Enum.find(fn candidate ->
+            DB.Txn.q(
+              txn,
+              "SELECT 1 FROM sessions WHERE sessionKey=?1 AND ownerUserId=?2 AND state='active'",
+              [candidate, owner]
+            ) == [[1]]
+          end)
+
+        case recipient do
+          recipient when is_binary(recipient) ->
             {:ok, %{session_key: recipient, owner_user_id: owner, work_item_id: work_item_id}}
 
-          _ ->
+          nil ->
             {:error,
              %{
                reason: :missing_accountable_owner,

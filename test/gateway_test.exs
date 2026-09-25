@@ -11,7 +11,7 @@ defmodule Tightbeam.GatewayTest do
     effects = Tightbeam.Gateway.handler_effects(%{db: :registry_test_unused})
 
     expected =
-      ~w(post wake condition facts-read artifact-record artifact-get artifacts rule effort-rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request approve-device deny-device revoke-device host-env-set host-env-list host-env-unset host-toolchain-set register-host update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list identity-apply kungfu-scaffold onboard promote-user add-user config harness-processes role-create role-bind role-rm role-list work-item-create work-item-get work-item-trace transcript attend execution-map execution-map-select toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail assign dispatch attest attests assignment-get revoke-assignment reopen-assignment repair-assignment assignments inspect cancel critical spawn tune session-reparent session-po-set retire assignment-commitref-correct)
+      ~w(post wake condition facts-read artifact-record artifact-get artifacts rule effort-rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request approve-device deny-device revoke-device host-env-set host-env-list host-env-unset host-toolchain-set register-host update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list identity-apply kungfu-scaffold onboard promote-user add-user config harness-processes role-create role-bind role-rm role-list work-item-create work-item-get work-item-delivery-scope-set delivery-scope-owner-set delivery-responsibility-get work-item-trace transcript attend execution-map execution-map-select toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail assign dispatch attest attests assignment-get revoke-assignment reopen-assignment repair-assignment assignments inspect cancel critical spawn tune session-reparent session-po-set retire assignment-commitref-correct)
 
     expected =
       expected ++ ~w(ask answer return read-marker-set read-marker-clear artifact-content-fetch)
@@ -2215,6 +2215,76 @@ defmodule Tightbeam.GatewayTest do
 
     assert {:ok, [[^before_count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM sessions")
     assert Idempotency.get(ctx.db, "flynn", "spawn", "spawn-taken") == nil
+  end
+
+  test "fresh PDO and orchestrator spawns resolve their defaults without changing coder choice",
+       ctx do
+    base_dir = role_test_base("engineering-default-spawn")
+    codex_auth = Tightbeam.Homes.home_path(base_dir, "testhost", :codex)
+    File.mkdir_p!(codex_auth)
+    File.write!(Path.join(codex_auth, "auth.json"), "test-token")
+    learn_engineering_identity_without_apply_fixture_skills!(base_dir)
+    ensure_global_registry()
+
+    put_host_catalog("testhost", "codex", [
+      {"gpt-6-sol", ["low"], :openai},
+      {"gpt-6-luna", ["max"], :openai}
+    ])
+
+    handlers = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))
+    spawn = handlers["spawn"]
+
+    assert %{setting: "default-archetype", value: "pdo"} =
+             handlers["config"].(%{
+               origin: "user:flynn",
+               params: %{action: "set", setting: "default-archetype", value: "pdo"}
+             })
+
+    assert %{session_key: default_pdo_key} =
+             spawn.(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{
+                 display_name: "Fresh default PDO",
+                 idempotency_key: "fresh-default-pdo"
+               }
+             })
+
+    assert %{archetype: "pdo", harness: "codex", provider: "openai"} =
+             Org.get(ctx.db, default_pdo_key)
+
+    assert Org.get(ctx.db, default_pdo_key).model ==
+             Model.new("gpt-6-sol", effort: "low")
+
+    for archetype <- ["pdo", "orchestrator"] do
+      assert %{session_key: key} =
+               spawn.(%{
+                 origin: "user:flynn",
+                 session_key: nil,
+                 params: %{
+                   display_name: "Fresh #{archetype}",
+                   archetype: archetype,
+                   idempotency_key: "fresh-#{archetype}"
+                 }
+               })
+
+      assert %{archetype: ^archetype, harness: "codex", provider: "openai"} = Org.get(ctx.db, key)
+
+      assert Org.get(ctx.db, key).model == Model.new("gpt-6-sol", effort: "low")
+    end
+
+    assert %{session_key: coder_key} =
+             spawn.(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{
+                 display_name: "Fresh coder",
+                 archetype: "coder",
+                 idempotency_key: "fresh-coder"
+               }
+             })
+
+    assert Org.get(ctx.db, coder_key).model == Model.new("gpt-6-luna", effort: "max")
   end
 
   test "spawn has no session-count gate when the cap is unset", ctx do

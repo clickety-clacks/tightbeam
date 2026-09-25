@@ -73,7 +73,15 @@ defmodule Tightbeam.SessionPoAssociationsTest do
     assert wake.origin == "topology:addressed-po-association"
     assert wake.prompt =~ "`product-owner:one`"
     assert wake.prompt =~ "revision `1`"
-    assert wake.prompt =~ "does not block otherwise authorized staffing"
+    assert wake.prompt =~ "your applicable role guidance before acting"
+    assert wake.prompt =~ "route substantive product questions to the addressed PO"
+    assert wake.prompt =~ "Preserve your current assignment custody"
+    assert wake.prompt =~ "grants no delivery authority"
+    assert wake.prompt =~ "requires no acknowledgement"
+    refute wake.prompt =~ "adopt or amend"
+    refute wake.prompt =~ "accountable PDO"
+    refute wake.prompt =~ "staffs it"
+    refute wake.prompt =~ "does not block otherwise authorized staffing"
 
     assert SessionPoAssociations.get(ctx.db, "orchestrator") == result["association"]
 
@@ -130,6 +138,37 @@ defmodule Tightbeam.SessionPoAssociationsTest do
              set(ctx.db, {:user, "owner"}, "product-owner:one", "replace")
 
     assert count(ctx.db, "wakes") == 2
+  end
+
+  test "notice gives every recipient the same bounded routing instruction", ctx do
+    expected =
+      "Your addressed PO is `product-owner:one` (association revision `1`). " <>
+        "Read the current association and your applicable role guidance before acting. " <>
+        "Preserve your current assignment custody and route substantive product questions to the addressed PO. " <>
+        "This notice grants no delivery authority and requires no acknowledgement."
+
+    for session_key <- [ctx.target.session_key, ctx.peer.session_key] do
+      result =
+        set_target(
+          ctx.db,
+          {:user, "owner"},
+          session_key,
+          "product-owner:one",
+          "notice-#{session_key}"
+        )
+
+      assert result["changed"]
+      assert Wakes.get(ctx.db, result["association"]["noticeWakeId"]).prompt == expected
+    end
+
+    refute expected =~ "adopt"
+    refute expected =~ "amend"
+    refute expected =~ "recommend"
+    refute expected =~ "team shape"
+    refute expected =~ "current parent"
+    refute expected =~ "accountable PDO"
+    refute expected =~ "staff"
+    refute expected =~ "decides and revises topology"
   end
 
   test "fresh-key unchanged replay after replacement preserves current association", ctx do

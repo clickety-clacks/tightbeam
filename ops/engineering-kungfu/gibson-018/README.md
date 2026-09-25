@@ -1,5 +1,17 @@
 # Apply the adopted engineering practice to Gibson 0.1.8
 
+## Current reapplication boundary
+
+This directory preserves historical publication evidence and the older overlay;
+it is not a current restoration payload. Do not execute the sequence below against
+a current org unchanged. First reconcile an exact new candidate with current
+authorized source, installed-release capabilities and incumbent custody, then
+independently review its full compositions and supported publication sequence.
+In particular, do not restore the superseded task-scoped no-turn restriction or
+delivery-owned PO topology amendment authority. Keep local constraints that remain
+applicable and verify actual received instructions after authorized refresh.
+Historical hashes, payload bytes and receipts below remain unchanged as evidence.
+
 Status, 12 September: compatible guidance published and eligible existing sessions
 migrated. The 58 supported CLI edits and removals published identity revision
 `fd24c468022fe09b338744639b12d7e4cfe29f37`. The default archetype changed from

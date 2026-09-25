@@ -1,6 +1,15 @@
 name = "reviewer-code"
 skills = ["repository-retirement"]
 
+[defaults]
+harness = "claude"
+model = "claude-opus-5-5"
+effort = "high"
+
+[[model_preferences]]
+model = "claude-opus-5-5"
+effort = "high"
+
 [guidance]
 text = """
 #include "golden-rule.md"
