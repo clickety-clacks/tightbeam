@@ -927,6 +927,15 @@ defmodule Tightbeam.IdentityTest do
         Path.join(source, doc)
       )
     end
+
+    File.mkdir_p!(Path.join(source, "sentinels"))
+
+    for file <- ~w(setup.md sentinels/landing-watch) do
+      File.cp!(
+        Application.app_dir(:tightbeam, "priv/kungfu/agentic-engineering/#{file}"),
+        Path.join(source, file)
+      )
+    end
   end
 
   defp edit!(base, archetype, target, content, author) do

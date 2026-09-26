@@ -332,6 +332,86 @@ defmodule Tightbeam.Placement do
     end
   end
 
+  @doc """
+  Set one sentinel-scoped environment value on `host`.
+
+  Sentinel values share the overlay table under the scope `sentinel:<bundle>/<name>`.
+  No harness reads that scope, and it has no host-environment projection or state
+  notice, so it never appears as a harness environment.
+  """
+  @spec set_sentinel_env(
+          DB.server(),
+          String.t(),
+          String.t(),
+          String.t(),
+          String.t(),
+          String.t(),
+          map()
+        ) ::
+          {:ok, %{changed: boolean()}} | {:error, map()}
+  def set_sentinel_env(db, host, scope, name, value, set_by, call) do
+    "sentinel:" <> _qualified = scope
+
+    with :ok <- valid_env_name(name),
+         :ok <- unreserved_env_name(name) do
+      {:ok, changed} =
+        DB.transaction(db, fn txn ->
+          DB.Txn.q(
+            txn,
+            """
+            INSERT INTO harness_env_overlays (host, harness, name, value, setBy, setAt)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ON CONFLICT(host, harness, name) DO UPDATE SET
+              value = excluded.value,
+              setBy = excluded.setBy,
+              setAt = excluded.setAt
+            WHERE harness_env_overlays.value != excluded.value
+            """,
+            [host, scope, name, value, set_by, System.system_time(:millisecond)]
+          )
+
+          changed = DB.Txn.changes(txn) == 1
+          Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
+          changed
+        end)
+
+      {:ok, %{changed: changed}}
+    end
+  end
+
+  @doc "Remove one sentinel-scoped environment value."
+  @spec unset_sentinel_env(DB.server(), String.t(), String.t(), String.t(), map()) :: boolean()
+  def unset_sentinel_env(db, host, scope, name, call) do
+    "sentinel:" <> _qualified = scope
+
+    {:ok, removed} =
+      DB.transaction(db, fn txn ->
+        DB.Txn.q(
+          txn,
+          "DELETE FROM harness_env_overlays WHERE host = ?1 AND harness = ?2 AND name = ?3",
+          [host, scope, name]
+        )
+
+        removed = DB.Txn.changes(txn) == 1
+        Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
+        removed
+      end)
+
+    removed
+  end
+
+  @doc "Remove every sentinel-scoped value of one bundle on `host`."
+  @spec delete_bundle_sentinel_env(DB.Txn.t(), String.t(), String.t()) :: :ok
+  def delete_bundle_sentinel_env(%DB.Txn{} = txn, host, bundle) do
+    DB.Txn.q(
+      txn,
+      "DELETE FROM harness_env_overlays WHERE host = ?1 AND substr(harness, 1, ?2) = ?3",
+      [host, String.length("sentinel:#{bundle}/"), "sentinel:#{bundle}/"]
+    )
+
+    :ok
+  end
+
   @doc "List stored overlay rows, optionally filtered by exact host and harness."
   @spec env_overlays(DB.server(), String.t() | nil, String.t() | nil) :: [map()]
   def env_overlays(db, host \\ nil, harness \\ nil) do

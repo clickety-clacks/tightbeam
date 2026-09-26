@@ -88,6 +88,8 @@ defmodule Tightbeam.Gateway do
     Rules,
     Roles,
     Schema,
+    SentinelSupervisor,
+    Sentinels,
     SessionPoAssociations,
     DeliveryResponsibilities,
     Spinup,
@@ -377,6 +379,8 @@ defmodule Tightbeam.Gateway do
          terminal_publisher: terminal_publisher(db),
          on_terminal: on_terminal,
          name: Tightbeam.LaneManager},
+        {Tightbeam.SentinelSupervisor,
+         db: db, base_dir: config.base_dir, cli_bin: Path.join(cli_bin, "tightbeam")},
         {Bandit, plug: {Tightbeam.Wire.Router, router_deps}, port: config.port}
       ]
   end
@@ -957,48 +961,82 @@ defmodule Tightbeam.Gateway do
         admin_call_handler(db, fn call ->
           p = call.params
 
-          case Placement.set_env_overlay_with_firehose(
-                 db,
-                 p.host,
-                 p.harness,
-                 p.name,
-                 p.value,
-                 call.origin,
-                 call
-               ) do
-            %{projection: projection, changed: changed} ->
-              %{
-                host_environment: StateResources.host_environment(projection),
-                changed: changed,
-                effect: "takes effect on next #{p.harness} adapter start on #{p.host}"
-              }
+          if Map.has_key?(p, :sentinel),
+            do: sentinel_env_set(config, db, call),
+            else: harness_env_set(db, call)
+        end),
+      {"host-env-list", []} =>
+        admin_call_handler(db, fn call ->
+          if Map.has_key?(call.params, :sentinel),
+            do: sentinel_env_list(config, db, call),
+            else: %{
+              overlays:
+                db
+                |> StateResources.query_host_environment(call.params)
+                |> Enum.map(&StateResources.host_environment/1)
+            }
+        end),
+      {"host-env-unset", ["host_env.updated"]} =>
+        admin_call_handler(db, fn call ->
+          if Map.has_key?(call.params, :sentinel),
+            do: sentinel_env_unset(config, db, call),
+            else: harness_env_unset(db, call)
+        end),
+      {"sentinel-enable", []} =>
+        admin_call_handler(db, fn call ->
+          host = Placement.local_host_name()
+
+          with {:ok, sentinel} <- Sentinels.resolve(config.base_dir, call.params[:name]),
+               {:ok, result} <- Sentinels.enable(db, host, sentinel, call.origin) do
+            :ok = SentinelSupervisor.reconcile(SentinelSupervisor, [sentinel.qualified])
+            result
+          else
+            {:error, denial} -> denial
+          end
+        end),
+      {"sentinel-disable", []} =>
+        admin_call_handler(db, fn call ->
+          host = Placement.local_host_name()
+
+          case Sentinels.resolve(config.base_dir, call.params[:name]) do
+            {:ok, sentinel} ->
+              {:ok, result} = Sentinels.disable(db, host, sentinel)
+              :ok = SentinelSupervisor.reconcile()
+              result
 
             {:error, denial} ->
               denial
           end
         end),
-      {"host-env-list", []} =>
-        admin_call_handler(db, fn call ->
-          %{
-            overlays:
-              db
-              |> StateResources.query_host_environment(call.params)
-              |> Enum.map(&StateResources.host_environment/1)
-          }
-        end),
-      {"host-env-unset", ["host_env.updated"]} =>
-        admin_call_handler(db, fn call ->
-          p = call.params
+      # Readable by any caller, like kungfu-list: names, states and shipped setup
+      # text only, never a setting value, so doctor can report it from a session.
+      {"sentinel-list", []} => fn _call ->
+        host = Placement.local_host_name()
+        states = Sentinels.states(db, host)
 
-          result = Placement.unset_env_overlay_with_firehose(db, p.host, p.harness, p.name, call)
+        %{
+          host: host,
+          sentinels:
+            config.base_dir
+            |> Identity.learned_sentinels()
+            |> Map.fetch!(:sentinels)
+            |> Enum.map(fn sentinel ->
+              row = Map.get(states, sentinel.qualified, %{})
 
-          %{
-            host_environment:
-              result.projection && StateResources.host_environment(result.projection),
-            changed: result.changed,
-            removed: result.changed
-          }
-        end),
+              %{
+                sentinel: sentinel.qualified,
+                state: Map.get(row, :state, "disabled"),
+                requires: sentinel.requires,
+                missing: Sentinels.missing_settings(db, host, sentinel),
+                command_sha256: row[:command_sha256],
+                started_at: row[:started_at],
+                reason: row[:reason]
+              }
+            end),
+          setup: Sentinels.setup_all(config.base_dir, db, host)
+        }
+      end,
+      {"kungfu-setup", []} => fn call -> kungfu_setup_result(config, db, call.params[:name]) end,
       {"host-toolchain-set", []} =>
         admin_call_handler(db, fn call ->
           p = call.params
@@ -3905,7 +3943,171 @@ defmodule Tightbeam.Gateway do
     end
   end
 
+  defp harness_env_set(db, call) do
+    p = call.params
+
+    case Placement.set_env_overlay_with_firehose(
+           db,
+           p.host,
+           p.harness,
+           p.name,
+           p.value,
+           call.origin,
+           call
+         ) do
+      %{projection: projection, changed: changed} ->
+        %{
+          host_environment: StateResources.host_environment(projection),
+          changed: changed,
+          effect: "takes effect on next #{p.harness} adapter start on #{p.host}"
+        }
+
+      {:error, denial} ->
+        denial
+    end
+  end
+
+  defp harness_env_unset(db, call) do
+    p = call.params
+    result = Placement.unset_env_overlay_with_firehose(db, p.host, p.harness, p.name, call)
+
+    %{
+      host_environment: result.projection && StateResources.host_environment(result.projection),
+      changed: result.changed,
+      removed: result.changed
+    }
+  end
+
+  # A sentinel's settings live on the gateway's own host, in the sentinel's scope.
+  # Results carry names only, never values.
+  defp sentinel_env_target(config, params) do
+    host = Placement.local_host_name()
+
+    cond do
+      Map.get(params, :harness) != nil ->
+        {:error,
+         %{
+           code: "sentinel_scope_conflict",
+           message:
+             "sentinel_scope_conflict rule: --sentinel and --harness name different scopes; use one"
+         }}
+
+      Map.get(params, :host) not in [nil, host] ->
+        {:error,
+         %{
+           code: "sentinel_host_not_local",
+           message:
+             "sentinel_host_not_local rule: sentinels run on the gateway's host #{host}, " <>
+               "not #{params.host}"
+         }}
+
+      true ->
+        with {:ok, sentinel} <- Sentinels.resolve(config.base_dir, params.sentinel),
+             do: {:ok, sentinel, host}
+    end
+  end
+
+  defp sentinel_env_set(config, db, call) do
+    p = call.params
+
+    with {:ok, sentinel, host} <- sentinel_env_target(config, p),
+         {:ok, %{changed: changed}} <-
+           Placement.set_sentinel_env(
+             db,
+             host,
+             Sentinels.scope(sentinel.qualified),
+             p.name,
+             p.value,
+             call.origin,
+             call
+           ) do
+      %{
+        sentinel: sentinel.qualified,
+        host: host,
+        name: p.name,
+        changed: changed,
+        effect: "takes effect on next start of #{sentinel.qualified}"
+      }
+    else
+      {:error, denial} -> denial
+    end
+  end
+
+  defp sentinel_env_list(config, db, call) do
+    case sentinel_env_target(config, call.params) do
+      {:ok, sentinel, host} ->
+        %{
+          sentinel: sentinel.qualified,
+          host: host,
+          requires: sentinel.requires,
+          missing: Sentinels.missing_settings(db, host, sentinel),
+          settings:
+            db
+            |> Placement.env_overlays(host, Sentinels.scope(sentinel.qualified))
+            |> Enum.map(&%{name: &1.name, set_by: &1.set_by, set_at: &1.set_at})
+        }
+
+      {:error, denial} ->
+        denial
+    end
+  end
+
+  defp sentinel_env_unset(config, db, call) do
+    p = call.params
+
+    case sentinel_env_target(config, p) do
+      {:ok, sentinel, host} ->
+        removed =
+          Placement.unset_sentinel_env(
+            db,
+            host,
+            Sentinels.scope(sentinel.qualified),
+            p.name,
+            call
+          )
+
+        %{
+          sentinel: sentinel.qualified,
+          host: host,
+          name: p.name,
+          changed: removed,
+          removed: removed
+        }
+
+      {:error, denial} ->
+        denial
+    end
+  end
+
+  defp kungfu_setup_result(config, db, name) do
+    case Sentinels.setup(config.base_dir, db, Placement.local_host_name(), name) do
+      %{learned: true} = setup ->
+        Map.delete(setup, :learned)
+
+      %{learned: false} ->
+        %{
+          code: "kungfu_not_learned",
+          message: "kungfu_not_learned rule: #{name} is not learned; run: tightbeam learn #{name}"
+        }
+    end
+  end
+
+  # A learned bundle's result carries its setup computation, so the caller sees
+  # what remains before its sentinels run.
   defp identity_learn_result(config, db, call) do
+    case learn_result(config, db, call) do
+      %{state: state} = result when state in ["published", "already-learned"] ->
+        setup =
+          Sentinels.setup(config.base_dir, db, Placement.local_host_name(), call.params.name)
+
+        Map.put(result, :setup, Map.delete(setup, :learned))
+
+      result ->
+        result
+    end
+  end
+
+  defp learn_result(config, db, call) do
     case Identity.learn!(config.base_dir, call.params.name, call.origin) do
       {:ok, candidate} ->
         publish_identity_candidate(config, db, call, candidate, %{
@@ -3939,9 +4141,20 @@ defmodule Tightbeam.Gateway do
     name = call.params.name
     archetypes = Identity.bundle_archetype_names!(config.base_dir, name)
 
-    release_identity_unlearn(config, db, call, name, archetypes, fn ->
-      Identity.unlearn!(config.base_dir, name, call.origin)
-    end)
+    result =
+      release_identity_unlearn(config, db, call, name, archetypes, fn ->
+        Identity.unlearn!(config.base_dir, name, call.origin)
+      end)
+
+    case result do
+      %{state: "published"} ->
+        :ok = Sentinels.remove_bundle(db, Placement.local_host_name(), name)
+        :ok = SentinelSupervisor.reconcile()
+        result
+
+      result ->
+        result
+    end
   end
 
   defp release_identity_unlearn(config, db, call, name, archetypes, prepare) do

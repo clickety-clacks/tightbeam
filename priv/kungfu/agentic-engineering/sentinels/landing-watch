@@ -1,0 +1,848 @@
+#!/usr/bin/env python3
+"""Watch GitHub landings and file Tightbeam landing facts.
+
+Settings (environment):
+  GH_CONFIG_DIR             required; the gh config directory holding the login.
+  LANDING_REPOS             required; whitespace-separated entries
+                            <owner>/<repo>@<branch>=<owner role>,
+                            for example example/repo@main=pdo:example.
+  LANDING_WATCH_AS_PROCESS  optional; adds --as-process <value> to each
+                            tightbeam call.
+
+The program calls `gh` and `tightbeam` from PATH. It files `landing.settled`
+for pull requests and `landing.branch-attention` for branches with
+`tightbeam condition --key`, and wakes a branch's owner role when a required
+check fails on the branch tip. Keys make every filing replayable, so repeated
+polls and restarts file nothing new.
+
+Usage: landing-watch [--once]
+  --once  run one poll of every configured branch and exit; the exit status is
+          0 when every poll completed and its state was saved, 1 otherwise.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.parse
+
+STATE_VERSION = 1
+POLL_SECONDS = 60
+MAX_BACKOFF_SECONDS = 900
+OVERLAP = dt.timedelta(minutes=10)
+COLD_START = dt.timedelta(hours=24)
+WAKE_FALLBACK = "10m"
+GH_TIMEOUT = 120
+TIGHTBEAM_TIMEOUT = 60
+
+SETTLED = "landing.settled"
+BRANCH_ATTENTION = "landing.branch-attention"
+
+CHECK_RUN_FAILING = {"FAILURE", "CANCELLED", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED"}
+STATUS_FAILING = {"FAILURE", "ERROR"}
+STATUS_PENDING = {"PENDING", "EXPECTED"}
+
+EXIT_SETTINGS = 2
+EXIT_LOGIN = 3
+
+NAME = r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9_])?"
+ENTRY = re.compile(r"^(" + NAME + r")/(" + r"[A-Za-z0-9._-]+" + r")@([^\s=@]+)=(\S+)$")
+QUEUE_BRANCH = "gh-readonly-queue/"
+
+ROLLUP_NODES = """
+          __typename
+          ... on CheckRun {
+            id name status conclusion startedAt completedAt detailsUrl %(required)s
+            checkSuite { app { databaseId } }
+          }
+          ... on StatusContext {
+            id context state createdAt targetUrl %(required)s
+          }
+"""
+
+Q_OPEN = """
+query LandingOpen($owner: String!, $name: String!, $base: String!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequests(states: [OPEN], baseRefName: $base, first: 100, after: $cursor) {
+      pageInfo { hasNextPage endCursor }
+      nodes { number updatedAt }
+    }
+  }
+}
+"""
+
+Q_RECENT = """
+query LandingRecent($owner: String!, $name: String!, $base: String!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequests(baseRefName: $base, orderBy: {field: UPDATED_AT, direction: DESC},
+                 first: 100, after: $cursor) {
+      pageInfo { hasNextPage endCursor }
+      nodes { number updatedAt }
+    }
+  }
+}
+"""
+
+Q_PULL = """
+query LandingPull($owner: String!, $name: String!, $number: Int!, $since: DateTime, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      number state merged mergeCommit { oid } headRefOid
+      autoMergeRequest { enabledAt }
+      mergeQueueEntry { id }
+      timelineItems(itemTypes: [REMOVED_FROM_MERGE_QUEUE_EVENT, AUTO_MERGE_DISABLED_EVENT, CLOSED_EVENT],
+                    since: $since, first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          __typename
+          ... on RemovedFromMergeQueueEvent { id createdAt reason }
+          ... on AutoMergeDisabledEvent { id createdAt }
+          ... on ClosedEvent { id createdAt }
+        }
+      }
+    }
+  }
+}
+"""
+
+Q_PULL_CHECKS = """
+query LandingPullChecks($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      commits(last: 1) {
+        nodes {
+          commit {
+            oid
+            statusCheckRollup {
+              contexts(first: 100, after: $cursor) {
+                pageInfo { hasNextPage endCursor }
+                nodes {%s}
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+""" % (ROLLUP_NODES % {"required": "isRequired(pullRequestNumber: $number)"})
+
+Q_MERGE_CHECKS = """
+query LandingMergeChecks($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      potentialMergeCommit {
+        oid
+        parents(first: 2) { nodes { oid } }
+        statusCheckRollup {
+          contexts(first: 100, after: $cursor) {
+            pageInfo { hasNextPage endCursor }
+            nodes {%s}
+          }
+        }
+      }
+    }
+  }
+}
+""" % (ROLLUP_NODES % {"required": "isRequired(pullRequestNumber: $number)"})
+
+Q_TIP = """
+query LandingTip($owner: String!, $name: String!, $qualified: String!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    ref(qualifiedName: $qualified) {
+      target {
+        __typename
+        ... on Commit {
+          oid
+          statusCheckRollup {
+            contexts(first: 100, after: $cursor) {
+              pageInfo { hasNextPage endCursor }
+              nodes {%s}
+            }
+          }
+        }
+      }
+    }
+  }
+}
+""" % (ROLLUP_NODES % {"required": ""})
+
+
+class SettingsError(Exception):
+    pass
+
+
+class LoginError(Exception):
+    pass
+
+
+class ReadError(Exception):
+    """A GitHub read that did not return complete, usable data."""
+
+
+def now_utc() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+
+
+def iso(moment: dt.datetime) -> str:
+    return moment.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_time(text: str) -> dt.datetime:
+    return dt.datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
+
+
+class Branch:
+    def __init__(self, owner: str, repo: str, branch: str, role: str):
+        self.owner = owner
+        self.repo = repo
+        self.branch = branch
+        self.role = role
+
+    @property
+    def slug(self) -> str:
+        return f"{self.owner.lower()}/{self.repo.lower()}"
+
+    @property
+    def scope(self) -> str:
+        return f"{self.slug}@{self.branch}"
+
+    def pr_scope(self, number: int) -> str:
+        return f"{self.slug}#{number}"
+
+    @property
+    def state_name(self) -> str:
+        return f"{self.owner.lower()}-{self.repo.lower()}-{self.branch}".replace("/", "-") + ".json"
+
+
+def parse_settings(env) -> tuple[list[Branch], str | None]:
+    config_dir = env.get("GH_CONFIG_DIR", "")
+    if not config_dir.strip():
+        raise SettingsError("GH_CONFIG_DIR is required")
+    if not os.path.isdir(config_dir):
+        raise SettingsError("GH_CONFIG_DIR is not a directory")
+    entries = env.get("LANDING_REPOS", "").split()
+    if not entries:
+        raise SettingsError("LANDING_REPOS is required")
+    branches: list[Branch] = []
+    seen = set()
+    for entry in entries:
+        match = ENTRY.match(entry)
+        if not match:
+            raise SettingsError(f"LANDING_REPOS entry is malformed: {entry!r}")
+        owner, repo, branch, role = match.groups()
+        if branch.startswith(QUEUE_BRANCH) or branch.startswith("/") or branch.endswith("/"):
+            raise SettingsError(f"LANDING_REPOS entry names an unwatchable branch: {entry!r}")
+        watched = Branch(owner, repo, branch, role)
+        if watched.scope in seen:
+            raise SettingsError(f"LANDING_REPOS names {watched.scope} more than once")
+        seen.add(watched.scope)
+        branches.append(watched)
+    as_process = env.get("LANDING_WATCH_AS_PROCESS")
+    if as_process is not None and (not as_process.strip() or any(c.isspace() for c in as_process)):
+        raise SettingsError("LANDING_WATCH_AS_PROCESS is set but malformed")
+    return branches, as_process
+
+
+def state_dir(env) -> str:
+    base = env.get("XDG_STATE_HOME") or os.path.join(env.get("HOME", ""), ".local", "state")
+    return os.path.join(base, "landing-watch")
+
+
+class Runner:
+    """Runs gh and tightbeam. Tests replace it with a fake."""
+
+    def __init__(self, as_process: str | None):
+        self.as_process = as_process
+
+    def _gh(self, args: list[str]) -> str:
+        try:
+            done = subprocess.run(
+                ["gh", *args],
+                capture_output=True,
+                text=True,
+                timeout=GH_TIMEOUT,
+                env={**os.environ, "GH_PROMPT_DISABLED": "1", "GH_NO_UPDATE_NOTIFIER": "1"},
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise ReadError(f"gh failed: {error}") from error
+        if done.returncode != 0:
+            raise ReadError(f"gh exited {done.returncode}: {one_line(done.stderr or done.stdout)}")
+        return done.stdout
+
+    def login(self) -> str:
+        try:
+            return self._gh(["api", "user", "--jq", ".login"]).strip()
+        except ReadError as error:
+            text = str(error)
+            if re.search(r"HTTP 401|Bad credentials|not logged in|gh auth login", text):
+                raise LoginError(text) from error
+            raise
+
+    def graphql(self, query: str, variables: dict) -> dict:
+        args = ["api", "graphql", "-f", f"query={query}"]
+        for key, value in variables.items():
+            if value is None:
+                continue
+            flag = "-F" if isinstance(value, int) else "-f"
+            args += [flag, f"{key}={value}"]
+        try:
+            body = json.loads(self._gh(args))
+        except json.JSONDecodeError as error:
+            raise ReadError(f"gh returned malformed JSON: {error}") from error
+        if not isinstance(body, dict) or body.get("errors") or not isinstance(body.get("data"), dict):
+            raise ReadError(f"graphql response incomplete: {one_line(json.dumps(body.get('errors') if isinstance(body, dict) else body))}")
+        return body["data"]
+
+    def rest(self, path: str):
+        try:
+            return json.loads(self._gh(["api", path]))
+        except json.JSONDecodeError as error:
+            raise ReadError(f"gh returned malformed JSON: {error}") from error
+
+    def tightbeam(self, args: list[str]) -> tuple[bool, str]:
+        argv = ["tightbeam", *args]
+        if self.as_process:
+            argv += ["--as-process", self.as_process]
+        try:
+            done = subprocess.run(argv, capture_output=True, text=True, timeout=TIGHTBEAM_TIMEOUT)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            return False, str(error)
+        return done.returncode == 0, one_line(done.stderr if done.returncode else done.stdout)
+
+
+def one_line(text: str) -> str:
+    return " ".join((text or "").split())[:500]
+
+
+def dig(data, *path):
+    """Walk required objects; a missing or null object is an incomplete read."""
+    node = data
+    for key in path:
+        if not isinstance(node, dict) or node.get(key) is None:
+            raise ReadError("null node at " + ".".join(path))
+        node = node[key]
+    return node
+
+
+def page_info(connection) -> tuple[bool, str | None]:
+    info = connection.get("pageInfo") if isinstance(connection, dict) else None
+    if not isinstance(info, dict) or not isinstance(connection.get("nodes"), list):
+        raise ReadError("connection without pageInfo or nodes")
+    more = bool(info.get("hasNextPage"))
+    cursor = info.get("endCursor")
+    if more and not cursor:
+        raise ReadError("page claims more results without a cursor")
+    return more, cursor
+
+
+def failing(result: dict) -> bool:
+    if result["__typename"] == "CheckRun":
+        return result.get("status") == "COMPLETED" and result.get("conclusion") in CHECK_RUN_FAILING
+    return result.get("state") in STATUS_FAILING
+
+
+def pending(result: dict) -> bool:
+    if result["__typename"] == "CheckRun":
+        return result.get("status") != "COMPLETED" or not result.get("conclusion")
+    return result.get("state") in STATUS_PENDING or not result.get("state")
+
+
+def context_name(result: dict) -> str | None:
+    return result.get("name") if result["__typename"] == "CheckRun" else result.get("context")
+
+
+def check_identity(result: dict) -> str:
+    if result["__typename"] == "CheckRun":
+        return result["id"]
+    return f"{result['context']}@{result['createdAt']}"
+
+
+def result_time(result: dict) -> str:
+    if result["__typename"] == "CheckRun":
+        return result.get("startedAt") or result.get("completedAt") or ""
+    return result.get("createdAt") or ""
+
+
+def result_link(result: dict) -> str:
+    return (result.get("detailsUrl") if result["__typename"] == "CheckRun" else result.get("targetUrl")) or "none"
+
+
+def latest_failure(results: list[dict]) -> dict | None:
+    """The latest result decides a requirement; missing or pending is unknown.
+
+    A pending result, such as a re-run that has not started, is treated as the
+    latest one, since it can lack the timestamp that would order it.
+    """
+    if not results or any(pending(r) for r in results):
+        return None
+    latest = max(results, key=lambda r: (result_time(r), check_identity(r)))
+    return latest if failing(latest) else None
+
+
+def blocked_candidate(pull: dict) -> bool:
+    auto = pull.get("autoMergeRequest")
+    return (
+        pull.get("merged") is False
+        and pull.get("state") == "OPEN"
+        and isinstance(auto, dict)
+        and bool(auto.get("enabledAt"))
+        and pull.get("mergeQueueEntry") is None
+    )
+
+
+def rollup_results(nodes: list) -> list[dict]:
+    results = []
+    for node in nodes:
+        if not isinstance(node, dict) or node.get("__typename") not in ("CheckRun", "StatusContext"):
+            continue
+        if context_name(node) is None:
+            continue
+        results.append(node)
+    return results
+
+
+def source_of(result: dict):
+    """The App ID of a check run, or None when the API cannot establish it."""
+    if result["__typename"] != "CheckRun":
+        return None
+    app = (result.get("checkSuite") or {}).get("app") or {}
+    return app.get("databaseId")
+
+
+def tip_failures(requirements: list[dict], results: list[dict]) -> list[dict]:
+    """Failing required checks on a tip, matched by context and configured source."""
+    failures = []
+    seen = set()
+    for requirement in requirements:
+        context = requirement["context"]
+        integration = requirement.get("integration_id")
+        named = [r for r in results if context_name(r) == context]
+        if integration is None:
+            matching = named
+        else:
+            if any(source_of(r) is None for r in named):
+                continue  # A same-name result of unknown source could be the required one.
+            matching = [r for r in named if source_of(r) == integration]
+        # GitHub requires both a check run and a commit status to pass when
+        # they share a required name. A newer success of one kind cannot hide
+        # a failure of the other kind.
+        for kind in ("CheckRun", "StatusContext"):
+            failure = latest_failure([r for r in matching if r["__typename"] == kind])
+            if failure and check_identity(failure) not in seen:
+                seen.add(check_identity(failure))
+                failures.append(failure)
+    return failures
+
+
+def pr_failures(results: list[dict]) -> list[dict]:
+    """Failing required checks on GitHub's effective pull request subject."""
+    required = [r for r in results if r.get("isRequired") is True]
+    # A check run and a commit status with the same name are separate checks:
+    # GitHub requires both to pass when that name is required.
+    names = sorted({(r["__typename"], context_name(r)) for r in required})
+    failures = []
+    for kind, name in names:
+        failure = latest_failure(
+            [r for r in required if r["__typename"] == kind and context_name(r) == name]
+        )
+        if failure:
+            failures.append(failure)
+    return failures
+
+
+class Log:
+    def __init__(self, stream=sys.stderr):
+        self.stream = stream
+        self.episodes: set[str] = set()
+
+    def line(self, text: str) -> None:
+        print(f"{iso(now_utc())} {text}", file=self.stream, flush=True)
+
+    def episode(self, key: str, text: str) -> None:
+        if key not in self.episodes:
+            self.episodes.add(key)
+            self.line(text)
+
+
+class Watcher:
+    def __init__(self, branch: Branch, runner, directory: str, log: Log, clock=now_utc):
+        self.branch = branch
+        self.runner = runner
+        self.directory = directory
+        self.log = log
+        self.clock = clock
+        self.path = os.path.join(directory, branch.state_name)
+
+    # State
+
+    def load(self) -> tuple[dt.datetime, set[int]]:
+        try:
+            with open(self.path, encoding="utf-8") as handle:
+                data = json.load(handle)
+        except FileNotFoundError:
+            return self.clock() - COLD_START, set()
+        except (OSError, json.JSONDecodeError) as error:
+            raise SettingsError(f"state file {self.path} is unreadable: {error}") from error
+        try:
+            if data["version"] != STATE_VERSION:
+                raise ValueError("unknown version")
+            tracked = data["tracked"]
+            if not isinstance(tracked, list) or not all(isinstance(n, int) for n in tracked):
+                raise ValueError("tracked must be a list of numbers")
+            return parse_time(data["watermark"]), set(tracked)
+        except (KeyError, TypeError, ValueError) as error:
+            raise SettingsError(f"state file {self.path} is malformed: {error}") from error
+
+    def save(self, watermark: dt.datetime, tracked: set[int]) -> None:
+        os.makedirs(self.directory, exist_ok=True)
+        body = json.dumps({"version": STATE_VERSION, "watermark": iso(watermark), "tracked": sorted(tracked)})
+        handle, temporary = tempfile.mkstemp(dir=self.directory, prefix=".landing-watch-")
+        try:
+            with os.fdopen(handle, "w", encoding="utf-8") as stream:
+                stream.write(body + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self.path)
+        except BaseException:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            raise
+
+    # Reads
+
+    def _repo_vars(self) -> dict:
+        return {"owner": self.branch.owner, "name": self.branch.repo}
+
+    def list_pulls(self, query: str, stop_before: dt.datetime | None) -> list[int]:
+        numbers: list[int] = []
+        cursor = None
+        while True:
+            data = self.runner.graphql(query, {**self._repo_vars(), "base": self.branch.branch, "cursor": cursor})
+            connection = dig(data, "repository", "pullRequests")
+            more, cursor = page_info(connection)
+            reached = False
+            for node in connection["nodes"]:
+                if not isinstance(node, dict) or not isinstance(node.get("number"), int):
+                    raise ReadError("pull request list returned a null node")
+                if stop_before is not None and parse_time(node["updatedAt"]) < stop_before:
+                    reached = True
+                    break
+                numbers.append(node["number"])
+            if not more or reached:
+                return numbers
+
+    def read_pull(self, number: int, since: dt.datetime | None, pull: dict) -> None:
+        """Fill `pull` as far as reads succeed; raise ReadError when incomplete."""
+        cursor = None
+        events: list[dict] = pull.setdefault("events", [])
+        while True:
+            variables = {**self._repo_vars(), "number": number, "since": iso(since) if since else None, "cursor": cursor}
+            node = dig(self.runner.graphql(Q_PULL, variables), "repository", "pullRequest")
+            if "state" not in pull:
+                for field in ("state", "merged", "mergeCommit", "headRefOid", "autoMergeRequest", "mergeQueueEntry"):
+                    pull[field] = node.get(field)
+            connection = node.get("timelineItems")
+            if connection is None:
+                raise ReadError(f"pull request {number} timeline is null")
+            more, cursor = page_info(connection)
+            for event in connection["nodes"]:
+                if not isinstance(event, dict) or not event.get("id"):
+                    raise ReadError(f"pull request {number} timeline returned a null node")
+                events.append(event)
+            if not more:
+                return
+
+    def read_pull_checks(self, number: int, head: str) -> list[dict] | None:
+        """Use test-merge statuses when present; otherwise use head statuses.
+
+        A missing or stale test merge is unknown, never evidence of a blocked PR.
+        """
+        cursor = None
+        oid = None
+        head_results: list[dict] = []
+        while True:
+            data = self.runner.graphql(Q_PULL_CHECKS, {**self._repo_vars(), "number": number, "cursor": cursor})
+            commits = dig(data, "repository", "pullRequest", "commits").get("nodes")
+            if not commits:
+                return None
+            commit = dig(commits[0], "commit")
+            if oid is not None and commit.get("oid") != oid:
+                raise ReadError(f"pull request {number} head moved while reading checks")
+            oid = commit.get("oid")
+            if oid != head:
+                return None
+            rollup = commit.get("statusCheckRollup")
+            if rollup is None:
+                break
+            connection = rollup.get("contexts")
+            more, cursor = page_info(connection)
+            head_results += rollup_results(connection["nodes"])
+            if not more:
+                break
+
+        cursor = None
+        merge_oid = None
+        merge_results: list[dict] = []
+        while True:
+            data = self.runner.graphql(Q_MERGE_CHECKS, {**self._repo_vars(), "number": number, "cursor": cursor})
+            merge = dig(data, "repository", "pullRequest").get("potentialMergeCommit")
+            if merge is None or not merge.get("oid"):
+                return None
+            if merge_oid is not None and merge["oid"] != merge_oid:
+                raise ReadError(f"pull request {number} test merge moved while reading checks")
+            merge_oid = merge["oid"]
+            parents = dig(merge, "parents").get("nodes")
+            if not isinstance(parents, list) or head not in [
+                parent.get("oid") for parent in parents if isinstance(parent, dict)
+            ]:
+                return None
+            rollup = merge.get("statusCheckRollup")
+            if rollup is None:
+                return head_results
+            connection = rollup.get("contexts")
+            more, cursor = page_info(connection)
+            merge_results += rollup_results(connection["nodes"])
+            if not more:
+                return merge_results if merge_results else head_results
+
+    def read_tip(self) -> tuple[str, list[dict]]:
+        cursor = None
+        oid = None
+        results: list[dict] = []
+        while True:
+            variables = {**self._repo_vars(), "qualified": f"refs/heads/{self.branch.branch}", "cursor": cursor}
+            target = dig(self.runner.graphql(Q_TIP, variables), "repository", "ref", "target")
+            if target.get("__typename") != "Commit" or not target.get("oid"):
+                raise ReadError("branch tip is not a commit")
+            if oid is not None and target["oid"] != oid:
+                raise ReadError("branch tip moved while reading checks")
+            oid = target["oid"]
+            rollup = target.get("statusCheckRollup")
+            if rollup is None:
+                return oid, []
+            connection = rollup.get("contexts")
+            more, cursor = page_info(connection)
+            results += rollup_results(connection["nodes"])
+            if not more:
+                return oid, results
+
+    def read_requirements(self) -> list[dict]:
+        branch = urllib.parse.quote(self.branch.branch, safe="/")
+        requirements: list[dict] = []
+        page = 1
+        while True:
+            rules = self.runner.rest(
+                f"repos/{self.branch.owner}/{self.branch.repo}/rules/branches/{branch}?per_page=100&page={page}"
+            )
+            if not isinstance(rules, list):
+                raise ReadError("branch rules response is not a list")
+            for rule in rules:
+                if not isinstance(rule, dict) or rule.get("type") != "required_status_checks":
+                    continue
+                checks = (rule.get("parameters") or {}).get("required_status_checks")
+                if not isinstance(checks, list):
+                    raise ReadError("required_status_checks rule without its checks")
+                for check in checks:
+                    if not isinstance(check, dict) or not isinstance(check.get("context"), str):
+                        raise ReadError("required status check without a context")
+                    requirements.append({"context": check["context"], "integration_id": check.get("integration_id")})
+            if len(rules) < 100:
+                return requirements
+            page += 1
+
+    # Filing
+
+    def condition(self, kind: str, scope: str, key: str) -> bool:
+        ok, detail = self.runner.tightbeam(["condition", "--kind", kind, "--scope", scope, "--key", key])
+        if not ok:
+            self.log.line(f"refused fact key={key} reason={detail}")
+        return ok
+
+    def wake(self, key: str, prompt: str) -> bool:
+        ok, detail = self.runner.tightbeam(
+            [
+                "wake",
+                "--role", self.branch.role,
+                "--when-fact", BRANCH_ATTENTION,
+                "--when-scope", self.branch.scope,
+                "--fallback-after", WAKE_FALLBACK,
+                "--key", key,
+                "--prompt", prompt,
+            ]
+        )
+        if not ok:
+            self.log.line(f"refused wake key={key} reason={detail}")
+        return ok
+
+    # Poll
+
+    def poll(self) -> bool:
+        """One poll. Returns True when it completed and its state was saved."""
+        started = self.clock()
+        watermark, tracked = self.load()
+        horizon = watermark - OVERLAP
+        pulls: dict[int, dict] = {}
+        complete = True
+        open_numbers: set[int] = set()
+        tip = None
+        try:
+            open_numbers = set(self.list_pulls(Q_OPEN, None))
+            candidates = sorted(open_numbers | tracked)
+            candidates += [n for n in self.list_pulls(Q_RECENT, horizon) if n not in candidates]
+            for number in candidates:
+                pull: dict = {}
+                pulls[number] = pull
+                try:
+                    self.read_pull(number, horizon if number in tracked else None, pull)
+                    if blocked_candidate(pull):
+                        pull["checks"] = self.read_pull_checks(number, pull["headRefOid"])
+                except ReadError as error:
+                    # One unreadable pull request must not withhold another's merge.
+                    complete = False
+                    self.log.line(f"poll failed branch={self.branch.scope} pr={number} reason={error}")
+            requirements = self.read_requirements()
+            tip = self.read_tip() + (requirements,)
+        except ReadError as error:
+            complete = False
+            self.log.line(f"poll failed branch={self.branch.scope} reason={error}")
+
+        # Every read finished before any fact that depends on absence is filed.
+        accepted = True
+        for number, pull in pulls.items():
+            accepted &= self.file_positive(number, pull)
+        if complete:
+            for number, pull in pulls.items():
+                accepted &= self.file_absence(number, pull)
+            accepted &= self.file_tip(*tip)
+        if not (complete and accepted):
+            return False
+        still_open = {n for n in open_numbers if pulls.get(n, {}).get("state") == "OPEN"}
+        self.save(started, still_open)
+        return True
+
+    def file_positive(self, number: int, pull: dict) -> bool:
+        scope = self.branch.pr_scope(number)
+        ok = True
+        merge = pull.get("mergeCommit") or {}
+        if pull.get("merged") is True and merge.get("oid"):
+            key = f"landing-fact:{scope}:merged:{merge['oid']}"
+            self.log.episode(key, f"episode merged pr={scope} commit={merge['oid']}")
+            ok &= self.condition(SETTLED, scope, key)
+        for event in pull.get("events", []):
+            if event.get("__typename") == "RemovedFromMergeQueueEvent":
+                key = f"landing-fact:{scope}:removed:{event['id']}"
+                reason = event.get("reason") or "unspecified"
+                self.log.episode(key, f"episode removed pr={scope} event={event['id']} reason={reason}")
+                ok &= self.condition(SETTLED, scope, key)
+        return ok
+
+    def file_absence(self, number: int, pull: dict) -> bool:
+        scope = self.branch.pr_scope(number)
+        if pull.get("merged") is not False:
+            return True
+        ok = True
+        for event in pull.get("events", []):
+            kind = event.get("__typename")
+            if kind == "AutoMergeDisabledEvent":
+                key = f"landing-fact:{scope}:automerge-disabled:{event['id']}"
+                self.log.episode(key, f"episode automerge-disabled pr={scope} event={event['id']}")
+                ok &= self.condition(SETTLED, scope, key)
+            elif kind == "ClosedEvent":
+                key = f"landing-fact:{scope}:closed:{event['id']}"
+                self.log.episode(key, f"episode closed pr={scope} event={event['id']}")
+                ok &= self.condition(SETTLED, scope, key)
+        if blocked_candidate(pull):
+            auto = pull["autoMergeRequest"]
+            results = pull["checks"]
+            if results is None:
+                return ok  # The effective subject is unknown.
+            for failure in pr_failures(results):
+                identity = check_identity(failure)
+                key = f"landing-fact:{scope}:blocked:{auto['enabledAt']}:{identity}"
+                self.log.episode(
+                    key,
+                    f"episode blocked pr={scope} head={pull['headRefOid']} check={context_name(failure)} identity={identity}",
+                )
+                ok &= self.condition(SETTLED, scope, key)
+        return ok
+
+    def file_tip(self, oid: str, results: list[dict], requirements: list[dict]) -> bool:
+        scope = self.branch.scope
+        ok = True
+        for failure in tip_failures(requirements, results):
+            identity = check_identity(failure)
+            episode = f"{scope}:red:{oid}:{identity}"
+            name = context_name(failure)
+            link = result_link(failure)
+            self.log.episode(episode, f"episode tip-red branch={scope} tip={oid} check={name} identity={identity}")
+            prompt = (
+                f"Branch {scope} is red: required check {name} failed on tip {oid}. "
+                f"Run: {link}"
+            )
+            # The wake subscribes before its fact is filed, so the fact fires it.
+            if not self.wake(f"landing-wake:{episode}", prompt):
+                ok = False
+                continue
+            ok &= self.condition(BRANCH_ATTENTION, scope, f"landing-fact:{episode}")
+        return ok
+
+
+def run(argv, env, runner=None, log=None, sleep=time.sleep) -> int:
+    log = log or Log()
+    once = "--once" in argv[1:]
+    unknown = [a for a in argv[1:] if a != "--once"]
+    if unknown:
+        log.line(f"exit reason=unknown arguments {' '.join(unknown)}")
+        return EXIT_SETTINGS
+    try:
+        branches, as_process = parse_settings(env)
+    except SettingsError as error:
+        log.line(f"exit reason={error}")
+        return EXIT_SETTINGS
+    runner = runner or Runner(as_process)
+    directory = state_dir(env)
+    watchers = [Watcher(branch, runner, directory, log) for branch in branches]
+    try:
+        for watcher in watchers:
+            watcher.load()
+    except SettingsError as error:
+        log.line(f"exit reason={error}")
+        return EXIT_SETTINGS
+    try:
+        login = runner.login()
+        log.line(f"start login={login} branches={' '.join(b.scope for b in branches)}")
+    except LoginError as error:
+        log.line(f"exit reason=gh cannot read GitHub with the configured login: {error}")
+        return EXIT_LOGIN
+    except ReadError as error:
+        log.line(f"poll failed reason=login check: {error}")
+
+    failures = 0
+    while True:
+        complete = True
+        for watcher in watchers:
+            try:
+                complete &= watcher.poll()
+            except SettingsError as error:
+                log.line(f"exit reason={error}")
+                return EXIT_SETTINGS
+            except OSError as error:
+                complete = False
+                log.line(f"poll failed branch={watcher.branch.scope} reason=state write: {error}")
+        if once:
+            return 0 if complete else 1
+        failures = 0 if complete else failures + 1
+        sleep(min(POLL_SECONDS * (2 ** failures), MAX_BACKOFF_SECONDS))
+
+
+if __name__ == "__main__":
+    sys.exit(run(sys.argv, os.environ))
