@@ -97,6 +97,7 @@ defmodule Tightbeam.Gateway do
     StateResources,
     SubagentMarkers,
     Supervision,
+    TerminalCredentialFailure,
     Unroutable,
     Wakes,
     WorkItems,
@@ -161,6 +162,7 @@ defmodule Tightbeam.Gateway do
 
     :ok = Schema.ensure_all(db)
     :ok = AdminProjection.bootstrap_served(db, config.base_dir)
+    :ok = TerminalCredentialFailure.reconcile_all(db)
 
     :ok = Assignments.audit_review_item_conflicts(db)
 
@@ -6166,9 +6168,10 @@ defmodule Tightbeam.Gateway do
          harness
        ) do
     result =
-      Enum.reduce_while(archetype.where, [], fn host, failures ->
+      Enum.reduce_while(archetype.where, %{failures: [], incidents: []}, fn host, acc ->
         candidate =
           with {:ok, ^host} <- Placement.resolve(archetype, host, hosts),
+               nil <- TerminalCredentialFailure.get_open(db, host, harness),
                model = spawn_model_selection(host, harness, p, default_model),
                :ok <- validate_credential(config, harness, host, model),
                {:ok, routed} <- route_spawn_candidate(host, harness, model),
@@ -6180,17 +6183,37 @@ defmodule Tightbeam.Gateway do
                    spinup_opts(config, db, harness, host, model)
                  ) do
             {:ok, %{host: host, model: model, routed: routed}}
+          else
+            %{} = open_incident ->
+              {:error,
+               %{
+                 code: "terminal_credential_failure",
+                 message: "catalog suppressed by incident #{open_incident.id}",
+                 incident: open_incident
+               }}
+
+            other ->
+              other
           end
 
         case candidate do
           {:ok, placement} ->
-            {:halt, {:ok, placement}}
+            {:halt,
+             {:ok, Map.put(placement, :terminal_redirect_incidents, Enum.reverse(acc.incidents))}}
 
           {:error, %Unroutable{} = unroutable} ->
-            {:cont, [{host, {:error, routing_error(unroutable)}} | failures]}
+            {:cont,
+             %{acc | failures: [{host, {:error, routing_error(unroutable)}} | acc.failures]}}
+
+          {:error, %{incident: open_incident} = denial} ->
+            {:cont,
+             %{
+               failures: [{host, {:error, Map.delete(denial, :incident)}} | acc.failures],
+               incidents: [open_incident.id | acc.incidents]
+             }}
 
           {:error, denial} ->
-            {:cont, [{host, {:error, denial}} | failures]}
+            {:cont, %{acc | failures: [{host, {:error, denial}} | acc.failures]}}
         end
       end)
 
@@ -6198,7 +6221,7 @@ defmodule Tightbeam.Gateway do
       {:ok, placement} ->
         {:ok, placement}
 
-      failures when is_list(failures) ->
+      %{failures: failures} ->
         causes =
           failures
           |> Enum.reverse()
@@ -6246,7 +6269,8 @@ defmodule Tightbeam.Gateway do
         %{host: ^host} ->
           model = spawn_model_selection(host, harness_string, p, default_model)
 
-          with :ok <- validate_credential(config, harness_string, host, model),
+          with nil <- TerminalCredentialFailure.get_open(db, host, harness_string),
+               :ok <- validate_credential(config, harness_string, host, model),
                {:ok, routed} <-
                  validate_catalog_model(host, harness_string, model, from_default?(p)),
                :ok <-
@@ -6255,8 +6279,19 @@ defmodule Tightbeam.Gateway do
                    harness_atom,
                    host,
                    spinup_opts(config, db, harness_string, host, model)
-                 ),
-               do: {:ok, {model, routed}}
+                 ) do
+            {:ok, {model, routed}}
+          else
+            %{id: incident_id} ->
+              {:error,
+               %{
+                 code: "terminal_credential_failure",
+                 message: "catalog suppressed by incident #{incident_id}"
+               }}
+
+            other ->
+              other
+          end
       end
 
     # Placement resolved the host FIRST, so the ref is judged against the account
@@ -6313,6 +6348,18 @@ defmodule Tightbeam.Gateway do
                     idempotency_key: p.idempotency_key,
                     session_key: session.session_key
                   })
+
+                  Enum.each(
+                    Map.get(placement, :terminal_redirect_incidents, []),
+                    fn incident_id ->
+                      TerminalCredentialFailure.record_redirect_in_txn(
+                        txn,
+                        incident_id,
+                        "spawn:" <> caller.owner_user_id <> ":" <> p.idempotency_key,
+                        session.host
+                      )
+                    end
+                  )
 
                   {:created, session}
                 end
