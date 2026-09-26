@@ -329,6 +329,86 @@ defmodule Tightbeam.StaleTurnSettlementTest do
     refute_receive {:terminal_published, %{session_key: "k1"}}
   end
 
+  for order <- [:follower_first, :holder_first] do
+    @reservation_order order
+    test "same-request settlement follower serializes: #{order}", ctx do
+      target = stale_turn!(ctx.db, "k1", "reserved settlement", 44)
+      request = request!("k1", target, "cancel", "same request", "reserved-replay")
+      {:ok, lane, token} = LaneManager.ensure_settlement_lane(Tightbeam.LaneManager, "k1")
+      assert is_reference(token)
+      assert {:ok, ^lane, nil} = LaneManager.ensure_settlement_lane(Tightbeam.LaneManager, "k1")
+      assert :sys.get_state(lane).reservation_token == token
+
+      {winner, follower} =
+        case @reservation_order do
+          :follower_first ->
+            pending = :gen_server.send_request(lane, {:settle_stale, nil, request})
+            # Same sender's state call is behind its settlement call in the lane
+            # mailbox: this proves admission before allowing the holder to send.
+            assert length(:sys.get_state(lane).settlement_waiters) == 1
+            assert :sys.get_state(lane).reservation_token == token
+            winner = Tightbeam.SessionLane.settle_stale(lane, token, request)
+            assert {:reply, follower} = :gen_server.wait_response(pending, 5_000)
+            {winner, follower}
+
+          :holder_first ->
+            winner = Tightbeam.SessionLane.settle_stale(lane, token, request)
+            assert :sys.get_state(lane).reservation_token == nil
+            {winner, Tightbeam.SessionLane.settle_stale(lane, nil, request)}
+        end
+
+      assert {:ok, %{won: true, replayed: false, status: "canceled"}} = winner
+      assert {:ok, %{won: false, replayed: true, status: "canceled"}} = follower
+      assert terminal_truth(ctx.db, target) == {"canceled", nil, 1, 1}
+      assert :sys.get_state(lane).settlement_waiters == []
+      assert_receive {:terminal_published, %{session_key: "k1", status: "canceled"}}
+      assert_receive {:terminal_callback, "k1", ^target}
+      # Both completed calls and the state barrier precede this mailbox check.
+      refute_received {:terminal_published, _}
+      refute_received {:terminal_callback, _, _}
+    end
+  end
+
+  test "reserved followers preserve conflict and wrong-token fencing", ctx do
+    target = stale_turn!(ctx.db, "k1", "reserved conflict", 44)
+    request = request!("k1", target, "cancel", "winner", "reserved-key")
+    conflict = %{request | reason: "conflicting reason"}
+    {:ok, lane, token} = LaneManager.ensure_settlement_lane(Tightbeam.LaneManager, "k1")
+    pending = :gen_server.send_request(lane, {:settle_stale, nil, conflict})
+    assert length(:sys.get_state(lane).settlement_waiters) == 1
+    assert {:error, %{code: "turn_status_ambiguous"}} =
+             Tightbeam.SessionLane.settle_stale(lane, make_ref(), request)
+    assert :sys.get_state(lane).reservation_token == token
+    assert {:ok, %{won: true}} = Tightbeam.SessionLane.settle_stale(lane, token, request)
+    assert {:reply, {:error, %{code: "idempotency_key_conflict"}}} =
+             :gen_server.wait_response(pending, 5_000)
+    assert {:error, %{code: "turn_status_ambiguous"}} =
+             Tightbeam.SessionLane.settle_stale(lane, token, request)
+    assert terminal_truth(ctx.db, target) == {"canceled", nil, 1, 1}
+  end
+
+  test "reservation owner death refuses waiting followers without settling", ctx do
+    target = stale_turn!(ctx.db, "k1", "abandoned reservation", 44)
+    request = request!("k1", target, "cancel", "abandoned", "abandoned-key")
+    parent = self()
+    owner = spawn(fn ->
+      reservation = LaneManager.ensure_settlement_lane(Tightbeam.LaneManager, "k1")
+      send(parent, {:reservation, reservation})
+      receive do :finish -> :ok end
+    end)
+    assert_receive {:reservation, {:ok, lane, token}}
+    pending = :gen_server.send_request(lane, {:settle_stale, nil, request})
+    assert length(:sys.get_state(lane).settlement_waiters) == 1
+    send(owner, :finish)
+    assert {:reply, {:error, %{code: "turn_status_ambiguous"}}} =
+             :gen_server.wait_response(pending, 5_000)
+    assert :sys.get_state(lane).reservation_token == nil
+    assert {:error, %{code: "turn_status_ambiguous"}} =
+             Tightbeam.SessionLane.settle_stale(lane, token, request)
+    assert terminal_truth(ctx.db, target) == {"running", nil, 0, 0}
+    refute_received {:terminal_published, _}
+  end
+
   test "a commit with a lost response is published and its successor drained by reconciliation",
        ctx do
     target = stale_turn!(ctx.db, "k1", "lost response", 45)

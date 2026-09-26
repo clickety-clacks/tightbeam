@@ -35,6 +35,9 @@ defmodule Tightbeam.SessionLane do
     current_message_id: nil,
     current_owner_lease: nil,
     reservation_token: nil,
+    reservation_owner_ref: nil,
+    settlement_waiters: [],
+    settlement_rechecking: false,
     deferred_drain: false
   ]
 
@@ -181,7 +184,9 @@ defmodule Tightbeam.SessionLane do
 
     token = Keyword.get(opts, :settlement_reservation)
     if is_nil(token), do: send(self(), :nudge)
-    {:ok, %{state | reservation_token: token}}
+    owner = Keyword.get(opts, :settlement_owner)
+    owner_ref = if not is_nil(token) and is_pid(owner), do: Process.monitor(owner)
+    {:ok, %{state | reservation_token: token, reservation_owner_ref: owner_ref}}
   end
 
   @impl true
@@ -336,6 +341,17 @@ defmodule Tightbeam.SessionLane do
 
   def handle_call({:at_turn_boundary, fun}, _from, state), do: {:reply, {:ok, fun.()}, state}
 
+  # A nil follower does not own the reservation. Keep its call pending so the
+  # rightful holder can enter the mailbox, then re-evaluate against its result.
+  def handle_call(
+        {:settle_stale, nil, request},
+        from,
+        %{reservation_token: token} = state
+      )
+      when not is_nil(token) do
+    {:noreply, %{state | settlement_waiters: [{from, request} | state.settlement_waiters]}}
+  end
+
   def handle_call(
         {:settle_stale, reservation_token, _request},
         _from,
@@ -420,6 +436,14 @@ defmodule Tightbeam.SessionLane do
     {:noreply, maybe_start(%{state | task_ref: nil})}
   end
 
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{reservation_owner_ref: ref} = state)
+      when not is_nil(ref) do
+    # An abandoned reservation cannot confer settlement authority on followers.
+    Enum.each(state.settlement_waiters, fn {from, _request} -> GenServer.reply(from, ambiguous()) end)
+    state = %{state | settlement_waiters: []}
+    {:noreply, state |> release_reservation(state.reservation_token) |> maybe_start()}
+  end
+
   def handle_info(_msg, state), do: {:noreply, state}
 
   ## Internals
@@ -470,6 +494,8 @@ defmodule Tightbeam.SessionLane do
 
     {:error, %{reason: :task_crash, record_in_txn: record, after_commit: committed}}
   end
+
+  defp maybe_start(%{settlement_rechecking: true} = state), do: state
 
   defp maybe_start(%{reservation_token: token} = state) when not is_nil(token), do: state
 
@@ -733,8 +759,21 @@ defmodule Tightbeam.SessionLane do
   defp release_reservation(%{reservation_token: nil} = state, nil), do: state
 
   defp release_reservation(%{reservation_token: token} = state, token)
-       when not is_nil(token),
-       do: %{state | reservation_token: nil, deferred_drain: false}
+       when not is_nil(token) do
+    if state.reservation_owner_ref, do: Process.demonitor(state.reservation_owner_ref, [:flush])
+    waiters = Enum.reverse(state.settlement_waiters)
+    state = %{state | reservation_token: nil, reservation_owner_ref: nil,
+                     settlement_waiters: [], settlement_rechecking: true, deferred_drain: false}
+
+    # Use the ordinary admission and settlement checks; a conflicting or live
+    # request must retain its refusal rather than inherit the holder's success.
+    Enum.reduce(waiters, state, fn {from, request}, acc ->
+      {:reply, result, next} = handle_call({:settle_stale, nil, request}, from, acc)
+      GenServer.reply(from, result)
+      next
+    end)
+    |> Map.put(:settlement_rechecking, false)
+  end
 
   defp release_reservation(state, _token), do: state
 
