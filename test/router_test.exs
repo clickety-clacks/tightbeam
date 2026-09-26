@@ -2078,6 +2078,57 @@ defmodule Tightbeam.Wire.RouterTest do
     assert missing_assignment.status == 404
   end
 
+  test "breathing rejects volunteered top-level targets and queries its params target", ctx do
+    target = create_session(ctx.db, "breathing-router-target", "flynn")
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO turns (sessionKey,messageId,origin,prompt,status,adapterGen,createdAt,startedAt) VALUES (?1,'m_breathing_router','user:flynn','work','running',4,10,11)",
+        [target.session_key]
+      )
+
+    ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, observed_real_handlers(ctx))}
+
+    params = %{targetKind: "session", targetId: target.session_key}
+
+    valid =
+      dispatch_cli(ctx, "tbc_test", %{verb: "breathing", asUser: "flynn", params: params})
+
+    assert valid.status == 200
+    assert JSON.decode!(valid.resp_body)["result"]["reason"] == "running_turn"
+
+    assert_receive {:call,
+                    %{
+                      verb: "breathing",
+                      params: %{target_kind: "session", target_id: "breathing-router-target"}
+                    }}
+
+    for volunteered <- [
+          %{sessionKey: target.session_key},
+          %{sessionKey: "breathing-router-missing"},
+          %{role: "breathing-router-missing-role"},
+          %{userId: "breathing-router-missing-user"},
+          %{target: "retired-target-shape"}
+        ] do
+      response =
+        dispatch_cli(
+          ctx,
+          "tbc_test",
+          Map.merge(%{verb: "breathing", asUser: "flynn", params: params}, volunteered)
+        )
+
+      assert response.status == 400
+
+      assert JSON.decode!(response.resp_body)["error"] == %{
+               "code" => "invalid_message",
+               "message" => "breathing takes no typed target"
+             }
+
+      refute_receive {:call, %{verb: "breathing"}}
+    end
+  end
+
   test "org CLI reserves process:tightbeam while other process origins still attribute", ctx do
     target = create_session(ctx.db, "reserved-origin-target", "flynn")
 

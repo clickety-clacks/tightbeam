@@ -811,7 +811,8 @@ defmodule Tightbeam.ExecutionMapTest do
 
   ## Surface — the wiring these verbs need, at the router
 
-  test "the router routes both verbs and refuses a volunteered typed target", ctx do
+  test "the router routes execution-map verbs and refuses typed targets for targetless queries",
+       ctx do
     session!(ctx.db, "s_real", "flynn")
     item!(ctx.db, "wi_routed")
 
@@ -835,7 +836,7 @@ defmodule Tightbeam.ExecutionMapTest do
     # what stops the roster filter from becoming a session-existence oracle: an
     # unknown key, a real session and a foreign session are one answer.
     refusals =
-      for verb <- ["execution-map", "execution-map-select"],
+      for verb <- ["execution-map", "execution-map-select", "breathing"],
           key <- ["s_real", "s_does_not_exist"] do
         response =
           post_dispatch(opts, %{verb: verb, asUser: "flynn", sessionKey: key, params: %{}})
@@ -844,7 +845,7 @@ defmodule Tightbeam.ExecutionMapTest do
         {verb, JSON.decode!(response.resp_body)}
       end
 
-    for verb <- ["execution-map", "execution-map-select"] do
+    for verb <- ["execution-map", "execution-map-select", "breathing"] do
       bodies = for {^verb, body} <- refusals, do: body
       assert length(bodies) == 2
 
@@ -869,6 +870,30 @@ defmodule Tightbeam.ExecutionMapTest do
                "error" => %{
                  "code" => "invalid_message",
                  "message" => ^verb <> " takes no typed target"
+               }
+             } = JSON.decode!(response.resp_body)
+    end
+
+    for target <- [%{userId: "flynn"}, %{userId: "user_does_not_exist"}] do
+      response =
+        post_dispatch(
+          opts,
+          Map.merge(
+            %{
+              verb: "breathing",
+              asUser: "flynn",
+              params: %{targetKind: "session", targetId: "s_real"}
+            },
+            target
+          )
+        )
+
+      assert response.status == 400
+
+      assert %{
+               "error" => %{
+                 "code" => "invalid_message",
+                 "message" => "breathing takes no typed target"
                }
              } = JSON.decode!(response.resp_body)
     end

@@ -1,0 +1,736 @@
+{
+  "seed": "INSERT INTO users (userId,isAdmin,creationKind,createdAt)\nVALUES ('owner',0,'admin_add',1);\n\nINSERT INTO sessions\n  (sessionKey,displayName,kind,isBuiltIn,ownerUserId,origin,operationalParent,\n   archetype,identityName,harness,provider,model,thinkingLevel,createdAt,updatedAt,state)\nVALUES\n  ('active','Active','custom',0,'owner','user:owner','active','default','default',\n   'codex','openai','model','medium',1,1,'active'),\n  ('active2','Active 2','custom',0,'owner','user:owner','active2','default','default',\n   'codex','openai','model','medium',1,1,'active'),\n  ('retired','Retired','custom',0,'owner','user:owner','retired','default','default',\n   'codex','openai','model','medium',1,1,'retired');\n\nINSERT INTO work_items (id,title,ownerUserId,state,createdByUser,createdAt)\nVALUES\n  ('wi_open','Open','owner','open','owner',1),\n  ('wi_linked','Linked','owner','open','owner',2),\n  ('wi_empty','Empty','owner','open','owner',3),\n  ('wi_terminal','Terminal','owner','closed','owner',4);\n\nINSERT INTO assignments\n  (id,subject,holderKey,openedByUser,openedAt,state,outcome,closedAt,closedByUser,workItemId)\nVALUES\n  ('asg_active','Active','active','owner',1,'open',NULL,NULL,NULL,'wi_open'),\n  ('asg_closed','Closed','active','owner',2,'open',NULL,NULL,NULL,'wi_open'),\n  ('asg_retired','Retired','retired','owner',3,'open',NULL,NULL,NULL,'wi_open'),\n  ('asg_pending','Pending','active','owner',5,'open',NULL,NULL,NULL,'wi_linked'),\n  ('asg_queued','Queued','active2','owner',6,'open',NULL,NULL,NULL,'wi_linked'),\n  ('asg_running','Running','active','owner',7,'open',NULL,NULL,NULL,'wi_linked');\n\nINSERT INTO attests (id,assignmentId,kind,note,bySession,ts)\nVALUES\n  ('att_closed','asg_closed','completion','closed fixture','active',3),\n  ('att_race_close','asg_active','completion','race fixture','active',2);\n\nUPDATE assignments\nSET state='closed',outcome='completed',closedAt=3,closedByUser='owner',closingAttestId='att_closed'\nWHERE id='asg_closed';\n\nUPDATE sessions SET cliToken='PARITY-SECRET-MUST-NOT-LEAK' WHERE sessionKey='active';",
+  "cases": [
+    {
+      "name": "session missing",
+      "sql": "",
+      "target": {
+        "kind": "session",
+        "id": "missing"
+      },
+      "expected": {
+        "schema": "breathing-v1",
+        "target": {
+          "kind": "session",
+          "id": "missing"
+        },
+        "breathing": false,
+        "reason": "session_missing",
+        "evidence": {}
+      }
+    },
+    {
+      "name": "assignment missing",
+      "sql": "",
+      "target": {
+        "kind": "assignment",
+        "id": "missing"
+      },
+      "expected": {
+        "schema": "breathing-v1",
+        "target": {
+          "kind": "assignment",
+          "id": "missing"
+        },
+        "breathing": false,
+        "reason": "assignment_missing",
+        "evidence": {}
+      }
+    },
+    {
+      "name": "work-item missing",
+      "sql": "",
+      "target": {
+        "kind": "work-item",
+        "id": "missing"
+      },
+      "expected": {
+        "schema": "breathing-v1",
+        "target": {
+          "kind": "work-item",
+          "id": "missing"
+        },
+        "breathing": false,
+        "reason": "work_item_missing",
+        "evidence": {}
+      }
+    },
+    {
+      "name": "session idle",
+      "sql": "",
+      "target": {
+        "kind": "session",
+        "id": "active"
+      },
+      "expected": {
+        "schema": "breathing-v1",
+        "target": {
+          "kind": "session",
+          "id": "active"
+        },
+        "breathing": false,
+        "reason": "no_current_path",
+        "evidence": {
+          "session": {
+            "sessionKey": "active",
+            "state": "active"
+          }
+        }
+      }
+    },
+    {
+      "name": "session running",
+      "sql": "INSERT INTO turns (seq,sessionKey,messageId,origin,prompt,assignmentId,jobRef,status,adapterGen,error,createdAt,startedAt,endedAt) VALUES (100,'active','parity-turn','user:owner','fixture','asg_active',NULL,'running',7,NULL,100,100,NULL);",
+      "target": {
+        "kind": "session",
+        "id": "active"
+      },
+      "expected": {
+        "schema": "breathing-v1",
+        "target": {
+          "kind": "session",
+          "id": "active"
+        },
+        "breathing": true,
+        "reason": "running_turn",
+        "evidence": {
+          "session": {
+            "sessionKey": "active",
+            "state": "active"
+          },
+          "turn": {
+            "seq": 100,
+            "sessionKey": "active",
+            "assignmentId": "asg_active",
+            "jobRef": null,
+            "status": "running",
+            "adapterGen": 7,
+            "error": null,
+            "createdAt": 100,
+            "startedAt": 100,
+            "endedAt": null
+          }
+        }
+      }
+    },
+    {
+      "name": "session queued",
+      "sql": "INSERT INTO turns (seq,sessionKey,messageId,origin,prompt,assignmentId,jobRef,status,adapterGen,error,createdAt,startedAt,endedAt) VALUES (100,'active','parity-turn','user:owner','fixture','asg_active',NULL,'queued',7,NULL,100,100,NULL);",
+      "target": {
+        "kind": "session",
+        "id": "active"
+      },
+      "expected": {
+        "schema": "breathing-v1",
+        "target": {
+          "kind": "session",
+          "id": "active"
+        },
+        "breathing": true,
+        "reason": "queued_turn",
+        "evidence": {
+          "session": {
+            "sessionKey": "active",
+            "state": "active"
+          },
+          "turn": {
+            "seq": 100,
+            "sessionKey": "active",
+            "assignmentId": "asg_active",
+            "jobRef": null,
+            "status": "queued",
+            "adapterGen": 7,
+            "error": null,
+            "createdAt": 100,
+            "startedAt": 100,
+            "endedAt": null
+          }
+        }
+      }
+    },
+    {
+      "name": "session pending future wake",
+      "sql": "INSERT INTO wakes (wakeId,sessionKey,origin,prompt,assignmentId,work_item_id,state,dueAt,createdAt) VALUES ('wake-parity','active','user:owner','fixture',NULL,NULL,'pending',9000000000000,1);",
+      "target": {
+        "kind": "session",
+        "id": "active"
+      },
+      "expected": {
+        "schema": "breathing-v1",
+        "target": {
+          "kind": "session",
+          "id": "active"
+        },
+        "breathing": true,
+        "reason": "pending_wake",
+        "evidence": {
+          "session": {
+            "sessionKey": "active",
+            "state": "active"
+          },
+          "wake": {
+            "wakeId": "wake-parity",
+            "sessionKey": "active",
+            "assignmentId": null,
+            "workItemId": null,
+            "state": "pending",
+            "dueAt": 9000000000000,
+            "createdAt": 1
+          }
+        }
+      }
+    },
+    {
+      "name": "retired session",
+      "sql": "",
+      "target": {
+        "kind": "session",
+        "id": "retired"
+      },
+      "expected": {
+        "schema": "breathing-v1",
+        "target": {
+          "kind": "session",
+          "id": "retired"
+        },
+        "breathing": false,
+        "reason": "session_retired",
+        "evidence": {
+          "session": {
+            "sessionKey": "retired",
+            "state": "retired"
+          }
+        }
+      }
+    },
+    {
+      "name": "retired holder",
+      "sql": "",
+      "target": {
+        "kind": "assignment",
+        "id": "asg_retired"
+      },
+      "expected": {
+        "schema": "breathing-v1",
+        "target": {
+          "kind": "assignment",
+          "id": "asg_retired"
+        },
+        "breathing": false,
+        "reason": "holder_retired",
+        "evidence": {
+          "assignment": {
+            "id": "asg_retired",
+            "openedAt": 3,
+            "state": "open",
+            "outcome": null,
+            "holderKey": "retired",
+            "workItemId": "wi_open"
+          },
+          "holder": {
+            "sessionKey": "retired",
+            "state": "retired"
+          }
+        }
+      }
+    },
+    {
+      "name": "closed assignment",
+      "sql": "",
+      "target": {
+        "kind": "assignment",
+        "id": "asg_closed"
+      },
+      "expected": {
+        "schema": "breathing-v1",
+        "target": {
+          "kind": "assignment",
+          "id": "asg_closed"
+        },
+        "breathing": false,
+        "reason": "assignment_closed",
+        "evidence": {
+          "assignment": {
+            "id": "asg_closed",
+            "openedAt": 2,
+            "state": "closed",
+            "outcome": "completed",
+            "holderKey": "active",
+            "workItemId": "wi_open"
+          }
+        }
+      }
+    },
+    {
+      "name": "assignment failed",
+      "sql": "INSERT INTO turns (seq,sessionKey,messageId,origin,prompt,assignmentId,jobRef,status,adapterGen,error,createdAt,startedAt,endedAt) VALUES (100,'active','parity-turn','user:owner','fixture','asg_active',NULL,'failed',7,'usageLimitExceeded',100,100,100);",
+      "target": {
+        "kind": "assignment",
+        "id": "asg_active"
+      },
+      "expected": {
+        "schema": "breathing-v1",
+        "target": {
+          "kind": "assignment",
+          "id": "asg_active"
+        },
+        "breathing": false,
+        "reason": "latest_terminal_failed",
+        "evidence": {
+          "assignment": {
+            "id": "asg_active",
+            "openedAt": 1,
+            "state": "open",
+            "outcome": null,
+            "holderKey": "active",
+            "workItemId": "wi_open"
+          },
+          "holder": {
+            "sessionKey": "active",
+            "state": "active"
+          },
+          "turn": {
+            "seq": 100,
+            "sessionKey": "active",
+            "assignmentId": "asg_active",
+            "jobRef": null,
+            "status": "failed",
+            "adapterGen": 7,
+            "error": "usageLimitExceeded",
+            "createdAt": 100,
+            "startedAt": 100,
+            "endedAt": 100
+          }
+        }
+      }
+    },
+    {
+      "name": "assignment failed_unknown",
+      "sql": "INSERT INTO turns (seq,sessionKey,messageId,origin,prompt,assignmentId,jobRef,status,adapterGen,error,createdAt,startedAt,endedAt) VALUES (100,'active','parity-turn','user:owner','fixture','asg_active',NULL,'failed_unknown',7,'usageLimitExceeded',100,100,100);",
+      "target": {
+        "kind": "assignment",
+        "id": "asg_active"
+      },
+      "expected": {
+        "schema": "breathing-v1",
+        "target": {
+          "kind": "assignment",
+          "id": "asg_active"
+        },
+        "breathing": false,
+        "reason": "latest_terminal_failed",
+        "evidence": {
+          "assignment": {
+            "id": "asg_active",
+            "openedAt": 1,
+            "state": "open",
+            "outcome": null,
+            "holderKey": "active",
+            "workItemId": "wi_open"
+          },
+          "holder": {
+            "sessionKey": "active",
+            "state": "active"
+          },
+          "turn": {
+            "seq": 100,
+            "sessionKey": "active",
+            "assignmentId": "asg_active",
+            "jobRef": null,
+            "status": "failed_unknown",
+            "adapterGen": 7,
+            "error": "usageLimitExceeded",
+            "createdAt": 100,
+            "startedAt": 100,
+            "endedAt": 100
+          }
+        }
+      }
+    },
+    {
+      "name": "assignment canceled",
+      "sql": "INSERT INTO turns (seq,sessionKey,messageId,origin,prompt,assignmentId,jobRef,status,adapterGen,error,createdAt,startedAt,endedAt) VALUES (100,'active','parity-turn','user:owner','fixture','asg_active',NULL,'canceled',7,NULL,100,100,100);",
+      "target": {
+        "kind": "assignment",
+        "id": "asg_active"
+      },
+      "expected": {
+        "schema": "breathing-v1",
+        "target": {
+          "kind": "assignment",
+          "id": "asg_active"
+        },
+        "breathing": false,
+        "reason": "latest_terminal_canceled",
+        "evidence": {
+          "assignment": {
+            "id": "asg_active",
+            "openedAt": 1,
+            "state": "open",
+            "outcome": null,
+            "holderKey": "active",
+            "workItemId": "wi_open"
+          },
+          "holder": {
+            "sessionKey": "active",
+            "state": "active"
+          },
+          "turn": {
+            "seq": 100,
+            "sessionKey": "active",
+            "assignmentId": "asg_active",
+            "jobRef": null,
+            "status": "canceled",
+            "adapterGen": 7,
+            "error": null,
+            "createdAt": 100,
+            "startedAt": 100,
+            "endedAt": 100
+          }
+        }
+      }
+    },
+    {
+      "name": "assignment delivered",
+      "sql": "INSERT INTO turns (seq,sessionKey,messageId,origin,prompt,assignmentId,jobRef,status,adapterGen,error,createdAt,startedAt,endedAt) VALUES (100,'active','parity-turn','user:owner','fixture','asg_active',NULL,'delivered',7,NULL,100,100,100);",
+      "target": {
+        "kind": "assignment",
+        "id": "asg_active"
+      },
+      "expected": {
+        "schema": "breathing-v1",
+        "target": {
+          "kind": "assignment",
+          "id": "asg_active"
+        },
+        "breathing": false,
+        "reason": "no_current_path",
+        "evidence": {
+          "assignment": {
+            "id": "asg_active",
+            "openedAt": 1,
+            "state": "open",
+            "outcome": null,
+            "holderKey": "active",
+            "workItemId": "wi_open"
+          },
+          "holder": {
+            "sessionKey": "active",
+            "state": "active"
+          },
+          "turn": {
+            "seq": 100,
+            "sessionKey": "active",
+            "assignmentId": "asg_active",
+            "jobRef": null,
+            "status": "delivered",
+            "adapterGen": 7,
+            "error": null,
+            "createdAt": 100,
+            "startedAt": 100,
+            "endedAt": 100
+          }
+        }
+      }
+    },
+    {
+      "name": "assignment pending",
+      "sql": "INSERT INTO wakes (wakeId,sessionKey,origin,prompt,assignmentId,work_item_id,state,dueAt,createdAt) VALUES ('wake-parity','active','user:owner','fixture','asg_active',NULL,'pending',9000000000000,1);",
+      "target": {
+        "kind": "assignment",
+        "id": "asg_active"
+      },
+      "expected": {
+        "schema": "breathing-v1",
+        "target": {
+          "kind": "assignment",
+          "id": "asg_active"
+        },
+        "breathing": true,
+        "reason": "pending_wake",
+        "evidence": {
+          "assignment": {
+            "id": "asg_active",
+            "openedAt": 1,
+            "state": "open",
+            "outcome": null,
+            "holderKey": "active",
+            "workItemId": "wi_open"
+          },
+          "holder": {
+            "sessionKey": "active",
+            "state": "active"
+          },
+          "wake": {
+            "wakeId": "wake-parity",
+            "sessionKey": "active",
+            "assignmentId": "asg_active",
+            "workItemId": null,
+            "state": "pending",
+            "dueAt": 9000000000000,
+            "createdAt": 1
+          }
+        }
+      }
+    },
+    {
+      "name": "terminal item",
+      "sql": "INSERT INTO wakes (wakeId,sessionKey,origin,prompt,assignmentId,work_item_id,state,dueAt,createdAt) VALUES ('wake-parity','active','user:owner','fixture',NULL,'wi_terminal','pending',9000000000000,1);",
+      "target": {
+        "kind": "work-item",
+        "id": "wi_terminal"
+      },
+      "expected": {
+        "schema": "breathing-v1",
+        "target": {
+          "kind": "work-item",
+          "id": "wi_terminal"
+        },
+        "breathing": false,
+        "reason": "work_item_terminal",
+        "evidence": {
+          "workItem": {
+            "id": "wi_terminal",
+            "state": "closed",
+            "failReason": null
+          }
+        }
+      }
+    },
+    {
+      "name": "empty item",
+      "sql": "",
+      "target": {
+        "kind": "work-item",
+        "id": "wi_empty"
+      },
+      "expected": {
+        "schema": "breathing-v1",
+        "target": {
+          "kind": "work-item",
+          "id": "wi_empty"
+        },
+        "breathing": false,
+        "reason": "no_open_assignment",
+        "evidence": {
+          "workItem": {
+            "id": "wi_empty",
+            "state": "open",
+            "failReason": null
+          }
+        }
+      }
+    },
+    {
+      "name": "direct item wake",
+      "sql": "INSERT INTO wakes (wakeId,sessionKey,origin,prompt,assignmentId,work_item_id,state,dueAt,createdAt) VALUES ('wake-parity','active','user:owner','fixture',NULL,'wi_empty','pending',9000000000000,1);",
+      "target": {
+        "kind": "work-item",
+        "id": "wi_empty"
+      },
+      "expected": {
+        "schema": "breathing-v1",
+        "target": {
+          "kind": "work-item",
+          "id": "wi_empty"
+        },
+        "breathing": true,
+        "reason": "pending_wake",
+        "evidence": {
+          "workItem": {
+            "id": "wi_empty",
+            "state": "open",
+            "failReason": null
+          },
+          "wake": {
+            "wakeId": "wake-parity",
+            "sessionKey": "active",
+            "assignmentId": null,
+            "workItemId": "wi_empty",
+            "state": "pending",
+            "dueAt": 9000000000000,
+            "createdAt": 1
+          }
+        }
+      }
+    },
+    {
+      "name": "direct item running",
+      "sql": "INSERT INTO turns (seq,sessionKey,messageId,origin,prompt,assignmentId,jobRef,status,adapterGen,error,createdAt,startedAt,endedAt) VALUES (100,'active','parity-turn','user:owner','fixture',NULL,'wi_empty','running',7,NULL,100,100,NULL);",
+      "target": {
+        "kind": "work-item",
+        "id": "wi_empty"
+      },
+      "expected": {
+        "schema": "breathing-v1",
+        "target": {
+          "kind": "work-item",
+          "id": "wi_empty"
+        },
+        "breathing": true,
+        "reason": "running_turn",
+        "evidence": {
+          "workItem": {
+            "id": "wi_empty",
+            "state": "open",
+            "failReason": null
+          },
+          "turn": {
+            "seq": 100,
+            "sessionKey": "active",
+            "assignmentId": null,
+            "jobRef": "wi_empty",
+            "status": "running",
+            "adapterGen": 7,
+            "error": null,
+            "createdAt": 100,
+            "startedAt": 100,
+            "endedAt": null
+          }
+        }
+      }
+    },
+    {
+      "name": "all linked idle canonical array",
+      "sql": "",
+      "target": {
+        "kind": "work-item",
+        "id": "wi_linked"
+      },
+      "expected": {
+        "schema": "breathing-v1",
+        "target": {
+          "kind": "work-item",
+          "id": "wi_linked"
+        },
+        "breathing": false,
+        "reason": "all_open_assignments_not_lively",
+        "evidence": {
+          "workItem": {
+            "id": "wi_linked",
+            "state": "open",
+            "failReason": null
+          },
+          "openAssignments": [
+            {
+              "id": "asg_pending",
+              "openedAt": 5,
+              "breathing": false,
+              "reason": "no_current_path",
+              "evidence": {
+                "assignment": {
+                  "id": "asg_pending",
+                  "openedAt": 5,
+                  "state": "open",
+                  "outcome": null,
+                  "holderKey": "active",
+                  "workItemId": "wi_linked"
+                },
+                "holder": {
+                  "sessionKey": "active",
+                  "state": "active"
+                }
+              }
+            },
+            {
+              "id": "asg_queued",
+              "openedAt": 6,
+              "breathing": false,
+              "reason": "no_current_path",
+              "evidence": {
+                "assignment": {
+                  "id": "asg_queued",
+                  "openedAt": 6,
+                  "state": "open",
+                  "outcome": null,
+                  "holderKey": "active2",
+                  "workItemId": "wi_linked"
+                },
+                "holder": {
+                  "sessionKey": "active2",
+                  "state": "active"
+                }
+              }
+            },
+            {
+              "id": "asg_running",
+              "openedAt": 7,
+              "breathing": false,
+              "reason": "no_current_path",
+              "evidence": {
+                "assignment": {
+                  "id": "asg_running",
+                  "openedAt": 7,
+                  "state": "open",
+                  "outcome": null,
+                  "holderKey": "active",
+                  "workItemId": "wi_linked"
+                },
+                "holder": {
+                  "sessionKey": "active",
+                  "state": "active"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "linked running winner",
+      "sql": "INSERT INTO turns (seq,sessionKey,messageId,origin,prompt,assignmentId,jobRef,status,adapterGen,error,createdAt,startedAt,endedAt) VALUES (100,'active','parity-turn','user:owner','fixture','asg_running',NULL,'running',7,NULL,100,100,NULL);",
+      "target": {
+        "kind": "work-item",
+        "id": "wi_linked"
+      },
+      "expected": {
+        "schema": "breathing-v1",
+        "target": {
+          "kind": "work-item",
+          "id": "wi_linked"
+        },
+        "breathing": true,
+        "reason": "open_assignment_lively",
+        "evidence": {
+          "workItem": {
+            "id": "wi_linked",
+            "state": "open",
+            "failReason": null
+          },
+          "assignment": {
+            "id": "asg_running",
+            "openedAt": 7,
+            "breathing": true,
+            "reason": "running_turn",
+            "evidence": {
+              "assignment": {
+                "id": "asg_running",
+                "openedAt": 7,
+                "state": "open",
+                "outcome": null,
+                "holderKey": "active",
+                "workItemId": "wi_linked"
+              },
+              "holder": {
+                "sessionKey": "active",
+                "state": "active"
+              },
+              "turn": {
+                "seq": 100,
+                "sessionKey": "active",
+                "assignmentId": "asg_running",
+                "jobRef": null,
+                "status": "running",
+                "adapterGen": 7,
+                "error": null,
+                "createdAt": 100,
+                "startedAt": 100,
+                "endedAt": null
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}
