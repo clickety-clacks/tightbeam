@@ -1,4 +1,5 @@
 name = "pdo"
+idle_cleanup = false
 skills = ["repository-retirement", "human-communication"]
 
 [defaults]

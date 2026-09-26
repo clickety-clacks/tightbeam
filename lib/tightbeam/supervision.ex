@@ -17,6 +17,7 @@ defmodule Tightbeam.Supervision do
   use GenServer
 
   alias Tightbeam.{
+    Archetypes,
     Assignments,
     CausalEvents,
     ConditionFacts,
@@ -3466,7 +3467,7 @@ defmodule Tightbeam.Supervision do
     Txn.q(
       txn,
       """
-      SELECT sessionKey,displayName,ownerUserId,harness,host,state,isBuiltIn,createdAt,updatedAt,
+      SELECT sessionKey,displayName,ownerUserId,harness,host,state,isBuiltIn,archetype,createdAt,updatedAt,
              #{Tightbeam.Org.current_parent_sql("sessions")}
       FROM sessions
       ORDER BY sessionKey
@@ -3480,6 +3481,7 @@ defmodule Tightbeam.Supervision do
                      host,
                      state,
                      built_in,
+                     archetype,
                      created_at,
                      updated_at,
                      parent
@@ -3492,6 +3494,7 @@ defmodule Tightbeam.Supervision do
         host: host,
         state: state,
         built_in: built_in == 1,
+        archetype: archetype,
         created_at: created_at,
         updated_at: updated_at,
         parent: parent
@@ -3502,6 +3505,7 @@ defmodule Tightbeam.Supervision do
 
   defp idle_cleanup_candidate_in_txn(txn, session, snapshot_at, sessions, ignored_wake \\ nil) do
     with true <- session.state == "active" and not session.built_in,
+         true <- idle_cleanup_enabled?(session.archetype),
          [] <-
            Txn.q(
              txn,
@@ -3565,6 +3569,13 @@ defmodule Tightbeam.Supervision do
       _ ->
         nil
     end
+  end
+
+  defp idle_cleanup_enabled?(name) do
+    archetype =
+      Archetypes.get(name) || raise ArgumentError, "unknown archetype in idle cleanup: #{name}"
+
+    archetype.idle_cleanup
   end
 
   # Only a committed sweep observation ends the occurrence. Cancellation

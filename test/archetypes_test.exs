@@ -717,6 +717,36 @@ defmodule Tightbeam.ArchetypesTest do
     end
   end
 
+  test "idle cleanup is an optional boolean with a true default" do
+    assert Archetypes.builtin_default().idle_cleanup == true
+
+    for {body, expected} <- [
+          {"name = \"quiet\"\n", true},
+          {"name = \"quiet\"\nidle_cleanup = true\n", true},
+          {"name = \"quiet\"\nidle_cleanup = false\n", false}
+        ] do
+      assert Archetypes.parse_manifest!(body, "quiet.toml").idle_cleanup == expected
+    end
+
+    for value <- ["\"false\"", "0", "[]"] do
+      assert_raise ArgumentError, ~r/archetype idle_cleanup must be a boolean/, fn ->
+        Archetypes.parse_manifest!("name = \"quiet\"\nidle_cleanup = #{value}\n", "quiet.toml")
+      end
+    end
+  end
+
+  test "the two shipped standing-seat manifests opt out of idle cleanup" do
+    for name <- ["product-owner", "pdo"] do
+      path =
+        Application.app_dir(
+          :tightbeam,
+          "priv/kungfu/agentic-engineering/archetypes/#{name}.toml"
+        )
+
+      assert Archetypes.parse_manifest!(File.read!(path), path).idle_cleanup == false
+    end
+  end
+
   # Stored selections hold FIELDS. A preference written as `"claude-fable-5[1m]"`
   # is refused by name rather than split here — splitting is the guess that read
   # a vendor context window as one of our reasoning levels and lost the model.

@@ -1,4 +1,5 @@
 name = "product-owner"
+idle_cleanup = false
 skills = ["repository-retirement", "tightbeam-dispatching"]
 
 [guidance]

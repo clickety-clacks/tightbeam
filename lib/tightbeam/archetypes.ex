@@ -21,6 +21,7 @@ defmodule Tightbeam.Archetypes do
           defaults: %{optional(:harness) => atom(), optional(:model) => Tightbeam.Model.t()},
           references: [%{name: String.t(), location: String.t(), access: String.t() | nil}],
           model_preferences: [Tightbeam.Model.t()],
+          idle_cleanup: boolean(),
           containment: %{fs: :off, network: :open},
           mcp: [
             %{
@@ -584,6 +585,7 @@ defmodule Tightbeam.Archetypes do
       defaults: %{},
       references: [],
       model_preferences: [],
+      idle_cleanup: true,
       containment: %{fs: :off, network: :open},
       mcp: [],
       guidance: nil,
@@ -600,6 +602,7 @@ defmodule Tightbeam.Archetypes do
         "defaults",
         "references",
         "model_preferences",
+        "idle_cleanup",
         "guidance",
         "mcp",
         "containment"
@@ -621,6 +624,11 @@ defmodule Tightbeam.Archetypes do
 
     where = Map.get(manifest, "where", [Tightbeam.Placement.local_host_name()])
     skills = Map.get(manifest, "skills", [])
+    idle_cleanup = Map.get(manifest, "idle_cleanup", true)
+
+    unless is_boolean(idle_cleanup) do
+      raise ArgumentError, "archetype idle_cleanup must be a boolean: #{path}"
+    end
 
     unless is_list(skills) and Enum.all?(skills, &is_binary/1) do
       raise ArgumentError, "archetype skills must be a list of strings: #{path}"
@@ -678,6 +686,7 @@ defmodule Tightbeam.Archetypes do
       skills: skills,
       where: where,
       model_preferences: model_preferences,
+      idle_cleanup: idle_cleanup,
       containment: containment,
       defaults: defaults,
       references: references,

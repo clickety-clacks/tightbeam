@@ -3,6 +3,7 @@ defmodule Tightbeam.SupervisionTest do
   alias Tightbeam.Model
 
   alias Tightbeam.{
+    Archetypes,
     Assignments,
     ConditionFacts,
     ConnRegistry,
@@ -122,6 +123,7 @@ defmodule Tightbeam.SupervisionTest do
     File.mkdir_p!(base)
     handlers = Gateway.handlers(%{db: db, wake_tick_ms: 60_000})
     Rules.load!(base, Map.keys(handlers))
+    Archetypes.load!(base)
     on_exit(fn -> File.rm_rf!(base) end)
 
     %{
@@ -250,6 +252,34 @@ defmodule Tightbeam.SupervisionTest do
 
     assert [%{kind: "idle_cleanup_prompt_claimed"}] =
              Enum.filter(EventLog.lifecycle_events(ctx.db), &(&1.subject == wake.wake_id))
+  end
+
+  test "idle cleanup honors each session's archetype opt-out and the true default", ctx do
+    manifests = Path.join([ctx.base, "identity", "archetypes"])
+    File.mkdir_p!(manifests)
+    File.write!(Path.join(manifests, "quiet-worker.toml"), "idle_cleanup = false\n")
+    File.write!(Path.join(manifests, "eager-worker.toml"), "idle_cleanup = true\n")
+    Archetypes.load!(ctx.base)
+
+    idle_cleanup_fixture!(ctx, ["quiet-child", "eager-child", "default-child"])
+
+    for {session_key, archetype} <- [
+          {"quiet-child", "quiet-worker"},
+          {"eager-child", "eager-worker"}
+        ] do
+      assert {:ok, _} =
+               DB.query(ctx.db, "UPDATE sessions SET archetype=?2 WHERE sessionKey=?1", [
+                 session_key,
+                 archetype
+               ])
+    end
+
+    start_liveness!(ctx, sweep_ms: 60_000, name: :idle_cleanup_archetype_supervision)
+
+    assert [wake] = idle_cleanup_wakes(ctx.db)
+    assert wake.prompt =~ "child=eager-child;"
+    assert wake.prompt =~ "child=default-child;"
+    refute wake.prompt =~ "child=quiet-child;"
   end
 
   test "idle cleanup applies its horizon and excludes open or pending sessions", ctx do
