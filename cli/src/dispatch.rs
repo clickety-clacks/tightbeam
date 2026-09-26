@@ -1218,6 +1218,25 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             vec![],
             vec![string_field("cancelWakeId", wake_id)],
         )),
+        Command::SettleTurn {
+            identity,
+            session_key,
+            turn_seq,
+            outcome,
+            reason,
+            idempotency_key,
+        } => Ok(request(
+            identity,
+            "settle-turn",
+            vec![],
+            vec![
+                string_field("sessionKey", session_key),
+                format!("\"turnSeq\":{turn_seq}"),
+                string_field("outcome", outcome),
+                string_field("reason", reason),
+                string_field("idempotencyKey", idempotency_key),
+            ],
+        )),
         Command::IdentityEdit {
             identity,
             idempotency_key,
@@ -1722,9 +1741,13 @@ fn send_to_with_timeout(
     request: &RequestSpec,
     timeout: Option<Duration>,
 ) -> Result<Option<Value>, String> {
-    let call = gateway_request("POST", endpoint, request.path, timeout)
-        .set("content-type", "application/json")
-        .send_string(&request.body_json);
+    let call = if request.path == "/version" {
+        gateway_request("GET", endpoint, request.path, timeout).call()
+    } else {
+        gateway_request("POST", endpoint, request.path, timeout)
+            .set("content-type", "application/json")
+            .send_string(&request.body_json)
+    };
 
     let (status, response) = match call {
         Ok(response) => (response.status(), response),
@@ -1734,6 +1757,12 @@ fn send_to_with_timeout(
     let encoded = response.into_string().map_err(|error| error.to_string())?;
     if !(200..300).contains(&status) && request.body_json.contains(r#""verb":"tune""#) {
         return Err(tune_refusal_json(&encoded));
+    }
+    // /version is a plain discovery object, not a dispatch result envelope.
+    if request.path == "/version" && (200..300).contains(&status) {
+        return serde_json::from_str(&encoded)
+            .map(Some)
+            .map_err(|error| error.to_string());
     }
     parse_response(status, &encoded)
 }
@@ -1978,6 +2007,25 @@ where
             if let Some(identity) = command_identity(&command) {
                 require_session_endpoint(identity, &endpoint)?;
             }
+            if matches!(command, Command::SettleTurn { .. }) {
+                let version = RequestSpec {
+                    path: "/version",
+                    body_json: String::new(),
+                };
+                let advertised = send_request(&endpoint, &version, None)?;
+                let present = advertised
+                    .as_ref()
+                    .and_then(|value| value.get("features"))
+                    .and_then(Value::as_array)
+                    .is_some_and(|features| {
+                        features
+                            .iter()
+                            .any(|feature| feature.as_str() == Some("stale-turn-settlement-v1"))
+                    });
+                if !present {
+                    return Err("capability_missing: stale-turn-settlement-v1".to_owned());
+                }
+            }
             let request = build_request(&command)?;
             if let Some(result) = send_request(&endpoint, &request, None)? {
                 println!(
@@ -2087,6 +2135,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::Attests { identity, .. }
         | Command::Assignments { identity, .. }
         | Command::CancelWake { identity, .. }
+        | Command::SettleTurn { identity, .. }
         | Command::IdentityEdit { identity, .. }
         | Command::IdentityStatus { identity, .. }
         | Command::IdentityRelearn { identity, .. }
@@ -2485,6 +2534,55 @@ mod tests {
         assert_eq!(
             first_user_for_target(false, || panic!("remote target attempted local mutation")),
             Ok(crate::users::FirstUser::Dispatch)
+        );
+    }
+
+    #[test]
+    fn settlement_capability_probe_uses_get_on_the_http_wire() {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut lines = Vec::new();
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                lines.push(line);
+            }
+            let body = r#"{"features":["stale-turn-settlement-v1"]}"#;
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            lines
+        });
+        let endpoint = Endpoint {
+            base: format!("http://{address}"),
+            token: "fixture-token".to_owned(),
+            origin: Origin::Provisioned,
+        };
+        let result = send_to_with_timeout(
+            &endpoint,
+            &RequestSpec {
+                path: "/version",
+                body_json: String::new(),
+            },
+            Some(Duration::from_secs(5)),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(result["features"][0], "stale-turn-settlement-v1");
+        let lines = server.join().unwrap();
+        assert_eq!(lines[0], "GET /version HTTP/1.1\r\n");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.to_ascii_lowercase() == "authorization: bearer fixture-token\r\n")
         );
     }
 

@@ -13,7 +13,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
   alias Tightbeam.{Assignments, ConnRegistry, DB, Schema, SessionPoAssociations, Wakes}
 
-  @shape "cannot-proceed-v1-019"
+  @shape "stale-turn-settlement-v1-019"
   @legacy_cursor_provider_shape "cursor-provider-v1-020"
   @row_driven_rules_shape "row-driven-rules-v1-019"
   @identity_render_stamp_previous_shape "effort-request-exit-v1-019"

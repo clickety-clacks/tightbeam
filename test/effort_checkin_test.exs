@@ -412,6 +412,20 @@ defmodule Tightbeam.EffortCheckinTest do
     request = fire_probe(ctx, modified.id)
     assert request.expecter_session_key == "parent"
 
+    # Settle only this earlier brief before the new bracket starts counting.
+    assert {:ok, older_brief} = Ledger.claim_next(ctx.db, "holder", "prior-effort-fixture")
+    modified_id = modified.id
+
+    assert {:ok, [[^modified_id]]} =
+             DB.query(ctx.db, "SELECT assignmentId FROM turns WHERE seq=?1", [older_brief.seq])
+
+    assert older_brief.prompt =~ "workspace-only activity"
+
+    assert :ok =
+             Ledger.finish(ctx.db, older_brief.seq, "delivered", nil,
+               owner_lease: older_brief.owner_lease
+             )
+
     # A stall is turns without effect: turns are reported, never counted.
     stalled = dispatch(ctx, {:session, "parent"}, "holder", "stall")
     wake = current_wake(ctx.db, stalled.id)
@@ -2063,17 +2077,28 @@ defmodule Tightbeam.EffortCheckinTest do
   end
 
   defp terminal_turn(db, session_key, terminal) do
-    id = "m_#{System.unique_integer([:positive])}"
+    turn =
+      case Ledger.claim_next(db, session_key, "effort-fixture") do
+        {:ok, claimed} ->
+          claimed
 
-    {:ok, seq} =
-      Ledger.enqueue(db, %{
-        session_key: session_key,
-        message_id: id,
-        origin: "agent:test",
-        prompt: id
-      })
+        :none ->
+          id = "m_#{System.unique_integer([:positive])}"
 
-    :ok = DB.execute(db, "UPDATE turns SET status='running' WHERE seq=#{seq}")
-    :ok = Ledger.finish(db, seq, terminal)
+          {:ok, seq} =
+            Ledger.enqueue(db, %{
+              session_key: session_key,
+              message_id: id,
+              origin: "agent:test",
+              prompt: id
+            })
+
+          assert {:ok, %{seq: ^seq} = claimed} =
+                   Ledger.claim_next(db, session_key, "effort-fixture")
+
+          claimed
+      end
+
+    :ok = Ledger.finish(db, turn.seq, terminal, nil, owner_lease: turn.owner_lease)
   end
 end

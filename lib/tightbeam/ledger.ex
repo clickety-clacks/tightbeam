@@ -18,6 +18,7 @@ defmodule Tightbeam.Ledger do
   """
 
   alias Tightbeam.{DB, HarnessHealth, Org, QueuedMessageSuppression}
+  alias Tightbeam.TurnLifecycle
   alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.Publisher
 
@@ -539,6 +540,20 @@ defmodule Tightbeam.Ledger do
                   [session_key]
                 )
 
+              owner_lease =
+                "ol_" <> Base.url_encode64(:crypto.strong_rand_bytes(24), padding: false)
+
+              TurnLifecycle.append_in_txn(txn, seq, %{
+                event_key: "claimed",
+                producer_event_id: "ledger:claimed",
+                kind: "claimed",
+                cause: "session-lane:claim",
+                principal: "process:tightbeam",
+                owner_lease: owner_lease,
+                detail: %{v: 1, owner: owner},
+                at: now
+              })
+
               Publisher.turn_in_txn(txn, "turn.started", seq)
               Org.sync_mechanical_status_in_txn(txn, session_key)
 
@@ -548,7 +563,8 @@ defmodule Tightbeam.Ledger do
                  message_id: message_id,
                  origin: origin,
                  prompt: prompt,
-                 wake_id: wake_id
+                 wake_id: wake_id,
+                 owner_lease: owner_lease
                }}
             else
               no_claim(txn, session_key)
@@ -574,6 +590,7 @@ defmodule Tightbeam.Ledger do
     won = Txn.changes(txn) == 1
 
     if won do
+      append_terminal_in_txn(txn, seq, "canceled", cause: "queued-message-suppressed")
       if transition, do: DB.record_row_commit(txn, transition)
       Publisher.turn_in_txn(txn, "turn.ended", seq)
 
@@ -690,6 +707,11 @@ defmodule Tightbeam.Ledger do
             |> Enum.map(&hd/1)
             |> Enum.sort()
 
+          Enum.each(
+            seqs,
+            &append_terminal_in_txn(txn, &1, "failed", cause: "unclaimable:#{reason}")
+          )
+
           Enum.each(transitions, &DB.record_row_commit(txn, &1))
           Enum.each(seqs, &Publisher.turn_in_txn(txn, "turn.ended", &1))
           if seqs != [], do: Org.sync_mechanical_status_in_txn(txn, session_key)
@@ -734,12 +756,12 @@ defmodule Tightbeam.Ledger do
   won the transition, :already_terminal otherwise.
   """
   @spec finish(db(), integer(), terminal(), String.t() | nil) :: :ok | :already_terminal
-  def finish(db \\ Tightbeam.DB, seq, terminal, error \\ nil)
+  def finish(db \\ Tightbeam.DB, seq, terminal, error \\ nil, opts \\ [])
       when terminal in ~w(delivered canceled failed failed_unknown) do
     {:ok, won} =
       DB.transaction_then(
         db,
-        fn txn -> finish_in_txn(txn, seq, terminal, error) end,
+        fn txn -> finish_in_txn(txn, seq, terminal, error, opts) end,
         fn txn, won ->
           Tightbeam.Wakes.row_commit_in_txn(txn, [])
           won
@@ -751,7 +773,7 @@ defmodule Tightbeam.Ledger do
 
   @doc "Terminal transition inside the caller's transaction."
   @spec finish_in_txn(Txn.t(), integer(), terminal(), String.t() | nil) :: boolean()
-  def finish_in_txn(%Txn{} = txn, seq, terminal, error \\ nil)
+  def finish_in_txn(%Txn{} = txn, seq, terminal, error \\ nil, opts \\ [])
       when terminal in ~w(delivered canceled failed failed_unknown) do
     now = System.system_time(:millisecond)
     transition = turn_terminal_transition_in_txn(txn, seq, "running", terminal)
@@ -766,6 +788,7 @@ defmodule Tightbeam.Ledger do
     if won and transition, do: DB.record_row_commit(txn, transition)
 
     if won do
+      append_terminal_in_txn(txn, seq, terminal, opts)
       Publisher.turn_in_txn(txn, "turn.ended", seq)
       [[session_key]] = Txn.q(txn, "SELECT sessionKey FROM turns WHERE seq = ?1", [seq])
       Org.sync_mechanical_status_in_txn(txn, session_key)
@@ -774,7 +797,8 @@ defmodule Tightbeam.Ledger do
     won
   end
 
-  defp turn_terminal_transition_in_txn(txn, seq, old_status, terminal) do
+  @doc false
+  def turn_terminal_transition_in_txn(txn, seq, old_status, terminal) do
     case Txn.q(
            txn,
            """
@@ -835,6 +859,7 @@ defmodule Tightbeam.Ledger do
     Enum.each(transitions, &DB.record_row_commit(txn, &1))
 
     seqs = Enum.map(rows, &hd/1)
+    Enum.each(seqs, &append_terminal_in_txn(txn, &1, "canceled", cause: "session-retired"))
     Enum.each(seqs, &Publisher.turn_in_txn(txn, "turn.ended", &1))
     seqs
   end
@@ -888,6 +913,11 @@ defmodule Tightbeam.Ledger do
               WHERE status = 'running' AND #{update_predicate}
             """,
             [now | predicate_params]
+          )
+
+          Enum.each(
+            seqs,
+            &append_terminal_in_txn(txn, &1, "failed_unknown", cause: "boot-recovery")
           )
 
           publications =
@@ -1051,6 +1081,11 @@ defmodule Tightbeam.Ledger do
             )
 
             if Txn.changes(txn) == 1 do
+              append_terminal_in_txn(txn, seq, "failed_unknown",
+                cause: "operator:clear-stranded",
+                principal: principal
+              )
+
               if transition, do: DB.record_row_commit(txn, transition)
               Publisher.turn_in_txn(txn, "turn.ended", seq)
               Org.sync_mechanical_status_in_txn(txn, session_key)
@@ -1230,6 +1265,21 @@ defmodule Tightbeam.Ledger do
       ])
 
     :ok
+  end
+
+  defp append_terminal_in_txn(txn, seq, terminal, opts) do
+    opts = Map.new(opts)
+
+    TurnLifecycle.append_in_txn(txn, seq, %{
+      event_key: "terminal:committed",
+      producer_event_id: "ledger:terminal:committed",
+      kind: "terminal_committed",
+      outcome: terminal,
+      cause: Map.get(opts, :cause, "turn:#{seq}"),
+      principal: Map.get(opts, :principal, "process:tightbeam"),
+      owner_lease: Map.get(opts, :owner_lease),
+      detail: %{v: 1, status: terminal}
+    })
   end
 
   @doc "Conservation audit: non-terminal rows older than max_age_ms. Must be []."

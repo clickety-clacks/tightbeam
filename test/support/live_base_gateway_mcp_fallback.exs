@@ -120,7 +120,10 @@ defmodule GuardMcpFallback do
           send(self(), {:push, Tightbeam.Wire.Payloads.ack("c_gold")})
           send(adapter, :continue_prompt)
           assert {:ok, %{terminal_publish: publish}} = Task.await(task)
-          assert :ok = Ledger.finish(db, turn.seq, "delivered")
+
+          assert :ok =
+                   Ledger.finish(db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+
           publish.("delivered")
 
           frames = collect_pushes(10, [])

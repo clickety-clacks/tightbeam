@@ -451,20 +451,20 @@ defmodule Tightbeam.WorkItemsTest do
 
   test "Proof 1: an item created during a running turn carries that seq with known = 1; created with no running turn carries NULL with known = 1",
        ctx do
-    running_seq = running_turn!(ctx.db, "holder")
+    {running_seq, owner_lease} = running_turn!(ctx.db, "holder")
     during = create(ctx, {:session, "holder"}, %{title: "During turn"})
 
     assert {:ok, [[^running_seq, 1]]} =
              creation_context(ctx.db, during.id)
 
-    :ok = Ledger.finish(ctx.db, running_seq, "delivered")
+    :ok = Ledger.finish(ctx.db, running_seq, "delivered", nil, owner_lease: owner_lease)
     idle = create(ctx, {:session, "holder"}, %{title: "No running turn"})
 
     assert {:ok, [[nil, 1]]} = creation_context(ctx.db, idle.id)
   end
 
   test "Proof 3: a bracket-turn create (jobRef, no assignment) stamps the turn", ctx do
-    running_seq = running_turn!(ctx.db, "holder", job_ref: "wi_bracket")
+    {running_seq, _owner_lease} = running_turn!(ctx.db, "holder", job_ref: "wi_bracket")
     item = create(ctx, {:session, "holder"}, %{title: "Bracket create"})
 
     assert {:ok, [[^running_seq, nil, "wi_bracket"]]} =
@@ -481,8 +481,8 @@ defmodule Tightbeam.WorkItemsTest do
   end
 
   test "Proof 5: a cancel-then-arriving create lands known = 1, seq = NULL", ctx do
-    running_seq = running_turn!(ctx.db, "holder")
-    :ok = Ledger.finish(ctx.db, running_seq, "canceled")
+    {running_seq, owner_lease} = running_turn!(ctx.db, "holder")
+    :ok = Ledger.finish(ctx.db, running_seq, "canceled", nil, owner_lease: owner_lease)
 
     item = create(ctx, {:session, "holder"}, %{title: "Arrived after cancel"})
 
@@ -756,8 +756,10 @@ defmodule Tightbeam.WorkItemsTest do
         job_ref: Keyword.get(opts, :job_ref)
       })
 
-    assert {:ok, %{seq: ^seq}} = Ledger.claim_next(db, session_key, "test-owner")
-    seq
+    assert {:ok, %{seq: ^seq, owner_lease: lease}} =
+             Ledger.claim_next(db, session_key, "test-owner")
+
+    {seq, lease}
   end
 
   defp update(ctx, principal, id, patch),

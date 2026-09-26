@@ -54,7 +54,11 @@ defmodule Tightbeam.ReminderTransactionTest do
       assert {:ok, source} = Ledger.claim_next(db, "r1-holder", "source-consumer")
       initial = state(db)
       failed_status = if recovery == :wake, do: "failed", else: "failed_unknown"
-      assert :ok = Ledger.finish(db, source_seq, failed_status, "fixture terminal failure")
+
+      assert :ok =
+               Ledger.finish(db, source_seq, failed_status, "fixture terminal failure",
+                 owner_lease: source.owner_lease
+               )
 
       assert {:ok, [[ended_at]]} =
                DB.query(db, "SELECT endedAt FROM turns WHERE seq=?1", [source_seq])
@@ -148,12 +152,15 @@ defmodule Tightbeam.ReminderTransactionTest do
 
       assert state(db) == rebound
 
-      assert {:ok, %{seq: ^successor_seq}} =
+      assert {:ok, %{seq: ^successor_seq, owner_lease: successor_lease}} =
                Ledger.claim_next(db, "r1-holder", "successor-consumer")
 
       assert {:ok, :recorded} =
                DB.transaction(db, fn txn ->
-                 assert Ledger.finish_in_txn(txn, successor_seq, "delivered", nil)
+                 assert Ledger.finish_in_txn(txn, successor_seq, "delivered", nil,
+                          owner_lease: successor_lease
+                        )
+
                  ReminderDelivery.delivered_in_txn(txn, successor_seq)
                end)
 
@@ -193,12 +200,15 @@ defmodule Tightbeam.ReminderTransactionTest do
     :ok =
       DB.execute(
         db,
-        "INSERT INTO turns(seq,sessionKey,messageId,wakeId,origin,prompt,assignmentId,status,createdAt) VALUES (1,'r1-holder','m1','r1-notice','process:tightbeam','notice','r1-assignment','running',1)"
+        "INSERT INTO turns(seq,sessionKey,messageId,wakeId,origin,prompt,assignmentId,status,createdAt) VALUES (1,'r1-holder','m1','r1-notice','process:tightbeam','notice','r1-assignment','queued',1)"
       )
+
+    assert {:ok, %{seq: 1, owner_lease: lease}} =
+             Ledger.claim_next(db, "r1-holder", "reminder-fixture")
 
     assert {:ok, :recorded} =
              DB.transaction(db, fn txn ->
-               assert Ledger.finish_in_txn(txn, 1, "delivered", nil)
+               assert Ledger.finish_in_txn(txn, 1, "delivered", nil, owner_lease: lease)
                ReminderDelivery.delivered_in_txn(txn, 1)
              end)
 
@@ -239,10 +249,12 @@ defmodule Tightbeam.ReminderTransactionTest do
     assert state(db)["claimEpoch"] == 2
     assert is_nil(state(db)["lastDeliveredAt"])
 
+    assert {:ok, %{seq: ^successor, owner_lease: lease}} =
+             Ledger.claim_next(db, "r1-holder", "reminder-successor-fixture")
+
     assert {:ok, :recorded} =
              DB.transaction(db, fn txn ->
-               Txn.q(txn, "UPDATE turns SET status='running' WHERE seq=?1", [successor])
-               assert Ledger.finish_in_txn(txn, successor, "delivered", nil)
+               assert Ledger.finish_in_txn(txn, successor, "delivered", nil, owner_lease: lease)
                ReminderDelivery.delivered_in_txn(txn, successor)
              end)
 

@@ -235,7 +235,10 @@ defmodule GuardCheckoutRefusal do
     # the STAGE (:checkout — pre-engine) and the raw fault the user-facing sentence flattened.
     assert {:ok, true} =
              DB.transaction(db, fn txn ->
-               assert Ledger.finish_in_txn(txn, turn.seq, "failed", reason)
+               assert Ledger.finish_in_txn(txn, turn.seq, "failed", reason,
+                        owner_lease: turn.owner_lease
+                      )
+
                record.(txn)
                true
              end)

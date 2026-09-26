@@ -310,10 +310,10 @@ defmodule Tightbeam.Firehose.RetireCommitOrderTest do
         assignment_id: assignment_id
       })
 
-    assert {:ok, %{seq: ^seq}} =
+    assert {:ok, %{seq: ^seq, owner_lease: seq_lease}} =
              Ledger.claim_next(db, session_key, "retire-regression")
 
-    assert :ok = Ledger.finish(db, seq, "delivered", nil)
+    assert :ok = Ledger.finish(db, seq, "delivered", nil, owner_lease: seq_lease)
     seq
   end
 
