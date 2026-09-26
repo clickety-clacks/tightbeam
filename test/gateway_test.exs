@@ -2256,7 +2256,10 @@ defmodule Tightbeam.GatewayTest do
     assert Org.get(ctx.db, default_pdo_key).model ==
              Model.new("gpt-6-sol", effort: "low")
 
-    for archetype <- ["pdo", "orchestrator"] do
+    for {archetype, family, effort} <- [
+          {"pdo", "gpt-6-sol", "low"},
+          {"orchestrator", "gpt-6-luna", "max"}
+        ] do
       assert %{session_key: key} =
                spawn.(%{
                  origin: "user:flynn",
@@ -2270,7 +2273,7 @@ defmodule Tightbeam.GatewayTest do
 
       assert %{archetype: ^archetype, harness: "codex", provider: "openai"} = Org.get(ctx.db, key)
 
-      assert Org.get(ctx.db, key).model == Model.new("gpt-6-sol", effort: "low")
+      assert Org.get(ctx.db, key).model == Model.new(family, effort: effort)
     end
 
     assert %{session_key: coder_key} =
