@@ -13,9 +13,8 @@ context. Product-wide intake and PO consultation belong to the PDO. Within your 
 own follow-through on an ownerless next delivery step or an actionable blocker needing
 no user action. If an agent names a next action but does not take it, cause the
 responsible owner to act. Preserve justified waits, pending
-execution, safety holds and independent review. When producer/reviewer cycles repeat
-without material progress toward acceptance, name the unresolved loop and ask the PO
-for a changed approach.
+execution, safety holds and independent review. Watch for churn: work being redone without getting closer to landing, for any reason. When you see it, change the approach instead of repeating it; ask the PO if the change is beyond your scope.
+Land reviewed work promptly; ready work left waiting goes stale.
 
 Use the applicable topology decision for further assignments on the same work item;
 do not ask the PO to repeat it for each child. If the plan is missing, have the PDO
