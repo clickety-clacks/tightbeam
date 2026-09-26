@@ -1334,6 +1334,70 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             ],
         )),
         Command::KungfuList { identity } => Ok(request(identity, "kungfu-list", vec![], vec![])),
+        Command::KungfuSetup { identity, name } => Ok(request(
+            identity,
+            "kungfu-setup",
+            vec![],
+            vec![string_field("name", name)],
+        )),
+        Command::SentinelEnable { identity, name } => Ok(request(
+            identity,
+            "sentinel-enable",
+            vec![],
+            vec![string_field("name", name)],
+        )),
+        Command::SentinelDisable { identity, name } => Ok(request(
+            identity,
+            "sentinel-disable",
+            vec![],
+            vec![string_field("name", name)],
+        )),
+        Command::SentinelList { identity } => {
+            Ok(request(identity, "sentinel-list", vec![], vec![]))
+        }
+        Command::SentinelEnvSet {
+            identity,
+            host,
+            sentinel,
+            name,
+            value,
+        } => {
+            let mut params = vec![
+                string_field("sentinel", sentinel),
+                string_field("name", name),
+                string_field("value", value),
+            ];
+            if let Some(value) = host {
+                params.push(string_field("host", value));
+            }
+            Ok(request(identity, "host-env-set", vec![], params))
+        }
+        Command::SentinelEnvList {
+            identity,
+            host,
+            sentinel,
+        } => {
+            let mut params = vec![string_field("sentinel", sentinel)];
+            if let Some(value) = host {
+                params.push(string_field("host", value));
+            }
+            Ok(request(identity, "host-env-list", vec![], params))
+        }
+        Command::SentinelEnvUnset {
+            identity,
+            host,
+            sentinel,
+            name,
+        } => {
+            let mut params = vec![
+                string_field("sentinel", sentinel),
+                string_field("name", name),
+            ];
+            if let Some(value) = host {
+                params.push(string_field("host", value));
+            }
+            Ok(request(identity, "host-env-unset", vec![], params))
+        }
         Command::IdentityApply {
             identity,
             session_key,
@@ -1929,7 +1993,11 @@ where
             unreachable!("help is handled before dispatch")
         }
         Command::IdentityCurrent => print_current_session_identity(),
-        Command::Doctor { json, base_dir } => crate::probe::run(json, base_dir),
+        Command::Doctor {
+            identity,
+            json,
+            base_dir,
+        } => crate::probe::run(json, base_dir, &identity),
         Command::AddUser {
             identity,
             user_id,
@@ -2165,6 +2233,13 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::HostEnvSet { identity, .. }
         | Command::HostEnvList { identity, .. }
         | Command::HostEnvUnset { identity, .. }
+        | Command::KungfuSetup { identity, .. }
+        | Command::SentinelEnable { identity, .. }
+        | Command::SentinelDisable { identity, .. }
+        | Command::SentinelList { identity }
+        | Command::SentinelEnvSet { identity, .. }
+        | Command::SentinelEnvList { identity, .. }
+        | Command::SentinelEnvUnset { identity, .. }
         | Command::HostToolchainSet { identity, .. }
         | Command::HarnessProcesses { identity } => Some(identity),
         Command::Help
@@ -3721,6 +3796,66 @@ mod tests {
                 "flynn",
             ]),
             r#"{"asUser":"flynn","verb":"host-env-unset","params":{"host":"gibson","harness":"claude","name":"EXAMPLE_OVERLAY_VAR"}}"#
+        );
+    }
+
+    #[test]
+    fn builds_byte_exact_sentinel_bodies() {
+        assert_eq!(
+            body(&[
+                "host-env-set",
+                "--sentinel",
+                "example-bundle/watch",
+                "EXAMPLE_SETTING=example",
+                "--as-user",
+                "flynn",
+            ]),
+            r#"{"asUser":"flynn","verb":"host-env-set","params":{"sentinel":"example-bundle/watch","name":"EXAMPLE_SETTING","value":"example"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "host-env-list",
+                "--host",
+                "example-host",
+                "--sentinel",
+                "watch",
+                "--as-user",
+                "flynn",
+            ]),
+            r#"{"asUser":"flynn","verb":"host-env-list","params":{"sentinel":"watch","host":"example-host"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "host-env-unset",
+                "--sentinel",
+                "watch",
+                "EXAMPLE_SETTING",
+                "--as-user",
+                "flynn",
+            ]),
+            r#"{"asUser":"flynn","verb":"host-env-unset","params":{"sentinel":"watch","name":"EXAMPLE_SETTING"}}"#
+        );
+        assert_eq!(
+            body(&["sentinel", "enable", "watch", "--as-user", "flynn"]),
+            r#"{"asUser":"flynn","verb":"sentinel-enable","params":{"name":"watch"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "sentinel",
+                "disable",
+                "example-bundle/watch",
+                "--as-user",
+                "flynn"
+            ]),
+            r#"{"asUser":"flynn","verb":"sentinel-disable","params":{"name":"example-bundle/watch"}}"#
+        );
+        assert_eq!(
+            body(&["sentinel", "list", "--as-user", "flynn"]),
+            r#"{"asUser":"flynn","verb":"sentinel-list","params":{}}"#
+        );
+        assert_eq!(
+            body(&["kungfu", "setup", "example-bundle", "--as-user", "flynn"]),
+            r#"{"asUser":"flynn","verb":"kungfu-setup","params":{"name":"example-bundle"}}"#
         );
     }
 

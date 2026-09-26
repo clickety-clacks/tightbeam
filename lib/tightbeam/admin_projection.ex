@@ -615,7 +615,8 @@ defmodule Tightbeam.AdminProjection do
     for [host, harness, name, set_at] <-
           Txn.q(
             txn,
-            "SELECT host, harness, name, setAt FROM harness_env_overlays ORDER BY host, harness, name"
+            "SELECT host, harness, name, setAt FROM harness_env_overlays " <>
+              "WHERE substr(harness, 1, 9) != 'sentinel:' ORDER BY host, harness, name"
           ) do
       encoded_key = key([host, harness, name])
 

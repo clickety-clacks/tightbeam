@@ -1494,11 +1494,21 @@ fn pretty_json(value: &Value) -> String {
     serde_json::to_string_pretty(value).expect("probe report serializes")
 }
 
-fn report_json(report: &Report) -> String {
-    pretty_json(&report_value(report))
+/// The doctor report, with the gateway's sentinel section when doctor asked for it.
+fn report_json(report: &Report, sentinels: Option<Value>) -> String {
+    let mut value = report_value(report);
+    if let (Some(sentinels), Some(fields)) = (sentinels, value.as_object_mut()) {
+        fields.insert("sentinels".to_owned(), sentinels);
+    }
+    pretty_json(&value)
 }
 
-pub fn run(json: bool, base_dir: Option<String>) -> Result<(), String> {
+pub fn run(
+    json: bool,
+    base_dir: Option<String>,
+    identity: &crate::args::Identity,
+) -> Result<(), String> {
+    let explicit_base_dir = base_dir.is_some();
     let wall = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
@@ -1542,10 +1552,12 @@ pub fn run(json: bool, base_dir: Option<String>) -> Result<(), String> {
     let mut report = assemble(raw, probed_at_ms, 0, hostname, base_dir);
     report.credential_health = inspect_credential_health(&resolved_base_dir);
     report.collection_ms = u64::try_from(monotonic.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let sentinels = doctor_sentinels(&resolved_base_dir, explicit_base_dir, identity);
     if json {
-        println!("{}", report_json(&report));
+        println!("{}", report_json(&report, Some(sentinel_value(&sentinels))));
     } else {
         println!("{}", human(&report));
+        println!("{}", sentinel_lines(&sentinels).join("\n"));
     }
     require_runnable_harness_cli(harness_catalog.as_ref())?;
     require_credential_integrity(&report.credential_health)?;
@@ -1553,6 +1565,142 @@ pub fn run(json: bool, base_dir: Option<String>) -> Result<(), String> {
         Some(failure) => Err(failure),
         None => Ok(()),
     }
+}
+
+/// What the gateway reports about this host's sentinels, or why it could not.
+/// A stopped or unconfigured sentinel is reported, not a doctor failure: the
+/// sentinel is optional and Tightbeam runs without it.
+enum SentinelStatus {
+    Listed(Value),
+    Unavailable(String),
+}
+
+fn doctor_sentinels(
+    base_dir: &Path,
+    explicit_base_dir: bool,
+    identity: &crate::args::Identity,
+) -> SentinelStatus {
+    let endpoint = if explicit_base_dir {
+        crate::dispatch::discover_from(base_dir)
+    } else {
+        crate::dispatch::discover()
+    };
+    let endpoint = match endpoint {
+        Ok(endpoint) => endpoint,
+        Err(reason) => return SentinelStatus::Unavailable(reason),
+    };
+    let request = match crate::dispatch::build_request(&crate::args::Command::SentinelList {
+        identity: identity.clone(),
+    }) {
+        Ok(request) => request,
+        Err(reason) => return SentinelStatus::Unavailable(reason),
+    };
+    let deadline = Instant::now() + std::time::Duration::from_secs(5);
+    match crate::dispatch::send_to_with_deadline(&endpoint, &request, Some(deadline)) {
+        Ok(Some(value)) => SentinelStatus::Listed(value),
+        Ok(None) => {
+            SentinelStatus::Unavailable("the gateway returned no sentinel status".to_owned())
+        }
+        Err(reason) => SentinelStatus::Unavailable(reason),
+    }
+}
+
+/// The sentinel section of `doctor --json`. The bundles' setup text belongs to
+/// `learn` and `kungfu setup`; doctor carries the computed list.
+fn sentinel_value(status: &SentinelStatus) -> Value {
+    match status {
+        SentinelStatus::Listed(value) => {
+            let mut value = value.clone();
+            if let Some(setups) = value.get_mut("setup").and_then(Value::as_array_mut) {
+                for setup in setups {
+                    if let Some(fields) = setup.as_object_mut() {
+                        fields.remove("setup_text");
+                    }
+                }
+            }
+            value
+        }
+        SentinelStatus::Unavailable(reason) => {
+            object([("unavailable", Value::from(reason.clone()))])
+        }
+    }
+}
+
+fn sentinel_lines(status: &SentinelStatus) -> Vec<String> {
+    let value = match status {
+        SentinelStatus::Unavailable(reason) => {
+            return vec![format!(
+                "sentinels: status unavailable ({reason}); run doctor from a session or pass --as-user <userId>"
+            )];
+        }
+        SentinelStatus::Listed(value) => value,
+    };
+    let text = |value: &Value, key: &str| value.get(key).and_then(Value::as_str).map(str::to_owned);
+    let host = text(value, "host").unwrap_or_else(|| "?".to_owned());
+    let sentinels = value
+        .get("sentinels")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if sentinels.is_empty() {
+        return vec![format!("sentinels: none learned on {host}")];
+    }
+
+    let mut lines = Vec::new();
+    for sentinel in &sentinels {
+        let mut line = format!(
+            "sentinel {} on {host}: {}",
+            text(sentinel, "sentinel").unwrap_or_default(),
+            text(sentinel, "state").unwrap_or_default()
+        );
+        let missing = sentinel
+            .get("missing")
+            .and_then(Value::as_array)
+            .map(|names| names.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+            .unwrap_or_default();
+        if !missing.is_empty() {
+            line.push_str(&format!("; missing {}", missing.join(", ")));
+        }
+        if let Some(sha256) = text(sentinel, "command_sha256") {
+            line.push_str(&format!("; command sha256 {sha256}"));
+        }
+        if let Some(reason) = text(sentinel, "reason") {
+            line.push_str(&format!("; {reason}"));
+        }
+        lines.push(line);
+    }
+    for setup in value
+        .get("setup")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let bundle = text(setup, "bundle").unwrap_or_default();
+        let pending = setup
+            .get("pending")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if pending.is_empty() {
+            lines.push(format!("setup {bundle}: nothing pending"));
+            continue;
+        }
+        if setup.get("setup_text").is_some_and(|text| !text.is_null()) {
+            lines.push(format!(
+                "setup {bundle}: steps are in `tightbeam kungfu setup {bundle}`"
+            ));
+        }
+        for item in &pending {
+            let setting = text(item, "setting").map_or_else(String::new, |name| format!(" {name}"));
+            lines.push(format!(
+                "setup {bundle}: {} {}{setting}: {}",
+                text(item, "sentinel").unwrap_or_default(),
+                text(item, "state").unwrap_or_default(),
+                text(item, "action").unwrap_or_default()
+            ));
+        }
+    }
+    lines
 }
 
 fn require_credential_integrity(
@@ -1685,6 +1833,64 @@ mod tests {
             seconds,
             microseconds: 123,
         }
+    }
+
+    #[test]
+    fn doctor_reports_sentinel_state_and_pending_setup_without_values_or_text() {
+        let listed = SentinelStatus::Listed(serde_json::json!({
+            "host": "example-host",
+            "sentinels": [
+                {"sentinel": "example-bundle/watch", "state": "stopped", "requires": ["EXAMPLE_A", "EXAMPLE_B"],
+                 "missing": ["EXAMPLE_B"], "command_sha256": "abc123", "started_at": 1, "reason": "exited 5 times"},
+                {"sentinel": "other-bundle/watch", "state": "enabled", "requires": [], "missing": [],
+                 "command_sha256": null, "started_at": null, "reason": null}
+            ],
+            "setup": [
+                {"bundle": "example-bundle", "host": "example-host", "setup_text": "Long setup steps.",
+                 "sentinels": ["example-bundle/watch"],
+                 "pending": [
+                    {"sentinel": "example-bundle/watch", "state": "setting-missing", "setting": "EXAMPLE_B",
+                     "action": "run: tightbeam host-env-set --sentinel example-bundle/watch EXAMPLE_B=<value>"},
+                    {"sentinel": "example-bundle/watch", "state": "stopped", "reason": "exited 5 times",
+                     "action": "run: tightbeam sentinel enable example-bundle/watch"}
+                 ]},
+                {"bundle": "other-bundle", "host": "example-host", "setup_text": null,
+                 "sentinels": ["other-bundle/watch"], "pending": []}
+            ]
+        }));
+
+        assert_eq!(
+            sentinel_lines(&listed),
+            vec![
+                "sentinel example-bundle/watch on example-host: stopped; missing EXAMPLE_B; command sha256 abc123; exited 5 times",
+                "sentinel other-bundle/watch on example-host: enabled",
+                "setup example-bundle: steps are in `tightbeam kungfu setup example-bundle`",
+                "setup example-bundle: example-bundle/watch setting-missing EXAMPLE_B: run: tightbeam host-env-set --sentinel example-bundle/watch EXAMPLE_B=<value>",
+                "setup example-bundle: example-bundle/watch stopped: run: tightbeam sentinel enable example-bundle/watch",
+                "setup other-bundle: nothing pending",
+            ]
+        );
+        let value = sentinel_value(&listed);
+        assert!(value["setup"][0].get("setup_text").is_none());
+        assert_eq!(value["setup"][0]["pending"].as_array().unwrap().len(), 2);
+
+        assert_eq!(
+            sentinel_lines(&SentinelStatus::Listed(
+                serde_json::json!({"host": "example-host", "sentinels": [], "setup": []})
+            )),
+            vec!["sentinels: none learned on example-host"]
+        );
+        let offline = SentinelStatus::Unavailable("connection refused".to_owned());
+        assert_eq!(
+            sentinel_lines(&offline),
+            vec![
+                "sentinels: status unavailable (connection refused); run doctor from a session or pass --as-user <userId>"
+            ]
+        );
+        assert_eq!(
+            sentinel_value(&offline),
+            serde_json::json!({"unavailable": "connection refused"})
+        );
     }
 
     #[test]
@@ -2451,7 +2657,7 @@ mod tests {
                 adapter_stderr_log_count: None,
             },
         );
-        let encoded: Value = serde_json::from_str(&report_json(&report)).unwrap();
+        let encoded: Value = serde_json::from_str(&report_json(&report, None)).unwrap();
         assert_eq!(
             encoded,
             serde_json::from_str::<Value>(
@@ -2553,7 +2759,7 @@ mod tests {
                 adapter_stderr_log_count: Some(2),
             },
         );
-        let encoded: Value = serde_json::from_str(&report_json(&report)).unwrap();
+        let encoded: Value = serde_json::from_str(&report_json(&report, None)).unwrap();
         assert_eq!(
             encoded,
             serde_json::from_str::<Value>(

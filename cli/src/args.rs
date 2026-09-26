@@ -54,6 +54,7 @@ pub enum Command {
     /// Print only the nearest session marker's non-secret session key.
     IdentityCurrent,
     Doctor {
+        identity: Identity,
         json: bool,
         base_dir: Option<String>,
     },
@@ -489,6 +490,21 @@ pub enum Command {
     KungfuList {
         identity: Identity,
     },
+    KungfuSetup {
+        identity: Identity,
+        name: String,
+    },
+    SentinelEnable {
+        identity: Identity,
+        name: String,
+    },
+    SentinelDisable {
+        identity: Identity,
+        name: String,
+    },
+    SentinelList {
+        identity: Identity,
+    },
     IdentityApply {
         identity: Identity,
         session_key: Option<String>,
@@ -534,6 +550,24 @@ pub enum Command {
         identity: Identity,
         host: String,
         harness: String,
+        name: String,
+    },
+    SentinelEnvSet {
+        identity: Identity,
+        host: Option<String>,
+        sentinel: String,
+        name: String,
+        value: String,
+    },
+    SentinelEnvList {
+        identity: Identity,
+        host: Option<String>,
+        sentinel: String,
+    },
+    SentinelEnvUnset {
+        identity: Identity,
+        host: Option<String>,
+        sentinel: String,
         name: String,
     },
     HostToolchainSet {
@@ -889,6 +923,14 @@ COMMANDS:
       List the kungfu bundles shipped with this Tightbeam build and each
       bundle's declared root archetype.
 
+  kungfu setup <bundle>
+      Show a learned bundle's setup text and what remains before each sentinel
+      it declares runs on this gateway's host. Changes nothing.
+
+  sentinel list
+      List learned sentinels on this gateway's host: state, required setting
+      names, missing names and the running command's SHA-256.
+
   identity current
       Print this session's key without printing its bearer credential.
 
@@ -905,7 +947,13 @@ COMMANDS:
       Install a shipped kungfu bundle. Available bundles ship with Tightbeam
       under priv/kungfu/; learning an installed bundle is a no-op.
   unlearn <bundle> [--key <idempotencyKey>]
-      Remove a learned kungfu bundle by its committed receipt.
+      Remove a learned kungfu bundle by its committed receipt, with its
+      sentinels' state and settings.
+  sentinel enable <sentinel>
+  sentinel disable <sentinel>
+      Start or stop a sentinel on this gateway's host and keep it so across
+      restarts. Name it <bundle>/<name>, or by bare name when only one bundle
+      declares it. Enable refuses while a required setting is missing.
   identity status [<archetype>]
       Report the live revision, session revisions, staleness, and conflicts. A
       session's identityRevision is the revision its Tightbeam skill files were
@@ -962,14 +1010,22 @@ COMMANDS:
       List environment overlays, optionally filtered by exact host and harness.
   host-env-unset --host <host> --harness <harness> NAME
       Remove one exact environment overlay.
+  host-env-set [--host <host>] --sentinel <sentinel> NAME=VALUE
+  host-env-list [--host <host>] --sentinel <sentinel>
+  host-env-unset [--host <host>] --sentinel <sentinel> NAME
+      Manage a sentinel's settings on this gateway's host. They reach only that
+      sentinel, never a harness; results show names, never values.
   host-toolchain-set --host <host> --dirs '<json-array>'
       Replace the host's ordered toolchain directories. An empty array restores
       the inherited PATH. The result previews the PATH shape adapters will use.
   harness-process list
       List the durable harness launch ledger, newest launch first.
 
-  doctor [--json] [--base-dir p]
-      Check the local Tightbeam installation and report its health.
+  doctor [--json] [--base-dir p] [--as <role> | --as-user <userId>]
+      Check the local Tightbeam installation and report its health, with each
+      learned sentinel's state and what remains to set it up. Sentinel status
+      comes from the gateway under the given identity (this session's by
+      default); setting values are never shown.
 
   assimilate <ssh-dest> [--name n] [--base-dir p] [--harness {{HARNESSES_CSV}}]
              [--dry-run]
@@ -1152,6 +1208,16 @@ fn named(flags: &HashMap<String, String>, name: &str) -> Option<Option<String>> 
 }
 
 fn identity(flags: &HashMap<String, String>) -> Result<Identity, String> {
+    identity_from(flags, std::env::var("TIGHTBEAM_AS_PROCESS").ok())
+}
+
+/// A call with no identity flag is attributed to the process named by
+/// `TIGHTBEAM_AS_PROCESS` when the environment sets it (a supervised sentinel's
+/// calls), and to this session otherwise. An explicit flag always wins.
+fn identity_from(
+    flags: &HashMap<String, String>,
+    as_process: Option<String>,
+) -> Result<Identity, String> {
     let identities = [
         nonempty(flags, "as").map(Identity::Role),
         nonempty(flags, "as-user").map(Identity::User),
@@ -1163,7 +1229,9 @@ fn identity(flags: &HashMap<String, String>) -> Result<Identity, String> {
 
     match identities.as_slice() {
         [identity] => Ok(identity.clone()),
-        [] => Ok(Identity::Session),
+        [] => Ok(as_process
+            .filter(|value| !value.is_empty())
+            .map_or(Identity::Session, Identity::Process)),
         _ => Err(
             "identity flags are mutually exclusive: pass exactly one of --as, --as-user, or --as-process"
                 .to_owned(),
@@ -1536,12 +1604,16 @@ fn parse_with_optional_catalog(
             if parsed.positional.len() != 1
                 || flags
                     .keys()
-                    .any(|flag| !matches!(flag.as_str(), "json" | "base-dir"))
+                    .any(|flag| !matches!(flag.as_str(), "json" | "base-dir" | "as" | "as-user"))
                 || (flags.contains_key("base-dir") && base_dir.is_none())
             {
-                return Err("usage: tightbeam doctor [--json] [--base-dir DIR]".to_owned());
+                return Err(
+                    "usage: tightbeam doctor [--json] [--base-dir DIR] [--as <role> | --as-user <userId>]"
+                        .to_owned(),
+                );
             }
             Ok(Command::Doctor {
+                identity: identity(flags)?,
                 json: flags.contains_key("json"),
                 base_dir,
             })
@@ -2795,14 +2867,17 @@ fn parse_with_optional_catalog(
             })
         }
         "identity" => parse_identity_command(&parsed, flags),
-        "kungfu" => {
-            if parsed.positional.as_slice() != ["kungfu", "list"] {
-                return Err("usage: tightbeam kungfu list".to_owned());
-            }
-            Ok(Command::KungfuList {
+        "kungfu" => match parsed.positional.as_slice() {
+            [_, list] if list == "list" => Ok(Command::KungfuList {
                 identity: identity(flags)?,
-            })
-        }
+            }),
+            [_, setup, bundle] if setup == "setup" => Ok(Command::KungfuSetup {
+                identity: identity(flags)?,
+                name: bundle.clone(),
+            }),
+            _ => Err("usage: tightbeam kungfu list | tightbeam kungfu setup <bundle>".to_owned()),
+        },
+        "sentinel" => parse_sentinel(&parsed, flags),
         "learn" | "unlearn" => {
             if parsed.positional.len() != 2 {
                 return Err(format!(
@@ -2889,19 +2964,33 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, cancel-wake, attest, attests, breathing, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-update, work-item-get, work-item-delivery-scope-set, delivery-scope-owner-set, delivery-responsibility-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, cancel-wake, attest, attests, breathing, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-update, work-item-get, work-item-delivery-scope-set, delivery-scope-owner-set, delivery-responsibility-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process"
         )),
     }
 }
 
 fn parse_host_env_set(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Command, String> {
-    let usage = "usage: tightbeam host-env-set --host <host> --harness <harness> NAME=VALUE";
+    let usage = if flags.contains_key("sentinel") {
+        "usage: tightbeam host-env-set [--host <host>] --sentinel <sentinel> NAME=VALUE"
+    } else {
+        "usage: tightbeam host-env-set --host <host> --harness <harness> NAME=VALUE"
+    };
     let assignment = parsed
         .positional
         .get(1)
         .filter(|_| parsed.positional.len() == 2)
         .ok_or_else(|| usage.to_owned())?;
     let (name, value) = assignment.split_once('=').ok_or_else(|| usage.to_owned())?;
+
+    if let Some(sentinel) = sentinel_scope(flags)? {
+        return Ok(Command::SentinelEnvSet {
+            identity: identity(flags)?,
+            host: nonempty(flags, "host"),
+            sentinel,
+            name: name.to_owned(),
+            value: value.to_owned(),
+        });
+    }
 
     Ok(Command::HostEnvSet {
         identity: identity(flags)?,
@@ -2915,8 +3004,17 @@ fn parse_host_env_set(parsed: &Flags, flags: &HashMap<String, String>) -> Result
 fn parse_host_env_list(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Command, String> {
     if parsed.positional.len() != 1 {
         return Err(
-            "usage: tightbeam host-env-list [--host <host>] [--harness <harness>]".to_owned(),
+            "usage: tightbeam host-env-list [--host <host>] [--harness <harness> | --sentinel <sentinel>]"
+                .to_owned(),
         );
+    }
+
+    if let Some(sentinel) = sentinel_scope(flags)? {
+        return Ok(Command::SentinelEnvList {
+            identity: identity(flags)?,
+            host: nonempty(flags, "host"),
+            sentinel,
+        });
     }
 
     Ok(Command::HostEnvList {
@@ -2930,12 +3028,25 @@ fn parse_host_env_unset(
     parsed: &Flags,
     flags: &HashMap<String, String>,
 ) -> Result<Command, String> {
-    let usage = "usage: tightbeam host-env-unset --host <host> --harness <harness> NAME";
+    let usage = if flags.contains_key("sentinel") {
+        "usage: tightbeam host-env-unset [--host <host>] --sentinel <sentinel> NAME"
+    } else {
+        "usage: tightbeam host-env-unset --host <host> --harness <harness> NAME"
+    };
     let name = parsed
         .positional
         .get(1)
         .filter(|_| parsed.positional.len() == 2)
         .ok_or_else(|| usage.to_owned())?;
+
+    if let Some(sentinel) = sentinel_scope(flags)? {
+        return Ok(Command::SentinelEnvUnset {
+            identity: identity(flags)?,
+            host: nonempty(flags, "host"),
+            sentinel,
+            name: name.clone(),
+        });
+    }
 
     Ok(Command::HostEnvUnset {
         identity: identity(flags)?,
@@ -2943,6 +3054,35 @@ fn parse_host_env_unset(
         harness: nonempty(flags, "harness").ok_or_else(|| usage.to_owned())?,
         name: name.clone(),
     })
+}
+
+/// `--sentinel` selects a sentinel's settings scope instead of a harness's; the
+/// two scopes never mix in one command.
+fn sentinel_scope(flags: &HashMap<String, String>) -> Result<Option<String>, String> {
+    match (nonempty(flags, "sentinel"), nonempty(flags, "harness")) {
+        (Some(_), Some(_)) => Err(
+            "--sentinel and --harness name different settings scopes; pass one of them".to_owned(),
+        ),
+        (sentinel, _) => Ok(sentinel),
+    }
+}
+
+fn parse_sentinel(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Command, String> {
+    let usage = "usage: tightbeam sentinel enable <sentinel> | tightbeam sentinel disable <sentinel> | tightbeam sentinel list";
+    match parsed.positional.as_slice() {
+        [_, list] if list == "list" => Ok(Command::SentinelList {
+            identity: identity(flags)?,
+        }),
+        [_, action, name] if action == "enable" => Ok(Command::SentinelEnable {
+            identity: identity(flags)?,
+            name: name.clone(),
+        }),
+        [_, action, name] if action == "disable" => Ok(Command::SentinelDisable {
+            identity: identity(flags)?,
+            name: name.clone(),
+        }),
+        _ => Err(usage.to_owned()),
+    }
 }
 
 fn parse_host_toolchain_set(
@@ -3528,6 +3668,172 @@ mod tests {
                 harness: "claude".to_owned(),
                 name: "EXAMPLE_OVERLAY_VAR".to_owned(),
             })
+        );
+    }
+
+    #[test]
+    fn sentinel_scope_parses_without_a_host_and_excludes_harness() {
+        assert_eq!(
+            parse(strings(&[
+                "host-env-set",
+                "--sentinel",
+                "example-bundle/watch",
+                "EXAMPLE_SETTING=a=b",
+                "--as-user",
+                "flynn",
+            ])),
+            Ok(Command::SentinelEnvSet {
+                identity: Identity::User("flynn".to_owned()),
+                host: None,
+                sentinel: "example-bundle/watch".to_owned(),
+                name: "EXAMPLE_SETTING".to_owned(),
+                value: "a=b".to_owned(),
+            })
+        );
+        assert_eq!(
+            parse(strings(&[
+                "host-env-list",
+                "--host",
+                "example-host",
+                "--sentinel",
+                "watch",
+            ])),
+            Ok(Command::SentinelEnvList {
+                identity: Identity::Session,
+                host: Some("example-host".to_owned()),
+                sentinel: "watch".to_owned(),
+            })
+        );
+        assert_eq!(
+            parse(strings(&[
+                "host-env-unset",
+                "--sentinel",
+                "example-bundle/watch",
+                "EXAMPLE_SETTING",
+            ])),
+            Ok(Command::SentinelEnvUnset {
+                identity: Identity::Session,
+                host: None,
+                sentinel: "example-bundle/watch".to_owned(),
+                name: "EXAMPLE_SETTING".to_owned(),
+            })
+        );
+        for args in [
+            strings(&[
+                "host-env-set",
+                "--sentinel",
+                "w",
+                "--harness",
+                "claude",
+                "A=b",
+            ]),
+            strings(&["host-env-list", "--sentinel", "w", "--harness", "claude"]),
+            strings(&[
+                "host-env-unset",
+                "--sentinel",
+                "w",
+                "--harness",
+                "claude",
+                "A",
+            ]),
+        ] {
+            assert_eq!(
+                parse(args),
+                Err(
+                    "--sentinel and --harness name different settings scopes; pass one of them"
+                        .to_owned()
+                )
+            );
+        }
+        assert_eq!(
+            parse(strings(&[
+                "host-env-set",
+                "--sentinel",
+                "w",
+                "NO_ASSIGNMENT"
+            ])),
+            Err(
+                "usage: tightbeam host-env-set [--host <host>] --sentinel <sentinel> NAME=VALUE"
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn sentinel_and_kungfu_setup_commands_parse() {
+        assert_eq!(
+            parse(strings(&["sentinel", "enable", "example-bundle/watch"])),
+            Ok(Command::SentinelEnable {
+                identity: Identity::Session,
+                name: "example-bundle/watch".to_owned(),
+            })
+        );
+        assert_eq!(
+            parse(strings(&[
+                "sentinel",
+                "disable",
+                "watch",
+                "--as-user",
+                "flynn"
+            ])),
+            Ok(Command::SentinelDisable {
+                identity: Identity::User("flynn".to_owned()),
+                name: "watch".to_owned(),
+            })
+        );
+        assert_eq!(
+            parse(strings(&["sentinel", "list"])),
+            Ok(Command::SentinelList {
+                identity: Identity::Session,
+            })
+        );
+        assert_eq!(
+            parse(strings(&["kungfu", "setup", "example-bundle"])),
+            Ok(Command::KungfuSetup {
+                identity: Identity::Session,
+                name: "example-bundle".to_owned(),
+            })
+        );
+        for args in [
+            strings(&["sentinel"]),
+            strings(&["sentinel", "enable"]),
+            strings(&["sentinel", "start", "watch"]),
+            strings(&["sentinel", "list", "extra"]),
+        ] {
+            assert_eq!(
+                parse(args),
+                Err("usage: tightbeam sentinel enable <sentinel> | tightbeam sentinel disable <sentinel> | tightbeam sentinel list".to_owned())
+            );
+        }
+        assert_eq!(
+            parse(strings(&["kungfu", "setup"])),
+            Err("usage: tightbeam kungfu list | tightbeam kungfu setup <bundle>".to_owned())
+        );
+    }
+
+    #[test]
+    fn an_unflagged_call_takes_the_supervised_process_identity() {
+        let none = HashMap::new();
+        assert_eq!(
+            identity_from(&none, Some("sentinel:example-bundle/watch".to_owned())),
+            Ok(Identity::Process(
+                "sentinel:example-bundle/watch".to_owned()
+            ))
+        );
+        assert_eq!(identity_from(&none, None), Ok(Identity::Session));
+        assert_eq!(
+            identity_from(&none, Some(String::new())),
+            Ok(Identity::Session)
+        );
+        let flagged = HashMap::from([("as-process".to_owned(), "watch".to_owned())]);
+        assert_eq!(
+            identity_from(&flagged, Some("sentinel:example-bundle/watch".to_owned())),
+            Ok(Identity::Process("watch".to_owned()))
+        );
+        let as_user = HashMap::from([("as-user".to_owned(), "flynn".to_owned())]);
+        assert_eq!(
+            identity_from(&as_user, Some("sentinel:example-bundle/watch".to_owned())),
+            Ok(Identity::User("flynn".to_owned()))
         );
     }
 
@@ -4219,6 +4525,7 @@ mod tests {
                 "operator-rule",
                 "operator-withdraw",
                 "retire",
+                "sentinel",
                 "session-reparent",
                 "session-po-set",
                 "settle-turn",
@@ -4282,6 +4589,13 @@ mod tests {
             "host-toolchain-set --host <host> --dirs '<json-array>'",
             "harness-process list",
             "kungfu list",
+            "kungfu setup <bundle>",
+            "sentinel list",
+            "sentinel enable <sentinel>",
+            "sentinel disable <sentinel>",
+            "host-env-set [--host <host>] --sentinel <sentinel> NAME=VALUE",
+            "host-env-list [--host <host>] --sentinel <sentinel>",
+            "host-env-unset [--host <host>] --sentinel <sentinel> NAME",
         ] {
             assert!(help.contains(syntax), "missing HELP syntax: {syntax}");
         }
@@ -4960,7 +5274,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, cancel-wake, attest, attests, breathing, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-update, work-item-get, work-item-delivery-scope-set, delivery-scope-owner-set, delivery-responsibility-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned()),
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, cancel-wake, attest, attests, breathing, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-update, work-item-get, work-item-delivery-scope-set, delivery-scope-owner-set, delivery-responsibility-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process".to_owned()),
         );
     }
 
@@ -5138,8 +5452,17 @@ mod tests {
                 "/tmp/tightbeam",
             ])),
             Ok(Command::Doctor {
+                identity: Identity::Session,
                 json: true,
                 base_dir: Some("/tmp/tightbeam".to_owned()),
+            })
+        );
+        assert_eq!(
+            parse(strings(&["doctor", "--as-user", "flynn"])),
+            Ok(Command::Doctor {
+                identity: Identity::User("flynn".to_owned()),
+                json: false,
+                base_dir: None,
             })
         );
         for args in [
@@ -5149,7 +5472,10 @@ mod tests {
         ] {
             assert_eq!(
                 parse(args),
-                Err("usage: tightbeam doctor [--json] [--base-dir DIR]".to_owned())
+                Err(
+                    "usage: tightbeam doctor [--json] [--base-dir DIR] [--as <role> | --as-user <userId>]"
+                        .to_owned()
+                )
             );
         }
     }
@@ -5497,6 +5823,7 @@ mod tests {
             (
                 strings(&["doctor", "--json", "--base-dir", "/tmp/tightbeam"]),
                 Command::Doctor {
+                    identity: Identity::Session,
                     json: true,
                     base_dir: Some("/tmp/tightbeam".to_owned()),
                 },

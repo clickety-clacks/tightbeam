@@ -22,6 +22,9 @@ defmodule Tightbeam.Identity do
   @reserved_prefix "tightbeam__"
   @seed_owned_paths ["archetypes/default.toml", "guidance/operating-model.md"]
   @bundle_doc_paths ~w(capabilities.md intake.md preferred-models.md manifest.toml)
+  @bundle_setup_path "setup.md"
+  @sentinel_keys ~w(name command requires)
+  @env_name ~r/^[A-Z_][A-Z0-9_]*$/
   @render_contract "universal-root-render-v1"
   @universal_roots ["operating-model.md", "operating-manual.md"]
 
@@ -753,7 +756,164 @@ defmodule Tightbeam.Identity do
           phrases
       end
 
-    %{purpose: purpose, phrases: phrases, root_archetype: Map.fetch!(manifest, "root_archetype")}
+    %{
+      purpose: purpose,
+      phrases: phrases,
+      root_archetype: Map.fetch!(manifest, "root_archetype"),
+      sentinels: sentinel_declarations!(Map.get(manifest, "sentinels", []), path)
+    }
+  end
+
+  defp sentinel_declarations!(entries, path) when is_list(entries) do
+    declarations = Enum.map(entries, &sentinel_declaration!(&1, path))
+    names = Enum.map(declarations, & &1.name)
+
+    case names -- Enum.uniq(names) do
+      [] ->
+        declarations
+
+      duplicates ->
+        raise ArgumentError, "kungfu manifest declares sentinel #{hd(duplicates)} twice: #{path}"
+    end
+  end
+
+  defp sentinel_declarations!(_entries, path),
+    do: raise(ArgumentError, "kungfu manifest sentinels must be an array of tables: #{path}")
+
+  defp sentinel_declaration!(entry, path) when is_map(entry) do
+    case Map.keys(entry) -- @sentinel_keys do
+      [] ->
+        :ok
+
+      keys ->
+        raise ArgumentError,
+              "kungfu manifest sentinel has unknown keys #{Enum.join(Enum.sort(keys), ", ")}: #{path}"
+    end
+
+    name = Map.get(entry, "name")
+    command = Map.get(entry, "command")
+    requires = Map.get(entry, "requires")
+
+    unless is_binary(name) and Regex.match?(~r/^[A-Za-z0-9][A-Za-z0-9_-]*$/, name) do
+      raise ArgumentError,
+            "kungfu manifest sentinel name must match [A-Za-z0-9][A-Za-z0-9_-]*: #{path}"
+    end
+
+    unless bundle_relative_file?(command) and
+             command not in [@bundle_setup_path | @bundle_doc_paths] do
+      raise ArgumentError,
+            "kungfu manifest sentinel #{name} command must be a file path inside the bundle: #{path}"
+    end
+
+    unless is_list(requires) and
+             Enum.all?(requires, &(is_binary(&1) and Regex.match?(@env_name, &1))) do
+      raise ArgumentError,
+            "kungfu manifest sentinel #{name} requires must be a list of names matching [A-Z_][A-Z0-9_]*: #{path}"
+    end
+
+    %{name: name, command: command, requires: Enum.uniq(requires)}
+  end
+
+  defp sentinel_declaration!(_entry, path),
+    do: raise(ArgumentError, "kungfu manifest sentinels must be an array of tables: #{path}")
+
+  defp bundle_relative_file?(relative) when is_binary(relative) do
+    segments = String.split(relative, "/")
+
+    Path.type(relative) == :relative and
+      Enum.all?(
+        segments,
+        &(&1 not in ["", ".", ".."] and Regex.match?(~r/^[A-Za-z0-9_.-]+$/, &1))
+      )
+  end
+
+  defp bundle_relative_file?(_relative), do: false
+
+  @doc """
+  Sentinels declared by the learned bundles of the published identity.
+
+  Each command path is the bundle-namespaced file at `revision`; the supervisor
+  runs exactly those bytes.
+  """
+  @spec learned_sentinels(String.t()) :: %{
+          revision: String.t(),
+          sentinels: [
+            %{
+              bundle: String.t(),
+              name: String.t(),
+              qualified: String.t(),
+              command_path: String.t(),
+              requires: [String.t()]
+            }
+          ]
+        }
+  def learned_sentinels(base_dir) do
+    dir = identity_dir(base_dir)
+    revision = git_output!(dir, ["rev-parse", @live])
+
+    sentinels =
+      for bundle <- learned_bundle_names(dir, revision),
+          sentinel <- live_bundle_sentinels(dir, revision, bundle) do
+        %{
+          bundle: bundle,
+          name: sentinel.name,
+          qualified: "#{bundle}/#{sentinel.name}",
+          command_path: Path.join(["kungfu", bundle, sentinel.command]),
+          requires: sentinel.requires
+        }
+      end
+
+    %{revision: revision, sentinels: sentinels}
+  end
+
+  @doc """
+  One bundle's setup source: whether the published identity has it learned, its
+  published `setup.md` text, and the sentinels the shipped bundle declares, so a
+  bundle learned before it shipped a sentinel can say one awaits `identity relearn`.
+  """
+  @spec bundle_setup_source(String.t(), String.t()) :: %{
+          learned: boolean(),
+          setup_text: String.t() | nil,
+          shipped_sentinels: [String.t()]
+        }
+  def bundle_setup_source(base_dir, name) do
+    validate_name!(name)
+    dir = identity_dir(base_dir)
+    revision = git_output!(dir, ["rev-parse", @live])
+    learned = name in learned_bundle_names(dir, revision)
+    setup_path = Path.join(["kungfu", name, @bundle_setup_path])
+
+    shipped =
+      if name in available_bundle_names() do
+        manifest_path = Path.join(bundle_dir(name), "manifest.toml")
+        bundle_manifest!(File.read!(manifest_path), manifest_path).sentinels
+      else
+        []
+      end
+
+    %{
+      learned: learned,
+      setup_text:
+        if(learned and path_exists_at?(dir, revision, setup_path),
+          do: git_show_bytes!(dir, revision, setup_path)
+        ),
+      shipped_sentinels: Enum.map(shipped, & &1.name)
+    }
+  end
+
+  @doc "The exact bytes of a file in the published identity at `revision`."
+  @spec revision_file_bytes!(String.t(), String.t(), String.t()) :: binary()
+  def revision_file_bytes!(base_dir, revision, path),
+    do: git_show_bytes!(identity_dir(base_dir), revision, path)
+
+  defp live_bundle_sentinels(dir, revision, bundle) do
+    manifest_path = Path.join(["kungfu", bundle, "manifest.toml"])
+
+    if path_exists_at?(dir, revision, manifest_path) do
+      bundle_manifest!(git_show!(dir, revision, manifest_path), manifest_path).sentinels
+    else
+      []
+    end
   end
 
   @doc "Import the current seed and learned bundle snapshots, then merge them into main."
@@ -834,7 +994,13 @@ defmodule Tightbeam.Identity do
     )
   end
 
-  defp bundle_root_dir, do: Application.app_dir(:tightbeam, "priv/kungfu")
+  defp bundle_root_dir do
+    Application.get_env(
+      :tightbeam,
+      :kungfu_bundle_root_dir,
+      Application.app_dir(:tightbeam, "priv/kungfu")
+    )
+  end
 
   defp bundle_dir("agentic-engineering") do
     Application.get_env(
@@ -881,18 +1047,31 @@ defmodule Tightbeam.Identity do
   end
 
   defp bundle_entries(name, bundle) do
-    manifest_path = Path.join(bundle, "manifest.toml")
-    _manifest = bundle_manifest!(File.read!(manifest_path), manifest_path)
+    commands = bundle_sentinel_commands!(name, bundle)
+    namespaced = [@bundle_setup_path | @bundle_doc_paths] ++ commands
 
     bundle
     |> source_entries()
-    |> Enum.map(fn
-      {relative, bytes}
-      when relative in @bundle_doc_paths ->
-        {Path.join(["kungfu", name, relative]), bytes}
+    |> Enum.map(fn {relative, bytes} ->
+      if relative in namespaced,
+        do: {Path.join(["kungfu", name, relative]), bytes},
+        else: {relative, bytes}
+    end)
+  end
 
-      {relative, bytes} ->
-        {relative, bytes}
+  # Declared sentinel commands, each checked to be a file the bundle ships.
+  defp bundle_sentinel_commands!(name, bundle) do
+    manifest_path = Path.join(bundle, "manifest.toml")
+    manifest = bundle_manifest!(File.read!(manifest_path), manifest_path)
+
+    Enum.map(manifest.sentinels, fn sentinel ->
+      unless File.regular?(Path.join(bundle, sentinel.command)) do
+        raise ArgumentError,
+              "kungfu bundle #{name} declares sentinel #{sentinel.name} command " <>
+                "#{sentinel.command}, which the bundle does not ship"
+      end
+
+      sentinel.command
     end)
   end
 
@@ -912,8 +1091,16 @@ defmodule Tightbeam.Identity do
           bundle_entries(name, bundle)
         end)
 
+    executables =
+      Enum.flat_map(bundle_names, fn name ->
+        name
+        |> bundle_sentinel_commands!(bundle_dir(name))
+        |> Enum.map(&Path.join(["kungfu", name, &1]))
+      end)
+
     git!(dir, ["switch", @upstream])
     replace_with_entries!(dir, entries)
+    Enum.each(executables, &File.chmod!(Path.join(dir, &1), 0o755))
     git!(dir, ["add", "-A"])
     git!(dir, ["commit", "--allow-empty", "-m", message], "tightbeam")
     git!(dir, ["switch", "main"])
@@ -991,8 +1178,8 @@ defmodule Tightbeam.Identity do
     end
   end
 
-  defp learned_bundle_names(dir) do
-    git_output!(dir, ["ls-tree", "-r", "--name-only", "main", "--", "kungfu"])
+  defp learned_bundle_names(dir, revision \\ "main") do
+    git_output!(dir, ["ls-tree", "-r", "--name-only", revision, "--", "kungfu"])
     |> String.split("\n", trim: true)
     |> Enum.flat_map(fn path ->
       case String.split(path, "/") do

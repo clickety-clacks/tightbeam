@@ -8,3 +8,8 @@ phrases = [
   "The same bug keeps coming back and nobody finds the cause.",
   "I want to know a change was actually tested, not just claimed."
 ]
+
+[[sentinels]]
+name = "landing-watch"
+command = "sentinels/landing-watch"
+requires = ["GH_CONFIG_DIR", "LANDING_REPOS"]
