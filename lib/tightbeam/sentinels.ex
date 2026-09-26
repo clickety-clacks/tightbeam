@@ -85,7 +85,10 @@ defmodule Tightbeam.Sentinels do
 
   def resolve(_base_dir, reference) do
     {:error,
-     %{code: "unknown_sentinel", message: "unknown_sentinel rule: #{inspect(reference)} is not a name"}}
+     %{
+       code: "unknown_sentinel",
+       message: "unknown_sentinel rule: #{inspect(reference)} is not a name"
+     }}
   end
 
   @doc "Every durable state row on `host`, keyed by qualified name."
@@ -117,7 +120,9 @@ defmodule Tightbeam.Sentinels do
   @doc "The names among `requires` with no value in the sentinel's scope on `host`."
   @spec missing_settings(DB.server(), String.t(), map()) :: [String.t()]
   def missing_settings(db, host, sentinel) do
-    present = db |> Placement.env_overlays(host, scope(sentinel.qualified)) |> MapSet.new(& &1.name)
+    present =
+      db |> Placement.env_overlays(host, scope(sentinel.qualified)) |> MapSet.new(& &1.name)
+
     Enum.reject(sentinel.requires, &MapSet.member?(present, &1))
   end
 
@@ -145,7 +150,8 @@ defmodule Tightbeam.Sentinels do
            code: "sentinel_settings_missing",
            message:
              "sentinel_settings_missing rule: #{sentinel.qualified} requires " <>
-               Enum.join(missing, ", ") <> " on #{host}; set each with: " <>
+               Enum.join(missing, ", ") <>
+               " on #{host}; set each with: " <>
                Enum.map_join(missing, "; ", &set_command(sentinel.qualified, &1)),
            missing: missing
          }}

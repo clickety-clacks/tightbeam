@@ -1598,7 +1598,9 @@ fn doctor_sentinels(
     let deadline = Instant::now() + std::time::Duration::from_secs(5);
     match crate::dispatch::send_to_with_deadline(&endpoint, &request, Some(deadline)) {
         Ok(Some(value)) => SentinelStatus::Listed(value),
-        Ok(None) => SentinelStatus::Unavailable("the gateway returned no sentinel status".to_owned()),
+        Ok(None) => {
+            SentinelStatus::Unavailable("the gateway returned no sentinel status".to_owned())
+        }
         Err(reason) => SentinelStatus::Unavailable(reason),
     }
 }
@@ -1618,7 +1620,9 @@ fn sentinel_value(status: &SentinelStatus) -> Value {
             }
             value
         }
-        SentinelStatus::Unavailable(reason) => object([("unavailable", Value::from(reason.clone()))]),
+        SentinelStatus::Unavailable(reason) => {
+            object([("unavailable", Value::from(reason.clone()))])
+        }
     }
 }
 
@@ -1633,7 +1637,11 @@ fn sentinel_lines(status: &SentinelStatus) -> Vec<String> {
     };
     let text = |value: &Value, key: &str| value.get(key).and_then(Value::as_str).map(str::to_owned);
     let host = text(value, "host").unwrap_or_else(|| "?".to_owned());
-    let sentinels = value.get("sentinels").and_then(Value::as_array).cloned().unwrap_or_default();
+    let sentinels = value
+        .get("sentinels")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     if sentinels.is_empty() {
         return vec![format!("sentinels: none learned on {host}")];
     }
@@ -1661,9 +1669,18 @@ fn sentinel_lines(status: &SentinelStatus) -> Vec<String> {
         }
         lines.push(line);
     }
-    for setup in value.get("setup").and_then(Value::as_array).into_iter().flatten() {
+    for setup in value
+        .get("setup")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
         let bundle = text(setup, "bundle").unwrap_or_default();
-        let pending = setup.get("pending").and_then(Value::as_array).cloned().unwrap_or_default();
+        let pending = setup
+            .get("pending")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
         if pending.is_empty() {
             lines.push(format!("setup {bundle}: nothing pending"));
             continue;
@@ -1866,9 +1883,14 @@ mod tests {
         let offline = SentinelStatus::Unavailable("connection refused".to_owned());
         assert_eq!(
             sentinel_lines(&offline),
-            vec!["sentinels: status unavailable (connection refused); run doctor from a session or pass --as-user <userId>"]
+            vec![
+                "sentinels: status unavailable (connection refused); run doctor from a session or pass --as-user <userId>"
+            ]
         );
-        assert_eq!(sentinel_value(&offline), serde_json::json!({"unavailable": "connection refused"}));
+        assert_eq!(
+            sentinel_value(&offline),
+            serde_json::json!({"unavailable": "connection refused"})
+        );
     }
 
     #[test]

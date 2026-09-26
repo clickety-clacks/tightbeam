@@ -339,7 +339,15 @@ defmodule Tightbeam.Placement do
   No harness reads that scope, and it has no host-environment projection or state
   notice, so it never appears as a harness environment.
   """
-  @spec set_sentinel_env(DB.server(), String.t(), String.t(), String.t(), String.t(), String.t(), map()) ::
+  @spec set_sentinel_env(
+          DB.server(),
+          String.t(),
+          String.t(),
+          String.t(),
+          String.t(),
+          String.t(),
+          map()
+        ) ::
           {:ok, %{changed: boolean()}} | {:error, map()}
   def set_sentinel_env(db, host, scope, name, value, set_by, call) do
     "sentinel:" <> _qualified = scope

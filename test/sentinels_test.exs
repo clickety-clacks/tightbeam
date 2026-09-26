@@ -106,7 +106,8 @@ defmodule Tightbeam.SentinelsTest do
       assert {:ok, %{qualified: "beta-bundle/watch", requires: ["WATCH_TARGET", "WATCH_EXTRA"]}} =
                Sentinels.resolve(ctx.base, "beta-bundle/watch")
 
-      assert {:error, %{code: "unknown_sentinel"}} = Sentinels.resolve(ctx.base, "alpha-bundle/other")
+      assert {:error, %{code: "unknown_sentinel"}} =
+               Sentinels.resolve(ctx.base, "alpha-bundle/other")
     end
 
     test "a bare name declared by one bundle resolves", ctx do
@@ -138,7 +139,12 @@ defmodule Tightbeam.SentinelsTest do
 
       {:ok, sentinel} = Sentinels.resolve(ctx.base, "alpha-bundle/watch")
 
-      assert {:error, %{code: "sentinel_settings_missing", missing: ["WATCH_TARGET", "WATCH_EXTRA"], message: message}} =
+      assert {:error,
+              %{
+                code: "sentinel_settings_missing",
+                missing: ["WATCH_TARGET", "WATCH_EXTRA"],
+                message: message
+              }} =
                Sentinels.enable(ctx.db, ctx.host, sentinel, "user:flynn")
 
       assert message =~
@@ -150,7 +156,9 @@ defmodule Tightbeam.SentinelsTest do
       assert [%{state: "disabled"}] =
                Sentinels.setup(ctx.base, ctx.db, ctx.host, "alpha-bundle").pending
 
-      assert {:ok, %{state: "enabled"}} = Sentinels.enable(ctx.db, ctx.host, sentinel, "user:flynn")
+      assert {:ok, %{state: "enabled"}} =
+               Sentinels.enable(ctx.db, ctx.host, sentinel, "user:flynn")
+
       assert Sentinels.setup(ctx.base, ctx.db, ctx.host, "alpha-bundle").pending == []
 
       assert ["beta-bundle"] ==
@@ -171,7 +179,10 @@ defmodule Tightbeam.SentinelsTest do
 
       listed = handlers["sentinel-list"].(%{origin: "process:any", params: %{}})
 
-      assert [%{sentinel: "alpha-bundle/watch", state: "disabled", missing: ["WATCH_EXTRA"]}, _beta] =
+      assert [
+               %{sentinel: "alpha-bundle/watch", state: "disabled", missing: ["WATCH_EXTRA"]},
+               _beta
+             ] =
                listed.sentinels
 
       refute inspect(setup) =~ "synthetic-secret-value"
@@ -187,13 +198,20 @@ defmodule Tightbeam.SentinelsTest do
       set =
         handlers["host-env-set"].(%{
           origin: "user:flynn",
-          params: %{sentinel: "alpha-bundle/watch", name: "WATCH_TARGET", value: "synthetic-secret-value"}
+          params: %{
+            sentinel: "alpha-bundle/watch",
+            name: "WATCH_TARGET",
+            value: "synthetic-secret-value"
+          }
         })
 
       assert %{sentinel: "alpha-bundle/watch", name: "WATCH_TARGET", changed: true} = set
 
       listed =
-        handlers["host-env-list"].(%{origin: "user:flynn", params: %{sentinel: "alpha-bundle/watch"}})
+        handlers["host-env-list"].(%{
+          origin: "user:flynn",
+          params: %{sentinel: "alpha-bundle/watch"}
+        })
 
       assert [%{name: "WATCH_TARGET"}] = listed.settings
       assert listed.missing == ["WATCH_EXTRA"]
@@ -207,13 +225,23 @@ defmodule Tightbeam.SentinelsTest do
       assert %{code: "sentinel_scope_conflict"} =
                handlers["host-env-set"].(%{
                  origin: "user:flynn",
-                 params: %{sentinel: "alpha-bundle/watch", harness: "claude", name: "WATCH_TARGET", value: "x"}
+                 params: %{
+                   sentinel: "alpha-bundle/watch",
+                   harness: "claude",
+                   name: "WATCH_TARGET",
+                   value: "x"
+                 }
                })
 
       assert %{code: "sentinel_host_not_local"} =
                handlers["host-env-set"].(%{
                  origin: "user:flynn",
-                 params: %{sentinel: "alpha-bundle/watch", host: "elsewhere", name: "WATCH_TARGET", value: "x"}
+                 params: %{
+                   sentinel: "alpha-bundle/watch",
+                   host: "elsewhere",
+                   name: "WATCH_TARGET",
+                   value: "x"
+                 }
                })
 
       assert %{code: "ambiguous_sentinel"} =
@@ -269,11 +297,27 @@ defmodule Tightbeam.SentinelsTest do
 
     test "a child runs the published bytes with only its own settings and attribution", ctx do
       learn_both!(ctx)
-      set_settings!(ctx, "alpha-bundle/watch", %{"WATCH_TARGET" => "alpha-value", "WATCH_EXTRA" => "e"})
-      set_settings!(ctx, "beta-bundle/watch", %{"WATCH_TARGET" => "beta-value", "BETA_ONLY" => "f"})
+
+      set_settings!(ctx, "alpha-bundle/watch", %{
+        "WATCH_TARGET" => "alpha-value",
+        "WATCH_EXTRA" => "e"
+      })
+
+      set_settings!(ctx, "beta-bundle/watch", %{
+        "WATCH_TARGET" => "beta-value",
+        "BETA_ONLY" => "f"
+      })
+
       enable!(ctx, "alpha-bundle/watch")
       # Removed after enable: the child must not inherit the gateway's value instead.
-      true = Placement.unset_sentinel_env(ctx.db, ctx.host, "sentinel:alpha-bundle/watch", "WATCH_EXTRA", %{})
+      true =
+        Placement.unset_sentinel_env(
+          ctx.db,
+          ctx.host,
+          "sentinel:alpha-bundle/watch",
+          "WATCH_EXTRA",
+          %{}
+        )
 
       start_supervisor!(ctx)
       run_dir = Path.join([ctx.base, "sentinels", "alpha-bundle", "watch"])
@@ -335,14 +379,19 @@ defmodule Tightbeam.SentinelsTest do
       supervisor = start_supervisor!(ctx, backoff_unit_ms: 1)
 
       assert wait_until(fn ->
-               match?(%{state: "stopped"}, Sentinels.states(ctx.db, ctx.host)["alpha-bundle/watch"])
+               match?(
+                 %{state: "stopped"},
+                 Sentinels.states(ctx.db, ctx.host)["alpha-bundle/watch"]
+               )
              end)
 
       %{reason: reason} = Sentinels.states(ctx.db, ctx.host)["alpha-bundle/watch"]
       assert reason =~ "exited 5 times in a row"
       assert reason =~ "last status 3"
 
-      log = File.read!(Path.join([ctx.base, "sentinels", "alpha-bundle", "watch", "sentinel.log"]))
+      log =
+        File.read!(Path.join([ctx.base, "sentinels", "alpha-bundle", "watch", "sentinel.log"]))
+
       assert length(Regex.scan(~r/ exit alpha-bundle\/watch status=3/, log)) == 5
 
       {:ok, wakes} = DB.query(ctx.db, "SELECT sessionKey, origin, prompt FROM wakes")
@@ -416,7 +465,15 @@ defmodule Tightbeam.SentinelsTest do
   defp set_settings!(ctx, qualified, settings) do
     for {name, value} <- settings do
       {:ok, _} =
-        Placement.set_sentinel_env(ctx.db, ctx.host, Sentinels.scope(qualified), name, value, "user:flynn", %{})
+        Placement.set_sentinel_env(
+          ctx.db,
+          ctx.host,
+          Sentinels.scope(qualified),
+          name,
+          value,
+          "user:flynn",
+          %{}
+        )
     end
   end
 

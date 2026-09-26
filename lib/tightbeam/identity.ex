@@ -769,8 +769,11 @@ defmodule Tightbeam.Identity do
     names = Enum.map(declarations, & &1.name)
 
     case names -- Enum.uniq(names) do
-      [] -> declarations
-      duplicates -> raise ArgumentError, "kungfu manifest declares sentinel #{hd(duplicates)} twice: #{path}"
+      [] ->
+        declarations
+
+      duplicates ->
+        raise ArgumentError, "kungfu manifest declares sentinel #{hd(duplicates)} twice: #{path}"
     end
   end
 
@@ -779,8 +782,12 @@ defmodule Tightbeam.Identity do
 
   defp sentinel_declaration!(entry, path) when is_map(entry) do
     case Map.keys(entry) -- @sentinel_keys do
-      [] -> :ok
-      keys -> raise ArgumentError, "kungfu manifest sentinel has unknown keys #{Enum.join(Enum.sort(keys), ", ")}: #{path}"
+      [] ->
+        :ok
+
+      keys ->
+        raise ArgumentError,
+              "kungfu manifest sentinel has unknown keys #{Enum.join(Enum.sort(keys), ", ")}: #{path}"
     end
 
     name = Map.get(entry, "name")
@@ -788,15 +795,18 @@ defmodule Tightbeam.Identity do
     requires = Map.get(entry, "requires")
 
     unless is_binary(name) and Regex.match?(~r/^[A-Za-z0-9][A-Za-z0-9_-]*$/, name) do
-      raise ArgumentError, "kungfu manifest sentinel name must match [A-Za-z0-9][A-Za-z0-9_-]*: #{path}"
+      raise ArgumentError,
+            "kungfu manifest sentinel name must match [A-Za-z0-9][A-Za-z0-9_-]*: #{path}"
     end
 
-    unless bundle_relative_file?(command) and command not in [@bundle_setup_path | @bundle_doc_paths] do
+    unless bundle_relative_file?(command) and
+             command not in [@bundle_setup_path | @bundle_doc_paths] do
       raise ArgumentError,
             "kungfu manifest sentinel #{name} command must be a file path inside the bundle: #{path}"
     end
 
-    unless is_list(requires) and Enum.all?(requires, &(is_binary(&1) and Regex.match?(@env_name, &1))) do
+    unless is_list(requires) and
+             Enum.all?(requires, &(is_binary(&1) and Regex.match?(@env_name, &1))) do
       raise ArgumentError,
             "kungfu manifest sentinel #{name} requires must be a list of names matching [A-Z_][A-Z0-9_]*: #{path}"
     end
@@ -811,7 +821,10 @@ defmodule Tightbeam.Identity do
     segments = String.split(relative, "/")
 
     Path.type(relative) == :relative and
-      Enum.all?(segments, &(&1 not in ["", ".", ".."] and Regex.match?(~r/^[A-Za-z0-9_.-]+$/, &1)))
+      Enum.all?(
+        segments,
+        &(&1 not in ["", ".", ".."] and Regex.match?(~r/^[A-Za-z0-9_.-]+$/, &1))
+      )
   end
 
   defp bundle_relative_file?(_relative), do: false

@@ -1010,33 +1010,32 @@ defmodule Tightbeam.Gateway do
         end),
       # Readable by any caller, like kungfu-list: names, states and shipped setup
       # text only, never a setting value, so doctor can report it from a session.
-      {"sentinel-list", []} =>
-        fn _call ->
-          host = Placement.local_host_name()
-          states = Sentinels.states(db, host)
+      {"sentinel-list", []} => fn _call ->
+        host = Placement.local_host_name()
+        states = Sentinels.states(db, host)
 
-          %{
-            host: host,
-            sentinels:
-              config.base_dir
-              |> Identity.learned_sentinels()
-              |> Map.fetch!(:sentinels)
-              |> Enum.map(fn sentinel ->
-                row = Map.get(states, sentinel.qualified, %{})
+        %{
+          host: host,
+          sentinels:
+            config.base_dir
+            |> Identity.learned_sentinels()
+            |> Map.fetch!(:sentinels)
+            |> Enum.map(fn sentinel ->
+              row = Map.get(states, sentinel.qualified, %{})
 
-                %{
-                  sentinel: sentinel.qualified,
-                  state: Map.get(row, :state, "disabled"),
-                  requires: sentinel.requires,
-                  missing: Sentinels.missing_settings(db, host, sentinel),
-                  command_sha256: row[:command_sha256],
-                  started_at: row[:started_at],
-                  reason: row[:reason]
-                }
-              end),
-            setup: Sentinels.setup_all(config.base_dir, db, host)
-          }
-        end,
+              %{
+                sentinel: sentinel.qualified,
+                state: Map.get(row, :state, "disabled"),
+                requires: sentinel.requires,
+                missing: Sentinels.missing_settings(db, host, sentinel),
+                command_sha256: row[:command_sha256],
+                started_at: row[:started_at],
+                reason: row[:reason]
+              }
+            end),
+          setup: Sentinels.setup_all(config.base_dir, db, host)
+        }
+      end,
       {"kungfu-setup", []} => fn call -> kungfu_setup_result(config, db, call.params[:name]) end,
       {"host-toolchain-set", []} =>
         admin_call_handler(db, fn call ->
@@ -3989,7 +3988,8 @@ defmodule Tightbeam.Gateway do
         {:error,
          %{
            code: "sentinel_scope_conflict",
-           message: "sentinel_scope_conflict rule: --sentinel and --harness name different scopes; use one"
+           message:
+             "sentinel_scope_conflict rule: --sentinel and --harness name different scopes; use one"
          }}
 
       Map.get(params, :host) not in [nil, host] ->
@@ -4058,9 +4058,21 @@ defmodule Tightbeam.Gateway do
     case sentinel_env_target(config, p) do
       {:ok, sentinel, host} ->
         removed =
-          Placement.unset_sentinel_env(db, host, Sentinels.scope(sentinel.qualified), p.name, call)
+          Placement.unset_sentinel_env(
+            db,
+            host,
+            Sentinels.scope(sentinel.qualified),
+            p.name,
+            call
+          )
 
-        %{sentinel: sentinel.qualified, host: host, name: p.name, changed: removed, removed: removed}
+        %{
+          sentinel: sentinel.qualified,
+          host: host,
+          name: p.name,
+          changed: removed,
+          removed: removed
+        }
 
       {:error, denial} ->
         denial
@@ -4085,7 +4097,9 @@ defmodule Tightbeam.Gateway do
   defp identity_learn_result(config, db, call) do
     case learn_result(config, db, call) do
       %{state: state} = result when state in ["published", "already-learned"] ->
-        setup = Sentinels.setup(config.base_dir, db, Placement.local_host_name(), call.params.name)
+        setup =
+          Sentinels.setup(config.base_dir, db, Placement.local_host_name(), call.params.name)
+
         Map.put(result, :setup, Map.delete(setup, :learned))
 
       result ->

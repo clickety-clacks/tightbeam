@@ -3840,7 +3840,13 @@ mod tests {
             r#"{"asUser":"flynn","verb":"sentinel-enable","params":{"name":"watch"}}"#
         );
         assert_eq!(
-            body(&["sentinel", "disable", "example-bundle/watch", "--as-user", "flynn"]),
+            body(&[
+                "sentinel",
+                "disable",
+                "example-bundle/watch",
+                "--as-user",
+                "flynn"
+            ]),
             r#"{"asUser":"flynn","verb":"sentinel-disable","params":{"name":"example-bundle/watch"}}"#
         );
         assert_eq!(

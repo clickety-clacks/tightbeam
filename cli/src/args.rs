@@ -3719,9 +3719,23 @@ mod tests {
             })
         );
         for args in [
-            strings(&["host-env-set", "--sentinel", "w", "--harness", "claude", "A=b"]),
+            strings(&[
+                "host-env-set",
+                "--sentinel",
+                "w",
+                "--harness",
+                "claude",
+                "A=b",
+            ]),
             strings(&["host-env-list", "--sentinel", "w", "--harness", "claude"]),
-            strings(&["host-env-unset", "--sentinel", "w", "--harness", "claude", "A"]),
+            strings(&[
+                "host-env-unset",
+                "--sentinel",
+                "w",
+                "--harness",
+                "claude",
+                "A",
+            ]),
         ] {
             assert_eq!(
                 parse(args),
@@ -3732,7 +3746,12 @@ mod tests {
             );
         }
         assert_eq!(
-            parse(strings(&["host-env-set", "--sentinel", "w", "NO_ASSIGNMENT"])),
+            parse(strings(&[
+                "host-env-set",
+                "--sentinel",
+                "w",
+                "NO_ASSIGNMENT"
+            ])),
             Err(
                 "usage: tightbeam host-env-set [--host <host>] --sentinel <sentinel> NAME=VALUE"
                     .to_owned()
@@ -3750,7 +3769,13 @@ mod tests {
             })
         );
         assert_eq!(
-            parse(strings(&["sentinel", "disable", "watch", "--as-user", "flynn"])),
+            parse(strings(&[
+                "sentinel",
+                "disable",
+                "watch",
+                "--as-user",
+                "flynn"
+            ])),
             Ok(Command::SentinelDisable {
                 identity: Identity::User("flynn".to_owned()),
                 name: "watch".to_owned(),
@@ -3791,10 +3816,15 @@ mod tests {
         let none = HashMap::new();
         assert_eq!(
             identity_from(&none, Some("sentinel:example-bundle/watch".to_owned())),
-            Ok(Identity::Process("sentinel:example-bundle/watch".to_owned()))
+            Ok(Identity::Process(
+                "sentinel:example-bundle/watch".to_owned()
+            ))
         );
         assert_eq!(identity_from(&none, None), Ok(Identity::Session));
-        assert_eq!(identity_from(&none, Some(String::new())), Ok(Identity::Session));
+        assert_eq!(
+            identity_from(&none, Some(String::new())),
+            Ok(Identity::Session)
+        );
         let flagged = HashMap::from([("as-process".to_owned(), "watch".to_owned())]);
         assert_eq!(
             identity_from(&flagged, Some("sentinel:example-bundle/watch".to_owned())),

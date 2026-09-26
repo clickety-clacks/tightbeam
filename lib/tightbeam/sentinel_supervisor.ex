@@ -258,7 +258,9 @@ defmodule Tightbeam.SentinelSupervisor do
         :ok
 
       :none ->
-        Logger.error("sentinel #{qualified} stop has no principal to wake (enabled by #{inspect(enabled_by)})")
+        Logger.error(
+          "sentinel #{qualified} stop has no principal to wake (enabled by #{inspect(enabled_by)})"
+        )
     end
   end
 
@@ -280,7 +282,8 @@ defmodule Tightbeam.SentinelSupervisor do
 
       {child, children} ->
         if child.os_pid,
-          do: System.cmd("kill", ["-TERM", Integer.to_string(child.os_pid)], stderr_to_stdout: true)
+          do:
+            System.cmd("kill", ["-TERM", Integer.to_string(child.os_pid)], stderr_to_stdout: true)
 
         if Port.info(child.port), do: Port.close(child.port)
 
