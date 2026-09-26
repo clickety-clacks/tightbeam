@@ -1,0 +1,228 @@
+//! B-owned observation/receipt contract tests, pending carrier registration.
+//! These use the production completion and sink, not fidelity's renderer fixtures.
+
+use super::*;
+use serde_json::{Value, json};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+struct Temp(std::path::PathBuf);
+
+impl Temp {
+    fn new() -> Self {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "tightbeam-observation-contract-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&path).unwrap();
+        Self(path)
+    }
+
+    fn records(&self) -> Vec<Value> {
+        std::fs::read_to_string(self.0.join("diagnostics/cli-transport-v1.log"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+}
+
+impl Drop for Temp {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn attempt(effect: EffectContract) -> Attempt {
+    Attempt::begin(
+        TransportOperation("cli.add_user"),
+        effect,
+        Some(Duration::from_millis(700)),
+        Some(Duration::from_millis(1200)),
+    )
+    .unwrap_or_else(|_| panic!("test could not obtain request-ID entropy"))
+}
+
+fn correlated_attempt(effect: EffectContract) -> Attempt {
+    let mut attempt = attempt(effect);
+    let id = attempt.request_id().as_str().to_owned();
+    attempt.observe_headers(Some(&id), Some("lgen_abcdefghijklmnopqrstuv"));
+    attempt
+}
+
+fn db_body(attempt: &Attempt) -> Value {
+    json!({"error": {
+        "code": "db_timeout",
+        "requestId": attempt.request_id().as_str(),
+        "gatewayAccepted": true,
+        "timeoutSource": "otp_db_call",
+        "operation": "db.transaction",
+        "elapsedMs": 30007,
+        "budgetMs": 30000,
+        "effectState": "unknown",
+        "action": "do_not_retry_report"
+    }})
+}
+
+#[test]
+fn completed_db_refusal_preserves_server_measurements_and_nullable_cause() {
+    let attempt = correlated_attempt(EffectContract::WriteWithoutIdempotency);
+    let body = db_body(&attempt);
+    let completed = attempt.complete_response(503, &body.to_string());
+    let rendered = completed.render();
+    let diagnostic = rendered.diagnostic.unwrap();
+    assert!(matches!(diagnostic.code(), DiagnosticCode::DbTimeout));
+    assert!(diagnostic.cause().is_none());
+    assert_eq!(diagnostic.elapsed_ms(), 30007);
+    assert!(matches!(
+        diagnostic.timeout(),
+        TimeoutBudget::OtpDbCall { budget_ms: 30000 }
+    ));
+    assert!(matches!(
+        diagnostic.operation(),
+        DiagnosticOperation::Database(operation) if operation.as_str() == "db.transaction"
+    ));
+    assert_eq!(rendered.transport_operation.as_str(), "cli.add_user");
+    assert!(matches!(
+        rendered.receipt,
+        ReceiptAvailability::NotApplicable
+    ));
+    assert!(matches!(
+        diagnostic.gateway_accepted(),
+        GatewayAccepted::Yes
+    ));
+    assert!(matches!(diagnostic.action(), Action::DoNotRetryReport));
+}
+
+#[test]
+fn untrusted_db_fields_cannot_create_a_typed_diagnostic() {
+    for (field, value) in [
+        ("requestId", json!("req_foreign")),
+        ("gatewayAccepted", json!(false)),
+        ("timeoutSource", json!("sqlite_busy")),
+        ("operation", json!("db.execute")),
+        ("effectKind", json!("read")),
+        ("effectState", json!("known")),
+        ("cause", json!("invented_cause")),
+        ("action", json!("retry_safe")),
+        ("elapsedMs", json!(-1)),
+        ("budgetMs", json!("30000")),
+    ] {
+        let attempt = correlated_attempt(EffectContract::WriteWithoutIdempotency);
+        let mut body = db_body(&attempt);
+        body["error"][field] = value;
+        let completed = attempt.complete_response(503, &body.to_string());
+        assert!(completed.render().diagnostic.is_none(), "accepted {field}");
+        assert!(matches!(
+            completed.render().receipt,
+            ReceiptAvailability::NotApplicable
+        ));
+    }
+}
+
+#[test]
+fn matching_body_without_matching_observed_header_is_not_correlation() {
+    for header in [None, Some("req_foreign")] {
+        let mut attempt = attempt(EffectContract::WriteWithoutIdempotency);
+        let body = db_body(&attempt);
+        attempt.observe_headers(header, Some("lgen_abcdefghijklmnopqrstuv"));
+        let completed = attempt.complete_response(503, &body.to_string());
+        assert!(completed.render().diagnostic.is_none());
+        assert!(completed.render().listener_generation.is_none());
+    }
+}
+
+#[test]
+fn listener_generation_requires_matching_id_and_closed_shape() {
+    for generation in ["lgen_short", "lgen_abcdefghijklmnopqrstu/", "secret=value"] {
+        let mut attempt = attempt(EffectContract::Read);
+        let id = attempt.request_id().as_str().to_owned();
+        attempt.observe_headers(Some(&id), Some(generation));
+        assert!(attempt.complete().render().listener_generation.is_none());
+    }
+}
+
+#[test]
+fn one_completion_appends_once_and_rendering_cannot_append_again() {
+    let temp = Temp::new();
+    let attempt = correlated_attempt(EffectContract::WriteWithoutIdempotency);
+    let id = attempt.request_id().as_str().to_owned();
+    assert!(id.starts_with("req_"));
+    assert_eq!(id.len(), 26);
+    let error = std::io::Error::new(std::io::ErrorKind::TimedOut, "token=PRIVATE_SENTINEL");
+    let completed = attempt.fail_body(&error, &temp.0);
+    for _ in 0..3 {
+        let rendered = completed.render();
+        assert_eq!(rendered.request_id.as_str(), id);
+        assert!(matches!(rendered.receipt, ReceiptAvailability::Recorded));
+        let diagnostic = rendered.diagnostic.unwrap();
+        assert!(matches!(
+            diagnostic.code(),
+            DiagnosticCode::GatewayTransportUncertain
+        ));
+        assert!(matches!(
+            diagnostic.gateway_accepted(),
+            GatewayAccepted::Unknown
+        ));
+        assert!(matches!(diagnostic.action(), Action::DoNotRetryReport));
+        assert!(matches!(
+            diagnostic.timeout(),
+            TimeoutBudget::CliRequest { budget_ms: 1200 }
+        ));
+    }
+    let records = temp.records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["request_id"], id);
+    assert_eq!(
+        records[0]["listener_generation"],
+        "lgen_abcdefghijklmnopqrstuv"
+    );
+    assert_eq!(records[0]["effect_state"], "unknown");
+    assert!(!records[0].to_string().contains("PRIVATE_SENTINEL"));
+    // The completion borrows the original error without replacing or redacting
+    // it; only fidelity owns presentation of this existing error input.
+    assert_eq!(error.to_string(), "token=PRIVATE_SENTINEL");
+}
+
+#[test]
+fn failed_append_keeps_original_failure_with_receipt_unavailable() {
+    let temp = Temp::new();
+    let invalid_base = temp.0.join("not-a-directory");
+    std::fs::write(&invalid_base, "unchanged").unwrap();
+    let attempt = correlated_attempt(EffectContract::WriteWithoutIdempotency);
+    let error = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "PRIVATE_SENTINEL");
+    let completed = attempt.fail_body(&error, &invalid_base);
+    let rendered = completed.render();
+    assert!(matches!(rendered.receipt, ReceiptAvailability::Unavailable));
+    let diagnostic = rendered.diagnostic.unwrap();
+    assert!(matches!(
+        diagnostic.cause(),
+        Some(AttemptCause::ConnectionReset)
+    ));
+    assert!(matches!(
+        diagnostic.gateway_accepted(),
+        GatewayAccepted::Unknown
+    ));
+    assert!(matches!(diagnostic.effect_state(), EffectState::Unknown));
+    assert!(matches!(diagnostic.action(), Action::DoNotRetryReport));
+    assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    assert_eq!(error.to_string(), "PRIVATE_SENTINEL");
+    assert_eq!(std::fs::read_to_string(invalid_base).unwrap(), "unchanged");
+}
+
+#[test]
+fn absent_boundary_keeps_diagnostic_unknown_even_with_timeout_error() {
+    let temp = Temp::new();
+    let attempt = attempt(EffectContract::WriteWithoutIdempotency);
+    let error = std::io::Error::new(std::io::ErrorKind::TimedOut, "deadline reached");
+    // No headers were observed. A typed IO timeout by itself proves no phase.
+    let completed = attempt.fail_body(&error, &temp.0);
+    assert!(completed.render().diagnostic.is_none());
+    assert!(completed.render().listener_generation.is_none());
+    let records = temp.records();
+    assert_eq!(records.len(), 1);
+    assert!(records[0]["code"].is_null());
+    assert!(records[0]["cause"].is_null());
+    assert_eq!(records[0]["gateway_accepted"], "unknown");
+}

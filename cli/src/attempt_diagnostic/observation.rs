@@ -8,6 +8,10 @@ use std::io::Read;
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
+#[path = "observation_tests.rs"]
+mod tests;
+
 /// Facts must come from the actual transport boundary, never elapsed time,
 /// error prose, a configured budget, or a previous attempt's connection.
 pub(crate) enum FailureFact {
