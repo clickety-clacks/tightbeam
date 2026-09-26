@@ -84,6 +84,9 @@ impl FailureFact {
 /// Metadata supplied by the finite typed command/ceremony mapping.
 /// An existing idempotency contract is evidence, not permission to retry here.
 pub(crate) enum EffectContract {
+    /// No verified per-request effect contract. Keep the closed diagnostic
+    /// absent rather than inventing an effect or retry recommendation.
+    Unknown,
     Read,
     WriteWithoutIdempotency,
     WriteWithExistingIdempotency,
@@ -295,23 +298,24 @@ impl Attempt {
     /// request's Result/error: the caller retains it for the fidelity renderer.
     fn fail(self, fact: FailureFact, base: &Path) -> CompletedAttempt {
         let elapsed_ms = millis(self.started.elapsed());
-        let (effect_kind, uncertain_effect, uncertain_action) = match self.effect {
-            EffectContract::Read => (EffectKind::Read, EffectState::None, Action::RetrySafe),
-            EffectContract::WriteWithoutIdempotency => (
+        let effect = match self.effect {
+            EffectContract::Unknown => None,
+            EffectContract::Read => Some((EffectKind::Read, EffectState::None, Action::RetrySafe)),
+            EffectContract::WriteWithoutIdempotency => Some((
                 EffectKind::Write,
                 EffectState::Unknown,
                 Action::DoNotRetryReport,
-            ),
-            EffectContract::WriteWithExistingIdempotency => (
+            )),
+            EffectContract::WriteWithExistingIdempotency => Some((
                 EffectKind::Write,
                 EffectState::Unknown,
                 Action::RetrySameIdempotencyKey,
-            ),
-            EffectContract::Schema => (
+            )),
+            EffectContract::Schema => Some((
                 EffectKind::Schema,
                 EffectState::Unknown,
                 Action::DoNotRetryReport,
-            ),
+            )),
         };
         let unavailable = |cause, timeout| {
             Some((
@@ -324,15 +328,23 @@ impl Attempt {
             ))
         };
         let uncertain = |cause, timeout| {
-            Some((
-                DiagnosticCode::GatewayTransportUncertain,
-                cause,
-                timeout,
-                GatewayAccepted::Unknown,
-                uncertain_effect,
-                uncertain_action,
-            ))
+            effect.map(|(_, uncertain_effect, uncertain_action)| {
+                (
+                    DiagnosticCode::GatewayTransportUncertain,
+                    cause,
+                    timeout,
+                    GatewayAccepted::Unknown,
+                    uncertain_effect,
+                    uncertain_action,
+                )
+            })
         };
+        let before_exchange = matches!(
+            fact,
+            FailureFact::DnsBeforeExchange
+                | FailureFact::RefusedBeforeExchange
+                | FailureFact::ConnectDeadlineBeforeExchange
+        );
         let classified = match fact {
             FailureFact::Unclassified => None,
             FailureFact::DnsBeforeExchange => {
@@ -364,8 +376,11 @@ impl Attempt {
                 uncertain(AttemptCause::TransportFailed, TimeoutBudget::None)
             }
         };
-        let diagnostic = classified.zip(elapsed_ms).map(
-            |((code, cause, timeout, gateway_accepted, effect_state, action), elapsed_ms)| {
+        let diagnostic = classified.zip(elapsed_ms).zip(effect).map(
+            |(
+                ((code, cause, timeout, gateway_accepted, effect_state, action), elapsed_ms),
+                (effect_kind, _, _),
+            )| {
                 FailureDiagnostic {
                     code,
                     operation: DiagnosticOperation::Transport(self.operation),
@@ -380,10 +395,7 @@ impl Attempt {
             },
         );
         // Before-connect facts must never retain a generation from any header.
-        let listener_generation = if diagnostic
-            .as_ref()
-            .is_some_and(|d| matches!(d.gateway_accepted(), GatewayAccepted::No))
-        {
+        let listener_generation = if before_exchange {
             None
         } else {
             self.listener_generation
@@ -392,7 +404,7 @@ impl Attempt {
             &self.request_id,
             self.operation,
             listener_generation.as_ref(),
-            effect_kind,
+            effect.map(|(kind, _, _)| kind),
             elapsed_ms,
             diagnostic.as_ref(),
         );
@@ -442,7 +454,7 @@ fn receipt_record(
     request_id: &RequestId,
     operation: TransportOperation,
     generation: Option<&ListenerGeneration>,
-    effect: EffectKind,
+    effect: Option<EffectKind>,
     elapsed_ms: Option<u64>,
     diagnostic: Option<&FailureDiagnostic>,
 ) -> serde_json::Value {
@@ -452,7 +464,7 @@ fn receipt_record(
         "request_id": request_id.as_str(),
         "operation": operation.as_str(),
         "listener_generation": generation.map(ListenerGeneration::as_str),
-        "effect_kind": match effect { EffectKind::Read => "read", EffectKind::Write => "write", EffectKind::Schema => "schema" },
+        "effect_kind": effect.map(|kind| match kind { EffectKind::Read => "read", EffectKind::Write => "write", EffectKind::Schema => "schema" }),
         "elapsed_ms": elapsed_ms,
         "code": null, "cause": null, "timeout_source": null, "budget_ms": null,
         "gateway_accepted": "unknown", "effect_state": null, "action": null

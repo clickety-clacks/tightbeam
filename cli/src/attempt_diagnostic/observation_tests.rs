@@ -226,3 +226,40 @@ fn absent_boundary_keeps_diagnostic_unknown_even_with_timeout_error() {
     assert!(records[0]["cause"].is_null());
     assert_eq!(records[0]["gateway_accepted"], "unknown");
 }
+
+#[test]
+fn unknown_effect_keeps_receipt_without_invented_classification_or_retry_advice() {
+    let temp = Temp::new();
+    let attempt = correlated_attempt(EffectContract::Unknown);
+    let id = attempt.request_id().as_str().to_owned();
+    let error = std::io::Error::new(std::io::ErrorKind::TimedOut, "PRIVATE_SENTINEL");
+    let completed = attempt.fail_body(&error, &temp.0);
+    let rendered = completed.render();
+    assert_eq!(rendered.request_id.as_str(), id);
+    assert!(rendered.diagnostic.is_none());
+    assert!(matches!(rendered.receipt, ReceiptAvailability::Recorded));
+    let records = temp.records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["request_id"], id);
+    assert_eq!(records[0]["operation"], "cli.add_user");
+    for field in ["effect_kind", "effect_state", "action", "code", "cause"] {
+        assert!(records[0][field].is_null(), "invented {field}");
+    }
+    assert!(!records[0].to_string().contains("PRIVATE_SENTINEL"));
+    assert_eq!(error.to_string(), "PRIVATE_SENTINEL");
+}
+
+#[test]
+fn before_exchange_drops_generation_even_when_effect_is_unknown() {
+    let temp = Temp::new();
+    // Adverse state injection exercises the completion invariant, not a real
+    // positive generation observation or a possible HTTP exchange sequence.
+    let attempt = correlated_attempt(EffectContract::Unknown);
+    let completed = attempt.fail(FailureFact::RefusedBeforeExchange, &temp.0);
+    assert!(completed.render().diagnostic.is_none());
+    assert!(completed.render().listener_generation.is_none());
+    let records = temp.records();
+    assert_eq!(records.len(), 1);
+    assert!(records[0]["listener_generation"].is_null());
+    assert!(records[0]["effect_kind"].is_null());
+}
