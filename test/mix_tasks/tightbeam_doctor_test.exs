@@ -436,6 +436,54 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
     assert Enum.all?(checks, &is_binary(&1["level"]))
   end
 
+  test "terminal keys skip credential probing and share canonical human and JSON bytes", ctx do
+    parent = self()
+
+    statement =
+      "local-test lost codex: its openai credential was rejected. Redirect destination: not yet observed; lawful alternate routing remains " <>
+        "enabled. local-test needs a human sign-in for codex; run on local-test: tightbeam " <>
+        "onboard openai --as-user <adminUserId> (replace <adminUserId> with your own " <>
+        "administrator id)."
+
+    incident = %{
+      incident_id: "tcf_fixture",
+      class: "terminal_credential_failure",
+      state: "open",
+      host: "local-test",
+      harness: "codex",
+      provider: "openai",
+      statement_id: "terminal-credential:tcf_fixture",
+      redirect_destinations: [],
+      canonical_statement: statement
+    }
+
+    catalog =
+      {:ok, elem(ctx.catalog, 1) |> Map.put("codex", []),
+       %{"codex" => {:unavailable, {:terminal_credential_failure, "tcf_fixture"}}}}
+
+    inputs =
+      ctx.inputs
+      |> put(:terminal_incidents, [incident])
+      |> put(:credential_state, fn provider ->
+        send(parent, {:credential_probe, provider})
+        :present
+      end)
+
+    {0, report} = Doctor.evaluate(catalog, inputs)
+
+    refute_receive {:credential_probe, :openai}, 50
+    assert report.terminal_credentials == [incident]
+    assert Doctor.format(report, :human) =~ statement
+
+    assert {:ok, %{"terminal_credentials" => [%{"canonical_statement" => ^statement}]}} =
+             report |> Doctor.format(:json) |> JSON.decode()
+
+    check = find(report, "harness_auth:codex")
+    refute check.ok
+    assert check.level == :warn
+    assert check.detail =~ "terminal credential incident tcf_fixture"
+  end
+
   # AC5, doctor's half: an installed-but-unrunnable harness (on PATH but fails to
   # execute — the gibson codex-as-`.js`-without-node incident) must have its
   # EXECUTABILITY gap named as its own row, distinct from the credential axis —

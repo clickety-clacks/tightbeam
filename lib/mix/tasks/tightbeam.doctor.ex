@@ -5,6 +5,7 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
   alias Tightbeam.Model
   alias Tightbeam.ModelCatalog
   alias Tightbeam.Placement
+  alias Tightbeam.TerminalCredentialFailure
 
   @shortdoc "Check inference-free Tightbeam bootstrap readiness"
 
@@ -20,7 +21,14 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
     end
 
     base_dir = options[:base_dir] || Diff.base_dir()
-    catalog = Diff.fetch_live(base_dir)
+    terminal_incidents = TerminalCredentialFailure.readonly_views(base_dir)
+
+    terminal_by_key =
+      Map.new(terminal_incidents, fn incident ->
+        {{incident.host, incident.harness}, incident}
+      end)
+
+    catalog = Diff.fetch_live(base_dir, terminal_incidents: terminal_by_key)
 
     # Invariant: resolve bootstrap config from ENV first (mirroring runtime.exs)
     # because a standalone mix task does not evaluate runtime.exs.
@@ -37,6 +45,7 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
       github_remote_url: github_remote_url(),
       local_host_name: Placement.local_host_name(),
       credential_state: &local_credential_state(base_dir, &1),
+      terminal_incidents: terminal_incidents,
       cli_bin: Path.join(base_dir, "bin")
     ]
 
@@ -63,6 +72,8 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
     cli_bin = Keyword.get(inputs, :cli_bin, Path.join(base_dir, "bin"))
     binary_probe = Keyword.get(inputs, :harness_binary_probe, &Placement.harness_binary_probe/2)
     credential_probe = Keyword.get(inputs, :credential_state, fn _provider -> :unknown end)
+    terminal_incidents = Keyword.get(inputs, :terminal_incidents, [])
+    suppressed = MapSet.new(terminal_incidents, &{&1.host, &1.harness})
 
     github_probe =
       Keyword.get(inputs, :github_probe, fn hostname, remote_url ->
@@ -79,7 +90,13 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
     credential_states =
       Map.new(harnesses, fn harness ->
         provider = Tightbeam.Harness.parse!(harness).credential_provider()
-        {harness, credential_probe.(provider)}
+
+        state =
+          if MapSet.member?(suppressed, {local_host_name, harness}),
+            do: :terminal,
+            else: credential_probe.(provider)
+
+        {harness, state}
       end)
 
     harness_checks =
@@ -144,7 +161,13 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
       ready_harnesses != [] and
         Enum.all?(non_harness_checks, &(&1.ok or &1.unverifiable))
 
-    {if(ready, do: 0, else: 1), %{checks: checks, github: github_status, ready: ready}}
+    {if(ready, do: 0, else: 1),
+     %{
+       checks: checks,
+       github: github_status,
+       ready: ready,
+       terminal_credentials: terminal_incidents
+     }}
   end
 
   @doc false
@@ -160,8 +183,15 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
     widths = column_widths([headings | rows])
     divider = Enum.map_join(widths, "-+-", &String.duplicate("-", &1))
 
-    ([format_row(headings, widths), divider] ++ Enum.map(rows, &format_row(&1, widths)))
-    |> Enum.join("\n")
+    table = [format_row(headings, widths), divider] ++ Enum.map(rows, &format_row(&1, widths))
+
+    terminal =
+      case Map.get(report, :terminal_credentials, []) do
+        [] -> []
+        incidents -> [""] ++ Enum.map(incidents, & &1.canonical_statement)
+      end
+
+    (table ++ terminal) |> Enum.join("\n")
   end
 
   defp default_model_check(catalog, harness, model, credential_state, base_dir, host) do
@@ -346,6 +376,10 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
         "not verified here: the credential server does not run inside a bare mix " <>
           "task, so #{harness} credential state is UNKNOWN from this command"
 
+      match?({:unavailable, {:terminal_credential_failure, _}}, reason) ->
+        {:unavailable, {:terminal_credential_failure, incident_id}} = reason
+        "terminal credential incident #{incident_id} suppresses #{harness} on #{host}"
+
       true ->
         "dead_sign_in: harness=#{harness} reason=#{inspect(reason)}"
     end
@@ -360,6 +394,9 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
         "Not a credential verdict — do not re-onboard on the strength of this row. " <>
           "Verify for real with Tightbeam.ClientE2E.preflight/2 for #{harness} " <>
           "against this base_dir, or read the running gateway's catalog."
+
+      match?({:unavailable, {:terminal_credential_failure, _}}, reason) ->
+        "Follow the terminal credential capacity statement below."
 
       true ->
         "Re-onboard the #{harness} harness credential."

@@ -4,7 +4,16 @@ defmodule Tightbeam.Org do
   and append-only harness-session pointer chains.
   """
 
-  alias Tightbeam.{AdminProjection, DB, EventLog, NoticeBatcher, Supervision, Wakes}
+  alias Tightbeam.{
+    AdminProjection,
+    DB,
+    EventLog,
+    NoticeBatcher,
+    Supervision,
+    TerminalCredentialFailure,
+    Wakes
+  }
+
   alias Tightbeam.DB.Txn
 
   @doc "Current lineage parent, with immutable spawning provenance as the fallback."
@@ -417,7 +426,14 @@ defmodule Tightbeam.Org do
       ]
     )
 
-    must_get(txn, session_key)
+    session = must_get(txn, session_key)
+    owner_user_id = Map.fetch!(input, :owner_user_id)
+
+    if session_key == personal_session_key(owner_user_id) do
+      :ok = TerminalCredentialFailure.reconcile_personal_session_in_txn(txn, owner_user_id)
+    end
+
+    session
   end
 
   @doc "Fetch an active session by its CLI token, or nil."

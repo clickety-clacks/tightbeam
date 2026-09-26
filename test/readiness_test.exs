@@ -51,6 +51,7 @@ defmodule Tightbeam.ReadinessTest do
       config: %{
         base_dir: base,
         db: db,
+        terminal_credential_views: [],
         default_model: Model.new("m", effort: "medium"),
         # HERMETIC by default: the executability axis reuses the real
         # `Placement.harness_binary_probe`, which spawns a `--version` subprocess.
@@ -135,6 +136,25 @@ defmodule Tightbeam.ReadinessTest do
            "the only thing a ready install adds is the O7 pre-expiry advisory"
 
     refute Enum.any?(advisory, &(&1 =~ "FOREGROUND")), "supervised: no foreground line"
+  end
+
+  test "a ready org still renders the canonical terminal capacity statement", ctx do
+    for module <- Harness.all(), do: install_adapter!(ctx.base, module)
+    catalog = catalog!(Map.new(Harness.all(), &{&1.wire_name(), live("m")}))
+
+    statement =
+      "racter lost codex: its openai credential was rejected. Redirect destination: eezo. racter needs a human sign-in for codex; run " <>
+        "on racter: tightbeam onboard openai --as-user <adminUserId> " <>
+        "(replace <adminUserId> with your own administrator id)."
+
+    config =
+      Map.put(ctx.config, :terminal_credential_views, [
+        %{canonical_statement: statement, host: "racter", harness: "codex"}
+      ])
+
+    summary = Readiness.summary(config, catalog)
+    assert summary.runnable?
+    assert statement in Readiness.render(summary, config)
   end
 
   test "a ready install with NO service manager says so — the install is not finished", ctx do

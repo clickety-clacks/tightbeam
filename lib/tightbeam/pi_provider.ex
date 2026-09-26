@@ -60,15 +60,8 @@ defmodule Tightbeam.PiProvider do
           {:error, {:no_pi_catalog, %{}}}
 
         1 ->
-          [{provider, reason}] = Map.to_list(errors)
-
-          case reason do
-            :malformed_catalog ->
-              {:error, {:pi_catalog_provider_failed, provider, reason}}
-
-            _ ->
-              {:error, reason}
-          end
+          [{provider_key, raw_reason}] = Map.to_list(errors)
+          {:error, {:pi_catalog_provider_failed, provider_key, raw_reason}}
 
         _ ->
           {:error, {:no_pi_catalog, errors}}

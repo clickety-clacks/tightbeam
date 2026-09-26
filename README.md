@@ -354,6 +354,10 @@ environment and compatible runtime/adapter versions through the supported
 installation procedure. Use the same idle/restart boundary and repeat verification.
 Check the target's state-migration rollback restrictions before reverting a
 Tightbeam package; restoring an executable alone does not undo a database migration.
+Before rolling back a database that contains terminal credential incidents, use the
+new code to prove that every such incident recovered. If older code will run while
+any incident remains open, explicitly acknowledge that it cannot honor the durable
+suppression and the automatic provider credential probe loop will return.
 
 ### Cutting a release
 

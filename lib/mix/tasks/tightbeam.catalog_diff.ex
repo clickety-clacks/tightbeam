@@ -48,7 +48,15 @@ defmodule Mix.Tasks.Tightbeam.Catalog.Diff do
   end
 
   @doc false
-  def fetch_live(base_dir, timeout_ms \\ @fetch_timeout_ms, options \\ []) do
+  def fetch_live(base_dir), do: fetch_live(base_dir, @fetch_timeout_ms, [])
+
+  def fetch_live(base_dir, timeout_ms) when is_integer(timeout_ms),
+    do: fetch_live(base_dir, timeout_ms, [])
+
+  def fetch_live(base_dir, options) when is_list(options),
+    do: fetch_live(base_dir, @fetch_timeout_ms, options)
+
+  def fetch_live(base_dir, timeout_ms, options) do
     name = Keyword.get(options, :name, :tightbeam_catalog_diff)
 
     # A bare mix task is a diagnostic of THIS machine and owns no DB to read
