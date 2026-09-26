@@ -337,8 +337,16 @@ impl CliRoot {
     }
 
     fn spawn(&self, command: &str, addr: SocketAddr) -> std::process::Child {
+        // The isolated POST fixture has no session marker. Supply a synthetic
+        // actor explicitly so the real CLI reaches the loopback gateway.
+        let identity: &[&str] = if command == "list" {
+            &["--as-user", "timeout-loopback-fixture"]
+        } else {
+            &[]
+        };
         std::process::Command::new(env!("CARGO_BIN_EXE_tightbeam"))
             .arg(command)
+            .args(identity)
             .env_clear()
             .env("TIGHTBEAM_URL", format!("http://{addr}"))
             .env("TIGHTBEAM_TOKEN", "synthetic-loopback-token")
