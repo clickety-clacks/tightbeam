@@ -779,7 +779,7 @@ defmodule Tightbeam.ArchetypesTest do
 
     for {role, harness, family, effort} <- [
           {"pdo", :codex, "gpt-6-sol", "low"},
-          {"orchestrator", :codex, "gpt-6-sol", "low"},
+          {"orchestrator", :codex, "gpt-6-luna", "max"},
           {"coder", :codex, "gpt-6-luna", "max"},
           {"spec-writer", :claude, "claude-opus-5-5", "high"},
           {"reviewer-code", :claude, "claude-opus-5-5", "high"},
@@ -807,7 +807,7 @@ defmodule Tightbeam.ArchetypesTest do
 
     assert mixed_family =~ "Product delivery orchestration | gpt-6-sol[low]"
     assert codex_only =~ "Product delivery orchestration | gpt-6-sol[low]"
-    assert activities =~ "Executive or delegated lane orchestration | gpt-6-sol[low]"
+    assert activities =~ "Executive or delegated lane orchestration | gpt-6-luna[max]"
     assert policy =~ "Codex-authored work uses Claude claude-opus-5-5/high"
     assert policy =~ "Claude-authored work uses Codex gpt-6-astra/high"
     assert policy =~ "including producer model overrides"
