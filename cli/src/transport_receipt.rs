@@ -56,14 +56,7 @@ fn append_inner(base: &Path, record: &serde_json::Value) -> Result<(), ()> {
     fs::create_dir_all(&dir).map_err(|_| ())?;
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).map_err(|_| ())?;
 
-    let lock = private_file(&dir.join("cli-transport-v1.lock"), false)?;
-    // An independent file description per attempt matters: flock contention
-    // must fail immediately even between threads in the same process.
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return Err(());
-    }
-    // Dropping the locked descriptor releases it on every exit, including a
-    // failed append/rename. Never unlink the lock (another process may own it).
+    let lock = ReceiptLock::acquire(&dir.join("cli-transport-v1.lock"))?;
     let path = dir.join("cli-transport-v1.log");
     let mut active = private_file(&path, true)?;
     let size = active.metadata().map_err(|_| ())?.len();
@@ -88,6 +81,30 @@ fn append_inner(base: &Path, record: &serde_json::Value) -> Result<(), ()> {
     drop(active);
     drop(lock);
     Ok(())
+}
+
+struct ReceiptLock(File);
+
+impl ReceiptLock {
+    fn acquire(path: &Path) -> Result<Self, ()> {
+        // Each attempt opens an independent file description, so contention
+        // refuses immediately even between threads in one process.
+        let file = private_file(path, false)?;
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(());
+        }
+        Ok(Self(file))
+    }
+}
+
+impl Drop for ReceiptLock {
+    fn drop(&mut self) {
+        // Explicitly release before close: a concurrently spawned child can
+        // briefly inherit this open file description before exec closes it.
+        // Closing only our descriptor would leave that shared lock alive.
+        // This also releases on failed append/rename; never unlink the lock.
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
 }
 
 fn private_file(path: &Path, read: bool) -> Result<File, ()> {
@@ -239,6 +256,116 @@ mod tests {
         assert_eq!(
             fs::read_to_string(temp.file("")).unwrap().lines().count(),
             1
+        );
+    }
+
+    #[test]
+    fn independent_processes_share_nonwaiting_lock_and_rotation() {
+        const CHILD_BASE: &str = "TIGHTBEAM_RECEIPT_TEST_BASE";
+        const CHILD_MODE: &str = "TIGHTBEAM_RECEIPT_TEST_MODE";
+        const TEST: &str =
+            "transport_receipt::tests::independent_processes_share_nonwaiting_lock_and_rotation";
+
+        // Re-enter this test in a fresh OS process so the actual writer opens
+        // its own lock descriptor. These controls exist only in the test
+        // executable; no production delay/failure API is introduced.
+        if let Some(base) = std::env::var_os(CHILD_BASE) {
+            let base = std::path::PathBuf::from(base);
+            let mode = std::env::var(CHILD_MODE).unwrap();
+            if mode == "contended" {
+                assert!(!append(&base, &record()));
+            } else {
+                let accepted = (0..128).filter(|_| append(&base, &record())).count();
+                fs::write(base.join(format!("accepted-{mode}")), accepted.to_string()).unwrap();
+            }
+            return;
+        }
+
+        fn spawn(base: &Path, mode: &str) -> std::process::Child {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD_BASE, base)
+                .env(CHILD_MODE, mode)
+                .spawn()
+                .unwrap()
+        }
+
+        fn finish(child: &mut std::process::Child) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success(), "receipt child failed: {status}");
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("receipt child waited for a lock or failed to exit");
+                }
+                // Timeout guard only: test ordering uses the held OS lock,
+                // not a sleep intended to guess when a write has happened.
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+
+        let temp = Temp::new();
+        for _ in 0..SEGMENT_RECORDS {
+            assert!(append(&temp.0, &record()));
+        }
+        let lock = private_file(&temp.0.join("diagnostics/cli-transport-v1.lock"), false).unwrap();
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let mut contended = spawn(&temp.0, "contended");
+        // The lock remains held until the child has exited: a blocking lock
+        // implementation fails this proof instead of being released for it.
+        finish(&mut contended);
+        drop(lock);
+
+        let mut children: Vec<_> = (0..4).map(|i| spawn(&temp.0, &i.to_string())).collect();
+        for child in &mut children {
+            finish(child);
+        }
+        let accepted: usize = (0..4)
+            .map(|i| {
+                fs::read_to_string(temp.0.join(format!("accepted-{i}")))
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap()
+            })
+            .sum();
+        assert!(accepted > 0);
+        assert!(accepted <= 512);
+
+        let active = fs::read_to_string(temp.file("")).unwrap();
+        let prior = fs::read_to_string(temp.file(".1")).unwrap();
+        assert_eq!(prior.lines().count(), SEGMENT_RECORDS);
+        assert_eq!(active.lines().count(), accepted);
+        assert!(active.len() + prior.len() <= (SEGMENT_BYTES * 2) as usize);
+        for line in active.lines().chain(prior.lines()) {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(value["event"], "cli_transport_failed");
+            assert_eq!(value["request_id"], record()["request_id"]);
+        }
+        assert!(!temp.file(".2").exists());
+    }
+
+    #[test]
+    fn inherited_descriptor_does_not_extend_completed_writer_lock() {
+        let temp = Temp::new();
+        assert!(append(&temp.0, &record()));
+        let lock = ReceiptLock::acquire(&temp.0.join("diagnostics/cli-transport-v1.lock")).unwrap();
+        // dup shares the same open file description just as fork inheritance
+        // does; retain that reference across the writer ownership boundary.
+        let inherited = lock.0.try_clone().unwrap();
+        assert!(!append(&temp.0, &record()));
+        drop(lock);
+        assert!(append(&temp.0, &record()));
+        drop(inherited);
+        assert_eq!(
+            fs::read_to_string(temp.file("")).unwrap().lines().count(),
+            2
         );
     }
 }
