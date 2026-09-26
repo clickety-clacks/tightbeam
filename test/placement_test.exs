@@ -1156,6 +1156,61 @@ defmodule Tightbeam.PlacementTest do
     refute_receive {:unexpected_sh, _}
   end
 
+  test "adapter_opts passes configured synthetic model data to launch preparation", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    config = fn model ->
+      %{
+        base_dir: base_dir,
+        db: db,
+        cwd: "/work",
+        cli_bin: "/local/bin",
+        default_model: model,
+        sh: fn _command -> {"", 0} end
+      }
+    end
+
+    synthetic_models = [
+      Model.new("synthetic-alpha", effort: "low"),
+      Model.new("synthetic-beta", effort: "high")
+    ]
+
+    parent = self()
+    :erlang.trace_pattern({Tightbeam.Harness.Fixture, :prepare_launch, 3}, true)
+
+    try do
+      for model <- synthetic_models ++ [nil] do
+        worker =
+          spawn(fn ->
+            send(parent, {:placement_worker_ready, self()})
+
+            receive do
+              :run ->
+                result =
+                  Placement.adapter_opts!(config.(model), {:fixture, "default", "testhost"})
+
+                send(parent, {:placement_worker_done, self(), result})
+            end
+          end)
+
+        assert_receive {:placement_worker_ready, ^worker}
+        :erlang.trace(worker, true, [:call])
+        send(worker, :run)
+
+        assert_receive {:trace, ^worker, :call,
+                        {Tightbeam.Harness.Fixture, :prepare_launch,
+                         [_target, _home, launch_opts]}},
+                       1_000
+
+        assert_receive {:placement_worker_done, ^worker, _opts}, 1_000
+        assert Keyword.fetch!(launch_opts, :model) == model
+      end
+    after
+      :erlang.trace_pattern({Tightbeam.Harness.Fixture, :prepare_launch, 3}, false)
+    end
+  end
+
   test "a terminal provider callback opens one authoritative auth incident", %{
     base_dir: base_dir,
     db: db
