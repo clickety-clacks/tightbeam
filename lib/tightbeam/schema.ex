@@ -29,6 +29,7 @@ defmodule Tightbeam.Schema do
     Tightbeam.DeliveryResponsibilities,
     Tightbeam.EffortCheckin,
     Tightbeam.Placement,
+    Tightbeam.Sentinels,
     Tightbeam.RecurrenceSuppression,
     Tightbeam.RailRemedy,
     Tightbeam.Supervision,
