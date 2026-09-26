@@ -240,7 +240,9 @@ defmodule Tightbeam.ListenerLifecycleTest do
         :get,
         {String.to_charlist("http://127.0.0.1:#{port}/not-found"),
          [{~c"x-tightbeam-request-id", String.to_charlist(id)}]},
-        [timeout: 2_000], body_format: :binary)
+        [timeout: 2_000],
+        body_format: :binary
+      )
 
     {status, headers}
   end
