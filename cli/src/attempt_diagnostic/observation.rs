@@ -20,6 +20,63 @@ pub(crate) enum FailureFact {
     OtherAfterConnect,
 }
 
+impl FailureFact {
+    fn from_transport(error: &ureq::Transport) -> Self {
+        use std::error::Error as _;
+        use std::io::ErrorKind as Io;
+        use ureq::{ErrorKind, TransportPhase as Phase, TransportRoute as Route};
+
+        if error.has_prior_exchange() {
+            return Self::Unclassified;
+        }
+        let Some(evidence) = error.phase_evidence() else {
+            return Self::Unclassified;
+        };
+        if evidence.route == Route::OtherProxy {
+            return Self::Unclassified;
+        }
+        let io_kind = error.source().and_then(|source| {
+            source
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind)
+        });
+        match evidence.phase {
+            Phase::Resolve if error.kind() == ErrorKind::Dns => Self::DnsBeforeExchange,
+            Phase::Connect => match io_kind {
+                Some(Io::ConnectionRefused) => Self::RefusedBeforeExchange,
+                Some(Io::TimedOut) => Self::ConnectDeadlineBeforeExchange,
+                _ => Self::Unclassified,
+            },
+            Phase::ConnectedSetup | Phase::TlsHandshake if evidence.route == Route::Direct => {
+                Self::after_connect(io_kind)
+            }
+            Phase::SendRequest | Phase::AwaitResponse
+                if matches!(evidence.route, Route::Direct | Route::HttpTunnel) =>
+            {
+                Self::after_connect(io_kind)
+            }
+            // A proxy handshake/forwarded reply or stale pool check is not an
+            // observed gateway channel. Do not infer it from a timeout kind.
+            _ => Self::Unclassified,
+        }
+    }
+
+    fn after_connect(kind: Option<std::io::ErrorKind>) -> Self {
+        use std::io::ErrorKind;
+        match kind {
+            // These sites use blocking sockets; WouldBlock is their configured
+            // socket deadline signal. PoolCheck's nonblocking I/O is excluded.
+            Some(ErrorKind::TimedOut | ErrorKind::WouldBlock) => Self::RequestDeadlineAfterConnect,
+            Some(
+                ErrorKind::ConnectionReset
+                | ErrorKind::ConnectionAborted
+                | ErrorKind::UnexpectedEof,
+            ) => Self::ResetAfterConnect,
+            _ => Self::OtherAfterConnect,
+        }
+    }
+}
+
 /// Metadata supplied by the finite typed command/ceremony mapping.
 /// An existing idempotency contract is evidence, not permission to retry here.
 pub(crate) enum EffectContract {
@@ -39,6 +96,7 @@ pub(crate) struct Attempt {
     started: Instant,
     connect_budget: Option<Duration>,
     request_budget: Option<Duration>,
+    headers_observed: bool,
     correlated_headers: bool,
     listener_generation: Option<ListenerGeneration>,
 }
@@ -76,6 +134,7 @@ impl Attempt {
             started: Instant::now(),
             connect_budget,
             request_budget,
+            headers_observed: false,
             correlated_headers: false,
             listener_generation: None,
         })
@@ -88,6 +147,7 @@ impl Attempt {
     /// Header values are evidence only for the matching local request. They
     /// never establish domain acceptance. Call before consuming Response.
     pub(crate) fn observe_headers(&mut self, echoed_id: Option<&str>, generation: Option<&str>) {
+        self.headers_observed = true;
         self.correlated_headers = echoed_id == Some(self.request_id.as_str());
         self.listener_generation = if self.correlated_headers {
             generation
@@ -214,9 +274,22 @@ impl Attempt {
         })
     }
 
+    pub(crate) fn fail_transport(self, error: &ureq::Transport, base: &Path) -> CompletedAttempt {
+        self.fail(FailureFact::from_transport(error), base)
+    }
+
+    pub(crate) fn fail_body(self, error: &std::io::Error, base: &Path) -> CompletedAttempt {
+        let fact = if self.headers_observed {
+            FailureFact::after_connect(Some(error.kind()))
+        } else {
+            FailureFact::Unclassified
+        };
+        self.fail(fact, base)
+    }
+
     /// Consume once and attempt one append. This never owns or transforms the
     /// request's Result/error: the caller retains it for the fidelity renderer.
-    pub(crate) fn fail(self, fact: FailureFact, base: &Path) -> CompletedAttempt {
+    fn fail(self, fact: FailureFact, base: &Path) -> CompletedAttempt {
         let elapsed_ms = millis(self.started.elapsed());
         let (effect_kind, uncertain_effect, uncertain_action) = match self.effect {
             EffectContract::Read => (EffectKind::Read, EffectState::None, Action::RetrySafe),

@@ -1954,7 +1954,9 @@ pub(crate) fn gateway_request(
     path: &str,
     timeout: Option<Duration>,
 ) -> ureq::Request {
-    let mut builder = ureq::AgentBuilder::new();
+    // One actual gateway exchange per invocation/ID. Keep this local to the
+    // gateway's fresh Agent; provider and other transports keep their policy.
+    let mut builder = ureq::AgentBuilder::new().redirects(0);
     if let Some(timeout) = timeout {
         builder = builder.timeout(timeout).timeout_connect(timeout);
     }
