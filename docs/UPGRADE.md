@@ -1,20 +1,52 @@
 # Upgrading a running instance
 
-Stop it, back it up, swap the code, start it, and verify the durable rows.
-Most upgrades are ordinary restarts because the ledger is durable. Tightbeam
-0.1.8 also carries one exact migration chain: `model-identity-v1` (0.1.7) to
-`operator-decision-requests-v1`, then to `pi-harness-v1`. A database already at
-the intermediate stamp runs only the second step. The gateway refuses every
-other old stamp. It never infers a schema from stored DDL.
+Keep each release in its own complete directory. Stage and verify the release
+package before selecting it through `/opt/tightbeam/current`; the selection is
+one atomic symlink replacement, and the previous build remains available.
+Never update the package directory that a service may load on a restart. In
+particular, do not use `npm install -g` for a service-managed gateway: it can
+replace restart-loadable bytes before a running process is restarted.
 
-If the gateway is service-managed, installing a new package only swaps the
-executable on disk; it does not restart the running process. After the package
-install, restart the service before performing the checks below. On Linux:
+For a package upgrade, first take the backup described below, then follow the
+release-package stage/select steps in [README.md](../README.md). `stage` checks
+the package SHA-256 against `SHA256SUMS`, binds the package version and source
+commit to `release-provenance.json`, checks the CLI and gateway versions, and
+records hashes for the staged files. It does not change `current`. After the
+candidate is reviewed and the applicable upgrade is authorized, `select`
+rechecks those files and switches `current` atomically. A failed or interrupted
+stage cannot change the selected build. Incomplete temporary stage directories
+are inert and are never selected.
 
-```sh
-sudo systemctl restart tightbeam.service
-systemctl is-active tightbeam.service
-```
+An installation still using a global npm path must first be migrated to the
+selector. Identify the actual running build from `GET /version` (`version` and
+`sha`). The `sha` is a short source commit stamp, not an artifact digest. Stage
+the published package only when deployment records establish that the running
+process came from that release and its provenance `commit` begins with the
+reported `sha`. Select that same package, point the service at
+`/opt/tightbeam/current/tightbeam/bin/tightbeam-gateway`, and reload its service
+configuration. If the running stamp does not match a verified package, stop the
+migration until the exact prior build is recovered; the executable currently
+on disk can already differ from the process in memory. If the running artifact's
+origin is unknown, the source stamp alone is not enough to claim it as a verified
+rollback build.
+
+After selection, `readlink /opt/tightbeam/current` identifies the selected
+build. The running process may still report the previous version until its
+service is restarted. Restart only after the applicable idle and authorization
+boundary, then compare `GET /version`'s `version` with the selected receipt's
+`version` and its short `sha` with the prefix of `sourceCommit` in
+`/opt/tightbeam/builds/<selected-build-id>/.tightbeam-stage.json`. Run
+`/opt/tightbeam/current/tightbeam/bin/tightbeam-select select --root
+/opt/tightbeam --build <previous-build-id>` to switch back to a retained build
+after you confirm that it supports the current database schema. Selecting old
+executable bytes does not reverse a SQLite migration or make an incompatible
+schema safe.
+
+Tightbeam 0.1.8 carries one exact migration chain: `model-identity-v1` (0.1.7)
+to `operator-decision-requests-v1`, then to `pi-harness-v1`. A database already
+at the intermediate stamp runs only the second step. The gateway refuses every
+other old stamp. It never infers a schema from stored DDL. This migration
+history does not establish downgrade compatibility.
 
 Everything below was measured on 2026-07-26 against a real `state.db` with work
 genuinely in flight.
@@ -189,17 +221,15 @@ isolated test gateway.
 Do not run the TARS or Shrdlu cold-install custody matrix again. This is the
 upgrade-preservation check that matrix did not cover.
 
-## The cycle
+## Release upgrade sequence
 
-```sh
-# 1. stop, and let it drain — SIGTERM is enough
-kill -TERM <gateway pid>          # verified: this runs prep_stop, which drains
-# 2. swap the code
-git -C <checkout> pull            # or checkout the tag you are deploying
-mix deps.get && mix compile
-# 3. start
-# 4. verify — the restart checks and fresh-agent proof below
-```
+For release packages, the stage/select sequence above is the supported cycle.
+Keep source builds outside every service-selected path; `git pull` and
+`mix compile` must not modify the executable that a crash or service restart
+would load. Stage the complete release package first, select only its reported
+build ID after verification and authorization, and restart the service as a
+separate operation. If the process exits before that restart, the service still
+starts the currently selected complete build.
 
 ## What the stop actually does
 

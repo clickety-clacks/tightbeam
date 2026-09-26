@@ -1,0 +1,436 @@
+#!/usr/bin/env node
+'use strict';
+
+const crypto = require('node:crypto');
+const fs = require('node:fs');
+const path = require('node:path');
+const { spawnSync } = require('node:child_process');
+
+const USAGE =
+  'usage: tightbeam-select stage --root ROOT --package FILE --checksums SHA256SUMS --provenance release-provenance.json\n' +
+  '       tightbeam-select select --root ROOT --build sha256-<package-digest>';
+
+function refuse(message) {
+  throw new Error(message);
+}
+
+function options(argv) {
+  const result = {};
+
+  for (let index = 0; index < argv.length; index += 2) {
+    const name = argv[index];
+    const value = argv[index + 1];
+
+    if (!name || !name.startsWith('--') || !value || value.startsWith('--')) {
+      refuse(USAGE);
+    }
+    const key = name.slice(2);
+    if (Object.hasOwn(result, key)) refuse(`duplicate option ${name}`);
+    result[key] = value;
+  }
+
+  return result;
+}
+
+function required(optionsValue, name) {
+  const value = optionsValue[name];
+  if (!value) refuse(`missing --${name}`);
+  return value;
+}
+
+function run(command, args) {
+  const result = spawnSync(command, args, { encoding: 'utf8' });
+  if (result.error) refuse(`${command} could not run: ${result.error.message}`);
+  if (result.status !== 0) {
+    const detail = (result.stderr || result.stdout || '').trim();
+    refuse(`${command} failed${detail ? `: ${detail}` : ''}`);
+  }
+  return result.stdout || '';
+}
+
+function regularFile(file, label) {
+  let stat;
+  try {
+    stat = fs.lstatSync(file);
+  } catch (error) {
+    if (error.code === 'ENOENT') refuse(`${label} is missing: ${file}`);
+    throw error;
+  }
+  if (!stat.isFile() || stat.isSymbolicLink()) refuse(`${label} is not a regular file: ${file}`);
+}
+
+function executableFile(file, label) {
+  regularFile(file, label);
+  if ((fs.statSync(file).mode & 0o111) === 0) refuse(`${label} is not executable: ${file}`);
+}
+
+function directory(dir, label) {
+  let stat;
+  try {
+    stat = fs.lstatSync(dir);
+  } catch (error) {
+    if (error.code === 'ENOENT') refuse(`${label} is missing: ${dir}`);
+    throw error;
+  }
+  if (!stat.isDirectory() || stat.isSymbolicLink()) refuse(`${label} is not a directory: ${dir}`);
+}
+
+function ensureDirectory(dir) {
+  fs.mkdirSync(dir, { recursive: true, mode: 0o755 });
+  directory(dir, 'installation directory');
+}
+
+function canonicalRoot(rootArg, create) {
+  const requested = path.resolve(rootArg);
+  if (create) ensureDirectory(requested);
+  directory(requested, 'installation root');
+  return fs.realpathSync(requested);
+}
+
+function sha256File(file) {
+  return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+}
+
+function jsonFile(file, label) {
+  regularFile(file, label);
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch (error) {
+    refuse(`${label} is not valid JSON: ${error.message}`);
+  }
+}
+
+function checkChecksum(checksumsPath, packageName, actualSha) {
+  regularFile(checksumsPath, 'SHA256SUMS');
+  const rows = fs.readFileSync(checksumsPath, 'utf8').split(/\r?\n/);
+  const matching = rows
+    .map((line) => line.match(/^([0-9a-f]{64})\s+\*?(.+)$/))
+    .filter(Boolean)
+    .filter((match) => match[2] === packageName || match[2] === `./${packageName}`);
+
+  if (matching.length !== 1) refuse(`SHA256SUMS must name ${packageName} exactly once`);
+  if (matching[0][1] !== actualSha) refuse(`package SHA-256 does not match SHA256SUMS for ${packageName}`);
+}
+
+function releaseIdentity(provenancePath, packageName, version) {
+  const provenance = jsonFile(provenancePath, 'release-provenance.json');
+  if (provenance.repository !== 'clickety-clacks/tightbeam') {
+    refuse('release provenance names a different repository');
+  }
+  if (provenance.checksums !== 'SHA256SUMS') refuse('release provenance does not name SHA256SUMS');
+  if (typeof provenance.tag !== 'string' || !provenance.tag.startsWith('v')) {
+    refuse('release provenance has no version tag');
+  }
+  const tagVersion = provenance.tag.slice(1).split('+', 1)[0];
+  if (tagVersion !== version) refuse(`release tag ${provenance.tag} does not match package version ${version}`);
+  if (typeof provenance.commit !== 'string' || !/^[0-9a-f]{40}$/.test(provenance.commit)) {
+    refuse('release provenance has no full source commit');
+  }
+  if (!Array.isArray(provenance.assets) || provenance.assets.filter((asset) => asset === packageName).length !== 1) {
+    refuse(`release provenance does not name package ${packageName} exactly once`);
+  }
+  if (typeof provenance.workflow !== 'string' || provenance.workflow.length === 0) {
+    refuse('release provenance has no workflow run');
+  }
+
+  const platform =
+    process.platform === 'darwin' && process.arch === 'arm64'
+      ? 'darwin-aarch64'
+      : process.platform === 'linux' && process.arch === 'x64'
+        ? 'linux-x86_64'
+        : null;
+  if (!platform) refuse(`unsupported install host ${process.platform}-${process.arch}`);
+  const suffix = `-${platform}-${provenance.commit.slice(0, 7)}.tgz`;
+  if (!packageName.startsWith(`tightbeam-${version}-`) || !packageName.endsWith(suffix)) {
+    refuse(`package name does not bind version, platform, and source commit: ${packageName}`);
+  }
+
+  return {
+    sourceCommit: provenance.commit,
+    tag: provenance.tag,
+    workflow: provenance.workflow,
+  };
+}
+
+function validateArchive(archive) {
+  const names = run('tar', ['-tzf', archive]).split(/\r?\n/).filter((name) => name.length > 0);
+  if (names.length === 0) refuse('package archive is empty');
+
+  for (const archivedName of names) {
+    const name = archivedName.endsWith('/') ? archivedName.slice(0, -1) : archivedName;
+    const parts = name.split('/');
+    if (
+      name.startsWith('/') ||
+      name.includes('\\') ||
+      (name !== 'tightbeam' && !name.startsWith('tightbeam/')) ||
+      parts.some((part) => part === '' || part === '.' || part === '..')
+    ) {
+      refuse(`package archive has an unsafe path: ${archivedName}`);
+    }
+  }
+}
+
+function treeEntries(root, relative = '') {
+  const current = relative ? path.join(root, relative) : root;
+  const stat = fs.lstatSync(current);
+  if (stat.isSymbolicLink()) refuse(`package contains a symbolic link: ${relative || '.'}`);
+
+  const mode = stat.mode & 0o777;
+  if (stat.isDirectory()) {
+    const entries = [{ path: relative || '.', type: 'directory', mode }];
+    const children = fs.readdirSync(current).sort();
+    for (const child of children) {
+      const childRelative = relative ? path.join(relative, child) : child;
+      entries.push(...treeEntries(root, childRelative));
+    }
+    return entries;
+  }
+  if (!stat.isFile()) refuse(`package contains a non-regular entry: ${relative}`);
+
+  return [
+    {
+      path: relative,
+      type: 'file',
+      mode,
+      sha256: sha256File(current),
+    },
+  ];
+}
+
+function treeSha256(packageRoot) {
+  const entries = treeEntries(packageRoot);
+  return { digest: crypto.createHash('sha256').update(JSON.stringify(entries)).digest('hex'), count: entries.length };
+}
+
+function packageVersion(packageRoot) {
+  const manifest = jsonFile(path.join(packageRoot, 'package.json'), 'package.json');
+  if (manifest.name !== 'tightbeam') refuse('package manifest name is not tightbeam');
+  if (typeof manifest.version !== 'string' || !/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(manifest.version)) {
+    refuse('package manifest has no valid version');
+  }
+  return manifest.version;
+}
+
+function verifyPackage(packageRoot, expectedVersion) {
+  directory(packageRoot, 'package root');
+  const version = packageVersion(packageRoot);
+  if (expectedVersion && version !== expectedVersion) {
+    refuse(`package version ${version} does not match staged version ${expectedVersion}`);
+  }
+
+  for (const relative of [
+    'release/releases/start_erl.data',
+    `release/lib/tightbeam-${version}/ebin/tightbeam.app`,
+  ]) {
+    regularFile(path.join(packageRoot, relative), relative);
+  }
+
+  for (const relative of [
+    'bin/tightbeam',
+    'bin/tightbeam-gateway',
+    'release/bin/tightbeam_gateway',
+  ]) {
+    executableFile(path.join(packageRoot, relative), relative);
+  }
+
+  const cliVersion = run(path.join(packageRoot, 'bin/tightbeam'), ['--version']).trim();
+  if (cliVersion !== version) refuse(`CLI version ${cliVersion} does not match package version ${version}`);
+
+  const startData = fs.readFileSync(path.join(packageRoot, 'release/releases/start_erl.data'), 'utf8').trim();
+  const gatewayVersion = startData.split(/\s+/)[1];
+  if (gatewayVersion !== version) {
+    refuse(`gateway version ${gatewayVersion || 'missing'} does not match package version ${version}`);
+  }
+
+  return version;
+}
+
+function readReceipt(root, buildId) {
+  if (!/^sha256-[0-9a-f]{64}$/.test(buildId)) refuse(`invalid build id: ${buildId}`);
+  const buildRoot = path.join(root, 'builds', buildId);
+  directory(buildRoot, `build ${buildId}`);
+  const receipt = jsonFile(path.join(buildRoot, '.tightbeam-stage.json'), `build receipt for ${buildId}`);
+
+  if (receipt.schema !== 'tightbeam-staged-build/v1' || receipt.buildId !== buildId) {
+    refuse(`build receipt does not identify ${buildId}`);
+  }
+  if (!/^[0-9a-f]{64}$/.test(receipt.packageSha256) || buildId !== `sha256-${receipt.packageSha256}`) {
+    refuse(`build receipt has an invalid package digest for ${buildId}`);
+  }
+  if (!/^[0-9a-f]{40}$/.test(receipt.sourceCommit)) refuse(`build receipt has no full source commit for ${buildId}`);
+  if (typeof receipt.packageFile !== 'string' || path.basename(receipt.packageFile) !== receipt.packageFile) {
+    refuse(`build receipt has an invalid package name for ${buildId}`);
+  }
+  if (
+    typeof receipt.tag !== 'string' ||
+    !receipt.tag.startsWith('v') ||
+    receipt.tag.slice(1).split('+', 1)[0] !== receipt.version ||
+    typeof receipt.workflow !== 'string' ||
+    receipt.workflow.length === 0
+  ) {
+    refuse(`build receipt has invalid release provenance for ${buildId}`);
+  }
+
+  const packageRoot = path.join(buildRoot, 'tightbeam');
+  const actualTree = treeSha256(packageRoot);
+  if (actualTree.digest !== receipt.treeSha256 || actualTree.count !== receipt.fileCount) {
+    refuse(`staged package ${buildId} changed after verification`);
+  }
+  const version = verifyPackage(packageRoot, receipt.version);
+
+  return { buildRoot, packageRoot, receipt, version };
+}
+
+function stage(values) {
+  process.umask(0o022);
+  const root = canonicalRoot(required(values, 'root'), true);
+  const packageArg = path.resolve(required(values, 'package'));
+  const packageName = path.basename(packageArg);
+  regularFile(packageArg, 'package archive');
+  const packageSha256 = sha256File(packageArg);
+  checkChecksum(path.resolve(required(values, 'checksums')), packageName, packageSha256);
+
+  const builds = path.join(root, 'builds');
+  const staging = path.join(root, '.staging');
+  ensureDirectory(builds);
+  ensureDirectory(staging);
+
+  validateArchive(packageArg);
+  const uniqueDir = path.join(staging, `${packageSha256}.${process.pid}.${crypto.randomBytes(6).toString('hex')}`);
+  fs.mkdirSync(uniqueDir, { mode: 0o755 });
+
+  try {
+    const tarArgs = ['-xzf', packageArg, '-C', uniqueDir];
+    if (process.platform === 'darwin') tarArgs.push('-o');
+    else tarArgs.push('--no-same-owner');
+    run('tar', tarArgs);
+
+    const packageRoot = path.join(uniqueDir, 'tightbeam');
+    directory(packageRoot, 'extracted package root');
+    const topLevel = fs.readdirSync(uniqueDir);
+    if (topLevel.length !== 1 || topLevel[0] !== 'tightbeam') {
+      refuse('package archive must contain only the tightbeam package root');
+    }
+
+    const version = packageVersion(packageRoot);
+    const identity = releaseIdentity(path.resolve(required(values, 'provenance')), packageName, version);
+    verifyPackage(packageRoot, version);
+    const tree = treeSha256(packageRoot);
+    const buildId = `sha256-${packageSha256}`;
+    const buildRoot = path.join(builds, buildId);
+
+    if (fs.existsSync(buildRoot)) {
+      const existing = readReceipt(root, buildId);
+      if (
+        existing.receipt.sourceCommit !== identity.sourceCommit ||
+        existing.receipt.treeSha256 !== tree.digest
+      ) {
+        refuse(`existing staged build ${buildId} does not match this package`);
+      }
+      fs.rmSync(uniqueDir, { recursive: true, force: true });
+      process.stdout.write(
+        `${JSON.stringify({ state: 'already-staged', buildId, version, sourceCommit: identity.sourceCommit, packageSha256 })}\n`,
+      );
+      return;
+    }
+
+    const receipt = {
+      schema: 'tightbeam-staged-build/v1',
+      buildId,
+      packageFile: packageName,
+      packageSha256,
+      sourceCommit: identity.sourceCommit,
+      tag: identity.tag,
+      workflow: identity.workflow,
+      version,
+      treeSha256: tree.digest,
+      fileCount: tree.count,
+    };
+    fs.writeFileSync(path.join(uniqueDir, '.tightbeam-stage.json'), `${JSON.stringify(receipt, null, 2)}\n`, {
+      flag: 'wx',
+      mode: 0o644,
+    });
+    fs.renameSync(uniqueDir, buildRoot);
+    process.stdout.write(
+      `${JSON.stringify({ state: 'staged', buildId, version, sourceCommit: identity.sourceCommit, packageSha256, treeSha256: tree.digest })}\n`,
+    );
+  } catch (error) {
+    fs.rmSync(uniqueDir, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+function currentBuild(root) {
+  const current = path.join(root, 'current');
+  let stat;
+  try {
+    stat = fs.lstatSync(current);
+  } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  }
+  if (!stat.isSymbolicLink()) refuse('current selector exists and is not a symlink');
+
+  const target = fs.readlinkSync(current);
+  const match = target.match(/^builds\/(sha256-[0-9a-f]{64})$/);
+  if (!match) refuse(`current selector has an unexpected target: ${target}`);
+  return match[1];
+}
+
+function select(values) {
+  const root = canonicalRoot(required(values, 'root'), false);
+  const buildId = required(values, 'build');
+  const candidate = readReceipt(root, buildId);
+  const previousBuildId = currentBuild(root);
+
+  if (previousBuildId) readReceipt(root, previousBuildId);
+  if (previousBuildId === buildId) {
+    process.stdout.write(
+      `${JSON.stringify({ state: 'already-selected', selectedBuildId: buildId, previousBuildId })}\n`,
+    );
+    return;
+  }
+
+  const temporarySelector = path.join(
+    root,
+    `.current.${process.pid}.${crypto.randomBytes(6).toString('hex')}`,
+  );
+  const target = path.relative(root, candidate.buildRoot);
+
+  try {
+    fs.symlinkSync(target, temporarySelector, 'dir');
+    // Both paths are siblings under the installation root, so rename replaces
+    // the selector atomically. The prior versioned directory remains untouched.
+    fs.renameSync(temporarySelector, path.join(root, 'current'));
+  } catch (error) {
+    try {
+      fs.unlinkSync(temporarySelector);
+    } catch (cleanupError) {
+      if (cleanupError.code !== 'ENOENT') throw cleanupError;
+    }
+    throw error;
+  }
+
+  process.stdout.write(
+    `${JSON.stringify({ state: 'selected', selectedBuildId: buildId, previousBuildId, version: candidate.version, sourceCommit: candidate.receipt.sourceCommit })}\n`,
+  );
+}
+
+function main() {
+  if (process.platform !== 'darwin' && process.platform !== 'linux') {
+    refuse(`unsupported install host ${process.platform}`);
+  }
+
+  const [operation, ...rest] = process.argv.slice(2);
+  const values = options(rest);
+  if (operation === 'stage') return stage(values);
+  if (operation === 'select') return select(values);
+  refuse(USAGE);
+}
+
+try {
+  main();
+} catch (error) {
+  process.stderr.write(`tightbeam-select: ${error.message}\n`);
+  process.exitCode = 1;
+}

@@ -220,28 +220,46 @@ sha256sum -c SHA256SUMS --ignore-missing
 shasum -a 256 -c SHA256SUMS --ignore-missing
 ```
 
-For an existing installation, complete the review in
-[UPGRADING AN EARLIER INSTALLATION](#upgrading-an-earlier-installation) before
-installing the verified package. For a fresh installation:
+For an existing installation, follow [UPGRADING AN EARLIER INSTALLATION](#upgrading-an-earlier-installation).
+Do not use `npm install -g` for a service-managed gateway: npm replaces the
+restart-loadable executable before the running process restarts. A crash in that
+window can load bytes that have not completed verification.
+
+Install the release under a versioned directory and switch the service through
+the `current` selector. First verify the package against the release sidecars
+above, then extract the selector helper and stage the package:
 
 ```sh
-npm install -g ./tightbeam-<version>-<os>-<arch>-build<N>.tgz
-tightbeam --version
-tightbeam-gateway                  # boots the gateway in the foreground
+PACKAGE=./tightbeam-<version>-<os>-<arch>-<source-short-sha>.tgz
+TOOLS=$(mktemp -d)
+trap 'rm -rf "$TOOLS"' EXIT
+tar -xzf "$PACKAGE" -C "$TOOLS" tightbeam/bin/tightbeam-select
+
+sudo env "PATH=$PATH" "$TOOLS/tightbeam/bin/tightbeam-select" stage \
+  --root /opt/tightbeam --package "$PACKAGE" \
+  --checksums SHA256SUMS --provenance release-provenance.json
 ```
 
-For a service-managed installation, `npm install -g` replaces the executable on
-disk but does not restart the running gateway. Restart the service after every
-upgrade, then verify it is active:
+`stage` checks the package digest, release source commit, host platform, package
+version, CLI version, and gateway version. It writes a complete versioned build
+and file manifest without changing `current`, and prints its `buildId`. After
+reviewing and authorizing that candidate, set `BUILD_ID` to that exact value and
+run the helper from the staged build:
 
 ```sh
-# Linux
-sudo systemctl restart tightbeam.service
-systemctl is-active tightbeam.service
+BUILD_ID=sha256-<package-digest>
+sudo env "PATH=$PATH" "/opt/tightbeam/builds/$BUILD_ID/tightbeam/bin/tightbeam-select" select \
+  --root /opt/tightbeam --build "$BUILD_ID"
 ```
 
-On macOS, restart the installed Tightbeam launchd service, then verify it with
-`sudo launchctl print system/com.tightbeam.gateway`.
+Selection rechecks the staged files and atomically replaces `/opt/tightbeam/current`.
+The result prints the previous build ID. Builds stay in `/opt/tightbeam/builds/`;
+select that ID to switch back after confirming its database compatibility. On a
+fresh install there is no previous build to switch back to. For a service-managed
+install, point the service at `/opt/tightbeam/current/tightbeam/bin/tightbeam-gateway`,
+then restart it only after selection. The running process can continue using the
+previous version until that restart; `/version` reports the running version and
+source stamp, while `readlink /opt/tightbeam/current` reports the selected build.
 
 `tightbeam-gateway` is the release equivalent of `mix run --no-halt`: same
 foreground process, same environment contract, same first-boot behaviour. It
@@ -250,12 +268,14 @@ creates the base dir, seeds the identity repository, creates `state.db` and
 **Connect your first client**; everything after this point is identical for
 both install paths.
 
-The CLI and the gateway ship in one package on purpose, so their version
-handshake holds by construction — you cannot end up with a CLI that its gateway
-refuses. `npm install -g` installs both in npm's global bin directory. If you
-want easy access to the Tightbeam CLI, make sure npm's global bin directory is
-in your `PATH`. Tightbeam does not change your `PATH` for you. Nothing else is
-added to the machine, and neither Elixir nor Rust is needed to run either one.
+The CLI and gateway ship in one package, so their version handshake holds by
+construction. Add `/opt/tightbeam/current/tightbeam/bin` to `PATH` for the CLI,
+or call it by its full path. The selector helper requires Node.js 20 or later;
+the packaged gateway itself does not need Elixir or Rust.
+
+For a foreground instance after a fresh install, start
+`/opt/tightbeam/current/tightbeam/bin/tightbeam-gateway`. A service-managed
+instance starts from the same selected path after its service restart.
 
 ### UPGRADING AN EARLIER INSTALLATION
 
@@ -642,8 +662,8 @@ meet the requirements above. `UserName` keeps the process off root.
   <key>UserName</key><string>you</string>
   <key>ProgramArguments</key>
   <array>
-    <!-- npm decides where -g bins land; ask it: `command -v tightbeam-gateway` -->
-    <string>/Users/you/.local/bin/tightbeam-gateway</string>
+    <!-- current changes only after a complete release package is verified -->
+    <string>/opt/tightbeam/current/tightbeam/bin/tightbeam-gateway</string>
   </array>
   <key>WorkingDirectory</key><string>/Users/you</string>
   <key>EnvironmentVariables</key>
@@ -652,7 +672,7 @@ meet the requirements above. `UserName` keeps the process off root.
     <key>TIGHTBEAM_BASE_DIR</key><string>/Users/you/.tightbeam</string>
     <key>TIGHTBEAM_PORT</key><string>11373</string>
     <key>TIGHTBEAM_ADVERTISED_URL</key><string>ws://gibson.local:11373</string>
-    <key>PATH</key><string>/Users/you/.local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+    <key>PATH</key><string>/opt/tightbeam/current/tightbeam/bin:/Users/you/.local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key>
@@ -689,13 +709,12 @@ Type=exec
 User=you
 Group=you
 WorkingDirectory=/home/you
-# npm decides where -g bins land; use the output of: command -v tightbeam-gateway
-ExecStart=/home/you/.local/bin/tightbeam-gateway
+ExecStart=/opt/tightbeam/current/tightbeam/bin/tightbeam-gateway
 Environment=TIGHTBEAM_LOCAL_HOST_NAME=gibson
 Environment=TIGHTBEAM_BASE_DIR=/home/you/.tightbeam
 Environment=TIGHTBEAM_PORT=11373
 Environment=TIGHTBEAM_ADVERTISED_URL=ws://gibson.local:11373
-Environment=PATH=/home/you/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=/opt/tightbeam/current/tightbeam/bin:/usr/local/bin:/usr/bin:/bin
 # Daemon-owned OpenCode Go key (optional): systemd copies the source file into
 # $CREDENTIALS_DIRECTORY/opencode-go-api-key, the fixed name the gateway reads.
 # LoadCredential=opencode-go-api-key:/home/you/secrets/opencode-go-api-key

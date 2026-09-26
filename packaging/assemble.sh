@@ -42,6 +42,7 @@ MIX_ENV=prod mix release tightbeam_gateway --overwrite --quiet
 cargo build --release --manifest-path cli/Cargo.toml
 cp cli/target/release/tightbeam "$OUT/bin/tightbeam"
 cp packaging/tightbeam-gateway "$OUT/bin/tightbeam-gateway"
+cp packaging/tightbeam-select "$OUT/bin/tightbeam-select"
 cp -R _build/prod/rel/tightbeam_gateway "$OUT/release"
 sed "s/\"name\": \"tightbeam\"/\"name\": \"tightbeam\",\n  \"version\": \"$VERSION\",\n  \"os\": [\"$OS\"],\n  \"cpu\": [\"$NPM_CPU\"]/" packaging/package.json > "$OUT/package.json"
 ARTIFACT="_build/npm/tightbeam-$VERSION-$OS-$ARCH.tgz"
