@@ -452,7 +452,8 @@ defmodule Tightbeam.Harness.Codex do
             "mode=$(stat -c %a #{path} 2>/dev/null) || exit 76; " <>
             "chmod \"$mode\" #{replacement}"
 
-        :missing -> "chmod 600 #{replacement}"
+        :missing ->
+          "chmod 600 #{replacement}"
       end
 
     script =
@@ -464,8 +465,12 @@ defmodule Tightbeam.Harness.Codex do
         [target.host_config.ssh, "sh", "-c", Support.shell_quote(script)]
 
     case target.sh.(command) do
-      {_output, 0} -> :ok
-      {_output, 75} -> raise "Codex config changed during Guardian default publication: #{path}"
+      {_output, 0} ->
+        :ok
+
+      {_output, 75} ->
+        raise "Codex config changed during Guardian default publication: #{path}"
+
       {output, exit} ->
         detail = String.trim(output)
         detail = if detail == "", do: "", else: ": #{detail}"
