@@ -251,7 +251,11 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     refute_receive {:firehose_notice,
                     %{"class" => "wake.fired", "payload" => %{"wakeId" => ^exact_wake_id}}}
 
-    assert :ok = Ledger.finish(ctx.db, turn.seq, "failed", "fixture failure")
+    assert :ok =
+             Ledger.finish(ctx.db, turn.seq, "failed", "fixture failure",
+               owner_lease: turn.owner_lease
+             )
+
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert turn_count(ctx.db, wake.wake_id) == 1
@@ -301,7 +305,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assert turn_count(ctx.db, terminal.wake_id) == 1
     assert turn_count(ctx.db, success.wake_id) == 0
 
-    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
+    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert turn_count(ctx.db, success.wake_id) == 1
   end
@@ -327,7 +331,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assert existing.recognition_path == "success"
     assert existing.recognition_transition.label == "registration-snapshot"
     assert turn_count(ctx.db, existing.wake_id) == 0
-    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
+    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert turn_count(ctx.db, existing.wake_id) == 1
@@ -463,7 +467,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
            }
 
     assert turn_count(ctx.db, wake.wake_id) == 0
-    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
+    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert turn_count(ctx.db, wake.wake_id) == 1
   end
@@ -511,7 +515,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert turn_count(ctx.db, wake.wake_id) == 0
 
-    assert :ok = Ledger.finish(ctx.db, turn.seq, "canceled")
+    assert :ok = Ledger.finish(ctx.db, turn.seq, "canceled", nil, owner_lease: turn.owner_lease)
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert turn_count(ctx.db, wake.wake_id) == 1
   end
@@ -673,7 +677,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
                | params: %{cancel_wake_id: response.wake_id, reason_kind: "requester_withdrew"}
              })
 
-    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
+    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert turn_count(ctx.db, response.wake_id) == 0
   end
@@ -713,7 +717,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
        delivery_opts: [conn_registry: ctx.registry, lane_manager: ctx.lane]}
     )
 
-    assert :ok = Ledger.finish(ctx.db, turn.seq, "failed")
+    assert :ok = Ledger.finish(ctx.db, turn.seq, "failed", nil, owner_lease: turn.owner_lease)
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert turn_count(ctx.db, latched.wake_id) == 1
 
@@ -1024,7 +1028,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     turn = running_turn(ctx.db, "holder")
     wake = register_wait(ctx.db, due_after(), predicate("R"))
     refute covered?(ctx.db, "A")
-    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
+    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
     assert covered?(ctx.db, "A")
     refute covered?(ctx.db, "B")
     assert {:match, %{id: "B"}} = Supervision.prod_production_matches?(ctx.db, "holder", turn.seq)
@@ -1042,7 +1046,12 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assert {:ok, continuation} = Ledger.claim_next(ctx.db, "holder", "fixture")
     assert covered?(ctx.db, "A")
     refute covered?(ctx.db, "B")
-    assert :ok = Ledger.finish(ctx.db, continuation.seq, "delivered")
+
+    assert :ok =
+             Ledger.finish(ctx.db, continuation.seq, "delivered", nil,
+               owner_lease: continuation.owner_lease
+             )
+
     refute covered?(ctx.db, "A")
 
     assert {:match, %{id: "A"}} =
@@ -1079,7 +1088,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     end
 
     turn = running_turn(ctx.db, "holder")
-    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
+    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
     register_wait(ctx.db, due_after(), predicate("R"))
     handlers = Gateway.handlers(%{db: ctx.db, wake_tick_ms: 60_000})
     assert {:prodded, 1} = Supervision.evaluate(ctx.db, handlers, 3, "holder", turn.seq)
@@ -1131,7 +1140,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assert wake.obligation_ref == "A"
     assert wake.originating_turn_seq == turn.seq
     refute covered?(ctx.db, "A")
-    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
+    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
     assert covered?(ctx.db, "A")
 
     # A rule installed after an earlier allowed decision must still be checked
@@ -1389,7 +1398,12 @@ defmodule Tightbeam.RowDrivenWaitsTest do
       assert {:ok, turn} = Ledger.claim_next(ctx.db, "holder", "fixture")
       assert covered?(ctx.db, "A")
       before = {attest_count(ctx.db, "A"), supervision_counts(ctx.db, "A")}
-      assert :ok = Ledger.finish(ctx.db, turn.seq, status, "model capacity")
+
+      assert :ok =
+               Ledger.finish(ctx.db, turn.seq, status, "model capacity",
+                 owner_lease: turn.owner_lease
+               )
+
       refute covered?(ctx.db, "A")
       assert {attest_count(ctx.db, "A"), supervision_counts(ctx.db, "A")} == before
 

@@ -38,20 +38,76 @@ defmodule Tightbeam.LedgerTest do
     seq
   end
 
+  test "a foreign claim lease rolls back terminal state and lifecycle evidence", %{db: db} do
+    seq = enqueue!(db, "k1", "lease-fenced terminal")
+    assert {:ok, turn} = Ledger.claim_next(db, "k1", "owner")
+
+    assert {:error, %Tightbeam.TurnLifecycle.WriteError{code: :stale_owner_lease}} =
+             DB.transaction(db, fn txn ->
+               Ledger.finish_in_txn(txn, seq, "delivered", nil, owner_lease: "foreign-owner")
+             end)
+
+    assert {:ok, [["running", nil]]} =
+             DB.query(db, "SELECT status,endedAt FROM turns WHERE seq=?1", [seq])
+
+    assert {:ok, [["claimed"]]} =
+             DB.query(db, "SELECT kind FROM turn_lifecycle_events WHERE turnSeq=?1", [seq])
+
+    assert :ok = Ledger.finish(db, seq, "delivered", nil, owner_lease: turn.owner_lease)
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               db,
+               "SELECT COUNT(*) FROM turn_lifecycle_events WHERE turnSeq=?1 AND kind='terminal_committed'",
+               [seq]
+             )
+  end
+
+  test "dispatch evidence rejects a different adapter generation without recording it", %{db: db} do
+    seq = enqueue!(db, "k1", "generation-fenced dispatch")
+    assert {:ok, turn} = Ledger.claim_next(db, "k1", "owner")
+    assert {:ok, _} = DB.query(db, "UPDATE turns SET adapterGen=2 WHERE seq=?1", [seq])
+
+    event = %{
+      event_key: "prompt:dispatched",
+      producer_event_id: "request:7",
+      kind: "prompt_dispatched",
+      stage: "prompt",
+      outcome: "dispatched",
+      cause: "acp:port-write",
+      principal: "process:tightbeam",
+      owner_lease: turn.owner_lease,
+      adapter_gen: 1,
+      acp_request_id: 7,
+      detail: %{v: 1}
+    }
+
+    assert {:error, {:turn_lifecycle_write_rejected, :generation_mismatch}} =
+             Tightbeam.TurnLifecycle.append(db, seq, event)
+
+    assert {:ok, [["claimed"]]} =
+             DB.query(db, "SELECT kind FROM turn_lifecycle_events WHERE turnSeq=?1", [seq])
+
+    assert :ok = Tightbeam.TurnLifecycle.append(db, seq, %{event | adapter_gen: 2})
+  end
+
   test "Firehose terminal publication follows winning commit and excludes rollback and replay", %{
     db: db
   } do
     alias Tightbeam.Firehose.Hub
     :ok = DB.execute(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES('flynn',0,1)")
     seq = enqueue!(db, "k1", "terminal publication")
-    assert {:ok, _} = Ledger.claim_next(db, "k1", "lane")
+    assert {:ok, claimed} = Ledger.claim_next(db, "k1", "lane")
     :ok = DB.execute(db, "UPDATE sessions SET mechanicalStatus='running' WHERE sessionKey='k1'")
     hub = start_supervised!({Hub, name: Hub})
     :ok = Hub.register(hub, self(), %{mode: :all, db: db, user_id: "flynn", is_admin: false})
 
     assert {:error, %RuntimeError{message: "rollback terminal"}} =
              DB.transaction(db, fn txn ->
-               assert Ledger.finish_in_txn(txn, seq, "delivered", nil)
+               assert Ledger.finish_in_txn(txn, seq, "delivered", nil,
+                        owner_lease: claimed.owner_lease
+                      )
+
                raise "rollback terminal"
              end)
 
@@ -61,7 +117,7 @@ defmodule Tightbeam.LedgerTest do
     assert {:ok, [["running"]]} =
              DB.query(db, "SELECT mechanicalStatus FROM sessions WHERE sessionKey='k1'")
 
-    assert :ok = Ledger.finish(db, seq, "delivered")
+    assert :ok = Ledger.finish(db, seq, "delivered", nil, owner_lease: claimed.owner_lease)
 
     assert_receive {:firehose_notice,
                     %{"class" => "turn.ended", "refs" => refs, "payload" => payload}}
@@ -201,7 +257,7 @@ defmodule Tightbeam.LedgerTest do
     {:ok, t} = Ledger.claim_next(db, "k1", "lane")
     assert :busy = Ledger.claim_next(db, "k1", "lane")
 
-    :ok = Ledger.finish(db, t.seq, "delivered")
+    :ok = Ledger.finish(db, t.seq, "delivered", nil, owner_lease: t.owner_lease)
     {:ok, t2} = Ledger.claim_next(db, "k1", "lane")
     assert t2.prompt == "b"
     assert :none = Ledger.claim_next(db, "k2", "lane")
@@ -211,8 +267,8 @@ defmodule Tightbeam.LedgerTest do
     enqueue!(db, "k1", "a")
     {:ok, t} = Ledger.claim_next(db, "k1", "lane")
 
-    assert :ok = Ledger.finish(db, t.seq, "delivered")
-    assert :already_terminal = Ledger.finish(db, t.seq, "failed")
+    assert :ok = Ledger.finish(db, t.seq, "delivered", nil, owner_lease: t.owner_lease)
+    assert :already_terminal = Ledger.finish(db, t.seq, "failed", nil, owner_lease: t.owner_lease)
   end
 
   test "wakeId dedupe: at-least-once attempts, exactly-once enqueue", %{db: db} do
@@ -268,9 +324,12 @@ defmodule Tightbeam.LedgerTest do
         job_ref: "wi_repair"
       })
 
-    {:ok, _turn} = Ledger.claim_next(db, "k1", "lane")
+    {:ok, turn} = Ledger.claim_next(db, "k1", "lane")
 
-    :ok = Ledger.finish(db, source_seq, "failed", "adapter unavailable")
+    :ok =
+      Ledger.finish(db, source_seq, "failed", "adapter unavailable",
+        owner_lease: turn.owner_lease
+      )
 
     assert {:ok, {:appended, attempt_seq, attempt_id}} =
              Ledger.repair_terminal(db, source_seq, "asg_repair", "repair-key", "agent:test")
@@ -408,12 +467,12 @@ defmodule Tightbeam.LedgerTest do
         """
       )
 
-    assert {:ok, %{seq: ^first}} = Ledger.claim_next(db, "k1", "lane")
+    assert {:ok, %{seq: ^first} = claimed} = Ledger.claim_next(db, "k1", "lane")
 
     assert {:ok, [["running", "gpt-5.6-sol", "high", "1m", "codex"]]} = mind(db, first)
 
     # The trace reads TERMINAL turns — the stamp must survive terminalization.
-    :ok = Ledger.finish(db, first, "delivered")
+    :ok = Ledger.finish(db, first, "delivered", nil, owner_lease: claimed.owner_lease)
 
     assert {:ok, [["delivered", "gpt-5.6-sol", "high", "1m", "codex"]]} = mind(db, first)
   end
@@ -429,7 +488,7 @@ defmodule Tightbeam.LedgerTest do
   test "publication feed: terminal rows surface until marked published", %{db: db} do
     enqueue!(db, "k1", "a")
     {:ok, t} = Ledger.claim_next(db, "k1", "lane")
-    :ok = Ledger.finish(db, t.seq, "delivered")
+    :ok = Ledger.finish(db, t.seq, "delivered", nil, owner_lease: t.owner_lease)
 
     assert [%{seq: seq, status: "delivered"}] = Ledger.unpublished_terminals(db)
     :ok = Ledger.mark_published(db, seq)

@@ -440,6 +440,14 @@ pub enum Command {
         identity: Identity,
         wake_id: String,
     },
+    SettleTurn {
+        identity: Identity,
+        session_key: String,
+        turn_seq: String,
+        outcome: String,
+        reason: String,
+        idempotency_key: String,
+    },
     IdentityEdit {
         identity: Identity,
         idempotency_key: String,
@@ -864,6 +872,11 @@ COMMANDS:
   cancel-wake <wakeId>
       Cancel a pending (scheduled) wake by its id (from the wake command's
       output).
+
+  settle-turn --session <key> --seq <turnSeq> --outcome cancel|fail
+              --reason <text> --key <idempotencyKey> --as-user <adminUserId>
+      Settle one proven-stale running turn. This operator-only command never
+      interrupts a live task; use cancel for a live task.
 
   kungfu list
       List the kungfu bundles shipped with this Tightbeam build and each
@@ -2732,6 +2745,34 @@ fn parse_with_optional_catalog(
                 wake_id,
             })
         }
+        "settle-turn" => {
+            let usage = "usage: tightbeam settle-turn --session <key> --seq <turnSeq> --outcome cancel|fail --reason <text> --key <idempotencyKey> --as-user <adminUserId>";
+            if parsed.positional.len() != 1 {
+                return Err(usage.to_owned());
+            }
+
+            let outcome = nonempty(flags, "outcome").ok_or_else(|| usage.to_owned())?;
+            if !matches!(outcome.as_str(), "cancel" | "fail") {
+                return Err("--outcome must be cancel or fail".to_owned());
+            }
+
+            let turn_seq = nonempty(flags, "seq").ok_or_else(|| usage.to_owned())?;
+            let normalized_turn_seq = turn_seq
+                .parse::<u64>()
+                .ok()
+                .filter(|value| *value > 0 && *value <= i64::MAX as u64)
+                .map(|value| value.to_string())
+                .ok_or_else(|| "--seq must be a positive integer".to_owned())?;
+
+            Ok(Command::SettleTurn {
+                identity: identity(flags)?,
+                session_key: nonempty(flags, "session").ok_or_else(|| usage.to_owned())?,
+                turn_seq: normalized_turn_seq,
+                outcome,
+                reason: nonempty(flags, "reason").ok_or_else(|| usage.to_owned())?,
+                idempotency_key: nonempty(flags, "key").ok_or_else(|| usage.to_owned())?,
+            })
+        }
         "identity" => parse_identity_command(&parsed, flags),
         "kungfu" => {
             if parsed.positional.as_slice() != ["kungfu", "list"] {
@@ -4043,6 +4084,47 @@ mod tests {
     }
 
     #[test]
+    fn settlement_requires_a_positive_sqlite_sequence_and_closed_outcome() {
+        let argv = [
+            "settle-turn",
+            "--session",
+            "k1",
+            "--seq",
+            "0007",
+            "--outcome",
+            "cancel",
+            "--reason",
+            "stale",
+            "--key",
+            "one",
+            "--as-user",
+            "mike",
+        ];
+        assert_eq!(
+            parse(strings(&argv)),
+            Ok(Command::SettleTurn {
+                identity: Identity::User("mike".to_owned()),
+                session_key: "k1".to_owned(),
+                turn_seq: "7".to_owned(),
+                outcome: "cancel".to_owned(),
+                reason: "stale".to_owned(),
+                idempotency_key: "one".to_owned(),
+            })
+        );
+        for seq in ["0", "-1", "9223372036854775808", "abc"] {
+            let mut invalid = argv;
+            invalid[4] = seq;
+            assert!(parse(strings(&invalid)).is_err(), "accepted {seq}");
+        }
+        let mut invalid = argv;
+        invalid[6] = "delivered";
+        assert_eq!(
+            parse(strings(&invalid)),
+            Err("--outcome must be cancel or fail".to_owned())
+        );
+    }
+
+    #[test]
     fn help_enumerates_exactly_cli_surface_v1() {
         let help = render_help(Some(&crate::harnesses::catalog().unwrap()));
         assert!(
@@ -4117,6 +4199,7 @@ mod tests {
                 "retire",
                 "session-reparent",
                 "session-po-set",
+                "settle-turn",
                 "repair-assignment",
                 "assignment-commitref-correct",
                 "revoke-assignment",

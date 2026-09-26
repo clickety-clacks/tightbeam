@@ -107,7 +107,7 @@ defmodule GuardUnknownDefault do
 
         assert {:ok, turn} = Ledger.claim_next(db, "k1", "test")
         assert {:ok, %{terminal_publish: publish}} = runner.(Map.put(turn, :session_key, "k1"))
-        assert :ok = Ledger.finish(db, turn.seq, "delivered")
+        assert :ok = Ledger.finish(db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
         publish.("delivered")
 
         assert_receive {:unknown_new_session, nil}
@@ -132,7 +132,11 @@ defmodule GuardUnknownDefault do
         assert {:ok, %{terminal_publish: fallback_publish}} =
                  runner.(Map.put(fallback_turn, :session_key, "k1"))
 
-        assert :ok = Ledger.finish(db, fallback_turn.seq, "delivered")
+        assert :ok =
+                 Ledger.finish(db, fallback_turn.seq, "delivered", nil,
+                   owner_lease: fallback_turn.owner_lease
+                 )
+
         fallback_publish.("delivered")
 
         assert_receive {:unknown_load_lost, "default-session", nil}

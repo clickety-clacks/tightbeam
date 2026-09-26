@@ -12,7 +12,7 @@ defmodule Tightbeam.PiReconciliationSchemaTest do
     assert :ok = Schema.ensure_all(db)
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["cannot-proceed-v1-019"]]} =
+    assert {:ok, [["stale-turn-settlement-v1-019"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert :ok =
@@ -55,7 +55,7 @@ defmodule Tightbeam.PiReconciliationSchemaTest do
 
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["cannot-proceed-v1-019"]]} =
+    assert {:ok, [["stale-turn-settlement-v1-019"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert {:ok, columns} = DB.query(db, "PRAGMA table_info(sessions)")

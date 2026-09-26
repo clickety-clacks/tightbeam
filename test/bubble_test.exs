@@ -82,7 +82,7 @@ defmodule Tightbeam.Productions.BubbleTest do
       )
 
     {:ok, turn} = Ledger.claim_next(db, session_key, "test-lane")
-    :ok = Ledger.finish(db, turn.seq, terminal, error)
+    :ok = Ledger.finish(db, turn.seq, terminal, error, owner_lease: turn.owner_lease)
     turn.seq
   end
 
@@ -96,8 +96,11 @@ defmodule Tightbeam.Productions.BubbleTest do
         assignment_id: assignment_id
       })
 
-    assert {:ok, _turn} = Ledger.claim_next(db, session_key, "assigned-cause")
-    assert :ok = Ledger.finish(db, seq, "failed", "assigned failure")
+    assert {:ok, %{seq: ^seq} = turn} = Ledger.claim_next(db, session_key, "assigned-cause")
+
+    assert :ok =
+             Ledger.finish(db, seq, "failed", "assigned failure", owner_lease: turn.owner_lease)
+
     seq
   end
 
@@ -132,7 +135,7 @@ defmodule Tightbeam.Productions.BubbleTest do
              )
 
     assert {:ok, turn} = Ledger.claim_next(ctx.db, ctx.holder.session_key, "wake-fixture")
-    assert :ok = Ledger.finish(ctx.db, turn.seq, status, error)
+    assert :ok = Ledger.finish(ctx.db, turn.seq, status, error, owner_lease: turn.owner_lease)
     {wake, turn, sender}
   end
 
@@ -170,10 +173,19 @@ defmodule Tightbeam.Productions.BubbleTest do
       assert {:ok, parent_notice} =
                Ledger.claim_next(ctx.db, ctx.supervisor.session_key, "fixture")
 
-      assert :ok = Ledger.finish(ctx.db, parent_notice.seq, "failed", "notice failed")
+      assert :ok =
+               Ledger.finish(ctx.db, parent_notice.seq, "failed", "notice failed",
+                 owner_lease: parent_notice.owner_lease
+               )
+
       assert :ok = Bubble.recognize_terminal(ctx.db, parent_notice.seq)
       assert {:ok, main_notice} = Ledger.claim_next(ctx.db, ctx.main.session_key, "fixture")
-      assert :ok = Ledger.finish(ctx.db, main_notice.seq, "failed", "notice failed")
+
+      assert :ok =
+               Ledger.finish(ctx.db, main_notice.seq, "failed", "notice failed",
+                 owner_lease: main_notice.owner_lease
+               )
+
       assert :ok = Bubble.recognize_terminal(ctx.db, main_notice.seq)
 
       assert {:ok, [[alert]]} =
@@ -301,7 +313,12 @@ defmodule Tightbeam.Productions.BubbleTest do
 
     # The supervisor cannot run either: its notice fails. Same wall.
     {:ok, notice} = Ledger.claim_next(ctx.db, "supervisor", "test-lane")
-    :ok = Ledger.finish(ctx.db, notice.seq, "failed", "quota exhausted")
+
+    :ok =
+      Ledger.finish(ctx.db, notice.seq, "failed", "quota exhausted",
+        owner_lease: notice.owner_lease
+      )
+
     :ok = Bubble.recognize_terminal(ctx.db, notice.seq)
 
     # The SAME cause climbed — not a notice about the notice.
@@ -314,7 +331,10 @@ defmodule Tightbeam.Productions.BubbleTest do
     # the lineage: the alert is a substrate message in the owner's stream (no
     # turn, no tokens) and the fact stands for the OWNER, not a session.
     {:ok, top} = Ledger.claim_next(ctx.db, ctx.main.session_key, "test-lane")
-    :ok = Ledger.finish(ctx.db, top.seq, "failed", "quota exhausted")
+
+    :ok =
+      Ledger.finish(ctx.db, top.seq, "failed", "quota exhausted", owner_lease: top.owner_lease)
+
     :ok = Bubble.recognize_terminal(ctx.db, top.seq)
 
     assert ConditionFacts.standing?(ctx.db, "user-alerted", "flynn")
@@ -386,7 +406,7 @@ defmodule Tightbeam.Productions.BubbleTest do
       )
 
     {:ok, turn} = Ledger.claim_next(ctx.db, "holder", "test-lane")
-    :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
+    :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
     :ok = Bubble.recognize_terminal(ctx.db, turn.seq)
 
     refute ConditionFacts.standing?(ctx.db, "user-alerted", "flynn")
@@ -400,7 +420,10 @@ defmodule Tightbeam.Productions.BubbleTest do
 
     for rung <- ["supervisor", ctx.main.session_key] do
       {:ok, notice} = Ledger.claim_next(ctx.db, rung, "test-lane")
-      :ok = Ledger.finish(ctx.db, notice.seq, "failed", "new wall")
+
+      :ok =
+        Ledger.finish(ctx.db, notice.seq, "failed", "new wall", owner_lease: notice.owner_lease)
+
       :ok = Bubble.recognize_terminal(ctx.db, notice.seq)
     end
 
@@ -643,7 +666,11 @@ defmodule Tightbeam.Productions.BubbleTest do
     assert {:ok, decision_turn} =
              Ledger.claim_next(ctx.db, ctx.supervisor.session_key, "decision-wake")
 
-    assert :ok = Ledger.finish(ctx.db, decision_turn.seq, "failed", "decision wake failed")
+    assert :ok =
+             Ledger.finish(ctx.db, decision_turn.seq, "failed", "decision wake failed",
+               owner_lease: decision_turn.owner_lease
+             )
+
     assert :ok = Bubble.recognize_terminal(ctx.db, decision_turn.seq)
     assert {:ok, notice} = Ledger.claim_next(ctx.db, ctx.main.session_key, "assigned-cause")
 
@@ -702,11 +729,20 @@ defmodule Tightbeam.Productions.BubbleTest do
     assert {:ok, supervisor_notice} =
              Ledger.claim_next(ctx.db, ctx.supervisor.session_key, "assigned-cause")
 
-    assert :ok = Ledger.finish(ctx.db, supervisor_notice.seq, "failed", "assigned failure")
+    assert :ok =
+             Ledger.finish(ctx.db, supervisor_notice.seq, "failed", "assigned failure",
+               owner_lease: supervisor_notice.owner_lease
+             )
+
     assert :ok = Bubble.recognize_terminal(ctx.db, supervisor_notice.seq)
 
     assert {:ok, main_notice} = Ledger.claim_next(ctx.db, ctx.main.session_key, "assigned-cause")
-    assert :ok = Ledger.finish(ctx.db, main_notice.seq, "failed", "assigned failure")
+
+    assert :ok =
+             Ledger.finish(ctx.db, main_notice.seq, "failed", "assigned failure",
+               owner_lease: main_notice.owner_lease
+             )
+
     assert :ok = Bubble.recognize_terminal(ctx.db, main_notice.seq)
 
     assert {:ok, [["user:flynn"]]} =

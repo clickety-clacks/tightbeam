@@ -1576,10 +1576,11 @@ defmodule Tightbeam.ConformanceSupport do
               assert {{:deny, %{code: "escalation_denied", rule: ^statute}}, [], []} =
                        Rules.decide(db, turn_call)
 
-              assert {:ok, %{seq: wake_seq}} =
+              assert {:ok, %{seq: wake_seq, owner_lease: wake_seq_lease}} =
                        Ledger.claim_next(db, session_key, "conformance-ruling-wake")
 
-              assert :ok = Ledger.finish(db, wake_seq, "delivered")
+              assert :ok =
+                       Ledger.finish(db, wake_seq, "delivered", nil, owner_lease: wake_seq_lease)
 
               assert {:prodded, 1} =
                        Supervision.evaluate(
@@ -1608,10 +1609,11 @@ defmodule Tightbeam.ConformanceSupport do
               assert {{:deny, %{rule: "later-sweep-statute"}}, [], [^request_id]} =
                        Rules.decide(db, turn_call)
 
-              assert {:ok, %{seq: wake_seq}} =
+              assert {:ok, %{seq: wake_seq, owner_lease: wake_seq_lease}} =
                        Ledger.claim_next(db, session_key, "conformance-ruling-wake")
 
-              assert :ok = Ledger.finish(db, wake_seq, "delivered")
+              assert :ok =
+                       Ledger.finish(db, wake_seq, "delivered", nil, owner_lease: wake_seq_lease)
 
               assert {:prodded, 1} =
                        Supervision.evaluate(
@@ -1963,10 +1965,13 @@ defmodule Tightbeam.ConformanceSupport do
       park_wake = Wakes.get(db, park_wake_id)
       assert %{state: "fired", fired_by: "condition"} = park_wake
 
-      assert {:ok, %{seq: continuation_seq}} =
+      assert {:ok, %{seq: continuation_seq, owner_lease: continuation_seq_lease}} =
                Ledger.claim_next(db, session_key, "conformance-ruling-wake")
 
-      assert :ok = Ledger.finish(db, continuation_seq, "delivered")
+      assert :ok =
+               Ledger.finish(db, continuation_seq, "delivered", nil,
+                 owner_lease: continuation_seq_lease
+               )
 
       assert {:prodded, 1} =
                Supervision.evaluate(db, handlers, 3, session_key, continuation_seq)
@@ -2910,8 +2915,11 @@ defmodule Tightbeam.ConformanceSupport do
                    })
 
           assert seq == turn["seq"]
-          assert {:ok, %{seq: ^seq}} = Ledger.claim_next(db, turn["session"], "conformance")
-          assert :ok = Ledger.finish(db, seq, "delivered")
+
+          assert {:ok, %{seq: ^seq, owner_lease: seq_lease}} =
+                   Ledger.claim_next(db, turn["session"], "conformance")
+
+          assert :ok = Ledger.finish(db, seq, "delivered", nil, owner_lease: seq_lease)
           Map.put(turns, turn["session"], seq)
         end
       end)

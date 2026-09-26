@@ -392,7 +392,8 @@ defmodule Tightbeam.Acp.Adapter do
         cmd: Keyword.fetch!(opts, :cmd),
         env: Keyword.get(opts, :env, []),
         stderr_path: stderr_path,
-        subscriber: self()
+        subscriber: self(),
+        connection_generation: Keyword.get(opts, :connection_generation)
       )
 
     case Keyword.fetch(opts, :harness_process_launch_id) do
@@ -1029,10 +1030,24 @@ defmodule Tightbeam.Acp.Adapter do
       end)
 
     receive do
-      {:acp_request_dispatched, ^dispatched, _request_id} ->
+      {:acp_request_dispatched, ^dispatched, request_id} ->
         Process.demonitor(conn_monitor, [:flush])
-        send(prompt_worker, {:prompt_dispatch_classified, dispatched})
-        {:noreply, state}
+
+        case trace_dispatch(opts, request_id) do
+          :ok ->
+            send(prompt_worker, {:prompt_dispatch_classified, dispatched})
+            {:noreply, state}
+
+          {:error, reason} ->
+            Process.exit(prompt_worker, :kill)
+
+            settle_prompt(
+              state,
+              sid,
+              from,
+              {:error, {:lifecycle_trace_failed_after_prompt, :dispatch, reason}}
+            )
+        end
 
       {:acp_request_not_dispatched, ^dispatched, reason} ->
         Process.demonitor(conn_monitor, [:flush])
@@ -1055,6 +1070,24 @@ defmodule Tightbeam.Acp.Adapter do
           {:error, {:acp_request_not_dispatched, :prompt_dispatch_failed}}
         )
     end
+  end
+
+  defp trace_dispatch(opts, request_id) do
+    case Keyword.get(opts, :trace_dispatch) do
+      fun when is_function(fun, 1) ->
+        case fun.(request_id) do
+          result when result in [:ok, :duplicate, :legacy] -> :ok
+          {:error, reason} -> {:error, reason}
+          other -> {:error, {:invalid_trace_callback_result, other}}
+        end
+
+      _ ->
+        :ok
+    end
+  rescue
+    error -> {:error, error}
+  catch
+    kind, reason -> {:error, {kind, reason}}
   end
 
   @impl true

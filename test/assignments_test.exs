@@ -958,7 +958,11 @@ defmodule Tightbeam.AssignmentsTest do
       assert root.session_key == "notice-parent"
       assert {:appended, "notice-parent", _, _} = deliver_terminal_notice(ctx.db, root)
       assert {:ok, source} = Ledger.claim_next(ctx.db, "notice-parent", "fixture")
-      assert :ok = Ledger.finish(ctx.db, source.seq, "failed", "fixture delivery failure")
+
+      assert :ok =
+               Ledger.finish(ctx.db, source.seq, "failed", "fixture delivery failure",
+                 owner_lease: source.owner_lease
+               )
 
       assert {:ok, {:ok, %{wake: recovery, replay: false}}} =
                recover_notice(ctx.db, root.wake_id, "session:notice-parent")
@@ -982,7 +986,11 @@ defmodule Tightbeam.AssignmentsTest do
       assert root.session_key == "delivery-successor"
       assert {:appended, "delivery-successor", _, _} = deliver_terminal_notice(ctx.db, root)
       assert {:ok, source} = Ledger.claim_next(ctx.db, "delivery-successor", "fixture")
-      assert :ok = Ledger.finish(ctx.db, source.seq, "failed", "fixture delivery failure")
+
+      assert :ok =
+               Ledger.finish(ctx.db, source.seq, "failed", "fixture delivery failure",
+                 owner_lease: source.owner_lease
+               )
 
       assert {:ok, {:ok, %{wake: recovery, replay: false}}} =
                recover_notice(ctx.db, root.wake_id, "session:delivery-successor")
@@ -1000,7 +1008,9 @@ defmodule Tightbeam.AssignmentsTest do
         assert {:ok, source} = Ledger.claim_next(ctx.db, "notice-parent", "fixture")
 
         assert :ok =
-                 Ledger.finish(ctx.db, source.seq, @recovery_status, "fixture delivery failure")
+                 Ledger.finish(ctx.db, source.seq, @recovery_status, "fixture delivery failure",
+                   owner_lease: source.owner_lease
+                 )
 
         {:ok, _} =
           DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey='notice-parent'")
@@ -1052,9 +1062,16 @@ defmodule Tightbeam.AssignmentsTest do
 
         assert is_binary(slate.wake_id)
         refute slate.wake_id == recovery.wake_id
-        assert :ok = Ledger.finish(ctx.db, slate.seq, "delivered")
-        assert {:ok, %{seq: ^seq}} = Ledger.claim_next(ctx.db, personal, "recovery-fixture")
-        assert :ok = Ledger.finish(ctx.db, seq, "delivered")
+
+        assert :ok =
+                 Ledger.finish(ctx.db, slate.seq, "delivered", nil,
+                   owner_lease: slate.owner_lease
+                 )
+
+        assert {:ok, %{seq: ^seq, owner_lease: seq_lease}} =
+                 Ledger.claim_next(ctx.db, personal, "recovery-fixture")
+
+        assert :ok = Ledger.finish(ctx.db, seq, "delivered", nil, owner_lease: seq_lease)
         assert notice_outcomes(ctx.db, assignment.id, root.wake_id).delivered != []
         before_refusal = recovery_snapshot(ctx.db)
 
@@ -1078,7 +1095,13 @@ defmodule Tightbeam.AssignmentsTest do
 
         if state in [:running, :delivered] do
           assert {:ok, turn} = Ledger.claim_next(ctx.db, "notice-parent", "fixture")
-          if state == :delivered, do: assert(:ok == Ledger.finish(ctx.db, turn.seq, "delivered"))
+
+          if state == :delivered,
+            do:
+              assert(
+                :ok ==
+                  Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+              )
         end
 
         if state == :inconsistent do
@@ -1105,7 +1128,12 @@ defmodule Tightbeam.AssignmentsTest do
       {_assignment, root, personal} = terminal_delivery_fixture(ctx, "completion")
       assert {:appended, _, _, _} = deliver_terminal_notice(ctx.db, root)
       assert {:ok, source} = Ledger.claim_next(ctx.db, "notice-parent", "fixture")
-      assert :ok = Ledger.finish(ctx.db, source.seq, "failed_unknown")
+
+      assert :ok =
+               Ledger.finish(ctx.db, source.seq, "failed_unknown", nil,
+                 owner_lease: source.owner_lease
+               )
+
       before = recovery_snapshot(ctx.db)
 
       assert {:ok, {:error, %{code: "terminal_recovery_not_authorized"}}} =
@@ -1131,7 +1159,11 @@ defmodule Tightbeam.AssignmentsTest do
       {assignment, root, _personal} = terminal_delivery_fixture(ctx, "completion")
       assert {:appended, _, _, _} = deliver_terminal_notice(ctx.db, root)
       assert {:ok, source} = Ledger.claim_next(ctx.db, "notice-parent", "fixture")
-      assert :ok = Ledger.finish(ctx.db, source.seq, "failed_unknown")
+
+      assert :ok =
+               Ledger.finish(ctx.db, source.seq, "failed_unknown", nil,
+                 owner_lease: source.owner_lease
+               )
 
       assert {:ok, {:appended, repair_seq, _}} =
                Ledger.repair_terminal(
@@ -1154,8 +1186,13 @@ defmodule Tightbeam.AssignmentsTest do
                recover_notice(ctx.db, root.wake_id)
 
       assert recovery_snapshot(ctx.db) == before
-      assert {:ok, %{seq: ^repair_seq}} = Ledger.claim_next(ctx.db, "notice-parent", "fixture")
-      assert :ok = Ledger.finish(ctx.db, repair_seq, "delivered")
+
+      assert {:ok, %{seq: ^repair_seq, owner_lease: repair_seq_lease}} =
+               Ledger.claim_next(ctx.db, "notice-parent", "fixture")
+
+      assert :ok =
+               Ledger.finish(ctx.db, repair_seq, "delivered", nil, owner_lease: repair_seq_lease)
+
       delivered = recovery_snapshot(ctx.db)
 
       assert {:ok, {:error, %{code: "terminal_recovery_delivered"}}} =
@@ -1168,7 +1205,9 @@ defmodule Tightbeam.AssignmentsTest do
       {_assignment, root, _personal} = terminal_delivery_fixture(ctx, "completion")
       assert {:appended, _, _, _} = deliver_terminal_notice(ctx.db, root)
       assert {:ok, source} = Ledger.claim_next(ctx.db, "notice-parent", "fixture")
-      assert :ok = Ledger.finish(ctx.db, source.seq, "failed")
+
+      assert :ok =
+               Ledger.finish(ctx.db, source.seq, "failed", nil, owner_lease: source.owner_lease)
 
       :ok =
         DB.execute(ctx.db, """
@@ -1271,8 +1310,10 @@ defmodule Tightbeam.AssignmentsTest do
                    successor.wake_id
                  ])
 
-        assert {:ok, %{seq: ^seq}} = Ledger.claim_next(ctx.db, personal, "route-b-fixture")
-        assert :ok = Ledger.finish(ctx.db, seq, "delivered")
+        assert {:ok, %{seq: ^seq, owner_lease: seq_lease}} =
+                 Ledger.claim_next(ctx.db, personal, "route-b-fixture")
+
+        assert :ok = Ledger.finish(ctx.db, seq, "delivered", nil, owner_lease: seq_lease)
         assert Wakes.get(ctx.db, root.wake_id) == root
         evidence = notice_outcomes(ctx.db, assignment.id, root.wake_id)
         assert length(evidence.delivered) == 1
@@ -3565,8 +3606,10 @@ defmodule Tightbeam.AssignmentsTest do
         assignment_id: assignment.id
       })
 
-    assert {:ok, %{seq: ^turn_seq}} = Ledger.claim_next(ctx.db, "holder", "test")
-    assert :ok = Ledger.finish(ctx.db, turn_seq, "delivered")
+    assert {:ok, %{seq: ^turn_seq, owner_lease: turn_seq_lease}} =
+             Ledger.claim_next(ctx.db, "holder", "test")
+
+    assert :ok = Ledger.finish(ctx.db, turn_seq, "delivered", nil, owner_lease: turn_seq_lease)
 
     liveness = start_liveness!(ctx)
 

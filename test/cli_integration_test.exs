@@ -516,7 +516,7 @@ defmodule Tightbeam.CliIntegrationTest do
     assert {:ok, [[0]]} =
              DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [dependency_id])
 
-    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
+    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
     Wakes.fire_due(Tightbeam.WakeScheduler)
 
     assert {:ok, [[after_delivered]]} =

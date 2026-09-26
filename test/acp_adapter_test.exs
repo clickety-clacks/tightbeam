@@ -1301,6 +1301,33 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert Enum.any?(captured_requests(capture_path), &(&1["method"] == "session/cancel"))
   end
 
+  test "dispatch callback receives the exact live Conn prompt request ID" do
+    {adapter, _capture_path} = start_adapter(gate_mode: "stall-turn", probe: false)
+    assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+    conn = Adapter.conn(adapter)
+    owner = self()
+
+    caller =
+      Task.async(fn ->
+        Adapter.prompt(adapter, sid, "stall",
+          trace_dispatch: fn request_id ->
+            send(owner, {:actual_dispatch, request_id})
+            :ok
+          end
+        )
+      end)
+
+    assert_receive {:actual_dispatch, request_id}
+    assert is_integer(request_id) and request_id > 0
+
+    assert %{method: "session/prompt", prompt_session_id: ^sid} =
+             :sys.get_state(conn).pending[request_id]
+
+    refute_receive {:actual_dispatch, _}
+    Tightbeam.Acp.Conn.notify(conn, "session/cancel", %{sessionId: sid})
+    assert {:error, _} = Task.await(caller)
+  end
+
   test "prompt worker death preserves existing monitor ownership and quiesces on explicit cancel" do
     {adapter, capture_path} = start_adapter(gate_mode: "stall-turn", probe: false)
     assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
@@ -2380,7 +2407,7 @@ defmodule Tightbeam.Acp.AdapterTest do
         assignment_id: "assignment-running"
       })
 
-    assert {:ok, %{seq: ^turn_seq}} =
+    assert {:ok, %{seq: ^turn_seq} = claimed} =
              Tightbeam.Ledger.claim_next(db, session.session_key, "test-owner")
 
     {:ok, adapter_slot} = Agent.start_link(fn -> nil end)
@@ -2426,7 +2453,10 @@ defmodule Tightbeam.Acp.AdapterTest do
     )
 
     assert_receive :subagent_event_captured
-    :ok = Tightbeam.Ledger.finish(db, turn_seq, "delivered")
+
+    :ok =
+      Tightbeam.Ledger.finish(db, turn_seq, "delivered", nil, owner_lease: claimed.owner_lease)
+
     assert_receive {:matching_fired, fact_id, false}, 2_000
     assert is_integer(fact_id)
     assert [%{assignment_id: "assignment-running"}] = Tightbeam.SubagentMarkers.list(db)

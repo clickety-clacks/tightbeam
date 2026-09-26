@@ -91,6 +91,7 @@ defmodule Tightbeam.Gateway do
     SessionPoAssociations,
     DeliveryResponsibilities,
     Spinup,
+    StaleTurnSettlement,
     StateResources,
     SubagentMarkers,
     Supervision,
@@ -1358,6 +1359,9 @@ defmodule Tightbeam.Gateway do
       {"assignments", []} => fn call -> Assignments.__handle__(db, "assignments", call) end,
       {"inspect", []} => fn call -> inspect_result(config, db, call) end,
       {"cancel", ["turn.ended", "session.updated"]} => fn call -> cancel_result(db, call) end,
+      {"settle-turn", ["turn.ended", "session.updated"]} => fn call ->
+        settle_turn_result(db, call)
+      end,
       {"clear-stranded", ["turn.ended", "session.updated"]} => fn call ->
         clear_stranded_result(config, db, call)
       end,
@@ -3013,6 +3017,22 @@ defmodule Tightbeam.Gateway do
                    adapter,
                    harness_session_id,
                    turn.prompt,
+                   trace_dispatch: fn request_id ->
+                     Tightbeam.TurnLifecycle.append(db, turn.seq, %{
+                       event_key: "prompt:dispatched",
+                       producer_event_id:
+                         "acp:#{turn.owner_lease}:request:#{request_id}:prompt-dispatched",
+                       kind: "prompt_dispatched",
+                       stage: "prompt",
+                       outcome: "dispatched",
+                       cause: "acp:port-write",
+                       principal: "process:tightbeam",
+                       owner_lease: turn.owner_lease,
+                       adapter_gen: generation,
+                       acp_request_id: request_id,
+                       detail: %{v: 1}
+                     })
+                   end,
                    progress:
                      progress_fun(db, turn.session_key, session.owner_user_id, correlation)
                  )
@@ -3115,6 +3135,11 @@ defmodule Tightbeam.Gateway do
             {:error,
              %{
                reason: reason,
+               terminal:
+                 if(match?({:lifecycle_trace_failed_after_prompt, _, _}, raw_reason),
+                   do: "failed_unknown",
+                   else: "failed"
+                 ),
                terminal_publish: failure_publish,
                record_in_txn: record_in_txn
              }}
@@ -3428,6 +3453,54 @@ defmodule Tightbeam.Gateway do
         %{ok: false, code: "not_running", message: "no turn in flight"}
     end
   end
+
+  defp settle_turn_result(db, call) do
+    with {:user, user_id} <- Map.get(call, :principal),
+         %{is_admin: true} <- Devices.user(db, user_id),
+         {:ok, request} <- StaleTurnSettlement.request(call.params, {:user, user_id}) do
+      case StaleTurnSettlement.replay_precheck(db, request) do
+        {:ok, result} ->
+          public_settlement_result(result)
+
+        {:error, refusal} ->
+          refusal
+
+        :continue ->
+          case Org.get(db, request.session_key) do
+            nil ->
+              %{code: "session_not_found", message: "session not found"}
+
+            %{state: state} when state != "active" ->
+              %{code: "session_retired", message: "session is not active"}
+
+            _active ->
+              case LaneManager.ensure_settlement_lane(
+                     Tightbeam.LaneManager,
+                     request.session_key
+                   ) do
+                {:ok, lane_pid, reservation_token} ->
+                  case Tightbeam.SessionLane.settle_stale(
+                         lane_pid,
+                         reservation_token,
+                         request
+                       ) do
+                    {:ok, result} -> public_settlement_result(result)
+                    {:error, refusal} -> refusal
+                  end
+
+                {:error, _reason} ->
+                  %{code: "turn_status_ambiguous", message: "turn liveness is ambiguous"}
+              end
+          end
+      end
+    else
+      {:error, refusal} -> refusal
+      _ -> %{code: "not_authorized", message: "admin user required"}
+    end
+  end
+
+  defp public_settlement_result(result),
+    do: Map.drop(result, [:message_id, :stored_error])
 
   defp harness_cancel(db, session) do
     with %{harness_session_id: sid} <- Org.current_pointer(db, session.session_key),

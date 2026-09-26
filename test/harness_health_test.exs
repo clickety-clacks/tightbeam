@@ -350,10 +350,14 @@ defmodule Tightbeam.HarnessHealthTest do
     assert {:ok, [[^expected_request_ref, ^expected_wake_id]]} =
              DB.query(ctx.db, "SELECT requestRef,wakeId FROM turns WHERE seq=?1", [first_turn_seq])
 
-    assert {:ok, %{seq: ^first_turn_seq}} =
+    assert {:ok, %{seq: ^first_turn_seq, owner_lease: first_turn_seq_lease}} =
              Ledger.claim_next(ctx.db, first_recipient, "route-settlement")
 
-    assert :ok = Ledger.finish(ctx.db, first_turn_seq, "failed")
+    assert :ok =
+             Ledger.finish(ctx.db, first_turn_seq, "failed", nil,
+               owner_lease: first_turn_seq_lease
+             )
+
     assert :ok = HarnessHealth.resume_other_routes(ctx.db)
 
     assert {:ok, [["non_delivered", "failed"]]} =
@@ -433,10 +437,10 @@ defmodule Tightbeam.HarnessHealthTest do
     assert is_binary(first_wake)
     assert is_integer(first_turn)
 
-    assert {:ok, %{seq: ^first_turn}} =
+    assert {:ok, %{seq: ^first_turn, owner_lease: first_turn_lease}} =
              Ledger.claim_next(ctx.db, route_recipient, "restart-recovery")
 
-    assert :ok = Ledger.finish(ctx.db, first_turn, "failed")
+    assert :ok = Ledger.finish(ctx.db, first_turn, "failed", nil, owner_lease: first_turn_lease)
     assert first_wake == "other-review:#{opened.id}:#{route_recipient}"
 
     assert {:ok, [[^request_ref, ^first_wake]]} =
@@ -597,8 +601,10 @@ defmodule Tightbeam.HarnessHealthTest do
                [opened.id, ordinal]
              )
 
-    assert {:ok, %{seq: ^turn_seq}} = Ledger.claim_next(ctx.db, recipient, "route-guards")
-    assert :ok = Ledger.finish(ctx.db, turn_seq, "delivered")
+    assert {:ok, %{seq: ^turn_seq, owner_lease: turn_seq_lease}} =
+             Ledger.claim_next(ctx.db, recipient, "route-guards")
+
+    assert :ok = Ledger.finish(ctx.db, turn_seq, "delivered", nil, owner_lease: turn_seq_lease)
     assert :ok = HarnessHealth.resume_other_routes(ctx.db)
 
     assert {:error, _} =
@@ -1273,7 +1279,9 @@ defmodule Tightbeam.HarnessHealthTest do
 
       assert {:ok, true} =
                DB.transaction(ctx.db, fn txn ->
-                 Ledger.finish_in_txn(txn, queued, "delivered", nil)
+                 Ledger.finish_in_txn(txn, queued, "delivered", nil,
+                   owner_lease: next.owner_lease
+                 )
                end)
 
       assert Ledger.claim_next(ctx.db, key, "recovered-lane") == :none
@@ -1318,7 +1326,10 @@ defmodule Tightbeam.HarnessHealthTest do
 
       assert {:ok, callback} =
                DB.transaction(ctx.db, fn txn ->
-                 assert Ledger.finish_in_txn(txn, seq, "failed", "provider failure")
+                 assert Ledger.finish_in_txn(txn, seq, "failed", "provider failure",
+                          owner_lease: turn.owner_lease
+                        )
+
                  HarnessHealth.observe_turn_failure_in_txn(txn, session, turn, :prompt, reason)
                end)
 
@@ -1341,7 +1352,7 @@ defmodule Tightbeam.HarnessHealthTest do
 
       assert {:ok, true} =
                DB.transaction(ctx.db, fn txn ->
-                 Ledger.finish_in_txn(txn, later, "delivered", nil)
+                 Ledger.finish_in_txn(txn, later, "delivered", nil, owner_lease: next.owner_lease)
                end)
     end
   end
@@ -1365,7 +1376,9 @@ defmodule Tightbeam.HarnessHealthTest do
 
       assert {:ok, post_commit} =
                DB.transaction(ctx.db, fn txn ->
-                 assert Ledger.finish_in_txn(txn, turn.seq, "failed", "auth expired")
+                 assert Ledger.finish_in_txn(txn, turn.seq, "failed", "auth expired",
+                          owner_lease: turn.owner_lease
+                        )
 
                  HarnessHealth.observe_turn_failure_in_txn(
                    txn,
@@ -1401,7 +1414,10 @@ defmodule Tightbeam.HarnessHealthTest do
 
     assert {:ok, :ok} =
              DB.transaction(ctx.db, fn txn ->
-               assert Ledger.finish_in_txn(txn, turn.seq, "delivered", nil)
+               assert Ledger.finish_in_txn(txn, turn.seq, "delivered", nil,
+                        owner_lease: turn.owner_lease
+                      )
+
                HarnessHealth.resolve_normal_turn_in_txn(txn, session, turn)
              end)
 
@@ -1436,7 +1452,9 @@ defmodule Tightbeam.HarnessHealthTest do
 
       assert {:ok, nil} =
                DB.transaction(ctx.db, fn txn ->
-                 assert Ledger.finish_in_txn(txn, turn.seq, "failed", "auth expired")
+                 assert Ledger.finish_in_txn(txn, turn.seq, "failed", "auth expired",
+                          owner_lease: turn.owner_lease
+                        )
 
                  HarnessHealth.observe_turn_failure_in_txn(
                    txn,
@@ -1486,7 +1504,9 @@ defmodule Tightbeam.HarnessHealthTest do
 
     assert {:ok, post_commit} =
              DB.transaction(ctx.db, fn txn ->
-               assert Ledger.finish_in_txn(txn, turn.seq, "failed", "auth expired")
+               assert Ledger.finish_in_txn(txn, turn.seq, "failed", "auth expired",
+                        owner_lease: turn.owner_lease
+                      )
 
                HarnessHealth.observe_turn_failure_in_txn(
                  txn,

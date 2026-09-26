@@ -102,6 +102,35 @@ defmodule Tightbeam.Idempotency do
   end
 
   @doc false
+  def upgrade_settlement_v1_in_txn(%Txn{} = txn) do
+    :ok =
+      Txn.exec(txn, """
+      CREATE TABLE wire_idempotency_settlement (
+        ownerUserId TEXT NOT NULL,
+        operation TEXT NOT NULL CHECK (operation IN ('spawn','retire','wake','assign','condition','work-item-create','session-reparent','session-po-set','settle-turn')),
+        idempotencyKey TEXT NOT NULL,
+        sessionKey TEXT NOT NULL,
+        requestFingerprint TEXT,
+        canonicalResponse TEXT,
+        responseJson TEXT,
+        PRIMARY KEY(ownerUserId,operation,idempotencyKey),
+        CHECK (operation NOT IN ('session-reparent','session-po-set') OR
+          (requestFingerprint IS NOT NULL AND canonicalResponse IS NOT NULL)),
+        CHECK (operation != 'settle-turn' OR
+          (requestFingerprint IS NOT NULL AND responseJson IS NOT NULL))
+      );
+      INSERT INTO wire_idempotency_settlement
+        (ownerUserId,operation,idempotencyKey,sessionKey,requestFingerprint,canonicalResponse)
+        SELECT ownerUserId,operation,idempotencyKey,sessionKey,requestFingerprint,canonicalResponse
+        FROM wire_idempotency;
+      DROP TABLE wire_idempotency;
+      ALTER TABLE wire_idempotency_settlement RENAME TO wire_idempotency;
+      """)
+
+    :ok
+  end
+
+  @doc false
   def reparent_result_in_txn(txn, owner, key) do
     case Txn.q(
            txn,
@@ -155,6 +184,70 @@ defmodule Tightbeam.Idempotency do
 
     :ok
   end
+
+  @doc "Stored settle-turn replay metadata for one operator/key pair, or nil."
+  @spec settlement(db(), String.t(), String.t()) :: map() | nil
+  def settlement(db \\ Tightbeam.DB, principal, idempotency_key) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT sessionKey, requestFingerprint, responseJson
+        FROM wire_idempotency
+        WHERE ownerUserId=?1 AND operation='settle-turn' AND idempotencyKey=?2
+        """,
+        [principal, idempotency_key]
+      )
+
+    settlement_row(rows)
+  end
+
+  @doc false
+  @spec settlement_in_txn(Txn.t(), String.t(), String.t()) :: map() | nil
+  def settlement_in_txn(%Txn{} = txn, principal, idempotency_key) do
+    txn
+    |> Txn.q(
+      """
+      SELECT sessionKey, requestFingerprint, responseJson
+      FROM wire_idempotency
+      WHERE ownerUserId=?1 AND operation='settle-turn' AND idempotencyKey=?2
+      """,
+      [principal, idempotency_key]
+    )
+    |> settlement_row()
+  end
+
+  @doc false
+  @spec put_settlement_in_txn(Txn.t(), map()) :: :ok
+  def put_settlement_in_txn(%Txn{} = txn, row) do
+    Txn.q(
+      txn,
+      """
+      INSERT INTO wire_idempotency
+        (ownerUserId, operation, idempotencyKey, sessionKey, requestFingerprint, responseJson)
+      VALUES (?1, 'settle-turn', ?2, ?3, ?4, ?5)
+      """,
+      [
+        Map.fetch!(row, :principal),
+        Map.fetch!(row, :idempotency_key),
+        Map.fetch!(row, :session_key),
+        Map.fetch!(row, :request_fingerprint),
+        Map.fetch!(row, :response_json)
+      ]
+    )
+
+    :ok
+  end
+
+  defp settlement_row([[session_key, fingerprint, response_json]])
+       when is_binary(fingerprint) and is_binary(response_json),
+       do: %{
+         session_key: session_key,
+         request_fingerprint: fingerprint,
+         response_json: response_json
+       }
+
+  defp settlement_row([]), do: nil
 
   defp transaction!(db, fun) do
     case DB.transaction(db, fun) do
