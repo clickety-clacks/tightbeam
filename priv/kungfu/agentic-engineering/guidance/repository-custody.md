@@ -22,7 +22,8 @@ repository's requirements. Preserve explicit target pins until their owner chang
 them; report an unexpected pin change before the affected integration. An unpinned
 moving target is ordinary integration within the shared agreement. The delivery
 owner judges where changed interactions need renewed review. A new commit hash
-alone does not invalidate applicable evidence. Advance only authorized destinations
-with applicable review and user acceptance. Report revision and actual delivery state.
+alone does not invalidate applicable evidence. Land on a shared branch through its
+pull request path with applicable review and user acceptance; your own branches are
+yours to push. Report revision and actual delivery state.
 
 Codex exposes /review-branch and /review-commit for engineering review.

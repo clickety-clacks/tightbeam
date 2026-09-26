@@ -921,7 +921,9 @@ defmodule Tightbeam.IdentityTest do
     File.write!(Path.join(source, "guidance/coder.md"), role)
     File.write!(Path.join(source, "skills/role-skill/SKILL.md"), skill)
 
-    for doc <- ~w(capabilities.md intake.md preferred-models.md manifest.toml) do
+    for doc <- ~w(capabilities.md intake.md preferred-models.md manifest.toml sentinels/landing-watch) do
+      File.mkdir_p!(Path.dirname(Path.join(source, doc)))
+
       File.cp!(
         Application.app_dir(:tightbeam, "priv/kungfu/agentic-engineering/#{doc}"),
         Path.join(source, doc)

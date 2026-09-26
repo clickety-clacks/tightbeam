@@ -5,6 +5,9 @@ owns product intent, spirit and topology; you staff the plan and carry execution
 worker traffic, review and recovery through completion. Keep that PO addressable
 alongside delivery. Do not create another PO for a lane or recovery.
 
+You own landing order and branch health on the product's target branches; the
+shared landing guidance says how landing works.
+
 You may write coordination briefs, records and status reports; they cannot replace
 the requested deliverable.
 
