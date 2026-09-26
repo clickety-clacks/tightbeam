@@ -1,7 +1,9 @@
 //! Pinned-client boundary evidence for the narrow transport instrumentation.
 //! Uses real loopback TCP for GET/POST; the pre-connect case holds only the
 //! test resolver until the client's own deadline has expired. These are not
-//! integrated CLI/R9 acceptance tests; the final receipt hookup remains separate.
+//! Integrated CLI cases below are authored for the proposed final receipt
+//! hookup and must run only on its authorized composed subject. They do not
+//! replace the real gateway listener lifecycle/restart R9 evidence.
 
 use std::error::Error as _;
 use std::io::{self, Read, Write};
@@ -378,6 +380,184 @@ fn finish_cli(mut child: std::process::Child) -> std::process::Output {
         }
         thread::sleep(Duration::from_millis(2));
     }
+}
+
+fn generated_id(request: &str) -> String {
+    let ids: Vec<_> = request
+        .lines()
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("x-tightbeam-request-id")
+                .then(|| value.trim())
+        })
+        .collect();
+    assert_eq!(ids.len(), 1, "one generated ID header per actual attempt");
+    let id = ids[0];
+    let suffix = id
+        .strip_prefix("req_")
+        .expect("generated request-ID namespace");
+    assert_eq!(suffix.len(), 22);
+    assert!(
+        suffix
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+    );
+    id.to_owned()
+}
+
+fn machine_failure(output: &std::process::Output) -> serde_json::Value {
+    assert!(
+        !output.status.success(),
+        "expected original CLI failure: {output:?}"
+    );
+    let stderr = std::str::from_utf8(&output.stderr).unwrap();
+    let mut lines = stderr.lines();
+    let human = lines.next().expect("human reading first");
+    assert!(!human.starts_with('{'), "human reading missing: {stderr}");
+    let machine = lines.next().expect("machine reading second");
+    assert!(
+        lines.next().is_none(),
+        "unexpected extra failure lines: {stderr}"
+    );
+    serde_json::from_str(machine).unwrap()
+}
+
+#[test]
+fn actual_cli_correlates_observed_headers_without_overwriting_foreign_error_fields() {
+    for echo_matches in [true, false] {
+        let root = CliRoot::new();
+        let gateway = TcpListener::bind("127.0.0.1:0").unwrap();
+        gateway.set_nonblocking(true).unwrap();
+        let child = root.spawn("list", gateway.local_addr().unwrap());
+        let mut stream = accept_bounded(&gateway);
+        let request = read_request(&mut stream);
+        assert!(request.starts_with("POST /agent/dispatch HTTP/1.1\r\n"));
+        let id = generated_id(&request);
+        let echo = if echo_matches {
+            id.as_str()
+        } else {
+            "req_foreign"
+        };
+        // This is actual CLI/header correlation proof against a loopback
+        // responder, not proof that ListenerLifecycle minted a generation.
+        let generation = "lgen_abcdefghijklmnopqrstuv";
+        let body = r#"{"error":{"code":"fixture_refusal","message":"fixture","requestId":"req_upstream_foreign","diagnostic":{"origin":"upstream"}}}"#;
+        write!(stream, "HTTP/1.1 503 Service Unavailable\r\nx-tightbeam-request-id: {echo}\r\nx-tightbeam-listener-generation: {generation}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        drop(stream);
+        let output = finish_cli(child);
+        let machine = machine_failure(&output);
+        assert_eq!(machine["error"]["requestId"], "req_upstream_foreign");
+        assert_eq!(machine["error"]["diagnostic"]["origin"], "upstream");
+        let attempt = &machine["attempt"];
+        assert_eq!(attempt.as_object().unwrap().len(), 5);
+        assert_eq!(attempt["requestId"], id);
+        assert_eq!(attempt["operation"], "cli.list");
+        assert!(
+            attempt["diagnostic"].is_null(),
+            "foreign envelope is not a local DB timeout"
+        );
+        assert_eq!(attempt["receipt"], "not_applicable");
+        if echo_matches {
+            assert_eq!(attempt["listenerGeneration"], generation);
+        } else {
+            assert!(attempt["listenerGeneration"].is_null());
+        }
+        assert!(
+            !root.0.join("diagnostics/cli-transport-v1.log").exists(),
+            "completed HTTP refusal is not a transport failure"
+        );
+        assert_eq!(
+            gateway.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+            "no replay"
+        );
+    }
+}
+
+#[test]
+fn actual_cli_get_and_post_body_failure_write_at_most_one_correlated_receipt() {
+    for command in ["help", "list"] {
+        let root = CliRoot::new();
+        let gateway = TcpListener::bind("127.0.0.1:0").unwrap();
+        gateway.set_nonblocking(true).unwrap();
+        let child = root.spawn(command, gateway.local_addr().unwrap());
+        let mut stream = accept_bounded(&gateway);
+        let request = read_request(&mut stream);
+        let id = generated_id(&request);
+        let expected_line = if command == "help" {
+            "GET /harnesses HTTP/1.1\r\n"
+        } else {
+            "POST /agent/dispatch HTTP/1.1\r\n"
+        };
+        assert!(request.starts_with(expected_line));
+        write!(stream, "HTTP/1.1 200 OK\r\nx-tightbeam-request-id: {id}\r\nx-tightbeam-listener-generation: lgen_abcdefghijklmnopqrstuv\r\nContent-Length: 50\r\nConnection: close\r\n\r\nx").unwrap();
+        drop(stream); // actual EOF with a still-incomplete HTTP body
+        let output = finish_cli(child);
+        assert_eq!(
+            output.status.success(),
+            command == "help",
+            "preserve help fallback: {output:?}"
+        );
+        if command == "list" {
+            let machine = machine_failure(&output);
+            assert_eq!(machine["error"]["code"], "response_unreadable");
+            assert_eq!(machine["attempt"]["requestId"], id);
+            assert_eq!(machine["attempt"]["receipt"], "recorded");
+        }
+        let log = std::fs::read_to_string(root.0.join("diagnostics/cli-transport-v1.log")).unwrap();
+        let records: Vec<serde_json::Value> = log
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record["request_id"], id);
+        assert_eq!(
+            record["operation"],
+            if command == "help" {
+                "cli.help"
+            } else {
+                "cli.list"
+            }
+        );
+        assert_eq!(record["listener_generation"], "lgen_abcdefghijklmnopqrstuv");
+        assert_eq!(record["code"], "gateway_transport_uncertain");
+        assert_eq!(record["effect_kind"], "read");
+        assert_eq!(record["effect_state"], "none");
+        assert_eq!(record["gateway_accepted"], "unknown");
+        assert_eq!(
+            gateway.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+            "no replay"
+        );
+    }
+}
+
+#[test]
+fn actual_cli_unavailable_receipt_does_not_replace_the_original_body_failure() {
+    let root = CliRoot::new();
+    std::fs::write(root.0.join("diagnostics"), "blocked fixture").unwrap();
+    let gateway = TcpListener::bind("127.0.0.1:0").unwrap();
+    gateway.set_nonblocking(true).unwrap();
+    let child = root.spawn("list", gateway.local_addr().unwrap());
+    let mut stream = accept_bounded(&gateway);
+    let id = generated_id(&read_request(&mut stream));
+    write!(stream, "HTTP/1.1 200 OK\r\nx-tightbeam-request-id: {id}\r\nContent-Length: 50\r\nConnection: close\r\n\r\nx").unwrap();
+    drop(stream);
+    let output = finish_cli(child);
+    let machine = machine_failure(&output);
+    assert_eq!(machine["error"]["code"], "response_unreadable");
+    assert_eq!(machine["attempt"]["requestId"], id);
+    assert_eq!(machine["attempt"]["receipt"], "unavailable");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("diagnosticReceipt=unavailable"));
+    assert_eq!(
+        std::fs::read_to_string(root.0.join("diagnostics")).unwrap(),
+        "blocked fixture"
+    );
+    assert_eq!(
+        gateway.accept().unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
 }
 
 fn cli_redirect_is_not_followed(command: &str, request_line: &str, success: bool) {

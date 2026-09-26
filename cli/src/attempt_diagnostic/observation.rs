@@ -83,6 +83,7 @@ impl FailureFact {
 
 /// Metadata supplied by the finite typed command/ceremony mapping.
 /// An existing idempotency contract is evidence, not permission to retry here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EffectContract {
     /// No verified per-request effect contract. Keep the closed diagnostic
     /// absent rather than inventing an effect or retry recommendation.
@@ -94,6 +95,38 @@ pub(crate) enum EffectContract {
 }
 
 pub(crate) struct IdUnavailable;
+
+/// The caller passes the SAME override given to the fresh gateway Agent. The
+/// pinned ureq2.12.1 Agent default is 30s connect and no whole-request timeout.
+/// Recording those resolved budgets does not change the transport settings.
+pub(crate) fn begin_gateway_attempt(
+    context: Option<super::command_context::CommandContext>,
+    method: &str,
+    path: &str,
+    timeout: Option<Duration>,
+) -> Option<Attempt> {
+    let (operation, effect) = context?.metadata_for_request(method, path)?;
+    Attempt::begin(
+        operation,
+        effect,
+        Some(timeout.unwrap_or(Duration::from_secs(30))),
+        timeout,
+    )
+    .ok()
+}
+
+/// Metadata allocation failure leaves the original request/error path intact.
+/// This header is added to the already-built authenticated gateway request;
+/// it does not build a different Agent, exchange, retry or deadline.
+pub(crate) fn attach_request_id(
+    request: ureq::Request,
+    attempt: Option<&Attempt>,
+) -> ureq::Request {
+    match attempt {
+        Some(attempt) => request.set("x-tightbeam-request-id", attempt.request_id().as_str()),
+        None => request,
+    }
+}
 
 /// Neither Clone nor Copy: only the actual worker owns completion.
 pub(crate) struct Attempt {
@@ -149,6 +182,22 @@ impl Attempt {
 
     pub(crate) fn request_id(&self) -> &RequestId {
         &self.request_id
+    }
+
+    /// Duplicate correlation headers are ambiguous, not permission to choose
+    /// whichever value matches. This must run before the body is consumed.
+    pub(crate) fn observe_response(&mut self, response: &ureq::Response) {
+        let ids = response.all("x-tightbeam-request-id");
+        let generations = response.all("x-tightbeam-listener-generation");
+        let id = match ids.as_slice() {
+            [one] => Some(*one),
+            _ => None,
+        };
+        let generation = match generations.as_slice() {
+            [one] => Some(*one),
+            _ => None,
+        };
+        self.observe_headers(id, generation);
     }
 
     /// Header values are evidence only for the matching local request. They

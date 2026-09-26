@@ -1,17 +1,29 @@
-//! B-owned typed request-context precursor, for the current 1b6fb487 Command
+//! B-owned typed request-context precursor, for the current 5158cb58 Command
 //! enum. Register only with the approved carrier/caller handoff. This module
-//! neither starts an attempt nor reads arguments, payloads, identity, or state.
+//! derives bounded metadata from typed commands without retaining key values,
+//! payloads or identity, allocating an attempt, or reading mutable state.
 
 use super::TransportOperation;
+use super::observation::EffectContract;
 use crate::args::Command;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Requests {
     Catalog,
     Dispatch,
     CatalogAndDispatch,
+    VersionAndDispatch,
     ToolCallObserved,
-    Attest,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum CatalogOrigin {
+    Help,
+    CommandHelp,
+    Doctor,
+    Spawn,
+    Assimilate,
+    Onboard,
 }
 
 /// Owned, immutable metadata may cross the existing lease-worker boundary.
@@ -21,6 +33,7 @@ enum Requests {
 pub(crate) struct CommandContext {
     operation: TransportOperation,
     requests: Requests,
+    dispatch_effect: EffectContract,
 }
 
 impl CommandContext {
@@ -30,9 +43,7 @@ impl CommandContext {
     /// and remote branches still create no attempt on their local branch.
     pub(crate) fn for_command(command: &Command) -> Option<Self> {
         use Command::*;
-        use Requests::{
-            Attest as AttestPaths, Catalog, CatalogAndDispatch, Dispatch as DispatchPath,
-        };
+        use Requests::{Catalog, CatalogAndDispatch, Dispatch as DispatchPath};
         let (operation, requests) = match command {
             IdentityCurrent | GithubAuthCheck => return None,
             Help => ("cli.help", Catalog),
@@ -98,11 +109,11 @@ impl CommandContext {
             WorkItemReopen { .. } => ("cli.work_item_reopen", DispatchPath),
             WorkItemClose { .. } => ("cli.work_item_close", DispatchPath),
             WorkItemFail { .. } => ("cli.work_item_fail", DispatchPath),
-            Attest { .. } => ("cli.attest", AttestPaths),
+            Attest { .. } => ("cli.attest", DispatchPath),
             Attests { .. } => ("cli.attests", DispatchPath),
             Assignments { .. } => ("cli.assignments", DispatchPath),
             CancelWake { .. } => ("cli.cancel_wake", DispatchPath),
-            SettleTurn { .. } => ("cli.settle_turn", DispatchPath),
+            SettleTurn { .. } => ("cli.settle_turn", Requests::VersionAndDispatch),
             IdentityEdit { .. } => ("cli.identity_edit", DispatchPath),
             IdentityStatus { .. } => ("cli.identity_status", DispatchPath),
             IdentityRelearn { .. } => ("cli.identity_relearn", DispatchPath),
@@ -126,6 +137,7 @@ impl CommandContext {
         Some(Self {
             operation: TransportOperation(operation),
             requests,
+            dispatch_effect: dispatch_effect(command),
         })
     }
 
@@ -133,22 +145,33 @@ impl CommandContext {
     /// calls, before it can construct the complete Command. Call them only in
     /// their already-selected parser arms; never classify arbitrary text here.
     pub(crate) fn spawn_catalog() -> Self {
-        Self {
-            operation: TransportOperation("cli.spawn"),
-            requests: Requests::Catalog,
-        }
+        Self::catalog(CatalogOrigin::Spawn)
     }
 
     pub(crate) fn assimilate_catalog() -> Self {
+        Self::catalog(CatalogOrigin::Assimilate)
+    }
+
+    pub(crate) fn catalog(origin: CatalogOrigin) -> Self {
+        let operation = match origin {
+            CatalogOrigin::Help => "cli.help",
+            CatalogOrigin::CommandHelp => "cli.command_help",
+            CatalogOrigin::Doctor => "cli.doctor",
+            CatalogOrigin::Spawn => "cli.spawn",
+            CatalogOrigin::Assimilate => "cli.assimilate",
+            CatalogOrigin::Onboard => "cli.onboard",
+        };
         Self {
-            operation: TransportOperation("cli.assimilate"),
+            operation: TransportOperation(operation),
             requests: Requests::Catalog,
+            dispatch_effect: EffectContract::Unknown,
         }
     }
 
     /// Check the actual method and literal path before allocating an attempt.
     /// A mismatch supplies no metadata; it must not reject or change the
-    /// original request. There is no production /version command in this source.
+    /// original request. SettleTurn's capability preflight is a real /version
+    /// request and retains the same root operation as its subsequent POST.
     pub(crate) fn operation_for_request(
         self,
         method: &str,
@@ -161,9 +184,9 @@ impl CommandContext {
             ),
             ("POST", "/agent/dispatch") => matches!(
                 self.requests,
-                Requests::Dispatch | Requests::CatalogAndDispatch | Requests::Attest
+                Requests::Dispatch | Requests::CatalogAndDispatch | Requests::VersionAndDispatch
             ),
-            ("POST", "/agent/terminal") => matches!(self.requests, Requests::Attest),
+            ("GET", "/version") => matches!(self.requests, Requests::VersionAndDispatch),
             ("POST", "/agent/tool-call-observed") => {
                 matches!(self.requests, Requests::ToolCallObserved)
             }
@@ -171,12 +194,360 @@ impl CommandContext {
         };
         allowed.then_some(self.operation)
     }
+
+    /// Effect belongs to this HTTP exchange, not the whole command/ceremony.
+    /// In particular catalog and capability GETs are reads even for commands
+    /// whose following POST mutates state. This does not authorize a retry.
+    pub(crate) fn metadata_for_request(
+        self,
+        method: &str,
+        path: &str,
+    ) -> Option<(TransportOperation, EffectContract)> {
+        self.operation_for_request(method, path).map(|operation| {
+            let effect = if method == "GET" {
+                EffectContract::Read
+            } else {
+                self.dispatch_effect
+            };
+            (operation, effect)
+        })
+    }
+
+    /// Root contexts for the existing internal ceremony builders, which do not
+    /// receive a complete Command. These create metadata, never an attempt.
+    pub(crate) fn onboard() -> Self {
+        Self {
+            operation: TransportOperation("cli.onboard"),
+            requests: Requests::CatalogAndDispatch,
+            dispatch_effect: EffectContract::WriteWithoutIdempotency,
+        }
+    }
+
+    pub(crate) fn assimilate_registration() -> Self {
+        Self {
+            operation: TransportOperation("cli.assimilate"),
+            requests: Requests::Dispatch,
+            dispatch_effect: EffectContract::WriteWithoutIdempotency,
+        }
+    }
+
+    pub(crate) fn update_clients() -> Self {
+        // The gateway returns host projections. Subsequent SSH work is not
+        // this HTTP attempt and must not change its effect kind.
+        Self {
+            operation: TransportOperation("cli.update_clients"),
+            requests: Requests::Dispatch,
+            dispatch_effect: EffectContract::Read,
+        }
+    }
+}
+
+// RequestSpec's existing derives can include metadata without changing the
+// agreed opaque carrier declaration or exposing identity/key values.
+impl std::fmt::Debug for CommandContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommandContext")
+            .field("operation", &self.operation.as_str())
+            .field("requests", &self.requests)
+            .field("dispatch_effect", &self.dispatch_effect)
+            .finish()
+    }
+}
+
+impl PartialEq for CommandContext {
+    fn eq(&self, other: &Self) -> bool {
+        self.operation.as_str() == other.operation.as_str()
+            && self.requests == other.requests
+            && self.dispatch_effect == other.dispatch_effect
+    }
+}
+impl Eq for CommandContext {}
+
+/// Finite source-reviewed domain effect map on fidelity5158. Audit/log writes
+/// are not promoted into domain mutation. Empty publisher effect-class lists
+/// are NOT read evidence. Keys are inspected for presence only, never retained.
+fn dispatch_effect(command: &Command) -> EffectContract {
+    use Command::*;
+    use EffectContract::*;
+    match command {
+        IdentityCurrent | GithubAuthCheck => Unknown,
+        Help
+        | CommandHelp(_)
+        | Doctor { .. }
+        | HarnessHealthEvidenceOther { .. }
+        | ArtifactContentFetch { .. }
+        | Artifacts { .. }
+        | List { .. }
+        | DecisionRequests { .. }
+        | DecisionRequest { .. }
+        | WorkItemGet { .. }
+        | WorkItemTrace { .. }
+        | DeliveryResponsibilityGet { .. }
+        | Breathing { .. }
+        | Transcript { .. }
+        | Toplines { .. }
+        | Topline { .. }
+        | DurableToplines { .. }
+        | DurableTopline { .. }
+        | Attests { .. }
+        | Assignments { .. }
+        | IdentityStatus { .. }
+        | KungfuList { .. }
+        | ConfigGet { .. }
+        | HostEnvList { .. }
+        | HarnessProcesses { .. }
+        | UpdateClients { .. } => Read,
+
+        Wake {
+            idempotency_key, ..
+        }
+        | Condition {
+            idempotency_key, ..
+        }
+        | Retire {
+            idempotency_key, ..
+        }
+        | Assign {
+            idempotency_key, ..
+        }
+        | Dispatch {
+            idempotency_key, ..
+        }
+        | WorkItemCreate {
+            idempotency_key, ..
+        } => keyed_write(idempotency_key.as_deref()),
+
+        HarnessHealthObserveOther {
+            idempotency_key, ..
+        }
+        | HarnessHealthResolveOther {
+            idempotency_key, ..
+        }
+        | HarnessHealthReviewOther {
+            idempotency_key, ..
+        }
+        | HarnessHealthClosePromotion {
+            idempotency_key, ..
+        }
+        | Spawn {
+            idempotency_key, ..
+        }
+        | SessionReparent {
+            idempotency_key, ..
+        }
+        | SessionPoSet {
+            idempotency_key, ..
+        }
+        | RepairAssignment {
+            idempotency_key, ..
+        }
+        | AssignmentCommitRefCorrect {
+            idempotency_key, ..
+        }
+        | WorkItemDeliveryScopeSet {
+            idempotency_key, ..
+        }
+        | DeliveryScopeOwnerSet {
+            idempotency_key, ..
+        }
+        | SettleTurn {
+            idempotency_key, ..
+        }
+        | IdentityEdit {
+            idempotency_key, ..
+        }
+        | Learn {
+            idempotency_key, ..
+        }
+        | Unlearn {
+            idempotency_key, ..
+        } => keyed_write(Some(idempotency_key)),
+
+        // Relearn's abort/conflict paths do not all establish the durable
+        // publication marker; do not generalize its key to the whole command.
+        IdentityRelearn { .. } => WriteWithoutIdempotency,
+
+        ToplineMutation { verb, .. } => match verb.as_str() {
+            "topline-placement-list" => Read,
+            "topline-create"
+            | "topline-update"
+            | "topline-close"
+            | "topline-reopen"
+            | "topline-link-work"
+            | "topline-unlink-work"
+            | "topline-concern-create"
+            | "topline-concern-link-work"
+            | "topline-concern-unlink-work"
+            | "topline-work-leave-unlinked" => WriteWithoutIdempotency,
+            _ => Unknown,
+        },
+
+        ArtifactRecord { .. }
+        | ToolCallObserved
+        | Tune { .. }
+        | EffortRule { .. }
+        | Ask { .. }
+        | Answer { .. }
+        | Return { .. }
+        | OperatorAsk { .. }
+        | OperatorRule { .. }
+        | OperatorWithdraw { .. }
+        | RevokeAssignment { .. }
+        | ReopenAssignment { .. }
+        | WorkItemUpdate { .. }
+        | Attend { .. }
+        | WorkItemIcebox { .. }
+        | WorkItemReopen { .. }
+        | WorkItemClose { .. }
+        | WorkItemFail { .. }
+        | Attest { .. }
+        | CancelWake { .. }
+        | IdentityRepoint { .. }
+        | IdentityApply { .. }
+        | Onboard { .. }
+        | AddUser { .. }
+        | ConfigSet { .. }
+        | HostEnvSet { .. }
+        | HostEnvUnset { .. }
+        | HostToolchainSet { .. }
+        | Assimilate(_) => WriteWithoutIdempotency,
+    }
+}
+
+fn keyed_write(key: Option<&str>) -> EffectContract {
+    if key.is_some_and(|key| !key.trim().is_empty()) {
+        EffectContract::WriteWithExistingIdempotency
+    } else {
+        EffectContract::WriteWithoutIdempotency
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::args::Identity;
+
+    fn effect(context: CommandContext, method: &str, path: &str) -> EffectContract {
+        context.metadata_for_request(method, path).unwrap().1
+    }
+
+    #[test]
+    fn settlement_capability_read_and_keyed_write_have_separate_attempt_metadata() {
+        let command = Command::SettleTurn {
+            identity: Identity::User("fixture".into()),
+            session_key: "session_fixture".into(),
+            turn_seq: "1".into(),
+            outcome: "failed_unknown".into(),
+            reason: "fixture".into(),
+            idempotency_key: "PRIVATE_SETTLEMENT_KEY".into(),
+        };
+        let context = CommandContext::for_command(&command).unwrap();
+        assert_eq!(effect(context, "GET", "/version"), EffectContract::Read);
+        assert_eq!(
+            effect(context, "POST", "/agent/dispatch"),
+            EffectContract::WriteWithExistingIdempotency
+        );
+        assert_eq!(
+            context
+                .operation_for_request("GET", "/version")
+                .unwrap()
+                .as_str(),
+            "cli.settle_turn"
+        );
+        assert!(!format!("{context:?}").contains("PRIVATE_SETTLEMENT_KEY"));
+        assert!(context.operation_for_request("GET", "/harnesses").is_none());
+    }
+
+    #[test]
+    fn ceremony_http_effect_is_distinct_from_the_whole_ceremony() {
+        let onboard = CommandContext::onboard();
+        assert_eq!(effect(onboard, "GET", "/harnesses"), EffectContract::Read);
+        assert_eq!(
+            effect(onboard, "POST", "/agent/dispatch"),
+            EffectContract::WriteWithoutIdempotency
+        );
+        assert_eq!(
+            effect(CommandContext::update_clients(), "POST", "/agent/dispatch"),
+            EffectContract::Read
+        );
+        assert_eq!(
+            effect(
+                CommandContext::assimilate_registration(),
+                "POST",
+                "/agent/dispatch"
+            ),
+            EffectContract::WriteWithoutIdempotency
+        );
+    }
+
+    #[test]
+    fn closed_topline_subcommands_do_not_gain_retry_advice_from_the_variant_name() {
+        for (verb, expected) in [
+            ("topline-placement-list", EffectContract::Read),
+            ("topline-create", EffectContract::WriteWithoutIdempotency),
+            ("unrecognized-private-verb", EffectContract::Unknown),
+        ] {
+            let command = Command::ToplineMutation {
+                identity: Identity::Session,
+                verb: verb.into(),
+                params: vec![],
+            };
+            let context = CommandContext::for_command(&command).unwrap();
+            assert_eq!(effect(context, "POST", "/agent/dispatch"), expected);
+            assert_eq!(context.operation.as_str(), "cli.topline_mutation");
+        }
+    }
+
+    #[test]
+    fn keyed_advice_requires_the_actual_typed_key_and_never_retains_it() {
+        for (key, expected) in [
+            (None, EffectContract::WriteWithoutIdempotency),
+            (Some(" "), EffectContract::WriteWithoutIdempotency),
+            (
+                Some("PRIVATE_RETIRE_KEY"),
+                EffectContract::WriteWithExistingIdempotency,
+            ),
+        ] {
+            let command = Command::Retire {
+                identity: Identity::Session,
+                session_key: "PRIVATE_TARGET".into(),
+                idempotency_key: key.map(str::to_owned),
+            };
+            let context = CommandContext::for_command(&command).unwrap();
+            assert_eq!(effect(context, "POST", "/agent/dispatch"), expected);
+            assert!(!format!("{context:?}").contains("PRIVATE_"));
+        }
+    }
+
+    #[test]
+    fn current_surrender_builder_uses_dispatch_not_the_historical_terminal_route() {
+        let command = crate::args::parse(
+            [
+                "attest",
+                "asg_fixture",
+                "--kind",
+                "surrender",
+                "--note",
+                "fixture",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        )
+        .unwrap();
+        let request = crate::dispatch::build_request(&command).unwrap();
+        let context = CommandContext::for_command(&command).unwrap();
+        assert_eq!(request.path, "/agent/dispatch");
+        assert_eq!(
+            effect(context, "POST", request.path),
+            EffectContract::WriteWithoutIdempotency
+        );
+        assert!(
+            context
+                .operation_for_request("POST", "/agent/terminal")
+                .is_none()
+        );
+    }
 
     #[test]
     fn payload_and_identity_do_not_enter_operation_or_broaden_allowed_paths() {

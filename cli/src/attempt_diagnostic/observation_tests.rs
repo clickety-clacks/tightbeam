@@ -263,3 +263,28 @@ fn before_exchange_drops_generation_even_when_effect_is_unknown() {
     assert!(records[0]["listener_generation"].is_null());
     assert!(records[0]["effect_kind"].is_null());
 }
+
+#[test]
+fn gateway_budgets_match_the_pinned_agent_default_and_actual_lease_override() {
+    let context = Some(super::super::command_context::CommandContext::onboard());
+    let ordinary = begin_gateway_attempt(context, "GET", "/harnesses", None).unwrap();
+    assert_eq!(ordinary.connect_budget, Some(Duration::from_secs(30)));
+    assert_eq!(ordinary.request_budget, None);
+    let lease = Duration::from_millis(73);
+    let bounded = begin_gateway_attempt(context, "POST", "/agent/dispatch", Some(lease)).unwrap();
+    assert_eq!(bounded.connect_budget, Some(lease));
+    assert_eq!(bounded.request_budget, Some(lease));
+    assert!(begin_gateway_attempt(context, "GET", "/foreign", None).is_none());
+    assert!(begin_gateway_attempt(None, "GET", "/harnesses", None).is_none());
+}
+
+#[test]
+fn duplicate_response_correlation_is_not_chosen_by_first_matching_header() {
+    let mut attempt = attempt(EffectContract::Read);
+    let id = attempt.request_id().as_str().to_owned();
+    let response: ureq::Response = format!(
+        "HTTP/1.1 200 OK\r\nx-tightbeam-request-id: {id}\r\nx-tightbeam-request-id: req_foreign\r\nx-tightbeam-listener-generation: lgen_abcdefghijklmnopqrstuv\r\nContent-Length: 0\r\n\r\n"
+    ).parse().unwrap();
+    attempt.observe_response(&response);
+    assert!(attempt.complete().render().listener_generation.is_none());
+}
