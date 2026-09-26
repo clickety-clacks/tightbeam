@@ -206,9 +206,298 @@ defmodule Tightbeam.Harness.Codex do
 
     rails = Tightbeam.Harness.CodexIdentity.hook_settings(rails)
 
-    Tightbeam.Homes.reconcile(target, home, %{desired | rails: rails},
-      rails_filename: "hooks.json"
+    reconciled =
+      Tightbeam.Homes.reconcile(target, home, %{desired | rails: rails},
+        rails_filename: "hooks.json"
+      )
+
+    if Map.has_key?(desired, :default_model) do
+      reconcile_guardian_approval_default!(target, reconciled.home_path)
+    end
+
+    reconciled
+  end
+
+  defp reconcile_guardian_approval_default!(target, home) do
+    path = Path.join(home, "config.toml")
+    observed = read_guardian_config!(target, path)
+    bytes = if observed == :missing, do: "", else: elem(observed, 1)
+    replacement = guardian_default_bytes!(bytes, path)
+
+    if replacement != bytes do
+      publish_guardian_config!(target, path, observed, replacement)
+    end
+  end
+
+  defp guardian_default_bytes!(bytes, path) do
+    replacement =
+      case Toml.decode(bytes) do
+        {:ok, config} -> guardian_default_for_valid_config(bytes, config)
+        {:error, _reason} -> bytes
+      end
+
+    if replacement == bytes do
+      bytes
+    else
+      case Toml.decode(replacement, filename: path) do
+        {:ok, %{"features" => %{"guardian_approval" => false}}} -> replacement
+        _ -> bytes
+      end
+    end
+  end
+
+  defp guardian_default_for_valid_config(bytes, config) do
+    case Map.fetch(config, "features") do
+      :error ->
+        append_guardian_table(bytes)
+
+      {:ok, features} when is_map(features) ->
+        if Map.has_key?(features, "guardian_approval") do
+          bytes
+        else
+          insert_guardian_lines(bytes, guardian_table_headers(bytes))
+        end
+
+      {:ok, _incompatible} ->
+        bytes
+    end
+  end
+
+  defp append_guardian_table("") do
+    "[features]\nguardian_approval = false\n"
+  end
+
+  defp append_guardian_table(bytes) do
+    separator = if String.ends_with?(bytes, "\n"), do: "", else: "\n"
+    bytes <> separator <> "[features]\nguardian_approval = false\n"
+  end
+
+  defp guardian_table_headers(bytes) do
+    Regex.scan(~r/^[ \t]*\[\[?[^\r\n]+\]?\][ \t]*(?:#[^\r\n]*)?(?:\r\n|\n|$)/m, bytes,
+      return: :index
     )
+    |> Enum.reduce(%{features: nil, first: nil}, fn [{offset, length}], headers ->
+      line = binary_part(bytes, offset, length)
+      first = headers.first || offset
+
+      features =
+        if features_table_header?(line) do
+          {offset, length, String.ends_with?(line, "\n")}
+        else
+          headers.features
+        end
+
+      %{features: features, first: first}
+    end)
+  end
+
+  defp features_table_header?(line) do
+    case Toml.decode(line <> "\n__tightbeam_guardian_marker__ = true") do
+      {:ok, %{"features" => %{"__tightbeam_guardian_marker__" => true}}} -> true
+      _ -> false
+    end
+  end
+
+  defp insert_guardian_lines(bytes, %{features: {offset, length, newline?}}) do
+    insertion = if(newline?, do: "", else: "\n") <> "guardian_approval = false\n"
+    split = offset + length
+
+    binary_part(bytes, 0, split) <>
+      insertion <> binary_part(bytes, split, byte_size(bytes) - split)
+  end
+
+  defp insert_guardian_lines(bytes, %{first: first}) when is_integer(first) do
+    binary_part(bytes, 0, first) <>
+      "features.guardian_approval = false\n" <>
+      binary_part(bytes, first, byte_size(bytes) - first)
+  end
+
+  defp insert_guardian_lines(bytes, _headers) do
+    separator = if bytes == "" or String.ends_with?(bytes, "\n"), do: "", else: "\n"
+    bytes <> separator <> "features.guardian_approval = false\n"
+  end
+
+  defp read_guardian_config!(target, path) do
+    if Support.local?(target) do
+      read_local_guardian_config!(path)
+    else
+      read_remote_guardian_config!(target, path)
+    end
+  end
+
+  defp read_local_guardian_config!(path) do
+    case File.lstat(path) do
+      {:ok, %{type: :regular}} -> {:present, File.read!(path)}
+      {:error, :enoent} -> :missing
+      {:ok, %{type: type}} -> raise "Codex config #{path} is not a regular file (#{type})"
+      {:error, reason} -> raise "could not inspect Codex config #{path}: #{inspect(reason)}"
+    end
+  end
+
+  defp read_remote_guardian_config!(target, path) do
+    quoted = Support.shell_quote(path)
+
+    script =
+      "if [ -L #{quoted} ]; then exit 45; " <>
+        "elif [ -f #{quoted} ]; then cat #{quoted}; " <>
+        "elif [ -e #{quoted} ]; then exit 45; else exit 44; fi"
+
+    command =
+      ["ssh" | Support.ssh_opts()] ++
+        [target.host_config.ssh, "sh", "-c", Support.shell_quote(script)]
+
+    case target.sh.(command) do
+      {bytes, 0} -> {:present, bytes}
+      {_output, 44} -> :missing
+      {_output, 45} -> raise "Codex config #{path} is not a regular file"
+      {_output, exit} -> raise "remote Codex config check failed with exit #{exit}"
+    end
+  end
+
+  defp publish_guardian_config!(target, path, observed, replacement) do
+    if Support.local?(target) do
+      publish_local_guardian_config!(path, observed, replacement)
+    else
+      publish_remote_guardian_config!(target, path, observed, replacement)
+    end
+  end
+
+  defp publish_local_guardian_config!(path, observed, replacement) do
+    temporary = path <> ".tightbeam-guardian-#{guardian_publication_id()}"
+
+    try do
+      File.write!(temporary, replacement, [:exclusive])
+
+      case observed do
+        {:present, _bytes} -> File.chmod!(temporary, File.stat!(path).mode)
+        :missing -> File.chmod!(temporary, 0o600)
+      end
+
+      if read_local_guardian_config!(path) != observed do
+        raise "Codex config changed during Guardian default publication: #{path}"
+      end
+
+      File.rename!(temporary, path)
+    after
+      File.rm(temporary)
+    end
+  end
+
+  defp publish_remote_guardian_config!(target, path, observed, replacement) do
+    nonce = guardian_publication_id()
+    staging = Path.join([target.base_dir, "staging", target.host_name, "codex-guardian"])
+    action = Path.join(staging, "action-#{nonce}")
+    remote_replacement = path <> ".tightbeam-guardian-#{nonce}"
+    remote_expected = path <> ".tightbeam-guardian-expected-#{nonce}"
+    local_replacement = Path.join(action, Path.basename(remote_replacement))
+    local_expected = Path.join(action, Path.basename(remote_expected))
+
+    File.mkdir_p!(action)
+
+    try do
+      File.write!(local_replacement, replacement)
+
+      case observed do
+        {:present, bytes} ->
+          File.write!(local_expected, bytes)
+
+        :missing ->
+          :ok
+      end
+
+      upload_guardian_stage!(target, action, Path.dirname(path))
+
+      publish_remote_guardian_stage!(
+        target,
+        path,
+        observed,
+        remote_expected,
+        remote_replacement
+      )
+    after
+      cleanup_remote_guardian_stage(target, remote_expected, remote_replacement)
+      File.rm_rf(action)
+    end
+  end
+
+  defp upload_guardian_stage!(target, local_dir, remote_dir) do
+    Support.run!(target, [
+      "rsync",
+      "-a",
+      "-e",
+      Enum.join(["ssh" | Support.ssh_opts()], " "),
+      local_dir <> "/",
+      "#{target.host_config.ssh}:#{remote_dir}/"
+    ])
+  end
+
+  defp publish_remote_guardian_stage!(target, path, observed, expected, replacement) do
+    path = Support.shell_quote(path)
+    expected = Support.shell_quote(expected)
+    replacement = Support.shell_quote(replacement)
+
+    unchanged =
+      case observed do
+        {:present, _bytes} ->
+          "[ ! -L #{path} ] && [ -f #{path} ] && cmp -s #{path} #{expected}"
+
+        :missing ->
+          "[ ! -e #{path} ] && [ ! -L #{path} ]"
+      end
+
+    mode =
+      case observed do
+        {:present, _bytes} ->
+          "mode=$(stat -f %Lp #{path} 2>/dev/null) || " <>
+            "mode=$(stat -c %a #{path} 2>/dev/null) || exit 76; " <>
+            "chmod \"$mode\" #{replacement}"
+
+        :missing ->
+          "chmod 600 #{replacement}"
+      end
+
+    script =
+      "trap \"rm -f #{expected} #{replacement}\" EXIT; " <>
+        unchanged <> " || exit 75; " <> mode <> " && mv -f #{replacement} #{path}"
+
+    command =
+      ["ssh" | Support.ssh_opts()] ++
+        [target.host_config.ssh, "sh", "-c", Support.shell_quote(script)]
+
+    case target.sh.(command) do
+      {_output, 0} ->
+        :ok
+
+      {_output, 75} ->
+        raise "Codex config changed during Guardian default publication: #{path}"
+
+      {output, exit} ->
+        detail = String.trim(output)
+        detail = if detail == "", do: "", else: ": #{detail}"
+        raise "remote Codex config publication failed with exit #{exit}#{detail}"
+    end
+  end
+
+  defp cleanup_remote_guardian_stage(target, expected, replacement) do
+    script =
+      "rm -f #{Support.shell_quote(expected)} #{Support.shell_quote(replacement)}"
+
+    command =
+      ["ssh" | Support.ssh_opts()] ++
+        [target.host_config.ssh, "sh", "-c", Support.shell_quote(script)]
+
+    target.sh.(command)
+    :ok
+  rescue
+    _ -> :ok
+  catch
+    _, _ -> :ok
+  end
+
+  defp guardian_publication_id do
+    16
+    |> :crypto.strong_rand_bytes()
+    |> Base.encode16(case: :lower)
   end
 
   @doc false
