@@ -2094,10 +2094,29 @@ defmodule Tightbeam.Wakes do
   end
 
   defp recognize_wait_transitions_in_txn(txn, transitions) do
-    transitions = Enum.filter(transitions, &(is_map(&1) and is_binary(&1[:owner_user_id])))
+    unowned_fact? = fn transition ->
+      is_map(transition) and transition[:domain] == "condition_fact" and
+        is_nil(transition[:owner_user_id])
+    end
 
-    transitions
-    |> Enum.map(& &1.owner_user_id)
+    transitions =
+      Enum.filter(
+        transitions,
+        &(is_map(&1) and (is_binary(&1[:owner_user_id]) or unowned_fact?.(&1)))
+      )
+
+    owners =
+      if Enum.any?(transitions, unowned_fact?) do
+        Txn.q(
+          txn,
+          "SELECT DISTINCT ownerUserId FROM wakes WHERE state='pending' AND waitMode='dependency' AND recognitionAt IS NULL"
+        )
+        |> Enum.map(fn [owner] -> owner end)
+      else
+        Enum.map(transitions, & &1.owner_user_id)
+      end
+
+    owners
     |> Enum.uniq()
     |> Enum.each(fn owner_user_id ->
       Txn.q(
@@ -2120,7 +2139,10 @@ defmodule Tightbeam.Wakes do
               Enum.filter(transitions, &(&1.owner_user_id == wake.owner_user_id))
 
             predicate_transition =
-              Enum.find(owner_transitions, &predicate_transition_relevant?(txn, wake, &1))
+              Enum.find(transitions, fn transition ->
+                (transition.owner_user_id == wake.owner_user_id or unowned_fact?.(transition)) and
+                  predicate_transition_relevant?(txn, wake, transition)
+              end)
 
             resolver_transition =
               Enum.find(owner_transitions, &resolver_transition_relevant?(wake, &1))

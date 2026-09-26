@@ -2257,7 +2257,7 @@ defmodule Tightbeam.Rules do
       if owner_user_id == "legacy-unscoped" do
         {"ownerUserId IS NULL", [after_id, kind]}
       else
-        {"ownerUserId=?3", [after_id, kind, owner_user_id]}
+        {"(ownerUserId IS NULL OR ownerUserId=?3)", [after_id, kind, owner_user_id]}
       end
 
     {scope_clause, params} =

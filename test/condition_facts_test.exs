@@ -702,6 +702,203 @@ defmodule Tightbeam.ConditionFactsTest do
     assert %{state: "fired", fired_by: "condition"} = Wakes.get(ctx.db, wake.wake_id)
   end
 
+  for path <- [:eager, :scheduler, :dependency] do
+    @tag matching_path: path
+    test "nullable fact ownership preserves recipient and kind/scope matching via #{path}", ctx do
+      assert :ok =
+               DB.execute(
+                 ctx.db,
+                 "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('fixture-owner-b', 0, 1)"
+               )
+
+      other =
+        Org.create(
+          ctx.db,
+          ctx.session
+          |> Map.take([:archetype, :host, :harness, :provider, :model])
+          |> Map.merge(%{
+            session_key: "agent:condition:other",
+            display_name: "Other condition target",
+            owner_user_id: "fixture-owner-b",
+            origin: "user:fixture-owner-b"
+          })
+        )
+
+      other_ctx = %{ctx | session: other}
+      spy = start_supervised!({FactNudgeSpy, self()})
+
+      arm =
+        if ctx.matching_path == :dependency do
+          base =
+            Path.join(
+              System.tmp_dir!(),
+              "nullable-fact-rules-#{System.unique_integer([:positive])}"
+            )
+
+          File.mkdir_p!(Path.join(base, "identity/rules"))
+
+          File.write!(Path.join(base, "identity/rules/verification.toml"), """
+          [[policy]]
+          name = "synthetic-condition-verification"
+          purpose = "wait-verification-admission"
+          when = [
+            { fact = "verifier.open", op = "eq", value = true },
+            { fact = "verifier.holder_is_other", op = "eq", value = true },
+          ]
+          verification = { trigger = "registration", terminal = "bound-verdict-or-obligation-terminal", fallback = "wake-due-at" }
+          """)
+
+          Rules.load!(base, [])
+
+          for target <- [ctx.session, other] do
+            verifier_key = target.session_key <> ":verifier"
+
+            Org.create(
+              ctx.db,
+              target
+              |> Map.take([:archetype, :host, :harness, :provider, :model, :owner_user_id])
+              |> Map.merge(%{
+                session_key: verifier_key,
+                display_name: "Condition verifier",
+                origin: "user:" <> target.owner_user_id
+              })
+            )
+
+            for holder <- [target.session_key, verifier_key] do
+              assert {:ok, _} =
+                       DB.query(
+                         ctx.db,
+                         "INSERT INTO assignments(id,subject,holderKey,openedByUser,openedAt) VALUES(?1,?1,?1,?2,1)",
+                         [holder, target.owner_user_id]
+                       )
+
+              assert {:ok, _} =
+                       DB.query(
+                         ctx.db,
+                         "INSERT INTO assignment_effects(assignmentId,effectKind) VALUES(?1,'coordination')",
+                         [holder]
+                       )
+            end
+          end
+
+          fn target_ctx, kind, scope ->
+            target = target_ctx.session
+            verifier_id = target.session_key <> ":verifier"
+
+            assert {:ok, %{wake_id: _} = wake} =
+                     DB.transaction(ctx.db, fn txn ->
+                       Wakes.register_wait_in_txn(txn, %{
+                         session_key: target.session_key,
+                         origin: "session:" <> target.session_key,
+                         prompt: "Continue from the synthetic condition.",
+                         due_at: System.system_time(:millisecond) + 60_000,
+                         assignment_id: target.session_key,
+                         registrant_session_key: target.session_key,
+                         owner_user_id: target.owner_user_id,
+                         predicate: %{
+                           "conditions" => [
+                             %{"fact" => "condition_fact.matches", "op" => "eq", "value" => true}
+                           ],
+                           "bindings" => %{
+                             "conditionKind" => kind,
+                             "conditionScope" => scope,
+                             "conditionAfterId" => 0
+                           },
+                           "resolverRef" => %{"kind" => "assignment", "id" => verifier_id},
+                           "verificationRef" => %{"kind" => "assignment", "id" => verifier_id},
+                           "necessity" => "The synthetic fact is required."
+                         }
+                       })
+                     end)
+
+            wake
+          end
+        else
+          &condition_wake/3
+        end
+
+      file = fn input ->
+        case ctx.matching_path do
+          :eager ->
+            # The spy cannot deliver: this proves transactional eager recognition.
+            ConditionFacts.file(ctx.db, spy, input)
+
+          :scheduler ->
+            {:ok, fact} = DB.transaction(ctx.db, &ConditionFacts.file_in_txn(&1, input))
+            assert :ok = Wakes.fire_due(ctx.scheduler)
+            fact
+
+          :dependency ->
+            fact = ConditionFacts.file(ctx.db, ctx.scheduler, input)
+            # Row commits recognize dependency waits; the due pass delivers them.
+            assert :ok = Wakes.fire_due(ctx.scheduler)
+            fact
+        end
+      end
+
+      owned_a = arm.(ctx, "fixture-nullable-owner", "owned")
+      owned_b = arm.(other_ctx, "fixture-nullable-owner", "owned")
+
+      owned_fact =
+        file.(%{
+          kind: "fixture-nullable-owner",
+          scope: "owned",
+          origin: "user:flynn"
+        })
+
+      assert {:ok, [["flynn", "user:flynn"]]} =
+               DB.query(ctx.db, "SELECT ownerUserId, origin FROM condition_facts WHERE id=?1", [
+                 owned_fact.fact_id
+               ])
+
+      process_a = arm.(ctx, "fixture-nullable-owner", "process")
+      process_b = arm.(other_ctx, "fixture-nullable-owner", "process")
+      wrong_kind = arm.(ctx, "fixture-other-kind", "process")
+      wrong_scope = arm.(other_ctx, "fixture-nullable-owner", "other-scope")
+
+      process_fact =
+        file.(%{
+          kind: "fixture-nullable-owner",
+          scope: "process",
+          origin: "process:fixture"
+        })
+
+      assert {:ok, [[nil, "process:fixture"]]} =
+               DB.query(ctx.db, "SELECT ownerUserId, origin FROM condition_facts WHERE id=?1", [
+                 process_fact.fact_id
+               ])
+
+      for {wake, target} <- [
+            {owned_a, ctx.session.session_key},
+            {process_a, ctx.session.session_key},
+            {process_b, other.session_key}
+          ] do
+        recognized = Wakes.get(ctx.db, wake.wake_id)
+        assert recognized.state == "fired"
+
+        if ctx.matching_path == :dependency do
+          assert recognized.recognition_path == "success"
+          assert recognized.recognition_evidence["label"] == "row-transition"
+          expected_fact = if wake.wake_id == owned_a.wake_id, do: owned_fact, else: process_fact
+          assert recognized.recognition_transition["row_id"] == expected_fact.fact_id
+        else
+          assert recognized.fired_by == "condition"
+        end
+
+        assert {:ok, [[^target, "queued"]]} =
+                 DB.query(ctx.db, "SELECT sessionKey, status FROM turns WHERE wakeId=?1", [
+                   wake.wake_id
+                 ])
+      end
+
+      for wake <- [owned_b, wrong_kind, wrong_scope] do
+        assert %{state: "pending"} = Wakes.get(ctx.db, wake.wake_id)
+        assert Wakes.get(ctx.db, wake.wake_id).recognition_path == nil
+        assert turn_count(ctx.db, wake.wake_id) == 0
+      end
+    end
+  end
+
   test "recovery advances its fact watermark after a full batch of scope nonmatches", ctx do
     for scope <- ["older-a", "older-b"] do
       condition_wake(ctx, "recovery-scope", scope)
