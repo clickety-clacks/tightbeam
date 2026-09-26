@@ -24,7 +24,7 @@ defmodule Tightbeam.ResponseObservationAdapterTest do
 
     def call(conn, opts) do
       conn =
-        if conn.request_path == "/close" do
+        if conn.request_path in ["/close", "/timeout-close"] do
           {adapter, payload} = conn.adapter
           %{conn | adapter: {ClosingAdapter, {adapter, payload, opts[:parent]}}}
         else
@@ -34,6 +34,12 @@ defmodule Tightbeam.ResponseObservationAdapterTest do
       conn = put_private(conn, :plug_route, {"/api/work-items", nil})
 
       RequestObservation.call(conn, fn conn ->
+        if conn.request_path in ["/timeout", "/timeout-close"] do
+          DB.transaction(opts[:db], fn txn ->
+            DB.Txn.exec(txn, "INSERT INTO effects(value) VALUES (1)")
+          end)
+        end
+
         sent = send_resp(conn, 200, "ok")
 
         if conn.request_path == "/late" do
@@ -154,6 +160,123 @@ defmodule Tightbeam.ResponseObservationAdapterTest do
     after
       :sys.resume(db)
     end
+  end
+
+  test "a timeout response completes once before the queued mutation finishes", %{
+    port: port,
+    db: db
+  } do
+    with_suspended_db(db, fn ->
+      id = RequestContext.id("req_")
+      assert {:ok, {{_, 503, _}, headers, body}} = request(port, "/timeout", id)
+      assert {~c"x-tightbeam-request-id", String.to_charlist(id)} in headers
+      assert %{"error" => %{"code" => "db_timeout", "requestId" => ^id}} = JSON.decode!(body)
+
+      assert_receive {:diagnostic,
+                      %{event: "db_call_abandoned", request_id: ^id, db_call_id: call_id}},
+                     2_000
+
+      assert_receive {:diagnostic,
+                      %{
+                        event: "http_response_terminal",
+                        request_id: ^id,
+                        db_call_id: ^call_id,
+                        response_state: "complete",
+                        http_status: 503,
+                        cause: "db_caller_timeout"
+                      }},
+                     2_000
+
+      :sys.resume(db)
+      assert_late_effect(db, id, call_id)
+      assert_one_terminal(id)
+    end)
+  end
+
+  for order <- [:send_failure_first, :late_completion_first] do
+    @order order
+    test "timeout response failure and late completion retain independent facts: #{@order}", %{
+      port: port,
+      db: db
+    } do
+      with_suspended_db(db, fn ->
+        id = RequestContext.id("req_")
+        task = Task.async(fn -> request(port, "/timeout-close", id) end)
+
+        assert_receive {:diagnostic,
+                        %{event: "db_call_abandoned", request_id: ^id, db_call_id: call_id}},
+                       2_000
+
+        assert_receive {:before_send, sender}, 2_000
+
+        if @order == :late_completion_first do
+          :sys.resume(db)
+          assert_late_effect(db, id, call_id)
+        end
+
+        send(sender, :close_socket)
+
+        assert_receive {:diagnostic,
+                        %{
+                          event: "http_response_terminal",
+                          request_id: ^id,
+                          db_call_id: ^call_id,
+                          response_state: "started",
+                          http_status: nil,
+                          cause: "connection_reset",
+                          timeout_source: "otp_db_call"
+                        }},
+                       2_000
+
+        assert {:error, _} = Task.await(task, 5_000)
+
+        if @order == :send_failure_first do
+          :sys.resume(db)
+          assert_late_effect(db, id, call_id)
+        end
+
+        assert_one_terminal(id)
+      end)
+    end
+  end
+
+  defp with_suspended_db(db, fun) do
+    previous = Application.fetch_env(:tightbeam, :db_call_timeout_ms)
+    Application.put_env(:tightbeam, :db_call_timeout_ms, 50)
+    :sys.suspend(db)
+
+    try do
+      fun.()
+    after
+      :sys.resume(db)
+
+      case previous do
+        {:ok, value} -> Application.put_env(:tightbeam, :db_call_timeout_ms, value)
+        :error -> Application.delete_env(:tightbeam, :db_call_timeout_ms)
+      end
+    end
+  end
+
+  defp assert_late_effect(db, id, call_id) do
+    assert {:ok, [[1]]} = DB.query(db, "SELECT count(*) FROM effects")
+
+    assert_receive {:diagnostic,
+                    %{
+                      event: "db_server_completed",
+                      request_id: ^id,
+                      db_call_id: ^call_id,
+                      result_class: "ok"
+                    }},
+                   2_000
+  end
+
+  defp assert_one_terminal(id) do
+    assert length(
+             Enum.filter(
+               Diagnostics.records(),
+               &(&1.event == "http_response_terminal" and &1.request_id == id)
+             )
+           ) == 1
   end
 
   defp request(port, path, id) do
