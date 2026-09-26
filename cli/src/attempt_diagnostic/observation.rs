@@ -39,6 +39,7 @@ pub(crate) struct Attempt {
     started: Instant,
     connect_budget: Option<Duration>,
     request_budget: Option<Duration>,
+    correlated_headers: bool,
     listener_generation: Option<ListenerGeneration>,
 }
 
@@ -75,6 +76,7 @@ impl Attempt {
             started: Instant::now(),
             connect_budget,
             request_budget,
+            correlated_headers: false,
             listener_generation: None,
         })
     }
@@ -86,7 +88,8 @@ impl Attempt {
     /// Header values are evidence only for the matching local request. They
     /// never establish domain acceptance. Call before consuming Response.
     pub(crate) fn observe_headers(&mut self, echoed_id: Option<&str>, generation: Option<&str>) {
-        self.listener_generation = if echoed_id == Some(self.request_id.as_str()) {
+        self.correlated_headers = echoed_id == Some(self.request_id.as_str());
+        self.listener_generation = if self.correlated_headers {
             generation
                 .filter(|value| valid_generation(value))
                 .map(|value| ListenerGeneration(value.to_owned()))
@@ -96,7 +99,7 @@ impl Attempt {
     }
 
     /// A fully read exchange (including a refusal or malformed JSON body) is
-    /// not a CLI transport failure. Correlated DB validation is a later seam.
+    /// not a CLI transport failure. Use complete_response for a read HTTP body.
     pub(crate) fn complete(self) -> CompletedAttempt {
         CompletedAttempt {
             request_id: self.request_id,
@@ -105,6 +108,110 @@ impl Attempt {
             diagnostic: None,
             receipt: ReceiptAvailability::NotApplicable,
         }
+    }
+
+    /// Inspect only the known A timeout envelope, without changing or retaining
+    /// it. The renderer still receives the original body. Unknown/mismatched
+    /// shapes stay generic; completed HTTP refusals never append a receipt.
+    pub(crate) fn complete_response(self, status: u16, encoded: &str) -> CompletedAttempt {
+        let diagnostic = self.correlated_db_timeout(status, encoded);
+        let mut completed = self.complete();
+        completed.diagnostic = diagnostic;
+        completed
+    }
+
+    fn correlated_db_timeout(&self, status: u16, encoded: &str) -> Option<FailureDiagnostic> {
+        use serde_json::Value;
+        if status != 503 || !self.correlated_headers {
+            return None;
+        }
+        let body: Value = serde_json::from_str(encoded).ok()?;
+        let error = body.get("error")?.as_object()?;
+        if error.get("code")?.as_str()? != "db_timeout"
+            || error.get("requestId")?.as_str()? != self.request_id.as_str()
+            || error.get("gatewayAccepted")?.as_bool()? != true
+            || error.get("timeoutSource")?.as_str()? != "otp_db_call"
+        {
+            return None;
+        }
+
+        // A's real DBObservation registry supplies these effect kinds. Generic
+        // db.query/db.execute/reference_fence have unknown effects: never copy
+        // the CLI effect into a DB diagnostic to fill that missing evidence.
+        let (operation, effect_kind, effect_name, effect_state, expected_state) =
+            match error.get("operation")?.as_str()? {
+                "auth.session_by_cli_token" => (
+                    DbOperation("auth.session_by_cli_token"),
+                    EffectKind::Read,
+                    "read",
+                    EffectState::None,
+                    "none",
+                ),
+                "wake.due_scan" => (
+                    DbOperation("wake.due_scan"),
+                    EffectKind::Read,
+                    "read",
+                    EffectState::None,
+                    "none",
+                ),
+                "db.transaction" => (
+                    DbOperation("db.transaction"),
+                    EffectKind::Write,
+                    "write",
+                    EffectState::Unknown,
+                    "unknown",
+                ),
+                "schema.ensure" => (
+                    DbOperation("schema.ensure"),
+                    EffectKind::Schema,
+                    "schema",
+                    EffectState::Unknown,
+                    "unknown",
+                ),
+                _ => return None,
+            };
+        if error.get("effectState")?.as_str()? != expected_state {
+            return None;
+        }
+        // The current A envelope omits effectKind and cause. If a successor
+        // supplies either, contradictions or open vocabulary are not accepted.
+        if let Some(kind) = error.get("effectKind") {
+            if kind.as_str()? != effect_name {
+                return None;
+            }
+        }
+        let cause = match error.get("cause") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(cause)) if cause == "db_caller_timeout" => {
+                Some(AttemptCause::DbCallerTimeout)
+            }
+            _ => return None,
+        };
+        let action = match (effect_kind, error.get("action")?.as_str()?) {
+            (EffectKind::Read, "retry_safe") => Action::RetrySafe,
+            (EffectKind::Write | EffectKind::Schema, "do_not_retry_report") => {
+                Action::DoNotRetryReport
+            }
+            (EffectKind::Write, "retry_same_idempotency_key")
+                if matches!(self.effect, EffectContract::WriteWithExistingIdempotency) =>
+            {
+                Action::RetrySameIdempotencyKey
+            }
+            _ => return None,
+        };
+        Some(FailureDiagnostic {
+            code: DiagnosticCode::DbTimeout,
+            operation: DiagnosticOperation::Database(operation),
+            cause,
+            elapsed_ms: error.get("elapsedMs")?.as_u64()?,
+            timeout: TimeoutBudget::OtpDbCall {
+                budget_ms: error.get("budgetMs")?.as_u64()?,
+            },
+            gateway_accepted: GatewayAccepted::Yes,
+            effect_kind,
+            effect_state,
+            action,
+        })
     }
 
     /// Consume once and attempt one append. This never owns or transforms the
