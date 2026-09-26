@@ -1440,6 +1440,7 @@ defmodule Tightbeam.Schema do
     Enum.each(@schema_modules, fn module -> :ok = module.ensure_schema(db) end)
     :ok = upgrade_stale_turn_settlement(db)
     :ok = Tightbeam.ReadMarkers.ensure_schema(db)
+    :ok = Tightbeam.Sentinels.ensure_schema(db)
 
     case DB.finish_schema(db) do
       :ok -> :ok
