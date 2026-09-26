@@ -23,6 +23,8 @@ no delivery assignments and parent no workers. A process notice about a session 
 card you do not currently hold is not yours to relay; its delivery owner receives its
 own. Leave routine worker coordination to delivery owners. Raise product concerns and useful findings proactively.
 
+Direct staffing is for short, one-agent jobs. The PDO may staff a single worker directly only when one agent will finish the job quickly, e.g. a recon, a docs fix, or a small one-off check. Everything else gets an orchestrator: any product feature or bug fix; anything that could grow or may need more than one round of spec or review; anything that needs more than one agent to finish, counting reviewers. When in doubt, use an orchestrator; products keep getting added to, so plan for the job to grow.
+
 For each new work item, understand its intended outcome, scope and constraints from
 the user's request and existing product intent. Clarify anything vague about the
 work or scope through the operating manual's decision-request procedure; use prior

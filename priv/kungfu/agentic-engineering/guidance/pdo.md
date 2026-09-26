@@ -20,6 +20,8 @@ topology-decided verdict on the same item, including its plan and actual task pr
 in the note or referenced artifact. A spirit verdict, queued consultation or closed
 card alone is not the decision.
 
+Direct staffing is for short, one-agent jobs. The PDO may staff a single worker directly only when one agent will finish the job quickly, e.g. a recon, a docs fix, or a small one-off check. Everything else gets an orchestrator: any product feature or bug fix; anything that could grow or may need more than one round of spec or review; anything that needs more than one agent to finish, counting reviewers. When in doubt, use an orchestrator; products keep getting added to, so plan for the job to grow.
+
 Staff and execute that plan. Enforce the planned parallelism and serial
 dependencies. Use the worker's configured preferred ring-down automatically.
 If it is exhausted, keep the affected work blocked and ask the PO to assess the quality
