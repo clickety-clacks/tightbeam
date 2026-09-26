@@ -11,6 +11,9 @@ on:
     branches: ["0.1.*"]
     tags: ["v*.*.*"]
   pull_request:
+  # The merge queue tests each group head, the tip about to exist, under the
+  # same linux and macos check names. It never packages or publishes.
+  merge_group:
   workflow_dispatch:
     inputs:
       candidate_sha:
@@ -188,7 +191,7 @@ jobs:
   # not pass on that platform.
   release:
     needs: test
-    if: startsWith(github.ref, 'refs/heads/0.1.') || startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name != 'merge_group' && (startsWith(github.ref, 'refs/heads/0.1.') || startsWith(github.ref, 'refs/tags/v'))
     strategy:
       matrix:
         include:

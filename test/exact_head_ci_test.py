@@ -10,6 +10,21 @@ import unittest
 WORKFLOW = Path(__file__).resolve().parents[1] / '.github/workflows/ci.yml'
 
 
+def evaluate(expression, context):
+    """Evaluate the small GitHub expression subset this workflow uses."""
+    tokens = re.findall(
+        r"\s*(&&|\|\||!=|==|[(),]|'[^']*'|startsWith|[A-Za-z_][\w.-]*)", expression)
+    if ''.join(tokens) != re.sub(r'\s+', '', expression):
+        raise ValueError('unsupported expression: ' + expression)
+    words = {'&&': ' and ', '||': ' or ', '!=': ' != ', '==': ' == ',
+             '(': '(', ')': ')', ',': ',', 'startsWith': '_starts'}
+    code = ''.join(
+        words.get(token) or (repr(token[1:-1]) if token.startswith("'")
+                             else repr(context[token]))
+        for token in tokens)
+    return eval(code, {'__builtins__': {}, '_starts': lambda s, p: s.startswith(p)})
+
+
 class ExactHeadCI(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -98,7 +113,8 @@ class ExactHeadCI(unittest.TestCase):
         job = self.jobs['release']
         self.assertIn('    needs: test', job)
         self.assertIn(
-            "if: startsWith(github.ref, 'refs/heads/0.1.') || startsWith(github.ref, 'refs/tags/v')",
+            "if: github.event_name != 'merge_group' && "
+            "(startsWith(github.ref, 'refs/heads/0.1.') || startsWith(github.ref, 'refs/tags/v'))",
             job)
         self.assertIn('${CI_SOURCE_SHA::7}.tgz', job)
         self.assertNotIn('${GITHUB_SHA::7}.tgz', job)
@@ -120,6 +136,37 @@ class ExactHeadCI(unittest.TestCase):
         self.assertNotIn('contents: write', self.jobs['test'])
         self.assertNotIn('contents: write', release)
         self.assertIn('permissions:\n  contents: read', self.text)
+
+    def test_merge_group_tests_group_head_under_required_names(self):
+        self.assertRegex(self.text, r'(?m)^  merge_group:$')
+        source = re.search(r'CI_SOURCE_SHA: \$\{\{ (.*?) \}\}', self.text).group(1)
+        context = {'github.event_name': 'merge_group', 'github.sha': 'c' * 40,
+                   'github.ref': 'refs/heads/gh-readonly-queue/0.1.9/pr-12-' + 'a' * 40,
+                   'inputs.candidate_sha': ''}
+        self.assertEqual(evaluate(source, context), 'c' * 40)
+        test_job = self.jobs['test']
+        self.assertIn('    name: ${{ matrix.name }}', test_job)
+        self.assertEqual(re.findall(r'(?m)^            name: (\S+)$', test_job),
+                         ['linux', 'macos'])
+        self.assertNotRegex(test_job, r'(?m)^    if:')
+
+    def test_merge_group_never_packages_or_publishes(self):
+        queue_ref = 'refs/heads/gh-readonly-queue/0.1.9/pr-12-' + 'a' * 40
+        conditions = {name: re.search(r'(?m)^    if: (.*)$', self.jobs[name]).group(1)
+                      for name in ('release', 'publish-release')}
+        # Packaging refuses the event itself, whatever ref it carries.
+        for ref in (queue_ref, 'refs/heads/0.1.9', 'refs/tags/v0.1.9'):
+            context = {'github.event_name': 'merge_group', 'github.ref': ref}
+            self.assertFalse(evaluate(conditions['release'], context), ref)
+        # Publication needs packaging, and refuses the queue ref on its own.
+        self.assertIn('    needs: release', self.jobs['publish-release'])
+        context = {'github.event_name': 'merge_group', 'github.ref': queue_ref}
+        self.assertFalse(evaluate(conditions['publish-release'], context))
+        for name in ('release', 'publish-release'):
+            context = {'github.event_name': 'push', 'github.ref': 'refs/tags/v0.1.9'}
+            self.assertTrue(evaluate(conditions[name], context), name)
+        context = {'github.event_name': 'push', 'github.ref': 'refs/heads/0.1.9'}
+        self.assertTrue(evaluate(conditions['release'], context))
 
     def test_no_retired_branch_dependency(self):
         self.assertNotIn('release-candidate/', self.text)

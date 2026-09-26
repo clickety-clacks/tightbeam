@@ -216,7 +216,7 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
     assert ci_workflow =~ ~s(branches: ["0.1.*"])
 
     assert ci_workflow =~
-             "if: startsWith(github.ref, 'refs/heads/0.1.') || startsWith(github.ref, 'refs/tags/v')"
+             "if: github.event_name != 'merge_group' && (startsWith(github.ref, 'refs/heads/0.1.') || startsWith(github.ref, 'refs/tags/v'))"
 
     assert ci_workflow =~
              ~s(sh scripts/validate_release_tag.sh "$GITHUB_REF_NAME" "$GITHUB_SHA")
