@@ -401,7 +401,7 @@ defmodule Tightbeam.SchemaShapeTest do
                "SELECT subject FROM lifecycle_events WHERE kind='condition_fact_owner_unattributed' ORDER BY subject"
              )
 
-    for fact_id <- 1..7 do
+    for fact_id <- 1..6 do
       assert {:ok, _} =
                DB.transaction(db, fn txn ->
                  Wakes.recognize_condition_fact_in_txn(txn, fact_id)
@@ -410,7 +410,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
     for fact_id <- 1..6, owner <- ["marker-a", "marker-b"] do
       wake_id = "marker-#{fact_id}-#{owner}"
-      expected = if fact_id in [1, 2] and owner == "marker-a", do: "fired", else: "pending"
+      expected = if fact_id in 3..6 or owner == "marker-a", do: "fired", else: "pending"
       assert Wakes.get(db, wake_id).state == expected
       expected_turns = if expected == "fired", do: 1, else: 0
 
@@ -418,10 +418,29 @@ defmodule Tightbeam.SchemaShapeTest do
                DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [wake_id])
     end
 
+    assert {:ok, [[10]]} =
+             DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId LIKE 'marker-%'")
+
+    assert Wakes.get(db, "marker-1-marker-b").state == "pending"
+
+    # Stored NULL ownership, not the process name, controls the final fact's match.
+    assert {:ok, _} =
+             DB.transaction(db, fn txn ->
+               Wakes.recognize_condition_fact_in_txn(txn, 7)
+             end)
+
+    assert Wakes.get(db, "marker-1-marker-b").state == "fired"
+
+    assert {:ok, [[1]]} =
+             DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId='marker-1-marker-b'")
+
+    assert {:ok, [[11]]} =
+             DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId LIKE 'marker-%'")
+
     # A second startup must not relabel ambiguous facts or duplicate recognition.
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [[2]]} =
+    assert {:ok, [[11]]} =
              DB.query(
                db,
                "SELECT COUNT(*) FROM turns WHERE wakeId LIKE 'marker-%'"
