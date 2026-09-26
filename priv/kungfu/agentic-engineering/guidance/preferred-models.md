@@ -7,9 +7,9 @@ activities live in `kungfu/agentic-engineering/preferred-models.md`.
 ## Working set (capsules)
 
 - **gpt-6-astra** — (nickname: astra): deep product, architecture, planning and review judgment. Use high or higher reasoning for sustained work.
-- **gpt-6-sol** — (nickname: sol): orchestration at low effort; stronger implementation when unresolved judgment warrants it. Keep technical production with qualified workers.
+- **gpt-6-sol** — (nickname: sol): the PDO default at low effort; stronger implementation when unresolved judgment warrants it. Keep technical production with qualified workers.
 - **gpt-5.6-terra** — (nickname: terra): bounded engineering implementation and mechanical work with an inspectable contract.
-- **gpt-6-luna** — (nickname: luna): the coder default at max effort for well-scoped and sustained implementation under an understood architecture. Select a stronger generation-6 model when consequential uncertainty warrants it.
+- **gpt-6-luna** — (nickname: luna): the orchestrator default at max effort; the coder default at max effort for well-scoped and sustained implementation under an understood architecture. Select a stronger generation-6 model when consequential uncertainty warrants it.
 - **claude-opus-5-5** — (nickname: opus): specification drafting at high effort and independent review of actual Codex-authored work. Qualify each host and harness; success elsewhere does not establish local access. Do not infer an unobserved context setting.
 - **claude-fable-5** — (nickname: fable): retained qualified choice for product judgment, difficult planning and implementation; independent review uses the actual-producer contract below.
 - **claude-sonnet-5** — (nickname: sonnet): bounded orchestration, specification and implementation under an understood contract.

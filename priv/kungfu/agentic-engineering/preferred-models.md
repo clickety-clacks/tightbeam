@@ -4,8 +4,8 @@ Use shared `guidance/preferred-models.md` for exact names, nickname expansion,
 qualification, access, independent-review selection and recovery. Activity choices
 are starting policy, not runtime fallback or permission to expand a role's authority.
 
-Use gpt-6-sol at low effort for PDO and generic orchestrator defaults. Use
-gpt-6-luna at max effort for coding under an understood architecture; choose a
+Use gpt-6-sol at low effort for PDO defaults and gpt-6-luna at max effort
+for generic orchestrator defaults. Use gpt-6-luna at max effort for coding under an understood architecture; choose a
 stronger generation-6 model when unresolved architecture, interacting failures or
 causal uncertainty warrants it. Importance alone does not justify a stronger coder,
 and a failed Luna attempt is not required. Prefer generation 6 for current work;
@@ -38,7 +38,7 @@ do not shift continual deep judgment into repeated corrective supervision.
 | --- | --- | --- |
 | Product ownership and spirit | gpt-6-astra[high], fable[high], opus[xhigh], sol[xhigh] | Challenge technically sound work against intent, sustain product context and decide topology. |
 | Product delivery orchestration | gpt-6-sol[low] | Obtain the PO's plan, reconcile current records, staff and execute within it, recognize revision needs and resolve routine traffic. |
-| Executive or delegated lane orchestration | gpt-6-sol[low] | Coordinate within actual scope, carry dependencies and follow-through, route consequential judgment to its qualified owner. |
+| Executive or delegated lane orchestration | gpt-6-luna[max] | Coordinate within actual scope, carry dependencies and follow-through, route consequential judgment to its qualified owner. |
 | Bounded team design or recovery planning | astra[high], fable[high], sol[xhigh], opus[xhigh] | Discover coupling, ownership, communication and evidence that invalidates the plan. |
 | Difficult sustained topology or recovery exploration | astra[xhigh], fable[xhigh], sol[max], opus[xhigh] | Sustain investigation and revise advice from evidence; the PO decides topology. |
 | Specification under product rulings | claude-opus-5-5[high] | Compose a coherent contract and expose unresolved intent. |

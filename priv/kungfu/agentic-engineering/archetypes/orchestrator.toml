@@ -3,12 +3,12 @@ skills = ["repository-retirement"]
 
 [defaults]
 harness = "codex"
-model = "gpt-6-sol"
-effort = "low"
+model = "gpt-6-luna"
+effort = "max"
 
 [[model_preferences]]
-model = "gpt-6-sol"
-effort = "low"
+model = "gpt-6-luna"
+effort = "max"
 
 [guidance]
 text = """
