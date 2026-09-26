@@ -422,6 +422,47 @@ fn machine_failure(output: &std::process::Output) -> serde_json::Value {
     serde_json::from_str(machine).unwrap()
 }
 
+fn one_receipt(root: &CliRoot) -> serde_json::Value {
+    let log = std::fs::read_to_string(root.0.join("diagnostics/cli-transport-v1.log")).unwrap();
+    let records: Vec<serde_json::Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        records.len(),
+        1,
+        "one failure receipt for one actual attempt"
+    );
+    records.into_iter().next().unwrap()
+}
+
+#[test]
+fn actual_cli_connect_refusal_is_unavailable_for_get_and_post() {
+    for command in ["help", "list"] {
+        let root = CliRoot::new();
+        let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = reservation.local_addr().unwrap();
+        drop(reservation); // actual loopback connect refusal, without a DNS query
+        let output = finish_cli(root.spawn(command, addr));
+        assert_eq!(output.status.success(), command == "help");
+        let record = one_receipt(&root);
+        assert_eq!(record["code"], "gateway_unavailable");
+        assert_eq!(record["cause"], "connect_refused");
+        assert_eq!(record["gateway_accepted"], false);
+        assert_eq!(record["effect_state"], "none");
+        assert_eq!(record["action"], "retry_safe");
+        assert!(record["listener_generation"].is_null());
+        if command == "list" {
+            let machine = machine_failure(&output);
+            assert_eq!(machine["attempt"]["requestId"], record["request_id"]);
+            assert_eq!(
+                machine["attempt"]["diagnostic"]["code"],
+                "gateway_unavailable"
+            );
+        }
+    }
+}
+
 #[test]
 fn actual_cli_correlates_observed_headers_without_overwriting_foreign_error_fields() {
     for echo_matches in [true, false] {
@@ -616,11 +657,26 @@ fn actual_cli_fresh_gateway_post_does_not_replay_after_peer_eof() {
     gateway.set_nonblocking(true).unwrap();
     let child = root.spawn("list", gateway.local_addr().unwrap());
     let mut stream = accept_bounded(&gateway);
-    assert!(read_request(&mut stream).starts_with("POST /agent/dispatch HTTP/1.1\r\n"));
+    let request = read_request(&mut stream);
+    assert!(request.starts_with("POST /agent/dispatch HTTP/1.1\r\n"));
+    let id = generated_id(&request);
     // The peer read the full real request but supplies no response. The fresh
     // Agent must not enter ureq's recycled-stream retry branches.
     drop(stream);
-    assert!(!finish_cli(child).status.success());
+    let output = finish_cli(child);
+    let machine = machine_failure(&output);
+    assert_eq!(machine["attempt"]["requestId"], id);
+    assert_eq!(
+        machine["attempt"]["diagnostic"]["code"],
+        "gateway_transport_uncertain"
+    );
+    assert_eq!(
+        machine["attempt"]["diagnostic"]["gatewayAccepted"],
+        "unknown"
+    );
+    let record = one_receipt(&root);
+    assert_eq!(record["request_id"], id);
+    assert!(record["listener_generation"].is_null());
     assert_eq!(
         gateway.accept().unwrap_err().kind(),
         io::ErrorKind::WouldBlock
@@ -634,12 +690,19 @@ fn actual_cli_fresh_catalog_get_does_not_replay_after_peer_eof() {
     gateway.set_nonblocking(true).unwrap();
     let child = root.spawn("help", gateway.local_addr().unwrap());
     let mut stream = accept_bounded(&gateway);
-    assert!(read_request(&mut stream).starts_with("GET /harnesses HTTP/1.1\r\n"));
+    let request = read_request(&mut stream);
+    assert!(request.starts_with("GET /harnesses HTTP/1.1\r\n"));
+    let id = generated_id(&request);
     drop(stream);
     assert!(
         finish_cli(child).status.success(),
         "help keeps its offline fallback"
     );
+    let record = one_receipt(&root);
+    assert_eq!(record["request_id"], id);
+    assert_eq!(record["code"], "gateway_transport_uncertain");
+    assert_eq!(record["gateway_accepted"], "unknown");
+    assert!(record["listener_generation"].is_null());
     assert_eq!(
         gateway.accept().unwrap_err().kind(),
         io::ErrorKind::WouldBlock
