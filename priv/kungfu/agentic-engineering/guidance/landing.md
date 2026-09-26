@@ -1,7 +1,7 @@
 # Landing on a shared branch
 
-Land reviewed work promptly through the route the repository and your work
-agreement authorize for its target; ready work left waiting goes stale. Where
+Land through the route the repository and your work
+agreement authorize for its target. Where
 the target takes changes through pull requests, the repository merges each one
 once its required checks pass. Where it also has a merge queue, the queue tests
 each change with what is ahead of it on the tip about to exist and merges in
@@ -48,8 +48,7 @@ conflict or a failure your change caused is yours to fix, and the fix goes back
 through review when it changes what was reviewed. A failure that was not your
 change's can be resubmitted once you have looked. A failure that keeps
 recurring is a defect in the branch: name it to your delivery owner so it gets
-an owner. Watch for churn: work being redone without getting closer to
-landing. When you see it, change the approach instead of repeating it.
+an owner.
 
 When the fallback fires, subscribe again before rereading the pull request, so
 settlement cannot race through the gap between the read and the next
