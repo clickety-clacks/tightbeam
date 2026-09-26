@@ -218,7 +218,7 @@ defmodule Tightbeam.Firehose.SessionRegistryA6Test do
     sync_hub()
     refute_receive {:firehose_notice, _notice}, 50
 
-    :ok = Ledger.finish(ctx.db, first, "delivered", nil)
+    :ok = Ledger.finish(ctx.db, first, "delivered", nil, owner_lease: first_turn.owner_lease)
     sync_hub()
     refute_receive {:firehose_notice, _notice}, 50
 
@@ -227,7 +227,7 @@ defmodule Tightbeam.Firehose.SessionRegistryA6Test do
     sync_hub()
     refute_receive {:firehose_notice, _notice}, 50
 
-    :ok = Ledger.finish(ctx.db, second, "delivered", nil)
+    :ok = Ledger.finish(ctx.db, second, "delivered", nil, owner_lease: second_turn.owner_lease)
     idle = receive_notice()["payload"]
     assert idle["mechanicalStatus"] == "idle"
     assert idle["rowVersion"] > running["rowVersion"]

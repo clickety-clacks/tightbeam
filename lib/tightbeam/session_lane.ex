@@ -18,6 +18,7 @@ defmodule Tightbeam.SessionLane do
 
   use GenServer
   require Logger
+  alias Tightbeam.StaleTurnSettlement
   alias Tightbeam.{DB, EventLog, Harness, HarnessHealth, HarnessProcess, Ledger, Placement}
 
   defstruct [
@@ -31,7 +32,10 @@ defmodule Tightbeam.SessionLane do
     task_ref: nil,
     task_pid: nil,
     current_seq: nil,
-    current_message_id: nil
+    current_message_id: nil,
+    current_owner_lease: nil,
+    reservation_token: nil,
+    deferred_drain: false
   ]
 
   @doc """
@@ -137,6 +141,17 @@ defmodule Tightbeam.SessionLane do
     end
   end
 
+  @doc "Settle one exact stale turn while this lane holds mailbox serialization."
+  @spec settle_stale(pid(), reference() | nil, StaleTurnSettlement.request()) ::
+          {:ok, map()} | {:error, map()}
+  def settle_stale(lane_pid, reservation_token, operator_request) when is_pid(lane_pid) do
+    GenServer.call(
+      lane_pid,
+      {:settle_stale, reservation_token, operator_request},
+      :infinity
+    )
+  end
+
   ## Server
 
   @impl true
@@ -155,8 +170,9 @@ defmodule Tightbeam.SessionLane do
       lane_owner: "lane:#{inspect(self())}:#{System.unique_integer([:positive])}"
     }
 
-    send(self(), :nudge)
-    {:ok, state}
+    token = Keyword.get(opts, :settlement_reservation)
+    if is_nil(token), do: send(self(), :nudge)
+    {:ok, %{state | reservation_token: token}}
   end
 
   @impl true
@@ -168,7 +184,9 @@ defmodule Tightbeam.SessionLane do
       DB.transaction_then(
         state.db,
         fn txn ->
-          if Ledger.finish_in_txn(txn, state.current_seq, "canceled") do
+          if Ledger.finish_in_txn(txn, state.current_seq, "canceled", nil,
+               owner_lease: state.current_owner_lease
+             ) do
             {true,
              HarnessHealth.settle_other_route_in_txn(
                txn,
@@ -198,6 +216,10 @@ defmodule Tightbeam.SessionLane do
         {:reply, :not_running, state}
     end
   end
+
+  def handle_call(:reap_abandoned, _from, %{reservation_token: token} = state)
+      when not is_nil(token),
+      do: {:reply, :active, state}
 
   def handle_call(:reap_abandoned, _from, %{task_ref: ref} = state) when not is_nil(ref),
     do: {:reply, :active, state}
@@ -295,10 +317,59 @@ defmodule Tightbeam.SessionLane do
 
   def handle_call({:at_turn_boundary, fun}, _from, state), do: {:reply, {:ok, fun.()}, state}
 
+  def handle_call(
+        {:settle_stale, reservation_token, _request},
+        _from,
+        %{reservation_token: expected} = state
+      )
+      when not is_nil(expected) and reservation_token != expected do
+    {:reply, ambiguous(), state}
+  end
+
+  def handle_call(
+        {:settle_stale, reservation_token, _request},
+        _from,
+        %{reservation_token: nil} = state
+      )
+      when not is_nil(reservation_token) do
+    {:reply, ambiguous(), state}
+  end
+
+  def handle_call(
+        {:settle_stale, reservation_token, %{turn_seq: turn_seq}},
+        _from,
+        %{task_ref: ref, current_seq: turn_seq} = state
+      )
+      when not is_nil(ref) do
+    state = release_reservation(state, reservation_token)
+    {:reply, {:error, %{code: "turn_live", message: "the session lane is running a turn"}}, state}
+  end
+
+  def handle_call({:settle_stale, reservation_token, _request}, _from, %{task_ref: ref} = state)
+      when not is_nil(ref) do
+    state = state |> release_reservation(reservation_token) |> maybe_start()
+    {:reply, ambiguous(), state}
+  end
+
+  def handle_call({:settle_stale, reservation_token, request}, _from, state) do
+    reserved? = not is_nil(reservation_token)
+    result = StaleTurnSettlement.settle(state.db, request)
+    state = publish_settlement(state, result)
+    state = release_reservation(state, reservation_token)
+    state = if reserved? or match?({:ok, _result}, result), do: maybe_start(state), else: state
+    {:reply, public_settlement_result(result), state}
+  end
+
   @impl true
+  def handle_cast(:nudge, %{reservation_token: token} = state) when not is_nil(token),
+    do: {:noreply, %{state | deferred_drain: true}}
+
   def handle_cast(:nudge, state), do: {:noreply, maybe_start(state)}
 
   @impl true
+  def handle_info(:nudge, %{reservation_token: token} = state) when not is_nil(token),
+    do: {:noreply, %{state | deferred_drain: true}}
+
   def handle_info(:nudge, state), do: {:noreply, maybe_start(state)}
 
   # TurnTask finished normally.
@@ -348,6 +419,8 @@ defmodule Tightbeam.SessionLane do
     {:error, %{reason: :task_crash, record_in_txn: record, after_commit: committed}}
   end
 
+  defp maybe_start(%{reservation_token: token} = state) when not is_nil(token), do: state
+
   defp maybe_start(%{task_ref: ref} = state) when not is_nil(ref), do: state
 
   defp maybe_start(state) do
@@ -396,6 +469,7 @@ defmodule Tightbeam.SessionLane do
         |> Map.put(:task_pid, task.pid)
         |> Map.put(:current_seq, turn.seq)
         |> Map.put(:current_message_id, turn.message_id)
+        |> Map.put(:current_owner_lease, turn.owner_lease)
 
       :busy ->
         state
@@ -438,6 +512,20 @@ defmodule Tightbeam.SessionLane do
         {:ok, _} ->
           {"delivered", nil, nil, nil, nil}
 
+        {:error,
+         %{
+           terminal: "failed_unknown",
+           reason: reason,
+           terminal_publish: fun,
+           record_in_txn: action
+         }}
+        when is_function(fun, 1) and is_function(action, 1) ->
+          after_commit = fn recorded ->
+            if is_function(recorded, 0), do: recorded.()
+          end
+
+          {"failed_unknown", error_text(reason), fun, action, after_commit}
+
         {:error, %{reason: reason, terminal_publish: fun, record_in_txn: action}}
         when is_function(fun, 1) and is_function(action, 1) ->
           after_commit = fn recorded ->
@@ -461,7 +549,9 @@ defmodule Tightbeam.SessionLane do
       DB.transaction_then(
         state.db,
         fn txn ->
-          if Ledger.finish_in_txn(txn, seq, terminal, error) do
+          if Ledger.finish_in_txn(txn, seq, terminal, error,
+               owner_lease: state.current_owner_lease
+             ) do
             recorded = if is_function(in_txn, 1), do: in_txn.(txn), else: nil
 
             route_publication =
@@ -499,7 +589,9 @@ defmodule Tightbeam.SessionLane do
           DB.transaction_then(
             state.db,
             fn txn ->
-              if Ledger.finish_in_txn(txn, seq, terminal, error) do
+              if Ledger.finish_in_txn(txn, seq, terminal, error,
+                   owner_lease: state.current_owner_lease
+                 ) do
                 route_publication =
                   HarnessHealth.settle_other_route_in_txn(
                     txn,
@@ -570,6 +662,37 @@ defmodule Tightbeam.SessionLane do
   # row is marked published. The publisher hook is injected by the composition
   # root; in E1 the ledger's publishedAt marking is the observable seam.
   defp publish_terminal(state, seq), do: Ledger.mark_published(state.db, seq)
+
+  defp publish_settlement(state, {:ok, %{won: true} = result}) do
+    state.terminal_publisher.(%{
+      session_key: state.session_key,
+      message_id: result.message_id,
+      status: result.status,
+      error: result.stored_error
+    })
+
+    publish_terminal(state, result.turn_seq)
+    state.on_terminal.(state.session_key, result.turn_seq)
+    state
+  end
+
+  defp publish_settlement(state, _result), do: state
+
+  defp release_reservation(%{reservation_token: nil} = state, nil), do: state
+
+  defp release_reservation(%{reservation_token: token} = state, token)
+       when not is_nil(token),
+       do: %{state | reservation_token: nil, deferred_drain: false}
+
+  defp release_reservation(state, _token), do: state
+
+  defp public_settlement_result({:ok, result}),
+    do: {:ok, Map.drop(result, [:message_id, :stored_error])}
+
+  defp public_settlement_result(result), do: result
+
+  defp ambiguous,
+    do: {:error, %{code: "turn_status_ambiguous", message: "turn liveness is ambiguous"}}
 
   defp error_text(reason) when is_binary(reason), do: reason
   defp error_text(%{code: code} = reason) when is_binary(code), do: JSON.encode!(reason)

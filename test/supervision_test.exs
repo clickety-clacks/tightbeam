@@ -1353,7 +1353,9 @@ defmodule Tightbeam.SupervisionTest do
     [wake] = Wakes.list_pending(ctx.db)
     assert :appended = admit_supervision_wake!(ctx.db, wake)
     assert {:ok, turn} = Ledger.claim_next(ctx.db, "holder", "unknown-consumer")
-    assert :ok = Ledger.finish(ctx.db, turn.seq, "failed_unknown")
+
+    assert :ok =
+             Ledger.finish(ctx.db, turn.seq, "failed_unknown", nil, owner_lease: turn.owner_lease)
 
     alias Tightbeam.Firehose.Hub
     hub = start_supervised!({Hub, name: Hub})
@@ -1590,7 +1592,7 @@ defmodule Tightbeam.SupervisionTest do
     assert Wakes.get(ctx.db, charged.wake_id).state == "pending"
     assert :appended = admit_supervision_wake!(ctx.db, charged)
     assert {:ok, turn} = Ledger.claim_next(ctx.db, "holder", "receipt-after-controller")
-    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
+    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
 
     sweep_liveness!(name)
 
@@ -4324,8 +4326,10 @@ defmodule Tightbeam.SupervisionTest do
         prompt: "external"
       })
 
-    assert {:ok, %{seq: ^seq}} = Ledger.claim_next(db, session_key, "test")
-    assert :ok = Ledger.finish(db, seq, "delivered")
+    assert {:ok, %{seq: ^seq, owner_lease: seq_lease}} =
+             Ledger.claim_next(db, session_key, "test")
+
+    assert :ok = Ledger.finish(db, seq, "delivered", nil, owner_lease: seq_lease)
     seq
   end
 
@@ -4342,7 +4346,8 @@ defmodule Tightbeam.SupervisionTest do
                job_ref: "wi_checkpoint"
              })
 
-    assert {:ok, %{seq: ^seq}} = Ledger.claim_next(ctx.db, "holder", "checkpoint-writer")
+    assert {:ok, %{seq: ^seq, owner_lease: seq_lease}} =
+             Ledger.claim_next(ctx.db, "holder", "checkpoint-writer")
 
     assert %{wake_id: wake_id, state: "pending"} =
              ctx.handlers["wake"].(%{
@@ -4367,7 +4372,7 @@ defmodule Tightbeam.SupervisionTest do
                [wake_id]
              )
 
-    assert :ok = Ledger.finish(ctx.db, seq, "delivered")
+    assert :ok = Ledger.finish(ctx.db, seq, "delivered", nil, owner_lease: seq_lease)
     {wake, seq}
   end
 
@@ -4660,8 +4665,10 @@ defmodule Tightbeam.SupervisionTest do
           if consume do
             consume.(wake.session_key)
           else
-            assert {:ok, %{seq: seq}} = Ledger.claim_next(db, wake.session_key, "test-controller")
-            assert :ok = Ledger.finish(db, seq, "delivered")
+            assert {:ok, %{seq: seq, owner_lease: seq_lease}} =
+                     Ledger.claim_next(db, wake.session_key, "test-controller")
+
+            assert :ok = Ledger.finish(db, seq, "delivered", nil, owner_lease: seq_lease)
           end
 
         {:ok, []} ->

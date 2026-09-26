@@ -148,7 +148,10 @@ defmodule GuardRemoteUrl do
           assert_receive {:prompt_started, ^adapter}, 60_000
           send(adapter, :continue_prompt)
           assert {:ok, %{terminal_publish: publish}} = Task.await(task)
-          assert :ok = Ledger.finish(db, turn.seq, "delivered")
+
+          assert :ok =
+                   Ledger.finish(db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+
           publish.("delivered")
         after
           Task.shutdown(task, :brutal_kill)

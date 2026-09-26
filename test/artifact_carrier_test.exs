@@ -167,8 +167,8 @@ defmodule Tightbeam.ArtifactCarrierTest do
 
   test "an unobserved record with no running turn is none, with a null edge", ctx do
     seq = enqueue_turn(ctx)
-    {:ok, _turn} = Ledger.claim_next(ctx.db, ctx.coder.session_key, "owner")
-    :ok = Ledger.finish(ctx.db, seq, "delivered")
+    {:ok, turn} = Ledger.claim_next(ctx.db, ctx.coder.session_key, "owner")
+    :ok = Ledger.finish(ctx.db, seq, "delivered", nil, owner_lease: turn.owner_lease)
 
     result = record_over_wire(ctx, %{"kind" => "doc", "title" => "Operator shell"})
 
@@ -184,7 +184,9 @@ defmodule Tightbeam.ArtifactCarrierTest do
     observed_message = start_turn(ctx)
     assert observe_over_wire(ctx) == 200
 
-    :ok = Ledger.finish(ctx.db, running_seq(ctx), "delivered")
+    :ok =
+      Ledger.finish(ctx.db, running_seq(ctx), "delivered", nil, owner_lease: claimed_lease(ctx))
+
     next_message = start_turn(ctx)
     refute next_message == observed_message
 
@@ -200,7 +202,8 @@ defmodule Tightbeam.ArtifactCarrierTest do
 
     # Cancel terminalizes BEFORE the serving task dies (session_lane.ex), which is
     # what used to make a legitimate mid-work record bind nothing.
-    :ok = Ledger.finish(ctx.db, running_seq(ctx), "canceled")
+    :ok =
+      Ledger.finish(ctx.db, running_seq(ctx), "canceled", nil, owner_lease: claimed_lease(ctx))
 
     result = record_over_wire(ctx, %{"kind" => "report", "title" => "Mid-work"})
 
@@ -212,7 +215,9 @@ defmodule Tightbeam.ArtifactCarrierTest do
 
   test "caller-supplied provenance never reaches the row", ctx do
     forged = start_turn(ctx)
-    :ok = Ledger.finish(ctx.db, running_seq(ctx), "delivered")
+
+    :ok =
+      Ledger.finish(ctx.db, running_seq(ctx), "delivered", nil, owner_lease: claimed_lease(ctx))
 
     result =
       record_over_wire(ctx, %{
@@ -270,7 +275,9 @@ defmodule Tightbeam.ArtifactCarrierTest do
   test "a fresher observation supersedes the session's window", ctx do
     first = start_turn(ctx)
     assert observe_over_wire(ctx) == 200
-    :ok = Ledger.finish(ctx.db, running_seq(ctx), "delivered")
+
+    :ok =
+      Ledger.finish(ctx.db, running_seq(ctx), "delivered", nil, owner_lease: claimed_lease(ctx))
 
     second = start_turn(ctx)
     assert observe_over_wire(ctx) == 200
@@ -285,7 +292,9 @@ defmodule Tightbeam.ArtifactCarrierTest do
        ctx do
     _stale = start_turn(ctx)
     assert observe_over_wire(ctx) == 200
-    :ok = Ledger.finish(ctx.db, running_seq(ctx), "delivered")
+
+    :ok =
+      Ledger.finish(ctx.db, running_seq(ctx), "delivered", nil, owner_lease: claimed_lease(ctx))
 
     # A second hook fire with nothing running: the freshest look saw no turn, so
     # the stale message must not survive to be bound.
@@ -551,7 +560,14 @@ defmodule Tightbeam.ArtifactCarrierTest do
   defp start_turn(ctx) do
     _seq = enqueue_turn(ctx)
     {:ok, turn} = Ledger.claim_next(ctx.db, ctx.coder.session_key, "owner")
+    Process.put({:claimed_lease, ctx.db, turn.seq}, turn.owner_lease)
     turn.message_id
+  end
+
+  defp claimed_lease(ctx) do
+    lease = Process.get({:claimed_lease, ctx.db, running_seq(ctx)})
+    assert is_binary(lease)
+    lease
   end
 
   defp running_seq(ctx) do

@@ -322,7 +322,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     _ = observed_classes()
 
     :ok =
-      Ledger.finish(db, wake_turn.seq, "delivered", nil)
+      Ledger.finish(db, wake_turn.seq, "delivered", nil, owner_lease: wake_turn.owner_lease)
 
     _ = observed_classes()
 
@@ -351,7 +351,9 @@ defmodule Tightbeam.Firehose.PublisherTest do
     _ = observed_classes()
 
     :ok =
-      Ledger.finish(db, condition_turn.seq, "delivered", nil)
+      Ledger.finish(db, condition_turn.seq, "delivered", nil,
+        owner_lease: condition_turn.owner_lease
+      )
 
     _ = observed_classes()
 
@@ -925,7 +927,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
              "payload" => %{"mechanicalStatus" => "running", "sessionKey" => "turn-target"}
            } = receive_notice()
 
-    assert {:ok, %{seq: ^seq}} =
+    assert {:ok, %{seq: ^seq, owner_lease: seq_lease}} =
              Ledger.claim_next(db, "turn-target", "lane:test")
 
     assert %{
@@ -934,7 +936,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
              "payload" => %{"status" => "running", "seq" => ^seq}
            } = receive_notice()
 
-    assert :ok = Ledger.finish(db, seq, "delivered")
+    assert :ok = Ledger.finish(db, seq, "delivered", nil, owner_lease: seq_lease)
 
     assert %{
              "class" => "turn.ended",

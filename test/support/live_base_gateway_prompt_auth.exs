@@ -148,7 +148,10 @@ defmodule GuardPromptAuth do
     # error_text would produce one.
     assert {:ok, true} =
              DB.transaction(db, fn txn ->
-               assert Ledger.finish_in_txn(txn, turn.seq, "failed", "prompt auth 401")
+               assert Ledger.finish_in_txn(txn, turn.seq, "failed", "prompt auth 401",
+                        owner_lease: turn.owner_lease
+                      )
+
                record.(txn)
                true
              end)

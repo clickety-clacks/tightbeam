@@ -100,7 +100,7 @@ defmodule GuardReattach do
         assert {:ok, %{terminal_publish: publish}} =
                  runner.(Map.put(turn, :session_key, "k1"))
 
-        assert :ok = Ledger.finish(db, turn.seq, "delivered")
+        assert :ok = Ledger.finish(db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
         publish.("delivered")
         assert_receive {:load_apply_residency, "load-apply-session"}
 

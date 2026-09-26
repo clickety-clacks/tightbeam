@@ -2251,6 +2251,70 @@ defmodule Tightbeam.AdapterCoordinatorTest do
 
   ## Task #14 — the guard covers the ACTION, not the RECORD
 
+  test "checkout before DOWN allocates one fresh successor generation", ctx do
+    key = {:claude, "shared", "testhost"}
+
+    coordinator =
+      start_fake_coordinator(ctx, :"before_down_#{System.unique_integer([:positive])}")
+
+    assert {:ok, predecessor, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+    await_ready!(coordinator, key)
+    old_entry = :sys.get_state(coordinator).adapters[key]
+
+    :ok = :sys.suspend(coordinator)
+
+    on_exit(fn ->
+      if Process.alive?(coordinator), do: :sys.resume(coordinator)
+    end)
+
+    caller = Task.async(fn -> AdapterCoordinator.adapter_for(coordinator, key) end)
+
+    assert eventually(fn ->
+             {:messages, messages} = Process.info(coordinator, :messages)
+
+             Enum.any?(messages, fn
+               {:"$gen_call", _, {:adapter_for, ^key}} -> true
+               _ -> false
+             end)
+           end)
+
+    monitor = Process.monitor(predecessor)
+    Process.exit(predecessor, :kill)
+    assert_receive {:DOWN, ^monitor, :process, ^predecessor, :killed}
+    :ok = :sys.resume(coordinator)
+
+    assert {:ok, successor, 2} = Task.await(caller, 5_000)
+    refute successor == predecessor
+    await_ready!(coordinator, key)
+    state = :sys.get_state(coordinator)
+    assert %{pid: ^successor, generation: 2, timer: nil, failures: 0} = state.adapters[key]
+    refute Map.has_key?(state.monitors, old_entry.monitor)
+
+    assert Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
+             event.kind == "adapter_down" and event.detail =~ "absorbed=true"
+           end)
+
+    owner = self()
+    caller_owner = spawn(fn -> receive do: (:stop -> :ok) end)
+
+    scope = %{
+      lane_pid: owner,
+      gateway_pid: caller_owner,
+      callback: fn _, _, _ -> send(owner, :stale_probe_entered) end
+    }
+
+    on_exit(fn -> send(caller_owner, :stop) end)
+
+    assert {:error, :generation_unavailable} =
+             AdapterCoordinator.with_generation_fence(coordinator, key, 1, scope)
+
+    refute_receive :stale_probe_entered
+    scope = %{scope | callback: fn pid, generation, valid? -> {pid, generation, valid?.()} end}
+
+    assert {:ok, {^successor, 2, true}} =
+             AdapterCoordinator.with_generation_fence(coordinator, key, 2, scope)
+  end
+
   test "a death absorbed by a replacement is recorded and told, but restarts nothing", ctx do
     key = {:claude, "shared", "testhost"}
     coordinator = start_fake_coordinator(ctx, :"absorbed_#{System.unique_integer([:positive])}")

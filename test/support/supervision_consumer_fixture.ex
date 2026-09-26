@@ -199,7 +199,9 @@ defmodule Tightbeam.SupervisionConsumerFixture do
     assert {:ok, source} = Ledger.claim_next(ctx.db, "holder", "interrupted-notice")
 
     assert :ok =
-             Ledger.finish(ctx.db, source.seq, "failed_unknown", "interrupted: outcome unknown")
+             Ledger.finish(ctx.db, source.seq, "failed_unknown", "interrupted: outcome unknown",
+               owner_lease: source.owner_lease
+             )
 
     assert {:ok, [[initial_json]]} =
              DB.query(ctx.db, "SELECT reminderState FROM assignments WHERE id='asg_1'")
@@ -480,7 +482,7 @@ defmodule Tightbeam.SupervisionConsumerFixture do
     assert [%{assignment_id: "asg_1"} = charged] = Wakes.list_pending(ctx.db)
     assert :appended = admit_supervision_wake!(ctx.db, charged)
     assert {:ok, turn} = Ledger.claim_next(ctx.db, "holder", "composed-controller")
-    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
+    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
     sweep_liveness!(first)
 
     assert {:ok, [["settled"]]} =
@@ -1132,8 +1134,10 @@ defmodule Tightbeam.SupervisionConsumerFixture do
         prompt: "external"
       })
 
-    assert {:ok, %{seq: ^seq}} = Ledger.claim_next(db, session_key, "test")
-    assert :ok = Ledger.finish(db, seq, "delivered")
+    assert {:ok, %{seq: ^seq, owner_lease: seq_lease}} =
+             Ledger.claim_next(db, session_key, "test")
+
+    assert :ok = Ledger.finish(db, seq, "delivered", nil, owner_lease: seq_lease)
     seq
   end
 
@@ -1150,7 +1154,8 @@ defmodule Tightbeam.SupervisionConsumerFixture do
                job_ref: "wi_checkpoint"
              })
 
-    assert {:ok, %{seq: ^seq}} = Ledger.claim_next(ctx.db, "holder", "checkpoint-writer")
+    assert {:ok, %{seq: ^seq, owner_lease: seq_lease}} =
+             Ledger.claim_next(ctx.db, "holder", "checkpoint-writer")
 
     assert %{wake_id: wake_id, state: "pending"} =
              ctx.handlers["wake"].(%{
@@ -1175,7 +1180,7 @@ defmodule Tightbeam.SupervisionConsumerFixture do
                [wake_id]
              )
 
-    assert :ok = Ledger.finish(ctx.db, seq, "delivered")
+    assert :ok = Ledger.finish(ctx.db, seq, "delivered", nil, owner_lease: seq_lease)
     {wake, seq}
   end
 
@@ -1468,8 +1473,10 @@ defmodule Tightbeam.SupervisionConsumerFixture do
           if consume do
             consume.(wake.session_key)
           else
-            assert {:ok, %{seq: seq}} = Ledger.claim_next(db, wake.session_key, "test-controller")
-            assert :ok = Ledger.finish(db, seq, "delivered")
+            assert {:ok, %{seq: seq, owner_lease: seq_lease}} =
+                     Ledger.claim_next(db, wake.session_key, "test-controller")
+
+            assert :ok = Ledger.finish(db, seq, "delivered", nil, owner_lease: seq_lease)
           end
 
         {:ok, []} ->

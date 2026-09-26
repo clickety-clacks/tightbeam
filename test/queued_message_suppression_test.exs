@@ -96,7 +96,8 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
         prompt: "originating turn"
       })
 
-    assert {:ok, %{seq: ^running_turn}} = Ledger.claim_next(db, "k1", "lane")
+    assert {:ok, %{seq: ^running_turn, owner_lease: running_turn_lease}} =
+             Ledger.claim_next(db, "k1", "lane")
 
     assert {:ok, continuation_wake} =
              DB.transaction(db, fn txn ->
@@ -113,7 +114,9 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
              end)
 
     assert continuation_wake.wait_mode == "after-turn"
-    assert :ok = Ledger.finish(db, running_turn, "delivered")
+
+    assert :ok =
+             Ledger.finish(db, running_turn, "delivered", nil, owner_lease: running_turn_lease)
 
     assert {:ok, true} =
              DB.transaction(db, &Wakes.covering_continuation_in_txn?(&1, "asg_continuation"))
@@ -183,8 +186,11 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
       })
 
     assert {:ok, []} = DB.query(db, "SELECT 1 FROM queued_message_scopes", [])
-    assert {:ok, %{seq: ^report_seq}} = Ledger.claim_next(db, "k1", "lane")
-    assert :ok = Ledger.finish(db, report_seq, "delivered")
+
+    assert {:ok, %{seq: ^report_seq, owner_lease: report_seq_lease}} =
+             Ledger.claim_next(db, "k1", "lane")
+
+    assert :ok = Ledger.finish(db, report_seq, "delivered", nil, owner_lease: report_seq_lease)
     assert {:ok, %{seq: ^failure_seq}} = Ledger.claim_next(db, "k1", "lane")
   end
 

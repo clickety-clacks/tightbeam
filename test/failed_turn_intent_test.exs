@@ -240,7 +240,10 @@ defmodule Tightbeam.FailedTurnIntentTest do
 
     {:ok, notice} = Ledger.claim_next(ctx.db, ctx.parent.session_key, "notice-test")
 
-    assert :ok = Ledger.finish(ctx.db, notice.seq, "failed", "parent could not run")
+    assert :ok =
+             Ledger.finish(ctx.db, notice.seq, "failed", "parent could not run",
+               owner_lease: notice.owner_lease
+             )
 
     assert :ok = Supervision.classify_terminal(ctx.db, notice.seq)
     assert :ok = Tightbeam.Productions.Bubble.recognize_terminal(ctx.db, notice.seq)
@@ -342,9 +345,9 @@ defmodule Tightbeam.FailedTurnIntentTest do
         request_ref: request_ref
       })
 
-    {:ok, _turn} = Ledger.claim_next(db, session_key, "intent-test")
+    {:ok, turn} = Ledger.claim_next(db, session_key, "intent-test")
 
-    assert :ok = Ledger.finish(db, seq, status, error)
+    assert :ok = Ledger.finish(db, seq, status, error, owner_lease: turn.owner_lease)
 
     {:ok, _} = DB.query(db, "UPDATE turns SET endedAt=10 WHERE seq=?1", [seq])
     seq

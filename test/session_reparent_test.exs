@@ -278,7 +278,7 @@ defmodule Tightbeam.SessionReparentTest do
     assert is_binary(result["eventId"])
     assert snapshot(ctx.db) == before
     assert Supervision.ladder_target(ctx.db, "child", 1) == ctx.parent
-    assert :ok = Ledger.finish(ctx.db, seq, "delivered")
+    assert :ok = Ledger.finish(ctx.db, seq, "delivered", nil, owner_lease: turn.owner_lease)
 
     assert rows(ctx.db, "SELECT sessionKey,status FROM turns WHERE seq=#{seq}") == [
              ["child", "delivered"]

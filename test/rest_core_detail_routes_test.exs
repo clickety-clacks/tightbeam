@@ -480,7 +480,10 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     {:ok, queued_turn} =
       Ledger.claim_next(ctx.db, ctx.admin_session.session_key, "raw-a6-fixture-drain")
 
-    :ok = Ledger.finish(ctx.db, queued_turn.seq, "delivered", nil)
+    :ok =
+      Ledger.finish(ctx.db, queued_turn.seq, "delivered", nil,
+        owner_lease: queued_turn.owner_lease
+      )
 
     {port, ws} = start_change_server(ctx)
     {frames, ws} = committed_core_frames(ctx, port, ws)
@@ -1347,7 +1350,11 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
                Ledger.claim_next(ctx.db, ctx.admin_session.session_key, "projection")
 
       assert earlier.seq == ctx.turn_seq
-      assert :ok = Ledger.finish(ctx.db, earlier.seq, "delivered")
+
+      assert :ok =
+               Ledger.finish(ctx.db, earlier.seq, "delivered", nil,
+                 owner_lease: earlier.owner_lease
+               )
 
       assert {:ok, {:appended, _, _, _}} =
                DB.transaction(ctx.db, fn txn ->
@@ -1368,7 +1375,9 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       assert JSON.decode!(get(ctx, path).resp_body)["item"]["deliveryStatus"] == "running"
 
       assert :ok =
-               Ledger.finish(ctx.db, carrier.seq, @carrier_terminal, "private terminal detail")
+               Ledger.finish(ctx.db, carrier.seq, @carrier_terminal, "private terminal detail",
+                 owner_lease: carrier.owner_lease
+               )
 
       terminal_response = get(ctx, path)
       assert terminal_response.status == 200

@@ -20,7 +20,7 @@ defmodule Tightbeam.GatewayTest do
       expected ++
         ~w(harness-health-observe-other harness-health-resolve-other harness-health-review-other harness-health-close-promotion harness-health-evidence-other)
 
-    expected = expected ++ ~w(clear-stranded)
+    expected = expected ++ ~w(clear-stranded settle-turn)
     assert Enum.sort(Map.keys(handlers)) == Enum.sort(expected)
     assert Enum.sort(Map.keys(effects)) == Enum.sort(expected)
     assert Enum.all?(Map.values(handlers), &is_function(&1, 1))
@@ -38,6 +38,7 @@ defmodule Tightbeam.GatewayTest do
            ]
 
     assert effects["cancel"] == ["turn.ended", "session.updated"]
+    assert effects["settle-turn"] == ["turn.ended", "session.updated"]
     classes = Tightbeam.Gateway.emitted_state_classes(effects)
     assert classes == Enum.sort(Enum.uniq(classes))
 
@@ -1117,9 +1118,12 @@ defmodule Tightbeam.GatewayTest do
         assignment_id: "asg_runner_repair"
       })
 
-    {:ok, _turn} = Ledger.claim_next(ctx.db, "k1", "test-lane")
+    {:ok, claimed_turn} = Ledger.claim_next(ctx.db, "k1", "test-lane")
 
-    :ok = Ledger.finish(ctx.db, source_seq, "failed_unknown", "interrupted: outcome unknown")
+    :ok =
+      Ledger.finish(ctx.db, source_seq, "failed_unknown", "interrupted: outcome unknown",
+        owner_lease: claimed_turn.owner_lease
+      )
 
     assert {:opened, incident} =
              HarnessHealth.observe(ctx.db, %{
@@ -1512,9 +1516,12 @@ defmodule Tightbeam.GatewayTest do
         assignment_id: assignment_id
       })
 
-    {:ok, _turn} = Ledger.claim_next(ctx.db, "k1", "repair-fixture")
+    {:ok, claimed_turn} = Ledger.claim_next(ctx.db, "k1", "repair-fixture")
 
-    :ok = Ledger.finish(ctx.db, source_seq, "failed", failure_class)
+    :ok =
+      Ledger.finish(ctx.db, source_seq, "failed", failure_class,
+        owner_lease: claimed_turn.owner_lease
+      )
 
     assert {:opened, incident} =
              HarnessHealth.observe(ctx.db, %{
@@ -1750,9 +1757,12 @@ defmodule Tightbeam.GatewayTest do
         assignment_id: assignment_id
       })
 
-    {:ok, _turn} = Ledger.claim_next(ctx.db, "k1", "rate-reconcile-race")
+    {:ok, claimed_turn} = Ledger.claim_next(ctx.db, "k1", "rate-reconcile-race")
 
-    :ok = Ledger.finish(ctx.db, source_seq, "failed", "rate-limit-dead")
+    :ok =
+      Ledger.finish(ctx.db, source_seq, "failed", "rate-limit-dead",
+        owner_lease: claimed_turn.owner_lease
+      )
 
     Tightbeam.HarnessProcess.prepare_launch(
       [
