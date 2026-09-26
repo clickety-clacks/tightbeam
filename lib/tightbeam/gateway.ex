@@ -340,6 +340,8 @@ defmodule Tightbeam.Gateway do
         # so the window's writer must own the ordering before the first
         # observation can arrive.
         {Tightbeam.TurnObservations, name: Tightbeam.TurnObservations},
+        # R8: retain listener evidence across Wakes and Bandit restarts.
+        {Tightbeam.ListenerLifecycle, []},
         {Tightbeam.Wakes,
          db: db,
          deliver: deliver,
@@ -383,7 +385,10 @@ defmodule Tightbeam.Gateway do
          name: Tightbeam.LaneManager},
         {Tightbeam.SentinelSupervisor,
          db: db, base_dir: config.base_dir, cli_bin: Path.join(cli_bin, "tightbeam")},
-        {Bandit, plug: {Tightbeam.Wire.Router, router_deps}, port: config.port}
+        Tightbeam.ListenerLifecycle.listener_spec(
+          plug: {Tightbeam.Wire.Router, router_deps},
+          port: config.port
+        )
       ]
   end
 

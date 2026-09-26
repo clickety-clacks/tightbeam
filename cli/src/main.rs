@@ -19,6 +19,7 @@ mod probe;
 mod process_tree;
 mod rail_action;
 mod session_connect;
+mod transport_receipt;
 mod users;
 
 fn main() {

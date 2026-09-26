@@ -1,7 +1,7 @@
 defmodule Tightbeam.Wire.RequestObservation do
   @moduledoc "One correlation and error boundary around the actual Plug request."
   alias Tightbeam.{DB, Diagnostics, RequestContext}
-  alias Tightbeam.Wire.OperationRegistry
+  alias Tightbeam.Wire.{OperationRegistry, ResponseObservationAdapter}
   import Plug.Conn
 
   @key {__MODULE__, :response}
@@ -13,8 +13,13 @@ defmodule Tightbeam.Wire.RequestObservation do
 
     RequestContext.bind(context, fn ->
       previous = Process.get(@key)
-      conn = conn |> put_resp_header("x-tightbeam-request-id", request_id)
-      Process.put(@key, %{conn: conn, state: "not_started", timeout: nil})
+
+      conn =
+        conn
+        |> put_resp_header("x-tightbeam-request-id", request_id)
+        |> ResponseObservationAdapter.wrap()
+
+      Process.put(@key, %{conn: conn, state: "not_started", timeout: nil, status: nil})
       conn = register_before_send(conn, &started/1)
 
       try do
@@ -44,20 +49,44 @@ defmodule Tightbeam.Wire.RequestObservation do
           end
 
         observation = Process.get(@key)
-        # Before-send only proves an attempt. Completion requires the adapter's
-        # successful return; chunked/upgraded streams remain started here.
-        state = if returned.state in [:sent, :file], do: "complete", else: observation.state
-        terminal(%{observation | conn: returned, state: state}, nil)
-        returned
+        # Adapter return, not the return of the entire Plug stack, owns the
+        # completed transition. A later exception cannot undo a sent response.
+        terminal(%{observation | conn: returned}, nil)
+        ResponseObservationAdapter.unwrap(returned)
       catch
         kind, reason ->
-          terminal(Process.get(@key), nil)
+          terminal(Process.get(@key), transport_cause(reason))
           :erlang.raise(kind, reason, __STACKTRACE__)
       after
         if previous, do: Process.put(@key, previous), else: Process.delete(@key)
       end
     end)
   end
+
+  @doc false
+  def sending(status) do
+    case Process.get(@key) do
+      nil -> :ok
+      observation -> Process.put(@key, %{observation | state: "started", status: status})
+    end
+  end
+
+  @doc false
+  def sent(status) do
+    case Process.get(@key) do
+      nil -> :ok
+      observation -> Process.put(@key, %{observation | state: "complete", status: status})
+    end
+  end
+
+  defp transport_cause(%Plug.Conn.WrapperError{reason: reason}), do: transport_cause(reason)
+
+  defp transport_cause(%Bandit.TransportError{error: reason})
+       when reason in [:closed, :econnreset],
+       do: "connection_reset"
+
+  defp transport_cause(%Bandit.TransportError{}), do: "transport_failed"
+  defp transport_cause(_), do: nil
 
   # Called after Plug's real route match, before auth/dispatch. No concrete URL
   # or parameter is retained in a diagnostic operation label.
@@ -72,7 +101,7 @@ defmodule Tightbeam.Wire.RequestObservation do
 
   defp started(conn) do
     observation = Process.get(@key)
-    Process.put(@key, %{observation | conn: conn, state: "started"})
+    Process.put(@key, %{observation | conn: conn})
     conn
   end
 
@@ -128,18 +157,19 @@ defmodule Tightbeam.Wire.RequestObservation do
 
     Diagnostics.emit(%{
       event: "http_response_terminal",
+      listener_generation: observation.conn.private[:tightbeam_listener_generation],
       request_id: context.request_id,
       principal_kind: context.principal_kind,
       principal_ref: context.principal_ref,
       operation: operation,
       response_state: observation.state,
-      http_status: observation.conn.status,
+      http_status: if(observation.state == "complete", do: observation.status, else: nil),
       gateway_accepted: true,
       db_call_id: failure && failure.db_call_id,
       effect_kind: failure && failure.effect_kind,
       effect_state: failure && failure.effect_state,
       action: failure && action(failure),
-      cause: if(failure, do: "db_caller_timeout", else: cause),
+      cause: cause || if(failure, do: "db_caller_timeout", else: nil),
       timeout_source: if(failure, do: failure.timeout_source, else: "none"),
       budget_ms: failure && failure.budget_ms,
       elapsed_ms: failure && failure.elapsed_ms

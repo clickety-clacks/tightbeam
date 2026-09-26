@@ -106,7 +106,7 @@ defmodule Tightbeam.RequestContext do
     end
   end
 
-  def id(prefix) when prefix in ["req_", "int_", "dbc_"] do
+  def id(prefix) when prefix in ["req_", "int_", "dbc_", "lgen_"] do
     prefix <> (:crypto.strong_rand_bytes(16) |> Base.url_encode64(padding: false))
   end
 end

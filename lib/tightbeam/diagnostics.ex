@@ -38,7 +38,7 @@ defmodule Tightbeam.Diagnostics do
     operation effect_kind principal_kind principal_ref queue_ms execute_ms callback_ms
     callback_sql_ms callback_outside_sql_ms total_ms elapsed_ms timeout_source budget_ms
     sqlite_timeout_source sqlite_busy_budget_ms result_class cause response_state http_status
-    gateway_accepted effect_state action)a
+    gateway_accepted effect_state action listener_generation prior_listener_generation)a
 
   @empty_health %{
     write_failures: 0,
