@@ -6,16 +6,17 @@ settles them, and a branch's owner hears when a required check fails on the
 branch tip. When it is skipped, nothing is lost: authors learn the outcome
 through their own fallback check.
 
-Walk the person through these steps in order. Each needs someone who can
-sign in to GitHub and change the repository's settings; you cannot do those
-parts for them. After each step, run `tightbeam kungfu setup
-agentic-engineering` to see what is still missing. Setup is done when it lists
-nothing.
+Walk the user through these steps in order. Steps 1 and 4 need someone who
+can sign in to GitHub and change the repository's settings; you cannot do
+those for the user. After each step, run `tightbeam kungfu setup
+agentic-engineering`: it lists the watcher settings still missing and whether
+the watcher is enabled. It cannot see GitHub, so confirm steps 1 and 4 with the
+user.
 
-1. Sign `gh` in to the GitHub account your agents should act as, using a gh
-   configuration directory of its own, for example
+1. Have the user sign `gh` in to the GitHub account the agents act as, using a
+   gh configuration directory of its own, for example
    `GH_CONFIG_DIR=<dir> gh auth login`. That account needs to read the
-   repositories you will list and their pull requests and checks.
+   listed repositories and their pull requests and checks.
 
 2. Tell the watcher where that login lives:
 

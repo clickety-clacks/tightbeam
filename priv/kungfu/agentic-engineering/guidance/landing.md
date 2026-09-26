@@ -28,19 +28,19 @@ The pin is checked when GitHub accepts the request; it does not stop later
 pushes. If the request fails, deal with the failure and cancel the subscription
 you no longer need.
 
-`landing.settled` means the pull request stopped moving on its own: merged,
-removed from the queue, auto-merge disabled, blocked by a failed required
-check, or closed. The fallback means only that nothing arrived in time; it is a
-reason to read, not a finding. Either way, read the pull request and act on
-what is true now.
+The landing watcher, a service that reads GitHub and files landing facts, files
+`landing.settled` where one runs. It means the pull request stopped moving on
+its own: merged, removed from the queue, auto-merge disabled, blocked by a
+failed required check, or closed. The fallback means only that nothing arrived
+in time; it is a reason to read, not a finding. Either way, read the pull
+request and act on what is true now.
 
 Merged: compare the merged head with the commit that was reviewed. If they
 differ, take the difference to your delivery owner before completing. If they
-match, record the landing with the merge commit read from the pull request,
-then complete under the usual rules.
+match, record the landing, then complete under the usual rules with the merge
+commit read from the pull request as the delivered commit.
 
     tightbeam attest <assignment> --kind verdict --verdict landed \
-      --commit-refs '[{"repo":"<host>:<abs path>","commit":"<merge sha>"}]' \
       --note "<owner>/<repo> <branch> PR <n> reviewed <head sha> merged <merge sha>"
 
 Removed, disabled, blocked or closed: find out why before resubmitting. A
@@ -61,12 +61,11 @@ Arrival order is the default landing order. Move a change forward when priority
 calls for it, and hold changes when the branch needs to settle first. To hold a
 queued change, dequeue it; turning off auto-merge does not remove a change that
 is already queued. Read the pull request afterwards, and report a change that
-merged before the hold took effect. A red tip is yours to resolve; the landing
-watcher, where one runs, wakes the branch's delivery owner when a required
-check fails on the tip. Get the tip green before more work builds on it. A
-queue that stops moving shows up in your own reads, not as a signal. Commission
-an integrator when reconciling changes from different sources is a job in
-itself.
+merged before the hold took effect. A red tip is yours to resolve; where the
+landing watcher runs, it wakes the branch's owner role when a required check
+fails on the tip. Get the tip green before more work builds on it. A queue that
+stops moving shows up in your own reads, not as a signal. Commission an
+integrator when reconciling changes from different sources is a job in itself.
 
 Bypassing the branch rules is the user's decision, made for that occasion on the
 user's direct instruction.
