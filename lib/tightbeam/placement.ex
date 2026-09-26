@@ -1418,7 +1418,8 @@ defmodule Tightbeam.Placement do
           host_config: host_config,
           host_name: host,
           sh: sh,
-          cli_bin: config.cli_bin
+          cli_bin: config.cli_bin,
+          default_model: Map.get(config, :default_model)
         },
         Map.get(config, :harness_target_overrides, %{})
       )
@@ -1510,6 +1511,7 @@ defmodule Tightbeam.Placement do
         common_env: common_env,
         remote_env: remote_env,
         lineage: lineage,
+        model: Map.get(target, :default_model),
         rails: Rails.hook_settings(),
         statutes: Rails.statutes?(),
         ensure_workdir: &ensure_workdir/4,
