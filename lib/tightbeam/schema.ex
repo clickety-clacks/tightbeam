@@ -1475,9 +1475,14 @@ defmodule Tightbeam.Schema do
     [[shape]] = Txn.q(txn, "SELECT shape FROM schema_stamp")
 
     liveness_objects =
-      if shape in [@cannot_proceed_shape, @settlement_shape, @terminal_credential_shape, @agent_reparent_shape],
-        do: @cannot_proceed_liveness_objects,
-        else: @o2_liveness_objects
+      if shape in [
+           @cannot_proceed_shape,
+           @settlement_shape,
+           @terminal_credential_shape,
+           @agent_reparent_shape
+         ],
+         do: @cannot_proceed_liveness_objects,
+         else: @o2_liveness_objects
 
     present = Enum.filter(liveness_objects, &owned_object_present?(txn, &1))
     Enum.each(present, &validate_owned_object!(txn, &1))
@@ -2264,7 +2269,12 @@ defmodule Tightbeam.Schema do
   defp bootstrap_module(db, Tightbeam.Assignments, _current?) do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
       {:ok, [[shape]]}
-      when shape in [@cannot_proceed_shape, @settlement_shape, @terminal_credential_shape, @agent_reparent_shape] ->
+      when shape in [
+             @cannot_proceed_shape,
+             @settlement_shape,
+             @terminal_credential_shape,
+             @agent_reparent_shape
+           ] ->
         Tightbeam.Assignments.ensure_schema(db)
 
       {:ok, [[_predecessor]]} ->
@@ -2278,7 +2288,12 @@ defmodule Tightbeam.Schema do
   def upgrade_firehose_r1(db, opts \\ []) do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
       {:ok, [[shape]]}
-      when shape in [@cursor_provider_shape, @settlement_shape, @terminal_credential_shape, @agent_reparent_shape] ->
+      when shape in [
+             @cursor_provider_shape,
+             @settlement_shape,
+             @terminal_credential_shape,
+             @agent_reparent_shape
+           ] ->
         :ok
 
       {:ok, [[@legacy_cursor_provider_shape]]} ->
@@ -2529,7 +2544,12 @@ defmodule Tightbeam.Schema do
   defp upgrade_o2(db) do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
       {:ok, [[shape]]}
-      when shape in [@cursor_provider_shape, @settlement_shape, @terminal_credential_shape, @agent_reparent_shape] ->
+      when shape in [
+             @cursor_provider_shape,
+             @settlement_shape,
+             @terminal_credential_shape,
+             @agent_reparent_shape
+           ] ->
         :ok
 
       {:ok, [[@legacy_cursor_provider_shape]]} ->
@@ -3563,7 +3583,12 @@ defmodule Tightbeam.Schema do
   defp upgrade_pi_providers(db) do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
       {:ok, [[shape]]}
-      when shape in [@cursor_provider_shape, @settlement_shape, @terminal_credential_shape, @agent_reparent_shape] ->
+      when shape in [
+             @cursor_provider_shape,
+             @settlement_shape,
+             @terminal_credential_shape,
+             @agent_reparent_shape
+           ] ->
         :ok
 
       {:ok, [[@legacy_cursor_provider_shape]]} ->
@@ -3589,7 +3614,12 @@ defmodule Tightbeam.Schema do
   defp upgrade_addressed_po_consultation(db) do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
       {:ok, [[shape]]}
-      when shape in [@cursor_provider_shape, @settlement_shape, @terminal_credential_shape, @agent_reparent_shape] ->
+      when shape in [
+             @cursor_provider_shape,
+             @settlement_shape,
+             @terminal_credential_shape,
+             @agent_reparent_shape
+           ] ->
         :ok
 
       {:ok, [[@cannot_proceed_shape]]} ->
@@ -3687,7 +3717,12 @@ defmodule Tightbeam.Schema do
   defp upgrade_cannot_proceed(db) do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
       {:ok, [[shape]]}
-      when shape in [@cannot_proceed_shape, @settlement_shape, @terminal_credential_shape, @agent_reparent_shape] ->
+      when shape in [
+             @cannot_proceed_shape,
+             @settlement_shape,
+             @terminal_credential_shape,
+             @agent_reparent_shape
+           ] ->
         :ok
 
       {:ok, [[@cursor_provider_shape]]} ->
@@ -3948,7 +3983,8 @@ defmodule Tightbeam.Schema do
   defp upgrade_stale_turn_settlement(db) do
     case DB.transaction(db, fn txn ->
            case Txn.q(txn, "SELECT shape FROM schema_stamp") do
-             [[shape]] when shape in [@settlement_shape, @terminal_credential_shape, @agent_reparent_shape] ->
+             [[shape]]
+             when shape in [@settlement_shape, @terminal_credential_shape, @agent_reparent_shape] ->
                :ok
 
              [[@cannot_proceed_shape]] ->
