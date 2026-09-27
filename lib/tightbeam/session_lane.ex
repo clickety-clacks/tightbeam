@@ -66,6 +66,15 @@ defmodule Tightbeam.SessionLane do
     end
   end
 
+  @doc "Release only the task for a turn already terminalized by manager recovery."
+  @spec release_recovered(String.t(), integer()) :: :ok | :no_lane
+  def release_recovered(session_key, seq) do
+    case Registry.lookup(Tightbeam.LaneRegistry, session_key) do
+      [{pid, _}] -> GenServer.cast(pid, {:release_recovered, seq})
+      [] -> :no_lane
+    end
+  end
+
   @doc "Reap running turns left by a dead lane."
   @spec reap_abandoned(String.t()) :: {:ok, [integer()]} | :active | :no_lane
   def reap_abandoned(session_key) do
@@ -221,8 +230,18 @@ defmodule Tightbeam.SessionLane do
       when not is_nil(token),
       do: {:reply, :active, state}
 
-  def handle_call(:reap_abandoned, _from, %{task_ref: ref} = state) when not is_nil(ref),
-    do: {:reply, :active, state}
+  def handle_call(:reap_abandoned, _from, %{task_ref: ref} = state) when not is_nil(ref) do
+    # The manager can itself die after committing recovery but before sending
+    # the release. Reconcile the durable terminal against this exact task too.
+    case DB.query(state.db, "SELECT status FROM turns WHERE seq=?1", [state.current_seq]) do
+      {:ok, [["failed_unknown"]]} ->
+        seq = state.current_seq
+        {:reply, {:ok, [seq]}, release_recovered_task(state)}
+
+      {:ok, [[_status]]} ->
+        {:reply, :active, state}
+    end
+  end
 
   def handle_call(:reap_abandoned, _from, state) do
     seqs =
@@ -361,6 +380,13 @@ defmodule Tightbeam.SessionLane do
   end
 
   @impl true
+  def handle_cast({:release_recovered, seq}, %{current_seq: seq, task_ref: ref} = state)
+      when not is_nil(ref) do
+    {:noreply, release_recovered_task(state)}
+  end
+
+  def handle_cast({:release_recovered, _seq}, state), do: {:noreply, state}
+
   def handle_cast(:nudge, %{reservation_token: token} = state) when not is_nil(token),
     do: {:noreply, %{state | deferred_drain: true}}
 
@@ -397,6 +423,32 @@ defmodule Tightbeam.SessionLane do
   def handle_info(_msg, state), do: {:noreply, state}
 
   ## Internals
+
+  defp release_recovered_task(state) do
+    # Recovery already won the terminal CAS. Kill the exact owned task and
+    # detach its monitor before draining: queued old results/DOWN must not
+    # finalize or clear the successor. A repeated or late recovery is a no-op.
+    ref = state.task_ref
+    pid = state.task_pid
+    Process.exit(pid, :kill)
+
+    receive do
+      {:DOWN, ^ref, :process, ^pid, _reason} -> :ok
+    end
+
+    Process.demonitor(ref, [:flush])
+
+    state = %{
+      state
+      | task_ref: nil,
+        task_pid: nil,
+        current_seq: nil,
+        current_message_id: nil,
+        current_owner_lease: nil
+    }
+
+    maybe_start(state)
+  end
 
   defp crash_outcome({%Placement.Refusal{} = refusal, _stacktrace}, _seq),
     do: {:error, refusal.message}

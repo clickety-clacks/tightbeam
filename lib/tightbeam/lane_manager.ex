@@ -14,7 +14,7 @@ defmodule Tightbeam.LaneManager do
   """
 
   use GenServer
-  alias Tightbeam.{HarnessHealth, Ledger, SessionLane}
+  alias Tightbeam.{DB, HarnessHealth, Ledger, SessionLane}
 
   defstruct [:db, :lane_sup, :task_sup, :runner, :interval, :terminal_publisher, :on_terminal]
 
@@ -70,7 +70,13 @@ defmodule Tightbeam.LaneManager do
     }
 
     # Boot recovery happens before the first scan starts nudging lanes.
-    Ledger.recover_running(state.db)
+    for seq <- Ledger.recover_running(state.db) do
+      {:ok, [[session_key]]} =
+        DB.query(state.db, "SELECT sessionKey FROM turns WHERE seq=?1", [seq])
+
+      SessionLane.release_recovered(session_key, seq)
+    end
+
     HarnessHealth.resume_other_routes(state.db)
     schedule(state.interval)
     {:ok, do_reconcile(state)}
