@@ -2178,35 +2178,6 @@ pub(crate) fn parse_response(status: u16, encoded: &str) -> Result<Option<Value>
     Ok(json.get("result").cloned())
 }
 
-pub fn run(command: Command) -> Result<(), String> {
-    if let Command::SessionConnect {
-        identity,
-        session_key,
-    } = command
-    {
-        return crate::session_connect::run(session_key, identity);
-    }
-
-    // `tool-call-observed` carries no identity flag, so it is not in
-    // `command_identity`; it is nonetheless a session call and only a session
-    // call, and saying so here makes a run from outside a workdir fail with the
-    // reason rather than with a 403 from the org token.
-    let session_identity = requires_session_discovery(&command);
-    run_with(
-        command,
-        move || {
-            if session_identity {
-                let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-                discover_session_from(&cwd)?.ok_or_else(|| identity_required(&cwd))
-            } else {
-                discover()
-            }
-        },
-        send_to_with_deadline,
-        crate::harnesses::load_optional_from,
-    )
-}
-
 /// A non-2xx reply to a route outside the dispatch envelope, in the same two readings.
 pub(crate) fn status_failure(status: u16, response: ureq::Response) -> String {
     let encoded = match response.into_string() {
@@ -3230,12 +3201,17 @@ fn redact_tokens(text: &str) -> String {
 }
 
 pub fn run(command: Command) -> Result<(), String> {
-    // `tool-call-observed` carries no identity flag, so it is not in
-    // `command_identity`; it is nonetheless a session call and only a session
-    // call, and saying so here makes a run from outside a workdir fail with the
-    // reason rather than with a 403 from the org token.
-    let session_identity = matches!(command, Command::ToolCallObserved)
-        || command_identity(&command).is_some_and(|identity| matches!(identity, Identity::Session));
+    if let Command::SessionConnect {
+        identity,
+        session_key,
+    } = command
+    {
+        return crate::session_connect::run(session_key, identity);
+    }
+
+    // Keep the current target's local first-user bootstrap exception and its
+    // session-only ToolCallObserved behavior when entering the shared dispatcher.
+    let session_identity = requires_session_discovery(&command);
     run_with(
         command,
         move || {
@@ -3328,6 +3304,9 @@ where
         }
         Command::UpdateClients { as_user } => crate::ceremonies::update_clients(&as_user),
         Command::Assimilate(args) => crate::ceremonies::assimilate(args),
+        Command::SessionConnect { .. } => {
+            unreachable!("session-connect is routed before the shared dispatcher")
+        }
         Command::GithubAuthCheck => crate::github_auth::check_tool_call_stdin(),
         Command::Onboard {
             identity,

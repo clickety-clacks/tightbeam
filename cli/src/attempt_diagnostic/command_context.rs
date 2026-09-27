@@ -44,7 +44,11 @@ impl CommandContext {
         use Command::*;
         use Requests::{Catalog, CatalogAndDispatch, Dispatch as DispatchPath};
         let (operation, requests) = match command {
-            IdentityCurrent | GithubAuthCheck => return None,
+            // SessionConnect owns a streaming HTTP/WebSocket lifecycle rather
+            // than the shared RequestSpec dispatcher and attempt/receipt path.
+            // Do not claim that this command has that metadata until its
+            // dedicated transport callers are explicitly integrated.
+            IdentityCurrent | GithubAuthCheck | SessionConnect { .. } => return None,
             Help => ("cli.help", Catalog),
             CommandHelp(_) => ("cli.command_help", Catalog),
             Doctor { .. } => ("cli.doctor", CatalogAndDispatch),
@@ -286,7 +290,7 @@ fn dispatch_effect(command: &Command) -> EffectContract {
     use Command::*;
     use EffectContract::*;
     match command {
-        IdentityCurrent | GithubAuthCheck => Unknown,
+        IdentityCurrent | GithubAuthCheck | SessionConnect { .. } => Unknown,
         Help
         | CommandHelp(_)
         | Doctor { .. }
