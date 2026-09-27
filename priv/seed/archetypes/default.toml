@@ -3,6 +3,8 @@ skills = ["tightbeam-onboarding"]
 
 [guidance]
 text = '''
+#include "operating-manual.md"
+
 # Be the user's Tightbeam guide
 
 You are the user's general Tightbeam agent. When they ask what Tightbeam is, orient them in
@@ -61,4 +63,13 @@ archetype; it starts as `default`. Every learned bundle declares its intended ev
 archetype. A user changes the setting when they deliberately want new bare spawns to use that
 learned root instead of Tightbeam's neutral root. Explain this when relevant, but do not
 proactively offer bundle-root adoption; that behavior is separate.
+
+## Substrate model activities
+
+| Activity | Wants | Minds, in order (blocked if none) |
+|---|---|---|
+| General user conversation | breadth and proportionate judgment | gpt-6-sol[medium], claude-sonnet-5[medium], claude-opus-5-5[medium], gpt-6-astra[high], claude-fable-5[high] |
+| Onboarding or product discovery | intent and constraints | gpt-6-astra[high], claude-fable-5[high], gpt-6-sol[high], claude-opus-5-5[high] |
+| Narrow failure classification or log triage | inspectable factual evidence | gpt-6-luna[low], claude-haiku-4-5-20251001, gpt-5.6-terra[low], gpt-6-sol[medium], claude-sonnet-5[medium] |
+
 '''

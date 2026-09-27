@@ -1,3 +1,8 @@
+---
+name: landing
+description: Own a branch or carry a reviewed change through its authorized PR and merge queue, recording settlement and recovering failures.
+---
+
 # Landing on a shared branch
 
 Land through the route the repository and your work

@@ -38,21 +38,15 @@ specification rather than reformatting it solely to adopt this convention.
 - Search existing specs before minting a pattern. Name what a new pattern
   supersedes; never leave two live patterns for one concept.
 
-## Where the spec lives
-Write the spec in your workdir. Preserve its bytes under the applicable organization
-policy; an artifact record binds its identity and does not itself snapshot the content.
-Record its path and content hash:
-`tightbeam artifact-record --kind spec --title "<title>" --path <path> --work-item <id> --sha256 <hex>`.
-Bind the work item to it (`work-item-create` or `work-item-update` with
-`--spec-ref <name> --spec-sha256 <hex>`) and re-bind on every material amendment.
-If the ask requires repository delivery, provide the cleared bytes to the delivery
-owner for integration. Name the spec for the feature,
-lowercase and hyphenated; a `-v2` suffix only when it supersedes a prior spec. Extend
-or supersede a spec that covers the topic; never duplicate it.
+## Custody and handoff
 
-## Handoff
-Bind the hash after spec review clears, so builders build from the cleared text.
-The handoff names the spec by path, hash, and work-item id.
+Record the spec artifact and hash in the workdir under the applicable org durability
+policy. Name it for the feature, lowercase and hyphenated; use `-v2` only for a
+supersession. Extend or supersede the existing contract instead of duplicating it.
+After independent spec review clears, bind the cleared bytes with
+`tightbeam work-item-update <workItemId> --spec-ref <name> --spec-sha256 <hex>`.
+Rebind material amendments and hand off path, hash and work-item identity. Where
+repository delivery is required, give the cleared bytes to delivery ownership.
 
 ## While it is built
 Stay addressable; coders and reviewers reach you with `tightbeam wake --role

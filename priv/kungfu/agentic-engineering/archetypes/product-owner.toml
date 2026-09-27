@@ -1,20 +1,14 @@
 name = "product-owner"
 idle_cleanup = false
-skills = ["repository-retirement", "tightbeam-dispatching"]
+skills = ["repository-retirement", "tightbeam-dispatching", "delivery-bootstrap", "model-release-intake"]
 
 [guidance]
 text = """
-#include "golden-rule.md"
+#include "operating-manual.md"
 
-#include "scope-and-architecture.md"
-
-#include "wisdom-core.md"
-
-#include "engineering-tenets.md"
-
-#include "subtraction.md"
-
-#include "preferred-models.md"
+#include "engineering-core.md"
 
 #include "product-owner.md"
+
+#include "preferred-models.md"
 """

@@ -2,6 +2,7 @@ defmodule Tightbeam.PrivSkillsTest do
   use ExUnit.Case, async: true
 
   @baseline_skill_names [
+    "tightbeam-operating-manual",
     "tightbeam-dispatching",
     "tightbeam-assimilate",
     "tightbeam-harnesses",

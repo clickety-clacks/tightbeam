@@ -291,6 +291,7 @@ defmodule Tightbeam.Schema do
   @legacy_cursor_provider_shape "cursor-provider-v1-020"
   @cursor_provider_shape "cursor-provider-addressed-po-v1-020"
   @settlement_shape "stale-turn-settlement-v1-019"
+  @agent_reparent_shape "delivery-owner-reparent-v1-019"
   @cursor_provider_previous_shape @addressed_po_shape
   @liveness_progress_receipts_previous_shape "identity-universal-root-render-v1-019"
   @cannot_proceed_shape "cannot-proceed-v1-019"
@@ -1325,6 +1326,7 @@ defmodule Tightbeam.Schema do
   @doc false
   def guard_compatible_stamps do
     [
+      @agent_reparent_shape,
       @settlement_shape,
       @cannot_proceed_shape,
       @cursor_provider_shape,
@@ -1394,7 +1396,8 @@ defmodule Tightbeam.Schema do
             @legacy_cursor_provider_shape,
             @cursor_provider_shape,
             @cannot_proceed_shape,
-            @settlement_shape
+            @settlement_shape,
+            @agent_reparent_shape
           ]
         )
     end)
@@ -1441,6 +1444,7 @@ defmodule Tightbeam.Schema do
     :ok = upgrade_stale_turn_settlement(db)
     :ok = Tightbeam.ReadMarkers.ensure_schema(db)
     :ok = Tightbeam.Sentinels.ensure_schema(db)
+    :ok = upgrade_agent_reparent(db)
 
     case DB.finish_schema(db) do
       :ok -> :ok
@@ -1467,7 +1471,7 @@ defmodule Tightbeam.Schema do
     [[shape]] = Txn.q(txn, "SELECT shape FROM schema_stamp")
 
     liveness_objects =
-      if shape in [@cannot_proceed_shape, @settlement_shape],
+      if shape in [@cannot_proceed_shape, @settlement_shape, @agent_reparent_shape],
         do: @cannot_proceed_liveness_objects,
         else: @o2_liveness_objects
 
@@ -1519,7 +1523,8 @@ defmodule Tightbeam.Schema do
            @legacy_cursor_provider_shape,
            @cursor_provider_shape,
            @cannot_proceed_shape,
-           @settlement_shape
+           @settlement_shape,
+           @agent_reparent_shape
          ],
          do: reparent_liveness_enforcement_objects(),
          else: @supervision_liveness_enforcement_objects
@@ -2036,7 +2041,12 @@ defmodule Tightbeam.Schema do
   defp check_shape(db) do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
       {:ok, [[shape]]}
-      when shape in [@cursor_provider_shape, @cannot_proceed_shape, @settlement_shape] ->
+      when shape in [
+             @cursor_provider_shape,
+             @cannot_proceed_shape,
+             @settlement_shape,
+             @agent_reparent_shape
+           ] ->
         :ok
 
       {:ok, [[@legacy_cursor_provider_shape]]} ->
@@ -2133,7 +2143,7 @@ defmodule Tightbeam.Schema do
         this Tightbeam database was written by a different build.
 
           stamped: #{found}
-          this build: #{@settlement_shape}
+          this build: #{@agent_reparent_shape}
 
         This build can migrate #{@model_identity_shape} or #{@operator_decision_shape}
         to #{@terminal_decision_liveness_shape}, then #{@effort_request_exit_previous_shape}.
@@ -2144,7 +2154,8 @@ defmodule Tightbeam.Schema do
         It can also migrate
         #{@effort_request_exit_previous_shape} to #{@effort_request_exit_shape},
         then through the same row-driven chain to #{@cursor_provider_shape}.
-        It then migrates to #{@cannot_proceed_shape}, followed atomically by #{@settlement_shape}.
+        It then migrates to #{@cannot_proceed_shape}, followed atomically by
+        #{@settlement_shape}, then #{@agent_reparent_shape}.
 
         No migration is defined for the stamped shape above. Keep the database
         in place and run a Tightbeam build that recognizes that exact stamp.
@@ -2158,7 +2169,7 @@ defmodule Tightbeam.Schema do
         this Tightbeam database carries MORE THAN ONE shape stamp.
 
           stamped: #{rows |> List.flatten() |> Enum.join(", ")}
-          this build: #{@settlement_shape}
+          this build: #{@agent_reparent_shape}
 
         Nothing in Tightbeam writes a second stamp, so this database was
         assembled by something else. Move it aside and let it be recreated.
@@ -2173,7 +2184,8 @@ defmodule Tightbeam.Schema do
   defp upgrade_r1(db) do
     case DB.transaction(db, fn txn ->
            case Txn.q(txn, "SELECT shape FROM schema_stamp") do
-             [[shape]] when shape in [@cursor_provider_shape, @settlement_shape] ->
+             [[shape]]
+             when shape in [@cursor_provider_shape, @settlement_shape, @agent_reparent_shape] ->
                :ok
 
              [[@legacy_cursor_provider_shape]] ->
@@ -2240,7 +2252,8 @@ defmodule Tightbeam.Schema do
 
   defp bootstrap_module(db, Tightbeam.Assignments, _current?) do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
-      {:ok, [[shape]]} when shape in [@cannot_proceed_shape, @settlement_shape] ->
+      {:ok, [[shape]]}
+      when shape in [@cannot_proceed_shape, @settlement_shape, @agent_reparent_shape] ->
         Tightbeam.Assignments.ensure_schema(db)
 
       {:ok, [[_predecessor]]} ->
@@ -2253,7 +2266,8 @@ defmodule Tightbeam.Schema do
   @doc false
   def upgrade_firehose_r1(db, opts \\ []) do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
-      {:ok, [[shape]]} when shape in [@cursor_provider_shape, @settlement_shape] ->
+      {:ok, [[shape]]}
+      when shape in [@cursor_provider_shape, @settlement_shape, @agent_reparent_shape] ->
         :ok
 
       {:ok, [[@legacy_cursor_provider_shape]]} ->
@@ -2341,7 +2355,8 @@ defmodule Tightbeam.Schema do
   def upgrade_session_reparent(db) do
     case DB.transaction(db, fn txn ->
            case Txn.q(txn, "SELECT shape FROM schema_stamp") do
-             [[shape]] when shape in [@cursor_provider_shape, @settlement_shape] ->
+             [[shape]]
+             when shape in [@cursor_provider_shape, @settlement_shape, @agent_reparent_shape] ->
                :ok
 
              [[@legacy_cursor_provider_shape]] ->
@@ -2402,7 +2417,8 @@ defmodule Tightbeam.Schema do
   def upgrade_artifact_durability(db) do
     case DB.transaction(db, fn txn ->
            case Txn.q(txn, "SELECT shape FROM schema_stamp") do
-             [[shape]] when shape in [@cursor_provider_shape, @settlement_shape] ->
+             [[shape]]
+             when shape in [@cursor_provider_shape, @settlement_shape, @agent_reparent_shape] ->
                validate_artifact_content_schema!(txn)
 
              [[@legacy_cursor_provider_shape]] ->
@@ -2491,7 +2507,8 @@ defmodule Tightbeam.Schema do
 
   defp upgrade_o2(db) do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
-      {:ok, [[shape]]} when shape in [@cursor_provider_shape, @settlement_shape] ->
+      {:ok, [[shape]]}
+      when shape in [@cursor_provider_shape, @settlement_shape, @agent_reparent_shape] ->
         :ok
 
       {:ok, [[@legacy_cursor_provider_shape]]} ->
@@ -3524,19 +3541,34 @@ defmodule Tightbeam.Schema do
 
   defp upgrade_pi_providers(db) do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
-      {:ok, [[shape]]} when shape in [@cursor_provider_shape, @settlement_shape] -> :ok
-      {:ok, [[@legacy_cursor_provider_shape]]} -> :ok
-      {:ok, [[@cannot_proceed_shape]]} -> :ok
-      {:ok, [[@addressed_po_shape]]} -> :ok
-      {:ok, [[@pi_shape]]} -> :ok
-      {:ok, [[@durability_shape]]} -> migrate_sessions_provider_shape(db, @durability_shape)
-      rows -> raise ShapeError, message: "incompatible Pi provider predecessor: #{inspect(rows)}"
+      {:ok, [[shape]]}
+      when shape in [@cursor_provider_shape, @settlement_shape, @agent_reparent_shape] ->
+        :ok
+
+      {:ok, [[@legacy_cursor_provider_shape]]} ->
+        :ok
+
+      {:ok, [[@cannot_proceed_shape]]} ->
+        :ok
+
+      {:ok, [[@addressed_po_shape]]} ->
+        :ok
+
+      {:ok, [[@pi_shape]]} ->
+        :ok
+
+      {:ok, [[@durability_shape]]} ->
+        migrate_sessions_provider_shape(db, @durability_shape)
+
+      rows ->
+        raise ShapeError, message: "incompatible Pi provider predecessor: #{inspect(rows)}"
     end
   end
 
   defp upgrade_addressed_po_consultation(db) do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
-      {:ok, [[shape]]} when shape in [@cursor_provider_shape, @settlement_shape] ->
+      {:ok, [[shape]]}
+      when shape in [@cursor_provider_shape, @settlement_shape, @agent_reparent_shape] ->
         :ok
 
       {:ok, [[@cannot_proceed_shape]]} ->
@@ -3633,7 +3665,8 @@ defmodule Tightbeam.Schema do
 
   defp upgrade_cannot_proceed(db) do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
-      {:ok, [[shape]]} when shape in [@cannot_proceed_shape, @settlement_shape] ->
+      {:ok, [[shape]]}
+      when shape in [@cannot_proceed_shape, @settlement_shape, @agent_reparent_shape] ->
         :ok
 
       {:ok, [[@cursor_provider_shape]]} ->
@@ -3874,7 +3907,12 @@ defmodule Tightbeam.Schema do
   defp upgrade_cursor_provider_v1_020(db) do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
       {:ok, [[shape]]}
-      when shape in [@cursor_provider_shape, @cannot_proceed_shape, @settlement_shape] ->
+      when shape in [
+             @cursor_provider_shape,
+             @cannot_proceed_shape,
+             @settlement_shape,
+             @agent_reparent_shape
+           ] ->
         :ok
 
       {:ok, [[@cursor_provider_previous_shape]]} ->
@@ -3888,6 +3926,9 @@ defmodule Tightbeam.Schema do
   defp upgrade_stale_turn_settlement(db) do
     case DB.transaction(db, fn txn ->
            case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@agent_reparent_shape]] ->
+               :ok
+
              [[@settlement_shape]] ->
                :ok
 
@@ -3909,6 +3950,38 @@ defmodule Tightbeam.Schema do
 
              other ->
                raise ShapeError, message: "incompatible settlement predecessor: #{inspect(other)}"
+           end
+         end) do
+      {:ok, :ok} -> :ok
+      {:error, error} -> raise error
+    end
+  end
+
+  defp upgrade_agent_reparent(db) do
+    case DB.transaction(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@agent_reparent_shape]] ->
+               :ok
+
+             [[@settlement_shape]] ->
+               :ok = Tightbeam.SessionReparent.upgrade_agent_principals_in_txn(txn)
+
+               Txn.q(txn, "UPDATE schema_stamp SET shape=?1, stampedAt=?2 WHERE shape=?3", [
+                 @agent_reparent_shape,
+                 System.system_time(:millisecond),
+                 @settlement_shape
+               ])
+
+               if Txn.changes(txn) != 1 do
+                 raise ShapeError,
+                   message: "agent reparent migration lost its exact stamp transition"
+               end
+
+               :ok
+
+             other ->
+               raise ShapeError,
+                 message: "incompatible agent reparent predecessor: #{inspect(other)}"
            end
          end) do
       {:ok, :ok} -> :ok

@@ -8,34 +8,13 @@ description: Operate an existing Tightbeam organization through its current-line
 Use Tightbeam as the record and coordination layer for the assignment. Run only the
 operations that the assignment authorizes. Ask Main to perform broader organization work.
 
-## Ground the records
+## Records
 
-Use these meanings consistently:
-
-- **Tightbeam:** the service that coordinates agent sessions for a human owner and keeps
-  work, obligations, communication, and evidence in durable rows.
-- **Work item:** the durable thread for one feature or bug.
-- **Assignment:** an obligation on that work held by a session.
-- **Card:** a work item that is staffed and moving, in the kanban sense.
-- **Session:** one running or retained agent identity with a Tightbeam session key and an
-  owner. One work item can carry several assignments. One assignment names one obligation
-  held by one session.
-- **Main:** the owner's general Tightbeam session. A user-targeted wake routes to that
-  owner's Main.
-- **Wake:** a durable prompt delivered now, later, or when a named condition fact arrives.
-- **Attest:** an attributed progress, completion, cannot-proceed, or review-verdict row on one
-  assignment.
-- **Artifact:** a pointer to evidence outside the assignment worktree. The pointer records
-  location and digest; it does not take custody of the file.
-- **Decision request:** a durable question for a named principal. It is not a ruling and
-  does not pause the assignment by itself.
-- **Condition fact:** an observable event that can release a subscribed wake.
-- **Kungfu:** a shipped bundle of practiced organizational behavior: guidance, skills,
-  rails, rules, and bundle metadata. Do not operate a kungfu bundle from this skill.
-
-Treat every returned `wi_...`, `asg_...`, `art_...`, `att_...`, `dr_...`, `w_...`, role,
-user, and session value as a typed identifier. Reuse identifiers from the assignment wake
-or Tightbeam results. Never invent one.
+A work item is the outcome; an assignment is one session's obligation on it.
+Attests record progress, judgments and completion; artifacts point to evidence.
+Wakes deliver addressed prompts and decisions ask a named principal for judgment.
+Use returned typed identifiers exactly; do not invent them. These records preserve
+custody across lost context; recover from them before acting.
 
 ## Start from the assignment
 
@@ -80,8 +59,6 @@ new scope to Main with the current work-item and assignment identifiers. Delegat
 spawning and retirement, identity and configuration changes, credential work, kungfu
 operation, target choice, integration, merge, release, deployment, and live administration
 to Main unless the assignment grants that exact operation.
-
-you should probably get main to do what you need it to instead of trying to do it yourself since main knows how to operate tightbeam.
 
 Discover mechanics from `tightbeam --help`. Do not guess a command, flag, model, role,
 session, target, record shape, or identifier.

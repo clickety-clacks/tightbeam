@@ -99,3 +99,6 @@ obligations on them.
 
 If reality disagrees, flag the operator and amend the proof table, its negative
 test, and this mirror together.
+
+
+See [harness-support.md](harness-support.md) for the engineering support evidence and limitations.
