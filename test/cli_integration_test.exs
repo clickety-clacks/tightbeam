@@ -217,7 +217,7 @@ defmodule Tightbeam.CliIntegrationTest do
 
     {refused, status} = run.(args)
     assert status != 0
-    assert refused =~ "user_principal_required"
+    assert refused =~ "delivery_responsibility_required"
     assert {corrected, 0} = run.(args ++ ["--as-user", "flynn"])
     result = JSON.decode!(corrected)
     assert result["session"]["currentParent"] == "cli-worker"

@@ -82,7 +82,8 @@ defmodule Tightbeam.IdentityTest do
 
     snapshot = Identity.snapshot!(ctx.base, "default", :codex)
     assert snapshot.skills == %{}
-    assert snapshot.guidance =~ "tightbeam learn <bundle>"
+    assert snapshot.guidance =~ "# Served identity"
+    assert snapshot.guidance =~ "The operating manual explains your served identity"
     refute snapshot.guidance =~ "role-v1"
 
     assert Identity.available_bundles() == [
@@ -143,25 +144,16 @@ defmodule Tightbeam.IdentityTest do
            |> MapSet.new() == MapSet.new(["main", "tightbeam/live", "tightbeam/upstream"])
   end
 
-  # Work-custody pin: operating-model.md is composed into EVERY archetype, so
-  # the custody rail reaches every session including learned-kungfu archetypes.
-  # The forensic reason it exists (2026-08-18): retirement deletes a workdir
-  # unless it holds registered in-workspace artifacts, so undeclared work is
-  # destroyed silently and attests that cite raw workdir paths point at bytes
-  # nobody owns — 7 of 10 paths cited over one day were already gone. Pin the
-  # load-bearing phrases so an edit that keeps the file cannot gut the rail.
-  test "the operating model carries the work-custody rail, not just the identity seam" do
+  # Neutral identity points to the operating manual, which owns artifact custody.
+  test "the neutral operating model points to durable artifact custody" do
     model =
       File.read!(Application.app_dir(:tightbeam, "priv/seed/guidance/operating-model.md"))
 
-    assert model =~ "Work custody: the last step of finishing"
-    assert model =~ "DELETED unless it holds\nregistered artifacts"
-    assert model =~ "A path\nwritten into an attest is a pointer, not custody"
-    assert model =~ "finishing has a fixed last step, not a judgment call"
-    assert model =~ "tightbeam artifact-record --kind <kind> --title"
-    assert model =~ "an unneeded artifact costs one row, an unrecorded one costs the work"
-    assert model =~ "that\nfile must be an artifact FIRST"
-    assert model =~ "the handoff is the artifact, never the\npath"
+    manual = File.read!(Application.app_dir(:tightbeam, "priv/guidance/operating-manual.md"))
+    assert model =~ "The operating manual explains your served identity, durable workdir"
+    assert manual =~ "a path you cite as evidence must be an artifact first"
+    assert manual =~ "a record of a remote path is a pointer, not a copy"
+    assert manual =~ "only recorded artifacts are in tracked custody"
   end
 
   test "a shipped bundle manifest without purpose is refused when bundles are read", ctx do
@@ -229,7 +221,8 @@ defmodule Tightbeam.IdentityTest do
     assert codex.skills == %{"role-skill" => "skill-v1"}
     assert codex.guidance =~ "Codex developer message"
     assert claude.guidance =~ "Claude system prompt"
-    assert codex.guidance =~ "tightbeam identity edit"
+    assert codex.guidance =~ "role-v1"
+    assert codex.guidance =~ "# Served identity"
 
     receipt = Path.join(ctx.base, "identity/kungfu/agentic-engineering/installed.toml")
     assert File.read!(receipt) =~ ~s(name = "agentic-engineering")
@@ -254,33 +247,30 @@ defmodule Tightbeam.IdentityTest do
     refute engineering_rule =~ ~s(target_role = "reviewer-code")
 
     for {role, present_axis, absent_axis} <- [
-          {"reviewer-code", "## Code judgment", "## Spec judgment"},
-          {"reviewer-spec", "## Spec judgment", "## Code judgment"}
+          {"reviewer-code", "# Code reviewer", "# Specification reviewer"},
+          {"reviewer-spec", "# Specification reviewer", "# Code reviewer"}
         ] do
       review = Identity.snapshot!(base, role, :codex)
-      assert review.guidance =~ "# Review"
+      assert review.guidance =~ "# Independent review"
       assert review.guidance =~ present_axis
       refute review.guidance =~ absent_axis
       refute Regex.match?(~r/^#include/m, review.guidance)
 
       if role == "reviewer-code" do
-        assert review.guidance =~ "a tests-passed receipt is not a precondition"
+        assert review.guidance =~ "For early or partial review"
       end
 
       assert Map.keys(review.skills) == ["repository-retirement"]
 
-      if role == "reviewer-code" do
-        assert review.guidance =~ "# Repository custody"
-      else
-        refute review.guidance =~ "# Repository custody"
-      end
+      assert review.guidance =~ "Use your own clone in your workdir"
 
       refute review.guidance =~ "# Guidance and policy craft"
     end
 
     coder = Identity.snapshot!(base, "coder", :codex)
-    assert coder.guidance =~ "Review can start before a passing-test receipt"
-    assert coder.guidance =~ "--verdict tests-passed"
+    assert coder.guidance =~ "Independent review may start before tests pass"
+    assert coder.guidance =~ "completion still needs verified evidence"
+    assert coder.guidance =~ "A card is the unit of review"
   end
 
   test "init refuses an identity repository missing the live ref with repair guidance", ctx do
