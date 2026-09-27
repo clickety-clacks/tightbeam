@@ -410,6 +410,52 @@ defmodule Tightbeam.CredentialsTest do
     assert :sys.get_state(server).status_reads == %{}
   end
 
+  test "an expired queued status cannot sweep a remote lease after its caller leaves", ctx do
+    parent = self()
+    machine = "stale-status-#{System.unique_integer([:positive])}"
+    server_name = {:global, {Credentials, machine}}
+    staging = Path.join(ctx.base, "stale-staging")
+    File.mkdir_p!(staging)
+    calls = :atomics.new(1, [])
+
+    {:ok, server} =
+      start_credentials(
+        name: server_name,
+        base_dir: ctx.base,
+        machine: machine,
+        ssh: "worker",
+        now: fn -> 1 end,
+        sh: fn command ->
+          if :atomics.add_get(calls, 1, 1) == 1 do
+            send(parent, {:kind_probe_started, self()})
+            receive do: (:release_kind_probe -> :ok)
+          end
+
+          run_remote_command(command)
+        end
+      )
+
+    :sys.replace_state(server, fn state ->
+      %{
+        state
+        | pending: Map.put(state.pending, :openai, %{id: "stale", path: staging, expires_at: 0})
+      }
+    end)
+
+    kind = Task.async(fn -> GenServer.call(server_name, {:kind, :openai}, :infinity) end)
+    assert_receive {:kind_probe_started, worker}
+
+    caller = Task.async(fn -> Credentials.status(:openai, server_name) end)
+
+    assert {:unavailable, %{host: ^machine, reason: :timeout}} =
+             Task.await(caller, 6_000)
+
+    send(worker, :release_kind_probe)
+    Task.await(kind, 1_000)
+    assert File.exists?(staging)
+    assert :sys.get_state(server).pending.openai.id == "stale"
+  end
+
   test "remote transport refusal is unknown rather than missing", ctx do
     {:ok, server} =
       start_credentials(
