@@ -521,45 +521,49 @@ defmodule Tightbeam.Credentials do
 
   @impl true
   def handle_call({:status, provider, deadline}, from, state) do
-    case expire_status_lease(state, provider, deadline) do
-      {:unavailable, reason} ->
-        {:reply, unavailable(state.machine, provider, reason), state}
+    if System.monotonic_time(:millisecond) >= deadline - @status_cleanup_ms do
+      {:reply, unavailable(state.machine, provider, :timeout), state}
+    else
+      case expire_status_lease(state, provider, deadline) do
+        {:unavailable, reason} ->
+          {:reply, unavailable(state.machine, provider, reason), state}
 
-      state ->
-        if System.monotonic_time(:millisecond) >= deadline - @status_cleanup_ms do
-          {:reply, unavailable(state.machine, provider, :timeout), state}
-        else
-          owner = self()
-          ref = make_ref()
-          worker_deadline = deadline - @status_cleanup_ms
-          snapshot = state
+        state ->
+          if System.monotonic_time(:millisecond) >= deadline - @status_cleanup_ms do
+            {:reply, unavailable(state.machine, provider, :timeout), state}
+          else
+            owner = self()
+            ref = make_ref()
+            worker_deadline = deadline - @status_cleanup_ms
+            snapshot = state
 
-          pid =
-            spawn(fn ->
-              result = status_read(snapshot, provider, worker_deadline)
-              send(owner, {:status_result, ref, result})
-            end)
+            pid =
+              spawn(fn ->
+                result = status_read(snapshot, provider, worker_deadline)
+                send(owner, {:status_result, ref, result})
+              end)
 
-          monitor = Process.monitor(pid)
+            monitor = Process.monitor(pid)
 
-          timer =
-            Process.send_after(
-              self(),
-              {:status_deadline, ref},
-              max(worker_deadline - System.monotonic_time(:millisecond), 0)
-            )
+            timer =
+              Process.send_after(
+                self(),
+                {:status_deadline, ref},
+                max(worker_deadline - System.monotonic_time(:millisecond), 0)
+              )
 
-          read = %{
-            from: from,
-            provider: provider,
-            pid: pid,
-            monitor: monitor,
-            timer: timer,
-            deadline: worker_deadline
-          }
+            read = %{
+              from: from,
+              provider: provider,
+              pid: pid,
+              monitor: monitor,
+              timer: timer,
+              deadline: worker_deadline
+            }
 
-          {:noreply, put_in(state.status_reads[ref], read)}
-        end
+            {:noreply, put_in(state.status_reads[ref], read)}
+          end
+      end
     end
   end
 
