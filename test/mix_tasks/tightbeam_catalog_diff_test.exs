@@ -94,12 +94,61 @@ defmodule Mix.Tasks.Tightbeam.Catalog.DiffTest do
     )
   end
 
-  test "raises a classified error when the working-set section is absent" do
+  test "canonical names compare vendor model identifiers, not their nicknames" do
+    with_guidance(["legacy"], fn path ->
+      File.write!(
+        path,
+        """
+        # Preferred models
+
+        ## Canonical names
+
+        - `sol`: `gpt-6-sol`, current implementation choice.
+        - `opus`: `claude-opus-5-5`, review choice.
+        - unrelated prose without a model identifier
+
+        ## Activities
+
+        - `outside`: `not-a-model`, must not enter the diff.
+
+        ## Working set (capsules)
+
+        - **legacy** — retained old format
+        """
+      )
+
+      {status, diff} = Diff.evaluate(inventories(["gpt-6-sol", "new"]), path)
+
+      assert status == 1
+      assert diff.working_set == ["claude-opus-5-5", "gpt-6-sol"]
+      assert diff.missing_from_catalog == ["claude-opus-5-5"]
+      assert diff.new_arrivals == ["new"]
+    end)
+  end
+
+  test "an empty canonical section falls back to a valid legacy working set" do
     with_guidance(["known"], fn path ->
-      File.write!(path, "# Preferred models\n")
+      File.write!(
+        path,
+        String.replace(
+          File.read!(path),
+          "## Working set (capsules)",
+          "## Canonical names\n\n- malformed model entry\n\n## Working set (capsules)"
+        )
+      )
+
+      {status, diff} = Diff.evaluate(inventories(["known"]), path)
+      assert status == 0
+      assert diff.working_set == ["known"]
+    end)
+  end
+
+  test "raises a classified error when neither section has valid model entries" do
+    with_guidance(["known"], fn path ->
+      File.write!(path, "# Preferred models\n\n## Canonical names\n\n- malformed entry\n")
 
       assert_raise Mix.Error,
-                   ~r/preferred_models_parse_failed: Working set \(capsules\) section not found/,
+                   ~r/preferred_models_parse_failed: no valid Canonical names or Working set \(capsules\) section/,
                    fn -> Diff.evaluate(inventories(["known"]), path) end
     end)
   end
