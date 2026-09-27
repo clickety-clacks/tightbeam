@@ -82,7 +82,7 @@ defmodule Tightbeam.ErrorDiagnostic do
                          apikey xapikey cookie setcookie credential credentials privatekey)
   @secret_field_suffixes ~w(token secret password apikey privatekey)
 
-  @secret_assignment ~r/\b((?:proxy[-_]?)?authorization|x[-_]api[-_]key|api[-_]?key|access[-_]?token|refresh[-_]?token|id[-_]?token|client[-_]?secret|private[-_]?key|token|password|passwd|secret|cookie)(["']?\s*(?:=>|[:=])\s*)((?:bearer|basic|token)\s+[^\s,;"'&}\]]+|"(?:[^"\\]|\\.)*"|'[^']*'|[^\s,;&}\]"']+)/i
+  @secret_assignment ~r/\b((?:proxy[-_]?)?authorization|x[-_]api[-_]key|api[-_]?key|access[-_]?token|refresh[-_]?token|id[-_]?token|client[-_]?secret|private[-_]?key|token|password|passwd|secret|cookie)(["']?\s*(?:=>|[:=])\s*)((?:bearer|basic|token)\s+[^\s,;"'&}\]]+|"(?:[^"\\]|\\(?:[\s\S]|\z))*(?:"|\z)|'(?:[^'\\]|\\(?:[\s\S]|\z))*(?:'|\z)|[^\s,;&}\]"']+)/i
 
   @type t :: %{optional(String.t()) => term()}
 

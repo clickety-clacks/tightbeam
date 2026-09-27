@@ -49,6 +49,20 @@ defmodule Tightbeam.ErrorDiagnosticTest do
       assert ErrorDiagnostic.redact_text("x -----BEGIN PRIVATE KEY-----\nfixtureSENTINEL") ==
                "x [REDACTED:private_key]"
     end
+
+    test "unterminated quoted secret assignments are masked through EOF" do
+      assert ErrorDiagnostic.redact_text("{\"password\":\"" <> @password) ==
+               "{\"password\":\"[REDACTED:secret_field]\""
+
+      assert ErrorDiagnostic.redact_text("api-key: '" <> @password) ==
+               "api-key: '[REDACTED:secret_field]'"
+
+      assert ErrorDiagnostic.redact_text("{\"password\":\"" <> @password <> "\\") ==
+               "{\"password\":\"[REDACTED:secret_field]\""
+
+      assert ErrorDiagnostic.redact_text("api-key: '" <> @password <> "\\") ==
+               "api-key: '[REDACTED:secret_field]'"
+    end
   end
 
   describe "encode_term/1" do

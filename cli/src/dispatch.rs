@@ -3048,12 +3048,13 @@ fn secret_value(text: &[u8]) -> Option<usize> {
                     _ => at += 1,
                 }
             }
-            None
+            Some(text.len())
         }
         Some(b'\'') => text[1..]
             .iter()
             .position(|byte| *byte == b'\'')
-            .map(|end| end + 2),
+            .map(|end| end + 2)
+            .or(Some(text.len())),
         _ => {
             let length = text
                 .iter()
@@ -6233,6 +6234,41 @@ mod tests {
     }
 
     #[test]
+    fn an_undecodable_reply_masks_unterminated_quoted_secrets_on_both_channels() {
+        let bodies = [
+            (
+                "{\"password\":\"fixtureSENTINEL",
+                "{\"password\":\"[REDACTED:secret_field]\"",
+            ),
+            (
+                "api-key: 'fixtureSENTINEL",
+                "api-key: '[REDACTED:secret_field]'",
+            ),
+            (
+                "{\"password\":\"fixtureSENTINEL\\",
+                "{\"password\":\"[REDACTED:secret_field]\"",
+            ),
+            (
+                "api-key: 'fixtureSENTINEL\\",
+                "api-key: '[REDACTED:secret_field]'",
+            ),
+        ];
+
+        for (body, expected) in bodies {
+            let error = parse_response(502, body).unwrap_err();
+            let (human, machine) = readings(&error);
+
+            assert!(!human.contains("fixtureSENTINEL"), "{human}");
+            assert!(human.contains("[REDACTED:secret_field]"), "{human}");
+            assert_eq!(machine["error"]["body"], expected);
+            assert!(
+                !machine.to_string().contains("fixtureSENTINEL"),
+                "{machine}"
+            );
+        }
+    }
+
+    #[test]
     fn an_undecodable_copy_is_bounded_on_a_character_boundary() {
         let body = format!("{}é{}", "x".repeat(BODY_LIMIT - 1), "y".repeat(100));
         let copy = bounded_body(&body);
@@ -6269,6 +6305,22 @@ mod tests {
             (
                 "api-key: 'fixtureSENTINEL' kept",
                 "api-key: '[REDACTED:secret_field]' kept",
+            ),
+            (
+                "{\"password\":\"fixtureSENTINEL",
+                "{\"password\":\"[REDACTED:secret_field]\"",
+            ),
+            (
+                "api-key: 'fixtureSENTINEL",
+                "api-key: '[REDACTED:secret_field]'",
+            ),
+            (
+                "{\"password\":\"fixtureSENTINEL\\",
+                "{\"password\":\"[REDACTED:secret_field]\"",
+            ),
+            (
+                "api-key: 'fixtureSENTINEL\\",
+                "api-key: '[REDACTED:secret_field]'",
             ),
             (
                 "%{\"password\" => \"fixtureSENTINEL\", status: 401}",
