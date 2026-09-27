@@ -1501,7 +1501,7 @@ defmodule Tightbeam.CliIntegrationTest do
                    "w_capture_#{id}",
                    ctx.session.session_key,
                    prompt,
-                   ruled_at + 86_400_000,
+                   ruled_at,
                    now,
                    id,
                    cursor

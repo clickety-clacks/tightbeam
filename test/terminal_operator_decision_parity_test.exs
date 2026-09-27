@@ -158,6 +158,36 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
              "Decision request #{request.id} was ruled. Read it with tightbeam decision-request --request #{request.id}."
   end
 
+  test "committed ruling wake remains immediately deliverable when the post-commit nudge is lost",
+       ctx do
+    request = Escalation.operator_ask(ctx.db, ask_call(ctx.raiser, %{question: "recover wake?"}))
+
+    ruled =
+      Escalation.operator_rule(
+        ctx.db,
+        rule_call(request.id, %{decision: "accept"})
+      )
+
+    assert {:ok, [["pending", due_at]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,dueAt FROM wakes WHERE conditionKind='escalation-ruled' AND conditionScope=?1",
+               [request.id]
+             )
+
+    assert due_at == ruled.ruled_at
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+
+    assert {:ok, [["fired", "condition"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,firedBy FROM wakes WHERE conditionKind='escalation-ruled' AND conditionScope=?1",
+               [request.id]
+             )
+
+    assert turn_count(ctx.db, wake_id_for(ctx.db, request.id)) == 1
+  end
+
   test "exact ruling replay validates a corrupt visible terminal row before interpreting it",
        ctx do
     request = Escalation.operator_ask(ctx.db, ask_call(ctx.raiser, %{question: "replay?"}))
@@ -526,7 +556,7 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
     assert insert_message =~ "decision_request_integrity_invalid"
   end
 
-  test "ruling wake preserves the request's stored decision duration", ctx do
+  test "ruling wake is due at settlement despite the request's stored decision duration", ctx do
     request =
       Escalation.operator_ask(
         ctx.db,
@@ -547,7 +577,7 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
                [request.id]
              )
 
-    assert due_at == ruled.ruled_at + 12_345
+    assert due_at == ruled.ruled_at
   end
 
   test "list validates every admitted invalid row and refuses the lexical first id", ctx do
@@ -1353,6 +1383,17 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
   defp turn_count(db, wake_id) do
     {:ok, [[count]]} = DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [wake_id])
     count
+  end
+
+  defp wake_id_for(db, request_id) do
+    {:ok, [[wake_id]]} =
+      DB.query(
+        db,
+        "SELECT wakeId FROM wakes WHERE conditionKind='escalation-ruled' AND conditionScope=?1",
+        [request_id]
+      )
+
+    wake_id
   end
 
   defp failure_trigger_suffix(:wake), do: "wake"

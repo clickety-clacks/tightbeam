@@ -2680,7 +2680,7 @@ defmodule Tightbeam.Escalation do
         session_key: request.raiser_session_key,
         origin: "process:tightbeam",
         prompt: operator_ruling_notification(request.id),
-        due_at: ruled_at + operator_decision_duration(request),
+        due_at: ruled_at,
         condition_kind: "escalation-ruled",
         condition_scope: request.id,
         creator_session_key: via_session,
@@ -3091,7 +3091,7 @@ defmodule Tightbeam.Escalation do
 
     expected_due_at =
       if is_integer(request.ruled_at),
-        do: request.ruled_at + operator_decision_duration(request),
+        do: request.ruled_at,
         else: nil
 
     [[count]] =
@@ -3337,13 +3337,6 @@ defmodule Tightbeam.Escalation do
   end
 
   defp operator_options_valid?(_options), do: false
-
-  defp operator_decision_duration(request)
-       when is_integer(request.deadline_at) and is_integer(request.raised_at) and
-              request.deadline_at > request.raised_at,
-       do: request.deadline_at - request.raised_at
-
-  defp operator_decision_duration(_request), do: decision_deadline_ms()
 
   defp get_raw(_db, nil), do: nil
 
