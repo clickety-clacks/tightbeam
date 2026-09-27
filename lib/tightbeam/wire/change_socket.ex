@@ -183,8 +183,8 @@ defmodule Tightbeam.Wire.ChangeSocket do
     id = message["subscriptionId"]
 
     cond do
-      not canonical_subscribe_shape?(message) ->
-        invalid("subscribe contains an unsupported key", state)
+      Map.has_key?(message, "protocolVersion") and message["protocolVersion"] != 1 ->
+        invalid("protocolVersion must be 1", state)
 
       not (is_binary(id) and id != "") ->
         invalid("subscriptionId is required", state)
@@ -242,14 +242,6 @@ defmodule Tightbeam.Wire.ChangeSocket do
   end
 
   defp normalize_filters(_filters), do: :error
-
-  defp canonical_subscribe_shape?(message) do
-    Enum.all?(
-      Map.keys(message),
-      &(&1 in ["type", "protocolVersion", "subscriptionId", "filters"])
-    ) and
-      (not Map.has_key?(message, "protocolVersion") or message["protocolVersion"] == 1)
-  end
 
   defp authorized_filters(%{principal_kind: :session, principal_id: session_key}, filters) do
     if filters["sessionKey"] == session_key do

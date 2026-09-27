@@ -53,7 +53,7 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
     assert state.principal_kind == :session
     assert state.principal_id == "agent:session"
 
-    {:push, {:text, shape_error}, state} =
+    {:push, {:text, version_error}, state} =
       inbound(
         %{
           "type" => "subscribe",
@@ -64,7 +64,7 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
         state
       )
 
-    assert JSON.decode!(shape_error)["code"] == "invalid_request"
+    assert JSON.decode!(version_error)["code"] == "invalid_request"
     assert state.subscriptions == %{}
 
     {:push, {:text, error}, state} =
@@ -86,7 +86,8 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
           "type" => "subscribe",
           "protocolVersion" => 1,
           "subscriptionId" => "exact",
-          "filters" => %{"sessionKey" => "agent:session", "classes" => ["session."]}
+          "filters" => %{"sessionKey" => "agent:session", "classes" => ["session."]},
+          "clientExtension" => %{"ignored" => true}
         },
         state
       )
