@@ -432,6 +432,28 @@ defmodule Tightbeam.Org do
     end
   end
 
+  @doc "Fetch the exact active session key bound to a session bearer, or nil."
+  @spec active_session_key_by_cli_token(db(), String.t()) :: String.t() | nil
+  def active_session_key_by_cli_token(db \\ Tightbeam.DB, token)
+
+  def active_session_key_by_cli_token(db, token) when is_binary(token) do
+    case DB.query(
+           db,
+           "SELECT sessionKey FROM sessions WHERE cliToken = ?1 AND state = 'active'",
+           [token]
+         ) do
+      {:ok, [[session_key]]} -> session_key
+      {:ok, []} -> nil
+      # A partial synthetic database may intentionally omit the session
+      # catalog. It cannot establish a session principal, so let the caller
+      # continue to the exact device-token lookup instead of crashing before
+      # that authority can be checked.
+      {:error, _reason} -> nil
+    end
+  end
+
+  def active_session_key_by_cli_token(_db, _token), do: nil
+
   @doc "Fetch a session by key, or nil."
   @spec get(db(), String.t()) :: session() | nil
   def get(db \\ Tightbeam.DB, session_key) do

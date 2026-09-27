@@ -1,7 +1,7 @@
 defmodule Tightbeam.Wire.ChangeSocketTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Devices, Gateway, StateResources}
+  alias Tightbeam.{DB, Devices, Gateway, Model, Org, StateResources}
   alias Tightbeam.Firehose.{Hub, Registry}
   alias Tightbeam.Wire.ChangeSocket
 
@@ -19,11 +19,112 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
       ChangeSocket.init(%{
         db: db,
         firehose_hub: hub,
+        cli_token: "org-token",
         firehose_heartbeat_ms: 60_000,
         model_catalog: %{}
       })
 
     %{db: db, hub: hub, device: device, state: state}
+  end
+
+  test "session bearer authenticates the exact session and cannot widen its subscription", ctx do
+    session =
+      Org.create(ctx.db, %{
+        session_key: "agent:session",
+        display_name: "Session",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+
+    {:push, {:text, auth_bytes}, state} =
+      inbound(%{"type" => "auth", "token" => session.cli_token}, ctx.state)
+
+    assert %{
+             "type" => "auth_result",
+             "success" => true,
+             "sessionKey" => "agent:session"
+           } = JSON.decode!(auth_bytes)
+
+    assert state.principal_kind == :session
+    assert state.principal_id == "agent:session"
+
+    {:push, {:text, version_error}, state} =
+      inbound(
+        %{
+          "type" => "subscribe",
+          "protocolVersion" => 2,
+          "subscriptionId" => "wrong-shape",
+          "filters" => %{"sessionKey" => "agent:session"}
+        },
+        state
+      )
+
+    assert JSON.decode!(version_error)["code"] == "invalid_request"
+    assert state.subscriptions == %{}
+
+    {:push, {:text, error}, state} =
+      inbound(
+        %{
+          "type" => "subscribe",
+          "subscriptionId" => "wide",
+          "filters" => %{"classes" => ["session."]}
+        },
+        state
+      )
+
+    assert JSON.decode!(error)["message"] == "sessionKey must match authenticated session"
+    assert state.subscriptions == %{}
+
+    {:push, {:text, ready}, state} =
+      inbound(
+        %{
+          "type" => "subscribe",
+          "protocolVersion" => 1,
+          "subscriptionId" => "exact",
+          "filters" => %{"sessionKey" => "agent:session", "classes" => ["session."]},
+          "clientExtension" => %{"ignored" => true}
+        },
+        state
+      )
+
+    assert JSON.decode!(ready) == %{
+             "type" => "subscription_ready",
+             "subscriptionId" => "exact"
+           }
+
+    assert Map.has_key?(state.subscriptions, "exact")
+
+    Hub.publish(ctx.hub, %{
+      "class" => "session.updated",
+      "refs" => %{"sessionKey" => "agent:sibling"},
+      "payload" => %{"sessionKey" => "agent:sibling", "rowVersion" => 1}
+    })
+
+    refute_receive {:firehose_notice, _}, 50
+
+    Hub.publish(ctx.hub, %{
+      "class" => "session.updated",
+      "refs" => %{"sessionKey" => "agent:session"},
+      "payload" => %{"sessionKey" => "agent:session", "rowVersion" => 1}
+    })
+
+    assert_receive {:firehose_notice, %{"refs" => %{"sessionKey" => "agent:session"}}}
+  end
+
+  test "organization bearer has no Firehose read principal", ctx do
+    {:stop, :normal, 1008, {:text, auth_bytes}, _state} =
+      inbound(%{"type" => "auth", "token" => "org-token"}, ctx.state)
+
+    assert JSON.decode!(auth_bytes) == %{
+             "type" => "auth_result",
+             "success" => false,
+             "reason" => "org_token_read_forbidden"
+           }
   end
 
   test "auth is in-band and subscriptions are multiplexed with conjunctive filters", ctx do
@@ -37,7 +138,6 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
       inbound(
         %{
           "type" => "subscribe",
-          "protocolVersion" => 1,
           "subscriptionId" => "work",
           "filters" => %{"classes" => ["work_item."], "workItemId" => "wi_1"}
         },
@@ -48,7 +148,6 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
       inbound(
         %{
           "type" => "subscribe",
-          "protocolVersion" => 1,
           "subscriptionId" => "all-work",
           "filters" => %{"classes" => ["work_item."]}
         },
@@ -83,7 +182,6 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
           inbound(
             %{
               "type" => "subscribe",
-              "protocolVersion" => 1,
               "subscriptionId" => "s#{index}"
             },
             state
@@ -94,7 +192,7 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
 
     {:push, {:text, error}, _state} =
       inbound(
-        %{"type" => "subscribe", "protocolVersion" => 1, "subscriptionId" => "s101"},
+        %{"type" => "subscribe", "subscriptionId" => "s101"},
         state
       )
 
@@ -110,7 +208,7 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
 
     {:push, {:text, _ready}, state} =
       inbound(
-        %{"type" => "subscribe", "protocolVersion" => 1, "subscriptionId" => "all"},
+        %{"type" => "subscribe", "subscriptionId" => "all"},
         state
       )
 

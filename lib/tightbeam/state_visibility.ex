@@ -7,7 +7,17 @@ defmodule Tightbeam.StateVisibility do
   @admin_classes ~w(config.updated host_env.updated host.registered user.added user.promoted user.demoted identity.updated kungfu.updated)
   @topline_invalidation_classes ~w(topline.created topline_work_membership.linked topline_work_membership.unlinked)
 
+  @spec visible?(DB.server(), map(), map()) :: boolean()
   @spec visible?(DB.server(), map(), String.t(), boolean()) :: boolean()
+  @doc "Apply Firehose visibility for a credential-derived session principal."
+  def visible?(db, notice, %{kind: "session", id: session_key})
+      when is_binary(session_key) and session_key != "" do
+    session_principal_notice_visible?(db, notice, session_key)
+  end
+
+  def visible?(db, notice, %{kind: "user", id: user_id, is_admin: is_admin}),
+    do: visible?(db, notice, user_id, is_admin)
+
   def visible?(_db, _notice, user_id, _is_admin)
       when not is_binary(user_id) or user_id == "", do: false
 
@@ -344,5 +354,55 @@ defmodule Tightbeam.StateVisibility do
     else
       false
     end
+  end
+
+  defp session_principal_notice_visible?(db, notice, session_key) do
+    refs = notice["refs"] || %{}
+    payload = notice["payload"] || %{}
+    principal = %{kind: "session", id: session_key, is_admin: false}
+
+    exact_session? =
+      [
+        refs["sessionKey"],
+        refs["holderKey"],
+        refs["createdBySession"],
+        refs["bySession"],
+        refs["raiserSessionKey"],
+        payload["sessionKey"],
+        payload["holderKey"],
+        payload["createdBySession"],
+        payload["bySession"],
+        payload["raiserSessionKey"]
+      ]
+      |> Enum.any?(&(&1 == session_key))
+
+    exact_principal? = refs["principal"] == "session:#{session_key}"
+    work_item_id = refs["workItemId"] || payload["workItemId"] || payload["id"]
+    work_item? = is_binary(work_item_id) and work_item_visible?(db, work_item_id, principal)
+
+    assignment_id = refs["assignmentId"] || payload["assignmentId"] || payload["id"]
+
+    assignment? =
+      is_binary(assignment_id) and session_assignment_visible?(db, assignment_id, session_key)
+
+    exact_session? or exact_principal? or work_item? or assignment?
+  end
+
+  defp session_assignment_visible?(db, assignment_id, session_key) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT 1
+        FROM assignments a
+        LEFT JOIN work_items wi ON wi.id = a.workItemId
+        WHERE a.id = ?1 AND (
+          a.holderKey = ?2 OR wi.createdBySession = ?2
+        )
+        """,
+        [assignment_id, session_key]
+      )
+
+    rows != []
   end
 end
