@@ -439,7 +439,10 @@ defmodule Tightbeam.SessionLane do
   def handle_info({:DOWN, ref, :process, _pid, _reason}, %{reservation_owner_ref: ref} = state)
       when not is_nil(ref) do
     # An abandoned reservation cannot confer settlement authority on followers.
-    Enum.each(state.settlement_waiters, fn {from, _request} -> GenServer.reply(from, ambiguous()) end)
+    Enum.each(state.settlement_waiters, fn {from, _request} ->
+      GenServer.reply(from, ambiguous())
+    end)
+
     state = %{state | settlement_waiters: []}
     {:noreply, state |> release_reservation(state.reservation_token) |> maybe_start()}
   end
@@ -762,8 +765,15 @@ defmodule Tightbeam.SessionLane do
        when not is_nil(token) do
     if state.reservation_owner_ref, do: Process.demonitor(state.reservation_owner_ref, [:flush])
     waiters = Enum.reverse(state.settlement_waiters)
-    state = %{state | reservation_token: nil, reservation_owner_ref: nil,
-                     settlement_waiters: [], settlement_rechecking: true, deferred_drain: false}
+
+    state = %{
+      state
+      | reservation_token: nil,
+        reservation_owner_ref: nil,
+        settlement_waiters: [],
+        settlement_rechecking: true,
+        deferred_drain: false
+    }
 
     # Use the ordinary admission and settlement checks; a conflicting or live
     # request must retain its refusal rather than inherit the holder's success.

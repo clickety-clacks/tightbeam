@@ -107,7 +107,11 @@ defmodule Tightbeam.LaneManager do
 
           case DynamicSupervisor.start_child(
                  state.lane_sup,
-                 {SessionLane, lane_opts(state, session_key, settlement_reservation: token, settlement_owner: owner)}
+                 {SessionLane,
+                  lane_opts(state, session_key,
+                    settlement_reservation: token,
+                    settlement_owner: owner
+                  )}
                ) do
             {:ok, pid} -> {:ok, pid, token}
             {:error, {:already_started, _pid}} -> {:error, :reservation_lost}

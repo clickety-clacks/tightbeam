@@ -376,14 +376,19 @@ defmodule Tightbeam.StaleTurnSettlementTest do
     {:ok, lane, token} = LaneManager.ensure_settlement_lane(Tightbeam.LaneManager, "k1")
     pending = :gen_server.send_request(lane, {:settle_stale, nil, conflict})
     assert length(:sys.get_state(lane).settlement_waiters) == 1
+
     assert {:error, %{code: "turn_status_ambiguous"}} =
              Tightbeam.SessionLane.settle_stale(lane, make_ref(), request)
+
     assert :sys.get_state(lane).reservation_token == token
     assert {:ok, %{won: true}} = Tightbeam.SessionLane.settle_stale(lane, token, request)
+
     assert {:reply, {:error, %{code: "idempotency_key_conflict"}}} =
              :gen_server.wait_response(pending, 5_000)
+
     assert {:error, %{code: "turn_status_ambiguous"}} =
              Tightbeam.SessionLane.settle_stale(lane, token, request)
+
     assert terminal_truth(ctx.db, target) == {"canceled", nil, 1, 1}
   end
 
@@ -391,20 +396,30 @@ defmodule Tightbeam.StaleTurnSettlementTest do
     target = stale_turn!(ctx.db, "k1", "abandoned reservation", 44)
     request = request!("k1", target, "cancel", "abandoned", "abandoned-key")
     parent = self()
-    owner = spawn(fn ->
-      reservation = LaneManager.ensure_settlement_lane(Tightbeam.LaneManager, "k1")
-      send(parent, {:reservation, reservation})
-      receive do :finish -> :ok end
-    end)
+
+    owner =
+      spawn(fn ->
+        reservation = LaneManager.ensure_settlement_lane(Tightbeam.LaneManager, "k1")
+        send(parent, {:reservation, reservation})
+
+        receive do
+          :finish -> :ok
+        end
+      end)
+
     assert_receive {:reservation, {:ok, lane, token}}
     pending = :gen_server.send_request(lane, {:settle_stale, nil, request})
     assert length(:sys.get_state(lane).settlement_waiters) == 1
     send(owner, :finish)
+
     assert {:reply, {:error, %{code: "turn_status_ambiguous"}}} =
              :gen_server.wait_response(pending, 5_000)
+
     assert :sys.get_state(lane).reservation_token == nil
+
     assert {:error, %{code: "turn_status_ambiguous"}} =
              Tightbeam.SessionLane.settle_stale(lane, token, request)
+
     assert terminal_truth(ctx.db, target) == {"running", nil, 0, 0}
     refute_received {:terminal_published, _}
   end
