@@ -209,6 +209,10 @@ pub enum Command {
         po_role: String,
         idempotency_key: String,
     },
+    SessionConnect {
+        identity: Identity,
+        session_key: String,
+    },
     Tune {
         identity: Identity,
         session_key: String,
@@ -754,6 +758,11 @@ COMMANDS:
 
   session-po-set --session <key> --po-role <role> --key <key>
       Explicitly associate an exact session with its addressed product-owner role.
+
+  session-connect --session <sessionKey>
+      Run the persistent NDJSON stdin/stdout connection for one selected session.
+      Optional --as, --as-user, or --as-process flags affect ordinary wake
+      attribution only; read authorization comes from the discovered bearer.
 
   retire --session <key> [--key <idempotencyKey>]
       End a session deliberately.
@@ -2110,6 +2119,21 @@ fn parse_with_optional_catalog(
                 session_key: nonempty(flags, "session").ok_or("--session is required")?,
                 po_role: nonempty(flags, "po-role").ok_or("--po-role is required")?,
                 idempotency_key: nonempty(flags, "key").ok_or("--key is required")?,
+            })
+        }
+        "session-connect" => {
+            if parsed.positional.len() != 1
+                || flags.keys().any(|flag| {
+                    !matches!(flag.as_str(), "session" | "as" | "as-user" | "as-process")
+                })
+            {
+                return Err("usage: tightbeam session-connect --session <sessionKey> [--as <role> | --as-user <userId> | --as-process <name>]".to_owned());
+            }
+            let session_key = nonempty(flags, "session")
+                .ok_or_else(|| "--session requires a non-empty full session key".to_owned())?;
+            Ok(Command::SessionConnect {
+                identity: identity(flags)?,
+                session_key,
             })
         }
         "tune" => parse_tune(&parsed, flags),
@@ -4452,6 +4476,19 @@ mod tests {
     }
 
     #[test]
+    fn session_connect_accepts_a_quoted_full_session_key_with_the_internal_space() {
+        let session_key = "agent:main:clawline:mike:main s_c55fd592";
+
+        assert_eq!(
+            parse(strings(&["session-connect", "--session", session_key])),
+            Ok(Command::SessionConnect {
+                identity: Identity::Session,
+                session_key: session_key.to_owned(),
+            })
+        );
+    }
+
+    #[test]
     fn help_enumerates_exactly_cli_surface_v1() {
         let help = render_help(Some(&crate::harnesses::catalog().unwrap()));
         assert!(
@@ -4526,6 +4563,7 @@ mod tests {
                 "operator-withdraw",
                 "retire",
                 "sentinel",
+                "session-connect",
                 "session-reparent",
                 "session-po-set",
                 "settle-turn",

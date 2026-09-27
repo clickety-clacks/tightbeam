@@ -1,6 +1,6 @@
 defmodule Tightbeam.KungfuProjectionRefusalTest do
   use Tightbeam.TestCase, async: false
-  alias Tightbeam.{AdminProjection, DB, Identity, StateResources, StateVisibility}
+  alias Tightbeam.{AdminProjection, DB, Identity, Org, StateResources, StateVisibility}
   alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.{Hub, Publisher, Rebuild, Registry}
   alias Tightbeam.Wire.ChangeSocket
@@ -392,7 +392,6 @@ defmodule Tightbeam.KungfuProjectionRefusalTest do
           ws,
           JSON.encode!(%{
             "type" => "subscribe",
-            "protocolVersion" => 1,
             "subscriptionId" => "wire",
             "filters" => %{"classes" => ["kungfu.", "work_item."]}
           })
@@ -428,6 +427,42 @@ defmodule Tightbeam.KungfuProjectionRefusalTest do
     after
       WS.close(ws)
     end
+  end
+
+  test "device authentication does not require a session catalog", %{db: db, hub: hub} do
+    alias Tightbeam.Devices
+
+    :ok = Devices.ensure_schema(db)
+
+    {:paired, device} =
+      Devices.pair(db, %{
+        device_id: "device-only",
+        claimed_name: "Device only",
+        platform: nil,
+        model: nil
+      })
+
+    assert Org.active_session_key_by_cli_token(db, device.token) == nil
+
+    deps = %{db: db, firehose_hub: hub, firehose_heartbeat_ms: 60_000, model_catalog: %{}}
+    assert {:ok, pending} = ChangeSocket.init(deps)
+
+    assert {:push, {:text, bytes}, live} =
+             ChangeSocket.handle_in(
+               {JSON.encode!(%{"type" => "auth", "token" => device.token}), opcode: :text},
+               pending
+             )
+
+    assert JSON.decode!(bytes) == %{
+             "type" => "auth_result",
+             "success" => true,
+             "userId" => device.user_id,
+             "isAdmin" => device.is_admin
+           }
+
+    assert live.principal_kind == :user
+    assert live.principal_id == device.user_id
+    assert :ok = ChangeSocket.terminate(:normal, live)
   end
 
   test "ChangeSocket authenticates synthetic devices and validates subscription state", %{
@@ -483,7 +518,6 @@ defmodule Tightbeam.KungfuProjectionRefusalTest do
 
     request = %{
       "type" => "subscribe",
-      "protocolVersion" => 1,
       "subscriptionId" => "one",
       "filters" => %{"classes" => ["kungfu."]}
     }
@@ -494,7 +528,7 @@ defmodule Tightbeam.KungfuProjectionRefusalTest do
 
     for invalid <- [
           request,
-          %{request | "subscriptionId" => "two", "protocolVersion" => 2},
+          Map.put(request, "protocolVersion", 2),
           %{request | "subscriptionId" => "two", "filters" => %{"unknown" => "value"}},
           %{request | "subscriptionId" => "two", "filters" => %{"classes" => [1]}}
         ] do

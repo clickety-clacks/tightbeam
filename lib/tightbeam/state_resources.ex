@@ -524,6 +524,24 @@ defmodule Tightbeam.StateResources do
     end
   end
 
+  @doc "Return the complete transcript projection for one session."
+  def query_messages_for_session(source, session_key) do
+    source
+    |> query(@message_select <> " WHERE m.sessionKey = ?1 ORDER BY m.seq ASC", [session_key])
+    |> Enum.map(&message_row/1)
+  end
+
+  @doc "Return the complete wake projection for one session."
+  def query_wakes_for_session(db, session_key),
+    do: Wakes.list_for_session(db, session_key)
+
+  @doc "Return the complete turn projection for one session."
+  def query_turns_for_session(source, session_key) do
+    source
+    |> query(@turn_select <> " WHERE t.sessionKey = ?1 ORDER BY t.seq ASC", [session_key])
+    |> Enum.map(&turn_row/1)
+  end
+
   defp session_query_row([
          session_key,
          display_name,

@@ -182,6 +182,44 @@ defmodule Tightbeam.Wire.RouterTest do
     }
   end
 
+  test "selected session REST routes use only the credential-derived read principal", ctx do
+    session = create_session(ctx.db, "selected-session", ctx.device.user_id)
+
+    catalog = %{
+      {"testhost", "claude"} => [
+        %{family: "fable", context: nil, efforts: ["medium"], provider: :anthropic}
+      ]
+    }
+
+    opts = ctx.opts ++ [model_catalog: catalog]
+
+    request = fn path, token ->
+      conn(:get, path)
+      |> put_req_header("authorization", "Bearer " <> token)
+      |> Router.call(Router.init(opts))
+    end
+
+    for suffix <- ["/messages", "/wakes", "/turns"] do
+      path = "/api/sessions/#{session.session_key}#{suffix}"
+      denied = request.(path, "tbc_test")
+      attributed = request.(path <> "?asUser=#{ctx.device.user_id}", "tbc_test")
+
+      assert denied.status == 403
+      assert attributed.status == 403
+      assert JSON.decode!(denied.resp_body)["error"]["code"] == "org_token_read_forbidden"
+      refute denied.resp_body =~ session.session_key
+    end
+
+    messages =
+      request.(
+        "/api/sessions/#{session.session_key}/messages?sessionKey=#{session.session_key}",
+        ctx.device.token
+      )
+
+    assert messages.status == 200
+    assert JSON.decode!(messages.resp_body)["resource"] == "transcript messages"
+  end
+
   test "core device detail preserves authorization order and canonical envelope", ctx do
     opts = ctx.opts ++ [model_catalog: %{}]
 
