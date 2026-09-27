@@ -411,9 +411,9 @@ defmodule Tightbeam.AttentionTierFixture do
              )
 
     assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "lane")
-    assert {:ok, _} = turn_runner(ctx).(Map.put(turn, :session_key, "k1"))
+    assert {:ok, %{record_in_txn: record}} = turn_runner(ctx).(Map.put(turn, :session_key, "k1"))
     # Close the turn the way the lane does, so a following turn can be claimed.
-    :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+    :ok = Tightbeam.GatewayTurnFixture.commit_success!(ctx.db, turn, record)
 
     stop_supervised!(coordinator_id)
 

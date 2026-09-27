@@ -195,8 +195,8 @@ defmodule GuardHarnessSwitch do
       assert_receive {:prompt_started, ^adapter}, 60_000
 
       send(adapter, :continue_prompt)
-      assert {:ok, %{terminal_publish: publish}} = Task.await(task)
-      assert :ok = Ledger.finish(db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+      assert {:ok, %{terminal_publish: publish, record_in_txn: record}} = Task.await(task)
+      assert :ok = Tightbeam.GatewayTurnFixture.commit_success!(db, turn, record)
       publish.("delivered")
 
       assert %{harness_session_id: "harness-1", harness: "codex"} =

@@ -3078,11 +3078,20 @@ defmodule Tightbeam.Gateway do
                      progress_fun(db, turn.session_key, session.owner_user_id, correlation)
                  )
                ) do
-          append_assistant_messages(db, turn, echo, result)
+          attention_tier = elected_attention(db, turn.seq)
 
+          # The lane's terminal CAS owns success publication. Recovery can
+          # terminalize this turn while its adapter result is in flight; a
+          # losing runner must not append assistant messages before that CAS.
           record_in_txn = fn txn ->
+            replies = append_assistant_messages_in_txn(txn, turn, echo, result, attention_tier)
             Tightbeam.ReminderDelivery.delivered_in_txn(txn, turn.seq)
-            HarnessHealth.resolve_normal_turn_in_txn(txn, session, turn)
+            health_publication = HarnessHealth.resolve_normal_turn_in_txn(txn, session, turn)
+
+            fn ->
+              Enum.each(replies, &publish_message(db, turn.session_key, &1))
+              if is_function(health_publication, 0), do: health_publication.()
+            end
           end
 
           {:ok, %{terminal_publish: terminal_publish, record_in_txn: record_in_txn}}
@@ -3194,29 +3203,21 @@ defmodule Tightbeam.Gateway do
   # before publishing any row so a crash cannot expose half of one turn's
   # assistant messages. Legacy adapters and test doubles return only `text`;
   # they keep the historical one-row behavior through the fallback below.
-  defp append_assistant_messages(db, turn, echo, result) do
-    texts = assistant_message_texts(result)
-    attention_tier = elected_attention(db, turn.seq)
+  defp append_assistant_messages_in_txn(txn, turn, echo, result, attention_tier) do
+    Enum.map(assistant_message_texts(result), fn text ->
+      {:appended, reply} =
+        Projection.append_in_txn(txn, %{
+          session_key: turn.session_key,
+          role: "assistant",
+          content: text,
+          sender: "tightbeam",
+          reply_to_message_id: echo && echo.id,
+          reply_to_client_message_id: echo && echo.client_message_id,
+          attention_tier: attention_tier
+        })
 
-    {:ok, replies} =
-      DB.transaction(db, fn txn ->
-        Enum.map(texts, fn text ->
-          {:appended, reply} =
-            Projection.append_in_txn(txn, %{
-              session_key: turn.session_key,
-              role: "assistant",
-              content: text,
-              sender: "tightbeam",
-              reply_to_message_id: echo && echo.id,
-              reply_to_client_message_id: echo && echo.client_message_id,
-              attention_tier: attention_tier
-            })
-
-          reply
-        end)
-      end)
-
-    Enum.each(replies, &publish_message(db, turn.session_key, &1))
+      reply
+    end)
   end
 
   defp assistant_message_texts(%{messages: messages}) when is_list(messages) and messages != [] do

@@ -2,6 +2,23 @@ defmodule Tightbeam.GatewayTurnFixture do
   @moduledoc false
   alias Tightbeam.Model
 
+  # These runner fixtures explicitly perform the lane's commit step. Success
+  # messages now belong to that transaction, so exercise its callback too.
+  def commit_success!(db, turn, record) do
+    {:ok, committed} =
+      Tightbeam.DB.transaction(db, fn txn ->
+        true =
+          Tightbeam.Ledger.finish_in_txn(txn, turn.seq, "delivered", nil,
+            owner_lease: turn.owner_lease
+          )
+
+        record.(txn)
+      end)
+
+    if is_function(committed, 0), do: committed.()
+    :ok
+  end
+
   defmodule CoordinatorStub do
     use GenServer
 

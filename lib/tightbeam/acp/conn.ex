@@ -11,7 +11,9 @@ defmodule Tightbeam.Acp.Conn do
   - Finite per-request timeout via Process.send_after; on timeout the caller gets
     {:error, :timeout} and the pending entry is KEPT (awaiting the adapter's
     eventual answer) until resolution, for quiescence accounting.
-    A live session/prompt explicitly uses :infinity and gets no timer.
+    Owned prompts instead carry an absolute deadline: expiry sends cancel,
+    waits for the original response, then closes this exact connection if the
+    bounded cancellation grace expires. A timeout is never proof of quiescence.
   - Requester death: each pending request monitors its caller; on :DOWN a
     session/cancel notification is sent for that request's session. The
     pending entry is retained until the adapter's terminal response arrives —
@@ -131,9 +133,14 @@ defmodule Tightbeam.Acp.Conn do
 
   @impl true
   def handle_call({:request, method, params, opts}, {pid, _} = from, state) do
-    if state.closed do
-      notify_not_dispatched(opts, :closed)
-      {:reply, {:error, :closed}, state}
+    expired? =
+      is_integer(opts[:prompt_deadline]) and
+        opts[:prompt_deadline] <= System.monotonic_time(:millisecond)
+
+    if state.closed or expired? do
+      reason = if state.closed, do: :closed, else: :prompt_timeout
+      notify_not_dispatched(opts, reason)
+      {:reply, {:error, reason}, state}
     else
       id = state.next_id
 
@@ -146,13 +153,30 @@ defmodule Tightbeam.Acp.Conn do
         notify_dispatched(opts, id)
         timeout = Keyword.get(opts, :timeout, 60_000)
 
-        if timeout != :infinity do
-          Process.send_after(self(), {:req_timeout, id}, timeout)
-        end
+        deadline = Keyword.get(opts, :prompt_deadline)
+        token = make_ref()
+
+        timer =
+          if is_integer(deadline) do
+            Process.send_after(
+              self(),
+              {:prompt_deadline, id, token},
+              max(deadline - System.monotonic_time(:millisecond), 0)
+            )
+          else
+            if timeout != :infinity, do: Process.send_after(self(), {:req_timeout, id}, timeout)
+          end
 
         entry = %{
           from: from,
           monitor: Process.monitor(pid),
+          owner_monitor: if(is_pid(opts[:owner]), do: Process.monitor(opts[:owner])),
+          deadline: deadline,
+          timer: timer,
+          cancel_timer: nil,
+          token: token,
+          cancel_reason: nil,
+          cancel_grace: Keyword.get(opts, :cancel_grace, 5_000),
           session_id: Keyword.get(opts, :session_id),
           prompt_session_id:
             if(method == "session/prompt", do: params[:sessionId] || params["sessionId"]),
@@ -196,7 +220,15 @@ defmodule Tightbeam.Acp.Conn do
   end
 
   def handle_cast(:close, state) do
-    if state.port && !state.closed, do: Port.close(state.port)
+    if state.port && !state.closed do
+      try do
+        Port.close(state.port)
+      rescue
+        # The Port may have exited before its exit_status was handled.
+        ArgumentError -> :ok
+      end
+    end
+
     {:noreply, fail_all(%{state | closed: true}, {:error, :closed})}
   end
 
@@ -223,21 +255,94 @@ defmodule Tightbeam.Acp.Conn do
     end
   end
 
-  def handle_info({:DOWN, ref, :process, _pid, _reason}, state) do
-    case Enum.find(state.pending, fn {_id, e} -> e.monitor == ref end) do
-      {id, entry} ->
-        if entry.session_id do
-          send_json(state.port, %{
-            jsonrpc: "2.0",
-            method: "session/cancel",
-            params: %{sessionId: entry.session_id}
-          })
+  def handle_info({:prompt_deadline, id, token}, state) do
+    case state.pending[id] do
+      %{token: ^token, deadline: deadline} when is_integer(deadline) ->
+        {:noreply, cancel_prompt(state, id, :prompt_timeout)}
+
+      _ ->
+        {:noreply, state}
+    end
+  end
+
+  def handle_info({:prompt_cancel_expired, id, token}, state) do
+    case state.pending[id] do
+      %{token: ^token, cancel_reason: reason, prompt_session_id: sid}
+      when not is_nil(reason) ->
+        # The original response is the acknowledgment. Without it, release the
+        # local transport, never pretend the cancel notification stopped it.
+        if state.port && !state.closed do
+          try do
+            Port.close(state.port)
+          rescue
+            # The Port may have exited before its exit_status was handled.
+            ArgumentError -> :ok
+          end
         end
 
+        emit(state, {:acp_prompt_teardown, self(), id, sid, reason})
+
+        {:noreply,
+         fail_all(
+           %{state | closed: true},
+           {:error, {:prompt_interrupted, {:cancel_unacknowledged, sid}}},
+           true
+         )}
+
+      _ ->
+        {:noreply, state}
+    end
+  end
+
+  def handle_info({:DOWN, ref, :process, _pid, reason}, state) do
+    case Enum.find(state.pending, fn {_id, e} -> e.monitor == ref or e.owner_monitor == ref end) do
+      {id, %{deadline: deadline} = entry} when is_integer(deadline) ->
+        state =
+          if entry.monitor == ref do
+            put_in(state.pending[id], %{entry | orphaned: true, replied: true})
+          else
+            state
+          end
+
+        cause = if entry.monitor == ref, do: {:prompt_worker_exit, reason}, else: :prompt_canceled
+        {:noreply, cancel_prompt(state, id, cause)}
+
+      {id, entry} ->
+        if entry.session_id, do: send_cancel(state, entry.session_id)
         {:noreply, put_in(state.pending[id], %{entry | orphaned: true, replied: true})}
 
       nil ->
         {:noreply, state}
+    end
+  end
+
+  defp cancel_prompt(state, id, reason) do
+    case state.pending[id] do
+      %{cancel_reason: nil} = entry ->
+        send_cancel(state, entry.prompt_session_id)
+
+        timer =
+          Process.send_after(
+            self(),
+            {:prompt_cancel_expired, id, entry.token},
+            entry.cancel_grace
+          )
+
+        emit(state, {:acp_prompt_cancelling, id, entry.prompt_session_id, reason})
+        put_in(state.pending[id], %{entry | cancel_reason: reason, cancel_timer: timer})
+
+      _ ->
+        state
+    end
+  end
+
+  defp send_cancel(state, sid) do
+    unless state.closed do
+      send_request_json(state.port, %{
+        jsonrpc: "2.0",
+        method: "session/cancel",
+        params: %{sessionId: sid}
+      })
     end
   end
 
@@ -265,18 +370,33 @@ defmodule Tightbeam.Acp.Conn do
 
   defp route(%{"id" => id} = msg, state) when is_map_key(state.pending, id) do
     {entry, pending} = Map.pop(state.pending, id)
-    Process.demonitor(entry.monitor, [:flush])
+    release_request(entry)
+
+    reason =
+      entry.cancel_reason ||
+        if(is_integer(entry.deadline) and entry.deadline <= System.monotonic_time(:millisecond),
+          do: :prompt_timeout
+        )
 
     reply =
-      case msg do
-        %{"error" => err} -> {:error, err}
-        _ -> {:ok, msg["result"]}
+      case {reason, msg} do
+        {reason, _} when not is_nil(reason) -> {:error, reason}
+        {nil, %{"error" => err}} -> {:error, err}
+        {nil, _} -> {:ok, msg["result"]}
       end
 
     cond do
-      entry.orphaned -> emit(state, {:acp_orphan_resolved, entry.session_id})
-      entry.replied -> emit(state, {:acp_late_reply, entry.method})
-      true -> GenServer.reply(entry.from, reply)
+      entry.orphaned and is_integer(entry.deadline) ->
+        emit(state, {:acp_prompt_orphan_resolved, self(), id, entry.session_id})
+
+      entry.orphaned ->
+        emit(state, {:acp_orphan_resolved, entry.session_id})
+
+      entry.replied ->
+        emit(state, {:acp_late_reply, entry.method})
+
+      true ->
+        GenServer.reply(entry.from, reply)
     end
 
     %{state | pending: pending}
@@ -291,9 +411,24 @@ defmodule Tightbeam.Acp.Conn do
 
   ## Helpers
 
-  defp fail_all(state, reply) do
-    for {_id, %{replied: false} = e} <- state.pending, do: GenServer.reply(e.from, reply)
+  defp fail_all(state, reply, owned_teardown? \\ false) do
+    for {_id, entry} <- state.pending do
+      release_request(entry)
+      # On exceptional teardown the adapter alone settles owned prompt calls.
+      # A worker reply racing that signal could otherwise start a successor
+      # before the generation's workers have been released.
+      unless entry.replied or (owned_teardown? and is_integer(entry.deadline)),
+        do: GenServer.reply(entry.from, reply)
+    end
+
     %{state | pending: %{}}
+  end
+
+  defp release_request(entry) do
+    Process.demonitor(entry.monitor, [:flush])
+    if entry.owner_monitor, do: Process.demonitor(entry.owner_monitor, [:flush])
+    if entry.timer, do: Process.cancel_timer(entry.timer)
+    if entry.cancel_timer, do: Process.cancel_timer(entry.cancel_timer)
   end
 
   defp emit(%{subscriber: nil}, _msg), do: :ok
