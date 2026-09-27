@@ -96,7 +96,7 @@ defmodule Tightbeam.LaneManager do
     {:reply, :ok, state}
   end
 
-  def handle_call({:ensure_settlement_lane, session_key}, _from, state) do
+  def handle_call({:ensure_settlement_lane, session_key}, {owner, _tag}, state) do
     reply =
       case Registry.lookup(Tightbeam.LaneRegistry, session_key) do
         [{pid, _}] ->
@@ -107,7 +107,11 @@ defmodule Tightbeam.LaneManager do
 
           case DynamicSupervisor.start_child(
                  state.lane_sup,
-                 {SessionLane, lane_opts(state, session_key, settlement_reservation: token)}
+                 {SessionLane,
+                  lane_opts(state, session_key,
+                    settlement_reservation: token,
+                    settlement_owner: owner
+                  )}
                ) do
             {:ok, pid} -> {:ok, pid, token}
             {:error, {:already_started, _pid}} -> {:error, :reservation_lost}
