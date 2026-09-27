@@ -27,7 +27,6 @@ defmodule Tightbeam.ModelCatalog do
     Harness,
     Id,
     Model,
-    PiProvider,
     Placement,
     TerminalCredentialFailure,
     Unroutable
@@ -722,6 +721,9 @@ defmodule Tightbeam.ModelCatalog do
         {:needs_onboarding, reason} ->
           {:error, {:needs_onboarding, reason}}
 
+        {:unavailable, detail} ->
+          {:error, {:credential_status_unavailable, detail}}
+
         # Onboarded, but the harness-home metadata records no kind. Refused rather than
         # defaulted: the two kinds read different routes, so a catalog derived
         # against a guessed kind would be a confident answer about the wrong
@@ -741,18 +743,25 @@ defmodule Tightbeam.ModelCatalog do
     end
   end
 
-  defp catalog_onboarding_status(Tightbeam.Harness.Pi, catalog_state, state, host) do
+  defp catalog_onboarding_status(Tightbeam.Harness.Pi, _catalog_state, state, host) do
+    go = credential_status(state, :opencode_go, host)
+    local = credential_status(state, :local_openai, host)
+
     cond do
-      credential_status(state, :opencode_go, host) ==
-          {:needs_onboarding, :credential_server_unavailable} ->
+      go == {:needs_onboarding, :credential_server_unavailable} ->
         {:needs_onboarding, :credential_server_unavailable}
 
-      credential_status(state, :local_openai, host) ==
-          {:needs_onboarding, :credential_server_unavailable} ->
+      local == {:needs_onboarding, :credential_server_unavailable} ->
         {:needs_onboarding, :credential_server_unavailable}
 
-      PiProvider.pi_catalog_ready?(catalog_state) ->
+      go == :onboarded or local == :onboarded ->
         :onboarded
+
+      match?({:unavailable, _}, go) ->
+        go
+
+      match?({:unavailable, _}, local) ->
+        local
 
       true ->
         {:needs_onboarding, :missing}
@@ -843,6 +852,7 @@ defmodule Tightbeam.ModelCatalog do
   # waiting a full TTL later (O4/I5, the DELETE). The `refreshing` guard still
   # bounds this to one in-flight derive per key.
   defp expired?(%{reason: {:needs_onboarding, _}}, _now, _ttl), do: true
+  defp expired?(%{reason: {:credential_status_unavailable, _}}, _now, _ttl), do: true
 
   defp expired?(%{derived_at: nil, attempted_at: nil}, _now, _ttl), do: true
 
