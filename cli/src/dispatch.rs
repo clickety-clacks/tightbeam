@@ -6747,7 +6747,10 @@ mod tests {
             FailurePresentation::Tune,
         );
         assert!(!rendered.contains("fixtureSENTINEL"), "{rendered}");
-        assert!(!rendered.contains('\n'), "tune stays one JSON line: {rendered}");
+        assert!(
+            !rendered.contains('\n'),
+            "tune stays one JSON line: {rendered}"
+        );
         let refusal: Value = serde_json::from_str(&rendered).unwrap();
         assert_eq!(refusal["body"], expected_body);
         assert_eq!(refusal["attempt"]["receipt"], "unavailable");
