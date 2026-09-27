@@ -71,6 +71,7 @@ defmodule Tightbeam.Ledger do
     ON turns (status, sessionKey, seq)
     WHERE status IN ('queued','running');
   CREATE INDEX IF NOT EXISTS turns_session ON turns (sessionKey, seq);
+  CREATE INDEX IF NOT EXISTS turns_message_id ON turns(messageId);
   CREATE INDEX IF NOT EXISTS turns_unpublished
     ON turns (endedAt) WHERE endedAt IS NOT NULL AND publishedAt IS NULL;
   CREATE INDEX IF NOT EXISTS turns_job_ref ON turns (jobRef);
