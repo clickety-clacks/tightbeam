@@ -11,6 +11,63 @@ defmodule Tightbeam.BreathingTest do
     %{db: db}
   end
 
+  test "assignment queue is computed, scoped and disclosed only to opener or owner", %{db: db} do
+    :ok =
+      DB.execute(
+        db,
+        "UPDATE assignments SET openedByUser=NULL,openedBySession='active2' WHERE id='asg_active'"
+      )
+
+    call = %{
+      principal: {:session, "active2"},
+      params: %{target_kind: "assignment", target_id: "asg_active"}
+    }
+
+    assert %{queue: %{count: 0, oldestAgeMs: nil, senders: []}} = Breathing.handle(db, call)
+
+    insert_turn!(db, 100, "active", "queued", assignment_id: "asg_active")
+    insert_turn!(db, 101, "active", "queued", assignment_id: "asg_active")
+    insert_turn!(db, 102, "active", "queued", assignment_id: "asg_pending")
+    insert_turn!(db, 103, "active2", "queued", assignment_id: "asg_active")
+    insert_turn!(db, 104, "active", "running", assignment_id: "asg_active")
+    :ok = DB.execute(db, "UPDATE turns SET origin='agent:sender' WHERE seq=101")
+
+    snapshot = DB.query(db, "SELECT * FROM turns ORDER BY seq")
+
+    assert {:ok, {:ok, %{count: 2, oldestAgeMs: 900, senders: ["agent:sender", "user:owner"]}}} =
+             DB.transaction(db, fn txn ->
+               Tightbeam.AssignmentQueue.query_in_txn(
+                 txn,
+                 "asg_active",
+                 {:session, "active2"},
+                 1000
+               )
+             end)
+
+    assert %{queue: %{count: 2} = queue} =
+             Breathing.handle(db, %{call | principal: {:user, "owner"}})
+
+    assert Enum.sort(Map.keys(queue)) == [:count, :oldestAgeMs, :senders]
+
+    for principal <- [
+          {:session, "active"},
+          {:session, "unrelated"},
+          {:user, "other"},
+          {:process, "tightbeam"}
+        ] do
+      assert {:ok, {:error, :forbidden}} =
+               DB.transaction(db, fn txn ->
+                 Tightbeam.AssignmentQueue.query_in_txn(txn, "asg_active", principal, 1000)
+               end)
+
+      refute Map.has_key?(Breathing.handle(db, %{call | principal: principal}), :queue)
+    end
+
+    assert DB.query(db, "SELECT * FROM turns ORDER BY seq") == snapshot
+    :ok = DB.execute(db, "UPDATE turns SET status='delivered',endedAt=1000 WHERE seq=100")
+    assert %{queue: %{count: 1, senders: ["agent:sender"]}} = Breathing.handle(db, call)
+  end
+
   test "A1 and A5: missing and retired session gates beat physical paths", %{db: db} do
     assert %{breathing: false, reason: "session_missing", evidence: %{}} =
              Breathing.query(db, "session", "missing")
