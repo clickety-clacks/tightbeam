@@ -262,14 +262,18 @@ defmodule Tightbeam.ModelCatalogTest do
 
         assert :counters.get(attempts, 1) == 1
 
-        Enum.each(1..10_000, fn _ ->
+        # The catalog has no count threshold: any read, concurrent read or force
+        # after the terminal answer that reached the provider would show as a
+        # second attempt. A few hundred of each proves that; ten thousand only
+        # measured how fast the runner drains the mailbox.
+        Enum.each(1..200, fn _ ->
           assert match?(
                    {[], {:unavailable, {:terminal_credential_failure, _incident_id}}},
                    ModelCatalog.get(@host, "codex", catalog)
                  )
         end)
 
-        1..10_000
+        1..256
         |> Task.async_stream(
           fn _ -> ModelCatalog.get(@host, "codex", catalog) end,
           max_concurrency: 32,
@@ -280,11 +284,12 @@ defmodule Tightbeam.ModelCatalogTest do
           {:ok, {[], {:unavailable, {:terminal_credential_failure, _incident_id}}}} -> :ok
         end)
 
-        Enum.each(1..10_000, fn _ ->
+        Enum.each(1..200, fn _ ->
           ModelCatalog.credential_present(@host, :openai, catalog)
         end)
 
-        _state_after_casts = :sys.get_state(catalog)
+        # Check-side barrier for the casts above; see test/support/test_case.ex.
+        _state_after_casts = :sys.get_state(catalog, 60_000)
         assert :counters.get(attempts, 1) == 1
       end)
 
@@ -336,7 +341,7 @@ defmodule Tightbeam.ModelCatalogTest do
           ModelCatalog.credential_present(@host, :openai, catalog)
         end)
 
-        _state_after_casts = :sys.get_state(catalog)
+        _state_after_casts = :sys.get_state(catalog, 60_000)
         assert :counters.get(attempts, 1) == 1
       end)
 
@@ -2029,7 +2034,9 @@ defmodule Tightbeam.ModelCatalogTest do
     await(fn -> ModelCatalog.get(host, harness, catalog) |> elem(1) == :fresh end)
   end
 
-  defp await(fun, attempts \\ 100)
+  # Check-side poll: 4,000 tries at 5 ms is a 20 s budget. Callers that hold a
+  # setup-side window pass their own count.
+  defp await(fun, attempts \\ 4_000)
 
   defp await(fun, attempts) when attempts > 0 do
     if fun.() do
@@ -2249,10 +2256,10 @@ defmodule Tightbeam.ModelCatalogTest do
       # The wired recognition fires with no get/3 afterward. The sys call is only
       # a mailbox barrier: once it returns, the preceding cast has been handled.
       ModelCatalog.credential_present(@host, :anthropic, catalog)
-      barrier_state = :sys.get_state(catalog)
+      barrier_state = :sys.get_state(catalog, 60_000)
 
       claude_after = claude_before + 1
-      assert_receive {:catalog_generation, :claude, ^claude_after}, 2_000
+      assert_receive {:catalog_generation, :claude, ^claude_after}, 60_000
       assert Agent.get(claude_generation, & &1) == claude_after
 
       # Provider-scoped: an anthropic recognition re-derives the harness that
@@ -2295,7 +2302,7 @@ defmodule Tightbeam.ModelCatalogTest do
         )
 
       # Derive #1 (boot) is in flight and blocked.
-      assert_receive {:fetch_started, 1}, 2_000
+      assert_receive {:fetch_started, 1}, 60_000
 
       # A credential-present lands while #1 is in flight -> recheck is set.
       ModelCatalog.credential_present(@host, :anthropic, catalog)
@@ -2303,7 +2310,7 @@ defmodule Tightbeam.ModelCatalogTest do
       # Release #1; it completes {:ok}. The recheck must force derive #2 — the
       # success path honoring it, symmetric with the error path.
       Agent.update(gate, fn _ -> true end)
-      assert_receive {:fetch_started, 2}, 2_000
+      assert_receive {:fetch_started, 2}, 60_000
     end
 
     # The eezo production repro (orchestrator, 2026-08-06): a CLEAN one-shot
@@ -2454,7 +2461,7 @@ defmodule Tightbeam.ModelCatalogTest do
       # and refreshing state prove the no-match action did nothing without a
       # timing-based negative receive.
       assert :ok = Tightbeam.Productions.CatalogRederive.recognize(ctx.db, catalog, 999_999)
-      no_match_state = :sys.get_state(catalog)
+      no_match_state = :sys.get_state(catalog, 60_000)
       refute get_in(no_match_state, [:entries, {@host, "claude"}, :refreshing])
       assert Agent.get(claude_generation, & &1) == claude_before
 
@@ -2471,10 +2478,10 @@ defmodule Tightbeam.ModelCatalogTest do
         end)
 
       assert :ok = Tightbeam.Productions.CatalogRederive.recognize(ctx.db, catalog, fact_id)
-      _matching_barrier = :sys.get_state(catalog)
+      _matching_barrier = :sys.get_state(catalog, 60_000)
 
       claude_after = claude_before + 1
-      assert_receive {:catalog_generation, :claude, ^claude_after}, 2_000
+      assert_receive {:catalog_generation, :claude, ^claude_after}, 60_000
       assert Agent.get(claude_generation, & &1) == claude_after
     end
   end

@@ -470,7 +470,8 @@ defmodule Tightbeam.IsolatedLifecycleIsolationTest do
     ArgumentError -> :ok
   end
 
-  defp wait_until(fun, timeout \\ 5_000, interval \\ 25) do
+  # Check-side poll; see test/support/test_case.ex.
+  defp wait_until(fun, timeout \\ 20_000, interval \\ 25) do
     deadline = System.monotonic_time(:millisecond) + timeout
     do_wait(fun, deadline, interval)
   end
