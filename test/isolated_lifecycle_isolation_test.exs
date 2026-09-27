@@ -425,7 +425,14 @@ defmodule Tightbeam.IsolatedLifecycleIsolationTest do
       ])
 
     {:os_pid, pid} = Port.info(port, :os_pid)
-    assert wait_until(fn -> process_command(pid) != "" end), "stand-in process failed to start"
+
+    # `exec` replaces `sh` in place, so until it lands the same pid reads as
+    # `sh -c exec sleep 300`. The shim compares the recorded command against the
+    # live one and refuses a mismatch as a recycled pid, so record only the final
+    # identity.
+    assert wait_until(fn -> process_command(pid) == "sleep 300" end),
+           "stand-in process failed to exec sleep"
+
     {port, pid, process_command(pid), process_start(pid)}
   end
 

@@ -159,6 +159,17 @@ defmodule Tightbeam.DeployReadinessTest do
              Ready.observe!(db, "new-session", "new-wake")
   end
 
+  test "mode rejects typos instead of entering full destructive smoke" do
+    assert Ready.mode!("readiness") == :readiness
+    assert_raise ArgumentError, fn -> Ready.mode!("ready") end
+  end
+end
+
+defmodule Tightbeam.DeployReadinessRuntimeTest do
+  # The child-BEAM case runs outside the async phase, where it would share the
+  # runner with up to max_cases async modules and test-file compilation.
+  use Tightbeam.TestCase, async: false
+
   @tag :tmp_dir
   test "observer preserves exact reply binding on the composed R1 schema", %{tmp_dir: tmp} do
     Tightbeam.GuardRuntimeFixture.run!(
@@ -166,10 +177,5 @@ defmodule Tightbeam.DeployReadinessTest do
       "guard_readiness_runtime.exs",
       "guarded-readiness-reply-binding: ok"
     )
-  end
-
-  test "mode rejects typos instead of entering full destructive smoke" do
-    assert Ready.mode!("readiness") == :readiness
-    assert_raise ArgumentError, fn -> Ready.mode!("ready") end
   end
 end
