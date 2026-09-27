@@ -487,10 +487,14 @@ defmodule Tightbeam.TranscriptTest do
         ctx.db,
         "UPDATE turns SET status='delivered',startedAt=1,endedAt=2 WHERE seq IN (?1,?2)",
         [first_turn, last_turn]
-      )
+    )
 
     assert Enum.map(Ledger.unpublished_terminals(ctx.db), & &1.seq) == [first_turn, last_turn]
-    assert Enum.any?(unpublished_terminal_plan(ctx.db), &String.contains?(&1, "turns_unpublished"))
+
+    assert Enum.any?(
+             unpublished_terminal_plan(ctx.db),
+             &String.contains?(&1, "turns_unpublished")
+           )
 
     expected_ids = Enum.map(turns, & &1.id) ++ [reply_id]
     indexed_before = read(ctx, %{session_key: "owned", limit: 500})
@@ -519,6 +523,7 @@ defmodule Tightbeam.TranscriptTest do
     after_upgrade = read(ctx, %{session_key: "owned", limit: 500})
     assert after_upgrade.messages == indexed_before.messages
     assert_indexed_transcript_plan(transcript_join_plan(ctx.db))
+
     assert {:ok, [[251]]} =
              DB.query(ctx.db, "SELECT COUNT(*) FROM messages WHERE sessionKey='owned'")
 
