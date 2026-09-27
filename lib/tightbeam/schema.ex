@@ -1440,15 +1440,22 @@ defmodule Tightbeam.Schema do
     :ok = upgrade_pi_providers(db)
     :ok = upgrade_addressed_po_consultation(db)
     :ok = Tightbeam.QueuedMessageSuppression.ensure_schema(db)
-    Enum.each(@schema_modules, fn module -> :ok = module.ensure_schema(db) end)
+    Enum.each(@schema_modules, fn
+      Tightbeam.Ledger -> :ok
+      module -> :ok = module.ensure_schema(db)
+    end)
     :ok = upgrade_cursor_provider_v1_020(db)
     :ok = upgrade_cannot_proceed(db)
-    Enum.each(@schema_modules, fn module -> :ok = module.ensure_schema(db) end)
+    Enum.each(@schema_modules, fn
+      Tightbeam.Ledger -> :ok
+      module -> :ok = module.ensure_schema(db)
+    end)
     :ok = upgrade_stale_turn_settlement(db)
     :ok = upgrade_terminal_credential_failure(db)
     :ok = Tightbeam.ReadMarkers.ensure_schema(db)
     :ok = Tightbeam.Sentinels.ensure_schema(db)
     :ok = upgrade_agent_reparent(db)
+    :ok = Tightbeam.Ledger.ensure_schema(db)
 
     case DB.finish_schema(db) do
       :ok -> :ok

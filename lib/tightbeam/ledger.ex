@@ -71,7 +71,6 @@ defmodule Tightbeam.Ledger do
     ON turns (status, sessionKey, seq)
     WHERE status IN ('queued','running');
   CREATE INDEX IF NOT EXISTS turns_session ON turns (sessionKey, seq);
-  CREATE INDEX IF NOT EXISTS turns_message_id ON turns(messageId);
   CREATE INDEX IF NOT EXISTS turns_unpublished
     ON turns (endedAt) WHERE endedAt IS NOT NULL AND publishedAt IS NULL;
   CREATE INDEX IF NOT EXISTS turns_job_ref ON turns (jobRef);
@@ -128,7 +127,9 @@ defmodule Tightbeam.Ledger do
     ON turn_clear_attempts (turnSeq, createdAt);
   """
 
-  @ddl @historical_ddl <> @clear_attempts_ddl
+  @ddl @historical_ddl <>
+         @clear_attempts_ddl <>
+         "CREATE INDEX IF NOT EXISTS turns_message_id ON turns(messageId);"
 
   @doc false
   @spec ensure_historical_schema(db()) :: :ok | {:error, term()}
