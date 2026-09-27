@@ -3050,11 +3050,17 @@ fn secret_value(text: &[u8]) -> Option<usize> {
             }
             Some(text.len())
         }
-        Some(b'\'') => text[1..]
-            .iter()
-            .position(|byte| *byte == b'\'')
-            .map(|end| end + 2)
-            .or(Some(text.len())),
+        Some(b'\'') => {
+            let mut at = 1;
+            while at < text.len() {
+                match text[at] {
+                    b'\\' if at + 1 < text.len() => at += 2,
+                    b'\'' => return Some(at + 1),
+                    _ => at += 1,
+                }
+            }
+            Some(text.len())
+        }
         _ => {
             let length = text
                 .iter()
@@ -6252,6 +6258,10 @@ mod tests {
                 "api-key: 'fixtureSENTINEL\\",
                 "api-key: '[REDACTED:secret_field]'",
             ),
+            (
+                "api-key: 'prefix\\'fixtureSENTINEL'",
+                "api-key: '[REDACTED:secret_field]'",
+            ),
         ];
 
         for (body, expected) in bodies {
@@ -6710,6 +6720,36 @@ mod tests {
             refusal["body"],
             "not json; Authorization: Bearer [REDACTED:secret_field]"
         );
+        assert_eq!(refusal["attempt"]["receipt"], "unavailable");
+
+        let unterminated_body = "not json; api-key: 'fixtureSENTINEL";
+        let decode_error = serde_json::from_str::<Value>(unterminated_body).unwrap_err();
+        let expected_body = "not json; api-key: '[REDACTED:secret_field]'";
+
+        let rendered = undecodable_response_with_attempt(
+            502,
+            unterminated_body,
+            &decode_error,
+            Some(fixture.render()),
+            FailurePresentation::Ordinary,
+        );
+        let (human, machine) = readings(&rendered);
+        assert!(!rendered.contains("fixtureSENTINEL"), "{rendered}");
+        assert!(human.contains(expected_body), "{human}");
+        assert_eq!(machine["error"]["body"], expected_body);
+        assert_eq!(machine["attempt"]["receipt"], "unavailable");
+
+        let rendered = undecodable_response_with_attempt(
+            502,
+            unterminated_body,
+            &decode_error,
+            Some(fixture.render()),
+            FailurePresentation::Tune,
+        );
+        assert!(!rendered.contains("fixtureSENTINEL"), "{rendered}");
+        assert!(!rendered.contains('\n'), "tune stays one JSON line: {rendered}");
+        let refusal: Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(refusal["body"], expected_body);
         assert_eq!(refusal["attempt"]["receipt"], "unavailable");
     }
 
