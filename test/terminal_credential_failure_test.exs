@@ -1,6 +1,21 @@
 defmodule Tightbeam.TerminalCredentialFailureTest do
   use Tightbeam.TestCase, async: false
 
+  @tag tmp_dir: true
+  test "read-only views refuse an unknown schema stamp", %{tmp_dir: tmp} do
+    path = Path.join(tmp, "state.db")
+    {:ok, conn} = Exqlite.Sqlite3.open(path)
+
+    try do
+      :ok = Exqlite.Sqlite3.execute(conn, "CREATE TABLE schema_stamp(shape TEXT NOT NULL)")
+      :ok = Exqlite.Sqlite3.execute(conn, "INSERT INTO schema_stamp VALUES ('unknown-successor')")
+    after
+      :ok = Exqlite.Sqlite3.close(conn)
+    end
+
+    assert Tightbeam.TerminalCredentialFailure.readonly_views(tmp) == []
+  end
+
   @tag tmp_dir: true, guard_runtime: true
   test "one open incident owns the canonical statement and current admin delivery", %{
     tmp_dir: tmp

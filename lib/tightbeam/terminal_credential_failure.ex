@@ -204,8 +204,15 @@ defmodule Tightbeam.TerminalCredentialFailure do
 
       try do
         case sqlite_rows(conn, "SELECT shape FROM schema_stamp") do
-          [["terminal-credential-failure-v1-019"]] -> readonly_views_from_conn(conn)
-          _other_shape -> []
+          [[shape]]
+          when shape in [
+                 "terminal-credential-failure-v1-019",
+                 "delivery-owner-reparent-v1-019"
+               ] ->
+            readonly_views_from_conn(conn)
+
+          _other_shape ->
+            []
         end
       after
         Exqlite.Sqlite3.close(conn)
