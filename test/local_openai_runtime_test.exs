@@ -1,8 +1,9 @@
 defmodule Tightbeam.LocalOpenAiRuntimeTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.LocalOpenAi.Providers
+  alias Tightbeam.ErrorDiagnostic
   alias Tightbeam.Harness.Support
+  alias Tightbeam.LocalOpenAi.Providers
   alias Tightbeam.PiProvider
   alias Tightbeam.PiProvider.LocalOpenAi
 
@@ -35,6 +36,46 @@ defmodule Tightbeam.LocalOpenAiRuntimeTest do
       assert reason =~ "reserved"
       assert {:error, _} = Providers.validate_name("Spark")
       assert {:error, _} = Providers.validate_name("1spark")
+    end
+  end
+
+  describe "malformed provider records" do
+    @sentinel "sk-fixture-SENTINEL-0123456789abcdef"
+
+    setup do
+      base =
+        Path.join(System.tmp_dir!(), "tb-local-openai-bad-#{System.unique_integer([:positive])}")
+
+      File.mkdir_p!(Providers.providers_dir(base))
+
+      File.write!(
+        Providers.provider_path(base, "spark"),
+        ~s({"name":"spark","apiKey":"#{@sentinel}" x})
+      )
+
+      on_exit(fn -> File.rm_rf(base) end)
+      %{base: base}
+    end
+
+    test "a JSON parse failure is a named reason, not a crash, and omits the bytes", %{base: base} do
+      assert {:error, reason} = Providers.read(base, "spark")
+      assert reason =~ "is invalid: not valid JSON: invalid byte at offset"
+      refute reason =~ @sentinel
+
+      bytes = File.read!(Providers.provider_path(base, "spark"))
+      assert Providers.hollow_reason(bytes) =~ "not valid JSON: invalid byte at offset"
+    end
+
+    test "materialization proceeds without them but logs why", %{base: base} do
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert PiProvider.named_local_providers(base) == []
+        end)
+
+      assert log =~ "local-openai providers could not be read"
+      assert log =~ "read_local_providers"
+      assert log =~ "not valid JSON"
+      refute log =~ @sentinel
     end
   end
 
@@ -299,6 +340,79 @@ defmodule Tightbeam.LocalOpenAiRuntimeTest do
     refute inspect(command) =~ secret
     assert inspect(command) =~ "JSON.parse"
     refute inspect(result) =~ secret
+  end
+
+  test "remote provider refusals that are not stdout keep their reason" do
+    remote = fn redactor ->
+      %{
+        base_dir: "/remote/tightbeam",
+        options: %{
+          find_executable: fn "ssh" -> "/usr/bin/ssh" end,
+          sh: fn command ->
+            joined = Enum.join(command, " ")
+
+            cond do
+              String.contains?(joined, "/bin/ls -1") -> {"spark.json\n", 0}
+              String.contains?(joined, "/bin/test") -> {"", 0}
+              String.contains?(joined, "JSON.parse") -> redactor.()
+              true -> {"", 0}
+            end
+          end
+        },
+        host_config: %{ssh: "fixture@remote", base_dir: "/remote/tightbeam"}
+      }
+    end
+
+    # The redacted record decodes but fails its shape check: the refusal is
+    # Tightbeam's own sentence and names the field.
+    empty_endpoint = fn ->
+      {~s({"name":"spark","type":"local-openai","endpoint":""}) <>
+         "\n__TIGHTBEAM_API_KEY_ABSENT__\n", 0}
+    end
+
+    assert {:error, {:remote_provider_read_failed, "spark", reason}} =
+             Providers.read_all_target(remote.(empty_endpoint))
+
+    assert reason ==
+             "the local-openai provider record at /remote/tightbeam/auth/pi-local/providers/spark.json is invalid: endpoint is empty"
+
+    # A transport exception keeps its message instead of becoming a bare atom.
+    raised = fn -> raise "ssh transport broke for sk-fixture-SENTINEL-0123456789abcdef" end
+
+    assert {:error,
+            {:remote_provider_read_failed, "spark", {:transport, {:transport_exception, message}}}} =
+             Providers.read_all_target(remote.(raised))
+
+    assert message == "ssh transport broke for [REDACTED:token]"
+
+    # An unexpected runner result keeps its classification and typed safe detail.
+    unexpected = fn -> {~s({"apiKey":"TB_REMOTE_UNEXPECTED_RESULT_SECRET"}), :killed} end
+
+    assert {:error, {:remote_provider_read_failed, "spark", reason}} =
+             Providers.read_all_target(remote.(unexpected))
+
+    assert {:remote_command_failed, {:unexpected_result, {{:binary, bytes}, :killed}}} =
+             ErrorDiagnostic.classified(reason)
+
+    assert bytes == byte_size(~s({"apiKey":"TB_REMOTE_UNEXPECTED_RESULT_SECRET"}))
+
+    assert %{
+             "kind" => "unexpected_result",
+             "operation" => "remote_command",
+             "phase" => "bounded_run",
+             "origin" => "local_openai_provider",
+             "reason" => %{
+               "$type" => "tuple",
+               "items" => [
+                 ~s({"apiKey":"[REDACTED:secret_field]"}),
+                 %{"$type" => "atom", "value" => "killed"}
+               ]
+             }
+           } = ErrorDiagnostic.of(reason)
+
+    assert inspect(reason) =~ "unexpected_result"
+    assert inspect(reason) =~ "killed"
+    refute inspect(reason) =~ "TB_REMOTE_UNEXPECTED_RESULT_SECRET"
   end
 
   test "unproven local models receive conservative capabilities" do

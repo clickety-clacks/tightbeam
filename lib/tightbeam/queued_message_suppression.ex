@@ -96,6 +96,7 @@ defmodule Tightbeam.QueuedMessageSuppression do
 
     session_key = Map.get(attrs, :session_key)
     origin = Map.get(attrs, :origin)
+
     sender_session_key =
       replacement_sender_session_in_txn(txn, assignment_id, Map.get(attrs, :wake_id))
 
@@ -246,7 +247,8 @@ defmodule Tightbeam.QueuedMessageSuppression do
       when target_gate != 0 ->
         true
 
-      _ -> false
+      _ ->
+        false
     end
   end
 

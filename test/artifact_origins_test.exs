@@ -169,7 +169,9 @@ defmodule Tightbeam.ArtifactOriginsTest do
     assert ArtifactOrigins.resolve(migrated) == {:error, :unknown_origin}
     assert :ok = Schema.ensure_all(db)
     assert Artifacts.get(db, row.artifact_id) == migrated
-    assert {:ok, [["artifact-origin-v1-019"]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok, [["identity-publication-denial-diagnostic-v1-019"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
   end
 
   test "migration stamp failure rolls the provenance columns back", %{db: db} do

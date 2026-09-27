@@ -1,5 +1,6 @@
 mod anthropic_oauth;
 mod args;
+mod attempt_diagnostic;
 mod base_dir;
 mod catalog_probe;
 mod ceremonies;
@@ -19,6 +20,7 @@ mod probe;
 mod process_tree;
 mod rail_action;
 mod session_connect;
+mod transport_receipt;
 mod users;
 
 fn main() {
@@ -162,10 +164,28 @@ fn main() {
 
     match args::parse(args) {
         Ok(args::Command::Help) => {
-            println!("{}", args::render_help(harnesses::load_optional().as_ref()))
+            println!(
+                "{}",
+                args::render_help(
+                    harnesses::load_optional(Some(
+                        attempt_diagnostic::command_context::CommandContext::catalog(
+                            attempt_diagnostic::command_context::CatalogOrigin::Help
+                        )
+                    ))
+                    .as_ref()
+                )
+            )
         }
         Ok(args::Command::CommandHelp(command)) => {
-            match args::render_command_help(harnesses::load_optional().as_ref(), &command) {
+            match args::render_command_help(
+                harnesses::load_optional(Some(
+                    attempt_diagnostic::command_context::CommandContext::catalog(
+                        attempt_diagnostic::command_context::CatalogOrigin::CommandHelp,
+                    ),
+                ))
+                .as_ref(),
+                &command,
+            ) {
                 Some(entry) => println!("{entry}"),
                 None => {
                     eprintln!("no such command: {command} — run 'tightbeam help' for usage");

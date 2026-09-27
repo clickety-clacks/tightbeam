@@ -227,6 +227,53 @@ defmodule Tightbeam.Wire.SocketTest do
              )
   end
 
+  test "a raised chat handler reaches the socket with its secrets masked", ctx do
+    {:paired, device} =
+      Devices.pair(ctx.db, %{
+        device_id: "chat-raise",
+        claimed_name: "Flynn",
+        platform: nil,
+        model: nil
+      })
+
+    raising = fn _call ->
+      raise "post failed: password=fixtureSENTINEL (echo Bearer fixtureSENTINELbearer1234)"
+    end
+
+    {:ok, socket} = Socket.init(%{ctx.deps | handlers: %{"post" => raising}})
+    auth = %{"type" => "auth", "token" => device.token, "deviceId" => device.device_id}
+
+    {:push, _auth_frames, replaying} =
+      Socket.handle_in({JSON.encode!(auth), opcode: :text}, socket)
+
+    {:push, _sync_frame, live} = Socket.handle_info(:finish_replay, replaying)
+
+    message = %{
+      "type" => "message",
+      "id" => "c_raise",
+      "content" => "hello",
+      "sessionKey" => Org.personal_session_key(device.user_id)
+    }
+
+    {:push, {:text, frame}, _live} =
+      Socket.handle_in({JSON.encode!(message), opcode: :text}, live)
+
+    refute frame =~ "SENTINEL"
+
+    assert %{
+             "type" => "error",
+             "code" => "server_error",
+             "messageId" => "c_raise",
+             "message" =>
+               "post failed: password=[REDACTED:secret_field] (echo Bearer [REDACTED:token])",
+             "diagnostic" => %{"kind" => "exception", "operation" => "post"}
+           } = JSON.decode!(frame)
+
+    {:ok, [[payload]]} = DB.query(ctx.db, "SELECT payload FROM events WHERE verb='post'")
+    assert payload =~ "[REDACTED:secret_field]"
+    refute payload =~ "SENTINEL"
+  end
+
   test "pair and auth failures use the contract reasons", ctx do
     {:ok, state} = Socket.init(ctx.deps)
 

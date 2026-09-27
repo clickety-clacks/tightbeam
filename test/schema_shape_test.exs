@@ -13,7 +13,8 @@ defmodule Tightbeam.SchemaShapeTest do
 
   alias Tightbeam.{Assignments, ConnRegistry, DB, Schema, SessionPoAssociations, Wakes}
 
-  @shape "artifact-origin-v1-019"
+  @shape "identity-publication-denial-diagnostic-v1-019"
+  @identity_publication_denial_diagnostic_previous_shape "artifact-origin-v1-019"
   @legacy_cursor_provider_shape "cursor-provider-v1-020"
   @row_driven_rules_shape "row-driven-rules-v1-019"
   @identity_render_stamp_previous_shape "effort-request-exit-v1-019"
@@ -1490,6 +1491,138 @@ defmodule Tightbeam.SchemaShapeTest do
 
     assert {:ok, [[@be61_shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
     refute "ruledViaSessionKey" in table_columns(db, "decision_requests")
+  end
+
+  test "identity denial diagnostic migration preserves old marker rows and nullable shape", %{
+    db: db
+  } do
+    assert :ok = Schema.ensure_all(db)
+
+    assert :ok =
+             DB.execute(db, """
+             INSERT INTO users (userId, isAdmin, createdAt)
+             VALUES ('origin-user', 0, 1);
+             INSERT INTO sessions
+               (sessionKey, displayName, ownerUserId, origin, archetype, harness,
+                provider, model, createdAt, updatedAt)
+             VALUES
+               ('legacy-origin-session', 'Legacy origin', 'origin-user', 'user:origin-user',
+                'coder', 'codex', 'openai', 'fixture-model', 1, 1);
+             INSERT INTO work_items (id, title, ownerUserId, createdByUser, createdAt)
+             VALUES ('wi_legacy_origin', 'Legacy origin', 'origin-user', 'origin-user', 1);
+             INSERT INTO artifacts
+               (artifactId, kind, title, createdBySession, workItemId, originPath,
+                recordedMessageId, recordedTurnEvidence, createdAt, updatedAt)
+             VALUES
+               ('art_legacy_origin', 'report', 'Legacy origin', 'legacy-origin-session',
+                'wi_legacy_origin', '/tmp/legacy-origin', NULL, 'none', 1, 1);
+             """)
+
+    assert {:ok, [[nil, nil]]} =
+             DB.query(
+               db,
+               "SELECT originHost, originWorkspace FROM artifacts WHERE artifactId='art_legacy_origin'"
+             )
+
+    assert :ok =
+             DB.execute(
+               db,
+               "ALTER TABLE identity_publication_markers DROP COLUMN denialDiagnostic"
+             )
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "UPDATE schema_stamp SET shape='#{@identity_publication_denial_diagnostic_previous_shape}', stampedAt=1"
+             )
+
+    assert {:ok, _} =
+             DB.query(db, """
+             INSERT INTO identity_publication_markers
+               (invocationId, expectedPriorLive, treeFingerprint, principal,
+                validationResult, denialCode, denialMessage, state, createdAt, updatedAt)
+             VALUES ('old-denied', 'prior', '#{String.duplicate("a", 64)}', 'user:flynn',
+                     'denied', 'identity_include_invalid', 'legacy message', 'denied', 1, 1)
+             """)
+
+    assert :ok = Schema.ensure_all(db)
+    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok, [[nil, nil]]} =
+             DB.query(
+               db,
+               "SELECT originHost, originWorkspace FROM artifacts WHERE artifactId='art_legacy_origin'"
+             )
+
+    assert {:ok, [[trigger_sql]]} =
+             DB.query(
+               db,
+               "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='artifacts_origin_immutable'"
+             )
+
+    assert trigger_sql =~ "originHost"
+    assert trigger_sql =~ "originWorkspace"
+
+    assert {:error, _} =
+             DB.query(
+               db,
+               "UPDATE artifacts SET originHost='invented-host' WHERE artifactId='art_legacy_origin'"
+             )
+
+    assert {:ok, [[nil]]} =
+             DB.query(
+               db,
+               "SELECT denialDiagnostic FROM identity_publication_markers WHERE invocationId='old-denied'"
+             )
+
+    columns = table_columns(db, "identity_publication_markers")
+    assert "denialDiagnostic" in columns
+
+    assert {:ok, table_info} = DB.query(db, "PRAGMA table_info(identity_publication_markers)")
+
+    assert Enum.any?(table_info, fn column ->
+             Enum.at(column, 1) == "denialDiagnostic" and Enum.at(column, 3) == 0
+           end)
+
+    assert :ok = Schema.ensure_all(db)
+    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+  end
+
+  test "identity denial diagnostic migration rolls back DDL with a refused stamp", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    assert :ok =
+             DB.execute(
+               db,
+               "ALTER TABLE identity_publication_markers DROP COLUMN denialDiagnostic"
+             )
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "UPDATE schema_stamp SET shape='#{@identity_publication_denial_diagnostic_previous_shape}', stampedAt=1"
+             )
+
+    assert :ok =
+             DB.execute(db, """
+             CREATE TRIGGER reject_identity_denial_diagnostic_stamp
+             BEFORE UPDATE OF shape ON schema_stamp
+             WHEN OLD.shape = '#{@identity_publication_denial_diagnostic_previous_shape}'
+               AND NEW.shape = '#{@shape}'
+             BEGIN
+               SELECT RAISE(ABORT, 'injected_identity_denial_stamp_failure');
+             END;
+             """)
+
+    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
+
+    assert error.message =~
+             "identity publication denial diagnostic migration failed and was rolled back"
+
+    assert {:ok, [[@identity_publication_denial_diagnostic_previous_shape]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+
+    refute "denialDiagnostic" in table_columns(db, "identity_publication_markers")
   end
 
   # The defect this refuses: `CREATE TABLE IF NOT EXISTS` is SILENT about a

@@ -4,6 +4,7 @@ defmodule Tightbeam.RailRemedy do
   alias Tightbeam.{
     DB,
     Dispatch,
+    ErrorDiagnostic,
     EventLog,
     Idempotency,
     Org,
@@ -36,6 +37,7 @@ defmodule Tightbeam.RailRemedy do
 
   @type outcome :: %{
           optional(:denial) => map(),
+          optional(:diagnostic) => map(),
           outcome: String.t(),
           producer_id: String.t() | nil
         }
@@ -76,8 +78,12 @@ defmodule Tightbeam.RailRemedy do
         {:error, {:assignment_not_open, _assignment_id}} ->
           %{outcome: "assignment-not-open", producer_id: nil}
 
-        {:error, _unbound} ->
-          %{outcome: "unbound", producer_id: nil}
+        {:error, unbound} ->
+          %{
+            outcome: "unbound",
+            producer_id: nil,
+            diagnostic: ErrorDiagnostic.from_reason(unbound)
+          }
       end
 
     lifecycle(db, rule, subject, call, result)
@@ -341,12 +347,12 @@ defmodule Tightbeam.RailRemedy do
                   now()
                 )
 
-              {:error, _} ->
+              {:error, missing} ->
                 persist_notice_state(
                   txn,
                   "completion-requires-review",
                   subject,
-                  Map.put(state, "blocked", "missing_accountable_owner")
+                  recipient_blocked(state, missing)
                 )
             end
         end
@@ -1475,8 +1481,8 @@ defmodule Tightbeam.RailRemedy do
       {:existing, state} ->
         state
 
-      {:error, _} ->
-        Map.put(state, "blocked", "missing_accountable_owner")
+      {:error, missing} ->
+        recipient_blocked(state, missing)
     end
   end
 
@@ -1588,8 +1594,8 @@ defmodule Tightbeam.RailRemedy do
                     next
                 end
 
-              {:error, _} ->
-                Map.put(state, "blocked", "missing_accountable_owner")
+              {:error, missing} ->
+                recipient_blocked(state, missing)
             end
           else
             state
@@ -1623,8 +1629,8 @@ defmodule Tightbeam.RailRemedy do
                 {:existing, next} -> next
               end
 
-            {:error, _} ->
-              Map.put(state, "blocked", "missing_accountable_owner")
+            {:error, missing} ->
+              recipient_blocked(state, missing)
           end
       end
 
@@ -1905,12 +1911,17 @@ defmodule Tightbeam.RailRemedy do
 
           persist_notice_state(txn, statute, subject, state)
 
-        {:error, _} ->
-          state = Map.put(state, "blocked", "missing_accountable_owner")
+        {:error, missing} ->
+          state = recipient_blocked(state, missing)
           persist_notice_state(txn, statute, subject, put_in(state, ["reassessment"], nil))
       end
     end
   end
+
+  # The recipient lookup names why no recipient exists: an unowned chain versus an
+  # assignment that is gone. Record that reason, not a fixed owner diagnosis.
+  defp recipient_blocked(state, %{reason: reason}) when is_atom(reason),
+    do: Map.put(state, "blocked", Atom.to_string(reason))
 
   defp persist_notice_state(txn, statute, subject, state) do
     Txn.q(
@@ -1968,14 +1979,16 @@ defmodule Tightbeam.RailRemedy do
 
   defp lifecycle(db, rule, subject, call, result) do
     detail =
-      JSON.encode!(%{
+      %{
         edge: if(Map.get(call, :edge, :verb) == :turn_end, do: "turn-end", else: "verb"),
         ref: subject,
         action: rule.remedy.action,
         producer_id: result.producer_id,
         outcome: result.outcome,
         origin: call.origin
-      })
+      }
+      |> ErrorDiagnostic.put(Map.get(result, :diagnostic))
+      |> JSON.encode!()
 
     try do
       EventLog.lifecycle(db, "rail_remedy", rule.name, detail)

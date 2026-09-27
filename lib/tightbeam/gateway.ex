@@ -70,6 +70,7 @@ defmodule Tightbeam.Gateway do
     DB,
     Devices,
     EffortCheckin,
+    ErrorDiagnostic,
     Escalation,
     EventLog,
     Harness,
@@ -623,14 +624,35 @@ defmodule Tightbeam.Gateway do
         try do
           Placement.provision_endpoint(config.base_dir, name, host, opts)
         rescue
-          error -> {:error, Exception.message(error)}
+          error ->
+            {:error,
+             ErrorDiagnostic.exception(error, __STACKTRACE__,
+               operation: "provision_endpoint",
+               origin: "gateway"
+             )}
         end
 
       with {:error, reason} <- result do
-        EventLog.lifecycle(db, "endpoint_not_provisioned", name, to_string(reason))
+        EventLog.lifecycle(db, "endpoint_not_provisioned", name, provision_detail(name, reason))
       end
     end)
   end
+
+  # A raised provisioning step keeps its exception type in the durable detail
+  # and its redacted stack in the log, instead of the bare message alone.
+  defp provision_detail(name, %{"exception" => %{"type" => type} = raised} = node) do
+    Logger.warning("endpoint #{name} was not provisioned: #{JSON.encode!(node)}")
+
+    case raised["message"] do
+      message when is_binary(message) -> "#{message} (#{type})"
+      message -> "#{JSON.encode!(message)} (#{type})"
+    end
+  end
+
+  defp provision_detail(_name, reason) when is_binary(reason) or is_atom(reason),
+    do: to_string(reason)
+
+  defp provision_detail(_name, reason), do: inspect(reason)
 
   defp harness_binary_readiness(cli_bin) do
     results =
@@ -1544,7 +1566,10 @@ defmodule Tightbeam.Gateway do
         }
 
       {:error, error} ->
-        %{ok: false, code: "repair_state_failed", message: inspect(error)}
+        ErrorDiagnostic.put(
+          %{ok: false, code: "repair_state_failed", message: inspect(error)},
+          ErrorDiagnostic.for_reason(error, operation: "assignment_repair", phase: "claim")
+        )
 
       {:error, code, message} ->
         %{ok: false, code: code, message: message}
@@ -1586,18 +1611,34 @@ defmodule Tightbeam.Gateway do
         {:error, code, message} -> {%{ok: false, code: code, message: message}, nil}
       end
 
+    # The persisted outcome keeps its diagnostic so an exact replay returns the
+    # original result; the published lifecycle row keeps its existing shape.
+    recorded = Map.delete(result, :diagnostic)
+
     case Ledger.finish_assignment_repair(db, attempt_id, result) do
       :ok ->
-        if incident, do: record_repair_result(db, call, assignment, incident, result)
+        if incident, do: record_repair_result(db, call, assignment, incident, recorded)
         result
 
       {:error, reason} ->
-        %{
-          ok: false,
-          code: "repair_state_failed",
-          message:
-            "repair effect outcome could not be persisted; attempt #{attempt_id} remains claimed: #{inspect(reason)}"
-        }
+        # The effect already ran; its own outcome rides beside the persistence
+        # failure that replaced it.
+        ErrorDiagnostic.put(
+          %{
+            ok: false,
+            code: "repair_state_failed",
+            message:
+              "repair effect outcome could not be persisted; attempt #{attempt_id} remains claimed: #{inspect(reason)}"
+          },
+          ErrorDiagnostic.new("term",
+            reason: reason,
+            operation: "assignment_repair",
+            phase: "persist_outcome",
+            attempt_id: attempt_id,
+            effect_result: recorded,
+            cause: Map.get(result, :diagnostic)
+          )
+        )
     end
   end
 
@@ -1736,7 +1777,7 @@ defmodule Tightbeam.Gateway do
         rerun_latest(db, call, assignment, incident)
 
       {:error, reason} ->
-        %{ok: false, code: "repair_failed", message: inspect(reason)}
+        repair_failed(reason, operation: "close_adapter", phase: "repair_#{action}")
     end
   end
 
@@ -1773,7 +1814,7 @@ defmodule Tightbeam.Gateway do
              lane_manager: Map.get(call, :lane_manager, Tightbeam.LaneManager)
            ) do
         :appended -> %{ok: true, action: "relaunch", assignmentId: assignment.id}
-        result -> %{ok: false, code: "repair_failed", message: inspect(result)}
+        result -> repair_failed(result, operation: "deliver_prompt", phase: "repair_relaunch")
       end
     else
       %{
@@ -1836,9 +1877,18 @@ defmodule Tightbeam.Gateway do
             }
 
           {:error, reason} ->
-            %{ok: false, code: "repair_failed", message: inspect(reason)}
+            repair_failed(reason, operation: "repair_terminal", phase: "repair_rerun")
         end
     end
+  end
+
+  # The public message stays the inspected classification; the reason's own
+  # structure and any carried node ride in the diagnostic.
+  defp repair_failed(reason, facts) do
+    ErrorDiagnostic.put(
+      %{ok: false, code: "repair_failed", message: inspect(ErrorDiagnostic.classified(reason))},
+      ErrorDiagnostic.with_facts(reason, facts)
+    )
   end
 
   defp record_repair_result(db, call, assignment, incident, result) do
@@ -2046,7 +2096,14 @@ defmodule Tightbeam.Gateway do
 
     case delivery_target(txn, session_key, opts[:target_gate]) do
       nil ->
-        cancel_unavailable_supervision_controller_in_txn(txn, opts, session_key)
+        case cancel_unavailable_supervision_controller_in_txn(txn, opts, session_key) do
+          :canceled ->
+            :ok
+
+          :ordinary ->
+            record_undeliverable_in_txn(txn, session_key, origin, opts, "no_delivery_target")
+        end
+
         :skipped
 
       {target, role_ref, role_fallback} when not is_nil(target) ->
@@ -2151,7 +2208,21 @@ defmodule Tightbeam.Gateway do
         "(origin=#{origin} wake=#{opts[:wake_id] || "none"} sender=#{opts[:sender] || "none"})"
     )
 
+    record_undeliverable_in_txn(txn, target, origin, opts, "no_session_row")
     :skipped
+  end
+
+  # `:skipped` is shared with deliberate non-delivery (a canceled controller, a
+  # withdrawn remedy), so the failure's own cause is kept as a durable event.
+  defp record_undeliverable_in_txn(txn, target, origin, opts, reason) do
+    :ok =
+      EventLog.lifecycle_in_txn(
+        txn,
+        "turn_undeliverable",
+        opts[:wake_id] || target || "none",
+        "reason=#{reason} target=#{target || "none"} origin=#{origin} " <>
+          "sender=#{opts[:sender] || "none"}"
+      )
   end
 
   defp fire_wake_in_txn(txn, opts) do
@@ -3136,12 +3207,15 @@ defmodule Tightbeam.Gateway do
             # what the user reads; `raw_reason` and `failed_stage` are what the
             # record keeps, because the sentence is a flattening and the next
             # misclassification will be diagnosed from what it flattened.
-            raw_reason = reason
+            # `raw_reason` is the classification every decision below always
+            # read; `diagnostic` is the original failure the adapter carried.
+            diagnostic = ErrorDiagnostic.of(reason)
+            raw_reason = ErrorDiagnostic.classified(reason)
 
             reason =
               case turn_credential_refusal(session) do
                 {:refused, message} -> message
-                :not_applicable -> reason
+                :not_applicable -> raw_reason
               end
 
             failure_publish = fn _terminal ->
@@ -3150,7 +3224,17 @@ defmodule Tightbeam.Gateway do
               # its message, and a failure that lost its brief showed Flynn
               # "agent progress interrupted" with no reason attached.
               append_turn_failed_marker(db, turn.session_key, error_sentence(reason))
-              publish_turn_state(db, turn.session_key, correlation, "failed", reason)
+
+              publish_turn_state(
+                db,
+                turn.session_key,
+                correlation,
+                "failed",
+                reason,
+                Tightbeam.ConnRegistry,
+                diagnostic
+              )
+
               publish_session_indicator(db, turn.session_key, session.owner_user_id)
 
               broadcast(
@@ -3181,10 +3265,17 @@ defmodule Tightbeam.Gateway do
             record_in_txn = fn txn ->
               detail =
                 try do
-                  JSON.encode!(%{stage: failed_stage, reason: raw_reason})
+                  JSON.encode!(
+                    ErrorDiagnostic.put(%{stage: failed_stage, reason: raw_reason}, diagnostic)
+                  )
                 rescue
                   _ ->
-                    JSON.encode!(%{stage: inspect(failed_stage), term: inspect(raw_reason)})
+                    JSON.encode!(
+                      ErrorDiagnostic.put(
+                        %{stage: inspect(failed_stage), term: inspect(raw_reason)},
+                        diagnostic
+                      )
+                    )
                 end
 
               EventLog.lifecycle_in_txn(txn, "harness_turn_error", turn.session_key, detail)
@@ -3488,24 +3579,27 @@ defmodule Tightbeam.Gateway do
         correlation = (echo && echo.client_message_id) || message_id
         publish_turn_state(db, call.session_key, correlation, "canceled", nil)
 
-        with %{} = session <- Org.get(db, call.session_key) do
-          publish_session_indicator(db, call.session_key, session.owner_user_id)
+        leg =
+          with %{} = session <- Org.get(db, call.session_key) do
+            publish_session_indicator(db, call.session_key, session.owner_user_id)
 
-          broadcast(
-            db,
-            session.owner_user_id,
-            Payloads.activity_event(%{
-              is_active: false,
-              message_id: correlation,
-              session_key: call.session_key
-            })
-          )
+            broadcast(
+              db,
+              session.owner_user_id,
+              Payloads.activity_event(%{
+                is_active: false,
+                message_id: correlation,
+                session_key: call.session_key
+              })
+            )
 
-          harness_cancel(db, session)
-        end
+            harness_cancel(db, session)
+          end
 
         Ledger.mark_published(db, seq)
-        %{ok: true}
+        # The lane cancel succeeded, so the result stays ok; the harness leg's
+        # truth rides in the diagnostic.
+        ErrorDiagnostic.put(%{ok: true}, cancel_leg(leg))
 
       _ ->
         %{ok: false, code: "not_running", message: "no turn in flight"}
@@ -3560,19 +3654,62 @@ defmodule Tightbeam.Gateway do
   defp public_settlement_result(result),
     do: Map.drop(result, [:message_id, :stored_error])
 
+  # The turn is already canceled in its lane; this leg only asks the harness to
+  # stop too. `session/cancel` is an ACP notification, so even a delivered one is
+  # never acknowledged: the best outcome is "unconfirmed", never "verified".
   defp harness_cancel(db, session) do
-    with %{harness_session_id: sid} <- Org.current_pointer(db, session.session_key),
+    with {:pointer, %{harness_session_id: sid}} <-
+           {:pointer, Org.current_pointer(db, session.session_key)},
          key = {Harness.parse!(session.harness).id(), "shared", session.host},
          {:ok, adapter, _gen} <- AdapterCoordinator.adapter_for(Tightbeam.AdapterCoordinator, key) do
       Tightbeam.Acp.Conn.notify(Tightbeam.Acp.Adapter.conn(adapter), "session/cancel", %{
         sessionId: sid
       })
+
+      {:unconfirmed, sid}
+    else
+      {:pointer, _} -> {:not_sent, :no_pointer}
+      {:error, reason} -> {:failed, ErrorDiagnostic.with_facts(reason, [])}
     end
   rescue
-    _ -> :ok
+    exception -> {:failed, ErrorDiagnostic.exception(exception, __STACKTRACE__)}
   catch
-    :exit, _ -> :ok
+    kind, reason -> {:failed, ErrorDiagnostic.caught(kind, reason, __STACKTRACE__, [])}
   end
+
+  defp cancel_leg({:unconfirmed, sid}),
+    do: cancel_node("unconfirmed", status: "unconfirmed", sent: true, session_id: sid)
+
+  defp cancel_leg({:not_sent, why}),
+    do: cancel_node("unknown", status: "not_sent", sent: false, precondition: why)
+
+  defp cancel_leg({:failed, cause}),
+    do: cancel_node("unknown", status: "failed", sent: false, cause: cause)
+
+  # No session row: nothing was attempted, so there is no leg to report.
+  defp cancel_leg(_), do: nil
+
+  defp cancel_node(kind, facts) do
+    ErrorDiagnostic.new(
+      kind,
+      [operation: "session/cancel", phase: "harness_cancel", origin: "gateway"] ++ facts
+    )
+  end
+
+  # The coordinator names why the circuit opened; the refusal carries its count and
+  # the last failure's redacted evidence so a caller need not read /version to learn it.
+  defp degraded_sentence(session, node) do
+    "adapter for #{session.harness}/#{session.identity_name} on host #{session.host} is degraded " <>
+      degraded_detail(node) <> "; see /version"
+  end
+
+  defp degraded_detail(%{"consecutiveFailures" => failures, "cause" => cause}),
+    do: "after #{failures} consecutive failures (last failure: #{JSON.encode!(cause)})"
+
+  defp degraded_detail(%{"consecutiveFailures" => failures}),
+    do: "after #{failures} consecutive failures (last failure unknown)"
+
+  defp degraded_detail(_node), do: "(host unreachable or adapter failing; cause unknown)"
 
   defp checkout_adapter(session, config) do
     key = {Harness.parse!(session.harness).id(), "shared", session.host}
@@ -3583,9 +3720,10 @@ defmodule Tightbeam.Gateway do
         {:ok, adapter, generation}
 
       {:error, :degraded} ->
-        {:error,
-         "adapter for #{session.harness}/#{session.identity_name} on host #{session.host} is degraded " <>
-           "(host unreachable or adapter failing); see /version"}
+        {:error, degraded_sentence(session, nil)}
+
+      {:error, {:diagnosed, :degraded, node}} ->
+        {:error, degraded_sentence(session, node)}
 
       {:error, {:parked, detail}} ->
         {:error,
@@ -3681,14 +3819,19 @@ defmodule Tightbeam.Gateway do
                   Tightbeam.AdapterCoordinator,
                   session.host,
                   fn ->
-                    case Adapter.load_session_for_turn(
-                           adapter,
-                           pointer.harness_session_id,
-                           session.model,
-                           cwd,
-                           mcp_servers,
-                           snapshot.guidance
-                         ) do
+                    loaded =
+                      Adapter.load_session_for_turn(
+                        adapter,
+                        pointer.harness_session_id,
+                        session.model,
+                        cwd,
+                        mcp_servers,
+                        snapshot.guidance
+                      )
+
+                    # Branch on the classification; a returned error keeps its
+                    # carrier for the turn record.
+                    case ErrorDiagnostic.classified(loaded) do
                       {:ok, _pushed_or_unknown} ->
                         Org.append_pointer(
                           db,
@@ -3700,21 +3843,21 @@ defmodule Tightbeam.Gateway do
                         stamp_session_identity(db, session.session_key, snapshot)
                         {:ok, pointer.harness_session_id}
 
-                      {:error, {:model_apply_failed, _reason}} = error ->
-                        error
+                      {:error, {:model_apply_failed, _reason}} ->
+                        loaded
 
-                      {:error, {:mode_apply_failed, _reason}} = error ->
-                        error
+                      {:error, {:mode_apply_failed, _reason}} ->
+                        loaded
 
                       # An adapter that could not answer has NOT told us the harness
                       # lost the session; falling back would forfeit the model
                       # context over an adapter fault and record a false
                       # pointer_fallback.
-                      {:error, {:adapter_unavailable, _reason}} = error ->
-                        error
+                      {:error, {:adapter_unavailable, _reason}} ->
+                        loaded
 
-                      {:error, {:codex_identity_projection_failed, _reason}} = error ->
-                        error
+                      {:error, {:codex_identity_projection_failed, _reason}} ->
+                        loaded
 
                       {:error, lost} ->
                         # Spec §pointer chain: reason "fallback" — the harness lost
@@ -3805,23 +3948,33 @@ defmodule Tightbeam.Gateway do
 
     # ATTEMPT-SCOPED: ask only for the death of the generation this turn checked
     # out. If the coordinator has not yet processed that :DOWN — or the record
-    # belongs to a PREVIOUS attempt — we get nil and report the generic reason.
+    # belongs to a PREVIOUS attempt — we get nil and say the cause is unrecorded.
     # Mislabelling a new death with its predecessor's reason would be worse than
     # saying less (cross-review F4).
     reason =
       case AdapterCoordinator.last_failure(coordinator, key, generation) do
-        nil -> "adapter is not running"
+        nil -> "adapter is not running; no failure is recorded for this attempt"
         failure -> Adapter.failure_text(failure)
       end
 
     {:error, {:adapter_unavailable, reason}}
   rescue
-    _ -> {:error, {:adapter_unavailable, "adapter is not running"}}
+    exception -> unreadable_adapter_failure(:error, exception, __STACKTRACE__)
   catch
-    :exit, _ -> {:error, {:adapter_unavailable, "adapter is not running"}}
+    :exit, reason -> unreadable_adapter_failure(:exit, reason, __STACKTRACE__)
   end
 
   defp enrich_adapter_unavailable(_config, result, _key, _generation), do: result
+
+  # `:noproc` already proves the adapter is not running; only the lookup of WHY
+  # failed, so both facts are kept rather than reading as a clean "no record".
+  defp unreadable_adapter_failure(kind, reason, stacktrace) do
+    node = ErrorDiagnostic.caught(kind, reason, stacktrace, operation: "last_failure")
+
+    {:error,
+     {:adapter_unavailable,
+      "adapter is not running; its failure record could not be read: " <> JSON.encode!(node)}}
+  end
 
   defp new_harness_session(db, adapter, session, cwd, mcp_servers, guidance) do
     with {:ok, sid} <-
@@ -4165,16 +4318,16 @@ defmodule Tightbeam.Gateway do
         Identity.unlearn!(config.base_dir, name, call.origin)
       end)
 
-    case result do
-      %{state: "published"} ->
-        :ok = Sentinels.remove_bundle(db, Placement.local_host_name(), name)
-        :ok = SentinelSupervisor.reconcile()
-        result
-
-      result ->
-        result
-    end
+    complete_identity_unlearn_cleanup(db, name, result)
   end
+
+  defp complete_identity_unlearn_cleanup(db, name, %{state: "published"} = result) do
+    :ok = Sentinels.remove_bundle(db, Placement.local_host_name(), name)
+    :ok = SentinelSupervisor.reconcile()
+    result
+  end
+
+  defp complete_identity_unlearn_cleanup(_db, _name, result), do: result
 
   defp release_identity_unlearn(config, db, call, name, archetypes, prepare) do
     case Org.release_archetypes(db, archetypes, prepare, fn candidate ->
@@ -4227,12 +4380,15 @@ defmodule Tightbeam.Gateway do
         error
 
       {:released, {:marker_failed, error}} ->
-        %{
-          state: "unlearn-failed",
-          code: "identity_marker_failed",
-          message: Exception.message(error),
-          live_revision: Identity.live_revision!(config.base_dir)
-        }
+        ErrorDiagnostic.put(
+          %{
+            state: "unlearn-failed",
+            code: "identity_marker_failed",
+            message: Exception.message(error),
+            live_revision: Identity.live_revision!(config.base_dir)
+          },
+          marker_failure(error)
+        )
     end
   end
 
@@ -4310,9 +4466,17 @@ defmodule Tightbeam.Gateway do
           end
       end
     else
-      {:error, error} -> %{code: "identity_marker_failed", message: Exception.message(error)}
+      {:error, error} ->
+        ErrorDiagnostic.put(
+          %{code: "identity_marker_failed", message: Exception.message(error)},
+          marker_failure(error)
+        )
     end
   end
+
+  # The transaction already consumed the stack; the exception's type is kept.
+  defp marker_failure(error),
+    do: ErrorDiagnostic.from_reason(error, operation: "begin_identity_publication")
 
   defp unlearn_referenced_result(name, references) do
     sessions = Enum.filter(references, &(&1.kind == "session"))
@@ -4391,10 +4555,13 @@ defmodule Tightbeam.Gateway do
         }
 
       {:error, reason} ->
-        %{
-          code: "identity_repoint_failed",
-          message: "session #{call.session_key} could not change archetype: #{inspect(reason)}"
-        }
+        ErrorDiagnostic.put(
+          %{
+            code: "identity_repoint_failed",
+            message: "session #{call.session_key} could not change archetype: #{inspect(reason)}"
+          },
+          ErrorDiagnostic.for_reason(reason, operation: "repoint_archetype")
+        )
     end
   end
 
@@ -4621,7 +4788,7 @@ defmodule Tightbeam.Gateway do
     stamp_session_identity(db, session.session_key, snapshot)
     :applied
   rescue
-    error -> {:error, identity_apply_failed(session, error)}
+    error -> {:error, identity_apply_raised(session, error, __STACKTRACE__)}
   end
 
   # An ordinary prompt, submitted and never waited on: the session re-reads its
@@ -4647,7 +4814,7 @@ defmodule Tightbeam.Gateway do
       _submitted -> :applied
     end
   rescue
-    error -> {:error, identity_apply_failed(session, error)}
+    error -> {:error, identity_apply_raised(session, error, __STACKTRACE__)}
   end
 
   defp identity_apply_prompt(revision) do
@@ -4656,8 +4823,12 @@ defmodule Tightbeam.Gateway do
       "reload your current model context."
   end
 
-  defp identity_apply_failed(session, error) when is_exception(error),
-    do: identity_apply_failed(session, Exception.message(error))
+  defp identity_apply_raised(session, error, stacktrace) do
+    ErrorDiagnostic.put(
+      identity_apply_failed(session, Exception.message(error)),
+      ErrorDiagnostic.exception(error, stacktrace, operation: "identity_apply")
+    )
+  end
 
   defp identity_apply_failed(session, reason) when is_binary(reason) do
     %{
@@ -4689,25 +4860,29 @@ defmodule Tightbeam.Gateway do
   # verb's named refusal rather than as a raw JSON-RPC envelope from three layers
   # down. The general error-boundary seam is its own ticket; this is one call
   # site's error made legible.
-  defp apply_failure(:model_unavailable),
+  # Message text is fixed by the pre-diagnostic reason; carried evidence goes
+  # to the response's `diagnostic`, never into this text.
+  defp apply_failure(reason), do: apply_failure_text(ErrorDiagnostic.classified(reason))
+
+  defp apply_failure_text(:model_unavailable),
     do: "the installed local client rejected the requested model as unsupported"
 
-  defp apply_failure(:model_readback_unavailable),
+  defp apply_failure_text(:model_readback_unavailable),
     do: "the installed local client reported success but did not confirm the requested model"
 
-  defp apply_failure({:model_apply_failed, reason}), do: apply_failure(reason)
+  defp apply_failure_text({:model_apply_failed, reason}), do: apply_failure_text(reason)
 
-  defp apply_failure({:adapter_unavailable, reason}),
+  defp apply_failure_text({:adapter_unavailable, reason}),
     do:
       "the requested model is unsupported because the installed local client could not " <>
         "launch it: #{Adapter.failure_text(reason)}"
 
-  defp apply_failure(:adapter_unavailable),
+  defp apply_failure_text(:adapter_unavailable),
     do:
       "the requested model is unsupported because the installed local client could not launch it"
 
-  defp apply_failure(%{"message" => message}) when is_binary(message), do: message
-  defp apply_failure(reason), do: inspect(reason)
+  defp apply_failure_text(%{"message" => message}) when is_binary(message), do: message
+  defp apply_failure_text(reason), do: inspect(reason)
 
   @onboarding_providers ["openai", "anthropic", "cursor", "opencode-go", "local-openai"] ++
                           if(Application.compile_env(:tightbeam, :fixture_harness, false),
@@ -4806,7 +4981,7 @@ defmodule Tightbeam.Gateway do
         }
 
       {:error, reason} ->
-        %{code: "needs_onboarding", message: inspect(reason)}
+        onboard_failed(inspect(reason), reason, provider, machine, "begin")
     end
   end
 
@@ -4834,7 +5009,7 @@ defmodule Tightbeam.Gateway do
         }
 
       {:error, reason} ->
-        %{code: "needs_onboarding", message: inspect(reason)}
+        onboard_failed(inspect(reason), reason, provider, machine, "begin_daemon")
     end
   end
 
@@ -4864,10 +5039,13 @@ defmodule Tightbeam.Gateway do
         %{provider: provider, credential_kind: wire_credential_kind(kind), status: "onboarded"}
 
       {:error, reason} ->
-        %{
-          code: "needs_onboarding",
-          message: "#{provider} #{kind} credential on #{machine}: #{inspect(reason)}"
-        }
+        onboard_failed(
+          "#{provider} #{kind} credential on #{machine}: #{inspect(reason)}",
+          reason,
+          provider,
+          machine,
+          "finish"
+        )
     end
   end
 
@@ -4881,6 +5059,14 @@ defmodule Tightbeam.Gateway do
          reason,
          _source
        ) do
+    # The store records only the classified failure it acts on; the caller's
+    # own reason is kept here instead of vanishing at the classification.
+    if is_binary(reason) do
+      Logger.info(
+        "onboarding cancel for #{provider} on #{machine}: #{ErrorDiagnostic.redact_text(reason)}"
+      )
+    end
+
     case Tightbeam.Credentials.cancel_onboard(
            provider,
            lease_id,
@@ -4890,9 +5076,25 @@ defmodule Tightbeam.Gateway do
       :ok ->
         %{provider: provider, status: "canceled"}
 
-      {:error, reason} ->
-        %{code: "needs_onboarding", message: inspect(reason)}
+      {:error, failure} ->
+        onboard_failed(inspect(failure), failure, provider, machine, "cancel",
+          cancel_reason: reason
+        )
     end
+  end
+
+  # Every onboarding phase shares one public code; the phase and the native
+  # reason ride in the diagnostic so they stay distinguishable. The message is
+  # built from `inspect(reason)`, so its secret material is masked like the
+  # diagnostic's.
+  defp onboard_failed(message, reason, provider, machine, phase, facts \\ []) do
+    ErrorDiagnostic.put(
+      %{code: "needs_onboarding", message: ErrorDiagnostic.redact_text(message)},
+      ErrorDiagnostic.with_facts(
+        reason,
+        [operation: "onboard", phase: phase, provider: provider, machine: machine] ++ facts
+      )
+    )
   end
 
   # The begin reply carries the OWNER user id so the CLI can wake THAT user with the
@@ -5385,9 +5587,13 @@ defmodule Tightbeam.Gateway do
             fun.(call)
           rescue
             error in Tightbeam.Identity.IncludeError ->
-              denial = %{code: "identity_include_invalid", message: Exception.message(error)}
+              denial = %{
+                code: "identity_include_invalid",
+                message: Exception.message(error),
+                diagnostic: Tightbeam.Identity.IncludeError.diagnostic(error)
+              }
 
-              {:ok, _marker} =
+              {:ok, marker} =
                 AdminProjection.deny_identity_validation(
                   db,
                   invocation_id,
@@ -5398,12 +5604,19 @@ defmodule Tightbeam.Gateway do
                   denial
                 )
 
-              denial
+              identity_denial_result(marker)
           end
 
         %{state: "accepted"} = marker ->
           accepted_without_state(db, call)
-          %{state: "published", live_revision: marker.candidate_revision}
+
+          result = %{state: "published", live_revision: marker.candidate_revision}
+
+          if call.verb == "unlearn" do
+            complete_identity_unlearn_cleanup(db, call.params.name, result)
+          else
+            result
+          end
 
         %{state: "denied"} = marker ->
           identity_denial_result(marker)
@@ -5421,9 +5634,12 @@ defmodule Tightbeam.Gateway do
 
     candidate = identity_candidate_from_marker(marker)
 
-    release_identity_unlearn(config, db, call, name, archetypes, fn ->
-      {candidate, marker}
-    end)
+    result =
+      release_identity_unlearn(config, db, call, name, archetypes, fn ->
+        candidate
+      end)
+
+    complete_identity_unlearn_cleanup(db, name, result)
   end
 
   defp replay_identity_publication(config, db, call, marker) do
@@ -5449,7 +5665,39 @@ defmodule Tightbeam.Gateway do
     |> put_present(:message, marker.denial_message)
     |> put_present(:expected, marker.denial_expected)
     |> put_present(:actual, marker.denial_actual)
+    |> ErrorDiagnostic.put(include_denial_diagnostic(marker))
   end
+
+  # Legacy include-refusal rows predate the structured diagnostic column. They
+  # replay only the cause, fingerprint and expected prior that those rows stored;
+  # the "none" and all-zero values are unknown placeholders, not facts.
+  @unknown_fingerprint String.duplicate("0", 64)
+  defp include_denial_diagnostic(%{denial_code: "identity_include_invalid"} = marker) do
+    case marker.denial_diagnostic do
+      %{"kind" => "denial"} = diagnostic ->
+        diagnostic
+
+      nil ->
+        legacy_include_denial_diagnostic(marker)
+    end
+  end
+
+  defp include_denial_diagnostic(_marker), do: nil
+
+  # Pre-amendment rows can replay only facts they actually persisted. Missing
+  # include location and chain fields stay absent; no message parsing/backfill.
+  defp legacy_include_denial_diagnostic(marker) do
+    details =
+      %{"cause" => marker.cause}
+      |> put_known("treeFingerprint", marker.tree_fingerprint, @unknown_fingerprint)
+      |> put_known("expectedPrior", marker.expected_prior, "none")
+
+    ErrorDiagnostic.new("denial", details: {:node, details})
+  end
+
+  defp put_known(map, _key, placeholder, placeholder), do: map
+  defp put_known(map, _key, nil, _placeholder), do: map
+  defp put_known(map, key, value, _placeholder), do: Map.put(map, key, value)
 
   defp put_present(result, _key, nil), do: result
   defp put_present(result, key, value), do: Map.put(result, key, value)
@@ -5955,19 +6203,39 @@ defmodule Tightbeam.Gateway do
     wait? = predicate? or after_turn?
 
     cond do
-      predicate_present? and not predicate? -> false
-      after_turn_present? and not after_turn? -> false
-      replace_present? and p[:replace_queued] not in [true, false] -> false
-      predicate? and after_turn? -> false
-      wait? and not (is_binary(p[:assignment_id]) and p.assignment_id != "") -> false
+      predicate_present? and not predicate? ->
+        false
+
+      after_turn_present? and not after_turn? ->
+        false
+
+      replace_present? and p[:replace_queued] not in [true, false] ->
+        false
+
+      predicate? and after_turn? ->
+        false
+
+      wait? and not (is_binary(p[:assignment_id]) and p.assignment_id != "") ->
+        false
+
       replace_queued? and
           not (is_binary(p[:replacement_assignment_id]) and p.replacement_assignment_id != "") ->
         false
-      replace_queued? and wait? -> false
-      wait? and is_binary(p[:condition_kind]) -> false
-      predicate? and is_nil(p[:after_ms]) and is_nil(p[:at]) -> false
-      after_turn? and (not is_nil(p[:after_ms]) or not is_nil(p[:at])) -> false
-      true -> true
+
+      replace_queued? and wait? ->
+        false
+
+      wait? and is_binary(p[:condition_kind]) ->
+        false
+
+      predicate? and is_nil(p[:after_ms]) and is_nil(p[:at]) ->
+        false
+
+      after_turn? and (not is_nil(p[:after_ms]) or not is_nil(p[:at])) ->
+        false
+
+      true ->
+        true
     end
   end
 
@@ -6121,7 +6389,7 @@ defmodule Tightbeam.Gateway do
         # would strand an unfireable controller. Roll the handler transaction
         # back so wake and sidecar remain all-or-nothing.
         raise "incompatible_supervision_liveness_v1: controller schedule :duplicate"
-      end
+    end
   end
 
   defp replacement_assignment_id_in_txn(txn, call, session_key) do
@@ -6779,8 +7047,17 @@ defmodule Tightbeam.Gateway do
                     case Placement.move_workdir(config, call.session_key, session.host, host) do
                       :ok ->
                         case commit_host_rearm(config, db, session, host, 8) do
-                          :ok -> %{ok: true, host: host}
-                          {:error, message} -> %{code: "workspace_move_race", message: message}
+                          :ok ->
+                            %{ok: true, host: host}
+
+                          {:error, reason} ->
+                            ErrorDiagnostic.put(
+                              %{
+                                code: "workspace_move_race",
+                                message: ErrorDiagnostic.classified(reason)
+                              },
+                              ErrorDiagnostic.of(reason)
+                            )
                         end
 
                       {:error, message} ->
@@ -6906,6 +7183,9 @@ defmodule Tightbeam.Gateway do
 
   defp tune_error(code, message), do: %{ok: false, code: code, message: message}
 
+  defp tune_error(code, message, diagnostic),
+    do: code |> tune_error(message) |> ErrorDiagnostic.put(diagnostic)
+
   defp turn_in_progress_error do
     tune_error(
       "turn_in_progress",
@@ -6996,10 +7276,22 @@ defmodule Tightbeam.Gateway do
                  {:error, reason} -> {:error, adapter, sid, reason}
                end
              else
-               _ -> {:error, nil, nil, :runtime_config_unknown}
+               # Nothing was sent to a harness; name which precondition failed.
+               nil ->
+                 {:error, nil, nil, fast_unreached("no_pointer", nil)}
+
+               false ->
+                 {:error, nil, nil, fast_unreached("session_not_resident", nil)}
+
+               {:error, reason} ->
+                 {:error, nil, nil, fast_unreached("adapter_unavailable", reason)}
+
+               other ->
+                 {:error, nil, nil, fast_unreached("unexpected", other)}
              end
            end)
-         end) do
+         end)
+         |> fast_outcome() do
       {:ok, {:ok, _adapter, _sid, fast}} ->
         runtime_success(db, session.session_key, "preserved", nil, "not_applicable")
         |> Map.merge(%{fast: fast, fast_status: "known"})
@@ -7011,18 +7303,45 @@ defmodule Tightbeam.Gateway do
         tune_error("runtime_config_mismatch", "the live Fast value differs from the request")
         |> Map.merge(%{fast: actual, fast_status: "known"})
 
-      {:ok, {:error, adapter, sid, _reason}} ->
+      {:ok, {:error, adapter, sid, {:carried, reason}}} ->
         if is_pid(adapter) and is_binary(sid), do: Adapter.forget_model_residency(adapter, sid)
 
         tune_error(
           "runtime_config_unknown",
-          "Fast may have changed, but exact live readback failed"
+          "Fast may have changed, but exact live readback failed",
+          ErrorDiagnostic.for_reason(reason, operation: "tune", phase: "fast")
         )
         |> Map.merge(%{fast: nil, fast_status: "unknown"})
 
       {:error, :turn_in_progress} ->
         turn_in_progress_error()
     end
+  end
+
+  # The Fast branches match the pre-diagnostic reason; a failure that carries
+  # evidence reaches the generic branch as `{:carried, reason}` with it intact.
+  defp fast_outcome({:ok, {:error, adapter, sid, reason}}) do
+    case ErrorDiagnostic.classified(reason) do
+      :fast_unsupported = bare -> {:ok, {:error, adapter, sid, bare}}
+      {:runtime_config_mismatch, _} = bare -> {:ok, {:error, adapter, sid, bare}}
+      _other -> {:ok, {:error, adapter, sid, {:carried, reason}}}
+    end
+  end
+
+  defp fast_outcome(outcome), do: outcome
+
+  defp fast_unreached(precondition, cause) do
+    node =
+      ErrorDiagnostic.new("unknown",
+        operation: "tune",
+        phase: "fast",
+        origin: "gateway",
+        precondition: precondition,
+        sent: false,
+        cause: cause && {:node, ErrorDiagnostic.with_facts(cause, [])}
+      )
+
+    ErrorDiagnostic.diagnosed(:runtime_config_unknown, node)
   end
 
   # A selection that names a model but no effort (the ordinary case from
@@ -7220,7 +7539,7 @@ defmodule Tightbeam.Gateway do
               close_source_runtime(db, session, source_pointer, call[:principal] || call.origin)
 
             runtime_success(db, call.session_key, "reset", true, cleanup.status)
-            |> Map.merge(Map.drop(cleanup, [:status]))
+            |> Map.merge(Map.drop(cleanup, [:status, :diagnostic]))
 
           {:error, error} ->
             cleanup =
@@ -7234,10 +7553,15 @@ defmodule Tightbeam.Gateway do
 
             tune_error(
               "session_config_commit_failed",
-              "the verified destination was not committed; the source runtime remains active"
+              "the verified destination was not committed; the source runtime remains active",
+              ErrorDiagnostic.with_facts(error,
+                operation: "tune",
+                phase: "commit",
+                cleanup: {:node, cleanup_node(cleanup, destination_sid)}
+              )
             )
             |> Map.merge(%{cleanup_status: cleanup.status, source_active: true})
-            |> Map.merge(Map.drop(cleanup, [:status]))
+            |> Map.merge(Map.drop(cleanup, [:status, :diagnostic]))
         end
 
       {:candidate_prepare_failed, reason, sid, cleanup} ->
@@ -7252,15 +7576,21 @@ defmodule Tightbeam.Gateway do
 
         tune_error(
           "model_apply_failed",
-          "the destination harness did not accept and verify the requested runtime: #{apply_failure(reason)}"
+          "the destination harness did not accept and verify the requested runtime: #{apply_failure(reason)}",
+          ErrorDiagnostic.with_facts(reason,
+            operation: "tune",
+            phase: "prepare",
+            cleanup: {:node, cleanup_node(cleanup, sid)}
+          )
         )
         |> Map.put(:cleanup_status, cleanup.status)
-        |> Map.merge(Map.drop(cleanup, [:status]))
+        |> Map.merge(Map.drop(cleanup, [:status, :diagnostic]))
 
       {:error, reason} ->
         tune_error(
           "model_apply_failed",
-          "the destination harness did not accept and verify the requested runtime: #{apply_failure(reason)}"
+          "the destination harness did not accept and verify the requested runtime: #{apply_failure(reason)}",
+          ErrorDiagnostic.for_reason(reason, operation: "tune", phase: "prepare")
         )
     end
   end
@@ -7272,7 +7602,7 @@ defmodule Tightbeam.Gateway do
          status: "unverified",
          reason: close_reason
        }) do
-    cleanup_unverified(db, sid, {cause, close_reason}, principal)
+    cleanup_unverified(db, sid, cause, close_reason, principal)
   end
 
   defp close_source_runtime(_db, _session, nil, _principal), do: %{status: "verified"}
@@ -7283,23 +7613,50 @@ defmodule Tightbeam.Gateway do
         close_runtime(db, adapter, pointer.harness_session_id, :superseded, principal)
 
       {:error, reason} ->
-        cleanup_unverified(db, pointer.harness_session_id, reason, principal)
+        cleanup_unverified(db, pointer.harness_session_id, nil, reason, principal)
     end
   end
 
   defp close_runtime(db, adapter, sid, cause, principal) do
-    case Adapter.close_session(adapter, sid) do
+    case Adapter.close_session(adapter, sid, diagnostic: true) do
       :ok -> %{status: "verified"}
-      {:error, reason} -> cleanup_unverified(db, sid, {cause, reason}, principal)
+      {:error, reason} -> cleanup_unverified(db, sid, cause, reason, principal)
     end
   end
 
-  defp cleanup_unverified(db, sid, cause, principal) do
+  # The cleanup a failed tune attempted, for that failure's diagnostic.
+  defp cleanup_node(%{diagnostic: node}, _sid) when is_map(node), do: node
+
+  defp cleanup_node(%{status: status}, sid),
+    do:
+      ErrorDiagnostic.new("cleanup",
+        operation: "session/close",
+        session_id: sid,
+        status: status
+      )
+
+  # `trigger` is what the close was cleaning up after (nil when no adapter
+  # could even be asked); `close_reason` is why the close did not confirm. The
+  # event's `cause` text keeps its prior spelling; the diagnostic keeps the
+  # close failure's own evidence.
+  defp cleanup_unverified(db, sid, trigger, close_reason, principal) do
+    cause = if is_nil(trigger), do: close_reason, else: {trigger, close_reason}
+
+    node =
+      ErrorDiagnostic.new("cleanup",
+        operation: "session/close",
+        session_id: sid,
+        status: "unverified",
+        trigger: trigger && {:node, ErrorDiagnostic.with_facts(trigger, [])},
+        cause: ErrorDiagnostic.with_facts(close_reason, [])
+      )
+
     detail =
       JSON.encode!(%{
         runtimeId: sid,
         cause: apply_failure(cause),
-        principal: inspect(principal)
+        principal: inspect(principal),
+        diagnostic: node
       })
 
     event =
@@ -7316,12 +7673,20 @@ defmodule Tightbeam.Gateway do
             "runtime cleanup for #{sid} was unverified and its lifecycle event failed: #{inspect(error)}"
           )
 
-          %{}
+          %{
+            diagnostic:
+              Map.put(
+                node,
+                "lifecycleEventFailure",
+                ErrorDiagnostic.with_facts(error, operation: "lifecycle_event")
+              )
+          }
       end
 
     %{
       status: "unverified",
-      warning: "runtime close could not be verified"
+      warning: "runtime close could not be verified",
+      diagnostic: node
     }
     |> Map.merge(event)
   end
@@ -7363,9 +7728,21 @@ defmodule Tightbeam.Gateway do
           allow_queued: allow_queued
         )
 
-      case boundary do
+      # Branches read the pre-diagnostic reason so every outcome and message is
+      # the one it was; the carried evidence goes only to `diagnostic`.
+      diagnostic =
+        case boundary do
+          {:ok, {:error, reason}} ->
+            ErrorDiagnostic.for_reason(reason, operation: "tune", phase: "model")
+
+          _ ->
+            nil
+        end
+
+      case ErrorDiagnostic.classified(boundary) do
         {:ok, :ok} ->
           runtime_success(db, session.session_key, "preserved", true, "not_applicable")
+          |> ErrorDiagnostic.put(ErrorDiagnostic.of(boundary))
 
         {:ok, {:runtime_projection_failed, %Model{} = actual}} ->
           tune_error(
@@ -7385,10 +7762,11 @@ defmodule Tightbeam.Gateway do
               |> Map.merge(runtime_actual(actual))
               |> Map.put(:projection_committed, true)
 
-            {:error, _reason} ->
+            {:error, reason} ->
               tune_error(
                 "runtime_projection_failed",
-                "the verified active runtime differs from the request and its projection could not be stored"
+                "the verified active runtime differs from the request and its projection could not be stored",
+                ErrorDiagnostic.for_reason(reason, operation: "tune", phase: "projection")
               )
               |> Map.merge(runtime_actual(actual))
               |> Map.put(:projection_committed, false)
@@ -7405,13 +7783,15 @@ defmodule Tightbeam.Gateway do
         {:ok, {:error, {:runtime_config_unknown, _reason}}} ->
           tune_error(
             "runtime_config_unknown",
-            "the runtime may have changed, but exact live readback failed"
+            "the runtime may have changed, but exact live readback failed",
+            diagnostic
           )
 
         {:ok, {:error, {:session_config_commit_failed, _reason}}} ->
           tune_error(
             "session_config_commit_failed",
-            "the verified replacement could not be committed; the prior runtime remains active"
+            "the verified replacement could not be committed; the prior runtime remains active",
+            diagnostic
           )
 
         # A real fault from the switch (adapter down, context move could not complete) -- NOT
@@ -7430,6 +7810,7 @@ defmodule Tightbeam.Gateway do
                 "#{apply_failure(reason)} (the session could not prepare the new model " <>
                 "for its next turn)"
           }
+          |> ErrorDiagnostic.put(diagnostic)
 
         # Busy = a turn is in flight; the switch cannot land mid-turn, so the change
         # was NOT applied. The honest remedy after this fix is to retry at the
@@ -7452,11 +7833,14 @@ defmodule Tightbeam.Gateway do
     }
   end
 
+  defp model_unsupported_reason?({:diagnosed, reason, node}) when is_map(node),
+    do: model_unsupported_reason?(ErrorDiagnostic.classified(reason))
+
   defp model_unsupported_reason?(:model_unavailable), do: true
   defp model_unsupported_reason?(:adapter_unavailable), do: true
 
   defp model_unsupported_reason?({:model_apply_failed, reason}),
-    do: model_unsupported_reason?(reason)
+    do: model_unsupported_reason?(ErrorDiagnostic.classified(reason))
 
   defp model_unsupported_reason?({:adapter_unavailable, _reason}), do: true
   defp model_unsupported_reason?(_reason), do: false
@@ -7625,8 +8009,8 @@ defmodule Tightbeam.Gateway do
             :ok
 
           {:error, error} ->
-            _cleanup = close_runtime(db, adapter, sid, error, principal)
-            {:error, {:session_config_commit_failed, error}}
+            cleanup = close_runtime(db, adapter, sid, error, principal)
+            {:error, commit_failed(error, cleanup, sid)}
         end
 
       {:candidate_prepare_failed, {:runtime_config_mismatch, %Model{} = actual} = reason, sid,
@@ -7635,8 +8019,16 @@ defmodule Tightbeam.Gateway do
         {:error, {:initial_runtime_config_mismatch, actual}}
 
       {:candidate_prepare_failed, reason, sid, cleanup} ->
-        _cleanup = report_candidate_cleanup(db, sid, reason, principal, cleanup)
-        {:error, reason}
+        cleanup = report_candidate_cleanup(db, sid, reason, principal, cleanup)
+
+        {:error,
+         ErrorDiagnostic.diagnosed(
+           ErrorDiagnostic.classified(reason),
+           ErrorDiagnostic.with_facts(reason,
+             phase: "prepare",
+             cleanup: {:node, cleanup_node(cleanup, sid)}
+           )
+         )}
 
       {:error, reason} ->
         {:error, reason}
@@ -7743,53 +8135,90 @@ defmodule Tightbeam.Gateway do
 
     case result do
       {:ok, {:changed, marker}} ->
-        close_superseded_model_session(adapter, session.session_key, prior_sid, switched_sid)
+        cleanup =
+          close_superseded_model_session(adapter, session.session_key, prior_sid, switched_sid)
+
         publish_stored_message(db, session.session_key, marker)
-        :ok
+        ErrorDiagnostic.diagnosed(:ok, cleanup)
 
       {:ok, :duplicate} ->
-        close_superseded_model_session(adapter, session.session_key, prior_sid, switched_sid)
-        :ok
+        adapter
+        |> close_superseded_model_session(session.session_key, prior_sid, switched_sid)
+        |> then(&ErrorDiagnostic.diagnosed(:ok, &1))
 
       {:error, error} ->
         if switched_sid == prior_sid do
           {:runtime_projection_failed, new_ref}
         else
-          reject_tuned_session(adapter, prior_sid, switched_sid)
-          {:error, {:session_config_commit_failed, error}}
+          cleanup = reject_tuned_session(adapter, prior_sid, switched_sid)
+          {:error, commit_failed(error, cleanup, switched_sid)}
         end
     end
   end
 
-  defp close_superseded_model_session(_adapter, _session_key, sid, sid), do: :ok
+  # The switch has committed either way; a close that did not confirm rides beside
+  # that success as a cleanup node instead of living only in the log.
+  defp close_superseded_model_session(_adapter, _session_key, sid, sid), do: nil
 
   defp close_superseded_model_session(adapter, session_key, prior_sid, _switched_sid) do
-    case Adapter.close_session(adapter, prior_sid) do
+    case Adapter.close_session(adapter, prior_sid, diagnostic: true) do
       :ok ->
-        :ok
+        nil
 
       {:error, reason} ->
         Logger.warning(
           "model switch committed for #{session_key}, but superseded session #{prior_sid} " <>
-            "could not close: #{inspect(reason)}"
+            "could not close: #{inspect(ErrorDiagnostic.classified(reason))}"
+        )
+
+        ErrorDiagnostic.new("cleanup",
+          operation: "session/close",
+          session_id: prior_sid,
+          status: "unverified",
+          cause: ErrorDiagnostic.with_facts(reason, [])
         )
     end
   end
 
-  defp reject_tuned_session(adapter, sid, sid),
-    do: :ok = Adapter.forget_model_residency(adapter, sid)
+  defp reject_tuned_session(adapter, sid, sid) do
+    :ok = Adapter.forget_model_residency(adapter, sid)
+    nil
+  end
 
   defp reject_tuned_session(adapter, _prior_sid, switched_sid) do
-    case Adapter.close_session(adapter, switched_sid) do
+    case Adapter.close_session(adapter, switched_sid, diagnostic: true) do
       :ok ->
-        :ok
+        %{status: "verified"}
 
       {:error, reason} ->
         Logger.warning(
           "model switch database projection failed, and replacement session #{switched_sid} " <>
-            "could not close: #{inspect(reason)}"
+            "could not close: #{inspect(ErrorDiagnostic.classified(reason))}"
         )
+
+        %{
+          status: "unverified",
+          diagnostic:
+            ErrorDiagnostic.new("cleanup",
+              operation: "session/close",
+              session_id: switched_sid,
+              status: "unverified",
+              cause: ErrorDiagnostic.with_facts(reason, [])
+            )
+        }
     end
+  end
+
+  # A commit failure keeps its classification; the database error and the
+  # replacement runtime's cleanup travel as its diagnostic.
+  defp commit_failed(error, cleanup, sid) do
+    ErrorDiagnostic.diagnosed(
+      {:session_config_commit_failed, error},
+      ErrorDiagnostic.with_facts(error,
+        phase: "commit",
+        cleanup: if(cleanup, do: {:node, cleanup_node(cleanup, sid)})
+      )
+    )
   end
 
   # A harness may make its installed local client authoritative for an exact
@@ -7855,18 +8284,26 @@ defmodule Tightbeam.Gateway do
         :ok
 
       {:needs_onboarding, reason} ->
+        # The sentence names the remedy; the diagnostic keeps the reason that
+        # chose it, e.g. which check found the plan unsupported.
         {:error,
          %{
            code: "needs_onboarding",
            message: credential_remedy(reason, provider, machine)
-         }}
+         }
+         |> ErrorDiagnostic.put(
+           ErrorDiagnostic.from_reason(reason, operation: "credential_status", provider: provider)
+         )}
 
       {:unavailable, %{reason: reason}} ->
         {:error,
          %{
            code: "credential_status_unavailable",
            message: credential_status_unavailable_message(provider, machine, reason)
-         }}
+         }
+         |> ErrorDiagnostic.put(
+           ErrorDiagnostic.from_reason(reason, operation: "credential_status", provider: provider)
+         )}
     end
   end
 
@@ -7957,8 +8394,19 @@ defmodule Tightbeam.Gateway do
   # ACP error map in an operator's chat (G3). Atoms and short tuples read plainly.
   defp credential_reason_phrase(reason) when is_atom(reason), do: to_string(reason)
 
-  defp credential_reason_phrase(reason) do
-    reason |> inspect() |> String.slice(0, 200)
+  defp credential_reason_phrase(reason), do: bounded_inspect(reason, 200)
+
+  # A cut is marked with the length it came from, so a reader can tell the
+  # phrase is partial instead of taking the prefix for the whole reason.
+  # Redact before cutting: a length bound is not a redaction, and cutting first
+  # could leave a secret's prefix that no longer matches a redaction pattern.
+  defp bounded_inspect(reason, limit) do
+    text = reason |> inspect() |> ErrorDiagnostic.redact_text()
+    length = String.length(text)
+
+    if length > limit,
+      do: String.slice(text, 0, limit) <> "… [truncated from #{length} characters]",
+      else: text
   end
 
   # A credential failure at the turn seam, named through the one shared remedy function.
@@ -8661,9 +9109,9 @@ defmodule Tightbeam.Gateway do
 
     :ok
   rescue
-    _ -> :ok
+    exception -> best_effort_failed("reap_retired_sessions", :error, exception, __STACKTRACE__)
   catch
-    :exit, _ -> :ok
+    :exit, reason -> best_effort_failed("reap_retired_sessions", :exit, reason, __STACKTRACE__)
   end
 
   defp archive_retired_workspace(config, db, session_key) do
@@ -8685,9 +9133,10 @@ defmodule Tightbeam.Gateway do
       )
     end
   rescue
-    _ -> :ok
+    exception ->
+      best_effort_failed("archive_retired_workspace", :error, exception, __STACKTRACE__)
   catch
-    _, _ -> :ok
+    kind, reason -> best_effort_failed("archive_retired_workspace", kind, reason, __STACKTRACE__)
   end
 
   defp reap_adapter_sessions(db, coordinator, key, retired) do
@@ -8715,9 +9164,9 @@ defmodule Tightbeam.Gateway do
       end
     end
   rescue
-    _ -> :ok
+    exception -> best_effort_failed("reap_adapter_sessions", :error, exception, __STACKTRACE__)
   catch
-    :exit, _ -> :ok
+    :exit, reason -> best_effort_failed("reap_adapter_sessions", :exit, reason, __STACKTRACE__)
   end
 
   defp live_session_on_adapter?(db, {harness, "shared", host}) do
@@ -8794,8 +9243,13 @@ defmodule Tightbeam.Gateway do
       {:ok, :placement_changed} ->
         {:error, "holder placement changed concurrently"}
 
+      # The transaction consumed the stack; the exception's type is kept.
       {:error, error} ->
-        {:error, Exception.message(error)}
+        {:error,
+         ErrorDiagnostic.diagnosed(
+           Exception.message(error),
+           ErrorDiagnostic.from_reason(error, operation: "commit_host_rearm")
+         )}
     end
   end
 
@@ -8845,7 +9299,7 @@ defmodule Tightbeam.Gateway do
   # inspect only when it has no readable text.
   defp error_sentence(reason) when is_map(reason) do
     case error_map_text(reason) do
-      "" -> reason |> inspect() |> String.slice(0, 300)
+      "" -> bounded_inspect(reason, 300)
       text -> text
     end
   end
@@ -8972,13 +9426,16 @@ defmodule Tightbeam.Gateway do
          correlation,
          state,
          error,
-         registry \\ Tightbeam.ConnRegistry
+         registry \\ Tightbeam.ConnRegistry,
+         diagnostic \\ nil
        ) do
     case Org.get(db, session_key) do
       nil ->
         :ok
 
       session ->
+        # A credential refusal replaces the sentence in `error`; the adapter's
+        # original failure rides beside it so a subscriber can still see it.
         Tightbeam.ConnRegistry.broadcast(
           registry,
           session.owner_user_id,
@@ -8986,7 +9443,8 @@ defmodule Tightbeam.Gateway do
             client_message_id: correlation,
             session_key: session_key,
             state: state,
-            error: error
+            error: error,
+            diagnostic: diagnostic
           }),
           &deliver/2
         )
@@ -9063,10 +9521,18 @@ defmodule Tightbeam.Gateway do
     try do
       fun.()
     rescue
-      _ -> :ok
+      exception -> best_effort_failed("best_effort", :error, exception, __STACKTRACE__)
     catch
-      _, _ -> :ok
+      kind, reason -> best_effort_failed("best_effort", kind, reason, __STACKTRACE__)
     end
+  end
+
+  # Best-effort work stays best-effort: the caller still gets :ok. What failed is
+  # logged with its type, message and stack instead of vanishing.
+  defp best_effort_failed(site, kind, reason, stacktrace) do
+    node = ErrorDiagnostic.caught(kind, reason, stacktrace, operation: site, origin: "gateway")
+    Logger.warning("#{site} failed; continuing: " <> JSON.encode!(node))
+    :ok
   end
 
   defp deliver(pid, payload), do: send(pid, {:push, payload})

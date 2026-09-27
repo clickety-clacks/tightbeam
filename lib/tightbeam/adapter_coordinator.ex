@@ -20,7 +20,8 @@ defmodule Tightbeam.AdapterCoordinator do
   - Backoff: restart with exponential backoff 1s → 60s cap. After the configured
     consecutive failures the circuit OPENS: the key is marked degraded,
     `adapter_for/2` returns {:error, :degraded} so affected turns fail fast
-    with a clear reason, /version|/health reflects it, the gateway stays up.
+    with a clear reason (carried as `{:diagnosed, :degraded, node}` naming the
+    consecutive failures and the last cause), /version|/health reflects it, the gateway stays up.
     A successful restart closes the circuit and resets the count.
   - Re-adoption semaphore: at most the configured number of concurrent session/load
     calls per machine (no thundering herd after an adapter bounce, and no machine
@@ -42,6 +43,7 @@ defmodule Tightbeam.AdapterCoordinator do
 
   use GenServer
   require Logger
+  alias Tightbeam.ErrorDiagnostic
 
   @adapter_readiness_timeout 185_000
   @adapter_checkout_timeout 190_000
@@ -114,6 +116,8 @@ defmodule Tightbeam.AdapterCoordinator do
   The adapter for a key, starting it lazily on first use. Returns the pid AND
   the current generation (the lane stamps it against the turn). Degraded key →
   {:error, :degraded} — fail the turn fast, never queue behind a dead adapter.
+  The class rides in `ErrorDiagnostic.diagnosed/2` with the failure count and
+  the last recorded cause; `ErrorDiagnostic.classified/1` recovers `:degraded`.
   """
   @spec adapter_for(GenServer.server(), adapter_key()) :: checkout()
   def adapter_for(server \\ __MODULE__, key) do
@@ -333,7 +337,7 @@ defmodule Tightbeam.AdapterCoordinator do
         {:reply, checkout(entry), state}
 
       entry.circuit == :open ->
-        {:reply, {:error, :degraded}, state}
+        {:reply, {:error, degraded(entry)}, state}
 
       readiness_pending?(entry) ->
         {:noreply, add_waiter(key, from, state)}
@@ -486,7 +490,7 @@ defmodule Tightbeam.AdapterCoordinator do
       # store still holding the original credential, and recovery needed an
       # operator restarting the gateway.
       entry.circuit == :open and not authoritative? ->
-        {:reply, {:error, :degraded}, state}
+        {:reply, {:error, degraded(entry)}, state}
 
       true ->
         {:noreply, begin_readiness(key, entry, state, context, from)}
@@ -913,18 +917,27 @@ defmodule Tightbeam.AdapterCoordinator do
   # `state_detail` names the STATE the adapter died in — the caller knows it and
   # the row must carry it, because "absorbed" and "parked" are the two ways a
   # death reaches this function by a path other than a live monitor.
+  # The text keeps the legacy reason; a carried diagnostic goes on the notice
+  # detail only, never into the chat line.
   defp record_adapter_down(state, key, was_ready?, reason, state_detail) do
     name = key_name(key)
+    text = inspect(ErrorDiagnostic.classified(reason))
+
+    diagnostic =
+      case ErrorDiagnostic.of(reason) do
+        nil -> ""
+        node -> " diagnostic=" <> JSON.encode!(node)
+      end
 
     Tightbeam.EventLog.notice(
       state.db,
       "adapter_down",
       name,
-      "#{inspect(reason)} #{state_detail}",
+      "#{text} #{state_detail}#{diagnostic}",
       audience: {:sessions, told_sessions(state.db, key, was_ready?)},
       attention: :normal,
       message:
-        "[adapter down]\n\nThe #{name} engine stopped: #{inspect(reason)}. Anything " <>
+        "[adapter down]\n\nThe #{name} engine stopped: #{text}. Anything " <>
           "that was running on it stopped with it. Tightbeam restarts the engine and " <>
           "releases this session when it is ready again."
     )
@@ -1009,10 +1022,15 @@ defmodule Tightbeam.AdapterCoordinator do
 
     cond do
       readiness_key != nil ->
-        refusal = %{
-          code: "adapter_readiness_failed",
-          message: "Adapter readiness preflight exited: #{inspect(reason)}"
-        }
+        refusal =
+          ErrorDiagnostic.put(
+            %{
+              code: "adapter_readiness_failed",
+              message:
+                "Adapter readiness preflight exited: #{inspect(ErrorDiagnostic.classified(reason))}"
+            },
+            ErrorDiagnostic.of(reason)
+          )
 
         {:noreply, finish_readiness(state, readiness_key, {:error, {:launch_refused, refusal}})}
 
@@ -1500,6 +1518,23 @@ defmodule Tightbeam.AdapterCoordinator do
       {:noreply, %{state | valid: false, monitors: Map.delete(state.monitors, ref)}}
     end
   end
+
+  # The fail-fast decision stays; the refusal keeps why the circuit opened.
+  defp degraded(entry) do
+    ErrorDiagnostic.diagnosed(
+      :degraded,
+      ErrorDiagnostic.new("circuit_open",
+        origin: "adapter_coordinator",
+        consecutive_failures: entry.failures,
+        cause: last_failure_node(entry.last_failure)
+      )
+    )
+  end
+
+  defp last_failure_node(nil), do: nil
+
+  defp last_failure_node({generation, reason}),
+    do: ErrorDiagnostic.with_facts(reason, generation: generation)
 
   defp fresh_entry do
     %{

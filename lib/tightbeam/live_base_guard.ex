@@ -143,8 +143,10 @@ defmodule Tightbeam.LiveBaseGuard do
       {:ok, value} ->
         if validator.(value), do: {:ok, value}, else: refuse(code, nil, "strict object")
 
-      {:error, _} ->
-        refuse(code, nil, "valid JSON")
+      # packaging/payload-manifest.exs loads this module alone, so the decoder's
+      # own reason is kept as is rather than converted by another module.
+      {:error, reason} ->
+        refuse(code, reason, "valid JSON")
     end
   end
 

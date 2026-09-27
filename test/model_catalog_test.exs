@@ -3,7 +3,16 @@ defmodule Tightbeam.ModelCatalogTest do
 
   import ExUnit.CaptureLog
 
-  alias Tightbeam.{Archetypes, Gateway, Model, ModelCatalog, Placement, Unroutable}
+  alias Tightbeam.{
+    Archetypes,
+    ErrorDiagnostic,
+    Gateway,
+    Model,
+    ModelCatalog,
+    Placement,
+    Unroutable
+  }
+
   alias Tightbeam.Harness.Support
 
   @fixtures Path.join(__DIR__, "fixtures/model_catalog")
@@ -858,6 +867,98 @@ defmodule Tightbeam.ModelCatalogTest do
     end
   end
 
+  test "a derivation that raises returns a typed redacted exception diagnostic", ctx do
+    sentinel = "sk-fixture-SENTINEL-0123456789abcdef"
+    catalog = unique_name(:raising_catalog)
+
+    log =
+      capture_log(fn ->
+        start_catalog(ctx,
+          name: catalog,
+          credential_status: fn _provider -> :onboarded end,
+          credential_kind: fn _provider -> raise ArgumentError, "kind failed near #{sentinel}" end
+        )
+
+        classification = {:exception, ArgumentError, "kind failed near [REDACTED:token]"}
+
+        await(fn ->
+          case ModelCatalog.get(@host, "claude", catalog) do
+            {[], {:unavailable, reason}} -> ErrorDiagnostic.classified(reason) == classification
+            _ -> false
+          end
+        end)
+
+        assert {[], {:unavailable, reason}} = ModelCatalog.get(@host, "claude", catalog)
+        assert ErrorDiagnostic.classified(reason) == classification
+
+        assert %{
+                 "kind" => "exception",
+                 "operation" => "derive_catalog",
+                 "phase" => "catalog_derivation",
+                 "origin" => "model_catalog",
+                 "host" => @host,
+                 "harness" => "claude",
+                 "exception" => %{
+                   "type" => "ArgumentError",
+                   "message" => "kind failed near [REDACTED:token]",
+                   "stacktrace" => [_ | _]
+                 }
+               } = ErrorDiagnostic.of(reason)
+
+        refute inspect(ErrorDiagnostic.of(reason)) =~ sentinel
+      end)
+
+    assert log =~ "model catalog derivation raised"
+    assert log =~ "derive_catalog"
+    assert log =~ "ArgumentError"
+    assert log =~ "stacktrace"
+    refute log =~ sentinel
+  end
+
+  test "a caught derivation failure returns its typed redacted reason", ctx do
+    sentinel = "sk-fixture-SENTINEL-0123456789abcdef"
+    catalog = unique_name(:throwing_catalog)
+
+    log =
+      capture_log(fn ->
+        start_catalog(ctx,
+          name: catalog,
+          credential_status: fn _provider -> :onboarded end,
+          credential_kind: fn _provider -> throw("kind failed near #{sentinel}") end
+        )
+
+        classification = {:throw, "kind failed near [REDACTED:token]"}
+
+        await(fn ->
+          case ModelCatalog.get(@host, "claude", catalog) do
+            {[], {:unavailable, reason}} -> ErrorDiagnostic.classified(reason) == classification
+            _ -> false
+          end
+        end)
+
+        assert {[], {:unavailable, reason}} = ModelCatalog.get(@host, "claude", catalog)
+        assert ErrorDiagnostic.classified(reason) == classification
+
+        assert %{
+                 "kind" => "throw",
+                 "operation" => "derive_catalog",
+                 "phase" => "catalog_derivation",
+                 "origin" => "model_catalog",
+                 "host" => @host,
+                 "harness" => "claude",
+                 "reason" => "kind failed near [REDACTED:token]",
+                 "stacktrace" => [_ | _]
+               } = ErrorDiagnostic.of(reason)
+
+        refute inspect(ErrorDiagnostic.of(reason)) =~ sentinel
+      end)
+
+    assert log =~ "model catalog derivation caught"
+    assert log =~ "derive_catalog"
+    assert log =~ "stacktrace"
+    refute log =~ sentinel
+  end
+
   test "an unreadable credential store is the catalog health and warning reason", ctx do
     reason =
       {:credential_store_unreadable,
@@ -888,7 +989,8 @@ defmodule Tightbeam.ModelCatalogTest do
     for {label, opts, harness, reason} <- [
           {:failed, [claude_fetch: fn _, _ -> {:error, :network_down} end], "claude",
            :network_down},
-          {:malformed, [claude_fetch: fn _, _ -> {:ok, "{"} end], "claude", :malformed_json},
+          {:malformed, [claude_fetch: fn _, _ -> {:ok, "{"} end], "claude",
+           {:malformed_json, {:unexpected_end, 1}}},
           # The vendor's own sentence, verbatim — this is the 401 body the live
           # endpoint returns for a grant that needs signing in again.
           {:refused_grant,
@@ -1802,9 +1904,15 @@ defmodule Tightbeam.ModelCatalogTest do
 
         catalog = start_catalog(ctx, sh: sh)
 
+        # The class keeps the exit status that produced it.
         await(fn ->
-          ModelCatalog.get(@host, "codex", catalog) ==
-            {[], {:unavailable, {:codex_path_unusable, binding}}}
+          match?(
+            {[],
+             {:unavailable,
+              {:diagnosed, {:codex_path_unusable, ^binding},
+               %{"kind" => "probe_failed", "exitStatus" => 69}}}},
+            ModelCatalog.get(@host, "codex", catalog)
+          )
         end)
       end
 
@@ -1907,20 +2015,27 @@ defmodule Tightbeam.ModelCatalogTest do
       states = [
         # A genuine prefix of a genuine file — what a reader sees mid-rewrite.
         {:torn, binary_part(whole, 0, div(byte_size(whole), 2)),
-         {:credential_read_torn, :retry_next_refresh}},
+         {:credential_read_torn, :retry_next_refresh}, 75},
         {:no_tokens_object, JSON.encode!(%{auth_mode: "chatgpt"}),
-         {:credential_missing_access_token, auth}},
+         {:credential_missing_access_token, auth}, 67},
         {:empty_token, JSON.encode!(%{tokens: %{access_token: ""}}),
-         {:credential_missing_access_token, auth}}
+         {:credential_missing_access_token, auth}, 67}
       ]
 
-      for {label, contents, expected} <- states do
+      # Each class carries the extraction exit status it was decided on, so a
+      # misclassification can be checked against the code the probe returned.
+      for {label, contents, expected, status} <- states do
         File.write!(auth, contents)
         catalog = start_catalog(ctx, name: unique_name(label), sh: sh)
         assert_receive {:probe_returned, _exit_status}, 10_000
 
         await(fn ->
-          ModelCatalog.get(@host, "codex", catalog) == {[], {:unavailable, expected}}
+          match?(
+            {[],
+             {:unavailable,
+              {:diagnosed, ^expected, %{"kind" => "probe_failed", "exitStatus" => ^status}}}},
+            ModelCatalog.get(@host, "codex", catalog)
+          )
         end)
       end
 
@@ -1931,9 +2046,17 @@ defmodule Tightbeam.ModelCatalogTest do
       assert_receive {:probe_returned, _exit_status}, 10_000
 
       await(fn ->
-        ModelCatalog.get(@host, "codex", catalog) ==
-          {[], {:unavailable, {:missing_credential, auth}}}
+        match?(
+          {[],
+           {:unavailable,
+            {:diagnosed, {:missing_credential, ^auth},
+             %{"kind" => "probe_failed", "exitStatus" => 66}}}},
+          ModelCatalog.get(@host, "codex", catalog)
+        )
       end)
+
+      {[], {:unavailable, reason}} = ModelCatalog.get(@host, "codex", catalog)
+      assert ErrorDiagnostic.classified(reason) == {:missing_credential, auth}
     end
 
     test "an unreachable host degrades only its own entries", ctx do

@@ -6,6 +6,7 @@ defmodule Tightbeam.Acp.AdapterTest do
 
   alias Tightbeam.Acp.Adapter
   alias Tightbeam.Model
+  alias Tightbeam.ErrorDiagnostic
 
   setup do
     previous = Application.get_env(:tightbeam, :enabled_dormant_harnesses)
@@ -127,8 +128,16 @@ defmodule Tightbeam.Acp.AdapterTest do
     {rejected, rejected_capture} =
       start_adapter(harness: :claude, fail_mode: "model-invalid-params")
 
-    assert {:error, :model_unavailable} =
-             Adapter.new_session(rejected, exact, "/tmp", [], "guidance")
+    rejection = Adapter.new_session(rejected, exact, "/tmp", [], "guidance")
+    assert {:error, :model_unavailable} = ErrorDiagnostic.classified(rejection)
+
+    assert %{
+             "kind" => "jsonrpc_error",
+             "origin" => "acp_adapter",
+             "phase" => "model",
+             "value" => "claude-opus-5-5",
+             "reason" => %{"code" => -32602, "message" => "Invalid params"}
+           } = ErrorDiagnostic.of(rejection)
 
     assert ["claude-opus-5-5"] =
              rejected_capture
@@ -341,6 +350,9 @@ defmodule Tightbeam.Acp.AdapterTest do
         if (failMode === "model-refusal") {
           return send({ id: m.id, error: { code: -32000, message: "Invalid value for config option model" } });
         }
+        if (failMode === "model-refused-data" && m.params.configId === "model") {
+          return send({ id: m.id, error: { code: -32602, message: "Invalid params", data: { model: m.params.value, detail: "not offered" } } });
+        }
         if (failMode === "model-invalid-params" && m.params.configId === "model") {
           // Recorded live 2026-07-28: codex-acp's refusal of a model value the
           // catalog advertised (`gpt-5.1-codex`) — JSON-RPC -32602 Invalid params.
@@ -373,6 +385,14 @@ defmodule Tightbeam.Acp.AdapterTest do
             m.params.configId === "reasoning_effort" &&
             m.params.value === "high") {
           return setTimeout(() => send({ id: m.id, result: configOptions(m.params.sessionId) }), 200);
+        }
+        if (failMode === "strict-model-unconfirmed-effort-refused" && m.params.value === "gpt-new") {
+          return send({ id: m.id, result: configOptions(m.params.sessionId) });
+        }
+        if (failMode === "strict-model-unconfirmed-effort-refused" &&
+            m.params.configId === "reasoning_effort" &&
+            m.params.value === "high") {
+          return send({ id: m.id, error: { code: -32000, message: "effort refused", data: { effort: "high", detail: "not offered" } } });
         }
         if (failMode === "apply-effort-failure" &&
             m.params.configId === "reasoning_effort" &&
@@ -419,6 +439,9 @@ defmodule Tightbeam.Acp.AdapterTest do
       case "session/set_mode": {
         capture(m);
         if (gateMode === "delay-setup") return setTimeout(() => send({ id: m.id, result: {} }), 75);
+        if (gateMode === "mode-refused-data" && m.params.sessionId === "probe-sess") {
+          return send({ id: m.id, error: { code: -32000, message: "mode refused", data: { modeId: m.params.modeId, policy: "probe mode denied" } } });
+        }
         if (failMode === "fail" ||
             (failMode === "fork-mode-fail" && m.params.sessionId.startsWith("sess-fork-"))) {
           return send({ id: m.id, error: { code: -32000, message: "mode refused" } });
@@ -867,8 +890,15 @@ defmodule Tightbeam.Acp.AdapterTest do
   test "load_session propagates a mode refusal without registering a promptable session" do
     {adapter, capture_path} = start_adapter(fail_mode: "fail")
 
+    refusal = Adapter.load_session(adapter, "sess-1", Model.new("haiku"), "/tmp", [], "guidance")
+
     assert {:error, {:mode_apply_failed, %{"message" => "mode refused"}}} =
-             Adapter.load_session(adapter, "sess-1", Model.new("haiku"), "/tmp", [], "guidance")
+             ErrorDiagnostic.classified(refusal)
+
+    assert %{
+             "operation" => "session/set_mode",
+             "reason" => %{"code" => -32000, "message" => "mode refused"}
+           } = ErrorDiagnostic.of(refusal)
 
     refute Adapter.knows_session?(adapter, "sess-1")
 
@@ -889,15 +919,25 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     switched_model = Model.new("claude-opus-4-8", context: "1m", effort: "high")
 
+    switch_result =
+      Adapter.switch_model_session(
+        adapter,
+        "sess-1",
+        switched_model,
+        "/tmp",
+        [],
+        "new guidance"
+      )
+
     assert {:error, {:model_apply_failed, :model_readback_unavailable}} =
-             Adapter.switch_model_session(
-               adapter,
-               "sess-1",
-               switched_model,
-               "/tmp",
-               [],
-               "new guidance"
-             )
+             ErrorDiagnostic.classified(switch_result)
+
+    assert %{
+             "kind" => "unconfirmed",
+             "phase" => "readback",
+             "configId" => "model",
+             "cleanup" => %{"status" => "verified", "sessionId" => "sess-fork-1"}
+           } = ErrorDiagnostic.of(switch_result)
 
     requests = captured_requests(capture_path)
 
@@ -963,15 +1003,25 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     assert {:ok, _turn} = Adapter.prompt(adapter, "sess-1", "persist this conversation")
 
+    switch_result =
+      Adapter.switch_model_session(
+        adapter,
+        "sess-1",
+        Model.new("claude-opus-4-8", context: "1m"),
+        "/tmp",
+        [],
+        "guidance"
+      )
+
     assert {:error, {:model_apply_failed, :model_readback_unavailable}} =
-             Adapter.switch_model_session(
-               adapter,
-               "sess-1",
-               Model.new("claude-opus-4-8", context: "1m"),
-               "/tmp",
-               [],
-               "guidance"
-             )
+             ErrorDiagnostic.classified(switch_result)
+
+    assert %{
+             "kind" => "unconfirmed",
+             "phase" => "readback",
+             "configId" => "model",
+             "cleanup" => %{"status" => "verified", "sessionId" => "sess-fork-1"}
+           } = ErrorDiagnostic.of(switch_result)
 
     model_writes =
       captured_requests(capture_path)
@@ -997,15 +1047,25 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     assert {:ok, _turn} = Adapter.prompt(adapter, "sess-1", "persist this conversation")
 
+    switch_result =
+      Adapter.switch_model_session(
+        adapter,
+        "sess-1",
+        Model.new("claude-opus-5", effort: "high"),
+        "/tmp",
+        [],
+        "guidance"
+      )
+
     assert {:error, {:model_apply_failed, :model_readback_unavailable}} =
-             Adapter.switch_model_session(
-               adapter,
-               "sess-1",
-               Model.new("claude-opus-5", effort: "high"),
-               "/tmp",
-               [],
-               "guidance"
-             )
+             ErrorDiagnostic.classified(switch_result)
+
+    assert %{
+             "kind" => "unconfirmed",
+             "phase" => "readback",
+             "configId" => "model",
+             "cleanup" => %{"status" => "verified", "sessionId" => "sess-fork-1"}
+           } = ErrorDiagnostic.of(switch_result)
 
     model_writes =
       captured_requests(capture_path)
@@ -1031,15 +1091,25 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     assert {:ok, _turn} = Adapter.prompt(adapter, "sess-1", "persist this conversation")
 
+    switch_result =
+      Adapter.switch_model_session(
+        adapter,
+        "sess-1",
+        Model.new("claude-opus-4-8", context: "1m", effort: "high"),
+        "/tmp",
+        [],
+        "guidance"
+      )
+
     assert {:error, {:model_apply_failed, :model_readback_unavailable}} =
-             Adapter.switch_model_session(
-               adapter,
-               "sess-1",
-               Model.new("claude-opus-4-8", context: "1m", effort: "high"),
-               "/tmp",
-               [],
-               "guidance"
-             )
+             ErrorDiagnostic.classified(switch_result)
+
+    assert %{
+             "kind" => "unconfirmed",
+             "phase" => "readback",
+             "configId" => "model",
+             "cleanup" => %{"status" => "verified", "sessionId" => "sess-fork-1"}
+           } = ErrorDiagnostic.of(switch_result)
 
     assert {:error, :model_readback_unavailable} =
              Adapter.current_model(adapter, "sess-fork-1")
@@ -1056,15 +1126,18 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert {:ok, "sess-1"} =
              Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
 
-    assert {:error, :fork_requires_prompted_session} =
-             Adapter.switch_model_session(
-               adapter,
-               "sess-1",
-               Model.new("claude-sonnet-5"),
-               "/tmp",
-               [],
-               "guidance"
-             )
+    fork_result =
+      Adapter.switch_model_session(
+        adapter,
+        "sess-1",
+        Model.new("claude-sonnet-5"),
+        "/tmp",
+        [],
+        "guidance"
+      )
+
+    # A local guard: no request was sent, so there is no provider evidence to carry.
+    assert {:error, :fork_requires_prompted_session} = fork_result
 
     refute Enum.any?(captured_requests(capture_path), &(&1["method"] == "session/fork"))
   end
@@ -1083,15 +1156,20 @@ defmodule Tightbeam.Acp.AdapterTest do
                "guidance"
              )
 
-    assert {:error, :fork_requires_prompted_session} =
-             Adapter.switch_model_session(
-               adapter,
-               "loaded-session",
-               Model.new("claude-sonnet-5"),
-               "/tmp",
-               [],
-               "guidance"
-             )
+    fork_result =
+      Adapter.switch_model_session(
+        adapter,
+        "loaded-session",
+        Model.new("claude-sonnet-5"),
+        "/tmp",
+        [],
+        "guidance"
+      )
+
+    assert {:error, :fork_requires_prompted_session} = ErrorDiagnostic.classified(fork_result)
+
+    assert %{"operation" => "session/fork", "reason" => %{"code" => -32002}} =
+             ErrorDiagnostic.of(fork_result)
 
     assert Enum.any?(captured_requests(capture_path), &(&1["method"] == "session/fork"))
   end
@@ -1151,15 +1229,20 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     assert {:ok, "sess-1"} = Adapter.new_session(adapter, nil, "/tmp", [], "guidance")
 
-    assert {:error, :model_unavailable} =
-             Adapter.switch_model_session(
-               adapter,
-               "sess-1",
-               Model.new("gpt-new"),
-               "/tmp",
-               [],
-               "guidance"
-             )
+    switch_result =
+      Adapter.switch_model_session(
+        adapter,
+        "sess-1",
+        Model.new("gpt-new"),
+        "/tmp",
+        [],
+        "guidance"
+      )
+
+    assert {:error, :model_unavailable} = ErrorDiagnostic.classified(switch_result)
+
+    assert %{"kind" => "jsonrpc_error", "value" => "gpt-new", "reason" => %{"code" => -32602}} =
+             ErrorDiagnostic.of(switch_result)
   end
 
   test "a prompt worker that dies before dispatch returns an error without wedging the adapter" do
@@ -2031,17 +2114,20 @@ defmodule Tightbeam.Acp.AdapterTest do
   test "the adapter's -32602 model refusal surfaces on new and canonical reattach" do
     {adapter, _capture} = start_adapter(harness: :codex, fail_mode: "model-invalid-params")
 
-    assert {:error, :model_unavailable} =
-             Adapter.new_session(adapter, Model.new("gpt-5.1-codex"), "/tmp", [], "guidance")
+    new_result = Adapter.new_session(adapter, Model.new("gpt-5.1-codex"), "/tmp", [], "guidance")
+    assert {:error, :model_unavailable} = ErrorDiagnostic.classified(new_result)
+    assert %{"reason" => %{"code" => -32602}, "phase" => "model"} = ErrorDiagnostic.of(new_result)
 
     assert {:error, {:model_apply_failed, :model_unavailable}} =
-             Adapter.load_session(
-               adapter,
-               "sess-1",
-               Model.new("gpt-5.1-codex"),
-               "/tmp",
-               [],
-               "guidance"
+             ErrorDiagnostic.classified(
+               Adapter.load_session(
+                 adapter,
+                 "sess-1",
+                 Model.new("gpt-5.1-codex"),
+                 "/tmp",
+                 [],
+                 "guidance"
+               )
              )
 
     refute Adapter.knows_session?(adapter, "sess-1")
@@ -2123,14 +2209,20 @@ defmodule Tightbeam.Acp.AdapterTest do
   test "Cursor refuses a ref no wire option is named for" do
     {adapter, capture} = start_adapter(harness: :cursor, fail_mode: "cursor-wire-enum")
 
+    candidate =
+      Adapter.new_candidate_session(
+        adapter,
+        Model.new("composer-2.5-fast"),
+        "/tmp",
+        [],
+        "guidance"
+      )
+
     assert {:error, {:session_prepare_failed, :model_unavailable, "sess-1", _teardown}} =
-             Adapter.new_candidate_session(
-               adapter,
-               Model.new("composer-2.5-fast"),
-               "/tmp",
-               [],
-               "guidance"
-             )
+             ErrorDiagnostic.classified(candidate)
+
+    assert %{"value" => "composer-2.5-fast", "reason" => %{"code" => -32602}} =
+             ErrorDiagnostic.of(candidate)
 
     model_writes =
       captured_requests(capture)
@@ -2148,12 +2240,14 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert {:error,
             {:session_prepare_failed, :model_unavailable, "sess-1",
              %{status: "verified", reason: nil}}} =
-             Adapter.new_candidate_session(
-               adapter,
-               Model.new("gpt-5.1-codex"),
-               "/tmp",
-               [],
-               "guidance"
+             ErrorDiagnostic.classified(
+               Adapter.new_candidate_session(
+                 adapter,
+                 Model.new("gpt-5.1-codex"),
+                 "/tmp",
+                 [],
+                 "guidance"
+               )
              )
 
     assert Enum.any?(captured_requests(capture_path), fn request ->
@@ -2246,13 +2340,20 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert {:ok, "sess-1"} = Adapter.new_session(adapter, nil, "/tmp", [], "guidance")
     assert {:ok, prior_model} = Adapter.current_model(adapter, "sess-1")
 
-    assert {:error, :model_unavailable} =
-             Adapter.apply_model_strict(
-               adapter,
-               "sess-1",
-               Model.new("gpt-5.1-codex"),
-               prior_model
-             )
+    strict =
+      Adapter.apply_model_strict(
+        adapter,
+        "sess-1",
+        Model.new("gpt-5.1-codex"),
+        prior_model
+      )
+
+    assert {:error, :model_unavailable} = ErrorDiagnostic.classified(strict)
+
+    assert %{"reason" => %{"code" => -32602}, "value" => "gpt-5.1-codex"} =
+             ErrorDiagnostic.of(strict)
+
+    refute Map.has_key?(ErrorDiagnostic.of(strict), "attempts")
 
     model_writes =
       captured_requests(capture_path)
@@ -2264,12 +2365,22 @@ defmodule Tightbeam.Acp.AdapterTest do
   test "new and canonical reattach surface model apply failures" do
     {adapter, _capture} = start_adapter(harness: :claude, fail_mode: "model-refusal")
 
+    new_result = Adapter.new_session(adapter, Model.new("fable"), "/tmp", [], "guidance")
+
     assert {:error, %{"message" => "Invalid value for config option model"}} =
-             Adapter.new_session(adapter, Model.new("fable"), "/tmp", [], "guidance")
+             ErrorDiagnostic.classified(new_result)
+
+    assert %{"phase" => "model", "value" => "fable", "reason" => %{"code" => -32000}} =
+             ErrorDiagnostic.of(new_result)
+
+    load_result =
+      Adapter.load_session(adapter, "sess-1", Model.new("fable"), "/tmp", [], "guidance")
 
     assert {:error,
             {:model_apply_failed, %{"message" => "Invalid value for config option model"}}} =
-             Adapter.load_session(adapter, "sess-1", Model.new("fable"), "/tmp", [], "guidance")
+             ErrorDiagnostic.classified(load_result)
+
+    assert %{"phase" => "model", "value" => "fable"} = ErrorDiagnostic.of(load_result)
 
     refute Adapter.knows_session?(adapter, "sess-1")
 
@@ -2358,13 +2469,22 @@ defmodule Tightbeam.Acp.AdapterTest do
                "guidance"
              )
 
-    assert {:error, :partial_apply} =
-             Adapter.apply_model_strict(
-               adapter,
-               "sess-1",
-               Model.new("gpt-new", effort: "high"),
-               Model.new("gpt-old", effort: "medium")
-             )
+    partial =
+      Adapter.apply_model_strict(
+        adapter,
+        "sess-1",
+        Model.new("gpt-new", effort: "high"),
+        Model.new("gpt-old", effort: "medium")
+      )
+
+    assert {:error, :partial_apply} = ErrorDiagnostic.classified(partial)
+
+    assert %{
+             "kind" => "unconfirmed",
+             "configId" => "reasoning_effort",
+             "expected" => "high",
+             "reported" => %{"currentValue" => "medium"}
+           } = ErrorDiagnostic.of(partial)
 
     refute Adapter.knows_session?(adapter, "sess-1")
     assert {:error, :model_readback_unavailable} = Adapter.current_model(adapter, "sess-1")
@@ -2403,6 +2523,59 @@ defmodule Tightbeam.Acp.AdapterTest do
            ]
   end
 
+  test "a strict apply keeps an effort refusal beside a model that did not read back" do
+    {adapter, capture_path} =
+      start_adapter(harness: :codex, fail_mode: "strict-model-unconfirmed-effort-refused")
+
+    assert {:ok, "sess-1"} =
+             Adapter.new_session(
+               adapter,
+               Model.new("gpt-old", effort: "medium"),
+               "/tmp",
+               [],
+               "guidance"
+             )
+
+    partial =
+      Adapter.apply_model_strict(
+        adapter,
+        "sess-1",
+        Model.new("gpt-new", effort: "high"),
+        Model.new("gpt-old", effort: "medium")
+      )
+
+    assert {:error, :partial_apply} = ErrorDiagnostic.classified(partial)
+
+    assert %{
+             "kind" => "unconfirmed",
+             "phase" => "readback",
+             "configId" => "model",
+             "expected" => "gpt-new",
+             "reported" => %{"currentValue" => "gpt-old"},
+             "effort" => %{
+               "kind" => "jsonrpc_error",
+               "operation" => "session/set_config_option",
+               "phase" => "effort",
+               "origin" => "acp_adapter",
+               "configId" => "reasoning_effort",
+               "value" => "high",
+               "reason" => %{
+                 "code" => -32000,
+                 "message" => "effort refused",
+                 "data" => %{"effort" => "high", "detail" => "not offered"}
+               }
+             }
+           } = ErrorDiagnostic.of(partial)
+
+    strict_writes =
+      captured_requests(capture_path)
+      |> Enum.filter(&(&1["method"] == "session/set_config_option"))
+      |> Enum.map(&{&1["configId"], &1["value"]})
+      |> Enum.drop(2)
+
+    assert strict_writes == [{"model", "gpt-new"}, {"reasoning_effort", "high"}]
+  end
+
   test "a hung strict effort request returns inside the outer budget and cleans up its late reply" do
     {adapter, _capture_path} = start_adapter(harness: :codex, fail_mode: "strict-effort-hang")
 
@@ -2419,13 +2592,18 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     deadline = System.monotonic_time(:millisecond) + 50
 
-    assert {:error, :partial_apply} =
-             GenServer.call(
-               adapter,
-               {:apply_model_strict, "sess-1", Model.new("gpt-new", effort: "high"),
-                Model.new("gpt-old", effort: "medium"), deadline},
-               30_000
-             )
+    hung =
+      GenServer.call(
+        adapter,
+        {:apply_model_strict, "sess-1", Model.new("gpt-new", effort: "high"),
+         Model.new("gpt-old", effort: "medium"), deadline},
+        30_000
+      )
+
+    assert {:error, :partial_apply} = ErrorDiagnostic.classified(hung)
+
+    assert %{"kind" => "timeout", "phase" => "effort", "configId" => "reasoning_effort"} =
+             ErrorDiagnostic.of(hung)
 
     assert System.monotonic_time(:millisecond) - started < 1_000
     refute Adapter.knows_session?(adapter, "sess-1")
@@ -2526,8 +2704,11 @@ defmodule Tightbeam.Acp.AdapterTest do
                "guidance"
              )
 
-    assert {:error, %{"message" => "effort refused"}} =
-             Adapter.apply_model(adapter, "sess-1", Model.new("gpt-new", effort: "high"))
+    applied = Adapter.apply_model(adapter, "sess-1", Model.new("gpt-new", effort: "high"))
+    assert {:error, %{"message" => "effort refused"}} = ErrorDiagnostic.classified(applied)
+
+    assert %{"phase" => "effort", "value" => "high", "reason" => %{"code" => -32000}} =
+             ErrorDiagnostic.of(applied)
 
     refute Adapter.knows_session?(adapter, "sess-1")
     assert {:error, :model_readback_unavailable} = Adapter.current_model(adapter, "sess-1")
@@ -3073,8 +3254,13 @@ defmodule Tightbeam.Acp.AdapterTest do
   test "new session propagates a mode refusal" do
     {plain, _capture} = start_adapter(fail_mode: "fail")
 
+    refusal = Adapter.new_session(plain, Model.new("haiku"), "/tmp", [], "guidance")
+
     assert {:error, {:mode_apply_failed, %{"message" => "mode refused"}}} =
-             Adapter.new_session(plain, Model.new("haiku"), "/tmp", [], "guidance")
+             ErrorDiagnostic.classified(refusal)
+
+    assert %{"operation" => "session/set_mode", "reason" => %{"code" => -32000}} =
+             ErrorDiagnostic.of(refusal)
   end
 
   test "fork mode refusal reaches the caller and closes the failed candidate" do
@@ -3086,15 +3272,23 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert {:ok, %{stop_reason: "end_turn"}} =
              Adapter.prompt(adapter, "sess-1", "persist this conversation")
 
+    fork_refusal =
+      Adapter.switch_model_session(
+        adapter,
+        "sess-1",
+        Model.new("claude-sonnet-5"),
+        "/tmp",
+        [],
+        "guidance"
+      )
+
     assert {:error, {:model_apply_failed, {:mode_apply_failed, %{"message" => "mode refused"}}}} =
-             Adapter.switch_model_session(
-               adapter,
-               "sess-1",
-               Model.new("claude-sonnet-5"),
-               "/tmp",
-               [],
-               "guidance"
-             )
+             ErrorDiagnostic.classified(fork_refusal)
+
+    assert %{
+             "operation" => "session/set_mode",
+             "cleanup" => %{"status" => "verified", "sessionId" => "sess-fork-1"}
+           } = ErrorDiagnostic.of(fork_refusal)
 
     refute Adapter.knows_session?(adapter, "sess-fork-1")
 
@@ -3238,7 +3432,21 @@ defmodule Tightbeam.Acp.AdapterTest do
             {:gate_attestation_failed, detail}
         end
 
-      assert reason == expected_reason
+      # The legacy stop reason is unchanged; the probe turn's own JSON-RPC
+      # error and the failing step ride along as the carried diagnostic.
+      assert ErrorDiagnostic.classified(reason) == expected_reason
+
+      if gate_mode == "turn-error" do
+        assert %{
+                 "kind" => "setup_failed",
+                 "operation" => "wiring_check",
+                 "step" => "session/prompt",
+                 "cause" => %{
+                   "kind" => "jsonrpc_error",
+                   "reason" => %{"code" => -32000, "message" => "probe turn failed"}
+                 }
+               } = ErrorDiagnostic.of(reason)
+      end
 
       # S4 defect 1: the queued call gets the DESIGNED reason, not an exit the
       # lane can only report as :task_crash.
@@ -3260,9 +3468,74 @@ defmodule Tightbeam.Acp.AdapterTest do
             do: assert(text =~ "probe turn failed: adapter transport unavailable")
       end
 
-      assert capture_path |> Path.dirname() |> Path.join("stderr.log.gate.log") |> File.read!() =~
-               "gate wiring-check FAIL detail=#{detail}"
+      gate_log =
+        capture_path |> Path.dirname() |> Path.join("stderr.log.gate.log") |> File.read!()
+
+      assert gate_log =~ "gate wiring-check FAIL detail=#{detail}"
+
+      if gate_mode == "turn-error",
+        do: assert(gate_log =~ ~s(diagnostic={"cause":))
     end
+  end
+
+  # R1: a wiring-check setup step that fails keeps the legacy `:turn_error`
+  # classification and names the step with the harness's own code, message
+  # and nested data.
+  test "gate wiring-check setup failure keeps the failing step and original error" do
+    {adapter, capture_path} = start_adapter(harness: :codex, gate_mode: "mode-refused-data")
+    monitor = Process.monitor(adapter)
+
+    Task.start(fn -> Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance") end)
+
+    reason = assert_down(adapter, monitor)
+    assert {:gate_attestation_failed, :turn_error} = ErrorDiagnostic.classified(reason)
+
+    assert %{
+             "kind" => "setup_failed",
+             "operation" => "wiring_check",
+             "step" => "session/set_mode",
+             "cause" => %{
+               "kind" => "jsonrpc_error",
+               "reason" => %{
+                 "code" => -32000,
+                 "message" => "mode refused",
+                 "data" => %{"modeId" => _, "policy" => "probe mode denied"}
+               }
+             }
+           } = ErrorDiagnostic.of(reason)
+
+    gate_log = capture_path |> Path.dirname() |> Path.join("stderr.log.gate.log") |> File.read!()
+    assert gate_log =~ "gate wiring-check FAIL detail=turn_error"
+    assert gate_log =~ "probe mode denied"
+  end
+
+  # R1: the per-turn APIs return the carrier, so the gateway can derive the
+  # legacy classification and still record the harness's original refusal.
+  test "per-turn model application keeps the harness refusal beside its classification" do
+    {adapter, _capture_path} = start_adapter(harness: :claude, fail_mode: "model-refused-data")
+    assert {:ok, "sess-1"} = Adapter.new_session(adapter, nil, "/tmp", [], "guidance")
+
+    result = Adapter.apply_model_for_turn(adapter, "sess-1", Model.new("claude-opus-5-5"))
+    assert {:error, :model_unavailable} = ErrorDiagnostic.classified(result)
+
+    assert %{
+             "kind" => "jsonrpc_error",
+             "origin" => "acp_adapter",
+             "phase" => "model",
+             "reason" => %{
+               "code" => -32602,
+               "message" => "Invalid params",
+               "data" => %{"model" => "claude-opus-5-5", "detail" => "not offered"}
+             }
+           } = ErrorDiagnostic.of(result)
+
+    created =
+      Adapter.new_session_for_turn(adapter, Model.new("claude-opus-5-5"), "/tmp", [], "guidance")
+
+    assert {:error, :model_unavailable} = ErrorDiagnostic.classified(created)
+
+    assert %{"reason" => %{"code" => -32602, "data" => %{"detail" => "not offered"}}} =
+             ErrorDiagnostic.of(created)
   end
 
   test "a gate-passing adapter that dies reports only its real stderr tail" do
@@ -3280,6 +3553,29 @@ defmodule Tightbeam.Acp.AdapterTest do
     gate_path = stderr_path <> ".gate.log"
     assert File.read!(gate_path) =~ "gate wiring-check PASS [gate: tightbeam-probe]"
     refute File.read!(stderr_path) =~ "gate wiring-check"
+  end
+
+  test "an unmeasured stderr offset keeps its stat error and claims no attempt line" do
+    dir = Path.join(System.tmp_dir!(), "tb-acp-stat-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(dir)
+    on_exit(fn -> File.rm_rf!(dir) end)
+    blocker = Path.join(dir, "not-a-dir")
+    File.write!(blocker, "earlier spawn: stale line\n")
+
+    {adapter, _capture_path} =
+      start_adapter(harness: :codex, stderr_path: Path.join(blocker, "stderr.log"))
+
+    monitor = Process.monitor(adapter)
+    reason = assert_down(adapter, monitor)
+
+    refute match?({:adapter_fault, _}, ErrorDiagnostic.classified(reason))
+
+    assert %{
+             "stderrOffset" => "unmeasured",
+             "stderrStatError" => %{"$type" => "atom", "value" => "enotdir"}
+           } = ErrorDiagnostic.of(reason)
+
+    refute inspect(reason) =~ "stale line"
   end
 
   test "adapter status redacts accumulating chunks and a raising call's guidance message" do
@@ -3306,7 +3602,9 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     refute log =~ chunk_marker
     refute log =~ guidance_marker
-    assert log =~ "State: :redacted"
+    # The nonsecret state stays readable; only the text-bearing fields are withheld.
+    assert log =~ "harness: :missing_harness"
+    assert log =~ "redacted: [:chunks, :preset, :config_options, :switchable_models, :callbacks]"
     assert log =~ ~r/Last message(?: \(from .+?\))?: :redacted/
   end
 

@@ -1,6 +1,7 @@
 defmodule Tightbeam.LocalOpenAi.Providers do
   @moduledoc false
 
+  alias Tightbeam.ErrorDiagnostic
   alias Tightbeam.Harness.Support
 
   @reserved_names ~w(opencode-go)
@@ -149,7 +150,7 @@ defmodule Tightbeam.LocalOpenAi.Providers do
   end
 
   defp decode_record(bytes, expected_name, path) do
-    with {:ok, decoded} <- JSON.decode(bytes),
+    with {:ok, decoded} <- decode_json(bytes),
          {:ok, record} <- normalize_record(decoded, expected_name) do
       {:ok, record}
     else
@@ -158,6 +159,21 @@ defmodule Tightbeam.LocalOpenAi.Providers do
         {:error, "the local-openai provider record#{label} is invalid: #{reason}"}
     end
   end
+
+  # JSON.decode reasons are tuples, which cannot be interpolated. Keep the
+  # parser's offset but not the offending bytes: the record carries an apiKey.
+  defp decode_json(bytes) do
+    case JSON.decode(bytes) do
+      {:ok, decoded} -> {:ok, decoded}
+      {:error, reason} -> {:error, "not valid JSON: #{json_error_text(reason)}"}
+    end
+  end
+
+  defp json_error_text({:invalid_byte, offset, _byte}), do: "invalid byte at offset #{offset}"
+  defp json_error_text({:unexpected_end, offset}), do: "unexpected end at offset #{offset}"
+
+  defp json_error_text({:unexpected_sequence, offset, _bytes}),
+    do: "unexpected sequence at offset #{offset}"
 
   defp remote_provider_files(target, ssh, dir) do
     script =
@@ -199,10 +215,27 @@ defmodule Tightbeam.LocalOpenAi.Providers do
   # The remote command must never put a descriptor in the error tuple. A failed
   # parser can leave stdout populated in a test double or in a shell diagnostic,
   # and that output may contain the provider's apiKey.
+  #
+  # Every other reason is Tightbeam's own text (a decode or shape refusal of the
+  # already-redacted record, a timeout) or a transport failure term. Neither is
+  # remote stdout, so it is kept, redacted, instead of erased.
   defp redaction_failure({:exit, status, _output}), do: {:exit, status}
   defp redaction_failure({:error, reason}) when is_atom(reason), do: reason
   defp redaction_failure(reason) when is_atom(reason), do: reason
-  defp redaction_failure(_reason), do: :redaction_failed
+  # remote_run already reduced its transport reason.
+  defp redaction_failure({:transport, _reduced} = reason), do: reason
+  defp redaction_failure({:timeout, ms} = reason) when is_integer(ms), do: reason
+  defp redaction_failure(reason) when is_binary(reason), do: ErrorDiagnostic.redact_text(reason)
+
+  defp redaction_failure({:transport_exception, message}) when is_binary(message),
+    do: {:transport_exception, ErrorDiagnostic.redact_text(message)}
+
+  # remote_run has already reduced the classification and built a redacted,
+  # typed diagnostic for this unexpected runner shape. Keep that carrier intact
+  # instead of encoding the carrier itself as an opaque tuple.
+  defp redaction_failure({:diagnosed, _reason, node} = reason) when is_map(node), do: reason
+
+  defp redaction_failure(reason), do: ErrorDiagnostic.encode_term(reason)
 
   defp remote_node(target, ssh) do
     configured =
@@ -281,13 +314,35 @@ defmodule Tightbeam.LocalOpenAi.Providers do
       {:ok, {:error, reason}} ->
         {:error, {:transport, redaction_failure(reason)}}
 
-      {:ok, _other} ->
-        {:error, :remote_command_failed}
+      # An unexpected result can hold remote stdout, which on the redactor path
+      # can hold the provider's apiKey. Keep the existing shape classification,
+      # and carry the typed original through ErrorDiagnostic's redactor.
+      {:ok, other} ->
+        classification = {:remote_command_failed, {:unexpected_result, result_shape(other)}}
+
+        diagnostic =
+          ErrorDiagnostic.new("unexpected_result",
+            operation: "remote_command",
+            phase: "bounded_run",
+            origin: "local_openai_provider",
+            reason: other
+          )
+
+        {:error, ErrorDiagnostic.diagnosed(classification, diagnostic)}
 
       {:error, reason} ->
         {:error, reason}
     end
   end
+
+  defp result_shape(value) when is_tuple(value),
+    do: value |> Tuple.to_list() |> Enum.map(&result_shape/1) |> List.to_tuple()
+
+  defp result_shape(value) when is_binary(value), do: {:binary, byte_size(value)}
+  defp result_shape(value) when is_integer(value) or is_atom(value), do: value
+  defp result_shape(value) when is_list(value), do: :list
+  defp result_shape(value) when is_map(value), do: :map
+  defp result_shape(_value), do: :other
 
   defp absolute_executable(container, name) do
     find =

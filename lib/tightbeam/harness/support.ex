@@ -1,6 +1,8 @@
 defmodule Tightbeam.Harness.Support do
   @moduledoc false
 
+  alias Tightbeam.ErrorDiagnostic
+
   @ssh_opts ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
   # The production-identity vars (exact names) are folded in so a DB env overlay
   # cannot re-inject the poison R3 scrubs (RELEASE_*, instance selectors, ERTS
@@ -242,20 +244,33 @@ defmodule Tightbeam.Harness.Support do
     timeout = Map.get(target, :timeout, 2_000)
 
     with bin when is_binary(bin) <- binary,
-         {:ok, {output, 0}} <- bounded_run(run, [bin, "--version"], timeout) do
+         {:ok, {output, 0}} when is_binary(output) <-
+           bounded_run(run, [bin, "--version"], timeout) do
       {:ok, %{bin: bin, version: String.trim(output)}}
     else
       nil ->
         {:error, :not_found}
 
-      {:ok, {output, status}} ->
-        {:error,
-         {:exec_failed, "exit=#{status} output=#{inspect(String.trim(to_string(output)))}"}}
+      # The Harness contract types this detail as text that operators read, so the
+      # exit status and the redacted output both stay in it.
+      {:ok, {output, status}} when is_binary(output) and is_integer(status) ->
+        output = output |> String.trim() |> ErrorDiagnostic.redact_text()
+        {:error, {:exec_failed, "exit=#{status} output=#{inspect(output)}"}}
 
-      {:error, detail} ->
-        {:error, {:exec_failed, detail}}
+      {:ok, {:error, reason}} ->
+        {:error, {:exec_failed, run_failure_text(reason)}}
+
+      {:error, reason} ->
+        {:error, {:exec_failed, run_failure_text(reason)}}
     end
   end
+
+  defp run_failure_text({:timeout, ms}), do: "timed out after #{ms}ms"
+
+  defp run_failure_text({:transport_exception, message}) when is_binary(message),
+    do: "raised: #{ErrorDiagnostic.redact_text(message)}"
+
+  defp run_failure_text(reason), do: JSON.encode!(ErrorDiagnostic.encode_term(reason))
 
   @doc false
   def conformance_vectors(module, profile) do
@@ -1222,7 +1237,7 @@ defmodule Tightbeam.Harness.Support do
   def bounded_run(run, command, timeout) do
     case bounded_call(fn -> run.(command) end, timeout) do
       {:ok, result} -> {:ok, result}
-      :timeout -> {:error, "timed out after #{timeout}ms"}
+      :timeout -> {:error, {:timeout, timeout}}
     end
   end
 

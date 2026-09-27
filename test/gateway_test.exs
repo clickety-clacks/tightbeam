@@ -265,6 +265,9 @@ defmodule Tightbeam.GatewayTest do
     def handle_call({:fast_status, _sid}, _from, state),
       do: {:reply, {:error, :fast_unsupported}, state}
 
+    def handle_call({:close_session, sid, _opts}, from, state),
+      do: handle_call({:close_session, sid}, from, state)
+
     def handle_call({:close_session, sid}, _from, {parent, models}) do
       send(parent, {:candidate_closed, sid})
       {:reply, :ok, {parent, Map.delete(models, sid)}}
@@ -291,6 +294,9 @@ defmodule Tightbeam.GatewayTest do
     use GenServer
     def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
     def init(parent), do: {:ok, parent}
+
+    def handle_call({:close_session, sid, _opts}, from, state),
+      do: handle_call({:close_session, sid}, from, state)
 
     def handle_call({:close_session, sid}, _from, parent) do
       send(parent, {:close_session_failed, sid})
@@ -322,9 +328,12 @@ defmodule Tightbeam.GatewayTest do
     def handle_call({:current_model, _sid}, _from, {_parent, opts} = state),
       do: {:reply, {:ok, Keyword.get(opts, :current_model, Model.new("fable"))}, state}
 
-    def handle_call({:close_session, sid}, _from, {parent, _opts} = state) do
+    def handle_call({:close_session, sid, _opts}, from, state),
+      do: handle_call({:close_session, sid}, from, state)
+
+    def handle_call({:close_session, sid}, _from, {parent, opts} = state) do
       send(parent, {:tune_session_closed, sid})
-      {:reply, :ok, state}
+      {:reply, Keyword.get(opts, :close_result, :ok), state}
     end
 
     def handle_call({:fast_status, _sid}, _from, state),
@@ -398,6 +407,9 @@ defmodule Tightbeam.GatewayTest do
 
     # A resident session: the adapter still holds it and answers a bounce.
     def handle_call({:knows_session?, _sid}, _from, parent), do: {:reply, true, parent}
+
+    def handle_call({:close_session, sid, _opts}, from, state),
+      do: handle_call({:close_session, sid}, from, state)
 
     def handle_call({:close_session, sid}, _from, parent) do
       send(parent, {:identity_apply_close, sid})
@@ -1354,6 +1366,18 @@ defmodule Tightbeam.GatewayTest do
 
     assert %{ok: false, code: "repair_failed"} = first = handler.(call)
     assert handler.(call) == first
+
+    # The coordinator's own reason rides beside the unchanged message, and the
+    # replay returns it too.
+    assert first.message == ":still_wedged"
+
+    assert %{
+             "kind" => "term",
+             "operation" => "close_adapter",
+             "phase" => "repair_restart",
+             "reason" => %{"$type" => "atom", "value" => "still_wedged"}
+           } = first.diagnostic
+
     assert_receive {:repair_close_adapter, {:claude, "shared", "testhost"}}
     refute_receive {:repair_close_adapter, _}, 50
 
@@ -2933,6 +2957,52 @@ defmodule Tightbeam.GatewayTest do
 
     assert message =~ "local_openai"
     refute message =~ "opencode_go"
+  end
+
+  test "a credential refusal keeps the reason that chose its remedy sentence", ctx do
+    base_dir = role_test_base("spawn-pi-unsupported-detail", false)
+    Archetypes.load!(base_dir)
+
+    put_host_catalog("testhost", "pi", [
+      {"spark/qwen3.5-35b", [], :local_openai}
+    ])
+
+    config =
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.put(:default_harness, :pi)
+      |> Map.put(:default_model, Model.new("spark/qwen3.5-35b"))
+      |> Map.put(:credential_status, fn
+        :local_openai, "testhost" -> {:needs_onboarding, {:unsupported, :no_subscription}}
+      end)
+
+    assert %{
+             code: "placement_denied",
+             message: message,
+             detail: %{code: "needs_onboarding", diagnostic: diagnostic}
+           } =
+             Gateway.handlers(config)["spawn"].(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{
+                 display_name: "Spark unsupported plan",
+                 idempotency_key: "spawn-pi-unsupported-detail"
+               }
+             })
+
+    # The sentence is unchanged; the check that said "unsupported" is now named.
+    assert message =~ "no supported subscription"
+
+    assert %{
+             "kind" => "term",
+             "operation" => "credential_status",
+             "reason" => %{
+               "$type" => "tuple",
+               "items" => [
+                 %{"$type" => "atom", "value" => "unsupported"},
+                 %{"$type" => "atom", "value" => "no_subscription"}
+               ]
+             }
+           } = diagnostic
   end
 
   test "spawn uses the next where host when the first cannot run the requested harness", ctx do
@@ -4560,6 +4630,42 @@ defmodule Tightbeam.GatewayTest do
     assert marker_facts.kind == "model-retune"
     assert marker_facts.from == "fable"
     assert marker_facts.to == "claude-sonnet-4-6"
+  end
+
+  test "set_model keeps a superseded session's failed close beside the committed switch", ctx do
+    base_dir = role_test_base("override-set-model-close-failed")
+    Archetypes.load!(base_dir)
+    config = gateway_config(base_dir, ctx.db, 0)
+    local_host = Placement.local_host_name()
+    Org.set_host(ctx.db, "k1", local_host)
+    Org.append_pointer(ctx.db, "k1", "existing-session", "created")
+    start_lane!(ctx.db, "k1")
+
+    adapter =
+      start_supervised!(
+        {TuneAdapterStub, {self(), resident: true, close_result: {:error, :closed}}}
+      )
+
+    start_supervised!({CoordinatorStub, {adapter, self()}})
+    put_host_catalog(local_host, "claude", ["claude-sonnet-4-6"])
+
+    assert %{ok: true, diagnostic: diagnostic} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: "user:flynn",
+               session_key: "k1",
+               params: %{setting: "set_model", model: "claude-sonnet-4-6"}
+             })
+
+    assert_receive {:tune_session_closed, "existing-session"}
+    assert Org.get(ctx.db, "k1").model == Model.new("claude-sonnet-4-6")
+
+    assert %{
+             "kind" => "cleanup",
+             "operation" => "session/close",
+             "sessionId" => "existing-session",
+             "status" => "unverified",
+             "cause" => %{"kind" => "closed"}
+           } = diagnostic
   end
 
   test "runtime tune hides unknown, foreign, retired, and process targets behind one refusal",
@@ -7110,6 +7216,23 @@ defmodule Tightbeam.GatewayTest do
     end
   end
 
+  # R1 (wi_3b4a20ce): a session-setup failure the adapter carries keeps its
+  # legacy reason for turns.error, the marker and health, while the
+  # harness_turn_error record keeps the harness's own code, message and data.
+  @tag cold_gateway: true, gateway_error_markers: true, tmp_dir: true
+  test "a setup failure records the adapter's original refusal beside its reason", ctx do
+    File.write!(
+      Path.join(ctx.tmp_dir, "error-case.json"),
+      JSON.encode!(%{mode: "setup_diagnosed"})
+    )
+
+    Tightbeam.GuardRuntimeFixture.run!(
+      ctx.tmp_dir,
+      "live_base_gateway_error_markers.exs",
+      "guarded-gateway-error-markers: ok"
+    )
+  end
+
   @tag error_reason: nil,
        expected_error: nil,
        cold_gateway: true,
@@ -7183,6 +7306,22 @@ defmodule Tightbeam.GatewayTest do
   test "a turn on a fresh-but-unexecutable host is not misrouted to the onboarding remedy",
        ctx do
     File.write!(Path.join(ctx.tmp_dir, "checkout-case.txt"), "fresh")
+
+    Tightbeam.GuardRuntimeFixture.run!(
+      ctx.tmp_dir,
+      "live_base_gateway_checkout_refusal.exs",
+      "guarded-gateway-checkout-refusal: ok"
+    )
+  end
+
+  # Error fidelity (wi_3b4a20ce): an open adapter circuit tells the caller why it
+  # opened -- count, dying generation and redacted exit -- through the real runner,
+  # lifecycle record and health observation, never the raw secret.
+  @tag :cold_gateway
+  @tag :gateway_checkout_refusal
+  @tag :tmp_dir
+  test "a degraded checkout names the circuit's failure count and redacted cause", ctx do
+    File.write!(Path.join(ctx.tmp_dir, "checkout-case.txt"), "degraded-cause")
 
     Tightbeam.GuardRuntimeFixture.run!(
       ctx.tmp_dir,

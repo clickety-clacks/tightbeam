@@ -3347,9 +3347,50 @@ defmodule Tightbeam.Wire.RouterTest do
              "error" => %{
                "code" => "unknown_host",
                "message" =>
-                 "host eurisko is not configured for codex; run tightbeam assimilate <ssh-dest> --name eurisko --as-user <adminUserId>"
+                 "host eurisko is not configured for codex; run tightbeam assimilate <ssh-dest> --name eurisko --as-user <adminUserId>",
+               "diagnostic" => %{
+                 "kind" => "denial",
+                 "operation" => "spawn",
+                 "origin" => "placement",
+                 "host" => "eurisko",
+                 "harness" => "codex"
+               }
              }
            }
+  end
+
+  test "a raised handler reaches HTTP with its message kept and its secrets masked", ctx do
+    opts =
+      with_handler(ctx.opts, "work-item-create", fn _call ->
+        raise MatchError,
+          term: %{creds: %{"password" => "fixtureSENTINEL"}, note: "token=fixtureSENTINEL"}
+      end)
+
+    response =
+      conn(
+        :post,
+        "/agent/dispatch",
+        JSON.encode!(%{verb: "work-item-create", asUser: "flynn", params: %{title: "boom"}})
+      )
+      |> put_req_header("authorization", "Bearer tbc_test")
+      |> put_req_header("x-tightbeam-cli-version", Tightbeam.CliCompatibility.required_version())
+      |> Router.call(Router.init(opts))
+
+    assert response.status == 500
+    refute response.resp_body =~ "SENTINEL"
+
+    assert %{"code" => "server_error", "message" => message, "diagnostic" => diagnostic} =
+             JSON.decode!(response.resp_body)["error"]
+
+    assert message =~ "no match of right hand side value"
+    assert message =~ ~s("password" => "[REDACTED:secret_field]")
+    assert message =~ "token=[REDACTED:secret_field]"
+    assert %{"kind" => "exception", "operation" => "work-item-create"} = diagnostic
+
+    {:ok, payloads} = DB.query(ctx.db, "SELECT payload FROM events WHERE verb='work-item-create'")
+    assert [[payload]] = payloads
+    assert payload =~ "[REDACTED:secret_field]"
+    refute payload =~ "SENTINEL"
   end
 
   # THE THIRD DESTRUCTION SITE. JSON can say `null`, and the router dropped it —

@@ -166,6 +166,20 @@ defmodule Tightbeam.Wire.PayloadsTest do
              "code" => "DIV-CURSOR-API-KEY-ONLY",
              "message" => "API key required"
            }
+
+    refute Map.has_key?(refused["payload"], "diagnostic")
+
+    diagnosed =
+      Payloads.prompt_turn_state_event(%{
+        client_message_id: "client-3",
+        session_key: "s1",
+        state: "failed",
+        error: "sign in again",
+        diagnostic: %{"kind" => "closed", "exitStatus" => 1}
+      })
+
+    assert diagnosed["payload"]["error"] == "sign in again"
+    assert diagnosed["payload"]["diagnostic"] == %{"kind" => "closed", "exitStatus" => 1}
   end
 
   test "stream builders preserve exact wrapper shapes" do

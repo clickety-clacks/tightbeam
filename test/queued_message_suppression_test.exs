@@ -272,6 +272,7 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
   test "replacement delivery claims next and keeps the source turn durable", %{db: db} do
     assignment!(db, "asg_next")
     session!(db, "sender")
+
     :ok =
       DB.execute(
         db,
@@ -303,8 +304,10 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
     new_seq = deliver_wake!(db, wake)
 
     assert {:ok, %{seq: ^new_seq, prompt: "new prompt"}} = Ledger.claim_next(db, "k1", "lane")
+
     assert {:ok, [["canceled", "queued-message-suppressed: sender_requested_replacement"]]} =
              DB.query(db, "SELECT status,error FROM turns WHERE seq=?1", [old_seq])
+
     assert {:ok, [[2]]} =
              DB.query(db, "SELECT COUNT(*) FROM turns WHERE seq IN (?1,?2)", [old_seq, new_seq])
   end
@@ -341,13 +344,16 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
                "SELECT seq,status,origin,prompt FROM turns WHERE sessionKey=?1 AND assignmentId=?2",
                ["k1", assignment_id]
              )
+
     assert source_prompt =~ assignment_id
     assert source_prompt =~ "the initial instruction"
 
     assert %{id: replayed_id} = Assignments.__handle__(db, "dispatch", dispatch)
     assert replayed_id == assignment_id
+
     assert {:ok, [[1]]} =
              DB.query(db, "SELECT COUNT(*) FROM turns WHERE sessionKey=?1", ["k1"])
+
     assert {:ok, [[1]]} =
              DB.query(
                db,
@@ -374,6 +380,7 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
                "SELECT sessionKey,origin,creatorSessionKey FROM wakes WHERE wakeId=?1",
                [replacement_wake.wake_id]
              )
+
     assert {:ok, [[^assignment_id]]} =
              DB.query(
                db,
@@ -393,6 +400,7 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
 
     assert %{id: replayed_after_replacement} = Assignments.__handle__(db, "dispatch", dispatch)
     assert replayed_after_replacement == assignment_id
+
     assert {:ok, [[1]]} =
              DB.query(
                db,
@@ -406,6 +414,7 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
   test "replacement leaves a turn that became running untouched", %{db: db} do
     assignment!(db, "asg_running")
     session!(db, "sender")
+
     :ok =
       DB.execute(
         db,
@@ -438,6 +447,7 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
 
     assert {:ok, [["running"]]} =
              DB.query(db, "SELECT status FROM turns WHERE seq=?1", [running_seq])
+
     assert {:ok, []} =
              DB.query(
                db,

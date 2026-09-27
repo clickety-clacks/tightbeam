@@ -5,8 +5,9 @@ defmodule Tightbeam.TerminalCredentialMigrationTest do
 
   @predecessor "stale-turn-settlement-v1-019"
   @terminal_shape "terminal-credential-failure-v1-019"
-  @successor "artifact-origin-v1-019"
-  @agent_reparent "delivery-owner-reparent-v1-019"
+  @artifact_origin_shape "artifact-origin-v1-019"
+  @agent_reparent_shape "delivery-owner-reparent-v1-019"
+  @successor "identity-publication-denial-diagnostic-v1-019"
 
   @terminal_objects ~w(
     terminal_credential_deliveries
@@ -46,6 +47,7 @@ defmodule Tightbeam.TerminalCredentialMigrationTest do
       DROP TABLE terminal_credential_redirects;
       DROP TABLE terminal_credential_observations;
       DROP TABLE terminal_credential_incidents;
+      ALTER TABLE identity_publication_markers DROP COLUMN denialDiagnostic;
       UPDATE schema_stamp SET shape='#{@predecessor}';
       """)
 
@@ -80,7 +82,13 @@ defmodule Tightbeam.TerminalCredentialMigrationTest do
     assert terminal_objects(db) == @terminal_objects
     assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM terminal_credential_incidents")
 
-    assert [@successor, @agent_reparent, @terminal_shape | _] =
+    assert [
+             @successor,
+             @artifact_origin_shape,
+             @agent_reparent_shape,
+             @terminal_shape,
+             @predecessor | _
+           ] =
              Schema.guard_compatible_stamps()
   end
 

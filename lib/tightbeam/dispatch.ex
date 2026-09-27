@@ -27,6 +27,7 @@ defmodule Tightbeam.Dispatch do
   alias Tightbeam.{
     Assignments,
     DB,
+    ErrorDiagnostic,
     Escalation,
     EventLog,
     Firehose.Publisher,
@@ -257,10 +258,14 @@ defmodule Tightbeam.Dispatch do
 
         case invoke(handler, handler_call) do
           {:returned, %{code: _} = error} ->
+            # A denial's diagnostic is caller evidence, like a crash's stack below:
+            # the audit row and the firehose keep the denial's existing shape.
+            recorded = Map.delete(error, :diagnostic)
+
             payload =
               if verb == "settle-turn",
-                do: outcome_payload(verb, call, {:returned, error}),
-                else: error
+                do: outcome_payload(verb, call, {:returned, recorded}),
+                else: recorded
 
             :ok =
               EventLog.append_event_with_handoff(
@@ -271,7 +276,7 @@ defmodule Tightbeam.Dispatch do
                 session_key,
                 payload,
                 principal,
-                &Publisher.denied_in_txn(&1, publisher_call, error)
+                &Publisher.denied_in_txn(&1, publisher_call, recorded)
               )
 
             {:error, error}
@@ -295,7 +300,7 @@ defmodule Tightbeam.Dispatch do
               Publisher.accepted_after_handler(
                 db,
                 Map.put(publisher_call, :firehose_changed, changed?),
-                result
+                caller_only_stripped(result)
               )
 
             {:ok, result}
@@ -324,14 +329,14 @@ defmodule Tightbeam.Dispatch do
                   session_key,
                   payload,
                   principal,
-                  &Publisher.accepted_in_txn(&1, publisher_call, result)
+                  &Publisher.accepted_in_txn(&1, publisher_call, caller_only_stripped(result))
                 )
             end
 
             {:ok, result}
 
-          {:raised, exception} ->
-            error = %{code: "server_error", message: Exception.message(exception)}
+          {:raised, exception, stacktrace} ->
+            error = %{code: "server_error", message: raised_message(exception)}
             denial_error = denial_notice_error(verb, call, error)
             payload = outcome_payload(verb, call, {:raised, exception})
 
@@ -347,7 +352,14 @@ defmodule Tightbeam.Dispatch do
                 &Publisher.denied_in_txn(&1, publisher_call, denial_error)
               )
 
-            {:error, error}
+            # The exception's type and stack go to the caller only. The audit row and
+            # the firehose keep their existing shape: a stack is caller evidence for
+            # this call, not an org-wide observation, and elided verbs must not grow
+            # a second copy of what they deliberately keep out of the log.
+            diagnostic =
+              ErrorDiagnostic.exception(exception, stacktrace, operation: verb, origin: "handler")
+
+            {:error, ErrorDiagnostic.put(error, diagnostic)}
         end
     end
   end
@@ -389,11 +401,12 @@ defmodule Tightbeam.Dispatch do
   # otherwise write message content verbatim into durable storage. That is why
   # elision keys on the classified handler OUTCOME, not on the event kind.
   #
-  # SCOPE, stated exactly: the caller's returned error above IS built with
-  # `Exception.message/1`, so it can carry the term the handler held. That is
-  # deliberate and unchanged — the caller just passed authorization for those very
-  # rows, so it is content they were entitled to read, and narrowing it is a
-  # behavior change no spec here authorizes. Elision governs the audit row only.
+  # SCOPE, stated exactly: the caller's returned error above IS built from
+  # `Exception.message/1`, so it can carry the term the handler held — the caller
+  # just passed authorization for those very rows, so it is content they were
+  # entitled to read. Only secret material (credentials, keys, tokens) is masked
+  # there, as everywhere an error leaves the gateway. Elision governs the audit
+  # row only.
   defp outcome_payload("settle-turn", call, outcome) do
     params = Map.get(call, :params, %{})
 
@@ -427,7 +440,7 @@ defmodule Tightbeam.Dispatch do
     if body_operation?(call) do
       %{crash: true, code: "server_error", bodyElided: true}
     else
-      %{code: "server_error", message: Exception.message(exception)}
+      %{code: "server_error", message: raised_message(exception)}
     end
   end
 
@@ -441,11 +454,21 @@ defmodule Tightbeam.Dispatch do
       end
     else
       case outcome do
-        {:returned, result} -> result
-        {:raised, exception} -> %{code: "server_error", message: Exception.message(exception)}
+        # A diagnostic on a successful result (cancel's unconfirmed harness leg,
+        # an artifact's evidence fallback) is caller evidence, like a denial's.
+        {:returned, result} -> caller_only_stripped(result)
+        {:raised, exception} -> %{code: "server_error", message: raised_message(exception)}
       end
     end
   end
+
+  # The message leaves the gateway (caller reply, firehose, audit row), so secret
+  # material in it is masked; the rest of the text keeps its wording and layout.
+  defp raised_message(exception),
+    do: exception |> Exception.message() |> ErrorDiagnostic.redact_text()
+
+  defp caller_only_stripped(result) when is_map(result), do: Map.delete(result, :diagnostic)
+  defp caller_only_stripped(result), do: result
 
   # An elided read returns a page, and the page is the only top-level list it
   # carries — so the count needs no per-verb knowledge of which key holds it. See
@@ -557,10 +580,19 @@ defmodule Tightbeam.Dispatch do
     {:returned, handler.(call)}
   rescue
     exception in Placement.Refusal ->
-      {:returned, %{code: exception.code, message: exception.message}}
+      diagnostic =
+        ErrorDiagnostic.new("denial",
+          operation: call.verb,
+          origin: "placement",
+          host: exception.host,
+          harness: exception.harness
+        )
+
+      {:returned,
+       ErrorDiagnostic.put(%{code: exception.code, message: exception.message}, diagnostic)}
 
     exception ->
-      {:raised, exception}
+      {:raised, exception, __STACKTRACE__}
   end
 
   defp gated_ref(call) do
