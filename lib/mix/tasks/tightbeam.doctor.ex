@@ -676,28 +676,31 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
       {:ok, report} ->
         report
 
-      {:error, _reason} ->
-        case org_hosts(base_dir) do
-          :absent ->
-            Tightbeam.HarnessBinaryProvenance.report_unavailable("org database absent")
+      {:error, gateway_error} ->
+        fallback =
+          case org_hosts(base_dir) do
+            :absent ->
+              Tightbeam.HarnessBinaryProvenance.report_unavailable("org database absent")
 
-          hosts ->
-            launches =
-              if Process.whereis(Tightbeam.AdapterCoordinator),
-                do: Tightbeam.AdapterCoordinator.binary_launches(),
-                else: []
+            hosts ->
+              launches =
+                if Process.whereis(Tightbeam.AdapterCoordinator),
+                  do: Tightbeam.AdapterCoordinator.binary_launches(),
+                  else: []
 
-            case Tightbeam.HarnessBinaryProvenance.report_for_inputs(
-                   base_dir,
-                   hosts,
-                   org_binary_selection_overlays(base_dir),
-                   launches,
-                   without_override_evidence?: true
-                 ) do
-              {:ok, report} -> report
-              {:error, report} -> report
-            end
-        end
+              case Tightbeam.HarnessBinaryProvenance.report_for_inputs(
+                     base_dir,
+                     hosts,
+                     org_binary_selection_overlays(base_dir),
+                     launches,
+                     without_override_evidence?: true
+                   ) do
+                {:ok, report} -> report
+                {:error, report} -> report
+              end
+          end
+
+        Tightbeam.HarnessBinaryProvenance.with_gateway_fetch_failure(fallback, gateway_error)
     end
   rescue
     error -> Tightbeam.HarnessBinaryProvenance.report_unavailable(Exception.message(error))

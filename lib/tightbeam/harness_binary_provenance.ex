@@ -400,38 +400,56 @@ defmodule Tightbeam.HarnessBinaryProvenance do
   defp selected_vendor_executable(_capture, _launch_plan), do: :unknown
 
   @doc "A read-only per-row formatter shared by `mix tightbeam.doctor`."
-  def format_human(%{"rows" => rows}) when is_list(rows) do
-    rows
-    |> Enum.flat_map(fn row ->
-      prefix = "harness binary #{row["host"]}/#{row["harness"]}"
-      adapter_prefix = "harness adapter #{row["host"]}/#{row["harness"]}"
-      adapter = Map.get(row, "adapter", %{})
+  def format_human(%{"rows" => rows} = report) when is_list(rows) do
+    gateway_failure? =
+      match?(%{"status" => "unavailable"}, Map.get(report, "gateway_report_fetch"))
 
-      running =
-        case row["running"] do
-          [] ->
-            ["  #{prefix} running: not observed"]
+    lines =
+      rows
+      |> Enum.flat_map(fn row ->
+        prefix = "harness binary #{row["host"]}/#{row["harness"]}"
+        adapter_prefix = "harness adapter #{row["host"]}/#{row["harness"]}"
+        adapter = Map.get(row, "adapter", %{})
 
-          values ->
-            Enum.flat_map(values, fn observation ->
-              [
-                format_adapter(
-                  adapter_prefix,
-                  "running",
-                  observation["adapter"],
-                  observation["generation"]
-                ),
-                format_observation(prefix, "running", observation)
-              ]
-            end)
-        end
+        running =
+          case row["running"] do
+            [] ->
+              if gateway_failure? do
+                ["  #{prefix} running: unavailable (gateway report fetch failed)"]
+              else
+                ["  #{prefix} running: not observed"]
+              end
 
-      [format_adapter(adapter_prefix, "next launch", adapter)] ++
-        running ++
-        [format_observation(prefix, "next launch", row["next_launch"])] ++
-        Enum.map(row["warnings"], &"  #{prefix} warning: #{&1}")
-    end)
-    |> Enum.join("\n")
+            values ->
+              Enum.flat_map(values, fn observation ->
+                [
+                  format_adapter(
+                    adapter_prefix,
+                    "running",
+                    observation["adapter"],
+                    observation["generation"]
+                  ),
+                  format_observation(prefix, "running", observation)
+                ]
+              end)
+          end
+
+        [format_adapter(adapter_prefix, "next launch", adapter)] ++
+          running ++
+          [format_observation(prefix, "next launch", row["next_launch"])] ++
+          Enum.map(row["warnings"], &"  #{prefix} warning: #{&1}")
+      end)
+
+    gateway_notice =
+      case Map.get(report, "gateway_report_fetch") do
+        %{"status" => "unavailable", "reason" => reason, "boundary" => boundary} ->
+          ["  gateway running-state fetch unavailable: #{reason} (#{boundary})"]
+
+        _ ->
+          []
+      end
+
+    Enum.join(gateway_notice ++ lines, "\n")
   end
 
   def format_human(%{"status" => status, "reason" => reason}),
@@ -492,6 +510,29 @@ defmodule Tightbeam.HarnessBinaryProvenance do
   @doc false
   def report_unavailable(reason),
     do: %{"status" => "unavailable", "reason" => to_string(reason), "rows" => []}
+
+  @doc false
+  def with_gateway_fetch_failure(report, failure) when is_map(report) do
+    reason =
+      case failure do
+        %{"reason" => reason} -> reason
+        _ -> failure
+      end
+
+    reason =
+      if is_binary(reason) do
+        reason |> String.replace(~r/[\r\n\t]+/, " ") |> String.slice(0, 200)
+      else
+        safe_reason(reason)
+      end
+
+    Map.put(report, "gateway_report_fetch", %{
+      "status" => "unavailable",
+      "reason" => reason,
+      "boundary" =>
+        "local fallback is not a complete gateway snapshot; empty running rows do not prove no adapter is running"
+    })
+  end
 
   @doc false
   def probe_capture(host_config, capture) do

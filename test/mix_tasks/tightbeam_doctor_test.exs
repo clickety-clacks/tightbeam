@@ -208,12 +208,12 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
     File.chmod!(broken, 0o755)
 
     unprobeable =
-      HarnessBinaryProvenance.capture(:codex, "eezo", temp_dir, "/usr/bin", [],
+      HarnessBinaryProvenance.capture(:codex, "eezo", temp_dir, "/usr/bin:/bin", [],
         process_env: %{"CODEX_PATH" => broken}
       )
 
     missing =
-      HarnessBinaryProvenance.capture(:codex, "eezo", temp_dir, "/usr/bin", [],
+      HarnessBinaryProvenance.capture(:codex, "eezo", temp_dir, "/usr/bin:/bin", [],
         process_env: %{"CODEX_PATH" => Path.join(temp_dir, "absent-codex")}
       )
 
@@ -912,6 +912,44 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
 
     assert {:ok, decoded} = report |> Doctor.format(:json) |> JSON.decode()
     assert decoded["harness_binary_provenance"] == provenance
+  end
+
+  test "gateway fetch failure survives local fallback with an explicit running boundary", ctx do
+    local_report = %{
+      "schema_version" => 1,
+      "rows" => [
+        %{
+          "host" => "eezo",
+          "harness" => "codex",
+          "adapter" => %{"package" => "codex-acp", "version" => "1.12.0"},
+          "running" => [],
+          "next_launch" => %{"status" => "unknown", "source" => "unknown"},
+          "warnings" => []
+        }
+      ]
+    }
+
+    provenance =
+      HarnessBinaryProvenance.with_gateway_fetch_failure(local_report, %{
+        "status" => "unavailable",
+        "reason" => "gateway returned HTTP 503"
+      })
+
+    {0, report} =
+      Doctor.evaluate(ctx.catalog, put(ctx.inputs, :harness_binary_provenance, provenance))
+
+    human = Doctor.format(report, :human)
+
+    assert human =~
+             "gateway running-state fetch unavailable: gateway returned HTTP 503 (local fallback is not a complete gateway snapshot; empty running rows do not prove no adapter is running)"
+
+    assert human =~ "harness binary eezo/codex running: unavailable (gateway report fetch failed)"
+    refute human =~ "harness binary eezo/codex running: not observed"
+
+    assert {:ok, decoded} = report |> Doctor.format(:json) |> JSON.decode()
+
+    assert decoded["harness_binary_provenance"]["gateway_report_fetch"] ==
+             provenance["gateway_report_fetch"]
   end
 
   # AC5, doctor's half: an installed-but-unrunnable harness (on PATH but fails to

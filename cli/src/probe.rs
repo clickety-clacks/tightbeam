@@ -1289,6 +1289,26 @@ fn harness_binary_provenance_lines(provenance: &Value) -> Vec<String> {
     };
 
     let mut lines = Vec::new();
+    let gateway_report_fetch = provenance.get("gateway_report_fetch");
+    let gateway_failure = gateway_report_fetch
+        .and_then(|observation| observation.get("status"))
+        .and_then(Value::as_str)
+        == Some("unavailable");
+
+    if let Some(observation) = gateway_report_fetch.filter(|_| gateway_failure) {
+        let reason = observation
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("gateway report unavailable");
+        let boundary = observation
+            .get("boundary")
+            .and_then(Value::as_str)
+            .unwrap_or("running adapter state was not fetched");
+        lines.push(format!(
+            "  gateway running-state fetch unavailable: {reason} ({boundary})"
+        ));
+    }
+
     for row in rows {
         let host = row.get("host").and_then(Value::as_str).unwrap_or("?");
         let harness = row.get("harness").and_then(Value::as_str).unwrap_or("?");
@@ -1308,7 +1328,13 @@ fn harness_binary_provenance_lines(provenance: &Value) -> Vec<String> {
             .unwrap_or_default();
 
         if running.is_empty() {
-            lines.push(format!("  {prefix} running: not observed"));
+            if gateway_failure {
+                lines.push(format!(
+                    "  {prefix} running: unavailable (gateway report fetch failed)"
+                ));
+            } else {
+                lines.push(format!("  {prefix} running: not observed"));
+            }
         } else {
             for observation in running {
                 lines.push(harness_adapter_observation_line(
@@ -2044,6 +2070,34 @@ mod tests {
         let encoded: Value =
             serde_json::from_str(&report_json(&report, None, Some(provenance.clone()))).unwrap();
         assert_eq!(encoded["harness_binary_provenance"], provenance);
+    }
+
+    #[test]
+    fn provenance_gateway_fetch_failure_keeps_the_running_evidence_boundary() {
+        let provenance = serde_json::json!({
+            "schema_version": 1,
+                "gateway_report_fetch": {
+                    "status": "unavailable",
+                    "reason": "connection timed out",
+                    "boundary": "local fallback is not a complete gateway snapshot; empty running rows do not prove no adapter is running"
+                },
+            "rows": [{
+                "host": "eezo",
+                "harness": "codex",
+                "adapter": {"package": "codex-acp", "version": "1.12.0"},
+                "running": [],
+                "next_launch": {"status": "unknown", "source": "unknown"},
+                "warnings": []
+            }]
+        });
+
+        let lines = harness_binary_provenance_lines(&provenance);
+        assert!(lines.iter().any(|line| {
+            line == "  gateway running-state fetch unavailable: connection timed out (local fallback is not a complete gateway snapshot; empty running rows do not prove no adapter is running)"
+        }));
+        assert!(lines.iter().any(|line| {
+            line == "  harness binary eezo/codex running: unavailable (gateway report fetch failed)"
+        }));
     }
 
     fn doctor_credential_root() -> PathBuf {
