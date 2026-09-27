@@ -258,7 +258,7 @@ defmodule Tightbeam.Acp.Conn do
   def handle_info({:prompt_deadline, id, token}, state) do
     case state.pending[id] do
       %{token: ^token, deadline: deadline} when is_integer(deadline) ->
-        {:noreply, cancel_prompt(state, id, :prompt_timeout)}
+        {:noreply, expire_prompt(state, id)}
 
       _ ->
         {:noreply, state}
@@ -267,8 +267,13 @@ defmodule Tightbeam.Acp.Conn do
 
   def handle_info({:prompt_cancel_expired, id, token}, state) do
     case state.pending[id] do
-      %{token: ^token, cancel_reason: reason, prompt_session_id: sid}
-      when not is_nil(reason) ->
+      %{
+        token: ^token,
+        cancel_reason: :prompt_timeout,
+        cancel_timer: timer,
+        prompt_session_id: sid
+      }
+      when is_reference(timer) ->
         # The original response is the acknowledgment. Without it, release the
         # local transport, never pretend the cancel notification stopped it.
         if state.port && !state.closed do
@@ -280,7 +285,7 @@ defmodule Tightbeam.Acp.Conn do
           end
         end
 
-        emit(state, {:acp_prompt_teardown, self(), id, sid, reason})
+        emit(state, {:acp_prompt_teardown, self(), id, sid, :prompt_timeout})
 
         {:noreply,
          fail_all(
@@ -321,6 +326,22 @@ defmodule Tightbeam.Acp.Conn do
       %{cancel_reason: nil} = entry ->
         send_cancel(state, entry.prompt_session_id)
 
+        emit(state, {:acp_prompt_cancelling, id, entry.prompt_session_id, reason})
+        put_in(state.pending[id], %{entry | cancel_reason: reason})
+
+      _ ->
+        state
+    end
+  end
+
+  defp expire_prompt(state, id) do
+    state = cancel_prompt(state, id, :prompt_timeout)
+
+    case state.pending[id] do
+      %{cancel_timer: nil} = entry ->
+        # Caller/worker death cancels only this session. Shared teardown is
+        # authorized only after the original absolute prompt deadline, even
+        # when an earlier cancellation is still awaiting its response.
         timer =
           Process.send_after(
             self(),
@@ -328,8 +349,10 @@ defmodule Tightbeam.Acp.Conn do
             entry.cancel_grace
           )
 
-        emit(state, {:acp_prompt_cancelling, id, entry.prompt_session_id, reason})
-        put_in(state.pending[id], %{entry | cancel_reason: reason, cancel_timer: timer})
+        if entry.cancel_reason != :prompt_timeout,
+          do: emit(state, {:acp_prompt_cancelling, id, entry.prompt_session_id, :prompt_timeout})
+
+        put_in(state.pending[id], %{entry | cancel_reason: :prompt_timeout, cancel_timer: timer})
 
       _ ->
         state

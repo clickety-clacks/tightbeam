@@ -1311,6 +1311,51 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert Enum.any?(captured_requests(capture_path), &(&1["method"] == "session/cancel"))
   end
 
+  for death <- [:caller, :worker] do
+    @death death
+    test "#{death} death with ignored cancellation cannot tear down before the original deadline" do
+      {adapter, capture} = start_adapter(gate_mode: "ignore-cancel-turn", probe: false)
+      conn = Adapter.conn(adapter)
+      adapter_monitor = Process.monitor(adapter)
+      conn_monitor = Process.monitor(conn)
+
+      caller =
+        Task.async(fn ->
+          Adapter.prompt(adapter, "canceled", "stall", timeout: 1_500, cancel_grace: 50)
+        end)
+
+      peer = Task.async(fn -> Adapter.prompt(adapter, "healthy", "peer") end)
+      assert pending_count?(conn, 2)
+      {id, entry} = prompt_entry(conn, "canceled")
+      worker = elem(entry.from, 0)
+      worker_monitor = Process.monitor(worker)
+
+      if @death == :caller,
+        do: Task.shutdown(caller, :brutal_kill),
+        else: Process.exit(worker, :kill)
+
+      assert eventually(fn -> not is_nil(:sys.get_state(conn).pending[id].cancel_reason) end)
+      assert :sys.get_state(conn).pending[id].cancel_timer == nil
+      # An ignored cancel outlives the injected grace without affecting the
+      # shared connection. Even an early stale grace signal has no authority.
+      send(conn, {:prompt_cancel_expired, id, entry.token})
+      refute_receive {:DOWN, ^adapter_monitor, :process, ^adapter, _}, 200
+      assert Process.alive?(conn)
+      Tightbeam.Acp.Conn.notify(conn, "test/complete", %{sessionId: "healthy"})
+      assert {:ok, _} = Task.await(peer)
+      assert Enum.count(captured_requests(capture), &(&1["method"] == "session/cancel")) == 1
+
+      assert_receive {:DOWN, ^adapter_monitor, :process, ^adapter,
+                      {:prompt_cancel_unacknowledged, "canceled"}},
+                     3_000
+
+      assert System.monotonic_time(:millisecond) >= entry.deadline
+      assert_receive {:DOWN, ^conn_monitor, :process, ^conn, _}, 2_000
+      assert_receive {:DOWN, ^worker_monitor, :process, ^worker, _}, 2_000
+      if @death == :worker, do: assert({:error, :prompt_timeout} = Task.await(caller))
+    end
+  end
+
   test "absolute prompt deadline cancels and returns timeout after acknowledgment" do
     {adapter, capture} = start_adapter(gate_mode: "stall-turn", probe: false)
     conn = Adapter.conn(adapter)
