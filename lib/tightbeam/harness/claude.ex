@@ -341,6 +341,26 @@ defmodule Tightbeam.Harness.Claude do
     Support.bounded_probe(find.(cli_binary()), target)
   end
 
+  @doc false
+  def binary_provenance_default_source, do: "bundled_fallback"
+
+  @doc false
+  def binary_provenance_override_env, do: "CLAUDE_CODE_EXECUTABLE"
+
+  @doc false
+  def binary_provenance_bundle_probe_script do
+    "const {createRequire}=require('node:module');" <>
+      "const r=createRequire(process.argv[1]+'/package.json');" <>
+      "const entry=r.resolve(" <>
+      JSON.encode!(install_package()) <>
+      ");" <>
+      "const sdk=createRequire(entry).resolve('@anthropic-ai/claude-agent-sdk');" <>
+      "const s=createRequire(sdk),p=process.platform,a=process.arch,e=p==='win32'?'.exe':'';" <>
+      "const names=p==='linux'?[`@anthropic-ai/claude-agent-sdk-linux-${a}-musl`,`@anthropic-ai/claude-agent-sdk-linux-${a}`]:[`@anthropic-ai/claude-agent-sdk-${p}-${a}`];" <>
+      "for(const n of names){try{process.stdout.write(s.resolve(`${n}/claude${e}`));process.exit(0)}catch{}}" <>
+      "process.exit(2);"
+  end
+
   @impl true
   def classify_auth_event(%{"authStatus" => %{"kind" => "none"}}), do: :terminal
 

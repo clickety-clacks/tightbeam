@@ -1576,14 +1576,14 @@ defmodule Tightbeam.Placement do
   end
 
   defp binary_selection_process_env(module) do
-    name =
-      case module.id() do
-        :codex -> "CODEX_PATH"
-        :claude -> "CLAUDE_CODE_EXECUTABLE"
-        _ -> nil
+    if function_exported?(module, :binary_provenance_override_env, 0) do
+      case module.binary_provenance_override_env() do
+        name when is_binary(name) -> %{name => System.get_env(name)}
+        _ -> %{}
       end
-
-    if name, do: %{name => System.get_env(name)}, else: %{}
+    else
+      %{}
+    end
   end
 
   @doc false

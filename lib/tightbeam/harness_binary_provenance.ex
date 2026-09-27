@@ -12,13 +12,13 @@ defmodule Tightbeam.HarnessBinaryProvenance do
 
   @version_timeout_ms 3_000
   @ssh_opts ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
-  @override_names %{codex: "CODEX_PATH", claude: "CLAUDE_CODE_EXECUTABLE"}
 
   @doc false
   def capture(harness, host, base_dir, path, overlays, opts \\ []) do
     module = Harness.module!(harness)
-    harness = module.id()
-    override_name = Map.get(@override_names, harness)
+    override_name = module_override_env(module)
+    default_source = module_default_source(module)
+    bundle_probe_script = bundle_probe_script(module)
     overlay_values = Map.new(overlays)
 
     override =
@@ -36,8 +36,7 @@ defmodule Tightbeam.HarnessBinaryProvenance do
       cond do
         is_binary(override) and String.trim(override) != "" -> "explicit_pinned_override"
         without_override_evidence? -> "unknown"
-        harness in [:codex, :claude] -> "bundled_fallback"
-        harness in [:pi, :cursor] -> "system"
+        is_binary(default_source) -> default_source
         true -> "unsupported"
       end
 
@@ -50,7 +49,7 @@ defmodule Tightbeam.HarnessBinaryProvenance do
       "override_name" => override_name,
       "override_path" => if(selection == "explicit_pinned_override", do: override),
       "binary_name" => module.cli_binary(),
-      "bundle_kind" => if(harness in [:codex, :claude], do: Atom.to_string(harness)),
+      "bundle_probe_script" => bundle_probe_script,
       "adapter" => %{
         "package" => module.install_package(),
         "version" => adapter_version(module)
@@ -382,7 +381,7 @@ defmodule Tightbeam.HarnessBinaryProvenance do
 
   defp resolve_remote_selection(host_config, path, module, snapshot, overlay, opts) do
     if snapshot["selection"] in ["bundled_fallback", "unknown"] do
-      case remote_override(host_config, path, module.id(), opts) do
+      case remote_override(host_config, path, snapshot["override_name"], opts) do
         {:ok, value} when is_binary(value) and value != "" ->
           capture(
             module,
@@ -409,7 +408,7 @@ defmodule Tightbeam.HarnessBinaryProvenance do
   end
 
   defp selection_overlays(db, host, harness) do
-    case Map.get(@override_names, Harness.parse!(harness).id()) do
+    case module_override_env(Harness.parse!(harness)) do
       nil ->
         []
 
@@ -480,47 +479,21 @@ defmodule Tightbeam.HarnessBinaryProvenance do
 
   defp executable(
          host_config,
-         %{"selection" => "bundled_fallback", "bundle_kind" => "codex"} = capture
+         %{"selection" => "bundled_fallback", "bundle_probe_script" => script} = capture
        ) do
-    node_bundle(host_config, capture, :codex)
-  end
-
-  defp executable(
-         host_config,
-         %{"selection" => "bundled_fallback", "bundle_kind" => "claude"} = capture
-       ) do
-    node_bundle(host_config, capture, :claude)
+    node_bundle(host_config, capture, script)
   end
 
   defp executable(_host_config, _capture), do: {:error, :unsupported}
 
-  defp node_bundle(host_config, capture, kind) do
+  defp node_bundle(host_config, capture, script) do
     root = Path.join(capture["base_dir"], "adapters/node_modules")
-    script = resolver_script(kind)
 
     case run_host(host_config, capture["path_env"], ["node", "-e", script, root]) do
       {:ok, path} when path != "" -> {:ok, ["node", String.trim(path)]}
       {:ok, _} -> {:error, :not_found}
       {:error, reason} -> {:error, reason}
     end
-  end
-
-  defp resolver_script(:codex) do
-    "const {createRequire}=require('node:module');" <>
-      "const r=createRequire(process.argv[1]+'/package.json');" <>
-      "const entry=r.resolve('@agentclientprotocol/codex-acp');" <>
-      "process.stdout.write(createRequire(entry).resolve('@openai/codex/bin/codex.js'));"
-  end
-
-  defp resolver_script(:claude) do
-    "const {createRequire}=require('node:module');" <>
-      "const r=createRequire(process.argv[1]+'/package.json');" <>
-      "const entry=r.resolve('@agentclientprotocol/claude-agent-acp');" <>
-      "const sdk=createRequire(entry).resolve('@anthropic-ai/claude-agent-sdk');" <>
-      "const s=createRequire(sdk),p=process.platform,a=process.arch,e=p==='win32'?'.exe':'';" <>
-      "const names=p==='linux'?[`@anthropic-ai/claude-agent-sdk-linux-${a}-musl`,`@anthropic-ai/claude-agent-sdk-linux-${a}`]:[`@anthropic-ai/claude-agent-sdk-${p}-${a}`];" <>
-      "for(const n of names){try{process.stdout.write(s.resolve(`${n}/claude${e}`));process.exit(0)}catch{}}" <>
-      "process.exit(2);"
   end
 
   defp resolve_on_host(host_config, path, command) do
@@ -567,9 +540,7 @@ defmodule Tightbeam.HarnessBinaryProvenance do
     end
   end
 
-  defp remote_override(%{ssh: ssh}, path, harness, opts) do
-    name = Map.get(@override_names, harness)
-
+  defp remote_override(%{ssh: ssh}, path, name, opts) do
     runner =
       Keyword.get(opts, :remote_runner, fn command, args, run_opts ->
         System.cmd(command, args, run_opts)
@@ -613,10 +584,28 @@ defmodule Tightbeam.HarnessBinaryProvenance do
   end
 
   defp selection_process_env(module) do
-    case Map.get(@override_names, module.id()) do
+    case module_override_env(module) do
       nil -> %{}
       name -> %{name => System.get_env(name)}
     end
+  end
+
+  defp module_override_env(module) do
+    if function_exported?(module, :binary_provenance_override_env, 0),
+      do: module.binary_provenance_override_env(),
+      else: nil
+  end
+
+  defp bundle_probe_script(module) do
+    if function_exported?(module, :binary_provenance_bundle_probe_script, 0),
+      do: module.binary_provenance_bundle_probe_script(),
+      else: nil
+  end
+
+  defp module_default_source(module) do
+    if function_exported?(module, :binary_provenance_default_source, 0),
+      do: module.binary_provenance_default_source(),
+      else: nil
   end
 
   defp format_observation(prefix, label, observation) do

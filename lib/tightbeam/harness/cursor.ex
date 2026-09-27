@@ -455,6 +455,9 @@ defmodule Tightbeam.Harness.Cursor do
   end
 
   @doc false
+  def binary_provenance_default_source, do: "system"
+
+  @doc false
   def verify_installed_cli(target) do
     with launcher when is_binary(launcher) <- resolve_launcher(target),
          {:ok, canonical} <- canonical_path(target, launcher),
