@@ -529,7 +529,7 @@ defmodule Tightbeam.Harness.Pi do
       catalog_expected: %{
         "valid" => {:ok, [valid_entry]},
         "valid_api_key" => {:ok, [valid_entry]},
-        "malformed" => {:error, :malformed_catalog},
+        "malformed" => {:error, {:pi_catalog_provider_failed, :opencode_go, :malformed_catalog}},
         "unavailable" => {:error, {:http_status, 503, ~s({"error":"unavailable"})}}
       },
       catalog_state: fn case_name, base ->
