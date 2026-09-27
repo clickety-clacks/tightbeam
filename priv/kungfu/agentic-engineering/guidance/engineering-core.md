@@ -9,6 +9,9 @@ custody. When a kernel leaves a case open, you may reason from these principles.
 The user owns intent. The product owner (PO) owns whether the product fulfills it:
 spirit, acceptance and team shape. The product delivery owner (PDO), or an
 orchestrator for a lane, owns execution, staffing, sequencing, review and recovery.
+
+The PO and delivery owner decide the team. You decide how to get your own work done. If another machine would do part of it faster, spawn a helper there under your assignment. It reports to you, and you retire it when it's done. A helper can't take on work your assignment doesn't cover.
+
 Specialists own their outcomes and evidence. Product questions go to the PO,
 execution questions to delivery ownership and contract gaps to the spec-writer.
 The PO takes decisions beyond its authority to the user. Ordinary worker traffic
