@@ -6263,7 +6263,7 @@ mod tests {
                 "api-key: '[REDACTED:secret_field]'",
             ),
             (
-                "api-key: 'prefix\\'fixtureSENTINEL",
+                "api-key: 'prefix\\'tailSENTINEL",
                 "api-key: '[REDACTED:secret_field]'",
             ),
         ];
@@ -6274,11 +6274,13 @@ mod tests {
 
             assert!(!human.contains("fixtureSENTINEL"), "{human}");
             assert!(human.contains("[REDACTED:secret_field]"), "{human}");
+            assert!(!human.contains("tailSENTINEL"), "{human}");
             assert_eq!(machine["error"]["body"], expected);
             assert!(
                 !machine.to_string().contains("fixtureSENTINEL"),
                 "{machine}"
             );
+            assert!(!machine.to_string().contains("tailSENTINEL"), "{machine}");
         }
     }
 
@@ -6759,7 +6761,7 @@ mod tests {
         assert_eq!(refusal["body"], expected_body);
         assert_eq!(refusal["attempt"]["receipt"], "unavailable");
 
-        let escaped_eof_body = "not json; api-key: 'prefix\\'fixtureSENTINEL";
+        let escaped_eof_body = "not json; api-key: 'prefix\\'tailSENTINEL";
         let decode_error = serde_json::from_str::<Value>(escaped_eof_body).unwrap_err();
         let expected_escaped_eof_body = "not json; api-key: '[REDACTED:secret_field]'";
 
@@ -6771,7 +6773,7 @@ mod tests {
             FailurePresentation::Ordinary,
         );
         let (human, machine) = readings(&rendered);
-        assert!(!rendered.contains("fixtureSENTINEL"), "{rendered}");
+        assert!(!rendered.contains("tailSENTINEL"), "{rendered}");
         assert!(human.contains(expected_escaped_eof_body), "{human}");
         assert_eq!(machine["error"]["body"], expected_escaped_eof_body);
         assert_eq!(machine["attempt"]["receipt"], "unavailable");
@@ -6783,7 +6785,7 @@ mod tests {
             Some(fixture.render()),
             FailurePresentation::Tune,
         );
-        assert!(!rendered.contains("fixtureSENTINEL"), "{rendered}");
+        assert!(!rendered.contains("tailSENTINEL"), "{rendered}");
         assert!(
             !rendered.contains('\n'),
             "tune stays one JSON line: {rendered}"
