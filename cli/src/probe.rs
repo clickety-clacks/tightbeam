@@ -1977,6 +1977,10 @@ mod tests {
             "rows": [{
                 "host": "eezo",
                 "harness": "codex",
+                "adapter": {
+                    "package": "codex-acp",
+                    "version": "1.12.0"
+                },
                 "running": [{
                     "status": "observed",
                     "source": "bundled_fallback",
