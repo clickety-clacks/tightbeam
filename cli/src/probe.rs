@@ -1293,17 +1293,13 @@ fn harness_binary_provenance_lines(provenance: &Value) -> Vec<String> {
         let host = row.get("host").and_then(Value::as_str).unwrap_or("?");
         let harness = row.get("harness").and_then(Value::as_str).unwrap_or("?");
         let prefix = format!("harness binary {host}/{harness}");
+        let adapter_prefix = format!("harness adapter {host}/{harness}");
         let adapter = row.get("adapter");
-        let package = adapter
-            .and_then(|value| value.get("package"))
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        let adapter_version = adapter
-            .and_then(|value| value.get("version"))
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        lines.push(format!(
-            "  harness adapter {host}/{harness}: {package} {adapter_version}"
+        lines.push(harness_adapter_observation_line(
+            &adapter_prefix,
+            "next launch",
+            adapter,
+            None,
         ));
         let running = row
             .get("running")
@@ -1315,6 +1311,12 @@ fn harness_binary_provenance_lines(provenance: &Value) -> Vec<String> {
             lines.push(format!("  {prefix} running: not observed"));
         } else {
             for observation in running {
+                lines.push(harness_adapter_observation_line(
+                    &adapter_prefix,
+                    "running",
+                    observation.get("adapter"),
+                    observation.get("generation").and_then(Value::as_u64),
+                ));
                 lines.push(harness_binary_observation_line(
                     &prefix,
                     "running",
@@ -1338,6 +1340,26 @@ fn harness_binary_provenance_lines(provenance: &Value) -> Vec<String> {
         }
     }
     lines
+}
+
+fn harness_adapter_observation_line(
+    prefix: &str,
+    label: &str,
+    adapter: Option<&Value>,
+    generation: Option<u64>,
+) -> String {
+    let package = adapter
+        .and_then(|value| value.get("package"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let version = adapter
+        .and_then(|value| value.get("version"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let generation = generation
+        .map(|value| format!(" generation {value}"))
+        .unwrap_or_default();
+    format!("  {prefix} {label}{generation}: {package} {version}")
 }
 
 fn harness_binary_observation_line(prefix: &str, label: &str, observation: &Value) -> String {
@@ -1985,7 +2007,12 @@ mod tests {
                     "status": "observed",
                     "source": "bundled_fallback",
                     "path": "/adapters/codex.js",
-                    "version": "codex-cli 0.145.0"
+                    "version": "codex-cli 0.145.0",
+                    "generation": 4,
+                    "adapter": {
+                        "package": "codex-acp",
+                        "version": "1.12.0"
+                    }
                 }],
                 "next_launch": {
                     "status": "observed",
@@ -1998,7 +2025,10 @@ mod tests {
         });
 
         let human = human_with_harness_binary_provenance(&report, &provenance);
-        assert!(human.contains("harness adapter eezo/codex: codex-acp 1.12.0"));
+        assert!(
+            human.contains("harness adapter eezo/codex running generation 4: codex-acp 1.12.0")
+        );
+        assert!(human.contains("harness adapter eezo/codex next launch: codex-acp 1.12.0"));
         assert!(human.contains("running: observed (bundled_fallback)"));
         assert!(human.contains("/adapters/codex.js; codex-cli 0.145.0"));
         assert!(human.contains("warning: bundled_fallback_selected"));

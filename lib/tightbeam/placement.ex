@@ -1571,6 +1571,14 @@ defmodule Tightbeam.Placement do
       end
 
     with {:ok, plan} <- Harness.prepare_launch(module, target, home, launch_opts) do
+      binary_capture =
+        Tightbeam.HarnessBinaryProvenance.capture_launch_observation(
+          host_config,
+          Keyword.fetch!(base, :harness_binary_capture),
+          target: target
+        )
+
+      base = Keyword.put(base, :harness_binary_capture, binary_capture)
       {:ok, Keyword.merge(base, plan)}
     end
   end

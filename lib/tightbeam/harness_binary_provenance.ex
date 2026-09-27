@@ -30,9 +30,10 @@ defmodule Tightbeam.HarnessBinaryProvenance do
       end
 
     without_override_evidence? =
-      Keyword.get(opts, :without_override_evidence?, false) and is_nil(override)
+      Keyword.get(opts, :without_override_evidence?, false) and is_nil(override) and
+        is_binary(override_name)
 
-    selection =
+    selection_rule =
       cond do
         is_binary(override) and String.trim(override) != "" -> "explicit_pinned_override"
         without_override_evidence? -> "unknown"
@@ -45,9 +46,9 @@ defmodule Tightbeam.HarnessBinaryProvenance do
       "harness" => module.wire_name(),
       "base_dir" => base_dir,
       "path_env" => path,
-      "selection" => selection,
+      "selection_rule" => selection_rule,
       "override_name" => override_name,
-      "override_path" => if(selection == "explicit_pinned_override", do: override),
+      "override_path" => if(selection_rule == "explicit_pinned_override", do: override),
       "binary_name" => module.cli_binary(),
       "bundle_probe_script" => bundle_probe_script,
       "adapter" => %{
@@ -57,13 +58,13 @@ defmodule Tightbeam.HarnessBinaryProvenance do
       "captured_at_ms" => System.system_time(:millisecond),
       "selection_evidence" =>
         cond do
-          selection == "unknown" ->
+          selection_rule == "unknown" ->
             "explicit override environment was not captured at adapter launch"
 
-          selection == "unsupported" ->
+          selection_rule == "unsupported" ->
             "the registered harness has no vendor CLI provenance rule"
 
-          selection == "explicit_pinned_override" ->
+          selection_rule == "explicit_pinned_override" ->
             override_name
 
           true ->
@@ -171,7 +172,6 @@ defmodule Tightbeam.HarnessBinaryProvenance do
   def report_for_inputs(base_dir, hosts, overlays, launches \\ [], opts \\ []) do
     config = %{base_dir: base_dir, cli_bin: Path.join(base_dir, "bin")}
     harnesses = Keyword.get(opts, :harnesses, Harness.all())
-    probe = Keyword.get(opts, :probe, &probe_capture/2)
 
     rows =
       for {host, host_config} <- Enum.sort(hosts), module <- harnesses do
@@ -188,7 +188,8 @@ defmodule Tightbeam.HarnessBinaryProvenance do
                 :process_env,
                 if(remote?, do: %{}, else: selection_process_env(module))
               ),
-            without_override_evidence?: Keyword.get(opts, :without_override_evidence?, false)
+            without_override_evidence?:
+              remote? and Keyword.get(opts, :without_override_evidence?, false)
           )
 
         next_capture =
@@ -200,17 +201,24 @@ defmodule Tightbeam.HarnessBinaryProvenance do
             launch["host"] == host and launch["harness"] == harness and launch["ready"]
           end)
           |> Enum.map(fn launch ->
-            run_capture = launch["capture"] || %{"selection" => "unknown"}
-            probed = probe.(host_config, run_capture)
+            run_capture = launch["capture"] || %{}
+
+            probed =
+              case run_capture["launch_observation"] do
+                %{} = observation -> observation
+                _ -> stale_launch_observation(run_capture)
+              end
 
             Map.merge(probed, %{
               "generation" => launch["generation"],
               "captured_at_ms" => run_capture["captured_at_ms"],
-              "observation" => "adapter_launch_selection"
+              "observation" => "adapter_launch_selection",
+              "adapter" =>
+                run_capture["adapter"] || %{"package" => "unknown", "version" => "unknown"}
             })
           end)
 
-        next_launch = probe.(host_config, next_capture)
+        next_launch = observe_selection(host_config, next_capture, opts)
 
         %{
           "host" => host,
@@ -229,23 +237,205 @@ defmodule Tightbeam.HarnessBinaryProvenance do
       {:error, %{"status" => "unavailable", "reason" => safe_reason({kind, reason})}}
   end
 
+  @doc false
+  def capture_launch_observation(host_config, capture, opts \\ []) do
+    capture = resolve_remote_launch_selection(host_config, capture, opts)
+    Map.put(capture, "launch_observation", observe_selection(host_config, capture, opts))
+  end
+
+  defp resolve_remote_launch_selection(
+         %{ssh: ssh} = host_config,
+         %{"selection_rule" => "unknown", "override_name" => name} = capture,
+         opts
+       )
+       when is_binary(ssh) and is_binary(name) do
+    case remote_override(host_config, capture["path_env"], name, opts) do
+      {:ok, value} when is_binary(value) and value != "" ->
+        recapture_remote_launch(capture, [{name, value}])
+
+      {:ok, _empty} ->
+        recapture_remote_launch(capture, [])
+
+      _ ->
+        capture
+    end
+  end
+
+  defp resolve_remote_launch_selection(_host_config, capture, _opts), do: capture
+
+  defp recapture_remote_launch(capture, overlays) do
+    capture(
+      Harness.parse!(capture["harness"]),
+      capture["host"],
+      capture["base_dir"],
+      capture["path_env"],
+      overlays
+    )
+  end
+
+  @doc false
+  def observe_selection(host_config, capture, opts \\ []) do
+    case capture["selection_rule"] do
+      "unknown" ->
+        %{"status" => "unknown", "source" => "unknown", "reason" => capture["selection_evidence"]}
+
+      "unsupported" ->
+        %{
+          "status" => "unsupported",
+          "source" => "unsupported",
+          "reason" => capture["selection_evidence"]
+        }
+
+      "system" ->
+        system_probe = Keyword.get(opts, :system_probe, &probe_system_selection/3)
+        system_probe.(host_config, capture, Keyword.get(opts, :target))
+
+      _ ->
+        probe = Keyword.get(opts, :probe, &probe_capture/2)
+        probe.(host_config, capture)
+    end
+  rescue
+    error ->
+      %{
+        "status" => "unavailable",
+        "source" => "unknown",
+        "reason" => safe_reason(error)
+      }
+  catch
+    kind, reason ->
+      %{
+        "status" => "unavailable",
+        "source" => "unknown",
+        "reason" => safe_reason({kind, reason})
+      }
+  end
+
+  defp stale_launch_observation(%{"captured_at_ms" => _captured_at_ms}) do
+    %{
+      "status" => "stale",
+      "source" => "unknown",
+      "reason" => "adapter generation has no captured binary-selection observation"
+    }
+  end
+
+  defp stale_launch_observation(_) do
+    %{
+      "status" => "unknown",
+      "source" => "unknown",
+      "reason" => "adapter generation has no binary-selection capture"
+    }
+  end
+
+  defp probe_system_selection(host_config, capture, target) do
+    module = Harness.parse!(capture["harness"])
+
+    target =
+      target ||
+        %{
+          base_dir: capture["base_dir"],
+          host_name: capture["host"],
+          host_config: host_config,
+          cli_bin: host_config[:cli_bin] || Path.join(capture["base_dir"], "bin")
+        }
+
+    path = capture["path_env"]
+
+    target =
+      if module.wire_name() == "pi" do
+        Map.put(target, :find_executable, fn name ->
+          script = "command -v " <> Tightbeam.Harness.Support.shell_quote(name)
+
+          case resolve_on_host(host_config, path, ["sh", "-c", script]) do
+            {:ok, resolved} when resolved != "" -> resolved
+            _ -> nil
+          end
+        end)
+      else
+        target
+      end
+
+    target =
+      Map.put(target, :run, fn argv ->
+        case run_host(host_config, path, argv) do
+          {:ok, output} -> {output, 0}
+          {:error, {:exit, code, output}} -> {output, code}
+          {:error, reason} -> {safe_reason(reason), 127}
+        end
+      end)
+
+    result = module.probe_cli(Map.put(target, :timeout, @version_timeout_ms))
+
+    case result do
+      {:ok, %{bin: path, version: version}} when is_binary(path) and is_binary(version) ->
+        %{
+          "status" => "observed",
+          "source" => "system",
+          "path" => path,
+          "version" => String.slice(String.trim(version), 0, 240),
+          "version_observed_at_ms" => System.system_time(:millisecond),
+          "selection_evidence" => "adapter probe_cli selected this executable"
+        }
+
+      {:error, :not_found} ->
+        %{
+          "status" => "missing",
+          "source" => "unknown",
+          "reason" => "adapter probe_cli did not select a system executable"
+        }
+
+      {:error, {:exec_failed, reason}} ->
+        %{
+          "status" => "unprobeable",
+          "source" => "unknown",
+          "reason" =>
+            "adapter-selected system executable version probe failed: #{safe_reason(reason)}"
+        }
+
+      {:error, reason} ->
+        %{"status" => "unavailable", "source" => "unknown", "reason" => safe_reason(reason)}
+
+      other ->
+        %{
+          "status" => "unavailable",
+          "source" => "unknown",
+          "reason" => "adapter probe_cli returned #{safe_reason(other)}"
+        }
+    end
+  rescue
+    error -> %{"status" => "unavailable", "source" => "unknown", "reason" => safe_reason(error)}
+  catch
+    kind, reason ->
+      %{"status" => "unavailable", "source" => "unknown", "reason" => safe_reason({kind, reason})}
+  end
+
   @doc "A read-only per-row formatter shared by `mix tightbeam.doctor`."
   def format_human(%{"rows" => rows}) when is_list(rows) do
     rows
     |> Enum.flat_map(fn row ->
       prefix = "harness binary #{row["host"]}/#{row["harness"]}"
+      adapter_prefix = "harness adapter #{row["host"]}/#{row["harness"]}"
       adapter = Map.get(row, "adapter", %{})
-      package = Map.get(adapter, "package", "unknown")
-      version = Map.get(adapter, "version", "unknown")
-      adapter_line = "  harness adapter #{row["host"]}/#{row["harness"]}: #{package} #{version}"
 
       running =
         case row["running"] do
-          [] -> ["  #{prefix} running: not observed"]
-          values -> Enum.map(values, &format_observation(prefix, "running", &1))
+          [] ->
+            ["  #{prefix} running: not observed"]
+
+          values ->
+            Enum.flat_map(values, fn observation ->
+              [
+                format_adapter(
+                  adapter_prefix,
+                  "running",
+                  observation["adapter"],
+                  observation["generation"]
+                ),
+                format_observation(prefix, "running", observation)
+              ]
+            end)
         end
 
-      [adapter_line] ++
+      [format_adapter(adapter_prefix, "next launch", adapter)] ++
         running ++
         [format_observation(prefix, "next launch", row["next_launch"])] ++
         Enum.map(row["warnings"], &"  #{prefix} warning: #{&1}")
@@ -257,6 +447,14 @@ defmodule Tightbeam.HarnessBinaryProvenance do
     do: "  #{status}: #{reason}"
 
   def format_human(_), do: "  unavailable"
+
+  defp format_adapter(prefix, label, adapter, generation \\ nil) do
+    adapter = adapter || %{}
+    package = Map.get(adapter, "package", "unknown")
+    version = Map.get(adapter, "version", "unknown")
+    generation = if is_integer(generation), do: " generation #{generation}", else: ""
+    "  #{prefix} #{label}#{generation}: #{package} #{version}"
+  end
 
   @doc "Fetch the same protected, live report used by the Rust doctor command."
   def fetch_gateway(base_dir) do
@@ -306,11 +504,18 @@ defmodule Tightbeam.HarnessBinaryProvenance do
 
   @doc false
   def probe_capture(host_config, capture) do
-    source = capture["selection"]
+    source = capture["selection_rule"]
 
     case {source, executable(host_config, capture)} do
       {"unknown", _} ->
         %{"status" => "unknown", "source" => "unknown", "reason" => capture["selection_evidence"]}
+
+      {"system", _} ->
+        %{
+          "status" => "unknown",
+          "source" => "unknown",
+          "reason" => "adapter-specific system selection was not observed"
+        }
 
       {_, {:ok, command}} ->
         args = command ++ ["--version"]
@@ -363,7 +568,7 @@ defmodule Tightbeam.HarnessBinaryProvenance do
     error ->
       %{
         "status" => "unavailable",
-        "source" => Map.get(capture, "selection", "unknown"),
+        "source" => Map.get(capture, "selection_rule", "unknown"),
         "reason" => safe_reason(error)
       }
   end
@@ -380,7 +585,7 @@ defmodule Tightbeam.HarnessBinaryProvenance do
     do: capture
 
   defp resolve_remote_selection(host_config, path, module, snapshot, overlay, opts) do
-    if snapshot["selection"] in ["bundled_fallback", "unknown"] do
+    if snapshot["selection_rule"] in ["bundled_fallback", "unknown"] do
       case remote_override(host_config, path, snapshot["override_name"], opts) do
         {:ok, value} when is_binary(value) and value != "" ->
           capture(
@@ -438,20 +643,20 @@ defmodule Tightbeam.HarnessBinaryProvenance do
     end
   end
 
-  defp executable(_host_config, %{"selection" => "unknown"}), do: {:error, :unknown}
-  defp executable(_host_config, %{"selection" => "unsupported"}), do: {:error, :unsupported}
+  defp executable(_host_config, %{"selection_rule" => "unknown"}), do: {:error, :unknown}
+  defp executable(_host_config, %{"selection_rule" => "unsupported"}), do: {:error, :unsupported}
 
   defp executable(
          host_config,
          %{
-           "selection" => "explicit_pinned_override",
+           "selection_rule" => "explicit_pinned_override",
            "override_path" => path
          } = capture
        )
        when is_binary(path) and path != "" do
     cond do
       Path.type(path) == :absolute ->
-        {:ok, [path]}
+        executable_file(host_config, capture["path_env"], path)
 
       String.contains?(path, "/") or String.contains?(path, "\\") ->
         {:error, :relative_override}
@@ -467,24 +672,24 @@ defmodule Tightbeam.HarnessBinaryProvenance do
     end
   end
 
-  defp executable(host_config, %{"selection" => "system", "binary_name" => name} = capture) do
-    script = "command -v " <> Tightbeam.Harness.Support.shell_quote(name)
-
-    case resolve_on_host(host_config, capture["path_env"], ["sh", "-c", script]) do
-      {:ok, path} when path != "" -> {:ok, [path]}
-      {:ok, _} -> {:error, :not_found}
-      {:error, reason} -> {:error, reason}
-    end
-  end
-
   defp executable(
          host_config,
-         %{"selection" => "bundled_fallback", "bundle_probe_script" => script} = capture
+         %{"selection_rule" => "bundled_fallback", "bundle_probe_script" => script} = capture
        ) do
     node_bundle(host_config, capture, script)
   end
 
   defp executable(_host_config, _capture), do: {:error, :unsupported}
+
+  defp executable_file(host_config, path_env, path) do
+    command = "test -x " <> Tightbeam.Harness.Support.shell_quote(path)
+
+    case run_host(host_config, path_env, ["sh", "-c", command]) do
+      {:ok, _output} -> {:ok, [path]}
+      {:error, {:exit, _code, _output}} -> {:error, :not_found}
+      {:error, reason} -> {:error, reason}
+    end
+  end
 
   defp node_bundle(host_config, capture, script) do
     root = Path.join(capture["base_dir"], "adapters/node_modules")
@@ -492,6 +697,7 @@ defmodule Tightbeam.HarnessBinaryProvenance do
     case run_host(host_config, capture["path_env"], ["node", "-e", script, root]) do
       {:ok, path} when path != "" -> {:ok, ["node", String.trim(path)]}
       {:ok, _} -> {:error, :not_found}
+      {:error, {:exit, 2, _output}} -> {:error, :not_found}
       {:error, reason} -> {:error, reason}
     end
   end

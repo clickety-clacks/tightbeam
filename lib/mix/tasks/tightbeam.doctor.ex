@@ -692,7 +692,6 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
                    hosts,
                    org_binary_selection_overlays(base_dir),
                    launches,
-                   process_env: %{},
                    without_override_evidence?: true
                  ) do
               {:ok, report} -> report
