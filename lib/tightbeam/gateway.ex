@@ -4713,6 +4713,7 @@ defmodule Tightbeam.Gateway do
         params[:reason],
         source
       )
+      |> finish_oauth_recovery_wake(config, call, provider_atom(provider), machine, phase, kind)
       |> with_owner_user_id(phase, gateway_db(config), call.origin)
     else
       false ->
@@ -4924,6 +4925,103 @@ defmodule Tightbeam.Gateway do
 
   defp onboarding_source(_provider, _phase, _source),
     do: {:error, :unknown_credential_source}
+
+  defp finish_oauth_recovery_wake(
+         %{status: "onboarded"} = result,
+         config,
+         call,
+         provider,
+         machine,
+         "finish",
+         :subscription
+       )
+       when provider in [:openai, :anthropic] do
+    caller = onboarding_caller(gateway_db(config), call)
+
+    case schedule_oauth_recovery_wake(config, caller, provider, machine) do
+      :ok ->
+        result
+
+      {:error, reason} ->
+        # Credential installation already committed in finish_onboard/4; report
+        # wake scheduling failure as partial success instead of implying rollback.
+        %{
+          code: "credential_recovered_wake_failed",
+          message:
+            "#{provider} subscription credential on #{machine} recovered, but its Main " <>
+              "recovery wake could not be scheduled: #{describe_error(reason)}",
+          provider: provider,
+          host: machine,
+          credential_recovered: true,
+          wake_scheduled: false
+        }
+    end
+  end
+
+  defp finish_oauth_recovery_wake(result, _config, _call, _provider, _machine, _phase, _kind),
+    do: result
+
+  defp schedule_oauth_recovery_wake(
+         config,
+         %{owner_user_id: owner} = caller,
+         provider,
+         machine
+       )
+       when provider in [:openai, :anthropic] and is_binary(owner) and owner != "" do
+    creator_session_key =
+      case caller[:caller_session] do
+        %{session_key: session_key} when is_binary(session_key) -> session_key
+        _ -> nil
+      end
+
+    prompt =
+      "The OAuth token for #{provider} on #{machine} was refreshed. " <>
+        "Read the manifests for every installed or learned Kung Fu. " <>
+        "Read each manifest's declared main archetype. " <>
+        "Find live agents with those archetypes. " <>
+        "Notify each that the OAuth token was refreshed, and require each to inspect and " <>
+        "resume any stalled agent graph."
+
+    case DB.transaction(gateway_db(config), fn txn ->
+           Wakes.schedule_in_txn(txn, %{
+             session_key: Org.personal_session_key(owner),
+             origin: "process:tightbeam",
+             creator_session_key: creator_session_key,
+             prompt: prompt,
+             consumer: "prompt",
+             due_at: System.system_time(:millisecond),
+             # Keep this ordinary native traffic immediate. A class would enroll
+             # it in the organization's notice-batching policy.
+             target_gate: 1
+           })
+         end) do
+      {:ok, _wake} ->
+        Wakes.fire_due(Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler))
+        :ok
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp schedule_oauth_recovery_wake(_config, _caller, _provider, _machine),
+    do: {:error, :authenticated_operator_unavailable}
+
+  defp onboarding_caller(_db, %{principal: {:user, owner}})
+       when is_binary(owner) and owner != "",
+       do: %{owner_user_id: owner, caller_session: nil}
+
+  defp onboarding_caller(db, %{principal: {:session, _session_key}} = call),
+    do: principal_caller(db, call)
+
+  # Agent requests use the session principal fixed by Router authentication;
+  # re-resolving an origin role here could bind a different session. Process
+  # principals must not inherit an owner from a user-looking origin.
+  defp onboarding_caller(_db, %{principal: nil, origin: "user:" <> owner})
+       when owner != "",
+       do: %{owner_user_id: owner, caller_session: nil}
+
+  defp onboarding_caller(_db, _call), do: nil
 
   defp provider_atom("openai"), do: :openai
   defp provider_atom("anthropic"), do: :anthropic
