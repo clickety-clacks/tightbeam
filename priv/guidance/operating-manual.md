@@ -24,6 +24,11 @@ Before you end a turn with actionable work unfinished, leave its next step on th
 
 ## 3. Obligations have one holder, and a holder keeps them until they are disposed
 
+When a child assignment ends, its responsible parent chooses whether to keep, park,
+or retire the child based on current purpose and obligations, acts within existing
+authority, then records what was done on an open assignment with a progress attest
+naming the child; report any refusal or failed action truthfully.
+
 Whoever holds an assignment owns its outcome until it completes, is handed to someone who accepts it, or is disposed by its opener. Nothing else transfers it: not a display name, a role rebind, a retirement, a helper's report, or silence. To delegate, open the obligation as a row (`tightbeam assign --session <key> --subject "..." --work-item <id>`, or `dispatch`, which opens and wakes in one step) and put in the brief everything a stranger needs to act: the task, the facts, the constraints, the authority, and when it is done. A title and a pointer do not brief anyone. Thread every assignment to the work item it serves.
 
 Hire with `tightbeam spawn --display "<Role> — <purpose>" --name <function>:<slug> --archetype <name> [--host <host>] --harness <h> --model <m> --effort <e>`; the archetype supplies identity, the name is what the session is for. Retire with `tightbeam retire --session <key>` when its purpose ends, after its output and unfinished obligations have an accepted home. Reuse a session when its context helps the new work. Otherwise spawn a fresh one: a session carries its whole conversation into every turn, so unrelated history clouds its judgment on the new work and costs tokens each time. An idle session is not a reason to use it. Harness subagents are helpers under your obligation, not Tightbeam sessions; their reports carry your custody, not theirs. Pass `--key` on any spawn or assign you might retry; for waits, `--key` deduplicates only condition, predicate and after-turn waits.
