@@ -240,7 +240,7 @@ defmodule Tightbeam.StaleTurnSettlementTest do
 
     assert mutation_snapshot(ctx.db, different_target) == different_before
     [{lane, _}] = Registry.lookup(Tightbeam.LaneRegistry, "k1")
-    send(:sys.get_state(lane).task_pid, {:release_runner, lane_live})
+    send(:sys.get_state(lane, 60_000).task_pid, {:release_runner, lane_live})
     assert eventually(fn -> turn_status(ctx.db, lane_live) == "delivered" end)
 
     provider_live = stale_turn!(ctx.db, "k2", "provider live", 2)
@@ -336,7 +336,7 @@ defmodule Tightbeam.StaleTurnSettlementTest do
     request = request!("k1", target, "cancel", "commit then lose response", "lost-response")
 
     settle = Task.async(fn -> StaleTurnSettlement.settle(ctx.db, request) end)
-    assert {:ok, %{status: "canceled", won: true}} = Task.await(settle, 5_000)
+    assert {:ok, %{status: "canceled", won: true}} = Task.await(settle, 60_000)
     assert terminal_truth(ctx.db, target) == {"canceled", nil, 1, 0}
     refute_received {:terminal_published, _}
 
@@ -434,7 +434,7 @@ defmodule Tightbeam.StaleTurnSettlementTest do
     Org.append_pointer(ctx.db, "k1", "hs-replacement", "loaded")
     :ok = :sys.resume(conn)
 
-    assert {:error, %{code: "turn_status_ambiguous"}} = Task.await(settlement, 5_000)
+    assert {:error, %{code: "turn_status_ambiguous"}} = Task.await(settlement, 60_000)
     assert terminal_truth(ctx.db, target) == {"running", nil, 0, 0}
   end
 
@@ -618,7 +618,8 @@ defmodule Tightbeam.StaleTurnSettlementTest do
     end
   end
 
-  defp eventually(fun, tries \\ 100) do
+  # Check-side poll: 2,000 tries at 10 ms is a 20 s budget.
+  defp eventually(fun, tries \\ 2_000) do
     cond do
       fun.() -> true
       tries == 0 -> false

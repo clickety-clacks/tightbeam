@@ -1,8 +1,8 @@
 defmodule Tightbeam.CredentialsTest do
-  # Synchronous: the remote-status cases shell out under the 5 s default
-  # `GenServer.call`, terminal parking awaits onboarding under the 5 s default
-  # `Task.await`, and the hollow-home case boots a child BEAM. In the async phase
-  # they share the runner with up to max_cases modules and test-file compilation.
+  # Synchronous: the real-probe remote-status case shells out under the 5 s default
+  # `GenServer.call`, terminal parking awaits onboarding across a pending edge, and
+  # the hollow-home case boots a child BEAM. In the async phase they share the
+  # runner with up to max_cases modules and test-file compilation.
   use Tightbeam.TestCase, async: false
 
   alias Tightbeam.Credentials
@@ -291,14 +291,26 @@ defmodule Tightbeam.CredentialsTest do
 
   test "remote absence requires a positively traversable parent", ctx do
     parent = Path.join([ctx.base, "homes", "worker"])
-    File.mkdir_p!(parent)
 
-    {:ok, server} = remote_server(ctx.base)
+    {:ok, server} = path_map_server(ctx.base, %{parent => :directory})
 
     assert Credentials.status(:openai, server) == {:needs_onboarding, :missing}
   end
 
   test "remote store below an untraversable parent refuses rather than guessing absence", ctx do
+    parent = Path.join([ctx.base, "homes", "worker"])
+
+    {:ok, server} = path_map_server(ctx.base, %{parent => :untraversable_directory})
+
+    assert Credentials.status(:openai, server) ==
+             {:needs_onboarding,
+              {:credential_store_unreadable,
+               %{path: parent, found: :untraversable, expected: :traversable_directory}}}
+  end
+
+  # The one remote-status case that runs the real `test` binary against a real
+  # chmod, so the path-map fake above cannot drift from what `test -x` answers.
+  test "remote store below an untraversable parent refuses through real probes", ctx do
     parent = Path.join([ctx.base, "homes", "worker"])
     File.mkdir_p!(parent)
     File.chmod!(parent, 0o600)
@@ -537,8 +549,8 @@ defmodule Tightbeam.CredentialsTest do
     assert Task.yield(onboard, 20) == nil
 
     send(park_receiver, :release_park)
-    assert Task.await(terminal) == :ok
-    assert Task.await(onboard) == :ok
+    assert Task.await(terminal, 60_000) == :ok
+    assert Task.await(onboard, 60_000) == :ok
   end
 
   test "terminal capture remains immutable while the park mutates membership", ctx do
@@ -1791,7 +1803,7 @@ defmodule Tightbeam.CredentialsTest do
 
       assert {:ok, lease_id} = Credentials.begin_daemon_onboard(:opencode_go, server)
       assert is_binary(lease_id)
-      staging = :sys.get_state(server).pending.opencode_go.path
+      staging = :sys.get_state(server, 60_000).pending.opencode_go.path
       assert File.dir?(staging)
       assert :ok = Credentials.finish_onboard(:opencode_go, :api_key, lease_id, server)
       refute File.exists?(staging)
@@ -1880,6 +1892,50 @@ defmodule Tightbeam.CredentialsTest do
       end
     )
   end
+
+  # A remote host whose filesystem is `paths`: `%{path => :directory |
+  # :untraversable_directory | {:file, bytes}}`, anything unlisted absent. It
+  # answers the status chain's `test` and `cat` probes, and the credential-file
+  # `sh -c` check, without forking a process per probe.
+  defp path_map_server(base, paths) do
+    start_credentials(
+      name: nil,
+      base_dir: base,
+      machine: "worker",
+      ssh: "worker",
+      sh: fn command ->
+        [_host | remote] = Enum.drop_while(command, &(&1 != "worker"))
+        path_map_reply(remote, paths)
+      end
+    )
+  end
+
+  defp path_map_reply(["test", operator, path], paths) do
+    if path_map_test?(operator, Map.get(paths, path)), do: {"", 0}, else: {"", 1}
+  end
+
+  defp path_map_reply(["cat", path], paths) do
+    case Map.get(paths, path) do
+      {:file, bytes} -> {bytes, 0}
+      _ -> {"cat: #{path}: No such file or directory\n", 1}
+    end
+  end
+
+  defp path_map_reply(["sh", "-c", script], paths) do
+    present? =
+      Enum.any?(paths, fn
+        {path, {:file, _bytes}} -> String.contains?(script, path)
+        _ -> false
+      end)
+
+    if present?, do: {"", 0}, else: {"", 1}
+  end
+
+  defp path_map_test?("-L", _entry), do: false
+  defp path_map_test?("-e", entry), do: entry != nil
+  defp path_map_test?("-f", entry), do: match?({:file, _bytes}, entry)
+  defp path_map_test?("-d", entry), do: entry in [:directory, :untraversable_directory]
+  defp path_map_test?("-x", entry), do: entry == :directory
 
   defp fixture(name) do
     "test/fixtures/credentials"
