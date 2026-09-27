@@ -8,7 +8,7 @@ defmodule Tightbeam.TerminalCredentialFailure do
   `HarnessHealth`, whose normal-turn resolver must never clear this state.
   """
 
-  alias Tightbeam.{ConditionFacts, DB, EventLog, Id, Org, Projection}
+  alias Tightbeam.{ConditionFacts, Credentials, DB, EventLog, Id, Org, Projection}
   alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.Publisher
 
@@ -238,7 +238,9 @@ defmodule Tightbeam.TerminalCredentialFailure do
         incident_id = "tcf_" <> Id.uuid4()
         observation_id = "tcfo_" <> Id.uuid4()
         statement_id = "terminal-credential:" <> incident_id
-        watermark = credential_watermark(txn, host, provider)
+
+        watermark =
+          credential_watermark(txn, host, credential_fact_provider(harness, provider))
 
         fact =
           ConditionFacts.file_in_txn(txn, %{
@@ -390,10 +392,11 @@ defmodule Tightbeam.TerminalCredentialFailure do
         with [host, provider] <- String.split(scope, ":", parts: 2) do
           Txn.q(
             txn,
-            incident_select() <> " WHERE state='open' AND host=?1 AND provider=?2 ORDER BY id",
-            [host, provider]
+            incident_select() <> " WHERE state='open' AND host=?1 ORDER BY id",
+            [host]
           )
           |> Enum.map(&incident/1)
+          |> Enum.filter(&(credential_fact_provider(&1.harness, &1.provider) == provider))
           |> Enum.flat_map(&claim_incident_in_txn(txn, &1, fact_id))
         else
           _ -> []
@@ -437,7 +440,11 @@ defmodule Tightbeam.TerminalCredentialFailure do
                case Txn.q(
                       txn,
                       "SELECT MAX(id) FROM condition_facts WHERE kind='credential-present' AND scope=?1",
-                      [incident.host <> ":" <> incident.provider]
+                      [
+                        incident.host <>
+                          ":" <>
+                          credential_fact_provider(incident.harness, incident.provider)
+                      ]
                     ) do
                  [[fact_id]] when is_integer(fact_id) ->
                    claim_incident_in_txn(txn, incident, fact_id)
@@ -802,11 +809,38 @@ defmodule Tightbeam.TerminalCredentialFailure do
         hosts -> Enum.join(hosts, ", ")
       end
 
+    onboard = onboarding_command(harness, provider)
+
     "#{host} lost #{harness}: its #{provider} credential was rejected. Redirect destination: " <>
       "#{redirect_state}. #{host} needs a human " <>
-      "sign-in for #{harness}; run on #{host}: tightbeam onboard #{provider} --as-user " <>
-      "<adminUserId> (replace <adminUserId> with your own administrator id)."
+      "sign-in for #{harness}; run on #{host}: #{onboard} " <>
+      "(replace <adminUserId> with your own administrator id)."
   end
+
+  defp credential_fact_provider("pi", "opencode_go"), do: "opencode_go"
+  defp credential_fact_provider("pi", _named_local_provider), do: "local_openai"
+  defp credential_fact_provider(_harness, provider), do: provider
+
+  defp onboarding_command(harness, provider) do
+    command =
+      harness
+      |> onboarding_provider(provider)
+      |> Credentials.onboard_command()
+      |> String.replace("<userId>", "<adminUserId>")
+
+    if harness == "pi" and provider != "opencode_go" do
+      String.replace(command, "<provider-name>", provider)
+    else
+      command
+    end
+  end
+
+  defp onboarding_provider("pi", "opencode_go"), do: :opencode_go
+  defp onboarding_provider("pi", _named_local_provider), do: :local_openai
+  defp onboarding_provider(_harness, "openai"), do: :openai
+  defp onboarding_provider(_harness, "anthropic"), do: :anthropic
+  defp onboarding_provider(_harness, "cursor"), do: :cursor
+  defp onboarding_provider(_harness, "fixture_provider"), do: :fixture_provider
 
   defp reconcile_delivery_in_txn(txn, incident_id, user_id, now) do
     incident = get_in_txn(txn, incident_id)

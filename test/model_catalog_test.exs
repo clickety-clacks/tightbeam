@@ -115,11 +115,22 @@ defmodule Tightbeam.ModelCatalogTest do
       )
     end)
 
-    assert %{provider: "opencode_go"} =
+    assert %{id: incident_id, provider: "opencode_go"} =
              Tightbeam.TerminalCredentialFailure.get_open(ctx.db, @host, "pi")
+
+    assert Tightbeam.TerminalCredentialFailure.statement(ctx.db, incident_id) =~
+             "tightbeam onboard opencode-go --api-key --as-user <adminUserId>"
   end
 
   test "Pi terminal 401 records the failed named local provider key", ctx do
+    mode =
+      start_supervised!(%{
+        id: unique_name(:pi_named_local_recovery_mode),
+        start: {Agent, :start_link, [fn -> :terminal end]}
+      })
+
+    attempts = :counters.new(1, [])
+
     File.mkdir_p!(Tightbeam.LocalOpenAi.Providers.providers_dir(ctx.base_dir))
 
     File.write!(
@@ -135,7 +146,12 @@ defmodule Tightbeam.ModelCatalogTest do
       script = Enum.join(command, " ")
 
       if String.contains?(script, "spark.example/v1/models") do
-        catalog_reply(~s({"detail":"fixture rejected"}), 401)
+        :counters.add(attempts, 1, 1)
+
+        case Agent.get(mode, & &1) do
+          :terminal -> catalog_reply(~s({"detail":"fixture rejected"}), 401)
+          :recovered -> catalog_reply(~s({"data":[{"id":"qwen3.5-35b"}]}))
+        end
       else
         ctx.codex_sh.(command)
       end
@@ -158,8 +174,22 @@ defmodule Tightbeam.ModelCatalogTest do
       )
     end)
 
-    assert %{provider: "spark"} =
+    assert %{id: incident_id, provider: "spark"} =
              Tightbeam.TerminalCredentialFailure.get_open(ctx.db, @host, "pi")
+
+    assert Tightbeam.TerminalCredentialFailure.statement(ctx.db, incident_id) =~
+             "tightbeam onboard local-openai --endpoint <endpoint-url> --name spark --as-user <adminUserId>"
+
+    assert :counters.get(attempts, 1) == 1
+
+    fact_id = credential_fact(ctx.db, @host, :local_openai)
+    Agent.update(mode, fn _ -> :recovered end)
+    assert :ok = ModelCatalog.credential_transition(@host, :local_openai, fact_id, catalog)
+
+    await(fn -> match?({[_ | _], :fresh}, ModelCatalog.get(@host, "pi", catalog)) end)
+
+    assert :counters.get(attempts, 1) == 2
+    refute Tightbeam.TerminalCredentialFailure.open?(ctx.db, @host, "pi")
   end
 
   test "startup loads a durable terminal incident before the exact provider task", ctx do
