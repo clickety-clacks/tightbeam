@@ -7766,7 +7766,29 @@ defmodule Tightbeam.Gateway do
            code: "needs_onboarding",
            message: credential_remedy(reason, provider, machine)
          }}
+
+      {:unavailable, %{reason: reason}} ->
+        {:error,
+         %{
+           code: "credential_status_unavailable",
+           message: credential_status_unavailable_message(provider, machine, reason)
+         }}
     end
+  end
+
+  defp credential_status_unavailable_message(provider, host, reason) do
+    detail =
+      case reason do
+        :timeout -> "the host check timed out"
+        {:transport, _code} -> "the host transport failed"
+        :ssh_unavailable -> "SSH is unavailable"
+        :lifecycle_changed -> "the credential lifecycle changed during the check"
+        :lease_cleanup_failed -> "an expired onboarding lease could not be cleaned up"
+        _ -> "the host check failed"
+      end
+
+    "Credential status unavailable for #{provider} on #{host}: #{detail}; " <>
+      "credentials were not changed by this check. Retry shortly."
   end
 
   # Pi is one harness with independently banked providers. The selected live

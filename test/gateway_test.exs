@@ -3336,6 +3336,35 @@ defmodule Tightbeam.GatewayTest do
              })
   end
 
+  test "spawn reports an unavailable remote credential check without onboarding advice", ctx do
+    machine = "credential-worker-timeout"
+    base_dir = move_test_base(ctx.db, "credential-status-timeout", machine)
+
+    {:ok, _entry} =
+      Placement.register_host(ctx.db, machine, %{ssh: machine, base_dir: "/remote/tb"})
+
+    config =
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.put(:credential_status, fn :anthropic, ^machine ->
+        {:unavailable, %{host: machine, provider: :anthropic, reason: :timeout}}
+      end)
+
+    assert %{code: "placement_denied", message: message} =
+             Gateway.handlers(config)["spawn"].(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{
+                 display_name: "Slow credential host",
+                 host: machine,
+                 idempotency_key: "spawn-slow-credential-host"
+               }
+             })
+
+    assert message =~ "Credential status unavailable for anthropic on #{machine}"
+    assert message =~ "host check timed out"
+    refute message =~ "Run on #{machine}: tightbeam onboard"
+  end
+
   test "register-host supervises credentials and refuses spawn until onboarding", ctx do
     machine = "credential-worker-registration"
     base_dir = move_test_base(ctx.db, "credential-server-registration", machine)

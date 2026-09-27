@@ -47,6 +47,26 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
     assert Enum.all?(checks, & &1.ok)
   end
 
+  test "an unavailable credential status remains unknown in doctor", ctx do
+    detail = %{host: "local-test", provider: :anthropic, reason: :timeout}
+    {:ok, inventories} = ctx.catalog
+
+    catalog =
+      {:ok, Map.put(inventories, "claude", []),
+       %{"claude" => {:unavailable, {:credential_status_unavailable, detail}}}}
+
+    {_status, report} = Doctor.evaluate(catalog, ctx.inputs)
+    auth = find(report, "harness_auth:claude")
+    model = find(report, "default_model")
+
+    assert auth.unverifiable
+    assert auth.detail =~ "credential status on local-test is unavailable"
+    assert auth.fix =~ "do not re-onboard"
+    refute auth.detail =~ "dead_sign_in"
+    assert model.unverifiable
+    assert model.detail =~ "liveness is UNKNOWN"
+  end
+
   # The ENTRY decides whether an effort is required. Rejecting `nil` out of hand
   # failed a perfectly valid default on an untiered model — a false readiness
   # verdict on a selection the gateway and the catalog both accept.

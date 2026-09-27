@@ -30,12 +30,17 @@ defmodule Tightbeam.Credentials do
   alias Tightbeam.CommandEdge.CredentialPark
 
   @ssh_opts ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
+  @status_budget_ms 5_000
+  @status_cleanup_ms 500
   @fixture_provider? Application.compile_env(:tightbeam, :fixture_harness, false)
 
   @type provider ::
           :openai | :anthropic | :cursor | :opencode_go | :local_openai | :fixture_provider
   @type kind :: :api_key | :subscription
-  @type status :: :onboarded | {:needs_onboarding, term()}
+  @type status ::
+          :onboarded
+          | {:needs_onboarding, term()}
+          | {:unavailable, %{host: String.t(), provider: provider(), reason: term()}}
 
   @doc "Start one lifecycle owner for this machine."
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -61,8 +66,22 @@ defmodule Tightbeam.Credentials do
 
   @doc "Read lifecycle and canonical credential health without refreshing."
   @spec status(provider(), GenServer.server()) :: status()
-  def status(provider, server \\ __MODULE__),
-    do: GenServer.call(server, {:status, provider})
+  def status(provider, server \\ __MODULE__) do
+    deadline = System.monotonic_time(:millisecond) + @status_budget_ms
+
+    try do
+      GenServer.call(server, {:status, provider, deadline}, @status_budget_ms)
+    catch
+      :exit, {:timeout, _} ->
+        unavailable(status_host(server), provider, :timeout)
+    end
+  end
+
+  defp status_host({:global, {__MODULE__, machine}}), do: machine
+  defp status_host(_server), do: Tightbeam.Placement.local_host_name()
+
+  defp unavailable(host, provider, reason),
+    do: {:unavailable, %{host: host, provider: provider, reason: reason}}
 
   @doc """
   The KIND of credential this machine holds for a provider, or `:none`.
@@ -468,6 +487,7 @@ defmodule Tightbeam.Credentials do
        ssh: Keyword.get(opts, :ssh),
        ssh_bin: Keyword.get(opts, :ssh_bin, System.find_executable("ssh")),
        sh: Keyword.get(opts, :sh, &system_cmd/1),
+       status_default_sh: not Keyword.has_key?(opts, :sh),
        sh_out:
          Keyword.get_lazy(opts, :sh_out, fn ->
            if Keyword.has_key?(opts, :sh),
@@ -494,14 +514,53 @@ defmodule Tightbeam.Credentials do
          Keyword.get(opts, :publish_sessions, fn _payload, _transition -> :ok end),
        onboarding_lease_ms: Keyword.get(opts, :onboarding_lease_ms, 1_800_000),
        present_but_unverified: %{},
-       pending: %{}
+       pending: %{},
+       status_reads: %{}
      }}
   end
 
   @impl true
-  def handle_call({:status, provider}, _from, state) do
-    state = expire_lease(state, provider)
-    {:reply, credential_status(state, provider), state}
+  def handle_call({:status, provider, deadline}, from, state) do
+    case expire_status_lease(state, provider, deadline) do
+      {:unavailable, reason} ->
+        {:reply, unavailable(state.machine, provider, reason), state}
+
+      state ->
+        if System.monotonic_time(:millisecond) >= deadline - @status_cleanup_ms do
+          {:reply, unavailable(state.machine, provider, :timeout), state}
+        else
+          owner = self()
+          ref = make_ref()
+          worker_deadline = deadline - @status_cleanup_ms
+          snapshot = state
+
+          pid =
+            spawn(fn ->
+              result = status_read(snapshot, provider, worker_deadline)
+              send(owner, {:status_result, ref, result})
+            end)
+
+          monitor = Process.monitor(pid)
+
+          timer =
+            Process.send_after(
+              self(),
+              {:status_deadline, ref},
+              max(worker_deadline - System.monotonic_time(:millisecond), 0)
+            )
+
+          read = %{
+            from: from,
+            provider: provider,
+            pid: pid,
+            monitor: monitor,
+            timer: timer,
+            deadline: worker_deadline
+          }
+
+          {:noreply, put_in(state.status_reads[ref], read)}
+        end
+    end
   end
 
   def handle_call({:kind, provider}, _from, state) do
@@ -509,6 +568,11 @@ defmodule Tightbeam.Credentials do
   end
 
   def handle_call({:mark_terminal, provider, evidence}, from, state) do
+    state =
+      if terminal_evidence?(provider, evidence),
+        do: cancel_status_reads(state, provider),
+        else: state
+
     cond do
       not terminal_evidence?(provider, evidence) ->
         {:reply, :ok, state}
@@ -573,7 +637,7 @@ defmodule Tightbeam.Credentials do
   end
 
   def handle_call({:onboard, provider}, _from, state) do
-    perform_onboard(provider, state)
+    perform_onboard(provider, cancel_status_reads(state, provider))
   end
 
   def handle_call(
@@ -586,7 +650,7 @@ defmodule Tightbeam.Credentials do
   end
 
   def handle_call({:begin_onboard, provider}, _from, state) do
-    state = expire_lease(state, provider)
+    state = state |> cancel_status_reads(provider) |> expire_lease(provider)
     {previous, pending} = Map.pop(state.pending, provider)
     state = %{state | pending: pending}
 
@@ -619,7 +683,7 @@ defmodule Tightbeam.Credentials do
   end
 
   def handle_call({:begin_daemon_onboard, provider}, _from, state) do
-    state = expire_lease(state, provider)
+    state = state |> cancel_status_reads(provider) |> expire_lease(provider)
     {previous, pending} = Map.pop(state.pending, provider)
     state = %{state | pending: pending}
 
@@ -656,7 +720,7 @@ defmodule Tightbeam.Credentials do
   end
 
   def handle_call({:finish_onboard, provider, kind, lease_id}, _from, state) do
-    state = expire_lease(state, provider)
+    state = state |> cancel_status_reads(provider) |> expire_lease(provider)
 
     case Map.fetch(state.pending, provider) do
       {:ok, %{id: ^lease_id, path: path}} ->
@@ -680,6 +744,8 @@ defmodule Tightbeam.Credentials do
   end
 
   def handle_call({:cancel_onboard, provider, lease_id, reason}, _from, state) do
+    state = cancel_status_reads(state, provider)
+
     case Map.fetch(state.pending, provider) do
       {:ok, %{id: ^lease_id, path: path}} ->
         cleanup_staging!(state, path)
@@ -692,7 +758,61 @@ defmodule Tightbeam.Credentials do
   end
 
   @impl true
+  def handle_info({:status_result, ref, result}, state) do
+    case Map.pop(state.status_reads, ref) do
+      {nil, _reads} ->
+        {:noreply, state}
+
+      {read, reads} ->
+        Process.cancel_timer(read.timer)
+        Process.demonitor(read.monitor, [:flush])
+
+        answer =
+          if System.monotonic_time(:millisecond) < read.deadline,
+            do: result,
+            else: unavailable(state.machine, read.provider, :timeout)
+
+        GenServer.reply(read.from, answer)
+        {:noreply, %{state | status_reads: reads}}
+    end
+  end
+
+  def handle_info({:status_deadline, ref}, state) do
+    case Map.pop(state.status_reads, ref) do
+      {nil, _reads} ->
+        {:noreply, state}
+
+      {read, reads} ->
+        cancel_status_worker(read.pid)
+        Process.demonitor(read.monitor, [:flush])
+        GenServer.reply(read.from, unavailable(state.machine, read.provider, :timeout))
+        {:noreply, %{state | status_reads: reads}}
+    end
+  end
+
+  def handle_info({:DOWN, monitor, :process, _pid, reason} = message, state) do
+    case Enum.find(state.status_reads, fn {_ref, read} -> read.monitor == monitor end) do
+      nil ->
+        handle_park_info(message, state)
+
+      {ref, read} ->
+        Process.cancel_timer(read.timer)
+
+        GenServer.reply(
+          read.from,
+          unavailable(state.machine, read.provider, {:probe_failed, reason})
+        )
+
+        {:noreply, update_in(state.status_reads, &Map.delete(&1, ref))}
+    end
+  end
+
+  @impl true
   def handle_info(message, state) when map_size(state.park_pending) > 0 do
+    handle_park_info(message, state)
+  end
+
+  defp handle_park_info(message, state) when map_size(state.park_pending) > 0 do
     case CommandEdge.check_response(message, state.park_requests) do
       {:answered, provider, result, park_requests} ->
         finish_park(provider, result, %{state | park_requests: park_requests})
@@ -708,6 +828,89 @@ defmodule Tightbeam.Credentials do
 
       :no_reply ->
         {:noreply, state}
+    end
+  end
+
+  defp handle_park_info(_message, state), do: {:noreply, state}
+
+  defp status_read(state, provider, deadline) do
+    if state.ssh != nil and (not is_binary(state.ssh_bin) or state.ssh_bin == "") do
+      unavailable(state.machine, provider, :ssh_unavailable)
+    else
+      sh = state.sh
+
+      state =
+        %{
+          state
+          | sh: fn argv ->
+              result =
+                if state.status_default_sh,
+                  do: status_command(argv, deadline),
+                  else: sh.(argv)
+
+              case result do
+                {_output, 255} -> throw({:status_transport, 255})
+                other -> other
+              end
+            end
+        }
+
+      try do
+        credential_status(state, provider)
+      rescue
+        _ -> unavailable(state.machine, provider, :probe_failed)
+      catch
+        {:status_transport, code} -> unavailable(state.machine, provider, {:transport, code})
+        :status_timeout -> unavailable(state.machine, provider, :timeout)
+        _kind, _reason -> unavailable(state.machine, provider, :probe_failed)
+      end
+    end
+  end
+
+  defp status_command([binary | args], deadline) do
+    port =
+      Port.open(
+        {:spawn_executable, binary},
+        [:binary, :exit_status, :stderr_to_stdout, args: args]
+      )
+
+    try do
+      status_command_result(port, deadline, [])
+    catch
+      kind, reason ->
+        kill_status_port(port)
+        :erlang.raise(kind, reason, __STACKTRACE__)
+    after
+      if Port.info(port) != nil, do: Port.close(port)
+    end
+  end
+
+  defp kill_status_port(port) do
+    case Port.info(port, :os_pid) do
+      {:os_pid, pid} ->
+        _ = System.cmd("/bin/kill", ["-KILL", Integer.to_string(pid)], stderr_to_stdout: true)
+        :ok
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp status_command_result(port, deadline, output) do
+    remaining = deadline - System.monotonic_time(:millisecond)
+    if remaining <= 0, do: throw(:status_timeout)
+
+    receive do
+      {^port, {:data, bytes}} ->
+        status_command_result(port, deadline, [bytes | output])
+
+      {^port, {:exit_status, code}} ->
+        {output |> Enum.reverse() |> IO.iodata_to_binary(), code}
+
+      :cancel_status ->
+        throw(:status_cancelled)
+    after
+      remaining -> throw(:status_timeout)
     end
   end
 
@@ -768,6 +971,7 @@ defmodule Tightbeam.Credentials do
   end
 
   defp finish_park(provider, result, state) do
+    state = cancel_status_reads(state, provider)
     pending = Map.fetch!(state.park_pending, provider)
 
     result =
@@ -852,6 +1056,79 @@ defmodule Tightbeam.Credentials do
     else
       _ -> state
     end
+  end
+
+  defp expired_lease?(state, provider) do
+    case Map.get(state.pending, provider) do
+      %{expires_at: expires_at} -> expires_at <= state.now.()
+      _ -> false
+    end
+  end
+
+  defp expire_status_lease(state, provider, deadline) do
+    if expired_lease?(state, provider) do
+      state = cancel_status_reads(state, provider)
+
+      if state.ssh == nil do
+        expire_lease(state, provider)
+      else
+        sh = state.sh
+
+        bounded = %{
+          state
+          | sh: fn argv ->
+              result =
+                if state.status_default_sh,
+                  do: status_command(argv, deadline - @status_cleanup_ms),
+                  else: sh.(argv)
+
+              case result do
+                {_output, 255} -> throw({:status_transport, 255})
+                other -> other
+              end
+            end
+        }
+
+        try do
+          %{expire_lease(bounded, provider) | sh: sh}
+        rescue
+          _ -> {:unavailable, :lease_cleanup_failed}
+        catch
+          {:status_transport, code} -> {:unavailable, {:transport, code}}
+          :status_timeout -> {:unavailable, :timeout}
+          _kind, _reason -> {:unavailable, :lease_cleanup_failed}
+        end
+      end
+    else
+      state
+    end
+  end
+
+  defp cancel_status_reads(state, provider) do
+    reads =
+      Enum.reduce(state.status_reads, %{}, fn {ref, read}, remaining ->
+        if read.provider == provider do
+          Process.cancel_timer(read.timer)
+          cancel_status_worker(read.pid)
+          Process.demonitor(read.monitor, [:flush])
+
+          GenServer.reply(
+            read.from,
+            unavailable(state.machine, read.provider, :lifecycle_changed)
+          )
+
+          remaining
+        else
+          Map.put(remaining, ref, read)
+        end
+      end)
+
+    %{state | status_reads: reads}
+  end
+
+  defp cancel_status_worker(pid) do
+    send(pid, :cancel_status)
+    {:ok, _timer} = :timer.apply_after(250, Process, :exit, [pid, :kill])
   end
 
   defp record_onboarding_failure!(state, provider, :unsupported_no_subscription) do

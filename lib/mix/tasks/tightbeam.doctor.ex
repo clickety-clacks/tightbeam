@@ -260,9 +260,8 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
       unverifiable_credential?(reason) ->
         unverifiable(
           "default_model",
-          "not verified here: #{harness} inventory is empty because the credential " <>
-            "server is unreachable from a bare mix task, so #{Model.describe(model)} " <>
-            "liveness is UNKNOWN",
+          "not verified here: #{harness} credential status is unavailable, so " <>
+            "#{Model.describe(model)} liveness is UNKNOWN",
           "Not a model verdict — do not repoint TIGHTBEAM_DEFAULT_MODEL on the " <>
             "strength of this row. Check the running gateway's catalog."
         )
@@ -361,6 +360,7 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
   # EXIT CODE now, so a renamed atom must break the match loudly instead of
   # sliding past a substring test.
   defp unverifiable_credential?({:unavailable, reason}), do: unverifiable_credential?(reason)
+  defp unverifiable_credential?({:credential_status_unavailable, _detail}), do: true
   defp unverifiable_credential?({:needs_onboarding, reason}), do: unverifiable_credential?(reason)
   defp unverifiable_credential?(:credential_server_unavailable), do: true
   defp unverifiable_credential?(_reason), do: false
@@ -371,6 +371,10 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
         module = Tightbeam.Harness.parse!(harness)
 
         missing_credential_message(module.credential_provider(), harness, host, base_dir)
+
+      match?({:unavailable, {:credential_status_unavailable, _}}, reason) ->
+        "not verified here: #{harness} credential status on #{host} is unavailable; " <>
+          "no credential health was established"
 
       unverifiable_credential?(reason) ->
         "not verified here: the credential server does not run inside a bare mix " <>
@@ -389,6 +393,9 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
     cond do
       missing_credential?(reason) ->
         onboard_command(Tightbeam.Harness.parse!(harness).credential_provider(), host)
+
+      match?({:unavailable, {:credential_status_unavailable, _}}, reason) ->
+        "Retry the host check; do not re-onboard from this result."
 
       unverifiable_credential?(reason) ->
         "Not a credential verdict — do not re-onboard on the strength of this row. " <>

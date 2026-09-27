@@ -308,6 +308,199 @@ defmodule Tightbeam.CredentialsTest do
                %{path: parent, found: :untraversable, expected: :traversable_directory}}}
   end
 
+  test "a blocked remote status returns unavailable while its owner remains responsive", ctx do
+    parent = self()
+
+    {:ok, server} =
+      start_credentials(
+        name: nil,
+        base_dir: ctx.base,
+        machine: "worker",
+        ssh: "worker",
+        sh: fn _command ->
+          send(parent, {:status_probe_started, self()})
+          receive do: (:release_status_probe -> {"", 1})
+        end
+      )
+
+    caller = Task.async(fn -> Credentials.status(:openai, server) end)
+    assert_receive {:status_probe_started, worker}
+    monitor = Process.monitor(worker)
+    assert map_size(:sys.get_state(server).status_reads) == 1
+
+    assert {:unavailable, %{host: "worker", provider: :openai, reason: :timeout}} =
+             Task.await(caller, 6_000)
+
+    assert_receive {:DOWN, ^monitor, :process, ^worker, _reason}, 1_000
+    assert :sys.get_state(server).status_reads == %{}
+  end
+
+  test "sequential remote probes share one status deadline", ctx do
+    parent = self()
+
+    {:ok, server} =
+      start_credentials(
+        name: nil,
+        base_dir: ctx.base,
+        machine: "worker",
+        ssh: "worker",
+        sh: fn command ->
+          send(parent, {:status_command, self(), command})
+          receive do: ({:status_command_result, result} -> result)
+        end
+      )
+
+    caller = Task.async(fn -> Credentials.status(:openai, server) end)
+
+    for _ <- 1..3 do
+      assert_receive {:status_command, worker, _command}
+      send(worker, {:status_command_result, {"", 1}})
+    end
+
+    assert_receive {:status_command, stalled_worker, _command}
+    monitor = Process.monitor(stalled_worker)
+
+    assert {:unavailable, %{reason: :timeout}} = Task.await(caller, 6_000)
+    assert_receive {:DOWN, ^monitor, :process, ^stalled_worker, _reason}, 1_000
+    refute_receive {:status_command, _, _}
+  end
+
+  test "queueing behind a lifecycle call cannot start an expired status read", ctx do
+    parent = self()
+    machine = "status-queue-#{System.unique_integer([:positive])}"
+    server_name = {:global, {Credentials, machine}}
+
+    {:ok, server} =
+      start_credentials(
+        name: server_name,
+        base_dir: ctx.base,
+        machine: machine,
+        gate: fn _provider ->
+          send(parent, {:gate_entered, self()})
+          receive do: (:release_gate -> :ok)
+        end
+      )
+
+    lifecycle = Task.async(fn -> Credentials.begin_onboard(:openai, server_name) end)
+    assert_receive {:gate_entered, ^server}
+
+    caller = Task.async(fn -> Credentials.status(:openai, server_name) end)
+
+    assert {:unavailable, %{host: ^machine, provider: :openai, reason: :timeout}} =
+             Task.await(caller, 6_000)
+
+    send(server, :release_gate)
+    assert {:ok, _staging, _lease_id} = Task.await(lifecycle, 1_000)
+    assert :sys.get_state(server).status_reads == %{}
+  end
+
+  test "remote transport refusal is unknown rather than missing", ctx do
+    {:ok, server} =
+      start_credentials(
+        name: nil,
+        base_dir: ctx.base,
+        machine: "worker",
+        ssh: "worker",
+        sh: fn _command -> {"connection closed", 255} end
+      )
+
+    assert Credentials.status(:openai, server) ==
+             {:unavailable, %{host: "worker", provider: :openai, reason: {:transport, 255}}}
+  end
+
+  test "an expired remote lease is cleaned at the status read seam", ctx do
+    clock = :counters.new(1, [])
+    :counters.put(clock, 1, 1_000)
+    File.mkdir_p!(Path.join([ctx.base, "homes", "worker"]))
+
+    {:ok, server} =
+      start_credentials(
+        name: nil,
+        base_dir: ctx.base,
+        machine: "worker",
+        ssh: "worker",
+        sh: &run_remote_command/1,
+        onboarding_lease_ms: 60_000,
+        now: fn -> :counters.get(clock, 1) end
+      )
+
+    assert {:ok, staging, _lease_id} = Credentials.begin_onboard(:openai, server)
+    assert Credentials.status(:openai, server) == {:needs_onboarding, :in_progress}
+
+    :counters.add(clock, 1, 61)
+
+    assert Credentials.status(:openai, server) == {:needs_onboarding, :missing}
+    refute File.exists?(staging)
+    assert :sys.get_state(server).pending == %{}
+  end
+
+  test "a lifecycle mutation cancels a remote status and ignores its late answer", ctx do
+    parent = self()
+    calls = :atomics.new(1, [])
+
+    {:ok, server} =
+      start_credentials(
+        name: nil,
+        base_dir: ctx.base,
+        machine: "worker",
+        ssh: "worker",
+        sh: fn command ->
+          if :atomics.add_get(calls, 1, 1) == 1 do
+            send(parent, {:status_probe_started, self()})
+            receive do: (:release_status_probe -> {"", 0})
+          else
+            run_remote_command(command)
+          end
+        end
+      )
+
+    caller = Task.async(fn -> Credentials.status(:openai, server) end)
+    assert_receive {:status_probe_started, worker}
+    monitor = Process.monitor(worker)
+    [{ref, _read}] = Map.to_list(:sys.get_state(server).status_reads)
+
+    assert {:ok, _staging, _lease_id} = Credentials.begin_onboard(:openai, server)
+    assert {:unavailable, %{reason: :lifecycle_changed}} = Task.await(caller, 1_000)
+    assert_receive {:DOWN, ^monitor, :process, ^worker, _reason}, 1_000
+
+    send(server, {:status_result, ref, :onboarded})
+    assert Credentials.status(:openai, server) == {:needs_onboarding, :in_progress}
+  end
+
+  test "a connected but stalled remote command is bounded and its owned port closes", ctx do
+    script = Path.join(ctx.base, "synthetic-ssh")
+    fifo = Path.join(ctx.base, "stalled-command")
+    marker = Path.join(ctx.base, "command-pid")
+    File.mkdir_p!(ctx.base)
+    {"", 0} = System.cmd("mkfifo", [fifo])
+    File.write!(script, "#!/bin/sh\nprintf '%s' \"$$\" > '#{marker}'\nread line < '#{fifo}'\n")
+    File.chmod!(script, 0o700)
+
+    {:ok, server} =
+      Credentials.start_link(
+        name: nil,
+        base_dir: ctx.base,
+        machine: "worker",
+        ssh: "worker",
+        ssh_bin: script
+      )
+
+    caller = Task.async(fn -> Credentials.status(:openai, server) end)
+    read = await_status_read(server)
+    monitor = Process.monitor(read.pid)
+
+    assert {:unavailable, %{host: "worker", provider: :openai, reason: :timeout}} =
+             Task.await(caller, 6_000)
+
+    assert_receive {:DOWN, ^monitor, :process, _, _reason}, 1_000
+
+    assert File.exists?(marker)
+    pid = File.read!(marker)
+    assert {_, code} = System.cmd("kill", ["-0", pid], stderr_to_stdout: true)
+    assert code != 0
+    assert :sys.get_state(server).status_reads == %{}
+  end
+
   test "Codex credential is never written while stop cannot confirm runtime exit", ctx do
     store = Path.join([ctx.base, "homes", "eezo", "codex", "auth.json"])
     File.mkdir_p!(Path.dirname(store))
@@ -1875,6 +2068,15 @@ defmodule Tightbeam.CredentialsTest do
         System.cmd(executable, args, stderr_to_stdout: true)
       end
     )
+  end
+
+  defp await_status_read(server) do
+    Enum.reduce_while(1..1_000, nil, fn _, _ ->
+      case Map.values(:sys.get_state(server).status_reads) do
+        [read] -> {:halt, read}
+        _ -> {:cont, nil}
+      end
+    end) || flunk("status read did not start")
   end
 
   defp fixture(name) do

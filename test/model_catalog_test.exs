@@ -87,6 +87,28 @@ defmodule Tightbeam.ModelCatalogTest do
     refute Enum.any?(claude ++ codex, &(&1.context != nil))
   end
 
+  test "an unavailable credential status never becomes missing or a fresh catalog", ctx do
+    detail = %{host: @host, provider: :anthropic, reason: :timeout}
+
+    catalog =
+      start_catalog(ctx,
+        credential_status: fn
+          :anthropic -> {:unavailable, detail}
+          _provider -> :onboarded
+        end
+      )
+
+    await(fn ->
+      match?(
+        {[], {:unavailable, {:credential_status_unavailable, ^detail}}},
+        ModelCatalog.get(@host, "claude", catalog)
+      )
+    end)
+
+    assert {[], {:unavailable, {:credential_status_unavailable, ^detail}}} =
+             ModelCatalog.get(@host, "claude", catalog)
+  end
+
   test "Pi terminal 401 records the failed opencode-go provider key", ctx do
     sh = fn command ->
       script = Enum.join(command, " ")
