@@ -56,9 +56,22 @@ defmodule Tightbeam.PiProvider do
         |> Map.merge(local_errors)
 
       case map_size(errors) do
-        0 -> {:error, {:no_pi_catalog, %{}}}
-        1 -> {:error, errors |> Map.values() |> hd()}
-        _ -> {:error, {:no_pi_catalog, errors}}
+        0 ->
+          {:error, {:no_pi_catalog, %{}}}
+
+        1 ->
+          [{provider, reason}] = Map.to_list(errors)
+
+          case reason do
+            :malformed_catalog ->
+              {:error, {:pi_catalog_provider_failed, provider, reason}}
+
+            _ ->
+              {:error, reason}
+          end
+
+        _ ->
+          {:error, {:no_pi_catalog, errors}}
       end
     else
       {:ok, Enum.sort_by(entries, & &1.family)}
