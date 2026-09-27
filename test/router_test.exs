@@ -1971,6 +1971,7 @@ defmodule Tightbeam.Wire.RouterTest do
     Org.create(ctx.db, %{
       session_key: main_key,
       display_name: "Main",
+      kind: "main",
       owner_user_id: "mike",
       origin: "user:mike",
       archetype: "default",
@@ -2595,7 +2596,14 @@ defmodule Tightbeam.Wire.RouterTest do
        ctx do
     holder = create_session(ctx.db, "holder-token", "flynn")
     sibling = create_session(ctx.db, "sibling-token", "mike")
-    main = create_session(ctx.db, "main-token", "flynn", is_built_in: true, kind: "main")
+
+    main =
+      create_session(ctx.db, Org.personal_session_key("flynn"), "flynn",
+        is_built_in: true,
+        kind: "main"
+      )
+
+    main_key = main.session_key
     roleless = create_session(ctx.db, "roleless-token", "flynn")
     several = create_session(ctx.db, "several-token", "flynn")
 
@@ -2703,11 +2711,11 @@ defmodule Tightbeam.Wire.RouterTest do
            end)
 
     assert dispatch_cli(ctx, main.cli_token, %{verb: "inspect"}).status == 200
-    assert_receive {:call, %{origin: "user:flynn", principal: {:session, "main-token"}}}
+    assert_receive {:call, %{origin: "user:flynn", principal: {:session, ^main_key}}}
 
     Roles.create!(ctx.db, "main-role", "flynn", main.session_key)
     assert dispatch_cli(ctx, main.cli_token, %{verb: "inspect"}).status == 200
-    assert_receive {:call, %{origin: "agent:main-role", principal: {:session, "main-token"}}}
+    assert_receive {:call, %{origin: "agent:main-role", principal: {:session, ^main_key}}}
 
     assert dispatch_cli(ctx, "tbc_test", %{verb: "inspect", asUser: "flynn"}).status == 200
 
@@ -2766,7 +2774,7 @@ defmodule Tightbeam.Wire.RouterTest do
     {:ok, principals} = DB.query(ctx.db, "SELECT principal FROM events ORDER BY id")
 
     assert ["session:holder-token"] in principals
-    assert ["session:main-token"] in principals
+    assert ["session:#{main_key}"] in principals
     assert ["user:flynn"] in principals
     assert ["process:cron"] in principals
     assert [nil] in principals
@@ -3277,7 +3285,12 @@ defmodule Tightbeam.Wire.RouterTest do
       provider: "anthropic",
       model: Model.new("fable"),
       is_built_in: Keyword.get(extra, :is_built_in, false),
-      kind: Keyword.get(extra, :kind, "custom")
+      kind:
+        Keyword.get(
+          extra,
+          :kind,
+          if(key == Org.personal_session_key(owner), do: "main", else: "custom")
+        )
     })
   end
 end

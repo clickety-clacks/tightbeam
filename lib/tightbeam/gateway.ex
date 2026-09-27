@@ -2835,6 +2835,7 @@ defmodule Tightbeam.Gateway do
         :origin,
         :spawned_by,
         :current_parent,
+        :topology_parent,
         :state,
         :created_at
       ])

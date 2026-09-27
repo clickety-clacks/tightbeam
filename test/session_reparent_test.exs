@@ -76,6 +76,12 @@ defmodule Tightbeam.SessionReparentTest do
              )
 
     origin = rows(db, "SELECT * FROM sessions ORDER BY sessionKey")
+
+    updated_at_index =
+      rows(db, "PRAGMA table_info(sessions)")
+      |> Enum.find_index(fn [_cid, name | _] -> name == "updatedAt" end)
+
+    before_version = Org.get(db, "child").updated_at
     before_tree = tree(db)
     before_role = Roles.resolve(db, "worker:synthetic")
     handlers = Gateway.handlers(%{db: db})
@@ -92,7 +98,25 @@ defmodule Tightbeam.SessionReparentTest do
     assert result["assignment"]["currentCoordinationParentRef"] == "session:" <> ctx.parent
     assert Org.get(db, "child").spawned_by == nil
     assert Org.get(db, "child").current_parent == ctx.parent
-    assert rows(db, "SELECT * FROM sessions ORDER BY sessionKey") == origin
+    assert Org.topology_parent(db, "child") == ctx.parent
+    assert Org.get(db, "child").topology_parent == ctx.parent
+
+    assert db
+           |> Tightbeam.StateResources.query_session("child")
+           |> Tightbeam.StateResources.session()
+           |> Map.fetch!("topologyParent") == ctx.parent
+
+    corrected = Org.get(db, "child")
+    assert corrected.updated_at > before_version
+
+    expected =
+      Enum.map(origin, fn row ->
+        if hd(row) == "child",
+          do: List.replace_at(row, updated_at_index, corrected.updated_at),
+          else: row
+      end)
+
+    assert rows(db, "SELECT * FROM sessions ORDER BY sessionKey") == expected
     assert rows(db, "SELECT * FROM assignments") == assignment
     assert Roles.resolve(db, "worker:synthetic") == before_role
 
@@ -443,6 +467,45 @@ defmodule Tightbeam.SessionReparentTest do
     assert count(ctx.db, "session_reparent_events") == 1
   end
 
+  test "reparent publishes one committed version and replay or refusal publishes none", ctx do
+    alias Tightbeam.Firehose.Hub
+    start_supervised!({Hub, name: Hub})
+
+    :ok =
+      Hub.register(Hub, self(), %{
+        mode: :subscribed,
+        db: ctx.db,
+        user_id: "owner",
+        is_admin: false
+      })
+
+    :ok =
+      Hub.subscribe(Hub, self(), "reparent", %{"classes" => ["session."], "sessionKey" => "child"})
+
+    before = Org.get(ctx.db, "child")
+
+    assert {:error, %RuntimeError{}} =
+             DB.transaction(ctx.db, fn txn ->
+               SessionReparent.apply_in_txn(txn, "owner", ctx.params)
+               raise "synthetic rollback"
+             end)
+
+    assert Org.get(ctx.db, "child").updated_at == before.updated_at
+    refute_receive {:firehose_notice, _}, 50
+
+    result = SessionReparent.handle(ctx.db, call(ctx.params))
+    assert_receive {:firehose_notice, %{"class" => "session.updated", "payload" => payload}}
+    assert payload["rowVersion"] > before.updated_at
+    assert payload == Tightbeam.StateResources.session(Org.get(ctx.db, "child"))
+    assert SessionReparent.handle(ctx.db, call(ctx.params)) == result
+
+    assert %{code: "no_change"} =
+             SessionReparent.handle(ctx.db, call(%{ctx.params | idempotency_key: "duplicate"}))
+
+    assert Org.get(ctx.db, "child").updated_at == payload["rowVersion"]
+    refute_receive {:firehose_notice, _}, 50
+  end
+
   test "faults before each write and before commit roll back the complete correction", ctx do
     for point <- [:event, :idempotency, :commit] do
       result =
@@ -502,9 +565,26 @@ defmodule Tightbeam.SessionReparentTest do
              """)
 
     before = snapshot(ctx.db)
+    before_version = Org.get(ctx.db, "child").updated_at
+
+    updated_at_index =
+      rows(ctx.db, "PRAGMA table_info(sessions)")
+      |> Enum.find_index(fn [_cid, name | _] -> name == "updatedAt" end)
+
     result = SessionReparent.handle(ctx.db, call(ctx.params))
     assert is_binary(result["eventId"])
-    assert snapshot(ctx.db) == before
+
+    corrected = Org.get(ctx.db, "child")
+    assert corrected.updated_at > before_version
+
+    expected_sessions =
+      Enum.map(before["sessions"], fn row ->
+        if hd(row) == "child",
+          do: List.replace_at(row, updated_at_index, corrected.updated_at),
+          else: row
+      end)
+
+    assert snapshot(ctx.db) == %{before | "sessions" => expected_sessions}
     assert Supervision.ladder_target(ctx.db, "child", 1) == ctx.parent
     assert :ok = Ledger.finish(ctx.db, seq, "delivered", nil, owner_lease: turn.owner_lease)
 
@@ -525,8 +605,11 @@ defmodule Tightbeam.SessionReparentTest do
 
     assert second["session"]["previousCurrentParent"] == ctx.parent
     assert Org.current_parent(ctx.db, "child") == "old"
+    assert Org.topology_parent(ctx.db, "child") == "old"
+    assert Org.get(ctx.db, "child").spawned_by == nil
     assert SessionReparent.handle(ctx.db, call(ctx.params)) == first
     assert Org.current_parent(ctx.db, "child") == "old"
+    assert Org.topology_parent(ctx.db, "child") == "old"
     assert :ok = Schema.ensure_all(ctx.db)
     assert Org.current_parent(ctx.db, "child") == "old"
     assert SessionReparent.handle(ctx.db, call(ctx.params)) == first

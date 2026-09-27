@@ -361,6 +361,7 @@ defmodule Tightbeam.SentinelsTest do
     test "repeated fast exits stop the sentinel and wake its enabler once", ctx do
       Org.create(ctx.db, %{
         session_key: Org.personal_session_key("flynn"),
+        kind: "main",
         display_name: "Flynn",
         owner_user_id: "flynn",
         origin: "user:flynn",

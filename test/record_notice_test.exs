@@ -36,6 +36,7 @@ defmodule Tightbeam.RecordNoticeTest do
     Org.create(db, %{
       session_key: session_key,
       display_name: display_name,
+      kind: if(session_key == Org.personal_session_key("flynn"), do: "main", else: "custom"),
       owner_user_id: "flynn",
       origin: "user:flynn",
       archetype: "default",

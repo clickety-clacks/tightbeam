@@ -177,7 +177,8 @@ defmodule Tightbeam.Wire.Payloads do
         "createdAt" => Map.fetch!(s, :created_at),
         "updatedAt" => Map.fetch!(s, :updated_at),
         "adopted" => Map.fetch!(s, :adopted),
-        "startedBy" => Tightbeam.Origin.started_by(s[:origin])
+        "startedBy" => Tightbeam.Origin.started_by(s[:origin]),
+        "topologyParent" => s[:topology_parent]
       },
       for(
         {key, value} <- [{"origin", s[:origin]}, {"spawnedBy", s[:spawned_by]}],

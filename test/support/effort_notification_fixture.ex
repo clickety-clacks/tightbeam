@@ -86,7 +86,14 @@ defmodule Tightbeam.EffortNotificationFixture do
 
     host = Placement.local_host_name()
     parent = session(db, "parent", "h1", host)
-    holder = session(db, "holder", "h2", host, %{spawned_by: "parent"})
+    holder = session(db, "holder", "h2", host)
+
+    # Preserve the historical cross-owner provenance exercised by these
+    # delivery proofs without treating it as a newly admissible spawn.
+    {:ok, _} =
+      DB.query(db, "UPDATE sessions SET spawnedBy='parent' WHERE sessionKey='holder'")
+
+    holder = Org.get(db, holder.session_key)
     # The extra keys are what `Gateway.children_after_preflight/1` reads: the
     # notification drain uses the REAL prompt-wake child, not a test closure.
     config = %{
@@ -419,6 +426,7 @@ defmodule Tightbeam.EffortNotificationFixture do
         %{
           session_key: key,
           display_name: key,
+          kind: if(key == Org.personal_session_key(owner), do: "main", else: "custom"),
           owner_user_id: owner,
           origin: "user:#{owner}",
           archetype: "default",

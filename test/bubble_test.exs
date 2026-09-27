@@ -57,6 +57,7 @@ defmodule Tightbeam.Productions.BubbleTest do
       Org.create(db, %{
         session_key: key,
         display_name: key,
+        kind: if(built_in?, do: "main", else: "custom"),
         owner_user_id: "flynn",
         origin: "user:flynn",
         archetype: "default",

@@ -2549,6 +2549,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     Tightbeam.Org.create(db, %{
       session_key: session_key,
       display_name: "Main",
+      kind: "main",
       owner_user_id: "flynn",
       origin: "user:flynn",
       archetype: "default",
