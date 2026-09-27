@@ -40,6 +40,7 @@ defmodule Tightbeam.Homes do
 
   @manifest_relative Path.join(".tightbeam", "manifest")
   @baseline_skill_names [
+    "tightbeam-operating-manual",
     "tightbeam-dispatching",
     "tightbeam-assimilate",
     "tightbeam-harnesses",

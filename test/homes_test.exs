@@ -41,6 +41,9 @@ defmodule Tightbeam.HomesTest do
       assert File.read_link!(Path.join([coder.home_path, "skills", name])) ==
                Application.app_dir(:tightbeam, "priv/skills/#{name}")
     end
+
+    manual_skill = Path.join([coder.home_path, "skills", "tightbeam-operating-manual"])
+    assert File.lstat!(manual_skill).type == :symlink
   end
 
   test "regeneration replaces only owned paths and preserves durable Codex state", %{

@@ -1,5 +1,5 @@
 name = "orchestrator"
-skills = ["repository-retirement"]
+skills = ["repository-retirement", "landing", "delivery-bootstrap"]
 
 [defaults]
 harness = "codex"
@@ -12,17 +12,13 @@ effort = "max"
 
 [guidance]
 text = """
-#include "golden-rule.md"
+#include "operating-manual.md"
 
-#include "scope-and-architecture.md"
+#include "engineering-core.md"
 
-#include "wisdom-core.md"
-
-#include "engineering-tenets.md"
-
-#include "preferred-models.md"
+#include "delivery.md"
 
 #include "orchestrator.md"
 
-#include "landing.md"
+#include "preferred-models.md"
 """

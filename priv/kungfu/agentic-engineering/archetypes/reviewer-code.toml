@@ -12,19 +12,11 @@ effort = "high"
 
 [guidance]
 text = """
-#include "golden-rule.md"
+#include "operating-manual.md"
 
-#include "scope-and-architecture.md"
+#include "engineering-core.md"
 
-#include "wisdom-core.md"
-
-#include "engineering-tenets.md"
-
-#include "subtraction.md"
-
-#include "preferred-models.md"
-
-#include "repository-custody.md"
+#include "review.md"
 
 #include "reviewer-code.md"
 """

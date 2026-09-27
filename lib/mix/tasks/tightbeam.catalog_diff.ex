@@ -179,13 +179,22 @@ defmodule Mix.Tasks.Tightbeam.Catalog.Diff do
   defp settled?(_state), do: false
 
   defp read_working_set!(guidance_path) do
-    guidance_path
-    |> read_working_set_source!()
-    |> String.split("\n")
-    |> Enum.drop_while(&(&1 != "## Working set (capsules)"))
-    |> case do
-      [] -> Mix.raise("preferred_models_parse_failed: Working set (capsules) section not found")
-      [_heading | section] -> working_set_bullets(section)
+    lines = guidance_path |> read_working_set_source!() |> String.split("\n")
+
+    case canonical_models(lines) do
+      [] ->
+        case working_set_models(lines) do
+          [] ->
+            Mix.raise(
+              "preferred_models_parse_failed: no valid Canonical names or Working set (capsules) section"
+            )
+
+          models ->
+            models
+        end
+
+      models ->
+        models
     end
   end
 
@@ -205,11 +214,24 @@ defmodule Mix.Tasks.Tightbeam.Catalog.Diff do
     end
   end
 
-  defp working_set_bullets(lines) do
+  defp canonical_models(lines) do
+    section_models(lines, "## Canonical names", ~r/^- `[^`]+`: `([^`]+)`/)
+  end
+
+  defp working_set_models(lines) do
+    section_models(lines, "## Working set (capsules)", ~r/^- \*\*([^*]+)\*\*/)
+  end
+
+  defp section_models(lines, heading, model_pattern) do
     lines
+    |> Enum.drop_while(&(&1 != heading))
+    |> case do
+      [] -> []
+      [_heading | section] -> section
+    end
     |> Enum.take_while(&(not String.starts_with?(&1, "## ")))
     |> Enum.flat_map(fn line ->
-      case Regex.run(~r/^- \*\*([^*]+)\*\*/, line) do
+      case Regex.run(model_pattern, line) do
         [_, model_id] -> [model_id]
         nil -> []
       end

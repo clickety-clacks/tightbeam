@@ -1,10 +1,10 @@
 defmodule Tightbeam.SessionReparent do
   @moduledoc "Owner correction of current topology; creation and runtime rows stay immutable."
 
-  alias Tightbeam.{DB, Idempotency, Org}
+  alias Tightbeam.{DB, DeliveryResponsibilities, Idempotency, Org}
   alias Tightbeam.DB.Txn
 
-  @ddl """
+  @table_ddl """
   CREATE TABLE session_reparent_events (
     eventSeq INTEGER PRIMARY KEY AUTOINCREMENT,
     eventId TEXT NOT NULL UNIQUE,
@@ -19,16 +19,24 @@ defmodule Tightbeam.SessionReparent do
     originAssignmentOpenerRef TEXT NOT NULL,
     previousCurrentCoordinationParentSessionKey TEXT,
     newCurrentCoordinationParentSessionKey TEXT NOT NULL REFERENCES sessions(sessionKey),
-    cause TEXT NOT NULL CHECK (cause='owner_topology_correction'),
-    principalKind TEXT NOT NULL CHECK (principalKind='user'),
+    cause TEXT NOT NULL CHECK (cause IN ('owner_topology_correction','delivery_owner_reparent')),
+    principalKind TEXT NOT NULL CHECK (principalKind IN ('user','session')),
     principalRef TEXT NOT NULL,
     idempotencyKey TEXT NOT NULL,
     requestFingerprint TEXT NOT NULL,
     createdAt INTEGER NOT NULL,
     UNIQUE(ownerUserId,idempotencyKey),
     CHECK (newCurrentParentSessionKey=newCurrentCoordinationParentSessionKey),
-    CHECK (principalRef='user:' || ownerUserId)
+    CHECK (
+      (principalKind='user' AND cause='owner_topology_correction' AND
+       principalRef='user:' || ownerUserId) OR
+      (principalKind='session' AND cause='delivery_owner_reparent' AND
+       substr(principalRef,1,8)='session:' AND length(principalRef)>8)
+    )
   );
+  """
+
+  @indexes_and_triggers_ddl """
   CREATE INDEX session_reparent_child ON session_reparent_events(childSessionKey,eventSeq);
   CREATE INDEX session_reparent_assignment ON session_reparent_events(assignmentId,eventSeq);
   CREATE TRIGGER session_reparent_no_update BEFORE UPDATE ON session_reparent_events
@@ -37,11 +45,81 @@ defmodule Tightbeam.SessionReparent do
   BEGIN SELECT RAISE(ABORT,'session_reparent_events is append-only'); END;
   """
 
+  @ddl @table_ddl <> @indexes_and_triggers_ddl
+
   @doc false
   def migrate_in_txn(txn), do: Txn.exec(txn, @ddl)
 
+  @doc false
+  def upgrade_agent_principals_in_txn(txn) do
+    [[table_sql]] =
+      Txn.q(
+        txn,
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='session_reparent_events'"
+      )
+
+    cond do
+      String.contains?(table_sql, "principalKind IN ('user','session')") and
+          String.contains?(table_sql, "delivery_owner_reparent") ->
+        :ok
+
+      String.contains?(table_sql, "cause='owner_topology_correction'") and
+        String.contains?(table_sql, "principalKind='user'") and
+          String.contains?(table_sql, "principalRef='user:' || ownerUserId") ->
+        [[count]] = Txn.q(txn, "SELECT COUNT(*) FROM session_reparent_events")
+
+        replacement_ddl =
+          String.replace(
+            @table_ddl,
+            "CREATE TABLE session_reparent_events (",
+            "CREATE TABLE session_reparent_events_agent_v1 (",
+            global: false
+          )
+
+        :ok = Txn.exec(txn, replacement_ddl)
+
+        :ok =
+          Txn.exec(
+            txn,
+            "INSERT INTO session_reparent_events_agent_v1 SELECT * FROM session_reparent_events"
+          )
+
+        [[^count]] = Txn.q(txn, "SELECT COUNT(*) FROM session_reparent_events_agent_v1")
+        :ok = Txn.exec(txn, "DROP TABLE session_reparent_events")
+
+        # Other tables own triggers whose SQL reads this table. Recreate the
+        # original name before touching those triggers; SQLite reparses them
+        # during ALTER TABLE and refuses a temporary missing reference.
+        :ok = Txn.exec(txn, @table_ddl)
+
+        :ok =
+          Txn.exec(
+            txn,
+            "INSERT INTO session_reparent_events SELECT * FROM session_reparent_events_agent_v1"
+          )
+
+        [[^count]] = Txn.q(txn, "SELECT COUNT(*) FROM session_reparent_events")
+        :ok = Txn.exec(txn, "DROP TABLE session_reparent_events_agent_v1")
+
+        :ok = Txn.exec(txn, @indexes_and_triggers_ddl)
+        [] = Txn.q(txn, "PRAGMA foreign_key_check(session_reparent_events)")
+        :ok
+
+      true ->
+        raise Tightbeam.Schema.ShapeError,
+          message: "incompatible session reparent principal table definition"
+    end
+  end
+
   def handle(db, %{principal: {:user, owner}, params: params}) do
     case DB.transaction(db, &apply_in_txn(&1, owner, params)) do
+      {:ok, result} -> result
+      {:error, error} -> raise error
+    end
+  end
+
+  def handle(db, %{principal: {:session, caller}, params: params}) do
+    case DB.transaction(db, &apply_agent_in_txn(&1, caller, params)) do
       {:ok, result} -> result
       {:error, error} -> raise error
     end
@@ -63,19 +141,73 @@ defmodule Tightbeam.SessionReparent do
         |> Base.encode16(case: :lower)
 
       case Idempotency.reparent_result_in_txn(txn, owner, key) do
-        %{fingerprint: ^fingerprint, response: response} -> response
-        nil -> correct_in_txn(txn, owner, child, parent, assignment, key, fingerprint)
-        _ -> refusal("idempotency_conflict")
+        %{fingerprint: ^fingerprint, response: response} ->
+          response
+
+        nil ->
+          correct_in_txn(txn, owner, child, parent, assignment, key, fingerprint, %{
+            kind: "user",
+            ref: "user:" <> owner,
+            cause: "owner_topology_correction"
+          })
+
+        _ ->
+          refusal("idempotency_conflict")
       end
     else
       _ -> refusal("invalid_message")
     end
   end
 
-  defp correct_in_txn(txn, owner, child, parent, assignment, key, fingerprint) do
+  defp apply_agent_in_txn(txn, caller, params) do
+    child = params[:session_key]
+    parent = params[:parent_session_key]
+    assignment = params[:assignment_id]
+    key = params[:idempotency_key]
+
+    with true <- valid_key?(key),
+         true <- Enum.all?([child, parent, assignment], &(is_binary(&1) and &1 != "")),
+         {:ok, owner} <- active_caller_in_txn(txn, caller) do
+      fingerprint =
+        :crypto.hash(:sha256, JSON.encode!([caller, child, parent, assignment]))
+        |> Base.encode16(case: :lower)
+
+      case Idempotency.reparent_result_in_txn(txn, owner, key) do
+        %{fingerprint: ^fingerprint, response: response} ->
+          response
+
+        nil ->
+          correct_in_txn(txn, owner, child, parent, assignment, key, fingerprint, %{
+            kind: "session",
+            ref: "session:" <> caller,
+            cause: "delivery_owner_reparent",
+            caller: caller
+          })
+
+        _ ->
+          refusal("idempotency_conflict")
+      end
+    else
+      false -> refusal("invalid_message")
+      {:error, code} -> refusal(code)
+    end
+  end
+
+  defp active_caller_in_txn(txn, caller) when is_binary(caller) do
+    case Txn.q(txn, "SELECT ownerUserId,state FROM sessions WHERE sessionKey=?1", [caller]) do
+      [[owner, "active"]] -> {:ok, owner}
+      _ -> {:error, "not_authorized"}
+    end
+  end
+
+  defp active_caller_in_txn(_txn, _caller), do: {:error, "not_authorized"}
+
+  defp correct_in_txn(txn, owner, child, parent, assignment, key, fingerprint, actor) do
     with {:ok, origin_parent} <- child_in_txn(txn, owner, child),
          :ok <- parent_in_txn(txn, owner, parent),
          {:ok, work_item, opener_kind, opener} <- assignment_in_txn(txn, owner, child, assignment),
+         :ok <-
+           authorize_actor(txn, actor, child, parent, assignment, work_item, opener_kind, opener),
          :ok <- acyclic(txn, parent, MapSet.new([child])) do
       previous_parent = Org.current_parent(txn, child)
       previous_coordination = current_coordination_parent(txn, assignment)
@@ -114,7 +246,7 @@ defmodule Tightbeam.SessionReparent do
              previousCurrentCoordinationParentSessionKey,newCurrentCoordinationParentSessionKey,
              cause,principalKind,principalRef,idempotencyKey,requestFingerprint,createdAt)
           VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?8,
-            'owner_topology_correction','user',?12,?13,?14,?15)
+            ?12,?13,?14,?15,?16,?17)
           """,
           [
             event,
@@ -128,7 +260,9 @@ defmodule Tightbeam.SessionReparent do
             opener_kind,
             opener,
             previous_coordination,
-            "user:" <> owner,
+            actor.cause,
+            actor.kind,
+            actor.ref,
             key,
             fingerprint,
             at
@@ -140,6 +274,45 @@ defmodule Tightbeam.SessionReparent do
       end
     else
       {:error, code} -> refusal(code)
+    end
+  end
+
+  defp authorize_actor(_txn, %{kind: "user"}, _child, _parent, _assignment, _item, _kind, _ref),
+    do: :ok
+
+  defp authorize_actor(
+         txn,
+         %{kind: "session", caller: caller},
+         child,
+         parent,
+         assignment,
+         item,
+         opener_kind,
+         opener
+       ) do
+    current_coordination = current_coordination_parent(txn, assignment)
+
+    effective_coordination =
+      if current_coordination == nil and opener_kind == "session",
+        do: opener,
+        else: session_ref(current_coordination)
+
+    cond do
+      DeliveryResponsibilities.responsibility_in_txn(txn, caller, item) not in [
+        "accountable",
+        "delegated"
+      ] ->
+        {:error, "delivery_responsibility_required"}
+
+      Org.current_parent(txn, child) != caller or
+          effective_coordination != session_ref(caller) ->
+        {:error, "current_custody_required"}
+
+      Org.current_parent(txn, parent) != caller ->
+        {:error, "target_not_owned"}
+
+      true ->
+        :ok
     end
   end
 
@@ -266,5 +439,14 @@ defmodule Tightbeam.SessionReparent do
 
   defp session_ref(nil), do: nil
   defp session_ref(key), do: "session:" <> key
+
+  defp refusal("current_custody_required" = code),
+    do: %{
+      ok: false,
+      code: code,
+      message:
+        "current worker and assignment custody must agree; ask the owning user for a topology correction"
+    }
+
   defp refusal(code), do: %{ok: false, code: code, message: code}
 end

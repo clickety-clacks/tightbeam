@@ -45,7 +45,7 @@ defmodule Tightbeam.SettlementMigrationTest do
     assert {:ok, ^before_ddl} = DB.query(db, preserved_sql)
     assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
 
-    assert {:ok, [["terminal-credential-failure-v1-019"]]} =
+    assert {:ok, [["delivery-owner-reparent-v1-019"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert {:ok, [["prior-fingerprint", ~s({"prior":true}), nil]]} =

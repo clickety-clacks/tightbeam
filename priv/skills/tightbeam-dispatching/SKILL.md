@@ -21,22 +21,3 @@ requirements, including independent guidance review for a policy change. Do not 
 a consultation to the default `code` effect or invent a dummy code review to close it.
 Classify the whole assigned output truthfully. Do not relabel historical policy or
 code work as coordination merely to close it; route the actual mismatch to its owner.
-
-Send a concise wake carrying the assignment reference and material new context. Link every
-assignment to the work item it serves. Decompose work into assignment subjects down the
-chain; genuinely new scope returns to the work item's owner instead of becoming a sideways
-work item.
-
-The operating manual owns the dispatch law and the duty to keep unfinished obligations
-owned. Use its supported continuation or dependency-wait procedure. Record material results,
-changed dependencies and decisions; do not manufacture progress prose to prove activity.
-
-Reuse an existing healthy wait or continuation. A scheduled wake is not proof that an
-obligation is covered, and escalation is not proof of a stall.
-
-Retire hires under the operating manual's single retirement duty. Preserve required output
-and unfinished dependent obligations before retirement; a zero open-assignment count alone
-does not erase custody.
-
-An escalation asks you to assess the obligation. Inspect its relevant execution, dependency
-and failure evidence, then carry recovery through the responsible owner.

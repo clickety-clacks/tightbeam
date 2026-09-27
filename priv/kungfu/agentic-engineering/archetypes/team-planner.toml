@@ -3,15 +3,11 @@ skills = ["repository-retirement"]
 
 [guidance]
 text = """
-#include "golden-rule.md"
+#include "operating-manual.md"
 
-#include "scope-and-architecture.md"
-
-#include "wisdom-core.md"
-
-#include "engineering-tenets.md"
-
-#include "preferred-models.md"
+#include "engineering-core.md"
 
 #include "team-planner.md"
+
+#include "preferred-models.md"
 """

@@ -1,6 +1,6 @@
 name = "pdo"
 idle_cleanup = false
-skills = ["repository-retirement", "human-communication"]
+skills = ["repository-retirement", "human-communication", "landing", "delivery-bootstrap"]
 
 [defaults]
 harness = "codex"
@@ -13,17 +13,13 @@ effort = "low"
 
 [guidance]
 text = """
-#include "golden-rule.md"
+#include "operating-manual.md"
 
-#include "scope-and-architecture.md"
+#include "engineering-core.md"
 
-#include "wisdom-core.md"
-
-#include "engineering-tenets.md"
-
-#include "preferred-models.md"
+#include "delivery.md"
 
 #include "pdo.md"
 
-#include "landing.md"
+#include "preferred-models.md"
 """

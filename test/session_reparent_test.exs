@@ -2,7 +2,9 @@ defmodule Tightbeam.SessionReparentTest do
   use Tightbeam.TestCase, async: false
 
   alias Tightbeam.{
+    Assignments,
     DB,
+    DeliveryResponsibilities,
     Gateway,
     Ledger,
     Model,
@@ -10,6 +12,7 @@ defmodule Tightbeam.SessionReparentTest do
     Roles,
     Schema,
     SessionReparent,
+    SessionPoAssociations,
     Supervision,
     WorkItems
   }
@@ -137,10 +140,14 @@ defmodule Tightbeam.SessionReparentTest do
 
   test "only the owning user can correct an active custom child with one direct open assignment",
        ctx do
-    for principal <- [{:session, "child"}, {:process, "synthetic"}] do
-      assert %{code: "user_principal_required"} =
-               SessionReparent.handle(ctx.db, %{call(ctx.params) | principal: principal})
-    end
+    assert %{code: "delivery_responsibility_required"} =
+             SessionReparent.handle(ctx.db, agent_call("child", ctx.params))
+
+    assert %{code: "user_principal_required"} =
+             SessionReparent.handle(ctx.db, %{
+               call(ctx.params)
+               | principal: {:process, "synthetic"}
+             })
 
     assert %{code: "not_authorized"} =
              SessionReparent.handle(ctx.db, %{call(ctx.params) | principal: {:user, "other"}})
@@ -166,6 +173,227 @@ defmodule Tightbeam.SessionReparentTest do
     assert %{code: "multiple_open_assignments"} = SessionReparent.handle(ctx.db, call(ctx.params))
     assert count(ctx.db, "session_reparent_events") == 0
     assert count(ctx.db, "wire_idempotency") == 0
+  end
+
+  test "accountable delivery owner moves only its current worker under its current coordinator",
+       ctx do
+    accountable_fixture(ctx)
+
+    result = SessionReparent.handle(ctx.db, agent_call("lead", agent_params(ctx)))
+    assert is_binary(result["eventId"])
+    assert result["session"]["originParent"] == "lead"
+    assert result["assignment"]["originOpenerRef"] == "session:lead"
+    assert Org.current_parent(ctx.db, "child") == "coordinator"
+    assert SessionReparent.current_coordination_parent(ctx.db, "asg_one") == "coordinator"
+    assert Supervision.ladder_target(ctx.db, "child", 1) == "coordinator"
+
+    assert rows(ctx.db, "SELECT principalKind,principalRef,cause FROM session_reparent_events") ==
+             [
+               ["session", "session:lead", "delivery_owner_reparent"]
+             ]
+
+    assert SessionReparent.handle(ctx.db, agent_call("lead", agent_params(ctx))) == result
+    assert count(ctx.db, "session_reparent_events") == 1
+
+    assert %{code: "idempotency_conflict"} =
+             SessionReparent.handle(ctx.db, call(agent_params(ctx)))
+
+    assert %{code: "idempotency_conflict"} =
+             SessionReparent.handle(ctx.db, agent_call("coordinator", agent_params(ctx)))
+
+    assert %{code: "current_custody_required", message: message} =
+             SessionReparent.handle(
+               ctx.db,
+               agent_call("lead", %{agent_params(ctx) | idempotency_key: "after-transfer"})
+             )
+
+    assert message =~ "owning user"
+    assert count(ctx.db, "session_reparent_events") == 1
+  end
+
+  test "valid delegated owner may move its worker and a recorded successor uses current custody",
+       ctx do
+    accountable_fixture(ctx)
+    delegated_lane(ctx.db)
+    assert DeliveryResponsibilities.responsibility(ctx.db, "lane", "wi_one") == "delegated"
+
+    # The operator makes a durable custody correction. Historical spawnedBy and
+    # openedBySession still name lead, while both current custody reads name lane.
+    assert is_binary(
+             SessionReparent.handle(
+               ctx.db,
+               call(%{agent_params(ctx) | parent_session_key: "lane", idempotency_key: "to-lane"})
+             )["eventId"]
+           )
+
+    assert Org.get(ctx.db, "child").spawned_by == "lead"
+
+    assert rows(ctx.db, "SELECT openedBySession FROM assignments WHERE id='asg_one'") == [
+             ["lead"]
+           ]
+
+    result =
+      SessionReparent.handle(
+        ctx.db,
+        agent_call("lane", %{
+          agent_params(ctx)
+          | parent_session_key: "lane-coordinator",
+            idempotency_key: "lane-move"
+        })
+      )
+
+    assert is_binary(result["eventId"])
+    assert result["assignment"]["originOpenerRef"] == "session:lead"
+    assert result["assignment"]["previousCurrentCoordinationParentRef"] == "session:lane"
+
+    assert rows(ctx.db, "SELECT principalRef FROM session_reparent_events ORDER BY eventSeq") == [
+             ["user:owner"],
+             ["session:lane"]
+           ]
+  end
+
+  test "agent authority requires exact current responsibility and both current custody facts",
+       ctx do
+    accountable_fixture(ctx)
+    delegated_lane(ctx.db)
+    session(ctx.db, "outsider")
+
+    assert %{code: "delivery_responsibility_required"} =
+             SessionReparent.handle(ctx.db, agent_call("outsider", agent_params(ctx)))
+
+    assert %{code: "current_custody_required"} =
+             SessionReparent.handle(ctx.db, agent_call("lane", agent_params(ctx)))
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE assignments SET openedBySession=NULL,openedByUser='owner' WHERE id='asg_one'"
+             )
+
+    assert %{code: "current_custody_required"} =
+             SessionReparent.handle(ctx.db, agent_call("lead", agent_params(ctx)))
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE assignments SET openedBySession='outsider',openedByUser=NULL WHERE id='asg_one'"
+             )
+
+    assert %{code: "current_custody_required"} =
+             SessionReparent.handle(ctx.db, agent_call("lead", agent_params(ctx)))
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE assignments SET openedBySession='lead' WHERE id='asg_one'")
+
+    assert is_binary(
+             SessionReparent.handle(
+               ctx.db,
+               call(%{agent_params(ctx) | parent_session_key: "lane", idempotency_key: "handoff"})
+             )["eventId"]
+           )
+
+    assert %{code: "current_custody_required"} =
+             SessionReparent.handle(
+               ctx.db,
+               agent_call("lead", %{agent_params(ctx) | idempotency_key: "former-lead"})
+             )
+
+    assert count(ctx.db, "session_reparent_events") == 1
+  end
+
+  test "agent target must remain a direct active child, with one assignment and no cycle", ctx do
+    accountable_fixture(ctx)
+    session(ctx.db, "outsider")
+
+    assert %{code: "not_authorized"} =
+             SessionReparent.handle(
+               ctx.db,
+               agent_call("lead", %{agent_params(ctx) | parent_session_key: "foreign"})
+             )
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE sessions SET spawnedBy='outsider' WHERE sessionKey='coordinator'"
+             )
+
+    assert %{code: "target_not_owned"} =
+             SessionReparent.handle(ctx.db, agent_call("lead", agent_params(ctx)))
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE sessions SET spawnedBy='lead',state='retired' WHERE sessionKey='coordinator'"
+             )
+
+    assert %{code: "session_retired"} =
+             SessionReparent.handle(ctx.db, agent_call("lead", agent_params(ctx)))
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE sessions SET state='active' WHERE sessionKey='coordinator'")
+
+    assert %{code: "cycle_detected"} =
+             SessionReparent.handle(
+               ctx.db,
+               agent_call("lead", %{agent_params(ctx) | parent_session_key: "child"})
+             )
+
+    assignment(ctx.db, "asg_two", "child", "wi_one")
+
+    assert %{code: "multiple_open_assignments"} =
+             SessionReparent.handle(ctx.db, agent_call("lead", agent_params(ctx)))
+
+    assert count(ctx.db, "session_reparent_events") == 0
+  end
+
+  test "a target transferred by a later event is no longer owned by its original parent", ctx do
+    accountable_fixture(ctx)
+    session(ctx.db, "outsider")
+    item(ctx.db, "wi_target")
+    assignment(ctx.db, "asg_target", "coordinator", "wi_target")
+
+    assert is_binary(
+             SessionReparent.handle(
+               ctx.db,
+               call(%{
+                 session_key: "coordinator",
+                 parent_session_key: "outsider",
+                 assignment_id: "asg_target",
+                 idempotency_key: "transfer-target"
+               })
+             )["eventId"]
+           )
+
+    assert Org.get(ctx.db, "coordinator").spawned_by == "lead"
+    assert Org.current_parent(ctx.db, "coordinator") == "outsider"
+
+    assert %{code: "target_not_owned"} =
+             SessionReparent.handle(ctx.db, agent_call("lead", agent_params(ctx)))
+
+    assert count(ctx.db, "session_reparent_events") == 1
+  end
+
+  test "a same-human work item or stale office does not grant an agent delivery authority", ctx do
+    accountable_fixture(ctx)
+    item(ctx.db, "wi_unbound")
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE assignments SET workItemId='wi_unbound' WHERE id='asg_one'")
+
+    assert %{code: "delivery_responsibility_required"} =
+             SessionReparent.handle(ctx.db, agent_call("lead", agent_params(ctx)))
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE assignments SET workItemId='wi_one' WHERE id='asg_one'")
+
+    Roles.create!(ctx.db, "product-owner:next", "owner", "lead")
+    associate(ctx.db, "lead", "product-owner:next", "lead-association-next")
+    assert DeliveryResponsibilities.responsibility(ctx.db, "lead", "wi_one") == "stale"
+
+    assert %{code: "delivery_responsibility_required"} =
+             SessionReparent.handle(ctx.db, agent_call("lead", agent_params(ctx)))
+
+    assert count(ctx.db, "session_reparent_events") == 0
   end
 
   test "foreign and closed work items refuse even for a caller owning the session", ctx do
@@ -403,6 +631,95 @@ defmodule Tightbeam.SessionReparentTest do
     assert Org.current_parent(legacy, "legacy") == nil
     assert :ok = Schema.ensure_all(legacy)
   end
+
+  defp accountable_fixture(ctx) do
+    session(ctx.db, "lead")
+    session(ctx.db, "coordinator", %{spawned_by: "lead"})
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE sessions SET spawnedBy='lead' WHERE sessionKey='child'")
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE assignments SET openedByUser=NULL,openedBySession='lead' WHERE id='asg_one'"
+             )
+
+    Roles.create!(ctx.db, "product-owner:reparent", "owner", "lead")
+    associate(ctx.db, "lead", "product-owner:reparent", "lead-association")
+
+    assert %{"changed" => true} =
+             DeliveryResponsibilities.handle(ctx.db, %{
+               verb: "delivery-scope-owner-set",
+               origin: "user:owner",
+               principal: {:user, "owner"},
+               params: %{
+                 session_key: "lead",
+                 association_revision: 1,
+                 expected_owner_session_key: nil,
+                 expected_owner_revision: 0,
+                 idempotency_key: "lead-owner"
+               }
+             })
+
+    assert %{"changed" => true} =
+             DeliveryResponsibilities.handle(ctx.db, %{
+               verb: "work-item-delivery-scope-set",
+               origin: "user:owner",
+               principal: {:user, "owner"},
+               params: %{
+                 work_item_id: "wi_one",
+                 association_session_key: "lead",
+                 association_revision: 1,
+                 expected_binding_revision: 0,
+                 idempotency_key: "lead-bind"
+               }
+             })
+
+    assert DeliveryResponsibilities.responsibility(ctx.db, "lead", "wi_one") == "accountable"
+  end
+
+  defp delegated_lane(db) do
+    session(db, "lane", %{spawned_by: "lead"})
+    session(db, "lane-coordinator", %{spawned_by: "lane"})
+    associate(db, "lane", "product-owner:reparent", "lane-association")
+
+    assert %{id: assignment_id} =
+             Assignments.__handle__(db, "assign", %{
+               verb: "assign",
+               origin: "agent:lead",
+               principal: {:session, "lead"},
+               session_key: "lane",
+               target_role: nil,
+               role_fallback: false,
+               supervision_interval_ms: 1_000,
+               params: %{
+                 subject: "delegate exact work item",
+                 idempotency_key: nil,
+                 work_item_id: "wi_one",
+                 reviews_assignment_id: nil,
+                 effect_kind: "coordination",
+                 files: nil,
+                 delegates_delivery: true
+               }
+             })
+
+    assert is_binary(assignment_id)
+  end
+
+  defp associate(db, target, po_role, key) do
+    assert %{"changed" => true} =
+             SessionPoAssociations.handle(db, %{
+               principal: {:user, "owner"},
+               params: %{session_key: target, po_role: po_role, idempotency_key: key}
+             })
+  end
+
+  defp agent_params(ctx),
+    do: %{ctx.params | parent_session_key: "coordinator", idempotency_key: "agent-move"}
+
+  defp agent_call(caller, params),
+    do: %{call(params) | principal: {:session, caller}, origin: "agent:" <> caller}
 
   defp session(db, key, extra \\ %{}) do
     Org.create(

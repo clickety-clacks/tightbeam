@@ -18,8 +18,10 @@ description: Apply the adopted writing invariants when creating or changing manu
    proposed behavior from what actually exists.
 6. Keep the whole composition consistent. Check kernel, includes, elected skills, and manual
    together, and remove instructions that oppose each other across those homes.
-7. Write direct, concise instructions. Role voice, concrete verbs, enough context to act
-   without the conversation history.
+7. State the intent and the reason. Give an instruction where a concrete action is
+   needed, in plain voice with its why and enough context to act without the
+   conversation history. Avoid emphatic CRITICAL/MUST/ALWAYS wording. Place guidance
+   by responsibility, not frequency.
 8. Revise proportionately. Batch coherent changes, preserve useful content, and do not add a
    procedural layer for every incident.
 

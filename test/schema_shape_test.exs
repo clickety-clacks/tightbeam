@@ -13,7 +13,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
   alias Tightbeam.{Assignments, ConnRegistry, DB, Schema, SessionPoAssociations, Wakes}
 
-  @shape "terminal-credential-failure-v1-019"
+  @shape "delivery-owner-reparent-v1-019"
   @legacy_cursor_provider_shape "cursor-provider-v1-020"
   @row_driven_rules_shape "row-driven-rules-v1-019"
   @identity_render_stamp_previous_shape "effort-request-exit-v1-019"
@@ -256,6 +256,84 @@ defmodule Tightbeam.SchemaShapeTest do
     assert SessionPoAssociations.get(db, "missing-session") == nil
     assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
     assert :ok = Schema.ensure_all(db)
+  end
+
+  test "historical user reparent events survive the principal upgrade with append-only history",
+       %{
+         db: db
+       } do
+    assert :ok = load_previous_pr31_fixture(db)
+
+    assert :ok =
+             DB.execute(db, """
+             INSERT INTO users(userId,isAdmin,createdAt) VALUES('owner',0,1);
+             INSERT INTO sessions
+               (sessionKey,displayName,ownerUserId,origin,archetype,harness,provider,model,createdAt,updatedAt)
+             VALUES
+               ('child','child','owner','user:owner','default','fixture','fixture_provider','fixture',1,1),
+               ('parent','parent','owner','user:owner','default','fixture','fixture_provider','fixture',1,1);
+             INSERT INTO work_items(id,title,ownerUserId,state,createdByUser,createdContextKnown,createdAt)
+             VALUES('wi_reparent','historical work','owner','open','owner',0,1);
+             INSERT INTO assignments(id,subject,holderKey,openedByUser,openedAt,state,workItemId)
+             VALUES('asg_reparent','historical assignment','child','owner',1,'open','wi_reparent');
+             INSERT INTO session_reparent_events
+               (eventId,ownerUserId,childSessionKey,assignmentId,workItemId,
+                originParentSessionKey,previousCurrentParentSessionKey,newCurrentParentSessionKey,
+                originAssignmentOpenerKind,originAssignmentOpenerRef,
+                previousCurrentCoordinationParentSessionKey,newCurrentCoordinationParentSessionKey,
+                cause,principalKind,principalRef,idempotencyKey,requestFingerprint,createdAt)
+             VALUES
+               ('trp_historical','owner','child','asg_reparent','wi_reparent',
+                NULL,NULL,'parent','user','user:owner',NULL,'parent',
+                'owner_topology_correction','user','user:owner','old-key','old-fingerprint',1);
+             """)
+
+    assert {:ok, [["trp_historical", "user", "user:owner"]]} =
+             DB.query(
+               db,
+               "SELECT eventId,principalKind,principalRef FROM session_reparent_events"
+             )
+
+    assert :ok = Schema.ensure_all(db)
+    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok, [[1, "trp_historical", "user", "user:owner", "owner_topology_correction"]]} =
+             DB.query(
+               db,
+               "SELECT eventSeq,eventId,principalKind,principalRef,cause FROM session_reparent_events"
+             )
+
+    assert {:error, _} =
+             DB.query(
+               db,
+               "UPDATE session_reparent_events SET cause='delivery_owner_reparent' WHERE eventId='trp_historical'"
+             )
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               """
+               INSERT INTO session_reparent_events
+                 (eventId,ownerUserId,childSessionKey,assignmentId,workItemId,
+                  originParentSessionKey,previousCurrentParentSessionKey,newCurrentParentSessionKey,
+                  originAssignmentOpenerKind,originAssignmentOpenerRef,
+                  previousCurrentCoordinationParentSessionKey,newCurrentCoordinationParentSessionKey,
+                  cause,principalKind,principalRef,idempotencyKey,requestFingerprint,createdAt)
+               VALUES
+                 ('trp_agent','owner','child','asg_reparent','wi_reparent',
+                  NULL,'parent','parent','user','user:owner','parent','parent',
+                  'delivery_owner_reparent','session','session:parent','new-key','new-fingerprint',2)
+               """
+             )
+
+    assert {:ok, [[2, "trp_agent", "session:parent"]]} =
+             DB.query(
+               db,
+               "SELECT eventSeq,eventId,principalRef FROM session_reparent_events WHERE eventId='trp_agent'"
+             )
+
+    assert :ok = Schema.ensure_all(db)
+    assert {:ok, [[2]]} = DB.query(db, "SELECT COUNT(*) FROM session_reparent_events")
   end
 
   test "the real predecessor advances through the cursor-provider migration", %{db: db} do

@@ -4,7 +4,8 @@ defmodule Tightbeam.TerminalCredentialMigrationTest do
   alias Tightbeam.{DB, Schema}
 
   @predecessor "stale-turn-settlement-v1-019"
-  @successor "terminal-credential-failure-v1-019"
+  @terminal_shape "terminal-credential-failure-v1-019"
+  @successor "delivery-owner-reparent-v1-019"
 
   @terminal_objects ~w(
     terminal_credential_deliveries
@@ -75,14 +76,15 @@ defmodule Tightbeam.TerminalCredentialMigrationTest do
     assert terminal_objects(db) == @terminal_objects
     assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM terminal_credential_incidents")
 
-    assert [@successor, @predecessor | _] = Schema.guard_compatible_stamps()
+    assert [@successor, @terminal_shape, @predecessor | _] =
+             Schema.guard_compatible_stamps()
   end
 
   test "stamp refusal rolls back every terminal object and preserves settlement", %{db: db} do
     :ok =
       DB.execute(db, """
       CREATE TRIGGER reject_terminal_credential_stamp BEFORE UPDATE ON schema_stamp
-      WHEN NEW.shape='#{@successor}'
+      WHEN NEW.shape='#{@terminal_shape}'
       BEGIN SELECT RAISE(ABORT,'forced terminal credential rollback'); END;
       """)
 

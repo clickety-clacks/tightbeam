@@ -2,8 +2,6 @@ defmodule Tightbeam.ExternalAgentSkillsTest do
   use ExUnit.Case, async: true
 
   @cli_name "tightbeam-cli"
-  @delegation_sentence "you should probably get main to do what you need it to instead of trying to do it yourself since main knows how to operate tightbeam."
-
   @cli_description "Operate an existing Tightbeam organization through its current-line CLI. Use when an external agent has the tightbeam executable and must read assigned work, record results, or contact Main without a served Tightbeam identity."
 
   @cli_commands [
@@ -22,19 +20,24 @@ defmodule Tightbeam.ExternalAgentSkillsTest do
   ]
 
   @required_markers [
-    "**Tightbeam:**",
-    "**Work item:**",
-    "**Assignment:**",
-    "**Card:**",
-    "**Main:**",
-    "**Kungfu:**"
+    "## Records",
+    "## Start from the assignment",
+    "## Perform only the obligation",
+    "## Record the result",
+    "## Contact Main and request decisions",
+    "## Wait on the real boundary",
+    "## Stop on visible failure"
   ]
 
   test "the external CLI edition ships as an isolated valid skill" do
     assert_skill(@cli_name, @cli_description)
 
     cli = skill_bytes()
-    assert cli =~ @delegation_sentence
+
+    assert cli =~
+             "Do not create or route new work unless the assignment grants coordination authority"
+
+    assert cli =~ "to Main unless the assignment grants that exact operation"
 
     for marker <- @required_markers do
       assert cli =~ marker

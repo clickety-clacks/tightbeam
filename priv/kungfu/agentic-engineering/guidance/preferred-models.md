@@ -1,106 +1,56 @@
 # Preferred models
 
-Own model selection through this guidance and the installed kungfu's activity table.
-Keep canonical names, selection mechanics and substrate activities here. Engineering
-activities live in `kungfu/agentic-engineering/preferred-models.md`.
+Choose the least costly qualified model for the actual remaining work, including
+briefing, supervision and rework. These activity rows are starting choices, not
+mandatory stages or permission to change product quality policy. Delivery.md
+owns configured ring-down and its exhaustion route.
 
-## Working set (capsules)
+## Canonical names
 
-- **gpt-6-astra** — (nickname: astra): deep product, architecture, planning and review judgment. Use high or higher reasoning for sustained work.
-- **gpt-6-sol** — (nickname: sol): the PDO default at low effort; stronger implementation when unresolved judgment warrants it. Keep technical production with qualified workers.
-- **gpt-5.6-terra** — (nickname: terra): bounded engineering implementation and mechanical work with an inspectable contract.
-- **gpt-6-luna** — (nickname: luna): the orchestrator default at max effort; the coder default at max effort for well-scoped and sustained implementation under an understood architecture. Select a stronger generation-6 model when consequential uncertainty warrants it.
-- **claude-opus-5-5** — (nickname: opus): specification drafting at high effort and independent review of actual Codex-authored work. Qualify each host and harness; success elsewhere does not establish local access. Do not infer an unobserved context setting.
-- **claude-fable-5** — (nickname: fable): retained qualified choice for product judgment, difficult planning and implementation; independent review uses the actual-producer contract below.
-- **claude-sonnet-5** — (nickname: sonnet): bounded orchestration, specification and implementation under an understood contract.
-- **claude-haiku-4-5-20251001** — (nickname: haiku): narrow factual extraction and classification with inspectable evidence. No effort setting is assumed.
+- `astra`: `gpt-6-astra`, deep product, architecture and review judgment; high or
+  greater reasoning for sustained work.
+- `sol`: `gpt-6-sol`, PDO low-effort default and stronger implementation when needed.
+- `luna`: `gpt-6-luna`, orchestrator and understood-architecture coder at max effort.
+- `terra`: `gpt-5.6-terra`, retained bounded mechanical choice, not a generation-6 alias.
+- `opus`: `claude-opus-5-5`, spec writing and review of Codex-authored work at high.
+- `fable`: `claude-fable-5`, qualified product, planning and implementation choice.
+- `sonnet`: `claude-sonnet-5`, bounded work under an understood contract.
+- `haiku`: `claude-haiku-4-5-20251001`, narrow factual work; no effort is assumed.
 
-## Select and recover
+Expand nicknames and pass supported model, effort and matching harness explicitly.
+Filter by permitted family, host, capability floor and actual runnable access;
+catalog presence does not prove access. Prefer generation 6 for current work,
+retaining attributable availability/context exceptions as exceptions, not a new
+default. Do not retry a known unavailable route without new evidence. Diagnose
+poor results before changing effort or approach; preserve custody and possible
+external effects. Explicit settings do not authorize live tuning or migration.
 
-Frugality is part of choosing the best agent. Choose the least costly qualified
-model and effort expected to complete the actual remaining work to the required
-quality. Spend more where the task's unresolved judgment, likely rework or useful
-retained context warrants it. Project importance, a broad domain label or the
-holder's previous model does not establish that need.
+The engineering core owns opposite-actual-producer review. Its exact selections
+are Claude `claude-opus-5-5/high` for Codex production and Codex
+`gpt-6-astra/high` for Claude production. Mixed authorship needs portion coverage
+and integrated review. Do not silently substitute same-harness review or an old
+reviewer default when access is missing.
 
-Count briefing and context reconstruction, supervision, synchronization, rework and
-review along with the agent's own usage. Preserve useful context when it reduces
-the cost of finishing; do not assume a model change requires a new session or
-harness. Reconsider the choice when the remaining work changes, without creating
-turns just to reassess it. Do not over-specify a job to fit it to a cheaper coder.
+## Activities
 
-The ringdown rows suggest starting choices and fallback order; inference owns the
-selection. Use their default order when the job supplies no reason to choose
-differently. Choose another qualified candidate when its task fit, retained context,
-expected total cost or availability better serves the outcome. A default or model
-preference is not a compulsory first attempt, a price ranking or automatic fallback.
-Explicit model/harness requirements, including the independent-review contract,
-remain binding; general selection discretion does not waive them.
-Use available cost and usage evidence without inventing prices or guaranteed cache
-reuse across sessions, models or harnesses. Routine selection needs no benchmark,
-new scoring ceremony or approval request.
+| Activity | Starting choice | Capability floor |
+| --- | --- | --- |
+| Product ownership and spirit | gpt-6-astra[high], fable[high], opus[xhigh], sol[xhigh] | Challenge technically sound work against intent, sustain product context and decide topology. |
+| Product delivery orchestration | gpt-6-sol[low] | Obtain the PO's plan, reconcile current records, staff and execute within it, recognize revision needs and resolve routine traffic. |
+| Executive or delegated lane orchestration | gpt-6-luna[max] | Coordinate within actual scope, carry dependencies and follow-through, route consequential judgment to its qualified owner. |
+| Bounded team design or recovery planning | astra[high], fable[high], sol[xhigh], opus[xhigh] | Discover coupling, ownership, communication and evidence that invalidates the plan. |
+| Difficult sustained topology or recovery exploration | astra[xhigh], fable[xhigh], sol[max], opus[xhigh] | Sustain investigation and revise advice from evidence; the PO decides topology. |
+| Specification under product rulings | claude-opus-5-5[high] | Compose a coherent contract and expose unresolved intent. |
+| Well-scoped or sustained implementation under an understood architecture | gpt-6-luna[max] | Implement and verify the contract, expose gaps and carry delivery without growing corrective supervision. |
+| Implementation with unresolved architectural or causal judgment | gpt-6-astra[high], gpt-6-sol[xhigh] | Reason about architecture and interacting failure modes during implementation; choose by the actual uncertainty. |
+| Open-ended recon or investigation | sol[high], opus[high], sonnet[high], astra[high], fable[high] | Distinguish evidence from inference and identify consequential unknowns. |
+| Narrow factual scouting | luna[low], haiku, terra[low], sol[medium], sonnet[medium] | Bounded factual extraction from inspectable evidence. Broader judgment goes to recon/planning. |
+| Mechanical non-code transformations | luna[medium], terra[low], sonnet[low], sol[medium] | Apply an inspectable transformation; code production uses the coder rows. |
+| Guidance or law authoring | astra[high], sol[xhigh], fable[high] | coherent authority and composed behavior |
 
-Determine permitted families from the organization's instructions. Filter candidates
-against those permissions and the activity table's explicit family limitations
-before choosing. Qualification still requires the activity's capability floor,
-allowed host and harness, supported model and effort, and runnable access.
-Catalog presence alone does not establish access.
-Suggested order can change; explicit family, authority and budget restrictions cannot.
-An allowed candidate for one activity does not establish support for the complete
-engineering workflow; use the activity table's limits for both single-harness cases.
-
-For an explicitly requested Claude slug, absence from a compiled inventory or the
-provider's `/v1/models` response does not establish provider rejection. Preserve
-unknown-slug pass-through on a supported route without alias substitution; do not
-turn these preference tables into an offered-set allowlist. Retain actual host,
-harness, version and credential validation and report provider refusals truthfully.
-An explicit pass-through request does not qualify an unsupported active default.
-If the installed route refuses the request, report that limitation to the existing
-model-access owner. Do not bypass the refusal or claim that pending routing work
-is already available.
-
-Use an applicable activity for the actual outcome; the rows are not required stages.
-Commission stronger planning or use a stronger agent throughout when the work needs it.
-
-Expand nicknames to canonical models above. Pass the chosen model, effort and matching
-permitted harness explicitly when spawning. Verify supported settings rather than
-inventing a similarly named model. Archetype metadata does not make the selection
-or implement fallback on the caller's behalf.
-
-Independent review requires an independent session and judgment on the opposite
-harness from actual authorship: Codex-authored work uses Claude claude-opus-5-5/high;
-Claude-authored work uses Codex gpt-6-astra/high. Apply this to guidance, code and spec
-review, including producer model overrides. Read actual authorship, not the producer
-archetype's default. For mixed authorship, preserve opposite-harness coverage of each
-portion and review the exact integrated subject. A fixed reviewer default cannot
-claim both. A family/access conflict is an unresolved review limitation; do not
-silently substitute same-harness review or add a generic provider enforcement gate.
-
-On an unavailable route, reassess the remaining qualified candidates using the same
-selection judgment. The suggested fallback order remains useful when there is no
-reason to depart from it; a fallback may cost more. Do not retry a known unavailable
-route without new evidence. If none qualifies, keep the obligation owned, record the
-capability block and continue separable work. Reframe the work or propose a policy
-change through its owner. Main is not a fallback worker. Report material consequences
-through ordinary ownership, not each attempted or successful staffing choice.
-
-A poor result requires diagnosis of the ask, inputs, context, dependencies and
-approach. Increase effort, use a stronger activity or seek planning according to the
-cause. Do not blindly demote by list position or repeat an uncertain external effect.
-Preserve usable work and custody when replacing a holder or changing its harness.
-
-Scale reasoning to expected task length and complexity. Astra low is not for
-sustained work. Start sustained difficult work at high or xhigh rather than waiting
-for a low-effort failure. More reasoning can produce a shorter plan; max or ultra is
-not a default requirement. Report material product impact, budget issues or access
-decisions through ordinary ownership, not every successful staffing choice.
-
-## Substrate activities
-
-| Activity | Wants | Minds, in order (blocked if none) |
-|---|---|---|
-| General user conversation | breadth and proportionate judgment | sol[medium], sonnet[medium], opus[medium], astra[high], fable[high] |
-| Onboarding or product discovery | intent and constraints | astra[high], fable[high], sol[high], opus[high] |
-| Narrow failure classification or log triage | inspectable factual evidence | luna[low], haiku, terra[low], sol[medium], sonnet[medium] |
-| Guidance or law authoring | coherent authority and composed behavior | astra[high], sol[xhigh], fable[high] |
-| Guidance or law review | independent judgment of authority, consistency and supported behavior | Actual Codex producer: claude-opus-5-5[high]; actual Claude producer: gpt-6-astra[high]. Apply the opposite-harness contract above. |
+The complete workflow requires both Codex and Claude. Claude-only operation lacks
+the configured Codex PDO/orchestration and implementation choices and Codex review
+of Claude-authored work. Codex-only operation lacks Claude specification and Claude
+review of Codex-authored work. Preserve permitted useful work, but state the unmet
+activity instead of claiming end-to-end support or overriding family restrictions.
+Model access remains its existing owner's obligation; Main is not a fallback worker.
