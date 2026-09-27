@@ -938,7 +938,18 @@ fn run_api_key_onboarding(
     ceremony: &Ceremony<'_>,
 ) -> Result<(), String> {
     let key = read_api_key(provider)?;
-    validate_api_key(provider, &key, machine, ceremony.deadline)?;
+    let configured_model = if provider == "opencode-go" {
+        std::env::var("TIGHTBEAM_DEFAULT_MODEL").ok()
+    } else {
+        None
+    };
+    validate_api_key(
+        provider,
+        &key,
+        machine,
+        configured_model.as_deref(),
+        ceremony.deadline,
+    )?;
     match provider {
         "openai" => bank_openai_api_key(staging, &key, ceremony),
         "anthropic" => bank_anthropic_api_key(staging, &key),
@@ -1020,9 +1031,31 @@ fn opencode_go_validation_request_id() -> String {
     format!("tightbeam-onboard-{}-{minted}", std::process::id())
 }
 
-fn opencode_go_validation_body() -> serde_json::Value {
+fn opencode_go_validation_model(configured: Option<&str>) -> Result<&str, String> {
+    match configured {
+        Some(configured) => configured
+            .strip_prefix("opencode-go/")
+            .filter(|model| !model.is_empty())
+            .ok_or_else(|| {
+                format!(
+                    "OpenCode Go API-key validation is unverified because the configured model \
+                 selection {configured:?} is not an OpenCode Go model. No authenticated request \
+                 was made and nothing was banked. Set TIGHTBEAM_DEFAULT_MODEL to an \
+                 opencode-go/<model> selection and retry."
+                )
+            }),
+        None => Err(
+            "OpenCode Go API-key validation is unverified because no configured model selection \
+             is available. No authenticated request was made and nothing was banked. Set \
+             TIGHTBEAM_DEFAULT_MODEL to an opencode-go/<model> selection and retry."
+                .to_owned(),
+        ),
+    }
+}
+
+fn opencode_go_validation_body(model: &str) -> serde_json::Value {
     serde_json::json!({
-        "model": "gpt-5.6-luna",
+        "model": model,
         "input": [{
             "role": "user",
             "content": [{"type": "input_text", "text": "Reply with OK."}]
@@ -1052,13 +1085,21 @@ fn validate_api_key(
     provider: &str,
     key: &str,
     machine: Option<&str>,
+    configured_model: Option<&str>,
     deadline: Instant,
 ) -> Result<(), String> {
     let host = machine.map(str::to_owned).unwrap_or_else(this_host);
     let provider = provider.to_owned();
     let key = key.to_owned();
+    let configured_model = configured_model.map(str::to_owned);
     validation_before_deadline(deadline, "API-key validation", move |remaining| {
-        validate_api_key_with_timeout(&provider, &key, &host, remaining)
+        validate_api_key_with_timeout(
+            &provider,
+            &key,
+            &host,
+            configured_model.as_deref(),
+            remaining,
+        )
     })
 }
 
@@ -1066,6 +1107,7 @@ fn validate_api_key_with_timeout(
     provider: &str,
     key: &str,
     host: &str,
+    configured_model: Option<&str>,
     timeout: Duration,
 ) -> Result<(), String> {
     let agent = validation_agent(timeout);
@@ -1088,6 +1130,7 @@ fn validate_api_key_with_timeout(
             agent.get(url).set(name, &value).call()
         }
         "opencode-go" => {
+            let model = opencode_go_validation_model(configured_model)?;
             let request_id = opencode_go_validation_request_id();
             agent
                 .post("https://opencode.ai/zen/go/v1/responses")
@@ -1096,7 +1139,7 @@ fn validate_api_key_with_timeout(
                 .set("x-opencode-session", &request_id)
                 .set("x-client-request-id", &request_id)
                 .set("content-type", "application/json")
-                .send_string(&opencode_go_validation_body().to_string())
+                .send_string(&opencode_go_validation_body(model).to_string())
         }
         #[cfg(test)]
         "fixture-provider" => return Ok(()),
@@ -1113,16 +1156,41 @@ fn validate_api_key_with_timeout(
                 }
                 Err(_) => "<unreadable response body>".to_owned(),
             };
-            Err(format!(
-                "the {provider} API key was rejected on {host}: HTTP {status} {}. Nothing was \
-                 banked -- the {provider} credential on {host} is unchanged.",
-                body.trim()
+            Err(api_key_status_error(
+                provider,
+                configured_model,
+                status,
+                body.trim(),
+                host,
             ))
         }
         Err(ureq::Error::Transport(error)) => {
             Err(unvalidated_api_key(provider, &error.to_string(), host))
         }
     }
+}
+
+fn api_key_status_error(
+    provider: &str,
+    configured_model: Option<&str>,
+    status: u16,
+    body: &str,
+    host: &str,
+) -> String {
+    if provider == "opencode-go" && status != 401 {
+        let selection = configured_model.unwrap_or("<missing>");
+        return format!(
+            "OpenCode Go validation did not establish that the API key is invalid on {host}: \
+             configured selection {selection:?} returned HTTP {status} {body}. This may be a \
+             model or access rejection. Nothing was banked and the opencode-go credential on \
+             {host} is unchanged."
+        );
+    }
+
+    format!(
+        "the {provider} API key was rejected on {host}: HTTP {status} {body}. Nothing was \
+         banked -- the {provider} credential on {host} is unchanged."
+    )
 }
 
 fn cursor_api_key_probe(key: &str) -> (&'static str, (&'static str, String)) {
@@ -2794,15 +2862,73 @@ mod tests {
     }
 
     #[test]
-    fn opencode_go_validation_uses_the_live_pi_request_shape() {
-        let body = opencode_go_validation_body();
+    fn opencode_go_validation_uses_the_configured_pi_request_shape() {
+        let body = opencode_go_validation_body("synthetic-alpha");
 
-        assert_eq!(body["model"], "gpt-5.6-luna");
+        assert_eq!(body["model"], "synthetic-alpha");
         assert_eq!(body["max_output_tokens"], 16);
         assert_eq!(body["stream"], false);
         assert_eq!(body["store"], false);
         assert!(body.get("session_id").is_none());
         assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
+    }
+
+    #[test]
+    fn opencode_go_validation_follows_provider_applicable_configuration() {
+        assert_eq!(
+            opencode_go_validation_model(Some("opencode-go/synthetic-alpha")),
+            Ok("synthetic-alpha")
+        );
+        assert_eq!(
+            opencode_go_validation_model(Some("opencode-go/synthetic-beta")),
+            Ok("synthetic-beta")
+        );
+
+        for configured in [
+            None,
+            Some("local-lab/synthetic-alpha"),
+            Some("opencode-go/"),
+        ] {
+            let error = opencode_go_validation_model(configured).unwrap_err();
+            assert!(error.contains("unverified"), "{error}");
+            assert!(
+                error.contains("No authenticated request was made"),
+                "{error}"
+            );
+            assert!(error.contains("nothing was banked"), "{error}");
+            assert!(!error.contains("API key is invalid"), "{error}");
+        }
+    }
+
+    #[test]
+    fn opencode_go_model_rejection_does_not_blame_the_credential() {
+        for status in [400, 403, 404, 422] {
+            let error = api_key_status_error(
+                "opencode-go",
+                Some("opencode-go/synthetic-alpha"),
+                status,
+                "model unavailable",
+                "fixture-host",
+            );
+            assert!(
+                error.contains("may be a model or access rejection"),
+                "{error}"
+            );
+            assert!(
+                error.contains("did not establish that the API key is invalid"),
+                "{error}"
+            );
+            assert!(!error.contains("API key was rejected"), "{error}");
+        }
+
+        let invalid = api_key_status_error(
+            "opencode-go",
+            Some("opencode-go/synthetic-alpha"),
+            401,
+            "invalid token",
+            "fixture-host",
+        );
+        assert!(invalid.contains("API key was rejected"), "{invalid}");
     }
 
     /// A subscription credential is a BEARER token, and sending it as `x-api-key` would
