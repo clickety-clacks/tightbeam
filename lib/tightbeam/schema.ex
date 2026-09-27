@@ -4330,8 +4330,7 @@ defmodule Tightbeam.Schema do
                :ok
 
              [[@identity_publication_denial_diagnostic_previous_shape]] ->
-               :ok =
-                 Tightbeam.AdminProjection.add_identity_denial_diagnostic_column_in_txn(txn)
+               :ok = Tightbeam.AdminProjection.add_identity_denial_diagnostic_column_in_txn(txn)
 
                Txn.q(txn, "UPDATE schema_stamp SET shape=?1, stampedAt=?2 WHERE shape=?3", [
                  @identity_publication_denial_diagnostic_shape,
@@ -4472,8 +4471,7 @@ defmodule Tightbeam.Schema do
         """
       )
 
-    [[rebuilt_marker_sequence]] =
-      Txn.q(txn, "SELECT COALESCE(MAX(id), 0) FROM subagent_markers")
+    [[rebuilt_marker_sequence]] = Txn.q(txn, "SELECT COALESCE(MAX(id), 0) FROM subagent_markers")
 
     marker_sequence = max(marker_sequence, rebuilt_marker_sequence)
 
