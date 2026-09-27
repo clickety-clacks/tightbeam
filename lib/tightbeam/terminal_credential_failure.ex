@@ -208,12 +208,12 @@ defmodule Tightbeam.TerminalCredentialFailure do
           when shape in [
                  "terminal-credential-failure-v1-019",
                  "delivery-owner-reparent-v1-019",
-                 "artifact-origin-v1-019"
+                 "artifact-origin-v1-019",
+                 "identity-publication-denial-diagnostic-v1-019"
                ] ->
             readonly_views_from_conn(conn)
 
-          _other_shape ->
-            []
+          _other_shape -> []
         end
       after
         Exqlite.Sqlite3.close(conn)
