@@ -757,6 +757,7 @@ fn spawn_send(
             predicate: None,
             assignment_id: None,
             after_turn: false,
+            replace_queued: false,
             idempotency_key: frame.idempotency_key,
             class: None,
         };

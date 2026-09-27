@@ -24,8 +24,307 @@ defmodule Tightbeam.QueuedMessageSuppression do
   );
   """
 
+  @replacement_requests_ddl """
+  CREATE TABLE IF NOT EXISTS queued_message_replacement_requests (
+    wakeId       TEXT PRIMARY KEY REFERENCES wakes(wakeId) ON DELETE RESTRICT,
+    assignmentId TEXT NOT NULL REFERENCES assignments(id) ON DELETE RESTRICT,
+    requestedAt  INTEGER NOT NULL CHECK(requestedAt >= 0)
+  );
+  CREATE INDEX IF NOT EXISTS queued_message_replacement_assignment
+    ON queued_message_replacement_requests(assignmentId, requestedAt);
+  """
+
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
-  def ensure_schema(db \\ DB), do: DB.execute(db, @ddl)
+  def ensure_schema(db \\ DB) do
+    with :ok <- DB.execute(db, @ddl),
+         :ok <- DB.execute(db, @replacement_requests_ddl) do
+      :ok
+    end
+  end
+
+  @doc "Persist the sender's explicit replacement scope on its durable wake row."
+  @spec record_replacement_request_in_txn(Txn.t(), String.t(), String.t()) :: :ok
+  def record_replacement_request_in_txn(%Txn{} = txn, wake_id, assignment_id)
+      when is_binary(wake_id) and is_binary(assignment_id) do
+    Txn.q(
+      txn,
+      """
+      INSERT INTO queued_message_replacement_requests(wakeId,assignmentId,requestedAt)
+      VALUES (?1,?2,?3)
+      """,
+      [wake_id, assignment_id, System.system_time(:millisecond)]
+    )
+
+    :ok
+  end
+
+  @doc "Copy an explicit replacement request when the wake retry creates a new durable row."
+  @spec copy_replacement_request_in_txn(Txn.t(), String.t(), String.t()) :: :ok
+  def copy_replacement_request_in_txn(%Txn{} = txn, source_wake_id, replacement_wake_id) do
+    Txn.q(
+      txn,
+      """
+      INSERT OR IGNORE INTO queued_message_replacement_requests(wakeId,assignmentId,requestedAt)
+      SELECT ?2,assignmentId,requestedAt
+      FROM queued_message_replacement_requests WHERE wakeId=?1
+      """,
+      [source_wake_id, replacement_wake_id]
+    )
+
+    :ok
+  end
+
+  @doc "Return the explicit assignment scope requested for one wake, if any."
+  @spec replacement_assignment_id_in_txn(Txn.t(), String.t() | nil) :: String.t() | nil
+  def replacement_assignment_id_in_txn(_txn, nil), do: nil
+
+  def replacement_assignment_id_in_txn(%Txn{} = txn, wake_id) when is_binary(wake_id) do
+    case Txn.q(
+           txn,
+           "SELECT assignmentId FROM queued_message_replacement_requests WHERE wakeId=?1",
+           [wake_id]
+         ) do
+      [[assignment_id]] -> assignment_id
+      [] -> nil
+    end
+  end
+
+  @doc "Terminalize this sender's older eligible turns for the exact holder and assignment."
+  @spec replace_own_queued_in_txn(Txn.t(), pos_integer(), map()) :: [pos_integer()]
+  def replace_own_queued_in_txn(%Txn{} = txn, replacement_seq, attrs) do
+    assignment_id = replacement_assignment_id_in_txn(txn, Map.get(attrs, :wake_id))
+
+    session_key = Map.get(attrs, :session_key)
+    origin = Map.get(attrs, :origin)
+    sender_session_key =
+      replacement_sender_session_in_txn(txn, assignment_id, Map.get(attrs, :wake_id))
+
+    if valid_replacement_request?(
+         txn,
+         assignment_id,
+         session_key,
+         origin,
+         sender_session_key,
+         Map.get(attrs, :wake_id),
+         attrs
+       ) do
+      candidates =
+        Txn.q(
+          txn,
+          """
+          SELECT t.seq,t.createdAt,t.wakeId,t.requestRef,t.origin,w.createdAt,w.targetGate,
+                 w.consumer,w.waitMode,w.obligationRef
+          FROM turns t
+          LEFT JOIN wakes w ON w.wakeId=t.wakeId
+          WHERE t.sessionKey=?1 AND t.status='queued' AND t.seq<>?2
+            AND (
+              (t.wakeId IS NULL AND t.assignmentId=?3 AND t.origin=?5 AND EXISTS (
+                SELECT 1 FROM assignments a
+                WHERE a.id=t.assignmentId AND a.openedBySession=?4
+              ))
+              OR
+              (t.wakeId IS NOT NULL AND w.creatorSessionKey=?4 AND (
+                w.assignmentId=?3 OR EXISTS (
+                  SELECT 1 FROM queued_message_replacement_requests r
+                  WHERE r.wakeId=t.wakeId AND r.assignmentId=?3
+                )
+              ))
+            )
+            AND (t.wakeId IS NULL OR w.wakeId IS NOT NULL)
+            AND NOT EXISTS (
+              SELECT 1 FROM queued_message_scopes s WHERE s.turnSeq=t.seq
+            )
+          ORDER BY t.seq
+          """,
+          [session_key, replacement_seq, assignment_id, sender_session_key, origin]
+        )
+
+      Enum.reduce(candidates, [], fn row, replaced ->
+        case replaceable_source(row) do
+          {:ok, source} ->
+            if Ledger.cancel_queued_in_txn(
+                 txn,
+                 source.turn_seq,
+                 "sender_requested_replacement"
+               ) do
+              record_replacement_in_txn(
+                txn,
+                source,
+                assignment_id,
+                session_key,
+                origin,
+                sender_session_key,
+                replacement_seq,
+                Map.get(attrs, :wake_id)
+              )
+
+              [source.turn_seq | replaced]
+            else
+              replaced
+            end
+
+          :protected ->
+            replaced
+        end
+      end)
+      |> Enum.reverse()
+    else
+      []
+    end
+  end
+
+  defp valid_replacement_request?(
+         txn,
+         assignment_id,
+         session_key,
+         origin,
+         sender_session_key,
+         wake_id,
+         attrs
+       ) do
+    is_binary(assignment_id) and String.trim(assignment_id) != "" and
+      is_binary(session_key) and String.trim(session_key) != "" and
+      is_binary(sender_session_key) and String.trim(sender_session_key) != "" and
+      replacement_origin_matches_sender?(txn, origin, sender_session_key) and
+      Map.get(attrs, :queue_message_kind) == nil and
+      not decision_ref?(Map.get(attrs, :request_ref)) and
+      Txn.q(
+        txn,
+        "SELECT 1 FROM assignments WHERE id=?1 AND holderKey=?2 AND state='open'",
+        [assignment_id, session_key]
+      ) == [[1]] and
+      replacement_wake_is_ordinary?(txn, wake_id, origin, sender_session_key)
+  end
+
+  defp replacement_sender_session_in_txn(_txn, nil, _wake_id), do: nil
+
+  defp replacement_sender_session_in_txn(txn, assignment_id, nil) do
+    case Txn.q(txn, "SELECT openedBySession FROM assignments WHERE id=?1", [assignment_id]) do
+      [[session_key]] -> session_key
+      [] -> nil
+    end
+  end
+
+  defp replacement_sender_session_in_txn(txn, _assignment_id, wake_id) do
+    case Txn.q(txn, "SELECT creatorSessionKey FROM wakes WHERE wakeId=?1", [wake_id]) do
+      [[session_key]] -> session_key
+      [] -> nil
+    end
+  end
+
+  defp replaceable_origin?(origin) when is_binary(origin) do
+    String.starts_with?(origin, "agent:") or String.starts_with?(origin, "session:")
+  end
+
+  defp replaceable_origin?(_origin), do: false
+
+  defp replacement_origin_matches_sender?(_txn, "session:" <> origin_session, sender),
+    do: origin_session == sender
+
+  defp replacement_origin_matches_sender?(txn, "agent:" <> role, sender) do
+    Txn.q(
+      txn,
+      "SELECT 1 FROM roles WHERE name=?1 AND boundSessionKey=?2",
+      [role, sender]
+    ) == [[1]]
+  end
+
+  defp replacement_origin_matches_sender?(_txn, _origin, _sender), do: false
+
+  defp replacement_wake_is_ordinary?(_txn, nil, _origin, _sender_session_key), do: true
+
+  defp replacement_wake_is_ordinary?(txn, wake_id, origin, sender_session_key) do
+    case Txn.q(
+           txn,
+           """
+           SELECT origin,creatorSessionKey,targetGate,consumer,waitMode,obligationRef
+           FROM wakes WHERE wakeId=?1
+           """,
+           [wake_id]
+         ) do
+      [[^origin, ^sender_session_key, target_gate, "prompt", nil, nil]]
+      when target_gate != 0 ->
+        true
+
+      _ -> false
+    end
+  end
+
+  defp replaceable_source([
+         seq,
+         turn_created_at,
+         wake_id,
+         request_ref,
+         origin,
+         wake_created_at,
+         target_gate,
+         consumer,
+         wait_mode,
+         obligation_ref
+       ]) do
+    cond do
+      decision_ref?(request_ref) ->
+        :protected
+
+      not replaceable_origin?(origin) ->
+        :protected
+
+      is_nil(wake_id) ->
+        {:ok,
+         %{
+           turn_seq: seq,
+           turn_created_at: turn_created_at,
+           wake_id: nil,
+           wake_created_at: nil
+         }}
+
+      target_gate == 0 or consumer != "prompt" or not is_nil(wait_mode) or
+          not is_nil(obligation_ref) ->
+        :protected
+
+      true ->
+        {:ok,
+         %{
+           turn_seq: seq,
+           turn_created_at: turn_created_at,
+           wake_id: wake_id,
+           wake_created_at: wake_created_at
+         }}
+    end
+  end
+
+  defp record_replacement_in_txn(
+         txn,
+         source,
+         assignment_id,
+         session_key,
+         origin,
+         sender_session_key,
+         replacement_seq,
+         replacement_wake_id
+       ) do
+    EventLog.lifecycle_in_txn(
+      txn,
+      "queued_message_suppressed",
+      Integer.to_string(source.turn_seq),
+      JSON.encode!(%{
+        turnSeq: source.turn_seq,
+        messageKind: "sender-replacement",
+        scopeKind: "assignment",
+        scopeId: assignment_id,
+        cause: "sender_requested_replacement",
+        sourceCreatedAt: source.turn_created_at,
+        sourceKind: if(source.wake_id, do: "wake", else: "turn"),
+        sourceId: source.wake_id || Integer.to_string(source.turn_seq),
+        sourceObservedAt: source.wake_created_at || source.turn_created_at,
+        senderOrigin: origin,
+        senderSessionKey: sender_session_key,
+        holderSessionKey: session_key,
+        replacementTurnSeq: replacement_seq,
+        replacementWakeId: replacement_wake_id
+      })
+    )
+  end
 
   @doc "Bind an eligible queued liveness notice to its exact durable wake."
   @spec record_in_txn(Txn.t(), pos_integer(), map()) :: :ok

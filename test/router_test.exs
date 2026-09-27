@@ -2066,6 +2066,25 @@ defmodule Tightbeam.Wire.RouterTest do
       refute Map.has_key?(params, :request_ref)
     end
 
+    replacement =
+      Router.atomize_params_for_test("wake", %{
+        "replaceQueued" => true,
+        "assignmentId" => "asg_replace",
+        "requestRef" => "dr_forged"
+      })
+
+    assert replacement.replacement_assignment_id == "asg_replace"
+    refute Map.has_key?(replacement, :assignment_id)
+    refute Map.has_key?(replacement, :request_ref)
+
+    forged_replacement =
+      Router.atomize_params_for_test("wake", %{
+        "replaceQueued" => true,
+        "replacementAssignmentId" => "asg_forged"
+      })
+
+    refute Map.has_key?(forged_replacement, :replacement_assignment_id)
+
     for malformed <- [%{"afterTurn" => false}, %{"afterTurn" => "true"}, %{"predicate" => nil}] do
       params =
         Router.atomize_params_for_test("wake", Map.put(malformed, "assignmentId", "asg_named"))

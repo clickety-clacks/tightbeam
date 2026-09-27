@@ -2115,7 +2115,7 @@ defmodule Tightbeam.Wire.Router do
   # spec's "stripped from any agent/dispatch param map" is read as scoped to the
   # carrier it is written about, not to the parameter name everywhere.
   @substrate_only_params %{
-    "wake" => ~w(request_ref)a,
+    "wake" => ~w(request_ref replacement_assignment_id)a,
     "operator-rule" => ~w(ruled_via_session_key)a,
     "work-item-create" => ~w(created_in_turn_seq created_context_known)a,
     # The artifact's turn edge and the class of evidence behind it are the
@@ -2165,9 +2165,18 @@ defmodule Tightbeam.Wire.Router do
   end
 
   defp strip_notification_assignment(params, "wake") do
-    if params[:after_turn] == true or is_map(params[:predicate]),
-      do: params,
-      else: Map.delete(params, :assignment_id)
+    cond do
+      params[:after_turn] == true or is_map(params[:predicate]) ->
+        params
+
+      params[:replace_queued] == true and is_binary(params[:assignment_id]) ->
+        params
+        |> Map.put(:replacement_assignment_id, params.assignment_id)
+        |> Map.delete(:assignment_id)
+
+      true ->
+        Map.delete(params, :assignment_id)
+    end
   end
 
   defp strip_notification_assignment(params, _verb), do: params

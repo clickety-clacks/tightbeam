@@ -136,6 +136,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             predicate,
             assignment_id,
             after_turn,
+            replace_queued,
             idempotency_key,
             class,
         } => {
@@ -162,6 +163,9 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             }
             if *after_turn {
                 params.push("\"afterTurn\":true".to_owned());
+            }
+            if *replace_queued {
+                params.push("\"replaceQueued\":true".to_owned());
             }
             for (name, value) in [
                 ("conditionKind", condition_kind),
@@ -2896,6 +2900,22 @@ mod tests {
                 "flynn"
             ]),
             r#"{"asUser":"flynn","verb":"wake","role":"reviewer","params":{"prompt":"go"}}"#
+        );
+
+        assert_eq!(
+            body(&[
+                "wake",
+                "--session",
+                "agent:r",
+                "--assignment",
+                "asg_a",
+                "--replace-queued",
+                "--prompt",
+                "new instruction",
+                "--as",
+                "coder"
+            ]),
+            r#"{"as":"coder","verb":"wake","sessionKey":"agent:r","params":{"prompt":"new instruction","assignmentId":"asg_a","replaceQueued":true}}"#
         );
         assert_eq!(
             body(&[

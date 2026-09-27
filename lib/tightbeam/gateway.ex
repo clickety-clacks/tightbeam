@@ -5750,6 +5750,16 @@ defmodule Tightbeam.Gateway do
   end
 
   defp schedule_wake_in_txn(txn, call, session_key, due_at) do
+    case replacement_assignment_id_in_txn(txn, call, session_key) do
+      {:ok, replacement_assignment_id} ->
+        schedule_wake_in_txn(txn, call, session_key, due_at, replacement_assignment_id)
+
+      {:error, error} ->
+        error
+    end
+  end
+
+  defp schedule_wake_in_txn(txn, call, session_key, due_at, replacement_assignment_id) do
     p = call.params
 
     cond do
@@ -5760,7 +5770,17 @@ defmodule Tightbeam.Gateway do
           p[:assignment_id],
           p[:supervision_wake_kind],
           session_key,
-          fn -> schedule_wake_row_in_txn(txn, call, session_key, due_at, nil, nil) end
+          fn ->
+            schedule_wake_row_in_txn(
+              txn,
+              call,
+              session_key,
+              due_at,
+              nil,
+              nil,
+              replacement_assignment_id
+            )
+          end
         )
 
       is_map(p[:predicate]) or p[:after_turn] == true ->
@@ -5771,6 +5791,7 @@ defmodule Tightbeam.Gateway do
           prompt: p.prompt,
           due_at: due_at,
           assignment_id: p[:assignment_id],
+          replacement_assignment_id: replacement_assignment_id,
           predicate: p[:predicate],
           after_turn: p[:after_turn] == true,
           registrant_session_key: creator_session_key(call[:principal]),
@@ -5800,7 +5821,8 @@ defmodule Tightbeam.Gateway do
                 session_key,
                 due_at,
                 "subagent_stop",
-                subagent_ref
+                subagent_ref,
+                replacement_assignment_id
               )
             end
         end
@@ -5812,7 +5834,8 @@ defmodule Tightbeam.Gateway do
           session_key,
           due_at,
           p[:condition_kind],
-          p[:condition_scope]
+          p[:condition_scope],
+          replacement_assignment_id
         )
     end
   end
@@ -5927,13 +5950,20 @@ defmodule Tightbeam.Gateway do
     predicate? = is_map(p[:predicate])
     after_turn_present? = Map.has_key?(p, :after_turn)
     after_turn? = p[:after_turn] == true
+    replace_present? = Map.has_key?(p, :replace_queued)
+    replace_queued? = p[:replace_queued] == true
     wait? = predicate? or after_turn?
 
     cond do
       predicate_present? and not predicate? -> false
       after_turn_present? and not after_turn? -> false
+      replace_present? and p[:replace_queued] not in [true, false] -> false
       predicate? and after_turn? -> false
       wait? and not (is_binary(p[:assignment_id]) and p.assignment_id != "") -> false
+      replace_queued? and
+          not (is_binary(p[:replacement_assignment_id]) and p.replacement_assignment_id != "") ->
+        false
+      replace_queued? and wait? -> false
       wait? and is_binary(p[:condition_kind]) -> false
       predicate? and is_nil(p[:after_ms]) and is_nil(p[:at]) -> false
       after_turn? and (not is_nil(p[:after_ms]) or not is_nil(p[:at])) -> false
@@ -5964,7 +5994,8 @@ defmodule Tightbeam.Gateway do
          session_key,
          due_at,
          condition_kind,
-         condition_scope
+         condition_scope,
+         replacement_assignment_id
        ) do
     case revalidate_remedy_assignment_in_txn(txn, call) do
       :ready ->
@@ -5974,7 +6005,8 @@ defmodule Tightbeam.Gateway do
           session_key,
           due_at,
           condition_kind,
-          condition_scope
+          condition_scope,
+          replacement_assignment_id
         )
 
       :assignment_not_open ->
@@ -6008,7 +6040,8 @@ defmodule Tightbeam.Gateway do
          session_key,
          due_at,
          condition_kind,
-         condition_scope
+         condition_scope,
+         replacement_assignment_id
        ) do
     p = call.params
 
@@ -6026,7 +6059,10 @@ defmodule Tightbeam.Gateway do
         # A class is the sender's election. An explicit time is also the
         # sender's election and inhibits batching without discarding the class.
         class: p[:class],
-        sender_scheduled: not is_nil(p[:at]) or not is_nil(p[:after_ms]),
+        replacement_assignment_id: replacement_assignment_id,
+        sender_scheduled:
+          not is_nil(p[:at]) or not is_nil(p[:after_ms]) or
+            not is_nil(replacement_assignment_id),
         reresolve: p[:reresolve],
         reresolve_seed: p[:reresolve_seed],
         reresolve_rung: p[:reresolve_rung],
@@ -6085,8 +6121,50 @@ defmodule Tightbeam.Gateway do
         # would strand an unfireable controller. Roll the handler transaction
         # back so wake and sidecar remain all-or-nothing.
         raise "incompatible_supervision_liveness_v1: controller schedule :duplicate"
+      end
+  end
+
+  defp replacement_assignment_id_in_txn(txn, call, session_key) do
+    if call.params[:replace_queued] == true do
+      assignment_id = call.params[:replacement_assignment_id]
+
+      with {:session, sender_session} <- call.principal,
+           true <- replacement_origin_matches_sender?(txn, call.origin, sender_session),
+           true <- is_binary(assignment_id) and assignment_id != "",
+           [[1]] <-
+             DB.Txn.q(
+               txn,
+               "SELECT 1 FROM assignments WHERE id=?1 AND holderKey=?2 AND state='open'",
+               [assignment_id, session_key]
+             ),
+           true <- not (is_map(call.params[:predicate]) or call.params[:after_turn] == true) do
+        {:ok, assignment_id}
+      else
+        _ ->
+          {:error,
+           %{
+             code: "replace_queued_refused",
+             message:
+               "--replace-queued requires a session sender and its open assignment's holder"
+           }}
+      end
+    else
+      {:ok, nil}
     end
   end
+
+  defp replacement_origin_matches_sender?(_txn, "session:" <> origin_session, sender),
+    do: origin_session == sender
+
+  defp replacement_origin_matches_sender?(txn, "agent:" <> role, sender) do
+    DB.Txn.q(
+      txn,
+      "SELECT 1 FROM roles WHERE name=?1 AND boundSessionKey=?2",
+      [role, sender]
+    ) == [[1]]
+  end
+
+  defp replacement_origin_matches_sender?(_txn, _origin, _sender), do: false
 
   defp schedule_supervision_controller_in_txn(
          _txn,
