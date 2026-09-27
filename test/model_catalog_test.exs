@@ -362,10 +362,31 @@ defmodule Tightbeam.ModelCatalogTest do
     refute Tightbeam.TerminalCredentialFailure.open?(ctx.db, @host, "codex")
     assert Tightbeam.TerminalCredentialFailure.views(ctx.db) == []
 
-    assert {:ok, [["resolved", ^fact_id]]} =
+    restoration_scope = Tightbeam.TerminalCredentialFailure.scope(@host, "codex")
+
+    assert {:ok,
+            [
+              [
+                "resolved",
+                ^fact_id,
+                "catalog-terminal-credential-restored",
+                ^restoration_scope,
+                ^incident_id,
+                ^fact_id,
+                1
+              ]
+            ]} =
              Tightbeam.DB.query(
                ctx.db,
-               "SELECT state,resolutionFactId FROM terminal_credential_incidents WHERE id=?1",
+               """
+               SELECT i.state,i.consumedFactId,f.kind,f.scope,o.incidentId,o.factId,
+                      i.resolutionFactId <> i.consumedFactId
+               FROM terminal_credential_incidents i
+               JOIN condition_facts f ON f.id=i.resolutionFactId
+               JOIN terminal_credential_observations o
+                 ON o.incidentId=i.id AND o.kind='resolution'
+               WHERE i.id=?1
+               """,
                [incident_id]
              )
   end
