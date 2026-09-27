@@ -1,5 +1,9 @@
 defmodule Tightbeam.CredentialsTest do
-  use ExUnit.Case, async: true
+  # Synchronous: the remote-status cases shell out under the 5 s default
+  # `GenServer.call`, terminal parking awaits onboarding under the 5 s default
+  # `Task.await`, and the hollow-home case boots a child BEAM. In the async phase
+  # they share the runner with up to max_cases modules and test-file compilation.
+  use Tightbeam.TestCase, async: false
 
   alias Tightbeam.Credentials
 

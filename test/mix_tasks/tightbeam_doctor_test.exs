@@ -410,15 +410,6 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
     refute File.exists?(db_path)
   end
 
-  @tag :tmp_dir
-  test "org_hosts reads a present hosts table through the read-only open", %{tmp_dir: tmp} do
-    Tightbeam.GuardRuntimeFixture.run!(
-      tmp,
-      "guard_doctor_runtime.exs",
-      "guarded-doctor-readonly: ok"
-    )
-  end
-
   test "human and JSON formats expose status, detail, fixes, and readiness", ctx do
     {0, report} = Doctor.evaluate(ctx.catalog, ctx.inputs)
     human = Doctor.format(report, :human)
@@ -542,5 +533,20 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
     |> String.split("\n")
     |> Enum.drop_while(&String.starts_with?(&1, "//"))
     |> Enum.join("\n")
+  end
+end
+
+defmodule Mix.Tasks.Tightbeam.DoctorRuntimeTest do
+  # The child-BEAM case runs outside the async phase, where it would share the
+  # runner with up to max_cases async modules and test-file compilation.
+  use Tightbeam.TestCase, async: false
+
+  @tag :tmp_dir
+  test "org_hosts reads a present hosts table through the read-only open", %{tmp_dir: tmp} do
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "guard_doctor_runtime.exs",
+      "guarded-doctor-readonly: ok"
+    )
   end
 end
