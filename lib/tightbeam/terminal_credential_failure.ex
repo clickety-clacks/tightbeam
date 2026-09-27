@@ -213,7 +213,8 @@ defmodule Tightbeam.TerminalCredentialFailure do
                ] ->
             readonly_views_from_conn(conn)
 
-          _other_shape -> []
+          _other_shape ->
+            []
         end
       after
         Exqlite.Sqlite3.close(conn)
