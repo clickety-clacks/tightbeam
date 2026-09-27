@@ -454,6 +454,103 @@ defmodule Tightbeam.CredentialsTest do
              {:unavailable, %{host: "worker", provider: :openai, reason: {:transport, 255}}}
   end
 
+  test "default remote runner preserves onboarded and missing after credential presence checks",
+       ctx do
+    script = Path.join(ctx.base, "synthetic-ssh")
+    File.mkdir_p!(ctx.base)
+
+    File.write!(
+      script,
+      "#!/bin/sh\nwhile [ \"$1\" = '-o' ]; do shift 2; done\nshift\nexec /bin/sh -c \"$*\"\n"
+    )
+
+    File.chmod!(script, 0o700)
+
+    home = Tightbeam.Homes.home_path(ctx.base, "worker", :codex)
+    File.mkdir_p!(home)
+    credential = Path.join(home, "auth.json")
+    File.write!(credential, "synthetic credential presence")
+
+    {:ok, server} =
+      Credentials.start_link(
+        name: nil,
+        base_dir: ctx.base,
+        machine: "worker",
+        ssh: "worker",
+        ssh_bin: script
+      )
+
+    assert Credentials.status(:openai, server) == :onboarded
+    File.rm!(credential)
+    assert Credentials.status(:openai, server) == {:needs_onboarding, :missing}
+  end
+
+  test "local-openai remote presence transport failure stays unavailable", ctx do
+    home = Tightbeam.Homes.home_path(ctx.base, "worker", :pi)
+    File.mkdir_p!(home)
+
+    {:ok, server} =
+      start_credentials(
+        name: nil,
+        base_dir: ctx.base,
+        machine: "worker",
+        ssh: "worker",
+        sh: fn command ->
+          if Enum.any?(command, &String.contains?(&1, "/bin/ls -1")),
+            do: {"synthetic transport refusal", 255},
+            else: run_remote_command(command)
+        end
+      )
+
+    assert Credentials.status(:local_openai, server) ==
+             {:unavailable, %{host: "worker", provider: :local_openai, reason: {:transport, 255}}}
+  end
+
+  test "local-openai status cancellation stops its connected remote presence command", ctx do
+    File.mkdir_p!(ctx.base)
+    script = Path.join(ctx.base, "synthetic-ssh")
+    fifo = Path.join(ctx.base, "stalled-presence")
+    marker = Path.join(ctx.base, "presence-pid")
+    {"", 0} = System.cmd("mkfifo", [fifo])
+
+    File.write!(
+      script,
+      "#!/bin/sh\n" <>
+        "while [ \"$1\" = '-o' ]; do shift 2; done\n" <>
+        "shift\n" <>
+        "case \"$*\" in\n" <>
+        "  *'/bin/ls -1'*) printf '%s' \"$$\" > '#{marker}'; read line < '#{fifo}' ;;\n" <>
+        "  *) exec /bin/sh -c \"$*\" ;;\n" <>
+        "esac\n"
+    )
+
+    File.chmod!(script, 0o700)
+    File.mkdir_p!(Tightbeam.Homes.home_path(ctx.base, "worker", :pi))
+
+    {:ok, server} =
+      Credentials.start_link(
+        name: nil,
+        base_dir: ctx.base,
+        machine: "worker",
+        ssh: "worker",
+        ssh_bin: script
+      )
+
+    caller = Task.async(fn -> Credentials.status(:local_openai, server) end)
+
+    assert Enum.any?(1..100, fn _ ->
+             Process.sleep(10)
+             File.exists?(marker)
+           end)
+
+    assert {:ok, _staging, _lease_id} = Credentials.begin_onboard(:local_openai, server)
+    assert {:unavailable, %{reason: :lifecycle_changed}} = Task.await(caller, 1_000)
+
+    pid = File.read!(marker)
+    assert {_, code} = System.cmd("kill", ["-0", pid], stderr_to_stdout: true)
+    assert code != 0
+  end
+
   test "an expired remote lease is cleaned at the status read seam", ctx do
     clock = :counters.new(1, [])
     :counters.put(clock, 1, 1_000)

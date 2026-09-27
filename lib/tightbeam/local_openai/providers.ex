@@ -263,7 +263,15 @@ defmodule Tightbeam.LocalOpenAi.Providers do
       [ssh | Support.ssh_opts()] ++
         [target.host_config.ssh, "/bin/sh", "-c", Support.shell_quote(script)]
 
-    case Support.bounded_run(sh(target), argv, @remote_timeout_ms) do
+    # Credential status already owns this read in a deadline-bound worker. A
+    # nested bounded_run Task would swallow transport throws and keep its port
+    # out of reach of the worker's cancellation message.
+    result =
+      if Map.get(target, :status_direct_remote_run, false),
+        do: {:ok, sh(target).(argv)},
+        else: Support.bounded_run(sh(target), argv, @remote_timeout_ms)
+
+    case result do
       {:ok, {output, 0}} when is_binary(output) ->
         {:ok, output}
 

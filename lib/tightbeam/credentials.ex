@@ -849,7 +849,7 @@ defmodule Tightbeam.Credentials do
           | sh: fn argv ->
               result =
                 if state.status_default_sh,
-                  do: status_command(argv, deadline),
+                  do: status_command(argv, deadline, state.ssh_bin),
                   else: sh.(argv)
 
               case result do
@@ -860,21 +860,36 @@ defmodule Tightbeam.Credentials do
         }
 
       try do
-        credential_status(state, provider)
+        credential_status(Map.put(state, :status_direct_remote_run, true), provider)
       rescue
         _ -> unavailable(state.machine, provider, :probe_failed)
       catch
-        {:status_transport, code} -> unavailable(state.machine, provider, {:transport, code})
-        :status_timeout -> unavailable(state.machine, provider, :timeout)
-        _kind, _reason -> unavailable(state.machine, provider, :probe_failed)
+        {:status_transport, code} ->
+          unavailable(state.machine, provider, {:transport, code})
+
+        :status_timeout ->
+          unavailable(state.machine, provider, :timeout)
+
+        :status_executable_unavailable ->
+          unavailable(state.machine, provider, :command_unavailable)
+
+        _kind, _reason ->
+          unavailable(state.machine, provider, :probe_failed)
       end
     end
   end
 
-  defp status_command([binary | args], deadline) do
+  defp status_command([binary | args], deadline, ssh_bin) do
+    executable =
+      if binary == "ssh" and is_binary(ssh_bin),
+        do: ssh_bin,
+        else: System.find_executable(binary)
+
+    if not is_binary(executable), do: throw(:status_executable_unavailable)
+
     port =
       Port.open(
-        {:spawn_executable, binary},
+        {:spawn_executable, executable},
         [:binary, :exit_status, :stderr_to_stdout, args: args]
       )
 
@@ -1083,7 +1098,7 @@ defmodule Tightbeam.Credentials do
           | sh: fn argv ->
               result =
                 if state.status_default_sh,
-                  do: status_command(argv, deadline - @status_cleanup_ms),
+                  do: status_command(argv, deadline - @status_cleanup_ms, state.ssh_bin),
                   else: sh.(argv)
 
               case result do
@@ -1100,6 +1115,7 @@ defmodule Tightbeam.Credentials do
         catch
           {:status_transport, code} -> {:unavailable, {:transport, code}}
           :status_timeout -> {:unavailable, :timeout}
+          :status_executable_unavailable -> {:unavailable, :command_unavailable}
           _kind, _reason -> {:unavailable, :lease_cleanup_failed}
         end
       end
@@ -1385,7 +1401,12 @@ defmodule Tightbeam.Credentials do
       host_config: %{ssh: state.ssh, base_dir: state.base_dir},
       host_name: state.machine,
       sh: state.sh,
-      sh_out: state.sh_out
+      sh_out: state.sh_out,
+      status_direct_remote_run: Map.get(state, :status_direct_remote_run, false),
+      find_executable: fn
+        "ssh" -> state.ssh_bin
+        name -> System.find_executable(name)
+      end
     }
 
   # No anthropic entry: the subscription ceremony lives in the Rust CLI
