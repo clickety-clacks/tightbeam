@@ -108,7 +108,7 @@ defmodule Tightbeam.Firehose.Publisher do
   end
 
   defp canonical_in_txn(txn, %{verb: verb} = call, result)
-       when verb in ~w(work-item-create work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail) do
+       when verb in ~w(work-item-create work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail work-item-deprioritize work-item-boundary) do
     id = result[:id] || result["id"] || call.params[:work_item_id]
     StateResources.query_work_item(txn, id, call) || result
   end
@@ -447,7 +447,7 @@ defmodule Tightbeam.Firehose.Publisher do
   defp canonical_result(nil, _call, result), do: result
 
   defp canonical_result(db, %{verb: verb} = call, result)
-       when verb in ~w(work-item-create work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail) do
+       when verb in ~w(work-item-create work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail work-item-deprioritize work-item-boundary) do
     id = result[:id] || result["id"] || call.params[:work_item_id]
     StateResources.query_work_item(db, id, call) || result
   end

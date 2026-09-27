@@ -73,6 +73,64 @@ defmodule Tightbeam.Firehose.PublisherTest do
     refute_receive {:firehose_notice, %{"class" => "wake.scheduled"}}
   end
 
+  test "work-item notices use the shared stored projection and unchanged updates emit no state notice" do
+    db = :firehose_work_item_priority_db
+    start_supervised!({DB, path: ":memory:", name: db})
+    :ok = Tightbeam.Schema.ensure_all(db)
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('flynn',1,'admin_add',1)"
+      )
+
+    register_testhost(db)
+    handlers = Gateway.handlers(%{db: db})
+
+    call = %{
+      verb: "work-item-create",
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      session_key: nil,
+      params: %{title: "Priority parity", priority: 4}
+    }
+
+    assert {:ok, item} = Dispatch.dispatch(db, handlers, call)
+    observed_classes()
+    before = StateResources.query_work_item(db, item.id, call) |> StateResources.work_item()
+
+    update = %{call | verb: "work-item-update", params: %{work_item_id: item.id, priority: 4}}
+    assert {:ok, unchanged} = Dispatch.dispatch(db, handlers, update)
+    assert unchanged.id == item.id
+    assert observed_classes() == ["verb.accepted"]
+    assert StateResources.work_item(StateResources.query_work_item(db, item.id, call)) == before
+
+    assert {:ok, changed} =
+             Dispatch.dispatch(db, handlers, %{
+               update
+               | params: %{work_item_id: item.id, priority: 5}
+             })
+
+    assert changed.priority == 5
+    assert Map.has_key?(changed, :deliverableContract)
+    assert %{"class" => "verb.accepted"} = receive_notice()
+    assert %{"class" => "work_item.updated", "payload" => payload} = receive_notice()
+    assert payload["priority"] == 5
+    assert payload["rowVersion"] > before["rowVersion"]
+    assert payload == StateResources.work_item(StateResources.query_work_item(db, item.id, call))
+    refute_receive {:firehose_notice, %{"class" => "work_item.updated"}}
+
+    for verb <-
+          ~w(work-item-create work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail work-item-deprioritize work-item-boundary) do
+      notice_call = %{update | verb: verb}
+
+      notice =
+        Publisher.state_notice(db, notice_call, %{workItem: %{id: item.id, title: "stale"}})
+
+      assert notice["payload"] == payload
+    end
+  end
+
   test "post declares the message effect its committed delivery actually emits" do
     db = :firehose_post_effect_db
     registry = :firehose_post_effect_registry
