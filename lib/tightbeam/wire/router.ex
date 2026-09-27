@@ -352,7 +352,7 @@ defmodule Tightbeam.Wire.Router do
   end
 
   get "/api/sessions/:session_key" do
-    session_detail(conn, session_key)
+    core_detail(conn, Map.fetch!(@core_detail_specs, :sessions), session_key)
   end
 
   get "/api/sessions/:session_key/messages" do
@@ -715,76 +715,6 @@ defmodule Tightbeam.Wire.Router do
   end
 
   defp session_collection_offset(_), do: {:error, 400, "invalid_cursor", nil}
-
-  defp session_detail(conn, session_key) do
-    spec = Map.fetch!(@core_detail_specs, :sessions)
-    started_at = System.monotonic_time(:microsecond)
-
-    with {:ok, auth} <-
-           core_detail_operation(conn, spec.resource, :bearer_auth, fn ->
-             selected_session_auth(conn)
-           end),
-         {:ok, query} <-
-           core_detail_operation(conn, spec.resource, :query_decode, fn ->
-             decode_state_query(conn)
-           end),
-         {:ok, principal} <-
-           core_detail_operation(
-             conn,
-             spec.resource,
-             :principal_resolution,
-             fn -> selected_session_principal(auth, query) end
-           ),
-         :ok <-
-           core_detail_operation(
-             conn,
-             spec.resource,
-             :request_validation,
-             fn -> selected_session_detail_request(query) end
-           ),
-         {:ok, key} <-
-           core_detail_operation(
-             conn,
-             spec.resource,
-             :key_decode,
-             fn -> core_detail_key(spec.resource, session_key) end
-           ),
-         :ok <- core_detail_probe(conn, spec.resource, :lookup),
-         row <-
-           core_detail_operation(
-             conn,
-             spec.resource,
-             :row_lookup,
-             fn ->
-               core_detail_row(conn, spec, key, core_detail_trace_principal(conn, principal))
-             end
-           ),
-         true <- not is_nil(row),
-         :ok <- core_detail_probe(conn, spec.resource, :schema),
-         :ok <- core_detail_probe(conn, spec.resource, :serializer),
-         item <- core_detail_serialize(conn, spec, row),
-         :ok <- core_detail_probe(conn, spec.resource, :encoder),
-         item_bytes <- core_detail_encode(conn, spec.resource, item),
-         :ok <- core_detail_probe(conn, spec.resource, :envelope) do
-      core_detail_trace(conn, {:envelope, spec.resource})
-      state_send(conn, 200, state_detail_envelope(spec.resource, item_bytes))
-    else
-      false -> state_not_found(conn, spec.resource, started_at)
-      {:error, :not_found} -> state_not_found(conn, spec.resource, started_at)
-      {:error, status, code, message} -> state_error(conn, spec.resource, status, code, message)
-    end
-  rescue
-    _error in [ArgumentError, KeyError, MatchError] ->
-      state_error(conn, "sessions", 500, "projection_invalid", nil)
-  end
-
-  defp selected_session_detail_request(query) do
-    cond do
-      Map.has_key?(query, "asUser") -> {:error, 400, "invalid_as_user", nil}
-      query == %{} -> :ok
-      true -> {:error, 400, "invalid_filter", nil}
-    end
-  end
 
   defp selected_session_auth(conn) do
     case bearer_token(conn) do

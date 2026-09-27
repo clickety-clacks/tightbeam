@@ -563,52 +563,24 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
 
   test "AC6 applies the complete AU2 precedence table with exact bytes and headers", ctx do
     for %{path: path, resource: resource} <- core_detail_cases(ctx) do
-      organization_cases =
-        if resource == "sessions" do
-          [
-            {path, "tbc_core_detail", 403, "org_token_read_forbidden", nil,
-             [:bearer_auth, :query_decode, :principal_resolution]},
-            {path <> "?asUser=", "tbc_core_detail", 403, "org_token_read_forbidden", nil,
-             [:bearer_auth, :query_decode, :principal_resolution]},
-            {path <> "?asUser=flynn&asUser=flynn", "tbc_core_detail", 403,
-             "org_token_read_forbidden", nil,
-             [:bearer_auth, :query_decode, :principal_resolution]}
-          ]
-        else
-          [
-            {path, "tbc_core_detail", 400, "invalid_message", nil,
-             [:bearer_auth, :query_decode, :principal_resolution]},
-            {path <> "?asUser=", "tbc_core_detail", 400, "invalid_message", nil,
-             [:bearer_auth, :query_decode, :principal_resolution]},
-            {path <> "?asUser=flynn&asUser=flynn", "tbc_core_detail", 400, "invalid_as_user", nil,
-             [:bearer_auth, :query_decode, :principal_resolution]}
-          ]
-        end
-
-      session_identity_case =
-        if resource == "sessions" do
-          {path <> "?asUser=mallory", ctx.admin_session.cli_token, 400, "invalid_as_user", nil,
-           [:bearer_auth, :query_decode, :principal_resolution]}
-        else
-          {path <> "?asUser=mallory", ctx.admin_session.cli_token, 403, "identity_not_yours",
-           "this session belongs to flynn", [:bearer_auth, :query_decode, :principal_resolution]}
-        end
-
-      cases =
-        [
-          {path, "", 401, "auth_failed", nil, [:bearer_auth]},
-          {path, "invalid-token", 401, "auth_failed", nil, [:bearer_auth]}
-        ] ++
-          organization_cases ++
-          [
-            session_identity_case,
-            {path <> "?asUser=flynn", nil, 400, "invalid_as_user", nil,
-             [:bearer_auth, :query_decode, :principal_resolution]},
-            {path <> "?asUser=flynn%zz", nil, 400, "malformed_query", nil,
-             [:bearer_auth, :query_decode]},
-            {path <> "?unsupported=1", nil, 400, "invalid_filter", nil,
-             [:bearer_auth, :query_decode, :principal_resolution, :request_validation]}
-          ]
+      cases = [
+        {path, "", 401, "auth_failed", nil, [:bearer_auth]},
+        {path, "invalid-token", 401, "auth_failed", nil, [:bearer_auth]},
+        {path, "tbc_core_detail", 400, "invalid_message", nil,
+         [:bearer_auth, :query_decode, :principal_resolution]},
+        {path <> "?asUser=", "tbc_core_detail", 400, "invalid_message", nil,
+         [:bearer_auth, :query_decode, :principal_resolution]},
+        {path <> "?asUser=flynn&asUser=flynn", "tbc_core_detail", 400, "invalid_as_user", nil,
+         [:bearer_auth, :query_decode, :principal_resolution]},
+        {path <> "?asUser=mallory", ctx.admin_session.cli_token, 403, "identity_not_yours",
+         "this session belongs to flynn", [:bearer_auth, :query_decode, :principal_resolution]},
+        {path <> "?asUser=flynn", nil, 400, "invalid_as_user", nil,
+         [:bearer_auth, :query_decode, :principal_resolution]},
+        {path <> "?asUser=flynn%zz", nil, 400, "malformed_query", nil,
+         [:bearer_auth, :query_decode]},
+        {path <> "?unsupported=1", nil, 400, "invalid_filter", nil,
+         [:bearer_auth, :query_decode, :principal_resolution, :request_validation]}
+      ]
 
       for {request_path, bearer, status, code, message, operations} <- cases do
         {response, trace} = traced_get(ctx, request_path, bearer)
