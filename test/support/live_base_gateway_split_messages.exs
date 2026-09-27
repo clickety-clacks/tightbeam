@@ -63,10 +63,10 @@ defmodule GuardSplitMessages do
         try do
           assert_receive {:prompt_started, ^adapter}, 60_000
           send(adapter, :continue_prompt)
-          assert {:ok, %{terminal_publish: publish}} = Task.await(task)
+          assert {:ok, %{terminal_publish: publish, record_in_txn: record}} = Task.await(task)
 
           assert :ok =
-                   Ledger.finish(db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+                   Tightbeam.GatewayTurnFixture.commit_success!(db, turn, record)
 
           publish.("delivered")
 
@@ -103,6 +103,76 @@ defmodule GuardSplitMessages do
           assert frames
                  |> Enum.filter(&(&1["type"] == "message" and &1["role"] == "assistant"))
                  |> Enum.map(& &1["content"]) == ["FIRST", "SECOND"]
+
+          # Drive a second real Gateway result through a real lane AFTER its
+          # ledger row was recovered. Neither messages nor delivered frames
+          # may escape the lane's losing terminal CAS.
+          parent = self()
+          {:ok, registry} = Registry.start_link(keys: :unique, name: Tightbeam.LaneRegistry)
+          {:ok, task_sup} = Task.Supervisor.start_link()
+
+          wrapped_runner = fn claimed ->
+            result = runner.(claimed)
+            send(parent, {:result_waiting, self(), claimed.seq})
+
+            receive do
+              :release_result -> result
+            end
+          end
+
+          assert :appended =
+                   Gateway.deliver_prompt("k1", "user:flynn", "late assistant result",
+                     db: db,
+                     conn_registry: exact_registry,
+                     lane_manager: lane,
+                     client_message_id: "c_recovered_result"
+                   )
+
+          {:ok, session_lane} =
+            Tightbeam.SessionLane.start_link(
+              session_key: "k1",
+              db: db,
+              task_sup: task_sup,
+              runner: wrapped_runner,
+              terminal_publisher: fn row -> send(parent, {:late_terminal, row}) end
+            )
+
+          try do
+            assert_receive {:prompt_started, ^adapter}, 60_000
+            send(adapter, :continue_prompt)
+            assert_receive {:result_waiting, worker, seq}, 5_000
+            assert [^seq] = Ledger.recover_running(db)
+            ref = :sys.get_state(session_lane).task_ref
+            send(worker, :release_result)
+            assert wait_until(fn -> :sys.get_state(session_lane).task_ref == nil end)
+            # A duplicate late completion has no owner after that boundary.
+            send(
+              session_lane,
+              {ref,
+               {seq, {:ok, %{terminal_publish: fn _ -> send(parent, :duplicate_terminal) end}}}}
+            )
+
+            assert :sys.get_state(session_lane).task_ref == nil
+
+            assert {:ok, [["failed_unknown"]]} =
+                     Tightbeam.DB.query(db, "SELECT status FROM turns WHERE seq=?1", [seq])
+
+            refute Enum.any?(
+                     Projection.list_after(db, "k1", echo.id, 100),
+                     &(&1.role == "assistant" and &1.content == "LATE ASSISTANT RESULT")
+                   )
+
+            refute_receive {:late_terminal, _}, 100
+            refute_receive :duplicate_terminal, 100
+
+            refute_receive {:push_message, _, _,
+                            %{"role" => "assistant", "content" => "LATE ASSISTANT RESULT"}},
+                           100
+          after
+            GenServer.stop(session_lane)
+            Supervisor.stop(task_sup)
+            Supervisor.stop(registry)
+          end
         after
           Task.shutdown(task, :brutal_kill)
         end
@@ -114,6 +184,20 @@ defmodule GuardSplitMessages do
         GenServer.stop(lane)
       end
     end)
+  end
+
+  defp wait_until(fun, remaining \\ 500) do
+    cond do
+      fun.() ->
+        true
+
+      remaining == 0 ->
+        false
+
+      true ->
+        Process.sleep(10)
+        wait_until(fun, remaining - 1)
+    end
   end
 
   defp collect_pushes(0, acc), do: Enum.reverse(acc)

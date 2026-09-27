@@ -270,8 +270,7 @@ defmodule Tightbeam.Acp.AdapterTest do
   ] });
   const capture = (m) => fs.appendFileSync(capturePath, JSON.stringify({ method: m.method, clientCapabilities: m.params.clientCapabilities, mcpServers: m.params.mcpServers, modeId: m.params.modeId, configId: m.params.configId, value: m.params.value, cwd: m.params.cwd, sessionId: m.params.sessionId, prompt: m.params.prompt, meta: m.params._meta }) + "\n");
   let pendingPrompt = null;
-  let stalledPrompt = null;
-  let stalledSession = null;
+  const stalledPrompts = new Map();
   rl.on("line", (line) => {
     if (!line.trim()) return;
     const m = JSON.parse(line);
@@ -433,9 +432,8 @@ defmodule Tightbeam.Acp.AdapterTest do
         if (text === "fail after dispatch") {
           return send({ id: m.id, error: { code: -32000, message: "post-dispatch failure" } });
         }
-        if (gateMode === "stall-turn") {
-          stalledPrompt = m.id;
-          stalledSession = sid;
+        if (["stall-turn", "ignore-cancel-turn", "late-success-turn"].includes(gateMode)) {
+          stalledPrompts.set(sid, m.id);
           return;
         }
         if (gateMode === "delay-turn") {
@@ -500,10 +498,23 @@ defmodule Tightbeam.Acp.AdapterTest do
       }
       case "session/cancel": {
         capture(m);
-        if (stalledPrompt !== null && m.params.sessionId === stalledSession) {
-          send({ id: stalledPrompt, error: { code: -32800, message: "canceled" } });
-          stalledPrompt = null;
-          stalledSession = null;
+        const sid = m.params.sessionId;
+        if (gateMode === "ignore-cancel-turn") return;
+        if (stalledPrompts.has(sid)) {
+          const id = stalledPrompts.get(sid);
+          stalledPrompts.delete(sid);
+          if (gateMode === "late-success-turn") {
+            send({ method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "obsolete success" } } } });
+            send({ id, result: { stopReason: "end_turn" } });
+          } else send({ id, error: { code: -32800, message: "canceled" } });
+        }
+        return;
+      }
+      case "test/complete": {
+        const sid = m.params.sessionId;
+        if (stalledPrompts.has(sid)) {
+          send({ id: stalledPrompts.get(sid), result: { stopReason: "end_turn" } });
+          stalledPrompts.delete(sid);
         }
         return;
       }
@@ -1284,21 +1295,465 @@ defmodule Tightbeam.Acp.AdapterTest do
              Adapter.prompt(adapter, "sess-1", "fail after dispatch")
   end
 
-  test "caller death preserves existing monitor ownership and requires explicit cancel" do
+  test "caller death cancels its owned prompt and releases the worker" do
     {adapter, capture_path} = start_adapter(gate_mode: "stall-turn", probe: false)
     assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
     conn = Adapter.conn(adapter)
 
     caller = Task.async(fn -> Adapter.prompt(adapter, sid, "stall") end)
     assert pending_count?(conn, 1)
+    worker = prompt_requester(conn)
+    monitor = Process.monitor(worker)
     Task.shutdown(caller, :brutal_kill)
 
-    assert pending_count?(conn, 1)
-    refute Enum.any?(captured_requests(capture_path), &(&1["method"] == "session/cancel"))
-
-    Tightbeam.Acp.Conn.notify(conn, "session/cancel", %{sessionId: sid})
     assert pending_count?(conn, 0)
+    assert_receive {:DOWN, ^monitor, :process, ^worker, _}, 2_000
     assert Enum.any?(captured_requests(capture_path), &(&1["method"] == "session/cancel"))
+  end
+
+  for death <- [:caller, :worker] do
+    @death death
+    test "#{death} death with ignored cancellation cannot tear down before the original deadline" do
+      {adapter, capture} = start_adapter(gate_mode: "ignore-cancel-turn", probe: false)
+      conn = Adapter.conn(adapter)
+      adapter_monitor = Process.monitor(adapter)
+      conn_monitor = Process.monitor(conn)
+
+      caller =
+        Task.async(fn ->
+          Adapter.prompt(adapter, "canceled", "stall", timeout: 1_500, cancel_grace: 50)
+        end)
+
+      peer = Task.async(fn -> Adapter.prompt(adapter, "healthy", "peer") end)
+      assert pending_count?(conn, 2)
+      {id, entry} = prompt_entry(conn, "canceled")
+      worker = elem(entry.from, 0)
+      worker_monitor = Process.monitor(worker)
+
+      if @death == :caller,
+        do: Task.shutdown(caller, :brutal_kill),
+        else: Process.exit(worker, :kill)
+
+      assert eventually(fn -> not is_nil(:sys.get_state(conn).pending[id].cancel_reason) end)
+      assert :sys.get_state(conn).pending[id].cancel_timer == nil
+      # An ignored cancel outlives the injected grace without affecting the
+      # shared connection. Even an early stale grace signal has no authority.
+      send(conn, {:prompt_cancel_expired, id, entry.token})
+      refute_receive {:DOWN, ^adapter_monitor, :process, ^adapter, _}, 200
+      assert Process.alive?(conn)
+      Tightbeam.Acp.Conn.notify(conn, "test/complete", %{sessionId: "healthy"})
+      assert {:ok, _} = Task.await(peer)
+      assert Enum.count(captured_requests(capture), &(&1["method"] == "session/cancel")) == 1
+
+      assert_receive {:DOWN, ^adapter_monitor, :process, ^adapter,
+                      {:prompt_cancel_unacknowledged, "canceled"}},
+                     3_000
+
+      assert System.monotonic_time(:millisecond) >= entry.deadline
+      assert_receive {:DOWN, ^conn_monitor, :process, ^conn, _}, 2_000
+      assert_receive {:DOWN, ^worker_monitor, :process, ^worker, _}, 2_000
+      if @death == :worker, do: assert({:error, :prompt_timeout} = Task.await(caller))
+    end
+  end
+
+  test "absolute prompt deadline cancels and returns timeout after acknowledgment" do
+    {adapter, capture} = start_adapter(gate_mode: "stall-turn", probe: false)
+    conn = Adapter.conn(adapter)
+    caller = Task.async(fn -> Adapter.prompt(adapter, "timed", "stall", timeout: 1_000) end)
+    assert pending_count?(conn, 1)
+    worker = prompt_requester(conn)
+    monitor = Process.monitor(worker)
+    assert {:error, :prompt_timeout} = Task.await(caller, 2_000)
+    assert_receive {:DOWN, ^monitor, :process, ^worker, _}, 2_000
+    assert :sys.get_state(conn).pending == %{}
+    assert :sys.get_state(adapter).prompts == %{}
+    assert Process.alive?(adapter)
+    assert Enum.count(captured_requests(capture), &(&1["method"] == "session/cancel")) == 1
+  end
+
+  test "late success during cancellation is timeout once, without killing a healthy peer" do
+    {adapter, _capture} = start_adapter(gate_mode: "late-success-turn", probe: false)
+    conn = Adapter.conn(adapter)
+    expired = Task.async(fn -> Adapter.prompt(adapter, "expired", "stall") end)
+    peer = Task.async(fn -> Adapter.prompt(adapter, "peer", "healthy") end)
+    assert pending_count?(conn, 2)
+    {id, entry} = prompt_entry(conn, "expired")
+    send(conn, {:prompt_deadline, id, entry.token})
+    send(conn, {:prompt_deadline, id, entry.token})
+    assert {:error, :prompt_timeout} = Task.await(expired)
+    assert pending_count?(conn, 1)
+    send(conn, {:prompt_cancel_expired, id, entry.token})
+    assert Process.alive?(Adapter.conn(adapter))
+    Tightbeam.Acp.Conn.notify(conn, "test/complete", %{sessionId: "peer"})
+    assert {:ok, %{text: ""}} = Task.await(peer)
+    assert :sys.get_state(adapter).prompts == %{}
+  end
+
+  test "ignored cancel closes only its generation and truthfully interrupts a shared peer" do
+    {adapter, capture} = start_adapter(gate_mode: "ignore-cancel-turn", probe: false)
+    {other, _} = start_adapter(gate_mode: "stall-turn", probe: false)
+    conn = Adapter.conn(adapter)
+    other_conn = Adapter.conn(other)
+    expired = Task.async(fn -> Adapter.prompt(adapter, "expired", "stall") end)
+    peer = Task.async(fn -> Adapter.prompt(adapter, "peer", "healthy") end)
+    independent = Task.async(fn -> Adapter.prompt(other, "other", "healthy") end)
+    assert pending_count?(conn, 2)
+    assert pending_count?(other_conn, 1)
+    workers = for {_id, entry} <- :sys.get_state(conn).pending, do: elem(entry.from, 0)
+    monitors = for pid <- workers, do: {pid, Process.monitor(pid)}
+    adapter_monitor = Process.monitor(adapter)
+    conn_monitor = Process.monitor(conn)
+    port = :sys.get_state(conn).port
+    {id, entry} = prompt_entry(conn, "expired")
+    send(conn, {:prompt_deadline, id, entry.token})
+
+    assert eventually(fn ->
+             Enum.any?(captured_requests(capture), &(&1["method"] == "session/cancel"))
+           end)
+
+    send(conn, {:prompt_cancel_expired, id, entry.token})
+    send(conn, {:prompt_cancel_expired, id, entry.token})
+    assert {:error, :prompt_timeout} = Task.await(expired)
+    assert {:error, {:prompt_interrupted, {:cancel_unacknowledged, "expired"}}} = Task.await(peer)
+
+    assert_receive {:DOWN, ^adapter_monitor, :process, ^adapter,
+                    {:prompt_cancel_unacknowledged, "expired"}},
+                   2_000
+
+    assert_receive {:DOWN, ^conn_monitor, :process, ^conn, _}, 2_000
+    for {pid, ref} <- monitors, do: assert_receive({:DOWN, ^ref, :process, ^pid, _}, 2_000)
+    assert Port.info(port) == nil
+    assert Process.alive?(other)
+    Tightbeam.Acp.Conn.notify(other_conn, "test/complete", %{sessionId: "other"})
+    assert {:ok, _} = Task.await(independent)
+
+    {replacement, _} = start_adapter(gate_mode: "stall-turn", probe: false)
+    replacement_conn = Adapter.conn(replacement)
+    next = Task.async(fn -> Adapter.prompt(replacement, "expired", "next") end)
+    assert pending_count?(replacement_conn, 1)
+    # Even a stale request-id collision carries the old token/connection.
+    {new_id, _} = prompt_entry(replacement_conn, "expired")
+    send(replacement_conn, {:prompt_cancel_expired, new_id, entry.token})
+    send(replacement, {:acp_prompt_teardown, conn, id, "expired", :prompt_timeout})
+    Tightbeam.Acp.Conn.notify(replacement_conn, "test/complete", %{sessionId: "expired"})
+    assert {:ok, _} = Task.await(next)
+    assert Process.alive?(replacement)
+  end
+
+  test "response before deadline fences both expiry messages from a later prompt" do
+    {adapter, _} = start_adapter(gate_mode: "stall-turn", probe: false)
+    conn = Adapter.conn(adapter)
+    first = Task.async(fn -> Adapter.prompt(adapter, "same", "first") end)
+    assert pending_count?(conn, 1)
+    {id, entry} = prompt_entry(conn, "same")
+    Tightbeam.Acp.Conn.notify(conn, "test/complete", %{sessionId: "same"})
+    assert {:ok, _} = Task.await(first)
+    next = Task.async(fn -> Adapter.prompt(adapter, "same", "next") end)
+    assert pending_count?(conn, 1)
+    send(conn, {:prompt_deadline, id, entry.token})
+    send(conn, {:prompt_cancel_expired, id, entry.token})
+    Tightbeam.Acp.Conn.notify(conn, "test/complete", %{sessionId: "same"})
+    assert {:ok, _} = Task.await(next)
+    assert Process.alive?(adapter)
+  end
+
+  test "worker death racing timeout acknowledgment preserves the timeout cause" do
+    {adapter, _} = start_adapter(gate_mode: "ignore-cancel-turn", probe: false)
+    conn = Adapter.conn(adapter)
+    caller = Task.async(fn -> Adapter.prompt(adapter, "timed", "stall") end)
+    assert pending_count?(conn, 1)
+    {id, entry} = prompt_entry(conn, "timed")
+    send(conn, {:prompt_deadline, id, entry.token})
+    assert :sys.get_state(conn).pending[id].cancel_reason == :prompt_timeout
+    Process.exit(elem(entry.from, 0), :kill)
+    assert eventually(fn -> :sys.get_state(conn).pending[id].orphaned end)
+    Tightbeam.Acp.Conn.notify(conn, "test/complete", %{sessionId: "timed"})
+    assert {:error, :prompt_timeout} = Task.await(caller)
+    assert :sys.get_state(conn).pending == %{}
+    assert :sys.get_state(adapter).prompts == %{}
+    assert Process.alive?(adapter)
+  end
+
+  test "concurrent expired prompts keep timeout causes and converge on one teardown" do
+    {adapter, _} = start_adapter(gate_mode: "ignore-cancel-turn", probe: false)
+    conn = Adapter.conn(adapter)
+    first = Task.async(fn -> Adapter.prompt(adapter, "first", "stall") end)
+    second = Task.async(fn -> Adapter.prompt(adapter, "second", "stall") end)
+    assert pending_count?(conn, 2)
+    {id1, entry1} = prompt_entry(conn, "first")
+    {id2, entry2} = prompt_entry(conn, "second")
+    send(conn, {:prompt_deadline, id1, entry1.token})
+    send(conn, {:prompt_deadline, id2, entry2.token})
+    send(conn, {:prompt_cancel_expired, id1, entry1.token})
+    send(conn, {:prompt_cancel_expired, id2, entry2.token})
+    assert {:error, :prompt_timeout} = Task.await(first)
+    assert {:error, :prompt_timeout} = Task.await(second)
+    assert eventually(fn -> not Process.alive?(adapter) end)
+    refute Process.alive?(conn)
+  end
+
+  test "a successor waits for old caller cancellation and stale results cannot settle it" do
+    {adapter, capture} = start_adapter(gate_mode: "ignore-cancel-turn", probe: false)
+    conn = Adapter.conn(adapter)
+    old = Task.async(fn -> Adapter.prompt(adapter, "same", "old") end)
+    assert pending_count?(conn, 1)
+    old_from = :sys.get_state(adapter).prompts["same"].from
+    {old_id, _} = prompt_entry(conn, "same")
+    Task.shutdown(old, :brutal_kill)
+    successor = Task.async(fn -> Adapter.prompt(adapter, "same", "next") end)
+    assert eventually(fn -> length(:sys.get_state(adapter).queued_prompts) == 1 end)
+    assert Enum.count(captured_requests(capture), &(&1["method"] == "session/prompt")) == 1
+    Tightbeam.Acp.Conn.notify(conn, "test/complete", %{sessionId: "same"})
+
+    assert eventually(fn ->
+             Enum.count(captured_requests(capture), &(&1["method"] == "session/prompt")) == 2
+           end)
+
+    send(adapter, {:prompt_done, "same", old_from, {:ok, %{"stopReason" => "end_turn"}}})
+    send(adapter, {:acp_prompt_orphan_resolved, conn, old_id, "same"})
+    send(adapter, {:acp_prompt_teardown, conn, old_id, "same", :prompt_timeout})
+    assert %{from: new_from} = :sys.get_state(adapter).prompts["same"]
+    assert new_from != old_from
+    Tightbeam.Acp.Conn.notify(conn, "test/complete", %{sessionId: "same"})
+    assert {:ok, %{text: ""}} = Task.await(successor)
+    assert :sys.get_state(conn).pending == %{}
+  end
+
+  test "ignored cancellation reaches bounded teardown without injected expiry messages" do
+    {adapter, _} = start_adapter(gate_mode: "ignore-cancel-turn", probe: false)
+    conn = Adapter.conn(adapter)
+    monitor = Process.monitor(adapter)
+
+    caller =
+      Task.async(fn ->
+        Adapter.prompt(adapter, "timed", "stall", timeout: 500, cancel_grace: 50)
+      end)
+
+    assert pending_count?(conn, 1)
+    worker = prompt_requester(conn)
+    worker_monitor = Process.monitor(worker)
+    assert {:error, :prompt_timeout} = Task.await(caller, 3_000)
+
+    assert_receive {:DOWN, ^monitor, :process, ^adapter,
+                    {:prompt_cancel_unacknowledged, "timed"}},
+                   2_000
+
+    assert_receive {:DOWN, ^worker_monitor, :process, ^worker, _}, 2_000
+    refute Process.alive?(conn)
+  end
+
+  test "missing dispatch acknowledgment releases the exact connection and request worker" do
+    {adapter, capture} = start_adapter(probe: false)
+    conn = Adapter.conn(adapter)
+    :ok = :sys.suspend(conn)
+    monitor = Process.monitor(conn)
+
+    caller =
+      Task.async(fn -> Adapter.prompt(adapter, "blocked", "never dispatched", timeout: 200) end)
+
+    assert {:error, :prompt_timeout} = Task.await(caller, 3_000)
+    assert_receive {:DOWN, ^monitor, :process, ^conn, _}, 2_000
+    refute Enum.any?(captured_requests(capture), &(&1["method"] == "session/prompt"))
+  end
+
+  test "a queued prompt budget expires without dispatching or disturbing its predecessor" do
+    {adapter, capture} = start_adapter(gate_mode: "stall-turn", probe: false)
+    conn = Adapter.conn(adapter)
+    first = Task.async(fn -> Adapter.prompt(adapter, "same", "first") end)
+    assert pending_count?(conn, 1)
+
+    assert {:error, {:acp_request_not_dispatched, :prompt_timeout}} =
+             Adapter.prompt(adapter, "same", "expired in queue", timeout: 100)
+
+    assert Enum.count(captured_requests(capture), &(&1["method"] == "session/prompt")) == 1
+    assert :sys.get_state(adapter).queued_prompts == []
+    Tightbeam.Acp.Conn.notify(conn, "test/complete", %{sessionId: "same"})
+    assert {:ok, _} = Task.await(first)
+  end
+
+  test "shared connection teardown preserves the lane's queued successor without replay" do
+    alias Tightbeam.{DB, Ledger, Schema, SessionLane}
+    db = :"timeout_db_#{System.unique_integer([:positive])}"
+    start_supervised!({DB, path: ":memory:", name: db})
+    :ok = Schema.ensure_all(db)
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO sessions
+        (sessionKey,displayName,ownerUserId,origin,spawnedBy,archetype,
+         harness,provider,model,thinkingLevel,host,createdAt,updatedAt)
+      VALUES ('timeout-lane','Timeout','t','user:t','timeout-lane','default',
+        'claude','anthropic','claude-sonnet-5','medium','testhost',1,1)
+      """)
+
+    start_supervised!({Registry, keys: :unique, name: Tightbeam.LaneRegistry})
+    task_sup = start_supervised!({Task.Supervisor, []})
+    {adapter, capture} = start_adapter(gate_mode: "ignore-cancel-turn", probe: false)
+    {replacement, replacement_capture} = start_adapter(probe: false)
+    parent = self()
+
+    enqueue = fn text ->
+      {:ok, seq} =
+        Ledger.enqueue(db, %{
+          session_key: "timeout-lane",
+          message_id: text,
+          origin: "user:t",
+          prompt: text
+        })
+
+      seq
+    end
+
+    first = enqueue.("timeout-first")
+    second = enqueue.("retained-second")
+
+    runner = fn turn ->
+      send(parent, {:ran, turn.seq})
+      selected = if turn.seq == first, do: adapter, else: replacement
+      Adapter.prompt(selected, "lane-session", turn.prompt, timeout: 1_000, cancel_grace: 50)
+    end
+
+    lane =
+      start_supervised!(
+        {SessionLane, session_key: "timeout-lane", db: db, task_sup: task_sup, runner: runner}
+      )
+
+    assert_receive {:ran, ^first}, 2_000
+    assert {:ok, [["queued"]]} = DB.query(db, "SELECT status FROM turns WHERE seq=?1", [second])
+    assert_receive {:ran, ^second}, 3_000
+    assert eventually(fn -> :sys.get_state(lane).task_ref == nil end)
+
+    assert {:ok, [["failed"], ["delivered"]]} =
+             DB.query(db, "SELECT status FROM turns WHERE seq IN (?1,?2) ORDER BY seq", [
+               first,
+               second
+             ])
+
+    refute_receive {:ran, _}, 100
+    assert Enum.count(captured_requests(capture), &(&1["method"] == "session/prompt")) == 1
+
+    assert Enum.count(captured_requests(replacement_capture), &(&1["method"] == "session/prompt")) ==
+             1
+  end
+
+  test "manager recovery with ignored cancel preserves a healthy shared peer and holds the successor" do
+    alias Tightbeam.{DB, LaneManager, Ledger, Schema}
+    db = :"recovery_cancel_db_#{System.unique_integer([:positive])}"
+    start_supervised!({DB, path: ":memory:", name: db})
+    :ok = Schema.ensure_all(db)
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO sessions
+        (sessionKey,displayName,ownerUserId,origin,spawnedBy,archetype,
+         harness,provider,model,thinkingLevel,host,createdAt,updatedAt)
+      VALUES ('recovery-lane','Recovery','t','user:t','recovery-lane','default',
+        'claude','anthropic','claude-sonnet-5','medium','testhost',1,1)
+      """)
+
+    start_supervised!({Registry, keys: :unique, name: Tightbeam.LaneRegistry})
+    task_sup = start_supervised!({Task.Supervisor, []})
+    lane_sup = start_supervised!({DynamicSupervisor, strategy: :one_for_one})
+    {adapter, capture} = start_adapter(gate_mode: "ignore-cancel-turn", probe: false)
+    conn = Adapter.conn(adapter)
+    adapter_monitor = Process.monitor(adapter)
+    peer = Task.async(fn -> Adapter.prompt(adapter, "healthy-peer", "peer") end)
+
+    enqueue = fn text ->
+      {:ok, seq} =
+        Ledger.enqueue(db, %{
+          session_key: "recovery-lane",
+          message_id: text,
+          origin: "user:t",
+          prompt: text
+        })
+
+      seq
+    end
+
+    first = enqueue.("recovered-first")
+    second = enqueue.("held-successor")
+
+    runner = fn turn ->
+      Adapter.prompt(adapter, "recovered-session", turn.prompt, timeout: 10_000, cancel_grace: 50)
+    end
+
+    manager_opts = [
+      db: db,
+      lane_sup: lane_sup,
+      task_sup: task_sup,
+      runner: runner,
+      interval: 60_000
+    ]
+
+    start_supervised!({LaneManager, manager_opts})
+    assert pending_count?(conn, 2)
+    [{lane, _}] = Registry.lookup(Tightbeam.LaneRegistry, "recovery-lane")
+    obsolete = :sys.get_state(lane).task_pid
+    obsolete_monitor = Process.monitor(obsolete)
+    assert {:ok, [["queued"]]} = DB.query(db, "SELECT status FROM turns WHERE seq=?1", [second])
+    stop_supervised!(LaneManager)
+    start_supervised!({LaneManager, manager_opts})
+    assert_receive {:DOWN, ^obsolete_monitor, :process, ^obsolete, :killed}, 2_000
+    assert eventually(fn -> length(:sys.get_state(adapter).queued_prompts) == 1 end)
+
+    assert {:ok, [["failed_unknown"]]} =
+             DB.query(db, "SELECT status FROM turns WHERE seq=?1", [first])
+
+    {id, _} = prompt_entry(conn, "recovered-session")
+
+    assert eventually(fn ->
+             :sys.get_state(conn).pending[id].cancel_reason == :prompt_canceled
+           end)
+
+    assert :sys.get_state(conn).pending[id].cancel_timer == nil
+    refute_receive {:DOWN, ^adapter_monitor, :process, ^adapter, _}, 200
+    Tightbeam.Acp.Conn.notify(conn, "test/complete", %{sessionId: "healthy-peer"})
+    assert {:ok, _} = Task.await(peer)
+
+    prompts = fn ->
+      Enum.filter(
+        captured_requests(capture),
+        &(&1["method"] == "session/prompt" and &1["sessionId"] == "recovered-session")
+      )
+    end
+
+    assert length(prompts.()) == 1
+    # The original response, even after the short cancellation grace elapsed,
+    # confirms quiescence and allows precisely the queued successor to start.
+    Tightbeam.Acp.Conn.notify(conn, "test/complete", %{sessionId: "recovered-session"})
+    assert eventually(fn -> length(prompts.()) == 2 end)
+    Tightbeam.Acp.Conn.notify(conn, "test/complete", %{sessionId: "recovered-session"})
+    assert eventually(fn -> :sys.get_state(lane).task_ref == nil end)
+
+    assert {:ok, [["failed_unknown"], ["delivered"]]} =
+             DB.query(db, "SELECT status FROM turns WHERE seq IN (?1,?2) ORDER BY seq", [
+               first,
+               second
+             ])
+
+    assert :sys.get_state(conn).pending == %{}
+    assert :sys.get_state(adapter).queued_prompts == []
+    assert Process.alive?(adapter)
+    assert Enum.count(captured_requests(capture), &(&1["method"] == "session/cancel")) == 1
+  end
+
+  defp eventually(fun, remaining \\ 500) do
+    cond do
+      fun.() ->
+        true
+
+      remaining == 0 ->
+        false
+
+      true ->
+        Process.sleep(10)
+        eventually(fun, remaining - 1)
+    end
+  end
+
+  defp prompt_entry(conn, sid) do
+    Enum.find(:sys.get_state(conn).pending, fn {_id, entry} -> entry.prompt_session_id == sid end)
   end
 
   test "dispatch callback receives the exact live Conn prompt request ID" do
@@ -1328,7 +1783,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert {:error, _} = Task.await(caller)
   end
 
-  test "prompt worker death preserves existing monitor ownership and quiesces on explicit cancel" do
+  test "prompt worker death cancels its request and releases the live caller" do
     {adapter, capture_path} = start_adapter(gate_mode: "stall-turn", probe: false)
     assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
     conn = Adapter.conn(adapter)
@@ -1337,15 +1792,11 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert pending_count?(conn, 1)
     Process.exit(prompt_requester(conn), :kill)
 
-    assert pending_count?(conn, 1)
-    refute Enum.any?(captured_requests(capture_path), &(&1["method"] == "session/cancel"))
-
-    Tightbeam.Acp.Conn.notify(conn, "session/cancel", %{sessionId: sid})
     assert pending_count?(conn, 0)
     assert Enum.any?(captured_requests(capture_path), &(&1["method"] == "session/cancel"))
-
-    Process.exit(adapter, :kill)
-    assert {:error, {:adapter_unavailable, _reason}} = Task.await(caller)
+    assert {:error, reason} = Task.await(caller)
+    assert reason in [:prompt_worker_exit, {:prompt_worker_exit, :killed}]
+    assert Process.alive?(adapter)
   end
 
   test "adapter death tears down its prompt worker and connection through existing links" do
@@ -1366,7 +1817,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert_receive {:DOWN, ^conn_monitor, :process, ^conn, :killed}
   end
 
-  test "thought and tool progress stay routed while an unbounded prompt runs" do
+  test "thought and tool progress stay routed within the prompt budget" do
     {adapter, _capture_path} = start_adapter(gate_mode: "progress-turn", probe: false)
     assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
     owner = self()

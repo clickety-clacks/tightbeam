@@ -147,10 +147,10 @@ defmodule GuardRemoteUrl do
           # Proven late, not lost -- see 60_000 for the measurement.
           assert_receive {:prompt_started, ^adapter}, 60_000
           send(adapter, :continue_prompt)
-          assert {:ok, %{terminal_publish: publish}} = Task.await(task)
+          assert {:ok, %{terminal_publish: publish, record_in_txn: record}} = Task.await(task)
 
           assert :ok =
-                   Ledger.finish(db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+                   Tightbeam.GatewayTurnFixture.commit_success!(db, turn, record)
 
           publish.("delivered")
         after

@@ -28,6 +28,11 @@ defmodule Tightbeam.Acp.Adapter do
   # deadline starts. Residency calls queue behind handle_continue, so their
   # caller budget must clear the full boot boundary.
   @boot_boundary_timeout 185_000
+  # A common absolute budget preserves long turns while making a hung prompt
+  # finite. Only the owning connection may escalate after cancellation fails.
+  @prompt_timeout 30 * 60_000
+  @prompt_cancel_grace 5_000
+  @prompt_reply_margin 2_000
   @gate_marker "[gate: tightbeam-probe]"
   @gate_prompt "Run exactly this command with your shell tool (no other arguments): tightbeam-gate-probe . If the command is refused or blocked by anything, report the exact refusal message you received, verbatim, then stop; do not retry or work around it."
   @gate_raw_update_limit 20
@@ -59,6 +64,8 @@ defmodule Tightbeam.Acp.Adapter do
     stderr_offset: 0,
     chunks: %{},
     progress: %{},
+    prompts: %{},
+    queued_prompts: [],
     subagent_tasks: %{},
     subagent_roots: %{},
     known: MapSet.new(),
@@ -271,6 +278,13 @@ defmodule Tightbeam.Acp.Adapter do
   this GenServer keeps routing updates, and preserves the public ACP messageId
   boundary between distinct assistant messages before the harness finishes.
 
+  The model-neutral default budget is 30 minutes, absolute from the call.
+  `:timeout` overrides the budget; `:cancel_grace` defaults to five
+  seconds and cannot exceed it. The original response confirms cancellation.
+  If it never arrives, the owning local connection and workers are released;
+  healthy prompts sharing it report interruption, and nothing is replayed.
+  Local teardown does not establish remote provider completion.
+
   A harness that dies MID-PROMPT kills this adapter before it can reply, so the
   call must be caught like every other adapter-boundary call: otherwise the turn
   task exits and the lane records a bare `:task_crash`, skipping the
@@ -285,8 +299,22 @@ defmodule Tightbeam.Acp.Adapter do
              messages: [%{message_id: String.t() | nil, text: String.t()}]
            }}
           | {:error, term()}
-  def prompt(adapter, session_id, text, opts \\ []),
-    do: call(adapter, {:prompt, session_id, text, opts}, :infinity)
+  def prompt(adapter, session_id, text, opts \\ []) do
+    timeout = Keyword.get(opts, :timeout, @prompt_timeout)
+    grace = Keyword.get(opts, :cancel_grace, @prompt_cancel_grace)
+
+    if is_integer(timeout) and timeout > 0 and is_integer(grace) and
+         grace >= 0 and grace <= @prompt_cancel_grace do
+      opts =
+        opts
+        |> Keyword.put(:prompt_deadline, System.monotonic_time(:millisecond) + timeout)
+        |> Keyword.put(:cancel_grace, grace)
+
+      call(adapter, {:prompt, session_id, text, opts}, timeout + grace + @prompt_reply_margin)
+    else
+      {:error, :invalid_prompt_timeout}
+    end
+  end
 
   @doc """
   Map one ACP session/update to a typing-indicator status line, or :skip.
@@ -646,7 +674,15 @@ defmodule Tightbeam.Acp.Adapter do
     do: {:reply, :ok, drop_model_residency(state, sid)}
 
   def handle_call({:prompt, sid, text, opts}, from, state) do
-    start_prompt(state, sid, text, opts, from)
+    if Map.has_key?(state.prompts, sid) do
+      # A recovered lane can reach its next prompt before cancel acknowledges
+      # the old one. Keep that call undispatched until the old operation ends.
+      timer = Process.send_after(self(), {:queued_prompt_expired, from}, prompt_remaining(opts))
+      queued = %{sid: sid, text: text, opts: opts, from: from, timer: timer}
+      {:noreply, %{state | queued_prompts: state.queued_prompts ++ [queued]}}
+    else
+      start_prompt(state, sid, text, opts, from)
+    end
   end
 
   def handle_call(:conn, _from, state), do: {:reply, state.conn, state}
@@ -997,6 +1033,23 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   defp start_prompt(state, sid, text, opts, from) do
+    cond do
+      prompt_remaining(opts) == 0 ->
+        GenServer.reply(from, {:error, {:acp_request_not_dispatched, :prompt_timeout}})
+        next_prompt(state, sid)
+
+      not Process.alive?(elem(from, 0)) ->
+        next_prompt(state, sid)
+
+      true ->
+        dispatch_prompt(state, sid, text, opts, from)
+    end
+  end
+
+  defp prompt_remaining(opts),
+    do: max(Keyword.fetch!(opts, :prompt_deadline) - System.monotonic_time(:millisecond), 0)
+
+  defp dispatch_prompt(state, sid, text, opts, from) do
     state = put_in(state.chunks[sid], [])
     # Per-turn progress channel: {fun, last_status, seq}. Deduped on text so
     # per-token thought chunks emit ONE "Thinking…" until something changes.
@@ -1012,26 +1065,40 @@ defmodule Tightbeam.Acp.Adapter do
     dispatched = make_ref()
     conn_monitor = Process.monitor(state.conn)
 
-    prompt_worker =
-      spawn(fn ->
+    {prompt_worker, worker_monitor} =
+      spawn_monitor(fn ->
+        adapter_monitor = Process.monitor(parent)
+
         result =
           Conn.request(
             state.conn,
             "session/prompt",
             %{sessionId: sid, prompt: [%{type: "text", text: text}]},
-            timeout: :infinity,
+            prompt_deadline: Keyword.fetch!(opts, :prompt_deadline),
+            cancel_grace: Keyword.fetch!(opts, :cancel_grace),
+            session_id: sid,
+            owner: elem(from, 0),
             notify_dispatched: {parent, dispatched}
           )
 
         receive do
           {:prompt_dispatch_classified, ^dispatched} ->
+            Process.demonitor(adapter_monitor, [:flush])
             send(parent, {:prompt_done, sid, from, result})
+
+          {:DOWN, ^adapter_monitor, :process, ^parent, _reason} ->
+            :ok
         end
       end)
+
+    prompt = %{from: from, worker: prompt_worker, monitor: worker_monitor, request_id: nil}
+    state = put_in(state.prompts[sid], prompt)
 
     receive do
       {:acp_request_dispatched, ^dispatched, request_id} ->
         Process.demonitor(conn_monitor, [:flush])
+
+        state = put_in(state.prompts[sid].request_id, request_id)
 
         case trace_dispatch(opts, request_id) do
           :ok ->
@@ -1039,14 +1106,15 @@ defmodule Tightbeam.Acp.Adapter do
             {:noreply, state}
 
           {:error, reason} ->
+            # The request was sent but its durable trace failed. Retain the
+            # identity until Conn confirms cancellation or tears down.
             Process.exit(prompt_worker, :kill)
 
-            settle_prompt(
-              state,
-              sid,
-              from,
-              {:error, {:lifecycle_trace_failed_after_prompt, :dispatch, reason}}
-            )
+            {:noreply,
+             put_in(
+               state.prompts[sid][:failure],
+               {:lifecycle_trace_failed_after_prompt, :dispatch, reason}
+             )}
         end
 
       {:acp_request_not_dispatched, ^dispatched, reason} ->
@@ -1069,6 +1137,11 @@ defmodule Tightbeam.Acp.Adapter do
           from,
           {:error, {:acp_request_not_dispatched, :prompt_dispatch_failed}}
         )
+    after
+      prompt_remaining(opts) ->
+        Process.demonitor(conn_monitor, [:flush])
+        Conn.notify(state.conn, "session/cancel", %{sessionId: sid})
+        teardown_prompt_connection(state, sid, :prompt_timeout)
     end
   end
 
@@ -1124,11 +1197,66 @@ defmodule Tightbeam.Acp.Adapter do
     end
   end
 
+  def handle_info({:queued_prompt_expired, from}, state) do
+    {expired, queued} = Enum.split_with(state.queued_prompts, &(&1.from == from))
+
+    for _ <- expired,
+        do: GenServer.reply(from, {:error, {:acp_request_not_dispatched, :prompt_timeout}})
+
+    {:noreply, %{state | queued_prompts: queued}}
+  end
+
+  def handle_info({:acp_prompt_cancelling, request_id, sid, reason}, state) do
+    case state.prompts[sid] do
+      %{request_id: ^request_id} ->
+        state = put_in(state.prompts[sid][:cancel_reason], reason)
+        {:noreply, %{state | progress: Map.delete(state.progress, sid)}}
+
+      _ ->
+        {:noreply, state}
+    end
+  end
+
+  def handle_info({:acp_prompt_orphan_resolved, conn, request_id, sid}, %{conn: conn} = state) do
+    case state.prompts[sid] do
+      %{from: from, request_id: ^request_id} = prompt ->
+        reason = prompt_failure(prompt, :prompt_worker_exit)
+        settle_prompt(state, sid, from, {:error, reason})
+
+      _ ->
+        {:noreply, state}
+    end
+  end
+
+  def handle_info({:acp_prompt_orphan_resolved, _conn, _request_id, _sid}, state),
+    do: {:noreply, state}
+
+  def handle_info({:acp_prompt_teardown, conn, request_id, sid, reason}, %{conn: conn} = state) do
+    case state.prompts[sid] do
+      %{request_id: ^request_id} -> teardown_prompt_connection(state, sid, reason)
+      _ -> {:noreply, state}
+    end
+  end
+
+  def handle_info({:acp_prompt_teardown, _conn, _request_id, _sid, _reason}, state),
+    do: {:noreply, state}
+
   def handle_info({:prompt_done, sid, from, result}, state) do
     settle_prompt(state, sid, from, result)
   end
 
   defp settle_prompt(state, sid, from, result) do
+    case state.prompts[sid] do
+      %{from: ^from} = prompt ->
+        stop_prompt_worker(prompt)
+        finish_prompt(state, sid, from, result)
+
+      _ ->
+        {:noreply, state}
+    end
+  end
+
+  defp finish_prompt(state, sid, from, result) do
     messages = state.chunks |> Map.get(sid, []) |> assistant_messages()
     text = Enum.map_join(messages, & &1.text)
 
@@ -1150,7 +1278,72 @@ defmodule Tightbeam.Acp.Adapter do
         do: %{state | unprompted: MapSet.delete(state.unprompted, sid)},
         else: state
 
-    {:noreply, put_in(state.chunks[sid], [])}
+    state = %{
+      state
+      | prompts: Map.delete(state.prompts, sid),
+        chunks: Map.delete(state.chunks, sid)
+    }
+
+    next_prompt(state, sid)
+  end
+
+  defp next_prompt(state, sid) do
+    case Enum.find_index(state.queued_prompts, &(&1.sid == sid)) do
+      nil ->
+        {:noreply, state}
+
+      index ->
+        {queued, rest} = List.pop_at(state.queued_prompts, index)
+        Process.cancel_timer(queued.timer)
+        start_prompt(%{state | queued_prompts: rest}, sid, queued.text, queued.opts, queued.from)
+    end
+  end
+
+  defp prompt_failure(prompt, fallback) do
+    case Map.get(prompt, :cancel_reason) do
+      :prompt_timeout -> :prompt_timeout
+      reason -> Map.get(prompt, :failure) || reason || fallback
+    end
+  end
+
+  defp stop_prompt_worker(%{worker: nil}), do: :ok
+
+  defp stop_prompt_worker(%{worker: pid, monitor: ref}) do
+    Process.exit(pid, :kill)
+
+    receive do
+      {:DOWN, ^ref, :process, ^pid, _reason} -> :ok
+    end
+
+    Process.demonitor(ref, [:flush])
+  end
+
+  defp teardown_prompt_connection(state, cause_sid, cause) do
+    # A PID is a generation identity. Never resolve a name here: a late
+    # deadline is not permission to terminate its replacement.
+    conn_monitor = Process.monitor(state.conn)
+    Process.unlink(state.conn)
+    Process.exit(state.conn, :kill)
+
+    receive do
+      {:DOWN, ^conn_monitor, :process, _pid, _reason} -> :ok
+    end
+
+    collateral = {:prompt_interrupted, {:cancel_unacknowledged, cause_sid}}
+
+    for {sid, prompt} <- state.prompts do
+      stop_prompt_worker(prompt)
+      reason = prompt_failure(prompt, if(sid == cause_sid, do: cause, else: collateral))
+      GenServer.reply(prompt.from, {:error, reason})
+    end
+
+    for queued <- state.queued_prompts do
+      Process.cancel_timer(queued.timer)
+      GenServer.reply(queued.from, {:error, {:acp_request_not_dispatched, collateral}})
+    end
+
+    {:stop, {:prompt_cancel_unacknowledged, cause_sid},
+     %{state | prompts: %{}, queued_prompts: [], progress: %{}, chunks: %{}}}
   end
 
   def handle_info({:subagent_event_ingested, event_ref, {:ok, _result}}, state) do
@@ -1168,6 +1361,27 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   def handle_info({:DOWN, monitor, :process, _pid, reason}, state) do
+    case Enum.find(state.prompts, fn {_sid, prompt} -> prompt.monitor == monitor end) do
+      {sid, prompt} ->
+        prompt =
+          prompt
+          |> Map.put(:worker, nil)
+          |> Map.put(:monitor, nil)
+          |> Map.put_new(:failure, {:prompt_worker_exit, reason})
+
+        {:noreply,
+         %{
+           state
+           | prompts: Map.put(state.prompts, sid, prompt),
+             progress: Map.delete(state.progress, sid)
+         }}
+
+      nil ->
+        subagent_down(state, monitor, reason)
+    end
+  end
+
+  defp subagent_down(state, monitor, reason) do
     case Enum.find(state.subagent_tasks, fn {_event_ref, task} -> task.monitor == monitor end) do
       {event_ref, task} ->
         Logger.error(

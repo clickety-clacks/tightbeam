@@ -93,6 +93,169 @@ defmodule Tightbeam.LaneTest do
     assert Agent.get(agent, &Enum.reverse(&1)) == ["first", "second"]
   end
 
+  test "manager restart releases surviving tasks and fences late results and repeated recovery",
+       ctx do
+    parent = self()
+    first = enqueue!(ctx.db, "k1", "blocked")
+    second = enqueue!(ctx.db, "k1", "successor")
+
+    runner = fn turn ->
+      send(parent, {:running, turn.seq, self()})
+
+      receive do
+        :complete ->
+          {:ok,
+           %{
+             terminal_publish: fn status -> send(parent, {:runner_terminal, turn.seq, status}) end
+           }}
+      end
+    end
+
+    opts = [
+      db: ctx.db,
+      lane_sup: ctx.lane_sup,
+      task_sup: ctx.task_sup,
+      runner: runner,
+      interval: 60_000,
+      terminal_publisher: fn row -> send(parent, {:recovery_terminal, row.seq, row.status}) end,
+      name: :"mgr_#{System.unique_integer([:positive])}"
+    ]
+
+    {:ok, manager} = LaneManager.start_link(opts)
+    assert_receive {:running, ^first, obsolete}
+    [{lane, _}] = Registry.lookup(Tightbeam.LaneRegistry, "k1")
+    %{task_ref: old_ref} = :sys.get_state(lane)
+    obsolete_monitor = Process.monitor(obsolete)
+    GenServer.stop(manager)
+
+    {:ok, restarted} = LaneManager.start_link(opts)
+    assert_receive {:DOWN, ^obsolete_monitor, :process, ^obsolete, :killed}
+    assert_receive {:running, ^second, successor}
+    assert_receive {:recovery_terminal, ^first, "failed_unknown"}
+    assert Registry.lookup(Tightbeam.LaneRegistry, "k1") == [{lane, nil}]
+    %{task_ref: successor_ref} = :sys.get_state(lane)
+
+    # Deliver both possible obsolete task signals after the new claim, plus
+    # duplicate recovery, in a known mailbox order. None may touch its owner.
+    SessionLane.release_recovered("k1", first)
+
+    send(
+      lane,
+      {old_ref, {first, {:ok, %{terminal_publish: fn _ -> send(parent, :stale_publish) end}}}}
+    )
+
+    send(lane, {:DOWN, old_ref, :process, obsolete, :killed})
+
+    assert %{task_ref: ^successor_ref, current_seq: ^second, task_pid: ^successor} =
+             :sys.get_state(lane)
+
+    assert Process.alive?(successor)
+    refute_receive :stale_publish
+    refute_receive {:runner_terminal, ^first, _}
+
+    assert {:ok, [["failed_unknown"], ["running"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq IN (?1, ?2) ORDER BY seq", [
+               first,
+               second
+             ])
+
+    send(successor, :complete)
+    assert_receive {:runner_terminal, ^second, "delivered"}
+    assert eventually(fn -> Ledger.pending_sessions(ctx.db) == [] end)
+    :ok = LaneManager.reconcile(restarted)
+    refute_receive {:recovery_terminal, ^first, _}
+    refute_receive {:runner_terminal, ^second, _}
+
+    GenServer.stop(restarted)
+    {:ok, again} = LaneManager.start_link(opts)
+    assert Ledger.recover_running(ctx.db) == []
+    assert :ok = LaneManager.reconcile(again)
+    refute_receive {:recovery_terminal, _, _}
+  end
+
+  test "recovery interrupted after its ledger commit still releases the old task", ctx do
+    parent = self()
+    first = enqueue!(ctx.db, "k1", "blocked")
+    second = enqueue!(ctx.db, "k1", "queued")
+
+    runner = fn turn ->
+      send(parent, {:running, turn.seq, self()})
+
+      receive do
+        :complete -> {:ok, %{}}
+      end
+    end
+
+    {:ok, lane} =
+      DynamicSupervisor.start_child(
+        ctx.lane_sup,
+        {SessionLane, session_key: "k1", db: ctx.db, task_sup: ctx.task_sup, runner: runner}
+      )
+
+    assert_receive {:running, ^first, obsolete}
+    monitor = Process.monitor(obsolete)
+    assert [^first] = Ledger.recover_running(ctx.db)
+    # The recovering manager died here, before release_recovered could be sent.
+    {:ok, manager} =
+      LaneManager.start_link(
+        db: ctx.db,
+        lane_sup: ctx.lane_sup,
+        task_sup: ctx.task_sup,
+        runner: runner,
+        interval: 60_000,
+        name: :"mgr_#{System.unique_integer([:positive])}"
+      )
+
+    assert_receive {:DOWN, ^monitor, :process, ^obsolete, :killed}
+    assert_receive {:running, ^second, successor}
+    assert %{task_pid: ^successor, current_seq: ^second} = :sys.get_state(lane)
+    :ok = LaneManager.reconcile(manager)
+    assert Process.alive?(successor)
+    send(successor, :complete)
+    assert eventually(fn -> Ledger.pending_sessions(ctx.db) == [] end)
+  end
+
+  test "late recovery cannot kill unrelated current work or lose queued work", ctx do
+    parent = self()
+    first = enqueue!(ctx.db, "k1", "active")
+    next = enqueue!(ctx.db, "k1", "queued")
+    other = enqueue!(ctx.db, "k2", "other")
+
+    runner = fn turn ->
+      send(parent, {:running, turn.seq, self()})
+
+      receive do
+        :complete -> {:ok, %{}}
+      end
+    end
+
+    {:ok, _manager} =
+      LaneManager.start_link(
+        db: ctx.db,
+        lane_sup: ctx.lane_sup,
+        task_sup: ctx.task_sup,
+        runner: runner,
+        interval: 60_000,
+        name: :"mgr_#{System.unique_integer([:positive])}"
+      )
+
+    assert_receive {:running, ^first, active}
+    assert_receive {:running, ^other, unrelated}
+    SessionLane.release_recovered("k1", other)
+    SessionLane.release_recovered("k2", first)
+    assert %{task_pid: ^active} = :sys.get_state(SessionLane.via("k1"))
+    assert %{task_pid: ^unrelated} = :sys.get_state(SessionLane.via("k2"))
+    assert {:ok, %{seq: ^first}} = SessionLane.cancel_current("k1")
+    assert_receive {:running, ^next, successor}
+    assert Process.alive?(unrelated)
+    send(successor, :complete)
+    send(unrelated, :complete)
+    assert eventually(fn -> Ledger.pending_sessions(ctx.db) == [] end)
+
+    assert {:ok, [["canceled"], ["delivered"], ["delivered"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns ORDER BY seq")
+  end
+
   test "a real lane terminal settles the current rung and publishes the next rung", ctx do
     parent = self()
     at = System.system_time(:millisecond)

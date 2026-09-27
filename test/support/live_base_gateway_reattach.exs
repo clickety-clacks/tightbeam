@@ -97,10 +97,10 @@ defmodule GuardReattach do
 
         assert {:ok, turn} = Ledger.claim_next(db, "k1", "test")
 
-        assert {:ok, %{terminal_publish: publish}} =
+        assert {:ok, %{terminal_publish: publish, record_in_txn: record}} =
                  runner.(Map.put(turn, :session_key, "k1"))
 
-        assert :ok = Ledger.finish(db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+        assert :ok = Tightbeam.GatewayTurnFixture.commit_success!(db, turn, record)
         publish.("delivered")
         assert_receive {:load_apply_residency, "load-apply-session"}
 
