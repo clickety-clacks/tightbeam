@@ -178,7 +178,10 @@ defmodule Tightbeam.ModelCatalogTest do
     catalog =
       start_catalog(ctx,
         sh: fn command ->
-          send(parent, {:codex_provider_task, command})
+          if codex_catalog_command?(command) do
+            send(parent, {:codex_provider_task, command})
+          end
+
           ctx.codex_sh.(command)
         end
       )
@@ -210,9 +213,13 @@ defmodule Tightbeam.ModelCatalogTest do
       capture_log(fn ->
         catalog =
           start_catalog(ctx,
-            sh: fn _command ->
-              :counters.add(attempts, 1, 1)
-              catalog_reply(raw_body, 401)
+            sh: fn command ->
+              if codex_catalog_command?(command) do
+                :counters.add(attempts, 1, 1)
+                catalog_reply(raw_body, 401)
+              else
+                ctx.codex_sh.(command)
+              end
             end
           )
 
@@ -274,9 +281,13 @@ defmodule Tightbeam.ModelCatalogTest do
       capture_log(fn ->
         catalog =
           start_catalog(ctx,
-            sh: fn _command ->
-              :counters.add(attempts, 1, 1)
-              catalog_reply(~s({"detail":"fixture rejected"}), 401)
+            sh: fn command ->
+              if codex_catalog_command?(command) do
+                :counters.add(attempts, 1, 1)
+                catalog_reply(~s({"detail":"fixture rejected"}), 401)
+              else
+                ctx.codex_sh.(command)
+              end
             end,
             terminal_open: fn _db, _input -> raise forbidden end
           )
@@ -313,11 +324,15 @@ defmodule Tightbeam.ModelCatalogTest do
     attempts = :counters.new(1, [])
 
     sh = fn command ->
-      :counters.add(attempts, 1, 1)
+      if codex_catalog_command?(command) do
+        :counters.add(attempts, 1, 1)
 
-      case Agent.get(mode, & &1) do
-        :terminal -> catalog_reply(~s({"detail":"fixture rejected"}), 401)
-        :recovered -> ctx.codex_sh.(command)
+        case Agent.get(mode, & &1) do
+          :terminal -> catalog_reply(~s({"detail":"fixture rejected"}), 401)
+          :recovered -> ctx.codex_sh.(command)
+        end
+      else
+        ctx.codex_sh.(command)
       end
     end
 
@@ -1916,6 +1931,13 @@ defmodule Tightbeam.ModelCatalogTest do
   end
 
   defp requeue(skipped), do: skipped |> Enum.reverse() |> Enum.each(&send(self(), &1))
+
+  defp codex_catalog_command?(command) do
+    Enum.any?(command, fn argument ->
+      is_binary(argument) and
+        String.contains?(argument, "https://chatgpt.com/backend-api/codex/models")
+    end)
+  end
 
   defp start_catalog(ctx, overrides \\ []) do
     name = Keyword.get(overrides, :name, unique_name(:catalog))
