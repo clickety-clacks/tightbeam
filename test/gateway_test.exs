@@ -274,6 +274,33 @@ defmodule Tightbeam.GatewayTest do
     end
   end
 
+  defmodule BlockingCandidateAdapterStub do
+    use GenServer
+
+    def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
+    def init(parent), do: {:ok, parent}
+
+    def handle_call({:new_candidate_session, _model, _cwd, _mcp, guidance}, _from, parent) do
+      send(parent, {:candidate_handoff_ready, guidance})
+
+      receive do
+        :allow_candidate -> {:reply, {:ok, "queued-switch-candidate"}, parent}
+      after
+        60_000 -> raise "timed out waiting for queued harness switch candidate"
+      end
+    end
+  end
+
+  defmodule FailingCandidateAdapterStub do
+    use GenServer
+
+    def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
+    def init(parent), do: {:ok, parent}
+
+    def handle_call({:new_candidate_session, _model, _cwd, _mcp, _guidance}, _from, parent),
+      do: {:reply, {:error, :deliberate_candidate_failure}, parent}
+  end
+
   defmodule MismatchedCandidateAdapterStub do
     use GenServer
     def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
@@ -6705,6 +6732,229 @@ defmodule Tightbeam.GatewayTest do
     send(runner, :finish_set_harness_turn)
   end
 
+  test "queued set_harness handoff excludes QMS sources and keeps other durable order", ctx do
+    candidate = start_supervised!({BlockingCandidateAdapterStub, self()})
+    {config, _local_host} = queued_harness_switch_config!(ctx, "queued-handoff", candidate)
+
+    {:appended, history_user} =
+      Projection.append(ctx.db, %{
+        session_key: "k1",
+        role: "user",
+        sender: "user:flynn",
+        content: "prior durable user context"
+      })
+
+    {:appended, history_agent} =
+      Projection.append(ctx.db, %{
+        session_key: "k1",
+        role: "assistant",
+        sender: "agent:reviewer",
+        content: "prior durable agent context"
+      })
+
+    assert history_user.seq < history_agent.seq
+
+    :ok =
+      DB.execute(ctx.db, """
+      INSERT INTO assignments
+        (id,subject,holderKey,openedByUser,openedAt,state)
+      VALUES ('asg_handoff','handoff','k1','flynn',1,'open')
+      """)
+
+    :ok =
+      DB.execute(ctx.db, """
+      INSERT INTO assignment_effects (assignmentId,effectKind)
+      VALUES ('asg_handoff','coordination')
+      """)
+
+    wake =
+      Wakes.schedule(ctx.db, %{
+        session_key: "k1",
+        origin: "process:tightbeam",
+        prompt: "superseded liveness notice",
+        due_at: System.system_time(:millisecond) + 60_000,
+        assignment_id: "asg_handoff",
+        consumer: "effort_probe"
+      })
+
+    assert {:ok, {:appended, "k1", suppressed_message, _opts}} =
+             DB.transaction(ctx.db, fn txn ->
+               Gateway.deliver_prompt_in_txn(
+                 txn,
+                 wake.session_key,
+                 wake.origin,
+                 wake.prompt,
+                 wake_id: wake.wake_id,
+                 sender: wake.origin,
+                 device_id: "test",
+                 client_message_id: wake.wake_id,
+                 target_gate: wake
+               )
+             end)
+
+    assert {:ok, [[suppressed_seq]]} =
+             DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [wake.wake_id])
+
+    assert suppressed_message.seq != suppressed_seq
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO supervision_liveness_receipts
+                 (assignmentId,sourceKind,sourceId,sourceAt,acceptedAt,generation,expiresAt)
+               VALUES ('asg_handoff','progress','progress-1',?1,?2,2,NULL)
+               """,
+               [wake.created_at, wake.created_at + 1]
+             )
+
+    assert {:ok, [^suppressed_seq]} =
+             DB.transaction(ctx.db, fn txn ->
+               Tightbeam.QueuedMessageSuppression.suppress_before_claim_in_txn(txn, "k1")
+             end)
+
+    {unattributed_canceled_seq, unattributed_canceled_message} =
+      enqueue_gateway_prompt!(
+        ctx.db,
+        "k1",
+        "user:flynn",
+        "unattributed canceled durable context"
+      )
+
+    assert {:ok, true} =
+             DB.transaction(ctx.db, fn txn ->
+               Ledger.cancel_queued_in_txn(
+                 txn,
+                 unattributed_canceled_seq,
+                 "unrelated cancellation"
+               )
+             end)
+
+    {first_seq, first_message} =
+      enqueue_gateway_prompt!(ctx.db, "k1", "user:flynn", "first queued request")
+
+    {second_seq, second_message} =
+      enqueue_gateway_prompt!(ctx.db, "k1", "agent:reviewer", "second queued request")
+
+    tune = Gateway.handlers(config)["tune"]
+
+    task =
+      Task.async(fn ->
+        tune.(%{
+          origin: "user:flynn",
+          session_key: "k1",
+          params: %{setting: "set_harness", harness: "codex", model: "gpt-5.6-sol"}
+        })
+      end)
+
+    assert_receive {:candidate_handoff_ready, guidance}, 60_000
+    assert guidance =~ "Cross-harness handoff from durable session records"
+    assert guidance =~ ~s("sender":"user:flynn")
+    assert guidance =~ ~s("sender":"agent:reviewer")
+    refute guidance =~ "superseded liveness notice"
+    assert guidance =~ "unattributed canceled durable context"
+    assert String.index(guidance, "prior durable user context") <
+             String.index(guidance, "prior durable agent context")
+    assert String.index(guidance, "prior durable agent context") <
+             String.index(guidance, "unattributed canceled durable context")
+    refute guidance =~ "first queued request"
+    refute guidance =~ "second queued request"
+    refute guidance =~ "late queued request"
+
+    {late_seq, late_message} =
+      enqueue_gateway_prompt!(ctx.db, "k1", "user:flynn", "late queued request")
+
+    send(candidate, :allow_candidate)
+
+    assert %{ok: true, harness: "codex", engine_context: "reset"} = Task.await(task, 60_000)
+    assert Org.get(ctx.db, "k1").cleared_through_seq == unattributed_canceled_message.seq
+    assert Ledger.pending_count(ctx.db, "k1") == 3
+
+    assert {:ok, queued_rows} =
+             DB.query(
+               ctx.db,
+               "SELECT seq,status,messageId FROM turns WHERE sessionKey='k1' ORDER BY seq"
+             )
+
+    assert queued_rows == [
+             [suppressed_seq, "canceled", suppressed_message.id],
+             [unattributed_canceled_seq, "canceled", unattributed_canceled_message.id],
+             [first_seq, "queued", first_message.id],
+             [second_seq, "queued", second_message.id],
+             [late_seq, "queued", late_message.id]
+           ]
+
+    assert {:ok, [[error]]} =
+             DB.query(ctx.db, "SELECT error FROM turns WHERE seq=?1", [suppressed_seq])
+
+    assert error =~ "queued-message-suppressed:"
+
+    assert Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
+             event.kind == "queued_message_suppressed" and
+               event.subject == Integer.to_string(suppressed_seq) and
+               JSON.decode!(event.detail)["messageKind"] == "liveness"
+           end)
+
+    visible_after_switch = Projection.list_after(ctx.db, "k1", nil, 100, history_agent.seq)
+
+    assert Enum.any?(visible_after_switch, &(&1.id == first_message.id))
+    assert Enum.any?(visible_after_switch, &(&1.id == second_message.id))
+    assert Enum.any?(visible_after_switch, &(&1.id == late_message.id))
+    assert Enum.any?(visible_after_switch, &(&1.marker && &1.marker.kind == "harness-switch"))
+
+    for expected_seq <- [first_seq, second_seq, late_seq] do
+      assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
+      assert turn.seq == expected_seq
+      assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+    end
+
+    assert :none = Ledger.claim_next(ctx.db, "k1", "test")
+  end
+
+  test "queued set_harness candidate failure leaves source, history, and queue intact", ctx do
+    candidate = start_supervised!({FailingCandidateAdapterStub, self()})
+    {config, _local_host} = queued_harness_switch_config!(ctx, "queued-handoff-failure", candidate)
+    Org.append_pointer(ctx.db, "k1", "source-session", "created")
+
+    {first_seq, first_message} =
+      enqueue_gateway_prompt!(ctx.db, "k1", "user:flynn", "first remains queued")
+
+    {second_seq, second_message} =
+      enqueue_gateway_prompt!(ctx.db, "k1", "user:flynn", "second remains queued")
+
+    before = Org.get(ctx.db, "k1")
+    before_pointer = Org.current_pointer(ctx.db, "k1")
+
+    assert %{ok: false, code: "model_apply_failed", message: message} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: "user:flynn",
+               session_key: "k1",
+               params: %{setting: "set_harness", harness: "codex", model: "gpt-5.6-sol"}
+             })
+
+    assert message =~ ":deliberate_candidate_failure"
+
+    assert Org.get(ctx.db, "k1").harness == before.harness
+    assert Org.get(ctx.db, "k1").cleared_through_seq == before.cleared_through_seq
+    assert Org.current_pointer(ctx.db, "k1") == before_pointer
+    assert Ledger.pending_count(ctx.db, "k1") == 2
+
+    assert {:ok, queued_rows} =
+             DB.query(
+               ctx.db,
+               "SELECT seq,status,messageId FROM turns WHERE sessionKey='k1' ORDER BY seq"
+             )
+
+    assert queued_rows == [
+             [first_seq, "queued", first_message.id],
+             [second_seq, "queued", second_message.id]
+           ]
+
+    refute Enum.any?(Projection.list_after(ctx.db, "k1", nil, 100), fn message ->
+             message.marker && message.marker.kind == "harness-switch"
+           end)
+  end
+
   # The value a client is TOLD to send must be a value this accepts. `setModel.options`
   # and `modelCatalog.models` advertise one row per model with a base ref, deliberately
   # — the effort tier belongs to the reasoning picker — while the catalog only holds an
@@ -9200,6 +9450,67 @@ defmodule Tightbeam.GatewayTest do
         {SessionLane, :start_link,
          [[session_key: session_key, db: db, task_sup: task_sup, runner: runner]]}
     })
+  end
+
+  defp start_reserved_lane!(db, session_key) do
+    task_sup =
+      start_supervised!(
+        {Task.Supervisor, name: :"reserved_lane_tasks_#{System.unique_integer([:positive])}"}
+      )
+
+    start_supervised!(%{
+      id: {:lane, session_key},
+      start:
+        {SessionLane, :start_link,
+         [[
+           session_key: session_key,
+           db: db,
+           task_sup: task_sup,
+           runner: fn _turn -> {:ok, %{}} end,
+           settlement_reservation: make_ref()
+         ]]}
+    })
+  end
+
+  defp queued_harness_switch_config!(ctx, suffix, candidate) do
+    base_dir = role_test_base(suffix)
+    Archetypes.load!(base_dir)
+
+    local_host = Placement.local_host_name()
+    codex_auth = Tightbeam.Homes.home_path(base_dir, local_host, :codex)
+    File.mkdir_p!(codex_auth)
+    File.write!(Path.join(codex_auth, "auth.json"), "test-token")
+
+    Org.set_host(ctx.db, "k1", local_host)
+    put_host_catalog(local_host, "codex", [])
+
+    put_host_catalog_entry(local_host, "codex", %{
+      family: "gpt-5.6-sol",
+      efforts: ["medium"],
+      provider: :openai
+    })
+
+    start_supervised!({CoordinatorStub, candidate})
+    start_reserved_lane!(ctx.db, "k1")
+
+    config =
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.put(:conn_registry, ctx.registry)
+      |> Map.put(:lane_manager, ctx.lane)
+
+    {config, local_host}
+  end
+
+  defp enqueue_gateway_prompt!(db, session_key, sender, prompt) do
+    {:ok, {:appended, ^session_key, message, _opts}} =
+      DB.transaction(db, fn txn ->
+        Gateway.deliver_prompt_in_txn(txn, session_key, sender, prompt, sender: sender)
+      end)
+
+    {:ok, [[seq]]} =
+      DB.query(db, "SELECT seq FROM turns WHERE messageId=?1", [message.id])
+
+    {seq, message}
   end
 
   defp ensure_global_registry do

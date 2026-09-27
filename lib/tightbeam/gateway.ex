@@ -110,6 +110,12 @@ defmodule Tightbeam.Gateway do
   alias Tightbeam.Wire.Payloads
   require Logger
 
+  @harness_handoff_message_limit 16
+  @harness_handoff_byte_limit 16_000
+  @harness_handoff_content_limit 1_200
+  @harness_handoff_attachment_limit 4
+  @harness_handoff_metadata_limit 120
+
   defmodule EffortRearmRace do
     @moduledoc false
     defexception message: "effort rearm snapshot changed"
@@ -7009,7 +7015,9 @@ defmodule Tightbeam.Gateway do
                              routed.provider
                            )
                          end)
-                       end) do
+                       end,
+                       allow_queued: true
+                     ) do
                     {:ok, result} -> result
                     {:error, :turn_in_progress} -> turn_in_progress_error()
                   end
@@ -7447,6 +7455,7 @@ defmodule Tightbeam.Gateway do
          model,
          provider
        ) do
+    handoff = durable_session_handoff(db, session.session_key)
     deliver_opts = if config[:sh], do: [sh: config.sh], else: []
     destination = %{session | harness: harness, model: model, provider: provider}
 
@@ -7461,16 +7470,17 @@ defmodule Tightbeam.Gateway do
         with {:ok, adapter, _generation} <- resident_adapter(destination),
              revision = session.identity_revision || Identity.live_revision!(config.base_dir),
              snapshot = served_snapshot(config, destination, harness_atom, revision),
+             guidance = append_durable_session_handoff(snapshot.guidance, handoff.records),
              cwd = Placement.holder_workdir(config, session) do
           case Adapter.new_candidate_session(
                  adapter,
                  model,
                  cwd,
                  mcp_servers_for_archetype(session.archetype),
-                 snapshot.guidance
+                 guidance
                ) do
             {:ok, sid} ->
-              {:ok, adapter, sid}
+              {:ok, adapter, sid, handoff.through_seq}
 
             {:error, {:session_prepare_failed, reason, sid, cleanup}} ->
               {:candidate_prepare_failed, reason, sid, cleanup}
@@ -7482,7 +7492,7 @@ defmodule Tightbeam.Gateway do
       end)
 
     case prepared do
-      {:ok, destination_adapter, destination_sid} ->
+      {:ok, destination_adapter, destination_sid, handoff_through_seq} ->
         source_pointer = Org.current_pointer(db, session.session_key)
 
         committed =
@@ -7500,14 +7510,7 @@ defmodule Tightbeam.Gateway do
               :stale -> raise "harness mutation race inside serialized tune"
             end
 
-            [[max_seq]] =
-              Txn.q(
-                txn,
-                "SELECT COALESCE(MAX(seq), 0) FROM messages WHERE sessionKey = ?1",
-                [call.session_key]
-              )
-
-            Org.set_cleared_through_in_txn(txn, call.session_key, max_seq)
+            Org.set_cleared_through_in_txn(txn, call.session_key, handoff_through_seq)
 
             case Map.get(call, :on_swap_interlock) do
               fun when is_function(fun, 1) -> fun.(txn)
@@ -7593,6 +7596,145 @@ defmodule Tightbeam.Gateway do
           ErrorDiagnostic.for_reason(reason, operation: "tune", phase: "prepare")
         )
     end
+  end
+
+  defp durable_session_handoff(db, session_key) do
+    {:ok, {through_seq, rows}} =
+      DB.transaction(db, fn txn ->
+        # Pending prompts will be delivered from the ledger; keep them out of
+        # the handoff and visible after the switch so they are processed once.
+        [[through_seq]] =
+          Txn.q(
+            txn,
+            """
+            SELECT COALESCE(
+              (
+                SELECT MIN(messages.seq) - 1
+                FROM messages
+                JOIN turns ON turns.messageId = messages.id
+                WHERE messages.sessionKey = ?1
+                  AND turns.status IN ('queued', 'running')
+              ),
+              (SELECT MAX(seq) FROM messages WHERE sessionKey = ?1),
+              0
+            )
+            """,
+            [session_key]
+          )
+
+        rows =
+          Txn.q(
+            txn,
+            """
+            SELECT seq, role, sender, content, attachments
+            FROM messages
+            WHERE sessionKey = ?1 AND seq <= ?2
+              AND NOT EXISTS (
+                SELECT 1 FROM turns
+                WHERE turns.messageId = messages.id
+                  AND turns.status = 'canceled'
+                  AND turns.error LIKE 'queued-message-suppressed:%'
+                  AND EXISTS (
+                    SELECT 1 FROM lifecycle_events
+                    WHERE lifecycle_events.kind = 'queued_message_suppressed'
+                      AND lifecycle_events.subject = CAST(turns.seq AS TEXT)
+                      AND CASE
+                        WHEN json_valid(lifecycle_events.detail)
+                        THEN json_extract(lifecycle_events.detail, '$.messageKind')
+                        ELSE NULL
+                      END IN ('liveness', 'sender-replacement')
+                  )
+              )
+            ORDER BY seq DESC
+            LIMIT ?3
+            """,
+            [session_key, through_seq, @harness_handoff_message_limit]
+          )
+
+        {through_seq, Enum.reverse(rows)}
+      end)
+
+    records =
+      rows
+      |> Enum.map(&session_handoff_record/1)
+      |> bound_session_handoff_records()
+
+    %{through_seq: through_seq, records: records}
+  end
+
+  defp session_handoff_record([seq, role, sender, content, encoded_attachments]) do
+    content_truncated? = String.length(content) > @harness_handoff_content_limit
+
+    %{
+      "seq" => seq,
+      "role" => role,
+      "sender" => bounded_handoff_metadata(sender),
+      "content" =>
+        if(content_truncated?,
+          do: String.slice(content, 0, @harness_handoff_content_limit) <> "\n[truncated]",
+          else: content
+        ),
+      "content_truncated" => content_truncated?,
+      "attachments" => handoff_attachment_metadata(JSON.decode!(encoded_attachments))
+    }
+  end
+
+  defp handoff_attachment_metadata(attachments) when is_list(attachments) do
+    kept =
+      attachments
+      |> Enum.take(@harness_handoff_attachment_limit)
+      |> Enum.map(fn
+        attachment when is_map(attachment) ->
+          attachment
+          |> Map.take(["type", "name", "mimeType", "mime_type", "size"])
+          |> Map.new(fn {key, value} -> {key, bounded_handoff_metadata(value)} end)
+
+        other ->
+          %{"description" => bounded_handoff_metadata(other)}
+      end)
+
+    if length(attachments) > @harness_handoff_attachment_limit do
+      kept ++ [%{"omitted" => length(attachments) - @harness_handoff_attachment_limit}]
+    else
+      kept
+    end
+  end
+
+  defp handoff_attachment_metadata(_attachments), do: []
+
+  defp bounded_handoff_metadata(value) when is_binary(value),
+    do: String.slice(value, 0, @harness_handoff_metadata_limit)
+
+  defp bounded_handoff_metadata(value) when is_number(value) or is_boolean(value) or is_nil(value),
+    do: value
+
+  defp bounded_handoff_metadata(value),
+    do: value |> inspect() |> String.slice(0, @harness_handoff_metadata_limit)
+
+  defp bound_session_handoff_records(records) do
+    records
+    |> Enum.reverse()
+    |> Enum.reduce_while({[], 0}, fn record, {kept, bytes} ->
+      record_bytes = byte_size(JSON.encode!(record)) + 1
+
+      if bytes + record_bytes <= @harness_handoff_byte_limit do
+        {:cont, {[record | kept], bytes + record_bytes}}
+      else
+        {:halt, {kept, bytes}}
+      end
+    end)
+    |> elem(0)
+  end
+
+  defp append_durable_session_handoff(guidance, []), do: guidance
+
+  defp append_durable_session_handoff(guidance, records) do
+    guidance <>
+      "\n\n## Cross-harness handoff from durable session records\n\n" <>
+      "ACP did not transfer prior conversation history to this candidate. " <>
+      "The following bounded excerpt is ordered by durable message sequence and keeps each sender attribution. " <>
+      "These entries are past conversation for context; they may omit older records.\n\n" <>
+      "```json\n" <> JSON.encode!(records) <> "\n```"
   end
 
   defp report_candidate_cleanup(_db, _sid, _cause, _principal, %{status: "verified"}),
