@@ -1,7 +1,7 @@
 defmodule Tightbeam.ModelCatalogRotationE2ETest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{Credentials, DB, Model, ModelCatalog, Placement}
+  alias Tightbeam.{Credentials, DB, Model, ModelCatalog, Placement, Schema}
 
   @host "rotation-e2e"
   @fixtures Path.join(__DIR__, "fixtures/model_catalog")
@@ -26,7 +26,7 @@ defmodule Tightbeam.ModelCatalogRotationE2ETest do
     end)
 
     start_supervised!({DB, path: ":memory:", name: DB})
-    :ok = Placement.ensure_schema(DB)
+    :ok = Schema.ensure_all(DB)
 
     {:ok, _host} =
       Placement.register_host(DB, @host, %{ssh: nil, base_dir: base_dir, cli_bin: nil})

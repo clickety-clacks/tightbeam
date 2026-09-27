@@ -12,7 +12,7 @@ defmodule Tightbeam.Devices do
   gateway-owned; prefix `tbt_`).
   """
 
-  alias Tightbeam.{AdminProjection, DB, StateResources}
+  alias Tightbeam.{AdminProjection, DB, StateResources, TerminalCredentialFailure}
   alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.Publisher
 
@@ -288,7 +288,9 @@ defmodule Tightbeam.Devices do
     transaction!(db, fn txn ->
       insert_user(txn, user_id, is_admin)
 
-      must_get_user(txn, user_id)
+      user = must_get_user(txn, user_id)
+      :ok = TerminalCredentialFailure.reconcile_admin_in_txn(txn, user_id)
+      user
     end)
   end
 
@@ -297,6 +299,7 @@ defmodule Tightbeam.Devices do
     transaction!(db, fn txn ->
       insert_user(txn, user_id, is_admin)
       user = StateResources.query_user(txn, user_id)
+      :ok = TerminalCredentialFailure.reconcile_admin_in_txn(txn, user_id)
       Publisher.maybe_accepted_in_txn(txn, call, %{user: user})
       user
     end)
@@ -314,6 +317,7 @@ defmodule Tightbeam.Devices do
       desired = !!is_admin
 
       if user.is_admin == desired do
+        :ok = TerminalCredentialFailure.reconcile_admin_in_txn(txn, user_id)
         Publisher.maybe_observed_accepted_in_txn(txn, call)
         %{user: StateResources.query_user(txn, user_id), changed: false}
       else
@@ -325,6 +329,7 @@ defmodule Tightbeam.Devices do
         updated_at = System.system_time(:millisecond)
         AdminProjection.allocate_in_txn(txn, "users", user_id, updated_at)
         projection = StateResources.query_user(txn, user_id)
+        :ok = TerminalCredentialFailure.reconcile_admin_in_txn(txn, user_id)
         Publisher.maybe_observed_accepted_in_txn(txn, call)
         class = if desired, do: "user.promoted", else: "user.demoted"
         Publisher.committed_in_txn(txn, class, projection, %{"userId" => user_id})
@@ -344,7 +349,9 @@ defmodule Tightbeam.Devices do
         if(is_admin, do: 1, else: 0)
       ])
 
-      must_get_user(txn, user_id)
+      user = must_get_user(txn, user_id)
+      :ok = TerminalCredentialFailure.reconcile_admin_in_txn(txn, user_id)
+      user
     end)
   end
 

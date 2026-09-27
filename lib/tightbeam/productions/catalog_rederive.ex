@@ -20,12 +20,11 @@ defmodule Tightbeam.Productions.CatalogRederive do
 
   A PLAIN module, not a GenServer: with the existing TTL sweep as the backstop
   (I5) there is no cursor and thus no sweeper process. Simpler than Bubble in
-  two more ways: the RHS is idempotent (a catalog re-derivation is a pure re-read
-  of world-state), so there is no lineage walk and no exactly-once dedup —
-  recognition may run twice for free. A dropped edge self-heals when the catalog
-  is next read (`ModelCatalog`'s read-triggered TTL re-derivation), which is
-  exactly when it matters — a spawn, turn, or readiness consult; the wired cast
-  is what meets AC4's "immediate".
+  two more ways: the RHS is idempotent for healthy keys (a catalog re-derivation
+  is a pure re-read of world-state), while an open terminal incident durably
+  deduplicates recovery by fact id. A dropped recognition edge for a terminal
+  key is recovered from that fact at ModelCatalog startup; ordinary reads remain
+  suppressed and never serve as a hidden recovery trigger.
   """
 
   alias Tightbeam.{DB, ModelCatalog}
@@ -45,7 +44,7 @@ defmodule Tightbeam.Productions.CatalogRederive do
   @spec recognize(DB.server(), GenServer.server(), integer()) :: :ok
   def recognize(db, catalog, fact_id) do
     case catalog_rederive_matches?(db, fact_id) do
-      {:ok, host, provider} -> rederive(catalog, host, provider)
+      {:ok, host, provider} -> rederive(catalog, host, provider, fact_id)
       :no_match -> :ok
     end
 
@@ -85,8 +84,8 @@ defmodule Tightbeam.Productions.CatalogRederive do
   # (I5: the fact only says "re-recognize now"); which `{host, harness}` keys
   # that touches is the catalog's own provider→harness mapping. A cast, so the
   # hook never blocks derivation (I4).
-  defp rederive(catalog, host, provider) do
-    ModelCatalog.credential_present(host, provider, catalog)
+  defp rederive(catalog, host, provider, fact_id) do
+    ModelCatalog.credential_transition(host, provider, fact_id, catalog)
   end
 
   # Scope is "<host>:<provider>", written by the one filing site. A scope that

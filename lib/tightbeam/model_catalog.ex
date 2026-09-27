@@ -22,7 +22,16 @@ defmodule Tightbeam.ModelCatalog do
 
   use GenServer
   require Logger
-  alias Tightbeam.{Harness, Model, PiProvider, Placement, Unroutable}
+
+  alias Tightbeam.{
+    Harness,
+    Id,
+    Model,
+    PiProvider,
+    Placement,
+    TerminalCredentialFailure,
+    Unroutable
+  }
 
   @default_ttl_ms :timer.minutes(15)
 
@@ -299,11 +308,20 @@ defmodule Tightbeam.ModelCatalog do
     GenServer.cast(server, {:credential_present, host, provider})
   end
 
+  @doc "Consume one committed credential transition through the durable recovery owner."
+  @spec credential_transition(String.t(), atom(), pos_integer(), GenServer.server()) :: :ok
+  def credential_transition(host, provider, fact_id, server \\ __MODULE__)
+      when is_binary(host) and is_atom(provider) and is_integer(fact_id) and fact_id > 0 do
+    GenServer.cast(server, {:credential_transition, host, provider, fact_id})
+  end
+
   @impl true
   def init(opts) do
     state = %{
       base_dir: Keyword.fetch!(opts, :base_dir),
-      db: Keyword.get(opts, :db, Tightbeam.DB),
+      db: Keyword.get(opts, :db),
+      terminal_incidents: Keyword.get(opts, :terminal_incidents),
+      terminal_open: Keyword.get(opts, :terminal_open, &TerminalCredentialFailure.open/2),
       hosts: Keyword.get(opts, :hosts),
       ttl_ms: Keyword.get(opts, :ttl_ms, @default_ttl_ms),
       now: Keyword.get(opts, :now, fn -> System.monotonic_time(:millisecond) end),
@@ -314,6 +332,7 @@ defmodule Tightbeam.ModelCatalog do
     }
 
     send(self(), :refresh_due)
+    if state.db, do: send(self(), :resume_terminal_recoveries)
     {:ok, state}
   end
 
@@ -349,48 +368,165 @@ defmodule Tightbeam.ModelCatalog do
     {:noreply, Enum.reduce(keys, state, &force_rederive(&2, &1))}
   end
 
+  def handle_cast({:credential_transition, host, provider, fact_id}, state) do
+    keys =
+      for harness <- harness_names(),
+          catalog_uses_provider?(Harness.parse!(harness), provider),
+          do: {host, harness}
+
+    claims =
+      if state.db do
+        state.db
+        |> TerminalCredentialFailure.claim_recoveries(fact_id)
+        |> Map.new(&{{&1.host, &1.harness}, &1})
+      else
+        %{}
+      end
+
+    state =
+      Enum.reduce(keys, state, fn key, acc ->
+        case Map.get(claims, key) do
+          nil -> force_rederive(acc, key)
+          claim -> start_recovery(acc, claim)
+        end
+      end)
+
+    {:noreply, state}
+  end
+
   defp catalog_uses_provider?(Tightbeam.Harness.Pi, :local_openai), do: true
   defp catalog_uses_provider?(module, provider), do: module.credential_provider() == provider
 
   @impl true
   def handle_info(:refresh_due, state), do: {:noreply, refresh_due(state)}
 
-  def handle_info({:catalog_refresh, key, {:ok, entries}}, state) do
-    now = now_ms(state)
-    recheck? = match?(%{recheck: true}, state.entries[key])
+  def handle_info(:resume_terminal_recoveries, state) do
+    state =
+      state.db
+      |> TerminalCredentialFailure.resume_recoveries()
+      |> Enum.reduce(state, &start_recovery(&2, &1))
 
-    cache = %{
-      entries: entries,
-      derived_at: now,
-      attempted_at: now,
-      reason: nil,
-      refreshing: false,
-      recheck: false
-    }
-
-    state = put_in(state, [:entries, key], cache)
-    {:noreply, maybe_recheck(state, key, recheck?)}
+    {:noreply, state}
   end
 
-  def handle_info({:catalog_refresh, {host, harness} = key, {:error, reason}}, state) do
-    Logger.warning("model catalog #{harness} on #{host} refresh degraded: #{inspect(reason)}")
+  def handle_info({:catalog_refresh, key, {:ok, entries}}, state) do
+    case terminal_incident(state, key) do
+      %{id: incident_id} ->
+        cache = terminal_cache(Map.get(state.entries, key, new_cache()), incident_id)
+        {:noreply, put_in(state, [:entries, key], cache)}
 
-    case state.entries[key] do
       nil ->
-        {:noreply, state}
+        now = now_ms(state)
+        recheck? = match?(%{recheck: true}, state.entries[key])
 
-      cache ->
-        recheck? = Map.get(cache, :recheck, false)
-
-        cache =
-          cache
-          |> Map.put(:reason, reason)
-          |> Map.put(:refreshing, false)
-          |> Map.put(:recheck, false)
+        cache = %{
+          entries: entries,
+          derived_at: now,
+          attempted_at: now,
+          reason: nil,
+          refreshing: false,
+          recheck: false
+        }
 
         state = put_in(state, [:entries, key], cache)
         {:noreply, maybe_recheck(state, key, recheck?)}
     end
+  end
+
+  def handle_info({:catalog_refresh, {host, harness} = key, {:error, reason}}, state) do
+    case terminal_provider(Harness.parse!(harness), reason) do
+      {:ok, provider} when not is_nil(state.db) ->
+        input = %{
+          host: host,
+          harness: harness,
+          provider: provider,
+          correlation_id: "catalog-attempt:" <> Id.uuid4(),
+          source_kind: "catalog-final-401",
+          principal: "process:tightbeam/model-catalog"
+        }
+
+        case persist_terminal_incident(state, input) do
+          {:ok, {_status, incident}} ->
+            Logger.warning(
+              "model catalog #{harness} on #{host} terminal credential failure: incident=#{incident.id}"
+            )
+
+            cache =
+              Map.get(state.entries, key, new_cache())
+              |> terminal_cache(incident.id)
+
+            {:noreply, put_in(state, [:entries, key], cache)}
+
+          :error ->
+            Logger.error(
+              "model catalog #{harness} on #{host} terminal credential persistence failure"
+            )
+
+            cache =
+              Map.get(state.entries, key, new_cache())
+              |> persistence_failure_cache()
+
+            {:noreply, put_in(state, [:entries, key], cache)}
+        end
+
+      _ ->
+        Logger.warning("model catalog #{harness} on #{host} refresh degraded: #{inspect(reason)}")
+
+        case state.entries[key] do
+          nil ->
+            {:noreply, state}
+
+          cache ->
+            recheck? = Map.get(cache, :recheck, false)
+
+            cache =
+              cache
+              |> Map.put(:reason, reason)
+              |> Map.put(:refreshing, false)
+              |> Map.put(:recheck, false)
+
+            state = put_in(state, [:entries, key], cache)
+            {:noreply, maybe_recheck(state, key, recheck?)}
+        end
+    end
+  end
+
+  def handle_info({:catalog_recovery, key, incident_id, fact_id, result}, state) do
+    {outcome, entries} = recovery_outcome(result)
+
+    resolution =
+      TerminalCredentialFailure.finish_recovery(state.db, incident_id, fact_id, outcome)
+
+    state =
+      case {resolution, entries} do
+        {{:resolved, _incident}, [_ | _]} ->
+          now = now_ms(state)
+
+          put_in(state, [:entries, key], %{
+            entries: entries,
+            derived_at: now,
+            attempted_at: now,
+            reason: nil,
+            refreshing: false,
+            recheck: false
+          })
+
+        {{:open, incident, successor}, _} ->
+          state =
+            update_in(state, [:entries, key], fn cache ->
+              (cache || new_cache())
+              |> Map.put(:reason, {:terminal_credential_failure, incident.id})
+              |> Map.put(:refreshing, false)
+              |> Map.put(:recheck, false)
+            end)
+
+          if successor, do: start_recovery(state, successor), else: state
+
+        {:stale, _} ->
+          state
+      end
+
+    {:noreply, state}
   end
 
   # Hosts are re-read every pass rather than captured at init: `assimilate`
@@ -423,6 +559,41 @@ defmodule Tightbeam.ModelCatalog do
     cache = Map.get(state.entries, key) || new_cache()
     state = put_in(state, [:entries, key], cache)
 
+    if cache.reason == :terminal_credential_persistence_failed do
+      put_in(state, [:entries, key], persistence_failure_cache(cache))
+    else
+      case terminal_incident(state, key) do
+        nil -> refresh_unsuppressed(state, key, host_config, force?, now, cache)
+        incident -> put_in(state, [:entries, key], terminal_cache(cache, incident.id))
+      end
+    end
+  end
+
+  defp terminal_incident(%{terminal_incidents: incidents}, key) when is_map(incidents),
+    do: Map.get(incidents, key)
+
+  defp terminal_incident(%{db: db}, {host, harness}) when not is_nil(db),
+    do: TerminalCredentialFailure.get_open(db, host, harness)
+
+  defp terminal_incident(_state, _key), do: nil
+
+  defp persistence_failure_cache(cache) do
+    cache
+    |> Map.put(:entries, [])
+    |> Map.put(:reason, :terminal_credential_persistence_failed)
+    |> Map.put(:refreshing, false)
+    |> Map.put(:recheck, false)
+  end
+
+  defp terminal_cache(cache, incident_id) do
+    cache
+    |> Map.put(:entries, [])
+    |> Map.put(:reason, {:terminal_credential_failure, incident_id})
+    |> Map.put(:refreshing, false)
+    |> Map.put(:recheck, false)
+  end
+
+  defp refresh_unsuppressed(state, key, host_config, force?, now, cache) do
     if not cache.refreshing and (force? or expired?(cache, now, state.ttl_ms)) do
       owner = self()
       probe = probe_state(state, key, host_config)
@@ -438,6 +609,38 @@ defmodule Tightbeam.ModelCatalog do
       |> put_in([:entries, key, :attempted_at], now)
     else
       state
+    end
+  end
+
+  defp start_recovery(
+         state,
+         %{host: host, harness: harness, incident_id: incident_id, fact_id: fact_id} = claim
+       ) do
+    key = {host, harness}
+
+    case Map.get(enumerate_hosts(state), host) do
+      nil ->
+        state
+
+      host_config ->
+        owner = self()
+        probe = probe_state(state, key, host_config)
+        snapshot = state
+
+        {:ok, _pid} =
+          Task.start(fn ->
+            send(
+              owner,
+              {:catalog_recovery, key, incident_id, fact_id, safely_derive(key, probe, snapshot)}
+            )
+          end)
+
+        update_in(state, [:entries, key], fn cache ->
+          (cache || new_cache())
+          |> Map.put(:reason, {:terminal_credential_failure, claim.incident_id})
+          |> Map.put(:refreshing, true)
+          |> Map.put(:recheck, false)
+        end)
     end
   end
 
@@ -626,6 +829,9 @@ defmodule Tightbeam.ModelCatalog do
   defp health(%{entries: []} = cache, _now, _ttl),
     do: {:unavailable, cache.reason || :empty_inventory}
 
+  defp health(%{reason: {:terminal_credential_failure, _} = reason}, _now, _ttl),
+    do: {:unavailable, reason}
+
   defp health(cache, now, ttl) do
     if now - cache.derived_at < ttl, do: :fresh, else: :stale
   end
@@ -646,6 +852,48 @@ defmodule Tightbeam.ModelCatalog do
   defp expired?(cache, now, ttl), do: now - cache.derived_at >= ttl
 
   defp now_ms(%{now: now}), do: now.()
+
+  defp persist_terminal_incident(state, input) do
+    try do
+      {:ok, state.terminal_open.(state.db, input)}
+    rescue
+      _error -> :error
+    catch
+      _kind, _reason -> :error
+    end
+  end
+
+  # Pi can derive from either the OpenCode Go subscription or a named local
+  # OpenAI provider. PiProvider preserves the exact provider that returned the
+  # sole failed catalog result; never infer it from onboarding precedence.
+  defp terminal_provider(
+         Tightbeam.Harness.Pi,
+         {:pi_catalog_provider_failed, provider_key, raw_reason}
+       )
+       when is_atom(provider_key) or is_binary(provider_key) do
+    if final_401?(raw_reason), do: {:ok, to_string(provider_key)}, else: :error
+  end
+
+  defp terminal_provider(Tightbeam.Harness.Pi, _reason), do: :error
+
+  defp terminal_provider(module, reason) do
+    if final_401?(reason),
+      do: {:ok, module.credential_provider() |> Atom.to_string()},
+      else: :error
+  end
+
+  defp final_401?({:http_status, 401, _body}), do: true
+  defp final_401?({:local_openai_catalog_failed, _name, reason}), do: final_401?(reason)
+  defp final_401?({:pi_catalog_provider_failed, _provider_key, reason}), do: final_401?(reason)
+
+  defp final_401?(_reason), do: false
+
+  defp recovery_outcome({:ok, [_ | _] = entries}), do: {"catalog_published", entries}
+  defp recovery_outcome({:ok, []}), do: {"empty_catalog", []}
+
+  defp recovery_outcome({:error, reason}) do
+    {if(final_401?(reason), do: "final_401", else: "transient_failure"), []}
+  end
 
   defp safe_call(server, request) do
     try do

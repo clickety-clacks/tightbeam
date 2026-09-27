@@ -1,7 +1,7 @@
 defmodule Tightbeam.ProviderAdditivityTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{Credentials, DB, Devices, Gateway, Harness, Homes}
+  alias Tightbeam.{Credentials, DB, Devices, Gateway, Harness, Homes, Schema}
 
   test "provider literal scan is closed and detects an unreported consumer" do
     scan = Path.expand("scripts/check_provider_literals.sh")
@@ -26,8 +26,7 @@ defmodule Tightbeam.ProviderAdditivityTest do
 
     db = :"provider_additivity_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
-    :ok = Devices.ensure_schema(db)
-    :ok = Tightbeam.Placement.ensure_schema(db)
+    :ok = Schema.ensure_all(db)
 
     assert %{user_id: "fixture-admin", is_admin: true} =
              Devices.add_user(db, "fixture-admin", false)

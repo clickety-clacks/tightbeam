@@ -40,7 +40,7 @@ defmodule Tightbeam.Readiness do
   thing it names.
   """
 
-  alias Tightbeam.{Harness, Model, ModelCatalog, Placement, Unroutable}
+  alias Tightbeam.{Harness, Model, ModelCatalog, Placement, TerminalCredentialFailure, Unroutable}
 
   @type harness_row :: %{
           host: String.t(),
@@ -118,9 +118,15 @@ defmodule Tightbeam.Readiness do
         harness_row(module, host, host_config, host == local, config, catalog)
       end
 
+    terminal_credentials =
+      Map.get_lazy(config, :terminal_credential_views, fn ->
+        TerminalCredentialFailure.views(Map.get(config, :db, Tightbeam.DB))
+      end)
+
     %{
       harnesses: rows,
       runnable?: Enum.any?(rows, & &1.runnable?),
+      terminal_credentials: terminal_credentials,
       unplaceable_archetypes: unplaceable_archetypes(archetypes, Enum.map(hosts, &elem(&1, 0)))
     }
   end
@@ -287,6 +293,7 @@ defmodule Tightbeam.Readiness do
     blocked = Enum.reject(rows, & &1.runnable?)
 
     ["READY: #{ready} can run turns."] ++
+      terminal_statement_lines(summary) ++
       Enum.flat_map(blocked, &harness_lines/1) ++
       pre_expiry_lines(rows) ++
       archetype_lines(summary) ++
@@ -299,10 +306,18 @@ defmodule Tightbeam.Readiness do
       "serving, so clients can connect, but every turn will fail until the",
       "gaps below are closed."
     ] ++
+      terminal_statement_lines(summary) ++
       Enum.flat_map(rows, &harness_lines/1) ++
       pre_expiry_lines(rows) ++
       archetype_lines(summary) ++
       ["", "Diagnose further with: mix tightbeam.doctor (base_dir #{config.base_dir})"]
+  end
+
+  defp terminal_statement_lines(summary) do
+    case Map.get(summary, :terminal_credentials, []) do
+      [] -> []
+      incidents -> [""] ++ Enum.map(incidents, & &1.canonical_statement)
+    end
   end
 
   # O7/I8 (PO ruling 2026-08-06): no credential kind carries a readable expiry, so

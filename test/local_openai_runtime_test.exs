@@ -336,6 +336,75 @@ defmodule Tightbeam.LocalOpenAiRuntimeTest do
   end
 
   describe "fetch_pi_catalog/1" do
+    test "preserves the opencode-go provider key on a sole catalog failure" do
+      base =
+        Path.join(System.tmp_dir!(), "tb-pi-ocgo-failure-#{System.unique_integer([:positive])}")
+
+      File.mkdir_p!(Providers.providers_dir(base))
+      on_exit(fn -> File.rm_rf!(base) end)
+
+      state = %{
+        base_dir: base,
+        credential_status: fn
+          :opencode_go, _ -> :onboarded
+          :local_openai, _ -> {:needs_onboarding, :missing}
+        end,
+        options: %{
+          find_executable: fn
+            "sh" -> "/bin/sh"
+            "curl" -> "/usr/bin/curl"
+          end,
+          sh: fn _command -> {~s({"error":"fixture rejected"}) <> "\n401", 0} end
+        },
+        host_config: %{ssh: nil}
+      }
+
+      assert {:error,
+              {:pi_catalog_provider_failed, :opencode_go,
+               {:http_status, 401, ~s({"error":"fixture rejected"})}}} =
+               PiProvider.fetch_pi_catalog(state)
+    end
+
+    test "preserves a named local provider key on a sole catalog failure" do
+      base =
+        Path.join(System.tmp_dir!(), "tb-pi-local-failure-#{System.unique_integer([:positive])}")
+
+      File.mkdir_p!(Providers.providers_dir(base))
+
+      File.write!(
+        Providers.provider_path(base, "spark"),
+        JSON.encode!(%{
+          "name" => "spark",
+          "type" => "local-openai",
+          "endpoint" => "https://spark.example/v1"
+        })
+      )
+
+      on_exit(fn -> File.rm_rf!(base) end)
+
+      state = %{
+        base_dir: base,
+        credential_status: fn
+          :opencode_go, _ -> {:needs_onboarding, :missing}
+          :local_openai, _ -> :onboarded
+        end,
+        options: %{
+          find_executable: fn
+            "sh" -> "/bin/sh"
+            "curl" -> "/usr/bin/curl"
+          end,
+          sh: fn _command -> {~s({"error":"fixture rejected"}) <> "\n401", 0} end
+        },
+        host_config: %{ssh: nil}
+      }
+
+      assert {:error,
+              {:pi_catalog_provider_failed, "spark",
+               {:local_openai_catalog_failed, "spark",
+                {:http_status, 401, ~s({"error":"fixture rejected"})}}}} =
+               PiProvider.fetch_pi_catalog(state)
+    end
+
     test "aggregates opencode-go and named locals independently" do
       base =
         Path.join(

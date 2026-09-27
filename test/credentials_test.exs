@@ -1871,8 +1871,8 @@ defmodule Tightbeam.CredentialsTest do
       machine: "worker",
       ssh: "worker",
       sh: fn command ->
-        remote_command = command |> Enum.drop(6) |> Enum.join(" ")
-        System.cmd("sh", ["-c", remote_command], stderr_to_stdout: true)
+        [executable | args] = Enum.drop(command, 6)
+        System.cmd(executable, args, stderr_to_stdout: true)
       end
     )
   end

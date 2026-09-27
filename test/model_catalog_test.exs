@@ -15,7 +15,7 @@ defmodule Tightbeam.ModelCatalogTest do
     base_dir = Path.join(System.tmp_dir!(), "model-catalog-#{System.unique_integer([:positive])}")
     db = :"model_catalog_db_#{System.unique_integer([:positive])}"
     start_supervised!({Tightbeam.DB, path: ":memory:", name: db})
-    :ok = Placement.ensure_schema(db)
+    :ok = Tightbeam.Schema.ensure_all(db)
     token_dir = Path.join([base_dir, "homes", @host, "claude"])
     File.mkdir_p!(token_dir)
 
@@ -85,6 +85,340 @@ defmodule Tightbeam.ModelCatalogTest do
              "medium"
 
     refute Enum.any?(claude ++ codex, &(&1.context != nil))
+  end
+
+  test "Pi terminal 401 records the failed opencode-go provider key", ctx do
+    sh = fn command ->
+      script = Enum.join(command, " ")
+
+      if String.contains?(script, "pi.dev/api/models/providers/opencode-go") do
+        catalog_reply(~s({"detail":"fixture rejected"}), 401)
+      else
+        ctx.codex_sh.(command)
+      end
+    end
+
+    catalog =
+      start_catalog(ctx,
+        sh: sh,
+        credential_status: fn
+          :opencode_go -> :onboarded
+          :local_openai -> {:needs_onboarding, :missing}
+          _provider -> :onboarded
+        end
+      )
+
+    await(fn ->
+      match?(
+        {[], {:unavailable, {:terminal_credential_failure, _incident_id}}},
+        ModelCatalog.get(@host, "pi", catalog)
+      )
+    end)
+
+    assert %{id: incident_id, provider: "opencode_go"} =
+             Tightbeam.TerminalCredentialFailure.get_open(ctx.db, @host, "pi")
+
+    assert Tightbeam.TerminalCredentialFailure.statement(ctx.db, incident_id) =~
+             "tightbeam onboard opencode-go --api-key --as-user <adminUserId>"
+  end
+
+  test "Pi terminal 401 records the failed named local provider key", ctx do
+    mode =
+      start_supervised!(%{
+        id: unique_name(:pi_named_local_recovery_mode),
+        start: {Agent, :start_link, [fn -> :terminal end]}
+      })
+
+    attempts = :counters.new(1, [])
+
+    File.mkdir_p!(Tightbeam.LocalOpenAi.Providers.providers_dir(ctx.base_dir))
+
+    File.write!(
+      Tightbeam.LocalOpenAi.Providers.provider_path(ctx.base_dir, "spark"),
+      JSON.encode!(%{
+        "name" => "spark",
+        "type" => "local-openai",
+        "endpoint" => "https://spark.example/v1"
+      })
+    )
+
+    sh = fn command ->
+      script = Enum.join(command, " ")
+
+      if String.contains?(script, "spark.example/v1/models") do
+        :counters.add(attempts, 1, 1)
+
+        case Agent.get(mode, & &1) do
+          :terminal -> catalog_reply(~s({"detail":"fixture rejected"}), 401)
+          :recovered -> catalog_reply(~s({"data":[{"id":"qwen3.5-35b"}]}))
+        end
+      else
+        ctx.codex_sh.(command)
+      end
+    end
+
+    catalog =
+      start_catalog(ctx,
+        sh: sh,
+        credential_status: fn
+          :opencode_go -> {:needs_onboarding, :missing}
+          :local_openai -> :onboarded
+          _provider -> :onboarded
+        end
+      )
+
+    await(fn ->
+      match?(
+        {[], {:unavailable, {:terminal_credential_failure, _incident_id}}},
+        ModelCatalog.get(@host, "pi", catalog)
+      )
+    end)
+
+    assert %{id: incident_id, provider: "spark"} =
+             Tightbeam.TerminalCredentialFailure.get_open(ctx.db, @host, "pi")
+
+    assert Tightbeam.TerminalCredentialFailure.statement(ctx.db, incident_id) =~
+             "tightbeam onboard local-openai --endpoint <endpoint-url> --name spark --as-user <adminUserId>"
+
+    assert :counters.get(attempts, 1) == 1
+
+    fact_id = credential_fact(ctx.db, @host, :local_openai)
+    Agent.update(mode, fn _ -> :recovered end)
+    assert :ok = ModelCatalog.credential_transition(@host, :local_openai, fact_id, catalog)
+
+    await(fn -> match?({[_ | _], :fresh}, ModelCatalog.get(@host, "pi", catalog)) end)
+
+    assert :counters.get(attempts, 1) == 2
+    refute Tightbeam.TerminalCredentialFailure.open?(ctx.db, @host, "pi")
+  end
+
+  test "startup loads a durable terminal incident before the exact provider task", ctx do
+    parent = self()
+
+    assert {:opened, _incident} =
+             Tightbeam.TerminalCredentialFailure.open(ctx.db, %{
+               host: @host,
+               harness: "codex",
+               provider: "openai",
+               correlation_id: "startup-suppression",
+               source_kind: "catalog-final-401",
+               principal: "process:tightbeam/model-catalog"
+             })
+
+    catalog =
+      start_catalog(ctx,
+        sh: fn command ->
+          if codex_catalog_command?(command) do
+            send(parent, {:codex_provider_task, command})
+          end
+
+          ctx.codex_sh.(command)
+        end
+      )
+
+    await(fn ->
+      match?(
+        {[], {:unavailable, {:terminal_credential_failure, _incident_id}}},
+        ModelCatalog.get(@host, "codex", catalog)
+      )
+    end)
+
+    refute_receive {:codex_provider_task, _command}, 50
+  end
+
+  test "final 401 records no provider body and suppresses read and force storms", ctx do
+    attempts = :counters.new(1, [])
+    fixture_token = "ey-fixture-terminal-token"
+    fixture_path = "/tmp/fixture-secret-credential.json"
+    fixture_account = "acct_fixture_private"
+
+    raw_body =
+      JSON.encode!(%{
+        error: "invalid bearer #{fixture_token}",
+        path: fixture_path,
+        account: fixture_account
+      })
+
+    log =
+      capture_log(fn ->
+        catalog =
+          start_catalog(ctx,
+            sh: fn command ->
+              if codex_catalog_command?(command) do
+                :counters.add(attempts, 1, 1)
+                catalog_reply(raw_body, 401)
+              else
+                ctx.codex_sh.(command)
+              end
+            end
+          )
+
+        await(fn ->
+          match?(
+            {[], {:unavailable, {:terminal_credential_failure, _incident_id}}},
+            ModelCatalog.get(@host, "codex", catalog)
+          )
+        end)
+
+        assert :counters.get(attempts, 1) == 1
+
+        Enum.each(1..10_000, fn _ ->
+          assert match?(
+                   {[], {:unavailable, {:terminal_credential_failure, _incident_id}}},
+                   ModelCatalog.get(@host, "codex", catalog)
+                 )
+        end)
+
+        1..10_000
+        |> Task.async_stream(
+          fn _ -> ModelCatalog.get(@host, "codex", catalog) end,
+          max_concurrency: 32,
+          ordered: false,
+          timeout: :infinity
+        )
+        |> Enum.each(fn
+          {:ok, {[], {:unavailable, {:terminal_credential_failure, _incident_id}}}} -> :ok
+        end)
+
+        Enum.each(1..10_000, fn _ ->
+          ModelCatalog.credential_present(@host, :openai, catalog)
+        end)
+
+        _state_after_casts = :sys.get_state(catalog)
+        assert :counters.get(attempts, 1) == 1
+      end)
+
+    for forbidden <- [raw_body, fixture_token, fixture_path, fixture_account] do
+      refute log =~ forbidden
+
+      for table <- ~w(
+            terminal_credential_incidents terminal_credential_observations
+            terminal_credential_redirects terminal_credential_deliveries
+            condition_facts lifecycle_events messages
+          ) do
+        assert {:ok, rows} = Tightbeam.DB.query(ctx.db, "SELECT * FROM #{table}")
+        refute inspect(rows) =~ forbidden
+      end
+    end
+  end
+
+  test "a terminal persistence failure fails closed without starting another provider task",
+       ctx do
+    attempts = :counters.new(1, [])
+    forbidden = "fixture-db-path-and-statement"
+
+    log =
+      capture_log(fn ->
+        catalog =
+          start_catalog(ctx,
+            sh: fn command ->
+              if codex_catalog_command?(command) do
+                :counters.add(attempts, 1, 1)
+                catalog_reply(~s({"detail":"fixture rejected"}), 401)
+              else
+                ctx.codex_sh.(command)
+              end
+            end,
+            terminal_open: fn _db, _input -> raise forbidden end
+          )
+
+        await(fn ->
+          ModelCatalog.get(@host, "codex", catalog) ==
+            {[], {:unavailable, :terminal_credential_persistence_failed}}
+        end)
+
+        assert :counters.get(attempts, 1) == 1
+
+        Enum.each(1..1_000, fn _ ->
+          assert ModelCatalog.get(@host, "codex", catalog) ==
+                   {[], {:unavailable, :terminal_credential_persistence_failed}}
+
+          ModelCatalog.credential_present(@host, :openai, catalog)
+        end)
+
+        _state_after_casts = :sys.get_state(catalog)
+        assert :counters.get(attempts, 1) == 1
+      end)
+
+    refute log =~ forbidden
+    assert log =~ "terminal credential persistence failure"
+  end
+
+  test "one newer credential fact runs recovery and publishes before routing resumes", ctx do
+    mode =
+      start_supervised!(%{
+        id: unique_name(:terminal_recovery_mode),
+        start: {Agent, :start_link, [fn -> :terminal end]}
+      })
+
+    attempts = :counters.new(1, [])
+
+    sh = fn command ->
+      if codex_catalog_command?(command) do
+        :counters.add(attempts, 1, 1)
+
+        case Agent.get(mode, & &1) do
+          :terminal -> catalog_reply(~s({"detail":"fixture rejected"}), 401)
+          :recovered -> ctx.codex_sh.(command)
+        end
+      else
+        ctx.codex_sh.(command)
+      end
+    end
+
+    catalog = start_catalog(ctx, sh: sh)
+
+    await(fn ->
+      match?(
+        {[], {:unavailable, {:terminal_credential_failure, _incident_id}}},
+        ModelCatalog.get(@host, "codex", catalog)
+      )
+    end)
+
+    assert :counters.get(attempts, 1) == 1
+
+    assert %{id: incident_id} =
+             Tightbeam.TerminalCredentialFailure.get_open(ctx.db, @host, "codex")
+
+    fact_id = credential_fact(ctx.db, @host, :openai)
+    Agent.update(mode, fn _ -> :recovered end)
+    assert :ok = ModelCatalog.credential_transition(@host, :openai, fact_id, catalog)
+
+    await(fn ->
+      match?({[_ | _], :fresh}, ModelCatalog.get(@host, "codex", catalog))
+    end)
+
+    assert :counters.get(attempts, 1) == 2
+    refute Tightbeam.TerminalCredentialFailure.open?(ctx.db, @host, "codex")
+    assert Tightbeam.TerminalCredentialFailure.views(ctx.db) == []
+
+    restoration_scope = Tightbeam.TerminalCredentialFailure.scope(@host, "codex")
+
+    assert {:ok,
+            [
+              [
+                "resolved",
+                ^fact_id,
+                "catalog-terminal-credential-restored",
+                ^restoration_scope,
+                ^incident_id,
+                ^fact_id,
+                1
+              ]
+            ]} =
+             Tightbeam.DB.query(
+               ctx.db,
+               """
+               SELECT i.state,i.consumedFactId,f.kind,f.scope,o.incidentId,o.factId,
+                      i.resolutionFactId <> i.consumedFactId
+               FROM terminal_credential_incidents i
+               JOIN condition_facts f ON f.id=i.resolutionFactId
+               JOIN terminal_credential_observations o
+                 ON o.incidentId=i.id AND o.kind='resolution'
+               WHERE i.id=?1
+               """,
+               [incident_id]
+             )
   end
 
   # THE DEFECT, at the catalog. Anthropic spells a context-window variant
@@ -541,7 +875,22 @@ defmodule Tightbeam.ModelCatalogTest do
       name = unique_name(label)
       catalog = start_catalog(ctx, Keyword.put(opts, :name, name))
 
-      await(fn -> ModelCatalog.get(@host, harness, catalog) == {[], {:unavailable, reason}} end)
+      if label == :refused_grant do
+        await(fn ->
+          match?(
+            {[], {:unavailable, {:terminal_credential_failure, _incident_id}}},
+            ModelCatalog.get(@host, harness, catalog)
+          )
+        end)
+
+        assert %{id: incident_id} =
+                 Tightbeam.TerminalCredentialFailure.get_open(ctx.db, @host, harness)
+
+        assert ModelCatalog.get(@host, harness, catalog) ==
+                 {[], {:unavailable, {:terminal_credential_failure, incident_id}}}
+      else
+        await(fn -> ModelCatalog.get(@host, harness, catalog) == {[], {:unavailable, reason}} end)
+      end
 
       assert {:error, %Unroutable{cause: :no_catalog}} =
                ModelCatalog.route(@host, harness, Model.new("absent"), catalog)
@@ -605,7 +954,7 @@ defmodule Tightbeam.ModelCatalogTest do
     assert File.read!(Path.join(home, ".credentials.json")) == rotated_home
   end
 
-  test "a subscription 401 is not retried and a later probe reports its distinct failure", ctx do
+  test "a subscription 401 opens one durable incident and suppresses later catalog starts", ctx do
     stale_store = ~s({"claudeAiOauth":{"accessToken":"fixture-token-STALE"}})
     File.mkdir_p!(Path.join([ctx.base_dir, "auth", "claude"]))
     File.write!(Path.join([ctx.base_dir, "auth", "claude", ".credentials.json"]), stale_store)
@@ -628,7 +977,6 @@ defmodule Tightbeam.ModelCatalogTest do
 
       case :counters.get(fetches, 1) do
         1 -> {:error, {:http_status, 401, revoked}}
-        2 -> {:error, {:network, :etimedout}}
         count -> flunk("catalog fetched #{count} times")
       end
     end
@@ -636,30 +984,31 @@ defmodule Tightbeam.ModelCatalogTest do
     catalog = start_catalog(ctx, claude_fetch: claude_fetch)
 
     await(fn ->
-      ModelCatalog.get(@host, "claude", catalog) ==
-        {[], {:unavailable, {:http_status, 401, revoked}}}
+      match?(
+        {[], {:unavailable, {:terminal_credential_failure, _incident_id}}},
+        ModelCatalog.get(@host, "claude", catalog)
+      )
     end)
 
     assert :counters.get(fetches, 1) == 1
 
+    assert %{id: incident_id} =
+             Tightbeam.TerminalCredentialFailure.get_open(ctx.db, @host, "claude")
+
     assert {:error, %Unroutable{} = unroutable} =
              ModelCatalog.route(@host, "claude", Model.new("anything"), catalog)
 
-    assert Unroutable.message(unroutable) =~ "revoked"
+    assert Unroutable.message(unroutable) =~ incident_id
+    refute Unroutable.message(unroutable) =~ "revoked"
 
     later = start_catalog(ctx, name: unique_name(:later_probe), claude_fetch: claude_fetch)
 
     await(fn ->
       ModelCatalog.get(@host, "claude", later) ==
-        {[], {:unavailable, {:network, :etimedout}}}
+        {[], {:unavailable, {:terminal_credential_failure, incident_id}}}
     end)
 
-    assert :counters.get(fetches, 1) == 2
-
-    assert {:error, %Unroutable{} = later_unroutable} =
-             ModelCatalog.route(@host, "claude", Model.new("anything"), later)
-
-    assert Unroutable.message(later_unroutable) =~ "etimedout"
+    assert :counters.get(fetches, 1) == 1
 
     assert File.read!(Path.join([ctx.base_dir, "auth", "claude", ".credentials.json"])) ==
              stale_store
@@ -687,11 +1036,14 @@ defmodule Tightbeam.ModelCatalogTest do
       )
 
     await(fn ->
-      ModelCatalog.get(@host, "claude", catalog) ==
-        {[], {:unavailable, {:http_status, 401, ~s({"detail":"API key is invalid."})}}}
+      match?(
+        {[], {:unavailable, {:terminal_credential_failure, _incident_id}}},
+        ModelCatalog.get(@host, "claude", catalog)
+      )
     end)
 
     assert File.read!(store) == "sk-ant-api03-STALE"
+    assert Tightbeam.TerminalCredentialFailure.open?(ctx.db, @host, "claude")
   end
 
   # The harvest reads the LOCAL filesystem, so the `ssh: nil` guard scopes it to
@@ -733,11 +1085,14 @@ defmodule Tightbeam.ModelCatalogTest do
     catalog = start_catalog(ctx, sh: sh)
 
     await(fn ->
-      ModelCatalog.get("sat", "claude", catalog) ==
-        {[], {:unavailable, {:http_status, 401, revoked}}}
+      match?(
+        {[], {:unavailable, {:terminal_credential_failure, _incident_id}}},
+        ModelCatalog.get("sat", "claude", catalog)
+      )
     end)
 
     assert File.read!(store) == stale_store
+    assert Tightbeam.TerminalCredentialFailure.open?(ctx.db, "sat", "claude")
   end
 
   defp bearer(headers) do
@@ -1628,6 +1983,13 @@ defmodule Tightbeam.ModelCatalogTest do
 
   defp requeue(skipped), do: skipped |> Enum.reverse() |> Enum.each(&send(self(), &1))
 
+  defp codex_catalog_command?(command) do
+    Enum.any?(command, fn argument ->
+      is_binary(argument) and
+        String.contains?(argument, "https://chatgpt.com/backend-api/codex/models")
+    end)
+  end
+
   defp start_catalog(ctx, overrides \\ []) do
     name = Keyword.get(overrides, :name, unique_name(:catalog))
 
@@ -1648,6 +2010,19 @@ defmodule Tightbeam.ModelCatalogTest do
 
     start_supervised!(%{id: name, start: {ModelCatalog, :start_link, [opts]}})
     name
+  end
+
+  defp credential_fact(db, host, provider) do
+    assert {:ok, %{fact_id: fact_id}} =
+             Tightbeam.DB.transaction(db, fn txn ->
+               Tightbeam.ConditionFacts.file_in_txn(txn, %{
+                 kind: "credential-present",
+                 scope: "#{host}:#{provider}",
+                 origin: "process:tightbeam"
+               })
+             end)
+
+    fact_id
   end
 
   defp await_fresh(catalog, harness, host \\ @host) do
