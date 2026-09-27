@@ -1636,6 +1636,108 @@ defmodule Tightbeam.Acp.AdapterTest do
              1
   end
 
+  test "manager recovery with ignored cancel preserves a healthy shared peer and holds the successor" do
+    alias Tightbeam.{DB, LaneManager, Ledger, Schema}
+    db = :"recovery_cancel_db_#{System.unique_integer([:positive])}"
+    start_supervised!({DB, path: ":memory:", name: db})
+    :ok = Schema.ensure_all(db)
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO sessions
+        (sessionKey,displayName,ownerUserId,origin,spawnedBy,archetype,
+         harness,provider,model,thinkingLevel,host,createdAt,updatedAt)
+      VALUES ('recovery-lane','Recovery','t','user:t','recovery-lane','default',
+        'claude','anthropic','claude-sonnet-5','medium','testhost',1,1)
+      """)
+
+    start_supervised!({Registry, keys: :unique, name: Tightbeam.LaneRegistry})
+    task_sup = start_supervised!({Task.Supervisor, []})
+    lane_sup = start_supervised!({DynamicSupervisor, strategy: :one_for_one})
+    {adapter, capture} = start_adapter(gate_mode: "ignore-cancel-turn", probe: false)
+    conn = Adapter.conn(adapter)
+    adapter_monitor = Process.monitor(adapter)
+    peer = Task.async(fn -> Adapter.prompt(adapter, "healthy-peer", "peer") end)
+
+    enqueue = fn text ->
+      {:ok, seq} =
+        Ledger.enqueue(db, %{
+          session_key: "recovery-lane",
+          message_id: text,
+          origin: "user:t",
+          prompt: text
+        })
+
+      seq
+    end
+
+    first = enqueue.("recovered-first")
+    second = enqueue.("held-successor")
+
+    runner = fn turn ->
+      Adapter.prompt(adapter, "recovered-session", turn.prompt, timeout: 10_000, cancel_grace: 50)
+    end
+
+    manager_opts = [
+      db: db,
+      lane_sup: lane_sup,
+      task_sup: task_sup,
+      runner: runner,
+      interval: 60_000
+    ]
+
+    start_supervised!({LaneManager, manager_opts})
+    assert pending_count?(conn, 2)
+    [{lane, _}] = Registry.lookup(Tightbeam.LaneRegistry, "recovery-lane")
+    obsolete = :sys.get_state(lane).task_pid
+    obsolete_monitor = Process.monitor(obsolete)
+    assert {:ok, [["queued"]]} = DB.query(db, "SELECT status FROM turns WHERE seq=?1", [second])
+    stop_supervised!(LaneManager)
+    start_supervised!({LaneManager, manager_opts})
+    assert_receive {:DOWN, ^obsolete_monitor, :process, ^obsolete, :killed}, 2_000
+    assert eventually(fn -> length(:sys.get_state(adapter).queued_prompts) == 1 end)
+
+    assert {:ok, [["failed_unknown"]]} =
+             DB.query(db, "SELECT status FROM turns WHERE seq=?1", [first])
+
+    {id, _} = prompt_entry(conn, "recovered-session")
+
+    assert eventually(fn ->
+             :sys.get_state(conn).pending[id].cancel_reason == :prompt_canceled
+           end)
+
+    assert :sys.get_state(conn).pending[id].cancel_timer == nil
+    refute_receive {:DOWN, ^adapter_monitor, :process, ^adapter, _}, 200
+    Tightbeam.Acp.Conn.notify(conn, "test/complete", %{sessionId: "healthy-peer"})
+    assert {:ok, _} = Task.await(peer)
+
+    prompts = fn ->
+      Enum.filter(
+        captured_requests(capture),
+        &(&1["method"] == "session/prompt" and &1["sessionId"] == "recovered-session")
+      )
+    end
+
+    assert length(prompts.()) == 1
+    # The original response, even after the short cancellation grace elapsed,
+    # confirms quiescence and allows precisely the queued successor to start.
+    Tightbeam.Acp.Conn.notify(conn, "test/complete", %{sessionId: "recovered-session"})
+    assert eventually(fn -> length(prompts.()) == 2 end)
+    Tightbeam.Acp.Conn.notify(conn, "test/complete", %{sessionId: "recovered-session"})
+    assert eventually(fn -> :sys.get_state(lane).task_ref == nil end)
+
+    assert {:ok, [["failed_unknown"], ["delivered"]]} =
+             DB.query(db, "SELECT status FROM turns WHERE seq IN (?1,?2) ORDER BY seq", [
+               first,
+               second
+             ])
+
+    assert :sys.get_state(conn).pending == %{}
+    assert :sys.get_state(adapter).queued_prompts == []
+    assert Process.alive?(adapter)
+    assert Enum.count(captured_requests(capture), &(&1["method"] == "session/cancel")) == 1
+  end
+
   defp eventually(fun, remaining \\ 500) do
     cond do
       fun.() ->
