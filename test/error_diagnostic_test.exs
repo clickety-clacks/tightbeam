@@ -62,6 +62,9 @@ defmodule Tightbeam.ErrorDiagnosticTest do
 
       assert ErrorDiagnostic.redact_text("api-key: '" <> @password <> "\\") ==
                "api-key: '[REDACTED:secret_field]'"
+
+      assert ErrorDiagnostic.redact_text("api-key: 'prefix\\'fixtureSENTINEL") ==
+               "api-key: '[REDACTED:secret_field]'"
     end
   end
 

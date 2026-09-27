@@ -6262,6 +6262,10 @@ mod tests {
                 "api-key: 'prefix\\'fixtureSENTINEL'",
                 "api-key: '[REDACTED:secret_field]'",
             ),
+            (
+                "api-key: 'prefix\\'fixtureSENTINEL",
+                "api-key: '[REDACTED:secret_field]'",
+            ),
         ];
 
         for (body, expected) in bodies {
@@ -6753,6 +6757,39 @@ mod tests {
         );
         let refusal: Value = serde_json::from_str(&rendered).unwrap();
         assert_eq!(refusal["body"], expected_body);
+        assert_eq!(refusal["attempt"]["receipt"], "unavailable");
+
+        let escaped_eof_body = "not json; api-key: 'prefix\\'fixtureSENTINEL";
+        let decode_error = serde_json::from_str::<Value>(escaped_eof_body).unwrap_err();
+        let expected_escaped_eof_body = "not json; api-key: '[REDACTED:secret_field]'";
+
+        let rendered = undecodable_response_with_attempt(
+            502,
+            escaped_eof_body,
+            &decode_error,
+            Some(fixture.render()),
+            FailurePresentation::Ordinary,
+        );
+        let (human, machine) = readings(&rendered);
+        assert!(!rendered.contains("fixtureSENTINEL"), "{rendered}");
+        assert!(human.contains(expected_escaped_eof_body), "{human}");
+        assert_eq!(machine["error"]["body"], expected_escaped_eof_body);
+        assert_eq!(machine["attempt"]["receipt"], "unavailable");
+
+        let rendered = undecodable_response_with_attempt(
+            502,
+            escaped_eof_body,
+            &decode_error,
+            Some(fixture.render()),
+            FailurePresentation::Tune,
+        );
+        assert!(!rendered.contains("fixtureSENTINEL"), "{rendered}");
+        assert!(
+            !rendered.contains('\n'),
+            "tune stays one JSON line: {rendered}"
+        );
+        let refusal: Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(refusal["body"], expected_escaped_eof_body);
         assert_eq!(refusal["attempt"]["receipt"], "unavailable");
     }
 
