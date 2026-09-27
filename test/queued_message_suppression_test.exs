@@ -55,6 +55,306 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
     assert error =~ "verified_liveness_recovery"
   end
 
+  test "sender replacement is isolated by sender, holder, assignment and protected traffic", %{
+    db: db
+  } do
+    assignment!(db, "asg_replace")
+    assignment!(db, "asg_other")
+    session!(db, "k2")
+    session!(db, "other")
+    session!(db, "reporter")
+    session!(db, "sender")
+
+    :ok =
+      DB.execute(
+        db,
+        "UPDATE assignments SET openedByUser=NULL,openedBySession='sender' WHERE id='asg_replace'"
+      )
+
+    {:ok, own_seq} =
+      Ledger.enqueue(db, %{
+        session_key: "k1",
+        message_id: "replace-own",
+        origin: "session:sender",
+        prompt: "own earlier assignment message",
+        assignment_id: "asg_replace"
+      })
+
+    other_sender_wake =
+      Wakes.schedule(db, %{
+        session_key: "k1",
+        origin: "session:other",
+        prompt: "other sender message",
+        due_at: System.system_time(:millisecond) + 60_000,
+        creator_session_key: "other",
+        assignment_id: "asg_replace"
+      })
+
+    other_sender_seq = deliver_wake!(db, other_sender_wake)
+
+    {:ok, other_sender_direct_seq} =
+      Ledger.enqueue(db, %{
+        session_key: "k1",
+        message_id: "replace-other-sender-direct",
+        origin: "session:other",
+        prompt: "other sender direct assignment message",
+        assignment_id: "asg_replace"
+      })
+
+    {:ok, other_assignment_seq} =
+      Ledger.enqueue(db, %{
+        session_key: "k1",
+        message_id: "replace-other-assignment",
+        origin: "session:sender",
+        prompt: "same sender, other assignment",
+        assignment_id: "asg_other"
+      })
+
+    {:ok, human_seq} =
+      Ledger.enqueue(db, %{
+        session_key: "k1",
+        message_id: "replace-human",
+        origin: "user:flynn",
+        prompt: "human request",
+        assignment_id: "asg_replace"
+      })
+
+    report_wake =
+      Wakes.schedule(db, %{
+        session_key: "k1",
+        origin: "agent:reporter",
+        prompt: "reported material",
+        due_at: System.system_time(:millisecond) + 60_000,
+        creator_session_key: "reporter",
+        assignment_id: "asg_replace",
+        class: "fyi",
+        sender_scheduled: true
+      })
+
+    report_seq = deliver_wake!(db, report_wake)
+
+    {:ok, process_failure_seq} =
+      Ledger.enqueue(db, %{
+        session_key: "k1",
+        message_id: "replace-process-failure",
+        origin: "process:tightbeam",
+        prompt: "system failure notice",
+        assignment_id: "asg_replace",
+        queue_message_kind: "failure"
+      })
+
+    decision_wake =
+      Wakes.schedule(db, %{
+        session_key: "k1",
+        origin: "session:sender",
+        prompt: "decision notice",
+        due_at: System.system_time(:millisecond) + 60_000,
+        assignment_id: "asg_replace",
+        creator_session_key: "sender",
+        target_gate: 0
+      })
+
+    {:ok, decision_seq} =
+      Ledger.enqueue(db, %{
+        session_key: "k1",
+        message_id: "replace-decision",
+        wake_id: decision_wake.wake_id,
+        origin: "session:sender",
+        prompt: "decision notice",
+        assignment_id: "asg_replace",
+        request_ref: "dr_decision"
+      })
+
+    failure_wake =
+      Wakes.schedule(db, %{
+        session_key: "k1",
+        origin: "session:sender",
+        prompt: "failure notice",
+        due_at: System.system_time(:millisecond) + 60_000,
+        assignment_id: "asg_replace",
+        creator_session_key: "sender",
+        obligation_ref: "terminal-child-owner-notification:asg_replace"
+      })
+
+    {:ok, failure_seq} =
+      Ledger.enqueue(db, %{
+        session_key: "k1",
+        message_id: "replace-failure",
+        wake_id: failure_wake.wake_id,
+        origin: "session:sender",
+        prompt: "failure notice",
+        assignment_id: "asg_replace"
+      })
+
+    {:ok, other_holder_seq} =
+      Ledger.enqueue(db, %{
+        session_key: "k2",
+        message_id: "replace-other-holder",
+        origin: "session:sender",
+        prompt: "same sender and assignment, other holder",
+        assignment_id: "asg_replace"
+      })
+
+    replacement_wake =
+      Wakes.schedule(db, %{
+        session_key: "k1",
+        origin: "session:sender",
+        prompt: "replacement prompt",
+        due_at: System.system_time(:millisecond),
+        creator_session_key: "sender",
+        replacement_assignment_id: "asg_replace",
+        class: "fyi"
+      })
+
+    assert replacement_wake.delivery_rule == "batcher-inhibited"
+
+    assert {:ok, [["asg_replace"]]} =
+             DB.query(
+               db,
+               "SELECT assignmentId FROM queued_message_replacement_requests WHERE wakeId=?1",
+               [replacement_wake.wake_id]
+             )
+
+    replacement_seq = deliver_wake!(db, replacement_wake)
+
+    assert {:ok, [["canceled"]]} =
+             DB.query(db, "SELECT status FROM turns WHERE seq=?1", [own_seq])
+
+    for seq <- [
+          other_sender_seq,
+          other_sender_direct_seq,
+          other_assignment_seq,
+          human_seq,
+          report_seq,
+          process_failure_seq,
+          decision_seq,
+          failure_seq,
+          other_holder_seq
+        ] do
+      assert {:ok, [["queued"]]} = DB.query(db, "SELECT status FROM turns WHERE seq=?1", [seq])
+    end
+
+    assert {:ok, [[10]]} =
+             DB.query(
+               db,
+               "SELECT COUNT(*) FROM turns WHERE seq IN (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+               [
+                 own_seq,
+                 other_sender_seq,
+                 other_sender_direct_seq,
+                 other_assignment_seq,
+                 human_seq,
+                 report_seq,
+                 process_failure_seq,
+                 decision_seq,
+                 failure_seq,
+                 other_holder_seq
+               ]
+             )
+
+    assert {:ok, [[detail]]} =
+             DB.query(
+               db,
+               """
+               SELECT detail FROM lifecycle_events
+               WHERE kind='queued_message_suppressed' AND subject=?1
+               """,
+               [Integer.to_string(own_seq)]
+             )
+
+    assert detail =~ "sender-replacement"
+    assert detail =~ "sender_requested_replacement"
+    assert detail =~ "asg_replace"
+    assert detail =~ "session:sender"
+    assert detail =~ "#{replacement_seq}"
+  end
+
+  test "replacement delivery claims next and keeps the source turn durable", %{db: db} do
+    assignment!(db, "asg_next")
+    session!(db, "sender")
+    :ok =
+      DB.execute(
+        db,
+        "UPDATE assignments SET openedByUser=NULL,openedBySession='sender' WHERE id='asg_next'"
+      )
+
+    old_wake =
+      Wakes.schedule(db, %{
+        session_key: "k1",
+        origin: "session:sender",
+        prompt: "old prompt",
+        due_at: System.system_time(:millisecond),
+        creator_session_key: "sender",
+        replacement_assignment_id: "asg_next"
+      })
+
+    old_seq = deliver_wake!(db, old_wake)
+
+    wake =
+      Wakes.schedule(db, %{
+        session_key: "k1",
+        origin: "session:sender",
+        prompt: "new prompt",
+        due_at: System.system_time(:millisecond),
+        creator_session_key: "sender",
+        replacement_assignment_id: "asg_next"
+      })
+
+    new_seq = deliver_wake!(db, wake)
+
+    assert {:ok, %{seq: ^new_seq, prompt: "new prompt"}} = Ledger.claim_next(db, "k1", "lane")
+    assert {:ok, [["canceled", "queued-message-suppressed: sender_requested_replacement"]]} =
+             DB.query(db, "SELECT status,error FROM turns WHERE seq=?1", [old_seq])
+    assert {:ok, [[2]]} =
+             DB.query(db, "SELECT COUNT(*) FROM turns WHERE seq IN (?1,?2)", [old_seq, new_seq])
+  end
+
+  test "replacement leaves a turn that became running untouched", %{db: db} do
+    assignment!(db, "asg_running")
+    session!(db, "sender")
+    :ok =
+      DB.execute(
+        db,
+        "UPDATE assignments SET openedByUser=NULL,openedBySession='sender' WHERE id='asg_running'"
+      )
+
+    {:ok, running_seq} =
+      Ledger.enqueue(db, %{
+        session_key: "k1",
+        message_id: "running-source",
+        origin: "session:sender",
+        prompt: "already running",
+        assignment_id: "asg_running"
+      })
+
+    :ok =
+      DB.execute(db, "UPDATE turns SET status='running',startedAt=2 WHERE seq=?1", [running_seq])
+
+    wake =
+      Wakes.schedule(db, %{
+        session_key: "k1",
+        origin: "session:sender",
+        prompt: "replacement while source runs",
+        due_at: System.system_time(:millisecond),
+        creator_session_key: "sender",
+        replacement_assignment_id: "asg_running"
+      })
+
+    _replacement_seq = deliver_wake!(db, wake)
+
+    assert {:ok, [["running"]]} =
+             DB.query(db, "SELECT status FROM turns WHERE seq=?1", [running_seq])
+    assert {:ok, []} =
+             DB.query(
+               db,
+               """
+               SELECT 1 FROM lifecycle_events
+               WHERE kind='queued_message_suppressed' AND subject=?1
+               """,
+               [Integer.to_string(running_seq)]
+             )
+  end
+
   test "suppresses an exact liveness wake after a newer assignment disposition", %{db: db} do
     :ok = DB.execute(db, "INSERT INTO users (userId,createdAt) VALUES ('flynn',1)")
     assignment!(db, "asg_closed")
@@ -280,6 +580,17 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
       DB.execute(db, """
       INSERT INTO assignment_effects (assignmentId,effectKind)
       VALUES ('#{id}','coordination')
+      """)
+  end
+
+  defp session!(db, id) do
+    :ok =
+      DB.execute(db, """
+      INSERT INTO sessions
+        (sessionKey,displayName,ownerUserId,origin,archetype,identityName,
+         harness,provider,model,thinkingLevel,modelContext,createdAt,updatedAt)
+      VALUES ('#{id}','#{id}','flynn','user:flynn','default','default',
+              'claude','anthropic','claude-sonnet-5','medium',NULL,1,1)
       """)
   end
 
