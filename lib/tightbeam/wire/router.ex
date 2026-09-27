@@ -186,6 +186,37 @@ defmodule Tightbeam.Wire.Router do
     end
   end
 
+  get "/doctor/harness-binary-provenance" do
+    with {:ok, _auth} <- cli_auth(conn) do
+      coordinator = deps(conn)[:adapter_coordinator] || Tightbeam.AdapterCoordinator
+
+      report_fun = deps(conn)[:harness_binary_provenance_report]
+
+      result =
+        if is_function(report_fun, 0) do
+          report_fun.()
+        else
+          Tightbeam.HarnessBinaryProvenance.report(
+            Map.fetch!(deps(conn), :base_dir),
+            db(conn),
+            coordinator
+          )
+        end
+
+      report =
+        case result do
+          {:ok, report} -> report
+          {:error, report} -> report
+        end
+
+      conn
+      |> Plug.Conn.put_resp_header("cache-control", "no-store")
+      |> json(200, report)
+    else
+      {:error, status, code, message} -> error(conn, status, code, message)
+    end
+  end
+
   post "/agent/dispatch" do
     with {:ok, auth} <- cli_auth(conn),
          {:ok, body, conn} <- read_json(conn),

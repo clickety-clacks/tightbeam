@@ -636,7 +636,8 @@ The service must **start with no interactive login**, **survive logout**,
 | `TIGHTBEAM_DEFAULT_MODEL` | The default model itself, undecorated (`claude-sonnet-5`). Must be live for the default harness. It is a single global, so on a two-harness host one harness will report its default as unselectable — that is expected, not a fault. |
 | `TIGHTBEAM_DEFAULT_EFFORT` | The default reasoning level (`low`…`max`). Required when the default model offers effort tiers — a model is selected by FIELDS, never one packed string. |
 | `TIGHTBEAM_DEFAULT_CONTEXT` | The vendor's context-window variant, when it offers more than one (`1m`). Omit for the model's default window. |
-| `CODEX_PATH` | Pin the codex binary. Harness CLIs auto-update underneath you; an unpinned one changes behaviour without warning. |
+| `CODEX_PATH` | Explicitly select the Codex CLI for this harness. Without it, `codex-acp` uses its bundled CLI; check `tightbeam doctor` for the binary Tightbeam observes. |
+| `CLAUDE_CODE_EXECUTABLE` | Explicitly select the Claude Code CLI for this harness. Without it, `claude-agent-acp` uses its bundled CLI; check `tightbeam doctor` for the binary Tightbeam observes. |
 
 Run the service **as an ordinary user, not root** — set the account explicitly
 (`User=` / `UserName=`) rather than letting the init system default to root. It

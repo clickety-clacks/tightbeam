@@ -2779,6 +2779,7 @@ mod tests {
             ("POST", "/agent/tool-call-observed", false),
             ("POST", "/agent/terminal", true),
             ("GET", "/harnesses", false),
+            ("GET", "/doctor/harness-binary-provenance", false),
         ] {
             let request = gateway_request(method, &endpoint, path, None);
             assert_eq!(request.method(), method);

@@ -1543,7 +1543,18 @@ defmodule Tightbeam.Placement do
       process_helper: Path.join(host_config[:cli_bin] || config.cli_bin, "tightbeam"),
       on_auth_event: auth_event_handler(config, host, module),
       on_subagent_event: subagent_event_handler(config, host, module),
-      env: []
+      env: [],
+      harness_binary_capture:
+        Tightbeam.HarnessBinaryProvenance.capture(
+          module,
+          host,
+          host_config.base_dir,
+          path,
+          overlay_env,
+          process_env:
+            if(is_nil(host_config.ssh), do: binary_selection_process_env(module), else: %{}),
+          without_override_evidence?: not is_nil(host_config.ssh)
+        )
     ]
 
     base =
@@ -1564,6 +1575,17 @@ defmodule Tightbeam.Placement do
     end
   end
 
+  defp binary_selection_process_env(module) do
+    name =
+      case module.id() do
+        :codex -> "CODEX_PATH"
+        :claude -> "CLAUDE_CODE_EXECUTABLE"
+        _ -> nil
+      end
+
+    if name, do: %{name => System.get_env(name)}, else: %{}
+  end
+
   @doc false
   def adapter_opts!(config, key) do
     {:ok, opts} = adapter_opts(config, key)
@@ -1578,6 +1600,9 @@ defmodule Tightbeam.Placement do
     |> Map.fetch!(host)
     |> then(&adapter_path(config, &1))
   end
+
+  @doc false
+  def toolchain_path_preview_for(config, host_config), do: adapter_path(config, host_config)
 
   defp adapter_path(config, %{ssh: ssh} = host_config) do
     case Map.fetch(host_config, :toolchain_dirs) do

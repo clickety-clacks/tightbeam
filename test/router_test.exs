@@ -1085,6 +1085,35 @@ defmodule Tightbeam.Wire.RouterTest do
     assert response.resp_body == expected
   end
 
+  test "harness binary provenance is a CLI-authenticated read-only projection", ctx do
+    parent = self()
+    report = %{"schema_version" => 1, "rows" => [%{"host" => "synthetic", "harness" => "codex"}]}
+
+    opts =
+      Keyword.put(ctx.opts, :harness_binary_provenance_report, fn ->
+        send(parent, :provenance_reported)
+        {:ok, report}
+      end)
+
+    unauthorized = Router.call(conn(:get, "/doctor/harness-binary-provenance"), Router.init(opts))
+    assert unauthorized.status == 401
+    refute_received :provenance_reported
+
+    request =
+      conn(:get, "/doctor/harness-binary-provenance")
+      |> put_req_header("authorization", "Bearer tbc_test")
+      |> put_req_header(
+        "x-tightbeam-cli-version",
+        Tightbeam.CliCompatibility.required_version()
+      )
+
+    response = Router.call(request, Router.init(opts))
+    assert response.status == 200
+    assert JSON.decode!(response.resp_body) == report
+    assert Plug.Conn.get_resp_header(response, "cache-control") == ["no-store"]
+    assert_received :provenance_reported
+  end
+
   test "/version states which bytes the gateway is: version + build stamp", ctx do
     response = Router.call(conn(:get, "/version"), Router.init(ctx.opts))
 
