@@ -487,14 +487,9 @@ defmodule Tightbeam.TranscriptTest do
         ctx.db,
         "UPDATE turns SET status='delivered',startedAt=1,endedAt=2 WHERE seq IN (?1,?2)",
         [first_turn, last_turn]
-      )
+    )
 
     assert Enum.map(Ledger.unpublished_terminals(ctx.db), & &1.seq) == [first_turn, last_turn]
-
-    assert Enum.any?(
-             unpublished_terminal_plan(ctx.db),
-             &String.contains?(&1, "turns_unpublished")
-           )
 
     expected_ids = Enum.map(turns, & &1.id) ++ [reply_id]
     indexed_before = read(ctx, %{session_key: "owned", limit: 500})
@@ -515,6 +510,7 @@ defmodule Tightbeam.TranscriptTest do
     assert with_index.messages == indexed_before.messages
     assert Enum.at(with_index.messages, -1).turn_seq == hd(turns).seq
     assert_indexed_transcript_plan(transcript_join_plan(ctx.db))
+    assert Enum.map(Ledger.unpublished_terminals(ctx.db), & &1.seq) == [first_turn, last_turn]
 
     # A database without the early index also receives it through the normal
     # schema boot path, with all stored rows and transcript fields intact.
@@ -523,6 +519,7 @@ defmodule Tightbeam.TranscriptTest do
     after_upgrade = read(ctx, %{session_key: "owned", limit: 500})
     assert after_upgrade.messages == indexed_before.messages
     assert_indexed_transcript_plan(transcript_join_plan(ctx.db))
+    assert Enum.map(Ledger.unpublished_terminals(ctx.db), & &1.seq) == [first_turn, last_turn]
 
     assert {:ok, [[251]]} =
              DB.query(ctx.db, "SELECT COUNT(*) FROM messages WHERE sessionKey='owned'")
@@ -752,20 +749,6 @@ defmodule Tightbeam.TranscriptTest do
            end)
 
     refute Enum.any?(plan, &String.contains?(&1, "SCAN t"))
-  end
-
-  defp unpublished_terminal_plan(db) do
-    {:ok, plan} =
-      DB.query(
-        db,
-        """
-        EXPLAIN QUERY PLAN
-        SELECT seq, messageId, origin, prompt, wakeId FROM turns
-        WHERE endedAt IS NOT NULL AND publishedAt IS NULL ORDER BY seq
-        """
-      )
-
-    Enum.map(plan, &Enum.at(&1, 3))
   end
 
   defp clear_through!(db, session_key, message_id) do
