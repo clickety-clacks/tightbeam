@@ -1,7 +1,7 @@
 defmodule Tightbeam.QueuedMessageSuppressionTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{Assignments, DB, Gateway, Ledger, Rules, Wakes}
+  alias Tightbeam.{Assignments, DB, Gateway, Ledger, Roles, Rules, Wakes}
 
   setup do
     db = String.to_atom("queued_message_suppression_#{System.unique_integer([:positive])}")
@@ -307,6 +307,100 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
              DB.query(db, "SELECT status,error FROM turns WHERE seq=?1", [old_seq])
     assert {:ok, [[2]]} =
              DB.query(db, "SELECT COUNT(*) FROM turns WHERE seq IN (?1,?2)", [old_seq, new_seq])
+  end
+
+  test "later same-sender wake replaces a dispatch prompt without changing dispatch replay",
+       %{db: db} do
+    session!(db, "sender")
+    assert %{name: "sender"} = Roles.create!(db, "sender", "flynn", "sender")
+
+    dispatch = %{
+      verb: "dispatch",
+      origin: "agent:sender",
+      principal: {:session, "sender"},
+      session_key: "k1",
+      params: %{
+        subject: "initial assignment prompt",
+        brief: "the initial instruction",
+        idempotency_key: "dispatch-initial-once",
+        work_item_id: nil
+      },
+      target_role: nil,
+      role_fallback: false,
+      supervision_interval_ms: 1_000
+    }
+
+    assignment = Assignments.__handle__(db, "dispatch", dispatch)
+    assignment_id = assignment.id
+    assert assignment.openedBySession == "sender"
+    assert assignment.holderKey == "k1"
+
+    assert {:ok, [[source_seq, "queued", "agent:sender", source_prompt]]} =
+             DB.query(
+               db,
+               "SELECT seq,status,origin,prompt FROM turns WHERE sessionKey=?1 AND assignmentId=?2",
+               ["k1", assignment_id]
+             )
+    assert source_prompt =~ assignment_id
+    assert source_prompt =~ "the initial instruction"
+
+    assert %{id: replayed_id} = Assignments.__handle__(db, "dispatch", dispatch)
+    assert replayed_id == assignment_id
+    assert {:ok, [[1]]} =
+             DB.query(db, "SELECT COUNT(*) FROM turns WHERE sessionKey=?1", ["k1"])
+    assert {:ok, [[1]]} =
+             DB.query(
+               db,
+               "SELECT COUNT(*) FROM assignments WHERE subject=?1",
+               ["initial assignment prompt"]
+             )
+
+    replacement_wake =
+      Wakes.schedule(db, %{
+        session_key: "k1",
+        origin: "agent:sender",
+        prompt: "the later replacement instruction",
+        due_at: System.system_time(:millisecond),
+        creator_session_key: "sender",
+        replacement_assignment_id: assignment.id,
+        class: "fyi"
+      })
+
+    replacement_seq = deliver_wake!(db, replacement_wake)
+
+    assert {:ok, [["k1", "agent:sender", "sender"]]} =
+             DB.query(
+               db,
+               "SELECT sessionKey,origin,creatorSessionKey FROM wakes WHERE wakeId=?1",
+               [replacement_wake.wake_id]
+             )
+    assert {:ok, [[^assignment_id]]} =
+             DB.query(
+               db,
+               "SELECT assignmentId FROM queued_message_replacement_requests WHERE wakeId=?1",
+               [replacement_wake.wake_id]
+             )
+
+    assert {:ok, [["canceled", "queued-message-suppressed: sender_requested_replacement"]]} =
+             DB.query(db, "SELECT status,error FROM turns WHERE seq=?1", [source_seq])
+
+    assert {:ok, [["queued", "k1", "agent:sender"]]} =
+             DB.query(
+               db,
+               "SELECT status,sessionKey,origin FROM turns WHERE seq=?1",
+               [replacement_seq]
+             )
+
+    assert %{id: replayed_after_replacement} = Assignments.__handle__(db, "dispatch", dispatch)
+    assert replayed_after_replacement == assignment_id
+    assert {:ok, [[1]]} =
+             DB.query(
+               db,
+               "SELECT COUNT(*) FROM assignments WHERE subject=?1 AND state='open'",
+               ["initial assignment prompt"]
+             )
+
+    assert {:ok, [[2]]} = DB.query(db, "SELECT COUNT(*) FROM turns WHERE sessionKey=?1", ["k1"])
   end
 
   test "replacement leaves a turn that became running untouched", %{db: db} do
