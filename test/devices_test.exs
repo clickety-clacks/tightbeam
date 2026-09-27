@@ -1,12 +1,12 @@
 defmodule Tightbeam.DevicesTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Devices}
+  alias Tightbeam.{DB, Devices, Schema}
 
   setup do
     name = :"db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: name})
-    :ok = Devices.ensure_schema(name)
+    :ok = Schema.ensure_all(name)
     %{db: name}
   end
 

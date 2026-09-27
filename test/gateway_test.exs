@@ -2966,6 +2966,112 @@ defmodule Tightbeam.GatewayTest do
     assert Org.get(ctx.db, session_key).host == "racter"
   end
 
+  test "spawn records one real redirect when an open exact key is skipped", ctx do
+    base_dir = placement_test_base("terminal-redirect", ["eurisko", "racter"])
+    ensure_global_registry()
+
+    register_hosts(ctx.db, %{
+      "eurisko" => %{ssh: "eurisko", base_dir: "/srv/eurisko", cli_bin: nil},
+      "racter" => %{ssh: "racter", base_dir: "/srv/racter", cli_bin: nil}
+    })
+
+    await_host_catalog("racter", "codex")
+
+    assert {:opened, incident} =
+             Tightbeam.TerminalCredentialFailure.open(ctx.db, %{
+               host: "eurisko",
+               harness: "codex",
+               provider: "openai",
+               correlation_id: "gateway-terminal-redirect",
+               source_kind: "catalog-final-401",
+               principal: "process:tightbeam/model-catalog"
+             })
+
+    config =
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.put(:default_harness, :codex)
+      |> Map.put(:default_model, Model.new("gpt-5.6-sol", effort: "medium"))
+      |> Map.put(:credential_status, fn
+        :openai, "eurisko" -> flunk("suppressed key must not read credential state")
+        :openai, "racter" -> :onboarded
+      end)
+      |> Map.put(:sh, fn _command -> {"", 0} end)
+
+    spawn = Gateway.handlers(config)["spawn"]
+
+    call = %{
+      origin: "user:flynn",
+      session_key: nil,
+      params: %{
+        display_name: "Terminal redirect",
+        idempotency_key: "spawn-terminal-redirect"
+      }
+    }
+
+    assert %{session_key: session_key} = spawn.(call)
+    assert Org.get(ctx.db, session_key).host == "racter"
+    assert %{session_key: ^session_key} = spawn.(call)
+
+    assert {:ok, [["racter", 1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT destinationHost,COUNT(*) FROM terminal_credential_redirects WHERE incidentId=?1 GROUP BY destinationHost",
+               [incident.id]
+             )
+  end
+
+  test "an explicit suppressed host refuses without probing or recording a redirect", ctx do
+    base_dir = placement_test_base("terminal-explicit", ["eurisko", "racter"])
+    ensure_global_registry()
+
+    register_hosts(ctx.db, %{
+      "eurisko" => %{ssh: "eurisko", base_dir: "/srv/eurisko", cli_bin: nil},
+      "racter" => %{ssh: "racter", base_dir: "/srv/racter", cli_bin: nil}
+    })
+
+    assert {:opened, incident} =
+             Tightbeam.TerminalCredentialFailure.open(ctx.db, %{
+               host: "eurisko",
+               harness: "codex",
+               provider: "openai",
+               correlation_id: "gateway-terminal-explicit",
+               source_kind: "catalog-final-401",
+               principal: "process:tightbeam/model-catalog"
+             })
+
+    config =
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.put(:default_harness, :codex)
+      |> Map.put(:default_model, Model.new("gpt-5.6-sol", effort: "medium"))
+      |> Map.put(:credential_status, fn
+        :openai, "eurisko" -> flunk("suppressed key must not read credential state")
+      end)
+
+    assert %{
+             code: "placement_denied",
+             detail: %{code: "terminal_credential_failure"},
+             message: message
+           } =
+             Gateway.handlers(config)["spawn"].(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{
+                 display_name: "Terminal explicit refusal",
+                 host: "eurisko",
+                 idempotency_key: "spawn-terminal-explicit"
+               }
+             })
+
+    assert message =~ incident.id
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM terminal_credential_redirects WHERE incidentId=?1",
+               [incident.id]
+             )
+  end
+
   test "spawn refusal relays each where host's catalog cause and remedy", ctx do
     base_dir = placement_test_base("catalog-causes", ["eurisko", "racter"])
 

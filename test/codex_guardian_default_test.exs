@@ -1,5 +1,5 @@
 defmodule Tightbeam.CodexGuardianDefaultTest do
-  use ExUnit.Case, async: true
+  use Tightbeam.TestCase, async: false
 
   alias Tightbeam.Harness.Codex
 

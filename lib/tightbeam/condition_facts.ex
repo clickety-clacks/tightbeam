@@ -26,6 +26,7 @@ defmodule Tightbeam.ConditionFacts do
     harness-task-crash harness-task-restored
     harness-interrupted-outcome-unknown harness-interrupted-outcome-reconciled
     harness-other-unavailable harness-other-restored
+    catalog-terminal-credential-failure catalog-terminal-credential-restored
     cli-incompatible cli-compatible
   )
   @agent_only_kinds ~w(work-blocked work-unblocked)
@@ -40,6 +41,7 @@ defmodule Tightbeam.ConditionFacts do
     "harness-task-crash" => "harness-task-restored",
     "harness-interrupted-outcome-unknown" => "harness-interrupted-outcome-reconciled",
     "harness-other-unavailable" => "harness-other-restored",
+    "catalog-terminal-credential-failure" => "catalog-terminal-credential-restored",
     "cli-incompatible" => "cli-compatible"
   }
 

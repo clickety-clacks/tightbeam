@@ -19,7 +19,7 @@ defmodule Tightbeam.CredentialKindsTest do
 
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{Credentials, ModelCatalog}
+  alias Tightbeam.{Credentials, ModelCatalog, Schema}
   alias Tightbeam.Harness.{Claude, Codex}
 
   defp start_credentials(opts), do: Credentials.start_link(credential_opts(opts))
@@ -45,7 +45,7 @@ defmodule Tightbeam.CredentialKindsTest do
     base = Path.join(System.tmp_dir!(), "tb-cred-kinds-#{System.unique_integer([:positive])}")
     db = :"cred_kinds_db_#{System.unique_integer([:positive])}"
     start_supervised!({Tightbeam.DB, path: ":memory:", name: db})
-    :ok = Tightbeam.Placement.ensure_schema(db)
+    :ok = Schema.ensure_all(db)
     on_exit(fn -> File.rm_rf!(base) end)
     %{base: base, db: db}
   end

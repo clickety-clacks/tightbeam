@@ -60,14 +60,12 @@ defmodule Tightbeam.PiProvider do
           {:error, {:no_pi_catalog, %{}}}
 
         1 ->
-          [{provider, reason}] = Map.to_list(errors)
+          [{provider_key, raw_reason}] = Map.to_list(errors)
 
-          case reason do
-            :malformed_catalog ->
-              {:error, {:pi_catalog_provider_failed, provider, reason}}
-
-            _ ->
-              {:error, reason}
+          if provider_identity_required?(raw_reason) do
+            {:error, {:pi_catalog_provider_failed, provider_key, raw_reason}}
+          else
+            {:error, raw_reason}
           end
 
         _ ->
@@ -81,6 +79,18 @@ defmodule Tightbeam.PiProvider do
   defp maybe_put_catalog_error(errors, _key, nil), do: errors
   defp maybe_put_catalog_error(errors, _key, :not_onboarded), do: errors
   defp maybe_put_catalog_error(errors, key, reason), do: Map.put(errors, key, reason)
+
+  defp provider_identity_required?(:malformed_catalog), do: true
+  defp provider_identity_required?({:http_status, 401, _body}), do: true
+
+  defp provider_identity_required?({
+         :local_openai_catalog_failed,
+         _name,
+         {:http_status, 401, _body}
+       }),
+       do: true
+
+  defp provider_identity_required?(_reason), do: false
 
   @doc false
   def pi_catalog_ready?(state) do

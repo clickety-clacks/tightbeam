@@ -11,6 +11,12 @@ defmodule Tightbeam.Firehose.Registry do
   @observational ~w(
     verb.accepted verb.denied rail.denied lifecycle.boot lifecycle.clean_shutdown
     lifecycle.dirty_exit lifecycle.takeover prod.fired
+    lifecycle.terminal_credential_opened
+    lifecycle.terminal_credential_suppression_activated
+    lifecycle.terminal_credential_redirect_observed
+    lifecycle.terminal_credential_recovery_claimed
+    lifecycle.terminal_credential_recovery_outcome
+    lifecycle.terminal_credential_resolved
   )
 
   @state_rows [
