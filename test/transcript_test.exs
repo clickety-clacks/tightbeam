@@ -487,7 +487,7 @@ defmodule Tightbeam.TranscriptTest do
         ctx.db,
         "UPDATE turns SET status='delivered',startedAt=1,endedAt=2 WHERE seq IN (?1,?2)",
         [first_turn, last_turn]
-    )
+      )
 
     assert Enum.map(Ledger.unpublished_terminals(ctx.db), & &1.seq) == [first_turn, last_turn]
 
