@@ -48,7 +48,7 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
     assert Enum.all?(checks, & &1.ok)
   end
 
-  test "binary source classification respects adapter selection and ignores unrelated secrets",
+  test "capture records adapter selector metadata without using PATH as provenance",
        _ctx do
     pi =
       HarnessBinaryProvenance.capture(:pi, "eezo", "/eezo", "/usr/local/bin:/usr/bin", [],
@@ -89,7 +89,7 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
       )
 
     assert pi["selection_rule"] == "system"
-    assert codex["selection_rule"] == "explicit_pinned_override"
+    assert codex["selection_rule"] == "pinned_override"
     assert codex["override_path"] == "/opt/pinned/codex"
     assert bundled["selection_rule"] == "bundled_fallback"
     assert remote_unknown["selection_rule"] == "unknown"
@@ -102,31 +102,18 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
         process_env: %{"CODEX_PATH" => "bin/codex"}
       )
 
-    assert %{"status" => "unavailable", "source" => "explicit_pinned_override"} =
+    assert %{"status" => "unavailable", "source" => "pinned_override"} =
              HarnessBinaryProvenance.probe_capture(%{ssh: nil}, relative_pin)
   end
 
-  test "system provenance requires adapter selection evidence and explicit pins beat PATH" do
+  test "an unobserved system selector stays unknown and configured pins beat PATH" do
     hosts = %{
       "eezo" => %{ssh: nil, base_dir: "/eezo", cli_bin: "/eezo/bin"}
     }
 
-    system_probe = fn _host_config, capture, _target ->
-      assert capture["selection_rule"] == "system"
-      assert capture["path_env"] =~ "/usr/bin"
-
-      %{
-        "status" => "observed",
-        "source" => "system",
-        "path" => "/adapter-selected/pi-wrapper",
-        "version" => "pi 2.0",
-        "selection_evidence" => "adapter probe_cli selected this executable"
-      }
-    end
-
     probe = fn _host_config, capture ->
       if capture["harness"] == "codex" do
-        assert capture["selection_rule"] == "explicit_pinned_override"
+        assert capture["selection_rule"] == "pinned_override"
 
         %{
           "status" => "observed",
@@ -135,7 +122,7 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
           "version" => "codex 1.0"
         }
       else
-        flunk("system selection must come from adapter evidence, not PATH probing")
+        HarnessBinaryProvenance.probe_capture(%{ssh: nil}, capture)
       end
     end
 
@@ -147,45 +134,66 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
                [],
                harnesses: [Tightbeam.Harness.Pi, Tightbeam.Harness.Codex],
                process_env: %{},
-               probe: probe,
-               system_probe: system_probe
+               probe: probe
              )
 
     pi = Enum.find(report["rows"], &(&1["harness"] == "pi"))
     codex = Enum.find(report["rows"], &(&1["harness"] == "codex"))
 
-    assert pi["next_launch"]["source"] == "system"
-    assert pi["next_launch"]["path"] == "/adapter-selected/pi-wrapper"
-    assert pi["next_launch"]["version"] == "pi 2.0"
-    assert codex["next_launch"]["source"] == "explicit_pinned_override"
+    assert pi["next_launch"]["status"] == "unknown"
+    assert pi["next_launch"]["source"] == "unknown"
+    assert codex["next_launch"]["source"] == "pinned_override"
     assert codex["next_launch"]["path"] == "/opt/pinned/codex"
 
     human = HarnessBinaryProvenance.format_human(report)
-    assert human =~ "/adapter-selected/pi-wrapper; pi 2.0"
-    refute human =~ "/usr/bin/pi"
+    assert human =~ "harness binary eezo/pi next launch: unknown (unknown)"
     assert human =~ "/opt/pinned/codex; codex 1.0"
   end
 
-  test "system source comes from the adapter-selected executable, not an unrelated PATH copy" do
+  test "system provenance needs an exact prepared launch executable, not PATH discovery" do
     temp_dir =
       Path.join(System.tmp_dir!(), "tightbeam-system-cli-#{System.unique_integer([:positive])}")
 
     File.mkdir_p!(temp_dir)
     on_exit(fn -> File.rm_rf!(temp_dir) end)
 
-    selected = Path.join(temp_dir, "pi")
-    File.write!(selected, "#!/bin/sh\nprintf 'pi 2.4.0\\n'\n")
+    path_copy = Path.join(temp_dir, "pi")
+    File.write!(path_copy, "#!/bin/sh\nprintf 'pi 2.4.0\\n'\n")
+    File.chmod!(path_copy, 0o755)
+
+    pi_capture =
+      HarnessBinaryProvenance.capture(:pi, "eezo", temp_dir, temp_dir <> ":/usr/bin:/bin", [])
+
+    assert %{"status" => "unknown", "source" => "unknown"} =
+             HarnessBinaryProvenance.observe_selection(%{ssh: nil}, pi_capture)
+
+    selected = Path.join(temp_dir, "cursor-agent")
+    File.write!(selected, "#!/bin/sh\nprintf 'cursor-agent 2.4.0\\n'\n")
     File.chmod!(selected, 0o755)
 
-    capture =
-      HarnessBinaryProvenance.capture(:pi, "eezo", temp_dir, temp_dir <> ":/usr/bin:/bin", [])
+    cursor_capture =
+      HarnessBinaryProvenance.capture(:cursor, "eezo", temp_dir, temp_dir <> ":/usr/bin:/bin", [])
+
+    observed =
+      HarnessBinaryProvenance.capture_launch_observation(
+        %{ssh: nil},
+        cursor_capture,
+        launch_plan: [cmd: [selected, "acp"]]
+      )["launch_observation"]
 
     assert %{
              "status" => "observed",
              "source" => "system",
              "path" => ^selected,
-             "version" => "pi 2.4.0"
-           } = HarnessBinaryProvenance.observe_selection(%{ssh: nil}, capture)
+             "version" => "cursor-agent 2.4.0"
+           } = observed
+
+    assert %{"status" => "unknown", "source" => "unknown"} =
+             HarnessBinaryProvenance.capture_launch_observation(
+               %{ssh: nil},
+               cursor_capture,
+               launch_plan: [cmd: ["cursor-agent", "acp"]]
+             )["launch_observation"]
   end
 
   test "missing and unprobeable explicit selections keep their source and status" do
@@ -211,13 +219,13 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
 
     assert %{
              "status" => "unprobeable",
-             "source" => "explicit_pinned_override",
+             "source" => "pinned_override",
              "path" => ^broken
            } = HarnessBinaryProvenance.probe_capture(%{ssh: nil}, unprobeable)
 
     assert %{
              "status" => "missing",
-             "source" => "explicit_pinned_override"
+             "source" => "pinned_override"
            } = HarnessBinaryProvenance.probe_capture(%{ssh: nil}, missing)
   end
 
@@ -249,7 +257,7 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
 
     probe = fn _host, capture ->
       case capture["selection_rule"] do
-        "explicit_pinned_override" ->
+        "pinned_override" ->
           %{
             "status" => "observed",
             "source" => capture["selection_rule"],
@@ -291,7 +299,7 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
 
     [row] = report["rows"]
     [running] = row["running"]
-    assert running["source"] == "explicit_pinned_override"
+    assert running["source"] == "pinned_override"
     assert running["path"] == "/opt/old/codex"
     assert row["next_launch"]["source"] == "bundled_fallback"
     assert row["next_launch"]["path"] == "/eezo/adapters/node_modules/@openai/codex/bin/codex.js"
@@ -331,7 +339,7 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
     assert [
              %{
                "next_launch" => %{
-                 "source" => "explicit_pinned_override",
+                 "source" => "pinned_override",
                  "path" => "/opt/remote/codex"
                }
              }
@@ -883,7 +891,7 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
           ],
           "next_launch" => %{
             "status" => "observed",
-            "source" => "explicit_pinned_override",
+            "source" => "pinned_override",
             "path" => "/usr/local/bin/codex",
             "version" => "codex 0.145.1"
           },

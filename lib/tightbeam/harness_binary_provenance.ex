@@ -35,7 +35,7 @@ defmodule Tightbeam.HarnessBinaryProvenance do
 
     selection_rule =
       cond do
-        is_binary(override) and String.trim(override) != "" -> "explicit_pinned_override"
+        is_binary(override) and String.trim(override) != "" -> "pinned_override"
         without_override_evidence? -> "unknown"
         is_binary(default_source) -> default_source
         true -> "unsupported"
@@ -48,7 +48,7 @@ defmodule Tightbeam.HarnessBinaryProvenance do
       "path_env" => path,
       "selection_rule" => selection_rule,
       "override_name" => override_name,
-      "override_path" => if(selection_rule == "explicit_pinned_override", do: override),
+      "override_path" => if(selection_rule == "pinned_override", do: override),
       "binary_name" => module.cli_binary(),
       "bundle_probe_script" => bundle_probe_script,
       "adapter" => %{
@@ -64,7 +64,7 @@ defmodule Tightbeam.HarnessBinaryProvenance do
           selection_rule == "unsupported" ->
             "the registered harness has no vendor CLI provenance rule"
 
-          selection_rule == "explicit_pinned_override" ->
+          selection_rule == "pinned_override" ->
             override_name
 
           true ->
@@ -240,7 +240,15 @@ defmodule Tightbeam.HarnessBinaryProvenance do
   @doc false
   def capture_launch_observation(host_config, capture, opts \\ []) do
     capture = resolve_remote_launch_selection(host_config, capture, opts)
-    Map.put(capture, "launch_observation", observe_selection(host_config, capture, opts))
+
+    observation =
+      if capture["selection_rule"] == "system" do
+        observe_effective_system_launch(host_config, capture, Keyword.get(opts, :launch_plan))
+      else
+        observe_selection(host_config, capture, opts)
+      end
+
+    Map.put(capture, "launch_observation", observation)
   end
 
   defp resolve_remote_launch_selection(
@@ -287,8 +295,11 @@ defmodule Tightbeam.HarnessBinaryProvenance do
         }
 
       "system" ->
-        system_probe = Keyword.get(opts, :system_probe, &probe_system_selection/3)
-        system_probe.(host_config, capture, Keyword.get(opts, :target))
+        %{
+          "status" => "unknown",
+          "source" => "unknown",
+          "reason" => "no effective vendor CLI launch has been observed"
+        }
 
       _ ->
         probe = Keyword.get(opts, :probe, &probe_capture/2)
@@ -326,79 +337,43 @@ defmodule Tightbeam.HarnessBinaryProvenance do
     }
   end
 
-  defp probe_system_selection(host_config, capture, target) do
-    module = Harness.parse!(capture["harness"])
+  defp observe_effective_system_launch(host_config, capture, launch_plan) do
+    case selected_vendor_executable(capture, launch_plan) do
+      {:ok, path} ->
+        case run_host(host_config, capture["path_env"], [path, "--version"]) do
+          {:ok, output} ->
+            %{
+              "status" => "observed",
+              "source" => "system",
+              "path" => path,
+              "version" => String.slice(String.trim(output), 0, 240),
+              "version_observed_at_ms" => System.system_time(:millisecond),
+              "selection_evidence" => "prepared adapter launch names this exact vendor CLI"
+            }
 
-    target =
-      target ||
-        %{
-          base_dir: capture["base_dir"],
-          host_name: capture["host"],
-          host_config: host_config,
-          cli_bin: host_config[:cli_bin] || Path.join(capture["base_dir"], "bin")
-        }
+          {:error, {:exit, code, output}} ->
+            %{
+              "status" => "unprobeable",
+              "source" => "system",
+              "path" => path,
+              "reason" =>
+                "version command exited #{code}: #{output |> String.trim() |> String.slice(0, 160)}"
+            }
 
-    path = capture["path_env"]
-
-    target =
-      if module.wire_name() == "pi" do
-        Map.put(target, :find_executable, fn name ->
-          script = "command -v " <> Tightbeam.Harness.Support.shell_quote(name)
-
-          case resolve_on_host(host_config, path, ["sh", "-c", script]) do
-            {:ok, resolved} when resolved != "" -> resolved
-            _ -> nil
-          end
-        end)
-      else
-        target
-      end
-
-    target =
-      Map.put(target, :run, fn argv ->
-        case run_host(host_config, path, argv) do
-          {:ok, output} -> {output, 0}
-          {:error, {:exit, code, output}} -> {output, code}
-          {:error, reason} -> {safe_reason(reason), 127}
+          {:error, reason} ->
+            %{
+              "status" => "unavailable",
+              "source" => "system",
+              "path" => path,
+              "reason" => safe_reason(reason)
+            }
         end
-      end)
 
-    result = module.probe_cli(Map.put(target, :timeout, @version_timeout_ms))
-
-    case result do
-      {:ok, %{bin: path, version: version}} when is_binary(path) and is_binary(version) ->
+      :unknown ->
         %{
-          "status" => "observed",
-          "source" => "system",
-          "path" => path,
-          "version" => String.slice(String.trim(version), 0, 240),
-          "version_observed_at_ms" => System.system_time(:millisecond),
-          "selection_evidence" => "adapter probe_cli selected this executable"
-        }
-
-      {:error, :not_found} ->
-        %{
-          "status" => "missing",
+          "status" => "unknown",
           "source" => "unknown",
-          "reason" => "adapter probe_cli did not select a system executable"
-        }
-
-      {:error, {:exec_failed, reason}} ->
-        %{
-          "status" => "unprobeable",
-          "source" => "unknown",
-          "reason" =>
-            "adapter-selected system executable version probe failed: #{safe_reason(reason)}"
-        }
-
-      {:error, reason} ->
-        %{"status" => "unavailable", "source" => "unknown", "reason" => safe_reason(reason)}
-
-      other ->
-        %{
-          "status" => "unavailable",
-          "source" => "unknown",
-          "reason" => "adapter probe_cli returned #{safe_reason(other)}"
+          "reason" => "prepared adapter launch does not expose the exact vendor CLI executable"
         }
     end
   rescue
@@ -407,6 +382,22 @@ defmodule Tightbeam.HarnessBinaryProvenance do
     kind, reason ->
       %{"status" => "unavailable", "source" => "unknown", "reason" => safe_reason({kind, reason})}
   end
+
+  defp selected_vendor_executable(capture, launch_plan) when is_list(launch_plan) do
+    case Keyword.get(launch_plan, :cmd) do
+      [path | _] when is_binary(path) ->
+        if Path.type(path) == :absolute and Path.basename(path) == capture["binary_name"] do
+          {:ok, path}
+        else
+          :unknown
+        end
+
+      _ ->
+        :unknown
+    end
+  end
+
+  defp selected_vendor_executable(_capture, _launch_plan), do: :unknown
 
   @doc "A read-only per-row formatter shared by `mix tightbeam.doctor`."
   def format_human(%{"rows" => rows}) when is_list(rows) do
@@ -649,7 +640,7 @@ defmodule Tightbeam.HarnessBinaryProvenance do
   defp executable(
          host_config,
          %{
-           "selection_rule" => "explicit_pinned_override",
+           "selection_rule" => "pinned_override",
            "override_path" => path
          } = capture
        )

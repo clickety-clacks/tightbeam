@@ -2016,7 +2016,7 @@ mod tests {
                 }],
                 "next_launch": {
                     "status": "observed",
-                    "source": "explicit_pinned_override",
+                    "source": "pinned_override",
                     "path": "/usr/local/bin/codex",
                     "version": "codex-cli 0.145.1"
                 },

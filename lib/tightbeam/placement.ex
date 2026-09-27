@@ -1575,7 +1575,8 @@ defmodule Tightbeam.Placement do
         Tightbeam.HarnessBinaryProvenance.capture_launch_observation(
           host_config,
           Keyword.fetch!(base, :harness_binary_capture),
-          target: target
+          target: target,
+          launch_plan: plan
         )
 
       base = Keyword.put(base, :harness_binary_capture, binary_capture)
