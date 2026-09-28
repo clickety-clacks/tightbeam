@@ -5955,19 +5955,39 @@ defmodule Tightbeam.Gateway do
     wait? = predicate? or after_turn?
 
     cond do
-      predicate_present? and not predicate? -> false
-      after_turn_present? and not after_turn? -> false
-      replace_present? and p[:replace_queued] not in [true, false] -> false
-      predicate? and after_turn? -> false
-      wait? and not (is_binary(p[:assignment_id]) and p.assignment_id != "") -> false
+      predicate_present? and not predicate? ->
+        false
+
+      after_turn_present? and not after_turn? ->
+        false
+
+      replace_present? and p[:replace_queued] not in [true, false] ->
+        false
+
+      predicate? and after_turn? ->
+        false
+
+      wait? and not (is_binary(p[:assignment_id]) and p.assignment_id != "") ->
+        false
+
       replace_queued? and
           not (is_binary(p[:replacement_assignment_id]) and p.replacement_assignment_id != "") ->
         false
-      replace_queued? and wait? -> false
-      wait? and is_binary(p[:condition_kind]) -> false
-      predicate? and is_nil(p[:after_ms]) and is_nil(p[:at]) -> false
-      after_turn? and (not is_nil(p[:after_ms]) or not is_nil(p[:at])) -> false
-      true -> true
+
+      replace_queued? and wait? ->
+        false
+
+      wait? and is_binary(p[:condition_kind]) ->
+        false
+
+      predicate? and is_nil(p[:after_ms]) and is_nil(p[:at]) ->
+        false
+
+      after_turn? and (not is_nil(p[:after_ms]) or not is_nil(p[:at])) ->
+        false
+
+      true ->
+        true
     end
   end
 
@@ -6121,7 +6141,7 @@ defmodule Tightbeam.Gateway do
         # would strand an unfireable controller. Roll the handler transaction
         # back so wake and sidecar remain all-or-nothing.
         raise "incompatible_supervision_liveness_v1: controller schedule :duplicate"
-      end
+    end
   end
 
   defp replacement_assignment_id_in_txn(txn, call, session_key) do
