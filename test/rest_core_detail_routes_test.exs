@@ -1647,7 +1647,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       )
 
     {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
-    {:ok, ws} = WS.connect("127.0.0.1", port, "/ws/changes?protocolVersion=1")
+    {:ok, ws} = WS.connect("127.0.0.1", port, "/ws/changes?protocolVersion=2")
     :ok = WS.send_text(ws, JSON.encode!(%{"type" => "auth", "token" => ctx.token}))
     {:ok, {:text, auth}, ws} = WS.recv(ws, 2_000)
     assert %{"type" => "auth_result", "success" => true} = JSON.decode!(auth)
@@ -1657,7 +1657,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
         ws,
         JSON.encode!(%{
           "type" => "subscribe",
-          "protocolVersion" => 1,
+          "protocolVersion" => 2,
           "subscriptionId" => "core-detail-a6",
           "filters" => %{
             "classes" => Enum.map(core_detail_cases(ctx), & &1.class) ++ extra_classes

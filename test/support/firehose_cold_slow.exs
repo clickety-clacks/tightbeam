@@ -132,7 +132,7 @@ try do
     )
 
   connect = fn ->
-    {:ok, ws} = WS.connect("127.0.0.1", slow_port, "/ws/changes?protocolVersion=1")
+    {:ok, ws} = WS.connect("127.0.0.1", slow_port, "/ws/changes?protocolVersion=2")
     :ok = WS.send_text(ws, JSON.encode!(%{"type" => "auth", "token" => device.token}))
     {:ok, {:text, auth}, ws} = WS.recv(ws, 2_000)
     assert JSON.decode!(auth)["success"]
@@ -142,7 +142,7 @@ try do
         ws,
         JSON.encode!(%{
           "type" => "subscribe",
-          "protocolVersion" => 1,
+          "protocolVersion" => 2,
           "subscriptionId" => "slow",
           "filters" => %{"classes" => ["work_item.created"]}
         })

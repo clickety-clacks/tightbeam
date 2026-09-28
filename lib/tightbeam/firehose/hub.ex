@@ -157,7 +157,12 @@ defmodule Tightbeam.Firehose.Hub do
       {frames, seq} =
         if socket.mode == :all,
           do: {[notice], socket.seq},
-          else: matching_frames(notice, socket.subscriptions, socket.seq)
+          else:
+            matching_frames(
+              notice,
+              socket.subscriptions,
+              socket.seq
+            )
 
       frames = Enum.map(frames, &Publisher.wire_notice/1)
       enqueue(%{socket | seq: seq}, pid, frames, limit)
@@ -213,7 +218,7 @@ defmodule Tightbeam.Firehose.Hub do
                  notice,
                  %{
                    "type" => "change",
-                   "schemaVersion" => 1,
+                   "schemaVersion" => 2,
                    "subscriptionId" => id,
                    "seq" => n + 1
                  }

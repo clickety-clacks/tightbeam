@@ -25,6 +25,7 @@ use crate::args::{Command, Identity, Target};
 use crate::dispatch::{self, Endpoint};
 
 const PROTOCOL_VERSION: u64 = 1;
+const FIREHOSE_PROTOCOL_PLAN: [u64; 2] = [2, 1];
 const SNAPSHOT_LIMIT: u64 = 500;
 const SIGNAL_EXIT_PREFIX: &str = "session_connect_signal_exit:";
 static SESSION_SIGNAL: AtomicI32 = AtomicI32::new(0);
@@ -591,10 +592,7 @@ fn connect_and_read(
     stopped: &Arc<AtomicBool>,
     lifecycle: &Arc<AtomicU64>,
 ) -> Result<(), ConnectionFailure> {
-    let url = websocket_url(&endpoint.base);
-    let (mut socket, _) = connect(url.as_str()).map_err(|_| {
-        ConnectionFailure::recoverable("connection_lost", "websocket connection failed")
-    })?;
+    let (mut socket, firehose_protocol) = connect_firehose(endpoint, stopped)?;
 
     let _ = set_read_timeout(socket.get_mut(), Some(Duration::from_millis(50)));
     if stopped.load(Ordering::SeqCst) {
@@ -612,10 +610,22 @@ fn connect_and_read(
                 "websocket authentication request failed",
             )
         })?;
+
+    let auth_frame = read_handshake_frame(&mut socket, stopped)?;
+    if auth_frame.get("type").and_then(Value::as_str) != Some("auth_result")
+        || auth_frame.get("success") != Some(&Value::Bool(true))
+    {
+        return Err(ConnectionFailure::fatal(
+            "auth_failed",
+            "gateway authentication failed",
+        ));
+    }
+
     socket
         .send(Message::Text(
             json!({
                 "type": "subscribe",
+                "protocolVersion": firehose_protocol,
                 "subscriptionId": format!("external-agent-{generation}"),
                 "filters": {
                     "sessionKey": session_key,
@@ -630,12 +640,28 @@ fn connect_and_read(
                 "websocket subscription request failed",
             )
         })?;
+
+    let ready_frame = read_handshake_frame(&mut socket, stopped)?;
+    if ready_frame.get("type").and_then(Value::as_str) != Some("subscription_ready") {
+        return Err(ConnectionFailure::fatal(
+            "invalid_subscription_response",
+            "gateway did not acknowledge the subscription",
+        ));
+    }
+
     if stopped.load(Ordering::SeqCst) {
         close_socket_normally(&mut socket);
         return Ok(());
     }
     set_lifecycle_generation(lifecycle, generation);
-    let _ = tx.send(Worker::Connected(generation));
+    if tx.send(Worker::Connected(generation)).is_err() {
+        return Ok(());
+    }
+    for frame in [auth_frame, ready_frame] {
+        if tx.send(Worker::Frame(generation, frame)).is_err() {
+            return Ok(());
+        }
+    }
 
     let mut last_seq = 0u64;
     while !stopped.load(Ordering::SeqCst) {
@@ -661,6 +687,22 @@ fn connect_and_read(
                 let frame: Value = serde_json::from_str(&text).map_err(|_| {
                     ConnectionFailure::recoverable("connection_lost", "firehose frame was invalid")
                 })?;
+                if frame.get("type").and_then(Value::as_str) == Some("change")
+                    && (frame.get("schemaVersion").and_then(Value::as_u64)
+                        != Some(firehose_protocol)
+                        || !session_change_frame_compatible(&frame))
+                {
+                    close_socket_with_protocol_error(&mut socket);
+                    if let Err(error) = rebuild_session_collection(endpoint) {
+                        return Err(ConnectionFailure::fatal(&error.code, &error.message));
+                    }
+                    let mut error = ConnectionFailure::fatal(
+                        "schema_mismatch",
+                        "Firehose frame did not match the negotiated schema",
+                    );
+                    error.close_code = Some(1002);
+                    return Err(error);
+                }
                 if frame.get("type").and_then(Value::as_str) == Some("auth_result")
                     && frame.get("success") == Some(&Value::Bool(false))
                 {
@@ -708,6 +750,100 @@ fn connect_and_read(
     Ok(())
 }
 
+fn connect_firehose(
+    endpoint: &Endpoint,
+    stopped: &AtomicBool,
+) -> Result<(tungstenite::WebSocket<MaybeTlsStream<TcpStream>>, u64), ConnectionFailure> {
+    for protocol_version in FIREHOSE_PROTOCOL_PLAN {
+        if stopped.load(Ordering::SeqCst) {
+            return Err(ConnectionFailure::recoverable(
+                "connection_lost",
+                "websocket connection stopped",
+            ));
+        }
+
+        let url = websocket_url(&endpoint.base, protocol_version);
+        match connect(url.as_str()) {
+            Ok((socket, _)) => return Ok((socket, protocol_version)),
+            Err(WebSocketError::Http(response)) if response.status().as_u16() == 426 => {
+                if response
+                    .body()
+                    .as_ref()
+                    .is_some_and(|body| !body.is_empty())
+                {
+                    return Err(ConnectionFailure::fatal(
+                        "invalid_protocol_refusal",
+                        "gateway protocol refusal was not empty",
+                    ));
+                }
+
+                rebuild_session_collection(endpoint)
+                    .map_err(|error| ConnectionFailure::fatal(&error.code, &error.message))?;
+            }
+            Err(_) => {
+                return Err(ConnectionFailure::recoverable(
+                    "connection_lost",
+                    "websocket connection failed",
+                ));
+            }
+        }
+    }
+
+    Err(ConnectionFailure::fatal(
+        "unsupported_protocol_version",
+        "gateway refused every supported Firehose protocol",
+    ))
+}
+
+fn read_handshake_frame(
+    socket: &mut tungstenite::WebSocket<MaybeTlsStream<TcpStream>>,
+    stopped: &AtomicBool,
+) -> Result<Value, ConnectionFailure> {
+    loop {
+        if stopped.load(Ordering::SeqCst) {
+            return Err(ConnectionFailure::recoverable(
+                "connection_lost",
+                "websocket connection stopped",
+            ));
+        }
+
+        match socket.read() {
+            Ok(Message::Text(text)) => {
+                return serde_json::from_str(&text).map_err(|_| {
+                    ConnectionFailure::recoverable(
+                        "connection_lost",
+                        "Firehose handshake frame was invalid",
+                    )
+                });
+            }
+            Ok(Message::Ping(payload)) => {
+                socket.send(Message::Pong(payload)).map_err(|_| {
+                    ConnectionFailure::recoverable("connection_lost", "websocket connection lost")
+                })?;
+            }
+            Ok(Message::Close(frame)) => return Err(close_failure(frame)),
+            Ok(Message::Binary(_)) => {
+                return Err(ConnectionFailure::fatal(
+                    "invalid_firehose_frame",
+                    "Firehose handshake frame was binary",
+                ));
+            }
+            Ok(_) => {}
+            Err(WebSocketError::Io(error))
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) => {}
+            Err(_) => {
+                return Err(ConnectionFailure::recoverable(
+                    "connection_lost",
+                    "websocket connection lost",
+                ));
+            }
+        }
+    }
+}
+
 fn set_read_timeout(
     stream: &mut MaybeTlsStream<TcpStream>,
     timeout: Option<Duration>,
@@ -730,12 +866,21 @@ fn normal_close_frame() -> tungstenite::protocol::CloseFrame<'static> {
     }
 }
 
-fn websocket_url(base: &str) -> String {
+fn websocket_url(base: &str, protocol_version: u64) -> String {
     let base = base
         .trim_end_matches('/')
         .replacen("https://", "wss://", 1)
         .replacen("http://", "ws://", 1);
-    format!("{base}/ws/changes?protocolVersion=1")
+    format!("{base}/ws/changes?protocolVersion={protocol_version}")
+}
+
+fn close_socket_with_protocol_error(
+    socket: &mut tungstenite::WebSocket<MaybeTlsStream<TcpStream>>,
+) {
+    let _ = socket.close(Some(tungstenite::protocol::CloseFrame {
+        code: tungstenite::protocol::frame::coding::CloseCode::Protocol,
+        reason: "schema mismatch".into(),
+    }));
 }
 
 fn spawn_send(
@@ -1284,6 +1429,7 @@ fn close_failure(frame: Option<tungstenite::protocol::CloseFrame>) -> Connection
             "auth_failed",
             "gateway policy closed the connection; credential or session is no longer authorized",
         ),
+        1002 => ConnectionFailure::fatal("protocol_error", &message),
         1012 => ConnectionFailure::recoverable("server_restart", &message),
         _ => ConnectionFailure::recoverable("connection_lost", &message),
     };
@@ -1298,6 +1444,9 @@ fn load_snapshot(endpoint: &Endpoint, session_key: &str) -> Result<Snapshot, Sna
         .get("item")
         .cloned()
         .ok_or_else(|| snapshot_failure("projection_invalid", false))?;
+    if !session_item_capability_compatible(&session) {
+        return Err(snapshot_failure("projection_invalid", false));
+    }
     let row_version = session
         .get("rowVersion")
         .and_then(Value::as_u64)
@@ -1423,6 +1572,87 @@ fn get_json(endpoint: &Endpoint, path: &str) -> Result<Value, SnapshotFailure> {
         return Err(snapshot_failure(code, false));
     }
     Ok(value)
+}
+
+fn rebuild_session_collection(endpoint: &Endpoint) -> Result<Vec<Value>, SnapshotFailure> {
+    let response = get_json(endpoint, "/api/sessions")?;
+    if response.get("schemaVersion") != Some(&json!(1)) {
+        return Err(snapshot_failure("projection_invalid", false));
+    }
+    let sessions = response
+        .get("items")
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or_else(|| snapshot_failure("projection_invalid", false))?;
+    if sessions
+        .iter()
+        .any(|session| !session_item_capability_compatible(session))
+    {
+        return Err(snapshot_failure("projection_invalid", false));
+    }
+    Ok(sessions)
+}
+
+fn session_change_frame_compatible(frame: &Value) -> bool {
+    match frame.get("class").and_then(Value::as_str) {
+        Some(
+            "session.spawned" | "session.updated" | "session.harness_changed" | "session.retired",
+        ) => frame
+            .get("payload")
+            .is_some_and(session_item_capability_compatible),
+        _ => true,
+    }
+}
+
+fn session_item_capability_compatible(item: &Value) -> bool {
+    if !item.is_object() {
+        return false;
+    }
+    let Some(capabilities) = item.get("capabilities") else {
+        return true;
+    };
+    let Some(capabilities) = capabilities.as_object() else {
+        return false;
+    };
+    let Some(capability) = capabilities.get("setHarness") else {
+        return true;
+    };
+    capabilities.len() == 1 && set_harness_capability_compatible(capability)
+}
+
+fn set_harness_capability_compatible(capability: &Value) -> bool {
+    let Some(capability) = capability.as_object() else {
+        return false;
+    };
+    match capability.get("supported") {
+        Some(Value::Bool(false)) => {
+            capability.len() == 2 && capability.get("reason").is_some_and(Value::is_string)
+        }
+        Some(Value::Bool(true)) => {
+            let Some(options) = capability.get("options").and_then(Value::as_array) else {
+                return false;
+            };
+            capability.len() == 2
+                && options.iter().all(|option| {
+                    let Some(option) = option.as_object() else {
+                        return false;
+                    };
+                    option.len() == 3
+                        && option
+                            .get("title")
+                            .and_then(Value::as_str)
+                            .is_some_and(|title| {
+                                !title.is_empty()
+                                    && option.get("value").and_then(Value::as_str) == Some(title)
+                            })
+                        && option.get("enabled").is_some_and(Value::is_boolean)
+                })
+                && options
+                    .iter()
+                    .any(|option| option["enabled"] == Value::Bool(true))
+        }
+        _ => false,
+    }
 }
 
 fn parse_input(
@@ -1824,6 +2054,47 @@ mod tests {
         );
     }
 
+    fn accept_subscribed_socket(
+        stream: TcpStream,
+        protocol_version: u64,
+    ) -> (tungstenite::WebSocket<TcpStream>, Value) {
+        let mut socket = tungstenite::accept_hdr(stream, |request, response| {
+            assert_eq!(
+                request.uri().query(),
+                Some(format!("protocolVersion={protocol_version}").as_str())
+            );
+            Ok(response)
+        })
+        .unwrap();
+
+        let Message::Text(auth) = socket.read().unwrap() else {
+            panic!("expected auth request")
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(&auth).unwrap()["type"],
+            "auth"
+        );
+        socket
+            .send(Message::Text(
+                json!({"type": "auth_result", "success": true}).to_string(),
+            ))
+            .unwrap();
+
+        let Message::Text(subscribe) = socket.read().unwrap() else {
+            panic!("expected subscribe request")
+        };
+        let subscribe: Value = serde_json::from_str(&subscribe).unwrap();
+        assert_eq!(subscribe["type"], "subscribe");
+        assert_eq!(subscribe["protocolVersion"], protocol_version);
+        socket
+            .send(Message::Text(
+                json!({"type": "subscription_ready", "subscriptionId": "external-agent-1"})
+                    .to_string(),
+            ))
+            .unwrap();
+        (socket, subscribe)
+    }
+
     fn send_frame(endpoint: Endpoint, idempotency_key: Option<&str>) -> (String, SendFailure) {
         let (tx, rx) = mpsc::channel();
         spawn_send(
@@ -2018,10 +2289,131 @@ mod tests {
         .unwrap_err();
         let request = server.join().unwrap();
 
-        assert!(request.starts_with("GET /ws/changes?protocolVersion=1 HTTP/1.1"));
+        assert!(request.starts_with("GET /ws/changes?protocolVersion=2 HTTP/1.1"));
         assert_eq!(failure.code, "connection_lost");
         assert_eq!(failure.message, "websocket connection failed");
         assert_eq!(failure.close_code, None);
+    }
+
+    #[test]
+    fn protocol_426_rebuilds_before_the_single_legacy_fallback() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = endpoint(&listener);
+        let server = thread::spawn(move || {
+            let (mut refusal, _) = listener.accept().unwrap();
+            let offer = read_http_request(&mut refusal);
+            assert!(offer.starts_with("GET /ws/changes?protocolVersion=2 HTTP/1.1"));
+            write!(
+                refusal,
+                "HTTP/1.1 426 Upgrade Required\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            )
+            .unwrap();
+            refusal.flush().unwrap();
+            drop(refusal);
+
+            let (mut rebuild, _) = listener.accept().unwrap();
+            let rebuild_request = read_http_request(&mut rebuild);
+            write_json_response(
+                &mut rebuild,
+                "200 OK",
+                "",
+                r#"{"schemaVersion":1,"items":[]}"#,
+            );
+            drop(rebuild);
+
+            let (stream, _) = listener.accept().unwrap();
+            let (mut socket, subscribe) = accept_subscribed_socket(stream, 1);
+            socket
+                .send(Message::Close(Some(tungstenite::protocol::CloseFrame {
+                    code: tungstenite::protocol::frame::coding::CloseCode::Normal,
+                    reason: "fixture complete".into(),
+                })))
+                .unwrap();
+            (offer, rebuild_request, subscribe)
+        });
+
+        let (tx, rx) = mpsc::channel();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let lifecycle = Arc::new(AtomicU64::new(0));
+        let result = connect_and_read(
+            &endpoint,
+            "agent:main/example",
+            1,
+            &tx,
+            &stopped,
+            &lifecycle,
+        );
+        let (offer, rebuild_request, subscribe) = server.join().unwrap();
+
+        let failure = result.unwrap_err();
+        assert_eq!(failure.code, "connection_lost");
+        assert_eq!(failure.close_code, Some(1000));
+        assert!(rebuild_request.starts_with("GET /api/sessions HTTP/1.1"));
+        assert_gateway_headers(&rebuild_request);
+        assert_eq!(subscribe["protocolVersion"], 1);
+
+        let frames = rx.try_iter().collect::<Vec<_>>();
+        assert!(matches!(frames.first(), Some(Worker::Connected(1))));
+        assert!(
+            matches!(frames.get(2), Some(Worker::Frame(1, frame)) if frame["type"] == "subscription_ready")
+        );
+        assert!(offer.contains("protocolVersion=2"));
+    }
+
+    #[test]
+    fn schema_mismatch_closes_with_1002_rebuilds_once_and_applies_no_notice() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = endpoint(&listener);
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let (mut socket, _) = accept_subscribed_socket(stream, 2);
+            socket
+                .send(Message::Text(
+                    json!({"type": "change", "schemaVersion": 1, "seq": 1}).to_string(),
+                ))
+                .unwrap();
+
+            let close = socket.read().unwrap();
+            assert!(matches!(
+                close,
+                Message::Close(Some(frame))
+                    if u16::from(frame.code) == 1002
+            ));
+            drop(socket);
+
+            let (mut rebuild, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut rebuild);
+            write_json_response(
+                &mut rebuild,
+                "200 OK",
+                "",
+                r#"{"schemaVersion":1,"items":[]}"#,
+            );
+            request
+        });
+
+        let (tx, rx) = mpsc::channel();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let lifecycle = Arc::new(AtomicU64::new(0));
+        let failure = connect_and_read(
+            &endpoint,
+            "agent:main/example",
+            4,
+            &tx,
+            &stopped,
+            &lifecycle,
+        )
+        .unwrap_err();
+        let rebuild_request = server.join().unwrap();
+
+        assert_eq!(failure.code, "schema_mismatch");
+        assert!(failure.fatal);
+        assert_eq!(failure.close_code, Some(1002));
+        assert!(rebuild_request.starts_with("GET /api/sessions HTTP/1.1"));
+        assert_gateway_headers(&rebuild_request);
+        assert!(!rx.try_iter().any(
+            |message| matches!(message, Worker::Frame(_, frame) if frame["type"] == "change")
+        ));
     }
 
     #[test]
@@ -2559,14 +2951,94 @@ mod tests {
     }
 
     #[test]
-    fn https_discovery_uses_wss_without_changing_the_v1_query() {
+    fn https_discovery_offers_v2_before_the_legacy_v1_query() {
         assert_eq!(
-            websocket_url("https://gateway.example/",),
-            "wss://gateway.example/ws/changes?protocolVersion=1"
+            websocket_url("https://gateway.example/", 2),
+            "wss://gateway.example/ws/changes?protocolVersion=2"
         );
         assert_eq!(
-            websocket_url("http://gateway.example"),
+            websocket_url("http://gateway.example", 1),
             "ws://gateway.example/ws/changes?protocolVersion=1"
         );
+        assert_eq!(FIREHOSE_PROTOCOL_PLAN, [2, 1]);
+    }
+
+    #[test]
+    fn session_reader_accepts_absent_legacy_and_both_closed_capability_forms() {
+        assert!(session_item_capability_compatible(
+            &json!({"sessionKey": "s"})
+        ));
+        assert!(session_item_capability_compatible(&json!({
+            "sessionKey": "s",
+            "capabilities": {"legacy": {"supported": true}}
+        })));
+        assert!(session_item_capability_compatible(&json!({
+            "sessionKey": "s",
+            "capabilities": {
+                "setHarness": {
+                    "supported": false,
+                    "reason": "session is not active"
+                }
+            }
+        })));
+        assert!(session_item_capability_compatible(&json!({
+            "sessionKey": "s",
+            "capabilities": {
+                "setHarness": {
+                    "supported": true,
+                    "options": [
+                        {"title": "claude", "value": "claude", "enabled": false},
+                        {"title": "codex", "value": "codex", "enabled": true}
+                    ]
+                }
+            }
+        })));
+    }
+
+    #[test]
+    fn session_reader_rejects_mixed_or_open_capability_shapes() {
+        for item in [
+            json!({
+                "capabilities": {
+                    "setHarness": {
+                        "supported": false,
+                        "reason": "session is not active",
+                        "options": []
+                    }
+                }
+            }),
+            json!({
+                "capabilities": {
+                    "setHarness": {
+                        "supported": true,
+                        "options": [{"title": "codex", "value": "codex", "enabled": true, "extra": true}]
+                    }
+                }
+            }),
+            json!({
+                "capabilities": {
+                    "setHarness": {
+                        "supported": true,
+                        "options": [{"title": "codex", "value": "other", "enabled": true}]
+                    }
+                }
+            }),
+            json!({
+                "capabilities": {
+                    "setHarness": {
+                        "supported": true,
+                        "options": [{"title": "codex", "value": "codex", "enabled": "true"}]
+                    }
+                }
+            }),
+            json!({
+                "capabilities": {
+                    "setHarness": {"supported": false, "reason": "session is not active"},
+                    "anotherCapability": {"supported": true}
+                }
+            }),
+        ] {
+            assert!(!session_item_capability_compatible(&item), "{item}");
+        }
     }
 }

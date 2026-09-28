@@ -135,10 +135,10 @@ defmodule Tightbeam.Wire.Router do
     conn = Plug.Conn.fetch_query_params(conn)
 
     if Plug.Conn.get_req_header(conn, "upgrade") == ["websocket"] and
-         conn.query_params["protocolVersion"] == "1" do
+         conn.query_params["protocolVersion"] == "2" do
       WebSockAdapter.upgrade(conn, ChangeSocket, deps(conn), max_frame_size: 2 * 1024 * 1024)
     else
-      error(conn, 426, "unsupported_protocol_version")
+      Plug.Conn.send_resp(conn, 426, "")
     end
   end
 

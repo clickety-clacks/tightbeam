@@ -39,11 +39,16 @@ defmodule Tightbeam.FirehoseInventoryAcceptance do
     first_kungfu = StateResources.query_kungfu(fixture.db, "a4-complete")
     assert first_kungfu["rowVersion"] > 0
 
-    ws =
+    {ws, initial_sessions} =
       Fixture.connect(fixture,
         subscription_id: "a4-authoritative",
         filters: %{"classes" => Rebuild.classes() ++ @a4_r8b_classes ++ @a4_delete_classes}
       )
+
+    assert Enum.any?(initial_sessions, fn session ->
+             session["sessionKey"] == main.session_key and
+               is_map(get_in(session, ["capabilities", "setHarness"]))
+           end)
 
     :ok =
       Hub.register(fixture.hub, self(), %{

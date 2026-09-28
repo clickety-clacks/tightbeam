@@ -41,17 +41,16 @@ defmodule Tightbeam.Wire.RouterTest do
     for {path, upgrade} <- [
           {"/ws/changes", false},
           {"/ws/changes?protocolVersion=1", false},
-          {"/ws/changes?protocolVersion=2", true},
+          {"/ws/changes?protocolVersion=1", true},
+          {"/ws/changes?protocolVersion=2", false},
+          {"/ws/changes?protocolVersion=3", true},
           {"/ws/changes?protocolVersion=0", true}
         ] do
       request = conn(:get, path)
       request = if upgrade, do: put_req_header(request, "upgrade", "websocket"), else: request
       response = Router.call(request, Router.init([]))
       assert response.status == 426
-
-      assert JSON.decode!(response.resp_body) == %{
-               "error" => %{"code" => "unsupported_protocol_version"}
-             }
+      assert response.resp_body == ""
     end
   end
 

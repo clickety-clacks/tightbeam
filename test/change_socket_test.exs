@@ -57,7 +57,7 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
       inbound(
         %{
           "type" => "subscribe",
-          "protocolVersion" => 2,
+          "protocolVersion" => 1,
           "subscriptionId" => "wrong-shape",
           "filters" => %{"sessionKey" => "agent:session"}
         },
@@ -65,6 +65,10 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
       )
 
     assert JSON.decode!(version_error)["code"] == "invalid_request"
+
+    assert JSON.decode!(version_error)["message"] ==
+             "protocolVersion must be 2"
+
     assert state.subscriptions == %{}
 
     {:push, {:text, error}, state} =
@@ -84,7 +88,7 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
       inbound(
         %{
           "type" => "subscribe",
-          "protocolVersion" => 1,
+          "protocolVersion" => 2,
           "subscriptionId" => "exact",
           "filters" => %{"sessionKey" => "agent:session", "classes" => ["session."]},
           "clientExtension" => %{"ignored" => true}
@@ -113,7 +117,12 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
       "payload" => %{"sessionKey" => "agent:session", "rowVersion" => 1}
     })
 
-    assert_receive {:firehose_notice, %{"refs" => %{"sessionKey" => "agent:session"}}}
+    assert_receive {:firehose_notice,
+                    %{
+                      "type" => "change",
+                      "schemaVersion" => 2,
+                      "refs" => %{"sessionKey" => "agent:session"}
+                    }}
   end
 
   test "organization bearer has no Firehose read principal", ctx do
