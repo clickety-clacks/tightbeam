@@ -124,11 +124,11 @@ defmodule Tightbeam.QueuedMessageSuppression do
                 WHERE a.id=t.assignmentId AND a.openedBySession=?4
               ))
               OR
-              (t.wakeId IS NOT NULL AND w.creatorSessionKey=?4 AND (
-                w.assignmentId=?3 OR EXISTS (
-                  SELECT 1 FROM queued_message_replacement_requests r
-                  WHERE r.wakeId=t.wakeId AND r.assignmentId=?3
-                )
+              -- A wake's assignment association is not replacement consent; only
+              -- an explicit earlier replacement request makes it a candidate.
+              (t.wakeId IS NOT NULL AND w.creatorSessionKey=?4 AND EXISTS (
+                SELECT 1 FROM queued_message_replacement_requests r
+                WHERE r.wakeId=t.wakeId AND r.assignmentId=?3
               ))
             )
             AND (t.wakeId IS NULL OR w.wakeId IS NOT NULL)

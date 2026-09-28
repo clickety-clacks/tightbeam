@@ -26,6 +26,11 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
          'claude', 'anthropic', 'claude-sonnet-5', 'medium', NULL, 1, 1)
       """)
 
+    {:ok, _} =
+      DB.query(db, "UPDATE sessions SET host=?1 WHERE sessionKey='k1'", [
+        Tightbeam.Placement.local_host_name()
+      ])
+
     %{db: db}
   end
 
@@ -319,6 +324,77 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
 
     assert {:ok, [[2]]} =
              DB.query(db, "SELECT COUNT(*) FROM turns WHERE seq IN (?1,?2)", [old_seq, new_seq])
+  end
+
+  test "replacement keeps a same-sender generic FYI wake in FIFO", %{db: db} do
+    assignment!(db, "asg_fyi")
+    session!(db, "sender")
+
+    :ok =
+      DB.execute(
+        db,
+        "UPDATE assignments SET openedByUser=NULL,openedBySession='sender' WHERE id='asg_fyi'"
+      )
+
+    report_wake =
+      Wakes.schedule(db, %{
+        session_key: "k1",
+        origin: "session:sender",
+        prompt: "keep this FYI",
+        due_at: System.system_time(:millisecond),
+        creator_session_key: "sender",
+        assignment_id: "asg_fyi",
+        class: "fyi",
+        sender_scheduled: true
+      })
+
+    report_seq = deliver_wake!(db, report_wake)
+
+    replacement_wake =
+      Wakes.schedule(db, %{
+        session_key: "k1",
+        origin: "session:sender",
+        prompt: "replacement instruction",
+        due_at: System.system_time(:millisecond),
+        creator_session_key: "sender",
+        replacement_assignment_id: "asg_fyi",
+        class: "fyi"
+      })
+
+    replacement_seq = deliver_wake!(db, replacement_wake)
+
+    assert {:ok, [["queued"]]} =
+             DB.query(db, "SELECT status FROM turns WHERE seq=?1", [report_seq])
+
+    assert {:ok, [["queued"]]} =
+             DB.query(db, "SELECT status FROM turns WHERE seq=?1", [replacement_seq])
+
+    assert {:ok, []} =
+             DB.query(
+               db,
+               "SELECT 1 FROM lifecycle_events WHERE kind='queued_message_suppressed' AND subject=?1",
+               [Integer.to_string(report_seq)]
+             )
+
+    assert {:ok, [[1, "fired"]]} =
+             DB.query(
+               db,
+               "SELECT COUNT(*),MIN(state) FROM wakes WHERE wakeId=?1",
+               [report_wake.wake_id]
+             )
+
+    assert {:ok, []} =
+             DB.query(
+               db,
+               "SELECT 1 FROM queued_message_replacement_requests WHERE wakeId=?1",
+               [report_wake.wake_id]
+             )
+
+    assert {:ok, %{seq: ^report_seq, prompt: "[from session:sender]\n\nkeep this FYI"}} =
+             Ledger.claim_next(db, "k1", "lane")
+
+    assert {:ok, [["queued"]]} =
+             DB.query(db, "SELECT status FROM turns WHERE seq=?1", [replacement_seq])
   end
 
   test "later same-sender wake replaces a dispatch prompt without changing dispatch replay",

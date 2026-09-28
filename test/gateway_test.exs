@@ -6918,11 +6918,14 @@ defmodule Tightbeam.GatewayTest do
     assert guidance =~ "other suppression reason durable context"
     assert guidance =~ "unattributed canceled durable context"
 
-    assert String.index(guidance, "prior durable user context") <
-             String.index(guidance, "prior durable agent context")
+    assert {prior_user_index, _} = :binary.match(guidance, "prior durable user context")
+    assert {prior_agent_index, _} = :binary.match(guidance, "prior durable agent context")
 
-    assert String.index(guidance, "prior durable agent context") <
-             String.index(guidance, "unattributed canceled durable context")
+    assert {unattributed_index, _} =
+             :binary.match(guidance, "unattributed canceled durable context")
+
+    assert prior_user_index < prior_agent_index
+    assert prior_agent_index < unattributed_index
 
     refute guidance =~ "first queued request"
     refute guidance =~ "second queued request"
