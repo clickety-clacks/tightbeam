@@ -8,6 +8,24 @@ each change with what is ahead of it on the tip about to exist and merges in
 arrival order, so the commit that was reviewed is the commit that lands. A
 refused merge request is not permission to land another way.
 
+## Waiting on PR checks
+
+Where a landing watcher supplies `pr.checks-completed`, end your turn with a
+wake on that fact when waiting on an open, unqueued PR's required checks, whether
+as its author or the coordinator who owns its review. Scope it to
+`<owner>/<repo>#<n>` so the result reaches you without holding a turn open or
+losing the news. This route requires that fact producer; a subscription alone
+does not create it:
+
+    tightbeam wake --role <your role> --when-fact pr.checks-completed \
+      --when-scope <owner>/<repo>#<n> --fallback-after 2h \
+      --prompt "Read PR <n>'s current checks and act on their result"
+
+The fact reports that checks finished, on pass or fail; read the latest required
+results for the current head. The coordinator who owns review opens it when they
+are green. Coders do not open their own review. A fallback is a reason to read the
+current state, not evidence that checks passed.
+
 ## Landing your own change
 
 Open the pull request from your branch to the authorized target, with
@@ -34,10 +52,6 @@ its own: merged, removed from the queue, auto-merge disabled, blocked by a
 failed required check, or closed. The fallback means only that nothing arrived
 in time; it is a reason to read, not a finding. Either way, read the pull
 request and act on what is true now.
-
-For an open, unqueued PR, agents waiting on its required checks should subscribe
-to `pr.checks-completed` with scope `<owner>/<repo>#<n>`; the fact wakes them
-when the latest required results all finish, on pass or fail.
 
 Merged: compare the merged head with the commit that was reviewed. If they
 differ, take the difference to your delivery owner before completing. If they
