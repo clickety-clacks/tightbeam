@@ -635,7 +635,7 @@ defmodule Tightbeam.ArtifactsTest do
     {:ok, _} =
       DB.query(
         ctx.db,
-        "UPDATE artifacts SET originHost=NULL, originWorkspace=NULL WHERE artifactId=?1",
+        "UPDATE artifacts SET originHost=NULL, originWorkspace=NULL, createdAt=1 WHERE artifactId=?1",
         [legacy.artifact_id]
       )
 
