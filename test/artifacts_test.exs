@@ -607,6 +607,53 @@ defmodule Tightbeam.ArtifactsTest do
     refute File.exists?(archive_root)
   end
 
+  test "unknown legacy relative origin blocks archive and names the artifact", ctx do
+    base = Path.join(System.tmp_dir!(), "legacy-origin-#{System.unique_integer([:positive])}")
+    workspace = Path.join(base, "workspace")
+    archive_root = Path.join(base, "archive")
+    File.mkdir_p!(Path.join(workspace, "reports"))
+    File.write!(Path.join(workspace, "legacy.md"), "same-spelled current file")
+    File.write!(Path.join(workspace, "reports/current.md"), "stamped current artifact")
+    on_exit(fn -> File.rm_rf!(base) end)
+
+    stamped =
+      record(ctx.db, ctx.child.session_key, %{
+        kind: "report",
+        title: "Current artifact",
+        origin_path: Path.join(workspace, "reports/current.md")
+      })
+
+    legacy =
+      record(ctx.db, ctx.child.session_key, %{
+        kind: "report",
+        title: "Legacy artifact",
+        origin_path: "legacy.md"
+      })
+
+    :ok = DB.execute(ctx.db, "DROP TRIGGER artifacts_origin_immutable")
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE artifacts SET originHost=NULL, originWorkspace=NULL WHERE artifactId=?1",
+        [legacy.artifact_id]
+      )
+
+    error =
+      assert_raise ArgumentError, fn ->
+        Artifacts.archive_session(ctx.db, ctx.child.session_key, workspace, archive_root)
+      end
+
+    assert error.message =~ legacy.artifact_id
+    assert error.message =~ "missing registration host/workspace"
+    assert File.read!(Path.join(workspace, "legacy.md")) == "same-spelled current file"
+    assert File.read!(Path.join(workspace, "reports/current.md")) == "stamped current artifact"
+    assert %{state: "in-workspace", home: nil} = Artifacts.get(ctx.db, legacy.artifact_id)
+    assert %{state: "in-workspace", home: nil} = Artifacts.get(ctx.db, stamped.artifact_id)
+    assert File.dir?(workspace)
+    refute File.exists?(archive_root)
+  end
+
   test "acceptance 7: an origin outside the workspace is external — released, and nothing raises",
        ctx do
     workspace =

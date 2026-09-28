@@ -416,6 +416,11 @@ defmodule Tightbeam.Artifacts do
   service) and was declared by recording it. There is nothing to take into
   custody, so the row is RELEASED rather than archived: the row is the record.
 
+  A legacy unqualified origin that parses as relative or ambiguous and has no
+  registration-time host or workspace remains unknown. It cannot be rebound to
+  the session's current placement; archival refuses before moving the workspace
+  and names the row whose missing provenance blocks it.
+
   Classification comes FIRST, before the workspace is touched at all. An origin
   that names a machine (`host:/absolute/path`, the form the operating manual
   teaches for remote work) is external by inspection — resolving it against a
@@ -455,47 +460,69 @@ defmodule Tightbeam.Artifacts do
     if live == [] do
       remove_workspace(workspace_path)
     else
-      {relative_paths, external, errors} = archive_candidates(live, workspace_path)
+      case archive_candidates(live, workspace_path) do
+        {:unknown_legacy_origin, artifact_id} ->
+          raise_unknown_legacy_origin!(artifact_id)
 
-      # An origin that is inside the workspace and unreadable is not external —
-      # nothing was released, the bytes are simply gone. That still refuses to
-      # invent custody.
-      if map_size(relative_paths) == 0 and errors != [] do
-        raise hd(errors)
+        {relative_paths, external, errors} ->
+          # An origin that is inside the workspace and unreadable is not external —
+          # nothing was released, the bytes are simply gone. That still refuses to
+          # invent custody.
+          if map_size(relative_paths) == 0 and errors != [] do
+            raise hd(errors)
+          end
+
+          archived_path =
+            if map_size(relative_paths) == 0 do
+              remove_workspace(workspace_path)
+              nil
+            else
+              ensure_workspace_available!(workspace_path)
+              archive_workspace!(workspace_path, archive_root, session_key)
+            end
+
+          updated_at = now()
+
+          transitions =
+            Enum.map(relative_paths, fn {id, {relative, custody}} ->
+              {id, "archived", Path.join(archived_path, relative), custody}
+            end) ++ Enum.map(external, &{&1, "released", nil, nil})
+
+          transitions
+          |> Enum.sort_by(&elem(&1, 0))
+          |> Enum.each(fn {id, state, home, custody} ->
+            transition_in_txn(txn, id, "in-workspace", state, home, updated_at, custody)
+          end)
       end
-
-      archived_path =
-        if map_size(relative_paths) == 0 do
-          remove_workspace(workspace_path)
-          nil
-        else
-          ensure_workspace_available!(workspace_path)
-          archive_workspace!(workspace_path, archive_root, session_key)
-        end
-
-      updated_at = now()
-
-      transitions =
-        Enum.map(relative_paths, fn {id, {relative, custody}} ->
-          {id, "archived", Path.join(archived_path, relative), custody}
-        end) ++ Enum.map(external, &{&1, "released", nil, nil})
-
-      transitions
-      |> Enum.sort_by(&elem(&1, 0))
-      |> Enum.each(fn {id, state, home, custody} ->
-        transition_in_txn(txn, id, "in-workspace", state, home, updated_at, custody)
-      end)
     end
 
     :ok
   end
 
   defp archive_candidates(live, workspace_path) do
-    Enum.reduce(live, {%{}, [], []}, fn row, acc ->
-      if names_a_machine?(row.origin_path),
-        do: external(acc, row),
-        else: resolved_candidate(row, workspace_path, acc)
+    Enum.reduce_while(live, {%{}, [], []}, fn row, acc ->
+      cond do
+        unknown_legacy_origin?(row) ->
+          {:halt, {:unknown_legacy_origin, row.artifact_id}}
+
+        names_a_machine?(row.origin_path) ->
+          {:cont, external(acc, row)}
+
+        true ->
+          {:cont, resolved_candidate(row, workspace_path, acc)}
+      end
     end)
+  end
+
+  defp unknown_legacy_origin?(row) do
+    is_nil(row.origin_host) and is_nil(row.origin_workspace) and
+      ArtifactOrigins.parse(row.origin_path) in [:relative, :unknown]
+  end
+
+  defp raise_unknown_legacy_origin!(artifact_id) do
+    raise ArgumentError,
+          "legacy artifact origin has missing registration host/workspace for artifact ID: " <>
+            artifact_id
   end
 
   # `host:/absolute/path` — the origin names a machine, so it is external by
