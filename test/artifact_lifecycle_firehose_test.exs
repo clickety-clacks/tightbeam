@@ -485,7 +485,17 @@ defmodule Tightbeam.ArtifactLifecycleFirehoseTest do
   end
 
   defp history_rows(db) do
-    assert {:ok, rows} = DB.query(db, "SELECT * FROM artifacts ORDER BY artifactId")
+    assert {:ok, rows} =
+             DB.query(
+               db,
+               """
+               SELECT artifactId,kind,title,description,createdBySession,workItemId,
+                 producedByAssignmentId,parentSession,originPath,contentSha256,recordedMessageId,
+                 recordedTurnEvidence,state,home,createdAt,updatedAt
+               FROM artifacts ORDER BY artifactId
+               """
+             )
+
     rows
   end
 
