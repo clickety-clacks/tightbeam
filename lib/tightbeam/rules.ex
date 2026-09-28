@@ -107,7 +107,17 @@ defmodule Tightbeam.Rules do
                  "on_rule_denied",
                  "params"
                ])
-  @binding_tokens ~w(assignment_id work_item_id holder_key holder_role holder_archetype caller_origin delivery_owner_ref)
+  @binding_tokens ~w(
+    assignment_id
+    work_item_id
+    holder_key
+    holder_role
+    holder_archetype
+    assignment_opener_session
+    session_key
+    caller_origin
+    delivery_owner_ref
+  )
   @embedded_fields ~w(subject prompt display)
   @whole_fields ~w(target_role target_session reviews work_item name harness model effort context archetype host after at)
   @verdict_facts ~w(
@@ -161,6 +171,10 @@ defmodule Tightbeam.Rules do
     "work_item.delivery_owner_state" => :string,
     "assignment.review_verdict_count" => :int,
     "assignment.prior_completed_fix_count" => :int,
+    "turn.queued_count" => :int,
+    "turn.oldest_age_ms" => :int,
+    "turn.caller_queued_count" => :int,
+    "session.working_without_open_assignment" => :bool,
     "assign.is_linked_review" => :bool,
     "assign.effect_kind" => :string,
     "assign.declared_files_overlap_open" => :bool,
@@ -648,7 +662,9 @@ defmodule Tightbeam.Rules do
     params = %{
       work_item_id: Map.get(bindings, "workItemId"),
       assignment_id: Map.get(bindings, "assignmentId"),
-      decision_request_id: Map.get(bindings, "decisionRequestId")
+      decision_request_id: Map.get(bindings, "decisionRequestId"),
+      session_key: Map.get(bindings, "sessionKey"),
+      caller_origin: Map.get(bindings, "callerOrigin")
     }
 
     %{
@@ -723,6 +739,8 @@ defmodule Tightbeam.Rules do
       end
 
     work_item_id = (assignment && assignment.work_item_id) || Map.get(call.params, :work_item_id)
+    assignment_opener_session =
+      assignment && assignment_opener_session(db, assignment.id)
 
     delivery_owner_ref =
       case work_item_id && DeliveryResponsibilities.current_owner(db, work_item_id) do
@@ -736,9 +754,28 @@ defmodule Tightbeam.Rules do
       holder_key: assignment && assignment.holder_key,
       holder_role: assignment && assignment[:holder_role],
       holder_archetype: assignment && assignment.holder_archetype,
+      assignment_opener_session: assignment_opener_session,
+      session_key: Map.get(call.params, :session_key),
       caller_origin: call.origin,
       delivery_owner_ref: delivery_owner_ref
     }
+  end
+
+  defp assignment_opener_session(db, assignment_id) do
+    case DB.query(
+           db,
+           "SELECT openedByUser,openedBySession FROM assignments WHERE id=?1",
+           [assignment_id]
+         ) do
+      {:ok, [[_opened_by_user, session_key]]} when is_binary(session_key) ->
+        session_key
+
+      {:ok, [[user_id, nil]]} when is_binary(user_id) ->
+        Org.personal_session_key(user_id)
+
+      _ ->
+        nil
+    end
   end
 
   defp row_commit_principal("session:" <> session_key, _owner) do
@@ -2505,6 +2542,98 @@ defmodule Tightbeam.Rules do
 
         {count, cache}
     end)
+  end
+
+  # These queue snapshots run only for the queued-turn commit that carries the
+  # target session. They are read from the durable queue after the enqueue has
+  # committed; no backlog classification is stored.
+  defp compute_fact("turn.queued_count", db, call, cache) do
+    with "queued_turn" <- row_commit_domain(call),
+         session_key when is_binary(session_key) and session_key != "" <-
+           Map.get(call.params, :session_key) do
+      {:ok, [[count]]} =
+        DB.query(
+          db,
+          "SELECT COUNT(*) FROM turns WHERE sessionKey=?1 AND status='queued'",
+          [session_key]
+        )
+
+      {count, cache}
+    else
+      _ -> {nil, cache}
+    end
+  end
+
+  defp compute_fact("turn.oldest_age_ms", db, call, cache) do
+    with "queued_turn" <- row_commit_domain(call),
+         session_key when is_binary(session_key) and session_key != "" <-
+           Map.get(call.params, :session_key) do
+      {:ok, [[created_at]]} =
+        DB.query(
+          db,
+          "SELECT MIN(createdAt) FROM turns WHERE sessionKey=?1 AND status='queued'",
+          [session_key]
+        )
+
+      age =
+        case created_at do
+          value when is_integer(value) -> max(System.system_time(:millisecond) - value, 0)
+          _ -> nil
+        end
+
+      {age, cache}
+    else
+      _ -> {nil, cache}
+    end
+  end
+
+  defp compute_fact("turn.caller_queued_count", db, call, cache) do
+    with "queued_turn" <- row_commit_domain(call),
+         session_key when is_binary(session_key) and session_key != "" <-
+           Map.get(call.params, :session_key),
+         origin when is_binary(origin) and origin != "" <- Map.get(call.params, :caller_origin),
+         true <- caller_origin?(origin) do
+      {:ok, [[count]]} =
+        DB.query(
+          db,
+          "SELECT COUNT(*) FROM turns WHERE sessionKey=?1 AND origin=?2 AND status='queued'",
+          [session_key, origin]
+        )
+
+      {count, cache}
+    else
+      _ -> {nil, cache}
+    end
+  end
+
+  defp compute_fact("session.working_without_open_assignment", db, call, cache) do
+    with "running_turn" <- row_commit_domain(call),
+         session_key when is_binary(session_key) and session_key != "" <-
+           Map.get(call.params, :session_key) do
+      {:ok, [[count]]} =
+        DB.query(
+          db,
+          "SELECT COUNT(*) FROM assignments WHERE holderKey=?1 AND state='open'",
+          [session_key]
+        )
+
+      {count == 0, cache}
+    else
+      _ -> {nil, cache}
+    end
+  end
+
+  defp caller_origin?(origin),
+    do:
+      String.starts_with?(origin, "agent:") or String.starts_with?(origin, "session:") or
+        String.starts_with?(origin, "user:")
+
+  defp row_commit_domain(call) do
+    if Map.get(call, :edge) == :row_commit do
+      field(Map.get(call, :transition, %{}), :domain)
+    else
+      nil
+    end
   end
 
   defp compute_fact("assign.declared_files_overlap_open", db, call, cache) do

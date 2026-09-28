@@ -11,6 +11,7 @@ defmodule Tightbeam.RulesTest do
     Escalation,
     EventLog,
     Gateway,
+    Ledger,
     Org,
     Roles,
     Rules,
@@ -1836,6 +1837,276 @@ defmodule Tightbeam.RulesTest do
              |> Enum.find(&(&1.kind == "rule_notice" and &1.subject == wake.wake_id))
 
     assert detail =~ ~s("principal":"remedy:assignment-remedy")
+  end
+
+  test "row-commit queue facts are scoped to the queued session and caller", ctx do
+    target = session(ctx.db, "queue-fact-target", "flynn", archetype: "coder")
+    other = session(ctx.db, "queue-fact-other", "flynn", archetype: "coder")
+
+    {:ok, oldest_seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: target.session_key,
+        message_id: "queue-fact-oldest",
+        origin: "agent:queue-spammer",
+        prompt: "oldest queued message"
+      })
+
+    {:ok, newer_seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: target.session_key,
+        message_id: "queue-fact-newer",
+        origin: "agent:queue-spammer",
+        prompt: "newer queued message"
+      })
+
+    {:ok, newest_seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: target.session_key,
+        message_id: "queue-fact-other-caller",
+        origin: "user:flynn",
+        prompt: "different caller"
+      })
+
+    {:ok, _other_seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: other.session_key,
+        message_id: "queue-fact-other-session",
+        origin: "agent:queue-spammer",
+        prompt: "different session"
+      })
+
+    now = System.system_time(:millisecond)
+
+    for {seq, age_ms} <- [{oldest_seq, 120_000}, {newer_seq, 60_000}, {newest_seq, 10_000}] do
+      assert {:ok, _} =
+               DB.query(ctx.db, "UPDATE turns SET createdAt=?1 WHERE seq=?2", [now - age_ms, seq])
+    end
+
+    put_raw(ctx, """
+    [[rule]]
+    name = "queue-snapshot"
+    verb = "post"
+    edges = ["row-commit"]
+    effect = "notice"
+    text = "observe queued-turn facts"
+    deny_when = [
+      { fact = "turn.queued_count", op = "eq", value = 3 },
+      { fact = "turn.oldest_age_ms", op = "gte", value = 90000 },
+      { fact = "turn.caller_queued_count", op = "eq", value = 2 }
+    ]
+
+    [rule.notice]
+    target_session = "{session_key}"
+    prompt = "queued by {caller_origin}"
+    """)
+
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    transition = %{
+      verb: "post",
+      domain: "queued_turn",
+      owner_user_id: "flynn",
+      principal: "session:queue-spammer",
+      row_id: "queue-fact-oldest",
+      bindings: %{
+        sessionKey: target.session_key,
+        callerOrigin: "agent:queue-spammer"
+      }
+    }
+
+    assert {:ok, [{:notice, rule, call, facts}]} =
+             DB.transaction(ctx.db, &Rules.row_commit_effects_in_txn(&1, transition))
+
+    assert {"turn.queued_count", 3} in facts
+    assert {"turn.caller_queued_count", 2} in facts
+    assert {"turn.oldest_age_ms", age_ms} = List.keyfind(facts, "turn.oldest_age_ms", 0)
+    assert age_ms >= 120_000
+
+    assert {:ok, {:ok, resolved}} =
+             DB.transaction(ctx.db, &Rules.resolve_notice_in_txn(&1, rule, call))
+
+    assert resolved.bound_session == target.session_key
+    assert resolved.params.prompt == "queued by agent:queue-spammer"
+  end
+
+  test "row-commit notice bindings resolve the assignment opener session", ctx do
+    opener = session(ctx.db, Org.personal_session_key("flynn"), "flynn", kind: "main")
+    holder = session(ctx.db, "opener-binding-holder", "flynn", archetype: "coder")
+    opened = assignment(ctx, holder.session_key, {:user, "flynn"})
+
+    put_raw(ctx, """
+    [[rule]]
+    name = "assignment-opener-binding"
+    verb = "assign"
+    edges = ["row-commit"]
+    effect = "notice"
+    text = "route the notice to the assignment opener"
+    deny_when = [{ fact = "assignment.state", op = "eq", value = "open" }]
+
+    [rule.notice]
+    target_session = "{assignment_opener_session}"
+    prompt = "assignment {assignment_id} opened for {holder_key}"
+    """)
+
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    transition = %{
+      verb: "assign",
+      domain: "assignment",
+      owner_user_id: "flynn",
+      principal: "user:flynn",
+      bindings: %{assignmentId: opened.id}
+    }
+
+    assert {:ok, [{:notice, rule, call, _facts}]} =
+             DB.transaction(ctx.db, &Rules.row_commit_effects_in_txn(&1, transition))
+
+    assert {:ok, {:ok, resolved}} =
+             DB.transaction(ctx.db, &Rules.resolve_notice_in_txn(&1, rule, call))
+
+    assert resolved.bound_session == opener.session_key
+    assert resolved.params.prompt ==
+             "assignment #{opened.id} opened for #{holder.session_key}"
+  end
+
+  test "row-commit review-round and completed-fix facts use the subject work item", ctx do
+    work_item_id = "wi_row_commit_rounds"
+    prior_holder = session(ctx.db, "round-prior-holder", "flynn", archetype: "coder")
+    current_holder = session(ctx.db, "round-current-holder", "flynn", archetype: "coder")
+    reviewer = session(ctx.db, "round-reviewer", "flynn", archetype: "reviewer-code")
+
+    prior_fix =
+      assignment(ctx, prior_holder.session_key, {:user, "flynn"}, effect_kind: "coordination")
+
+    attach_work_item(ctx, prior_fix.id, work_item_id)
+
+    assert %{assignment: %{state: "closed"}} =
+             Assignments.__handle__(
+               ctx.db,
+               "attest",
+               p3_call("attest", {:session, prior_holder.session_key}, %{
+                 assignment_id: prior_fix.id,
+                 kind: "completion"
+               })
+             )
+
+    current_fix = assignment(ctx, current_holder.session_key, {:user, "flynn"})
+    attach_work_item(ctx, current_fix.id, work_item_id)
+    review = assignment(ctx, reviewer.session_key, {:user, "flynn"}, reviews: current_fix.id)
+    verdict(ctx, reviewer.session_key, review.id, "changes-requested", "first round")
+    verdict(ctx, reviewer.session_key, review.id, "changes-requested", "second round")
+
+    put_raw(ctx, """
+    [[rule]]
+    name = "review-round-count"
+    verb = "attest"
+    edges = ["row-commit"]
+    effect = "notice"
+    text = "observe repeated review rounds"
+    deny_when = [{ fact = "assignment.review_verdict_count", op = "eq", value = 2 }]
+
+    [rule.notice]
+    target_session = "round-reviewer"
+    prompt = "review rounds observed"
+
+    [[rule]]
+    name = "completed-fix-count"
+    verb = "assign"
+    edges = ["row-commit"]
+    effect = "notice"
+    text = "observe prior completed fixes"
+    deny_when = [{ fact = "assignment.prior_completed_fix_count", op = "eq", value = 1 }]
+
+    [rule.notice]
+    target_session = "round-reviewer"
+    prompt = "completed fixes observed"
+    """)
+
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    transitions = [
+      %{
+        verb: "attest",
+        domain: "attest",
+        owner_user_id: "flynn",
+        principal: "session:round-reviewer",
+        bindings: %{assignmentId: review.id, workItemId: work_item_id}
+      },
+      %{
+        verb: "assign",
+        domain: "assignment",
+        owner_user_id: "flynn",
+        principal: "user:flynn",
+        bindings: %{assignmentId: current_fix.id, workItemId: work_item_id}
+      }
+    ]
+
+    assert {:ok, effects} =
+             DB.transaction(ctx.db, &Rules.row_commit_effects_in_txn(&1, transitions))
+
+    assert MapSet.new(effects, fn {:notice, rule, _call, _facts} -> rule.name end) ==
+             MapSet.new(["review-round-count", "completed-fix-count"])
+
+    assert Enum.any?(effects, fn {:notice, rule, _call, facts} ->
+             rule.name == "review-round-count" and {"assignment.review_verdict_count", 2} in facts
+           end)
+
+    assert Enum.any?(effects, fn {:notice, rule, _call, facts} ->
+             rule.name == "completed-fix-count" and
+               {"assignment.prior_completed_fix_count", 1} in facts
+           end)
+  end
+
+  test "working-without-assignment is evaluated only for a running-turn commit", ctx do
+    unassigned = session(ctx.db, "running-unassigned", "flynn", archetype: "coder")
+    assigned = session(ctx.db, "running-assigned", "flynn", archetype: "coder")
+    _open = assignment(ctx, assigned.session_key, {:user, "flynn"})
+
+    put_raw(ctx, """
+    [[rule]]
+    name = "working-without-assignment"
+    verb = "post"
+    edges = ["row-commit"]
+    effect = "notice"
+    text = "observe working session without assignment"
+    deny_when = [{ fact = "session.working_without_open_assignment", op = "eq", value = true }]
+
+    [rule.notice]
+    target_session = "running-unassigned"
+    prompt = "unassigned work observed"
+    """)
+
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    transitions = [
+      %{
+        verb: "post",
+        domain: "running_turn",
+        owner_user_id: "flynn",
+        principal: "session:running-unassigned",
+        bindings: %{sessionKey: unassigned.session_key}
+      },
+      %{
+        verb: "post",
+        domain: "running_turn",
+        owner_user_id: "flynn",
+        principal: "session:running-assigned",
+        bindings: %{sessionKey: assigned.session_key}
+      },
+      %{
+        verb: "post",
+        domain: "queued_turn",
+        owner_user_id: "flynn",
+        principal: "session:running-unassigned",
+        bindings: %{sessionKey: unassigned.session_key}
+      }
+    ]
+
+    assert {:ok, [{:notice, rule, _call, facts}]} =
+             DB.transaction(ctx.db, &Rules.row_commit_effects_in_txn(&1, transitions))
+
+    assert rule.name == "working-without-assignment"
+    assert {"session.working_without_open_assignment", true} in facts
   end
 
   test "row-commit rejects effects that cannot run after the governed write", ctx do
