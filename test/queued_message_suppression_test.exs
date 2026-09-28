@@ -1,12 +1,20 @@
 defmodule Tightbeam.QueuedMessageSuppressionTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{Assignments, DB, Gateway, Ledger, Rules, Wakes}
+  alias Tightbeam.{Assignments, DB, Gateway, Ledger, Roles, Rules, Wakes}
 
   setup do
     db = String.to_atom("queued_message_suppression_#{System.unique_integer([:positive])}")
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = ensure_all_schemas(db)
+
+    register_hosts(db, %{
+      Tightbeam.Placement.local_host_name() => %{
+        ssh: nil,
+        base_dir: Application.fetch_env!(:tightbeam, :base_dir),
+        cli_bin: nil
+      }
+    })
 
     :ok =
       DB.execute(db, """
@@ -17,6 +25,11 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
         ('k1', 'K1', 'flynn', 'user:flynn', 'default', 'default',
          'claude', 'anthropic', 'claude-sonnet-5', 'medium', NULL, 1, 1)
       """)
+
+    {:ok, _} =
+      DB.query(db, "UPDATE sessions SET host=?1 WHERE sessionKey='k1'", [
+        Tightbeam.Placement.local_host_name()
+      ])
 
     %{db: db}
   end
@@ -206,7 +219,7 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
         class: "fyi"
       })
 
-    assert replacement_wake.delivery_rule == "batcher-inhibited"
+    assert replacement_wake.delivery_rule == "batcher-inhibited r1"
 
     assert {:ok, [["asg_replace"]]} =
              DB.query(
@@ -272,6 +285,7 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
   test "replacement delivery claims next and keeps the source turn durable", %{db: db} do
     assignment!(db, "asg_next")
     session!(db, "sender")
+
     :ok =
       DB.execute(
         db,
@@ -302,16 +316,191 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
 
     new_seq = deliver_wake!(db, wake)
 
-    assert {:ok, %{seq: ^new_seq, prompt: "new prompt"}} = Ledger.claim_next(db, "k1", "lane")
+    assert {:ok, %{seq: ^new_seq, prompt: "[from session:sender]\n\nnew prompt"}} =
+             Ledger.claim_next(db, "k1", "lane")
+
     assert {:ok, [["canceled", "queued-message-suppressed: sender_requested_replacement"]]} =
              DB.query(db, "SELECT status,error FROM turns WHERE seq=?1", [old_seq])
+
     assert {:ok, [[2]]} =
              DB.query(db, "SELECT COUNT(*) FROM turns WHERE seq IN (?1,?2)", [old_seq, new_seq])
+  end
+
+  test "replacement keeps a same-sender generic FYI wake in FIFO", %{db: db} do
+    assignment!(db, "asg_fyi")
+    session!(db, "sender")
+
+    :ok =
+      DB.execute(
+        db,
+        "UPDATE assignments SET openedByUser=NULL,openedBySession='sender' WHERE id='asg_fyi'"
+      )
+
+    report_wake =
+      Wakes.schedule(db, %{
+        session_key: "k1",
+        origin: "session:sender",
+        prompt: "keep this FYI",
+        due_at: System.system_time(:millisecond),
+        creator_session_key: "sender",
+        assignment_id: "asg_fyi",
+        class: "fyi",
+        sender_scheduled: true
+      })
+
+    report_seq = deliver_wake!(db, report_wake)
+
+    replacement_wake =
+      Wakes.schedule(db, %{
+        session_key: "k1",
+        origin: "session:sender",
+        prompt: "replacement instruction",
+        due_at: System.system_time(:millisecond),
+        creator_session_key: "sender",
+        replacement_assignment_id: "asg_fyi",
+        class: "fyi"
+      })
+
+    replacement_seq = deliver_wake!(db, replacement_wake)
+
+    assert {:ok, [["queued"]]} =
+             DB.query(db, "SELECT status FROM turns WHERE seq=?1", [report_seq])
+
+    assert {:ok, [["queued"]]} =
+             DB.query(db, "SELECT status FROM turns WHERE seq=?1", [replacement_seq])
+
+    assert {:ok, []} =
+             DB.query(
+               db,
+               "SELECT 1 FROM lifecycle_events WHERE kind='queued_message_suppressed' AND subject=?1",
+               [Integer.to_string(report_seq)]
+             )
+
+    # deliver_wake!/2 appends directly; the scheduler fires prompt wakes before delivery.
+    assert {:ok, [[1, "pending"]]} =
+             DB.query(
+               db,
+               "SELECT COUNT(*),MIN(state) FROM wakes WHERE wakeId=?1",
+               [report_wake.wake_id]
+             )
+
+    assert {:ok, []} =
+             DB.query(
+               db,
+               "SELECT 1 FROM queued_message_replacement_requests WHERE wakeId=?1",
+               [report_wake.wake_id]
+             )
+
+    assert {:ok, %{seq: ^report_seq, prompt: "[from session:sender]\n\nkeep this FYI"}} =
+             Ledger.claim_next(db, "k1", "lane")
+
+    assert {:ok, [["queued"]]} =
+             DB.query(db, "SELECT status FROM turns WHERE seq=?1", [replacement_seq])
+  end
+
+  test "later same-sender wake replaces a dispatch prompt without changing dispatch replay",
+       %{db: db} do
+    session!(db, "sender")
+    assert %{name: "sender"} = Roles.create!(db, "sender", "flynn", "sender")
+
+    dispatch = %{
+      verb: "dispatch",
+      origin: "agent:sender",
+      principal: {:session, "sender"},
+      session_key: "k1",
+      params: %{
+        subject: "initial assignment prompt",
+        brief: "the initial instruction",
+        idempotency_key: "dispatch-initial-once",
+        work_item_id: nil
+      },
+      target_role: nil,
+      role_fallback: false,
+      supervision_interval_ms: 1_000
+    }
+
+    assignment = Assignments.__handle__(db, "dispatch", dispatch)
+    assignment_id = assignment.id
+    assert assignment.openedBySession == "sender"
+    assert assignment.holderKey == "k1"
+
+    assert {:ok, [[source_seq, "queued", "agent:sender", source_prompt]]} =
+             DB.query(
+               db,
+               "SELECT seq,status,origin,prompt FROM turns WHERE sessionKey=?1 AND assignmentId=?2",
+               ["k1", assignment_id]
+             )
+
+    assert source_prompt =~ assignment_id
+    assert source_prompt =~ "the initial instruction"
+
+    assert %{id: replayed_id} = Assignments.__handle__(db, "dispatch", dispatch)
+    assert replayed_id == assignment_id
+
+    assert {:ok, [[1]]} =
+             DB.query(db, "SELECT COUNT(*) FROM turns WHERE sessionKey=?1", ["k1"])
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               db,
+               "SELECT COUNT(*) FROM assignments WHERE subject=?1",
+               ["initial assignment prompt"]
+             )
+
+    replacement_wake =
+      Wakes.schedule(db, %{
+        session_key: "k1",
+        origin: "agent:sender",
+        prompt: "the later replacement instruction",
+        due_at: System.system_time(:millisecond),
+        creator_session_key: "sender",
+        replacement_assignment_id: assignment.id,
+        class: "fyi"
+      })
+
+    replacement_seq = deliver_wake!(db, replacement_wake)
+
+    assert {:ok, [["k1", "agent:sender", "sender"]]} =
+             DB.query(
+               db,
+               "SELECT sessionKey,origin,creatorSessionKey FROM wakes WHERE wakeId=?1",
+               [replacement_wake.wake_id]
+             )
+
+    assert {:ok, [[^assignment_id]]} =
+             DB.query(
+               db,
+               "SELECT assignmentId FROM queued_message_replacement_requests WHERE wakeId=?1",
+               [replacement_wake.wake_id]
+             )
+
+    assert {:ok, [["canceled", "queued-message-suppressed: sender_requested_replacement"]]} =
+             DB.query(db, "SELECT status,error FROM turns WHERE seq=?1", [source_seq])
+
+    assert {:ok, [["queued", "k1", "agent:sender"]]} =
+             DB.query(
+               db,
+               "SELECT status,sessionKey,origin FROM turns WHERE seq=?1",
+               [replacement_seq]
+             )
+
+    assert %{id: replayed_after_replacement} = Assignments.__handle__(db, "dispatch", dispatch)
+    assert replayed_after_replacement == assignment_id
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               db,
+               "SELECT COUNT(*) FROM assignments WHERE subject=?1 AND state='open'",
+               ["initial assignment prompt"]
+             )
+
+    assert {:ok, [[2]]} = DB.query(db, "SELECT COUNT(*) FROM turns WHERE sessionKey=?1", ["k1"])
   end
 
   test "replacement leaves a turn that became running untouched", %{db: db} do
     assignment!(db, "asg_running")
     session!(db, "sender")
+
     :ok =
       DB.execute(
         db,
@@ -327,8 +516,8 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
         assignment_id: "asg_running"
       })
 
-    :ok =
-      DB.execute(db, "UPDATE turns SET status='running',startedAt=2 WHERE seq=?1", [running_seq])
+    {:ok, _} =
+      DB.query(db, "UPDATE turns SET status='running',startedAt=2 WHERE seq=?1", [running_seq])
 
     wake =
       Wakes.schedule(db, %{
@@ -344,6 +533,7 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
 
     assert {:ok, [["running"]]} =
              DB.query(db, "SELECT status FROM turns WHERE seq=?1", [running_seq])
+
     assert {:ok, []} =
              DB.query(
                db,

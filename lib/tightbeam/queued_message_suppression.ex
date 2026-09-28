@@ -96,6 +96,7 @@ defmodule Tightbeam.QueuedMessageSuppression do
 
     session_key = Map.get(attrs, :session_key)
     origin = Map.get(attrs, :origin)
+
     sender_session_key =
       replacement_sender_session_in_txn(txn, assignment_id, Map.get(attrs, :wake_id))
 
@@ -123,11 +124,11 @@ defmodule Tightbeam.QueuedMessageSuppression do
                 WHERE a.id=t.assignmentId AND a.openedBySession=?4
               ))
               OR
-              (t.wakeId IS NOT NULL AND w.creatorSessionKey=?4 AND (
-                w.assignmentId=?3 OR EXISTS (
-                  SELECT 1 FROM queued_message_replacement_requests r
-                  WHERE r.wakeId=t.wakeId AND r.assignmentId=?3
-                )
+              -- A wake's assignment association is not replacement consent; only
+              -- an explicit earlier replacement request makes it a candidate.
+              (t.wakeId IS NOT NULL AND w.creatorSessionKey=?4 AND EXISTS (
+                SELECT 1 FROM queued_message_replacement_requests r
+                WHERE r.wakeId=t.wakeId AND r.assignmentId=?3
               ))
             )
             AND (t.wakeId IS NULL OR w.wakeId IS NOT NULL)
@@ -246,7 +247,8 @@ defmodule Tightbeam.QueuedMessageSuppression do
       when target_gate != 0 ->
         true
 
-      _ -> false
+      _ ->
+        false
     end
   end
 
