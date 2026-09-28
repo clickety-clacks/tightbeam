@@ -19,8 +19,13 @@ card wins.
   a capability exists or is missing. Two stale conclusions were already overturned by
   it (per-session unload EXISTS as session/close; hook semantics).
 - **Harness CLIs auto-update under us** (codex 0.144.5→0.144.6→0.145.0 in two days).
-  Pin binaries explicitly (CODEX_PATH); re-probe behavior per version; never trust
-  yesterday's diagnosis against today's binary.
+  Prefer the host-installed harness CLI when it is present and Tightbeam can run it;
+  use the bundled SDK CLI when the host copy is absent or unusable. `CODEX_PATH` and
+  `CLAUDE_CODE_EXECUTABLE` are deliberate explicit pins and remain effective when
+  set, even when they point to a host-installed binary. Current Codex and Claude ACP
+  adapters still choose their bundled SDK CLI by default; this guidance does not
+  claim that automatic host-first selection is implemented. Re-probe behavior against
+  the actual selected CLI version.
 - **codex hooks are TRUST-GATED, not inert, under `codex app-server`** (established
   2026-07-23, reversing the earlier "exec-only" conclusion — that was a bundled-binary
   + untrusted-state artifact at 0.144.x). Hooks run through the same core engine in

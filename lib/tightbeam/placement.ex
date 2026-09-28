@@ -1545,7 +1545,18 @@ defmodule Tightbeam.Placement do
       process_helper: Path.join(host_config[:cli_bin] || config.cli_bin, "tightbeam"),
       on_auth_event: auth_event_handler(config, host, module),
       on_subagent_event: subagent_event_handler(config, host, module),
-      env: []
+      env: [],
+      harness_binary_capture:
+        Tightbeam.HarnessBinaryProvenance.capture(
+          module,
+          host,
+          host_config.base_dir,
+          path,
+          overlay_env,
+          process_env:
+            if(is_nil(host_config.ssh), do: binary_selection_process_env(module), else: %{}),
+          without_override_evidence?: not is_nil(host_config.ssh)
+        )
     ]
 
     base =
@@ -1562,7 +1573,27 @@ defmodule Tightbeam.Placement do
       end
 
     with {:ok, plan} <- Harness.prepare_launch(module, target, home, launch_opts) do
+      binary_capture =
+        Tightbeam.HarnessBinaryProvenance.capture_launch_observation(
+          host_config,
+          Keyword.fetch!(base, :harness_binary_capture),
+          target: target,
+          launch_plan: plan
+        )
+
+      base = Keyword.put(base, :harness_binary_capture, binary_capture)
       {:ok, Keyword.merge(base, plan)}
+    end
+  end
+
+  defp binary_selection_process_env(module) do
+    if function_exported?(module, :binary_provenance_override_env, 0) do
+      case module.binary_provenance_override_env() do
+        name when is_binary(name) -> %{name => System.get_env(name)}
+        _ -> %{}
+      end
+    else
+      %{}
     end
   end
 
@@ -1580,6 +1611,9 @@ defmodule Tightbeam.Placement do
     |> Map.fetch!(host)
     |> then(&adapter_path(config, &1))
   end
+
+  @doc false
+  def toolchain_path_preview_for(config, host_config), do: adapter_path(config, host_config)
 
   defp adapter_path(config, %{ssh: ssh} = host_config) do
     case Map.fetch(host_config, :toolchain_dirs) do

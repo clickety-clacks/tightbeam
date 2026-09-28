@@ -4,6 +4,7 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
   import Tightbeam.TestCase, only: [catalog_reply: 1]
 
   alias Mix.Tasks.Tightbeam.Doctor
+  alias Tightbeam.HarnessBinaryProvenance
 
   setup do
     base_dir =
@@ -45,6 +46,392 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
   test "all bootstrap checks pass with hermetic inputs", ctx do
     assert {0, %{ready: true, checks: checks}} = Doctor.evaluate(ctx.catalog, ctx.inputs)
     assert Enum.all?(checks, & &1.ok)
+  end
+
+  test "capture records adapter selector metadata without using PATH as provenance",
+       _ctx do
+    pi =
+      HarnessBinaryProvenance.capture(:pi, "eezo", "/eezo", "/usr/local/bin:/usr/bin", [],
+        process_env: %{}
+      )
+
+    codex =
+      HarnessBinaryProvenance.capture(
+        :codex,
+        "eezo",
+        "/eezo",
+        "/usr/local/bin:/usr/bin",
+        [{"ANTHROPIC_API_KEY", "SECRETXYZ"}, {"CODEX_PATH", "/opt/pinned/codex"}],
+        process_env: %{}
+      )
+
+    bundled =
+      HarnessBinaryProvenance.capture(:claude, "eezo", "/eezo", "/usr/local/bin:/usr/bin", [],
+        process_env: %{}
+      )
+
+    remote_unknown =
+      HarnessBinaryProvenance.capture(:codex, "racter", "/racter", "$PATH", [],
+        process_env: %{},
+        without_override_evidence?: true
+      )
+
+    remote_system =
+      HarnessBinaryProvenance.capture(:pi, "racter", "/racter", "$PATH", [],
+        process_env: %{},
+        without_override_evidence?: true
+      )
+
+    remote_unsupported =
+      HarnessBinaryProvenance.capture(:fixture, "racter", "/racter", "$PATH", [],
+        process_env: %{},
+        without_override_evidence?: true
+      )
+
+    assert pi["selection_rule"] == "system"
+    assert codex["selection_rule"] == "pinned_override"
+    assert codex["override_path"] == "/opt/pinned/codex"
+    assert bundled["selection_rule"] == "bundled_fallback"
+    assert remote_unknown["selection_rule"] == "unknown"
+    assert remote_system["selection_rule"] == "system"
+    assert remote_unsupported["selection_rule"] == "unsupported"
+    refute JSON.encode!(codex) =~ "SECRETXYZ"
+
+    relative_pin =
+      HarnessBinaryProvenance.capture(:codex, "eezo", "/eezo", "/usr/bin", [],
+        process_env: %{"CODEX_PATH" => "bin/codex"}
+      )
+
+    assert %{"status" => "unavailable", "source" => "pinned_override"} =
+             HarnessBinaryProvenance.probe_capture(%{ssh: nil}, relative_pin)
+  end
+
+  test "an unobserved system selector stays unknown and configured pins beat PATH" do
+    hosts = %{
+      "eezo" => %{ssh: nil, base_dir: "/eezo", cli_bin: "/eezo/bin"}
+    }
+
+    probe = fn _host_config, capture ->
+      if capture["harness"] == "codex" do
+        assert capture["selection_rule"] == "pinned_override"
+
+        %{
+          "status" => "observed",
+          "source" => capture["selection_rule"],
+          "path" => capture["override_path"],
+          "version" => "codex 1.0"
+        }
+      else
+        HarnessBinaryProvenance.probe_capture(%{ssh: nil}, capture)
+      end
+    end
+
+    assert {:ok, report} =
+             HarnessBinaryProvenance.report_for_inputs(
+               "/eezo",
+               hosts,
+               %{{"eezo", "codex"} => [{"CODEX_PATH", "/opt/pinned/codex"}]},
+               [],
+               harnesses: [Tightbeam.Harness.Pi, Tightbeam.Harness.Codex],
+               process_env: %{},
+               probe: probe
+             )
+
+    pi = Enum.find(report["rows"], &(&1["harness"] == "pi"))
+    codex = Enum.find(report["rows"], &(&1["harness"] == "codex"))
+
+    assert pi["next_launch"]["status"] == "unknown"
+    assert pi["next_launch"]["source"] == "unknown"
+    assert codex["next_launch"]["source"] == "pinned_override"
+    assert codex["next_launch"]["path"] == "/opt/pinned/codex"
+
+    human = HarnessBinaryProvenance.format_human(report)
+    assert human =~ "harness binary eezo/pi next launch: unknown (unknown)"
+    assert human =~ "/opt/pinned/codex; codex 1.0"
+  end
+
+  test "system provenance needs an exact prepared launch executable, not PATH discovery" do
+    temp_dir =
+      Path.join(System.tmp_dir!(), "tightbeam-system-cli-#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(temp_dir)
+    on_exit(fn -> File.rm_rf!(temp_dir) end)
+
+    path_copy = Path.join(temp_dir, "pi")
+    File.write!(path_copy, "#!/bin/sh\nprintf 'pi 2.4.0\\n'\n")
+    File.chmod!(path_copy, 0o755)
+
+    pi_capture =
+      HarnessBinaryProvenance.capture(:pi, "eezo", temp_dir, temp_dir <> ":/usr/bin:/bin", [])
+
+    assert %{"status" => "unknown", "source" => "unknown"} =
+             HarnessBinaryProvenance.observe_selection(%{ssh: nil}, pi_capture)
+
+    selected = Path.join(temp_dir, "cursor-agent")
+    File.write!(selected, "#!/bin/sh\nprintf 'cursor-agent 2.4.0\\n'\n")
+    File.chmod!(selected, 0o755)
+
+    cursor_capture =
+      HarnessBinaryProvenance.capture(:cursor, "eezo", temp_dir, temp_dir <> ":/usr/bin:/bin", [])
+
+    observed =
+      HarnessBinaryProvenance.capture_launch_observation(
+        %{ssh: nil},
+        cursor_capture,
+        launch_plan: [cmd: [selected, "acp"]]
+      )["launch_observation"]
+
+    assert %{
+             "status" => "observed",
+             "source" => "system",
+             "path" => ^selected,
+             "version" => "cursor-agent 2.4.0"
+           } = observed
+
+    assert %{"status" => "unknown", "source" => "unknown"} =
+             HarnessBinaryProvenance.capture_launch_observation(
+               %{ssh: nil},
+               cursor_capture,
+               launch_plan: [cmd: ["cursor-agent", "acp"]]
+             )["launch_observation"]
+  end
+
+  test "missing and unprobeable explicit selections keep their source and status" do
+    temp_dir =
+      Path.join(System.tmp_dir!(), "tightbeam-provenance-#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(temp_dir)
+    on_exit(fn -> File.rm_rf!(temp_dir) end)
+
+    broken = Path.join(temp_dir, "codex-broken")
+    File.write!(broken, "#!/bin/sh\necho version-unavailable >&2\nexit 9\n")
+    File.chmod!(broken, 0o755)
+
+    unprobeable =
+      HarnessBinaryProvenance.capture(:codex, "eezo", temp_dir, "/usr/bin:/bin", [],
+        process_env: %{"CODEX_PATH" => broken}
+      )
+
+    missing =
+      HarnessBinaryProvenance.capture(:codex, "eezo", temp_dir, "/usr/bin:/bin", [],
+        process_env: %{"CODEX_PATH" => Path.join(temp_dir, "absent-codex")}
+      )
+
+    assert %{
+             "status" => "unprobeable",
+             "source" => "pinned_override",
+             "path" => ^broken
+           } = HarnessBinaryProvenance.probe_capture(%{ssh: nil}, unprobeable)
+
+    assert %{
+             "status" => "missing",
+             "source" => "pinned_override"
+           } = HarnessBinaryProvenance.probe_capture(%{ssh: nil}, missing)
+  end
+
+  test "binary provenance separates the captured launch from next launch and emits fallback warning" do
+    hosts = %{"eezo" => %{ssh: nil, base_dir: "/eezo", cli_bin: "/eezo/bin"}}
+
+    old_launch_capture =
+      HarnessBinaryProvenance.capture(
+        :codex,
+        "eezo",
+        "/eezo",
+        "/system/bin:/usr/bin",
+        [{"CODEX_PATH", "/opt/old/codex"}]
+      )
+
+    old_launch =
+      HarnessBinaryProvenance.capture_launch_observation(
+        %{ssh: nil},
+        old_launch_capture,
+        probe: fn _host, capture ->
+          %{
+            "status" => "observed",
+            "source" => capture["selection_rule"],
+            "path" => capture["override_path"],
+            "version" => "codex 1.0"
+          }
+        end
+      )
+
+    probe = fn _host, capture ->
+      case capture["selection_rule"] do
+        "pinned_override" ->
+          %{
+            "status" => "observed",
+            "source" => capture["selection_rule"],
+            "path" => capture["override_path"],
+            "version" => "codex 1.0"
+          }
+
+        "bundled_fallback" ->
+          %{
+            "status" => "observed",
+            "source" => capture["selection_rule"],
+            "path" => "/eezo/adapters/node_modules/@openai/codex/bin/codex.js",
+            "version" => "codex 2.0"
+          }
+
+        _ ->
+          %{"status" => "missing", "source" => capture["selection_rule"]}
+      end
+    end
+
+    assert {:ok, report} =
+             HarnessBinaryProvenance.report_for_inputs(
+               "/eezo",
+               hosts,
+               %{},
+               [
+                 %{
+                   "host" => "eezo",
+                   "harness" => "codex",
+                   "generation" => 4,
+                   "ready" => true,
+                   "capture" => old_launch
+                 }
+               ],
+               harnesses: [Tightbeam.Harness.Codex],
+               process_env: %{},
+               probe: probe
+             )
+
+    [row] = report["rows"]
+    [running] = row["running"]
+    assert running["source"] == "pinned_override"
+    assert running["path"] == "/opt/old/codex"
+    assert row["next_launch"]["source"] == "bundled_fallback"
+    assert row["next_launch"]["path"] == "/eezo/adapters/node_modules/@openai/codex/bin/codex.js"
+    assert "bundled_fallback_selected" in row["warnings"]
+  end
+
+  test "remote next-launch selection uses only the named remote override evidence" do
+    hosts = %{
+      "racter" => %{
+        ssh: "clu@racter",
+        base_dir: "/racter/tightbeam",
+        cli_bin: "/racter/tightbeam/bin"
+      }
+    }
+
+    probe = fn _host, capture ->
+      %{
+        "status" => "observed",
+        "source" => capture["selection_rule"],
+        "path" => capture["override_path"],
+        "version" => "codex 2.0"
+      }
+    end
+
+    assert {:ok, report} =
+             HarnessBinaryProvenance.report_for_inputs(
+               "/gateway",
+               hosts,
+               %{},
+               [],
+               harnesses: [Tightbeam.Harness.Codex],
+               process_env: %{},
+               remote_runner: fn "ssh", _args, _opts -> {"/opt/remote/codex", 0} end,
+               probe: probe
+             )
+
+    assert [
+             %{
+               "next_launch" => %{
+                 "source" => "pinned_override",
+                 "path" => "/opt/remote/codex"
+               }
+             }
+           ] =
+             report["rows"]
+  end
+
+  test "same-harness versions warn only when observed versions differ" do
+    row = fn host, version ->
+      %{
+        "host" => host,
+        "harness" => "codex",
+        "running" => [%{"status" => "observed", "version" => version}],
+        "next_launch" => %{"status" => "unknown", "source" => "unknown"}
+      }
+    end
+
+    assert [first, second] =
+             HarnessBinaryProvenance.project([row.("eezo", "1.0"), row.("racter", "2.0")])
+
+    assert "observed_version_differs_across_hosts" in first["warnings"]
+    assert "observed_version_differs_across_hosts" in second["warnings"]
+
+    next_row = fn host, version ->
+      %{
+        "host" => host,
+        "harness" => "codex",
+        "running" => [],
+        "next_launch" => %{"status" => "observed", "version" => version}
+      }
+    end
+
+    assert [first, second] =
+             HarnessBinaryProvenance.project([
+               next_row.("eezo", "1.0"),
+               next_row.("racter", "2.0")
+             ])
+
+    assert "observed_version_differs_across_hosts" in first["warnings"]
+    assert "observed_version_differs_across_hosts" in second["warnings"]
+
+    assert [first, second] =
+             HarnessBinaryProvenance.project([row.("eezo", "1.0"), row.("racter", "1.0")])
+
+    refute "observed_version_differs_across_hosts" in first["warnings"]
+    refute "observed_version_differs_across_hosts" in second["warnings"]
+  end
+
+  test "unreachable and unsupported selections stay unknown instead of being inferred" do
+    hosts = %{
+      "racter" => %{
+        ssh: "clu@racter",
+        base_dir: "/racter/tightbeam",
+        cli_bin: "/racter/tightbeam/bin"
+      }
+    }
+
+    stale_capture =
+      HarnessBinaryProvenance.capture(:codex, "racter", "/racter/tightbeam", "$PATH", [],
+        process_env: %{},
+        without_override_evidence?: true
+      )
+
+    assert {:ok, report} =
+             HarnessBinaryProvenance.report_for_inputs(
+               "/gateway",
+               hosts,
+               %{},
+               [
+                 %{
+                   "host" => "racter",
+                   "harness" => "codex",
+                   "generation" => 7,
+                   "ready" => true,
+                   "capture" => stale_capture
+                 }
+               ],
+               harnesses: [Tightbeam.Harness.Codex, Tightbeam.Harness.Fixture],
+               process_env: %{},
+               without_override_evidence?: true,
+               remote_runner: fn _command, _args, _opts -> {"", 255} end,
+               probe: &HarnessBinaryProvenance.probe_capture/2
+             )
+
+    assert %{"status" => "unknown", "source" => "unknown"} =
+             report["rows"] |> Enum.at(0) |> Map.fetch!("next_launch")
+
+    assert %{"status" => "unsupported", "source" => "unsupported"} =
+             report["rows"] |> Enum.at(1) |> Map.fetch!("next_launch")
+
+    assert %{"status" => "stale", "source" => "unknown"} =
+             report["rows"] |> Enum.at(0) |> Map.fetch!("running") |> Enum.at(0)
   end
 
   # The ENTRY decides whether an effort is required. Rejecting `nil` out of hand
@@ -473,6 +860,87 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
     refute check.ok
     assert check.level == :warn
     assert check.detail =~ "terminal credential incident tcf_fixture"
+  end
+
+  test "human and JSON doctor output render the same binary provenance rows", ctx do
+    provenance = %{
+      "schema_version" => 1,
+      "rows" => [
+        %{
+          "host" => "eezo",
+          "harness" => "codex",
+          "adapter" => %{"package" => "codex-acp", "version" => "1.12.0"},
+          "running" => [
+            %{
+              "status" => "observed",
+              "source" => "bundled_fallback",
+              "path" => "/eezo/adapters/codex.js",
+              "version" => "codex 0.145.0",
+              "generation" => 4,
+              "adapter" => %{"package" => "codex-acp", "version" => "1.12.0"}
+            }
+          ],
+          "next_launch" => %{
+            "status" => "observed",
+            "source" => "pinned_override",
+            "path" => "/usr/local/bin/codex",
+            "version" => "codex 0.145.1"
+          },
+          "warnings" => ["bundled_fallback_selected"]
+        }
+      ]
+    }
+
+    {0, report} =
+      Doctor.evaluate(ctx.catalog, put(ctx.inputs, :harness_binary_provenance, provenance))
+
+    human = Doctor.format(report, :human)
+    assert human =~ "harness adapter eezo/codex next launch: codex-acp 1.12.0"
+    assert human =~ "harness adapter eezo/codex running generation 4: codex-acp 1.12.0"
+    assert human =~ "harness binary eezo/codex running: observed (bundled_fallback)"
+    assert human =~ "/eezo/adapters/codex.js; codex 0.145.0"
+    assert human =~ "warning: bundled_fallback_selected"
+
+    assert {:ok, decoded} = report |> Doctor.format(:json) |> JSON.decode()
+    assert decoded["harness_binary_provenance"] == provenance
+  end
+
+  test "gateway fetch failure survives local fallback with an explicit running boundary", ctx do
+    local_report = %{
+      "schema_version" => 1,
+      "rows" => [
+        %{
+          "host" => "eezo",
+          "harness" => "codex",
+          "adapter" => %{"package" => "codex-acp", "version" => "1.12.0"},
+          "running" => [],
+          "next_launch" => %{"status" => "unknown", "source" => "unknown"},
+          "warnings" => []
+        }
+      ]
+    }
+
+    provenance =
+      HarnessBinaryProvenance.with_gateway_fetch_failure(local_report, %{
+        "status" => "unavailable",
+        "reason" => "gateway returned HTTP 503"
+      })
+
+    {0, report} =
+      Doctor.evaluate(ctx.catalog, put(ctx.inputs, :harness_binary_provenance, provenance))
+
+    human = Doctor.format(report, :human)
+
+    assert human =~
+             "gateway running-state fetch unavailable: gateway returned HTTP 503 (local fallback is not a complete gateway snapshot; empty running rows do not prove no adapter is running)"
+
+    assert human =~ "harness binary eezo/codex running: unavailable (gateway report fetch failed)"
+    refute human =~ "harness binary eezo/codex running: not observed"
+
+    assert {:ok, decoded} = report |> Doctor.format(:json) |> JSON.decode()
+
+    assert decoded["harness_binary_provenance"]["gateway_report_fetch"] ==
+             provenance["gateway_report_fetch"]
   end
 
   # AC5, doctor's half: an installed-but-unrunnable harness (on PATH but fails to

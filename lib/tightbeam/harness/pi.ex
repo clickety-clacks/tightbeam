@@ -414,6 +414,9 @@ defmodule Tightbeam.Harness.Pi do
     Support.bounded_probe(find.(cli_binary()), target)
   end
 
+  @doc false
+  def binary_provenance_default_source, do: "system"
+
   @impl true
   def classify_auth_event(_event), do: :unknown
 

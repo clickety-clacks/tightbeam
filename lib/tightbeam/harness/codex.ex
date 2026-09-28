@@ -614,6 +614,22 @@ defmodule Tightbeam.Harness.Codex do
     Support.bounded_probe(binary, target)
   end
 
+  @doc false
+  def binary_provenance_default_source, do: "bundled_fallback"
+
+  @doc false
+  def binary_provenance_override_env, do: "CODEX_PATH"
+
+  @doc false
+  def binary_provenance_bundle_probe_script do
+    "const {createRequire}=require('node:module');" <>
+      "const r=createRequire(process.argv[1]+'/package.json');" <>
+      "const entry=r.resolve(" <>
+      JSON.encode!(install_package()) <>
+      ");" <>
+      "process.stdout.write(createRequire(entry).resolve('@openai/codex/bin/codex.js'));"
+  end
+
   @impl true
   def classify_auth_event(%{"authStatus" => %{"kind" => "none"}}), do: :terminal
 

@@ -1269,6 +1269,146 @@ fn human(report: &Report) -> String {
     lines.join("\n")
 }
 
+fn human_with_harness_binary_provenance(report: &Report, provenance: &Value) -> String {
+    let mut lines = vec![human(report), "harness binary provenance:".to_owned()];
+    lines.extend(harness_binary_provenance_lines(provenance));
+    lines.join("\n")
+}
+
+fn harness_binary_provenance_lines(provenance: &Value) -> Vec<String> {
+    if let Some(status) = provenance.get("status").and_then(Value::as_str) {
+        let reason = provenance
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("gateway report unavailable");
+        return vec![format!("  {status}: {reason}")];
+    }
+
+    let Some(rows) = provenance.get("rows").and_then(Value::as_array) else {
+        return vec!["  unavailable: gateway report unavailable".to_owned()];
+    };
+
+    let mut lines = Vec::new();
+    let gateway_report_fetch = provenance.get("gateway_report_fetch");
+    let gateway_failure = gateway_report_fetch
+        .and_then(|observation| observation.get("status"))
+        .and_then(Value::as_str)
+        == Some("unavailable");
+
+    if let Some(observation) = gateway_report_fetch.filter(|_| gateway_failure) {
+        let reason = observation
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("gateway report unavailable");
+        let boundary = observation
+            .get("boundary")
+            .and_then(Value::as_str)
+            .unwrap_or("running adapter state was not fetched");
+        lines.push(format!(
+            "  gateway running-state fetch unavailable: {reason} ({boundary})"
+        ));
+    }
+
+    for row in rows {
+        let host = row.get("host").and_then(Value::as_str).unwrap_or("?");
+        let harness = row.get("harness").and_then(Value::as_str).unwrap_or("?");
+        let prefix = format!("harness binary {host}/{harness}");
+        let adapter_prefix = format!("harness adapter {host}/{harness}");
+        let adapter = row.get("adapter");
+        lines.push(harness_adapter_observation_line(
+            &adapter_prefix,
+            "next launch",
+            adapter,
+            None,
+        ));
+        let running = row
+            .get("running")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+
+        if running.is_empty() {
+            if gateway_failure {
+                lines.push(format!(
+                    "  {prefix} running: unavailable (gateway report fetch failed)"
+                ));
+            } else {
+                lines.push(format!("  {prefix} running: not observed"));
+            }
+        } else {
+            for observation in running {
+                lines.push(harness_adapter_observation_line(
+                    &adapter_prefix,
+                    "running",
+                    observation.get("adapter"),
+                    observation.get("generation").and_then(Value::as_u64),
+                ));
+                lines.push(harness_binary_observation_line(
+                    &prefix,
+                    "running",
+                    observation,
+                ));
+            }
+        }
+
+        if let Some(next) = row.get("next_launch") {
+            lines.push(harness_binary_observation_line(
+                &prefix,
+                "next launch",
+                next,
+            ));
+        }
+
+        if let Some(warnings) = row.get("warnings").and_then(Value::as_array) {
+            for warning in warnings.iter().filter_map(Value::as_str) {
+                lines.push(format!("  {prefix} warning: {warning}"));
+            }
+        }
+    }
+    lines
+}
+
+fn harness_adapter_observation_line(
+    prefix: &str,
+    label: &str,
+    adapter: Option<&Value>,
+    generation: Option<u64>,
+) -> String {
+    let package = adapter
+        .and_then(|value| value.get("package"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let version = adapter
+        .and_then(|value| value.get("version"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let generation = generation
+        .map(|value| format!(" generation {value}"))
+        .unwrap_or_default();
+    format!("  {prefix} {label}{generation}: {package} {version}")
+}
+
+fn harness_binary_observation_line(prefix: &str, label: &str, observation: &Value) -> String {
+    let status = observation
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let source = observation
+        .get("source")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let detail = ["path", "version", "reason"]
+        .into_iter()
+        .filter_map(|key| observation.get(key).and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("; ");
+    if detail.is_empty() {
+        format!("  {prefix} {label}: {status} ({source})")
+    } else {
+        format!("  {prefix} {label}: {status} ({source}) — {detail}")
+    }
+}
+
 fn object(entries: impl IntoIterator<Item = (&'static str, Value)>) -> Value {
     Value::Object(
         entries
@@ -1495,10 +1635,17 @@ fn pretty_json(value: &Value) -> String {
 }
 
 /// The doctor report, with the gateway's sentinel section when doctor asked for it.
-fn report_json(report: &Report, sentinels: Option<Value>) -> String {
+fn report_json(
+    report: &Report,
+    sentinels: Option<Value>,
+    harness_binary_provenance: Option<Value>,
+) -> String {
     let mut value = report_value(report);
     if let (Some(sentinels), Some(fields)) = (sentinels, value.as_object_mut()) {
         fields.insert("sentinels".to_owned(), sentinels);
+    }
+    if let (Some(provenance), Some(fields)) = (harness_binary_provenance, value.as_object_mut()) {
+        fields.insert("harness_binary_provenance".to_owned(), provenance);
     }
     pretty_json(&value)
 }
@@ -1517,6 +1664,8 @@ pub fn run(
     let io = SystemIo;
     let resolved_base_dir = resolve_base_dir(base_dir);
     let (harness_catalog, harness_notes) = doctor_harness_catalog(&resolved_base_dir);
+    let harness_binary_provenance =
+        doctor_harness_binary_provenance(&resolved_base_dir, explicit_base_dir);
     let (mut raw, collection_failure) = match std::env::consts::OS {
         "linux" => (
             collect_linux(&io, std::process::id(), harness_catalog.as_ref())?,
@@ -1554,9 +1703,19 @@ pub fn run(
     report.collection_ms = u64::try_from(monotonic.elapsed().as_millis()).unwrap_or(u64::MAX);
     let sentinels = doctor_sentinels(&resolved_base_dir, explicit_base_dir, identity);
     if json {
-        println!("{}", report_json(&report, Some(sentinel_value(&sentinels))));
+        println!(
+            "{}",
+            report_json(
+                &report,
+                Some(sentinel_value(&sentinels)),
+                Some(harness_binary_provenance.clone())
+            )
+        );
     } else {
-        println!("{}", human(&report));
+        println!(
+            "{}",
+            human_with_harness_binary_provenance(&report, &harness_binary_provenance)
+        );
         println!("{}", sentinel_lines(&sentinels).join("\n"));
     }
     require_runnable_harness_cli(harness_catalog.as_ref())?;
@@ -1564,6 +1723,58 @@ pub fn run(
     match collection_failure {
         Some(failure) => Err(failure),
         None => Ok(()),
+    }
+}
+
+fn doctor_harness_binary_provenance(base_dir: &Path, explicit_base_dir: bool) -> Value {
+    let endpoint = if explicit_base_dir {
+        crate::dispatch::discover_from(base_dir)
+    } else {
+        crate::dispatch::discover()
+    };
+    let endpoint = match endpoint {
+        Ok(endpoint) => endpoint,
+        Err(reason) => {
+            return serde_json::json!({
+                "status": "unavailable",
+                "reason": reason,
+                "rows": []
+            });
+        }
+    };
+
+    match crate::dispatch::gateway_request(
+        "GET",
+        &endpoint,
+        "/doctor/harness-binary-provenance",
+        None,
+    )
+    .call()
+    {
+        Ok(response) => match response.into_string() {
+            Ok(encoded) => serde_json::from_str(&encoded).unwrap_or_else(|error| {
+                serde_json::json!({
+                    "status": "unavailable",
+                    "reason": format!("gateway provenance response was invalid JSON: {error}"),
+                    "rows": []
+                })
+            }),
+            Err(error) => serde_json::json!({
+                "status": "unavailable",
+                "reason": format!("gateway provenance response could not be read: {error}"),
+                "rows": []
+            }),
+        },
+        Err(ureq::Error::Status(status, _response)) => serde_json::json!({
+            "status": "unavailable",
+            "reason": format!("gateway returned HTTP {status}"),
+            "rows": []
+        }),
+        Err(error) => serde_json::json!({
+            "status": "unavailable",
+            "reason": error.to_string(),
+            "rows": []
+        }),
     }
 }
 
@@ -1791,6 +2002,103 @@ fn offline_harness_notes(
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn provenance_human_and_json_carry_the_same_selected_binary_evidence() {
+        let raw = RawFacts {
+            platform: "linux",
+            pids_scanned: 0,
+            pids_env_unreadable: Some(0),
+            processes: Vec::new(),
+            notes: Vec::new(),
+            collection_failure: None,
+        };
+        let report = assemble(
+            raw,
+            1,
+            0,
+            "doctor-host".to_owned(),
+            inspect_base_dir(&SystemIo, Path::new("/missing"), &mut Vec::new()),
+        );
+        let provenance = serde_json::json!({
+            "schema_version": 1,
+            "rows": [{
+                "host": "eezo",
+                "harness": "codex",
+                "adapter": {
+                    "package": "codex-acp",
+                    "version": "1.12.0"
+                },
+                "running": [{
+                    "status": "observed",
+                    "source": "bundled_fallback",
+                    "path": "/adapters/codex.js",
+                    "version": "codex-cli 0.145.0",
+                    "generation": 4,
+                    "adapter": {
+                        "package": "codex-acp",
+                        "version": "1.12.0"
+                    }
+                }],
+                "next_launch": {
+                    "status": "observed",
+                    "source": "pinned_override",
+                    "path": "/usr/local/bin/codex",
+                    "version": "codex-cli 0.145.1"
+                },
+                "warnings": ["bundled_fallback_selected"]
+            }]
+        });
+
+        let human = human_with_harness_binary_provenance(&report, &provenance);
+        assert!(
+            human.contains("harness adapter eezo/codex running generation 4: codex-acp 1.12.0")
+        );
+        assert!(human.contains("harness adapter eezo/codex next launch: codex-acp 1.12.0"));
+        assert!(human.contains("running: observed (bundled_fallback)"));
+        assert!(human.contains("/adapters/codex.js; codex-cli 0.145.0"));
+        assert!(human.contains("warning: bundled_fallback_selected"));
+        assert_eq!(
+            harness_binary_provenance_lines(&serde_json::json!({
+                "status": "unavailable",
+                "reason": "gateway offline",
+                "rows": []
+            })),
+            ["  unavailable: gateway offline"]
+        );
+
+        let encoded: Value =
+            serde_json::from_str(&report_json(&report, None, Some(provenance.clone()))).unwrap();
+        assert_eq!(encoded["harness_binary_provenance"], provenance);
+    }
+
+    #[test]
+    fn provenance_gateway_fetch_failure_keeps_the_running_evidence_boundary() {
+        let provenance = serde_json::json!({
+            "schema_version": 1,
+                "gateway_report_fetch": {
+                    "status": "unavailable",
+                    "reason": "connection timed out",
+                    "boundary": "local fallback is not a complete gateway snapshot; empty running rows do not prove no adapter is running"
+                },
+            "rows": [{
+                "host": "eezo",
+                "harness": "codex",
+                "adapter": {"package": "codex-acp", "version": "1.12.0"},
+                "running": [],
+                "next_launch": {"status": "unknown", "source": "unknown"},
+                "warnings": []
+            }]
+        });
+
+        let lines = harness_binary_provenance_lines(&provenance);
+        assert!(lines.iter().any(|line| {
+            line == "  gateway running-state fetch unavailable: connection timed out (local fallback is not a complete gateway snapshot; empty running rows do not prove no adapter is running)"
+        }));
+        assert!(lines.iter().any(|line| {
+            line == "  harness binary eezo/codex running: unavailable (gateway report fetch failed)"
+        }));
+    }
 
     fn doctor_credential_root() -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -2657,7 +2965,7 @@ mod tests {
                 adapter_stderr_log_count: None,
             },
         );
-        let encoded: Value = serde_json::from_str(&report_json(&report, None)).unwrap();
+        let encoded: Value = serde_json::from_str(&report_json(&report, None, None)).unwrap();
         assert_eq!(
             encoded,
             serde_json::from_str::<Value>(
@@ -2759,7 +3067,7 @@ mod tests {
                 adapter_stderr_log_count: Some(2),
             },
         );
-        let encoded: Value = serde_json::from_str(&report_json(&report, None)).unwrap();
+        let encoded: Value = serde_json::from_str(&report_json(&report, None, None)).unwrap();
         assert_eq!(
             encoded,
             serde_json::from_str::<Value>(

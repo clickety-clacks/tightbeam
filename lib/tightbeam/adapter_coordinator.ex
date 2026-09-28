@@ -159,6 +159,9 @@ defmodule Tightbeam.AdapterCoordinator do
     GenServer.call(server, :health)
   end
 
+  @doc "Read-only selection metadata for adapter generations observed at launch."
+  def binary_launches(server \\ __MODULE__), do: GenServer.call(server, :binary_launches)
+
   @doc "Durable launch ledger for operator diagnosis, newest launch first."
   @spec harness_processes(GenServer.server()) :: [Tightbeam.HarnessProcess.row()]
   def harness_processes(server \\ __MODULE__), do: GenServer.call(server, :harness_processes)
@@ -413,6 +416,23 @@ defmodule Tightbeam.AdapterCoordinator do
       end)
 
     {:reply, health, state}
+  end
+
+  def handle_call(:binary_launches, _from, state) do
+    launches =
+      Enum.map(state.adapters, fn {{harness, _identity, host}, entry} ->
+        module = Tightbeam.Harness.module!(harness)
+
+        %{
+          "host" => host,
+          "harness" => module.wire_name(),
+          "generation" => entry.generation,
+          "ready" => entry.ready and live_entry?(entry),
+          "capture" => entry.binary_capture
+        }
+      end)
+
+    {:reply, launches, state}
   end
 
   def handle_call(:harness_processes, _from, state) do
@@ -1135,8 +1155,8 @@ defmodule Tightbeam.AdapterCoordinator do
         Process.demonitor(entry.readiness_monitor, [:flush])
 
         case result do
-          {:ok, opts, context} ->
-            entry = %{entry | context: context}
+          {:ok, opts, context, binary_capture} ->
+            entry = %{entry | context: context, binary_capture: binary_capture}
             state = %{state | adapters: Map.put(state.adapters, key, entry)}
             {:noreply, start_adapter_unfenced(key, entry, state, opts)}
 
@@ -1226,6 +1246,7 @@ defmodule Tightbeam.AdapterCoordinator do
 
             case adapter_opts.(key, resolved_context) do
               {:ok, opts} when is_list(opts) ->
+                {binary_capture, opts} = Keyword.pop(opts, :harness_binary_capture)
                 opts = Keyword.put(opts, :db, db)
 
                 opts =
@@ -1233,12 +1254,13 @@ defmodule Tightbeam.AdapterCoordinator do
                     do: Tightbeam.HarnessProcess.prepare_launch(opts, db, key),
                     else: opts
 
-                {:ok, opts, normalize_context(resolved_context)}
+                {:ok, opts, normalize_context(resolved_context), binary_capture}
 
               {:error, refusal} ->
                 {:error, refusal}
 
               opts when is_list(opts) ->
+                {binary_capture, opts} = Keyword.pop(opts, :harness_binary_capture)
                 opts = Keyword.put(opts, :db, db)
 
                 opts =
@@ -1246,7 +1268,7 @@ defmodule Tightbeam.AdapterCoordinator do
                     do: Tightbeam.HarnessProcess.prepare_launch(opts, db, key),
                     else: opts
 
-                {:ok, opts, normalize_context(resolved_context)}
+                {:ok, opts, normalize_context(resolved_context), binary_capture}
             end
           rescue
             error ->
@@ -1265,6 +1287,7 @@ defmodule Tightbeam.AdapterCoordinator do
         readiness_timer: timer,
         readiness_token: token,
         ready: false,
+        binary_capture: nil,
         waiters: entry.waiters
     }
 
@@ -1512,6 +1535,7 @@ defmodule Tightbeam.AdapterCoordinator do
       ready: false,
       last_failure: nil,
       context: nil,
+      binary_capture: nil,
       readiness_task: nil,
       readiness_monitor: nil,
       readiness_timer: nil,

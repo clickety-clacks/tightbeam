@@ -46,6 +46,7 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
       local_host_name: Placement.local_host_name(),
       credential_state: &local_credential_state(base_dir, &1),
       terminal_incidents: terminal_incidents,
+      harness_binary_provenance: harness_binary_provenance(base_dir),
       cli_bin: Path.join(base_dir, "bin")
     ]
 
@@ -161,12 +162,20 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
       ready_harnesses != [] and
         Enum.all?(non_harness_checks, &(&1.ok or &1.unverifiable))
 
+    provenance =
+      Keyword.get(
+        inputs,
+        :harness_binary_provenance,
+        Tightbeam.HarnessBinaryProvenance.report_unavailable("not collected")
+      )
+
     {if(ready, do: 0, else: 1),
      %{
        checks: checks,
        github: github_status,
        ready: ready,
-       terminal_credentials: terminal_incidents
+       terminal_credentials: terminal_incidents,
+       harness_binary_provenance: provenance
      }}
   end
 
@@ -191,7 +200,12 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
         incidents -> [""] ++ Enum.map(incidents, & &1.canonical_statement)
       end
 
-    (table ++ terminal) |> Enum.join("\n")
+    provenance =
+      report
+      |> Map.get(:harness_binary_provenance, %{})
+      |> Tightbeam.HarnessBinaryProvenance.format_human()
+
+    Enum.join(table ++ terminal ++ ["", "harness binary provenance:", provenance], "\n")
   end
 
   defp default_model_check(catalog, harness, model, credential_state, base_dir, host) do
@@ -580,17 +594,116 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
         {:ok, rows} = Exqlite.Sqlite3.fetch_all(conn, stmt)
         :ok = Exqlite.Sqlite3.release(conn, stmt)
 
-        rows
-        |> Map.new(fn [name, ssh, host_base, cli_bin] ->
-          {name, %{ssh: ssh, base_dir: host_base, cli_bin: cli_bin}}
-        end)
-        |> Map.put(Placement.local_host_name(), %{ssh: nil, base_dir: base_dir, cli_bin: nil})
+        hosts =
+          rows
+          |> Map.new(fn [name, ssh, host_base, cli_bin] ->
+            {name, %{ssh: ssh, base_dir: host_base, cli_bin: cli_bin}}
+          end)
+
+        hosts = attach_toolchain_dirs(conn, hosts)
+
+        Map.put(hosts, Placement.local_host_name(), %{ssh: nil, base_dir: base_dir, cli_bin: nil})
       after
         Exqlite.Sqlite3.close(conn)
       end
     else
       :absent
     end
+  end
+
+  defp attach_toolchain_dirs(conn, hosts) do
+    with {:ok, statement} <-
+           Exqlite.Sqlite3.prepare(
+             conn,
+             "SELECT host, dir FROM host_toolchain_dirs ORDER BY host, position"
+           ),
+         {:ok, rows} <- Exqlite.Sqlite3.fetch_all(conn, statement) do
+      :ok = Exqlite.Sqlite3.release(conn, statement)
+
+      Enum.reduce(rows, hosts, fn [host, dir], acc ->
+        case Map.fetch(acc, host) do
+          {:ok, config} ->
+            Map.put(acc, host, Map.update(config, :toolchain_dirs, [dir], &(&1 ++ [dir])))
+
+          :error ->
+            acc
+        end
+      end)
+    else
+      {:error, reason} ->
+        raise "could not read registered toolchain directories: #{inspect(reason)}"
+    end
+  end
+
+  defp org_binary_selection_overlays(base_dir) do
+    db_path = Path.join(base_dir, "state.db")
+
+    if File.exists?(db_path) do
+      {:ok, conn} = Exqlite.Sqlite3.open(db_path, mode: :readonly)
+
+      try do
+        with {:ok, statement} <-
+               Exqlite.Sqlite3.prepare(
+                 conn,
+                 "SELECT host, harness, name, value FROM harness_env_overlays " <>
+                   "WHERE name IN ('CODEX_PATH','CLAUDE_CODE_EXECUTABLE')"
+               ),
+             {:ok, rows} <- Exqlite.Sqlite3.fetch_all(conn, statement) do
+          :ok = Exqlite.Sqlite3.release(conn, statement)
+
+          Enum.group_by(rows, fn [host, harness, _name, _value] -> {host, harness} end, fn [
+                                                                                             _host,
+                                                                                             _harness,
+                                                                                             name,
+                                                                                             value
+                                                                                           ] ->
+            {name, value}
+          end)
+        else
+          {:error, reason} ->
+            raise "could not read harness binary override registry: #{inspect(reason)}"
+        end
+      after
+        Exqlite.Sqlite3.close(conn)
+      end
+    else
+      %{}
+    end
+  end
+
+  defp harness_binary_provenance(base_dir) do
+    case Tightbeam.HarnessBinaryProvenance.fetch_gateway(base_dir) do
+      {:ok, report} ->
+        report
+
+      {:error, gateway_error} ->
+        fallback =
+          case org_hosts(base_dir) do
+            :absent ->
+              Tightbeam.HarnessBinaryProvenance.report_unavailable("org database absent")
+
+            hosts ->
+              launches =
+                if Process.whereis(Tightbeam.AdapterCoordinator),
+                  do: Tightbeam.AdapterCoordinator.binary_launches(),
+                  else: []
+
+              case Tightbeam.HarnessBinaryProvenance.report_for_inputs(
+                     base_dir,
+                     hosts,
+                     org_binary_selection_overlays(base_dir),
+                     launches,
+                     without_override_evidence?: true
+                   ) do
+                {:ok, report} -> report
+                {:error, report} -> report
+              end
+          end
+
+        Tightbeam.HarnessBinaryProvenance.with_gateway_fetch_failure(fallback, gateway_error)
+    end
+  rescue
+    error -> Tightbeam.HarnessBinaryProvenance.report_unavailable(Exception.message(error))
   end
 
   defp hosts_check(:absent, _local_host_name) do
