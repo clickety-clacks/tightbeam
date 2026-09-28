@@ -349,12 +349,19 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
         replacement_assignment_id: "asg_delayed_replacement"
       })
 
-    :ok =
-      DB.execute(
-        db,
-        "UPDATE queued_message_replacement_requests SET requestedAt=100 WHERE wakeId=?1",
-        [delayed_old_wake.wake_id]
-      )
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "UPDATE queued_message_replacement_requests SET requestedAt=100 WHERE wakeId=?1",
+               [delayed_old_wake.wake_id]
+             )
+
+    assert {:ok, [[100]]} =
+             DB.query(
+               db,
+               "SELECT requestedAt FROM queued_message_replacement_requests WHERE wakeId=?1",
+               [delayed_old_wake.wake_id]
+             )
 
     newer_wake =
       Wakes.schedule(db, %{
@@ -366,12 +373,19 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
         replacement_assignment_id: "asg_delayed_replacement"
       })
 
-    :ok =
-      DB.execute(
-        db,
-        "UPDATE queued_message_replacement_requests SET requestedAt=200 WHERE wakeId=?1",
-        [newer_wake.wake_id]
-      )
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "UPDATE queued_message_replacement_requests SET requestedAt=200 WHERE wakeId=?1",
+               [newer_wake.wake_id]
+             )
+
+    assert {:ok, [[200]]} =
+             DB.query(
+               db,
+               "SELECT requestedAt FROM queued_message_replacement_requests WHERE wakeId=?1",
+               [newer_wake.wake_id]
+             )
 
     assert delayed_old_wake.due_at > newer_wake.due_at
 
