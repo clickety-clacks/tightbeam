@@ -1141,6 +1141,82 @@ defmodule Tightbeam.SchemaShapeTest do
              DB.query(db, "SELECT COUNT(*),MIN(activatedAt) FROM supervision_liveness_epoch")
   end
 
+  test "work-item body activation creates the exact additive shape", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:ok, [[shape_before, stamped_at_before]]} =
+             DB.query(db, "SELECT shape, stampedAt FROM schema_stamp")
+
+    assert table_columns(db, "work_item_bodies") ==
+             ~w(workItemId body updatedByUser updatedBySession updatedAt)
+
+    assert table_columns(db, "work_item_body_activation") ==
+             ~w(id activatedAt cause principal)
+
+    assert {:ok, [[0, "schema_activation", "process:tightbeam"]]} =
+             DB.query(db, "SELECT id, cause, principal FROM work_item_body_activation")
+
+    assert :ok = Schema.ensure_all(db)
+    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM work_item_body_activation")
+
+    assert :ok = Schema.ensure_work_item_body_schema(db)
+
+    assert {:ok, [[^shape_before, ^stamped_at_before]]} =
+             DB.query(db, "SELECT shape, stampedAt FROM schema_stamp")
+  end
+
+  test "malformed or incomplete work-item body activation refuses without repair", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+    assert :ok = DB.execute(db, "DROP TABLE work_item_body_activation")
+
+    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
+    assert error.message =~ "incompatible_work_item_body_v1"
+
+    assert {:ok, []} =
+             DB.query(db, "SELECT name FROM sqlite_master WHERE name='work_item_body_activation'")
+
+    assert :ok = DB.execute(db, "CREATE TABLE work_item_body_activation (id INTEGER)")
+    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_work_item_body_schema(db) end
+    assert error.message =~ "incompatible_work_item_body_v1"
+  end
+
+  test "interrupted work-item body activation rolls back and retries", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    assert :ok =
+             DB.execute(db, "DROP TABLE work_item_bodies; DROP TABLE work_item_body_activation")
+
+    for statement <- [1, 2] do
+      assert {:error, %RuntimeError{message: "forced activation interruption"}} =
+               DB.transaction(db, fn txn ->
+                 Schema.ensure_work_item_body_schema_in_txn(txn,
+                   fail_after_statement: statement
+                 )
+               end)
+
+      assert {:ok, []} =
+               DB.query(
+                 db,
+                 "SELECT name FROM sqlite_master WHERE name IN ('work_item_bodies','work_item_body_activation')"
+               )
+    end
+
+    assert :ok = Schema.ensure_work_item_body_schema(db)
+    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM work_item_body_activation")
+  end
+
+  test "malformed work-item body storage refuses without repairing it", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+    assert :ok = DB.execute(db, "DROP TABLE work_item_body_activation")
+    assert :ok = DB.execute(db, "DROP TABLE work_item_bodies")
+    assert :ok = DB.execute(db, "CREATE TABLE work_item_bodies (workItemId TEXT PRIMARY KEY)")
+
+    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_work_item_body_schema(db) end
+    assert error.message =~ "incompatible_work_item_body_v1"
+    assert table_columns(db, "work_item_bodies") == ["workItemId"]
+    refute table?(db, "work_item_body_activation")
+  end
+
   test "a malformed additive object refuses without partial activation", %{db: db} do
     assert :ok = Schema.ensure_all(db)
     drop_liveness_activation(db)

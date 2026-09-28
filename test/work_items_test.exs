@@ -632,12 +632,293 @@ defmodule Tightbeam.WorkItemsTest do
     assert MapSet.member?(expected, {current.specRefName, current.specRefSha256})
   end
 
+  test "body sidecar preserves exact text, spec reference, attribution, and empty versus absent",
+       ctx do
+    legacy = create(ctx, {:user, "flynn"}, %{title: "Legacy"})
+
+    pinned =
+      create(ctx, {:user, "flynn"}, %{
+        title: "Body",
+        spec_ref_name: "spec.md",
+        spec_ref_sha256: @sha
+      })
+
+    assert get(ctx, {:user, "flynn"}, legacy.id).workItem.body == nil
+
+    assert %{body: nil, bodyUpdatedByUser: nil, bodyUpdatedBySession: nil, bodyUpdatedAt: nil} =
+             get(ctx, {:user, "flynn"}, legacy.id).workItem
+
+    text = "  Scope\n✓ \"ship\"\n"
+
+    %{workItem: updated, bodyUpdate: descriptor} =
+      update(ctx, {:session, ctx.holder.session_key}, pinned.id, %{body: text})
+
+    refute Map.has_key?(updated, :body)
+    assert descriptor.state == "present"
+    assert descriptor.updatedBySession == ctx.holder.session_key
+    assert descriptor.updatedByUser == nil
+    assert updated.specRefName == "spec.md"
+    assert updated.specRefSha256 == @sha
+
+    max_body = String.duplicate("x", 65_536)
+    max_result = update(ctx, {:user, "flynn"}, pinned.id, %{body: max_body})
+    assert max_result.bodyUpdate.byteLength == 65_536
+    assert get(ctx, {:user, "flynn"}, pinned.id).workItem.body == max_body
+
+    assert %{code: "invalid_body"} =
+             update(ctx, {:user, "flynn"}, pinned.id, %{body: String.duplicate("y", 65_537)})
+
+    assert get(ctx, {:user, "flynn"}, pinned.id).workItem.body == max_body
+
+    assert %{code: "invalid_body"} =
+             update(ctx, {:user, "flynn"}, pinned.id, %{body: <<255>>})
+
+    reapplied = update(ctx, {:user, "flynn"}, pinned.id, %{body: text})
+    detail = get(ctx, {:user, "flynn"}, pinned.id).workItem
+    assert detail.body == text
+    assert detail.specRefName == "spec.md"
+    assert detail.specRefSha256 == @sha
+
+    assert %{workItems: listed} = list(ctx, {:user, "flynn"})
+    refute Enum.any?(listed, &Map.has_key?(&1, :body))
+
+    same = update(ctx, {:user, "flynn"}, pinned.id, %{body: text})
+    assert same.bodyUpdate.changed == false
+    assert same.bodyUpdate.updatedAt == reapplied.bodyUpdate.updatedAt
+
+    empty = update(ctx, {:user, "flynn"}, pinned.id, %{body: ""})
+    assert empty.bodyUpdate.state == "present"
+    assert get(ctx, {:user, "flynn"}, pinned.id).workItem.body == ""
+    cleared = update(ctx, {:user, "flynn"}, pinned.id, %{clear_body: true})
+    assert cleared.bodyUpdate.state == "absent"
+    assert cleared.bodyUpdate.updatedByUser == "flynn"
+    assert get(ctx, {:user, "flynn"}, pinned.id).workItem.body == nil
+    assert cleared.workItem.specRefName == "spec.md"
+    assert cleared.workItem.specRefSha256 == @sha
+  end
+
+  test "body updates leave every work-item lifecycle state and failure reason unchanged", ctx do
+    open = create(ctx, {:user, "flynn"}, %{title: "Open body"})
+    iceboxed = create(ctx, {:user, "flynn"}, %{title: "Iceboxed body"})
+    closed = create(ctx, {:user, "flynn"}, %{title: "Closed body"})
+    failed = create(ctx, {:user, "flynn"}, %{title: "Failed body"})
+
+    assert %{ok: true} =
+             WorkItems.__handle__(
+               ctx.db,
+               "work-item-icebox",
+               call("work-item-icebox", {:user, "flynn"}, %{work_item_id: iceboxed.id})
+             )
+
+    assert %{ok: true} =
+             WorkItems.__handle__(
+               ctx.db,
+               "work-item-close",
+               call("work-item-close", {:user, "flynn"}, %{work_item_id: closed.id})
+             )
+
+    assert %{ok: true} =
+             WorkItems.__handle__(
+               ctx.db,
+               "work-item-fail",
+               call("work-item-fail", {:user, "flynn"}, %{
+                 work_item_id: failed.id,
+                 reason: "body lifecycle fixture"
+               })
+             )
+
+    for {item, state, fail_reason} <- [
+          {open, "open", nil},
+          {iceboxed, "iceboxed", nil},
+          {closed, "closed", nil},
+          {failed, "failed", "body lifecycle fixture"}
+        ] do
+      before = get(ctx, {:user, "flynn"}, item.id).workItem
+      assert before.state == state
+      assert before.failReason == fail_reason
+
+      assert %{workItem: updated, bodyUpdate: %{state: "present"}} =
+               update(ctx, {:user, "flynn"}, item.id, %{body: "body for #{state}"})
+
+      assert updated.state == state
+      assert updated.failReason == fail_reason
+    end
+  end
+
+  test "raw metadata patches preserve the flat response and an existing body", ctx do
+    item =
+      create(ctx, {:user, "flynn"}, %{
+        title: "Metadata with body",
+        spec_ref_name: "before.md",
+        spec_ref_sha256: @sha
+      })
+
+    body = "body-stays-byte-exact-✓"
+    _ = update(ctx, {:session, ctx.holder.session_key}, item.id, %{body: body})
+    before = get(ctx, {:user, "flynn"}, item.id).workItem
+
+    metadata_result =
+      update(ctx, {:user, "flynn"}, item.id, %{
+        title: "Updated metadata",
+        is_bug: true,
+        spec_ref_name: "after.md",
+        spec_ref_sha256: @sha2,
+        priority: 3
+      })
+
+    assert Enum.sort(Map.keys(metadata_result)) == Enum.sort(Map.keys(item))
+    refute Map.has_key?(metadata_result, :body)
+
+    after_update = get(ctx, {:user, "flynn"}, item.id).workItem
+    assert after_update.body == body
+    assert after_update.bodyUpdatedBySession == ctx.holder.session_key
+    assert after_update.bodyUpdatedByUser == nil
+    assert after_update.bodyUpdatedAt == before.bodyUpdatedAt
+    assert after_update.title == "Updated metadata"
+    assert after_update.isBug
+    assert after_update.specRefName == "after.md"
+    assert after_update.specRefSha256 == @sha2
+    assert after_update.priority == 3
+  end
+
+  test "body changes ring the metadata doorbell once and no-op body writes stay silent", ctx do
+    item = create(ctx, {:user, "flynn"}, %{title: "Doorbell"})
+    notify = fn _, _ -> send(self(), :body_change) end
+
+    changed =
+      update_call({:user, "flynn"}, item.id, %{body: "body"})
+      |> Map.put(:on_work_item_change, notify)
+
+    assert %{bodyUpdate: %{changed: true}} =
+             WorkItems.__handle__(ctx.db, "work-item-update", changed)
+
+    assert_received :body_change
+
+    noop =
+      update_call({:user, "flynn"}, item.id, %{body: "body"})
+      |> Map.put(:on_work_item_change, notify)
+
+    assert %{bodyUpdate: %{changed: false}} =
+             WorkItems.__handle__(ctx.db, "work-item-update", noop)
+
+    refute_received :body_change
+  end
+
+  test "dispatched body update and read return text while their audits stay content-free", ctx do
+    item = create(ctx, {:user, "flynn"}, %{title: "Audit detail"})
+    sentinel = "actual-work-item-body-secret-#{System.unique_integer([:positive])}"
+
+    assert {:ok, %{workItem: updated, bodyUpdate: descriptor}} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               update_call({:user, "flynn"}, item.id, %{body: sentinel})
+             )
+
+    refute Map.has_key?(updated, :body)
+    assert descriptor.state == "present"
+    {:ok, [[update_payload]]} =
+      DB.query(ctx.db, "SELECT payload FROM events WHERE verb='work-item-update' ORDER BY id DESC LIMIT 1")
+
+    refute update_payload =~ sentinel
+    assert update_payload =~ "bodyUpdate"
+    assert update_payload =~ descriptor.sha256
+
+    assert {:ok, %{workItem: %{body: ^sentinel} = detail}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, get_call({:user, "flynn"}, item.id))
+
+    assert detail.bodyUpdatedByUser == "flynn"
+    {:ok, [[get_payload]]} =
+      DB.query(ctx.db, "SELECT payload FROM events WHERE verb='work-item-get' ORDER BY id DESC LIMIT 1")
+
+    refute get_payload =~ sentinel
+    refute get_payload =~ "bodyUpdatedByUser"
+    refute get_payload =~ "bodyUpdatedBySession"
+    refute get_payload =~ "bodyUpdatedAt"
+    assert get_payload =~ "bodyRead"
+    assert get_payload =~ descriptor.sha256
+  end
+
+  test "body updates remain serialized under concurrent writers", ctx do
+    item = create(ctx, {:user, "flynn"}, %{title: "Concurrent body"})
+    parent = self()
+
+    first =
+      Task.async(fn ->
+        update_call({:user, "flynn"}, item.id, %{body: "first-body"})
+        |> Map.put(:on_work_item_change, fn _, _ ->
+          send(parent, :first_committed)
+
+          receive do
+            :release_first -> :ok
+          end
+        end)
+        |> then(&WorkItems.__handle__(ctx.db, "work-item-update", &1))
+      end)
+
+    assert_receive :first_committed
+
+    second =
+      Task.async(fn ->
+        update_call({:user, "flynn"}, item.id, %{body: "second-body"})
+        |> Map.put(:on_work_item_change, fn _, _ -> send(parent, :second_committed) end)
+        |> then(&WorkItems.__handle__(ctx.db, "work-item-update", &1))
+      end)
+
+    assert_receive :second_committed
+    assert %{bodyUpdate: %{changed: true}} = Task.await(second)
+    send(first.pid, :release_first)
+    assert %{bodyUpdate: %{changed: true}} = Task.await(first)
+    assert get(ctx, {:user, "flynn"}, item.id).workItem.body == "second-body"
+  end
+
+  test "accepted dispositions never audit a body sentinel", ctx do
+    item = create(ctx, {:user, "flynn"}, %{title: "Disposition"})
+    sentinel = "disposition-body-secret"
+    _ = update(ctx, {:user, "flynn"}, item.id, %{body: sentinel})
+
+    assert {:ok, %{ok: true, workItem: work_item}} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               call("work-item-close", {:user, "flynn"}, %{work_item_id: item.id})
+             )
+
+    refute Map.has_key?(work_item, :body)
+
+    {:ok, rows} = DB.query(ctx.db, "SELECT payload FROM events WHERE verb='work-item-close'")
+    refute Enum.any?(rows, fn [payload] -> payload =~ sentinel end)
+  end
+
+  test "body updates reject metadata combinations and invalid sizes", ctx do
+    item =
+      create(ctx, {:user, "flynn"}, %{
+        title: "Body",
+        spec_ref_name: "spec.md",
+        spec_ref_sha256: @sha
+      })
+
+    assert %{code: "invalid_body_patch"} =
+             update(ctx, {:user, "flynn"}, item.id, %{body: "x", title: "Nope"})
+
+    assert %{code: "invalid_body"} =
+             update(ctx, {:user, "flynn"}, item.id, %{body: String.duplicate("x", 65_537)})
+
+    assert get(ctx, {:user, "flynn"}, item.id).workItem.body == nil
+    assert get(ctx, {:user, "flynn"}, item.id).workItem.specRefSha256 == @sha
+  end
+
   test "get and list return deterministic eras, aspects, and ordering", ctx do
     assert %{workItems: []} = list(ctx, {:user, "flynn"})
     assert %{code: "unknown_work_item"} = get(ctx, {:user, "flynn"}, "missing")
 
     first = create(ctx, {:user, "flynn"}, %{title: "First"})
-    assert %{workItem: ^first, assignments: []} = get(ctx, {:session, "holder"}, first.id)
+    assert %{workItem: detail, assignments: []} = get(ctx, {:session, "holder"}, first.id)
+
+    assert Map.drop(detail, [:body, :bodyUpdatedByUser, :bodyUpdatedBySession, :bodyUpdatedAt]) ==
+             first
+
+    assert detail.body == nil
     second = create(ctx, {:user, "flynn"}, %{title: "Second"})
     {:ok, _} = DB.query(ctx.db, "UPDATE work_items SET createdAt = 99")
 

@@ -332,6 +332,7 @@ defmodule Tightbeam.Dispatch do
 
           {:raised, exception} ->
             error = %{code: "server_error", message: Exception.message(exception)}
+            denial_error = denial_notice_error(verb, call, error)
             payload = outcome_payload(verb, call, {:raised, exception})
 
             :ok =
@@ -343,7 +344,7 @@ defmodule Tightbeam.Dispatch do
                 session_key,
                 payload,
                 principal,
-                &Publisher.denied_in_txn(&1, publisher_call, error)
+                &Publisher.denied_in_txn(&1, publisher_call, denial_error)
               )
 
             {:error, error}
@@ -415,6 +416,21 @@ defmodule Tightbeam.Dispatch do
   defp outcome_payload("onboard", _call, {:returned, result}) when is_map(result),
     do: Map.delete(result, :lease_id)
 
+  defp outcome_payload(verb, _call, {:returned, result})
+       when verb in ["work-item-get", "work-item-update"] and is_map(result),
+       do: redact_work_item_body(verb, result)
+
+  defp outcome_payload("work-item-get", _call, {:raised, _exception}),
+    do: %{crash: true, code: "server_error", bodyElided: true}
+
+  defp outcome_payload("work-item-update", call, {:raised, exception}) do
+    if body_operation?(call) do
+      %{crash: true, code: "server_error", bodyElided: true}
+    else
+      %{code: "server_error", message: Exception.message(exception)}
+    end
+  end
+
   defp outcome_payload(verb, call, outcome) do
     if verb in @result_elided do
       elided = %{elided: true, params: Map.get(call, :params, %{})}
@@ -444,6 +460,68 @@ defmodule Tightbeam.Dispatch do
     do: :crypto.hash(:sha256, value) |> Base.encode16(case: :lower)
 
   defp digest(_value), do: nil
+
+  defp body_operation?(call) do
+    params = Map.get(call, :params, %{})
+    Map.has_key?(params, :body) or Map.get(params, :clear_body, false)
+  end
+
+  defp denial_notice_error("work-item-get", _call, _error),
+    do: %{code: "server_error", bodyElided: true}
+
+  defp denial_notice_error("work-item-update", call, error) do
+    if body_operation?(call),
+      do: %{code: "server_error", bodyElided: true},
+      else: error
+  end
+
+  defp denial_notice_error(_verb, _call, error), do: error
+
+  defp redact_work_item_body("work-item-update", %{body: body} = item) do
+    body_update = Map.get(item, :bodyUpdate) || body_update_descriptor(item, body)
+
+    %{
+      workItem:
+        Map.drop(item, [
+          :body,
+          :bodyUpdate,
+          :bodyUpdatedByUser,
+          :bodyUpdatedBySession,
+          :bodyUpdatedAt
+        ]),
+      bodyUpdate: body_update
+    }
+  end
+
+  defp redact_work_item_body("work-item-get", %{workItem: item} = result) when is_map(item),
+    do: Map.put(result, :workItem, redact_work_item_body(item))
+
+  defp redact_work_item_body(_verb, result), do: result
+
+  defp redact_work_item_body(%{body: body} = item) do
+    item
+    |> Map.drop([:body, :bodyUpdatedByUser, :bodyUpdatedBySession, :bodyUpdatedAt])
+    |> Map.merge(body_descriptor(body))
+  end
+
+  defp redact_work_item_body(item) when is_map(item), do: item
+
+  defp body_descriptor(nil), do: %{bodyRead: %{state: "absent", byteLength: 0, sha256: nil}}
+
+  defp body_descriptor(body) when is_binary(body),
+    do: %{bodyRead: %{state: "present", byteLength: byte_size(body), sha256: sha256(body)}}
+
+  defp body_update_descriptor(item, body) do
+    descriptor = body_descriptor(body).bodyRead
+
+    descriptor
+    |> Map.put(:changed, not is_nil(Map.get(item, :bodyUpdatedAt)))
+    |> Map.put(:updatedByUser, Map.get(item, :bodyUpdatedByUser))
+    |> Map.put(:updatedBySession, Map.get(item, :bodyUpdatedBySession))
+    |> Map.put(:updatedAt, Map.get(item, :bodyUpdatedAt))
+  end
+
+  defp sha256(body), do: Base.encode16(:crypto.hash(:sha256, body), case: :lower)
 
   defp best_effort_denial(db, verb, origin, principal, session_key, error) do
     try do
