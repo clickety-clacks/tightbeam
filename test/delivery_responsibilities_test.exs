@@ -388,6 +388,23 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
     assert {:ok, %{rumination_required: true}} =
              Dispatch.dispatch(db, handlers, owner_dispatch)
 
+    assert [owner_rumination] =
+             Enum.filter(Tightbeam.Wakes.list_pending(db), fn wake ->
+               wake.rumination and wake.work_item_id == "wi_a1" and
+                 wake.creator_session_key == "pdo-a"
+             end)
+
+    assert {:ok, []} =
+             DB.query(db, "UPDATE wakes SET state='fired',firedAt=?2 WHERE wakeId=?1", [
+               owner_rumination.wake_id,
+               System.system_time(:millisecond)
+             ])
+
+    assert Tightbeam.Wakes.rumination_exists?(db, "wi_a1", "pdo-a")
+
+    assert {:ok, %{holderKey: "peer", workItemId: "wi_a1"}} =
+             Dispatch.dispatch(db, handlers, owner_dispatch)
+
     delegated_dispatch = production_call("dispatch", {:session, "lane-a"}, "worker-a", "wi_a1")
 
     assert {:ok, %{rumination_required: true}} =
