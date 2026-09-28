@@ -176,7 +176,6 @@ defmodule Tightbeam.Wire.Router do
       "features" => ["stale-turn-settlement-v1"],
       "adapters" => health,
       "diagnostics" => diagnostic_health()
-      "features" => ["stale-turn-settlement-v1"]
     })
   end
 
