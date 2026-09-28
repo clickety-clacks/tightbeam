@@ -797,7 +797,7 @@ COMMANDS:
       idempotent (same key returns the same item).
   work-item-update <workItemId> [--title "<title>"] [--spec-ref <name>]
                    [--spec-sha256 <hex>] [--clear-spec-ref] [--delivery-owner <sessionKey> | --clear-delivery-owner] [--priority <0..8>]
-      Patch an item's title, current governing spec, or priority. Omitted fields
+      Patch an item's title, governing spec, delivery owner, or priority. Omitted fields
       stay unchanged; --clear-spec-ref clears both spec-ref fields. Open cards
       inherit priority changes.
       Body-only forms: --body <text>, --body=<text>, or --clear-body. A body

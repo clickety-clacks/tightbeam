@@ -171,8 +171,37 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
     assert count(db, "assignments") == after_success
   end
 
+  test "authenticated unlinked control survives intake and is not creator-only", %{db: db} do
+    item =
+      WorkItems.__handle__(db, "work-item-create", %{
+        verb: "work-item-create",
+        principal: {:session, "pdo-a"},
+        origin: "agent:pdo-a",
+        params: %{title: "Existing unlinked control"}
+      })
+
+    assert %{holderKey: "worker-a"} = assign(db, {:user, "owner"}, "worker-a", item.id)
+
+    assert {:ok, [[nil]]} =
+             DB.query(db, "SELECT routingWakeId FROM work_items WHERE id=?1", [item.id])
+
+    assert %{holderKey: "lane-a"} = assign(db, {:session, "peer"}, "lane-a", item.id)
+    assert is_nil(DeliveryResponsibilities.current_owner(db, item.id))
+
+    before = count(db, "assignments")
+
+    assert %{code: "delivery_owner_missing"} =
+             assign(db, {:session, "foreign-worker"}, "foreign-worker", item.id)
+
+    assert count(db, "assignments") == before
+  end
+
   test "missing references, unavailable owners, and mismatched owner refs are named", %{db: db} do
-    assert %{code: "work_item_required"} = assign(db, {:session, "pdo-a"}, "worker-a", nil)
+    assert %{holderKey: "worker-a", workItemId: nil} =
+             assign(db, {:session, "pdo-a"}, "worker-a", nil)
+
+    assert %{code: "work_item_required"} =
+             assign(db, {:session, "pdo-a"}, "worker-a", 123)
 
     assert %{code: "unknown_work_item", message: message} =
              assign(db, {:session, "pdo-a"}, "worker-a", "wi_missing")

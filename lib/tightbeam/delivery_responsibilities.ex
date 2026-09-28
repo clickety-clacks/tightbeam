@@ -392,61 +392,48 @@ defmodule Tightbeam.DeliveryResponsibilities do
     end
   end
 
-  # A direct creator can keep the original human/session intake assignment while
-  # the exact WorkItems routing bracket is live. Raw unowned rows without that
-  # durable bracket still require an explicit delivery owner.
-  defp ownerless_work_item_intake_assignment?(txn, %{verb: "assign"} = call, params)
-       when is_map(params) do
+  # Preserve authenticated intake and continued assignment custody for unlinked
+  # items. A raw item or a canceled/mismatched routing wake is not that path.
+  defp ownerless_work_item_intake_assignment?(txn, %{verb: verb} = call, params)
+       when verb in ["assign", "dispatch"] and is_map(params) do
     work_item_id = Map.get(params, :work_item_id)
     owner_user_id = ownerless_intake_principal_user(txn, call)
 
-    creator_session_key =
-      case Map.get(call, :principal) do
-        {:session, session_key} when is_binary(session_key) -> session_key
-        _ -> nil
-      end
-
     is_binary(work_item_id) and is_binary(owner_user_id) and
-      Enum.all?(supplied_owner_references(params), &is_nil/1) and
-      is_nil(Map.get(params, :reviews_assignment_id)) and
+      supplied_owner_references(params) == [] and
       Txn.q(
         txn,
         """
-        SELECT 1
-        FROM work_items wi
-        JOIN wakes w ON w.wakeId = wi.routingWakeId AND w.work_item_id = wi.id
-        WHERE wi.id = ?1 AND wi.state = 'open'
-          AND wi.ownerUserId = ?2
-          AND ((?4 IS NULL AND wi.createdByUser = ?2)
-            OR (?4 IS NOT NULL AND wi.createdBySession = ?4))
+        SELECT 1 FROM work_items wi
+        WHERE wi.id=?1 AND wi.state='open' AND wi.ownerUserId=?2
           AND wi.deliveryOwnerSessionKey IS NULL
-          AND wi.routingWakeId IS NOT NULL
-          AND w.origin = 'process:tightbeam' AND w.consumer = 'prompt'
-          AND w.sessionKey = ?3 AND w.state IN ('pending','fired')
+          AND (
+            EXISTS (
+              SELECT 1 FROM wakes w
+              WHERE w.wakeId=wi.routingWakeId AND w.work_item_id=wi.id
+                AND w.origin='process:tightbeam' AND w.consumer='prompt'
+                AND w.sessionKey=?3 AND w.state IN ('pending','fired')
+            ) OR EXISTS (
+              SELECT 1 FROM assignments a WHERE a.workItemId=wi.id
+            )
+          )
         LIMIT 1
         """,
-        [
-          work_item_id,
-          owner_user_id,
-          Tightbeam.Org.personal_session_key(owner_user_id),
-          creator_session_key
-        ]
+        [work_item_id, owner_user_id, Tightbeam.Org.personal_session_key(owner_user_id)]
       ) == [[1]]
   end
 
   defp ownerless_work_item_intake_assignment?(_txn, _call, _params), do: false
 
   defp ownerless_intake_principal_user(txn, call) do
-    case {Map.get(call, :principal), Map.get(call, :origin)} do
-      {{:user, user_id}, "user:" <> origin_user}
-      when is_binary(user_id) and user_id == origin_user ->
+    case Map.get(call, :principal) do
+      {:user, user_id} when is_binary(user_id) ->
         user_id
 
-      {{:session, session_key}, "agent:" <> origin_session}
-      when is_binary(session_key) and session_key == origin_session ->
+      {:session, session_key} when is_binary(session_key) ->
         case Txn.q(
                txn,
-               "SELECT ownerUserId FROM sessions WHERE sessionKey = ?1 AND state = 'active' LIMIT 1",
+               "SELECT ownerUserId FROM sessions WHERE sessionKey=?1 AND state='active' LIMIT 1",
                [session_key]
              ) do
           [[user_id]] when is_binary(user_id) -> user_id
@@ -524,6 +511,14 @@ defmodule Tightbeam.DeliveryResponsibilities do
     case Map.get(call, :principal) do
       {:user, _user_id} ->
         true
+
+      {:remedy, %{action: "assign", owner: user_id}} when call.verb == "assign" ->
+        txn = Keyword.fetch!(opts, :txn)
+
+        Txn.q(txn, "SELECT 1 FROM work_items WHERE id=?1 AND ownerUserId=?2", [
+          work_item_id,
+          user_id
+        ]) == [[1]]
 
       {:session, ^owner} ->
         true

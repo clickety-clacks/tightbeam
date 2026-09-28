@@ -164,7 +164,7 @@ defmodule Tightbeam.SessionReparentTest do
 
   test "only the owning user can correct an active custom child with one direct open assignment",
        ctx do
-    assert %{code: "delivery_responsibility_required"} =
+    assert %{code: "current_custody_required"} =
              SessionReparent.handle(ctx.db, agent_call("child", ctx.params))
 
     assert %{code: "user_principal_required"} =
@@ -412,6 +412,12 @@ defmodule Tightbeam.SessionReparentTest do
 
     Roles.create!(ctx.db, "product-owner:next", "owner", "lead")
     associate(ctx.db, "lead", "product-owner:next", "lead-association-next")
+    # PO association changes do not replace the explicit delivery owner.
+    assert DeliveryResponsibilities.responsibility(ctx.db, "lead", "wi_one") == "accountable"
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey='lead'")
+
     assert DeliveryResponsibilities.responsibility(ctx.db, "lead", "wi_one") == "stale"
 
     assert %{code: "delivery_responsibility_required"} =
@@ -763,8 +769,7 @@ defmodule Tightbeam.SessionReparentTest do
                  work_item_id: "wi_one",
                  reviews_assignment_id: nil,
                  effect_kind: "coordination",
-                 files: nil,
-                 delegates_delivery: true
+                 files: nil
                }
              })
 
