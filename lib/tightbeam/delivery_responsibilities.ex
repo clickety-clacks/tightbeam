@@ -38,6 +38,9 @@ defmodule Tightbeam.DeliveryResponsibilities do
   end
 
   @doc false
+  def current_owner_in_txn(%Txn{}, nil), do: nil
+
+  @doc false
   def current_owner_in_txn(%Txn{} = txn, work_item_id) when is_binary(work_item_id) do
     case Txn.q(txn, owner_sql(), [work_item_id]) do
       [row] -> owner(row, work_item_id)
@@ -107,6 +110,9 @@ defmodule Tightbeam.DeliveryResponsibilities do
       cond do
         internal_spawn_remedy?(call, opts) ->
           validate_internal_spawn_references(txn, params)
+
+        ownerless_work_item_intake_assignment?(txn, call, params) ->
+          :ok
 
         production_staffing_operation?(call, opts) and
             not itemless_non_owner_link_control?(call) ->
@@ -323,7 +329,7 @@ defmodule Tightbeam.DeliveryResponsibilities do
     else
       refusal(
         "delivery_owner_required",
-        "work item #{work_item_id} is owned by session:#{owner}; production staffing must come from that owner or an active holder of an open assignment on this exact item"
+        "work item #{work_item_id} is owned by session:#{owner}; production staffing must come from that owner, an active holder of an open assignment on this exact item, or the active opener of such an assignment"
       )
     end
   end
@@ -357,6 +363,59 @@ defmodule Tightbeam.DeliveryResponsibilities do
 
       _ ->
         false
+    end
+  end
+
+  # A direct creator can keep the original human/session intake assignment while
+  # the exact WorkItems routing bracket is live. Raw unowned rows without that
+  # durable bracket still require an explicit delivery owner.
+  defp ownerless_work_item_intake_assignment?(txn, %{verb: "assign", params: params} = call)
+       when is_map(params) do
+    work_item_id = Map.get(params, :work_item_id)
+    owner_user_id = ownerless_intake_principal_user(txn, call)
+
+    is_binary(work_item_id) and is_binary(owner_user_id) and
+      Enum.all?(supplied_owner_references(params), &is_nil/1) and
+      is_nil(Map.get(params, :reviews_assignment_id)) and
+      Txn.q(
+        txn,
+        """
+        SELECT 1
+        FROM work_items wi
+        JOIN wakes w ON w.wakeId = wi.routingWakeId AND w.work_item_id = wi.id
+        WHERE wi.id = ?1 AND wi.state = 'open'
+          AND wi.ownerUserId = ?2 AND wi.createdByUser = ?2
+          AND wi.deliveryOwnerSessionKey IS NULL
+          AND wi.routingWakeId IS NOT NULL
+          AND w.origin = 'process:tightbeam' AND w.consumer = 'prompt'
+          AND w.sessionKey = ?3 AND w.state IN ('pending','fired')
+        LIMIT 1
+        """,
+        [work_item_id, owner_user_id, Tightbeam.Org.personal_session_key(owner_user_id)]
+      ) == [[1]]
+  end
+
+  defp ownerless_work_item_intake_assignment?(_txn, _call, _params), do: false
+
+  defp ownerless_intake_principal_user(txn, call) do
+    case {Map.get(call, :principal), Map.get(call, :origin)} do
+      {{:user, user_id}, "user:" <> origin_user}
+      when is_binary(user_id) and user_id == origin_user ->
+        user_id
+
+      {{:session, session_key}, "agent:" <> origin_session}
+      when is_binary(session_key) and session_key == origin_session ->
+        case Txn.q(
+               txn,
+               "SELECT userId FROM sessions WHERE sessionKey = ?1 AND state = 'active' LIMIT 1",
+               [session_key]
+             ) do
+          [[user_id]] when is_binary(user_id) -> user_id
+          _ -> nil
+        end
+
+      _ ->
+        nil
     end
   end
 
@@ -417,6 +476,14 @@ defmodule Tightbeam.DeliveryResponsibilities do
     ) == [[1]]
   end
 
+  defp active_assignment_opener?(txn, session_key, work_item_id) do
+    Txn.q(
+      txn,
+      "SELECT 1 FROM assignments a JOIN sessions s ON s.sessionKey=a.openedBySession WHERE a.workItemId=?1 AND a.openedBySession=?2 AND a.state='open' AND s.state='active' LIMIT 1",
+      [work_item_id, session_key]
+    ) == [[1]]
+  end
+
   defp caller_is_responsible?(owner, work_item_id, call, opts) do
     case Map.get(call, :principal) do
       {:user, _user_id} ->
@@ -426,7 +493,10 @@ defmodule Tightbeam.DeliveryResponsibilities do
         true
 
       {:session, session_key} when is_binary(session_key) ->
-        active_assignment_holder?(Keyword.fetch!(opts, :txn), session_key, work_item_id)
+        txn = Keyword.fetch!(opts, :txn)
+
+        active_assignment_holder?(txn, session_key, work_item_id) or
+          active_assignment_opener?(txn, session_key, work_item_id)
 
       _ ->
         false

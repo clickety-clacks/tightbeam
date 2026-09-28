@@ -3877,28 +3877,54 @@ defmodule Tightbeam.AssignmentsTest do
 
   test "unowned dispatch rejects canceled and mismatched routing brackets", ctx do
     canceled_item = create_work_item(ctx, "Canceled routing bracket")
-    mismatched_item = create_work_item(ctx, "Mismatched routing bracket")
+    mismatched_item = seed_unrouted_work_item(ctx, "Mismatched routing bracket")
+    mismatched_source_item = create_work_item(ctx, "Mismatched routing source")
 
     assert {:ok, [[canceled_wake_id]]} =
              DB.query(ctx.db, "SELECT routingWakeId FROM work_items WHERE id = ?1", [
                canceled_item.id
              ])
 
-    assert {:ok, [[mismatched_wake_id]]} =
+    assert {:ok, [[mismatched_source_wake_id]]} =
              DB.query(ctx.db, "SELECT routingWakeId FROM work_items WHERE id = ?1", [
-               mismatched_item.id
+               mismatched_source_item.id
              ])
 
-    assert {:ok, []} =
-             DB.query(ctx.db, "UPDATE wakes SET state = 'canceled' WHERE wakeId = ?1", [
-               canceled_wake_id
-             ])
+    assert {:ok, true} =
+             DB.transaction(ctx.db, fn txn ->
+               {:ok, trigger} =
+                 Tightbeam.Supervision.liveness_trigger_in_txn(
+                   txn,
+                   {:work_item, canceled_item.id}
+                 )
+
+               Wakes.cancel_in_txn(txn, %{
+                 wake_id: canceled_wake_id,
+                 requester: %{kind: "process", id: "tightbeam:wake-scheduler"},
+                 reason_kind: "target_unresolvable",
+                 causal_source: %{kind: "scheduler_delivery", id: canceled_wake_id},
+                 outcome: %{kind: "no_replacement", liveness_trigger: trigger}
+               })
+             end)
 
     assert {:ok, []} =
-             DB.query(ctx.db, "UPDATE wakes SET work_item_id = ?2 WHERE wakeId = ?1", [
-               mismatched_wake_id,
-               canceled_item.id
-             ])
+             DB.query(
+               ctx.db,
+               "UPDATE work_items SET routingWakeId = ?2 WHERE id = ?1",
+               [mismatched_item.id, mismatched_source_wake_id]
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT 1 FROM work_items wi JOIN wakes w ON w.wakeId=wi.routingWakeId
+               WHERE wi.id=?1 AND wi.id<>w.work_item_id AND w.work_item_id=?2
+                 AND w.origin='process:tightbeam' AND w.consumer='prompt'
+                 AND w.state IN ('pending','fired')
+               """,
+               [mismatched_item.id, mismatched_source_item.id]
+             )
 
     baseline = assignment_count(ctx.db)
 
