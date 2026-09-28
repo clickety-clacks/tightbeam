@@ -376,7 +376,8 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
                [Integer.to_string(report_seq)]
              )
 
-    assert {:ok, [[1, "fired"]]} =
+    # deliver_wake!/2 appends directly; the scheduler fires prompt wakes before delivery.
+    assert {:ok, [[1, "pending"]]} =
              DB.query(
                db,
                "SELECT COUNT(*),MIN(state) FROM wakes WHERE wakeId=?1",

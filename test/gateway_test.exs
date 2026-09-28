@@ -6735,6 +6735,7 @@ defmodule Tightbeam.GatewayTest do
 
   test "queued set_harness handoff excludes exact replacement QMS sources and keeps other durable order",
        ctx do
+    ensure_global_registry()
     candidate = start_supervised!({BlockingCandidateAdapterStub, self()})
     {config, _local_host} = queued_harness_switch_config!(ctx, "queued-handoff", candidate)
 
