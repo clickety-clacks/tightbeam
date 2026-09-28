@@ -571,7 +571,8 @@ defmodule Tightbeam.WorkspaceCleanup do
         esac
         [ -n "$component" ] || return 1
         parent="$root\${parent_rel:+/$parent_rel}"
-        [ -d "$parent" ] && [ ! -L "$parent" ] || return 1
+        [ ! -L "$parent" ] || return 2
+        [ -d "$parent" ] || return 1
         found=0
         for entry in "$parent"/* "$parent"/.[!.]* "$parent"/..?*; do
           [ -e "$entry" ] || [ -L "$entry" ] || continue
@@ -583,7 +584,8 @@ defmodule Tightbeam.WorkspaceCleanup do
         [ "$found" -eq 1 ] || return 1
         parent_rel=\${parent_rel:+$parent_rel/}$component
         if [ "$has_more" -eq 1 ]; then
-          [ -d "$root/$parent_rel" ] && [ ! -L "$root/$parent_rel" ] || return 1
+          [ ! -L "$root/$parent_rel" ] || return 2
+          [ -d "$root/$parent_rel" ] || return 1
         fi
       done
       return 0
@@ -695,9 +697,14 @@ defmodule Tightbeam.WorkspaceCleanup do
           if [ ! -e "$root/$keep" ] && [ ! -L "$root/$keep" ]; then
             emit_error artifact_missing "$keep"
             had_error=1
-          elif ! exact_keep_path "$keep"; then
-            emit_error artifact_path_spelling_mismatch "$keep"
-            had_error=1
+          else
+            exact_keep_path "$keep"
+            keep_status=$?
+            case "$keep_status" in
+              0) ;;
+              2) emit_error symlink_route "$keep"; had_error=1 ;;
+              *) emit_error artifact_path_spelling_mismatch "$keep"; had_error=1 ;;
+            esac
           fi
         done
         set +f

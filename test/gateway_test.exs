@@ -1370,7 +1370,7 @@ defmodule Tightbeam.GatewayTest do
     refute_receive {:unexpected_remote_cleanup, _invocation}
   end
 
-  test "remote cleanup fails closed when a protected route changes to a symlink", ctx do
+  test "remote cleanup preflight fails closed when a protected route changes to a symlink", ctx do
     ensure_global_registry()
     fixture = remote_cleanup_fixture(ctx.db, "race")
     protected_file = Path.join(fixture.workspace, "z-protected/keep.md")
@@ -1380,7 +1380,7 @@ defmodule Tightbeam.GatewayTest do
     File.mkdir_p!(outside)
     File.write!(protected_file, "registered before the race")
     File.write!(Path.join(outside, "keep.md"), "outside the workdir")
-    File.write!(scratch, "remove before the raced route")
+    File.write!(scratch, "preserve when preflight detects the raced route")
     artifact = remote_artifact(ctx.db, fixture, "protected", "z-protected/keep.md")
     parent = self()
 
@@ -1409,8 +1409,8 @@ defmodule Tightbeam.GatewayTest do
     assert File.lstat!(Path.join(fixture.workspace, "z-protected")).type == :symlink
     assert File.read!(Path.join(outside, "keep.md")) == "outside the workdir"
     assert Artifacts.get(ctx.db, artifact.artifact_id).state == "in-workspace"
-    assert "a-scratch.txt" in cleanup.removed_paths
-    refute File.exists?(scratch)
+    assert cleanup.removed_paths == []
+    assert File.read!(scratch) == "preserve when preflight detects the raced route"
   end
 
   test "retiring with a live adapter sibling leaves the adapter up and records residency", ctx do
