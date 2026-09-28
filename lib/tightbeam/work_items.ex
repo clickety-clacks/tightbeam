@@ -69,7 +69,10 @@ defmodule Tightbeam.WorkItems do
   @doc "Create the work-item schema."
   @spec ensure_schema(DB.server()) :: :ok
   def ensure_schema(db \\ Tightbeam.DB) do
-    with :ok <- DB.execute(db, @ddl), do: DB.execute(db, @priority_ddl)
+    with :ok <- DB.execute(db, @ddl),
+         :ok <- DB.execute(db, @priority_ddl) do
+      :ok
+    end
   end
 
   @doc false
@@ -89,7 +92,8 @@ defmodule Tightbeam.WorkItems do
     is_bug = Map.get(call.params, :is_bug, false)
     key = call.params[:idempotency_key]
 
-    with :ok <- principal_allowed(call.principal),
+    with :ok <- ensure_body_schema_for_use(db),
+         :ok <- principal_allowed(call.principal),
          :ok <- valid_title(call.params[:title]),
          :ok <- valid_spec_ref(call.params[:spec_ref_name], call.params[:spec_ref_sha256]),
          :ok <- valid_is_bug(is_bug),
@@ -196,13 +200,16 @@ defmodule Tightbeam.WorkItems do
   ## Update (title/spec-ref/isBug PATCH — unchanged bracket-wise)
 
   defp update_result(db, call) do
-    with :ok <- principal_allowed(call.principal) do
+    with :ok <- ensure_body_schema_for_use(db),
+         :ok <- principal_allowed(call.principal) do
       result =
         transaction(db, fn txn ->
           result =
             update_in_txn(
               txn,
-              Map.put(call.params, :effort_config, Map.get(call, :effort_config, %{}))
+              call.params
+              |> Map.put(:effort_config, Map.get(call, :effort_config, %{}))
+              |> Map.put(:principal, call.principal)
             )
 
           case result do
@@ -219,7 +226,12 @@ defmodule Tightbeam.WorkItems do
       case result do
         {:updated, item, changed?} ->
           if changed?, do: best_effort(fn -> on_change(call).(item.id, "metadata") end)
-          public_work_item(item)
+
+          result = public_work_item(item)
+
+          if Map.has_key?(call.params, :body) or Map.get(call.params, :clear_body, false),
+            do: %{workItem: result, bodyUpdate: body_update_descriptor(item, changed?)},
+            else: result
 
         error ->
           error
@@ -228,7 +240,7 @@ defmodule Tightbeam.WorkItems do
   end
 
   defp publish_item_result_in_txn(txn, call, item, true),
-    do: Publisher.maybe_accepted_in_txn(txn, call, public_work_item(item))
+    do: Publisher.maybe_accepted_in_txn(txn, call, public_event_work_item(item))
 
   defp publish_item_result_in_txn(txn, call, _item, false),
     do: Publisher.maybe_observed_accepted_in_txn(txn, call)
@@ -239,38 +251,98 @@ defmodule Tightbeam.WorkItems do
         unknown(params[:work_item_id])
 
       item ->
-        title = if Map.has_key?(params, :title), do: params.title, else: item.title
-
-        {spec_ref_name, spec_ref_sha256} = patch_spec_ref(item, params)
-        is_bug = if Map.has_key?(params, :is_bug), do: params.is_bug, else: item.isBug
-
-        with :ok <- valid_title(title),
-             :ok <- valid_spec_ref(spec_ref_name, spec_ref_sha256),
-             :ok <- valid_is_bug(is_bug),
-             :ok <- valid_priority(params[:priority]) do
-          priority = if Map.has_key?(params, :priority), do: params.priority, else: item.priority
-          updates = patch_updates(params, title, spec_ref_name, spec_ref_sha256, is_bug)
-          apply_updates(txn, item, updates)
-
-          if priority != item.priority do
-            put_priority_in_txn(txn, item.id, priority)
-
-            EffortCheckin.reprioritize_work_item_in_txn(
-              txn,
-              Map.get(params, :effort_config, %{}),
-              item.id,
-              priority
-            )
-          end
-
-          updated = fetch_in_txn(txn, item.id)
-          changed? = metadata(item) != metadata(updated)
-
-          if changed?, do: stamp_version_in_txn(txn, item.id, now())
-          {:updated, fetch_in_txn(txn, item.id), changed?}
+        if Map.has_key?(params, :body) or Map.get(params, :clear_body, false) do
+          update_body_in_txn(txn, item, params)
+        else
+          update_metadata_in_txn(txn, item, params)
         end
     end
   end
+
+  defp update_metadata_in_txn(txn, item, params) do
+    title = if Map.has_key?(params, :title), do: params.title, else: item.title
+
+    {spec_ref_name, spec_ref_sha256} = patch_spec_ref(item, params)
+    is_bug = if Map.has_key?(params, :is_bug), do: params.is_bug, else: item.isBug
+
+    with :ok <- valid_title(title),
+         :ok <- valid_spec_ref(spec_ref_name, spec_ref_sha256),
+         :ok <- valid_is_bug(is_bug),
+         :ok <- valid_priority(params[:priority]) do
+      priority = if Map.has_key?(params, :priority), do: params.priority, else: item.priority
+      updates = patch_updates(params, title, spec_ref_name, spec_ref_sha256, is_bug)
+      apply_updates(txn, item, updates)
+
+      if priority != item.priority do
+        put_priority_in_txn(txn, item.id, priority)
+
+        EffortCheckin.reprioritize_work_item_in_txn(
+          txn,
+          Map.get(params, :effort_config, %{}),
+          item.id,
+          priority
+        )
+      end
+
+      updated = fetch_in_txn(txn, item.id)
+      changed? = metadata(item) != metadata(updated)
+
+      if changed?, do: stamp_version_in_txn(txn, item.id, now())
+      {:updated, fetch_in_txn(txn, item.id), changed?}
+    end
+  end
+
+  defp update_body_in_txn(txn, item, params) do
+    metadata_keys = [:title, :is_bug, :spec_ref_name, :spec_ref_sha256, :priority]
+
+    if Enum.any?(metadata_keys, &Map.has_key?(params, &1)) do
+      error(
+        "invalid_body_patch",
+        "body cannot be combined with title, isBug, specRefName, specRefSha256, or priority"
+      )
+    else
+      body = if Map.get(params, :clear_body, false), do: nil, else: params[:body]
+
+      with :ok <- valid_body(body) do
+        current = body_record_in_txn(txn, item.id)
+
+        if (current && current.body) === body do
+          {:updated, fetch_in_txn(txn, item.id), false}
+        else
+          {updated_by_user, updated_by_session} = body_attribution(params[:principal])
+          updated_at = now()
+
+          Txn.q(
+            txn,
+            """
+            INSERT INTO work_item_bodies
+              (workItemId, body, updatedByUser, updatedBySession, updatedAt)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(workItemId) DO UPDATE SET
+              body=excluded.body, updatedByUser=excluded.updatedByUser,
+              updatedBySession=excluded.updatedBySession,
+              updatedAt=excluded.updatedAt
+            """,
+            [item.id, body, updated_by_user, updated_by_session, updated_at]
+          )
+
+          stamp_version_in_txn(txn, item.id, updated_at)
+          {:updated, fetch_in_txn(txn, item.id), true}
+        end
+      end
+    end
+  end
+
+  defp body_record_in_txn(txn, id) do
+    case Txn.q(txn, "SELECT body FROM work_item_bodies WHERE workItemId = ?1", [id]) do
+      [[body]] -> %{body: body}
+      [] -> nil
+    end
+  end
+
+  defp body_attribution({:user, user}), do: {user, nil}
+  defp body_attribution({:session, session}), do: {nil, session}
+  defp body_attribution(_), do: {nil, "unknown"}
 
   defp patch_updates(params, title, spec_ref_name, spec_ref_sha256, is_bug) do
     updates =
@@ -345,7 +417,8 @@ defmodule Tightbeam.WorkItems do
   ## Terminal dispositions (owner-or-admin) — icebox/reopen/close/fail
 
   defp dispose_result(db, call, verb) do
-    with :ok <- principal_allowed(call.principal) do
+    with :ok <- ensure_body_schema_for_use(db),
+         :ok <- principal_allowed(call.principal) do
       id = call.params[:work_item_id]
       reason = call.params[:reason]
 
@@ -703,19 +776,22 @@ defmodule Tightbeam.WorkItems do
   ## Reads
 
   defp get_result(db, call) do
-    with :ok <- principal_allowed(call.principal) do
+    with :ok <- ensure_body_schema_for_use(db),
+         :ok <- principal_allowed(call.principal) do
       case fetch(db, call.params[:work_item_id]) do
         nil ->
           unknown(call.params[:work_item_id])
 
         item ->
           %{
-            workItem: public_work_item(item),
+            workItem: public_detail_work_item(item),
             assignments: Tightbeam.Assignments.__for_work_item__(db, item.id)
           }
       end
     end
   end
+
+  defp ensure_body_schema_for_use(db), do: Tightbeam.Schema.ensure_work_item_body_schema(db)
 
   defp trace_result(db, call) do
     id = call.params[:work_item_id]
@@ -762,11 +838,12 @@ defmodule Tightbeam.WorkItems do
   defp trace_not_found, do: error("not_found", "work item not found")
 
   defp list_result(db, call) do
-    with :ok <- principal_allowed(call.principal) do
+    with :ok <- ensure_body_schema_for_use(db),
+         :ok <- principal_allowed(call.principal) do
       {:ok, rows} =
         DB.query(db, "SELECT #{columns()} FROM work_items ORDER BY createdAt DESC, id DESC")
 
-      %{workItems: Enum.map(rows, &(work_item(&1) |> public_work_item()))}
+      %{workItems: Enum.map(rows, &(work_item(&1) |> public_work_item() |> public_summary()))}
     end
   end
 
@@ -817,6 +894,17 @@ defmodule Tightbeam.WorkItems do
 
   defp valid_priority(_),
     do: error("invalid_priority", "priority must be an integer from 0 through 8")
+
+  defp valid_body(nil), do: :ok
+
+  defp valid_body(body) when is_binary(body) do
+    if String.valid?(body) and byte_size(body) <= 65_536,
+      do: :ok,
+      else: error("invalid_body", "body must be null or valid UTF-8 text of at most 65536 bytes")
+  end
+
+  defp valid_body(_),
+    do: error("invalid_body", "body must be null or valid UTF-8 text of at most 65536 bytes")
 
   defp valid_idempotency_key(nil), do: :ok
 
@@ -952,7 +1040,11 @@ defmodule Tightbeam.WorkItems do
       "routingWakeId, slateWakeId, createdByUser, createdBySession, createdAt, " <>
       "COALESCE((SELECT rowVersion FROM work_item_versions WHERE workItemId = work_items.id), createdAt), " <>
       "COALESCE((SELECT priority FROM work_item_priorities p WHERE p.workItemId=work_items.id), " <>
-      "CAST(COALESCE((SELECT value FROM org_settings WHERE key='default-priority'),'4') AS INTEGER))"
+      "CAST(COALESCE((SELECT value FROM org_settings WHERE key='default-priority'),'4') AS INTEGER)), " <>
+      "(SELECT body FROM work_item_bodies b WHERE b.workItemId = work_items.id), " <>
+      "(SELECT updatedByUser FROM work_item_bodies b WHERE b.workItemId = work_items.id), " <>
+      "(SELECT updatedBySession FROM work_item_bodies b WHERE b.workItemId = work_items.id), " <>
+      "(SELECT updatedAt FROM work_item_bodies b WHERE b.workItemId = work_items.id)"
   end
 
   defp work_item([
@@ -970,7 +1062,11 @@ defmodule Tightbeam.WorkItems do
          session,
          created_at,
          row_version,
-         priority
+         priority,
+         body,
+         body_updated_by_user,
+         body_updated_by_session,
+         body_updated_at
        ]) do
     %{
       id: id,
@@ -987,11 +1083,63 @@ defmodule Tightbeam.WorkItems do
       createdBySession: session,
       createdAt: created_at,
       rowVersion: row_version,
-      priority: priority
+      priority: priority,
+      body: body,
+      bodyUpdatedByUser: body_updated_by_user,
+      bodyUpdatedBySession: body_updated_by_session,
+      bodyUpdatedAt: body_updated_at
     }
   end
 
-  defp public_work_item(item), do: Map.drop(item, [:routingWakeId, :slateWakeId])
+  defp public_work_item(item), do: public_summary(item)
+
+  defp public_detail_work_item(item), do: Map.drop(item, [:routingWakeId, :slateWakeId])
+
+  defp public_summary(item),
+    do:
+      Map.drop(item, [
+        :routingWakeId,
+        :slateWakeId,
+        :body,
+        :bodyUpdatedByUser,
+        :bodyUpdatedBySession,
+        :bodyUpdatedAt
+      ])
+
+  defp public_event_work_item(item) do
+    if is_nil(Map.get(item, :bodyUpdatedAt)) do
+      public_summary(item)
+    else
+      item
+      |> public_summary()
+      |> Map.merge(body_descriptor(item))
+    end
+  end
+
+  defp body_descriptor(%{body: nil}),
+    do: %{bodyState: "absent", bodyBytes: 0, bodySha256: nil}
+
+  defp body_descriptor(%{body: body}) when is_binary(body),
+    do: %{
+      bodyState: "present",
+      bodyBytes: byte_size(body),
+      bodySha256: Base.encode16(:crypto.hash(:sha256, body), case: :lower)
+    }
+
+  defp body_update_descriptor(item, changed?) do
+    body = Map.get(item, :body)
+
+    %{
+      state: if(is_nil(body), do: "absent", else: "present"),
+      byteLength: if(is_nil(body), do: 0, else: byte_size(body)),
+      sha256:
+        if(is_nil(body), do: nil, else: Base.encode16(:crypto.hash(:sha256, body), case: :lower)),
+      changed: changed?,
+      updatedByUser: Map.get(item, :bodyUpdatedByUser),
+      updatedBySession: Map.get(item, :bodyUpdatedBySession),
+      updatedAt: Map.get(item, :bodyUpdatedAt)
+    }
+  end
 
   defp bool_to_int(true), do: 1
   defp bool_to_int(false), do: 0

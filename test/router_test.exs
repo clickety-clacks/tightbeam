@@ -123,7 +123,10 @@ defmodule Tightbeam.Wire.RouterTest do
       end,
       "work-item-update" => fn call ->
         send(parent, {:call, call})
-        %{id: call.params.work_item_id, title: call.params[:title]}
+
+        if call.params[:body] && call.params[:title],
+          do: %{code: "invalid_body_patch"},
+          else: %{id: call.params.work_item_id, title: call.params[:title]}
       end,
       "artifact-record" => fn call ->
         send(parent, {:call, call})
@@ -253,6 +256,144 @@ defmodule Tightbeam.Wire.RouterTest do
     missing = request.("/api/devices/missing", ctx.device.token, opts)
     assert missing.status == 404
     assert JSON.decode!(missing.resp_body)["error"]["code"] == "not_found"
+  end
+
+  test "agent dispatch renders invalid body patches as HTTP 400", ctx do
+    response =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "work-item-update",
+        params: %{workItemId: "wi_test", body: "x", title: "metadata"}
+      })
+
+    assert response.status == 400
+    assert JSON.decode!(response.resp_body)["error"]["code"] == "invalid_message"
+  end
+
+  test "work-item body verbs preserve credential-specific identity authorization", ctx do
+    session = create_session(ctx.db, "body-auth-session", ctx.device.user_id)
+    Roles.create!(ctx.db, "body-auth-role", ctx.device.user_id, session.session_key)
+
+    item =
+      WorkItems.__handle__(ctx.db, "work-item-create", %{
+        verb: "work-item-create",
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        session_key: nil,
+        params: %{title: "Body authorization"}
+      })
+
+    id = item.id
+
+    assert %{bodyUpdate: %{state: "present"}} =
+             WorkItems.__handle__(ctx.db, "work-item-update", %{
+               verb: "work-item-update",
+               origin: "user:flynn",
+               principal: {:user, "flynn"},
+               session_key: nil,
+               params: %{work_item_id: id, body: "initial-body"}
+             })
+
+    parent = self()
+    real_handlers = Gateway.handlers(%{db: ctx.db})
+
+    handlers =
+      ctx.opts[:handlers]
+      |> Map.put("work-item-get", fn call ->
+        send(parent, {:body_auth_handler, call.verb, call.origin, call.principal})
+        real_handlers["work-item-get"].(call)
+      end)
+      |> Map.put("work-item-update", fn call ->
+        send(parent, {:body_auth_handler, call.verb, call.origin, call.principal})
+        real_handlers["work-item-update"].(call)
+      end)
+
+    ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, handlers)}
+
+    _final_body =
+      Enum.reduce(
+        [
+          {"tbc_test", %{asUser: "flynn"}, "user:flynn", {:user, "flynn"}, "org-user-body"},
+          {session.cli_token, %{asUser: "flynn"}, "user:flynn", {:user, "flynn"},
+           "session-user-body"},
+          {session.cli_token, %{as: "body-auth-role"}, "agent:body-auth-role",
+           {:session, session.session_key}, "session-role-body"}
+        ],
+        "initial-body",
+        fn {bearer, selector, origin, principal, body}, previous_body ->
+          get =
+            dispatch_cli(ctx, bearer, %{
+              verb: "work-item-get",
+              params: %{workItemId: id}
+            } |> Map.merge(selector))
+
+          assert get.status == 200, get.resp_body
+          assert JSON.decode!(get.resp_body)["result"]["workItem"]["body"] == previous_body
+          assert_receive {:body_auth_handler, "work-item-get", ^origin, ^principal}
+
+          update =
+            dispatch_cli(ctx, bearer, %{
+              verb: "work-item-update",
+              params: %{workItemId: id, body: body}
+            } |> Map.merge(selector))
+
+          assert update.status == 200, update.resp_body
+          update_result = JSON.decode!(update.resp_body)["result"]
+          refute Map.has_key?(update_result["workItem"], "body")
+          assert update_result["bodyUpdate"]["state"] == "present"
+          assert_receive {:body_auth_handler, "work-item-update", ^origin, ^principal}
+          body
+        end
+      )
+
+    stored_body = "session-role-body"
+
+    for {bearer, selector, verb, body} <- [
+          {"tbc_test", %{asProcess: "cron"}, "work-item-get", nil},
+          {"tbc_test", %{asProcess: "cron"}, "work-item-update", "denied-org-process"}
+        ] do
+      params = if body, do: %{workItemId: id, body: body}, else: %{workItemId: id}
+      response = dispatch_cli(ctx, bearer, Map.merge(%{verb: verb, params: params}, selector))
+      assert response.status == 403
+      assert JSON.decode!(response.resp_body)["error"]["code"] == "process_denied"
+      assert_receive {:body_auth_handler, ^verb, "process:cron", {:process, "cron"}}
+    end
+
+    for verb <- ["work-item-get", "work-item-update"] do
+      body = if verb == "work-item-update", do: "denied-session-process", else: nil
+      params = if body, do: %{workItemId: id, body: body}, else: %{workItemId: id}
+      response = dispatch_cli(ctx, session.cli_token, %{verb: verb, asProcess: "cron", params: params})
+      assert response.status == 403
+      assert JSON.decode!(response.resp_body)["error"]["code"] == "identity_not_yours"
+      refute_receive {:body_auth_handler, _, _, _}
+    end
+
+    for {verb, body} <- [{"work-item-get", nil}, {"work-item-update", "denied-held-role"}] do
+      params = if body, do: %{workItemId: id, body: body}, else: %{workItemId: id}
+      response = dispatch_cli(ctx, "tbc_test", %{verb: verb, as: "body-auth-role", params: params})
+      assert response.status == 403
+      assert JSON.decode!(response.resp_body)["error"]["code"] == "principal_required"
+      assert_receive {:body_auth_handler, ^verb, "agent:body-auth-role", nil}
+    end
+
+    for verb <- ["work-item-get", "work-item-update"] do
+      params =
+        if verb == "work-item-update",
+          do: %{workItemId: id, body: "missing-org-identity"},
+          else: %{workItemId: id}
+
+      response = dispatch_cli(ctx, "tbc_test", %{verb: verb, params: params})
+      assert response.status == 400
+      assert JSON.decode!(response.resp_body)["error"]["code"] == "invalid_message"
+      refute_receive {:body_auth_handler, _, _, _}
+    end
+
+    assert WorkItems.__handle__(ctx.db, "work-item-get", %{
+             verb: "work-item-get",
+             origin: "user:flynn",
+             principal: {:user, "flynn"},
+             session_key: nil,
+             params: %{work_item_id: id}
+           }).workItem.body == stored_body
   end
 
   test "closed wake and artifact projections reject malformed public shapes without altering internal rows",

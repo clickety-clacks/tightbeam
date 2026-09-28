@@ -884,8 +884,16 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             spec_ref_sha256,
             clear_spec_ref,
             priority,
+            body,
+            clear_body,
         } => {
             let mut params = vec![string_field("workItemId", work_item_id)];
+            if let Some(value) = body {
+                params.push(string_field("body", value));
+            }
+            if *clear_body {
+                params.push("\"body\":null".to_owned());
+            }
             if let Some(value) = title {
                 params.push(string_field("title", value));
             }
@@ -2050,8 +2058,7 @@ pub fn run(command: Command) -> Result<(), String> {
     // `command_identity`; it is nonetheless a session call and only a session
     // call, and saying so here makes a run from outside a workdir fail with the
     // reason rather than with a 403 from the org token.
-    let session_identity = matches!(command, Command::ToolCallObserved)
-        || command_identity(&command).is_some_and(|identity| matches!(identity, Identity::Session));
+    let session_identity = requires_session_discovery(&command);
     run_with(
         command,
         move || {
@@ -2211,6 +2218,27 @@ where
 
 fn add_user_target_is_local(endpoint: &Endpoint) -> bool {
     add_user_endpoint_matches_local(endpoint, &provisioned())
+}
+
+fn requires_session_discovery(command: &Command) -> bool {
+    if matches!(command, Command::ToolCallObserved) {
+        return true;
+    }
+
+    // The no-selector first-user bootstrap is local only. `run_with` still
+    // requires a provisioned endpoint before it can create the first user, and
+    // refuses a named remote endpoint without an explicit session credential.
+    if matches!(
+        command,
+        Command::AddUser {
+            identity: Identity::Session,
+            ..
+        }
+    ) {
+        return false;
+    }
+
+    command_identity(command).is_some_and(|identity| matches!(identity, Identity::Session))
 }
 
 fn first_user_for_target<F>(local: bool, create: F) -> Result<crate::users::FirstUser, String>
@@ -2662,6 +2690,18 @@ mod tests {
             body(&["add-user", "guest", "--admin", "--as-user", "flynn"]),
             r#"{"asUser":"flynn","verb":"add-user","params":{"userId":"guest","isAdmin":true}}"#
         );
+    }
+
+    #[test]
+    fn no_selector_add_user_can_resolve_the_local_first_user_bootstrap() {
+        let bootstrap = parse(&["add-user", "smoke-admin", "--admin"]);
+        assert!(!requires_session_discovery(&bootstrap));
+
+        let ordinary_session_call = parse(&["work-item-get", "wi_1"]);
+        assert!(requires_session_discovery(&ordinary_session_call));
+
+        let explicit_user = parse(&["add-user", "guest", "--as-user", "flynn"]);
+        assert!(!requires_session_discovery(&explicit_user));
     }
 
     /// The case the value comparison could not see.
@@ -3475,6 +3515,29 @@ mod tests {
         assert_eq!(
             body(&["work-item-get", "wi_1", "--as-user", "flynn"]),
             r#"{"asUser":"flynn","verb":"work-item-get","params":{"workItemId":"wi_1"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "work-item-update",
+                "wi_1",
+                "--body",
+                "  Scope\n✓ \"ship\"\n",
+                "--as-user",
+                "flynn",
+            ]),
+            r#"{"asUser":"flynn","verb":"work-item-update","params":{"workItemId":"wi_1","body":"  Scope\n✓ \"ship\"\n"}}"#
+        );
+        assert_eq!(
+            body(&["work-item-update", "wi_1", "--body=--clear-body"]),
+            r#"{"verb":"work-item-update","params":{"workItemId":"wi_1","body":"--clear-body"}}"#
+        );
+        assert_eq!(
+            body(&["work-item-update", "wi_1", "--body="]),
+            r#"{"verb":"work-item-update","params":{"workItemId":"wi_1","body":""}}"#
+        );
+        assert_eq!(
+            body(&["work-item-update", "wi_1", "--clear-body"]),
+            r#"{"verb":"work-item-update","params":{"workItemId":"wi_1","body":null}}"#
         );
         assert_eq!(
             body(&[

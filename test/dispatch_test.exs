@@ -3,6 +3,21 @@ defmodule Tightbeam.DispatchTest do
 
   alias Tightbeam.{DB, Dispatch, Escalation, EventLog, Rules}
 
+  defmodule DenialHandoffCapture do
+    use GenServer
+
+    def start_link(owner), do: GenServer.start_link(__MODULE__, owner)
+
+    @impl true
+    def init(owner), do: {:ok, owner}
+
+    @impl true
+    def handle_cast({:denied, call, error}, owner) do
+      send(owner, {:denial_handoff, call, error})
+      {:noreply, owner}
+    end
+  end
+
   setup do
     :persistent_term.erase(Rules)
     name = :"db_#{System.unique_integer([:positive])}"
@@ -136,6 +151,111 @@ defmodule Tightbeam.DispatchTest do
     {:ok, [[payload]]} = DB.query(db, "SELECT payload FROM events")
     assert payload =~ "server_error"
     assert payload =~ "boom"
+  end
+
+  test "body reads and body updates elide raised denial messages", %{db: db} do
+    hub = start_supervised!({DenialHandoffCapture, self()})
+    sentinel = "dispatch-body-secret-#{System.unique_integer([:positive])}"
+
+    for {verb, params} <- [
+          {"work-item-get", %{work_item_id: "wi_1"}},
+          {"work-item-update", %{work_item_id: "wi_1", body: sentinel}}
+        ] do
+      call = %{
+        verb: verb,
+        origin: "user:flynn",
+        session_key: nil,
+        params: params,
+        firehose_hub: hub
+      }
+
+      assert {:error, %{code: "server_error", message: ^sentinel}} =
+               Dispatch.dispatch(db, %{verb => fn _ -> raise sentinel end}, call)
+
+      assert_receive {:denial_handoff, handed_call, denial_error}
+      assert handed_call.verb == verb
+      assert denial_error == %{code: "server_error", bodyElided: true}
+      notices = Tightbeam.Firehose.Publisher.denied_notices(handed_call, denial_error)
+      refute inspect(notices) =~ sentinel
+
+      assert [%{kind: "verb", verb: ^verb}] = EventLog.events_after(db, 0, 10) |> Enum.take(-1)
+      {:ok, [[payload]]} = DB.query(db, "SELECT payload FROM events ORDER BY id DESC LIMIT 1")
+      refute payload =~ sentinel
+      assert payload =~ "bodyElided"
+    end
+  end
+
+  test "metadata update crashes preserve their existing denial message", %{db: db} do
+    call = %{
+      verb: "work-item-update",
+      origin: "user:flynn",
+      session_key: nil,
+      params: %{work_item_id: "wi_1", title: "metadata"}
+    }
+
+    assert {:error, %{code: "server_error", message: "metadata boom"}} =
+             Dispatch.dispatch(
+               db,
+               %{"work-item-update" => fn _ -> raise "metadata boom" end},
+               call
+             )
+
+    {:ok, [[payload]]} = DB.query(db, "SELECT payload FROM events ORDER BY id DESC LIMIT 1")
+    assert payload =~ "metadata boom"
+  end
+
+  test "accepted body update audit stores only the descriptor", %{db: db} do
+    sentinel = "accepted-body-secret-#{System.unique_integer([:positive])}"
+
+    call = %{
+      verb: "work-item-update",
+      origin: "user:flynn",
+      session_key: nil,
+      params: %{body: sentinel}
+    }
+
+    result = %{body: sentinel, bodyUpdate: %{state: "present", byteLength: byte_size(sentinel)}}
+
+    assert {:ok, ^result} =
+             Dispatch.dispatch(db, %{"work-item-update" => fn _ -> result end}, call)
+
+    {:ok, [[payload]]} = DB.query(db, "SELECT payload FROM events ORDER BY id DESC LIMIT 1")
+    refute payload =~ sentinel
+    assert payload =~ "bodyUpdate"
+  end
+
+  test "successful body get returns detail but audits only its descriptor", %{db: db} do
+    sentinel = "accepted-body-read-secret-#{System.unique_integer([:positive])}"
+
+    detail = %{
+      id: "wi_1",
+      body: sentinel,
+      bodyUpdatedByUser: "flynn",
+      bodyUpdatedBySession: nil,
+      bodyUpdatedAt: 123
+    }
+
+    result = %{workItem: detail, assignments: []}
+
+    call = %{
+      verb: "work-item-get",
+      origin: "user:flynn",
+      session_key: nil,
+      params: %{work_item_id: "wi_1"}
+    }
+
+    assert {:ok, ^result} = Dispatch.dispatch(db, %{"work-item-get" => fn _ -> result end}, call)
+
+    {:ok, [[payload]]} = DB.query(db, "SELECT payload FROM events ORDER BY id DESC LIMIT 1")
+    digest = :crypto.hash(:sha256, sentinel) |> Base.encode16(case: :lower)
+    refute payload =~ sentinel
+    refute payload =~ "bodyUpdatedByUser"
+    refute payload =~ "bodyUpdatedBySession"
+    refute payload =~ "bodyUpdatedAt"
+    assert payload =~ "bodyRead"
+    assert payload =~ "present"
+    assert payload =~ Integer.to_string(byte_size(sentinel))
+    assert payload =~ digest
   end
 
   test "ruling CAS loss emits a queryable E1 denial", %{db: db} do
