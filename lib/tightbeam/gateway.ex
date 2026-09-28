@@ -7439,7 +7439,16 @@ defmodule Tightbeam.Gateway do
         _ -> :ok
       end
 
-      if opts[:allow_queued] != true and Ledger.pending_count(db, session_key) > 0,
+      # A restarted lane can be idle while a durable running row still has a
+      # live provider request. Allowing queued turns must not skip this guard.
+      turn_in_progress? =
+        if opts[:allow_queued] == true do
+          Ledger.running?(db, session_key)
+        else
+          Ledger.pending_count(db, session_key) > 0
+        end
+
+      if turn_in_progress?,
         do: {:tune_refused, :turn_in_progress},
         else: fun.()
     end)
