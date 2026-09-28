@@ -1175,10 +1175,15 @@ fn split_args(args: Vec<String>) -> Flags {
                 }
             } else {
                 let next = args.get(index + 1);
-                if next.is_none() || next.is_some_and(|value| value.starts_with("--")) {
+                let missing = next.is_none() || next.is_some_and(|value| value.starts_with("--"));
+                if missing {
                     missing_values.insert(name.to_owned());
                 }
-                let value = next.cloned().unwrap_or_default();
+                let value = if missing {
+                    String::new()
+                } else {
+                    next.cloned().unwrap_or_default()
+                };
                 if flags.insert(name.to_owned(), value).is_some() {
                     duplicates.insert(name.to_owned());
                 }
