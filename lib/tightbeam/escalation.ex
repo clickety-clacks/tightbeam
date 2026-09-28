@@ -2680,7 +2680,7 @@ defmodule Tightbeam.Escalation do
         session_key: request.raiser_session_key,
         origin: "process:tightbeam",
         prompt: operator_ruling_notification(request.id),
-        due_at: ruled_at + operator_decision_duration(request),
+        due_at: ruled_at,
         condition_kind: "escalation-ruled",
         condition_scope: request.id,
         creator_session_key: via_session,
@@ -3088,11 +3088,7 @@ defmodule Tightbeam.Escalation do
   defp operator_notification_count_in_txn(txn, request) do
     prompt = operator_ruling_notification(request.id)
     expected_creator = request.ruled_via_session_key
-
-    expected_due_at =
-      if is_integer(request.ruled_at),
-        do: request.ruled_at + operator_decision_duration(request),
-        else: nil
+    {settlement_due_at, deadline_relative_due_at} = raiser_wake_due_at_contract(request)
 
     [[count]] =
       Txn.q(
@@ -3102,7 +3098,7 @@ defmodule Tightbeam.Escalation do
         WHERE sessionKey = ?1 AND targetRole IS NULL AND origin = 'process:tightbeam'
           AND prompt = ?2 AND consumer = 'prompt'
           AND conditionKind = 'escalation-ruled' AND conditionScope = ?3
-          AND conditionAfterId < ?4 AND dueAt = ?5 AND targetGate = 0
+          AND conditionAfterId < ?4 AND dueAt IN (?5, ?7) AND targetGate = 0
           AND reresolve IS NULL AND reresolveSeed IS NULL AND reresolveRung IS NULL
           AND ((?6 IS NULL AND creatorSessionKey IS NULL) OR creatorSessionKey = ?6)
           AND ((state = 'pending' AND firedAt IS NULL AND firedBy IS NULL)
@@ -3113,12 +3109,43 @@ defmodule Tightbeam.Escalation do
           prompt,
           request.id,
           request.ruling_fact_id,
-          expected_due_at,
-          expected_creator
+          settlement_due_at,
+          expected_creator,
+          deadline_relative_due_at
         ]
       )
 
     count
+  end
+
+  # Raiser-wake dueAt contract for post-activation rulings.
+  #
+  # Two dueAt values are canonical for the committed raiser wake, and nothing
+  # else is:
+  #
+  #   settlement        dueAt = ruledAt
+  #                     Written by every ruling since the settlement-time wake,
+  #                     so `fire_due` recovers a lost post-commit nudge at once.
+  #
+  #   deadline-relative dueAt = ruledAt + (deadlineAt - raisedAt)
+  #                     Written by rulings that predate the settlement-time
+  #                     wake. Those rows share the post-activation fact epoch,
+  #                     so they are accepted by name here rather than through
+  #                     an epoch bump or a migration that rewrites history.
+  #
+  # A wake at any other dueAt is dirt and fails `raiserNotificationWake`.
+  # Only the integrity check reads this contract; new rulings always write
+  # the settlement form.
+  defp raiser_wake_due_at_contract(request) do
+    settlement = if is_integer(request.ruled_at), do: request.ruled_at, else: nil
+
+    deadline_relative =
+      if is_integer(settlement) and is_integer(request.deadline_at) and
+           is_integer(request.raised_at) and request.deadline_at > request.raised_at,
+         do: settlement + (request.deadline_at - request.raised_at),
+         else: nil
+
+    {settlement, deadline_relative}
   end
 
   defp performer_principal_valid?(request, :post_activation),
@@ -3337,13 +3364,6 @@ defmodule Tightbeam.Escalation do
   end
 
   defp operator_options_valid?(_options), do: false
-
-  defp operator_decision_duration(request)
-       when is_integer(request.deadline_at) and is_integer(request.raised_at) and
-              request.deadline_at > request.raised_at,
-       do: request.deadline_at - request.raised_at
-
-  defp operator_decision_duration(_request), do: decision_deadline_ms()
 
   defp get_raw(_db, nil), do: nil
 

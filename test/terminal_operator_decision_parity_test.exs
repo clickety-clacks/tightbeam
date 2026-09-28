@@ -158,6 +158,36 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
              "Decision request #{request.id} was ruled. Read it with tightbeam decision-request --request #{request.id}."
   end
 
+  test "committed ruling wake remains immediately deliverable when the post-commit nudge is lost",
+       ctx do
+    request = Escalation.operator_ask(ctx.db, ask_call(ctx.raiser, %{question: "recover wake?"}))
+
+    ruled =
+      Escalation.operator_rule(
+        ctx.db,
+        rule_call(request.id, %{decision: "accept"})
+      )
+
+    assert {:ok, [["pending", due_at]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,dueAt FROM wakes WHERE conditionKind='escalation-ruled' AND conditionScope=?1",
+               [request.id]
+             )
+
+    assert due_at == ruled.ruled_at
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+
+    assert {:ok, [["fired", "condition"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,firedBy FROM wakes WHERE conditionKind='escalation-ruled' AND conditionScope=?1",
+               [request.id]
+             )
+
+    assert turn_count(ctx.db, wake_id_for(ctx.db, request.id)) == 1
+  end
+
   test "exact ruling replay validates a corrupt visible terminal row before interpreting it",
        ctx do
     request = Escalation.operator_ask(ctx.db, ask_call(ctx.raiser, %{question: "replay?"}))
@@ -526,7 +556,7 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
     assert insert_message =~ "decision_request_integrity_invalid"
   end
 
-  test "ruling wake preserves the request's stored decision duration", ctx do
+  test "ruling wake is due at settlement despite the request's stored decision duration", ctx do
     request =
       Escalation.operator_ask(
         ctx.db,
@@ -547,7 +577,89 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
                [request.id]
              )
 
-    assert due_at == ruled.ruled_at + 12_345
+    assert due_at == ruled.ruled_at
+  end
+
+  test "rulings written before the settlement-time wake stay valid on list, detail, and replay",
+       ctx do
+    # Databases written before the settlement-time wake carry post-activation
+    # rulings whose raiser wake is due at ruledAt + (deadlineAt - raisedAt).
+    # Both a still-pending and an already-fired old wake must remain readable
+    # without an epoch bump or migration, while any other dueAt stays refused.
+    duration = 12_345
+
+    cases =
+      for {label, opts} <- [{"old pending", []}, {"old fired", [scheduler: ctx.scheduler]}] do
+        request =
+          Escalation.operator_ask(
+            ctx.db,
+            ask_call(ctx.raiser, %{question: "#{label} wake?", deadline: duration})
+          )
+
+        call = rule_call(request.id, %{decision: "accept"})
+        ruled = Escalation.operator_rule(ctx.db, call, opts)
+        assert ruled.deadline_at - ruled.raised_at == duration
+
+        :ok =
+          DB.execute(
+            ctx.db,
+            "UPDATE wakes SET dueAt=#{ruled.ruled_at + duration} WHERE conditionKind='escalation-ruled' AND conditionScope='#{request.id}'"
+          )
+
+        {label, request, call, ruled}
+      end
+
+    assert {:ok, [["pending"], ["fired"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state FROM wakes WHERE conditionKind='escalation-ruled' ORDER BY state DESC"
+             )
+
+    for {_label, request, call, ruled} <- cases do
+      assert %{id: id, status: "ruled", decision: "accept"} =
+               Escalation.get(ctx.db, call, request.id, owner_user_id: "flynn")
+
+      assert id == request.id
+
+      replay = Escalation.operator_rule(ctx.db, call, scheduler: ctx.scheduler)
+      assert replay.id == request.id
+      assert replay.ruling_fact_id == ruled.ruling_fact_id
+    end
+
+    {_label, _request, list_call, _ruled} = hd(cases)
+    listed = Escalation.list(ctx.db, list_call, "ruled", owner_user_id: "flynn")
+    assert Enum.sort(Enum.map(listed, & &1.id)) == Enum.sort(Enum.map(cases, &elem(&1, 1).id))
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM decision_request_integrity_evidence")
+
+    assert {:ok, [[1, 1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT SUM(state='pending'), SUM(state='fired') FROM wakes WHERE conditionKind='escalation-ruled'"
+             )
+
+    # The old contract is exactly the stored decision duration: any other
+    # deadline-relative offset is still dirt.
+    {_label, tampered, tampered_call, tampered_ruled} = hd(cases)
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        "UPDATE wakes SET dueAt=#{tampered_ruled.ruled_at + duration + 1} WHERE conditionKind='escalation-ruled' AND conditionScope='#{tampered.id}'"
+      )
+
+    assert %{code: "decision_request_integrity_invalid", request_id: request_id} =
+             Escalation.get(ctx.db, tampered_call, tampered.id, owner_user_id: "flynn")
+
+    assert request_id == tampered.id
+
+    assert {:ok, [[~s(["raiserNotificationWake"])]]} =
+             DB.query(
+               ctx.db,
+               "SELECT failingFields FROM decision_request_integrity_evidence WHERE requestId=?1",
+               [tampered.id]
+             )
   end
 
   test "list validates every admitted invalid row and refuses the lexical first id", ctx do
@@ -1353,6 +1465,17 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
   defp turn_count(db, wake_id) do
     {:ok, [[count]]} = DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [wake_id])
     count
+  end
+
+  defp wake_id_for(db, request_id) do
+    {:ok, [[wake_id]]} =
+      DB.query(
+        db,
+        "SELECT wakeId FROM wakes WHERE conditionKind='escalation-ruled' AND conditionScope=?1",
+        [request_id]
+      )
+
+    wake_id
   end
 
   defp failure_trigger_suffix(:wake), do: "wake"
