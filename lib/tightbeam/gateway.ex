@@ -8561,7 +8561,15 @@ defmodule Tightbeam.Gateway do
   defp reap_retired_sessions(config, db, session_keys) do
     coordinator = Map.get(config, :adapter_coordinator, Tightbeam.AdapterCoordinator)
 
-    Enum.each(session_keys, &archive_retired_workspace(config, db, &1))
+    Enum.each(session_keys, fn session_key ->
+      case archive_retired_workspace(config, db, session_key) do
+        :ok ->
+          :ok
+
+        {:error, reason} ->
+          record_retirement_cleanup_failure(db, session_key, reason)
+      end
+    end)
 
     session_keys
     |> Enum.flat_map(fn session_key ->
@@ -8589,23 +8597,44 @@ defmodule Tightbeam.Gateway do
   end
 
   defp archive_retired_workspace(config, db, session_key) do
-    with session when not is_nil(session) <- Org.get(db, session_key) do
-      host = Placement.hosts(config.base_dir, db)[session.host]
+    case Org.get(db, session_key) do
+      nil ->
+        {:error, :retired_session_missing}
 
-      # Remote workspaces are derivable but not locally accessible. Reap has
-      # no remote workspace-removal mechanism, so v1 flips their rows only.
-      workspace_path =
-        if host && host.ssh == nil,
-          do: Placement.workdir_path(config, session),
-          else: nil
+      session ->
+        case Placement.hosts(config.base_dir, db)[session.host] do
+          %{ssh: nil} ->
+            Artifacts.archive_session(
+              db,
+              session_key,
+              Placement.workdir_path(config, session),
+              Path.join(config.base_dir, "archive")
+            )
 
-      Artifacts.archive_session(
-        db,
-        session_key,
-        workspace_path,
-        Path.join(config.base_dir, "archive")
-      )
+          %{ssh: ssh} when is_binary(ssh) and ssh != "" ->
+            # A nil workspace made relative remote origins look unresolvable
+            # and could release their rows even though no remote cleanup ran.
+            # Keep the rows untouched until an original-host runner can report
+            # a truthful cleanup result.
+            {:error, {:remote_workspace_cleanup_unsupported, session.host}}
+
+          nil ->
+            {:error, {:retirement_host_unknown, session.host}}
+        end
     end
+  rescue
+    error -> {:error, {:retired_workspace_cleanup_failed, error}}
+  catch
+    kind, reason -> {:error, {:retired_workspace_cleanup_failed, kind, reason}}
+  end
+
+  defp record_retirement_cleanup_failure(db, session_key, reason) do
+    EventLog.lifecycle(
+      db,
+      "retired_workspace_cleanup_incomplete",
+      session_key,
+      describe_error(reason)
+    )
   rescue
     _ -> :ok
   catch

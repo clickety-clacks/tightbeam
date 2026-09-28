@@ -953,6 +953,96 @@ defmodule Tightbeam.GatewayTest do
     assert unchanged_external.home == nil
   end
 
+  test "remote workspace cleanup refusal is visible and keeps artifact rows in place", ctx do
+    ensure_global_registry()
+
+    base_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "gateway_remote_artifact_#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf!(base_dir) end)
+    :ok = File.mkdir_p(base_dir)
+
+    {:ok, _host} =
+      Placement.register_host(ctx.db, "retire_remote", %{
+        ssh: "retire-remote",
+        base_dir: "/remote/tightbeam"
+      })
+
+    session = create_session(ctx.db, "remote-artifact-retire", "flynn")
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE sessions SET host=?2 WHERE sessionKey=?1", [
+        session.session_key,
+        "retire_remote"
+      ])
+
+    session = Org.get(ctx.db, session.session_key)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO work_items (id, title, ownerUserId, createdByUser, createdAt)
+        VALUES ('wi_remote_artifact', 'Remote artifact', 'flynn', 'flynn', 1)
+        """
+      )
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO messages (id, sessionKey, role, content, timestamp, llmVisibleMessageId)
+        VALUES ('msg_remote_artifact', ?1, 'assistant', 'artifact-record', 1, 'msg_remote_artifact')
+        """,
+        [session.session_key]
+      )
+
+    artifact =
+      Artifacts.record(ctx.db, %{
+        principal: {:session, session.session_key},
+        session_key: session.session_key,
+        artifact_base_dir: base_dir,
+        recorded_message_id: "msg_remote_artifact",
+        params: %{
+          kind: "report",
+          title: "Remote report",
+          origin_path: "reports/remote.md",
+          work_item_id: "wi_remote_artifact"
+        }
+      })
+
+    parent = self()
+
+    result =
+      Gateway.handlers(%{
+        db: ctx.db,
+        base_dir: base_dir,
+        wake_tick_ms: 1_000,
+        sh: fn invocation ->
+          send(parent, {:unexpected_remote_cleanup, invocation})
+          {"", 0}
+        end
+      })["retire"].(%{
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        session_key: session.session_key,
+        params: %{}
+      })
+
+    assert result.retired_session_keys == [session.session_key]
+    assert %{state: "in-workspace", home: nil} = Artifacts.get(ctx.db, artifact.artifact_id)
+    refute_receive {:unexpected_remote_cleanup, _invocation}
+
+    assert Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
+             event.kind == "retired_workspace_cleanup_incomplete" and
+               event.subject == session.session_key and
+               event.detail =~ "remote_workspace_cleanup_unsupported"
+           end)
+  end
+
   test "retiring with a live adapter sibling leaves the adapter up and records residency", ctx do
     ensure_global_registry()
     retired = create_session(ctx.db, "reap-sibling-retired", "flynn")
