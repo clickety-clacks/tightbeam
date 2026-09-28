@@ -8616,10 +8616,15 @@ defmodule Tightbeam.Gateway do
         end
     end
   rescue
-    error -> retirement_cleanup_failure(db, session_key, {:retired_workspace_cleanup_failed, error})
+    error ->
+      retirement_cleanup_failure(db, session_key, {:retired_workspace_cleanup_failed, error})
   catch
     kind, reason ->
-      retirement_cleanup_failure(db, session_key, {:retired_workspace_cleanup_failed, kind, reason})
+      retirement_cleanup_failure(
+        db,
+        session_key,
+        {:retired_workspace_cleanup_failed, kind, reason}
+      )
   end
 
   defp retirement_cleanup_failure(db, session_key, reason) do

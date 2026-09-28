@@ -174,6 +174,7 @@ defmodule Tightbeam.WorkspaceCleanup do
     with true <- Path.type(workspace) == :absolute,
          false <- contains_line_break?(workspace) do
       root = Path.expand(workspace)
+
       rows =
         Txn.q(
           txn,
@@ -340,9 +341,15 @@ defmodule Tightbeam.WorkspaceCleanup do
   defp execution_report({output, status}) when is_binary(output) and is_integer(status) do
     {removed, errors, done, diagnostics} = parse_output(output)
 
-    command_errors = if status == 0, do: [], else: [%{reason: "cleanup_command_failed", exit: status}]
-    confirmation_errors = if done in [0, 1], do: [], else: [%{reason: "cleanup_result_unconfirmed"}]
-    incomplete_errors = if done == 1 and errors == [], do: [%{reason: "cleanup_incomplete"}], else: []
+    command_errors =
+      if status == 0, do: [], else: [%{reason: "cleanup_command_failed", exit: status}]
+
+    confirmation_errors =
+      if done in [0, 1], do: [], else: [%{reason: "cleanup_result_unconfirmed"}]
+
+    incomplete_errors =
+      if done == 1 and errors == [], do: [%{reason: "cleanup_incomplete"}], else: []
+
     blockers = errors ++ command_errors ++ confirmation_errors ++ incomplete_errors
 
     completed? = status == 0 and done == 0 and errors == []
@@ -380,17 +387,25 @@ defmodule Tightbeam.WorkspaceCleanup do
 
   defp parse_output(output) do
     Enum.reduce(String.split(output, "\n", trim: true), {[], [], nil, []}, fn line,
-                                                                                 {removed, errors,
-                                                                                  done, diagnostics} ->
+                                                                              {removed, errors,
+                                                                               done, diagnostics} ->
       case String.split(line, "\t") do
         ["R", hex] ->
           case decode_path(hex) do
-            {:ok, path} -> {removed ++ [path], errors, done, diagnostics}
-            :error -> {removed, errors ++ [%{reason: "cleanup_report_invalid"}], done, diagnostics}
+            {:ok, path} ->
+              {removed ++ [path], errors, done, diagnostics}
+
+            :error ->
+              {removed, errors ++ [%{reason: "cleanup_report_invalid"}], done, diagnostics}
           end
 
         ["E", reason, hex] ->
-          path = case decode_path(hex) do {:ok, decoded} -> decoded; :error -> nil end
+          path =
+            case decode_path(hex) do
+              {:ok, decoded} -> decoded
+              :error -> nil
+            end
+
           {removed, errors ++ [%{reason: reason, path: path}], done, diagnostics}
 
         ["DONE", "0"] ->

@@ -859,7 +859,8 @@ defmodule Tightbeam.GatewayTest do
     assert_receive {:DOWN, ^monitor, :process, ^adapter, :normal}
   end
 
-  test "retirement removes unregistered local files and preserves registered file and directory paths", ctx do
+  test "retirement removes unregistered local files and preserves registered file and directory paths",
+       ctx do
     ensure_global_registry()
 
     base_dir =
@@ -1013,6 +1014,7 @@ defmodule Tightbeam.GatewayTest do
     checkout = remote_artifact(ctx.db, fixture, "checkout", "registered-checkout")
 
     parent = self()
+
     fake_ssh = fn invocation, script, input ->
       send(parent, {:remote_cleanup_invocation, invocation})
       Tightbeam.WorkspaceCleanup.system_runner(["sh", "-c", script], script, input)
@@ -1084,10 +1086,12 @@ defmodule Tightbeam.GatewayTest do
                command_exit: 255
              } = cleanup
            ] = result.workspace_cleanup
+
     assert_receive {:remote_cleanup_invocation, invocation}
     assert "retire-failure" in invocation
     assert File.read!(retained_path) == "retained after failed dispatch"
     assert Artifacts.get(ctx.db, artifact.artifact_id).state == "in-workspace"
+
     assert Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
              event.kind == "retired_workspace_cleanup_incomplete" and
                event.subject == fixture.session.session_key and
@@ -1130,6 +1134,7 @@ defmodule Tightbeam.GatewayTest do
 
     assert [%{status: "incomplete", blockers: [%{reason: "artifact_origin_ambiguous"}]}] =
              result.workspace_cleanup
+
     assert File.read!(artifact_path) == "legacy artifact"
     events = EventLog.lifecycle_events(ctx.db)
 
@@ -9201,8 +9206,14 @@ defmodule Tightbeam.GatewayTest do
     workspace = Placement.workdir_path(%{base_dir: base_dir, db: db}, session)
     File.mkdir_p!(workspace)
 
-    %{base_dir: base_dir, host_name: host_name, ssh: ssh, work_item_id: work_item_id,
-      session: session, workspace: workspace}
+    %{
+      base_dir: base_dir,
+      host_name: host_name,
+      ssh: ssh,
+      work_item_id: work_item_id,
+      session: session,
+      workspace: workspace
+    }
   end
 
   defp remote_artifact(db, fixture, suffix, origin_path) do
