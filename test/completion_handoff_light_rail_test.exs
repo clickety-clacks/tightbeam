@@ -159,6 +159,18 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     assert turn_count(ctx.db, root.wake_id) == 1
     assert reminders(ctx.db, root.wake_id) == []
 
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM assignments WHERE holderKey='notice-parent' AND state='open'"
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM attests WHERE bySession='notice-parent' AND kind='progress' AND note LIKE 'completion-handoff-action %'"
+             )
+
     _later_assignment =
       handle(
         ctx,
@@ -294,29 +306,45 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     packaged_manual =
       Application.app_dir(:tightbeam, "priv/guidance/operating-manual.md")
       |> File.read!()
+      |> String.replace(~r/\s+/, " ")
 
     assert packaged_manual =~ "copy `assignment_id`, `source_kind`, and `source_token`"
 
     assert packaged_manual =~
-             "completion-handoff-action <assignment_id> <source_kind> <source_token> <kept|parked|retired> — <what you did>"
+             "completion-handoff-action <assignment_id> <source_kind> <source_token> <kept|parked|retired>: <what you did>"
 
-    assert packaged_manual =~ "preserve the literal em dash (`—`)"
-    assert packaged_manual =~ "no reminder is scheduled and there is no lawful"
-    assert packaged_manual =~ "do not self-assign or fabricate an acknowledgment"
+    assert packaged_manual =~ "use the plain ASCII colon after the outcome"
+    refute packaged_manual =~ "preserve the literal em dash"
+    assert packaged_manual =~ "No reminder is scheduled"
+
+    assert Regex.match?(
+             ~r/No reminder is scheduled without a lawful\s+progress-attest destination/,
+             packaged_manual
+           )
+
+    assert packaged_manual =~ "Do not self-assign or fabricate an acknowledgment"
 
     :initialized = Tightbeam.Identity.init!(base)
     revision = Tightbeam.Identity.live_revision!(base)
 
     for harness <- [:codex, :claude] do
       snapshot = Tightbeam.Identity.snapshot_at!(base, revision, "default", harness)
-      assert snapshot.guidance =~ "copy `assignment_id`, `source_kind`, and `source_token`"
+      guidance = String.replace(snapshot.guidance, ~r/\s+/, " ")
+      assert guidance =~ "copy `assignment_id`, `source_kind`, and `source_token`"
 
-      assert snapshot.guidance =~
-               "completion-handoff-action <assignment_id> <source_kind> <source_token> <kept|parked|retired> — <what you did>"
+      assert guidance =~
+               "completion-handoff-action <assignment_id> <source_kind> <source_token> <kept|parked|retired>: <what you did>"
 
-      assert snapshot.guidance =~ "preserve the literal em dash (`—`)"
-      assert snapshot.guidance =~ "no reminder is scheduled and there is no lawful"
-      assert snapshot.guidance =~ "do not self-assign or fabricate an acknowledgment"
+      assert guidance =~ "use the plain ASCII colon after the outcome"
+      refute guidance =~ "preserve the literal em dash"
+      assert guidance =~ "No reminder is scheduled"
+
+      assert Regex.match?(
+               ~r/No reminder is scheduled without a lawful\s+progress-attest destination/,
+               guidance
+             )
+
+      assert guidance =~ "Do not self-assign or fabricate an acknowledgment"
       refute Regex.match?(~r/^#include/m, snapshot.guidance)
     end
   end
@@ -366,6 +394,16 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
                ctx,
                "attest",
                progress_call({:session, "notice-parent"}, parent_assignment.id, wrong_note)
+             )
+
+    wrong_occurrence =
+      "completion-handoff-action #{child_assignment.id} attest #{root.wake_id} kept: kept the child"
+
+    assert %{attest: %{kind: "progress"}} =
+             handle(
+               ctx,
+               "attest",
+               progress_call({:session, "notice-parent"}, parent_assignment.id, wrong_occurrence)
              )
 
     assert [^pending] = pending_reminders(ctx.db, root.wake_id)
@@ -490,7 +528,7 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
   defp action_note(child_assignment_id, root, action, detail) do
     [source_kind, source_token] = terminal_source(root.prompt)
 
-    "completion-handoff-action #{child_assignment_id} #{source_kind} #{source_token} #{action} — #{detail}"
+    "completion-handoff-action #{child_assignment_id} #{source_kind} #{source_token} #{action}: #{detail}"
   end
 
   defp terminal_source(prompt) do
