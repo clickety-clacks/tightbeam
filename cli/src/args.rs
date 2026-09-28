@@ -1175,19 +1175,15 @@ fn split_args(args: Vec<String>) -> Flags {
                 }
             } else {
                 let next = args.get(index + 1);
-                let missing = next.is_none() || next.is_some_and(|value| value.starts_with("--"));
+                let missing = next.is_none();
                 if missing {
                     missing_values.insert(name.to_owned());
                 }
-                let value = if missing {
-                    String::new()
-                } else {
-                    next.cloned().unwrap_or_default()
-                };
+                let value = next.cloned().unwrap_or_default();
                 if flags.insert(name.to_owned(), value).is_some() {
                     duplicates.insert(name.to_owned());
                 }
-                if next.is_some_and(|value| !value.starts_with("--")) {
+                if next.is_some() {
                     index += 1;
                 }
             }
@@ -1261,14 +1257,14 @@ fn split_work_item_update_args(args: Vec<String>) -> Flags {
                 }
             } else {
                 let next = args.get(index + 1);
-                if next.is_none() || next.is_some_and(|value| value.starts_with("--")) {
+                if next.is_none() {
                     missing_values.insert(name.to_owned());
                 }
                 let value = next.cloned().unwrap_or_default();
                 if flags.insert(name.to_owned(), value).is_some() {
                     duplicates.insert(name.to_owned());
                 }
-                if next.is_some_and(|value| !value.starts_with("--")) {
+                if next.is_some() {
                     index += 1;
                 }
             }
@@ -6354,8 +6350,25 @@ mod tests {
             "--second",
             "value",
         ]));
-        assert_eq!(adjacent.flags.get("first"), Some(&String::new()));
-        assert_eq!(adjacent.flags.get("second"), Some(&"value".to_owned()));
-        assert!(adjacent.missing_values.contains("first"));
+        assert_eq!(adjacent.flags.get("first"), Some(&"--second".to_owned()));
+        assert!(!adjacent.flags.contains_key("second"));
+        assert!(!adjacent.missing_values.contains("first"));
+
+        let prefixed_note = split_args(strings(&["attest", "--note", "--see x"]));
+        assert_eq!(prefixed_note.flags.get("note"), Some(&"--see x".to_owned()));
+        assert!(!prefixed_note.missing_values.contains("note"));
+    }
+
+    #[test]
+    fn work_item_update_metadata_consumes_prefixed_values() {
+        let update = split_args(strings(&[
+            "work-item-update",
+            "wi_1",
+            "--title",
+            "--prefixed",
+        ]));
+        assert_eq!(update.flags.get("title"), Some(&"--prefixed".to_owned()));
+        assert!(!update.flags.contains_key("prefixed"));
+        assert!(!update.missing_values.contains("title"));
     }
 }
