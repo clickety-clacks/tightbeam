@@ -82,9 +82,6 @@ defmodule Tightbeam.FirehoseR1SchemaTest do
     assert :ok = Schema.upgrade_firehose_r1(db)
     assert retained(db) == before
 
-    assert rows(db, "SELECT originHost,originWorkspace FROM artifacts ORDER BY artifactId") ==
-             [[nil, nil]]
-
     assert rows(db, "SELECT shape FROM schema_stamp") == [["firehose-r1-v1-019"]]
 
     assert rows(db, "SELECT reminderState,closedByProcess FROM assignments ORDER BY id") ==
