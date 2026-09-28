@@ -1642,11 +1642,13 @@ defmodule Tightbeam.HarnessHealthTest do
                  "AND status='queued'"
              )
 
+    healthy_session = Org.get(ctx.db, healthy.session)
+
     assert {:ok, :ok} =
              DB.transaction(ctx.db, fn txn ->
                HarnessHealth.resolve_normal_turn_in_txn(
                  txn,
-                 Org.get(ctx.db, healthy.session),
+                 healthy_session,
                  restoration
                )
              end)
@@ -1705,11 +1707,13 @@ defmodule Tightbeam.HarnessHealthTest do
                [restoration.seq]
              )
 
+    healthy_session = Org.get(ctx.db, healthy.session)
+
     assert {:ok, :ok} =
              DB.transaction(ctx.db, fn txn ->
                HarnessHealth.resolve_normal_turn_in_txn(
                  txn,
-                 Org.get(ctx.db, healthy.session),
+                 healthy_session,
                  restoration
                )
              end)
