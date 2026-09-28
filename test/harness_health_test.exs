@@ -1537,16 +1537,20 @@ defmodule Tightbeam.HarnessHealthTest do
   end
 
   test "once-only health redelivery survives restart and a second typed incident", _ctx do
-    path =
+    base =
       Path.join(
         System.tmp_dir!(),
-        "harness-health-redelivery-#{System.unique_integer([:positive])}.db"
+        "harness-health-redelivery-#{System.unique_integer([:positive, :monotonic])}"
       )
 
+    File.mkdir_p!(base)
+    on_exit(fn -> File.rm_rf!(base) end)
+    path = Path.join(base, "state.db")
     {:ok, db} = DB.start_link(path: path, name: nil, guard_inputs: [])
 
     try do
       :ok = ensure_all_schemas(db)
+      :ok = DB.assert_base_admitted!(db, base)
       owner = "health-redelivery-restart"
       ensure_main_session(db, owner)
 
@@ -1661,6 +1665,7 @@ defmodule Tightbeam.HarnessHealthTest do
 
       try do
         :ok = ensure_all_schemas(reopened)
+        :ok = DB.assert_base_admitted!(reopened, base)
 
         assert {:ok, 0} =
                  DB.transaction(reopened, fn txn ->
@@ -1685,9 +1690,6 @@ defmodule Tightbeam.HarnessHealthTest do
       end
     after
       if Process.alive?(db), do: GenServer.stop(db)
-      File.rm_rf!(path)
-      File.rm_rf!(path <> "-wal")
-      File.rm_rf!(path <> "-shm")
     end
   end
 

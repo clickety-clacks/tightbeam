@@ -566,6 +566,8 @@ defmodule Tightbeam.EscalationDeliveryFixture do
               "append_and_enqueue_in_txn/7"} => 1,
              {"lib/tightbeam/harness_health.ex", "Ledger.enqueue_in_txn/2",
               "incident_notice_in_txn/4"} => 1,
+             {"lib/tightbeam/wakes.ex", "Ledger.enqueue_in_txn/2",
+              "redeliver_health_source_in_txn/3"} => 1,
              {"lib/tightbeam/ledger.ex", "Ledger.enqueue_in_txn/2", "enqueue/2"} => 1,
              {"lib/tightbeam/ledger.ex", "Ledger.enqueue_in_txn/2", "append_repair_attempt/5"} =>
                1
