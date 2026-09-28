@@ -4636,6 +4636,7 @@ mod tests {
                 "settle-turn",
                 "repair-assignment",
                 "assignment-commitref-correct",
+                "assignment-stop-turn",
                 "revoke-assignment",
                 "reopen-assignment",
                 "spawn",
