@@ -7633,7 +7633,7 @@ defmodule Tightbeam.Gateway do
                 SELECT 1 FROM turns
                 WHERE turns.messageId = messages.id
                   AND turns.status = 'canceled'
-                  AND turns.error LIKE 'queued-message-suppressed:%'
+                  AND turns.error = 'queued-message-suppressed: sender_requested_replacement'
                   AND EXISTS (
                     SELECT 1 FROM lifecycle_events
                     WHERE lifecycle_events.kind = 'queued_message_suppressed'

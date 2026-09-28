@@ -6732,7 +6732,8 @@ defmodule Tightbeam.GatewayTest do
     send(runner, :finish_set_harness_turn)
   end
 
-  test "queued set_harness handoff excludes QMS sources and keeps other durable order", ctx do
+  test "queued set_harness handoff excludes exact replacement QMS sources and keeps other durable order",
+       ctx do
     candidate = start_supervised!({BlockingCandidateAdapterStub, self()})
     {config, _local_host} = queued_harness_switch_config!(ctx, "queued-handoff", candidate)
 
@@ -6813,6 +6814,31 @@ defmodule Tightbeam.GatewayTest do
                Tightbeam.QueuedMessageSuppression.suppress_before_claim_in_txn(txn, "k1")
              end)
 
+    {other_suppressed_seq, other_suppressed_message} =
+      enqueue_gateway_prompt!(
+        ctx.db,
+        "k1",
+        "user:flynn",
+        "other suppression reason durable context"
+      )
+
+    assert {:ok, true} =
+             DB.transaction(ctx.db, fn txn ->
+               Ledger.cancel_queued_in_txn(
+                 txn,
+                 other_suppressed_seq,
+                 "queued-message-suppressed: another_reason"
+               )
+             end)
+
+    :ok =
+      EventLog.lifecycle(
+        ctx.db,
+        "queued_message_suppressed",
+        Integer.to_string(other_suppressed_seq),
+        JSON.encode!(%{messageKind: "liveness"})
+      )
+
     {unattributed_canceled_seq, unattributed_canceled_message} =
       enqueue_gateway_prompt!(
         ctx.db,
@@ -6852,6 +6878,7 @@ defmodule Tightbeam.GatewayTest do
     assert guidance =~ ~s("sender":"user:flynn")
     assert guidance =~ ~s("sender":"agent:reviewer")
     refute guidance =~ "superseded liveness notice"
+    assert guidance =~ "other suppression reason durable context"
     assert guidance =~ "unattributed canceled durable context"
     assert String.index(guidance, "prior durable user context") <
              String.index(guidance, "prior durable agent context")
@@ -6878,6 +6905,7 @@ defmodule Tightbeam.GatewayTest do
 
     assert queued_rows == [
              [suppressed_seq, "canceled", suppressed_message.id],
+             [other_suppressed_seq, "canceled", other_suppressed_message.id],
              [unattributed_canceled_seq, "canceled", unattributed_canceled_message.id],
              [first_seq, "queued", first_message.id],
              [second_seq, "queued", second_message.id],
@@ -6887,7 +6915,7 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, [[error]]} =
              DB.query(ctx.db, "SELECT error FROM turns WHERE seq=?1", [suppressed_seq])
 
-    assert error =~ "queued-message-suppressed:"
+    assert error == "queued-message-suppressed: sender_requested_replacement"
 
     assert Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
              event.kind == "queued_message_suppressed" and
