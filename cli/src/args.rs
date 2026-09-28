@@ -2554,11 +2554,11 @@ fn parse_with_optional_catalog(
         }
         "work-item-update" => {
             let metadata_usage = "usage: tightbeam work-item-update <workItemId> [--title \"...\"] [--spec-ref <name>] [--spec-sha256 <hex>] [--clear-spec-ref] [--priority <0..8>]";
-            let body_usage =
-                "usage: tightbeam work-item-update <workItemId> (--body <text> | --body=<text> | --clear-body)";
+            let body_usage = "usage: tightbeam work-item-update <workItemId> (--body <text> | --body=<text> | --clear-body)";
 
             if !parsed.body_operations.is_empty() {
-                const BODY_ALLOWED: &[&str] = &["body", "clear-body", "as", "as-user", "as-process"];
+                const BODY_ALLOWED: &[&str] =
+                    &["body", "clear-body", "as", "as-user", "as-process"];
 
                 if parsed.positional.len() != 2
                     || parsed.body_operations.len() != 1
@@ -6287,7 +6287,14 @@ mod tests {
             strings(&["work-item-update", "wi_1", "--body", "x", "--clear-body"]),
             strings(&["work-item-update", "wi_1", "--body", "x", "--body", "y"]),
             strings(&["work-item-update", "wi_1", "--body=x", "--body=y"]),
-            strings(&["work-item-update", "wi_1", "--body", "x", "--bogus", "value"]),
+            strings(&[
+                "work-item-update",
+                "wi_1",
+                "--body",
+                "x",
+                "--bogus",
+                "value",
+            ]),
             strings(&["work-item-update", "--body", "x"]),
         ] {
             assert_eq!(parse(args).unwrap_err(), usage);
@@ -6332,12 +6339,7 @@ mod tests {
         ]));
         assert_eq!(inline.flags.get("name=value"), Some(&"tail".to_owned()));
 
-        let clear = split_args(strings(&[
-            "work-item-get",
-            "wi_1",
-            "--clear-body",
-            "next",
-        ]));
+        let clear = split_args(strings(&["work-item-get", "wi_1", "--clear-body", "next"]));
         assert_eq!(clear.flags.get("clear-body"), Some(&"next".to_owned()));
 
         let adjacent = split_args(strings(&[
