@@ -258,6 +258,59 @@ defmodule Tightbeam.DispatchTest do
     assert payload =~ digest
   end
 
+  test "a raised message keeps its text but not its secrets in the reply and audit row",
+       %{db: db} do
+    echoed = fn _call ->
+      raise "login failed: password=fixtureSENTINEL (echo password=fixtureSENTINEL) " <>
+              "via https://svc:fixtureSENTINEL@db.test/x"
+    end
+
+    nested = fn _call ->
+      raise MatchError, term: %{creds: %{"password" => "fixtureSENTINEL"}, status: 401}
+    end
+
+    update = fn _call -> raise "update failed password=fixtureSENTINEL" end
+
+    for {verb, handler} <- [
+          {"post", echoed},
+          {"work-item-create", nested},
+          {"work-item-update", update}
+        ] do
+      call = %{verb: verb, origin: "system", session_key: nil, params: %{}}
+
+      assert {:error, %{code: "server_error", message: message} = error} =
+               Dispatch.dispatch(db, %{verb => handler}, call)
+
+      refute JSON.encode!(error) =~ "SENTINEL"
+      assert message =~ "[REDACTED:secret_field]"
+
+      if verb == "post" do
+        # An unquoted value is masked to the next delimiter, so the `)` goes with it
+        # rather than risk leaving the tail of a secret that contains one.
+        assert message ==
+                 "login failed: password=[REDACTED:secret_field] " <>
+                   "(echo password=[REDACTED:secret_field] via https://[REDACTED:userinfo]@db.test/x"
+      else
+        if verb == "work-item-create" do
+          assert message =~ "no match of right hand side value"
+          assert message =~ ~s("password" => "[REDACTED:secret_field]")
+          assert message =~ "status: 401"
+        else
+          assert message == "update failed password=[REDACTED:secret_field]"
+        end
+      end
+    end
+
+    {:ok, payloads} = DB.query(db, "SELECT payload FROM events ORDER BY id")
+    assert length(payloads) == 3
+
+    for [payload] <- payloads do
+      assert payload =~ "server_error"
+      assert payload =~ "[REDACTED:secret_field]"
+      refute payload =~ "SENTINEL"
+    end
+  end
+
   test "ruling CAS loss emits a queryable E1 denial", %{db: db} do
     call = %{
       verb: "post",

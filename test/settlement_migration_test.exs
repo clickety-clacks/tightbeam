@@ -14,6 +14,7 @@ defmodule Tightbeam.SettlementMigrationTest do
       DROP TABLE turn_lifecycle_events;
       DROP TABLE turn_lifecycle_epoch;
       DROP TABLE wire_idempotency;
+      ALTER TABLE identity_publication_markers DROP COLUMN denialDiagnostic;
       CREATE TABLE wire_idempotency (
         ownerUserId TEXT NOT NULL,
         operation TEXT NOT NULL CHECK(operation IN
@@ -48,7 +49,7 @@ defmodule Tightbeam.SettlementMigrationTest do
     assert {:ok, ^before_ddl} = DB.query(db, preserved_sql)
     assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
 
-    assert {:ok, [["artifact-origin-v1-019"]]} =
+    assert {:ok, [["identity-publication-denial-diagnostic-v1-019"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert {:ok, [["prior-fingerprint", ~s({"prior":true}), nil]]} =

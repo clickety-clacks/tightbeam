@@ -24,6 +24,7 @@ defmodule Tightbeam.ModelCatalog do
   require Logger
 
   alias Tightbeam.{
+    ErrorDiagnostic,
     Harness,
     Id,
     Model,
@@ -737,10 +738,49 @@ defmodule Tightbeam.ModelCatalog do
           {:error, reason}
       end
     rescue
-      error -> {:error, {:exception, Exception.message(error)}}
+      # Keep the old health classification for existing callers and attach the
+      # safe typed node so callers can inspect the same exception and stack.
+      error ->
+        diagnostic =
+          ErrorDiagnostic.exception(error, __STACKTRACE__,
+            operation: "derive_catalog",
+            phase: "catalog_derivation",
+            origin: "model_catalog",
+            host: host,
+            harness: harness
+          )
+
+        Logger.warning("model catalog derivation raised: #{JSON.encode!(diagnostic)}")
+
+        classification =
+          {:exception, error.__struct__, ErrorDiagnostic.redact_text(Exception.message(error))}
+
+        {:error, ErrorDiagnostic.diagnosed(classification, diagnostic)}
     catch
-      kind, reason -> {:error, {kind, reason}}
+      kind, reason ->
+        diagnostic =
+          ErrorDiagnostic.caught(kind, reason, __STACKTRACE__,
+            operation: "derive_catalog",
+            phase: "catalog_derivation",
+            origin: "model_catalog",
+            host: host,
+            harness: harness
+          )
+
+        Logger.warning("model catalog derivation caught: #{JSON.encode!(diagnostic)}")
+
+        classification = {kind, redact_caught_reason(reason)}
+        {:error, ErrorDiagnostic.diagnosed(classification, diagnostic)}
     end
+  end
+
+  defp redact_caught_reason(reason) when is_binary(reason),
+    do: ErrorDiagnostic.redact_text(reason)
+
+  defp redact_caught_reason(reason) do
+    rendered = inspect(reason)
+    redacted = ErrorDiagnostic.redact_text(rendered)
+    if redacted == rendered, do: reason, else: redacted
   end
 
   defp catalog_onboarding_status(Tightbeam.Harness.Pi, _catalog_state, state, host) do

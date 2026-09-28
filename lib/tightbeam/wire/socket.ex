@@ -56,7 +56,7 @@ defmodule Tightbeam.Wire.Socket do
 
   @behaviour WebSock
 
-  alias Tightbeam.{ConnRegistry, DB, Devices, Dispatch, Org, Projection}
+  alias Tightbeam.{ConnRegistry, DB, Devices, Dispatch, ErrorDiagnostic, Org, Projection}
   alias Tightbeam.Wire.Payloads
 
   @max_content_bytes 64 * 1024
@@ -92,8 +92,16 @@ defmodule Tightbeam.Wire.Socket do
   @impl true
   def handle_in({data, opcode: :text}, state) do
     case JSON.decode(data) do
-      {:ok, msg} when is_map(msg) -> route(msg, state)
-      _ -> push(Payloads.wire_error("invalid_message", "malformed json"), state)
+      {:ok, msg} when is_map(msg) ->
+        route(msg, state)
+
+      {:ok, other} ->
+        diagnostic = ErrorDiagnostic.json_decode({:not_object, other}, origin: "wire")
+        push(Payloads.wire_error("invalid_message", "malformed json", nil, diagnostic), state)
+
+      {:error, reason} ->
+        diagnostic = ErrorDiagnostic.json_decode(reason, origin: "wire")
+        push(Payloads.wire_error("invalid_message", "malformed json", nil, diagnostic), state)
     end
   end
 
@@ -450,9 +458,26 @@ defmodule Tightbeam.Wire.Socket do
             push(Payloads.ack(id), state)
 
           {:error, error} ->
-            push(Payloads.wire_error(error[:code] || "server_error", error[:message], id), state)
+            push(dispatch_error_frame(error, id), state)
         end
     end
+  end
+
+  # A handler error keeps its own code, message and diagnostic. Every dispatch
+  # error carries a code today; if one ever arrives without, the frame still says
+  # server_error so clients branch safely, and the diagnostic records that the
+  # code was missing instead of presenting server_error as the handler's own.
+  defp dispatch_error_frame(error, id) do
+    diagnostic =
+      case error[:code] do
+        code when is_binary(code) ->
+          ErrorDiagnostic.for_error(error)
+
+        _missing ->
+          ErrorDiagnostic.new("term", reason: error, code_missing: true)
+      end
+
+    Payloads.wire_error(error[:code] || "server_error", error[:message], id, diagnostic)
   end
 
   defp seed_main_stream(user_id, state) do

@@ -4,12 +4,35 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+use crate::attempt_diagnostic::command_context::CommandContext;
+
 use crate::args::{Command, Identity, Target, ToplineSelection, TuneControl};
+use crate::attempt_diagnostic::{
+    Action, AttemptCause, AttemptRender, DiagnosticCode, DiagnosticOperation, EffectKind,
+    EffectState, FailureDiagnostic, FailurePresentation, GatewayAccepted, ReceiptAvailability,
+    TimeoutBudget,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestSpec {
     pub path: &'static str,
     pub body_json: String,
+    pub(crate) attempt_context: Option<CommandContext>,
+    // I/O context only: never included in the diagnostic/receipt projection.
+    pub(crate) receipt_base_override: Option<PathBuf>,
+}
+
+impl RequestSpec {
+    fn with_attempt_context(mut self, context: Option<CommandContext>) -> Self {
+        self.attempt_context = context;
+        self
+    }
+
+    pub(crate) fn with_doctor_attempt(mut self, receipt_base: &Path) -> Self {
+        self.attempt_context = Some(CommandContext::doctor_sentinels());
+        self.receipt_base_override = Some(receipt_base.to_path_buf());
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,6 +130,8 @@ fn request(
     body.append(&mut fields);
     body.push(params_field(params));
     RequestSpec {
+        attempt_context: None,
+        receipt_base_override: None,
         path: "/agent/dispatch",
         body_json: object(body),
     }
@@ -114,6 +139,11 @@ fn request(
 
 /// Build the dispatch request without performing discovery or network I/O.
 pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
+    let context = CommandContext::for_command(command);
+    build_unobserved_request(command).map(|request| request.with_attempt_context(context))
+}
+
+fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
     match command {
         Command::Help
         | Command::CommandHelp(_)
@@ -189,7 +219,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             let mut params = vec![string_field("kind", kind)];
             if let Some(encoded) = payload {
                 let value: Value = serde_json::from_str(encoded)
-                    .map_err(|_| "--payload requires a JSON object".to_owned())?;
+                    .map_err(|error| format!("--payload requires a JSON object: {error}"))?;
                 if !value.is_object() {
                     return Err("--payload requires a JSON object".to_owned());
                 }
@@ -431,6 +461,8 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
         // tells the gateway to look at this session's running turn NOW, while the
         // command it observed has not run yet.
         Command::ToolCallObserved => Ok(RequestSpec {
+            attempt_context: None,
+            receipt_base_override: None,
             path: "/agent/tool-call-observed",
             body_json: "{}".to_owned(),
         }),
@@ -1584,6 +1616,7 @@ pub fn build_onboard_phase_request(
         params.push(string_field("source", source));
     }
     request(identity, "onboard", vec![], params)
+        .with_attempt_context(Some(CommandContext::onboard()))
 }
 
 /// Build a `wake --user <owner>` request carrying the onboarding sign-in prompt, so the
@@ -1603,6 +1636,7 @@ pub fn build_operator_wake_request(
         vec![string_field("userId", owner_user_id)],
         vec![string_field("prompt", prompt)],
     )
+    .with_attempt_context(Some(CommandContext::onboard()))
 }
 
 pub fn build_register_host_request(
@@ -1625,6 +1659,7 @@ pub fn build_register_host_request(
             string_field("adapterBinDir", adapter_bin_dir),
         ],
     )
+    .with_attempt_context(Some(CommandContext::assimilate_registration()))
 }
 
 pub fn build_update_clients_request(as_user: &str) -> RequestSpec {
@@ -1634,6 +1669,7 @@ pub fn build_update_clients_request(as_user: &str) -> RequestSpec {
         vec![],
         vec![],
     )
+    .with_attempt_context(Some(CommandContext::update_clients()))
 }
 
 pub fn discover() -> Result<Endpoint, String> {
@@ -1925,10 +1961,37 @@ fn send_to_with_timeout(
     request: &RequestSpec,
     timeout: Option<Duration>,
 ) -> Result<Option<Value>, String> {
-    let call = if request.path == "/version" {
-        gateway_request("GET", endpoint, request.path, timeout).call()
+    let tune = is_tune(request);
+    let presentation = if tune {
+        FailurePresentation::Tune
     } else {
-        gateway_request("POST", endpoint, request.path, timeout)
+        FailurePresentation::Ordinary
+    };
+    // Consume an explicit Doctor destination before measuring the actual
+    // transport attempt. Ordinary calls use the same resolved CLI base dir as
+    // the rest of the local projection cache.
+    let receipt_base = request
+        .receipt_base_override
+        .clone()
+        .unwrap_or_else(crate::base_dir::resolve);
+    let method = if request.path == "/version" {
+        "GET"
+    } else {
+        "POST"
+    };
+    let gateway = gateway_request(method, endpoint, request.path, timeout);
+    let mut attempt = crate::attempt_diagnostic::observation::begin_gateway_attempt(
+        request.attempt_context,
+        method,
+        request.path,
+        timeout,
+    );
+    let gateway =
+        crate::attempt_diagnostic::observation::attach_request_id(gateway, attempt.as_ref());
+    let call = if method == "GET" {
+        gateway.call()
+    } else {
+        gateway
             .set("content-type", "application/json")
             .send_string(&request.body_json)
     };
@@ -1936,39 +1999,98 @@ fn send_to_with_timeout(
     let (status, response) = match call {
         Ok(response) => (response.status(), response),
         Err(ureq::Error::Status(status, response)) => (status, response),
-        Err(ureq::Error::Transport(error)) => return Err(error.to_string()),
+        Err(ureq::Error::Transport(error)) => {
+            return Err(match attempt.take() {
+                Some(attempt) => {
+                    let completed = attempt.fail_transport(&error, &receipt_base);
+                    transport_failure_with_attempt(&error, Some(completed.render()), presentation)
+                }
+                None => transport_failure(&error),
+            });
+        }
     };
-    let encoded = response.into_string().map_err(|error| error.to_string())?;
-    if !(200..300).contains(&status) && request.body_json.contains(r#""verb":"tune""#) {
-        return Err(tune_refusal_json(&encoded));
+    if let Some(attempt) = attempt.as_mut() {
+        attempt.observe_response(&response);
+    }
+    let encoded = match response.into_string() {
+        Ok(encoded) => encoded,
+        Err(error) => {
+            return Err(match attempt.take() {
+                Some(attempt) => {
+                    let completed = attempt.fail_body(&error, &receipt_base);
+                    unreadable_response_with_attempt(
+                        status,
+                        &error,
+                        Some(completed.render()),
+                        presentation,
+                    )
+                }
+                None if tune => machine_line(flattened(unreadable_error(status, &error))),
+                None => unreadable_response(status, &error),
+            });
+        }
+    };
+    let completed = attempt
+        .take()
+        .map(|attempt| attempt.complete_response(status, &encoded));
+    let attempt_render = completed.as_ref().map(|completed| completed.render());
+    if !(200..300).contains(&status) && tune {
+        return Err(tune_refusal_json_with_attempt(
+            status,
+            &encoded,
+            attempt_render,
+        ));
     }
     // /version is a plain discovery object, not a dispatch result envelope.
     if request.path == "/version" && (200..300).contains(&status) {
         return serde_json::from_str(&encoded)
             .map(Some)
-            .map_err(|error| error.to_string());
+            .map_err(|error| match attempt_render {
+                Some(attempt) => undecodable_response_with_attempt(
+                    status,
+                    &encoded,
+                    &error,
+                    Some(attempt),
+                    FailurePresentation::Ordinary,
+                ),
+                None => error.to_string(),
+            });
     }
-    parse_response(status, &encoded)
+    parse_response_with_attempt(status, &encoded, attempt_render)
 }
 
-fn tune_refusal_json(encoded: &str) -> String {
+/// Read from the verb the body actually names, not from a substring of it: any other
+/// field that happened to contain `"verb":"tune"` would otherwise re-route the reply.
+fn is_tune(request: &RequestSpec) -> bool {
+    serde_json::from_str::<Value>(&request.body_json)
+        .ok()
+        .and_then(|body| {
+            body.get("verb")
+                .and_then(Value::as_str)
+                .map(|verb| verb == "tune")
+        })
+        .unwrap_or(false)
+}
+
+/// `tune` refusals are one JSON object on stderr, the whole error envelope flattened
+/// with `ok: false`. Undecodable replies keep that shape so a caller parsing tune output
+/// never meets prose in its place.
+fn tune_refusal_json(status: u16, encoded: &str) -> String {
     let parsed: Value = match serde_json::from_str(encoded) {
         Ok(parsed) => parsed,
-        Err(error) => return error.to_string(),
+        Err(error) => return machine_line(flattened(undecodable_error(status, encoded, &error))),
     };
     let error = parsed.get("error").unwrap_or(&parsed);
     let mut refusal = match error.as_object() {
-        Some(fields) => fields.clone(),
+        Some(fields) => redact_fields(fields),
         None => {
-            return serde_json::to_string(&serde_json::json!({
-                "ok": false,
-                "code": "undefined",
-                "message": ""
-            }))
-            .expect("JSON value serializes");
+            let mut fields = serde_json::Map::new();
+            fields.insert("body".to_owned(), redact_value(&parsed));
+            fields
         }
     };
     refusal.insert("ok".to_owned(), Value::Bool(false));
+    refusal.insert("httpStatus".to_owned(), Value::from(status));
 
     serde_json::to_string(&Value::Object(refusal)).expect("JSON value serializes")
 }
@@ -1979,7 +2101,10 @@ pub(crate) fn gateway_request(
     path: &str,
     timeout: Option<Duration>,
 ) -> ureq::Request {
-    let mut builder = ureq::AgentBuilder::new();
+    // Gateway exchanges are single attempts. Redirects can change the target
+    // after identity-bearing headers have been attached, so leave them to the
+    // caller as an ordinary HTTP response.
+    let mut builder = ureq::AgentBuilder::new().redirects(0);
     if let Some(timeout) = timeout {
         builder = builder.timeout(timeout).timeout_connect(timeout);
     }
@@ -1995,50 +2120,34 @@ pub(crate) fn gateway_request(
     }
 }
 
-/// LOAD-BEARING WORDING. This sentence is control flow, not just prose.
-///
-/// `ceremonies::cancel_after_begin` matches `contains("onboarding lease expired")` on
-/// whatever a failed cancel dispatch returns, and this is the only thing that produces
-/// that substring on that route. Reword it and the guard stops matching, falls through to
-/// its `_` arm, and the cancel failure silently vanishes from the operator's message. No
-/// test covers the transition, so nothing goes red.
-///
-/// The phrase is doing the job of an error code while looking like an error message.
-/// Several sites across four modules produce it, tests in four modules assert on it (one
-/// of them NEGATIVELY, that a message must not contain it), and this guard is the only
-/// place it changes behaviour. Making it a real variant is a change worth doing and is not
-/// this branch's to make.
-///
-/// Deliberately no count. The first version of this comment carried one, and it was wrong
-/// before it reached review — restated from a message, never recounted against the file.
-/// A tally in a comment is stale the moment someone adds a test; what a reader needs is
-/// that exactly one site branches on it, and that survives.
+/// Several sites across four modules produce this phrase and tests assert on it, so
+/// reword it everywhere or nowhere. No code branches on it.
 fn ceremony_expired() -> String {
     "gateway request refused because the onboarding lease expired".to_owned()
 }
 
+/// Every gateway failure the CLI reports carries two readings. Its first line is the
+/// sentence a person acts on; a line of its own, the last one unless a caller appends
+/// later context on further lines, is one JSON object beginning `{"ok":false` for a
+/// script. That object keeps the HTTP status and the gateway's whole `error`
+/// envelope (code, message, requestId, diagnostic and any other field), so nothing the
+/// gateway said is lost to the rendering. A reply that could not be read or decoded
+/// names that as its own code and keeps a bounded, redacted copy of what arrived.
+/// Errors raised by the CLI itself, before any request, stay plain prose.
 pub(crate) fn parse_response(status: u16, encoded: &str) -> Result<Option<Value>, String> {
-    let json: Value = serde_json::from_str(encoded).map_err(|error| error.to_string())?;
+    let json: Value = match serde_json::from_str(encoded) {
+        Ok(json) => json,
+        Err(error) => return Err(undecodable_response(status, encoded, &error)),
+    };
 
     if !(200..300).contains(&status) {
-        let code = json
-            .pointer("/error/code")
-            .and_then(Value::as_str)
-            .unwrap_or("undefined");
-        let message = json.pointer("/error/message").and_then(Value::as_str);
-        let request_id = json.pointer("/error/requestId").and_then(Value::as_str);
-        let rendered = match message {
-            Some(message) if !message.is_empty() => format!("{code}: {message}"),
-            _ => code.to_owned(),
-        };
-        return Err(match request_id {
-            Some(request_id) if !request_id.is_empty() => format!("{rendered} ({request_id})"),
-            _ => rendered,
-        });
+        return Err(refused_response(status, &json));
     }
 
+    // A 2xx whose body still carries an error is a failure: the status must not be the
+    // only thing a caller reads.
     if json.get("error").is_some_and(|error| !error.is_null()) {
-        return Err(serde_json::to_string_pretty(&json).expect("JSON value serializes"));
+        return Err(refused_response(status, &json));
     }
 
     // The third outcome (202). It is not a result: the verb HALTED and its
@@ -2046,7 +2155,8 @@ pub(crate) fn parse_response(status: u16, encoded: &str) -> Result<Option<Value>
     // agent the action happened. It is not the error envelope either, so it
     // needs its own branch or it falls through to `result` -- absent -- and
     // becomes a silent success. Rendered like a refusal because that is what
-    // the caller must do about it: the action did not take effect.
+    // the caller must do about it: the action did not take effect. Its machine
+    // line carries `decisionPending`, never `error`, so it stays distinct.
     if let Some(pending) = json.get("decisionPending") {
         let id = pending
             .get("decisionRequestId")
@@ -2056,10 +2166,1045 @@ pub(crate) fn parse_response(status: u16, encoded: &str) -> Result<Option<Value>
             .get("message")
             .and_then(Value::as_str)
             .unwrap_or("this action needs an owner decision");
-        return Err(format!("decision_pending: {message} ({id})"));
+        let mut machine = serde_json::Map::new();
+        machine.insert("httpStatus".to_owned(), Value::from(status));
+        machine.insert("decisionPending".to_owned(), redact_value(pending));
+        return Err(two_readings(
+            format!("decision_pending: {message} ({id})"),
+            machine,
+        ));
     }
 
     Ok(json.get("result").cloned())
+}
+
+/// A non-2xx reply to a route outside the dispatch envelope, in the same two readings.
+pub(crate) fn status_failure(status: u16, response: ureq::Response) -> String {
+    let encoded = match response.into_string() {
+        Ok(encoded) => encoded,
+        Err(error) => return unreadable_response(status, &error),
+    };
+    match serde_json::from_str(&encoded) {
+        Ok(json) => refused_response(status, &json),
+        Err(error) => undecodable_response(status, &encoded, &error),
+    }
+}
+
+fn refused_response(status: u16, json: &Value) -> String {
+    let mut machine = serde_json::Map::new();
+    machine.insert("httpStatus".to_owned(), Value::from(status));
+    let human = match json.get("error") {
+        Some(Value::Object(fields)) => {
+            let fields = redact_fields(fields);
+            let human = refusal_sentence(status, &fields);
+            machine.insert("error".to_owned(), Value::Object(fields));
+            human
+        }
+        _ => {
+            let body = redact_value(json);
+            let human = format!(
+                "gateway answered HTTP {status} without an error object: {}",
+                bounded_body(&body.to_string())
+            );
+            machine.insert("body".to_owned(), body);
+            human
+        }
+    };
+    two_readings(human, machine)
+}
+
+fn refusal_sentence(status: u16, fields: &serde_json::Map<String, Value>) -> String {
+    let text = |key: &str| {
+        fields
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+    };
+    let code = match text("code") {
+        Some(code) => code.to_owned(),
+        None => format!("HTTP {status} error without a code"),
+    };
+    let rendered = match text("message") {
+        Some(message) => format!("{code}: {message}"),
+        None => code,
+    };
+    match text("requestId") {
+        Some(request_id) => format!("{rendered} ({request_id})"),
+        None => rendered,
+    }
+}
+
+fn undecodable_response(status: u16, encoded: &str, error: &serde_json::Error) -> String {
+    let fields = undecodable_error(status, encoded, error);
+    let human = format!(
+        "gateway reply (HTTP {status}) is not JSON: {error}; received: {}",
+        fields["error"]["body"].as_str().unwrap_or_default()
+    );
+    two_readings(human, fields)
+}
+
+fn undecodable_error(
+    status: u16,
+    encoded: &str,
+    error: &serde_json::Error,
+) -> serde_json::Map<String, Value> {
+    let mut detail = serde_json::Map::new();
+    detail.insert("code".to_owned(), Value::from("response_undecodable"));
+    detail.insert("message".to_owned(), Value::from(error.to_string()));
+    detail.insert("line".to_owned(), Value::from(error.line()));
+    detail.insert("column".to_owned(), Value::from(error.column()));
+    detail.insert("bodyBytes".to_owned(), Value::from(encoded.len()));
+    detail.insert("body".to_owned(), Value::from(bounded_body(encoded)));
+    let mut fields = serde_json::Map::new();
+    fields.insert("httpStatus".to_owned(), Value::from(status));
+    fields.insert("error".to_owned(), Value::Object(detail));
+    fields
+}
+
+pub(crate) fn unreadable_response(status: u16, error: &std::io::Error) -> String {
+    let fields = unreadable_error(status, error);
+    let message = fields["error"]["message"]
+        .as_str()
+        .expect("unreadable error has a message");
+    two_readings(
+        format!("gateway reply (HTTP {status}) could not be read: {message}"),
+        fields,
+    )
+}
+
+fn unreadable_error(status: u16, error: &std::io::Error) -> serde_json::Map<String, Value> {
+    let mut detail = serde_json::Map::new();
+    detail.insert("code".to_owned(), Value::from("response_unreadable"));
+    detail.insert(
+        "message".to_owned(),
+        Value::from(redact_body(&error.to_string())),
+    );
+    detail.insert(
+        "kind".to_owned(),
+        Value::from(format!("{:?}", error.kind())),
+    );
+    let mut fields = serde_json::Map::new();
+    fields.insert("httpStatus".to_owned(), Value::from(status));
+    fields.insert("error".to_owned(), Value::Object(detail));
+    fields
+}
+
+/// No status: the request never got a reply.
+pub(crate) fn transport_failure(error: &ureq::Transport) -> String {
+    transport_failure_parts(&format!("{:?}", error.kind()), &error.to_string())
+}
+
+fn transport_failure_parts(kind: &str, raw_message: &str) -> String {
+    let message = redact_body(raw_message);
+    let mut detail = serde_json::Map::new();
+    detail.insert("code".to_owned(), Value::from("transport_failed"));
+    detail.insert("kind".to_owned(), Value::from(kind));
+    detail.insert("message".to_owned(), Value::from(message.clone()));
+    let mut fields = serde_json::Map::new();
+    fields.insert("error".to_owned(), Value::Object(detail));
+    two_readings(message, fields)
+}
+
+/// Parse and render a response with a read-only view of the completed CLI attempt.
+/// Existing callers keep using `parse_response`; Timeout B owns the later call-site
+/// handoff after this renderer API has been frozen.
+pub(crate) fn parse_response_with_attempt(
+    status: u16,
+    encoded: &str,
+    attempt: Option<AttemptRender<'_>>,
+) -> Result<Option<Value>, String> {
+    if attempt.is_none() {
+        return parse_response(status, encoded);
+    }
+
+    let json: Value = match serde_json::from_str(encoded) {
+        Ok(json) => json,
+        Err(error) => {
+            return Err(undecodable_response_with_attempt(
+                status,
+                encoded,
+                &error,
+                attempt,
+                FailurePresentation::Ordinary,
+            ));
+        }
+    };
+
+    if !(200..300).contains(&status) {
+        return Err(refused_response_with_attempt(status, &json, attempt));
+    }
+
+    if json.get("error").is_some_and(|error| !error.is_null()) {
+        return Err(refused_response_with_attempt(status, &json, attempt));
+    }
+
+    if let Some(pending) = json.get("decisionPending") {
+        let redacted_pending = redact_value(pending);
+        let id = redacted_pending
+            .get("decisionRequestId")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_owned();
+        let message = pending
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("this action needs an owner decision")
+            .to_owned();
+        let mut machine = serde_json::Map::new();
+        machine.insert("httpStatus".to_owned(), Value::from(status));
+        machine.insert("decisionPending".to_owned(), redacted_pending);
+        insert_attempt(&mut machine, attempt);
+        return Err(two_readings(
+            human_with_attempt(format!("decision_pending: {message} ({id})"), attempt),
+            machine,
+        ));
+    }
+
+    Ok(json.get("result").cloned())
+}
+
+/// Render a tune refusal as one flattened JSON object while preserving a colliding
+/// upstream `attempt` object under `upstreamError` before adding the local attempt.
+pub(crate) fn tune_refusal_json_with_attempt(
+    status: u16,
+    encoded: &str,
+    attempt: Option<AttemptRender<'_>>,
+) -> String {
+    if attempt.is_none() {
+        return tune_refusal_json(status, encoded);
+    }
+
+    let mut refusal = match serde_json::from_str::<Value>(encoded) {
+        Ok(parsed) => match parsed.get("error").unwrap_or(&parsed) {
+            Value::Object(fields) => redact_fields(fields),
+            other => {
+                let mut fields = serde_json::Map::new();
+                fields.insert("body".to_owned(), redact_value(other));
+                fields
+            }
+        },
+        Err(error) => flattened(undecodable_error(status, encoded, &error)),
+    };
+
+    let local_attempt = attempt.expect("checked above");
+    if refusal.contains_key("attempt") {
+        let upstream_error = Value::Object(refusal.clone());
+        refusal.insert("upstreamError".to_owned(), upstream_error);
+    }
+    refusal.insert("attempt".to_owned(), attempt_projection(local_attempt));
+    refusal.insert("ok".to_owned(), Value::Bool(false));
+    refusal.insert("httpStatus".to_owned(), Value::from(status));
+    serde_json::to_string(&Value::Object(refusal)).expect("JSON value serializes")
+}
+
+pub(crate) fn transport_failure_with_attempt(
+    error: &ureq::Transport,
+    attempt: Option<AttemptRender<'_>>,
+    presentation: FailurePresentation,
+) -> String {
+    if attempt.is_none() && matches!(presentation, FailurePresentation::Ordinary) {
+        return transport_failure(error);
+    }
+
+    let detail = serde_json::json!({
+        "code": "transport_failed",
+        "kind": format!("{:?}", error.kind()),
+        "message": error.to_string(),
+    });
+    let mut fields = serde_json::Map::new();
+    fields.insert("error".to_owned(), redact_value(&detail));
+    if let Some(attempt) = attempt {
+        insert_attempt(&mut fields, Some(attempt));
+        match presentation {
+            FailurePresentation::Ordinary => {
+                two_readings(human_with_attempt(error.to_string(), Some(attempt)), fields)
+            }
+            FailurePresentation::Tune => machine_line(flattened(fields)),
+        }
+    } else {
+        match presentation {
+            FailurePresentation::Ordinary => two_readings(error.to_string(), fields),
+            FailurePresentation::Tune => machine_line(flattened(fields)),
+        }
+    }
+}
+
+pub(crate) fn unreadable_response_with_attempt(
+    status: u16,
+    error: &std::io::Error,
+    attempt: Option<AttemptRender<'_>>,
+    presentation: FailurePresentation,
+) -> String {
+    if attempt.is_none() && matches!(presentation, FailurePresentation::Ordinary) {
+        return unreadable_response(status, error);
+    }
+
+    let mut fields = unreadable_error(status, error);
+    match attempt {
+        Some(attempt) => {
+            insert_attempt(&mut fields, Some(attempt));
+            match presentation {
+                FailurePresentation::Ordinary => two_readings(
+                    human_with_attempt(
+                        format!("gateway reply (HTTP {status}) could not be read: {error}"),
+                        Some(attempt),
+                    ),
+                    fields,
+                ),
+                FailurePresentation::Tune => machine_line(flattened(fields)),
+            }
+        }
+        None => match presentation {
+            FailurePresentation::Ordinary => two_readings(
+                format!("gateway reply (HTTP {status}) could not be read: {error}"),
+                fields,
+            ),
+            FailurePresentation::Tune => machine_line(flattened(fields)),
+        },
+    }
+}
+
+pub(crate) fn undecodable_response_with_attempt(
+    status: u16,
+    encoded: &str,
+    error: &serde_json::Error,
+    attempt: Option<AttemptRender<'_>>,
+    presentation: FailurePresentation,
+) -> String {
+    if attempt.is_none() && matches!(presentation, FailurePresentation::Ordinary) {
+        return undecodable_response(status, encoded, error);
+    }
+
+    let mut fields = undecodable_error(status, encoded, error);
+    if let Some(Value::Object(detail)) = fields.get_mut("error") {
+        detail.insert(
+            "message".to_owned(),
+            Value::from(redact_body(&error.to_string())),
+        );
+    }
+    match attempt {
+        Some(attempt) => {
+            insert_attempt(&mut fields, Some(attempt));
+            let human =
+                format!("gateway reply (HTTP {status}) is not JSON: {error}; received: {encoded}");
+            match presentation {
+                FailurePresentation::Ordinary => {
+                    two_readings(human_with_attempt(human, Some(attempt)), fields)
+                }
+                FailurePresentation::Tune => machine_line(flattened(fields)),
+            }
+        }
+        None => match presentation {
+            FailurePresentation::Ordinary => undecodable_response(status, encoded, error),
+            FailurePresentation::Tune => machine_line(flattened(fields)),
+        },
+    }
+}
+
+pub(crate) fn status_failure_with_attempt(
+    status: u16,
+    encoded: &str,
+    attempt: Option<AttemptRender<'_>>,
+) -> String {
+    match serde_json::from_str(encoded) {
+        Ok(json) => refused_response_with_attempt(status, &json, attempt),
+        Err(error) => undecodable_response_with_attempt(
+            status,
+            encoded,
+            &error,
+            attempt,
+            FailurePresentation::Ordinary,
+        ),
+    }
+}
+
+fn refused_response_with_attempt(
+    status: u16,
+    json: &Value,
+    attempt: Option<AttemptRender<'_>>,
+) -> String {
+    if attempt.is_none() {
+        return refused_response(status, json);
+    }
+
+    let mut fields = serde_json::Map::new();
+    fields.insert("httpStatus".to_owned(), Value::from(status));
+    let human = match json.get("error") {
+        Some(Value::Object(upstream)) => {
+            let human = refusal_sentence(status, upstream);
+            fields.insert("error".to_owned(), Value::Object(redact_fields(upstream)));
+            human
+        }
+        _ => {
+            let body = redact_value(json);
+            let human = format!(
+                "gateway answered HTTP {status} without an error object: {}",
+                json
+            );
+            fields.insert("body".to_owned(), body);
+            human
+        }
+    };
+    insert_attempt(&mut fields, attempt);
+    two_readings(human_with_attempt(human, attempt), fields)
+}
+
+fn insert_attempt(fields: &mut serde_json::Map<String, Value>, attempt: Option<AttemptRender<'_>>) {
+    if let Some(attempt) = attempt {
+        fields.insert("attempt".to_owned(), attempt_projection(attempt));
+    }
+}
+
+fn attempt_projection(attempt: AttemptRender<'_>) -> Value {
+    let mut fields = serde_json::Map::new();
+    fields.insert(
+        "requestId".to_owned(),
+        Value::from(attempt.request_id.as_str()),
+    );
+    fields.insert(
+        "operation".to_owned(),
+        Value::from(attempt.transport_operation.as_str()),
+    );
+    fields.insert(
+        "listenerGeneration".to_owned(),
+        attempt
+            .listener_generation
+            .map_or(Value::Null, |generation| Value::from(generation.as_str())),
+    );
+    fields.insert(
+        "diagnostic".to_owned(),
+        attempt
+            .diagnostic
+            .map_or(Value::Null, |diagnostic| diagnostic_projection(diagnostic)),
+    );
+    fields.insert(
+        "receipt".to_owned(),
+        Value::from(receipt_name(attempt.receipt)),
+    );
+    Value::Object(fields)
+}
+
+fn diagnostic_projection(diagnostic: &FailureDiagnostic) -> Value {
+    let (timeout_source, budget_ms) = match diagnostic.timeout() {
+        TimeoutBudget::None => ("none", Value::Null),
+        TimeoutBudget::OtpDbCall { budget_ms } => ("otp_db_call", Value::from(budget_ms)),
+        TimeoutBudget::SqliteBusy { budget_ms } => ("sqlite_busy", Value::from(budget_ms)),
+        TimeoutBudget::CliConnect { budget_ms } => ("cli_connect", Value::from(budget_ms)),
+        TimeoutBudget::CliRequest { budget_ms } => ("cli_request", Value::from(budget_ms)),
+    };
+    let mut fields = serde_json::Map::new();
+    fields.insert(
+        "code".to_owned(),
+        Value::from(diagnostic_code(diagnostic.code())),
+    );
+    fields.insert(
+        "operation".to_owned(),
+        Value::from(diagnostic_operation(diagnostic.operation())),
+    );
+    fields.insert(
+        "cause".to_owned(),
+        diagnostic
+            .cause()
+            .map_or(Value::Null, |cause| Value::from(cause_name(cause))),
+    );
+    fields.insert("elapsedMs".to_owned(), Value::from(diagnostic.elapsed_ms()));
+    fields.insert("timeoutSource".to_owned(), Value::from(timeout_source));
+    fields.insert("budgetMs".to_owned(), budget_ms);
+    fields.insert(
+        "gatewayAccepted".to_owned(),
+        match diagnostic.gateway_accepted() {
+            GatewayAccepted::Yes => Value::Bool(true),
+            GatewayAccepted::No => Value::Bool(false),
+            GatewayAccepted::Unknown => Value::from("unknown"),
+        },
+    );
+    fields.insert(
+        "effectKind".to_owned(),
+        Value::from(effect_kind_name(diagnostic.effect_kind())),
+    );
+    fields.insert(
+        "effectState".to_owned(),
+        Value::from(effect_state_name(diagnostic.effect_state())),
+    );
+    fields.insert(
+        "action".to_owned(),
+        Value::from(action_name(diagnostic.action())),
+    );
+    Value::Object(fields)
+}
+
+fn diagnostic_code(code: DiagnosticCode) -> &'static str {
+    match code {
+        DiagnosticCode::DbTimeout => "db_timeout",
+        DiagnosticCode::GatewayUnavailable => "gateway_unavailable",
+        DiagnosticCode::GatewayTransportUncertain => "gateway_transport_uncertain",
+    }
+}
+
+fn diagnostic_operation(operation: DiagnosticOperation) -> String {
+    match operation {
+        DiagnosticOperation::Transport(operation) => operation.as_str().to_owned(),
+        DiagnosticOperation::Database(operation) => operation.as_str().to_owned(),
+    }
+}
+
+fn cause_name(cause: AttemptCause) -> &'static str {
+    match cause {
+        AttemptCause::DbCallerTimeout => "db_caller_timeout",
+        AttemptCause::DnsFailed => "dns_failed",
+        AttemptCause::ConnectRefused => "connect_refused",
+        AttemptCause::ConnectTimeout => "connect_timeout",
+        AttemptCause::RequestTimeout => "request_timeout",
+        AttemptCause::ConnectionReset => "connection_reset",
+        AttemptCause::TransportFailed => "transport_failed",
+    }
+}
+
+fn effect_kind_name(kind: EffectKind) -> &'static str {
+    match kind {
+        EffectKind::Read => "read",
+        EffectKind::Write => "write",
+        EffectKind::Schema => "schema",
+    }
+}
+
+fn effect_state_name(state: EffectState) -> &'static str {
+    match state {
+        EffectState::None => "none",
+        EffectState::Known => "known",
+        EffectState::Unknown => "unknown",
+    }
+}
+
+fn action_name(action: Action) -> &'static str {
+    match action {
+        Action::RetrySafe => "retry_safe",
+        Action::RetrySameIdempotencyKey => "retry_same_idempotency_key",
+        Action::DoNotRetryReport => "do_not_retry_report",
+    }
+}
+
+fn receipt_name(receipt: ReceiptAvailability) -> &'static str {
+    match receipt {
+        ReceiptAvailability::NotApplicable => "not_applicable",
+        ReceiptAvailability::Recorded => "recorded",
+        ReceiptAvailability::Unavailable => "unavailable",
+    }
+}
+
+fn human_with_attempt(human: String, attempt: Option<AttemptRender<'_>>) -> String {
+    let Some(attempt) = attempt else {
+        return human;
+    };
+    let human = bounded_body(&human)
+        .replace('\r', "\\r")
+        .replace('\n', "\\n");
+    let mut rendered = format!(
+        "{human}; attempt requestId={} operation={} listenerGeneration={} receipt={}",
+        attempt.request_id.as_str(),
+        attempt.transport_operation.as_str(),
+        attempt
+            .listener_generation
+            .map_or("unknown", |generation| generation.as_str()),
+        receipt_name(attempt.receipt)
+    );
+    if let Some(diagnostic) = attempt.diagnostic {
+        let (timeout_source, budget_ms) = match diagnostic.timeout() {
+            TimeoutBudget::None => ("none", "null".to_owned()),
+            TimeoutBudget::OtpDbCall { budget_ms } => ("otp_db_call", budget_ms.to_string()),
+            TimeoutBudget::SqliteBusy { budget_ms } => ("sqlite_busy", budget_ms.to_string()),
+            TimeoutBudget::CliConnect { budget_ms } => ("cli_connect", budget_ms.to_string()),
+            TimeoutBudget::CliRequest { budget_ms } => ("cli_request", budget_ms.to_string()),
+        };
+        let cause = diagnostic.cause().map_or("unknown", cause_name);
+        let accepted = match diagnostic.gateway_accepted() {
+            GatewayAccepted::Yes => "true",
+            GatewayAccepted::No => "false",
+            GatewayAccepted::Unknown => "unknown",
+        };
+        rendered.push_str(&format!(
+            "; diagnostic code={} operation={} cause={} elapsedMs={} timeoutSource={} budgetMs={} gatewayAccepted={} effectKind={} effectState={} action={}",
+            diagnostic_code(diagnostic.code()),
+            diagnostic_operation(diagnostic.operation()),
+            cause,
+            diagnostic.elapsed_ms(),
+            timeout_source,
+            budget_ms,
+            accepted,
+            effect_kind_name(diagnostic.effect_kind()),
+            effect_state_name(diagnostic.effect_state()),
+            action_name(diagnostic.action())
+        ));
+        rendered.push_str("; ");
+        rendered.push_str(match diagnostic.action() {
+            Action::RetrySafe => "retry is safe",
+            Action::RetrySameIdempotencyKey => "retry only with the same idempotency key",
+            Action::DoNotRetryReport => "do not retry; report request ID",
+        });
+        if matches!(diagnostic.action(), Action::DoNotRetryReport) {
+            rendered.push(' ');
+            rendered.push_str(attempt.request_id.as_str());
+        }
+    } else {
+        rendered.push_str("; diagnostic=unknown");
+    }
+    if matches!(attempt.receipt, ReceiptAvailability::Unavailable) {
+        rendered.push_str("; diagnosticReceipt=unavailable");
+    }
+    rendered
+}
+
+/// The tune shape: the `error` object's fields at the top level beside the status.
+fn flattened(mut fields: serde_json::Map<String, Value>) -> serde_json::Map<String, Value> {
+    if let Some(Value::Object(error)) = fields.remove("error") {
+        fields.extend(error);
+    }
+    fields
+}
+
+fn two_readings(human: String, machine: serde_json::Map<String, Value>) -> String {
+    format!("{human}\n{}", machine_line(machine))
+}
+
+fn machine_line(mut machine: serde_json::Map<String, Value>) -> String {
+    machine.insert("ok".to_owned(), Value::Bool(false));
+    serde_json::to_string(&Value::Object(machine)).expect("JSON value serializes")
+}
+
+const BODY_LIMIT: usize = 2048;
+
+/// What arrived, cut to a bound on a character boundary, with its secret material
+/// masked by `redact_body`. A reply the CLI could not decode was not shaped by the
+/// gateway's own redaction, so its copy is masked here.
+fn bounded_body(encoded: &str) -> String {
+    let redacted = redact_body(encoded);
+    if redacted.len() <= BODY_LIMIT {
+        return redacted;
+    }
+    let mut end = BODY_LIMIT;
+    while !redacted.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...[truncated]", &redacted[..end])
+}
+
+const STRING_LIMIT: usize = 8192;
+const LIST_LIMIT: usize = 100;
+
+/// A decoded reply as the machine line keeps it. A reply need not come from the
+/// gateway (a proxy can answer too), so its values get the gateway's own treatment
+/// from `Tightbeam.ErrorDiagnostic`: a secret-named field's value is replaced, text
+/// is masked by `redact_body`, and a string or list past the gateway's bounds is cut
+/// with a marker naming what was left out. Every other field is kept as it arrived.
+fn redact_value(value: &Value) -> Value {
+    match value {
+        Value::String(text) => bounded_string(redact_body(text)),
+        Value::Array(items) => {
+            let mut kept: Vec<Value> = items.iter().take(LIST_LIMIT).map(redact_value).collect();
+            if items.len() > LIST_LIMIT {
+                kept.push(serde_json::json!({
+                    "$type": "omitted",
+                    "reason": "list_limit",
+                    "count": items.len() - LIST_LIMIT
+                }));
+            }
+            Value::Array(kept)
+        }
+        Value::Object(fields) => Value::Object(redact_fields(fields)),
+        other => other.clone(),
+    }
+}
+
+fn redact_fields(fields: &serde_json::Map<String, Value>) -> serde_json::Map<String, Value> {
+    fields
+        .iter()
+        .map(|(key, value)| {
+            let kept = if secret_field(key) && !value.is_null() {
+                Value::from("[REDACTED:secret_field]")
+            } else {
+                redact_value(value)
+            };
+            (key.clone(), kept)
+        })
+        .collect()
+}
+
+/// The field names `Tightbeam.ErrorDiagnostic` treats as secret.
+fn secret_field(name: &str) -> bool {
+    const EXACT: [&str; 13] = [
+        "token",
+        "authorization",
+        "proxyauthorization",
+        "password",
+        "passwd",
+        "secret",
+        "apikey",
+        "xapikey",
+        "cookie",
+        "setcookie",
+        "credential",
+        "credentials",
+        "privatekey",
+    ];
+    const SUFFIXES: [&str; 5] = ["token", "secret", "password", "apikey", "privatekey"];
+    let normalized: String = name
+        .chars()
+        .filter(|ch| !matches!(ch, '-' | '_' | ' '))
+        .collect::<String>()
+        .to_lowercase();
+    EXACT.contains(&normalized.as_str())
+        || SUFFIXES.iter().any(|suffix| normalized.ends_with(suffix))
+}
+
+fn bounded_string(text: String) -> Value {
+    if text.len() <= STRING_LIMIT {
+        return Value::from(text);
+    }
+    let mut end = STRING_LIMIT;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    serde_json::json!({
+        "$type": "truncated_string",
+        "prefix": &text[..end],
+        "bytes": text.len()
+    })
+}
+
+/// Secret material masked by the rules and markers of
+/// `Tightbeam.ErrorDiagnostic.redact_text/1`: private-key blocks, secret-named
+/// assignments (`password=`, `"token": "..."`, `Cookie:`, `Authorization: Basic ...`),
+/// URL userinfo, and bearer or token-prefixed credentials. The text around each
+/// marker keeps its wording and layout.
+fn redact_body(text: &str) -> String {
+    let text = redact_private_keys(text);
+    let text = redact_assignments(&text);
+    let text = redact_userinfo(&text);
+    redact_tokens(&text)
+}
+
+fn redact_private_keys(text: &str) -> String {
+    const BEGIN: &str = "-----BEGIN ";
+    const END: &str = "-----END ";
+    let mut redacted = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(BEGIN) {
+        let after = &rest[start + BEGIN.len()..];
+        let Some(header) = private_key_label(after) else {
+            redacted.push_str(&rest[..start + BEGIN.len()]);
+            rest = after;
+            continue;
+        };
+        redacted.push_str(&rest[..start]);
+        redacted.push_str("[REDACTED:private_key]");
+        // An unterminated block is masked to the end of the text.
+        let body = &after[header..];
+        let mut from = 0;
+        rest = "";
+        while let Some(found) = body[from..].find(END) {
+            let label = from + found + END.len();
+            if let Some(footer) = private_key_label(&body[label..]) {
+                rest = &body[label + footer..];
+                break;
+            }
+            from = label;
+        }
+    }
+    redacted.push_str(rest);
+    redacted
+}
+
+/// The length of `[A-Z0-9 ]*PRIVATE KEY-----` at the start of `text`, if it is there.
+fn private_key_label(text: &str) -> Option<usize> {
+    let label = text
+        .bytes()
+        .take_while(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || *byte == b' ')
+        .count();
+    (text[..label].ends_with("PRIVATE KEY") && text[label..].starts_with("-----"))
+        .then_some(label + "-----".len())
+}
+
+fn is_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+// `\s` as the gateway's regexes read it.
+fn is_space_byte(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | b'\x0b' | b'\x0c')
+}
+
+fn redact_assignments(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut redacted: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let at_boundary = index == 0 || !is_word_byte(bytes[index - 1]);
+        if at_boundary {
+            if let Some((value_start, value_end)) = secret_assignment(&bytes[index..]) {
+                let value = &bytes[index + value_start..index + value_end];
+                redacted.extend_from_slice(&bytes[index..index + value_start]);
+                redacted.extend_from_slice(&mask_value(value));
+                index += value_end;
+                continue;
+            }
+        }
+        redacted.push(bytes[index]);
+        index += 1;
+    }
+    // Every cut falls on an ASCII byte, so the text stays UTF-8.
+    String::from_utf8(redacted).expect("masking cuts only at ASCII bytes")
+}
+
+/// Where the value of a secret assignment starting at `text` begins and ends.
+fn secret_assignment(text: &[u8]) -> Option<(usize, usize)> {
+    // A `-` stands for a required `-` or `_`, a `?` for an optional one.
+    const KEYS: [&str; 14] = [
+        "proxy?authorization",
+        "authorization",
+        "x-api-key",
+        "api?key",
+        "access?token",
+        "refresh?token",
+        "id?token",
+        "client?secret",
+        "private?key",
+        "token",
+        "password",
+        "passwd",
+        "secret",
+        "cookie",
+    ];
+    let key = KEYS.iter().find_map(|key| key_length(text, key))?;
+    let mut at = key;
+    if matches!(text.get(at), Some(b'"' | b'\'')) {
+        at += 1;
+    }
+    at += spaces(&text[at..]);
+    let mut separators = Vec::with_capacity(2);
+    if text[at..].starts_with(b"=>") {
+        separators.push(at + 2);
+    }
+    if matches!(text.get(at), Some(b':' | b'=')) {
+        separators.push(at + 1);
+    }
+    separators.into_iter().find_map(|separator| {
+        let start = separator + spaces(&text[separator..]);
+        secret_value(&text[start..]).map(|length| (start, start + length))
+    })
+}
+
+fn key_length(text: &[u8], key: &str) -> Option<usize> {
+    let mut at = 0;
+    for expected in key.bytes() {
+        let joiner = matches!(text.get(at), Some(b'-' | b'_'));
+        match expected {
+            b'-' if joiner => at += 1,
+            b'-' => return None,
+            b'?' if joiner => at += 1,
+            b'?' => {}
+            _ if text
+                .get(at)
+                .is_some_and(|byte| byte.to_ascii_lowercase() == expected) =>
+            {
+                at += 1
+            }
+            _ => return None,
+        }
+    }
+    Some(at)
+}
+
+fn spaces(text: &[u8]) -> usize {
+    text.iter().take_while(|byte| is_space_byte(**byte)).count()
+}
+
+/// The length of the value the gateway's secret-assignment rule masks, in the order it
+/// tries them: an auth scheme and its credential, a quoted string, then a bare word.
+fn secret_value(text: &[u8]) -> Option<usize> {
+    let scheme = ["bearer", "basic", "token"].iter().find_map(|scheme| {
+        let named = text
+            .get(..scheme.len())
+            .is_some_and(|word| word.eq_ignore_ascii_case(scheme.as_bytes()));
+        if !named {
+            return None;
+        }
+        let gap = spaces(&text[scheme.len()..]);
+        let credential = text[scheme.len() + gap..]
+            .iter()
+            .take_while(|byte| !is_space_byte(**byte) && !b",;\"'&}]".contains(*byte))
+            .count();
+        (gap > 0 && credential > 0).then_some(scheme.len() + gap + credential)
+    });
+    if scheme.is_some() {
+        return scheme;
+    }
+    match text.first() {
+        Some(b'"') => {
+            let mut at = 1;
+            while at < text.len() {
+                match text[at] {
+                    b'\\' if at + 1 < text.len() => at += 2,
+                    b'"' => return Some(at + 1),
+                    _ => at += 1,
+                }
+            }
+            Some(text.len())
+        }
+        Some(b'\'') => {
+            let mut at = 1;
+            while at < text.len() {
+                match text[at] {
+                    b'\\' if at + 1 < text.len() => at += 2,
+                    b'\'' => return Some(at + 1),
+                    _ => at += 1,
+                }
+            }
+            Some(text.len())
+        }
+        _ => {
+            let length = text
+                .iter()
+                .take_while(|byte| !is_space_byte(**byte) && !b",;&}]\"'".contains(*byte))
+                .count();
+            (length > 0).then_some(length)
+        }
+    }
+}
+
+/// A quoted value keeps its quotes and an auth scheme keeps its name, so an echoed
+/// JSON body or header line keeps its layout around the marker.
+fn mask_value(value: &[u8]) -> Vec<u8> {
+    const MARKER: &[u8] = b"[REDACTED:secret_field]";
+    if let Some(quote @ (b'"' | b'\'')) = value.first() {
+        return [&[*quote][..], MARKER, &[*quote][..]].concat();
+    }
+    let scheme = value
+        .iter()
+        .take_while(|byte| byte.is_ascii_alphabetic())
+        .count();
+    let gap = spaces(&value[scheme..]);
+    if gap > 0
+        && ["bearer", "basic", "token"]
+            .iter()
+            .any(|name| value[..scheme].eq_ignore_ascii_case(name.as_bytes()))
+    {
+        return [&value[..scheme + gap], MARKER].concat();
+    }
+    MARKER.to_vec()
+}
+
+/// `scheme://user:password@` keeps its scheme and loses its userinfo.
+fn redact_userinfo(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut redacted = String::with_capacity(text.len());
+    let mut copied = 0;
+    for (separator, _) in text.match_indices("://") {
+        if separator < copied || !has_scheme(&bytes[copied..separator]) {
+            continue;
+        }
+        let authority = separator + 3;
+        let user = bytes[authority..]
+            .iter()
+            .take_while(|byte| !is_space_byte(**byte) && !b"/:@[".contains(*byte))
+            .count();
+        if user == 0 {
+            continue;
+        }
+        let mut end = authority + user;
+        if bytes.get(end) == Some(&b':') {
+            end += 1;
+            end += bytes[end..]
+                .iter()
+                .take_while(|byte| !is_space_byte(**byte) && !b"/@".contains(*byte))
+                .count();
+        }
+        if bytes.get(end) != Some(&b'@') {
+            continue;
+        }
+        redacted.push_str(&text[copied..authority]);
+        redacted.push_str("[REDACTED:userinfo]@");
+        copied = end + 1;
+    }
+    redacted.push_str(&text[copied..]);
+    redacted
+}
+
+/// Whether `before` ends in a scheme: a letter at a word boundary, then letters,
+/// digits, `+`, `.` or `-`.
+fn has_scheme(before: &[u8]) -> bool {
+    let scheme_byte = |byte: &u8| byte.is_ascii_alphanumeric() || b"+.-".contains(byte);
+    let run = before
+        .iter()
+        .rev()
+        .take_while(|byte| scheme_byte(byte))
+        .count();
+    let start = before.len() - run;
+    (start..before.len())
+        .any(|at| before[at].is_ascii_alphabetic() && (at == 0 || !is_word_byte(before[at - 1])))
+}
+
+fn redact_tokens(text: &str) -> String {
+    const PREFIXES: [&str; 17] = [
+        "github_pat_",
+        "gho_",
+        "ghp_",
+        "ghu_",
+        "ghs_",
+        "ghr_",
+        "sk-",
+        "sk_",
+        "xoxa-",
+        "xoxb-",
+        "xoxp-",
+        "xoxr-",
+        "xoxs-",
+        "tbc_",
+        "tbs_",
+        "tbt_",
+        "tbp_",
+    ];
+    let token_char = |ch: char| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-';
+    let mut redacted = String::with_capacity(text.len());
+    let mut index = 0;
+    while index < text.len() {
+        let rest = &text[index..];
+        let at_boundary = text[..index].chars().next_back().map_or(true, |before| {
+            !(before.is_ascii_alphanumeric() || before == '_')
+        });
+        let prefix = PREFIXES
+            .iter()
+            .find(|prefix| at_boundary && rest.starts_with(**prefix));
+        if let Some(prefix) = prefix {
+            let value = rest[prefix.len()..]
+                .find(|ch: char| !token_char(ch))
+                .unwrap_or(rest.len() - prefix.len());
+            if value >= 8 {
+                redacted.push_str("[REDACTED:token]");
+                index += prefix.len() + value;
+                continue;
+            }
+        }
+        if at_boundary
+            && rest
+                .get(..7)
+                .is_some_and(|scheme| scheme.eq_ignore_ascii_case("bearer "))
+        {
+            let token = rest[7..]
+                .find(|ch: char| ch.is_whitespace() || ch == '"' || ch == '\'')
+                .unwrap_or(rest.len() - 7);
+            // A value an earlier rule already masked keeps its own marker.
+            if token >= 12 && !rest[7..].starts_with("[REDACTED:") {
+                redacted.push_str(&rest[..7]);
+                redacted.push_str("[REDACTED:token]");
+                index += 7 + token;
+                continue;
+            }
+        }
+        let ch = rest.chars().next().expect("index is inside text");
+        redacted.push(ch);
+        index += ch.len_utf8();
+    }
+    redacted
 }
 
 pub fn run(command: Command) -> Result<(), String> {
@@ -2071,10 +3216,8 @@ pub fn run(command: Command) -> Result<(), String> {
         return crate::session_connect::run(session_key, identity);
     }
 
-    // `tool-call-observed` carries no identity flag, so it is not in
-    // `command_identity`; it is nonetheless a session call and only a session
-    // call, and saying so here makes a run from outside a workdir fail with the
-    // reason rather than with a 403 from the org token.
+    // Keep the current target's local first-user bootstrap exception and its
+    // session-only ToolCallObserved behavior when entering the shared dispatcher.
     let session_identity = requires_session_discovery(&command);
     run_with(
         command,
@@ -2102,6 +3245,7 @@ where
     S: Fn(&Endpoint, &RequestSpec, Option<Instant>) -> Result<Option<Value>, String>,
     H: Fn(&Endpoint, Instant) -> Result<Option<crate::harnesses::HarnessCatalog>, String>,
 {
+    let attempt_context = CommandContext::for_command(&command);
     match command {
         Command::Help | Command::CommandHelp(_) => {
             unreachable!("help is handled before dispatch")
@@ -2153,7 +3297,8 @@ where
                             string_field("userId", &user_id),
                             format!("\"isAdmin\":{admin}"),
                         ],
-                    );
+                    )
+                    .with_attempt_context(attempt_context);
                     if let Some(result) = send_request(&endpoint, &request, None)? {
                         println!(
                             "{}",
@@ -2166,6 +3311,9 @@ where
         }
         Command::UpdateClients { as_user } => crate::ceremonies::update_clients(&as_user),
         Command::Assimilate(args) => crate::ceremonies::assimilate(args),
+        Command::SessionConnect { .. } => {
+            unreachable!("session-connect is routed before the shared dispatcher")
+        }
         Command::GithubAuthCheck => crate::github_auth::check_tool_call_stdin(),
         Command::Onboard {
             identity,
@@ -2204,6 +3352,8 @@ where
             }
             if matches!(command, Command::SettleTurn { .. }) {
                 let version = RequestSpec {
+                    attempt_context,
+                    receipt_base_override: None,
                     path: "/version",
                     body_json: String::new(),
                 };
@@ -2675,14 +3825,37 @@ mod tests {
     #[test]
     fn tune_refusals_remain_machine_readable_json() {
         assert_eq!(
-            tune_refusal_json(r#"{"error":{"code":"same_harness","message":"omit --harness"}}"#),
-            r#"{"code":"same_harness","message":"omit --harness","ok":false}"#
+            tune_refusal_json(
+                409,
+                r#"{"error":{"code":"same_harness","message":"omit --harness"}}"#
+            ),
+            r#"{"code":"same_harness","httpStatus":409,"message":"omit --harness","ok":false}"#
+        );
+    }
+
+    #[test]
+    fn an_undecodable_tune_refusal_stays_one_json_object() {
+        let refusal: Value = serde_json::from_str(&tune_refusal_json(
+            502,
+            "upstream sk-fixture-SENTINEL-0123456789abcdef",
+        ))
+        .unwrap();
+        assert_eq!(refusal["ok"], false);
+        assert_eq!(refusal["httpStatus"], 502);
+        assert_eq!(refusal["code"], "response_undecodable");
+        assert_eq!(refusal["body"], "upstream [REDACTED:token]");
+
+        let refusal: Value = serde_json::from_str(&tune_refusal_json(500, r#""down""#)).unwrap();
+        assert_eq!(
+            refusal,
+            serde_json::json!({"ok": false, "httpStatus": 500, "body": "down"})
         );
     }
 
     #[test]
     fn tune_refusals_preserve_verified_runtime_and_cleanup_fields() {
         let refusal = tune_refusal_json(
+            409,
             r#"{"error":{"code":"runtime_config_mismatch","message":"readback differed","model":"gpt-5.6-sol","effort":"high","projectionCommitted":false,"cleanupStatus":"unverified","lifecycleEventId":"le_123","warnings":["candidate close unverified"]}}"#,
         );
 
@@ -2690,6 +3863,7 @@ mod tests {
             serde_json::from_str::<Value>(&refusal).unwrap(),
             serde_json::json!({
                 "ok": false,
+                "httpStatus": 409,
                 "code": "runtime_config_mismatch",
                 "message": "readback differed",
                 "model": "gpt-5.6-sol",
@@ -2807,6 +3981,8 @@ mod tests {
         let result = send_to_with_timeout(
             &endpoint,
             &RequestSpec {
+                attempt_context: None,
+                receipt_base_override: None,
                 path: "/version",
                 body_json: String::new(),
             },
@@ -4884,26 +6060,59 @@ mod tests {
         assert!(error.contains("onboarding lease expired"), "{error}");
     }
 
+    /// The human sentence and the JSON line of one rendered gateway failure.
+    fn readings(error: &str) -> (String, Value) {
+        let (human, machine) = error.rsplit_once('\n').expect("two readings");
+        (
+            human.to_owned(),
+            serde_json::from_str(machine).expect("machine line is JSON"),
+        )
+    }
+
     #[test]
     fn the_third_outcome_renders_named_and_keeps_the_other_two_intact() {
         // 202 + decisionPending: not a result, not an error. Without its own
         // branch it falls through to an absent "result" and becomes Ok(None) --
         // a silent exit 0 telling an agent the action happened.
+        let pending = parse_response(
+            202,
+            r#"{"decisionPending":{"decisionRequestId":"dr_7","code":"decision_pending","message":"this action needs an owner decision; request dr_7 is open"}}"#,
+        )
+        .unwrap_err();
+        let (human, machine) = readings(&pending);
         assert_eq!(
-            parse_response(
-                202,
-                r#"{"decisionPending":{"decisionRequestId":"dr_7","code":"decision_pending","message":"this action needs an owner decision; request dr_7 is open"}}"#
-            ),
-            Err(
-                "decision_pending: this action needs an owner decision; request dr_7 is open (dr_7)"
-                    .to_owned()
-            )
+            human,
+            "decision_pending: this action needs an owner decision; request dr_7 is open (dr_7)"
         );
+        assert_eq!(
+            machine,
+            serde_json::json!({
+                "ok": false,
+                "httpStatus": 202,
+                "decisionPending": {
+                    "decisionRequestId": "dr_7",
+                    "code": "decision_pending",
+                    "message": "this action needs an owner decision; request dr_7 is open"
+                }
+            })
+        );
+        assert!(machine.get("error").is_none(), "{machine}");
 
         // A malformed pending envelope still names itself rather than vanishing.
+        let (human, _machine) =
+            readings(&parse_response(202, r#"{"decisionPending":{}}"#).unwrap_err());
         assert_eq!(
-            parse_response(202, r#"{"decisionPending":{}}"#),
-            Err("decision_pending: this action needs an owner decision (undefined)".to_owned())
+            human,
+            "decision_pending: this action needs an owner decision (undefined)"
+        );
+
+        // Its copy gets the same masking as an error envelope's.
+        let (_human, machine) = readings(
+            &parse_response(202, r#"{"decisionPending":{"authToken":"tbc_leaked"}}"#).unwrap_err(),
+        );
+        assert_eq!(
+            machine["decisionPending"]["authToken"],
+            "[REDACTED:secret_field]"
         );
 
         // The two shapes that already worked are untouched.
@@ -4911,34 +6120,775 @@ mod tests {
             parse_response(200, r#"{"result":{"id":"asg_1"}}"#),
             Ok(Some(serde_json::json!({"id": "asg_1"})))
         );
-        assert_eq!(
-            parse_response(403, r#"{"error":{"code":"denied","message":"no"}}"#),
-            Err("denied: no".to_owned())
+        let (human, _machine) = readings(
+            &parse_response(403, r#"{"error":{"code":"denied","message":"no"}}"#).unwrap_err(),
+        );
+        assert_eq!(human, "denied: no");
+        let (human, _machine) = readings(
+            &parse_response(
+                500,
+                r#"{"error":{"code":"decision_request_integrity_invalid","message":"decision request integrity check failed","requestId":"dr_exact"}}"#,
+            )
+            .unwrap_err(),
         );
         assert_eq!(
-            parse_response(
-                500,
-                r#"{"error":{"code":"decision_request_integrity_invalid","message":"decision request integrity check failed","requestId":"dr_exact"}}"#
-            ),
-            Err(
-                "decision_request_integrity_invalid: decision request integrity check failed (dr_exact)"
-                    .to_owned()
-            )
+            human,
+            "decision_request_integrity_invalid: decision request integrity check failed (dr_exact)"
         );
     }
 
     #[test]
     fn successful_error_envelopes_are_visible_failures() {
+        let (human, machine) = readings(
+            &parse_response(200, r#"{"error":{"code":"denied","message":"no"}}"#).unwrap_err(),
+        );
+        assert_eq!(human, "denied: no");
         assert_eq!(
-            parse_response(200, r#"{"error":{"code":"denied","message":"no"}}"#),
-            Err(
-                "{\n  \"error\": {\n    \"code\": \"denied\",\n    \"message\": \"no\"\n  }\n}"
-                    .to_owned()
+            machine,
+            serde_json::json!({
+                "ok": false,
+                "httpStatus": 200,
+                "error": {"code": "denied", "message": "no"}
+            })
+        );
+    }
+
+    #[test]
+    fn a_refusal_keeps_its_status_and_every_field_of_the_error_envelope() {
+        let body = serde_json::json!({
+            "error": {
+                "code": "adapter_unavailable",
+                "message": "adapter for codex/luna on host racter is degraded",
+                "requestId": "req_9",
+                "diagnostic": {
+                    "kind": "circuit_open",
+                    "origin": "adapter_coordinator",
+                    "consecutiveFailures": 3,
+                    "cause": {"kind": "exit", "reason": "boom", "generation": 4},
+                    "unknownUpstreamField": {"nested": [1, 2]}
+                },
+                "foreignField": true
+            }
+        });
+        let error = parse_response(503, &body.to_string()).unwrap_err();
+        let (human, machine) = readings(&error);
+
+        assert_eq!(
+            human,
+            "adapter_unavailable: adapter for codex/luna on host racter is degraded (req_9)"
+        );
+        assert_eq!(machine["httpStatus"], 503);
+        assert_eq!(machine["ok"], false);
+        assert_eq!(machine["error"], body["error"]);
+    }
+
+    #[test]
+    fn a_refusal_without_a_code_says_so_instead_of_inventing_one() {
+        let (human, machine) =
+            readings(&parse_response(500, r#"{"error":{"message":"it broke"}}"#).unwrap_err());
+        assert_eq!(human, "HTTP 500 error without a code: it broke");
+        assert!(!human.contains("undefined"), "{human}");
+        assert_eq!(machine["error"], serde_json::json!({"message": "it broke"}));
+
+        let (human, machine) = readings(&parse_response(502, r#"{"detail":"bad"}"#).unwrap_err());
+        assert_eq!(
+            human,
+            r#"gateway answered HTTP 502 without an error object: {"detail":"bad"}"#
+        );
+        assert_eq!(
+            machine,
+            serde_json::json!({"ok": false, "httpStatus": 502, "body": {"detail": "bad"}})
+        );
+    }
+
+    #[test]
+    fn an_undecodable_reply_is_its_own_failure_and_keeps_what_arrived() {
+        let body = "<html>502 Bad Gateway token=sk-fixture-SENTINEL-0123456789abcdef</html>";
+        let error = parse_response(502, body).unwrap_err();
+        let (human, machine) = readings(&error);
+
+        assert!(
+            human.starts_with("gateway reply (HTTP 502) is not JSON: expected value"),
+            "{human}"
+        );
+        assert!(human.contains("<html>502 Bad Gateway"), "{human}");
+        assert!(!error.contains("SENTINEL"), "{error}");
+        assert_eq!(machine["httpStatus"], 502);
+        assert_eq!(machine["error"]["code"], "response_undecodable");
+        assert_eq!(machine["error"]["line"], 1);
+        assert_eq!(machine["error"]["column"], 1);
+        assert_eq!(machine["error"]["bodyBytes"], body.len());
+        assert_eq!(
+            machine["error"]["body"],
+            // A bare value is masked to the next delimiter, as the gateway masks it.
+            "<html>502 Bad Gateway token=[REDACTED:secret_field]"
+        );
+
+        // A reply cut off mid-body names where decoding stopped.
+        let (_human, machine) =
+            readings(&parse_response(200, r#"{"result":{"id":"asg_"#).unwrap_err());
+        assert_eq!(machine["httpStatus"], 200);
+        assert_eq!(machine["error"]["code"], "response_undecodable");
+        assert_eq!(machine["error"]["body"], r#"{"result":{"id":"asg_"#);
+        assert!(
+            machine["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("EOF"),
+            "{machine}"
+        );
+    }
+
+    #[test]
+    fn an_undecodable_reply_masks_unterminated_quoted_secrets_on_both_channels() {
+        let bodies = [
+            (
+                "{\"password\":\"fixtureSENTINEL",
+                "{\"password\":\"[REDACTED:secret_field]\"",
+            ),
+            (
+                "api-key: 'fixtureSENTINEL",
+                "api-key: '[REDACTED:secret_field]'",
+            ),
+            (
+                "{\"password\":\"fixtureSENTINEL\\",
+                "{\"password\":\"[REDACTED:secret_field]\"",
+            ),
+            (
+                "api-key: 'fixtureSENTINEL\\",
+                "api-key: '[REDACTED:secret_field]'",
+            ),
+            (
+                "api-key: 'prefix\\'fixtureSENTINEL'",
+                "api-key: '[REDACTED:secret_field]'",
+            ),
+            (
+                "api-key: 'prefix\\'tailSENTINEL",
+                "api-key: '[REDACTED:secret_field]'",
+            ),
+        ];
+
+        for (body, expected) in bodies {
+            let error = parse_response(502, body).unwrap_err();
+            let (human, machine) = readings(&error);
+
+            assert!(!human.contains("fixtureSENTINEL"), "{human}");
+            assert!(human.contains("[REDACTED:secret_field]"), "{human}");
+            assert!(!human.contains("tailSENTINEL"), "{human}");
+            assert_eq!(machine["error"]["body"], expected);
+            assert!(
+                !machine.to_string().contains("fixtureSENTINEL"),
+                "{machine}"
+            );
+            assert!(!machine.to_string().contains("tailSENTINEL"), "{machine}");
+        }
+    }
+
+    #[test]
+    fn an_undecodable_copy_is_bounded_on_a_character_boundary() {
+        let body = format!("{}é{}", "x".repeat(BODY_LIMIT - 1), "y".repeat(100));
+        let copy = bounded_body(&body);
+        assert_eq!(
+            copy,
+            format!("{}...[truncated]", "x".repeat(BODY_LIMIT - 1))
+        );
+
+        assert_eq!(
+            redact_body("Authorization: Bearer abcdefghijklmnop rest ghp_short"),
+            "Authorization: Bearer [REDACTED:secret_field] rest ghp_short"
+        );
+        assert_eq!(
+            redact_body("sent Bearer abcdefghijklmnop rest"),
+            "sent Bearer [REDACTED:token] rest"
+        );
+        assert_eq!(redact_body("mask-sk-abcdefgh"), "mask-[REDACTED:token]");
+        assert_eq!(redact_body("task_abcdefghij"), "task_abcdefghij");
+    }
+
+    // Each form `Tightbeam.ErrorDiagnostic.redact_text/1` masks, with the same marker
+    // and the text around it kept.
+    #[test]
+    fn a_body_loses_the_secret_forms_the_gateway_masks() {
+        let cases = [
+            (
+                "login failed: password=fixtureSENTINEL, retry later",
+                "login failed: password=[REDACTED:secret_field], retry later",
+            ),
+            (
+                r#"{"detail": "x", "client_secret": "fixture\"SENTINEL"}"#,
+                r#"{"detail": "x", "client_secret": "[REDACTED:secret_field]"}"#,
+            ),
+            (
+                "api-key: 'fixtureSENTINEL' kept",
+                "api-key: '[REDACTED:secret_field]' kept",
+            ),
+            (
+                "{\"password\":\"fixtureSENTINEL",
+                "{\"password\":\"[REDACTED:secret_field]\"",
+            ),
+            (
+                "api-key: 'fixtureSENTINEL",
+                "api-key: '[REDACTED:secret_field]'",
+            ),
+            (
+                "{\"password\":\"fixtureSENTINEL\\",
+                "{\"password\":\"[REDACTED:secret_field]\"",
+            ),
+            (
+                "api-key: 'fixtureSENTINEL\\",
+                "api-key: '[REDACTED:secret_field]'",
+            ),
+            (
+                "%{\"password\" => \"fixtureSENTINEL\", status: 401}",
+                "%{\"password\" => \"[REDACTED:secret_field]\", status: 401}",
+            ),
+            (
+                "Authorization: Basic Zml4dHVyZVNFTlRJTkVM\nHost: db.test",
+                "Authorization: Basic [REDACTED:secret_field]\nHost: db.test",
+            ),
+            (
+                "Cookie: session=fixtureSENTINEL; theme=dark",
+                "Cookie: [REDACTED:secret_field]; theme=dark",
+            ),
+            (
+                "fetch https://svc:fixtureSENTINEL@db.test/x failed",
+                "fetch https://[REDACTED:userinfo]@db.test/x failed",
+            ),
+            (
+                "clone git+ssh://fixtureSENTINEL@host/repo",
+                "clone git+ssh://[REDACTED:userinfo]@host/repo",
+            ),
+            (
+                "key -----BEGIN RSA PRIVATE KEY-----\nfixtureSENTINEL\n-----END RSA PRIVATE KEY----- end",
+                "key [REDACTED:private_key] end",
+            ),
+            (
+                "cut -----BEGIN PRIVATE KEY-----\nfixtureSENTINEL",
+                "cut [REDACTED:private_key]",
+            ),
+            (
+                "PASSWORD = fixtureSENTINEL",
+                "PASSWORD = [REDACTED:secret_field]",
+            ),
+            (
+                "github_token=fine mytoken=fine",
+                "github_token=fine mytoken=fine",
+            ),
+            (
+                "-----BEGIN CERTIFICATE----- ok",
+                "-----BEGIN CERTIFICATE----- ok",
+            ),
+            ("see https://db.test/a@b", "see https://db.test/a@b"),
+            (
+                "café password=fixtureSENTINEL é",
+                "café password=[REDACTED:secret_field] é",
+            ),
+        ];
+        for (body, expected) in cases {
+            assert_eq!(redact_body(body), expected, "{body}");
+        }
+    }
+
+    #[test]
+    fn a_transport_failure_keeps_safe_context_on_both_error_channels() {
+        let rendered = transport_failure_parts(
+            "ConnectionFailed",
+            "connect failed for https://user:fixtureSENTINEL@host.test: token=fixtureSENTINEL",
+        );
+        let (human, machine) = readings(&rendered);
+
+        assert!(!rendered.contains("fixtureSENTINEL"), "{rendered}");
+        assert!(
+            human.contains("https://[REDACTED:userinfo]@host.test"),
+            "{human}"
+        );
+        assert!(human.contains("token=[REDACTED:secret_field]"), "{human}");
+        assert_eq!(machine["error"]["code"], "transport_failed");
+        assert_eq!(
+            machine["error"]["message"],
+            "connect failed for https://[REDACTED:userinfo]@host.test: token=[REDACTED:secret_field]"
+        );
+    }
+
+    // A decoded reply keeps every field; only a secret-named field's value and secret
+    // text inside strings are replaced, and a cut names what it left out.
+    #[test]
+    fn a_decoded_refusal_keeps_its_fields_and_loses_its_secrets() {
+        let body = serde_json::json!({
+            "error": {
+                "code": "upstream_refused",
+                "message": "auth failed: password=fixtureSENTINEL",
+                "requestId": "req_1",
+                "apiKey": "fixtureSENTINEL",
+                "sessionToken": null,
+                "diagnostic": {
+                    "kind": "upstream",
+                    "headers": {"Set-Cookie": "sid=fixtureSENTINEL", "x-trace": "t1"},
+                    "url": "https://svc:fixtureSENTINEL@db.test/x"
+                },
+                "unknownField": [1, 2]
+            }
+        });
+        let error = parse_response(502, &body.to_string()).unwrap_err();
+        assert!(!error.contains("SENTINEL"), "{error}");
+        let (human, machine) = readings(&error);
+        assert_eq!(
+            human,
+            "upstream_refused: auth failed: password=[REDACTED:secret_field] (req_1)"
+        );
+        assert_eq!(
+            machine["error"],
+            serde_json::json!({
+                "code": "upstream_refused",
+                "message": "auth failed: password=[REDACTED:secret_field]",
+                "requestId": "req_1",
+                "apiKey": "[REDACTED:secret_field]",
+                "sessionToken": null,
+                "diagnostic": {
+                    "kind": "upstream",
+                    "headers": {"Set-Cookie": "[REDACTED:secret_field]", "x-trace": "t1"},
+                    "url": "https://[REDACTED:userinfo]@db.test/x"
+                },
+                "unknownField": [1, 2]
+            })
+        );
+
+        let body = serde_json::json!({
+            "detail": "denied",
+            "token": "fixtureSENTINEL",
+            "items": (0..101).collect::<Vec<_>>(),
+            "trace": "x".repeat(STRING_LIMIT + 1)
+        });
+        let error = parse_response(403, &body.to_string()).unwrap_err();
+        assert!(!error.contains("SENTINEL"), "{error}");
+        let (human, machine) = readings(&error);
+        assert!(human.starts_with("gateway answered HTTP 403 without an error object: "));
+        assert!(human.ends_with("...[truncated]"), "{human}");
+        let kept = &machine["body"];
+        assert_eq!(kept["detail"], "denied");
+        assert_eq!(kept["token"], "[REDACTED:secret_field]");
+        assert_eq!(kept["items"].as_array().unwrap().len(), LIST_LIMIT + 1);
+        assert_eq!(
+            kept["items"][LIST_LIMIT],
+            serde_json::json!({"$type": "omitted", "reason": "list_limit", "count": 1})
+        );
+        assert_eq!(kept["trace"]["$type"], "truncated_string");
+        assert_eq!(kept["trace"]["bytes"], STRING_LIMIT + 1);
+        assert_eq!(kept["trace"]["prefix"], "x".repeat(STRING_LIMIT));
+
+        let refusal: Value = serde_json::from_str(&tune_refusal_json(
+            409,
+            r#"{"error":{"code":"busy","secret":"fixtureSENTINEL"}}"#,
+        ))
+        .unwrap();
+        assert_eq!(
+            refusal,
+            serde_json::json!({
+                "ok": false,
+                "httpStatus": 409,
+                "code": "busy",
+                "secret": "[REDACTED:secret_field]"
+            })
+        );
+    }
+
+    #[test]
+    fn typed_attempt_projection_keeps_cli_and_gateway_facts_distinct() {
+        use crate::attempt_diagnostic::test_fixtures::Attempt as AttemptFixture;
+
+        let fixture = AttemptFixture::dns_failure();
+        let body = serde_json::json!({
+            "error": {
+                "code": "adapter_unavailable",
+                "message": "failed with Authorization: Bearer fixtureSENTINEL",
+                "requestId": "req_foreign",
+                "diagnostic": {"origin": "adapter_coordinator", "phase": "checkout"},
+                "unknown": {"kept": true}
+            }
+        });
+        let rendered = parse_response_with_attempt(503, &body.to_string(), Some(fixture.render()))
+            .unwrap_err();
+        let (human, machine) = readings(&rendered);
+
+        assert!(!rendered.contains("fixtureSENTINEL"), "{rendered}");
+        assert!(human.contains("attempt requestId=req_abcdefghijklmnopqrstuv operation=cli.list"));
+        assert!(human.contains("diagnostic code=gateway_unavailable operation=cli.list"));
+        assert!(human.contains("cause=dns_failed elapsedMs=12 timeoutSource=none budgetMs=null"));
+        assert!(
+            human.contains(
+                "gatewayAccepted=false effectKind=read effectState=none action=retry_safe"
             )
         );
         assert_eq!(
-            parse_response(403, r#"{"error":{"code":"denied","message":"no"}}"#),
-            Err("denied: no".to_owned())
+            machine["attempt"],
+            serde_json::json!({
+                "requestId": "req_abcdefghijklmnopqrstuv",
+                "operation": "cli.list",
+                "listenerGeneration": null,
+                "diagnostic": {
+                    "code": "gateway_unavailable",
+                    "operation": "cli.list",
+                    "cause": "dns_failed",
+                    "elapsedMs": 12,
+                    "timeoutSource": "none",
+                    "budgetMs": null,
+                    "gatewayAccepted": false,
+                    "effectKind": "read",
+                    "effectState": "none",
+                    "action": "retry_safe"
+                },
+                "receipt": "recorded"
+            })
+        );
+        assert_eq!(
+            machine["error"]["message"],
+            "failed with Authorization: Bearer [REDACTED:secret_field]"
+        );
+        assert!(
+            !rendered.contains("[REDACTED:secret_field]]"),
+            "redaction markers must not be rewritten: {rendered}"
+        );
+        assert_eq!(machine["error"]["requestId"], "req_foreign");
+        assert_eq!(
+            machine["error"]["diagnostic"]["origin"],
+            "adapter_coordinator"
+        );
+        assert_eq!(machine["error"]["diagnostic"]["phase"], "checkout");
+        assert_eq!(machine["error"]["unknown"]["kept"], true);
+    }
+
+    #[test]
+    fn decision_pending_with_attempt_redacts_before_rendering_and_keeps_both_objects() {
+        use crate::attempt_diagnostic::test_fixtures::Attempt as AttemptFixture;
+
+        let fixture = AttemptFixture::unclassified();
+        let rendered = parse_response_with_attempt(
+            202,
+            r#"{"decisionPending":{"decisionRequestId":"dr_7","code":"decision_pending","message":"owner reply token=fixtureSENTINEL","authToken":"fixtureSENTINEL"}}"#,
+            Some(fixture.render()),
+        )
+        .unwrap_err();
+        let (human, machine) = readings(&rendered);
+
+        assert!(!rendered.contains("fixtureSENTINEL"), "{rendered}");
+        assert!(
+            human.starts_with("decision_pending: owner reply token=[REDACTED:secret_field] (dr_7)"),
+            "{human}"
+        );
+        assert!(human.contains("diagnostic=unknown"), "{human}");
+        assert_eq!(
+            machine["decisionPending"],
+            serde_json::json!({
+                "decisionRequestId": "dr_7",
+                "code": "decision_pending",
+                "message": "owner reply token=[REDACTED:secret_field]",
+                "authToken": "[REDACTED:secret_field]"
+            })
+        );
+        assert_eq!(
+            machine["attempt"],
+            serde_json::json!({
+                "requestId": "req_abcdefghijklmnopqrstuv",
+                "operation": "cli.tune",
+                "listenerGeneration": null,
+                "diagnostic": null,
+                "receipt": "unavailable"
+            })
+        );
+    }
+
+    #[test]
+    fn db_timeout_keeps_its_db_operation_and_report_request_id() {
+        use crate::attempt_diagnostic::test_fixtures::Attempt as AttemptFixture;
+
+        let fixture = AttemptFixture::db_timeout();
+        let rendered = parse_response_with_attempt(
+            503,
+            r#"{"error":{"code":"db_timeout","message":"database operation timed out","requestId":"req_abcdefghijklmnopqrstuv","diagnostic":{"operation":"db.transaction","timeoutSource":"otp_db_call"}}}"#,
+            Some(fixture.render()),
+        )
+        .unwrap_err();
+        let (human, machine) = readings(&rendered);
+
+        assert!(human.contains("operation=db.transaction cause=db_caller_timeout elapsedMs=5037"));
+        assert!(human.contains("timeoutSource=otp_db_call budgetMs=5000"));
+        assert!(human.contains("do not retry; report request ID req_abcdefghijklmnopqrstuv"));
+        assert_eq!(machine["attempt"]["operation"], "cli.add_user");
+        assert_eq!(
+            machine["attempt"]["diagnostic"]["operation"],
+            "db.transaction"
+        );
+        assert_eq!(machine["attempt"]["diagnostic"]["elapsedMs"], 5037);
+        assert_eq!(machine["attempt"]["diagnostic"]["budgetMs"], 5000);
+        assert_eq!(
+            machine["attempt"]["diagnostic"]["action"],
+            "do_not_retry_report"
+        );
+        assert_eq!(machine["attempt"]["receipt"], "not_applicable");
+        assert_eq!(
+            machine["error"]["diagnostic"]["operation"],
+            "db.transaction"
+        );
+    }
+
+    #[test]
+    fn tune_attempt_collision_preserves_the_sanitized_upstream_object() {
+        use crate::attempt_diagnostic::test_fixtures::Attempt as AttemptFixture;
+
+        let fixture = AttemptFixture::uncertain_write();
+        let rendered = tune_refusal_json_with_attempt(
+            409,
+            r#"{"error":{"code":"refused","message":"password=fixtureSENTINEL","attempt":{"upstream":true},"upstreamError":{"prior":"kept"}}}"#,
+            Some(fixture.render()),
+        );
+        let refusal: Value = serde_json::from_str(&rendered).unwrap();
+
+        assert!(!rendered.contains("fixtureSENTINEL"), "{rendered}");
+        assert!(
+            !rendered.contains('\n'),
+            "tune stays one JSON line: {rendered}"
+        );
+        assert_eq!(refusal["attempt"]["operation"], "cli.add_user");
+        assert_eq!(refusal["attempt"]["diagnostic"]["cause"], Value::Null);
+        assert_eq!(
+            refusal["attempt"]["diagnostic"]["gatewayAccepted"],
+            "unknown"
+        );
+        assert_eq!(refusal["attempt"]["receipt"], "unavailable");
+        assert_eq!(
+            refusal["upstreamError"],
+            serde_json::json!({
+                "code": "refused",
+                "message": "password=[REDACTED:secret_field]",
+                "attempt": {"upstream": true},
+                "upstreamError": {"prior": "kept"}
+            })
+        );
+        assert_eq!(refusal["ok"], false);
+        assert_eq!(refusal["httpStatus"], 409);
+    }
+
+    #[test]
+    fn read_and_decode_failures_keep_attempt_receipt_and_redact_synthetic_secrets() {
+        use crate::attempt_diagnostic::test_fixtures::Attempt as AttemptFixture;
+
+        let fixture = AttemptFixture::uncertain_write();
+        let read_error = std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "read failed: token=tbc_fixtureSENTINEL",
+        );
+        let rendered = unreadable_response_with_attempt(
+            503,
+            &read_error,
+            Some(fixture.render()),
+            FailurePresentation::Ordinary,
+        );
+        let (human, machine) = readings(&rendered);
+        assert!(!rendered.contains("fixtureSENTINEL"), "{rendered}");
+        assert!(human.contains("diagnosticReceipt=unavailable"), "{human}");
+        assert_eq!(machine["error"]["code"], "response_unreadable");
+        assert_eq!(
+            machine["error"]["message"],
+            "read failed: token=[REDACTED:secret_field]"
+        );
+        assert_eq!(machine["attempt"]["receipt"], "unavailable");
+        assert!(
+            !rendered.contains("[REDACTED:secret_field]]"),
+            "redaction markers must not be rewritten: {rendered}"
+        );
+
+        let rendered = unreadable_response(503, &read_error);
+        assert!(!rendered.contains("fixtureSENTINEL"), "{rendered}");
+        let (human, machine) = readings(&rendered);
+        assert!(human.contains("token=[REDACTED:secret_field]"), "{human}");
+        assert_eq!(
+            machine["error"]["message"],
+            "read failed: token=[REDACTED:secret_field]"
+        );
+
+        let invalid_body = "not json; Authorization: Bearer fixtureSENTINEL";
+        let decode_error = serde_json::from_str::<Value>(invalid_body).unwrap_err();
+        let rendered = undecodable_response_with_attempt(
+            502,
+            invalid_body,
+            &decode_error,
+            Some(fixture.render()),
+            FailurePresentation::Tune,
+        );
+        assert!(!rendered.contains("fixtureSENTINEL"), "{rendered}");
+        assert!(
+            !rendered.contains('\n'),
+            "tune stays one JSON line: {rendered}"
+        );
+        let refusal: Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(refusal["code"], "response_undecodable");
+        assert_eq!(
+            refusal["body"],
+            "not json; Authorization: Bearer [REDACTED:secret_field]"
+        );
+        assert_eq!(refusal["attempt"]["receipt"], "unavailable");
+
+        let unterminated_body = "not json; api-key: 'fixtureSENTINEL";
+        let decode_error = serde_json::from_str::<Value>(unterminated_body).unwrap_err();
+        let expected_body = "not json; api-key: '[REDACTED:secret_field]'";
+
+        let rendered = undecodable_response_with_attempt(
+            502,
+            unterminated_body,
+            &decode_error,
+            Some(fixture.render()),
+            FailurePresentation::Ordinary,
+        );
+        let (human, machine) = readings(&rendered);
+        assert!(!rendered.contains("fixtureSENTINEL"), "{rendered}");
+        assert!(human.contains(expected_body), "{human}");
+        assert_eq!(machine["error"]["body"], expected_body);
+        assert_eq!(machine["attempt"]["receipt"], "unavailable");
+
+        let rendered = undecodable_response_with_attempt(
+            502,
+            unterminated_body,
+            &decode_error,
+            Some(fixture.render()),
+            FailurePresentation::Tune,
+        );
+        assert!(!rendered.contains("fixtureSENTINEL"), "{rendered}");
+        assert!(
+            !rendered.contains('\n'),
+            "tune stays one JSON line: {rendered}"
+        );
+        let refusal: Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(refusal["body"], expected_body);
+        assert_eq!(refusal["attempt"]["receipt"], "unavailable");
+
+        let escaped_eof_body = "not json; api-key: 'prefix\\'tailSENTINEL";
+        let decode_error = serde_json::from_str::<Value>(escaped_eof_body).unwrap_err();
+        let expected_escaped_eof_body = "not json; api-key: '[REDACTED:secret_field]'";
+
+        let rendered = undecodable_response_with_attempt(
+            502,
+            escaped_eof_body,
+            &decode_error,
+            Some(fixture.render()),
+            FailurePresentation::Ordinary,
+        );
+        let (human, machine) = readings(&rendered);
+        assert!(!rendered.contains("tailSENTINEL"), "{rendered}");
+        assert!(human.contains(expected_escaped_eof_body), "{human}");
+        assert_eq!(machine["error"]["body"], expected_escaped_eof_body);
+        assert_eq!(machine["attempt"]["receipt"], "unavailable");
+
+        let rendered = undecodable_response_with_attempt(
+            502,
+            escaped_eof_body,
+            &decode_error,
+            Some(fixture.render()),
+            FailurePresentation::Tune,
+        );
+        assert!(!rendered.contains("tailSENTINEL"), "{rendered}");
+        assert!(
+            !rendered.contains('\n'),
+            "tune stays one JSON line: {rendered}"
+        );
+        let refusal: Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(refusal["body"], expected_escaped_eof_body);
+        assert_eq!(refusal["attempt"]["receipt"], "unavailable");
+    }
+
+    #[test]
+    fn absent_attempt_keeps_the_existing_parser_and_tune_projection() {
+        let body = r#"{"error":{"code":"denied","message":"no"}}"#;
+        assert_eq!(
+            parse_response_with_attempt(403, body, None),
+            parse_response(403, body)
+        );
+        assert_eq!(
+            tune_refusal_json_with_attempt(409, body, None),
+            tune_refusal_json(409, body)
+        );
+    }
+
+    #[test]
+    fn unknown_attempt_evidence_stays_null_and_says_receipt_unavailable() {
+        use crate::attempt_diagnostic::test_fixtures::Attempt as AttemptFixture;
+
+        let fixture = AttemptFixture::unclassified();
+        let rendered = parse_response_with_attempt(
+            500,
+            r#"{"error":{"code":"denied","requestId":"req_foreign"}}"#,
+            Some(fixture.render()),
+        )
+        .unwrap_err();
+        let (human, machine) = readings(&rendered);
+
+        assert!(human.contains("diagnostic=unknown"), "{human}");
+        assert!(human.contains("diagnosticReceipt=unavailable"), "{human}");
+        assert_eq!(
+            machine["attempt"],
+            serde_json::json!({
+                "requestId": "req_abcdefghijklmnopqrstuv",
+                "operation": "cli.tune",
+                "listenerGeneration": null,
+                "diagnostic": null,
+                "receipt": "unavailable"
+            })
+        );
+        assert_eq!(machine["error"]["requestId"], "req_foreign");
+    }
+
+    #[test]
+    fn non_dispatch_status_failure_keeps_foreign_fields_and_local_attempt_separate() {
+        use crate::attempt_diagnostic::test_fixtures::Attempt as AttemptFixture;
+
+        let fixture = AttemptFixture::unclassified();
+        let rendered = status_failure_with_attempt(
+            502,
+            r#"{"error":{"code":"proxy_refused","requestId":"req_foreign","diagnostic":{"cause":"proxy"},"detail":"kept"}}"#,
+            Some(fixture.render()),
+        );
+        let (human, machine) = readings(&rendered);
+
+        assert!(human.starts_with("proxy_refused"), "{human}");
+        assert_eq!(machine["error"]["requestId"], "req_foreign");
+        assert_eq!(machine["error"]["diagnostic"]["cause"], "proxy");
+        assert_eq!(machine["error"]["detail"], "kept");
+        assert_eq!(
+            machine["attempt"]["requestId"],
+            "req_abcdefghijklmnopqrstuv"
+        );
+        assert_eq!(machine["attempt"]["diagnostic"], Value::Null);
+    }
+
+    #[test]
+    fn transport_failure_renders_attempt_action_and_keeps_receipt_unavailable_visible() {
+        use crate::attempt_diagnostic::test_fixtures::Attempt as AttemptFixture;
+
+        let ureq::Error::Transport(error) = ureq::get("http://127.0.0.1:1").call().unwrap_err()
+        else {
+            panic!("port 1 should fail before an HTTP response");
+        };
+        let fixture = AttemptFixture::uncertain_write();
+        let rendered = transport_failure_with_attempt(
+            &error,
+            Some(fixture.render()),
+            FailurePresentation::Ordinary,
+        );
+        let (human, machine) = readings(&rendered);
+
+        assert!(
+            human.contains("action=retry_same_idempotency_key"),
+            "{human}"
+        );
+        assert!(
+            human.contains("retry only with the same idempotency key"),
+            "{human}"
+        );
+        assert!(human.contains("diagnosticReceipt=unavailable"), "{human}");
+        assert_eq!(machine["error"]["code"], "transport_failed");
+        assert_eq!(machine["attempt"]["diagnostic"]["cause"], Value::Null);
+        assert_eq!(
+            machine["attempt"]["diagnostic"]["gatewayAccepted"],
+            "unknown"
         );
     }
 
@@ -4957,6 +6907,47 @@ mod tests {
             }
             _ => panic!("expected structured gateway refusal"),
         }
+    }
+
+    #[test]
+    fn an_unreachable_gateway_is_a_transport_failure_without_a_status() {
+        let endpoint = Endpoint {
+            base: "http://127.0.0.1:1".to_owned(),
+            token: "tbc_test".to_owned(),
+            origin: Origin::Provisioned,
+        };
+        let request = RequestSpec {
+            attempt_context: None,
+            receipt_base_override: None,
+            path: "/dispatch",
+            body_json: r#"{"verb":"list","params":{}}"#.to_owned(),
+        };
+        let error = send_to(&endpoint, &request).unwrap_err();
+        let (human, machine) = readings(&error);
+
+        assert!(!human.is_empty());
+        assert_eq!(machine["error"]["code"], "transport_failed");
+        assert_eq!(machine["error"]["kind"], "ConnectionFailed");
+        assert!(machine.get("httpStatus").is_none(), "{machine}");
+    }
+
+    #[test]
+    fn only_the_tune_verb_routes_to_the_tune_refusal_shape() {
+        let tune = RequestSpec {
+            attempt_context: None,
+            receipt_base_override: None,
+            path: "/dispatch",
+            body_json: r#"{"verb":"tune","params":{}}"#.to_owned(),
+        };
+        let mention = RequestSpec {
+            attempt_context: None,
+            receipt_base_override: None,
+            path: "/dispatch",
+            body_json: r#"{"verb":"wake","params":{"prompt":"{\"verb\":\"tune\"}"}}"#.to_owned(),
+        };
+        assert!(is_tune(&tune));
+        assert!(mention.body_json.contains(r#"verb\":\"tune"#));
+        assert!(!is_tune(&mention));
     }
 
     #[test]

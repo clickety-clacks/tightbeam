@@ -303,8 +303,12 @@ defmodule Tightbeam.Rails do
                 ~s(statute #{name} requires exactly one of "pattern" or "action")
         else
           case Regex.compile(pattern) do
-            {:ok, _} -> :ok
-            {:error, _} -> raise ArgumentError, "invalid gate pattern: #{inspect(pattern)}"
+            {:ok, _} ->
+              :ok
+
+            {:error, {reason, position}} ->
+              raise ArgumentError,
+                    "invalid gate pattern: #{inspect(pattern)}: #{reason} at byte #{position}"
           end
         end
 

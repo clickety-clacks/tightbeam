@@ -746,6 +746,10 @@ fn spawn_send(
     tx: Sender<Worker>,
 ) {
     thread::spawn(move || {
+        let has_idempotency_key = frame
+            .idempotency_key
+            .as_deref()
+            .is_some_and(|key| !key.trim().is_empty());
         let request = Command::Wake {
             identity,
             target: Target::Session(session_key),
@@ -772,7 +776,12 @@ fn spawn_send(
                         dispatch::SessionSendError::Transport(error) => (
                             "outcome_unknown".to_owned(),
                             format!(
-                                "wake outcome is unknown; retry only with the same idempotencyKey: {}",
+                                "wake outcome is unknown; {}: {}",
+                                if has_idempotency_key {
+                                    "retry only with the same idempotencyKey"
+                                } else {
+                                    "do not retry without an idempotencyKey"
+                                },
                                 safe_reason(&error)
                             ),
                         ),
@@ -1753,9 +1762,267 @@ fn emit(value: &Value) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use std::net::TcpListener;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{TcpListener, TcpStream};
 
     use super::*;
+
+    fn endpoint(listener: &TcpListener) -> Endpoint {
+        Endpoint {
+            base: format!("http://{}", listener.local_addr().unwrap()),
+            token: "tbc_session_connect_test".to_owned(),
+            origin: crate::dispatch::Origin::Named,
+        }
+    }
+
+    fn read_http_request(stream: &mut TcpStream) -> String {
+        let mut reader = BufReader::new(stream);
+        let mut request = String::new();
+        let mut content_length = 0usize;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line.is_empty() {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                if name.eq_ignore_ascii_case("content-length") {
+                    content_length = value.trim().parse().unwrap();
+                }
+            }
+            let finished = line == "\r\n";
+            request.push_str(&line);
+            if finished {
+                break;
+            }
+        }
+        let mut body = vec![0; content_length];
+        reader.read_exact(&mut body).unwrap();
+        request.push_str(&String::from_utf8(body).unwrap());
+        request
+    }
+
+    fn write_json_response(stream: &mut TcpStream, status: &str, extra: &str, body: &str) {
+        write!(
+            stream,
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n{extra}\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        stream.flush().unwrap();
+    }
+
+    fn assert_gateway_headers(request: &str) {
+        let lower = request.to_ascii_lowercase();
+        assert!(
+            lower.contains("authorization: bearer tbc_session_connect_test\r\n"),
+            "{request}"
+        );
+        assert!(
+            lower.contains("x-tightbeam-cli-version: 0.1.9\r\n"),
+            "{request}"
+        );
+    }
+
+    fn send_frame(endpoint: Endpoint, idempotency_key: Option<&str>) -> (String, SendFailure) {
+        let (tx, rx) = mpsc::channel();
+        spawn_send(
+            endpoint,
+            "agent:main/example".to_owned(),
+            Identity::Session,
+            SendFrame {
+                request_id: "request-1".to_owned(),
+                content: "synthetic message".to_owned(),
+                idempotency_key: idempotency_key.map(str::to_owned),
+            },
+            tx,
+        );
+        match rx.recv_timeout(Duration::from_secs(3)).unwrap() {
+            Worker::SendResult {
+                request_id,
+                result: Err(error),
+            } => (request_id, error),
+            other => panic!("expected a failed session wake, got {other:?}"),
+        }
+    }
+
+    fn respond_to_snapshot_request(stream: &mut TcpStream, request_number: usize) {
+        let session = json!({
+            "item": {"rowVersion": 7, "clearedThroughSeq": 2}
+        });
+        let collection = json!({
+            "items": [],
+            "page": {"hasMoreAfter": false}
+        });
+        let body = if request_number == 0 || request_number == 4 {
+            session.to_string()
+        } else {
+            collection.to_string()
+        };
+        write_json_response(stream, "200 OK", "", &body);
+    }
+
+    #[test]
+    fn snapshot_uses_each_rest_path_and_the_shared_gateway_request_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = endpoint(&listener);
+        let session_key = "agent:main/example";
+        let encoded_key = encode_path(session_key);
+        let expected = [
+            format!("GET /api/sessions/{encoded_key} HTTP/1.1"),
+            format!(
+                "GET /api/sessions/{encoded_key}/messages?sessionKey={encoded_key}&limit=500 HTTP/1.1"
+            ),
+            format!(
+                "GET /api/sessions/{encoded_key}/wakes?sessionKey={encoded_key}&limit=500 HTTP/1.1"
+            ),
+            format!(
+                "GET /api/sessions/{encoded_key}/turns?sessionKey={encoded_key}&limit=500 HTTP/1.1"
+            ),
+            format!("GET /api/sessions/{encoded_key} HTTP/1.1"),
+        ];
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for index in 0..expected.len() {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_request(&mut stream);
+                respond_to_snapshot_request(&mut stream, index);
+                requests.push(request);
+            }
+            (expected, requests)
+        });
+
+        let snapshot = load_snapshot(&endpoint, session_key).unwrap();
+        let (expected, requests) = server.join().unwrap();
+        assert_eq!(
+            requests.len(),
+            5,
+            "four unique REST paths, five boundary-checked GETs"
+        );
+        for (request, expected_line) in requests.iter().zip(expected) {
+            assert_eq!(request.lines().next(), Some(expected_line.as_str()));
+            assert_gateway_headers(request);
+        }
+        assert_eq!(snapshot.row_version, 7);
+        assert_eq!(snapshot.cleared_through_seq, 2);
+        assert!(snapshot.messages.is_empty());
+        assert!(snapshot.wakes.is_empty());
+        assert!(snapshot.turns.is_empty());
+    }
+
+    #[test]
+    fn snapshot_redirect_is_returned_as_a_gateway_failure_without_following_it() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = endpoint(&listener);
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut stream);
+            write_json_response(
+                &mut stream,
+                "302 Found",
+                "location: /must-not-follow\r\n",
+                r#"{"error":{"code":"snapshot_redirect","message":"gateway redirect"}}"#,
+            );
+            request
+        });
+
+        let error = load_snapshot(&endpoint, "agent:main/example").unwrap_err();
+        let request = server.join().unwrap();
+        assert!(request.starts_with("GET /api/sessions/agent%3Amain%2Fexample HTTP/1.1"));
+        assert_gateway_headers(&request);
+        assert_eq!(error.code, "snapshot_redirect");
+        assert!(!error.retryable);
+    }
+
+    #[test]
+    fn session_wake_redirect_keeps_the_gateway_refusal_and_does_not_follow_it() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = endpoint(&listener);
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut stream);
+            write_json_response(
+                &mut stream,
+                "302 Found",
+                "location: /must-not-follow\r\n",
+                r#"{"error":{"code":"wake_redirect","message":"wake was redirected"}}"#,
+            );
+            request
+        });
+
+        let (request_id, error) = send_frame(endpoint, Some("retry-key"));
+        let request = server.join().unwrap();
+        assert_eq!(request_id, "request-1");
+        assert!(request.starts_with("POST /agent/dispatch HTTP/1.1"));
+        assert_gateway_headers(&request);
+        assert_eq!(error.code, "wake_redirect");
+        assert_eq!(error.message, "wake was redirected");
+    }
+
+    #[test]
+    fn session_wake_transport_failure_only_advises_retry_when_a_key_exists() {
+        for (key, expected_guidance) in [
+            (Some("retry-key"), "retry only with the same idempotencyKey"),
+            (None, "do not retry without an idempotencyKey"),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = endpoint(&listener);
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_request(&mut stream);
+                drop(stream);
+                request
+            });
+
+            let (request_id, error) = send_frame(endpoint, key);
+            let request = server.join().unwrap();
+            assert_eq!(request_id, "request-1");
+            assert!(request.starts_with("POST /agent/dispatch HTTP/1.1"));
+            assert_gateway_headers(&request);
+            assert_eq!(error.code, "outcome_unknown");
+            assert!(
+                error.message.contains(expected_guidance),
+                "{}",
+                error.message
+            );
+        }
+    }
+
+    #[test]
+    fn websocket_handshake_failure_is_reported_without_ureq_phase_claims() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = endpoint(&listener);
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut stream);
+            write!(
+                stream,
+                "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            )
+            .unwrap();
+            stream.flush().unwrap();
+            request
+        });
+
+        let (tx, _rx) = mpsc::channel();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let lifecycle = Arc::new(AtomicU64::new(0));
+        let failure = connect_and_read(
+            &endpoint,
+            "agent:main/example",
+            1,
+            &tx,
+            &stopped,
+            &lifecycle,
+        )
+        .unwrap_err();
+        let request = server.join().unwrap();
+
+        assert!(request.starts_with("GET /ws/changes?protocolVersion=1 HTTP/1.1"));
+        assert_eq!(failure.code, "connection_lost");
+        assert_eq!(failure.message, "websocket connection failed");
+        assert_eq!(failure.close_code, None);
+    }
 
     #[test]
     fn accepts_only_the_send_frame_shape() {

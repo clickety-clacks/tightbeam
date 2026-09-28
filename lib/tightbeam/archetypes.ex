@@ -378,7 +378,8 @@ defmodule Tightbeam.Archetypes do
                %{
                  code: "invalid_overrides",
                  message: "overrides.guidance_extra #{Exception.message(error)}"
-               }}
+               }
+               |> Tightbeam.ErrorDiagnostic.put(override_guidance_diagnostic(error))}
           end
         end
 
@@ -387,6 +388,12 @@ defmodule Tightbeam.Archetypes do
          %{code: "invalid_overrides", message: "overrides.guidance_extra must be a string"}}
     end
   end
+
+  defp override_guidance_diagnostic(%Tightbeam.Identity.IncludeError{} = error),
+    do: Tightbeam.Identity.IncludeError.diagnostic(error)
+
+  defp override_guidance_diagnostic(error),
+    do: Tightbeam.ErrorDiagnostic.exception(error, nil, operation: "render_guidance_extra")
 
   defp maybe_put_override(map, _key, nil), do: map
   defp maybe_put_override(map, _key, []), do: map

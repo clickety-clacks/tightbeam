@@ -76,8 +76,7 @@ defmodule Tightbeam.HarnessClaudeWarmTest do
       |> Map.put(:warm_timeout_ms, 10)
 
     started = System.monotonic_time(:millisecond)
-    assert {:error, reason} = Claude.warm_home(target, "/tmp/claude-home")
-    assert inspect(reason) =~ "timed out"
+    assert {:error, {:timeout, 10}} = Claude.warm_home(target, "/tmp/claude-home")
     assert System.monotonic_time(:millisecond) - started < 500
   end
 
