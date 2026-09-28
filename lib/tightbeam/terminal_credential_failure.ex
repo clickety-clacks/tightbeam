@@ -207,7 +207,8 @@ defmodule Tightbeam.TerminalCredentialFailure do
           [[shape]]
           when shape in [
                  "terminal-credential-failure-v1-019",
-                 "delivery-owner-reparent-v1-019"
+                 "delivery-owner-reparent-v1-019",
+                 "artifact-origin-v1-019"
                ] ->
             readonly_views_from_conn(conn)
 
