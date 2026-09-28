@@ -388,7 +388,7 @@ defmodule Tightbeam.WorkspaceCleanup do
 
   defp run_bounded(runner, invocation, script, manifest, timeout_ms) do
     task =
-      Task.async_nolink(fn ->
+      Task.Supervisor.async_nolink(Tightbeam.TurnTaskSupervisor, fn ->
         try do
           {:runner_result, runner.(invocation, script, manifest)}
         rescue
