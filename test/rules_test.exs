@@ -2688,31 +2688,31 @@ defmodule Tightbeam.RulesTest do
     assert notice_count(ctx.db, "remedy:compat-work-item-review-verdict-count") == 0
 
     for {reviewer, index} <- Enum.with_index(Enum.take(reviewers, 3), 1) do
-        {producer_opener, producer_holder} = Enum.at(producer_rounds, index - 1)
+      {producer_opener, producer_holder} = Enum.at(producer_rounds, index - 1)
 
-        producer_assignment =
-          assignment(ctx, producer_holder.session_key, {:session, producer_opener.session_key},
-            work_item_id: work_item_id
-          )
-
-        review_assignment =
-          assignment(ctx, reviewer.session_key, {:session, review_opener.session_key},
-            reviews: producer_assignment.id
-          )
-
-        verdict(
-          ctx,
-          reviewer.session_key,
-          review_assignment.id,
-          "changes-requested",
-          "fresh reviewer #{index}"
+      producer_assignment =
+        assignment(ctx, producer_holder.session_key, {:session, producer_opener.session_key},
+          work_item_id: work_item_id
         )
 
-        assert notice_count(ctx.db, "remedy:compat-work-item-review-verdict-count") ==
-                 if(index >= 2, do: 1, else: 0)
+      review_assignment =
+        assignment(ctx, reviewer.session_key, {:session, review_opener.session_key},
+          reviews: producer_assignment.id
+        )
 
-        {producer_assignment, review_assignment}
-      end
+      verdict(
+        ctx,
+        reviewer.session_key,
+        review_assignment.id,
+        "changes-requested",
+        "fresh reviewer #{index}"
+      )
+
+      assert notice_count(ctx.db, "remedy:compat-work-item-review-verdict-count") ==
+               if(index >= 2, do: 1, else: 0)
+
+      {producer_assignment, review_assignment}
+    end
 
     assert {:ok, [[compat_target, compat_prompt]]} =
              DB.query(
@@ -2749,6 +2749,7 @@ defmodule Tightbeam.RulesTest do
 
   test "AC6a fourth review and fix rounds route through real assignment and attest commits",
        ctx do
+    assert %{user_id: "flynn"} = Devices.add_user(ctx.db, "flynn", false)
     opener = session(ctx.db, Org.personal_session_key("flynn"), "flynn", kind: "main")
     fix_holder = session(ctx.db, "ac6a-round-fix-holder", "flynn", archetype: "coder")
     reviewer = session(ctx.db, "ac6a-round-reviewer", "flynn", archetype: "reviewer-code")
@@ -2842,13 +2843,16 @@ defmodule Tightbeam.RulesTest do
           effect_kind: "code"
         )
 
+      refs = verified_code_refs(ctx, prior, fix_holder, reviewer)
+
       assert %{assignment: %{state: "closed", outcome: "completed"}} =
                Assignments.__handle__(
                  ctx.db,
                  "attest",
                  p3_call("attest", {:session, fix_holder.session_key}, %{
                    assignment_id: prior.id,
-                   kind: "completion"
+                   kind: "completion",
+                   commit_refs: refs
                  })
                )
     end
@@ -2886,6 +2890,7 @@ defmodule Tightbeam.RulesTest do
 
   test "AC6a routes unassigned agent stretches to the item coordinator once and excludes human starts",
        ctx do
+    assert %{user_id: "flynn"} = Devices.add_user(ctx.db, "flynn", false)
     agent = session(ctx.db, "ac6a-unassigned-agent", "flynn", archetype: "coder")
     foreign_sender = session(ctx.db, "ac6a-foreign-agent", "flynn", archetype: "coder")
     human_started = session(ctx.db, "ac6a-human-started", "flynn", archetype: "coder")
@@ -2991,7 +2996,12 @@ defmodule Tightbeam.RulesTest do
              Ledger.claim_next(ctx.db, agent.session_key, "ac6a-assigned-claim")
 
     assert notice_count(ctx.db, "remedy:ac6a-unassigned-agent-turn") == 1
-    assert :ok = Ledger.finish(ctx.db, assigned_seq, "delivered", nil, owner_lease: assigned_lease)
+
+    assert :ok =
+             Ledger.finish(ctx.db, assigned_seq, "delivered", nil, owner_lease: assigned_lease)
+
+    reviewer = session(ctx.db, "ac6a-unassigned-reviewer", "flynn", archetype: "reviewer-code")
+    refs = verified_code_refs(ctx, opened, agent, reviewer)
 
     assert %{assignment: %{state: "closed", outcome: "completed"}} =
              Assignments.__handle__(
@@ -2999,7 +3009,8 @@ defmodule Tightbeam.RulesTest do
                "attest",
                p3_call("attest", {:session, agent.session_key}, %{
                  assignment_id: opened.id,
-                 kind: "completion"
+                 kind: "completion",
+                 commit_refs: refs
                })
              )
 
@@ -3016,6 +3027,7 @@ defmodule Tightbeam.RulesTest do
              Ledger.claim_next(ctx.db, agent.session_key, "ac6a-after-assignment-claim")
 
     assert notice_count(ctx.db, "remedy:ac6a-unassigned-agent-turn") == 2
+
     assert :ok =
              Ledger.finish(ctx.db, after_assignment_seq, "delivered", nil,
                owner_lease: after_assignment_lease
@@ -3071,8 +3083,11 @@ defmodule Tightbeam.RulesTest do
              DB.query(
                ctx.db,
                "SELECT COUNT(*) FROM lifecycle_events WHERE kind='rule_notice_failed' " <>
-                 "AND objectId='ac6a-unassigned-agent-turn'"
+                 "AND subject='ac6a-unassigned-agent-turn'"
              )
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE kind='operator'")
 
     assert :ok =
              Ledger.finish(ctx.db, no_context_seq, "delivered", nil,
@@ -3122,12 +3137,11 @@ defmodule Tightbeam.RulesTest do
     absent_opener_assignment =
       assignment(ctx, absent_holder.session_key, {:user, "flynn"}, work_item_id: work_item_id)
 
-    assert {:ok, _} =
-             DB.query(
-               ctx.db,
-               "UPDATE assignments SET openedByUser=NULL,openedBySession=NULL WHERE id=?1",
-               [absent_opener_assignment.id]
-             )
+    # A user opener without a Main session has no reachable notice recipient.
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM sessions WHERE sessionKey=?1", [
+               Org.personal_session_key("flynn")
+             ])
 
     for index <- 1..20 do
       assert {:ok, _} =
@@ -3172,7 +3186,7 @@ defmodule Tightbeam.RulesTest do
     assert {:ok, [[1]]} =
              DB.query(
                ctx.db,
-               "SELECT COUNT(*) FROM lifecycle_events WHERE kind='rule_notice_failed' AND objectId='ac6a-queue-backlog'"
+               "SELECT COUNT(*) FROM lifecycle_events WHERE kind='rule_notice_failed' AND subject='ac6a-queue-backlog'"
              )
   end
 
@@ -3528,6 +3542,38 @@ defmodule Tightbeam.RulesTest do
     # Gateway startup activates row-commit recognition after loading rules.
     :ok = Wakes.activate_wait_recognition(ctx.db)
     rules
+  end
+
+  defp verified_code_refs(ctx, producer, holder, reviewer) do
+    {sha, 0} = System.cmd("git", ["rev-parse", "HEAD"])
+
+    refs = [
+      %{
+        "repo" => "#{Tightbeam.Placement.local_host_name()}:#{File.cwd!()}",
+        "commit" => String.trim(sha)
+      }
+    ]
+
+    review = assignment(ctx, reviewer.session_key, {:user, "flynn"}, reviews: producer.id)
+
+    for {session_key, assignment_id, kind} <- [
+          {holder.session_key, producer.id, "verified"},
+          {reviewer.session_key, review.id, "reviewed-clean"}
+        ] do
+      assert %{attest: %{verdictKind: ^kind}} =
+               Assignments.__handle__(
+                 ctx.db,
+                 "attest",
+                 p3_call("attest", {:session, session_key}, %{
+                   assignment_id: assignment_id,
+                   kind: "verdict",
+                   verdict_kind: kind,
+                   commit_refs: refs
+                 })
+               )
+    end
+
+    refs
   end
 
   defp notice_count(db, origin) do
