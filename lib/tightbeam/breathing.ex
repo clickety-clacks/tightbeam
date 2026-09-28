@@ -14,7 +14,8 @@ defmodule Tightbeam.Breathing do
   @terminal_statuses ~w(delivered canceled failed failed_unknown)
 
   @spec handle(DB.server(), map()) :: map()
-  def handle(db, %{principal: {kind, principal}, params: params}) when kind in [:session, :user] do
+  def handle(db, %{principal: {kind, principal}, params: params})
+      when kind in [:session, :user] do
     with target_kind when target_kind in ~w(session assignment work-item) <-
            params[:target_kind],
          target_id when is_binary(target_id) and target_id != "" <- params[:target_id] do
@@ -46,8 +47,11 @@ defmodule Tightbeam.Breathing do
            now_ms = System.system_time(:millisecond)
 
            case AssignmentQueue.read_in_txn(txn, id, principal, now_ms) do
-             {:ok, queue} -> Map.put(assignment_in_txn(txn, id), :queue, queue)
-             :not_found -> assignment_in_txn(txn, id)
+             {:ok, queue} ->
+               Map.put(assignment_in_txn(txn, id), :queue, queue)
+
+             :not_found ->
+               assignment_in_txn(txn, id)
 
              :forbidden ->
                %{
