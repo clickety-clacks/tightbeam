@@ -60,7 +60,7 @@ defmodule Tightbeam.TurnObservations do
 
   use GenServer
 
-  alias Tightbeam.Ledger
+  alias Tightbeam.{ErrorDiagnostic, Ledger}
 
   # How long a caller waits, and therefore the deadline it stamps on its post.
   # One number for both, so "the caller gave up" and "the post expired" are the
@@ -94,10 +94,15 @@ defmodule Tightbeam.TurnObservations do
   @doc """
   Capture the session's running turn as the open window, superseding any
   previous one. No running turn closes the window rather than leaving it.
+  `{:unavailable, diagnostic}` when the writer could not be reached: nothing was
+  captured, and the diagnostic says why.
   """
-  @spec observe(GenServer.server(), String.t(), GenServer.server()) :: :ok
+  @spec observe(GenServer.server(), String.t(), GenServer.server()) ::
+          :ok | {:unavailable, ErrorDiagnostic.t()}
   def observe(db, session_key, server \\ __MODULE__) do
-    call(server, {:observe, db, session_key, now() + @call_timeout_ms}, fn -> :ok end)
+    call(server, {:observe, db, session_key, now() + @call_timeout_ms}, fn node ->
+      {:unavailable, node}
+    end)
   end
 
   @doc """
@@ -105,11 +110,23 @@ defmodule Tightbeam.TurnObservations do
 
   Both sources are consulted here, with nothing able to run between them, so the
   answer is one snapshot rather than two reads of two different instants.
+
+  The third element is nil when the writer answered, or the diagnostic of the
+  writer's unavailability when the answer is the request-process ledger
+  fallback. The class stays the fallback's, so the reason for the weaker class
+  is visible without changing what the class means.
   """
   @spec evidence(GenServer.server(), String.t(), GenServer.server()) ::
-          {String.t() | nil, String.t()}
+          {String.t() | nil, String.t(), ErrorDiagnostic.t() | nil}
   def evidence(db, session_key, server \\ __MODULE__) do
-    call(server, {:evidence, db, session_key}, fn -> ledger_evidence(db, session_key) end)
+    case call(server, {:evidence, db, session_key}, &{:unavailable, &1}) do
+      {:unavailable, node} ->
+        {message_id, class} = ledger_evidence(db, session_key)
+        {message_id, class, node}
+
+      {message_id, class} ->
+        {message_id, class, nil}
+    end
   end
 
   @impl true
@@ -192,12 +209,31 @@ defmodule Tightbeam.TurnObservations do
   # allowed to raise because it is absent. Missing writer = no observation, which
   # is exactly the hookless case the evidence classes already describe. A timeout
   # exits here too, and the deadline riding on the message is what stops the
-  # abandoned call from acting after this process has moved on.
+  # abandoned call from acting after this process has moved on. The fallback
+  # is kept, but its cause is handed on rather than dropped.
   defp call(server, message, on_unavailable) do
     GenServer.call(server, message, @call_timeout_ms)
   catch
-    :exit, _ -> on_unavailable.()
+    :exit, reason ->
+      on_unavailable.(
+        ErrorDiagnostic.new("unknown",
+          operation: "turn_observation",
+          origin: "turn_observations",
+          status: "writer_unavailable",
+          cause:
+            ErrorDiagnostic.from_reason(unavailable_reason(reason), timeout_ms: timeout(reason))
+        )
+      )
   end
+
+  # `GenServer.call` exits with `{reason, {GenServer, :call, args}}`; the args
+  # carry the caller's db handle and session, which are not the cause.
+  defp unavailable_reason({reason, {GenServer, :call, _args}}), do: unavailable_reason(reason)
+  defp unavailable_reason(:timeout), do: :timeout
+  defp unavailable_reason(reason), do: {:exit, reason}
+
+  defp timeout({:timeout, _}), do: @call_timeout_ms
+  defp timeout(_), do: nil
 
   defp expired?(deadline), do: now() >= deadline
 

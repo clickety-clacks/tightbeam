@@ -10,7 +10,9 @@ defmodule Tightbeam.HarnessProcess do
   identity file until the launch resolves to a terminal state.
   """
 
-  alias Tightbeam.{DB, EventLog, Id}
+  alias Tightbeam.{DB, ErrorDiagnostic, EventLog, Id}
+
+  require Logger
 
   @ssh_opts ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
   @command_timeout_ms 5_000
@@ -500,7 +502,7 @@ defmodule Tightbeam.HarnessProcess do
 
   defp reconcile_row(db, row, terminal_state \\ "killed") do
     with {:ok, row} <- recover_identity_until(db, row, deadline(identity_wait_ms())) do
-      if reboot_orphan?(row) do
+      if reboot_orphan?(db, row) do
         reboot_orphan(db, row)
       else
         kill(db, row, terminal_state)
@@ -513,7 +515,7 @@ defmodule Tightbeam.HarnessProcess do
   defp settle_proven_dead_row(db, row) do
     case recover_identity_until(db, row, deadline(identity_wait_ms())) do
       {:ok, recovered} ->
-        if reboot_orphan?(recovered) do
+        if reboot_orphan?(db, recovered) do
           reboot_orphan(db, recovered)
         else
           case kill(db, recovered, "exited") do
@@ -542,14 +544,27 @@ defmodule Tightbeam.HarnessProcess do
   # LOCAL rows only: a remote row's boot identity belongs to the REMOTE
   # machine, and comparing it to ours would resolve a possibly-live process.
   # Remote reboot orphans keep the fence until someone reads the remote boot.
-  defp reboot_orphan?(%{ssh: nil, boot_identity: recorded} = row) when is_binary(recorded) do
+  defp reboot_orphan?(db, %{ssh: nil, boot_identity: recorded} = row) when is_binary(recorded) do
     case local_boot_identity(row) do
-      {:ok, current} -> recorded != current
-      {:error, _} -> false
+      {:ok, current} ->
+        recorded != current
+
+      # Unknown is not "same boot": the fence stays, and the event keeps the
+      # helper's actual answer next to whatever the kill attempt records.
+      {:error, reason} ->
+        :ok =
+          EventLog.lifecycle(
+            db,
+            "harness_boot_identity_unknown",
+            row.adapter_key,
+            inspect(%{launch_id: row.launch_id, reason: reason})
+          )
+
+        false
     end
   end
 
-  defp reboot_orphan?(_row), do: false
+  defp reboot_orphan?(_db, _row), do: false
 
   defp reboot_orphan(db, row) do
     :ok =
@@ -709,16 +724,7 @@ defmodule Tightbeam.HarnessProcess do
     end
   end
 
-  defp await_identity(row, :infinity) do
-    case read_identity(row, command_timeout_ms()) do
-      {:ok, _pid, _process_group_id, _boot_identity, _identity_token} = identity ->
-        identity
-
-      {:error, _reason} ->
-        Process.sleep(25)
-        await_identity(row, :infinity)
-    end
-  end
+  defp await_identity(row, :infinity), do: await_identity_forever(row, nil)
 
   defp await_identity(row, deadline) do
     remaining_ms = max(deadline - System.monotonic_time(:millisecond), 0)
@@ -734,6 +740,26 @@ defmodule Tightbeam.HarnessProcess do
         else
           {:error, reason}
         end
+    end
+  end
+
+  # The unbounded wait keeps retrying; each distinct refusal is logged once so a
+  # wait that never ends still names what it is waiting on.
+  defp await_identity_forever(row, last_reason) do
+    case read_identity(row, command_timeout_ms()) do
+      {:ok, _pid, _process_group_id, _boot_identity, _identity_token} = identity ->
+        identity
+
+      {:error, reason} ->
+        if reason != last_reason do
+          Logger.warning(
+            "harness identity not yet readable for launch #{row.launch_id}: " <>
+              ErrorDiagnostic.redact_text(inspect(reason))
+          )
+        end
+
+        Process.sleep(25)
+        await_identity_forever(row, reason)
     end
   end
 

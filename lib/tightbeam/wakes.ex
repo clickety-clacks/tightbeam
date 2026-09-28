@@ -1462,6 +1462,11 @@ defmodule Tightbeam.Wakes do
   def schedule_in_txn(%Txn{} = txn, input) do
     condition_kind = Map.get(input, :condition_kind)
 
+    input =
+      if is_binary(Map.get(input, :replacement_assignment_id)),
+        do: Map.put(input, :sender_scheduled, true),
+        else: input
+
     owner_user_id =
       Map.get(input, :owner_user_id) || authenticated_wake_owner_in_txn(txn, input.session_key)
 
@@ -1610,6 +1615,14 @@ defmodule Tightbeam.Wakes do
         encode_optional(wake.recognition_transition)
       ]
     )
+
+    if is_binary(Map.get(input, :replacement_assignment_id)) do
+      Tightbeam.QueuedMessageSuppression.record_replacement_request_in_txn(
+        txn,
+        wake.wake_id,
+        input.replacement_assignment_id
+      )
+    end
 
     if is_binary(condition_kind) do
       EventLog.lifecycle_in_txn(
@@ -1842,6 +1855,7 @@ defmodule Tightbeam.Wakes do
             due_at: now,
             creator_session_key: input.registrant_session_key,
             assignment_id: obligation.id,
+            replacement_assignment_id: input[:replacement_assignment_id],
             owner_user_id: obligation.owner_user_id,
             obligation_ref: obligation.id,
             wait_mode: "after-turn",
@@ -1896,6 +1910,7 @@ defmodule Tightbeam.Wakes do
           due_at: input.due_at,
           creator_session_key: input.registrant_session_key,
           assignment_id: obligation.id,
+          replacement_assignment_id: input[:replacement_assignment_id],
           owner_user_id: obligation.owner_user_id,
           obligation_ref: obligation.id,
           wait_mode: "dependency",
@@ -3125,6 +3140,12 @@ defmodule Tightbeam.Wakes do
       ]
     )
 
+    Tightbeam.QueuedMessageSuppression.copy_replacement_request_in_txn(
+      txn,
+      wake.wake_id,
+      retry_wake_id
+    )
+
     publish_change_in_txn(txn, "wake.scheduled", retry_wake_id)
   end
 
@@ -3382,6 +3403,12 @@ defmodule Tightbeam.Wakes do
       )
 
       if Txn.changes(txn) == 1 do
+        Tightbeam.QueuedMessageSuppression.copy_replacement_request_in_txn(
+          txn,
+          wake_id,
+          replacement_id
+        )
+
         case Txn.q(
                txn,
                """
@@ -6399,7 +6426,7 @@ defmodule Tightbeam.Wakes do
       txn,
       "wake_unresolved",
       wake.wake_id,
-      "firedBy=#{cause}#{matched} target=#{target} reason=unresolvable"
+      "firedBy=#{cause}#{matched} target=#{target} reason=delivery_skipped"
     )
   end
 

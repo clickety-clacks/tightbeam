@@ -7,6 +7,7 @@ defmodule Tightbeam.AdminProjectionTest do
     Credentials,
     DB,
     Devices,
+    ErrorDiagnostic,
     Harness,
     Identity,
     Org,
@@ -42,6 +43,120 @@ defmodule Tightbeam.AdminProjectionTest do
       %{base_dir: base_dir, db: db}
     else
       :ok
+    end
+  end
+
+  test "identity denial diagnostic upgrade preserves predecessor markers" do
+    {:ok, db} = DB.start_link(path: ":memory:", name: nil, guard_inputs: [])
+
+    try do
+      assert :ok = Schema.ensure_all(db)
+      assert :ok = AdminProjection.ensure_storage(db)
+
+      assert :ok =
+               DB.execute(
+                 db,
+                 "ALTER TABLE identity_publication_markers DROP COLUMN denialDiagnostic"
+               )
+
+      assert {:ok, _} =
+               DB.query(
+                 db,
+                 "UPDATE schema_stamp SET shape='artifact-origin-v1-019', stampedAt=1"
+               )
+
+      assert {:ok, :ok} =
+               DB.transaction(db, fn txn ->
+                 Tightbeam.DB.Txn.q(
+                   txn,
+                   """
+                   INSERT INTO identity_publication_markers
+                     (invocationId, expectedPriorLive, candidateRevision, treeFingerprint,
+                      principal, validationResult, cause, denialCode, denialMessage,
+                      denialExpected, denialActual, state, createdAt, updatedAt)
+                   VALUES (?1, ?2, ?3, ?4, ?5, 'accepted', NULL, NULL, NULL, NULL, NULL,
+                           'accepted', 1, 1)
+                   """,
+                   [
+                     "old-accepted",
+                     "prior-a",
+                     "candidate-a",
+                     String.duplicate("a", 64),
+                     "user:flynn"
+                   ]
+                 )
+
+                 Tightbeam.DB.Txn.q(
+                   txn,
+                   """
+                   INSERT INTO identity_publication_markers
+                     (invocationId, expectedPriorLive, candidateRevision, treeFingerprint,
+                      principal, validationResult, cause, denialCode, denialMessage,
+                      denialExpected, denialActual, state, createdAt, updatedAt)
+                   VALUES (?1, ?2, NULL, ?3, ?4, 'denied', ?5, ?6, ?7, NULL, NULL,
+                           'denied', 2, 2)
+                   """,
+                   [
+                     "old-denied",
+                     "prior-d",
+                     String.duplicate("d", 64),
+                     "user:flynn",
+                     "missing_fragment",
+                     "identity_include_invalid",
+                     "legacy denial message"
+                   ]
+                 )
+
+                 :ok
+               end)
+
+      assert :ok = Schema.ensure_all(db)
+
+      accepted = AdminProjection.identity_publication_marker(db, "old-accepted", "prior-a")
+      assert accepted.state == "accepted"
+      assert accepted.candidate_revision == "candidate-a"
+      assert accepted.denial_diagnostic == nil
+
+      denied = AdminProjection.identity_publication_marker(db, "old-denied", "prior-d")
+      assert denied.state == "denied"
+      assert denied.cause == "missing_fragment"
+      assert denied.denial_code == "identity_include_invalid"
+      assert denied.denial_message == "legacy denial message"
+      assert denied.denial_diagnostic == nil
+
+      diagnostic =
+        ErrorDiagnostic.new("denial",
+          details: %{
+            "path" => "includes/api_key=synthetic-db-secret.md",
+            "longValue" => String.duplicate("x", 9_000)
+          }
+        )
+
+      {:ok, stored} =
+        AdminProjection.deny_identity_validation(
+          db,
+          "new-denial",
+          "prior-new-denial",
+          String.duplicate("b", 64),
+          "user:flynn",
+          "missing_fragment",
+          %{
+            code: "identity_include_invalid",
+            message: "include validation failed",
+            diagnostic: diagnostic
+          }
+        )
+
+      assert stored.denial_diagnostic == diagnostic
+
+      assert %{
+               "path" => "includes/api_key=[REDACTED:secret_field]",
+               "longValue" => %{"$type" => "truncated_string", "bytes" => 9_000}
+             } = stored.denial_diagnostic["details"]
+
+      refute JSON.encode!(stored.denial_diagnostic) =~ "synthetic-db-secret"
+    after
+      if Process.alive?(db), do: GenServer.stop(db)
     end
   end
 

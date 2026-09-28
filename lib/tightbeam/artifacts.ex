@@ -24,7 +24,7 @@ defmodule Tightbeam.Artifacts do
   through `recorded_kinds/3`, which reads neither column.
   """
 
-  alias Tightbeam.{ArtifactContent, ArtifactOrigins, DB, TurnObservations}
+  alias Tightbeam.{ArtifactContent, ArtifactOrigins, DB, ErrorDiagnostic, TurnObservations}
   alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.Publisher
 
@@ -184,7 +184,7 @@ defmodule Tightbeam.Artifacts do
       when is_binary(session_key) and is_binary(work_item_id) ->
         artifact_id = "art_" <> (:crypto.strong_rand_bytes(4) |> Base.encode16(case: :lower))
         parent_session = parent_session(db, session_key)
-        {recorded_message_id, evidence} = turn_evidence(db, session_key)
+        {recorded_message_id, evidence, evidence_diagnostic} = turn_evidence(db, session_key)
         now = now()
         producer_id = call.params[:produced_by_assignment_id]
 
@@ -192,6 +192,7 @@ defmodule Tightbeam.Artifacts do
                db,
                fn txn ->
                  with :ok <- validate_session_active_in_txn(txn, session_key),
+                      :ok <- validate_work_item_in_txn(txn, work_item_id),
                       :ok <- validate_producer_in_txn(txn, producer_id, session_key, work_item_id) do
                    {origin_host, origin_workspace} =
                      ArtifactOrigins.registration_context(txn, call)
@@ -263,8 +264,16 @@ defmodule Tightbeam.Artifacts do
                  end
                end
              ) do
-          {:ok, result} -> result
-          {:error, error} -> raise error
+          # The row still lands on the weaker class; when that class came from
+          # an unreachable observation writer, the caller learns why.
+          {:ok, %{artifact_id: _} = artifact} ->
+            ErrorDiagnostic.put(artifact, evidence_diagnostic)
+
+          {:ok, result} ->
+            result
+
+          {:error, error} ->
+            raise error
         end
 
       {{:session, session_key}, session_key, _work_item_id} when is_binary(session_key) ->
@@ -282,6 +291,15 @@ defmodule Tightbeam.Artifacts do
 
       _ ->
         %{code: "session_not_active", message: "artifact-record requires an active session"}
+    end
+  end
+
+  # Checked in the recording transaction, so the refusal names the absent work item
+  # instead of leaking the insert's foreign-key failure.
+  defp validate_work_item_in_txn(txn, work_item_id) do
+    case Txn.q(txn, "SELECT 1 FROM work_items WHERE id=?1", [work_item_id]) do
+      [[1]] -> :ok
+      [] -> %{code: "unknown_work_item", message: "unknown work item: #{work_item_id}"}
     end
   end
 
@@ -662,7 +680,10 @@ defmodule Tightbeam.Artifacts do
       :ok ->
         archive_dir
 
-      {:error, _reason} ->
+      # A failed rename (typically :exdev across filesystems) is the expected
+      # trigger for the copy. Its errno matters only if the copy also fails, and
+      # then the raise keeps both outcomes.
+      {:error, rename_reason} ->
         case File.cp_r(workspace_path, archive_dir) do
           {:ok, _paths} ->
             File.rm_rf!(workspace_path)
@@ -673,7 +694,7 @@ defmodule Tightbeam.Artifacts do
 
             raise File.CopyError,
               reason: reason,
-              action: "copy",
+              action: "copy after rename failed (#{:file.format_error(rename_reason)})",
               source: file,
               destination: archive_dir
         end
@@ -745,8 +766,14 @@ defmodule Tightbeam.Artifacts do
       {:ok, _stat} ->
         canonical_components!(candidate, rest, symlink_hops)
 
-      {:error, _reason} ->
+      {:error, :enoent} ->
         raise ArgumentError, "artifact origin is missing from its session workspace"
+
+      # A path that exists but cannot be examined is not "missing"; name the errno.
+      {:error, reason} ->
+        raise ArgumentError,
+              "artifact origin cannot be examined in its session workspace: " <>
+                "#{reason} (#{:file.format_error(reason)})"
     end
   end
 

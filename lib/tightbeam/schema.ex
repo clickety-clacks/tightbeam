@@ -324,6 +324,8 @@ defmodule Tightbeam.Schema do
   @terminal_credential_shape "terminal-credential-failure-v1-019"
   @agent_reparent_shape "delivery-owner-reparent-v1-019"
   @artifact_origin_shape "artifact-origin-v1-019"
+  @identity_publication_denial_diagnostic_previous_shape @artifact_origin_shape
+  @identity_publication_denial_diagnostic_shape "identity-publication-denial-diagnostic-v1-019"
   @cursor_provider_previous_shape @addressed_po_shape
   @liveness_progress_receipts_previous_shape "identity-universal-root-render-v1-019"
   @cannot_proceed_shape "cannot-proceed-v1-019"
@@ -1358,6 +1360,7 @@ defmodule Tightbeam.Schema do
   @doc false
   def guard_compatible_stamps do
     [
+      @identity_publication_denial_diagnostic_shape,
       @artifact_origin_shape,
       @agent_reparent_shape,
       @terminal_credential_shape,
@@ -1433,6 +1436,7 @@ defmodule Tightbeam.Schema do
             @settlement_shape,
             @terminal_credential_shape,
             @agent_reparent_shape,
+            @identity_publication_denial_diagnostic_shape,
             @artifact_origin_shape
           ]
         )
@@ -1495,6 +1499,7 @@ defmodule Tightbeam.Schema do
     :ok = upgrade_agent_reparent(db)
     :ok = upgrade_artifact_origins(db)
     :ok = Tightbeam.Ledger.ensure_schema(db)
+    :ok = upgrade_identity_publication_denial_diagnostic(db)
 
     case DB.finish_schema(db) do
       :ok -> :ok
@@ -1604,6 +1609,7 @@ defmodule Tightbeam.Schema do
            @settlement_shape,
            @terminal_credential_shape,
            @agent_reparent_shape,
+           @identity_publication_denial_diagnostic_shape,
            @artifact_origin_shape
          ],
          do: @cannot_proceed_liveness_objects,
@@ -1660,6 +1666,7 @@ defmodule Tightbeam.Schema do
            @settlement_shape,
            @terminal_credential_shape,
            @agent_reparent_shape,
+           @identity_publication_denial_diagnostic_shape,
            @artifact_origin_shape
          ],
          do: reparent_liveness_enforcement_objects(),
@@ -2183,6 +2190,7 @@ defmodule Tightbeam.Schema do
              @settlement_shape,
              @terminal_credential_shape,
              @agent_reparent_shape,
+             @identity_publication_denial_diagnostic_shape,
              @artifact_origin_shape
            ] ->
         :ok
@@ -2281,7 +2289,7 @@ defmodule Tightbeam.Schema do
         this Tightbeam database was written by a different build.
 
           stamped: #{found}
-          this build: #{@artifact_origin_shape}
+          this build: #{@identity_publication_denial_diagnostic_shape}
 
         This build can migrate #{@model_identity_shape} or #{@operator_decision_shape}
         to #{@terminal_decision_liveness_shape}, then #{@effort_request_exit_previous_shape}.
@@ -2293,8 +2301,9 @@ defmodule Tightbeam.Schema do
         #{@effort_request_exit_previous_shape} to #{@effort_request_exit_shape},
         then through the same row-driven chain to #{@cursor_provider_shape}.
         It then migrates to #{@cannot_proceed_shape}, followed atomically by
-        #{@settlement_shape}, #{@terminal_credential_shape}, and #{@agent_reparent_shape},
-        then #{@artifact_origin_shape}.
+        #{@settlement_shape}, #{@terminal_credential_shape}, #{@agent_reparent_shape},
+        then #{@artifact_origin_shape}, followed by
+        #{@identity_publication_denial_diagnostic_shape}.
 
         No migration is defined for the stamped shape above. Keep the database
         in place and run a Tightbeam build that recognizes that exact stamp.
@@ -2308,7 +2317,7 @@ defmodule Tightbeam.Schema do
         this Tightbeam database carries MORE THAN ONE shape stamp.
 
           stamped: #{rows |> List.flatten() |> Enum.join(", ")}
-          this build: #{@artifact_origin_shape}
+          this build: #{@identity_publication_denial_diagnostic_shape}
 
         Nothing in Tightbeam writes a second stamp, so this database was
         assembled by something else. Move it aside and let it be recreated.
@@ -2329,6 +2338,7 @@ defmodule Tightbeam.Schema do
                     @settlement_shape,
                     @terminal_credential_shape,
                     @agent_reparent_shape,
+                    @identity_publication_denial_diagnostic_shape,
                     @artifact_origin_shape
                   ] ->
                :ok
@@ -2403,6 +2413,7 @@ defmodule Tightbeam.Schema do
              @settlement_shape,
              @terminal_credential_shape,
              @agent_reparent_shape,
+             @identity_publication_denial_diagnostic_shape,
              @artifact_origin_shape
            ] ->
         Tightbeam.Assignments.ensure_schema(db)
@@ -2423,6 +2434,7 @@ defmodule Tightbeam.Schema do
              @settlement_shape,
              @terminal_credential_shape,
              @agent_reparent_shape,
+             @identity_publication_denial_diagnostic_shape,
              @artifact_origin_shape
            ] ->
         :ok
@@ -2518,6 +2530,7 @@ defmodule Tightbeam.Schema do
                     @settlement_shape,
                     @terminal_credential_shape,
                     @agent_reparent_shape,
+                    @identity_publication_denial_diagnostic_shape,
                     @artifact_origin_shape
                   ] ->
                :ok
@@ -2586,6 +2599,7 @@ defmodule Tightbeam.Schema do
                     @settlement_shape,
                     @terminal_credential_shape,
                     @agent_reparent_shape,
+                    @identity_publication_denial_diagnostic_shape,
                     @artifact_origin_shape
                   ] ->
                validate_artifact_content_schema!(txn)
@@ -2682,6 +2696,7 @@ defmodule Tightbeam.Schema do
              @settlement_shape,
              @terminal_credential_shape,
              @agent_reparent_shape,
+             @identity_publication_denial_diagnostic_shape,
              @artifact_origin_shape
            ] ->
         :ok
@@ -3722,6 +3737,7 @@ defmodule Tightbeam.Schema do
              @settlement_shape,
              @terminal_credential_shape,
              @agent_reparent_shape,
+             @identity_publication_denial_diagnostic_shape,
              @artifact_origin_shape
            ] ->
         :ok
@@ -3754,6 +3770,7 @@ defmodule Tightbeam.Schema do
              @settlement_shape,
              @terminal_credential_shape,
              @agent_reparent_shape,
+             @identity_publication_denial_diagnostic_shape,
              @artifact_origin_shape
            ] ->
         :ok
@@ -3858,6 +3875,7 @@ defmodule Tightbeam.Schema do
              @settlement_shape,
              @terminal_credential_shape,
              @agent_reparent_shape,
+             @identity_publication_denial_diagnostic_shape,
              @artifact_origin_shape
            ] ->
         :ok
@@ -4106,6 +4124,7 @@ defmodule Tightbeam.Schema do
              @settlement_shape,
              @terminal_credential_shape,
              @agent_reparent_shape,
+             @identity_publication_denial_diagnostic_shape,
              @artifact_origin_shape
            ] ->
         :ok
@@ -4126,6 +4145,7 @@ defmodule Tightbeam.Schema do
                     @settlement_shape,
                     @terminal_credential_shape,
                     @agent_reparent_shape,
+                    @identity_publication_denial_diagnostic_shape,
                     @artifact_origin_shape
                   ] ->
                :ok
@@ -4158,13 +4178,13 @@ defmodule Tightbeam.Schema do
   defp upgrade_terminal_credential_failure(db) do
     case DB.transaction(db, fn txn ->
            case Txn.q(txn, "SELECT shape FROM schema_stamp") do
-             [[@agent_reparent_shape]] ->
-               :ok
-
-             [[@artifact_origin_shape]] ->
-               :ok
-
-             [[@terminal_credential_shape]] ->
+             [[shape]]
+             when shape in [
+                    @terminal_credential_shape,
+                    @agent_reparent_shape,
+                    @artifact_origin_shape,
+                    @identity_publication_denial_diagnostic_shape
+                  ] ->
                :ok
 
              [[@settlement_shape]] ->
@@ -4204,7 +4224,11 @@ defmodule Tightbeam.Schema do
   defp upgrade_agent_reparent(db) do
     case DB.transaction(db, fn txn ->
            case Txn.q(txn, "SELECT shape FROM schema_stamp") do
-             [[@agent_reparent_shape]] ->
+             [[shape]]
+             when shape in [
+                    @agent_reparent_shape,
+                    @identity_publication_denial_diagnostic_shape
+                  ] ->
                :ok
 
              [[@artifact_origin_shape]] ->
@@ -4248,7 +4272,8 @@ defmodule Tightbeam.Schema do
   defp upgrade_artifact_origins(db) do
     case DB.transaction(db, fn txn ->
            case Txn.q(txn, "SELECT shape FROM schema_stamp") do
-             [[@artifact_origin_shape]] ->
+             [[shape]]
+             when shape in [@artifact_origin_shape, @identity_publication_denial_diagnostic_shape] ->
                validate_artifact_origins!(txn)
 
              [[@agent_reparent_shape]] ->
@@ -4295,6 +4320,45 @@ defmodule Tightbeam.Schema do
     case Txn.q(txn, "SELECT sql FROM sqlite_master WHERE name='artifacts_origin_immutable'") do
       [[^expected]] -> :ok
       _ -> raise ShapeError, message: "incompatible artifact origin immutability trigger"
+    end
+  end
+
+  defp upgrade_identity_publication_denial_diagnostic(db) do
+    case DB.transaction(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@identity_publication_denial_diagnostic_shape]] ->
+               :ok
+
+             [[@identity_publication_denial_diagnostic_previous_shape]] ->
+               :ok = Tightbeam.AdminProjection.add_identity_denial_diagnostic_column_in_txn(txn)
+
+               Txn.q(txn, "UPDATE schema_stamp SET shape=?1, stampedAt=?2 WHERE shape=?3", [
+                 @identity_publication_denial_diagnostic_shape,
+                 System.system_time(:millisecond),
+                 @identity_publication_denial_diagnostic_previous_shape
+               ])
+
+               if Txn.changes(txn) != 1 do
+                 raise ShapeError,
+                   message:
+                     "identity publication denial diagnostic migration lost its exact stamp transition"
+               end
+
+               :ok
+
+             other ->
+               raise ShapeError,
+                 message:
+                   "incompatible identity publication denial diagnostic predecessor: #{inspect(other)}"
+           end
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "identity publication denial diagnostic migration failed and was rolled back: #{Exception.message(error)}"
     end
   end
 
@@ -4407,8 +4471,7 @@ defmodule Tightbeam.Schema do
         """
       )
 
-    [[rebuilt_marker_sequence]] =
-      Txn.q(txn, "SELECT COALESCE(MAX(id), 0) FROM subagent_markers")
+    [[rebuilt_marker_sequence]] = Txn.q(txn, "SELECT COALESCE(MAX(id), 0) FROM subagent_markers")
 
     marker_sequence = max(marker_sequence, rebuilt_marker_sequence)
 

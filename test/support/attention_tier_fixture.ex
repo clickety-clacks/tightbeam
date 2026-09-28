@@ -94,6 +94,10 @@ defmodule Tightbeam.AttentionTierFixture do
         do: handle_call({:new_session, model, cwd, mcp, guidance}, from, state)
 
     def handle_call(:conn, _from, state), do: {:reply, self(), state}
+
+    def handle_call({:close_session, sid, _opts}, from, state),
+      do: handle_call({:close_session, sid}, from, state)
+
     def handle_call({:close_session, _sid}, _from, state), do: {:reply, :ok, state}
 
     def handle_call({:prompt, _sid, prompt, _opts}, _from, state) do

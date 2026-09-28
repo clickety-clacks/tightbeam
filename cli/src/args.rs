@@ -69,6 +69,7 @@ pub enum Command {
         predicate: Option<serde_json::Value>,
         assignment_id: Option<String>,
         after_turn: bool,
+        replace_queued: bool,
         idempotency_key: Option<String>,
         /// Sender-elected delivery class. The vocabulary is extensible, so the
         /// CLI validates only that a supplied name is non-empty.
@@ -667,7 +668,7 @@ TARGET (for commands that take one — pass exactly one):
 
 COMMANDS:
   wake (--session <key> | --role <name> | --user <id>) --prompt "<text>"
-       [--after 30s|5m|2h] [--at <epochMs>]
+       [--after 30s|5m|2h] [--at <epochMs>] [--assignment <id> --replace-queued]
        [--class fyi|status-query|input-needed|blocker|algedonic]
       Condition wake:
         tightbeam wake (--session <key> | --role <name> | --user <id>)
@@ -687,6 +688,8 @@ COMMANDS:
       session (or yourself).
       A matching fact or fallback delivers a new notification turn.
       It never resumes or replays prior work. The fact stamp reports why the prompt arrived.
+      --replace-queued requires --assignment and asks delivery to cancel only your own
+      eligible queued messages to that assignment's holder.
       The accountable agent re-reads durable state and decides the next action.
       The fallback timer detects silence only; it does not select an action.
       A dependency predicate names conditions, bindings, resolverRef, necessity,
@@ -1129,6 +1132,7 @@ const BOOLEAN_FLAGS: &[&str] = &[
     "admin",
     "all",
     "after-turn",
+    "replace-queued",
     "api-key",
     "clear-spec-ref",
     "daemon-credential",
@@ -1786,7 +1790,7 @@ fn parse_with_optional_catalog(
             let predicate = nonempty(flags, "predicate")
                 .map(|encoded| {
                     let value = serde_json::from_str::<serde_json::Value>(&encoded)
-                        .map_err(|_| "--predicate must be a JSON object".to_owned())?;
+                        .map_err(|error| format!("--predicate must be a JSON object: {error}"))?;
                     if value.is_object() {
                         Ok(value)
                     } else {
@@ -1796,6 +1800,7 @@ fn parse_with_optional_catalog(
                 .transpose()?;
             let assignment_id = nonempty(flags, "assignment");
             let after_turn = flags.contains_key("after-turn");
+            let replace_queued = flags.contains_key("replace-queued");
             let wait = predicate.is_some() || after_turn;
 
             if condition_scope.is_some() && condition_kind.is_none() {
@@ -1824,7 +1829,16 @@ fn parse_with_optional_catalog(
             if wait && assignment_id.is_none() {
                 return Err("--predicate and --after-turn require --assignment".to_owned());
             }
-            if !wait && assignment_id.is_some() {
+            if replace_queued && assignment_id.is_none() {
+                return Err("--replace-queued requires --assignment".to_owned());
+            }
+            if replace_queued && wait {
+                return Err(
+                    "--replace-queued cannot be combined with --predicate or --after-turn"
+                        .to_owned(),
+                );
+            }
+            if !wait && assignment_id.is_some() && !replace_queued {
                 return Err("--assignment requires --predicate or --after-turn".to_owned());
             }
             if predicate.is_some() && fallback_after_ms.is_none() && at.is_none() {
@@ -1859,6 +1873,7 @@ fn parse_with_optional_catalog(
                 predicate,
                 assignment_id,
                 after_turn,
+                replace_queued,
                 idempotency_key,
                 class: nonempty(flags, "class"),
             })
@@ -2171,7 +2186,9 @@ fn parse_with_optional_catalog(
             if let Some(name) = harness.as_deref() {
                 let catalog = match supplied_catalog {
                     Some(catalog) => catalog.clone(),
-                    None => crate::harnesses::catalog()?,
+                    None => crate::harnesses::catalog_for(Some(
+                        crate::attempt_diagnostic::command_context::CommandContext::spawn_catalog(),
+                    ))?,
                 };
                 if !catalog.contains(name) {
                     return Err(format!("unsupported harness: {name}"));
@@ -2272,8 +2289,9 @@ fn parse_with_optional_catalog(
                 nonempty(flags, "subject").ok_or_else(|| "--subject is required".to_owned())?;
             let files = nonempty(flags, "files")
                 .map(|encoded| {
-                    serde_json::from_str::<Vec<String>>(&encoded)
-                        .map_err(|_| "--files must be a JSON array of strings".to_owned())
+                    serde_json::from_str::<Vec<String>>(&encoded).map_err(|error| {
+                        format!("--files must be a JSON array of strings: {error}")
+                    })
                 })
                 .transpose()?;
             Ok(Command::Assign {
@@ -2538,7 +2556,7 @@ fn parse_with_optional_catalog(
                 .ok_or_else(|| "--commit-refs is required".to_owned())
                 .and_then(|encoded| {
                     serde_json::from_str::<Vec<serde_json::Value>>(&encoded)
-                        .map_err(|_| "--commit-refs must be a JSON array".to_owned())
+                        .map_err(|error| format!("--commit-refs must be a JSON array: {error}"))
                 })?;
             Ok(Command::AssignmentCommitRefCorrect {
                 identity: identity(flags)?,
@@ -2952,7 +2970,7 @@ fn parse_with_optional_catalog(
             let commit_refs = nonempty(flags, "commit-refs")
                 .map(|encoded| {
                     serde_json::from_str::<Vec<serde_json::Value>>(&encoded)
-                        .map_err(|_| "--commit-refs must be a JSON array".to_owned())
+                        .map_err(|error| format!("--commit-refs must be a JSON array: {error}"))
                 })
                 .transpose()?;
             let release_fact_kind = nonempty(flags, "release-fact-kind");
@@ -3150,7 +3168,10 @@ fn parse_with_optional_catalog(
             debug_assert_eq!(selected_identity, Identity::User(as_user.clone()));
             let catalog = match supplied_catalog {
                 Some(catalog) => catalog.clone(),
-                None => crate::harnesses::catalog()?,
+                None => crate::harnesses::catalog_for(Some(
+                    crate::attempt_diagnostic::command_context::CommandContext::assimilate_catalog(
+                    ),
+                ))?,
             };
             let harnesses = match nonempty(flags, "harness") {
                 Some(value) => value.split(',').map(str::to_owned).collect::<Vec<_>>(),
@@ -3302,7 +3323,7 @@ fn parse_host_toolchain_set(
 
     let encoded = nonempty(flags, "dirs").ok_or_else(|| usage.to_owned())?;
     let dirs = serde_json::from_str::<Vec<String>>(&encoded)
-        .map_err(|_| "--dirs must be a JSON array of strings".to_owned())?;
+        .map_err(|error| format!("--dirs must be a JSON array of strings: {error}"))?;
 
     Ok(Command::HostToolchainSet {
         identity: identity(flags)?,
@@ -4172,7 +4193,9 @@ mod tests {
                 "--dirs",
                 r#"[1]"#,
             ])),
-            Err("--dirs must be a JSON array of strings".to_owned())
+            Err("--dirs must be a JSON array of strings: \
+                 invalid type: integer `1`, expected a string at line 1 column 2"
+                .to_owned())
         );
     }
 
@@ -5108,6 +5131,7 @@ mod tests {
                 predicate: None,
                 assignment_id: None,
                 after_turn: false,
+                replace_queued: false,
                 idempotency_key: Some("wake-1".to_owned()),
                 class: None,
             })
@@ -5137,6 +5161,7 @@ mod tests {
                 predicate: None,
                 assignment_id: None,
                 after_turn: false,
+                replace_queued: false,
                 idempotency_key: None,
                 class: None,
             })
@@ -5156,6 +5181,54 @@ mod tests {
                 idempotency_key: None,
                 payload: None,
             })
+        );
+    }
+
+    #[test]
+    fn replacement_wakes_require_an_assignment_and_cannot_replace_continuations() {
+        assert!(matches!(
+            parse(strings(&[
+                "wake",
+                "--session",
+                "agent:holder",
+                "--assignment",
+                "asg_a",
+                "--replace-queued",
+                "--prompt",
+                "new instruction",
+            ])),
+            Ok(Command::Wake {
+                assignment_id: Some(id),
+                replace_queued: true,
+                ..
+            }) if id == "asg_a"
+        ));
+
+        assert_eq!(
+            parse(strings(&[
+                "wake",
+                "--session",
+                "agent:holder",
+                "--replace-queued",
+                "--prompt",
+                "new instruction",
+            ])),
+            Err("--replace-queued requires --assignment".to_owned())
+        );
+
+        assert_eq!(
+            parse(strings(&[
+                "wake",
+                "--session",
+                "agent:holder",
+                "--assignment",
+                "asg_a",
+                "--replace-queued",
+                "--after-turn",
+                "--prompt",
+                "continue",
+            ])),
+            Err("--replace-queued cannot be combined with --predicate or --after-turn".to_owned())
         );
     }
 
@@ -5190,6 +5263,7 @@ mod tests {
                 predicate: Some(serde_json::from_str(predicate).unwrap()),
                 assignment_id: Some("asg_a".to_owned()),
                 after_turn: false,
+                replace_queued: false,
                 idempotency_key: None,
                 class: None,
             })
@@ -5219,6 +5293,7 @@ mod tests {
                 predicate: None,
                 assignment_id: Some("asg_a".to_owned()),
                 after_turn: true,
+                replace_queued: false,
                 idempotency_key: None,
                 class: None,
             })
@@ -5239,6 +5314,27 @@ mod tests {
                 "continue",
             ])),
             Err("--predicate must be a JSON object".to_owned())
+        );
+
+        // Malformed JSON keeps the parser's location for the person who typed it.
+        assert_eq!(
+            parse(strings(&[
+                "wake",
+                "--session",
+                "agent:holder",
+                "--assignment",
+                "asg_a",
+                "--predicate",
+                r#"{"state":"#,
+                "--fallback-after",
+                "2h",
+                "--prompt",
+                "continue",
+            ])),
+            Err(
+                "--predicate must be a JSON object: EOF while parsing a value at line 1 column 9"
+                    .to_owned()
+            )
         );
     }
 
@@ -5994,6 +6090,7 @@ mod tests {
                     predicate: None,
                     assignment_id: None,
                     after_turn: false,
+                    replace_queued: false,
                     idempotency_key: None,
                     class: None,
                 },

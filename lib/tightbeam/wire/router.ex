@@ -56,6 +56,7 @@ defmodule Tightbeam.Wire.Router do
     D1Read,
     Devices,
     Dispatch,
+    ErrorDiagnostic,
     Org,
     Roles,
     WorkState
@@ -182,7 +183,11 @@ defmodule Tightbeam.Wire.Router do
       |> Plug.Conn.put_resp_content_type("application/json")
       |> Plug.Conn.send_resp(200, bytes)
     else
-      {:error, status, code, message} -> error(conn, status, code, message)
+      {:error, status, code, message} ->
+        error(conn, status, code, message)
+
+      {:error, status, code, message, diagnostic} ->
+        error(conn, status, code, message, diagnostic)
     end
   end
 
@@ -224,7 +229,11 @@ defmodule Tightbeam.Wire.Router do
 
       dispatch_response(conn, call, 200, &%{"result" => &1})
     else
-      {:error, status, code, message} -> error(conn, status, code, message)
+      {:error, status, code, message} ->
+        error(conn, status, code, message)
+
+      {:error, status, code, message, diagnostic} ->
+        error(conn, status, code, message, diagnostic)
     end
   end
 
@@ -238,7 +247,11 @@ defmodule Tightbeam.Wire.Router do
         "terminal surrender was removed; file a typed cannot-proceed attest through /agent"
       )
     else
-      {:error, status, code, message} -> error(conn, status, code, message)
+      {:error, status, code, message} ->
+        error(conn, status, code, message)
+
+      {:error, status, code, message, diagnostic} ->
+        error(conn, status, code, message, diagnostic)
     end
   end
 
@@ -251,10 +264,21 @@ defmodule Tightbeam.Wire.Router do
   # no window to open for it. The org's own principal never runs inside a turn.
   post "/agent/tool-call-observed" do
     with {:ok, {:session, session}} <- session_cli_auth(conn) do
-      :ok = Tightbeam.TurnObservations.observe(db(conn), session.session_key)
-      json(conn, 200, %{"observed" => true})
+      # Still 200: observation fails open (the hook must never block its tool
+      # call), but an unreachable writer is not reported as an observation.
+      case Tightbeam.TurnObservations.observe(db(conn), session.session_key) do
+        :ok ->
+          json(conn, 200, %{"observed" => true})
+
+        {:unavailable, diagnostic} ->
+          json(conn, 200, %{"observed" => false, "diagnostic" => diagnostic})
+      end
     else
-      {:error, status, code, message} -> error(conn, status, code, message)
+      {:error, status, code, message} ->
+        error(conn, status, code, message)
+
+      {:error, status, code, message, diagnostic} ->
+        error(conn, status, code, message, diagnostic)
     end
   end
 
@@ -412,7 +436,11 @@ defmodule Tightbeam.Wire.Router do
 
       dispatch_response(conn, call, 201, & &1)
     else
-      {:error, status, code, message} -> error(conn, status, code, message)
+      {:error, status, code, message} ->
+        error(conn, status, code, message)
+
+      {:error, status, code, message, diagnostic} ->
+        error(conn, status, code, message, diagnostic)
     end
   end
 
@@ -431,7 +459,11 @@ defmodule Tightbeam.Wire.Router do
 
       dispatch_response(conn, call, 200, & &1)
     else
-      {:error, status, code, message} -> error(conn, status, code, message)
+      {:error, status, code, message} ->
+        error(conn, status, code, message)
+
+      {:error, status, code, message, diagnostic} ->
+        error(conn, status, code, message, diagnostic)
     end
   end
 
@@ -454,7 +486,11 @@ defmodule Tightbeam.Wire.Router do
 
       dispatch_response(conn, call, 200, & &1)
     else
-      {:error, status, code, message} -> error(conn, status, code, message)
+      {:error, status, code, message} ->
+        error(conn, status, code, message)
+
+      {:error, status, code, message, diagnostic} ->
+        error(conn, status, code, message, diagnostic)
     end
   end
 
@@ -529,7 +565,11 @@ defmodule Tightbeam.Wire.Router do
 
       control_response(conn, call, key, action)
     else
-      {:error, status, code, message} -> error(conn, status, code, message)
+      {:error, status, code, message} ->
+        error(conn, status, code, message)
+
+      {:error, status, code, message, diagnostic} ->
+        error(conn, status, code, message, diagnostic)
     end
   end
 
@@ -1467,8 +1507,13 @@ defmodule Tightbeam.Wire.Router do
            required,
            conn.request_path
          ) do
-      {:error, _reason} ->
-        {:error, 503, "mismatch_state_unavailable", "CLI mismatch state could not be recorded"}
+      {:error, reason} ->
+        {:error, 503, "mismatch_state_unavailable", "CLI mismatch state could not be recorded",
+         ErrorDiagnostic.from_reason(reason,
+           operation: "observe_cli_compatibility",
+           origin: "gateway",
+           cli_state: state
+         )}
 
       _ ->
         :ok
@@ -2003,14 +2048,18 @@ defmodule Tightbeam.Wire.Router do
       {:ok, result} ->
         control_json(conn, result, session_key, action)
 
-      {:error, %{code: "server_error", message: message}} ->
-        json(conn, 200, %{
+      # A crashed control handler is a server failure, not a refusal: the status
+      # says so (500) while the body keeps the control shape clients already read.
+      {:error, %{code: "server_error", message: message} = error} ->
+        %{
           "ok" => false,
           "sessionKey" => session_key,
           "action" => action,
           "code" => "control_failed",
           "message" => message
-        })
+        }
+        |> put_optional("diagnostic", ErrorDiagnostic.for_error(error))
+        |> then(&json(conn, 500, &1))
 
       {:error, result} ->
         control_json(conn, result, session_key, action)
@@ -2044,6 +2093,9 @@ defmodule Tightbeam.Wire.Router do
         }
         |> put_optional("code", code)
         |> put_optional("message", result[:message])
+        # A failed control's evidence, or a succeeded one's unconfirmed side leg
+        # (cancel's harness notification). A successful tune carries none.
+        |> put_optional("diagnostic", result[:diagnostic])
         |> put_optional("turnSeq", result[:turn_seq])
         |> put_optional("replayed", result[:replayed])
         |> then(&json(conn, 200, &1))
@@ -2071,6 +2123,9 @@ defmodule Tightbeam.Wire.Router do
 
   defp error_status(_), do: 400
 
+  # A body that could not be read and a body that is not a JSON object are
+  # different failures: the first names the read (too large, timed out, closed),
+  # the second where the parser stopped. Both keep the invalid_message code.
   defp read_json(conn) do
     case Plug.Conn.read_body(conn) do
       {:ok, "", conn} ->
@@ -2078,12 +2133,25 @@ defmodule Tightbeam.Wire.Router do
 
       {:ok, body, conn} ->
         case JSON.decode(body) do
-          {:ok, decoded} when is_map(decoded) -> {:ok, decoded, conn}
-          _ -> {:error, 400, "invalid_message", nil}
+          {:ok, decoded} when is_map(decoded) ->
+            {:ok, decoded, conn}
+
+          {:ok, other} ->
+            {:error, 400, "invalid_message", nil,
+             ErrorDiagnostic.json_decode({:not_object, other}, origin: "http", phase: "decode")}
+
+          {:error, reason} ->
+            {:error, 400, "invalid_message", nil,
+             ErrorDiagnostic.json_decode(reason, origin: "http", phase: "decode")}
         end
 
-      _ ->
-        {:error, 400, "invalid_message", nil}
+      {:more, _partial, _conn} ->
+        {:error, 413, "invalid_message", "request body too large",
+         ErrorDiagnostic.new("decode", origin: "http", phase: "read", error: "body_too_large")}
+
+      {:error, reason} ->
+        {:error, 400, "invalid_message", "request body could not be read",
+         ErrorDiagnostic.from_reason(reason, origin: "http", phase: "read")}
     end
   end
 
@@ -2115,7 +2183,7 @@ defmodule Tightbeam.Wire.Router do
   # spec's "stripped from any agent/dispatch param map" is read as scoped to the
   # carrier it is written about, not to the parameter name everywhere.
   @substrate_only_params %{
-    "wake" => ~w(request_ref)a,
+    "wake" => ~w(request_ref replacement_assignment_id)a,
     "operator-rule" => ~w(ruled_via_session_key)a,
     "work-item-create" => ~w(created_in_turn_seq created_context_known)a,
     # The artifact's turn edge and the class of evidence behind it are the
@@ -2165,9 +2233,18 @@ defmodule Tightbeam.Wire.Router do
   end
 
   defp strip_notification_assignment(params, "wake") do
-    if params[:after_turn] == true or is_map(params[:predicate]),
-      do: params,
-      else: Map.delete(params, :assignment_id)
+    cond do
+      params[:after_turn] == true or is_map(params[:predicate]) ->
+        params
+
+      params[:replace_queued] == true and is_binary(params[:assignment_id]) ->
+        params
+        |> Map.put(:replacement_assignment_id, params.assignment_id)
+        |> Map.delete(:assignment_id)
+
+      true ->
+        Map.delete(params, :assignment_id)
+    end
   end
 
   defp strip_notification_assignment(params, _verb), do: params
@@ -2180,8 +2257,12 @@ defmodule Tightbeam.Wire.Router do
     |> Plug.Conn.send_resp(status, data)
   end
 
-  defp error(conn, status, code, message \\ nil) do
-    detail = %{"code" => code} |> put_optional("message", message)
+  defp error(conn, status, code, message \\ nil, diagnostic \\ nil) do
+    detail =
+      %{"code" => code}
+      |> put_optional("message", message)
+      |> put_optional("diagnostic", diagnostic)
+
     json(conn, status, %{"error" => detail})
   end
 
@@ -2199,7 +2280,7 @@ defmodule Tightbeam.Wire.Router do
   end
 
   defp dispatch_error(conn, _call, status, result) do
-    error(conn, status, result[:code], result[:message])
+    error(conn, status, result[:code], result[:message], ErrorDiagnostic.for_error(result))
   end
 
   defp put_optional(map, _key, nil), do: map

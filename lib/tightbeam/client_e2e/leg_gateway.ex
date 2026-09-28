@@ -205,7 +205,7 @@ defmodule Tightbeam.ClientE2E.LegGateway do
   end
 
   defp poll_verdict(gateway, leg_name, deadline, poll_ms, progress, last_progress_at) do
-    lines = log_lines(gateway.log_path)
+    {lines, read_error} = log_lines(gateway.log_path)
 
     case verdict(lines, leg_name) do
       :runnable ->
@@ -218,10 +218,7 @@ defmodule Tightbeam.ClientE2E.LegGateway do
         now = System.monotonic_time(:millisecond)
 
         if now >= deadline do
-          {:error,
-           {:no_verdict,
-            "the gateway never published its boot readiness verdict (READY/NOT READY) " <>
-              "in #{gateway.log_path}" <> waiting_hint(lines)}}
+          {:error, {:no_verdict, no_verdict_text(gateway.log_path, read_error, lines)}}
         else
           last_progress_at =
             if is_nil(last_progress_at) or now - last_progress_at >= 5_000 do
@@ -251,16 +248,36 @@ defmodule Tightbeam.ClientE2E.LegGateway do
   # Strip the Logger console prefix ("12:34:56.789 [info] ") so the summary
   # lines compare against what Tightbeam.Readiness.render/2 actually produced,
   # indentation intact.
+  # A read failure is kept beside the (empty) lines: a log that could not be
+  # read must not be reported as a gateway that never published its verdict.
   defp log_lines(path) do
     case File.read(path) do
       {:ok, content} ->
-        content
-        |> String.split("\n")
-        |> Enum.map(&String.replace(&1, ~r/^\d{2}:\d{2}:\d{2}\.\d+ (?:[^\[]*)?\[[a-z]+\] /, ""))
+        lines =
+          content
+          |> String.split("\n")
+          |> Enum.map(&String.replace(&1, ~r/^\d{2}:\d{2}:\d{2}\.\d+ (?:[^\[]*)?\[[a-z]+\] /, ""))
 
-      {:error, _} ->
-        []
+        {lines, nil}
+
+      {:error, reason} ->
+        {[], reason}
     end
+  end
+
+  defp no_verdict_text(path, nil, lines) do
+    "the gateway never published its boot readiness verdict (READY/NOT READY) " <>
+      "in #{path}" <> waiting_hint(lines)
+  end
+
+  defp no_verdict_text(path, :enoent, _lines) do
+    "the gateway never published its boot readiness verdict (READY/NOT READY): " <>
+      "its log #{path} was never created"
+  end
+
+  defp no_verdict_text(path, reason, _lines) do
+    "the gateway's boot readiness verdict could not be read: " <>
+      "#{path}: #{:file.format_error(reason)}"
   end
 
   defp verdict(lines, leg_name) do

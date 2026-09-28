@@ -26,7 +26,7 @@ defmodule Tightbeam.Credentials do
 
   use GenServer
 
-  alias Tightbeam.{CommandEdge, Harness, Homes, LocalOpenAi.Providers, Rails}
+  alias Tightbeam.{CommandEdge, ErrorDiagnostic, Harness, Homes, LocalOpenAi.Providers, Rails}
   alias Tightbeam.CommandEdge.CredentialPark
 
   @ssh_opts ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
@@ -107,8 +107,13 @@ defmodule Tightbeam.Credentials do
   end
 
   @spec kind_at(String.t(), String.t(), provider()) :: kind() | :none
+  # The fallbacks below are existing policy and stay. Absent metadata is a legacy
+  # home and needs no note; metadata that exists but cannot be used is logged with
+  # its cause, so the fallback is not mistaken for what the file said.
   def kind_at(base_dir, machine, provider) do
-    case File.read(metadata_path(base_dir, machine, provider)) do
+    path = metadata_path(base_dir, machine, provider)
+
+    case File.read(path) do
       {:ok, bytes} ->
         case JSON.decode(bytes) do
           {:ok, metadata} when is_map(metadata) ->
@@ -116,14 +121,39 @@ defmodule Tightbeam.Credentials do
               do: decode_kind(metadata["kind"]),
               else: :none
 
-          _ ->
-            :none
+          {:ok, _other} ->
+            kind_fallback(provider, path, :none, "is not a JSON object")
+
+          {:error, error} ->
+            kind_fallback(provider, path, :none, "is not valid JSON: #{json_error_text(error)}")
         end
 
-      {:error, _reason} ->
+      {:error, :enoent} ->
         if credential_present_at?(base_dir, machine, provider), do: :subscription, else: :none
+
+      {:error, reason} ->
+        fallback =
+          if credential_present_at?(base_dir, machine, provider), do: :subscription, else: :none
+
+        kind_fallback(
+          provider,
+          path,
+          fallback,
+          "could not be read: #{:file.format_error(reason)}"
+        )
     end
   end
+
+  defp kind_fallback(provider, path, fallback, cause) do
+    Logger.warning("credential kind for #{provider} fell back to #{fallback}: #{path} #{cause}")
+    fallback
+  end
+
+  defp json_error_text({:invalid_byte, offset, _byte}), do: "invalid byte at offset #{offset}"
+  defp json_error_text({:unexpected_end, offset}), do: "unexpected end at offset #{offset}"
+
+  defp json_error_text({:unexpected_sequence, offset, _bytes}),
+    do: "unexpected sequence at offset #{offset}"
 
   @doc "Run the provider flow through the serialized gate/stop/write/start/resume lifecycle."
   @spec onboard(provider(), GenServer.server()) :: :ok | {:error, term()}
@@ -301,8 +331,8 @@ defmodule Tightbeam.Credentials do
       {:ok, _other} ->
         "the Pi auth.json has no opencode-go API-key record"
 
-      {:error, _reason} ->
-        "the Pi auth.json is not valid JSON"
+      {:error, error} ->
+        "the Pi auth.json is not valid JSON: #{json_error_text(error)}"
     end
   end
 
@@ -1519,9 +1549,49 @@ defmodule Tightbeam.Credentials do
   defp start_for_finish(state, provider, kind) do
     state.start.(provider, kind)
   rescue
-    error -> {:error, {:credential_start_failed, {:exception, Exception.message(error)}}}
+    # The refusal is persisted and returned, so it keeps the exception type and
+    # a redacted message; the stack goes only to the log.
+    error ->
+      diagnostic =
+        ErrorDiagnostic.exception(error, __STACKTRACE__,
+          operation: "credential_start",
+          provider: Atom.to_string(provider)
+        )
+
+      Logger.warning("credential start raised: #{JSON.encode!(diagnostic)}")
+
+      {:error,
+       ErrorDiagnostic.diagnosed(
+         {:credential_start_failed,
+          {:exception, error.__struct__, ErrorDiagnostic.redact_text(Exception.message(error))}},
+         diagnostic
+       )}
   catch
-    caught_kind, reason -> {:error, {:credential_start_failed, {caught_kind, reason}}}
+    caught_kind, reason ->
+      diagnostic =
+        ErrorDiagnostic.caught(caught_kind, reason, __STACKTRACE__,
+          operation: "credential_start",
+          provider: Atom.to_string(provider)
+        )
+
+      Logger.warning("credential start caught: #{JSON.encode!(diagnostic)}")
+
+      safe_reason = redact_caught_reason(reason)
+
+      {:error,
+       ErrorDiagnostic.diagnosed(
+         {:credential_start_failed, {caught_kind, safe_reason}},
+         diagnostic
+       )}
+  end
+
+  defp redact_caught_reason(reason) when is_binary(reason),
+    do: ErrorDiagnostic.redact_text(reason)
+
+  defp redact_caught_reason(reason) do
+    rendered = inspect(reason)
+    redacted = ErrorDiagnostic.redact_text(rendered)
+    if redacted == rendered, do: reason, else: redacted
   end
 
   defp mark_onboarded_for_finish(state, provider, kind, credential) do
@@ -1529,8 +1599,9 @@ defmodule Tightbeam.Credentials do
   end
 
   # Fail CLOSED and VISIBLE: the installed credential stays present, the org
-  # reads as not-onboarded, and the cause carries the failure verbatim so a
-  # reader learns what the vendor or the runtime actually said. `status/1`
+  # reads as not-onboarded, and the durable cause keeps a redacted rendering of
+  # the failure. The returned term retains its native classification and any
+  # typed diagnostic. `status/1`
   # serves `present_but_unverified` from both the in-memory map and the durable
   # marker, so the refusal survives a gateway restart — a failed login must not
   # look healthy again just because the process bounced.
@@ -1540,10 +1611,9 @@ defmodule Tightbeam.Credentials do
   # `finish_staged_onboard/4` committed before anything was installed. That is
   # less specific than the vendor's own words — a known, accepted degradation
   # (Sol xhigh review, important 1) — but it still fails closed, which is the
-  # property that matters. The verbatim reason reaches the caller in the
-  # returned compound error either way.
+  # property that matters. The failure term reaches the caller either way.
   defp failed_finish(state, provider, kind, failure) do
-    cause = %{"finish" => inspect(failure)}
+    cause = %{"finish" => ErrorDiagnostic.redact_text(inspect(failure))}
 
     marker_result =
       write_metadata_result(state, provider, %{

@@ -6,6 +6,7 @@ defmodule Tightbeam.CredentialsTest do
   use Tightbeam.TestCase, async: false
 
   alias Tightbeam.Credentials
+  alias Tightbeam.ErrorDiagnostic
 
   defp start_credentials(opts) do
     Credentials.start_link(Keyword.put(opts, :sh, credential_runner(opts)))
@@ -256,6 +257,36 @@ defmodule Tightbeam.CredentialsTest do
     File.mkdir_p!(Path.dirname(metadata))
     File.write!(metadata, JSON.encode!(%{"onboarded" => true, "kind" => "api_key"}))
     assert Credentials.kind_at(ctx.base, "eezo", :openai) == :none
+  end
+
+  test "kind metadata that exists but cannot be used logs why the fallback was taken", ctx do
+    credential = Credentials.credential_path(ctx.base, "eezo", :openai)
+    metadata = Path.join([Path.dirname(credential), ".tightbeam", "credential.json"])
+
+    assert ExUnit.CaptureLog.capture_log(fn ->
+             assert Credentials.kind_at(ctx.base, "eezo", :openai) == :none
+           end) == ""
+
+    File.mkdir_p!(Path.dirname(metadata))
+    File.write!(metadata, ~s({"kind": x}))
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert Credentials.kind_at(ctx.base, "eezo", :openai) == :none
+      end)
+
+    assert log =~ "credential kind for openai fell back to none: #{metadata} is not valid JSON"
+    assert log =~ "invalid byte at offset 9"
+
+    File.rm!(metadata)
+    File.mkdir_p!(metadata)
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert Credentials.kind_at(ctx.base, "eezo", :openai) == :none
+      end)
+
+    assert log =~ "#{metadata} could not be read: illegal operation on a directory"
   end
 
   test "a stale legacy store and a credential symlink are not authority", ctx do
@@ -1421,18 +1452,27 @@ defmodule Tightbeam.CredentialsTest do
       assert cause["finish"] =~ "runtime_start_failed"
     end
 
-    test "raised and exited start failures refuse and clean the lease without killing the owner",
+    test "raised, exited, and thrown start failures refuse without leaking secrets",
          ctx do
       owner = self()
 
       failures = [
         {"raise", fn -> raise "runtime-start-crash" end,
-         {:error, {:credential_start_failed, {:exception, "runtime-start-crash"}}}},
+         {:error, {:credential_start_failed, {:exception, RuntimeError, "runtime-start-crash"}}},
+         "exception"},
+        # The refusal is persisted, so a secret in the message is redacted.
+        {"raise-secret",
+         fn -> raise ArgumentError, "start saw sk-fixture-SENTINEL-0123456789abcdef" end,
+         {:error,
+          {:credential_start_failed, {:exception, ArgumentError, "start saw [REDACTED:token]"}}},
+         "exception"},
         {"exit", fn -> exit(:runtime_start_exit) end,
-         {:error, {:credential_start_failed, {:exit, :runtime_start_exit}}}}
+         {:error, {:credential_start_failed, {:exit, :runtime_start_exit}}}, "exit"},
+        {"throw-secret", fn -> throw("start saw sk-fixture-SENTINEL-0123456789abcdef") end,
+         {:error, {:credential_start_failed, {:throw, "start saw [REDACTED:token]"}}}, "throw"}
       ]
 
-      Enum.each(failures, fn {label, fail_start, expected} ->
+      Enum.each(failures, fn {label, fail_start, expected, diagnostic_kind} ->
         base = Path.join(ctx.base, label)
 
         {:ok, server} =
@@ -1449,8 +1489,27 @@ defmodule Tightbeam.CredentialsTest do
         assert {:ok, staging, lease_id} = Credentials.begin_onboard(:openai, server)
         File.write!(Path.join(staging, "auth.json"), ~S({"token":"candidate"}))
 
-        assert ^expected =
-                 Credentials.finish_onboard(:openai, :subscription, lease_id, server)
+        log =
+          ExUnit.CaptureLog.capture_log(fn ->
+            result = Credentials.finish_onboard(:openai, :subscription, lease_id, server)
+            assert {:error, _diagnosed_failure} = result
+            assert ErrorDiagnostic.classified(result) == expected
+
+            assert %{"kind" => ^diagnostic_kind, "operation" => "credential_start"} =
+                     ErrorDiagnostic.of(result)
+
+            refute inspect(ErrorDiagnostic.of(result)) =~ "SENTINEL"
+          end)
+
+        refute log =~ "SENTINEL"
+
+        if diagnostic_kind == "exception" do
+          assert log =~ "credential start raised"
+          assert log =~ "stacktrace"
+        else
+          assert log =~ "credential start caught"
+          assert log =~ "stacktrace"
+        end
 
         assert Process.alive?(server)
 
@@ -1465,6 +1524,11 @@ defmodule Tightbeam.CredentialsTest do
                  Credentials.status(:openai, server)
 
         assert cause["finish"] =~ "credential_start_failed"
+        refute cause["finish"] =~ "SENTINEL"
+
+        durable_cause = credential_metadata(base, "codex")["present_but_unverified"]
+        assert durable_cause == cause
+        refute JSON.encode!(durable_cause) =~ "SENTINEL"
       end)
 
       refute_receive :forbidden_credential_present
