@@ -81,8 +81,10 @@ defmodule Tightbeam.FirehoseR1SchemaTest do
     before = retained(db)
     assert :ok = Schema.upgrade_firehose_r1(db)
     assert retained(db) == before
+
     assert rows(db, "SELECT originHost,originWorkspace FROM artifacts ORDER BY artifactId") ==
              [[nil, nil]]
+
     assert rows(db, "SELECT shape FROM schema_stamp") == [["firehose-r1-v1-019"]]
 
     assert rows(db, "SELECT reminderState,closedByProcess FROM assignments ORDER BY id") ==
@@ -100,6 +102,7 @@ defmodule Tightbeam.FirehoseR1SchemaTest do
     assert rows(db, "PRAGMA foreign_key_check") == []
     assert :ok = Schema.ensure_all(db)
     assert retained(db) == before
+
     assert rows(db, "SELECT originHost,originWorkspace FROM artifacts ORDER BY artifactId") ==
              [[nil, nil]]
   end
@@ -190,8 +193,7 @@ defmodule Tightbeam.FirehoseR1SchemaTest do
             producedByAssignmentId,parentSession,originPath,contentSha256,
             recordedMessageId,recordedTurnEvidence,state,home,createdAt,updatedAt
      FROM artifacts ORDER BY artifactId
-     """),
-     rows(db, "SELECT * FROM decision_request_terminal_epoch"),
+     """), rows(db, "SELECT * FROM decision_request_terminal_epoch"),
      rows(db, "SELECT * FROM turns ORDER BY seq")}
   end
 
