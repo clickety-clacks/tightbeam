@@ -63,23 +63,6 @@ defmodule Tightbeam.DeliveryResponsibilities do
       } ->
         session_key
 
-      nil ->
-        if legacy_owner_history_present_in_txn?(txn) do
-          case legacy_current_owner_in_txn(txn, work_item_id) do
-            %{
-              "ownerUserId" => ^owner_user_id,
-              "accountableSessionKey" => session_key,
-              "deliveryState" => "current"
-            } ->
-              session_key
-
-            _ ->
-              nil
-          end
-        else
-          nil
-        end
-
       _ ->
         nil
     end
@@ -533,12 +516,7 @@ defmodule Tightbeam.DeliveryResponsibilities do
     end
   end
 
-  # Legacy scope events are consulted only for the exact stamped backfill and
-  # the held Gateway review-recipient path. Staffing reads the direct link.
-  defp legacy_owner_history_present_in_txn?(txn) do
-    legacy_owner_history_table_count_in_txn(txn) == 2
-  end
-
+  # Legacy scope events are consulted only for the exact stamped backfill.
   defp legacy_owner_history_table_count_in_txn(txn) do
     case Txn.q(
            txn,

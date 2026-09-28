@@ -1608,7 +1608,6 @@ defmodule Tightbeam.AssignmentsTest do
     sibling_item = create_work_item(ctx, "sibling terminal")
 
     set_delivery_owner(ctx, delegated_item.id, "delivery-owner")
-    set_delivery_owner(ctx, sibling_item.id, "delivery-owner")
 
     delegation =
       terminal_notice_assign_call(
@@ -1646,6 +1645,10 @@ defmodule Tightbeam.AssignmentsTest do
           sibling_item.id
         )
       )
+
+    assert %{id: _} = sibling
+    # This assignment predates the owner link; replacement preserves its opener.
+    set_delivery_owner(ctx, sibling_item.id, "delivery-owner")
 
     {delegated, sibling, delegation}
   end

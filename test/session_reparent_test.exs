@@ -420,6 +420,19 @@ defmodule Tightbeam.SessionReparentTest do
 
     assert DeliveryResponsibilities.responsibility(ctx.db, "lead", "wi_one") == "stale"
 
+    assert %{code: "not_authorized"} =
+             SessionReparent.handle(ctx.db, agent_call("lead", agent_params(ctx)))
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE sessions SET state='active' WHERE sessionKey='lead'")
+
+    assert %{deliveryOwnerSessionKey: nil} =
+             WorkItems.__handle__(ctx.db, "work-item-update", %{
+               principal: {:user, "owner"},
+               origin: "user:owner",
+               params: %{work_item_id: "wi_one", delivery_owner_session_key: nil}
+             })
+
     assert %{code: "delivery_responsibility_required"} =
              SessionReparent.handle(ctx.db, agent_call("lead", agent_params(ctx)))
 
