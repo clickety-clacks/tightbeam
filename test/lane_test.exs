@@ -9,6 +9,7 @@ defmodule Tightbeam.LaneTest do
     HarnessHealth,
     LaneManager,
     Ledger,
+    Org,
     Placement,
     Projection,
     Schema,
@@ -695,6 +696,222 @@ defmodule Tightbeam.LaneTest do
     assert SessionLane.cancel_current("k1") == :not_running
     {:ok, [[status]]} = DB.query(ctx.db, "SELECT status FROM turns WHERE seq = ?1", [seq1])
     assert status == "canceled"
+  end
+
+  test "assignment opener stop records actor and reason, then drains in the same session", ctx do
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO assignments(id,subject,holderKey,openedByUser,openedAt)
+        VALUES('asg_stop_turn','stop turn','k1','t',1)
+        """
+      )
+
+    Org.append_pointer(ctx.db, "k1", "acp-session-preserved", "created")
+    parent = self()
+
+    runner = fn turn ->
+      send(parent, {:started, turn.seq, turn.session_key, turn.prompt, self()})
+
+      if turn.prompt == "current" do
+        receive do
+          :graceful_cancel -> {:error, :canceled}
+        end
+      else
+        {:ok, %{}}
+      end
+    end
+
+    {:ok, seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: "k1",
+        message_id: "m_current_assignment_turn",
+        origin: "user:t",
+        prompt: "current",
+        assignment_id: "asg_stop_turn"
+      })
+
+    {:ok, _} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: "k1",
+        message_id: "m_assignment_replacement",
+        origin: "user:t",
+        prompt: "replacement",
+        assignment_id: "asg_stop_turn"
+      })
+
+    manager = :"mgr_#{System.unique_integer([:positive])}"
+
+    {:ok, _mgr} =
+      LaneManager.start_link(
+        db: ctx.db,
+        lane_sup: ctx.lane_sup,
+        task_sup: ctx.task_sup,
+        runner: runner,
+        interval: 60_000,
+        name: manager
+      )
+
+    :ok = LaneManager.ensure_lane(manager, "k1")
+    assert_receive {:started, ^seq, "k1", "current", task_pid}
+
+    assert {:ok, %{seq: ^seq, message_id: "m_current_assignment_turn"}} =
+             SessionLane.stop_assignment_turn(
+               "k1",
+               "asg_stop_turn",
+               {:user, "t"},
+               "replacement is waiting"
+             )
+
+    assert Process.alive?(task_pid)
+    send(task_pid, :graceful_cancel)
+    assert_receive {:started, _replacement_seq, "k1", "replacement", _replacement_pid}
+    assert eventually(fn -> Ledger.pending_sessions(ctx.db) == [] end)
+
+    assert Org.current_pointer(ctx.db, "k1").harness_session_id == "acp-session-preserved"
+
+    assert {:ok, [["canceled"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [seq])
+
+    assert [
+             %{
+               subject: subject,
+               detail: detail
+             }
+           ] =
+             Enum.filter(EventLog.lifecycle_events(ctx.db), fn event ->
+               event.kind == "assignment_turn_stopped"
+             end)
+
+    assert subject == Integer.to_string(seq)
+
+    assert Tightbeam.JSON.decode!(detail) == %{
+             "assignmentId" => "asg_stop_turn",
+             "actor" => "user:t",
+             "reason" => "replacement is waiting"
+           }
+
+    assert {:ok, [["assignment-opener-stop", "user:t"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT cause,principal FROM turn_lifecycle_events WHERE turnSeq=?1 AND kind='terminal_committed'",
+               [seq]
+             )
+  end
+
+  test "assignment stop refuses a non-opener, closed assignment, changed turn attribution, and an idle lane",
+       ctx do
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO assignments(id,subject,holderKey,openedByUser,openedAt)
+        VALUES('asg_stop_race','stop race','k1','t',1)
+        """
+      )
+
+    parent = self()
+
+    runner = fn turn ->
+      send(parent, {:started, turn.seq, self()})
+
+      receive do
+        :finish -> {:ok, %{}}
+      end
+    end
+
+    {:ok, seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: "k1",
+        message_id: "m_stop_race",
+        origin: "user:t",
+        prompt: "hold",
+        assignment_id: "asg_stop_race"
+      })
+
+    manager = :"mgr_#{System.unique_integer([:positive])}"
+
+    {:ok, _mgr} =
+      LaneManager.start_link(
+        db: ctx.db,
+        lane_sup: ctx.lane_sup,
+        task_sup: ctx.task_sup,
+        runner: runner,
+        interval: 60_000,
+        name: manager
+      )
+
+    :ok = LaneManager.ensure_lane(manager, "k1")
+    assert_receive {:started, ^seq, task_pid}
+
+    assert {:error, :not_assignment_opener} =
+             SessionLane.stop_assignment_turn(
+               "k1",
+               "asg_stop_race",
+               {:user, "other"},
+               "not your assignment"
+             )
+
+    assert {:ok, [["running"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [seq])
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        UPDATE assignments
+        SET state='closed',outcome='revoked',closedAt=2,closedByUser='t'
+        WHERE id='asg_stop_race'
+        """
+      )
+
+    assert {:error, :assignment_not_open} =
+             SessionLane.stop_assignment_turn(
+               "k1",
+               "asg_stop_race",
+               {:user, "t"},
+               "assignment was closed"
+             )
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        UPDATE assignments
+        SET state='open',outcome=NULL,closedAt=NULL,closedByUser=NULL
+        WHERE id='asg_stop_race'
+        """
+      )
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE turns SET assignmentId=NULL WHERE seq=?1", [seq])
+
+    assert {:error, :turn_not_attributed_to_assignment} =
+             SessionLane.stop_assignment_turn(
+               "k1",
+               "asg_stop_race",
+               {:user, "t"},
+               "try after reassignment"
+             )
+
+    assert {:ok, [["running"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [seq])
+
+    assert Enum.all?(EventLog.lifecycle_events(ctx.db), fn event ->
+             event.kind != "assignment_turn_stopped"
+           end)
+
+    send(task_pid, :finish)
+    assert eventually(fn -> Ledger.pending_sessions(ctx.db) == [] end)
+
+    assert {:error, :not_running} =
+             SessionLane.stop_assignment_turn(
+               "k1",
+               "asg_stop_race",
+               {:user, "t"},
+               "turn already finished"
+             )
   end
 
   test "reconcile republishes recovered terminals through the same on_terminal closure", ctx do

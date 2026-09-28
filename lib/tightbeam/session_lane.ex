@@ -19,7 +19,7 @@ defmodule Tightbeam.SessionLane do
   use GenServer
   require Logger
   alias Tightbeam.StaleTurnSettlement
-  alias Tightbeam.{DB, EventLog, Harness, HarnessHealth, HarnessProcess, Ledger, Placement}
+  alias Tightbeam.{DB, EventLog, Harness, HarnessHealth, HarnessProcess, JSON, Ledger, Placement}
 
   defstruct [
     :session_key,
@@ -131,6 +131,36 @@ defmodule Tightbeam.SessionLane do
   end
 
   @doc """
+  Stop the currently running turn only when it is attributed to an open
+  assignment whose opener matches principal. The lane revalidates that relationship
+  and its own ownership of the exact running turn in the terminal transaction.
+  """
+  @spec stop_assignment_turn(String.t(), String.t(), term(), String.t()) ::
+          {:ok, %{seq: integer(), message_id: String.t()}} | {:error, atom()} | :no_lane
+  def stop_assignment_turn(session_key, assignment_id, principal, reason) do
+    cond do
+      not is_binary(assignment_id) or assignment_id == "" ->
+        {:error, :invalid_assignment_id}
+
+      not is_binary(reason) or byte_size(reason) not in 1..512 or String.trim(reason) == "" ->
+        {:error, :invalid_reason}
+
+      true ->
+        case Registry.lookup(Tightbeam.LaneRegistry, session_key) do
+          [{pid, _}] ->
+            GenServer.call(
+              pid,
+              {:stop_assignment_turn, assignment_id, principal, reason},
+              :infinity
+            )
+
+          [] ->
+            :no_lane
+        end
+    end
+  end
+
+  @doc """
   Run `fun` at a turn boundary, or refuse — the lane IS the serialization point.
 
   The lane claims turns in its own message loop (`maybe_start/1`), so it cannot
@@ -193,23 +223,87 @@ defmodule Tightbeam.SessionLane do
   def handle_call(:cancel_current, _from, %{task_ref: nil} = state),
     do: {:reply, :not_running, state}
 
-  def handle_call(:cancel_current, _from, state) do
-    {:ok, {won, route_publication}} =
+  def handle_call(:cancel_current, _from, state),
+    do: cancel_running_turn(state, nil)
+
+  def handle_call({:stop_assignment_turn, _assignment_id, _principal, _reason}, _from, state)
+      when is_nil(state.task_ref),
+      do: {:reply, {:error, :not_running}, state}
+
+  def handle_call(
+        {:stop_assignment_turn, assignment_id, principal, reason},
+        _from,
+        state
+      ) do
+    cancel_running_turn(state, %{
+      assignment_id: assignment_id,
+      principal: principal,
+      reason: reason
+    })
+  end
+
+  defp cancel_running_turn(state, audit) do
+    audit =
+      if is_map(audit),
+        do: Map.put(audit, :principal_ref, assignment_stop_principal_ref(audit.principal)),
+        else: nil
+
+    {:ok, {result, route_publication}} =
       DB.transaction_then(
         state.db,
         fn txn ->
-          if Ledger.finish_in_txn(txn, state.current_seq, "canceled", nil,
-               owner_lease: state.current_owner_lease
-             ) do
-            {true,
-             HarnessHealth.settle_other_route_in_txn(
-               txn,
-               state.current_seq,
-               "canceled",
-               System.system_time(:millisecond)
-             )}
-          else
-            {false, nil}
+          target =
+            if is_nil(audit) do
+              {:ok, state.current_message_id}
+            else
+              assignment_turn_stop_target_in_txn(
+                txn,
+                state,
+                audit.assignment_id,
+                audit.principal,
+                audit.principal_ref
+              )
+            end
+
+          case target do
+            {:ok, message_id} ->
+              ledger_opts =
+                [owner_lease: state.current_owner_lease] ++
+                  if(audit,
+                    do: [
+                      cause: "assignment-opener-stop",
+                      principal: audit.principal_ref
+                    ],
+                    else: []
+                  )
+
+              if Ledger.finish_in_txn(txn, state.current_seq, "canceled", nil, ledger_opts) do
+                if audit do
+                  EventLog.lifecycle_in_txn(
+                    txn,
+                    "assignment_turn_stopped",
+                    Integer.to_string(state.current_seq),
+                    JSON.encode!(%{
+                      "assignmentId" => audit.assignment_id,
+                      "actor" => audit.principal_ref,
+                      "reason" => audit.reason
+                    })
+                  )
+                end
+
+                {{:ok, message_id},
+                 HarnessHealth.settle_other_route_in_txn(
+                   txn,
+                   state.current_seq,
+                   "canceled",
+                   System.system_time(:millisecond)
+                 )}
+              else
+                {{:error, :not_running}, nil}
+              end
+
+            {:error, refusal} ->
+              {{:error, refusal}, nil}
           end
         end,
         fn txn, result ->
@@ -218,16 +312,23 @@ defmodule Tightbeam.SessionLane do
         end
       )
 
-    case won do
-      true ->
+    case result do
+      {:ok, message_id} ->
         publish_route_publication(route_publication)
         state.on_terminal.(state.session_key, state.current_seq)
-        reply = {:ok, %{seq: state.current_seq, message_id: state.current_message_id}}
-        if is_pid(state.task_pid), do: Process.exit(state.task_pid, :kill)
+        reply = {:ok, %{seq: state.current_seq, message_id: message_id}}
+        # Assignment stops rely on the ACP session/cancel notification sent by
+        # the gateway. Keep the turn task alive until that cancellation returns
+        # naturally; only the pre-existing generic cancel keeps its old task
+        # teardown behavior.
+        if is_nil(audit) and is_pid(state.task_pid), do: Process.exit(state.task_pid, :kill)
         {:reply, reply, state}
 
-      false ->
+      {:error, :not_running} when is_nil(audit) ->
         {:reply, :not_running, state}
+
+      {:error, refusal} ->
+        {:reply, {:error, refusal}, state}
     end
   end
 
@@ -791,6 +892,90 @@ defmodule Tightbeam.SessionLane do
     do: {:ok, Map.drop(result, [:message_id, :stored_error])}
 
   defp public_settlement_result(result), do: result
+
+  defp assignment_turn_stop_target_in_txn(
+         txn,
+         state,
+         assignment_id,
+         principal,
+         principal_ref
+       ) do
+    case DB.Txn.q(
+           txn,
+           """
+           SELECT a.holderKey, a.state, a.openedByUser, a.openedBySession,
+                  t.sessionKey, t.assignmentId, t.status, t.owner, t.messageId
+           FROM assignments a
+           JOIN turns t ON t.seq=?2
+           WHERE a.id=?1
+           """,
+           [assignment_id, state.current_seq]
+         ) do
+      [
+        [
+          holder,
+          assignment_state,
+          opened_by_user,
+          opened_by_session,
+          turn_session,
+          turn_assignment,
+          turn_status,
+          turn_owner,
+          message_id
+        ]
+      ] ->
+        opened_by =
+          cond do
+            is_binary(opened_by_user) -> "user:" <> opened_by_user
+            is_binary(opened_by_session) -> "session:" <> opened_by_session
+            true -> nil
+          end
+
+        cond do
+          not is_binary(principal_ref) or opened_by != principal_ref ->
+            {:error, :not_assignment_opener}
+
+          assignment_state != "open" ->
+            {:error, :assignment_not_open}
+
+          holder != state.session_key ->
+            {:error, :assignment_holder_changed}
+
+          turn_session != state.session_key ->
+            {:error, :turn_session_changed}
+
+          turn_assignment != assignment_id ->
+            {:error, :turn_not_attributed_to_assignment}
+
+          turn_status != "running" ->
+            {:error, :not_running}
+
+          turn_owner != state.lane_owner ->
+            {:error, :turn_owner_changed}
+
+          not is_binary(state.current_owner_lease) ->
+            {:error, :turn_owner_changed}
+
+          principal != {:user, opened_by_user} and
+              principal != {:session, opened_by_session} ->
+            {:error, :not_assignment_opener}
+
+          true ->
+            {:ok, message_id}
+        end
+
+      [] ->
+        {:error, :assignment_or_turn_not_found}
+    end
+  end
+
+  defp assignment_stop_principal_ref({:user, user_id}) when is_binary(user_id),
+    do: "user:" <> user_id
+
+  defp assignment_stop_principal_ref({:session, session_key}) when is_binary(session_key),
+    do: "session:" <> session_key
+
+  defp assignment_stop_principal_ref(_), do: nil
 
   defp ambiguous,
     do: {:error, %{code: "turn_status_ambiguous", message: "turn liveness is ambiguous"}}

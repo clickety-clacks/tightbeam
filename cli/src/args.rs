@@ -292,6 +292,11 @@ pub enum Command {
         identity: Identity,
         request_id: String,
     },
+    AssignmentStopTurn {
+        identity: Identity,
+        assignment_id: String,
+        reason: String,
+    },
     RevokeAssignment {
         identity: Identity,
         assignment_id: String,
@@ -890,6 +895,8 @@ COMMANDS:
   decision-request --request <decisionRequestId>
       Read one effort request by complete id. Other request kinds keep their
       existing visibility rules.
+  assignment-stop-turn <assignmentId> --reason "<why>"
+      Stop the current turn only when you opened that assignment.
   revoke-assignment <assignmentId> --reason "..."
       Revoke when the assignment handler already authorizes your principal.
   reopen-assignment <assignmentId> --reason <reason>
@@ -2341,6 +2348,22 @@ fn parse_with_optional_catalog(
                 request_id: request_id.expect("checked above"),
             })
         }
+        "assignment-stop-turn" => {
+            let usage = "usage: tightbeam assignment-stop-turn <assignmentId> --reason \"<why>\"";
+            const ALLOWED: &[&str] = &["reason", "as", "as-user", "as-process"];
+            if parsed.positional.len() != 2
+                || parsed.duplicates.contains("reason")
+                || flags.keys().any(|flag| !ALLOWED.contains(&flag.as_str()))
+            {
+                return Err(usage.to_owned());
+            }
+            let reason = nonempty(flags, "reason").ok_or_else(|| usage.to_owned())?;
+            Ok(Command::AssignmentStopTurn {
+                identity: identity(flags)?,
+                assignment_id: parsed.positional[1].clone(),
+                reason,
+            })
+        }
         "revoke-assignment" => {
             let usage = "usage: tightbeam revoke-assignment <assignmentId> --reason \"...\"";
             if parsed.positional.len() != 2 || parsed.duplicates.contains("reason") {
@@ -3508,6 +3531,50 @@ mod tests {
             parse(strings(&["revoke-assignment", "asg_test", "--reason", "superseded"])),
             Ok(Command::RevokeAssignment { assignment_id, reason, .. })
                 if assignment_id == "asg_test" && reason == "superseded"
+        ));
+    }
+
+    #[test]
+    fn assignment_stop_turn_requires_one_reason_and_only_identity_overrides() {
+        for args in [
+            strings(&["assignment-stop-turn", "asg_test"]),
+            strings(&["assignment-stop-turn", "asg_test", "--reason", ""]),
+            strings(&[
+                "assignment-stop-turn",
+                "asg_test",
+                "--reason",
+                "one",
+                "--reason",
+                "two",
+            ]),
+            strings(&[
+                "assignment-stop-turn",
+                "asg_test",
+                "--reason",
+                "stop",
+                "--session",
+                "holder",
+            ]),
+        ] {
+            assert!(parse(args).is_err());
+        }
+
+        assert!(matches!(
+            parse(strings(&[
+                "assignment-stop-turn",
+                "asg_test",
+                "--reason",
+                "replace the stale turn",
+                "--as-user",
+                "mike",
+            ])),
+            Ok(Command::AssignmentStopTurn {
+                identity: Identity::User(user_id),
+                assignment_id,
+                reason,
+            }) if user_id == "mike"
+                && assignment_id == "asg_test"
+                && reason == "replace the stale turn"
         ));
     }
 

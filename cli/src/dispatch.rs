@@ -774,6 +774,19 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             vec![],
             vec![string_field("request", request_id)],
         )),
+        Command::AssignmentStopTurn {
+            identity,
+            assignment_id,
+            reason,
+        } => Ok(request(
+            identity,
+            "cancel",
+            vec![],
+            vec![
+                string_field("assignmentId", assignment_id),
+                string_field("reason", reason),
+            ],
+        )),
         Command::RevokeAssignment {
             identity,
             assignment_id,
@@ -2281,6 +2294,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::OperatorWithdraw { identity, .. }
         | Command::DecisionRequests { identity, .. }
         | Command::DecisionRequest { identity, .. }
+        | Command::AssignmentStopTurn { identity, .. }
         | Command::RevokeAssignment { identity, .. }
         | Command::ReopenAssignment { identity, .. }
         | Command::RepairAssignment { identity, .. }
@@ -3343,6 +3357,17 @@ mod tests {
                 "superseded"
             ]),
             r#"{"as":"parent","verb":"revoke-assignment","params":{"assignmentId":"asg_1","reason":"superseded"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "assignment-stop-turn",
+                "asg_1",
+                "--reason",
+                "replace the stale turn",
+                "--as",
+                "parent",
+            ]),
+            r#"{"as":"parent","verb":"cancel","params":{"assignmentId":"asg_1","reason":"replace the stale turn"}}"#
         );
         assert_eq!(
             body(&[

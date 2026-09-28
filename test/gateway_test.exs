@@ -176,6 +176,38 @@ defmodule Tightbeam.GatewayTest do
     end
   end
 
+  defmodule CancelCoordinatorStub do
+    use GenServer
+
+    def start_link({parent, adapter}), do: GenServer.start_link(__MODULE__, {parent, adapter})
+    def init(state), do: {:ok, state}
+
+    def handle_call({:adapter_for, key}, _from, {parent, adapter} = state) do
+      send(parent, {:cancel_adapter_for, key})
+      {:reply, {:ok, adapter, 1}, state}
+    end
+  end
+
+  defmodule CancelAdapterStub do
+    use GenServer
+
+    def start_link(conn), do: GenServer.start_link(__MODULE__, conn)
+    def init(conn), do: {:ok, conn}
+    def handle_call(:conn, _from, conn), do: {:reply, conn, conn}
+  end
+
+  defmodule CancelConnStub do
+    use GenServer
+
+    def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
+    def init(parent), do: {:ok, parent}
+
+    def handle_cast({:notify, "session/cancel", %{sessionId: sid}}, parent) do
+      send(parent, {:acp_session_cancel, sid})
+      {:noreply, parent}
+    end
+  end
+
   defmodule FenceDeleteRaceDB do
     use GenServer
 
@@ -5864,6 +5896,108 @@ defmodule Tightbeam.GatewayTest do
 
     assert {:ok, [["canceled"]]} =
              DB.query(ctx.db, "SELECT status FROM turns ORDER BY seq DESC LIMIT 1")
+  end
+
+  test "assignment opener stop uses the cancel handler and drains the holder queue", ctx do
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO assignments(id,subject,holderKey,openedByUser,openedAt)
+        VALUES('asg_gateway_stop','gateway stop','k1','flynn',1)
+        """
+      )
+
+    {:ok, current_seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: "k1",
+        message_id: "m_gateway_stop_current",
+        origin: "user:flynn",
+        prompt: "current",
+        assignment_id: "asg_gateway_stop"
+      })
+
+    {:ok, _replacement_seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: "k1",
+        message_id: "m_gateway_stop_replacement",
+        origin: "user:flynn",
+        prompt: "replacement",
+        assignment_id: "asg_gateway_stop"
+      })
+
+    Org.append_pointer(ctx.db, "k1", "acp-session-stop", "created")
+    conn = start_supervised!({CancelConnStub, self()})
+    adapter = start_supervised!({CancelAdapterStub, conn})
+    coordinator = start_supervised!({CancelCoordinatorStub, {self(), adapter}})
+    ensure_global_registry()
+    parent = self()
+
+    lane =
+      start_lane!(ctx.db, "k1", fn turn ->
+        send(parent, {:assignment_stop_started, turn.seq, turn.session_key, turn.prompt, self()})
+
+        if turn.prompt == "current" do
+          receive do
+            :graceful_cancel -> {:error, :canceled}
+          end
+        else
+          {:ok, %{}}
+        end
+      end)
+
+    barrier_lane_started(lane)
+    assert_receive {:assignment_stop_started, ^current_seq, "k1", "current", task_pid}
+
+    handler =
+      Gateway.handlers(%{db: ctx.db, adapter_coordinator: coordinator})["cancel"]
+
+    result =
+      handler.(%{
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        session_key: nil,
+        params: %{
+          assignment_id: "asg_gateway_stop",
+          reason: "replacement is waiting"
+        }
+      })
+
+    assert result == %{
+             ok: true,
+             assignment_id: "asg_gateway_stop",
+             session_key: "k1",
+             turn_seq: current_seq,
+             acp_cancel: :unconfirmed
+           }
+
+    assert_receive {:cancel_adapter_for, _adapter_key}
+    assert_receive {:acp_session_cancel, "acp-session-stop"}
+    assert Process.alive?(task_pid)
+    send(task_pid, :graceful_cancel)
+
+    assert_receive {:assignment_stop_started, _replacement_seq, "k1", "replacement",
+                    _replacement_pid}
+
+    assert eventually(fn -> Ledger.pending_sessions(ctx.db) == [] end)
+
+    assert {:ok, [["canceled"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [current_seq])
+
+    assert [
+             %{
+               detail: detail
+             }
+           ] =
+             Enum.filter(EventLog.lifecycle_events(ctx.db), fn event ->
+               event.kind == "assignment_turn_stopped"
+             end)
+
+    assert Tightbeam.JSON.decode!(detail) == %{
+             "assignmentId" => "asg_gateway_stop",
+             "actor" => "user:flynn",
+             "reason" => "replacement is waiting"
+           }
   end
 
   test "cancel stays durable and the lane alive when the adapter is dead", ctx do

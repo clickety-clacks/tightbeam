@@ -1399,7 +1399,13 @@ defmodule Tightbeam.Gateway do
       end,
       {"assignments", []} => fn call -> Assignments.__handle__(db, "assignments", call) end,
       {"inspect", []} => fn call -> inspect_result(config, db, call) end,
-      {"cancel", ["turn.ended", "session.updated"]} => fn call -> cancel_result(db, call) end,
+      {"cancel", ["turn.ended", "session.updated"]} => fn call ->
+        if Map.has_key?(call.params, :assignment_id) or Map.has_key?(call.params, :reason) do
+          assignment_stop_turn_result(config, db, call)
+        else
+          cancel_result(db, call)
+        end
+      end,
       {"settle-turn", ["turn.ended", "session.updated"]} => fn call ->
         settle_turn_result(db, call)
       end,
@@ -8984,4 +8990,170 @@ defmodule Tightbeam.Gateway do
   end
 
   defp deliver(pid, payload), do: send(pid, {:push, payload})
+
+  # Assignment stops have their own path so the generic cancel handler and its
+  # ACP diagnostics remain owned by the shared cancel implementation.
+  defp assignment_stop_turn_result(config, db, call) do
+    params = call.params
+
+    with {:ok, assignment_id} <- assignment_stop_id(params[:assignment_id]),
+         {:ok, reason} <- assignment_stop_reason(params[:reason]),
+         {:ok, session_key} <- assignment_stop_target(db, assignment_id, call.principal) do
+      case Tightbeam.SessionLane.stop_assignment_turn(
+             session_key,
+             assignment_id,
+             call.principal,
+             reason
+           ) do
+        {:ok, result} ->
+          publish_assignment_stopped_turn(
+            config,
+            db,
+            session_key,
+            assignment_id,
+            result
+          )
+
+        {:error, refusal} ->
+          assignment_stop_refusal(refusal)
+
+        :no_lane ->
+          %{code: "lane_unavailable", message: "assignment holder lane is unavailable"}
+      end
+    else
+      {:error, code, message} ->
+        %{code: code, message: message}
+    end
+  end
+
+  defp assignment_stop_id(id) when is_binary(id) and id != "", do: {:ok, id}
+
+  defp assignment_stop_id(_),
+    do: {:error, "invalid_assignment_id", "assignmentId must be a non-empty string"}
+
+  defp assignment_stop_reason(reason)
+       when is_binary(reason) and byte_size(reason) in 1..512 do
+    if String.trim(reason) == "",
+      do: {:error, "invalid_reason", "reason must contain non-whitespace text"},
+      else: {:ok, reason}
+  end
+
+  defp assignment_stop_reason(_),
+    do: {:error, "invalid_reason", "reason must be 1-512 bytes"}
+
+  defp assignment_stop_target(db, assignment_id, principal) do
+    case DB.query(
+           db,
+           "SELECT holderKey,state,openedByUser,openedBySession FROM assignments WHERE id=?1",
+           [assignment_id]
+         ) do
+      {:ok, [[holder, assignment_state, opened_by_user, opened_by_session]]} ->
+        cond do
+          not assignment_stop_opener?(principal, opened_by_user, opened_by_session) ->
+            {:error, "not_authorized", "only this assignment's opener may stop its running turn"}
+
+          assignment_state != "open" ->
+            {:error, "assignment_not_open", "assignment is no longer open"}
+
+          true ->
+            {:ok, holder}
+        end
+
+      {:ok, []} ->
+        {:error, "unknown_assignment", "unknown assignment: #{assignment_id}"}
+
+      {:error, _reason} ->
+        {:error, "server_error", "could not read assignment state"}
+    end
+  end
+
+  defp assignment_stop_opener?({:user, user_id}, user_id, nil) when is_binary(user_id),
+    do: true
+
+  defp assignment_stop_opener?({:session, session_key}, nil, session_key)
+       when is_binary(session_key),
+       do: true
+
+  defp assignment_stop_opener?(_principal, _opened_by_user, _opened_by_session), do: false
+
+  defp assignment_stop_refusal(:not_assignment_opener),
+    do: %{
+      code: "not_authorized",
+      message: "only this assignment's opener may stop its running turn"
+    }
+
+  defp assignment_stop_refusal(:assignment_not_open),
+    do: %{code: "assignment_not_open", message: "assignment is no longer open"}
+
+  defp assignment_stop_refusal(:not_running),
+    do: %{code: "not_running", message: "assignment has no running turn to stop"}
+
+  defp assignment_stop_refusal(:turn_not_attributed_to_assignment),
+    do: %{
+      code: "turn_not_attributed",
+      message: "current turn is not attributed to this assignment"
+    }
+
+  defp assignment_stop_refusal(refusal),
+    do: %{code: "stop_refused", message: "assignment turn stop refused: #{refusal}"}
+
+  defp publish_assignment_stopped_turn(
+         config,
+         db,
+         session_key,
+         assignment_id,
+         %{message_id: message_id, seq: seq}
+       ) do
+    echo = Projection.get(db, message_id)
+    correlation = (echo && echo.client_message_id) || message_id
+    publish_turn_state(db, session_key, correlation, "canceled", nil)
+
+    acp_cancel =
+      with %{} = session <- Org.get(db, session_key) do
+        publish_session_indicator(db, session_key, session.owner_user_id)
+
+        broadcast(
+          db,
+          session.owner_user_id,
+          Payloads.activity_event(%{
+            is_active: false,
+            message_id: correlation,
+            session_key: session_key
+          })
+        )
+
+        assignment_harness_cancel(config, db, session)
+      else
+        _ -> :not_sent
+      end
+
+    Ledger.mark_published(db, seq)
+
+    %{
+      ok: true,
+      assignment_id: assignment_id,
+      session_key: session_key,
+      turn_seq: seq,
+      acp_cancel: acp_cancel
+    }
+  end
+
+  defp assignment_harness_cancel(config, db, session) do
+    with %{harness_session_id: sid} <- Org.current_pointer(db, session.session_key),
+         key = {Harness.parse!(session.harness).id(), "shared", session.host},
+         coordinator = Map.get(config, :adapter_coordinator, Tightbeam.AdapterCoordinator),
+         {:ok, adapter, _gen} <- AdapterCoordinator.adapter_for(coordinator, key),
+         :ok <-
+           Tightbeam.Acp.Conn.notify(Tightbeam.Acp.Adapter.conn(adapter), "session/cancel", %{
+             sessionId: sid
+           }) do
+      :unconfirmed
+    else
+      _ -> :not_sent
+    end
+  rescue
+    _ -> :not_sent
+  catch
+    _, _ -> :not_sent
+  end
 end
