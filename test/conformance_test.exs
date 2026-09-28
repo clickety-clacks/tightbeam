@@ -2772,7 +2772,7 @@ defmodule Tightbeam.ConformanceSupport do
       Enum.reduce(Map.get(world, "work_items", []), ids.work_items, fn item, item_ids ->
         result =
           WorkItems.__handle__(db, "work-item-create", %{
-            principal: {:user, first_user(world)},
+            principal: {:user, item["owner"] || first_user(world)},
             params: %{title: item["title"]}
           })
 

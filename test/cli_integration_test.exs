@@ -1314,6 +1314,21 @@ defmodule Tightbeam.CliIntegrationTest do
         model: Model.new("test")
       })
 
+    product_owner =
+      Org.create(ctx.db, %{
+        session_key: "cli-product-owner",
+        display_name: "CLI Product Owner",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "product-owner",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+
+    product_owner_dir = session_workdir!(ctx, product_owner)
+
     Roles.create!(ctx.db, "cli-coder", "flynn", coder.session_key)
     Roles.create!(ctx.db, "cli-reviewer", "flynn", reviewer.session_key)
     coder_dir = session_workdir!(ctx, coder)
@@ -1329,7 +1344,7 @@ defmodule Tightbeam.CliIntegrationTest do
 
     item_id = JSON.decode!(created)["id"]
 
-    Roles.create!(ctx.db, "product-owner:papertrail", "flynn", ctx.session.session_key)
+    Roles.create!(ctx.db, "product-owner:papertrail", "flynn", product_owner.session_key)
 
     assert {_association_output, 0} =
              System.cmd(
@@ -1376,7 +1391,7 @@ defmodule Tightbeam.CliIntegrationTest do
           "--subject",
           "decide the papertrail topology",
           "--session",
-          ctx.session.session_key,
+          product_owner.session_key,
           "--effect-kind",
           "coordination",
           "--work-item",
@@ -1399,11 +1414,9 @@ defmodule Tightbeam.CliIntegrationTest do
                  "--kind",
                  "verdict",
                  "--verdict",
-                 "topology-decided",
-                 "--as",
-                 "cli-holder"
+                 "topology-decided"
                ],
-               cd: ctx.workdir,
+               cd: product_owner_dir,
                stderr_to_stdout: true
              )
 
