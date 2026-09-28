@@ -29,6 +29,9 @@ defmodule Tightbeam.SettlementMigrationTest do
       INSERT INTO wire_idempotency VALUES
         ('mike','session-reparent','prior-key','prior-event','prior-fingerprint','{"prior":true}'),
       ('mike','session-po-set','po-key','po-event','po-fingerprint','{"po":true}');
+      DROP TRIGGER artifacts_origin_immutable;
+      ALTER TABLE artifacts DROP COLUMN originHost;
+      ALTER TABLE artifacts DROP COLUMN originWorkspace;
       UPDATE schema_stamp SET shape='cannot-proceed-v1-019';
       """)
 
