@@ -1938,9 +1938,14 @@ defmodule Tightbeam.Gateway do
     db = Keyword.get(opts, :db, Tightbeam.DB)
 
     result =
-      DB.transaction(db, fn txn ->
-        deliver_prompt_in_txn(txn, session_key, origin, prompt, opts)
-      end)
+      DB.transaction_then(
+        db,
+        fn txn -> deliver_prompt_in_txn(txn, session_key, origin, prompt, opts) end,
+        fn txn, delivery ->
+          Tightbeam.Wakes.row_commit_in_txn(txn, [])
+          delivery
+        end
+      )
 
     case result do
       {:ok, delivery} ->

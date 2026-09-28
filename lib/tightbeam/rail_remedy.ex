@@ -49,11 +49,18 @@ defmodule Tightbeam.RailRemedy do
   def resolve_notice(db, notice, bindings) when is_map(notice) and is_map(bindings) do
     target = Map.take(notice, [:target_role, :target_session])
     params = Map.take(notice, [:prompt])
+    idempotency = Map.take(notice, [:idempotency_key])
 
     with {:ok, resolved_target} <- resolve_map(target, bindings),
          {:ok, resolved_params} <- resolve_map(params, bindings),
+         {:ok, resolved_idempotency} <- resolve_map(idempotency, bindings),
          {:ok, resolved} <-
            bind_target(db, "wake", %{target: resolved_target, params: resolved_params}) do
+      resolved =
+        resolved
+        |> Map.merge(Map.take(bindings, [:assignment_id, :work_item_id]))
+        |> Map.put(:idempotency_key, resolved_idempotency[:idempotency_key])
+
       {:ok, resolved}
     end
   end
@@ -1192,7 +1199,7 @@ defmodule Tightbeam.RailRemedy do
         end
 
       {key, value}, {:ok, acc} ->
-        embedded? = key in [:subject, :prompt, :display]
+        embedded? = key in [:subject, :prompt, :display, :idempotency_key]
 
         case resolve_value(value, bindings, embedded?) do
           {:ok, resolved} -> {:cont, {:ok, Map.put(acc, key, resolved)}}

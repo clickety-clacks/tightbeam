@@ -2917,29 +2917,44 @@ defmodule Tightbeam.Wakes do
   defp deliver_rule_notice_in_txn(txn, rule, call, evidence) do
     case RuleRuntime.resolve_notice_in_txn(txn, rule, call) do
       {:ok, resolved} ->
-        wake =
-          schedule_in_txn(txn, %{
+        wake_id = rule_notice_wake_id(rule, resolved)
+
+        if is_binary(wake_id) and
+             Txn.q(
+               txn,
+               "SELECT 1 FROM wakes WHERE wakeId=?1 AND origin=?2",
+               [wake_id, "remedy:#{rule.name}"]
+             ) != [] do
+          :ok
+        else
+          input = %{
             session_key: resolved.bound_session,
             target_role: resolved.target[:target_role],
             origin: "remedy:#{rule.name}",
             prompt: resolved.params.prompt,
             due_at: System.system_time(:millisecond),
             creator_session_key: principal_session(call.principal),
+            assignment_id: resolved[:assignment_id] || Map.get(call.params, :assignment_id),
+            work_item_id: resolved[:work_item_id] || Map.get(call.params, :work_item_id),
             summon: true
-          })
+          }
 
-        EventLog.lifecycle_in_txn(
-          txn,
-          "rule_notice",
-          wake.wake_id,
-          JSON.encode!(%{
-            rule: rule.name,
-            edge: rule_edge(call),
-            cause: Map.get(call, :transition),
-            principal: call.origin,
-            evidence: Enum.map(evidence, fn {fact, value} -> %{fact: fact, value: value} end)
-          })
-        )
+          input = if is_binary(wake_id), do: Map.put(input, :wake_id, wake_id), else: input
+          wake = schedule_in_txn(txn, input)
+
+          EventLog.lifecycle_in_txn(
+            txn,
+            "rule_notice",
+            wake.wake_id,
+            JSON.encode!(%{
+              rule: rule.name,
+              edge: rule_edge(call),
+              cause: Map.get(call, :transition),
+              principal: call.origin,
+              evidence: Enum.map(evidence, fn {fact, value} -> %{fact: fact, value: value} end)
+            })
+          )
+        end
 
         :ok
 
@@ -2947,6 +2962,19 @@ defmodule Tightbeam.Wakes do
         raise "notice #{rule.name} has unresolved target: #{inspect(reason)}"
     end
   end
+
+  defp rule_notice_wake_id(_rule, %{idempotency_key: nil}), do: nil
+
+  defp rule_notice_wake_id(rule, %{bound_session: session_key, idempotency_key: key})
+       when is_binary(session_key) and is_binary(key) do
+    digest =
+      :crypto.hash(:sha256, rule.name <> "\0" <> session_key <> "\0" <> key)
+      |> Base.encode16(case: :lower)
+
+    "w_rule_" <> digest
+  end
+
+  defp rule_notice_wake_id(_rule, _resolved), do: nil
 
   defp principal_session({:session, session_key}), do: session_key
   defp principal_session(_principal), do: nil
@@ -5669,7 +5697,14 @@ defmodule Tightbeam.Wakes do
       )
 
     Enum.each(rows, fn [wake_id] ->
-      case DB.transaction(db, fn txn -> deliver_wait_in_txn(txn, wake_id, delivery_opts) end) do
+      case DB.transaction_then(
+             db,
+             fn txn -> deliver_wait_in_txn(txn, wake_id, delivery_opts) end,
+             fn txn, result ->
+               row_commit_in_txn(txn, [])
+               result
+             end
+           ) do
         {:ok, {:delivery, delivery}} -> Gateway.complete_delivery(db, delivery)
         {:ok, _} -> :ok
         {:error, error} -> raise error
@@ -6192,12 +6227,19 @@ defmodule Tightbeam.Wakes do
 
   defp fire_candidate(db, wake_id, fact_id) do
     result =
-      DB.transaction(db, fn txn ->
-        case Txn.q(txn, select_wake_sql() <> " WHERE wakeId = ?1", [wake_id]) do
-          [row] -> fire_in_txn(txn, to_wake(row), fact_id)
-          [] -> :noop
+      DB.transaction_then(
+        db,
+        fn txn ->
+          case Txn.q(txn, select_wake_sql() <> " WHERE wakeId = ?1", [wake_id]) do
+            [row] -> fire_in_txn(txn, to_wake(row), fact_id)
+            [] -> :noop
+          end
+        end,
+        fn txn, result ->
+          row_commit_in_txn(txn, [])
+          result
         end
-      end)
+      )
 
     case result do
       {:ok, {:fired, delivery}} -> Gateway.complete_delivery(db, delivery)

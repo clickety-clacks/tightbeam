@@ -65,6 +65,24 @@ defmodule Tightbeam.RuleRuntime do
     "condition_fact.matches" => %{kind: :condition_fact, domains: ["condition_fact"]}
   }
 
+  # These facts are available only while inspecting the corresponding durable
+  # row-commit transition. They are intentionally not ad-hoc wait predicates:
+  # the event carries the session and caller binding needed to compute them.
+  @row_commit_fact_domains %{
+    "turn.queued_count" => ["queued_turn"],
+    "turn.oldest_age_ms" => ["queued_turn"],
+    "turn.caller_queued_count" => ["queued_turn"],
+    "turn.backlogged" => ["queued_turn"],
+    "turn.backlog_episode_id" => ["queued_turn"],
+    "turn.caller_threshold_seq" => ["queued_turn"],
+    "session.working_without_open_assignment" => ["running_turn"],
+    "session.unassigned_stretch_id" => ["running_turn"],
+    "work_item.fourth_round_kind" => ["assignment", "attest"],
+    "work_item.review_verdict_count" => ["attest"],
+    "assignment.review_verdict_count" => ["assignment", "attest"],
+    "assignment.prior_completed_fix_count" => ["assignment"]
+  }
+
   @type callbacks :: %{
           row_commit_effects: (DB.Txn.t(), [map()] | map() -> [tuple()]),
           resolve_notice: (DB.Txn.t(), map(), map() -> {:ok, map()} | {:error, term()}),
@@ -115,9 +133,15 @@ defmodule Tightbeam.RuleRuntime do
   @doc false
   @spec predicate_row_domains(String.t()) :: [String.t()]
   def predicate_row_domains(fact) do
-    case predicate_transition_contract(fact) do
-      {:ok, %{domains: domains}} -> domains
-      {:error, _} -> []
+    case Map.fetch(@row_commit_fact_domains, fact) do
+      {:ok, domains} ->
+        domains
+
+      :error ->
+        case predicate_transition_contract(fact) do
+          {:ok, %{domains: domains}} -> domains
+          {:error, _} -> []
+        end
     end
   end
 
