@@ -1047,48 +1047,38 @@ defmodule Tightbeam.CliIntegrationTest do
 
     Roles.create!(ctx.db, "product-owner:papertrail", "flynn", ctx.session.session_key)
 
-    for args <- [
-          [
-            "session-po-set",
-            "--session",
-            ctx.session.session_key,
-            "--po-role",
-            "product-owner:papertrail",
-            "--key",
-            "papertrail-association",
-            "--as-user",
-            "flynn"
-          ],
-          [
-            "delivery-scope-owner-set",
-            "--session",
-            ctx.session.session_key,
-            "--association-revision",
-            "1",
-            "--expected-revision",
-            "0",
-            "--key",
-            "papertrail-owner",
-            "--as-user",
-            "flynn"
-          ],
-          [
-            "work-item-delivery-scope-set",
-            item_id,
-            "--association-session",
-            ctx.session.session_key,
-            "--association-revision",
-            "1",
-            "--expected-revision",
-            "0",
-            "--key",
-            "papertrail-scope",
-            "--as-user",
-            "flynn"
-          ]
-        ] do
-      assert {_output, 0} = System.cmd(ctx.binary, args, cd: ctx.workdir, stderr_to_stdout: true)
-    end
+    assert {_association_output, 0} =
+             System.cmd(
+               ctx.binary,
+               [
+                 "session-po-set",
+                 "--session",
+                 ctx.session.session_key,
+                 "--po-role",
+                 "product-owner:papertrail",
+                 "--key",
+                 "papertrail-association",
+                 "--as-user",
+                 "flynn"
+               ],
+               cd: ctx.workdir,
+               stderr_to_stdout: true
+             )
+
+    assert {_owner_output, 0} =
+             System.cmd(
+               ctx.binary,
+               [
+                 "work-item-update",
+                 item_id,
+                 "--delivery-owner",
+                 ctx.session.session_key,
+                 "--as-user",
+                 "flynn"
+               ],
+               cd: ctx.workdir,
+               stderr_to_stdout: true
+             )
 
     assert :ok = Wakes.fire_due(Tightbeam.WakeScheduler)
     assert_receive {:wake_delivered, association_wake}, 5_000

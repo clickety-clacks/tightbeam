@@ -1607,35 +1607,8 @@ defmodule Tightbeam.AssignmentsTest do
     delegated_item = create_work_item(ctx, "delegated terminal")
     sibling_item = create_work_item(ctx, "sibling terminal")
 
-    assert %{"changed" => true} =
-             DeliveryResponsibilities.handle(ctx.db, %{
-               verb: "delivery-scope-owner-set",
-               origin: "user:flynn",
-               principal: {:user, "flynn"},
-               params: %{
-                 session_key: "delivery-owner",
-                 association_revision: 1,
-                 expected_owner_session_key: nil,
-                 expected_owner_revision: 0,
-                 idempotency_key: "delegated-owner"
-               }
-             })
-
-    for {item, key} <- [{delegated_item, "delegated"}, {sibling_item, "sibling"}] do
-      assert %{"changed" => true} =
-               DeliveryResponsibilities.handle(ctx.db, %{
-                 verb: "work-item-delivery-scope-set",
-                 origin: "user:flynn",
-                 principal: {:user, "flynn"},
-                 params: %{
-                   work_item_id: item.id,
-                   association_session_key: "delivery-owner",
-                   association_revision: 1,
-                   expected_binding_revision: 0,
-                   idempotency_key: "#{key}-scope"
-                 }
-               })
-    end
+    set_delivery_owner(ctx, delegated_item.id, "delivery-owner")
+    set_delivery_owner(ctx, sibling_item.id, "delivery-owner")
 
     delegation =
       terminal_notice_assign_call(
@@ -1644,7 +1617,6 @@ defmodule Tightbeam.AssignmentsTest do
         delegated_item.id
       )
       |> Map.put(:session_key, "notice-parent")
-      |> put_in([:params, :delegates_delivery], true)
       |> then(&handle(ctx, "assign", &1))
 
     assert DeliveryResponsibilities.responsibility(ctx.db, "notice-parent", delegated_item.id) ==

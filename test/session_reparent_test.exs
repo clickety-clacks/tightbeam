@@ -731,32 +731,13 @@ defmodule Tightbeam.SessionReparentTest do
     Roles.create!(ctx.db, "product-owner:reparent", "owner", "lead")
     associate(ctx.db, "lead", "product-owner:reparent", "lead-association")
 
-    assert %{"changed" => true} =
-             DeliveryResponsibilities.handle(ctx.db, %{
-               verb: "delivery-scope-owner-set",
+    assert %{deliveryOwnerSessionKey: "lead"} =
+             Tightbeam.WorkItems.__handle__(ctx.db, "work-item-update", %{
+               verb: "work-item-update",
                origin: "user:owner",
                principal: {:user, "owner"},
-               params: %{
-                 session_key: "lead",
-                 association_revision: 1,
-                 expected_owner_session_key: nil,
-                 expected_owner_revision: 0,
-                 idempotency_key: "lead-owner"
-               }
-             })
-
-    assert %{"changed" => true} =
-             DeliveryResponsibilities.handle(ctx.db, %{
-               verb: "work-item-delivery-scope-set",
-               origin: "user:owner",
-               principal: {:user, "owner"},
-               params: %{
-                 work_item_id: "wi_one",
-                 association_session_key: "lead",
-                 association_revision: 1,
-                 expected_binding_revision: 0,
-                 idempotency_key: "lead-bind"
-               }
+               session_key: nil,
+               params: %{work_item_id: "wi_one", delivery_owner_session_key: "lead"}
              })
 
     assert DeliveryResponsibilities.responsibility(ctx.db, "lead", "wi_one") == "accountable"

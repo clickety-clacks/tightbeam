@@ -63,7 +63,7 @@ defmodule Tightbeam.TerminalCredentialCoreFixture do
     assert view.canonical_statement == expected
     assert view.redirect_destinations == ["alternate"]
 
-    assert {:ok, [["artifact-origin-v1-019"]]} =
+    assert {:ok, [["work-item-delivery-owner-v1-019"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert [readonly] = TerminalCredentialFailure.readonly_views(base)

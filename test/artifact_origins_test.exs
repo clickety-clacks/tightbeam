@@ -155,6 +155,7 @@ defmodule Tightbeam.ArtifactOriginsTest do
       DROP TRIGGER artifacts_origin_immutable;
       ALTER TABLE artifacts DROP COLUMN originHost;
       ALTER TABLE artifacts DROP COLUMN originWorkspace;
+      ALTER TABLE work_items DROP COLUMN deliveryOwnerSessionKey;
       UPDATE schema_stamp SET shape='delivery-owner-reparent-v1-019';
       """)
 
@@ -169,7 +170,9 @@ defmodule Tightbeam.ArtifactOriginsTest do
     assert ArtifactOrigins.resolve(migrated) == {:error, :unknown_origin}
     assert :ok = Schema.ensure_all(db)
     assert Artifacts.get(db, row.artifact_id) == migrated
-    assert {:ok, [["artifact-origin-v1-019"]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok, [["work-item-delivery-owner-v1-019"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
   end
 
   test "migration stamp failure rolls the provenance columns back", %{db: db} do
@@ -178,6 +181,7 @@ defmodule Tightbeam.ArtifactOriginsTest do
       DROP TRIGGER artifacts_origin_immutable;
       ALTER TABLE artifacts DROP COLUMN originHost;
       ALTER TABLE artifacts DROP COLUMN originWorkspace;
+      ALTER TABLE work_items DROP COLUMN deliveryOwnerSessionKey;
       UPDATE schema_stamp SET shape='delivery-owner-reparent-v1-019';
       CREATE TRIGGER reject_origin_stamp BEFORE UPDATE ON schema_stamp
       WHEN NEW.shape='artifact-origin-v1-019'

@@ -5,7 +5,7 @@ defmodule Tightbeam.TerminalCredentialMigrationTest do
 
   @predecessor "stale-turn-settlement-v1-019"
   @terminal_shape "terminal-credential-failure-v1-019"
-  @successor "artifact-origin-v1-019"
+  @successor "work-item-delivery-owner-v1-019"
   @agent_reparent "delivery-owner-reparent-v1-019"
 
   @terminal_objects ~w(
@@ -46,6 +46,7 @@ defmodule Tightbeam.TerminalCredentialMigrationTest do
       DROP TABLE terminal_credential_redirects;
       DROP TABLE terminal_credential_observations;
       DROP TABLE terminal_credential_incidents;
+      ALTER TABLE work_items DROP COLUMN deliveryOwnerSessionKey;
       UPDATE schema_stamp SET shape='#{@predecessor}';
       """)
 

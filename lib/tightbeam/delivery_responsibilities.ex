@@ -395,10 +395,16 @@ defmodule Tightbeam.DeliveryResponsibilities do
   # A direct creator can keep the original human/session intake assignment while
   # the exact WorkItems routing bracket is live. Raw unowned rows without that
   # durable bracket still require an explicit delivery owner.
-  defp ownerless_work_item_intake_assignment?(txn, %{verb: "assign", params: params} = call)
+  defp ownerless_work_item_intake_assignment?(txn, %{verb: "assign"} = call, params)
        when is_map(params) do
     work_item_id = Map.get(params, :work_item_id)
     owner_user_id = ownerless_intake_principal_user(txn, call)
+
+    creator_session_key =
+      case Map.get(call, :principal) do
+        {:session, session_key} when is_binary(session_key) -> session_key
+        _ -> nil
+      end
 
     is_binary(work_item_id) and is_binary(owner_user_id) and
       Enum.all?(supplied_owner_references(params), &is_nil/1) and
@@ -410,14 +416,21 @@ defmodule Tightbeam.DeliveryResponsibilities do
         FROM work_items wi
         JOIN wakes w ON w.wakeId = wi.routingWakeId AND w.work_item_id = wi.id
         WHERE wi.id = ?1 AND wi.state = 'open'
-          AND wi.ownerUserId = ?2 AND wi.createdByUser = ?2
+          AND wi.ownerUserId = ?2
+          AND ((?4 IS NULL AND wi.createdByUser = ?2)
+            OR (?4 IS NOT NULL AND wi.createdBySession = ?4))
           AND wi.deliveryOwnerSessionKey IS NULL
           AND wi.routingWakeId IS NOT NULL
           AND w.origin = 'process:tightbeam' AND w.consumer = 'prompt'
           AND w.sessionKey = ?3 AND w.state IN ('pending','fired')
         LIMIT 1
         """,
-        [work_item_id, owner_user_id, Tightbeam.Org.personal_session_key(owner_user_id)]
+        [
+          work_item_id,
+          owner_user_id,
+          Tightbeam.Org.personal_session_key(owner_user_id),
+          creator_session_key
+        ]
       ) == [[1]]
   end
 
@@ -486,10 +499,15 @@ defmodule Tightbeam.DeliveryResponsibilities do
     review_id = call.params[:reviews_assignment_id]
     txn = Keyword.get(opts, :txn)
 
-    is_struct(txn, Txn) and is_binary(work_item_id) and is_binary(review_id) and
+    is_struct(txn, Txn) and is_binary(review_id) and
+      (is_binary(work_item_id) or is_nil(work_item_id)) and
       Txn.q(
         txn,
-        "SELECT 1 FROM assignments WHERE id=?1 AND workItemId=?2 AND reviewsAssignmentId IS NULL",
+        """
+        SELECT 1 FROM assignments
+        WHERE id=?1 AND (workItemId=?2 OR (workItemId IS NULL AND ?2 IS NULL))
+          AND reviewsAssignmentId IS NULL
+        """,
         [review_id, work_item_id]
       ) == [[1]]
   end
