@@ -126,9 +126,16 @@ defmodule Tightbeam.QueuedMessageSuppression do
               OR
               -- A wake's assignment association is not replacement consent; only
               -- an explicit earlier replacement request makes it a candidate.
+              -- Retry wakes keep the original requestedAt, so a delayed older
+              -- request cannot cancel a newer queued replacement.
               (t.wakeId IS NOT NULL AND w.creatorSessionKey=?4 AND EXISTS (
                 SELECT 1 FROM queued_message_replacement_requests r
                 WHERE r.wakeId=t.wakeId AND r.assignmentId=?3
+                  AND r.requestedAt < (
+                    SELECT incoming.requestedAt
+                    FROM queued_message_replacement_requests incoming
+                    WHERE incoming.wakeId=?6 AND incoming.assignmentId=?3
+                  )
               ))
             )
             AND (t.wakeId IS NULL OR w.wakeId IS NOT NULL)
@@ -137,7 +144,14 @@ defmodule Tightbeam.QueuedMessageSuppression do
             )
           ORDER BY t.seq
           """,
-          [session_key, replacement_seq, assignment_id, sender_session_key, origin]
+          [
+            session_key,
+            replacement_seq,
+            assignment_id,
+            sender_session_key,
+            origin,
+            Map.get(attrs, :wake_id)
+          ]
         )
 
       Enum.reduce(candidates, [], fn row, replaced ->
