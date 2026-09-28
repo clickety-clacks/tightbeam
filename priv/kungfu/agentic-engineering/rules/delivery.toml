@@ -70,6 +70,18 @@ deny_when = [
 ]
 
 [[rule]]
+name = "engineering-assign-production-accountable-owner-target-refused"
+verb = "assign"
+text = "Production work cannot be assigned to the accountable delivery owner. Current delivery owner: {delivery_owner_ref}. Keep that owner accountable and assign an implementation worker instead."
+edges = ["verb"]
+effect = "deny"
+deny_when = [
+  { fact = "assign.is_linked_review", op = "ne", value = true },
+  { fact = "assign.effect_kind", op = "ne", value = "coordination" },
+  { fact = "target.delivery_responsibility", op = "eq", value = "accountable" },
+]
+
+[[rule]]
 name = "engineering-assign-production-needs-topology"
 verb = "assign"
 text = "Production staffing requires returned attributable topology for this work item. Current delivery owner: {delivery_owner_ref}. Record topology-decided on the item, then have that owner or an active exact-item assignment holder retry."
@@ -142,6 +154,17 @@ effect = "deny"
 deny_when = [
   { fact = "assign.effect_kind", op = "ne", value = "coordination" },
   { fact = "target.archetype", op = "in", value = ["product-owner", "pdo"] },
+]
+
+[[rule]]
+name = "engineering-dispatch-production-accountable-owner-target-refused"
+verb = "dispatch"
+text = "Production work cannot be dispatched to the accountable delivery owner. Current delivery owner: {delivery_owner_ref}. Keep that owner accountable and dispatch an implementation worker instead."
+edges = ["verb"]
+effect = "deny"
+deny_when = [
+  { fact = "assign.effect_kind", op = "ne", value = "coordination" },
+  { fact = "target.delivery_responsibility", op = "eq", value = "accountable" },
 ]
 
 [[rule]]
