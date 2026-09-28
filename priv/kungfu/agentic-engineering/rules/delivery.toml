@@ -47,7 +47,7 @@ deny_when = [
 [[rule]]
 name = "engineering-assign-production-needs-delivery-owner"
 verb = "assign"
-text = "Production staffing of work item {work_item_id} requires a current delivery owner. Have the item's human owner/admin or its active Main set the owner with work-item-update --delivery-owner before retrying."
+text = "Production staffing of work item {work_item_id} requires a current delivery owner. Set the intended owner explicitly with work-item-update --delivery-owner before retrying."
 edges = ["verb"]
 effect = "deny"
 deny_when = [
@@ -111,7 +111,7 @@ deny_when = [
 [[rule]]
 name = "engineering-dispatch-production-needs-delivery-owner"
 verb = "dispatch"
-text = "Production staffing of work item {work_item_id} requires a current delivery owner. Have the item's human owner/admin or its active Main set the owner with work-item-update --delivery-owner before retrying."
+text = "Production staffing of work item {work_item_id} requires a current delivery owner. Set the intended owner explicitly with work-item-update --delivery-owner before retrying."
 edges = ["verb"]
 effect = "deny"
 deny_when = [

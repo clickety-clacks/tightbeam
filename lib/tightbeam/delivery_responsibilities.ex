@@ -297,7 +297,7 @@ defmodule Tightbeam.DeliveryResponsibilities do
       is_nil(owner) ->
         refusal(
           "delivery_owner_missing",
-          "work item #{work_item_id} has no recorded delivery owner; its human owner/admin or active Main must set one with work-item-update --delivery-owner before production staffing"
+          "work item #{work_item_id} has no recorded delivery owner; set the intended owner explicitly with work-item-update --delivery-owner before production staffing"
         )
 
       Enum.any?(references, &(&1 != owner["accountableSessionKey"])) ->
@@ -306,7 +306,7 @@ defmodule Tightbeam.DeliveryResponsibilities do
 
         refusal(
           "delivery_owner_mismatch",
-          "work item #{work_item_id} records delivery owner session:#{expected}, not #{supplied}; retry with the recorded owner or update the item through its authorized owner/admin"
+          "work item #{work_item_id} records delivery owner session:#{expected}, not #{supplied}; retry with the recorded owner or explicitly update the link with work-item-update --delivery-owner"
         )
 
       true ->
@@ -323,7 +323,7 @@ defmodule Tightbeam.DeliveryResponsibilities do
   defp owner_available(nil, work_item_id, _call, _opts) do
     refusal(
       "delivery_owner_missing",
-      "work item #{work_item_id} has no recorded delivery owner; its human owner/admin or active Main must set one with work-item-update --delivery-owner before production staffing"
+      "work item #{work_item_id} has no recorded delivery owner; set the intended owner explicitly with work-item-update --delivery-owner before production staffing"
     )
   end
 
@@ -346,7 +346,7 @@ defmodule Tightbeam.DeliveryResponsibilities do
   defp owner_available(%{"accountableSessionKey" => owner}, work_item_id, _call, _opts) do
     refusal(
       "delivery_owner_unavailable",
-      "work item #{work_item_id} records delivery owner session:#{owner}, but that session is unavailable; its human owner/admin should replace the link with work-item-update --delivery-owner before production staffing"
+      "work item #{work_item_id} records delivery owner session:#{owner}, but that session is unavailable; explicitly replace the link with work-item-update --delivery-owner before production staffing"
     )
   end
 

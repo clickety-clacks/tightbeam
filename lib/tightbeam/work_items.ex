@@ -269,8 +269,7 @@ defmodule Tightbeam.WorkItems do
          :ok <- valid_spec_ref(spec_ref_name, spec_ref_sha256),
          :ok <- valid_is_bug(is_bug),
          :ok <- valid_priority(params[:priority]),
-         :ok <- authorize_delivery_owner_update(txn, item, params),
-         :ok <- valid_delivery_owner(txn, item, params) do
+         :ok <- valid_delivery_owner(txn, params) do
       priority = if Map.has_key?(params, :priority), do: params.priority, else: item.priority
 
       updates =
@@ -400,43 +399,13 @@ defmodule Tightbeam.WorkItems do
       else: []
   end
 
-  defp authorize_delivery_owner_update(_txn, _item, params)
+  defp valid_delivery_owner(_txn, params)
        when not is_map_key(params, :delivery_owner_session_key),
        do: :ok
 
-  defp authorize_delivery_owner_update(txn, item, params) do
-    allowed? =
-      case params[:principal] do
-        {:user, user} ->
-          user == item.ownerUserId or admin_user?(txn, user)
+  defp valid_delivery_owner(_txn, %{delivery_owner_session_key: nil}), do: :ok
 
-        {:session, session} ->
-          Txn.q(
-            txn,
-            "SELECT 1 FROM sessions WHERE sessionKey=?1 AND ownerUserId=?2 AND state='active' AND (kind='main' OR sessionKey=?3)",
-            [session, item.ownerUserId, item.deliveryOwnerSessionKey]
-          ) == [[1]]
-
-        _ ->
-          false
-      end
-
-    if allowed?,
-      do: :ok,
-      else:
-        error(
-          "not_authorized",
-          "changing a delivery owner requires the item's human owner/admin, its active Main, or its current active delivery owner"
-        )
-  end
-
-  defp valid_delivery_owner(_txn, _item, params)
-       when not is_map_key(params, :delivery_owner_session_key),
-       do: :ok
-
-  defp valid_delivery_owner(_txn, _item, %{delivery_owner_session_key: nil}), do: :ok
-
-  defp valid_delivery_owner(txn, item, %{delivery_owner_session_key: session_key})
+  defp valid_delivery_owner(txn, %{delivery_owner_session_key: session_key})
        when is_binary(session_key) do
     if String.trim(session_key) == "" do
       error(
@@ -444,17 +413,11 @@ defmodule Tightbeam.WorkItems do
         "deliveryOwnerSessionKey must be an active session or null"
       )
     else
-      case Txn.q(txn, "SELECT ownerUserId,state FROM sessions WHERE sessionKey=?1", [session_key]) do
-        [[owner, _state]] when owner != item.ownerUserId ->
-          error(
-            "cross_owner_scope",
-            "delivery owner session #{session_key} must belong to the work item's human owner"
-          )
-
-        [[_owner, "active"]] ->
+      case Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey=?1", [session_key]) do
+        [["active"]] ->
           :ok
 
-        [[_owner, _state]] ->
+        [[_state]] ->
           error(
             "delivery_owner_unavailable",
             "delivery owner session #{session_key} is not active"
@@ -469,7 +432,7 @@ defmodule Tightbeam.WorkItems do
     end
   end
 
-  defp valid_delivery_owner(_txn, _item, _params),
+  defp valid_delivery_owner(_txn, _params),
     do:
       error("invalid_delivery_owner", "deliveryOwnerSessionKey must be an active session or null")
 

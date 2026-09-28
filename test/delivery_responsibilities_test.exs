@@ -81,76 +81,56 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
     refute DeliveryResponsibilities.current_owner(db, "wi_b1")
   end
 
-  test "only the human owner, admin, actual Main, or active current owner may change an owner link",
+  test "owner updates retain ordinary work-item principal checks without a field-specific permission",
        %{db: db} do
-    for principal <- [{:session, "peer"}, {:session, "foreign-worker"}, {:user, "other"}] do
-      assert %{code: "not_authorized"} = set_owner(db, principal, "wi_a1", "peer")
-      assert is_nil(DeliveryResponsibilities.current_owner(db, "wi_a1"))
+    for principal <- [
+          {:user, "owner"},
+          {:user, "admin"},
+          {:session, "peer"},
+          {:session, "foreign-worker"}
+        ] do
+      assert %{deliveryOwnerSessionKey: "pdo-a"} = set_owner(db, principal, "wi_a1", "pdo-a")
+      assert %{deliveryOwnerSessionKey: "pdo-b"} = set_owner(db, principal, "wi_a1", "pdo-b")
+      assert %{deliveryOwnerSessionKey: nil} = set_owner(db, principal, "wi_a1", nil)
     end
-
-    assert %{deliveryOwnerSessionKey: "pdo-a"} = set_owner(db, {:user, "owner"}, "wi_a1", "pdo-a")
-
-    for principal <- [{:session, "peer"}, {:session, "foreign-worker"}, {:user, "other"}],
-        replacement <- ["peer", nil] do
-      assert %{code: "not_authorized"} = set_owner(db, principal, "wi_a1", replacement)
-
-      assert %{"accountableSessionKey" => "pdo-a"} =
-               DeliveryResponsibilities.current_owner(db, "wi_a1")
-    end
-
-    assert %{deliveryOwnerSessionKey: "pdo-b"} =
-             set_owner(db, {:session, "pdo-a"}, "wi_a1", "pdo-b")
-
-    assert %{code: "not_authorized"} = set_owner(db, {:session, "pdo-a"}, "wi_a1", "pdo-a")
-    assert %{deliveryOwnerSessionKey: nil} = set_owner(db, {:session, "pdo-b"}, "wi_a1", nil)
-    assert %{deliveryOwnerSessionKey: "pdo-a"} = set_owner(db, {:user, "admin"}, "wi_a1", "pdo-a")
-    assert %{deliveryOwnerSessionKey: nil} = set_owner(db, {:user, "owner"}, "wi_a1", nil)
-
-    main = Org.personal_session_key("owner")
-    assert %{deliveryOwnerSessionKey: "pdo-b"} = set_owner(db, {:session, main}, "wi_a1", "pdo-b")
-    {:ok, _} = DB.query(db, "UPDATE sessions SET state='retired' WHERE sessionKey='pdo-b'")
-    assert %{code: "not_authorized"} = set_owner(db, {:session, "pdo-b"}, "wi_a1", "peer")
-    assert %{deliveryOwnerSessionKey: "pdo-a"} = set_owner(db, {:session, main}, "wi_a1", "pdo-a")
-    {:ok, _} = DB.query(db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [main])
-    assert %{code: "not_authorized"} = set_owner(db, {:session, main}, "wi_a1", nil)
-  end
-
-  test "owner links cannot cross human ownership and denied patches have no metadata effect", %{
-    db: db
-  } do
-    set_owner(db, {:user, "owner"}, "wi_a1", "pdo-a")
-
-    for principal <- [{:user, "owner"}, {:user, "admin"}, {:session, "pdo-a"}] do
-      assert %{code: "cross_owner_scope"} = set_owner(db, principal, "wi_a1", "foreign-pdo")
-
-      assert %{"accountableSessionKey" => "pdo-a"} =
-               DeliveryResponsibilities.current_owner(db, "wi_a1")
-    end
-
-    before = WorkItems.__handle__(db, "work-item-get", work_item_call({:user, "owner"}, "wi_a1"))
 
     call = %{
       verb: "work-item-update",
-      origin: "agent:peer",
-      principal: {:session, "peer"},
-      params: %{
-        work_item_id: "wi_a1",
-        title: "Metadata-only title",
-        delivery_owner_session_key: "peer"
-      }
+      origin: "process:test",
+      principal: {:process, "test"},
+      params: %{work_item_id: "wi_a1", delivery_owner_session_key: "pdo-a"}
     }
 
-    assert %{code: "not_authorized"} = WorkItems.__handle__(db, "work-item-update", call)
+    assert %{code: "process_denied"} = WorkItems.__handle__(db, "work-item-update", call)
+    assert is_nil(DeliveryResponsibilities.current_owner(db, "wi_a1"))
+  end
 
-    assert ^before =
-             WorkItems.__handle__(db, "work-item-get", work_item_call({:user, "owner"}, "wi_a1"))
+  test "owner remedy text describes explicit update without an owner-admin permission claim", %{
+    db: db
+  } do
+    assert %{code: "delivery_owner_missing", message: missing} =
+             assign(db, {:session, "peer"}, "worker-a", "wi_a1")
 
-    # Existing metadata authorization is independent from the new owner-link write.
-    assert %{title: "Metadata-only title"} =
-             WorkItems.__handle__(db, "work-item-update", %{
-               call
-               | params: Map.delete(call.params, :delivery_owner_session_key)
-             })
+    assert missing =~ "set the intended owner explicitly with work-item-update --delivery-owner"
+    refute missing =~ "human owner/admin"
+
+    set_owner(db, {:session, "peer"}, "wi_a1", "pdo-a")
+
+    assert %{code: "delivery_owner_mismatch", message: mismatch} =
+             assign(db, {:session, "pdo-a"}, "worker-a", "wi_a1",
+               delivery_owner_ref: "session:pdo-b"
+             )
+
+    assert mismatch =~ "explicitly update the link with work-item-update --delivery-owner"
+    refute mismatch =~ "owner/admin"
+
+    {:ok, _} = DB.query(db, "UPDATE sessions SET state='retired' WHERE sessionKey='pdo-a'")
+
+    assert %{code: "delivery_owner_unavailable", message: unavailable} =
+             assign(db, {:session, "peer"}, "worker-a", "wi_a1")
+
+    assert unavailable =~ "explicitly replace the link with work-item-update --delivery-owner"
+    refute unavailable =~ "human owner/admin"
   end
 
   test "role names, shared human ownership, and ancestry do not elect an owner", %{db: db} do
@@ -473,7 +453,8 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
                )
 
       assert message =~ item_id
-      assert message =~ "human owner/admin or its active Main"
+      assert message =~ "Set the intended owner explicitly"
+      refute message =~ "human owner/admin"
       assert message =~ "work-item-update --delivery-owner"
     end
 
