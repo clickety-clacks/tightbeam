@@ -2005,7 +2005,7 @@ fn send_to_with_timeout(
                     let completed = attempt.fail_transport(&error, &receipt_base);
                     transport_failure_with_attempt(&error, Some(completed.render()), presentation)
                 }
-                None => transport_failure(&error),
+                None => transport_failure_with_attempt(&error, None, presentation),
             });
         }
     };
@@ -2025,8 +2025,7 @@ fn send_to_with_timeout(
                         presentation,
                     )
                 }
-                None if tune => machine_line(flattened(unreadable_error(status, &error))),
-                None => unreadable_response(status, &error),
+                None => unreadable_response_with_attempt(status, &error, None, presentation),
             });
         }
     };
@@ -2053,7 +2052,13 @@ fn send_to_with_timeout(
                     Some(attempt),
                     FailurePresentation::Ordinary,
                 ),
-                None => error.to_string(),
+                None => undecodable_response_with_attempt(
+                    status,
+                    &encoded,
+                    &error,
+                    None,
+                    FailurePresentation::Ordinary,
+                ),
             });
     }
     parse_response_with_attempt(status, &encoded, attempt_render)
@@ -6069,6 +6074,36 @@ mod tests {
         )
     }
 
+    fn local_response(
+        status: u16,
+        body: impl Into<String>,
+        declared_body_bytes: usize,
+    ) -> (Endpoint, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = body.into();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            write!(
+                stream,
+                "HTTP/1.1 {status} Synthetic\r\nContent-Type: application/json\r\nContent-Length: {declared_body_bytes}\r\nConnection: close\r\n\r\n{body}"
+            )
+            .unwrap();
+        });
+        (
+            Endpoint {
+                base: format!("http://{address}"),
+                token: "tbc_test".to_owned(),
+                origin: Origin::Provisioned,
+            },
+            server,
+        )
+    }
+
     #[test]
     fn the_third_outcome_renders_named_and_keeps_the_other_two_intact() {
         // 202 + decisionPending: not a result, not an error. Without its own
@@ -6929,6 +6964,92 @@ mod tests {
         assert_eq!(machine["error"]["code"], "transport_failed");
         assert_eq!(machine["error"]["kind"], "ConnectionFailed");
         assert!(machine.get("httpStatus").is_none(), "{machine}");
+
+        let tune_request = RequestSpec {
+            attempt_context: None,
+            receipt_base_override: None,
+            path: "/dispatch",
+            body_json: r#"{"verb":"tune","params":{}}"#.to_owned(),
+        };
+        let tune_error = send_to(&endpoint, &tune_request).unwrap_err();
+        assert!(
+            !tune_error.contains('\n'),
+            "Tune is one JSON line: {tune_error}"
+        );
+        let tune: Value = serde_json::from_str(&tune_error).unwrap();
+        assert_eq!(tune["ok"], false);
+        assert_eq!(tune["code"], "transport_failed");
+        assert_eq!(tune["kind"], "ConnectionFailed");
+        assert!(tune.get("httpStatus").is_none(), "{tune}");
+    }
+
+    #[test]
+    fn no_attempt_unreadable_callers_preserve_ordinary_and_tune_shapes() {
+        let partial = "Authorization: Bearer fixtureSENTINEL";
+        for (body_json, tune) in [
+            (r#"{"verb":"list","params":{}}"#, false),
+            (r#"{"verb":"tune","params":{}}"#, true),
+        ] {
+            let (endpoint, server) = local_response(503, partial, partial.len() + 20);
+            let request = RequestSpec {
+                attempt_context: None,
+                receipt_base_override: None,
+                path: "/dispatch",
+                body_json: body_json.to_owned(),
+            };
+
+            let rendered = send_to(&endpoint, &request).unwrap_err();
+            server.join().unwrap();
+
+            assert!(!rendered.contains("fixtureSENTINEL"), "{rendered}");
+            if tune {
+                assert!(
+                    !rendered.contains('\n'),
+                    "Tune is one JSON line: {rendered}"
+                );
+                let machine: Value = serde_json::from_str(&rendered).unwrap();
+                assert_eq!(machine["ok"], false);
+                assert_eq!(machine["httpStatus"], 503);
+                assert_eq!(machine["code"], "response_unreadable");
+                assert!(!machine["message"].as_str().unwrap().is_empty());
+            } else {
+                let (human, machine) = readings(&rendered);
+                assert!(!human.is_empty());
+                assert_eq!(machine["ok"], false);
+                assert_eq!(machine["httpStatus"], 503);
+                assert_eq!(machine["error"]["code"], "response_unreadable");
+                assert!(!machine["error"]["message"].as_str().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn no_attempt_version_decode_keeps_status_location_and_redacted_body() {
+        let encoded = "not JSON; Authorization: Bearer fixtureSENTINEL";
+        let (endpoint, server) = local_response(200, encoded, encoded.len());
+        let request = RequestSpec {
+            attempt_context: None,
+            receipt_base_override: None,
+            path: "/version",
+            body_json: "{}".to_owned(),
+        };
+
+        let rendered = send_to(&endpoint, &request).unwrap_err();
+        server.join().unwrap();
+
+        assert!(!rendered.contains("fixtureSENTINEL"), "{rendered}");
+        let (human, machine) = readings(&rendered);
+        assert!(human.contains("HTTP 200"), "{human}");
+        assert_eq!(machine["ok"], false);
+        assert_eq!(machine["httpStatus"], 200);
+        assert_eq!(machine["error"]["code"], "response_undecodable");
+        assert!(machine["error"]["line"].as_u64().is_some());
+        assert!(machine["error"]["column"].as_u64().is_some());
+        assert_eq!(machine["error"]["bodyBytes"], encoded.len());
+        assert_eq!(
+            machine["error"]["body"],
+            "not JSON; Authorization: Bearer [REDACTED:secret_field]"
+        );
     }
 
     #[test]

@@ -313,7 +313,13 @@ fn request_catalog(
                 Some(attempt),
                 FailurePresentation::Ordinary,
             ),
-            None => error.to_string(),
+            None => dispatch::undecodable_response_with_attempt(
+                status,
+                &encoded,
+                &error,
+                None,
+                FailurePresentation::Ordinary,
+            ),
         }));
     }
     parse(&encoded).map_err(CatalogRequestFailure::Projection)
@@ -613,6 +619,51 @@ mod tests {
                     "extra": 7
                 }
             })
+        );
+    }
+
+    #[test]
+    fn a_no_attempt_catalog_decode_failure_keeps_status_and_redacts_body() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = "not JSON; Authorization: Bearer fixtureSENTINEL";
+        let body_bytes = body.len();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(), body
+            )
+            .unwrap();
+        });
+        let endpoint = dispatch::Endpoint {
+            base: format!("http://{address}"),
+            token: "tbc_test".to_owned(),
+            origin: crate::dispatch::Origin::Provisioned,
+        };
+
+        let error = match request_catalog(&endpoint, None, &std::env::temp_dir(), None) {
+            Err(CatalogRequestFailure::Gateway(error)) => error,
+            _ => panic!("expected malformed catalog response"),
+        };
+        server.join().unwrap();
+
+        assert!(!error.contains("fixtureSENTINEL"), "{error}");
+        let (human, machine) = error.split_once('\n').expect("two readings");
+        assert!(human.contains("HTTP 200"), "{human}");
+        let machine: Value = serde_json::from_str(machine).unwrap();
+        assert_eq!(machine["ok"], false);
+        assert_eq!(machine["httpStatus"], 200);
+        assert_eq!(machine["error"]["code"], "response_undecodable");
+        assert_eq!(machine["error"]["bodyBytes"], body_bytes);
+        assert_eq!(
+            machine["error"]["body"],
+            "not JSON; Authorization: Bearer [REDACTED:secret_field]"
         );
     }
 }
