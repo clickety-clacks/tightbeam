@@ -1,32 +1,51 @@
 defmodule Tightbeam.WorkspaceCleanup do
   @moduledoc false
 
-  alias Tightbeam.{ArtifactOrigins, EventLog}
+  alias Tightbeam.{ArtifactOrigins, DB, EventLog}
   alias Tightbeam.DB.Txn
 
-  @ssh_opts ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
+  @ssh_opts [
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "ConnectTimeout=5",
+    "-o",
+    "ServerAliveInterval=5",
+    "-o",
+    "ServerAliveCountMax=2"
+  ]
+  @default_runner_timeout_ms 900_000
 
   @doc false
   def reap(db, opts) do
     session_key = Keyword.fetch!(opts, :session_key)
 
-    try do
-      case GenServer.call(db, {:transaction, fn txn -> reap_in_txn(txn, opts) end}, :infinity) do
-        {:ok, report} ->
-          report
+    report =
+      try do
+        case DB.transaction(db, fn txn -> cleanup_plan_in_txn(txn, opts) end) do
+          {:ok, {:ok, plan}} ->
+            run_cleanup_plan(plan, opts)
 
-        {:error, reason} ->
-          incomplete_report(db, opts, "cleanup_transaction_failed", inspect(reason))
+          {:ok, {:error, blocker}} ->
+            blocked_report(opts, blocker)
+
+          {:error, reason} ->
+            failed_report(opts, "cleanup_plan_failed", inspect(reason))
+        end
+      rescue
+        error ->
+          failed_report(opts, "cleanup_plan_failed", Exception.message(error))
+      catch
+        kind, reason ->
+          failed_report(opts, "cleanup_plan_failed", "#{kind}: #{inspect(reason)}")
       end
-    rescue
-      error ->
-        incomplete_report(db, opts, "cleanup_transaction_failed", Exception.message(error))
-    catch
-      kind, reason ->
-        incomplete_report(db, opts, "cleanup_transaction_failed", "#{kind}: #{inspect(reason)}")
-    end
-    |> Map.put_new(:session_key, session_key)
+      |> Map.put_new(:session_key, session_key)
+
+    record_report(db, report)
   end
+
+  @doc false
+  def default_runner_timeout_ms, do: @default_runner_timeout_ms
 
   @doc false
   def system_runner(invocation, _script, input) do
@@ -54,79 +73,110 @@ defmodule Tightbeam.WorkspaceCleanup do
     end
   end
 
-  defp reap_in_txn(txn, opts) do
+  defp cleanup_plan_in_txn(txn, opts) do
     session_key = Keyword.fetch!(opts, :session_key)
     host_name = Keyword.fetch!(opts, :host_name)
     requested_workspace = Keyword.fetch!(opts, :workspace)
 
-    report =
-      try do
-        with {:ok, host, hosts, workspace} <-
-               current_route(txn, session_key, host_name, requested_workspace, opts),
-             {:ok, keep} <- protection_plan(txn, host_name, host, hosts, workspace),
-             {:ok, execution} <- execute(host, workspace, keep, Keyword.get(opts, :runner)) do
-          Map.merge(execution, %{
-            session_key: session_key,
-            host: host_name,
-            workspace: workspace,
-            preserved_artifacts: keep.artifacts
-          })
-        else
-          {:error, blocker} ->
-            %{
-              status: "incomplete",
-              session_key: session_key,
-              host: host_name,
-              workspace: requested_workspace,
-              removed_paths: [],
-              removed_paths_complete: true,
-              result_confirmed: true,
-              preserved_artifacts: [],
-              blockers: [blocker]
-            }
-        end
-      rescue
-        error ->
-          %{
-            status: "incomplete",
-            session_key: session_key,
-            host: host_name,
-            workspace: requested_workspace,
-            removed_paths: [],
-            removed_paths_complete: false,
-            result_confirmed: false,
-            preserved_artifacts: [],
-            blockers: [%{reason: "cleanup_failed", detail: Exception.message(error)}]
-          }
-      catch
-        kind, reason ->
-          %{
-            status: "incomplete",
-            session_key: session_key,
-            host: host_name,
-            workspace: requested_workspace,
-            removed_paths: [],
-            removed_paths_complete: false,
-            result_confirmed: false,
-            preserved_artifacts: [],
-            blockers: [%{reason: "cleanup_failed", detail: "#{kind}: #{inspect(reason)}"}]
-          }
-      end
+    with {:ok, host, hosts, workspace} <-
+           current_route(txn, session_key, host_name, requested_workspace, opts),
+         {:ok, keep} <- protection_plan(txn, host_name, host, hosts, workspace) do
+      {:ok,
+       %{
+         session_key: session_key,
+         host_name: host_name,
+         host: host,
+         hosts: hosts,
+         workspace: workspace,
+         keep: keep
+       }}
+    end
+  end
 
+  defp run_cleanup_plan(plan, opts) do
+    case execute(
+           plan.host,
+           plan.workspace,
+           plan.keep,
+           Keyword.get(opts, :runner),
+           Keyword.get(opts, :runner_timeout_ms, @default_runner_timeout_ms)
+         ) do
+      {:ok, execution} ->
+        Map.merge(execution, %{
+          session_key: plan.session_key,
+          host: plan.host_name,
+          workspace: plan.workspace,
+          preserved_artifacts: plan.keep.artifacts
+        })
+
+      {:error, blocker} ->
+        blocked_report(opts, blocker)
+    end
+  rescue
+    error ->
+      failed_report(opts, "cleanup_failed", Exception.message(error))
+  catch
+    kind, reason ->
+      failed_report(opts, "cleanup_failed", "#{kind}: #{inspect(reason)}")
+  end
+
+  defp blocked_report(opts, blocker) do
+    %{
+      status: "incomplete",
+      session_key: Keyword.get(opts, :session_key),
+      host: Keyword.get(opts, :host_name),
+      workspace: Keyword.get(opts, :workspace),
+      removed_paths: [],
+      removed_paths_complete: true,
+      result_confirmed: true,
+      preserved_artifacts: [],
+      blockers: [blocker]
+    }
+  end
+
+  defp failed_report(opts, reason, detail) do
+    %{
+      status: "incomplete",
+      session_key: Keyword.get(opts, :session_key),
+      host: Keyword.get(opts, :host_name),
+      workspace: Keyword.get(opts, :workspace),
+      removed_paths: [],
+      removed_paths_complete: false,
+      result_confirmed: false,
+      preserved_artifacts: [],
+      blockers: [%{reason: reason, detail: detail}]
+    }
+  end
+
+  defp record_report(db, report) do
     kind =
       if report.status == "completed",
         do: "retired_workspace_cleanup_completed",
         else: "retired_workspace_cleanup_incomplete"
 
-    EventLog.lifecycle_in_txn(txn, kind, session_key, JSON.encode!(report))
+    EventLog.lifecycle(db, kind, report.session_key, JSON.encode!(report))
     report
+  rescue
+    error ->
+      blocker = %{reason: "cleanup_result_record_failed", detail: Exception.message(error)}
+
+      report
+      |> Map.put(:status, "incomplete")
+      |> Map.update(:blockers, [blocker], &(&1 ++ [blocker]))
+  catch
+    kind, reason ->
+      blocker = %{reason: "cleanup_result_record_failed", detail: "#{kind}: #{inspect(reason)}"}
+
+      report
+      |> Map.put(:status, "incomplete")
+      |> Map.update(:blockers, [blocker], &(&1 ++ [blocker]))
   end
 
   defp current_route(txn, session_key, host_name, requested_workspace, opts) do
-    session_host =
-      case Txn.q(txn, "SELECT host FROM sessions WHERE sessionKey=?1", [session_key]) do
-        [[host]] -> host
-        [] -> nil
+    {session_host, session_state} =
+      case Txn.q(txn, "SELECT host, state FROM sessions WHERE sessionKey=?1", [session_key]) do
+        [[host, state]] -> {host, state}
+        [] -> {nil, nil}
       end
 
     local_host_name = Tightbeam.Placement.local_host_name()
@@ -151,6 +201,7 @@ defmodule Tightbeam.WorkspaceCleanup do
       end
 
     with true <- session_host == host_name,
+         true <- session_state == "retired",
          true <- is_map(host),
          expected <- Keyword.fetch!(opts, :host),
          true <- host.ssh == expected.ssh and host.base_dir == expected.base_dir,
@@ -163,6 +214,7 @@ defmodule Tightbeam.WorkspaceCleanup do
          %{
            reason: "retirement_route_changed",
            session_host: session_host,
+           session_state: session_state,
            requested_host: host_name
          }}
     end
@@ -296,43 +348,69 @@ defmodule Tightbeam.WorkspaceCleanup do
     end
   end
 
-  defp execute(host, workspace, keep, runner) do
-    if contains_line_break?(workspace) do
-      {:error, %{reason: "workspace_path_unrepresentable"}}
-    else
-      script = cleanup_script(Path.expand(workspace))
-      manifest = if keep.paths == [], do: "", else: Enum.join(keep.paths, "\n") <> "\n"
+  defp execute(host, workspace, keep, runner, timeout_ms) do
+    cond do
+      contains_line_break?(workspace) ->
+        {:error, %{reason: "workspace_path_unrepresentable"}}
 
-      invocation =
-        case host.ssh do
-          nil ->
-            ["sh", "-c", script]
+      not (is_integer(timeout_ms) and timeout_ms > 0) ->
+        {:error, %{reason: "cleanup_runner_timeout_invalid"}}
 
-          ssh when is_binary(ssh) and ssh != "" ->
-            ["ssh" | @ssh_opts] ++ [ssh, "sh", "-lc", shell_quote(script)]
+      true ->
+        script = cleanup_script(Path.expand(workspace))
+        manifest = if keep.paths == [], do: "", else: Enum.join(keep.paths, "\n") <> "\n"
 
-          _ ->
-            nil
-        end
+        invocation =
+          case host.ssh do
+            nil ->
+              ["sh", "-c", script]
 
-      if is_nil(invocation) do
-        {:error, %{reason: "retirement_host_unavailable"}}
-      else
-        runner =
-          runner ||
-            Application.get_env(:tightbeam, :workspace_cleanup_runner, &system_runner/3)
+            ssh when is_binary(ssh) and ssh != "" ->
+              ["ssh" | @ssh_opts] ++ [ssh, "sh", "-lc", shell_quote(script)]
 
-        response =
-          try do
-            runner.(invocation, script, manifest)
-          rescue
-            error -> {:runner_exception, Exception.message(error)}
-          catch
-            kind, reason -> {:runner_exception, "#{kind}: #{inspect(reason)}"}
+            _ ->
+              nil
           end
 
-        {:ok, execution_report(response)}
-      end
+        if is_nil(invocation) do
+          {:error, %{reason: "retirement_host_unavailable"}}
+        else
+          runner =
+            runner ||
+              Application.get_env(:tightbeam, :workspace_cleanup_runner, &system_runner/3)
+
+          response = run_bounded(runner, invocation, script, manifest, timeout_ms)
+
+          {:ok, execution_report(response)}
+        end
+    end
+  end
+
+  defp run_bounded(runner, invocation, script, manifest, timeout_ms) do
+    task =
+      Task.async_nolink(fn ->
+        try do
+          {:runner_result, runner.(invocation, script, manifest)}
+        rescue
+          error -> {:runner_exception, Exception.message(error)}
+        catch
+          kind, reason -> {:runner_exception, "#{kind}: #{inspect(reason)}"}
+        end
+      end)
+
+    case Task.yield(task, timeout_ms) do
+      {:ok, {:runner_result, response}} ->
+        response
+
+      {:ok, {:runner_exception, detail}} ->
+        {:runner_exception, detail}
+
+      {:exit, reason} ->
+        {:runner_exception, inspect(reason)}
+
+      nil ->
+        _ = Task.shutdown(task, :brutal_kill)
+        {:runner_timeout, timeout_ms}
     end
   end
 
@@ -369,6 +447,17 @@ defmodule Tightbeam.WorkspaceCleanup do
       removed_paths: [],
       removed_paths_complete: false,
       blockers: [%{reason: "cleanup_runner_failed", detail: detail}],
+      result_confirmed: false
+    }
+  end
+
+  defp execution_report({:runner_timeout, timeout_ms}) do
+    %{
+      status: "incomplete",
+      removed_paths: [],
+      removed_paths_complete: false,
+      blockers: [%{reason: "cleanup_runner_timeout", timeout_ms: timeout_ms}],
+      diagnostics: [],
       result_confirmed: false
     }
   end
@@ -468,6 +557,37 @@ defmodule Tightbeam.WorkspaceCleanup do
         *) return 1 ;;
       esac
     }
+
+    exact_keep_path() (
+      set +f
+      keep_path=$1
+      [ "$keep_path" = . ] && return 0
+      parent_rel=
+      rest=$keep_path
+      while [ -n "$rest" ]; do
+        case "$rest" in
+          */*) component=\${rest%%/*}; rest=\${rest#*/}; has_more=1 ;;
+          *) component=$rest; rest=; has_more=0 ;;
+        esac
+        [ -n "$component" ] || return 1
+        parent="$root\${parent_rel:+/$parent_rel}"
+        [ -d "$parent" ] && [ ! -L "$parent" ] || return 1
+        found=0
+        for entry in "$parent"/* "$parent"/.[!.]* "$parent"/..?*; do
+          [ -e "$entry" ] || [ -L "$entry" ] || continue
+          if [ "\${entry##*/}" = "$component" ]; then
+            found=1
+            break
+          fi
+        done
+        [ "$found" -eq 1 ] || return 1
+        parent_rel=\${parent_rel:+$parent_rel/}$component
+        if [ "$has_more" -eq 1 ]; then
+          [ -d "$root/$parent_rel" ] && [ ! -L "$root/$parent_rel" ] || return 1
+        fi
+      done
+      return 0
+    )
 
     verify_route() {
       [ ! -L "$root" ] || return 1
@@ -575,12 +695,15 @@ defmodule Tightbeam.WorkspaceCleanup do
           if [ ! -e "$root/$keep" ] && [ ! -L "$root/$keep" ]; then
             emit_error artifact_missing "$keep"
             had_error=1
+          elif ! exact_keep_path "$keep"; then
+            emit_error artifact_path_spelling_mismatch "$keep"
+            had_error=1
           fi
         done
         set +f
         IFS=$saved_ifs
 
-        if ! is_protected .; then
+        if [ "$had_error" -eq 0 ] && ! is_protected .; then
           if cleanup_dir ""; then :; else had_error=1; fi
         fi
 
@@ -604,35 +727,6 @@ defmodule Tightbeam.WorkspaceCleanup do
       exit 2
     fi
     """
-  end
-
-  defp incomplete_report(db, opts, reason, detail) do
-    report = %{
-      status: "incomplete",
-      session_key: Keyword.get(opts, :session_key),
-      host: Keyword.get(opts, :host_name),
-      workspace: Keyword.get(opts, :workspace),
-      removed_paths: [],
-      removed_paths_complete: false,
-      result_confirmed: false,
-      preserved_artifacts: [],
-      blockers: [%{reason: reason, detail: detail}]
-    }
-
-    try do
-      EventLog.lifecycle(
-        db,
-        "retired_workspace_cleanup_incomplete",
-        to_string(Keyword.get(opts, :session_key, "unknown")),
-        JSON.encode!(report)
-      )
-    rescue
-      _ -> :ok
-    catch
-      _, _ -> :ok
-    end
-
-    report
   end
 
   defp contains_line_break?(value),

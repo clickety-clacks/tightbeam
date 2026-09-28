@@ -8287,11 +8287,19 @@ defmodule Tightbeam.Gateway do
 
     cond do
       prior && prior.session_key == call.session_key ->
-        retire_replay_observation(db, call, %{
-          deleted_session_key: call.session_key,
-          retired_session_keys: retired_subtree_keys(db, call.session_key),
-          deferred: []
-        })
+        retired_keys = retired_subtree_keys(db, call.session_key)
+
+        retire_replay_with_cleanup(
+          config,
+          db,
+          call,
+          %{
+            deleted_session_key: call.session_key,
+            retired_session_keys: retired_keys,
+            deferred: []
+          },
+          retired_keys
+        )
 
       true ->
         case Org.get(db, call.session_key) do
@@ -8362,11 +8370,17 @@ defmodule Tightbeam.Gateway do
                 workspace_cleanup: cleanup_reports
               }
             else
-              retire_replay_observation(db, call, %{
-                deleted_session_key: session.session_key,
-                retired_session_keys: [],
-                deferred: []
-              })
+              retire_replay_with_cleanup(
+                config,
+                db,
+                call,
+                %{
+                  deleted_session_key: session.session_key,
+                  retired_session_keys: [],
+                  deferred: []
+                },
+                retired_subtree_keys(db, session.session_key)
+              )
             end
 
           _ ->
@@ -8382,6 +8396,46 @@ defmodule Tightbeam.Gateway do
       end)
 
     result
+  end
+
+  defp retire_replay_with_cleanup(config, db, call, result, session_keys) do
+    result = retire_replay_observation(db, call, result)
+    reports = retry_incomplete_retired_workspaces(config, db, session_keys)
+
+    if reports == [], do: result, else: Map.put(result, :workspace_cleanup, reports)
+  end
+
+  defp retry_incomplete_retired_workspaces(config, db, session_keys) do
+    Enum.flat_map(session_keys, fn session_key ->
+      case Org.get(db, session_key) do
+        %{state: "retired"} ->
+          if last_workspace_cleanup_incomplete?(db, session_key) do
+            [cleanup_retired_workspace(config, db, session_key)]
+          else
+            []
+          end
+
+        _ ->
+          []
+      end
+    end)
+  end
+
+  defp last_workspace_cleanup_incomplete?(db, session_key) do
+    case DB.query(
+           db,
+           """
+           SELECT kind FROM lifecycle_events
+           WHERE subject=?1
+             AND kind IN ('retired_workspace_cleanup_completed',
+                          'retired_workspace_cleanup_incomplete')
+           ORDER BY id DESC LIMIT 1
+           """,
+           [session_key]
+         ) do
+      {:ok, [["retired_workspace_cleanup_incomplete"]]} -> true
+      _ -> false
+    end
   end
 
   defp critical_result(config, db, call) do
@@ -8609,7 +8663,13 @@ defmodule Tightbeam.Gateway do
               host: host,
               hosts: hosts,
               workspace: Placement.workdir_path(config, session),
-              runner: Map.get(config, :workspace_cleanup_runner)
+              runner: Map.get(config, :workspace_cleanup_runner),
+              runner_timeout_ms:
+                Map.get(
+                  config,
+                  :workspace_cleanup_timeout_ms,
+                  WorkspaceCleanup.default_runner_timeout_ms()
+                )
             )
 
           nil ->

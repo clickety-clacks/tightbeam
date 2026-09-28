@@ -191,49 +191,48 @@ defmodule Tightbeam.Artifacts do
         case DB.transaction_then(
                db,
                fn txn ->
-                 case validate_producer_in_txn(txn, producer_id, session_key, work_item_id) do
-                   :ok ->
-                     {origin_host, origin_workspace} =
-                       ArtifactOrigins.registration_context(txn, call)
+                 with :ok <- validate_session_active_in_txn(txn, session_key),
+                      :ok <- validate_producer_in_txn(txn, producer_id, session_key, work_item_id) do
+                   {origin_host, origin_workspace} =
+                     ArtifactOrigins.registration_context(txn, call)
 
-                     reserve_version_in_txn(txn, artifact_id)
+                   reserve_version_in_txn(txn, artifact_id)
 
-                     Txn.q(
-                       txn,
-                       """
-                       INSERT INTO artifacts
-                         (artifactId, kind, title, description, createdBySession, workItemId,
-                          producedByAssignmentId, parentSession, originPath, contentSha256,
-                          recordedMessageId, recordedTurnEvidence, state, home, createdAt, updatedAt,
-                          originHost, originWorkspace)
-                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                               'in-workspace', NULL, ?13, ?13, ?14, ?15)
-                       """,
-                       [
-                         artifact_id,
-                         call.params.kind,
-                         call.params.title,
-                         call.params[:description],
-                         session_key,
-                         work_item_id,
-                         producer_id,
-                         parent_session,
-                         call.params.origin_path,
-                         call.params[:content_sha256],
-                         recorded_message_id,
-                         evidence,
-                         now,
-                         origin_host,
-                         origin_workspace
-                       ]
-                     )
+                   Txn.q(
+                     txn,
+                     """
+                     INSERT INTO artifacts
+                       (artifactId, kind, title, description, createdBySession, workItemId,
+                        producedByAssignmentId, parentSession, originPath, contentSha256,
+                        recordedMessageId, recordedTurnEvidence, state, home, createdAt, updatedAt,
+                        originHost, originWorkspace)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                             'in-workspace', NULL, ?13, ?13, ?14, ?15)
+                     """,
+                     [
+                       artifact_id,
+                       call.params.kind,
+                       call.params.title,
+                       call.params[:description],
+                       session_key,
+                       work_item_id,
+                       producer_id,
+                       parent_session,
+                       call.params.origin_path,
+                       call.params[:content_sha256],
+                       recorded_message_id,
+                       evidence,
+                       now,
+                       origin_host,
+                       origin_workspace
+                     ]
+                   )
 
-                     Publisher.maybe_observed_accepted_in_txn(txn, call)
-                     publish_in_txn(txn, "artifact.recorded", artifact_id, call)
-                     {:created, artifact_in_txn(txn, artifact_id)}
-
-                   error ->
-                     error
+                   Publisher.maybe_observed_accepted_in_txn(txn, call)
+                   publish_in_txn(txn, "artifact.recorded", artifact_id, call)
+                   {:created, artifact_in_txn(txn, artifact_id)}
+                 else
+                   error -> error
                  end
                end,
                fn txn, result ->
@@ -273,6 +272,16 @@ defmodule Tightbeam.Artifacts do
 
       _ ->
         %{code: "invalid", message: "artifact-record requires a session caller"}
+    end
+  end
+
+  defp validate_session_active_in_txn(txn, session_key) do
+    case Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey=?1", [session_key]) do
+      [["active"]] ->
+        :ok
+
+      _ ->
+        %{code: "session_not_active", message: "artifact-record requires an active session"}
     end
   end
 
