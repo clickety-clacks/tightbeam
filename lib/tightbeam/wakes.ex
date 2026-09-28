@@ -203,6 +203,12 @@ defmodule Tightbeam.Wakes do
   );
   CREATE INDEX IF NOT EXISTS wake_retry_root
     ON wake_retry_attempts (rootWakeId, attempt);
+  """
+
+  # AC4's retry guard is current-build storage. Do not install it during the
+  # historical bootstrap pass: a later predecessor migration may refuse, and
+  # that refusal must leave the predecessor's object set intact.
+  @health_redelivery_ddl """
   CREATE TABLE IF NOT EXISTS health_redelivery_attempts (
     idempotencyKey TEXT PRIMARY KEY CHECK(length(trim(idempotencyKey)) > 0),
     sessionKey TEXT NOT NULL CHECK(length(trim(sessionKey)) > 0),
@@ -236,6 +242,15 @@ defmodule Tightbeam.Wakes do
 
   @spec ensure_schema(db()) :: :ok | {:error, term()}
   def ensure_schema(db \\ Tightbeam.DB) do
+    with :ok <- ensure_historical_schema(db),
+         :ok <- DB.execute(db, @health_redelivery_ddl) do
+      :ok
+    end
+  end
+
+  @doc false
+  @spec ensure_historical_schema(db()) :: :ok | {:error, term()}
+  def ensure_historical_schema(db \\ Tightbeam.DB) do
     with :ok <- DB.execute(db, @ddl) do
       if RuleRuntime.loaded?(), do: activate_wait_recognition(db), else: :ok
     end
