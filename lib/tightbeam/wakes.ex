@@ -212,6 +212,8 @@ defmodule Tightbeam.Wakes do
   CREATE TABLE IF NOT EXISTS health_redelivery_attempts (
     idempotencyKey TEXT PRIMARY KEY CHECK(length(trim(idempotencyKey)) > 0),
     sessionKey TEXT NOT NULL CHECK(length(trim(sessionKey)) > 0),
+    sourceHarness TEXT NOT NULL CHECK(length(trim(sourceHarness)) > 0),
+    sourceHost TEXT NOT NULL CHECK(length(trim(sourceHost)) > 0),
     sourceMessageId TEXT NOT NULL CHECK(length(trim(sourceMessageId)) > 0),
     sourceTurnSeq INTEGER NOT NULL REFERENCES turns(seq),
     sourceWakeId TEXT,
@@ -223,7 +225,8 @@ defmodule Tightbeam.Wakes do
     jobRef TEXT,
     requestRef TEXT,
     failureClass TEXT NOT NULL CHECK(failureClass IN (
-      'auth-dead','rate-limit-dead','adapter_unavailable','model_unavailable','task_crash'
+      'auth-dead','rate-limit-dead','adapter_unavailable','model_unavailable','task_crash',
+      'unclassified'
     )),
     restorationTurnSeq INTEGER REFERENCES turns(seq),
     redeliveryTurnSeq INTEGER UNIQUE REFERENCES turns(seq),
@@ -233,7 +236,7 @@ defmodule Tightbeam.Wakes do
     CHECK((restorationTurnSeq IS NULL) = (redeliveryTurnSeq IS NULL))
   );
   CREATE INDEX IF NOT EXISTS health_redelivery_pending
-    ON health_redelivery_attempts (sessionKey, failureClass, sourceTurnSeq)
+    ON health_redelivery_attempts (sourceHarness, sourceHost, sourceTurnSeq)
     WHERE redeliveryTurnSeq IS NULL;
   """
 
@@ -3031,15 +3034,16 @@ defmodule Tightbeam.Wakes do
                "rate-limit-dead",
                "adapter_unavailable",
                "model_unavailable",
-               "task_crash"
+               "task_crash",
+               "unclassified"
              ] do
     case Txn.q(
            txn,
            """
-           SELECT sessionKey,messageId,wakeId,origin,prompt,roleRef,roleFallback,
-                  assignmentId,jobRef,requestRef
-           FROM turns
-           WHERE seq=?1 AND status='failed' AND messageId IS NOT NULL
+           SELECT t.sessionKey,t.messageId,t.wakeId,t.origin,t.prompt,t.roleRef,t.roleFallback,
+                  t.assignmentId,t.jobRef,t.requestRef,s.harness,s.host
+           FROM turns t JOIN sessions s ON s.sessionKey=t.sessionKey
+           WHERE t.seq=?1 AND t.status='failed' AND t.messageId IS NOT NULL
            """,
            [source_turn_seq]
          ) do
@@ -3054,22 +3058,28 @@ defmodule Tightbeam.Wakes do
           role_fallback,
           assignment_id,
           job_ref,
-          request_ref
+          request_ref,
+          source_harness,
+          source_host
         ]
-      ] ->
+      ]
+      when is_binary(source_harness) and is_binary(source_host) ->
         idempotency_key = health_redelivery_key(session_key, source_turn_seq)
 
         Txn.q(
           txn,
           """
           INSERT OR IGNORE INTO health_redelivery_attempts
-            (idempotencyKey,sessionKey,sourceMessageId,sourceTurnSeq,sourceWakeId,origin,prompt,
-             roleRef,roleFallback,assignmentId,jobRef,requestRef,failureClass,createdAt)
-          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
+            (idempotencyKey,sessionKey,sourceHarness,sourceHost,sourceMessageId,sourceTurnSeq,
+             sourceWakeId,origin,prompt,roleRef,roleFallback,assignmentId,jobRef,requestRef,
+             failureClass,createdAt)
+          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
           """,
           [
             idempotency_key,
             session_key,
+            source_harness,
+            source_host,
             message_id,
             source_turn_seq,
             wake_id,
@@ -3089,6 +3099,53 @@ defmodule Tightbeam.Wakes do
 
       [] ->
         :ok
+
+      [_] ->
+        :ok
+    end
+  end
+
+  @doc false
+  @spec redeliver_pending_health_intents_in_txn(Txn.t(), map(), map()) :: non_neg_integer()
+  def redeliver_pending_health_intents_in_txn(%Txn{} = txn, session, turn)
+      when is_map(session) and is_map(turn) do
+    harness = to_string(session.harness)
+    host = session.host
+    restoration_turn_seq = Map.fetch!(turn, :seq)
+
+    if is_binary(host) and String.trim(host) != "" do
+      Txn.q(
+        txn,
+        """
+        SELECT a.idempotencyKey,a.sessionKey,a.sourceMessageId,a.sourceTurnSeq,
+               a.sourceWakeId,a.origin,a.prompt,a.roleRef,a.roleFallback,a.assignmentId,
+               a.jobRef,a.requestRef
+        FROM health_redelivery_attempts a
+        WHERE a.sourceHarness=?1
+          AND a.sourceHost=?2
+          AND a.redeliveryTurnSeq IS NULL
+          AND NOT EXISTS (
+            SELECT 1
+            FROM harness_health_observations observation
+            JOIN harness_health_incidents incident ON incident.id=observation.incidentId
+            WHERE observation.correlationId =
+              'harness-turn:' || a.sourceTurnSeq || ':' || a.failureClass
+              AND observation.evidenceKind='terminal-failure'
+              AND incident.state='open'
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM wake_retry_attempts retry
+            WHERE retry.sourceTurnSeq=a.sourceTurnSeq AND retry.retryWakeId IS NOT NULL
+          )
+        ORDER BY a.sourceTurnSeq
+        """,
+        [harness, host]
+      )
+      |> Enum.reduce(0, fn source, count ->
+        count + redeliver_health_source_in_txn(txn, source, restoration_turn_seq)
+      end)
+    else
+      0
     end
   end
 

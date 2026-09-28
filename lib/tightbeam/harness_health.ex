@@ -1059,6 +1059,10 @@ defmodule Tightbeam.HarnessHealth do
   def observe_turn_failure_in_txn(%Txn{} = txn, session, turn, failed_stage, reason) do
     case classify_turn_failure(reason) do
       nil ->
+        # The terminal failure path has no assistant output. Preserve a
+        # message-bearing unclassified failure so the next successful turn on
+        # this harness and host can act as the bounded recovery signal.
+        Wakes.record_health_redelivery_source_in_txn(txn, turn.seq, "unclassified")
         nil
 
       failure_class ->
@@ -1187,6 +1191,8 @@ defmodule Tightbeam.HarnessHealth do
         end
       end
     end)
+
+    Wakes.redeliver_pending_health_intents_in_txn(txn, session, turn)
 
     :ok
   end
