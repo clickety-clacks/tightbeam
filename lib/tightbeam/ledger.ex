@@ -127,7 +127,9 @@ defmodule Tightbeam.Ledger do
     ON turn_clear_attempts (turnSeq, createdAt);
   """
 
-  @ddl @historical_ddl <> @clear_attempts_ddl
+  @ddl @historical_ddl <>
+         @clear_attempts_ddl <>
+         "CREATE INDEX IF NOT EXISTS turns_message_id ON turns(messageId);"
 
   @doc false
   @spec ensure_historical_schema(db()) :: :ok | {:error, term()}

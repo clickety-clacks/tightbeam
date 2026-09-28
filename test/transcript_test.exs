@@ -20,7 +20,9 @@ defmodule Tightbeam.TranscriptTest do
     DB,
     Dispatch,
     Gateway,
+    Ledger,
     Org,
+    Schema,
     Transcript
   }
 
@@ -464,6 +466,68 @@ defmodule Tightbeam.TranscriptTest do
     assert Enum.filter(qualified, &(elem(&1, 2) == :enqueue)) == []
   end
 
+  test "turns_message_id boot preserves transcript rows and selects the named index", ctx do
+    turns =
+      for index <- 1..250 do
+        prompt_id = message!(ctx.db, "owned", "user", "indexed prompt #{index}")
+        seq = turn!(ctx.db, "owned", prompt_id, model: "fable", harness: "claude")
+        %{id: prompt_id, seq: seq}
+      end
+
+    reply_id =
+      message!(ctx.db, "owned", "assistant", "reply to first prompt",
+        reply_to: hd(turns).id,
+        sender: "tightbeam"
+      )
+
+    [first_turn, last_turn] = [hd(turns).seq, List.last(turns).seq]
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE turns SET status='delivered',startedAt=1,endedAt=2 WHERE seq IN (?1,?2)",
+        [first_turn, last_turn]
+      )
+
+    assert Enum.map(Ledger.unpublished_terminals(ctx.db), & &1.seq) == [first_turn, last_turn]
+
+    expected_ids = Enum.map(turns, & &1.id) ++ [reply_id]
+    indexed_before = read(ctx, %{session_key: "owned", limit: 500})
+    assert Enum.map(indexed_before.messages, & &1.id) == expected_ids
+    assert hd(indexed_before.messages).turn_seq == hd(turns).seq
+
+    :ok = DB.execute(ctx.db, "DROP INDEX turns_message_id")
+    without_index = read(ctx, %{session_key: "owned", limit: 500})
+    assert without_index.messages == indexed_before.messages
+    before_plan = transcript_join_plan(ctx.db)
+    assert Enum.any?(before_plan, &String.contains?(&1, "SCAN t"))
+
+    # Model a 0.1.8 database where the exact live-safe index was installed first.
+    :ok = DB.execute(ctx.db, "CREATE INDEX IF NOT EXISTS turns_message_id ON turns(messageId)")
+    :ok = Schema.ensure_all(ctx.db)
+
+    with_index = read(ctx, %{session_key: "owned", limit: 500})
+    assert with_index.messages == indexed_before.messages
+    assert Enum.at(with_index.messages, -1).turn_seq == hd(turns).seq
+    assert_indexed_transcript_plan(transcript_join_plan(ctx.db))
+    assert Enum.map(Ledger.unpublished_terminals(ctx.db), & &1.seq) == [first_turn, last_turn]
+
+    # A database without the early index also receives it through the normal
+    # schema boot path, with all stored rows and transcript fields intact.
+    :ok = DB.execute(ctx.db, "DROP INDEX turns_message_id")
+    :ok = Schema.ensure_all(ctx.db)
+    after_upgrade = read(ctx, %{session_key: "owned", limit: 500})
+    assert after_upgrade.messages == indexed_before.messages
+    assert_indexed_transcript_plan(transcript_join_plan(ctx.db))
+    assert Enum.map(Ledger.unpublished_terminals(ctx.db), & &1.seq) == [first_turn, last_turn]
+
+    assert {:ok, [[251]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM messages WHERE sessionKey='owned'")
+
+    assert {:ok, [[250]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey='owned'")
+  end
+
   ## Proof 9 — limit
 
   test "proof 9: the default is 50 and an over-cap request is clamped", ctx do
@@ -655,6 +719,36 @@ defmodule Tightbeam.TranscriptTest do
       DB.query(db, "SELECT seq FROM turns WHERE messageId = ?1", [message_id])
 
     seq
+  end
+
+  defp transcript_join_plan(db) do
+    {:ok, plan} =
+      DB.query(
+        db,
+        """
+        EXPLAIN QUERY PLAN
+        SELECT m.id, m.timestamp, m.role, m.sender, m.content, m.attachments,
+               m.replyToMessageId, t.seq, t.model, t.thinkingLevel, t.modelContext,
+               t.harness, t.assignmentId, t.jobRef
+        FROM messages AS m
+        LEFT JOIN turns AS t
+          ON t.messageId = CASE m.role WHEN 'user' THEN m.id ELSE m.replyToMessageId END
+        WHERE m.sessionKey = ?1 AND m.seq > ?2
+        ORDER BY m.seq DESC LIMIT ?3
+        """,
+        ["owned", 0, 500]
+      )
+
+    Enum.map(plan, &Enum.at(&1, 3))
+  end
+
+  defp assert_indexed_transcript_plan(plan) do
+    assert Enum.any?(plan, fn detail ->
+             String.contains?(detail, "SEARCH t") and
+               String.contains?(detail, "turns_message_id")
+           end)
+
+    refute Enum.any?(plan, &String.contains?(&1, "SCAN t"))
   end
 
   defp clear_through!(db, session_key, message_id) do
