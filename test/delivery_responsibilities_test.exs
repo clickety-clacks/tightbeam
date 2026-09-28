@@ -81,6 +81,78 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
     refute DeliveryResponsibilities.current_owner(db, "wi_b1")
   end
 
+  test "only the human owner, admin, actual Main, or active current owner may change an owner link",
+       %{db: db} do
+    for principal <- [{:session, "peer"}, {:session, "foreign-worker"}, {:user, "other"}] do
+      assert %{code: "not_authorized"} = set_owner(db, principal, "wi_a1", "peer")
+      assert is_nil(DeliveryResponsibilities.current_owner(db, "wi_a1"))
+    end
+
+    assert %{deliveryOwnerSessionKey: "pdo-a"} = set_owner(db, {:user, "owner"}, "wi_a1", "pdo-a")
+
+    for principal <- [{:session, "peer"}, {:session, "foreign-worker"}, {:user, "other"}],
+        replacement <- ["peer", nil] do
+      assert %{code: "not_authorized"} = set_owner(db, principal, "wi_a1", replacement)
+
+      assert %{"accountableSessionKey" => "pdo-a"} =
+               DeliveryResponsibilities.current_owner(db, "wi_a1")
+    end
+
+    assert %{deliveryOwnerSessionKey: "pdo-b"} =
+             set_owner(db, {:session, "pdo-a"}, "wi_a1", "pdo-b")
+
+    assert %{code: "not_authorized"} = set_owner(db, {:session, "pdo-a"}, "wi_a1", "pdo-a")
+    assert %{deliveryOwnerSessionKey: nil} = set_owner(db, {:session, "pdo-b"}, "wi_a1", nil)
+    assert %{deliveryOwnerSessionKey: "pdo-a"} = set_owner(db, {:user, "admin"}, "wi_a1", "pdo-a")
+    assert %{deliveryOwnerSessionKey: nil} = set_owner(db, {:user, "owner"}, "wi_a1", nil)
+
+    main = Org.personal_session_key("owner")
+    assert %{deliveryOwnerSessionKey: "pdo-b"} = set_owner(db, {:session, main}, "wi_a1", "pdo-b")
+    {:ok, _} = DB.query(db, "UPDATE sessions SET state='retired' WHERE sessionKey='pdo-b'")
+    assert %{code: "not_authorized"} = set_owner(db, {:session, "pdo-b"}, "wi_a1", "peer")
+    assert %{deliveryOwnerSessionKey: "pdo-a"} = set_owner(db, {:session, main}, "wi_a1", "pdo-a")
+    {:ok, _} = DB.query(db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [main])
+    assert %{code: "not_authorized"} = set_owner(db, {:session, main}, "wi_a1", nil)
+  end
+
+  test "owner links cannot cross human ownership and denied patches have no metadata effect", %{
+    db: db
+  } do
+    set_owner(db, {:user, "owner"}, "wi_a1", "pdo-a")
+
+    for principal <- [{:user, "owner"}, {:user, "admin"}, {:session, "pdo-a"}] do
+      assert %{code: "cross_owner_scope"} = set_owner(db, principal, "wi_a1", "foreign-pdo")
+
+      assert %{"accountableSessionKey" => "pdo-a"} =
+               DeliveryResponsibilities.current_owner(db, "wi_a1")
+    end
+
+    before = WorkItems.__handle__(db, "work-item-get", work_item_call({:user, "owner"}, "wi_a1"))
+
+    call = %{
+      verb: "work-item-update",
+      origin: "agent:peer",
+      principal: {:session, "peer"},
+      params: %{
+        work_item_id: "wi_a1",
+        title: "Metadata-only title",
+        delivery_owner_session_key: "peer"
+      }
+    }
+
+    assert %{code: "not_authorized"} = WorkItems.__handle__(db, "work-item-update", call)
+
+    assert ^before =
+             WorkItems.__handle__(db, "work-item-get", work_item_call({:user, "owner"}, "wi_a1"))
+
+    # Existing metadata authorization is independent from the new owner-link write.
+    assert %{title: "Metadata-only title"} =
+             WorkItems.__handle__(db, "work-item-update", %{
+               call
+               | params: Map.delete(call.params, :delivery_owner_session_key)
+             })
+  end
+
   test "role names, shared human ownership, and ancestry do not elect an owner", %{db: db} do
     assert %{code: "delivery_owner_missing", message: missing} =
              assign(db, {:session, "pdo-a"}, "worker-a", "wi_a1")
@@ -348,6 +420,120 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
 
     assert DeliveryResponsibilities.current_owner(db, "wi_a1")["accountableSessionKey"] ==
              "pdo-a"
+  end
+
+  test "loaded engineering rules require owner and topology even with an authentic routing bracket",
+       %{db: db} do
+    tmp =
+      Path.join(System.tmp_dir!(), "delivery-routing-rules-#{System.unique_integer([:positive])}")
+
+    on_exit(fn -> File.rm_rf!(tmp) end)
+    load_delivery_rules!(tmp)
+    handlers = assignment_handlers(db)
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT OR IGNORE INTO hosts(name,baseDir) VALUES('synthetic-host','/synthetic-only')"
+      )
+
+    item =
+      WorkItems.__handle__(db, "work-item-create", %{
+        verb: "work-item-create",
+        origin: "user:owner",
+        principal: {:user, "owner"},
+        params: %{title: "Authentic engineering intake"}
+      })
+
+    assert %{id: item_id} = item
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               db,
+               """
+               SELECT 1 FROM work_items wi JOIN wakes w ON w.wakeId=wi.routingWakeId
+               WHERE wi.id=?1 AND wi.deliveryOwnerSessionKey IS NULL
+                 AND w.work_item_id=wi.id AND w.origin='process:tightbeam'
+                 AND w.sessionKey=?2 AND w.state='pending'
+               """,
+               [item_id, Org.personal_session_key("owner")]
+             )
+
+    before = count(db, "assignments")
+    wakes_before = count(db, "wakes")
+
+    for verb <- ["assign", "dispatch"], principal <- [{:user, "owner"}, {:session, "peer"}] do
+      rule = "engineering-#{verb}-production-needs-delivery-owner"
+
+      assert {:error, %{code: "rule_denied", rule: ^rule, message: message}} =
+               Dispatch.dispatch(
+                 db,
+                 handlers,
+                 production_call(verb, principal, "worker-a", item_id)
+               )
+
+      assert message =~ item_id
+      assert message =~ "human owner/admin or its active Main"
+      assert message =~ "work-item-update --delivery-owner"
+    end
+
+    assert count(db, "assignments") == before
+    assert count(db, "wakes") == wakes_before
+
+    # Real coordination and linked review still admit before the link exists.
+    intake =
+      production_call("assign", {:user, "owner"}, "intake-pdo", item_id)
+      |> put_in([:params, :effect_kind], "coordination")
+
+    assert {:ok, coordination} = Dispatch.dispatch(db, handlers, intake)
+
+    consultation =
+      production_call("dispatch", {:user, "owner"}, "consult-po", item_id)
+      |> put_in([:params, :effect_kind], "coordination")
+
+    assert {:ok, %{holderKey: "consult-po"}} = Dispatch.dispatch(db, handlers, consultation)
+
+    review =
+      production_call("assign", {:user, "owner"}, "reviewer", item_id)
+      |> put_in([:params, :effect_kind], "review")
+      |> put_in([:params, :reviews_assignment_id], coordination.id)
+
+    assert {:ok, %{holderKey: "reviewer"}} = Dispatch.dispatch(db, handlers, review)
+
+    # Existing intake assignments do not let production bypass the loaded rule.
+    for verb <- ["assign", "dispatch"] do
+      assert {:error, %{code: "rule_denied"}} =
+               Dispatch.dispatch(
+                 db,
+                 handlers,
+                 production_call(verb, {:user, "owner"}, "worker-a", item_id)
+               )
+    end
+
+    assert %{deliveryOwnerSessionKey: "pdo-a"} = set_owner(db, {:user, "owner"}, item_id, "pdo-a")
+
+    for verb <- ["assign", "dispatch"] do
+      rule = "engineering-#{verb}-production-needs-topology"
+
+      assert {:error, %{code: "rule_denied", rule: ^rule}} =
+               Dispatch.dispatch(
+                 db,
+                 handlers,
+                 production_call(verb, {:user, "owner"}, "worker-a", item_id)
+               )
+    end
+
+    assert %{attest: %{verdictKind: "topology-decided"}} =
+             attest_verdict(db, "intake-pdo", coordination.id, "topology-decided")
+
+    for verb <- ["assign", "dispatch"] do
+      assert {:ok, %{holderKey: "worker-a", workItemId: ^item_id}} =
+               Dispatch.dispatch(
+                 db,
+                 handlers,
+                 production_call(verb, {:user, "owner"}, "worker-a", item_id)
+               )
+    end
   end
 
   test "assignment and dispatch share admission while intake and linked review stay reachable", %{

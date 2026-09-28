@@ -1,6 +1,6 @@
-# Exact work-item references and returned topology remain rule-gated. Owner
-# presence here scopes only that existing topology duty; staffing authority and
-# owner-specific refusals come from the shared DeliveryResponsibilities check.
+# Engineering production requires an explicit owner and returned topology.
+# Core authorization still applies to every caller; coordination and linked
+# review retain their existing intake paths.
 [[rule]]
 name = "engineering-spawn-staffing-needs-work-item"
 verb = "spawn"
@@ -42,6 +42,19 @@ edges = ["verb"]
 effect = "deny"
 deny_when = [
   { fact = "work_item.reference_state", op = "ne", value = "known" },
+]
+
+[[rule]]
+name = "engineering-assign-production-needs-delivery-owner"
+verb = "assign"
+text = "Production staffing of work item {work_item_id} requires a current delivery owner. Have the item's human owner/admin or its active Main set the owner with work-item-update --delivery-owner before retrying."
+edges = ["verb"]
+effect = "deny"
+deny_when = [
+  { fact = "assign.is_linked_review", op = "ne", value = true },
+  { fact = "assign.effect_kind", op = "ne", value = "coordination" },
+  { fact = "work_item.reference_state", op = "eq", value = "known" },
+  { fact = "work_item.delivery_owner_state", op = "ne", value = "current" },
 ]
 
 [[rule]]
@@ -93,6 +106,18 @@ edges = ["verb"]
 effect = "deny"
 deny_when = [
   { fact = "work_item.reference_state", op = "ne", value = "known" },
+]
+
+[[rule]]
+name = "engineering-dispatch-production-needs-delivery-owner"
+verb = "dispatch"
+text = "Production staffing of work item {work_item_id} requires a current delivery owner. Have the item's human owner/admin or its active Main set the owner with work-item-update --delivery-owner before retrying."
+edges = ["verb"]
+effect = "deny"
+deny_when = [
+  { fact = "assign.effect_kind", op = "ne", value = "coordination" },
+  { fact = "work_item.reference_state", op = "eq", value = "known" },
+  { fact = "work_item.delivery_owner_state", op = "ne", value = "current" },
 ]
 
 [[rule]]

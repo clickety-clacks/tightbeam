@@ -1270,7 +1270,6 @@ defmodule Tightbeam.Assignments do
   """
   @spec dispatch_precheck(DB.server(), map()) ::
           :proceed
-          | {:proceed, {:ownerless_fired_rumination, reference(), String.t(), String.t()}}
           | {:replay, map()}
           | {:refuse, map()}
   def dispatch_precheck(db, call) do
@@ -1322,25 +1321,6 @@ defmodule Tightbeam.Assignments do
                 :ok ->
                   :proceed
 
-                %{code: "delivery_owner_missing"} = error when call.verb == "dispatch" ->
-                  case call.principal do
-                    {:session, caller_session} ->
-                      cond do
-                        Wakes.rumination_exists?(txn, work_item_id, caller_session) ->
-                          {:proceed,
-                           {:ownerless_fired_rumination, make_ref(), work_item_id, caller_session}}
-
-                        live_owner_routing_bracket_in_txn?(txn, work_item_id) ->
-                          :proceed
-
-                        true ->
-                          {:refuse, error}
-                      end
-
-                    _ ->
-                      {:refuse, error}
-                  end
-
                 %{code: _} = error ->
                   {:refuse, error}
               end
@@ -1355,50 +1335,6 @@ defmodule Tightbeam.Assignments do
       end
     end)
   end
-
-  defp live_owner_routing_bracket_in_txn?(txn, work_item_id) do
-    case Txn.q(
-           txn,
-           """
-           SELECT ownerUserId, routingWakeId
-           FROM work_items
-           WHERE id = ?1 AND state = 'open'
-             AND deliveryOwnerSessionKey IS NULL AND routingWakeId IS NOT NULL
-           """,
-           [work_item_id]
-         ) do
-      [[owner_user_id, wake_id]] when is_binary(owner_user_id) and is_binary(wake_id) ->
-        owner_session_key = Tightbeam.Org.personal_session_key(owner_user_id)
-
-        Txn.q(
-          txn,
-          """
-          SELECT 1 FROM wakes
-          WHERE wakeId = ?1 AND work_item_id = ?2
-            AND origin = 'process:tightbeam' AND consumer = 'prompt'
-            AND sessionKey = ?3 AND state IN ('pending', 'fired')
-          LIMIT 1
-          """,
-          [wake_id, work_item_id, owner_session_key]
-        ) == [[1]]
-
-      _ ->
-        false
-    end
-  end
-
-  defp ownerless_fired_rumination_prechecked?(call, work_item_id, "dispatch") do
-    case Map.get(call, :__tb_ownerless_fired_rumination_precheck__) do
-      {:ownerless_fired_rumination, token, ^work_item_id, caller_session}
-      when is_reference(token) ->
-        Map.get(call, :principal) == {:session, caller_session}
-
-      _ ->
-        false
-    end
-  end
-
-  defp ownerless_fired_rumination_prechecked?(_call, _work_item_id, _verb), do: false
 
   defp dispatch_result(db, call) do
     case {call.params[:work_item_id], call.principal} do
@@ -1947,18 +1883,14 @@ defmodule Tightbeam.Assignments do
         # F7 amendment: dispatch persists workItemId exactly as assign does.
         work_item_id = call.params[:work_item_id]
 
-        if ownerless_fired_rumination_prechecked?(call, work_item_id, verb) do
-          :ok
-        else
-          case Tightbeam.DeliveryResponsibilities.check_staffing_owner_in_txn(
-                 txn,
-                 call,
-                 target_session_key: call.session_key,
-                 target_archetype: target_archetype
-               ) do
-            :ok -> :ok
-            %{code: _} = error -> throw({:delivery_owner_error, error})
-          end
+        case Tightbeam.DeliveryResponsibilities.check_staffing_owner_in_txn(
+               txn,
+               call,
+               target_session_key: call.session_key,
+               target_archetype: target_archetype
+             ) do
+          :ok -> :ok
+          %{code: _} = error -> throw({:delivery_owner_error, error})
         end
 
         reviews_assignment_id =

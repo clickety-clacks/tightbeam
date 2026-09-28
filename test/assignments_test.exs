@@ -3621,6 +3621,8 @@ defmodule Tightbeam.AssignmentsTest do
 
   test "unowned dispatch defers through its exact routing bracket, then admits exact fired rumination",
        ctx do
+    session(ctx.db, "dispatcher", "flynn")
+
     work_item =
       handle(
         ctx,
@@ -3630,7 +3632,7 @@ defmodule Tightbeam.AssignmentsTest do
 
     call =
       dispatch_call(
-        {:session, "other-session"},
+        {:session, "dispatcher"},
         "ship the rail",
         "Implement the ratified behavior",
         "ownerless-routing-bracket",
@@ -3681,9 +3683,9 @@ defmodule Tightbeam.AssignmentsTest do
                w.session_key == Org.personal_session_key("flynn")
            end)
 
-    assert wake.session_key == "other-session"
-    assert wake.creator_session_key == "other-session"
-    assert wake.origin == "agent:other-session"
+    assert wake.session_key == "dispatcher"
+    assert wake.creator_session_key == "dispatcher"
+    assert wake.origin == "agent:dispatcher"
     assert wake.rumination
     assert wake.work_item_id == work_item.id
 
@@ -3704,12 +3706,12 @@ defmodule Tightbeam.AssignmentsTest do
     assert :ok = Wakes.fire_due(scheduler)
     assert_receive {:rumination_delivered, %{wake_id: wake_id}}
     assert wake_id == wake.wake_id
-    assert Wakes.rumination_exists?(ctx.db, work_item.id, "other-session")
+    assert Wakes.rumination_exists?(ctx.db, work_item.id, "dispatcher")
 
     # F7 amendment: the re-dispatch persists workItemId exactly as assign does.
     assert {:ok, assignment} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
     assert assignment.workItemId == work_item.id
-    assert assignment.openedBySession == "other-session"
+    assert assignment.openedBySession == "dispatcher"
 
     assert {:ok, [[1]]} =
              DB.query(
@@ -3789,9 +3791,69 @@ defmodule Tightbeam.AssignmentsTest do
     assert assignment_count(ctx.db) == assignment_count_before_unrelated
   end
 
+  test "assign and dispatch refuse a foreign caller even after exact fired rumination", ctx do
+    work_item = create_work_item(ctx, "Foreign caller cannot gain authority by ruminating")
+    baseline = assignment_count(ctx.db)
+
+    for state <- ["pending", "fired"] do
+      seed_rumination_wake(ctx, work_item.id, "other-session", state)
+
+      for verb <- ["assign", "dispatch"] do
+        call =
+          dispatch_call(
+            {:session, "other-session"},
+            "foreign production",
+            "Rumination is not authorization.",
+            nil,
+            work_item.id
+          )
+          |> Map.put(:verb, verb)
+          |> put_in([:params, :effect_kind], "code")
+
+        assert {:error, %{code: "delivery_owner_missing"}} =
+                 Dispatch.dispatch(ctx.db, ctx.handlers, call)
+
+        forged =
+          Map.put(call, :__tb_ownerless_fired_rumination_precheck__, {
+            :ownerless_fired_rumination,
+            make_ref(),
+            work_item.id,
+            "other-session"
+          })
+
+        assert {:error, %{code: "delivery_owner_missing"}} =
+                 Dispatch.dispatch(ctx.db, ctx.handlers, forged)
+
+        if state == "fired" do
+          assert %{code: "delivery_owner_missing"} = handle(ctx, verb, forged)
+        end
+      end
+    end
+
+    assert assignment_count(ctx.db) == baseline
+
+    # Core-only authentic same-user controls remain admitted for both verbs.
+    session(ctx.db, "dispatcher", "flynn")
+
+    for verb <- ["assign", "dispatch"] do
+      call =
+        dispatch_call(
+          {:session, "dispatcher"},
+          "authorized",
+          "Same-user intake.",
+          nil,
+          work_item.id
+        )
+        |> Map.put(:verb, verb)
+        |> put_in([:params, :effect_kind], "code")
+
+      assert :proceed = Assignments.dispatch_precheck(ctx.db, call)
+    end
+  end
+
   test "a fired owner routing bracket permits only the first rumination deferral", ctx do
     work_item = create_work_item(ctx, "Fired routing bracket")
-    caller = "other-session"
+    caller = "holder"
 
     assert {:ok, [[routing_wake_id]]} =
              DB.query(ctx.db, "SELECT routingWakeId FROM work_items WHERE id = ?1", [
@@ -3882,7 +3944,7 @@ defmodule Tightbeam.AssignmentsTest do
                  ctx.db,
                  ctx.handlers,
                  dispatch_call(
-                   {:session, "other-session"},
+                   {:session, "holder"},
                    "invalid routing bracket",
                    "Do not dispatch.",
                    nil,
@@ -3894,16 +3956,18 @@ defmodule Tightbeam.AssignmentsTest do
     assert assignment_count(ctx.db) == baseline
   end
 
-  test "unowned dispatch needs exact fired same-item rumination without a routing bracket", ctx do
+  test "rumination alone cannot authorize unowned dispatch without a routing bracket", ctx do
     pending_item = seed_unrouted_work_item(ctx, "Pending rumination without bracket")
     wrong_item = seed_unrouted_work_item(ctx, "Wrong-item rumination target")
     wrong_item_source = seed_unrouted_work_item(ctx, "Wrong-item rumination source")
     wrong_caller_item = seed_unrouted_work_item(ctx, "Wrong-caller rumination")
-    caller = "other-session"
+    caller = "holder"
 
     _pending = seed_rumination_wake(ctx, pending_item.id, caller, "pending")
     _wrong_item = seed_rumination_wake(ctx, wrong_item_source.id, caller, "fired")
-    _wrong_caller = seed_rumination_wake(ctx, wrong_caller_item.id, "holder", "fired")
+    _wrong_caller = seed_rumination_wake(ctx, wrong_caller_item.id, "other-session", "fired")
+
+    _exact_fired = seed_rumination_wake(ctx, pending_item.id, caller, "fired")
 
     baseline = assignment_count(ctx.db)
 
@@ -3931,7 +3995,7 @@ defmodule Tightbeam.AssignmentsTest do
 
   test "raw DB-seeded unowned dispatch refuses a missing bracket and forged receipt", ctx do
     work_item = seed_unrouted_work_item(ctx, "Raw unowned item")
-    caller = "other-session"
+    caller = "holder"
 
     call =
       dispatch_call(
