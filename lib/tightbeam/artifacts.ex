@@ -24,7 +24,7 @@ defmodule Tightbeam.Artifacts do
   through `recorded_kinds/3`, which reads neither column.
   """
 
-  alias Tightbeam.{ArtifactContent, DB, TurnObservations}
+  alias Tightbeam.{ArtifactContent, ArtifactOrigins, DB, TurnObservations}
   alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.Publisher
 
@@ -73,13 +73,19 @@ defmodule Tightbeam.Artifacts do
   #{Enum.join(@index_ddl, ";\n")};
   """
 
+  @current_ddl String.replace(
+                 @ddl,
+                 "updatedAt         INTEGER NOT NULL,",
+                 "updatedAt         INTEGER NOT NULL,\n    originHost        TEXT,\n    originWorkspace   TEXT,"
+               )
+
   @doc false
   def ensure_r1_schema(db), do: DB.execute(db, @ddl)
 
   @doc "Create the artifact registry schema."
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
   def ensure_schema(db \\ Tightbeam.DB) do
-    :ok = DB.execute(db, @ddl)
+    :ok = DB.execute(db, @current_ddl)
     DB.execute(db, "CREATE TABLE IF NOT EXISTS artifact_version_floors (#{@floor_definition})")
   end
 
@@ -187,6 +193,9 @@ defmodule Tightbeam.Artifacts do
                fn txn ->
                  case validate_producer_in_txn(txn, producer_id, session_key, work_item_id) do
                    :ok ->
+                     {origin_host, origin_workspace} =
+                       ArtifactOrigins.registration_context(txn, call)
+
                      reserve_version_in_txn(txn, artifact_id)
 
                      Txn.q(
@@ -195,9 +204,10 @@ defmodule Tightbeam.Artifacts do
                        INSERT INTO artifacts
                          (artifactId, kind, title, description, createdBySession, workItemId,
                           producedByAssignmentId, parentSession, originPath, contentSha256,
-                          recordedMessageId, recordedTurnEvidence, state, home, createdAt, updatedAt)
+                          recordedMessageId, recordedTurnEvidence, state, home, createdAt, updatedAt,
+                          originHost, originWorkspace)
                        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                               'in-workspace', NULL, ?13, ?13)
+                               'in-workspace', NULL, ?13, ?13, ?14, ?15)
                        """,
                        [
                          artifact_id,
@@ -212,7 +222,9 @@ defmodule Tightbeam.Artifacts do
                          call.params[:content_sha256],
                          recorded_message_id,
                          evidence,
-                         now
+                         now,
+                         origin_host,
+                         origin_workspace
                        ]
                      )
 
@@ -719,7 +731,7 @@ defmodule Tightbeam.Artifacts do
     """
     artifactId, kind, title, description, createdBySession, workItemId,
     producedByAssignmentId, parentSession, originPath, contentSha256, recordedMessageId,
-    recordedTurnEvidence, state, home, createdAt, updatedAt
+    recordedTurnEvidence, state, home, createdAt, updatedAt, originHost, originWorkspace
     """
   end
 
@@ -739,7 +751,9 @@ defmodule Tightbeam.Artifacts do
          state,
          home,
          created_at,
-         updated_at
+         updated_at,
+         origin_host,
+         origin_workspace
        ]) do
     %{
       artifact_id: artifact_id,
@@ -751,6 +765,8 @@ defmodule Tightbeam.Artifacts do
       produced_by_assignment_id: produced_by_assignment_id,
       parent_session: parent_session,
       origin_path: origin_path,
+      origin_host: origin_host,
+      origin_workspace: origin_workspace,
       content_sha256: content_sha256,
       recorded_message_id: recorded_message_id,
       recorded_turn_evidence: recorded_turn_evidence,

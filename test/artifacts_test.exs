@@ -437,7 +437,7 @@ defmodule Tightbeam.ArtifactsTest do
     assert Enum.map(columns, &Enum.at(&1, 1)) == ~w(
              artifactId kind title description createdBySession workItemId producedByAssignmentId parentSession
              originPath contentSha256 recordedMessageId recordedTurnEvidence state home
-             createdAt updatedAt
+             createdAt updatedAt originHost originWorkspace
            )
 
     # NULLABLE now, and paired with a closed evidence domain.

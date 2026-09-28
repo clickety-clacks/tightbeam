@@ -6,7 +6,7 @@ defmodule Tightbeam.ArtifactDurabilityMigrationTest do
   @fixture Path.expand("fixtures/artifact_durability_reparent_9082cb14.sql", __DIR__)
   @fixture_sha "d8039e7a3584ab26a77aae6214c8927dfc077ab1234ba452ae61ba5731597508"
   @predecessor "session-reparent-v1-019"
-  @successor "delivery-owner-reparent-v1-019"
+  @successor "artifact-origin-v1-019"
 
   @content_objects [
     "artifact_contents",
@@ -30,7 +30,7 @@ defmodule Tightbeam.ArtifactDurabilityMigrationTest do
     %{db: db}
   end
 
-  test "AD1 accepted predecessor boots to the terminal stamp with usable durability storage",
+  test "AD1 accepted predecessor boots to the current stamp with usable durability storage",
        %{db: db} do
     assert :ok = Schema.ensure_all(db)
     assert rows(db, "SELECT shape FROM schema_stamp") == [[@successor]]
@@ -171,13 +171,18 @@ defmodule Tightbeam.ArtifactDurabilityMigrationTest do
     # A released row with no stored content is the external case: bytes that
     # were never taken into custody. The migration claims no custody over it,
     # so the terminal state, the origin and the projection version all stand.
-    assert rows(db, "SELECT * FROM artifacts ORDER BY artifactId") == before
+    assert rows(db, "SELECT * FROM artifacts ORDER BY artifactId") ==
+             Enum.map(before, &(&1 ++ [nil, nil]))
+
     assert rows(db, "SELECT * FROM artifact_version_floors ORDER BY artifactId") == floors_before
     assert rows(db, "SELECT COUNT(*) FROM artifact_contents") == [[0]]
     assert rows(db, "PRAGMA foreign_key_check") == []
 
     assert :ok = Schema.ensure_all(db)
-    assert rows(db, "SELECT * FROM artifacts ORDER BY artifactId") == before
+
+    assert rows(db, "SELECT * FROM artifacts ORDER BY artifactId") ==
+             Enum.map(before, &(&1 ++ [nil, nil]))
+
     assert rows(db, "SELECT * FROM artifact_version_floors ORDER BY artifactId") == floors_before
   end
 
