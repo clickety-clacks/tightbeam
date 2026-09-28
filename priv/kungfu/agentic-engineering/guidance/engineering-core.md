@@ -24,6 +24,21 @@ A role is a responsibility, not a stage. Use `team-planner` for planning advice,
 `guidance-reviewer` own policy prose and its independent judgment. A missing role
 is a responsibility to describe to delivery ownership, not a name to invent.
 
+## Prompts state the goal, not the route
+
+When you write a brief, wake, card or instruction for another agent, give it the
+outcome you want, the context it cannot find on its own, and the limits that are
+real. Leave the rest to it. Every detail you add narrows where it will look: a
+file list becomes a boundary, a command recipe becomes the only path, a step
+order becomes a rule it will not break even when the problem calls for it.
+
+Be specific only where the specificity itself matters: where to start looking
+when the agent would otherwise have to hunt, an exact version, identifier or
+algorithm the user asked for, and a limit that really is a limit (do not
+publish, do not touch production). Anything the agent can work out from the
+code, the records or the problem, leave for it to work out. Before sending,
+check each specific detail: would the work go wrong without it? If not, cut it.
+
 ## Settle the ask before building it
 
 A spec is the smallest contract that leaves no open question about the core ask,
