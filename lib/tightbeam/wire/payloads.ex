@@ -53,7 +53,8 @@ defmodule Tightbeam.Wire.Payloads do
   - wire error: message/messageId keys present only when given.
   - prompt_turn_state: payload carries messageId==correlationId==the
     clientMessageId, and terminalState: true iff state ∈
-    delivered|canceled|failed.
+    delivered|canceled|failed. A failed turn may carry `diagnostic`, the
+    original failure beside the sentence in `error`.
   """
 
   @type payload :: %{optional(String.t()) => term()}
@@ -138,11 +139,17 @@ defmodule Tightbeam.Wire.Payloads do
   @spec ack(String.t()) :: payload()
   def ack(client_message_id), do: %{"type" => "ack", "id" => client_message_id}
 
-  @spec wire_error(error_code(), String.t() | nil, String.t() | nil) :: payload()
-  def wire_error(code, message \\ nil, message_id \\ nil) do
+  @doc """
+  A wire error frame. `diagnostic` is the optional structured node documented in
+  `Tightbeam.ErrorDiagnostic`; it is absent when there is nothing beyond code and
+  message.
+  """
+  @spec wire_error(error_code(), String.t() | nil, String.t() | nil, map() | nil) :: payload()
+  def wire_error(code, message \\ nil, message_id \\ nil, diagnostic \\ nil) do
     %{"type" => "error", "code" => code}
     |> put_if_present("message", message)
     |> put_if_present("messageId", message_id)
+    |> put_if_present("diagnostic", diagnostic)
   end
 
   @spec assistant_typing(String.t(), boolean()) :: payload()
@@ -237,7 +244,10 @@ defmodule Tightbeam.Wire.Payloads do
     %{
       "type" => "event",
       "event" => "prompt_turn_state",
-      "payload" => put_if_present(payload, "error", Map.fetch!(input, :error))
+      "payload" =>
+        payload
+        |> put_if_present("error", Map.fetch!(input, :error))
+        |> put_if_present("diagnostic", Map.get(input, :diagnostic))
     }
   end
 

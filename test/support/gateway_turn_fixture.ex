@@ -71,6 +71,12 @@ defmodule Tightbeam.GatewayTurnFixture do
       {:ok, parent}
     end
 
+    # The adapter's reply to session creation, in place of a fresh session.
+    def init({:new_session_reply, reply, parent}) do
+      Process.put(:new_session_reply, reply)
+      {:ok, parent}
+    end
+
     def init(parent), do: {:ok, parent}
 
     def handle_call({:new_session, _model, _cwd, mcp_servers, _guidance}, _from, parent) do
@@ -81,7 +87,7 @@ defmodule Tightbeam.GatewayTurnFixture do
           do: "harness-#{System.unique_integer([:positive])}",
           else: "harness-1"
 
-      {:reply, {:ok, sid}, parent}
+      {:reply, Process.get(:new_session_reply, {:ok, sid}), parent}
     end
 
     def handle_call({:new_candidate_session, model, cwd, mcp_servers, guidance}, from, parent),
@@ -110,6 +116,9 @@ defmodule Tightbeam.GatewayTurnFixture do
           parent
         ),
         do: handle_call({:load_session, sid, model, cwd, mcp_servers, guidance}, from, parent)
+
+    def handle_call({:close_session, sid, _opts}, from, state),
+      do: handle_call({:close_session, sid}, from, state)
 
     def handle_call({:close_session, sid}, _from, parent) do
       send(parent, {:close_session, sid})

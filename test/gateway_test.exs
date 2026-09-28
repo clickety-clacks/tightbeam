@@ -265,10 +265,40 @@ defmodule Tightbeam.GatewayTest do
     def handle_call({:fast_status, _sid}, _from, state),
       do: {:reply, {:error, :fast_unsupported}, state}
 
+    def handle_call({:close_session, sid, _opts}, from, state),
+      do: handle_call({:close_session, sid}, from, state)
+
     def handle_call({:close_session, sid}, _from, {parent, models}) do
       send(parent, {:candidate_closed, sid})
       {:reply, :ok, {parent, Map.delete(models, sid)}}
     end
+  end
+
+  defmodule BlockingCandidateAdapterStub do
+    use GenServer
+
+    def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
+    def init(parent), do: {:ok, parent}
+
+    def handle_call({:new_candidate_session, _model, _cwd, _mcp, guidance}, _from, parent) do
+      send(parent, {:candidate_handoff_ready, guidance})
+
+      receive do
+        :allow_candidate -> {:reply, {:ok, "queued-switch-candidate"}, parent}
+      after
+        60_000 -> raise "timed out waiting for queued harness switch candidate"
+      end
+    end
+  end
+
+  defmodule FailingCandidateAdapterStub do
+    use GenServer
+
+    def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
+    def init(parent), do: {:ok, parent}
+
+    def handle_call({:new_candidate_session, _model, _cwd, _mcp, _guidance}, _from, parent),
+      do: {:reply, {:error, :deliberate_candidate_failure}, parent}
   end
 
   defmodule MismatchedCandidateAdapterStub do
@@ -291,6 +321,9 @@ defmodule Tightbeam.GatewayTest do
     use GenServer
     def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
     def init(parent), do: {:ok, parent}
+
+    def handle_call({:close_session, sid, _opts}, from, state),
+      do: handle_call({:close_session, sid}, from, state)
 
     def handle_call({:close_session, sid}, _from, parent) do
       send(parent, {:close_session_failed, sid})
@@ -322,9 +355,12 @@ defmodule Tightbeam.GatewayTest do
     def handle_call({:current_model, _sid}, _from, {_parent, opts} = state),
       do: {:reply, {:ok, Keyword.get(opts, :current_model, Model.new("fable"))}, state}
 
-    def handle_call({:close_session, sid}, _from, {parent, _opts} = state) do
+    def handle_call({:close_session, sid, _opts}, from, state),
+      do: handle_call({:close_session, sid}, from, state)
+
+    def handle_call({:close_session, sid}, _from, {parent, opts} = state) do
       send(parent, {:tune_session_closed, sid})
-      {:reply, :ok, state}
+      {:reply, Keyword.get(opts, :close_result, :ok), state}
     end
 
     def handle_call({:fast_status, _sid}, _from, state),
@@ -398,6 +434,9 @@ defmodule Tightbeam.GatewayTest do
 
     # A resident session: the adapter still holds it and answers a bounce.
     def handle_call({:knows_session?, _sid}, _from, parent), do: {:reply, true, parent}
+
+    def handle_call({:close_session, sid, _opts}, from, state),
+      do: handle_call({:close_session, sid}, from, state)
 
     def handle_call({:close_session, sid}, _from, parent) do
       send(parent, {:identity_apply_close, sid})
@@ -1354,6 +1393,18 @@ defmodule Tightbeam.GatewayTest do
 
     assert %{ok: false, code: "repair_failed"} = first = handler.(call)
     assert handler.(call) == first
+
+    # The coordinator's own reason rides beside the unchanged message, and the
+    # replay returns it too.
+    assert first.message == ":still_wedged"
+
+    assert %{
+             "kind" => "term",
+             "operation" => "close_adapter",
+             "phase" => "repair_restart",
+             "reason" => %{"$type" => "atom", "value" => "still_wedged"}
+           } = first.diagnostic
+
     assert_receive {:repair_close_adapter, {:claude, "shared", "testhost"}}
     refute_receive {:repair_close_adapter, _}, 50
 
@@ -2614,8 +2665,9 @@ defmodule Tightbeam.GatewayTest do
     assert_receive {:candidate_guidance, "candidate-1", guidance}
     assert guidance =~ "tightbeam transcript --session \"swapme\" --limit 50"
     assert guidance =~ "Do not replay or inject earlier messages"
-    refute guidance =~ "REPLAY_SENTINEL_ONE"
-    refute guidance =~ "REPLAY_SENTINEL_TWO"
+    assert guidance =~ "Cross-harness handoff from durable session records"
+    assert guidance =~ "REPLAY_SENTINEL_ONE"
+    assert guidance =~ "REPLAY_SENTINEL_TWO"
 
     cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), Org.get(ctx.db, "swapme"))
 
@@ -2933,6 +2985,52 @@ defmodule Tightbeam.GatewayTest do
 
     assert message =~ "local_openai"
     refute message =~ "opencode_go"
+  end
+
+  test "a credential refusal keeps the reason that chose its remedy sentence", ctx do
+    base_dir = role_test_base("spawn-pi-unsupported-detail", false)
+    Archetypes.load!(base_dir)
+
+    put_host_catalog("testhost", "pi", [
+      {"spark/qwen3.5-35b", [], :local_openai}
+    ])
+
+    config =
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.put(:default_harness, :pi)
+      |> Map.put(:default_model, Model.new("spark/qwen3.5-35b"))
+      |> Map.put(:credential_status, fn
+        :local_openai, "testhost" -> {:needs_onboarding, {:unsupported, :no_subscription}}
+      end)
+
+    assert %{
+             code: "placement_denied",
+             message: message,
+             detail: %{code: "needs_onboarding", diagnostic: diagnostic}
+           } =
+             Gateway.handlers(config)["spawn"].(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{
+                 display_name: "Spark unsupported plan",
+                 idempotency_key: "spawn-pi-unsupported-detail"
+               }
+             })
+
+    # The sentence is unchanged; the check that said "unsupported" is now named.
+    assert message =~ "no supported subscription"
+
+    assert %{
+             "kind" => "term",
+             "operation" => "credential_status",
+             "reason" => %{
+               "$type" => "tuple",
+               "items" => [
+                 %{"$type" => "atom", "value" => "unsupported"},
+                 %{"$type" => "atom", "value" => "no_subscription"}
+               ]
+             }
+           } = diagnostic
   end
 
   test "spawn uses the next where host when the first cannot run the requested harness", ctx do
@@ -4560,6 +4658,42 @@ defmodule Tightbeam.GatewayTest do
     assert marker_facts.kind == "model-retune"
     assert marker_facts.from == "fable"
     assert marker_facts.to == "claude-sonnet-4-6"
+  end
+
+  test "set_model keeps a superseded session's failed close beside the committed switch", ctx do
+    base_dir = role_test_base("override-set-model-close-failed")
+    Archetypes.load!(base_dir)
+    config = gateway_config(base_dir, ctx.db, 0)
+    local_host = Placement.local_host_name()
+    Org.set_host(ctx.db, "k1", local_host)
+    Org.append_pointer(ctx.db, "k1", "existing-session", "created")
+    start_lane!(ctx.db, "k1")
+
+    adapter =
+      start_supervised!(
+        {TuneAdapterStub, {self(), resident: true, close_result: {:error, :closed}}}
+      )
+
+    start_supervised!({CoordinatorStub, {adapter, self()}})
+    put_host_catalog(local_host, "claude", ["claude-sonnet-4-6"])
+
+    assert %{ok: true, diagnostic: diagnostic} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: "user:flynn",
+               session_key: "k1",
+               params: %{setting: "set_model", model: "claude-sonnet-4-6"}
+             })
+
+    assert_receive {:tune_session_closed, "existing-session"}
+    assert Org.get(ctx.db, "k1").model == Model.new("claude-sonnet-4-6")
+
+    assert %{
+             "kind" => "cleanup",
+             "operation" => "session/close",
+             "sessionId" => "existing-session",
+             "status" => "unverified",
+             "cause" => %{"kind" => "closed"}
+           } = diagnostic
   end
 
   test "runtime tune hides unknown, foreign, retired, and process targets behind one refusal",
@@ -6599,6 +6733,306 @@ defmodule Tightbeam.GatewayTest do
     send(runner, :finish_set_harness_turn)
   end
 
+  test "queued set_harness handoff excludes exact replacement QMS sources and keeps other durable order",
+       ctx do
+    ensure_global_registry()
+    candidate = start_supervised!({BlockingCandidateAdapterStub, self()})
+    {config, _local_host} = queued_harness_switch_config!(ctx, "queued-handoff", candidate)
+
+    {:appended, history_user} =
+      Projection.append(ctx.db, %{
+        session_key: "k1",
+        role: "user",
+        sender: "user:flynn",
+        content: "prior durable user context"
+      })
+
+    {:appended, history_agent} =
+      Projection.append(ctx.db, %{
+        session_key: "k1",
+        role: "assistant",
+        sender: "agent:reviewer",
+        content: "prior durable agent context"
+      })
+
+    assert history_user.seq < history_agent.seq
+
+    :ok =
+      DB.execute(ctx.db, """
+      INSERT INTO assignments
+        (id,subject,holderKey,openedByUser,openedAt,state)
+      VALUES ('asg_handoff','handoff','k1','flynn',1,'open')
+      """)
+
+    :ok =
+      DB.execute(ctx.db, """
+      INSERT INTO assignment_effects (assignmentId,effectKind)
+      VALUES ('asg_handoff','coordination')
+      """)
+
+    wake =
+      Wakes.schedule(ctx.db, %{
+        session_key: "k1",
+        origin: "process:tightbeam",
+        prompt: "superseded liveness notice",
+        due_at: System.system_time(:millisecond) + 60_000,
+        assignment_id: "asg_handoff",
+        consumer: "effort_probe"
+      })
+
+    assert {:ok, {:appended, "k1", suppressed_message, _opts}} =
+             DB.transaction(ctx.db, fn txn ->
+               Gateway.deliver_prompt_in_txn(
+                 txn,
+                 wake.session_key,
+                 wake.origin,
+                 wake.prompt,
+                 wake_id: wake.wake_id,
+                 sender: wake.origin,
+                 device_id: "test",
+                 client_message_id: wake.wake_id,
+                 target_gate: wake
+               )
+             end)
+
+    assert {:ok, [[suppressed_seq]]} =
+             DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [wake.wake_id])
+
+    assert suppressed_message.seq != suppressed_seq
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO supervision_liveness_receipts
+                 (assignmentId,sourceKind,sourceId,sourceAt,acceptedAt,generation,expiresAt)
+               VALUES ('asg_handoff','progress','progress-1',?1,?2,2,NULL)
+               """,
+               [wake.created_at, wake.created_at + 1]
+             )
+
+    assert {:ok, [^suppressed_seq]} =
+             DB.transaction(ctx.db, fn txn ->
+               Tightbeam.QueuedMessageSuppression.suppress_before_claim_in_txn(txn, "k1")
+             end)
+
+    {other_suppressed_seq, other_suppressed_message} =
+      enqueue_gateway_prompt!(
+        ctx.db,
+        "k1",
+        "user:flynn",
+        "other suppression reason durable context"
+      )
+
+    assert {:ok, true} =
+             DB.transaction(ctx.db, fn txn ->
+               Ledger.cancel_queued_in_txn(
+                 txn,
+                 other_suppressed_seq,
+                 "queued-message-suppressed: another_reason"
+               )
+             end)
+
+    :ok =
+      EventLog.lifecycle(
+        ctx.db,
+        "queued_message_suppressed",
+        Integer.to_string(other_suppressed_seq),
+        JSON.encode!(%{messageKind: "liveness"})
+      )
+
+    {replacement_source_seq, replacement_source_message} =
+      enqueue_gateway_prompt!(
+        ctx.db,
+        "k1",
+        "session:sender",
+        "exact sender replacement source to omit"
+      )
+
+    assert {:ok, true} =
+             DB.transaction(ctx.db, fn txn ->
+               Ledger.cancel_queued_in_txn(
+                 txn,
+                 replacement_source_seq,
+                 "sender_requested_replacement"
+               )
+             end)
+
+    :ok =
+      EventLog.lifecycle(
+        ctx.db,
+        "queued_message_suppressed",
+        Integer.to_string(replacement_source_seq),
+        JSON.encode!(%{
+          messageKind: "sender-replacement",
+          cause: "sender_requested_replacement"
+        })
+      )
+
+    assert {:ok, [["canceled", "queued-message-suppressed: sender_requested_replacement"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT status,error FROM turns WHERE seq=?1",
+               [replacement_source_seq]
+             )
+
+    {unattributed_canceled_seq, unattributed_canceled_message} =
+      enqueue_gateway_prompt!(
+        ctx.db,
+        "k1",
+        "user:flynn",
+        "unattributed canceled durable context"
+      )
+
+    assert {:ok, true} =
+             DB.transaction(ctx.db, fn txn ->
+               Ledger.cancel_queued_in_txn(
+                 txn,
+                 unattributed_canceled_seq,
+                 "unrelated cancellation"
+               )
+             end)
+
+    {first_seq, first_message} =
+      enqueue_gateway_prompt!(ctx.db, "k1", "user:flynn", "first queued request")
+
+    {second_seq, second_message} =
+      enqueue_gateway_prompt!(ctx.db, "k1", "agent:reviewer", "second queued request")
+
+    tune = Gateway.handlers(config)["tune"]
+
+    task =
+      Task.async(fn ->
+        tune.(%{
+          origin: "user:flynn",
+          session_key: "k1",
+          params: %{setting: "set_harness", harness: "codex", model: "gpt-5.6-sol"}
+        })
+      end)
+
+    assert_receive {:candidate_handoff_ready, guidance}, 60_000
+    assert guidance =~ "Cross-harness handoff from durable session records"
+    assert guidance =~ ~s("sender":"user:flynn")
+    assert guidance =~ ~s("sender":"agent:reviewer")
+    assert guidance =~ "superseded liveness notice"
+    refute guidance =~ "exact sender replacement source to omit"
+    assert guidance =~ "other suppression reason durable context"
+    assert guidance =~ "unattributed canceled durable context"
+
+    assert {prior_user_index, _} = :binary.match(guidance, "prior durable user context")
+    assert {prior_agent_index, _} = :binary.match(guidance, "prior durable agent context")
+
+    assert {unattributed_index, _} =
+             :binary.match(guidance, "unattributed canceled durable context")
+
+    assert prior_user_index < prior_agent_index
+    assert prior_agent_index < unattributed_index
+
+    refute guidance =~ "first queued request"
+    refute guidance =~ "second queued request"
+    refute guidance =~ "late queued request"
+
+    {late_seq, late_message} =
+      enqueue_gateway_prompt!(ctx.db, "k1", "user:flynn", "late queued request")
+
+    send(candidate, :allow_candidate)
+
+    assert %{ok: true, harness: "codex", engine_context: "reset"} = Task.await(task, 60_000)
+    assert Org.get(ctx.db, "k1").cleared_through_seq == unattributed_canceled_message.seq
+    assert Ledger.pending_count(ctx.db, "k1") == 3
+
+    assert {:ok, queued_rows} =
+             DB.query(
+               ctx.db,
+               "SELECT seq,status,messageId FROM turns WHERE sessionKey='k1' ORDER BY seq"
+             )
+
+    assert queued_rows == [
+             [suppressed_seq, "canceled", suppressed_message.id],
+             [other_suppressed_seq, "canceled", other_suppressed_message.id],
+             [replacement_source_seq, "canceled", replacement_source_message.id],
+             [unattributed_canceled_seq, "canceled", unattributed_canceled_message.id],
+             [first_seq, "queued", first_message.id],
+             [second_seq, "queued", second_message.id],
+             [late_seq, "queued", late_message.id]
+           ]
+
+    assert {:ok, [[error]]} =
+             DB.query(ctx.db, "SELECT error FROM turns WHERE seq=?1", [suppressed_seq])
+
+    assert error == "queued-message-suppressed: verified_liveness_recovery"
+
+    assert Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
+             event.kind == "queued_message_suppressed" and
+               event.subject == Integer.to_string(suppressed_seq) and
+               JSON.decode!(event.detail)["messageKind"] == "liveness"
+           end)
+
+    visible_after_switch = Projection.list_after(ctx.db, "k1", nil, 100, history_agent.seq)
+
+    assert Enum.any?(visible_after_switch, &(&1.id == first_message.id))
+    assert Enum.any?(visible_after_switch, &(&1.id == second_message.id))
+    assert Enum.any?(visible_after_switch, &(&1.id == late_message.id))
+    assert Enum.any?(visible_after_switch, &(&1.marker && &1.marker.kind == "harness-switch"))
+
+    for expected_seq <- [first_seq, second_seq, late_seq] do
+      assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
+      assert turn.seq == expected_seq
+
+      assert :ok =
+               Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+    end
+
+    assert :none = Ledger.claim_next(ctx.db, "k1", "test")
+  end
+
+  test "queued set_harness candidate failure leaves source, history, and queue intact", ctx do
+    candidate = start_supervised!({FailingCandidateAdapterStub, self()})
+
+    {config, _local_host} =
+      queued_harness_switch_config!(ctx, "queued-handoff-failure", candidate)
+
+    Org.append_pointer(ctx.db, "k1", "source-session", "created")
+
+    {first_seq, first_message} =
+      enqueue_gateway_prompt!(ctx.db, "k1", "user:flynn", "first remains queued")
+
+    {second_seq, second_message} =
+      enqueue_gateway_prompt!(ctx.db, "k1", "user:flynn", "second remains queued")
+
+    before = Org.get(ctx.db, "k1")
+    before_pointer = Org.current_pointer(ctx.db, "k1")
+
+    assert %{ok: false, code: "model_apply_failed", message: message} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: "user:flynn",
+               session_key: "k1",
+               params: %{setting: "set_harness", harness: "codex", model: "gpt-5.6-sol"}
+             })
+
+    assert message =~ ":deliberate_candidate_failure"
+
+    assert Org.get(ctx.db, "k1").harness == before.harness
+    assert Org.get(ctx.db, "k1").cleared_through_seq == before.cleared_through_seq
+    assert Org.current_pointer(ctx.db, "k1") == before_pointer
+    assert Ledger.pending_count(ctx.db, "k1") == 2
+
+    assert {:ok, queued_rows} =
+             DB.query(
+               ctx.db,
+               "SELECT seq,status,messageId FROM turns WHERE sessionKey='k1' ORDER BY seq"
+             )
+
+    assert queued_rows == [
+             [first_seq, "queued", first_message.id],
+             [second_seq, "queued", second_message.id]
+           ]
+
+    refute Enum.any?(Projection.list_after(ctx.db, "k1", nil, 100), fn message ->
+             message.marker && message.marker.kind == "harness-switch"
+           end)
+  end
+
   # The value a client is TOLD to send must be a value this accepts. `setModel.options`
   # and `modelCatalog.models` advertise one row per model with a base ref, deliberately
   # — the effort tier belongs to the reasoning picker — while the catalog only holds an
@@ -7110,6 +7544,23 @@ defmodule Tightbeam.GatewayTest do
     end
   end
 
+  # R1 (wi_3b4a20ce): a session-setup failure the adapter carries keeps its
+  # legacy reason for turns.error, the marker and health, while the
+  # harness_turn_error record keeps the harness's own code, message and data.
+  @tag cold_gateway: true, gateway_error_markers: true, tmp_dir: true
+  test "a setup failure records the adapter's original refusal beside its reason", ctx do
+    File.write!(
+      Path.join(ctx.tmp_dir, "error-case.json"),
+      JSON.encode!(%{mode: "setup_diagnosed"})
+    )
+
+    Tightbeam.GuardRuntimeFixture.run!(
+      ctx.tmp_dir,
+      "live_base_gateway_error_markers.exs",
+      "guarded-gateway-error-markers: ok"
+    )
+  end
+
   @tag error_reason: nil,
        expected_error: nil,
        cold_gateway: true,
@@ -7183,6 +7634,22 @@ defmodule Tightbeam.GatewayTest do
   test "a turn on a fresh-but-unexecutable host is not misrouted to the onboarding remedy",
        ctx do
     File.write!(Path.join(ctx.tmp_dir, "checkout-case.txt"), "fresh")
+
+    Tightbeam.GuardRuntimeFixture.run!(
+      ctx.tmp_dir,
+      "live_base_gateway_checkout_refusal.exs",
+      "guarded-gateway-checkout-refusal: ok"
+    )
+  end
+
+  # Error fidelity (wi_3b4a20ce): an open adapter circuit tells the caller why it
+  # opened -- count, dying generation and redacted exit -- through the real runner,
+  # lifecycle record and health observation, never the raw secret.
+  @tag :cold_gateway
+  @tag :gateway_checkout_refusal
+  @tag :tmp_dir
+  test "a degraded checkout names the circuit's failure count and redacted cause", ctx do
+    File.write!(Path.join(ctx.tmp_dir, "checkout-case.txt"), "degraded-cause")
 
     Tightbeam.GuardRuntimeFixture.run!(
       ctx.tmp_dir,
@@ -9061,6 +9528,69 @@ defmodule Tightbeam.GatewayTest do
         {SessionLane, :start_link,
          [[session_key: session_key, db: db, task_sup: task_sup, runner: runner]]}
     })
+  end
+
+  defp start_reserved_lane!(db, session_key) do
+    task_sup =
+      start_supervised!(
+        {Task.Supervisor, name: :"reserved_lane_tasks_#{System.unique_integer([:positive])}"}
+      )
+
+    start_supervised!(%{
+      id: {:lane, session_key},
+      start:
+        {SessionLane, :start_link,
+         [
+           [
+             session_key: session_key,
+             db: db,
+             task_sup: task_sup,
+             runner: fn _turn -> {:ok, %{}} end,
+             settlement_reservation: make_ref()
+           ]
+         ]}
+    })
+  end
+
+  defp queued_harness_switch_config!(ctx, suffix, candidate) do
+    base_dir = role_test_base(suffix)
+    Archetypes.load!(base_dir)
+
+    local_host = Placement.local_host_name()
+    codex_auth = Tightbeam.Homes.home_path(base_dir, local_host, :codex)
+    File.mkdir_p!(codex_auth)
+    File.write!(Path.join(codex_auth, "auth.json"), "test-token")
+
+    Org.set_host(ctx.db, "k1", local_host)
+    put_host_catalog(local_host, "codex", [])
+
+    put_host_catalog_entry(local_host, "codex", %{
+      family: "gpt-5.6-sol",
+      efforts: ["medium"],
+      provider: :openai
+    })
+
+    start_supervised!({CoordinatorStub, candidate})
+    start_reserved_lane!(ctx.db, "k1")
+
+    config =
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.put(:conn_registry, ctx.registry)
+      |> Map.put(:lane_manager, ctx.lane)
+
+    {config, local_host}
+  end
+
+  defp enqueue_gateway_prompt!(db, session_key, sender, prompt) do
+    {:ok, {:appended, ^session_key, message, _opts}} =
+      DB.transaction(db, fn txn ->
+        Gateway.deliver_prompt_in_txn(txn, session_key, sender, prompt, sender: sender)
+      end)
+
+    {:ok, [[seq]]} =
+      DB.query(db, "SELECT seq FROM turns WHERE messageId=?1", [message.id])
+
+    {seq, message}
   end
 
   defp ensure_global_registry do

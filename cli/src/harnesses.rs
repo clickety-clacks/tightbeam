@@ -4,6 +4,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+use crate::attempt_diagnostic::FailurePresentation;
+use crate::attempt_diagnostic::command_context::{CatalogOrigin, CommandContext};
 use crate::dispatch;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,7 +101,7 @@ pub(crate) fn load_for_doctor(base_dir: &Path) -> DoctorCatalog {
         }
     };
 
-    match load_endpoint_for_doctor(&endpoint) {
+    match load_endpoint_for_doctor(&endpoint, base_dir) {
         Ok(live) => DoctorCatalog::Live(cached.unwrap_or(live)),
         Err(DoctorLoadError::Offline(reason)) => offline_doctor_catalog(cached, reason),
         Err(DoctorLoadError::Gateway(_reason)) if cached.is_some() => {
@@ -131,25 +133,21 @@ enum DoctorLoadError {
 
 fn load_endpoint_for_doctor(
     endpoint: &dispatch::Endpoint,
+    base_dir: &Path,
 ) -> Result<HarnessCatalog, DoctorLoadError> {
-    let response = match dispatch::gateway_request("GET", endpoint, "/harnesses", None).call() {
-        Ok(response) => response,
-        Err(ureq::Error::Transport(error)) => {
-            return Err(DoctorLoadError::Offline(doctor_unavailable(
-                &error.to_string(),
-            )));
+    let context = Some(CommandContext::catalog(CatalogOrigin::Doctor));
+    match request_catalog(endpoint, context, base_dir, None) {
+        Ok(catalog) => Ok(catalog),
+        Err(CatalogRequestFailure::Transport(reason)) => Err(DoctorLoadError::Offline(
+            gateway_failure(reason, doctor_unavailable),
+        )),
+        Err(CatalogRequestFailure::Gateway(reason)) => Err(DoctorLoadError::Gateway(
+            gateway_failure(reason, doctor_unavailable),
+        )),
+        Err(CatalogRequestFailure::Projection(reason)) => {
+            Err(DoctorLoadError::Gateway(doctor_unavailable(&reason)))
         }
-        Err(ureq::Error::Status(status, response)) => {
-            let encoded = response
-                .into_string()
-                .unwrap_or_else(|_| format!("HTTP {status}"));
-            return Err(DoctorLoadError::Gateway(doctor_unavailable(&encoded)));
-        }
-    };
-    let encoded = response
-        .into_string()
-        .map_err(|error| DoctorLoadError::Gateway(doctor_unavailable(&error.to_string())))?;
-    parse(&encoded).map_err(|reason| DoctorLoadError::Gateway(doctor_unavailable(&reason)))
+    }
 }
 
 pub fn load() -> Result<HarnessCatalog, String> {
@@ -197,58 +195,162 @@ fn load_endpoint_with_deadline(
     endpoint: &dispatch::Endpoint,
     deadline: Option<Instant>,
 ) -> Result<HarnessCatalog, String> {
+    let receipt_base = home_dir();
+    load_endpoint_with_context_and_deadline(endpoint, None, &receipt_base, deadline)
+}
+
+fn load_endpoint_with_context_and_deadline(
+    endpoint: &dispatch::Endpoint,
+    context: Option<CommandContext>,
+    receipt_base: &Path,
+    deadline: Option<Instant>,
+) -> Result<HarnessCatalog, String> {
     if let Some(deadline) = deadline {
         let endpoint = endpoint.clone();
+        let receipt_base = receipt_base.to_path_buf();
         return crate::lease::until(deadline, move |remaining| {
-            load_endpoint_with_timeout(&endpoint, Some(remaining))
+            load_endpoint_with_timeout(&endpoint, context, &receipt_base, Some(remaining))
         })
         .map_err(|()| harness_lease_expired())?;
     }
 
-    load_endpoint_with_timeout(endpoint, None)
+    load_endpoint_with_timeout(endpoint, context, receipt_base, None)
 }
 
 fn load_endpoint_with_timeout(
     endpoint: &dispatch::Endpoint,
+    context: Option<CommandContext>,
+    receipt_base: &Path,
     timeout: Option<Duration>,
 ) -> Result<HarnessCatalog, String> {
-    let response = match dispatch::gateway_request("GET", endpoint, "/harnesses", timeout).call() {
-        Ok(response) => response,
-        Err(ureq::Error::Status(status, response)) => {
-            let encoded = response
-                .into_string()
-                .unwrap_or_else(|_| format!("HTTP {status}"));
-            let detail = serde_json::from_str::<Value>(&encoded)
-                .ok()
-                .and_then(|json| {
-                    let code = json.pointer("/error/code")?.as_str()?;
-                    let message = json.pointer("/error/message").and_then(Value::as_str);
-                    Some(match message {
-                        Some(message) if !message.is_empty() => format!("{code}: {message}"),
-                        _ => code.to_owned(),
-                    })
-                })
-                .unwrap_or(encoded);
-            return Err(unavailable(&detail));
+    match request_catalog(endpoint, context, receipt_base, timeout) {
+        Ok(catalog) => Ok(catalog),
+        Err(CatalogRequestFailure::Transport(reason) | CatalogRequestFailure::Gateway(reason)) => {
+            Err(gateway_failure(reason, unavailable))
         }
-        Err(ureq::Error::Transport(error)) => return Err(unavailable(&error.to_string())),
-    };
-    let encoded = response
-        .into_string()
-        .map_err(|error| unavailable(&error.to_string()))?;
-    parse(&encoded).map_err(|reason| unavailable(&reason))
+        Err(CatalogRequestFailure::Projection(reason)) => Err(unavailable(&reason)),
+    }
 }
 
-pub fn load_optional() -> Option<HarnessCatalog> {
-    load().ok()
+enum CatalogRequestFailure {
+    Transport(String),
+    Gateway(String),
+    Projection(String),
+}
+
+/// Perform one catalog GET and retain only typed attempt evidence. Catalog
+/// projection errors remain distinct from transport and gateway failures.
+fn request_catalog(
+    endpoint: &dispatch::Endpoint,
+    context: Option<CommandContext>,
+    receipt_base: &Path,
+    timeout: Option<Duration>,
+) -> Result<HarnessCatalog, CatalogRequestFailure> {
+    let request = dispatch::gateway_request("GET", endpoint, "/harnesses", timeout);
+    let mut attempt = crate::attempt_diagnostic::observation::begin_gateway_attempt(
+        context,
+        "GET",
+        "/harnesses",
+        timeout,
+    );
+    let request =
+        crate::attempt_diagnostic::observation::attach_request_id(request, attempt.as_ref());
+    let (status, response) = match request.call() {
+        Ok(response) => (response.status(), response),
+        Err(ureq::Error::Status(status, response)) => (status, response),
+        Err(ureq::Error::Transport(error)) => {
+            let reason = match attempt.take() {
+                Some(attempt) => {
+                    let completed = attempt.fail_transport(&error, receipt_base);
+                    dispatch::transport_failure_with_attempt(
+                        &error,
+                        Some(completed.render()),
+                        FailurePresentation::Ordinary,
+                    )
+                }
+                None => dispatch::transport_failure(&error),
+            };
+            return Err(CatalogRequestFailure::Transport(reason));
+        }
+    };
+    if let Some(attempt) = attempt.as_mut() {
+        attempt.observe_response(&response);
+    }
+    let encoded = match response.into_string() {
+        Ok(encoded) => encoded,
+        Err(error) => {
+            let reason = match attempt.take() {
+                Some(attempt) => {
+                    let completed = attempt.fail_body(&error, receipt_base);
+                    dispatch::unreadable_response_with_attempt(
+                        status,
+                        &error,
+                        Some(completed.render()),
+                        FailurePresentation::Ordinary,
+                    )
+                }
+                None => dispatch::unreadable_response(status, &error),
+            };
+            return Err(CatalogRequestFailure::Gateway(reason));
+        }
+    };
+    let completed = attempt
+        .take()
+        .map(|attempt| attempt.complete_response(status, &encoded));
+    let attempt_render = completed.as_ref().map(|completed| completed.render());
+    if !(200..300).contains(&status) {
+        return Err(CatalogRequestFailure::Gateway(
+            dispatch::status_failure_with_attempt(status, &encoded, attempt_render),
+        ));
+    }
+
+    if let Err(error) = serde_json::from_str::<Value>(&encoded) {
+        return Err(CatalogRequestFailure::Gateway(match attempt_render {
+            Some(attempt) => dispatch::undecodable_response_with_attempt(
+                status,
+                &encoded,
+                &error,
+                Some(attempt),
+                FailurePresentation::Ordinary,
+            ),
+            None => error.to_string(),
+        }));
+    }
+    parse(&encoded).map_err(CatalogRequestFailure::Projection)
+}
+
+fn load_with_context(context: Option<CommandContext>) -> Result<HarnessCatalog, String> {
+    let receipt_base = home_dir();
+    load_from_with(&receipt_base, || {
+        let endpoint = dispatch::discover().map_err(|reason| unavailable(&reason))?;
+        load_endpoint_with_context_and_deadline(&endpoint, context, &receipt_base, None)
+    })
+}
+
+pub(crate) fn load_optional(context: Option<CommandContext>) -> Option<HarnessCatalog> {
+    load_with_context(context).ok()
+}
+
+pub(crate) fn catalog_for(context: Option<CommandContext>) -> Result<HarnessCatalog, String> {
+    #[cfg(test)]
+    {
+        let _ = context;
+        catalog()
+    }
+    #[cfg(not(test))]
+    {
+        load_with_context(context)
+    }
 }
 
 pub(crate) fn load_optional_from(
     endpoint: &dispatch::Endpoint,
     deadline: Instant,
 ) -> Result<Option<HarnessCatalog>, String> {
-    match load_from_with(&home_dir(), || {
-        load_endpoint_with_deadline(endpoint, Some(deadline))
+    let receipt_base = home_dir();
+    let context = Some(CommandContext::catalog(CatalogOrigin::Onboard));
+    match load_from_with(&receipt_base, || {
+        load_endpoint_with_context_and_deadline(endpoint, context, &receipt_base, Some(deadline))
     }) {
         Ok(catalog) => Ok(Some(catalog)),
         Err(reason) if reason == harness_lease_expired() => Err(reason),
@@ -282,6 +384,15 @@ pub fn catalog() -> Result<HarnessCatalog, String> {
         })
         .collect(),
     })
+}
+
+/// Dispatch's two readings with this module's wording on the sentence. The JSON line
+/// stays whole on its own line after it, so nothing is appended to that line.
+fn gateway_failure(failure: String, wrap: fn(&str) -> String) -> String {
+    match failure.split_once('\n') {
+        Some((human, machine)) => format!("{}\n{machine}", wrap(human)),
+        None => wrap(&failure),
+    }
 }
 
 fn unavailable(reason: &str) -> String {
@@ -459,5 +570,49 @@ mod tests {
                 .unwrap_err();
 
         assert!(error.contains("onboarding lease expired"), "{error}");
+    }
+
+    #[test]
+    fn a_refused_catalog_lookup_keeps_the_status_and_whole_error() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = r#"{"error":{"code":"forbidden","message":"not yours","requestId":"req-9","diagnostic":{"kind":"denial"},"apiToken":"tbc_leaked","extra":7}}"#;
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request);
+            write!(stream, "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        });
+        let endpoint = dispatch::Endpoint {
+            base: format!("http://{address}"),
+            token: "tbc_test".to_owned(),
+            origin: crate::dispatch::Origin::Provisioned,
+        };
+
+        let error = load_endpoint(&endpoint).unwrap_err();
+        server.join().unwrap();
+
+        let (human, machine) = error.split_once('\n').expect("two readings");
+        assert_eq!(
+            human,
+            "harness checks unavailable: forbidden: not yours (req-9); run tightbeam doctor"
+        );
+        let machine: Value = serde_json::from_str(machine).unwrap();
+        assert_eq!(
+            machine,
+            serde_json::json!({
+                "ok": false,
+                "httpStatus": 403,
+                "error": {
+                    "code": "forbidden",
+                    "message": "not yours",
+                    "requestId": "req-9",
+                    "diagnostic": {"kind": "denial"},
+                    "apiToken": "[REDACTED:secret_field]",
+                    "extra": 7
+                }
+            })
+        );
     }
 }

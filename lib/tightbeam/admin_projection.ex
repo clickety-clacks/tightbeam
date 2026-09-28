@@ -2,7 +2,7 @@ defmodule Tightbeam.AdminProjection do
   @moduledoc "Durable row-version floors for branch-local administrative projections."
   require Logger
 
-  alias Tightbeam.DB
+  alias Tightbeam.{DB, ErrorDiagnostic}
   alias Tightbeam.DB.Txn
 
   @ddl """
@@ -67,6 +67,12 @@ defmodule Tightbeam.AdminProjection do
     end
   end
 
+  @doc false
+  @spec add_identity_denial_diagnostic_column_in_txn(Txn.t()) :: :ok
+  def add_identity_denial_diagnostic_column_in_txn(%Txn{} = txn) do
+    Txn.exec(txn, "ALTER TABLE identity_publication_markers ADD COLUMN denialDiagnostic TEXT")
+  end
+
   @doc "Read one durable identity validation-publication marker."
   def identity_publication_marker(source, invocation_id, expected_prior) do
     case query(
@@ -74,7 +80,7 @@ defmodule Tightbeam.AdminProjection do
            """
            SELECT invocationId, expectedPriorLive, candidateRevision, treeFingerprint,
                   principal, validationResult, cause, denialCode, denialMessage,
-                  denialExpected, denialActual, state, createdAt, updatedAt
+                  denialExpected, denialActual, denialDiagnostic, state, createdAt, updatedAt
            FROM identity_publication_markers
            WHERE invocationId = ?1 AND expectedPriorLive = ?2
            """,
@@ -93,6 +99,7 @@ defmodule Tightbeam.AdminProjection do
           denial_message,
           denial_expected,
           denial_actual,
+          denial_diagnostic,
           state,
           created,
           updated
@@ -110,6 +117,7 @@ defmodule Tightbeam.AdminProjection do
           denial_message: denial_message,
           denial_expected: denial_expected,
           denial_actual: denial_actual,
+          denial_diagnostic: decode_denial_diagnostic(denial_diagnostic),
           state: state,
           created_at: created,
           updated_at: updated
@@ -202,7 +210,13 @@ defmodule Tightbeam.AdminProjection do
     :ok
   end
 
-  @doc "Record a pre-commit typed validation denial without a candidate revision."
+  @doc """
+  Record a pre-commit typed validation denial without a candidate revision.
+
+  The optional diagnostic must already be a bounded, redacted JSON-ready
+  ErrorDiagnostic node from its caller. Its JSON-ready shape is checked, then
+  it is encoded for storage unchanged, without a second diagnostic pass.
+  """
   def deny_identity_validation(
         db,
         invocation_id,
@@ -213,6 +227,8 @@ defmodule Tightbeam.AdminProjection do
         denial
       ) do
     now = System.system_time(:millisecond)
+    denial_message = denial |> Map.fetch!(:message) |> ErrorDiagnostic.redact_text()
+    denial_diagnostic = denial |> Map.get(:diagnostic) |> encode_denial_diagnostic()
 
     DB.transaction(db, fn txn ->
       Txn.q(
@@ -221,9 +237,9 @@ defmodule Tightbeam.AdminProjection do
         INSERT OR IGNORE INTO identity_publication_markers
           (invocationId, expectedPriorLive, candidateRevision, treeFingerprint,
            principal, validationResult, cause, denialCode, denialMessage,
-           denialExpected, denialActual, state, createdAt, updatedAt)
-        VALUES (?1, ?2, NULL, ?3, ?4, 'denied', ?5, ?6, ?7, NULL, NULL,
-                'denied', ?8, ?8)
+           denialExpected, denialActual, denialDiagnostic, state, createdAt, updatedAt)
+        VALUES (?1, ?2, NULL, ?3, ?4, 'denied', ?5, ?6, ?7, NULL, NULL, ?8,
+                'denied', ?9, ?9)
         """,
         [
           invocation_id,
@@ -232,13 +248,48 @@ defmodule Tightbeam.AdminProjection do
           principal,
           cause,
           Map.fetch!(denial, :code),
-          Map.fetch!(denial, :message),
+          denial_message,
+          denial_diagnostic,
           now
         ]
       )
 
       identity_publication_marker(txn, invocation_id, expected_prior)
     end)
+  end
+
+  defp encode_denial_diagnostic(nil), do: nil
+
+  defp encode_denial_diagnostic(%{"kind" => "denial"} = diagnostic) do
+    unless json_ready_term?(diagnostic),
+      do: raise(ArgumentError, "identity_denial_diagnostic_invalid")
+
+    JSON.encode!(diagnostic)
+  end
+
+  defp encode_denial_diagnostic(_diagnostic),
+    do: raise(ArgumentError, "identity_denial_diagnostic_invalid")
+
+  defp json_ready_term?(value)
+       when is_nil(value) or is_boolean(value) or is_number(value) or is_binary(value),
+       do: true
+
+  defp json_ready_term?(values) when is_list(values),
+    do: Enum.all?(values, &json_ready_term?/1)
+
+  defp json_ready_term?(object) when is_map(object) do
+    Enum.all?(object, fn {key, value} -> is_binary(key) and json_ready_term?(value) end)
+  end
+
+  defp json_ready_term?(_value), do: false
+
+  defp decode_denial_diagnostic(nil), do: nil
+
+  defp decode_denial_diagnostic(encoded) when is_binary(encoded) do
+    case JSON.decode!(encoded) do
+      %{"kind" => "denial"} = diagnostic -> diagnostic
+      _ -> raise ArgumentError, "identity_denial_diagnostic_invalid"
+    end
   end
 
   @spec key(String.t() | [String.t()]) :: String.t()

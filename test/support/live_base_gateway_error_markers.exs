@@ -10,7 +10,7 @@ end
 
 defmodule GuardErrorMarkers do
   import ExUnit.Assertions
-  alias Tightbeam.{ConnRegistry, DB, EventLog, Gateway, Ledger, Model, Org}
+  alias Tightbeam.{ConnRegistry, DB, ErrorDiagnostic, EventLog, Gateway, Ledger, Model, Org}
   alias Tightbeam.GatewayTurnFixture.{AdapterStub, CoordinatorStub}
 
   def run do
@@ -30,7 +30,32 @@ defmodule GuardErrorMarkers do
       })
 
       {:ok, lane} = GenServer.start_link(GuardErrorDoorbell, self())
-      {:ok, adapter} = AdapterStub.start_link(self())
+      setup_diagnosed? = input["mode"] == "setup_diagnosed"
+
+      # What the real adapter returns when the harness refuses the model while
+      # creating the session: the legacy classification carrying the refusal.
+      setup_refusal = %{
+        "code" => -32602,
+        "message" => "Invalid params",
+        "data" => %{"model" => "fable", "detail" => "not offered"}
+      }
+
+      stub_arg =
+        if setup_diagnosed?,
+          do:
+            {:new_session_reply,
+             {:error,
+              ErrorDiagnostic.diagnosed(
+                :model_unavailable,
+                ErrorDiagnostic.with_facts(setup_refusal,
+                  operation: "session/set_config_option",
+                  phase: "model",
+                  origin: "acp_adapter"
+                )
+              )}, self()},
+          else: self()
+
+      {:ok, adapter} = AdapterStub.start_link(stub_arg)
       {:ok, coordinator} = CoordinatorStub.start_link({adapter, self()})
       exact_registry = Tightbeam.ConnRegistry
 
@@ -52,9 +77,11 @@ defmodule GuardErrorMarkers do
         pre_dispatch? = input["mode"] == "pre_dispatch"
 
         prompt =
-          if pre_dispatch?,
-            do: "fail before dispatch",
-            else: "fail with " <> JSON.encode!(input["reason"])
+          cond do
+            pre_dispatch? -> "fail before dispatch"
+            setup_diagnosed? -> "never reaches the prompt"
+            true -> "fail with " <> JSON.encode!(input["reason"])
+          end
 
         assert :appended =
                  Gateway.deliver_prompt(
@@ -78,6 +105,12 @@ defmodule GuardErrorMarkers do
           assert runner_reason == {:acp_request_not_dispatched, :closed}
         end
 
+        # The turn's reason is the classification it always was; the carrier
+        # never reaches turns.error, the marker or the health decision.
+        if setup_diagnosed? do
+          assert runner_reason == :model_unavailable
+        end
+
         assert {:ok, true} =
                  DB.transaction(db, fn txn ->
                    assert Ledger.finish_in_txn(txn, turn.seq, "failed", "boom",
@@ -97,9 +130,11 @@ defmodule GuardErrorMarkers do
         frames = collect_pushes(9, [])
 
         expected =
-          if pre_dispatch?,
-            do: "{:acp_request_not_dispatched, :closed}",
-            else: input["expected"]
+          cond do
+            pre_dispatch? -> "{:acp_request_not_dispatched, :closed}"
+            setup_diagnosed? -> ":model_unavailable"
+            true -> input["expected"]
+          end
 
         assert Enum.any?(frames, fn frame ->
                  frame["type"] == "message" and
@@ -121,6 +156,38 @@ defmodule GuardErrorMarkers do
                    &1
                  )
                )
+
+        if setup_diagnosed? do
+          assert %{
+                   "stage" => "session",
+                   "reason" => "model_unavailable",
+                   "diagnostic" => %{
+                     "kind" => "jsonrpc_error",
+                     "operation" => "session/set_config_option",
+                     "phase" => "model",
+                     "origin" => "acp_adapter",
+                     "reason" => ^setup_refusal
+                   }
+                 } = JSON.decode!(lifecycle.detail)
+
+          # The live turn-state stream carries the same original refusal.
+          assert Enum.any?(frames, fn frame ->
+                   match?(
+                     %{
+                       "event" => "prompt_turn_state",
+                       "payload" => %{
+                         "state" => "failed",
+                         "diagnostic" => %{
+                           "kind" => "jsonrpc_error",
+                           "operation" => "session/set_config_option",
+                           "reason" => ^setup_refusal
+                         }
+                       }
+                     },
+                     frame
+                   )
+                 end)
+        end
 
         if pre_dispatch? do
           assert lifecycle.detail =~ "prompt"

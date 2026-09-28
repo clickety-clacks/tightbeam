@@ -681,7 +681,7 @@ defmodule Tightbeam.Harness.Claude do
     case JSON.decode(body) do
       {:ok, %{"data" => models}} when is_list(models) -> {:ok, models}
       {:ok, _} -> {:error, :malformed_catalog}
-      {:error, _} -> {:error, :malformed_json}
+      {:error, reason} -> {:error, {:malformed_json, reason}}
     end
   end
 

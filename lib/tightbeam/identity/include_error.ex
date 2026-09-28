@@ -50,6 +50,29 @@ defmodule Tightbeam.Identity.IncludeError do
     }
   end
 
+  @doc """
+  The refusal's structured fields as an error diagnostic `denial` node, so a
+  caller can read cause, origin, location and chain without parsing `message`.
+  Unset fields are absent.
+  """
+  def diagnostic(%__MODULE__{} = error) do
+    details =
+      %{
+        "cause" => error.cause && to_string(error.cause),
+        "origin" => error.origin,
+        "path" => error.path,
+        "line" => error.line,
+        "chain" => error.chain,
+        "paths" => error.paths,
+        "treeFingerprint" => error.tree_fingerprint,
+        "expectedPrior" => error.expected_prior
+      }
+      |> Enum.reject(fn {_key, value} -> value in [nil, []] end)
+      |> Map.new()
+
+    Tightbeam.ErrorDiagnostic.new("denial", details: details)
+  end
+
   @doc false
   def with_candidate(%__MODULE__{} = error, fingerprint, expected_prior) do
     %{error | tree_fingerprint: fingerprint, expected_prior: expected_prior}

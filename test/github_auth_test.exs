@@ -52,6 +52,17 @@ defmodule Tightbeam.GithubAuthTest do
              "https://[redacted]@github.com/org/repo.git"
   end
 
+  # The same inputs and outputs as the Rust scrubber's layout test in
+  # cli/src/github_auth/redact.rs; the two sides must agree byte for byte.
+  test "scrub_detail keeps multi-line layout like the Rust scrubber" do
+    assert GithubAuth.scrub_detail(
+             "  remote: denied\n\tfatal: https://u:ghp_fixture_LAYOUT@github.com/o/r.git\n\nhint:  retry  "
+           ) == "remote: denied\n\tfatal: https://[redacted]@github.com/o/r.git\n\nhint:  retry"
+
+    assert GithubAuth.scrub_detail("see https://github.com/o/r:1@x") ==
+             "see https://github.com/o/r:1@x"
+  end
+
   test "classify_api_failure matches the Rust classifier's contract" do
     # The sentinel phrases that previously classified differently per side.
     assert GithubAuth.classify_api_failure("invalid oauth token") == :needs_onboarding

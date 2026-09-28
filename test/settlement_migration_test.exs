@@ -14,6 +14,7 @@ defmodule Tightbeam.SettlementMigrationTest do
       DROP TABLE turn_lifecycle_events;
       DROP TABLE turn_lifecycle_epoch;
       DROP TABLE wire_idempotency;
+      ALTER TABLE identity_publication_markers DROP COLUMN denialDiagnostic;
       CREATE TABLE wire_idempotency (
         ownerUserId TEXT NOT NULL,
         operation TEXT NOT NULL CHECK(operation IN

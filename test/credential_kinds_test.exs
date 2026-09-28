@@ -191,6 +191,21 @@ defmodule Tightbeam.CredentialKindsTest do
       refute File.exists?(Credentials.credential_path(ctx.base, "eezo", :opencode_go))
     end
 
+    test "a Pi auth.json that is not JSON is refused with its offset, not its bytes", ctx do
+      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
+
+      {:ok, staging, lease_id} = Credentials.begin_onboard(:opencode_go, server)
+      sentinel = "sk-fixture-SENTINEL-0123456789abcdef"
+      File.write!(Path.join(staging, "auth.json"), ~s({"opencode-go" x "#{sentinel}"}))
+
+      assert {:error, {:hollow_credential, %{found: found}}} =
+               Credentials.finish_onboard(:opencode_go, :api_key, lease_id, server)
+
+      assert found =~ "the Pi auth.json is not valid JSON: invalid byte at offset 15"
+      refute found =~ sentinel
+      refute File.exists?(Credentials.credential_path(ctx.base, "eezo", :opencode_go))
+    end
+
     test "a subscription banks with its kind without inferring expiry", ctx do
       {:ok, server} =
         start_credentials(
@@ -663,11 +678,17 @@ defmodule Tightbeam.CredentialKindsTest do
       for {engine, expected} <- [
             {~s({"error":"spawn_failed"}), {:selected_engine_model_list_failed, "spawn_failed"}},
             {~s({"models":"invalid","engineVersion":"0.154.0"}),
-             :malformed_selected_engine_model_list}
+             :malformed_selected_engine_model_list},
+            {{"node: codex not found\nOPENAI_API_KEY=sk-fixture-SENTINEL-0123456789abcdef\n",
+              127},
+             {:selected_engine_model_list_failed,
+              {:exit, 127, "node: codex not found\nOPENAI_API_KEY=[REDACTED:token]"}}}
           ] do
+        {output, status} = if is_tuple(engine), do: engine, else: {engine, 0}
+
         sh = fn command ->
           if String.contains?(Enum.join(command, " "), "model/list"),
-            do: {engine, 0},
+            do: {output, status},
             else: {provider, 0}
         end
 
@@ -829,6 +850,54 @@ defmodule Tightbeam.CredentialKindsTest do
       # The wire translation did not leak into the store, whose spelling is its
       # own (invariant: one authority per vocabulary).
       assert Credentials.kind(:anthropic, Credentials) == :api_key
+    end
+
+    test "a failed finish masks secrets the inspected reason carries", ctx do
+      :ok = Tightbeam.Devices.ensure_schema(ctx.db)
+
+      {:ok, _rows} =
+        Tightbeam.DB.query(
+          ctx.db,
+          "INSERT INTO users (userId, isAdmin, createdAt) VALUES (?1, 1, ?2)",
+          ["kind-admin", System.system_time(:second)]
+        )
+
+      rejected = fn _provider -> {:error, "resume refused: password=fixtureSENTINEL"} end
+
+      start_supervised!(
+        {Credentials,
+         credential_opts(
+           name: Credentials,
+           base_dir: ctx.base,
+           machine: "testhost",
+           on_credential_present: rejected
+         )}
+      )
+
+      onboard =
+        Tightbeam.Gateway.handlers(%{
+          base_dir: ctx.base,
+          db: ctx.db,
+          onboarding_lease_ms: 1_800_000
+        })["onboard"]
+
+      call = %{origin: "user:kind-admin", params: %{provider: "anthropic", kind: "apiKey"}}
+
+      assert %{status: "ready", staging_path: staging, lease_id: lease_id} =
+               onboard.(put_in(call.params[:phase], "begin"))
+
+      File.write!(Path.join(staging, ".credentials.json"), "sk-ant-api03-ceremony")
+
+      assert %{code: "needs_onboarding", message: message} =
+               reply =
+               onboard.(
+                 call
+                 |> put_in([:params, :phase], "finish")
+                 |> put_in([:params, :lease_id], lease_id)
+               )
+
+      assert message =~ "resume refused: password=[REDACTED:secret_field]"
+      refute JSON.encode!(reply) =~ "SENTINEL"
     end
 
     # wi_0535922b: the begin reply names the OWNER user so the CLI can wake that

@@ -1,3 +1,24 @@
+defmodule Tightbeam.IdentityPublicationFixture.ReconcileOnceFailure do
+  @moduledoc false
+  use GenServer
+
+  def start_link(parent) do
+    GenServer.start_link(__MODULE__, parent, name: Tightbeam.SentinelSupervisor)
+  end
+
+  @impl true
+  def init(parent), do: {:ok, %{parent: parent, attempts: 0}}
+
+  @impl true
+  def handle_call({:reconcile, restart}, _from, state) do
+    attempt = state.attempts + 1
+    send(state.parent, {:identity_publication_reconcile, attempt, restart})
+
+    reply = if attempt == 1, do: {:error, :synthetic_reconcile_failure}, else: :ok
+    {:reply, reply, %{state | attempts: attempt}}
+  end
+end
+
 defmodule Tightbeam.IdentityPublicationFixture do
   import ExUnit.Assertions
 
@@ -7,6 +28,7 @@ defmodule Tightbeam.IdentityPublicationFixture do
     DB,
     Devices,
     Dispatch,
+    ErrorDiagnostic,
     Gateway,
     Identity,
     Model,
@@ -101,6 +123,15 @@ defmodule Tightbeam.IdentityPublicationFixture do
     assert %{code: "identity_include_invalid", message: message} = denial = handler.(call)
     assert message =~ "missing.md"
 
+    # The first answer carries the refusal's location as fields, not only as text.
+    assert %{"kind" => "denial", "details" => %{"cause" => "missing_fragment"} = details} =
+             denial.diagnostic
+
+    assert details["treeFingerprint"] =~ ~r/\A[0-9a-f]{64}\z/
+    assert details["expectedPrior"] == live
+    assert %{"origin" => origin, "path" => path, "line" => 1, "paths" => ["missing.md"]} = details
+    assert is_binary(origin) and is_binary(path)
+
     assert %{
              state: "denied",
              cause: "missing_fragment",
@@ -111,7 +142,13 @@ defmodule Tightbeam.IdentityPublicationFixture do
            } = AdminProjection.identity_publication_marker(ctx.db, invocation, live)
 
     assert byte_size(fingerprint) == 64
-    assert handler.(call) == denial
+    # A replay answers from the marker: the same code and message, and the
+    # fields the marker stores.
+    replay = handler.(call)
+    assert Map.delete(replay, :diagnostic) == Map.delete(denial, :diagnostic)
+
+    assert replay.diagnostic == denial.diagnostic
+
     assert git!(identity_dir, ["rev-parse", "main"]) == main
     assert git!(identity_dir, ["rev-parse", "tightbeam/live"]) == live
   end
@@ -230,6 +267,486 @@ defmodule Tightbeam.IdentityPublicationFixture do
              )
 
     assert candidate_revision == candidate.candidate_revision
+  end
+
+  defp scenario(4, ctx) do
+    prepare_learned_unlearn_bundle!(ctx)
+    seed_unlearn_sentinel_rows!(ctx)
+    key = "unlearn-pending-cleanup"
+    {candidate, invocation} = begin_pending_unlearn!(ctx, key)
+    before_refs = identity_ref_snapshot(ctx.base_dir)
+    before_history = identity_history_snapshot(ctx.base_dir)
+    call = unlearn_call(key)
+
+    assert {:ok, %{state: "published", live_revision: revision}} =
+             Dispatch.dispatch(ctx.db, identity_handlers(ctx), call)
+
+    assert revision == candidate.candidate_revision
+
+    assert %{state: "accepted"} =
+             AdminProjection.identity_publication_marker(
+               ctx.db,
+               invocation,
+               candidate.expected_prior
+             )
+
+    assert sentinel_state_rows(ctx) == [["agentic-engineering-extra/runner", "disabled"]]
+    assert sentinel_env_rows(ctx) == [["sentinel:agentic-engineering-extra/runner", "FOREIGN"]]
+    assert identity_ref_snapshot(ctx.base_dir) == before_refs
+    assert identity_history_snapshot(ctx.base_dir) == before_history
+    assert Identity.live_revision!(ctx.base_dir) == revision
+    assert call == unlearn_call(key)
+  end
+
+  defp scenario(5, ctx) do
+    prepare_learned_unlearn_bundle!(ctx)
+    seed_unlearn_sentinel_rows!(ctx)
+    key = "unlearn-accepted-after-delete-failure"
+    call = unlearn_call(key)
+    invocation = keyed_invocation(call.origin, call.verb, key)
+    trigger = "identity_publication_fail_sentinel_delete"
+
+    assert :ok =
+             DB.execute(
+               ctx.db,
+               """
+               CREATE TRIGGER #{trigger} BEFORE DELETE ON sentinel_states
+               BEGIN SELECT RAISE(ABORT, 'synthetic sentinel delete failure'); END
+               """
+             )
+
+    assert {:error, %{code: "server_error"}} =
+             Dispatch.dispatch(ctx.db, identity_handlers(ctx), call)
+
+    marker = AdminProjection.identity_publication_marker_by_invocation(ctx.db, invocation)
+    assert %{state: "accepted", candidate_revision: revision} = marker
+
+    assert sentinel_state_rows(ctx) == [
+             ["agentic-engineering-extra/runner", "disabled"],
+             ["agentic-engineering/runner", "disabled"]
+           ]
+
+    assert sentinel_env_rows(ctx) == [
+             ["sentinel:agentic-engineering-extra/runner", "FOREIGN"],
+             ["sentinel:agentic-engineering/runner", "TARGET"]
+           ]
+
+    before_refs = identity_ref_snapshot(ctx.base_dir)
+    before_history = identity_history_snapshot(ctx.base_dir)
+    before_projection = identity_projection_snapshot(ctx.db)
+    assert call.params == %{name: "agentic-engineering", idempotency_key: key}
+    assert invocation == keyed_invocation(call.origin, call.verb, call.params.idempotency_key)
+
+    assert :ok = DB.execute(ctx.db, "DROP TRIGGER #{trigger}")
+
+    assert {:ok, %{state: "published", live_revision: ^revision}} =
+             Dispatch.dispatch(ctx.db, identity_handlers(ctx), call)
+
+    assert AdminProjection.identity_publication_marker_by_invocation(ctx.db, invocation) ==
+             marker
+
+    assert sentinel_state_rows(ctx) == [["agentic-engineering-extra/runner", "disabled"]]
+    assert sentinel_env_rows(ctx) == [["sentinel:agentic-engineering-extra/runner", "FOREIGN"]]
+    assert identity_ref_snapshot(ctx.base_dir) == before_refs
+    assert identity_history_snapshot(ctx.base_dir) == before_history
+    assert identity_projection_snapshot(ctx.db) == before_projection
+    assert Identity.live_revision!(ctx.base_dir) == revision
+    assert call == unlearn_call(key)
+  end
+
+  defp scenario(6, ctx) do
+    prepare_learned_unlearn_bundle!(ctx)
+    seed_unlearn_sentinel_rows!(ctx)
+    key = "unlearn-accepted-after-reconcile-failure"
+    call = unlearn_call(key)
+    invocation = keyed_invocation(call.origin, call.verb, key)
+    assert is_nil(Process.whereis(Tightbeam.SentinelSupervisor))
+
+    {:ok, supervisor} =
+      Tightbeam.IdentityPublicationFixture.ReconcileOnceFailure.start_link(self())
+
+    try do
+      assert {:error, %{code: "server_error"}} =
+               Dispatch.dispatch(ctx.db, identity_handlers(ctx), call)
+
+      assert_receive {:identity_publication_reconcile, 1, []}
+      marker = AdminProjection.identity_publication_marker_by_invocation(ctx.db, invocation)
+      assert %{state: "accepted", candidate_revision: revision} = marker
+      assert sentinel_state_rows(ctx) == [["agentic-engineering-extra/runner", "disabled"]]
+      assert sentinel_env_rows(ctx) == [["sentinel:agentic-engineering-extra/runner", "FOREIGN"]]
+
+      before_refs = identity_ref_snapshot(ctx.base_dir)
+      before_history = identity_history_snapshot(ctx.base_dir)
+      before_projection = identity_projection_snapshot(ctx.db)
+      assert call.params == %{name: "agentic-engineering", idempotency_key: key}
+      assert invocation == keyed_invocation(call.origin, call.verb, call.params.idempotency_key)
+
+      assert {:ok, %{state: "published", live_revision: ^revision}} =
+               Dispatch.dispatch(ctx.db, identity_handlers(ctx), call)
+
+      assert_receive {:identity_publication_reconcile, 2, []}
+
+      assert AdminProjection.identity_publication_marker_by_invocation(ctx.db, invocation) ==
+               marker
+
+      assert sentinel_state_rows(ctx) == [["agentic-engineering-extra/runner", "disabled"]]
+      assert sentinel_env_rows(ctx) == [["sentinel:agentic-engineering-extra/runner", "FOREIGN"]]
+      assert identity_ref_snapshot(ctx.base_dir) == before_refs
+      assert identity_history_snapshot(ctx.base_dir) == before_history
+      assert identity_projection_snapshot(ctx.db) == before_projection
+      assert Identity.live_revision!(ctx.base_dir) == revision
+      assert call == unlearn_call(key)
+    after
+      if Process.alive?(supervisor), do: GenServer.stop(supervisor)
+    end
+  end
+
+  defp scenario(7, ctx) do
+    prepare_learned_unlearn_bundle!(ctx)
+    seed_unlearn_sentinel_rows!(ctx)
+    key = "unlearn-initial-cleanup"
+    call = unlearn_call(key)
+    invocation = keyed_invocation(call.origin, call.verb, key)
+
+    assert {:ok, %{state: "published", live_revision: revision}} =
+             Dispatch.dispatch(ctx.db, identity_handlers(ctx), call)
+
+    assert %{state: "accepted", candidate_revision: ^revision} =
+             AdminProjection.identity_publication_marker_by_invocation(ctx.db, invocation)
+
+    assert sentinel_state_rows(ctx) == [["agentic-engineering-extra/runner", "disabled"]]
+    assert sentinel_env_rows(ctx) == [["sentinel:agentic-engineering-extra/runner", "FOREIGN"]]
+    assert Identity.live_revision!(ctx.base_dir) == revision
+  end
+
+  defp prepare_learned_unlearn_bundle!(ctx) do
+    assert {:ok, learned} = Identity.learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
+    assert {:ok, _revision} = Identity.publish_live!(ctx.base_dir, learned)
+    Archetypes.load!(ctx.base_dir)
+  end
+
+  defp identity_handlers(ctx),
+    do: Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})
+
+  defp begin_pending_unlearn!(ctx, key) do
+    candidate = Identity.unlearn!(ctx.base_dir, "agentic-engineering", "user:flynn")
+    invocation = keyed_invocation("user:flynn", "unlearn", key)
+
+    assert {:ok, %{state: "pending"}} =
+             AdminProjection.begin_identity_publication(
+               ctx.db,
+               invocation,
+               candidate,
+               "user:flynn"
+             )
+
+    assert {:ok, _revision} = Identity.publish_live!(ctx.base_dir, candidate)
+    {candidate, invocation}
+  end
+
+  defp seed_unlearn_sentinel_rows!(ctx) do
+    now = System.system_time(:millisecond)
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               DB.Txn.q(
+                 txn,
+                 """
+                 INSERT INTO sentinel_states (host, sentinel, state, updatedAt)
+                 VALUES
+                   ('testhost', 'agentic-engineering/runner', 'disabled', ?1),
+                   ('testhost', 'agentic-engineering-extra/runner', 'disabled', ?1)
+                 """,
+                 [now]
+               )
+
+               DB.Txn.q(
+                 txn,
+                 """
+                 INSERT INTO harness_env_overlays
+                   (host, harness, name, value, setBy, setAt)
+                 VALUES
+                   ('testhost', 'sentinel:agentic-engineering/runner', 'TOKEN',
+                    'TARGET', 'user:flynn', ?1),
+                   ('testhost', 'sentinel:agentic-engineering-extra/runner', 'TOKEN',
+                    'FOREIGN', 'user:flynn', ?1)
+                 """,
+                 [now]
+               )
+
+               :ok
+             end)
+  end
+
+  defp unlearn_call(key) do
+    %{
+      verb: "unlearn",
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      session_key: nil,
+      params: %{name: "agentic-engineering", idempotency_key: key}
+    }
+  end
+
+  defp sentinel_state_rows(ctx) do
+    assert {:ok, rows} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT sentinel, state
+               FROM sentinel_states
+               WHERE host = 'testhost'
+               ORDER BY sentinel
+               """
+             )
+
+    rows
+  end
+
+  defp sentinel_env_rows(ctx) do
+    assert {:ok, rows} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT harness, value
+               FROM harness_env_overlays
+               WHERE host = 'testhost' AND harness LIKE 'sentinel:%'
+               ORDER BY harness
+               """
+             )
+
+    rows
+  end
+
+  defp identity_ref_snapshot(base_dir) do
+    identity_dir = Path.join(base_dir, "identity")
+
+    ["main", "tightbeam/live", "tightbeam/upstream"]
+    |> Enum.map(&git!(identity_dir, ["rev-parse", &1]))
+  end
+
+  defp identity_history_snapshot(base_dir) do
+    base_dir
+    |> Path.join("identity")
+    |> git!(["rev-list", "--all", "--format=%H%x00%P%x00%s"])
+  end
+
+  defp identity_projection_snapshot(db) do
+    assert {:ok, rows} =
+             DB.query(
+               db,
+               """
+               SELECT resource, primaryKey, rowVersion, fingerprint, item
+               FROM admin_projection_versions
+               WHERE resource IN ('identity', 'kungfu')
+               ORDER BY resource, primaryKey
+               """
+             )
+
+    rows
+  end
+
+  defp scenario(8, ctx) do
+    handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})
+    live = git!(Path.join(ctx.base_dir, "identity"), ["rev-parse", "tightbeam/live"])
+
+    include_invocation = "identity-include-secret-redaction"
+    secret_include = "api_key=synthetic-include-secret.md"
+
+    include_call =
+      identity_call(
+        %{
+          archetype: "operating-model",
+          content: "#include \"#{secret_include}\"\n"
+        },
+        include_invocation
+      )
+
+    assert {:error, include_denial} = Dispatch.dispatch(ctx.db, handlers, include_call)
+
+    refute include_denial.message =~ "synthetic-include-secret"
+    assert %{"kind" => "denial", "details" => include_details} = include_denial.diagnostic
+    assert include_details["cause"] == "missing_fragment"
+    assert include_details["line"] == 1
+    assert include_details["treeFingerprint"] =~ ~r/\A[0-9a-f]{64}\z/
+    assert hd(include_details["paths"]) =~ "[REDACTED:secret_field]"
+
+    include_marker = AdminProjection.identity_publication_marker(ctx.db, include_invocation, live)
+    assert include_marker.denial_message == include_denial.message
+    assert include_marker.denial_diagnostic == include_denial.diagnostic
+
+    include_replay_call =
+      identity_call(
+        %{archetype: "default", content: "# valid now\n"},
+        include_invocation
+      )
+
+    assert {:error, ^include_denial} =
+             Dispatch.dispatch(ctx.db, handlers, include_replay_call)
+
+    invocation = "identity-denial-secret-field-redaction"
+
+    diagnostic =
+      ErrorDiagnostic.new("denial",
+        details: %{
+          "path" => "includes/api_key=synthetic-secret.md",
+          "apiKey" => "synthetic-field-secret",
+          "safeSibling" => "preserve-this-value",
+          "longValue" => String.duplicate("x", 9_000)
+        }
+      )
+
+    {:ok, marker} =
+      AdminProjection.deny_identity_validation(
+        ctx.db,
+        invocation,
+        live,
+        String.duplicate("a", 64),
+        "user:flynn",
+        "missing_fragment",
+        %{
+          code: "identity_include_invalid",
+          message:
+            "identity_include_invalid token=synthetic-message-secret safeSibling=preserve-this-value",
+          diagnostic: diagnostic
+        }
+      )
+
+    assert marker.denial_message =~ "safeSibling=preserve-this-value"
+    refute marker.denial_message =~ "synthetic-message-secret"
+
+    assert %{"kind" => "denial", "details" => details} = marker.denial_diagnostic
+    assert marker.denial_diagnostic == diagnostic
+    assert details["path"] == "includes/api_key=[REDACTED:secret_field]"
+    assert details["apiKey"] == "[REDACTED:secret_field]"
+    assert details["safeSibling"] == "preserve-this-value"
+    assert %{"$type" => "truncated_string", "bytes" => 9_000} = details["longValue"]
+    refute JSON.encode!(marker.denial_diagnostic) =~ "synthetic-secret"
+    refute JSON.encode!(marker.denial_diagnostic) =~ "synthetic-field-secret"
+
+    field_replay_call =
+      identity_call(
+        %{archetype: "default", content: "# this request would validate\n"},
+        invocation
+      )
+
+    assert {:error, replay} = Dispatch.dispatch(ctx.db, handlers, field_replay_call)
+
+    assert replay.code == "identity_include_invalid"
+    assert replay.message == marker.denial_message
+    assert replay.diagnostic == marker.denial_diagnostic
+  end
+
+  defp scenario(9, ctx) do
+    invocation = "identity-denial-first-writer-race"
+    live = git!(Path.join(ctx.base_dir, "identity"), ["rev-parse", "tightbeam/live"])
+    fingerprint = String.duplicate("b", 64)
+
+    diagnostics =
+      ["first", "second"]
+      |> Enum.map(fn path ->
+        ErrorDiagnostic.new("denial", details: %{"path" => "#{path}.md", "safeSibling" => path})
+      end)
+
+    tasks =
+      Enum.map(diagnostics, fn diagnostic ->
+        Task.async(fn ->
+          AdminProjection.deny_identity_validation(
+            ctx.db,
+            invocation,
+            live,
+            fingerprint,
+            "user:flynn",
+            "missing_fragment",
+            %{
+              code: "identity_include_invalid",
+              message: "same first-writer message",
+              diagnostic: diagnostic
+            }
+          )
+        end)
+      end)
+
+    [{:ok, left}, {:ok, right}] = Enum.map(tasks, &Task.await(&1, 5_000))
+    assert left.denial_code == right.denial_code
+    assert left.denial_message == right.denial_message
+    assert left.denial_diagnostic == right.denial_diagnostic
+    assert left.denial_diagnostic in diagnostics
+
+    assert %{denial_diagnostic: winner} =
+             AdminProjection.identity_publication_marker(ctx.db, invocation, live)
+
+    assert winner == left.denial_diagnostic
+  end
+
+  defp scenario(10, ctx) do
+    handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})
+    cli_token = "tbc_identity_publication_transport"
+
+    router =
+      Tightbeam.Wire.Router.init(
+        db: ctx.db,
+        base_dir: ctx.base_dir,
+        handlers: handlers,
+        cli_token: cli_token,
+        session_status: fn _ -> nil end
+      )
+
+    key = "identity-public-denial-redaction"
+    invocation = keyed_invocation("user:flynn", "identity-edit", key)
+    secret_path = "api_key=synthetic-public-secret.md"
+
+    first =
+      post_identity_dispatch(router, cli_token, "flynn", %{
+        "archetype" => "operating-model",
+        "content" => "#include \"#{secret_path}\"\n",
+        "idempotencyKey" => key
+      })
+
+    assert first.status == 400, first.resp_body
+
+    assert %{
+             "error" => %{
+               "code" => "identity_include_invalid",
+               "message" => message,
+               "diagnostic" => %{"kind" => "denial", "details" => details} = diagnostic
+             }
+           } = first_body = JSON.decode!(first.resp_body)
+
+    assert details["cause"] == "missing_fragment"
+    assert details["line"] == 1
+    assert is_binary(details["path"])
+    refute first.resp_body =~ "synthetic-public-secret"
+
+    marker = AdminProjection.identity_publication_marker_by_invocation(ctx.db, invocation)
+    assert marker.denial_message == message
+    assert marker.denial_diagnostic == diagnostic
+    refute marker.denial_message =~ "synthetic-public-secret"
+    refute JSON.encode!(marker.denial_diagnostic) =~ "synthetic-public-secret"
+
+    replay =
+      post_identity_dispatch(router, cli_token, "flynn", %{
+        "archetype" => "default",
+        "content" => "# valid after denial\n",
+        "idempotencyKey" => key
+      })
+
+    assert replay.status == 400, replay.resp_body
+    assert JSON.decode!(replay.resp_body) == first_body
+  end
+
+  defp post_identity_dispatch(router, cli_token, user_id, params) do
+    Plug.Test.conn(
+      :post,
+      "/agent/dispatch",
+      JSON.encode!(%{"verb" => "identity-edit", "asUser" => user_id, "params" => params})
+    )
+    |> Plug.Conn.put_req_header("authorization", "Bearer " <> cli_token)
+    |> Plug.Conn.put_req_header(
+      "x-tightbeam-cli-version",
+      Tightbeam.CliCompatibility.required_version()
+    )
+    |> Tightbeam.Wire.Router.call(router)
   end
 
   defp identity_call(params, invocation_id) do

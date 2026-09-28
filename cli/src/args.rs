@@ -1793,7 +1793,7 @@ fn parse_with_optional_catalog(
             let predicate = nonempty(flags, "predicate")
                 .map(|encoded| {
                     let value = serde_json::from_str::<serde_json::Value>(&encoded)
-                        .map_err(|_| "--predicate must be a JSON object".to_owned())?;
+                        .map_err(|error| format!("--predicate must be a JSON object: {error}"))?;
                     if value.is_object() {
                         Ok(value)
                     } else {
@@ -2189,7 +2189,9 @@ fn parse_with_optional_catalog(
             if let Some(name) = harness.as_deref() {
                 let catalog = match supplied_catalog {
                     Some(catalog) => catalog.clone(),
-                    None => crate::harnesses::catalog()?,
+                    None => crate::harnesses::catalog_for(Some(
+                        crate::attempt_diagnostic::command_context::CommandContext::spawn_catalog(),
+                    ))?,
                 };
                 if !catalog.contains(name) {
                     return Err(format!("unsupported harness: {name}"));
@@ -2290,8 +2292,9 @@ fn parse_with_optional_catalog(
                 nonempty(flags, "subject").ok_or_else(|| "--subject is required".to_owned())?;
             let files = nonempty(flags, "files")
                 .map(|encoded| {
-                    serde_json::from_str::<Vec<String>>(&encoded)
-                        .map_err(|_| "--files must be a JSON array of strings".to_owned())
+                    serde_json::from_str::<Vec<String>>(&encoded).map_err(|error| {
+                        format!("--files must be a JSON array of strings: {error}")
+                    })
                 })
                 .transpose()?;
             Ok(Command::Assign {
@@ -2556,7 +2559,7 @@ fn parse_with_optional_catalog(
                 .ok_or_else(|| "--commit-refs is required".to_owned())
                 .and_then(|encoded| {
                     serde_json::from_str::<Vec<serde_json::Value>>(&encoded)
-                        .map_err(|_| "--commit-refs must be a JSON array".to_owned())
+                        .map_err(|error| format!("--commit-refs must be a JSON array: {error}"))
                 })?;
             Ok(Command::AssignmentCommitRefCorrect {
                 identity: identity(flags)?,
@@ -2992,7 +2995,7 @@ fn parse_with_optional_catalog(
             let commit_refs = nonempty(flags, "commit-refs")
                 .map(|encoded| {
                     serde_json::from_str::<Vec<serde_json::Value>>(&encoded)
-                        .map_err(|_| "--commit-refs must be a JSON array".to_owned())
+                        .map_err(|error| format!("--commit-refs must be a JSON array: {error}"))
                 })
                 .transpose()?;
             let release_fact_kind = nonempty(flags, "release-fact-kind");
@@ -3190,7 +3193,10 @@ fn parse_with_optional_catalog(
             debug_assert_eq!(selected_identity, Identity::User(as_user.clone()));
             let catalog = match supplied_catalog {
                 Some(catalog) => catalog.clone(),
-                None => crate::harnesses::catalog()?,
+                None => crate::harnesses::catalog_for(Some(
+                    crate::attempt_diagnostic::command_context::CommandContext::assimilate_catalog(
+                    ),
+                ))?,
             };
             let harnesses = match nonempty(flags, "harness") {
                 Some(value) => value.split(',').map(str::to_owned).collect::<Vec<_>>(),
@@ -3342,7 +3348,7 @@ fn parse_host_toolchain_set(
 
     let encoded = nonempty(flags, "dirs").ok_or_else(|| usage.to_owned())?;
     let dirs = serde_json::from_str::<Vec<String>>(&encoded)
-        .map_err(|_| "--dirs must be a JSON array of strings".to_owned())?;
+        .map_err(|error| format!("--dirs must be a JSON array of strings: {error}"))?;
 
     Ok(Command::HostToolchainSet {
         identity: identity(flags)?,
@@ -4212,7 +4218,9 @@ mod tests {
                 "--dirs",
                 r#"[1]"#,
             ])),
-            Err("--dirs must be a JSON array of strings".to_owned())
+            Err("--dirs must be a JSON array of strings: \
+                 invalid type: integer `1`, expected a string at line 1 column 2"
+                .to_owned())
         );
     }
 
@@ -5331,6 +5339,27 @@ mod tests {
                 "continue",
             ])),
             Err("--predicate must be a JSON object".to_owned())
+        );
+
+        // Malformed JSON keeps the parser's location for the person who typed it.
+        assert_eq!(
+            parse(strings(&[
+                "wake",
+                "--session",
+                "agent:holder",
+                "--assignment",
+                "asg_a",
+                "--predicate",
+                r#"{"state":"#,
+                "--fallback-after",
+                "2h",
+                "--prompt",
+                "continue",
+            ])),
+            Err(
+                "--predicate must be a JSON object: EOF while parsing a value at line 1 column 9"
+                    .to_owned()
+            )
         );
     }
 

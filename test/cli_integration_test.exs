@@ -669,6 +669,290 @@ defmodule Tightbeam.CliIntegrationTest do
     assert network =~ "Connection refused" or network =~ "connection refused"
   end
 
+  test "real CLI keeps a gateway reply's status and whole envelope on its machine line", ctx do
+    session_file = Path.join(ctx.base_dir, "work/session/.tightbeam-session")
+    sentinel = "sk-fixture-SENTINEL-0123456789abcdef"
+
+    replies = [
+      {502, "text/html", "<html>bad gateway key=#{sentinel}</html>"},
+      {409, "application/json",
+       JSON.encode!(%{
+         "error" => %{
+           "code" => "upstream_refused",
+           "message" => "provider said no",
+           "requestId" => "req_fixture",
+           "diagnostic" => %{"cause" => %{"code" => "rate_limited", "phase" => "turn"}},
+           "unknownUpstreamField" => %{"kept" => true}
+         }
+       })},
+      {200, "application/json", ~s({"result":)}
+    ]
+
+    {:ok, listener} =
+      :gen_tcp.listen(0, [:binary, ip: {127, 0, 0, 1}, active: false, reuseaddr: true])
+
+    {:ok, {_address, port}} = :inet.sockname(listener)
+    peer = Task.async(fn -> Enum.each(replies, &serve_one(listener, &1)) end)
+
+    File.write!(
+      session_file,
+      JSON.encode!(%{
+        url: "http://127.0.0.1:#{port}",
+        token: ctx.session.cli_token,
+        sessionKey: ctx.session.session_key
+      })
+    )
+
+    [html, nested, truncated] =
+      Enum.map(replies, fn _reply ->
+        {output, status} =
+          System.cmd(ctx.binary, ["list"], cd: ctx.workdir, stderr_to_stdout: true)
+
+        assert status != 0, output
+        output
+      end)
+
+    Task.await(peer)
+    :gen_tcp.close(listener)
+
+    # The secret in a non-JSON body never reaches either reading.
+    refute html =~ sentinel
+    assert html =~ "gateway reply (HTTP 502) is not JSON"
+    html_machine = machine_line!(html)
+    assert html_machine["ok"] == false
+    assert html_machine["httpStatus"] == 502
+    assert html_machine["error"]["code"] == "response_undecodable"
+    assert html_machine["error"]["body"] =~ "[REDACTED:token]"
+    assert html_machine["error"]["body"] =~ "bad gateway"
+
+    # A refusal keeps every field the peer sent, including ones the CLI does not know.
+    assert nested =~ "upstream_refused: provider said no (req_fixture)"
+
+    machine = machine_line!(nested)
+
+    assert Map.drop(machine, ["attempt"]) == %{
+             "ok" => false,
+             "httpStatus" => 409,
+             "error" => %{
+               "code" => "upstream_refused",
+               "message" => "provider said no",
+               "requestId" => "req_fixture",
+               "diagnostic" => %{"cause" => %{"code" => "rate_limited", "phase" => "turn"}},
+               "unknownUpstreamField" => %{"kept" => true}
+             }
+           }
+
+    assert_attempt_projection!(machine, "cli.list")
+
+    # A cut-off 2xx body is a decode failure, not a success with no result.
+    truncated_machine = machine_line!(truncated)
+    assert truncated_machine["httpStatus"] == 200
+    assert truncated_machine["error"]["code"] == "response_undecodable"
+    assert truncated_machine["error"]["body"] == ~s({"result":)
+  end
+
+  test "real CLI masks every secret form a failure body carries and keeps the rest", ctx do
+    session_file = Path.join(ctx.base_dir, "work/session/.tightbeam-session")
+
+    html =
+      "<p>login password=fixtureSENTINEL failed</p>\n" <>
+        "<p>upstream https://svc:fixtureSENTINEL@db.test/x</p>\n" <>
+        "Authorization: Basic Zml4dHVyZVNFTlRJTkVM\n" <>
+        "Cookie: sid=fixtureSENTINEL; theme=dark\n" <>
+        "-----BEGIN PRIVATE KEY-----\nfixtureSENTINEL\n-----END PRIVATE KEY-----\n<p>end</p>"
+
+    replies = [
+      {502, "text/html", html},
+      {401, "application/json",
+       JSON.encode!(%{
+         "error" => %{
+           "code" => "upstream_refused",
+           "message" => "rejected password=fixtureSENTINEL",
+           "clientSecret" => "fixtureSENTINEL",
+           "diagnostic" => %{"headers" => %{"Set-Cookie" => "fixtureSENTINEL", "x-trace" => "t1"}}
+         }
+       })},
+      {403, "application/json",
+       JSON.encode!(%{"detail" => "denied", "access_token" => "fixtureSENTINEL"})}
+    ]
+
+    {:ok, listener} =
+      :gen_tcp.listen(0, [:binary, ip: {127, 0, 0, 1}, active: false, reuseaddr: true])
+
+    {:ok, {_address, port}} = :inet.sockname(listener)
+    peer = Task.async(fn -> Enum.each(replies, &serve_one(listener, &1)) end)
+
+    File.write!(
+      session_file,
+      JSON.encode!(%{
+        url: "http://127.0.0.1:#{port}",
+        token: ctx.session.cli_token,
+        sessionKey: ctx.session.session_key
+      })
+    )
+
+    [undecodable, refusal, bare] =
+      Enum.map(replies, fn _reply ->
+        {output, status} =
+          System.cmd(ctx.binary, ["list"], cd: ctx.workdir, stderr_to_stdout: true)
+
+        assert status != 0, output
+        refute output =~ "SENTINEL"
+        output
+      end)
+
+    Task.await(peer)
+    :gen_tcp.close(listener)
+
+    body = machine_line!(undecodable)["error"]["body"]
+    assert body =~ "<p>login password=[REDACTED:secret_field] failed</p>"
+    assert body =~ "<p>upstream https://[REDACTED:userinfo]@db.test/x</p>"
+    assert body =~ "Authorization: Basic [REDACTED:secret_field]\n"
+    assert body =~ "Cookie: [REDACTED:secret_field]; theme=dark\n"
+    assert body =~ "[REDACTED:private_key]\n<p>end</p>"
+
+    assert refusal =~ "upstream_refused: rejected password=[REDACTED:secret_field]"
+
+    machine = machine_line!(refusal)
+
+    assert Map.drop(machine, ["attempt"]) == %{
+             "ok" => false,
+             "httpStatus" => 401,
+             "error" => %{
+               "code" => "upstream_refused",
+               "message" => "rejected password=[REDACTED:secret_field]",
+               "clientSecret" => "[REDACTED:secret_field]",
+               "diagnostic" => %{
+                 "headers" => %{"Set-Cookie" => "[REDACTED:secret_field]", "x-trace" => "t1"}
+               }
+             }
+           }
+
+    assert_attempt_projection!(machine, "cli.list")
+
+    bare_machine = machine_line!(bare)
+
+    assert Map.drop(bare_machine, ["attempt"]) == %{
+             "ok" => false,
+             "httpStatus" => 403,
+             "body" => %{"detail" => "denied", "access_token" => "[REDACTED:secret_field]"}
+           }
+
+    assert_attempt_projection!(bare_machine, "cli.list")
+  end
+
+  test "real CLI prints a gateway handler crash with its secrets masked", ctx do
+    raising = fn _call ->
+      raise MatchError,
+        term: %{creds: %{"password" => "fixtureSENTINEL"}, echo: "password=fixtureSENTINEL"}
+    end
+
+    router_opts =
+      Router.init(
+        db: ctx.db,
+        base_dir: ctx.base_dir,
+        handlers: Map.put(ctx.handlers, "work-item-create", raising),
+        cli_token: "tbc_cli_integration",
+        session_status: fn _ -> nil end
+      )
+
+    bandit =
+      start_supervised!(
+        {Bandit, plug: {Router, router_opts}, port: 0, ip: {127, 0, 0, 1}, startup_log: false},
+        id: :raising_router
+      )
+
+    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
+
+    File.write!(
+      Path.join(ctx.base_dir, "work/session/.tightbeam-session"),
+      JSON.encode!(%{
+        url: "http://127.0.0.1:#{port}",
+        token: ctx.session.cli_token,
+        sessionKey: ctx.session.session_key
+      })
+    )
+
+    {output, status} =
+      System.cmd(ctx.binary, ["work-item-create", "--title", "crash", "--as-user", "flynn"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert status != 0, output
+    refute output =~ "SENTINEL"
+    assert output =~ "server_error: no match of right hand side value"
+
+    machine = machine_line!(output)
+    assert machine["httpStatus"] == 500
+    assert machine["error"]["code"] == "server_error"
+    assert machine["error"]["message"] =~ ~s("password" => "[REDACTED:secret_field]")
+    assert machine["error"]["message"] =~ "password=[REDACTED:secret_field]"
+
+    assert %{"kind" => "exception", "operation" => "work-item-create"} =
+             machine["error"]["diagnostic"]
+
+    {:ok, [[payload]]} =
+      DB.query(ctx.db, "SELECT payload FROM events WHERE verb='work-item-create'")
+
+    assert payload =~ "[REDACTED:secret_field]"
+    refute payload =~ "SENTINEL"
+  end
+
+  defp serve_one(listener, {status, content_type, body}) do
+    {:ok, socket} = :gen_tcp.accept(listener, 10_000)
+    :ok = read_request(socket, "")
+
+    :ok =
+      :gen_tcp.send(socket, [
+        "HTTP/1.1 #{status} Fixture\r\n",
+        "content-type: #{content_type}\r\n",
+        "content-length: #{byte_size(body)}\r\n",
+        "connection: close\r\n\r\n",
+        body
+      ])
+
+    :gen_tcp.close(socket)
+  end
+
+  defp read_request(socket, acc) do
+    complete? =
+      case String.split(acc, "\r\n\r\n", parts: 2) do
+        [head, rest] ->
+          case Regex.run(~r/content-length:\s*(\d+)/i, head) do
+            [_, length] -> byte_size(rest) >= String.to_integer(length)
+            nil -> true
+          end
+
+        [_partial] ->
+          false
+      end
+
+    if complete? do
+      :ok
+    else
+      {:ok, data} = :gen_tcp.recv(socket, 0, 10_000)
+      read_request(socket, acc <> data)
+    end
+  end
+
+  defp machine_line!(output) do
+    output |> String.trim_trailing() |> String.split("\n") |> List.last() |> JSON.decode!()
+  end
+
+  defp assert_attempt_projection!(machine, operation) do
+    assert %{
+             "requestId" => request_id,
+             "operation" => ^operation,
+             "listenerGeneration" => nil,
+             "diagnostic" => nil,
+             "receipt" => "not_applicable"
+           } = machine["attempt"]
+
+    assert is_binary(request_id)
+    assert String.starts_with?(request_id, "req_")
+  end
+
   test "real CLI discovers a session token, dispatches, and loses access at retire", ctx do
     {listed, 0} = System.cmd(ctx.binary, ["list"], cd: ctx.workdir, stderr_to_stdout: true)
     assert listed =~ "cli-holder"
@@ -1356,6 +1640,42 @@ defmodule Tightbeam.CliIntegrationTest do
 
     assert %{status: "closed"} =
              RailRemedy.episode(ctx.db, "completion-requires-results-artifact", work_id)
+
+    # An absent work item is refused by name over the real wire, never as the
+    # insert's foreign-key MatchError.
+    {refused, status} =
+      System.cmd(
+        ctx.binary,
+        [
+          "artifact-record",
+          "--kind",
+          "report",
+          "--title",
+          "stray",
+          "--path",
+          "results.txt",
+          "--work-item",
+          "wi_absent"
+        ],
+        cd: coder_dir,
+        stderr_to_stdout: true
+      )
+
+    assert status != 0
+    assert refused =~ "unknown_work_item"
+    assert refused =~ "unknown work item: wi_absent"
+    refute refused =~ "no match of right hand side"
+    refute refused =~ "FOREIGN KEY"
+
+    # The machine line carries the real gateway's status and envelope.
+    assert %{
+             "ok" => false,
+             "httpStatus" => 404,
+             "error" => %{
+               "code" => "unknown_work_item",
+               "message" => "unknown work item: wi_absent"
+             }
+           } = machine_line!(refused)
   end
 
   # O2 keeps its code-evidence edge active even when the org has no learned
@@ -1841,8 +2161,29 @@ defmodule Tightbeam.CliIntegrationTest do
 
     assert exit_status != 0
 
-    assert String.trim(refusal) ==
-             "decision_request_integrity_invalid: decision request integrity check failed (#{request.id})"
+    assert [human, _machine] = refusal |> String.trim() |> String.split("\n")
+
+    expected_human =
+      "decision_request_integrity_invalid: decision request integrity check failed (#{request.id})"
+
+    assert [^expected_human, attempt_text] = String.split(human, "; attempt ", parts: 2)
+
+    assert attempt_text =~
+             ~r/^requestId=req_\S+ operation=cli\.decision_request listenerGeneration=unknown receipt=not_applicable; diagnostic=unknown$/
+
+    machine = machine_line!(refusal)
+
+    assert Map.drop(machine, ["attempt"]) == %{
+             "ok" => false,
+             "httpStatus" => 500,
+             "error" => %{
+               "code" => "decision_request_integrity_invalid",
+               "message" => "decision request integrity check failed",
+               "requestId" => request.id
+             }
+           }
+
+    assert_attempt_projection!(machine, "cli.decision_request")
   end
 
   test "real CLI creates and gets work items and enforces spec-ref pairing", ctx do
