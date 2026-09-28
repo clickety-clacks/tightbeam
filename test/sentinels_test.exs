@@ -9,6 +9,13 @@ defmodule Tightbeam.SentinelsTest do
   @bundles ~w(alpha-bundle beta-bundle)
 
   setup do
+    # The seed commit trips git's auto-maintenance, which detaches and repacks the
+    # identity repository in the background. A later write that races its cleanup of
+    # an object directory fails on macOS as "unable to create temporary file: Invalid
+    # argument", and a repack still running at on_exit breaks File.rm_rf!/1. Nothing
+    # here tests maintenance, so this module's git never starts it.
+    disable_git_auto_maintenance!()
+
     root = Path.join(System.tmp_dir!(), "tb-sentinels-#{System.unique_integer([:positive])}")
     bundles = Path.join(root, "kungfu")
     base = Path.join(root, "runtime")
@@ -460,6 +467,18 @@ defmodule Tightbeam.SentinelsTest do
   defp learn_both!(ctx) do
     Identity.init!(ctx.base)
     Enum.each(@bundles, &learn!(ctx.base, &1))
+  end
+
+  # Appended through git's environment config so it reaches every git the
+  # substrate spawns; TestCase restores the environment after each test.
+  defp disable_git_auto_maintenance! do
+    index = String.to_integer(System.get_env("GIT_CONFIG_COUNT", "0"))
+
+    System.put_env(%{
+      "GIT_CONFIG_COUNT" => Integer.to_string(index + 1),
+      "GIT_CONFIG_KEY_#{index}" => "maintenance.auto",
+      "GIT_CONFIG_VALUE_#{index}" => "false"
+    })
   end
 
   defp set_settings!(ctx, qualified, settings) do
