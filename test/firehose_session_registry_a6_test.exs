@@ -70,6 +70,17 @@ defmodule Tightbeam.Firehose.SessionRegistryA6Test do
     assert payload == canonical_session(ctx.db, ctx.worker.session_key)
     assert payload == StateResources.session(renamed)
     assert payload["rowVersion"] > before["rowVersion"]
+    capability = payload["capabilities"]["setHarness"]
+
+    assert capability == %{
+             "supported" => true,
+             "options" =>
+               Enum.map(Tightbeam.Harness.all(), fn module ->
+                 name = module.wire_name()
+                 %{"title" => name, "value" => name, "enabled" => name != payload["harness"]}
+               end)
+           }
+
     refute Map.has_key?(payload, "cliToken")
     refute inspect(payload) =~ "tbs_"
 
@@ -92,6 +103,60 @@ defmodule Tightbeam.Firehose.SessionRegistryA6Test do
 
     assert model == newer["payload"]
     assert model == canonical_session(ctx.db, ctx.worker.session_key)
+  end
+
+  test "harness changes publish one committed capability item and duplicates publish none", ctx do
+    before = canonical_session(ctx.db, ctx.worker.session_key)
+
+    switched =
+      Org.set_harness(
+        ctx.db,
+        ctx.worker.session_key,
+        "codex",
+        "openai",
+        Tightbeam.Model.new("gpt-5.6-sol")
+      )
+
+    notice = receive_notice()
+    payload = notice["payload"]
+
+    assert notice["class"] == "session.harness_changed"
+    assert notice["resource"] == "sessions"
+    assert notice["op"] == "upsert"
+    assert notice["refs"] == %{"sessionKey" => ctx.worker.session_key}
+    assert payload == canonical_session(ctx.db, ctx.worker.session_key)
+    assert payload == StateResources.session(switched)
+    assert payload["rowVersion"] > before["rowVersion"]
+    assert payload["harness"] == "codex"
+
+    assert payload["capabilities"]["setHarness"]["options"] == [
+             %{"title" => "claude", "value" => "claude", "enabled" => true},
+             %{"title" => "codex", "value" => "codex", "enabled" => false}
+           ]
+
+    assert {:ok, rebuilt} =
+             Tightbeam.Firehose.Rebuild.fetch(
+               ctx.db,
+               "session.harness_changed",
+               %{"sessionKey" => ctx.worker.session_key},
+               "flynn",
+               false
+             )
+
+    assert rebuilt == payload
+
+    duplicate =
+      Org.set_harness(
+        ctx.db,
+        ctx.worker.session_key,
+        "codex",
+        "openai",
+        Tightbeam.Model.new("gpt-5.6-sol")
+      )
+
+    assert duplicate.updated_at == switched.updated_at
+    sync_hub()
+    refute_receive {:firehose_notice, _notice}, 50
   end
 
   test "PO association leaves canonical session notices and row versions unchanged", ctx do

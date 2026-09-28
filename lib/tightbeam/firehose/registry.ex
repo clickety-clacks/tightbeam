@@ -41,6 +41,7 @@ defmodule Tightbeam.Firehose.Registry do
     {"decision_request.withdrawn", "decision-requests", "upsert", "decisionRequestId"},
     {"session.spawned", "sessions", "upsert", "sessionKey"},
     {"session.updated", "sessions", "upsert", "sessionKey"},
+    {"session.harness_changed", "sessions", "upsert", "sessionKey"},
     {"session.retired", "sessions", "upsert", "sessionKey"},
     {"role.created", "roles", "upsert", "role"},
     {"role.bound", "roles", "upsert", "role"},
@@ -250,6 +251,14 @@ defmodule Tightbeam.Firehose.Registry do
           |> Map.put(:primary_refs, ["messageId", "sessionKey"])
         end)
         |> Map.update!("session.updated", fn row ->
+          Map.merge(row, %{
+            query: :query_session,
+            visibility: :visible?,
+            rebuild: true,
+            version_source: "sessions.updatedAt"
+          })
+        end)
+        |> Map.update!("session.harness_changed", fn row ->
           Map.merge(row, %{
             query: :query_session,
             visibility: :visible?,

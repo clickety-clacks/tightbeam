@@ -90,7 +90,7 @@ defmodule Tightbeam.StateResources do
     "decision requests" =>
       ~w(id kind raiserId raiserSessionKey ownerUserId assignmentId expecterSessionKey expecterUserId lineageRung effortGeneration deadlineWakeId raisedAt deadlineAt statuteName question options context status decision rationale ruledBy ruledAt consumedAt withdrawnBy withdrawnReason withdrawnAt askedOfRole answer answeredBy answeredAt rowVersion),
     "sessions" =>
-      ~w(sessionKey displayName kind orderIndex isBuiltIn adopted ownerUserId origin spawnedBy topologyParent handle archetype overrides identityName identityRevision harness provider model thinkingLevel modelContext host clearedThroughSeq state createdAt updatedAt mechanicalStatus rowVersion),
+      ~w(sessionKey displayName kind orderIndex isBuiltIn adopted ownerUserId origin spawnedBy topologyParent handle archetype overrides identityName identityRevision harness provider model thinkingLevel modelContext host clearedThroughSeq state createdAt updatedAt mechanicalStatus capabilities rowVersion),
     "roles" => ~w(name boundSessionKey ownerUserId createdAt updatedAt rowVersion),
     "users" => ~w(userId isAdmin createdAt rowVersion),
     "devices" => ~w(deviceId userId claimedName status platform model createdAt rowVersion),
@@ -270,6 +270,7 @@ defmodule Tightbeam.StateResources do
     {"decision requests", "options"} => {:array, :decision_option, :preserve},
     {"decision requests", "context"} => :json,
     {"sessions", "overrides"} => :session_overrides,
+    {"sessions", "capabilities"} => :session_capabilities,
     {"transcript messages", "attachments"} => {:array, :attachment, :preserve},
     {"transcript messages", "context"} => :json,
     {"identity", "sessionRevisions"} => :string_map,
@@ -1219,6 +1220,8 @@ defmodule Tightbeam.StateResources do
     reject_public_shape_drift!(row, "sessions")
 
     row = row |> session_wire_overrides() |> session_model_selection()
+    harness_registry = registered_harness_names()
+    set_harness = set_harness_capability(row, harness_registry)
 
     exact!(
       "sessions",
@@ -1250,10 +1253,62 @@ defmodule Tightbeam.StateResources do
         "createdAt" => session_wire_value!(row, :created_at, "createdAt"),
         "updatedAt" => session_wire_value!(row, :updated_at, "updatedAt"),
         "mechanicalStatus" => session_wire_value!(row, :mechanical_status, "mechanicalStatus"),
+        "capabilities" => %{"setHarness" => set_harness},
         "rowVersion" => session_wire_value!(row, :row_version, "rowVersion")
       }
     )
   end
+
+  @doc false
+  def set_harness_capability(row, registry \\ registered_harness_names())
+      when is_map(row) do
+    registry = validate_harness_registry!(registry)
+    harness = row |> value(:harness) |> normalize_session_wire_value()
+    state = row |> value(:state) |> normalize_session_wire_value()
+
+    unless is_binary(harness) and harness != "" do
+      raise ArgumentError, "sessions.harness must be a non-empty string"
+    end
+
+    unless harness in registry do
+      raise ArgumentError, "sessions.harness is not registered"
+    end
+
+    cond do
+      state != "active" ->
+        %{"supported" => false, "reason" => "session is not active"}
+
+      true ->
+        options =
+          Enum.map(registry, fn name ->
+            %{"title" => name, "value" => name, "enabled" => name != harness}
+          end)
+
+        if Enum.any?(options, & &1["enabled"]) do
+          %{"supported" => true, "options" => options}
+        else
+          %{"supported" => false, "reason" => "no alternate harness is registered"}
+        end
+    end
+  end
+
+  defp registered_harness_names do
+    Harness.all()
+    |> Enum.map(& &1.wire_name())
+    |> validate_harness_registry!()
+  end
+
+  defp validate_harness_registry!(registry) when is_list(registry) do
+    unless registry != [] and Enum.all?(registry, &(is_binary(&1) and &1 != "")) and
+             length(registry) == length(Enum.uniq(registry)) do
+      raise ArgumentError, "harness registry has an empty or duplicate wire name"
+    end
+
+    registry
+  end
+
+  defp validate_harness_registry!(_registry),
+    do: raise(ArgumentError, "harness registry must be an ordered list")
 
   def role(row), do: row |> public() |> correlate("role", "name")
 
@@ -1634,6 +1689,33 @@ defmodule Tightbeam.StateResources do
     )
   end
 
+  defp validate_wire_value!(value, :session_capabilities, label) do
+    validate_closed_wire_object!(value, %{"setHarness" => :harness_capability}, label)
+  end
+
+  defp validate_wire_value!(%{"supported" => false} = value, :harness_capability, label) do
+    validate_closed_wire_object!(value, %{"supported" => :boolean, "reason" => :string}, label)
+  end
+
+  defp validate_wire_value!(%{"supported" => true} = value, :harness_capability, label) do
+    validate_closed_wire_object!(
+      value,
+      %{"supported" => :boolean, "options" => {:array, :harness_option, :preserve}},
+      label
+    )
+  end
+
+  defp validate_wire_value!(_value, :harness_capability, label),
+    do: raise(ArgumentError, "#{label} has an invalid supported form")
+
+  defp validate_wire_value!(value, :harness_option, label) do
+    validate_closed_wire_object!(
+      value,
+      %{"title" => :string, "value" => :string, "enabled" => :boolean},
+      label
+    )
+  end
+
   defp validate_wire_value!(value, :attachment, label) do
     validate_closed_wire_object!(
       value,
@@ -1844,6 +1926,34 @@ defmodule Tightbeam.StateResources do
   end
 
   defp encode_item_field("sessions", "overrides", nil), do: "null"
+
+  defp encode_item_field("sessions", "capabilities", value) do
+    capability = Map.fetch!(value, "setHarness")
+
+    encoded_capability =
+      case capability do
+        %{"supported" => false} ->
+          encode_closed_object!(
+            capability,
+            ~w(supported reason),
+            "sessions.capabilities.setHarness"
+          )
+
+        %{"supported" => true, "options" => options} ->
+          "{\"supported\":true,\"options\":" <>
+            encode_closed_list!(
+              options,
+              ~w(title value enabled),
+              "sessions.capabilities.setHarness.options"
+            ) <>
+            "}"
+
+        _ ->
+          raise ArgumentError, "sessions.capabilities.setHarness has an invalid supported form"
+      end
+
+    "{\"setHarness\":" <> encoded_capability <> "}"
+  end
 
   defp encode_item_field("sessions", "overrides", value) do
     "{" <>

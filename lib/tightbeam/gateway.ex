@@ -1445,7 +1445,7 @@ defmodule Tightbeam.Gateway do
       end,
       {"critical", ["critical_lease.updated"]} => fn call -> critical_result(config, db, call) end,
       {"spawn", ["session.spawned"]} => fn call -> spawn_result(config, db, call) end,
-      {"tune", ["message.created", "session.updated"]} => fn call ->
+      {"tune", ["message.created", "session.updated", "session.harness_changed"]} => fn call ->
         tune_result(config, db, call)
       end,
       {"session-reparent", []} => fn call -> Tightbeam.SessionReparent.handle(db, call) end,
@@ -2547,6 +2547,7 @@ defmodule Tightbeam.Gateway do
         nil
 
       session ->
+        canonical_session = StateResources.session(session)
         _ = ensure_status_residency(config, db, session)
 
         {:ok, [[depth]]} =
@@ -2655,14 +2656,7 @@ defmodule Tightbeam.Gateway do
             setReasoning: reasoning_capability,
             setFastMode: fast_capability,
             setMode: unsupported.("sessions run YOLO"),
-            setHarness: %{
-              supported: true,
-              options:
-                Enum.map(Harness.all(), fn module ->
-                  harness = module.wire_name()
-                  %{title: harness, value: harness, enabled: true}
-                end)
-            },
+            setHarness: canonical_session["capabilities"]["setHarness"],
             setVerbosity: unsupported.("not supported"),
             canCancelCurrentRun: true,
             canChangeModel: true,

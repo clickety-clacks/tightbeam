@@ -1593,7 +1593,15 @@ defmodule Tightbeam.Org do
       {:unchanged, after_mutation, result}
     else
       session = stamp_session_change_in_txn(txn, session_key, now())
-      publish_session_in_txn(txn, "session.updated", session)
+
+      class =
+        if before.harness == after_mutation.harness do
+          "session.updated"
+        else
+          "session.harness_changed"
+        end
+
+      publish_session_in_txn(txn, class, session)
       {:changed, session, result}
     end
   end

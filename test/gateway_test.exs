@@ -29,6 +29,7 @@ defmodule Tightbeam.GatewayTest do
     assert Enum.all?(Map.values(handlers), &is_function(&1, 1))
     assert effects["reopen-assignment"] == ["assignment.reopened"]
     assert effects["artifact-content-fetch"] == []
+    assert effects["tune"] == ["message.created", "session.updated", "session.harness_changed"]
     assert effects["repair-assignment"] == ["message.created", "session.updated"]
     assert effects["session-po-set"] == ["wake.scheduled"]
 
@@ -6047,11 +6048,31 @@ defmodule Tightbeam.GatewayTest do
   test "session_status publishes the live harness switch capability", ctx do
     Archetypes.load!(role_test_base("session-status-harness-switch"))
     status = Gateway.session_status("k1", ctx.db)
+    session = Org.get(ctx.db, "k1")
 
-    assert %{supported: true, options: harness_options} = status.capabilities.setHarness
+    canonical =
+      ctx.db
+      |> Tightbeam.StateResources.query_session("k1")
+      |> Tightbeam.StateResources.session()
 
-    assert Enum.map(harness_options, & &1.value) ==
+    capability = canonical["capabilities"]["setHarness"]
+
+    assert status.capabilities.setHarness == capability
+    assert %{"supported" => true, "options" => harness_options} = capability
+    assert Map.keys(capability) |> Enum.sort() == ~w(options supported)
+
+    assert Enum.map(harness_options, & &1["value"]) ==
              Enum.map(Tightbeam.Harness.all(), & &1.wire_name())
+
+    assert Enum.all?(harness_options, fn option ->
+             Map.keys(option) |> Enum.sort() == ~w(enabled title value) and
+               option["title"] == option["value"] and
+               option["enabled"] == (option["value"] != session.harness)
+           end)
+
+    refute Map.has_key?(capability, "provider")
+    refute Map.has_key?(capability, "model")
+    refute Map.has_key?(capability, "credential")
   end
 
   test "session_status separates unknown live runtime from configured intent", ctx do

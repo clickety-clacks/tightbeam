@@ -39,7 +39,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     "decision requests" =>
       ~w(id kind raiserId raiserSessionKey ownerUserId assignmentId expecterSessionKey expecterUserId lineageRung effortGeneration deadlineWakeId raisedAt deadlineAt statuteName question options context status decision rationale ruledBy ruledAt consumedAt withdrawnBy withdrawnReason withdrawnAt askedOfRole answer answeredBy answeredAt rowVersion),
     "sessions" =>
-      ~w(sessionKey displayName kind orderIndex isBuiltIn adopted ownerUserId origin spawnedBy topologyParent handle archetype overrides identityName identityRevision harness provider model thinkingLevel modelContext host clearedThroughSeq state createdAt updatedAt mechanicalStatus rowVersion),
+      ~w(sessionKey displayName kind orderIndex isBuiltIn adopted ownerUserId origin spawnedBy topologyParent handle archetype overrides identityName identityRevision harness provider model thinkingLevel modelContext host clearedThroughSeq state createdAt updatedAt mechanicalStatus capabilities rowVersion),
     "devices" => ~w(deviceId userId claimedName status platform model createdAt rowVersion),
     "artifacts" =>
       ~w(artifactId kind title description createdBySession workItemId parentSession originPath contentSha256 recordedMessageId recordedTurnEvidence state home createdAt updatedAt rowVersion),
@@ -1109,6 +1109,36 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
           assert Map.keys(value) |> Enum.sort() == ~w(guidanceExtra skillsAdd)
           assert Enum.all?(value["skillsAdd"], &is_binary/1)
           assert is_nil(value["guidanceExtra"]) or is_binary(value["guidanceExtra"])
+
+        {resource, field} == {"sessions", "capabilities"} ->
+          assert Map.keys(value) == ["setHarness"]
+
+          capability = value["setHarness"]
+          names = Enum.map(Tightbeam.Harness.all(), & &1.wire_name())
+
+          case capability do
+            %{"supported" => true, "options" => options} ->
+              assert item["state"] == "active"
+              assert Map.keys(capability) |> Enum.sort() == ~w(options supported)
+              assert Enum.map(options, & &1["value"]) == names
+
+              assert Enum.all?(options, fn option ->
+                       Map.keys(option) |> Enum.sort() == ~w(enabled title value) and
+                         option["title"] == option["value"] and
+                         option["enabled"] == (option["value"] != item["harness"])
+                     end)
+
+              assert Enum.any?(options, & &1["enabled"])
+
+            %{"supported" => false, "reason" => reason} ->
+              assert Map.keys(capability) |> Enum.sort() == ~w(reason supported)
+
+              assert reason ==
+                       if(item["state"] == "active",
+                         do: "no alternate harness is registered",
+                         else: "session is not active"
+                       )
+          end
 
         true ->
           assert is_binary(value), "#{resource}.#{field} is not a string"
