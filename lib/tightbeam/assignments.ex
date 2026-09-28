@@ -22,6 +22,8 @@ defmodule Tightbeam.Assignments do
 
   @effect_kinds ~w(code policy release live_mutation evidence review coordination)
   @effect_kind_sql Enum.map_join(@effect_kinds, ", ", &"'#{&1}'")
+  @completion_blocking_verdict_kinds ~w(blocked waiting)
+  @completion_state_verdict_kinds @completion_blocking_verdict_kinds ++ ["cleared"]
 
   defmodule TransitionRace do
     @moduledoc false
@@ -723,6 +725,23 @@ defmodule Tightbeam.Assignments do
       "SELECT 1 FROM assignment_cannot_proceed WHERE assignmentId=?1 AND state='standing' LIMIT 1",
       [assignment_id]
     ) != []
+  end
+
+  defp latest_completion_blocking_verdict_in_txn(txn, assignment_id) do
+    case Txn.q(
+           txn,
+           """
+           SELECT verdictKind
+           FROM attests
+           WHERE assignmentId=?1 AND kind='verdict' AND verdictKind IN (?2, ?3, ?4)
+           ORDER BY ts DESC, rowid DESC
+           LIMIT 1
+           """,
+           [assignment_id | @completion_state_verdict_kinds]
+         ) do
+      [[kind]] when kind in @completion_blocking_verdict_kinds -> kind
+      _ -> nil
+    end
   end
 
   @doc false
@@ -2365,12 +2384,23 @@ defmodule Tightbeam.Assignments do
                 "completion" ->
                   case standing_cannot_proceed(txn, assignment_id) do
                     nil ->
-                      insert_and_apply_lifecycle_attest(txn, call, assignment, holder)
+                      case latest_completion_blocking_verdict_in_txn(txn, assignment_id) do
+                        nil ->
+                          insert_and_apply_lifecycle_attest(txn, call, assignment, holder)
+
+                        blocking_verdict ->
+                          error(
+                            "completion_blocked",
+                            "assignment completion is blocked by its latest #{blocking_verdict} verdict; " <>
+                              "file cannot-proceed to route the dependency to the parent as a decision, or, " <>
+                              "after it actually clears, file verdictKind=cleared on this assignment before completing"
+                          )
+                      end
 
                     _standing ->
                       error(
                         "cannot_proceed_standing",
-                        "assignment completion is blocked while cannot-proceed is standing"
+                        "assignment completion is blocked while cannot-proceed is standing; its exact configured release fact must settle it before completion"
                       )
                   end
 
