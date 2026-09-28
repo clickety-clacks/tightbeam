@@ -2559,6 +2559,9 @@ defmodule Tightbeam.HarnessHealth do
   end
 
   defp observation_identity(observation) do
+    # observed_at records when this report was received, not which evidence
+    # event it describes. Replaying the same correlation naturally has a newer
+    # timestamp and must remain idempotent.
     base =
       Map.take(observation, [
         :correlation_id,
@@ -2568,7 +2571,6 @@ defmodule Tightbeam.HarnessHealth do
         :evidence_kind,
         :session_key,
         :assignment_id,
-        :observed_at,
         :cause,
         :principal
       ])
