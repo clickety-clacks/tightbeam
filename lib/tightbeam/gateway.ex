@@ -8351,12 +8351,14 @@ defmodule Tightbeam.Gateway do
                 end)
               end)
 
-              reap_retired_sessions(config, db, Enum.map(result.retired, & &1.session_key))
+              cleanup_reports =
+                reap_retired_sessions(config, db, Enum.map(result.retired, & &1.session_key))
 
               %{
                 deleted_session_key: session.session_key,
                 retired_session_keys: Enum.map(result.retired, & &1.session_key),
-                deferred: result.deferred
+                deferred: result.deferred,
+                workspace_cleanup: cleanup_reports
               }
             else
               retire_replay_observation(db, call, %{
@@ -8556,76 +8558,82 @@ defmodule Tightbeam.Gateway do
   # harness SID is closed independently and the adapter itself is closed only
   # when no active session still shares that key. Every operation is guarded:
   # an absent/dead adapter can never turn a committed retire into a failure.
-  defp reap_retired_sessions(_config, _db, []), do: :ok
+  defp reap_retired_sessions(_config, _db, []), do: []
 
   defp reap_retired_sessions(config, db, session_keys) do
     coordinator = Map.get(config, :adapter_coordinator, Tightbeam.AdapterCoordinator)
 
-    Enum.each(session_keys, fn session_key ->
-      case archive_retired_workspace(config, db, session_key) do
-        :ok ->
-          :ok
+    cleanup_reports = Enum.map(session_keys, &cleanup_retired_workspace(config, db, &1))
 
-        {:error, reason} ->
-          record_retirement_cleanup_failure(db, session_key, reason)
-      end
-    end)
+    try do
+      session_keys
+      |> Enum.flat_map(fn session_key ->
+        with session when not is_nil(session) <- Org.get(db, session_key),
+             %{harness_session_id: sid} <- Org.current_pointer(db, session_key) do
+          [
+            %{
+              session_key: session_key,
+              sid: sid,
+              key: {Harness.parse!(session.harness).id(), "shared", session.host}
+            }
+          ]
+        else
+          _ -> []
+        end
+      end)
+      |> Enum.group_by(& &1.key)
+      |> Enum.each(fn {key, retired} -> reap_adapter_sessions(db, coordinator, key, retired) end)
+    rescue
+      _ -> :ok
+    catch
+      :exit, _ -> :ok
+    end
 
-    session_keys
-    |> Enum.flat_map(fn session_key ->
-      with session when not is_nil(session) <- Org.get(db, session_key),
-           %{harness_session_id: sid} <- Org.current_pointer(db, session_key) do
-        [
-          %{
-            session_key: session_key,
-            sid: sid,
-            key: {Harness.parse!(session.harness).id(), "shared", session.host}
-          }
-        ]
-      else
-        _ -> []
-      end
-    end)
-    |> Enum.group_by(& &1.key)
-    |> Enum.each(fn {key, retired} -> reap_adapter_sessions(db, coordinator, key, retired) end)
-
-    :ok
-  rescue
-    _ -> :ok
-  catch
-    :exit, _ -> :ok
+    cleanup_reports
   end
 
-  defp archive_retired_workspace(config, db, session_key) do
+  defp cleanup_retired_workspace(config, db, session_key) do
     case Org.get(db, session_key) do
       nil ->
-        {:error, :retired_session_missing}
+        retirement_cleanup_failure(db, session_key, :retired_session_missing)
 
       session ->
-        case Placement.hosts(config.base_dir, db)[session.host] do
-          %{ssh: nil} ->
-            Artifacts.archive_session(
-              db,
-              session_key,
-              Placement.workdir_path(config, session),
-              Path.join(config.base_dir, "archive")
+        hosts = Placement.hosts(config.base_dir, db)
+
+        case hosts[session.host] do
+          %{ssh: ssh} = host when is_nil(ssh) or (is_binary(ssh) and ssh != "") ->
+            WorkspaceCleanup.reap(db,
+              session_key: session_key,
+              host_name: session.host,
+              host: host,
+              hosts: hosts,
+              workspace: Placement.workdir_path(config, session),
+              runner: Map.get(config, :workspace_cleanup_runner)
             )
 
-          %{ssh: ssh} when is_binary(ssh) and ssh != "" ->
-            # A nil workspace made relative remote origins look unresolvable
-            # and could release their rows even though no remote cleanup ran.
-            # Keep the rows untouched until an original-host runner can report
-            # a truthful cleanup result.
-            {:error, {:remote_workspace_cleanup_unsupported, session.host}}
-
           nil ->
-            {:error, {:retirement_host_unknown, session.host}}
+            retirement_cleanup_failure(db, session_key, {:retirement_host_unknown, session.host})
         end
     end
   rescue
-    error -> {:error, {:retired_workspace_cleanup_failed, error}}
+    error -> retirement_cleanup_failure(db, session_key, {:retired_workspace_cleanup_failed, error})
   catch
-    kind, reason -> {:error, {:retired_workspace_cleanup_failed, kind, reason}}
+    kind, reason ->
+      retirement_cleanup_failure(db, session_key, {:retired_workspace_cleanup_failed, kind, reason})
+  end
+
+  defp retirement_cleanup_failure(db, session_key, reason) do
+    report = %{
+      status: "incomplete",
+      session_key: session_key,
+      removed_paths: [],
+      removed_paths_complete: false,
+      result_confirmed: false,
+      blockers: [%{reason: "retired_workspace_cleanup_failed", detail: inspect(reason)}]
+    }
+
+    record_retirement_cleanup_failure(db, session_key, reason)
+    report
   end
 
   defp record_retirement_cleanup_failure(db, session_key, reason) do

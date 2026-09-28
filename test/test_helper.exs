@@ -3,6 +3,10 @@
 # The wrapper names this VM through argv instead of an inherited Erlang flag, forces
 # OS-owned port allocation, and supplies the expected name so this seam can prove it
 # received the isolated invocation rather than merely trusting a marker.
+Application.put_env(:tightbeam, :workspace_cleanup_runner, fn _invocation, _script, _input ->
+  {"synthetic SSH runner not configured for this test", 255}
+end)
+
 if System.get_env("TIGHTBEAM_AUTHORITATIVE_GATE") == "1" do
   expected_node = System.get_env("TIGHTBEAM_GATE_NODE")
   actual_node = node() |> Atom.to_string() |> String.split("@", parts: 2) |> hd()
