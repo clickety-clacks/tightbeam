@@ -84,6 +84,19 @@ deny_when = [
 ]
 
 [[rule]]
+name = "engineering-assign-labeled-coordination-needs-delivery-owner"
+verb = "assign"
+text = "Coordination work sent to a non-office target requires a delivery owner for work item {work_item_id}. Set the intended owner explicitly with work-item-update --delivery-owner before retrying."
+edges = ["verb"]
+effect = "deny"
+deny_when = [
+  { fact = "assign.is_linked_review", op = "ne", value = true },
+  { fact = "assign.effect_kind", op = "eq", value = "coordination" },
+  { fact = "target.archetype", op = "not_in", value = ["product-owner", "pdo"] },
+  { fact = "work_item.has_delivery_owner", op = "ne", value = true },
+]
+
+[[rule]]
 name = "engineering-assign-labeled-coordination-needs-topology"
 verb = "assign"
 text = "Coordination staffing for this work item requires returned attributable topology. Current delivery owner: {delivery_owner_ref}. Record topology-decided on the item, then have that owner or an active exact-item assignment holder retry."
@@ -142,6 +155,18 @@ deny_when = [
   { fact = "assign.effect_kind", op = "ne", value = "coordination" },
   { fact = "work_item.delivery_owner_state", op = "eq", value = "current" },
   { fact = "work_item.verdict_kinds", op = "not_in", value = ["topology-decided"] },
+]
+
+[[rule]]
+name = "engineering-dispatch-labeled-coordination-needs-delivery-owner"
+verb = "dispatch"
+text = "Coordination work sent to a non-office target requires a delivery owner for work item {work_item_id}. Set the intended owner explicitly with work-item-update --delivery-owner before retrying."
+edges = ["verb"]
+effect = "deny"
+deny_when = [
+  { fact = "assign.effect_kind", op = "eq", value = "coordination" },
+  { fact = "target.archetype", op = "not_in", value = ["product-owner", "pdo"] },
+  { fact = "work_item.has_delivery_owner", op = "ne", value = true },
 ]
 
 [[rule]]

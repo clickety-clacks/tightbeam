@@ -442,14 +442,17 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
     before = count(db, "assignments")
     wakes_before = count(db, "wakes")
 
-    for verb <- ["assign", "dispatch"], principal <- [{:user, "owner"}, {:session, "peer"}] do
-      rule = "engineering-#{verb}-production-needs-delivery-owner"
+    for verb <- ["assign", "dispatch"],
+        principal <- [{:user, "owner"}, {:session, "peer"}],
+        {effect, rule_kind} <- [{"code", "production"}, {"coordination", "labeled-coordination"}] do
+      rule = "engineering-#{verb}-#{rule_kind}-needs-delivery-owner"
 
       assert {:error, %{code: "rule_denied", rule: ^rule, message: message}} =
                Dispatch.dispatch(
                  db,
                  handlers,
                  production_call(verb, principal, "worker-a", item_id)
+                 |> put_in([:params, :effect_kind], effect)
                )
 
       assert message =~ item_id
@@ -481,38 +484,49 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
 
     assert {:ok, %{holderKey: "reviewer"}} = Dispatch.dispatch(db, handlers, review)
 
+    assert {:ok, %{holderKey: "reviewer"}} =
+             Dispatch.dispatch(
+               db,
+               handlers,
+               put_in(review, [:params, :effect_kind], "coordination")
+             )
+
     # Existing intake assignments do not let production bypass the loaded rule.
-    for verb <- ["assign", "dispatch"] do
+    for verb <- ["assign", "dispatch"], effect <- ["code", "coordination"] do
       assert {:error, %{code: "rule_denied"}} =
                Dispatch.dispatch(
                  db,
                  handlers,
                  production_call(verb, {:user, "owner"}, "worker-a", item_id)
+                 |> put_in([:params, :effect_kind], effect)
                )
     end
 
     assert %{deliveryOwnerSessionKey: "pdo-a"} = set_owner(db, {:user, "owner"}, item_id, "pdo-a")
 
-    for verb <- ["assign", "dispatch"] do
-      rule = "engineering-#{verb}-production-needs-topology"
+    for verb <- ["assign", "dispatch"], effect <- ["code", "coordination"] do
+      rule_kind = if effect == "code", do: "production", else: "labeled-coordination"
+      rule = "engineering-#{verb}-#{rule_kind}-needs-topology"
 
       assert {:error, %{code: "rule_denied", rule: ^rule}} =
                Dispatch.dispatch(
                  db,
                  handlers,
                  production_call(verb, {:user, "owner"}, "worker-a", item_id)
+                 |> put_in([:params, :effect_kind], effect)
                )
     end
 
     assert %{attest: %{verdictKind: "topology-decided"}} =
              attest_verdict(db, "intake-pdo", coordination.id, "topology-decided")
 
-    for verb <- ["assign", "dispatch"] do
+    for verb <- ["assign", "dispatch"], effect <- ["code", "coordination"] do
       assert {:ok, %{holderKey: "worker-a", workItemId: ^item_id}} =
                Dispatch.dispatch(
                  db,
                  handlers,
                  production_call(verb, {:user, "owner"}, "worker-a", item_id)
+                 |> put_in([:params, :effect_kind], effect)
                )
     end
   end
