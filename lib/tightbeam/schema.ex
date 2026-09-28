@@ -4292,7 +4292,11 @@ defmodule Tightbeam.Schema do
   defp upgrade_terminal_credential_failure(db) do
     case DB.transaction(db, fn txn ->
            case Txn.q(txn, "SELECT shape FROM schema_stamp") do
-             [[shape]] when shape in [@work_item_owner_link_shape, @identity_publication_denial_diagnostic_shape] ->
+             [[shape]]
+             when shape in [
+                    @work_item_owner_link_shape,
+                    @identity_publication_denial_diagnostic_shape
+                  ] ->
                :ok
 
              [[@agent_reparent_shape]] ->
@@ -4341,7 +4345,11 @@ defmodule Tightbeam.Schema do
   defp upgrade_agent_reparent(db) do
     case DB.transaction(db, fn txn ->
            case Txn.q(txn, "SELECT shape FROM schema_stamp") do
-             [[shape]] when shape in [@work_item_owner_link_shape, @identity_publication_denial_diagnostic_shape] ->
+             [[shape]]
+             when shape in [
+                    @work_item_owner_link_shape,
+                    @identity_publication_denial_diagnostic_shape
+                  ] ->
                :ok
 
              [[@agent_reparent_shape]] ->
@@ -4388,7 +4396,11 @@ defmodule Tightbeam.Schema do
   defp upgrade_artifact_origins(db) do
     case DB.transaction(db, fn txn ->
            case Txn.q(txn, "SELECT shape FROM schema_stamp") do
-             [[shape]] when shape in [@work_item_owner_link_shape, @identity_publication_denial_diagnostic_shape] ->
+             [[shape]]
+             when shape in [
+                    @work_item_owner_link_shape,
+                    @identity_publication_denial_diagnostic_shape
+                  ] ->
                validate_artifact_origins!(txn)
 
              [[@artifact_origin_shape]] ->
@@ -4444,7 +4456,11 @@ defmodule Tightbeam.Schema do
   defp upgrade_identity_publication_denial_diagnostic(db) do
     case DB.transaction(db, fn txn ->
            case Txn.q(txn, "SELECT shape FROM schema_stamp") do
-             [[shape]] when shape in [@identity_publication_denial_diagnostic_shape, @work_item_owner_link_shape] ->
+             [[shape]]
+             when shape in [
+                    @identity_publication_denial_diagnostic_shape,
+                    @work_item_owner_link_shape
+                  ] ->
                :ok
 
              [[@identity_publication_denial_diagnostic_previous_shape]] ->

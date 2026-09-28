@@ -325,7 +325,10 @@ defmodule Tightbeam.SchemaShapeTest do
 
     assert error.message =~ "expected both legacy delivery-scope history tables or neither"
     assert error.message =~ "found 1 of 2"
-    assert {:ok, [[@identity_publication_denial_diagnostic_shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok, [[@identity_publication_denial_diagnostic_shape]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+
     refute "deliveryOwnerSessionKey" in table_columns(db, "work_items")
     assert table?(db, "work_item_delivery_scope_events")
     refute table?(db, "delivery_scope_owner_events")
@@ -347,7 +350,10 @@ defmodule Tightbeam.SchemaShapeTest do
     assert error.message =~ "wi_link_stale"
     assert error.message =~ "link-agent-stale"
     assert error.message =~ "stale"
-    assert {:ok, [[@identity_publication_denial_diagnostic_shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok, [[@identity_publication_denial_diagnostic_shape]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+
     refute "deliveryOwnerSessionKey" in table_columns(db, "work_items")
 
     assert {:ok, [[1, 1]]} =
