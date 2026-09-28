@@ -54,7 +54,7 @@ deny_when = [
   { fact = "assign.is_linked_review", op = "ne", value = true },
   { fact = "assign.effect_kind", op = "ne", value = "coordination" },
   { fact = "work_item.reference_state", op = "eq", value = "known" },
-  { fact = "work_item.delivery_owner_state", op = "ne", value = "current" },
+  { fact = "work_item.has_delivery_owner", op = "ne", value = true },
 ]
 
 [[rule]]
@@ -117,7 +117,7 @@ effect = "deny"
 deny_when = [
   { fact = "assign.effect_kind", op = "ne", value = "coordination" },
   { fact = "work_item.reference_state", op = "eq", value = "known" },
-  { fact = "work_item.delivery_owner_state", op = "ne", value = "current" },
+  { fact = "work_item.has_delivery_owner", op = "ne", value = true },
 ]
 
 [[rule]]

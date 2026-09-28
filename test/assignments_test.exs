@@ -3967,12 +3967,14 @@ defmodule Tightbeam.AssignmentsTest do
     _wrong_item = seed_rumination_wake(ctx, wrong_item_source.id, caller, "fired")
     _wrong_caller = seed_rumination_wake(ctx, wrong_caller_item.id, "other-session", "fired")
 
-    _exact_fired = seed_rumination_wake(ctx, pending_item.id, caller, "fired")
+    exact_item = seed_unrouted_work_item(ctx, "Exact rumination without bracket")
+    _exact_fired = seed_rumination_wake(ctx, exact_item.id, caller, "fired")
 
     baseline = assignment_count(ctx.db)
 
     for {item, subject} <- [
           {pending_item, "pending rumination"},
+          {exact_item, "exact fired rumination"},
           {wrong_item, "wrong-item fired rumination"},
           {wrong_caller_item, "wrong-caller fired rumination"}
         ] do
