@@ -37,13 +37,11 @@ defmodule Tightbeam.WorkspaceCleanup do
       )
 
     try do
-      {:ok, file} = File.open(manifest, [:write, :binary, :exclusive], 0o600)
-
-      try do
-        :ok = IO.binwrite(file, input)
-      after
-        File.close(file)
-      end
+      {:ok, :ok} =
+        File.open(manifest, [:write, :binary, :exclusive], fn file ->
+          :ok = File.chmod(manifest, 0o600)
+          IO.binwrite(file, input)
+        end)
 
       command =
         "exec " <>

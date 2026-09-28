@@ -991,7 +991,7 @@ defmodule Tightbeam.GatewayTest do
     assert Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
              event.kind == "retired_workspace_cleanup_completed" and
                event.subject == session.session_key and
-               Jason.decode!(event.detail)["removed_paths"] == cleanup.removed_paths
+               JSON.decode!(event.detail)["removed_paths"] == cleanup.removed_paths
            end)
   end
 
@@ -1095,7 +1095,7 @@ defmodule Tightbeam.GatewayTest do
     assert Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
              event.kind == "retired_workspace_cleanup_incomplete" and
                event.subject == fixture.session.session_key and
-               Jason.decode!(event.detail)["status"] == cleanup.status
+               JSON.decode!(event.detail)["status"] == cleanup.status
            end)
   end
 
