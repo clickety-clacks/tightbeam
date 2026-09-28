@@ -120,7 +120,7 @@ defmodule Tightbeam.WorkspaceCleanup do
         do: "retired_workspace_cleanup_completed",
         else: "retired_workspace_cleanup_incomplete"
 
-    EventLog.lifecycle_in_txn(txn, kind, session_key, Jason.encode!(report))
+    EventLog.lifecycle_in_txn(txn, kind, session_key, JSON.encode!(report))
     report
   end
 
@@ -626,7 +626,7 @@ defmodule Tightbeam.WorkspaceCleanup do
         db,
         "retired_workspace_cleanup_incomplete",
         to_string(Keyword.get(opts, :session_key, "unknown")),
-        Jason.encode!(report)
+        JSON.encode!(report)
       )
     rescue
       _ -> :ok
