@@ -2,22 +2,28 @@ defmodule Tightbeam.Breathing do
   @moduledoc """
   Deterministic, read-only physical breathing queries.
 
-  A result is computed from one database snapshot and is never stored. Only
-  session, assignment, work-item, turn, and wake rows participate.
+  A result is computed from one database snapshot and is never stored.
+  Assignment queries for the opener or an associated user also include a
+  read-only summary of the holder's queued turns.
   """
 
-  alias Tightbeam.DB
+  alias Tightbeam.{AssignmentQueue, DB}
   alias Tightbeam.DB.Txn
 
   @schema "breathing-v1"
   @terminal_statuses ~w(delivered canceled failed failed_unknown)
 
   @spec handle(DB.server(), map()) :: map()
-  def handle(db, %{principal: {kind, _}, params: params}) when kind in [:session, :user] do
+  def handle(db, %{principal: {kind, principal}, params: params})
+      when kind in [:session, :user] do
     with target_kind when target_kind in ~w(session assignment work-item) <-
            params[:target_kind],
          target_id when is_binary(target_id) and target_id != "" <- params[:target_id] do
-      query(db, target_kind, target_id)
+      if target_kind == "assignment" do
+        assignment_query(db, target_id, {kind, principal})
+      else
+        query(db, target_kind, target_id)
+      end
     else
       _ ->
         %{
@@ -35,6 +41,26 @@ defmodule Tightbeam.Breathing do
       code: "principal_required",
       message: "breathing requires a user credential or session token"
     }
+
+  defp assignment_query(db, id, principal) do
+    case DB.transaction(db, fn txn ->
+           now_ms = System.system_time(:millisecond)
+
+           case AssignmentQueue.read_in_txn(txn, id, principal, now_ms) do
+             {:ok, queue} ->
+               Map.put(assignment_in_txn(txn, id), :queue, queue)
+
+             :not_found ->
+               assignment_in_txn(txn, id)
+
+             :forbidden ->
+               assignment_in_txn(txn, id)
+           end
+         end) do
+      {:ok, result} -> result
+      {:error, error} -> raise error
+    end
+  end
 
   @spec query(DB.server(), String.t(), String.t()) :: map()
   def query(db, target_kind, target_id)
