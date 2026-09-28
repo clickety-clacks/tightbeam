@@ -85,6 +85,7 @@ impl CommandContext {
             OperatorWithdraw { .. } => ("cli.operator_withdraw", DispatchPath),
             DecisionRequests { .. } => ("cli.decision_requests", DispatchPath),
             DecisionRequest { .. } => ("cli.decision_request", DispatchPath),
+            AssignmentStopTurn { .. } => ("cli.assignment_stop_turn", DispatchPath),
             RevokeAssignment { .. } => ("cli.revoke_assignment", DispatchPath),
             ReopenAssignment { .. } => ("cli.reopen_assignment", DispatchPath),
             RepairAssignment { .. } => ("cli.repair_assignment", DispatchPath),
@@ -416,6 +417,7 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | OperatorAsk { .. }
         | OperatorRule { .. }
         | OperatorWithdraw { .. }
+        | AssignmentStopTurn { .. }
         | RevokeAssignment { .. }
         | ReopenAssignment { .. }
         | WorkItemUpdate { .. }
@@ -484,6 +486,31 @@ mod tests {
         );
         assert!(!format!("{context:?}").contains("PRIVATE_SETTLEMENT_KEY"));
         assert!(context.operation_for_request("GET", "/harnesses").is_none());
+    }
+
+    #[test]
+    fn assignment_stop_turn_is_an_unkeyed_dispatch_write_without_retained_identity() {
+        let command = Command::AssignmentStopTurn {
+            identity: Identity::User("PRIVATE_USER".into()),
+            assignment_id: "PRIVATE_ASSIGNMENT".into(),
+            reason: "PRIVATE_REASON".into(),
+        };
+        let context = CommandContext::for_command(&command).unwrap();
+        assert_eq!(
+            context
+                .operation_for_request("POST", "/agent/dispatch")
+                .unwrap()
+                .as_str(),
+            "cli.assignment_stop_turn"
+        );
+        assert_eq!(
+            effect(context, "POST", "/agent/dispatch"),
+            EffectContract::WriteWithoutIdempotency
+        );
+        let debug = format!("{context:?}");
+        assert!(!debug.contains("PRIVATE_USER"));
+        assert!(!debug.contains("PRIVATE_ASSIGNMENT"));
+        assert!(!debug.contains("PRIVATE_REASON"));
     }
 
     #[test]
