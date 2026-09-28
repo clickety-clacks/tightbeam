@@ -1,4 +1,4 @@
-//! B-owned typed request-context precursor, for the current 5158cb58 Command
+//! B-owned typed request-context precursor, for the public 9b76c0a8 Command
 //! enum. Register only with the approved carrier/caller handoff. This module
 //! derives bounded metadata from typed commands without retaining key values,
 //! payloads or identity, allocating an attempt, or reading mutable state.
@@ -45,10 +45,10 @@ impl CommandContext {
         use Command::*;
         use Requests::{Catalog, CatalogAndDispatch, Dispatch as DispatchPath};
         let (operation, requests) = match command {
-            IdentityCurrent | GithubAuthCheck => return None,
+            IdentityCurrent | GithubAuthCheck | SessionConnect { .. } => return None,
             Help => ("cli.help", Catalog),
             CommandHelp(_) => ("cli.command_help", Catalog),
-            Doctor { .. } => ("cli.doctor", Catalog),
+            Doctor { .. } => ("cli.doctor", CatalogAndDispatch),
             Wake { .. } => ("cli.wake", DispatchPath),
             Condition { .. } => ("cli.condition", DispatchPath),
             HarnessHealthObserveOther { .. } => ("cli.harness_health_observe_other", DispatchPath),
@@ -121,6 +121,13 @@ impl CommandContext {
             Learn { .. } => ("cli.learn", DispatchPath),
             Unlearn { .. } => ("cli.unlearn", DispatchPath),
             KungfuList { .. } => ("cli.kungfu_list", DispatchPath),
+            KungfuSetup { .. } => ("cli.kungfu_setup", DispatchPath),
+            SentinelEnable { .. } => ("cli.sentinel_enable", DispatchPath),
+            SentinelDisable { .. } => ("cli.sentinel_disable", DispatchPath),
+            SentinelList { .. } => ("cli.sentinel_list", DispatchPath),
+            SentinelEnvSet { .. } => ("cli.sentinel_env_set", DispatchPath),
+            SentinelEnvList { .. } => ("cli.sentinel_env_list", DispatchPath),
+            SentinelEnvUnset { .. } => ("cli.sentinel_env_unset", DispatchPath),
             IdentityApply { .. } => ("cli.identity_apply", DispatchPath),
             Onboard { .. } => ("cli.onboard", CatalogAndDispatch),
             AddUser { .. } => ("cli.add_user", DispatchPath),
@@ -150,6 +157,16 @@ impl CommandContext {
 
     pub(crate) fn assimilate_catalog() -> Self {
         Self::catalog(CatalogOrigin::Assimilate)
+    }
+
+    /// Doctor's nested SentinelList is a separate read attempt belonging to
+    /// Doctor, not a direct invocation of the sentinel-list CLI command.
+    pub(crate) fn doctor_sentinels() -> Self {
+        Self {
+            operation: TransportOperation("cli.doctor"),
+            requests: Requests::Dispatch,
+            dispatch_effect: EffectContract::Read,
+        }
     }
 
     pub(crate) fn catalog(origin: CatalogOrigin) -> Self {
@@ -263,14 +280,14 @@ impl PartialEq for CommandContext {
 }
 impl Eq for CommandContext {}
 
-/// Finite source-reviewed domain effect map on fidelity5158. Audit/log writes
+/// Finite source-reviewed domain effect map on public 9b76c0a8. Audit/log writes
 /// are not promoted into domain mutation. Empty publisher effect-class lists
 /// are NOT read evidence. Keys are inspected for presence only, never retained.
 fn dispatch_effect(command: &Command) -> EffectContract {
     use Command::*;
     use EffectContract::*;
     match command {
-        IdentityCurrent | GithubAuthCheck => Unknown,
+        IdentityCurrent | GithubAuthCheck | SessionConnect { .. } => Unknown,
         Help
         | CommandHelp(_)
         | Doctor { .. }
@@ -293,6 +310,9 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | Assignments { .. }
         | IdentityStatus { .. }
         | KungfuList { .. }
+        | KungfuSetup { .. }
+        | SentinelList { .. }
+        | SentinelEnvList { .. }
         | ConfigGet { .. }
         | HostEnvList { .. }
         | HarnessProcesses { .. }
@@ -358,10 +378,11 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         }
         | Learn {
             idempotency_key, ..
-        }
-        | Unlearn {
-            idempotency_key, ..
         } => keyed_write(Some(idempotency_key)),
+
+        // Publication's existing key does not prove replay completion for
+        // the later sentinel cleanup. Keep the wire key, but no keyed advice.
+        Unlearn { .. } => WriteWithoutIdempotency,
 
         // Relearn's abort/conflict paths do not all establish the durable
         // publication marker; do not generalize its key to the whole command.
@@ -409,6 +430,10 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | ConfigSet { .. }
         | HostEnvSet { .. }
         | HostEnvUnset { .. }
+        | SentinelEnable { .. }
+        | SentinelDisable { .. }
+        | SentinelEnvSet { .. }
+        | SentinelEnvUnset { .. }
         | HostToolchainSet { .. }
         | Assimilate(_) => WriteWithoutIdempotency,
     }
@@ -620,6 +645,12 @@ mod tests {
     fn local_commands_and_separate_tool_endpoint_cannot_borrow_dispatch_context() {
         assert!(CommandContext::for_command(&Command::IdentityCurrent).is_none());
         assert!(CommandContext::for_command(&Command::GithubAuthCheck).is_none());
+        let session_connect = Command::SessionConnect {
+            identity: Identity::Session,
+            session_key: "PRIVATE_SESSION".into(),
+        };
+        assert!(CommandContext::for_command(&session_connect).is_none());
+        assert_eq!(dispatch_effect(&session_connect), EffectContract::Unknown);
         let context = CommandContext::for_command(&Command::ToolCallObserved).unwrap();
         assert_eq!(
             context
@@ -633,5 +664,265 @@ mod tests {
                 .operation_for_request("POST", "/agent/dispatch")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn sentinel_commands_keep_fixed_metadata_and_existing_wire_bodies() {
+        let identity = Identity::User("PRIVATE_ACTOR".into());
+        let cases = [
+            (
+                Command::KungfuSetup {
+                    identity: identity.clone(),
+                    name: "PRIVATE_BUNDLE".into(),
+                },
+                "cli.kungfu_setup",
+                "kungfu-setup",
+                EffectContract::Read,
+            ),
+            (
+                Command::SentinelEnable {
+                    identity: identity.clone(),
+                    name: "PRIVATE_SENTINEL".into(),
+                },
+                "cli.sentinel_enable",
+                "sentinel-enable",
+                EffectContract::WriteWithoutIdempotency,
+            ),
+            (
+                Command::SentinelDisable {
+                    identity: identity.clone(),
+                    name: "PRIVATE_SENTINEL".into(),
+                },
+                "cli.sentinel_disable",
+                "sentinel-disable",
+                EffectContract::WriteWithoutIdempotency,
+            ),
+            (
+                Command::SentinelList {
+                    identity: identity.clone(),
+                },
+                "cli.sentinel_list",
+                "sentinel-list",
+                EffectContract::Read,
+            ),
+            (
+                Command::SentinelEnvSet {
+                    identity: identity.clone(),
+                    host: Some("PRIVATE_HOST".into()),
+                    sentinel: "PRIVATE_SENTINEL".into(),
+                    name: "PRIVATE_NAME".into(),
+                    value: "PRIVATE_VALUE".into(),
+                },
+                "cli.sentinel_env_set",
+                "host-env-set",
+                EffectContract::WriteWithoutIdempotency,
+            ),
+            (
+                Command::SentinelEnvList {
+                    identity: identity.clone(),
+                    host: None,
+                    sentinel: "PRIVATE_SENTINEL".into(),
+                },
+                "cli.sentinel_env_list",
+                "host-env-list",
+                EffectContract::Read,
+            ),
+            (
+                Command::SentinelEnvUnset {
+                    identity,
+                    host: None,
+                    sentinel: "PRIVATE_SENTINEL".into(),
+                    name: "PRIVATE_NAME".into(),
+                },
+                "cli.sentinel_env_unset",
+                "host-env-unset",
+                EffectContract::WriteWithoutIdempotency,
+            ),
+        ];
+        for (command, operation, verb, expected) in cases {
+            let context = CommandContext::for_command(&command).unwrap();
+            let request = crate::dispatch::build_request(&command).unwrap();
+            assert_eq!(request.path, "/agent/dispatch");
+            assert_eq!(context.operation.as_str(), operation);
+            assert_eq!(effect(context, "POST", request.path), expected);
+            assert!(!format!("{context:?}").contains("PRIVATE_"));
+            assert!(context.metadata_for_request("GET", "/harnesses").is_none());
+            assert!(
+                context
+                    .metadata_for_request("GET", "/agent/dispatch")
+                    .is_none()
+            );
+            let body: serde_json::Value = serde_json::from_str(&request.body_json).unwrap();
+            assert_eq!(body["asUser"], "PRIVATE_ACTOR");
+            assert_eq!(body["verb"], verb);
+            assert!(body["params"].get("idempotencyKey").is_none());
+            if matches!(command, Command::SentinelEnvSet { .. }) {
+                assert_eq!(body["params"]["value"], "PRIVATE_VALUE");
+                assert_eq!(body["params"]["host"], "PRIVATE_HOST");
+                assert_eq!(body["params"]["sentinel"], "PRIVATE_SENTINEL");
+                assert!(body["params"].get("harness").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn unlearn_wire_key_does_not_grant_unproven_cleanup_replay_advice() {
+        let command = Command::Unlearn {
+            identity: Identity::User("PRIVATE_ACTOR".into()),
+            name: "PRIVATE_BUNDLE".into(),
+            idempotency_key: "PRIVATE_EXISTING_KEY".into(),
+        };
+        let request = crate::dispatch::build_request(&command).unwrap();
+        let context = CommandContext::for_command(&command).unwrap();
+        assert_eq!(
+            effect(context, "POST", request.path),
+            EffectContract::WriteWithoutIdempotency
+        );
+        assert_eq!(context.operation.as_str(), "cli.unlearn");
+        assert!(!format!("{context:?}").contains("PRIVATE_"));
+        let body: serde_json::Value = serde_json::from_str(&request.body_json).unwrap();
+        assert_eq!(body["verb"], "unlearn");
+        assert_eq!(body["params"]["idempotencyKey"], "PRIVATE_EXISTING_KEY");
+        assert_eq!(body["params"]["name"], "PRIVATE_BUNDLE");
+    }
+
+    #[test]
+    fn doctor_catalog_and_nested_sentinel_have_separate_read_metadata() {
+        let root = CommandContext::for_command(&Command::Doctor {
+            identity: Identity::Session,
+            json: true,
+            base_dir: Some("PRIVATE_DOCTOR_BASE".into()),
+        })
+        .unwrap();
+        assert_eq!(
+            root.operation_for_request("GET", "/harnesses")
+                .unwrap()
+                .as_str(),
+            "cli.doctor"
+        );
+        assert_eq!(effect(root, "GET", "/harnesses"), EffectContract::Read);
+        assert_eq!(
+            root.operation_for_request("POST", "/agent/dispatch")
+                .unwrap()
+                .as_str(),
+            "cli.doctor"
+        );
+        assert_eq!(
+            effect(root, "POST", "/agent/dispatch"),
+            EffectContract::Read
+        );
+
+        // Doctor's nested SentinelList is labeled as a Doctor request, not
+        // as a direct sentinel-list invocation.
+        let context = CommandContext::doctor_sentinels();
+        assert_eq!(
+            context
+                .operation_for_request("POST", "/agent/dispatch")
+                .unwrap()
+                .as_str(),
+            "cli.doctor"
+        );
+        assert_eq!(
+            effect(context, "POST", "/agent/dispatch"),
+            EffectContract::Read
+        );
+        assert!(!format!("{context:?}").contains("PRIVATE_"));
+        assert!(context.metadata_for_request("GET", "/harnesses").is_none());
+        assert!(root.metadata_for_request("GET", "/version").is_none());
+    }
+
+    #[test]
+    fn sentinel_command_context_completes_one_synthetic_attempt_and_receipt() {
+        use std::io::ErrorKind;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let base = std::env::temp_dir().join(format!(
+            "tightbeam-context-attempt-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&base).unwrap();
+
+        let command = Command::SentinelEnvUnset {
+            identity: Identity::User("PRIVATE_ACTOR".into()),
+            host: Some("PRIVATE_HOST".into()),
+            sentinel: "PRIVATE_SENTINEL".into(),
+            name: "PRIVATE_NAME".into(),
+        };
+        let context = CommandContext::for_command(&command).unwrap();
+        let mut attempt = super::super::observation::begin_gateway_attempt(
+            Some(context),
+            "POST",
+            "/agent/dispatch",
+            Some(Duration::from_millis(5_000)),
+        )
+        .expect("a synthetic attempt should obtain local request-ID entropy");
+        let request_id = attempt.request_id().as_str().to_owned();
+        assert!(request_id.starts_with("req_"));
+        assert_eq!(request_id.len(), 26);
+        attempt.observe_headers(Some(&request_id), Some("lgen_abcdefghijklmnopqrstuv"));
+
+        // Exercise the same one-shot completion and receipt path without a
+        // socket, provider CLI, or change to the original transport error.
+        let original = std::io::Error::new(ErrorKind::TimedOut, "PRIVATE_TRANSPORT_DETAIL");
+        let completed = attempt.fail_body(&original, &base);
+        for _ in 0..3 {
+            let rendered = completed.render();
+            assert_eq!(rendered.request_id.as_str(), request_id);
+            assert_eq!(
+                rendered.transport_operation.as_str(),
+                "cli.sentinel_env_unset"
+            );
+            assert!(matches!(
+                rendered.receipt,
+                super::super::ReceiptAvailability::Recorded
+            ));
+            let diagnostic = rendered.diagnostic.unwrap();
+            assert!(matches!(
+                diagnostic.code(),
+                super::super::DiagnosticCode::GatewayTransportUncertain
+            ));
+            assert!(matches!(
+                diagnostic.timeout(),
+                super::super::TimeoutBudget::CliRequest { budget_ms: 5_000 }
+            ));
+            assert!(matches!(
+                diagnostic.effect_kind(),
+                super::super::EffectKind::Write
+            ));
+            assert!(matches!(
+                diagnostic.effect_state(),
+                super::super::EffectState::Unknown
+            ));
+            assert!(matches!(
+                diagnostic.action(),
+                super::super::Action::DoNotRetryReport
+            ));
+        }
+        assert_eq!(original.to_string(), "PRIVATE_TRANSPORT_DETAIL");
+
+        let path = base.join("diagnostics/cli-transport-v1.log");
+        let content = std::fs::read_to_string(path).unwrap();
+        let records: Vec<serde_json::Value> = content
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["request_id"], request_id);
+        assert_eq!(records[0]["operation"], "cli.sentinel_env_unset");
+        assert_eq!(records[0]["effect_kind"], "write");
+        assert_eq!(records[0]["effect_state"], "unknown");
+        assert_eq!(records[0]["action"], "do_not_retry_report");
+        assert_eq!(records[0]["timeout_source"], "cli_request");
+        assert_eq!(records[0]["budget_ms"], 5_000);
+        assert_eq!(records[0]["gateway_accepted"], "unknown");
+        assert_eq!(
+            records[0]["listener_generation"],
+            "lgen_abcdefghijklmnopqrstuv"
+        );
+        assert!(!content.contains("PRIVATE_"));
+        std::fs::remove_dir_all(base).unwrap();
     }
 }
