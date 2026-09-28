@@ -811,6 +811,15 @@ defmodule Tightbeam.LaneTest do
         """
       )
 
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO assignments(id,subject,holderKey,openedByUser,openedAt)
+        VALUES('asg_stop_closed','closed stop race','k1','t',2)
+        """
+      )
+
     parent = self()
 
     runner = fn turn ->
@@ -856,33 +865,24 @@ defmodule Tightbeam.LaneTest do
     assert {:ok, [["running"]]} =
              DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [seq])
 
-    {:ok, _} =
-      DB.query(
-        ctx.db,
-        """
-        UPDATE assignments
-        SET state='closed',outcome='revoked',closedAt=2,closedByUser='t'
-        WHERE id='asg_stop_race'
-        """
-      )
+    assert %{state: "closed", outcome: "revoked"} =
+             Tightbeam.Assignments.__handle__(ctx.db, "revoke-assignment", %{
+               verb: "revoke-assignment",
+               principal: {:user, "t"},
+               origin: "user:t",
+               params: %{
+                 assignment_id: "asg_stop_closed",
+                 reason: "fixture closed assignment"
+               }
+             })
 
     assert {:error, :assignment_not_open} =
              SessionLane.stop_assignment_turn(
                "k1",
-               "asg_stop_race",
+               "asg_stop_closed",
                {:user, "t"},
                "assignment was closed"
              )
-
-    {:ok, _} =
-      DB.query(
-        ctx.db,
-        """
-        UPDATE assignments
-        SET state='open',outcome=NULL,closedAt=NULL,closedByUser=NULL
-        WHERE id='asg_stop_race'
-        """
-      )
 
     {:ok, _} =
       DB.query(ctx.db, "UPDATE turns SET assignmentId=NULL WHERE seq=?1", [seq])

@@ -19,7 +19,7 @@ defmodule Tightbeam.SessionLane do
   use GenServer
   require Logger
   alias Tightbeam.StaleTurnSettlement
-  alias Tightbeam.{DB, EventLog, Harness, HarnessHealth, HarnessProcess, JSON, Ledger, Placement}
+  alias Tightbeam.{DB, EventLog, Harness, HarnessHealth, HarnessProcess, Ledger, Placement}
 
   defstruct [
     :session_key,
