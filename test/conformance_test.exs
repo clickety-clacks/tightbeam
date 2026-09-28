@@ -68,7 +68,7 @@ defmodule Tightbeam.ConformanceSupport do
     "users" => ~w(id admin),
     "sessions" => ~w(key owner archetype harness provider host model),
     "roles" => ~w(name session),
-    "work_items" => ~w(id title),
+    "work_items" => ~w(id title owner),
     "assignments" => ~w(id holder creator reviews work_item files),
     "attests" => ~w(assignment kind by verdict_kind),
     "stored_attests" => ~w(assignment kind by verdict_kind),
