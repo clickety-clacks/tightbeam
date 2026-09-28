@@ -6841,7 +6841,7 @@ defmodule Tightbeam.GatewayTest do
         JSON.encode!(%{messageKind: "liveness"})
       )
 
-    {replacement_source_seq, _replacement_source_message} =
+    {replacement_source_seq, replacement_source_message} =
       enqueue_gateway_prompt!(
         ctx.db,
         "k1",
@@ -6950,6 +6950,7 @@ defmodule Tightbeam.GatewayTest do
     assert queued_rows == [
              [suppressed_seq, "canceled", suppressed_message.id],
              [other_suppressed_seq, "canceled", other_suppressed_message.id],
+             [replacement_source_seq, "canceled", replacement_source_message.id],
              [unattributed_canceled_seq, "canceled", unattributed_canceled_message.id],
              [first_seq, "queued", first_message.id],
              [second_seq, "queued", second_message.id],
