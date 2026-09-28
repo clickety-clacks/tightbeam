@@ -6880,10 +6880,13 @@ defmodule Tightbeam.GatewayTest do
     refute guidance =~ "superseded liveness notice"
     assert guidance =~ "other suppression reason durable context"
     assert guidance =~ "unattributed canceled durable context"
+
     assert String.index(guidance, "prior durable user context") <
              String.index(guidance, "prior durable agent context")
+
     assert String.index(guidance, "prior durable agent context") <
              String.index(guidance, "unattributed canceled durable context")
+
     refute guidance =~ "first queued request"
     refute guidance =~ "second queued request"
     refute guidance =~ "late queued request"
@@ -6933,7 +6936,9 @@ defmodule Tightbeam.GatewayTest do
     for expected_seq <- [first_seq, second_seq, late_seq] do
       assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
       assert turn.seq == expected_seq
-      assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+
+      assert :ok =
+               Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
     end
 
     assert :none = Ledger.claim_next(ctx.db, "k1", "test")
@@ -6941,7 +6946,8 @@ defmodule Tightbeam.GatewayTest do
 
   test "queued set_harness candidate failure leaves source, history, and queue intact", ctx do
     candidate = start_supervised!({FailingCandidateAdapterStub, self()})
-    {config, _local_host} = queued_harness_switch_config!(ctx, "queued-handoff-failure", candidate)
+    {config, _local_host} =
+      queued_harness_switch_config!(ctx, "queued-handoff-failure", candidate)
     Org.append_pointer(ctx.db, "k1", "source-session", "created")
 
     {first_seq, first_message} =
@@ -9490,13 +9496,15 @@ defmodule Tightbeam.GatewayTest do
       id: {:lane, session_key},
       start:
         {SessionLane, :start_link,
-         [[
-           session_key: session_key,
-           db: db,
-           task_sup: task_sup,
-           runner: fn _turn -> {:ok, %{}} end,
-           settlement_reservation: make_ref()
-         ]]}
+         [
+           [
+             session_key: session_key,
+             db: db,
+             task_sup: task_sup,
+             runner: fn _turn -> {:ok, %{}} end,
+             settlement_reservation: make_ref()
+           ]
+         ]}
     })
   end
 

@@ -7002,22 +7002,24 @@ defmodule Tightbeam.Gateway do
                          session.host,
                          spinup_opts(config, db, harness, session.host, model)
                        ) do
-                  case at_tune_boundary(config, db, session.session_key, fn ->
-                         run_session_mutation(session.session_key, fn ->
-                           apply_harness_change(
-                             config,
-                             db,
-                             call,
-                             session,
-                             harness,
-                             harness_atom,
-                             model,
-                             routed.provider
-                           )
-                         end)
-                       end,
-                       allow_queued: true
-                     ) do
+                  case at_tune_boundary(
+                         config,
+                         db,
+                         session.session_key,
+                         fn ->
+                           run_session_mutation(session.session_key, fn ->
+                             apply_harness_change(
+                               config,
+                               db,
+                               call,
+                               session,
+                               harness,
+                               harness_atom,
+                               model,
+                               routed.provider
+                             )
+                           end)
+                         end, allow_queued: true) do
                     {:ok, result} -> result
                     {:error, :turn_in_progress} -> turn_in_progress_error()
                   end
@@ -7705,7 +7707,8 @@ defmodule Tightbeam.Gateway do
   defp bounded_handoff_metadata(value) when is_binary(value),
     do: String.slice(value, 0, @harness_handoff_metadata_limit)
 
-  defp bounded_handoff_metadata(value) when is_number(value) or is_boolean(value) or is_nil(value),
+  defp bounded_handoff_metadata(value)
+       when is_number(value) or is_boolean(value) or is_nil(value),
     do: value
 
   defp bounded_handoff_metadata(value),
