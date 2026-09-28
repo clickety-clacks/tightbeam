@@ -1953,7 +1953,14 @@ defmodule Tightbeam.Gateway do
           |> Keyword.put(:role_fallback, false)
           |> Keyword.put(:fire_wake_in_txn, true)
 
-        deliver_prompt_once_in_txn(txn, wake.session_key, wake.origin, wake.prompt, opts)
+        case deliver_prompt_once_in_txn(txn, wake.session_key, wake.origin, wake.prompt, opts) do
+          {:appended, actual_session_key, _message, _delivery_opts} = delivered ->
+            Wakes.terminal_notice_delivered_in_txn(txn, wake.wake_id, actual_session_key)
+            delivered
+
+          other ->
+            other
+        end
 
       {:terminal_notice_undeliverable, _} = incomplete ->
         incomplete
