@@ -161,6 +161,7 @@ class FakeRunner:
     def __init__(self, github):
         self.github = github
         self.filed = []
+        self.checks = []
         self.refuse = None  # callable(args) -> bool
 
     def graphql(self, query, variables):
@@ -172,6 +173,9 @@ class FakeRunner:
     def tightbeam(self, args):
         if self.refuse and self.refuse(args):
             return False, 'refused by fake gateway'
+        if '--kind' in args and args[args.index('--kind') + 1] == lw.CHECKS_COMPLETED:
+            self.checks.append(list(args))
+            return True, '{}'
         self.filed.append(list(args))
         return True, '{}'
 
@@ -639,7 +643,7 @@ class State(WatcherCase):
         self.assertTrue(self.poll())
         read = [v['number'] for op, v in self.github.calls if op == 'LandingPull']
         self.assertEqual(read, [1, 2])  # the recent read excludes the first pull older than 24 hours + overlap
-        self.assertEqual(self.state(), {'version': 1, 'watermark': lw.iso(NOW), 'tracked': [1]})
+        self.assertEqual(self.state(), {'version': 2, 'watermark': lw.iso(NOW), 'tracked': [1]})
 
     def test_cold_start_excludes_old_nodes_from_the_first_recent_page(self):
         self.github.add(pull(1, state='CLOSED', updated=23 * 60),
@@ -693,9 +697,16 @@ class State(WatcherCase):
         self.assertEqual(os.listdir(self.tmp.name), ['example-repo-main.json'])
         self.assertEqual(self.state()['tracked'], [1, 3])
 
+    def test_version_one_state_loads_and_migrates_on_save(self):
+        path = os.path.join(self.tmp.name, 'example-repo-main.json')
+        with open(path, 'w') as handle:
+            json.dump({'version': 1, 'watermark': lw.iso(NOW), 'tracked': []}, handle)
+        self.assertTrue(self.poll())
+        self.assertEqual(self.state()['version'], 2)
+
     def test_malformed_state_refuses(self):
         path = os.path.join(self.tmp.name, 'example-repo-main.json')
-        for body in ('not json', '{"version": 2, "watermark": "2026-09-26T00:00:00Z", "tracked": []}',
+        for body in ('not json', '{"version": 3, "watermark": "2026-09-26T00:00:00Z", "tracked": []}',
                      '{"version": 1, "watermark": "yesterday", "tracked": []}',
                      '{"version": 1, "watermark": "2026-09-26T00:00:00Z", "tracked": ["1"]}'):
             with self.subTest(body=body):
@@ -779,8 +790,102 @@ class Process(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn('start login=example-bot branches=example/repo@main', done.stderr)
         state = json.loads((Path(self.tmp.name) / 'state/landing-watch/example-repo-main.json').read_text())
-        self.assertEqual((state['version'], state['tracked']), (1, []))
+        self.assertEqual((state['version'], state['tracked']), (2, []))
         self.assertFalse(self.calls.exists())  # nothing to file on an empty repository
+
+
+class ChecksCompletedCase(WatcherCase):
+    def checks_keys(self):
+        return [args[args.index('--key') + 1] for args in self.runner.checks]
+
+    def check_reads(self, number):
+        return [
+            variables
+            for operation, variables in self.github.calls
+            if operation == 'LandingPullChecks' and variables['number'] == number
+        ]
+
+    def test_all_required_passed_files_once_and_remembers_head_after_restart(self):
+        self.save_state()
+        self.github.add(pull(7, checks=[check_run('C1', 'linux', 'SUCCESS', required=True),
+                                        check_run('C2', 'macos', 'SUCCESS', required=True)]))
+        self.assertTrue(self.watcher().poll())
+        self.assertTrue(self.watcher().poll())
+        self.assertEqual(self.checks_keys(), ['pr-checks:example/repo#7:head1:pass'])
+        self.assertEqual(len(self.check_reads(7)), 1)
+        fact = self.runner.checks[0]
+        self.assertEqual(fact[:3], ['condition', '--kind', 'pr.checks-completed'])
+        self.assertEqual(fact[fact.index('--scope') + 1], 'example/repo#7')
+        self.assertEqual(self.state()['checked_heads'], ['7:head1'])
+
+    def test_required_failure_files_fail(self):
+        self.save_state()
+        self.github.add(pull(8, checks=[check_run('C1', 'linux', 'SUCCESS', required=True),
+                                        check_run('C2', 'macos', 'FAILURE', required=True)]))
+        self.assertTrue(self.poll())
+        self.assertEqual(self.checks_keys(), ['pr-checks:example/repo#8:head1:fail'])
+
+    def test_running_required_check_files_nothing(self):
+        self.save_state()
+        self.github.add(pull(9, checks=[check_run('C1', 'linux', 'SUCCESS', required=True),
+                                        check_run('C2', 'macos', status='IN_PROGRESS', required=True)]))
+        self.assertTrue(self.poll())
+        self.assertEqual(self.checks_keys(), [])
+
+    def test_optional_checks_alone_file_nothing(self):
+        self.save_state()
+        self.github.add(pull(10, checks=[check_run('C1', 'lint', 'SUCCESS', required=False)]))
+        self.assertTrue(self.poll())
+        self.assertEqual(self.checks_keys(), [])
+
+    def test_latest_terminal_rerun_decides(self):
+        self.save_state()
+        self.github.add(pull(11, checks=[check_run('C1', 'macos', 'FAILURE', started=20, required=True),
+                                         check_run('C2', 'macos', 'SUCCESS', started=5, required=True)]))
+        self.assertTrue(self.poll())
+        self.assertEqual(self.checks_keys(), ['pr-checks:example/repo#11:head1:pass'])
+
+    def test_pending_rerun_without_timestamp_blocks_completion(self):
+        self.save_state()
+        self.github.add(pull(14, checks=[check_run('C1', 'linux', 'SUCCESS', started=20, required=True),
+                                         check_run('C2', 'linux', status='QUEUED', started=None, required=True)]))
+        self.assertTrue(self.poll())
+        self.assertEqual(self.checks_keys(), [])
+
+    def test_new_head_files_again(self):
+        self.save_state()
+        watcher = self.watcher()
+        self.github.add(pull(12, checks=[check_run('C1', 'linux', 'FAILURE', required=True)]))
+        self.assertTrue(watcher.poll())
+        self.github.add(pull(12, head='head2', checks=[check_run('C3', 'linux', 'SUCCESS', required=True)]))
+        self.assertTrue(watcher.poll())
+        self.assertEqual(self.checks_keys(), ['pr-checks:example/repo#12:head1:fail',
+                                              'pr-checks:example/repo#12:head2:pass'])
+
+    def test_queued_pull_is_not_read(self):
+        self.save_state()
+        self.github.add(pull(13, queued=True, auto=ts(3),
+                             checks=[check_run('C1', 'linux', 'SUCCESS', required=True)]))
+        self.assertTrue(self.poll())
+        self.assertEqual(self.checks_keys(), [])
+        self.assertEqual(self.check_reads(13), [])
+
+    def test_refused_fact_retries_saved_outcome_without_reading_head_again(self):
+        self.save_state()
+        self.github.add(pull(15, checks=[check_run('C1', 'linux', 'SUCCESS', required=True)]))
+        self.runner.refuse = lambda args: (
+            '--kind' in args and args[args.index('--kind') + 1] == lw.CHECKS_COMPLETED
+        )
+        self.assertFalse(self.watcher().poll())
+        self.assertEqual(self.state()['pending_checks'], {'15:head1': 'pass'})
+        self.assertEqual(len(self.check_reads(15)), 1)
+
+        self.runner.refuse = None
+        self.assertTrue(self.watcher().poll())
+        self.assertEqual(self.checks_keys(), ['pr-checks:example/repo#15:head1:pass'])
+        self.assertEqual(len(self.check_reads(15)), 1)
+        self.assertEqual(self.state()['checked_heads'], ['15:head1'])
+        self.assertNotIn('pending_checks', self.state())
 
 
 if __name__ == '__main__':

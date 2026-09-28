@@ -10,8 +10,9 @@ Settings (environment):
                             tightbeam call.
 
 The program calls `gh` and `tightbeam` from PATH. It files `landing.settled`
-for pull requests and `landing.branch-attention` for branches with
-`tightbeam condition --key`, and wakes a branch's owner role when a required
+for pull requests, `pr.checks-completed` when every required check on an open
+pull request's head has finished, and `landing.branch-attention` for branches
+with `tightbeam condition --key`, and wakes a branch's owner role when a required
 check fails on the branch tip. Keys make every filing replayable, so repeated
 polls and restarts file nothing new.
 
@@ -32,7 +33,8 @@ import tempfile
 import time
 import urllib.parse
 
-STATE_VERSION = 1
+STATE_VERSION = 2
+PREVIOUS_STATE_VERSION = 1
 POLL_SECONDS = 60
 MAX_BACKOFF_SECONDS = 900
 OVERLAP = dt.timedelta(minutes=10)
@@ -43,6 +45,7 @@ TIGHTBEAM_TIMEOUT = 60
 
 SETTLED = "landing.settled"
 BRANCH_ATTENTION = "landing.branch-attention"
+CHECKS_COMPLETED = "pr.checks-completed"
 
 CHECK_RUN_FAILING = {"FAILURE", "CANCELLED", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED"}
 STATUS_FAILING = {"FAILURE", "ERROR"}
@@ -457,6 +460,45 @@ def pr_failures(results: list[dict]) -> list[dict]:
     return failures
 
 
+def checks_outcome(results: list[dict]) -> str | None:
+    """Return pass or fail when every required check name has a terminal result."""
+    required = [result for result in results if result.get("isRequired") is True]
+    if not required:
+        return None
+
+    latest: dict[tuple[str, str], dict] = {}
+    for result in required:
+        name = (result["__typename"], context_name(result))
+        current = latest.get(name)
+        if current is None or (result_time(result), check_identity(result)) > (
+            result_time(current),
+            check_identity(current),
+        ):
+            latest[name] = result
+
+    # A newly queued rerun may not have a timestamp yet; treat it as the latest
+    # result for its name until it reaches a terminal state.
+    for name in latest:
+        pending_results = [
+            result
+            for result in required
+            if (result["__typename"], context_name(result)) == name and pending(result)
+        ]
+        if pending_results:
+            latest[name] = max(pending_results, key=lambda result: (result_time(result), check_identity(result)))
+
+    if any(pending(result) for result in latest.values()):
+        return None
+    return "fail" if any(failing(result) for result in latest.values()) else "pass"
+
+
+def valid_head_key(value) -> bool:
+    if not isinstance(value, str):
+        return False
+    number, separator, head = value.partition(":")
+    return bool(separator and number.isdecimal() and int(number) > 0 and head and ":" not in head)
+
+
 class Log:
     def __init__(self, stream=sys.stderr):
         self.stream = stream
@@ -479,30 +521,50 @@ class Watcher:
         self.log = log
         self.clock = clock
         self.path = os.path.join(directory, branch.state_name)
+        self.checked_heads: set[str] = set()
+        self.pending_checks: dict[str, str] = {}
+        self._state_watermark = self.clock() - COLD_START
+        self._state_tracked: set[int] = set()
 
     # State
 
-    def load(self) -> tuple[dt.datetime, set[int]]:
+    def load(self) -> tuple[dt.datetime, set[int], set[str], dict[str, str]]:
         try:
             with open(self.path, encoding="utf-8") as handle:
                 data = json.load(handle)
         except FileNotFoundError:
-            return self.clock() - COLD_START, set()
+            return self.clock() - COLD_START, set(), set(), {}
         except (OSError, json.JSONDecodeError) as error:
             raise SettingsError(f"state file {self.path} is unreadable: {error}") from error
         try:
-            if data["version"] != STATE_VERSION:
+            if data["version"] not in (PREVIOUS_STATE_VERSION, STATE_VERSION):
                 raise ValueError("unknown version")
             tracked = data["tracked"]
             if not isinstance(tracked, list) or not all(isinstance(n, int) for n in tracked):
                 raise ValueError("tracked must be a list of numbers")
-            return parse_time(data["watermark"]), set(tracked)
+            checked_heads = data.get("checked_heads", [])
+            if not isinstance(checked_heads, list) or not all(valid_head_key(head) for head in checked_heads):
+                raise ValueError("checked_heads must be a list of strings")
+            pending_checks = data.get("pending_checks", {})
+            if not isinstance(pending_checks, dict) or not all(
+                valid_head_key(head) and outcome in ("pass", "fail")
+                for head, outcome in pending_checks.items()
+            ):
+                raise ValueError("pending_checks must map head keys to pass or fail")
+            if set(checked_heads) & set(pending_checks):
+                raise ValueError("a head cannot be both checked and pending")
+            return parse_time(data["watermark"]), set(tracked), set(checked_heads), pending_checks
         except (KeyError, TypeError, ValueError) as error:
             raise SettingsError(f"state file {self.path} is malformed: {error}") from error
 
     def save(self, watermark: dt.datetime, tracked: set[int]) -> None:
         os.makedirs(self.directory, exist_ok=True)
-        body = json.dumps({"version": STATE_VERSION, "watermark": iso(watermark), "tracked": sorted(tracked)})
+        data = {"version": STATE_VERSION, "watermark": iso(watermark), "tracked": sorted(tracked)}
+        if self.checked_heads:
+            data["checked_heads"] = sorted(self.checked_heads)
+        if self.pending_checks:
+            data["pending_checks"] = dict(sorted(self.pending_checks.items()))
+        body = json.dumps(data)
         handle, temporary = tempfile.mkstemp(dir=self.directory, prefix=".landing-watch-")
         try:
             with os.fdopen(handle, "w", encoding="utf-8") as stream:
@@ -614,6 +676,27 @@ class Watcher:
             if not more:
                 return merge_results if merge_results else head_results
 
+    def read_head_checks(self, number: int, head: str) -> list[dict] | None:
+        """Read required check results only if the pull request still has this head."""
+        cursor = None
+        results: list[dict] = []
+        while True:
+            data = self.runner.graphql(Q_PULL_CHECKS, {**self._repo_vars(), "number": number, "cursor": cursor})
+            commits = dig(data, "repository", "pullRequest", "commits").get("nodes")
+            if not commits:
+                return None
+            commit = dig(commits[0], "commit")
+            if commit.get("oid") != head:
+                return None
+            rollup = commit.get("statusCheckRollup")
+            if rollup is None:
+                return None
+            connection = rollup.get("contexts")
+            more, cursor = page_info(connection)
+            results += rollup_results(connection["nodes"])
+            if not more:
+                return results
+
     def read_tip(self) -> tuple[str, list[dict]]:
         cursor = None
         oid = None
@@ -688,7 +771,11 @@ class Watcher:
     def poll(self) -> bool:
         """One poll. Returns True when it completed and its state was saved."""
         started = self.clock()
-        watermark, tracked = self.load()
+        watermark, tracked, checked_heads, pending_checks = self.load()
+        self.checked_heads = checked_heads
+        self.pending_checks = pending_checks
+        self._state_watermark = watermark
+        self._state_tracked = tracked
         horizon = watermark - OVERLAP
         pulls: dict[int, dict] = {}
         complete = True
@@ -705,6 +792,16 @@ class Watcher:
                     self.read_pull(number, horizon if number in tracked else None, pull)
                     if blocked_candidate(pull):
                         pull["checks"] = self.read_pull_checks(number, pull["headRefOid"])
+                    head = pull.get("headRefOid")
+                    check_key = f"{number}:{head}" if head else None
+                    if (
+                        pull.get("state") == "OPEN"
+                        and pull.get("mergeQueueEntry") is None
+                        and head
+                        and check_key not in self.checked_heads
+                        and check_key not in self.pending_checks
+                    ):
+                        pull["head_checks"] = self.read_head_checks(number, head)
                 except ReadError as error:
                     # One unreadable pull request must not withhold another's merge.
                     complete = False
@@ -717,6 +814,8 @@ class Watcher:
 
         # Every read finished before any fact that depends on absence is filed.
         accepted = True
+        for check_key in list(self.pending_checks):
+            accepted &= self.file_pending_check(check_key)
         for number, pull in pulls.items():
             accepted &= self.file_positive(number, pull)
         if complete:
@@ -743,7 +842,37 @@ class Watcher:
                 reason = event.get("reason") or "unspecified"
                 self.log.episode(key, f"episode removed pr={scope} event={event['id']} reason={reason}")
                 ok &= self.condition(SETTLED, scope, key)
+        head = pull.get("headRefOid")
+        results = pull.get("head_checks")
+        if head and results is not None:
+            check_key = f"{number}:{head}"
+            if check_key not in self.checked_heads and check_key not in self.pending_checks:
+                outcome = checks_outcome(results)
+                if outcome is not None:
+                    self.pending_checks[check_key] = outcome
+                    try:
+                        self.save(self._state_watermark, self._state_tracked)
+                    except OSError as error:
+                        self.log.line(f"failed to save pending checks pr={scope} head={head} reason={error}")
+                        return False
+        if head:
+            check_key = f"{number}:{head}"
+            if check_key in self.pending_checks:
+                ok &= self.file_pending_check(check_key)
         return ok
+
+    def file_pending_check(self, check_key: str) -> bool:
+        number_text, head = check_key.split(":", 1)
+        number = int(number_text)
+        scope = self.branch.pr_scope(number)
+        outcome = self.pending_checks[check_key]
+        key = f"pr-checks:{scope}:{head}:{outcome}"
+        self.log.episode(key, f"episode checks-completed pr={scope} head={head} outcome={outcome}")
+        if not self.condition(CHECKS_COMPLETED, scope, key):
+            return False
+        self.pending_checks.pop(check_key)
+        self.checked_heads.add(check_key)
+        return True
 
     def file_absence(self, number: int, pull: dict) -> bool:
         scope = self.branch.pr_scope(number)

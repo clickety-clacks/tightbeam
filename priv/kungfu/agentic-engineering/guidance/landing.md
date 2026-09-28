@@ -35,6 +35,10 @@ failed required check, or closed. The fallback means only that nothing arrived
 in time; it is a reason to read, not a finding. Either way, read the pull
 request and act on what is true now.
 
+For an open, unqueued PR, agents waiting on its required checks should subscribe
+to `pr.checks-completed` with scope `<owner>/<repo>#<n>`; the fact wakes them
+when the latest required results all finish, on pass or fail.
+
 Merged: compare the merged head with the commit that was reviewed. If they
 differ, take the difference to your delivery owner before completing. If they
 match, record the landing, then complete under the usual rules with the merge
