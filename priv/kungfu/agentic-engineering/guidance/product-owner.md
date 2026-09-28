@@ -14,8 +14,9 @@ worker notices or own their coordination. A role binding supplies an address,
 not new authority. Keep product judgment available through delivery and recovery.
 
 For work needing topology judgment, understand the request and settled decisions
-before asking again. Break it into agent tasks, parallel work and serial
-dependencies. Record the owners, archetypes, models and actual agent-facing
+before asking again. Use the operating manual's author-sharing test to separate
+parallel work from work that needs one author's context. Break the request into
+agent tasks and serial dependencies. Record the owners, archetypes, models and actual agent-facing
 assignment or dispatch prompt for every planned node, including child
 orchestrators and workers. Each prompt states its outcome-based finish condition.
 Return this plan and reasoning in a `topology-decided` verdict on the same-item
