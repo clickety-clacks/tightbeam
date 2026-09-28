@@ -2480,10 +2480,58 @@ defmodule Tightbeam.AssignmentsTest do
     filed = handle(ctx, "attest", filing)
     replay = handle(ctx, "attest", filing)
 
+    assert %{code: "cannot_proceed_standing"} =
+             handle(
+               ctx,
+               "attest",
+               attest_call({:session, "holder"}, first.id, "completion")
+             )
+
+    assert %{attest: %{verdictKind: "cleared"}} =
+             attest_call({:session, "holder"}, first.id, "verdict")
+             |> put_in([:params, :verdict_kind], "cleared")
+             |> put_in(
+               [:params, :note],
+               "The verdict blocker cleared; the dependency remains unresolved"
+             )
+             |> then(&handle(ctx, "attest", &1))
+
+    assert {:ok, [["standing"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state FROM assignment_cannot_proceed WHERE assignmentId=?1",
+               [first.id]
+             )
+
+    assert {:ok, _wrong_fact} =
+             DB.transaction(ctx.db, fn txn ->
+               ConditionFacts.file_in_txn(txn, %{
+                 kind: "dependency-ready",
+                 scope: first.id,
+                 origin: "agent:other-session"
+               })
+             end)
+
+    assert %{code: "cannot_proceed_standing"} =
+             handle(
+               ctx,
+               "attest",
+               attest_call({:session, "holder"}, first.id, "completion")
+             )
+
+    assert %{attest: %{verdictKind: "waiting"}} =
+             attest_call({:session, "holder"}, first.id, "verdict")
+             |> put_in([:params, :verdict_kind], "waiting")
+             |> put_in(
+               [:params, :note],
+               "The dependency remains blocked after the earlier clearance"
+             )
+             |> then(&handle(ctx, "attest", &1))
+
     assert filed.assignment.state == "open"
     assert replay.replayed
     assert replay.cannotProceed.id == filed.cannotProceed.id
-    assert Assignments.attest_count(ctx.db, first.id) == 1
+    assert Assignments.attest_count(ctx.db, first.id) == 3
     assert filed.decisionRequest.assignment_id == first.id
     assert filed.decisionRequest.expecter_session_key == Org.personal_session_key("flynn")
 
@@ -2564,7 +2612,20 @@ defmodule Tightbeam.AssignmentsTest do
     assert released_replay.replayed
     assert released_replay.cannotProceed.id == filed.cannotProceed.id
     assert released_replay.cannotProceed.state == "settled"
-    assert Assignments.attest_count(ctx.db, first.id) == 1
+    assert Assignments.attest_count(ctx.db, first.id) == 3
+
+    assert %{code: "completion_blocked"} =
+             handle(
+               ctx,
+               "attest",
+               attest_call({:session, "holder"}, first.id, "completion")
+             )
+
+    assert %{attest: %{verdictKind: "cleared"}} =
+             attest_call({:session, "holder"}, first.id, "verdict")
+             |> put_in([:params, :verdict_kind], "cleared")
+             |> put_in([:params, :note], "The verdict blocker actually cleared")
+             |> then(&handle(ctx, "attest", &1))
 
     assert {:ok, [["withdrawn", "canceled", nil, excluded]]} =
              DB.query(
@@ -2586,6 +2647,147 @@ defmodule Tightbeam.AssignmentsTest do
                ctx,
                "attest",
                attest_call({:session, "holder"}, first.id, "completion")
+             )
+  end
+
+  test "blocked and waiting verdicts refuse completion until explicitly cleared", ctx do
+    for blocking_kind <- ["blocked", "waiting"] do
+      assignment =
+        assign_call({:user, "flynn"}, "#{blocking_kind} verdict completion")
+        |> put_in([:params, :effect_kind], "coordination")
+        |> then(&handle(ctx, "assign", &1))
+
+      assert %{attest: %{verdictKind: ^blocking_kind}} =
+               attest_call({:session, "holder"}, assignment.id, "verdict")
+               |> put_in([:params, :verdict_kind], blocking_kind)
+               |> put_in([:params, :note], "The dependency is still unresolved")
+               |> then(&handle(ctx, "attest", &1))
+
+      assert %{code: "completion_blocked", message: message} =
+               handle(
+                 ctx,
+                 "attest",
+                 attest_call({:session, "holder"}, assignment.id, "completion")
+               )
+
+      assert message =~ "file cannot-proceed to route the dependency to the parent as a decision"
+      assert message =~ "file verdictKind=cleared on this assignment"
+
+      assert %{state: "open", closingAttestId: nil} =
+               handle(
+                 ctx,
+                 "assignment-get",
+                 assignment_get_call({:session, "holder"}, assignment.id)
+               )
+
+      assert {:ok, [[0]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT count(*) FROM attests WHERE assignmentId=?1 AND kind='completion'",
+                 [assignment.id]
+               )
+
+      assert %{attest: %{verdictKind: "cleared"}} =
+               attest_call({:session, "holder"}, assignment.id, "verdict")
+               |> put_in([:params, :verdict_kind], "cleared")
+               |> put_in([:params, :note], "The dependency actually cleared")
+               |> then(&handle(ctx, "attest", &1))
+
+      assert %{assignment: %{state: "closed", outcome: "completed"}} =
+               handle(
+                 ctx,
+                 "attest",
+                 attest_call({:session, "holder"}, assignment.id, "completion")
+               )
+    end
+  end
+
+  test "a later blocked verdict reblocks after clearance, including timestamp ties", ctx do
+    assignment =
+      assign_call({:user, "flynn"}, "reblocked completion")
+      |> put_in([:params, :effect_kind], "coordination")
+      |> then(&handle(ctx, "assign", &1))
+
+    for verdict_kind <- ["blocked", "cleared", "waiting"] do
+      attest_call({:session, "holder"}, assignment.id, "verdict")
+      |> put_in([:params, :verdict_kind], verdict_kind)
+      |> put_in([:params, :note], "Status record: #{verdict_kind}")
+      |> then(&handle(ctx, "attest", &1))
+    end
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE attests SET ts=100 WHERE assignmentId=?1", [assignment.id])
+
+    assert %{code: "completion_blocked"} =
+             handle(
+               ctx,
+               "attest",
+               attest_call({:session, "holder"}, assignment.id, "completion")
+             )
+
+    attest_call({:session, "holder"}, assignment.id, "verdict")
+    |> put_in([:params, :verdict_kind], "cleared")
+    |> put_in([:params, :note], "The waiting dependency actually cleared")
+    |> then(&handle(ctx, "attest", &1))
+
+    assert %{assignment: %{state: "closed", outcome: "completed"}} =
+             handle(
+               ctx,
+               "attest",
+               attest_call({:session, "holder"}, assignment.id, "completion")
+             )
+  end
+
+  test "prose, unrelated verdict kinds, and another assignment cannot clear a block", ctx do
+    blocked_assignment =
+      assign_call({:user, "flynn"}, "blocked assignment")
+      |> put_in([:params, :effect_kind], "coordination")
+      |> then(&handle(ctx, "assign", &1))
+
+    other_assignment =
+      assign_call({:user, "flynn"}, "other assignment")
+      |> put_in([:params, :effect_kind], "coordination")
+      |> then(&handle(ctx, "assign", &1))
+
+    attest_call({:session, "holder"}, blocked_assignment.id, "verdict")
+    |> put_in([:params, :verdict_kind], "blocked")
+    |> put_in([:params, :note], "A dependency is still blocked")
+    |> then(&handle(ctx, "attest", &1))
+
+    attest_call({:session, "holder"}, blocked_assignment.id, "progress")
+    |> put_in([:params, :note], "The blocker is cleared; this is only prose")
+    |> then(&handle(ctx, "attest", &1))
+
+    attest_call({:session, "holder"}, blocked_assignment.id, "verdict")
+    |> put_in([:params, :verdict_kind], "reviewed-clean")
+    |> then(&handle(ctx, "attest", &1))
+
+    attest_call({:session, "holder"}, blocked_assignment.id, "verdict")
+    |> put_in([:params, :verdict_kind], "work-blocked")
+    |> then(&handle(ctx, "attest", &1))
+
+    attest_call({:session, "holder"}, other_assignment.id, "verdict")
+    |> put_in([:params, :verdict_kind], "cleared")
+    |> put_in([:params, :note], "A different assignment cleared")
+    |> then(&handle(ctx, "attest", &1))
+
+    assert %{code: "completion_blocked"} =
+             handle(
+               ctx,
+               "attest",
+               attest_call({:session, "holder"}, blocked_assignment.id, "completion")
+             )
+
+    attest_call({:session, "holder"}, blocked_assignment.id, "verdict")
+    |> put_in([:params, :verdict_kind], "cleared")
+    |> put_in([:params, :note], "This assignment's blocker actually cleared")
+    |> then(&handle(ctx, "attest", &1))
+
+    assert %{assignment: %{state: "closed", outcome: "completed"}} =
+             handle(
+               ctx,
+               "attest",
+               attest_call({:session, "holder"}, blocked_assignment.id, "completion")
              )
   end
 
