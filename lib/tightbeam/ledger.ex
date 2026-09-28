@@ -189,6 +189,7 @@ defmodule Tightbeam.Ledger do
 
       [[seq]] = Txn.q(txn, "SELECT last_insert_rowid()")
       :ok = QueuedMessageSuppression.record_in_txn(txn, seq, attrs)
+      QueuedMessageSuppression.replace_own_queued_in_txn(txn, seq, attrs)
       Org.sync_mechanical_status_in_txn(txn, session_key)
       {:ok, seq}
     else

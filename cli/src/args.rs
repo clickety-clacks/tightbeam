@@ -69,6 +69,7 @@ pub enum Command {
         predicate: Option<serde_json::Value>,
         assignment_id: Option<String>,
         after_turn: bool,
+        replace_queued: bool,
         idempotency_key: Option<String>,
         /// Sender-elected delivery class. The vocabulary is extensible, so the
         /// CLI validates only that a supplied name is non-empty.
@@ -667,7 +668,7 @@ TARGET (for commands that take one — pass exactly one):
 
 COMMANDS:
   wake (--session <key> | --role <name> | --user <id>) --prompt "<text>"
-       [--after 30s|5m|2h] [--at <epochMs>]
+       [--after 30s|5m|2h] [--at <epochMs>] [--assignment <id> --replace-queued]
        [--class fyi|status-query|input-needed|blocker|algedonic]
       Condition wake:
         tightbeam wake (--session <key> | --role <name> | --user <id>)
@@ -687,6 +688,8 @@ COMMANDS:
       session (or yourself).
       A matching fact or fallback delivers a new notification turn.
       It never resumes or replays prior work. The fact stamp reports why the prompt arrived.
+      --replace-queued requires --assignment and asks delivery to cancel only your own
+      eligible queued messages to that assignment's holder.
       The accountable agent re-reads durable state and decides the next action.
       The fallback timer detects silence only; it does not select an action.
       A dependency predicate names conditions, bindings, resolverRef, necessity,
@@ -1129,6 +1132,7 @@ const BOOLEAN_FLAGS: &[&str] = &[
     "admin",
     "all",
     "after-turn",
+    "replace-queued",
     "api-key",
     "clear-spec-ref",
     "daemon-credential",
@@ -1796,6 +1800,7 @@ fn parse_with_optional_catalog(
                 .transpose()?;
             let assignment_id = nonempty(flags, "assignment");
             let after_turn = flags.contains_key("after-turn");
+            let replace_queued = flags.contains_key("replace-queued");
             let wait = predicate.is_some() || after_turn;
 
             if condition_scope.is_some() && condition_kind.is_none() {
@@ -1824,7 +1829,16 @@ fn parse_with_optional_catalog(
             if wait && assignment_id.is_none() {
                 return Err("--predicate and --after-turn require --assignment".to_owned());
             }
-            if !wait && assignment_id.is_some() {
+            if replace_queued && assignment_id.is_none() {
+                return Err("--replace-queued requires --assignment".to_owned());
+            }
+            if replace_queued && wait {
+                return Err(
+                    "--replace-queued cannot be combined with --predicate or --after-turn"
+                        .to_owned(),
+                );
+            }
+            if !wait && assignment_id.is_some() && !replace_queued {
                 return Err("--assignment requires --predicate or --after-turn".to_owned());
             }
             if predicate.is_some() && fallback_after_ms.is_none() && at.is_none() {
@@ -1859,6 +1873,7 @@ fn parse_with_optional_catalog(
                 predicate,
                 assignment_id,
                 after_turn,
+                replace_queued,
                 idempotency_key,
                 class: nonempty(flags, "class"),
             })
@@ -5108,6 +5123,7 @@ mod tests {
                 predicate: None,
                 assignment_id: None,
                 after_turn: false,
+                replace_queued: false,
                 idempotency_key: Some("wake-1".to_owned()),
                 class: None,
             })
@@ -5137,6 +5153,7 @@ mod tests {
                 predicate: None,
                 assignment_id: None,
                 after_turn: false,
+                replace_queued: false,
                 idempotency_key: None,
                 class: None,
             })
@@ -5156,6 +5173,54 @@ mod tests {
                 idempotency_key: None,
                 payload: None,
             })
+        );
+    }
+
+    #[test]
+    fn replacement_wakes_require_an_assignment_and_cannot_replace_continuations() {
+        assert!(matches!(
+            parse(strings(&[
+                "wake",
+                "--session",
+                "agent:holder",
+                "--assignment",
+                "asg_a",
+                "--replace-queued",
+                "--prompt",
+                "new instruction",
+            ])),
+            Ok(Command::Wake {
+                assignment_id: Some(id),
+                replace_queued: true,
+                ..
+            }) if id == "asg_a"
+        ));
+
+        assert_eq!(
+            parse(strings(&[
+                "wake",
+                "--session",
+                "agent:holder",
+                "--replace-queued",
+                "--prompt",
+                "new instruction",
+            ])),
+            Err("--replace-queued requires --assignment".to_owned())
+        );
+
+        assert_eq!(
+            parse(strings(&[
+                "wake",
+                "--session",
+                "agent:holder",
+                "--assignment",
+                "asg_a",
+                "--replace-queued",
+                "--after-turn",
+                "--prompt",
+                "continue",
+            ])),
+            Err("--replace-queued cannot be combined with --predicate or --after-turn".to_owned())
         );
     }
 
@@ -5190,6 +5255,7 @@ mod tests {
                 predicate: Some(serde_json::from_str(predicate).unwrap()),
                 assignment_id: Some("asg_a".to_owned()),
                 after_turn: false,
+                replace_queued: false,
                 idempotency_key: None,
                 class: None,
             })
@@ -5219,6 +5285,7 @@ mod tests {
                 predicate: None,
                 assignment_id: Some("asg_a".to_owned()),
                 after_turn: true,
+                replace_queued: false,
                 idempotency_key: None,
                 class: None,
             })
@@ -5994,6 +6061,7 @@ mod tests {
                     predicate: None,
                     assignment_id: None,
                     after_turn: false,
+                    replace_queued: false,
                     idempotency_key: None,
                     class: None,
                 },
