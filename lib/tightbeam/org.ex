@@ -38,6 +38,36 @@ defmodule Tightbeam.Org do
   alias Tightbeam.Firehose.Publisher
   alias Tightbeam.Model
 
+  @doc """
+  Organizational parent, distinct from creation provenance and authority lineage.
+
+  Each user's Main is a root. Other sessions retain their current lineage parent
+  when present, otherwise Main represents the user's organizational ownership.
+  Its stable key also represents the root before Main is materialized.
+  This projection never changes `spawned_by`, `owner_user_id`, or `current_parent`.
+  """
+  def topology_parent(db, session_key) do
+    case DB.query(
+           db,
+           "SELECT #{topology_parent_sql("s")} FROM sessions s WHERE s.sessionKey=?1",
+           [
+             session_key
+           ]
+         ) do
+      {:ok, [[parent]]} -> parent
+      {:ok, []} -> nil
+    end
+  end
+
+  @doc false
+  # Source-owned alias only, as with current_parent_sql/1. No duplicate stored edge.
+  def topology_parent_sql(session_alias) do
+    main = "('agent:main:clawline:' || #{session_alias}.ownerUserId || ':main')"
+
+    "CASE WHEN #{session_alias}.sessionKey = #{main} THEN NULL " <>
+      "ELSE COALESCE(#{current_parent_sql(session_alias)}, #{main}) END"
+  end
+
   @type db :: GenServer.server()
 
   @typedoc """
@@ -56,6 +86,7 @@ defmodule Tightbeam.Org do
           owner_user_id: String.t(),
           origin: String.t(),
           spawned_by: String.t() | nil,
+          topology_parent: String.t() | nil,
           handle: String.t() | nil,
           archetype: String.t(),
           overrides: map() | nil,
@@ -386,6 +417,8 @@ defmodule Tightbeam.Org do
     session_key =
       Map.get(input, :session_key) || custom_session_key(Map.fetch!(input, :owner_user_id))
 
+    validate_topology_creation!(txn, session_key, input)
+
     now = now()
     cli_token = session_token()
     %Model{} = model = Map.fetch!(input, :model)
@@ -434,6 +467,62 @@ defmodule Tightbeam.Org do
     end
 
     session
+  end
+
+  # Main may be virtual until its first connection. Only an explicitly supplied
+  # parent requires a stored session; the derived fallback never creates one.
+  defp validate_topology_creation!(txn, key, input) do
+    owner = Map.fetch!(input, :owner_user_id)
+    main = personal_session_key(owner)
+    parent = Map.get(input, :spawned_by)
+    kind = Map.get(input, :kind, "custom")
+
+    cond do
+      key == main != (kind == "main") ->
+        raise ArgumentError, "invalid topology root"
+
+      key == main and parent != nil ->
+        raise ArgumentError, "Main cannot have an organizational parent"
+
+      parent == nil ->
+        :ok
+
+      parent == key ->
+        raise ArgumentError, "topology cycle"
+
+      true ->
+        case get_in_txn(txn, parent) do
+          %{owner_user_id: ^owner, state: "active"} ->
+            validate_topology_ancestry!(txn, parent, owner, MapSet.new([key]))
+
+          _ ->
+            raise ArgumentError, "invalid organizational parent"
+        end
+    end
+  end
+
+  defp validate_topology_ancestry!(txn, key, owner, seen) do
+    cond do
+      MapSet.member?(seen, key) ->
+        raise ArgumentError, "topology cycle"
+
+      key == personal_session_key(owner) ->
+        :ok
+
+      true ->
+        case get_in_txn(txn, key) do
+          %{owner_user_id: ^owner} ->
+            validate_topology_ancestry!(
+              txn,
+              topology_parent(txn, key),
+              owner,
+              MapSet.put(seen, key)
+            )
+
+          _ ->
+            raise ArgumentError, "invalid organizational parent"
+        end
+    end
   end
 
   @doc "Fetch an active session by its CLI token, or nil."
@@ -1494,7 +1583,8 @@ defmodule Tightbeam.Org do
   # item without its version, advances the durable per-session version once,
   # and queues exactly one post-commit state notice. A duplicate write does
   # none of those things.
-  defp mutate_session_in_txn(txn, session_key, mutation) do
+  @doc false
+  def mutate_session_in_txn(txn, session_key, mutation) do
     before = must_get(txn, session_key)
     result = mutation.()
     after_mutation = must_get(txn, session_key)
@@ -1543,7 +1633,8 @@ defmodule Tightbeam.Org do
            ownerUserId, origin, spawnedBy, handle, archetype, overrides, identityName,
            identityRevision, identityRenderContract, identityGuidanceDigest, cliToken, harness, provider,
            model, thinkingLevel, modelContext, host, clearedThroughSeq, state,
-           mechanicalStatus, createdAt, updatedAt, #{current_parent_sql("sessions")}
+           mechanicalStatus, createdAt, updatedAt, #{current_parent_sql("sessions")},
+           #{topology_parent_sql("sessions")}
     FROM sessions
     """
   end
@@ -1577,7 +1668,8 @@ defmodule Tightbeam.Org do
          mechanical_status,
          created_at,
          updated_at,
-         current_parent
+         current_parent,
+         topology_parent
        ]) do
     %{
       session_key: session_key,
@@ -1590,6 +1682,7 @@ defmodule Tightbeam.Org do
       origin: origin,
       spawned_by: spawned_by,
       current_parent: current_parent,
+      topology_parent: topology_parent,
       handle: handle,
       archetype: archetype,
       overrides: decode_overrides(overrides),

@@ -696,6 +696,7 @@ defmodule Tightbeam.EscalationDeliveryFixture do
     Org.create(db, %{
       session_key: key,
       display_name: key,
+      kind: if(key == Org.personal_session_key("flynn"), do: "main", else: "custom"),
       owner_user_id: "flynn",
       origin: "user:flynn",
       archetype: "default",

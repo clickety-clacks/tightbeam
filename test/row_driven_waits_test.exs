@@ -1616,6 +1616,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     Org.create(db, %{
       session_key: key,
       display_name: key,
+      kind: if(key == Org.personal_session_key(owner), do: "main", else: "custom"),
       owner_user_id: owner,
       origin: "user:#{owner}",
       archetype: "default",

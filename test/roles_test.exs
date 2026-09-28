@@ -210,6 +210,7 @@ defmodule Tightbeam.RolesTest do
     Org.create(db, %{
       session_key: session_key,
       display_name: session_key,
+      kind: if(session_key == Org.personal_session_key(owner), do: "main", else: "custom"),
       owner_user_id: owner,
       origin: "user:#{owner}",
       archetype: "default",

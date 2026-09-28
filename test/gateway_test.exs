@@ -1720,6 +1720,10 @@ defmodule Tightbeam.GatewayTest do
 
     assert [%{created_at: created_at}] = inspect.sessions
     assert created_at == session.created_at
+    assert [%{topology_parent: topology_parent, spawned_by: spawned_by}] = inspect.sessions
+    assert topology_parent == Org.personal_session_key("flynn")
+    assert spawned_by == session.spawned_by
+    assert Payloads.stream_session(session)["topologyParent"] == topology_parent
 
     projections = [
       inspect,
@@ -7448,7 +7452,7 @@ defmodule Tightbeam.GatewayTest do
 
     main =
       Org.create(ctx.db, %{
-        session_key: "user:bundle-main",
+        session_key: Org.personal_session_key("bundle-owner"),
         display_name: "Main",
         kind: "main",
         is_built_in: true,

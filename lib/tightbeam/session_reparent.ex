@@ -215,61 +215,66 @@ defmodule Tightbeam.SessionReparent do
       if previous_parent == parent and previous_coordination == parent do
         refusal("no_change")
       else
-        event = "trp_" <> Tightbeam.Id.uuid4()
-        at = System.system_time(:millisecond)
+        {_change, _session, response} =
+          Org.mutate_session_in_txn(txn, child, fn ->
+            event = "trp_" <> Tightbeam.Id.uuid4()
+            at = System.system_time(:millisecond)
 
-        response = %{
-          "eventId" => event,
-          "session" => %{
-            "sessionKey" => child,
-            "originParent" => origin_parent,
-            "previousCurrentParent" => previous_parent,
-            "currentParent" => parent
-          },
-          "assignment" => %{
-            "assignmentId" => assignment,
-            "workItemId" => work_item,
-            "originOpenerRef" => opener,
-            "previousCurrentCoordinationParentRef" => session_ref(previous_coordination),
-            "currentCoordinationParentRef" => session_ref(parent)
-          },
-          "appliedAt" => at
-        }
+            response = %{
+              "eventId" => event,
+              "session" => %{
+                "sessionKey" => child,
+                "originParent" => origin_parent,
+                "previousCurrentParent" => previous_parent,
+                "currentParent" => parent
+              },
+              "assignment" => %{
+                "assignmentId" => assignment,
+                "workItemId" => work_item,
+                "originOpenerRef" => opener,
+                "previousCurrentCoordinationParentRef" => session_ref(previous_coordination),
+                "currentCoordinationParentRef" => session_ref(parent)
+              },
+              "appliedAt" => at
+            }
 
-        Txn.q(
-          txn,
-          """
-          INSERT INTO session_reparent_events
-            (eventId,ownerUserId,childSessionKey,assignmentId,workItemId,
-             originParentSessionKey,previousCurrentParentSessionKey,newCurrentParentSessionKey,
-             originAssignmentOpenerKind,originAssignmentOpenerRef,
-             previousCurrentCoordinationParentSessionKey,newCurrentCoordinationParentSessionKey,
-             cause,principalKind,principalRef,idempotencyKey,requestFingerprint,createdAt)
-          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?8,
-            ?12,?13,?14,?15,?16,?17)
-          """,
-          [
-            event,
-            owner,
-            child,
-            assignment,
-            work_item,
-            origin_parent,
-            previous_parent,
-            parent,
-            opener_kind,
-            opener,
-            previous_coordination,
-            actor.cause,
-            actor.kind,
-            actor.ref,
-            key,
-            fingerprint,
-            at
-          ]
-        )
+            Txn.q(
+              txn,
+              """
+              INSERT INTO session_reparent_events
+                (eventId,ownerUserId,childSessionKey,assignmentId,workItemId,
+                 originParentSessionKey,previousCurrentParentSessionKey,newCurrentParentSessionKey,
+                 originAssignmentOpenerKind,originAssignmentOpenerRef,
+                 previousCurrentCoordinationParentSessionKey,newCurrentCoordinationParentSessionKey,
+                 cause,principalKind,principalRef,idempotencyKey,requestFingerprint,createdAt)
+              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?8,
+                ?12,?13,?14,?15,?16,?17)
+              """,
+              [
+                event,
+                owner,
+                child,
+                assignment,
+                work_item,
+                origin_parent,
+                previous_parent,
+                parent,
+                opener_kind,
+                opener,
+                previous_coordination,
+                actor.cause,
+                actor.kind,
+                actor.ref,
+                key,
+                fingerprint,
+                at
+              ]
+            )
 
-        :ok = Idempotency.put_reparent_in_txn(txn, owner, key, fingerprint, event, response)
+            :ok = Idempotency.put_reparent_in_txn(txn, owner, key, fingerprint, event, response)
+            response
+          end)
+
         response
       end
     else
@@ -322,9 +327,16 @@ defmodule Tightbeam.SessionReparent do
            "SELECT ownerUserId,kind,isBuiltIn,state,spawnedBy FROM sessions WHERE sessionKey=?1",
            [child]
          ) do
-      [[^owner, "custom", 0, "active", origin]] -> {:ok, origin}
-      [[^owner, _, _, _, _]] -> {:error, "unsupported_session"}
-      _ -> {:error, "not_authorized"}
+      [[^owner, "custom", 0, "active", origin]] ->
+        if child == Org.personal_session_key(owner),
+          do: {:error, "unsupported_session"},
+          else: {:ok, origin}
+
+      [[^owner, _, _, _, _]] ->
+        {:error, "unsupported_session"}
+
+      _ ->
+        {:error, "not_authorized"}
     end
   end
 
@@ -371,7 +383,7 @@ defmodule Tightbeam.SessionReparent do
   defp acyclic(txn, key, seen) do
     if MapSet.member?(seen, key),
       do: {:error, "cycle_detected"},
-      else: acyclic(txn, Org.current_parent(txn, key), MapSet.put(seen, key))
+      else: acyclic(txn, Org.topology_parent(txn, key), MapSet.put(seen, key))
   end
 
   def current_coordination_parent(db, assignment) do

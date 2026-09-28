@@ -555,7 +555,7 @@ defmodule Tightbeam.RulesTest do
   end
 
   test "target facts cover active retired missing ghost dm and main sessions", ctx do
-    active = session(ctx.db, "active", "flynn", kind: "main")
+    active = session(ctx.db, Org.personal_session_key("flynn"), "flynn", kind: "main")
     dm = session(ctx.db, "dm", "mike", kind: "dm")
     custom = session(ctx.db, "custom", "mike")
     retired = session(ctx.db, "retired", "flynn")
@@ -2289,7 +2289,12 @@ defmodule Tightbeam.RulesTest do
     Org.create(db, %{
       session_key: key,
       display_name: key,
-      kind: Keyword.get(opts, :kind, "custom"),
+      kind:
+        Keyword.get(
+          opts,
+          :kind,
+          if(key == Org.personal_session_key(owner), do: "main", else: "custom")
+        ),
       owner_user_id: owner,
       origin: "user:#{owner}",
       archetype: Keyword.get(opts, :archetype, "default"),

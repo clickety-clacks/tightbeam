@@ -59,7 +59,15 @@ defmodule Tightbeam.EffortCheckinTest do
 
     host = Placement.local_host_name()
     parent = session(db, "parent", "h1", host)
-    holder = session(db, "holder", "h2", host, %{spawned_by: "parent"})
+    holder = session(db, "holder", "h2", host)
+
+    # This suite exercises authorization over durable cross-owner provenance
+    # that predates the same-owner topology admission rule. Preserve that
+    # historical row shape without presenting it as a newly admissible spawn.
+    {:ok, _} =
+      DB.query(db, "UPDATE sessions SET spawnedBy='parent' WHERE sessionKey='holder'")
+
+    holder = Org.get(db, holder.session_key)
     # The extra keys are what `Gateway.children_after_preflight/1` reads: the
     # notification drain uses the REAL prompt-wake child, not a test closure.
     config = %{

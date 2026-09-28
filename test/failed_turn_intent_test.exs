@@ -166,7 +166,7 @@ defmodule Tightbeam.FailedTurnIntentTest do
         "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('legacy-owner', 1, 1)"
       )
 
-    legacy = session(db, Org.personal_session_key("legacy-owner"), nil, true)
+    legacy = session(db, Org.personal_session_key("legacy-owner"), nil, true, "legacy-owner")
     legacy_seq = terminal!(db, legacy.session_key, "failed", "provider rate limit")
 
     assert {:ok, []} = DB.query(db, "SELECT firstTurnSeq FROM patrol_failure_boundary")
@@ -314,13 +314,13 @@ defmodule Tightbeam.FailedTurnIntentTest do
              DB.query(ctx.db, "SELECT 1 FROM patrol_failure_streaks WHERE sessionKey='parent'")
   end
 
-  defp session(db, key, parent, built_in? \\ false) do
+  defp session(db, key, parent, built_in? \\ false, owner \\ "flynn") do
     Org.create(db, %{
       session_key: key,
       display_name: key,
       kind: if(built_in?, do: "main", else: "custom"),
-      owner_user_id: "flynn",
-      origin: "user:flynn",
+      owner_user_id: owner,
+      origin: "user:#{owner}",
       archetype: "default",
       harness: "claude",
       provider: "anthropic",

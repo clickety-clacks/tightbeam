@@ -22,7 +22,8 @@ defmodule Tightbeam.StateResources do
          sessions.identityName, sessions.identityRevision, sessions.harness,
          sessions.provider, sessions.model, sessions.thinkingLevel, sessions.modelContext,
          sessions.host, sessions.clearedThroughSeq, sessions.state, sessions.createdAt,
-         sessions.updatedAt, sessions.mechanicalStatus, sessions.updatedAt
+         sessions.updatedAt, sessions.mechanicalStatus, sessions.updatedAt,
+         #{Tightbeam.Org.topology_parent_sql("sessions")}
   FROM sessions
   """
 
@@ -89,7 +90,7 @@ defmodule Tightbeam.StateResources do
     "decision requests" =>
       ~w(id kind raiserId raiserSessionKey ownerUserId assignmentId expecterSessionKey expecterUserId lineageRung effortGeneration deadlineWakeId raisedAt deadlineAt statuteName question options context status decision rationale ruledBy ruledAt consumedAt withdrawnBy withdrawnReason withdrawnAt askedOfRole answer answeredBy answeredAt rowVersion),
     "sessions" =>
-      ~w(sessionKey displayName kind orderIndex isBuiltIn adopted ownerUserId origin spawnedBy handle archetype overrides identityName identityRevision harness provider model thinkingLevel modelContext host clearedThroughSeq state createdAt updatedAt mechanicalStatus rowVersion),
+      ~w(sessionKey displayName kind orderIndex isBuiltIn adopted ownerUserId origin spawnedBy topologyParent handle archetype overrides identityName identityRevision harness provider model thinkingLevel modelContext host clearedThroughSeq state createdAt updatedAt mechanicalStatus rowVersion),
     "roles" => ~w(name boundSessionKey ownerUserId createdAt updatedAt rowVersion),
     "users" => ~w(userId isAdmin createdAt rowVersion),
     "devices" => ~w(deviceId userId claimedName status platform model createdAt rowVersion),
@@ -174,11 +175,11 @@ defmodule Tightbeam.StateResources do
     },
     "sessions" => %{
       strings:
-        ~w(sessionKey displayName kind ownerUserId origin spawnedBy handle archetype identityName identityRevision harness provider model thinkingLevel modelContext host state mechanicalStatus),
+        ~w(sessionKey displayName kind ownerUserId origin spawnedBy topologyParent handle archetype identityName identityRevision harness provider model thinkingLevel modelContext host state mechanicalStatus),
       integers: ~w(orderIndex clearedThroughSeq createdAt updatedAt rowVersion),
       booleans: ~w(isBuiltIn adopted),
       nullable:
-        ~w(ownerUserId spawnedBy handle identityName identityRevision provider model thinkingLevel modelContext host clearedThroughSeq overrides)
+        ~w(ownerUserId spawnedBy topologyParent handle identityName identityRevision provider model thinkingLevel modelContext host clearedThroughSeq overrides)
     },
     "roles" => %{
       strings: ~w(name boundSessionKey ownerUserId),
@@ -568,7 +569,8 @@ defmodule Tightbeam.StateResources do
          created_at,
          updated_at,
          mechanical_status,
-         row_version
+         row_version,
+         topology_parent
        ]) do
     %{
       session_key: session_key,
@@ -580,6 +582,7 @@ defmodule Tightbeam.StateResources do
       owner_user_id: owner_user_id,
       origin: origin,
       spawned_by: spawned_by,
+      topology_parent: topology_parent,
       handle: handle,
       archetype: archetype,
       overrides: if(is_binary(overrides), do: JSON.decode!(overrides), else: overrides),
@@ -1229,6 +1232,7 @@ defmodule Tightbeam.StateResources do
         "ownerUserId" => session_wire_value!(row, :owner_user_id, "ownerUserId"),
         "origin" => session_wire_value!(row, :origin, "origin"),
         "spawnedBy" => session_wire_value!(row, :spawned_by, "spawnedBy"),
+        "topologyParent" => session_wire_value!(row, :topology_parent, "topologyParent"),
         "handle" => session_wire_value!(row, :handle, "handle"),
         "archetype" => session_wire_value!(row, :archetype, "archetype"),
         "overrides" => session_wire_value!(row, :overrides, "overrides"),

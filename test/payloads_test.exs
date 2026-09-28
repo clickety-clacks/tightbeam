@@ -199,7 +199,8 @@ defmodule Tightbeam.Wire.PayloadsTest do
       "createdAt" => 1,
       "updatedAt" => 2,
       "adopted" => true,
-      "startedBy" => "user"
+      "startedBy" => "user",
+      "topologyParent" => nil
     }
 
     stream = Payloads.stream_session(session)

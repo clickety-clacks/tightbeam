@@ -404,6 +404,7 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
       session_key: session_key,
       display_name: session_key,
       owner_user_id: owner,
+      kind: if(session_key == Org.personal_session_key(owner), do: "main", else: "custom"),
       origin: "user:#{owner}",
       archetype: "default",
       host: @host,
