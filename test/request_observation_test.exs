@@ -16,9 +16,18 @@ defmodule Tightbeam.RequestObservationTest do
     assert {:ok, routes} = OperationRegistry.router_routes()
     assert :ok = OperationRegistry.check_source(:http, routes)
     assert {:ok, rows} = OperationRegistry.rows(:http)
-    assert length(rows) == 42
+    assert length(rows) == 45
     assert OperationRegistry.http("POST", "/agent/terminal") == "http.agent_terminal"
     assert OperationRegistry.http("GET", "/api/work-items/:id") == "http.api_work_items.get"
+
+    assert OperationRegistry.http("GET", "/api/sessions/:session_key/messages") ==
+             "http.api_sessions.messages.list"
+
+    assert OperationRegistry.http("GET", "/api/sessions/:session_key/turns") ==
+             "http.api_sessions.turns.list"
+
+    assert OperationRegistry.http("GET", "/api/sessions/:session_key/wakes") ==
+             "http.api_sessions.wakes.list"
 
     assert {:error, [{:unmapped_source, {"GET", "/new"}}]} =
              OperationRegistry.check(rows, [{"GET", "/new"} | routes])

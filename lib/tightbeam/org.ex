@@ -547,8 +547,9 @@ defmodule Tightbeam.Org do
   def active_session_key_by_cli_token(db \\ Tightbeam.DB, token)
 
   def active_session_key_by_cli_token(db, token) when is_binary(token) do
-    case DB.query(
+    case DB.query_for(
            db,
+           "auth.session_by_cli_token",
            "SELECT sessionKey FROM sessions WHERE cliToken = ?1 AND state = 'active'",
            [token]
          ) do

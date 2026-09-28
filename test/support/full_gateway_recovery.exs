@@ -337,7 +337,9 @@ readiness = %{
 {_id, bandit, _type, _modules} =
   Enum.find(
     Supervisor.which_children(Tightbeam.Supervisor),
-    fn {id, _pid, _type, modules} -> id == Bandit or (is_list(modules) and Bandit in modules) end
+    fn {id, _pid, _type, modules} ->
+      id == Bandit or match?({Bandit, _}, id) or (is_list(modules) and Bandit in modules)
+    end
   )
 
 {:ok, {_address, bound_port}} = ThousandIsland.listener_info(bandit)
