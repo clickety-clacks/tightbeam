@@ -326,6 +326,91 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
              DB.query(db, "SELECT COUNT(*) FROM turns WHERE seq IN (?1,?2)", [old_seq, new_seq])
   end
 
+  test "a delayed older replacement cannot cancel a newer queued replacement", %{db: db} do
+    assignment!(db, "asg_delayed_replacement")
+    session!(db, "sender")
+
+    :ok =
+      DB.execute(
+        db,
+        """
+        UPDATE assignments SET openedByUser=NULL,openedBySession='sender'
+        WHERE id='asg_delayed_replacement'
+        """
+      )
+
+    delayed_old_wake =
+      Wakes.schedule(db, %{
+        session_key: "k1",
+        origin: "session:sender",
+        prompt: "older delayed instruction",
+        due_at: System.system_time(:millisecond) + 60_000,
+        creator_session_key: "sender",
+        replacement_assignment_id: "asg_delayed_replacement"
+      })
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "UPDATE queued_message_replacement_requests SET requestedAt=100 WHERE wakeId=?1",
+               [delayed_old_wake.wake_id]
+             )
+
+    assert {:ok, [[100]]} =
+             DB.query(
+               db,
+               "SELECT requestedAt FROM queued_message_replacement_requests WHERE wakeId=?1",
+               [delayed_old_wake.wake_id]
+             )
+
+    newer_wake =
+      Wakes.schedule(db, %{
+        session_key: "k1",
+        origin: "session:sender",
+        prompt: "newer instruction",
+        due_at: System.system_time(:millisecond),
+        creator_session_key: "sender",
+        replacement_assignment_id: "asg_delayed_replacement"
+      })
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "UPDATE queued_message_replacement_requests SET requestedAt=200 WHERE wakeId=?1",
+               [newer_wake.wake_id]
+             )
+
+    assert {:ok, [[200]]} =
+             DB.query(
+               db,
+               "SELECT requestedAt FROM queued_message_replacement_requests WHERE wakeId=?1",
+               [newer_wake.wake_id]
+             )
+
+    assert delayed_old_wake.due_at > newer_wake.due_at
+
+    newer_seq = deliver_wake!(db, newer_wake)
+    # deliver_wake!/2 appends directly, so this models the older scheduled wake
+    # firing late after the newer replacement is already queued.
+    delayed_old_seq = deliver_wake!(db, delayed_old_wake)
+
+    assert {:ok, [["queued"]]} =
+             DB.query(db, "SELECT status FROM turns WHERE seq=?1", [newer_seq])
+
+    assert {:ok, []} =
+             DB.query(
+               db,
+               "SELECT 1 FROM lifecycle_events WHERE kind='queued_message_suppressed' AND subject=?1",
+               [Integer.to_string(newer_seq)]
+             )
+
+    assert {:ok, %{seq: ^newer_seq, prompt: "[from session:sender]\n\nnewer instruction"}} =
+             Ledger.claim_next(db, "k1", "lane")
+
+    assert {:ok, [["queued"]]} =
+             DB.query(db, "SELECT status FROM turns WHERE seq=?1", [delayed_old_seq])
+  end
+
   test "replacement keeps a same-sender generic FYI wake in FIFO", %{db: db} do
     assignment!(db, "asg_fyi")
     session!(db, "sender")
