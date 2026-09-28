@@ -628,12 +628,22 @@ defmodule Tightbeam.Placement do
   def workdir_path(config, session) do
     host = fetch_session_host!(config, session)
 
-    digest =
-      :crypto.hash(:sha256, session.session_key)
-      |> Base.encode16(case: :lower)
-      |> binary_part(0, 12)
+    host_workdir_path(host, session.session_key)
+  end
 
-    Path.join([host.base_dir, "work", digest])
+  @doc false
+  def host_in_txn(txn, base_dir, name) do
+    if name == local_host_name() do
+      if is_binary(base_dir), do: %{ssh: nil, base_dir: base_dir, cli_bin: nil}
+    else
+      case DB.Txn.q(txn, "SELECT ssh, baseDir, cliBin FROM hosts WHERE name=?1", [name]) do
+        [[ssh, host_base_dir, cli_bin]] ->
+          %{ssh: ssh, base_dir: host_base_dir, cli_bin: cli_bin}
+
+        [] ->
+          nil
+      end
+    end
   end
 
   @doc """
@@ -1340,7 +1350,8 @@ defmodule Tightbeam.Placement do
     end
   end
 
-  defp host_workdir_path(host, session_key) do
+  @doc false
+  def host_workdir_path(host, session_key) do
     digest =
       :crypto.hash(:sha256, session_key)
       |> Base.encode16(case: :lower)

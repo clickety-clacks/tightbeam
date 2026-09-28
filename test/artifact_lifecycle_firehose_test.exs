@@ -305,6 +305,7 @@ defmodule Tightbeam.ArtifactLifecycleFirehoseTest do
     assert {:ok, [[501], [501]]} =
              DB.query(db, "SELECT rowVersion FROM artifact_version_floors ORDER BY artifactId")
 
+    assert :ok = Schema.ensure_all(db)
     assert Artifacts.release(db, "archived").state == "released"
     assert_receive {:firehose_notice, %{"class" => "artifact.released", "payload" => payload}}
     Hub.delivered(Hub, self())
@@ -334,6 +335,7 @@ defmodule Tightbeam.ArtifactLifecycleFirehoseTest do
       )
 
     assert :ok = Schema.upgrade_firehose_r1(db)
+    assert :ok = Schema.ensure_all(db)
     assert StateResources.query_artifact(db, "released") == nil
     assert StateResources.query_artifact(db, "archived").row_version == 501
     assert {:ok, 1} = DB.transaction(db, &Artifacts.reserve_version_in_txn(&1, "released"))
@@ -364,6 +366,7 @@ defmodule Tightbeam.ArtifactLifecycleFirehoseTest do
     assert {:ok, ^ddl} =
              DB.query(db, "SELECT sql FROM sqlite_master WHERE name='artifact_version_floors'")
 
+    assert :ok = Schema.ensure_all(db)
     raw = StateResources.query_artifact(db, "archived")
 
     for invalid <- [nil, 0, -1, 1.5] do
@@ -444,6 +447,7 @@ defmodule Tightbeam.ArtifactLifecycleFirehoseTest do
     assert {:ok, [["row-driven-r1-v1-019"]]} = DB.query(db, "SELECT shape FROM schema_stamp")
     :ok = DB.execute(db, "DROP TRIGGER fail_artifact_stamp")
     assert :ok = Schema.upgrade_firehose_r1(db)
+    assert :ok = Schema.ensure_all(db)
     assert StateResources.query_artifact(db, "archived").row_version == 501
     assert history_rows(db) == before
     assert {:ok, ^reminder} = DB.query(db, "SELECT reminderState FROM assignments")
@@ -481,7 +485,17 @@ defmodule Tightbeam.ArtifactLifecycleFirehoseTest do
   end
 
   defp history_rows(db) do
-    assert {:ok, rows} = DB.query(db, "SELECT * FROM artifacts ORDER BY artifactId")
+    assert {:ok, rows} =
+             DB.query(
+               db,
+               """
+               SELECT artifactId,kind,title,description,createdBySession,workItemId,
+                 producedByAssignmentId,parentSession,originPath,contentSha256,recordedMessageId,
+                 recordedTurnEvidence,state,home,createdAt,updatedAt
+               FROM artifacts ORDER BY artifactId
+               """
+             )
+
     rows
   end
 

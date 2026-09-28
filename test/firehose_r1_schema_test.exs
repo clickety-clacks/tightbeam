@@ -56,7 +56,7 @@ defmodule Tightbeam.FirehoseR1SchemaTest do
     assert :ok = Schema.ensure_all(db)
 
     assert rows(db, "SELECT shape FROM schema_stamp") ==
-             [["delivery-owner-reparent-v1-019"]]
+             [["artifact-origin-v1-019"]]
 
     for {table, column} <- [
           {"assignments", "reminderState"},
@@ -81,6 +81,7 @@ defmodule Tightbeam.FirehoseR1SchemaTest do
     before = retained(db)
     assert :ok = Schema.upgrade_firehose_r1(db)
     assert retained(db) == before
+
     assert rows(db, "SELECT shape FROM schema_stamp") == [["firehose-r1-v1-019"]]
 
     assert rows(db, "SELECT reminderState,closedByProcess FROM assignments ORDER BY id") ==
@@ -98,6 +99,9 @@ defmodule Tightbeam.FirehoseR1SchemaTest do
     assert rows(db, "PRAGMA foreign_key_check") == []
     assert :ok = Schema.ensure_all(db)
     assert retained(db) == before
+
+    assert rows(db, "SELECT originHost,originWorkspace FROM artifacts ORDER BY artifactId") ==
+             [[nil, nil]]
   end
 
   test "failure before final stamp rolls back whole suffix and restores connection pragmas", %{
@@ -181,8 +185,12 @@ defmodule Tightbeam.FirehoseR1SchemaTest do
        db,
        "SELECT id,subject,holderKey,state,outcome,closedAt,closedByUser,closedBySession,reminderState FROM assignments ORDER BY id"
      ), rows(db, "SELECT * FROM condition_facts ORDER BY id"),
-     rows(db, "SELECT * FROM artifacts ORDER BY artifactId"),
-     rows(db, "SELECT * FROM decision_request_terminal_epoch"),
+     rows(db, """
+     SELECT artifactId,kind,title,description,createdBySession,workItemId,
+            producedByAssignmentId,parentSession,originPath,contentSha256,
+            recordedMessageId,recordedTurnEvidence,state,home,createdAt,updatedAt
+     FROM artifacts ORDER BY artifactId
+     """), rows(db, "SELECT * FROM decision_request_terminal_epoch"),
      rows(db, "SELECT * FROM turns ORDER BY seq")}
   end
 

@@ -29,6 +29,9 @@ defmodule Tightbeam.SettlementMigrationTest do
       INSERT INTO wire_idempotency VALUES
         ('mike','session-reparent','prior-key','prior-event','prior-fingerprint','{"prior":true}'),
       ('mike','session-po-set','po-key','po-event','po-fingerprint','{"po":true}');
+      DROP TRIGGER artifacts_origin_immutable;
+      ALTER TABLE artifacts DROP COLUMN originHost;
+      ALTER TABLE artifacts DROP COLUMN originWorkspace;
       UPDATE schema_stamp SET shape='cannot-proceed-v1-019';
       """)
 
@@ -45,7 +48,7 @@ defmodule Tightbeam.SettlementMigrationTest do
     assert {:ok, ^before_ddl} = DB.query(db, preserved_sql)
     assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
 
-    assert {:ok, [["delivery-owner-reparent-v1-019"]]} =
+    assert {:ok, [["artifact-origin-v1-019"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert {:ok, [["prior-fingerprint", ~s({"prior":true}), nil]]} =

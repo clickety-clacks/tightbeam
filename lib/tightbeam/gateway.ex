@@ -850,7 +850,9 @@ defmodule Tightbeam.Gateway do
           end
         end,
       {"facts-read", []} => fn call -> facts_read_result(db, call) end,
-      {"artifact-record", ["artifact.recorded"]} => fn call -> Artifacts.record(db, call) end,
+      {"artifact-record", ["artifact.recorded"]} => fn call ->
+        Artifacts.record(db, Map.put(call, :artifact_base_dir, config[:base_dir]))
+      end,
       {"artifact-content-fetch", []} => fn call ->
         Tightbeam.ArtifactContent.fetch_call(db, call)
       end,

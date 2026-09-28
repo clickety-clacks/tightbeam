@@ -323,6 +323,7 @@ defmodule Tightbeam.Schema do
   @settlement_shape "stale-turn-settlement-v1-019"
   @terminal_credential_shape "terminal-credential-failure-v1-019"
   @agent_reparent_shape "delivery-owner-reparent-v1-019"
+  @artifact_origin_shape "artifact-origin-v1-019"
   @cursor_provider_previous_shape @addressed_po_shape
   @liveness_progress_receipts_previous_shape "identity-universal-root-render-v1-019"
   @cannot_proceed_shape "cannot-proceed-v1-019"
@@ -1357,6 +1358,7 @@ defmodule Tightbeam.Schema do
   @doc false
   def guard_compatible_stamps do
     [
+      @artifact_origin_shape,
       @agent_reparent_shape,
       @terminal_credential_shape,
       @settlement_shape,
@@ -1430,7 +1432,8 @@ defmodule Tightbeam.Schema do
             @cannot_proceed_shape,
             @settlement_shape,
             @terminal_credential_shape,
-            @agent_reparent_shape
+            @agent_reparent_shape,
+            @artifact_origin_shape
           ]
         )
     end)
@@ -1490,6 +1493,7 @@ defmodule Tightbeam.Schema do
     :ok = Tightbeam.ReadMarkers.ensure_schema(db)
     :ok = Tightbeam.Sentinels.ensure_schema(db)
     :ok = upgrade_agent_reparent(db)
+    :ok = upgrade_artifact_origins(db)
     :ok = Tightbeam.Ledger.ensure_schema(db)
 
     case DB.finish_schema(db) do
@@ -1599,7 +1603,8 @@ defmodule Tightbeam.Schema do
            @cannot_proceed_shape,
            @settlement_shape,
            @terminal_credential_shape,
-           @agent_reparent_shape
+           @agent_reparent_shape,
+           @artifact_origin_shape
          ],
          do: @cannot_proceed_liveness_objects,
          else: @o2_liveness_objects
@@ -1654,7 +1659,8 @@ defmodule Tightbeam.Schema do
            @cannot_proceed_shape,
            @settlement_shape,
            @terminal_credential_shape,
-           @agent_reparent_shape
+           @agent_reparent_shape,
+           @artifact_origin_shape
          ],
          do: reparent_liveness_enforcement_objects(),
          else: @supervision_liveness_enforcement_objects
@@ -2176,7 +2182,8 @@ defmodule Tightbeam.Schema do
              @cannot_proceed_shape,
              @settlement_shape,
              @terminal_credential_shape,
-             @agent_reparent_shape
+             @agent_reparent_shape,
+             @artifact_origin_shape
            ] ->
         :ok
 
@@ -2274,7 +2281,7 @@ defmodule Tightbeam.Schema do
         this Tightbeam database was written by a different build.
 
           stamped: #{found}
-          this build: #{@agent_reparent_shape}
+          this build: #{@artifact_origin_shape}
 
         This build can migrate #{@model_identity_shape} or #{@operator_decision_shape}
         to #{@terminal_decision_liveness_shape}, then #{@effort_request_exit_previous_shape}.
@@ -2286,7 +2293,8 @@ defmodule Tightbeam.Schema do
         #{@effort_request_exit_previous_shape} to #{@effort_request_exit_shape},
         then through the same row-driven chain to #{@cursor_provider_shape}.
         It then migrates to #{@cannot_proceed_shape}, followed atomically by
-        #{@settlement_shape} and #{@terminal_credential_shape}, then #{@agent_reparent_shape}.
+        #{@settlement_shape}, #{@terminal_credential_shape}, and #{@agent_reparent_shape},
+        then #{@artifact_origin_shape}.
 
         No migration is defined for the stamped shape above. Keep the database
         in place and run a Tightbeam build that recognizes that exact stamp.
@@ -2300,7 +2308,7 @@ defmodule Tightbeam.Schema do
         this Tightbeam database carries MORE THAN ONE shape stamp.
 
           stamped: #{rows |> List.flatten() |> Enum.join(", ")}
-          this build: #{@agent_reparent_shape}
+          this build: #{@artifact_origin_shape}
 
         Nothing in Tightbeam writes a second stamp, so this database was
         assembled by something else. Move it aside and let it be recreated.
@@ -2320,7 +2328,8 @@ defmodule Tightbeam.Schema do
                     @cursor_provider_shape,
                     @settlement_shape,
                     @terminal_credential_shape,
-                    @agent_reparent_shape
+                    @agent_reparent_shape,
+                    @artifact_origin_shape
                   ] ->
                :ok
 
@@ -2393,7 +2402,8 @@ defmodule Tightbeam.Schema do
              @cannot_proceed_shape,
              @settlement_shape,
              @terminal_credential_shape,
-             @agent_reparent_shape
+             @agent_reparent_shape,
+             @artifact_origin_shape
            ] ->
         Tightbeam.Assignments.ensure_schema(db)
 
@@ -2412,7 +2422,8 @@ defmodule Tightbeam.Schema do
              @cursor_provider_shape,
              @settlement_shape,
              @terminal_credential_shape,
-             @agent_reparent_shape
+             @agent_reparent_shape,
+             @artifact_origin_shape
            ] ->
         :ok
 
@@ -2506,7 +2517,8 @@ defmodule Tightbeam.Schema do
                     @cursor_provider_shape,
                     @settlement_shape,
                     @terminal_credential_shape,
-                    @agent_reparent_shape
+                    @agent_reparent_shape,
+                    @artifact_origin_shape
                   ] ->
                :ok
 
@@ -2573,7 +2585,8 @@ defmodule Tightbeam.Schema do
                     @cursor_provider_shape,
                     @settlement_shape,
                     @terminal_credential_shape,
-                    @agent_reparent_shape
+                    @agent_reparent_shape,
+                    @artifact_origin_shape
                   ] ->
                validate_artifact_content_schema!(txn)
 
@@ -2668,7 +2681,8 @@ defmodule Tightbeam.Schema do
              @cursor_provider_shape,
              @settlement_shape,
              @terminal_credential_shape,
-             @agent_reparent_shape
+             @agent_reparent_shape,
+             @artifact_origin_shape
            ] ->
         :ok
 
@@ -3707,7 +3721,8 @@ defmodule Tightbeam.Schema do
              @cursor_provider_shape,
              @settlement_shape,
              @terminal_credential_shape,
-             @agent_reparent_shape
+             @agent_reparent_shape,
+             @artifact_origin_shape
            ] ->
         :ok
 
@@ -3738,7 +3753,8 @@ defmodule Tightbeam.Schema do
              @cursor_provider_shape,
              @settlement_shape,
              @terminal_credential_shape,
-             @agent_reparent_shape
+             @agent_reparent_shape,
+             @artifact_origin_shape
            ] ->
         :ok
 
@@ -3841,7 +3857,8 @@ defmodule Tightbeam.Schema do
              @cannot_proceed_shape,
              @settlement_shape,
              @terminal_credential_shape,
-             @agent_reparent_shape
+             @agent_reparent_shape,
+             @artifact_origin_shape
            ] ->
         :ok
 
@@ -4088,7 +4105,8 @@ defmodule Tightbeam.Schema do
              @cannot_proceed_shape,
              @settlement_shape,
              @terminal_credential_shape,
-             @agent_reparent_shape
+             @agent_reparent_shape,
+             @artifact_origin_shape
            ] ->
         :ok
 
@@ -4104,7 +4122,12 @@ defmodule Tightbeam.Schema do
     case DB.transaction(db, fn txn ->
            case Txn.q(txn, "SELECT shape FROM schema_stamp") do
              [[shape]]
-             when shape in [@settlement_shape, @terminal_credential_shape, @agent_reparent_shape] ->
+             when shape in [
+                    @settlement_shape,
+                    @terminal_credential_shape,
+                    @agent_reparent_shape,
+                    @artifact_origin_shape
+                  ] ->
                :ok
 
              [[@cannot_proceed_shape]] ->
@@ -4136,6 +4159,9 @@ defmodule Tightbeam.Schema do
     case DB.transaction(db, fn txn ->
            case Txn.q(txn, "SELECT shape FROM schema_stamp") do
              [[@agent_reparent_shape]] ->
+               :ok
+
+             [[@artifact_origin_shape]] ->
                :ok
 
              [[@terminal_credential_shape]] ->
@@ -4181,6 +4207,9 @@ defmodule Tightbeam.Schema do
              [[@agent_reparent_shape]] ->
                :ok
 
+             [[@artifact_origin_shape]] ->
+               :ok
+
              [[@terminal_credential_shape]] ->
                :ok = Tightbeam.SessionReparent.upgrade_agent_principals_in_txn(txn)
 
@@ -4204,6 +4233,68 @@ defmodule Tightbeam.Schema do
          end) do
       {:ok, :ok} -> :ok
       {:error, error} -> raise error
+    end
+  end
+
+  @artifact_origin_trigger """
+  CREATE TRIGGER artifacts_origin_immutable
+  BEFORE UPDATE OF originHost, originWorkspace ON artifacts
+  WHEN NEW.originHost IS NOT OLD.originHost OR NEW.originWorkspace IS NOT OLD.originWorkspace
+  BEGIN
+    SELECT RAISE(ABORT, 'artifact_origin_immutable');
+  END
+  """
+
+  defp upgrade_artifact_origins(db) do
+    case DB.transaction(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@artifact_origin_shape]] ->
+               validate_artifact_origins!(txn)
+
+             [[@agent_reparent_shape]] ->
+               # Legacy placement is not evidence of an artifact's origin.
+               # Keep both fields NULL for every existing row.
+               Txn.q(txn, "ALTER TABLE artifacts ADD COLUMN originHost TEXT")
+               Txn.q(txn, "ALTER TABLE artifacts ADD COLUMN originWorkspace TEXT")
+               Txn.q(txn, @artifact_origin_trigger)
+               validate_artifact_origins!(txn)
+
+               Txn.q(txn, "UPDATE schema_stamp SET shape=?1, stampedAt=?2 WHERE shape=?3", [
+                 @artifact_origin_shape,
+                 System.system_time(:millisecond),
+                 @agent_reparent_shape
+               ])
+
+               if Txn.changes(txn) != 1,
+                 do: raise(ShapeError, message: "artifact origin stamp race")
+
+               :ok
+
+             other ->
+               raise ShapeError,
+                 message: "incompatible artifact origin predecessor: #{inspect(other)}"
+           end
+         end) do
+      {:ok, :ok} -> :ok
+      {:error, error} -> raise error
+    end
+  end
+
+  defp validate_artifact_origins!(txn) do
+    columns = Txn.q(txn, "PRAGMA table_info(artifacts)")
+
+    for name <- ["originHost", "originWorkspace"] do
+      case Enum.find(columns, &(Enum.at(&1, 1) == name)) do
+        [_id, ^name, "TEXT", 0, nil, 0] -> :ok
+        _ -> raise ShapeError, message: "incompatible artifact origin column: #{name}"
+      end
+    end
+
+    expected = String.trim(@artifact_origin_trigger)
+
+    case Txn.q(txn, "SELECT sql FROM sqlite_master WHERE name='artifacts_origin_immutable'") do
+      [[^expected]] -> :ok
+      _ -> raise ShapeError, message: "incompatible artifact origin immutability trigger"
     end
   end
 
