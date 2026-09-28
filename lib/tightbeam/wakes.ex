@@ -685,7 +685,8 @@ defmodule Tightbeam.Wakes do
 
   defp schedule_terminal_action_reminder_in_txn(txn, root, event, recipient, predecessor_id) do
     if terminal_action_event?(event) and
-         is_nil(terminal_action_attest_for_event_in_txn(txn, event, recipient)) do
+         is_nil(terminal_action_attest_for_event_in_txn(txn, event, recipient)) and
+         terminal_action_destination_available_in_txn?(txn, recipient) do
       wake_id = terminal_action_wake_id(root.wake_id, predecessor_id)
       prompt = terminal_action_prompt(event, root.wake_id)
       condition_kind = terminal_action_condition_kind(root.wake_id)
@@ -761,6 +762,14 @@ defmodule Tightbeam.Wakes do
     |> Enum.find_value(fn [attest_id, note] ->
       if terminal_action_note_matches?(note, event), do: attest_id
     end)
+  end
+
+  defp terminal_action_destination_available_in_txn?(txn, parent) do
+    Txn.q(
+      txn,
+      "SELECT 1 FROM assignments WHERE holderKey=?1 AND state='open' LIMIT 1",
+      [parent]
+    ) == [[1]]
   end
 
   defp terminal_action_attest_for_wake_in_txn(txn, wake, attest_id) do
@@ -858,6 +867,10 @@ defmodule Tightbeam.Wakes do
   end
 
   defp cancel_unresolvable_terminal_action_reminder_in_txn(txn, wake) do
+    # The session may still be active, but without an open holder assignment it
+    # has no lawful destination for the progress attest this reminder requires.
+    # The existing target-unresolvable cancellation records that limit without
+    # claiming the parent completed the action.
     cancel_in_txn(txn, %{
       wake_id: wake.wake_id,
       requester: %{kind: "process", id: "tightbeam:wake-scheduler"},
@@ -6202,10 +6215,10 @@ defmodule Tightbeam.Wakes do
 
     if cause do
       cond do
-        cancel_unresolvable_terminal_action_reminder_if_needed_in_txn(txn, wake) ->
+        supersede_completed_terminal_action_reminder_in_txn(txn, wake) ->
           :noop
 
-        supersede_completed_terminal_action_reminder_in_txn(txn, wake) ->
+        cancel_unresolvable_terminal_action_reminder_if_needed_in_txn(txn, wake) ->
           :noop
 
         true ->
@@ -6275,7 +6288,19 @@ defmodule Tightbeam.Wakes do
        ) do
     case terminal_action_root_event_in_txn(txn, wake) do
       {:ok, _root, _event} ->
-        false
+        # A valid receipt is checked before this eligibility gate in
+        # `fire_in_txn/3`, so a later assignment closure cannot erase it.
+        if terminal_action_destination_available_in_txn?(txn, wake.session_key) do
+          false
+        else
+          unless cancel_unresolvable_terminal_action_reminder_in_txn(txn, wake) do
+            raise DB.Error,
+              message:
+                "parent action reminder without a lawful attest destination could not be closed"
+          end
+
+          true
+        end
 
       :error ->
         unless cancel_unresolvable_terminal_action_reminder_in_txn(txn, wake) do

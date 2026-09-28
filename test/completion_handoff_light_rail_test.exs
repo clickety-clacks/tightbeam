@@ -106,7 +106,7 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     refute third.wake_id in [first.wake_id, second.wake_id]
   end
 
-  test "a recovered finish notice starts reminders from its delivered recovery turn", ctx do
+  test "a recovered finish notice without an action destination remains notice-only", ctx do
     item = create_work_item(ctx, "recovered completion")
 
     child_assignment =
@@ -148,8 +148,138 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert Wakes.get(ctx.db, recovered.wake_id).state == "fired"
     assert turn_count(ctx.db, recovered.wake_id) == 1
-    [reminder] = pending_reminders(ctx.db, recovered.wake_id)
-    assert reminder.condition_scope == recovered.wake_id
+    assert reminders(ctx.db, recovered.wake_id) == []
+  end
+
+  test "a parent with no open assignment gets the initial notice but no reminder rail", ctx do
+    {nil, child_assignment, root} = completed_child(ctx, with_parent_destination: false)
+
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    assert Wakes.get(ctx.db, root.wake_id).state == "fired"
+    assert turn_count(ctx.db, root.wake_id) == 1
+    assert reminders(ctx.db, root.wake_id) == []
+
+    _later_assignment =
+      handle(
+        ctx,
+        "assign",
+        assign_call(
+          {:session, "other-parent"},
+          "notice-parent",
+          "later parent work",
+          child_assignment.workItemId
+        )
+      )
+
+    assert {:ok, {:ok, replay}} =
+             DB.transaction(
+               ctx.db,
+               &Wakes.admit_terminal_notification_in_txn(&1, child_assignment.id)
+             )
+
+    assert replay.wake_id == root.wake_id
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    assert reminders(ctx.db, root.wake_id) == []
+  end
+
+  test "a pending reminder is truthfully canceled if the parent's last open assignment closes",
+       ctx do
+    {parent_assignment, _child_assignment, root} =
+      completed_child(ctx, parent_opener: "other-parent")
+
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    [pending] = pending_reminders(ctx.db, root.wake_id)
+
+    assert %{assignment: %{state: "closed"}, attest: %{kind: "completion"}} =
+             handle(
+               ctx,
+               "attest",
+               attest_call({:session, "notice-parent"}, parent_assignment.id, "completion")
+             )
+
+    set_due_now(ctx.db, pending.wake_id)
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+
+    assert Wakes.get(ctx.db, pending.wake_id).state == "canceled"
+    assert turn_count(ctx.db, pending.wake_id) == 0
+    assert pending_reminders(ctx.db, root.wake_id) == []
+
+    assert {:ok, [["target_unresolvable", "scheduler_delivery", wake_id, "no_replacement"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT reasonKind,causalSourceKind,causalSourceId,outcomeKind FROM wake_cancellations WHERE wakeId=?1",
+               [pending.wake_id]
+             )
+
+    assert wake_id == pending.wake_id
+  end
+
+  test "a delivered reminder does not rearm after the parent loses its last open assignment",
+       ctx do
+    {parent_assignment, _child_assignment, root} =
+      completed_child(ctx, parent_opener: "other-parent")
+
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    [first] = pending_reminders(ctx.db, root.wake_id)
+    set_due_now(ctx.db, first.wake_id)
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    assert Wakes.get(ctx.db, first.wake_id).state == "fired"
+    assert turn_count(ctx.db, first.wake_id) == 1
+    [successor] = pending_reminders(ctx.db, root.wake_id)
+
+    assert %{assignment: %{state: "closed"}} =
+             handle(
+               ctx,
+               "attest",
+               attest_call({:session, "notice-parent"}, parent_assignment.id, "completion")
+             )
+
+    set_due_now(ctx.db, successor.wake_id)
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+
+    assert Wakes.get(ctx.db, successor.wake_id).state == "canceled"
+    assert turn_count(ctx.db, successor.wake_id) == 0
+    assert pending_reminders(ctx.db, root.wake_id) == []
+    assert length(reminders(ctx.db, root.wake_id)) == 2
+  end
+
+  test "a valid action receipt remains stopping evidence after its assignment closes", ctx do
+    {parent_assignment, child_assignment, root} =
+      completed_child(ctx, parent_opener: "other-parent")
+
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    [pending] = pending_reminders(ctx.db, root.wake_id)
+    note = action_note(child_assignment.id, root, "kept", "kept the child for its next owner")
+
+    assert %{attest: %{id: attest_id, kind: "progress"}} =
+             handle(
+               ctx,
+               "attest",
+               progress_call({:session, "notice-parent"}, parent_assignment.id, note)
+             )
+
+    assert Wakes.get(ctx.db, pending.wake_id).state == "canceled"
+
+    assert %{assignment: %{state: "closed"}} =
+             handle(
+               ctx,
+               "attest",
+               attest_call({:session, "notice-parent"}, parent_assignment.id, "completion")
+             )
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               Wakes.terminal_notice_delivered_in_txn(txn, root.wake_id, "notice-parent")
+             end)
+
+    assert pending_reminders(ctx.db, root.wake_id) == []
+
+    assert {:ok, [["superseded", "progress_attest", ^attest_id, "no_replacement"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT reasonKind,causalSourceKind,causalSourceId,outcomeKind FROM wake_cancellations WHERE wakeId=?1",
+               [pending.wake_id]
+             )
   end
 
   test "the shipped parent directive appears in composed guidance for both harnesses", _ctx do
@@ -171,6 +301,8 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
              "completion-handoff-action <assignment_id> <source_kind> <source_token> <kept|parked|retired> — <what you did>"
 
     assert packaged_manual =~ "preserve the literal em dash (`—`)"
+    assert packaged_manual =~ "no reminder is scheduled and there is no lawful"
+    assert packaged_manual =~ "do not self-assign or fabricate an acknowledgment"
 
     :initialized = Tightbeam.Identity.init!(base)
     revision = Tightbeam.Identity.live_revision!(base)
@@ -183,6 +315,8 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
                "completion-handoff-action <assignment_id> <source_kind> <source_token> <kept|parked|retired> — <what you did>"
 
       assert snapshot.guidance =~ "preserve the literal em dash (`—`)"
+      assert snapshot.guidance =~ "no reminder is scheduled and there is no lawful"
+      assert snapshot.guidance =~ "do not self-assign or fabricate an acknowledgment"
       refute Regex.match?(~r/^#include/m, snapshot.guidance)
     end
   end
@@ -307,15 +441,25 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     assert turn_count(ctx.db, successor.wake_id) == 0
   end
 
-  defp completed_child(ctx) do
+  defp completed_child(ctx, opts \\ []) do
     item = create_work_item(ctx, "completion handoff")
 
     parent_assignment =
-      handle(
-        ctx,
-        "assign",
-        assign_call({:session, "notice-parent"}, "notice-parent", "parent coordination", item.id)
-      )
+      if Keyword.get(opts, :with_parent_destination, true) do
+        parent_opener = Keyword.get(opts, :parent_opener, "notice-parent")
+
+        handle(
+          ctx,
+          "assign",
+          assign_call(
+            {:session, parent_opener},
+            "notice-parent",
+            "parent coordination",
+            item.id,
+            effect_kind: "coordination"
+          )
+        )
+      end
 
     child_assignment =
       handle(
