@@ -321,20 +321,30 @@ defmodule Tightbeam.Wire.RouterTest do
         "initial-body",
         fn {bearer, selector, origin, principal, body}, previous_body ->
           get =
-            dispatch_cli(ctx, bearer, %{
-              verb: "work-item-get",
-              params: %{workItemId: id}
-            } |> Map.merge(selector))
+            dispatch_cli(
+              ctx,
+              bearer,
+              %{
+                verb: "work-item-get",
+                params: %{workItemId: id}
+              }
+              |> Map.merge(selector)
+            )
 
           assert get.status == 200, get.resp_body
           assert JSON.decode!(get.resp_body)["result"]["workItem"]["body"] == previous_body
           assert_receive {:body_auth_handler, "work-item-get", ^origin, ^principal}
 
           update =
-            dispatch_cli(ctx, bearer, %{
-              verb: "work-item-update",
-              params: %{workItemId: id, body: body}
-            } |> Map.merge(selector))
+            dispatch_cli(
+              ctx,
+              bearer,
+              %{
+                verb: "work-item-update",
+                params: %{workItemId: id, body: body}
+              }
+              |> Map.merge(selector)
+            )
 
           assert update.status == 200, update.resp_body
           update_result = JSON.decode!(update.resp_body)["result"]
@@ -361,7 +371,10 @@ defmodule Tightbeam.Wire.RouterTest do
     for verb <- ["work-item-get", "work-item-update"] do
       body = if verb == "work-item-update", do: "denied-session-process", else: nil
       params = if body, do: %{workItemId: id, body: body}, else: %{workItemId: id}
-      response = dispatch_cli(ctx, session.cli_token, %{verb: verb, asProcess: "cron", params: params})
+
+      response =
+        dispatch_cli(ctx, session.cli_token, %{verb: verb, asProcess: "cron", params: params})
+
       assert response.status == 403
       assert JSON.decode!(response.resp_body)["error"]["code"] == "identity_not_yours"
       refute_receive {:body_auth_handler, _, _, _}
@@ -369,7 +382,10 @@ defmodule Tightbeam.Wire.RouterTest do
 
     for {verb, body} <- [{"work-item-get", nil}, {"work-item-update", "denied-held-role"}] do
       params = if body, do: %{workItemId: id, body: body}, else: %{workItemId: id}
-      response = dispatch_cli(ctx, "tbc_test", %{verb: verb, as: "body-auth-role", params: params})
+
+      response =
+        dispatch_cli(ctx, "tbc_test", %{verb: verb, as: "body-auth-role", params: params})
+
       assert response.status == 403
       assert JSON.decode!(response.resp_body)["error"]["code"] == "principal_required"
       assert_receive {:body_auth_handler, ^verb, "agent:body-auth-role", nil}

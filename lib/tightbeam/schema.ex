@@ -1470,6 +1470,7 @@ defmodule Tightbeam.Schema do
     :ok = upgrade_pi_providers(db)
     :ok = upgrade_addressed_po_consultation(db)
     :ok = Tightbeam.QueuedMessageSuppression.ensure_schema(db)
+
     Enum.each(@schema_modules, fn
       Tightbeam.Ledger -> :ok
       module -> :ok = module.ensure_schema(db)
