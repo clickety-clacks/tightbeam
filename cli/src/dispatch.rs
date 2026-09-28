@@ -900,6 +900,8 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             spec_ref_name,
             spec_ref_sha256,
             clear_spec_ref,
+            delivery_owner,
+            clear_delivery_owner,
             priority,
             body,
             clear_body,
@@ -924,6 +926,12 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 if let Some(value) = spec_ref_sha256 {
                     params.push(string_field("specRefSha256", value));
                 }
+            }
+            if let Some(value) = delivery_owner {
+                params.push(string_field("deliveryOwnerSessionKey", value));
+            }
+            if *clear_delivery_owner {
+                params.push("\"deliveryOwnerSessionKey\":null".to_owned());
             }
             if let Some(value) = priority {
                 params.push(format!("\"priority\":{value}"));
@@ -3539,6 +3547,14 @@ mod tests {
 
     #[test]
     fn builds_byte_exact_work_item_bodies() {
+        assert_eq!(
+            body(&["work-item-update", "wi_1", "--delivery-owner", "agent:owner"]),
+            r#"{"verb":"work-item-update","params":{"workItemId":"wi_1","deliveryOwnerSessionKey":"agent:owner"}}"#
+        );
+        assert_eq!(
+            body(&["work-item-update", "wi_1", "--clear-delivery-owner"]),
+            r#"{"verb":"work-item-update","params":{"workItemId":"wi_1","deliveryOwnerSessionKey":null}}"#
+        );
         let sha = "a".repeat(64);
         let class_a_sha = "d4e8260c8a82faf07ab2659e1f317bef961441af6ba43a4b9d1ef62fa01d4b86";
         assert_eq!(

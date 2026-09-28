@@ -446,7 +446,7 @@ defmodule Tightbeam.DeliveryResponsibilities do
       when is_binary(session_key) and session_key == origin_session ->
         case Txn.q(
                txn,
-               "SELECT userId FROM sessions WHERE sessionKey = ?1 AND state = 'active' LIMIT 1",
+               "SELECT ownerUserId FROM sessions WHERE sessionKey = ?1 AND state = 'active' LIMIT 1",
                [session_key]
              ) do
           [[user_id]] when is_binary(user_id) -> user_id

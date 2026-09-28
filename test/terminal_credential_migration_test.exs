@@ -81,7 +81,7 @@ defmodule Tightbeam.TerminalCredentialMigrationTest do
     assert terminal_objects(db) == @terminal_objects
     assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM terminal_credential_incidents")
 
-    assert [@successor, @agent_reparent, @terminal_shape | _] =
+    assert [@successor, "artifact-origin-v1-019", @agent_reparent, @terminal_shape | _] =
              Schema.guard_compatible_stamps()
   end
 

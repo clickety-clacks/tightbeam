@@ -191,7 +191,7 @@ defmodule Tightbeam.JobForensicsTest do
     assert_keys(
       fetch_item(db, "wi_disp").workItem,
       ~w(body bodyUpdatedAt bodyUpdatedBySession bodyUpdatedByUser createdAt
-         createdBySession createdByUser failReason id isBug ownerUserId priority
+         createdBySession createdByUser deliveryOwnerSessionKey failReason id isBug ownerUserId priority
          rowVersion specRefName specRefSha256 state title)a
     )
   end

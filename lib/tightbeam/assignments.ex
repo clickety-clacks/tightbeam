@@ -1235,8 +1235,8 @@ defmodule Tightbeam.Assignments do
   end
 
   @doc false
-  def __handle__(db, "assign", call), do: assign_result(db, call)
-  def __handle__(db, "dispatch", call), do: dispatch_result(db, call)
+  def __handle__(db, "assign", call), do: assign_result(db, Map.put(call, :verb, "assign"))
+  def __handle__(db, "dispatch", call), do: dispatch_result(db, Map.put(call, :verb, "dispatch"))
   def __handle__(db, "attest", call), do: attest_result(db, call)
   def __handle__(db, "attests", call), do: attests_result(db, call)
   def __handle__(db, "assignment-get", call), do: assignment_get_result(db, call)
