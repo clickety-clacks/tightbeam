@@ -1527,6 +1527,7 @@ defmodule Tightbeam.AssignmentsTest do
       DB.query(ctx.db, "UPDATE sessions SET spawnedBy='notice-decoy' WHERE sessionKey='holder'")
 
     item = create_work_item(ctx, "terminal delivery")
+    set_delivery_owner(ctx, item.id, "notice-parent")
 
     assignment =
       handle(
@@ -1561,34 +1562,7 @@ defmodule Tightbeam.AssignmentsTest do
     end
 
     item = create_work_item(ctx, "terminal successor")
-
-    assert %{"changed" => true} =
-             DeliveryResponsibilities.handle(ctx.db, %{
-               verb: "delivery-scope-owner-set",
-               origin: "user:flynn",
-               principal: {:user, "flynn"},
-               params: %{
-                 session_key: "notice-parent",
-                 association_revision: 1,
-                 expected_owner_session_key: nil,
-                 expected_owner_revision: 0,
-                 idempotency_key: "terminal-owner-initial"
-               }
-             })
-
-    assert %{"changed" => true} =
-             DeliveryResponsibilities.handle(ctx.db, %{
-               verb: "work-item-delivery-scope-set",
-               origin: "user:flynn",
-               principal: {:user, "flynn"},
-               params: %{
-                 work_item_id: item.id,
-                 association_session_key: "notice-parent",
-                 association_revision: 1,
-                 expected_binding_revision: 0,
-                 idempotency_key: "terminal-scope"
-               }
-             })
+    set_delivery_owner(ctx, item.id, "notice-parent")
 
     assignment =
       handle(
@@ -1601,19 +1575,7 @@ defmodule Tightbeam.AssignmentsTest do
         )
       )
 
-    assert %{"changed" => true} =
-             DeliveryResponsibilities.handle(ctx.db, %{
-               verb: "delivery-scope-owner-set",
-               origin: "agent:notice-parent",
-               principal: {:session, "notice-parent"},
-               params: %{
-                 session_key: "delivery-successor",
-                 association_revision: 1,
-                 expected_owner_session_key: "notice-parent",
-                 expected_owner_revision: 1,
-                 idempotency_key: "terminal-owner-transfer"
-               }
-             })
+    set_delivery_owner(ctx, item.id, "delivery-successor")
 
     {:ok, _} =
       DB.query(
@@ -4093,6 +4055,8 @@ defmodule Tightbeam.AssignmentsTest do
         "work-item-create",
         work_item_call("work-item-create", {:user, "flynn"}, %{title: "Second"})
       )
+
+    set_delivery_owner(ctx, first.id, "holder")
 
     linked = handle(ctx, "assign", assign_call({:user, "flynn"}, "linked", "work-key", first.id))
 

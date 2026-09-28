@@ -329,7 +329,7 @@ defmodule Tightbeam.DeliveryResponsibilities do
     else
       refusal(
         "delivery_owner_required",
-        "work item #{work_item_id} is owned by session:#{owner}; production staffing must come from that owner, an active holder of an open assignment on this exact item, or the active opener of such an assignment"
+        "work item #{work_item_id} is owned by session:#{owner}; production staffing must come from that owner or an active holder of an open assignment on this exact item"
       )
     end
   end
@@ -476,14 +476,6 @@ defmodule Tightbeam.DeliveryResponsibilities do
     ) == [[1]]
   end
 
-  defp active_assignment_opener?(txn, session_key, work_item_id) do
-    Txn.q(
-      txn,
-      "SELECT 1 FROM assignments a JOIN sessions s ON s.sessionKey=a.openedBySession WHERE a.workItemId=?1 AND a.openedBySession=?2 AND a.state='open' AND s.state='active' LIMIT 1",
-      [work_item_id, session_key]
-    ) == [[1]]
-  end
-
   defp caller_is_responsible?(owner, work_item_id, call, opts) do
     case Map.get(call, :principal) do
       {:user, _user_id} ->
@@ -495,8 +487,7 @@ defmodule Tightbeam.DeliveryResponsibilities do
       {:session, session_key} when is_binary(session_key) ->
         txn = Keyword.fetch!(opts, :txn)
 
-        active_assignment_holder?(txn, session_key, work_item_id) or
-          active_assignment_opener?(txn, session_key, work_item_id)
+        active_assignment_holder?(txn, session_key, work_item_id)
 
       _ ->
         false

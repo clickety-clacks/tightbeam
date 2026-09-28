@@ -402,6 +402,12 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
 
     assert Tightbeam.Wakes.rumination_exists?(db, "wi_a1", "pdo-a")
 
+    {:ok, []} =
+      DB.query(
+        db,
+        "INSERT OR IGNORE INTO hosts(name,baseDir) VALUES('synthetic-host','/synthetic-only')"
+      )
+
     assert {:ok, %{holderKey: "peer", workItemId: "wi_a1"}} =
              Dispatch.dispatch(db, handlers, owner_dispatch)
 
