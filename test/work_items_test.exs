@@ -817,8 +817,12 @@ defmodule Tightbeam.WorkItemsTest do
 
     refute Map.has_key?(updated, :body)
     assert descriptor.state == "present"
+
     {:ok, [[update_payload]]} =
-      DB.query(ctx.db, "SELECT payload FROM events WHERE verb='work-item-update' ORDER BY id DESC LIMIT 1")
+      DB.query(
+        ctx.db,
+        "SELECT payload FROM events WHERE verb='work-item-update' ORDER BY id DESC LIMIT 1"
+      )
 
     refute update_payload =~ sentinel
     assert update_payload =~ "bodyUpdate"
@@ -828,8 +832,12 @@ defmodule Tightbeam.WorkItemsTest do
              Dispatch.dispatch(ctx.db, ctx.handlers, get_call({:user, "flynn"}, item.id))
 
     assert detail.bodyUpdatedByUser == "flynn"
+
     {:ok, [[get_payload]]} =
-      DB.query(ctx.db, "SELECT payload FROM events WHERE verb='work-item-get' ORDER BY id DESC LIMIT 1")
+      DB.query(
+        ctx.db,
+        "SELECT payload FROM events WHERE verb='work-item-get' ORDER BY id DESC LIMIT 1"
+      )
 
     refute get_payload =~ sentinel
     refute get_payload =~ "bodyUpdatedByUser"
