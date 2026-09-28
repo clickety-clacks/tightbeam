@@ -6960,7 +6960,7 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, [[error]]} =
              DB.query(ctx.db, "SELECT error FROM turns WHERE seq=?1", [suppressed_seq])
 
-    assert error == "queued-message-suppressed: sender_requested_replacement"
+    assert error == "queued-message-suppressed: verified_liveness_recovery"
 
     assert Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
              event.kind == "queued_message_suppressed" and
