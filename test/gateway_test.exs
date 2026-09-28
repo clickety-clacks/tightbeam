@@ -6946,8 +6946,10 @@ defmodule Tightbeam.GatewayTest do
 
   test "queued set_harness candidate failure leaves source, history, and queue intact", ctx do
     candidate = start_supervised!({FailingCandidateAdapterStub, self()})
+
     {config, _local_host} =
       queued_harness_switch_config!(ctx, "queued-handoff-failure", candidate)
+
     Org.append_pointer(ctx.db, "k1", "source-session", "created")
 
     {first_seq, first_message} =

@@ -7019,7 +7019,9 @@ defmodule Tightbeam.Gateway do
                                routed.provider
                              )
                            end)
-                         end, allow_queued: true) do
+                         end,
+                         allow_queued: true
+                       ) do
                     {:ok, result} -> result
                     {:error, :turn_in_progress} -> turn_in_progress_error()
                   end
@@ -7709,7 +7711,7 @@ defmodule Tightbeam.Gateway do
 
   defp bounded_handoff_metadata(value)
        when is_number(value) or is_boolean(value) or is_nil(value),
-    do: value
+       do: value
 
   defp bounded_handoff_metadata(value),
     do: value |> inspect() |> String.slice(0, @harness_handoff_metadata_limit)
