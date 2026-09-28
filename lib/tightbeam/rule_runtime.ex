@@ -128,7 +128,9 @@ defmodule Tightbeam.RuleRuntime do
   @spec predicate_row_domains(String.t()) :: [String.t()]
   def predicate_row_domains(fact) do
     case Map.fetch(@row_commit_fact_domains, fact) do
-      {:ok, domains} -> domains
+      {:ok, domains} ->
+        domains
+
       :error ->
         case predicate_transition_contract(fact) do
           {:ok, %{domains: domains}} -> domains

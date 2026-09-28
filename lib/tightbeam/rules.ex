@@ -739,6 +739,7 @@ defmodule Tightbeam.Rules do
       end
 
     work_item_id = (assignment && assignment.work_item_id) || Map.get(call.params, :work_item_id)
+
     assignment_opener_session =
       assignment && assignment_opener_session(db, assignment.id)
 

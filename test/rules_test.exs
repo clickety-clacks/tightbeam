@@ -1965,6 +1965,7 @@ defmodule Tightbeam.RulesTest do
              DB.transaction(ctx.db, &Rules.resolve_notice_in_txn(&1, rule, call))
 
     assert resolved.bound_session == opener.session_key
+
     assert resolved.params.prompt ==
              "assignment #{opened.id} opened for #{holder.session_key}"
   end
