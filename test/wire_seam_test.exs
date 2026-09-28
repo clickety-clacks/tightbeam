@@ -174,6 +174,34 @@ defmodule Tightbeam.Wire.SeamTest do
            }) == %{subject: "review the fix", reviews_assignment_id: "asg_reviewed"}
   end
 
+  test "assignment-stop-turn crosses dispatch and refuses a non-opener", ctx do
+    holder = create_session(ctx.db, "stop-holder", "flynn")
+
+    ok!(
+      dispatch_cli(ctx, "tbc_wire_seam", %{
+        verb: "assign",
+        asUser: "flynn",
+        sessionKey: holder.session_key,
+        params: %{subject: "stop only by the opener"}
+      })
+    )
+
+    assignment = assignment_id(ctx.db, "stop only by the opener")
+
+    response =
+      dispatch_cli(ctx, "tbc_wire_seam", %{
+        verb: "cancel",
+        asUser: "other",
+        params: %{
+          assignmentId: assignment,
+          reason: "replacement is waiting"
+        }
+      })
+
+    assert response.status == 403
+    assert JSON.decode!(response.resp_body)["error"]["code"] == "not_authorized"
+  end
+
   test "assign --reviews lands the review link on the row", ctx do
     producer = create_session(ctx.db, "producer", "flynn")
     reviewer = create_session(ctx.db, "reviewer", "flynn")
