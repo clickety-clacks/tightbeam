@@ -231,6 +231,122 @@ defmodule Tightbeam.BreathingTest do
              Breathing.handle(db, %{call | principal: {:process, "tightbeam"}})
   end
 
+  test "assignment queue summaries are scoped, private, and read-only", %{db: db} do
+    now_ms = System.system_time(:millisecond)
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO assignments
+        (id,subject,holderKey,openedByUser,openedBySession,openedAt,state,workItemId)
+      VALUES
+        ('asg_session_opened','Session opened','active',NULL,'active2',#{now_ms},'open','wi_open'),
+        ('asg_other','Other assignment','active','owner',NULL,#{now_ms},'open','wi_open');
+      """)
+
+    insert_turn!(db, 50, "active", "queued",
+      assignment_id: "asg_session_opened",
+      created_at: now_ms - 120_000,
+      origin: "agent:alpha",
+      prompt: "private-body-alpha"
+    )
+
+    insert_wake!(db, "w_queue_beta", "active",
+      assignment_id: "asg_session_opened",
+      created_at: now_ms - 60_000,
+      due_at: now_ms - 60_000,
+      origin: "agent:beta",
+      state: "fired"
+    )
+
+    insert_turn!(db, 51, "active", "queued",
+      wake_id: "w_queue_beta",
+      created_at: now_ms - 60_000,
+      origin: "agent:beta",
+      prompt: "private-body-beta"
+    )
+
+    insert_wake!(db, "w_queue_gamma", "active",
+      assignment_id: "asg_session_opened",
+      created_at: now_ms - 90_000,
+      due_at: now_ms - 90_000,
+      origin: "agent:gamma",
+      state: "fired"
+    )
+
+    insert_turn!(db, 52, "active", "queued",
+      wake_id: "w_queue_gamma",
+      created_at: now_ms - 90_000,
+      origin: "agent:gamma",
+      prompt: "private-body-gamma"
+    )
+
+    :ok =
+      DB.execute(
+        db,
+        "INSERT INTO queued_message_scopes (turnSeq,assignmentId,turnCreatedAt,wakeId,wakeCreatedAt) VALUES (52,'asg_session_opened',#{now_ms - 90_000},'w_queue_gamma',#{now_ms - 90_000})"
+      )
+
+    insert_turn!(db, 53, "active", "queued",
+      assignment_id: "asg_other",
+      created_at: now_ms - 5_000_000,
+      origin: "agent:other"
+    )
+
+    insert_turn!(db, 54, "active", "queued",
+      created_at: now_ms - 6_000_000,
+      origin: "agent:unscoped"
+    )
+
+    {:ok, [[before_events]]} = DB.query(db, "SELECT count(*) FROM events")
+
+    opener =
+      Breathing.handle(db, %{
+        principal: {:session, "active2"},
+        params: %{target_kind: "assignment", target_id: "asg_session_opened"}
+      })
+
+    assert %{
+             queue: %{
+               count: 3,
+               oldestAgeMs: age_ms,
+               senders: ["agent:alpha", "agent:gamma", "agent:beta"]
+             }
+           } = opener
+
+    assert age_ms >= 120_000 and age_ms < 130_000
+    refute inspect(opener) =~ "private-body-"
+
+    owner =
+      Breathing.handle(db, %{
+        principal: {:user, "owner"},
+        params: %{target_kind: "assignment", target_id: "asg_session_opened"}
+      })
+
+    assert owner.queue.count == 3
+    assert owner.queue.senders == opener.queue.senders
+    assert owner.queue.oldestAgeMs >= 120_000 and owner.queue.oldestAgeMs < 130_000
+
+    forbidden =
+      Breathing.handle(db, %{
+        principal: {:session, "active"},
+        params: %{target_kind: "assignment", target_id: "asg_session_opened"}
+      })
+
+    assert %{code: "forbidden"} = forbidden
+    refute Map.has_key?(forbidden, :queue)
+
+    empty =
+      Breathing.handle(db, %{
+        principal: {:user, "owner"},
+        params: %{target_kind: "assignment", target_id: "asg_active"}
+      })
+
+    assert %{queue: %{count: 0, oldestAgeMs: nil, senders: []}} = empty
+
+    {:ok, [[after_events]]} = DB.query(db, "SELECT count(*) FROM events")
+    assert before_events == after_events
+  end
+
   defp seed!(db) do
     :ok =
       DB.execute(db, """
@@ -277,20 +393,30 @@ defmodule Tightbeam.BreathingTest do
   end
 
   defp insert_turn!(db, seq, session_key, status, opts \\ []) do
+    wake_id = sql(Keyword.get(opts, :wake_id))
+    origin = sql(Keyword.get(opts, :origin, "user:owner"))
+    prompt = sql(Keyword.get(opts, :prompt, "work"))
+    created_at = Keyword.get(opts, :created_at, seq)
+
     :ok =
       DB.execute(
         db,
-        "INSERT INTO turns (seq,sessionKey,messageId,origin,prompt,assignmentId,jobRef,status,adapterGen,error,createdAt,startedAt,endedAt) VALUES (#{seq},'#{session_key}','m_#{seq}','user:owner','work',#{sql(Keyword.get(opts, :assignment_id))},#{sql(Keyword.get(opts, :job_ref))},'#{status}',7,#{sql(Keyword.get(opts, :error))},#{seq},#{seq},#{if status in ~w(queued running), do: "NULL", else: seq})"
+        "INSERT INTO turns (seq,sessionKey,messageId,wakeId,origin,prompt,assignmentId,jobRef,status,adapterGen,error,createdAt,startedAt,endedAt) VALUES (#{seq},'#{session_key}','m_#{seq}',#{wake_id},#{origin},#{prompt},#{sql(Keyword.get(opts, :assignment_id))},#{sql(Keyword.get(opts, :job_ref))},'#{status}',7,#{sql(Keyword.get(opts, :error))},#{created_at},#{created_at},#{if status in ~w(queued running), do: "NULL", else: created_at})"
       )
   end
 
   defp insert_wake!(db, wake_id, session_key, opts) do
     due_at = Keyword.get(opts, :due_at, 100)
+    state = Keyword.get(opts, :state, "pending")
+    created_at = Keyword.get(opts, :created_at, 1)
+    origin = sql(Keyword.get(opts, :origin, "user:owner"))
+    fired_at = if state == "fired", do: Keyword.get(opts, :fired_at, created_at), else: nil
+    fired_at_sql = if is_nil(fired_at), do: "NULL", else: Integer.to_string(fired_at)
 
     :ok =
       DB.execute(
         db,
-        "INSERT INTO wakes (wakeId,sessionKey,origin,prompt,dueAt,state,createdAt,assignmentId,work_item_id) VALUES ('#{wake_id}','#{session_key}','user:owner','resume',#{due_at},'pending',1,#{sql(Keyword.get(opts, :assignment_id))},#{sql(Keyword.get(opts, :work_item_id))})"
+        "INSERT INTO wakes (wakeId,sessionKey,origin,prompt,dueAt,state,createdAt,firedAt,assignmentId,work_item_id) VALUES ('#{wake_id}','#{session_key}',#{origin},'resume',#{due_at},'#{state}',#{created_at},#{fired_at_sql},#{sql(Keyword.get(opts, :assignment_id))},#{sql(Keyword.get(opts, :work_item_id))})"
       )
   end
 
