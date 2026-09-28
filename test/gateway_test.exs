@@ -2665,8 +2665,9 @@ defmodule Tightbeam.GatewayTest do
     assert_receive {:candidate_guidance, "candidate-1", guidance}
     assert guidance =~ "tightbeam transcript --session \"swapme\" --limit 50"
     assert guidance =~ "Do not replay or inject earlier messages"
-    refute guidance =~ "REPLAY_SENTINEL_ONE"
-    refute guidance =~ "REPLAY_SENTINEL_TWO"
+    assert guidance =~ "Cross-harness handoff from durable session records"
+    assert guidance =~ "REPLAY_SENTINEL_ONE"
+    assert guidance =~ "REPLAY_SENTINEL_TWO"
 
     cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), Org.get(ctx.db, "swapme"))
 
@@ -6839,6 +6840,41 @@ defmodule Tightbeam.GatewayTest do
         JSON.encode!(%{messageKind: "liveness"})
       )
 
+    {replacement_source_seq, _replacement_source_message} =
+      enqueue_gateway_prompt!(
+        ctx.db,
+        "k1",
+        "session:sender",
+        "exact sender replacement source to omit"
+      )
+
+    assert {:ok, true} =
+             DB.transaction(ctx.db, fn txn ->
+               Ledger.cancel_queued_in_txn(
+                 txn,
+                 replacement_source_seq,
+                 "sender_requested_replacement"
+               )
+             end)
+
+    :ok =
+      EventLog.lifecycle(
+        ctx.db,
+        "queued_message_suppressed",
+        Integer.to_string(replacement_source_seq),
+        JSON.encode!(%{
+          messageKind: "sender-replacement",
+          cause: "sender_requested_replacement"
+        })
+      )
+
+    assert {:ok, [["canceled", "queued-message-suppressed: sender_requested_replacement"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT status,error FROM turns WHERE seq=?1",
+               [replacement_source_seq]
+             )
+
     {unattributed_canceled_seq, unattributed_canceled_message} =
       enqueue_gateway_prompt!(
         ctx.db,
@@ -6877,7 +6913,8 @@ defmodule Tightbeam.GatewayTest do
     assert guidance =~ "Cross-harness handoff from durable session records"
     assert guidance =~ ~s("sender":"user:flynn")
     assert guidance =~ ~s("sender":"agent:reviewer")
-    refute guidance =~ "superseded liveness notice"
+    assert guidance =~ "superseded liveness notice"
+    refute guidance =~ "exact sender replacement source to omit"
     assert guidance =~ "other suppression reason durable context"
     assert guidance =~ "unattributed canceled durable context"
 

@@ -8,6 +8,14 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = ensure_all_schemas(db)
 
+    register_hosts(db, %{
+      Tightbeam.Placement.local_host_name() => %{
+        ssh: nil,
+        base_dir: Application.fetch_env!(:tightbeam, :base_dir),
+        cli_bin: nil
+      }
+    })
+
     :ok =
       DB.execute(db, """
       INSERT INTO sessions
@@ -206,7 +214,7 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
         class: "fyi"
       })
 
-    assert replacement_wake.delivery_rule == "batcher-inhibited"
+    assert replacement_wake.delivery_rule == "batcher-inhibited r1"
 
     assert {:ok, [["asg_replace"]]} =
              DB.query(
@@ -303,7 +311,8 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
 
     new_seq = deliver_wake!(db, wake)
 
-    assert {:ok, %{seq: ^new_seq, prompt: "new prompt"}} = Ledger.claim_next(db, "k1", "lane")
+    assert {:ok, %{seq: ^new_seq, prompt: "[from session:sender]\n\nnew prompt"}} =
+             Ledger.claim_next(db, "k1", "lane")
 
     assert {:ok, [["canceled", "queued-message-suppressed: sender_requested_replacement"]]} =
              DB.query(db, "SELECT status,error FROM turns WHERE seq=?1", [old_seq])
@@ -430,8 +439,8 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
         assignment_id: "asg_running"
       })
 
-    :ok =
-      DB.execute(db, "UPDATE turns SET status='running',startedAt=2 WHERE seq=?1", [running_seq])
+    {:ok, _} =
+      DB.query(db, "UPDATE turns SET status='running',startedAt=2 WHERE seq=?1", [running_seq])
 
     wake =
       Wakes.schedule(db, %{
