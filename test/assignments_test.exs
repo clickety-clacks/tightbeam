@@ -3790,7 +3790,7 @@ defmodule Tightbeam.AssignmentsTest do
       handle(
         ctx,
         "assign",
-        assign_call({:session, "other-session"}, "bookkeeping", nil, work_item.id)
+        assign_call({:session, "holder"}, "bookkeeping", nil, work_item.id)
       )
 
     assert assigned.workItemId == work_item.id
@@ -3801,6 +3801,17 @@ defmodule Tightbeam.AssignmentsTest do
                "SELECT count(*) FROM assignments WHERE id = ?1 AND workItemId = ?2",
                [assigned.id, work_item.id]
              )
+
+    assignment_count_before_unrelated = assignment_count(ctx.db)
+
+    assert %{code: "delivery_owner_required"} =
+             handle(
+               ctx,
+               "assign",
+               assign_call({:session, "other-session"}, "unrelated owner", nil, work_item.id)
+             )
+
+    assert assignment_count(ctx.db) == assignment_count_before_unrelated
   end
 
   test "a fired owner routing bracket permits only the first rumination deferral", ctx do

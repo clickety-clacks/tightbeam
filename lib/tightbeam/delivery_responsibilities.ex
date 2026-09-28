@@ -55,20 +55,33 @@ defmodule Tightbeam.DeliveryResponsibilities do
         owner_user_id
       )
       when is_binary(work_item_id) and is_binary(owner_user_id) do
-    if legacy_owner_history_present_in_txn?(txn) do
-      case legacy_current_owner_in_txn(txn, work_item_id) do
-        %{
-          "ownerUserId" => ^owner_user_id,
-          "accountableSessionKey" => session_key,
-          "deliveryState" => "current"
-        } ->
-          session_key
+    case current_owner_in_txn(txn, work_item_id) do
+      %{
+        "ownerUserId" => ^owner_user_id,
+        "accountableSessionKey" => session_key,
+        "deliveryState" => "current"
+      } ->
+        session_key
 
-        _ ->
+      nil ->
+        if legacy_owner_history_present_in_txn?(txn) do
+          case legacy_current_owner_in_txn(txn, work_item_id) do
+            %{
+              "ownerUserId" => ^owner_user_id,
+              "accountableSessionKey" => session_key,
+              "deliveryState" => "current"
+            } ->
+              session_key
+
+            _ ->
+              nil
+          end
+        else
           nil
-      end
-    else
-      nil
+        end
+
+      _ ->
+        nil
     end
   end
 
