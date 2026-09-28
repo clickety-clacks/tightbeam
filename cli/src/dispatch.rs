@@ -3548,7 +3548,12 @@ mod tests {
     #[test]
     fn builds_byte_exact_work_item_bodies() {
         assert_eq!(
-            body(&["work-item-update", "wi_1", "--delivery-owner", "agent:owner"]),
+            body(&[
+                "work-item-update",
+                "wi_1",
+                "--delivery-owner",
+                "agent:owner"
+            ]),
             r#"{"verb":"work-item-update","params":{"workItemId":"wi_1","deliveryOwnerSessionKey":"agent:owner"}}"#
         );
         assert_eq!(

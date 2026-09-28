@@ -2653,9 +2653,15 @@ fn parse_with_optional_catalog(
                 return Err(metadata_usage.to_owned());
             }
 
-            if ["title", "spec-ref", "spec-sha256", "priority", "delivery-owner"]
-                .iter()
-                .any(|flag| parsed.missing_values.contains(*flag))
+            if [
+                "title",
+                "spec-ref",
+                "spec-sha256",
+                "priority",
+                "delivery-owner",
+            ]
+            .iter()
+            .any(|flag| parsed.missing_values.contains(*flag))
             {
                 return Err(metadata_usage.to_owned());
             }
@@ -2663,7 +2669,9 @@ fn parse_with_optional_catalog(
             let clear_delivery_owner = flags.contains_key("clear-delivery-owner");
             let delivery_owner = flags.get("delivery-owner").cloned();
             if (clear_delivery_owner && delivery_owner.is_some())
-                || delivery_owner.as_ref().is_some_and(|owner| owner.trim().is_empty())
+                || delivery_owner
+                    .as_ref()
+                    .is_some_and(|owner| owner.trim().is_empty())
             {
                 return Err(metadata_usage.to_owned());
             }
