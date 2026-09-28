@@ -6544,37 +6544,48 @@ defmodule Tightbeam.Gateway do
                    ) do
                   {:cap_exceeded, max_live_sessions}
                 else
-                  session = Org.create_in_txn(txn, input)
+                  case DeliveryResponsibilities.check_staffing_owner_in_txn(
+                         txn,
+                         Map.put(call, :verb, "spawn"),
+                         owner_user_id: caller.owner_user_id,
+                         target_archetype: archetype.name
+                       ) do
+                    :ok ->
+                      session = Org.create_in_txn(txn, input)
 
-                  if p[:handle] do
-                    Roles.create_in_txn!(
-                      txn,
-                      p.handle,
-                      caller.owner_user_id,
-                      session.session_key
-                    )
-                  end
+                      if p[:handle] do
+                        Roles.create_in_txn!(
+                          txn,
+                          p.handle,
+                          caller.owner_user_id,
+                          session.session_key
+                        )
+                      end
 
-                  Idempotency.put_in_txn(txn, %{
-                    owner_user_id: caller.owner_user_id,
-                    operation: "spawn",
-                    idempotency_key: p.idempotency_key,
-                    session_key: session.session_key
-                  })
+                      Idempotency.put_in_txn(txn, %{
+                        owner_user_id: caller.owner_user_id,
+                        operation: "spawn",
+                        idempotency_key: p.idempotency_key,
+                        session_key: session.session_key
+                      })
 
-                  Enum.each(
-                    Map.get(placement, :terminal_redirect_incidents, []),
-                    fn incident_id ->
-                      TerminalCredentialFailure.record_redirect_in_txn(
-                        txn,
-                        incident_id,
-                        "spawn:" <> caller.owner_user_id <> ":" <> p.idempotency_key,
-                        session.host
+                      Enum.each(
+                        Map.get(placement, :terminal_redirect_incidents, []),
+                        fn incident_id ->
+                          TerminalCredentialFailure.record_redirect_in_txn(
+                            txn,
+                            incident_id,
+                            "spawn:" <> caller.owner_user_id <> ":" <> p.idempotency_key,
+                            session.host
+                          )
+                        end
                       )
-                    end
-                  )
 
-                  {:created, session}
+                      {:created, session}
+
+                    %{code: _} = denial ->
+                      {:delivery_owner_denied, denial}
+                  end
                 end
               else
                 {:error, :unknown_archetype}
@@ -6591,6 +6602,9 @@ defmodule Tightbeam.Gateway do
 
         {:ok, {:error, :unknown_archetype}} ->
           %{code: "unknown_archetype", message: "no such archetype: #{archetype.name}"}
+
+        {:ok, {:delivery_owner_denied, denial}} ->
+          denial
 
         {:error, %Roles.TransactionError{error: error}} ->
           classified_denial("config_denied", error)

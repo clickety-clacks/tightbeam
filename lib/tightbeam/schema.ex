@@ -324,6 +324,8 @@ defmodule Tightbeam.Schema do
   @terminal_credential_shape "terminal-credential-failure-v1-019"
   @agent_reparent_shape "delivery-owner-reparent-v1-019"
   @artifact_origin_shape "artifact-origin-v1-019"
+  @fresh_owner_link_origin_table "schema_bootstrap_origin"
+  @work_item_owner_link_shape "work-item-delivery-owner-v1-019"
   @cursor_provider_previous_shape @addressed_po_shape
   @liveness_progress_receipts_previous_shape "identity-universal-root-render-v1-019"
   @cannot_proceed_shape "cannot-proceed-v1-019"
@@ -1358,6 +1360,7 @@ defmodule Tightbeam.Schema do
   @doc false
   def guard_compatible_stamps do
     [
+      @work_item_owner_link_shape,
       @artifact_origin_shape,
       @agent_reparent_shape,
       @terminal_credential_shape,
@@ -1412,6 +1415,7 @@ defmodule Tightbeam.Schema do
   @spec ensure_all(DB.server()) :: :ok
   def ensure_all(db) do
     :ok = ensure_stamp_table(db)
+    :ok = ensure_fresh_owner_link_origin(db)
     :ok = check_shape(db)
     :ok = upgrade_o2(db)
     {:ok, [[predecessor]]} = DB.query(db, "SELECT shape FROM schema_stamp")
@@ -1433,7 +1437,8 @@ defmodule Tightbeam.Schema do
             @settlement_shape,
             @terminal_credential_shape,
             @agent_reparent_shape,
-            @artifact_origin_shape
+            @artifact_origin_shape,
+            @work_item_owner_link_shape
           ]
         )
     end)
@@ -1495,6 +1500,7 @@ defmodule Tightbeam.Schema do
     :ok = upgrade_agent_reparent(db)
     :ok = upgrade_artifact_origins(db)
     :ok = Tightbeam.Ledger.ensure_schema(db)
+    :ok = upgrade_work_item_delivery_owner_link(db)
 
     case DB.finish_schema(db) do
       :ok -> :ok
@@ -1604,7 +1610,8 @@ defmodule Tightbeam.Schema do
            @settlement_shape,
            @terminal_credential_shape,
            @agent_reparent_shape,
-           @artifact_origin_shape
+           @artifact_origin_shape,
+           @work_item_owner_link_shape
          ],
          do: @cannot_proceed_liveness_objects,
          else: @o2_liveness_objects
@@ -1660,7 +1667,8 @@ defmodule Tightbeam.Schema do
            @settlement_shape,
            @terminal_credential_shape,
            @agent_reparent_shape,
-           @artifact_origin_shape
+           @artifact_origin_shape,
+           @work_item_owner_link_shape
          ],
          do: reparent_liveness_enforcement_objects(),
          else: @supervision_liveness_enforcement_objects
@@ -2174,8 +2182,55 @@ defmodule Tightbeam.Schema do
     end
   end
 
+  defp ensure_fresh_owner_link_origin(db) do
+    case DB.query(db, "SELECT shape FROM schema_stamp") do
+      {:ok, []} ->
+        case DB.query(
+               db,
+               "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT IN ('schema_stamp', '#{@fresh_owner_link_origin_table}') LIMIT 1"
+             ) do
+          {:ok, []} ->
+            :ok =
+              DB.execute(db, """
+              CREATE TABLE IF NOT EXISTS #{@fresh_owner_link_origin_table} (
+                id INTEGER PRIMARY KEY CHECK(id=1),
+                origin TEXT NOT NULL CHECK(origin='fresh'),
+                createdAt INTEGER NOT NULL
+              );
+              """)
+
+            {:ok, []} =
+              DB.query(
+                db,
+                "INSERT OR IGNORE INTO #{@fresh_owner_link_origin_table}(id,origin,createdAt) VALUES(1,'fresh',?1)",
+                [System.system_time(:millisecond)]
+              )
+
+            :ok
+
+          {:ok, [_ | _]} ->
+            :ok
+
+          other ->
+            raise ShapeError,
+              message: "incompatible fresh owner-link origin probe: #{inspect(other)}"
+        end
+
+      {:ok, [_ | _]} ->
+        :ok
+
+      other ->
+        raise ShapeError,
+          message:
+            "incompatible schema stamp probe for fresh owner-link origin: #{inspect(other)}"
+    end
+  end
+
   defp check_shape(db) do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
+      {:ok, [[@work_item_owner_link_shape]]} ->
+        check_work_item_owner_link_shape(db)
+
       {:ok, [[shape]]}
       when shape in [
              @cursor_provider_shape,
@@ -2281,8 +2336,7 @@ defmodule Tightbeam.Schema do
         this Tightbeam database was written by a different build.
 
           stamped: #{found}
-          this build: #{@artifact_origin_shape}
-
+          this build: #{@work_item_owner_link_shape}
         This build can migrate #{@model_identity_shape} or #{@operator_decision_shape}
         to #{@terminal_decision_liveness_shape}, then #{@effort_request_exit_previous_shape}.
         It can migrate #{@terminal_decision_shape} through
@@ -2293,9 +2347,8 @@ defmodule Tightbeam.Schema do
         #{@effort_request_exit_previous_shape} to #{@effort_request_exit_shape},
         then through the same row-driven chain to #{@cursor_provider_shape}.
         It then migrates to #{@cannot_proceed_shape}, followed atomically by
-        #{@settlement_shape}, #{@terminal_credential_shape}, and #{@agent_reparent_shape},
-        then #{@artifact_origin_shape}.
-
+        #{@settlement_shape}, #{@terminal_credential_shape}, #{@agent_reparent_shape},
+        #{@artifact_origin_shape}, then #{@work_item_owner_link_shape}.
         No migration is defined for the stamped shape above. Keep the database
         in place and run a Tightbeam build that recognizes that exact stamp.
         """
@@ -2308,12 +2361,62 @@ defmodule Tightbeam.Schema do
         this Tightbeam database carries MORE THAN ONE shape stamp.
 
           stamped: #{rows |> List.flatten() |> Enum.join(", ")}
-          this build: #{@artifact_origin_shape}
-
+          this build: #{@work_item_owner_link_shape}
         Nothing in Tightbeam writes a second stamp, so this database was
         assembled by something else. Move it aside and let it be recreated.
         """
     end
+  end
+
+  defp check_work_item_owner_link_shape(db) do
+    {:ok, columns} = DB.query(db, "PRAGMA table_info(work_items)")
+
+    unless Enum.any?(columns, fn
+             [_cid, "deliveryOwnerSessionKey", "TEXT", 0, nil, 0] -> true
+             _ -> false
+           end) do
+      raise ShapeError,
+        message:
+          "incompatible #{@work_item_owner_link_shape}: work_items.deliveryOwnerSessionKey must be nullable TEXT"
+    end
+
+    {:ok, foreign_keys} = DB.query(db, "PRAGMA foreign_key_list(work_items)")
+
+    unless Enum.any?(foreign_keys, fn
+             [
+               _id,
+               _seq,
+               "sessions",
+               "deliveryOwnerSessionKey",
+               "sessionKey",
+               _on_update,
+               _on_delete,
+               _match
+             ] ->
+               true
+
+             _ ->
+               false
+           end) do
+      raise ShapeError,
+        message:
+          "incompatible #{@work_item_owner_link_shape}: deliveryOwnerSessionKey must reference sessions(sessionKey)"
+    end
+
+    {:ok, bootstrap_origin} =
+      DB.query(
+        db,
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+        [@fresh_owner_link_origin_table]
+      )
+
+    if bootstrap_origin != [] do
+      raise ShapeError,
+        message:
+          "incompatible #{@work_item_owner_link_shape}: fresh-bootstrap origin marker was not consumed"
+    end
+
+    :ok
   end
 
   # R1 follows completed O2 activation, for both fresh and upgraded databases.
@@ -2329,7 +2432,8 @@ defmodule Tightbeam.Schema do
                     @settlement_shape,
                     @terminal_credential_shape,
                     @agent_reparent_shape,
-                    @artifact_origin_shape
+                    @artifact_origin_shape,
+                    @work_item_owner_link_shape
                   ] ->
                :ok
 
@@ -2403,7 +2507,8 @@ defmodule Tightbeam.Schema do
              @settlement_shape,
              @terminal_credential_shape,
              @agent_reparent_shape,
-             @artifact_origin_shape
+             @artifact_origin_shape,
+             @work_item_owner_link_shape
            ] ->
         Tightbeam.Assignments.ensure_schema(db)
 
@@ -2423,7 +2528,8 @@ defmodule Tightbeam.Schema do
              @settlement_shape,
              @terminal_credential_shape,
              @agent_reparent_shape,
-             @artifact_origin_shape
+             @artifact_origin_shape,
+             @work_item_owner_link_shape
            ] ->
         :ok
 
@@ -2518,7 +2624,8 @@ defmodule Tightbeam.Schema do
                     @settlement_shape,
                     @terminal_credential_shape,
                     @agent_reparent_shape,
-                    @artifact_origin_shape
+                    @artifact_origin_shape,
+                    @work_item_owner_link_shape
                   ] ->
                :ok
 
@@ -2586,7 +2693,8 @@ defmodule Tightbeam.Schema do
                     @settlement_shape,
                     @terminal_credential_shape,
                     @agent_reparent_shape,
-                    @artifact_origin_shape
+                    @artifact_origin_shape,
+                    @work_item_owner_link_shape
                   ] ->
                validate_artifact_content_schema!(txn)
 
@@ -2682,7 +2790,8 @@ defmodule Tightbeam.Schema do
              @settlement_shape,
              @terminal_credential_shape,
              @agent_reparent_shape,
-             @artifact_origin_shape
+             @artifact_origin_shape,
+             @work_item_owner_link_shape
            ] ->
         :ok
 
@@ -3722,7 +3831,8 @@ defmodule Tightbeam.Schema do
              @settlement_shape,
              @terminal_credential_shape,
              @agent_reparent_shape,
-             @artifact_origin_shape
+             @artifact_origin_shape,
+             @work_item_owner_link_shape
            ] ->
         :ok
 
@@ -3754,7 +3864,8 @@ defmodule Tightbeam.Schema do
              @settlement_shape,
              @terminal_credential_shape,
              @agent_reparent_shape,
-             @artifact_origin_shape
+             @artifact_origin_shape,
+             @work_item_owner_link_shape
            ] ->
         :ok
 
@@ -3858,7 +3969,8 @@ defmodule Tightbeam.Schema do
              @settlement_shape,
              @terminal_credential_shape,
              @agent_reparent_shape,
-             @artifact_origin_shape
+             @artifact_origin_shape,
+             @work_item_owner_link_shape
            ] ->
         :ok
 
@@ -4106,7 +4218,8 @@ defmodule Tightbeam.Schema do
              @settlement_shape,
              @terminal_credential_shape,
              @agent_reparent_shape,
-             @artifact_origin_shape
+             @artifact_origin_shape,
+             @work_item_owner_link_shape
            ] ->
         :ok
 
@@ -4126,7 +4239,8 @@ defmodule Tightbeam.Schema do
                     @settlement_shape,
                     @terminal_credential_shape,
                     @agent_reparent_shape,
-                    @artifact_origin_shape
+                    @artifact_origin_shape,
+                    @work_item_owner_link_shape
                   ] ->
                :ok
 
@@ -4158,6 +4272,9 @@ defmodule Tightbeam.Schema do
   defp upgrade_terminal_credential_failure(db) do
     case DB.transaction(db, fn txn ->
            case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@work_item_owner_link_shape]] ->
+               :ok
+
              [[@agent_reparent_shape]] ->
                :ok
 
@@ -4204,6 +4321,9 @@ defmodule Tightbeam.Schema do
   defp upgrade_agent_reparent(db) do
     case DB.transaction(db, fn txn ->
            case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@work_item_owner_link_shape]] ->
+               :ok
+
              [[@agent_reparent_shape]] ->
                :ok
 
@@ -4248,6 +4368,9 @@ defmodule Tightbeam.Schema do
   defp upgrade_artifact_origins(db) do
     case DB.transaction(db, fn txn ->
            case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@work_item_owner_link_shape]] ->
+               validate_artifact_origins!(txn)
+
              [[@artifact_origin_shape]] ->
                validate_artifact_origins!(txn)
 
@@ -4295,6 +4418,118 @@ defmodule Tightbeam.Schema do
     case Txn.q(txn, "SELECT sql FROM sqlite_master WHERE name='artifacts_origin_immutable'") do
       [[^expected]] -> :ok
       _ -> raise ShapeError, message: "incompatible artifact origin immutability trigger"
+    end
+  end
+
+  defp upgrade_work_item_delivery_owner_link(db) do
+    case DB.transaction(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@work_item_owner_link_shape]] ->
+               :ok
+
+             [[@artifact_origin_shape]] ->
+               fresh_bootstrap? = fresh_owner_link_origin_in_txn(txn)
+
+               backfill =
+                 if fresh_bootstrap?,
+                   do: {:ok, []},
+                   else: Tightbeam.DeliveryResponsibilities.legacy_owner_link_backfill_in_txn(txn)
+
+               case backfill do
+                 {:ok, backfill} ->
+                   Txn.exec(
+                     txn,
+                     "ALTER TABLE work_items ADD COLUMN deliveryOwnerSessionKey TEXT NULL REFERENCES sessions(sessionKey)"
+                   )
+
+                   Enum.each(backfill, fn {work_item_id, session_key} ->
+                     Txn.q(
+                       txn,
+                       "UPDATE work_items SET deliveryOwnerSessionKey=?1 WHERE id=?2",
+                       [session_key, work_item_id]
+                     )
+
+                     if Txn.changes(txn) != 1 do
+                       raise ShapeError,
+                         message:
+                           "migration #{@artifact_origin_shape} -> #{@work_item_owner_link_shape} lost work item #{work_item_id} during owner backfill"
+                     end
+                   end)
+
+                   [] = Txn.q(txn, "PRAGMA foreign_key_check")
+
+                   Txn.q(
+                     txn,
+                     "UPDATE schema_stamp SET shape=?1, stampedAt=?2 WHERE shape=?3",
+                     [
+                       @work_item_owner_link_shape,
+                       System.system_time(:millisecond),
+                       @artifact_origin_shape
+                     ]
+                   )
+
+                   if Txn.changes(txn) != 1 do
+                     raise ShapeError,
+                       message:
+                         "migration #{@artifact_origin_shape} -> #{@work_item_owner_link_shape} lost its exact stamp transition"
+                   end
+
+                   if fresh_bootstrap? do
+                     Txn.exec(txn, "DROP TABLE #{@fresh_owner_link_origin_table}")
+                   end
+
+                   :ok
+
+                 {:error, %{work_item_id: item, session_key: session, state: state}} ->
+                   raise ShapeError,
+                     message:
+                       "incompatible owner-link predecessor at work item #{item}: session #{inspect(session)} has delivery state #{state}; preserve history and repair the exact owner relation before migrating"
+               end
+
+             other ->
+               raise ShapeError,
+                 message:
+                   "incompatible owner-link predecessor: expected exact #{@artifact_origin_shape}, found #{inspect(other)}"
+           end
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "migration #{@artifact_origin_shape} -> #{@work_item_owner_link_shape} failed and was rolled back: #{Exception.message(error)}"
+    end
+  end
+
+  defp fresh_owner_link_origin_in_txn(txn) do
+    case Txn.q(
+           txn,
+           "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+           [@fresh_owner_link_origin_table]
+         ) do
+      [] ->
+        false
+
+      [[1]] ->
+        case Txn.q(
+               txn,
+               "SELECT origin FROM #{@fresh_owner_link_origin_table} WHERE id=1"
+             ) do
+          [["fresh"]] ->
+            true
+
+          rows ->
+            raise ShapeError,
+              message: "incompatible fresh owner-link bootstrap marker: #{inspect(rows)}"
+        end
+
+      rows ->
+        raise ShapeError,
+          message: "incompatible fresh owner-link bootstrap table: #{inspect(rows)}"
     end
   end
 

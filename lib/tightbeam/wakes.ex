@@ -1391,11 +1391,18 @@ defmodule Tightbeam.Wakes do
     personal = Tightbeam.Org.personal_session_key(event.owner_user_id)
 
     current =
-      DeliveryResponsibilities.current_accountable_recipient_in_txn(
-        txn,
-        event.work_item_id,
-        event.owner_user_id
-      )
+      case DeliveryResponsibilities.current_owner_in_txn(txn, event.work_item_id) do
+        %{
+          "ownerUserId" => owner_user_id,
+          "accountableSessionKey" => session_key,
+          "deliveryState" => "current"
+        }
+        when owner_user_id == event.owner_user_id ->
+          session_key
+
+        _ ->
+          nil
+      end
 
     delegated_opener =
       if event.opened_by_kind == "session" and

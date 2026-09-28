@@ -2149,17 +2149,6 @@ defmodule Tightbeam.Rules do
     end)
   end
 
-  defp compute_fact("work_item.has_delivery_owner", db, call, cache) do
-    with_dependency("$work_item_id", db, call, cache, fn
-      nil, cache ->
-        {false, cache}
-
-      work_item_id, cache ->
-        value = not is_nil(DeliveryResponsibilities.current_owner(db, work_item_id))
-        {value, cache}
-    end)
-  end
-
   defp compute_fact("work_item.delivery_owner_ref", db, call, cache) do
     with_dependency("$work_item_id", db, call, cache, fn
       nil, cache ->
@@ -2173,6 +2162,16 @@ defmodule Tightbeam.Rules do
           end
 
         {value, cache}
+    end)
+  end
+
+  defp compute_fact("work_item.has_delivery_owner", db, call, cache) do
+    with_dependency("$work_item_id", db, call, cache, fn
+      nil, cache ->
+        {false, cache}
+
+      work_item_id, cache ->
+        {not is_nil(DeliveryResponsibilities.current_owner(db, work_item_id)), cache}
     end)
   end
 
@@ -2562,14 +2561,7 @@ defmodule Tightbeam.Rules do
   defp compute_fact("assign.is_linked_review", _db, _call, cache), do: {false, cache}
 
   defp compute_fact("assign.delegates_delivery", _db, call, cache) do
-    value =
-      if call.verb in ["assign", "dispatch"] do
-        case Map.get(call.params, :delegates_delivery, false) do
-          value when is_boolean(value) -> value
-          _ -> nil
-        end
-      end
-
+    value = if call.verb in ["assign", "dispatch"], do: false
     {value, cache}
   end
 

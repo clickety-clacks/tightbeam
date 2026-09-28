@@ -13,7 +13,45 @@ defmodule Tightbeam.SchemaShapeTest do
 
   alias Tightbeam.{Assignments, ConnRegistry, DB, Schema, SessionPoAssociations, Wakes}
 
-  @shape "artifact-origin-v1-019"
+  @shape "work-item-delivery-owner-v1-019"
+  @artifact_origin_shape "artifact-origin-v1-019"
+  @agent_reparent_shape "delivery-owner-reparent-v1-019"
+  @owner_link_history_ddl """
+  CREATE TABLE work_item_delivery_scope_events (
+    eventSeq INTEGER PRIMARY KEY AUTOINCREMENT,
+    eventId TEXT NOT NULL UNIQUE,
+    workItemId TEXT NOT NULL REFERENCES work_items(id),
+    bindingRevision INTEGER NOT NULL CHECK(bindingRevision >= 1),
+    ownerUserId TEXT NOT NULL,
+    poRole TEXT NOT NULL,
+    associationSessionKey TEXT NOT NULL REFERENCES sessions(sessionKey),
+    associationRevision INTEGER NOT NULL CHECK(associationRevision >= 1),
+    previousOwnerUserId TEXT,
+    previousPoRole TEXT,
+    setByKind TEXT NOT NULL CHECK(setByKind IN ('user','session')),
+    setByRef TEXT NOT NULL,
+    cause TEXT NOT NULL CHECK(cause IN ('initial','reassigned')),
+    createdAt INTEGER NOT NULL,
+    UNIQUE(workItemId,bindingRevision)
+  );
+  CREATE TABLE delivery_scope_owner_events (
+    eventSeq INTEGER PRIMARY KEY AUTOINCREMENT,
+    eventId TEXT NOT NULL UNIQUE,
+    ownerUserId TEXT NOT NULL,
+    poRole TEXT NOT NULL,
+    ownerRevision INTEGER NOT NULL CHECK(ownerRevision >= 1),
+    previousSessionKey TEXT REFERENCES sessions(sessionKey),
+    accountableSessionKey TEXT NOT NULL REFERENCES sessions(sessionKey),
+    associationRevision INTEGER NOT NULL CHECK(associationRevision >= 1),
+    expectedOwnerRevision INTEGER NOT NULL CHECK(expectedOwnerRevision >= 0),
+    expectedSessionKey TEXT REFERENCES sessions(sessionKey),
+    setByKind TEXT NOT NULL CHECK(setByKind IN ('user','session')),
+    setByRef TEXT NOT NULL,
+    cause TEXT NOT NULL CHECK(cause IN ('initial','transfer','recovery')),
+    createdAt INTEGER NOT NULL,
+    UNIQUE(ownerUserId,poRole,ownerRevision)
+  );
+  """
   @legacy_cursor_provider_shape "cursor-provider-v1-020"
   @row_driven_rules_shape "row-driven-rules-v1-019"
   @identity_render_stamp_previous_shape "effort-request-exit-v1-019"
@@ -203,6 +241,10 @@ defmodule Tightbeam.SchemaShapeTest do
   test "a fresh database is created and stamped", %{db: db} do
     assert :ok = Schema.ensure_all(db)
     assert "executionId" in table_columns(db, "command_executions")
+    assert "deliveryOwnerSessionKey" in table_columns(db, "work_items")
+    refute table?(db, "schema_bootstrap_origin")
+    refute table?(db, "work_item_delivery_scope_events")
+    refute table?(db, "delivery_scope_owner_events")
 
     assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
 
@@ -232,6 +274,78 @@ defmodule Tightbeam.SchemaShapeTest do
                (kind, principal, subagentRef, sourceEventRef, harness, at)
              VALUES ('subagent_start', 'cursor-session', 'sub', 'event', 'cursor', 1);
              """)
+  end
+
+  test "the exact agent-reparent predecessor backfills current and retired owners", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+    assert :ok = DB.execute(db, @owner_link_history_ddl)
+    seed_owner_link_history!(db, "current", "active", true)
+    seed_owner_link_history!(db, "retired", "active", true)
+
+    assert {:ok, []} =
+             DB.query(
+               db,
+               "UPDATE sessions SET state='retired' WHERE sessionKey='link-agent-retired'"
+             )
+
+    rewind_to_agent_reparent!(db)
+
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok, [["link-agent-current"], ["link-agent-retired"]]} =
+             DB.query(
+               db,
+               "SELECT deliveryOwnerSessionKey FROM work_items ORDER BY id"
+             )
+
+    assert {:ok, [[2, 2]]} =
+             DB.query(
+               db,
+               "SELECT (SELECT COUNT(*) FROM work_item_delivery_scope_events), (SELECT COUNT(*) FROM delivery_scope_owner_events)"
+             )
+
+    assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
+    assert :ok = Schema.ensure_all(db)
+    refute table?(db, "schema_bootstrap_origin")
+  end
+
+  test "the exact agent-reparent migration refuses stale owner history without changing it", %{
+    db: db
+  } do
+    assert :ok = Schema.ensure_all(db)
+    assert :ok = DB.execute(db, @owner_link_history_ddl)
+    seed_owner_link_history!(db, "stale", "active", false)
+    rewind_to_agent_reparent!(db)
+
+    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
+
+    assert error.message =~ "wi_link_stale"
+    assert error.message =~ "link-agent-stale"
+    assert error.message =~ "stale"
+    assert {:ok, [[@agent_reparent_shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+    refute "deliveryOwnerSessionKey" in table_columns(db, "work_items")
+
+    assert {:ok, [[1, 1]]} =
+             DB.query(
+               db,
+               "SELECT (SELECT COUNT(*) FROM work_item_delivery_scope_events), (SELECT COUNT(*) FROM delivery_scope_owner_events)"
+             )
+  end
+
+  test "an unknown predecessor refuses before the owner-link shape is accepted", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+    unexpected = "unknown-owner-link-predecessor"
+
+    assert {:ok, []} =
+             DB.query(db, "UPDATE schema_stamp SET shape=?1, stampedAt=1", [unexpected])
+
+    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
+
+    assert error.message =~ unexpected
+    assert {:ok, [[^unexpected]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+    assert "deliveryOwnerSessionKey" in table_columns(db, "work_items")
   end
 
   test "the real previous PR31 schema gains addressed-PO storage before admission", %{db: db} do
@@ -779,6 +893,7 @@ defmodule Tightbeam.SchemaShapeTest do
     {:ok, messages_before} =
       DB.query(db, "SELECT #{model_identity_message_columns()} FROM messages ORDER BY seq")
 
+    assert :ok = DB.execute(db, @owner_link_history_ddl)
     assert :ok = Schema.ensure_all(db)
 
     assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
@@ -1578,6 +1693,92 @@ defmodule Tightbeam.SchemaShapeTest do
     test "coverage admission predecessor survives restart, activated=#{activated}" do
       Tightbeam.SchemaShapeRuntimeFixture.run!("coverage", %{activated: unquote(activated)})
     end
+  end
+
+  defp seed_owner_link_history!(db, suffix, agent_state, associate_agent?) do
+    owner = "link-owner-#{suffix}"
+    role = "product-owner:link-#{suffix}"
+    office = "link-office-#{suffix}"
+    agent = "link-agent-#{suffix}"
+    item = "wi_link_#{suffix}"
+
+    assert {:ok, []} =
+             DB.query(
+               db,
+               "INSERT INTO users(userId,isAdmin,createdAt) VALUES(?1,0,1)",
+               [owner]
+             )
+
+    owner_link_session!(db, office, owner, "active")
+    owner_link_session!(db, agent, owner, agent_state)
+
+    assert {:ok, []} =
+             DB.query(
+               db,
+               "INSERT INTO roles(name,boundSessionKey,ownerUserId,createdAt,updatedAt) VALUES(?1,?2,?3,1,1)",
+               [role, office, owner]
+             )
+
+    assert %{"changed" => true} =
+             SessionPoAssociations.handle(db, %{
+               principal: {:user, owner},
+               params: %{
+                 session_key: office,
+                 po_role: role,
+                 idempotency_key: "history-office-#{suffix}"
+               }
+             })
+
+    if associate_agent? do
+      assert %{"changed" => true} =
+               SessionPoAssociations.handle(db, %{
+                 principal: {:user, owner},
+                 params: %{
+                   session_key: agent,
+                   po_role: role,
+                   idempotency_key: "history-agent-#{suffix}"
+                 }
+               })
+    end
+
+    assert {:ok, []} =
+             DB.query(
+               db,
+               "INSERT INTO work_items(id,title,ownerUserId,createdByUser,createdAt) VALUES(?1,?2,?3,?3,1)",
+               [item, "Owner link #{suffix}", owner]
+             )
+
+    assert {:ok, []} =
+             DB.query(
+               db,
+               "INSERT INTO work_item_delivery_scope_events(eventId,workItemId,bindingRevision,ownerUserId,poRole,associationSessionKey,associationRevision,setByKind,setByRef,cause,createdAt) VALUES(?1,?2,1,?3,?4,?5,1,'user',?3,'initial',1)",
+               ["scope-#{suffix}", item, owner, role, office]
+             )
+
+    assert {:ok, []} =
+             DB.query(
+               db,
+               "INSERT INTO delivery_scope_owner_events(eventId,ownerUserId,poRole,ownerRevision,accountableSessionKey,associationRevision,expectedOwnerRevision,setByKind,setByRef,cause,createdAt) VALUES(?1,?2,?3,1,?4,1,0,'user',?2,'initial',1)",
+               ["owner-#{suffix}", owner, role, agent]
+             )
+
+    :ok
+  end
+
+  defp owner_link_session!(db, key, owner, state) do
+    assert {:ok, []} =
+             DB.query(
+               db,
+               "INSERT INTO sessions(sessionKey,displayName,ownerUserId,origin,archetype,harness,provider,model,host,state,createdAt,updatedAt) VALUES(?1,?1,?2,?3,'coder','codex','openai','fixture-model','local',?4,1,1)",
+               [key, owner, "user:" <> owner, state]
+             )
+  end
+
+  defp rewind_to_agent_reparent!(db) do
+    assert :ok = DB.execute(db, "ALTER TABLE work_items DROP COLUMN deliveryOwnerSessionKey")
+
+    assert {:ok, []} =
+             DB.query(db, "UPDATE schema_stamp SET shape=?1, stampedAt=1", [@agent_reparent_shape])
   end
 
   defp historical_session!(db, row) do

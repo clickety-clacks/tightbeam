@@ -33,14 +33,6 @@ defmodule Tightbeam.Assignments do
     defexception [:code, :message]
   end
 
-  defmodule UnknownWorkItem do
-    @moduledoc false
-    defexception [:work_item_id]
-
-    @impl true
-    def message(%__MODULE__{work_item_id: id}), do: "unknown work item: #{id}"
-  end
-
   defmodule UnknownReviewTarget do
     @moduledoc false
     defexception [:assignment_id]
@@ -1277,7 +1269,10 @@ defmodule Tightbeam.Assignments do
   validations (authority, subject, key-format, files) run verbatim first.
   """
   @spec dispatch_precheck(DB.server(), map()) ::
-          :proceed | {:replay, map()} | {:refuse, map()}
+          :proceed
+          | {:proceed, {:ownerless_fired_rumination, reference(), String.t(), String.t()}}
+          | {:replay, map()}
+          | {:refuse, map()}
   def dispatch_precheck(db, call) do
     verb = Map.fetch!(call, :verb)
 
@@ -1299,10 +1294,7 @@ defmodule Tightbeam.Assignments do
               :proceed
 
             work_item_id ->
-              case Tightbeam.WorkItems.state_for(db, work_item_id) do
-                state when state in [nil, "open"] -> :proceed
-                _terminal -> {:refuse, work_item_not_open(work_item_id)}
-              end
+              dispatch_item_precheck(db, call, work_item_id)
           end
       end
     else
@@ -1312,6 +1304,101 @@ defmodule Tightbeam.Assignments do
 
   defp work_item_not_open(work_item_id),
     do: error("work_item_not_open", "work item #{work_item_id} is not open")
+
+  defp dispatch_item_precheck(db, call, work_item_id) do
+    transaction(db, fn txn ->
+      case Tightbeam.WorkItems.state_in_txn(txn, work_item_id) do
+        state when state in [nil, "open"] ->
+          case Txn.q(txn, "SELECT archetype FROM sessions WHERE sessionKey=?1", [
+                 call.session_key
+               ]) do
+            [[target_archetype]] ->
+              case Tightbeam.DeliveryResponsibilities.check_staffing_owner_in_txn(
+                     txn,
+                     call,
+                     target_session_key: call.session_key,
+                     target_archetype: target_archetype
+                   ) do
+                :ok ->
+                  :proceed
+
+                %{code: "delivery_owner_missing"} = error when call.verb == "dispatch" ->
+                  case call.principal do
+                    {:session, caller_session} ->
+                      cond do
+                        Wakes.rumination_exists?(txn, work_item_id, caller_session) ->
+                          {:proceed,
+                           {:ownerless_fired_rumination, make_ref(), work_item_id, caller_session}}
+
+                        live_owner_routing_bracket_in_txn?(txn, work_item_id) ->
+                          :proceed
+
+                        true ->
+                          {:refuse, error}
+                      end
+
+                    _ ->
+                      {:refuse, error}
+                  end
+
+                %{code: _} = error ->
+                  {:refuse, error}
+              end
+
+            # Preserve the existing unknown-target result in the dispatch handler.
+            [] ->
+              :proceed
+          end
+
+        _terminal ->
+          {:refuse, work_item_not_open(work_item_id)}
+      end
+    end)
+  end
+
+  defp live_owner_routing_bracket_in_txn?(txn, work_item_id) do
+    case Txn.q(
+           txn,
+           """
+           SELECT ownerUserId, routingWakeId
+           FROM work_items
+           WHERE id = ?1 AND state = 'open'
+             AND deliveryOwnerSessionKey IS NULL AND routingWakeId IS NOT NULL
+           """,
+           [work_item_id]
+         ) do
+      [[owner_user_id, wake_id]] when is_binary(owner_user_id) and is_binary(wake_id) ->
+        owner_session_key = Tightbeam.Org.personal_session_key(owner_user_id)
+
+        Txn.q(
+          txn,
+          """
+          SELECT 1 FROM wakes
+          WHERE wakeId = ?1 AND work_item_id = ?2
+            AND origin = 'process:tightbeam' AND consumer = 'prompt'
+            AND sessionKey = ?3 AND state IN ('pending', 'fired')
+          LIMIT 1
+          """,
+          [wake_id, work_item_id, owner_session_key]
+        ) == [[1]]
+
+      _ ->
+        false
+    end
+  end
+
+  defp ownerless_fired_rumination_prechecked?(call, work_item_id, "dispatch") do
+    case Map.get(call, :__tb_ownerless_fired_rumination_precheck__) do
+      {:ownerless_fired_rumination, token, ^work_item_id, caller_session}
+      when is_reference(token) ->
+        Map.get(call, :principal) == {:session, caller_session}
+
+      _ ->
+        false
+    end
+  end
+
+  defp ownerless_fired_rumination_prechecked?(_call, _work_item_id, _verb), do: false
 
   defp dispatch_result(db, call) do
     case {call.params[:work_item_id], call.principal} do
@@ -1471,7 +1558,6 @@ defmodule Tightbeam.Assignments do
       end
     end
   rescue
-    error in UnknownWorkItem -> error("unknown_work_item", Exception.message(error))
     error in UnknownReviewTarget -> error("unknown_review_target", Exception.message(error))
   end
 
@@ -1847,32 +1933,32 @@ defmodule Tightbeam.Assignments do
   end
 
   defp create_assignment(txn, call, owner, key, files, verb) do
-    case Txn.q(txn, "SELECT state, harness, provider FROM sessions WHERE sessionKey = ?1", [
-           call.session_key
-         ]) do
-      [["retired", _harness, _provider]] ->
+    case Txn.q(
+           txn,
+           "SELECT state, harness, provider, archetype FROM sessions WHERE sessionKey = ?1",
+           [
+             call.session_key
+           ]
+         ) do
+      [["retired", _harness, _provider, _archetype]] ->
         error("session_retired", "assignments require an active holder session")
 
-      [["active", harness, provider]] ->
+      [["active", harness, provider, target_archetype]] ->
         # F7 amendment: dispatch persists workItemId exactly as assign does.
         work_item_id = call.params[:work_item_id]
 
-        case work_item_id do
-          nil ->
-            :ok
-
-          work_item_id ->
-            if Txn.q(txn, "SELECT 1 FROM work_items WHERE id = ?1", [work_item_id]) == [],
-              do: raise(UnknownWorkItem, work_item_id: work_item_id)
-        end
-
-        case Tightbeam.DeliveryResponsibilities.validate_assignment_delegation_in_txn(
-               txn,
-               call,
-               call.session_key
-             ) do
-          :ok -> :ok
-          %{code: _} = error -> throw({:delivery_delegation_error, error})
+        if ownerless_fired_rumination_prechecked?(call, work_item_id, verb) do
+          :ok
+        else
+          case Tightbeam.DeliveryResponsibilities.check_staffing_owner_in_txn(
+                 txn,
+                 call,
+                 target_session_key: call.session_key,
+                 target_archetype: target_archetype
+               ) do
+            :ok -> :ok
+            %{code: _} = error -> throw({:delivery_owner_error, error})
+          end
         end
 
         reviews_assignment_id =
@@ -1996,13 +2082,6 @@ defmodule Tightbeam.Assignments do
 
         assignment = fetch_assignment!(txn, id)
 
-        :ok =
-          Tightbeam.DeliveryResponsibilities.record_assignment_delegation_in_txn(
-            txn,
-            call,
-            assignment
-          )
-
         append_assignment_marker(txn, assignment, :opened)
 
         if succeeds_assignment_id do
@@ -2035,7 +2114,7 @@ defmodule Tightbeam.Assignments do
     {:successor_error, error} ->
       error
 
-    {:delivery_delegation_error, error} ->
+    {:delivery_owner_error, error} ->
       error
   end
 

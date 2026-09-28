@@ -74,6 +74,7 @@ defmodule Tightbeam.Dispatch do
   @spec dispatch(GenServer.server(), handlers(), call()) ::
           {:ok, map()} | {:error, map()} | {:decision_pending, String.t()}
   def dispatch(db \\ Tightbeam.DB, handlers, call) do
+    call = Map.delete(call, :__tb_ownerless_fired_rumination_precheck__)
     verb = Map.fetch!(call, :verb)
     origin = Map.fetch!(call, :origin)
     principal = Map.get(call, :principal)
@@ -82,6 +83,17 @@ defmodule Tightbeam.Dispatch do
     case bracket_precheck(db, call, verb) do
       :proceed ->
         dispatch_through_rail(db, handlers, call, verb, origin, principal, session_key)
+
+      {:proceed, {:ownerless_fired_rumination, _token, _work_item_id, _caller_session} = receipt} ->
+        dispatch_through_rail(
+          db,
+          handlers,
+          Map.put(call, :__tb_ownerless_fired_rumination_precheck__, receipt),
+          verb,
+          origin,
+          principal,
+          session_key
+        )
 
       {:replay, assignment} ->
         # A keyed replay bypasses the rail entirely (statute inertness): the
