@@ -101,6 +101,7 @@ defmodule Tightbeam.Gateway do
     TerminalCredentialFailure,
     Unroutable,
     Wakes,
+    WorkspaceCleanup,
     WorkItems,
     WorkState
   }
@@ -8959,11 +8960,19 @@ defmodule Tightbeam.Gateway do
 
     cond do
       prior && prior.session_key == call.session_key ->
-        retire_replay_observation(db, call, %{
-          deleted_session_key: call.session_key,
-          retired_session_keys: retired_subtree_keys(db, call.session_key),
-          deferred: []
-        })
+        retired_keys = retired_subtree_keys(db, call.session_key)
+
+        retire_replay_with_cleanup(
+          config,
+          db,
+          call,
+          %{
+            deleted_session_key: call.session_key,
+            retired_session_keys: retired_keys,
+            deferred: []
+          },
+          retired_keys
+        )
 
       true ->
         case Org.get(db, call.session_key) do
@@ -9024,19 +9033,27 @@ defmodule Tightbeam.Gateway do
                 end)
               end)
 
-              reap_retired_sessions(config, db, Enum.map(result.retired, & &1.session_key))
+              cleanup_reports =
+                reap_retired_sessions(config, db, Enum.map(result.retired, & &1.session_key))
 
               %{
                 deleted_session_key: session.session_key,
                 retired_session_keys: Enum.map(result.retired, & &1.session_key),
-                deferred: result.deferred
+                deferred: result.deferred,
+                workspace_cleanup: cleanup_reports
               }
             else
-              retire_replay_observation(db, call, %{
-                deleted_session_key: session.session_key,
-                retired_session_keys: [],
-                deferred: []
-              })
+              retire_replay_with_cleanup(
+                config,
+                db,
+                call,
+                %{
+                  deleted_session_key: session.session_key,
+                  retired_session_keys: [],
+                  deferred: []
+                },
+                retired_subtree_keys(db, session.session_key)
+              )
             end
 
           _ ->
@@ -9052,6 +9069,46 @@ defmodule Tightbeam.Gateway do
       end)
 
     result
+  end
+
+  defp retire_replay_with_cleanup(config, db, call, result, session_keys) do
+    result = retire_replay_observation(db, call, result)
+    reports = retry_incomplete_retired_workspaces(config, db, session_keys)
+
+    if reports == [], do: result, else: Map.put(result, :workspace_cleanup, reports)
+  end
+
+  defp retry_incomplete_retired_workspaces(config, db, session_keys) do
+    Enum.flat_map(session_keys, fn session_key ->
+      case Org.get(db, session_key) do
+        %{state: "retired"} ->
+          if last_workspace_cleanup_incomplete?(db, session_key) do
+            [cleanup_retired_workspace(config, db, session_key)]
+          else
+            []
+          end
+
+        _ ->
+          []
+      end
+    end)
+  end
+
+  defp last_workspace_cleanup_incomplete?(db, session_key) do
+    case DB.query(
+           db,
+           """
+           SELECT kind FROM lifecycle_events
+           WHERE subject=?1
+             AND kind IN ('retired_workspace_cleanup_completed',
+                          'retired_workspace_cleanup_incomplete')
+           ORDER BY id DESC LIMIT 1
+           """,
+           [session_key]
+         ) do
+      {:ok, [["retired_workspace_cleanup_incomplete"]]} -> true
+      _ -> false
+    end
   end
 
   defp critical_result(config, db, call) do
@@ -9229,56 +9286,102 @@ defmodule Tightbeam.Gateway do
   # harness SID is closed independently and the adapter itself is closed only
   # when no active session still shares that key. Every operation is guarded:
   # an absent/dead adapter can never turn a committed retire into a failure.
-  defp reap_retired_sessions(_config, _db, []), do: :ok
+  defp reap_retired_sessions(_config, _db, []), do: []
 
   defp reap_retired_sessions(config, db, session_keys) do
     coordinator = Map.get(config, :adapter_coordinator, Tightbeam.AdapterCoordinator)
 
-    Enum.each(session_keys, &archive_retired_workspace(config, db, &1))
+    cleanup_reports = Enum.map(session_keys, &cleanup_retired_workspace(config, db, &1))
 
-    session_keys
-    |> Enum.flat_map(fn session_key ->
-      with session when not is_nil(session) <- Org.get(db, session_key),
-           %{harness_session_id: sid} <- Org.current_pointer(db, session_key) do
-        [
-          %{
-            session_key: session_key,
-            sid: sid,
-            key: {Harness.parse!(session.harness).id(), "shared", session.host}
-          }
-        ]
-      else
-        _ -> []
-      end
-    end)
-    |> Enum.group_by(& &1.key)
-    |> Enum.each(fn {key, retired} -> reap_adapter_sessions(db, coordinator, key, retired) end)
+    try do
+      session_keys
+      |> Enum.flat_map(fn session_key ->
+        with session when not is_nil(session) <- Org.get(db, session_key),
+             %{harness_session_id: sid} <- Org.current_pointer(db, session_key) do
+          [
+            %{
+              session_key: session_key,
+              sid: sid,
+              key: {Harness.parse!(session.harness).id(), "shared", session.host}
+            }
+          ]
+        else
+          _ -> []
+        end
+      end)
+      |> Enum.group_by(& &1.key)
+      |> Enum.each(fn {key, retired} -> reap_adapter_sessions(db, coordinator, key, retired) end)
+    rescue
+      exception -> best_effort_failed("reap_retired_sessions", :error, exception, __STACKTRACE__)
+    catch
+      :exit, reason -> best_effort_failed("reap_retired_sessions", :exit, reason, __STACKTRACE__)
+    end
 
-    :ok
-  rescue
-    exception -> best_effort_failed("reap_retired_sessions", :error, exception, __STACKTRACE__)
-  catch
-    :exit, reason -> best_effort_failed("reap_retired_sessions", :exit, reason, __STACKTRACE__)
+    cleanup_reports
   end
 
-  defp archive_retired_workspace(config, db, session_key) do
-    with session when not is_nil(session) <- Org.get(db, session_key) do
-      host = Placement.hosts(config.base_dir, db)[session.host]
+  defp cleanup_retired_workspace(config, db, session_key) do
+    case Org.get(db, session_key) do
+      nil ->
+        retirement_cleanup_failure(db, session_key, :retired_session_missing)
 
-      # Remote workspaces are derivable but not locally accessible. Reap has
-      # no remote workspace-removal mechanism, so v1 flips their rows only.
-      workspace_path =
-        if host && host.ssh == nil,
-          do: Placement.workdir_path(config, session),
-          else: nil
+      session ->
+        hosts = Placement.hosts(config.base_dir, db)
 
-      Artifacts.archive_session(
+        case hosts[session.host] do
+          %{ssh: ssh} = host when is_nil(ssh) or (is_binary(ssh) and ssh != "") ->
+            WorkspaceCleanup.reap(db,
+              session_key: session_key,
+              host_name: session.host,
+              host: host,
+              hosts: hosts,
+              workspace: Placement.workdir_path(config, session),
+              runner: Map.get(config, :workspace_cleanup_runner),
+              runner_timeout_ms:
+                Map.get(
+                  config,
+                  :workspace_cleanup_timeout_ms,
+                  WorkspaceCleanup.default_runner_timeout_ms()
+                )
+            )
+
+          nil ->
+            retirement_cleanup_failure(db, session_key, {:retirement_host_unknown, session.host})
+        end
+    end
+  rescue
+    error ->
+      retirement_cleanup_failure(db, session_key, {:retired_workspace_cleanup_failed, error})
+  catch
+    kind, reason ->
+      retirement_cleanup_failure(
         db,
         session_key,
-        workspace_path,
-        Path.join(config.base_dir, "archive")
+        {:retired_workspace_cleanup_failed, kind, reason}
       )
-    end
+  end
+
+  defp retirement_cleanup_failure(db, session_key, reason) do
+    report = %{
+      status: "incomplete",
+      session_key: session_key,
+      removed_paths: [],
+      removed_paths_complete: false,
+      result_confirmed: false,
+      blockers: [%{reason: "retired_workspace_cleanup_failed", detail: inspect(reason)}]
+    }
+
+    record_retirement_cleanup_failure(db, session_key, reason)
+    report
+  end
+
+  defp record_retirement_cleanup_failure(db, session_key, reason) do
+    EventLog.lifecycle(
+      db,
+      "retired_workspace_cleanup_incomplete",
+      session_key,
+      describe_error(reason)
+    )
   rescue
     exception ->
       best_effort_failed("archive_retired_workspace", :error, exception, __STACKTRACE__)

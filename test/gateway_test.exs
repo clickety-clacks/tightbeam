@@ -898,7 +898,8 @@ defmodule Tightbeam.GatewayTest do
     assert_receive {:DOWN, ^monitor, :process, ^adapter, :normal}
   end
 
-  test "reap archives a local workspace with artifacts before adapter teardown", ctx do
+  test "retirement removes unregistered local files and preserves registered file and directory paths",
+       ctx do
     ensure_global_registry()
 
     base_dir =
@@ -918,8 +919,16 @@ defmodule Tightbeam.GatewayTest do
     session = Org.get(ctx.db, session.session_key)
     workspace = Placement.workdir_path(%{base_dir: base_dir, db: ctx.db}, session)
     artifact_path = Path.join(workspace, "specs/banana.md")
+    checkout_file = Path.join(workspace, "checkout/.git/HEAD")
+    checkout_build = Path.join(workspace, "checkout/target/build/output.bin")
+    unregistered_file = Path.join(workspace, "scratch.txt")
     File.mkdir_p!(Path.dirname(artifact_path))
+    File.mkdir_p!(Path.dirname(checkout_file))
+    File.mkdir_p!(Path.dirname(checkout_build))
     File.write!(artifact_path, "banana")
+    File.write!(checkout_file, "ref: refs/heads/main")
+    File.write!(checkout_build, "generated")
+    File.write!(unregistered_file, "remove me")
 
     {:ok, _} =
       DB.query(
@@ -931,7 +940,7 @@ defmodule Tightbeam.GatewayTest do
         """
       )
 
-    for message_id <- ~w(msg_banana_artifact msg_external_artifact) do
+    for message_id <- ~w(msg_banana_artifact msg_checkout_artifact msg_external_artifact) do
       {:ok, _} =
         DB.query(
           ctx.db,
@@ -957,6 +966,19 @@ defmodule Tightbeam.GatewayTest do
         }
       })
 
+    checkout_artifact =
+      Artifacts.record(ctx.db, %{
+        principal: {:session, session.session_key},
+        session_key: session.session_key,
+        recorded_message_id: "msg_checkout_artifact",
+        params: %{
+          kind: "data",
+          title: "Checkout",
+          origin_path: Path.join(workspace, "checkout"),
+          work_item_id: "wi_banana"
+        }
+      })
+
     external =
       Artifacts.record(ctx.db, %{
         principal: {:session, session.session_key},
@@ -971,7 +993,12 @@ defmodule Tightbeam.GatewayTest do
       })
 
     result =
-      Gateway.handlers(%{db: ctx.db, base_dir: base_dir, wake_tick_ms: 1_000})["retire"].(%{
+      Gateway.handlers(%{
+        db: ctx.db,
+        base_dir: base_dir,
+        wake_tick_ms: 1_000,
+        workspace_cleanup_runner: &Tightbeam.WorkspaceCleanup.system_runner/3
+      })["retire"].(%{
         origin: "user:flynn",
         principal: {:user, "flynn"},
         session_key: session.session_key,
@@ -979,17 +1006,411 @@ defmodule Tightbeam.GatewayTest do
       })
 
     assert result.retired_session_keys == [session.session_key]
-    refute File.exists?(workspace)
+    assert [%{status: "completed"} = cleanup] = result.workspace_cleanup
+    assert File.dir?(workspace)
+    assert File.read!(artifact_path) == "banana"
+    assert File.read!(checkout_file) == "ref: refs/heads/main"
+    assert File.read!(checkout_build) == "generated"
+    refute File.exists?(unregistered_file)
 
-    [archive_dir] = Path.wildcard(Path.join(base_dir, "archive/artifact_writer-*"))
-    archived = Artifacts.get(ctx.db, artifact.artifact_id)
-    assert archived.state == "archived"
-    assert archived.home == Path.join(archive_dir, "specs/banana.md")
-    assert File.read!(archived.home) == "banana"
+    unchanged = Artifacts.get(ctx.db, artifact.artifact_id)
+    assert unchanged.state == "in-workspace"
+    assert unchanged.home == nil
+
+    retained_directory = Artifacts.get(ctx.db, checkout_artifact.artifact_id)
+    assert retained_directory.state == "in-workspace"
+    assert retained_directory.origin_path == Path.join(workspace, "checkout")
 
     unchanged_external = Artifacts.get(ctx.db, external.artifact_id)
     assert unchanged_external.state == "in-workspace"
     assert unchanged_external.home == nil
+
+    assert "scratch.txt" in cleanup.removed_paths
+
+    assert Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
+             event.kind == "retired_workspace_cleanup_completed" and
+               event.subject == session.session_key and
+               JSON.decode!(event.detail)["removed_paths"] == cleanup.removed_paths
+           end)
+  end
+
+  test "retirement dispatches remote cleanup through the configured SSH alias", ctx do
+    ensure_global_registry()
+    fixture = remote_cleanup_fixture(ctx.db, "success")
+    report_path = Path.join(fixture.workspace, "reports/remote.md")
+    checkout_file = Path.join(fixture.workspace, "registered-checkout/.git/HEAD")
+    checkout_output = Path.join(fixture.workspace, "registered-checkout/target/build.bin")
+    unregistered_file = Path.join(fixture.workspace, "scratch.txt")
+    File.mkdir_p!(Path.dirname(report_path))
+    File.mkdir_p!(Path.dirname(checkout_file))
+    File.mkdir_p!(Path.dirname(checkout_output))
+    File.write!(report_path, "remote report")
+    File.write!(checkout_file, "ref: refs/heads/main")
+    File.write!(checkout_output, "preserve the registered directory subtree")
+    File.write!(unregistered_file, "remove me")
+
+    report = remote_artifact(ctx.db, fixture, "report", "reports/remote.md")
+    checkout = remote_artifact(ctx.db, fixture, "checkout", "registered-checkout")
+
+    parent = self()
+
+    fake_ssh = fn invocation, script, input ->
+      send(parent, {:remote_cleanup_invocation, invocation})
+      Tightbeam.WorkspaceCleanup.system_runner(["sh", "-c", script], script, input)
+    end
+
+    result =
+      Gateway.handlers(%{
+        db: ctx.db,
+        base_dir: fixture.base_dir,
+        wake_tick_ms: 1_000,
+        workspace_cleanup_runner: fake_ssh
+      })["retire"].(%{
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        session_key: fixture.session.session_key,
+        params: %{}
+      })
+
+    assert result.retired_session_keys == [fixture.session.session_key]
+    assert [%{status: "completed"} = cleanup] = result.workspace_cleanup
+    assert_receive {:remote_cleanup_invocation, invocation}
+    assert Enum.take(invocation, 1) == ["ssh"]
+    assert "retire-success" in invocation
+    assert "ServerAliveInterval=5" in invocation
+    assert "ServerAliveCountMax=2" in invocation
+    assert File.read!(report_path) == "remote report"
+    assert File.read!(checkout_file) == "ref: refs/heads/main"
+    assert File.read!(checkout_output) == "preserve the registered directory subtree"
+    refute File.exists?(unregistered_file)
+    assert Artifacts.get(ctx.db, report.artifact_id).state == "in-workspace"
+    assert Artifacts.get(ctx.db, checkout.artifact_id).state == "in-workspace"
+    assert "scratch.txt" in cleanup.removed_paths
+
+    assert Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
+             event.kind == "retired_workspace_cleanup_completed" and
+               event.subject == fixture.session.session_key
+           end)
+  end
+
+  test "remote cleanup reports SSH failure without claiming removal", ctx do
+    ensure_global_registry()
+    fixture = remote_cleanup_fixture(ctx.db, "failure")
+    retained_path = Path.join(fixture.workspace, "reports/remote.md")
+    File.mkdir_p!(Path.dirname(retained_path))
+    File.write!(retained_path, "retained after failed dispatch")
+    artifact = remote_artifact(ctx.db, fixture, "report", "reports/remote.md")
+    parent = self()
+
+    result =
+      Gateway.handlers(%{
+        db: ctx.db,
+        base_dir: fixture.base_dir,
+        wake_tick_ms: 1_000,
+        workspace_cleanup_runner: fn invocation, _script, _input ->
+          send(parent, {:remote_cleanup_invocation, invocation})
+          {"connection refused", 255}
+        end
+      })["retire"].(%{
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        session_key: fixture.session.session_key,
+        params: %{}
+      })
+
+    assert [
+             %{
+               status: "incomplete",
+               removed_paths: [],
+               removed_paths_complete: false,
+               result_confirmed: false,
+               command_exit: 255
+             } = cleanup
+           ] = result.workspace_cleanup
+
+    assert_receive {:remote_cleanup_invocation, invocation}
+    assert "retire-failure" in invocation
+    assert File.read!(retained_path) == "retained after failed dispatch"
+    assert Artifacts.get(ctx.db, artifact.artifact_id).state == "in-workspace"
+
+    assert Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
+             event.kind == "retired_workspace_cleanup_incomplete" and
+               event.subject == fixture.session.session_key and
+               JSON.decode!(event.detail)["status"] == cleanup.status
+           end)
+  end
+
+  test "a hung cleanup runner times out outside the database owner", ctx do
+    ensure_global_registry()
+    fixture = remote_cleanup_fixture(ctx.db, "timeout")
+    scratch = Path.join(fixture.workspace, "scratch.txt")
+    File.write!(scratch, "keep until the runner confirms cleanup")
+    parent = self()
+
+    handler =
+      Gateway.handlers(%{
+        db: ctx.db,
+        base_dir: fixture.base_dir,
+        wake_tick_ms: 1_000,
+        workspace_cleanup_timeout_ms: 2_000,
+        workspace_cleanup_runner: fn invocation, _script, _input ->
+          send(parent, {:cleanup_runner_started, invocation})
+
+          receive do
+            :never -> {"", 0}
+          end
+        end
+      })["retire"]
+
+    retirement =
+      Task.async(fn ->
+        handler.(%{
+          origin: "user:flynn",
+          principal: {:user, "flynn"},
+          session_key: fixture.session.session_key,
+          params: %{}
+        })
+      end)
+
+    assert_receive {:cleanup_runner_started, invocation}, 1_000
+    assert "retire-timeout" in invocation
+
+    database_read = Task.async(fn -> DB.query(ctx.db, "SELECT 1") end)
+    database_result = Task.yield(database_read, 500)
+    if is_nil(database_result), do: Task.shutdown(database_read, :brutal_kill)
+    assert {:ok, {:ok, [[1]]}} = database_result
+
+    rejected_late_artifact = remote_artifact(ctx.db, fixture, "late", "reports/late.md")
+    assert rejected_late_artifact.code == "session_not_active"
+
+    result = Task.await(retirement, 3_000)
+
+    assert [
+             %{status: "incomplete", removed_paths_complete: false, result_confirmed: false} =
+               cleanup
+           ] =
+             result.workspace_cleanup
+
+    assert Enum.any?(cleanup.blockers, &(&1.reason == "cleanup_runner_timeout"))
+    assert File.read!(scratch) == "keep until the runner confirms cleanup"
+  end
+
+  test "cleanup fails closed when an artifact path resolves with different spelling", ctx do
+    ensure_global_registry()
+    fixture = remote_cleanup_fixture(ctx.db, "path-spelling")
+    differently_spelled_path = Path.join(fixture.workspace, "reports/report.md")
+    registered_path = "reports/Report.md"
+    File.mkdir_p!(Path.dirname(differently_spelled_path))
+    File.write!(differently_spelled_path, "registered path must not be removed")
+    remote_artifact(ctx.db, fixture, "path-spelling", registered_path)
+
+    result =
+      Gateway.handlers(%{
+        db: ctx.db,
+        base_dir: fixture.base_dir,
+        wake_tick_ms: 1_000,
+        workspace_cleanup_runner: fn _invocation, script, input ->
+          Tightbeam.WorkspaceCleanup.system_runner(["sh", "-c", script], script, input)
+        end
+      })["retire"].(%{
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        session_key: fixture.session.session_key,
+        params: %{}
+      })
+
+    assert [%{status: "incomplete", removed_paths: []} = cleanup] = result.workspace_cleanup
+    assert File.read!(differently_spelled_path) == "registered path must not be removed"
+
+    if File.exists?(Path.join(fixture.workspace, registered_path)) do
+      assert Enum.any?(cleanup.blockers, &(&1.reason == "artifact_path_spelling_mismatch"))
+    else
+      assert Enum.any?(cleanup.blockers, &(&1.reason == "artifact_missing"))
+    end
+  end
+
+  test "replaying retirement retries incomplete cleanup and preserves registered artifacts",
+       ctx do
+    ensure_global_registry()
+    fixture = remote_cleanup_fixture(ctx.db, "retry")
+    protected_path = Path.join(fixture.workspace, "z-protected/keep.md")
+    first_removed = Path.join(fixture.workspace, "a-scratch.txt")
+    injected_failure = Path.join(fixture.workspace, "z-failure.txt")
+    outside = Path.join(fixture.base_dir, "outside/keep.md")
+    File.mkdir_p!(Path.dirname(protected_path))
+    File.mkdir_p!(Path.dirname(outside))
+    File.write!(protected_path, "registered content")
+    File.write!(first_removed, "removed during the partial attempt")
+    File.write!(injected_failure, "removed on retry")
+    File.write!(outside, "must remain outside the root")
+    artifact = remote_artifact(ctx.db, fixture, "retry", "z-protected/keep.md")
+    attempts = :atomics.new(1, [])
+
+    fake_ssh = fn invocation, script, input ->
+      case :atomics.add_get(attempts, 1, 1) do
+        1 ->
+          fail_one_entry = """
+          rm() {
+            case "$*" in
+              *z-failure.txt*) return 1 ;;
+              *) command rm "$@" ;;
+            esac
+          }
+          """
+
+          Tightbeam.WorkspaceCleanup.system_runner(
+            ["sh", "-c", fail_one_entry <> script],
+            script,
+            input
+          )
+
+        _ ->
+          assert "retire-retry" in invocation
+          Tightbeam.WorkspaceCleanup.system_runner(["sh", "-c", script], script, input)
+      end
+    end
+
+    handler =
+      Gateway.handlers(%{
+        db: ctx.db,
+        base_dir: fixture.base_dir,
+        wake_tick_ms: 1_000,
+        workspace_cleanup_runner: fake_ssh
+      })["retire"]
+
+    call = %{
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      session_key: fixture.session.session_key,
+      params: %{idempotency_key: "retry-cleanup-session"}
+    }
+
+    first = handler.(call)
+    assert [%{status: "incomplete"} = partial] = first.workspace_cleanup
+    assert "a-scratch.txt" in partial.removed_paths
+    refute File.exists?(first_removed)
+    assert File.exists?(injected_failure)
+    assert File.read!(protected_path) == "registered content"
+
+    retry = handler.(call)
+    assert retry.retired_session_keys == [fixture.session.session_key]
+    assert [%{status: "completed"} = completed] = retry.workspace_cleanup
+    assert File.dir?(fixture.workspace)
+    assert File.read!(protected_path) == "registered content"
+    refute File.exists?(injected_failure)
+    assert File.read!(outside) == "must remain outside the root"
+    assert Artifacts.get(ctx.db, artifact.artifact_id).state == "in-workspace"
+    assert 2 == :atomics.get(attempts, 1)
+
+    cleanup_events =
+      EventLog.lifecycle_events(ctx.db)
+      |> Enum.filter(&(&1.subject == fixture.session.session_key))
+      |> Enum.filter(
+        &(&1.kind in [
+            "retired_workspace_cleanup_completed",
+            "retired_workspace_cleanup_incomplete"
+          ])
+      )
+
+    assert Enum.map(cleanup_events, & &1.kind) == [
+             "retired_workspace_cleanup_incomplete",
+             "retired_workspace_cleanup_completed"
+           ]
+
+    assert "z-failure.txt" in completed.removed_paths
+  end
+
+  test "remote cleanup refuses ambiguous legacy artifact provenance before SSH", ctx do
+    ensure_global_registry()
+    fixture = remote_cleanup_fixture(ctx.db, "legacy")
+    artifact_path = Path.join(fixture.workspace, "reports/legacy.md")
+    File.mkdir_p!(Path.dirname(artifact_path))
+    File.write!(artifact_path, "legacy artifact")
+    artifact = remote_artifact(ctx.db, fixture, "legacy", "reports/legacy.md")
+
+    :ok = DB.execute(ctx.db, "DROP TRIGGER artifacts_origin_immutable")
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE artifacts SET originHost=NULL, originWorkspace=NULL WHERE artifactId=?1",
+        [artifact.artifact_id]
+      )
+
+    parent = self()
+
+    result =
+      Gateway.handlers(%{
+        db: ctx.db,
+        base_dir: fixture.base_dir,
+        wake_tick_ms: 1_000,
+        workspace_cleanup_runner: fn invocation, _script, _input ->
+          send(parent, {:unexpected_remote_cleanup, invocation})
+          {"", 0}
+        end
+      })["retire"].(%{
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        session_key: fixture.session.session_key,
+        params: %{}
+      })
+
+    assert [%{status: "incomplete", blockers: [%{reason: "artifact_origin_ambiguous"}]}] =
+             result.workspace_cleanup
+
+    assert File.read!(artifact_path) == "legacy artifact"
+    events = EventLog.lifecycle_events(ctx.db)
+
+    assert Enum.any?(events, fn event ->
+             event.kind == "retired_workspace_cleanup_incomplete" and
+               event.subject == fixture.session.session_key and
+               event.detail =~ "artifact_origin_ambiguous"
+           end)
+
+    refute_receive {:unexpected_remote_cleanup, _invocation}
+  end
+
+  test "remote cleanup preflight fails closed when a protected route changes to a symlink", ctx do
+    ensure_global_registry()
+    fixture = remote_cleanup_fixture(ctx.db, "race")
+    protected_file = Path.join(fixture.workspace, "z-protected/keep.md")
+    outside = Path.join(fixture.base_dir, "outside")
+    scratch = Path.join(fixture.workspace, "a-scratch.txt")
+    File.mkdir_p!(Path.dirname(protected_file))
+    File.mkdir_p!(outside)
+    File.write!(protected_file, "registered before the race")
+    File.write!(Path.join(outside, "keep.md"), "outside the workdir")
+    File.write!(scratch, "preserve when preflight detects the raced route")
+    artifact = remote_artifact(ctx.db, fixture, "protected", "z-protected/keep.md")
+    parent = self()
+
+    result =
+      Gateway.handlers(%{
+        db: ctx.db,
+        base_dir: fixture.base_dir,
+        wake_tick_ms: 1_000,
+        workspace_cleanup_runner: fn invocation, script, input ->
+          send(parent, {:remote_cleanup_invocation, invocation})
+          File.rm_rf!(Path.join(fixture.workspace, "z-protected"))
+          File.ln_s!(outside, Path.join(fixture.workspace, "z-protected"))
+          Tightbeam.WorkspaceCleanup.system_runner(["sh", "-c", script], script, input)
+        end
+      })["retire"].(%{
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        session_key: fixture.session.session_key,
+        params: %{}
+      })
+
+    assert [%{status: "incomplete", blockers: blockers} = cleanup] = result.workspace_cleanup
+    assert_receive {:remote_cleanup_invocation, invocation}
+    assert "retire-race" in invocation
+    assert Enum.any?(blockers, &(&1.reason == "symlink_route"))
+    assert File.lstat!(Path.join(fixture.workspace, "z-protected")).type == :symlink
+    assert File.read!(Path.join(outside, "keep.md")) == "outside the workdir"
+    assert Artifacts.get(ctx.db, artifact.artifact_id).state == "in-workspace"
+    assert cleanup.removed_paths == []
+    assert File.read!(scratch) == "preserve when preflight detects the raced route"
   end
 
   test "retiring with a live adapter sibling leaves the adapter up and records residency", ctx do
@@ -9393,6 +9814,84 @@ defmodule Tightbeam.GatewayTest do
       credential_kind: fn _provider -> :subscription end,
       patch_adapter: fn _harness, _path -> :ok end
     }
+  end
+
+  defp remote_cleanup_fixture(db, suffix) do
+    base_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "gateway_remote_cleanup_#{suffix}_#{System.unique_integer([:positive])}"
+      )
+
+    File.rm_rf!(base_dir)
+    File.mkdir_p!(base_dir)
+    on_exit(fn -> File.rm_rf!(base_dir) end)
+
+    host_name = "retire_#{suffix}"
+    ssh = "retire-#{suffix}"
+    work_item_id = "wi_remote_cleanup_#{suffix}"
+
+    {:ok, _host} =
+      Placement.register_host(db, host_name, %{ssh: ssh, base_dir: base_dir})
+
+    session = create_session(db, "remote-cleanup-#{suffix}", "flynn")
+
+    {:ok, _} =
+      DB.query(db, "UPDATE sessions SET host=?2 WHERE sessionKey=?1", [
+        session.session_key,
+        host_name
+      ])
+
+    session = Org.get(db, session.session_key)
+
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT INTO work_items (id, title, ownerUserId, createdByUser, createdAt)
+        VALUES (?1, 'Remote cleanup', 'flynn', 'flynn', 1)
+        """,
+        [work_item_id]
+      )
+
+    workspace = Placement.workdir_path(%{base_dir: base_dir, db: db}, session)
+    File.mkdir_p!(workspace)
+
+    %{
+      base_dir: base_dir,
+      host_name: host_name,
+      ssh: ssh,
+      work_item_id: work_item_id,
+      session: session,
+      workspace: workspace
+    }
+  end
+
+  defp remote_artifact(db, fixture, suffix, origin_path) do
+    message_id = "msg_remote_cleanup_#{suffix}"
+
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT INTO messages (id, sessionKey, role, content, timestamp, llmVisibleMessageId)
+        VALUES (?1, ?2, 'assistant', 'artifact-record', 1, ?1)
+        """,
+        [message_id, fixture.session.session_key]
+      )
+
+    Artifacts.record(db, %{
+      principal: {:session, fixture.session.session_key},
+      session_key: fixture.session.session_key,
+      artifact_base_dir: fixture.base_dir,
+      recorded_message_id: message_id,
+      params: %{
+        kind: "data",
+        title: "Remote cleanup #{suffix}",
+        origin_path: origin_path,
+        work_item_id: fixture.work_item_id
+      }
+    })
   end
 
   defp make_model_unknown(db, session_key) do

@@ -407,11 +407,11 @@ defmodule Tightbeam.WorkStateTest do
         params: %{}
       })
 
-    assert result == %{
+    assert %{
              deleted_session_key: "retiring",
              retired_session_keys: ["retiring"],
              deferred: []
-           }
+           } = result
 
     assert_receive {:retired, "retiring"}
     assert_receive {:push, first}
