@@ -89,6 +89,19 @@ defmodule Tightbeam.DeliveryResponsibilities do
 
   @doc false
   def legacy_owner_link_backfill_in_txn(%Txn{} = txn) do
+    case legacy_owner_history_table_count_in_txn(txn) do
+      0 ->
+        {:ok, []}
+
+      2 ->
+        backfill_legacy_owner_links_in_txn(txn)
+
+      count ->
+        {:error, {:incomplete_legacy_owner_history, count}}
+    end
+  end
+
+  defp backfill_legacy_owner_links_in_txn(txn) do
     txn
     |> Txn.q("SELECT id FROM work_items ORDER BY id")
     |> Enum.reduce_while({:ok, []}, fn [work_item_id], {:ok, backfill} ->
@@ -510,10 +523,17 @@ defmodule Tightbeam.DeliveryResponsibilities do
   # Legacy scope events are consulted only for the exact stamped backfill and
   # the held Gateway review-recipient path. Staffing reads the direct link.
   defp legacy_owner_history_present_in_txn?(txn) do
-    Txn.q(
-      txn,
-      "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('work_item_delivery_scope_events','delivery_scope_owner_events')"
-    ) == [[2]]
+    legacy_owner_history_table_count_in_txn(txn) == 2
+  end
+
+  defp legacy_owner_history_table_count_in_txn(txn) do
+    case Txn.q(
+           txn,
+           "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('work_item_delivery_scope_events','delivery_scope_owner_events')"
+         ) do
+      [[count]] -> count
+      rows -> raise "invalid legacy owner-history table-count result: #{inspect(rows)}"
+    end
   end
 
   defp legacy_current_owner_in_txn(txn, work_item_id) do

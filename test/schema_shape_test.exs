@@ -311,6 +311,28 @@ defmodule Tightbeam.SchemaShapeTest do
     refute table?(db, "schema_bootstrap_origin")
   end
 
+  test "the agent-reparent migration refuses partial legacy owner history without changing it", %{
+    db: db
+  } do
+    assert :ok = Schema.ensure_all(db)
+    assert :ok = DB.execute(db, @owner_link_history_ddl)
+    seed_owner_link_history!(db, "partial", "active", true)
+    assert :ok = DB.execute(db, "DROP TABLE delivery_scope_owner_events")
+    rewind_to_agent_reparent!(db)
+
+    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
+
+    assert error.message =~ "expected both legacy delivery-scope history tables or neither"
+    assert error.message =~ "found 1 of 2"
+    assert {:ok, [[@agent_reparent_shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+    refute "deliveryOwnerSessionKey" in table_columns(db, "work_items")
+    assert table?(db, "work_item_delivery_scope_events")
+    refute table?(db, "delivery_scope_owner_events")
+
+    assert {:ok, [["scope-partial"]]} =
+             DB.query(db, "SELECT eventId FROM work_item_delivery_scope_events")
+  end
+
   test "the exact agent-reparent migration refuses stale owner history without changing it", %{
     db: db
   } do

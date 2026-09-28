@@ -4480,6 +4480,11 @@ defmodule Tightbeam.Schema do
 
                    :ok
 
+                 {:error, {:incomplete_legacy_owner_history, count}} ->
+                   raise ShapeError,
+                     message:
+                       "incompatible owner-link predecessor: expected both legacy delivery-scope history tables or neither, found #{count} of 2"
+
                  {:error, %{work_item_id: item, session_key: session, state: state}} ->
                    raise ShapeError,
                      message:
