@@ -222,6 +222,39 @@ defmodule Tightbeam.Wire.RouterTest do
     assert JSON.decode!(messages.resp_body)["resource"] == "transcript messages"
   end
 
+  test "canonical session collection uses visible rows and the shared item serializer", ctx do
+    {:pending, _device} =
+      Devices.pair(ctx.db, %{
+        device_id: "collection-reader-device",
+        claimed_name: "Collection reader",
+        platform: nil,
+        model: nil
+      })
+
+    reader = Devices.approve(ctx.db, "collection-reader-device", "collection-reader")
+    visible = create_session(ctx.db, "collection-visible", "collection-reader")
+    _hidden = create_session(ctx.db, "collection-hidden", ctx.device.user_id)
+
+    catalog = %{
+      {"testhost", "claude"} => [
+        %{family: "fable", context: nil, efforts: ["medium"], provider: :anthropic}
+      ]
+    }
+
+    response =
+      conn(:get, "/api/sessions")
+      |> put_req_header("authorization", "Bearer " <> reader.token)
+      |> Router.call(Router.init(ctx.opts ++ [model_catalog: catalog]))
+
+    assert response.status == 200
+
+    body = JSON.decode!(response.resp_body)
+    assert body["schemaVersion"] == 1
+    assert body["resource"] == "sessions"
+    assert Enum.map(body["items"], & &1["sessionKey"]) == [visible.session_key]
+    assert body["items"] == [Tightbeam.StateResources.session(visible)]
+  end
+
   test "core device detail preserves authorization order and canonical envelope", ctx do
     opts = ctx.opts ++ [model_catalog: %{}]
 

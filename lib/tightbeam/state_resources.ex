@@ -519,6 +519,31 @@ defmodule Tightbeam.StateResources do
     end
   end
 
+  @doc "Return the session rows visible to a REST principal, in creation order."
+  def query_sessions(
+        db,
+        %{kind: kind, id: principal_id, is_admin: is_admin} = principal
+      )
+      when kind in ["user", "session"] and is_binary(principal_id) and is_boolean(is_admin) do
+    trace_core_detail(principal, {:au4_visibility, "sessions"})
+
+    observed_query(
+      db,
+      principal,
+      @session_select <>
+        """
+         WHERE (
+           ?1 = 1 OR
+           (?2 = 'session' AND sessions.sessionKey = ?3) OR
+           (?2 = 'user' AND sessions.ownerUserId = ?3)
+         )
+         ORDER BY sessions.createdAt ASC, sessions.sessionKey ASC
+        """,
+      [if(is_admin, do: 1, else: 0), kind, principal_id]
+    )
+    |> Enum.map(&session_query_row/1)
+  end
+
   def query_session(db, id) when is_binary(id) do
     case query(db, @session_select <> " WHERE sessions.sessionKey = ?1", [id]) do
       [row] -> session_query_row(row)

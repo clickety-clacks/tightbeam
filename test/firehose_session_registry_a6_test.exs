@@ -129,10 +129,11 @@ defmodule Tightbeam.Firehose.SessionRegistryA6Test do
     assert payload["rowVersion"] > before["rowVersion"]
     assert payload["harness"] == "codex"
 
-    assert payload["capabilities"]["setHarness"]["options"] == [
-             %{"title" => "claude", "value" => "claude", "enabled" => true},
-             %{"title" => "codex", "value" => "codex", "enabled" => false}
-           ]
+    assert payload["capabilities"]["setHarness"]["options"] ==
+             Enum.map(Tightbeam.Harness.all(), fn module ->
+               name = module.wire_name()
+               %{"title" => name, "value" => name, "enabled" => name != "codex"}
+             end)
 
     assert {:ok, rebuilt} =
              Tightbeam.Firehose.Rebuild.fetch(
@@ -331,7 +332,7 @@ defmodule Tightbeam.Firehose.SessionRegistryA6Test do
              end)
 
     notice = receive_notice()
-    assert notice["class"] == "session.updated"
+    assert notice["class"] == "session.harness_changed"
     assert notice["payload"] == StateResources.session(updated)
     assert notice["payload"] == canonical_session(ctx.db, ctx.worker.session_key)
     assert notice["payload"]["harness"] == "codex"
