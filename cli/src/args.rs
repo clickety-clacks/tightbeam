@@ -337,6 +337,8 @@ pub enum Command {
         spec_ref_sha256: Option<String>,
         clear_spec_ref: bool,
         priority: Option<String>,
+        body: Option<String>,
+        clear_body: bool,
     },
     WorkItemGet {
         identity: Identity,
@@ -788,6 +790,8 @@ COMMANDS:
       Patch an item's title, current governing spec, or priority. Omitted fields
       stay unchanged; --clear-spec-ref clears both spec-ref fields. Open cards
       inherit priority changes.
+      Body-only forms: --body <text>, --body=<text>, or --clear-body. A body
+      update replaces the whole text; --clear-body removes it.
   work-item-get <workItemId>
   work-item-delivery-scope-set <workItemId> --association-session <key>
       --association-revision <n> --expected-revision <n> --key <idempotencyKey>
@@ -1138,12 +1142,29 @@ struct Flags {
     positional: Vec<String>,
     flags: HashMap<String, String>,
     duplicates: HashSet<String>,
+    missing_values: HashSet<String>,
+    body_operations: Vec<BodyUpdateOperation>,
+}
+
+#[derive(Debug)]
+enum BodyUpdateOperation {
+    Replace(String),
+    Clear,
+    MissingReplacement,
 }
 
 fn split_args(args: Vec<String>) -> Flags {
+    if args
+        .first()
+        .is_some_and(|command| command == "work-item-update")
+    {
+        return split_work_item_update_args(args);
+    }
+
     let mut positional = Vec::new();
     let mut flags = HashMap::new();
     let mut duplicates = HashSet::new();
+    let mut missing_values = HashSet::new();
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
@@ -1153,11 +1174,18 @@ fn split_args(args: Vec<String>) -> Flags {
                     duplicates.insert(name.to_owned());
                 }
             } else {
-                let value = args.get(index + 1).cloned().unwrap_or_default();
+                let next = args.get(index + 1);
+                let missing = next.is_none();
+                if missing {
+                    missing_values.insert(name.to_owned());
+                }
+                let value = next.cloned().unwrap_or_default();
                 if flags.insert(name.to_owned(), value).is_some() {
                     duplicates.insert(name.to_owned());
                 }
-                index += 1;
+                if next.is_some() {
+                    index += 1;
+                }
             }
         } else {
             positional.push(arg.clone());
@@ -1168,6 +1196,91 @@ fn split_args(args: Vec<String>) -> Flags {
         positional,
         flags,
         duplicates,
+        missing_values,
+        body_operations: Vec::new(),
+    }
+}
+
+fn split_work_item_update_args(args: Vec<String>) -> Flags {
+    let mut positional = Vec::new();
+    let mut flags = HashMap::new();
+    let mut duplicates = HashSet::new();
+    let mut missing_values = HashSet::new();
+    let mut body_operations = Vec::new();
+    let mut index = 0;
+
+    while index < args.len() {
+        let arg = &args[index];
+
+        if let Some(body) = arg.strip_prefix("--body=") {
+            body_operations.push(BodyUpdateOperation::Replace(body.to_owned()));
+            if flags.insert("body".to_owned(), body.to_owned()).is_some() {
+                duplicates.insert("body".to_owned());
+            }
+            index += 1;
+            continue;
+        }
+
+        if arg == "--body" {
+            match args.get(index + 1) {
+                Some(body) if !body.starts_with("--") => {
+                    body_operations.push(BodyUpdateOperation::Replace(body.clone()));
+                    if flags.insert("body".to_owned(), body.clone()).is_some() {
+                        duplicates.insert("body".to_owned());
+                    }
+                    index += 2;
+                }
+                _ => {
+                    body_operations.push(BodyUpdateOperation::MissingReplacement);
+                    index += 1;
+                }
+            }
+            continue;
+        }
+
+        if arg == "--clear-body" {
+            body_operations.push(BodyUpdateOperation::Clear);
+            if flags
+                .insert("clear-body".to_owned(), String::new())
+                .is_some()
+            {
+                duplicates.insert("clear-body".to_owned());
+            }
+            index += 1;
+            continue;
+        }
+
+        if let Some(name) = arg.strip_prefix("--") {
+            if BOOLEAN_FLAGS.contains(&name) {
+                if flags.insert(name.to_owned(), String::new()).is_some() {
+                    duplicates.insert(name.to_owned());
+                }
+            } else {
+                let next = args.get(index + 1);
+                if next.is_none() {
+                    missing_values.insert(name.to_owned());
+                }
+                let value = next.cloned().unwrap_or_default();
+                if flags.insert(name.to_owned(), value).is_some() {
+                    duplicates.insert(name.to_owned());
+                }
+                if next.is_some() {
+                    index += 1;
+                }
+            }
+        } else {
+            positional.push(arg.clone());
+        }
+
+        index += 1;
+    }
+
+    Flags {
+        positional,
+        flags,
+        duplicates,
+        missing_values,
+        body_operations,
     }
 }
 
@@ -2441,6 +2554,43 @@ fn parse_with_optional_catalog(
             })
         }
         "work-item-update" => {
+            let metadata_usage = "usage: tightbeam work-item-update <workItemId> [--title \"...\"] [--spec-ref <name>] [--spec-sha256 <hex>] [--clear-spec-ref] [--priority <0..8>]";
+            let body_usage = "usage: tightbeam work-item-update <workItemId> (--body <text> | --body=<text> | --clear-body)";
+
+            if !parsed.body_operations.is_empty() {
+                const BODY_ALLOWED: &[&str] =
+                    &["body", "clear-body", "as", "as-user", "as-process"];
+
+                if parsed.positional.len() != 2
+                    || parsed.body_operations.len() != 1
+                    || flags
+                        .keys()
+                        .any(|flag| !BODY_ALLOWED.contains(&flag.as_str()))
+                {
+                    return Err(body_usage.to_owned());
+                }
+
+                let (body, clear_body) = match &parsed.body_operations[0] {
+                    BodyUpdateOperation::Replace(body) => (Some(body.clone()), false),
+                    BodyUpdateOperation::Clear => (None, true),
+                    BodyUpdateOperation::MissingReplacement => {
+                        return Err(body_usage.to_owned());
+                    }
+                };
+
+                return Ok(Command::WorkItemUpdate {
+                    identity: identity(flags)?,
+                    work_item_id: parsed.positional[1].clone(),
+                    title: None,
+                    spec_ref_name: None,
+                    spec_ref_sha256: None,
+                    clear_spec_ref: false,
+                    priority: None,
+                    body,
+                    clear_body,
+                });
+            }
+
             const ALLOWED: &[&str] = &[
                 "title",
                 "spec-ref",
@@ -2455,7 +2605,14 @@ fn parse_with_optional_catalog(
             if parsed.positional.len() != 2
                 || flags.keys().any(|flag| !ALLOWED.contains(&flag.as_str()))
             {
-                return Err("usage: tightbeam work-item-update <workItemId> [--title \"...\"] [--spec-ref <name>] [--spec-sha256 <hex>] [--clear-spec-ref] [--priority <0..8>]".to_owned());
+                return Err(metadata_usage.to_owned());
+            }
+
+            if ["title", "spec-ref", "spec-sha256", "priority"]
+                .iter()
+                .any(|flag| parsed.missing_values.contains(*flag))
+            {
+                return Err(metadata_usage.to_owned());
             }
 
             let clear_spec_ref = flags.contains_key("clear-spec-ref");
@@ -2477,6 +2634,8 @@ fn parse_with_optional_catalog(
                 spec_ref_sha256: flags.get("spec-sha256").cloned(),
                 clear_spec_ref,
                 priority: priority_flag(flags)?,
+                body: None,
+                clear_body: false,
             })
         }
         "work-item-get" => {
@@ -6081,5 +6240,135 @@ mod tests {
                 Err("usage: tightbeam breathing session|assignment|work-item <id>".to_owned())
             );
         }
+    }
+
+    #[test]
+    fn body_update_forms_are_disjoint_and_preserve_literal_values() {
+        assert!(matches!(
+            parse(strings(&["work-item-update", "wi_1", "--body", "alpha", "--as-user", "flynn"])),
+            Ok(Command::WorkItemUpdate { body: Some(body), clear_body: false, .. }) if body == "alpha"
+        ));
+        assert!(matches!(
+            parse(strings(&["work-item-update", "wi_1", "--body", "", "--as-user", "flynn"])),
+            Ok(Command::WorkItemUpdate { body: Some(body), clear_body: false, .. }) if body.is_empty()
+        ));
+        assert!(matches!(
+            parse(strings(&["work-item-update", "wi_1", "--body=", "--as-user", "flynn"])),
+            Ok(Command::WorkItemUpdate { body: Some(body), clear_body: false, .. }) if body.is_empty()
+        ));
+        assert!(matches!(
+            parse(strings(&["work-item-update", "wi_1", "--body=--clear-body"])),
+            Ok(Command::WorkItemUpdate { body: Some(body), clear_body: false, .. }) if body == "--clear-body"
+        ));
+        assert!(matches!(
+            parse(strings(&["work-item-update", "wi_1", "--body=--body"])),
+            Ok(Command::WorkItemUpdate { body: Some(body), clear_body: false, .. }) if body == "--body"
+        ));
+        assert!(matches!(
+            parse(strings(&[
+                "work-item-update",
+                "wi_1",
+                "--clear-body",
+                "--as-user",
+                "flynn"
+            ])),
+            Ok(Command::WorkItemUpdate {
+                body: None,
+                clear_body: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn body_update_rejects_mixed_or_repeated_operations_before_dispatch() {
+        let usage = "usage: tightbeam work-item-update <workItemId> (--body <text> | --body=<text> | --clear-body)";
+        for args in [
+            strings(&["work-item-update", "wi_1", "--body", "x", "--title", "bad"]),
+            strings(&["work-item-update", "wi_1", "--body", "x", "--clear-body"]),
+            strings(&["work-item-update", "wi_1", "--body", "x", "--body", "y"]),
+            strings(&["work-item-update", "wi_1", "--body=x", "--body=y"]),
+            strings(&[
+                "work-item-update",
+                "wi_1",
+                "--body",
+                "x",
+                "--bogus",
+                "value",
+            ]),
+            strings(&["work-item-update", "--body", "x"]),
+        ] {
+            assert_eq!(parse(args).unwrap_err(), usage);
+        }
+
+        for args in [
+            strings(&["work-item-update", "wi_1", "--body"]),
+            strings(&["work-item-update", "wi_1", "--body", "--clear-body"]),
+            strings(&["work-item-update", "wi_1", "--clear-body", "--clear-body"]),
+            strings(&["work-item-update", "wi_1", "--body", "--as-user", "flynn"]),
+            strings(&["work-item-update", "wi_1", "--clear-body", "--body=x"]),
+        ] {
+            assert_eq!(parse(args).unwrap_err(), usage);
+        }
+
+        let metadata_usage = "usage: tightbeam work-item-update <workItemId> [--title \"...\"] [--spec-ref <name>] [--spec-sha256 <hex>] [--clear-spec-ref] [--priority <0..8>]";
+        assert_eq!(
+            parse(strings(&["work-item-update", "wi_1", "--title"])).unwrap_err(),
+            metadata_usage
+        );
+        assert_eq!(
+            parse(strings(&[
+                "work-item-update",
+                "wi_1",
+                "--title",
+                "--priority",
+                "3"
+            ]))
+            .unwrap_err(),
+            metadata_usage
+        );
+    }
+
+    #[test]
+    fn body_flag_tokenization_does_not_change_other_commands() {
+        let inline = split_args(strings(&[
+            "work-item-create",
+            "--title",
+            "x",
+            "--name=value",
+            "tail",
+        ]));
+        assert_eq!(inline.flags.get("name=value"), Some(&"tail".to_owned()));
+
+        let clear = split_args(strings(&["work-item-get", "wi_1", "--clear-body", "next"]));
+        assert_eq!(clear.flags.get("clear-body"), Some(&"next".to_owned()));
+
+        let adjacent = split_args(strings(&[
+            "work-item-get",
+            "wi_1",
+            "--first",
+            "--second",
+            "value",
+        ]));
+        assert_eq!(adjacent.flags.get("first"), Some(&"--second".to_owned()));
+        assert!(!adjacent.flags.contains_key("second"));
+        assert!(!adjacent.missing_values.contains("first"));
+
+        let prefixed_note = split_args(strings(&["attest", "--note", "--see x"]));
+        assert_eq!(prefixed_note.flags.get("note"), Some(&"--see x".to_owned()));
+        assert!(!prefixed_note.missing_values.contains("note"));
+    }
+
+    #[test]
+    fn work_item_update_metadata_consumes_prefixed_values() {
+        let update = split_args(strings(&[
+            "work-item-update",
+            "wi_1",
+            "--title",
+            "--prefixed",
+        ]));
+        assert_eq!(update.flags.get("title"), Some(&"--prefixed".to_owned()));
+        assert!(!update.flags.contains_key("prefixed"));
+        assert!(!update.missing_values.contains("title"));
     }
 }

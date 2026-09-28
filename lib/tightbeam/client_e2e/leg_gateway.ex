@@ -363,7 +363,10 @@ defmodule Tightbeam.ClientE2E.LegGateway do
           end
 
         {:error, reason, restarted} ->
-          {:error, {:restart_boot_failed, reason, restarted.log_path}}
+          # Keep the half-booted process identity with the error. Callers own
+          # teardown even when readiness fails; returning only its log path can
+          # leave a gateway alive while cleanup removes its state directory.
+          {:error, {:restart_boot_failed, reason, restarted}}
       end
     end
   end

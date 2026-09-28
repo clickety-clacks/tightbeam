@@ -4,6 +4,36 @@ defmodule Tightbeam.Schema do
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
 
+  @work_item_body_objects [
+    %{
+      type: "table",
+      name: "work_item_bodies",
+      sql: """
+      CREATE TABLE work_item_bodies (
+        workItemId TEXT PRIMARY KEY REFERENCES work_items(id),
+        body TEXT,
+        updatedByUser TEXT REFERENCES users(userId),
+        updatedBySession TEXT REFERENCES sessions(sessionKey),
+        updatedAt INTEGER NOT NULL CHECK(updatedAt >= 0),
+        CHECK(body IS NULL OR (typeof(body) = 'text' AND length(CAST(body AS BLOB)) <= 65536)),
+        CHECK((updatedByUser IS NOT NULL) != (updatedBySession IS NOT NULL))
+      )
+      """
+    },
+    %{
+      type: "table",
+      name: "work_item_body_activation",
+      sql: """
+      CREATE TABLE work_item_body_activation (
+        id INTEGER PRIMARY KEY CHECK(id = 0),
+        activatedAt INTEGER NOT NULL CHECK(activatedAt >= 0),
+        cause TEXT NOT NULL CHECK(cause = 'schema_activation'),
+        principal TEXT NOT NULL CHECK(principal = 'process:tightbeam')
+      )
+      """
+    }
+  ]
+
   @schema_modules [
     Tightbeam.Ledger,
     Tightbeam.EventLog,
@@ -1446,6 +1476,7 @@ defmodule Tightbeam.Schema do
       module -> :ok = module.ensure_schema(db)
     end)
 
+    :ok = ensure_work_item_body_schema(db)
     :ok = upgrade_cursor_provider_v1_020(db)
     :ok = upgrade_cannot_proceed(db)
 
@@ -1466,6 +1497,84 @@ defmodule Tightbeam.Schema do
       {:error, error} -> raise error
     end
   end
+
+  @doc false
+  @spec ensure_work_item_body_schema(DB.server()) :: :ok
+  def ensure_work_item_body_schema(db) do
+    case DB.transaction(db, fn txn -> ensure_work_item_body_schema_in_txn(txn, []) end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "incompatible_work_item_body_v1: additive activation failed: #{Exception.message(error)}"
+    end
+  end
+
+  @doc false
+  def ensure_work_item_body_schema_in_txn(%Txn{} = txn, opts \\ []) do
+    present = Enum.filter(@work_item_body_objects, &owned_object_present?(txn, &1))
+
+    Enum.each(present, fn object ->
+      validate_work_item_body_object!(txn, object)
+    end)
+
+    case length(present) do
+      0 ->
+        Enum.with_index(@work_item_body_objects, 1)
+        |> Enum.each(fn {object, index} ->
+          :ok = Txn.exec(txn, object.sql)
+          validate_work_item_body_object!(txn, object)
+          maybe_interrupt_activation!(opts, index)
+        end)
+
+        Txn.q(
+          txn,
+          "INSERT INTO work_item_body_activation (id, activatedAt, cause, principal) VALUES (0, ?1, 'schema_activation', 'process:tightbeam')",
+          [System.system_time(:millisecond)]
+        )
+        |> then(fn result ->
+          maybe_interrupt_activation!(opts, 3)
+          result
+        end)
+
+      2 ->
+        case Txn.q(txn, "SELECT id, activatedAt, cause, principal FROM work_item_body_activation") do
+          [[0, activated_at, "schema_activation", "process:tightbeam"]]
+          when is_integer(activated_at) and activated_at >= 0 ->
+            :ok
+
+          _ ->
+            incompatible_work_item_body!("malformed activation row")
+        end
+
+      _ ->
+        incompatible_work_item_body!("incomplete additive shape")
+    end
+
+    :ok
+  end
+
+  defp validate_work_item_body_object!(txn, %{type: type, name: name, sql: expected}) do
+    case Txn.q(txn, "SELECT sql FROM sqlite_master WHERE type=?1 AND name=?2", [type, name]) do
+      [[actual]] when is_binary(actual) ->
+        if normalize_schema_sql(actual) != normalize_schema_sql(expected),
+          do: incompatible_work_item_body!("malformed object #{name}")
+
+      [] ->
+        incompatible_work_item_body!("missing object #{name}")
+
+      _ ->
+        incompatible_work_item_body!("duplicate object #{name}")
+    end
+  end
+
+  defp incompatible_work_item_body!(detail),
+    do: raise(ShapeError, message: "incompatible_work_item_body_v1: #{detail}")
 
   @doc false
   @spec ensure_supervision_liveness_v1_in_txn(Txn.t()) :: :ok
