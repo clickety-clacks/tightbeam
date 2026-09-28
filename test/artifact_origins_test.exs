@@ -155,6 +155,7 @@ defmodule Tightbeam.ArtifactOriginsTest do
       DROP TRIGGER artifacts_origin_immutable;
       ALTER TABLE artifacts DROP COLUMN originHost;
       ALTER TABLE artifacts DROP COLUMN originWorkspace;
+      ALTER TABLE identity_publication_markers DROP COLUMN denialDiagnostic;
       UPDATE schema_stamp SET shape='delivery-owner-reparent-v1-019';
       """)
 

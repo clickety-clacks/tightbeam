@@ -62,7 +62,7 @@ defmodule Tightbeam.AdminProjectionTest do
       assert {:ok, _} =
                DB.query(
                  db,
-                 "UPDATE schema_stamp SET shape='stale-turn-settlement-v1-019', stampedAt=1"
+                 "UPDATE schema_stamp SET shape='artifact-origin-v1-019', stampedAt=1"
                )
 
       assert {:ok, :ok} =
