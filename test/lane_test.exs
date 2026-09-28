@@ -786,7 +786,7 @@ defmodule Tightbeam.LaneTest do
 
     assert subject == Integer.to_string(seq)
 
-    assert Tightbeam.JSON.decode!(detail) == %{
+    assert JSON.decode!(detail) == %{
              "assignmentId" => "asg_stop_turn",
              "actor" => "user:t",
              "reason" => "replacement is waiting"
@@ -805,6 +805,12 @@ defmodule Tightbeam.LaneTest do
     {:ok, _} =
       DB.query(
         ctx.db,
+        "INSERT INTO users(userId,createdAt) VALUES ('t',1) ON CONFLICT(userId) DO NOTHING"
+      )
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
         """
         INSERT INTO assignments(id,subject,holderKey,openedByUser,openedAt)
         VALUES('asg_stop_race','stop race','k1','t',1)
@@ -815,8 +821,8 @@ defmodule Tightbeam.LaneTest do
       DB.query(
         ctx.db,
         """
-        INSERT INTO assignments(id,subject,holderKey,openedByUser,openedAt)
-        VALUES('asg_stop_closed','closed stop race','k1','t',2)
+        INSERT INTO assignments(id,subject,holderKey,openedBySession,openedAt)
+        VALUES('asg_stop_closed','closed stop race','k1','k2',2)
         """
       )
 
@@ -868,8 +874,8 @@ defmodule Tightbeam.LaneTest do
     assert %{state: "closed", outcome: "revoked"} =
              Tightbeam.Assignments.__handle__(ctx.db, "revoke-assignment", %{
                verb: "revoke-assignment",
-               principal: {:user, "t"},
-               origin: "user:t",
+               principal: {:session, "k2"},
+               origin: "agent:k2",
                params: %{
                  assignment_id: "asg_stop_closed",
                  reason: "fixture closed assignment"
@@ -880,7 +886,7 @@ defmodule Tightbeam.LaneTest do
              SessionLane.stop_assignment_turn(
                "k1",
                "asg_stop_closed",
-               {:user, "t"},
+               {:session, "k2"},
                "assignment was closed"
              )
 

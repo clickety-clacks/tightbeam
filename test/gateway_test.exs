@@ -5993,7 +5993,7 @@ defmodule Tightbeam.GatewayTest do
                event.kind == "assignment_turn_stopped"
              end)
 
-    assert Tightbeam.JSON.decode!(detail) == %{
+    assert JSON.decode!(detail) == %{
              "assignmentId" => "asg_gateway_stop",
              "actor" => "user:flynn",
              "reason" => "replacement is waiting"
