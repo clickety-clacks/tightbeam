@@ -43,6 +43,7 @@ defmodule Tightbeam.HarnessHealthRedeliveryRestart do
 
       [first, second, healthy] = sessions
       auth_error = %{"status" => 401, "error" => "unauthorized"}
+      interrupted_error = :interrupted_outcome_unknown
 
       source_turns =
         Enum.map(
@@ -126,6 +127,28 @@ defmodule Tightbeam.HarnessHealthRedeliveryRestart do
                  """
                )
 
+      # A parentless interrupted outcome uses the same once-only success
+      # fallback, and its persisted attempt must survive reopening this store.
+      interrupted_source =
+        fail_health_turn!(
+          db,
+          first,
+          "restart-interrupted-source",
+          "original interrupted prompt",
+          interrupted_error,
+          terminal: "failed_unknown"
+        )
+
+      _third_restore = restore_health_turn!(db, healthy, "restore-third")
+
+      assert {:ok, [[3]]} = DB.query(db, "SELECT COUNT(*) FROM health_redelivery_attempts")
+
+      assert {:ok, [[2]]} =
+               DB.query(
+                 db,
+                 "SELECT COUNT(*) FROM turns WHERE messageId='restart-interrupted-source'"
+               )
+
       GenServer.stop(db)
       {:ok, reopened} = DB.start_link(path: path, name: nil, guard_inputs: [])
 
@@ -143,8 +166,50 @@ defmodule Tightbeam.HarnessHealthRedeliveryRestart do
                    )
                  end)
 
-        assert {:ok, [[2]]} =
+        assert {:ok, [[3]]} =
                  DB.query(reopened, "SELECT COUNT(*) FROM health_redelivery_attempts")
+
+        assert {:ok, [[2]]} =
+                 DB.query(
+                   reopened,
+                   "SELECT COUNT(*) FROM health_redelivery_attempts " <>
+                     "WHERE failureClass='auth-dead' " <>
+                     "AND redeliveryTurnSeq IS NOT NULL"
+                 )
+
+        assert {:ok, [[1]]} =
+                 DB.query(
+                   reopened,
+                   "SELECT COUNT(*) FROM health_redelivery_attempts " <>
+                     "WHERE sessionKey=?1 AND sourceTurnSeq=?2 " <>
+                     "AND failureClass='interrupted-outcome-unknown' " <>
+                     "AND redeliveryTurnSeq IS NOT NULL",
+                   [first, interrupted_source.seq]
+                 )
+
+        assert {:ok, :ok} =
+                 DB.transaction(reopened, fn txn ->
+                   Wakes.record_health_redelivery_source_in_txn(
+                     txn,
+                     interrupted_source.seq,
+                     "interrupted-outcome-unknown"
+                   )
+                 end)
+
+        _fourth_restore = restore_health_turn!(reopened, healthy, "restore-fourth")
+
+        assert {:ok, [[2]]} =
+                 DB.query(
+                   reopened,
+                   "SELECT COUNT(*) FROM turns WHERE messageId='restart-interrupted-source'"
+                 )
+
+        assert {:ok, [[1]]} =
+                 DB.query(
+                   reopened,
+                   "SELECT COUNT(*) FROM turns WHERE messageId='restart-interrupted-source' " <>
+                     "AND status='queued'"
+                 )
 
         assert {:ok, [[second_restore_seq]]} =
                  DB.query(
@@ -197,7 +262,9 @@ defmodule Tightbeam.HarnessHealthRedeliveryRestart do
     end
   end
 
-  defp fail_health_turn!(db, session_key, message_id, prompt, reason) do
+  defp fail_health_turn!(db, session_key, message_id, prompt, reason, opts \\ []) do
+    terminal = Keyword.get(opts, :terminal, "failed")
+
     {:ok, source_seq} =
       Ledger.enqueue(db, %{
         session_key: session_key,
@@ -212,17 +279,34 @@ defmodule Tightbeam.HarnessHealthRedeliveryRestart do
 
     assert {:ok, post_commit} =
              DB.transaction(db, fn txn ->
-               assert Ledger.finish_in_txn(txn, source_seq, "failed", "HTTP 401",
+               assert Ledger.finish_in_txn(
+                        txn,
+                        source_seq,
+                        terminal,
+                        if(terminal == "failed_unknown",
+                          do: "interrupted: outcome unknown",
+                          else: "HTTP 401"
+                        ),
                         owner_lease: turn.owner_lease
                       )
 
-               HarnessHealth.observe_turn_failure_in_txn(
-                 txn,
-                 session,
-                 turn,
-                 :prompt,
-                 reason
-               )
+               if terminal == "failed_unknown" do
+                 HarnessHealth.observe_terminal_in_txn(
+                   txn,
+                   source_seq,
+                   "interrupted-outcome-unknown",
+                   "test terminal was interrupted; outcome unknown",
+                   "process:test"
+                 )
+               else
+                 HarnessHealth.observe_turn_failure_in_txn(
+                   txn,
+                   session,
+                   turn,
+                   :prompt,
+                   reason
+                 )
+               end
              end)
 
     if is_function(post_commit, 0), do: post_commit.()

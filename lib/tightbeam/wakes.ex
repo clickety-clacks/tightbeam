@@ -226,8 +226,9 @@ defmodule Tightbeam.Wakes do
     requestRef TEXT,
     failureClass TEXT NOT NULL CHECK(failureClass IN (
       'auth-dead','rate-limit-dead','adapter_unavailable','model_unavailable','task_crash',
-      'unclassified'
+      'interrupted-outcome-unknown','unclassified'
     )),
+    parentSessionKey TEXT REFERENCES sessions(sessionKey),
     restorationTurnSeq INTEGER REFERENCES turns(seq),
     redeliveryTurnSeq INTEGER UNIQUE REFERENCES turns(seq),
     createdAt INTEGER NOT NULL CHECK(createdAt >= 0),
@@ -3035,6 +3036,7 @@ defmodule Tightbeam.Wakes do
                "adapter_unavailable",
                "model_unavailable",
                "task_crash",
+               "interrupted-outcome-unknown",
                "unclassified"
              ] do
     case Txn.q(
@@ -3043,9 +3045,11 @@ defmodule Tightbeam.Wakes do
            SELECT t.sessionKey,t.messageId,t.wakeId,t.origin,t.prompt,t.roleRef,t.roleFallback,
                   t.assignmentId,t.jobRef,t.requestRef,s.harness,s.host
            FROM turns t JOIN sessions s ON s.sessionKey=t.sessionKey
-           WHERE t.seq=?1 AND t.status='failed' AND t.messageId IS NOT NULL
+           WHERE t.seq=?1 AND t.messageId IS NOT NULL
+             AND (t.status='failed' OR
+                  (t.status='failed_unknown' AND ?2='interrupted-outcome-unknown'))
            """,
-           [source_turn_seq]
+           [source_turn_seq, failure_class]
          ) do
       [
         [
@@ -3066,14 +3070,19 @@ defmodule Tightbeam.Wakes do
       when is_binary(source_harness) and is_binary(source_host) ->
         idempotency_key = health_redelivery_key(session_key, source_turn_seq)
 
+        parent_session_key =
+          if failure_class == "interrupted-outcome-unknown" do
+            interrupted_redelivery_parent_in_txn(txn, session_key, assignment_id)
+          end
+
         Txn.q(
           txn,
           """
           INSERT OR IGNORE INTO health_redelivery_attempts
             (idempotencyKey,sessionKey,sourceHarness,sourceHost,sourceMessageId,sourceTurnSeq,
              sourceWakeId,origin,prompt,roleRef,roleFallback,assignmentId,jobRef,requestRef,
-             failureClass,createdAt)
-          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
+             failureClass,parentSessionKey,createdAt)
+          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
           """,
           [
             idempotency_key,
@@ -3091,9 +3100,22 @@ defmodule Tightbeam.Wakes do
             job_ref,
             request_ref,
             failure_class,
+            parent_session_key,
             now()
           ]
         )
+
+        if Txn.changes(txn) == 1 and is_binary(parent_session_key) do
+          ask_interrupted_redelivery_parent_in_txn(
+            txn,
+            parent_session_key,
+            session_key,
+            source_turn_seq,
+            message_id,
+            origin,
+            prompt
+          )
+        end
 
         :ok
 
@@ -3103,6 +3125,73 @@ defmodule Tightbeam.Wakes do
       [_] ->
         :ok
     end
+  end
+
+  defp interrupted_redelivery_parent_in_txn(txn, source_session_key, assignment_id) do
+    assignment_parent =
+      if is_binary(assignment_id) do
+        case Txn.q(
+               txn,
+               """
+               SELECT parent.sessionKey
+               FROM assignments assignment
+               JOIN sessions parent ON parent.sessionKey=assignment.openedBySession
+               WHERE assignment.id=?1 AND parent.state='active'
+                 AND parent.sessionKey!=?2
+               """,
+               [assignment_id, source_session_key]
+             ) do
+          [[parent_session_key]] -> parent_session_key
+          _ -> nil
+        end
+      end
+
+    assignment_parent ||
+      case Txn.q(
+             txn,
+             """
+             SELECT parent.sessionKey
+             FROM sessions source
+             JOIN sessions parent
+               ON parent.sessionKey=#{Tightbeam.Org.current_parent_sql("source")}
+             WHERE source.sessionKey=?1 AND parent.state='active'
+               AND parent.sessionKey!=source.sessionKey
+             """,
+             [source_session_key]
+           ) do
+        [[parent_session_key]] -> parent_session_key
+        _ -> nil
+      end
+  end
+
+  defp ask_interrupted_redelivery_parent_in_txn(
+         txn,
+         parent_session_key,
+         source_session_key,
+         source_turn_seq,
+         message_id,
+         origin,
+         original_prompt
+       ) do
+    wake_id = "w_health_redelivery_parent_#{source_turn_seq}"
+
+    prompt =
+      "A turn in session #{source_session_key} ended with typed " <>
+        "interrupted-outcome-unknown. No automatic retry was queued. " <>
+        "Should the original message be redelivered?\n" <>
+        "Source turn: #{source_turn_seq}; message: #{message_id}; sender: #{origin}.\n" <>
+        "Original message:\n#{original_prompt}\n" <>
+        "If you want it retried, use the ordinary dispatch path for that session; " <>
+        "otherwise leave the failed turn unchanged."
+
+    schedule_in_txn(txn, %{
+      wake_id: wake_id,
+      session_key: parent_session_key,
+      origin: "health-redelivery-parent",
+      prompt: prompt,
+      due_at: now(),
+      summon: true
+    })
   end
 
   @doc false
@@ -3124,6 +3213,7 @@ defmodule Tightbeam.Wakes do
         WHERE a.sourceHarness=?1
           AND a.sourceHost=?2
           AND a.redeliveryTurnSeq IS NULL
+          AND a.parentSessionKey IS NULL
           AND NOT EXISTS (
             SELECT 1
             FROM harness_health_observations observation
@@ -3164,7 +3254,8 @@ defmodule Tightbeam.Wakes do
                "rate-limit-dead",
                "adapter_unavailable",
                "model_unavailable",
-               "task_crash"
+               "task_crash",
+               "interrupted-outcome-unknown"
              ] and is_map(restoration_turn) do
     restoration_turn_seq = Map.fetch!(restoration_turn, :seq)
 
@@ -3212,6 +3303,7 @@ defmodule Tightbeam.Wakes do
         AND observed.messageId IS NOT NULL
         AND a.failureClass=?2
         AND a.redeliveryTurnSeq IS NULL
+        AND a.parentSessionKey IS NULL
         AND NOT EXISTS (
           SELECT 1 FROM wake_retry_attempts retry
           WHERE retry.sourceTurnSeq=observed.seq AND retry.retryWakeId IS NOT NULL

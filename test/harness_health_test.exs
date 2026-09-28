@@ -1552,6 +1552,17 @@ defmodule Tightbeam.HarnessHealthTest do
       fail_health_turn!(ctx.db, ref.session, message_id, "original prompt", "auth expired")
     end)
 
+    fail_health_turn!(
+      ctx.db,
+      first.session,
+      "structured-interrupted-source",
+      "original interrupted prompt",
+      %{
+        "message" => "interrupted: outcome unknown",
+        "data" => %{"kind" => "synthetic-error"}
+      }
+    )
+
     assert [incident] = HarnessHealth.active(ctx.db)
     assert incident.failureClass == "auth-dead"
 
@@ -1564,7 +1575,8 @@ defmodule Tightbeam.HarnessHealthTest do
              DB.query(
                ctx.db,
                "SELECT COUNT(*) FROM turns WHERE messageId IN " <>
-                 "('text-source-1','text-source-2') AND status='queued'"
+                 "('text-source-1','text-source-2','structured-interrupted-source') " <>
+                 "AND status='queued'"
              )
   end
 
@@ -1585,14 +1597,6 @@ defmodule Tightbeam.HarnessHealthTest do
       "compaction-source",
       "original compaction prompt",
       %{"code" => -32001, "message" => "compaction failed"}
-    )
-
-    fail_health_turn!(
-      ctx.db,
-      first.session,
-      "interrupted-unknown-source",
-      "original interrupted prompt",
-      :interrupted_outcome_unknown
     )
 
     assert {:ok, [[2]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM health_redelivery_attempts")
@@ -1628,20 +1632,6 @@ defmodule Tightbeam.HarnessHealthTest do
                "SELECT COUNT(*) FROM turns WHERE messageId='compaction-source' AND status='queued'"
              )
 
-    assert {:ok, [[0]]} =
-             DB.query(
-               ctx.db,
-               "SELECT COUNT(*) FROM health_redelivery_attempts " <>
-                 "WHERE sourceMessageId='interrupted-unknown-source'"
-             )
-
-    assert {:ok, [[0]]} =
-             DB.query(
-               ctx.db,
-               "SELECT COUNT(*) FROM turns WHERE messageId='interrupted-unknown-source' " <>
-                 "AND status='queued'"
-             )
-
     healthy_session = Org.get(ctx.db, healthy.session)
 
     assert {:ok, :ok} =
@@ -1658,6 +1648,180 @@ defmodule Tightbeam.HarnessHealthTest do
                ctx.db,
                "SELECT COUNT(*) FROM turns WHERE messageId IN " <>
                  "('unclassified-source','compaction-source') AND status='queued'"
+             )
+  end
+
+  test "interrupted outcome without a parent redelivers once after same-harness success", ctx do
+    [failed, _, healthy | _] = ctx.sessions
+
+    source =
+      fail_health_turn!(
+        ctx.db,
+        failed.session,
+        "interrupted-parentless-source",
+        "original interrupted prompt",
+        :interrupted_outcome_unknown,
+        terminal: "failed_unknown"
+      )
+
+    assert {:ok, [["failed_unknown"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT status FROM turns WHERE seq=?1",
+               [source.seq]
+             )
+
+    assert {:ok, [["interrupted-outcome-unknown", nil]]} =
+             DB.query(
+               ctx.db,
+               "SELECT failureClass,parentSessionKey FROM health_redelivery_attempts " <>
+                 "WHERE sourceTurnSeq=?1",
+               [source.seq]
+             )
+
+    _restoration = restore_health_turn!(ctx.db, healthy.session, "interrupted-restoration")
+
+    assert {:ok,
+            [
+              [
+                "interrupted-parentless-source",
+                "agent:health-redelivery",
+                "original interrupted prompt"
+              ]
+            ]} =
+             DB.query(
+               ctx.db,
+               "SELECT messageId,origin,prompt FROM turns " <>
+                 "WHERE sessionKey=?1 AND status='queued'",
+               [failed.session]
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM health_redelivery_attempts " <>
+                 "WHERE sourceTurnSeq=?1 AND restorationTurnSeq IS NOT NULL " <>
+                 "AND redeliveryTurnSeq IS NOT NULL",
+               [source.seq]
+             )
+
+    _second_restoration =
+      restore_health_turn!(ctx.db, healthy.session, "interrupted-restoration-second")
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM turns WHERE sessionKey=?1 " <>
+                 "AND messageId='interrupted-parentless-source' AND status='queued'",
+               [failed.session]
+             )
+  end
+
+  test "interrupted outcome asks its active dispatcher or session parent", ctx do
+    [dispatched, parented, healthy | _] = ctx.sessions
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "UPDATE assignments SET openedBySession=?1 WHERE id=?2",
+               [ctx.main_session, dispatched.assignment]
+             )
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "UPDATE sessions SET spawnedBy=?1 WHERE sessionKey=?2",
+               [ctx.main_session, parented.session]
+             )
+
+    dispatched_source =
+      fail_health_turn!(
+        ctx.db,
+        dispatched.session,
+        "interrupted-dispatched-source",
+        "original dispatched prompt",
+        :interrupted_outcome_unknown,
+        assignment_id: dispatched.assignment
+      )
+
+    parented_source =
+      fail_health_turn!(
+        ctx.db,
+        parented.session,
+        "interrupted-parented-source",
+        "original parented prompt",
+        :interrupted_outcome_unknown,
+        assignment_id: parented.assignment
+      )
+
+    main_session = ctx.main_session
+
+    assert {:ok, [[^main_session], [^main_session]]} =
+             DB.query(
+               ctx.db,
+               "SELECT parentSessionKey FROM health_redelivery_attempts " <>
+                 "WHERE sourceTurnSeq IN (?1,?2) ORDER BY sourceTurnSeq",
+               [dispatched_source.seq, parented_source.seq]
+             )
+
+    assert {:ok, wake_rows} =
+             DB.query(
+               ctx.db,
+               "SELECT sessionKey,prompt FROM wakes " <>
+                 "WHERE origin='health-redelivery-parent' ORDER BY wakeId"
+             )
+
+    assert length(wake_rows) == 2
+
+    assert Enum.all?(wake_rows, fn [session_key, prompt] ->
+             session_key == ctx.main_session and
+               String.contains?(prompt, "Should the original message be redelivered?")
+           end)
+
+    assert Enum.any?(wake_rows, fn [_session_key, prompt] ->
+             String.contains?(prompt, "interrupted-dispatched-source") and
+               String.contains?(prompt, "original dispatched prompt")
+           end)
+
+    assert Enum.any?(wake_rows, fn [_session_key, prompt] ->
+             String.contains?(prompt, "interrupted-parented-source") and
+               String.contains?(prompt, "original parented prompt")
+           end)
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               Wakes.record_health_redelivery_source_in_txn(
+                 txn,
+                 dispatched_source.seq,
+                 "interrupted-outcome-unknown"
+               )
+             end)
+
+    _restoration = restore_health_turn!(ctx.db, healthy.session, "interrupted-parent-restoration")
+
+    assert {:ok, [[2]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE origin='health-redelivery-parent' " <>
+                 "AND sessionKey=?1",
+               [ctx.main_session]
+             )
+
+    assert {:ok, [[2]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM health_redelivery_attempts " <>
+                 "WHERE sourceTurnSeq IN (?1,?2) AND parentSessionKey=?3 " <>
+                 "AND redeliveryTurnSeq IS NULL",
+               [dispatched_source.seq, parented_source.seq, ctx.main_session]
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM turns WHERE messageId IN " <>
+                 "('interrupted-dispatched-source','interrupted-parented-source') " <>
+                 "AND status='queued'"
              )
   end
 
@@ -2066,13 +2230,16 @@ defmodule Tightbeam.HarnessHealthTest do
              )
   end
 
-  defp fail_health_turn!(db, session_key, message_id, prompt, reason) do
+  defp fail_health_turn!(db, session_key, message_id, prompt, reason, opts \\ []) do
+    terminal = Keyword.get(opts, :terminal, "failed")
+
     {:ok, source_seq} =
       Ledger.enqueue(db, %{
         session_key: session_key,
         message_id: message_id,
         origin: "agent:health-redelivery",
-        prompt: prompt
+        prompt: prompt,
+        assignment_id: Keyword.get(opts, :assignment_id)
       })
 
     {:ok, turn} = Ledger.claim_next(db, session_key, "health-redelivery-test")
@@ -2081,17 +2248,34 @@ defmodule Tightbeam.HarnessHealthTest do
 
     assert {:ok, post_commit} =
              DB.transaction(db, fn txn ->
-               assert Ledger.finish_in_txn(txn, source_seq, "failed", "HTTP 401",
+               assert Ledger.finish_in_txn(
+                        txn,
+                        source_seq,
+                        terminal,
+                        if(terminal == "failed_unknown",
+                          do: "interrupted: outcome unknown",
+                          else: "HTTP 401"
+                        ),
                         owner_lease: turn.owner_lease
                       )
 
-               HarnessHealth.observe_turn_failure_in_txn(
-                 txn,
-                 session,
-                 turn,
-                 :prompt,
-                 reason
-               )
+               if terminal == "failed_unknown" do
+                 HarnessHealth.observe_terminal_in_txn(
+                   txn,
+                   source_seq,
+                   "interrupted-outcome-unknown",
+                   "test terminal was interrupted; outcome unknown",
+                   "process:test"
+                 )
+               else
+                 HarnessHealth.observe_turn_failure_in_txn(
+                   txn,
+                   session,
+                   turn,
+                   :prompt,
+                   reason
+                 )
+               end
              end)
 
     if is_function(post_commit, 0), do: post_commit.()

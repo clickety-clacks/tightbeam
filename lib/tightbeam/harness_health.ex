@@ -37,6 +37,7 @@ defmodule Tightbeam.HarnessHealth do
   @other_failure_class "other"
   @redeliverable_failure_classes ~w(
     auth-dead rate-limit-dead adapter_unavailable model_unavailable task_crash
+    interrupted-outcome-unknown
   )
   @prod_shape_consumers ["assignment_prodder"]
   @failure_evidence ~w(authoritative-provider terminal-failure)
@@ -1001,6 +1002,13 @@ defmodule Tightbeam.HarnessHealth do
   # not create a durable redelivery attempt.
   defp typed_redelivery_failure_class(:task_crash), do: "task_crash"
   defp typed_redelivery_failure_class({:task_crash, _}), do: "task_crash"
+
+  defp typed_redelivery_failure_class(:interrupted_outcome_unknown),
+    do: "interrupted-outcome-unknown"
+
+  defp typed_redelivery_failure_class({:interrupted_outcome_unknown, _}),
+    do: "interrupted-outcome-unknown"
+
   defp typed_redelivery_failure_class({:adapter_unavailable, _}), do: "adapter_unavailable"
   defp typed_redelivery_failure_class(:adapter_unavailable), do: "adapter_unavailable"
   defp typed_redelivery_failure_class(:model_unavailable), do: "model_unavailable"
@@ -1046,6 +1054,9 @@ defmodule Tightbeam.HarnessHealth do
   defp typed_redelivery_failure_class(%{"message" => message, "data" => data} = reason)
        when is_binary(message) and is_map(data) do
     case classify_turn_failure(reason) do
+      # This class is admitted only from the protocol's typed carrier above.
+      # Text inside a generic error map is not enough to authorize a replay.
+      "interrupted-outcome-unknown" -> nil
       failure_class when failure_class in @redeliverable_failure_classes -> failure_class
       _ -> nil
     end
