@@ -1797,7 +1797,13 @@ defmodule Tightbeam.SchemaShapeTest do
   end
 
   defp rewind_to_agent_reparent!(db) do
-    assert :ok = DB.execute(db, "ALTER TABLE work_items DROP COLUMN deliveryOwnerSessionKey")
+    assert :ok =
+             DB.execute(db, """
+             DROP TRIGGER artifacts_origin_immutable;
+             ALTER TABLE artifacts DROP COLUMN originHost;
+             ALTER TABLE artifacts DROP COLUMN originWorkspace;
+             ALTER TABLE work_items DROP COLUMN deliveryOwnerSessionKey;
+             """)
 
     assert {:ok, []} =
              DB.query(db, "UPDATE schema_stamp SET shape=?1, stampedAt=1", [@agent_reparent_shape])
