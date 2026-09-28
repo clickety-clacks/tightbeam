@@ -2324,6 +2324,21 @@ mod tests {
             let (stream, _) = listener.accept().unwrap();
             let (mut socket, subscribe) = accept_subscribed_socket(stream, 1);
             socket
+                .send(Message::Text(
+                    json!({
+                        "type": "change",
+                        "schemaVersion": 1,
+                        "class": "session.updated",
+                        "seq": 1,
+                        "payload": {
+                            "sessionKey": "agent:main/example",
+                            "rowVersion": 3
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap();
+            socket
                 .send(Message::Close(Some(tungstenite::protocol::CloseFrame {
                     code: tungstenite::protocol::frame::coding::CloseCode::Normal,
                     reason: "fixture complete".into(),
@@ -2357,11 +2372,19 @@ mod tests {
         assert!(
             matches!(frames.get(2), Some(Worker::Frame(1, frame)) if frame["type"] == "subscription_ready")
         );
+        assert!(frames.iter().any(|message| matches!(
+            message,
+            Worker::Frame(1, frame)
+                if frame["type"] == "change"
+                    && frame["schemaVersion"] == 1
+                    && frame["class"] == "session.updated"
+                    && frame["payload"].get("capabilities").is_none()
+        )));
         assert!(offer.contains("protocolVersion=2"));
     }
 
     #[test]
-    fn schema_mismatch_closes_with_1002_rebuilds_once_and_applies_no_notice() {
+    fn schema_mismatch_closes_with_1002_rebuilds_once_without_applying_bad_notice() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = endpoint(&listener);
         let server = thread::spawn(move || {
@@ -2369,7 +2392,37 @@ mod tests {
             let (mut socket, _) = accept_subscribed_socket(stream, 2);
             socket
                 .send(Message::Text(
-                    json!({"type": "change", "schemaVersion": 1, "seq": 1}).to_string(),
+                    json!({
+                        "type": "change",
+                        "schemaVersion": 2,
+                        "class": "session.harness_changed",
+                        "seq": 1,
+                        "payload": {
+                            "sessionKey": "agent:main/example",
+                            "rowVersion": 4,
+                            "capabilities": {
+                                "setHarness": {
+                                    "supported": true,
+                                    "options": [
+                                        {"title": "claude", "value": "claude", "enabled": false},
+                                        {"title": "codex", "value": "codex", "enabled": true}
+                                    ]
+                                }
+                            }
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap();
+            socket
+                .send(Message::Text(
+                    json!({
+                        "type": "change",
+                        "schemaVersion": 1,
+                        "class": "session.updated",
+                        "seq": 2
+                    })
+                    .to_string(),
                 ))
                 .unwrap();
 
@@ -2411,9 +2464,20 @@ mod tests {
         assert_eq!(failure.close_code, Some(1002));
         assert!(rebuild_request.starts_with("GET /api/sessions HTTP/1.1"));
         assert_gateway_headers(&rebuild_request);
-        assert!(!rx.try_iter().any(
-            |message| matches!(message, Worker::Frame(_, frame) if frame["type"] == "change")
-        ));
+
+        let applied_changes = rx
+            .try_iter()
+            .filter_map(|message| match message {
+                Worker::Frame(_, frame) if frame["type"] == "change" => Some(frame),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(applied_changes.len(), 1);
+        assert_eq!(applied_changes[0]["class"], "session.harness_changed");
+        assert_eq!(
+            applied_changes[0]["payload"]["capabilities"]["setHarness"]["supported"],
+            true
+        );
     }
 
     #[test]
