@@ -1107,6 +1107,8 @@ defmodule Tightbeam.GatewayTest do
     File.write!(artifact_path, "legacy artifact")
     artifact = remote_artifact(ctx.db, fixture, "legacy", "reports/legacy.md")
 
+    :ok = DB.execute(ctx.db, "DROP TRIGGER artifacts_origin_immutable")
+
     {:ok, _} =
       DB.query(
         ctx.db,

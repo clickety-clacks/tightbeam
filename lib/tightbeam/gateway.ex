@@ -100,6 +100,7 @@ defmodule Tightbeam.Gateway do
     TerminalCredentialFailure,
     Unroutable,
     Wakes,
+    WorkspaceCleanup,
     WorkItems,
     WorkState
   }
