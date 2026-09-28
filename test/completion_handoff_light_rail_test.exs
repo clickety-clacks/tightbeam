@@ -165,14 +165,20 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
       Application.app_dir(:tightbeam, "priv/guidance/operating-manual.md")
       |> File.read!()
 
-    assert packaged_manual =~ "its responsible parent chooses whether to keep, park,"
+    assert packaged_manual =~ "copy `assignment_id`, `source_kind`, and `source_token`"
+    assert packaged_manual =~
+             "completion-handoff-action <assignment_id> <source_kind> <source_token> <kept|parked|retired> — <what you did>"
+    assert packaged_manual =~ "preserve the literal em dash (`—`)"
 
     :initialized = Tightbeam.Identity.init!(base)
     revision = Tightbeam.Identity.live_revision!(base)
 
     for harness <- [:codex, :claude] do
       snapshot = Tightbeam.Identity.snapshot_at!(base, revision, "default", harness)
-      assert snapshot.guidance =~ "its responsible parent chooses whether to keep, park,"
+      assert snapshot.guidance =~ "copy `assignment_id`, `source_kind`, and `source_token`"
+      assert snapshot.guidance =~
+               "completion-handoff-action <assignment_id> <source_kind> <source_token> <kept|parked|retired> — <what you did>"
+      assert snapshot.guidance =~ "preserve the literal em dash (`—`)"
       refute Regex.match?(~r/^#include/m, snapshot.guidance)
     end
   end
