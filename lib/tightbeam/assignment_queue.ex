@@ -15,9 +15,10 @@ defmodule Tightbeam.AssignmentQueue do
     case Txn.q(
            txn,
            """
-           SELECT a.holderKey,a.openedByUser,a.openedBySession,w.ownerUserId
+           SELECT a.holderKey,a.openedByUser,a.openedBySession,w.ownerUserId,s.ownerUserId
            FROM assignments AS a
            LEFT JOIN work_items AS w ON w.id=a.workItemId
+           LEFT JOIN sessions AS s ON s.sessionKey=a.openedBySession
            WHERE a.id=?1
            """,
            [assignment_id]
@@ -25,8 +26,14 @@ defmodule Tightbeam.AssignmentQueue do
       [] ->
         :not_found
 
-      [[holder_key, opened_by_user, opened_by_session, owner_user_id]] ->
-        if authorized?(principal, opened_by_user, opened_by_session, owner_user_id) do
+      [[holder_key, opened_by_user, opened_by_session, owner_user_id, opener_owner_user_id]] ->
+        if authorized?(
+             principal,
+             opened_by_user,
+             opened_by_session,
+             owner_user_id,
+             opener_owner_user_id
+           ) do
           {:ok, summarize_in_txn(txn, assignment_id, holder_key, now_ms)}
         else
           :forbidden
@@ -72,14 +79,34 @@ defmodule Tightbeam.AssignmentQueue do
     }
   end
 
-  defp authorized?({:session, session_key}, _opened_by_user, opened_by_session, _owner_user_id)
+  defp authorized?(
+         {:session, session_key},
+         _opened_by_user,
+         opened_by_session,
+         _owner_user_id,
+         _opener_owner_user_id
+       )
        when is_binary(session_key) and session_key != "",
        do: session_key == opened_by_session
 
-  defp authorized?({:user, user_id}, opened_by_user, _opened_by_session, owner_user_id)
+  defp authorized?(
+         {:user, user_id},
+         opened_by_user,
+         _opened_by_session,
+         owner_user_id,
+         opener_owner_user_id
+       )
        when is_binary(user_id) and user_id != "",
-       do: user_id == opened_by_user or user_id == owner_user_id
+       do:
+         user_id == opened_by_user or user_id == owner_user_id or
+           user_id == opener_owner_user_id
 
-  defp authorized?(_principal, _opened_by_user, _opened_by_session, _owner_user_id),
-    do: false
+  defp authorized?(
+         _principal,
+         _opened_by_user,
+         _opened_by_session,
+         _owner_user_id,
+         _opener_owner_user_id
+       ),
+       do: false
 end

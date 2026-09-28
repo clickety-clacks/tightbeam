@@ -240,7 +240,8 @@ defmodule Tightbeam.BreathingTest do
         (id,subject,holderKey,openedByUser,openedBySession,openedAt,state,workItemId)
       VALUES
         ('asg_session_opened','Session opened','active',NULL,'active2',#{now_ms},'open','wi_open'),
-        ('asg_other','Other assignment','active','owner',NULL,#{now_ms},'open','wi_open');
+        ('asg_other','Other assignment','active','owner',NULL,#{now_ms},'open','wi_open'),
+        ('asg_no_work_item','No work item','active',NULL,'active2',#{now_ms},'open',NULL);
       """)
 
     insert_turn!(db, 50, "active", "queued",
@@ -297,6 +298,12 @@ defmodule Tightbeam.BreathingTest do
       origin: "agent:unscoped"
     )
 
+    insert_turn!(db, 55, "active", "queued",
+      assignment_id: "asg_no_work_item",
+      created_at: now_ms - 1_000,
+      origin: "agent:no-work-item"
+    )
+
     {:ok, [[before_events]]} = DB.query(db, "SELECT count(*) FROM events")
 
     opener =
@@ -326,14 +333,25 @@ defmodule Tightbeam.BreathingTest do
     assert owner.queue.senders == opener.queue.senders
     assert owner.queue.oldestAgeMs >= 120_000 and owner.queue.oldestAgeMs < 130_000
 
-    forbidden =
+    unrelated_session =
       Breathing.handle(db, %{
         principal: {:session, "active"},
         params: %{target_kind: "assignment", target_id: "asg_session_opened"}
       })
 
-    assert %{code: "forbidden"} = forbidden
-    refute Map.has_key?(forbidden, :queue)
+    assert unrelated_session == Breathing.query(db, "assignment", "asg_session_opened")
+    refute Map.has_key?(unrelated_session, :queue)
+
+    user_of_opener_without_work_item =
+      Breathing.handle(db, %{
+        principal: {:user, "owner"},
+        params: %{target_kind: "assignment", target_id: "asg_no_work_item"}
+      })
+
+    assert %{queue: %{count: 1, oldestAgeMs: age_ms, senders: ["agent:no-work-item"]}} =
+             user_of_opener_without_work_item
+
+    assert age_ms >= 1_000 and age_ms < 60_000
 
     empty =
       Breathing.handle(db, %{

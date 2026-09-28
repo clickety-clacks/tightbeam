@@ -3,7 +3,7 @@ defmodule Tightbeam.Breathing do
   Deterministic, read-only physical breathing queries.
 
   A result is computed from one database snapshot and is never stored.
-  Assignment queries for the opener or work-item owner also include a
+  Assignment queries for the opener or an associated user also include a
   read-only summary of the holder's queued turns.
   """
 
@@ -54,10 +54,7 @@ defmodule Tightbeam.Breathing do
                assignment_in_txn(txn, id)
 
              :forbidden ->
-               %{
-                 code: "forbidden",
-                 message: "assignment queue is visible only to its opener and work-item owner"
-               }
+               assignment_in_txn(txn, id)
            end
          end) do
       {:ok, result} -> result
