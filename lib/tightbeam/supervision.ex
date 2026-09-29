@@ -1844,12 +1844,15 @@ defmodule Tightbeam.Supervision do
         case Txn.q(
                txn,
                """
-               SELECT generation, dueAt, state, lastAttemptGeneration,
-                      supervisionIntervalMs, basisKind, basisId
-               FROM supervision_entitlements
-               WHERE assignmentId=?1
+               SELECT e.generation, e.dueAt, e.state, e.lastAttemptGeneration,
+                      e.supervisionIntervalMs, e.basisKind, e.basisId,
+                      w.lastEvaluatedTerminal
+               FROM supervision_entitlements e
+               LEFT JOIN supervision_watermarks w
+                 ON w.sessionKey=?2 AND w.assignmentId=e.assignmentId
+               WHERE e.assignmentId=?1
                """,
-               [assignment.id]
+               [assignment.id, session_key]
              ) do
           [] ->
             # An open obligation with no entitlement row: the ladder has nothing
@@ -1887,7 +1890,50 @@ defmodule Tightbeam.Supervision do
 
             :unarmed
 
-          [[generation, due_at, state, last_attempt, stored_interval, basis_kind, basis_id]] ->
+          [
+            [
+              _generation,
+              _due_at,
+              _state,
+              _last_attempt,
+              _stored_interval,
+              _basis_kind,
+              _basis_id,
+              last_terminal
+            ]
+          ]
+          when is_integer(terminal_seq) and is_integer(last_terminal) and
+                 last_terminal == terminal_seq ->
+            :duplicate
+
+          [
+            [
+              _generation,
+              _due_at,
+              _state,
+              _last_attempt,
+              _stored_interval,
+              _basis_kind,
+              _basis_id,
+              prior_terminal
+            ]
+          ]
+          when is_integer(terminal_seq) and is_integer(prior_terminal) and
+                 prior_terminal > terminal_seq ->
+            :coalesced
+
+          [
+            [
+              generation,
+              due_at,
+              state,
+              last_attempt,
+              stored_interval,
+              basis_kind,
+              basis_id,
+              _last_terminal
+            ]
+          ] ->
             interval =
               if is_integer(replacement_interval) and replacement_interval > 0,
                 do: replacement_interval,
@@ -1950,6 +1996,9 @@ defmodule Tightbeam.Supervision do
 
       :not_due ->
         :not_due
+
+      :coalesced ->
+        :coalesced
 
       :controlled ->
         :continuation
@@ -2922,11 +2971,16 @@ defmodule Tightbeam.Supervision do
             [assignment_id]
           )
 
+        expected_events = [
+          ["supervision_entitlement_rearmed", expected_detail],
+          ["supervision_entitlement_recovered", expected_recovery_detail]
+        ]
+
         controller_event_matches? =
-          latest_entitlement_event in [
-            ["supervision_entitlement_rearmed", expected_detail],
-            ["supervision_entitlement_recovered", expected_recovery_detail]
-          ]
+          case latest_entitlement_event do
+            [event] -> event in expected_events
+            _ -> false
+          end
 
         coherent? =
           wake_matches? and current_holder? and
@@ -2935,9 +2989,11 @@ defmodule Tightbeam.Supervision do
             (is_nil(latest_progress_generation) or latest_progress_generation < generation) and
             controller_event_matches?
 
-        if coherent?,
-          do: {:ok, generation, basis_kind, wake_id},
-          else: {:refused, "pending_controller_lineage_incoherent"}
+        if coherent? do
+          {:ok, generation, basis_kind, wake_id}
+        else
+          {:refused, "pending_controller_lineage_incoherent"}
+        end
 
       [] ->
         :none

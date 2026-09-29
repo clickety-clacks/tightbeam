@@ -1637,7 +1637,7 @@ defmodule Tightbeam.SupervisionTest do
   end
 
   test "pending controller admission absorbs progress before any prod turn", ctx do
-    terminal_seq = terminal!(ctx.db, "holder")
+    terminal!(ctx.db, "holder")
     attach_work_item!(ctx.db, "asg_1", "wi_receipts")
     insert_entitlement!(ctx.db, "asg_1", generation: 4, due_at: 0, interval: 60_000)
 
@@ -1650,7 +1650,7 @@ defmodule Tightbeam.SupervisionTest do
         "INSERT INTO attests (id, assignmentId, kind, note, bySession, ts) VALUES ('att_before_checkpoint','asg_1','progress','work before checkpoint','holder',9000000000000)"
       )
 
-    {checkpoint, _source_turn} =
+    {checkpoint, checkpoint_source_seq} =
       schedule_checkpoint_via_gateway!(ctx, "checkpoint before prod admission", 60_000)
 
     {:ok, _} =
@@ -1708,7 +1708,7 @@ defmodule Tightbeam.SupervisionTest do
                "SELECT COUNT(*) FROM supervision_liveness_receipts WHERE assignmentId='asg_1'"
              )
 
-    assert Ledger.last_terminal_seq(ctx.db, "holder") == terminal_seq
+    assert Ledger.last_terminal_seq(ctx.db, "holder") == checkpoint_source_seq
   end
 
   test "typed checkpoint binding suppresses a controller when the public wake has no assignment id",
@@ -1762,18 +1762,79 @@ defmodule Tightbeam.SupervisionTest do
         "UPDATE assignment_prods SET attemptCount=4,prodCount=2,deniedStreak=3,stalledAt=1234 WHERE assignmentId='asg_1'"
       )
 
+    wake_id = controller.wake_id
+
+    assert {:ok,
+            [
+              [
+                ^wake_id,
+                "prod",
+                12,
+                "pending",
+                "pending",
+                "process:tightbeam",
+                "asg_1",
+                "holder",
+                "prompt",
+                nil,
+                nil,
+                nil
+              ]
+            ]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT s.wakeId,s.wakeKind,s.chargedGeneration,s.controllerState,
+                      w.state,w.origin,w.assignmentId,w.sessionKey,w.consumer,
+                      w.reresolve,w.reresolveSeed,w.reresolveRung
+               FROM supervision_liveness_sidecar s
+               JOIN wakes w ON w.wakeId=s.wakeId
+               WHERE s.assignmentId='asg_1' AND s.controllerState='pending'
+               """
+             )
+
+    assert {:ok, [["holder", "open", "active", 1, nil, nil]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT a.holderKey,a.state,s.state,
+                      (SELECT COUNT(*) FROM supervision_liveness_receipt_state rs WHERE rs.assignmentId=a.id),
+                      (SELECT MAX(generation) FROM supervision_liveness_receipts r WHERE r.assignmentId=a.id),
+                      (SELECT MAX(generation) FROM supervision_progress_absorptions p WHERE p.assignmentId=a.id)
+               FROM assignments a JOIN sessions s ON s.sessionKey=a.holderKey
+               WHERE a.id='asg_1'
+               """
+             )
+
+    assert {:ok, [["supervision_entitlement_rearmed", event_detail]]} =
+             DB.query(
+               ctx.db,
+               "SELECT kind,detail FROM lifecycle_events WHERE subject='asg_1' AND kind GLOB 'supervision_entitlement_*' ORDER BY id DESC LIMIT 1"
+             )
+
+    assert event_detail ==
+             "generation=12 basis=prod_scheduled:#{wake_id} cause=prod_scheduled principal=process:tightbeam"
+
     {:ok, _} = DB.query(ctx.db, "DELETE FROM supervision_entitlements WHERE assignmentId='asg_1'")
 
     assert :ok = Supervision.recover_liveness!(ctx.db, 60_000)
 
-    assert {:ok,
-            [[12, "armed", "prod_scheduled", basis_id, "prod_scheduled", "process:tightbeam"]]} =
-             DB.query(
-               ctx.db,
-               "SELECT generation,state,basisKind,basisId,cause,principal FROM supervision_entitlements WHERE assignmentId='asg_1'"
-             )
+    recovery_events =
+      DB.query(
+        ctx.db,
+        "SELECT kind,detail FROM lifecycle_events WHERE subject='asg_1' AND kind GLOB 'supervision_entitlement_*' ORDER BY id DESC LIMIT 2"
+      )
 
-    assert basis_id == controller.wake_id
+    entitlement_result =
+      DB.query(
+        ctx.db,
+        "SELECT generation,state,basisKind,basisId,cause,principal FROM supervision_entitlements WHERE assignmentId='asg_1'"
+      )
+
+    assert entitlement_result ==
+             {:ok,
+              [[12, "armed", "prod_scheduled", wake_id, "prod_scheduled", "process:tightbeam"]]},
+           "recovery disposition: #{inspect(recovery_events)}"
 
     scheduler = start_wake_scheduler!(ctx, :recovered_controller)
     assert :ok = Wakes.fire_due(scheduler)
