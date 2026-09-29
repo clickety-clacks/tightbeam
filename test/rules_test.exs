@@ -8,7 +8,6 @@ defmodule Tightbeam.RulesTest do
     DB,
     Devices,
     Dispatch,
-    DeliveryResponsibilities,
     Escalation,
     EventLog,
     Gateway,
@@ -16,7 +15,6 @@ defmodule Tightbeam.RulesTest do
     Org,
     Roles,
     Rules,
-    SessionPoAssociations,
     Toplines,
     Wakes
   }
@@ -3739,49 +3737,19 @@ defmodule Tightbeam.RulesTest do
   end
 
   defp setup_work_item_coordinator(ctx, work_item_id) do
-    po_office = session(ctx.db, "ac6a-po-office", "flynn", archetype: "product-owner")
     coordinator = session(ctx.db, "ac6a-work-item-coordinator", "flynn", archetype: "pdo")
-    po_role = "product-owner:ac6a-test"
-    assert %{name: ^po_role} = Roles.create!(ctx.db, po_role, "flynn", po_office.session_key)
 
-    assert %{"changed" => true} =
-             SessionPoAssociations.handle(ctx.db, %{
-               origin: "user:flynn",
-               principal: {:user, "flynn"},
-               params: %{
-                 session_key: coordinator.session_key,
-                 po_role: po_role,
-                 idempotency_key: "ac6a-coordinator-association"
-               }
-             })
-
-    assert %{"changed" => true} =
-             DeliveryResponsibilities.handle(ctx.db, %{
-               verb: "delivery-scope-owner-set",
-               origin: "user:flynn",
-               principal: {:user, "flynn"},
-               params: %{
-                 session_key: coordinator.session_key,
-                 association_revision: 1,
-                 expected_owner_session_key: nil,
-                 expected_owner_revision: 0,
-                 idempotency_key: "ac6a-coordinator-owner"
-               }
-             })
-
-    assert %{"changed" => true} =
-             DeliveryResponsibilities.handle(ctx.db, %{
-               verb: "work-item-delivery-scope-set",
+    assert %{deliveryOwnerSessionKey: owner} =
+             Tightbeam.WorkItems.__handle__(ctx.db, "work-item-update", %{
                origin: "user:flynn",
                principal: {:user, "flynn"},
                params: %{
                  work_item_id: work_item_id,
-                 association_session_key: coordinator.session_key,
-                 association_revision: 1,
-                 expected_binding_revision: 0,
-                 idempotency_key: "ac6a-coordinator-work-item-binding"
+                 delivery_owner_session_key: coordinator.session_key
                }
              })
+
+    assert owner == coordinator.session_key
 
     coordinator
   end
