@@ -28,8 +28,12 @@ defmodule Tightbeam.QueuedMessageSuppression do
   CREATE TABLE IF NOT EXISTS queued_message_replacement_requests (
     wakeId       TEXT PRIMARY KEY REFERENCES wakes(wakeId) ON DELETE RESTRICT,
     assignmentId TEXT NOT NULL REFERENCES assignments(id) ON DELETE RESTRICT,
-    requestedAt  INTEGER NOT NULL CHECK(requestedAt >= 0)
+    requestedAt  INTEGER NOT NULL CHECK(requestedAt >= 0),
+    requestOrder INTEGER NOT NULL CHECK(requestOrder > 0)
   );
+  """
+
+  @replacement_requests_index_ddl """
   CREATE INDEX IF NOT EXISTS queued_message_replacement_assignment
     ON queued_message_replacement_requests(assignmentId, requestedAt);
   """
@@ -37,8 +41,58 @@ defmodule Tightbeam.QueuedMessageSuppression do
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
   def ensure_schema(db \\ DB) do
     with :ok <- DB.execute(db, @ddl),
-         :ok <- DB.execute(db, @replacement_requests_ddl) do
+         :ok <- DB.execute(db, @replacement_requests_ddl),
+         :ok <- ensure_replacement_request_order(db),
+         :ok <- DB.execute(db, @replacement_requests_index_ddl) do
       :ok
+    end
+  end
+
+  defp ensure_replacement_request_order(db) do
+    case DB.transaction(db, &ensure_replacement_request_order_in_txn/1) do
+      {:ok, :ok} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp ensure_replacement_request_order_in_txn(%Txn{} = txn) do
+    columns =
+      Txn.q(txn, "PRAGMA table_info(queued_message_replacement_requests)")
+      |> Enum.map(&Enum.at(&1, 1))
+
+    case columns do
+      ["wakeId", "assignmentId", "requestedAt"] ->
+        :ok =
+          Txn.exec(
+            txn,
+            "ALTER TABLE queued_message_replacement_requests " <>
+              "ADD COLUMN requestOrder INTEGER NOT NULL DEFAULT 0"
+          )
+
+        Txn.q(
+          txn,
+          "UPDATE queued_message_replacement_requests SET requestOrder=rowid WHERE requestOrder=0"
+        )
+
+        :ok
+
+      ["wakeId", "assignmentId", "requestedAt", "requestOrder"] ->
+        case Txn.q(
+               txn,
+               "SELECT wakeId,requestOrder FROM queued_message_replacement_requests " <>
+                 "WHERE requestOrder <= 0 LIMIT 1"
+             ) do
+          [] ->
+            :ok
+
+          invalid_rows ->
+            raise ArgumentError,
+                  "invalid queued message replacement request order rows: #{inspect(invalid_rows)}"
+        end
+
+      unexpected_columns ->
+        raise ArgumentError,
+              "unexpected queued message replacement request schema: #{inspect(unexpected_columns)}"
     end
   end
 
@@ -49,8 +103,10 @@ defmodule Tightbeam.QueuedMessageSuppression do
     Txn.q(
       txn,
       """
-      INSERT INTO queued_message_replacement_requests(wakeId,assignmentId,requestedAt)
-      VALUES (?1,?2,?3)
+      INSERT INTO queued_message_replacement_requests
+        (wakeId,assignmentId,requestedAt,requestOrder)
+      VALUES (?1,?2,?3,(SELECT COALESCE(MAX(requestOrder),0)+1
+                         FROM queued_message_replacement_requests))
       """,
       [wake_id, assignment_id, System.system_time(:millisecond)]
     )
@@ -64,8 +120,9 @@ defmodule Tightbeam.QueuedMessageSuppression do
     Txn.q(
       txn,
       """
-      INSERT OR IGNORE INTO queued_message_replacement_requests(wakeId,assignmentId,requestedAt)
-      SELECT ?2,assignmentId,requestedAt
+      INSERT OR IGNORE INTO queued_message_replacement_requests
+        (wakeId,assignmentId,requestedAt,requestOrder)
+      SELECT ?2,assignmentId,requestedAt,requestOrder
       FROM queued_message_replacement_requests WHERE wakeId=?1
       """,
       [source_wake_id, replacement_wake_id]
@@ -126,16 +183,16 @@ defmodule Tightbeam.QueuedMessageSuppression do
               OR
               -- A wake's assignment association is not replacement consent; only
               -- an explicit earlier replacement request makes it a candidate.
-              -- Retry wakes keep the original requestedAt, so a delayed older
-              -- request cannot cancel a newer queued replacement.
+              -- Retry wakes keep their original request order as well as the
+              -- requestedAt timestamp, so delayed older requests stay older.
               (t.wakeId IS NOT NULL AND w.creatorSessionKey=?4 AND EXISTS (
                 SELECT 1 FROM queued_message_replacement_requests r
+                JOIN queued_message_replacement_requests incoming
+                  ON incoming.wakeId=?6 AND incoming.assignmentId=?3
                 WHERE r.wakeId=t.wakeId AND r.assignmentId=?3
-                  AND r.requestedAt < (
-                    SELECT incoming.requestedAt
-                    FROM queued_message_replacement_requests incoming
-                    WHERE incoming.wakeId=?6 AND incoming.assignmentId=?3
-                  )
+                  AND (r.requestedAt < incoming.requestedAt OR
+                       (r.requestedAt = incoming.requestedAt AND
+                        r.requestOrder < incoming.requestOrder))
               ))
             )
             AND (t.wakeId IS NULL OR w.wakeId IS NOT NULL)
