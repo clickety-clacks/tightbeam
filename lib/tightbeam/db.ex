@@ -146,6 +146,62 @@ defmodule Tightbeam.DB do
     GenServer.call(server, {:transaction, fun}, call_timeout())
   end
 
+  defp shutdown_diag(event, fields) do
+    case :ets.whereis(:adapter_shutdown_diag) do
+      :undefined ->
+        :ok
+
+      table ->
+        subject = Process.get(:adapter_shutdown_diag_subject, self())
+
+        case :ets.lookup(table, :target) do
+          [{:target, ^subject}] ->
+            phase =
+              case :ets.lookup(table, {:phase, subject}) do
+                [{{:phase, ^subject}, value}] -> value
+                _ -> nil
+              end
+
+            fields = if phase, do: Map.put(fields, :phase, phase), else: fields
+            fields = Map.put(fields, :subject_pid, inspect(subject))
+            at_us = System.monotonic_time(:microsecond)
+            :ets.insert(
+              table,
+              {{at_us, System.unique_integer([:positive])}, self(), event, fields}
+            )
+            :ok
+
+          _ ->
+            :ok
+        end
+    end
+  catch
+    :error, :badarg -> :ok
+  end
+
+  defp shutdown_diag_target?(pid) do
+    case :ets.whereis(:adapter_shutdown_diag) do
+      :undefined ->
+        false
+
+      table ->
+        :ets.lookup(table, :target) == [{:target, pid}]
+    end
+  catch
+    :error, :badarg -> false
+  end
+
+  defp shutdown_diag_remaining(:infinity), do: :infinity
+  defp shutdown_diag_remaining(deadline), do: deadline - System.monotonic_time(:millisecond)
+
+  defp shutdown_diag_outcome(nil), do: :timeout
+  defp shutdown_diag_outcome(:ok), do: :ok
+  defp shutdown_diag_outcome({:ok, _}), do: :ok
+  defp shutdown_diag_outcome({:error, %DeadlineExceeded{}}), do: :deadline_exceeded
+  defp shutdown_diag_outcome({:error, _}), do: :error
+  defp shutdown_diag_outcome({:exit, _}), do: :exit
+  defp shutdown_diag_outcome(_), do: :other
+
   @doc """
   Run a transaction only while the monotonic deadline remains available.
 
@@ -158,17 +214,39 @@ defmodule Tightbeam.DB do
         when result: term()
   def transaction_until(server \\ __MODULE__, fun, deadline)
       when is_function(fun, 1) and is_integer(deadline) do
+    client_started_us = System.monotonic_time(:microsecond)
     remaining = deadline - System.monotonic_time(:millisecond)
 
+    shutdown_diag(:db_client_call_start, %{
+      deadline_ms: deadline,
+      remaining_ms: remaining,
+      server: server
+    })
+
     if remaining <= 0 do
+      shutdown_diag(:db_client_expired_before_send, %{
+        deadline_ms: deadline,
+        remaining_ms: remaining
+      })
+
       {:error, %DeadlineExceeded{}}
     else
-      try do
-        GenServer.call(server, {:transaction_until, fun, deadline}, remaining + 50)
-      catch
-        :exit, {:timeout, _} -> {:error, %DeadlineExceeded{}}
-        :exit, reason -> {:error, reason}
-      end
+      result =
+        try do
+          GenServer.call(server, {:transaction_until, fun, deadline}, remaining + 50)
+        catch
+          :exit, {:timeout, _} -> {:error, %DeadlineExceeded{}}
+          :exit, reason -> {:error, reason}
+        end
+
+      shutdown_diag(:db_client_call_done, %{
+        deadline_ms: deadline,
+        elapsed_us: System.monotonic_time(:microsecond) - client_started_us,
+        remaining_ms: deadline - System.monotonic_time(:millisecond),
+        outcome: shutdown_diag_outcome(result)
+      })
+
+      result
     end
   end
 
@@ -491,20 +569,51 @@ defmodule Tightbeam.DB do
     end
   end
 
-  def handle_call({:transaction_until, fun, deadline}, _from, %{conn: conn} = state) do
-    remaining = deadline - System.monotonic_time(:millisecond)
+  def handle_call({:transaction_until, fun, deadline}, from, %{conn: conn} = state) do
+    caller_pid = elem(from, 0)
+    trace_call? = shutdown_diag_target?(caller_pid)
+    prior_trace_subject = Process.get(:adapter_shutdown_diag_subject)
+    if trace_call?, do: Process.put(:adapter_shutdown_diag_subject, caller_pid)
 
-    if remaining <= 0 do
-      {:reply, {:error, %DeadlineExceeded{}}, state}
-    else
-      :ok = Sqlite3.execute(conn, "PRAGMA busy_timeout=#{max(remaining, 1)}")
-      Process.put(row_commit_key(conn), [])
+    try do
+      server_received_us = System.monotonic_time(:microsecond)
+      remaining = deadline - System.monotonic_time(:millisecond)
 
-      try do
-        {:reply, commit_phase(conn, fun, fenced_archetypes(state), deadline), state}
-      after
-        Process.delete(row_commit_key(conn))
-        _ = Sqlite3.execute(conn, "PRAGMA busy_timeout=5000")
+      shutdown_diag(:db_server_received, %{
+        deadline_ms: deadline,
+        remaining_ms: remaining,
+        caller: caller_pid
+      })
+
+      if remaining <= 0 do
+        shutdown_diag(:db_server_expired_in_queue, %{deadline_ms: deadline})
+        {:reply, {:error, %DeadlineExceeded{}}, state}
+      else
+        pragma_started_us = System.monotonic_time(:microsecond)
+        pragma_result = Sqlite3.execute(conn, "PRAGMA busy_timeout=#{max(remaining, 1)}")
+
+        shutdown_diag(:db_busy_timeout_configured, %{
+          deadline_ms: deadline,
+          elapsed_us: System.monotonic_time(:microsecond) - pragma_started_us,
+          server_since_receive_us: System.monotonic_time(:microsecond) - server_received_us,
+          outcome: shutdown_diag_outcome(pragma_result)
+        })
+
+        :ok = pragma_result
+        Process.put(row_commit_key(conn), [])
+
+        try do
+          {:reply, commit_phase(conn, fun, fenced_archetypes(state), deadline), state}
+        after
+          Process.delete(row_commit_key(conn))
+          _ = Sqlite3.execute(conn, "PRAGMA busy_timeout=5000")
+        end
+      end
+    after
+      if trace_call? do
+        if prior_trace_subject,
+          do: Process.put(:adapter_shutdown_diag_subject, prior_trace_subject),
+          else: Process.delete(:adapter_shutdown_diag_subject)
       end
     end
   end
@@ -614,16 +723,75 @@ defmodule Tightbeam.DB do
         # Before BEGIN, so an already-spent deadline never opens a transaction.
         # This raise is why the outer rescue below exists: there is nothing to
         # roll back yet.
+        shutdown_diag(:db_before_begin_deadline_guard, %{
+          deadline_ms: deadline,
+          remaining_ms: shutdown_diag_remaining(deadline)
+        })
+
         Txn.ensure_before_deadline(txn)
-        :ok = Sqlite3.execute(conn, "BEGIN IMMEDIATE")
+
+        begin_started_us = System.monotonic_time(:microsecond)
+
+        shutdown_diag(:db_begin_start, %{
+          deadline_ms: deadline,
+          remaining_ms: shutdown_diag_remaining(deadline)
+        })
+
+        begin_result = Sqlite3.execute(conn, "BEGIN IMMEDIATE")
+
+        shutdown_diag(:db_begin_done, %{
+          deadline_ms: deadline,
+          elapsed_us: System.monotonic_time(:microsecond) - begin_started_us,
+          remaining_ms: shutdown_diag_remaining(deadline),
+          outcome: shutdown_diag_outcome(begin_result)
+        })
+
+        :ok = begin_result
 
         try do
+          callback_started_us = System.monotonic_time(:microsecond)
+          shutdown_diag(:db_callback_start, %{deadline_ms: deadline})
           result = fun.(txn)
+
+          shutdown_diag(:db_callback_done, %{
+            deadline_ms: deadline,
+            elapsed_us: System.monotonic_time(:microsecond) - callback_started_us,
+            remaining_ms: shutdown_diag_remaining(deadline)
+          })
+
+          shutdown_diag(:db_before_commit_deadline_guard, %{
+            deadline_ms: deadline,
+            remaining_ms: shutdown_diag_remaining(deadline)
+          })
+
           Txn.ensure_before_deadline(txn)
-          :ok = Sqlite3.execute(conn, "COMMIT")
+
+          commit_started_us = System.monotonic_time(:microsecond)
+
+          shutdown_diag(:db_commit_start, %{
+            deadline_ms: deadline,
+            remaining_ms: shutdown_diag_remaining(deadline)
+          })
+
+          commit_result = Sqlite3.execute(conn, "COMMIT")
+
+          shutdown_diag(:db_commit_done, %{
+            deadline_ms: deadline,
+            elapsed_us: System.monotonic_time(:microsecond) - commit_started_us,
+            remaining_ms: shutdown_diag_remaining(deadline),
+            outcome: shutdown_diag_outcome(commit_result)
+          })
+
+          :ok = commit_result
           {:committed, result, Enum.reverse(Process.get(key))}
         rescue
           error ->
+            shutdown_diag(:db_rollback_start, %{
+              deadline_ms: deadline,
+              error_class: error.__struct__,
+              remaining_ms: shutdown_diag_remaining(deadline)
+            })
+
             # Not `:ok =`: under a deadline the busy_timeout is the remaining
             # time, so ROLLBACK can itself fail, and asserting on it would
             # replace the real error with a MatchError.
@@ -632,7 +800,15 @@ defmodule Tightbeam.DB do
             # that learns the connection was not restored, and the tuple below
             # asserts a rollback that may not have happened. Say so, and still
             # return the real error.
-            case Sqlite3.execute(conn, "ROLLBACK") do
+            rollback_result = Sqlite3.execute(conn, "ROLLBACK")
+
+            shutdown_diag(:db_rollback_done, %{
+              deadline_ms: deadline,
+              outcome: shutdown_diag_outcome(rollback_result),
+              remaining_ms: shutdown_diag_remaining(deadline)
+            })
+
+            case rollback_result do
               :ok -> :ok
               other -> Logger.error("transaction rollback failed: #{inspect(other)}")
             end
@@ -640,7 +816,14 @@ defmodule Tightbeam.DB do
             {:rolled_back, error}
         end
       rescue
-        error -> {:rolled_back, error}
+        error ->
+          shutdown_diag(:db_transaction_aborted_before_begin, %{
+            deadline_ms: deadline,
+            error_class: error.__struct__,
+            remaining_ms: shutdown_diag_remaining(deadline)
+          })
+
+          {:rolled_back, error}
       after
         Process.delete(key)
       end
@@ -651,6 +834,12 @@ defmodule Tightbeam.DB do
         {:ok, result}
 
       {:rolled_back, error} ->
+        shutdown_diag(:db_transaction_rolled_back, %{
+          deadline_ms: deadline,
+          error_class: error.__struct__,
+          remaining_ms: shutdown_diag_remaining(deadline)
+        })
+
         {:error, error}
     end
   end
