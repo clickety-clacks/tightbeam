@@ -13,13 +13,15 @@ permission to point a command at a live base.
 For source-lineage context, canonical tag `v0.1.8+1337` (build 1337,
 `fdb3db53b596d4114d06505b39a4c1836fba7564`) writes
 `operator-decision-requests-v1`, which current 0.1.9 names as a predecessor.
-The manifest for the actual snapshot must establish that exact tag, build,
-commit, and stamp; stop for delivery's source-backed adjudication if a value is
-missing or differs. See the [0.1.9 migration runbook](e2e/0.1.9/migration.md)
-for the source qualification procedure. The `pi-harness-v1` stamp below is the
-historical terminal stamp of the 0.1.8 package's own migration chain. It is not
-an accepted 0.1.9 source stamp, and this document does not claim that current
-0.1.9 migrates it.
+This is a verified reference lineage, not presumed provenance for a later real
+0.1.8 database. The actual snapshot's manifest must establish its source tag,
+build, package provenance, commit, and stored stamp. If the actual build or
+stamp differs from this reference, stop for delivery's source-backed lineage
+adjudication; a different stamp does not automatically reject every 0.1.8
+release. See the [0.1.9 migration runbook](e2e/0.1.9/migration.md) for source
+qualification. The `pi-harness-v1` stamp below is the historical terminal
+stamp of the 0.1.8 package's own migration chain. It is not an accepted 0.1.9
+source stamp, and this document does not claim that current 0.1.9 migrates it.
 
 Keep each release in its own complete directory. Stage and verify the release
 package before selecting it through `/opt/tightbeam/current`; the selection is
