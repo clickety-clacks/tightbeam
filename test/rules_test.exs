@@ -2253,7 +2253,7 @@ defmodule Tightbeam.RulesTest do
              )
 
     rules = load_ac6a_rules(ctx)
-    assert Enum.count(rules, &String.starts_with?(&1.name, "ac6a-")) == 4
+    assert Enum.count(rules, &String.starts_with?(&1.name, "ac6a-")) == 5
 
     assert {:ok, _} =
              Ledger.enqueue(ctx.db, %{
@@ -2945,6 +2945,120 @@ defmodule Tightbeam.RulesTest do
     assert notice_count(ctx.db, "remedy:compat-work-item-review-verdict-count") == 1
   end
 
+  test "AC6a third review rejection spans fresh reviewers and fires once at equality", ctx do
+    review_opener = session(ctx.db, "ac6a-rejection-review-opener", "flynn")
+
+    producer_rounds =
+      for index <- 1..4 do
+        opener = session(ctx.db, "ac6a-rejection-producer-opener-#{index}", "flynn")
+        holder = session(ctx.db, "ac6a-rejection-producer-#{index}", "flynn", archetype: "coder")
+        {opener, holder}
+      end
+
+    reviewers =
+      for index <- 1..4 do
+        session(ctx.db, "ac6a-rejection-reviewer-#{index}", "flynn", archetype: "reviewer-code")
+      end
+
+    work_item_id = "wi_ac6a_third_review_rejection"
+    create_work_item(ctx, work_item_id)
+    _rules = load_ac6a_rules(ctx)
+
+    review_rounds =
+      for {reviewer, index} <- Enum.with_index(Enum.take(reviewers, 3), 1) do
+        {producer_opener, producer_holder} = Enum.at(producer_rounds, index - 1)
+
+        producer_assignment =
+          assignment(ctx, producer_holder.session_key, {:session, producer_opener.session_key},
+            work_item_id: work_item_id
+          )
+
+        review_assignment =
+          assignment(ctx, reviewer.session_key, {:session, review_opener.session_key},
+            reviews: producer_assignment.id
+          )
+
+        verdict(
+          ctx,
+          reviewer.session_key,
+          review_assignment.id,
+          "changes-requested",
+          "fresh reviewer #{index}"
+        )
+
+        assert notice_count(ctx.db, "remedy:ac6a-third-review-rejection") ==
+                 if(index == 3, do: 1, else: 0)
+
+        {producer_assignment, review_assignment}
+      end
+
+    {_third_producer_assignment, third_review} = Enum.at(review_rounds, 2)
+    {third_opener, _third_holder} = Enum.at(producer_rounds, 2)
+
+    assert {:ok, [[third_attest_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT id FROM attests WHERE assignmentId=?1 AND verdictKind='changes-requested'",
+               [third_review.id]
+             )
+
+    replayed_rejection = %{
+      verb: "attest",
+      domain: "attest",
+      row_id: third_attest_id,
+      owner_user_id: "flynn",
+      principal: "session:#{Enum.at(reviewers, 2).session_key}",
+      bindings: %{assignmentId: third_review.id, workItemId: nil},
+      fields: %{
+        kind: %{old: nil, new: "verdict"},
+        verdictKind: %{old: nil, new: "changes-requested"}
+      }
+    }
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               Wakes.row_commit_in_txn(txn, replayed_rejection)
+               :ok
+             end)
+
+    prompt =
+      "This item has 3 review rejections. If the producer's own judgment is the cause, " <>
+        "move the seat up a model row (e.g. Luna max to Astra high, tune when idle); " <>
+        "if the cause is scope, routing or test hosts, fix that instead."
+
+    assert {:ok, [[target, notice_assignment, notice_work_item, notice_prompt]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sessionKey,assignmentId,work_item_id,prompt FROM wakes " <>
+                 "WHERE origin='remedy:ac6a-third-review-rejection'"
+             )
+
+    assert [target, notice_assignment, notice_work_item, notice_prompt] ==
+             [third_opener.session_key, third_review.id, work_item_id, prompt]
+
+    {fourth_opener, fourth_holder} = Enum.at(producer_rounds, 3)
+
+    fourth_producer_assignment =
+      assignment(ctx, fourth_holder.session_key, {:session, fourth_opener.session_key},
+        work_item_id: work_item_id
+      )
+
+    fourth_review =
+      assignment(ctx, Enum.at(reviewers, 3).session_key, {:session, review_opener.session_key},
+        reviews: fourth_producer_assignment.id
+      )
+
+    verdict(
+      ctx,
+      Enum.at(reviewers, 3).session_key,
+      fourth_review.id,
+      "changes-requested",
+      "fourth"
+    )
+
+    assert notice_count(ctx.db, "remedy:ac6a-third-review-rejection") == 1
+  end
+
   test "AC6a fourth review and fix rounds route through real assignment and attest commits",
        ctx do
     assert %{user_id: "flynn"} = Devices.add_user(ctx.db, "flynn", false)
@@ -3279,23 +3393,155 @@ defmodule Tightbeam.RulesTest do
 
     assert notice_count(ctx.db, "remedy:ac6a-unassigned-agent-turn") == 2
 
+    assert {:ok, [[request_id, "open", "flynn", raiser_id, raiser_session, question, context]]} =
+             DB.query(
+               ctx.db,
+               "SELECT id,status,ownerUserId,raiserId,raiserSessionKey,question,context " <>
+                 "FROM decision_requests WHERE kind='operator'"
+             )
+
+    assert raiser_id == "agent:#{no_context_role}"
+    assert raiser_session == no_context.session_key
+    assert question =~ "has no assignment or work-item owner"
+    assert question =~ "Session: #{no_context.session_key}"
+    assert context =~ "stretch=initial:#{no_context.session_key}"
+
+    assert {:ok, [[main_session, notification_prompt]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sessionKey,prompt FROM wakes WHERE origin='process:tightbeam' " <>
+                 "AND prompt LIKE ?1",
+               ["%#{request_id}%"]
+             )
+
+    assert main_session == Org.personal_session_key("flynn")
+    assert notification_prompt =~ question
+
+    assert {:ok, [["running"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [no_context_seq])
+
+    assert :ok =
+             Ledger.finish(ctx.db, no_context_seq, "delivered", nil,
+               owner_lease: no_context_lease
+             )
+
+    assert {:ok, _} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: no_context.session_key,
+               message_id: "ac6a-unassigned-no-context-replay",
+               origin: "session:#{no_context.session_key}",
+               prompt: "same unowned stretch after the first request"
+             })
+
+    assert {:ok, %{seq: replay_seq, owner_lease: replay_lease}} =
+             Ledger.claim_next(
+               ctx.db,
+               no_context.session_key,
+               "ac6a-unassigned-no-context-replay-claim"
+             )
+
     assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE kind='operator'")
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE origin='process:tightbeam' AND prompt LIKE ?1",
+               ["%#{request_id}%"]
+             )
+
+    assert :ok =
+             Ledger.finish(ctx.db, replay_seq, "delivered", nil, owner_lease: replay_lease)
+
+    assert %{id: ^request_id, status: "ruled"} =
+             Escalation.operator_rule(ctx.db, %{
+               verb: "operator-rule",
+               origin: "user:flynn",
+               principal: {:user, "flynn"},
+               transport_session_key: nil,
+               params: %{request: request_id, decision: "accept"}
+             })
+
+    assert {:ok, _} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: no_context.session_key,
+               message_id: "ac6a-unassigned-no-context-after-ruling",
+               origin: "agent:#{no_context_role}",
+               prompt: "the ruling does not reopen the same stretch request"
+             })
+
+    assert {:ok, %{seq: ruled_replay_seq, owner_lease: ruled_replay_lease}} =
+             Ledger.claim_next(
+               ctx.db,
+               no_context.session_key,
+               "ac6a-unassigned-no-context-after-ruling-claim"
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE kind='operator'")
+
+    assert {:ok, [[0]]} =
              DB.query(
                ctx.db,
                "SELECT COUNT(*) FROM lifecycle_events WHERE kind='rule_notice_failed' " <>
                  "AND subject='ac6a-unassigned-agent-turn'"
              )
 
-    assert {:ok, [[0]]} =
+    assert :ok =
+             Ledger.finish(ctx.db, ruled_replay_seq, "delivered", nil,
+               owner_lease: ruled_replay_lease
+             )
+
+    between_stretches_assignment =
+      assignment(ctx, no_context.session_key, {:user, "flynn"})
+
+    assert %{state: "closed", outcome: "revoked"} =
+             Assignments.__handle__(
+               ctx.db,
+               "revoke-assignment",
+               p3_call("revoke-assignment", {:user, "flynn"}, %{
+                 assignment_id: between_stretches_assignment.id,
+                 reason: "start a distinct unowned session stretch"
+               })
+             )
+
+    assert {:ok, _} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: no_context.session_key,
+               message_id: "ac6a-unassigned-new-stretch",
+               origin: "agent:#{no_context_role}",
+               prompt: "new stretch after the assignment closes"
+             })
+
+    assert {:ok, %{seq: new_stretch_seq, owner_lease: new_stretch_lease}} =
+             Ledger.claim_next(
+               ctx.db,
+               no_context.session_key,
+               "ac6a-unassigned-new-stretch-claim"
+             )
+
+    assert {:ok, [[new_status, new_raiser, new_context]]} =
+             DB.query(
+               ctx.db,
+               "SELECT status,raiserId,context FROM decision_requests " <>
+                 "WHERE kind='operator' AND id != ?1",
+               [request_id]
+             )
+
+    assert new_status == "open"
+    assert new_raiser == "agent:#{no_context_role}"
+    assert new_context =~ "after-assignment:#{between_stretches_assignment.id}:"
+
+    assert {:ok, [[2]]} =
              DB.query(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE kind='operator'")
 
     assert :ok =
-             Ledger.finish(ctx.db, no_context_seq, "delivered", nil,
-               owner_lease: no_context_lease
+             Ledger.finish(ctx.db, new_stretch_seq, "delivered", nil,
+               owner_lease: new_stretch_lease
              )
   end
 
-  test "AC6a absent or invalid opener falls back and missing context keeps the enqueue",
+  test "AC6a absent or invalid opener falls back and asks once per unowned stretch",
        ctx do
     holder = session(ctx.db, "ac6a-fallback-holder", "flynn", archetype: "coder")
     opened = assignment(ctx, holder.session_key, {:user, "flynn"})

@@ -1988,6 +1988,88 @@ defmodule Tightbeam.Escalation do
     end
   end
 
+  @doc false
+  @spec request_unowned_agent_stretch_in_txn(Txn.t(), String.t(), String.t(), String.t()) ::
+          map()
+  def request_unowned_agent_stretch_in_txn(
+        %Txn{} = txn,
+        session_key,
+        raiser_id,
+        stretch_id
+      )
+      when is_binary(session_key) and is_binary(raiser_id) and is_binary(stretch_id) do
+    with true <- unowned_agent_stretch_raiser?(txn, session_key, raiser_id),
+         [[owner_user_id]] <-
+           Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [session_key]),
+         [] <-
+           Txn.q(
+             txn,
+             "SELECT 1 FROM assignments WHERE holderKey=?1 AND state='open' LIMIT 1",
+             [session_key]
+           ) do
+      ask = %{
+        question:
+          "An agent-started turn has no assignment or work-item owner. How should it be routed? " <>
+            "Session: #{session_key}; stretch: #{stretch_id}.",
+        note: "rule=ac6a-unassigned-agent-turn; session=#{session_key}; stretch=#{stretch_id}",
+        options: [%{"label" => "accept"}, %{"label" => "dismiss"}],
+        assignment_id: nil,
+        supersedes: nil,
+        deadline_ms: decision_deadline_ms()
+      }
+
+      action_key = unowned_agent_stretch_action_key(session_key, stretch_id)
+
+      case unowned_agent_stretch_request_in_txn(txn, owner_user_id, session_key, action_key) do
+        nil ->
+          insert_operator_request_in_txn(
+            txn,
+            session_key,
+            owner_user_id,
+            raiser_id,
+            action_key,
+            ask,
+            []
+          )
+
+        request ->
+          request
+      end
+    else
+      false -> error("invalid", "unowned-stretch decision requires its originating agent session")
+      [] -> error("not_found", "unowned-stretch decision session not found")
+      _ -> error("not_unowned", "unowned-stretch decision requires no open assignment")
+    end
+  end
+
+  defp unowned_agent_stretch_raiser?(_txn, session_key, "session:" <> caller_session_key),
+    do: session_key == caller_session_key
+
+  defp unowned_agent_stretch_raiser?(txn, session_key, "agent:" <> role) do
+    case Roles.resolve(txn, role) do
+      {:ok, ^session_key, false} -> true
+      _ -> false
+    end
+  end
+
+  defp unowned_agent_stretch_raiser?(_txn, _session_key, _raiser_id), do: false
+
+  defp unowned_agent_stretch_action_key(session_key, stretch_id) do
+    :crypto.hash(:sha256, "ac6a-unassigned-agent-turn\0#{session_key}\0#{stretch_id}")
+    |> Base.encode16(case: :lower)
+  end
+
+  defp unowned_agent_stretch_request_in_txn(txn, owner_user_id, session_key, action_key) do
+    case Txn.q(
+           txn,
+           "SELECT #{@request_columns} FROM decision_requests WHERE kind = 'operator' AND ownerUserId = ?1 AND raiserSessionKey = ?2 AND actionKey = ?3 ORDER BY rowid DESC LIMIT 1",
+           [owner_user_id, session_key, action_key]
+         ) do
+      [row] -> request_from_row(row)
+      [] -> nil
+    end
+  end
+
   defp insert_operator_request_in_txn(
          txn,
          session_key,

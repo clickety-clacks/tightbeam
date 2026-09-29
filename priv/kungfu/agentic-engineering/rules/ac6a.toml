@@ -67,3 +67,19 @@ deny_when = [
 target_session = "{assignment_opener_or_coordinator_session}"
 prompt = "Agent {session_key} started a turn without an open assignment. Review the associated work item and direct the next step."
 idempotency_key = "unassigned:{session_unassigned_stretch_id}"
+
+[[rule]]
+name = "ac6a-third-review-rejection"
+verb = "attest"
+verbs = ["attest"]
+edges = ["row-commit"]
+effect = "notice"
+text = "A work item has received its third review rejection."
+deny_when = [
+  { fact = "work_item.changes_requested_count", op = "eq", value = 3 },
+]
+
+[rule.notice]
+target_session = "{reviewed_producer_assignment_opener_session}"
+prompt = "This item has 3 review rejections. If the producer's own judgment is the cause, move the seat up a model row (e.g. Luna max to Astra high, tune when idle); if the cause is scope, routing or test hosts, fix that instead."
+idempotency_key = "changes-requested:{work_item_id}:3"
