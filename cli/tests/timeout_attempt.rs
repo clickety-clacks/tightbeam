@@ -442,9 +442,9 @@ fn one_receipt(root: &CliRoot) -> serde_json::Value {
 fn actual_cli_connect_refusal_is_unavailable_for_get_and_post() {
     for command in ["help", "list"] {
         let root = CliRoot::new();
-        let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = reservation.local_addr().unwrap();
-        drop(reservation); // actual loopback connect refusal, without a DNS query
+        // Port zero cannot name a listening TCP endpoint, so refusal is stable
+        // without releasing a dynamically reserved port before CLI launch.
+        let addr = SocketAddr::from(([127, 0, 0, 1], 0));
         let output = finish_cli(root.spawn(command, addr));
         assert_eq!(output.status.success(), command == "help");
         let record = one_receipt(&root);
