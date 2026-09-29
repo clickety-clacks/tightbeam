@@ -301,6 +301,26 @@ defmodule Tightbeam.FirehoseInventoryAcceptance do
     drain_publications(fixture)
 
     notices =
+      capture_classes(fixture, notices, ["session.harness_changed"], fn ->
+        Org.set_harness(
+          fixture.db,
+          main.session_key,
+          "codex",
+          "openai",
+          Tightbeam.Model.new("gpt-5.6-sol")
+        )
+      end)
+
+    harness_notice = notices["session.harness_changed"]
+    assert harness_notice["schemaVersion"] == 2
+    assert harness_notice["payload"]["harness"] == "codex"
+
+    assert Enum.any?(
+             harness_notice["payload"]["capabilities"]["setHarness"]["options"],
+             fn option -> option["value"] == "codex" and option["enabled"] == false end
+           )
+
+    notices =
       capture_classes(fixture, notices, ["session.updated"], fn ->
         updated = Org.rename(fixture.db, main.session_key, "A4 authoritative rebuild")
       end)

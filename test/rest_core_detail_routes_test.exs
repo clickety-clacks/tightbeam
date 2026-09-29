@@ -376,6 +376,34 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     end
   end
 
+  test "session collection returns ordered canonical items limited to visible sessions", ctx do
+    outsider_device = outsider_device(ctx)
+    outsider_session = ensure_main_session(ctx.db, "outsider")
+    item = StateResources.session(outsider_session)
+    item_bytes = StateResources.encode_item("sessions", item, ctx.catalog)
+    expected = ~s({"schemaVersion":1,"resource":"sessions","items":[#{item_bytes}]})
+
+    collection = get(ctx, "/api/sessions", outsider_device.token)
+    assert collection.status == 200
+    assert_application_headers(collection)
+    assert collection.resp_body == expected
+    assert JSON.decode!(collection.resp_body)["items"] == [item]
+    refute collection.resp_body =~ ctx.admin_session.session_key
+
+    detail = get(ctx, "/api/sessions/#{outsider_session.session_key}", outsider_device.token)
+    assert detail.status == 200
+    assert JSON.decode!(detail.resp_body)["item"] == item
+
+    session_collection = get(ctx, "/api/sessions", outsider_session.cli_token)
+    assert session_collection.resp_body == expected
+
+    admin_collection = get(ctx, "/api/sessions", ctx.admin_device.token)
+    assert admin_collection.status == 200
+    admin_items = JSON.decode!(admin_collection.resp_body)["items"]
+    assert Enum.any?(admin_items, &(&1["sessionKey"] == ctx.admin_session.session_key))
+    assert Enum.any?(admin_items, &(&1["sessionKey"] == outsider_session.session_key))
+  end
+
   test "artifact archive and release notices equal the current ordered REST detail", ctx do
     workspace =
       Path.join(System.tmp_dir!(), "artifact-rest-#{System.unique_integer([:positive])}")

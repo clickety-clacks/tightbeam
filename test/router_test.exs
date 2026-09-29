@@ -38,6 +38,10 @@ defmodule Tightbeam.Wire.RouterTest do
   end
 
   test "changes route refuses missing upgrade or unsupported protocol before authentication" do
+    hub = :"router_refused_changes_hub_#{System.unique_integer([:positive])}"
+    start_supervised!({Tightbeam.Firehose.Hub, name: hub})
+    hub_before = :sys.get_state(hub)
+
     for {path, upgrade} <- [
           {"/ws/changes", false},
           {"/ws/changes?protocolVersion=1", false},
@@ -48,10 +52,12 @@ defmodule Tightbeam.Wire.RouterTest do
         ] do
       request = conn(:get, path)
       request = if upgrade, do: put_req_header(request, "upgrade", "websocket"), else: request
-      response = Router.call(request, Router.init([]))
+      response = Router.call(request, Router.init(firehose_hub: hub))
       assert response.status == 426
       assert response.resp_body == ""
     end
+
+    assert :sys.get_state(hub) == hub_before
   end
 
   setup do

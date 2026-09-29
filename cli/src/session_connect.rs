@@ -271,7 +271,8 @@ pub fn run(session_key: String, identity: Identity) -> Result<(), String> {
                             }
                         }
                         "subscription_ready" => {
-                            begin_snapshot(
+                            begin_snapshot_after_subscription_ready(
+                                &frame,
                                 &endpoint,
                                 &session_key,
                                 generation,
@@ -1413,6 +1414,20 @@ fn begin_snapshot(
     });
 }
 
+fn begin_snapshot_after_subscription_ready(
+    frame: &Value,
+    endpoint: &Endpoint,
+    session_key: &str,
+    generation: u64,
+    cycle: u64,
+    tx: &Sender<Worker>,
+    pending: &mut Option<PendingSnapshot>,
+) {
+    if frame.get("type").and_then(Value::as_str) == Some("subscription_ready") {
+        begin_snapshot(endpoint, session_key, generation, cycle, tx, pending);
+    }
+}
+
 fn close_failure(frame: Option<tungstenite::protocol::CloseFrame>) -> ConnectionFailure {
     let Some(frame) = frame else {
         return ConnectionFailure::recoverable("connection_lost", "gateway connection closed");
@@ -2119,7 +2134,17 @@ mod tests {
 
     fn respond_to_snapshot_request(stream: &mut TcpStream, request_number: usize) {
         let session = json!({
-            "item": {"rowVersion": 7, "clearedThroughSeq": 2}
+            "item": {
+                "sessionKey": "agent:main/example",
+                "rowVersion": 7,
+                "clearedThroughSeq": 2,
+                "capabilities": {
+                    "setHarness": {
+                        "supported": false,
+                        "reason": "session is not active"
+                    }
+                }
+            }
         });
         let collection = json!({
             "items": [],
@@ -2381,6 +2406,55 @@ mod tests {
                     && frame["payload"].get("capabilities").is_none()
         )));
         assert!(offer.contains("protocolVersion=2"));
+    }
+
+    #[test]
+    fn protocol_offer_exhaustion_rebuilds_once_per_empty_refusal_and_stops() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = endpoint(&listener);
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for protocol_version in [2, 1] {
+                let (mut refusal, _) = listener.accept().unwrap();
+                let offer = read_http_request(&mut refusal);
+                assert!(offer.starts_with(&format!(
+                    "GET /ws/changes?protocolVersion={protocol_version} HTTP/1.1"
+                )));
+                write!(
+                    refusal,
+                    "HTTP/1.1 426 Upgrade Required\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                )
+                .unwrap();
+                refusal.flush().unwrap();
+                drop(refusal);
+
+                let (mut rebuild, _) = listener.accept().unwrap();
+                let rebuild_request = read_http_request(&mut rebuild);
+                assert!(rebuild_request.starts_with("GET /api/sessions HTTP/1.1"));
+                assert_gateway_headers(&rebuild_request);
+                write_json_response(
+                    &mut rebuild,
+                    "200 OK",
+                    "",
+                    r#"{"schemaVersion":1,"items":[]}"#,
+                );
+                requests.push((offer, rebuild_request));
+            }
+            requests
+        });
+
+        let stopped = AtomicBool::new(false);
+        let failure = match connect_firehose(&endpoint, &stopped) {
+            Err(failure) => failure,
+            Ok(_) => panic!("protocol offers unexpectedly succeeded"),
+        };
+        let requests = server.join().unwrap();
+
+        assert_eq!(failure.code, "unsupported_protocol_version");
+        assert!(failure.fatal);
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].0.contains("protocolVersion=2"));
+        assert!(requests[1].0.contains("protocolVersion=1"));
     }
 
     #[test]
@@ -2995,6 +3069,188 @@ mod tests {
         worker.join().unwrap();
         let close = server.join().unwrap().expect("normal close frame");
         assert_eq!(u16::from(close.code), 1000);
+        assert_eq!(lifecycle_generation(&lifecycle), 0);
+    }
+
+    fn receive_closed(
+        rx: &std::sync::mpsc::Receiver<Worker>,
+        generation: u64,
+    ) -> ConnectionFailure {
+        loop {
+            match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+                Worker::Closed(actual, failure) if actual == generation => return failure,
+                Worker::Fatal(failure) => panic!("socket worker failed fatally: {}", failure.code),
+                _ => {}
+            }
+        }
+    }
+
+    fn receive_subscription_ready(
+        rx: &std::sync::mpsc::Receiver<Worker>,
+        generation: u64,
+    ) -> Value {
+        loop {
+            match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+                Worker::Frame(actual, frame)
+                    if actual == generation
+                        && frame.get("type").and_then(Value::as_str)
+                            == Some("subscription_ready") =>
+                {
+                    return frame;
+                }
+                Worker::Fatal(failure) => panic!("socket worker failed fatally: {}", failure.code),
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn sequence_gap_and_server_restart_reconnect_then_snapshot_after_ready() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = endpoint(&listener);
+        let snapshot_endpoint = endpoint.clone();
+        let session_key = "agent:main/example";
+        let encoded_key = encode_path(session_key);
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let (mut first, first_subscribe) = accept_subscribed_socket(stream, 2);
+            first
+                .send(Message::Text(
+                    json!({
+                        "type": "change",
+                        "schemaVersion": 2,
+                        "class": "session.updated",
+                        "seq": 2,
+                        "payload": {"sessionKey": session_key, "rowVersion": 8}
+                    })
+                    .to_string(),
+                ))
+                .unwrap();
+            drop(first);
+
+            let (stream, _) = listener.accept().unwrap();
+            let (mut second, second_subscribe) = accept_subscribed_socket(stream, 2);
+            second
+                .send(Message::Close(Some(tungstenite::protocol::CloseFrame {
+                    code: tungstenite::protocol::frame::coding::CloseCode::Restart,
+                    reason: "gateway restarting".into(),
+                })))
+                .unwrap();
+            drop(second);
+
+            let (stream, _) = listener.accept().unwrap();
+            let (mut third, third_subscribe) = accept_subscribed_socket(stream, 2);
+            let mut requests = Vec::new();
+            for request_number in 0..5 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_request(&mut stream);
+                assert_gateway_headers(&request);
+                respond_to_snapshot_request(&mut stream, request_number);
+                requests.push(request);
+            }
+            let close = third.read().unwrap();
+            (
+                first_subscribe,
+                second_subscribe,
+                third_subscribe,
+                requests,
+                close,
+            )
+        });
+
+        let stopped = Arc::new(AtomicBool::new(false));
+        let lifecycle = Arc::new(AtomicU64::new(0));
+        let (tx, rx) = mpsc::channel();
+        let snapshot_tx = tx.clone();
+        let worker = spawn_socket_worker(
+            endpoint,
+            session_key.to_owned(),
+            tx,
+            stopped.clone(),
+            lifecycle.clone(),
+        );
+
+        let gap = receive_closed(&rx, 1);
+        assert_eq!(gap.code, "connection_lost");
+        assert!(gap.message.contains("firehose sequence gap"));
+        assert!(!gap.fatal);
+
+        let restart = receive_closed(&rx, 2);
+        assert_eq!(restart.code, "server_restart");
+        assert_eq!(restart.close_code, Some(1012));
+        assert!(!restart.fatal);
+
+        let ready = receive_subscription_ready(&rx, 3);
+        let mut pending = None;
+        begin_snapshot_after_subscription_ready(
+            &json!({"type": "auth_result"}),
+            &snapshot_endpoint,
+            session_key,
+            3,
+            9,
+            &snapshot_tx,
+            &mut pending,
+        );
+        assert!(pending.is_none());
+
+        begin_snapshot_after_subscription_ready(
+            &ready,
+            &snapshot_endpoint,
+            session_key,
+            3,
+            9,
+            &snapshot_tx,
+            &mut pending,
+        );
+        assert!(matches!(
+            pending,
+            Some(PendingSnapshot {
+                generation: 3,
+                cycle: 9,
+                ..
+            })
+        ));
+
+        let snapshot = loop {
+            match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+                Worker::SnapshotResult {
+                    generation: 3,
+                    cycle: 9,
+                    result,
+                } => break result.unwrap(),
+                Worker::Fatal(failure) => panic!("socket worker failed fatally: {}", failure.code),
+                _ => {}
+            }
+        };
+        assert_eq!(snapshot.session["rowVersion"], 7);
+        assert_eq!(
+            snapshot.session["capabilities"]["setHarness"],
+            json!({"supported": false, "reason": "session is not active"})
+        );
+
+        stopped.store(true, Ordering::SeqCst);
+        worker.join().unwrap();
+        let (first_subscribe, second_subscribe, third_subscribe, requests, close) =
+            server.join().unwrap();
+        for subscribe in [first_subscribe, second_subscribe, third_subscribe] {
+            assert_eq!(subscribe["protocolVersion"], 2);
+        }
+        assert_eq!(requests.len(), 5);
+        assert!(requests[0].starts_with(&format!("GET /api/sessions/{encoded_key} HTTP/1.1")));
+        assert!(requests[1].starts_with(&format!(
+            "GET /api/sessions/{encoded_key}/messages?sessionKey={encoded_key}&limit=500 HTTP/1.1"
+        )));
+        assert!(requests[2].starts_with(&format!(
+            "GET /api/sessions/{encoded_key}/wakes?sessionKey={encoded_key}&limit=500 HTTP/1.1"
+        )));
+        assert!(requests[3].starts_with(&format!(
+            "GET /api/sessions/{encoded_key}/turns?sessionKey={encoded_key}&limit=500 HTTP/1.1"
+        )));
+        assert!(requests[4].starts_with(&format!("GET /api/sessions/{encoded_key} HTTP/1.1")));
+        assert!(matches!(
+            close,
+            Message::Close(Some(frame)) if u16::from(frame.code) == 1000
+        ));
         assert_eq!(lifecycle_generation(&lifecycle), 0);
     }
 
