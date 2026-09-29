@@ -996,10 +996,10 @@ defmodule Tightbeam.HarnessHealth do
     end
   end
 
-  # Health classification retains legacy text fallback for incident diagnosis,
-  # but replay requires a typed carrier from the failed protocol operation.
-  # Assistant output never reaches this path; message-only/bare-text reasons do
-  # not create a durable redelivery attempt.
+  # Health classification retains legacy text fallback for incident diagnosis.
+  # A replay uses the typed class only when it matches that diagnosis; otherwise
+  # the terminal failure takes the bounded unclassified-recovery path. Assistant
+  # output never reaches this function.
   defp typed_redelivery_failure_class(:task_crash), do: "task_crash"
   defp typed_redelivery_failure_class({:task_crash, _}), do: "task_crash"
 
@@ -1107,9 +1107,17 @@ defmodule Tightbeam.HarnessHealth do
             principal: turn.origin || "process:tightbeam"
           })
 
-        if typed_redelivery_failure_class(reason) == failure_class do
-          Wakes.record_health_redelivery_source_in_txn(txn, turn.seq, failure_class)
-        end
+        redelivery_failure_class =
+          case typed_redelivery_failure_class(reason) do
+            ^failure_class -> failure_class
+            _ -> "unclassified"
+          end
+
+        Wakes.record_health_redelivery_source_in_txn(
+          txn,
+          turn.seq,
+          redelivery_failure_class
+        )
 
         post_commit(result)
     end

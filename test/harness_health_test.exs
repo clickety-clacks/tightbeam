@@ -1545,38 +1545,66 @@ defmodule Tightbeam.HarnessHealthTest do
     )
   end
 
-  test "message-only failure text does not create a health redelivery attempt", ctx do
-    [first, second, healthy] = ctx.sessions
+  test "text-classified auth failure without a typed carrier redelivers once as unclassified",
+       ctx do
+    [first, _second, healthy] = ctx.sessions
+    first_session_key = first.session
 
-    Enum.each([{first, "text-source-1"}, {second, "text-source-2"}], fn {ref, message_id} ->
-      fail_health_turn!(ctx.db, ref.session, message_id, "original prompt", "auth expired")
-    end)
+    source =
+      fail_health_turn!(
+        ctx.db,
+        first.session,
+        "text-source-1",
+        "original prompt 1",
+        %{"code" => -32000, "message" => "Authentication required"}
+      )
 
-    fail_health_turn!(
-      ctx.db,
-      first.session,
-      "structured-interrupted-source",
-      "original interrupted prompt",
-      %{
-        "message" => "interrupted: outcome unknown",
-        "data" => %{"kind" => "synthetic-error"}
-      }
-    )
-
-    assert [incident] = HarnessHealth.active(ctx.db)
-    assert incident.failureClass == "auth-dead"
-
-    _restoration = restore_health_turn!(ctx.db, healthy.session, "text-restoration")
-
-    assert HarnessHealth.get(ctx.db, incident.id).state == "resolved"
-    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM health_redelivery_attempts")
-
-    assert {:ok, [[0]]} =
+    assert {:ok, [["auth-dead"]]} =
              DB.query(
                ctx.db,
-               "SELECT COUNT(*) FROM turns WHERE messageId IN " <>
-                 "('text-source-1','text-source-2','structured-interrupted-source') " <>
-                 "AND status='queued'"
+               "SELECT failureClass FROM harness_health_observations WHERE correlationId=?1",
+               ["harness-turn:#{source.seq}:auth-dead"]
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM health_redelivery_attempts " <>
+                 "WHERE failureClass='unclassified' AND redeliveryTurnSeq IS NULL"
+             )
+
+    restoration = restore_health_turn!(ctx.db, healthy.session, "text-restoration")
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM health_redelivery_attempts " <>
+                 "WHERE failureClass='unclassified' AND restorationTurnSeq=?1 " <>
+                 "AND redeliveryTurnSeq IS NOT NULL",
+               [restoration.seq]
+             )
+
+    assert {:ok,
+            [
+              [
+                "text-source-1",
+                ^first_session_key,
+                "agent:health-redelivery",
+                "original prompt 1"
+              ]
+            ]} =
+             DB.query(
+               ctx.db,
+               "SELECT messageId,sessionKey,origin,prompt FROM turns " <>
+                 "WHERE messageId=?1 AND status='queued'",
+               ["text-source-1"]
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM turns WHERE messageId=?1 AND status='failed'",
+               ["text-source-1"]
              )
   end
 
