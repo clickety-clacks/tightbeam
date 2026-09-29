@@ -282,7 +282,9 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
     assert detail =~ "#{replacement_seq}"
   end
 
-  test "replacement delivery claims next and keeps the source turn durable", %{db: db} do
+  test "replacement delivery claims next and keeps source durable when request time regresses", %{
+    db: db
+  } do
     assignment!(db, "asg_next")
     session!(db, "sender")
 
@@ -304,6 +306,18 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
 
     old_seq = deliver_wake!(db, old_wake)
 
+    # The production edge is two requests in one millisecond. Put the older
+    # durable request ahead of the current wall clock to exercise that tie
+    # deterministically, including a clock step backward between requests.
+    old_request_at = System.system_time(:millisecond) + 60_000
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "UPDATE queued_message_replacement_requests SET requestedAt=?1 WHERE wakeId=?2",
+        [old_request_at, old_wake.wake_id]
+      )
+
     wake =
       Wakes.schedule(db, %{
         session_key: "k1",
@@ -315,6 +329,15 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
       })
 
     new_seq = deliver_wake!(db, wake)
+
+    assert {:ok, [[new_request_at]]} =
+             DB.query(
+               db,
+               "SELECT requestedAt FROM queued_message_replacement_requests WHERE wakeId=?1",
+               [wake.wake_id]
+             )
+
+    assert new_request_at > old_request_at
 
     assert {:ok, %{seq: ^new_seq, prompt: "[from session:sender]\n\nnew prompt"}} =
              Ledger.claim_next(db, "k1", "lane")
