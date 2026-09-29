@@ -65,6 +65,10 @@ jobs:
       - name: Public rule facts never shrink
         run: python3 scripts/verify_public_rule_facts.py
 
+      - name: Set setup-beam target for the self-hosted macOS runner
+        if: matrix.name == 'macos' && runner.environment == 'self-hosted'
+        run: echo "ImageOS=macos26" >> "$GITHUB_ENV"
+
       # ONE pinned BEAM for every platform. erlef/setup-beam does support macOS
       # runners (OTP 25-29 on macOS-14/15/26) — the earlier "linux and windows
       # only" reading was wrong, and brew cost us the parity the matrix exists
