@@ -17,48 +17,93 @@ preserved result.
 - Use a disposable test base and an unused port. Never resolve a path to a live
   base. Do not install a package on Gibson.
 - For CLI rows, `tightbeam` means the absolute-path CLI from the same verified
-  0.1.9 package as the gateway under test. Configure it for the disposable area
-  base; do not let `PATH` select an unrelated installed CLI.
+  0.1.9 package as the gateway under test. The CLI resolves an ancestor
+  `.tightbeam-session` first, then `TIGHTBEAM_URL` plus `TIGHTBEAM_TOKEN`,
+  and only then `TIGHTBEAM_BASE_DIR`. Run every CLI call from a disposable
+  shell working directory whose ancestors up to `/` contain no
+  `.tightbeam-session`; stop if that cannot be verified. Unset
+  `TIGHTBEAM_URL` and `TIGHTBEAM_TOKEN` in that shell and keep them unset
+  for every call. Then set `TIGHTBEAM_BASE_DIR` to the disposable area base.
+  Do not let `PATH` select an unrelated installed CLI.
+  The `identity current` row is the deliberate exception: use only the fresh
+  marker of its throwaway test session, and first confirm its URL and token
+  match that area's loopback endpoint and `gateway.json` without printing the
+  token. A CLI call made by a test session must use that test base's freshly
+  provisioned marker; never use a marker from the operator's current session.
+
+  Establish that shell before running any CLI row, then leave its working
+  directory unchanged for those calls:
+
+  ```sh
+  cli_cwd="$(mktemp -d "${TMPDIR:-/tmp}/tightbeam-cli.XXXXXX")"
+  cd "$cli_cwd"
+  directory="$(pwd -P)"
+  while :; do
+    test ! -e "$directory/.tightbeam-session" || {
+      echo "session marker in CLI working-directory ancestry; stop" >&2
+      exit 1
+    }
+    test "$directory" = "/" && break
+    directory="$(dirname "$directory")"
+  done
+  unset TIGHTBEAM_URL TIGHTBEAM_TOKEN
+  ```
+
 - Start the migration rehearsal from an operator-supplied, verified copy of a
   real 0.1.8 `state.db`. Do not copy `gateway.json`, provider credentials,
   harness homes, or identity state from the source base.
-- Provision any feature-smoke harness credentials separately on the permitted
-  test host through its approved onboarding route. Do not onboard from a smoke
-  script or copy credentials from another base. Keep tokens, credential bytes,
-  request bodies, and private database content out of scorecards and artifacts.
+- Do not give the copied org access to the test host's existing harness
+  credentials. The copied sessions must not inherit a provider credential or
+  a route to a real host.
 - If a check needs an incident, failed turn, pending placement, provider grant,
   or other real prerequisite that is absent, record it as `INCOMPLETE` with the
   missing prerequisite. Do not fabricate a success with synthetic state.
 
+### Safe stop before copied-org gateway boot
+
+The current 0.1.9 source has no supported quiescent boot mode for a database
+copied from a real org. Before starting, `Gateway` performs liveness recovery,
+and `LaneManager` immediately reconciles pending sessions at startup; pending
+turns can start before a runbook check begins. The wake and supervision
+interval settings delay periodic scans but do not disable that initial work.
+The copied `hosts` rows can also name SSH destinations. No current runbook
+step proves those routes, wakes, supervision work, or provider credentials are
+inert on a real-org copy.
+
+Therefore, stop before the first 0.1.9 gateway boot in both the migration and
+feature-area procedures until the PO records a source-backed isolation path
+that keeps copied sessions, turns, wakes, remote hosts, and credentials from
+acting. Do not try to create that path by editing the copied database, deleting
+its rows, pre-seeding build markers, changing private release config, or
+extending scan intervals. Record the migration or area as `INCOMPLETE` and
+leave the source and migrated result unapproved. A local bind address or
+network block alone does not prevent copied work from being reconciled inside
+the gateway.
+
+The feature smoke also follows that boundary: it no longer sweeps pre-existing
+open work or applies identity to every copied session. Each invocation creates
+its own unique fixtures. If it stops part-way through, discard that area copy
+and make a fresh one from the preserved migration result; do not clean unrelated
+rows to prepare a retry.
+
 ## Aggregate run
 
 1. Read [`migration.md`](migration.md) and qualify the real 0.1.8 source copy.
-   Run the 0.1.9 package against one isolated migration base exactly once.
-   Stop it cleanly, save the migrated `state.db` and its non-secret manifest,
-   and leave the source copy read-only. Do not continue if a stamp, integrity,
-   foreign-key, version, or unexplained row-count check fails.
-2. Provision a disposable feature-test base on the same permitted host with a
-   fresh gateway descriptor and the host's already-authorized harness setup.
-   For each area, clone that base into a new directory while the gateway is
-   stopped, then replace its `state.db` with a fresh copy of the preserved
-   migrated database. This keeps the test host's authorized setup while leaving
-   source-base credentials and configuration behind. Use a distinct port and
-   base for each run. Start the verified 0.1.9 gateway on that clone with
-   `TIGHTBEAM_BASE_DIR`, `TIGHTBEAM_PORT` and `TIGHTBEAM_ADVERTISED_URL` set
-   explicitly, and keep it running for the scripted and manual checks:
-
-   ```sh
-   gateway_bin="/path/to/verified-0.1.9/tightbeam/bin/tightbeam-gateway"
-   TIGHTBEAM_BASE_DIR="$AREA_BASE" \
-   TIGHTBEAM_PORT="$AREA_PORT" \
-   TIGHTBEAM_ADVERTISED_URL="ws://127.0.0.1:$AREA_PORT" \
-   TIGHTBEAM_EFFORT_CHECKIN_HORIZON_MS=250 \
-   "$gateway_bin"
-   ```
-
-   In the feature tables, `tightbeam` denotes the same package's absolute-path
-   CLI. Run each call with `TIGHTBEAM_BASE_DIR="$AREA_BASE"` so it targets this
-   clone.
+   The current source-backed isolation stop blocks package boot. Do not
+   continue until the PO records an approved boot path and the migration
+   runbook is updated to use it. Then run the 0.1.9 package against one
+   isolated migration base exactly once, stop it cleanly, save the migrated
+   `state.db` and its non-secret manifest, and leave the source copy read-only.
+   Do not continue if a stamp, integrity, foreign-key, version, or unexplained
+   row-count check fails.
+2. After the approved isolation path is in place, create a fresh gateway
+   descriptor for each disposable feature base and copy in a new copy of the
+   preserved migrated database while the gateway is stopped. Do not attach
+   credentials until the approved path proves copied sessions cannot use them.
+   Use a distinct port and base for each run. Start the verified 0.1.9 gateway
+   only by the exact source-backed command in the approved path. In the feature
+   tables, `tightbeam` denotes the same package's absolute-path CLI; the
+   endpoint precedence checks above apply to every call.
 3. Run the complete scripted smoke once on a disposable clone:
 
    ```sh
@@ -89,8 +134,8 @@ host/provider state.
 | Provider and runtime | `provider` | Local deployment, identity and onboarding surfaces | [provider-runtime.md](provider-runtime.md) |
 | Work and routing | `work` | Facts/config reads, item/assignment reads, dispatch, body and direct-owner patch/clear | [work-routing.md](work-routing.md) |
 | Decisions and assignments | `decisions` | Effort check-in, review loop, cannot-proceed handoff | [decisions-assignments.md](decisions-assignments.md) |
-| Telemetry | `telemetry` | Breathing, execution map/selection, durable Topline lifecycle and roster | [telemetry.md](telemetry.md) |
-| Artifacts | `artifacts` | Gate enforcement, real-turn artifact carrier and captured-content fetch | [artifacts.md](artifacts.md) |
+| Telemetry | `telemetry` | Breathing, execution map/selection, and durable Topline lifecycle/list | [telemetry.md](telemetry.md) |
+| Artifacts | `artifacts` | Gate enforcement, real-turn artifact carrier, and structured `content_not_captured` with matching metadata; this does not cover positive captured-content retrieval | [artifacts.md](artifacts.md) |
 
 ## 0.1.9 must-land coverage
 
@@ -99,6 +144,9 @@ item has no operator-facing E2E path. The linked rows give the concrete action
 and pass condition. Source-CI rows are covered by the unchanged
 `scripts/verify_mix.sh` merge checks; they do not invoke the new feature-smoke,
 real-snapshot migration or aggregate procedures.
+The artifacts area also checks the truthful uncaptured result for its newly
+registered fixture. No source-backed capture lifecycle or fixture is available
+for positive content-fetch coverage, so this check does not claim one.
 
 | Must-land | E2E coverage |
 |---|---|

@@ -5,9 +5,11 @@ shared limits in the [aggregate](README.md#execution-contract).
 
 ## Scripted area
 
-Prepare a fresh area clone and start its gateway as described in the
-[aggregate](README.md#aggregate-run). From the repository root on Racter or
-Eezo, have the unchanged canonical wrapper execute:
+The shared [safe-stop](README.md#safe-stop-before-copied-org-gateway-boot)
+blocks boot on this copied database. Do not start it until the PO records the
+source-backed isolation path and this runbook names its supported use. Once
+cleared, prepare a fresh area clone and use that route before the unchanged
+canonical wrapper on Racter or Eezo executes:
 
 ```sh
 TIGHTBEAM_BASE_DIR="$AREA_BASE" \

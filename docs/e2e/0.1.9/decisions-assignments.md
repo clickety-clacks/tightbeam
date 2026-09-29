@@ -6,9 +6,11 @@ and assignment below must belong to the disposable test org.
 
 ## Scripted area
 
-Prepare a fresh area clone and start its gateway as described in the
-[aggregate](README.md#aggregate-run). From the repository root on Racter or
-Eezo, have the unchanged canonical wrapper execute:
+The shared [safe-stop](README.md#safe-stop-before-copied-org-gateway-boot)
+blocks boot on this copied database. Do not start it until the PO records the
+source-backed isolation path and this runbook names its supported use. Once
+cleared, prepare a fresh area clone and use that route before the unchanged
+canonical wrapper on Racter or Eezo executes:
 
 ```sh
 TIGHTBEAM_BASE_DIR="$AREA_BASE" \
@@ -35,7 +37,7 @@ durable row; it does not treat a command response alone as proof.
 | <a id="completion-while-blocked"></a>Completion while blocked | Give a disposable successor assignment an unfinished predecessor. Attempt its completion attest before the predecessor completes, then complete the predecessor and retry. | The first attempt is refused and the successor remains open; after the real blocker clears, one completion closes it. |
 | <a id="stop-and-redirect"></a>Stop and redirect | Start one harmless turn on a throwaway assignment, stop it with `assignment-stop-turn <assignment> --reason ...`, then send the replacement instruction to the intended disposable holder. | The old turn reaches its stopped outcome before the replacement turn begins; readback ties the new message to the selected holder and leaves other queued work alone. |
 | <a id="stop-running-turn"></a>Stop a running assignment turn | Start a deliberately long, harmless turn on a throwaway assignment. Record its session and turn sequence, then run `assignment-stop-turn <assignment> --reason ...`. | The exact in-flight turn reaches the documented stopped outcome and no unrelated turn or assignment changes. Do not issue this command against an ordinary active assignment. |
-| Revoke with reason | Revoke a separate open test assignment using `revoke-assignment <id> --reason ...`. | The exact assignment closes and `assignment-get`/`work-item-trace` retain the reason; no other assignment changes. |
+| Revoke with reason | Revoke a separate open test assignment using `revoke-assignment <id> --reason ...`. | The exact assignment closes and `work-item-trace <workItemId>` retains the reason; no other assignment changes. |
 | Reopen an assignment | Close a disposable assignment through its supported terminal path, then run `reopen-assignment <id> --reason ...`. | Readback shows the same assignment reopened according to the command's response contract; its work-item and holder links remain exact. |
 | <a id="failed-turn-remains-failed-and-can-be-redelivered"></a>Failed turn remains failed and can be redelivered | Use only a genuine failed turn in the disposable org. Read its failed outcome before choosing one supported `repair-assignment <id> --action tune|restart|rerun|resume|relaunch --key ...` action, then read the new turn and assignment. | The original turn remains failed; the repair creates only the requested recovery attempt, and its terminal result is independently reported. A timeout that is still running is not a failed-turn fixture. Mark `INCOMPLETE` if no genuine failed turn occurs. |
 | Repair a failed assignment | Use a genuine failed or never-launched disposable turn and run one appropriate `repair-assignment` action with the required evidence and explicit key. | The response and subsequent assignment/turn reads show only the requested repair action. A merely slow or running turn is not a failed-turn fixture. |

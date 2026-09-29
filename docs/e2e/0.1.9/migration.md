@@ -102,7 +102,23 @@ approved value, the source copy fails integrity checks, or the input digest
 does not match its verified provenance. Do not inspect DDL to guess a
 replacement stamp.
 
-## Run the migration once
+## Admission stop for the current 0.1.9 package
+
+A copied 0.1.8 database is an existing unmarked base. Current 0.1.9 build
+admission refuses that state with `build_transition_required`, and the
+packaged gateway exposes no supported operator input for the required
+`live_base_guard` transition. Do not pre-seed a `build-owner.json` marker,
+edit private release configuration, or otherwise bypass admission.
+
+The copied-org boot is also held by the shared
+[safe-stop condition](README.md#safe-stop-before-copied-org-gateway-boot):
+current startup recovers and reconciles copied work before the migration checks
+can begin. Stop here and record `E2E migration: INCOMPLETE` until the PO
+records a supported build-admission route and source-backed isolation path,
+then updates this procedure with their exact use. Do not run the gateway
+command below while either condition remains unresolved.
+
+## Run the migration once after the stop is cleared
 
 Use the hash-verified 0.1.9 package built from the authorized target source
 commit. Set a unique scratch base and port explicitly. Start the packaged
@@ -189,14 +205,14 @@ existing_request="replace-with-real-decision-request-id"
 existing_artifact="replace-with-real-artifact-id"
 TIGHTBEAM_BASE_DIR="$test_base" /path/to/verified-0.1.9/tightbeam/bin/tightbeam list --as-user "$test_admin"
 TIGHTBEAM_BASE_DIR="$test_base" /path/to/verified-0.1.9/tightbeam/bin/tightbeam work-item-get "$existing_work_item" --as-user "$test_admin"
-TIGHTBEAM_BASE_DIR="$test_base" /path/to/verified-0.1.9/tightbeam/bin/tightbeam assignment-get "$existing_assignment" --as-user "$test_admin"
 TIGHTBEAM_BASE_DIR="$test_base" /path/to/verified-0.1.9/tightbeam/bin/tightbeam decision-request --request "$existing_request" --as-user "$test_admin"
 TIGHTBEAM_BASE_DIR="$test_base" /path/to/verified-0.1.9/tightbeam/bin/tightbeam artifacts --as-user "$test_admin"
 ```
 
-Confirm `existing_artifact` appears in the artifact listing; a content fetch is
-not required because a historical artifact's bytes may never have been
-captured.
+Choose `existing_assignment` from `existing_work_item` so the read returns
+that exact assignment in the work item's `assignments` field. Confirm
+`existing_artifact` appears in the artifact listing; a content fetch is not
+required because a historical artifact's bytes may never have been captured.
 
 Stop the isolated gateway through its packaged `tightbeam-gateway stop` command
 with the same explicit `TIGHTBEAM_BASE_DIR`, then confirm its recorded process

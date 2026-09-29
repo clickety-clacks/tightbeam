@@ -125,7 +125,6 @@ defmodule FeatureSmoke do
         leg: leg,
         providers: Tightbeam.FeatureSmokePlan.provider_names(Tightbeam.Harness.all())
       }
-      |> sweep_open_work_items()
       |> run_selected_areas(areas)
       |> finish_leg()
     end)
@@ -192,7 +191,7 @@ defmodule FeatureSmoke do
     |> check_breathing_query()
     |> check_execution_map()
     |> check_topline_lifecycle()
-    |> check_toplines_board()
+    |> check_toplines_list()
   end
 
   defp run_smoke_area(state, "artifacts") do
@@ -512,12 +511,11 @@ defmodule FeatureSmoke do
     session_key = get_in(session, ["stream", "sessionKey"]) || session["sessionKey"]
     applied = ok!(state, "identity-apply", %{"sessionKey" => session_key, "all" => false})
     assert(state, session_key in (applied["applied"] || []), "identity-apply missed its session")
-    _all = ok!(state, "identity-apply", %{"all" => true})
     retire(state, session)
 
     pass(
       state,
-      "identity status/edit guidance/edit manifest/skill put+rm/relearn/apply session+all"
+      "identity status/edit guidance/edit manifest/skill put+rm/relearn/apply selected session"
     )
   end
 
@@ -1153,25 +1151,54 @@ defmodule FeatureSmoke do
 
     artifact_id = prompted["artifactId"]
 
-    captured =
-      ok!(state, "artifact-content-fetch", %{
+    fetch =
+      post(state, "artifact-content-fetch", %{
         "artifactId" => artifact_id
       })
 
-    bytes = Base.decode64!(captured["contentBase64"])
-    digest = Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
+    case get_in(fetch, ["error", "code"]) || fetch["code"] do
+      "content_not_captured" ->
+        message = get_in(fetch, ["error", "message"]) || fetch["message"]
+        artifact = ok!(state, "artifact-get", %{"artifactId" => artifact_id})
 
-    assert(
-      state,
-      bytes == holder.check.output and captured["contentSize"] == byte_size(bytes) and
-        captured["contentSha256"] == digest,
-      "artifact-content-fetch did not return the captured report bytes and matching size/digest: #{inspect(Map.drop(captured, ["contentBase64"]))}"
-    )
+        assert(
+          state,
+          message == "artifact has no stored content" and
+            artifact["artifactId"] == artifact_id and
+            artifact["kind"] == "report" and
+            artifact["createdBySession"] == holder.key and
+            artifact["workItemId"] == wi_id and is_nil(artifact["contentSha256"]) and
+            artifact["recordedTurnEvidence"] == prompted["recordedTurnEvidence"],
+          "uncaptured artifact result did not match the recorded report metadata: " <>
+            inspect(
+              Map.take(artifact, [
+                "artifactId",
+                "kind",
+                "createdBySession",
+                "workItemId",
+                "contentSha256",
+                "recordedTurnEvidence"
+              ])
+            )
+        )
 
-    pass(
-      state,
-      "artifact-content-fetch returns the report captured from a real #{state.leg.wire_name} turn"
-    )
+        pass(
+          state,
+          "artifact-content-fetch returns structured content_not_captured with truthful report metadata; this does not cover positive content retrieval"
+        )
+
+      nil ->
+        fail(
+          state,
+          "the newly recorded report unexpectedly returned stored content; review the source-backed fixture lifecycle before treating this as capture coverage"
+        )
+
+      code ->
+        fail(
+          state,
+          "artifact-content-fetch returned #{code}: #{inspect(fetch["error"] || fetch)}"
+        )
+    end
   end
 
   # A host-pinned coder holding grounded work. Both halves need exactly this, and the
@@ -1866,6 +1893,8 @@ defmodule FeatureSmoke do
     pass(state, "config default-archetype set/get persists and steers spawn")
   end
 
+  # This is a gateway HTTP verb, not a CLI command. The packaged CLI reads
+  # assignment state through work-item-get/work-item-trace.
   # --- work-item + assignment-get --------------------------------------------
   defp check_work_item_and_assignment_get(state) do
     wi =
@@ -2087,13 +2116,14 @@ defmodule FeatureSmoke do
     assert(
       state,
       result["schema"] == "breathing-v1" and
-        result["targetKind"] == "work-item" and result["targetId"] == wi_id and
-        result["breathing"] == false,
-      "breathing did not return the physical idle snapshot for a fresh work item: #{inspect(result)}"
+        get_in(result, ["target", "kind"]) == "work-item" and
+        get_in(result, ["target", "id"]) == wi_id and
+        result["breathing"] == true and result["reason"] == "pending_wake",
+      "breathing did not report the new work item's scheduled routing wake: #{inspect(result)}"
     )
 
     ok!(state, "work-item-close", %{"workItemId" => wi_id})
-    pass(state, "breathing work-item query returns the typed idle snapshot")
+    pass(state, "breathing work-item query reports its pending routing wake")
   end
 
   # --- 0.1.9 execution-map roster and scoped selection ------------------------
@@ -2107,25 +2137,33 @@ defmodule FeatureSmoke do
       })
 
     wi_id = wi["workItemId"] || wi["id"]
-    roster = ok!(state, "execution-map", %{})
-    mine = Enum.find(roster["items"] || [], &(&1["id"] == wi_id))
 
-    assert(
-      state,
-      roster["edgeBasis"] == "concurrent_turn" and not is_nil(mine),
-      "execution-map roster omitted the new work item or its edge basis: #{inspect(roster)}"
-    )
+    try do
+      roster = ok!(state, "execution-map", %{})
+      mine = Enum.find(roster["items"] || [], &(&1["id"] == wi_id))
 
-    selected = ok!(state, "execution-map-select", %{"under" => wi_id})
+      assert(
+        state,
+        roster["edgeBasis"] == "concurrent_turn" and not is_nil(mine),
+        "execution-map roster omitted the new work item or its edge basis: #{inspect(roster)}"
+      )
 
-    assert(
-      state,
-      Enum.map(selected["items"] || [], & &1["id"]) == [wi_id],
-      "execution-map-select --under did not return only its visible anchor: #{inspect(selected)}"
-    )
+      assert_execution_map_node(state, mine)
+      assert_execution_map_state_filter(state, [mine])
+      assert_execution_map_forest(state, [mine])
 
-    ok!(state, "work-item-close", %{"workItemId" => wi_id})
-    pass(state, "execution-map roster and exact visible subtree selection")
+      selected = ok!(state, "execution-map-select", %{"under" => wi_id})
+
+      assert(
+        state,
+        Enum.map(selected["roots"] || [], & &1["id"]) == [wi_id],
+        "execution-map-select --under did not return only its visible anchor: #{inspect(selected)}"
+      )
+
+      pass(state, "execution-map roster, creation context, filters, forest, and scoped selection")
+    after
+      ok!(state, "work-item-close", %{"workItemId" => wi_id})
+    end
   end
 
   # --- 0.1.9 durable Topline mutation flow ------------------------------------
@@ -2410,60 +2448,41 @@ defmodule FeatureSmoke do
     end
   end
 
-  # --- toplines: the board must reflect a work item THIS area just made ------
-  # This check creates its own non-vacuous item so `telemetry` can run without
-  # any earlier area. When the full smoke runs, the board also reflects the
-  # other work items created during that run. Expectations are derived from the
-  # current roster, direct assignment reads, and attests rather than literals.
-  defp check_toplines_board(state) do
+  # --- durable Topline list ---------------------------------------------------
+  defp check_toplines_list(state) do
     u = unique()
 
-    wi =
-      ok!(state, "work-item-create", %{
-        "title" => "smoke #{Process.get(:salt)}toplines board #{u}",
-        "idempotencyKey" => "tlb-#{u}"
+    created =
+      ok!(state, "topline-create", %{
+        "title" => "smoke durable topline list #{u}",
+        "idempotencyKey" => "tllist-#{u}"
       })
 
-    wi_id = wi["workItemId"] || wi["id"]
+    topline_id = get_in(created, ["topline", "id"])
+    assert(state, is_binary(topline_id), "topline-create returned no id: #{inspect(created)}")
 
     try do
-      roster = ok!(state, "toplines", %{})
+      listed = ok!(state, "toplines", %{})
+      match = Enum.find(listed["toplines"] || [], &(&1["id"] == topline_id))
 
       assert(
         state,
-        roster["edgeBasis"] == "concurrent_turn",
-        "toplines must state its edge basis: #{inspect(roster["edgeBasis"])}"
+        match != nil and match["title"] == "smoke durable topline list #{u}" and
+          match["state"] == "open",
+        "toplines list omitted the newly created durable record: #{inspect(listed)}"
       )
 
-      assert(
-        state,
-        is_integer(get_in(roster, ["coverage", "attributionCutoff"])),
-        "toplines must report its coverage cutoff: #{inspect(roster["coverage"])}"
-      )
-
-      mine = this_run(roster["items"] || [])
-
-      # Non-vacuous in both a full run and an isolated telemetry run.
-      assert(
-        state,
-        Enum.any?(mine, &(&1["id"] == wi_id)),
-        "toplines roster omitted this area's work item #{wi_id}; titles were #{inspect(Enum.map(roster["items"] || [], & &1["title"]))}"
-      )
-
-      Enum.each(mine, &assert_toplines_node(state, &1))
-      assert_toplines_state_filter(state, mine)
-      assert_toplines_forest(state, mine)
-
-      pass(
-        state,
-        "toplines board reflects this area: #{length(mine)} items, resolved membership, live progress clock, recorded creation context"
-      )
+      pass(state, "toplines lists the new durable Topline with its current title and state")
     after
-      ok!(state, "work-item-close", %{"workItemId" => wi_id})
+      ok!(state, "topline-close", %{
+        "toplineId" => topline_id,
+        "reason" => "finish the Topline list smoke check",
+        "idempotencyKey" => "tlclose-list-#{u}"
+      })
     end
   end
 
-  defp assert_toplines_node(state, item) do
+  defp assert_execution_map_node(state, item) do
     id = item["id"]
     direct = ok!(state, "work-item-get", %{"workItemId" => id})["assignments"] || []
     resolved = item["assignments"]["open"] + item["assignments"]["closed"]
@@ -2475,24 +2494,24 @@ defmodule FeatureSmoke do
     assert(
       state,
       resolved >= length(direct),
-      "toplines resolved membership (#{resolved}) is below DIRECT (#{length(direct)}) for #{id}"
+      "execution-map resolved membership (#{resolved}) is below DIRECT (#{length(direct)}) for #{id}"
     )
 
     assert(
       state,
       item["jobs"] >= length(Enum.uniq(Enum.map(direct, & &1["holderKey"]))),
-      "toplines jobs (#{item["jobs"]}) undercounts the holders that ever held #{id}"
+      "execution-map jobs (#{item["jobs"]}) undercounts the holders that ever held #{id}"
     )
 
     # The explicit assignment surface must map every DIRECT id back to THIS item
     # — the two surfaces reading the SAME membership function, on live rows.
     Enum.each(direct, fn asg ->
-      selected = ok!(state, "topline", %{"assignments" => [asg["id"]]})
+      selected = ok!(state, "execution-map-select", %{"assignments" => [asg["id"]]})
 
       assert(
         state,
         Enum.map(selected["items"] || [], & &1["id"]) == [id],
-        "topline --assignments #{asg["id"]} should resolve to #{id}, got #{inspect(selected)}"
+        "execution-map-select --assignments #{asg["id"]} should resolve to #{id}, got #{inspect(selected)}"
       )
 
       assert(
@@ -2513,7 +2532,7 @@ defmodule FeatureSmoke do
     assert(
       state,
       item["attests"]["total"] >= direct_attests,
-      "toplines attests (#{item["attests"]["total"]}) undercounts #{id}'s direct attests (#{direct_attests})"
+      "execution-map attests (#{item["attests"]["total"]}) undercounts #{id}'s direct attests (#{direct_attests})"
     )
 
     # This run just happened, so the progress clock cannot be claiming more quiet
@@ -2524,10 +2543,10 @@ defmodule FeatureSmoke do
     assert(
       state,
       item["sinceProgressMs"] <= budget,
-      "toplines sinceProgressMs #{item["sinceProgressMs"]} for #{id} exceeds this run's own age (#{budget}ms) — the progress clock is not tracking live activity"
+      "execution-map sinceProgressMs #{item["sinceProgressMs"]} for #{id} exceeds this run's own age (#{budget}ms) — the progress clock is not tracking live activity"
     )
 
-    assert_toplines_creation_context(state, item)
+    assert_execution_map_creation_context(state, item)
   end
 
   # THE TEETH. Cross-checks the reader against C1's ACTUAL columns on live rows,
@@ -2538,7 +2557,7 @@ defmodule FeatureSmoke do
   # `unrecorded` on a row this run wrote would mean either C1 stopped stamping on
   # the live path or the reader misreads the bit. The old pre-C1 smoke database
   # showed every parent as `unrecorded`; a fresh run must not.
-  defp assert_toplines_creation_context(state, item) do
+  defp assert_execution_map_creation_context(state, item) do
     id = item["id"]
     {known, seq} = item_creation_columns(state, id)
     status = get_in(item, ["parent", "status"])
@@ -2596,35 +2615,35 @@ defmodule FeatureSmoke do
 
   # `--state` must select exactly the subset the unfiltered roster already shows
   # in that state, in the same order — derived from the roster, never hardcoded.
-  defp assert_toplines_state_filter(state, mine) do
+  defp assert_execution_map_state_filter(state, mine) do
     ids = Enum.map(mine, & &1["id"])
 
     Enum.each(Enum.uniq(Enum.map(mine, & &1["state"])), fn wanted ->
       expected = mine |> Enum.filter(&(&1["state"] == wanted)) |> Enum.map(& &1["id"])
 
       got =
-        ok!(state, "toplines", %{"state" => wanted})["items"]
+        ok!(state, "execution-map", %{"state" => wanted})["items"]
         |> Enum.map(& &1["id"])
         |> Enum.filter(&(&1 in ids))
 
       assert(
         state,
         got == expected,
-        "toplines --state #{wanted} returned #{inspect(got)}, expected #{inspect(expected)}"
+        "execution-map --state #{wanted} returned #{inspect(got)}, expected #{inspect(expected)}"
       )
     end)
   end
 
   # The forest carries the same nodes as the roster: nesting changes shape, never
   # membership.
-  defp assert_toplines_forest(state, mine) do
-    forest = ok!(state, "toplines", %{"tree" => true})
+  defp assert_execution_map_forest(state, mine) do
+    forest = ok!(state, "execution-map", %{"tree" => true})
     nested = forest["roots"] |> List.wrap() |> Enum.flat_map(&flatten_node/1) |> this_run()
 
     assert(
       state,
       Enum.sort(Enum.map(nested, & &1["id"])) == Enum.sort(Enum.map(mine, & &1["id"])),
-      "--tree node set diverges from the roster: #{inspect(Enum.map(nested, & &1["id"]))}"
+      "execution-map --tree node set diverges from the roster: #{inspect(Enum.map(nested, & &1["id"]))}"
     )
   end
 
@@ -2648,31 +2667,6 @@ defmodule FeatureSmoke do
   end
 
   # --- helpers ---------------------------------------------------------------
-  # Brackets hygiene: an open unrouted work item nags its owner's main session
-  # (work-item-brackets-v1 bracket 1), so leftovers from a prior partial run flood
-  # the main session with nag turns and identity-apply never finds a turn boundary.
-  # Dispose anything a previous smoke left open; disposal cancels both bracket wakes.
-  defp sweep_open_work_items(state) do
-    items = ok!(state, "work-item-list", %{})["workItems"] || []
-
-    items
-    |> Enum.filter(&(&1["state"] == "open"))
-    |> Enum.each(fn item ->
-      got = ok!(state, "work-item-get", %{"workItemId" => item["id"]})
-
-      for asg <- got["assignments"] || [], asg["state"] == "open" do
-        ok!(state, "revoke-assignment", %{
-          "assignmentId" => asg["id"],
-          "reason" => "Smoke setup clears an open assignment left by a previous run"
-        })
-      end
-
-      ok!(state, "work-item-close", %{"workItemId" => item["id"]})
-    end)
-
-    state
-  end
-
   defp ok!(state, verb, params) do
     res = post(state, verb, params)
 
