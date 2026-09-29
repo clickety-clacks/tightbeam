@@ -33,7 +33,7 @@ deny_when = [
 [rule.notice]
 target_session = "{caller_session_key}"
 prompt = "Your messages now account for at least three queued turns to already-backlogged agent {session_key}. Pause additional messages and coordinate through the assignment owner."
-idempotency_key = "flood:{turn_caller_threshold_seq}"
+idempotency_key = "flood:{turn_backlog_episode_id}:{turn_caller_threshold_seq}"
 
 [[rule]]
 name = "ac6a-fourth-review-or-fix-round"

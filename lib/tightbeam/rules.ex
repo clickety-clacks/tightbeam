@@ -3061,17 +3061,57 @@ defmodule Tightbeam.Rules do
            Map.get(call.params, :session_key),
          origin when is_binary(origin) and origin != "" <- Map.get(call.params, :caller_origin),
          true <- caller_origin?(origin) do
-      case DB.query(
-             db,
-             "SELECT seq FROM turns WHERE sessionKey=?1 AND origin=?2 AND status='queued' AND origin NOT LIKE 'remedy:ac6a-%' ORDER BY seq LIMIT 1 OFFSET 2",
-             [session_key, origin]
-           ) do
-        {:ok, [[seq]]} -> {seq, cache}
-        _ -> {nil, cache}
-      end
+      {:ok, rows} =
+        DB.query(
+          db,
+          "SELECT seq,createdAt,CASE WHEN status='queued' THEN NULL " <>
+            "ELSE COALESCE(startedAt,endedAt,createdAt) END FROM turns " <>
+            "WHERE sessionKey=?1 AND origin=?2",
+          [session_key, origin]
+        )
+
+      {sender_threshold_seq(rows), cache}
     else
       _ -> {nil, cache}
     end
+  end
+
+  # Identify the current continuous >=3 sender queue interval, not its moving
+  # third remaining turn. As with backlog episodes, coalesce equal-ms events.
+  # The earliest enqueue seq in the crossing batch stays stable even if more
+  # enqueues or claims are recorded in that same millisecond later.
+  defp sender_threshold_seq(rows) do
+    {_count, threshold_seq} =
+      rows
+      |> Enum.flat_map(fn [seq, created_at, left_at] ->
+        events = [{created_at, 1, seq}]
+
+        if is_integer(left_at) do
+          [{max(left_at, created_at), -1, nil} | events]
+        else
+          events
+        end
+      end)
+      |> Enum.group_by(fn {at, _, _} -> at end)
+      |> Enum.sort_by(fn {at, _} -> at end)
+      |> Enum.reduce({0, nil}, fn {_at, events}, {count, threshold_seq} ->
+        count = Enum.reduce(events, count, fn {_, delta, _}, count -> count + delta end)
+
+        threshold_seq =
+          if count >= 3 do
+            threshold_seq ||
+              events
+              |> Enum.flat_map(fn
+                {_, 1, seq} -> [seq]
+                _ -> []
+              end)
+              |> Enum.min()
+          end
+
+        {count, threshold_seq}
+      end)
+
+    threshold_seq
   end
 
   defp queued_turn_snapshot(db, call) do

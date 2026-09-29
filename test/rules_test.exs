@@ -2489,6 +2489,72 @@ defmodule Tightbeam.RulesTest do
     assert notice_count(ctx.db, "remedy:ac6a-queue-backlog") == 2
   end
 
+  test "AC6a sender flood stays deduped across claims and resets after either recovery", ctx do
+    {holder, opened} = ac6a_backlog_fixture(ctx, "flood-claim-regression")
+    sender = session(ctx.db, "ac6a-flood-claim-sender", "flynn", archetype: "coder")
+    flood_origin = "remedy:ac6a-sender-flood"
+
+    send_turn = fn id ->
+      assert {:ok, seq} =
+               Ledger.enqueue(ctx.db, %{
+                 session_key: holder.session_key,
+                 message_id: id,
+                 origin: "session:#{sender.session_key}",
+                 assignment_id: opened.id,
+                 prompt: "sender flood episode regression"
+               })
+
+      seq
+    end
+
+    sender_seqs = for index <- 1..5, do: send_turn.("flood-sender-#{index}")
+    for index <- 1..20, do: ac6a_enqueue(ctx, holder, opened, "flood-seed-#{index}")
+    assert notice_count(ctx.db, flood_origin) == 1
+
+    for index <- 0..1 do
+      assert {:ok, claimed} = Ledger.claim_next(ctx.db, holder.session_key, "flood-claim")
+      assert claimed.seq == Enum.at(sender_seqs, index)
+      ac6a_enqueue(ctx, holder, opened, "flood-other-sender-#{index}")
+      assert notice_count(ctx.db, flood_origin) == 1
+      finish_claim(ctx.db, claimed)
+    end
+
+    # The sender stops flooding while the target remains backlogged, then
+    # unambiguously crosses three again. That is a new finding, exactly once.
+    assert {:ok, claimed} = Ledger.claim_next(ctx.db, holder.session_key, "flood-claim")
+    assert claimed.seq == Enum.at(sender_seqs, 2)
+    finish_claim(ctx.db, claimed)
+    Process.sleep(2)
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    send_turn.("flood-sender-recross")
+    assert notice_count(ctx.db, flood_origin) == 2
+    send_turn.("flood-sender-still-over")
+    assert notice_count(ctx.db, flood_origin) == 2
+
+    # Keep at least three sender turns at the tail while the target recovers
+    # below twenty, then crosses depth again without a sender-count recovery.
+    for index <- 1..3, do: send_turn.("flood-tail-#{index}")
+
+    for _ <- 1..(queued_depth(ctx.db, holder.session_key) - 19) do
+      assert {:ok, claimed} = Ledger.claim_next(ctx.db, holder.session_key, "flood-claim")
+      finish_claim(ctx.db, claimed)
+    end
+
+    assert queued_depth(ctx.db, holder.session_key) == 19
+    assert notice_count(ctx.db, flood_origin) == 2
+    Process.sleep(2)
+    ac6a_enqueue(ctx, holder, opened, "flood-backlog-recross")
+    assert notice_count(ctx.db, flood_origin) == 3
+    ac6a_enqueue(ctx, holder, opened, "flood-backlog-still-over")
+    assert notice_count(ctx.db, flood_origin) == 3
+
+    assert {:ok, [[3]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM wakes WHERE origin=?1 AND sessionKey=?2", [
+               flood_origin,
+               sender.session_key
+             ])
+  end
+
   test "AC6a age and sender-flood thresholds fire on crossing, then dedupe", ctx do
     holder = session(ctx.db, "ac6a-age-holder", "flynn", archetype: "coder")
     sender = session(ctx.db, "ac6a-flood-sender", "flynn", archetype: "coder")
@@ -2507,11 +2573,13 @@ defmodule Tightbeam.RulesTest do
                prompt: "old queued turn"
              })
 
+    # The 30-minute margin exceeds the unchanged test timeout; a slow runner
+    # cannot age this below-threshold fixture across the 60-minute boundary.
     now = System.system_time(:millisecond)
 
     assert {:ok, _} =
              DB.query(ctx.db, "UPDATE turns SET createdAt=?1 WHERE messageId='ac6a-age-oldest'", [
-               now - 3_599_000
+               now - 30 * 60 * 1_000
              ])
 
     assert {:ok, _} =
