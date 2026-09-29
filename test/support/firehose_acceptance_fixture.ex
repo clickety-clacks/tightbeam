@@ -32,6 +32,9 @@ defmodule Tightbeam.FirehoseAcceptanceFixture do
           {"testhost", "fixture"} => [
             %{family: "fixture-model", context: nil, efforts: [], provider: :fixture_provider}
           ],
+          {"testhost", "codex"} => [
+            %{family: "gpt-5.6-sol", context: nil, efforts: [], provider: :openai}
+          ],
           {"testhost", "claude"} => [
             %{family: "fable", context: nil, efforts: ["medium"], provider: :anthropic}
           ]
