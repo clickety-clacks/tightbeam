@@ -1782,9 +1782,14 @@ defmodule Tightbeam.AdapterCoordinatorTest do
         # Deliberately looser than the budget so an overrun fails on the elapsed
         # bound below with a real number, instead of exiting here on an ambiguous
         # caller timeout.
-        started_at = System.monotonic_time(:millisecond)
+        started_at = System.monotonic_time()
         assert :ok = GenServer.stop(coordinator, :shutdown, 3_000)
-        send(self(), {:shutdown_elapsed_ms, System.monotonic_time(:millisecond) - started_at})
+        elapsed_native = System.monotonic_time() - started_at
+
+        send(
+          self(),
+          {:shutdown_elapsed_ms, System.convert_time_unit(elapsed_native, :native, :millisecond)}
+        )
 
         assert eventually(
                  fn -> HarnessProcessCensus.capture_for_root(ctx.test_dir).count == 0 end,
