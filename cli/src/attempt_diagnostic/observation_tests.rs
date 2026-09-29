@@ -51,6 +51,59 @@ fn correlated_attempt(effect: EffectContract) -> Attempt {
     attempt
 }
 
+#[test]
+fn typed_connect_refusal_requires_connect_phase_and_connection_refused_source() {
+    let direct_connect = ureq::TransportEvidence {
+        phase: ureq::TransportPhase::Connect,
+        route: ureq::TransportRoute::Direct,
+    };
+    let refusal = FailureFact::from_typed_evidence(
+        ureq::ErrorKind::Io,
+        direct_connect,
+        Some(std::io::ErrorKind::ConnectionRefused),
+    );
+    assert!(matches!(&refusal, FailureFact::RefusedBeforeExchange));
+    let temp = Temp::new();
+    let refused = attempt(EffectContract::Read).fail(refusal, &temp.0);
+    let refused_render = refused.render();
+    let refused_diagnostic = refused_render.diagnostic.unwrap();
+    assert!(matches!(
+        refused_diagnostic.code(),
+        DiagnosticCode::GatewayUnavailable
+    ));
+    assert!(matches!(
+        refused_diagnostic.cause(),
+        Some(AttemptCause::ConnectRefused)
+    ));
+
+    let missing_source =
+        FailureFact::from_typed_evidence(ureq::ErrorKind::Io, direct_connect, None);
+    assert!(matches!(missing_source, FailureFact::Unclassified));
+    let unclassified = attempt(EffectContract::Read).fail(missing_source, &temp.0);
+    assert!(unclassified.render().diagnostic.is_none());
+
+    let after_connect = FailureFact::from_typed_evidence(
+        ureq::ErrorKind::Io,
+        ureq::TransportEvidence {
+            phase: ureq::TransportPhase::AwaitResponse,
+            route: ureq::TransportRoute::Direct,
+        },
+        Some(std::io::ErrorKind::ConnectionRefused),
+    );
+    assert!(matches!(&after_connect, FailureFact::OtherAfterConnect));
+    let uncertain = attempt(EffectContract::Read).fail(after_connect, &temp.0);
+    let uncertain_render = uncertain.render();
+    let uncertain_diagnostic = uncertain_render.diagnostic.unwrap();
+    assert!(matches!(
+        uncertain_diagnostic.code(),
+        DiagnosticCode::GatewayTransportUncertain
+    ));
+    assert!(matches!(
+        uncertain_diagnostic.gateway_accepted(),
+        GatewayAccepted::Unknown
+    ));
+}
+
 fn db_body(attempt: &Attempt) -> Value {
     json!({"error": {
         "code": "db_timeout",
