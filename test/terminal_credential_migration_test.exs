@@ -7,7 +7,8 @@ defmodule Tightbeam.TerminalCredentialMigrationTest do
   @terminal_shape "terminal-credential-failure-v1-019"
   @artifact_origin_shape "artifact-origin-v1-019"
   @agent_reparent_shape "delivery-owner-reparent-v1-019"
-  @successor "identity-publication-denial-diagnostic-v1-019"
+  @successor "work-item-delivery-owner-v1-019"
+  @identity_publication_denial_diagnostic_shape "identity-publication-denial-diagnostic-v1-019"
 
   @terminal_objects ~w(
     terminal_credential_deliveries
@@ -47,6 +48,7 @@ defmodule Tightbeam.TerminalCredentialMigrationTest do
       DROP TABLE terminal_credential_redirects;
       DROP TABLE terminal_credential_observations;
       DROP TABLE terminal_credential_incidents;
+      ALTER TABLE work_items DROP COLUMN deliveryOwnerSessionKey;
       ALTER TABLE identity_publication_markers DROP COLUMN denialDiagnostic;
       UPDATE schema_stamp SET shape='#{@predecessor}';
       """)
@@ -84,6 +86,7 @@ defmodule Tightbeam.TerminalCredentialMigrationTest do
 
     assert [
              @successor,
+             @identity_publication_denial_diagnostic_shape,
              @artifact_origin_shape,
              @agent_reparent_shape,
              @terminal_shape,

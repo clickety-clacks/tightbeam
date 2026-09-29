@@ -342,6 +342,8 @@ pub enum Command {
         spec_ref_name: Option<String>,
         spec_ref_sha256: Option<String>,
         clear_spec_ref: bool,
+        delivery_owner: Option<String>,
+        clear_delivery_owner: bool,
         priority: Option<String>,
         body: Option<String>,
         clear_body: bool,
@@ -794,8 +796,8 @@ COMMANDS:
       it, then route it (assign/dispatch) or icebox it. --key makes create
       idempotent (same key returns the same item).
   work-item-update <workItemId> [--title "<title>"] [--spec-ref <name>]
-                   [--spec-sha256 <hex>] [--clear-spec-ref] [--priority <0..8>]
-      Patch an item's title, current governing spec, or priority. Omitted fields
+                   [--spec-sha256 <hex>] [--clear-spec-ref] [--delivery-owner <sessionKey> | --clear-delivery-owner] [--priority <0..8>]
+      Patch an item's title, governing spec, delivery owner, or priority. Omitted fields
       stay unchanged; --clear-spec-ref clears both spec-ref fields. Open cards
       inherit priority changes.
       Body-only forms: --body <text>, --body=<text>, or --clear-body. A body
@@ -1135,6 +1137,7 @@ const BOOLEAN_FLAGS: &[&str] = &[
     "replace-queued",
     "api-key",
     "clear-spec-ref",
+    "clear-delivery-owner",
     "daemon-credential",
     "delegates-delivery",
     "dry-run",
@@ -2595,7 +2598,7 @@ fn parse_with_optional_catalog(
             })
         }
         "work-item-update" => {
-            let metadata_usage = "usage: tightbeam work-item-update <workItemId> [--title \"...\"] [--spec-ref <name>] [--spec-sha256 <hex>] [--clear-spec-ref] [--priority <0..8>]";
+            let metadata_usage = "usage: tightbeam work-item-update <workItemId> [--title \"...\"] [--spec-ref <name>] [--spec-sha256 <hex>] [--clear-spec-ref] [--delivery-owner <sessionKey> | --clear-delivery-owner] [--priority <0..8>]";
             let body_usage = "usage: tightbeam work-item-update <workItemId> (--body <text> | --body=<text> | --clear-body)";
 
             if !parsed.body_operations.is_empty() {
@@ -2626,6 +2629,8 @@ fn parse_with_optional_catalog(
                     spec_ref_name: None,
                     spec_ref_sha256: None,
                     clear_spec_ref: false,
+                    delivery_owner: None,
+                    clear_delivery_owner: false,
                     priority: None,
                     body,
                     clear_body,
@@ -2637,6 +2642,8 @@ fn parse_with_optional_catalog(
                 "spec-ref",
                 "spec-sha256",
                 "clear-spec-ref",
+                "delivery-owner",
+                "clear-delivery-owner",
                 "priority",
                 "as",
                 "as-user",
@@ -2649,9 +2656,25 @@ fn parse_with_optional_catalog(
                 return Err(metadata_usage.to_owned());
             }
 
-            if ["title", "spec-ref", "spec-sha256", "priority"]
-                .iter()
-                .any(|flag| parsed.missing_values.contains(*flag))
+            if [
+                "title",
+                "spec-ref",
+                "spec-sha256",
+                "priority",
+                "delivery-owner",
+            ]
+            .iter()
+            .any(|flag| parsed.missing_values.contains(*flag))
+            {
+                return Err(metadata_usage.to_owned());
+            }
+
+            let clear_delivery_owner = flags.contains_key("clear-delivery-owner");
+            let delivery_owner = flags.get("delivery-owner").cloned();
+            if (clear_delivery_owner && delivery_owner.is_some())
+                || delivery_owner
+                    .as_ref()
+                    .is_some_and(|owner| owner.trim().is_empty())
             {
                 return Err(metadata_usage.to_owned());
             }
@@ -2674,6 +2697,8 @@ fn parse_with_optional_catalog(
                 spec_ref_name: flags.get("spec-ref").cloned(),
                 spec_ref_sha256: flags.get("spec-sha256").cloned(),
                 clear_spec_ref,
+                delivery_owner,
+                clear_delivery_owner,
                 priority: priority_flag(flags)?,
                 body: None,
                 clear_body: false,
@@ -6476,7 +6501,7 @@ mod tests {
             assert_eq!(parse(args).unwrap_err(), usage);
         }
 
-        let metadata_usage = "usage: tightbeam work-item-update <workItemId> [--title \"...\"] [--spec-ref <name>] [--spec-sha256 <hex>] [--clear-spec-ref] [--priority <0..8>]";
+        let metadata_usage = "usage: tightbeam work-item-update <workItemId> [--title \"...\"] [--spec-ref <name>] [--spec-sha256 <hex>] [--clear-spec-ref] [--delivery-owner <sessionKey> | --clear-delivery-owner] [--priority <0..8>]";
         assert_eq!(
             parse(strings(&["work-item-update", "wi_1", "--title"])).unwrap_err(),
             metadata_usage

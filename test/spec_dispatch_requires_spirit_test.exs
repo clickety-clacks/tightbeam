@@ -48,20 +48,6 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
                }
              })
 
-    assert %{"changed" => true} =
-             DeliveryResponsibilities.handle(db, %{
-               verb: "delivery-scope-owner-set",
-               origin: "user:flynn",
-               principal: {:user, "flynn"},
-               params: %{
-                 session_key: pdo.session_key,
-                 association_revision: 1,
-                 expected_owner_session_key: nil,
-                 expected_owner_revision: 0,
-                 idempotency_key: "set-spirit-owner"
-               }
-             })
-
     base_dir =
       Path.join(
         System.tmp_dir!(),
@@ -207,17 +193,17 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
   end
 
   defp establish_delivery(ctx, item) do
-    assert %{"changed" => true} =
-             DeliveryResponsibilities.handle(ctx.db, %{
-               verb: "work-item-delivery-scope-set",
+    owner_session_key = ctx.pdo.session_key
+
+    assert %{deliveryOwnerSessionKey: ^owner_session_key} =
+             WorkItems.__handle__(ctx.db, "work-item-update", %{
+               verb: "work-item-update",
                origin: "user:flynn",
                principal: {:user, "flynn"},
+               session_key: nil,
                params: %{
                  work_item_id: item.id,
-                 association_session_key: ctx.pdo.session_key,
-                 association_revision: 1,
-                 expected_binding_revision: 0,
-                 idempotency_key: "bind-spirit-#{item.id}"
+                 delivery_owner_session_key: owner_session_key
                }
              })
 

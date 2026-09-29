@@ -33,6 +33,7 @@ defmodule Tightbeam.SettlementMigrationTest do
       DROP TRIGGER artifacts_origin_immutable;
       ALTER TABLE artifacts DROP COLUMN originHost;
       ALTER TABLE artifacts DROP COLUMN originWorkspace;
+      ALTER TABLE work_items DROP COLUMN deliveryOwnerSessionKey;
       UPDATE schema_stamp SET shape='cannot-proceed-v1-019';
       """)
 
@@ -49,7 +50,7 @@ defmodule Tightbeam.SettlementMigrationTest do
     assert {:ok, ^before_ddl} = DB.query(db, preserved_sql)
     assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
 
-    assert {:ok, [["identity-publication-denial-diagnostic-v1-019"]]} =
+    assert {:ok, [["work-item-delivery-owner-v1-019"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert {:ok, [["prior-fingerprint", ~s({"prior":true}), nil]]} =

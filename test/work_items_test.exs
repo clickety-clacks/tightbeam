@@ -358,7 +358,8 @@ defmodule Tightbeam.WorkItemsTest do
              "createdBySession",
              "createdInTurnSeq",
              "createdContextKnown",
-             "createdAt"
+             "createdAt",
+             "deliveryOwnerSessionKey"
            ]
 
     assert {:ok, assignment_columns} = DB.query(db, "PRAGMA table_info(assignments)")

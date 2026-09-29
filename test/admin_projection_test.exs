@@ -53,6 +53,8 @@ defmodule Tightbeam.AdminProjectionTest do
       assert :ok = Schema.ensure_all(db)
       assert :ok = AdminProjection.ensure_storage(db)
 
+      assert :ok = DB.execute(db, "ALTER TABLE work_items DROP COLUMN deliveryOwnerSessionKey")
+
       assert :ok =
                DB.execute(
                  db,

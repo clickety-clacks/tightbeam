@@ -764,6 +764,15 @@ defmodule Tightbeam.EscalationDeliveryFixture do
         params: %{title: "Delivery trace"}
       })
 
+    assert %{deliveryOwnerSessionKey: "mid"} =
+             WorkItems.__handle__(ctx.db, "work-item-update", %{
+               verb: "work-item-update",
+               origin: "user:flynn",
+               principal: {:user, "flynn"},
+               session_key: nil,
+               params: %{work_item_id: item.id, delivery_owner_session_key: "mid"}
+             })
+
     # Dispatching a work-item-linked assignment requires the dispatcher to have
     # ruminated on the item first (a fired rumination wake it created).
     rumination =

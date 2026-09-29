@@ -3,7 +3,7 @@ defmodule Tightbeam.DBCallTimeoutTest do
 
   import ExUnit.CaptureLog
 
-  alias Tightbeam.{DB, Gateway, Org, WorkItems}
+  alias Tightbeam.{DB, Gateway}
 
   # The suspended owner answers nothing, so every call below waits out its own
   # timeout rather than racing real work. The elapsed bounds are deliberately
@@ -115,8 +115,7 @@ defmodule Tightbeam.DBCallTimeoutTest do
   test "a gateway read survives a transient owner queue longer than the legacy 5s default" do
     Application.delete_env(:tightbeam, :db_call_timeout_ms)
     db = start_supervised!({DB, path: ":memory:", name: nil})
-    :ok = Org.ensure_schema(db)
-    :ok = WorkItems.ensure_schema(db)
+    :ok = Tightbeam.Schema.ensure_all(db)
     parent = self()
 
     blocker =

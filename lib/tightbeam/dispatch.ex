@@ -127,7 +127,7 @@ defmodule Tightbeam.Dispatch do
   # Assignment idempotency is resolved before the rail so both the guard and
   # Rules.decide see the replay outcome.
   defp bracket_precheck(db, call, verb) when verb in ["assign", "dispatch"] do
-    Assignments.dispatch_precheck(db, call)
+    Assignments.dispatch_precheck(db, Map.put(call, :verb, verb))
   end
 
   defp bracket_precheck(_db, _call, _verb), do: :proceed

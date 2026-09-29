@@ -197,7 +197,7 @@ defmodule Tightbeam.WorkItems do
     end
   end
 
-  ## Update (title/spec-ref/isBug PATCH — unchanged bracket-wise)
+  ## Update (work-item metadata and the explicit accountable delivery owner)
 
   defp update_result(db, call) do
     with :ok <- ensure_body_schema_for_use(db),
@@ -268,9 +268,14 @@ defmodule Tightbeam.WorkItems do
     with :ok <- valid_title(title),
          :ok <- valid_spec_ref(spec_ref_name, spec_ref_sha256),
          :ok <- valid_is_bug(is_bug),
-         :ok <- valid_priority(params[:priority]) do
+         :ok <- valid_priority(params[:priority]),
+         :ok <- valid_delivery_owner(txn, params) do
       priority = if Map.has_key?(params, :priority), do: params.priority, else: item.priority
-      updates = patch_updates(params, title, spec_ref_name, spec_ref_sha256, is_bug)
+
+      updates =
+        patch_updates(params, title, spec_ref_name, spec_ref_sha256, is_bug) ++
+          delivery_owner_update(params)
+
       apply_updates(txn, item, updates)
 
       if priority != item.priority do
@@ -293,12 +298,19 @@ defmodule Tightbeam.WorkItems do
   end
 
   defp update_body_in_txn(txn, item, params) do
-    metadata_keys = [:title, :is_bug, :spec_ref_name, :spec_ref_sha256, :priority]
+    metadata_keys = [
+      :title,
+      :is_bug,
+      :spec_ref_name,
+      :spec_ref_sha256,
+      :priority,
+      :delivery_owner_session_key
+    ]
 
     if Enum.any?(metadata_keys, &Map.has_key?(params, &1)) do
       error(
         "invalid_body_patch",
-        "body cannot be combined with title, isBug, specRefName, specRefSha256, or priority"
+        "body cannot be combined with title, isBug, specRefName, specRefSha256, priority, or deliveryOwnerSessionKey"
       )
     else
       body = if Map.get(params, :clear_body, false), do: nil, else: params[:body]
@@ -380,6 +392,49 @@ defmodule Tightbeam.WorkItems do
 
     updates ++ spec_updates
   end
+
+  defp delivery_owner_update(params) do
+    if Map.has_key?(params, :delivery_owner_session_key),
+      do: [{"deliveryOwnerSessionKey", params[:delivery_owner_session_key]}],
+      else: []
+  end
+
+  defp valid_delivery_owner(_txn, params)
+       when not is_map_key(params, :delivery_owner_session_key),
+       do: :ok
+
+  defp valid_delivery_owner(_txn, %{delivery_owner_session_key: nil}), do: :ok
+
+  defp valid_delivery_owner(txn, %{delivery_owner_session_key: session_key})
+       when is_binary(session_key) do
+    if String.trim(session_key) == "" do
+      error(
+        "invalid_delivery_owner",
+        "deliveryOwnerSessionKey must be an active session or null"
+      )
+    else
+      case Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey=?1", [session_key]) do
+        [["active"]] ->
+          :ok
+
+        [[_state]] ->
+          error(
+            "delivery_owner_unavailable",
+            "delivery owner session #{session_key} is not active"
+          )
+
+        [] ->
+          error(
+            "unknown_delivery_owner",
+            "delivery owner session #{session_key} does not exist"
+          )
+      end
+    end
+  end
+
+  defp valid_delivery_owner(_txn, _params),
+    do:
+      error("invalid_delivery_owner", "deliveryOwnerSessionKey must be an active session or null")
 
   defp apply_updates(_txn, item, []), do: item
 
@@ -948,7 +1003,9 @@ defmodule Tightbeam.WorkItems do
   defp error(code, message), do: %{code: code, message: message}
 
   defp metadata(item),
-    do: {item.title, item.specRefName, item.specRefSha256, item.isBug, item.priority}
+    do:
+      {item.title, item.specRefName, item.specRefSha256, item.isBug, item.priority,
+       item.deliveryOwnerSessionKey}
 
   defp put_priority_in_txn(txn, work_item_id, priority) do
     Txn.q(
@@ -1036,7 +1093,7 @@ defmodule Tightbeam.WorkItems do
   # The wake-id columns are INTERNAL substrate truth — never surfaced in a
   # response object (§Response shapes).
   defp columns do
-    "id, title, specRefName, specRefSha256, isBug, ownerUserId, state, failReason, " <>
+    "id, title, specRefName, specRefSha256, isBug, ownerUserId, deliveryOwnerSessionKey, state, failReason, " <>
       "routingWakeId, slateWakeId, createdByUser, createdBySession, createdAt, " <>
       "COALESCE((SELECT rowVersion FROM work_item_versions WHERE workItemId = work_items.id), createdAt), " <>
       "COALESCE((SELECT priority FROM work_item_priorities p WHERE p.workItemId=work_items.id), " <>
@@ -1054,6 +1111,7 @@ defmodule Tightbeam.WorkItems do
          spec_ref_sha256,
          is_bug,
          owner_user_id,
+         delivery_owner_session_key,
          state,
          fail_reason,
          routing_wake_id,
@@ -1075,6 +1133,7 @@ defmodule Tightbeam.WorkItems do
       specRefSha256: spec_ref_sha256,
       isBug: is_bug == 1,
       ownerUserId: owner_user_id,
+      deliveryOwnerSessionKey: delivery_owner_session_key,
       state: state,
       failReason: fail_reason,
       routingWakeId: routing_wake_id,

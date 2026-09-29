@@ -217,7 +217,7 @@ defmodule Tightbeam.CliIntegrationTest do
 
     {refused, status} = run.(args)
     assert status != 0
-    assert refused =~ "delivery_responsibility_required"
+    assert refused =~ "current_custody_required"
     assert {corrected, 0} = run.(args ++ ["--as-user", "flynn"])
     result = JSON.decode!(corrected)
     assert result["session"]["currentParent"] == "cli-worker"
@@ -1314,6 +1314,21 @@ defmodule Tightbeam.CliIntegrationTest do
         model: Model.new("test")
       })
 
+    product_owner =
+      Org.create(ctx.db, %{
+        session_key: "cli-product-owner",
+        display_name: "CLI Product Owner",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "product-owner",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+
+    product_owner_dir = session_workdir!(ctx, product_owner)
+
     Roles.create!(ctx.db, "cli-coder", "flynn", coder.session_key)
     Roles.create!(ctx.db, "cli-reviewer", "flynn", reviewer.session_key)
     coder_dir = session_workdir!(ctx, coder)
@@ -1329,50 +1344,40 @@ defmodule Tightbeam.CliIntegrationTest do
 
     item_id = JSON.decode!(created)["id"]
 
-    Roles.create!(ctx.db, "product-owner:papertrail", "flynn", ctx.session.session_key)
+    Roles.create!(ctx.db, "product-owner:papertrail", "flynn", product_owner.session_key)
 
-    for args <- [
-          [
-            "session-po-set",
-            "--session",
-            ctx.session.session_key,
-            "--po-role",
-            "product-owner:papertrail",
-            "--key",
-            "papertrail-association",
-            "--as-user",
-            "flynn"
-          ],
-          [
-            "delivery-scope-owner-set",
-            "--session",
-            ctx.session.session_key,
-            "--association-revision",
-            "1",
-            "--expected-revision",
-            "0",
-            "--key",
-            "papertrail-owner",
-            "--as-user",
-            "flynn"
-          ],
-          [
-            "work-item-delivery-scope-set",
-            item_id,
-            "--association-session",
-            ctx.session.session_key,
-            "--association-revision",
-            "1",
-            "--expected-revision",
-            "0",
-            "--key",
-            "papertrail-scope",
-            "--as-user",
-            "flynn"
-          ]
-        ] do
-      assert {_output, 0} = System.cmd(ctx.binary, args, cd: ctx.workdir, stderr_to_stdout: true)
-    end
+    assert {_association_output, 0} =
+             System.cmd(
+               ctx.binary,
+               [
+                 "session-po-set",
+                 "--session",
+                 ctx.session.session_key,
+                 "--po-role",
+                 "product-owner:papertrail",
+                 "--key",
+                 "papertrail-association",
+                 "--as-user",
+                 "flynn"
+               ],
+               cd: ctx.workdir,
+               stderr_to_stdout: true
+             )
+
+    assert {_owner_output, 0} =
+             System.cmd(
+               ctx.binary,
+               [
+                 "work-item-update",
+                 item_id,
+                 "--delivery-owner",
+                 ctx.session.session_key,
+                 "--as-user",
+                 "flynn"
+               ],
+               cd: ctx.workdir,
+               stderr_to_stdout: true
+             )
 
     assert :ok = Wakes.fire_due(Tightbeam.WakeScheduler)
     assert_receive {:wake_delivered, association_wake}, 5_000
@@ -1386,7 +1391,7 @@ defmodule Tightbeam.CliIntegrationTest do
           "--subject",
           "decide the papertrail topology",
           "--session",
-          ctx.session.session_key,
+          product_owner.session_key,
           "--effect-kind",
           "coordination",
           "--work-item",
@@ -1409,11 +1414,9 @@ defmodule Tightbeam.CliIntegrationTest do
                  "--kind",
                  "verdict",
                  "--verdict",
-                 "topology-decided",
-                 "--as",
-                 "cli-holder"
+                 "topology-decided"
                ],
-               cd: ctx.workdir,
+               cd: product_owner_dir,
                stderr_to_stdout: true
              )
 

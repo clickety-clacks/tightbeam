@@ -1527,6 +1527,7 @@ defmodule Tightbeam.AssignmentsTest do
       DB.query(ctx.db, "UPDATE sessions SET spawnedBy='notice-decoy' WHERE sessionKey='holder'")
 
     item = create_work_item(ctx, "terminal delivery")
+    set_delivery_owner(ctx, item.id, "notice-parent")
 
     assignment =
       handle(
@@ -1561,34 +1562,7 @@ defmodule Tightbeam.AssignmentsTest do
     end
 
     item = create_work_item(ctx, "terminal successor")
-
-    assert %{"changed" => true} =
-             DeliveryResponsibilities.handle(ctx.db, %{
-               verb: "delivery-scope-owner-set",
-               origin: "user:flynn",
-               principal: {:user, "flynn"},
-               params: %{
-                 session_key: "notice-parent",
-                 association_revision: 1,
-                 expected_owner_session_key: nil,
-                 expected_owner_revision: 0,
-                 idempotency_key: "terminal-owner-initial"
-               }
-             })
-
-    assert %{"changed" => true} =
-             DeliveryResponsibilities.handle(ctx.db, %{
-               verb: "work-item-delivery-scope-set",
-               origin: "user:flynn",
-               principal: {:user, "flynn"},
-               params: %{
-                 work_item_id: item.id,
-                 association_session_key: "notice-parent",
-                 association_revision: 1,
-                 expected_binding_revision: 0,
-                 idempotency_key: "terminal-scope"
-               }
-             })
+    set_delivery_owner(ctx, item.id, "notice-parent")
 
     assignment =
       handle(
@@ -1601,19 +1575,7 @@ defmodule Tightbeam.AssignmentsTest do
         )
       )
 
-    assert %{"changed" => true} =
-             DeliveryResponsibilities.handle(ctx.db, %{
-               verb: "delivery-scope-owner-set",
-               origin: "agent:notice-parent",
-               principal: {:session, "notice-parent"},
-               params: %{
-                 session_key: "delivery-successor",
-                 association_revision: 1,
-                 expected_owner_session_key: "notice-parent",
-                 expected_owner_revision: 1,
-                 idempotency_key: "terminal-owner-transfer"
-               }
-             })
+    set_delivery_owner(ctx, item.id, "delivery-successor")
 
     {:ok, _} =
       DB.query(
@@ -1645,35 +1607,7 @@ defmodule Tightbeam.AssignmentsTest do
     delegated_item = create_work_item(ctx, "delegated terminal")
     sibling_item = create_work_item(ctx, "sibling terminal")
 
-    assert %{"changed" => true} =
-             DeliveryResponsibilities.handle(ctx.db, %{
-               verb: "delivery-scope-owner-set",
-               origin: "user:flynn",
-               principal: {:user, "flynn"},
-               params: %{
-                 session_key: "delivery-owner",
-                 association_revision: 1,
-                 expected_owner_session_key: nil,
-                 expected_owner_revision: 0,
-                 idempotency_key: "delegated-owner"
-               }
-             })
-
-    for {item, key} <- [{delegated_item, "delegated"}, {sibling_item, "sibling"}] do
-      assert %{"changed" => true} =
-               DeliveryResponsibilities.handle(ctx.db, %{
-                 verb: "work-item-delivery-scope-set",
-                 origin: "user:flynn",
-                 principal: {:user, "flynn"},
-                 params: %{
-                   work_item_id: item.id,
-                   association_session_key: "delivery-owner",
-                   association_revision: 1,
-                   expected_binding_revision: 0,
-                   idempotency_key: "#{key}-scope"
-                 }
-               })
-    end
+    set_delivery_owner(ctx, delegated_item.id, "delivery-owner")
 
     delegation =
       terminal_notice_assign_call(
@@ -1682,7 +1616,6 @@ defmodule Tightbeam.AssignmentsTest do
         delegated_item.id
       )
       |> Map.put(:session_key, "notice-parent")
-      |> put_in([:params, :delegates_delivery], true)
       |> then(&handle(ctx, "assign", &1))
 
     assert DeliveryResponsibilities.responsibility(ctx.db, "notice-parent", delegated_item.id) ==
@@ -1712,6 +1645,10 @@ defmodule Tightbeam.AssignmentsTest do
           sibling_item.id
         )
       )
+
+    assert %{id: _} = sibling
+    # This assignment predates the owner link; replacement preserves its opener.
+    set_delivery_owner(ctx, sibling_item.id, "delivery-owner")
 
     {delegated, sibling, delegation}
   end
@@ -1983,6 +1920,7 @@ defmodule Tightbeam.AssignmentsTest do
 
   test "reopen restores custody, records the close, and rearms every existing monitor", ctx do
     item = create_work_item(ctx, "reopen lifecycle")
+    set_delivery_owner(ctx, item.id, "holder")
 
     assignment =
       reopen_fixture_call({:user, "flynn"}, "reopen me", nil, item.id)
@@ -3883,8 +3821,10 @@ defmodule Tightbeam.AssignmentsTest do
              DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE id = ?1", [assignment.id])
   end
 
-  test "linked dispatch ruminates first, then atomically assigns and wakes, linking the work item",
+  test "unowned dispatch defers through its exact routing bracket, then admits exact fired rumination",
        ctx do
+    session(ctx.db, "dispatcher", "flynn")
+
     work_item =
       handle(
         ctx,
@@ -3894,12 +3834,30 @@ defmodule Tightbeam.AssignmentsTest do
 
     call =
       dispatch_call(
-        {:session, "other-session"},
+        {:session, "dispatcher"},
         "ship the rail",
         "Implement the ratified behavior",
-        nil,
+        "ownerless-routing-bracket",
         work_item.id
       )
+
+    baseline = assignment_count(ctx.db)
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT 1 FROM work_items AS wi
+               JOIN wakes AS w ON w.wakeId = wi.routingWakeId
+               WHERE wi.id = ?1 AND wi.state = 'open'
+                 AND wi.deliveryOwnerSessionKey IS NULL
+                 AND wi.routingWakeId IS NOT NULL
+                 AND w.wakeId = wi.routingWakeId AND w.work_item_id = wi.id
+                 AND w.origin = 'process:tightbeam' AND w.consumer = 'prompt'
+                 AND w.sessionKey = ?2 AND w.state = 'pending'
+               """,
+               [work_item.id, Org.personal_session_key("flynn")]
+             )
 
     assert {:ok,
             %{
@@ -3927,9 +3885,9 @@ defmodule Tightbeam.AssignmentsTest do
                w.session_key == Org.personal_session_key("flynn")
            end)
 
-    assert wake.session_key == "other-session"
-    assert wake.creator_session_key == "other-session"
-    assert wake.origin == "agent:other-session"
+    assert wake.session_key == "dispatcher"
+    assert wake.creator_session_key == "dispatcher"
+    assert wake.origin == "agent:dispatcher"
     assert wake.rumination
     assert wake.work_item_id == work_item.id
 
@@ -3950,12 +3908,12 @@ defmodule Tightbeam.AssignmentsTest do
     assert :ok = Wakes.fire_due(scheduler)
     assert_receive {:rumination_delivered, %{wake_id: wake_id}}
     assert wake_id == wake.wake_id
-    assert Wakes.rumination_exists?(ctx.db, work_item.id, "other-session")
+    assert Wakes.rumination_exists?(ctx.db, work_item.id, "dispatcher")
 
     # F7 amendment: the re-dispatch persists workItemId exactly as assign does.
     assert {:ok, assignment} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
     assert assignment.workItemId == work_item.id
-    assert assignment.openedBySession == "other-session"
+    assert assignment.openedBySession == "dispatcher"
 
     assert {:ok, [[1]]} =
              DB.query(
@@ -3969,6 +3927,12 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert prompt =~ assignment.id
     assert prompt =~ "Implement the ratified behavior"
+
+    assert {:ok, replayed} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
+    assert replayed.id == assignment.id
+    assert assignment_count(ctx.db) == baseline + 1
+
+    set_delivery_owner(ctx, work_item.id, "holder")
 
     user_dispatch =
       handle(
@@ -4005,7 +3969,7 @@ defmodule Tightbeam.AssignmentsTest do
       handle(
         ctx,
         "assign",
-        assign_call({:session, "other-session"}, "bookkeeping", nil, work_item.id)
+        assign_call({:session, "holder"}, "bookkeeping", nil, work_item.id)
       )
 
     assert assigned.workItemId == work_item.id
@@ -4016,6 +3980,253 @@ defmodule Tightbeam.AssignmentsTest do
                "SELECT count(*) FROM assignments WHERE id = ?1 AND workItemId = ?2",
                [assigned.id, work_item.id]
              )
+
+    assignment_count_before_unrelated = assignment_count(ctx.db)
+
+    assert %{code: "delivery_owner_required"} =
+             handle(
+               ctx,
+               "assign",
+               assign_call({:session, "other-session"}, "unrelated owner", nil, work_item.id)
+             )
+
+    assert assignment_count(ctx.db) == assignment_count_before_unrelated
+  end
+
+  test "assign and dispatch refuse a foreign caller even after exact fired rumination", ctx do
+    work_item = create_work_item(ctx, "Foreign caller cannot gain authority by ruminating")
+    baseline = assignment_count(ctx.db)
+
+    for state <- ["pending", "fired"] do
+      seed_rumination_wake(ctx, work_item.id, "other-session", state)
+
+      for verb <- ["assign", "dispatch"] do
+        call =
+          dispatch_call(
+            {:session, "other-session"},
+            "foreign production",
+            "Rumination is not authorization.",
+            nil,
+            work_item.id
+          )
+          |> Map.put(:verb, verb)
+          |> put_in([:params, :effect_kind], "code")
+
+        assert {:error, %{code: "delivery_owner_missing"}} =
+                 Dispatch.dispatch(ctx.db, ctx.handlers, call)
+
+        forged =
+          Map.put(call, :__tb_ownerless_fired_rumination_precheck__, {
+            :ownerless_fired_rumination,
+            make_ref(),
+            work_item.id,
+            "other-session"
+          })
+
+        assert {:error, %{code: "delivery_owner_missing"}} =
+                 Dispatch.dispatch(ctx.db, ctx.handlers, forged)
+
+        if state == "fired" do
+          assert %{code: "delivery_owner_missing"} = handle(ctx, verb, forged)
+        end
+      end
+    end
+
+    assert assignment_count(ctx.db) == baseline
+
+    # Core-only authentic same-user controls remain admitted for both verbs.
+    session(ctx.db, "dispatcher", "flynn")
+
+    for verb <- ["assign", "dispatch"] do
+      call =
+        dispatch_call(
+          {:session, "dispatcher"},
+          "authorized",
+          "Same-user intake.",
+          nil,
+          work_item.id
+        )
+        |> Map.put(:verb, verb)
+        |> put_in([:params, :effect_kind], "code")
+
+      assert :proceed = Assignments.dispatch_precheck(ctx.db, call)
+    end
+  end
+
+  test "a fired owner routing bracket permits only the first rumination deferral", ctx do
+    work_item = create_work_item(ctx, "Fired routing bracket")
+    caller = "holder"
+
+    assert {:ok, [[routing_wake_id]]} =
+             DB.query(ctx.db, "SELECT routingWakeId FROM work_items WHERE id = ?1", [
+               work_item.id
+             ])
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "UPDATE wakes SET state = 'fired', firedAt = ?2 WHERE wakeId = ?1",
+               [routing_wake_id, System.system_time(:millisecond)]
+             )
+
+    baseline = assignment_count(ctx.db)
+
+    assert {:ok, %{rumination_required: true}} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               dispatch_call(
+                 {:session, caller},
+                 "fired routing bracket",
+                 "Ruminate before assigning.",
+                 nil,
+                 work_item.id
+               )
+             )
+
+    assert assignment_count(ctx.db) == baseline
+  end
+
+  test "unowned dispatch rejects canceled and mismatched routing brackets", ctx do
+    canceled_item = create_work_item(ctx, "Canceled routing bracket")
+    mismatched_item = seed_unrouted_work_item(ctx, "Mismatched routing bracket")
+    mismatched_source_item = create_work_item(ctx, "Mismatched routing source")
+
+    assert {:ok, [[canceled_wake_id]]} =
+             DB.query(ctx.db, "SELECT routingWakeId FROM work_items WHERE id = ?1", [
+               canceled_item.id
+             ])
+
+    assert {:ok, [[mismatched_source_wake_id]]} =
+             DB.query(ctx.db, "SELECT routingWakeId FROM work_items WHERE id = ?1", [
+               mismatched_source_item.id
+             ])
+
+    assert {:ok, true} =
+             DB.transaction(ctx.db, fn txn ->
+               {:ok, trigger} =
+                 Tightbeam.Supervision.liveness_trigger_in_txn(
+                   txn,
+                   {:work_item, canceled_item.id}
+                 )
+
+               Wakes.cancel_in_txn(txn, %{
+                 wake_id: canceled_wake_id,
+                 requester: %{kind: "process", id: "tightbeam:wake-scheduler"},
+                 reason_kind: "target_unresolvable",
+                 causal_source: %{kind: "scheduler_delivery", id: canceled_wake_id},
+                 outcome: %{kind: "no_replacement", liveness_trigger: trigger}
+               })
+             end)
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "UPDATE work_items SET routingWakeId = ?2 WHERE id = ?1",
+               [mismatched_item.id, mismatched_source_wake_id]
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT 1 FROM work_items wi JOIN wakes w ON w.wakeId=wi.routingWakeId
+               WHERE wi.id=?1 AND wi.id<>w.work_item_id AND w.work_item_id=?2
+                 AND w.origin='process:tightbeam' AND w.consumer='prompt'
+                 AND w.state IN ('pending','fired')
+               """,
+               [mismatched_item.id, mismatched_source_item.id]
+             )
+
+    baseline = assignment_count(ctx.db)
+
+    for item <- [canceled_item, mismatched_item] do
+      assert {:error, %{code: "delivery_owner_missing"}} =
+               Dispatch.dispatch(
+                 ctx.db,
+                 ctx.handlers,
+                 dispatch_call(
+                   {:session, "holder"},
+                   "invalid routing bracket",
+                   "Do not dispatch.",
+                   nil,
+                   item.id
+                 )
+               )
+    end
+
+    assert assignment_count(ctx.db) == baseline
+  end
+
+  test "rumination alone cannot authorize unowned dispatch without a routing bracket", ctx do
+    pending_item = seed_unrouted_work_item(ctx, "Pending rumination without bracket")
+    wrong_item = seed_unrouted_work_item(ctx, "Wrong-item rumination target")
+    wrong_item_source = seed_unrouted_work_item(ctx, "Wrong-item rumination source")
+    wrong_caller_item = seed_unrouted_work_item(ctx, "Wrong-caller rumination")
+    caller = "holder"
+
+    _pending = seed_rumination_wake(ctx, pending_item.id, caller, "pending")
+    _wrong_item = seed_rumination_wake(ctx, wrong_item_source.id, caller, "fired")
+    _wrong_caller = seed_rumination_wake(ctx, wrong_caller_item.id, "other-session", "fired")
+
+    exact_item = seed_unrouted_work_item(ctx, "Exact rumination without bracket")
+    _exact_fired = seed_rumination_wake(ctx, exact_item.id, caller, "fired")
+
+    baseline = assignment_count(ctx.db)
+
+    for {item, subject} <- [
+          {pending_item, "pending rumination"},
+          {exact_item, "exact fired rumination"},
+          {wrong_item, "wrong-item fired rumination"},
+          {wrong_caller_item, "wrong-caller fired rumination"}
+        ] do
+      assert {:error, %{code: "delivery_owner_missing"}} =
+               Dispatch.dispatch(
+                 ctx.db,
+                 ctx.handlers,
+                 dispatch_call(
+                   {:session, caller},
+                   subject,
+                   "A rumination without the exact live bracket is insufficient.",
+                   nil,
+                   item.id
+                 )
+               )
+    end
+
+    assert assignment_count(ctx.db) == baseline
+  end
+
+  test "raw DB-seeded unowned dispatch refuses a missing bracket and forged receipt", ctx do
+    work_item = seed_unrouted_work_item(ctx, "Raw unowned item")
+    caller = "holder"
+
+    call =
+      dispatch_call(
+        {:session, caller},
+        "raw ownerless dispatch",
+        "A raw item has no routing bracket.",
+        nil,
+        work_item.id
+      )
+
+    baseline = assignment_count(ctx.db)
+
+    assert {:error, %{code: "delivery_owner_missing"}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, call)
+
+    forged =
+      Map.put(call, :__tb_ownerless_fired_rumination_precheck__, {
+        :ownerless_fired_rumination,
+        make_ref(),
+        work_item.id,
+        caller
+      })
+
+    assert {:error, %{code: "delivery_owner_missing"}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, forged)
+
+    assert assignment_count(ctx.db) == baseline
   end
 
   test "review and file declarations are assign-only inputs", ctx do
@@ -4098,6 +4309,8 @@ defmodule Tightbeam.AssignmentsTest do
         "work-item-create",
         work_item_call("work-item-create", {:user, "flynn"}, %{title: "Second"})
       )
+
+    set_delivery_owner(ctx, first.id, "holder")
 
     linked = handle(ctx, "assign", assign_call({:user, "flynn"}, "linked", "work-key", first.id))
 
@@ -4285,6 +4498,7 @@ defmodule Tightbeam.AssignmentsTest do
   test "Proof 4: DIRECT consumers stay unchanged: revoke-loop membership is direct and client snapshots are byte-identical",
        ctx do
     item = create_work_item(ctx, "Direct lifecycle")
+    set_delivery_owner(ctx, item.id, "holder")
     reviewed = handle(ctx, "assign", assign_call({:user, "flynn"}, "owned", nil, item.id))
 
     before_get =
@@ -5352,6 +5566,59 @@ defmodule Tightbeam.AssignmentsTest do
       ctx,
       "work-item-create",
       work_item_call("work-item-create", {:user, "flynn"}, %{title: title})
+    )
+  end
+
+  defp seed_unrouted_work_item(ctx, title) do
+    id = "wi_seeded_ownerless_#{System.unique_integer([:positive])}"
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO work_items (id, title, ownerUserId, state, createdByUser, createdAt)
+               VALUES (?1, ?2, 'flynn', 'open', 'flynn', ?3)
+               """,
+               [id, title, System.system_time(:millisecond)]
+             )
+
+    %{id: id}
+  end
+
+  defp seed_rumination_wake(ctx, work_item_id, creator_session, state) do
+    {:ok, wake} =
+      DB.transaction(ctx.db, fn txn ->
+        Wakes.schedule_in_txn(txn, %{
+          session_key: creator_session,
+          origin: "agent:" <> creator_session,
+          creator_session_key: creator_session,
+          prompt: "Ruminate on this ownerless item.",
+          due_at: System.system_time(:millisecond) + 60_000,
+          rumination: true,
+          work_item_id: work_item_id
+        })
+      end)
+
+    if state == "fired" do
+      assert {:ok, []} =
+               DB.query(
+                 ctx.db,
+                 "UPDATE wakes SET state='fired', firedAt=?2 WHERE wakeId=?1",
+                 [wake.wake_id, System.system_time(:millisecond)]
+               )
+    end
+
+    wake
+  end
+
+  defp set_delivery_owner(ctx, work_item_id, session_key) do
+    handle(
+      ctx,
+      "work-item-update",
+      work_item_call("work-item-update", {:user, "flynn"}, %{
+        work_item_id: work_item_id,
+        delivery_owner_session_key: session_key
+      })
     )
   end
 

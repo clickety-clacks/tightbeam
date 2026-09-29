@@ -333,6 +333,24 @@ defmodule Tightbeam.FirehoseInventoryAcceptance do
 
     r8b_work_item = Fixture.create_item(fixture, "A4 observe refetch work item")
 
+    assert %{deliveryOwnerSessionKey: owner_session_key} =
+             Tightbeam.WorkItems.__handle__(
+               fixture.db,
+               "work-item-update",
+               %{
+                 verb: "work-item-update",
+                 origin: "user:#{fixture.user_id}",
+                 principal: {:user, fixture.user_id},
+                 session_key: nil,
+                 params: %{
+                   work_item_id: r8b_work_item,
+                   delivery_owner_session_key: main.session_key
+                 }
+               }
+             )
+
+    assert owner_session_key == main.session_key
+
     {:ok, r8b_assignment} =
       Dispatch.dispatch(
         fixture.db,

@@ -1807,11 +1807,28 @@ defmodule Tightbeam.RulesTest do
 
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
 
+    item =
+      Tightbeam.WorkItems.__handle__(ctx.db, "work-item-create", %{
+        principal: {:user, "flynn"},
+        origin: "user:flynn",
+        params: %{title: "Assignment remedy notice"}
+      })
+
+    assert %{deliveryOwnerSessionKey: owner} =
+             Tightbeam.WorkItems.__handle__(ctx.db, "work-item-update", %{
+               principal: {:user, "flynn"},
+               origin: "user:flynn",
+               params: %{work_item_id: item.id, delivery_owner_session_key: target.session_key}
+             })
+
+    assert owner == target.session_key
+
     principal = {:remedy, %{statute: "assignment-remedy", action: "assign", owner: "flynn"}}
 
     call =
       p3_call("assign", {:user, "flynn"}, %{
         subject: "remedy-created assignment",
+        work_item_id: item.id,
         idempotency_key: nil,
         reviews_assignment_id: nil,
         effect_kind: nil,
@@ -1822,6 +1839,13 @@ defmodule Tightbeam.RulesTest do
         principal: principal,
         session_key: target.session_key
       })
+
+    assert %{code: "work_item_required"} =
+             Assignments.__handle__(
+               ctx.db,
+               "assign",
+               update_in(call.params, &Map.delete(&1, :work_item_id))
+             )
 
     assert %{id: _assignment_id} = Assignments.__handle__(ctx.db, "assign", call)
 
