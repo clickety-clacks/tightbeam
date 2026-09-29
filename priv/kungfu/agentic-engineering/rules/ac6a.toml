@@ -1,0 +1,69 @@
+# Event-driven supervision findings. These rules observe committed rows only;
+# the measured queue/assignment state is recomputed for each transition.
+[[rule]]
+name = "ac6a-queue-backlog"
+verb = "post"
+verbs = ["post", "wake"]
+edges = ["row-commit"]
+effect = "notice"
+text = "The agent queue has reached the ruled backlog threshold."
+deny_when = [
+  { fact = "turn.backlogged", op = "eq", value = true },
+  { fact = "turn.backlog_episode_id", op = "ne", value = "" },
+]
+
+[rule.notice]
+target_session = "{assignment_opener_or_coordinator_session}"
+prompt = "Agent {session_key} has 20 or more queued turns or a queued turn at least 60 minutes old. Review the assignment or work-item queue and direct the next step."
+idempotency_key = "backlog:{turn_backlog_episode_id}"
+
+[[rule]]
+name = "ac6a-sender-flood"
+verb = "post"
+verbs = ["post", "wake"]
+edges = ["row-commit"]
+effect = "notice"
+text = "One sender has crossed the queue-flood threshold for a backlogged agent."
+deny_when = [
+  { fact = "turn.backlogged", op = "eq", value = true },
+  { fact = "turn.caller_queued_count", op = "gte", value = 3 },
+  { fact = "turn.caller_threshold_seq", op = "gte", value = 1 },
+]
+
+[rule.notice]
+target_session = "{caller_session_key}"
+prompt = "Your messages now account for at least three queued turns to already-backlogged agent {session_key}. Pause additional messages and coordinate through the assignment owner."
+idempotency_key = "flood:{turn_backlog_episode_id}:{turn_caller_threshold_seq}"
+
+[[rule]]
+name = "ac6a-fourth-review-or-fix-round"
+verb = "attest"
+verbs = ["attest", "assign", "dispatch"]
+edges = ["row-commit"]
+effect = "notice"
+text = "A work item has reached its fourth review or fix round."
+deny_when = [
+  { fact = "work_item.fourth_round_kind", op = "ne", value = "" },
+]
+
+[rule.notice]
+target_session = "{assignment_opener_or_coordinator_session}"
+prompt = "Work item {work_item_id} has reached its fourth {work_item_fourth_round_kind} round. Review the repeated cycle and direct the next step."
+idempotency_key = "fourth-round:{work_item_id}:{work_item_fourth_round_kind}"
+
+[[rule]]
+name = "ac6a-unassigned-agent-turn"
+verb = "post"
+verbs = ["post", "wake"]
+edges = ["row-commit"]
+effect = "notice"
+text = "An agent-started turn is running without an open assignment."
+deny_when = [
+  { fact = "session.working_without_open_assignment", op = "eq", value = true },
+  { fact = "session.unassigned_stretch_id", op = "ne", value = "" },
+]
+
+[rule.notice]
+target_session = "{assignment_opener_or_coordinator_session}"
+prompt = "Agent {session_key} started a turn without an open assignment. Review the associated work item and direct the next step."
+idempotency_key = "unassigned:{session_unassigned_stretch_id}"

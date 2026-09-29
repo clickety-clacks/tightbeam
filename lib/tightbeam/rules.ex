@@ -31,12 +31,14 @@ defmodule Tightbeam.Rules do
   assignmentId, or from the reviewed assignment on an assign call, and are nil
   when that assignment cannot be resolved.
 
-  Work-item facts are `work_item.is_bug` (the org-set work-item attribute) and
+  Work-item facts include `work_item.is_bug` (the org-set work-item attribute),
   `assignment.prior_completed_fix_count` (completed, non-review assignments on
-  the same work item, excluding the current assignment). On an implementation
-  `dispatch`, the assignment facts project the latest completed fix for the
-  supplied work item so a re-fix gate can inspect its commissioned verdicts
-  before the next assignment exists.
+  the same work item, excluding the current assignment), and the row-commit-only
+  `work_item.review_verdict_count` (review verdict attest rows on the item
+  through the current row). On an
+  implementation `dispatch`, the assignment facts project the latest completed
+  fix for the supplied work item so a re-fix gate can inspect its commissioned
+  verdicts before the next assignment exists.
 
   Rule denials and fact errors are written as `kind = "denied"` events by
   dispatch. That audit write is best-effort: an unavailable event sink never
@@ -67,6 +69,7 @@ defmodule Tightbeam.Rules do
   @rule_keys MapSet.new([
                "name",
                "verb",
+               "verbs",
                "deny_when",
                "text",
                "edges",
@@ -91,7 +94,7 @@ defmodule Tightbeam.Rules do
   @rearm_keys MapSet.new(["recovered_when", "recurred_when"])
   @recurrence_fingerprint ~w(statute target_session subject failure_class failure_code)
   @check_keys MapSet.new(["script", "returns", "timeout_ms", "effects"])
-  @notice_keys MapSet.new(["target_role", "target_session", "prompt"])
+  @notice_keys MapSet.new(["target_role", "target_session", "prompt", "idempotency_key"])
   @remedy_keys MapSet.new([
                  "action",
                  "produces",
@@ -107,8 +110,24 @@ defmodule Tightbeam.Rules do
                  "on_rule_denied",
                  "params"
                ])
-  @binding_tokens ~w(assignment_id work_item_id holder_key holder_role holder_archetype caller_origin delivery_owner_ref)
-  @embedded_fields ~w(subject prompt display)
+  @binding_tokens ~w(
+    assignment_id
+    work_item_id
+    holder_key
+    holder_role
+    holder_archetype
+    assignment_opener_session
+    assignment_opener_or_coordinator_session
+    session_key
+    session_unassigned_stretch_id
+    caller_session_key
+    caller_origin
+    delivery_owner_ref
+    work_item_fourth_round_kind
+    turn_backlog_episode_id
+    turn_caller_threshold_seq
+  )
+  @embedded_fields ~w(subject prompt display idempotency_key)
   @whole_fields ~w(target_role target_session reviews work_item name harness model effort context archetype host after at)
   @verdict_facts ~w(
     assignment.verdicts
@@ -161,6 +180,16 @@ defmodule Tightbeam.Rules do
     "work_item.delivery_owner_state" => :string,
     "assignment.review_verdict_count" => :int,
     "assignment.prior_completed_fix_count" => :int,
+    "work_item.review_verdict_count" => :int,
+    "work_item.fourth_round_kind" => :string,
+    "turn.queued_count" => :int,
+    "turn.oldest_age_ms" => :int,
+    "turn.caller_queued_count" => :int,
+    "turn.backlogged" => :bool,
+    "turn.backlog_episode_id" => :string,
+    "turn.caller_threshold_seq" => :int,
+    "session.working_without_open_assignment" => :bool,
+    "session.unassigned_stretch_id" => :string,
     "assign.is_linked_review" => :bool,
     "assign.effect_kind" => :string,
     "assign.declared_files_overlap_open" => :bool,
@@ -648,7 +677,9 @@ defmodule Tightbeam.Rules do
     params = %{
       work_item_id: Map.get(bindings, "workItemId"),
       assignment_id: Map.get(bindings, "assignmentId"),
-      decision_request_id: Map.get(bindings, "decisionRequestId")
+      decision_request_id: Map.get(bindings, "decisionRequestId"),
+      session_key: Map.get(bindings, "sessionKey"),
+      caller_origin: Map.get(bindings, "callerOrigin")
     }
 
     %{
@@ -678,27 +709,35 @@ defmodule Tightbeam.Rules do
 
     :persistent_term.get(@persist_key, [])
     |> Enum.filter(fn rule ->
-      rule.verb == verb and "row-commit" in rule.edges and rule.effect == "notice" and
+      verb in rule.verbs and "row-commit" in rule.edges and rule.effect == "notice" and
         row_domain_candidate?(rule, domain)
     end)
     |> Enum.flat_map(fn rule ->
       try do
-        candidates =
-          artifact_candidates_in_txn(txn, rule.conditions, call.predicate_bindings, owner)
+        row_commit_candidate_calls_in_txn(txn, rule, call)
+        |> Enum.flat_map(fn candidate_call ->
+          candidates =
+            artifact_candidates_in_txn(
+              txn,
+              rule.conditions,
+              candidate_call.predicate_bindings,
+              owner
+            )
 
-        Enum.reduce_while(candidates, [], fn candidate, [] ->
-          candidate_call = Map.put(call, :artifact_candidate, candidate)
+          Enum.reduce_while(candidates, [], fn candidate, [] ->
+            candidate_call = Map.put(candidate_call, :artifact_candidate, candidate)
 
-          case evaluate_conditions(rule.conditions, rule, txn, candidate_call, %{}) do
-            {:match, cache} ->
-              {:halt, [{:notice, rule, candidate_call, evidence_facts(rule.conditions, cache)}]}
+            case evaluate_conditions(rule.conditions, rule, txn, candidate_call, %{}) do
+              {:match, cache} ->
+                {:halt, [{:notice, rule, candidate_call, evidence_facts(rule.conditions, cache)}]}
 
-            {:no_match, _cache} ->
-              {:cont, []}
+              {:no_match, _cache} ->
+                {:cont, []}
 
-            {:error, fact} ->
-              raise "row-commit rule #{rule.name} failed to compute #{fact}"
-          end
+              {:error, fact} ->
+                raise "row-commit rule #{rule.name} failed to compute #{fact}"
+            end
+          end)
         end)
       rescue
         error ->
@@ -708,6 +747,35 @@ defmodule Tightbeam.Rules do
   end
 
   defp evaluate_row_transition_in_txn(_txn, _transition), do: []
+
+  defp row_commit_candidate_calls_in_txn(txn, rule, call) do
+    flood_rule? = Enum.any?(rule.conditions, &(&1.fact == "turn.caller_queued_count"))
+
+    with true <- flood_rule?,
+         "queued_turn" <- row_commit_domain(call),
+         {true, _cache} <- compute_fact("turn.backlogged", txn, call, %{}),
+         session_key when is_binary(session_key) <- Map.get(call.params, :session_key),
+         {:ok, rows} <-
+           DB.query(
+             txn,
+             "SELECT origin FROM turns WHERE sessionKey=?1 AND status='queued' " <>
+               "AND (origin LIKE 'agent:%' OR origin LIKE 'session:%' OR origin LIKE 'user:%') " <>
+               "GROUP BY origin HAVING COUNT(*)>=3 ORDER BY MIN(seq)",
+             [session_key]
+           ) do
+      Enum.map(rows, fn [origin] ->
+        %{
+          call
+          | origin: origin,
+            principal:
+              row_commit_caller_principal(txn, origin, Map.get(call, :predicate_owner_user_id)),
+            params: Map.put(call.params, :caller_origin, origin)
+        }
+      end)
+    else
+      _ -> [call]
+    end
+  end
 
   defp row_domain_candidate?(rule, domain) do
     Enum.any?(rule.conditions, fn condition ->
@@ -722,10 +790,25 @@ defmodule Tightbeam.Rules do
         _ -> nil
       end
 
-    work_item_id = (assignment && assignment.work_item_id) || Map.get(call.params, :work_item_id)
+    work_item_id =
+      case Map.get(call, :edge) do
+        :row_commit -> row_commit_work_item_id(db, call, assignment)
+        _ -> (assignment && assignment.work_item_id) || Map.get(call.params, :work_item_id)
+      end
+
+    assignment_opener_session =
+      assignment && assignment_opener_session(db, assignment.id)
+
+    active_assignment_opener_session = active_notice_session(db, assignment_opener_session)
+
+    work_item_coordinator_session =
+      if Map.get(call, :edge) == :row_commit and is_nil(active_assignment_opener_session) and
+           work_item_id do
+        work_item_coordinator_session(db, work_item_id)
+      end
 
     delivery_owner_ref =
-      case work_item_id && DeliveryResponsibilities.current_owner(db, work_item_id) do
+      case work_item_id && current_delivery_owner(db, work_item_id) do
         %{"accountableSessionKey" => session_key} -> "session:" <> session_key
         _ -> "none"
       end
@@ -736,10 +819,144 @@ defmodule Tightbeam.Rules do
       holder_key: assignment && assignment.holder_key,
       holder_role: assignment && assignment[:holder_role],
       holder_archetype: assignment && assignment.holder_archetype,
+      assignment_opener_session: assignment_opener_session,
+      assignment_opener_or_coordinator_session:
+        active_assignment_opener_session || work_item_coordinator_session,
+      session_key: Map.get(call.params, :session_key),
+      session_unassigned_stretch_id: row_commit_value(db, call, "session.unassigned_stretch_id"),
+      caller_session_key: caller_session_key(db, call),
       caller_origin: call.origin,
-      delivery_owner_ref: delivery_owner_ref
+      delivery_owner_ref: delivery_owner_ref,
+      work_item_fourth_round_kind: row_commit_value(db, call, "work_item.fourth_round_kind"),
+      turn_backlog_episode_id: row_commit_value(db, call, "turn.backlog_episode_id"),
+      turn_caller_threshold_seq:
+        case row_commit_value(db, call, "turn.caller_threshold_seq") do
+          seq when is_integer(seq) -> Integer.to_string(seq)
+          _ -> nil
+        end
     }
   end
+
+  # Row-commit notices already execute in the DB owner transaction.
+  defp current_delivery_owner(%DB.Txn{} = txn, work_item_id),
+    do: DeliveryResponsibilities.current_owner_in_txn(txn, work_item_id)
+
+  defp current_delivery_owner(db, work_item_id),
+    do: DeliveryResponsibilities.current_owner(db, work_item_id)
+
+  defp assignment_opener_session(db, assignment_id) do
+    case DB.query(
+           db,
+           "SELECT openedByUser,openedBySession FROM assignments WHERE id=?1",
+           [assignment_id]
+         ) do
+      {:ok, [[_opened_by_user, session_key]]} when is_binary(session_key) ->
+        session_key
+
+      {:ok, [[user_id, nil]]} when is_binary(user_id) ->
+        Org.personal_session_key(user_id)
+
+      _ ->
+        nil
+    end
+  end
+
+  defp row_commit_work_item_id(db, call, assignment) do
+    case Map.get(call.params, :work_item_id) || (assignment && assignment.work_item_id) do
+      work_item_id when is_binary(work_item_id) ->
+        work_item_id
+
+      _ ->
+        case assignment && assignment.reviews_assignment_id do
+          subject_id when is_binary(subject_id) ->
+            case DB.query(db, "SELECT workItemId FROM assignments WHERE id=?1", [subject_id]) do
+              {:ok, [[work_item_id]]} when is_binary(work_item_id) -> work_item_id
+              _ -> nil
+            end
+
+          _ ->
+            nil
+        end
+    end
+  end
+
+  defp work_item_coordinator_session(db, work_item_id) do
+    with {:ok, [[owner_user_id]]} <-
+           DB.query(db, "SELECT ownerUserId FROM work_items WHERE id=?1", [work_item_id]),
+         session_key when is_binary(session_key) <-
+           DeliveryResponsibilities.current_accountable_recipient_in_txn(
+             db,
+             work_item_id,
+             owner_user_id
+           ) do
+      active_notice_session(db, session_key)
+    else
+      _ -> nil
+    end
+  end
+
+  defp active_notice_session(db, session_key) when is_binary(session_key) do
+    case DB.query(
+           db,
+           "SELECT 1 FROM sessions WHERE sessionKey=?1 AND state='active'",
+           [session_key]
+         ) do
+      {:ok, [[1]]} -> session_key
+      _ -> nil
+    end
+  end
+
+  defp active_notice_session(_db, _session_key), do: nil
+
+  defp caller_session_key(db, %{edge: :row_commit, params: params}) do
+    caller_session_from_origin(db, Map.get(params, :caller_origin))
+  end
+
+  defp caller_session_key(_db, _call), do: nil
+
+  defp caller_session_from_origin(db, "agent:" <> role) do
+    case Roles.resolve(db, role) do
+      {:ok, session_key, false} -> active_notice_session(db, session_key)
+      _ -> nil
+    end
+  end
+
+  defp caller_session_from_origin(db, "user:" <> user_id),
+    do: active_notice_session(db, Org.personal_session_key(user_id))
+
+  defp caller_session_from_origin(db, "session:" <> session_key),
+    do: active_notice_session(db, session_key)
+
+  defp caller_session_from_origin(_db, _origin), do: nil
+
+  defp row_commit_caller_principal(db, "agent:" <> role, owner_user_id) do
+    with {:ok, session_key, false} <- Roles.resolve(db, role),
+         session_key when is_binary(session_key) <- active_notice_session(db, session_key) do
+      {:session, session_key}
+    else
+      _ -> {:user, owner_user_id}
+    end
+  end
+
+  defp row_commit_caller_principal(db, "session:" <> session_key, owner_user_id) do
+    case active_notice_session(db, session_key) do
+      session_key when is_binary(session_key) -> {:session, session_key}
+      _ -> {:user, owner_user_id}
+    end
+  end
+
+  defp row_commit_caller_principal(_db, "user:" <> user_id, _owner_user_id),
+    do: {:user, user_id}
+
+  defp row_commit_caller_principal(_db, _origin, owner_user_id), do: {:user, owner_user_id}
+
+  defp row_commit_value(db, %{edge: :row_commit} = call, fact) do
+    case compute_fact(fact, db, call, %{}) do
+      {value, _cache} -> value
+    end
+  end
+
+  defp row_commit_value(_db, _call, _fact), do: nil
 
   defp row_commit_principal("session:" <> session_key, _owner) do
     origin =
@@ -931,6 +1148,7 @@ defmodule Tightbeam.Rules do
       do: fail.("must carry at least one of deny_when or [rule.check]")
 
     edges = validate_edges!(Map.get(rule, "edges", ["verb"]), verb, fail)
+    verbs = validate_rule_verbs!(Map.get(rule, "verbs"), verb, edges, valid_verbs, fail)
 
     effect =
       validate_effect!(Map.get(rule, "effect", "deny"), check, Map.has_key?(rule, "effect"), fail)
@@ -963,6 +1181,7 @@ defmodule Tightbeam.Rules do
     %{
       name: raw_name,
       verb: verb,
+      verbs: verbs,
       text: String.trim(text),
       conditions: conditions,
       edges: edges,
@@ -981,6 +1200,33 @@ defmodule Tightbeam.Rules do
   defp validate_rule!(path, ordinal, _rule, _valid_verbs, _base_dir, _identity_manifest_sha) do
     raise ArgumentError, "#{path}: rule ##{ordinal}: rule must be a table"
   end
+
+  defp validate_rule_verbs!(nil, verb, _edges, _valid_verbs, _fail), do: [verb]
+
+  defp validate_rule_verbs!(verbs, verb, edges, valid_verbs, fail) when is_list(verbs) do
+    cond do
+      "row-commit" not in edges ->
+        fail.("verbs is valid only on row-commit rules")
+
+      verbs == [] or not Enum.all?(verbs, &is_binary/1) ->
+        fail.("verbs must be a non-empty list of strings")
+
+      Enum.uniq(verbs) != verbs ->
+        fail.("verbs must not contain duplicates")
+
+      not Enum.all?(verbs, &MapSet.member?(valid_verbs, &1)) ->
+        fail.("verbs contains an unknown verb")
+
+      verb not in verbs ->
+        fail.("verbs must include the rule's verb")
+
+      true ->
+        verbs
+    end
+  end
+
+  defp validate_rule_verbs!(_verbs, _verb, _edges, _valid_verbs, fail),
+    do: fail.("verbs must be a list")
 
   defp validate_conditions!(nil, _fail), do: []
 
@@ -2504,6 +2750,424 @@ defmodule Tightbeam.Rules do
 
         {count, cache}
     end)
+  end
+
+  defp compute_fact("work_item.fourth_round_kind", db, call, cache) do
+    case row_commit_domain(call) do
+      "attest" ->
+        case {row_commit_attest_record(db, call), fetch_fact("$assignment", db, call, cache)} do
+          {%{kind: "verdict"}, {:ok, %{reviews_assignment_id: subject_id} = assignment, cache}}
+          when is_binary(subject_id) ->
+            case row_commit_work_item_id(db, call, assignment) do
+              work_item_id when is_binary(work_item_id) ->
+                {:ok, [[count]]} =
+                  DB.query(
+                    db,
+                    """
+                    SELECT COUNT(*)
+                    FROM attests verdict
+                    JOIN assignments review ON review.id=verdict.assignmentId
+                    JOIN assignments producer ON producer.id=review.reviewsAssignmentId
+                    WHERE COALESCE(review.workItemId,producer.workItemId)=?1
+                      AND verdict.kind='verdict'
+                    """,
+                    [work_item_id]
+                  )
+
+                if count == 4, do: {"review", cache}, else: {nil, cache}
+
+              _ ->
+                {nil, cache}
+            end
+
+          {_attest_or_other, {:ok, _assignment, cache}} ->
+            {nil, cache}
+
+          _ ->
+            {nil, cache}
+        end
+
+      "assignment" ->
+        case fetch_fact("$assignment", db, call, cache) do
+          {:ok, %{reviews_assignment_id: nil, effect_kind: "code"}, cache} ->
+            case compute_fact("assignment.prior_completed_fix_count", db, call, cache) do
+              {3, cache} -> {"fix", cache}
+              {_count, cache} -> {nil, cache}
+            end
+
+          {:ok, _assignment, cache} ->
+            {nil, cache}
+
+          _ ->
+            {nil, cache}
+        end
+
+      _ ->
+        {nil, cache}
+    end
+  end
+
+  defp row_commit_attest_record(db, call) do
+    transition = Map.get(call, :transition, %{})
+    attest_id = field(transition, :row_id)
+
+    with "attest" <- row_commit_domain(call),
+         attest_id when is_binary(attest_id) <- attest_id,
+         {:ok, [[assignment_id, kind, verdict_kind]]} <-
+           DB.query(
+             db,
+             "SELECT assignmentId,kind,verdictKind FROM attests WHERE id=?1",
+             [attest_id]
+           ) do
+      %{assignment_id: assignment_id, kind: kind, verdict_kind: verdict_kind}
+    else
+      _ -> nil
+    end
+  end
+
+  # Keep the historical work-item-wide review count available to existing
+  # operators, including all verdict kinds through the triggering row.
+  defp compute_fact("work_item.review_verdict_count", db, call, cache) do
+    attest_id = field(Map.get(call, :transition, %{}), :row_id)
+
+    assignment =
+      case fetch_fact("$assignment", db, call, cache) do
+        {:ok, value, _cache} -> value
+        _ -> nil
+      end
+
+    case {row_commit_work_item_id(db, call, assignment), attest_id} do
+      {work_item_id, attest_id} when is_binary(work_item_id) and is_binary(attest_id) ->
+        {:ok, [[count]]} =
+          DB.query(
+            db,
+            """
+            SELECT COUNT(*)
+            FROM attests verdict
+            JOIN assignments review ON review.id=verdict.assignmentId
+            LEFT JOIN assignments subject ON subject.id=review.reviewsAssignmentId
+            WHERE COALESCE(review.workItemId,subject.workItemId)=?1
+              AND review.reviewsAssignmentId IS NOT NULL
+              AND verdict.kind='verdict'
+              AND verdict.rowid <= (
+                SELECT event_attest.rowid FROM attests event_attest WHERE event_attest.id=?2
+              )
+            """,
+            [work_item_id, attest_id]
+          )
+
+        {count, cache}
+
+      _ ->
+        {nil, cache}
+    end
+  end
+
+  # These queue snapshots run only for the queued-turn commit that carries the
+  # target session. They are read from the durable queue after the enqueue has
+  # committed; no backlog classification is stored.
+  defp compute_fact("turn.queued_count", db, call, cache) do
+    with "queued_turn" <- row_commit_domain(call),
+         session_key when is_binary(session_key) and session_key != "" <-
+           Map.get(call.params, :session_key) do
+      {:ok, [[count]]} =
+        DB.query(
+          db,
+          "SELECT COUNT(*) FROM turns WHERE sessionKey=?1 AND status='queued'",
+          [session_key]
+        )
+
+      {count, cache}
+    else
+      _ -> {nil, cache}
+    end
+  end
+
+  defp compute_fact("turn.oldest_age_ms", db, call, cache) do
+    with "queued_turn" <- row_commit_domain(call),
+         session_key when is_binary(session_key) and session_key != "" <-
+           Map.get(call.params, :session_key) do
+      {:ok, [[created_at]]} =
+        DB.query(
+          db,
+          "SELECT MIN(createdAt) FROM turns WHERE sessionKey=?1 AND status='queued'",
+          [session_key]
+        )
+
+      age =
+        case created_at do
+          value when is_integer(value) -> max(System.system_time(:millisecond) - value, 0)
+          _ -> nil
+        end
+
+      {age, cache}
+    else
+      _ -> {nil, cache}
+    end
+  end
+
+  defp compute_fact("turn.caller_queued_count", db, call, cache) do
+    with "queued_turn" <- row_commit_domain(call),
+         session_key when is_binary(session_key) and session_key != "" <-
+           Map.get(call.params, :session_key),
+         origin when is_binary(origin) and origin != "" <- Map.get(call.params, :caller_origin),
+         true <- caller_origin?(origin) do
+      {:ok, [[count]]} =
+        DB.query(
+          db,
+          "SELECT COUNT(*) FROM turns WHERE sessionKey=?1 AND origin=?2 AND status='queued'",
+          [session_key, origin]
+        )
+
+      {count, cache}
+    else
+      _ -> {nil, cache}
+    end
+  end
+
+  defp compute_fact("session.working_without_open_assignment", db, call, cache) do
+    with "running_turn" <- row_commit_domain(call),
+         session_key when is_binary(session_key) and session_key != "" <-
+           Map.get(call.params, :session_key) do
+      if agent_started_turn?(db, Map.get(call.params, :caller_origin), session_key) do
+        {:ok, [[count]]} =
+          DB.query(
+            db,
+            "SELECT COUNT(*) FROM assignments WHERE holderKey=?1 AND state='open'",
+            [session_key]
+          )
+
+        {count == 0, cache}
+      else
+        {false, cache}
+      end
+    else
+      _ -> {nil, cache}
+    end
+  end
+
+  defp compute_fact("session.unassigned_stretch_id", db, call, cache) do
+    with "running_turn" <- row_commit_domain(call),
+         session_key when is_binary(session_key) and session_key != "" <-
+           Map.get(call.params, :session_key),
+         true <- agent_started_turn?(db, Map.get(call.params, :caller_origin), session_key) do
+      {:ok, [[count]]} =
+        DB.query(
+          db,
+          "SELECT COUNT(*) FROM assignments WHERE holderKey=?1 AND state='open'",
+          [session_key]
+        )
+
+      if count == 0 do
+        {:ok, rows} =
+          DB.query(
+            db,
+            "SELECT id,closedAt FROM assignments WHERE holderKey=?1 AND state='closed' " <>
+              "ORDER BY closedAt DESC,rowid DESC LIMIT 1",
+            [session_key]
+          )
+
+        stretch_id =
+          case rows do
+            [[assignment_id, closed_at]] ->
+              "after-assignment:" <> assignment_id <> ":" <> Integer.to_string(closed_at)
+
+            [] ->
+              "initial:" <> session_key
+          end
+
+        {stretch_id, cache}
+      else
+        {nil, cache}
+      end
+    else
+      _ -> {nil, cache}
+    end
+  end
+
+  defp compute_fact("turn.backlogged", db, call, cache) do
+    case queued_turn_snapshot(db, call) do
+      %{count: count, age_ms: age_ms} ->
+        {count >= 20 or (is_integer(age_ms) and age_ms >= 60 * 60 * 1_000), cache}
+
+      _ ->
+        {nil, cache}
+    end
+  end
+
+  defp compute_fact("turn.backlog_episode_id", db, call, cache) do
+    case queued_turn_snapshot(db, call) do
+      %{count: count, age_ms: age_ms, session_key: session_key, now: now}
+      when count >= 20 or (is_integer(age_ms) and age_ms >= 60 * 60 * 1_000) ->
+        case backlog_started_at(db, session_key, now) do
+          nil -> {nil, cache}
+          at -> {"queue:" <> session_key <> ":" <> Integer.to_string(at), cache}
+        end
+
+      _ ->
+        {nil, cache}
+    end
+  end
+
+  # Reconstruct the union of depth and age backlog intervals from queue residence,
+  # not the oldest *remaining* turn. Claiming a head turn does not end a backlog.
+  # Equal-millisecond boundaries are coalesced: durable timestamps cannot order
+  # a claim and enqueue within that millisecond, so a zero-duration recovery
+  # conservatively stays in the same episode. No classification is persisted.
+  defp backlog_started_at(db, session_key, now) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT createdAt,CASE WHEN status='queued' THEN NULL " <>
+          "ELSE COALESCE(startedAt,endedAt,createdAt) END FROM turns " <>
+          "WHERE sessionKey=?1 AND origin NOT LIKE 'remedy:ac6a-%'",
+        [session_key]
+      )
+
+    {_depth, _aged, started_at} =
+      rows
+      |> Enum.flat_map(fn [created_at, left_at] ->
+        age_at = created_at + 60 * 60 * 1_000
+        left_at = if is_integer(left_at), do: max(left_at, created_at), else: nil
+        ages? = is_nil(left_at) or age_at < left_at
+        events = [{created_at, 1, 0}]
+        events = if ages?, do: [{age_at, 0, 1} | events], else: events
+
+        if is_integer(left_at) do
+          [{left_at, -1, if(ages?, do: -1, else: 0)} | events]
+        else
+          events
+        end
+      end)
+      |> Enum.reject(fn {at, _, _} -> at > now end)
+      |> Enum.group_by(fn {at, _, _} -> at end)
+      |> Enum.sort_by(fn {at, _} -> at end)
+      |> Enum.reduce({0, 0, nil}, fn {at, events}, {depth, aged, started_at} ->
+        {depth, aged} =
+          Enum.reduce(events, {depth, aged}, fn {_, depth_delta, age_delta}, {depth, aged} ->
+            {depth + depth_delta, aged + age_delta}
+          end)
+
+        started_at = if depth >= 20 or aged > 0, do: started_at || at, else: nil
+        {depth, aged, started_at}
+      end)
+
+    started_at
+  end
+
+  defp compute_fact("turn.caller_threshold_seq", db, call, cache) do
+    with "queued_turn" <- row_commit_domain(call),
+         session_key when is_binary(session_key) and session_key != "" <-
+           Map.get(call.params, :session_key),
+         origin when is_binary(origin) and origin != "" <- Map.get(call.params, :caller_origin),
+         true <- caller_origin?(origin) do
+      {:ok, rows} =
+        DB.query(
+          db,
+          "SELECT seq,createdAt,CASE WHEN status='queued' THEN NULL " <>
+            "ELSE COALESCE(startedAt,endedAt,createdAt) END FROM turns " <>
+            "WHERE sessionKey=?1 AND origin=?2",
+          [session_key, origin]
+        )
+
+      {sender_threshold_seq(rows), cache}
+    else
+      _ -> {nil, cache}
+    end
+  end
+
+  # Identify the current continuous >=3 sender queue interval, not its moving
+  # third remaining turn. As with backlog episodes, coalesce equal-ms events.
+  # The earliest enqueue seq in the crossing batch stays stable even if more
+  # enqueues or claims are recorded in that same millisecond later.
+  defp sender_threshold_seq(rows) do
+    {_count, threshold_seq} =
+      rows
+      |> Enum.flat_map(fn [seq, created_at, left_at] ->
+        events = [{created_at, 1, seq}]
+
+        if is_integer(left_at) do
+          [{max(left_at, created_at), -1, nil} | events]
+        else
+          events
+        end
+      end)
+      |> Enum.group_by(fn {at, _, _} -> at end)
+      |> Enum.sort_by(fn {at, _} -> at end)
+      |> Enum.reduce({0, nil}, fn {_at, events}, {count, threshold_seq} ->
+        count = Enum.reduce(events, count, fn {_, delta, _}, count -> count + delta end)
+
+        threshold_seq =
+          if count >= 3 do
+            threshold_seq ||
+              events
+              |> Enum.flat_map(fn
+                {_, 1, seq} -> [seq]
+                _ -> []
+              end)
+              |> Enum.min()
+          end
+
+        {count, threshold_seq}
+      end)
+
+    threshold_seq
+  end
+
+  defp queued_turn_snapshot(db, call) do
+    with "queued_turn" <- row_commit_domain(call),
+         session_key when is_binary(session_key) and session_key != "" <-
+           Map.get(call.params, :session_key),
+         {:ok, [[count, created_at]]} <-
+           DB.query(
+             db,
+             "SELECT COUNT(*),MIN(createdAt) FROM turns " <>
+               "WHERE sessionKey=?1 AND status='queued' AND origin NOT LIKE 'remedy:ac6a-%'",
+             [session_key]
+           ) do
+      now = System.system_time(:millisecond)
+
+      age_ms =
+        case created_at do
+          value when is_integer(value) -> max(now - value, 0)
+          _ -> nil
+        end
+
+      %{count: count, age_ms: age_ms, session_key: session_key, now: now}
+    else
+      _ -> nil
+    end
+  end
+
+  defp agent_started_turn?(_db, "session:" <> caller_session_key, target_session_key),
+    do: caller_session_key != "" and caller_session_key == target_session_key
+
+  defp agent_started_turn?(db, origin, target_session_key) when is_binary(origin) do
+    case Tightbeam.Origin.parse(origin) do
+      {:agent, role} ->
+        case Roles.resolve(db, role) do
+          {:ok, ^target_session_key, false} -> true
+          _ -> false
+        end
+
+      _ ->
+        false
+    end
+  end
+
+  defp agent_started_turn?(_db, _origin, _target_session_key), do: false
+
+  defp caller_origin?(origin),
+    do:
+      String.starts_with?(origin, "agent:") or String.starts_with?(origin, "session:") or
+        String.starts_with?(origin, "user:")
+
+  defp row_commit_domain(call) do
+    if Map.get(call, :edge) == :row_commit do
+      field(Map.get(call, :transition, %{}), :domain)
+    else
+      nil
+    end
   end
 
   defp compute_fact("assign.declared_files_overlap_open", db, call, cache) do

@@ -4058,7 +4058,7 @@ defmodule Tightbeam.HarnessHealth do
   @spec resume_other_routes(DB.server()) :: :ok
   def resume_other_routes(db \\ DB) do
     publications =
-      transaction!(db, fn txn ->
+      transaction_with_row_commits!(db, fn txn ->
         marked =
           Txn.q(
             txn,
@@ -4191,6 +4191,16 @@ defmodule Tightbeam.HarnessHealth do
 
   defp transaction!(db, fun) do
     case DB.transaction(db, fun) do
+      {:ok, result} -> result
+      {:error, error} -> raise error
+    end
+  end
+
+  defp transaction_with_row_commits!(db, fun) do
+    case DB.transaction_then(db, fun, fn txn, result ->
+           Tightbeam.Wakes.row_commit_in_txn(txn, [])
+           result
+         end) do
       {:ok, result} -> result
       {:error, error} -> raise error
     end
