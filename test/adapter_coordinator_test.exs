@@ -26,6 +26,9 @@ defmodule Tightbeam.AdapterCoordinatorTest do
          db: Keyword.fetch!(opts, :db),
          delay_ms: Keyword.fetch!(opts, :delay_ms),
          owner: Keyword.fetch!(opts, :owner),
+         lock_holder: Keyword.get(opts, :lock_holder),
+         release_lock_on_call: Keyword.get(opts, :release_lock_on_call),
+         notify_result_on_call: Keyword.get(opts, :notify_result_on_call),
          calls: 0
        }}
     end
@@ -33,8 +36,25 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     @impl true
     def handle_call({:transaction_until, fun, deadline}, _from, state) do
       call = state.calls + 1
-      if call == 2, do: Process.sleep(state.delay_ms)
+
+      if call == 2 do
+        # Keep the synthetic delay inside the transaction's real deadline;
+        # otherwise the proxy can keep sleeping after the coordinator's
+        # bounded call has already expired.
+        remaining_ms = max(deadline - System.monotonic_time(:millisecond), 0)
+        Process.sleep(min(state.delay_ms, remaining_ms))
+      end
+
       reply = Tightbeam.DB.transaction_until(state.db, fun, deadline)
+
+      if call == state.notify_result_on_call do
+        send(state.owner, {:delayed_db_proxy_result, call, reply})
+      end
+
+      if call == state.release_lock_on_call and is_pid(state.lock_holder) do
+        send(state.lock_holder, :release_db_lock)
+      end
+
       send(state.owner, {:delayed_db_proxy_done, call})
       {:reply, reply, %{state | calls: call}}
     end
@@ -1446,19 +1466,31 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     blocker =
       Task.async(fn ->
         DB.transaction(ctx.db, fn _txn ->
-          send(parent, :shutdown_preparation_db_locked)
-          # Must hold the DB owner past the park deadline (budget minus
-          # settlement reserve) so preparation misses, while releasing well
-          # before the full budget so settlement still lands. Process.sleep
-          # only promises a minimum; the gap on each side absorbs the
-          # scheduler overshoot a loaded parallel suite adds, which at the
-          # old 450-in-500 margin recorded zero cleanup outcomes.
-          Process.sleep(1_200)
-          :ok
+          send(parent, {:shutdown_preparation_db_locked, self()})
+
+          receive do
+            :release_db_lock -> :ok
+          end
         end)
       end)
 
-    assert_receive :shutdown_preparation_db_locked, 500
+    assert_receive {:shutdown_preparation_db_locked, db_owner}, 500
+
+    # The prep transaction times out against the held DB owner. The proxy
+    # releases that owner as soon as it observes the result, leaving the full
+    # settlement reserve to commit one cleanup event per adapter.
+    proxy =
+      start_supervised!(
+        {DelayedDbProxy,
+         db: ctx.db,
+         delay_ms: 0,
+         owner: self(),
+         lock_holder: db_owner,
+         release_lock_on_call: 1,
+         notify_result_on_call: 1}
+      )
+
+    :sys.replace_state(coordinator, fn state -> %{state | db: proxy} end)
     started_at = System.monotonic_time(:millisecond)
 
     log =
@@ -1469,6 +1501,8 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     elapsed_ms = System.monotonic_time(:millisecond) - started_at
     assert elapsed_ms < 2_000
     assert {:ok, :ok} = Task.await(blocker, 1_000)
+    assert_received {:delayed_db_proxy_result, 1, {:error, %Tightbeam.DB.DeadlineExceeded{}}}
+
     assert log =~ "preparation unresolved"
 
     rows = HarnessProcess.list(ctx.db)
@@ -1614,14 +1648,15 @@ defmodule Tightbeam.AdapterCoordinatorTest do
       start_supervised!({DelayedDbProxy, db: ctx.db, delay_ms: 500, owner: self()})
 
     :sys.replace_state(coordinator, fn state -> %{state | db: proxy} end)
-    started_at = System.monotonic_time(:millisecond)
 
     log =
       ExUnit.CaptureLog.capture_log(fn ->
+        started_at = System.monotonic_time(:millisecond)
         assert :ok = GenServer.stop(coordinator, :shutdown, 5_000)
+        send(self(), {:shutdown_elapsed_ms, System.monotonic_time(:millisecond) - started_at})
       end)
 
-    elapsed_ms = System.monotonic_time(:millisecond) - started_at
+    assert_received {:shutdown_elapsed_ms, elapsed_ms}
     assert elapsed_ms < 1_000
     assert_receive {:delayed_db_proxy_done, 2}, 1_000
     assert log =~ "durable outcomes unresolved"
@@ -1738,8 +1773,6 @@ defmodule Tightbeam.AdapterCoordinatorTest do
              300
            )
 
-    started_at = System.monotonic_time(:millisecond)
-
     # The cleanup now runs on its own owner AFTER terminate/2 returns, so its log
     # lands after GenServer.stop does. Waiting for the descendants to disappear
     # inside the capture is what makes that line observable here; measuring the
@@ -1749,8 +1782,14 @@ defmodule Tightbeam.AdapterCoordinatorTest do
         # Deliberately looser than the budget so an overrun fails on the elapsed
         # bound below with a real number, instead of exiting here on an ambiguous
         # caller timeout.
+        started_at = System.monotonic_time()
         assert :ok = GenServer.stop(coordinator, :shutdown, 3_000)
-        send(self(), {:shutdown_elapsed_ms, System.monotonic_time(:millisecond) - started_at})
+        elapsed_native = System.monotonic_time() - started_at
+
+        send(
+          self(),
+          {:shutdown_elapsed_ms, System.convert_time_unit(elapsed_native, :native, :millisecond)}
+        )
 
         assert eventually(
                  fn -> HarnessProcessCensus.capture_for_root(ctx.test_dir).count == 0 end,
