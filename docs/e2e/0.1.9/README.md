@@ -80,11 +80,13 @@ leave the source and migrated result unapproved. A local bind address or
 network block alone does not prevent copied work from being reconciled inside
 the gateway.
 
-The feature smoke also follows that boundary: it no longer sweeps pre-existing
-open work or applies identity to every copied session. Each invocation creates
-its own unique fixtures. If it stops part-way through, discard that area copy
-and make a fresh one from the preserved migration result; do not clean unrelated
-rows to prepare a retry.
+The feature smoke also follows that boundary: it clears only open work items
+whose titles carry the random salt created by the current invocation, and only
+between its provider legs. That lets the second leg clean the first leg's
+fixtures without touching work copied from the source org. It does not apply
+identity to every copied session. If an invocation stops part-way through,
+discard that area copy and make a fresh one from the preserved migration result;
+a later process cannot safely identify the interrupted run's leftover rows.
 
 ## Aggregate run
 

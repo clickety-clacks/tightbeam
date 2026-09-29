@@ -107,7 +107,13 @@ defmodule FeatureSmoke do
   defp run_full do
     base_dir = System.get_env("TIGHTBEAM_BASE_DIR") || Path.expand("~/.tightbeam-beam")
     gw = base_dir |> Path.join("gateway.json") |> File.read!() |> JSON.decode!()
-    Process.put(:salt, Integer.to_string(System.os_time(:second)) <> "-")
+
+    Process.put(
+      :salt,
+      Integer.to_string(System.os_time(:second)) <>
+        "-" <> Base.url_encode64(:crypto.strong_rand_bytes(16), padding: false) <> "-"
+    )
+
     areas = selected_smoke_areas!()
 
     announce_selection!(Tightbeam.FeatureSmokePlan.selection(Tightbeam.Harness.all()))
@@ -125,6 +131,7 @@ defmodule FeatureSmoke do
         leg: leg,
         providers: Tightbeam.FeatureSmokePlan.provider_names(Tightbeam.Harness.all())
       }
+      |> clear_previous_leg_work_items()
       |> run_selected_areas(areas)
       |> finish_leg()
     end)
@@ -2654,6 +2661,32 @@ defmodule FeatureSmoke do
   defp this_run(items) do
     salt = Process.get(:salt, "")
     Enum.filter(items, &String.contains?(&1["title"] || "", salt))
+  end
+
+  # Each selected provider leg is an independent smoke run. Clear only open work
+  # created by an earlier leg in this invocation; the random run salt cannot match
+  # rows in the copied org. An interrupted invocation is handled by discarding its
+  # area clone, since a later process cannot prove ownership of its leftover rows.
+  defp clear_previous_leg_work_items(state) do
+    items = ok!(state, "work-item-list", %{})["workItems"] || []
+
+    items
+    |> this_run()
+    |> Enum.filter(&(&1["state"] == "open"))
+    |> Enum.each(fn item ->
+      got = ok!(state, "work-item-get", %{"workItemId" => item["id"]})
+
+      for asg <- got["assignments"] || [], asg["state"] == "open" do
+        ok!(state, "revoke-assignment", %{
+          "assignmentId" => asg["id"],
+          "reason" => "Smoke setup clears an open assignment left by a previous run"
+        })
+      end
+
+      ok!(state, "work-item-close", %{"workItemId" => item["id"]})
+    end)
+
+    state
   end
 
   # The salt IS the run's start second, so the run can bound its own clock
