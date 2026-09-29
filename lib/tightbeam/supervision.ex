@@ -986,7 +986,12 @@ defmodule Tightbeam.Supervision do
          ) do
       [[wake_kind, charged_generation, generation, _basis_kind, _basis_id, interval]]
       when generation == charged_generation ->
-        case absorb_liveness_receipts_in_txn(txn, assignment_id, interval) do
+        case absorb_liveness_receipts_in_txn(
+               txn,
+               assignment_id,
+               interval,
+               wake_kind == "prod"
+             ) do
           :rebased ->
             :canceled
 
@@ -2626,6 +2631,8 @@ defmodule Tightbeam.Supervision do
     recovery_clock = now()
 
     transaction_then!(state.db, fn txn ->
+      settle_ended_controllers_in_txn(txn)
+
       retired_holders =
         Txn.q(
           txn,
@@ -2701,32 +2708,11 @@ defmodule Tightbeam.Supervision do
             :ok
 
           :none ->
-            baseline_progress_in_txn(txn, assignment_id)
-
-            ensure_liveness_receipt_state_in_txn(
+            recover_missing_entitlement_in_txn(
               txn,
               assignment_id,
-              "recovery_backfill",
-              "process:tightbeam"
-            )
-
-            Txn.q(
-              txn,
-              """
-              INSERT INTO supervision_entitlements
-                (assignmentId, generation, dueAt, state, lastAttemptGeneration, claimClock,
-                 basisKind, basisId, terminusAt, cause, principal, supervisionIntervalMs)
-              VALUES (?1, 1, ?2, 'armed', NULL, NULL, 'recovery_backfill', ?1, NULL,
-                      'recovery_backfill', 'process:tightbeam', ?3)
-              """,
-              [assignment_id, recovery_clock + interval, interval]
-            )
-
-            EventLog.lifecycle_in_txn(
-              txn,
-              "supervision_entitlement_armed",
-              assignment_id,
-              "generation=1 basis=recovery_backfill:#{assignment_id} cause=recovery_backfill principal=process:tightbeam"
+              recovery_clock,
+              interval
             )
 
           {:error, reason} ->
@@ -2737,6 +2723,266 @@ defmodule Tightbeam.Supervision do
   end
 
   defp recover_liveness(_state), do: :ok
+
+  defp settle_ended_controllers_in_txn(txn) do
+    ended =
+      Txn.q(
+        txn,
+        """
+        SELECT s.wakeId, s.assignmentId, w.state
+        FROM supervision_liveness_sidecar s
+        JOIN wakes w ON w.wakeId=s.wakeId
+        WHERE s.controllerOrigin='scheduled' AND s.controllerState='pending'
+          AND w.state IN ('fired','canceled')
+        ORDER BY s.assignmentId, s.wakeId
+        """
+      )
+
+    Enum.each(ended, fn [wake_id, assignment_id, wake_state] ->
+      Txn.q(
+        txn,
+        """
+        UPDATE supervision_liveness_sidecar
+        SET controllerState='settled'
+        WHERE wakeId=?1 AND assignmentId=?2 AND controllerOrigin='scheduled'
+          AND controllerState='pending'
+        """,
+        [wake_id, assignment_id]
+      )
+
+      if Txn.changes(txn) == 1 do
+        EventLog.lifecycle_in_txn(
+          txn,
+          "supervision_controller_settlement_recovered",
+          assignment_id,
+          "wakeId=#{wake_id} wakeState=#{wake_state} principal=process:tightbeam"
+        )
+      end
+    end)
+
+    :ok
+  end
+
+  defp recover_missing_entitlement_in_txn(txn, assignment_id, recovery_clock, interval) do
+    case recoverable_pending_controller_in_txn(txn, assignment_id) do
+      {:ok, generation, basis_kind, basis_id} ->
+        Txn.q(
+          txn,
+          """
+          INSERT INTO supervision_entitlements
+            (assignmentId, generation, dueAt, state, lastAttemptGeneration, claimClock,
+             basisKind, basisId, terminusAt, cause, principal, supervisionIntervalMs)
+          VALUES (?1, ?2, ?3, 'armed', NULL, NULL, ?4, ?5, NULL, ?4,
+                  'process:tightbeam', ?6)
+          """,
+          [assignment_id, generation, recovery_clock + interval, basis_kind, basis_id, interval]
+        )
+
+        EventLog.lifecycle_in_txn(
+          txn,
+          "supervision_entitlement_recovered",
+          assignment_id,
+          "generation=#{generation} basis=#{basis_kind}:#{basis_id} cause=#{basis_kind} principal=process:tightbeam source=scheduled_controller"
+        )
+
+      {:refused, reason} ->
+        refuse_missing_entitlement_recovery_in_txn(txn, assignment_id, reason)
+
+      :none ->
+        if surviving_liveness_lineage_in_txn?(txn, assignment_id) do
+          refuse_missing_entitlement_recovery_in_txn(
+            txn,
+            assignment_id,
+            "surviving_lineage_without_coherent_pending_controller"
+          )
+        else
+          baseline_progress_in_txn(txn, assignment_id)
+
+          ensure_liveness_receipt_state_in_txn(
+            txn,
+            assignment_id,
+            "recovery_backfill",
+            "process:tightbeam"
+          )
+
+          Txn.q(
+            txn,
+            """
+            INSERT INTO supervision_entitlements
+              (assignmentId, generation, dueAt, state, lastAttemptGeneration, claimClock,
+               basisKind, basisId, terminusAt, cause, principal, supervisionIntervalMs)
+            VALUES (?1, 1, ?2, 'armed', NULL, NULL, 'recovery_backfill', ?1, NULL,
+                    'recovery_backfill', 'process:tightbeam', ?3)
+            """,
+            [assignment_id, recovery_clock + interval, interval]
+          )
+
+          EventLog.lifecycle_in_txn(
+            txn,
+            "supervision_entitlement_armed",
+            assignment_id,
+            "generation=1 basis=recovery_backfill:#{assignment_id} cause=recovery_backfill principal=process:tightbeam"
+          )
+        end
+    end
+
+    :ok
+  end
+
+  defp recoverable_pending_controller_in_txn(txn, assignment_id) do
+    case Txn.q(
+           txn,
+           """
+           SELECT s.wakeId, s.wakeKind, s.chargedGeneration,
+                  w.state, w.origin, w.assignmentId, w.sessionKey, w.consumer,
+                  w.reresolve, w.reresolveSeed, w.reresolveRung
+           FROM supervision_liveness_sidecar s
+           JOIN wakes w ON w.wakeId=s.wakeId
+           WHERE s.assignmentId=?1 AND s.controllerOrigin='scheduled'
+             AND s.controllerState='pending'
+           """,
+           [assignment_id]
+         ) do
+      [
+        [
+          wake_id,
+          wake_kind,
+          generation,
+          "pending",
+          "process:tightbeam",
+          ^assignment_id,
+          session_key,
+          "prompt",
+          reresolve,
+          reresolve_seed,
+          reresolve_rung
+        ]
+      ]
+      when is_integer(generation) and generation > 0 ->
+        basis_kind = "#{wake_kind}_scheduled"
+
+        wake_matches? =
+          case {wake_kind, reresolve, reresolve_seed, reresolve_rung} do
+            {"prod", nil, nil, nil} ->
+              true
+
+            {"escalation", "lineage", seed, rung} ->
+              is_binary(seed) and seed != "" and is_integer(rung) and rung > 0
+
+            _ ->
+              false
+          end
+
+        expected_detail =
+          "generation=#{generation} basis=#{basis_kind}:#{wake_id} " <>
+            "cause=#{basis_kind} principal=process:tightbeam"
+
+        expected_recovery_detail = expected_detail <> " source=scheduled_controller"
+
+        latest_entitlement_event =
+          Txn.q(
+            txn,
+            """
+            SELECT kind, detail FROM lifecycle_events
+            WHERE subject=?1 AND kind GLOB 'supervision_entitlement_*'
+            ORDER BY id DESC LIMIT 1
+            """,
+            [assignment_id]
+          )
+
+        receipt_state_exists? =
+          Txn.q(
+            txn,
+            "SELECT 1 FROM supervision_liveness_receipt_state WHERE assignmentId=?1",
+            [assignment_id]
+          ) == [[1]]
+
+        current_holder? =
+          Txn.q(
+            txn,
+            """
+            SELECT 1 FROM assignments a
+            JOIN sessions s ON s.sessionKey=a.holderKey
+            WHERE a.id=?1 AND a.holderKey=?2 AND a.state='open' AND s.state='active'
+            """,
+            [assignment_id, session_key]
+          ) == [[1]]
+
+        [[latest_receipt_generation]] =
+          Txn.q(
+            txn,
+            "SELECT MAX(generation) FROM supervision_liveness_receipts WHERE assignmentId=?1",
+            [assignment_id]
+          )
+
+        [[latest_progress_generation]] =
+          Txn.q(
+            txn,
+            "SELECT MAX(generation) FROM supervision_progress_absorptions WHERE assignmentId=?1",
+            [assignment_id]
+          )
+
+        controller_event_matches? =
+          latest_entitlement_event in [
+            ["supervision_entitlement_rearmed", expected_detail],
+            ["supervision_entitlement_recovered", expected_recovery_detail]
+          ]
+
+        coherent? =
+          wake_matches? and current_holder? and
+            receipt_state_exists? and
+            (is_nil(latest_receipt_generation) or latest_receipt_generation < generation) and
+            (is_nil(latest_progress_generation) or latest_progress_generation < generation) and
+            controller_event_matches?
+
+        if coherent?,
+          do: {:ok, generation, basis_kind, wake_id},
+          else: {:refused, "pending_controller_lineage_incoherent"}
+
+      [] ->
+        :none
+
+      _ ->
+        {:refused, "pending_controller_lineage_ambiguous"}
+    end
+  end
+
+  defp surviving_liveness_lineage_in_txn?(txn, assignment_id) do
+    Txn.q(
+      txn,
+      """
+      SELECT 1 FROM supervision_liveness_sidecar WHERE assignmentId=?1
+      UNION ALL
+      SELECT 1 FROM supervision_liveness_checkpoint_bindings WHERE assignmentId=?1
+      UNION ALL
+      SELECT 1 FROM supervision_liveness_receipts WHERE assignmentId=?1
+      UNION ALL
+      SELECT 1 FROM supervision_progress_absorptions WHERE assignmentId=?1
+      UNION ALL
+      SELECT 1 FROM lifecycle_events
+      WHERE subject=?1 AND kind GLOB 'supervision_entitlement_*'
+      LIMIT 1
+      """,
+      [assignment_id]
+    ) != []
+  end
+
+  defp refuse_missing_entitlement_recovery_in_txn(txn, assignment_id, reason) do
+    detail = "reason=#{reason} principal=process:tightbeam"
+
+    if Txn.q(
+         txn,
+         "SELECT 1 FROM lifecycle_events WHERE subject=?1 AND kind='supervision_entitlement_recovery_refused' AND detail=?2 LIMIT 1",
+         [assignment_id, detail]
+       ) == [] do
+      EventLog.lifecycle_in_txn(
+        txn,
+        "supervision_entitlement_recovery_refused",
+        assignment_id,
+        detail
+      )
+    end
+  end
 
   defp baseline_progress_in_txn(txn, assignment_id) do
     rows =
@@ -2827,6 +3073,8 @@ defmodule Tightbeam.Supervision do
 
     outcome =
       transaction!(state.db, fn txn ->
+        settle_ended_controllers_in_txn(txn)
+
         assignments =
           Txn.q(
             txn,
@@ -2869,7 +3117,12 @@ defmodule Tightbeam.Supervision do
 
   defp liveness_cycle(_state, _terminal_rebases), do: :ok
 
-  defp absorb_liveness_receipts_in_txn(txn, assignment_id, interval) do
+  defp absorb_liveness_receipts_in_txn(
+         txn,
+         assignment_id,
+         interval,
+         allow_pending_controller? \\ false
+       ) do
     ensure_liveness_receipt_state_in_txn(
       txn,
       assignment_id,
@@ -2895,7 +3148,8 @@ defmodule Tightbeam.Supervision do
         [assignment_id]
       ) != []
 
-    if state in ["armed", "claimed"] and not pending_controller? do
+    if state in ["armed", "claimed"] and
+         (allow_pending_controller? or not pending_controller?) do
       absorb_receipt_candidates_in_txn(txn, assignment_id, generation, interval)
     else
       :duplicate

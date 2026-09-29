@@ -1460,6 +1460,37 @@ defmodule Tightbeam.SupervisionTest do
     assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq3)
   end
 
+  test "concurrent terminal evaluations credit one receipt and one generation", ctx do
+    insert_entitlement!(ctx.db, "asg_1", generation: 4, due_at: 9_000_000_000_000)
+    terminal_seq = terminal!(ctx.db, "holder")
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO attests (id, assignmentId, kind, note, bySession, ts) VALUES ('att_concurrent','asg_1','progress','concurrent work','holder',9000000000000)"
+      )
+
+    results =
+      1..2
+      |> Enum.map(fn _ ->
+        Task.async(fn ->
+          Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", terminal_seq)
+        end)
+      end)
+      |> Enum.map(&Task.await(&1, 5_000))
+
+    assert Enum.all?(results, &(&1 in [:rebased, :duplicate]))
+
+    assert %{supervisionGeneration: 5, supervisionBasisKind: "liveness_receipt"} =
+             Supervision.prod_state(ctx.db, "asg_1")
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM supervision_liveness_receipts WHERE assignmentId='asg_1'"
+             )
+  end
+
   test "several typed effects produce one generation with exact source receipts", ctx do
     attach_work_item!(ctx.db, "asg_1", "wi_receipts")
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 9_000_000_000_000)
@@ -1605,37 +1636,222 @@ defmodule Tightbeam.SupervisionTest do
     assert {:ok, []} = DB.query(ctx.db, "SELECT receiptId FROM supervision_liveness_receipts")
   end
 
-  test "a receipt waits for an already-issued controller and resets after it settles", ctx do
-    terminal!(ctx.db, "holder")
+  test "pending controller admission absorbs progress before any prod turn", ctx do
+    terminal_seq = terminal!(ctx.db, "holder")
+    attach_work_item!(ctx.db, "asg_1", "wi_receipts")
     insert_entitlement!(ctx.db, "asg_1", generation: 4, due_at: 0, interval: 60_000)
 
     name = start_liveness!(ctx, sweep_ms: 60_000)
-    assert [%{assignment_id: "asg_1"} = charged] = Wakes.list_pending(ctx.db)
+    assert [%{assignment_id: "asg_1"} = controller] = Wakes.list_pending(ctx.db)
 
     {:ok, _} =
       DB.query(
         ctx.db,
-        "INSERT INTO attests (id, assignmentId, kind, verdictKind, byUser, ts) VALUES ('att_after_due','asg_1','verdict','verified','flynn',9000000000000)"
+        "INSERT INTO attests (id, assignmentId, kind, note, bySession, ts) VALUES ('att_before_checkpoint','asg_1','progress','work before checkpoint','holder',9000000000000)"
       )
 
-    sweep_liveness!(name)
-    assert Wakes.get(ctx.db, charged.wake_id).state == "pending"
-    assert :appended = admit_supervision_wake!(ctx.db, charged)
-    assert {:ok, turn} = Ledger.claim_next(ctx.db, "holder", "receipt-after-controller")
-    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+    {checkpoint, _source_turn} =
+      schedule_checkpoint_via_gateway!(ctx, "checkpoint before prod admission", 60_000)
 
-    sweep_liveness!(name)
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO attests (id, assignmentId, kind, note, bySession, ts) VALUES ('att_after_checkpoint','asg_1','progress','work after checkpoint','holder',9000000001000)"
+      )
+
+    assert checkpoint.assignment_id == nil
+
+    scheduler = start_wake_scheduler!(ctx, :receipt_before_prod)
+    assert :ok = Wakes.fire_due(scheduler)
+
+    assert Wakes.get(ctx.db, controller.wake_id).state in ["fired", "canceled"]
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [controller.wake_id])
 
     assert %{
              supervisionState: "armed",
              supervisionGeneration: 6,
-             supervisionDueAt: 9_000_000_060_000,
              supervisionBasisKind: "liveness_receipt",
              attemptCount: 0,
              prodCount: 0
            } = Supervision.prod_state(ctx.db, "asg_1")
 
-    assert Ledger.last_terminal_seq(ctx.db, "holder") == turn.seq
+    assert {:ok, [[0, 0, 0, nil]]} =
+             DB.query(
+               ctx.db,
+               "SELECT attemptCount,prodCount,deniedStreak,stalledAt FROM assignment_prods WHERE assignmentId='asg_1'"
+             )
+
+    assert {:ok,
+            [
+              ["progress", "att_before_checkpoint", 6],
+              ["progress", "att_after_checkpoint", 6]
+            ]} =
+             DB.query(
+               ctx.db,
+               "SELECT sourceKind,sourceId,generation FROM supervision_liveness_receipts WHERE assignmentId='asg_1' ORDER BY receiptId"
+             )
+
+    sweep_liveness!(name)
+
+    assert {:ok, [["settled"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT controllerState FROM supervision_liveness_sidecar WHERE wakeId=?1",
+               [controller.wake_id]
+             )
+
+    assert {:ok, [[2]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM supervision_liveness_receipts WHERE assignmentId='asg_1'"
+             )
+
+    assert Ledger.last_terminal_seq(ctx.db, "holder") == terminal_seq
+  end
+
+  test "typed checkpoint binding suppresses a controller when the public wake has no assignment id",
+       ctx do
+    terminal_seq = terminal!(ctx.db, "holder")
+    insert_entitlement!(ctx.db, "asg_1", generation: 11, due_at: 0, interval: 60_000)
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", terminal_seq)
+    assert [%{assignment_id: "asg_1"} = controller] = Wakes.list_pending(ctx.db)
+
+    {checkpoint, _source_turn} =
+      schedule_checkpoint_via_gateway!(ctx, "checkpoint before prod admission", 60_000)
+
+    assert checkpoint.assignment_id == nil
+
+    scheduler = start_wake_scheduler!(ctx, :checkpoint_before_prod)
+    assert :ok = Wakes.fire_due(scheduler)
+
+    assert Wakes.get(ctx.db, controller.wake_id).state in ["fired", "canceled"]
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [controller.wake_id])
+
+    assert {:ok, [["checkpoint", checkpoint_id, 13]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sourceKind,sourceId,generation FROM supervision_liveness_receipts WHERE assignmentId='asg_1'"
+             )
+
+    assert checkpoint_id == checkpoint.wake_id
+
+    assert %{supervisionGeneration: 13, supervisionBasisKind: "liveness_receipt"} =
+             Supervision.prod_state(ctx.db, "asg_1")
+  end
+
+  test "missing entitlement recovery preserves a coherent generation-12 controller lineage",
+       ctx do
+    terminal_seq = terminal!(ctx.db, "holder")
+    insert_entitlement!(ctx.db, "asg_1", generation: 11, due_at: 0, interval: 60_000)
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", terminal_seq)
+    assert [%{assignment_id: "asg_1"} = controller] = Wakes.list_pending(ctx.db)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO attests (id, assignmentId, kind, note, bySession, ts) VALUES ('att_after_recovery','asg_1','progress','work after recovery','holder',9000000000000)"
+      )
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE assignment_prods SET attemptCount=4,prodCount=2,deniedStreak=3,stalledAt=1234 WHERE assignmentId='asg_1'"
+      )
+
+    {:ok, _} = DB.query(ctx.db, "DELETE FROM supervision_entitlements WHERE assignmentId='asg_1'")
+
+    assert :ok = Supervision.recover_liveness!(ctx.db, 60_000)
+
+    assert {:ok,
+            [[12, "armed", "prod_scheduled", basis_id, "prod_scheduled", "process:tightbeam"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT generation,state,basisKind,basisId,cause,principal FROM supervision_entitlements WHERE assignmentId='asg_1'"
+             )
+
+    assert basis_id == controller.wake_id
+
+    scheduler = start_wake_scheduler!(ctx, :recovered_controller)
+    assert :ok = Wakes.fire_due(scheduler)
+
+    assert Wakes.get(ctx.db, controller.wake_id).state in ["fired", "canceled"]
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [controller.wake_id])
+
+    assert %{supervisionGeneration: 13, supervisionBasisKind: "liveness_receipt"} =
+             Supervision.prod_state(ctx.db, "asg_1")
+
+    assert {:ok, [[0, 0, 0, nil]]} =
+             DB.query(
+               ctx.db,
+               "SELECT attemptCount,prodCount,deniedStreak,stalledAt FROM assignment_prods WHERE assignmentId='asg_1'"
+             )
+  end
+
+  test "missing entitlement with incoherent controller lineage is refused without generation one",
+       ctx do
+    terminal_seq = terminal!(ctx.db, "holder")
+    insert_entitlement!(ctx.db, "asg_1", generation: 11, due_at: 0, interval: 60_000)
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", terminal_seq)
+
+    {:ok, _} = DB.query(ctx.db, "DELETE FROM supervision_entitlements WHERE assignmentId='asg_1'")
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE lifecycle_events SET detail='generation=11 basis=prod_scheduled:wrong cause=prod_scheduled principal=process:tightbeam' WHERE id=(SELECT MAX(id) FROM lifecycle_events WHERE subject='asg_1' AND kind='supervision_entitlement_rearmed')"
+      )
+
+    assert :ok = Supervision.recover_liveness!(ctx.db, 60_000)
+    assert :ok = Supervision.recover_liveness!(ctx.db, 60_000)
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "SELECT generation FROM supervision_entitlements WHERE assignmentId='asg_1'"
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM lifecycle_events WHERE subject='asg_1' AND kind='supervision_entitlement_recovery_refused' AND detail='reason=pending_controller_lineage_incoherent principal=process:tightbeam'"
+             )
+  end
+
+  test "missing entitlement with only typed checkpoint lineage is refused without generation one",
+       ctx do
+    attach_work_item!(ctx.db, "asg_1", "wi_checkpoint")
+    insert_entitlement!(ctx.db, "asg_1", generation: 12, due_at: 9_000_000_000_000)
+
+    {checkpoint, _source_turn} =
+      schedule_checkpoint_via_gateway!(ctx, "checkpoint survives missing entitlement", 60_000)
+
+    assert checkpoint.assignment_id == nil
+    {:ok, _} = DB.query(ctx.db, "DELETE FROM supervision_entitlements WHERE assignmentId='asg_1'")
+
+    assert :ok = Supervision.recover_liveness!(ctx.db, 60_000)
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "SELECT generation FROM supervision_entitlements WHERE assignmentId='asg_1'"
+             )
+
+    assert {:ok,
+            [
+              [
+                "reason=surviving_lineage_without_coherent_pending_controller principal=process:tightbeam"
+              ]
+            ]} =
+             DB.query(
+               ctx.db,
+               "SELECT detail FROM lifecycle_events WHERE subject='asg_1' AND kind='supervision_entitlement_recovery_refused'"
+             )
   end
 
   test "settled controller verdict reset then holder typed wait survives restart and suppresses due sweep",
@@ -4303,6 +4519,23 @@ defmodule Tightbeam.SupervisionTest do
     )
 
     :sys.get_state(name)
+    name
+  end
+
+  defp start_wake_scheduler!(ctx, prefix) do
+    suffix = System.unique_integer([:positive])
+    registry = :"#{prefix}_registry_#{suffix}"
+    lane = :"#{prefix}_lane_#{suffix}"
+    name = :"#{prefix}_scheduler_#{suffix}"
+
+    start_supervised!({ConnRegistry, name: registry})
+    start_supervised!({LaneDoorbell, lane})
+
+    start_supervised!(
+      {Wakes,
+       db: ctx.db, deliver: delivery_fun(ctx.db, registry, lane), tick_ms: 60_000, name: name}
+    )
+
     name
   end
 
