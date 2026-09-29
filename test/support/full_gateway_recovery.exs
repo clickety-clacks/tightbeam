@@ -1,4 +1,6 @@
 defmodule Tightbeam.RecoveryScenario do
+  import ExUnit.Assertions
+
   alias Tightbeam.{DB, Gateway, Model, Org, Placement, Wakes}
 
   def await!(predicate, deadline \\ nil) do
