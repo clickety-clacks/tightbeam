@@ -501,16 +501,36 @@ defmodule Tightbeam.FirehoseInventoryAcceptance do
     {model, ws} =
       Enum.reduce(1..map_size(notices), {%{}, ws}, fn _, {model, ws} ->
         {notice, ws} = Fixture.recv_change(ws)
-        fresh = assert_a4_fresh!(fixture, notice)
         model = apply_a4_notice(model, notice)
-        assert model[a4_key(notice)].payload == fresh
-        assert model[a4_key(notice)].applications == 1
         {model, ws}
       end)
 
+    expected_keys =
+      notices
+      |> Map.values()
+      |> Enum.map(&a4_key/1)
+      |> MapSet.new()
+
+    assert MapSet.new(Map.keys(model)) == expected_keys
+
+    Enum.each(notices, fn {_class, notice} ->
+      key = a4_key(notice)
+      assert model[key].payload == assert_a4_fresh!(fixture, notice)
+
+      expected_applications =
+        notices
+        |> Map.values()
+        |> Enum.filter(&(a4_key(&1) == key))
+        |> Enum.map(&(&1["payload"]["rowVersion"] || &1["occurredAt"]))
+        |> Enum.uniq()
+        |> length()
+
+      assert model[key].applications == expected_applications
+    end)
+
     {model, ws} = replay_a4_orders(fixture, ws, model, notices)
 
-    assert map_size(model) == map_size(notices)
+    assert MapSet.new(Map.keys(model)) == expected_keys
     ws
   end
 
