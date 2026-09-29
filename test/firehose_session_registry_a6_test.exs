@@ -163,6 +163,37 @@ defmodule Tightbeam.Firehose.SessionRegistryA6Test do
     refute_receive {:firehose_notice, _notice}, 50
   end
 
+  test "a hidden-only sink does not derive session capabilities", ctx do
+    hidden =
+      Org.create(ctx.db, %{
+        session_key: "a6-hidden",
+        display_name: "Hidden worker",
+        owner_user_id: "mallory",
+        origin: "user:mallory",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+
+    sync_hub()
+    hub_pid = GenServer.whereis(Hub)
+    :erlang.trace_pattern({StateResources, :set_harness_capability, 2}, true, [:local])
+    :erlang.trace(hub_pid, true, [:call, {:tracer, self()}])
+
+    try do
+      Org.rename(ctx.db, hidden.session_key, "Still hidden")
+      sync_hub()
+
+      refute_received {:trace, ^hub_pid, :call, {StateResources, :set_harness_capability, _args}}
+      refute_received {:firehose_notice, _notice}
+    after
+      :erlang.trace(hub_pid, false, [:call])
+      :erlang.trace_pattern({StateResources, :set_harness_capability, 2}, false, [:local])
+    end
+  end
+
   test "rolled back harness changes keep the canonical capability and publish no notice", ctx do
     before_row = Org.get(ctx.db, ctx.worker.session_key)
     before = canonical_session(ctx.db, ctx.worker.session_key)

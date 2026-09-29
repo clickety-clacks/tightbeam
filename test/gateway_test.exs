@@ -3037,13 +3037,9 @@ defmodule Tightbeam.GatewayTest do
 
   test "a harness swap leaves a tombstone ABOVE its own barrier", ctx do
     base_dir = role_test_base("swap-tombstone")
-    auth_dir = Tightbeam.Homes.home_path(base_dir, "testhost", :fixture)
-    adapter = Path.join([base_dir, "adapters", "node_modules", ".bin", "fixture-acp"])
+    auth_dir = Tightbeam.Homes.home_path(base_dir, "testhost", :codex)
     File.mkdir_p!(auth_dir)
-    File.write!(Path.join(auth_dir, "fixture.json"), "fixture-token")
-    File.mkdir_p!(Path.dirname(adapter))
-    File.write!(adapter, "#!/bin/sh\n")
-    File.chmod!(adapter, 0o755)
+    File.write!(Path.join(auth_dir, "auth.json"), "test-token")
     learn_engineering_identity!(base_dir)
     candidate = start_supervised!({CandidateAdapterStub, self()})
     start_supervised!({CoordinatorStub, candidate})
@@ -3069,6 +3065,8 @@ defmodule Tightbeam.GatewayTest do
 
     start_lane!(ctx.db, "swapme")
 
+    start_supervised!({Tightbeam.Firehose.Hub, name: Tightbeam.Firehose.Hub})
+
     # Real prior conversation, so the barrier has something to bury.
     for body <- ["REPLAY_SENTINEL_ONE", "REPLAY_SENTINEL_TWO"] do
       Projection.append(ctx.db, %{
@@ -3079,12 +3077,60 @@ defmodule Tightbeam.GatewayTest do
       })
     end
 
+    :ok =
+      Tightbeam.Firehose.Hub.register(Tightbeam.Firehose.Hub, self(), %{
+        mode: :subscribed,
+        db: ctx.db,
+        user_id: "flynn",
+        is_admin: false
+      })
+
+    :ok =
+      Tightbeam.Firehose.Hub.subscribe(Tightbeam.Firehose.Hub, self(), "swapme", %{
+        "classes" => ["session."],
+        "sessionKey" => "swapme"
+      })
+
     assert %{ok: true} =
              handlers["tune"].(%{
                origin: "user:flynn",
                session_key: "swapme",
-               params: %{setting: "set_harness", harness: "fixture", model: "fixture-model"}
+               params: %{setting: "set_harness", harness: "codex", model: "gpt-5.6-sol"}
              })
+
+    assert_receive {:firehose_notice,
+                    %{
+                      "class" => "session.harness_changed",
+                      "payload" => harness_changed
+                    }}
+
+    assert harness_changed["clearedThroughSeq"] == Org.get(ctx.db, "swapme").cleared_through_seq
+
+    :ok = Tightbeam.Firehose.Hub.delivered(Tightbeam.Firehose.Hub, self())
+    :sys.get_state(Tightbeam.Firehose.Hub)
+    refute_receive {:firehose_notice, %{"class" => "session.updated"}}, 0
+
+    rest_opts =
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.merge(%{
+        handlers: handlers,
+        cli_token: "tbc_gateway_test",
+        firehose_hub: Tightbeam.Firehose.Hub,
+        model_catalog: Tightbeam.ModelCatalog.get(),
+        session_status: fn _ -> nil end
+      })
+      |> Map.to_list()
+
+    rest =
+      Plug.Test.conn(:get, "/api/sessions/swapme")
+      |> Plug.Conn.put_req_header(
+        "authorization",
+        "Bearer #{Org.get(ctx.db, "swapme").cli_token}"
+      )
+      |> Tightbeam.Wire.Router.call(Tightbeam.Wire.Router.init(rest_opts))
+
+    assert rest.status == 200, rest.resp_body
+    assert JSON.decode!(rest.resp_body)["item"] == harness_changed
 
     assert_receive {:candidate_guidance, "candidate-1", guidance}
     assert guidance =~ "tightbeam transcript --session \"swapme\" --limit 50"
@@ -3095,7 +3141,7 @@ defmodule Tightbeam.GatewayTest do
 
     cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), Org.get(ctx.db, "swapme"))
 
-    assert File.read!(Path.join(cwd, ".fixture/skills/tightbeam__model-release-intake/SKILL.md"))
+    assert File.read!(Path.join(cwd, ".codex/skills/tightbeam__model-release-intake/SKILL.md"))
 
     refute guidance =~ "[engine swap]"
 
@@ -3114,13 +3160,13 @@ defmodule Tightbeam.GatewayTest do
     assert tombstone.marker == %{
              kind: "harness-switch",
              from: "claude (before-model)",
-             to: "fixture (fixture-model)"
+             to: "codex (gpt-5.6-sol)"
            }
 
     # It names the change, both ends of it, and that nothing was deleted.
     assert tombstone.content =~ "[engine swap]"
     assert tombstone.content =~ "claude (before-model)"
-    assert tombstone.content =~ "fixture (fixture-model)"
+    assert tombstone.content =~ "codex (gpt-5.6-sol)"
     assert tombstone.content =~ "RETAINED"
     assert tombstone.content =~ "not deleted"
     assert tombstone.content =~ "expected"

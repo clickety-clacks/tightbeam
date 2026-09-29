@@ -2932,6 +2932,7 @@ defmodule Tightbeam.Gateway do
         :created_at
       ])
       |> Map.merge(published_identity(session.model))
+      |> Map.put(:capabilities, StateResources.session(session)["capabilities"])
 
     Map.put(item, :po_association, SessionPoAssociations.get(db, session.session_key))
   end
@@ -7530,14 +7531,13 @@ defmodule Tightbeam.Gateway do
                    txn,
                    session.session_key,
                    {record_model, record_harness},
-                   {model, harness, provider}
+                   {model, harness, provider},
+                   cleared_through: handoff_through_seq
                  ) do
               {:ok, _} -> :ok
               {:duplicate, _} -> raise "harness changed before staged swap commit"
               :stale -> raise "harness mutation race inside serialized tune"
             end
-
-            Org.set_cleared_through_in_txn(txn, call.session_key, handoff_through_seq)
 
             case Map.get(call, :on_swap_interlock) do
               fun when is_function(fun, 1) -> fun.(txn)

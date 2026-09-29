@@ -11,6 +11,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     DB,
     Devices,
     Escalation,
+    Gateway,
     Identity,
     Ledger,
     Model,
@@ -412,6 +413,36 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     admin_items = JSON.decode!(admin_collection.resp_body)["items"]
     assert Enum.any?(admin_items, &(&1["sessionKey"] == ctx.admin_session.session_key))
     assert Enum.any?(admin_items, &(&1["sessionKey"] == outsider_session.session_key))
+  end
+
+  test "CLI inspect capabilities match the REST session detail", ctx do
+    handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.opts[:base_dir]})
+    opts = Keyword.put(ctx.opts, :handlers, handlers)
+
+    request = JSON.encode!(%{"verb" => "inspect", "asUser" => "flynn", "params" => %{}})
+
+    cli =
+      conn(:post, "/agent/dispatch", request)
+      |> put_req_header("authorization", "Bearer #{ctx.opts[:cli_token]}")
+      |> put_req_header("x-tightbeam-cli-version", Tightbeam.CliCompatibility.required_version())
+      |> Router.call(Router.init(opts))
+
+    assert cli.status == 200, cli.resp_body
+    cli_result = JSON.decode!(cli.resp_body)["result"]
+
+    cli_session =
+      Enum.find(cli_result["sessions"], &(&1["sessionKey"] == ctx.admin_session.session_key))
+
+    refute is_nil(cli_session)
+
+    detail =
+      get(ctx, "/api/sessions/#{ctx.admin_session.session_key}", ctx.admin_session.cli_token)
+
+    assert detail.status == 200, detail.resp_body
+    rest_session = JSON.decode!(detail.resp_body)["item"]
+
+    assert cli_session["capabilities"]["setHarness"] ==
+             rest_session["capabilities"]["setHarness"]
   end
 
   test "artifact archive and release notices equal the current ordered REST detail", ctx do

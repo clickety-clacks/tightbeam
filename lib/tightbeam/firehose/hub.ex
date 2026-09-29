@@ -24,6 +24,8 @@ defmodule Tightbeam.Firehose.Hub do
 
   defstruct sockets: %{}, queue_limit: 1_000, shutting_down: false, shutdown_waiter: nil
 
+  @session_event_classes ~w(session.spawned session.updated session.harness_changed session.retired)
+
   def start_link(opts \\ []),
     do: GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
 
@@ -113,6 +115,15 @@ defmodule Tightbeam.Firehose.Hub do
   def handle_cast({:delivered, pid}, state),
     do: {:noreply, update(state, pid, &dispatch_next(%{&1 | in_flight: false}, pid))}
 
+  def handle_cast({:committed, class, payload, refs}, state)
+      when class in @session_event_classes do
+    if session_change_visible_to_sink?(state, class, payload, refs) do
+      {:noreply, fanout(state, Publisher.committed_notice(class, payload, refs))}
+    else
+      {:noreply, state}
+    end
+  end
+
   def handle_cast({:committed, class, payload, refs}, state),
     do: {:noreply, fanout(state, Publisher.committed_notice(class, payload, refs))}
 
@@ -139,6 +150,35 @@ defmodule Tightbeam.Firehose.Hub do
 
     %{state | sockets: sockets}
   end
+
+  defp session_change_visible_to_sink?(state, class, payload, refs)
+       when is_map(payload) and is_map(refs) do
+    session_key =
+      Map.get(refs, "sessionKey") || Map.get(refs, :session_key) ||
+        Map.get(refs, "session_key") || Map.get(payload, "sessionKey") ||
+        Map.get(payload, :session_key) || Map.get(payload, "session_key")
+
+    if is_binary(session_key) and session_key != "" do
+      owner_user_id =
+        Map.get(refs, "ownerUserId") || Map.get(refs, :owner_user_id) ||
+          Map.get(payload, "ownerUserId") || Map.get(payload, :owner_user_id)
+
+      probe = %{
+        "class" => class,
+        "refs" => %{"sessionKey" => session_key, "ownerUserId" => owner_user_id},
+        "payload" => %{"sessionKey" => session_key, "ownerUserId" => owner_user_id}
+      }
+
+      Enum.any?(state.sockets, fn {_pid, socket} ->
+        not is_nil(socket.db) and socket.mode != :pending and not socket.overflowed and
+          visible?(socket, probe)
+      end)
+    else
+      true
+    end
+  end
+
+  defp session_change_visible_to_sink?(_state, _class, _payload, _refs), do: true
 
   defp deliver_notice(%{mode: :pending} = socket, _, _, _), do: socket
   defp deliver_notice(%{overflowed: true} = socket, _, _, _), do: socket
