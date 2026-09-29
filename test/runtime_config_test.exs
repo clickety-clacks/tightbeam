@@ -3,6 +3,8 @@ defmodule Tightbeam.RuntimeConfigTest do
 
   @runtime_env %{
     "TIGHTBEAM_BASE_DIR" => "/tmp/tightbeam-runtime-poison",
+    "TIGHTBEAM_LIVE_BASE_TRANSITION" =>
+      ~s({"base":"/tmp/tightbeam-runtime-poison","expectedSchema":"legacy018","source":"unmarked","target":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}),
     "TIGHTBEAM_PORT" => "4321",
     "TIGHTBEAM_CWD" => "/tmp/tightbeam-runtime-cwd",
     "TIGHTBEAM_DEFAULT_HARNESS" => "claude",
@@ -44,6 +46,10 @@ defmodule Tightbeam.RuntimeConfigTest do
     expected = [
       tightbeam: [
         base_dir: "/tmp/tightbeam-runtime-poison",
+        live_base_guard: [
+          transition:
+            ~s({"base":"/tmp/tightbeam-runtime-poison","expectedSchema":"legacy018","source":"unmarked","target":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"})
+        ],
         port: 4321,
         cwd: "/tmp/tightbeam-runtime-cwd",
         default_harness: :claude,
