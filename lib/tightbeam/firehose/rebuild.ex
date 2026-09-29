@@ -79,7 +79,7 @@ defmodule Tightbeam.Firehose.Rebuild do
   defp query(db, "message.created", refs, _user_id),
     do: StateResources.query_message(db, fetch!(refs, "messageId"))
 
-  defp query(db, "session.updated", refs, _user_id),
+  defp query(db, class, refs, _user_id) when class in ~w(session.updated session.harness_changed),
     do: StateResources.query_session(db, fetch!(refs, "sessionKey"))
 
   defp query(db, "identity.updated", refs, _user_id) do

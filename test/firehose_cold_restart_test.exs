@@ -26,7 +26,7 @@ defmodule Tightbeam.FirehoseColdRestartTest do
       ws = subscribe!(old["port"], device.token)
 
       {:ok, preauth} =
-        WS.connect("127.0.0.1", old["port"], "/ws/changes?protocolVersion=1")
+        WS.connect("127.0.0.1", old["port"], "/ws/changes?protocolVersion=2")
 
       try do
         before = create!(plan, old["port"], device, "Before process restart")
@@ -678,7 +678,7 @@ defmodule Tightbeam.FirehoseColdRestartTest do
   end
 
   defp subscribe!(port, token, classes \\ ["work_item.created"]) do
-    {:ok, ws} = WS.connect("127.0.0.1", port, "/ws/changes?protocolVersion=1")
+    {:ok, ws} = WS.connect("127.0.0.1", port, "/ws/changes?protocolVersion=2")
     :ok = WS.send_text(ws, JSON.encode!(%{"type" => "auth", "token" => token}))
     {:ok, {:text, raw}, ws} = WS.recv(ws, 2_000)
     assert %{"type" => "auth_result", "success" => true} = JSON.decode!(raw)
@@ -688,7 +688,7 @@ defmodule Tightbeam.FirehoseColdRestartTest do
         ws,
         JSON.encode!(%{
           "type" => "subscribe",
-          "protocolVersion" => 1,
+          "protocolVersion" => 2,
           "subscriptionId" => "restart",
           "filters" => %{"classes" => classes}
         })

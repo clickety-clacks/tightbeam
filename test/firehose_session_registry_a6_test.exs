@@ -70,6 +70,17 @@ defmodule Tightbeam.Firehose.SessionRegistryA6Test do
     assert payload == canonical_session(ctx.db, ctx.worker.session_key)
     assert payload == StateResources.session(renamed)
     assert payload["rowVersion"] > before["rowVersion"]
+    capability = payload["capabilities"]["setHarness"]
+
+    assert capability == %{
+             "supported" => true,
+             "options" =>
+               Enum.map(Tightbeam.Harness.all(), fn module ->
+                 name = module.wire_name()
+                 %{"title" => name, "value" => name, "enabled" => name != payload["harness"]}
+               end)
+           }
+
     refute Map.has_key?(payload, "cliToken")
     refute inspect(payload) =~ "tbs_"
 
@@ -92,6 +103,129 @@ defmodule Tightbeam.Firehose.SessionRegistryA6Test do
 
     assert model == newer["payload"]
     assert model == canonical_session(ctx.db, ctx.worker.session_key)
+  end
+
+  test "harness changes publish one committed capability item and duplicates publish none", ctx do
+    before = canonical_session(ctx.db, ctx.worker.session_key)
+
+    switched =
+      Org.set_harness(
+        ctx.db,
+        ctx.worker.session_key,
+        "codex",
+        "openai",
+        Tightbeam.Model.new("gpt-5.6-sol")
+      )
+
+    notice = receive_notice()
+    payload = notice["payload"]
+
+    assert notice["class"] == "session.harness_changed"
+    assert notice["type"] == "change"
+    assert notice["schemaVersion"] == 2
+    assert notice["subscriptionId"] == "session"
+    assert notice["resource"] == "sessions"
+    assert notice["op"] == "upsert"
+    assert notice["refs"] == %{"sessionKey" => ctx.worker.session_key}
+    assert payload == canonical_session(ctx.db, ctx.worker.session_key)
+    assert payload == StateResources.session(switched)
+    assert payload["rowVersion"] > before["rowVersion"]
+    assert payload["harness"] == "codex"
+
+    assert payload["capabilities"]["setHarness"]["options"] ==
+             Enum.map(Tightbeam.Harness.all(), fn module ->
+               name = module.wire_name()
+               %{"title" => name, "value" => name, "enabled" => name != "codex"}
+             end)
+
+    assert {:ok, rebuilt} =
+             Tightbeam.Firehose.Rebuild.fetch(
+               ctx.db,
+               "session.harness_changed",
+               %{"sessionKey" => ctx.worker.session_key},
+               "flynn",
+               false
+             )
+
+    assert rebuilt == payload
+
+    duplicate =
+      Org.set_harness(
+        ctx.db,
+        ctx.worker.session_key,
+        "codex",
+        "openai",
+        Tightbeam.Model.new("gpt-5.6-sol")
+      )
+
+    assert duplicate.updated_at == switched.updated_at
+    sync_hub()
+    refute_receive {:firehose_notice, _notice}, 50
+  end
+
+  test "a hidden-only sink does not derive session capabilities", ctx do
+    hidden =
+      Org.create(ctx.db, %{
+        session_key: "a6-hidden",
+        display_name: "Hidden worker",
+        owner_user_id: "mallory",
+        origin: "user:mallory",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+
+    sync_hub()
+    hub_pid = GenServer.whereis(Hub)
+    :erlang.trace_pattern({StateResources, :set_harness_capability, 2}, true, [:local])
+    :erlang.trace(hub_pid, true, [:call, {:tracer, self()}])
+
+    try do
+      Org.rename(ctx.db, hidden.session_key, "Still hidden")
+      sync_hub()
+
+      refute_received {:trace, ^hub_pid, :call, {StateResources, :set_harness_capability, _args}}
+      refute_received {:firehose_notice, _notice}
+    after
+      :erlang.trace(hub_pid, false, [:call])
+      :erlang.trace_pattern({StateResources, :set_harness_capability, 2}, false, [:local])
+    end
+  end
+
+  test "rolled back harness changes keep the canonical capability and publish no notice", ctx do
+    before_row = Org.get(ctx.db, ctx.worker.session_key)
+    before = canonical_session(ctx.db, ctx.worker.session_key)
+
+    assert {:error, %RuntimeError{message: "rollback setHarness"}} =
+             DB.transaction(ctx.db, fn txn ->
+               assert {:ok, _updated} =
+                        Org.swap_model_in_txn(
+                          txn,
+                          ctx.worker.session_key,
+                          {before_row.model, before_row.harness},
+                          {Model.new("gpt-5.6-sol"), "codex", "openai"}
+                        )
+
+               raise "rollback setHarness"
+             end)
+
+    assert Org.get(ctx.db, ctx.worker.session_key) == before_row
+    assert canonical_session(ctx.db, ctx.worker.session_key) == before
+    sync_hub()
+    refute_receive {:firehose_notice, _notice}, 50
+
+    assert {:ok, rebuilt} =
+             Tightbeam.Firehose.Rebuild.fetch(
+               ctx.db,
+               "session.harness_changed",
+               %{"sessionKey" => ctx.worker.session_key},
+               "flynn",
+               false
+             )
+
+    assert rebuilt == before
   end
 
   test "PO association leaves canonical session notices and row versions unchanged", ctx do
@@ -176,7 +310,30 @@ defmodule Tightbeam.Firehose.SessionRegistryA6Test do
 
   test "hub restart replays nothing and a fresh rebuild converges before later updates", ctx do
     _ = Org.rename(ctx.db, ctx.worker.session_key, "Before restart")
-    before_restart = receive_notice()["payload"]
+    rename_notice = receive_notice()
+    assert rename_notice["class"] == "session.updated"
+    renamed = rename_notice["payload"]
+    assert renamed == StateResources.session(Org.get(ctx.db, ctx.worker.session_key))
+
+    switched =
+      Org.set_harness(
+        ctx.db,
+        ctx.worker.session_key,
+        "codex",
+        "openai",
+        Model.new("gpt-5.6-sol")
+      )
+
+    harness_notice = receive_notice()
+    assert harness_notice["class"] == "session.harness_changed"
+    before_restart = harness_notice["payload"]
+    assert before_restart == StateResources.session(switched)
+
+    assert before_restart["capabilities"]["setHarness"]["options"] ==
+             Enum.map(Tightbeam.Harness.all(), fn module ->
+               name = module.wire_name()
+               %{"title" => name, "value" => name, "enabled" => name != switched.harness}
+             end)
 
     assert :ok = stop_supervised(Hub)
     start_supervised!({Hub, name: Hub})
@@ -266,7 +423,7 @@ defmodule Tightbeam.Firehose.SessionRegistryA6Test do
              end)
 
     notice = receive_notice()
-    assert notice["class"] == "session.updated"
+    assert notice["class"] == "session.harness_changed"
     assert notice["payload"] == StateResources.session(updated)
     assert notice["payload"] == canonical_session(ctx.db, ctx.worker.session_key)
     assert notice["payload"]["harness"] == "codex"

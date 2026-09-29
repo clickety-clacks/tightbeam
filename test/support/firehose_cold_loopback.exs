@@ -88,7 +88,7 @@ try do
   {:ok, device} =
     SimClient.pair("127.0.0.1", port, device_id: "cold-firehose", claimed_name: "Synthetic")
 
-  {:ok, ws} = WS.connect("127.0.0.1", port, "/ws/changes?protocolVersion=1")
+  {:ok, ws} = WS.connect("127.0.0.1", port, "/ws/changes?protocolVersion=2")
 
   try do
     :ok = WS.send_text(ws, JSON.encode!(%{"type" => "auth", "token" => device.token}))
@@ -100,7 +100,7 @@ try do
         ws,
         JSON.encode!(%{
           "type" => "subscribe",
-          "protocolVersion" => 1,
+          "protocolVersion" => 2,
           "subscriptionId" => "cold",
           "filters" => %{"classes" => ["work_item.created"]}
         })

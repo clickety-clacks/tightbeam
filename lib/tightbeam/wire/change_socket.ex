@@ -183,8 +183,9 @@ defmodule Tightbeam.Wire.ChangeSocket do
     id = message["subscriptionId"]
 
     cond do
-      Map.has_key?(message, "protocolVersion") and message["protocolVersion"] != 1 ->
-        invalid("protocolVersion must be 1", state)
+      Map.has_key?(message, "protocolVersion") and
+          message["protocolVersion"] != 2 ->
+        invalid("protocolVersion must be 2", state)
 
       not (is_binary(id) and id != "") ->
         invalid("subscriptionId is required", state)

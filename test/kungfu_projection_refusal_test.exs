@@ -380,7 +380,7 @@ defmodule Tightbeam.KungfuProjectionRefusalTest do
       )
 
     {:ok, {_address, port}} = ThousandIsland.listener_info(gateway)
-    assert {:ok, ws} = WS.connect("127.0.0.1", port, "/ws/changes?protocolVersion=1")
+    assert {:ok, ws} = WS.connect("127.0.0.1", port, "/ws/changes?protocolVersion=2")
 
     try do
       :ok = WS.send_text(ws, JSON.encode!(%{"type" => "auth", "token" => device.token}))

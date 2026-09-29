@@ -1445,7 +1445,7 @@ defmodule Tightbeam.Gateway do
       end,
       {"critical", ["critical_lease.updated"]} => fn call -> critical_result(config, db, call) end,
       {"spawn", ["session.spawned"]} => fn call -> spawn_result(config, db, call) end,
-      {"tune", ["message.created", "session.updated"]} => fn call ->
+      {"tune", ["message.created", "session.updated", "session.harness_changed"]} => fn call ->
         tune_result(config, db, call)
       end,
       {"session-reparent", []} => fn call -> Tightbeam.SessionReparent.handle(db, call) end,
@@ -2547,6 +2547,7 @@ defmodule Tightbeam.Gateway do
         nil
 
       session ->
+        canonical_session = StateResources.session(session)
         _ = ensure_status_residency(config, db, session)
 
         {:ok, [[depth]]} =
@@ -2655,14 +2656,7 @@ defmodule Tightbeam.Gateway do
             setReasoning: reasoning_capability,
             setFastMode: fast_capability,
             setMode: unsupported.("sessions run YOLO"),
-            setHarness: %{
-              supported: true,
-              options:
-                Enum.map(Harness.all(), fn module ->
-                  harness = module.wire_name()
-                  %{title: harness, value: harness, enabled: true}
-                end)
-            },
+            setHarness: canonical_session["capabilities"]["setHarness"],
             setVerbosity: unsupported.("not supported"),
             canCancelCurrentRun: true,
             canChangeModel: true,
@@ -2938,6 +2932,7 @@ defmodule Tightbeam.Gateway do
         :created_at
       ])
       |> Map.merge(published_identity(session.model))
+      |> Map.put(:capabilities, StateResources.session(session)["capabilities"])
 
     Map.put(item, :po_association, SessionPoAssociations.get(db, session.session_key))
   end
@@ -7536,14 +7531,13 @@ defmodule Tightbeam.Gateway do
                    txn,
                    session.session_key,
                    {record_model, record_harness},
-                   {model, harness, provider}
+                   {model, harness, provider},
+                   cleared_through: handoff_through_seq
                  ) do
               {:ok, _} -> :ok
               {:duplicate, _} -> raise "harness changed before staged swap commit"
               :stale -> raise "harness mutation race inside serialized tune"
             end
-
-            Org.set_cleared_through_in_txn(txn, call.session_key, handoff_through_seq)
 
             case Map.get(call, :on_swap_interlock) do
               fun when is_function(fun, 1) -> fun.(txn)

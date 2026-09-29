@@ -38,21 +38,26 @@ defmodule Tightbeam.Wire.RouterTest do
   end
 
   test "changes route refuses missing upgrade or unsupported protocol before authentication" do
+    hub = :"router_refused_changes_hub_#{System.unique_integer([:positive])}"
+    start_supervised!({Tightbeam.Firehose.Hub, name: hub})
+    hub_before = :sys.get_state(hub)
+
     for {path, upgrade} <- [
           {"/ws/changes", false},
           {"/ws/changes?protocolVersion=1", false},
-          {"/ws/changes?protocolVersion=2", true},
+          {"/ws/changes?protocolVersion=1", true},
+          {"/ws/changes?protocolVersion=2", false},
+          {"/ws/changes?protocolVersion=3", true},
           {"/ws/changes?protocolVersion=0", true}
         ] do
       request = conn(:get, path)
       request = if upgrade, do: put_req_header(request, "upgrade", "websocket"), else: request
-      response = Router.call(request, Router.init([]))
+      response = Router.call(request, Router.init(firehose_hub: hub))
       assert response.status == 426
-
-      assert JSON.decode!(response.resp_body) == %{
-               "error" => %{"code" => "unsupported_protocol_version"}
-             }
+      assert response.resp_body == ""
     end
+
+    assert :sys.get_state(hub) == hub_before
   end
 
   setup do
@@ -221,6 +226,39 @@ defmodule Tightbeam.Wire.RouterTest do
 
     assert messages.status == 200
     assert JSON.decode!(messages.resp_body)["resource"] == "transcript messages"
+  end
+
+  test "canonical session collection uses visible rows and the shared item serializer", ctx do
+    {:pending, _device} =
+      Devices.pair(ctx.db, %{
+        device_id: "collection-reader-device",
+        claimed_name: "Collection reader",
+        platform: nil,
+        model: nil
+      })
+
+    reader = Devices.approve(ctx.db, "collection-reader-device", "collection-reader")
+    visible = create_session(ctx.db, "collection-visible", "collection-reader")
+    _hidden = create_session(ctx.db, "collection-hidden", ctx.device.user_id)
+
+    catalog = %{
+      {"testhost", "claude"} => [
+        %{family: "fable", context: nil, efforts: ["medium"], provider: :anthropic}
+      ]
+    }
+
+    response =
+      conn(:get, "/api/sessions")
+      |> put_req_header("authorization", "Bearer " <> reader.token)
+      |> Router.call(Router.init(ctx.opts ++ [model_catalog: catalog]))
+
+    assert response.status == 200
+
+    body = JSON.decode!(response.resp_body)
+    assert body["schemaVersion"] == 1
+    assert body["resource"] == "sessions"
+    assert Enum.map(body["items"], & &1["sessionKey"]) == [visible.session_key]
+    assert body["items"] == [Tightbeam.StateResources.session(visible)]
   end
 
   test "core device detail preserves authorization order and canonical envelope", ctx do

@@ -135,10 +135,10 @@ defmodule Tightbeam.Wire.Router do
     conn = Plug.Conn.fetch_query_params(conn)
 
     if Plug.Conn.get_req_header(conn, "upgrade") == ["websocket"] and
-         conn.query_params["protocolVersion"] == "1" do
+         conn.query_params["protocolVersion"] == "2" do
       WebSockAdapter.upgrade(conn, ChangeSocket, deps(conn), max_frame_size: 2 * 1024 * 1024)
     else
-      error(conn, 426, "unsupported_protocol_version")
+      Plug.Conn.send_resp(conn, 426, "")
     end
   end
 
@@ -373,6 +373,10 @@ defmodule Tightbeam.Wire.Router do
       Map.fetch!(@core_detail_specs, :decision_requests),
       decision_request_id
     )
+  end
+
+  get "/api/sessions" do
+    session_index(conn)
   end
 
   get "/api/sessions/:session_key" do
@@ -678,6 +682,64 @@ defmodule Tightbeam.Wire.Router do
   rescue
     _error in [ArgumentError, KeyError, MatchError] ->
       state_error(conn, spec.resource, 500, "projection_invalid", nil)
+  end
+
+  defp session_index(conn) do
+    with {:ok, auth} <-
+           core_detail_operation(conn, "sessions", :bearer_auth, fn ->
+             state_bearer_auth(conn)
+           end),
+         {:ok, query} <-
+           core_detail_operation(conn, "sessions", :query_decode, fn ->
+             decode_state_query(conn)
+           end),
+         {:ok, principal} <-
+           core_detail_operation(conn, "sessions", :principal_resolution, fn ->
+             state_principal(auth, query, conn)
+           end),
+         :ok <-
+           core_detail_operation(conn, "sessions", :request_validation, fn ->
+             session_index_request(query)
+           end),
+         :ok <- core_detail_probe(conn, "sessions", :lookup),
+         rows <-
+           core_detail_operation(conn, "sessions", :row_lookup, fn ->
+             StateResources.query_sessions(
+               db(conn),
+               core_detail_trace_principal(conn, principal)
+             )
+           end),
+         {:ok, page_rows, page} <- state_session_page(rows, query),
+         :ok <- core_detail_probe(conn, "sessions", :schema),
+         :ok <- core_detail_probe(conn, "sessions", :serializer),
+         item_bytes <- session_index_item_bytes(page_rows, state_catalog(conn)),
+         :ok <- core_detail_probe(conn, "sessions", :encoder),
+         :ok <- core_detail_probe(conn, "sessions", :envelope) do
+      core_detail_trace(conn, {:envelope, "sessions"})
+
+      body =
+        "{" <>
+          ~s("schemaVersion":1,"resource":"sessions","items":[#{item_bytes}],"page":#{JSON.encode!(page)}})
+
+      state_send(conn, 200, body)
+    else
+      {:error, status, code, message} -> state_error(conn, "sessions", status, code, message)
+    end
+  rescue
+    _error in [ArgumentError, KeyError, MatchError] ->
+      state_error(conn, "sessions", 500, "projection_invalid", nil)
+  end
+
+  defp session_index_item_bytes(rows, catalog) do
+    Enum.map_join(rows, ",", fn row ->
+      StateResources.encode_item("sessions", StateResources.session(row), catalog)
+    end)
+  end
+
+  defp session_index_request(query) do
+    if Enum.all?(Map.keys(query), &(&1 in ["asUser", "limit", "after"])),
+      do: :ok,
+      else: {:error, 400, "invalid_filter", nil}
   end
 
   defp session_collection(conn, session_key, resource, query_fun, serializer) do

@@ -32,6 +32,9 @@ defmodule Tightbeam.FirehoseAcceptanceFixture do
           {"testhost", "fixture"} => [
             %{family: "fixture-model", context: nil, efforts: [], provider: :fixture_provider}
           ],
+          {"testhost", "codex"} => [
+            %{family: "gpt-5.6-sol", context: nil, efforts: [], provider: :openai}
+          ],
           {"testhost", "claude"} => [
             %{family: "fable", context: nil, efforts: ["medium"], provider: :anthropic}
           ]
@@ -61,7 +64,8 @@ defmodule Tightbeam.FirehoseAcceptanceFixture do
   end
 
   def connect(fixture, opts \\ []) do
-    {:ok, ws} = WS.connect("127.0.0.1", fixture.port, "/ws/changes?protocolVersion=1")
+    {:ok, ws} = WS.connect("127.0.0.1", fixture.port, "/ws/changes?protocolVersion=2")
+
     :ok = WS.send_text(ws, JSON.encode!(%{"type" => "auth", "token" => fixture.device.token}))
     {:ok, {:text, auth}, ws} = WS.recv(ws, 2_000)
     assert %{"type" => "auth_result", "success" => true} = JSON.decode!(auth)
@@ -71,7 +75,7 @@ defmodule Tightbeam.FirehoseAcceptanceFixture do
         ws,
         JSON.encode!(%{
           "type" => "subscribe",
-          "protocolVersion" => 1,
+          "protocolVersion" => 2,
           "subscriptionId" => Keyword.get(opts, :subscription_id, "inventory"),
           "filters" => Keyword.get(opts, :filters, %{"classes" => ["work_item."]})
         })
@@ -79,20 +83,42 @@ defmodule Tightbeam.FirehoseAcceptanceFixture do
 
     {:ok, {:text, ready}, ws} = WS.recv(ws, 2_000)
     assert %{"type" => "subscription_ready"} = JSON.decode!(ready)
-    ws
+
+    {ws, sessions!(fixture)}
   end
 
   def recv_change(ws) do
     case WS.recv_event(ws, 2_000) do
       {:ok, {:text, bytes}, ws} ->
         case JSON.decode!(bytes) do
-          %{"type" => "change"} = notice -> {notice, ws}
-          _ -> recv_change(ws)
+          %{"type" => "change", "schemaVersion" => 2} = notice ->
+            {notice, ws}
+
+          %{"type" => "change"} = notice ->
+            flunk("unexpected Firehose schema: #{inspect(notice)}")
+
+          _ ->
+            recv_change(ws)
         end
 
       other ->
         flunk("inventory socket closed before notice: #{inspect(other)}")
     end
+  end
+
+  def sessions!(fixture) do
+    headers = [{~c"authorization", String.to_charlist("Bearer " <> fixture.device.token)}]
+
+    {:ok, {{_, 200, _}, _, raw}} =
+      :httpc.request(
+        :get,
+        {~c"http://127.0.0.1:#{fixture.port}/api/sessions", headers},
+        [timeout: 2_000],
+        body_format: :binary
+      )
+
+    %{"schemaVersion" => 1, "items" => sessions} = JSON.decode!(raw)
+    sessions
   end
 
   def create_item(fixture, title) do

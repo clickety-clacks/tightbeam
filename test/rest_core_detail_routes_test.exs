@@ -11,6 +11,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     DB,
     Devices,
     Escalation,
+    Gateway,
     Identity,
     Ledger,
     Model,
@@ -39,7 +40,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     "decision requests" =>
       ~w(id kind raiserId raiserSessionKey ownerUserId assignmentId expecterSessionKey expecterUserId lineageRung effortGeneration deadlineWakeId raisedAt deadlineAt statuteName question options context status decision rationale ruledBy ruledAt consumedAt withdrawnBy withdrawnReason withdrawnAt askedOfRole answer answeredBy answeredAt rowVersion),
     "sessions" =>
-      ~w(sessionKey displayName kind orderIndex isBuiltIn adopted ownerUserId origin spawnedBy topologyParent handle archetype overrides identityName identityRevision harness provider model thinkingLevel modelContext host clearedThroughSeq state createdAt updatedAt mechanicalStatus rowVersion),
+      ~w(sessionKey displayName kind orderIndex isBuiltIn adopted ownerUserId origin spawnedBy topologyParent handle archetype overrides identityName identityRevision harness provider model thinkingLevel modelContext host clearedThroughSeq state createdAt updatedAt mechanicalStatus capabilities rowVersion),
     "devices" => ~w(deviceId userId claimedName status platform model createdAt rowVersion),
     "artifacts" =>
       ~w(artifactId kind title description createdBySession workItemId parentSession originPath contentSha256 recordedMessageId recordedTurnEvidence state home createdAt updatedAt rowVersion),
@@ -374,6 +375,74 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       assert response.resp_body ==
                ~s({"schemaVersion":1,"resource":#{JSON.encode!(resource)},"item":#{item_bytes}})
     end
+  end
+
+  test "session collection returns ordered canonical items limited to visible sessions", ctx do
+    outsider_device = outsider_device(ctx)
+    outsider_session = ensure_main_session(ctx.db, "outsider")
+    item = StateResources.session(outsider_session)
+    item_bytes = StateResources.encode_item("sessions", item, ctx.catalog)
+
+    page = %{
+      "oldestCursor" => nil,
+      "newestCursor" => "1",
+      "hasMoreBefore" => false,
+      "hasMoreAfter" => false
+    }
+
+    expected =
+      ~s({"schemaVersion":1,"resource":"sessions","items":[#{item_bytes}],"page":) <>
+        JSON.encode!(page) <> "}"
+
+    collection = get(ctx, "/api/sessions", outsider_device.token)
+    assert collection.status == 200
+    assert_application_headers(collection)
+    assert collection.resp_body == expected
+    assert JSON.decode!(collection.resp_body)["items"] == [item]
+    refute collection.resp_body =~ ctx.admin_session.session_key
+
+    detail = get(ctx, "/api/sessions/#{outsider_session.session_key}", outsider_device.token)
+    assert detail.status == 200
+    assert JSON.decode!(detail.resp_body)["item"] == item
+
+    session_collection = get(ctx, "/api/sessions", outsider_session.cli_token)
+    assert session_collection.resp_body == expected
+
+    admin_collection = get(ctx, "/api/sessions", ctx.admin_device.token)
+    assert admin_collection.status == 200
+    admin_items = JSON.decode!(admin_collection.resp_body)["items"]
+    assert Enum.any?(admin_items, &(&1["sessionKey"] == ctx.admin_session.session_key))
+    assert Enum.any?(admin_items, &(&1["sessionKey"] == outsider_session.session_key))
+  end
+
+  test "CLI inspect capabilities match the REST session detail", ctx do
+    handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.opts[:base_dir]})
+    opts = Keyword.put(ctx.opts, :handlers, handlers)
+
+    request = JSON.encode!(%{"verb" => "inspect", "asUser" => "flynn", "params" => %{}})
+
+    cli =
+      conn(:post, "/agent/dispatch", request)
+      |> put_req_header("authorization", "Bearer #{ctx.opts[:cli_token]}")
+      |> put_req_header("x-tightbeam-cli-version", Tightbeam.CliCompatibility.required_version())
+      |> Router.call(Router.init(opts))
+
+    assert cli.status == 200, cli.resp_body
+    cli_result = JSON.decode!(cli.resp_body)["result"]
+
+    cli_session =
+      Enum.find(cli_result["sessions"], &(&1["sessionKey"] == ctx.admin_session.session_key))
+
+    refute is_nil(cli_session)
+
+    detail =
+      get(ctx, "/api/sessions/#{ctx.admin_session.session_key}", ctx.admin_session.cli_token)
+
+    assert detail.status == 200, detail.resp_body
+    rest_session = JSON.decode!(detail.resp_body)["item"]
+
+    assert cli_session["capabilities"]["setHarness"] ==
+             rest_session["capabilities"]["setHarness"]
   end
 
   test "artifact archive and release notices equal the current ordered REST detail", ctx do
@@ -1110,6 +1179,36 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
           assert Enum.all?(value["skillsAdd"], &is_binary/1)
           assert is_nil(value["guidanceExtra"]) or is_binary(value["guidanceExtra"])
 
+        {resource, field} == {"sessions", "capabilities"} ->
+          assert Map.keys(value) == ["setHarness"]
+
+          capability = value["setHarness"]
+          names = Enum.map(Tightbeam.Harness.all(), & &1.wire_name())
+
+          case capability do
+            %{"supported" => true, "options" => options} ->
+              assert item["state"] == "active"
+              assert Map.keys(capability) |> Enum.sort() == ~w(options supported)
+              assert Enum.map(options, & &1["value"]) == names
+
+              assert Enum.all?(options, fn option ->
+                       Map.keys(option) |> Enum.sort() == ~w(enabled title value) and
+                         option["title"] == option["value"] and
+                         option["enabled"] == (option["value"] != item["harness"])
+                     end)
+
+              assert Enum.any?(options, & &1["enabled"])
+
+            %{"supported" => false, "reason" => reason} ->
+              assert Map.keys(capability) |> Enum.sort() == ~w(reason supported)
+
+              assert reason ==
+                       if(item["state"] == "active",
+                         do: "no alternate harness is registered",
+                         else: "session is not active"
+                       )
+          end
+
         true ->
           assert is_binary(value), "#{resource}.#{field} is not a string"
       end
@@ -1617,7 +1716,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       )
 
     {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
-    {:ok, ws} = WS.connect("127.0.0.1", port, "/ws/changes?protocolVersion=1")
+    {:ok, ws} = WS.connect("127.0.0.1", port, "/ws/changes?protocolVersion=2")
     :ok = WS.send_text(ws, JSON.encode!(%{"type" => "auth", "token" => ctx.token}))
     {:ok, {:text, auth}, ws} = WS.recv(ws, 2_000)
     assert %{"type" => "auth_result", "success" => true} = JSON.decode!(auth)
@@ -1627,7 +1726,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
         ws,
         JSON.encode!(%{
           "type" => "subscribe",
-          "protocolVersion" => 1,
+          "protocolVersion" => 2,
           "subscriptionId" => "core-detail-a6",
           "filters" => %{
             "classes" => Enum.map(core_detail_cases(ctx), & &1.class) ++ extra_classes

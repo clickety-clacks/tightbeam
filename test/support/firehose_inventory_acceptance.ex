@@ -39,11 +39,16 @@ defmodule Tightbeam.FirehoseInventoryAcceptance do
     first_kungfu = StateResources.query_kungfu(fixture.db, "a4-complete")
     assert first_kungfu["rowVersion"] > 0
 
-    ws =
+    {ws, initial_sessions} =
       Fixture.connect(fixture,
         subscription_id: "a4-authoritative",
         filters: %{"classes" => Rebuild.classes() ++ @a4_r8b_classes ++ @a4_delete_classes}
       )
+
+    assert Enum.any?(initial_sessions, fn session ->
+             session["sessionKey"] == main.session_key and
+               is_map(get_in(session, ["capabilities", "setHarness"]))
+           end)
 
     :ok =
       Hub.register(fixture.hub, self(), %{
@@ -296,6 +301,38 @@ defmodule Tightbeam.FirehoseInventoryAcceptance do
     drain_publications(fixture)
 
     notices =
+      capture_classes(fixture, notices, ["session.harness_changed"], fn ->
+        Org.set_harness(
+          fixture.db,
+          main.session_key,
+          "codex",
+          "openai",
+          Tightbeam.Model.new("gpt-5.6-sol")
+        )
+      end)
+
+    # This observer captures the committed projection before protocol framing;
+    # Fixture.recv_change below checks schemaVersion 2 on the actual socket frame.
+    harness_notice = notices["session.harness_changed"]
+    assert harness_notice["payload"]["harness"] == "codex"
+
+    assert Enum.any?(
+             harness_notice["payload"]["capabilities"]["setHarness"]["options"],
+             fn option -> option["value"] == "codex" and option["enabled"] == false end
+           )
+
+    assert {:ok, fresh_harness} =
+             Rebuild.fetch(
+               fixture.db,
+               "session.harness_changed",
+               harness_notice["refs"],
+               fixture.user_id,
+               true
+             )
+
+    assert fresh_harness == harness_notice["payload"]
+
+    notices =
       capture_classes(fixture, notices, ["session.updated"], fn ->
         updated = Org.rename(fixture.db, main.session_key, "A4 authoritative rebuild")
       end)
@@ -312,7 +349,9 @@ defmodule Tightbeam.FirehoseInventoryAcceptance do
     assert "prod.fired" in Registry.observational_classes()
     assert Registry.fetch("prod.fired") == :error
 
-    for {class, notice} <- notices do
+    # This notice predates the rename and was checked against its commit-time
+    # rebuild above; the final database row has since advanced one version.
+    for {class, notice} <- Map.delete(notices, "session.harness_changed") do
       assert {:ok, fresh} =
                Rebuild.fetch(fixture.db, class, notice["refs"], fixture.user_id, true)
 
@@ -462,16 +501,36 @@ defmodule Tightbeam.FirehoseInventoryAcceptance do
     {model, ws} =
       Enum.reduce(1..map_size(notices), {%{}, ws}, fn _, {model, ws} ->
         {notice, ws} = Fixture.recv_change(ws)
-        fresh = assert_a4_fresh!(fixture, notice)
         model = apply_a4_notice(model, notice)
-        assert model[a4_key(notice)].payload == fresh
-        assert model[a4_key(notice)].applications == 1
         {model, ws}
       end)
 
+    expected_keys =
+      notices
+      |> Map.values()
+      |> Enum.map(&a4_key/1)
+      |> MapSet.new()
+
+    assert MapSet.new(Map.keys(model)) == expected_keys
+
+    Enum.each(notices, fn {_class, notice} ->
+      key = a4_key(notice)
+      assert model[key].payload == assert_a4_fresh!(fixture, notice)
+
+      expected_applications =
+        notices
+        |> Map.values()
+        |> Enum.filter(&(a4_key(&1) == key))
+        |> Enum.map(&(&1["payload"]["rowVersion"] || &1["occurredAt"]))
+        |> Enum.uniq()
+        |> length()
+
+      assert model[key].applications == expected_applications
+    end)
+
     {model, ws} = replay_a4_orders(fixture, ws, model, notices)
 
-    assert map_size(model) == map_size(notices)
+    assert MapSet.new(Map.keys(model)) == expected_keys
     ws
   end
 
