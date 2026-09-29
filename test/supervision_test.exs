@@ -1711,17 +1711,31 @@ defmodule Tightbeam.SupervisionTest do
     assert Ledger.last_terminal_seq(ctx.db, "holder") == checkpoint_source_seq
   end
 
-  test "typed checkpoint binding suppresses a controller when the public wake has no assignment id",
+  test "typed null-bound checkpoint self-wake does not hide durable progress from prod admission",
        ctx do
     terminal_seq = terminal!(ctx.db, "holder")
     insert_entitlement!(ctx.db, "asg_1", generation: 11, due_at: 0, interval: 60_000)
     assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", terminal_seq)
     assert [%{assignment_id: "asg_1"} = controller] = Wakes.list_pending(ctx.db)
 
+    assert {:ok, [[nil]]} =
+             DB.query(ctx.db, "SELECT workItemId FROM assignments WHERE id='asg_1'")
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO attests (id, assignmentId, kind, note, bySession, ts) VALUES ('att_progress_without_work_item','asg_1','progress','work without a work item','holder',9000000000000)"
+      )
+
     {checkpoint, _source_turn} =
       schedule_checkpoint_via_gateway!(ctx, "checkpoint before prod admission", 60_000)
 
     assert checkpoint.assignment_id == nil
+
+    assert {:ok, [[nil]]} =
+             DB.query(ctx.db, "SELECT work_item_id FROM wakes WHERE wakeId=?1", [
+               checkpoint.wake_id
+             ])
 
     scheduler = start_wake_scheduler!(ctx, :checkpoint_before_prod)
     assert :ok = Wakes.fire_due(scheduler)
@@ -1731,13 +1745,11 @@ defmodule Tightbeam.SupervisionTest do
     assert {:ok, []} =
              DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [controller.wake_id])
 
-    assert {:ok, [["checkpoint", checkpoint_id, 13]]} =
+    assert {:ok, [["progress", "att_progress_without_work_item", 13]]} =
              DB.query(
                ctx.db,
                "SELECT sourceKind,sourceId,generation FROM supervision_liveness_receipts WHERE assignmentId='asg_1'"
              )
-
-    assert checkpoint_id == checkpoint.wake_id
 
     assert %{supervisionGeneration: 13, supervisionBasisKind: "liveness_receipt"} =
              Supervision.prod_state(ctx.db, "asg_1")
