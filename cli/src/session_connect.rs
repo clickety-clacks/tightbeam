@@ -3041,7 +3041,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            let mut socket = tungstenite::accept(stream).unwrap();
+            let (mut socket, _) = accept_subscribed_socket(stream, 2);
             loop {
                 match socket.read().unwrap() {
                     Message::Close(frame) => return frame,
