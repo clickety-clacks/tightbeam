@@ -462,7 +462,7 @@ fn actual_cli_unreachable_port_keeps_typed_refusal_or_unknown_fallback_for_get_a
                     assert_eq!(record["timeout_source"], "cli_connect");
                     assert!(record["budget_ms"].as_u64().is_some());
                 } else {
-                    assert!(record["timeout_source"].is_null());
+                    assert_eq!(record["timeout_source"], "none");
                     assert!(record["budget_ms"].is_null());
                 }
                 Some("gateway_unavailable")
@@ -480,7 +480,7 @@ fn actual_cli_unreachable_port_keeps_typed_refusal_or_unknown_fallback_for_get_a
                     assert_eq!(record["timeout_source"], "cli_request");
                     assert!(record["budget_ms"].as_u64().is_some());
                 } else {
-                    assert!(record["timeout_source"].is_null());
+                    assert_eq!(record["timeout_source"], "none");
                     assert!(record["budget_ms"].is_null());
                 }
                 Some("gateway_transport_uncertain")
