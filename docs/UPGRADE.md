@@ -1,5 +1,24 @@
 # Upgrading a running instance
 
+## 0.1.8 to 0.1.9 database rehearsal
+
+The canonical standalone E2E migration procedure is
+[docs/e2e/0.1.9/migration.md](e2e/0.1.9/migration.md). It starts from a
+verified copy of a real 0.1.8 database, lets the verified 0.1.9 gateway migrate
+that copy once, and preserves the migrated result for separately runnable
+feature checks. The aggregate order and feature-area runbooks are in
+[docs/e2e/0.1.9/README.md](e2e/0.1.9/README.md). Do not use this rehearsal as
+permission to point a command at a live base.
+
+For source-lineage context, canonical tag `v0.1.8+1337` (build 1337,
+`fdb3db53b596d4114d06505b39a4c1836fba7564`) writes
+`operator-decision-requests-v1`, which current 0.1.9 accepts. This is a
+reference lineage, not presumed provenance for a later real 0.1.8 database.
+The source manifest for the actual snapshot must establish its build and stored
+stamp; stop for delivery's source-backed adjudication if either differs. The
+historical `pi-harness-v1` stamp below is not named by the current 0.1.9
+accepted-stamp chain.
+
 Keep each release in its own complete directory. Stage and verify the release
 package before selecting it through `/opt/tightbeam/current`; the selection is
 one atomic symlink replacement, and the previous build remains available.
@@ -64,7 +83,12 @@ The primary database does not migrate a satellite database for it. A macOS host
 whose registry entry says `baseDir=/Users/mike/.tightbeam`, for example, must be
 stopped, backed up, upgraded, and started on that host.
 
-## The supported 0.1.7 to 0.1.8 migration chain
+## The historical 0.1.7 to 0.1.8 migration chain
+
+This describes the historical 0.1.7-to-0.1.8 transition only; it does not
+define the input contract for the current 0.1.9 migration. Use the
+source-backed lineage check above and the standalone 0.1.9 rehearsal before
+starting that upgrade.
 
 Let the 0.1.8 gateway perform this migration at first boot. Do not edit the
 stamp or issue manual `ALTER TABLE` statements.

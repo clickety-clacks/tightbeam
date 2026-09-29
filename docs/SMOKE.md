@@ -10,6 +10,11 @@ observable frame, bubble, or row. The DB checks use
 `README.md` is the authority for the fresh-org install path. This runbook
 follows that path verbatim rather than restating it.
 
+The 0.1.9 release-specific migration and feature acceptance runbooks are
+collected in [docs/e2e/0.1.9/README.md](e2e/0.1.9/README.md). That aggregate
+preserves one migrated real 0.1.8 database as the reusable starting point and
+links each independently runnable feature area.
+
 Conventions: GATEWAY = the gateway under test (fresh base_dir unless the run
 says otherwise). First device to pair becomes the admin user. `tb` = the
 reference CLI with TIGHTBEAM_URL/TIGHTBEAM_TOKEN pointed at GATEWAY (token
