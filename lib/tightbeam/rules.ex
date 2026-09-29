@@ -2997,14 +2997,62 @@ defmodule Tightbeam.Rules do
 
   defp compute_fact("turn.backlog_episode_id", db, call, cache) do
     case queued_turn_snapshot(db, call) do
-      %{count: count, age_ms: age_ms, oldest_seq: seq}
-      when is_integer(seq) and
-             (count >= 20 or (is_integer(age_ms) and age_ms >= 60 * 60 * 1_000)) ->
-        {"queue:" <> Integer.to_string(seq), cache}
+      %{count: count, age_ms: age_ms, session_key: session_key, now: now}
+      when count >= 20 or (is_integer(age_ms) and age_ms >= 60 * 60 * 1_000) ->
+        case backlog_started_at(db, session_key, now) do
+          nil -> {nil, cache}
+          at -> {"queue:" <> session_key <> ":" <> Integer.to_string(at), cache}
+        end
 
       _ ->
         {nil, cache}
     end
+  end
+
+  # Reconstruct the union of depth and age backlog intervals from queue residence,
+  # not the oldest *remaining* turn. Claiming a head turn does not end a backlog.
+  # Equal-millisecond boundaries are coalesced: durable timestamps cannot order
+  # a claim and enqueue within that millisecond, so a zero-duration recovery
+  # conservatively stays in the same episode. No classification is persisted.
+  defp backlog_started_at(db, session_key, now) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT createdAt,CASE WHEN status='queued' THEN NULL " <>
+          "ELSE COALESCE(startedAt,endedAt,createdAt) END FROM turns " <>
+          "WHERE sessionKey=?1 AND origin NOT LIKE 'remedy:ac6a-%'",
+        [session_key]
+      )
+
+    {_depth, _aged, started_at} =
+      rows
+      |> Enum.flat_map(fn [created_at, left_at] ->
+        age_at = created_at + 60 * 60 * 1_000
+        left_at = if is_integer(left_at), do: max(left_at, created_at), else: nil
+        ages? = is_nil(left_at) or age_at < left_at
+        events = [{created_at, 1, 0}]
+        events = if ages?, do: [{age_at, 0, 1} | events], else: events
+
+        if is_integer(left_at) do
+          [{left_at, -1, if(ages?, do: -1, else: 0)} | events]
+        else
+          events
+        end
+      end)
+      |> Enum.reject(fn {at, _, _} -> at > now end)
+      |> Enum.group_by(fn {at, _, _} -> at end)
+      |> Enum.sort_by(fn {at, _} -> at end)
+      |> Enum.reduce({0, 0, nil}, fn {at, events}, {depth, aged, started_at} ->
+        {depth, aged} =
+          Enum.reduce(events, {depth, aged}, fn {_, depth_delta, age_delta}, {depth, aged} ->
+            {depth + depth_delta, aged + age_delta}
+          end)
+
+        started_at = if depth >= 20 or aged > 0, do: started_at || at, else: nil
+        {depth, aged, started_at}
+      end)
+
+    started_at
   end
 
   defp compute_fact("turn.caller_threshold_seq", db, call, cache) do
@@ -3030,22 +3078,22 @@ defmodule Tightbeam.Rules do
     with "queued_turn" <- row_commit_domain(call),
          session_key when is_binary(session_key) and session_key != "" <-
            Map.get(call.params, :session_key),
-         {:ok, [[count, created_at, oldest_seq]]} <-
+         {:ok, [[count, created_at]]} <-
            DB.query(
              db,
-             "SELECT COUNT(*),MIN(createdAt),(SELECT seq FROM turns oldest WHERE oldest.sessionKey=?1 " <>
-               "AND oldest.status='queued' AND oldest.origin NOT LIKE 'remedy:ac6a-%' " <>
-               "ORDER BY oldest.createdAt,oldest.seq LIMIT 1) FROM turns " <>
+             "SELECT COUNT(*),MIN(createdAt) FROM turns " <>
                "WHERE sessionKey=?1 AND status='queued' AND origin NOT LIKE 'remedy:ac6a-%'",
              [session_key]
            ) do
+      now = System.system_time(:millisecond)
+
       age_ms =
         case created_at do
-          value when is_integer(value) -> max(System.system_time(:millisecond) - value, 0)
+          value when is_integer(value) -> max(now - value, 0)
           _ -> nil
         end
 
-      %{count: count, age_ms: age_ms, oldest_seq: oldest_seq, session_key: session_key}
+      %{count: count, age_ms: age_ms, session_key: session_key, now: now}
     else
       _ -> nil
     end

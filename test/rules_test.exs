@@ -2370,6 +2370,127 @@ defmodule Tightbeam.RulesTest do
     assert notice_count(ctx.db, "remedy:ac6a-queue-backlog") == 1
   end
 
+  test "AC6a depth backlog survives claims and rearms after an observed recovery", ctx do
+    {holder, opened} = ac6a_backlog_fixture(ctx, "depth-episode")
+
+    for index <- 1..21, do: ac6a_enqueue(ctx, holder, opened, "initial-#{index}")
+    assert notice_count(ctx.db, "remedy:ac6a-queue-backlog") == 1
+
+    assert {:ok, claimed} = Ledger.claim_next(ctx.db, holder.session_key, "depth-first")
+    assert queued_depth(ctx.db, holder.session_key) == 20
+    # Re-loading rules must not discard the episode: it is derived from durable rows.
+    load_ac6a_rules(ctx)
+    ac6a_enqueue(ctx, holder, opened, "after-first-claim")
+    assert notice_count(ctx.db, "remedy:ac6a-queue-backlog") == 1
+    finish_claim(ctx.db, claimed)
+
+    for index <- 1..3 do
+      assert {:ok, claimed} = Ledger.claim_next(ctx.db, holder.session_key, "drain-#{index}")
+      finish_claim(ctx.db, claimed)
+    end
+
+    assert queued_depth(ctx.db, holder.session_key) == 18
+    # A positive-duration gap distinguishes recovery from same-millisecond churn.
+    Process.sleep(2)
+    ac6a_enqueue(ctx, holder, opened, "below-again")
+    assert notice_count(ctx.db, "remedy:ac6a-queue-backlog") == 1
+    ac6a_enqueue(ctx, holder, opened, "recross")
+    assert notice_count(ctx.db, "remedy:ac6a-queue-backlog") == 2
+    ac6a_enqueue(ctx, holder, opened, "after-recross")
+    assert notice_count(ctx.db, "remedy:ac6a-queue-backlog") == 2
+  end
+
+  test "AC6a age backlog survives oldest turnover and a handoff to depth backlog", ctx do
+    {holder, opened} = ac6a_backlog_fixture(ctx, "age-episode")
+    first = ac6a_enqueue(ctx, holder, opened, "oldest")
+    second = ac6a_enqueue(ctx, holder, opened, "next-oldest")
+    now = System.system_time(:millisecond)
+
+    for {seq, age} <- [{first, 3_601_000}, {second, 3_600_500}] do
+      assert {:ok, _} =
+               DB.query(ctx.db, "UPDATE turns SET createdAt=?1 WHERE seq=?2", [now - age, seq])
+    end
+
+    ac6a_enqueue(ctx, holder, opened, "age-trigger")
+    assert notice_count(ctx.db, "remedy:ac6a-queue-backlog") == 1
+
+    assert {:ok, %{seq: ^first} = claimed} =
+             Ledger.claim_next(ctx.db, holder.session_key, "age-first")
+
+    ac6a_enqueue(ctx, holder, opened, "after-aged-claim")
+    assert notice_count(ctx.db, "remedy:ac6a-queue-backlog") == 1
+    finish_claim(ctx.db, claimed)
+
+    for index <- 1..19, do: ac6a_enqueue(ctx, holder, opened, "depth-handoff-#{index}")
+
+    assert {:ok, %{seq: ^second} = claimed} =
+             Ledger.claim_next(ctx.db, holder.session_key, "age-second")
+
+    ac6a_enqueue(ctx, holder, opened, "after-last-aged-claim")
+    assert notice_count(ctx.db, "remedy:ac6a-queue-backlog") == 1
+    finish_claim(ctx.db, claimed)
+
+    for index <- 1..4 do
+      assert {:ok, claimed} = Ledger.claim_next(ctx.db, holder.session_key, "age-drain-#{index}")
+      finish_claim(ctx.db, claimed)
+    end
+
+    assert queued_depth(ctx.db, holder.session_key) == 18
+    Process.sleep(2)
+    ac6a_enqueue(ctx, holder, opened, "age-recovery-below")
+    ac6a_enqueue(ctx, holder, opened, "age-recovery-recross")
+    ac6a_enqueue(ctx, holder, opened, "age-recovery-repeat")
+    assert notice_count(ctx.db, "remedy:ac6a-queue-backlog") == 2
+  end
+
+  test "AC6a coalesces indistinguishable same-millisecond recovery and re-cross", ctx do
+    {holder, opened} = ac6a_backlog_fixture(ctx, "tied-episode")
+    for index <- 1..20, do: ac6a_enqueue(ctx, holder, opened, "tied-initial-#{index}")
+    assert notice_count(ctx.db, "remedy:ac6a-queue-backlog") == 1
+    Process.sleep(2)
+    assert {:ok, claimed} = Ledger.claim_next(ctx.db, holder.session_key, "tied-claim")
+    assert queued_depth(ctx.db, holder.session_key) == 19
+
+    assert {:ok, [[claimed_at]]} =
+             DB.query(ctx.db, "SELECT startedAt FROM turns WHERE seq=?1", [claimed.seq])
+
+    # Use the real enqueue/drain path, fixing only the clock resolution so the
+    # ambiguous claim/enqueue boundary is deterministic on every test host.
+    assert {:ok, :ok} =
+             DB.transaction_then(
+               ctx.db,
+               fn txn ->
+                 assert {:ok, seq} =
+                          Ledger.enqueue_in_txn(txn, %{
+                            session_key: holder.session_key,
+                            message_id: "tied-recross",
+                            origin: "process:seed",
+                            assignment_id: opened.id,
+                            prompt: "same millisecond as claim"
+                          })
+
+                 assert {:ok, _} =
+                          DB.query(txn, "UPDATE turns SET createdAt=?1 WHERE seq=?2", [
+                            claimed_at,
+                            seq
+                          ])
+
+                 :ok
+               end,
+               fn txn, :ok -> Wakes.row_commit_in_txn(txn, []) end
+             )
+
+    assert queued_depth(ctx.db, holder.session_key) == 20
+    assert notice_count(ctx.db, "remedy:ac6a-queue-backlog") == 1
+    finish_claim(ctx.db, claimed)
+    Process.sleep(2)
+    assert {:ok, claimed} = Ledger.claim_next(ctx.db, holder.session_key, "untied-claim")
+    finish_claim(ctx.db, claimed)
+    Process.sleep(2)
+    ac6a_enqueue(ctx, holder, opened, "untied-recross")
+    assert notice_count(ctx.db, "remedy:ac6a-queue-backlog") == 2
+  end
+
   test "AC6a age and sender-flood thresholds fire on crossing, then dedupe", ctx do
     holder = session(ctx.db, "ac6a-age-holder", "flynn", archetype: "coder")
     sender = session(ctx.db, "ac6a-flood-sender", "flynn", archetype: "coder")
@@ -3542,6 +3663,42 @@ defmodule Tightbeam.RulesTest do
     # Gateway startup activates row-commit recognition after loading rules.
     :ok = Wakes.activate_wait_recognition(ctx.db)
     rules
+  end
+
+  defp ac6a_backlog_fixture(ctx, name) do
+    holder = session(ctx.db, "ac6a-#{name}", "flynn", archetype: "coder")
+    session(ctx.db, Org.personal_session_key("flynn"), "flynn", kind: "main")
+    opened = assignment(ctx, holder.session_key, {:user, "flynn"})
+    attach_work_item(ctx, opened.id, "wi_ac6a_#{name}")
+    load_ac6a_rules(ctx)
+    {holder, opened}
+  end
+
+  defp ac6a_enqueue(ctx, holder, opened, message_id) do
+    assert {:ok, seq} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: holder.session_key,
+               message_id: message_id,
+               origin: "process:seed",
+               assignment_id: opened.id,
+               prompt: "backlog episode regression"
+             })
+
+    seq
+  end
+
+  defp queued_depth(db, session_key) do
+    assert {:ok, [[count]]} =
+             DB.query(db, "SELECT COUNT(*) FROM turns WHERE sessionKey=?1 AND status='queued'", [
+               session_key
+             ])
+
+    count
+  end
+
+  defp finish_claim(db, claimed) do
+    assert :ok =
+             Ledger.finish(db, claimed.seq, "delivered", nil, owner_lease: claimed.owner_lease)
   end
 
   defp verified_code_refs(ctx, producer, holder, reviewer) do
