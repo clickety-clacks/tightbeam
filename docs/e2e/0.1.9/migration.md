@@ -209,6 +209,8 @@ wait "$gateway_pid"
 
 ## Preserve the reusable result
 
+<a id="record-the-result"></a>
+
 Take a clean SQLite snapshot of the migrated database into a separate output
 directory. Record the target stamp, target version/source SHA/package SHA,
 source stamp/source SHA, row counts, integrity results, package start command,

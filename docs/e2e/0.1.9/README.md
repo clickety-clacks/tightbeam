@@ -92,26 +92,60 @@ host/provider state.
 | Telemetry | `telemetry` | Breathing, execution map/selection, durable Topline lifecycle and roster | [telemetry.md](telemetry.md) |
 | Artifacts | `artifacts` | Gate enforcement, real-turn artifact carrier and captured-content fetch | [artifacts.md](artifacts.md) |
 
-## 0.1.9 feature coverage ledger
+## 0.1.9 must-land coverage
 
-Use this ledger to keep the manual rows attached to the public behavior they
-exercise. The command names are the shipped 0.1.9 CLI spellings.
+This ledger maps Mike's 43 must-land items to one manual row or states why the
+item has no operator-facing E2E path. The linked rows give the concrete action
+and pass condition. Source-CI rows are covered by the unchanged
+`scripts/verify_mix.sh` merge checks; they do not invoke the new feature-smoke,
+real-snapshot migration or aggregate procedures.
 
-| Public feature | Area and check |
+| Must-land | E2E coverage |
 |---|---|
-| Wake assignment binding, dependency predicate, after-turn continuation, queued replacement, and delivery class | [Work and routing](work-routing.md): run each delivery form against a disposable held assignment and read the durable wake/turn rows. |
-| Spawn attached to a work item and assignment `--succeeds` dependency | [Work and routing](work-routing.md): create a disposable parent/child chain and verify the exact work and predecessor links. |
-| Work-item priority, metadata/body updates, and direct delivery owner | [Work and routing](work-routing.md): patch and read back values, including setting and clearing the direct owner. |
-| Condition payload and default priority | [Work and routing](work-routing.md): publish/read a scoped fact payload and set/read the org's test-only priority default. |
-| Session PO association and session reparenting | [Work and routing](work-routing.md): use disposable sessions and a sole open assignment; verify the resulting exact association/parent. |
-| Assignment stop, reopen, repair, commit-ref correction, and stale-turn settlement | [Decisions and assignments](decisions-assignments.md): use only a deliberately created disposable turn or genuine failure and verify the terminal/readback state. |
-| Ask, answer, return, and decision-request readback | [Decisions and assignments](decisions-assignments.md): create two disposable requests, answer one, return the other, and read both. |
-| Breathing; execution-map roster and selection | [Telemetry](telemetry.md): script checks an idle item, its roster row, and the exact scoped selection; manual rows cover active session/assignment targets. |
-| Durable Topline reads, history, mutations, work/concern links, and placements | [Telemetry](telemetry.md): script covers the lifecycle; check placement resolution only when a natural pending placement exists. |
-| Artifact producer binding, captured content, attest evidence/wait and content-unavailable behavior | [Artifacts](artifacts.md) and [decisions/assignments](decisions-assignments.md): script fetches and verifies captured bytes; manual rows check provenance and real evidence bindings. |
-| Session connect, identity current/status/apply, provider onboarding variants | [Provider and runtime](provider-runtime.md): use disposable sessions and already-authorized test provider state; identity refresh requires a discardable test revision. |
-| Kungfu setup, sentinel listing/configuration, harness process ledger | [Provider and runtime](provider-runtime.md): inspect read-only state, then exercise reversible changes on an isolated test gateway. |
-| Harness health observation, resolution, review, evidence and promotion close | [Provider and runtime](provider-runtime.md): requires a genuine, redacted host incident and real review provenance; otherwise mark incomplete. |
+| Completion handoff | [Completion handoff](decisions-assignments.md#completion-handoff). |
+| Surrender replacement | Source CI verifies the retired terminal `surrender` protocol is rejected; the [typed `cannot-proceed` replacement](decisions-assignments.md#cannot-proceed-replacement) checks the supported route and opener handoff. |
+| Wake cancellation history | [Wake cancellation history](work-routing.md#wake-cancellation-history). |
+| Notice batching | [Notice batching](work-routing.md#notice-batching); requires an already selected disposable recipient lane or is recorded incomplete. |
+| Parent reactivation | [Completion handoff](decisions-assignments.md#completion-handoff) checks the parent's real child notice and resumed turn. |
+| Wake delivery | [Wake delivery](work-routing.md#wake-delivery-options). |
+| Deterministic liveness | [Progress receipts](decisions-assignments.md#liveness-from-progress-receipts) and [physical breathing](telemetry.md#deterministic-liveness). |
+| Editable work-item body | [Editable work-item body](work-routing.md#editable-work-item-body). |
+| Session connect | [Session connect](provider-runtime.md#session-connect). |
+| Harness switching in Firehose (`setHarness`) | [Firehose harness switch](provider-runtime.md#firehose-harness-switch). |
+| Agent control 1: replace my unread messages | [Replace unread messages](work-routing.md#replace-unread-messages). |
+| Agent control 2: see a worker's queue | [Worker queue summary](telemetry.md#worker-queue-summary). |
+| Agent control 3: stop and redirect | [Stop and redirect](decisions-assignments.md#stop-and-redirect). |
+| Agent control 3: stop a running turn | [Stop a running assignment turn](decisions-assignments.md#stop-running-turn). |
+| Landing watcher: CI-finished fact | [Landing watcher](work-routing.md#landing-watcher). |
+| No completion while blocked | [Completion while blocked](decisions-assignments.md#completion-while-blocked). |
+| Agent control 4: failed means failed, and redeliver | [Failed turn and redelivery](decisions-assignments.md#failed-turn-remains-failed-and-can-be-redelivered). |
+| Agent control 5: switch a seat with work queued | [Firehose harness switch with queued work](provider-runtime.md#firehose-harness-switch). |
+| Agent control 6: advancing query plus owner rail | [Advancing query and owner rail](telemetry.md#advancing-query-owner-rail). |
+| Flaky test fixes | Source-CI only: flakiness is established by repeated canonical Linux/macOS suite results, not a new operational scenario. |
+| Crash fix A: index `turns.messageId` | Source-CI only: this storage-index repair has no independent public action; migration and database inspection stay under the separately authorized rehearsal. |
+| Crash fix B: lanes recover after a manager restart | Source-CI only: the restart/race fixture is internal supervision behavior and is not exposed as an operator command. |
+| Retirement cleanup on the original host | [Retirement cleanup](provider-runtime.md#retirement-cleanup-on-the-original-host). |
+| Model neutrality | Run the same aggregate and each standalone feature area for every authorized harness leg; compare behavior and pass conditions, not model-specific wording. |
+| Philosophy-first guidance refactor | Guidance-only: prose ordering has no separate product operation to exercise. |
+| Credential backoff | [Credential backoff](provider-runtime.md#credential-backoff); it requires a provider-approved reversible test fixture or is incomplete. |
+| Sign-in recovery wake (from Main) | [Sign-in recovery wake](provider-runtime.md#sign-in-recovery-wake). |
+| Simplify ownership module | Source-CI only: this is an internal refactor with no separate observable operation. |
+| Stuck-turn settlement | [Stale-turn settlement](decisions-assignments.md#stale-turn-settlement). |
+| Timeout diagnostics | [Timeout diagnostics](decisions-assignments.md#timeout-diagnostics). |
+| Error fidelity | [Error fidelity](decisions-assignments.md#error-fidelity). |
+| GitHub #23 no-op rows | Source-CI only: these are internal supervision watermark/audit rows; no public command can safely drive or inspect the scheduler tick. |
+| Topology | [Canonical session topology](work-routing.md#canonical-topology) distinguishes current parent from spawn provenance. |
+| Visitor identity | Source-CI only: the 0.1.9 CLI has no supported visitor-principal creation route for a disposable operator fixture. |
+| Deploy safety, unrolled | The staged selector and rollback remain a [release runbook](../../UPGRADE.md#release-upgrade-sequence); its package-selector behavior is source-CI tested, and this E2E card does not install a release. |
+| Release CI exact-commit check (from main) | Source-CI only: the required release workflow checks the pushed source SHA; a manual E2E command cannot establish that CI property. |
+| GitHub #15 retire test | [Retirement cleanup](provider-runtime.md#retirement-cleanup-on-the-original-host) checks the original-host outcome on a disposable session. |
+| Idle cleanup skips standing seats | Source-CI only: the scheduled supervisor's standing-seat exclusion uses controlled clock/process fixtures unavailable through the public CLI. |
+| Orchestrator model ring-down | [Orchestrator model defaults](work-routing.md#orchestrator-model-defaults) reads the choice from the target host's own catalog. |
+| Orchestrator-by-default staffing rule | Guidance-only: staffing defaults are instructions, not an independent user operation. |
+| Codex Guardian off by default | [Codex Guardian default](provider-runtime.md#codex-guardian-default). |
+| Process facts wake again | [Landing watcher](work-routing.md#landing-watcher) observes two real scoped process facts and both resulting wakes. |
+| Sentinels and landing queue | [Sentinel lifecycle](provider-runtime.md#sentinel-lifecycle), [landing watcher](work-routing.md#landing-watcher), and required source-CI merge-group checks cover the separate runtime and queue behaviors. |
 
-Do not add this matrix or any E2E invocation to CI. CI establishes source
-correctness; Mike calls the separate real-host E2E run.
+Do not wire this matrix or any E2E invocation into CI. The corrected bot PR
+runs the unchanged source suite through the canonical wrapper; Mike calls the
+separate real-host E2E run.
