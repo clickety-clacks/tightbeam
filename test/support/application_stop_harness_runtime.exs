@@ -119,16 +119,82 @@ await = fn recur, fun, remaining, failure ->
   end
 end
 
+authority_path = escape_identity <> ".authority"
+authority_version = "tightbeam-harness-identity-v2"
+expected_escape_launch = "application-stop-escapee"
+
+# The CLI creates this final path before publishing the complete authority row.
+authority_record =
+  Regex.compile!(
+    "\\A#{Regex.escape(authority_version)}\\t([1-9][0-9]*)\\t([1-9][0-9]*)\\t-?[0-9]+\\t-?[0-9]+\\t[^\\t\\r\\n]+\\t#{Regex.escape(expected_escape_launch)}\\n\\z"
+  )
+
+authority_ready? = fn contents ->
+  case Regex.run(authority_record, contents) do
+    [_record, _pid, _pgid] ->
+      true
+
+    nil ->
+      if String.ends_with?(contents, "\n") do
+        raise ArgumentError, "escape identity authority is malformed or mismatched"
+      else
+        false
+      end
+  end
+end
+
+partial_authority = authority_version <> "\t81624"
+false = authority_ready?.(partial_authority)
+
+complete_authority =
+  Enum.join(
+    [authority_version, "81624", "81624", "1", "2", "fixture-boot", expected_escape_launch],
+    "\t"
+  ) <> "\n"
+
+true = authority_ready?.(complete_authority)
+
+refuses_authority? = fn contents ->
+  try do
+    authority_ready?.(contents)
+    false
+  rescue
+    error in ArgumentError ->
+      error.message == "escape identity authority is malformed or mismatched"
+  end
+end
+
+true =
+  refuses_authority?.(
+    Enum.join(
+      [authority_version, "not-a-pid", "81624", "1", "2", "fixture-boot", expected_escape_launch],
+      "\t"
+    ) <> "\n"
+  )
+
+true =
+  refuses_authority?.(
+    Enum.join(
+      [authority_version, "81624", "81624", "1", "2", "fixture-boot", "different-launch"],
+      "\t"
+    ) <> "\n"
+  )
+
 await.(
   await,
-  fn -> File.exists?(escape_identity <> ".authority") end,
+  fn ->
+    case File.read(authority_path) do
+      {:ok, contents} -> authority_ready?.(contents)
+      {:error, :enoent} -> false
+      {:error, reason} -> raise File.Error, reason: reason, action: "read", path: authority_path
+    end
+  end,
   1_500,
-  "escape identity missing"
+  "escape identity authority missing or incomplete"
 )
 
 [authority, escape_pid, escape_pgid, _seconds, _micros, _boot, "application-stop-escapee"] =
-  escape_identity
-  |> Kernel.<>(".authority")
+  authority_path
   |> File.read!()
   |> String.trim()
   |> String.split("\t")
