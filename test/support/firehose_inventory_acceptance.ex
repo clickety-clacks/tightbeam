@@ -311,8 +311,9 @@ defmodule Tightbeam.FirehoseInventoryAcceptance do
         )
       end)
 
+    # This observer captures the committed projection before protocol framing;
+    # Fixture.recv_change below checks schemaVersion 2 on the actual socket frame.
     harness_notice = notices["session.harness_changed"]
-    assert harness_notice["schemaVersion"] == 2
     assert harness_notice["payload"]["harness"] == "codex"
 
     assert Enum.any?(

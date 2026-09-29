@@ -381,7 +381,17 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     outsider_session = ensure_main_session(ctx.db, "outsider")
     item = StateResources.session(outsider_session)
     item_bytes = StateResources.encode_item("sessions", item, ctx.catalog)
-    expected = ~s({"schemaVersion":1,"resource":"sessions","items":[#{item_bytes}]})
+
+    page = %{
+      "oldestCursor" => nil,
+      "newestCursor" => "1",
+      "hasMoreBefore" => false,
+      "hasMoreAfter" => false
+    }
+
+    expected =
+      ~s({"schemaVersion":1,"resource":"sessions","items":[#{item_bytes}],"page":) <>
+        JSON.encode!(page) <> "}"
 
     collection = get(ctx, "/api/sessions", outsider_device.token)
     assert collection.status == 200
