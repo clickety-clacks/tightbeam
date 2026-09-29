@@ -321,6 +321,17 @@ defmodule Tightbeam.FirehoseInventoryAcceptance do
              fn option -> option["value"] == "codex" and option["enabled"] == false end
            )
 
+    assert {:ok, fresh_harness} =
+             Rebuild.fetch(
+               fixture.db,
+               "session.harness_changed",
+               harness_notice["refs"],
+               fixture.user_id,
+               true
+             )
+
+    assert fresh_harness == harness_notice["payload"]
+
     notices =
       capture_classes(fixture, notices, ["session.updated"], fn ->
         updated = Org.rename(fixture.db, main.session_key, "A4 authoritative rebuild")
@@ -338,7 +349,9 @@ defmodule Tightbeam.FirehoseInventoryAcceptance do
     assert "prod.fired" in Registry.observational_classes()
     assert Registry.fetch("prod.fired") == :error
 
-    for {class, notice} <- notices do
+    # This notice predates the rename and was checked against its commit-time
+    # rebuild above; the final database row has since advanced one version.
+    for {class, notice} <- Map.delete(notices, "session.harness_changed") do
       assert {:ok, fresh} =
                Rebuild.fetch(fixture.db, class, notice["refs"], fixture.user_id, true)
 
