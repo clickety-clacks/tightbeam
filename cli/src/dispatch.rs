@@ -6086,8 +6086,41 @@ mod tests {
         let body = body.into();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 4096];
-            let _ = stream.read(&mut request);
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            // Drain the full POST before replying; one TCP read may stop after
+            // headers and make the intended body-read case a transport failure.
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0_u8; 1024];
+                let read = stream.read(&mut chunk).unwrap();
+                assert!(read > 0, "client closed before completing its request");
+                request.extend_from_slice(&chunk[..read]);
+                assert!(request.len() < 8192, "unexpected unbounded test request");
+
+                let Some(header_end) = request
+                    .windows(4)
+                    .position(|part| part == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+                let request_line = headers.lines().next().expect("HTTP request line");
+                let content_length = headers.lines().skip(1).find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().expect("valid content length"))
+                });
+                let body_bytes = if request_line.starts_with("POST ") {
+                    content_length.expect("POST request has a content length")
+                } else {
+                    content_length.unwrap_or(0)
+                };
+                if request.len() >= header_end + 4 + body_bytes {
+                    break;
+                }
+            }
             write!(
                 stream,
                 "HTTP/1.1 {status} Synthetic\r\nContent-Type: application/json\r\nContent-Length: {declared_body_bytes}\r\nConnection: close\r\n\r\n{body}"
@@ -7009,14 +7042,14 @@ mod tests {
                 );
                 let machine: Value = serde_json::from_str(&rendered).unwrap();
                 assert_eq!(machine["ok"], false);
-                assert_eq!(machine["httpStatus"], 503);
+                assert_eq!(machine["httpStatus"], 503, "machine output: {machine:?}");
                 assert_eq!(machine["code"], "response_unreadable");
                 assert!(!machine["message"].as_str().unwrap().is_empty());
             } else {
                 let (human, machine) = readings(&rendered);
                 assert!(!human.is_empty());
                 assert_eq!(machine["ok"], false);
-                assert_eq!(machine["httpStatus"], 503);
+                assert_eq!(machine["httpStatus"], 503, "machine output: {machine:?}");
                 assert_eq!(machine["error"]["code"], "response_unreadable");
                 assert!(!machine["error"]["message"].as_str().unwrap().is_empty());
             }
