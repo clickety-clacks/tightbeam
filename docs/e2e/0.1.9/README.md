@@ -100,8 +100,8 @@ exercise. The command names are the shipped 0.1.9 CLI spellings.
 | Public feature | Area and check |
 |---|---|
 | Wake assignment binding, dependency predicate, after-turn continuation, queued replacement, and delivery class | [Work and routing](work-routing.md): run each delivery form against a disposable held assignment and read the durable wake/turn rows. |
-| Spawn attached to a work item; assignment `--succeeds` and `--delegates-delivery` links | [Work and routing](work-routing.md): create a disposable parent/child chain and verify the exact work and predecessor links. |
-| Work-item priority, metadata/body updates, direct delivery owner, and delivery-scope responsibility | [Work and routing](work-routing.md): patch and read back values; set and read back scoped responsibility revisions. |
+| Spawn attached to a work item and assignment `--succeeds` dependency | [Work and routing](work-routing.md): create a disposable parent/child chain and verify the exact work and predecessor links. |
+| Work-item priority, metadata/body updates, and direct delivery owner | [Work and routing](work-routing.md): patch and read back values, including setting and clearing the direct owner. |
 | Condition payload and default priority | [Work and routing](work-routing.md): publish/read a scoped fact payload and set/read the org's test-only priority default. |
 | Session PO association and session reparenting | [Work and routing](work-routing.md): use disposable sessions and a sole open assignment; verify the resulting exact association/parent. |
 | Assignment stop, reopen, repair, commit-ref correction, and stale-turn settlement | [Decisions and assignments](decisions-assignments.md): use only a deliberately created disposable turn or genuine failure and verify the terminal/readback state. |
