@@ -1648,14 +1648,15 @@ defmodule Tightbeam.AdapterCoordinatorTest do
       start_supervised!({DelayedDbProxy, db: ctx.db, delay_ms: 500, owner: self()})
 
     :sys.replace_state(coordinator, fn state -> %{state | db: proxy} end)
-    started_at = System.monotonic_time(:millisecond)
 
     log =
       ExUnit.CaptureLog.capture_log(fn ->
+        started_at = System.monotonic_time(:millisecond)
         assert :ok = GenServer.stop(coordinator, :shutdown, 5_000)
+        send(self(), {:shutdown_elapsed_ms, System.monotonic_time(:millisecond) - started_at})
       end)
 
-    elapsed_ms = System.monotonic_time(:millisecond) - started_at
+    assert_received {:shutdown_elapsed_ms, elapsed_ms}
     assert elapsed_ms < 1_000
     assert_receive {:delayed_db_proxy_done, 2}, 1_000
     assert log =~ "durable outcomes unresolved"
