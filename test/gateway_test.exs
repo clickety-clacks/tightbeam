@@ -3108,6 +3108,7 @@ defmodule Tightbeam.GatewayTest do
 
     :ok = Tightbeam.Firehose.Hub.delivered(Tightbeam.Firehose.Hub, self())
     :sys.get_state(Tightbeam.Firehose.Hub)
+    refute_receive {:firehose_notice, %{"class" => "session.harness_changed"}}, 0
     refute_receive {:firehose_notice, %{"class" => "session.updated"}}, 0
 
     rest_opts =
@@ -3160,13 +3161,13 @@ defmodule Tightbeam.GatewayTest do
     assert tombstone.marker == %{
              kind: "harness-switch",
              from: "claude (before-model)",
-             to: "codex (gpt-5.6-sol)"
+             to: "codex (gpt-5.6-sol (effort medium))"
            }
 
     # It names the change, both ends of it, and that nothing was deleted.
     assert tombstone.content =~ "[engine swap]"
     assert tombstone.content =~ "claude (before-model)"
-    assert tombstone.content =~ "codex (gpt-5.6-sol)"
+    assert tombstone.content =~ "codex (gpt-5.6-sol (effort medium))"
     assert tombstone.content =~ "RETAINED"
     assert tombstone.content =~ "not deleted"
     assert tombstone.content =~ "expected"
