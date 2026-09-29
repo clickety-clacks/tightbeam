@@ -24,7 +24,8 @@ defmodule Tightbeam.HarnessHealth do
     Ledger,
     Org,
     Wire.Payloads,
-    Projection
+    Projection,
+    Wakes
   }
 
   alias Tightbeam.DB.Txn
@@ -34,6 +35,10 @@ defmodule Tightbeam.HarnessHealth do
     interrupted-outcome-unknown
   )
   @other_failure_class "other"
+  @redeliverable_failure_classes ~w(
+    auth-dead rate-limit-dead adapter_unavailable model_unavailable task_crash
+    interrupted-outcome-unknown
+  )
   @prod_shape_consumers ["assignment_prodder"]
   @failure_evidence ~w(authoritative-provider terminal-failure)
   @evidence_window_ms 120_000
@@ -991,12 +996,84 @@ defmodule Tightbeam.HarnessHealth do
     end
   end
 
+  # Health classification retains legacy text fallback for incident diagnosis.
+  # A replay uses the typed class only when it matches that diagnosis; otherwise
+  # the terminal failure takes the bounded unclassified-recovery path. Assistant
+  # output never reaches this function.
+  defp typed_redelivery_failure_class(:task_crash), do: "task_crash"
+  defp typed_redelivery_failure_class({:task_crash, _}), do: "task_crash"
+
+  defp typed_redelivery_failure_class(:interrupted_outcome_unknown),
+    do: "interrupted-outcome-unknown"
+
+  defp typed_redelivery_failure_class({:interrupted_outcome_unknown, _}),
+    do: "interrupted-outcome-unknown"
+
+  defp typed_redelivery_failure_class({:adapter_unavailable, _}), do: "adapter_unavailable"
+  defp typed_redelivery_failure_class(:adapter_unavailable), do: "adapter_unavailable"
+  defp typed_redelivery_failure_class(:model_unavailable), do: "model_unavailable"
+
+  defp typed_redelivery_failure_class(%{code: code} = reason)
+       when code in ["adapter_unavailable", "model_unavailable"],
+       do: classify_turn_failure(reason)
+
+  defp typed_redelivery_failure_class(%{"code" => code} = reason)
+       when code in ["adapter_unavailable", "model_unavailable"],
+       do: classify_turn_failure(reason)
+
+  defp typed_redelivery_failure_class(%{"status" => status} = reason)
+       when status in [401, 429],
+       do: classify_turn_failure(reason)
+
+  defp typed_redelivery_failure_class(%{status: status} = reason)
+       when status in [401, 429],
+       do: classify_turn_failure(reason)
+
+  defp typed_redelivery_failure_class(%{"status_code" => status} = reason)
+       when status in [401, 429],
+       do: classify_turn_failure(reason)
+
+  defp typed_redelivery_failure_class(%{status_code: status} = reason)
+       when status in [401, 429],
+       do: classify_turn_failure(reason)
+
+  defp typed_redelivery_failure_class(%{"statusCode" => status} = reason)
+       when status in [401, 429],
+       do: classify_turn_failure(reason)
+
+  defp typed_redelivery_failure_class(%{statusCode: status} = reason)
+       when status in [401, 429],
+       do: classify_turn_failure(reason)
+
+  defp typed_redelivery_failure_class(%{"data" => %{"codexErrorInfo" => "usageLimitExceeded"}}),
+    do: "rate-limit-dead"
+
+  defp typed_redelivery_failure_class(%{"data" => %{"errorKind" => "rate_limit"}}),
+    do: "rate-limit-dead"
+
+  defp typed_redelivery_failure_class(%{"message" => message, "data" => data} = reason)
+       when is_binary(message) and is_map(data) do
+    case classify_turn_failure(reason) do
+      # This class is admitted only from the protocol's typed carrier above.
+      # Text inside a generic error map is not enough to authorize a replay.
+      "interrupted-outcome-unknown" -> nil
+      failure_class when failure_class in @redeliverable_failure_classes -> failure_class
+      _ -> nil
+    end
+  end
+
+  defp typed_redelivery_failure_class(_reason), do: nil
+
   @doc "Record classified turn-failure evidence inside the turn's terminal transaction."
   @spec observe_turn_failure_in_txn(Txn.t(), map(), map(), term(), term()) ::
           nil | (-> :ok)
   def observe_turn_failure_in_txn(%Txn{} = txn, session, turn, failed_stage, reason) do
     case classify_turn_failure(reason) do
       nil ->
+        # The terminal failure path has no assistant output. Preserve a
+        # message-bearing unclassified failure so the next successful turn on
+        # this harness and host can act as the bounded recovery signal.
+        Wakes.record_health_redelivery_source_in_txn(txn, turn.seq, "unclassified")
         nil
 
       failure_class ->
@@ -1029,6 +1106,18 @@ defmodule Tightbeam.HarnessHealth do
             cause: "stage=#{failed_stage} reason=#{evidence_text(reason)}",
             principal: turn.origin || "process:tightbeam"
           })
+
+        redelivery_failure_class =
+          case typed_redelivery_failure_class(reason) do
+            ^failure_class -> failure_class
+            _ -> "unclassified"
+          end
+
+        Wakes.record_health_redelivery_source_in_txn(
+          txn,
+          turn.seq,
+          redelivery_failure_class
+        )
 
         post_commit(result)
     end
@@ -1073,6 +1162,10 @@ defmodule Tightbeam.HarnessHealth do
             principal: principal
           })
 
+        if failure_class in @redeliverable_failure_classes do
+          Wakes.record_health_redelivery_source_in_txn(txn, seq, failure_class)
+        end
+
         post_commit(result)
 
       [] ->
@@ -1088,14 +1181,13 @@ defmodule Tightbeam.HarnessHealth do
     Txn.q(
       txn,
       """
-      SELECT failureClass FROM harness_health_incidents
+      SELECT id,failureClass FROM harness_health_incidents
       WHERE harness=?1 AND host=?2 AND state='open'
       ORDER BY failureClass
       """,
       [harness, session.host]
     )
-    |> List.flatten()
-    |> Enum.each(fn failure_class ->
+    |> Enum.each(fn [incident_id, failure_class] ->
       input = %{
         correlation_id: "harness-turn:#{turn.seq}:normal-success:#{failure_class}",
         harness: harness,
@@ -1109,9 +1201,17 @@ defmodule Tightbeam.HarnessHealth do
       }
 
       if failure_class != @other_failure_class do
-        resolve_in_txn(txn, input)
+        case resolve_in_txn(txn, input) do
+          {:resolved, _incident} when failure_class in @redeliverable_failure_classes ->
+            Wakes.redeliver_failed_intent_in_txn(txn, incident_id, failure_class, turn)
+
+          _ ->
+            :ok
+        end
       end
     end)
+
+    Wakes.redeliver_pending_health_intents_in_txn(txn, session, turn)
 
     :ok
   end
@@ -2484,6 +2584,9 @@ defmodule Tightbeam.HarnessHealth do
   end
 
   defp observation_identity(observation) do
+    # observed_at records when this report was received, not which evidence
+    # event it describes. Replaying the same correlation naturally has a newer
+    # timestamp and must remain idempotent.
     base =
       Map.take(observation, [
         :correlation_id,
@@ -2493,7 +2596,6 @@ defmodule Tightbeam.HarnessHealth do
         :evidence_kind,
         :session_key,
         :assignment_id,
-        :observed_at,
         :cause,
         :principal
       ])
@@ -4058,7 +4160,7 @@ defmodule Tightbeam.HarnessHealth do
   @spec resume_other_routes(DB.server()) :: :ok
   def resume_other_routes(db \\ DB) do
     publications =
-      transaction!(db, fn txn ->
+      transaction_with_row_commits!(db, fn txn ->
         marked =
           Txn.q(
             txn,
@@ -4191,6 +4293,16 @@ defmodule Tightbeam.HarnessHealth do
 
   defp transaction!(db, fun) do
     case DB.transaction(db, fun) do
+      {:ok, result} -> result
+      {:error, error} -> raise error
+    end
+  end
+
+  defp transaction_with_row_commits!(db, fun) do
+    case DB.transaction_then(db, fun, fn txn, result ->
+           Tightbeam.Wakes.row_commit_in_txn(txn, [])
+           result
+         end) do
       {:ok, result} -> result
       {:error, error} -> raise error
     end

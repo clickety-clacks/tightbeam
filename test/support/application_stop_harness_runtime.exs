@@ -137,6 +137,23 @@ await.(
 {escape_pid, ""} = Integer.parse(escape_pid)
 {escape_pgid, ""} = Integer.parse(escape_pgid)
 
+# The helper publishes authority after setsid but before exec. The cleanup walk
+# follows detached descendants too, so stopping here could capture its old
+# Darwin audit-token image and correctly refuse a signal after exec.
+await.(
+  await,
+  fn ->
+    case System.cmd("/bin/ps", ["-p", Integer.to_string(escape_pid), "-o", "comm="],
+           stderr_to_stdout: true
+         ) do
+      {command, 0} -> Path.basename(String.trim(command)) == "sleep"
+      {_output, _status} -> false
+    end
+  end,
+  1_500,
+  "escape descendant did not exec sleep"
+)
+
 [row] = HarnessProcess.list(DB)
 true = row.state == "running"
 true = row.process_group_id != escape_pgid

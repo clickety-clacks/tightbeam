@@ -190,6 +190,19 @@ defmodule Tightbeam.Ledger do
       [[seq]] = Txn.q(txn, "SELECT last_insert_rowid()")
       :ok = QueuedMessageSuppression.record_in_txn(txn, seq, attrs)
       QueuedMessageSuppression.replace_own_queued_in_txn(txn, seq, attrs)
+
+      if transition =
+           turn_row_commit_transition_in_txn(
+             txn,
+             seq,
+             "queued_turn",
+             nil,
+             "queued",
+             attrs.origin
+           ) do
+        DB.record_row_commit(txn, transition)
+      end
+
       Org.sync_mechanical_status_in_txn(txn, session_key)
       {:ok, seq}
     else
@@ -215,7 +228,14 @@ defmodule Tightbeam.Ledger do
   @spec enqueue(db(), map()) ::
           {:ok, integer()} | {:error, :duplicate_wake | :no_session | term()}
   def enqueue(db \\ Tightbeam.DB, attrs) do
-    case DB.transaction(db, fn txn -> enqueue_in_txn(txn, attrs) end) do
+    case DB.transaction_then(
+           db,
+           fn txn -> enqueue_in_txn(txn, attrs) end,
+           fn txn, result ->
+             Tightbeam.Wakes.row_commit_in_txn(txn, [])
+             result
+           end
+         ) do
       {:ok, {:ok, seq}} ->
         {:ok, seq}
 
@@ -351,22 +371,29 @@ defmodule Tightbeam.Ledger do
   @spec repair_terminal(db(), integer(), String.t(), String.t(), String.t()) ::
           {:ok, {:appended | :duplicate, integer(), String.t()}} | {:error, atom() | term()}
   def repair_terminal(db \\ Tightbeam.DB, source_seq, assignment_id, repair_key, principal) do
-    case DB.transaction(db, fn txn ->
-           case Txn.q(
-                  txn,
-                  """
-                  SELECT attemptSeq,id FROM turn_repair_attempts
-                  WHERE assignmentId=?1 AND repairKey=?2
-                  """,
-                  [assignment_id, repair_key]
-                ) do
-             [[attempt_seq, attempt_id]] ->
-               {:duplicate, attempt_seq, attempt_id}
+    case DB.transaction_then(
+           db,
+           fn txn ->
+             case Txn.q(
+                    txn,
+                    """
+                    SELECT attemptSeq,id FROM turn_repair_attempts
+                    WHERE assignmentId=?1 AND repairKey=?2
+                    """,
+                    [assignment_id, repair_key]
+                  ) do
+               [[attempt_seq, attempt_id]] ->
+                 {:duplicate, attempt_seq, attempt_id}
 
-             [] ->
-               append_repair_attempt(txn, source_seq, assignment_id, repair_key, principal)
+               [] ->
+                 append_repair_attempt(txn, source_seq, assignment_id, repair_key, principal)
+             end
+           end,
+           fn txn, result ->
+             Tightbeam.Wakes.row_commit_in_txn(txn, [])
+             result
            end
-         end) do
+         ) do
       {:ok, {:error, reason}} -> {:error, reason}
       {:ok, result} -> {:ok, result}
       {:error, error} -> {:error, error}
@@ -478,102 +505,121 @@ defmodule Tightbeam.Ledger do
     now = System.system_time(:millisecond)
 
     {:ok, result} =
-      DB.transaction(db, fn txn ->
-        running =
-          Txn.q(
-            txn,
-            "SELECT seq FROM turns WHERE sessionKey = ?1 AND status = 'running' LIMIT 1",
-            [session_key]
-          )
-
-        case running do
-          [_ | _] ->
-            :busy
-
-          [] ->
-            QueuedMessageSuppression.suppress_before_claim_in_txn(txn, session_key)
-
-            selected_mind =
-              case Txn.q(
-                     txn,
-                     """
-                     SELECT model, thinkingLevel, modelContext, harness
-                     FROM sessions WHERE sessionKey = ?1
-                     """,
-                     [session_key]
-                   ) do
-                [[model, effort, context, harness]] -> {model, effort, context, harness}
-                [] -> {nil, nil, nil, nil}
-              end
-
+      DB.transaction_then(
+        db,
+        fn txn ->
+          running =
             Txn.q(
               txn,
-              """
-                UPDATE turns
-                SET status = 'running', owner = ?2, startedAt = ?3,
-                    model = ?4, harness = ?5, thinkingLevel = ?6, modelContext = ?7
-                WHERE seq = (SELECT t.seq FROM turns AS t
-                             WHERE t.sessionKey = ?1 AND t.status = 'queued'
-                               AND EXISTS (
-                                 SELECT 1 FROM sessions AS s
-                                 WHERE s.sessionKey = t.sessionKey AND s.state = 'active'
-                               )
-                             ORDER BY seq LIMIT 1)
-                  AND status = 'queued'
-              """,
-              [
-                session_key,
-                owner,
-                now,
-                elem(selected_mind, 0),
-                elem(selected_mind, 3),
-                elem(selected_mind, 1),
-                elem(selected_mind, 2)
-              ]
+              "SELECT seq FROM turns WHERE sessionKey = ?1 AND status = 'running' LIMIT 1",
+              [session_key]
             )
 
-            if Txn.changes(txn) == 1 do
-              [[seq, message_id, origin, prompt, wake_id]] =
-                Txn.q(
-                  txn,
-                  """
-                    SELECT seq, messageId, origin, prompt, wakeId FROM turns
-                    WHERE sessionKey = ?1 AND status = 'running'
-                  """,
-                  [session_key]
-                )
+          case running do
+            [_ | _] ->
+              :busy
 
-              owner_lease =
-                "ol_" <> Base.url_encode64(:crypto.strong_rand_bytes(24), padding: false)
+            [] ->
+              QueuedMessageSuppression.suppress_before_claim_in_txn(txn, session_key)
 
-              TurnLifecycle.append_in_txn(txn, seq, %{
-                event_key: "claimed",
-                producer_event_id: "ledger:claimed",
-                kind: "claimed",
-                cause: "session-lane:claim",
-                principal: "process:tightbeam",
-                owner_lease: owner_lease,
-                detail: %{v: 1, owner: owner},
-                at: now
-              })
+              selected_mind =
+                case Txn.q(
+                       txn,
+                       """
+                       SELECT model, thinkingLevel, modelContext, harness
+                       FROM sessions WHERE sessionKey = ?1
+                       """,
+                       [session_key]
+                     ) do
+                  [[model, effort, context, harness]] -> {model, effort, context, harness}
+                  [] -> {nil, nil, nil, nil}
+                end
 
-              Publisher.turn_in_txn(txn, "turn.started", seq)
-              Org.sync_mechanical_status_in_txn(txn, session_key)
+              Txn.q(
+                txn,
+                """
+                  UPDATE turns
+                  SET status = 'running', owner = ?2, startedAt = ?3,
+                      model = ?4, harness = ?5, thinkingLevel = ?6, modelContext = ?7
+                  WHERE seq = (SELECT t.seq FROM turns AS t
+                               WHERE t.sessionKey = ?1 AND t.status = 'queued'
+                                 AND EXISTS (
+                                   SELECT 1 FROM sessions AS s
+                                   WHERE s.sessionKey = t.sessionKey AND s.state = 'active'
+                                 )
+                               ORDER BY seq LIMIT 1)
+                    AND status = 'queued'
+                """,
+                [
+                  session_key,
+                  owner,
+                  now,
+                  elem(selected_mind, 0),
+                  elem(selected_mind, 3),
+                  elem(selected_mind, 1),
+                  elem(selected_mind, 2)
+                ]
+              )
 
-              {:ok,
-               %{
-                 seq: seq,
-                 message_id: message_id,
-                 origin: origin,
-                 prompt: prompt,
-                 wake_id: wake_id,
-                 owner_lease: owner_lease
-               }}
-            else
-              no_claim(txn, session_key)
-            end
+              if Txn.changes(txn) == 1 do
+                [[seq, message_id, origin, prompt, wake_id]] =
+                  Txn.q(
+                    txn,
+                    """
+                      SELECT seq, messageId, origin, prompt, wakeId FROM turns
+                      WHERE sessionKey = ?1 AND status = 'running'
+                    """,
+                    [session_key]
+                  )
+
+                owner_lease =
+                  "ol_" <> Base.url_encode64(:crypto.strong_rand_bytes(24), padding: false)
+
+                TurnLifecycle.append_in_txn(txn, seq, %{
+                  event_key: "claimed",
+                  producer_event_id: "ledger:claimed",
+                  kind: "claimed",
+                  cause: "session-lane:claim",
+                  principal: "process:tightbeam",
+                  owner_lease: owner_lease,
+                  detail: %{v: 1, owner: owner},
+                  at: now
+                })
+
+                if transition =
+                     turn_row_commit_transition_in_txn(
+                       txn,
+                       seq,
+                       "running_turn",
+                       "queued",
+                       "running",
+                       "process:tightbeam"
+                     ) do
+                  DB.record_row_commit(txn, transition)
+                end
+
+                Publisher.turn_in_txn(txn, "turn.started", seq)
+                Org.sync_mechanical_status_in_txn(txn, session_key)
+
+                {:ok,
+                 %{
+                   seq: seq,
+                   message_id: message_id,
+                   origin: origin,
+                   prompt: prompt,
+                   wake_id: wake_id,
+                   owner_lease: owner_lease
+                 }}
+              else
+                no_claim(txn, session_key)
+              end
+          end
+        end,
+        fn txn, result ->
+          Tightbeam.Wakes.row_commit_in_txn(txn, [])
+          result
         end
-      end)
+      )
 
     result
   end
@@ -822,6 +868,48 @@ defmodule Tightbeam.Ledger do
           principal: origin,
           bindings: %{assignmentId: assignment_id, workItemId: work_item_id},
           field: %{name: "status", old: old_status, new: terminal}
+        }
+
+      [] ->
+        nil
+    end
+  end
+
+  defp turn_row_commit_transition_in_txn(
+         txn,
+         seq,
+         domain,
+         old_status,
+         new_status,
+         principal
+       ) do
+    # The runtime consumes this transient event after commit and recomputes its
+    # queue or session facts from the durable row.
+    case Txn.q(
+           txn,
+           """
+           SELECT t.sessionKey,t.wakeId,t.origin,t.assignmentId,a.workItemId,s.ownerUserId
+           FROM turns t
+           JOIN sessions s ON s.sessionKey=t.sessionKey
+           LEFT JOIN assignments a ON a.id=t.assignmentId
+           WHERE t.seq=?1 AND t.status=?2
+           """,
+           [seq, new_status]
+         ) do
+      [[session_key, wake_id, origin, assignment_id, work_item_id, owner_user_id]] ->
+        %{
+          verb: if(is_binary(wake_id), do: "wake", else: "post"),
+          domain: domain,
+          row_id: seq,
+          owner_user_id: owner_user_id,
+          principal: principal,
+          bindings: %{
+            sessionKey: session_key,
+            callerOrigin: origin,
+            assignmentId: assignment_id,
+            workItemId: work_item_id
+          },
+          field: %{name: "status", old: old_status, new: new_status}
         }
 
       [] ->

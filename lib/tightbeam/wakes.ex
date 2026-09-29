@@ -205,11 +205,56 @@ defmodule Tightbeam.Wakes do
     ON wake_retry_attempts (rootWakeId, attempt);
   """
 
+  # AC4's retry guard is current-build storage. Do not install it during the
+  # historical bootstrap pass: a later predecessor migration may refuse, and
+  # that refusal must leave the predecessor's object set intact.
+  @health_redelivery_ddl """
+  CREATE TABLE IF NOT EXISTS health_redelivery_attempts (
+    idempotencyKey TEXT PRIMARY KEY CHECK(length(trim(idempotencyKey)) > 0),
+    sessionKey TEXT NOT NULL CHECK(length(trim(sessionKey)) > 0),
+    sourceHarness TEXT NOT NULL CHECK(length(trim(sourceHarness)) > 0),
+    sourceHost TEXT NOT NULL CHECK(length(trim(sourceHost)) > 0),
+    sourceMessageId TEXT NOT NULL CHECK(length(trim(sourceMessageId)) > 0),
+    sourceTurnSeq INTEGER NOT NULL REFERENCES turns(seq),
+    sourceWakeId TEXT,
+    origin TEXT NOT NULL CHECK(length(trim(origin)) > 0),
+    prompt TEXT NOT NULL,
+    roleRef TEXT,
+    roleFallback INTEGER NOT NULL CHECK(roleFallback IN (0,1)),
+    assignmentId TEXT,
+    jobRef TEXT,
+    requestRef TEXT,
+    failureClass TEXT NOT NULL CHECK(failureClass IN (
+      'auth-dead','rate-limit-dead','adapter_unavailable','model_unavailable','task_crash',
+      'interrupted-outcome-unknown','unclassified'
+    )),
+    parentSessionKey TEXT REFERENCES sessions(sessionKey),
+    restorationTurnSeq INTEGER REFERENCES turns(seq),
+    redeliveryTurnSeq INTEGER UNIQUE REFERENCES turns(seq),
+    createdAt INTEGER NOT NULL CHECK(createdAt >= 0),
+    UNIQUE(sessionKey, sourceTurnSeq),
+    UNIQUE(sessionKey, sourceMessageId),
+    CHECK((restorationTurnSeq IS NULL) = (redeliveryTurnSeq IS NULL))
+  );
+  CREATE INDEX IF NOT EXISTS health_redelivery_pending
+    ON health_redelivery_attempts (sourceHarness, sourceHost, sourceTurnSeq)
+    WHERE redeliveryTurnSeq IS NULL;
+  """
+
   @retry_base_ms 30_000
   @retry_ceiling_ms 30 * 60_000
 
   @spec ensure_schema(db()) :: :ok | {:error, term()}
   def ensure_schema(db \\ Tightbeam.DB) do
+    with :ok <- ensure_historical_schema(db),
+         :ok <- DB.execute(db, @health_redelivery_ddl) do
+      :ok
+    end
+  end
+
+  @doc false
+  @spec ensure_historical_schema(db()) :: :ok | {:error, term()}
+  def ensure_historical_schema(db \\ Tightbeam.DB) do
     with :ok <- DB.execute(db, @ddl) do
       if RuleRuntime.loaded?(), do: activate_wait_recognition(db), else: :ok
     end
@@ -2917,29 +2962,44 @@ defmodule Tightbeam.Wakes do
   defp deliver_rule_notice_in_txn(txn, rule, call, evidence) do
     case RuleRuntime.resolve_notice_in_txn(txn, rule, call) do
       {:ok, resolved} ->
-        wake =
-          schedule_in_txn(txn, %{
+        wake_id = rule_notice_wake_id(rule, resolved)
+
+        if is_binary(wake_id) and
+             Txn.q(
+               txn,
+               "SELECT 1 FROM wakes WHERE wakeId=?1 AND origin=?2",
+               [wake_id, "remedy:#{rule.name}"]
+             ) != [] do
+          :ok
+        else
+          input = %{
             session_key: resolved.bound_session,
             target_role: resolved.target[:target_role],
             origin: "remedy:#{rule.name}",
             prompt: resolved.params.prompt,
             due_at: System.system_time(:millisecond),
             creator_session_key: principal_session(call.principal),
+            assignment_id: resolved[:assignment_id] || Map.get(call.params, :assignment_id),
+            work_item_id: resolved[:work_item_id] || Map.get(call.params, :work_item_id),
             summon: true
-          })
+          }
 
-        EventLog.lifecycle_in_txn(
-          txn,
-          "rule_notice",
-          wake.wake_id,
-          JSON.encode!(%{
-            rule: rule.name,
-            edge: rule_edge(call),
-            cause: Map.get(call, :transition),
-            principal: call.origin,
-            evidence: Enum.map(evidence, fn {fact, value} -> %{fact: fact, value: value} end)
-          })
-        )
+          input = if is_binary(wake_id), do: Map.put(input, :wake_id, wake_id), else: input
+          wake = schedule_in_txn(txn, input)
+
+          EventLog.lifecycle_in_txn(
+            txn,
+            "rule_notice",
+            wake.wake_id,
+            JSON.encode!(%{
+              rule: rule.name,
+              edge: rule_edge(call),
+              cause: Map.get(call, :transition),
+              principal: call.origin,
+              evidence: Enum.map(evidence, fn {fact, value} -> %{fact: fact, value: value} end)
+            })
+          )
+        end
 
         :ok
 
@@ -2947,6 +3007,19 @@ defmodule Tightbeam.Wakes do
         raise "notice #{rule.name} has unresolved target: #{inspect(reason)}"
     end
   end
+
+  defp rule_notice_wake_id(_rule, %{idempotency_key: nil}), do: nil
+
+  defp rule_notice_wake_id(rule, %{bound_session: session_key, idempotency_key: key})
+       when is_binary(session_key) and is_binary(key) do
+    digest =
+      :crypto.hash(:sha256, rule.name <> "\0" <> session_key <> "\0" <> key)
+      |> Base.encode16(case: :lower)
+
+    "w_rule_" <> digest
+  end
+
+  defp rule_notice_wake_id(_rule, _resolved), do: nil
 
   defp principal_session({:session, session_key}), do: session_key
   defp principal_session(_principal), do: nil
@@ -2979,6 +3052,352 @@ defmodule Tightbeam.Wakes do
       _ ->
         :not_wake
     end
+  end
+
+  @doc false
+  @spec record_health_redelivery_source_in_txn(Txn.t(), integer(), String.t()) :: :ok
+  def record_health_redelivery_source_in_txn(%Txn{} = txn, source_turn_seq, failure_class)
+      when is_integer(source_turn_seq) and
+             failure_class in [
+               "auth-dead",
+               "rate-limit-dead",
+               "adapter_unavailable",
+               "model_unavailable",
+               "task_crash",
+               "interrupted-outcome-unknown",
+               "unclassified"
+             ] do
+    case Txn.q(
+           txn,
+           """
+           SELECT t.sessionKey,t.messageId,t.wakeId,t.origin,t.prompt,t.roleRef,t.roleFallback,
+                  t.assignmentId,t.jobRef,t.requestRef,s.harness,s.host
+           FROM turns t JOIN sessions s ON s.sessionKey=t.sessionKey
+           WHERE t.seq=?1 AND t.messageId IS NOT NULL
+             AND (t.status='failed' OR
+                  (t.status='failed_unknown' AND ?2='interrupted-outcome-unknown'))
+           """,
+           [source_turn_seq, failure_class]
+         ) do
+      [
+        [
+          session_key,
+          message_id,
+          wake_id,
+          origin,
+          prompt,
+          role_ref,
+          role_fallback,
+          assignment_id,
+          job_ref,
+          request_ref,
+          source_harness,
+          source_host
+        ]
+      ]
+      when is_binary(source_harness) and is_binary(source_host) ->
+        idempotency_key = health_redelivery_key(session_key, source_turn_seq)
+
+        parent_session_key =
+          if failure_class == "interrupted-outcome-unknown" do
+            interrupted_redelivery_parent_in_txn(txn, session_key, assignment_id)
+          end
+
+        Txn.q(
+          txn,
+          """
+          INSERT OR IGNORE INTO health_redelivery_attempts
+            (idempotencyKey,sessionKey,sourceHarness,sourceHost,sourceMessageId,sourceTurnSeq,
+             sourceWakeId,origin,prompt,roleRef,roleFallback,assignmentId,jobRef,requestRef,
+             failureClass,parentSessionKey,createdAt)
+          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
+          """,
+          [
+            idempotency_key,
+            session_key,
+            source_harness,
+            source_host,
+            message_id,
+            source_turn_seq,
+            wake_id,
+            origin,
+            prompt,
+            role_ref,
+            role_fallback,
+            assignment_id,
+            job_ref,
+            request_ref,
+            failure_class,
+            parent_session_key,
+            now()
+          ]
+        )
+
+        if Txn.changes(txn) == 1 and is_binary(parent_session_key) do
+          ask_interrupted_redelivery_parent_in_txn(
+            txn,
+            parent_session_key,
+            session_key,
+            source_turn_seq,
+            message_id,
+            origin,
+            prompt
+          )
+        end
+
+        :ok
+
+      [] ->
+        :ok
+
+      [_] ->
+        :ok
+    end
+  end
+
+  defp interrupted_redelivery_parent_in_txn(txn, source_session_key, assignment_id) do
+    assignment_parent =
+      if is_binary(assignment_id) do
+        case Txn.q(
+               txn,
+               """
+               SELECT parent.sessionKey
+               FROM assignments assignment
+               JOIN sessions parent ON parent.sessionKey=assignment.openedBySession
+               WHERE assignment.id=?1 AND parent.state='active'
+                 AND parent.sessionKey!=?2
+               """,
+               [assignment_id, source_session_key]
+             ) do
+          [[parent_session_key]] -> parent_session_key
+          _ -> nil
+        end
+      end
+
+    assignment_parent ||
+      case Txn.q(
+             txn,
+             """
+             SELECT parent.sessionKey
+             FROM sessions source
+             JOIN sessions parent
+               ON parent.sessionKey=#{Tightbeam.Org.current_parent_sql("source")}
+             WHERE source.sessionKey=?1 AND parent.state='active'
+               AND parent.sessionKey!=source.sessionKey
+             """,
+             [source_session_key]
+           ) do
+        [[parent_session_key]] -> parent_session_key
+        _ -> nil
+      end
+  end
+
+  defp ask_interrupted_redelivery_parent_in_txn(
+         txn,
+         parent_session_key,
+         source_session_key,
+         source_turn_seq,
+         message_id,
+         origin,
+         original_prompt
+       ) do
+    wake_id = "w_health_redelivery_parent_#{source_turn_seq}"
+
+    prompt =
+      "A turn in session #{source_session_key} ended with typed " <>
+        "interrupted-outcome-unknown. No automatic retry was queued. " <>
+        "Should the original message be redelivered?\n" <>
+        "Source turn: #{source_turn_seq}; message: #{message_id}; sender: #{origin}.\n" <>
+        "Original message:\n#{original_prompt}\n" <>
+        "If you want it retried, use the ordinary dispatch path for that session; " <>
+        "otherwise leave the failed turn unchanged."
+
+    schedule_in_txn(txn, %{
+      wake_id: wake_id,
+      session_key: parent_session_key,
+      origin: "health-redelivery-parent",
+      prompt: prompt,
+      due_at: now(),
+      summon: true
+    })
+  end
+
+  @doc false
+  @spec redeliver_pending_health_intents_in_txn(Txn.t(), map(), map()) :: non_neg_integer()
+  def redeliver_pending_health_intents_in_txn(%Txn{} = txn, session, turn)
+      when is_map(session) and is_map(turn) do
+    harness = to_string(session.harness)
+    host = session.host
+    restoration_turn_seq = Map.fetch!(turn, :seq)
+
+    if is_binary(host) and String.trim(host) != "" do
+      Txn.q(
+        txn,
+        """
+        SELECT a.idempotencyKey,a.sessionKey,a.sourceMessageId,a.sourceTurnSeq,
+               a.sourceWakeId,a.origin,a.prompt,a.roleRef,a.roleFallback,a.assignmentId,
+               a.jobRef,a.requestRef
+        FROM health_redelivery_attempts a
+        WHERE a.sourceHarness=?1
+          AND a.sourceHost=?2
+          AND a.redeliveryTurnSeq IS NULL
+          AND a.parentSessionKey IS NULL
+          AND NOT EXISTS (
+            SELECT 1
+            FROM harness_health_observations observation
+            JOIN harness_health_incidents incident ON incident.id=observation.incidentId
+            WHERE observation.correlationId =
+              'harness-turn:' || a.sourceTurnSeq || ':' || a.failureClass
+              AND observation.evidenceKind='terminal-failure'
+              AND incident.state='open'
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM wake_retry_attempts retry
+            WHERE retry.sourceTurnSeq=a.sourceTurnSeq AND retry.retryWakeId IS NOT NULL
+          )
+        ORDER BY a.sourceTurnSeq
+        """,
+        [harness, host]
+      )
+      |> Enum.reduce(0, fn source, count ->
+        count + redeliver_health_source_in_txn(txn, source, restoration_turn_seq)
+      end)
+    else
+      0
+    end
+  end
+
+  @doc false
+  @spec redeliver_failed_intent_in_txn(Txn.t(), String.t(), String.t(), map()) ::
+          non_neg_integer()
+  def redeliver_failed_intent_in_txn(
+        %Txn{} = txn,
+        incident_id,
+        failure_class,
+        restoration_turn
+      )
+      when is_binary(incident_id) and
+             failure_class in [
+               "auth-dead",
+               "rate-limit-dead",
+               "adapter_unavailable",
+               "model_unavailable",
+               "task_crash",
+               "interrupted-outcome-unknown"
+             ] and is_map(restoration_turn) do
+    restoration_turn_seq = Map.fetch!(restoration_turn, :seq)
+
+    restoration_correlation =
+      "harness-turn:#{restoration_turn_seq}:normal-success:#{failure_class}"
+
+    case Txn.q(
+           txn,
+           """
+           SELECT i.state,r.correlationId,r.evidenceKind
+           FROM harness_health_incidents i
+           JOIN harness_health_observations r ON r.id=i.resolutionObservationId
+           WHERE i.id=?1 AND i.failureClass=?2
+           """,
+           [incident_id, failure_class]
+         ) do
+      [["resolved", ^restoration_correlation, "normal-turn-success"]] ->
+        health_redelivery_sources_in_txn(txn, incident_id, failure_class)
+        |> Enum.reduce(0, fn source, count ->
+          count + redeliver_health_source_in_txn(txn, source, restoration_turn_seq)
+        end)
+
+      _ ->
+        0
+    end
+  end
+
+  defp health_redelivery_sources_in_txn(txn, incident_id, failure_class) do
+    Txn.q(
+      txn,
+      """
+      SELECT DISTINCT a.idempotencyKey,a.sessionKey,a.sourceMessageId,a.sourceTurnSeq,
+             a.sourceWakeId,a.origin,a.prompt,a.roleRef,a.roleFallback,a.assignmentId,
+             a.jobRef,a.requestRef
+      FROM harness_health_observations observation
+      JOIN turns observed
+        ON observation.correlationId =
+           'harness-turn:' || observed.seq || ':' || observation.failureClass
+      JOIN health_redelivery_attempts a
+        ON a.sessionKey=observed.sessionKey AND a.sourceMessageId=observed.messageId
+      WHERE observation.incidentId=?1
+        AND observation.failureClass=?2
+        AND observation.evidenceKind='terminal-failure'
+        AND observed.status='failed'
+        AND observed.messageId IS NOT NULL
+        AND a.failureClass=?2
+        AND a.redeliveryTurnSeq IS NULL
+        AND a.parentSessionKey IS NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM wake_retry_attempts retry
+          WHERE retry.sourceTurnSeq=observed.seq AND retry.retryWakeId IS NOT NULL
+        )
+      ORDER BY a.sourceTurnSeq
+      """,
+      [incident_id, failure_class]
+    )
+  end
+
+  defp redeliver_health_source_in_txn(
+         txn,
+         [
+           idempotency_key,
+           session_key,
+           message_id,
+           source_turn_seq,
+           _source_wake_id,
+           origin,
+           prompt,
+           role_ref,
+           role_fallback,
+           assignment_id,
+           job_ref,
+           request_ref
+         ],
+         restoration_turn_seq
+       ) do
+    if Ledger.enqueueable_in_txn?(txn, session_key) do
+      case Ledger.enqueue_in_txn(txn, %{
+             session_key: session_key,
+             message_id: message_id,
+             origin: origin,
+             prompt: prompt,
+             role_ref: role_ref,
+             role_fallback: role_fallback == 1,
+             assignment_id: assignment_id,
+             job_ref: job_ref,
+             request_ref: request_ref
+           }) do
+        {:ok, redelivery_turn_seq} ->
+          Txn.q(
+            txn,
+            """
+            UPDATE health_redelivery_attempts
+            SET restorationTurnSeq=?2,redeliveryTurnSeq=?3
+            WHERE idempotencyKey=?1 AND redeliveryTurnSeq IS NULL
+            """,
+            [idempotency_key, restoration_turn_seq, redelivery_turn_seq]
+          )
+
+          if Txn.changes(txn) != 1,
+            do: raise("health redelivery attempt lost its enqueue")
+
+          1
+
+        {:error, :no_session} ->
+          0
+      end
+    else
+      0
+    end
+  end
+
+  defp health_redelivery_key(session_key, source_turn_seq) do
+    "health-redelivery:" <> JSON.encode!([session_key, source_turn_seq])
   end
 
   defp preserve_wake_terminal_in_txn(txn, turn, wake_id, failure_class) do
@@ -5697,7 +6116,14 @@ defmodule Tightbeam.Wakes do
       )
 
     Enum.each(rows, fn [wake_id] ->
-      case DB.transaction(db, fn txn -> deliver_wait_in_txn(txn, wake_id, delivery_opts) end) do
+      case DB.transaction_then(
+             db,
+             fn txn -> deliver_wait_in_txn(txn, wake_id, delivery_opts) end,
+             fn txn, result ->
+               row_commit_in_txn(txn, [])
+               result
+             end
+           ) do
         {:ok, {:delivery, delivery}} -> Gateway.complete_delivery(db, delivery)
         {:ok, _} -> :ok
         {:error, error} -> raise error
@@ -6220,12 +6646,19 @@ defmodule Tightbeam.Wakes do
 
   defp fire_candidate(db, wake_id, fact_id) do
     result =
-      DB.transaction(db, fn txn ->
-        case Txn.q(txn, select_wake_sql() <> " WHERE wakeId = ?1", [wake_id]) do
-          [row] -> fire_in_txn(txn, to_wake(row), fact_id)
-          [] -> :noop
+      DB.transaction_then(
+        db,
+        fn txn ->
+          case Txn.q(txn, select_wake_sql() <> " WHERE wakeId = ?1", [wake_id]) do
+            [row] -> fire_in_txn(txn, to_wake(row), fact_id)
+            [] -> :noop
+          end
+        end,
+        fn txn, result ->
+          row_commit_in_txn(txn, [])
+          result
         end
-      end)
+      )
 
     case result do
       {:ok, {:fired, delivery}} -> Gateway.complete_delivery(db, delivery)

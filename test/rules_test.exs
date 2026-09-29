@@ -11,6 +11,7 @@ defmodule Tightbeam.RulesTest do
     Escalation,
     EventLog,
     Gateway,
+    Ledger,
     Org,
     Roles,
     Rules,
@@ -1862,6 +1863,365 @@ defmodule Tightbeam.RulesTest do
     assert detail =~ ~s("principal":"remedy:assignment-remedy")
   end
 
+  test "row-commit queue facts are scoped to the queued session and caller", ctx do
+    target = session(ctx.db, "queue-fact-target", "flynn", archetype: "coder")
+    other = session(ctx.db, "queue-fact-other", "flynn", archetype: "coder")
+
+    {:ok, oldest_seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: target.session_key,
+        message_id: "queue-fact-oldest",
+        origin: "agent:queue-spammer",
+        prompt: "oldest queued message"
+      })
+
+    {:ok, newer_seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: target.session_key,
+        message_id: "queue-fact-newer",
+        origin: "agent:queue-spammer",
+        prompt: "newer queued message"
+      })
+
+    {:ok, newest_seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: target.session_key,
+        message_id: "queue-fact-other-caller",
+        origin: "user:flynn",
+        prompt: "different caller"
+      })
+
+    {:ok, _other_seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: other.session_key,
+        message_id: "queue-fact-other-session",
+        origin: "agent:queue-spammer",
+        prompt: "different session"
+      })
+
+    now = System.system_time(:millisecond)
+
+    for {seq, age_ms} <- [{oldest_seq, 120_000}, {newer_seq, 60_000}, {newest_seq, 10_000}] do
+      assert {:ok, _} =
+               DB.query(ctx.db, "UPDATE turns SET createdAt=?1 WHERE seq=?2", [now - age_ms, seq])
+    end
+
+    put_raw(ctx, """
+    [[rule]]
+    name = "queue-snapshot"
+    verb = "post"
+    edges = ["row-commit"]
+    effect = "notice"
+    text = "observe queued-turn facts"
+    deny_when = [
+      { fact = "turn.queued_count", op = "eq", value = 3 },
+      { fact = "turn.oldest_age_ms", op = "gte", value = 90000 },
+      { fact = "turn.caller_queued_count", op = "eq", value = 2 }
+    ]
+
+    [rule.notice]
+    target_session = "{session_key}"
+    prompt = "queued by {caller_origin}"
+    """)
+
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    transition = %{
+      verb: "post",
+      domain: "queued_turn",
+      owner_user_id: "flynn",
+      principal: "session:queue-spammer",
+      row_id: "queue-fact-oldest",
+      bindings: %{
+        sessionKey: target.session_key,
+        callerOrigin: "agent:queue-spammer"
+      }
+    }
+
+    assert {:ok, [{:notice, rule, call, facts}]} =
+             DB.transaction(ctx.db, &Rules.row_commit_effects_in_txn(&1, transition))
+
+    assert {"turn.queued_count", 3} in facts
+    assert {"turn.caller_queued_count", 2} in facts
+    assert {"turn.oldest_age_ms", age_ms} = List.keyfind(facts, "turn.oldest_age_ms", 0)
+    assert age_ms >= 120_000
+
+    assert {:ok, {:ok, resolved}} =
+             DB.transaction(ctx.db, &Rules.resolve_notice_in_txn(&1, rule, call))
+
+    assert resolved.bound_session == target.session_key
+    assert resolved.params.prompt == "queued by agent:queue-spammer"
+  end
+
+  test "row-commit notice bindings resolve the assignment opener session", ctx do
+    opener = session(ctx.db, Org.personal_session_key("flynn"), "flynn", kind: "main")
+    holder = session(ctx.db, "opener-binding-holder", "flynn", archetype: "coder")
+    opened = assignment(ctx, holder.session_key, {:user, "flynn"})
+
+    put_raw(ctx, """
+    [[rule]]
+    name = "assignment-opener-binding"
+    verb = "assign"
+    edges = ["row-commit"]
+    effect = "notice"
+    text = "route the notice to the assignment opener"
+    deny_when = [{ fact = "assignment.state", op = "eq", value = "open" }]
+
+    [rule.notice]
+    target_session = "{assignment_opener_session}"
+    prompt = "assignment {assignment_id} opened for {holder_key}"
+    """)
+
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    transition = %{
+      verb: "assign",
+      domain: "assignment",
+      owner_user_id: "flynn",
+      principal: "user:flynn",
+      bindings: %{assignmentId: opened.id}
+    }
+
+    assert {:ok, [{:notice, rule, call, _facts}]} =
+             DB.transaction(ctx.db, &Rules.row_commit_effects_in_txn(&1, transition))
+
+    assert {:ok, {:ok, resolved}} =
+             DB.transaction(ctx.db, &Rules.resolve_notice_in_txn(&1, rule, call))
+
+    assert resolved.bound_session == opener.session_key
+
+    assert resolved.params.prompt ==
+             "assignment #{opened.id} opened for #{holder.session_key}"
+  end
+
+  test "row-commit review-round and completed-fix facts use the subject work item", ctx do
+    {:ok, _} =
+      DB.query(ctx.db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1)")
+
+    work_item_id = "wi_row_commit_rounds"
+    prior_holder = session(ctx.db, "round-prior-holder", "flynn", archetype: "coder")
+    current_holder = session(ctx.db, "round-current-holder", "flynn", archetype: "coder")
+    reviewer = session(ctx.db, "round-reviewer", "flynn", archetype: "reviewer-code")
+
+    prior_fix =
+      assignment(ctx, prior_holder.session_key, {:user, "flynn"}, effect_kind: "coordination")
+
+    attach_work_item(ctx, prior_fix.id, work_item_id)
+
+    assert %{assignment: %{state: "closed"}} =
+             Assignments.__handle__(
+               ctx.db,
+               "attest",
+               p3_call("attest", {:session, prior_holder.session_key}, %{
+                 assignment_id: prior_fix.id,
+                 kind: "completion"
+               })
+             )
+
+    current_fix = assignment(ctx, current_holder.session_key, {:user, "flynn"})
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE assignments SET workItemId = ?2 WHERE id = ?1", [
+        current_fix.id,
+        work_item_id
+      ])
+
+    review = assignment(ctx, reviewer.session_key, {:user, "flynn"}, reviews: current_fix.id)
+    verdict(ctx, reviewer.session_key, review.id, "changes-requested", "first round")
+    verdict(ctx, reviewer.session_key, review.id, "changes-requested", "second round")
+
+    put_raw(ctx, """
+    [[rule]]
+    name = "review-round-count"
+    verb = "attest"
+    edges = ["row-commit"]
+    effect = "notice"
+    text = "observe repeated review rounds"
+    deny_when = [{ fact = "assignment.review_verdict_count", op = "eq", value = 2 }]
+
+    [rule.notice]
+    target_session = "round-reviewer"
+    prompt = "review rounds observed"
+
+    [[rule]]
+    name = "completed-fix-count"
+    verb = "assign"
+    edges = ["row-commit"]
+    effect = "notice"
+    text = "observe prior completed fixes"
+    deny_when = [{ fact = "assignment.prior_completed_fix_count", op = "eq", value = 1 }]
+
+    [rule.notice]
+    target_session = "round-reviewer"
+    prompt = "completed fixes observed"
+    """)
+
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    transitions = [
+      %{
+        verb: "attest",
+        domain: "attest",
+        owner_user_id: "flynn",
+        principal: "session:round-reviewer",
+        bindings: %{assignmentId: review.id, workItemId: work_item_id}
+      },
+      %{
+        verb: "assign",
+        domain: "assignment",
+        owner_user_id: "flynn",
+        principal: "user:flynn",
+        bindings: %{assignmentId: current_fix.id, workItemId: work_item_id}
+      }
+    ]
+
+    assert {:ok, effects} =
+             DB.transaction(ctx.db, &Rules.row_commit_effects_in_txn(&1, transitions))
+
+    assert MapSet.new(effects, fn {:notice, rule, _call, _facts} -> rule.name end) ==
+             MapSet.new(["review-round-count", "completed-fix-count"])
+
+    assert Enum.any?(effects, fn {:notice, rule, _call, facts} ->
+             rule.name == "review-round-count" and {"assignment.review_verdict_count", 2} in facts
+           end)
+
+    assert Enum.any?(effects, fn {:notice, rule, _call, facts} ->
+             rule.name == "completed-fix-count" and
+               {"assignment.prior_completed_fix_count", 1} in facts
+           end)
+  end
+
+  test "working-without-assignment is evaluated only for a running-turn commit", ctx do
+    unassigned = session(ctx.db, "running-unassigned", "flynn", archetype: "coder")
+    assigned = session(ctx.db, "running-assigned", "flynn", archetype: "coder")
+    _open = assignment(ctx, assigned.session_key, {:user, "flynn"})
+
+    put_raw(ctx, """
+    [[rule]]
+    name = "working-without-assignment"
+    verb = "post"
+    edges = ["row-commit"]
+    effect = "notice"
+    text = "observe working session without assignment"
+    deny_when = [{ fact = "session.working_without_open_assignment", op = "eq", value = true }]
+
+    [rule.notice]
+    target_session = "running-unassigned"
+    prompt = "unassigned work observed"
+    """)
+
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    transitions = [
+      %{
+        verb: "post",
+        domain: "running_turn",
+        owner_user_id: "flynn",
+        principal: "session:running-unassigned",
+        bindings: %{
+          sessionKey: unassigned.session_key,
+          callerOrigin: "session:#{unassigned.session_key}"
+        }
+      },
+      %{
+        verb: "post",
+        domain: "running_turn",
+        owner_user_id: "flynn",
+        principal: "session:running-assigned",
+        bindings: %{
+          sessionKey: assigned.session_key,
+          callerOrigin: "session:#{assigned.session_key}"
+        }
+      },
+      %{
+        verb: "post",
+        domain: "queued_turn",
+        owner_user_id: "flynn",
+        principal: "session:running-unassigned",
+        bindings: %{
+          sessionKey: unassigned.session_key,
+          callerOrigin: "session:#{unassigned.session_key}"
+        }
+      }
+    ]
+
+    assert {:ok, [{:notice, rule, _call, facts}]} =
+             DB.transaction(ctx.db, &Rules.row_commit_effects_in_txn(&1, transitions))
+
+    assert rule.name == "working-without-assignment"
+    assert {"session.working_without_open_assignment", true} in facts
+  end
+
+  test "Ledger queue and claim commits reach AC6a row-commit rules", ctx do
+    holder = session(ctx.db, "ac6a-ledger-event-holder", "flynn", archetype: "coder")
+
+    put_raw(ctx, """
+    [[rule]]
+    name = "ac6a-queued-depth-one"
+    verb = "post"
+    edges = ["row-commit"]
+    effect = "notice"
+    text = "observe one queued turn"
+    deny_when = [{ fact = "turn.queued_count", op = "eq", value = 1 }]
+
+    [rule.notice]
+    target_session = "ac6a-ledger-event-holder"
+    prompt = "one queued turn observed"
+
+    [[rule]]
+    name = "ac6a-queued-depth-two"
+    verb = "post"
+    edges = ["row-commit"]
+    effect = "notice"
+    text = "observe two queued turns"
+    deny_when = [{ fact = "turn.queued_count", op = "eq", value = 2 }]
+
+    [rule.notice]
+    target_session = "ac6a-ledger-event-holder"
+    prompt = "two queued turns observed"
+
+    [[rule]]
+    name = "ac6a-unassigned-running"
+    verb = "post"
+    edges = ["row-commit"]
+    effect = "notice"
+    text = "observe unassigned running work"
+    deny_when = [
+      { fact = "session.working_without_open_assignment", op = "eq", value = true }
+    ]
+
+    [rule.notice]
+    target_session = "ac6a-ledger-event-holder"
+    prompt = "unassigned running turn observed"
+    """)
+
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    assert {:ok, _seq} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: holder.session_key,
+               message_id: "ac6a-ledger-event-one",
+               origin: "session:#{holder.session_key}",
+               prompt: "one queued turn"
+             })
+
+    assert {:ok, _seq} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: holder.session_key,
+               message_id: "ac6a-ledger-event-two",
+               origin: "user:flynn",
+               prompt: "second queued turn"
+             })
+
+    assert {:ok, %{seq: _seq}} = Ledger.claim_next(ctx.db, holder.session_key, "ac6a-claim")
+
+    assert {:ok, [[3]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE origin LIKE 'remedy:ac6a-%' AND state='pending'"
+             )
+  end
+
   test "row-commit rejects effects that cannot run after the governed write", ctx do
     put_raw(ctx, """
     [[rule]]
@@ -1875,6 +2235,1159 @@ defmodule Tightbeam.RulesTest do
     assert_raise ArgumentError, ~r/edge "row-commit" requires effect = "notice"/, fn ->
       Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
     end
+  end
+
+  test "AC6a backlog crosses at 20, preserves protected traffic, and replays without a notice loop",
+       ctx do
+    holder = session(ctx.db, "ac6a-backlog-self-holder", "flynn", archetype: "coder")
+    caller = session(ctx.db, "ac6a-backlog-caller", "flynn", archetype: "coder")
+    opened = assignment(ctx, holder.session_key, {:user, "flynn"})
+    work_item_id = "wi_ac6a_backlog_replay"
+    attach_work_item(ctx, opened.id, work_item_id)
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE assignments SET openedByUser=NULL,openedBySession=?2 WHERE id=?1",
+               [opened.id, holder.session_key]
+             )
+
+    rules = load_ac6a_rules(ctx)
+    assert Enum.count(rules, &String.starts_with?(&1.name, "ac6a-")) == 4
+
+    assert {:ok, _} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: holder.session_key,
+               message_id: "ac6a-protected-request",
+               origin: "process:protected-traffic",
+               request_ref: "decision:ac6a-protected",
+               assignment_id: opened.id,
+               prompt: "protected decision traffic"
+             })
+
+    for index <- 1..18 do
+      assert {:ok, _} =
+               Ledger.enqueue(ctx.db, %{
+                 session_key: holder.session_key,
+                 message_id: "ac6a-backlog-before-#{index}",
+                 origin: "session:#{caller.session_key}",
+                 assignment_id: opened.id,
+                 prompt: "queue below threshold"
+               })
+    end
+
+    assert notice_count(ctx.db, "remedy:ac6a-queue-backlog") == 0
+
+    assert {:ok, _} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: holder.session_key,
+               message_id: "ac6a-backlog-threshold",
+               wake_id: "ac6a-backlog-threshold-wake",
+               origin: "session:#{caller.session_key}",
+               assignment_id: opened.id,
+               prompt: "cross the 20 queued-turn threshold"
+             })
+
+    assert {:ok, [[trigger_seq]]} =
+             DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId='ac6a-backlog-threshold-wake'")
+
+    assert {:ok, [[backlog_target, backlog_origin, backlog_assignment, backlog_work_item]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sessionKey,origin,assignmentId,work_item_id FROM wakes WHERE origin='remedy:ac6a-queue-backlog'"
+             )
+
+    assert [backlog_target, backlog_origin, backlog_assignment, backlog_work_item] ==
+             [holder.session_key, "remedy:ac6a-queue-backlog", opened.id, work_item_id]
+
+    replay = %{
+      verb: "wake",
+      domain: "queued_turn",
+      row_id: trigger_seq,
+      owner_user_id: "flynn",
+      principal: "session:#{caller.session_key}",
+      bindings: %{
+        sessionKey: holder.session_key,
+        callerOrigin: "session:#{caller.session_key}",
+        assignmentId: opened.id,
+        workItemId: work_item_id
+      }
+    }
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               Wakes.row_commit_in_txn(txn, replay)
+               :ok
+             end)
+
+    assert {:ok, _} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: holder.session_key,
+               message_id: "ac6a-backlog-still-over-threshold",
+               origin: "session:#{caller.session_key}",
+               assignment_id: opened.id,
+               prompt: "remain above the threshold"
+             })
+
+    assert notice_count(ctx.db, "remedy:ac6a-queue-backlog") == 1
+
+    assert {:ok, [["queued", "decision:ac6a-protected"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT status,requestRef FROM turns WHERE messageId='ac6a-protected-request'"
+             )
+
+    assert {:ok,
+            [
+              [
+                notice_wake_id,
+                delivered_target,
+                delivered_origin,
+                delivered_assignment,
+                delivered_work_item
+              ]
+            ]} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId,sessionKey,origin,assignmentId,work_item_id FROM wakes WHERE origin='remedy:ac6a-queue-backlog'"
+             )
+
+    assert [delivered_target, delivered_origin, delivered_assignment, delivered_work_item] ==
+             [holder.session_key, "remedy:ac6a-queue-backlog", opened.id, work_item_id]
+
+    assert {:ok, _} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: holder.session_key,
+               message_id: "ac6a-delivered-notice",
+               wake_id: notice_wake_id,
+               origin: "remedy:ac6a-queue-backlog",
+               assignment_id: opened.id,
+               prompt: "the persisted backlog notice was delivered"
+             })
+
+    assert notice_count(ctx.db, "remedy:ac6a-queue-backlog") == 1
+  end
+
+  test "AC6a depth backlog survives claims and rearms after an observed recovery", ctx do
+    {holder, opened} = ac6a_backlog_fixture(ctx, "depth-episode")
+
+    for index <- 1..21, do: ac6a_enqueue(ctx, holder, opened, "initial-#{index}")
+    assert notice_count(ctx.db, "remedy:ac6a-queue-backlog") == 1
+
+    assert {:ok, claimed} = Ledger.claim_next(ctx.db, holder.session_key, "depth-first")
+    assert queued_depth(ctx.db, holder.session_key) == 20
+    # Re-loading rules must not discard the episode: it is derived from durable rows.
+    load_ac6a_rules(ctx)
+    ac6a_enqueue(ctx, holder, opened, "after-first-claim")
+    assert notice_count(ctx.db, "remedy:ac6a-queue-backlog") == 1
+    finish_claim(ctx.db, claimed)
+
+    for index <- 1..3 do
+      assert {:ok, claimed} = Ledger.claim_next(ctx.db, holder.session_key, "drain-#{index}")
+      finish_claim(ctx.db, claimed)
+    end
+
+    assert queued_depth(ctx.db, holder.session_key) == 18
+    # A positive-duration gap distinguishes recovery from same-millisecond churn.
+    Process.sleep(2)
+    ac6a_enqueue(ctx, holder, opened, "below-again")
+    assert notice_count(ctx.db, "remedy:ac6a-queue-backlog") == 1
+    ac6a_enqueue(ctx, holder, opened, "recross")
+    assert notice_count(ctx.db, "remedy:ac6a-queue-backlog") == 2
+    ac6a_enqueue(ctx, holder, opened, "after-recross")
+    assert notice_count(ctx.db, "remedy:ac6a-queue-backlog") == 2
+  end
+
+  test "AC6a age backlog survives oldest turnover and a handoff to depth backlog", ctx do
+    {holder, opened} = ac6a_backlog_fixture(ctx, "age-episode")
+    first = ac6a_enqueue(ctx, holder, opened, "oldest")
+    second = ac6a_enqueue(ctx, holder, opened, "next-oldest")
+    now = System.system_time(:millisecond)
+
+    for {seq, age} <- [{first, 3_601_000}, {second, 3_600_500}] do
+      assert {:ok, _} =
+               DB.query(ctx.db, "UPDATE turns SET createdAt=?1 WHERE seq=?2", [now - age, seq])
+    end
+
+    ac6a_enqueue(ctx, holder, opened, "age-trigger")
+    assert notice_count(ctx.db, "remedy:ac6a-queue-backlog") == 1
+
+    assert {:ok, %{seq: ^first} = claimed} =
+             Ledger.claim_next(ctx.db, holder.session_key, "age-first")
+
+    ac6a_enqueue(ctx, holder, opened, "after-aged-claim")
+    assert notice_count(ctx.db, "remedy:ac6a-queue-backlog") == 1
+    finish_claim(ctx.db, claimed)
+
+    for index <- 1..19, do: ac6a_enqueue(ctx, holder, opened, "depth-handoff-#{index}")
+
+    assert {:ok, %{seq: ^second} = claimed} =
+             Ledger.claim_next(ctx.db, holder.session_key, "age-second")
+
+    ac6a_enqueue(ctx, holder, opened, "after-last-aged-claim")
+    assert notice_count(ctx.db, "remedy:ac6a-queue-backlog") == 1
+    finish_claim(ctx.db, claimed)
+
+    for index <- 1..4 do
+      assert {:ok, claimed} = Ledger.claim_next(ctx.db, holder.session_key, "age-drain-#{index}")
+      finish_claim(ctx.db, claimed)
+    end
+
+    assert queued_depth(ctx.db, holder.session_key) == 18
+    Process.sleep(2)
+    ac6a_enqueue(ctx, holder, opened, "age-recovery-below")
+    ac6a_enqueue(ctx, holder, opened, "age-recovery-recross")
+    ac6a_enqueue(ctx, holder, opened, "age-recovery-repeat")
+    assert notice_count(ctx.db, "remedy:ac6a-queue-backlog") == 2
+  end
+
+  test "AC6a coalesces indistinguishable same-millisecond recovery and re-cross", ctx do
+    {holder, opened} = ac6a_backlog_fixture(ctx, "tied-episode")
+    for index <- 1..20, do: ac6a_enqueue(ctx, holder, opened, "tied-initial-#{index}")
+    assert notice_count(ctx.db, "remedy:ac6a-queue-backlog") == 1
+    Process.sleep(2)
+    assert {:ok, claimed} = Ledger.claim_next(ctx.db, holder.session_key, "tied-claim")
+    assert queued_depth(ctx.db, holder.session_key) == 19
+
+    assert {:ok, [[claimed_at]]} =
+             DB.query(ctx.db, "SELECT startedAt FROM turns WHERE seq=?1", [claimed.seq])
+
+    # Use the real enqueue/drain path, fixing only the clock resolution so the
+    # ambiguous claim/enqueue boundary is deterministic on every test host.
+    assert {:ok, :ok} =
+             DB.transaction_then(
+               ctx.db,
+               fn txn ->
+                 assert {:ok, seq} =
+                          Ledger.enqueue_in_txn(txn, %{
+                            session_key: holder.session_key,
+                            message_id: "tied-recross",
+                            origin: "process:seed",
+                            assignment_id: opened.id,
+                            prompt: "same millisecond as claim"
+                          })
+
+                 assert {:ok, _} =
+                          DB.query(txn, "UPDATE turns SET createdAt=?1 WHERE seq=?2", [
+                            claimed_at,
+                            seq
+                          ])
+
+                 :ok
+               end,
+               fn txn, :ok -> Wakes.row_commit_in_txn(txn, []) end
+             )
+
+    assert queued_depth(ctx.db, holder.session_key) == 20
+    assert notice_count(ctx.db, "remedy:ac6a-queue-backlog") == 1
+    finish_claim(ctx.db, claimed)
+    Process.sleep(2)
+    assert {:ok, claimed} = Ledger.claim_next(ctx.db, holder.session_key, "untied-claim")
+    finish_claim(ctx.db, claimed)
+    Process.sleep(2)
+    ac6a_enqueue(ctx, holder, opened, "untied-recross")
+    assert notice_count(ctx.db, "remedy:ac6a-queue-backlog") == 2
+  end
+
+  test "AC6a sender flood stays deduped across claims and resets after either recovery", ctx do
+    {holder, opened} = ac6a_backlog_fixture(ctx, "flood-claim-regression")
+    sender = session(ctx.db, "ac6a-flood-claim-sender", "flynn", archetype: "coder")
+    flood_origin = "remedy:ac6a-sender-flood"
+
+    send_turn = fn id ->
+      assert {:ok, seq} =
+               Ledger.enqueue(ctx.db, %{
+                 session_key: holder.session_key,
+                 message_id: id,
+                 origin: "session:#{sender.session_key}",
+                 assignment_id: opened.id,
+                 prompt: "sender flood episode regression"
+               })
+
+      seq
+    end
+
+    sender_seqs = for index <- 1..5, do: send_turn.("flood-sender-#{index}")
+    for index <- 1..20, do: ac6a_enqueue(ctx, holder, opened, "flood-seed-#{index}")
+    assert notice_count(ctx.db, flood_origin) == 1
+
+    for index <- 0..1 do
+      assert {:ok, claimed} = Ledger.claim_next(ctx.db, holder.session_key, "flood-claim")
+      assert claimed.seq == Enum.at(sender_seqs, index)
+      ac6a_enqueue(ctx, holder, opened, "flood-other-sender-#{index}")
+      assert notice_count(ctx.db, flood_origin) == 1
+      finish_claim(ctx.db, claimed)
+    end
+
+    # The sender stops flooding while the target remains backlogged, then
+    # unambiguously crosses three again. That is a new finding, exactly once.
+    assert {:ok, claimed} = Ledger.claim_next(ctx.db, holder.session_key, "flood-claim")
+    assert claimed.seq == Enum.at(sender_seqs, 2)
+    finish_claim(ctx.db, claimed)
+    Process.sleep(2)
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    send_turn.("flood-sender-recross")
+    assert notice_count(ctx.db, flood_origin) == 2
+    send_turn.("flood-sender-still-over")
+    assert notice_count(ctx.db, flood_origin) == 2
+
+    # Keep at least three sender turns at the tail while the target recovers
+    # below twenty, then crosses depth again without a sender-count recovery.
+    for index <- 1..3, do: send_turn.("flood-tail-#{index}")
+
+    for _ <- 1..(queued_depth(ctx.db, holder.session_key) - 19) do
+      assert {:ok, claimed} = Ledger.claim_next(ctx.db, holder.session_key, "flood-claim")
+      finish_claim(ctx.db, claimed)
+    end
+
+    assert queued_depth(ctx.db, holder.session_key) == 19
+    assert notice_count(ctx.db, flood_origin) == 2
+    Process.sleep(2)
+    ac6a_enqueue(ctx, holder, opened, "flood-backlog-recross")
+    assert notice_count(ctx.db, flood_origin) == 3
+    ac6a_enqueue(ctx, holder, opened, "flood-backlog-still-over")
+    assert notice_count(ctx.db, flood_origin) == 3
+
+    assert {:ok, [[3]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM wakes WHERE origin=?1 AND sessionKey=?2", [
+               flood_origin,
+               sender.session_key
+             ])
+  end
+
+  test "AC6a age and sender-flood thresholds fire on crossing, then dedupe", ctx do
+    holder = session(ctx.db, "ac6a-age-holder", "flynn", archetype: "coder")
+    sender = session(ctx.db, "ac6a-flood-sender", "flynn", archetype: "coder")
+    opener = session(ctx.db, Org.personal_session_key("flynn"), "flynn", kind: "main")
+    opened = assignment(ctx, holder.session_key, {:user, "flynn"})
+    work_item_id = "wi_ac6a_age_threshold"
+    attach_work_item(ctx, opened.id, work_item_id)
+    _rules = load_ac6a_rules(ctx)
+
+    assert {:ok, _} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: holder.session_key,
+               message_id: "ac6a-age-oldest",
+               origin: "process:seed",
+               assignment_id: opened.id,
+               prompt: "old queued turn"
+             })
+
+    # The 30-minute margin exceeds the unchanged test timeout; a slow runner
+    # cannot age this below-threshold fixture across the 60-minute boundary.
+    now = System.system_time(:millisecond)
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE turns SET createdAt=?1 WHERE messageId='ac6a-age-oldest'", [
+               now - 30 * 60 * 1_000
+             ])
+
+    assert {:ok, _} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: holder.session_key,
+               message_id: "ac6a-age-below",
+               origin: "process:seed",
+               assignment_id: opened.id,
+               prompt: "still below 60 minutes"
+             })
+
+    assert notice_count(ctx.db, "remedy:ac6a-queue-backlog") == 0
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE turns SET createdAt=?1 WHERE messageId='ac6a-age-oldest'", [
+               System.system_time(:millisecond) - 3_600_001
+             ])
+
+    assert {:ok, _} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: holder.session_key,
+               message_id: "ac6a-age-crossing",
+               origin: "process:seed",
+               assignment_id: opened.id,
+               prompt: "cross 60 minutes"
+             })
+
+    assert {:ok, [[age_notice_target]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sessionKey FROM wakes WHERE origin='remedy:ac6a-queue-backlog'"
+             )
+
+    assert age_notice_target == opener.session_key
+
+    assert {:ok, _} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: holder.session_key,
+               message_id: "ac6a-age-still-over",
+               origin: "process:seed",
+               assignment_id: opened.id,
+               prompt: "remain age-backlogged"
+             })
+
+    assert notice_count(ctx.db, "remedy:ac6a-queue-backlog") == 1
+
+    for index <- 1..16 do
+      assert {:ok, _} =
+               Ledger.enqueue(ctx.db, %{
+                 session_key: holder.session_key,
+                 message_id: "ac6a-age-depth-crossing-#{index}",
+                 origin: "process:seed",
+                 assignment_id: opened.id,
+                 prompt: "the same oldest queued turn remains the backlog episode"
+               })
+    end
+
+    assert notice_count(ctx.db, "remedy:ac6a-queue-backlog") == 1
+
+    flood_holder = session(ctx.db, "ac6a-flood-holder", "flynn", archetype: "coder")
+    sender_role = "ac6a-flood-sender-role"
+    assert %{name: ^sender_role} = Roles.create!(ctx.db, sender_role, "flynn", sender.session_key)
+    flood_assignment = assignment(ctx, flood_holder.session_key, {:user, "flynn"})
+    flood_work_item = "wi_ac6a_flood_threshold"
+    attach_work_item(ctx, flood_assignment.id, flood_work_item)
+
+    for index <- 1..3 do
+      assert {:ok, _} =
+               Ledger.enqueue(ctx.db, %{
+                 session_key: flood_holder.session_key,
+                 message_id: "ac6a-flood-before-backlog-#{index}",
+                 origin: "agent:#{sender_role}",
+                 assignment_id: flood_assignment.id,
+                 prompt: "sender threshold before the recipient is backlogged"
+               })
+    end
+
+    assert notice_count(ctx.db, "remedy:ac6a-sender-flood") == 0
+
+    for index <- 1..20 do
+      assert {:ok, _} =
+               Ledger.enqueue(ctx.db, %{
+                 session_key: flood_holder.session_key,
+                 message_id: "ac6a-flood-backlog-seed-#{index}",
+                 origin: "process:seed",
+                 assignment_id: flood_assignment.id,
+                 prompt: "establish the recipient backlog"
+               })
+    end
+
+    assert notice_count(ctx.db, "remedy:ac6a-queue-backlog") == 2
+
+    assert {:ok, [[backlog_crossing_flood_target]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sessionKey FROM wakes WHERE origin='remedy:ac6a-sender-flood' " <>
+                 "AND assignmentId=?1",
+               [flood_assignment.id]
+             )
+
+    assert backlog_crossing_flood_target == sender.session_key
+
+    assert {:ok, [[flood_creator]]} =
+             DB.query(
+               ctx.db,
+               "SELECT creatorSessionKey FROM wakes WHERE origin='remedy:ac6a-sender-flood' " <>
+                 "AND assignmentId=?1 ORDER BY createdAt LIMIT 1",
+               [flood_assignment.id]
+             )
+
+    assert flood_creator == sender.session_key
+
+    assert {:ok, _} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: flood_holder.session_key,
+               message_id: "ac6a-flood-after-backlog",
+               origin: "agent:#{sender_role}",
+               assignment_id: flood_assignment.id,
+               prompt: "fourth sender message after backlog threshold"
+             })
+
+    assert {:ok, [[flood_notice_target]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sessionKey FROM wakes WHERE origin='remedy:ac6a-sender-flood'"
+             )
+
+    assert flood_notice_target == sender.session_key
+
+    assert {:ok, _} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: flood_holder.session_key,
+               message_id: "ac6a-flood-after-duplicate",
+               origin: "agent:#{sender_role}",
+               assignment_id: flood_assignment.id,
+               prompt: "fifth sender message"
+             })
+
+    assert notice_count(ctx.db, "remedy:ac6a-sender-flood") == 1
+
+    threshold_holder = session(ctx.db, "ac6a-flood-threshold-holder", "flynn", archetype: "coder")
+    threshold_assignment = assignment(ctx, threshold_holder.session_key, {:user, "flynn"})
+    attach_work_item(ctx, threshold_assignment.id, "wi_ac6a_flood_exact_threshold")
+
+    for index <- 1..20 do
+      assert {:ok, _} =
+               Ledger.enqueue(ctx.db, %{
+                 session_key: threshold_holder.session_key,
+                 message_id: "ac6a-exact-flood-backlog-#{index}",
+                 origin: "process:seed",
+                 assignment_id: threshold_assignment.id,
+                 prompt: "already-backlogged before sender threshold"
+               })
+    end
+
+    for index <- 1..2 do
+      assert {:ok, _} =
+               Ledger.enqueue(ctx.db, %{
+                 session_key: threshold_holder.session_key,
+                 message_id: "ac6a-exact-flood-before-#{index}",
+                 origin: "agent:#{sender_role}",
+                 assignment_id: threshold_assignment.id,
+                 prompt: "two of three sender turns"
+               })
+    end
+
+    assert notice_count(ctx.db, "remedy:ac6a-sender-flood") == 1
+
+    assert {:ok, _} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: threshold_holder.session_key,
+               message_id: "ac6a-exact-flood-threshold",
+               origin: "agent:#{sender_role}",
+               assignment_id: threshold_assignment.id,
+               prompt: "third sender turn while already backlogged"
+             })
+
+    assert {:ok, [[exact_threshold_target]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sessionKey FROM wakes WHERE origin='remedy:ac6a-sender-flood' " <>
+                 "ORDER BY createdAt DESC LIMIT 1"
+             )
+
+    assert exact_threshold_target == sender.session_key
+    assert notice_count(ctx.db, "remedy:ac6a-sender-flood") == 2
+
+    user_holder = session(ctx.db, "ac6a-flood-user-holder", "flynn", archetype: "coder")
+    user_assignment = assignment(ctx, user_holder.session_key, {:user, "flynn"})
+    attach_work_item(ctx, user_assignment.id, "wi_ac6a_user_flood")
+
+    for index <- 1..20 do
+      assert {:ok, _} =
+               Ledger.enqueue(ctx.db, %{
+                 session_key: user_holder.session_key,
+                 message_id: "ac6a-user-flood-backlog-#{index}",
+                 origin: "process:seed",
+                 assignment_id: user_assignment.id,
+                 prompt: "backlog for user sender attribution"
+               })
+    end
+
+    for index <- 1..3 do
+      assert {:ok, _} =
+               Ledger.enqueue(ctx.db, %{
+                 session_key: user_holder.session_key,
+                 message_id: "ac6a-user-flood-sender-#{index}",
+                 origin: "user:flynn",
+                 assignment_id: user_assignment.id,
+                 prompt: "human sender contributes to a backlogged agent queue"
+               })
+    end
+
+    assert {:ok, [[user_notice_target]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sessionKey FROM wakes WHERE origin='remedy:ac6a-sender-flood' AND assignmentId=?1",
+               [user_assignment.id]
+             )
+
+    assert user_notice_target == opener.session_key
+    assert notice_count(ctx.db, "remedy:ac6a-sender-flood") == 3
+  end
+
+  test "AC6a legacy review verdict count spans fresh reviewers and all verdict kinds", ctx do
+    review_opener = session(ctx.db, "ac6a-rejection-review-opener", "flynn")
+
+    producer_rounds =
+      for index <- 1..4 do
+        opener = session(ctx.db, "ac6a-rejection-producer-opener-#{index}", "flynn")
+        holder = session(ctx.db, "ac6a-rejection-producer-#{index}", "flynn", archetype: "coder")
+        {opener, holder}
+      end
+
+    reviewers =
+      for index <- 1..4 do
+        session(ctx.db, "ac6a-rejection-reviewer-#{index}", "flynn", archetype: "reviewer-code")
+      end
+
+    work_item_id = "wi_ac6a_third_review_rejection"
+    create_work_item(ctx, work_item_id)
+    set_work_item_owner(ctx, work_item_id, review_opener.session_key)
+    _rules = load_ac6a_rules(ctx)
+
+    put_raw(
+      ctx,
+      """
+      [[rule]]
+      name = "compat-work-item-review-verdict-count"
+      verb = "attest"
+      edges = ["row-commit"]
+      effect = "notice"
+      text = "observe the preserved work-item review count"
+      deny_when = [{ fact = "work_item.review_verdict_count", op = "eq", value = 3 }]
+
+      [rule.notice]
+      target_session = "{assignment_opener_session}"
+      prompt = "preserved work-item review count observed"
+      idempotency_key = "compat-review-count:{work_item_id}:3"
+      """,
+      "compat-review-count.toml"
+    )
+
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    compat_producer_opener = session(ctx.db, "ac6a-compat-producer-opener", "flynn")
+
+    compat_producer_holder =
+      session(ctx.db, "ac6a-compat-producer-holder", "flynn", archetype: "coder")
+
+    compat_reviewer = session(ctx.db, "ac6a-compat-reviewer", "flynn", archetype: "reviewer-code")
+
+    # Distinct producer openers remain authorized participants under the public
+    # direct-owner model, without changing which opener receives the notice.
+    for producer_opener <- [compat_producer_opener | Enum.map(producer_rounds, &elem(&1, 0))] do
+      assert %{id: _} =
+               assignment(ctx, producer_opener.session_key, {:user, "flynn"},
+                 work_item_id: work_item_id,
+                 effect_kind: "coordination"
+               )
+    end
+
+    compat_producer =
+      assignment(
+        ctx,
+        compat_producer_holder.session_key,
+        {:session, compat_producer_opener.session_key},
+        work_item_id: work_item_id
+      )
+
+    compat_review =
+      assignment(ctx, compat_reviewer.session_key, {:session, review_opener.session_key},
+        reviews: compat_producer.id
+      )
+
+    verdict(
+      ctx,
+      compat_reviewer.session_key,
+      compat_review.id,
+      "reviewed-clean",
+      "compat baseline"
+    )
+
+    assert notice_count(ctx.db, "remedy:compat-work-item-review-verdict-count") == 0
+
+    for {reviewer, index} <- Enum.with_index(Enum.take(reviewers, 3), 1) do
+      {producer_opener, producer_holder} = Enum.at(producer_rounds, index - 1)
+
+      producer_assignment =
+        assignment(ctx, producer_holder.session_key, {:session, producer_opener.session_key},
+          work_item_id: work_item_id
+        )
+
+      review_assignment =
+        assignment(ctx, reviewer.session_key, {:session, review_opener.session_key},
+          reviews: producer_assignment.id
+        )
+
+      verdict(
+        ctx,
+        reviewer.session_key,
+        review_assignment.id,
+        "changes-requested",
+        "fresh reviewer #{index}"
+      )
+
+      assert notice_count(ctx.db, "remedy:compat-work-item-review-verdict-count") ==
+               if(index >= 2, do: 1, else: 0)
+
+      {producer_assignment, review_assignment}
+    end
+
+    assert {:ok, [[compat_target, compat_prompt]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sessionKey,prompt FROM wakes " <>
+                 "WHERE origin='remedy:compat-work-item-review-verdict-count'"
+             )
+
+    assert [compat_target, compat_prompt] ==
+             [review_opener.session_key, "preserved work-item review count observed"]
+
+    {fourth_opener, fourth_holder} = Enum.at(producer_rounds, 3)
+
+    fourth_producer_assignment =
+      assignment(ctx, fourth_holder.session_key, {:session, fourth_opener.session_key},
+        work_item_id: work_item_id
+      )
+
+    fourth_review =
+      assignment(ctx, Enum.at(reviewers, 3).session_key, {:session, review_opener.session_key},
+        reviews: fourth_producer_assignment.id
+      )
+
+    verdict(
+      ctx,
+      Enum.at(reviewers, 3).session_key,
+      fourth_review.id,
+      "changes-requested",
+      "fourth"
+    )
+
+    assert notice_count(ctx.db, "remedy:compat-work-item-review-verdict-count") == 1
+  end
+
+  test "AC6a fourth review and fix rounds route through real assignment and attest commits",
+       ctx do
+    assert %{user_id: "flynn"} = Devices.add_user(ctx.db, "flynn", false)
+    opener = session(ctx.db, Org.personal_session_key("flynn"), "flynn", kind: "main")
+    fix_holder = session(ctx.db, "ac6a-round-fix-holder", "flynn", archetype: "coder")
+    reviewer = session(ctx.db, "ac6a-round-reviewer", "flynn", archetype: "reviewer-code")
+    review_item = "wi_ac6a_review_round"
+    create_work_item(ctx, review_item)
+    set_work_item_owner(ctx, review_item, opener.session_key)
+    _rules = load_ac6a_rules(ctx)
+
+    for round <- 1..3 do
+      review_subject =
+        assignment(ctx, fix_holder.session_key, {:user, "flynn"}, work_item_id: review_item)
+
+      review_assignment =
+        assignment(ctx, reviewer.session_key, {:user, "flynn"}, reviews: review_subject.id)
+
+      verdict(
+        ctx,
+        reviewer.session_key,
+        review_assignment.id,
+        "changes-requested",
+        "round #{round}"
+      )
+    end
+
+    churn_origin = "remedy:ac6a-fourth-review-or-fix-round"
+    assert notice_count(ctx.db, churn_origin) == 0
+
+    fourth_subject =
+      assignment(ctx, fix_holder.session_key, {:user, "flynn"}, work_item_id: review_item)
+
+    fourth_review =
+      assignment(ctx, reviewer.session_key, {:user, "flynn"}, reviews: fourth_subject.id)
+
+    verdict(ctx, reviewer.session_key, fourth_review.id, "changes-requested", "fourth round")
+
+    assert {:ok, [[review_target, review_notice_assignment, review_work_item, review_prompt]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sessionKey,assignmentId,work_item_id,prompt FROM wakes WHERE origin=?1",
+               [churn_origin]
+             )
+
+    assert [review_target, review_notice_assignment, review_work_item] ==
+             [opener.session_key, fourth_review.id, review_item]
+
+    assert review_prompt =~ "fourth review round"
+
+    assert {:ok, [[fourth_attest_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT id FROM attests WHERE assignmentId=?1 AND note='fourth round'",
+               [fourth_review.id]
+             )
+
+    replayed_review = %{
+      verb: "attest",
+      domain: "attest",
+      row_id: fourth_attest_id,
+      owner_user_id: "flynn",
+      principal: "session:#{reviewer.session_key}",
+      bindings: %{assignmentId: fourth_review.id, workItemId: nil},
+      fields: %{
+        kind: %{old: nil, new: "verdict"},
+        verdictKind: %{old: nil, new: "changes-requested"}
+      }
+    }
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               Wakes.row_commit_in_txn(txn, replayed_review)
+               :ok
+             end)
+
+    assert notice_count(ctx.db, churn_origin) == 1
+
+    fifth_subject =
+      assignment(ctx, fix_holder.session_key, {:user, "flynn"}, work_item_id: review_item)
+
+    fifth_review =
+      assignment(ctx, reviewer.session_key, {:user, "flynn"}, reviews: fifth_subject.id)
+
+    verdict(ctx, reviewer.session_key, fifth_review.id, "changes-requested", "fifth round")
+    assert notice_count(ctx.db, churn_origin) == 1
+
+    fix_item = "wi_ac6a_fourth_fix_round"
+    create_work_item(ctx, fix_item)
+    set_work_item_owner(ctx, fix_item, opener.session_key)
+
+    for round <- 1..3 do
+      prior =
+        assignment(ctx, fix_holder.session_key, {:user, "flynn"},
+          work_item_id: fix_item,
+          effect_kind: "code"
+        )
+
+      refs = verified_code_refs(ctx, prior, fix_holder, reviewer)
+
+      assert %{assignment: %{state: "closed", outcome: "completed"}} =
+               Assignments.__handle__(
+                 ctx.db,
+                 "attest",
+                 p3_call("attest", {:session, fix_holder.session_key}, %{
+                   assignment_id: prior.id,
+                   kind: "completion",
+                   commit_refs: refs
+                 })
+               )
+    end
+
+    assert notice_count(ctx.db, churn_origin) == 1
+
+    fourth =
+      assignment(ctx, fix_holder.session_key, {:user, "flynn"},
+        work_item_id: fix_item,
+        effect_kind: "code"
+      )
+
+    assert {:ok, [[fix_target, fix_assignment, fix_work_item, fix_prompt]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sessionKey,assignmentId,work_item_id,prompt FROM wakes " <>
+                 "WHERE origin=?1 AND prompt LIKE '%fourth fix round%'",
+               [churn_origin]
+             )
+
+    assert [fix_target, fix_assignment, fix_work_item] ==
+             [opener.session_key, fourth.id, fix_item]
+
+    assert fix_prompt =~ "fourth fix round"
+
+    fifth =
+      assignment(ctx, fix_holder.session_key, {:user, "flynn"},
+        work_item_id: fix_item,
+        effect_kind: "code"
+      )
+
+    assert fourth.id != fifth.id
+    assert notice_count(ctx.db, churn_origin) == 2
+  end
+
+  test "AC6a routes unassigned agent stretches to the item coordinator once and excludes human starts",
+       ctx do
+    assert %{user_id: "flynn"} = Devices.add_user(ctx.db, "flynn", false)
+    agent = session(ctx.db, "ac6a-unassigned-agent", "flynn", archetype: "coder")
+    foreign_sender = session(ctx.db, "ac6a-foreign-agent", "flynn", archetype: "coder")
+    human_started = session(ctx.db, "ac6a-human-started", "flynn", archetype: "coder")
+    agent_role = "ac6a-unassigned-agent-role"
+    assert %{name: ^agent_role} = Roles.create!(ctx.db, agent_role, "flynn", agent.session_key)
+
+    work_item_id = "wi_ac6a_unassigned_stretch"
+    create_work_item(ctx, work_item_id)
+    coordinator = setup_work_item_coordinator(ctx, work_item_id)
+
+    stale_assignment =
+      assignment(ctx, agent.session_key, {:user, "flynn"}, work_item_id: work_item_id)
+
+    assert %{state: "closed", outcome: "revoked"} =
+             Assignments.__handle__(
+               ctx.db,
+               "revoke-assignment",
+               p3_call("revoke-assignment", {:user, "flynn"}, %{
+                 assignment_id: stale_assignment.id,
+                 reason: "end the earlier assignment before the unassigned stretch"
+               })
+             )
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE assignments SET openedByUser=NULL,openedBySession='missing-opener' WHERE id=?1",
+               [stale_assignment.id]
+             )
+
+    _rules = load_ac6a_rules(ctx)
+
+    assert {:ok, _} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: agent.session_key,
+               message_id: "ac6a-agent-turn-one",
+               assignment_id: stale_assignment.id,
+               origin: "agent:#{agent_role}",
+               prompt: "agent started without an open assignment"
+             })
+
+    assert {:ok, %{seq: first_seq, owner_lease: first_lease}} =
+             Ledger.claim_next(ctx.db, agent.session_key, "ac6a-agent-claim-one")
+
+    assert {:ok, [[first_target, first_assignment, first_work_item]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sessionKey,assignmentId,work_item_id FROM wakes " <>
+                 "WHERE origin='remedy:ac6a-unassigned-agent-turn'"
+             )
+
+    assert [first_target, first_assignment, first_work_item] ==
+             [coordinator.session_key, stale_assignment.id, work_item_id]
+
+    assert :ok = Ledger.finish(ctx.db, first_seq, "delivered", nil, owner_lease: first_lease)
+
+    assert {:ok, _} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: agent.session_key,
+               message_id: "ac6a-agent-turn-two",
+               assignment_id: stale_assignment.id,
+               origin: "session:#{agent.session_key}",
+               prompt: "same unassigned stretch"
+             })
+
+    assert {:ok, %{seq: second_seq, owner_lease: second_lease}} =
+             Ledger.claim_next(ctx.db, agent.session_key, "ac6a-agent-claim-two")
+
+    assert notice_count(ctx.db, "remedy:ac6a-unassigned-agent-turn") == 1
+    assert :ok = Ledger.finish(ctx.db, second_seq, "delivered", nil, owner_lease: second_lease)
+
+    assert {:ok, _} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: agent.session_key,
+               message_id: "ac6a-foreign-started-turn",
+               assignment_id: stale_assignment.id,
+               origin: "session:#{foreign_sender.session_key}",
+               prompt: "another agent started this turn"
+             })
+
+    assert {:ok, %{seq: foreign_seq, owner_lease: foreign_lease}} =
+             Ledger.claim_next(ctx.db, agent.session_key, "ac6a-foreign-claim")
+
+    assert :ok = Ledger.finish(ctx.db, foreign_seq, "delivered", nil, owner_lease: foreign_lease)
+    assert notice_count(ctx.db, "remedy:ac6a-unassigned-agent-turn") == 1
+
+    opened =
+      assignment(ctx, agent.session_key, {:user, "flynn"},
+        work_item_id: work_item_id,
+        effect_kind: "code"
+      )
+
+    assert {:ok, _} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: agent.session_key,
+               message_id: "ac6a-assigned-agent-turn",
+               assignment_id: opened.id,
+               origin: "session:#{agent.session_key}",
+               prompt: "an open assignment suppresses the finding"
+             })
+
+    assert {:ok, %{seq: assigned_seq, owner_lease: assigned_lease}} =
+             Ledger.claim_next(ctx.db, agent.session_key, "ac6a-assigned-claim")
+
+    assert notice_count(ctx.db, "remedy:ac6a-unassigned-agent-turn") == 1
+
+    assert :ok =
+             Ledger.finish(ctx.db, assigned_seq, "delivered", nil, owner_lease: assigned_lease)
+
+    reviewer = session(ctx.db, "ac6a-unassigned-reviewer", "flynn", archetype: "reviewer-code")
+    refs = verified_code_refs(ctx, opened, agent, reviewer)
+
+    assert %{assignment: %{state: "closed", outcome: "completed"}} =
+             Assignments.__handle__(
+               ctx.db,
+               "attest",
+               p3_call("attest", {:session, agent.session_key}, %{
+                 assignment_id: opened.id,
+                 kind: "completion",
+                 commit_refs: refs
+               })
+             )
+
+    assert {:ok, _} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: agent.session_key,
+               message_id: "ac6a-agent-turn-after-assignment",
+               assignment_id: opened.id,
+               origin: "session:#{agent.session_key}",
+               prompt: "a new unassigned stretch starts after the assignment closes"
+             })
+
+    assert {:ok, %{seq: after_assignment_seq, owner_lease: after_assignment_lease}} =
+             Ledger.claim_next(ctx.db, agent.session_key, "ac6a-after-assignment-claim")
+
+    assert notice_count(ctx.db, "remedy:ac6a-unassigned-agent-turn") == 2
+
+    assert :ok =
+             Ledger.finish(ctx.db, after_assignment_seq, "delivered", nil,
+               owner_lease: after_assignment_lease
+             )
+
+    assert {:ok, _} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: agent.session_key,
+               message_id: "ac6a-agent-turn-after-assignment-two",
+               assignment_id: opened.id,
+               origin: "session:#{agent.session_key}",
+               prompt: "same later stretch"
+             })
+
+    assert {:ok, %{seq: _later_seq}} =
+             Ledger.claim_next(ctx.db, agent.session_key, "ac6a-after-assignment-claim-two")
+
+    assert notice_count(ctx.db, "remedy:ac6a-unassigned-agent-turn") == 2
+
+    assert {:ok, _} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: human_started.session_key,
+               message_id: "ac6a-human-started-turn",
+               origin: "user:flynn",
+               prompt: "human-started work does not count"
+             })
+
+    assert {:ok, %{seq: _human_seq}} =
+             Ledger.claim_next(ctx.db, human_started.session_key, "ac6a-human-claim")
+
+    assert notice_count(ctx.db, "remedy:ac6a-unassigned-agent-turn") == 2
+
+    no_context = session(ctx.db, "ac6a-unassigned-no-context", "flynn", archetype: "coder")
+    no_context_role = "ac6a-unassigned-no-context-role"
+
+    assert %{name: ^no_context_role} =
+             Roles.create!(ctx.db, no_context_role, "flynn", no_context.session_key)
+
+    assert {:ok, _} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: no_context.session_key,
+               message_id: "ac6a-unassigned-no-context",
+               origin: "agent:#{no_context_role}",
+               prompt: "no assignment or work item context"
+             })
+
+    assert {:ok, %{seq: no_context_seq, owner_lease: no_context_lease}} =
+             Ledger.claim_next(ctx.db, no_context.session_key, "ac6a-unassigned-no-context-claim")
+
+    assert notice_count(ctx.db, "remedy:ac6a-unassigned-agent-turn") == 2
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM lifecycle_events WHERE kind='rule_notice_failed' " <>
+                 "AND subject='ac6a-unassigned-agent-turn'"
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE kind='operator'")
+
+    assert :ok =
+             Ledger.finish(ctx.db, no_context_seq, "delivered", nil,
+               owner_lease: no_context_lease
+             )
+  end
+
+  test "AC6a absent or invalid opener falls back and missing context keeps the enqueue",
+       ctx do
+    holder = session(ctx.db, "ac6a-fallback-holder", "flynn", archetype: "coder")
+    opened = assignment(ctx, holder.session_key, {:user, "flynn"})
+    work_item_id = "wi_ac6a_invalid_opener_fallback"
+    attach_work_item(ctx, opened.id, work_item_id)
+    coordinator = setup_work_item_coordinator(ctx, work_item_id)
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE assignments SET openedByUser=NULL,openedBySession='missing-opener' WHERE id=?1",
+               [opened.id]
+             )
+
+    _rules = load_ac6a_rules(ctx)
+
+    for index <- 1..20 do
+      assert {:ok, _} =
+               Ledger.enqueue(ctx.db, %{
+                 session_key: holder.session_key,
+                 message_id: "ac6a-fallback-#{index}",
+                 origin: "process:seed",
+                 assignment_id: opened.id,
+                 prompt: "cross the coordinator fallback threshold"
+               })
+    end
+
+    assert {:ok, [[fallback_target, fallback_assignment, fallback_work_item]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sessionKey,assignmentId,work_item_id FROM wakes WHERE origin='remedy:ac6a-queue-backlog'"
+             )
+
+    assert [fallback_target, fallback_assignment, fallback_work_item] ==
+             [coordinator.session_key, opened.id, work_item_id]
+
+    absent_holder = session(ctx.db, "ac6a-absent-opener-holder", "flynn", archetype: "coder")
+
+    absent_opener_assignment =
+      assignment(ctx, absent_holder.session_key, {:user, "flynn"}, work_item_id: work_item_id)
+
+    # A user opener without a Main session has no reachable notice recipient.
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM sessions WHERE sessionKey=?1", [
+               Org.personal_session_key("flynn")
+             ])
+
+    for index <- 1..20 do
+      assert {:ok, _} =
+               Ledger.enqueue(ctx.db, %{
+                 session_key: absent_holder.session_key,
+                 message_id: "ac6a-absent-opener-#{index}",
+                 origin: "process:seed",
+                 assignment_id: absent_opener_assignment.id,
+                 prompt: "cross the threshold with no opener"
+               })
+    end
+
+    assert {:ok, [[absent_fallback_target, absent_fallback_assignment, absent_fallback_item]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sessionKey,assignmentId,work_item_id FROM wakes WHERE origin='remedy:ac6a-queue-backlog' AND assignmentId=?1",
+               [absent_opener_assignment.id]
+             )
+
+    assert [absent_fallback_target, absent_fallback_assignment, absent_fallback_item] ==
+             [coordinator.session_key, absent_opener_assignment.id, work_item_id]
+
+    no_context = session(ctx.db, "ac6a-missing-owner-context", "flynn", archetype: "coder")
+
+    for index <- 1..20 do
+      assert {:ok, _} =
+               Ledger.enqueue(ctx.db, %{
+                 session_key: no_context.session_key,
+                 message_id: "ac6a-no-context-#{index}",
+                 origin: "process:seed",
+                 prompt: "no opener or work item context"
+               })
+    end
+
+    assert {:ok, [[20]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM turns WHERE sessionKey=?1 AND status='queued'",
+               [no_context.session_key]
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM lifecycle_events WHERE kind='rule_notice_failed' AND subject='ac6a-queue-backlog'"
+             )
   end
 
   test "ad hoc predicates validate ownership and make nil fail every operator", ctx do
@@ -2113,6 +3626,7 @@ defmodule Tightbeam.RulesTest do
       p3_call("assign", opener, %{
         subject: opts[:subject] || "P3 assignment #{System.unique_integer([:positive])}",
         idempotency_key: nil,
+        work_item_id: opts[:work_item_id],
         reviews_assignment_id: opts[:reviews],
         effect_kind: opts[:effect_kind],
         files: opts[:files]
@@ -2205,6 +3719,121 @@ defmodule Tightbeam.RulesTest do
         assignment_id,
         work_item_id
       ])
+  end
+
+  defp create_work_item(ctx, work_item_id) do
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO work_items (id, title, ownerUserId, state, createdByUser, createdAt) " <>
+          "VALUES (?1, 'AC6a row test', 'flynn', 'open', 'flynn', 1)",
+        [work_item_id]
+      )
+  end
+
+  defp load_ac6a_rules(ctx) do
+    put_raw(
+      ctx,
+      File.read!("priv/kungfu/agentic-engineering/rules/ac6a.toml"),
+      "ac6a.toml"
+    )
+
+    rules = Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    # Gateway startup activates row-commit recognition after loading rules.
+    :ok = Wakes.activate_wait_recognition(ctx.db)
+    rules
+  end
+
+  defp ac6a_backlog_fixture(ctx, name) do
+    holder = session(ctx.db, "ac6a-#{name}", "flynn", archetype: "coder")
+    session(ctx.db, Org.personal_session_key("flynn"), "flynn", kind: "main")
+    opened = assignment(ctx, holder.session_key, {:user, "flynn"})
+    attach_work_item(ctx, opened.id, "wi_ac6a_#{name}")
+    load_ac6a_rules(ctx)
+    {holder, opened}
+  end
+
+  defp ac6a_enqueue(ctx, holder, opened, message_id) do
+    assert {:ok, seq} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: holder.session_key,
+               message_id: message_id,
+               origin: "process:seed",
+               assignment_id: opened.id,
+               prompt: "backlog episode regression"
+             })
+
+    seq
+  end
+
+  defp queued_depth(db, session_key) do
+    assert {:ok, [[count]]} =
+             DB.query(db, "SELECT COUNT(*) FROM turns WHERE sessionKey=?1 AND status='queued'", [
+               session_key
+             ])
+
+    count
+  end
+
+  defp finish_claim(db, claimed) do
+    assert :ok =
+             Ledger.finish(db, claimed.seq, "delivered", nil, owner_lease: claimed.owner_lease)
+  end
+
+  defp verified_code_refs(ctx, producer, holder, reviewer) do
+    {sha, 0} = System.cmd("git", ["rev-parse", "HEAD"])
+
+    refs = [
+      %{
+        "repo" => "#{Tightbeam.Placement.local_host_name()}:#{File.cwd!()}",
+        "commit" => String.trim(sha)
+      }
+    ]
+
+    review = assignment(ctx, reviewer.session_key, {:user, "flynn"}, reviews: producer.id)
+
+    for {session_key, assignment_id, kind} <- [
+          {holder.session_key, producer.id, "verified"},
+          {reviewer.session_key, review.id, "reviewed-clean"}
+        ] do
+      assert %{attest: %{verdictKind: ^kind}} =
+               Assignments.__handle__(
+                 ctx.db,
+                 "attest",
+                 p3_call("attest", {:session, session_key}, %{
+                   assignment_id: assignment_id,
+                   kind: "verdict",
+                   verdict_kind: kind,
+                   commit_refs: refs
+                 })
+               )
+    end
+
+    refs
+  end
+
+  defp notice_count(db, origin) do
+    {:ok, [[count]]} = DB.query(db, "SELECT COUNT(*) FROM wakes WHERE origin=?1", [origin])
+    count
+  end
+
+  defp setup_work_item_coordinator(ctx, work_item_id) do
+    coordinator = session(ctx.db, "ac6a-work-item-coordinator", "flynn", archetype: "pdo")
+
+    set_work_item_owner(ctx, work_item_id, coordinator.session_key)
+    coordinator
+  end
+
+  defp set_work_item_owner(ctx, work_item_id, session_key) do
+    assert %{deliveryOwnerSessionKey: ^session_key} =
+             Tightbeam.WorkItems.__handle__(ctx.db, "work-item-update", %{
+               origin: "user:flynn",
+               principal: {:user, "flynn"},
+               params: %{
+                 work_item_id: work_item_id,
+                 delivery_owner_session_key: session_key
+               }
+             })
   end
 
   defp record_artifact(ctx, work_item_id, session_key, kind, state) do

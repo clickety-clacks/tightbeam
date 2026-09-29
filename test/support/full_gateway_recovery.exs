@@ -1,4 +1,6 @@
 defmodule Tightbeam.RecoveryScenario do
+  import ExUnit.Assertions
+
   alias Tightbeam.{DB, Gateway, Model, Org, Placement, Wakes}
 
   def await!(predicate, deadline \\ nil) do
@@ -149,6 +151,7 @@ defmodule Tightbeam.RecoveryScenario do
     await!(fn ->
       rows("SELECT status FROM turns WHERE sessionKey='agent:recovery:a' ORDER BY seq") == [
         ["failed_unknown"],
+        ["delivered"],
         ["delivered"]
       ] and
         rows("SELECT status FROM turns WHERE wakeId='w_recovery_b'") == [["delivered"]] and
@@ -156,6 +159,36 @@ defmodule Tightbeam.RecoveryScenario do
           "SELECT state FROM wakes WHERE wakeId IN ('w_recovery_b','w_recovery_c') ORDER BY wakeId"
         ) == [["fired"], ["fired"]]
     end)
+
+    [
+      [source_turn_seq, "failed_unknown", source_message_id, source_origin, source_prompt],
+      [
+        successor_turn_seq,
+        "delivered",
+        _successor_message_id,
+        _successor_origin,
+        _successor_prompt
+      ],
+      [redelivery_turn_seq, "delivered", source_message_id, source_origin, source_prompt]
+    ] =
+      rows("""
+      SELECT seq,status,messageId,origin,prompt
+      FROM turns WHERE sessionKey='agent:recovery:a' ORDER BY seq
+      """)
+
+    assert source_turn_seq < successor_turn_seq
+    assert successor_turn_seq < redelivery_turn_seq
+
+    [[1]] =
+      rows(
+        """
+        SELECT COUNT(*) FROM health_redelivery_attempts
+        WHERE sessionKey='agent:recovery:a' AND sourceTurnSeq=?1
+          AND sourceMessageId=?2 AND restorationTurnSeq=?3
+          AND redeliveryTurnSeq=?4 AND failureClass='interrupted-outcome-unknown'
+        """,
+        [source_turn_seq, source_message_id, successor_turn_seq, redelivery_turn_seq]
+      )
 
     [["delivered"]] = rows("SELECT status FROM turns WHERE wakeId='w_recovery_c'")
     # Publication/fired and consumer terminal are independent assertions.

@@ -28,6 +28,7 @@ if (fs.readFileSync(path.join(home, "fixture.json"), "utf8") !==
   throw new Error("fixture accepts only its synthetic arena credential");
 }
 const transcript = path.join(arena, "recovery-acp.jsonl");
+const heldPromptMarker = path.join(arena, "recovery-hold-a-observed");
 const record = (direction, frame) => fs.appendFileSync(transcript,
   JSON.stringify({ pid: process.pid, direction, frame }) + "\n");
 const send = (frame) => {
@@ -87,10 +88,20 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
       }
       const text = p.prompt.map((part) => part.text).join("\n");
       // The controller uses this explicit arena barrier to observe A running.
-      // It never completes A; restart must mark that turn failed_unknown.
+      // Its first attempt remains pending so restart marks that turn failed_unknown.
+      // AC4 then redelivers the same source after the queued successor succeeds;
+      // complete that one replay so the fixture can verify the durable retry.
       if (text.includes("RECOVERY_HOLD_A")) {
-        pending.set(p.sessionId, frame.id);
-        return;
+        if (!fs.existsSync(heldPromptMarker)) {
+          fs.writeFileSync(heldPromptMarker, "first source delivery held\n", { flag: "wx" });
+          pending.set(p.sessionId, frame.id);
+          return;
+        }
+
+        send({ method: "session/update", params: { sessionId: p.sessionId,
+          update: { sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "recovered original prompt delivered once" } } } });
+        return reply(frame.id, { stopReason: "end_turn" });
       }
       send({ method: "session/update", params: { sessionId: p.sessionId,
         update: { sessionUpdate: "agent_message_chunk",
