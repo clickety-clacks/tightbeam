@@ -38,7 +38,7 @@ jobs:
           - os: macos-latest
             name: macos
     name: ${{ matrix.name }}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.name == 'macos' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "eezo-macos"]') || matrix.os }}
     steps:
       - name: Validate exact source SHA
         shell: bash
