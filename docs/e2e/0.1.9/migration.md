@@ -213,9 +213,9 @@ manifest. The database file and manifest together are the migration result.
 
 ```sh
 mkdir -p "$trial_root/migrated-output"
-# VACUUM INTO leaves its source file unchanged, but SQLite must be able to write
-# the new destination database.
-sqlite3 -bail "$test_base/state.db" \
+# VACUUM INTO reads this source through a read-only connection and writes only
+# the separate destination database, which must not already exist.
+sqlite3 -readonly -bail "$test_base/state.db" \
   "VACUUM INTO '$trial_root/migrated-output/state.db';"
 shasum -a 256 "$trial_root/migrated-output/state.db"
 ```
