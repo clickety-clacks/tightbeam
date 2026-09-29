@@ -1657,7 +1657,10 @@ defmodule Tightbeam.Schema do
     liveness_objects =
       cond do
         supervision_receipt_cancellation_active?(txn, shape) ->
-          @supervision_receipt_cancellation_liveness_objects
+          Enum.reject(
+            @supervision_receipt_cancellation_liveness_objects,
+            &(&1.name == "supervision_receipt_cancellation_epoch")
+          )
 
         shape in [
           @cannot_proceed_shape,
@@ -1744,19 +1747,13 @@ defmodule Tightbeam.Schema do
     :ok
   end
 
-  defp supervision_receipt_cancellation_active?(txn, shape) do
+  defp supervision_receipt_cancellation_active?(txn, _shape) do
     marker =
       Enum.find(@supervision_receipt_cancellation_liveness_objects, fn object ->
         object.name == "supervision_receipt_cancellation_epoch"
       end)
 
     if owned_object_present?(txn, marker) do
-      unless shape == @work_item_owner_link_shape do
-        incompatible_supervision_liveness!(
-          "receipt cancellation marker appears under unexpected schema stamp #{shape}"
-        )
-      end
-
       validate_owned_object!(txn, marker)
 
       case Txn.q(
