@@ -293,7 +293,26 @@ defmodule Tightbeam.AdapterCoordinator do
     # park rows kept their fence but lost their durable outcome.
     park_deadline = settle_start - state.shutdown_cancel_grace_ms
 
+    shutdown_diag_phase(:preparation)
+    shutdown_diag(:terminate_start, %{
+      now_ms: System.monotonic_time(:millisecond),
+      deadline_ms: deadline,
+      settle_start_ms: settle_start,
+      park_deadline_ms: park_deadline,
+      budget_ms: state.shutdown_budget_ms,
+      settlement_budget_ms: state.shutdown_settlement_budget_ms,
+      cancel_grace_ms: state.shutdown_cancel_grace_ms
+    })
+
     {pending, state, preparation} = prepare_shutdown(state, park_deadline)
+    shutdown_diag_phase(:park_collection)
+
+    shutdown_diag(:preparation_done, %{
+      now_ms: System.monotonic_time(:millisecond),
+      pending_count: length(pending),
+      preparation: shutdown_diag_outcome(preparation),
+      park_deadline_remaining_ms: park_deadline - System.monotonic_time(:millisecond)
+    })
 
     results =
       case preparation do
@@ -314,16 +333,51 @@ defmodule Tightbeam.AdapterCoordinator do
           preparation_unresolved_results(pending, reason)
       end
 
+    shutdown_diag(:park_results_ready, %{
+      now_ms: System.monotonic_time(:millisecond),
+      result_count: length(results),
+      settle_start_remaining_ms: settle_start - System.monotonic_time(:millisecond)
+    })
+
     # Retirement's cutoff is the reserve boundary, not the park deadline: on
     # the happy path the grace window goes unused, and retirement may keep
     # using it right up to where the settlement reserve begins.
+    shutdown_diag_phase(:retirement)
+    shutdown_diag(:retirement_start, %{
+      now_ms: System.monotonic_time(:millisecond),
+      result_count: length(results),
+      settle_start_remaining_ms: settle_start - System.monotonic_time(:millisecond)
+    })
+
     {results, state, late_targets} = retire_shutdown_results(results, state, settle_start)
+
+    shutdown_diag(:retirement_done, %{
+      now_ms: System.monotonic_time(:millisecond),
+      late_target_count: length(late_targets),
+      settle_start_remaining_ms: settle_start - System.monotonic_time(:millisecond)
+    })
 
     # Durable settlement runs before any late cleanup, so it is reachable inside
     # the configured deadline no matter how many adapters were retained; the
     # cleanup those late entries still need is handed to its own owner after.
+    shutdown_diag_phase(:settlement)
+    shutdown_diag(:settlement_start, %{
+      now_ms: System.monotonic_time(:millisecond),
+      result_count: length(results),
+      deadline_remaining_ms: deadline - System.monotonic_time(:millisecond)
+    })
+
     settle_shutdown_results(results, state, deadline)
+
+    shutdown_diag(:settlement_done, %{
+      now_ms: System.monotonic_time(:millisecond),
+      deadline_remaining_ms: deadline - System.monotonic_time(:millisecond)
+    })
+
+    shutdown_diag_phase(:late_cleanup_dispatch)
+    shutdown_diag(:late_cleanup_dispatch_start, %{target_count: length(late_targets)})
     dispatch_late_cleanup(late_targets, state)
+    shutdown_diag(:late_cleanup_dispatch_done, %{})
 
     :ok
   end
@@ -571,6 +625,58 @@ defmodule Tightbeam.AdapterCoordinator do
   # shutdown result therefore has to remain durable in the harness ledger and
   # lifecycle stream; returning an error here would falsely suggest that
   # Application.stop/1 can report the cleanup failure.
+  defp shutdown_diag(event, fields) do
+    case :ets.whereis(:adapter_shutdown_diag) do
+      :undefined ->
+        :ok
+
+      table ->
+        case :ets.lookup(table, :target) do
+          [{:target, target}] when target == self() ->
+            phase =
+              case :ets.lookup(table, {:phase, target}) do
+                [{{:phase, ^target}, value}] -> value
+                _ -> nil
+              end
+
+            fields = if phase, do: Map.put(fields, :phase, phase), else: fields
+            at_us = System.monotonic_time(:microsecond)
+      :ets.insert(
+        table,
+        {{at_us, System.unique_integer([:positive])}, self(), event, fields}
+      )
+            :ok
+
+          _ ->
+            :ok
+        end
+    end
+  catch
+    :error, :badarg -> :ok
+  end
+
+  defp shutdown_diag_phase(phase) do
+    case :ets.whereis(:adapter_shutdown_diag) do
+      :undefined ->
+        :ok
+
+      table ->
+        if :ets.lookup(table, :target) == [{:target, self()}],
+          do: :ets.insert(table, {{:phase, self()}, phase})
+
+        :ok
+    end
+  catch
+    :error, :badarg -> :ok
+  end
+
+  defp shutdown_diag_outcome(nil), do: :timeout
+  defp shutdown_diag_outcome(:ok), do: :ok
+  defp shutdown_diag_outcome({:ok, _}), do: :ok
+  defp shutdown_diag_outcome({:exit, _}), do: :exit
+  defp shutdown_diag_outcome({:error, _}), do: :error
+  defp shutdown_diag_outcome(_), do: :other
+
   defp prepare_shutdown(state, deadline) do
     keys = Map.keys(state.adapters)
 
@@ -646,7 +752,20 @@ defmodule Tightbeam.AdapterCoordinator do
          cancel_grace_ms,
          results
        ) do
-    case Task.yield(task, max(deadline - System.monotonic_time(:millisecond), 0)) do
+    remaining_ms = max(deadline - System.monotonic_time(:millisecond), 0)
+    yield_started_us = System.monotonic_time(:microsecond)
+    shutdown_diag(:park_task_yield_start, %{task_pid: task.pid, remaining_ms: remaining_ms})
+
+    outcome = Task.yield(task, remaining_ms)
+
+    shutdown_diag(:park_task_yield_done, %{
+      task_pid: task.pid,
+      elapsed_us: System.monotonic_time(:microsecond) - yield_started_us,
+      remaining_ms: deadline - System.monotonic_time(:millisecond),
+      outcome: shutdown_diag_outcome(outcome)
+    })
+
+    case outcome do
       {:ok, result} ->
         collect_shutdown_results(rest, deadline, settle_start, cancel_grace_ms, [
           {key, process_row, result} | results
@@ -671,6 +790,8 @@ defmodule Tightbeam.AdapterCoordinator do
   end
 
   defp cancel_shutdown_tasks(tasks) do
+    shutdown_diag(:cancel_notified, %{task_count: length(tasks)})
+
     Enum.each(tasks, fn {_key, _process_row, task} ->
       send(task.pid, {:tightbeam_shutdown_cancel, self()})
     end)
@@ -686,24 +807,62 @@ defmodule Tightbeam.AdapterCoordinator do
     cancel_deadline =
       min(System.monotonic_time(:millisecond) + cancel_grace_ms, settle_start)
 
+    shutdown_diag(:cancel_grace_start, %{
+      now_ms: System.monotonic_time(:millisecond),
+      settle_start_ms: settle_start,
+      cancel_deadline_ms: cancel_deadline,
+      cancel_grace_ms: cancel_grace_ms,
+      task_count: length(tasks)
+    })
+
     yielded =
       Enum.map(tasks, fn {key, process_row, task} ->
         remaining = max(cancel_deadline - System.monotonic_time(:millisecond), 0)
-        {key, process_row, task, Task.yield(task, remaining)}
+        yield_started_us = System.monotonic_time(:microsecond)
+        shutdown_diag(:cancel_task_yield_start, %{task_pid: task.pid, remaining_ms: remaining})
+        outcome = Task.yield(task, remaining)
+
+        shutdown_diag(:cancel_task_yield_done, %{
+          task_pid: task.pid,
+          elapsed_us: System.monotonic_time(:microsecond) - yield_started_us,
+          remaining_ms: cancel_deadline - System.monotonic_time(:millisecond),
+          outcome: shutdown_diag_outcome(outcome)
+        })
+
+        {key, process_row, task, outcome}
       end)
+
+    shutdown_diag(:cancel_yields_complete, %{
+      now_ms: System.monotonic_time(:millisecond),
+      settle_start_remaining_ms: settle_start - System.monotonic_time(:millisecond)
+    })
 
     # Kill every task that outlived its grace before awaiting any of them, so
     # the DOWN waits overlap. Awaiting each kill inside the yield loop let the
     # waits accumulate serially, and on a starved scheduler their sum spent the
     # settlement reserve just like the unbudgeted grace did.
     Enum.each(yielded, fn
-      {_key, _process_row, task, nil} -> Process.exit(task.pid, :kill)
-      _ -> :ok
+      {_key, _process_row, task, nil} ->
+        shutdown_diag(:task_kill_start, %{task_pid: task.pid})
+        result = Process.exit(task.pid, :kill)
+        shutdown_diag(:task_kill_done, %{task_pid: task.pid, result: result})
+
+      _ ->
+        :ok
     end)
 
     Enum.map(yielded, fn {key, process_row, task, outcome} ->
       if outcome == nil do
-        _ = Task.shutdown(task, :brutal_kill)
+        shutdown_started_us = System.monotonic_time(:microsecond)
+        shutdown_diag(:task_shutdown_start, %{task_pid: task.pid})
+        shutdown_result = Task.shutdown(task, :brutal_kill)
+
+        shutdown_diag(:task_shutdown_done, %{
+          task_pid: task.pid,
+          elapsed_us: System.monotonic_time(:microsecond) - shutdown_started_us,
+          outcome: shutdown_diag_outcome(shutdown_result),
+          settle_start_remaining_ms: settle_start - System.monotonic_time(:millisecond)
+        })
       end
 
       {key, process_row, {:error, :shutdown_budget_exhausted}}
@@ -733,7 +892,19 @@ defmodule Tightbeam.AdapterCoordinator do
       {late, targets} = late_shutdown_outcomes([{key, process_row, result} | rest], state)
       {Enum.reverse(retired) ++ late, state, targets}
     else
+      retire_started_us = System.monotonic_time(:microsecond)
+
+      shutdown_diag(:retire_adapter_start, %{
+        remaining_ms: deadline - System.monotonic_time(:millisecond)
+      })
+
       state = retire_shutdown_adapter(key, state)
+
+      shutdown_diag(:retire_adapter_done, %{
+        elapsed_us: System.monotonic_time(:microsecond) - retire_started_us,
+        remaining_ms: deadline - System.monotonic_time(:millisecond)
+      })
+
       retire_shutdown_results(rest, state, deadline, [{key, process_row, result} | retired])
     end
   end
@@ -838,7 +1009,23 @@ defmodule Tightbeam.AdapterCoordinator do
   end
 
   defp settle_shutdown_results(results, state, deadline) do
-    case Tightbeam.HarnessProcess.settle_park_results_until(state.db, results, deadline) do
+    started_us = System.monotonic_time(:microsecond)
+
+    shutdown_diag(:settlement_wrapper_call_start, %{
+      result_count: length(results),
+      deadline_ms: deadline,
+      remaining_ms: deadline - System.monotonic_time(:millisecond)
+    })
+
+    outcome = Tightbeam.HarnessProcess.settle_park_results_until(state.db, results, deadline)
+
+    shutdown_diag(:settlement_wrapper_call_done, %{
+      elapsed_us: System.monotonic_time(:microsecond) - started_us,
+      remaining_ms: deadline - System.monotonic_time(:millisecond),
+      outcome: shutdown_diag_outcome(outcome)
+    })
+
+    case outcome do
       :ok ->
         :ok
 

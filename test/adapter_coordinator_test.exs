@@ -1387,32 +1387,83 @@ defmodule Tightbeam.AdapterCoordinatorTest do
              300
            )
 
-    started_at = System.monotonic_time(:millisecond)
-    assert :ok = GenServer.stop(coordinator, :shutdown, 5_000)
-    elapsed_ms = System.monotonic_time(:millisecond) - started_at
+    trace_table =
+      :ets.new(:adapter_shutdown_diag, [
+        :named_table,
+        :public,
+        :ordered_set,
+        write_concurrency: true
+      ])
 
-    assert elapsed_ms < 2_000
+    :ets.insert(trace_table, {:target, coordinator})
 
-    rows = HarnessProcess.list(ctx.db)
-    assert length(rows) == length(keys)
-    assert Enum.all?(rows, &(&1.state == "kill_failed"))
-    assert Enum.all?(rows, &(&1.last_error =~ "shutdown_budget_exhausted"))
-    assert Enum.all?(keys, &HarnessProcess.fenced?(ctx.db, &1))
+    try do
+      started_at = System.monotonic_time(:millisecond)
+      assert :ok = GenServer.stop(coordinator, :shutdown, 5_000)
+      elapsed_ms = System.monotonic_time(:millisecond) - started_at
+      Process.put(:adapter_shutdown_diag_elapsed_ms, elapsed_ms)
 
-    assert length(
-             Enum.filter(
-               EventLog.lifecycle_events(ctx.db),
-               &(&1.kind == "adapter_shutdown_cleanup_failed")
+      assert elapsed_ms < 2_000
+
+      rows = HarnessProcess.list(ctx.db)
+      assert length(rows) == length(keys)
+      assert Enum.all?(rows, &(&1.state == "kill_failed"))
+      assert Enum.all?(rows, &(&1.last_error =~ "shutdown_budget_exhausted"))
+      assert Enum.all?(keys, &HarnessProcess.fenced?(ctx.db, &1))
+
+      assert length(
+               Enum.filter(
+                 EventLog.lifecycle_events(ctx.db),
+                 &(&1.kind == "adapter_shutdown_cleanup_failed")
+               )
+             ) == length(keys)
+
+      # The forced path must cancel the port-owned helper as well as record the
+      # durable cleanup failure. A Task kill alone can strand the shebang wrapper
+      # on macOS, where suite teardown catches it as a leaked fixture process.
+      assert eventually(
+               fn -> HarnessProcessCensus.capture_for_root(ctx.test_dir).count == 0 end,
+               300
              )
-           ) == length(keys)
+    after
+      trace_rows =
+        :ets.tab2list(trace_table)
+        |> Enum.filter(fn
+          {{at_us, _sequence}, _pid, _event, _fields} when is_integer(at_us) -> true
+          _ -> false
+        end)
+        |> Enum.sort_by(fn {{at_us, sequence}, _pid, _event, _fields} -> {at_us, sequence} end)
 
-    # The forced path must cancel the port-owned helper as well as record the
-    # durable cleanup failure. A Task kill alone can strand the shebang wrapper
-    # on macOS, where suite teardown catches it as a leaked fixture process.
-    assert eventually(
-             fn -> HarnessProcessCensus.capture_for_root(ctx.test_dir).count == 0 end,
-             300
-           )
+      origin_us =
+        case trace_rows do
+          [{{at_us, _sequence}, _pid, _event, _fields} | _] -> at_us
+          [] -> System.monotonic_time(:microsecond)
+        end
+
+      trace_rows =
+        Enum.map(trace_rows, fn {{at_us, sequence}, pid, event, fields} ->
+          %{
+            at_us: at_us - origin_us,
+            sequence: sequence,
+            pid: inspect(pid),
+            event: event,
+            fields: fields
+          }
+        end)
+
+      IO.inspect(Process.get(:adapter_shutdown_diag_elapsed_ms),
+        label: "ADAPTER_SHUTDOWN_DIAG_ELAPSED_MS"
+      )
+
+      IO.inspect(trace_rows,
+        label: "ADAPTER_SHUTDOWN_DIAG_EVENTS",
+        limit: :infinity,
+        printable_limit: :infinity,
+        pretty: false
+      )
+
+      :ets.delete(trace_table)
+    end
   end
 
   test "preparation exhaustion fences every adapter and records each outcome", ctx do
