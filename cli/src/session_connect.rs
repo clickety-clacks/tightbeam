@@ -2073,13 +2073,16 @@ mod tests {
         stream: TcpStream,
         protocol_version: u64,
     ) -> (tungstenite::WebSocket<TcpStream>, Value) {
-        let mut socket = tungstenite::accept_hdr(stream, |request, response| {
-            assert_eq!(
-                request.uri().query(),
-                Some(format!("protocolVersion={protocol_version}").as_str())
-            );
-            Ok(response)
-        })
+        let mut socket = tungstenite::accept_hdr(
+            stream,
+            |request: &tungstenite::handshake::server::Request, response| {
+                assert_eq!(
+                    request.uri().query(),
+                    Some(format!("protocolVersion={protocol_version}").as_str())
+                );
+                Ok(response)
+            },
+        )
         .unwrap();
 
         let Message::Text(auth) = socket.read().unwrap() else {
