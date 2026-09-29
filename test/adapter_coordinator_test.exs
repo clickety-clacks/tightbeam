@@ -1501,8 +1501,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     elapsed_ms = System.monotonic_time(:millisecond) - started_at
     assert elapsed_ms < 2_000
     assert {:ok, :ok} = Task.await(blocker, 1_000)
-    assert_received {:delayed_db_proxy_result, 1,
-                     {:error, %Tightbeam.DB.DeadlineExceeded{}}}
+    assert_received {:delayed_db_proxy_result, 1, {:error, %Tightbeam.DB.DeadlineExceeded{}}}
 
     assert log =~ "preparation unresolved"
 
