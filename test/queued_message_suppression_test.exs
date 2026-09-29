@@ -1,7 +1,16 @@
 defmodule Tightbeam.QueuedMessageSuppressionTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{Assignments, DB, Gateway, Ledger, Roles, Rules, Wakes}
+  alias Tightbeam.{
+    Assignments,
+    DB,
+    Gateway,
+    Ledger,
+    QueuedMessageSuppression,
+    Roles,
+    Rules,
+    Wakes
+  }
 
   setup do
     db = String.to_atom("queued_message_suppression_#{System.unique_integer([:positive])}")
@@ -413,9 +422,34 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
     assert delayed_old_wake.due_at > newer_wake.due_at
 
     newer_seq = deliver_wake!(db, newer_wake)
-    # deliver_wake!/2 appends directly, so this models the older scheduled wake
-    # firing late after the newer replacement is already queued.
-    delayed_old_seq = deliver_wake!(db, delayed_old_wake)
+
+    delayed_retry_wake =
+      Wakes.schedule(db, %{
+        session_key: "k1",
+        origin: "session:sender",
+        prompt: "older delayed instruction",
+        due_at: System.system_time(:millisecond) + 60_000,
+        creator_session_key: "sender"
+      })
+
+    assert {:ok, :ok} =
+             DB.transaction(db, fn txn ->
+               QueuedMessageSuppression.copy_replacement_request_in_txn(
+                 txn,
+                 delayed_old_wake.wake_id,
+                 delayed_retry_wake.wake_id
+               )
+             end)
+
+    assert {:ok, [[100]]} =
+             DB.query(
+               db,
+               "SELECT requestedAt FROM queued_message_replacement_requests WHERE wakeId=?1",
+               [delayed_retry_wake.wake_id]
+             )
+
+    # The delayed retry carries its source timestamp even though its wake row is new.
+    delayed_old_seq = deliver_wake!(db, delayed_retry_wake)
 
     assert {:ok, [["queued"]]} =
              DB.query(db, "SELECT status FROM turns WHERE seq=?1", [newer_seq])
