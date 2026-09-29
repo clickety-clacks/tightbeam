@@ -56,6 +56,14 @@ where a mock could hide severe failure, release needs real-response evidence.
 Independent review may start before tests pass; completion still needs verified evidence. Where a mechanism protects a concrete invariant, protect it; where it only
 enforces a preferred workflow, leave it to judgment. Iterate in the smallest loop that can show the change works: a small change and the narrowest test that exercises it, repeated until it passes. Widen to comprehensive testing and independent review once the change holds, not on every step. A card is the unit of review, not every edit inside it.
 
+## Test only the version under test
+
+Before a test run, confirm and record the versions of every component it touches.
+Bring mismatched components to the version under test before running it: mixed
+versions produce results that describe no real build, so their pass or failure
+means nothing. Tests deliberately exercising an explicitly requested version-mix
+scenario are the exception.
+
 ## Scope and repositories
 
 Build the authorized outcome and necessary supporting behavior. Route incidental
