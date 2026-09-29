@@ -990,7 +990,7 @@ defmodule Tightbeam.Supervision do
                txn,
                assignment_id,
                interval,
-               wake_kind == "prod"
+               wake_kind in ["prod", "escalation"]
              ) do
           :rebased ->
             :canceled
