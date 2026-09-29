@@ -6099,9 +6099,7 @@ mod tests {
                 request.extend_from_slice(&chunk[..read]);
                 assert!(request.len() < 8192, "unexpected unbounded test request");
 
-                let Some(header_end) = request
-                    .windows(4)
-                    .position(|part| part == b"\r\n\r\n")
+                let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
                 else {
                     continue;
                 };
