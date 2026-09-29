@@ -297,8 +297,10 @@ defmodule Tightbeam.GatewayTest do
     def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
     def init(parent), do: {:ok, parent}
 
-    def handle_call({:new_candidate_session, _model, _cwd, _mcp, _guidance}, _from, parent),
-      do: {:reply, {:error, :deliberate_candidate_failure}, parent}
+    def handle_call({:new_candidate_session, _model, _cwd, _mcp, _guidance}, _from, parent) do
+      send(parent, :candidate_prepare_attempted)
+      {:reply, {:error, :deliberate_candidate_failure}, parent}
+    end
   end
 
   defmodule MismatchedCandidateAdapterStub do
@@ -7152,6 +7154,68 @@ defmodule Tightbeam.GatewayTest do
     assert File.read!(Path.join(home, "auth.json")) == "test-token"
     refute File.exists?(Path.join([home, ".tightbeam", "manifest"]))
     send(runner, :finish_set_harness_turn)
+  end
+
+  test "set_harness refuses a durable running turn after its lane becomes idle", ctx do
+    candidate = start_supervised!({FailingCandidateAdapterStub, self()})
+
+    {config, _local_host} =
+      queued_harness_switch_config!(ctx, "harness-orphaned-running-turn", candidate)
+
+    Org.append_pointer(ctx.db, "k1", "source-session", "created")
+
+    {:ok, running_seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: "k1",
+        message_id: "orphaned-running-turn",
+        origin: "user:flynn",
+        prompt: "still executing after lane restart"
+      })
+
+    {:ok, queued_seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: "k1",
+        message_id: "orphaned-running-turn-followup",
+        origin: "user:flynn",
+        prompt: "keep this queued"
+      })
+
+    assert {:ok, claimed_turn} = Ledger.claim_next(ctx.db, "k1", "interrupted-lane")
+    assert claimed_turn.seq == running_seq
+
+    before = Org.get(ctx.db, "k1")
+    before_pointer = Org.current_pointer(ctx.db, "k1")
+    assert Ledger.running?(ctx.db, "k1")
+    assert Ledger.pending_count(ctx.db, "k1") == 2
+
+    assert %{ok: false, code: "turn_in_progress", message: message} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: "user:flynn",
+               session_key: "k1",
+               params: %{setting: "set_harness", harness: "codex", model: "gpt-5.6-sol"}
+             })
+
+    assert message =~ "Try again once the current turn finishes"
+    refute_received :candidate_prepare_attempted
+    assert Org.get(ctx.db, "k1") == before
+    assert Org.current_pointer(ctx.db, "k1") == before_pointer
+    assert Ledger.running?(ctx.db, "k1")
+    assert Ledger.pending_count(ctx.db, "k1") == 2
+
+    assert {:ok, queued_rows} =
+             DB.query(
+               ctx.db,
+               "SELECT seq,status,messageId FROM turns WHERE sessionKey='k1' ORDER BY seq"
+             )
+
+    assert queued_rows == [
+             [running_seq, "running", "orphaned-running-turn"],
+             [queued_seq, "queued", "orphaned-running-turn-followup"]
+           ]
+
+    refute Enum.any?(Projection.list_after(ctx.db, "k1", nil, 100), fn message ->
+             message.marker && message.marker.kind == "harness-switch"
+           end)
   end
 
   test "queued set_harness handoff excludes exact replacement QMS sources and keeps other durable order",
