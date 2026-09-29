@@ -43,72 +43,6 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
     %{db: db}
   end
 
-  test "migrates replacement requests with durable insertion order", %{db: db} do
-    assignment!(db, "asg_request_order_migration")
-    session!(db, "sender")
-
-    first_wake =
-      Wakes.schedule(db, %{
-        session_key: "k1",
-        origin: "session:sender",
-        prompt: "first request",
-        due_at: System.system_time(:millisecond),
-        creator_session_key: "sender"
-      })
-
-    second_wake =
-      Wakes.schedule(db, %{
-        session_key: "k1",
-        origin: "session:sender",
-        prompt: "second request",
-        due_at: System.system_time(:millisecond),
-        creator_session_key: "sender"
-      })
-
-    :ok = DB.execute(db, "DROP TABLE queued_message_replacement_requests")
-
-    :ok =
-      DB.execute(db, """
-      CREATE TABLE queued_message_replacement_requests (
-        wakeId       TEXT PRIMARY KEY REFERENCES wakes(wakeId) ON DELETE RESTRICT,
-        assignmentId TEXT NOT NULL REFERENCES assignments(id) ON DELETE RESTRICT,
-        requestedAt  INTEGER NOT NULL CHECK(requestedAt >= 0)
-      )
-      """)
-
-    assert {:ok, []} =
-             DB.query(
-               db,
-               "INSERT INTO queued_message_replacement_requests VALUES (?1,?2,100)",
-               [first_wake.wake_id, "asg_request_order_migration"]
-             )
-
-    assert {:ok, []} =
-             DB.query(
-               db,
-               "INSERT INTO queued_message_replacement_requests VALUES (?1,?2,100)",
-               [second_wake.wake_id, "asg_request_order_migration"]
-             )
-
-    assert :ok = QueuedMessageSuppression.ensure_schema(db)
-
-    assert {:ok, [[100, first_order]]} =
-             DB.query(
-               db,
-               "SELECT requestedAt,requestOrder FROM queued_message_replacement_requests WHERE wakeId=?1",
-               [first_wake.wake_id]
-             )
-
-    assert {:ok, [[100, second_order]]} =
-             DB.query(
-               db,
-               "SELECT requestedAt,requestOrder FROM queued_message_replacement_requests WHERE wakeId=?1",
-               [second_wake.wake_id]
-             )
-
-    assert first_order < second_order
-  end
-
   test "suppresses an exact liveness wake after a newer typed receipt", %{db: db} do
     assignment!(db, "asg_liveness")
     wake = liveness_wake!(db, "asg_liveness", "old liveness notice")
@@ -357,10 +291,9 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
     assert detail =~ "#{replacement_seq}"
   end
 
-  test "replacement delivery claims next and keeps source durable for equal request timestamps",
-       %{
-         db: db
-       } do
+  test "replacement delivery claims next and keeps source durable when request time regresses", %{
+    db: db
+  } do
     assignment!(db, "asg_next")
     session!(db, "sender")
 
@@ -382,16 +315,17 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
 
     old_seq = deliver_wake!(db, old_wake)
 
-    # Equal timestamps exercise the production tie directly; requestOrder keeps
-    # the older durable request first even when wall-clock time cannot order them.
-    old_request_at = 100
+    # The production edge is two requests in one millisecond. Put the older
+    # durable request ahead of the current wall clock to exercise that tie
+    # deterministically, including a clock step backward between requests.
+    old_request_at = System.system_time(:millisecond) + 60_000
 
-    assert {:ok, []} =
-             DB.query(
-               db,
-               "UPDATE queued_message_replacement_requests SET requestedAt=?1 WHERE wakeId=?2",
-               [old_request_at, old_wake.wake_id]
-             )
+    {:ok, _} =
+      DB.query(
+        db,
+        "UPDATE queued_message_replacement_requests SET requestedAt=?1 WHERE wakeId=?2",
+        [old_request_at, old_wake.wake_id]
+      )
 
     wake =
       Wakes.schedule(db, %{
@@ -403,29 +337,6 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
         replacement_assignment_id: "asg_next"
       })
 
-    assert {:ok, []} =
-             DB.query(
-               db,
-               "UPDATE queued_message_replacement_requests SET requestedAt=?1 WHERE wakeId=?2",
-               [old_request_at, wake.wake_id]
-             )
-
-    assert {:ok, [[^old_request_at, old_order]]} =
-             DB.query(
-               db,
-               "SELECT requestedAt,requestOrder FROM queued_message_replacement_requests WHERE wakeId=?1",
-               [old_wake.wake_id]
-             )
-
-    assert {:ok, [[^old_request_at, new_order]]} =
-             DB.query(
-               db,
-               "SELECT requestedAt,requestOrder FROM queued_message_replacement_requests WHERE wakeId=?1",
-               [wake.wake_id]
-             )
-
-    assert old_order < new_order
-
     new_seq = deliver_wake!(db, wake)
 
     assert {:ok, [[new_request_at]]} =
@@ -435,7 +346,7 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
                [wake.wake_id]
              )
 
-    assert new_request_at == old_request_at
+    assert new_request_at > old_request_at
 
     assert {:ok, %{seq: ^new_seq, prompt: "[from session:sender]\n\nnew prompt"}} =
              Ledger.claim_next(db, "k1", "lane")
@@ -508,22 +419,6 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
                [newer_wake.wake_id]
              )
 
-    assert {:ok, [[older_order]]} =
-             DB.query(
-               db,
-               "SELECT requestOrder FROM queued_message_replacement_requests WHERE wakeId=?1",
-               [delayed_old_wake.wake_id]
-             )
-
-    assert {:ok, [[newer_order]]} =
-             DB.query(
-               db,
-               "SELECT requestOrder FROM queued_message_replacement_requests WHERE wakeId=?1",
-               [newer_wake.wake_id]
-             )
-
-    assert older_order < newer_order
-
     assert delayed_old_wake.due_at > newer_wake.due_at
 
     newer_seq = deliver_wake!(db, newer_wake)
@@ -546,14 +441,14 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
                )
              end)
 
-    assert {:ok, [[100, ^older_order]]} =
+    assert {:ok, [[100]]} =
              DB.query(
                db,
-               "SELECT requestedAt,requestOrder FROM queued_message_replacement_requests WHERE wakeId=?1",
+               "SELECT requestedAt FROM queued_message_replacement_requests WHERE wakeId=?1",
                [delayed_retry_wake.wake_id]
              )
 
-    # The delayed retry carries the original order even though its wake row is new.
+    # The delayed retry carries its source timestamp even though its wake row is new.
     delayed_old_seq = deliver_wake!(db, delayed_retry_wake)
 
     assert {:ok, [["queued"]]} =
