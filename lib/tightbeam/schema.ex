@@ -328,6 +328,7 @@ defmodule Tightbeam.Schema do
   @work_item_owner_link_shape "work-item-delivery-owner-v1-019"
   @identity_publication_denial_diagnostic_previous_shape @artifact_origin_shape
   @identity_publication_denial_diagnostic_shape "identity-publication-denial-diagnostic-v1-019"
+  @supervision_receipt_cancellation_shape "supervision-receipt-cancellation-v1-019"
   @cursor_provider_previous_shape @addressed_po_shape
   @liveness_progress_receipts_previous_shape "identity-universal-root-render-v1-019"
   @cannot_proceed_shape "cannot-proceed-v1-019"
@@ -1359,6 +1360,49 @@ defmodule Tightbeam.Schema do
                                        object
                                    end)
 
+  # Receipt-driven controller cancellation names the durable ledger row that
+  # superseded the scheduled wake. Preserve the prior liveness DDL for its
+  # stamped shape and migrate only from the current 0.1.9 schema.
+  @supervision_receipt_cancellation_liveness_objects [
+    %{
+      type: "table",
+      name: "supervision_receipt_cancellation_epoch",
+      sql: """
+      CREATE TABLE IF NOT EXISTS supervision_receipt_cancellation_epoch (
+        id INTEGER PRIMARY KEY CHECK(id = 0),
+        shape TEXT NOT NULL CHECK(shape = 'supervision-receipt-cancellation-v1-019'),
+        activatedAt INTEGER NOT NULL CHECK(activatedAt >= 0),
+        principal TEXT NOT NULL CHECK(principal = 'process:tightbeam')
+      )
+      """
+    }
+    | Enum.map(@cannot_proceed_liveness_objects, fn
+        %{name: "wake_cancellations", sql: sql} = object ->
+          old_source_tail = "'session_transition','scheduler_delivery'"
+          new_source_tail = "'session_transition','scheduler_delivery','supervision_receipt'"
+
+          new_supervision_route =
+            "causalSourceKind IN ('progress_attest','supervision_receipt') AND outcomeKind = 'no_replacement')"
+
+          true = String.contains?(sql, old_source_tail)
+          true = String.contains?(sql, "causalSourceKind = 'progress_attest'")
+
+          sql =
+            sql
+            |> String.replace(old_source_tail, new_source_tail, global: false)
+            |> String.replace(
+              "causalSourceKind = 'progress_attest' AND outcomeKind = 'no_replacement')",
+              new_supervision_route,
+              global: false
+            )
+
+          %{object | sql: sql}
+
+        object ->
+          object
+      end)
+  ]
+
   @doc false
   def guard_compatible_stamps do
     [
@@ -1506,6 +1550,7 @@ defmodule Tightbeam.Schema do
     :ok = Tightbeam.Ledger.ensure_schema(db)
     :ok = upgrade_identity_publication_denial_diagnostic(db)
     :ok = upgrade_work_item_delivery_owner_link(db)
+    :ok = upgrade_supervision_receipt_cancellation_v1(db)
 
     case DB.finish_schema(db) do
       :ok -> :ok
@@ -1610,17 +1655,24 @@ defmodule Tightbeam.Schema do
     [[shape]] = Txn.q(txn, "SELECT shape FROM schema_stamp")
 
     liveness_objects =
-      if shape in [
-           @cannot_proceed_shape,
-           @settlement_shape,
-           @terminal_credential_shape,
-           @agent_reparent_shape,
-           @artifact_origin_shape,
-           @identity_publication_denial_diagnostic_shape,
-           @work_item_owner_link_shape
-         ],
-         do: @cannot_proceed_liveness_objects,
-         else: @o2_liveness_objects
+      cond do
+        supervision_receipt_cancellation_active?(txn, shape) ->
+          @supervision_receipt_cancellation_liveness_objects
+
+        shape in [
+          @cannot_proceed_shape,
+          @settlement_shape,
+          @terminal_credential_shape,
+          @agent_reparent_shape,
+          @artifact_origin_shape,
+          @identity_publication_denial_diagnostic_shape,
+          @work_item_owner_link_shape
+        ] ->
+          @cannot_proceed_liveness_objects
+
+        true ->
+          @o2_liveness_objects
+      end
 
     present = Enum.filter(liveness_objects, &owned_object_present?(txn, &1))
     Enum.each(present, &validate_owned_object!(txn, &1))
@@ -1690,6 +1742,38 @@ defmodule Tightbeam.Schema do
     end)
 
     :ok
+  end
+
+  defp supervision_receipt_cancellation_active?(txn, shape) do
+    marker =
+      Enum.find(@supervision_receipt_cancellation_liveness_objects, fn object ->
+        object.name == "supervision_receipt_cancellation_epoch"
+      end)
+
+    if owned_object_present?(txn, marker) do
+      unless shape == @work_item_owner_link_shape do
+        incompatible_supervision_liveness!(
+          "receipt cancellation marker appears under unexpected schema stamp #{shape}"
+        )
+      end
+
+      validate_owned_object!(txn, marker)
+
+      case Txn.q(
+             txn,
+             "SELECT shape FROM supervision_receipt_cancellation_epoch WHERE id=0"
+           ) do
+        [[@supervision_receipt_cancellation_shape]] ->
+          true
+
+        rows ->
+          incompatible_supervision_liveness!(
+            "malformed receipt cancellation marker #{inspect(rows)}"
+          )
+      end
+    else
+      false
+    end
   end
 
   def ensure_supervision_liveness_v1_in_txn(%Txn{}, _activated_at, _opts) do
@@ -2088,6 +2172,141 @@ defmodule Tightbeam.Schema do
 
   defp incompatible_supervision_liveness!(detail) do
     raise ShapeError, message: "incompatible_supervision_liveness_v1: #{detail}"
+  end
+
+  @doc false
+  @spec upgrade_supervision_receipt_cancellation_v1(DB.server()) :: :ok
+  def upgrade_supervision_receipt_cancellation_v1(db) do
+    {:ok, [[foreign_keys]]} = DB.query(db, "PRAGMA foreign_keys")
+    {:ok, [[legacy_alter_table]]} = DB.query(db, "PRAGMA legacy_alter_table")
+    :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
+    :ok = DB.execute(db, "PRAGMA legacy_alter_table = ON")
+
+    try do
+      case DB.transaction(db, &upgrade_supervision_receipt_cancellation_v1_in_txn/1) do
+        {:ok, :ok} ->
+          :ok
+
+        {:error, %ShapeError{} = error} ->
+          raise error
+
+        {:error, error} ->
+          raise ShapeError,
+            message:
+              "incompatible_supervision_receipt_cancellation_v1: migration failed: #{Exception.message(error)}"
+      end
+    after
+      :ok = DB.execute(db, "PRAGMA legacy_alter_table = #{legacy_alter_table}")
+      :ok = DB.execute(db, "PRAGMA foreign_keys = #{foreign_keys}")
+    end
+  end
+
+  defp upgrade_supervision_receipt_cancellation_v1_in_txn(%Txn{} = txn) do
+    [[@work_item_owner_link_shape]] = Txn.q(txn, "SELECT shape FROM schema_stamp")
+
+    marker =
+      Enum.find(@supervision_receipt_cancellation_liveness_objects, fn object ->
+        object.name == "supervision_receipt_cancellation_epoch"
+      end)
+
+    if owned_object_present?(txn, marker) do
+      validate_owned_object!(txn, marker)
+
+      case Txn.q(
+             txn,
+             "SELECT shape FROM supervision_receipt_cancellation_epoch WHERE id=0"
+           ) do
+        [[@supervision_receipt_cancellation_shape]] ->
+          :ok
+
+        rows ->
+          incompatible_supervision_liveness!(
+            "malformed receipt cancellation marker #{inspect(rows)}"
+          )
+      end
+    else
+      migrate_supervision_receipt_cancellation_v1_in_txn(txn, marker)
+    end
+  end
+
+  defp migrate_supervision_receipt_cancellation_v1_in_txn(txn, marker) do
+    old_table = Enum.find(@cannot_proceed_liveness_objects, &(&1.name == "wake_cancellations"))
+
+    new_table =
+      Enum.find(
+        @supervision_receipt_cancellation_liveness_objects,
+        &(&1.name == "wake_cancellations")
+      )
+
+    validate_owned_object!(txn, old_table)
+
+    triggers =
+      Enum.filter(@supervision_receipt_cancellation_liveness_objects, fn object ->
+        object.type == "trigger" and
+          object.name in [
+            "wake_cancellations_pending_insert",
+            "wakes_typed_cancellation_required"
+          ]
+      end)
+
+    Enum.each(triggers, &validate_owned_object!(txn, &1))
+
+    Enum.each(triggers, fn trigger ->
+      :ok = Txn.exec(txn, "DROP TRIGGER #{trigger.name}")
+    end)
+
+    [[cancellation_count]] = Txn.q(txn, "SELECT COUNT(*) FROM wake_cancellations")
+
+    :ok =
+      Txn.exec(
+        txn,
+        "ALTER TABLE wake_cancellations RENAME TO wake_cancellations_receipt_source_previous_v1"
+      )
+
+    :ok = Txn.exec(txn, new_table.sql)
+
+    columns =
+      "wakeId,wakeState,canceledAt,requesterKind,requesterId,reasonKind," <>
+        "causalSourceKind,causalSourceId,outcomeKind,replacementWakeId," <>
+        "dispositionKind,dispositionId,primaryWorkKind,primaryWorkId,workImpactKind," <>
+        "livenessTriggerKind,livenessTriggerId,actionNeeded"
+
+    Txn.q(
+      txn,
+      "INSERT INTO wake_cancellations (#{columns}) SELECT #{columns} FROM wake_cancellations_receipt_source_previous_v1"
+    )
+
+    if Txn.changes(txn) != cancellation_count do
+      raise ShapeError,
+        message:
+          "receipt cancellation migration copied #{Txn.changes(txn)} of #{cancellation_count} rows"
+    end
+
+    [[^cancellation_count]] = Txn.q(txn, "SELECT COUNT(*) FROM wake_cancellations")
+
+    :ok = Txn.exec(txn, "DROP TABLE wake_cancellations_receipt_source_previous_v1")
+
+    Enum.each(triggers, fn trigger -> :ok = Txn.exec(txn, trigger.sql) end)
+    validate_owned_object!(txn, new_table)
+
+    :ok = Txn.exec(txn, marker.sql)
+
+    Txn.q(
+      txn,
+      "INSERT INTO supervision_receipt_cancellation_epoch (id,shape,activatedAt,principal) VALUES (0,?1,?2,'process:tightbeam')",
+      [@supervision_receipt_cancellation_shape, System.system_time(:millisecond)]
+    )
+
+    validate_owned_object!(txn, marker)
+
+    case Txn.q(txn, "PRAGMA foreign_key_check") do
+      [] ->
+        :ok
+
+      rows ->
+        raise ShapeError,
+          message: "receipt cancellation migration left invalid foreign keys: #{inspect(rows)}"
+    end
   end
 
   @doc false

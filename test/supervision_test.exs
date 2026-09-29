@@ -1751,9 +1751,9 @@ defmodule Tightbeam.SupervisionTest do
     assert {:ok,
             [
               ["artifact", "art_unique_material_preserved", 6],
+              ["verdict", "att_human_fact_preserved", 6],
               ["progress", "att_before_checkpoint", 6],
-              ["progress", "att_after_checkpoint", 6],
-              ["verdict", "att_human_fact_preserved", 6]
+              ["progress", "att_after_checkpoint", 6]
             ]} =
              DB.query(
                ctx.db,
@@ -1775,11 +1775,38 @@ defmodule Tightbeam.SupervisionTest do
                "SELECT COUNT(*) FROM supervision_liveness_receipts WHERE assignmentId='asg_1'"
              )
 
+    assert {:ok, [[receipt_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT CAST(MAX(receiptId) AS TEXT) FROM supervision_liveness_receipts WHERE assignmentId='asg_1'"
+             )
+
+    assert {:ok,
+            [
+              [
+                "tightbeam:supervision",
+                "superseded",
+                "supervision_receipt",
+                ^receipt_id,
+                "no_replacement",
+                "supervision_entitlement",
+                "asg_1#6"
+              ]
+            ]} =
+             DB.query(
+               ctx.db,
+               "SELECT requesterId,reasonKind,causalSourceKind,causalSourceId,outcomeKind,livenessTriggerKind,livenessTriggerId FROM wake_cancellations WHERE wakeId=?1",
+               [controller.wake_id]
+             )
+
     assert {:ok, ^human_attest_before} =
              DB.query(
                ctx.db,
                "SELECT id,assignmentId,kind,verdictKind,byUser,ts FROM attests WHERE id='att_human_fact_preserved'"
              )
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM attests WHERE id='att_human_fact_preserved'")
 
     assert {:ok, ^decision_before} =
              DB.query(
@@ -1787,10 +1814,22 @@ defmodule Tightbeam.SupervisionTest do
                "SELECT id,status,question,options,context,actionKey FROM decision_requests WHERE id='dr_human_decision_preserved'"
              )
 
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM decision_requests WHERE id='dr_human_decision_preserved'"
+             )
+
     assert {:ok, ^artifact_before} =
              DB.query(
                ctx.db,
                "SELECT artifactId,kind,title,createdBySession,workItemId,state FROM artifacts WHERE artifactId='art_unique_material_preserved'"
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM artifacts WHERE artifactId='art_unique_material_preserved'"
              )
 
     audit_after = EventLog.lifecycle_events(ctx.db)
@@ -1807,6 +1846,9 @@ defmodule Tightbeam.SupervisionTest do
                "SELECT origin,prompt,state FROM wakes WHERE wakeId=?1",
                [human_wake.wake_id]
              )
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM wakes WHERE wakeId=?1", [human_wake.wake_id])
 
     assert Ledger.last_terminal_seq(ctx.db, "holder") == checkpoint_source_seq
   end
@@ -1860,10 +1902,28 @@ defmodule Tightbeam.SupervisionTest do
                "SELECT COUNT(*) FROM lifecycle_events WHERE kind='supervision_entitlement_transferred' AND subject='asg_1'"
              )
 
-    assert {:ok, [["progress", "att_escalation_before_fire", 13]]} =
+    assert {:ok,
+            [
+              [
+                "tightbeam:supervision",
+                "superseded",
+                "supervision_receipt",
+                receipt_id,
+                "no_replacement",
+                "supervision_entitlement",
+                "asg_1#13"
+              ]
+            ]} =
              DB.query(
                ctx.db,
-               "SELECT sourceKind,sourceId,generation FROM supervision_liveness_receipts WHERE assignmentId='asg_1' ORDER BY receiptId"
+               "SELECT requesterId,reasonKind,causalSourceKind,causalSourceId,outcomeKind,livenessTriggerKind,livenessTriggerId FROM wake_cancellations WHERE wakeId=?1",
+               [escalation.wake_id]
+             )
+
+    assert {:ok, [["progress", "att_escalation_before_fire", 13, ^receipt_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sourceKind,sourceId,generation,CAST(receiptId AS TEXT) FROM supervision_liveness_receipts WHERE assignmentId='asg_1' ORDER BY receiptId"
              )
   end
 

@@ -3498,7 +3498,7 @@ defmodule Tightbeam.Wakes do
 
   @requester_kinds ~w(user session process)
   @reason_kinds ~w(requester_withdrew superseded obligation_disposed cannot_proceed_released routing_bracket_satisfied target_retired production_unmatched consumer_unavailable target_unresolvable)
-  @source_kinds ~w(verb_call wake progress_attest condition_fact assignment_transition work_item_transition decision_request monitor_generation routing_bracket session_transition scheduler_delivery)
+  @source_kinds ~w(verb_call wake progress_attest supervision_receipt condition_fact assignment_transition work_item_transition decision_request monitor_generation routing_bracket session_transition scheduler_delivery)
   @disposition_kinds ~w(assignment_transition work_item_transition decision_request_transition monitor_generation_transition)
   @liveness_kinds ~w(supervision_entitlement supervision_transfer pending_wake routing_bracket)
 
@@ -3520,7 +3520,7 @@ defmodule Tightbeam.Wakes do
   @reason_matrix %{
     "requester_withdrew" => {~w(verb_call), ~w(no_replacement)},
     "superseded" =>
-      {~w(wake progress_attest monitor_generation decision_request),
+      {~w(wake progress_attest supervision_receipt monitor_generation decision_request),
        ~w(replacement no_replacement)},
     "obligation_disposed" =>
       {~w(assignment_transition work_item_transition decision_request monitor_generation),
@@ -4017,7 +4017,7 @@ defmodule Tightbeam.Wakes do
         :error
 
       requester_id == "tightbeam:supervision" ->
-        if reason == "superseded" and source == "progress_attest" and
+        if reason == "superseded" and source in ["progress_attest", "supervision_receipt"] and
              outcome == "no_replacement",
            do: :ok,
            else: :error
@@ -4058,6 +4058,34 @@ defmodule Tightbeam.Wakes do
          ) do
       [[1]] -> :ok
       _ -> :error
+    end
+  end
+
+  defp validate_source(txn, "supervision_receipt", source_id, wake) do
+    case Integer.parse(source_id) do
+      {receipt_id, ""} when is_binary(wake.assignment_id) ->
+        case Txn.q(
+               txn,
+               """
+               SELECT 1
+               FROM supervision_liveness_receipts r
+               JOIN supervision_entitlements e ON e.assignmentId=r.assignmentId
+               JOIN supervision_liveness_sidecar s ON s.assignmentId=r.assignmentId
+               WHERE r.receiptId=?1 AND r.assignmentId=?2
+                 AND r.generation=e.generation
+                 AND e.state='armed' AND e.basisKind='progress'
+                 AND e.basisId='receipt:' || r.receiptId
+                 AND s.wakeId=?3 AND s.controllerOrigin='scheduled'
+                 AND s.controllerState='pending' AND s.chargedGeneration < r.generation
+               """,
+               [receipt_id, wake.assignment_id, wake.wake_id]
+             ) do
+          [[1]] -> :ok
+          _ -> :error
+        end
+
+      _ ->
+        :error
     end
   end
 

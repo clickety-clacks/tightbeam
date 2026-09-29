@@ -993,6 +993,7 @@ defmodule Tightbeam.Supervision do
                wake_kind in ["prod", "escalation"]
              ) do
           :rebased ->
+            cancel_rebased_controller_in_txn(txn, wake_id, assignment_id)
             :canceled
 
           :duplicate ->
@@ -1019,24 +1020,29 @@ defmodule Tightbeam.Supervision do
 
       [[_wake_kind, _charged_generation, generation, "progress", basis_id, _interval]]
       when is_integer(generation) ->
-        if Wakes.cancel_in_txn(txn, %{
-             wake_id: wake_id,
-             requester: %{kind: "process", id: "tightbeam:supervision"},
-             reason_kind: "superseded",
-             causal_source: %{kind: "progress_attest", id: basis_id},
-             outcome: %{
-               kind: "no_replacement",
-               liveness_trigger: %{
-                 kind: "supervision_entitlement",
-                 id: "#{assignment_id}##{generation}"
-               }
-             }
-           }) do
-          Txn.q(
-            txn,
-            "UPDATE supervision_liveness_sidecar SET controllerState='settled' WHERE wakeId=?1",
-            [wake_id]
-          )
+        case String.split(basis_id, ":", parts: 2) do
+          ["receipt", _receipt_id] ->
+            cancel_rebased_controller_in_txn(txn, wake_id, assignment_id)
+
+          _ ->
+            canceled =
+              Wakes.cancel_in_txn(txn, %{
+                wake_id: wake_id,
+                requester: %{kind: "process", id: "tightbeam:supervision"},
+                reason_kind: "superseded",
+                causal_source: %{kind: "progress_attest", id: basis_id},
+                outcome: %{
+                  kind: "no_replacement",
+                  liveness_trigger: %{
+                    kind: "supervision_entitlement",
+                    id: "#{assignment_id}##{generation}"
+                  }
+                }
+              })
+
+            unless canceled do
+              raise "incompatible_supervision_liveness_v1: progress controller cancellation refused"
+            end
         end
 
         :canceled
@@ -1050,6 +1056,65 @@ defmodule Tightbeam.Supervision do
   end
 
   def transition_in_txn(%Txn{}, _observation), do: :duplicate
+
+  defp cancel_rebased_controller_in_txn(txn, wake_id, assignment_id) do
+    case Txn.q(
+           txn,
+           "SELECT generation,basisKind,basisId FROM supervision_entitlements WHERE assignmentId=?1",
+           [assignment_id]
+         ) do
+      [[generation, "progress", "receipt:" <> receipt_id]] when generation > 0 ->
+        cancel_controller_for_receipt_in_txn(
+          txn,
+          wake_id,
+          assignment_id,
+          generation,
+          receipt_id
+        )
+
+      rows ->
+        raise "incompatible_supervision_liveness_v1: rebased controller receipt lineage #{inspect(rows)}"
+    end
+  end
+
+  defp cancel_controller_for_receipt_in_txn(
+         txn,
+         wake_id,
+         assignment_id,
+         generation,
+         receipt_id
+       ) do
+    canceled =
+      Wakes.cancel_in_txn(txn, %{
+        wake_id: wake_id,
+        requester: %{kind: "process", id: "tightbeam:supervision"},
+        reason_kind: "superseded",
+        causal_source: %{kind: "supervision_receipt", id: receipt_id},
+        outcome: %{
+          kind: "no_replacement",
+          liveness_trigger: %{
+            kind: "supervision_entitlement",
+            id: "#{assignment_id}##{generation}"
+          }
+        }
+      })
+
+    unless canceled do
+      raise "incompatible_supervision_liveness_v1: receipt controller cancellation refused"
+    end
+
+    case Txn.q(
+           txn,
+           "SELECT controllerState FROM supervision_liveness_sidecar WHERE wakeId=?1 AND assignmentId=?2 AND controllerOrigin='scheduled'",
+           [wake_id, assignment_id]
+         ) do
+      [["settled"]] ->
+        :ok
+
+      rows ->
+        raise "incompatible_supervision_liveness_v1: receipt cancellation did not settle controller #{inspect(rows)}"
+    end
+  end
 
   @spec liveness_trigger_in_txn(Txn.t(), {:assignment | :work_item, String.t()}) ::
           {:ok, %{kind: String.t(), id: String.t()}} | :none | {:error, term()}
