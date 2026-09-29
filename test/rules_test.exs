@@ -2753,6 +2753,7 @@ defmodule Tightbeam.RulesTest do
 
     work_item_id = "wi_ac6a_third_review_rejection"
     create_work_item(ctx, work_item_id)
+    set_work_item_owner(ctx, work_item_id, review_opener.session_key)
     _rules = load_ac6a_rules(ctx)
 
     put_raw(
@@ -2782,6 +2783,16 @@ defmodule Tightbeam.RulesTest do
       session(ctx.db, "ac6a-compat-producer-holder", "flynn", archetype: "coder")
 
     compat_reviewer = session(ctx.db, "ac6a-compat-reviewer", "flynn", archetype: "reviewer-code")
+
+    # Distinct producer openers remain authorized participants under the public
+    # direct-owner model, without changing which opener receives the notice.
+    for producer_opener <- [compat_producer_opener | Enum.map(producer_rounds, &elem(&1, 0))] do
+      assert %{id: _} =
+               assignment(ctx, producer_opener.session_key, {:user, "flynn"},
+                 work_item_id: work_item_id,
+                 effect_kind: "coordination"
+               )
+    end
 
     compat_producer =
       assignment(
@@ -2874,6 +2885,7 @@ defmodule Tightbeam.RulesTest do
     reviewer = session(ctx.db, "ac6a-round-reviewer", "flynn", archetype: "reviewer-code")
     review_item = "wi_ac6a_review_round"
     create_work_item(ctx, review_item)
+    set_work_item_owner(ctx, review_item, opener.session_key)
     _rules = load_ac6a_rules(ctx)
 
     for round <- 1..3 do
@@ -2954,6 +2966,7 @@ defmodule Tightbeam.RulesTest do
 
     fix_item = "wi_ac6a_fourth_fix_round"
     create_work_item(ctx, fix_item)
+    set_work_item_owner(ctx, fix_item, opener.session_key)
 
     for round <- 1..3 do
       prior =
@@ -3739,19 +3752,20 @@ defmodule Tightbeam.RulesTest do
   defp setup_work_item_coordinator(ctx, work_item_id) do
     coordinator = session(ctx.db, "ac6a-work-item-coordinator", "flynn", archetype: "pdo")
 
-    assert %{deliveryOwnerSessionKey: owner} =
+    set_work_item_owner(ctx, work_item_id, coordinator.session_key)
+    coordinator
+  end
+
+  defp set_work_item_owner(ctx, work_item_id, session_key) do
+    assert %{deliveryOwnerSessionKey: ^session_key} =
              Tightbeam.WorkItems.__handle__(ctx.db, "work-item-update", %{
                origin: "user:flynn",
                principal: {:user, "flynn"},
                params: %{
                  work_item_id: work_item_id,
-                 delivery_owner_session_key: coordinator.session_key
+                 delivery_owner_session_key: session_key
                }
              })
-
-    assert owner == coordinator.session_key
-
-    coordinator
   end
 
   defp record_artifact(ctx, work_item_id, session_key, kind, state) do
