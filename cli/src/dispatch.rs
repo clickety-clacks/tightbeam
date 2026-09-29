@@ -597,7 +597,6 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             effect_kind,
             files,
             succeeds,
-            delegates_delivery,
         } => {
             let target = match target {
                 Target::Session(value) => string_field("sessionKey", value),
@@ -626,9 +625,6 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             if let Some(value) = succeeds {
                 params.push(string_field("succeedsAssignmentId", value));
             }
-            if *delegates_delivery {
-                params.push("\"delegatesDelivery\":true".to_owned());
-            }
             Ok(request(identity, "assign", vec![target], params))
         }
         Command::Dispatch {
@@ -641,7 +637,6 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             brief,
             idempotency_key,
             succeeds,
-            delegates_delivery,
         } => {
             let mut params = vec![
                 string_field("subject", subject),
@@ -661,9 +656,6 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             }
             if let Some(value) = succeeds {
                 params.push(string_field("succeedsAssignmentId", value));
-            }
-            if *delegates_delivery {
-                params.push("\"delegatesDelivery\":true".to_owned());
             }
             Ok(request(
                 identity,
@@ -976,60 +968,6 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
         } => Ok(request(
             identity,
             "work-item-get",
-            vec![],
-            vec![string_field("workItemId", work_item_id)],
-        )),
-        Command::WorkItemDeliveryScopeSet {
-            identity,
-            work_item_id,
-            association_session_key,
-            association_revision,
-            expected_binding_revision,
-            idempotency_key,
-        } => Ok(request(
-            identity,
-            "work-item-delivery-scope-set",
-            vec![],
-            vec![
-                string_field("workItemId", work_item_id),
-                string_field("associationSessionKey", association_session_key),
-                format!("\"associationRevision\":{association_revision}"),
-                format!("\"expectedBindingRevision\":{expected_binding_revision}"),
-                string_field("idempotencyKey", idempotency_key),
-            ],
-        )),
-        Command::DeliveryScopeOwnerSet {
-            identity,
-            session_key,
-            association_revision,
-            expected_owner_session_key,
-            expected_owner_revision,
-            idempotency_key,
-        } => {
-            let mut params = vec![
-                string_field("sessionKey", session_key),
-                format!("\"associationRevision\":{association_revision}"),
-            ];
-            if let Some(value) = expected_owner_session_key {
-                params.push(string_field("expectedOwnerSessionKey", value));
-            }
-            params.push(format!(
-                "\"expectedOwnerRevision\":{expected_owner_revision}"
-            ));
-            params.push(string_field("idempotencyKey", idempotency_key));
-            Ok(request(
-                identity,
-                "delivery-scope-owner-set",
-                vec![],
-                params,
-            ))
-        }
-        Command::DeliveryResponsibilityGet {
-            identity,
-            work_item_id,
-        } => Ok(request(
-            identity,
-            "delivery-responsibility-get",
             vec![],
             vec![string_field("workItemId", work_item_id)],
         )),
@@ -3497,9 +3435,6 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::WorkItemCreate { identity, .. }
         | Command::WorkItemUpdate { identity, .. }
         | Command::WorkItemGet { identity, .. }
-        | Command::WorkItemDeliveryScopeSet { identity, .. }
-        | Command::DeliveryScopeOwnerSet { identity, .. }
-        | Command::DeliveryResponsibilityGet { identity, .. }
         | Command::WorkItemTrace { identity, .. }
         | Command::Attend { identity, .. }
         | Command::Breathing { identity, .. }
@@ -4494,38 +4429,8 @@ mod tests {
             ]),
             r#"{"asUser":"flynn","verb":"dispatch","sessionKey":"agent:builder","params":{"subject":"ship","brief":"Please ship it.","workItemId":"wi_1","effectKind":"release","workdirRoot":"checkout","idempotencyKey":"idem"}}"#
         );
-        assert_eq!(
-            body(&[
-                "assign",
-                "--subject",
-                "own the lane",
-                "--session",
-                "agent:orchestrator",
-                "--work-item",
-                "wi_1",
-                "--delegates-delivery",
-                "--as-user",
-                "flynn",
-            ]),
-            r#"{"asUser":"flynn","verb":"assign","sessionKey":"agent:orchestrator","params":{"subject":"own the lane","workItemId":"wi_1","delegatesDelivery":true}}"#
-        );
-        assert_eq!(
-            body(&[
-                "dispatch",
-                "--holder",
-                "agent:orchestrator",
-                "--subject",
-                "own the lane",
-                "--brief",
-                "Carry this lane.",
-                "--work-item",
-                "wi_1",
-                "--delegates-delivery",
-                "--as",
-                "pdo",
-            ]),
-            r#"{"as":"pdo","verb":"dispatch","sessionKey":"agent:orchestrator","params":{"subject":"own the lane","brief":"Carry this lane.","workItemId":"wi_1","delegatesDelivery":true}}"#
-        );
+
+
         assert_eq!(
             body(&[
                 "effort-rule",
@@ -4786,45 +4691,9 @@ mod tests {
             body(&["work-item-update", "wi_1", "--clear-body"]),
             r#"{"verb":"work-item-update","params":{"workItemId":"wi_1","body":null}}"#
         );
-        assert_eq!(
-            body(&[
-                "work-item-delivery-scope-set",
-                "wi_1",
-                "--association-session",
-                "agent:intake",
-                "--association-revision",
-                "3",
-                "--expected-revision",
-                "0",
-                "--key",
-                "scope-1",
-                "--as-user",
-                "flynn",
-            ]),
-            r#"{"asUser":"flynn","verb":"work-item-delivery-scope-set","params":{"workItemId":"wi_1","associationSessionKey":"agent:intake","associationRevision":3,"expectedBindingRevision":0,"idempotencyKey":"scope-1"}}"#
-        );
-        assert_eq!(
-            body(&[
-                "delivery-scope-owner-set",
-                "--session",
-                "agent:successor",
-                "--association-revision",
-                "4",
-                "--expected-owner",
-                "agent:pdo",
-                "--expected-revision",
-                "2",
-                "--key",
-                "owner-2",
-                "--as-user",
-                "flynn",
-            ]),
-            r#"{"asUser":"flynn","verb":"delivery-scope-owner-set","params":{"sessionKey":"agent:successor","associationRevision":4,"expectedOwnerSessionKey":"agent:pdo","expectedOwnerRevision":2,"idempotencyKey":"owner-2"}}"#
-        );
-        assert_eq!(
-            body(&["delivery-responsibility-get", "wi_1", "--as", "pdo",]),
-            r#"{"as":"pdo","verb":"delivery-responsibility-get","params":{"workItemId":"wi_1"}}"#
-        );
+
+
+
         assert_eq!(
             body(&["work-item-update", "wi_1", "--as-user", "flynn"]),
             r#"{"asUser":"flynn","verb":"work-item-update","params":{"workItemId":"wi_1"}}"#

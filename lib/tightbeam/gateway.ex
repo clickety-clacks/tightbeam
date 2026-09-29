@@ -1253,15 +1253,6 @@ defmodule Tightbeam.Gateway do
       end,
       {"breathing", []} => fn call -> Tightbeam.Breathing.handle(db, call) end,
       {"work-item-get", []} => fn call -> WorkItems.__handle__(db, "work-item-get", call) end,
-      {"work-item-delivery-scope-set", []} => fn call ->
-        DeliveryResponsibilities.handle(db, call)
-      end,
-      {"delivery-scope-owner-set", []} => fn call ->
-        DeliveryResponsibilities.handle(db, call)
-      end,
-      {"delivery-responsibility-get", []} => fn call ->
-        DeliveryResponsibilities.handle(db, call)
-      end,
       {"work-item-trace", []} => fn call -> WorkItems.__handle__(db, "work-item-trace", call) end,
       {"transcript", []} => fn call -> Tightbeam.Transcript.read(db, call) end,
       {"attend", []} => fn call -> attend_result(db, call) end,

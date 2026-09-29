@@ -95,9 +95,6 @@ impl CommandContext {
             WorkItemCreate { .. } => ("cli.work_item_create", DispatchPath),
             WorkItemUpdate { .. } => ("cli.work_item_update", DispatchPath),
             WorkItemGet { .. } => ("cli.work_item_get", DispatchPath),
-            WorkItemDeliveryScopeSet { .. } => ("cli.work_item_delivery_scope_set", DispatchPath),
-            DeliveryScopeOwnerSet { .. } => ("cli.delivery_scope_owner_set", DispatchPath),
-            DeliveryResponsibilityGet { .. } => ("cli.delivery_responsibility_get", DispatchPath),
             WorkItemTrace { .. } => ("cli.work_item_trace", DispatchPath),
             Attend { .. } => ("cli.attend", DispatchPath),
             Breathing { .. } => ("cli.breathing", DispatchPath),
@@ -303,7 +300,6 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | DecisionRequest { .. }
         | WorkItemGet { .. }
         | WorkItemTrace { .. }
-        | DeliveryResponsibilityGet { .. }
         | Breathing { .. }
         | Transcript { .. }
         | Toplines { .. }
@@ -366,12 +362,6 @@ fn dispatch_effect(command: &Command) -> EffectContract {
             idempotency_key, ..
         }
         | AssignmentCommitRefCorrect {
-            idempotency_key, ..
-        }
-        | WorkItemDeliveryScopeSet {
-            idempotency_key, ..
-        }
-        | DeliveryScopeOwnerSet {
             idempotency_key, ..
         }
         | SettleTurn {

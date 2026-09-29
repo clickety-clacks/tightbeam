@@ -9,25 +9,8 @@ defmodule Tightbeam.DeliveryResponsibilities do
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
 
-  @legacy_operations ~w(
-    work-item-delivery-scope-set
-    delivery-scope-owner-set
-    delivery-responsibility-get
-  )
-
   @doc false
   def ensure_schema(_db), do: :ok
-
-  @doc false
-  def handle(_db, %{verb: verb}) when verb in @legacy_operations do
-    refusal(
-      "delivery_operation_retired",
-      "#{verb} used the retired scope/delegation ledger; use work-item-get and the existing work-item-update --delivery-owner path"
-    )
-  end
-
-  def handle(_db, _call),
-    do: refusal("unknown_operation", "unsupported delivery responsibility operation")
 
   @doc "Return the explicit current owner link for an exact work item."
   def current_owner(db \\ DB, work_item_id) when is_binary(work_item_id) do
@@ -115,33 +98,31 @@ defmodule Tightbeam.DeliveryResponsibilities do
     opts = Keyword.put(opts, :txn, txn)
     params = Map.get(call, :params, %{})
 
-    with :ok <- retired_delegation(params) do
-      cond do
-        internal_spawn_remedy?(call, opts) ->
-          validate_internal_spawn_references(txn, params)
+    cond do
+      internal_spawn_remedy?(call, opts) ->
+        validate_internal_spawn_references(txn, params)
 
-        ownerless_work_item_intake_assignment?(txn, call, params) ->
+      ownerless_work_item_intake_assignment?(txn, call, params) ->
+        :ok
+
+      production_staffing_operation?(call, opts) and
+          not itemless_non_owner_link_control?(call) ->
+        work_item_id = Map.get(params, :work_item_id)
+
+        with :ok <- validate_supplied_owner_reference(params),
+             :ok <- required_work_item(work_item_id),
+             :ok <- known_work_item(txn, work_item_id),
+             {:ok, owner} <- owner_for_staffing(txn, work_item_id, call, opts),
+             :ok <- supplied_owner_matches(params, owner, work_item_id),
+             :ok <- owner_available(owner, work_item_id, call, opts) do
           :ok
+        else
+          %{code: _} = error -> error
+          {:error, code, message} -> refusal(code, message)
+        end
 
-        production_staffing_operation?(call, opts) and
-            not itemless_non_owner_link_control?(call) ->
-          work_item_id = Map.get(params, :work_item_id)
-
-          with :ok <- validate_supplied_owner_reference(params),
-               :ok <- required_work_item(work_item_id),
-               :ok <- known_work_item(txn, work_item_id),
-               {:ok, owner} <- owner_for_staffing(txn, work_item_id, call, opts),
-               :ok <- supplied_owner_matches(params, owner, work_item_id),
-               :ok <- owner_available(owner, work_item_id, call, opts) do
-            :ok
-          else
-            %{code: _} = error -> error
-            {:error, code, message} -> refusal(code, message)
-          end
-
-        true ->
-          :ok
-      end
+      true ->
+        :ok
     end
   end
 
@@ -349,18 +330,6 @@ defmodule Tightbeam.DeliveryResponsibilities do
       "work item #{work_item_id} records delivery owner session:#{owner}, but that session is unavailable; explicitly replace the link with work-item-update --delivery-owner before production staffing"
     )
   end
-
-  defp retired_delegation(%{delegates_delivery: true}),
-    do:
-      refusal(
-        "delivery_delegation_retired",
-        "delegatesDelivery no longer grants staffing authority; use the recorded work-item owner and existing assignment custody"
-      )
-
-  defp retired_delegation(%{delegates_delivery: value}) when not is_boolean(value),
-    do: refusal("invalid_delegates_delivery", "delegatesDelivery must be a boolean when supplied")
-
-  defp retired_delegation(_params), do: :ok
 
   defp production_staffing_operation?(call, opts) do
     case call.verb do
