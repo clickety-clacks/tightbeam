@@ -46,16 +46,35 @@ defmodule Tightbeam.QueuedMessageSuppression do
   @spec record_replacement_request_in_txn(Txn.t(), String.t(), String.t()) :: :ok
   def record_replacement_request_in_txn(%Txn{} = txn, wake_id, assignment_id)
       when is_binary(wake_id) and is_binary(assignment_id) do
+    requested_at = next_replacement_request_at_in_txn(txn, assignment_id)
+
     Txn.q(
       txn,
       """
       INSERT INTO queued_message_replacement_requests(wakeId,assignmentId,requestedAt)
       VALUES (?1,?2,?3)
       """,
-      [wake_id, assignment_id, System.system_time(:millisecond)]
+      [wake_id, assignment_id, requested_at]
     )
 
     :ok
+  end
+
+  # requestedAt is the durable order key used to distinguish older sender
+  # requests from replacements. Wall-clock milliseconds can collide or move
+  # backward, so keep each new request strictly after prior requests for this
+  # assignment. Retry wakes copy their source request's original value.
+  defp next_replacement_request_at_in_txn(%Txn{} = txn, assignment_id) do
+    now = System.system_time(:millisecond)
+
+    case Txn.q(
+           txn,
+           "SELECT MAX(requestedAt) FROM queued_message_replacement_requests WHERE assignmentId=?1",
+           [assignment_id]
+         ) do
+      [[nil]] -> now
+      [[latest]] when is_integer(latest) -> max(now, latest + 1)
+    end
   end
 
   @doc "Copy an explicit replacement request when the wake retry creates a new durable row."

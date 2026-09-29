@@ -50,7 +50,40 @@ defmodule Tightbeam.IdentityPublicationTest do
     Tightbeam.IdentityPublicationFixture.run!(tmp, 9)
   end
 
+  test "child diagnostics persist across a controlled stall and the child exits cleanly", %{
+    tmp_dir: tmp
+  } do
+    Tightbeam.IdentityPublicationFixture.run_controlled_stall!(tmp)
+  end
+
   test "public dispatch JSON returns the redacted persisted identity denial", %{tmp_dir: tmp} do
     Tightbeam.IdentityPublicationFixture.run!(tmp, 10)
   end
 end
+
+ExUnit.after_suite(fn _result ->
+  suite_tmp = Application.fetch_env!(:tightbeam, :test_suite_tmp)
+  requested = Path.join(suite_tmp, "identity-publication-diagnostic-requested")
+  diagnostic = Path.join(suite_tmp, "identity-publication-child-diagnostic.jsonl")
+
+  if File.exists?(requested) do
+    IO.puts(:stderr, "identity-publication-child-diagnostic-begin")
+
+    case File.read(diagnostic) do
+      {:ok, contents} when byte_size(contents) <= 24 * 1024 ->
+        IO.write(:stderr, contents)
+
+      {:ok, _oversized} ->
+        IO.puts(:stderr, "identity-publication-child-diagnostic exceeded its fixed output bound")
+
+      {:error, :enoent} ->
+        IO.puts(:stderr, "no child phase was persisted before the parent test ended")
+
+      {:error, reason} ->
+        IO.puts(:stderr, "child diagnostic unavailable: #{inspect(reason)}")
+    end
+
+    IO.puts(:stderr, "identity-publication-child-diagnostic-end")
+    IO.puts(:stderr, "stack entries are phase-time snapshots; no live timeout stack is captured")
+  end
+end)

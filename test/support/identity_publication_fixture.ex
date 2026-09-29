@@ -1,3 +1,98 @@
+defmodule Tightbeam.IdentityPublicationFixture.Diagnostics do
+  @moduledoc false
+
+  @path_env "DD36_IDENTITY_PUBLICATION_DIAGNOSTIC_PATH"
+  @max_bytes 24 * 1024
+  @max_events 8
+  @max_stack_frames 16
+  @max_string_bytes 128
+
+  @phases [
+    :child_started,
+    :runtime_ready,
+    :scenario_9_entered,
+    :scenario_9_completed,
+    :controlled_child_stalled,
+    :controlled_child_released
+  ]
+
+  def record(phase) when phase in @phases do
+    case System.get_env(@path_env) do
+      path when is_binary(path) and path != "" ->
+        event = %{
+          "schema" => "identity-publication-child-diagnostic/v1",
+          "phase" => Atom.to_string(phase),
+          "output" => "identity-publication-child: #{phase}",
+          "timestamp_ms" => System.system_time(:millisecond),
+          "stack" => current_stack()
+        }
+
+        line = JSON.encode!(event) <> "\n"
+        existing = read_existing(path)
+
+        event_count =
+          if existing == "", do: 0, else: length(String.split(existing, "\n", trim: true))
+
+        if event_count >= @max_events or byte_size(existing) + byte_size(line) > @max_bytes do
+          raise "identity publication child diagnostics exceeded their fixed bound"
+        end
+
+        File.write!(path, line, [:append, :sync])
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp read_existing(path) do
+    case File.read(path) do
+      {:ok, contents} -> contents
+      {:error, :enoent} -> ""
+      {:error, reason} -> raise "cannot read identity publication diagnostics: #{inspect(reason)}"
+    end
+  end
+
+  defp current_stack do
+    case Process.info(self(), :current_stacktrace) do
+      {:current_stacktrace, stack} ->
+        stack
+        |> Enum.take(@max_stack_frames)
+        |> Enum.map(&safe_frame/1)
+
+      _ ->
+        []
+    end
+  end
+
+  defp safe_frame({module, function, arity, location}) do
+    location = if is_list(location), do: location, else: []
+    file = Keyword.get(location, :file)
+
+    file =
+      case file do
+        value when is_binary(value) -> value
+        value when is_list(value) -> List.to_string(value)
+        _ -> nil
+      end
+
+    %{
+      "module" => short(inspect(module)),
+      "function" => short(Atom.to_string(function)),
+      "arity" => safe_arity(arity),
+      "file" => if(file, do: file |> Path.basename() |> short(), else: nil),
+      "line" => Keyword.get(location, :line)
+    }
+  end
+
+  defp safe_frame(_), do: %{"frame" => "unavailable"}
+
+  defp safe_arity(arity) when is_integer(arity), do: arity
+  defp safe_arity(arity) when is_list(arity), do: length(arity)
+  defp safe_arity(_), do: nil
+
+  defp short(value), do: String.slice(value, 0, @max_string_bytes)
+end
+
 defmodule Tightbeam.IdentityPublicationFixture.ReconcileOnceFailure do
   @moduledoc false
   use GenServer
@@ -48,6 +143,10 @@ defmodule Tightbeam.IdentityPublicationFixture do
       Archetypes.load!(base)
       Devices.add_user(db, "flynn", true)
       scenario(scenario, %{base_dir: base, db: db})
+
+      if scenario == 9,
+        do: Tightbeam.IdentityPublicationFixture.Diagnostics.record(:scenario_9_completed)
+
       assert File.read!(Path.join(base, "build-owner.json")) == marker
     after
       if Process.alive?(db), do: GenServer.stop(db)
@@ -638,6 +737,7 @@ defmodule Tightbeam.IdentityPublicationFixture do
   end
 
   defp scenario(9, ctx) do
+    Tightbeam.IdentityPublicationFixture.Diagnostics.record(:scenario_9_entered)
     invocation = "identity-denial-first-writer-race"
     live = git!(Path.join(ctx.base_dir, "identity"), ["rev-parse", "tightbeam/live"])
     fingerprint = String.duplicate("b", 64)
@@ -776,15 +876,152 @@ defmodule Tightbeam.IdentityPublicationFixture do
     %{executable: executable, args: args, env: env} =
       Tightbeam.GuardRuntimeFixture.prepare!(tmp, "identity_publication_runtime.exs")
 
+    diagnostic_path =
+      if scenario == 9 do
+        suite_tmp = Application.fetch_env!(:tightbeam, :test_suite_tmp)
+        path = Path.join(suite_tmp, "identity-publication-child-diagnostic.jsonl")
+        _ = File.rm(path)
+        requested = Path.join(suite_tmp, "identity-publication-diagnostic-requested")
+        _ = File.rm(requested)
+        File.write!(requested, "scenario_9\n")
+        path
+      end
+
+    diagnostic_env =
+      if diagnostic_path,
+        do: [{"DD36_IDENTITY_PUBLICATION_DIAGNOSTIC_PATH", diagnostic_path}],
+        else: []
+
+    child_env = [{"DD36_SCENARIO", Integer.to_string(scenario)}] ++ diagnostic_env ++ env
+
     {output, status} =
       System.cmd(executable, args,
-        env: [{"DD36_SCENARIO", Integer.to_string(scenario)} | env],
+        env: child_env,
         stderr_to_stdout: true
       )
 
     File.write!(Path.join(tmp, "runtime.log"), output)
+
+    if scenario == 9 and status == 0 do
+      assert_scenario_9_diagnostics!(diagnostic_path)
+    end
+
     assert status == 0, output
     assert output =~ "identity_publication-case: #{scenario}: ok"
+  end
+
+  def run_controlled_stall!(tmp) do
+    diagnostic_path = Path.join(tmp, "controlled-child-diagnostic.jsonl")
+
+    %{executable: executable, args: args, env: env} =
+      Tightbeam.GuardRuntimeFixture.prepare!(tmp, "identity_publication_runtime.exs")
+
+    child_env =
+      [
+        {"DD36_IDENTITY_PUBLICATION_CONTROLLED_STALL", "1"},
+        {"DD36_IDENTITY_PUBLICATION_DIAGNOSTIC_PATH", diagnostic_path}
+      ] ++ env
+
+    port =
+      Port.open(
+        {:spawn_executable, String.to_charlist(executable)},
+        [
+          :binary,
+          :exit_status,
+          :use_stdio,
+          :stderr_to_stdout,
+          {:args, Enum.map(args, &String.to_charlist/1)},
+          {:env, Enum.map(child_env, &port_env/1)}
+        ]
+      )
+
+    try do
+      waiting_output =
+        receive_until(port, "identity-publication-child: waiting for release", 15_000)
+
+      assert waiting_output =~ "identity-publication-child: waiting for release"
+
+      stalled_events = read_diagnostic_events(diagnostic_path)
+
+      assert Enum.map(stalled_events, & &1["phase"]) == [
+               "child_started",
+               "runtime_ready",
+               "controlled_child_stalled"
+             ]
+
+      stalled = List.last(stalled_events)
+      assert stalled["output"] == "identity-publication-child: controlled_child_stalled"
+      assert is_integer(stalled["timestamp_ms"])
+      assert is_list(stalled["stack"]) and length(stalled["stack"]) <= 16
+      assert File.stat!(diagnostic_path).size <= 24 * 1024
+
+      true = Port.command(port, "release\n")
+      released_output = receive_until(port, "identity-publication-child: released", 15_000)
+      assert released_output =~ "identity-publication-child: released"
+      assert_receive {^port, {:exit_status, 0}}, 15_000
+
+      released_events = read_diagnostic_events(diagnostic_path)
+
+      assert Enum.map(released_events, & &1["phase"]) == [
+               "child_started",
+               "runtime_ready",
+               "controlled_child_stalled",
+               "controlled_child_released"
+             ]
+    after
+      if Port.info(port), do: Port.close(port)
+    end
+  end
+
+  defp port_env({name, nil}), do: {String.to_charlist(name), false}
+  defp port_env({name, value}), do: {String.to_charlist(name), String.to_charlist(value)}
+
+  defp read_diagnostic_events(path) do
+    path
+    |> File.read!()
+    |> String.split("\n", trim: true)
+    |> Enum.map(&JSON.decode!/1)
+  end
+
+  defp assert_scenario_9_diagnostics!(path) do
+    events = read_diagnostic_events(path)
+
+    assert Enum.map(events, & &1["phase"]) == [
+             "child_started",
+             "runtime_ready",
+             "scenario_9_entered",
+             "scenario_9_completed"
+           ]
+
+    assert Enum.all?(events, fn event ->
+             is_binary(event["output"]) and is_integer(event["timestamp_ms"]) and
+               is_list(event["stack"]) and length(event["stack"]) <= 16
+           end)
+
+    assert File.stat!(path).size <= 24 * 1024
+  end
+
+  defp receive_until(port, marker, timeout) do
+    started = System.monotonic_time(:millisecond)
+    receive_until(port, marker, timeout, started, "")
+  end
+
+  defp receive_until(port, marker, timeout, started, received) do
+    remaining = max(timeout - (System.monotonic_time(:millisecond) - started), 0)
+
+    receive do
+      {^port, {:data, data}} ->
+        combined = received <> data
+
+        if String.contains?(combined, marker),
+          do: combined,
+          else: receive_until(port, marker, timeout, started, combined)
+
+      {^port, {:exit_status, status}} ->
+        flunk("identity publication child exited #{status} before output #{inspect(marker)}")
+    after
+      remaining -> flunk("identity publication child did not emit #{inspect(marker)}")
+    end
   end
 
   defp start_supervised!(child, opts \\ []) do

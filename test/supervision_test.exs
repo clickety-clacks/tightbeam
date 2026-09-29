@@ -1460,6 +1460,37 @@ defmodule Tightbeam.SupervisionTest do
     assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq3)
   end
 
+  test "concurrent terminal evaluations credit one receipt and one generation", ctx do
+    insert_entitlement!(ctx.db, "asg_1", generation: 4, due_at: 9_000_000_000_000)
+    terminal_seq = terminal!(ctx.db, "holder")
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO attests (id, assignmentId, kind, note, bySession, ts) VALUES ('att_concurrent','asg_1','progress','concurrent work','holder',9000000000000)"
+      )
+
+    results =
+      1..2
+      |> Enum.map(fn _ ->
+        Task.async(fn ->
+          Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", terminal_seq)
+        end)
+      end)
+      |> Enum.map(&Task.await(&1, 5_000))
+
+    assert Enum.all?(results, &(&1 in [:rebased, :duplicate]))
+
+    assert %{supervisionGeneration: 5, supervisionBasisKind: "liveness_receipt"} =
+             Supervision.prod_state(ctx.db, "asg_1")
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM supervision_liveness_receipts WHERE assignmentId='asg_1'"
+             )
+  end
+
   test "several typed effects produce one generation with exact source receipts", ctx do
     attach_work_item!(ctx.db, "asg_1", "wi_receipts")
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 9_000_000_000_000)
@@ -1605,37 +1636,511 @@ defmodule Tightbeam.SupervisionTest do
     assert {:ok, []} = DB.query(ctx.db, "SELECT receiptId FROM supervision_liveness_receipts")
   end
 
-  test "a receipt waits for an already-issued controller and resets after it settles", ctx do
+  test "prod fire credits progress and preserves unique human, material, and audit rows", ctx do
     terminal!(ctx.db, "holder")
+    attach_work_item!(ctx.db, "asg_1", "wi_receipts")
     insert_entitlement!(ctx.db, "asg_1", generation: 4, due_at: 0, interval: 60_000)
 
     name = start_liveness!(ctx, sweep_ms: 60_000)
-    assert [%{assignment_id: "asg_1"} = charged] = Wakes.list_pending(ctx.db)
+    assert [%{assignment_id: "asg_1"} = controller] = Wakes.list_pending(ctx.db)
+
+    insert_artifact!(
+      ctx.db,
+      "art_unique_material_preserved",
+      "holder",
+      "wi_receipts",
+      9_000_000_000_002
+    )
 
     {:ok, _} =
       DB.query(
         ctx.db,
-        "INSERT INTO attests (id, assignmentId, kind, verdictKind, byUser, ts) VALUES ('att_after_due','asg_1','verdict','verified','flynn',9000000000000)"
+        "INSERT INTO attests (id,assignmentId,kind,verdictKind,byUser,ts) VALUES ('att_human_fact_preserved','asg_1','verdict','verified','flynn',9000000000001)"
       )
 
-    sweep_liveness!(name)
-    assert Wakes.get(ctx.db, charged.wake_id).state == "pending"
-    assert :appended = admit_supervision_wake!(ctx.db, charged)
-    assert {:ok, turn} = Ledger.claim_next(ctx.db, "holder", "receipt-after-controller")
-    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO decision_requests
+          (id,kind,raiserId,raiserSessionKey,ownerUserId,assignmentId,raisedAt,
+           deadlineAt,actionKey,question,options,context,status)
+        VALUES
+          ('dr_human_decision_preserved','operator','session:holder','holder','flynn',
+           'asg_1',9000000000003,9000000001003,'receipt-preserve-human-decision',
+           'Keep this unique human decision request','["accept","deny"]',
+           '{"source":"preservation regression"}','open')
+        """
+      )
 
-    sweep_liveness!(name)
+    human_wake =
+      Wakes.schedule(ctx.db, %{
+        session_key: "holder",
+        origin: "user:flynn",
+        prompt: "Preserve this unique human instruction.",
+        due_at: System.system_time(:millisecond) + 3_600_000,
+        sender_scheduled: true
+      })
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO attests (id, assignmentId, kind, note, bySession, ts) VALUES ('att_before_checkpoint','asg_1','progress','work before checkpoint','holder',9000000000000)"
+      )
+
+    {checkpoint, checkpoint_source_seq} =
+      schedule_checkpoint_via_gateway!(ctx, "checkpoint before prod admission", 60_000)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO attests (id, assignmentId, kind, note, bySession, ts) VALUES ('att_after_checkpoint','asg_1','progress','work after checkpoint','holder',9000000001000)"
+      )
+
+    assert checkpoint.assignment_id == nil
+
+    EventLog.lifecycle(
+      ctx.db,
+      "unique_material_preservation_fixture",
+      "asg_1",
+      "retain this audit row exactly once"
+    )
+
+    {:ok, human_attest_before} =
+      DB.query(
+        ctx.db,
+        "SELECT id,assignmentId,kind,verdictKind,byUser,ts FROM attests WHERE id='att_human_fact_preserved'"
+      )
+
+    {:ok, decision_before} =
+      DB.query(
+        ctx.db,
+        "SELECT id,status,question,options,context,actionKey FROM decision_requests WHERE id='dr_human_decision_preserved'"
+      )
+
+    {:ok, artifact_before} =
+      DB.query(
+        ctx.db,
+        "SELECT artifactId,kind,title,createdBySession,workItemId,state FROM artifacts WHERE artifactId='art_unique_material_preserved'"
+      )
+
+    audit_before = EventLog.lifecycle_events(ctx.db)
+
+    scheduler = start_wake_scheduler!(ctx, :receipt_before_prod)
+    assert :ok = Wakes.fire_due(scheduler)
+
+    assert Wakes.get(ctx.db, controller.wake_id).state == "canceled"
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [controller.wake_id])
 
     assert %{
              supervisionState: "armed",
              supervisionGeneration: 6,
-             supervisionDueAt: 9_000_000_060_000,
              supervisionBasisKind: "liveness_receipt",
              attemptCount: 0,
              prodCount: 0
            } = Supervision.prod_state(ctx.db, "asg_1")
 
-    assert Ledger.last_terminal_seq(ctx.db, "holder") == turn.seq
+    assert {:ok, [[0, 0, 0, nil]]} =
+             DB.query(
+               ctx.db,
+               "SELECT attemptCount,prodCount,deniedStreak,stalledAt FROM assignment_prods WHERE assignmentId='asg_1'"
+             )
+
+    assert {:ok,
+            [
+              ["artifact", "art_unique_material_preserved", 6],
+              ["verdict", "att_human_fact_preserved", 6],
+              ["progress", "att_before_checkpoint", 6],
+              ["progress", "att_after_checkpoint", 6]
+            ]} =
+             DB.query(
+               ctx.db,
+               "SELECT sourceKind,sourceId,generation FROM supervision_liveness_receipts WHERE assignmentId='asg_1' ORDER BY receiptId"
+             )
+
+    sweep_liveness!(name)
+
+    assert {:ok, [["settled"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT controllerState FROM supervision_liveness_sidecar WHERE wakeId=?1",
+               [controller.wake_id]
+             )
+
+    assert {:ok, [[4]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM supervision_liveness_receipts WHERE assignmentId='asg_1'"
+             )
+
+    assert {:ok, [[receipt_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT CAST(MAX(receiptId) AS TEXT) FROM supervision_liveness_receipts WHERE assignmentId='asg_1'"
+             )
+
+    assert {:ok,
+            [
+              [
+                "tightbeam:supervision",
+                "superseded",
+                "supervision_receipt",
+                ^receipt_id,
+                "no_replacement",
+                "supervision_entitlement",
+                "asg_1#6"
+              ]
+            ]} =
+             DB.query(
+               ctx.db,
+               "SELECT requesterId,reasonKind,causalSourceKind,causalSourceId,outcomeKind,livenessTriggerKind,livenessTriggerId FROM wake_cancellations WHERE wakeId=?1",
+               [controller.wake_id]
+             )
+
+    assert {:ok, ^human_attest_before} =
+             DB.query(
+               ctx.db,
+               "SELECT id,assignmentId,kind,verdictKind,byUser,ts FROM attests WHERE id='att_human_fact_preserved'"
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM attests WHERE id='att_human_fact_preserved'")
+
+    assert {:ok, ^decision_before} =
+             DB.query(
+               ctx.db,
+               "SELECT id,status,question,options,context,actionKey FROM decision_requests WHERE id='dr_human_decision_preserved'"
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM decision_requests WHERE id='dr_human_decision_preserved'"
+             )
+
+    assert {:ok, ^artifact_before} =
+             DB.query(
+               ctx.db,
+               "SELECT artifactId,kind,title,createdBySession,workItemId,state FROM artifacts WHERE artifactId='art_unique_material_preserved'"
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM artifacts WHERE artifactId='art_unique_material_preserved'"
+             )
+
+    audit_after = EventLog.lifecycle_events(ctx.db)
+    assert Enum.take(audit_after, length(audit_before)) == audit_before
+
+    assert Enum.count(audit_after, fn event ->
+             event.kind == "unique_material_preservation_fixture" and event.subject == "asg_1" and
+               event.detail == "retain this audit row exactly once"
+           end) == 1
+
+    assert {:ok, [["user:flynn", "Preserve this unique human instruction.", "pending"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT origin,prompt,state FROM wakes WHERE wakeId=?1",
+               [human_wake.wake_id]
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM wakes WHERE wakeId=?1", [human_wake.wake_id])
+
+    assert Ledger.last_terminal_seq(ctx.db, "holder") == checkpoint_source_seq
+  end
+
+  test "escalation fire credits progress and skips parent transfer", ctx do
+    terminal_seq = terminal!(ctx.db, "holder")
+    insert_entitlement!(ctx.db, "asg_1", generation: 11, due_at: 0)
+
+    assert {:escalated, 1, "supervisor"} =
+             Supervision.evaluate(ctx.db, ctx.handlers, 0, "holder", terminal_seq)
+
+    assert [%{assignment_id: "asg_1", reresolve: "lineage"} = escalation] =
+             Wakes.list_pending(ctx.db)
+
+    assert {:ok, [[12, "pending"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT chargedGeneration,controllerState FROM supervision_liveness_sidecar WHERE wakeId=?1",
+               [escalation.wake_id]
+             )
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO attests (id,assignmentId,kind,note,bySession,ts) VALUES ('att_escalation_before_fire','asg_1','progress','holder work before escalation fire','holder',9000000000000)"
+      )
+
+    {:ok, _} = DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [escalation.wake_id])
+    scheduler = start_wake_scheduler!(ctx, :receipts_before_escalation)
+    assert :ok = Wakes.fire_due(scheduler)
+
+    assert Wakes.get(ctx.db, escalation.wake_id).state == "canceled"
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [escalation.wake_id])
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey='supervisor'")
+
+    assert %{
+             supervisionState: "armed",
+             supervisionGeneration: 13,
+             supervisionBasisKind: "liveness_receipt",
+             supervisionTransferWakeId: nil,
+             supervisionTransferSessionKey: nil
+           } = Supervision.prod_state(ctx.db, "asg_1")
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM lifecycle_events WHERE kind='supervision_entitlement_transferred' AND subject='asg_1'"
+             )
+
+    assert {:ok,
+            [
+              [
+                "tightbeam:supervision",
+                "superseded",
+                "supervision_receipt",
+                receipt_id,
+                "no_replacement",
+                "supervision_entitlement",
+                "asg_1#13"
+              ]
+            ]} =
+             DB.query(
+               ctx.db,
+               "SELECT requesterId,reasonKind,causalSourceKind,causalSourceId,outcomeKind,livenessTriggerKind,livenessTriggerId FROM wake_cancellations WHERE wakeId=?1",
+               [escalation.wake_id]
+             )
+
+    assert {:ok, [["progress", "att_escalation_before_fire", 13, ^receipt_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sourceKind,sourceId,generation,CAST(receiptId AS TEXT) FROM supervision_liveness_receipts WHERE assignmentId='asg_1' ORDER BY receiptId"
+             )
+  end
+
+  test "typed null-bound checkpoint self-wake does not hide durable progress from prod admission",
+       ctx do
+    terminal_seq = terminal!(ctx.db, "holder")
+    insert_entitlement!(ctx.db, "asg_1", generation: 11, due_at: 0, interval: 60_000)
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", terminal_seq)
+    assert [%{assignment_id: "asg_1"} = controller] = Wakes.list_pending(ctx.db)
+
+    assert {:ok, [[nil]]} =
+             DB.query(ctx.db, "SELECT workItemId FROM assignments WHERE id='asg_1'")
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO attests (id, assignmentId, kind, note, bySession, ts) VALUES ('att_progress_without_work_item','asg_1','progress','work without a work item','holder',9000000000000)"
+      )
+
+    {checkpoint, _source_turn} =
+      schedule_checkpoint_via_gateway!(ctx, "checkpoint before prod admission", 60_000)
+
+    assert checkpoint.assignment_id == nil
+
+    assert {:ok, [[nil]]} =
+             DB.query(ctx.db, "SELECT work_item_id FROM wakes WHERE wakeId=?1", [
+               checkpoint.wake_id
+             ])
+
+    scheduler = start_wake_scheduler!(ctx, :checkpoint_before_prod)
+    assert :ok = Wakes.fire_due(scheduler)
+
+    assert Wakes.get(ctx.db, controller.wake_id).state in ["fired", "canceled"]
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [controller.wake_id])
+
+    assert {:ok, [["progress", "att_progress_without_work_item", 13]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sourceKind,sourceId,generation FROM supervision_liveness_receipts WHERE assignmentId='asg_1'"
+             )
+
+    assert %{supervisionGeneration: 13, supervisionBasisKind: "liveness_receipt"} =
+             Supervision.prod_state(ctx.db, "asg_1")
+  end
+
+  test "missing entitlement recovery preserves a coherent generation-12 controller lineage",
+       ctx do
+    terminal_seq = terminal!(ctx.db, "holder")
+    insert_entitlement!(ctx.db, "asg_1", generation: 11, due_at: 0, interval: 60_000)
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", terminal_seq)
+    assert [%{assignment_id: "asg_1"} = controller] = Wakes.list_pending(ctx.db)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO attests (id, assignmentId, kind, note, bySession, ts) VALUES ('att_after_recovery','asg_1','progress','work after recovery','holder',9000000000000)"
+      )
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE assignment_prods SET attemptCount=4,prodCount=2,deniedStreak=3,stalledAt=1234 WHERE assignmentId='asg_1'"
+      )
+
+    wake_id = controller.wake_id
+
+    assert {:ok,
+            [
+              [
+                ^wake_id,
+                "prod",
+                12,
+                "pending",
+                "pending",
+                "process:tightbeam",
+                "asg_1",
+                "holder",
+                "prompt",
+                nil,
+                nil,
+                nil
+              ]
+            ]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT s.wakeId,s.wakeKind,s.chargedGeneration,s.controllerState,
+                      w.state,w.origin,w.assignmentId,w.sessionKey,w.consumer,
+                      w.reresolve,w.reresolveSeed,w.reresolveRung
+               FROM supervision_liveness_sidecar s
+               JOIN wakes w ON w.wakeId=s.wakeId
+               WHERE s.assignmentId='asg_1' AND s.controllerState='pending'
+               """
+             )
+
+    assert {:ok, [["holder", "open", "active", 1, nil, nil]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT a.holderKey,a.state,s.state,
+                      (SELECT COUNT(*) FROM supervision_liveness_receipt_state rs WHERE rs.assignmentId=a.id),
+                      (SELECT MAX(generation) FROM supervision_liveness_receipts r WHERE r.assignmentId=a.id),
+                      (SELECT MAX(generation) FROM supervision_progress_absorptions p WHERE p.assignmentId=a.id)
+               FROM assignments a JOIN sessions s ON s.sessionKey=a.holderKey
+               WHERE a.id='asg_1'
+               """
+             )
+
+    assert {:ok, [["supervision_entitlement_rearmed", event_detail]]} =
+             DB.query(
+               ctx.db,
+               "SELECT kind,detail FROM lifecycle_events WHERE subject='asg_1' AND kind GLOB 'supervision_entitlement_*' ORDER BY id DESC LIMIT 1"
+             )
+
+    assert event_detail ==
+             "generation=12 basis=prod_scheduled:#{wake_id} cause=prod_scheduled principal=process:tightbeam"
+
+    {:ok, _} = DB.query(ctx.db, "DELETE FROM supervision_entitlements WHERE assignmentId='asg_1'")
+
+    assert :ok = Supervision.recover_liveness!(ctx.db, 60_000)
+
+    recovery_events =
+      DB.query(
+        ctx.db,
+        "SELECT kind,detail FROM lifecycle_events WHERE subject='asg_1' AND kind GLOB 'supervision_entitlement_*' ORDER BY id DESC LIMIT 2"
+      )
+
+    entitlement_result =
+      DB.query(
+        ctx.db,
+        "SELECT generation,state,basisKind,basisId,cause,principal FROM supervision_entitlements WHERE assignmentId='asg_1'"
+      )
+
+    assert entitlement_result ==
+             {:ok,
+              [[12, "armed", "prod_scheduled", wake_id, "prod_scheduled", "process:tightbeam"]]},
+           "recovery disposition: #{inspect(recovery_events)}"
+
+    scheduler = start_wake_scheduler!(ctx, :recovered_controller)
+    assert :ok = Wakes.fire_due(scheduler)
+
+    assert Wakes.get(ctx.db, controller.wake_id).state in ["fired", "canceled"]
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [controller.wake_id])
+
+    assert %{supervisionGeneration: 13, supervisionBasisKind: "liveness_receipt"} =
+             Supervision.prod_state(ctx.db, "asg_1")
+
+    assert {:ok, [[0, 0, 0, nil]]} =
+             DB.query(
+               ctx.db,
+               "SELECT attemptCount,prodCount,deniedStreak,stalledAt FROM assignment_prods WHERE assignmentId='asg_1'"
+             )
+  end
+
+  test "missing entitlement with incoherent controller lineage is refused without generation one",
+       ctx do
+    terminal_seq = terminal!(ctx.db, "holder")
+    insert_entitlement!(ctx.db, "asg_1", generation: 11, due_at: 0, interval: 60_000)
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", terminal_seq)
+
+    {:ok, _} = DB.query(ctx.db, "DELETE FROM supervision_entitlements WHERE assignmentId='asg_1'")
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE lifecycle_events SET detail='generation=11 basis=prod_scheduled:wrong cause=prod_scheduled principal=process:tightbeam' WHERE id=(SELECT MAX(id) FROM lifecycle_events WHERE subject='asg_1' AND kind='supervision_entitlement_rearmed')"
+      )
+
+    assert :ok = Supervision.recover_liveness!(ctx.db, 60_000)
+    assert :ok = Supervision.recover_liveness!(ctx.db, 60_000)
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "SELECT generation FROM supervision_entitlements WHERE assignmentId='asg_1'"
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM lifecycle_events WHERE subject='asg_1' AND kind='supervision_entitlement_recovery_refused' AND detail='reason=pending_controller_lineage_incoherent principal=process:tightbeam'"
+             )
+  end
+
+  test "missing entitlement with only typed checkpoint lineage is refused without generation one",
+       ctx do
+    attach_work_item!(ctx.db, "asg_1", "wi_checkpoint")
+    insert_entitlement!(ctx.db, "asg_1", generation: 12, due_at: 9_000_000_000_000)
+
+    {checkpoint, _source_turn} =
+      schedule_checkpoint_via_gateway!(ctx, "checkpoint survives missing entitlement", 60_000)
+
+    assert checkpoint.assignment_id == nil
+    {:ok, _} = DB.query(ctx.db, "DELETE FROM supervision_entitlements WHERE assignmentId='asg_1'")
+
+    assert :ok = Supervision.recover_liveness!(ctx.db, 60_000)
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "SELECT generation FROM supervision_entitlements WHERE assignmentId='asg_1'"
+             )
+
+    assert {:ok,
+            [
+              [
+                "reason=surviving_lineage_without_coherent_pending_controller principal=process:tightbeam"
+              ]
+            ]} =
+             DB.query(
+               ctx.db,
+               "SELECT detail FROM lifecycle_events WHERE subject='asg_1' AND kind='supervision_entitlement_recovery_refused'"
+             )
   end
 
   test "settled controller verdict reset then holder typed wait survives restart and suppresses due sweep",
@@ -1858,7 +2363,7 @@ defmodule Tightbeam.SupervisionTest do
              )
   end
 
-  test "durable parent-turn admission replaces the child row with one virtual transfer proof",
+  test "genuine no-progress escalation delivers and replaces the child row with one transfer proof",
        ctx do
     terminal_seq = terminal!(ctx.db, "holder")
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
@@ -1870,6 +2375,13 @@ defmodule Tightbeam.SupervisionTest do
     assert escalation.reresolve == "lineage"
 
     assert :appended = admit_supervision_wake!(ctx.db, escalation)
+
+    assert {:ok, [["supervisor"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sessionKey FROM turns WHERE wakeId=?1",
+               [escalation.wake_id]
+             )
 
     assert %{
              supervisionState: "parent_elevated",
@@ -4303,6 +4815,23 @@ defmodule Tightbeam.SupervisionTest do
     )
 
     :sys.get_state(name)
+    name
+  end
+
+  defp start_wake_scheduler!(ctx, prefix) do
+    suffix = System.unique_integer([:positive])
+    registry = :"#{prefix}_registry_#{suffix}"
+    lane = :"#{prefix}_lane_#{suffix}"
+    name = :"#{prefix}_scheduler_#{suffix}"
+
+    start_supervised!({ConnRegistry, name: registry})
+    start_supervised!({LaneDoorbell, lane})
+
+    start_supervised!(
+      {Wakes,
+       db: ctx.db, deliver: delivery_fun(ctx.db, registry, lane), tick_ms: 60_000, name: name}
+    )
+
     name
   end
 
