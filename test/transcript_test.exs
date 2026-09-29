@@ -447,9 +447,9 @@ defmodule Tightbeam.TranscriptTest do
     assert legacy.job_ref == nil
   end
 
-  test "proof 8 (source): exactly one qualified enqueue_in_txn call and no enqueue/2 call" do
+  test "proof 8 (source): qualified enqueue_in_txn callers are enumerated and no enqueue/2 call" do
     # `turns.messageId` has no UNIQUE constraint, so the 0-or-1 join rests on
-    # this write invariant instead. A second production enqueue path fails here.
+    # explicitly enumerating each production enqueue path.
     files = Path.wildcard("lib/**/*.ex")
 
     qualified =
@@ -460,7 +460,8 @@ defmodule Tightbeam.TranscriptTest do
 
     assert Enum.filter(qualified, &(elem(&1, 2) == :enqueue_in_txn)) == [
              {"lib/tightbeam/gateway.ex", "append_and_enqueue_in_txn/7", :enqueue_in_txn},
-             {"lib/tightbeam/harness_health.ex", "incident_notice_in_txn/4", :enqueue_in_txn}
+             {"lib/tightbeam/harness_health.ex", "incident_notice_in_txn/4", :enqueue_in_txn},
+             {"lib/tightbeam/wakes.ex", "redeliver_health_source_in_txn/3", :enqueue_in_txn}
            ]
 
     assert Enum.filter(qualified, &(elem(&1, 2) == :enqueue)) == []

@@ -2497,6 +2497,11 @@ defmodule Tightbeam.Schema do
   defp bootstrap_module(db, Tightbeam.Ledger, _current?),
     do: Tightbeam.Ledger.ensure_historical_schema(db)
 
+  # Health redelivery is installed only after all exact predecessor migrations
+  # succeed. Existing wake storage still bootstraps before those migrations.
+  defp bootstrap_module(db, Tightbeam.Wakes, _current?),
+    do: Tightbeam.Wakes.ensure_historical_schema(db)
+
   # The correction table is additive current-build storage. Keep its DDL out
   # of the bootstrap pass so a refused migration preserves the exact
   # predecessor snapshot; the final schema pass installs it after migrations.
