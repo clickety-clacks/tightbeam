@@ -20,16 +20,15 @@ Start this gateway clone with `TIGHTBEAM_EFFORT_CHECKIN_HORIZON_MS=250` as in
 the aggregate setup so the effort check-in uses the bounded test horizon.
 
 It checks an effort check-in, an independent review loop, and a
-<a id="cannot-proceed-replacement"></a>typed `cannot-proceed` request reaching
-its opener. This is the supported replacement for terminal surrender. The
-request check reads its durable row; it does not treat a command response
-alone as proof.
+`cannot-proceed` request reaching its opener. The request check reads its
+durable row; it does not treat a command response alone as proof.
 
 ## Manual 0.1.9 checks
 
 | Feature | Exercise | Pass condition |
 |---|---|---|
 | <a id="liveness-from-progress-receipts"></a>Liveness from progress receipts | On an open throwaway assignment, have its actual holder file one `attest <id> --kind progress --note ...`. Read `attests <id>` and then the assignment's `breathing` result from an authorized observer. | The persisted receipt names the same assignment and holder, and the physical liveness read reflects that receipt once; with no receipt, the read does not invent activity. |
+| <a id="cannot-proceed-replacement"></a>Typed `cannot-proceed` replacement for terminal surrender | On a throwaway assignment, have its actual holder run `tightbeam attest <id> --kind cannot-proceed --note "blocked on disposable fixture"`. Read `attests <id>`, the assignment and the opener's decision inbox. | One typed block receipt is durable, the assignment remains open, and the exact opener receives its linked decision. The separate source-CI check confirms the removed terminal surrender route cannot close the assignment. |
 | Ask and answer | Use `tightbeam ask --session <throwaway-session> --question ... --about <test-assignment>` to open a request. Read it with `decision-requests --status open` and `decision-request --request <id>`, then answer it from its addressed session with `answer --request <id> --answer ...`. | The request is initially open, the addressed session is exact, and readback shows it answered with the submitted response. |
 | Return a request | Open a second throwaway request and use `return --request <id> --reason ...` from its authorized holder. | Readback shows the returned state and reason; the first request remains answered and unchanged. |
 | <a id="completion-handoff"></a>Completion handoff | With a disposable parent that has an open assignment, run a child to a real terminal completion. Read the parent's received handoff notice and its exact source attest, then have the parent use the shipped `completion-handoff-action <assignment_id> <source_kind> <source_token> <kept|parked|retired> — <what you did>` directive for that child. | The parent's notice names that child and terminal source; its matching action is retained as progress and stops the reminder chain. An unrelated or stale source token does not stop it. This also verifies that the idle parent is reactivated for a new child notice. |
