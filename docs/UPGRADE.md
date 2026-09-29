@@ -12,12 +12,14 @@ permission to point a command at a live base.
 
 For source-lineage context, canonical tag `v0.1.8+1337` (build 1337,
 `fdb3db53b596d4114d06505b39a4c1836fba7564`) writes
-`operator-decision-requests-v1`, which current 0.1.9 accepts. This is a
-reference lineage, not presumed provenance for a later real 0.1.8 database.
-The source manifest for the actual snapshot must establish its build and stored
-stamp; stop for delivery's source-backed adjudication if either differs. The
-historical `pi-harness-v1` stamp below is not named by the current 0.1.9
-accepted-stamp chain.
+`operator-decision-requests-v1`, which current 0.1.9 names as a predecessor.
+The manifest for the actual snapshot must establish that exact tag, build,
+commit, and stamp; stop for delivery's source-backed adjudication if a value is
+missing or differs. See the [0.1.9 migration runbook](e2e/0.1.9/migration.md)
+for the source qualification procedure. The `pi-harness-v1` stamp below is the
+historical terminal stamp of the 0.1.8 package's own migration chain. It is not
+an accepted 0.1.9 source stamp, and this document does not claim that current
+0.1.9 migrates it.
 
 Keep each release in its own complete directory. Stage and verify the release
 package before selecting it through `/opt/tightbeam/current`; the selection is
@@ -61,11 +63,13 @@ after you confirm that it supports the current database schema. Selecting old
 executable bytes does not reverse a SQLite migration or make an incompatible
 schema safe.
 
-Tightbeam 0.1.8 carries one exact migration chain: `model-identity-v1` (0.1.7)
-to `operator-decision-requests-v1`, then to `pi-harness-v1`. A database already
-at the intermediate stamp runs only the second step. The gateway refuses every
-other old stamp. It never infers a schema from stored DDL. This migration
-history does not establish downgrade compatibility.
+The 0.1.8 package carries its own exact migration chain: `model-identity-v1`
+(0.1.7) to `operator-decision-requests-v1`, then to `pi-harness-v1`. A database
+already at the intermediate stamp runs only the second step. When running that
+0.1.8 package, the gateway refuses every other old stamp; it never infers a
+schema from stored DDL. This historical chain does not establish that current
+0.1.9 accepts `pi-harness-v1` as its source, nor does it establish downgrade
+compatibility.
 
 Everything below was measured on 2026-07-26 against a real `state.db` with work
 genuinely in flight.

@@ -10,15 +10,17 @@ exact 0.1.8 build and package provenance, source commit, database SHA-256,
 stored stamp, and the approved backup method and time. A version label and a
 stamp by themselves do not establish which source produced the database.
 
-The reference lineage is canonical tag `v0.1.8+1337`, build 1337 at
-`fdb3db53b596d4114d06505b39a4c1836fba7564`. That source stamps
-`operator-decision-requests-v1`, and current 0.1.9 names that predecessor. It
-is a reference input, not presumed provenance for a later real 0.1.8 snapshot.
-If the actual manifest identifies another build or stamp, stop before boot and
-get delivery's source-backed lineage ruling. A difference requires
-adjudication; it does not by itself reject every 0.1.8 snapshot. In
-particular, `pi-harness-v1` is not named by the current 0.1.9 accepted-stamp
-chain, so do not claim that it migrates through 0.1.9 without such a ruling.
+Pin the source manifest for this rehearsal to canonical tag `v0.1.8+1337`,
+build 1337 at commit `fdb3db53b596d4114d06505b39a4c1836fba7564`, with stored
+stamp `operator-decision-requests-v1`. Current 0.1.9 names that stamp as its
+predecessor. The manifest must establish those exact tag, build, commit, and
+stamp values for the actual database; do not fill them from this reference
+without source evidence. If a value is missing or differs, stop before boot
+and request delivery's source-backed lineage adjudication. That pause does not
+by itself reject every 0.1.8 snapshot. `pi-harness-v1` is the historical
+terminal stamp of the 0.1.8 package's own migration chain, not an accepted
+0.1.9 source stamp; this procedure does not claim that it migrates through
+current 0.1.9.
 
 The check uses the 0.1.9 packaged gateway once against a verified copy of a real
 0.1.8 database. It preserves the input and saves the migrated output for later
@@ -57,9 +59,10 @@ cp -p "$source_db" "$test_base/state.db"
 test "$(shasum -a 256 "$test_base/state.db" | awk '{print $1}')" = "$source_sha256"
 ```
 
-Before boot, require the one stored source stamp to match the value established
-by the source manifest and its lineage ruling. For the exact `v0.1.8+1337`
-reference source, that value is `operator-decision-requests-v1`. Record
+Before boot, require the source manifest's tag, build, and commit to match the
+pinned lineage above, and require the one stored source stamp to match the
+manifest and that lineage. For the exact `v0.1.8+1337` source, that value is
+`operator-decision-requests-v1`. Record
 `PRAGMA quick_check`, `PRAGMA foreign_key_check`, and counts for existing
 durable rows. At minimum record counts for `users`, `sessions`, `work_items`,
 `assignments`, `attests`, `decision_requests`, `messages`, `turns`, `wakes`, and
