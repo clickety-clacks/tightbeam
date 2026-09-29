@@ -2235,7 +2235,21 @@ fn parse_with_optional_catalog(
         }
         "tune" => parse_tune(&parsed, flags),
         "assign" => {
-            closed_command_flags("assign", flags, &["subject","session","role","key","work-item","reviews","effect-kind","files","succeeds"])?;
+            closed_command_flags(
+                "assign",
+                flags,
+                &[
+                    "subject",
+                    "session",
+                    "role",
+                    "key",
+                    "work-item",
+                    "reviews",
+                    "effect-kind",
+                    "files",
+                    "succeeds",
+                ],
+            )?;
             let targets = [
                 nonempty(flags, "session").map(Target::Session),
                 nonempty(flags, "role").map(Target::Role),
@@ -2268,7 +2282,21 @@ fn parse_with_optional_catalog(
             })
         }
         "dispatch" => {
-            closed_command_flags("dispatch", flags, &["to","holder","subject","brief","work-item","effect-kind","workdir-root","key","succeeds"])?;
+            closed_command_flags(
+                "dispatch",
+                flags,
+                &[
+                    "to",
+                    "holder",
+                    "subject",
+                    "brief",
+                    "work-item",
+                    "effect-kind",
+                    "workdir-root",
+                    "key",
+                    "succeeds",
+                ],
+            )?;
             let holders = [nonempty(flags, "to"), nonempty(flags, "holder")]
                 .into_iter()
                 .flatten()
@@ -5602,8 +5630,15 @@ mod tests {
                     let flag = format!("--{option}");
                     let mut args = base.clone();
                     args.push(&flag);
-                    if let Some(value) = value { args.push(value); }
-                    assert_eq!(parse(strings(&args)), Err(format!("usage: tightbeam {verb} does not accept --{option}")));
+                    if let Some(value) = value {
+                        args.push(value);
+                    }
+                    assert_eq!(
+                        parse(strings(&args)),
+                        Err(format!(
+                            "usage: tightbeam {verb} does not accept --{option}"
+                        ))
+                    );
                 }
             }
         }

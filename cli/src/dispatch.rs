@@ -4430,7 +4430,6 @@ mod tests {
             r#"{"asUser":"flynn","verb":"dispatch","sessionKey":"agent:builder","params":{"subject":"ship","brief":"Please ship it.","workItemId":"wi_1","effectKind":"release","workdirRoot":"checkout","idempotencyKey":"idem"}}"#
         );
 
-
         assert_eq!(
             body(&[
                 "effort-rule",
@@ -4691,8 +4690,6 @@ mod tests {
             body(&["work-item-update", "wi_1", "--clear-body"]),
             r#"{"verb":"work-item-update","params":{"workItemId":"wi_1","body":null}}"#
         );
-
-
 
         assert_eq!(
             body(&["work-item-update", "wi_1", "--as-user", "flynn"]),

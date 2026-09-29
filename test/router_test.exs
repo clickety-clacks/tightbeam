@@ -703,11 +703,22 @@ defmodule Tightbeam.Wire.RouterTest do
     handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})
     ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, handlers)}
 
-    for verb <- ~w(delivery-responsibility-get work-item-delivery-scope-set delivery-scope-owner-set) do
+    for verb <-
+          ~w(delivery-responsibility-get work-item-delivery-scope-set delivery-scope-owner-set) do
       refute Map.has_key?(handlers, verb)
-      response = dispatch_cli(ctx, "tbc_test", %{verb: verb, asUser: ctx.device.user_id, params: %{workItemId: "wi_absent"}})
+
+      response =
+        dispatch_cli(ctx, "tbc_test", %{
+          verb: verb,
+          asUser: ctx.device.user_id,
+          params: %{workItemId: "wi_absent"}
+        })
+
       assert response.status == 400
-      assert JSON.decode!(response.resp_body) == %{"error" => %{"code" => "invalid_message", "message" => "verb not allowed: #{verb}"}}
+
+      assert JSON.decode!(response.resp_body) == %{
+               "error" => %{"code" => "invalid_message", "message" => "verb not allowed: #{verb}"}
+             }
     end
   end
 
