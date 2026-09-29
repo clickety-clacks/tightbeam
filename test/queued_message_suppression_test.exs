@@ -357,9 +357,10 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
     assert detail =~ "#{replacement_seq}"
   end
 
-  test "replacement delivery claims next and keeps source durable for equal request timestamps", %{
-    db: db
-  } do
+  test "replacement delivery claims next and keeps source durable for equal request timestamps",
+       %{
+         db: db
+       } do
     assignment!(db, "asg_next")
     session!(db, "sender")
 
