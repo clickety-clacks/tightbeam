@@ -1466,7 +1466,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     blocker =
       Task.async(fn ->
         DB.transaction(ctx.db, fn _txn ->
-          send(parent, :shutdown_preparation_db_locked)
+          send(parent, {:shutdown_preparation_db_locked, self()})
 
           receive do
             :release_db_lock -> :ok
@@ -1474,7 +1474,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
         end)
       end)
 
-    assert_receive :shutdown_preparation_db_locked, 500
+    assert_receive {:shutdown_preparation_db_locked, db_owner}, 500
 
     # The prep transaction times out against the held DB owner. The proxy
     # releases that owner as soon as it observes the result, leaving the full
@@ -1485,7 +1485,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
          db: ctx.db,
          delay_ms: 0,
          owner: self(),
-         lock_holder: blocker.pid,
+         lock_holder: db_owner,
          release_lock_on_call: 1,
          notify_result_on_call: 1}
       )
