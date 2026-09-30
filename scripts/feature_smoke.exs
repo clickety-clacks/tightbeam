@@ -2,11 +2,15 @@
 # (full HTTP + router + dispatch + handler + DB stack; the integration path
 # unit tests don't cover). Reads port+token from <base_dir>/gateway.json.
 #
-#   TIGHTBEAM_BASE_DIR=~/.tightbeam-beam \
+#   TIGHTBEAM_BASE_DIR=/absolute/owned/test-base \
+#   TIGHTBEAM_SMOKE_OWNED_BASE=/absolute/owned/test-base \
 #   TIGHTBEAM_SMOKE_MODEL_CLAUDE='claude-sonnet-5' TIGHTBEAM_SMOKE_EFFORT_CLAUDE='medium' \
 #   TIGHTBEAM_SMOKE_MODEL_CODEX='gpt-5.6-sol' TIGHTBEAM_SMOKE_EFFORT_CODEX='medium' \
 #   TIGHTBEAM_SMOKE_MODEL_CURSOR='<catalog-listed-cursor-model>' \
 #   mix run --no-start scripts/feature_smoke.exs
+#
+# Run only selected areas with TIGHTBEAM_SMOKE_AREAS=provider,work,decisions,
+# telemetry,artifacts. The default is all; each selected area owns its fixtures.
 #
 # Runs one explicit spawn/dispatch leg per SELECTED harness and exits non-zero on
 # the first failed assertion. Every new roadmap feature that is user-callable
@@ -55,6 +59,7 @@ defmodule FeatureSmoke do
   end
 
   @owner System.get_env("TIGHTBEAM_SMOKE_OWNER") || "mike"
+  @smoke_areas ~w(provider work decisions telemetry artifacts)
 
   # How long a remedy episode gets to reach a status. The transition rides the attest
   # that provoked it, so this covers scheduling, not model time.
@@ -74,12 +79,29 @@ defmodule FeatureSmoke do
     )
   end
 
-  defp run_readiness do
-    base_dir = System.fetch_env!("TIGHTBEAM_BASE_DIR")
+  # Both modes create, bind and retire records in the base they are pointed at, so
+  # neither may default one: the operator names the disposable base twice.
+  defp owned_base_dir! do
+    base_dir = System.get_env("TIGHTBEAM_BASE_DIR")
 
-    unless System.get_env("TIGHTBEAM_SMOKE_OWNED_BASE") == Path.expand(base_dir) do
-      raise "readiness requires explicit TIGHTBEAM_SMOKE_OWNED_BASE for its authorized disposable base"
+    cond do
+      base_dir in [nil, ""] ->
+        raise Failure,
+          message: "feature-smoke requires TIGHTBEAM_BASE_DIR for its disposable base"
+
+      System.get_env("TIGHTBEAM_SMOKE_OWNED_BASE") != Path.expand(base_dir) ->
+        raise Failure,
+          message:
+            "feature-smoke requires TIGHTBEAM_SMOKE_OWNED_BASE equal to TIGHTBEAM_BASE_DIR " <>
+              "for its authorized disposable base"
+
+      true ->
+        base_dir
     end
+  end
+
+  defp run_readiness do
+    base_dir = owned_base_dir!()
 
     gw = base_dir |> Path.join("gateway.json") |> File.read!() |> JSON.decode!()
     announce_selection!(Tightbeam.FeatureSmokePlan.selection(Tightbeam.Harness.all()))
@@ -101,9 +123,12 @@ defmodule FeatureSmoke do
   end
 
   defp run_full do
-    base_dir = System.get_env("TIGHTBEAM_BASE_DIR") || Path.expand("~/.tightbeam-beam")
+    base_dir = owned_base_dir!()
     gw = base_dir |> Path.join("gateway.json") |> File.read!() |> JSON.decode!()
+
     Process.put(:salt, Integer.to_string(System.os_time(:second)) <> "-")
+
+    areas = selected_smoke_areas!()
 
     announce_selection!(Tightbeam.FeatureSmokePlan.selection(Tightbeam.Harness.all()))
 
@@ -120,22 +145,79 @@ defmodule FeatureSmoke do
         leg: leg,
         providers: Tightbeam.FeatureSmokePlan.provider_names(Tightbeam.Harness.all())
       }
-      |> sweep_open_work_items()
-      |> check_local_deployment()
-      |> check_identity_surface()
-      |> check_onboard_surface()
-      |> check_facts_read()
-      |> check_config_default_archetype()
-      |> check_work_item_and_assignment_get()
-      |> check_dispatch_opens_assignment()
-      |> check_effort_without_effect()
-      |> check_flagship_review_loop()
-      |> check_cannot_proceed_to_opener()
-      |> check_toplines_board()
-      |> check_gate_chain_enforced()
-      |> check_carrier_on_real_turn()
+      |> run_selected_areas(areas)
       |> finish_leg()
     end)
+  end
+
+  defp run_selected_areas(state, areas) do
+    Enum.reduce(areas, state, fn area, current -> run_smoke_area(current, area) end)
+  end
+
+  defp selected_smoke_areas! do
+    requested =
+      System.get_env("TIGHTBEAM_SMOKE_AREAS", "all")
+      |> String.split(",", trim: true)
+      |> Enum.map(&String.trim/1)
+      |> Enum.uniq()
+
+    selected = if requested == ["all"], do: @smoke_areas, else: requested
+    unknown = selected -- @smoke_areas
+
+    cond do
+      selected == [] ->
+        raise Failure, message: "feature-smoke selected no areas"
+
+      "all" in selected ->
+        raise Failure,
+          message: "TIGHTBEAM_SMOKE_AREAS=all cannot be combined with named areas"
+
+      unknown != [] ->
+        raise Failure,
+          message:
+            "unknown feature-smoke area(s): #{Enum.join(unknown, ", ")}; choose #{Enum.join(@smoke_areas, ", ")} or all"
+
+      true ->
+        IO.puts("feature-smoke areas: #{Enum.join(selected, ", ")}")
+        selected
+    end
+  end
+
+  defp run_smoke_area(state, "provider") do
+    state
+    |> check_local_deployment()
+    |> check_identity_surface()
+    |> check_onboard_surface()
+  end
+
+  defp run_smoke_area(state, "work") do
+    state
+    |> check_facts_read()
+    |> check_config_default_archetype()
+    |> check_work_item_and_assignment_get()
+    |> check_dispatch_opens_assignment()
+    |> check_work_item_body_and_delivery_owner()
+  end
+
+  defp run_smoke_area(state, "decisions") do
+    state
+    |> check_effort_without_effect()
+    |> check_flagship_review_loop()
+    |> check_cannot_proceed_to_opener()
+  end
+
+  defp run_smoke_area(state, "telemetry") do
+    state
+    |> check_breathing_query()
+    |> check_execution_map()
+    |> check_topline_lifecycle()
+    |> check_toplines_list()
+  end
+
+  defp run_smoke_area(state, "artifacts") do
+    state
+    |> check_gate_chain_enforced()
+    |> check_carrier_on_real_turn()
   end
 
   defp preflight!(leg, base_dir) do
@@ -143,9 +225,14 @@ defmodule FeatureSmoke do
     IO.puts("credential preflight #{row.step}: #{String.upcase(to_string(row.status))}")
 
     case row.status do
-      :pass -> :ok
-      :fail -> raise "credential preflight failed: #{row.note}"
-      :incomplete -> raise "credential preflight INCOMPLETE/blocker: #{row.note}"
+      :pass ->
+        :ok
+
+      :fail ->
+        raise Failure, message: "credential preflight failed: #{row.note}"
+
+      :incomplete ->
+        raise Failure, message: "credential preflight INCOMPLETE/blocker: #{row.note}"
     end
   end
 
@@ -384,53 +471,74 @@ defmodule FeatureSmoke do
     original_guidance = File.read!(guidance_path)
     marker = "\n\nfeature-smoke #{unique()}\n"
 
-    ok!(state, "identity-edit", %{
-      "archetype" => "default",
-      "manifest" => false,
-      "remove" => false,
-      "content" => original_guidance <> marker
-    })
-
-    ok!(state, "identity-edit", %{
-      "archetype" => "default",
-      "manifest" => false,
-      "remove" => false,
-      "content" => original_guidance
-    })
+    with_undo(
+      state,
+      "default guidance edit",
+      fn ->
+        post(state, "identity-edit", %{
+          "archetype" => "default",
+          "manifest" => false,
+          "remove" => false,
+          "content" => original_guidance
+        })
+      end,
+      fn ->
+        ok!(state, "identity-edit", %{
+          "archetype" => "default",
+          "manifest" => false,
+          "remove" => false,
+          "content" => original_guidance <> marker
+        })
+      end
+    )
 
     manifest_path = Path.join([state.base_dir, "identity", "archetypes", "default.toml"])
     original_manifest = File.read!(manifest_path)
 
-    ok!(state, "identity-edit", %{
-      "archetype" => "default",
-      "manifest" => true,
-      "remove" => false,
-      "content" => original_manifest <> "\n# feature-smoke #{unique()}\n"
-    })
-
-    ok!(state, "identity-edit", %{
-      "archetype" => "default",
-      "manifest" => true,
-      "remove" => false,
-      "content" => original_manifest
-    })
+    with_undo(
+      state,
+      "default manifest edit",
+      fn ->
+        post(state, "identity-edit", %{
+          "archetype" => "default",
+          "manifest" => true,
+          "remove" => false,
+          "content" => original_manifest
+        })
+      end,
+      fn ->
+        ok!(state, "identity-edit", %{
+          "archetype" => "default",
+          "manifest" => true,
+          "remove" => false,
+          "content" => original_manifest <> "\n# feature-smoke #{unique()}\n"
+        })
+      end
+    )
 
     skill = "feature-smoke-#{unique()}"
 
-    ok!(state, "identity-edit", %{
-      "archetype" => "default",
-      "manifest" => false,
-      "skill" => skill,
-      "remove" => false,
-      "content" => "# #{skill}\n"
-    })
-
-    ok!(state, "identity-edit", %{
-      "archetype" => "default",
-      "manifest" => false,
-      "skill" => skill,
-      "remove" => true
-    })
+    with_undo(
+      state,
+      "default skill put",
+      fn ->
+        post(state, "identity-edit", %{
+          "archetype" => "default",
+          "manifest" => false,
+          "skill" => skill,
+          "remove" => true
+        })
+      end,
+      fn ->
+        ok!(state, "identity-edit", %{
+          "archetype" => "default",
+          "manifest" => false,
+          "skill" => skill,
+          "remove" => false,
+          "content" => "# #{skill}\n"
+        })
+      end
+    )
 
     relearn = ok!(state, "identity-relearn", %{})
 
@@ -449,12 +557,11 @@ defmodule FeatureSmoke do
     session_key = get_in(session, ["stream", "sessionKey"]) || session["sessionKey"]
     applied = ok!(state, "identity-apply", %{"sessionKey" => session_key, "all" => false})
     assert(state, session_key in (applied["applied"] || []), "identity-apply missed its session")
-    _all = ok!(state, "identity-apply", %{"all" => true})
     retire(state, session)
 
     pass(
       state,
-      "identity status/edit guidance/edit manifest/skill put+rm/relearn/apply session+all"
+      "identity status/edit guidance/edit manifest/skill put+rm/relearn/apply selected session"
     )
   end
 
@@ -540,13 +647,20 @@ defmodule FeatureSmoke do
   defp check_flagship_review_loop(state) do
     u = unique()
     # A reviewer role bound to a live reviewer session (the remedy's assign target).
+    prior = role_binding(state, "reviewer-code")
     post(state, "role-create", %{"name" => "reviewer-code"})
 
     reviewer =
       ok!(state, "spawn", %{"displayName" => "smoke-reviewer-#{u}", "idempotencyKey" => "rv-#{u}"})
 
     reviewer_key = get_in(reviewer, ["stream", "sessionKey"]) || reviewer["sessionKey"]
-    ok!(state, "role-bind", %{"name" => "reviewer-code", "sessionKey" => reviewer_key})
+
+    with_role_binding(state, "reviewer-code", prior, reviewer_key, fn ->
+      flagship_review_loop(state, u, reviewer, reviewer_key)
+    end)
+  end
+
+  defp flagship_review_loop(state, u, reviewer, reviewer_key) do
     reviewer_tok = session_token(state, reviewer_key)
 
     # A coder holding a work assignment.
@@ -606,7 +720,7 @@ defmodule FeatureSmoke do
     assert(
       state,
       is_map(review_asg),
-      "flagship: remedy did not assign the reviewer a review of #{asg_id}; got #{inspect(reviews)}"
+      "flagship: remedy did not assign the reviewer a review of #{asg_id}; got #{brief(reviews)}"
     )
 
     review_id = review_asg["id"] || review_asg["assignmentId"]
@@ -710,6 +824,7 @@ defmodule FeatureSmoke do
     reviewer_leg = independent_leg(state)
     preflight_independent!(state, reviewer_leg)
 
+    prior = role_binding(state, "reviewer-code")
     post(state, "role-create", %{"name" => "reviewer-code"})
 
     # The reviewer is spawned through the other SELECTED leg where this run has one. The
@@ -724,7 +839,13 @@ defmodule FeatureSmoke do
       })
 
     reviewer_key = get_in(reviewer, ["stream", "sessionKey"]) || reviewer["sessionKey"]
-    ok!(state, "role-bind", %{"name" => "reviewer-code", "sessionKey" => reviewer_key})
+
+    with_role_binding(state, "reviewer-code", prior, reviewer_key, fn ->
+      gate_chain_enforced(state, u, reviewer_leg, reviewer, reviewer_key)
+    end)
+  end
+
+  defp gate_chain_enforced(state, u, reviewer_leg, reviewer, reviewer_key) do
     reviewer_tok = session_token(state, reviewer_key)
 
     wi =
@@ -758,7 +879,7 @@ defmodule FeatureSmoke do
         is_map(review),
         "gate chain: the review remedy did not assign the #{reviewer_leg.wire_name} reviewer a " <>
           "review of #{asg_id}. The role is rebound to this group's live reviewer, so an " <>
-          "unresolved target here is a real remedy failure. Got: #{inspect(reviews)}"
+          "unresolved target here is a real remedy failure. Got: #{brief(reviews)}"
       )
 
       # Independence is a property of the SESSION, never of the harness:
@@ -994,102 +1115,149 @@ defmodule FeatureSmoke do
     holder = open_grounded_assignment!(state, u, wi_id, "carrier proof #{u}", "c")
     asg_id = holder.assignment_id
 
-    try do
-      await_lane_idle!(state, holder.key, "before issuing the artifact wake")
+    prompted =
+      try do
+        await_lane_idle!(state, holder.key, "before issuing the artifact wake")
 
-      wake =
-        ok!(state, "wake", %{
-          "sessionKey" => holder.key,
-          "prompt" => artifact_prompt(u, marker, holder.check.name, wi_id, asg_id),
-          "idempotencyKey" => "cwake-#{u}"
-        })
+        wake =
+          ok!(state, "wake", %{
+            "sessionKey" => holder.key,
+            "prompt" => artifact_prompt(u, marker, holder.check.name, wi_id, asg_id),
+            "idempotencyKey" => "cwake-#{u}"
+          })
 
-      wake_id = wake["wakeId"]
+        wake_id = wake["wakeId"]
 
-      proof = %{
-        wake_id: wake_id,
-        message_id: await_turn_message_id!(state, wake_id),
-        marker: marker
-      }
+        proof = %{
+          wake_id: wake_id,
+          message_id: await_turn_message_id!(state, wake_id),
+          marker: marker
+        }
 
-      {prompted, reports} = await_prompted_report!(state, holder.key, wi_id, asg_id, proof)
-      classes = Enum.map(reports, & &1["recordedTurnEvidence"])
+        {prompted, reports} = await_prompted_report!(state, holder.key, wi_id, asg_id, proof)
+        classes = Enum.map(reports, & &1["recordedTurnEvidence"])
 
-      # The null-vs-non-null coupling, on EVERY row. Pure substrate: `tool-call-observed`
-      # and `session-concurrent` each name a turn and must carry its id, `none` names no
-      # turn and must carry NULL. A row breaking the pairing is a carrier defect whatever
-      # the agent chose to run.
-      Enum.each(reports, fn row ->
+        # The null-vs-non-null coupling, on EVERY row. Pure substrate: `tool-call-observed`
+        # and `session-concurrent` each name a turn and must carry its id, `none` names no
+        # turn and must carry NULL. A row breaking the pairing is a carrier defect whatever
+        # the agent chose to run.
+        Enum.each(reports, fn row ->
+          assert(
+            state,
+            row["recordedTurnEvidence"] in ~w(tool-call-observed session-concurrent none),
+            "carrier proof: recordedTurnEvidence outside its closed domain: #{inspect(row)}"
+          )
+
+          if row["recordedTurnEvidence"] == "none" do
+            assert(
+              state,
+              is_nil(row["recordedMessageId"]),
+              "carrier proof: evidence 'none' must carry a NULL recordedMessageId: #{inspect(row)}"
+            )
+          else
+            assert(
+              state,
+              is_binary(row["recordedMessageId"]),
+              "carrier proof: evidence #{inspect(row["recordedTurnEvidence"])} names a turn but " <>
+                "recordedMessageId is NULL: #{inspect(row)}"
+            )
+          end
+        end)
+
+        # THE R7 assertion, per leg, and an IDENTITY claim rather than a content one: the row
+        # bound to the turn this group prompted must read `tool-call-observed`. Selecting on
+        # `recordedMessageId` is what makes the class unspoofable by anything else on the
+        # session — a record that inherited another turn's window carries that turn's id and
+        # never reaches this line — and the negative control in `check_gate_chain_enforced/1`
+        # is what proves the class cannot be reached without a tool call at all.
         assert(
           state,
-          row["recordedTurnEvidence"] in ~w(tool-call-observed session-concurrent none),
-          "carrier proof: recordedTurnEvidence outside its closed domain: #{inspect(row)}"
+          prompted["recordedTurnEvidence"] == "tool-call-observed",
+          "carrier proof: the record bound to the prompted turn (message #{proof.message_id}) " <>
+            "reads #{inspect(prompted["recordedTurnEvidence"])}, not tool-call-observed — the " <>
+            "reserved PreToolUse observation did not fire for the #{state.leg.wire_name} holder " <>
+            "on a turn that ran with no other turn on its lane, so this leg's record rests on " <>
+            "concurrency rather than observation. Read it as the RECORDER side of " <>
+            "#{state.leg.wire_name} failing; the filer side is a separate question. " <>
+            "Row: #{inspect(prompted)}. All classes seen: #{inspect(classes)}"
         )
 
-        if row["recordedTurnEvidence"] == "none" do
-          assert(
-            state,
-            is_nil(row["recordedMessageId"]),
-            "carrier proof: evidence 'none' must carry a NULL recordedMessageId: #{inspect(row)}"
-          )
-        else
-          assert(
-            state,
-            is_binary(row["recordedMessageId"]),
-            "carrier proof: evidence #{inspect(row["recordedTurnEvidence"])} names a turn but " <>
-              "recordedMessageId is NULL: #{inspect(row)}"
-          )
-        end
-      end)
+        # NOTHING here asserts artifact lifecycle `state`. Retirement moves rows
+        # in-workspace → released and the gate is state-blind on purpose, so a state
+        # assertion would be a brittle oracle for a fact the substrate does not gate on.
+        # Kind and provenance are the whole contract. Do not add one.
+        #
+        # The outcome is ACCEPTED, not required. A holder that went on to complete did the
+        # job; one still working has not failed. Only revocation is a failure here.
+        #
+        # SAMPLED AFTER THE LANE SETTLES, because the wait above returns the instant the
+        # record lands and that is normally MID-TURN. Reading the outcome there would ask the
+        # question before the holder had finished answering it. The matrix was right; the
+        # moment it was sampled was not.
+        await_lane_idle!(state, holder.key, "before reading the assignment's outcome")
+        final = ok!(state, "assignment-get", %{"assignmentId" => asg_id})
 
-      # THE R7 assertion, per leg, and an IDENTITY claim rather than a content one: the row
-      # bound to the turn this group prompted must read `tool-call-observed`. Selecting on
-      # `recordedMessageId` is what makes the class unspoofable by anything else on the
-      # session — a record that inherited another turn's window carries that turn's id and
-      # never reaches this line — and the negative control in `check_gate_chain_enforced/1`
-      # is what proves the class cannot be reached without a tool call at all.
-      assert(
-        state,
-        prompted["recordedTurnEvidence"] == "tool-call-observed",
-        "carrier proof: the record bound to the prompted turn (message #{proof.message_id}) " <>
-          "reads #{inspect(prompted["recordedTurnEvidence"])}, not tool-call-observed — the " <>
-          "reserved PreToolUse observation did not fire for the #{state.leg.wire_name} holder " <>
-          "on a turn that ran with no other turn on its lane, so this leg's record rests on " <>
-          "concurrency rather than observation. Read it as the RECORDER side of " <>
-          "#{state.leg.wire_name} failing; the filer side is a separate question. " <>
-          "Row: #{inspect(prompted)}. All classes seen: #{inspect(classes)}"
-      )
+        assert(
+          state,
+          final["outcome"] in [nil, "completed"],
+          "carrier proof: #{asg_id} ended #{inspect(final["outcome"])}. Completing is accepted and " <>
+            "still working is fine; abandoning is not. " <> abandonment_note(final["outcome"])
+        )
 
-      # NOTHING here asserts artifact lifecycle `state`. Retirement moves rows
-      # in-workspace → released and the gate is state-blind on purpose, so a state
-      # assertion would be a brittle oracle for a fact the substrate does not gate on.
-      # Kind and provenance are the whole contract. Do not add one.
-      #
-      # The outcome is ACCEPTED, not required. A holder that went on to complete did the
-      # job; one still working has not failed. Only revocation is a failure here.
-      #
-      # SAMPLED AFTER THE LANE SETTLES, because the wait above returns the instant the
-      # record lands and that is normally MID-TURN. Reading the outcome there would ask the
-      # question before the holder had finished answering it. The matrix was right; the
-      # moment it was sampled was not.
-      await_lane_idle!(state, holder.key, "before reading the assignment's outcome")
-      final = ok!(state, "assignment-get", %{"assignmentId" => asg_id})
+        prompted
+      after
+        retire(state, holder.session)
+      end
 
-      assert(
-        state,
-        final["outcome"] in [nil, "completed"],
-        "carrier proof: #{asg_id} ended #{inspect(final["outcome"])}. Completing is accepted and " <>
-          "still working is fine; abandoning is not. " <> abandonment_note(final["outcome"])
-      )
+    artifact_id = prompted["artifactId"]
 
-      pass(
-        state,
-        "carrier on a real #{state.leg.wire_name} turn: CLI artifact-record bound to its own " <>
-          "turn, #{prompted["recordedTurnEvidence"]} with a non-null edge; assignment " <>
-          "#{inspect(final["outcome"] || "open")}"
-      )
-    after
-      retire(state, holder.session)
+    fetch =
+      post(state, "artifact-content-fetch", %{
+        "artifactId" => artifact_id
+      })
+
+    case get_in(fetch, ["error", "code"]) || fetch["code"] do
+      "content_not_captured" ->
+        message = get_in(fetch, ["error", "message"]) || fetch["message"]
+        artifact = ok!(state, "artifact-get", %{"artifactId" => artifact_id})
+
+        assert(
+          state,
+          message == "artifact has no stored content" and
+            artifact["artifactId"] == artifact_id and
+            artifact["kind"] == "report" and
+            artifact["createdBySession"] == holder.key and
+            artifact["workItemId"] == wi_id and is_nil(artifact["contentSha256"]) and
+            artifact["recordedTurnEvidence"] == prompted["recordedTurnEvidence"],
+          "uncaptured artifact result did not match the recorded report metadata: " <>
+            inspect(
+              Map.take(artifact, [
+                "artifactId",
+                "kind",
+                "createdBySession",
+                "workItemId",
+                "contentSha256",
+                "recordedTurnEvidence"
+              ])
+            )
+        )
+
+        pass(
+          state,
+          "artifact-content-fetch returns structured content_not_captured with truthful report metadata; this does not cover positive content retrieval"
+        )
+
+      nil ->
+        fail(
+          state,
+          "the newly recorded report unexpectedly returned stored content; review the source-backed fixture lifecycle before treating this as capture coverage"
+        )
+
+      code ->
+        fail(
+          state,
+          "artifact-content-fetch returned #{code}: #{inspect(fetch["error"] || fetch)}"
+        )
     end
   end
 
@@ -1757,34 +1925,55 @@ defmodule FeatureSmoke do
     original =
       ok!(state, "config", %{"action" => "get", "setting" => "default-archetype"})["value"]
 
-    ok!(state, "config", %{
-      "action" => "set",
-      "setting" => "default-archetype",
-      "value" => "reviewer-code"
-    })
+    # The wire has no unset: `get` reports the effective value ("default" when no row
+    # exists), and setting "default" is the product's own clear command.
+    with_undo(
+      state,
+      "default-archetype setting",
+      fn ->
+        post(state, "config", %{
+          "action" => "set",
+          "setting" => "default-archetype",
+          "value" => original || "default"
+        })
+      end,
+      fn ->
+        ok!(state, "config", %{
+          "action" => "set",
+          "setting" => "default-archetype",
+          "value" => "reviewer-code"
+        })
 
-    got = ok!(state, "config", %{"action" => "get", "setting" => "default-archetype"})["value"]
-    assert(state, got == "reviewer-code", "config: set did not persist (#{inspect(got)})")
+        got =
+          ok!(state, "config", %{"action" => "get", "setting" => "default-archetype"})["value"]
 
-    spawn =
-      ok!(state, "spawn", %{
-        "displayName" => "smoke-cfg-#{unique()}",
-        "idempotencyKey" => "cfg-#{unique()}"
-      })
+        assert(state, got == "reviewer-code", "config: set did not persist (#{inspect(got)})")
 
-    arch = get_in(spawn, ["stream", "archetype"]) || spawn["archetype"]
-    # reset before asserting so a failure can't leave the org mutated
-    ok!(state, "config", %{
-      "action" => "set",
-      "setting" => "default-archetype",
-      "value" => original || "default"
-    })
+        spawn =
+          ok!(state, "spawn", %{
+            "displayName" => "smoke-cfg-#{unique()}",
+            "idempotencyKey" => "cfg-#{unique()}"
+          })
 
-    assert(state, arch in ["reviewer-code", nil], "config: spawn archetype was #{inspect(arch)}")
-    retire(state, spawn)
+        # The spawn response carries no archetype, so read the session row itself.
+        session_key = get_in(spawn, ["stream", "sessionKey"]) || spawn["sessionKey"]
+
+        arch =
+          sqlite(
+            state,
+            "SELECT archetype FROM sessions WHERE sessionKey = #{sql_quote(session_key)}"
+          )
+
+        retire(state, spawn)
+        assert(state, arch == "reviewer-code", "config: spawn archetype was #{inspect(arch)}")
+      end
+    )
+
     pass(state, "config default-archetype set/get persists and steers spawn")
   end
 
+  # This is a gateway HTTP verb, not a CLI command. The packaged CLI reads
+  # assignment state through work-item-get/work-item-trace.
   # --- work-item + assignment-get --------------------------------------------
   defp check_work_item_and_assignment_get(state) do
     wi =
@@ -1833,6 +2022,102 @@ defmodule FeatureSmoke do
 
     retire(state, holder)
     pass(state, "work-item-create + assign + assignment-get round-trip (and not_found)")
+  end
+
+  # --- 0.1.9 editable bodies and direct delivery-owner link -------------------
+  defp check_work_item_body_and_delivery_owner(state) do
+    u = unique()
+
+    holder =
+      ok!(state, "spawn", %{
+        "displayName" => "smoke-delivery-owner-#{u}",
+        "idempotencyKey" => "doh-#{u}"
+      })
+
+    holder_key = get_in(holder, ["stream", "sessionKey"]) || holder["sessionKey"]
+
+    wi =
+      ok!(state, "work-item-create", %{
+        "title" => "smoke editable body #{u}",
+        "idempotencyKey" => "bwi-#{u}"
+      })
+
+    wi_id = wi["workItemId"] || wi["id"]
+    body = "body round-trip #{u}\n"
+
+    try do
+      saved =
+        ok!(state, "work-item-update", %{
+          "workItemId" => wi_id,
+          "body" => body
+        })
+
+      assert(
+        state,
+        get_in(saved, ["bodyUpdate", "state"]) == "present" and
+          get_in(saved, ["bodyUpdate", "sha256"]) ==
+            Base.encode16(:crypto.hash(:sha256, body), case: :lower),
+        "work-item-update body did not return the saved state and digest: #{inspect(saved)}"
+      )
+
+      read_body = ok!(state, "work-item-get", %{"workItemId" => wi_id})
+
+      assert(
+        state,
+        get_in(read_body, ["workItem", "body"]) == body,
+        "work-item-get did not return the updated body: #{inspect(read_body)}"
+      )
+
+      cleared_body =
+        ok!(state, "work-item-update", %{
+          "workItemId" => wi_id,
+          "clearBody" => true
+        })
+
+      assert(
+        state,
+        get_in(cleared_body, ["bodyUpdate", "state"]) == "absent" and
+          is_nil(get_in(cleared_body, ["bodyUpdate", "sha256"])),
+        "work-item-update --clear-body did not clear the body: #{inspect(cleared_body)}"
+      )
+
+      updated_owner =
+        ok!(state, "work-item-update", %{
+          "workItemId" => wi_id,
+          "deliveryOwnerSessionKey" => holder_key
+        })
+
+      assert(
+        state,
+        updated_owner["deliveryOwnerSessionKey"] == holder_key,
+        "work-item-update --delivery-owner did not set the accountable session: #{inspect(updated_owner)}"
+      )
+
+      read_owner = ok!(state, "work-item-get", %{"workItemId" => wi_id})
+
+      assert(
+        state,
+        get_in(read_owner, ["workItem", "deliveryOwnerSessionKey"]) == holder_key,
+        "work-item-get did not return the direct delivery owner: #{inspect(read_owner)}"
+      )
+
+      cleared_owner =
+        ok!(state, "work-item-update", %{
+          "workItemId" => wi_id,
+          "deliveryOwnerSessionKey" => nil
+        })
+
+      assert(
+        state,
+        is_nil(cleared_owner["deliveryOwnerSessionKey"]),
+        "work-item-update could not clear the direct delivery owner: #{inspect(cleared_owner)}"
+      )
+
+      ok!(state, "work-item-close", %{"workItemId" => wi_id})
+      pass(state, "editable work-item body replace/clear and direct delivery-owner set/clear")
+    after
+      retire(state, holder)
+    end
   end
 
   # --- dispatch (happy path: opens the assignment + wakes the holder) --------
@@ -1889,9 +2174,209 @@ defmodule FeatureSmoke do
     pass(state, "dispatch opens an assignment linked to its work item (brackets F7)")
   end
 
+  # --- 0.1.9 physical breathing query -----------------------------------------
+  defp check_breathing_query(state) do
+    u = unique()
+
+    wi =
+      ok!(state, "work-item-create", %{
+        "title" => "smoke breathing #{u}",
+        "idempotencyKey" => "bri-#{u}"
+      })
+
+    wi_id = wi["workItemId"] || wi["id"]
+
+    result =
+      ok!(state, "breathing", %{
+        "targetKind" => "work-item",
+        "targetId" => wi_id
+      })
+
+    assert(
+      state,
+      result["schema"] == "breathing-v1" and
+        get_in(result, ["target", "kind"]) == "work-item" and
+        get_in(result, ["target", "id"]) == wi_id and
+        result["breathing"] == true and result["reason"] == "pending_wake",
+      "breathing did not report the new work item's scheduled routing wake: #{inspect(result)}"
+    )
+
+    ok!(state, "work-item-close", %{"workItemId" => wi_id})
+    pass(state, "breathing work-item query reports its pending routing wake")
+  end
+
+  # --- 0.1.9 execution-map roster and scoped selection ------------------------
+  defp check_execution_map(state) do
+    u = unique()
+
+    wi =
+      ok!(state, "work-item-create", %{
+        "title" => "smoke execution map #{u}",
+        "idempotencyKey" => "emi-#{u}"
+      })
+
+    wi_id = wi["workItemId"] || wi["id"]
+
+    try do
+      roster = ok!(state, "execution-map", %{})
+      mine = Enum.find(roster["items"] || [], &(&1["id"] == wi_id))
+
+      assert(
+        state,
+        roster["edgeBasis"] == "concurrent_turn" and not is_nil(mine),
+        "execution-map roster omitted the new work item or its edge basis: #{brief(roster)}"
+      )
+
+      assert_execution_map_node(state, mine)
+      assert_execution_map_state_filter(state, [mine])
+      assert_execution_map_forest(state, mine)
+
+      selected = ok!(state, "execution-map-select", %{"under" => wi_id})
+
+      assert(
+        state,
+        Enum.map(selected["roots"] || [], & &1["id"]) == [wi_id],
+        "execution-map-select --under did not return only its visible anchor: #{brief(selected)}"
+      )
+
+      pass(state, "execution-map roster, creation context, filters, forest, and scoped selection")
+    after
+      ok!(state, "work-item-close", %{"workItemId" => wi_id})
+    end
+  end
+
+  # --- 0.1.9 durable Topline mutation flow ------------------------------------
+  defp check_topline_lifecycle(state) do
+    u = unique()
+
+    wi =
+      ok!(state, "work-item-create", %{
+        "title" => "smoke durable topline work #{u}",
+        "idempotencyKey" => "tlwi-#{u}"
+      })
+
+    wi_id = wi["workItemId"] || wi["id"]
+
+    topline =
+      ok!(state, "topline-create", %{
+        "title" => "smoke durable topline #{u}",
+        "idempotencyKey" => "tlc-#{u}"
+      })
+
+    topline_id = get_in(topline, ["topline", "id"])
+
+    updated =
+      ok!(state, "topline-update", %{
+        "toplineId" => topline_id,
+        "title" => "smoke durable topline updated #{u}",
+        "reason" => "exercise the 0.1.9 durable topline update",
+        "idempotencyKey" => "tlu-#{u}"
+      })
+
+    assert(
+      state,
+      get_in(updated, ["topline", "title"]) == "smoke durable topline updated #{u}",
+      "topline-update did not return the new title: #{inspect(updated)}"
+    )
+
+    membership =
+      ok!(state, "topline-link-work", %{
+        "toplineId" => topline_id,
+        "workItemId" => wi_id,
+        "reason" => "exercise the 0.1.9 work link",
+        "idempotencyKey" => "tll-#{u}"
+      })
+
+    membership_id = get_in(membership, ["membership", "id"])
+
+    concern =
+      ok!(state, "topline-concern-create", %{
+        "toplineId" => topline_id,
+        "title" => "smoke durable concern #{u}",
+        "idempotencyKey" => "tlcc-#{u}"
+      })
+
+    concern_id = get_in(concern, ["concern", "id"])
+
+    linked_concern =
+      ok!(state, "topline-concern-link-work", %{
+        "concernId" => concern_id,
+        "workItemId" => wi_id,
+        "reason" => "exercise the 0.1.9 concern link",
+        "idempotencyKey" => "tlcl-#{u}"
+      })
+
+    assert(
+      state,
+      get_in(linked_concern, ["concernTag", "workItemId"]) == wi_id,
+      "topline-concern-link-work did not return the linked work item: #{inspect(linked_concern)}"
+    )
+
+    detail = ok!(state, "topline", %{"toplineId" => topline_id, "history" => true})
+
+    assert(
+      state,
+      get_in(detail, ["topline", "state"]) == "open" and
+        Enum.any?(
+          get_in(detail, ["topline", "workMemberships"]) || [],
+          &(&1["id"] == membership_id)
+        ) and
+        Enum.any?(get_in(detail, ["topline", "concerns"]) || [], &(&1["id"] == concern_id)) and
+        is_list(get_in(detail, ["topline", "history"])),
+      "topline read did not expose its open state, linked rows, and history: #{inspect(detail)}"
+    )
+
+    ok!(state, "topline-concern-unlink-work", %{
+      "concernId" => concern_id,
+      "workItemId" => wi_id,
+      "reason" => "remove the smoke concern link",
+      "idempotencyKey" => "tlcu-#{u}"
+    })
+
+    ok!(state, "topline-unlink-work", %{
+      "membershipId" => membership_id,
+      "reason" => "remove the smoke work link",
+      "idempotencyKey" => "tluw-#{u}"
+    })
+
+    closed =
+      ok!(state, "topline-close", %{
+        "toplineId" => topline_id,
+        "reason" => "exercise the 0.1.9 close transition",
+        "idempotencyKey" => "tlclo-#{u}"
+      })
+
+    assert(state, get_in(closed, ["topline", "state"]) == "closed", "topline-close failed")
+
+    reopened =
+      ok!(state, "topline-reopen", %{
+        "toplineId" => topline_id,
+        "reason" => "exercise the 0.1.9 reopen transition",
+        "idempotencyKey" => "tlro-#{u}"
+      })
+
+    assert(
+      state,
+      get_in(reopened, ["topline", "state"]) == "open",
+      "topline-reopen did not return the open state: #{inspect(reopened)}"
+    )
+
+    placements = ok!(state, "topline-placement-list", %{"state" => "all"})
+    assert(state, is_list(placements["placements"]), "topline-placement-list was malformed")
+
+    ok!(state, "topline-close", %{
+      "toplineId" => topline_id,
+      "reason" => "finish the smoke topline",
+      "idempotencyKey" => "tlclf-#{u}"
+    })
+
+    ok!(state, "work-item-close", %{"workItemId" => wi_id})
+    pass(state, "durable Topline create/update/link/concern/history/close/reopen flow")
+  end
+
   # --- effort-without-effect: durable parent check-in and reassignment ----------
-  # Run the smoke gateway with TIGHTBEAM_EFFORT_CHECKIN_HORIZON_MS=250 (or another
-  # short value). The child is never prompted by this probe; its unavailable/idle
+  # Run the smoke gateway with TIGHTBEAM_EFFORT_CHECKIN_HORIZON_MS=2500. The check-in
+  # deadline shares this setting, and 250 is too short for the parent to rule. The child is never prompted by this probe; its unavailable/idle
   # workdir is adjudicated only by the opening user.
   defp check_effort_without_effect(state) do
     u = unique()
@@ -2029,12 +2514,12 @@ defmodule FeatureSmoke do
         request
 
       System.monotonic_time(:millisecond) >= deadline ->
-        raise(
-          "effort smoke timed out; run the gateway with a short " <>
-            "TIGHTBEAM_EFFORT_CHECKIN_HORIZON_MS (2500 works; the deadline " <>
-            "shares this config, so 250 rung-rotates requests away from the " <>
-            "parent before it can rule)"
-        )
+        raise Failure,
+          message:
+            "effort smoke timed out; run the gateway with a short " <>
+              "TIGHTBEAM_EFFORT_CHECKIN_HORIZON_MS (2500 works; the deadline " <>
+              "shares this config, so 250 rung-rotates requests away from the " <>
+              "parent before it can rule)"
 
       true ->
         Process.sleep(100)
@@ -2042,48 +2527,41 @@ defmodule FeatureSmoke do
     end
   end
 
-  # --- toplines: the board must reflect the work THIS run just did -----------
-  # Runs LAST so every earlier group's material exists: work items, direct and
-  # dispatched assignments, the flagship review chain, and their attests. Every
-  # expectation is DERIVED — from this run's salt, from `work-item-get`'s DIRECT
-  # assignments, and from the `attests` verb — so no number here can rot when an
-  # earlier group changes what it does.
-  defp check_toplines_board(state) do
-    roster = ok!(state, "toplines", %{})
+  # --- durable Topline list ---------------------------------------------------
+  defp check_toplines_list(state) do
+    u = unique()
 
-    assert(
-      state,
-      roster["edgeBasis"] == "concurrent_turn",
-      "toplines must state its edge basis: #{inspect(roster["edgeBasis"])}"
-    )
+    created =
+      ok!(state, "topline-create", %{
+        "title" => "smoke durable topline list #{u}",
+        "idempotencyKey" => "tllist-#{u}"
+      })
 
-    assert(
-      state,
-      is_integer(get_in(roster, ["coverage", "attributionCutoff"])),
-      "toplines must report its coverage cutoff: #{inspect(roster["coverage"])}"
-    )
+    topline_id = get_in(created, ["topline", "id"])
+    assert(state, is_binary(topline_id), "topline-create returned no id: #{inspect(created)}")
 
-    mine = this_run(roster["items"] || [])
+    try do
+      listed = ok!(state, "toplines", %{})
+      match = Enum.find(listed["toplines"] || [], &(&1["id"] == topline_id))
 
-    # Non-vacuous: the earlier groups created work items under this run's salt,
-    # so an empty database cannot pass this check.
-    assert(
-      state,
-      mine != [],
-      "toplines roster shows none of this run's items; titles were #{inspect(Enum.map(roster["items"] || [], & &1["title"]))}"
-    )
+      assert(
+        state,
+        match != nil and match["title"] == "smoke durable topline list #{u}" and
+          match["state"] == "open",
+        "toplines list omitted the newly created durable record: #{inspect(listed)}"
+      )
 
-    Enum.each(mine, &assert_toplines_node(state, &1))
-    assert_toplines_state_filter(state, mine)
-    assert_toplines_forest(state, mine)
-
-    pass(
-      state,
-      "toplines board reflects this run: #{length(mine)} items, resolved membership, live progress clock, recorded creation context"
-    )
+      pass(state, "toplines lists the new durable Topline with its current title and state")
+    after
+      ok!(state, "topline-close", %{
+        "toplineId" => topline_id,
+        "reason" => "finish the Topline list smoke check",
+        "idempotencyKey" => "tlclose-list-#{u}"
+      })
+    end
   end
 
-  defp assert_toplines_node(state, item) do
+  defp assert_execution_map_node(state, item) do
     id = item["id"]
     direct = ok!(state, "work-item-get", %{"workItemId" => id})["assignments"] || []
     resolved = item["assignments"]["open"] + item["assignments"]["closed"]
@@ -2095,30 +2573,30 @@ defmodule FeatureSmoke do
     assert(
       state,
       resolved >= length(direct),
-      "toplines resolved membership (#{resolved}) is below DIRECT (#{length(direct)}) for #{id}"
+      "execution-map resolved membership (#{resolved}) is below DIRECT (#{length(direct)}) for #{id}"
     )
 
     assert(
       state,
       item["jobs"] >= length(Enum.uniq(Enum.map(direct, & &1["holderKey"]))),
-      "toplines jobs (#{item["jobs"]}) undercounts the holders that ever held #{id}"
+      "execution-map jobs (#{item["jobs"]}) undercounts the holders that ever held #{id}"
     )
 
     # The explicit assignment surface must map every DIRECT id back to THIS item
     # — the two surfaces reading the SAME membership function, on live rows.
     Enum.each(direct, fn asg ->
-      selected = ok!(state, "topline", %{"assignments" => [asg["id"]]})
+      selected = ok!(state, "execution-map-select", %{"assignments" => [asg["id"]]})
 
       assert(
         state,
         Enum.map(selected["items"] || [], & &1["id"]) == [id],
-        "topline --assignments #{asg["id"]} should resolve to #{id}, got #{inspect(selected)}"
+        "execution-map-select --assignments #{asg["id"]} should resolve to #{id}, got #{brief(selected)}"
       )
 
       assert(
         state,
         (selected["noItem"] || []) == [],
-        "a pinned assignment must not land in noItem: #{inspect(selected)}"
+        "a pinned assignment must not land in noItem: #{brief(selected)}"
       )
     end)
 
@@ -2133,7 +2611,7 @@ defmodule FeatureSmoke do
     assert(
       state,
       item["attests"]["total"] >= direct_attests,
-      "toplines attests (#{item["attests"]["total"]}) undercounts #{id}'s direct attests (#{direct_attests})"
+      "execution-map attests (#{item["attests"]["total"]}) undercounts #{id}'s direct attests (#{direct_attests})"
     )
 
     # This run just happened, so the progress clock cannot be claiming more quiet
@@ -2144,10 +2622,10 @@ defmodule FeatureSmoke do
     assert(
       state,
       item["sinceProgressMs"] <= budget,
-      "toplines sinceProgressMs #{item["sinceProgressMs"]} for #{id} exceeds this run's own age (#{budget}ms) — the progress clock is not tracking live activity"
+      "execution-map sinceProgressMs #{item["sinceProgressMs"]} for #{id} exceeds this run's own age (#{budget}ms) — the progress clock is not tracking live activity"
     )
 
-    assert_toplines_creation_context(state, item)
+    assert_execution_map_creation_context(state, item)
   end
 
   # THE TEETH. Cross-checks the reader against C1's ACTUAL columns on live rows,
@@ -2158,7 +2636,7 @@ defmodule FeatureSmoke do
   # `unrecorded` on a row this run wrote would mean either C1 stopped stamping on
   # the live path or the reader misreads the bit. The old pre-C1 smoke database
   # showed every parent as `unrecorded`; a fresh run must not.
-  defp assert_toplines_creation_context(state, item) do
+  defp assert_execution_map_creation_context(state, item) do
     id = item["id"]
     {known, seq} = item_creation_columns(state, id)
     status = get_in(item, ["parent", "status"])
@@ -2216,35 +2694,51 @@ defmodule FeatureSmoke do
 
   # `--state` must select exactly the subset the unfiltered roster already shows
   # in that state, in the same order — derived from the roster, never hardcoded.
-  defp assert_toplines_state_filter(state, mine) do
+  defp assert_execution_map_state_filter(state, mine) do
     ids = Enum.map(mine, & &1["id"])
 
     Enum.each(Enum.uniq(Enum.map(mine, & &1["state"])), fn wanted ->
       expected = mine |> Enum.filter(&(&1["state"] == wanted)) |> Enum.map(& &1["id"])
 
       got =
-        ok!(state, "toplines", %{"state" => wanted})["items"]
+        ok!(state, "execution-map", %{"state" => wanted})["items"]
         |> Enum.map(& &1["id"])
         |> Enum.filter(&(&1 in ids))
 
       assert(
         state,
         got == expected,
-        "toplines --state #{wanted} returned #{inspect(got)}, expected #{inspect(expected)}"
+        "execution-map --state #{wanted} returned #{inspect(got)}, expected #{inspect(expected)}"
       )
     end)
   end
 
   # The forest carries the same nodes as the roster: nesting changes shape, never
-  # membership.
-  defp assert_toplines_forest(state, mine) do
-    forest = ok!(state, "toplines", %{"tree" => true})
-    nested = forest["roots"] |> List.wrap() |> Enum.flat_map(&flatten_node/1) |> this_run()
+  # membership. Both sides are this run's whole population, since earlier legs
+  # and areas leave their own salted items (open or closed) in both reads.
+  defp assert_execution_map_forest(state, mine) do
+    listed =
+      ok!(state, "execution-map", %{})["items"]
+      |> List.wrap()
+      |> this_run()
+      |> Enum.map(& &1["id"])
+      |> Enum.sort()
+
+    forest = ok!(state, "execution-map", %{"tree" => true})
+
+    nested =
+      forest["roots"]
+      |> List.wrap()
+      |> Enum.flat_map(&flatten_node/1)
+      |> this_run()
+      |> Enum.map(& &1["id"])
+      |> Enum.sort()
 
     assert(
       state,
-      Enum.sort(Enum.map(nested, & &1["id"])) == Enum.sort(Enum.map(mine, & &1["id"])),
-      "--tree node set diverges from the roster: #{inspect(Enum.map(nested, & &1["id"]))}"
+      nested == listed and mine["id"] in nested,
+      "execution-map --tree node set diverges from the roster (or omits #{mine["id"]}): " <>
+        "tree #{inspect(nested)}, roster #{inspect(listed)}"
     )
   end
 
@@ -2268,31 +2762,6 @@ defmodule FeatureSmoke do
   end
 
   # --- helpers ---------------------------------------------------------------
-  # Brackets hygiene: an open unrouted work item nags its owner's main session
-  # (work-item-brackets-v1 bracket 1), so leftovers from a prior partial run flood
-  # the main session with nag turns and identity-apply never finds a turn boundary.
-  # Dispose anything a previous smoke left open; disposal cancels both bracket wakes.
-  defp sweep_open_work_items(state) do
-    items = ok!(state, "work-item-list", %{})["workItems"] || []
-
-    items
-    |> Enum.filter(&(&1["state"] == "open"))
-    |> Enum.each(fn item ->
-      got = ok!(state, "work-item-get", %{"workItemId" => item["id"]})
-
-      for asg <- got["assignments"] || [], asg["state"] == "open" do
-        ok!(state, "revoke-assignment", %{
-          "assignmentId" => asg["id"],
-          "reason" => "Smoke setup clears an open assignment left by a previous run"
-        })
-      end
-
-      ok!(state, "work-item-close", %{"workItemId" => item["id"]})
-    end)
-
-    state
-  end
-
   defp ok!(state, verb, params) do
     res = post(state, verb, params)
 
@@ -2376,6 +2845,78 @@ defmodule FeatureSmoke do
   defp retire(state, spawn) do
     Tightbeam.DeployReadiness.retire!(fn verb, params -> post(state, verb, params) end, spawn)
   end
+
+  # Runs `body`, then always runs `undo`, which returns a wire response. A failed undo
+  # fails a passing check, and is printed beside the check's own failure otherwise, so
+  # the first error is never masked and a leftover change is never silent.
+  defp with_undo(state, label, undo, body) do
+    try do
+      body.()
+    rescue
+      error ->
+        case undo_error(undo) do
+          nil -> :ok
+          why -> IO.puts("  RESTORE FAILED [#{state.leg.wire_name}] #{label}: #{why}")
+        end
+
+        reraise error, __STACKTRACE__
+    else
+      result ->
+        case undo_error(undo) do
+          nil -> result
+          why -> fail(state, "#{label}: restore failed: #{why}")
+        end
+    end
+  end
+
+  defp undo_error(undo) do
+    case undo.() do
+      %{"error" => error} -> brief(error)
+      _ -> nil
+    end
+  rescue
+    error in Failure -> error.message
+  end
+
+  # "" when the role does not exist, "role:" when it exists unbound, "role:<key>" when
+  # bound. Read before this group creates or rebinds it.
+  defp role_binding(state, role) do
+    sqlite(
+      state,
+      "SELECT 'role:' || COALESCE(boundSessionKey, '') FROM roles WHERE name = #{sql_quote(role)}"
+    )
+  end
+
+  # Binds a shared role for one group and then puts back what was there: no role when
+  # the group created it, or the prior binding. The wire has no unbind, and a bind to an
+  # inactive session is refused, so a prior binding that was already inactive or absent
+  # stays on this group's retired session, which resolves the same way.
+  defp with_role_binding(state, role, prior, session_key, body) do
+    ok!(state, "role-bind", %{"name" => role, "sessionKey" => session_key})
+
+    with_undo(
+      state,
+      "#{role} binding",
+      fn ->
+        case prior do
+          "" ->
+            post(state, "role-rm", %{"name" => role})
+
+          "role:" ->
+            %{}
+
+          "role:" <> prior_key ->
+            case post(state, "role-bind", %{"name" => role, "sessionKey" => prior_key}) do
+              %{"error" => %{"code" => "unknown_session"}} -> %{}
+              response -> response
+            end
+        end
+      end,
+      body
+    )
+  end
+
+  defp brief(term), do: inspect(term, limit: 20, printable_limit: 1_000)
 
   defp leaf_entries(root), do: leaf_entries(root, root, [])
 

@@ -17,8 +17,8 @@ from `<base_dir>/gateway.json`).
 
 ## Bounded fresh-agent deploy readiness
 
-The full feature smoke changes org rules, identity and config and sweeps open
-work. Do not run that suite as a production deploy-readiness check.
+The full feature smoke changes org rules, identity and config and creates its
+own work. Do not run that suite as a production deploy-readiness check.
 Use an already-installed gateway in an explicitly authorized disposable base,
 with existing supported credentials and a permitted non-production test host:
 
@@ -194,7 +194,8 @@ on 2026-07-25:
   refuses the run before the first leg. For the current registry:
 
   ```sh
-  TIGHTBEAM_BASE_DIR=~/.tightbeam-beam \
+  TIGHTBEAM_BASE_DIR=/absolute/owned/test-base \
+  TIGHTBEAM_SMOKE_OWNED_BASE=/absolute/owned/test-base \
   TIGHTBEAM_SMOKE_MODEL_CLAUDE='claude-sonnet-5' TIGHTBEAM_SMOKE_EFFORT_CLAUDE='medium' \
   TIGHTBEAM_SMOKE_MODEL_CODEX='gpt-5.6-sol' TIGHTBEAM_SMOKE_EFFORT_CODEX='medium' \
   TIGHTBEAM_SMOKE_MODEL_CURSOR='<catalog-listed-cursor-model>' \

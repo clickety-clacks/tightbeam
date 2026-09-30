@@ -1,5 +1,28 @@
 # Upgrading a running instance
 
+## 0.1.8 to 0.1.9 database rehearsal
+
+The canonical standalone E2E migration procedure is
+[docs/e2e/0.1.9/migration.md](e2e/0.1.9/migration.md). It starts from a
+verified copy of a real 0.1.8 database, lets the verified 0.1.9 gateway migrate
+that copy once, and preserves the migrated result for separately runnable
+feature checks. The aggregate order and feature-area runbooks are in
+[docs/e2e/0.1.9/README.md](e2e/0.1.9/README.md). Do not use this rehearsal as
+permission to point a command at a live base.
+
+For source-lineage context, canonical tag `v0.1.8+1337` (build 1337,
+`fdb3db53b596d4114d06505b39a4c1836fba7564`) writes
+`operator-decision-requests-v1`, which current 0.1.9 names as a predecessor.
+This is a verified reference lineage, not presumed provenance for a later real
+0.1.8 database. The actual snapshot's manifest must establish its source tag,
+build, package provenance, commit, and stored stamp. If the actual build or
+stamp differs from this reference, stop for delivery's source-backed lineage
+adjudication; a different stamp does not automatically reject every 0.1.8
+release. See the [0.1.9 migration runbook](e2e/0.1.9/migration.md) for source
+qualification. The `pi-harness-v1` stamp below is the historical terminal
+stamp of the 0.1.8 package's own migration chain. It is not an accepted 0.1.9
+source stamp, and this document does not claim that current 0.1.9 migrates it.
+
 Keep each release in its own complete directory. Stage and verify the release
 package before selecting it through `/opt/tightbeam/current`; the selection is
 one atomic symlink replacement, and the previous build remains available.
@@ -42,11 +65,13 @@ after you confirm that it supports the current database schema. Selecting old
 executable bytes does not reverse a SQLite migration or make an incompatible
 schema safe.
 
-Tightbeam 0.1.8 carries one exact migration chain: `model-identity-v1` (0.1.7)
-to `operator-decision-requests-v1`, then to `pi-harness-v1`. A database already
-at the intermediate stamp runs only the second step. The gateway refuses every
-other old stamp. It never infers a schema from stored DDL. This migration
-history does not establish downgrade compatibility.
+The 0.1.8 package carries its own exact migration chain: `model-identity-v1`
+(0.1.7) to `operator-decision-requests-v1`, then to `pi-harness-v1`. A database
+already at the intermediate stamp runs only the second step. When running that
+0.1.8 package, the gateway refuses every other old stamp; it never infers a
+schema from stored DDL. This historical chain does not establish that current
+0.1.9 accepts `pi-harness-v1` as its source, nor does it establish downgrade
+compatibility.
 
 Everything below was measured on 2026-07-26 against a real `state.db` with work
 genuinely in flight.
@@ -64,7 +89,12 @@ The primary database does not migrate a satellite database for it. A macOS host
 whose registry entry says `baseDir=/Users/mike/.tightbeam`, for example, must be
 stopped, backed up, upgraded, and started on that host.
 
-## The supported 0.1.7 to 0.1.8 migration chain
+## The historical 0.1.7 to 0.1.8 migration chain
+
+This describes the historical 0.1.7-to-0.1.8 transition only; it does not
+define the input contract for the current 0.1.9 migration. Use the
+source-backed lineage check above and the standalone 0.1.9 rehearsal before
+starting that upgrade.
 
 Let the 0.1.8 gateway perform this migration at first boot. Do not edit the
 stamp or issue manual `ALTER TABLE` statements.
