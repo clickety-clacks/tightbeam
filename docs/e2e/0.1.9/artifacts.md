@@ -1,40 +1,35 @@
-# 0.1.9 artifact custody checks
+# 0.1.9 artifact custody and retirement checks
 
-Run this area on a fresh copy of the preserved migrated database. Follow the
-shared limits in the [aggregate](README.md#execution-contract). Artifact bytes
-and source paths can contain private data; use only disposable fixtures and
-keep content out of the scorecard.
-
-## Scripted area
-
-The shared [safe-stop](README.md#safe-stop-before-copied-org-gateway-boot)
-blocks boot on this copied database. Do not start it until the PO records the
-source-backed isolation path and this runbook names its supported use. Once
-cleared, prepare a fresh area clone and use that route before the unchanged
-canonical wrapper on Racter or Eezo executes:
+Offline rows run on a new copy of the migrated result
+([reuse the result](migration.md#reuse-the-result)) inside the verified
+[containment](README.md#containment) boundary, from the
+[CLI shell](README.md#cli-shell). A copied session acts through
+[`as_session`](README.md#copied-session-tokens); an admin acts through
+`tb ... --as-user "$test_admin"`:
 
 ```sh
-TIGHTBEAM_BASE_DIR="$AREA_BASE" \
-TIGHTBEAM_SMOKE_AREAS=artifacts \
-mix run --no-start scripts/feature_smoke.exs
+test_admin="$(sqlite3 -readonly "${AREA_BASE:?}/state.db" "SELECT userId FROM users WHERE isAdmin = 1 ORDER BY userId LIMIT 1")"
 ```
 
-The area checks artifact-backed rule gates, then asks a real harness turn to
-record the report from its actual output. It calls `artifact-content-fetch` for
-that newly registered artifact and checks the structured `content_not_captured`
-result against the record's ID, kind, creator, work item, digest field and turn
-evidence. The current source-backed fixture lifecycle does not capture bytes, so
-this is a negative/uncaptured-content check, not positive content-retrieval
-coverage. The coverage map records that gap. A named single-harness run remains
-incomplete for harness parity.
+Create this area's own test work items and assignments, and pick copied active
+sessions with the same owner as their actors. Artifact paths name disposable
+files in scratch; never record a path from the copied org, and keep file
+content out of the scorecard.
 
-## Manual 0.1.9 checks
+Online rows run on a fresh empty base under the [online tier](README.md#tiers)
+and are labelled "fresh-base feature evidence, not proof on migrated state".
+The feature smoke's `artifacts` area ([feature smoke](README.md#feature-smoke),
+online only) checks artifact-backed rule gates and the uncaptured-content
+result on an artifact a real turn records.
 
-| Feature | Exercise | Pass condition |
-|---|---|---|
-| Artifact producer binding | On a disposable item, have its assigned holder directly run `tightbeam artifact-record --kind report --title ... --path <observed-output> --work-item <id> --produced-by-assignment <held-assignment>`. | `artifacts --work-item <id>` reports that exact producer assignment. A different holder, assignment, work item, or owner is refused. |
-| Uncaptured content on a newly registered artifact | The scripted real-turn check fetches the artifact just recorded by that turn, then reads its metadata with the `artifact-get` gateway verb. | `artifact-content-fetch` returns structured `content_not_captured` with the source's `artifact has no stored content` message. The `artifact-get` gateway response has the same ID, report kind, creating session, work item and turn evidence, with no stored digest. This does not count as positive captured-content retrieval coverage; the current source-backed fixture has no capture lifecycle. The fetch reads custody only and never the origin path. |
-| Artifact-attest binding | Use the supported verdict path on a disposable review assignment with a real artifact, its exact SHA, and the relevant wake ID if this verdict is a continuation. Read `attests <assignmentId>`. | The verdict carries the exact artifact ID, digest and wait ID; the relevant gate accepts only that matching custody row. |
+| Feature | Tier | Exercise | Pass condition |
+|---|---|---|---|
+| <a id="producer-binding"></a>Artifact producer binding | Offline | Dispatch test assignment P from an opener to holder X. As X, write a scratch file and run `artifact-record --kind report --title ... --path <file> --work-item <wi> --sha256 <its SHA-256> --produced-by-assignment <P>`. Read `artifacts --work-item <wi>`, and read-only `SELECT originHost FROM artifacts WHERE artifactId = '<A>'` for that artifact A. Repeat as X naming an assignment X does not hold, then naming P with `--work-item` set to a second test item. Run the first form as the admin through `tb` instead of a session. | The first record succeeds and the listing shows `producedByAssignmentId` equal to P, and A's `originHost` names X's host. Both wrong bindings are refused `invalid_producer` ("artifact producer must be a held assignment on the artifact work item"). The admin call is refused `invalid` ("artifact-record requires a session caller"). |
+| <a id="verdict-binding"></a>Verdict bound to an artifact revision | Offline | Using P and its artifact A from the row above, open review assignment R with `assign --reviews <P>` to holder Y, and wake nothing. As Y, file `attest <R> --kind verdict --verdict reviewed-clean --artifact <A> --sha256 <A's SHA-256>`. Also file the same with a different 64-hex digest, the same on a second review card that reviews another assignment, `--kind progress` with the artifact pair, and `--verdict reviewed-clean --wait <any wake id>`. Read `attests <R>`. | The first verdict is kept with `artifactId` and `contentSha256` equal to A and its digest. The wrong digest and the other review card are refused `invalid_revision_binding` ("artifact revision must match the assignment reviewed by this review card"). The progress form is refused by the CLI before any request. `--wait` on an ordinary verdict is refused `invalid_wait_verdict`. |
+| Wait verdicts | Offline | On R, as Y, file `--verdict wait-verified` with no `--wait`. | Refused `wait_required`. A `wait-verified` bound to a real [dependency wait](work-routing.md#wake-delivery-options) needs that wait's verifier assignment; if the area has none, record the positive half `skipped`. |
+| Uncaptured content | Online | Run the smoke's `artifacts` area. It has a real turn record its report with `artifact-record`, then calls `artifact-content-fetch <id>` and reads the record through the gateway's `artifact-get`. | The fetch returns `content_not_captured` ("artifact has no stored content"). The record names the same ID, kind, creating session, work item and turn evidence, with no stored digest. This checks the uncaptured result only; 0.1.9 has no capture path to test positive retrieval. |
+| <a id="retirement-cleanup"></a>Retirement workspace cleanup | Offline | Pick a copied leaf session (no child sessions, no open assignment) whose host row has an `ssh` route; containment conditions 2 and 4 already proved that route and the host's base unreachable. As its owner, run `retire --session <leaf> --key rb-retire-1 --as-user <owner>`, then the same command again. Try `retire` on the owner's Main. Read `list`. | The first call returns `deletedSessionKey` and `retiredSessionKeys` naming the leaf, `deferred`, and one `workspaceCleanup` report with `status` `incomplete`, empty `removedPaths` and `blockers` naming the unreachable host (for example `cleanup_command_failed`). The repeat replays and retries the cleanup. The Main is refused `denied`. The leaf no longer appears in `list`. |
+| Retirement cleanup on a reachable host | Online | On a fresh base, spawn a test session, record an artifact from its workdir with `artifact-record`, write a second scratch file there, and retire it. | `workspaceCleanup` reports `completed`, `removedPaths` covers the scratch file, and `preservedArtifacts` names the recorded artifact, whose file is still present. |
 
-Do not hand-write report bytes, claim output that a command did not produce, or
-fetch from an origin path as a substitute for the captured-content result.
+Do not hand-write report bytes, claim output a command did not produce, or read
+an origin path in place of `artifact-content-fetch`.

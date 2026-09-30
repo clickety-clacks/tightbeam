@@ -1,52 +1,47 @@
 # 0.1.9 work and routing checks
 
-This area checks work-item updates, assignment relationships, direct delivery
-owner links and wake routing. Follow the shared test-host and data-isolation
-rules in the [aggregate](README.md#execution-contract), and begin from a fresh
-copy of the preserved migrated database described in [migration.md](migration.md).
-
-## Scripted area
-
-The shared [safe-stop](README.md#safe-stop-before-copied-org-gateway-boot)
-blocks boot on this copied database. Do not start it until the PO records the
-source-backed isolation path and this runbook names its supported use. Once
-cleared, prepare a fresh area clone and use that route before the unchanged
-canonical wrapper on Racter or Eezo executes:
+Offline rows run on a new copy of the migrated result
+([reuse the result](migration.md#reuse-the-result)) inside the verified
+[containment](README.md#containment) boundary, from the
+[CLI shell](README.md#cli-shell). A copied session acts through
+[`as_session`](README.md#copied-session-tokens); an admin acts through
+`tb ... --as-user "$test_admin"`:
 
 ```sh
-TIGHTBEAM_BASE_DIR="$AREA_BASE" \
-TIGHTBEAM_SMOKE_AREAS=work \
-mix run --no-start scripts/feature_smoke.exs
+test_admin="$(sqlite3 -readonly "${AREA_BASE:?}/state.db" "SELECT userId FROM users WHERE isAdmin = 1 ORDER BY userId LIMIT 1")"
 ```
 
-The area creates and closes its own records. It checks work-item and assignment
-reads, dispatch linking, body replace/clear, and direct delivery-owner
-set/read/clear. It also checks existing facts and configuration reads. A full
-run selects this same area as part of `all`.
+Create this area's own test work items and assignments, and pick copied
+active sessions with the same owner as their actors. Offline, a turn that a row
+queues fails for want of a login or network; the row reads the durable wake and
+turn records, not the turn's reply. Rows that read a table do so read-only:
+`sqlite3 -readonly "$AREA_BASE/state.db"`.
 
-## Manual 0.1.9 checks
+Online rows run on a fresh empty base under the [online tier](README.md#tiers)
+and are labelled "fresh-base feature evidence, not proof on migrated state".
+The feature smoke's `work` area ([feature smoke](README.md#feature-smoke),
+online only) covers facts and configuration reads, work-item and assignment
+reads, dispatch linking, body replace and clear, and delivery owner
+set, read and clear.
 
-Use unique throwaway work items, sessions and assignment IDs in the area copy.
-Record the exact values you sent and read them back; do not use real open work.
+The D1 REST reads are in [gateway-surface.md](gateway-surface.md#rest-d1).
 
-| Feature | Exercise | Pass condition |
-|---|---|---|
-| Work-item create and patch fields | Create a throwaway item with `work-item-create --title ... --priority 3`. Run `tightbeam work-item-update <id> --title ... --priority 5`; set a test spec with `--spec-ref <name> --spec-sha256 <exact-sha>`, then clear it with `--clear-spec-ref`. Read with `tightbeam work-item-get <id>`. | Each selected field changes, omitted fields stay unchanged, the spec name/hash remain a pair, and the read shows the requested priority/title. |
-| <a id="editable-work-item-body"></a>Editable work-item body | Create a disposable item, set a body with `work-item-update <id> --body ...`, replace it with a different body, then clear it with `--clear-body`. Read after each operation. | Each read shows the latest body or an empty body after clear; an omitted body field never resets the title, priority, or metadata. |
-| Default priority | Read `config get default-priority`, set a test-only value with `config set default-priority <0..8>`, create an open throwaway work item, then read both values and restore the prior setting in the disposable org. | The setting readback matches and the new item inherits it; restoring the test base discards the temporary organization default. |
-| Spawn work-item placement and dependency edges | `tightbeam spawn --display ... --work-item <id>`; attach one assignment to a second throwaway item with `assign --succeeds <prior-assignment>`. The successor remains an ordinary assignment. | `list`, `work-item-get <id>`, and `work-item-trace <id>` show the exact work-item and predecessor links requested. No edge points at a different record. |
-| <a id="orchestrator-model-defaults"></a>Orchestrator model defaults | On a disposable work item, use the authorized default staffing path to spawn an `orchestrator` session without model overrides. Read its harness, model and effort alongside that host's advertised catalog. | The session defaults to `codex` with `gpt-6-luna/max` when that exact pair is advertised. If the target host cannot supply it, mark `INCOMPLETE` and stop rather than substituting a different host's catalog. |
-| Direct work-item delivery owner | On a throwaway item, run `tightbeam work-item-update <id> --delivery-owner <sessionKey>` for an active disposable session, then read with `tightbeam work-item-get <id>`. Clear it with `--clear-delivery-owner` and read again. | The item names the selected direct owner, then has no owner after clearing. |
-| <a id="canonical-topology"></a>Canonical session topology | Create a disposable custom child session and one open assignment linked to a test work item. Run `session-reparent --session <child> --parent <parent> --assignment <id> --key <unique>` as the authorized user, then read the session. | `topologyParent` reflects the committed parent while `spawnedBy` remains the original creation provenance; the child retains the exact open assignment. The command refuses if its preconditions do not hold. Do not reparent a production session. |
-| <a id="wake-delivery-options"></a>Wake delivery | Create a held disposable assignment. Exercise a ready-now continuation with `wake --session <holder> --assignment <id> --after-turn --prompt "<continuation>"`, a predicate/fallback wait with its prompt, and a wake with an explicit delivery class and prompt. Read the durable wake and resulting turn rows. | Each wake records the requested assignment, condition/predicate, fallback or class; only the matching eligible turn is delivered. Every wake command includes the required non-empty `--prompt`. |
-| <a id="replace-unread-messages"></a>Replace unread messages | Queue two eligible messages for one throwaway assignment, then issue a newer message with `wake --session <holder> --assignment <id> --replace-queued --prompt ...`. Leave a second assignment for that holder queued as a control. | Only eligible queued messages scoped to the selected assignment are canceled/replaced; the unrelated assignment, human messages and any turn that already started remain unchanged. Read the durable wake/turn history. |
-| <a id="wake-cancellation-history"></a>Wake cancellation history | Schedule a disposable future wake, record its returned ID, then run `cancel-wake <wakeId>` before it becomes due. Read the wake and its event history, and inspect the holder's queue. | The original wake remains queryable with its canceled outcome, no delivery turn is created, and another wake for that holder is unaffected. |
-| Condition fact payload | Publish one unique test fact with `condition --kind <kind> --scope <scope> --payload '<json>' --key <unique-key>`, then read the resulting fact and satisfy one matching disposable dependency wait. | The fact row retains the exact structured payload and scope; the matching wake resumes with that fact, while a nonmatching scope does not. |
-| <a id="landing-watcher"></a>Landing watcher and process-fact wake | In a designated disposable repository, subscribe the test owner to `pr.checks-completed` with scope `<owner>/<repo>#<number>` and a bounded fallback. Let the real required checks on that open PR finish; do not publish a synthetic condition. Repeat on a second disposable PR to confirm a later process fact can wake the same test owner again. | Each completed check set produces one correctly scoped fact and matching wake; a different PR scope does not wake the subscriber. The fallback is not treated as check evidence. |
-| <a id="notice-batching"></a>Notice batching | Only in a disposable org whose approved policy already selects batching for the test recipient, send two routine agent-authored `fyi` notices to that same lane and one urgent blocker. If no such lane is configured, record `INCOMPLETE` rather than editing internal policy rows. | The batch preserves both source notice IDs in publication order and delivers one carrier; urgent traffic remains on the ordinary immediate path, and each source wake remains readable. |
+| Feature | Tier | Exercise | Pass condition |
+|---|---|---|---|
+| Work-item fields | Offline | As the admin, create a test item with `work-item-create --title ... --priority 3`. Run `work-item-update <id> --title ... --priority 5`, then `--spec-ref <name> --spec-sha256 <64 hex>`, then `--clear-spec-ref`, then `--priority 9`. Read `work-item-get <id>` after each. | Each read shows only the requested change; omitted fields are unchanged; the spec name and hash appear and clear together. Priority 9 is refused by the CLI before any request ("priority must be an integer from 0 through 8"). |
+| <a id="editable-work-item-body"></a>Editable work-item body | Offline | On a test item, run `work-item-update <id> --body "first"`, again with `--body "second"`, again with `--body "second"`, then `--clear-body`. Also run `work-item-update <id> --body x --title y`. Read `work-item-get <id>` after each. | `workItem.body` shows the latest text, and `bodyUpdate` carries `state`, `byteLength`, `sha256`, `changed` and the updater. The repeated body shows `changed: false`. After the clear, `body` is null and `bodyUpdate.state` is `absent`. Title, priority and metadata never change. The combined form is a CLI usage error with exit 1. |
+| Default priority | Offline | Run `config get default-priority`, then `config set default-priority 2` as the admin, create a test item with no `--priority`, read it, then set the setting back to its first value. Try `config set default-priority 9`. | The setting reads back as 2 and the new item has priority 2. The restored value matches the first read. 9 is refused. |
+| <a id="delivery-owner"></a>Direct delivery owner | Offline | On a test item, run `work-item-update <id> --delivery-owner <active copied session>`, read `work-item-get <id>`, then `--clear-delivery-owner` and read again. Also try an unknown session key, a copied retired session, and `work-item-delivery-scope-set`. | The item shows `deliveryOwnerSessionKey` equal to the session, then null. The unknown key is refused `unknown_delivery_owner`, the retired session `delivery_owner_unavailable`, and the retired verb `delivery_operation_retired`. |
+| Successor assignment | Offline | Dispatch assignment A on a test item and close it. Dispatch assignment B with `--succeeds <A>`. Then try `--succeeds` naming an open assignment. Read `work-item-get <wi>`. | B's `subject` ends with `Ruled-but-unconsumed decisions carried from <A>: ...` and an `assignment-successor-created` fact is scoped to B. The open predecessor is refused `predecessor_not_terminal`. |
+| <a id="canonical-topology"></a>Canonical session topology | Offline | Pick a copied custom child session holding exactly one open assignment and a second copied session with the same owner. As the owning user, run `session-reparent --session <child> --parent <new parent> --assignment <id> --key <unique>`. Read `list`. Repeat the same call, and try a reparent that makes a cycle. | The response shows `originParent`, `previousCurrentParent` and `currentParent`, and the assignment shows `currentCoordinationParentRef`. `list` shows the new `currentParent` and `topologyParent`, with `spawnedBy` unchanged. The repeat replays; the cycle is refused `cycle_detected`. |
+| <a id="wake-delivery-options"></a>Dependency wait | Offline | On a test item, open assignment H (the waiter), R (the resolver) and V (the verifier). As H's holder, run `wake --session <H holder> --assignment <H> --fallback-after 1h --prompt "resolver closed" --predicate '{"conditions":[{"fact":"assignment.state","op":"eq","value":"closed"}],"bindings":{"assignmentId":"<R>"},"resolverRef":{"kind":"assignment","id":"<R>"},"necessity":"R owns the required output.","verificationRef":{"kind":"assignment","id":"<V>"}}'`. Read the `turns` table for its `wakeId`. Revoke R with a reason, wait one wake tick, and read again. Also run the same wake as a user, and with both `--predicate` and `--after-turn`. | Before R closes, no turn carries the wake's ID. After R is revoked, one turn does, with the prompt. The user caller is refused `invalid_wait`; the combined flags fail at parse. |
+| Ready-now continuation | Online | From inside a harmless running turn of H's holder, have it run `wake --session <itself> --assignment <H> --after-turn --prompt "continue"`. Read the `turns` table after the turn ends. Run the same command from a session with no running turn. | Exactly one later turn carries the continuation's wake ID, and it starts only after the capturing turn ended. With no running turn: `no_running_turn`. |
+| Delivery class | Offline | As a copied session, send `wake --session <other> --class blocker --prompt ...` and `wake --session <other> --class not-a-class --prompt ...`. Read `class` for both wake IDs from the `wakes` table. | Each wake stores the class its sender gave. The unknown class is accepted, not refused. |
+| <a id="replace-unread-messages"></a>Replace unread messages | Online | Keep H's holder busy with a long harmless turn. From the opener session, send two messages with `wake --session <holder> --assignment <H> --replace-queued --prompt ...`, then a third the same way. As a control, send one ordinary wake to the same holder from a different session. Read the holder's turns. | The two earlier queued turns end `canceled` with error `queued-message-suppressed: sender_requested_replacement`, and a `queued_message_suppressed` event is written. The third stays queued. The running turn and the control are unchanged. |
+| <a id="wake-cancellation-history"></a>Wake cancellation history | Offline | As H's holder, register another [dependency wait](#wake-delivery-options) on H naming a resolver that stays open, and a third as a control. Run `cancel-wake <wakeId>` from the holder, then again. Try cancelling the control from a different session. Read `work-item-trace <wi>` and the `turns` table. | The first cancel returns `canceled: true`, the second `canceled: false`. The trace shows `wake_canceled` for that wake with reason `requester_withdrew`. No turn carries its ID. The other session's cancel leaves the control pending. |
+| Consequence condition fact | Offline | On an assignment with at least one attest, as its holder, publish `condition --kind obligation-consequence-changed --scope <asg> --key <unique> --payload '<object>'` with exactly `assignmentId` (the scope), `consequenceKey`, `revision`, `attentionRequestId`, `evidenceAttestId` and boolean `explicitAttention`. Try a payload on another kind, and a payload missing a key. | The fact is kept with its payload. A payload on another kind is refused `invalid` ("payload requires consequence kind"); the incomplete payload is refused `invalid`. |
+| <a id="landing-watcher"></a>Landing watcher | Online | In a disposable repository with one open PR, set the sentinel's `GH_CONFIG_DIR` and `LANDING_REPOS` and enable `agentic-engineering/landing-watch` (see [sentinel lifecycle](provider-runtime.md#sentinel-lifecycle)). Subscribe a test owner with `wake --session <owner> --when-fact pr.checks-completed --when-scope <owner>/<repo>#<n> --fallback-after 2h --prompt ...`. Let the PR's real checks finish. | One fact with the lowercased scope and key `pr-checks:<scope>:<head>:<outcome>` is filed for that head, and the subscriber wakes with `firedBy` `condition`. A subscription on another PR's scope does not fire. The fallback is not check evidence. |
+| Orchestrator defaults | Online | After `learn agentic-engineering`, spawn an `orchestrator` session on a test item without harness, model or effort flags. | The session has harness `codex`, model `gpt-6-luna` and effort `max`. If that host does not offer that model, record `INCOMPLETE`; do not substitute another host. |
 
-The predicate, queued-message replacement and `--after-turn` rows need real
-turn/wake state. Call `--after-turn` from the holder's harmless live turn so it
-captures that turn. If the selected gateway cannot create the stated condition
-without fabricating rows, mark that check `INCOMPLETE` and name the missing
-fixture.
+0.1.9 has no command that turns on notice batching, so these runbooks do not
+check it.

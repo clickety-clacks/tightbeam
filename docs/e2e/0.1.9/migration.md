@@ -1,156 +1,275 @@
 # Migrate a real 0.1.8 database to 0.1.9
 
-This is the single standalone migration rehearsal for 0.1.8 to 0.1.9. It folds
-the older `release-019-database-migration-rehearsal.md` procedure into the
-canonical release runbooks. Start with the shared execution contract in the
-[aggregate](README.md#execution-contract).
+This is the one migration procedure for 0.1.8 to 0.1.9. It replaces the separate
+`release-019-database-migration-rehearsal.md` procedure in the specs repository.
+It runs the 0.1.9 packaged gateway against a verified copy of a real 0.1.8
+database, checks build admission, preserves the migrated output and hands that
+output to every feature runbook. Nothing here runs until Mike calls the run.
 
-Bind the actual source snapshot to a non-secret manifest that identifies its
-exact 0.1.8 build and package provenance, source commit, database SHA-256,
-stored stamp, and the approved backup method and time. A version label and a
-stamp by themselves do not establish which source produced the database.
+Everything below runs inside an environment that has passed all six
+[containment](README.md#containment) conditions, from a
+[CLI shell](README.md#cli-shell), with the README's
+[gateway helper](README.md#gateway-start-and-stop) defined. Never point a
+command at a live base, edit a schema stamp or marker, issue manual
+`ALTER TABLE` statements, or rerun this migration to prepare a feature test.
 
-The verified reference lineage is canonical tag `v0.1.8+1337`, build 1337 at
-commit `fdb3db53b596d4114d06505b39a4c1836fba7564`, with stored stamp
-`operator-decision-requests-v1`. Current 0.1.9 names that stamp as a
-predecessor. This reference is not presumed provenance for a later real 0.1.8
-snapshot. Its non-secret manifest must establish the actual source tag, build,
-package provenance, source commit, database SHA-256, and stored stamp. If the
-actual build or stamp differs from this reference, stop before boot and request
-delivery's source-backed lineage adjudication. That pause does not by itself
-reject every 0.1.8 snapshot. `pi-harness-v1` is the historical terminal stamp
-of the 0.1.8 package's own migration chain, not an accepted 0.1.9 source stamp;
-this procedure does not claim that it migrates through current 0.1.9.
+## Source qualification
 
-The check uses the 0.1.9 packaged gateway once against a verified copy of a real
-0.1.8 database. It preserves the input and saves the migrated output for later
-feature runs. Never point a command at a live base, edit a schema stamp, issue
-manual `ALTER TABLE` statements, or rerun migration to prepare a feature test.
+The database is bound to a non-secret source manifest with `format`
+(`tightbeam-e2e-source/v1`), `sourceVersion`, `sourceTag`, `sourceBuild`,
+`sourceCommit`, `sourcePackageSha256`, `stateDbSha256`, `schemaStamp`,
+`lineageEvidence`, `backupMethod` and `backupTime`. A version label and a stamp
+alone do not establish which build produced a database.
 
-## Inputs and isolation
+The approved reference lineage is tag `v0.1.8+1337`, build 1337, commit
+`fdb3db53b596d4114d06505b39a4c1836fba7564`, stored stamp
+`operator-decision-requests-v1`. If the actual snapshot differs in tag, build,
+commit or stamp, stop before boot and ask delivery ownership for a source-backed
+lineage ruling; do not substitute the reference values. `pi-harness-v1` is the
+last stamp of the 0.1.8 package's own migration chain, not an accepted 0.1.9
+source stamp, and this procedure makes no claim about it.
 
-Before starting, record the source host and exact 0.1.8 build, its package
-provenance and source commit, the approved backup method and time, source file
-size and SHA-256, the stored source stamp and its lineage evidence, the target
-package version/source commit/package SHA, the test host, an unused port, and
-the path of the disposable area. Obtain the database copy through the
-operator's authorized backup process.
-When the source is a live WAL database, use the established consistent
-read-only `VACUUM INTO` backup procedure in [UPGRADE.md](../../UPGRADE.md#take-a-backup-first).
-
-Use only the verified `state.db` as the migration input. Do not copy the source
-base's `gateway.json`, `auth/`, `homes/`, `identity/`, provider credentials, or
-workspace files. The package starts from a new scratch base and writes its own
-gateway descriptor. If that isolated boot cannot satisfy the release's normal
-host prerequisites without importing source credentials, stop and record the
-missing prerequisite.
+The database copy comes from the operator's authorized backup. For a live WAL
+database that is the consistent read-only `VACUUM INTO` backup in
+[UPGRADE.md](../../UPGRADE.md#take-a-backup-first). Only `state.db` is copied:
+never the source base's `gateway.json`, `auth/`, `homes/`, `identity/`,
+credentials or workspaces.
 
 ```sh
 set -eu
-trial_root="$(mktemp -d)"
-source_db="/operator-supplied/verified-0.1.8/state.db"
-expected_source_sha256="replace-with-the-db-sha-from-the-approved-source-manifest"
-source_sha256="$(shasum -a 256 "$source_db" | awk '{print $1}')"
-test "$source_sha256" = "$expected_source_sha256"
+trial_root="$(mktemp -d "${SCRATCH:?}/migration.XXXXXX")"
+source_db="${SOURCE_DIR:?}/state.db"
+source_manifest="$SOURCE_DIR/manifest.json"
+source_package="$SOURCE_DIR/package-0.1.8.tar"
+target_package_archive="$SOURCE_DIR/package-0.1.9.tar"
+expected_target_package_sha256="replace-with-published-package-sha256"
+target_package_sha256="$(sha256 "$target_package_archive")"
+test "$target_package_sha256" = "$expected_target_package_sha256"
+manifest_value() {
+  python3 - "$source_manifest" "$1" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    manifest = json.load(f)
+if manifest.get("format") != "tightbeam-e2e-source/v1":
+    raise SystemExit("unrecognized source manifest format")
+value = manifest.get(sys.argv[2])
+if not isinstance(value, (str, int)) or not str(value).strip():
+    raise SystemExit(f"missing source manifest field: {sys.argv[2]}")
+print(value)
+PY
+}
+source_version="$(manifest_value sourceVersion)"
+source_tag="$(manifest_value sourceTag)"
+source_build="$(manifest_value sourceBuild)"
+source_commit="$(manifest_value sourceCommit)"
+source_package_sha256="$(manifest_value sourcePackageSha256)"
+expected_source_sha256="$(manifest_value stateDbSha256)"
+manifest_source_stamp="$(manifest_value schemaStamp)"
+manifest_value lineageEvidence >/dev/null
+manifest_value backupMethod >/dev/null
+manifest_value backupTime >/dev/null
+test "$source_version" = "0.1.8"
+# Fixed until a source-backed ruling admits a different actual 0.1.8 snapshot.
+approved_source_tag="v0.1.8+1337"
+approved_source_build="1337"
+approved_source_commit="fdb3db53b596d4114d06505b39a4c1836fba7564"
+expected_source_stamp="operator-decision-requests-v1"
+test "$source_tag" = "$approved_source_tag"
+test "$source_build" = "$approved_source_build"
+test "$source_commit" = "$approved_source_commit"
+python3 - "$source_commit" "$source_package_sha256" "$expected_source_sha256" "$target_package_sha256" <<'PY'
+import re, sys
+if re.fullmatch(r"[0-9a-f]{40}", sys.argv[1]) is None:
+    raise SystemExit("source commit must be a full lowercase Git SHA")
+for value in sys.argv[2:]:
+    if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise SystemExit("package and database SHA-256 values must be lowercase hex")
+PY
+test "$(sha256 "$source_package")" = "$source_package_sha256"
+test "$(sha256 "$source_db")" = "$expected_source_sha256"
 test_base="$trial_root/migration-base"
+mkdir "$test_base"
+test_base="$(cd "$test_base" && pwd -P)"
 test_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
-mkdir -p "$test_base"
 cp -p "$source_db" "$test_base/state.db"
-test "$(shasum -a 256 "$test_base/state.db" | awk '{print $1}')" = "$source_sha256"
+test "$(sha256 "$test_base/state.db")" = "$expected_source_sha256"
+test ! -e "$test_base/build-owner.json"
 ```
 
-Before boot, require the source manifest to establish the actual source tag,
-build, package provenance, and commit, with lineage supported by the applicable
-source-backed ruling. Require the one stored source stamp to match the manifest
-and that ruling. For the exact `v0.1.8+1337` reference source, the stamp is
-`operator-decision-requests-v1`. Record
-`PRAGMA quick_check`, `PRAGMA foreign_key_check`, and counts for existing
-durable rows. At minimum record counts for `users`, `sessions`, `work_items`,
-`assignments`, `attests`, `decision_requests`, `messages`, `turns`, `wakes`, and
-`artifacts`. Save only the non-secret stamp, counts, and digests in the
-scorecard.
+Record integrity and row counts before boot. Save only the stamp, counts and
+digests in the scorecard.
 
 ```sh
-# Use this value only for the exact +1337 reference lineage. For another source,
-# do not proceed until delivery records its source-backed lineage ruling.
-expected_source_stamp="operator-decision-requests-v1"
+row_counts() {
+  sqlite3 -readonly -bail -separator '|' "$1" \
+    "SELECT 'users',count(*) FROM users UNION ALL
+     SELECT 'sessions',count(*) FROM sessions UNION ALL
+     SELECT 'work_items',count(*) FROM work_items UNION ALL
+     SELECT 'assignments',count(*) FROM assignments UNION ALL
+     SELECT 'attests',count(*) FROM attests UNION ALL
+     SELECT 'decision_requests',count(*) FROM decision_requests UNION ALL
+     SELECT 'messages',count(*) FROM messages UNION ALL
+     SELECT 'turns',count(*) FROM turns UNION ALL
+     SELECT 'wakes',count(*) FROM wakes UNION ALL
+     SELECT 'artifacts',count(*) FROM artifacts ORDER BY 1;"
+}
 source_stamp="$(sqlite3 -readonly -bail "$test_base/state.db" "SELECT shape FROM schema_stamp;")"
 quick_check="$(sqlite3 -readonly -bail "$test_base/state.db" "PRAGMA quick_check;")"
 foreign_key_failures="$(sqlite3 -readonly -bail "$test_base/state.db" "PRAGMA foreign_key_check;")"
+test "$source_stamp" = "$manifest_source_stamp"
 test "$source_stamp" = "$expected_source_stamp"
 test "$quick_check" = "ok"
 test -z "$foreign_key_failures"
+source_row_counts="$(row_counts "$test_base/state.db")"
 printf 'source stamp: %s\nquick_check: %s\nforeign_key_check: clean\n' "$source_stamp" "$quick_check"
-sqlite3 -readonly -bail "$test_base/state.db" \
-  "SELECT 'users',count(*) FROM users UNION ALL
-   SELECT 'sessions',count(*) FROM sessions UNION ALL
-   SELECT 'work_items',count(*) FROM work_items UNION ALL
-   SELECT 'assignments',count(*) FROM assignments UNION ALL
-   SELECT 'attests',count(*) FROM attests UNION ALL
-   SELECT 'decision_requests',count(*) FROM decision_requests UNION ALL
-   SELECT 'messages',count(*) FROM messages UNION ALL
-   SELECT 'turns',count(*) FROM turns UNION ALL
-   SELECT 'wakes',count(*) FROM wakes UNION ALL
-   SELECT 'artifacts',count(*) FROM artifacts ORDER BY 1;"
+printf '%s\n' "$source_row_counts"
 ```
 
-For the exact `v0.1.8+1337` reference lineage, the expected stamp is
-`operator-decision-requests-v1`. Set `expected_source_stamp` only to the stamp
-established by the source-backed lineage ruling for the actual manifest. Stop
-before boot if that evidence is missing, the observed stamp differs from the
-approved value, the source copy fails integrity checks, or the input digest
-does not match its verified provenance. Do not inspect DDL to guess a
-replacement stamp.
+Stop before boot if any of these fails. Do not inspect DDL to guess or repair a
+stamp.
 
-## Admission stop for the current 0.1.9 package
+## Build admission
 
-A copied 0.1.8 database is an existing unmarked base. Current 0.1.9 build
-admission refuses that state with `build_transition_required`, and the
-packaged gateway exposes no supported operator input for the required
-`live_base_guard` transition. Do not pre-seed a `build-owner.json` marker,
-edit private release configuration, or otherwise bypass admission.
+<a id="build-admission"></a>
 
-The copied-org boot is also held by the shared
-[safe-stop condition](README.md#safe-stop-before-copied-org-gateway-boot):
-current startup recovers and reconciles copied work before the migration checks
-can begin. Stop here and record `E2E migration: INCOMPLETE` until the PO
-records a supported build-admission route and source-backed isolation path,
-then updates this procedure with their exact use. Do not run the gateway
-command below while either condition remains unresolved.
+0.1.9 refuses to open a base that carries no build marker unless the operator
+names the exact transition. Merge `1265b3c894356755d46bc1fd143aeab5be2c873c`
+(PR #183) adds that input, `TIGHTBEAM_LIVE_BASE_TRANSITION`: one JSON object with
+exactly these four fields.
 
-## Run the migration once after the stop is cleared
+- `base`: the canonical absolute path of this scratch base.
+- `expectedSchema`: the source stamp read from the copied `state.db`.
+- `source`: the literal `"unmarked"`.
+- `target`: the 64-character lowercase `buildIdentity` in the target package's
+  `build-manifest.json`. This is the package payload identity, not a commit and
+  not a schema stamp.
 
-Use the hash-verified 0.1.9 package built from the authorized target source
-commit. Set a unique scratch base and port explicitly. Start the packaged
-foreground gateway and capture its output in private scratch for local
-diagnostics:
+The guard recomputes the payload identity itself and refuses if the payload does
+not match its manifest. Never compute a replacement identity. The variable is
+operator input for one start; it does not isolate anything.
 
 ```sh
-gateway_bin="/path/to/verified-0.1.9/tightbeam/bin/tightbeam-gateway"
-TIGHTBEAM_BASE_DIR="$test_base" \
-TIGHTBEAM_PORT="$test_port" \
-TIGHTBEAM_ADVERTISED_URL="ws://127.0.0.1:$test_port" \
-"$gateway_bin" >"$trial_root/gateway.log" 2>&1 &
-gateway_pid=$!
-attempt=0
-until curl -fsS "http://127.0.0.1:$test_port/version" >"$trial_root/version.json"; do
-  kill -0 "$gateway_pid" 2>/dev/null || exit 1
-  attempt=$((attempt + 1))
-  test "$attempt" -lt 60 || exit 1
-  sleep 1
-done
-cat "$trial_root/version.json"
-```
-
-Keep the raw gateway log in private scratch only. Do not attach it to an artifact
-or scorecard; record only non-secret checks and redacted diagnostic excerpts.
-
-While it is running, require `GET /version` to report version `0.1.9` and a
-source SHA matching the package provenance. Set the full source commit from the
-verified package provenance before this check:
-
-```sh
+PKG="${PKG:?}"
 target_source_commit="replace-with-full-source-commit-from-package-provenance"
+target_source_checkout="/operator-supplied/verified-0.1.9/source"
+git -C "$target_source_checkout" merge-base --is-ancestor \
+  1265b3c894356755d46bc1fd143aeab5be2c873c "$target_source_commit"
+target_payload_root="$(python3 - "$PKG" <<'PY'
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1]) / "release" / "lib"
+manifests = list(root.glob("tightbeam-*/build-manifest.json"))
+if len(manifests) != 1:
+    raise SystemExit(f"expected one packaged payload manifest, found {len(manifests)}")
+print(manifests[0].parent)
+PY
+)"
+target_build_identity="$(python3 - "$target_payload_root/build-manifest.json" <<'PY'
+import json, re, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    manifest = json.load(f)
+identity = manifest.get("buildIdentity")
+if manifest.get("format") != "tightbeam-payload/v1" or not isinstance(identity, str):
+    raise SystemExit("unrecognized 0.1.9 payload manifest")
+if re.fullmatch(r"[0-9a-f]{64}", identity) is None:
+    raise SystemExit("payload buildIdentity is not a 64-character lowercase hex digest")
+print(identity)
+PY
+)"
+transition_json() { # transition_json BASE EXPECTED_SCHEMA TARGET
+  python3 - "$1" "$2" "$3" <<'PY'
+import json, os, sys
+base = os.path.realpath(sys.argv[1])
+if not os.path.isabs(base) or base != os.path.normpath(base):
+    raise SystemExit("scratch base is not canonical")
+print(json.dumps({
+    "base": base,
+    "expectedSchema": sys.argv[2],
+    "source": "unmarked",
+    "target": sys.argv[3],
+}, separators=(",", ":")))
+PY
+}
+```
+
+### Refusal probes
+
+Run these on the migration base itself, before the positive start. Admission
+reads the base read-only and refuses before anything is written, so a correct
+refusal leaves the copy unchanged; the probes check exactly that. A refusal
+raises inside the gateway's supervision tree, so the process exits nonzero and
+may write `erl_crash.dump` into its working directory. Run the probes from the
+CLI shell's scratch directory.
+
+```sh
+probe_refusal() { # probe_refusal NAME EXPECTED_CODE [NAME=VALUE ...]
+  name="$1"; expected="$2"; shift 2
+  log="$trial_root/probe-$name.log"
+  digest_before="$(sha256 "$test_base/state.db")"
+  ls -A "$test_base" >"$trial_root/probe-$name.before"
+  if gateway_start "$test_base" "$test_port" "$log" "$@"; then
+    echo "$name: observed-fail (gateway served /version)"
+    gateway_stop
+    return 0
+  fi
+  if kill -0 "$gateway_pid" 2>/dev/null; then
+    echo "$name: observed-fail (no /version and no exit within the limit)"
+    gateway_stop
+    return 0
+  fi
+  status=0; wait "$gateway_pid" || status=$?; gateway_pid=""
+  ls -A "$test_base" >"$trial_root/probe-$name.after"
+  added="$(comm -13 "$trial_root/probe-$name.before" "$trial_root/probe-$name.after" | grep -vx 'state.db-shm' || true)"
+  if test "$status" -ne 0 && grep -q "$expected" "$log" &&
+     test "$(sha256 "$test_base/state.db")" = "$digest_before" &&
+     test -z "$added" && test ! -e "$test_base/build-owner.json"; then
+    echo "$name: observed-pass ($expected)"
+  else
+    echo "$name: observed-fail (exit $status, added: ${added:-none})"
+  fi
+}
+
+other_base="$(mktemp -d "$trial_root/other-base.XXXXXX")"
+probe_refusal no-transition build_transition_required
+probe_refusal malformed invalid_build_transition \
+  TIGHTBEAM_LIVE_BASE_TRANSITION='{"base":'
+probe_refusal wrong-target build_transition_mismatch \
+  TIGHTBEAM_LIVE_BASE_TRANSITION="$(transition_json "$test_base" "$source_stamp" 0000000000000000000000000000000000000000000000000000000000000000)"
+probe_refusal wrong-base build_transition_mismatch \
+  TIGHTBEAM_LIVE_BASE_TRANSITION="$(transition_json "$other_base" "$source_stamp" "$target_build_identity")"
+probe_refusal wrong-schema legacy_schema_mismatch \
+  TIGHTBEAM_LIVE_BASE_TRANSITION="$(transition_json "$test_base" "not-the-source-stamp" "$target_build_identity")"
+```
+
+| Probe | Input | Expected refusal |
+|---|---|---|
+| `no-transition` | Variable unset | `build_transition_required` |
+| `malformed` | Truncated JSON | `invalid_build_transition` |
+| `wrong-target` | Valid JSON, `target` of 64 zeros | `build_transition_mismatch` |
+| `wrong-base` | Valid JSON naming another canonical scratch directory | `build_transition_mismatch` |
+| `wrong-schema` | Valid JSON, `expectedSchema` not the copied stamp | `legacy_schema_mismatch` |
+
+Each probe passes only with a nonzero exit, the expected code in its private
+log, no `/version`, an unchanged `state.db` digest, no `build-owner.json`, and
+no new base entry other than `state.db-shm`. A probe that serves or changes the
+base is `observed-fail`; if it changed the base, stop and restart this runbook
+from a new copy, because the positive start needs an untouched copy.
+
+`incompatible_schema` needs a source whose stamp 0.1.9 does not accept. Run it
+only on a separate, provenance-verified source that a lineage ruling names for
+that purpose; otherwise record `skipped: no authorized incompatible source`.
+Never edit a stamp to make one.
+
+## Run the migration once
+
+Start the gateway with the exact transition, on this one start only. Do not
+export the variable.
+
+```sh
+gateway_start "$test_base" "$test_port" "$trial_root/gateway.log" \
+  TIGHTBEAM_LIVE_BASE_TRANSITION="$(transition_json "$test_base" "$source_stamp" "$target_build_identity")"
+cp "$trial_root/gateway.log.version" "$trial_root/version.json"
 python3 - "$trial_root/version.json" "$target_source_commit" <<'PY'
 import json, sys
 with open(sys.argv[1], encoding="utf-8") as f:
@@ -163,11 +282,12 @@ if not isinstance(reported, str) or not reported or not sys.argv[2].startswith(r
 PY
 ```
 
-Require the stamp to reach
-`work-item-delivery-owner-v1-019`. Run the same integrity, foreign-key and row
-count queries from above. Compare the old durable row populations, and explain
-every intentional schema-owned difference from the exact migration source
-before calling the result a pass.
+If the exact input above is refused, record the observed code as
+`observed-fail`. That is a product result; do not change the check.
+
+Require the target stamp and a clean integrity check, and review the row
+populations. Explain every difference from the source counts against the exact
+migration source before calling the result a pass.
 
 ```sh
 target_stamp="$(sqlite3 -readonly -bail "$test_base/state.db" "SELECT shape FROM schema_stamp;")"
@@ -176,80 +296,213 @@ foreign_key_failures="$(sqlite3 -readonly -bail "$test_base/state.db" "PRAGMA fo
 test "$target_stamp" = "work-item-delivery-owner-v1-019"
 test "$target_quick_check" = "ok"
 test -z "$foreign_key_failures"
+target_row_counts="$(row_counts "$test_base/state.db")"
 printf 'target stamp: %s\nquick_check: %s\nforeign_key_check: clean\n' "$target_stamp" "$target_quick_check"
-sqlite3 -readonly -bail "$test_base/state.db" \
-  "SELECT 'users',count(*) FROM users UNION ALL
-   SELECT 'sessions',count(*) FROM sessions UNION ALL
-   SELECT 'work_items',count(*) FROM work_items UNION ALL
-   SELECT 'assignments',count(*) FROM assignments UNION ALL
-   SELECT 'attests',count(*) FROM attests UNION ALL
-   SELECT 'decision_requests',count(*) FROM decision_requests UNION ALL
-   SELECT 'messages',count(*) FROM messages UNION ALL
-   SELECT 'turns',count(*) FROM turns UNION ALL
-   SELECT 'wakes',count(*) FROM wakes UNION ALL
-   SELECT 'artifacts',count(*) FROM artifacts ORDER BY 1;"
+printf '%s\n' "$target_row_counts"
 ```
 
-Use the packaged CLI against this scratch base to confirm that the migrated
-owner, a real existing work item, and existing assignment, decision-request,
-and artifact rows can be read. Choose IDs from the verified copied database;
-skip a surface only when the source database has no row of that kind, and
-record that fact. Do not create replacement data to hide a failed preservation
-read.
+### Preservation reads
+
+Read existing rows through the same package's CLI. Choose the IDs from the
+copied database: an admin user, a work item with an assignment, a decision
+request, an artifact. Skip a surface only when the source has no row of that
+kind, and record that. Never create replacement data to hide a failed read.
 
 ```sh
-test_admin="replace-with-existing-admin-user-id"
+AREA_BASE="$test_base"; AREA_PORT="$test_port"
+test_admin="$(sqlite3 -readonly "$test_base/state.db" "SELECT userId FROM users WHERE isAdmin = 1 ORDER BY userId LIMIT 1")"
 existing_work_item="replace-with-real-work-item-id"
-existing_assignment="replace-with-real-assignment-id"
-existing_request="replace-with-real-decision-request-id"
+existing_assignment="replace-with-an-assignment-of-that-work-item"
+existing_request="replace-with-real-dr-id"
 existing_artifact="replace-with-real-artifact-id"
-TIGHTBEAM_BASE_DIR="$test_base" /path/to/verified-0.1.9/tightbeam/bin/tightbeam list --as-user "$test_admin"
-TIGHTBEAM_BASE_DIR="$test_base" /path/to/verified-0.1.9/tightbeam/bin/tightbeam work-item-get "$existing_work_item" --as-user "$test_admin"
-TIGHTBEAM_BASE_DIR="$test_base" /path/to/verified-0.1.9/tightbeam/bin/tightbeam decision-request --request "$existing_request" --as-user "$test_admin"
-TIGHTBEAM_BASE_DIR="$test_base" /path/to/verified-0.1.9/tightbeam/bin/tightbeam artifacts --as-user "$test_admin"
+tb list --as-user "${test_admin:?}"
+tb work-item-get "$existing_work_item" --as-user "$test_admin"
+tb decision-request --request "$existing_request" --as-user "$test_admin"
+tb artifacts --as-user "$test_admin"
 ```
 
-Choose `existing_assignment` from `existing_work_item` so the read returns
-that exact assignment in the work item's `assignments` field. Confirm
-`existing_artifact` appears in the artifact listing; a content fetch is not
-required because a historical artifact's bytes may never have been captured.
+`work-item-get` returns `existing_assignment` in its `assignments` field, and
+`existing_artifact` appears in the listing. A content fetch is not required: a
+historical artifact's bytes may never have been captured. `decision-request
+--request` accepts only `dr_<uuidv4>` IDs; pick a request whose ID has that
+form.
 
-Stop the isolated gateway through its packaged `tightbeam-gateway stop` command
-with the same explicit `TIGHTBEAM_BASE_DIR`, then confirm its recorded process
-has exited. Leave the original verified source copy unchanged.
+### Transcript index
+
+<a id="transcript-index"></a>
+
+0.1.9 creates the `turns_message_id` index at boot and pages transcripts through
+it. On a real-size copy, check both:
 
 ```sh
-TIGHTBEAM_BASE_DIR="$test_base" "$gateway_bin" stop
-wait "$gateway_pid"
+sqlite3 -readonly "$test_base/state.db" \
+  "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'turns_message_id';"
+busiest_session="$(sqlite3 -readonly "$test_base/state.db" \
+  "SELECT sessionKey FROM turns GROUP BY sessionKey ORDER BY count(*) DESC LIMIT 1")"
+started="$(date +%s)"
+tb transcript --session "$busiest_session" --limit 50 --as-user "$test_admin" >/dev/null
+echo "transcript read: $(($(date +%s) - started))s"
 ```
+
+The index query prints `turns_message_id`. The transcript command exits 0 with
+at most 50 entries; record its elapsed time. Do not keep its output: it is the
+copied org's conversation.
+
+### Stop and check the marker
+
+```sh
+gateway_stop
+python3 - "$test_base/build-owner.json" "$target_build_identity" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    marker = json.load(f)
+if marker != {
+    "format": "tightbeam-build-owner/v1",
+    "buildIdentity": sys.argv[2],
+}:
+    raise SystemExit("gateway owner marker does not match the migrated payload")
+PY
+```
+
+The gateway itself writes the marker. Never construct or edit one.
+
+### Left-set refusal
+
+<a id="left-set-refusal"></a>
+
+Once the marker exists, the transition input is stale. An operator who leaves it
+set must be refused; one who unsets it must be admitted.
+
+```sh
+probe_refusal left-set build_transition_mismatch \
+  TIGHTBEAM_LIVE_BASE_TRANSITION="$(transition_json "$test_base" "$source_stamp" "$target_build_identity")"
+gateway_start "$test_base" "$test_port" "$trial_root/reboot.log"
+gateway_stop
+```
+
+`left-set` passes as described under [refusal probes](#refusal-probes). The
+restart with the variable unset serves `/version` and stops cleanly. The
+helper always unsets the variable, so any restart outside these runbooks must
+unset it as well.
 
 ## Preserve the reusable result
 
 <a id="record-the-result"></a>
 
-Take a clean SQLite snapshot of the migrated database into a separate output
-directory. Record the target stamp, target version/source SHA/package SHA,
-source stamp/source SHA, row counts, integrity results, package start command,
-test host, run time, and the output database SHA-256 in a non-secret JSON
-manifest. The database file and manifest together are the migration result.
+The reusable result is a clean snapshot of the migrated database, the marker the
+gateway wrote and a non-secret manifest.
 
 ```sh
-mkdir -p "$trial_root/migrated-output"
-# VACUUM INTO reads this source through a read-only connection and writes only
-# the separate destination database, which must not already exist.
+mkdir "$trial_root/migrated-output"
+# VACUUM INTO reads through a read-only connection and writes only the new file.
 sqlite3 -readonly -bail "$test_base/state.db" \
   "VACUUM INTO '$trial_root/migrated-output/state.db';"
-shasum -a 256 "$trial_root/migrated-output/state.db"
+cp -p "$test_base/build-owner.json" "$trial_root/migrated-output/build-owner.json"
+target_version="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$trial_root/version.json")"
+E2E_OUTPUT_DIR="$trial_root/migrated-output" \
+E2E_SOURCE_MANIFEST="$source_manifest" \
+E2E_SOURCE_ROW_COUNTS="$source_row_counts" \
+E2E_TARGET_ROW_COUNTS="$target_row_counts" \
+E2E_TARGET_VERSION="$target_version" \
+E2E_TARGET_SOURCE_COMMIT="$target_source_commit" \
+E2E_TARGET_PACKAGE_SHA256="$target_package_sha256" \
+E2E_TARGET_BUILD_IDENTITY="$target_build_identity" \
+E2E_TARGET_STAMP="$target_stamp" \
+E2E_TARGET_QUICK_CHECK="$target_quick_check" \
+E2E_TEST_HOST="$(hostname)" \
+E2E_COMPLETED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+E2E_GATEWAY_BIN="$PKG/bin/tightbeam-gateway" \
+python3 - <<'PY'
+import hashlib, json, os
+from pathlib import Path
+
+output = Path(os.environ["E2E_OUTPUT_DIR"])
+with open(os.environ["E2E_SOURCE_MANIFEST"], encoding="utf-8") as f:
+    source = json.load(f)
+
+def parse_counts(value):
+    counts = {}
+    for line in value.splitlines():
+        name, count = line.split("|", 1)
+        counts[name] = int(count)
+    if len(counts) != 10:
+        raise SystemExit("expected ten source and target row counts")
+    return counts
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+manifest = {
+    "format": "tightbeam-e2e-migration/v1",
+    "source": {
+        key: source[key]
+        for key in (
+            "sourceVersion", "sourceTag", "sourceBuild", "sourceCommit",
+            "sourcePackageSha256", "stateDbSha256", "schemaStamp",
+            "lineageEvidence", "backupMethod", "backupTime",
+        )
+    },
+    "sourceRowCounts": parse_counts(os.environ["E2E_SOURCE_ROW_COUNTS"]),
+    "target": {
+        "version": os.environ["E2E_TARGET_VERSION"],
+        "sourceCommit": os.environ["E2E_TARGET_SOURCE_COMMIT"],
+        "packageSha256": os.environ["E2E_TARGET_PACKAGE_SHA256"],
+        "buildIdentity": os.environ["E2E_TARGET_BUILD_IDENTITY"],
+        "schemaStamp": os.environ["E2E_TARGET_STAMP"],
+        "quickCheck": os.environ["E2E_TARGET_QUICK_CHECK"],
+        "foreignKeyCheck": "clean",
+        "rowCounts": parse_counts(os.environ["E2E_TARGET_ROW_COUNTS"]),
+    },
+    "migration": {
+        "testHost": os.environ["E2E_TEST_HOST"],
+        "completedAt": os.environ["E2E_COMPLETED_AT"],
+        "gatewayBinary": os.environ["E2E_GATEWAY_BIN"],
+        "transition": "TIGHTBEAM_LIVE_BASE_TRANSITION supplied for one start only",
+    },
+    "output": {
+        "stateDbSha256": digest(output / "state.db"),
+        "buildOwnerSha256": digest(output / "build-owner.json"),
+    },
+}
+with open(output / "manifest.json", "x", encoding="utf-8") as f:
+    json.dump(manifest, f, sort_keys=True, indent=2)
+    f.write("\n")
+PY
+chmod a-w "$trial_root/migrated-output"/*
 ```
 
-Keep that snapshot immutable. For every standalone feature area, provision a
-fresh disposable feature base with the permitted test host's own harness
-setup, replace its database with a new copy of this saved `state.db`, and start
-the matching 0.1.9 checkout gateway as the feature runbook requires. Do not
-copy source-base credentials or configuration into those areas. Do not boot
-0.1.8 against the migrated output and do not migrate it again.
+Record `E2E migration: observed-pass` only if the version, stamp, integrity,
+row-count review, every refusal probe, the preservation reads, the transcript
+index, the marker, the left-set refusal, the unset restart and the preserved
+output all hold. Otherwise record what was observed and leave the output
+unapproved for feature runs.
 
-The acceptance record must say `E2E migration: PASS` only if the exact version,
-stamp, integrity, foreign-key, preservation-read, row-count review, clean stop,
-and reusable output checks all pass. Otherwise record the observed failure and
-leave the output unapproved for feature runs.
+## Reuse the result
+
+<a id="reuse-the-result"></a>
+
+Every feature area starts from a new copy of the preserved output, run with the
+same package whose identity the manifest records. The copied marker lets the
+gateway open the migrated database directly, so no transition input is set and
+the migration never repeats. A different package identity is refused and needs
+its own migration result.
+
+```sh
+migrated="/path/to/preserved/migrated-output"
+python3 - "$migrated/manifest.json" "$target_build_identity" <<'PY'
+import json, sys
+manifest = json.load(open(sys.argv[1], encoding="utf-8"))
+if manifest["target"]["buildIdentity"] != sys.argv[2]:
+    raise SystemExit("package identity differs from the migrated result")
+PY
+test "$(sha256 "$migrated/state.db")" = "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["output"]["stateDbSha256"])' "$migrated/manifest.json")"
+AREA_BASE="$(mktemp -d "${SCRATCH:?}/area.XXXXXX")"
+AREA_BASE="$(cd "$AREA_BASE" && pwd -P)"
+AREA_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
+cp "$migrated/state.db" "$migrated/build-owner.json" "$AREA_BASE/"
+chmod u+w "$AREA_BASE/state.db" "$AREA_BASE/build-owner.json"
+gateway_start "$AREA_BASE" "$AREA_PORT" "$AREA_BASE.log"
+```
+
+Copy nothing else into the area base. Never boot 0.1.8 against the migrated
+output. Delete the area base after its runbook finishes.

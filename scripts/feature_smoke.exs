@@ -2,7 +2,8 @@
 # (full HTTP + router + dispatch + handler + DB stack; the integration path
 # unit tests don't cover). Reads port+token from <base_dir>/gateway.json.
 #
-#   TIGHTBEAM_BASE_DIR=~/.tightbeam-beam \
+#   TIGHTBEAM_BASE_DIR=/absolute/owned/test-base \
+#   TIGHTBEAM_SMOKE_OWNED_BASE=/absolute/owned/test-base \
 #   TIGHTBEAM_SMOKE_MODEL_CLAUDE='claude-sonnet-5' TIGHTBEAM_SMOKE_EFFORT_CLAUDE='medium' \
 #   TIGHTBEAM_SMOKE_MODEL_CODEX='gpt-5.6-sol' TIGHTBEAM_SMOKE_EFFORT_CODEX='medium' \
 #   TIGHTBEAM_SMOKE_MODEL_CURSOR='<catalog-listed-cursor-model>' \
@@ -78,12 +79,29 @@ defmodule FeatureSmoke do
     )
   end
 
-  defp run_readiness do
-    base_dir = System.fetch_env!("TIGHTBEAM_BASE_DIR")
+  # Both modes create, bind and retire records in the base they are pointed at, so
+  # neither may default one: the operator names the disposable base twice.
+  defp owned_base_dir! do
+    base_dir = System.get_env("TIGHTBEAM_BASE_DIR")
 
-    unless System.get_env("TIGHTBEAM_SMOKE_OWNED_BASE") == Path.expand(base_dir) do
-      raise "readiness requires explicit TIGHTBEAM_SMOKE_OWNED_BASE for its authorized disposable base"
+    cond do
+      base_dir in [nil, ""] ->
+        raise Failure,
+          message: "feature-smoke requires TIGHTBEAM_BASE_DIR for its disposable base"
+
+      System.get_env("TIGHTBEAM_SMOKE_OWNED_BASE") != Path.expand(base_dir) ->
+        raise Failure,
+          message:
+            "feature-smoke requires TIGHTBEAM_SMOKE_OWNED_BASE equal to TIGHTBEAM_BASE_DIR " <>
+              "for its authorized disposable base"
+
+      true ->
+        base_dir
     end
+  end
+
+  defp run_readiness do
+    base_dir = owned_base_dir!()
 
     gw = base_dir |> Path.join("gateway.json") |> File.read!() |> JSON.decode!()
     announce_selection!(Tightbeam.FeatureSmokePlan.selection(Tightbeam.Harness.all()))
@@ -105,7 +123,7 @@ defmodule FeatureSmoke do
   end
 
   defp run_full do
-    base_dir = System.get_env("TIGHTBEAM_BASE_DIR") || Path.expand("~/.tightbeam-beam")
+    base_dir = owned_base_dir!()
     gw = base_dir |> Path.join("gateway.json") |> File.read!() |> JSON.decode!()
 
     Process.put(:salt, Integer.to_string(System.os_time(:second)) <> "-")
@@ -207,9 +225,14 @@ defmodule FeatureSmoke do
     IO.puts("credential preflight #{row.step}: #{String.upcase(to_string(row.status))}")
 
     case row.status do
-      :pass -> :ok
-      :fail -> raise "credential preflight failed: #{row.note}"
-      :incomplete -> raise "credential preflight INCOMPLETE/blocker: #{row.note}"
+      :pass ->
+        :ok
+
+      :fail ->
+        raise Failure, message: "credential preflight failed: #{row.note}"
+
+      :incomplete ->
+        raise Failure, message: "credential preflight INCOMPLETE/blocker: #{row.note}"
     end
   end
 
@@ -448,53 +471,74 @@ defmodule FeatureSmoke do
     original_guidance = File.read!(guidance_path)
     marker = "\n\nfeature-smoke #{unique()}\n"
 
-    ok!(state, "identity-edit", %{
-      "archetype" => "default",
-      "manifest" => false,
-      "remove" => false,
-      "content" => original_guidance <> marker
-    })
-
-    ok!(state, "identity-edit", %{
-      "archetype" => "default",
-      "manifest" => false,
-      "remove" => false,
-      "content" => original_guidance
-    })
+    with_undo(
+      state,
+      "default guidance edit",
+      fn ->
+        post(state, "identity-edit", %{
+          "archetype" => "default",
+          "manifest" => false,
+          "remove" => false,
+          "content" => original_guidance
+        })
+      end,
+      fn ->
+        ok!(state, "identity-edit", %{
+          "archetype" => "default",
+          "manifest" => false,
+          "remove" => false,
+          "content" => original_guidance <> marker
+        })
+      end
+    )
 
     manifest_path = Path.join([state.base_dir, "identity", "archetypes", "default.toml"])
     original_manifest = File.read!(manifest_path)
 
-    ok!(state, "identity-edit", %{
-      "archetype" => "default",
-      "manifest" => true,
-      "remove" => false,
-      "content" => original_manifest <> "\n# feature-smoke #{unique()}\n"
-    })
-
-    ok!(state, "identity-edit", %{
-      "archetype" => "default",
-      "manifest" => true,
-      "remove" => false,
-      "content" => original_manifest
-    })
+    with_undo(
+      state,
+      "default manifest edit",
+      fn ->
+        post(state, "identity-edit", %{
+          "archetype" => "default",
+          "manifest" => true,
+          "remove" => false,
+          "content" => original_manifest
+        })
+      end,
+      fn ->
+        ok!(state, "identity-edit", %{
+          "archetype" => "default",
+          "manifest" => true,
+          "remove" => false,
+          "content" => original_manifest <> "\n# feature-smoke #{unique()}\n"
+        })
+      end
+    )
 
     skill = "feature-smoke-#{unique()}"
 
-    ok!(state, "identity-edit", %{
-      "archetype" => "default",
-      "manifest" => false,
-      "skill" => skill,
-      "remove" => false,
-      "content" => "# #{skill}\n"
-    })
-
-    ok!(state, "identity-edit", %{
-      "archetype" => "default",
-      "manifest" => false,
-      "skill" => skill,
-      "remove" => true
-    })
+    with_undo(
+      state,
+      "default skill put",
+      fn ->
+        post(state, "identity-edit", %{
+          "archetype" => "default",
+          "manifest" => false,
+          "skill" => skill,
+          "remove" => true
+        })
+      end,
+      fn ->
+        ok!(state, "identity-edit", %{
+          "archetype" => "default",
+          "manifest" => false,
+          "skill" => skill,
+          "remove" => false,
+          "content" => "# #{skill}\n"
+        })
+      end
+    )
 
     relearn = ok!(state, "identity-relearn", %{})
 
@@ -603,13 +647,20 @@ defmodule FeatureSmoke do
   defp check_flagship_review_loop(state) do
     u = unique()
     # A reviewer role bound to a live reviewer session (the remedy's assign target).
+    prior = role_binding(state, "reviewer-code")
     post(state, "role-create", %{"name" => "reviewer-code"})
 
     reviewer =
       ok!(state, "spawn", %{"displayName" => "smoke-reviewer-#{u}", "idempotencyKey" => "rv-#{u}"})
 
     reviewer_key = get_in(reviewer, ["stream", "sessionKey"]) || reviewer["sessionKey"]
-    ok!(state, "role-bind", %{"name" => "reviewer-code", "sessionKey" => reviewer_key})
+
+    with_role_binding(state, "reviewer-code", prior, reviewer_key, fn ->
+      flagship_review_loop(state, u, reviewer, reviewer_key)
+    end)
+  end
+
+  defp flagship_review_loop(state, u, reviewer, reviewer_key) do
     reviewer_tok = session_token(state, reviewer_key)
 
     # A coder holding a work assignment.
@@ -669,7 +720,7 @@ defmodule FeatureSmoke do
     assert(
       state,
       is_map(review_asg),
-      "flagship: remedy did not assign the reviewer a review of #{asg_id}; got #{inspect(reviews)}"
+      "flagship: remedy did not assign the reviewer a review of #{asg_id}; got #{brief(reviews)}"
     )
 
     review_id = review_asg["id"] || review_asg["assignmentId"]
@@ -773,6 +824,7 @@ defmodule FeatureSmoke do
     reviewer_leg = independent_leg(state)
     preflight_independent!(state, reviewer_leg)
 
+    prior = role_binding(state, "reviewer-code")
     post(state, "role-create", %{"name" => "reviewer-code"})
 
     # The reviewer is spawned through the other SELECTED leg where this run has one. The
@@ -787,7 +839,13 @@ defmodule FeatureSmoke do
       })
 
     reviewer_key = get_in(reviewer, ["stream", "sessionKey"]) || reviewer["sessionKey"]
-    ok!(state, "role-bind", %{"name" => "reviewer-code", "sessionKey" => reviewer_key})
+
+    with_role_binding(state, "reviewer-code", prior, reviewer_key, fn ->
+      gate_chain_enforced(state, u, reviewer_leg, reviewer, reviewer_key)
+    end)
+  end
+
+  defp gate_chain_enforced(state, u, reviewer_leg, reviewer, reviewer_key) do
     reviewer_tok = session_token(state, reviewer_key)
 
     wi =
@@ -821,7 +879,7 @@ defmodule FeatureSmoke do
         is_map(review),
         "gate chain: the review remedy did not assign the #{reviewer_leg.wire_name} reviewer a " <>
           "review of #{asg_id}. The role is rebound to this group's live reviewer, so an " <>
-          "unresolved target here is a real remedy failure. Got: #{inspect(reviews)}"
+          "unresolved target here is a real remedy failure. Got: #{brief(reviews)}"
       )
 
       # Independence is a property of the SESSION, never of the harness:
@@ -1867,31 +1925,50 @@ defmodule FeatureSmoke do
     original =
       ok!(state, "config", %{"action" => "get", "setting" => "default-archetype"})["value"]
 
-    ok!(state, "config", %{
-      "action" => "set",
-      "setting" => "default-archetype",
-      "value" => "reviewer-code"
-    })
+    # The wire has no unset: `get` reports the effective value ("default" when no row
+    # exists), and setting "default" is the product's own clear command.
+    with_undo(
+      state,
+      "default-archetype setting",
+      fn ->
+        post(state, "config", %{
+          "action" => "set",
+          "setting" => "default-archetype",
+          "value" => original || "default"
+        })
+      end,
+      fn ->
+        ok!(state, "config", %{
+          "action" => "set",
+          "setting" => "default-archetype",
+          "value" => "reviewer-code"
+        })
 
-    got = ok!(state, "config", %{"action" => "get", "setting" => "default-archetype"})["value"]
-    assert(state, got == "reviewer-code", "config: set did not persist (#{inspect(got)})")
+        got =
+          ok!(state, "config", %{"action" => "get", "setting" => "default-archetype"})["value"]
 
-    spawn =
-      ok!(state, "spawn", %{
-        "displayName" => "smoke-cfg-#{unique()}",
-        "idempotencyKey" => "cfg-#{unique()}"
-      })
+        assert(state, got == "reviewer-code", "config: set did not persist (#{inspect(got)})")
 
-    arch = get_in(spawn, ["stream", "archetype"]) || spawn["archetype"]
-    # reset before asserting so a failure can't leave the org mutated
-    ok!(state, "config", %{
-      "action" => "set",
-      "setting" => "default-archetype",
-      "value" => original || "default"
-    })
+        spawn =
+          ok!(state, "spawn", %{
+            "displayName" => "smoke-cfg-#{unique()}",
+            "idempotencyKey" => "cfg-#{unique()}"
+          })
 
-    assert(state, arch in ["reviewer-code", nil], "config: spawn archetype was #{inspect(arch)}")
-    retire(state, spawn)
+        # The spawn response carries no archetype, so read the session row itself.
+        session_key = get_in(spawn, ["stream", "sessionKey"]) || spawn["sessionKey"]
+
+        arch =
+          sqlite(
+            state,
+            "SELECT archetype FROM sessions WHERE sessionKey = #{sql_quote(session_key)}"
+          )
+
+        retire(state, spawn)
+        assert(state, arch == "reviewer-code", "config: spawn archetype was #{inspect(arch)}")
+      end
+    )
+
     pass(state, "config default-archetype set/get persists and steers spawn")
   end
 
@@ -2147,7 +2224,7 @@ defmodule FeatureSmoke do
       assert(
         state,
         roster["edgeBasis"] == "concurrent_turn" and not is_nil(mine),
-        "execution-map roster omitted the new work item or its edge basis: #{inspect(roster)}"
+        "execution-map roster omitted the new work item or its edge basis: #{brief(roster)}"
       )
 
       assert_execution_map_node(state, mine)
@@ -2159,7 +2236,7 @@ defmodule FeatureSmoke do
       assert(
         state,
         Enum.map(selected["roots"] || [], & &1["id"]) == [wi_id],
-        "execution-map-select --under did not return only its visible anchor: #{inspect(selected)}"
+        "execution-map-select --under did not return only its visible anchor: #{brief(selected)}"
       )
 
       pass(state, "execution-map roster, creation context, filters, forest, and scoped selection")
@@ -2298,8 +2375,8 @@ defmodule FeatureSmoke do
   end
 
   # --- effort-without-effect: durable parent check-in and reassignment ----------
-  # Run the smoke gateway with TIGHTBEAM_EFFORT_CHECKIN_HORIZON_MS=250 (or another
-  # short value). The child is never prompted by this probe; its unavailable/idle
+  # Run the smoke gateway with TIGHTBEAM_EFFORT_CHECKIN_HORIZON_MS=2500. The check-in
+  # deadline shares this setting, and 250 is too short for the parent to rule. The child is never prompted by this probe; its unavailable/idle
   # workdir is adjudicated only by the opening user.
   defp check_effort_without_effect(state) do
     u = unique()
@@ -2437,12 +2514,12 @@ defmodule FeatureSmoke do
         request
 
       System.monotonic_time(:millisecond) >= deadline ->
-        raise(
-          "effort smoke timed out; run the gateway with a short " <>
-            "TIGHTBEAM_EFFORT_CHECKIN_HORIZON_MS (2500 works; the deadline " <>
-            "shares this config, so 250 rung-rotates requests away from the " <>
-            "parent before it can rule)"
-        )
+        raise Failure,
+          message:
+            "effort smoke timed out; run the gateway with a short " <>
+              "TIGHTBEAM_EFFORT_CHECKIN_HORIZON_MS (2500 works; the deadline " <>
+              "shares this config, so 250 rung-rotates requests away from the " <>
+              "parent before it can rule)"
 
       true ->
         Process.sleep(100)
@@ -2513,13 +2590,13 @@ defmodule FeatureSmoke do
       assert(
         state,
         Enum.map(selected["items"] || [], & &1["id"]) == [id],
-        "execution-map-select --assignments #{asg["id"]} should resolve to #{id}, got #{inspect(selected)}"
+        "execution-map-select --assignments #{asg["id"]} should resolve to #{id}, got #{brief(selected)}"
       )
 
       assert(
         state,
         (selected["noItem"] || []) == [],
-        "a pinned assignment must not land in noItem: #{inspect(selected)}"
+        "a pinned assignment must not land in noItem: #{brief(selected)}"
       )
     end)
 
@@ -2752,6 +2829,78 @@ defmodule FeatureSmoke do
   defp retire(state, spawn) do
     Tightbeam.DeployReadiness.retire!(fn verb, params -> post(state, verb, params) end, spawn)
   end
+
+  # Runs `body`, then always runs `undo`, which returns a wire response. A failed undo
+  # fails a passing check, and is printed beside the check's own failure otherwise, so
+  # the first error is never masked and a leftover change is never silent.
+  defp with_undo(state, label, undo, body) do
+    try do
+      body.()
+    rescue
+      error ->
+        case undo_error(undo) do
+          nil -> :ok
+          why -> IO.puts("  RESTORE FAILED [#{state.leg.wire_name}] #{label}: #{why}")
+        end
+
+        reraise error, __STACKTRACE__
+    else
+      result ->
+        case undo_error(undo) do
+          nil -> result
+          why -> fail(state, "#{label}: restore failed: #{why}")
+        end
+    end
+  end
+
+  defp undo_error(undo) do
+    case undo.() do
+      %{"error" => error} -> brief(error)
+      _ -> nil
+    end
+  rescue
+    error in Failure -> error.message
+  end
+
+  # "" when the role does not exist, "role:" when it exists unbound, "role:<key>" when
+  # bound. Read before this group creates or rebinds it.
+  defp role_binding(state, role) do
+    sqlite(
+      state,
+      "SELECT 'role:' || COALESCE(boundSessionKey, '') FROM roles WHERE name = #{sql_quote(role)}"
+    )
+  end
+
+  # Binds a shared role for one group and then puts back what was there: no role when
+  # the group created it, or the prior binding. The wire has no unbind, and a bind to an
+  # inactive session is refused, so a prior binding that was already inactive or absent
+  # stays on this group's retired session, which resolves the same way.
+  defp with_role_binding(state, role, prior, session_key, body) do
+    ok!(state, "role-bind", %{"name" => role, "sessionKey" => session_key})
+
+    with_undo(
+      state,
+      "#{role} binding",
+      fn ->
+        case prior do
+          "" ->
+            post(state, "role-rm", %{"name" => role})
+
+          "role:" ->
+            %{}
+
+          "role:" <> prior_key ->
+            case post(state, "role-bind", %{"name" => role, "sessionKey" => prior_key}) do
+              %{"error" => %{"code" => "unknown_session"}} -> %{}
+              response -> response
+            end
+        end
+      end,
+      body
+    )
+  end
+
+  defp brief(term), do: inspect(term, limit: 20, printable_limit: 1_000)
 
   defp leaf_entries(root), do: leaf_entries(root, root, [])
 
