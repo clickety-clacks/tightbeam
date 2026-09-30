@@ -54,7 +54,7 @@ defmodule Tightbeam.FeatureSmokeRevocationContractTest do
       end)
 
     assert Enum.sort(revocation_scopes) ==
-             Enum.sort([:check_cannot_proceed_to_opener, :check_flagship_review_loop])
+             Enum.sort([:check_cannot_proceed_to_opener, :check_effort_without_effect])
 
     refute String.contains?(source, "sweep_open_work_items")
     refute String.contains?(source, "clear_previous_leg_work_items")
