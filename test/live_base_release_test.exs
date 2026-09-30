@@ -1,11 +1,13 @@
 defmodule Tightbeam.LiveBaseReleaseTest do
-  use ExUnit.Case, async: false
+  use Tightbeam.TestCase, async: false
 
   alias Exqlite.Sqlite3
   alias Tightbeam.{DB, LiveBaseAdmission, LiveBaseGuard, LiveBaseRelease, Schema}
 
   setup do
-    root = Path.join(System.tmp_dir!(), "live-base-release-#{System.unique_integer([:positive])}")
+    suffix = System.unique_integer([:positive])
+    root = Path.join(File.cwd!(), ".tmp-live-base-release-#{suffix}")
+    base = Path.join(File.cwd!(), ".tmp-live-base-release-base-#{suffix}")
     app = Path.join(root, "release/lib/tightbeam-0.1.9")
     File.mkdir_p!(Path.join(app, "ebin"))
     File.mkdir_p!(Path.join(app, "priv"))
@@ -16,19 +18,24 @@ defmodule Tightbeam.LiveBaseReleaseTest do
     File.write!(Path.join(root, "bin/tightbeam"), "fixture")
     File.write!(Path.join(root, "bin/tightbeam-gateway"), "fixture")
     File.write!(Path.join(root, "release/README"), "fixture")
-    on_exit(fn -> File.rm_rf!(root) end)
-    %{root: root, app: app}
+
+    on_exit(fn ->
+      File.rm_rf!(root)
+      File.rm_rf!(base)
+    end)
+
+    %{root: root, app: app, base: base}
   end
 
   test "a released package derives the exact unmarked transition without operator input", %{
     root: root,
-    app: app
+    app: app,
+    base: base
   } do
     write_provenance!(root)
     {:ok, manifest} = LiveBaseGuard.generate_manifest(LiveBaseAdmission.payload_files!(app))
     File.write!(Path.join(app, "build-manifest.json"), JSON.encode!(manifest))
 
-    base = Path.join(root, "base")
     File.mkdir_p!(base)
     {:ok, conn} = Sqlite3.open(Path.join(base, "state.db"))
 
@@ -95,12 +102,12 @@ defmodule Tightbeam.LiveBaseReleaseTest do
 
   test "a work-branch package refuses an unmarked base without changing it", %{
     root: root,
-    app: app
+    app: app,
+    base: base
   } do
     {:ok, manifest} = LiveBaseGuard.generate_manifest(LiveBaseAdmission.payload_files!(app))
     File.write!(Path.join(app, "build-manifest.json"), JSON.encode!(manifest))
 
-    base = Path.join(root, "base")
     File.mkdir_p!(base)
     path = Path.join(base, "state.db")
     {:ok, conn} = Sqlite3.open(path)
