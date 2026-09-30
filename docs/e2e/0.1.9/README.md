@@ -70,25 +70,29 @@ tb() { TIGHTBEAM_BASE_DIR="${AREA_BASE:?}" "${PKG:?}/bin/tightbeam" "$@"; }
 
 ### Copied session tokens
 
-Whether a run may act as a copied session with that session's copied bearer
-token is an open product question. Until a recorded ruling permits it, rows
-that act through `as_session` are conditional: the helper below stops before
-it reads any token unless `COPIED_TOKEN_RULING` names that ruling, and every
-such row is recorded `INCOMPLETE: copied-token use not ruled`. Rows that only
-use `tb` as the operator or an admin still run.
+Rows that act as a copied session are conditional. They run only inside an
+area copy whose containment conditions all passed, and only when the run's
+recorded execution approval names copied-token use. The PO's authoring ruling
+(`att_eb2fcdf2`) permits these checks to be written; it grants no credential,
+host or execution authority. The helper below stops before it reads any token
+unless `COPIED_TOKEN_APPROVAL` names that execution approval; without it, each
+such row is recorded `INCOMPLETE: copied-token use not approved`. Rows that
+only use `tb` as the operator or an admin still run.
 
-When a ruling permits it, a row uses the session's `cliToken` from the area
-copy. That value is the live org's real bearer, so it is used only inside the
-verified boundary, only against the area's loopback gateway, and never
-printed, logged or saved. These runbooks do not claim a copied token is
+With that approval, a row uses the session's `cliToken` from the area copy.
+That value is the live org's real bearer, and isolating the copy does not
+revoke it: it would still work against the live gateway. So it is used only
+inside the verified boundary, only against the area's loopback gateway, and
+never printed, logged, exported or saved. A copied session acts with its own
+ordinary permissions; no row grants it more. These runbooks do not claim a copied token is
 accepted by the area gateway: if a call is refused for authentication, record
 that row `INCOMPLETE` with the refusal code, not `observed-fail`. Do not run
 this helper under `set -x`:
 
 ```sh
 as_session() {
-  if test -z "${COPIED_TOKEN_RULING:-}"; then
-    echo "STOP: copied-token use not ruled; record this row INCOMPLETE" >&2
+  if test -z "${COPIED_TOKEN_APPROVAL:-}"; then
+    echo "STOP: copied-token use not approved; record this row INCOMPLETE" >&2
     return 1
   fi
   key="$1"; shift
@@ -277,8 +281,8 @@ sha256() { if command -v sha256sum >/dev/null; then sha256sum "$1"; else shasum 
    ```
 
 Copied rows are not sanitized. They hold real bearer tokens and host routes;
-condition 4 makes those unusable outside the copy but does not make them safe
-to show. Remove each area copy after its runbook finishes, keep the migrated
+isolation does not revoke those tokens, and condition 4 only keeps them from
+reaching anything outside the copy. Never show, export or log them. Remove each area copy after its runbook finishes, keep the migrated
 output, and discard the environment at the end.
 
 ## Tiers
