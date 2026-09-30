@@ -70,13 +70,27 @@ tb() { TIGHTBEAM_BASE_DIR="${AREA_BASE:?}" "${PKG:?}/bin/tightbeam" "$@"; }
 
 ### Copied session tokens
 
-Rows that need a copied session to act use that session's `cliToken` from the
-area copy. That token is the live org's real bearer, so it is used only inside
-the verified boundary, only against the area's loopback gateway, and never
-printed, logged or saved. Do not run this helper under `set -x`:
+Whether a run may act as a copied session with that session's copied bearer
+token is an open product question. Until a recorded ruling permits it, rows
+that act through `as_session` are conditional: the helper below stops before
+it reads any token unless `COPIED_TOKEN_RULING` names that ruling, and every
+such row is recorded `INCOMPLETE: copied-token use not ruled`. Rows that only
+use `tb` as the operator or an admin still run.
+
+When a ruling permits it, a row uses the session's `cliToken` from the area
+copy. That value is the live org's real bearer, so it is used only inside the
+verified boundary, only against the area's loopback gateway, and never
+printed, logged or saved. These runbooks do not claim a copied token is
+accepted by the area gateway: if a call is refused for authentication, record
+that row `INCOMPLETE` with the refusal code, not `observed-fail`. Do not run
+this helper under `set -x`:
 
 ```sh
 as_session() {
+  if test -z "${COPIED_TOKEN_RULING:-}"; then
+    echo "STOP: copied-token use not ruled; record this row INCOMPLETE" >&2
+    return 1
+  fi
   key="$1"; shift
   token="$(sqlite3 -readonly "${AREA_BASE:?}/state.db" \
     "SELECT cliToken FROM sessions WHERE sessionKey = '$(printf %s "$key" | sed "s/'/''/g")'")"
@@ -272,7 +286,7 @@ output, and discard the environment at the end.
 - **Offline, real-data copy.** Inside the verified boundary: the migration and
   its refusal probes, preservation reads, the transition checks, and every row
   that needs no provider, network or login. Rows that need a copied session to
-  act use [copied session tokens](#copied-session-tokens).
+  act are conditional on the [copied-token ruling](#copied-session-tokens).
 - **Online, fresh empty base.** A separately authorized environment with
   conditions 1 to 3 met; its online authorization replaces conditions 4 and 5.
   It uses test-owned accounts and a new empty 0.1.9 base, never copied data.

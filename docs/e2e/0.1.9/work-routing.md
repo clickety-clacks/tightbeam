@@ -4,7 +4,9 @@ Offline rows run on a new copy of the migrated result
 ([reuse the result](migration.md#reuse-the-result)) inside the verified
 [containment](README.md#containment) boundary, from the
 [CLI shell](README.md#cli-shell). A copied session acts through
-[`as_session`](README.md#copied-session-tokens); an admin acts through
+[`as_session`](README.md#copied-session-tokens), which stops unless a recorded
+ruling permits copied-token use; without it, record each row that acts as a
+copied session `INCOMPLETE: copied-token use not ruled`. An admin acts through
 `tb ... --as-user "$test_admin"`:
 
 ```sh
