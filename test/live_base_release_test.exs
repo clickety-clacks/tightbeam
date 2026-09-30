@@ -68,6 +68,63 @@ defmodule Tightbeam.LiveBaseReleaseTest do
     :ok = GenServer.stop(db)
   end
 
+  test "a valid explicit transition remains authoritative for a released package", %{
+    root: root,
+    app: app,
+    base: base
+  } do
+    write_provenance!(root)
+    {:ok, manifest} = LiveBaseGuard.generate_manifest(LiveBaseAdmission.payload_files!(app))
+    File.write!(Path.join(app, "build-manifest.json"), JSON.encode!(manifest))
+    seed_predecessor!(base)
+
+    transition =
+      JSON.encode!(%{
+        "base" => LiveBaseAdmission.canonical!(base),
+        "expectedSchema" => Schema.live_base_upgrade_predecessor(),
+        "source" => "unmarked",
+        "target" => manifest["buildIdentity"]
+      })
+
+    admission = LiveBaseAdmission.prepare!(base, payload_root: app, transition: transition)
+
+    assert admission.marker == :absent
+    assert admission.decision.source == "unmarked"
+    assert admission.decision.target == manifest["buildIdentity"]
+    assert admission.decision.expected_schema == Schema.live_base_upgrade_predecessor()
+  end
+
+  test "invalid explicit input never falls back to automatic release admission", %{
+    root: root,
+    app: app,
+    base: base
+  } do
+    write_provenance!(root)
+    {:ok, manifest} = LiveBaseGuard.generate_manifest(LiveBaseAdmission.payload_files!(app))
+    File.write!(Path.join(app, "build-manifest.json"), JSON.encode!(manifest))
+    seed_predecessor!(base)
+    before = File.read!(Path.join(base, "state.db"))
+
+    assert_raise LiveBaseAdmission.Refusal, ~r/invalid_build_transition/, fn ->
+      LiveBaseAdmission.prepare!(base, payload_root: app, transition: "{")
+    end
+
+    mismatched =
+      JSON.encode!(%{
+        "base" => LiveBaseAdmission.canonical!(base),
+        "expectedSchema" => Schema.live_base_upgrade_predecessor(),
+        "source" => "unmarked",
+        "target" => String.duplicate("f", 64)
+      })
+
+    assert_raise LiveBaseAdmission.Refusal, ~r/build_transition_mismatch/, fn ->
+      LiveBaseAdmission.prepare!(base, payload_root: app, transition: mismatched)
+    end
+
+    assert File.read!(Path.join(base, "state.db")) == before
+    refute File.exists?(Path.join(base, "build-owner.json"))
+  end
+
   test "tagged provenance authorizes only the exact supported predecessor", %{
     root: root,
     app: app
@@ -167,5 +224,18 @@ defmodule Tightbeam.LiveBaseReleaseTest do
         "tag" => "v0.1.9+1337"
       })
     )
+  end
+
+  defp seed_predecessor!(base) do
+    File.mkdir_p!(base)
+    {:ok, conn} = Sqlite3.open(Path.join(base, "state.db"))
+
+    :ok =
+      Sqlite3.execute(
+        conn,
+        "CREATE TABLE schema_stamp(shape TEXT); INSERT INTO schema_stamp VALUES ('#{Schema.live_base_upgrade_predecessor()}');"
+      )
+
+    :ok = Sqlite3.close(conn)
   end
 end
