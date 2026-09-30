@@ -63,8 +63,12 @@ defmodule Tightbeam.LiveBaseRelease do
     path = provenance_path(payload_root)
 
     case File.lstat(path) do
-      {:error, :enoent} -> :missing
-      {:ok, %{type: :regular}} -> decode_provenance(path, app_version(payload_root))
+      {:error, :enoent} ->
+        :missing
+
+      {:ok, %{type: :regular}} ->
+        decode_provenance(path, app_version(payload_root))
+
       other ->
         {:error,
          "release provenance refused: #{path} is not a regular file (#{inspect(other)})"}
@@ -90,7 +94,8 @@ defmodule Tightbeam.LiveBaseRelease do
     with {:ok, version} <- release_version(tag),
          :ok <- validate_commit(commit),
          :ok <- validate_app_version(version, expected_version) do
-      {:ok, %{format: @format, repository: @repository, tag: tag, commit: commit, version: version}}
+      {:ok,
+       %{format: @format, repository: @repository, tag: tag, commit: commit, version: version}}
     else
       {:error, message} -> {:error, "release provenance refused: #{message}"}
     end
@@ -129,8 +134,12 @@ defmodule Tightbeam.LiveBaseRelease do
            Path.basename(payload_root),
            capture: :all_names
          ) do
-      [version] -> version
-      _ -> raise Refusal, message: "release provenance refused: application payload has no version"
+      [version] ->
+        version
+
+      _ ->
+        raise Refusal,
+          message: "release provenance refused: application payload has no version"
     end
   end
 

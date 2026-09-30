@@ -61,7 +61,10 @@ defmodule Tightbeam.LiveBaseReleaseTest do
     :ok = GenServer.stop(db)
   end
 
-  test "tagged provenance authorizes only the exact supported predecessor", %{root: root, app: app} do
+  test "tagged provenance authorizes only the exact supported predecessor", %{
+    root: root,
+    app: app
+  } do
     write_provenance!(root)
 
     assert {:ok, transition} =
@@ -90,7 +93,10 @@ defmodule Tightbeam.LiveBaseReleaseTest do
              )
   end
 
-  test "a work-branch package refuses an unmarked base without changing it", %{root: root, app: app} do
+  test "a work-branch package refuses an unmarked base without changing it", %{
+    root: root,
+    app: app
+  } do
     {:ok, manifest} = LiveBaseGuard.generate_manifest(LiveBaseAdmission.payload_files!(app))
     File.write!(Path.join(app, "build-manifest.json"), JSON.encode!(manifest))
 
