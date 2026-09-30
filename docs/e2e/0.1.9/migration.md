@@ -13,6 +13,34 @@ Everything below runs inside an environment that has passed all six
 command at a live base, edit a schema stamp or marker, issue manual
 `ALTER TABLE` statements, or rerun this migration to prepare a feature test.
 
+## Package acquisition
+
+<a id="package-acquisition"></a>
+
+No published 0.1.9 release exists yet, so the package under test is a
+candidate built by the `release candidate` workflow:
+
+1. Push a branch named `release-candidate/<name>` at the exact 0.1.9 commit under
+   test. The workflow runs on that push (or by `workflow_dispatch` with the
+   branch and its 40-hex head).
+2. When it succeeds it publishes one artifact,
+   `release-candidate-proof-<sha>`, kept for 90 days. It holds
+   `packages/linux/tightbeam-0.1.9-linux-x86_64-<short>.tgz`,
+   `packages/darwin/…`, `toolchains/`, `release-candidate-manifest.json` and a
+   `SHA256SUMS` over all of them. The proof artifact exists only if both test
+   jobs and both package jobs passed.
+3. Copy the Linux package and `SHA256SUMS` into `SOURCE_DIR`. The
+   `expected_target_package_sha256` below is that file's line for the package.
+   Extract the package once; `PKG` is the extracted `tightbeam/` directory, which
+   holds `bin/`, `release/` and, for a published release only,
+   `release-provenance.json`.
+4. `target_source_commit` is the candidate SHA, and `target_source_checkout` is
+   a checkout of that SHA placed inside `SOURCE_DIR` before containment.
+
+A published, tagged 0.1.9 release replaces steps 1 and 2 with its GitHub
+release assets and `SHA256SUMS`. Nothing else changes except the
+[package kind](#package-kind).
+
 ## Source qualification
 
 A published tagged 0.1.9 package carries a canonical
@@ -32,9 +60,13 @@ The database is bound to a non-secret source manifest with `format`
 `lineageEvidence`, `backupMethod` and `backupTime`. A version label and a stamp
 alone do not establish which build produced a database.
 
-The approved reference lineage is tag `v0.1.8+1337`, build 1337, commit
-`fdb3db53b596d4114d06505b39a4c1836fba7564`, stored stamp
-`operator-decision-requests-v1`. If the actual snapshot differs in tag, build,
+The approved reference lineage is tag `v0.1.8+1343`, build 1343, commit
+`b2add64414b41606a713ed284abf01a0b4d125e6`, stored stamp
+`operator-decision-requests-v1`. That is the release Gibson runs: its
+`/version` reports sha `b2add644`, and the release's `release-provenance.json`
+names that commit. Its Linux package is
+`tightbeam-0.1.8-linux-x86_64-b2add64.tgz`, SHA-256
+`9dcfd9dc04eb718e27fcf479a494b38818f8fe5d41c2a6b065c224d3ffe4b623`. If the actual snapshot differs in tag, build,
 commit or stamp, stop before boot and ask delivery ownership for a source-backed
 lineage ruling; do not substitute the reference values. `pi-harness-v1` is the
 last stamp of the 0.1.8 package's own migration chain, not an accepted 0.1.9
@@ -81,9 +113,9 @@ manifest_value backupMethod >/dev/null
 manifest_value backupTime >/dev/null
 test "$source_version" = "0.1.8"
 # Fixed until a source-backed ruling admits a different actual 0.1.8 snapshot.
-approved_source_tag="v0.1.8+1337"
-approved_source_build="1337"
-approved_source_commit="fdb3db53b596d4114d06505b39a4c1836fba7564"
+approved_source_tag="v0.1.8+1343"
+approved_source_build="1343"
+approved_source_commit="b2add64414b41606a713ed284abf01a0b4d125e6"
 expected_source_stamp="operator-decision-requests-v1"
 test "$source_tag" = "$approved_source_tag"
 test "$source_build" = "$approved_source_build"
@@ -142,6 +174,30 @@ stamp.
 ## Build admission
 
 <a id="build-admission"></a>
+
+### Package kind
+
+<a id="package-kind"></a>
+
+Two things can supply the transition the guard demands, and the runbook has to
+know which one this package uses before it probes anything:
+
+```sh
+if test -f "${PKG:?}/release-provenance.json"; then package_kind=release; else package_kind=candidate; fi
+echo "package kind: $package_kind"
+```
+
+- `candidate`: a release-candidate or dispatched build. It has no
+  `release-provenance.json`, so the gateway never migrates on its own. The
+  explicit `TIGHTBEAM_LIVE_BASE_TRANSITION` path below is the only path, and a
+  start with no input is refused with `build_transition_required`. This is the
+  workbranch rehearsal.
+- `release`: a tagged push build. On an unmarked base stamped
+  `operator-decision-requests-v1` the gateway derives the same transition itself
+  (PR #185) and migrates with no input. On this kind, a start with no input
+  **is the positive start**: never run it as a refusal probe, because it would
+  migrate the copy. The explicit input still works and an invalid explicit
+  input is still refused, so the other probes stay.
 
 0.1.9 refuses to open a base that carries no build marker unless the operator
 names the exact transition. Merge `1265b3c894356755d46bc1fd143aeab5be2c873c`
@@ -251,7 +307,10 @@ probe_refusal() { # probe_refusal NAME EXPECTED_CODE [NAME=VALUE ...]
 }
 
 other_base="$(mktemp -d "$trial_root/other-base.XXXXXX")"
-probe_refusal no-transition build_transition_required
+case "$package_kind" in
+  candidate) probe_refusal no-transition build_transition_required ;;
+  release) echo "no-transition: not a probe on a release package; it is the positive start" ;;
+esac
 probe_refusal malformed invalid_build_transition \
   TIGHTBEAM_LIVE_BASE_TRANSITION='{"base":'
 probe_refusal wrong-target build_transition_mismatch \
@@ -264,7 +323,7 @@ probe_refusal wrong-schema legacy_schema_mismatch \
 
 | Probe | Input | Expected refusal |
 |---|---|---|
-| `no-transition` | Variable unset | `build_transition_required` |
+| `no-transition` | Variable unset (candidate package only) | `build_transition_required` |
 | `malformed` | Truncated JSON | `invalid_build_transition` |
 | `wrong-target` | Valid JSON, `target` of 64 zeros | `build_transition_mismatch` |
 | `wrong-base` | Valid JSON naming another canonical scratch directory | `build_transition_mismatch` |
@@ -286,12 +345,20 @@ Never edit a stamp to make one.
 
 ## Run the migration once
 
-Start the gateway with the exact transition, on this one start only. Do not
-export the variable.
+On a candidate package, start the gateway with the exact transition, on this
+one start only, and do not export the variable. On a release package, start it
+with no input: the automatic upgrade is the behavior under test.
 
 ```sh
-gateway_start "$test_base" "$test_port" "$trial_root/gateway.log" \
-  TIGHTBEAM_LIVE_BASE_TRANSITION="$(transition_json "$test_base" "$source_stamp" "$target_build_identity")"
+case "$package_kind" in
+  candidate)
+    migration_path="TIGHTBEAM_LIVE_BASE_TRANSITION supplied for one start only"
+    gateway_start "$test_base" "$test_port" "$trial_root/gateway.log" \
+      TIGHTBEAM_LIVE_BASE_TRANSITION="$(transition_json "$test_base" "$source_stamp" "$target_build_identity")" ;;
+  release)
+    migration_path="automatic, from release-provenance.json"
+    gateway_start "$test_base" "$test_port" "$trial_root/gateway.log" ;;
+esac
 cp "$trial_root/gateway.log.version" "$trial_root/version.json"
 python3 - "$trial_root/version.json" "$target_source_commit" <<'PY'
 import json, sys
@@ -394,7 +461,8 @@ The gateway itself writes the marker. Never construct or edit one.
 <a id="left-set-refusal"></a>
 
 Once the marker exists, the transition input is stale. An operator who leaves it
-set must be refused; one who unsets it must be admitted.
+set must be refused; one who unsets it must be admitted. This holds for both
+package kinds.
 
 ```sh
 probe_refusal left-set build_transition_mismatch \
@@ -436,6 +504,7 @@ E2E_TARGET_QUICK_CHECK="$target_quick_check" \
 E2E_TEST_HOST="$(hostname)" \
 E2E_COMPLETED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
 E2E_GATEWAY_BIN="$PKG/bin/tightbeam-gateway" \
+E2E_MIGRATION_PATH="$migration_path" \
 python3 - <<'PY'
 import hashlib, json, os
 from pathlib import Path
@@ -481,7 +550,7 @@ manifest = {
         "testHost": os.environ["E2E_TEST_HOST"],
         "completedAt": os.environ["E2E_COMPLETED_AT"],
         "gatewayBinary": os.environ["E2E_GATEWAY_BIN"],
-        "transition": "TIGHTBEAM_LIVE_BASE_TRANSITION supplied for one start only",
+        "transition": os.environ["E2E_MIGRATION_PATH"],
     },
     "output": {
         "stateDbSha256": digest(output / "state.db"),

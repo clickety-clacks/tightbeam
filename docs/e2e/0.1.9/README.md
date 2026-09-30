@@ -11,7 +11,8 @@ feature check never repeats the migration and never changes the preserved copy.
 
 | Runbook | What it covers | Starts from |
 |---|---|---|
-| [migration.md](migration.md) | 0.1.8 to 0.1.9 migration, build admission (`TIGHTBEAM_LIVE_BASE_TRANSITION`), preservation reads, reusable output | A verified copy of a real 0.1.8 `state.db` |
+| [PREFLIGHT.md](PREFLIGHT.md) | Readiness: every prerequisite classified, what is missing and who supplies it | Nothing; read it first |
+| [migration.md](migration.md) | 0.1.8 to 0.1.9 migration, package acquisition and kind, build admission (`TIGHTBEAM_LIVE_BASE_TRANSITION` or release provenance), preservation reads, reusable output | A verified copy of a real 0.1.8 `state.db` |
 | [gateway-surface.md](gateway-surface.md) | Gateway shim verbs, stop isolation, REST authentication and D1 reads, CLI transport diagnostics | Fresh empty bases, plus one migrated copy |
 | [provider-runtime.md](provider-runtime.md) | Identity, harness control, sentinels, session connection, shipped guidance | Migrated copy (offline) or fresh base (online) |
 | [work-routing.md](work-routing.md) | Work-item fields and body, delivery owner, successors, topology, wakes and dependency waits, conditions, landing watcher | Migrated copy (offline) or fresh base (online) |
@@ -211,7 +212,9 @@ sha256() { if command -v sha256sum >/dev/null; then sha256sum "$1"; else shasum 
    fi
    ```
 
-   Any printed line fails the condition.
+   Any printed line fails the condition. A container runtime's own bind mounts
+   of `/etc/hosts`, `/etc/hostname` and `/etc/resolv.conf` are expected and do
+   not fail it; anything else from the host does.
 
 3. **No host control.** No container runtime, systemd, D-Bus, tmux or SSH-agent
    socket is reachable, and every Unix socket lives in scratch. The process list
