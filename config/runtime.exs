@@ -5,6 +5,13 @@ if config_env() != :test do
     config :tightbeam, :base_dir, value
   end
 
+  # An operator may carry the exact serialized build transition into the
+  # packaged gateway. Keep the bytes untouched here: LiveBaseAdmission owns
+  # strict decoding, base/source/target matching, and schema qualification.
+  if value = System.get_env("TIGHTBEAM_LIVE_BASE_TRANSITION") do
+    config :tightbeam, :live_base_guard, transition: value
+  end
+
   if value = System.get_env("TIGHTBEAM_PORT") do
     config :tightbeam, :port, String.to_integer(value)
   end

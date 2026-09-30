@@ -405,6 +405,20 @@ overrides the port. Whatever you set for the service, set for the shell you run
 the CLI from: if they disagree, the CLI looks for its gateway in a directory
 that does not have one.
 
+For a packaged 0.1.9 gateway adopting an existing unmarked 0.1.8 base, set
+`TIGHTBEAM_LIVE_BASE_TRANSITION` to the exact JSON transition supplied by the
+operator's release procedure. For example (with the real canonical base,
+target build identity, and schema stamp substituted):
+
+```sh
+export TIGHTBEAM_LIVE_BASE_TRANSITION='{"base":"/srv/tightbeam","expectedSchema":"<0.1.8-schema-stamp>","source":"unmarked","target":"<64-hex-0.1.9-build-identity>"}'
+```
+
+The value is passed through as serialized bytes; the gateway still performs its
+normal exact base/source/target and schema checks. Omitting the variable leaves
+ordinary unmarked-base refusal in place. Malformed JSON, a mismatched identity,
+or an incompatible schema is refused.
+
 ### More than one gateway on one machine
 
 Supported. Give each instance its own `TIGHTBEAM_BASE_DIR` and its own
@@ -630,6 +644,7 @@ The service must **start with no interactive login**, **survive logout**,
 |---|---|
 | `TIGHTBEAM_LOCAL_HOST_NAME` | **Set this. It is the one that bites.** The homes tree is keyed `homes/<machine>/<harness>`, and the machine name defaults to the OS hostname. If the hostname is unstable — a container that gets a new id per start, a renamed machine — every restart projects a NEW home tree and silently orphans the durable harness state (codex `sessions/`, claude `projects/`) under the old name. It does not fail; it just quietly stops finding the old conversations. Pin it to a name you choose and never change it. |
 | `TIGHTBEAM_BASE_DIR` | The org: `auth/`, `identity/`, `homes/`, `state.db`, `work/`. Defaults to `TIGHTBEAM_HOME`, else `~/.tightbeam`. |
+| `TIGHTBEAM_LIVE_BASE_TRANSITION` | Optional exact JSON transition for a packaged 0.1.9 gateway adopting an unmarked 0.1.8 base; malformed, mismatched, or schema-incompatible values are refused. |
 | `TIGHTBEAM_PORT` | Rewritten into `gateway.json` at every boot. |
 | `TIGHTBEAM_NODE` | The release's Erlang node name. Defaults to `tightbeam_gateway_<port>`, which is already unique per instance — set it only if you want to choose the name. |
 | `TIGHTBEAM_ADVERTISED_URL` | The URL clients are told to connect back on. `mix tightbeam.doctor` fails without it. |
