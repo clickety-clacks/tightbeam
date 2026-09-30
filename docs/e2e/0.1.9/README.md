@@ -111,7 +111,10 @@ Never `SELECT *` from `sessions`. Query named columns only.
 Every runbook starts a gateway through this helper, in the same script as its
 checks, so an interrupted script still stops the gateway it started. The
 package `stop` verb signals the process recorded in the named base's
-`gateway.json` and does not wait, so the trap waits for it.
+`gateway.json` and does not wait, so the trap waits for it. Startup writes
+`gateway.json` only after preflight, and `stop` refuses before then; in that
+window the helper sends `TERM` to the child this shell launched, and nothing
+else. The wait is bounded: a child still running after 60 seconds gets `KILL`.
 
 ```sh
 gateway_pid=""
@@ -133,7 +136,14 @@ gateway_start() { # gateway_start BASE PORT LOG [NAME=VALUE ...]
 }
 gateway_stop() {
   test -n "$gateway_pid" || return 0
-  TIGHTBEAM_BASE_DIR="$gateway_base" "${PKG:?}/bin/tightbeam-gateway" stop || true
+  TIGHTBEAM_BASE_DIR="$gateway_base" "${PKG:?}/bin/tightbeam-gateway" stop ||
+    kill -TERM "$gateway_pid" 2>/dev/null || true
+  stop_wait=0
+  while kill -0 "$gateway_pid" 2>/dev/null && test "$stop_wait" -lt 60; do
+    stop_wait=$((stop_wait + 1))
+    sleep 1
+  done
+  if kill -0 "$gateway_pid" 2>/dev/null; then kill -KILL "$gateway_pid" || true; fi
   wait "$gateway_pid" || true
   gateway_pid=""
 }

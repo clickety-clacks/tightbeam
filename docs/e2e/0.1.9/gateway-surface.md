@@ -38,9 +38,11 @@ the other, even when the shell carries the other's node name, port and a cookie.
 The check runs in a subshell with its own cleanup, registered before either
 start, so the shared `gateway_stop` trap stays in place for later sections.
 The cleanup stops the gateway `gateway_start` last launched through the shared
-`gateway_stop`, which knows it from launch, so an interrupt during readiness
-polling still stops it; once B is up it moves to `pid_b`. The subshell clears
-`gateway_pid` first so it never stops a gateway the parent shell started.
+`gateway_stop`, which knows it from launch and stops it within a bounded time
+even before `gateway.json` exists, so an interrupt during readiness polling
+still stops it; once B is up it moves to `pid_b`, and cleanup stops it the same
+way afterwards. The subshell clears `gateway_pid` first so it never stops a
+gateway the parent shell started.
 
 ```sh
 (
@@ -52,8 +54,8 @@ gateway_pid=""; pid_b=""
 stop_pair() {
   gateway_stop
   if test -n "$pid_b"; then
-    TIGHTBEAM_BASE_DIR="$base_b" "$PKG/bin/tightbeam-gateway" stop || true
-    wait "$pid_b" || true; pid_b=""
+    gateway_pid="$pid_b"; gateway_base="$base_b"; pid_b=""
+    gateway_stop
   fi
 }
 trap stop_pair EXIT
