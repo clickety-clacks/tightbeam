@@ -366,7 +366,7 @@ A 0.1.9 change with no user-callable surface outside the ledger has no row.
 | `wi_08c74b58` | #123 | [Sign-in recovery wake](provider-runtime.md#sign-in-recovery-wake), online, operator at keyboard |
 | `wi_0f4ec953` | #168 | CI: workflow change only |
 | `wi_14dd922d` | #108 | TEST: two test modules made synchronous; the fix landed in `8121b52d` |
-| `wi_164c025c` | #64 | NOT SHIPPED on 0.1.9 despite the #64 trailer. #64 is wi_5501fe61's code, covered there; the contract is main-only (#61, `910cbde0`, cut by `dr_7683fd67`). |
+| `wi_164c025c` | #64 | NOT SHIPPED on 0.1.9; no row checks it. The ledger maps it from #64, whose body says "Landing is serialized behind lane 1 (wi_164c025c)" and names wi_5501fe61 / asg_265faa86 as its work. #64 merged as `91da0304` onto 0.1.9: six cherry-picked Class A failed-turn commits (`8d899368..91da0304` on `35a6c0ca`), covered under `wi_5501fe61`. The completion-deliverable contract is main-only (#61, merge `910cbde0`, cut for 0.1.9 by `dr_7683fd67`). |
 | `wi_1926c45c` | #142, #161 | [Harness change refused during a turn](provider-runtime.md#tune-turn-in-progress), online |
 | `wi_1b74fd76` | #132, #136, #139 | TEST: test files only |
 | `wi_2457fbf2` | #159 | [Sentinel lifecycle](provider-runtime.md#sentinel-lifecycle) lists landing-watch; [landing watcher](work-routing.md#landing-watcher), online |
