@@ -35,24 +35,40 @@ echo "stop without a base exit: $status"
 Two gateways on new empty bases. Stopping one through its own base must not reach
 the other, even when the shell carries the other's node name, port and a cookie.
 
+The check runs in a subshell with its own cleanup, registered before either
+start, so the shared `gateway_stop` trap stays in place for later sections.
+
 ```sh
+(
 base_a="$(mktemp -d "${SCRATCH:?}/stop-a.XXXXXX")"; base_a="$(cd "$base_a" && pwd -P)"
 base_b="$(mktemp -d "$SCRATCH/stop-b.XXXXXX")"; base_b="$(cd "$base_b" && pwd -P)"
 free_port() { python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()'; }
 port_a="$(free_port)"; port_b="$(free_port)"
-gateway_start "$base_b" "$port_b" "$base_b.log"; pid_b="$gateway_pid"
-gateway_start "$base_a" "$port_a" "$base_a.log"; pid_a="$gateway_pid"
-trap 'TIGHTBEAM_BASE_DIR="$base_a" "$PKG/bin/tightbeam-gateway" stop || true
-      TIGHTBEAM_BASE_DIR="$base_b" "$PKG/bin/tightbeam-gateway" stop || true
-      wait' EXIT INT TERM
+pid_a=""; pid_b=""
+stop_pair() {
+  if test -n "$pid_a"; then
+    TIGHTBEAM_BASE_DIR="$base_a" "$PKG/bin/tightbeam-gateway" stop || true
+    wait "$pid_a" || true; pid_a=""
+  fi
+  if test -n "$pid_b"; then
+    TIGHTBEAM_BASE_DIR="$base_b" "$PKG/bin/tightbeam-gateway" stop || true
+    wait "$pid_b" || true; pid_b=""
+  fi
+}
+trap stop_pair EXIT
+trap 'exit 130' INT TERM
+started=0; gateway_start "$base_b" "$port_b" "$base_b.log" || started=$?
+pid_b="$gateway_pid"; test "$started" -eq 0 || exit 1
+started=0; gateway_start "$base_a" "$port_a" "$base_a.log" || started=$?
+pid_a="$gateway_pid"; test "$started" -eq 0 || exit 1
 RELEASE_NODE="tightbeam_gateway_$port_b" TIGHTBEAM_PORT="$port_b" \
   RELEASE_COOKIE="runbook-sentinel-not-a-cookie" TIGHTBEAM_BASE_DIR="$base_a" \
   "$PKG/bin/tightbeam-gateway" stop
-wait "$pid_a" || true
+wait "$pid_a" || true; pid_a=""
 curl -fsS --noproxy '*' "http://127.0.0.1:$port_a/version" && echo "A still serving"
 curl -fsS --noproxy '*' "http://127.0.0.1:$port_b/version" >/dev/null && echo "B serving"
-TIGHTBEAM_BASE_DIR="$base_b" "$PKG/bin/tightbeam-gateway" stop
-wait "$pid_b" || true
+stop_pair
+)
 ```
 
 Pass: gateway A exits, the first `curl` fails, and the output ends with
@@ -63,8 +79,9 @@ Pass: gateway A exits, the first `curl` fails, and the output ends with
 <a id="rest-d1"></a>
 
 Run against a gateway on a new copy of the migrated result
-([reuse the result](migration.md#reuse-the-result)). The probe reads the area
-gateway's own descriptor for its operator token, keeps the token and all
+([reuse the result](migration.md#reuse-the-result)), started in this shell so
+the shared `gateway_stop` trap stops it on failure or exit. The probe reads the
+area gateway's own descriptor for its operator token, keeps the token and all
 response bodies in memory, and prints only the assertion result.
 
 ```sh
@@ -126,6 +143,7 @@ assert missing_auth["schemaVersion"] == 1 and missing_auth["resource"] == "hosts
 assert missing_auth["error"]["code"] == "auth_failed"
 print("D1 collection, filter and authentication assertions passed")
 PY
+gateway_stop
 ```
 
 Pass: the probe exits 0 and prints its final line. An unauthenticated
@@ -133,6 +151,7 @@ Pass: the probe exits 0 and prints its final line. An unauthenticated
 `{"schemaVersion":1,"resource":"hosts","error":{"code":"auth_failed"}}`
 (0.1.8 answered 404). Each collection reports its resource and schema version 1,
 every response is `no-store`, and an unknown filter is `400 invalid_filter`.
+`gateway_stop` then stops the area gateway; delete its base afterwards.
 
 ## CLI transport diagnostics
 

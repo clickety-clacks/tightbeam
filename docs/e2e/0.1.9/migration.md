@@ -203,10 +203,19 @@ may write `erl_crash.dump` into its working directory. Run the probes from the
 CLI shell's scratch directory.
 
 ```sh
+marker_state() { # the marker's digest, or "absent"
+  if test -e "$test_base/build-owner.json"; then
+    sha256 "$test_base/build-owner.json"
+  else
+    echo absent
+  fi
+}
+
 probe_refusal() { # probe_refusal NAME EXPECTED_CODE [NAME=VALUE ...]
   name="$1"; expected="$2"; shift 2
   log="$trial_root/probe-$name.log"
   digest_before="$(sha256 "$test_base/state.db")"
+  marker_before="$(marker_state)"
   ls -A "$test_base" >"$trial_root/probe-$name.before"
   if gateway_start "$test_base" "$test_port" "$log" "$@"; then
     echo "$name: observed-fail (gateway served /version)"
@@ -223,7 +232,7 @@ probe_refusal() { # probe_refusal NAME EXPECTED_CODE [NAME=VALUE ...]
   added="$(comm -13 "$trial_root/probe-$name.before" "$trial_root/probe-$name.after" | grep -vx 'state.db-shm' || true)"
   if test "$status" -ne 0 && grep -q "$expected" "$log" &&
      test "$(sha256 "$test_base/state.db")" = "$digest_before" &&
-     test -z "$added" && test ! -e "$test_base/build-owner.json"; then
+     test -z "$added" && test "$(marker_state)" = "$marker_before"; then
     echo "$name: observed-pass ($expected)"
   else
     echo "$name: observed-fail (exit $status, added: ${added:-none})"
@@ -251,8 +260,11 @@ probe_refusal wrong-schema legacy_schema_mismatch \
 | `wrong-schema` | Valid JSON, `expectedSchema` not the copied stamp | `legacy_schema_mismatch` |
 
 Each probe passes only with a nonzero exit, the expected code in its private
-log, no `/version`, an unchanged `state.db` digest, no `build-owner.json`, and
-no new base entry other than `state.db-shm`. A probe that serves or changes the
+log, no `/version`, an unchanged `state.db` digest, `build-owner.json` in the
+state it was in before the probe, and no new base entry other than
+`state.db-shm`. Before migration that means the marker is still absent; for
+[left-set](#left-set-refusal) it means the gateway's marker is still present
+with the same digest. A probe that serves or changes the
 base is `observed-fail`; if it changed the base, stop and restart this runbook
 from a new copy, because the positive start needs an untouched copy.
 
@@ -380,7 +392,8 @@ gateway_start "$test_base" "$test_port" "$trial_root/reboot.log"
 gateway_stop
 ```
 
-`left-set` passes as described under [refusal probes](#refusal-probes). The
+`left-set` passes as described under [refusal probes](#refusal-probes): the
+marker checked above is still present and unchanged. The
 restart with the variable unset serves `/version` and stops cleanly. The
 helper always unsets the variable, so any restart outside these runbooks must
 unset it as well.

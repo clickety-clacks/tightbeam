@@ -2229,7 +2229,7 @@ defmodule FeatureSmoke do
 
       assert_execution_map_node(state, mine)
       assert_execution_map_state_filter(state, [mine])
-      assert_execution_map_forest(state, [mine])
+      assert_execution_map_forest(state, mine)
 
       selected = ok!(state, "execution-map-select", %{"under" => wi_id})
 
@@ -2714,15 +2714,31 @@ defmodule FeatureSmoke do
   end
 
   # The forest carries the same nodes as the roster: nesting changes shape, never
-  # membership.
+  # membership. Both sides are this run's whole population, since earlier legs
+  # and areas leave their own salted items (open or closed) in both reads.
   defp assert_execution_map_forest(state, mine) do
+    listed =
+      ok!(state, "execution-map", %{})["items"]
+      |> List.wrap()
+      |> this_run()
+      |> Enum.map(& &1["id"])
+      |> Enum.sort()
+
     forest = ok!(state, "execution-map", %{"tree" => true})
-    nested = forest["roots"] |> List.wrap() |> Enum.flat_map(&flatten_node/1) |> this_run()
+
+    nested =
+      forest["roots"]
+      |> List.wrap()
+      |> Enum.flat_map(&flatten_node/1)
+      |> this_run()
+      |> Enum.map(& &1["id"])
+      |> Enum.sort()
 
     assert(
       state,
-      Enum.sort(Enum.map(nested, & &1["id"])) == Enum.sort(Enum.map(mine, & &1["id"])),
-      "execution-map --tree node set diverges from the roster: #{inspect(Enum.map(nested, & &1["id"]))}"
+      nested == listed and mine["id"] in nested,
+      "execution-map --tree node set diverges from the roster (or omits #{mine["id"]}): " <>
+        "tree #{inspect(nested)}, roster #{inspect(listed)}"
     )
   end
 
