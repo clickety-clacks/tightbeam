@@ -164,7 +164,10 @@ defmodule Tightbeam.Application do
     [
       # DB owner first — the serialization seam everything writes through.
       {Tightbeam.DB,
-       path: db_path, name: Tightbeam.DB, guard_inputs: Map.get(config, :guard_inputs, [])},
+       path: db_path,
+       name: Tightbeam.DB,
+       guard_inputs: Map.get(config, :guard_inputs, []),
+       payload_root: Application.app_dir(:tightbeam)},
       # Schema + boot epoch as a transient one-shot after the DB is up.
       {Tightbeam.Boot, config},
       # Lane naming registry and the task supervisor for turn work.

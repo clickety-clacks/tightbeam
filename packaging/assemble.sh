@@ -44,6 +44,35 @@ cp cli/target/release/tightbeam "$OUT/bin/tightbeam"
 cp packaging/tightbeam-gateway "$OUT/bin/tightbeam-gateway"
 cp packaging/tightbeam-select "$OUT/bin/tightbeam-select"
 cp -R _build/prod/rel/tightbeam_gateway "$OUT/release"
+
+# Only a tagged GitHub release carries automatic live-base adoption authority.
+# Branch/work-tree packages intentionally omit this file, so their unmarked-base
+# boot still takes the existing explicit-transition refusal path. The runtime
+# validates this exact provenance beside the published release payload; version,
+# MIX_ENV, package layout, and operator flags cannot substitute for it.
+if [ "${GITHUB_REF_TYPE:-}" = "tag" ] || case "${GITHUB_REF:-}" in refs/tags/v*) true ;; *) false ;; esac; then
+  provenance_tag="${GITHUB_REF_NAME:-}"
+  provenance_commit="${CI_SOURCE_SHA:-${GITHUB_SHA:-}}"
+  provenance_repository="${GITHUB_REPOSITORY:-}"
+
+  case "$provenance_tag" in v*) ;; *) echo "packaging: tagged release is missing GITHUB_REF_NAME." >&2; exit 1 ;; esac
+  if ! printf '%s' "$provenance_commit" | grep -Eq '^[0-9a-f]{40}$'; then
+    echo "packaging: tagged release requires a full lower-case CI source SHA." >&2
+    exit 1
+  fi
+  if [ "$provenance_repository" != "clickety-clacks/tightbeam" ]; then
+    echo "packaging: tagged release provenance repository is not clickety-clacks/tightbeam." >&2
+    exit 1
+  fi
+
+  jq -n -S \
+    --arg format "tightbeam-release-provenance/v1" \
+    --arg repository "$provenance_repository" \
+    --arg tag "$provenance_tag" \
+    --arg commit "$provenance_commit" \
+    '{commit: $commit, format: $format, repository: $repository, tag: $tag}' \
+    > "$OUT/release-provenance.json"
+fi
 sed "s/\"name\": \"tightbeam\"/\"name\": \"tightbeam\",\n  \"version\": \"$VERSION\",\n  \"os\": [\"$OS\"],\n  \"cpu\": [\"$NPM_CPU\"]/" packaging/package.json > "$OUT/package.json"
 ARTIFACT="_build/npm/tightbeam-$VERSION-$OS-$ARCH.tgz"
 elixir packaging/payload-manifest.exs generate "$OUT"

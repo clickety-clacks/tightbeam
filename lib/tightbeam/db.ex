@@ -400,7 +400,10 @@ defmodule Tightbeam.DB do
       do: raise(ArgumentError, "persistent DB requires a canonical base/state.db path")
 
     base = LiveBaseAdmission.canonical!(Path.dirname(Path.expand(path)))
-    payload = LiveBaseAdmission.canonical!(Application.app_dir(:tightbeam))
+    payload =
+      opts
+      |> Keyword.get(:payload_root, Application.app_dir(:tightbeam))
+      |> LiveBaseAdmission.canonical!()
     inputs = Keyword.fetch!(opts, :guard_inputs)
 
     unless Keyword.keyword?(inputs) and Enum.all?(Keyword.keys(inputs), &(&1 == :transition)),
