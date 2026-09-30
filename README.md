@@ -405,19 +405,27 @@ overrides the port. Whatever you set for the service, set for the shell you run
 the CLI from: if they disagree, the CLI looks for its gateway in a directory
 that does not have one.
 
-For a packaged 0.1.9 gateway adopting an existing unmarked 0.1.8 base, set
-`TIGHTBEAM_LIVE_BASE_TRANSITION` to the exact JSON transition supplied by the
-operator's release procedure. For example (with the real canonical base,
-target build identity, and schema stamp substituted):
+An assembled tagged 0.1.9 release carries exact release provenance beside its
+payload. When it sees an existing unmarked base stamped with the supported
+`operator-decision-requests-v1` 0.1.8 predecessor, it derives the transition,
+runs the normal migration, and writes the verified build marker only after the
+current schema commits. A development or work-branch build has no release
+provenance and still refuses before migration; a missing, malformed, or
+ambiguous provenance file is refused rather than guessed.
+
+For an explicit transition, set `TIGHTBEAM_LIVE_BASE_TRANSITION` to the exact
+JSON supplied by the operator's release procedure. This remains useful for a
+supported non-automatic rehearsal or a release carrying a different approved
+predecessor. For example (with the real canonical base, target build identity,
+and schema stamp substituted):
 
 ```sh
 export TIGHTBEAM_LIVE_BASE_TRANSITION='{"base":"/srv/tightbeam","expectedSchema":"<0.1.8-schema-stamp>","source":"unmarked","target":"<64-hex-0.1.9-build-identity>"}'
 ```
 
 The value is passed through as serialized bytes; the gateway still performs its
-normal exact base/source/target and schema checks. Omitting the variable leaves
-ordinary unmarked-base refusal in place. Malformed JSON, a mismatched identity,
-or an incompatible schema is refused.
+normal exact base/source/target and schema checks. Malformed JSON, a mismatched
+identity, or an incompatible schema is refused.
 
 ### More than one gateway on one machine
 

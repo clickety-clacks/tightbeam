@@ -130,6 +130,8 @@ defmodule Tightbeam.LiveBaseAdmission do
         other -> refuse!("invalid base: #{inspect(other)}")
       end
 
+    database = Path.join(base, "state.db")
+
     transition =
       case Keyword.get(options, :transition) do
         nil -> nil
@@ -137,8 +139,19 @@ defmodule Tightbeam.LiveBaseAdmission do
         _ -> refuse!("transition must be exact serialized input")
       end
 
+    transition =
+      if transition == nil and state == :existing and marker == :absent do
+        stamp = read_schema_stamp!(database)
+
+        case Tightbeam.LiveBaseRelease.automatic_transition(payload, base, identity, stamp) do
+          {:ok, generated} -> generated
+          :none -> nil
+        end
+      else
+        transition
+      end
+
     admission = checked!(LiveBaseGuard.admit_build(base, identity, marker, state, transition))
-    database = Path.join(base, "state.db")
     stamp = qualify_readonly!(database, state, admission)
 
     %{

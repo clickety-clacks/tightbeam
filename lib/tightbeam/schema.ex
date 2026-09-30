@@ -1404,6 +1404,9 @@ defmodule Tightbeam.Schema do
   ]
 
   @doc false
+  def live_base_upgrade_predecessor, do: @operator_decision_shape
+
+  @doc false
   def guard_compatible_stamps do
     [
       @work_item_owner_link_shape,

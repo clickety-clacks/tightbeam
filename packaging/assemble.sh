@@ -44,6 +44,11 @@ cp cli/target/release/tightbeam "$OUT/bin/tightbeam"
 cp packaging/tightbeam-gateway "$OUT/bin/tightbeam-gateway"
 cp packaging/tightbeam-select "$OUT/bin/tightbeam-select"
 cp -R _build/prod/rel/tightbeam_gateway "$OUT/release"
+
+# Only the validated tagged push release carries automatic live-base adoption
+# authority. Candidate and manually dispatched workflows intentionally omit this
+# file, even when their ref happens to be a tag-shaped name.
+sh packaging/write-release-provenance.sh "$OUT/release-provenance.json"
 sed "s/\"name\": \"tightbeam\"/\"name\": \"tightbeam\",\n  \"version\": \"$VERSION\",\n  \"os\": [\"$OS\"],\n  \"cpu\": [\"$NPM_CPU\"]/" packaging/package.json > "$OUT/package.json"
 ARTIFACT="_build/npm/tightbeam-$VERSION-$OS-$ARCH.tgz"
 elixir packaging/payload-manifest.exs generate "$OUT"

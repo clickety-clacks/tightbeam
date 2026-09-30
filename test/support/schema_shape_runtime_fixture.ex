@@ -174,6 +174,38 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
     end
   end
 
+  @doc false
+  def seed_operator_predecessor!(path, payload_root \\ Application.app_dir(:tightbeam)) do
+    base = Path.dirname(path)
+    File.mkdir_p!(base)
+
+    {:ok, db} =
+      DB.start_link(
+        path: path,
+        name: nil,
+        guard_inputs: [],
+        payload_root: payload_root
+      )
+
+    :ok = load_admission_fixture(db)
+    downgrade_row_driven_rules(db)
+
+    :ok =
+      DB.execute(db, """
+      DROP TRIGGER decision_requests_terminal_insert_guard;
+      DROP TRIGGER decision_requests_terminal_update_guard;
+      DROP TABLE decision_request_integrity_evidence;
+      DROP TABLE decision_request_terminal_epoch;
+      ALTER TABLE decision_requests DROP COLUMN ruledViaPrincipal;
+      ALTER TABLE decision_requests DROP COLUMN ruledViaSessionState;
+      ALTER TABLE sessions DROP COLUMN identityGuidanceDigest;
+      ALTER TABLE sessions DROP COLUMN identityRenderContract;
+      UPDATE schema_stamp SET shape = '#{@operator_decision_shape}', stampedAt = 1;
+      """)
+
+    :ok = GenServer.stop(db)
+  end
+
   def proof!("activation", base, opts) do
     activated = opts.activated
     boundary = opts.boundary

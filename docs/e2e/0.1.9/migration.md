@@ -15,6 +15,17 @@ command at a live base, edit a schema stamp or marker, issue manual
 
 ## Source qualification
 
+A published tagged 0.1.9 package carries a canonical
+`release-provenance.json` beside its release payload. The gateway uses that
+file only to distinguish a published release from a development or work-branch
+build. It then derives the same exact transition the runbook would otherwise
+carry explicitly, but only for an unmarked base whose read-only stamp is
+`operator-decision-requests-v1`. The migration remains transactional and the
+build-owner marker is written only after the current target stamp commits.
+Missing or malformed release provenance, a marked base, or any other schema is
+refused before migration. An explicit `TIGHTBEAM_LIVE_BASE_TRANSITION` remains
+supported for the separately authorized rehearsal path below.
+
 The database is bound to a non-secret source manifest with `format`
 (`tightbeam-e2e-source/v1`), `sourceVersion`, `sourceTag`, `sourceBuild`,
 `sourceCommit`, `sourcePackageSha256`, `stateDbSha256`, `schemaStamp`,
