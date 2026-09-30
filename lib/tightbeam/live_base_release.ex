@@ -70,8 +70,7 @@ defmodule Tightbeam.LiveBaseRelease do
         decode_provenance(path, app_version(payload_root))
 
       other ->
-        {:error,
-         "release provenance refused: #{path} is not a regular file (#{inspect(other)})"}
+        {:error, "release provenance refused: #{path} is not a regular file (#{inspect(other)})"}
     end
   end
 

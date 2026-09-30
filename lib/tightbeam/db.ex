@@ -405,6 +405,7 @@ defmodule Tightbeam.DB do
       opts
       |> Keyword.get(:payload_root, Application.app_dir(:tightbeam))
       |> LiveBaseAdmission.canonical!()
+
     inputs = Keyword.fetch!(opts, :guard_inputs)
 
     unless Keyword.keyword?(inputs) and Enum.all?(Keyword.keys(inputs), &(&1 == :transition)),
