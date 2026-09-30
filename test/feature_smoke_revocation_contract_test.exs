@@ -1,7 +1,7 @@
 defmodule Tightbeam.FeatureSmokeRevocationContractTest do
   use ExUnit.Case, async: true
 
-  test "all provider-smoke revocations supply the reason contract without running the smoke" do
+  test "fixture revocations are reasoned and no cross-run sweep is invoked" do
     source = File.read!(Path.expand("../scripts/feature_smoke.exs", __DIR__))
     ast = Code.string_to_quoted!(source)
 
@@ -14,7 +14,7 @@ defmodule Tightbeam.FeatureSmokeRevocationContractTest do
           {node, calls}
       end)
 
-    assert length(calls) == 4
+    assert length(calls) == 3
 
     reasons =
       Enum.map(calls, fn fields ->
@@ -26,12 +26,38 @@ defmodule Tightbeam.FeatureSmokeRevocationContractTest do
         reason
       end)
 
-    assert Enum.sort(reasons) ==
-             Enum.sort([
-               "smoke opener disposed the blocked card",
-               "Effort smoke replaces the first assignment to verify request supersession",
-               "Effort smoke completed the replacement assignment checks",
-               "Smoke setup clears an open assignment left by a previous run"
-             ])
+    expected_reasons = [
+      "smoke opener disposed the blocked card",
+      "Effort smoke replaces the first assignment to verify request supersession",
+      "Effort smoke completed the replacement assignment checks"
+    ]
+
+    assert Enum.sort(reasons) == Enum.sort(expected_reasons)
+
+    {_, revocation_scopes} =
+      Macro.prewalk(ast, [], fn
+        {:defp, _, [{name, _, _args}, body]} = node, scopes ->
+          {_, scoped_calls} =
+            Macro.prewalk(body, [], fn
+              {:ok!, _, [_state, "revoke-assignment", _payload]} = call, scoped_calls ->
+                {call, [call | scoped_calls]}
+
+              node, scoped_calls ->
+                {node, scoped_calls}
+            end)
+
+          scopes = if scoped_calls == [], do: scopes, else: [name | scopes]
+          {node, scopes}
+
+        node, scopes ->
+          {node, scopes}
+      end)
+
+    assert Enum.sort(revocation_scopes) ==
+             Enum.sort([:check_cannot_proceed_to_opener, :check_flagship_review_loop])
+
+    refute String.contains?(source, "sweep_open_work_items")
+    refute String.contains?(source, "clear_previous_leg_work_items")
+    refute String.contains?(source, "work-item-list")
   end
 end
