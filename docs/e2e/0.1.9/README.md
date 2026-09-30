@@ -298,6 +298,41 @@ isolation does not revoke those tokens, and condition 4 only keeps them from
 reaching anything outside the copy. Never show, export or log them. Remove each area copy after its runbook finishes, keep the migrated
 output, and discard the environment at the end.
 
+### Reference environment
+
+<a id="reference-environment"></a>
+
+The six conditions describe the environment; this is one way to build it that
+satisfies them, on a Linux host with Docker. The approval for the run names
+the image digest. Nothing here touches the host's own Tightbeam base.
+
+```Dockerfile
+FROM ubuntu:24.04
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl git sqlite3 python3 procps findutils libssl3 libncurses6 nodejs npm \
+    && npm install -g @anthropic-ai/claude-code @openai/codex \
+    && rm -rf /var/lib/apt/lists/*
+RUN useradd -m -u 10001 e2e
+USER e2e
+```
+
+```sh
+docker build -t tightbeam-e2e:0.1.9 -f Dockerfile .
+docker image inspect --format '{{index .RepoDigests 0}}{{.Id}}' tightbeam-e2e:0.1.9   # record this
+docker run --rm -it --network none --hostname e2e \
+  -v "/host/source-dir:/source:ro" -v "/host/scratch:/scratch" \
+  -e SOURCE_DIR=/source -e SCRATCH=/scratch -e HOME=/scratch/home \
+  tightbeam-e2e:0.1.9 bash
+```
+
+Inside: `mkdir -p "$HOME"`, extract the package into `$SCRATCH/pkg` and set
+`PKG="$SCRATCH/pkg/tightbeam"`, then run the six checks above before anything
+else. The harness CLIs are installed and have never been logged in, which is
+what condition 5 and the boot preflight need. `/host/source-dir` holds the
+[source snapshot](migration.md#source-snapshot) files, the 0.1.9 package, its
+`SHA256SUMS` and the candidate checkout; `/host/scratch` must have room for
+three copies of the database.
+
 ## Tiers
 
 - **Offline, real-data copy.** Inside the verified boundary: the migration and

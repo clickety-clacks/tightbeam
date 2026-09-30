@@ -61,8 +61,8 @@ so nothing is a surprise), **one-time** (set up once, then reused), or
 
 | Prerequisite | Class | Where documented | Status |
 |---|---|---|---|
-| Consistent `VACUUM INTO` copy of the live Gibson `state.db`, from a read-only handle, plus `PRAGMA quick_check` | one-time per E2E cycle | [UPGRADE.md](../../UPGRADE.md#take-a-backup-first) | **Blocker.** No snapshot exists. Owner: operator (Mike's go); executor: the E2E runner. Size 21.3 GB; Gibson has 348 GB free. Reads only; nothing on Gibson changes. |
-| Source manifest (`tightbeam-e2e-source/v1`) with tag, build, commit, package SHA, DB SHA, stamp, lineage evidence, backup method and time | one-time, with the snapshot | migration.md source qualification | Values below are established; the file does not exist yet |
+| Consistent `VACUUM INTO` copy of the live Gibson `state.db`, from a read-only handle, plus `PRAGMA quick_check` and the manifest | one-time per E2E cycle | [Source snapshot](migration.md#source-snapshot) (added) | **Blocker.** No snapshot exists. Owner: operator (Mike's go); executor: the E2E runner. Size 21.3 GB; Gibson has 348 GB free. Reads only; nothing on Gibson changes. |
+| Source manifest (`tightbeam-e2e-source/v1`) | one-time, with the snapshot | [Source snapshot](migration.md#source-snapshot) writes it | Produced by the snapshot step |
 | The 0.1.8 package that produced the source (`package-0.1.8.tar`) beside the snapshot | one-time | migration.md source qualification | Download `tightbeam-0.1.8-linux-x86_64-b2add64.tgz` from release `v0.1.8+1343`; SHA `9dcfd9dc04eb718e27fcf479a494b38818f8fe5d41c2a6b065c224d3ffe4b623` |
 | Lineage pins match the actual snapshot, or a source-backed ruling admits the difference | every run (STOP) | migration.md source qualification | **Corrected.** The runbook pinned `v0.1.8+1337`; Gibson runs `v0.1.8+1343` (`/version` sha `b2add644`, release provenance commit `b2add64414b41606a713ed284abf01a0b4d125e6`, stamp `operator-decision-requests-v1`). The pins now name +1343. Delivery ownership confirms by reviewing that change. |
 
@@ -70,7 +70,7 @@ so nothing is a surprise), **one-time** (set up once, then reused), or
 
 | Prerequisite | Class | Where documented | Status |
 |---|---|---|---|
-| A disposable Linux environment: own PID and network namespaces, loopback only, no live base, read-only `SOURCE_DIR`, writable `SCRATCH` | one-time (image), every run (fresh container) | README containment | **One-time setup, not done.** Racter has Docker usable by `clu`. Build an image with `sqlite3 python3 curl git procps findutils` and the `claude` and `codex` CLIs installed and logged out; run it with `--network none`, `-v <source>:/source:ro`, `-v <scratch>:/scratch`. Eezo has no container runtime and macOS is outside the written checks. |
+| A disposable Linux environment: own PID and network namespaces, loopback only, no live base, read-only `SOURCE_DIR`, writable `SCRATCH` | one-time (image), every run (fresh container) | [Reference environment](README.md#reference-environment) (added) | Guided. Racter has Docker usable by `clu`. Eezo has no container runtime and macOS is outside the written checks. |
 | Scratch holds at least 3× the source (64 GB) plus the source itself if it lives on the same disk (21 GB) | every run (STOP) | README containment condition 1 | **Blocker.** Racter has 68 GB free on its only volume. Owner: Racter's operator. Action: free or attach about 90 GB, or mount the snapshot from Gibson read-only so only 64 GB is local. |
 | Six containment checks pass inside the container before the first gateway start | every run (STOP) | README containment | Ready. Docker's own bind mounts of `/etc/hosts`, `/etc/hostname` and `/etc/resolv.conf` are expected under condition 2 and are now named there. |
 | Boot preflight finds a runnable harness CLI (`no_harness_cli` otherwise) | every run | README containment condition 6 | Satisfied by the image |
@@ -121,6 +121,11 @@ depend on it.
 - migration.md: a [Package acquisition](migration.md#package-acquisition) section
   naming the release-candidate workflow, its proof artifact and the extracted
   layout, because no published 0.1.9 package exists.
-- README.md: containment condition 2 names Docker's expected bind mounts.
+- README.md: containment condition 2 names Docker's expected bind mounts, and a
+  reference environment (Dockerfile and run command) that meets the six
+  conditions.
+- migration.md: a source snapshot section that takes the read-only copy and
+  writes the manifest, so the snapshot is a runbook step rather than an
+  operator improvisation.
 - The specs-repository `release-019-database-migration-rehearsal.md` is marked
   superseded by migration.md.

@@ -41,6 +41,64 @@ A published, tagged 0.1.9 release replaces steps 1 and 2 with its GitHub
 release assets and `SHA256SUMS`. Nothing else changes except the
 [package kind](#package-kind).
 
+## Source snapshot
+
+<a id="source-snapshot"></a>
+
+The snapshot is taken on the source host, outside containment, from a
+read-only handle, and it is the only thing that reads the live database. It
+changes nothing on that host. Run it as the operator once per E2E cycle; the
+same snapshot serves every package tested afterwards.
+
+```sh
+set -eu
+snapshot_dir="/operator-supplied/writable/snapshot-$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$snapshot_dir"
+live_db="$HOME/.tightbeam/state.db"
+backup_time="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+sqlite3 "file:$live_db?mode=ro" "VACUUM INTO '$snapshot_dir/state.db';"
+test "$(sqlite3 -readonly -bail "$snapshot_dir/state.db" "PRAGMA quick_check;")" = ok
+schema_stamp="$(sqlite3 -readonly -bail "$snapshot_dir/state.db" "SELECT shape FROM schema_stamp;")"
+version_json="$(curl -fsS --noproxy '*' http://127.0.0.1:11373/version)"
+running_sha="$(printf '%s' "$version_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["sha"])')"
+# The 0.1.8 package that produced this database, from its GitHub release.
+cp /operator-supplied/tightbeam-0.1.8-linux-x86_64-b2add64.tgz "$snapshot_dir/package-0.1.8.tar"
+sha256() { if command -v sha256sum >/dev/null; then sha256sum "$1"; else shasum -a 256 "$1"; fi | awk '{print $1}'; }
+SNAP_DIR="$snapshot_dir" SNAP_STAMP="$schema_stamp" SNAP_SHA="$running_sha" SNAP_TIME="$backup_time" \
+SNAP_DB_SHA="$(sha256 "$snapshot_dir/state.db")" SNAP_PKG_SHA="$(sha256 "$snapshot_dir/package-0.1.8.tar")" \
+python3 - <<'PY'
+import json, os
+sha = os.environ["SNAP_SHA"]
+commit = "b2add64414b41606a713ed284abf01a0b4d125e6"
+if not commit.startswith(sha):
+    raise SystemExit(f"running gateway sha {sha!r} is not the approved lineage commit")
+manifest = {
+    "format": "tightbeam-e2e-source/v1",
+    "sourceVersion": "0.1.8",
+    "sourceTag": "v0.1.8+1343",
+    "sourceBuild": "1343",
+    "sourceCommit": commit,
+    "sourcePackageSha256": os.environ["SNAP_PKG_SHA"],
+    "stateDbSha256": os.environ["SNAP_DB_SHA"],
+    "schemaStamp": os.environ["SNAP_STAMP"],
+    "lineageEvidence": f"GET /version on the source host reported sha {sha} at {os.environ['SNAP_TIME']}; release v0.1.8+1343 release-provenance.json names commit {commit}",
+    "backupMethod": "sqlite3 VACUUM INTO from a mode=ro URI handle",
+    "backupTime": os.environ["SNAP_TIME"],
+}
+with open(os.path.join(os.environ["SNAP_DIR"], "manifest.json"), "x", encoding="utf-8") as f:
+    json.dump(manifest, f, indent=2, sort_keys=True)
+    f.write("\n")
+PY
+chmod a-w "$snapshot_dir"/*
+```
+
+The result is three files, `state.db`, `manifest.json` and `package-0.1.8.tar`,
+that become the read-only `SOURCE_DIR` inside containment, together with the
+0.1.9 package, its `SHA256SUMS` and the candidate checkout from
+[package acquisition](#package-acquisition). If the running sha, tag, build or
+stamp differ from the approved lineage, the manifest script stops; do not edit
+the values to match.
+
 ## Source qualification
 
 A published tagged 0.1.9 package carries a canonical
