@@ -13,38 +13,22 @@ arrangement; Main and PO do not become production staffers. A named agent retain
 intake until the receiving PDO explicitly accepts it on the same work item. Do
 not ask the user to repeat or reconfirm already-authorized work.
 
-On runtimes supporting delivery-scope records, make that acceptance inspectable
-before production. Read `tightbeam delivery-responsibility-get <workItemId>` and
-the receiving PDO's `po_association` in `tightbeam list`. A delivery scope is the
-pair `(ownerUserId, poRole)`, not a lane or a session name; all items bound to that
-scope share one accountable owner. Preserve the exact association session and
-revision. If the association is missing, have the target session or its current
-parent set the intended, registered PO with `tightbeam session-po-set --session
-<key> --po-role <role> --key <idempotencyKey>`, then read back the revision.
+Before production, read `tightbeam work-item-get <workItemId>` and inspect
+`deliveryOwnerSessionKey`. It is the one explicit accountable owner link for
+that item. Do not infer it from `ownerUserId`, PO association, role, ancestry,
+a lane, or another item's owner. Preserve the addressed-PO association notice
+and actual assignment custody without treating either as a second owner link.
 
-Have the item's actual Main bind a new intake item and record the accepting PDO;
-the human owner/admin can also do this, and a current accountable owner can bind
-items to its scope and arrange succession. A role label, PO association or
-delegated lane does not grant those bootstrap powers. Use the supported forms:
+If the owner link is missing or its session is unavailable, route the item to
+responsible intake or its current owner for an authorized remedy. A caller
+permitted by the ordinary work-item update path may set or replace the link
+with `tightbeam work-item-update <workItemId> --delivery-owner <sessionKey>`.
+Read `tightbeam work-item-get <workItemId>` again before staffing or claiming
+handoff. A refusal is a blocker for its responsible owner, not permission for
+a delegate to self-promote or to infer an owner from a PO association.
 
-```text
-tightbeam work-item-delivery-scope-set <workItemId> --association-session <key> --association-revision <n> --expected-revision <n> --key <idempotencyKey>
-tightbeam delivery-scope-owner-set --session <key> --association-revision <n> [--expected-owner <key>] --expected-revision <n> --key <idempotencyKey>
-```
-
-For binding, use the accepting PDO's current association and the item's observed
-`scope.bindingRevision` (0 only if unbound). Read responsibility again after
-binding; reuse an existing current owner for that scope. For initial ownership,
-use the accepting PDO as `--session`, its association revision, expected revision
-0 and no expected owner. For succession, supply the observed `accountable.ownerRevision`
-and `accountable.accountableSessionKey` as expected revision and expected owner.
-Use distinct idempotency keys per intended change; a retry keeps its original key
-and arguments. Read responsibility back before claiming the handoff. Preserve
-assignment acceptance and open obligations separately; these records neither close
-assignments nor reparent sessions.
-
-If ownership is stale or unavailable, route recovery to the human owner/admin or
-the owner's actual Main; do not let a delegate self-promote or keep retrying stale
-revisions. If the installed CLI lacks these operations, retain accountable intake
-and supported assignment custody, report the concrete setup limitation to Main,
-and do not claim scope-record enforcement or invent replacement commands.
+Keep existing assignments, reviews, opener history and evidence intact when
+the recorded owner changes. Staff and coordinate through ordinary same-item
+assignments and their actual custody; a coordination card does not change
+the owner link. If this build lacks the supported update path, retain intake
+and report the concrete limitation rather than inventing a replacement verb.

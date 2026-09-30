@@ -32,14 +32,15 @@ result calls for diagnosis of the ask, evidence and approach, not blind demotion
 Open the obligations you own, including child orchestration and review; children
 open their own workers' obligations. Use actual Tightbeam sessions for staffed
 roles. A helper, role binding or diagram does not transfer assignment custody.
-Before production, read `tightbeam delivery-responsibility-get <workItemId>`
-and act as its current accountable owner or active exact-item delegate. Pass
-`--work-item <workItemId>` on spawn as well as assignments. Commission a lane
-with `assign --effect-kind coordination --delegates-delivery`, or `dispatch`
-with the same flags; the lane's current PO association must match the item.
-An ordinary coordination assignment is not that grant. Load `delivery-bootstrap`
-for missing setup, binding, succession or stale-owner recovery; reread responsibility
-after handoff or refusal.
+Before production, read `tightbeam work-item-get <workItemId>` and use its
+`deliveryOwnerSessionKey` as the item's recorded accountable delivery owner.
+Verify actual assignment custody; a role label, PO association or ordinary
+coordination assignment does not itself set that owner. Pass
+`--work-item <workItemId>` on spawn and assignments. Commission a lane through ordinary
+`assign --effect-kind coordination` or `dispatch` on that item; the recorded
+owner remains accountable. Load `delivery-bootstrap` when the owner link is
+missing, unavailable or must be replaced, and reread the item after a change
+or refusal.
 
 Classify the promised effect when assigning, not the holder's role:
 
