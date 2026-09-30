@@ -37,6 +37,10 @@ the other, even when the shell carries the other's node name, port and a cookie.
 
 The check runs in a subshell with its own cleanup, registered before either
 start, so the shared `gateway_stop` trap stays in place for later sections.
+The cleanup stops the gateway `gateway_start` last launched through the shared
+`gateway_stop`, which knows it from launch, so an interrupt during readiness
+polling still stops it; once B is up it moves to `pid_b`. The subshell clears
+`gateway_pid` first so it never stops a gateway the parent shell started.
 
 ```sh
 (
@@ -44,12 +48,9 @@ base_a="$(mktemp -d "${SCRATCH:?}/stop-a.XXXXXX")"; base_a="$(cd "$base_a" && pw
 base_b="$(mktemp -d "$SCRATCH/stop-b.XXXXXX")"; base_b="$(cd "$base_b" && pwd -P)"
 free_port() { python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()'; }
 port_a="$(free_port)"; port_b="$(free_port)"
-pid_a=""; pid_b=""
+gateway_pid=""; pid_b=""
 stop_pair() {
-  if test -n "$pid_a"; then
-    TIGHTBEAM_BASE_DIR="$base_a" "$PKG/bin/tightbeam-gateway" stop || true
-    wait "$pid_a" || true; pid_a=""
-  fi
+  gateway_stop
   if test -n "$pid_b"; then
     TIGHTBEAM_BASE_DIR="$base_b" "$PKG/bin/tightbeam-gateway" stop || true
     wait "$pid_b" || true; pid_b=""
@@ -57,14 +58,13 @@ stop_pair() {
 }
 trap stop_pair EXIT
 trap 'exit 130' INT TERM
-started=0; gateway_start "$base_b" "$port_b" "$base_b.log" || started=$?
-pid_b="$gateway_pid"; test "$started" -eq 0 || exit 1
-started=0; gateway_start "$base_a" "$port_a" "$base_a.log" || started=$?
-pid_a="$gateway_pid"; test "$started" -eq 0 || exit 1
+gateway_start "$base_b" "$port_b" "$base_b.log" || exit 1
+pid_b="$gateway_pid"; gateway_pid=""
+gateway_start "$base_a" "$port_a" "$base_a.log" || exit 1
 RELEASE_NODE="tightbeam_gateway_$port_b" TIGHTBEAM_PORT="$port_b" \
   RELEASE_COOKIE="runbook-sentinel-not-a-cookie" TIGHTBEAM_BASE_DIR="$base_a" \
   "$PKG/bin/tightbeam-gateway" stop
-wait "$pid_a" || true; pid_a=""
+wait "$gateway_pid" || true; gateway_pid=""
 curl -fsS --noproxy '*' "http://127.0.0.1:$port_a/version" && echo "A still serving"
 curl -fsS --noproxy '*' "http://127.0.0.1:$port_b/version" >/dev/null && echo "B serving"
 stop_pair
