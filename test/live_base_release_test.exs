@@ -68,6 +68,81 @@ defmodule Tightbeam.LiveBaseReleaseTest do
     :ok = GenServer.stop(db)
   end
 
+  test "a released package upgrades a real predecessor, marks it, and restarts marked", %{
+    root: root,
+    app: app,
+    base: base
+  } do
+    write_provenance!(root)
+    {:ok, manifest} = LiveBaseGuard.generate_manifest(LiveBaseAdmission.payload_files!(app))
+    File.write!(Path.join(app, "build-manifest.json"), JSON.encode!(manifest))
+    seed_real_predecessor!(base, app)
+    identity = manifest["buildIdentity"]
+
+    refute File.exists?(Path.join(base, "build-owner.json"))
+
+    {:ok, db} =
+      DB.start_link(
+        path: Path.join(base, "state.db"),
+        name: nil,
+        guard_inputs: [],
+        payload_root: app
+      )
+
+    :ok = Schema.ensure_all(db)
+    target = hd(Schema.guard_compatible_stamps())
+    assert {:ok, [[^target]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert %{
+             "format" => "tightbeam-build-owner/v1",
+             "buildIdentity" => ^identity
+           } = JSON.decode!(File.read!(Path.join(base, "build-owner.json")))
+
+    :ok = GenServer.stop(db)
+
+    {:ok, restarted} =
+      DB.start_link(
+        path: Path.join(base, "state.db"),
+        name: nil,
+        guard_inputs: [],
+        payload_root: app
+      )
+
+    assert :ok = Schema.ensure_all(restarted)
+    assert {:ok, [[^target]]} = DB.query(restarted, "SELECT shape FROM schema_stamp")
+    assert File.exists?(Path.join(base, "build-owner.json"))
+    :ok = GenServer.stop(restarted)
+  end
+
+  test "a failed released migration leaves the predecessor and no marker", %{
+    root: root,
+    app: app,
+    base: base
+  } do
+    write_provenance!(root)
+    {:ok, manifest} = LiveBaseGuard.generate_manifest(LiveBaseAdmission.payload_files!(app))
+    File.write!(Path.join(app, "build-manifest.json"), JSON.encode!(manifest))
+    seed_real_predecessor!(base, app)
+    install_migration_failure_trigger!(base)
+
+    {:ok, db} =
+      DB.start_link(
+        path: Path.join(base, "state.db"),
+        name: nil,
+        guard_inputs: [],
+        payload_root: app
+      )
+
+    assert_raise Schema.ShapeError, ~r/migration .* failed and was rolled back/, fn ->
+      Schema.ensure_all(db)
+    end
+
+    predecessor = Schema.live_base_upgrade_predecessor()
+    assert {:ok, [[^predecessor]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+    refute File.exists?(Path.join(base, "build-owner.json"))
+    :ok = GenServer.stop(db)
+  end
+
   test "a valid explicit transition remains authoritative for a released package", %{
     root: root,
     app: app,
@@ -224,6 +299,29 @@ defmodule Tightbeam.LiveBaseReleaseTest do
         "tag" => "v0.1.9+1337"
       })
     )
+  end
+
+  defp seed_real_predecessor!(base, app) do
+    Tightbeam.SchemaShapeRuntimeFixture.seed_operator_predecessor!(
+      Path.join(base, "state.db"),
+      app
+    )
+  end
+
+  defp install_migration_failure_trigger!(base) do
+    path = Path.join(base, "state.db")
+    {:ok, conn} = Sqlite3.open(path)
+
+    :ok =
+      Sqlite3.execute(conn, """
+      CREATE TRIGGER synthetic_live_base_migration_failure
+      BEFORE UPDATE OF shape ON schema_stamp
+      BEGIN
+        SELECT RAISE(ABORT, 'synthetic migration failure');
+      END;
+      """)
+
+    :ok = Sqlite3.close(conn)
   end
 
   defp seed_predecessor!(base) do
