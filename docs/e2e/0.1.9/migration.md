@@ -38,19 +38,27 @@ candidate built by the `release candidate` workflow:
    marker's. Record both.
 2. When it succeeds it publishes one artifact,
    `release-candidate-proof-<sha>`, kept for 90 days. It holds
-   `packages/linux/tightbeam-0.1.9-linux-x86_64-<short>.tgz`,
-   `packages/darwin/…`, `toolchains/`, `release-candidate-manifest.json` and a
-   `SHA256SUMS` over all of them. The proof artifact exists only if both test
-   jobs and both package jobs passed.
+   `packages/linux-x86_64/tightbeam-0.1.9-linux-x86_64.tgz`,
+   `packages/darwin-aarch64/tightbeam-0.1.9-darwin-aarch64.tgz`, `toolchains/`,
+   `release-candidate-manifest.json` and a `SHA256SUMS` whose lines name those
+   relative paths. The package file names carry no commit suffix. The proof
+   artifact exists only if both test jobs and both package jobs passed.
 3. Stage the Linux package under the exact name source qualification expects,
    and take its digest from the proof's `SHA256SUMS`:
 
    ```sh
-   cp packages/linux/tightbeam-0.1.9-linux-x86_64-*.tgz "$SOURCE_DIR/package-0.1.9.tar"
+   # From the downloaded proof artifact directory:
+   package_entry="packages/linux-x86_64/tightbeam-0.1.9-linux-x86_64.tgz"
+   test -f "$package_entry"
+   cp "$package_entry" "$SOURCE_DIR/package-0.1.9.tar"
    cp SHA256SUMS "$SOURCE_DIR/SHA256SUMS.0.1.9"
-   expected_target_package_sha256="$(awk '/packages\/linux\/tightbeam-0\.1\.9-linux/ {print $1}' SHA256SUMS)"
+   expected_target_package_sha256="$(awk -v p="$package_entry" '$2 == p {print $1}' SHA256SUMS)"
+   test -n "$expected_target_package_sha256"
    test "$(sha256 "$SOURCE_DIR/package-0.1.9.tar")" = "$expected_target_package_sha256"
    ```
+
+   The `awk` match is on the exact relative path the checksum file records, so
+   an empty result stops the run instead of passing an unverified package.
 
    Extract the archive once into `SCRATCH`; `PKG` is the extracted `tightbeam/`
    directory, which holds `bin/`, `release/` and, for a published release only,
@@ -59,8 +67,22 @@ candidate built by the `release candidate` workflow:
    a checkout of that SHA placed inside `SOURCE_DIR` before containment.
 
 A published, tagged 0.1.9 release replaces steps 1 and 2 with its GitHub
-release assets and `SHA256SUMS`. Nothing else changes except the
-[package kind](#package-kind).
+release assets, whose names carry the short commit and whose `SHA256SUMS`
+lines name bare file names (as `v0.1.8+1343` does:
+`tightbeam-0.1.8-linux-x86_64-b2add64.tgz`). Step 3 then binds by basename:
+
+```sh
+# From the downloaded release assets directory:
+package_entry="$(ls tightbeam-0.1.9-linux-x86_64-*.tgz)"
+test "$(printf '%s\n' "$package_entry" | wc -l | tr -d ' ')" -eq 1
+cp "$package_entry" "$SOURCE_DIR/package-0.1.9.tar"
+cp SHA256SUMS "$SOURCE_DIR/SHA256SUMS.0.1.9"
+expected_target_package_sha256="$(awk -v p="$package_entry" '$2 == p {print $1}' SHA256SUMS)"
+test -n "$expected_target_package_sha256"
+test "$(sha256 "$SOURCE_DIR/package-0.1.9.tar")" = "$expected_target_package_sha256"
+```
+
+Nothing else changes except the [package kind](#package-kind).
 
 ## Source snapshot
 
