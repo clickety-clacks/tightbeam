@@ -2,18 +2,21 @@
 
 This page answers one question before anyone runs the [0.1.9 E2E runbooks](README.md):
 are the inputs and safety conditions in place? It adds no new procedure. Every
-check it names already lives in the README, [migration.md](migration.md) or
+check it names already lives in the area runbooks or
 [UPGRADE.md](../../UPGRADE.md); this page classifies them, records what is
 missing, and says who supplies it.
 
 The answer is either **YES, run** with every input named, or a finite list of
 blockers. Nothing runs until Mike calls the run and that call is recorded.
 
-## Verdict, as of 2026-09-30
+## Historical readiness snapshot, 2026-09-30
 
-**Not yet.** The runbooks are complete, but four inputs do not exist and one
-host condition is unmet. None of them is a documentation gap any more; each is
-listed below with its owner and action. No step outside the runbooks is needed.
+The September 30 assessment was **not yet**: four inputs were absent and one
+host condition was unmet. Its package, disk, account and approval statuses
+below are a dated snapshot, not current readiness evidence. Reconcile them
+against the run's recorded inputs before calling it ready. The October 1
+coverage revision adds the fresh-base prerequisites listed below; authoring
+and source CI do not execute or authorize these E2E journeys.
 
 ## Two upgrade paths, and which one E2E uses
 
@@ -44,9 +47,9 @@ interchangeable and the runbook now tells them apart by the presence of
 
 ## Prerequisites
 
-Each row is one of: **every run** (a runbook step, already written; listed here
-so nothing is a surprise), **one-time** (set up once, then reused), or
-**blocker** (does not exist today; owner and action given).
+Each row is one of: **every run** (a runbook step), **one-time** (set up once,
+then reused), or a **blocker in the dated snapshot** (owner and action given).
+The status column preserves that assessment; it is not a fresh host probe.
 
 ### Candidate package
 
@@ -93,8 +96,27 @@ the artifacts above and the copy itself, never from guesswork:
 - `existing_work_item`, `existing_assignment`, `existing_request`,
   `existing_artifact` for the preservation reads, chosen from the copy
 - `SOURCE_DIR`, `SCRATCH`, `PKG` (README containment)
-- `incompatible_schema` needs a second, authorized source; otherwise it records
-  `skipped`, as written
+
+### Fresh-base outcome prerequisites
+
+New-record features use the [fresh-base actors](README.md#fresh-base-actors),
+not a migrated copy reconnected to the network. Ordinary admitted actors,
+roles and test users are shared across compatible journeys. Missing admission
+is a setup result, never permission for raw fixture writes.
+
+| Journey | Input supplied by the authorized E2E runner/operator | If absent |
+|---|---|---|
+| U1 transition and U2 satellite | Matching packaged client on a configured test satellite with no local gateway; a paired test device for the status route; two credential-ready harnesses and one real session | Name the missing route, credential or harness. A local snapshot is not satellite proof. |
+| U1 legacy fallback | An already approved hash-qualified v1-only gateway fixture and redacted protocol observation | Named fallback gap; current v2/REST evidence remains separate. Do not build a fake server. |
+| U1 Pi/Cursor | Test provider/model and actual tool observation; Cursor's supported dedicated execution account already exists | Named allow/deny or execution-identity gap, not parity credit from a reply alone. |
+| U3–U6 records/notice/queue | Admitted independent test actors; a genuine bounded running/queued window; actual review-card admission | Report missed windows or admission limits; never forge verification evidence. |
+| U4 sentinel | One disposable test repository/PR, authorized checks and guarded queue/merge route, test GitHub configuration and sentinel settings | No sentinel landing evidence; keep the same PR for checks and settlement. |
+| U7 recovery | The specific genuine authorized incident for each row and existing safe observation; an already-unreachable registered test host suffices for #138 | Record each missing incident/recovery half and its focused source reference. Do not force faults. |
+| U9 retirement | Owned disposable workspace on the recorded original host and a no-artifact companion | Name the unavailable host/workspace; local absence cannot prove remote cleanup. |
+| U10 D1 | Fresh non-admin test session and known harmless host-environment entry with cleanup | Named authorization/redaction setup gap. |
+
+The run's approval names the host, package/source and fixtures it actually
+covers. This page supplies no approval for a provider, GitHub or live-org action.
 
 ## What a YES looks like
 

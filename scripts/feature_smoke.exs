@@ -10,30 +10,26 @@
 #   mix run --no-start scripts/feature_smoke.exs
 #
 # Run only selected areas with TIGHTBEAM_SMOKE_AREAS=provider,work,decisions,
-# telemetry,artifacts. The default is all; each selected area owns its fixtures.
-#
-# Runs one explicit spawn/dispatch leg per SELECTED harness and exits non-zero on
-# the first failed assertion. Every new roadmap feature that is user-callable
-# should get a check here (see the smoke-coverage practice).
+# telemetry,artifacts. The default is all. Shared record journeys run once using
+# one selected leg as their fixture; local deployment and real carrier journeys
+# run once per selected harness. The output names both categories.
 #
 # By default the selection is every Harness.all/0 entry, and a model is required
 # for each. TIGHTBEAM_SMOKE_LEGS narrows it (tier-map GAP-3):
 #
 #   TIGHTBEAM_SMOKE_LEGS=codex mix run --no-start scripts/feature_smoke.exs
 #
-# A narrowed run needs a model only for the legs it selected, which is what makes
-# one leg affordable rather than merely shorter. It also reports INCOMPLETE(parity)
-# by design and proves nothing about the leg it skipped, so the gibson gate still
-# wants both legs green (artifact-carrier-proposal-v1 §7.3); the filter is for
-# answering one leg's question quickly, not for satisfying the gate.
+# A narrowed run needs a model only for the legs it selected. Each provider-backed
+# shared stage uses one selected fixture leg; it does not prove parity for the
+# other selected or filtered legs. Per-harness local deployment and carrier checks
+# preflight and exercise every selected leg. A filtered run reports
+# INCOMPLETE(parity) by design; the gibson gate still wants both legs green
+# (artifact-carrier-proposal-v1 §7.3).
 #
-# The last two groups cover artifact-carrier-proposal-v1 §7.3 as a pair, and the
-# split between them is deliberate. `check_gate_chain_enforced/1` proves the LAW —
-# each statute denies while its fact is unsatisfied, and the artifact releases the
-# last one — driven entirely over HTTP, so the holder's remedy turns are never STARTED
-# while it runs, which the group measures rather than assumes.
-# `check_carrier_on_real_turn/1` proves the CARRIER: a real CLI artifact-record
-# inside a real harness turn, bound to that turn and reading tool-call-observed.
+# The artifact area retains two different checks: `check_gate_chain_enforced/1`
+# proves the shared LAW once over HTTP, and `check_carrier_on_real_turn/1` proves
+# the CARRIER once per selected harness inside a real turn, bound to that turn and
+# reading tool-call-observed.
 #
 # "A REAL AGENT WALKS THE GATES" was proven in the field, not dropped. Both legs
 # did the whole lifecycle autonomously and honestly on 2026-07-30 — claude
@@ -41,8 +37,8 @@
 # the same shape at 12:09–12:12, landing art_0f26ec21 tool-call-observed with a
 # non-null edge. Driving that chain through a scripted holder is what the split
 # gives up, because a capable holder finishes it before any scripted denial can
-# fire; the second group keeps the substrate half under assertion every run and
-# accepts the holder completing its own assignment rather than calling it a race.
+# fire; the shared gate-chain check retains the substrate half once per invocation,
+# while the carrier accepts the holder completing its own assignment.
 #
 # Both groups additionally need the org's identity/rules to carry the shipped
 # verification statutes (completion-requires-verification,
@@ -132,26 +128,125 @@ defmodule FeatureSmoke do
 
     announce_selection!(Tightbeam.FeatureSmokePlan.selection(Tightbeam.Harness.all()))
 
-    Tightbeam.FeatureSmokePlan.legs(Tightbeam.Harness.all())
-    |> Enum.each(fn leg ->
-      IO.puts("\nfeature-smoke leg #{leg.wire_name} model=#{leg.model}")
-      preflight!(leg, base_dir)
+    legs = Tightbeam.FeatureSmokePlan.legs(Tightbeam.Harness.all())
+    fixture_leg = hd(legs)
+    providers = Tightbeam.FeatureSmokePlan.provider_names(Tightbeam.Harness.all())
 
-      %{
-        port: gw["port"],
-        token: gw["cliToken"],
-        base_dir: base_dir,
-        pass: 0,
-        leg: leg,
-        providers: Tightbeam.FeatureSmokePlan.provider_names(Tightbeam.Harness.all())
-      }
-      |> run_selected_areas(areas)
-      |> finish_leg()
+    IO.puts(
+      "feature-smoke selected models: " <>
+        Enum.map_join(legs, ", ", fn leg -> "#{leg.wire_name}=#{leg.model}" end)
+    )
+
+    announce_run_categories!(areas, legs, fixture_leg)
+
+    preflighted_legs = preflight_full_legs!(areas, legs, base_dir)
+
+    shared_state =
+      smoke_state(gw, base_dir, fixture_leg, providers, "shared fixture #{fixture_leg.wire_name}")
+      |> Map.put(:preflighted_legs, preflighted_legs)
+
+    harness_states =
+      Enum.map(legs, fn leg ->
+        smoke_state(gw, base_dir, leg, providers, "per-harness #{leg.wire_name}")
+      end)
+
+    {shared_state, harness_states} = run_selected_areas(shared_state, harness_states, areas)
+
+    finish_shared(shared_state)
+
+    Enum.each(harness_states, fn state ->
+      if state.pass > 0, do: finish_leg(state)
     end)
   end
 
-  defp run_selected_areas(state, areas) do
-    Enum.reduce(areas, state, fn area, current -> run_smoke_area(current, area) end)
+  defp smoke_state(gw, base_dir, leg, providers, smoke_scope) do
+    %{
+      port: gw["port"],
+      token: gw["cliToken"],
+      base_dir: base_dir,
+      pass: 0,
+      leg: leg,
+      providers: providers,
+      smoke_scope: smoke_scope
+    }
+  end
+
+  # Shared work fixtures select one provider leg because dispatches can wake their
+  # sessions. The gate chain also preflights its selected independent-review leg.
+  # Provider deployment and the real carrier perform per-harness work, so every
+  # selected leg needs a passing preflight there. Record-only telemetry does not
+  # probe provider credentials.
+  defp preflight_full_legs!(areas, legs, base_dir) do
+    fixture_leg = hd(legs)
+
+    reviewer_leg =
+      if "decisions" in areas do
+        Enum.find(legs, &(&1.wire_name != fixture_leg.wire_name))
+      end
+
+    required =
+      cond do
+        "provider" in areas or "artifacts" in areas -> legs
+        "decisions" in areas -> [fixture_leg | List.wrap(reviewer_leg)]
+        "work" in areas -> [fixture_leg]
+        true -> []
+      end
+
+    Enum.reduce(required, MapSet.new(), fn leg, preflighted ->
+      preflight!(leg, base_dir)
+      MapSet.put(preflighted, leg.wire_name)
+    end)
+  end
+
+  defp announce_run_categories!(areas, legs, fixture_leg) do
+    shared =
+      Enum.flat_map(areas, fn
+        "provider" -> ["provider/onboard surface"]
+        "work" -> ["work records and dispatch"]
+        "decisions" -> ["effort check-in"]
+        "telemetry" -> ["telemetry queries and execution-map assertions"]
+        "artifacts" -> []
+      end)
+
+    shared =
+      if Enum.any?(areas, &(&1 in ["decisions", "artifacts"])),
+        do: shared ++ ["artifact gate chain (once)"],
+        else: shared
+
+    per_harness =
+      Enum.flat_map(areas, fn
+        "provider" -> ["provider/local deployment"]
+        "artifacts" -> ["artifacts/real carrier"]
+        _ -> []
+      end)
+
+    IO.puts(
+      "feature-smoke shared checks (one fixture leg #{fixture_leg.wire_name}; not harness parity): " <>
+        Enum.join(shared, ", ")
+    )
+
+    per_harness_label = if per_harness == [], do: "none", else: Enum.join(per_harness, ", ")
+
+    IO.puts(
+      "feature-smoke per-harness checks (#{Enum.map_join(legs, ", ", & &1.wire_name)}): " <>
+        per_harness_label
+    )
+  end
+
+  defp run_selected_areas(shared_state, harness_states, areas) do
+    {shared_state, harness_states, _gate_chain_ran} =
+      Enum.reduce(
+        areas,
+        {shared_state, harness_states, false},
+        fn area, {shared, harnesses, gate_chain_ran} ->
+          {shared, gate_chain_ran} = run_shared_smoke_area(shared, area, gate_chain_ran)
+
+          harnesses = Enum.map(harnesses, &run_harness_smoke_area(&1, area))
+          {shared, harnesses, gate_chain_ran}
+        end
+      )
+
+    {shared_state, harness_states}
   end
 
   defp selected_smoke_areas! do
@@ -183,42 +278,46 @@ defmodule FeatureSmoke do
     end
   end
 
-  defp run_smoke_area(state, "provider") do
-    state
-    |> check_local_deployment()
-    |> check_identity_surface()
-    |> check_onboard_surface()
+  defp run_shared_smoke_area(state, "provider", gate_chain_ran),
+    do: {check_onboard_surface(state), gate_chain_ran}
+
+  defp run_shared_smoke_area(state, "work", gate_chain_ran) do
+    state =
+      state
+      |> check_facts_read()
+      |> check_config_default_archetype()
+      |> check_work_item_and_assignment_get()
+      |> check_dispatch_opens_assignment()
+
+    {state, gate_chain_ran}
   end
 
-  defp run_smoke_area(state, "work") do
-    state
-    |> check_facts_read()
-    |> check_config_default_archetype()
-    |> check_work_item_and_assignment_get()
-    |> check_dispatch_opens_assignment()
-    |> check_work_item_body_and_delivery_owner()
+  defp run_shared_smoke_area(state, "decisions", gate_chain_ran) do
+    state = check_effort_without_effect(state)
+    run_shared_gate_chain(state, gate_chain_ran)
   end
 
-  defp run_smoke_area(state, "decisions") do
-    state
-    |> check_effort_without_effect()
-    |> check_flagship_review_loop()
-    |> check_cannot_proceed_to_opener()
+  defp run_shared_smoke_area(state, "telemetry", gate_chain_ran) do
+    state =
+      state
+      |> check_breathing_query()
+      |> check_execution_map()
+      |> check_toplines_list()
+
+    {state, gate_chain_ran}
   end
 
-  defp run_smoke_area(state, "telemetry") do
-    state
-    |> check_breathing_query()
-    |> check_execution_map()
-    |> check_topline_lifecycle()
-    |> check_toplines_list()
-  end
+  defp run_shared_smoke_area(state, "artifacts", gate_chain_ran),
+    do: run_shared_gate_chain(state, gate_chain_ran)
 
-  defp run_smoke_area(state, "artifacts") do
-    state
-    |> check_gate_chain_enforced()
-    |> check_carrier_on_real_turn()
-  end
+  defp run_shared_gate_chain(state, true), do: {state, true}
+
+  defp run_shared_gate_chain(state, false),
+    do: {check_gate_chain_enforced(state), true}
+
+  defp run_harness_smoke_area(state, "provider"), do: check_local_deployment(state)
+  defp run_harness_smoke_area(state, "artifacts"), do: check_carrier_on_real_turn(state)
+  defp run_harness_smoke_area(state, _area), do: state
 
   defp preflight!(leg, base_dir) do
     row = Tightbeam.ClientE2E.preflight(leg.wire_name, base_dir)
@@ -391,180 +490,6 @@ defmodule FeatureSmoke do
     Path.join([base_dir, "work", digest])
   end
 
-  # Advance the identity repo's live ref onto the commit just made.
-  #
-  # ROADMAP 0a3: `Identity.publish_live!/1` is private and no verb exposes it, so anything
-  # that commits to the identity repo from OUTSIDE the Identity module — which is exactly
-  # what installing this fixture does — leaves `tightbeam/live` behind `main`. Delete this
-  # and call the verb the day one exists.
-  #
-  # WHAT THE STALENESS DOES AND DOES NOT BREAK, measured on a scratch identity repo rather
-  # than reasoned about. Statutes are unaffected: `Rules.load!` globs the WORKING TREE, so
-  # the probe arms at boot whatever live says, and the sha it stamps comes from HEAD so it
-  # stays consistent with the tree it read. Archetype snapshots are unaffected because
-  # rules are not part of one. And `identity-edit` calls `publish_live!` itself, so the
-  # identity group heals this partway through a run that gets that far.
-  #
-  # What is left is a window — and, for a run that stops before that group, a durable
-  # state — in which the org's published revision does not contain org law the org is
-  # already enforcing. No assertion trips over it today. It is still not a state to walk
-  # away from an operator's org in.
-  #
-  # Same shape as `publish_live!`: refuse rather than force when live cannot fast-forward,
-  # and use update-ref's compare-and-swap so a concurrent publisher loses the race
-  # visibly instead of being silently overwritten.
-  defp publish_identity_live!(dir) do
-    live = smoke_git!(dir, ["rev-parse", "tightbeam/live"])
-    main = smoke_git!(dir, ["rev-parse", "main"])
-
-    case System.cmd("git", ["merge-base", "--is-ancestor", live, main], cd: dir) do
-      {_out, 0} ->
-        smoke_git!(dir, ["update-ref", "refs/heads/tightbeam/live", main, live])
-
-      _ ->
-        raise Failure,
-          message:
-            "identity tightbeam/live (#{live}) cannot fast-forward to main (#{main}) in #{dir}"
-    end
-  end
-
-  # A run-scoped committer identity for the fixture commit, and a failure that names
-  # itself.
-  #
-  # `git commit` refuses outright on a host where the smoke user has no committer
-  # identity, and the bare `{_, 0} = System.cmd(...)` this replaces turned that refusal
-  # into a MatchError naming neither the command nor the reason. Supplying the identity in
-  # the call's own env is what `Tightbeam.Identity.git!/3` already does for every commit
-  # the substrate makes, and it keeps the identity scoped to this one commit: no global
-  # identity is required or selected, and the org's own git config is not rewritten by the
-  # act of smoking it.
-  #
-  # The address follows `Identity.git_env/1`'s own derivation rather than being chosen
-  # freely — it sanitizes the name into the local part, so the name below yields exactly
-  # this address. Matching it keeps the two producers of tightbeam commits indistinguishable
-  # in the log.
-  @smoke_git_env [
-    {"GIT_AUTHOR_NAME", "tightbeam feature-smoke"},
-    {"GIT_AUTHOR_EMAIL", "tightbeam-feature-smoke@tightbeam.local"},
-    {"GIT_COMMITTER_NAME", "tightbeam feature-smoke"},
-    {"GIT_COMMITTER_EMAIL", "tightbeam-feature-smoke@tightbeam.local"}
-  ]
-
-  defp smoke_git!(dir, args) do
-    case System.cmd("git", args, cd: dir, stderr_to_stdout: true, env: @smoke_git_env) do
-      {out, 0} ->
-        String.trim(out)
-
-      {out, status} ->
-        raise Failure,
-          message: "git #{Enum.join(args, " ")} failed (#{status}) in #{dir}: #{String.trim(out)}"
-    end
-  end
-
-  # --- served identity: every public seam shape --------------------------------
-  defp check_identity_surface(state) do
-    status = ok!(state, "identity-status", %{"archetype" => "default"})
-    assert(state, is_binary(status["liveRevision"]), "identity-status returned no live revision")
-    assert(state, is_map(status["guidance"]), "identity-status returned no composed guidance")
-
-    guidance_path = Path.join([state.base_dir, "identity", "guidance", "default.md"])
-    original_guidance = File.read!(guidance_path)
-    marker = "\n\nfeature-smoke #{unique()}\n"
-
-    with_undo(
-      state,
-      "default guidance edit",
-      fn ->
-        post(state, "identity-edit", %{
-          "archetype" => "default",
-          "manifest" => false,
-          "remove" => false,
-          "content" => original_guidance
-        })
-      end,
-      fn ->
-        ok!(state, "identity-edit", %{
-          "archetype" => "default",
-          "manifest" => false,
-          "remove" => false,
-          "content" => original_guidance <> marker
-        })
-      end
-    )
-
-    manifest_path = Path.join([state.base_dir, "identity", "archetypes", "default.toml"])
-    original_manifest = File.read!(manifest_path)
-
-    with_undo(
-      state,
-      "default manifest edit",
-      fn ->
-        post(state, "identity-edit", %{
-          "archetype" => "default",
-          "manifest" => true,
-          "remove" => false,
-          "content" => original_manifest
-        })
-      end,
-      fn ->
-        ok!(state, "identity-edit", %{
-          "archetype" => "default",
-          "manifest" => true,
-          "remove" => false,
-          "content" => original_manifest <> "\n# feature-smoke #{unique()}\n"
-        })
-      end
-    )
-
-    skill = "feature-smoke-#{unique()}"
-
-    with_undo(
-      state,
-      "default skill put",
-      fn ->
-        post(state, "identity-edit", %{
-          "archetype" => "default",
-          "manifest" => false,
-          "skill" => skill,
-          "remove" => true
-        })
-      end,
-      fn ->
-        ok!(state, "identity-edit", %{
-          "archetype" => "default",
-          "manifest" => false,
-          "skill" => skill,
-          "remove" => false,
-          "content" => "# #{skill}\n"
-        })
-      end
-    )
-
-    relearn = ok!(state, "identity-relearn", %{})
-
-    assert(
-      state,
-      relearn["state"] in ["published", "relearn-conflicted"],
-      "identity-relearn returned #{inspect(relearn)}"
-    )
-
-    session =
-      ok!(state, "spawn", %{
-        "displayName" => "smoke-identity-#{unique()}",
-        "idempotencyKey" => "identity-#{unique()}"
-      })
-
-    session_key = get_in(session, ["stream", "sessionKey"]) || session["sessionKey"]
-    applied = ok!(state, "identity-apply", %{"sessionKey" => session_key, "all" => false})
-    assert(state, session_key in (applied["applied"] || []), "identity-apply missed its session")
-    retire(state, session)
-
-    pass(
-      state,
-      "identity status/edit guidance/edit manifest/skill put+rm/relearn/apply selected session"
-    )
-  end
-
   # Exercise the public entry without beginning a credential mutation. The
   # phase-less request must direct the operator to the interactive CLI.
   defp check_onboard_surface(state) do
@@ -581,181 +506,6 @@ defmodule FeatureSmoke do
     end
 
     pass(state, "onboard registered providers interactive entry")
-  end
-
-  # --- #3 cannot-proceed: one open card routes one opener decision ----------------
-  defp check_cannot_proceed_to_opener(state) do
-    u = unique()
-    wi = ok!(state, "work-item-create", %{"title" => "esc #{u}", "idempotencyKey" => "ewi-#{u}"})
-    wi_id = wi["workItemId"] || wi["id"]
-
-    coder =
-      ok!(state, "spawn", %{
-        "displayName" => "smoke-esc-coder-#{u}",
-        "idempotencyKey" => "ec-#{u}"
-      })
-
-    coder_key = get_in(coder, ["stream", "sessionKey"]) || coder["sessionKey"]
-    post(state, "role-create", %{"name" => "coder-esc-#{u}"})
-    ok!(state, "role-bind", %{"name" => "coder-esc-#{u}", "sessionKey" => coder_key})
-    coder_tok = session_token(state, coder_key)
-
-    asg =
-      ok!(state, "assign", %{
-        "sessionKey" => coder_key,
-        "subject" => "esc impl #{u}",
-        "workItemId" => wi_id,
-        "idempotencyKey" => "ea-#{u}"
-      })
-
-    asg_id = asg["id"] || asg["assignmentId"]
-
-    blocked =
-      ok_as!(state, coder_tok, "attest", %{
-        "assignmentId" => asg_id,
-        "kind" => "cannot-proceed",
-        "note" => "smoke needs its opener"
-      })
-
-    assert(
-      state,
-      get_in(blocked, ["assignment", "state"]) == "open" and
-        get_in(blocked, ["cannotProceed", "state"]) == "standing" and
-        is_binary(get_in(blocked, ["decisionWake", "wakeId"])),
-      "cannot-proceed did not keep the card open with one linked opener decision: #{inspect(blocked)}"
-    )
-
-    ok!(state, "revoke-assignment", %{
-      "assignmentId" => asg_id,
-      "reason" => "smoke opener disposed the blocked card"
-    })
-
-    retire(state, coder)
-
-    pass(
-      state,
-      "cannot-proceed keeps the card open, routes one opener decision, and disposes cleanly"
-    )
-  end
-
-  # --- P7 flagship enforced loop: completion requires an independent review ---
-  # Proves the whole enforcement spine live over HTTP with two fresh sessions on this
-  # same selected harness: a coder attesting completion WITHOUT a reviewed-clean verdict
-  # triggers the remedy, which assigns a reviewer and blocks completion; the gate
-  # self-releases once the linked review-holder verdict lands.
-  # Requires the `completion-requires-review` rail loaded (identity/rules/engineering.toml).
-  defp check_flagship_review_loop(state) do
-    u = unique()
-    # A reviewer role bound to a live reviewer session (the remedy's assign target).
-    prior = role_binding(state, "reviewer-code")
-    post(state, "role-create", %{"name" => "reviewer-code"})
-
-    reviewer =
-      ok!(state, "spawn", %{"displayName" => "smoke-reviewer-#{u}", "idempotencyKey" => "rv-#{u}"})
-
-    reviewer_key = get_in(reviewer, ["stream", "sessionKey"]) || reviewer["sessionKey"]
-
-    with_role_binding(state, "reviewer-code", prior, reviewer_key, fn ->
-      flagship_review_loop(state, u, reviewer, reviewer_key)
-    end)
-  end
-
-  defp flagship_review_loop(state, u, reviewer, reviewer_key) do
-    reviewer_tok = session_token(state, reviewer_key)
-
-    # A coder holding a work assignment.
-    wi =
-      ok!(state, "work-item-create", %{"title" => "flagship #{u}", "idempotencyKey" => "fwi-#{u}"})
-
-    wi_id = wi["workItemId"] || wi["id"]
-
-    coder =
-      ok!(state, "spawn", %{"displayName" => "smoke-coder-#{u}", "idempotencyKey" => "cd-#{u}"})
-
-    coder_key = get_in(coder, ["stream", "sessionKey"]) || coder["sessionKey"]
-
-    assert(
-      state,
-      coder_key != reviewer_key,
-      "flagship: producer and reviewer must be different sessions"
-    )
-
-    # A session needs a role bound to act (attest) under its own credential.
-    post(state, "role-create", %{"name" => "coder-#{u}"})
-    ok!(state, "role-bind", %{"name" => "coder-#{u}", "sessionKey" => coder_key})
-    coder_tok = session_token(state, coder_key)
-
-    asg =
-      ok!(state, "assign", %{
-        "sessionKey" => coder_key,
-        "subject" => "impl #{u}",
-        "workItemId" => wi_id,
-        "idempotencyKey" => "fa-#{u}"
-      })
-
-    asg_id = asg["id"] || asg["assignmentId"]
-
-    # 1. Coder attests completion with NO review on record → BLOCKED by the rule.
-    # (The wire exposes only code+message; a remedy and a plain deny both carry
-    # code=rule_denied — the remedy's `reason=remedy_fired` is stripped. Proof that
-    # it was a REMEDY, not a bare deny, is step 2: the reviewer gets assigned.)
-    blocked =
-      post_as(state, coder_tok, "attest", %{"assignmentId" => asg_id, "kind" => "completion"})
-
-    assert(
-      state,
-      get_in(blocked, ["error", "rule"]) == "completion-requires-review" or
-        (get_in(blocked, ["error", "message"]) || "") =~ "completion-requires-review",
-      "flagship: completion without review should be blocked by the rule, got #{inspect(blocked)}"
-    )
-
-    # 2. The remedy assigned the reviewer a review of the coder's assignment.
-    reviews = ok!(state, "assignments", %{"sessionKey" => reviewer_key})
-
-    review_asg =
-      (reviews["assignments"] || reviews)
-      |> List.wrap()
-      |> Enum.find(fn a -> (a["reviewsAssignmentId"] || a["reviews"]) == asg_id end)
-
-    assert(
-      state,
-      is_map(review_asg),
-      "flagship: remedy did not assign the reviewer a review of #{asg_id}; got #{brief(reviews)}"
-    )
-
-    review_id = review_asg["id"] || review_asg["assignmentId"]
-
-    # 3. Reviewer files the reviewed-clean verdict on the review assignment.
-    v =
-      post_as(state, reviewer_tok, "attest", %{
-        "assignmentId" => review_id,
-        "kind" => "verdict",
-        "verdictKind" => "reviewed-clean"
-      })
-
-    assert(
-      state,
-      not (is_map(v) and Map.has_key?(v, "error")),
-      "flagship: reviewer verdict failed: #{inspect(v)}"
-    )
-
-    # 4. Coder re-attests completion → the verdict is present → the gate passes.
-    done =
-      post_as(state, coder_tok, "attest", %{"assignmentId" => asg_id, "kind" => "completion"})
-
-    assert(
-      state,
-      not (is_map(done) and Map.has_key?(done, "error")),
-      "flagship: completion after review should PASS the gate, got #{inspect(done)}"
-    )
-
-    retire(state, reviewer)
-    retire(state, coder)
-
-    pass(
-      state,
-      "flagship reviewer-loop enforced end-to-end on same harness with different sessions: blocked → reviewer assigned → verdict → completes"
-    )
   end
 
   # --- T2a: the gate chain, enforced -------------------------------------------------
@@ -822,7 +572,7 @@ defmodule FeatureSmoke do
   defp check_gate_chain_enforced(state) do
     u = unique()
     reviewer_leg = independent_leg(state)
-    preflight_independent!(state, reviewer_leg)
+    state = preflight_independent!(state, reviewer_leg)
 
     prior = role_binding(state, "reviewer-code")
     post(state, "role-create", %{"name" => "reviewer-code"})
@@ -1394,7 +1144,9 @@ defmodule FeatureSmoke do
   # rarely-run runbook and it mints material; a smoke that reaches for it turns a reported
   # gap into a silent repair.
   defp preflight_independent!(state, leg) do
-    if leg.wire_name == state.leg.wire_name do
+    preflighted = Map.get(state, :preflighted_legs, MapSet.new())
+
+    if MapSet.member?(preflighted, leg.wire_name) do
       state
     else
       row = Tightbeam.ClientE2E.preflight(leg.wire_name, state.base_dir)
@@ -1407,6 +1159,8 @@ defmodule FeatureSmoke do
           "this leg INCOMPLETE with a named waiver for the missing #{leg.wire_name} credential, " <>
           "run the onboarding runbook, and re-run."
       )
+
+      Map.put(state, :preflighted_legs, MapSet.put(preflighted, leg.wire_name))
     end
   end
 
@@ -2024,102 +1778,6 @@ defmodule FeatureSmoke do
     pass(state, "work-item-create + assign + assignment-get round-trip (and not_found)")
   end
 
-  # --- 0.1.9 editable bodies and direct delivery-owner link -------------------
-  defp check_work_item_body_and_delivery_owner(state) do
-    u = unique()
-
-    holder =
-      ok!(state, "spawn", %{
-        "displayName" => "smoke-delivery-owner-#{u}",
-        "idempotencyKey" => "doh-#{u}"
-      })
-
-    holder_key = get_in(holder, ["stream", "sessionKey"]) || holder["sessionKey"]
-
-    wi =
-      ok!(state, "work-item-create", %{
-        "title" => "smoke editable body #{u}",
-        "idempotencyKey" => "bwi-#{u}"
-      })
-
-    wi_id = wi["workItemId"] || wi["id"]
-    body = "body round-trip #{u}\n"
-
-    try do
-      saved =
-        ok!(state, "work-item-update", %{
-          "workItemId" => wi_id,
-          "body" => body
-        })
-
-      assert(
-        state,
-        get_in(saved, ["bodyUpdate", "state"]) == "present" and
-          get_in(saved, ["bodyUpdate", "sha256"]) ==
-            Base.encode16(:crypto.hash(:sha256, body), case: :lower),
-        "work-item-update body did not return the saved state and digest: #{inspect(saved)}"
-      )
-
-      read_body = ok!(state, "work-item-get", %{"workItemId" => wi_id})
-
-      assert(
-        state,
-        get_in(read_body, ["workItem", "body"]) == body,
-        "work-item-get did not return the updated body: #{inspect(read_body)}"
-      )
-
-      cleared_body =
-        ok!(state, "work-item-update", %{
-          "workItemId" => wi_id,
-          "clearBody" => true
-        })
-
-      assert(
-        state,
-        get_in(cleared_body, ["bodyUpdate", "state"]) == "absent" and
-          is_nil(get_in(cleared_body, ["bodyUpdate", "sha256"])),
-        "work-item-update --clear-body did not clear the body: #{inspect(cleared_body)}"
-      )
-
-      updated_owner =
-        ok!(state, "work-item-update", %{
-          "workItemId" => wi_id,
-          "deliveryOwnerSessionKey" => holder_key
-        })
-
-      assert(
-        state,
-        updated_owner["deliveryOwnerSessionKey"] == holder_key,
-        "work-item-update --delivery-owner did not set the accountable session: #{inspect(updated_owner)}"
-      )
-
-      read_owner = ok!(state, "work-item-get", %{"workItemId" => wi_id})
-
-      assert(
-        state,
-        get_in(read_owner, ["workItem", "deliveryOwnerSessionKey"]) == holder_key,
-        "work-item-get did not return the direct delivery owner: #{inspect(read_owner)}"
-      )
-
-      cleared_owner =
-        ok!(state, "work-item-update", %{
-          "workItemId" => wi_id,
-          "deliveryOwnerSessionKey" => nil
-        })
-
-      assert(
-        state,
-        is_nil(cleared_owner["deliveryOwnerSessionKey"]),
-        "work-item-update could not clear the direct delivery owner: #{inspect(cleared_owner)}"
-      )
-
-      ok!(state, "work-item-close", %{"workItemId" => wi_id})
-      pass(state, "editable work-item body replace/clear and direct delivery-owner set/clear")
-    after
-      retire(state, holder)
-    end
-  end
-
   # --- dispatch (happy path: opens the assignment + wakes the holder) --------
   # NOTE: the rumination REROUTE only fires for a SESSION caller (users don't
   # ruminate), which needs the caller session's own bearer token — session-token
@@ -2243,135 +1901,6 @@ defmodule FeatureSmoke do
     after
       ok!(state, "work-item-close", %{"workItemId" => wi_id})
     end
-  end
-
-  # --- 0.1.9 durable Topline mutation flow ------------------------------------
-  defp check_topline_lifecycle(state) do
-    u = unique()
-
-    wi =
-      ok!(state, "work-item-create", %{
-        "title" => "smoke durable topline work #{u}",
-        "idempotencyKey" => "tlwi-#{u}"
-      })
-
-    wi_id = wi["workItemId"] || wi["id"]
-
-    topline =
-      ok!(state, "topline-create", %{
-        "title" => "smoke durable topline #{u}",
-        "idempotencyKey" => "tlc-#{u}"
-      })
-
-    topline_id = get_in(topline, ["topline", "id"])
-
-    updated =
-      ok!(state, "topline-update", %{
-        "toplineId" => topline_id,
-        "title" => "smoke durable topline updated #{u}",
-        "reason" => "exercise the 0.1.9 durable topline update",
-        "idempotencyKey" => "tlu-#{u}"
-      })
-
-    assert(
-      state,
-      get_in(updated, ["topline", "title"]) == "smoke durable topline updated #{u}",
-      "topline-update did not return the new title: #{inspect(updated)}"
-    )
-
-    membership =
-      ok!(state, "topline-link-work", %{
-        "toplineId" => topline_id,
-        "workItemId" => wi_id,
-        "reason" => "exercise the 0.1.9 work link",
-        "idempotencyKey" => "tll-#{u}"
-      })
-
-    membership_id = get_in(membership, ["membership", "id"])
-
-    concern =
-      ok!(state, "topline-concern-create", %{
-        "toplineId" => topline_id,
-        "title" => "smoke durable concern #{u}",
-        "idempotencyKey" => "tlcc-#{u}"
-      })
-
-    concern_id = get_in(concern, ["concern", "id"])
-
-    linked_concern =
-      ok!(state, "topline-concern-link-work", %{
-        "concernId" => concern_id,
-        "workItemId" => wi_id,
-        "reason" => "exercise the 0.1.9 concern link",
-        "idempotencyKey" => "tlcl-#{u}"
-      })
-
-    assert(
-      state,
-      get_in(linked_concern, ["concernTag", "workItemId"]) == wi_id,
-      "topline-concern-link-work did not return the linked work item: #{inspect(linked_concern)}"
-    )
-
-    detail = ok!(state, "topline", %{"toplineId" => topline_id, "history" => true})
-
-    assert(
-      state,
-      get_in(detail, ["topline", "state"]) == "open" and
-        Enum.any?(
-          get_in(detail, ["topline", "workMemberships"]) || [],
-          &(&1["id"] == membership_id)
-        ) and
-        Enum.any?(get_in(detail, ["topline", "concerns"]) || [], &(&1["id"] == concern_id)) and
-        is_list(get_in(detail, ["topline", "history"])),
-      "topline read did not expose its open state, linked rows, and history: #{inspect(detail)}"
-    )
-
-    ok!(state, "topline-concern-unlink-work", %{
-      "concernId" => concern_id,
-      "workItemId" => wi_id,
-      "reason" => "remove the smoke concern link",
-      "idempotencyKey" => "tlcu-#{u}"
-    })
-
-    ok!(state, "topline-unlink-work", %{
-      "membershipId" => membership_id,
-      "reason" => "remove the smoke work link",
-      "idempotencyKey" => "tluw-#{u}"
-    })
-
-    closed =
-      ok!(state, "topline-close", %{
-        "toplineId" => topline_id,
-        "reason" => "exercise the 0.1.9 close transition",
-        "idempotencyKey" => "tlclo-#{u}"
-      })
-
-    assert(state, get_in(closed, ["topline", "state"]) == "closed", "topline-close failed")
-
-    reopened =
-      ok!(state, "topline-reopen", %{
-        "toplineId" => topline_id,
-        "reason" => "exercise the 0.1.9 reopen transition",
-        "idempotencyKey" => "tlro-#{u}"
-      })
-
-    assert(
-      state,
-      get_in(reopened, ["topline", "state"]) == "open",
-      "topline-reopen did not return the open state: #{inspect(reopened)}"
-    )
-
-    placements = ok!(state, "topline-placement-list", %{"state" => "all"})
-    assert(state, is_list(placements["placements"]), "topline-placement-list was malformed")
-
-    ok!(state, "topline-close", %{
-      "toplineId" => topline_id,
-      "reason" => "finish the smoke topline",
-      "idempotencyKey" => "tlclf-#{u}"
-    })
-
-    ok!(state, "work-item-close", %{"workItemId" => wi_id})
-    pass(state, "durable Topline create/update/link/concern/history/close/reopen flow")
   end
 
   # --- effort-without-effect: durable parent check-in and reassignment ----------
@@ -2567,9 +2096,9 @@ defmodule FeatureSmoke do
     resolved = item["assignments"]["open"] + item["assignments"]["closed"]
 
     # RESOLVED is a SUPERSET of DIRECT. A review assignment is pinned to no item
-    # and reaches its story only through `reviewsAssignmentId`, so the flagship
+    # and reaches its story only through `reviewsAssignmentId`, so the gate-chain
     # item's resolved count exceeds its direct count — asserted as an inequality
-    # rather than a literal so it survives a change to the flagship loop.
+    # rather than a literal so it survives a change to the gate-chain journey.
     assert(
       state,
       resolved >= length(direct),
@@ -2990,7 +2519,7 @@ defmodule FeatureSmoke do
   defp assert(state, _false, msg), do: fail(state, msg)
 
   defp pass(state, label) do
-    IO.puts("  PASS [#{state.leg.wire_name}] #{label}")
+    IO.puts("  PASS [#{Map.get(state, :smoke_scope, state.leg.wire_name)}] #{label}")
     %{state | pass: state.pass + 1}
   end
 
@@ -2999,7 +2528,16 @@ defmodule FeatureSmoke do
   end
 
   defp finish_leg(state) do
-    IO.puts("feature-smoke leg #{state.leg.wire_name}: #{state.pass} checks PASS")
+    IO.puts("feature-smoke per-harness #{state.leg.wire_name}: #{state.pass} checks PASS")
+    :ok
+  end
+
+  defp finish_shared(state) do
+    IO.puts(
+      "feature-smoke shared fixture #{state.leg.wire_name}: #{state.pass} checks PASS; " <>
+        "this result does not establish harness parity"
+    )
+
     :ok
   end
 

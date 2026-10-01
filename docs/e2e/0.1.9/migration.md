@@ -26,9 +26,10 @@ candidate built by the `release candidate` workflow:
    commit and verify that its tree is the tip's tree:
 
    ```sh
-   git checkout -b "release-candidate/e2e-$(date -u +%Y%m%d)" <0.1.9 commit>
-   git commit --allow-empty -m "release candidate: E2E package marker for <0.1.9 commit>"
-   git diff --quiet <0.1.9 commit> HEAD && echo "tree unchanged"
+   candidate_base='<full 0.1.9 commit under test>'
+   git checkout -b "release-candidate/e2e-$(date -u +%Y%m%d)" "$candidate_base"
+   git commit --allow-empty -m "release candidate: E2E package marker for $candidate_base"
+   git diff --quiet "$candidate_base" HEAD && echo "tree unchanged"
    git push origin HEAD
    ```
 
@@ -298,7 +299,7 @@ echo "package kind: $package_kind"
   (PR #185) and migrates with no input. On this kind, a start with no input
   **is the positive start**: never run it as a refusal probe, because it would
   migrate the copy. The explicit input still works and an invalid explicit
-  input is still refused, so the other probes stay.
+  input is still refused; retain the wrong-target refusal below on both kinds.
 
 0.1.9 refuses to open a base that carries no build marker unless the operator
 names the exact transition. Merge `1265b3c894356755d46bc1fd143aeab5be2c873c`
@@ -363,7 +364,12 @@ PY
 
 ### Refusal probes
 
-Run these on the migration base itself, before the positive start. Admission
+Run the candidate's absent-transition refusal and one wrong-target refusal on
+the migration base itself, before the positive start. The malformed JSON,
+wrong-base and wrong-schema permutations remain source checks in
+`test/live_base_guard_test.exs`; they do not each boot and hash this real-size
+copy. Keep their source CI reference in the scorecard, not an E2E pass.
+Admission
 reads the base read-only and refuses before anything is written, so a correct
 refusal leaves the copy unchanged; the probes check exactly that. A refusal
 raises inside the gateway's supervision tree, so the process exits nonzero and
@@ -388,12 +394,12 @@ probe_refusal() { # probe_refusal NAME EXPECTED_CODE [NAME=VALUE ...]
   if gateway_start "$test_base" "$test_port" "$log" "$@"; then
     echo "$name: observed-fail (gateway served /version)"
     gateway_stop
-    return 0
+    return 1
   fi
   if kill -0 "$gateway_pid" 2>/dev/null; then
     echo "$name: observed-fail (no /version and no exit within the limit)"
     gateway_stop
-    return 0
+    return 1
   fi
   status=0; wait "$gateway_pid" || status=$?; gateway_pid=""
   ls -A "$test_base" >"$trial_root/probe-$name.after"
@@ -404,31 +410,22 @@ probe_refusal() { # probe_refusal NAME EXPECTED_CODE [NAME=VALUE ...]
     echo "$name: observed-pass ($expected)"
   else
     echo "$name: observed-fail (exit $status, added: ${added:-none})"
+    return 1
   fi
 }
 
-other_base="$(mktemp -d "$trial_root/other-base.XXXXXX")"
 case "$package_kind" in
-  candidate) probe_refusal no-transition build_transition_required ;;
+  candidate) probe_refusal no-transition build_transition_required || exit 1 ;;
   release) echo "no-transition: not a probe on a release package; it is the positive start" ;;
 esac
-probe_refusal malformed invalid_build_transition \
-  TIGHTBEAM_LIVE_BASE_TRANSITION='{"base":'
 probe_refusal wrong-target build_transition_mismatch \
-  TIGHTBEAM_LIVE_BASE_TRANSITION="$(transition_json "$test_base" "$source_stamp" 0000000000000000000000000000000000000000000000000000000000000000)"
-probe_refusal wrong-base build_transition_mismatch \
-  TIGHTBEAM_LIVE_BASE_TRANSITION="$(transition_json "$other_base" "$source_stamp" "$target_build_identity")"
-probe_refusal wrong-schema legacy_schema_mismatch \
-  TIGHTBEAM_LIVE_BASE_TRANSITION="$(transition_json "$test_base" "not-the-source-stamp" "$target_build_identity")"
+  TIGHTBEAM_LIVE_BASE_TRANSITION="$(transition_json "$test_base" "$source_stamp" 0000000000000000000000000000000000000000000000000000000000000000)" || exit 1
 ```
 
 | Probe | Input | Expected refusal |
 |---|---|---|
 | `no-transition` | Variable unset (candidate package only) | `build_transition_required` |
-| `malformed` | Truncated JSON | `invalid_build_transition` |
 | `wrong-target` | Valid JSON, `target` of 64 zeros | `build_transition_mismatch` |
-| `wrong-base` | Valid JSON naming another canonical scratch directory | `build_transition_mismatch` |
-| `wrong-schema` | Valid JSON, `expectedSchema` not the copied stamp | `legacy_schema_mismatch` |
 
 Each probe passes only with a nonzero exit, the expected code in its private
 log, no `/version`, an unchanged `state.db` digest, `build-owner.json` in the
@@ -567,8 +564,8 @@ package kinds.
 
 ```sh
 probe_refusal left-set build_transition_mismatch \
-  TIGHTBEAM_LIVE_BASE_TRANSITION="$(transition_json "$test_base" "$source_stamp" "$target_build_identity")"
-gateway_start "$test_base" "$test_port" "$trial_root/reboot.log"
+  TIGHTBEAM_LIVE_BASE_TRANSITION="$(transition_json "$test_base" "$source_stamp" "$target_build_identity")" || exit 1
+gateway_start "$test_base" "$test_port" "$trial_root/reboot.log" || exit 1
 gateway_stop
 ```
 

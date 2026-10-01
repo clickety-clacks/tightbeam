@@ -6,22 +6,24 @@ runbook authorizes no host, container runtime, `sudo` route, database copy,
 credential or execution.
 
 The procedure migrates one real 0.1.8 database once and preserves the migrated
-result. Every feature runbook starts from a fresh copy of that result, so a
-feature check never repeats the migration and never changes the preserved copy.
+result. Historical preservation and a migrated-state read sample use copies of
+that result. New-record feature journeys use disposable fresh bases and
+test-owned actors; they do not require another real-org copy. No feature check
+repeats the migration or changes the preserved copy.
 
 | Runbook | What it covers | Starts from |
 |---|---|---|
 | [PREFLIGHT.md](PREFLIGHT.md) | Readiness: every prerequisite classified, what is missing and who supplies it | Nothing; read it first |
 | [migration.md](migration.md) | 0.1.8 to 0.1.9 migration, package acquisition and kind, build admission (`TIGHTBEAM_LIVE_BASE_TRANSITION` or release provenance), preservation reads, reusable output | A verified copy of a real 0.1.8 `state.db` |
 | [gateway-surface.md](gateway-surface.md) | Gateway shim verbs, stop isolation, REST authentication and D1 reads, CLI transport diagnostics | Fresh empty bases, plus one migrated copy |
-| [provider-runtime.md](provider-runtime.md) | Identity, harness control, sentinels, session connection, shipped guidance | Migrated copy (offline) or fresh base (online) |
-| [work-routing.md](work-routing.md) | Work-item fields and body, delivery owner, successors, topology, wakes and dependency waits, conditions, landing watcher | Migrated copy (offline) or fresh base (online) |
-| [decisions-assignments.md](decisions-assignments.md) | Cannot-proceed; ask, answer and return; liveness, completion handoff and gates; turn stop; revoke, reopen, repair and settle; failed-turn escalation | Migrated copy (offline) or fresh base (online) |
-| [telemetry.md](telemetry.md) | Breathing, queue summary, execution map, durable Toplines, notice rules | Migrated copy (offline) or fresh base (online) |
-| [artifacts.md](artifacts.md) | Producer and verdict binding, gate enforcement, uncaptured content, retirement cleanup | Migrated copy (offline) or fresh base (online) |
+| [provider-runtime.md](provider-runtime.md) | Identity, harness transition, satellite connection, shipped guidance, conditional recovery | Fresh base |
+| [work-routing.md](work-routing.md) | Work-item fields and body, current-owner routing, topology, replace/stop/resume, conditions, sentinel lifecycle | Fresh base |
+| [decisions-assignments.md](decisions-assignments.md) | Cannot-proceed; ask, answer and return; liveness, completion handoff and gates; revoke, reopen and conditional recovery | Fresh base |
+| [telemetry.md](telemetry.md) | Breathing, queue summary, execution map, durable Toplines, fourth-review notice | Fresh base; historical sample may reuse a migrated copy |
+| [artifacts.md](artifacts.md) | Producer and verdict binding, gate enforcement, uncaptured content, original-host retirement cleanup | Fresh base; contained migrated copy only for the unreachable historical-host control |
 
 Each runbook runs on its own. A later change reruns only the runbooks it
-touches, from a new copy of the same preserved migration result. The
+touches, with the fixture class its row names. The
 [aggregate run](#aggregate-run) runs them all.
 
 ## Execution contract
@@ -67,7 +69,50 @@ tb() { TIGHTBEAM_BASE_DIR="${AREA_BASE:?}" "${PKG:?}/bin/tightbeam" "$@"; }
 ```
 
 `tb` acts as the area gateway's operator. Rows that need an admin add
-`--as-user <adminUserId>` with an admin user chosen from the area copy.
+`--as-user <adminUserId>` with an admin user of that test base.
+
+### Fresh-base actors
+
+Use a separately authorized empty base with the same verified package and the
+CLI shell above. Record its test admin, admitted local host, test owner(s),
+session keys and workdirs. Create users with `add-user`, and sessions with
+`spawn --name <unique-role> --archetype <admitted-role> --harness <harness>
+--model <catalog-model>`, using the actual catalog and admission constraints.
+Never insert fixture rows in the database or copy a live session/token into
+this base. A missing admitted actor is `INCOMPLETE` with the refused operation;
+it does not authorize relaxing admission.
+
+For a local test session, run the packaged CLI from its returned workdir so
+the CLI carries that session's own identity. In the area tables, `as_actor
+<workdir> <verb> ...` means:
+
+```sh
+as_actor() {
+  actor_dir="$(realpath "${1:?test session workdir}")" || return 1
+  shift
+  actor_root="$(realpath "${AREA_BASE:?}/work")" || return 1
+  case "$actor_dir" in "$actor_root"/*) ;; *) echo "actor outside test base" >&2; return 1 ;; esac
+  test -f "$actor_dir/.tightbeam-session" || return 1
+  (cd "$actor_dir" && "${PKG:?}/bin/tightbeam" "$@")
+}
+```
+
+Use only workdirs created in this base and verified to belong to the recorded
+test sessions. For an authorized satellite actor, use its own workdir on that
+satellite, its matching packaged CLI, and its configured test gateway route;
+record those paths separately. Do not copy a bearer into command arguments or
+evidence. Reads of named non-secret database columns are allowed in private
+test scratch. Never `SELECT * FROM sessions`.
+
+`Fresh / records` rows need admitted actors and normal public record operations;
+they do not require a model to demonstrate the record's semantics. Spawn,
+dispatch, automatic remedies or identity apply can still require working host
+or provider setup. Record those real prerequisites and any incidental turns.
+`Fresh / online` rows require actual provider, satellite, GitHub or human
+interaction. A command returning a queued wake is not proof of a model reply.
+
+These fixture instructions do not extend execution authority. All records,
+roles, files and repositories belong to the authorized test environment.
 
 ### Copied session tokens
 
@@ -337,8 +382,8 @@ three copies of the database.
 ## Tiers
 
 - **Offline, real-data copy.** Inside the verified boundary: the migration and
-  its refusal probes, preservation reads, the transition checks, and every row
-  that needs no provider, network or login. Rows that need a copied session to
+  its refusal probes, preservation reads, transition checks and the migrated
+  acceptance sample. Rows that need a copied session to
   act are conditional on the [copied-token ruling](#copied-session-tokens).
 - **Online, fresh empty base.** A separately authorized environment with
   conditions 1 to 3 met; its online authorization replaces conditions 4 and 5.
@@ -346,8 +391,10 @@ three copies of the database.
   Rows that need a provider turn, GitHub or an interactive login run here. Label
   every result "fresh-base feature evidence, not proof on migrated state".
 
-The feature smoke is online only: its preflight probes live provider
-credentials. Each area row names its tier.
+Fresh-base record work uses the same authorized fresh-base environment; record
+checks run once rather than once per provider. The feature smoke still has
+real runtime prerequisites and runs only in the authorized online tier. A
+shared smoke result is not evidence for an omitted harness.
 
 ## Scorecard
 
@@ -363,6 +410,33 @@ Each row records exactly one status:
 
 An expected outcome in a runbook is an assertion, never a predicted pass. Keep
 E2E results separate from source CI and static review.
+
+For a conditional recovery row, name the exact missing behavior and its source
+test reference. `skipped: no incident` alone is insufficient: a missing rate
+limit is different from a missing typed ACP failure. A source test reference is
+an explicit limit on E2E evidence, not an `observed-pass`. When a row reuses
+another row's result, record its evidence ID and do not rerun that journey.
+
+### One aggregate owner per behavior
+
+The manual area is the owner unless this table assigns the journey to smoke.
+Standalone areas use the same owner, including their selected smoke area when
+needed. An extension below adds distinct evidence to the owner's result.
+
+| Behavior | Owner | Other references do only this |
+|---|---|---|
+| Body replace/repeat/clear, other-field preservation | Work-routing CLI row | Smoke omits its duplicate body/owner lifecycle |
+| Owner-link CRUD and current-owner notification | Work-routing owner/topology journey | Smoke omits its duplicate owner lifecycle |
+| Identity status/apply and reversible identity edits | Provider CLI journey | Per-harness smoke keeps actual deployment/projection evidence |
+| Cannot-proceed routing/replay and standing refusals | Decisions CLI journey | Smoke omits its duplicate cannot-proceed lifecycle |
+| Topline mutations/history/replay | Telemetry CLI journey | Smoke keeps execution-map roster/filter assertions |
+| Execution-map and physical breathing reads | Shared smoke telemetry pass | CLI adds one packaged read/shape check and the queue authorization outcome |
+| Review/verification/artifact gate chain | Shared smoke, once if decisions or artifacts is selected | Both areas cite that one chain; no flagship duplicate |
+| Tool-observed artifact provenance | Real carrier smoke per selected harness | Ordinary uncaptured content needs only a registered file |
+| Replace queued dispatch, stop audit, correction runs | Work-routing combined journey | Decisions cites its stop evidence |
+| Sentinel settings, checks, landing fact, disable | Work-routing one disposable-PR journey | Provider cites its lifecycle evidence |
+| Fourth-round notice | Telemetry CLI journey | Guidance inspection alone is not notice evidence |
+| Pi tool boundary (#47 and #106) | One provider Pi journey | One onboarding per selected provider; no second #47 run |
 
 ## Feature smoke
 
@@ -396,27 +470,35 @@ process cannot safely identify the interrupted run's leftover rows.
 2. Run [migration.md](migration.md) once. It ends with a preserved `state.db`,
    the gateway-written `build-owner.json` and a manifest. If migration fails,
    stop: no area runs on an unapproved result.
-3. For each area, make a new base from the preserved output as
-   [migration.md](migration.md#reuse-the-result) describes, run that area's
-   offline rows, stop its gateway and delete the copy.
-4. Run [gateway-surface.md](gateway-surface.md).
-5. In the online environment, run each area's online rows and the feature smoke
-   with `TIGHTBEAM_SMOKE_AREAS=all`, on fresh empty bases.
+3. Make one area copy as [migration.md](migration.md#reuse-the-result)
+   describes. Run the gateway D1 historical reads and telemetry historical
+   breathing sample; the artifact unreachable-original-host control remains
+   conditional on copied-token/actor authority. Stop its gateway and discard
+   only this disposable copy. Keep the preserved migration output.
+4. Run the fresh-base gateway checks, then each manual area's fresh-base
+   journeys once. Retain their result IDs; use the ownership table above.
+5. In the separately authorized online environment, run the feature smoke
+   with `TIGHTBEAM_SMOKE_AREAS=all` once, recording its shared results and real
+   harness results separately. Run the distinct manual online extensions
+   once. Reuse accounts and evidence, not a second full lifecycle for a row
+   already owned by smoke. Never reconnect a copied-data base to the network.
 6. Complete the scorecard: package and source identity, host, harness, model
    and effort per leg, commands, the status of every row and every missing
    prerequisite.
 
-A standalone rerun repeats step 1, then step 3 or 5 for one area, from a new
-copy of the same preserved output.
+A standalone rerun checks the applicable containment and package inputs, then
+runs only the selected area's owner journeys on their stated fixture class.
+Historical checks use a new copy of the preserved output; new-record checks use
+a fresh base. Neither requires a second migration.
 
 ## Coverage of merged 0.1.9 work
 
 This matrix follows the merged-work ledger
-(`shared/evidence/e2e-019/landed-on-019.md`): 48 work items across 60 merged
-pull requests, plus 10 pull requests with no work item, plus PR #183, which
+(`shared/evidence/e2e-019/landed-on-019.md`): 48 work items and 60 unique merged
+pull requests, including the 10 pull requests with no work item, plus PR #183, which
 merged after the ledger. Each entry names the row that checks it or the reason
-there is none. TEST means source tests cover it and no safe real trigger
-exists; CI means the change is to CI or test infrastructure; GUIDANCE means it
+there is none. TEST means the focused source suite is the proportionate owner
+of that case; CI means the change is to CI or test infrastructure; GUIDANCE means it
 changed shipped guidance, checked by the
 [guidance presence](provider-runtime.md#guidance-presence) row.
 
@@ -440,34 +522,34 @@ A 0.1.9 change with no user-callable surface outside the ledger has no row.
 | `wi_25e38cf9` | #133 | [Canonical session topology](work-routing.md#canonical-topology) |
 | `wi_2aa19876` | #60 | GUIDANCE |
 | `wi_2c216950` | #127 | TEST: one test timeout |
-| `wi_379c3e06` | #115 | TEST: the Guardian default is written only at a Codex launch and no CLI output shows it |
-| `wi_3b4a20ce` | #142 | [CLI transport diagnostics](gateway-surface.md#cli-transport-diagnostics) |
+| `wi_379c3e06` | #115 | [Composed guidance/deployment inspection](provider-runtime.md#identity-and-composed-guidance) reads the generated Codex configuration; explicit-value permutations stay in `test/codex_guardian_default_test.exs`. |
+| `wi_3b4a20ce` | #142 | [CLI transport diagnostics](gateway-surface.md#cli-transport-diagnostics); bounded upstream refusal/unreadable/decode fidelity remains in `cli/src/dispatch.rs`. |
 | `wi_40820f7a` | #141 | [Worker queue summary](telemetry.md#worker-queue-summary) |
 | `wi_46596ef4` | #35 | GUIDANCE |
 | `wi_4e7e6130` | #108 | TEST: runtime fix to forced shutdown with a parked adapter; no safe trigger |
 | `wi_502874f7` | #156, #176 | [Replace unread messages](work-routing.md#replace-unread-messages), online; [wake cancellation history](work-routing.md#wake-cancellation-history) |
-| `wi_5501fe61` | #64 | [Failed-turn escalation](decisions-assignments.md#failed-turn-escalation) |
-| `wi_57b42e04` | #135 | TEST: settlement race; no safe trigger |
+| `wi_5501fe61` | #64 | [Incident evidence](decisions-assignments.md#incident-evidence): conditional rate-limit successor with preserved lineage; ordinary escalation is a different outcome. |
+| `wi_57b42e04` | #136 | TEST: the ledger associates the settlement product question with #136; #135 implements its resolution under `wi_6eb31048`. No second feature or race E2E. |
 | `wi_5b430658` | #177 | TEST: test and fixtures only |
 | `wi_5ed0c7e1` | #167 | [Liveness superseded by progress](decisions-assignments.md#liveness-superseded-by-progress) |
 | `wi_6454bc1d` | #131 | GUIDANCE |
-| `wi_66725983` | #147 | [Stop a running assignment turn](decisions-assignments.md#stop-running-turn); refusals offline, cancel online |
+| `wi_66725983` | #147 | [Replace, stop and resume](work-routing.md#queue-correction): authorization, actor/reason and real correction in the same session. |
 | `wi_684f7f8f` | #120 | [Session connection](provider-runtime.md#session-connect) |
-| `wi_6c9bf9fd` | #145 | [Notice rules present](telemetry.md#notice-rules); firing is TEST |
+| `wi_6c9bf9fd` | #145 | [Fourth-review supervision notice](telemetry.md#fourth-review-notice); the other predicates and exact reevaluation/races remain source-tested. |
 | `wi_6eb31048` | #135 | TEST: race; no safe trigger |
-| `wi_725a1bc6` | #58 | [REST authentication and D1 reads](gateway-surface.md#rest-d1) |
+| `wi_725a1bc6` | #58 | [REST authentication and D1 reads](gateway-surface.md#rest-d1), extended by the [non-admin/redaction pair](gateway-surface.md#non-admin-authorization-and-redaction-u10). |
 | `wi_73e7bc28` | #144 | [Completion handoff](decisions-assignments.md#completion-handoff) |
 | `wi_74a9ad87` | #119, #126 | TEST: the configured model reaches adapter options only, and #119 needs a malformed catalog |
 | `wi_762dede5` | #163 | GUIDANCE |
 | `wi_78db9a18` | #129 | [Transcript index and query](migration.md#transcript-index) |
-| `wi_7e25614b` | #121 | TEST: the terminal credential state is reported only by the source-tree doctor task, which the package does not ship |
+| `wi_7e25614b` | #121 | [Provider recovery evidence](provider-runtime.md#provider-recovery-evidence): conditional suppression, public refusal/standing remedy and recovery; absent incident halves stay named gaps. |
 | `wi_7ff1a4ed` | #114 | [Sentinel lifecycle](provider-runtime.md#sentinel-lifecycle) |
 | `wi_8e99311d` | #134 | GUIDANCE |
 | `wi_97ff875e` | #93 | [Gateway shim verbs](gateway-surface.md#shim-verbs) and [stop isolation](gateway-surface.md#stop-isolation) |
 | `wi_9a725587` | #170 | TEST: test fixture |
 | `wi_a00bca2e` | #162 | [Harness control capability](provider-runtime.md#harness-capability) |
 | `wi_a1ee0c7a` | #122 | [Canonical session topology](work-routing.md#canonical-topology) (reparent) and [guidance presence](provider-runtime.md#guidance-presence) (operating-manual skill) |
-| `wi_a597deb3` | #138 | TEST: the host credential status is reported only by the source-tree doctor task, which the package does not ship |
+| `wi_a597deb3` | #138 | [Provider recovery evidence](provider-runtime.md#provider-recovery-evidence): an already-unreachable registered test host reports unavailable, not missing credentials; timing/fencing stays source-tested. |
 | `wi_ac41993f` | #173 | TEST: test fixture |
 | `wi_b9d31443` | #130 | TEST: runtime fix to lane recovery; no safe trigger |
 | `wi_c00e925d` | #100 | GUIDANCE |
@@ -475,21 +557,21 @@ A 0.1.9 change with no user-callable surface outside the ledger has no row.
 | `wi_e92b90d7` | #164 | [Completion while blocked](decisions-assignments.md#completion-while-blocked) |
 | `wi_eb1e49bd` | #165 | GUIDANCE |
 | `wi_f2dba202` | #94 | CI: source gate |
-| `wi_f9360112` | #153 | TEST: needs a real typed adapter failure and recovery |
+| `wi_f9360112` | #153 | [Incident evidence](decisions-assignments.md#incident-evidence): conditional typed ACP recovery and one original-message redelivery. |
 | `wi_fb0a697a` | #151, #157 | [Retirement cleanup](artifacts.md#retirement-cleanup) |
 
 ### Pull requests without a work item
 
 | PR | Row or reason |
 |---|---|
-| #154 | [CLI transport diagnostics](gateway-surface.md#cli-transport-diagnostics) |
-| #112 | TEST: condition-owner matching has no simple trigger |
+| #154 | TEST: no-attempt transport/unreadable/decode fidelity in `cli/src/dispatch.rs` (`no_attempt_unreadable_callers_preserve_ordinary_and_tune_shapes`, `no_attempt_version_decode_keeps_status_location_and_redacted_body`) and `cli/src/harnesses.rs` (`a_no_attempt_catalog_decode_failure_keeps_status_and_redacts_body`). The ordinary recorded-attempt CLI refusal is adjacent, not proof of this delta. |
+| #112 | [Sentinel/PR lifecycle](work-routing.md#sentinel-and-pr): two eligible owners observe the same process-filed fact; owned-fact isolation remains in `test/condition_facts_test.exs`. |
 | #106 | [Pi harness and local providers](provider-runtime.md#local-openai), online, optional |
-| #48 | TEST: needs a failed runner |
+| #48 | [Incident evidence](decisions-assignments.md#incident-evidence): one sanctioned repair, identical-key replay and preserved terminal history, conditional on a genuine failed runner. |
 | #47 | [Pi harness and local providers](provider-runtime.md#local-openai), online, optional |
-| #39 | GUIDANCE. Its engineering posture rule was later removed (`ac0b966c`), so no row checks for it. |
+| #39 | [Composed guidance](provider-runtime.md#identity-and-composed-guidance) checks surviving agreed-phase/MVP and blocker scope; the deleted engineering-posture rail is not required. |
 | #37 | CI: OTP patch-release gate |
-| #33 | NOT PRESENT: removed by `f608318e` |
+| #33 | [Composed guidance](provider-runtime.md#identity-and-composed-guidance) checks surviving owned-clone/custody intent; the old clone-owned skill removed by `f608318e` is not required. |
 | #31 | [Cursor leg](provider-runtime.md#cursor-leg), online, optional |
 | #19 | TEST: a real 401 credential refresh has no safe trigger |
 | #183 | [Build admission](migration.md#build-admission) and the [left-set refusal](migration.md#left-set-refusal) |

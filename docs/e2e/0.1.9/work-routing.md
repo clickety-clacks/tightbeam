@@ -1,49 +1,180 @@
 # 0.1.9 work and routing checks
 
-Offline rows run on a new copy of the migrated result
-([reuse the result](migration.md#reuse-the-result)) inside the verified
-[containment](README.md#containment) boundary, from the
-[CLI shell](README.md#cli-shell). A copied session acts through
-[`as_session`](README.md#copied-session-tokens), which stops unless the run's
-execution approval names copied-token use; without it, record each row that
-acts as a copied session `INCOMPLETE: copied-token use not approved`. An admin acts through
-`tb ... --as-user "$test_admin"`:
+Use the [fresh-base actors](README.md#fresh-base-actors), matching package and
+[CLI shell](README.md#cli-shell). `test_admin` is the admin of this disposable
+base; `as_actor <workdir>` carries a test session's identity. Create only
+area-owned items and assignments. Record admission refusals and missing actors
+as setup limits; never fabricate rows or borrow live tokens.
 
-```sh
-test_admin="$(sqlite3 -readonly "${AREA_BASE:?}/state.db" "SELECT userId FROM users WHERE isAdmin = 1 ORDER BY userId LIMIT 1")"
-```
+Rows labelled **Fresh / records** check durable operations through admitted
+test actors. **Fresh / online** needs the stated real runtime or external
+service. Record each prerequisite and use the [scorecard](README.md#scorecard).
+A queued turn alone is not evidence of delivery or a reply. Every database
+inspection uses `sqlite3 -readonly "$AREA_BASE/state.db"` and named columns.
 
-Create this area's own test work items and assignments, and pick copied
-active sessions with the same owner as their actors. Offline, a turn that a row
-queues fails for want of a login or network; the row reads the durable wake and
-turn records, not the turn's reply. Rows that read a table do so read-only:
-`sqlite3 -readonly "$AREA_BASE/state.db"`.
-
-Online rows run on a fresh empty base under the [online tier](README.md#tiers)
-and are labelled "fresh-base feature evidence, not proof on migrated state".
-The feature smoke's `work` area ([feature smoke](README.md#feature-smoke),
-online only) covers facts and configuration reads, work-item and assignment
-reads, dispatch linking, body replace and clear, and delivery owner
-set, read and clear.
-
-The D1 REST reads are in [gateway-surface.md](gateway-surface.md#rest-d1).
+The smoke `work` area owns facts/configuration reads and the basic
+work-item/assignment/dispatch wiring pass. The rows here own distinct CLI
+field changes, body preservation, current-owner routing and queue behavior.
+Do not repeat their CRUD lifecycles in smoke.
 
 | Feature | Tier | Exercise | Pass condition |
 |---|---|---|---|
-| Work-item fields | Offline | As the admin, create a test item with `work-item-create --title ... --priority 3`. Run `work-item-update <id> --title ... --priority 5`, then `--spec-ref <name> --spec-sha256 <64 hex>`, then `--clear-spec-ref`, then `--priority 9`. Read `work-item-get <id>` after each. | Each read shows only the requested change; omitted fields are unchanged; the spec name and hash appear and clear together. Priority 9 is refused by the CLI before any request ("priority must be an integer from 0 through 8"). |
-| <a id="editable-work-item-body"></a>Editable work-item body | Offline | On a test item, run `work-item-update <id> --body "first"`, again with `--body "second"`, again with `--body "second"`, then `--clear-body`. Also run `work-item-update <id> --body x --title y`. Read `work-item-get <id>` after each. | `workItem.body` shows the latest text, and `bodyUpdate` carries `state`, `byteLength`, `sha256`, `changed` and the updater. The repeated body shows `changed: false`. After the clear, `body` is null and `bodyUpdate.state` is `absent`. Title, priority and metadata never change. The combined form is a CLI usage error with exit 1. |
-| Default priority | Offline | Run `config get default-priority`, then `config set default-priority 2` as the admin, create a test item with no `--priority`, read it, then set the setting back to its first value. Try `config set default-priority 9`. | The setting reads back as 2 and the new item has priority 2. The restored value matches the first read. 9 is refused. |
-| <a id="delivery-owner"></a>Direct delivery owner | Offline | On a test item, run `work-item-update <id> --delivery-owner <active copied session>`, read `work-item-get <id>`, then `--clear-delivery-owner` and read again. Also try an unknown session key, a copied retired session, and the removed verb `work-item-delivery-scope-set`. | The item shows `deliveryOwnerSessionKey` equal to the session, then null. The unknown key is refused `unknown_delivery_owner` and the retired session `delivery_owner_unavailable`. The removed verb is an unknown command to the CLI (PR #171): nonzero exit before any request, and no `delivery_operation_retired` handler remains. |
-| Successor assignment | Offline | Dispatch assignment A on a test item and close it. Dispatch assignment B with `--succeeds <A>`. Then try `--succeeds` naming an open assignment. Read `work-item-get <wi>`. | B's `subject` ends with `Ruled-but-unconsumed decisions carried from <A>: ...` and an `assignment-successor-created` fact is scoped to B. The open predecessor is refused `predecessor_not_terminal`. |
-| <a id="canonical-topology"></a>Canonical session topology | Offline | Pick a copied custom child session holding exactly one open assignment and a second copied session with the same owner. As the owning user, run `session-reparent --session <child> --parent <new parent> --assignment <id> --key <unique>`. Read `list`. Repeat the same call, and try a reparent that makes a cycle. | The response shows `originParent`, `previousCurrentParent` and `currentParent`, and the assignment shows `currentCoordinationParentRef`. `list` shows the new `currentParent` and `topologyParent`, with `spawnedBy` unchanged. The repeat replays; the cycle is refused `cycle_detected`. |
-| <a id="wake-delivery-options"></a>Dependency wait | Offline | On a test item, open assignment H (the waiter), R (the resolver) and V (the verifier). As H's holder, run `wake --session <H holder> --assignment <H> --fallback-after 1h --prompt "resolver closed" --predicate '{"conditions":[{"fact":"assignment.state","op":"eq","value":"closed"}],"bindings":{"assignmentId":"<R>"},"resolverRef":{"kind":"assignment","id":"<R>"},"necessity":"R owns the required output.","verificationRef":{"kind":"assignment","id":"<V>"}}'`. Read the `turns` table for its `wakeId`. Revoke R with a reason, wait one wake tick, and read again. Also run the same wake as a user, and with both `--predicate` and `--after-turn`. | Before R closes, no turn carries the wake's ID. After R is revoked, one turn does, with the prompt. The user caller is refused `invalid_wait`; the combined flags fail at parse. |
-| Ready-now continuation | Online | From inside a harmless running turn of H's holder, have it run `wake --session <itself> --assignment <H> --after-turn --prompt "continue"`. Read the `turns` table after the turn ends. Run the same command from a session with no running turn. | Exactly one later turn carries the continuation's wake ID, and it starts only after the capturing turn ended. With no running turn: `no_running_turn`. |
-| Delivery class | Offline | As a copied session, send `wake --session <other> --class blocker --prompt ...` and `wake --session <other> --class not-a-class --prompt ...`. Read `class` for both wake IDs from the `wakes` table. | Each wake stores the class its sender gave. The unknown class is accepted, not refused. |
-| <a id="replace-unread-messages"></a>Replace unread messages | Online | Keep H's holder busy with a long harmless turn. From the opener session, send two messages with `wake --session <holder> --assignment <H> --replace-queued --prompt ...`, then a third the same way. As a control, send one ordinary wake to the same holder from a different session. Read the holder's turns. | The two earlier queued turns end `canceled` with error `queued-message-suppressed: sender_requested_replacement`, and a `queued_message_suppressed` event is written. The third stays queued. The running turn and the control are unchanged. |
-| <a id="wake-cancellation-history"></a>Wake cancellation history | Offline | As H's holder, register another [dependency wait](#wake-delivery-options) on H naming a resolver that stays open, and a third as a control. Run `cancel-wake <wakeId>` from the holder, then again. Try cancelling the control from a different session. Read `work-item-trace <wi>` and the `turns` table. | The first cancel returns `canceled: true`, the second `canceled: false`. The trace shows `wake_canceled` for that wake with reason `requester_withdrew`. No turn carries its ID. The other session's cancel leaves the control pending. |
-| Consequence condition fact | Offline | On an assignment with at least one attest, as its holder, publish `condition --kind obligation-consequence-changed --scope <asg> --key <unique> --payload '<object>'` with exactly `assignmentId` (the scope), `consequenceKey`, `revision`, `attentionRequestId`, `evidenceAttestId` and boolean `explicitAttention`. Try a payload on another kind, and a payload missing a key. | The fact is kept with its payload. A payload on another kind is refused `invalid` ("payload requires consequence kind"); the incomplete payload is refused `invalid`. |
-| <a id="landing-watcher"></a>Landing watcher | Online | In a disposable repository with one open PR, set the sentinel's `GH_CONFIG_DIR` and `LANDING_REPOS` and enable `agentic-engineering/landing-watch` (see [sentinel lifecycle](provider-runtime.md#sentinel-lifecycle)). Subscribe a test owner with `wake --session <owner> --when-fact pr.checks-completed --when-scope <owner>/<repo>#<n> --fallback-after 2h --prompt ...`. Let the PR's real checks finish. | One fact with the lowercased scope and key `pr-checks:<scope>:<head>:<outcome>` is filed for that head, and the subscriber wakes with `firedBy` `condition`. A subscription on another PR's scope does not fire. The fallback is not check evidence. |
-| Orchestrator defaults | Online | After `learn agentic-engineering`, spawn an `orchestrator` session on a test item without harness, model or effort flags. | The session has harness `codex`, model `gpt-6-luna` and effort `max`. If that host does not offer that model, record `INCOMPLETE`; do not substitute another host. |
+| Work-item fields | Fresh / records | As the admin, create a test item with `work-item-create --title ... --priority 3`. Run `work-item-update <id> --title ... --priority 5`, then `--spec-ref <name> --spec-sha256 <64 hex>`, then `--clear-spec-ref`. Read `work-item-get <id>` after each. | Each read shows only the requested change; omitted fields are unchanged; the spec name and hash appear and clear together. |
+| <a id="editable-work-item-body"></a>Editable work-item body | Fresh / records | On a test item with recorded title, priority, metadata and bound spec name/hash, run `work-item-update <id> --body "first"`, again with `--body "second"`, again with `--body "second"`, then `--clear-body`. Read `work-item-get <id>` after each. | `workItem.body` shows the latest text, and `bodyUpdate` carries `state`, `byteLength`, `sha256`, `changed` and the updater. The repeated body shows `changed: false`. After the clear, `body` is null and `bodyUpdate.state` is `absent`. Title, priority, metadata and the spec name/hash never change. This is the sole aggregate body lifecycle. |
+| Default priority | Fresh / records | Run `config get default-priority`, then `config set default-priority 2` as the admin, create a test item with no `--priority`, read it, then set the setting back to its first value. | The setting reads back as 2 and the new item has priority 2. The restored value matches the first read. |
+| <a id="delivery-owner"></a>Current delivery owner (U6) | Fresh / records; receipt online | Follow the [owner/topology journey](#owner-topology-journey), including owner set/read/replace/clear and a child terminal event after replacement. | The owner field reads back exactly, the worker retains assignment/provenance, and the terminal notice routes to the current eligible owner without a stale-owner duplicate. A stored owner link alone is not notice evidence. |
+| Successor assignment | Fresh / records | Dispatch assignment A on a test item and close it. Dispatch assignment B with `--succeeds <A>`. Then try `--succeeds` naming an open assignment. Read `work-item-get <wi>`. | B's `subject` ends with `Ruled-but-unconsumed decisions carried from <A>: ...` and an `assignment-successor-created` fact is scoped to B. The open predecessor is refused `predecessor_not_terminal`. |
+| <a id="canonical-topology"></a>Canonical topology and session-principal reparent (U6) | Fresh / records | Use the same [owner/topology journey](#owner-topology-journey). Deliberately inspect a Main-proxy edge and have the delivery-owner session reparent its own worker. | `topologyParent` distinguishes the proxy edge from `spawnedBy`; the authenticated session reparent changes current coordination, not historical opener/owner/holder/spawn provenance. The same-key replay has one event. |
+| <a id="wake-delivery-options"></a>Dependency wait | Fresh / records | On a test item, open assignment H (the waiter), R (the resolver) and V (the verifier). As H's holder, run `wake --session <H holder> --assignment <H> --fallback-after 1h --prompt "resolver closed" --predicate '{"conditions":[{"fact":"assignment.state","op":"eq","value":"closed"}],"bindings":{"assignmentId":"<R>"},"resolverRef":{"kind":"assignment","id":"<R>"},"necessity":"R owns the required output.","verificationRef":{"kind":"assignment","id":"<V>"}}'`. Read the `turns` table for its `wakeId`. Revoke R with a reason, wait one wake tick, and read again. Also run the same wake as a user. | Before R closes, no turn carries the wake's ID. After R is revoked, one turn does, with the prompt. The user caller is refused `invalid_wait`. |
+| Ready-now continuation | Fresh / online | From inside a harmless running turn of H's holder, have it run `wake --session <itself> --assignment <H> --after-turn --prompt "continue"`. Read the `turns` table after the turn ends. Run the same command from a session with no running turn. | Exactly one later turn carries the continuation's wake ID, and it starts only after the capturing turn ended. With no running turn: `no_running_turn`. |
+| Delivery class | Fresh / records | As a test session, send `wake --session <other> --class blocker --prompt ...` and `wake --session <other> --class not-a-class --prompt ...`. Read `class` for both wake IDs from the `wakes` table. | Each wake stores the class its sender gave. The unknown class is accepted, not refused. |
+| <a id="replace-unread-messages"></a>Replace, stop and resume (U5) | Fresh / online | Follow [queue correction](#queue-correction), including the still-queued dispatch prompt, another sender, and the real resumed correction. | Superseded source messages stay auditable; stop records its actor/reason; the newest correction runs next in the same session. The running turn and different-sender message survive replacement; only the authorized stop cancels the current turn. |
+| <a id="wake-cancellation-history"></a>Wake cancellation history | Fresh / records | As H's holder, register another [dependency wait](#wake-delivery-options) on H naming a resolver that stays open, and a third as a control. Run `cancel-wake <wakeId>` from the holder, then again. Try cancelling the control from a different session. Read `work-item-trace <wi>` and the `turns` table. | The first cancel returns `canceled: true`, the second `canceled: false`. The trace shows `wake_canceled` for that wake with reason `requester_withdrew`. No turn carries its ID. The other session's cancel leaves the control pending. |
+| Consequence condition fact | Fresh / records | On an assignment with at least one attest, as its holder, publish `condition --kind obligation-consequence-changed --scope <asg> --key <unique> --payload '<object>'` with exactly `assignmentId` (the scope), `consequenceKey`, `revision`, `attentionRequestId`, `evidenceAttestId` and boolean `explicitAttention`. | The fact is kept with its payload. |
+| <a id="landing-watcher"></a>One sentinel/PR lifecycle (U4) | Fresh / online, disposable repository | Follow [sentinel and PR](#sentinel-and-pr) with two eligible test owners and one wrong-scope control. | The same real PR yields the checks-completed fact and queue/landing settlement fact, both eligible owners wake from the process fact, and disabling stops the owned sentinel. Fallback expiry is never fact evidence. |
+| Orchestrator defaults | Fresh / records | After learning `agentic-engineering`, inspect its composed `identity/archetypes/orchestrator.toml` and the matching `identity status orchestrator` readback. | Defaults are harness `codex`, model `gpt-6-luna`, effort `max`. This checks shipped defaults without a provider placement; actual availability and configured-model forwarding remain distinct evidence. |
 
 0.1.9 has no command that turns on notice batching, so these runbooks do not
 check it.
+
+## Queue correction
+
+Use admitted test sessions O (opener), H (holder) and C (different sender), and
+an area item. Let H start a harmless bounded task on assignment A opened by O.
+Record the actual running turn sequence and assignment attribution. Do not
+freeze a lane or edit turn rows to hold this window. If the task ends before
+the observations below, record the missed running/queued prerequisite and
+retry this bounded journey; no race outcome is presumed.
+
+While A's turn is running:
+
+1. O uses `dispatch --to <H> --work-item <W> --subject <fixture>
+   --brief "INITIAL <nonce>" --key <unique>` to open assignment B. Confirm
+   its initial prompt is still queued. O sends one ordinary wake to H on B,
+   `wake --session <H> --assignment <B> --prompt "OLDER <nonce>"`. Save both
+   wake/message IDs. This is the two-message window reused by the telemetry
+   queue-summary row; read it now if that row is selected.
+2. O sends `wake --session <H> --assignment <B> --replace-queued
+   --prompt "CORRECTION <nonce>: reply with this nonce"`. Read H's turn
+   records: both older same-sender queued messages, including the dispatch,
+   are canceled with `queued-message-suppressed: sender_requested_replacement`.
+   Read the `queued_message_suppressed` audit and retain the original message
+   contents/IDs. A's running turn remains running.
+3. C sends an ordinary control wake to H. O sends a newer correction on B
+   with `--replace-queued` and a new nonce. Require the prior correction to be
+   canceled and C's control to remain queued. Let this bounded task finish and
+   the two surviving messages drain once in their recorded order. A different
+   sender's earlier queue position is preserved; do not demand overtaking.
+4. Still in the same session H and assignment B, start one bounded harmless
+   continuation and observe it running. With no surviving control ahead of it,
+   O queues an older correction and then the final correction using
+   `--replace-queued`. Require the older one canceled and the final one queued.
+   As a non-opener, try `assignment-stop-turn <B> --reason <fixture reason>`;
+   require `not_authorized` and no change. As O, run that stop once. Its result
+   names B, H, the exact current `turn_seq` and `acp_cancel`. That turn becomes
+   `canceled` with `assignment-opener-stop`; `assignment_turn_stopped` in the
+   private event log records O's actor and the exact reason. The final queued
+   correction is unchanged by the stop.
+5. Require that final correction to run next and produce its nonce reply in H,
+   with B's assignment and W's work lineage. All suppressed INITIAL, OLDER and
+   replaced correction messages remain readable but never execute. C's
+   previously preserved control has exactly one delivered turn. Record the
+   actual sequences and terminal results, not only accepted wakes. The second
+   bounded window isolates stop/resume ordering without discarding C's message.
+
+The decisions stop row cites this result. `test/queued_message_suppression_test.exs`
+owns clock-regression/retry ordering and the wider protected-traffic matrix;
+`test/lane_test.exs` owns deterministic stop races. A normal-stop test
+is not evidence for automatic incident recovery.
+
+## Owner/topology journey
+
+<a id="owner-topology-journey"></a>
+
+Use test owner U, its Main M, direct owner D, successor N, coordinator K and
+worker H, all under U. At least D is user-spawned: its `spawnedBy` and
+`currentParent` are null while `topologyParent` names M; M has no topology
+parent. This is the Main-proxy specimen, not an inferred spawn edge. D spawns
+K and H so their original ancestry names D. Record `list` before changes.
+Use public PO association and role setup (`session-po-set --session <key>
+--po-role <test PO role> --key <unique>`) where required for the existing
+admission contract; no raw fixture writes.
+
+U creates W and sets `work-item-update <W> --delivery-owner <D>`. D opens H's
+single test assignment on W. As D through its session workdir, run
+`session-reparent --session <H> --parent <K> --assignment <A> --key <unique>`.
+Require the returned origin parent/opener still name D and the current parent
+and `currentCoordinationParentRef` name K. `list` agrees, while H's
+`spawnedBy`, owner, assignment holder and work-item ID remain unchanged.
+Read `session_reparent_events` by returned event ID: `principalKind` is
+`session`, `principalRef` names D and `cause` is `delivery_owner_reparent`.
+Repeat the exact key/request as D and require the same event, not a second
+transfer. An unrelated session cannot perform this transfer; retain its
+no-write refusal. Scope/cycle permutations stay in `test/session_reparent_test.exs`.
+
+Before H's terminal event, U changes W's direct owner to N and reads it back.
+D is not also a delegated opener with a separate still-open lane assignment
+on W; the supported delegated-opener priority is not stale-owner duplication.
+Have H finish its actual bounded test assignment with the required genuine
+verification/review evidence, or use a completed coordination fixture whose
+admission requires none of that code evidence. Read the terminal source attest,
+W's trace and recipient transcripts/notice wakes. Require the notice for that
+source to name/reach N once and no corresponding notice to stale owner D.
+If recipient execution is unavailable, record routed wake and missing delivery
+separately. Re-read to confirm one source notice. Owner replacement does not
+rewrite A's original opener, H's holder or spawn provenance.
+
+Finally clear W's owner link and read null. On a separate inactive fixture,
+retain unknown-owner and retired-owner no-write refusals (`unknown_delivery_owner`
+and `delivery_owner_unavailable`). Source cases remain in
+`test/delivery_responsibilities_test.exs` and `test/topology_parent_test.exs`.
+
+## Sentinel and PR
+
+Use one authorized disposable repository and one PR with real required checks
+and a merge queue available for its disposable target branch. Repository
+mutation/landing authority and test GitHub credentials are prerequisites;
+this runbook grants neither. Record the repository, branch, PR, head and
+checks. Missing queue support leaves settlement/landing evidence `skipped`
+even if checks-completed succeeds; do not use a production PR to fill it.
+
+Before learning the bundle, inspect `sentinel list`; enabling an unlearned
+landing watcher refuses `kungfu_not_learned` or `unknown_sentinel`. Learn
+`agentic-engineering`, inspect `kungfu setup agentic-engineering` and
+`sentinel list`, and require disabled state plus missing `GH_CONFIG_DIR` and
+`LANDING_REPOS`. Enable while those settings are absent: require
+`sentinel_settings_missing` and no owned watcher process.
+
+Set the real test `GH_CONFIG_DIR` and a single `LANDING_REPOS` entry
+`<owner>/<repo>@<disposable branch>=<test owner role>` with
+`host-env-set --sentinel agentic-engineering/landing-watch NAME=VALUE`.
+`host-env-list --sentinel agentic-engineering/landing-watch` shows setting
+names with values withheld. Ensure the sentinel's CLI resolves to the same
+verified package and only this fresh test gateway; record that binding before
+enabling it. Run `sentinel enable agentic-engineering/landing-watch` as the
+test admin and record its owned process identity.
+
+Before the PR's checks finish, have two eligible sessions owned by distinct
+test users each register `wake --session <self> --when-fact pr.checks-completed
+--when-scope <owner>/<repo>#<n> --fallback-after 2h --prompt <unique>`.
+Register a third subscription on a different PR scope. After actual checks
+finish, require one process-filed fact with lowercased scope and key
+`pr-checks:<scope>:<head>:<outcome>`. Both owners' subscriptions fire by
+`condition` for that same fact; the wrong-scope control stays pending.
+Inspect actual wake and turn records. Fallback wakes prove no condition.
+
+Before queueing the same PR, register settlement subscriptions on
+`landing.settled` with its same scope. Use the authorized ordinary queue/merge
+route. Observe the real queue settlement/landing and the watcher's fact, with
+its actual source key such as `landing-fact:<scope>:merged:<merge SHA>`;
+require the merge SHA matches the repository's public readback and both
+eligible subscribers fire once. A removed queue entry or closed PR has its
+own truthful settlement outcome and is not a merged result. Record whichever
+actually occurred; do not force fail/rerun/restart permutations.
+
+Run `sentinel disable agentic-engineering/landing-watch`. Require disabled
+state and the previously recorded owned process stopped, without affecting
+another process. Unset only the two test-owned settings and cancel the pending
+wrong-scope subscriptions. Source watcher tests own red/green/rerun/restart
+cases; `test/wakes_test.exs` retains owned-fact isolation. This is also the
+provider sentinel row's evidence; do not start a second watcher lifecycle.
