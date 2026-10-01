@@ -737,8 +737,10 @@ defmodule Tightbeam.Wire.RouterTest do
   test "other health review and evidence cross agent dispatch with their existing authorization",
        ctx do
     owner = ctx.device.user_id
-    source = create_session(ctx.db, "health-wire-source", owner, is_built_in: true)
-    stranger = create_session(ctx.db, "health-wire-stranger", owner, is_built_in: true)
+    source = create_session(ctx.db, "health-wire-source", owner)
+    stranger = create_session(ctx.db, "health-wire-stranger", owner)
+    Roles.create!(ctx.db, "coder:health-wire-source", owner, source.session_key)
+    Roles.create!(ctx.db, "coder:health-wire-stranger", owner, stranger.session_key)
     at = System.system_time(:millisecond)
 
     assert {:opened, incident} =
@@ -764,10 +766,15 @@ defmodule Tightbeam.Wire.RouterTest do
 
     ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, Gateway.handlers(%{db: ctx.db}))}
 
-    evidence = %{verb: "harness-health-evidence-other", params: %{incidentId: incident.id}}
+    evidence = %{
+      verb: "harness-health-evidence-other",
+      as: "coder:health-wire-source",
+      params: %{incidentId: incident.id}
+    }
 
     review = %{
       verb: "harness-health-review-other",
+      as: "coder:health-wire-source",
       params: %{
         incidentId: incident.id,
         outcome: "confirmed_other",
@@ -777,7 +784,9 @@ defmodule Tightbeam.Wire.RouterTest do
     }
 
     for body <- [evidence, review] do
-      refused = dispatch_cli(ctx, stranger.cli_token, body)
+      refused =
+        dispatch_cli(ctx, stranger.cli_token, %{body | as: "coder:health-wire-stranger"})
+
       assert refused.status == 403
       assert JSON.decode!(refused.resp_body)["error"]["code"] == "not_authorized"
     end
@@ -796,7 +805,13 @@ defmodule Tightbeam.Wire.RouterTest do
     assert reviewed.status == 200
     assert JSON.decode!(reviewed.resp_body)["result"]["review"]["outcome"] == "confirmed_other"
 
-    internal = dispatch_cli(ctx, source.cli_token, %{verb: "repair-assignment", params: %{}})
+    internal =
+      dispatch_cli(ctx, source.cli_token, %{
+        verb: "repair-assignment",
+        as: "coder:health-wire-source",
+        params: %{}
+      })
+
     assert internal.status == 400
     assert JSON.decode!(internal.resp_body)["error"]["code"] == "invalid_message"
   end
