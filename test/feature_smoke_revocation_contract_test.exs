@@ -14,7 +14,8 @@ defmodule Tightbeam.FeatureSmokeRevocationContractTest do
           {node, calls}
       end)
 
-    assert length(calls) == 3
+    # The cannot-proceed duplicate moved to its decisions-runbook owner.
+    assert length(calls) == 2
 
     reasons =
       Enum.map(calls, fn fields ->
@@ -27,7 +28,6 @@ defmodule Tightbeam.FeatureSmokeRevocationContractTest do
       end)
 
     expected_reasons = [
-      "smoke opener disposed the blocked card",
       "Effort smoke replaces the first assignment to verify request supersession",
       "Effort smoke completed the replacement assignment checks"
     ]
@@ -53,8 +53,7 @@ defmodule Tightbeam.FeatureSmokeRevocationContractTest do
           {node, scopes}
       end)
 
-    assert Enum.sort(revocation_scopes) ==
-             Enum.sort([:check_cannot_proceed_to_opener, :check_effort_without_effect])
+    assert Enum.sort(revocation_scopes) == [:check_effort_without_effect]
 
     refute String.contains?(source, "sweep_open_work_items")
     refute String.contains?(source, "clear_previous_leg_work_items")
