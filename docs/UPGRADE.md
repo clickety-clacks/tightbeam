@@ -10,8 +10,8 @@ feature checks. The aggregate order and feature-area runbooks are in
 [docs/e2e/0.1.9/README.md](e2e/0.1.9/README.md). Do not use this rehearsal as
 permission to point a command at a live base.
 
-For source-lineage context, canonical tag `v0.1.8+1337` (build 1337,
-`fdb3db53b596d4114d06505b39a4c1836fba7564`) writes
+For source-lineage context, canonical tag `v0.1.8+1343` (build 1343,
+`b2add64414b41606a713ed284abf01a0b4d125e6`, the release Gibson runs) writes
 `operator-decision-requests-v1`, which current 0.1.9 names as a predecessor.
 This is a verified reference lineage, not presumed provenance for a later real
 0.1.8 database. The actual snapshot's manifest must establish its source tag,

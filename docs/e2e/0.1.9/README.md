@@ -11,7 +11,8 @@ feature check never repeats the migration and never changes the preserved copy.
 
 | Runbook | What it covers | Starts from |
 |---|---|---|
-| [migration.md](migration.md) | 0.1.8 to 0.1.9 migration, build admission (`TIGHTBEAM_LIVE_BASE_TRANSITION`), preservation reads, reusable output | A verified copy of a real 0.1.8 `state.db` |
+| [PREFLIGHT.md](PREFLIGHT.md) | Readiness: every prerequisite classified, what is missing and who supplies it | Nothing; read it first |
+| [migration.md](migration.md) | 0.1.8 to 0.1.9 migration, package acquisition and kind, build admission (`TIGHTBEAM_LIVE_BASE_TRANSITION` or release provenance), preservation reads, reusable output | A verified copy of a real 0.1.8 `state.db` |
 | [gateway-surface.md](gateway-surface.md) | Gateway shim verbs, stop isolation, REST authentication and D1 reads, CLI transport diagnostics | Fresh empty bases, plus one migrated copy |
 | [provider-runtime.md](provider-runtime.md) | Identity, harness control, sentinels, session connection, shipped guidance | Migrated copy (offline) or fresh base (online) |
 | [work-routing.md](work-routing.md) | Work-item fields and body, delivery owner, successors, topology, wakes and dependency waits, conditions, landing watcher | Migrated copy (offline) or fresh base (online) |
@@ -211,7 +212,9 @@ sha256() { if command -v sha256sum >/dev/null; then sha256sum "$1"; else shasum 
    fi
    ```
 
-   Any printed line fails the condition.
+   Any printed line fails the condition. A container runtime's own bind mounts
+   of `/etc/hosts`, `/etc/hostname` and `/etc/resolv.conf` are expected and do
+   not fail it; anything else from the host does.
 
 3. **No host control.** No container runtime, systemd, D-Bus, tmux or SSH-agent
    socket is reachable, and every Unix socket lives in scratch. The process list
@@ -294,6 +297,42 @@ Copied rows are not sanitized. They hold real bearer tokens and host routes;
 isolation does not revoke those tokens, and condition 4 only keeps them from
 reaching anything outside the copy. Never show, export or log them. Remove each area copy after its runbook finishes, keep the migrated
 output, and discard the environment at the end.
+
+### Reference environment
+
+<a id="reference-environment"></a>
+
+The six conditions describe the environment; this is one way to build it that
+satisfies them, on a Linux host with Docker. The approval for the run names
+the image ID, and the container is started by that ID, not by a tag that can
+move. Nothing here touches the host's own Tightbeam base.
+
+```Dockerfile
+FROM ubuntu:24.04
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl git sqlite3 python3 procps findutils libssl3 libncurses6 nodejs npm \
+    && npm install -g @anthropic-ai/claude-code @openai/codex \
+    && rm -rf /var/lib/apt/lists/*
+RUN useradd -m -u 10001 e2e
+USER e2e
+```
+
+```sh
+docker build -t tightbeam-e2e:0.1.9 -f Dockerfile .
+image_id="$(docker image inspect --format '{{.Id}}' tightbeam-e2e:0.1.9)"   # sha256:…, record this
+docker run --rm -it --network none --hostname e2e \
+  -v "/host/source-dir:/source:ro" -v "/host/scratch:/scratch" \
+  -e SOURCE_DIR=/source -e SCRATCH=/scratch -e HOME=/scratch/home \
+  "$image_id" bash
+```
+
+Inside: `mkdir -p "$HOME"`, extract the package into `$SCRATCH/pkg` and set
+`PKG="$SCRATCH/pkg/tightbeam"`, then run the six checks above before anything
+else. The harness CLIs are installed and have never been logged in, which is
+what condition 5 and the boot preflight need. `/host/source-dir` holds the
+[source snapshot](migration.md#source-snapshot) files, the 0.1.9 package, its
+`SHA256SUMS` and the candidate checkout; `/host/scratch` must have room for
+three copies of the database.
 
 ## Tiers
 
