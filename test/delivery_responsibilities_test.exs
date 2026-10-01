@@ -308,9 +308,6 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
     child = assign(db, {:session, "lane-a"}, "worker-a", "wi_a1")
     assert DeliveryResponsibilities.responsibility(db, "worker-a", "wi_a1") == "delegated"
 
-    assert %{code: "delivery_delegation_retired"} =
-             assign(db, {:session, "pdo-a"}, "lane-b", "wi_a1", delegates_delivery: true)
-
     close_assignment(db, lane.id, "pdo-a")
 
     assert DeliveryResponsibilities.responsibility(db, "lane-a", "wi_a1") == "none"
@@ -761,18 +758,7 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
     assert %{code: "work_item_required"} = spoofed
   end
 
-  test "retired verbs refuse clearly and new stores do not create a second ledger", %{db: db} do
-    for verb <- [
-          "work-item-delivery-scope-set",
-          "delivery-scope-owner-set",
-          "delivery-responsibility-get"
-        ] do
-      assert %{code: "delivery_operation_retired", message: message} =
-               DeliveryResponsibilities.handle(db, %{verb: verb})
-
-      assert message =~ "work-item-update --delivery-owner"
-    end
-
+  test "unlinked stores have no recipient or second delivery ledger", %{db: db} do
     assert {:ok, nil} =
              DB.transaction(db, fn txn ->
                DeliveryResponsibilities.current_accountable_recipient_in_txn(
@@ -813,7 +799,7 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
 
     params =
       Enum.reduce(
-        [:delivery_owner_ref, :delivery_owner_session_key, :delegates_delivery],
+        [:delivery_owner_ref, :delivery_owner_session_key],
         params,
         fn key, acc ->
           if Keyword.has_key?(options, key),
