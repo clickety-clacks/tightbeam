@@ -321,7 +321,12 @@ operator input for one start; it does not isolate anything.
 PKG="${PKG:?}"
 target_source_commit="replace-with-full-source-commit-from-package-provenance"
 target_source_checkout="/operator-supplied/verified-0.1.9/source"
-git -C "$target_source_checkout" merge-base --is-ancestor \
+# The checkout is a read-only bind mount owned by the host user, and this shell
+# runs as the image user, so git refuses it as "dubious ownership" unless the
+# directory is marked safe for this one command. Scope the setting to the
+# command; never write it into the mounted checkout.
+GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0="$target_source_checkout" \
+  git -C "$target_source_checkout" merge-base --is-ancestor \
   1265b3c894356755d46bc1fd143aeab5be2c873c "$target_source_commit"
 target_payload_root="$(python3 - "$PKG" <<'PY'
 from pathlib import Path
