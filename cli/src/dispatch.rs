@@ -349,11 +349,10 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
                 string_field("incidentId", incident_id),
                 string_field("outcome", outcome),
             ];
-            for (name, value) in [("namedClass", named_class), ("cause", cause)] {
-                if let Some(value) = value {
-                    params.push(string_field(name, value));
-                }
+            if let Some(value) = named_class {
+                params.push(string_field("namedClass", value));
             }
+            params.push(string_field("cause", cause));
             params.push(string_field("idempotencyKey", idempotency_key));
             Ok(request(
                 identity,

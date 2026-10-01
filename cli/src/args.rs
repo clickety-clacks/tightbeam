@@ -123,7 +123,7 @@ pub enum Command {
         incident_id: String,
         outcome: String,
         named_class: Option<String>,
-        cause: Option<String>,
+        cause: String,
         idempotency_key: String,
     },
     HarnessHealthClosePromotion {
@@ -699,8 +699,9 @@ COMMANDS:
       --recovery-condition <text> --cause <text>
       Record a PROVEN recovery observation for an open other incident.
   harness-health-review-other <incidentId>
-      --outcome confirmed_other|reclassified|promotion_required
-      Close the mandatory review for an other incident.
+      --outcome confirmed_other|reclassified|promotion_required [--named-class <class>]
+      --cause <text> --key <idempotencyKey>
+      Close the mandatory review for an other incident with a nonblank reason.
   harness-health-close-promotion <promotionId> --named-class <class>
       --spec-artifact <artifactId> --review-artifact <artifactId>
       --review-attest <attestId> --review-assignment <assignmentId> --candidate-commit <commit> --key <idempotencyKey>
@@ -1999,7 +2000,7 @@ fn parse_with_optional_catalog(
             if parsed.positional.len() != 2
                 || flags.keys().any(|flag| !allowed.contains(&flag.as_str()))
             {
-                return Err("usage: tightbeam harness-health-review-other <incidentId> --outcome confirmed_other|reclassified|promotion_required [--named-class <class>] [--cause <text>] --key <idempotencyKey>".to_owned());
+                return Err("usage: tightbeam harness-health-review-other <incidentId> --outcome confirmed_other|reclassified|promotion_required [--named-class <class>] --cause <text> --key <idempotencyKey>".to_owned());
             }
             let outcome =
                 nonempty(flags, "outcome").ok_or_else(|| "--outcome is required".to_owned())?;
@@ -2014,7 +2015,11 @@ fn parse_with_optional_catalog(
                 incident_id: parsed.positional[1].clone(),
                 outcome,
                 named_class: nonempty(flags, "named-class"),
-                cause: nonempty(flags, "cause"),
+                cause: flags
+                    .get("cause")
+                    .filter(|value| !value.trim().is_empty())
+                    .cloned()
+                    .ok_or_else(|| "--cause is required and must be nonblank".to_owned())?,
                 idempotency_key: nonempty(flags, "key")
                     .ok_or_else(|| "--key is required".to_owned())?,
             })
@@ -3754,6 +3759,58 @@ mod tests {
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn harness_health_review_other_requires_nonblank_cause_and_sends_it() {
+        for outcome in ["confirmed_other", "reclassified", "promotion_required"] {
+            let required = [
+                "harness-health-review-other",
+                "hh_example",
+                "--outcome",
+                outcome,
+                "--key",
+                "review-1",
+            ];
+            for cause in [None, Some(""), Some(" \t ")] {
+                let mut args = required.to_vec();
+                if let Some(cause) = cause {
+                    args.extend(["--cause", cause]);
+                }
+                let error = parse(strings(&args)).unwrap_err();
+                assert!(error.contains("--cause"), "{error}");
+            }
+
+            let mut args = required.to_vec();
+            args.extend(["--cause", "  review judgment  "]);
+            let command = parse(strings(&args)).unwrap();
+            assert!(matches!(
+                &command,
+                Command::HarnessHealthReviewOther { cause, .. } if cause == "  review judgment  "
+            ));
+            let request = crate::dispatch::build_request(&command).unwrap();
+            assert_eq!(request.path, "/agent/dispatch");
+            let body: serde_json::Value = serde_json::from_str(&request.body_json).unwrap();
+            assert_eq!(body["verb"], "harness-health-review-other");
+            assert_eq!(body["params"]["outcome"], outcome);
+            assert_eq!(body["params"]["cause"], "  review judgment  ");
+            assert_eq!(body["params"]["idempotencyKey"], "review-1");
+            assert_eq!(
+                crate::dispatch::build_request(&command).unwrap().body_json,
+                request.body_json
+            );
+        }
+
+        for help in [
+            render_help(None),
+            render_command_help(None, "harness-health-review-other").unwrap(),
+        ] {
+            assert!(help.contains(
+                "--outcome confirmed_other|reclassified|promotion_required [--named-class <class>]"
+            ));
+            assert!(help.contains("--cause <text> --key <idempotencyKey>"));
+            assert!(help.contains("nonblank reason"));
+        }
     }
 
     #[test]
