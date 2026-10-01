@@ -176,9 +176,11 @@ env_name="RUNBOOK_D1_REDACTION_$(date +%s)_$$"
 The following probe reads only the fresh gateway descriptor and the fresh
 non-admin session marker, holds bearers/responses in memory, and prints only
 assertion results. Run without shell tracing. Supply the recorded marker path,
-not an arbitrary path found on the host. It checks an existing admin resource
-before requiring its non-admin denial, avoiding a meaningless missing-object
-404. The shipped denial for this detail is `404 not_found`, not `403`.
+not an arbitrary path found on the host. It checks the existing test admin's
+user detail before requiring its non-admin denial, avoiding an unseeded config
+detail or a meaningless missing-object 404. Hosts collection visibility allows
+an empty list: the local gateway host need not have a persisted registration.
+The shipped denial for the user detail is `404 not_found`, not `403`.
 
 ```sh
 (
@@ -191,7 +193,7 @@ python3 - "$AREA_BASE/gateway.json" "$AREA_PORT" "$test_admin" \
   "$reader_workdir/.tightbeam-session" "$test_host" "$test_harness" "$env_name" <<'PY'
 import json, sys
 from urllib.error import HTTPError
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from urllib.request import ProxyHandler, Request, build_opener
 
 descriptor, port, admin, marker, host, harness, name = sys.argv[1:]
@@ -211,12 +213,14 @@ def get(path, bearer):
     return response.code, json.loads(response.read())
 
 admin_query = "?" + urlencode({"asUser": admin})
-status, existing = get("/api/config/default-archetype" + admin_query, admin_token)
-assert status == 200 and existing["schemaVersion"] == 1
+admin_detail = "/api/users/" + quote(admin, safe="")
+status, existing = get(admin_detail + admin_query, admin_token)
+assert status == 200 and existing["schemaVersion"] == 1 and existing["resource"] == "users"
+assert existing["item"]["userId"] == admin and existing["item"]["isAdmin"] is True
 status, hosts = get("/api/hosts", reader_token)
 assert status == 200 and hosts["resource"] == "hosts" and hosts["schemaVersion"] == 1
-assert any(row["host"] == host for row in hosts["items"])
-status, denied = get("/api/config/default-archetype", reader_token)
+assert isinstance(hosts["items"], list)
+status, denied = get(admin_detail, reader_token)
 assert status == 404 and denied["error"]["code"] == "not_found"
 status, environment = get("/api/host-env" + admin_query, admin_token)
 assert status == 200 and environment["schemaVersion"] == 1

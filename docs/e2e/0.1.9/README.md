@@ -76,8 +76,10 @@ tb() { TIGHTBEAM_BASE_DIR="${AREA_BASE:?}" "${PKG:?}/bin/tightbeam" "$@"; }
 Use a separately authorized empty base with the same verified package and the
 CLI shell above. Record its test admin, admitted local host, test owner(s),
 session keys and workdirs. Create users with `add-user`, and sessions with
-`spawn --name <unique-role> --archetype <admitted-role> --harness <harness>
---model <catalog-model>`, using the actual catalog and admission constraints.
+`spawn --display <test-display-name> --name <unique-role>
+--archetype <admitted-role> --harness <harness> --model <catalog-model>`, using
+the actual catalog and admission constraints. `--display` is required;
+`--name` supplies the optional role handle.
 Never insert fixture rows in the database or copy a live session/token into
 this base. A missing admitted actor is `INCOMPLETE` with the refused operation;
 it does not authorize relaxing admission.

@@ -40,7 +40,8 @@ check it.
 ## Queue correction
 
 Use admitted test sessions O (opener), H (holder) and C (different sender), and
-an area item. Let H start a harmless bounded task on assignment A opened by O.
+an area item W. O dispatches a harmless bounded task to H on assignment A.
+Fixture briefs leave assignments open for the opener's cleanup after checks.
 Record the actual running turn sequence and assignment attribution. Do not
 freeze a lane or edit turn rows to hold this window. If the task ends before
 the observations below, record the missed running/queued prerequisite and
@@ -50,37 +51,50 @@ While A's turn is running:
 
 1. O uses `dispatch --to <H> --work-item <W> --subject <fixture>
    --brief "INITIAL <nonce>" --key <unique>` to open assignment B. Confirm
-   its initial prompt is still queued. O sends one ordinary wake to H on B,
-   `wake --session <H> --assignment <B> --prompt "OLDER <nonce>"`. Save both
-   wake/message IDs. This is the two-message window reused by the telemetry
-   queue-summary row; read it now if that row is selected.
+   its initial prompt is still queued. C sends the ordinary control
+   `wake --session <H> --prompt "CONTROL <nonce>: reply with this nonce"`,
+   without `--assignment`. Require exactly these two queued turns and record
+   their source IDs, enqueue times and origins. Read the telemetry queue
+   summary for B now if selected: only INITIAL is attributed to B, so that
+   summary counts one turn, excluding C's unbound control.
 2. O sends `wake --session <H> --assignment <B> --replace-queued
    --prompt "CORRECTION <nonce>: reply with this nonce"`. Read H's turn
-   records: both older same-sender queued messages, including the dispatch,
-   are canceled with `queued-message-suppressed: sender_requested_replacement`.
+   records: B's INITIAL dispatch is canceled with
+   `queued-message-suppressed: sender_requested_replacement`; C's ordinary
+   control stays queued. An ordinary wake is not replacement consent.
    Read the `queued_message_suppressed` audit and retain the original message
    contents/IDs. A's running turn remains running.
-3. C sends an ordinary control wake to H. O sends a newer correction on B
-   with `--replace-queued` and a new nonce. Require the prior correction to be
-   canceled and C's control to remain queued. Let this bounded task finish and
-   the two surviving messages drain once in their recorded order. A different
-   sender's earlier queue position is preserved; do not demand overtaking.
-4. Still in the same session H and assignment B, start one bounded harmless
-   continuation and observe it running. With no surviving control ahead of it,
-   O queues an older correction and then the final correction using
-   `--replace-queued`. Require the older one canceled and the final one queued.
-   As a non-opener, try `assignment-stop-turn <B> --reason <fixture reason>`;
+3. O sends a newer correction using the same B-bound `--replace-queued`
+   command and a new nonce. Require the prior replacement-consenting
+   correction to be canceled and C's control to remain queued. Let A's bounded
+   task finish and the two surviving messages drain once in recorded order:
+   C's control, then the newest correction. Preserve that earlier queue
+   position; do not demand that a correction overtake another sender.
+4. Still in H, O dispatches one bounded harmless task on a new assignment D
+   under W. Observe its initial dispatch turn running and attributed to D.
+   A replacement wake scopes suppression but does not stamp its turn with an
+   assignment; it cannot supply this attributed running-turn prerequisite.
+   With no surviving control ahead of it, O sends
+   `wake --session <H> --assignment <D> --replace-queued
+   --prompt "OLDER <nonce>"`, then another such `--replace-queued` wake with
+   the final correction and a fresh nonce. Require OLDER canceled and the
+   final correction queued. Both correction wakes explicitly consent to
+   replacement; do not use an ordinary wake for OLDER.
+   As a non-opener, try `assignment-stop-turn <D> --reason <fixture reason>`;
    require `not_authorized` and no change. As O, run that stop once. Its result
-   names B, H, the exact current `turn_seq` and `acp_cancel`. That turn becomes
-   `canceled` with `assignment-opener-stop`; `assignment_turn_stopped` in the
-   private event log records O's actor and the exact reason. The final queued
-   correction is unchanged by the stop.
-5. Require that final correction to run next and produce its nonce reply in H,
-   with B's assignment and W's work lineage. All suppressed INITIAL, OLDER and
+   names D, H, the exact current `turnSeq` and `acpCancel`. That turn becomes
+   `canceled`; its lifecycle event records cause `assignment-opener-stop`.
+   The `assignment_turn_stopped` lifecycle event records O's actor and exact
+   reason. The final queued correction is unchanged by the stop.
+5. Require that final correction to run next and produce its nonce reply in H.
+   Tie its wake ID to D through `queued_message_replacement_requests` and D
+   to W through the assignment record; do not claim automatic turn attribution
+   from a replacement request. All suppressed INITIAL, OLDER and
    replaced correction messages remain readable but never execute. C's
    previously preserved control has exactly one delivered turn. Record the
    actual sequences and terminal results, not only accepted wakes. The second
    bounded window isolates stop/resume ordering without discarding C's message.
+   Dispose all three fixture assignments with recorded reasons after the checks.
 
 The decisions stop row cites this result. `test/queued_message_suppression_test.exs`
 owns clock-regression/retry ordering and the wider protected-traffic matrix;

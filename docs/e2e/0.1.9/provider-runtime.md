@@ -24,25 +24,41 @@ is in [work-routing.md](work-routing.md#landing-watcher).
 | Harness-health authorization | Fresh / records | As a non-admin test session call `harness-health-review-other hh_runbook-unknown --outcome confirmed_other --key <unique>` and `harness-health-evidence-other hh_runbook-unknown`. | `not_authorized`, `evidence_not_found`, and no incident created. Invalid enums remain in CLI tests. |
 | <a id="sign-in-recovery-wake"></a>Sign-in recovery wake | Online, operator at keyboard | Complete one authorized subscription `onboard openai` or `onboard anthropic`, then inspect that user's Main turns. | Exactly one recovery wake to that user. API-key-negative/provider failure cases remain in `test/oauth_recovery_wake_test.exs`; no second login ceremony. |
 | <a id="local-openai"></a>Pi boundary (#47/#106; U1) | Conditional online | Onboard one authorized Pi provider, record its catalog model, then follow [real tool boundary](#real-tool-boundary). | Real allowed tool, before-execution denial with absent effect, recorded provider/model and clean closure. One journey covers both PRs. |
-| <a id="cursor-leg"></a>Cursor boundary (#31; U1) | Conditional online | With test credentials and Cursor's existing dedicated execution identity, follow [real tool boundary](#real-tool-boundary) locally on the gateway host. | Real allow/deny and non-execution, plus observed UID matching the dedicated account. Prompt/reply alone is insufficient. |
+| <a id="cursor-leg"></a>Cursor boundary (#31; U1) | Conditional online; deny gap | With test credentials and Cursor's existing dedicated execution identity, follow the allowed-tool/UID portion of [real tool boundary](#real-tool-boundary) locally on the gateway host. | Record `skipped: no probe gate on Cursor` for the boundary row; keep any actual allowed-call/UID evidence separately. It does not establish the deny/non-execution half. |
 | <a id="provider-recovery"></a>Provider recovery (U7) | Conditional incidents | Follow [provider recovery evidence](#provider-recovery-evidence). | Each incident retains its own prerequisite, public outcome and missing-evidence status. |
 
 ## Identity and composed guidance
 
 Learn `agentic-engineering` on the fresh base and record `identity status`'s
-`live_revision`. Preserve original test guidance/manifest bytes. Through
-`identity edit default --file <scratch-file>`, add one inert fixture comment,
-read the published bytes, then restore through the same seam. Repeat with
-`--manifest` and a TOML comment. Put one unelected inert test skill with
-`--skill <unique> --file <scratch-file>`, inspect it, then remove it with
-`--skill <unique> --rm`. These are temporary test mutations, not live guidance.
-Verify original bytes and absence of the skill after cleanup, including on
-failure. Run `identity relearn`, retaining its actual publication/conflict
+`live_revision`. Before editing, verify that this test base already contains
+`identity/guidance/coder.md` and `identity/archetypes/coder.toml`, whose guidance
+includes `coder.md`. Save both original files byte-for-byte in private scratch
+outside the identity repository and record their digests. A missing fragment
+or include is a setup gap; do not create an unreferenced guidance file.
+
+Append one unique inert fixture comment to a scratch copy of the guidance,
+then publish it with `identity edit coder --file <edited-guidance-copy>`.
+Require the published fragment and `identity status coder`'s composed guidance
+to contain that comment. Restore through `identity edit coder --file
+<original-guidance-copy>`; require the original file digest and absence of the
+comment from composed guidance. Repeat with a TOML comment in a scratch copy
+of the existing coder manifest using `identity edit coder --manifest --file
+<edited-manifest-copy>`, then restore using the untouched original manifest
+copy and verify its digest. Keep these restoration copies until cleanup is
+verified, including after any failed step; unresolved restoration stops the
+journey and remains an incomplete cleanup result.
+
+Choose an unelected test skill name absent from this base. Put it with
+`identity edit coder --skill <unique> --file <scratch-skill-file>`, inspect it,
+then remove it with `identity edit coder --skill <unique> --rm`. Verify absence
+after cleanup, including on failure. These are temporary mutations of test
+fixtures only. Run `identity relearn`, retaining its actual publication/conflict
 result; conflict is not successful publication.
 
-Apply to one active test session, then read status: `applied` names it,
-`identity_revision` equals `live_revision`, and `identity_stale` is false with
-expected revision/render/digest fields. Applying to an already-retired test
+Apply to one active test session; the apply response's `applied` names it.
+Then read status: `identity_revision` equals `live_revision`, and
+`identity_stale` is false with expected revision/render/digest fields.
+Applying to an already-retired test
 session refuses `not_found`. Host/admission failures are setup gaps.
 
 Read `identity status pdo`, `identity status reviewer-code` and `identity
@@ -86,8 +102,10 @@ From S's own satellite workdir, with stdin held open, run:
 "$PKG/bin/tightbeam" session-connect --session "$session_key"
 ```
 
-Keep output in private scratch. Require `connection`, `snapshot.begin`, items,
-matching `snapshot.end`, then `ready` for S. Send one line:
+Keep output in private scratch. Require `snapshot.begin`, `snapshot.item`
+frames, matching `snapshot.end`, then `ready` for S. A fresh invocation has no
+leading `connection` frame; that frame reports `state: reconnecting` after an
+existing worker connection closes. Send one line:
 
 ```json
 {"type":"send","protocolVersion":1,"requestId":"rb-satellite-1","content":"Reply with SATELLITE-ONE <nonce>","idempotencyKey":"rb-satellite-1-<nonce>"}
@@ -180,13 +198,22 @@ as `printf 'ALLOW-<nonce>\n'; id -u`. Require actual tool arguments, successful
 result and UID; Cursor's UID matches the configured dedicated execution
 account, not the gateway user. Do not create an OS account to pass.
 
-Next request `touch <absolute test scratch>/must-not-exist; echo tightbeam-gate-probe`.
+For Pi only, next request `touch <absolute test scratch>/must-not-exist; echo tightbeam-gate-probe`.
 The only possible side effect is this inert file in its own workspace.
 Establish absence before the call. The existing reserved `tightbeam-probe`
 gate matches it. Require an actual tool attempt, gate denial and the file
 still absent afterward. A model merely declining to call the tool leaves
 boundary evidence missing. Never disable the gate or supply a synthetic
-response. Dispose its test assignment and close the session normally,
+response.
+
+Cursor's shipped rails do not include this probe gate. Record the Cursor
+boundary row `skipped: no probe gate on Cursor`, with the missing deny and
+non-execution evidence named. Keep its allowed-call/UID observations separately;
+they do not make the full boundary pass. Do not send the Pi denial command to
+Cursor or add a gate to manufacture this outcome. The Cursor source test adds
+a probe explicitly and does not establish that shipped sessions carry it.
+
+For each tested session, dispose its assignment and close it normally,
 recording terminal state/cleanup and preserving artifacts.
 
 Provider-selection, process-instance, race and local-only permutations remain
