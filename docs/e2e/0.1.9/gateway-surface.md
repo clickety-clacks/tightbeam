@@ -155,6 +155,88 @@ Pass: the probe exits 0 and prints its final line. An unauthenticated
 every response is `no-store`, and an unknown filter is `400 invalid_filter`.
 `gateway_stop` then stops the area gateway; delete its base afterwards.
 
+### Non-admin authorization and redaction (U10)
+
+Run this paired case on a fresh test base, using the
+[fresh-base actors](README.md#fresh-base-actors). Reuse the endpoint/envelope
+assertions above; do not repeat all six collections. Create one non-admin
+test user with `add-user <unique>` (no `--admin`) and an admitted local session
+owned by that user. Record its user, session key and workdir. Verify the
+user's `isAdmin` is false and that the marker belongs to this fresh base.
+No copied session token is needed.
+
+Choose a unique harmless environment name for the admitted local test host
+and harness. The paired probe below sets it as the test admin and removes it
+on success, failure or interruption:
+
+```sh
+env_name="RUNBOOK_D1_REDACTION_$(date +%s)_$$"
+```
+
+The following probe reads only the fresh gateway descriptor and the fresh
+non-admin session marker, holds bearers/responses in memory, and prints only
+assertion results. Run without shell tracing. Supply the recorded marker path,
+not an arbitrary path found on the host. It checks the existing test admin's
+user detail before requiring its non-admin denial, avoiding an unseeded config
+detail or a meaningless missing-object 404. Hosts collection visibility allows
+an empty list: the local gateway host need not have a persisted registration.
+The shipped denial for the user detail is `404 not_found`, not `403`.
+
+```sh
+(
+trap 'probe_status=$?; tb host-env-unset --host "$test_host" --harness "$test_harness" "$env_name" --as-user "$test_admin" || probe_status=1; exit "$probe_status"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+tb host-env-set --host "$test_host" --harness "$test_harness" \
+  "$env_name=runbook-private-value" --as-user "$test_admin" || exit 1
+python3 - "$AREA_BASE/gateway.json" "$AREA_PORT" "$test_admin" \
+  "$reader_workdir/.tightbeam-session" "$test_host" "$test_harness" "$env_name" <<'PY'
+import json, sys
+from urllib.error import HTTPError
+from urllib.parse import quote, urlencode
+from urllib.request import ProxyHandler, Request, build_opener
+
+descriptor, port, admin, marker, host, harness, name = sys.argv[1:]
+with open(descriptor, encoding="utf-8") as f:
+    admin_token = json.load(f)["cliToken"]
+with open(marker, encoding="utf-8") as f:
+    reader_token = json.load(f)["token"]
+base = f"http://127.0.0.1:{port}"
+opener = build_opener(ProxyHandler({}))
+
+def get(path, bearer):
+    try:
+        response = opener.open(Request(base + path, headers={"Authorization": f"Bearer {bearer}"}))
+    except HTTPError as error:
+        response = error
+    assert response.headers.get("Cache-Control") == "no-store"
+    return response.code, json.loads(response.read())
+
+admin_query = "?" + urlencode({"asUser": admin})
+admin_detail = "/api/users/" + quote(admin, safe="")
+status, existing = get(admin_detail + admin_query, admin_token)
+assert status == 200 and existing["schemaVersion"] == 1 and existing["resource"] == "users"
+assert existing["item"]["userId"] == admin and existing["item"]["isAdmin"] is True
+status, hosts = get("/api/hosts", reader_token)
+assert status == 200 and hosts["resource"] == "hosts" and hosts["schemaVersion"] == 1
+assert isinstance(hosts["items"], list)
+status, denied = get(admin_detail, reader_token)
+assert status == 404 and denied["error"]["code"] == "not_found"
+status, environment = get("/api/host-env" + admin_query, admin_token)
+assert status == 200 and environment["schemaVersion"] == 1
+rows = [r for r in environment["items"] if r["host"] == host and r["harness"] == harness and r["name"] == name]
+assert len(rows) == 1 and rows[0]["value"] is None and rows[0]["valuePresent"] is True
+assert "runbook-private-value" not in json.dumps(environment)
+print("D1 non-admin host visibility, admin-detail denial and value redaction checked")
+PY
+)
+```
+
+If cleanup itself fails, retain its refusal and finish the unset through the
+test admin before disposal. Do not export the raw response or bearer. Record the
+probe's outcome and dispose the test session through ordinary custody.
+Source visibility/filter permutations remain in `test/d1_read_test.exs`.
+
 ## CLI transport diagnostics
 
 <a id="cli-transport-diagnostics"></a>
