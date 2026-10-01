@@ -52,7 +52,7 @@ so nothing is a surprise), **one-time** (set up once, then reused), or
 
 | Prerequisite | Class | Where documented | Status |
 |---|---|---|---|
-| Build the candidate: push `release-candidate/<name>` at the exact 0.1.9 head, let `release candidate` run, download `release-candidate-proof-<sha>` | one-time per package | [Package acquisition](migration.md#package-acquisition) (added) | **Blocker.** No 0.1.9 candidate artifact exists. Owner: PDO. Action: run the workflow on the 0.1.9 head Mike names; the artifact keeps for 90 days. |
+| Build the candidate: branch `release-candidate/<name>` from the 0.1.9 head plus one empty marker commit (the workflow refuses an empty range), let `release candidate` run, download `release-candidate-proof-<sha>` | one-time per package | [Package acquisition](migration.md#package-acquisition) (added) | **Blocker.** No 0.1.9 candidate artifact exists. Owner: PDO. Action: run the workflow on the 0.1.9 head Mike names; the artifact keeps for 90 days. |
 | Verify the package against the proof `SHA256SUMS`, extract it, set `PKG` to the extracted `tightbeam/` directory | every run | migration.md source qualification | Ready once the artifact exists |
 | `target_source_commit` = the candidate SHA; `target_source_checkout` = a checkout of that SHA inside `SOURCE_DIR` | every run | migration.md build admission | Ready once the artifact exists |
 | Package kind check: `release-provenance.json` absent, so the explicit path applies | every run | migration.md package kind (added) | Ready |

@@ -304,7 +304,8 @@ output, and discard the environment at the end.
 
 The six conditions describe the environment; this is one way to build it that
 satisfies them, on a Linux host with Docker. The approval for the run names
-the image digest. Nothing here touches the host's own Tightbeam base.
+the image ID, and the container is started by that ID, not by a tag that can
+move. Nothing here touches the host's own Tightbeam base.
 
 ```Dockerfile
 FROM ubuntu:24.04
@@ -318,11 +319,11 @@ USER e2e
 
 ```sh
 docker build -t tightbeam-e2e:0.1.9 -f Dockerfile .
-docker image inspect --format '{{index .RepoDigests 0}}{{.Id}}' tightbeam-e2e:0.1.9   # record this
+image_id="$(docker image inspect --format '{{.Id}}' tightbeam-e2e:0.1.9)"   # sha256:…, record this
 docker run --rm -it --network none --hostname e2e \
   -v "/host/source-dir:/source:ro" -v "/host/scratch:/scratch" \
   -e SOURCE_DIR=/source -e SCRATCH=/scratch -e HOME=/scratch/home \
-  tightbeam-e2e:0.1.9 bash
+  "$image_id" bash
 ```
 
 Inside: `mkdir -p "$HOME"`, extract the package into `$SCRATCH/pkg` and set

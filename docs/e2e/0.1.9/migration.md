@@ -20,19 +20,40 @@ command at a live base, edit a schema stamp or marker, issue manual
 No published 0.1.9 release exists yet, so the package under test is a
 candidate built by the `release candidate` workflow:
 
-1. Push a branch named `release-candidate/<name>` at the exact 0.1.9 commit under
-   test. The workflow runs on that push (or by `workflow_dispatch` with the
-   branch and its 40-hex head).
+1. Create a branch named `release-candidate/<name>` from the 0.1.9 commit under
+   test. The workflow and `scripts/release_candidate.sh --check` refuse a branch
+   whose head equals the protected tip (an empty range), so add one empty marker
+   commit and verify that its tree is the tip's tree:
+
+   ```sh
+   git checkout -b "release-candidate/e2e-$(date -u +%Y%m%d)" <0.1.9 commit>
+   git commit --allow-empty -m "release candidate: E2E package marker for <0.1.9 commit>"
+   git diff --quiet <0.1.9 commit> HEAD && echo "tree unchanged"
+   git push origin HEAD
+   ```
+
+   The workflow runs on that push (or by `workflow_dispatch` with the branch
+   and its 40-hex head). The candidate SHA is the marker commit; the package it
+   builds is the 0.1.9 tree, and the gateway's `/version` sha will be the
+   marker's. Record both.
 2. When it succeeds it publishes one artifact,
    `release-candidate-proof-<sha>`, kept for 90 days. It holds
    `packages/linux/tightbeam-0.1.9-linux-x86_64-<short>.tgz`,
    `packages/darwin/…`, `toolchains/`, `release-candidate-manifest.json` and a
    `SHA256SUMS` over all of them. The proof artifact exists only if both test
    jobs and both package jobs passed.
-3. Copy the Linux package and `SHA256SUMS` into `SOURCE_DIR`. The
-   `expected_target_package_sha256` below is that file's line for the package.
-   Extract the package once; `PKG` is the extracted `tightbeam/` directory, which
-   holds `bin/`, `release/` and, for a published release only,
+3. Stage the Linux package under the exact name source qualification expects,
+   and take its digest from the proof's `SHA256SUMS`:
+
+   ```sh
+   cp packages/linux/tightbeam-0.1.9-linux-x86_64-*.tgz "$SOURCE_DIR/package-0.1.9.tar"
+   cp SHA256SUMS "$SOURCE_DIR/SHA256SUMS.0.1.9"
+   expected_target_package_sha256="$(awk '/packages\/linux\/tightbeam-0\.1\.9-linux/ {print $1}' SHA256SUMS)"
+   test "$(sha256 "$SOURCE_DIR/package-0.1.9.tar")" = "$expected_target_package_sha256"
+   ```
+
+   Extract the archive once into `SCRATCH`; `PKG` is the extracted `tightbeam/`
+   directory, which holds `bin/`, `release/` and, for a published release only,
    `release-provenance.json`.
 4. `target_source_commit` is the candidate SHA, and `target_source_checkout` is
    a checkout of that SHA placed inside `SOURCE_DIR` before containment.
