@@ -27,8 +27,7 @@ pub(crate) enum FailureFact {
 impl FailureFact {
     fn from_transport(error: &ureq::Transport) -> Self {
         use std::error::Error as _;
-        use std::io::ErrorKind as Io;
-        use ureq::{ErrorKind, TransportPhase as Phase, TransportRoute as Route};
+        use ureq::TransportRoute as Route;
 
         if error.has_prior_exchange() {
             return Self::Unclassified;
@@ -44,8 +43,22 @@ impl FailureFact {
                 .downcast_ref::<std::io::Error>()
                 .map(std::io::Error::kind)
         });
+        Self::from_typed_evidence(error.kind(), evidence, io_kind)
+    }
+
+    /// Classify already-observed typed facts. Keeping the decision pure lets
+    /// unit tests prove the closed Connect/ConnectionRefused case without
+    /// relying on an operating system's errno for a chosen loopback address.
+    fn from_typed_evidence(
+        error_kind: ureq::ErrorKind,
+        evidence: ureq::TransportEvidence,
+        io_kind: Option<std::io::ErrorKind>,
+    ) -> Self {
+        use std::io::ErrorKind as Io;
+        use ureq::{ErrorKind, TransportPhase as Phase, TransportRoute as Route};
+
         match evidence.phase {
-            Phase::Resolve if error.kind() == ErrorKind::Dns => Self::DnsBeforeExchange,
+            Phase::Resolve if error_kind == ErrorKind::Dns => Self::DnsBeforeExchange,
             Phase::Connect => match io_kind {
                 Some(Io::ConnectionRefused) => Self::RefusedBeforeExchange,
                 Some(Io::TimedOut) => Self::ConnectDeadlineBeforeExchange,

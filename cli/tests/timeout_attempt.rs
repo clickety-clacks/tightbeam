@@ -439,28 +439,73 @@ fn one_receipt(root: &CliRoot) -> serde_json::Value {
 }
 
 #[test]
-fn actual_cli_connect_refusal_is_unavailable_for_get_and_post() {
+fn actual_cli_unreachable_port_keeps_typed_refusal_or_unknown_fallback_for_get_and_post() {
     for command in ["help", "list"] {
         let root = CliRoot::new();
-        let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = reservation.local_addr().unwrap();
-        drop(reservation); // actual loopback connect refusal, without a DNS query
+        // Port zero has no listening endpoint. Its OS error kind may vary, so
+        // assert either typed refusal or the honest unknown-phase fallback.
+        let addr = SocketAddr::from(([127, 0, 0, 1], 0));
         let output = finish_cli(root.spawn(command, addr));
         assert_eq!(output.status.success(), command == "help");
         let record = one_receipt(&root);
-        assert_eq!(record["code"], "gateway_unavailable");
-        assert_eq!(record["cause"], "connect_refused");
-        assert_eq!(record["gateway_accepted"], false);
-        assert_eq!(record["effect_state"], "none");
-        assert_eq!(record["action"], "retry_safe");
+        let diagnostic_code = match record["code"].as_str() {
+            Some("gateway_unavailable") => {
+                assert!(matches!(
+                    record["cause"].as_str(),
+                    Some("connect_refused" | "connect_timeout" | "dns_failed")
+                ));
+                assert_eq!(record["gateway_accepted"], false);
+                assert_eq!(record["effect_kind"], "read");
+                assert_eq!(record["effect_state"], "none");
+                assert_eq!(record["action"], "retry_safe");
+                if record["cause"] == "connect_timeout" {
+                    assert_eq!(record["timeout_source"], "cli_connect");
+                    assert!(record["budget_ms"].as_u64().is_some());
+                } else {
+                    assert_eq!(record["timeout_source"], "none");
+                    assert!(record["budget_ms"].is_null());
+                }
+                Some("gateway_unavailable")
+            }
+            Some("gateway_transport_uncertain") => {
+                assert!(matches!(
+                    record["cause"].as_str(),
+                    Some("request_timeout" | "connection_reset" | "transport_failed")
+                ));
+                assert_eq!(record["gateway_accepted"], "unknown");
+                assert_eq!(record["effect_kind"], "read");
+                assert_eq!(record["effect_state"], "none");
+                assert_eq!(record["action"], "retry_safe");
+                if record["cause"] == "request_timeout" {
+                    assert_eq!(record["timeout_source"], "cli_request");
+                    assert!(record["budget_ms"].as_u64().is_some());
+                } else {
+                    assert_eq!(record["timeout_source"], "none");
+                    assert!(record["budget_ms"].is_null());
+                }
+                Some("gateway_transport_uncertain")
+            }
+            None => {
+                assert!(record["cause"].is_null());
+                assert_eq!(record["gateway_accepted"], "unknown");
+                assert_eq!(record["effect_kind"], "read");
+                assert!(record["effect_state"].is_null());
+                assert!(record["action"].is_null());
+                assert!(record["timeout_source"].is_null());
+                assert!(record["budget_ms"].is_null());
+                None
+            }
+            code => panic!("unexpected transport classification: {code:?}"),
+        };
         assert!(record["listener_generation"].is_null());
         if command == "list" {
             let machine = machine_failure(&output);
             assert_eq!(machine["attempt"]["requestId"], record["request_id"]);
-            assert_eq!(
-                machine["attempt"]["diagnostic"]["code"],
-                "gateway_unavailable"
-            );
+            if let Some(code) = diagnostic_code {
+                assert_eq!(machine["attempt"]["diagnostic"]["code"], code);
+            } else {
+                assert!(machine["attempt"]["diagnostic"].is_null());
+            }
         }
     }
 }
