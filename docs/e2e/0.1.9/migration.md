@@ -237,9 +237,25 @@ mkdir "$test_base"
 test_base="$(cd "$test_base" && pwd -P)"
 test_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
 cp -p "$source_db" "$test_base/state.db"
+# The source snapshot may be mode 0444. Make only this new disposable copy
+# writable for SQLite; keep /source and its read-only mount unchanged.
+python3 - "$source_db" "$test_base/state.db" <<'PY'
+import os, stat, sys
+source, copy = sys.argv[1:]
+if os.path.islink(copy) or not stat.S_ISREG(os.stat(copy).st_mode) or os.path.samefile(source, copy):
+    raise SystemExit("scratch state.db must be a distinct regular file")
+PY
+chmod u+w "$test_base/state.db"
+test -w "$test_base/state.db"
+test -w "$test_base" && test -x "$test_base"
 test "$(sha256 "$test_base/state.db")" = "$expected_source_sha256"
 test ! -e "$test_base/build-owner.json"
 ```
+
+Make only the disposable database copy owner-writable so SQLite can migrate it;
+keep the source snapshot and its mount read-only. Stop if the copy is not a
+distinct regular file, the gateway user cannot write the copy and search/write
+its scratch directory, or its content digest differs from the approved source.
 
 Record integrity and row counts before boot. Save only the stamp, counts and
 digests in the scorecard.
@@ -321,7 +337,12 @@ operator input for one start; it does not isolate anything.
 PKG="${PKG:?}"
 target_source_commit="replace-with-full-source-commit-from-package-provenance"
 target_source_checkout="/operator-supplied/verified-0.1.9/source"
-git -C "$target_source_checkout" merge-base --is-ancestor \
+# The checkout is a read-only bind mount owned by the host user, and this shell
+# runs as the image user, so git refuses it as "dubious ownership" unless the
+# directory is marked safe for this one command. Scope the setting to the
+# command; never write it into the mounted checkout.
+GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0="$target_source_checkout" \
+  git -C "$target_source_checkout" merge-base --is-ancestor \
   1265b3c894356755d46bc1fd143aeab5be2c873c "$target_source_commit"
 target_payload_root="$(python3 - "$PKG" <<'PY'
 from pathlib import Path

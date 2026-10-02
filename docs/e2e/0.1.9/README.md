@@ -379,7 +379,10 @@ else. The harness CLIs are installed and have never been logged in, which is
 what condition 5 and the boot preflight need. `/host/source-dir` holds the
 [source snapshot](migration.md#source-snapshot) files, the 0.1.9 package, its
 `SHA256SUMS` and the candidate checkout; `/host/scratch` must have room for
-three copies of the database.
+three copies of the database. Files under `/source` keep the host user's
+ownership, so any `git` command against the candidate checkout there needs
+`safe.directory` for that command, as the migration runbook shows; do not
+`chown` the mount or change its permissions.
 
 ## Tiers
 
