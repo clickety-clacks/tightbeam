@@ -72,12 +72,22 @@ end
 File.mkdir_p!(Path.join(base, "work"))
 Application.put_env(:tightbeam, :cwd, Path.join(base, "work"))
 port_path = Path.join(base, "restart-port")
+missing_executable = System.get_env("FIREHOSE_MISSING_EXECUTABLE") == "1"
 
 port =
-  if fresh do
-    0
-  else
-    port_path |> File.read!() |> String.to_integer()
+  cond do
+    not fresh ->
+      port_path |> File.read!() |> String.to_integer()
+
+    missing_executable ->
+      # Preflight refuses before Bandit starts; keep a concrete endpoint for the refusal check.
+      {:ok, listener} = :gen_tcp.listen(0, [:binary, active: false, ip: {127, 0, 0, 1}])
+      {:ok, {_, selected}} = :inet.sockname(listener)
+      :ok = :gen_tcp.close(listener)
+      selected
+
+    true ->
+      0
   end
 
 Application.put_env(:tightbeam, :port, port)
@@ -86,7 +96,7 @@ Application.put_env(:tightbeam, :default_model, Model.new("fixture-model"))
 Application.put_env(:tightbeam, :autostart, true)
 Application.put_env(:tightbeam, :drain_timeout_ms, 1_000)
 
-if System.get_env("FIREHOSE_MISSING_EXECUTABLE") == "1" do
+if missing_executable do
   empty_bin = Path.join(base, "empty-executable-path")
   File.mkdir_p!(empty_bin)
   System.put_env("PATH", empty_bin)
@@ -100,7 +110,8 @@ if System.get_env("FIREHOSE_MISSING_EXECUTABLE") == "1" do
     Path.join(base, "refusal-input.json"),
     JSON.encode!(%{
       "pid" => System.pid(),
-      "port" => port,
+      "requestedPort" => port,
+      "boundPort" => nil,
       "marker" => marker
     })
   )

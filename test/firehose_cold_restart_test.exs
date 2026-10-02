@@ -424,11 +424,19 @@ defmodule Tightbeam.FirehoseColdRestartTest do
       evidence = JSON.decode!(File.read!(Path.join(plan.base, "refusal-input.json")))
       assert evidence["pid"] == Integer.to_string(pid)
       assert File.read!(Path.join(plan.base, "build-owner.json")) == evidence["marker"]
+      assert evidence["requestedPort"] in 1..65_535
+      assert evidence["boundPort"] == nil
+      refute File.exists?(Path.join(plan.base, "restart-port"))
       refute File.exists?(Path.join(plan.base, "first-ready.json"))
       assert Port.info(port) == nil
 
       assert {:error, :econnrefused} =
-               :gen_tcp.connect({127, 0, 0, 1}, evidence["port"], [:binary, active: false], 1_000)
+               :gen_tcp.connect(
+                 {127, 0, 0, 1},
+                 evidence["requestedPort"],
+                 [:binary, active: false],
+                 1_000
+               )
 
       refute File.exists?(Path.join(plan.base, "forbidden-execution.log"))
       assert Tightbeam.HarnessProcessCensus.capture_for_root(plan.base).count == 0
