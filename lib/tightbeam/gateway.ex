@@ -3121,7 +3121,8 @@ defmodule Tightbeam.Gateway do
               %{
                 harness_session_id: harness_session_id,
                 adapter: prompt_adapter,
-                generation: prompt_generation
+                generation: prompt_generation,
+                session: active_session
               }} <-
                stage(
                  :session,
@@ -3142,7 +3143,7 @@ defmodule Tightbeam.Gateway do
                  end)
                ),
              {:ok, result} <-
-               stage(
+               stage_with_session(
                  :prompt,
                  Adapter.prompt(
                    prompt_adapter,
@@ -3166,7 +3167,8 @@ defmodule Tightbeam.Gateway do
                    end,
                    progress:
                      progress_fun(db, turn.session_key, session.owner_user_id, correlation)
-                 )
+                 ),
+                 active_session
                ) do
           attention_tier = elected_attention(db, turn.seq)
 
@@ -3176,7 +3178,9 @@ defmodule Tightbeam.Gateway do
           record_in_txn = fn txn ->
             replies = append_assistant_messages_in_txn(txn, turn, echo, result, attention_tier)
             Tightbeam.ReminderDelivery.delivered_in_txn(txn, turn.seq)
-            health_publication = HarnessHealth.resolve_normal_turn_in_txn(txn, session, turn)
+
+            health_publication =
+              HarnessHealth.resolve_normal_turn_in_txn(txn, active_session, turn)
 
             fn ->
               Enum.each(replies, &publish_message(db, turn.session_key, &1))
@@ -3186,7 +3190,9 @@ defmodule Tightbeam.Gateway do
 
           {:ok, %{terminal_publish: terminal_publish, record_in_txn: record_in_txn}}
         else
-          {:error, {failed_stage, reason}} ->
+          {:error, failure} ->
+            {failed_stage, reason, active_session} = turn_failure_context(failure, session)
+
             # A FAILED TURN FAILS. It does not freeze the session behind a
             # ruling. Adjudication — episodes, holds, an escalation ladder, a
             # `tightbeam adjudicate` verb — was deleted 2026-08-05 (Flynn: "why
@@ -3217,7 +3223,7 @@ defmodule Tightbeam.Gateway do
             raw_reason = model_selection_record_reason(classified_reason)
 
             reason =
-              case turn_credential_refusal(session) do
+              case turn_credential_refusal(active_session) do
                 {:refused, message} -> message
                 :not_applicable -> classified_reason
               end
@@ -3286,7 +3292,7 @@ defmodule Tightbeam.Gateway do
 
               HarnessHealth.observe_turn_failure_in_txn(
                 txn,
-                session,
+                active_session,
                 turn,
                 failed_stage,
                 raw_reason
@@ -3339,6 +3345,19 @@ defmodule Tightbeam.Gateway do
 
   defp stage(stage, {:error, reason}), do: {:error, {stage, reason}}
   defp stage(_stage, result), do: result
+
+  defp stage_with_session(stage_name, result, session) do
+    case stage(stage_name, result) do
+      {:error, {^stage_name, reason}} -> {:error, {stage_name, reason, session}}
+      other -> other
+    end
+  end
+
+  defp turn_failure_context({failed_stage, reason, session}, _fallback),
+    do: {failed_stage, reason, session}
+
+  defp turn_failure_context({failed_stage, reason}, fallback),
+    do: {failed_stage, reason, fallback}
 
   defp adapter_key(session), do: {Harness.parse!(session.harness).id(), "shared", session.host}
 
@@ -3853,7 +3872,8 @@ defmodule Tightbeam.Gateway do
            %{
              harness_session_id: sid,
              adapter: attempt_adapter,
-             generation: attempt_generation
+             generation: attempt_generation,
+             session: attempt_session
            }}
 
         {:error, reason} = error ->
