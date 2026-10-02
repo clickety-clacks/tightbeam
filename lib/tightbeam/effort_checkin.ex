@@ -2,11 +2,14 @@ defmodule Tightbeam.EffortCheckin do
   @moduledoc """
   Event-driven effort-without-effect brackets for assignments.
 
-  EFFECT is any of, since the bracket armed: an artifact the holder recorded for
-  the assignment's work item, an attest on the assignment, or an update to that
-  work item. Turns and workspace writes are effort, never effect. Work done
-  elsewhere (another machine, a service, a person) is surfaced by RECORDING AN
-  ARTIFACT on the card's work item.
+  EFFECT is attributable durable advancement since the bracket armed: an
+  artifact the holder recorded for the assignment's work item, an attest on the
+  assignment or attributable linked delivery on the same work item, an update
+  to that work item, or a bound pending continuation checkpoint. Turns, including
+  assignment-attributed delivered turns, are liveness telemetry rather than
+  advancement. The check-in's own turns and workspace writes are effort, never
+  effect. Work done elsewhere (another machine, a service, a person) is
+  surfaced by RECORDING AN ARTIFACT on the card's work item.
 
   Zero effect on every channel prods the AGENT first — one wake naming the three
   channels. Continued silence climbs the holder's active operational parents
@@ -1243,8 +1246,14 @@ defmodule Tightbeam.EffortCheckin do
     end
   end
 
-  # The three activity channels, all read in the verdict's own transaction. Turns ride
-  # along as EFFORT — they are reported, never counted as effect.
+  # All activity channels are read in the verdict's own transaction. Exact-card
+  # attests retain their original channel. Linked-card attests make portfolio
+  # obligations reflect same-holder work and non-review delivery cards opened
+  # by that portfolio holder, without letting an unrelated sibling holder
+  # silence a stalled obligation. Attributed
+  # turns remain visible in evidence, but do not count as effect: a turn proves
+  # liveness, not advancement. A checkpoint counts only through the native
+  # assignment binding and while its wake is still pending.
   defp channels(txn, generation, _inspection) do
     %{
       artifacts: artifact_updates(txn, generation),
@@ -1254,13 +1263,40 @@ defmodule Tightbeam.EffortCheckin do
           "SELECT COUNT(*) FROM attests WHERE assignmentId = ?1 AND rowid > ?2",
           [generation.assignment_id, generation.attest_watermark]
         ),
+      linkedAttests: linked_attest_updates(txn, generation),
       workItems: work_item_updates(txn, generation),
-      turns: terminal_turns(txn, generation)
+      turns: terminal_turns(txn, generation),
+      attributedTurns: attributed_turns(txn, generation),
+      checkpoints: bound_checkpoints(txn, generation)
     }
   end
 
   defp effect?(channels) do
-    channels.artifacts > 0 or channels.attests > 0 or channels.workItems > 0
+    channels.artifacts > 0 or channels.attests > 0 or channels.linkedAttests > 0 or
+      channels.workItems > 0 or channels.checkpoints > 0
+  end
+
+  defp linked_attest_updates(txn, generation) do
+    case Txn.q(txn, "SELECT workItemId FROM assignments WHERE id = ?1", [
+           generation.assignment_id
+         ]) do
+      [[item]] when is_binary(item) ->
+        count_since(
+          txn,
+          """
+          SELECT COUNT(*)
+          FROM attests AS t
+          JOIN assignments AS a ON a.id=t.assignmentId
+          WHERE a.workItemId=?1 AND a.id!=?2 AND t.rowid>?3
+            AND a.reviewsAssignmentId IS NULL
+            AND (a.holderKey=?4 OR a.openedBySession=?4)
+          """,
+          [item, generation.assignment_id, generation.attest_watermark, generation.holder_key]
+        )
+
+      _ ->
+        0
+    end
   end
 
   defp artifact_updates(txn, generation) do
@@ -1317,6 +1353,39 @@ defmodule Tightbeam.EffortCheckin do
     turns
   end
 
+  defp attributed_turns(txn, generation) do
+    count_since(
+      txn,
+      """
+      SELECT COUNT(*) FROM turns
+      WHERE sessionKey=?1 AND assignmentId=?2 AND seq>?3
+        AND status='delivered' AND origin!='process:tightbeam'
+      """,
+      [
+        generation.holder_key,
+        generation.assignment_id,
+        generation.terminal_seq_watermark
+      ]
+    )
+  end
+
+  defp bound_checkpoints(txn, generation) do
+    count_since(
+      txn,
+      """
+      SELECT COUNT(*)
+      FROM supervision_liveness_checkpoint_bindings AS b
+      JOIN wakes AS w ON w.wakeId=b.wakeId
+      WHERE b.assignmentId=?1 AND b.holderSessionKey=?2
+        AND w.state='pending'
+      """,
+      [
+        generation.assignment_id,
+        generation.holder_key
+      ]
+    )
+  end
+
   # No table guards. A channel whose table is missing is a broken substrate, not
   # a channel that observed nothing — reading it as zero would fire a prod off
   # the breakage. The gateway creates all four tables at boot.
@@ -1338,7 +1407,10 @@ defmodule Tightbeam.EffortCheckin do
       channels: %{
         artifacts: channels.artifacts,
         attests: channels.attests,
-        workItems: channels.workItems
+        linkedAttests: channels.linkedAttests,
+        workItems: channels.workItems,
+        attributedTurns: channels.attributedTurns,
+        checkpoints: channels.checkpoints
       },
       agentProdded: generation.agent_prodded > 0,
       turnsSinceArmed: channels.turns,
@@ -1483,8 +1555,10 @@ defmodule Tightbeam.EffortCheckin do
   end
 
   defp channel_sentence(evidence) do
-    "no artifacts, attests, or work-item updates observed since " <>
-      "#{evidence.minutesSinceArmed}m ago (#{evidence.turnsSinceArmed} turns taken)."
+    "no artifacts, attests, or work-item updates; no linked-card progress or " <>
+      "bound checkpoints observed since #{evidence.minutesSinceArmed}m ago " <>
+      "(#{evidence.turnsSinceArmed} turns taken; " <>
+      "#{evidence.channels.attributedTurns} attributed delivered turns are liveness only)."
   end
 
   defp advanced_baseline(_baseline, {:ok, _observation} = inspection), do: inspection
