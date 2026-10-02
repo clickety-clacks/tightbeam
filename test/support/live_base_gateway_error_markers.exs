@@ -105,10 +105,10 @@ defmodule GuardErrorMarkers do
           assert runner_reason == {:acp_request_not_dispatched, :closed}
         end
 
-        # The turn's reason is the classification it always was; the carrier
-        # never reaches turns.error, the marker or the health decision.
+        # A configured model ring may report explicit exhaustion, but the
+        # original classification remains the carrier inside that result.
         if setup_diagnosed? do
-          assert runner_reason == :model_unavailable
+          assert %{code: "model_selection_exhausted", message: _} = runner_reason
         end
 
         assert {:ok, true} =
@@ -132,7 +132,7 @@ defmodule GuardErrorMarkers do
         expected =
           cond do
             pre_dispatch? -> "{:acp_request_not_dispatched, :closed}"
-            setup_diagnosed? -> ":model_unavailable"
+            setup_diagnosed? -> runner_reason.message
             true -> input["expected"]
           end
 
