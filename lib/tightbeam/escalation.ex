@@ -535,10 +535,25 @@ defmodule Tightbeam.Escalation do
             "SELECT #{@terminal_request_columns} FROM decision_requests WHERE kind = 'operator' AND status IN ('ruled','consumed') ORDER BY id"
           )
 
+        # Activation runs inside the migration transaction. Read the lifecycle
+        # cardinalities once, rather than rescanning history for every request.
+        # Runtime validation still queries the current relation independently.
+        event_counts =
+          if rows == [] do
+            %{}
+          else
+            txn
+            |> Txn.q("""
+            SELECT subject, COUNT(*) FROM lifecycle_events
+            WHERE kind = 'decision_request_ruled' GROUP BY subject
+            """)
+            |> Map.new(fn [subject, count] -> {subject, count} end)
+          end
+
         Enum.each(rows, fn row ->
           request = request_from_terminal_row(row)
 
-          case validate_terminal_request_in_txn(txn, request) do
+          case validate_terminal_request_in_txn(txn, request, event_counts) do
             %{failures: []} ->
               :ok
 
@@ -3290,7 +3305,7 @@ defmodule Tightbeam.Escalation do
     }
   end
 
-  defp validate_terminal_request_in_txn(txn, request) do
+  defp validate_terminal_request_in_txn(txn, request, event_counts \\ nil) do
     [[cutoff]] =
       Txn.q(
         txn,
@@ -3300,12 +3315,21 @@ defmodule Tightbeam.Escalation do
     epoch = terminal_epoch(request.ruling_fact_id, cutoff)
     fact_shape = terminal_fact_shape_in_txn(txn, request)
 
-    [[event_count]] =
-      Txn.q(
-        txn,
-        "SELECT COUNT(*) FROM lifecycle_events WHERE kind = 'decision_request_ruled' AND subject = ?1",
-        [request.id]
-      )
+    event_count =
+      case event_counts do
+        nil ->
+          [[count]] =
+            Txn.q(
+              txn,
+              "SELECT COUNT(*) FROM lifecycle_events WHERE kind = 'decision_request_ruled' AND subject = ?1",
+              [request.id]
+            )
+
+          count
+
+        counts ->
+          Map.get(counts, request.id, 0)
+      end
 
     notification_count =
       if epoch == :post_activation,

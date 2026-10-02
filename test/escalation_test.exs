@@ -2798,6 +2798,230 @@ defmodule Tightbeam.EscalationTest do
     }
   end
 
+  test "migration terminal census scans lifecycle once as request population grows", ctx do
+    :ok =
+      DB.execute(ctx.db, """
+      WITH RECURSIVE history(n) AS (
+        VALUES(1) UNION ALL SELECT n + 1 FROM history WHERE n < 25000
+      )
+      INSERT INTO lifecycle_events(ts, kind, subject, detail)
+      SELECT n, 'unrelated-census-history', 'unrelated', NULL FROM history;
+      """)
+
+    for count <- [1, 16, 64] do
+      seed_census_requests(ctx, count)
+      reset_terminal_census(ctx.db)
+      queries = run_terminal_census(ctx.db)
+      assert [{sql, []}] = lifecycle_queries(queries)
+      assert sql =~ "GROUP BY subject"
+      assert {:ok, plan} = DB.query(ctx.db, "EXPLAIN QUERY PLAN " <> sql)
+      assert Enum.count(plan, fn row -> List.last(row) =~ "SCAN lifecycle_events" end) == 1
+
+      assert {:ok, [[0]]} =
+               DB.query(ctx.db, "SELECT COUNT(*) FROM decision_request_integrity_evidence")
+
+      assert {:ok, [[25000]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM lifecycle_events WHERE kind='unrelated-census-history'"
+               )
+
+      assert [] == lifecycle_queries(run_terminal_census(ctx.db))
+    end
+  end
+
+  test "migration census preserves missing duplicate malformed and consumed integrity evidence",
+       ctx do
+    [valid, missing, duplicate, malformed, consumed] = seed_census_requests(ctx, 5)
+    reset_terminal_census(ctx.db)
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "DELETE FROM lifecycle_events WHERE kind='decision_request_ruled' AND subject=?1",
+               [missing.id]
+             )
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO lifecycle_events(ts,kind,subject) VALUES(1,'decision_request_ruled',?1)",
+               [duplicate.id]
+             )
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE decision_requests SET options='not-json' WHERE id=?1", [
+               malformed.id
+             ])
+
+    # Historical malformed row: seed under disabled CHECKs, then restore
+    # enforcement before exercising either migration or runtime validation.
+    :ok = DB.execute(ctx.db, "PRAGMA ignore_check_constraints=ON")
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE decision_requests SET status='consumed',consumedAt=1 WHERE id=?1",
+               [consumed.id]
+             )
+
+    :ok = DB.execute(ctx.db, "PRAGMA ignore_check_constraints=OFF")
+
+    # Unrelated kinds with the same subject must not contribute to cardinality.
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO lifecycle_events(ts,kind,subject) VALUES(1,'unrelated',?1)",
+               [valid.id]
+             )
+
+    assert [_] = lifecycle_queries(run_terminal_census(ctx.db))
+
+    assert {:ok, evidence} =
+             DB.query(
+               ctx.db,
+               "SELECT requestId,shapeDigest,failingFields,firstSurface FROM decision_request_integrity_evidence ORDER BY requestId"
+             )
+
+    fields =
+      Map.new(evidence, fn [id, _, fields, surface] ->
+        assert surface == "migration-preflight"
+        {id, JSON.decode!(fields)}
+      end)
+
+    assert fields == %{
+             missing.id => ["rulingLifecycleEvent"],
+             duplicate.id => ["rulingLifecycleEvent"],
+             malformed.id => ["options"],
+             consumed.id => ["lifecycleConsumption"]
+           }
+
+    # The ordinary runtime validator independently observes the same relation;
+    # its evidence digest must agree with migration and create no new shape.
+    for request <- [missing, duplicate, malformed, consumed] do
+      assert %{code: "decision_request_integrity_invalid"} = operator_request(ctx, request.id)
+    end
+
+    assert %{id: id} = operator_request(ctx, valid.id)
+    assert id == valid.id
+
+    assert {:ok, ^evidence} =
+             DB.query(
+               ctx.db,
+               "SELECT requestId,shapeDigest,failingFields,firstSurface FROM decision_request_integrity_evidence ORDER BY requestId"
+             )
+
+    # Runtime must still see a mutation after the migration map has gone away.
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "DELETE FROM lifecycle_events WHERE kind='decision_request_ruled' AND subject=?1",
+               [valid.id]
+             )
+
+    assert %{code: "decision_request_integrity_invalid"} = operator_request(ctx, valid.id)
+  end
+
+  test "census query failure and later failure roll back epoch and evidence before retry", ctx do
+    [request] = seed_census_requests(ctx, 1)
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "DELETE FROM lifecycle_events WHERE kind='decision_request_ruled' AND subject=?1",
+               [request.id]
+             )
+
+    reset_terminal_census(ctx.db)
+
+    assert {:error, _} =
+             DB.transaction(ctx.db, fn txn ->
+               :ok =
+                 DB.Txn.exec(
+                   txn,
+                   "ALTER TABLE lifecycle_events RENAME TO hidden_lifecycle_events"
+                 )
+
+               Escalation.ensure_terminal_parity_in_txn(txn, 1234, true)
+             end)
+
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM decision_request_terminal_epoch")
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM decision_request_integrity_evidence")
+
+    assert {:error, _} =
+             DB.transaction(ctx.db, fn txn ->
+               :ok = Escalation.ensure_terminal_parity_in_txn(txn, 1234, true)
+               raise DB.Error, message: "failure after terminal census"
+             end)
+
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM decision_request_terminal_epoch")
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM decision_request_integrity_evidence")
+
+    assert [_] = lifecycle_queries(run_terminal_census(ctx.db))
+
+    assert {:ok, [[1234]]} =
+             DB.query(ctx.db, "SELECT activatedAt FROM decision_request_terminal_epoch")
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM decision_request_integrity_evidence")
+
+    assert [] == lifecycle_queries(run_terminal_census(ctx.db))
+  end
+
+  defp seed_census_requests(ctx, count) do
+    for n <- 1..count do
+      request =
+        Escalation.operator_ask(
+          ctx.db,
+          operator_call(ctx.raiser, %{question: "census #{count}/#{n}?"})
+        )
+
+      Escalation.operator_rule(ctx.db, owner_operator_rule(request.id, %{decision: "accept"}))
+    end
+  end
+
+  defp reset_terminal_census(db) do
+    :ok =
+      DB.execute(db, """
+      DELETE FROM decision_request_terminal_epoch;
+      DELETE FROM decision_request_integrity_evidence;
+      UPDATE decision_requests SET ruledViaPrincipal=NULL, ruledViaSessionState=NULL;
+      """)
+  end
+
+  defp run_terminal_census(db) do
+    observer = self()
+    ref = make_ref()
+
+    assert {:ok, :ok} =
+             DB.transaction(db, fn txn ->
+               traced =
+                 DB.Txn.observe_queries(txn, fn {:sql_query, sql, params} ->
+                   send(observer, {ref, sql, params})
+                 end)
+
+               Escalation.ensure_terminal_parity_in_txn(traced, 1234, true)
+             end)
+
+    drain_census_queries(ref)
+  end
+
+  defp drain_census_queries(ref) do
+    receive do
+      {^ref, sql, params} -> [{sql, params} | drain_census_queries(ref)]
+    after
+      0 -> []
+    end
+  end
+
+  defp lifecycle_queries(queries) do
+    Enum.filter(queries, fn {sql, _} -> String.contains?(sql, "FROM lifecycle_events") end)
+  end
+
   defp agent_call(session, params, overrides \\ %{}) do
     Map.merge(
       %{
