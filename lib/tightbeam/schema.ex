@@ -1499,8 +1499,6 @@ defmodule Tightbeam.Schema do
         )
     end)
 
-    :ok = ensure_lifecycle_runtime_indexes(db)
-
     activated_at = System.system_time(:millisecond)
 
     case DB.transaction(db, fn txn ->
@@ -1561,6 +1559,11 @@ defmodule Tightbeam.Schema do
     :ok = upgrade_identity_publication_denial_diagnostic(db)
     :ok = upgrade_work_item_delivery_owner_link(db)
     :ok = upgrade_supervision_receipt_cancellation_v1(db)
+
+    # Refused predecessors must retain their exact schema, including indexes.
+    # Build these additive access paths only after the existing migrations and
+    # qualifications succeed, but before publishing a successful boot marker.
+    :ok = ensure_lifecycle_runtime_indexes(db)
 
     case DB.finish_schema(db) do
       :ok -> :ok
