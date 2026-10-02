@@ -111,6 +111,157 @@ defmodule Tightbeam.DBCallTimeoutTest do
     assert {:ok, [[1]]} = DB.query_until(db, "SELECT 1", [], deadline)
   end
 
+  test "migration context covers query, DDL, transaction and guard calls without changing runtime bounds" do
+    Application.put_env(:tightbeam, :db_call_timeout_ms, 20)
+    db = start_supervised!({DB, path: ":memory:", name: nil})
+    migration = DB.migration_context(db)
+
+    for {operation, expected} <- [
+          {fn -> DB.query(migration, "SELECT 1") end, {:ok, [[1]]}},
+          {fn -> DB.execute(migration, "CREATE TABLE context_fixture(id INTEGER)") end, :ok},
+          {fn -> DB.transaction(migration, fn _ -> :done end) end, {:ok, :done}},
+          {fn -> DB.prepare_schema(migration) end, :ok},
+          {fn -> DB.finish_schema(migration) end, :ok}
+        ] do
+      :sys.suspend(db)
+      caller = Task.async(operation)
+      # Synchronize on a call actually queued to the suspended owner before
+      # timing the release; this is an injected queue delay, not migration work.
+      await_queued_call(db)
+      Process.send_after(self(), :resume_owner, 80)
+      receive do: (:resume_owner -> :sys.resume(db))
+      assert Task.await(caller) == expected
+      assert DB.call_timeout() == 20
+    end
+
+    :sys.suspend(db)
+
+    try do
+      assert catch_exit(DB.query(db, "SELECT 1")) |> elem(0) == :timeout
+    after
+      :sys.resume(db)
+    end
+  end
+
+  defp await_queued_call(db) do
+    case Process.info(db, :messages) do
+      {:messages, [{:"$gen_call", _, _} | _]} ->
+        :ok
+
+      _ ->
+        receive do
+        after
+          1 -> await_queued_call(db)
+        end
+    end
+  end
+
+  test "a failed schema migration rolls back and restores checks" do
+    db = start_supervised!({DB, path: ":memory:", name: nil})
+
+    assert {:error, %RuntimeError{message: "synthetic migration failure"}} =
+             DB.migration_transaction(
+               db,
+               :synthetic_failure,
+               ["PRAGMA ignore_check_constraints = ON"],
+               ["PRAGMA ignore_check_constraints = OFF"],
+               fn txn ->
+                 :ok = Tightbeam.DB.Txn.exec(txn, "CREATE TABLE rolled_back (id INTEGER)")
+                 raise "synthetic migration failure"
+               end
+             )
+
+    assert {:ok, [[0]]} = DB.query(db, "PRAGMA ignore_check_constraints")
+
+    assert {:ok, []} =
+             DB.query(db, "SELECT name FROM sqlite_master WHERE type='table' AND name=?1", [
+               "rolled_back"
+             ])
+  end
+
+  test "a partial migration prelude failure restores CHECK enforcement before returning" do
+    db = start_supervised!({DB, path: ":memory:", name: nil})
+    assert :ok = DB.execute(db, "CREATE TABLE checked(id INTEGER CHECK(id > 0))")
+
+    assert {:error, %MatchError{}} =
+             DB.migration_transaction(
+               db,
+               :prelude_failure,
+               ["PRAGMA ignore_check_constraints=ON", "invalid SQL"],
+               ["PRAGMA ignore_check_constraints=OFF"],
+               fn _ -> flunk("prelude must refuse") end
+             )
+
+    assert {:ok, [[0]]} = DB.query(db, "PRAGMA ignore_check_constraints")
+    assert {:error, reason} = DB.execute(db, "INSERT INTO checked VALUES(-1)")
+    assert reason =~ "CHECK constraint failed"
+  end
+
+  test "a bounded cleanup call can mask the original transaction timeout while the owner continues" do
+    Application.put_env(:tightbeam, :db_call_timeout_ms, 25)
+    db = start_supervised!({DB, path: ":memory:", name: nil})
+    parent = self()
+
+    {caller, monitor} =
+      spawn_monitor(fn ->
+        try do
+          DB.transaction(db, fn txn ->
+            send(parent, :old_migration_entered)
+            receive do: (:finish_old_migration -> :ok)
+            DB.Txn.exec(txn, "CREATE TABLE old_migration_committed(id INTEGER)")
+          end)
+        catch
+          :exit, reason ->
+            send(parent, {:primary_timeout, reason})
+            exit(reason)
+        after
+          DB.execute(db, "PRAGMA ignore_check_constraints=OFF")
+        end
+      end)
+
+    assert_receive :old_migration_entered
+
+    assert_receive {:primary_timeout,
+                    {:timeout, {GenServer, :call, [^db, {:transaction, _}, 25]}}}
+
+    assert_receive {:DOWN, ^monitor, :process, ^caller,
+                    {:timeout,
+                     {GenServer, :call,
+                      [^db, {:execute, "PRAGMA ignore_check_constraints=OFF"}, 25]}}}
+
+    send(db, :finish_old_migration)
+
+    assert {:ok, [["old_migration_committed"]]} =
+             DB.query(
+               DB.migration_context(db),
+               "SELECT name FROM sqlite_master WHERE name='old_migration_committed'"
+             )
+  end
+
+  test "a restoration failure reports the primary error and closes the owner" do
+    db = start_supervised!({DB, path: ":memory:", name: nil}, restart: :temporary)
+    monitor = Process.monitor(db)
+
+    log =
+      capture_log(fn ->
+        assert {:error, %DB.Error{message: message}} =
+                 DB.migration_transaction(
+                   db,
+                   :restoration_failure,
+                   ["PRAGMA ignore_check_constraints=ON"],
+                   ["invalid restoration SQL", "PRAGMA ignore_check_constraints=OFF"],
+                   fn _ -> raise "primary synthetic failure" end
+                 )
+
+        assert message =~ "primary synthetic failure"
+        assert message =~ "pragma restoration failed"
+        assert_receive {:DOWN, ^monitor, :process, ^db, %DB.Error{}}
+      end)
+
+    refute log =~ "transaction rolled back"
+    refute Process.alive?(db)
+  end
+
   @tag timeout: 20_000
   test "a gateway read survives a transient owner queue longer than the legacy 5s default" do
     Application.delete_env(:tightbeam, :db_call_timeout_ms)

@@ -20,8 +20,25 @@ defmodule Tightbeam.DB do
   use GenServer
   alias Exqlite.Sqlite3
 
-  @typedoc "The DB owner process (name or pid) — pass a test-local name to isolate."
-  @type server :: GenServer.server()
+  defmodule Migration do
+    @moduledoc false
+    @enforce_keys [:server]
+    defstruct [:server]
+    @type t :: %__MODULE__{server: GenServer.server()}
+  end
+
+  @typedoc "The DB owner, or its explicit boot-only migration context."
+  @type server :: GenServer.server() | Migration.t()
+
+  @doc """
+  Give schema bootstrap an explicit unbounded client context. Pass this value
+  through delegated schema calls; it changes neither the owner nor application
+  configuration. Discard it after bootstrap. Runtime callers keep their bounded
+  server handle, and SQLite's separate lock-wait bound is unchanged.
+  """
+  @spec migration_context(server()) :: Migration.t()
+  def migration_context(%Migration{} = context), do: context
+  def migration_context(server), do: %Migration{server: server}
 
   @typedoc "One result row, positional (SELECT column order)."
   @type row :: [term()]
@@ -56,6 +73,12 @@ defmodule Tightbeam.DB do
   # Validated once in `init/1` rather than on this path: the DB client path is
   # hot, and a bad value should stop the owner starting, not surface as a
   # per-call crash.
+  # 30s is a conservative queue-plus-execution ceiling for a single serialized
+  # runtime owner, not a migration budget. Ecto.Repo uses 15s per query and
+  # SqlClient defaults to 30s of network reads (different semantics); our
+  # supported transient owner backlog already exceeds GenServer's 5s default.
+  # Keep this bounded, configurable ceiling without changing the 5s SQLite
+  # lock wait. See docs/migration-timeouts.md for comparisons and limitations.
   @default_call_timeout_ms 30_000
 
   @doc "Configured client wait for a DB call, ms (`:db_call_timeout_ms`, default 30_000)."
@@ -94,7 +117,7 @@ defmodule Tightbeam.DB do
   end
 
   def query(server, sql, params) do
-    GenServer.call(server, {:query, sql, params}, call_timeout())
+    call(server, {:query, sql, params})
   end
 
   @doc """
@@ -130,7 +153,7 @@ defmodule Tightbeam.DB do
   @doc "Execute DDL / statements without results."
   @spec execute(server(), String.t()) :: :ok | {:error, term()}
   def execute(server \\ __MODULE__, sql) do
-    GenServer.call(server, {:execute, sql}, call_timeout())
+    call(server, {:execute, sql})
   end
 
   @doc """
@@ -143,7 +166,7 @@ defmodule Tightbeam.DB do
           {:ok, result} | {:error, Exception.t()}
         when result: term()
   def transaction(server \\ __MODULE__, fun) when is_function(fun, 1) do
-    GenServer.call(server, {:transaction, fun}, call_timeout())
+    call(server, {:transaction, fun})
   end
 
   @doc """
@@ -342,10 +365,52 @@ defmodule Tightbeam.DB do
   ## Server
 
   @doc false
-  def prepare_schema(server), do: GenServer.call(server, :prepare_schema, call_timeout())
+  def prepare_schema(server), do: call(server, :prepare_schema)
 
   @doc false
-  def finish_schema(server), do: GenServer.call(server, :finish_schema, call_timeout())
+  def finish_schema(server), do: call(server, :finish_schema)
+
+  defp call(%Migration{server: server}, request) do
+    operation = if is_tuple(request), do: elem(request, 0), else: request
+    started = System.monotonic_time(:millisecond)
+    Logger.info("database migration call #{operation}: begin")
+    result = GenServer.call(server, request, :infinity)
+    elapsed = System.monotonic_time(:millisecond) - started
+    outcome = if match?({:error, _}, result), do: "failed", else: "finished"
+    Logger.info("database migration call #{operation}: #{outcome} elapsed_ms=#{elapsed}")
+    result
+  end
+
+  defp call(server, request), do: GenServer.call(server, request, call_timeout())
+
+  @doc """
+  Run a schema migration in the DB owner without the runtime client deadline.
+
+  Migrations are serialized, transactional work whose duration is determined by
+  the database size. They must not be sent through the ordinary bounded runtime
+  calls: a caller timeout can leave the owner finishing the transaction while a
+  cleanup call waits behind it and reports the wrong phase. The SQLite
+  `busy_timeout` remains the connection's lock-wait bound; this `:infinity`
+  applies only to the caller waiting for this migration result.
+
+  Primary references: `GenServer.call/3` timeout semantics
+  (https://www.erlang.org/doc/apps/stdlib/gen_server.html#call/3) and SQLite's
+  `busy_timeout` pragma (https://sqlite.org/pragma.html#pragma_busy_timeout) and
+  `ignore_check_constraints` pragma
+  (https://sqlite.org/pragma.html#pragma_ignore_check_constraints).
+  """
+  @spec migration_transaction(
+          server(),
+          atom(),
+          [String.t()],
+          [String.t()],
+          (Tightbeam.DB.Txn.t() -> result)
+        ) :: {:ok, result} | {:error, Exception.t()}
+        when result: term()
+  def migration_transaction(server, label, before, restore, fun)
+      when is_atom(label) and is_list(before) and is_list(restore) and is_function(fun, 1) do
+    call(migration_context(server), {:migration_transaction, label, before, restore, fun})
+  end
 
   @doc false
   def assert_base_admitted!(server, base) do
@@ -476,6 +541,47 @@ defmodule Tightbeam.DB do
     end
   end
 
+  def handle_call(
+        {:migration_transaction, label, before, restore, fun},
+        _from,
+        %{conn: conn} = state
+      ) do
+    Logger.info("database migration #{label}: begin")
+    Process.put(row_commit_key(conn), [])
+
+    result =
+      try do
+        :ok = execute_migration_pragmas(conn, before)
+        commit_phase(conn, fun, fenced_archetypes(state))
+      rescue
+        error -> {:error, error}
+      after
+        Process.delete(row_commit_key(conn))
+      end
+
+    case restore_migration_pragmas(conn, restore) do
+      [] ->
+        outcome = if match?({:ok, _}, result), do: "committed", else: "failed"
+        Logger.info("database migration #{label}: #{outcome}; runtime checks restored")
+        {:reply, result, state}
+
+      errors ->
+        primary =
+          case result do
+            {:error, error} -> Exception.message(error)
+            {:ok, _} -> "transaction committed"
+          end
+
+        error = %Error{
+          message: "migration #{label}: #{primary}; pragma restoration failed: #{inspect(errors)}"
+        }
+
+        # Never reuse a connection whose enforcement state could not be restored.
+        # Preserve the primary failure alongside the cleanup failure.
+        {:stop, error, {:error, error}, state}
+    end
+  end
+
   def handle_call({:query, sql, params}, _from, %{conn: conn} = state) do
     {:reply, {:ok, run_query(conn, sql, params)}, state}
   rescue
@@ -592,6 +698,20 @@ defmodule Tightbeam.DB do
   end
 
   defp row_commit_key(conn), do: {__MODULE__, :row_commits, conn}
+
+  defp execute_migration_pragmas(conn, statements) do
+    Enum.each(statements, fn statement -> :ok = Sqlite3.execute(conn, statement) end)
+    :ok
+  end
+
+  defp restore_migration_pragmas(conn, statements) do
+    Enum.flat_map(statements, fn statement ->
+      case Sqlite3.execute(conn, statement) do
+        :ok -> []
+        error -> [{statement, error}]
+      end
+    end)
+  end
 
   # Each real transaction owns a distinct queue. Invalidate it before sending
   # casts; later recognition failure cannot undo the first committed phase.

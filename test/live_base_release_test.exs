@@ -3,6 +3,7 @@ defmodule Tightbeam.LiveBaseReleaseTest do
 
   alias Exqlite.Sqlite3
   alias Tightbeam.{DB, LiveBaseAdmission, LiveBaseGuard, LiveBaseRelease, Schema}
+  import ExUnit.CaptureLog
 
   setup do
     suffix = System.unique_integer([:positive])
@@ -133,14 +134,105 @@ defmodule Tightbeam.LiveBaseReleaseTest do
         payload_root: app
       )
 
-    assert_raise Schema.ShapeError, ~r/migration .* failed and was rolled back/, fn ->
+    assert_raise Schema.ShapeError, ~r/migration .* failed: .*synthetic migration failure/, fn ->
       Schema.ensure_all(db)
     end
 
     predecessor = Schema.live_base_upgrade_predecessor()
     assert {:ok, [[^predecessor]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+    assert {:ok, [[0]]} = DB.query(db, "PRAGMA ignore_check_constraints")
+    assert :ok = DB.execute(db, "CREATE TEMP TABLE check_probe(n INTEGER CHECK(n > 0))")
+    assert {:error, reason} = DB.execute(db, "INSERT INTO check_probe VALUES(-1)")
+    assert reason =~ "CHECK constraint failed"
+    assert {:ok, columns} = DB.query(db, "PRAGMA table_info(decision_requests)")
+    refute Enum.any?(columns, fn [_, name | _] -> name == "ruledViaPrincipal" end)
     refute File.exists?(Path.join(base, "build-owner.json"))
     :ok = GenServer.stop(db)
+  end
+
+  @tag timeout: 600_000
+  test "a large guarded predecessor migration outlives 30s, preserves rows and restarts marked",
+       %{
+         root: root,
+         app: app,
+         base: base
+       } do
+    write_provenance!(root)
+    {:ok, manifest} = LiveBaseGuard.generate_manifest(LiveBaseAdmission.payload_files!(app))
+    File.write!(Path.join(app, "build-manifest.json"), JSON.encode!(manifest))
+    seed_real_predecessor!(base, app)
+    seed_migration_population!(base)
+    refute File.exists?(Path.join(base, "build-owner.json"))
+
+    {:ok, db} =
+      DB.start_link(
+        path: Path.join(base, "state.db"),
+        name: nil,
+        guard_inputs: [],
+        payload_root: app
+      )
+
+    log =
+      capture_log(fn ->
+        {elapsed, :ok} = :timer.tc(fn -> Schema.ensure_all(db) end)
+        assert elapsed > 30_000_000
+
+        IO.puts(
+          "M6 guarded migration: elapsed_us=#{elapsed} decisions=20000 lifecycle_events=150000"
+        )
+      end)
+
+    # The actual operator transaction, not fixture seeding or a sum of short
+    # calls, must exceed the old cap. This is its production census workload;
+    # no sleeping, dummy cross-join, trigger delay or mock DB is involved.
+    [_, elapsed] =
+      Regex.run(~r/migration call migration_transaction: finished elapsed_ms=(\d+)/, log)
+
+    assert String.to_integer(elapsed) > 30_000
+    assert log =~ "terminal census begin"
+    assert log =~ "stamp begin"
+    assert log =~ "runtime checks restored"
+    IO.puts(log)
+
+    target = hd(Schema.guard_compatible_stamps())
+    assert {:ok, [[^target]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok, [[20_000, 200_010_000]]} =
+             DB.query(
+               db,
+               "SELECT COUNT(*), SUM(raisedAt) FROM decision_requests WHERE id LIKE 'm6-%'"
+             )
+
+    assert {:ok, [[150_000]]} =
+             DB.query(
+               db,
+               "SELECT COUNT(*) FROM lifecycle_events WHERE kind = 'synthetic_m6_history'"
+             )
+
+    assert {:ok, [[0]]} = DB.query(db, "PRAGMA ignore_check_constraints")
+    assert {:ok, [[1]]} = DB.query(db, "PRAGMA foreign_keys")
+    assert {:ok, [[5000]]} = DB.query(db, "PRAGMA busy_timeout")
+    assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
+
+    assert {:error, _} =
+             DB.execute(db, "UPDATE decision_requests SET status = 'invalid' WHERE id = 'm6-1'")
+
+    marker = File.read!(Path.join(base, "build-owner.json"))
+    assert JSON.decode!(marker)["buildIdentity"] == manifest["buildIdentity"]
+    :ok = GenServer.stop(db)
+
+    {:ok, restarted} =
+      DB.start_link(
+        path: Path.join(base, "state.db"),
+        name: nil,
+        guard_inputs: [],
+        payload_root: app
+      )
+
+    assert :ok = Schema.ensure_all(restarted)
+    assert {:ok, [[^target]]} = DB.query(restarted, "SELECT shape FROM schema_stamp")
+    assert File.read!(Path.join(base, "build-owner.json")) == marker
+    :ok = GenServer.stop(restarted)
   end
 
   test "a valid explicit transition remains authoritative for a released package", %{
@@ -306,6 +398,28 @@ defmodule Tightbeam.LiveBaseReleaseTest do
       Path.join(base, "state.db"),
       app
     )
+  end
+
+  defp seed_migration_population!(base) do
+    {:ok, conn} = Sqlite3.open(Path.join(base, "state.db"))
+
+    :ok =
+      Sqlite3.execute(conn, """
+      BEGIN;
+      WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<20000)
+      INSERT INTO decision_requests
+        (id, kind, raiserId, raiserSessionKey, ownerUserId, raisedAt, deadlineAt,
+         actionKey, question, options, context, status, decision, ruledBy, ruledAt, rulingFactId)
+      SELECT 'm6-'||x, 'operator', 'session:synthetic', 'synthetic', 'synthetic', x, x+1,
+        'synthetic-m6', 'synthetic migration fixture', '["accept","reject"]', '{}',
+        'ruled', 'accept', 'user:synthetic', x, 1 FROM n;
+      WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<150000)
+      INSERT INTO lifecycle_events(ts, kind, subject, detail)
+        SELECT x, 'synthetic_m6_history', 'synthetic-'||x, 'synthetic historical event' FROM n;
+      COMMIT;
+      """)
+
+    :ok = Sqlite3.close(conn)
   end
 
   defp install_migration_failure_trigger!(base) do

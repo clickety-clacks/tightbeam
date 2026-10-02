@@ -3,6 +3,7 @@ defmodule Tightbeam.Schema do
 
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
+  require Logger
 
   @work_item_body_objects [
     %{
@@ -1464,6 +1465,10 @@ defmodule Tightbeam.Schema do
 
   @spec ensure_all(DB.server()) :: :ok
   def ensure_all(db) do
+    # All delegates receive this boot-only context, including queries, module
+    # DDL, later migrations and final marker publication. Runtime handles and
+    # SQLite busy_timeout are unaffected.
+    db = DB.migration_context(db)
     :ok = ensure_stamp_table(db)
     :ok = ensure_fresh_owner_link_origin(db)
     :ok = check_shape(db)
@@ -3635,12 +3640,17 @@ defmodule Tightbeam.Schema do
     # The reviewed predecessor census explicitly admits historically impossible
     # operator rows. SQLite revalidates table CHECK constraints while adding a
     # column, so suspend CHECK enforcement for this one exclusive activation
-    # transaction. The migration writes no request row and restores enforcement
-    # before the database can serve a call.
-    :ok = DB.execute(db, "PRAGMA ignore_check_constraints = ON")
+    # transaction. The owner-local migration call keeps the prelude, migration,
+    # and restoration in one serialized operation; it has no ordinary client
+    # deadline, while SQLite's busy_timeout still bounds lock waits.
+    case DB.migration_transaction(
+           db,
+           :operator_decision_v1,
+           ["PRAGMA ignore_check_constraints = ON"],
+           ["PRAGMA ignore_check_constraints = OFF"],
+           fn txn ->
+             Logger.info("database migration operator_decision_v1: DDL begin")
 
-    try do
-      case DB.transaction(db, fn txn ->
              :ok =
                Txn.exec(
                  txn,
@@ -3651,11 +3661,15 @@ defmodule Tightbeam.Schema do
                  """
                )
 
+             Logger.info("database migration operator_decision_v1: terminal census begin")
+
              :ok =
                Tightbeam.Escalation.ensure_terminal_parity_in_txn(
                  txn,
                  System.system_time(:millisecond)
                )
+
+             Logger.info("database migration operator_decision_v1: stamp begin")
 
              Txn.q(
                txn,
@@ -3674,20 +3688,18 @@ defmodule Tightbeam.Schema do
              end
 
              :ok
-           end) do
-        {:ok, :ok} ->
-          :ok
+           end
+         ) do
+      {:ok, :ok} ->
+        :ok
 
-        {:error, %ShapeError{} = error} ->
-          raise error
+      {:error, %ShapeError{} = error} ->
+        raise error
 
-        {:error, error} ->
-          raise ShapeError,
-            message:
-              "migration #{@operator_decision_shape} -> #{@terminal_decision_liveness_shape} failed and was rolled back: #{Exception.message(error)}"
-      end
-    after
-      :ok = DB.execute(db, "PRAGMA ignore_check_constraints = OFF")
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "migration #{@operator_decision_shape} -> #{@terminal_decision_liveness_shape} failed: #{Exception.message(error)}"
     end
   end
 
