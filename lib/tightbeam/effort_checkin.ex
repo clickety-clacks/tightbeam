@@ -4,8 +4,8 @@ defmodule Tightbeam.EffortCheckin do
 
   EFFECT is attributable durable advancement since the bracket armed: an
   artifact the holder recorded for the assignment's work item, an attest on the
-  assignment or one of the work item's linked assignments, an update to that
-  work item, or a bound pending continuation checkpoint. Turns, including
+  assignment or attributable linked delivery on the same work item, an update
+  to that work item, or a bound pending continuation checkpoint. Turns, including
   assignment-attributed delivered turns, are liveness telemetry rather than
   advancement. The check-in's own turns and workspace writes are effort, never
   effect. Work done elsewhere (another machine, a service, a person) is
@@ -1248,7 +1248,9 @@ defmodule Tightbeam.EffortCheckin do
 
   # All activity channels are read in the verdict's own transaction. Exact-card
   # attests retain their original channel. Linked-card attests make portfolio
-  # obligations reflect work that advanced on the same work item. Attributed
+  # obligations reflect same-holder work and non-review delivery cards opened
+  # by that portfolio holder, without letting an unrelated sibling holder
+  # silence a stalled obligation. Attributed
   # turns remain visible in evidence, but do not count as effect: a turn proves
   # liveness, not advancement. A checkpoint counts only through the native
   # assignment binding and while its wake is still pending.
@@ -1286,8 +1288,10 @@ defmodule Tightbeam.EffortCheckin do
           FROM attests AS t
           JOIN assignments AS a ON a.id=t.assignmentId
           WHERE a.workItemId=?1 AND a.id!=?2 AND t.rowid>?3
+            AND a.reviewsAssignmentId IS NULL
+            AND (a.holderKey=?4 OR a.openedBySession=?4)
           """,
-          [item, generation.assignment_id, generation.attest_watermark]
+          [item, generation.assignment_id, generation.attest_watermark, generation.holder_key]
         )
 
       _ ->

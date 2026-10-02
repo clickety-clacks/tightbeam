@@ -453,6 +453,74 @@ defmodule Tightbeam.EffortCheckinTest do
 
     assert nil == fire_probe(ctx, portfolio.id)
     assert Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == portfolio.id)) == []
+
+    worker = session(ctx.db, "linked-worker", "h1", Placement.local_host_name())
+    unrelated_item = work_item!(ctx.db, "unrelated sibling")
+
+    unrelated_portfolio =
+      dispatch_for_item(
+        ctx,
+        {:session, "parent"},
+        "holder",
+        "unrelated portfolio",
+        unrelated_item.id
+      )
+
+    unrelated =
+      dispatch_for_item(
+        ctx,
+        {:session, "parent"},
+        worker.session_key,
+        "unrelated other-holder delivery",
+        unrelated_item.id
+      )
+
+    assignment(ctx, "attest", {:session, worker.session_key}, nil, %{
+      assignment_id: unrelated.id,
+      kind: "progress",
+      note: "a different holder advanced an unrelated sibling"
+    })
+
+    assert nil == fire_probe(ctx, unrelated_portfolio.id)
+
+    assert [_prod] =
+             Enum.filter(
+               prods(ctx.db, "holder"),
+               &(&1.assignment_id == unrelated_portfolio.id)
+             )
+
+    delegated_item = work_item!(ctx.db, "owner delegated child")
+
+    delegated_portfolio =
+      dispatch_for_item(
+        ctx,
+        {:session, "parent"},
+        "holder",
+        "delegating portfolio",
+        delegated_item.id
+      )
+
+    delegated =
+      dispatch_for_item(
+        ctx,
+        {:session, "holder"},
+        worker.session_key,
+        "explicitly delegated child",
+        delegated_item.id
+      )
+
+    assignment(ctx, "attest", {:session, worker.session_key}, nil, %{
+      assignment_id: delegated.id,
+      kind: "progress",
+      note: "the portfolio holder's delegated child advanced"
+    })
+
+    assert nil == fire_probe(ctx, delegated_portfolio.id)
+
+    assert Enum.filter(
+             prods(ctx.db, "holder"),
+             &(&1.assignment_id == delegated_portfolio.id)
+           ) == []
   end
 
   test "a terminal race suppresses output while a truly idle open assignment still prods", ctx do
