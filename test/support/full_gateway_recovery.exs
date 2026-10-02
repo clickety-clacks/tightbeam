@@ -150,17 +150,21 @@ defmodule Tightbeam.RecoveryScenario do
   end
 
   def recovered! do
-    await!(fn ->
-      rows("SELECT status FROM turns WHERE sessionKey='agent:recovery:a' ORDER BY seq") == [
-        ["failed_unknown"],
-        ["delivered"],
-        ["delivered"]
-      ] and
-        rows("SELECT status FROM turns WHERE wakeId='w_recovery_b'") == [["delivered"]] and
-        rows(
-          "SELECT state FROM wakes WHERE wakeId IN ('w_recovery_b','w_recovery_c') ORDER BY wakeId"
-        ) == [["fired"], ["fired"]]
-    end, nil, &recovery_barrier_state/0)
+    await!(
+      fn ->
+        rows("SELECT status FROM turns WHERE sessionKey='agent:recovery:a' ORDER BY seq") == [
+          ["failed_unknown"],
+          ["delivered"],
+          ["delivered"]
+        ] and
+          rows("SELECT status FROM turns WHERE wakeId='w_recovery_b'") == [["delivered"]] and
+          rows(
+            "SELECT state FROM wakes WHERE wakeId IN ('w_recovery_b','w_recovery_c') ORDER BY wakeId"
+          ) == [["fired"], ["fired"]]
+      end,
+      nil,
+      &recovery_barrier_state/0
+    )
 
     [
       [source_turn_seq, "failed_unknown", source_message_id, source_origin, source_prompt],
