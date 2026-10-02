@@ -79,6 +79,15 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
           });
         }
 
+        if (id === "effort" && models[sid] === "synthetic-invalid-effort") {
+          // Recorded codex-acp carrier: an effort refusal can be JSON-RPC
+          // -32602 Invalid params without an effort-specific message.
+          return send({
+            id: request.id,
+            error: { code: -32602, message: "Invalid params" }
+          });
+        }
+
         if (id === "model") models[sid] = value;
         if (id === "effort") efforts[sid] = value;
         return send({ id: request.id, result: configOptions(sid) });
@@ -432,6 +441,87 @@ defmodule Tightbeam.ModelSelectionRingDownTest do
 
       publish.("delivered")
     end)
+  end
+
+  test "turn advances through recorded invalid-params effort carrier" do
+    preferences = [
+      {"synthetic-invalid-effort", "max", nil},
+      {"synthetic-success", "high", "wide"}
+    ]
+
+    with_gateway(
+      fn %{db: db, config: config, lane: lane} ->
+        effort_model = Model.new("synthetic-invalid-effort", effort: "max")
+        selected = Model.new("synthetic-success", effort: "high", context: "wide")
+        session_key = "ring-recorded-effort"
+
+        [effort_reason] = production_model_use_failures([effort_model])
+
+        assert %{"code" => -32602, "message" => "Invalid params"} =
+                 ErrorDiagnostic.classified(effort_reason)
+
+        assert %{"phase" => "effort"} = ErrorDiagnostic.of(effort_reason)
+
+        Org.create(db, %{
+          session_key: session_key,
+          display_name: "Synthetic recorded effort ring",
+          owner_user_id: "synthetic-owner",
+          origin: "user:synthetic-owner",
+          archetype: "synthetic-ring",
+          host: "testhost",
+          harness: "fixture",
+          provider: "fixture_provider",
+          model: effort_model
+        })
+
+        {:ok, adapter} =
+          RingDownAdapter.start_link(
+            parent: self(),
+            outcomes: %{
+              effort_model.family => {:error, effort_reason},
+              selected.family => {:ok, "synthetic-recorded-effort-session"}
+            },
+            readback: %{"synthetic-recorded-effort-session" => selected}
+          )
+
+        {:ok, _coordinator} = CoordinatorStub.start_link({adapter, self()})
+        runner = runner(config)
+
+        assert :appended =
+                 Gateway.deliver_prompt(session_key, "user:synthetic-owner", "select",
+                   db: db,
+                   lane_manager: lane,
+                   conn_registry: ConnRegistry,
+                   client_message_id: "ring-recorded-effort-client"
+                 )
+
+        assert {:ok, turn} = Ledger.claim_next(db, session_key, "ring-test")
+
+        assert {:ok, %{terminal_publish: publish}} =
+                 runner.(Map.put(turn, :session_key, session_key))
+
+        assert_receive {:model_attempt, ^effort_model}
+        assert_receive {:model_attempt, ^selected}
+        refute_receive {:model_attempt, _}
+        assert Org.get(db, session_key).model == selected
+
+        details =
+          EventLog.lifecycle_events(db)
+          |> Enum.filter(&(&1.kind == "model_selection_attempt"))
+          |> Enum.map(& &1.detail)
+          |> Enum.join("\n")
+
+        assert details =~ "Invalid params"
+        assert details =~ "effort"
+        assert details =~ "original_reason"
+        assert details =~ "diagnostic"
+
+        assert :ok = Ledger.finish(db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+
+        publish.("delivered")
+      end,
+      preferences
+    )
   end
 
   test "successful setup is not gated by cached model readback" do

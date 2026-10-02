@@ -3876,34 +3876,38 @@ defmodule Tightbeam.Gateway do
 
   defp model_selection_classified_failure?(_classification), do: false
 
-  # The production ACP adapter returns a diagnosed JSON-RPC map directly from
-  # a fresh session, and wraps that same carrier as {:model_apply_failed, ...}
-  # when pushing a resident session. The diagnostic phase is the boundary that
-  # distinguishes an effort refusal from an unrelated JSON-RPC failure.
+  # The production ACP adapter preserves the original JSON-RPC carrier and
+  # attaches phase: "effort" when the effort request is refused. The carrier
+  # message is not reliable: the adapter records this as -32602 "Invalid
+  # params" without the word "effort". The phase is therefore the eligibility signal;
+  # known transport and terminal classes remain excluded from ring-down.
   defp adapter_effort_refusal?(classified, %{"phase" => "effort"}) do
-    case adapter_failure_message(classified) do
-      message when is_binary(message) ->
-        downcased = String.downcase(message)
-
-        String.contains?(downcased, "effort") and
-          (String.contains?(downcased, "refus") or
-             String.contains?(downcased, "invalid") or
-             String.contains?(downcased, "not offer") or
-             String.contains?(downcased, "unsupported"))
-
-      _ ->
-        false
-    end
+    not terminal_effort_failure?(classified)
   end
 
   defp adapter_effort_refusal?(_classified, _diagnostic), do: false
 
-  defp adapter_failure_message(%{"message" => message}), do: message
+  defp terminal_effort_failure?(classification)
+       when classification in [
+              :closed,
+              :timeout,
+              :cancelled,
+              :canceled,
+              :model_transport_failure,
+              :credential,
+              :quota,
+              :trace,
+              :degraded
+            ],
+       do: true
 
-  defp adapter_failure_message({:model_apply_failed, %{"message" => message}}),
-    do: message
+  defp terminal_effort_failure?(classification) when is_tuple(classification) do
+    classification
+    |> Tuple.to_list()
+    |> Enum.any?(&terminal_effort_failure?/1)
+  end
 
-  defp adapter_failure_message(_classified), do: nil
+  defp terminal_effort_failure?(_classification), do: false
 
   defp model_selection_snapshot(nil), do: "unavailable"
 
