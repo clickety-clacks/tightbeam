@@ -3635,12 +3635,15 @@ defmodule Tightbeam.Schema do
     # The reviewed predecessor census explicitly admits historically impossible
     # operator rows. SQLite revalidates table CHECK constraints while adding a
     # column, so suspend CHECK enforcement for this one exclusive activation
-    # transaction. The migration writes no request row and restores enforcement
-    # before the database can serve a call.
-    :ok = DB.execute(db, "PRAGMA ignore_check_constraints = ON")
-
-    try do
-      case DB.transaction(db, fn txn ->
+    # transaction. The owner-local migration call keeps the prelude, migration,
+    # and restoration in one serialized operation; it has no ordinary client
+    # deadline, while SQLite's busy_timeout still bounds lock waits.
+    case DB.migration_transaction(
+           db,
+           :operator_decision_v1,
+           ["PRAGMA ignore_check_constraints = ON"],
+           ["PRAGMA ignore_check_constraints = OFF"],
+           fn txn ->
              :ok =
                Txn.exec(
                  txn,
@@ -3674,20 +3677,18 @@ defmodule Tightbeam.Schema do
              end
 
              :ok
-           end) do
-        {:ok, :ok} ->
-          :ok
+           end
+         ) do
+      {:ok, :ok} ->
+        :ok
 
-        {:error, %ShapeError{} = error} ->
-          raise error
+      {:error, %ShapeError{} = error} ->
+        raise error
 
-        {:error, error} ->
-          raise ShapeError,
-            message:
-              "migration #{@operator_decision_shape} -> #{@terminal_decision_liveness_shape} failed and was rolled back: #{Exception.message(error)}"
-      end
-    after
-      :ok = DB.execute(db, "PRAGMA ignore_check_constraints = OFF")
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "migration #{@operator_decision_shape} -> #{@terminal_decision_liveness_shape} failed and was rolled back: #{Exception.message(error)}"
     end
   end
 

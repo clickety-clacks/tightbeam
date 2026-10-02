@@ -111,6 +111,62 @@ defmodule Tightbeam.DBCallTimeoutTest do
     assert {:ok, [[1]]} = DB.query_until(db, "SELECT 1", [], deadline)
   end
 
+  @tag timeout: 60_000
+  test "a large-base schema migration outlives the former 30s client timeout" do
+    Application.delete_env(:tightbeam, :db_call_timeout_ms)
+    assert DB.call_timeout() == 30_000
+    db = start_supervised!({DB, path: ":memory:", name: nil})
+    parent = self()
+
+    assert {:ok, :ok} =
+             DB.migration_transaction(
+               db,
+               :synthetic_large_base,
+               ["PRAGMA ignore_check_constraints = ON"],
+               ["PRAGMA ignore_check_constraints = OFF"],
+               fn txn ->
+                 send(parent, :migration_started)
+                 # A real large-base DDL phase can exceed the former client
+                 # wait. Keep this synthetic phase just over that boundary so
+                 # the test fails if migrations are routed through call_timeout.
+                 Process.sleep(30_050)
+                 :ok = Tightbeam.DB.Txn.exec(txn, "CREATE TABLE migration_fixture (id INTEGER)")
+                 :ok
+               end
+             )
+
+    assert_receive :migration_started
+    assert {:ok, [[0]]} = DB.query(db, "PRAGMA ignore_check_constraints")
+
+    assert {:ok, [["migration_fixture"]]} =
+             DB.query(db, "SELECT name FROM sqlite_master WHERE type='table' AND name=?1", [
+               "migration_fixture"
+             ])
+  end
+
+  test "a failed schema migration rolls back and restores checks" do
+    db = start_supervised!({DB, path: ":memory:", name: nil})
+
+    assert {:error, %RuntimeError{message: "synthetic migration failure"}} =
+             DB.migration_transaction(
+               db,
+               :synthetic_failure,
+               ["PRAGMA ignore_check_constraints = ON"],
+               ["PRAGMA ignore_check_constraints = OFF"],
+               fn txn ->
+                 :ok = Tightbeam.DB.Txn.exec(txn, "CREATE TABLE rolled_back (id INTEGER)")
+                 raise "synthetic migration failure"
+               end
+             )
+
+    assert {:ok, [[0]]} = DB.query(db, "PRAGMA ignore_check_constraints")
+
+    assert {:ok, []} =
+             DB.query(db, "SELECT name FROM sqlite_master WHERE type='table' AND name=?1", [
+               "rolled_back"
+             ])
+  end
+
   @tag timeout: 20_000
   test "a gateway read survives a transient owner queue longer than the legacy 5s default" do
     Application.delete_env(:tightbeam, :db_call_timeout_ms)

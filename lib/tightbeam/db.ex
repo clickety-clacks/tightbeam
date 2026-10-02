@@ -347,6 +347,35 @@ defmodule Tightbeam.DB do
   @doc false
   def finish_schema(server), do: GenServer.call(server, :finish_schema, call_timeout())
 
+  @doc """
+  Run a schema migration in the DB owner without the runtime client deadline.
+
+  Migrations are serialized, transactional work whose duration is determined by
+  the database size. They must not be sent through the ordinary bounded runtime
+  calls: a caller timeout can leave the owner finishing the transaction while a
+  cleanup call waits behind it and reports the wrong phase. The SQLite
+  `busy_timeout` remains the connection's lock-wait bound; this `:infinity`
+  applies only to the caller waiting for this migration result.
+
+  Primary references: `GenServer.call/3` timeout semantics
+  (https://www.erlang.org/doc/apps/stdlib/gen_server.html#call/3) and SQLite's
+  `busy_timeout` pragma (https://sqlite.org/pragma.html#pragma_busy_timeout) and
+  `ignore_check_constraints` pragma
+  (https://sqlite.org/pragma.html#pragma_ignore_check_constraints).
+  """
+  @spec migration_transaction(
+          server(),
+          atom(),
+          [String.t()],
+          [String.t()],
+          (Tightbeam.DB.Txn.t() -> result)
+        ) :: {:ok, result} | {:error, Exception.t()}
+        when result: term()
+  def migration_transaction(server, label, before, restore, fun)
+      when is_atom(label) and is_list(before) and is_list(restore) and is_function(fun, 1) do
+    GenServer.call(server, {:migration_transaction, label, before, restore, fun}, :infinity)
+  end
+
   @doc false
   def assert_base_admitted!(server, base) do
     case GenServer.call(server, {:assert_base_admitted, base}, call_timeout()) do
@@ -476,6 +505,31 @@ defmodule Tightbeam.DB do
     end
   end
 
+  def handle_call(
+        {:migration_transaction, label, before, restore, fun},
+        _from,
+        %{conn: conn} = state
+      ) do
+    Logger.info("database migration #{label}: begin")
+    :ok = execute_migration_pragmas(conn, before)
+    Process.put(row_commit_key(conn), [])
+
+    try do
+      result = commit_phase(conn, fun, fenced_archetypes(state))
+
+      case result do
+        {:ok, _} -> Logger.info("database migration #{label}: transaction committed")
+        {:error, _} -> Logger.warning("database migration #{label}: transaction rolled back")
+      end
+
+      {:reply, result, state}
+    after
+      Process.delete(row_commit_key(conn))
+      :ok = execute_migration_pragmas(conn, restore)
+      Logger.info("database migration #{label}: runtime checks restored")
+    end
+  end
+
   def handle_call({:query, sql, params}, _from, %{conn: conn} = state) do
     {:reply, {:ok, run_query(conn, sql, params)}, state}
   rescue
@@ -592,6 +646,11 @@ defmodule Tightbeam.DB do
   end
 
   defp row_commit_key(conn), do: {__MODULE__, :row_commits, conn}
+
+  defp execute_migration_pragmas(conn, statements) do
+    Enum.each(statements, fn statement -> :ok = Sqlite3.execute(conn, statement) end)
+    :ok
+  end
 
   # Each real transaction owns a distinct queue. Invalidate it before sending
   # casts; later recognition failure cannot undo the first committed phase.
