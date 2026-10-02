@@ -5,10 +5,11 @@ defmodule Tightbeam.EffortCheckin do
   EFFECT is attributable durable advancement since the bracket armed: an
   artifact the holder recorded for the assignment's work item, an attest on the
   assignment or one of the work item's linked assignments, an update to that
-  work item, an assignment-attributed delivered turn, or a bound pending
-  continuation checkpoint. The check-in's own turns and workspace writes are
-  effort, never effect. Work done elsewhere (another machine, a service, a
-  person) is surfaced by RECORDING AN ARTIFACT on the card's work item.
+  work item, or a bound pending continuation checkpoint. Turns, including
+  assignment-attributed delivered turns, are liveness telemetry rather than
+  advancement. The check-in's own turns and workspace writes are effort, never
+  effect. Work done elsewhere (another machine, a service, a person) is
+  surfaced by RECORDING AN ARTIFACT on the card's work item.
 
   Zero effect on every channel prods the AGENT first — one wake naming the three
   channels. Continued silence climbs the holder's active operational parents
@@ -1247,11 +1248,10 @@ defmodule Tightbeam.EffortCheckin do
 
   # All activity channels are read in the verdict's own transaction. Exact-card
   # attests retain their original channel. Linked-card attests make portfolio
-  # obligations reflect work that advanced on the same work item. A turn counts
-  # only when the ledger attributes it to this assignment and it did not come
-  # from this check-in process, so a prod cannot manufacture its own clearance.
-  # A checkpoint counts only through the native assignment binding and while its
-  # wake is still pending.
+  # obligations reflect work that advanced on the same work item. Attributed
+  # turns remain visible in evidence, but do not count as effect: a turn proves
+  # liveness, not advancement. A checkpoint counts only through the native
+  # assignment binding and while its wake is still pending.
   defp channels(txn, generation, _inspection) do
     %{
       artifacts: artifact_updates(txn, generation),
@@ -1271,7 +1271,7 @@ defmodule Tightbeam.EffortCheckin do
 
   defp effect?(channels) do
     channels.artifacts > 0 or channels.attests > 0 or channels.linkedAttests > 0 or
-      channels.workItems > 0 or channels.attributedTurns > 0 or channels.checkpoints > 0
+      channels.workItems > 0 or channels.checkpoints > 0
   end
 
   defp linked_attest_updates(txn, generation) do
@@ -1551,9 +1551,10 @@ defmodule Tightbeam.EffortCheckin do
   end
 
   defp channel_sentence(evidence) do
-    "no artifacts, attests, or work-item updates; no linked-card progress, " <>
-      "attributed turns, or bound checkpoints observed since " <>
-      "#{evidence.minutesSinceArmed}m ago (#{evidence.turnsSinceArmed} turns taken)."
+    "no artifacts, attests, or work-item updates; no linked-card progress or " <>
+      "bound checkpoints observed since #{evidence.minutesSinceArmed}m ago " <>
+      "(#{evidence.turnsSinceArmed} turns taken; " <>
+      "#{evidence.channels.attributedTurns} attributed delivered turns are liveness only)."
   end
 
   defp advanced_baseline(_baseline, {:ok, _observation} = inspection), do: inspection

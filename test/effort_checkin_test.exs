@@ -392,14 +392,13 @@ defmodule Tightbeam.EffortCheckinTest do
            ]) == [[0]]
   end
 
-  test "attributed work turns, bound checkpoints, and linked-card attests advance a bracket",
+  test "turns stay diagnostic while bound checkpoints and linked-card attests advance a bracket",
        ctx do
     attributed = dispatch(ctx, {:session, "parent"}, "holder", "attributed turn")
     terminal_assignment_turn(ctx.db, "holder", attributed.id, "agent:parent")
 
     assert nil == fire_probe(ctx, attributed.id)
-    assert Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == attributed.id)) == []
-    assert bracket_state(ctx.db, attributed.id) == "armed"
+    assert [_prod] = Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == attributed.id))
 
     self_generated = dispatch(ctx, {:session, "parent"}, "holder", "self-generated turn")
     terminal_assignment_turn(ctx.db, "holder", self_generated.id, "process:tightbeam")
