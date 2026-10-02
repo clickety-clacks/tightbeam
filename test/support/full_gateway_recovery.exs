@@ -3,18 +3,20 @@ defmodule Tightbeam.RecoveryScenario do
 
   alias Tightbeam.{DB, Gateway, Model, Org, Placement, Wakes}
 
-  def await!(predicate, deadline \\ nil) do
+  def await!(predicate, deadline \\ nil, diagnostic \\ nil) do
     deadline = deadline || System.monotonic_time(:millisecond) + 60_000
 
     if predicate.() do
       :ok
     else
-      if System.monotonic_time(:millisecond) >= deadline,
-        do: raise("recovery scenario barrier timed out")
+      if System.monotonic_time(:millisecond) >= deadline do
+        detail = if diagnostic, do: ": #{inspect(diagnostic.(), limit: :infinity)}", else: ""
+        raise("recovery scenario barrier timed out#{detail}")
+      end
 
       receive do
       after
-        20 -> await!(predicate, deadline)
+        20 -> await!(predicate, deadline, diagnostic)
       end
     end
   end
@@ -158,7 +160,7 @@ defmodule Tightbeam.RecoveryScenario do
         rows(
           "SELECT state FROM wakes WHERE wakeId IN ('w_recovery_b','w_recovery_c') ORDER BY wakeId"
         ) == [["fired"], ["fired"]]
-    end)
+    end, nil, &recovery_barrier_state/0)
 
     [
       [source_turn_seq, "failed_unknown", source_message_id, source_origin, source_prompt],
@@ -203,6 +205,29 @@ defmodule Tightbeam.RecoveryScenario do
     end
 
     snapshot()
+  end
+
+  defp recovery_barrier_state do
+    %{
+      a_turns:
+        rows(
+          "SELECT seq,status,messageId,wakeId,origin,prompt FROM turns WHERE sessionKey='agent:recovery:a' ORDER BY seq"
+        ),
+      wake_turns:
+        rows(
+          "SELECT seq,wakeId,sessionKey,status FROM turns WHERE wakeId IN ('w_recovery_b','w_recovery_c') ORDER BY seq"
+        ),
+      wakes:
+        rows(
+          "SELECT wakeId,sessionKey,state,firedAt FROM wakes WHERE wakeId IN ('w_recovery_b','w_recovery_c') ORDER BY wakeId"
+        ),
+      redelivery:
+        rows(
+          "SELECT sessionKey,sourceTurnSeq,restorationTurnSeq,redeliveryTurnSeq,failureClass,parentSessionKey FROM health_redelivery_attempts WHERE sessionKey='agent:recovery:a'"
+        ),
+      assignment_notice:
+        rows("SELECT reminderState FROM assignments WHERE id='asg_recovery_preserve'")
+    }
   end
 end
 
