@@ -75,11 +75,7 @@ port_path = Path.join(base, "restart-port")
 
 port =
   if fresh do
-    {:ok, listener} = :gen_tcp.listen(0, [:binary, active: false, ip: {127, 0, 0, 1}])
-    {:ok, {_, selected}} = :inet.sockname(listener)
-    :ok = :gen_tcp.close(listener)
-    File.write!(port_path, Integer.to_string(selected))
-    selected
+    0
   else
     port_path |> File.read!() |> String.to_integer()
   end
@@ -111,6 +107,21 @@ if System.get_env("FIREHOSE_MISSING_EXECUTABLE") == "1" do
 end
 
 {:ok, _apps} = Application.ensure_all_started(:tightbeam)
+{Bandit, bandit, _, _} =
+  Supervisor.which_children(Tightbeam.Supervisor)
+  |> List.keyfind(Bandit, 0)
+
+{:ok, {_, bound_port}} = ThousandIsland.listener_info(bandit)
+true = bound_port > 0
+
+if fresh do
+  File.write!(port_path, Integer.to_string(bound_port))
+else
+  ^port = bound_port
+end
+
+port = port_path |> File.read!() |> String.to_integer()
+^bound_port = port
 
 import ExUnit.Assertions
 
