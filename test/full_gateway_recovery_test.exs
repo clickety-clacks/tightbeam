@@ -63,8 +63,8 @@ defmodule Tightbeam.FullGatewayRecoveryTest do
           assert before[table] == after_state[table], "unexpected mutation of #{table}"
         end
 
-        # R1 permits the first notice for a legacy-null open obligation. Bind
-        # that one new claim exactly; no other assignment mutation is permitted.
+        # R1 permits one notice for the legacy-null open obligation. Its
+        # immediate wake may finish while A's recovery and B/C are settling.
         assert before["columns"] == after_state["columns"]
         assignment_columns = before["columns"]["assignments"]
         assert [prior_row] = before["assignments"]
@@ -78,21 +78,34 @@ defmodule Tightbeam.FullGatewayRecoveryTest do
         assert prior["openedByUser"] == "recovery-admin"
         assert prior["state"] == "open"
         claim = JSON.decode!(encoded)
-        assert %{"pending" => %{"consumer" => %{"wake" => notice_id}}} = claim
+        assert %{"lastConsumer" => %{"wake" => notice_id}} = claim
+
+        turn_columns = after_state["columns"]["turns"]
+        after_turns = Enum.map(after_state["turns"], &Map.new(Enum.zip(turn_columns, &1)))
+        a_turns = Enum.filter(after_turns, &(&1["sessionKey"] == prior["holderKey"]))
+        assert length(a_turns) == 4
+        assert Enum.count(a_turns, &is_nil(&1["wakeId"])) == 3
+        assert [notice_turn] = Enum.filter(a_turns, &(&1["wakeId"] == notice_id))
+        assert notice_turn["assignmentId"] == prior["id"]
+        assert notice_turn["status"] == "delivered"
+        assert is_integer(notice_turn["endedAt"])
+
+        notice_snapshot = %{
+          "kind" => "prod",
+          "target" => prior["holderKey"],
+          "consequence" => nil
+        }
 
         assert claim == %{
                  "version" => 1,
                  "claimEpoch" => 1,
-                 "pending" => %{
-                   "consumer" => %{"wake" => notice_id},
-                   "intent" => notice_id,
-                   "epoch" => 1,
-                   "snapshot" => %{
-                     "kind" => "prod",
-                     "target" => prior["holderKey"],
-                     "consequence" => nil
-                   }
-                 }
+                 "pending" => nil,
+                 "lastSnapshot" => notice_snapshot,
+                 "lastIntent" => notice_id,
+                 "lastConsumer" => %{"wake" => notice_id},
+                 "lastDeliveredAt" => notice_turn["endedAt"],
+                 "backoffStep" => 0,
+                 "nextEligibleAt" => notice_turn["endedAt"] + 300_000
                }
 
         wake_columns = before["columns"]["wakes"]
@@ -104,8 +117,10 @@ defmodule Tightbeam.FullGatewayRecoveryTest do
         assert notice["sessionKey"] == prior["holderKey"]
         assert notice["ownerUserId"] == prior["openedByUser"]
         assert notice["origin"] == "process:tightbeam"
-        assert notice["state"] == "pending"
-        assert notice["firedAt"] == nil
+        assert notice["state"] == "fired"
+        assert is_integer(notice["firedAt"])
+        assert notice_turn["origin"] == notice["origin"]
+        assert notice_turn["prompt"] == "[from #{notice["origin"]}]\n\n#{notice["prompt"]}"
 
         # Every committed pre-crash message remains byte-identical exactly once.
         assert length(before["artifacts"]) >= 1

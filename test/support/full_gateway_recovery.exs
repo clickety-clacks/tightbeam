@@ -35,7 +35,7 @@ defmodule Tightbeam.RecoveryScenario do
     )
     |> Map.put(
       "columns",
-      Map.new(~w(assignments wakes), fn table ->
+      Map.new(~w(assignments wakes turns), fn table ->
         {table, Enum.map(rows("PRAGMA table_info(#{table})"), &Enum.at(&1, 1))}
       end)
     )
@@ -152,7 +152,9 @@ defmodule Tightbeam.RecoveryScenario do
   def recovered! do
     await!(
       fn ->
-        rows("SELECT status FROM turns WHERE sessionKey='agent:recovery:a' ORDER BY seq") == [
+        rows(
+          "SELECT status FROM turns WHERE sessionKey='agent:recovery:a' AND wakeId IS NULL ORDER BY seq"
+        ) == [
           ["failed_unknown"],
           ["delivered"],
           ["delivered"]
@@ -160,7 +162,13 @@ defmodule Tightbeam.RecoveryScenario do
           rows("SELECT status FROM turns WHERE wakeId='w_recovery_b'") == [["delivered"]] and
           rows(
             "SELECT state FROM wakes WHERE wakeId IN ('w_recovery_b','w_recovery_c') ORDER BY wakeId"
-          ) == [["fired"], ["fired"]]
+          ) == [["fired"], ["fired"]] and
+          rows("SELECT state FROM wakes WHERE assignmentId='asg_recovery_preserve'") == [
+            ["fired"]
+          ] and
+          rows("SELECT status FROM turns WHERE assignmentId='asg_recovery_preserve'") == [
+            ["delivered"]
+          ]
       end,
       nil,
       &recovery_barrier_state/0
@@ -179,7 +187,7 @@ defmodule Tightbeam.RecoveryScenario do
     ] =
       rows("""
       SELECT seq,status,messageId,origin,prompt
-      FROM turns WHERE sessionKey='agent:recovery:a' ORDER BY seq
+      FROM turns WHERE sessionKey='agent:recovery:a' AND wakeId IS NULL ORDER BY seq
       """)
 
     assert source_turn_seq < successor_turn_seq
