@@ -35,7 +35,8 @@ defmodule Tightbeam.Rules do
   `assignment.prior_completed_fix_count` (completed, non-review assignments on
   the same work item, excluding the current assignment), and the row-commit-only
   `work_item.review_verdict_count` (review verdict attest rows on the item
-  through the current row). On an
+  through the current row) and `work_item.changes_requested_count` (all
+  changes-requested verdicts across its review assignments). On an
   implementation `dispatch`, the assignment facts project the latest completed
   fix for the supplied work item so a re-fix gate can inspect its commissioned
   verdicts before the next assignment exists.
@@ -118,6 +119,7 @@ defmodule Tightbeam.Rules do
     holder_archetype
     assignment_opener_session
     assignment_opener_or_coordinator_session
+    reviewed_producer_assignment_opener_session
     session_key
     session_unassigned_stretch_id
     caller_session_key
@@ -181,6 +183,7 @@ defmodule Tightbeam.Rules do
     "assignment.review_verdict_count" => :int,
     "assignment.prior_completed_fix_count" => :int,
     "work_item.review_verdict_count" => :int,
+    "work_item.changes_requested_count" => :int,
     "work_item.fourth_round_kind" => :string,
     "turn.queued_count" => :int,
     "turn.oldest_age_ms" => :int,
@@ -799,6 +802,11 @@ defmodule Tightbeam.Rules do
     assignment_opener_session =
       assignment && assignment_opener_session(db, assignment.id)
 
+    reviewed_producer_assignment_opener_session =
+      if assignment && is_binary(assignment.reviews_assignment_id) do
+        assignment_opener_session(db, assignment.reviews_assignment_id)
+      end
+
     active_assignment_opener_session = active_notice_session(db, assignment_opener_session)
 
     work_item_coordinator_session =
@@ -820,6 +828,7 @@ defmodule Tightbeam.Rules do
       holder_role: assignment && assignment[:holder_role],
       holder_archetype: assignment && assignment.holder_archetype,
       assignment_opener_session: assignment_opener_session,
+      reviewed_producer_assignment_opener_session: reviewed_producer_assignment_opener_session,
       assignment_opener_or_coordinator_session:
         active_assignment_opener_session || work_item_coordinator_session,
       session_key: Map.get(call.params, :session_key),
@@ -2822,6 +2831,42 @@ defmodule Tightbeam.Rules do
       %{assignment_id: assignment_id, kind: kind, verdict_kind: verdict_kind}
     else
       _ -> nil
+    end
+  end
+
+  # Count only committed changes-requested verdicts, across every review
+  # assignment whose reviewed producer belongs to this work item. No counter
+  # is persisted, so later review assignments share the same threshold.
+  defp compute_fact("work_item.changes_requested_count", db, call, cache) do
+    case {row_commit_attest_record(db, call), fetch_fact("$assignment", db, call, cache)} do
+      {%{kind: "verdict", verdict_kind: "changes-requested"},
+       {:ok, %{reviews_assignment_id: reviewed_assignment_id} = assignment, cache}}
+      when is_binary(reviewed_assignment_id) ->
+        case row_commit_work_item_id(db, call, assignment) do
+          work_item_id when is_binary(work_item_id) ->
+            {:ok, [[count]]} =
+              DB.query(
+                db,
+                """
+                SELECT COUNT(*)
+                FROM attests verdict
+                JOIN assignments review ON review.id=verdict.assignmentId
+                JOIN assignments producer ON producer.id=review.reviewsAssignmentId
+                WHERE COALESCE(review.workItemId,producer.workItemId)=?1
+                  AND verdict.kind='verdict'
+                  AND verdict.verdictKind='changes-requested'
+                """,
+                [work_item_id]
+              )
+
+            {count, cache}
+
+          _ ->
+            {nil, cache}
+        end
+
+      _ ->
+        {nil, cache}
     end
   end
 

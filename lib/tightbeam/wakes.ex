@@ -3004,9 +3004,59 @@ defmodule Tightbeam.Wakes do
         :ok
 
       {:error, reason} ->
-        raise "notice #{rule.name} has unresolved target: #{inspect(reason)}"
+        case request_unowned_agent_stretch_decision_in_txn(txn, rule, call, evidence) do
+          :handled ->
+            :ok
+
+          :not_applicable ->
+            raise "notice #{rule.name} has unresolved target: #{inspect(reason)}"
+        end
     end
   end
+
+  defp request_unowned_agent_stretch_decision_in_txn(
+         txn,
+         %{name: "ac6a-unassigned-agent-turn"},
+         call,
+         evidence
+       ) do
+    session_key = Map.get(call.params, :session_key)
+    caller_origin = Map.get(call.params, :caller_origin)
+
+    stretch_id =
+      case List.keyfind(evidence, "session.unassigned_stretch_id", 0) do
+        {"session.unassigned_stretch_id", value} -> value
+        nil -> nil
+      end
+
+    if is_binary(session_key) and is_binary(caller_origin) and is_binary(stretch_id) and
+         stretch_id != "" do
+      case Escalation.request_unowned_agent_stretch_in_txn(
+             txn,
+             session_key,
+             caller_origin,
+             stretch_id
+           ) do
+        %{code: code, message: message} ->
+          EventLog.lifecycle_in_txn(
+            txn,
+            "rule_notice_failed",
+            "ac6a-unassigned-agent-turn",
+            "operator decision request failed (#{code}): #{message}"
+          )
+
+        _request ->
+          :ok
+      end
+
+      :handled
+    else
+      :not_applicable
+    end
+  end
+
+  defp request_unowned_agent_stretch_decision_in_txn(_txn, _rule, _call, _evidence),
+    do: :not_applicable
 
   defp rule_notice_wake_id(_rule, %{idempotency_key: nil}), do: nil
 

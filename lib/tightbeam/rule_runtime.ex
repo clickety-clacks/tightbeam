@@ -78,6 +78,7 @@ defmodule Tightbeam.RuleRuntime do
     "session.working_without_open_assignment" => ["running_turn"],
     "session.unassigned_stretch_id" => ["running_turn"],
     "work_item.fourth_round_kind" => ["assignment", "attest"],
+    "work_item.changes_requested_count" => ["attest"],
     "work_item.review_verdict_count" => ["attest"],
     "assignment.review_verdict_count" => ["assignment", "attest"],
     "assignment.prior_completed_fix_count" => ["assignment"]
