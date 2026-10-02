@@ -156,9 +156,23 @@ Never `SELECT *` from `sessions`. Query named columns only.
 
 ### Gateway start and stop
 
-Every runbook starts a gateway through this helper, in the same script as its
-checks, so an interrupted script still stops the gateway it started. The
-package `stop` verb signals the process recorded in the named base's
+Every runbook starts a gateway through these helpers, in the same script as its
+checks, so an interrupted script still stops the gateway it started.
+`gateway_start` waits up to 120 seconds for `/version` and fails sooner if the
+process exits. Refusal probes and every ordinary start use it.
+
+`gateway_start_migration` is only for the positive start in
+[migration.md](migration.md#run-the-migration-once), the one start that
+migrates a real-size base. A gateway serves `/version` only after its
+migration completes, and that can take longer than 120 seconds, so this
+helper has no time limit. It keeps waiting only while the launched process is
+alive. If the process exits first, it reports the exit status and returns
+failure; that exit is never treated as a ready gateway. Every 60 checks it
+prints the elapsed seconds and the private log's size in bytes. It prints
+nothing from the log. An operator stops a start that has gone on too long by
+interrupting the script, which runs the same cleanup trap.
+
+The package `stop` verb signals the process recorded in the named base's
 `gateway.json` and does not wait, so the trap waits for it. Startup writes
 `gateway.json` only after preflight, and `stop` refuses before then; in that
 window the helper sends `TERM` to the child this shell launched, and nothing
@@ -166,7 +180,7 @@ else. The wait is bounded: a child still running after 60 seconds gets `KILL`.
 
 ```sh
 gateway_pid=""
-gateway_start() { # gateway_start BASE PORT LOG [NAME=VALUE ...]
+gateway_launch() { # gateway_launch BASE PORT LOG [NAME=VALUE ...]
   base="$1"; port="$2"; log="$3"; shift 3
   env -u TIGHTBEAM_LIVE_BASE_TRANSITION -u TIGHTBEAM_ADVERTISED_URL \
     -u RELEASE_NODE -u RELEASE_COOKIE -u TIGHTBEAM_NODE \
@@ -174,13 +188,43 @@ gateway_start() { # gateway_start BASE PORT LOG [NAME=VALUE ...]
     "${PKG:?}/bin/tightbeam-gateway" >"$log" 2>&1 &
   gateway_pid=$!
   gateway_base="$base"
+  gateway_port="$port"
+  gateway_log="$log"
+}
+gateway_ready() { # one /version read from the last launched gateway
+  curl -fsS --noproxy '*' "http://127.0.0.1:$gateway_port/version" >"$gateway_log.version"
+}
+gateway_start() { # gateway_start BASE PORT LOG [NAME=VALUE ...]
+  gateway_launch "$@"
   attempt=0
-  until curl -fsS --noproxy '*' "http://127.0.0.1:$port/version" >"$log.version"; do
+  until gateway_ready; do
     kill -0 "$gateway_pid" 2>/dev/null || return 1
     attempt=$((attempt + 1))
     test "$attempt" -lt 120 || return 1
     sleep 1
   done
+}
+gateway_start_migration() { # same arguments; no time limit while the process lives
+  gateway_launch "$@"
+  started="$(date +%s)"
+  attempt=0
+  until gateway_ready; do
+    elapsed=$(($(date +%s) - started))
+    if test -z "$gateway_pid"; then
+      echo "migration start: stopped by the operator after ${elapsed}s" >&2
+      return 1
+    fi
+    if ! kill -0 "$gateway_pid" 2>/dev/null; then
+      status=0; wait "$gateway_pid" || status=$?; gateway_pid=""
+      echo "migration start: gateway exited with status $status after ${elapsed}s without serving /version" >&2
+      return 1
+    fi
+    attempt=$((attempt + 1))
+    test $((attempt % 60)) -ne 0 ||
+      echo "migration start: gateway alive, no /version yet, ${elapsed}s, log $(wc -c <"$gateway_log") bytes" >&2
+    sleep 1
+  done
+  echo "migration start: /version served after $(($(date +%s) - started))s" >&2
 }
 gateway_stop() {
   test -n "$gateway_pid" || return 0
