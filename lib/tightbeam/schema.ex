@@ -3650,6 +3650,7 @@ defmodule Tightbeam.Schema do
            ["PRAGMA ignore_check_constraints = OFF"],
            fn txn ->
              Logger.info("database migration operator_decision_v1: DDL begin")
+
              :ok =
                Txn.exec(
                  txn,
