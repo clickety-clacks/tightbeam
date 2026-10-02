@@ -68,7 +68,7 @@ above Erlang's 5,000 ms default for `gen_server:call/2`; it is therefore a
 request-path ceiling rather than a migration budget. The application also keeps
 its 5,000 ms SQLite `busy_timeout` as a separate lock-wait bound. Primary
 references: [Erlang `gen_server` documentation](https://www.erlang.org/docs/26/man/gen_server.html),
-[Thousand Island options](https://hexdocs.pm/thousand_island/1.0.0-pre.1/ThousandIsland.html),
+[Thousand Island options](https://hexdocs.pm/thousand_island/ThousandIsland.html),
 and [SQLite `busy_timeout`](https://sqlite.org/pragma.html#pragma_busy_timeout).
 
 `mix format --check-formatted` passes. The focused Mix test is currently blocked

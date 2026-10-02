@@ -29,7 +29,7 @@ Erlang's documented 5,000 ms `gen_server:call/2` default and below the
 Bandit HTTP server. It is not used as a migration budget. References:
 
 - https://www.erlang.org/docs/26/man/gen_server.html
-- https://hexdocs.pm/thousand_island/1.0.0-pre.1/ThousandIsland.html
+- https://hexdocs.pm/thousand_island/ThousandIsland.html
 - https://sqlite.org/pragma.html#pragma_busy_timeout
 
 Local verification: `mix format --check-formatted`, `git diff --check`, and
