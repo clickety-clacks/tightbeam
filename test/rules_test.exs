@@ -2822,13 +2822,6 @@ defmodule Tightbeam.RulesTest do
     work_item_id = "wi_ac6a_third_review_rejection"
     create_work_item(ctx, work_item_id)
     set_work_item_owner(ctx, work_item_id, review_opener.session_key)
-
-    for {producer_opener, _producer_holder} <- producer_rounds do
-      assignment(ctx, producer_opener.session_key, {:session, review_opener.session_key},
-        work_item_id: work_item_id
-      )
-    end
-
     _rules = load_ac6a_rules(ctx)
 
     put_raw(
@@ -2970,6 +2963,13 @@ defmodule Tightbeam.RulesTest do
     work_item_id = "wi_ac6a_third_review_rejection"
     create_work_item(ctx, work_item_id)
     set_work_item_owner(ctx, work_item_id, review_opener.session_key)
+
+    for {producer_opener, _producer_holder} <- producer_rounds do
+      assignment(ctx, producer_opener.session_key, {:session, review_opener.session_key},
+        work_item_id: work_item_id
+      )
+    end
+
     _rules = load_ac6a_rules(ctx)
 
     review_rounds =
