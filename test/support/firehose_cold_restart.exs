@@ -118,6 +118,7 @@ if missing_executable do
 end
 
 {:ok, _apps} = Application.ensure_all_started(:tightbeam)
+
 {_id, bandit, _type, _modules} =
   Enum.find(
     Supervisor.which_children(Tightbeam.Supervisor),
