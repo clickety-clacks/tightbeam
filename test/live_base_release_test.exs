@@ -150,6 +150,55 @@ defmodule Tightbeam.LiveBaseReleaseTest do
     :ok = GenServer.stop(db)
   end
 
+  test "a failed lifecycle index build rolls back its indexes and cannot stamp a successful boot",
+       %{
+         root: root,
+         app: app,
+         base: base
+       } do
+    write_provenance!(root)
+    {:ok, manifest} = LiveBaseGuard.generate_manifest(LiveBaseAdmission.payload_files!(app))
+    File.write!(Path.join(app, "build-manifest.json"), JSON.encode!(manifest))
+    seed_real_predecessor!(base, app)
+    {:ok, conn} = Sqlite3.open(Path.join(base, "state.db"))
+
+    :ok =
+      Sqlite3.execute(conn, """
+      CREATE TABLE lifecycle_events_idle_cleanup_kind_id(x);
+      INSERT INTO lifecycle_events(ts,kind,subject,detail) VALUES(0,'synthetic','preserved','raw history');
+      """)
+
+    :ok = Sqlite3.close(conn)
+
+    {:ok, db} =
+      DB.start_link(
+        path: Path.join(base, "state.db"),
+        name: nil,
+        guard_inputs: [],
+        payload_root: app
+      )
+
+    capture_log(fn ->
+      assert_raise Schema.ShapeError, ~r/lifecycle runtime index migration failed/, fn ->
+        Schema.ensure_all(db)
+      end
+    end)
+
+    assert {:ok, []} =
+             DB.query(
+               db,
+               "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='lifecycle_events'"
+             )
+
+    assert {:ok, [["raw history"]]} =
+             DB.query(db, "SELECT detail FROM lifecycle_events WHERE subject='preserved'")
+
+    assert {:ok, [[0]]} = DB.query(db, "PRAGMA ignore_check_constraints")
+    assert {:ok, [[1]]} = DB.query(db, "PRAGMA foreign_keys")
+    refute File.exists?(Path.join(base, "build-owner.json"))
+    :ok = GenServer.stop(db)
+  end
+
   @tag timeout: 600_000
   test "a large guarded predecessor migration preserves rows and restarts marked",
        %{
@@ -162,6 +211,13 @@ defmodule Tightbeam.LiveBaseReleaseTest do
     File.write!(Path.join(app, "build-manifest.json"), JSON.encode!(manifest))
     seed_real_predecessor!(base, app)
     seed_migration_population!(base)
+    # The captured predecessor has no lifecycle indexes. Prove upgrade builds
+    # them over populated history, rather than seeding already-indexed rows.
+    {:ok, before_upgrade} = Sqlite3.open(Path.join(base, "state.db"))
+    {:ok, index_query} = Sqlite3.prepare(before_upgrade, "PRAGMA index_list(lifecycle_events)")
+    {:ok, []} = Sqlite3.fetch_all(before_upgrade, index_query)
+    :ok = Sqlite3.release(before_upgrade, index_query)
+    :ok = Sqlite3.close(before_upgrade)
     refute File.exists?(Path.join(base, "build-owner.json"))
 
     {:ok, db} =
@@ -188,6 +244,9 @@ defmodule Tightbeam.LiveBaseReleaseTest do
     assert log =~ "terminal census begin"
     assert log =~ "stamp begin"
     assert log =~ "runtime checks restored"
+    assert log =~ "database migration lifecycle_runtime_indexes: committed"
+    assert log =~ "lifecycle index lifecycle_events_subject_kind: finished elapsed_ms="
+    assert log =~ "lifecycle index lifecycle_events_idle_cleanup_kind_id: finished elapsed_ms="
     IO.puts(log)
 
     target = hd(Schema.guard_compatible_stamps())
@@ -213,6 +272,15 @@ defmodule Tightbeam.LiveBaseReleaseTest do
     assert {:error, _} =
              DB.execute(db, "UPDATE decision_requests SET status = 'invalid' WHERE id = 'm6-1'")
 
+    :ok = Tightbeam.LifecycleRuntimeFixture.seed!(db)
+    :ok = Tightbeam.LifecycleRuntimeFixture.assert_plans_and_results!(db)
+
+    {:ok, indexes_before_restart} =
+      DB.query(
+        db,
+        "SELECT name,rootpage FROM sqlite_master WHERE type='index' AND tbl_name='lifecycle_events' ORDER BY name"
+      )
+
     marker = File.read!(Path.join(base, "build-owner.json"))
     assert JSON.decode!(marker)["buildIdentity"] == manifest["buildIdentity"]
     :ok = GenServer.stop(db)
@@ -228,6 +296,13 @@ defmodule Tightbeam.LiveBaseReleaseTest do
     assert :ok = Schema.ensure_all(restarted)
     assert {:ok, [[^target]]} = DB.query(restarted, "SELECT shape FROM schema_stamp")
     assert File.read!(Path.join(base, "build-owner.json")) == marker
+
+    assert DB.query(
+             restarted,
+             "SELECT name,rootpage FROM sqlite_master WHERE type='index' AND tbl_name='lifecycle_events' ORDER BY name"
+           ) ==
+             {:ok, indexes_before_restart}
+
     :ok = GenServer.stop(restarted)
   end
 

@@ -1499,6 +1499,8 @@ defmodule Tightbeam.Schema do
         )
     end)
 
+    :ok = ensure_lifecycle_runtime_indexes(db)
+
     activated_at = System.system_time(:millisecond)
 
     case DB.transaction(db, fn txn ->
@@ -1563,6 +1565,53 @@ defmodule Tightbeam.Schema do
     case DB.finish_schema(db) do
       :ok -> :ok
       {:error, error} -> raise error
+    end
+  end
+
+  # Additive access paths, built before runtime consumers start. A copied
+  # predecessor can contain tens of millions of lifecycle rows; index creation
+  # belongs to the unbounded migration context, never an ordinary DB call.
+  # Both indexes commit together, and IF NOT EXISTS makes restart inexpensive.
+  defp ensure_lifecycle_runtime_indexes(db) do
+    indexes = [
+      {"lifecycle_events_subject_kind",
+       """
+       CREATE INDEX IF NOT EXISTS lifecycle_events_subject_kind
+       ON lifecycle_events(subject, kind)
+       """},
+      {"lifecycle_events_idle_cleanup_kind_id",
+       """
+       CREATE INDEX IF NOT EXISTS lifecycle_events_idle_cleanup_kind_id
+       ON lifecycle_events(kind, id)
+       WHERE kind='idle_cleanup_pending_observed'
+       """}
+    ]
+
+    # The idle-cleanup occurrence read filters JSON after selecting its kind.
+    # Keep that evaluation in the read: an expression index would impose a new
+    # JSON-validity constraint on this otherwise free-form lifecycle relation.
+    # This small partial index excludes unrelated history and preserves latest
+    # id ordering without indexing every event a second time.
+    case DB.migration_transaction(db, :lifecycle_runtime_indexes, [], [], fn txn ->
+           Enum.each(indexes, fn {name, sql} ->
+             started = System.monotonic_time(:millisecond)
+             Logger.info("database migration lifecycle index #{name}: begin")
+             :ok = Txn.exec(txn, sql)
+             elapsed = System.monotonic_time(:millisecond) - started
+
+             Logger.info(
+               "database migration lifecycle index #{name}: finished elapsed_ms=#{elapsed}"
+             )
+           end)
+
+           :ok
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, error} ->
+        raise ShapeError,
+          message: "lifecycle runtime index migration failed: #{Exception.message(error)}"
     end
   end
 
