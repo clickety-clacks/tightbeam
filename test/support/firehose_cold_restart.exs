@@ -118,9 +118,11 @@ if missing_executable do
 end
 
 {:ok, _apps} = Application.ensure_all_started(:tightbeam)
-{Bandit, bandit, _, _} =
-  Supervisor.which_children(Tightbeam.Supervisor)
-  |> List.keyfind(Bandit, 0)
+{_id, bandit, _type, _modules} =
+  Enum.find(
+    Supervisor.which_children(Tightbeam.Supervisor),
+    fn {id, _pid, _type, modules} -> id == Bandit or (is_list(modules) and Bandit in modules) end
+  )
 
 {:ok, {_, bound_port}} = ThousandIsland.listener_info(bandit)
 true = bound_port > 0
