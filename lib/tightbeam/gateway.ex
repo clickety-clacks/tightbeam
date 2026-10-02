@@ -3126,7 +3126,7 @@ defmodule Tightbeam.Gateway do
                    # pre-checkout snapshot or interleave with that sequence.
                    current = Org.get(db, turn.session_key)
 
-                   harness_session(
+                   configured_turn_session(
                      config,
                      db,
                      adapter,
@@ -3751,6 +3751,184 @@ defmodule Tightbeam.Gateway do
     |> archetypes.get()
     |> Kernel.||(archetypes.builtin_default())
     |> archetypes.acp_mcp_servers()
+  end
+
+  # A turn starts with the session's current selection, then advances through
+  # the ordered model preferences owned by its archetype. The adapter remains
+  # the authority on whether an entry can actually be used; this seam only
+  # advances on its typed model-use refusal.
+  defp configured_turn_session(config, db, adapter, generation, session, turn_seq) do
+    models = configured_turn_model_ring(session)
+
+    try_configured_turn_session(models, config, db, adapter, generation, session, turn_seq)
+  end
+
+  defp try_configured_turn_session(
+         [],
+         _config,
+         _db,
+         _adapter,
+         _generation,
+         _session,
+         _turn_seq
+       ),
+       do: {:error, :model_selection_exhausted}
+
+  defp try_configured_turn_session(
+         [model | remaining],
+         config,
+         db,
+         adapter,
+         generation,
+         session,
+         turn_seq
+       ) do
+    attempt_session = %{session | model: model}
+
+    case harness_session(config, db, adapter, generation, attempt_session, turn_seq) do
+      {:ok, sid} ->
+        case model do
+          %Model{} ->
+            _ = Org.set_model(db, session.session_key, model, session.provider)
+
+          nil ->
+            :ok
+        end
+
+        record_model_selection_attempt(
+          db,
+          session.session_key,
+          model,
+          %{status: "accepted", readback: model_selection_snapshot(model)}
+        )
+
+        {:ok, sid}
+
+      {:error, reason} = error ->
+        record_model_selection_attempt(
+          db,
+          session.session_key,
+          model,
+          failed_model_selection_outcome(reason)
+        )
+
+        if model_selection_failure?(reason) and remaining != [] do
+          try_configured_turn_session(
+            remaining,
+            config,
+            db,
+            adapter,
+            generation,
+            session,
+            turn_seq
+          )
+        else
+          error
+        end
+    end
+  end
+
+  defp configured_turn_model_ring(%{archetype: archetype, model: current}) do
+    preferences =
+      case Archetypes.get(archetype) || Archetypes.builtin_default() do
+        %{model_preferences: values} when is_list(values) -> values
+        _ -> []
+      end
+
+    case current do
+      nil ->
+        case Enum.uniq(preferences) do
+          [] -> [nil]
+          values -> values
+        end
+
+      model ->
+        case Enum.find_index(preferences, &(&1 == model)) do
+          nil -> Enum.uniq([model | preferences])
+          index -> Enum.uniq([model | Enum.drop(preferences, index + 1)])
+        end
+    end
+  end
+
+  # Classify the adapter original reason before deciding whether to advance.
+  # Only typed model-use refusals are eligible: a model that is not selectable,
+  # an unsupported effort, or an explicit provider rejection. Transport,
+  # credential, quota, cancellation, timeout, trace, degraded, readback and
+  # general ACP errors remain terminal; retrying those would turn ring-down
+  # into an unrelated replay loop.
+  defp model_selection_failure?(reason) do
+    classified = ErrorDiagnostic.classified(reason)
+
+    model_selection_classified_failure?(classified) or
+      adapter_effort_refusal?(classified, ErrorDiagnostic.of(reason))
+  end
+
+  # The production ACP adapter preserves a model refusal as :model_unavailable;
+  # catalog/placement causes such as :effort_not_offered are not turn-use
+  # failures and must not be replayed here.
+  defp model_selection_classified_failure?(:model_unavailable), do: true
+
+  defp model_selection_classified_failure?({:model_apply_failed, reason}),
+    do: model_selection_classified_failure?(ErrorDiagnostic.classified(reason))
+
+  defp model_selection_classified_failure?({:diagnosed, reason, _diagnostic}),
+    do: model_selection_classified_failure?(ErrorDiagnostic.classified(reason))
+
+  defp model_selection_classified_failure?(_classification), do: false
+
+  # The production ACP adapter returns a diagnosed JSON-RPC map directly from
+  # a fresh session, and wraps that same carrier as {:model_apply_failed, ...}
+  # when pushing a resident session. The diagnostic phase is the boundary that
+  # distinguishes an effort refusal from an unrelated JSON-RPC failure.
+  defp adapter_effort_refusal?(classified, %{"phase" => "effort"}) do
+    case adapter_failure_message(classified) do
+      message when is_binary(message) ->
+        downcased = String.downcase(message)
+
+        String.contains?(downcased, "effort") and
+          (String.contains?(downcased, "refus") or
+             String.contains?(downcased, "invalid") or
+             String.contains?(downcased, "not offer") or
+             String.contains?(downcased, "unsupported"))
+
+      _ ->
+        false
+    end
+  end
+
+  defp adapter_effort_refusal?(_classified, _diagnostic), do: false
+
+  defp adapter_failure_message(%{"message" => message}), do: message
+
+  defp adapter_failure_message({:model_apply_failed, %{"message" => message}}),
+    do: message
+
+  defp adapter_failure_message(_classified), do: nil
+
+  defp model_selection_snapshot(nil), do: "unavailable"
+
+  defp model_selection_snapshot(%Model{} = model) do
+    %{family: model.family, effort: model.effort, context: model.context}
+  end
+
+  defp failed_model_selection_outcome(reason) do
+    %{
+      status: "failed",
+      reason: error_sentence(reason),
+      classification: ErrorDiagnostic.encode_term(ErrorDiagnostic.classified(reason)),
+      original_reason: ErrorDiagnostic.encode_term(reason),
+      diagnostic: ErrorDiagnostic.of(reason)
+    }
+  end
+
+  defp record_model_selection_attempt(db, session_key, model, outcome) do
+    :ok =
+      EventLog.lifecycle(
+        db,
+        "model_selection_attempt",
+        session_key,
+        JSON.encode!(Map.merge(%{model: model_selection_snapshot(model)}, outcome))
+      )
   end
 
   defp harness_session(config, db, adapter, generation, session, turn_seq) do
