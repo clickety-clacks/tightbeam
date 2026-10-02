@@ -72,16 +72,22 @@ end
 File.mkdir_p!(Path.join(base, "work"))
 Application.put_env(:tightbeam, :cwd, Path.join(base, "work"))
 port_path = Path.join(base, "restart-port")
+missing_executable = System.get_env("FIREHOSE_MISSING_EXECUTABLE") == "1"
 
 port =
-  if fresh do
-    {:ok, listener} = :gen_tcp.listen(0, [:binary, active: false, ip: {127, 0, 0, 1}])
-    {:ok, {_, selected}} = :inet.sockname(listener)
-    :ok = :gen_tcp.close(listener)
-    File.write!(port_path, Integer.to_string(selected))
-    selected
-  else
-    port_path |> File.read!() |> String.to_integer()
+  cond do
+    not fresh ->
+      port_path |> File.read!() |> String.to_integer()
+
+    missing_executable ->
+      # Preflight refuses before Bandit starts; keep a concrete endpoint for the refusal check.
+      {:ok, listener} = :gen_tcp.listen(0, [:binary, active: false, ip: {127, 0, 0, 1}])
+      {:ok, {_, selected}} = :inet.sockname(listener)
+      :ok = :gen_tcp.close(listener)
+      selected
+
+    true ->
+      0
   end
 
 Application.put_env(:tightbeam, :port, port)
@@ -90,7 +96,7 @@ Application.put_env(:tightbeam, :default_model, Model.new("fixture-model"))
 Application.put_env(:tightbeam, :autostart, true)
 Application.put_env(:tightbeam, :drain_timeout_ms, 1_000)
 
-if System.get_env("FIREHOSE_MISSING_EXECUTABLE") == "1" do
+if missing_executable do
   empty_bin = Path.join(base, "empty-executable-path")
   File.mkdir_p!(empty_bin)
   System.put_env("PATH", empty_bin)
@@ -104,13 +110,32 @@ if System.get_env("FIREHOSE_MISSING_EXECUTABLE") == "1" do
     Path.join(base, "refusal-input.json"),
     JSON.encode!(%{
       "pid" => System.pid(),
-      "port" => port,
+      "requestedPort" => port,
+      "boundPort" => nil,
       "marker" => marker
     })
   )
 end
 
 {:ok, _apps} = Application.ensure_all_started(:tightbeam)
+
+{_id, bandit, _type, _modules} =
+  Enum.find(
+    Supervisor.which_children(Tightbeam.Supervisor),
+    fn {id, _pid, _type, modules} -> id == Bandit or (is_list(modules) and Bandit in modules) end
+  )
+
+{:ok, {_, bound_port}} = ThousandIsland.listener_info(bandit)
+true = bound_port > 0
+
+if fresh do
+  File.write!(port_path, Integer.to_string(bound_port))
+else
+  ^port = bound_port
+end
+
+port = port_path |> File.read!() |> String.to_integer()
+^bound_port = port
 
 import ExUnit.Assertions
 
