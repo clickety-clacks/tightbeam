@@ -3117,7 +3117,13 @@ defmodule Tightbeam.Gateway do
       outcome =
         with {:ok, adapter, generation} <-
                stage(:checkout, checkout_adapter(session, config)),
-             {:ok, harness_session_id} <-
+             {:ok,
+              %{
+                harness_session_id: harness_session_id,
+                adapter: prompt_adapter,
+                generation: prompt_generation,
+                session: active_session
+              }} <-
                stage(
                  :session,
                  with_session_mutation_lock(turn.session_key, fn ->
@@ -3137,10 +3143,10 @@ defmodule Tightbeam.Gateway do
                  end)
                ),
              {:ok, result} <-
-               stage(
+               stage_with_session(
                  :prompt,
                  Adapter.prompt(
-                   adapter,
+                   prompt_adapter,
                    harness_session_id,
                    turn.prompt,
                    trace_dispatch: fn request_id ->
@@ -3154,14 +3160,15 @@ defmodule Tightbeam.Gateway do
                        cause: "acp:port-write",
                        principal: "process:tightbeam",
                        owner_lease: turn.owner_lease,
-                       adapter_gen: generation,
+                       adapter_gen: prompt_generation,
                        acp_request_id: request_id,
                        detail: %{v: 1}
                      })
                    end,
                    progress:
                      progress_fun(db, turn.session_key, session.owner_user_id, correlation)
-                 )
+                 ),
+                 active_session
                ) do
           attention_tier = elected_attention(db, turn.seq)
 
@@ -3171,7 +3178,9 @@ defmodule Tightbeam.Gateway do
           record_in_txn = fn txn ->
             replies = append_assistant_messages_in_txn(txn, turn, echo, result, attention_tier)
             Tightbeam.ReminderDelivery.delivered_in_txn(txn, turn.seq)
-            health_publication = HarnessHealth.resolve_normal_turn_in_txn(txn, session, turn)
+
+            health_publication =
+              HarnessHealth.resolve_normal_turn_in_txn(txn, active_session, turn)
 
             fn ->
               Enum.each(replies, &publish_message(db, turn.session_key, &1))
@@ -3181,7 +3190,9 @@ defmodule Tightbeam.Gateway do
 
           {:ok, %{terminal_publish: terminal_publish, record_in_txn: record_in_txn}}
         else
-          {:error, {failed_stage, reason}} ->
+          {:error, failure} ->
+            {failed_stage, reason, active_session} = turn_failure_context(failure, session)
+
             # A FAILED TURN FAILS. It does not freeze the session behind a
             # ruling. Adjudication — episodes, holds, an escalation ladder, a
             # `tightbeam adjudicate` verb — was deleted 2026-08-05 (Flynn: "why
@@ -3208,12 +3219,13 @@ defmodule Tightbeam.Gateway do
             # `raw_reason` is the classification every decision below always
             # read; `diagnostic` is the original failure the adapter carried.
             diagnostic = ErrorDiagnostic.of(reason)
-            raw_reason = ErrorDiagnostic.classified(reason)
+            classified_reason = ErrorDiagnostic.classified(reason)
+            raw_reason = model_selection_record_reason(classified_reason)
 
             reason =
-              case turn_credential_refusal(session) do
+              case turn_credential_refusal(active_session) do
                 {:refused, message} -> message
-                :not_applicable -> raw_reason
+                :not_applicable -> classified_reason
               end
 
             failure_publish = fn _terminal ->
@@ -3280,7 +3292,7 @@ defmodule Tightbeam.Gateway do
 
               HarnessHealth.observe_turn_failure_in_txn(
                 txn,
-                session,
+                active_session,
                 turn,
                 failed_stage,
                 raw_reason
@@ -3333,6 +3345,19 @@ defmodule Tightbeam.Gateway do
 
   defp stage(stage, {:error, reason}), do: {:error, {stage, reason}}
   defp stage(_stage, result), do: result
+
+  defp stage_with_session(stage_name, result, session) do
+    case stage(stage_name, result) do
+      {:error, {^stage_name, reason}} -> {:error, {stage_name, reason, session}}
+      other -> other
+    end
+  end
+
+  defp turn_failure_context({failed_stage, reason, session}, _fallback),
+    do: {failed_stage, reason, session}
+
+  defp turn_failure_context({failed_stage, reason}, fallback),
+    do: {failed_stage, reason, fallback}
 
   defp adapter_key(session), do: {Harness.parse!(session.harness).id(), "shared", session.host}
 
@@ -3754,13 +3779,24 @@ defmodule Tightbeam.Gateway do
   end
 
   # A turn starts with the session's current selection, then advances through
-  # the ordered model preferences owned by its archetype. The adapter remains
-  # the authority on whether an entry can actually be used; this seam only
-  # advances on its typed model-use refusal.
+  # the ordered model preferences owned by its archetype. A preference is
+  # routed through the existing host catalog before it reaches an adapter; when
+  # the route names another harness, that harness gets its own adapter and ACP
+  # session. The preference data remains the archetype's configuration, not a
+  # second model registry.
   defp configured_turn_session(config, db, adapter, generation, session, turn_seq) do
     models = configured_turn_model_ring(session)
 
-    try_configured_turn_session(models, config, db, adapter, generation, session, turn_seq)
+    try_configured_turn_session(
+      models,
+      config,
+      db,
+      adapter,
+      generation,
+      session,
+      turn_seq,
+      []
+    )
   end
 
   defp try_configured_turn_session(
@@ -3770,9 +3806,12 @@ defmodule Tightbeam.Gateway do
          _adapter,
          _generation,
          _session,
-         _turn_seq
+         _turn_seq,
+         attempted
        ),
-       do: {:error, :model_selection_exhausted}
+       do:
+         {:error,
+          model_selection_exhausted_error(Enum.reverse(attempted), :model_selection_exhausted)}
 
   defp try_configured_turn_session(
          [model | remaining],
@@ -3781,29 +3820,88 @@ defmodule Tightbeam.Gateway do
          adapter,
          generation,
          session,
-         turn_seq
+         turn_seq,
+         attempted
        ) do
-    attempt_session = %{session | model: model}
+    attempted = [model | attempted]
 
-    case harness_session(config, db, adapter, generation, attempt_session, turn_seq) do
-      {:ok, sid} ->
-        case model do
-          %Model{} ->
-            _ = Org.set_model(db, session.session_key, model, session.provider)
+    with {:ok, attempt_session} <- configured_turn_candidate(config, session, model),
+         {:ok, attempt_adapter, attempt_generation} <-
+           configured_turn_adapter(
+             config,
+             session,
+             attempt_session,
+             adapter,
+             generation
+           ) do
+      source_pointer = Org.current_pointer(db, session.session_key)
 
-          nil ->
-            :ok
-        end
+      case harness_session(
+             config,
+             db,
+             attempt_adapter,
+             attempt_generation,
+             attempt_session,
+             turn_seq
+           ) do
+        {:ok, sid} ->
+          persist_configured_turn_selection(db, session, attempt_session, model)
 
-        record_model_selection_attempt(
-          db,
-          session.session_key,
-          model,
-          %{status: "accepted", readback: model_selection_snapshot(model)}
-        )
+          if attempt_session.harness != session.harness do
+            close_superseded_turn_runtime(
+              db,
+              session,
+              adapter,
+              source_pointer,
+              attempt_session
+            )
+          end
 
-        {:ok, sid}
+          record_model_selection_attempt(
+            db,
+            session.session_key,
+            model,
+            %{
+              status: "accepted",
+              harness: attempt_session.harness,
+              readback: model_selection_snapshot(model)
+            }
+          )
 
+          {:ok,
+           %{
+             harness_session_id: sid,
+             adapter: attempt_adapter,
+             generation: attempt_generation,
+             session: attempt_session
+           }}
+
+        {:error, reason} = error ->
+          record_model_selection_attempt(
+            db,
+            session.session_key,
+            model,
+            failed_model_selection_outcome(reason)
+          )
+
+          if advanceable_model_selection_failure?(reason) and remaining != [] do
+            try_configured_turn_session(
+              remaining,
+              config,
+              db,
+              adapter,
+              generation,
+              session,
+              turn_seq,
+              attempted
+            )
+          else
+            if advanceable_model_selection_failure?(reason),
+              do: {:error, model_selection_exhausted_error(attempted, reason)},
+              else: error
+          end
+      end
+    else
       {:error, reason} = error ->
         record_model_selection_attempt(
           db,
@@ -3812,7 +3910,7 @@ defmodule Tightbeam.Gateway do
           failed_model_selection_outcome(reason)
         )
 
-        if model_selection_failure?(reason) and remaining != [] do
+        if advanceable_model_selection_failure?(reason) and remaining != [] do
           try_configured_turn_session(
             remaining,
             config,
@@ -3820,13 +3918,77 @@ defmodule Tightbeam.Gateway do
             adapter,
             generation,
             session,
-            turn_seq
+            turn_seq,
+            attempted
           )
         else
-          error
+          if advanceable_model_selection_failure?(reason),
+            do: {:error, model_selection_exhausted_error(attempted, reason)},
+            else: error
         end
     end
   end
+
+  defp configured_turn_candidate(_config, session, nil), do: {:ok, session}
+
+  defp configured_turn_candidate(_config, session, %Model{} = model)
+       when model == session.model,
+       do: {:ok, %{session | model: model}}
+
+  defp configured_turn_candidate(config, session, %Model{} = model) do
+    candidate = %{session | model: model}
+    catalog = Map.get(config, :model_catalog, ModelCatalog)
+
+    case ModelCatalog.route(session.host, model, catalog) do
+      {:ok, %{harness: harness, provider: provider}}
+      when is_binary(harness) and is_binary(provider) ->
+        {:ok, %{candidate | harness: harness, provider: provider}}
+
+      {:error, %Unroutable{} = refusal} ->
+        {:error, refusal}
+    end
+  end
+
+  defp configured_turn_adapter(config, session, candidate, adapter, generation) do
+    if candidate.harness == session.harness do
+      {:ok, adapter, generation}
+    else
+      checkout_adapter(candidate, config)
+    end
+  end
+
+  defp persist_configured_turn_selection(_db, _session, _candidate, nil), do: :ok
+
+  defp persist_configured_turn_selection(db, session, candidate, %Model{} = model) do
+    if candidate.harness == session.harness do
+      _ = Org.set_model(db, session.session_key, model, candidate.provider || session.provider)
+    else
+      _ =
+        Org.set_harness(
+          db,
+          session.session_key,
+          candidate.harness,
+          candidate.provider,
+          model
+        )
+    end
+  end
+
+  defp close_superseded_turn_runtime(_db, _session, _adapter, nil, _candidate), do: :ok
+
+  defp close_superseded_turn_runtime(
+         db,
+         session,
+         adapter,
+         %{harness_session_id: sid},
+         %{harness: harness}
+       )
+       when harness != session.harness do
+    _ = close_runtime(db, adapter, sid, :superseded, "turn:model-selection")
+    :ok
+  end
+
+  defp close_superseded_turn_runtime(_db, _session, _adapter, _pointer, _candidate), do: :ok
 
   defp configured_turn_model_ring(%{archetype: archetype, model: current}) do
     preferences =
@@ -3863,6 +4025,9 @@ defmodule Tightbeam.Gateway do
       adapter_effort_refusal?(classified, ErrorDiagnostic.of(reason))
   end
 
+  defp advanceable_model_selection_failure?(reason),
+    do: model_selection_failure?(reason) or match?(%Unroutable{}, reason)
+
   # The production ACP adapter preserves a model refusal as :model_unavailable;
   # catalog/placement causes such as :effort_not_offered are not turn-use
   # failures and must not be replayed here.
@@ -3876,13 +4041,17 @@ defmodule Tightbeam.Gateway do
 
   defp model_selection_classified_failure?(_classification), do: false
 
-  # The production ACP adapter preserves the original JSON-RPC carrier and
-  # attaches phase: "effort" when the effort request is refused. The carrier
-  # message is not reliable: the adapter records this as -32602 "Invalid
-  # params" without the word "effort". The phase is therefore the eligibility signal;
-  # known transport and terminal classes remain excluded from ring-down.
-  defp adapter_effort_refusal?(classified, %{"phase" => "effort"}) do
-    not terminal_effort_failure?(classified)
+  # The adapter's config failure carries phase and the actual harness option
+  # identifier. Codex reports reasoning_effort, Pi reports thought_level, and
+  # Claude/fixture report effort. The message is not a reliable discriminator:
+  # the recorded carrier is JSON-RPC -32602 "Invalid params".
+  defp adapter_effort_refusal?(classified, diagnostic) when is_map(diagnostic) do
+    phase = Map.get(diagnostic, "phase") || Map.get(diagnostic, :phase)
+    config_id = Map.get(diagnostic, "configId") || Map.get(diagnostic, :config_id)
+
+    phase == "effort" and
+      config_id in ["effort", "reasoning_effort", "thought_level"] and
+      not terminal_effort_failure?(classified)
   end
 
   defp adapter_effort_refusal?(_classified, _diagnostic), do: false
@@ -3908,6 +4077,39 @@ defmodule Tightbeam.Gateway do
   end
 
   defp terminal_effort_failure?(_classification), do: false
+
+  defp model_selection_record_reason(%{
+         code: "model_selection_exhausted",
+         original_reason: original_reason
+       }),
+       do: ErrorDiagnostic.classified(original_reason)
+
+  defp model_selection_record_reason(reason), do: ErrorDiagnostic.classified(reason)
+
+  defp model_selection_exhausted_error(attempted, reason) do
+    models = Enum.filter(attempted, &match?(%Model{}, &1))
+
+    if models == [] do
+      reason
+    else
+      described = Enum.map_join(models, ", ", &Model.describe/1)
+      last = error_sentence(ErrorDiagnostic.classified(reason))
+
+      %{
+        code: "model_selection_exhausted",
+        message:
+          "all configured model preferences were exhausted (tried: #{described}); " <>
+            "last refusal: #{last}",
+        diagnostic:
+          ErrorDiagnostic.new("model_selection_exhausted",
+            reason: ErrorDiagnostic.classified(reason),
+            cause: ErrorDiagnostic.of(reason)
+          ),
+        original_reason: reason,
+        attempted: Enum.map(models, &model_selection_snapshot/1)
+      }
+    end
+  end
 
   defp model_selection_snapshot(nil), do: "unavailable"
 
@@ -6756,24 +6958,34 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp resolve_spawn_host(config, db, archetype, %{host: host}, _module, _default_model)
+  defp resolve_spawn_host(config, db, archetype, %{host: host} = p, module, default_model)
        when is_binary(host) do
     with {:ok, resolved} <-
-           Placement.resolve(archetype, host, Placement.hosts(config.base_dir, db)),
-         do: {:ok, %{host: resolved}}
+           Placement.resolve(archetype, host, Placement.hosts(config.base_dir, db)) do
+      if spawn_preference_ring?(archetype, p) do
+        resolve_spawn_preference_for_host(config, db, archetype, resolved)
+      else
+        {:ok, %{host: resolved}}
+      end
+    end
   end
 
   defp resolve_spawn_host(
          config,
          db,
          %{where: ["*"]} = archetype,
-         _p,
-         _module,
-         _default_model
+         p,
+         module,
+         default_model
        ) do
     with {:ok, resolved} <-
-           Placement.resolve(archetype, nil, Placement.hosts(config.base_dir, db)),
-         do: {:ok, %{host: resolved}}
+           Placement.resolve(archetype, nil, Placement.hosts(config.base_dir, db)) do
+      if spawn_preference_ring?(archetype, p) do
+        resolve_spawn_preference_for_host(config, db, archetype, resolved)
+      else
+        {:ok, %{host: resolved}}
+      end
+    end
   end
 
   defp resolve_spawn_host(config, db, archetype, p, module, default_model) do
@@ -6782,7 +6994,11 @@ defmodule Tightbeam.Gateway do
 
     case archetype.where do
       [host] when is_map_key(hosts, host) ->
-        {:ok, %{host: host}}
+        if spawn_preference_ring?(archetype, p) do
+          resolve_spawn_preference_for_host(config, db, archetype, host)
+        else
+          {:ok, %{host: host}}
+        end
 
       _multiple_or_missing ->
         resolve_spawn_host_candidates(
@@ -6811,30 +7027,34 @@ defmodule Tightbeam.Gateway do
     result =
       Enum.reduce_while(archetype.where, %{failures: [], incidents: []}, fn host, acc ->
         candidate =
-          with {:ok, ^host} <- Placement.resolve(archetype, host, hosts),
-               nil <- TerminalCredentialFailure.get_open(db, host, harness),
-               model = spawn_model_selection(host, harness, p, default_model),
-               :ok <- validate_credential(config, harness, host, model),
-               {:ok, routed} <- route_spawn_candidate(host, harness, model),
-               :ok <-
-                 Spinup.ensure_ready(
-                   config,
-                   module.id(),
-                   host,
-                   spinup_opts(config, db, harness, host, model)
-                 ) do
-            {:ok, %{host: host, model: model, routed: routed}}
+          if spawn_preference_ring?(archetype, p) do
+            resolve_spawn_preference_for_host(config, db, archetype, host)
           else
-            %{} = open_incident ->
-              {:error,
-               %{
-                 code: "terminal_credential_failure",
-                 message: "catalog suppressed by incident #{open_incident.id}",
-                 incident: open_incident
-               }}
+            with {:ok, ^host} <- Placement.resolve(archetype, host, hosts),
+                 nil <- TerminalCredentialFailure.get_open(db, host, harness),
+                 model = spawn_model_selection(host, harness, p, default_model),
+                 :ok <- validate_credential(config, harness, host, model),
+                 {:ok, routed} <- route_spawn_candidate(host, harness, model),
+                 :ok <-
+                   Spinup.ensure_ready(
+                     config,
+                     module.id(),
+                     host,
+                     spinup_opts(config, db, harness, host, model)
+                   ) do
+              {:ok, %{host: host, model: model, routed: routed}}
+            else
+              %{} = open_incident ->
+                {:error,
+                 %{
+                   code: "terminal_credential_failure",
+                   message: "catalog suppressed by incident #{open_incident.id}",
+                   incident: open_incident
+                 }}
 
-            other ->
-              other
+              other ->
+                other
+            end
           end
 
         case candidate do
@@ -6879,6 +7099,97 @@ defmodule Tightbeam.Gateway do
     end
   end
 
+  # A spawn with no explicit harness/model may use the archetype's ordered
+  # preferences. Each entry is routed against the host's complete catalog
+  # before credential/readiness checks, so a foreign-harness entry is never
+  # offered to the default adapter or persisted under the wrong harness.
+  defp spawn_preference_ring?(archetype, params) do
+    is_nil(params[:harness]) and
+      Model.named_fields(params) == %{} and
+      archetype.model_preferences != []
+  end
+
+  defp resolve_spawn_preference_for_host(config, db, archetype, host) do
+    result =
+      Enum.reduce_while(archetype.model_preferences, [], fn model, failures ->
+        case resolve_spawn_preference_candidate(config, db, host, model) do
+          {:ok, placement} ->
+            {:halt, {:ok, placement}}
+
+          {:error, %Unroutable{} = refusal} ->
+            {:cont, [{model, routing_error(refusal)} | failures]}
+
+          {:error, %{incident: _incident} = denial} ->
+            {:halt, {:error, denial}}
+
+          {:error, denial} ->
+            {:halt, {:error, denial}}
+        end
+      end)
+
+    case result do
+      {:ok, placement} ->
+        {:ok, placement}
+
+      {:error, denial} ->
+        {:error, denial}
+
+      failures when is_list(failures) ->
+        details =
+          failures
+          |> Enum.reverse()
+          |> Enum.map_join("; ", fn {model, denial} ->
+            "#{Model.describe(model)}: #{denial.message}"
+          end)
+
+        models =
+          failures
+          |> Enum.reverse()
+          |> Enum.map(fn {model, _denial} -> model_selection_snapshot(model) end)
+
+        {:error,
+         %{
+           code: "model_selection_exhausted",
+           message:
+             "no configured model preference can run on host #{host}; " <>
+               "tried: #{details}",
+           attempted: models
+         }}
+    end
+  end
+
+  defp resolve_spawn_preference_candidate(config, db, host, %Model{} = model) do
+    catalog = Map.get(config, :model_catalog, ModelCatalog)
+
+    with {:ok, %{harness: harness, provider: provider} = routed} <-
+           ModelCatalog.route(host, model, catalog),
+         nil <- TerminalCredentialFailure.get_open(db, host, harness),
+         :ok <- validate_credential(config, harness, host, model),
+         :ok <-
+           Spinup.ensure_ready(
+             config,
+             Harness.parse!(harness).id(),
+             host,
+             spinup_opts(config, db, harness, host, model)
+           ) do
+      {:ok, %{host: host, harness: harness, provider: provider, model: model, routed: routed}}
+    else
+      %{} = open_incident ->
+        {:error,
+         %{
+           code: "terminal_credential_failure",
+           message: "catalog suppressed by incident #{open_incident.id}",
+           incident: open_incident
+         }}
+
+      {:error, %Unroutable{} = refusal} ->
+        {:error, refusal}
+
+      {:error, denial} ->
+        {:error, denial}
+    end
+  end
+
   defp route_spawn_candidate(host, harness, %Model{} = model),
     do: route_requested_model(host, harness, model)
 
@@ -6890,7 +7201,10 @@ defmodule Tightbeam.Gateway do
     max_live_sessions = Map.get(config, :max_live_sessions_per_user)
     host = placement.host
     defaults = defaults(config, db)
-    harness = p[:harness] || archetype.defaults[:harness] || defaults.harness
+
+    harness =
+      placement[:harness] || p[:harness] || archetype.defaults[:harness] || defaults.harness
+
     module = if is_atom(harness), do: Harness.module!(harness), else: Harness.parse!(harness)
     harness_string = module.wire_name()
     harness_atom = module.id()
