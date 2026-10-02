@@ -336,9 +336,11 @@ schedule a concrete continuation wake. Do not manufacture a generic progress att
 Completion remains the holder's truthful terminal receipt.
 
 A turn with neither a receipt nor a scheduled continuation is a stall. The substrate checks in
-on the holder and escalates unanswered check-ins to the session that spawned it. Workdir writes,
-recorded artifacts, assignment attests, and work-item updates remain the mechanical effect
-channels that keep the liveness bracket moving.
+on the holder and escalates unanswered check-ins to the session that spawned it. The effort
+bracket advances on attributable durable evidence: recorded artifacts, exact-card or linked-card
+attests, work-item updates, assignment-attributed delivered turns, and native bound pending
+continuation checkpoints. The check-in's own turn and unattributed workspace writes do not count.
+The verdict transaction rechecks that the assignment is still open before it emits a prod.
 
 ## Work alongside other agents
 Other agents work at the same time. Keep your assignment files in the durable workdir that

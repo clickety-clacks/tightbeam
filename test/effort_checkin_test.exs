@@ -392,6 +392,96 @@ defmodule Tightbeam.EffortCheckinTest do
            ]) == [[0]]
   end
 
+  test "attributed work turns, bound checkpoints, and linked-card attests advance a bracket",
+       ctx do
+    attributed = dispatch(ctx, {:session, "parent"}, "holder", "attributed turn")
+    terminal_assignment_turn(ctx.db, "holder", attributed.id, "agent:parent")
+
+    assert nil == fire_probe(ctx, attributed.id)
+    assert Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == attributed.id)) == []
+    assert bracket_state(ctx.db, attributed.id) == "armed"
+
+    self_generated = dispatch(ctx, {:session, "parent"}, "holder", "self-generated turn")
+    terminal_assignment_turn(ctx.db, "holder", self_generated.id, "process:tightbeam")
+
+    assert nil == fire_probe(ctx, self_generated.id)
+
+    assert [_prod] =
+             Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == self_generated.id))
+
+    checkpointed = dispatch(ctx, {:session, "parent"}, "holder", "bound checkpoint")
+
+    {_turn_seq, _lease} =
+      running_assignment_turn(ctx.db, "holder", checkpointed.id, "agent:holder")
+
+    checkpoint =
+      Wakes.schedule(ctx.db, %{
+        session_key: "holder",
+        creator_session_key: "holder",
+        origin: "agent:holder",
+        prompt: "resume the exact gate",
+        due_at: System.system_time(:millisecond) + 60_000,
+        assignment_id: checkpointed.id,
+        sender_scheduled: true
+      })
+
+    assert {:ok, :armed} =
+             DB.transaction(ctx.db, fn txn ->
+               Tightbeam.Supervision.transition_in_txn(txn, %{
+                 kind: "checkpoint_scheduled",
+                 wake_id: checkpoint.wake_id,
+                 creator_session_key: "holder",
+                 supervision_interval_ms: 60_000
+               })
+             end)
+
+    assert nil == fire_probe(ctx, checkpointed.id)
+    assert Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == checkpointed.id)) == []
+
+    work_item = work_item!(ctx.db, "portfolio")
+
+    portfolio =
+      dispatch_for_item(ctx, {:session, "parent"}, "holder", "portfolio owner", work_item.id)
+
+    delivery =
+      dispatch_for_item(ctx, {:session, "parent"}, "holder", "linked delivery", work_item.id)
+
+    assignment(ctx, "attest", {:session, "holder"}, nil, %{
+      assignment_id: delivery.id,
+      kind: "progress",
+      note: "the linked delivery advanced"
+    })
+
+    assert nil == fire_probe(ctx, portfolio.id)
+    assert Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == portfolio.id)) == []
+  end
+
+  test "a terminal race suppresses output while a truly idle open assignment still prods", ctx do
+    terminal = dispatch(ctx, {:session, "parent"}, "holder", "terminal race")
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO attests (id,assignmentId,kind,bySession,ts) VALUES ('att_terminal_race',?1,'completion','holder',?2)",
+               [terminal.id, System.system_time(:millisecond)]
+             )
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE assignments SET state='closed',outcome='completed',closedAt=?2,closedBySession='holder',closingAttestId='att_terminal_race' WHERE id=?1",
+               [terminal.id, System.system_time(:millisecond)]
+             )
+
+    assert nil == fire_probe(ctx, terminal.id)
+    assert bracket_state(ctx.db, terminal.id) == "canceled"
+    assert Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == terminal.id)) == []
+
+    idle = dispatch(ctx, {:session, "parent"}, "holder", "genuinely idle")
+    assert nil == fire_probe(ctx, idle.id)
+    assert [_prod] = Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == idle.id))
+  end
+
   test "proof 4: internal wakes create no turn and stay out of pending/inspection", ctx do
     item = dispatch(ctx, {:session, "parent"}, "holder", "internal")
     wake = current_wake(ctx.db, item.id)
@@ -3416,5 +3506,46 @@ defmodule Tightbeam.EffortCheckinTest do
       end)
 
     :ok = Ledger.finish(db, seq, terminal, nil, owner_lease: lease)
+  end
+
+  defp terminal_assignment_turn(db, session_key, assignment_id, origin) do
+    {seq, lease} = running_assignment_turn(db, session_key, assignment_id, origin)
+    :ok = Ledger.finish(db, seq, "delivered", nil, owner_lease: lease)
+  end
+
+  defp running_assignment_turn(db, session_key, assignment_id, origin) do
+    id = "m_#{System.unique_integer([:positive])}"
+
+    {:ok, seq} =
+      Ledger.enqueue(db, %{
+        session_key: session_key,
+        message_id: id,
+        origin: origin,
+        prompt: id,
+        assignment_id: assignment_id
+      })
+
+    lease = "ol_test_#{System.unique_integer([:positive])}"
+
+    {:ok, :appended} =
+      DB.transaction(db, fn txn ->
+        DB.Txn.q(
+          txn,
+          "UPDATE turns SET status='running', startedAt=?2, owner='test' WHERE seq=?1 AND status='queued'",
+          [seq, System.system_time(:millisecond)]
+        )
+
+        Tightbeam.TurnLifecycle.append_in_txn(txn, seq, %{
+          event_key: "claimed",
+          producer_event_id: "effort-checkin-assignment-fixture:#{seq}",
+          kind: "claimed",
+          cause: "test-fixture:claim",
+          principal: "process:tightbeam",
+          owner_lease: lease,
+          detail: %{v: 1, owner: "test"}
+        })
+      end)
+
+    {seq, lease}
   end
 end
