@@ -111,36 +111,90 @@ defmodule Tightbeam.DBCallTimeoutTest do
     assert {:ok, [[1]]} = DB.query_until(db, "SELECT 1", [], deadline)
   end
 
-  @tag timeout: 60_000
+  @tag timeout: 120_000
   test "a large-base schema migration outlives the former 30s client timeout" do
     Application.delete_env(:tightbeam, :db_call_timeout_ms)
     assert DB.call_timeout() == 30_000
     db = start_supervised!({DB, path: ":memory:", name: nil})
     parent = self()
 
-    assert {:ok, :ok} =
-             DB.migration_transaction(
-               db,
-               :synthetic_large_base,
-               ["PRAGMA ignore_check_constraints = ON"],
-               ["PRAGMA ignore_check_constraints = OFF"],
-               fn txn ->
-                 send(parent, :migration_started)
-                 # A real large-base DDL phase can exceed the former client
-                 # wait. Keep this synthetic phase just over that boundary so
-                 # the test fails if migrations are routed through call_timeout.
-                 Process.sleep(30_050)
-                 :ok = Tightbeam.DB.Txn.exec(txn, "CREATE TABLE migration_fixture (id INTEGER)")
-                 :ok
-               end
-             )
+    {elapsed_us, result} =
+      :timer.tc(fn ->
+        DB.migration_transaction(
+          db,
+          :synthetic_large_base,
+          ["PRAGMA ignore_check_constraints = ON"],
+          ["PRAGMA ignore_check_constraints = OFF"],
+          fn txn ->
+            send(parent, :migration_started)
+
+            :ok =
+              Tightbeam.DB.Txn.exec(
+                txn,
+                "CREATE TABLE migration_fixture (id INTEGER PRIMARY KEY, payload INTEGER NOT NULL)"
+              )
+
+            # This is a real SQLite workload, not a sleep: the migration builds
+            # a one-million-row fixture and performs a two-billion-row join
+            # aggregate over it. It is deliberately large enough to exceed the
+            # former 30s caller wait while remaining a small on-disk fixture.
+            :ok =
+              Tightbeam.DB.Txn.exec(txn, """
+              WITH RECURSIVE series(value) AS (
+                SELECT 1
+                UNION ALL
+                SELECT value + 1 FROM series WHERE value < 1000000
+              )
+              INSERT INTO migration_fixture
+              SELECT value, (value * 17) % 1000003 FROM series
+              """)
+
+            :ok =
+              Tightbeam.DB.Txn.exec(
+                txn,
+                "CREATE TABLE migration_work_fanout (factor INTEGER PRIMARY KEY)"
+              )
+
+            :ok =
+              Tightbeam.DB.Txn.exec(txn, """
+              WITH RECURSIVE series(value) AS (
+                SELECT 1
+                UNION ALL
+                SELECT value + 1 FROM series WHERE value < 2000
+              )
+              INSERT INTO migration_work_fanout SELECT value FROM series
+              """)
+
+            [[checksum]] =
+              Tightbeam.DB.Txn.q(txn, """
+              SELECT sum(f.payload * w.factor)
+              FROM migration_fixture AS f
+              CROSS JOIN migration_work_fanout AS w
+              """)
+
+            send(parent, {:migration_work_complete, checksum})
+
+            :ok =
+              Tightbeam.DB.Txn.exec(
+                txn,
+                "CREATE TABLE migration_complete (id INTEGER PRIMARY KEY)"
+              )
+
+            :ok
+          end
+        )
+      end)
+
+    assert {:ok, :ok} = result
+    assert elapsed_us >= 30_000_000
 
     assert_receive :migration_started
+    assert_receive {:migration_work_complete, checksum} when is_integer(checksum) and checksum > 0
     assert {:ok, [[0]]} = DB.query(db, "PRAGMA ignore_check_constraints")
 
-    assert {:ok, [["migration_fixture"]]} =
+    assert {:ok, [["migration_complete"]]} =
              DB.query(db, "SELECT name FROM sqlite_master WHERE type='table' AND name=?1", [
-               "migration_fixture"
+               "migration_complete"
              ])
   end
 
