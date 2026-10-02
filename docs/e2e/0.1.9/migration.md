@@ -145,6 +145,28 @@ the values to match.
 
 ## Source qualification
 
+Record the source gateway's effective local host name with the source manifest's
+SHA-256 and the source owner's confirmation. The existing manifest has no
+structured host field: do not invent one or infer the name from an unmatched
+toolchain row. For the approved snapshot, manifest SHA-256
+`48cb1f56565905b9689d93ecbfa8fe8b25fd28cf327a225aca66b6fdf6988324`
+has `lineageEvidence` naming Gibson, and Mike's source-host statement confirms
+the logical name `gibson`. If the recorded provenance conflicts, STOP for the
+source owner; do not probe the live host or change copied rows.
+
+```sh
+SOURCE_LOCAL_HOST=gibson   # shell variable, not an exported product setting
+```
+
+Pass this recorded name through the shared helper's `NAME=VALUE` arguments for
+the positive migration start and **every** later restart or area copy of the
+migrated result. `TIGHTBEAM_LOCAL_HOST_NAME` remains absent from the ambient
+shell under containment condition 5. The per-command input preserves the source
+local-host relationship; it does not register hosts, change toolchain paths or
+make an unrelated orphan valid. Do not map missing source paths onto the test
+host. Keep the same recorded name with the preserved result when another shell
+reuses it; a fresh-base-only run uses its own test identity.
+
 A published tagged 0.1.9 package carries a canonical
 `release-provenance.json` beside its release payload. The gateway uses that
 file only to distinguish a published release from a development or work-branch
@@ -487,10 +509,12 @@ case "$package_kind" in
   candidate)
     migration_path="TIGHTBEAM_LIVE_BASE_TRANSITION supplied for one start only"
     gateway_start_migration "$test_base" "$test_port" "$trial_root/gateway.log" \
+      "TIGHTBEAM_LOCAL_HOST_NAME=${SOURCE_LOCAL_HOST:?}" \
       TIGHTBEAM_LIVE_BASE_TRANSITION="$(transition_json "$test_base" "$source_stamp" "$target_build_identity")" ;;
   release)
     migration_path="automatic, from release-provenance.json"
-    gateway_start_migration "$test_base" "$test_port" "$trial_root/gateway.log" ;;
+    gateway_start_migration "$test_base" "$test_port" "$trial_root/gateway.log" \
+      "TIGHTBEAM_LOCAL_HOST_NAME=${SOURCE_LOCAL_HOST:?}" ;;
 esac
 cp "$trial_root/gateway.log.version" "$trial_root/version.json"
 python3 - "$trial_root/version.json" "$target_source_commit" <<'PY'
@@ -600,7 +624,8 @@ package kinds.
 ```sh
 probe_refusal left-set build_transition_mismatch \
   TIGHTBEAM_LIVE_BASE_TRANSITION="$(transition_json "$test_base" "$source_stamp" "$target_build_identity")" || exit 1
-gateway_start "$test_base" "$test_port" "$trial_root/reboot.log" || exit 1
+gateway_start "$test_base" "$test_port" "$trial_root/reboot.log" \
+  "TIGHTBEAM_LOCAL_HOST_NAME=${SOURCE_LOCAL_HOST:?}" || exit 1
 gateway_stop
 ```
 
@@ -727,7 +752,8 @@ AREA_BASE="$(cd "$AREA_BASE" && pwd -P)"
 AREA_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
 cp "$migrated/state.db" "$migrated/build-owner.json" "$AREA_BASE/"
 chmod u+w "$AREA_BASE/state.db" "$AREA_BASE/build-owner.json"
-gateway_start "$AREA_BASE" "$AREA_PORT" "$AREA_BASE.log"
+gateway_start "$AREA_BASE" "$AREA_PORT" "$AREA_BASE.log" \
+  "TIGHTBEAM_LOCAL_HOST_NAME=${SOURCE_LOCAL_HOST:?}"
 ```
 
 Copy nothing else into the area base. Never boot 0.1.8 against the migrated

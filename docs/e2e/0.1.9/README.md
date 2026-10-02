@@ -183,6 +183,7 @@ gateway_pid=""
 gateway_launch() { # gateway_launch BASE PORT LOG [NAME=VALUE ...]
   base="$1"; port="$2"; log="$3"; shift 3
   env -u TIGHTBEAM_LIVE_BASE_TRANSITION -u TIGHTBEAM_ADVERTISED_URL \
+    -u TIGHTBEAM_LOCAL_HOST_NAME \
     -u RELEASE_NODE -u RELEASE_COOKIE -u TIGHTBEAM_NODE \
     TIGHTBEAM_BASE_DIR="$base" TIGHTBEAM_PORT="$port" "$@" \
     "${PKG:?}/bin/tightbeam-gateway" >"$log" 2>&1 &
@@ -370,8 +371,11 @@ sha256() { if command -v sha256sum >/dev/null; then sha256sum "$1"; else shasum 
    env | cut -d= -f1 | grep -Ei '(anthropic|openai|cursor|claude|codex|gh_|github|token|api_key|secret)'
    ```
 
-   Both `grep` lines print nothing. Run the [CLI shell](#cli-shell) marker check
-   from the working directory you will use.
+   Both `grep` lines print nothing. The copied-base starts in
+   [migration.md](migration.md#source-qualification) deliberately pass the
+   snapshot's proven local host name to that gateway command only; this is not
+   permission to export or inherit `TIGHTBEAM_LOCAL_HOST_NAME`. Run the
+   [CLI shell](#cli-shell) marker check from the working directory you will use.
 
 6. **Contained prerequisites.** The package hash matches its published value and
    the source snapshot's digest matches its manifest. Boot preflight refuses to
