@@ -468,15 +468,29 @@ On a candidate package, start the gateway with the exact transition, on this
 one start only, and do not export the variable. On a release package, start it
 with no input: the automatic upgrade is the behavior under test.
 
+This start uses `gateway_start_migration`, which has no time limit: on a
+real-size base the gateway serves `/version` only after the migration
+completes. Refusal probes and the later restart keep the 120-second
+`gateway_start`. Record the helper's final line, with its elapsed seconds, in
+the scorecard.
+
+If the gateway exits before serving `/version`, the helper reports the exit
+status and the script stops. That exit is never a ready gateway; classify it
+from the private log under the [scorecard](README.md#scorecard) rules. If the
+operator interrupts a start that is still running, the trap stops the gateway
+and the row is `INCOMPLETE` with the elapsed time: the check was stopped before
+a product result, so it is neither a pass nor a failure. After either, the copy
+may have changed, so a later attempt starts from a new copy.
+
 ```sh
 case "$package_kind" in
   candidate)
     migration_path="TIGHTBEAM_LIVE_BASE_TRANSITION supplied for one start only"
-    gateway_start "$test_base" "$test_port" "$trial_root/gateway.log" \
+    gateway_start_migration "$test_base" "$test_port" "$trial_root/gateway.log" \
       TIGHTBEAM_LIVE_BASE_TRANSITION="$(transition_json "$test_base" "$source_stamp" "$target_build_identity")" ;;
   release)
     migration_path="automatic, from release-provenance.json"
-    gateway_start "$test_base" "$test_port" "$trial_root/gateway.log" ;;
+    gateway_start_migration "$test_base" "$test_port" "$trial_root/gateway.log" ;;
 esac
 cp "$trial_root/gateway.log.version" "$trial_root/version.json"
 python3 - "$trial_root/version.json" "$target_source_commit" <<'PY'
