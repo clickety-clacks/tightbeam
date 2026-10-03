@@ -348,12 +348,14 @@ defmodule Tightbeam.ArtifactDurabilityMigrationTest do
   test "AD5 a contradictory existing content object refuses without adopting it", %{db: db} do
     :ok = DB.execute(db, "CREATE TABLE artifact_contents (wrong TEXT)")
     before = snapshot(db)
+    toplines_stamp = rows(db, "SELECT * FROM topline_schema_stamp")
 
     assert_raise Schema.ShapeError, ~r/artifact durability objects/, fn ->
       Schema.ensure_all(db)
     end
 
     assert snapshot(db) == before
+    assert rows(db, "SELECT * FROM topline_schema_stamp") == toplines_stamp
     assert clear_attempt_objects(db) == []
   end
 

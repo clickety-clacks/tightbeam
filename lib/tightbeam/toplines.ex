@@ -3,8 +3,8 @@ defmodule Tightbeam.Toplines do
   Durable human-intent Toplines and explicit Work membership.
 
   This module owns the runtime Topline persistence seam. Production boot calls
-  the closed V5 schema activator after the database connection registers the
-  deterministic Unicode title functions.
+  the portable schema activator, including the stamped V5 predecessor migration.
+  Title normalization and Unicode scalar limits are enforced at this API seam.
 
   The old read-only work telemetry remains byte-compatible through `roster/2`
   and `topline/2`, which delegate to `Tightbeam.ExecutionMap`.
@@ -54,6 +54,10 @@ defmodule Tightbeam.Toplines do
 
   @spec ensure_schema(DB.server()) :: :ok | {:error, map()}
   def ensure_schema(db \\ Tightbeam.DB), do: ToplinesSchema.activate(db)
+
+  @doc false
+  def ensure_historical_schema(db),
+    do: ToplinesSchema.activate(db, System.system_time(:millisecond), defer_v5_migration: true)
 
   @doc false
   def __handle__(db, "topline-create", call), do: create(db, call)

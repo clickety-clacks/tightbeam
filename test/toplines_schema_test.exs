@@ -9,7 +9,7 @@ defmodule Tightbeam.ToplinesSchemaTest do
 
     assert :ok = ToplinesSchema.activate(db, 123)
 
-    assert {:ok, [[1, "standalone-toplines-v5", 123]]} =
+    assert {:ok, [[1, "standalone-toplines-v6", 123]]} =
              DB.query(db, "SELECT singleton, shape, stampedAt FROM topline_schema_stamp")
 
     expected =
@@ -32,7 +32,7 @@ defmodule Tightbeam.ToplinesSchemaTest do
     assert snapshot(db) == before
   end
 
-  test "the connection registers deterministic title functions before schema activation" do
+  test "legacy V5 title constraints remain supported until the portable migration" do
     db = base_db!()
 
     assert {:ok, [["Café", 2, nil, nil]]} =
@@ -47,12 +47,40 @@ defmodule Tightbeam.ToplinesSchemaTest do
                ["\u00a0Cafe\u0301\u3000", "é💩"]
              )
 
-    assert :ok = ToplinesSchema.activate(db, 1)
+    :ok = DB.execute(db, File.read!("test/fixtures/toplines_v5.sql"))
     insert_topline!(db, "Café")
 
     for invalid <- [" Cafe", "Cafe\u0301", "", String.duplicate("a", 2_001), 1] do
       assert {:error, %DB.Error{}} = insert_topline(db, invalid)
     end
+
+    assert :ok = ToplinesSchema.activate(db, 124)
+    assert {:ok, [["Café"]]} = DB.query(db, "SELECT title FROM toplines")
+    assert {:error, %DB.Error{}} = insert_topline(db, 1)
+  end
+
+  test "boot qualification preserves exact V5 until final activation and refuses drift" do
+    db = base_db!()
+    :ok = DB.execute(db, File.read!("test/fixtures/toplines_v5.sql"))
+    insert_topline!(db, "Café")
+    before = snapshot(db)
+
+    assert :ok = Tightbeam.Toplines.ensure_historical_schema(db)
+    assert snapshot(db) == before
+    assert :ok = Tightbeam.Toplines.ensure_schema(db)
+
+    assert {:ok, [["standalone-toplines-v6"]]} =
+             DB.query(db, "SELECT shape FROM topline_schema_stamp")
+
+    assert {:ok, [["Café"]]} = DB.query(db, "SELECT title FROM toplines")
+
+    :ok = DB.execute(db, "DROP INDEX toplines_id_owner")
+    before = snapshot(db)
+
+    assert {:error, %{code: "schema_shape_mismatch"}} =
+             Tightbeam.Toplines.ensure_historical_schema(db)
+
+    assert snapshot(db) == before
   end
 
   test "an empty, unknown, or altered stamp refuses before any write" do
@@ -165,6 +193,90 @@ defmodule Tightbeam.ToplinesSchemaTest do
       "guard_toplines_runtime.exs",
       "guarded-toplines-crash: ok"
     )
+  end
+
+  @tag :tmp_dir
+  test "populated V5 migration is atomic, portable to bare SQLite, and reopens", %{tmp_dir: tmp} do
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "guard_toplines_portable_runtime.exs",
+      "guarded-toplines-portable: ok"
+    )
+  end
+
+  test "V5 drift, extensions, and unknown incoming relationships refuse without writes" do
+    for sql <- [
+          "ALTER TABLE toplines ADD COLUMN unexpected TEXT",
+          "DROP INDEX toplines_id_owner",
+          "CREATE INDEX extra_title ON toplines(title)",
+          "CREATE TRIGGER extra_title AFTER INSERT ON toplines BEGIN SELECT 1; END",
+          "CREATE TABLE extra_child (id TEXT REFERENCES toplines(id) ON DELETE CASCADE)"
+        ] do
+      db = base_db!()
+      :ok = DB.execute(db, File.read!("test/fixtures/toplines_v5.sql"))
+      :ok = DB.execute(db, sql)
+      before = snapshot(db)
+
+      assert {:error, %{code: "schema_shape_mismatch"}} =
+               Tightbeam.Toplines.ensure_historical_schema(db)
+
+      assert snapshot(db) == before
+      assert {:error, %{code: "schema_shape_mismatch"}} = ToplinesSchema.activate(db, 124)
+      assert snapshot(db) == before
+      assert {:ok, [[1]]} = DB.query(db, "PRAGMA foreign_keys")
+    end
+  end
+
+  test "invalid V5 title data refuses migration rather than legitimizing it" do
+    db = base_db!()
+    :ok = DB.execute(db, File.read!("test/fixtures/toplines_v5.sql"))
+    :ok = DB.execute(db, "PRAGMA ignore_check_constraints=ON")
+    insert_topline!(db, " Cafe ")
+    :ok = DB.execute(db, "PRAGMA ignore_check_constraints=OFF")
+    before = snapshot(db)
+    assert_raise RuntimeError, ~r/invalid titles/, fn -> ToplinesSchema.activate(db, 124) end
+    assert snapshot(db) == before
+  end
+
+  test "a copied row constraint failure restores the entire V5 schema and data" do
+    db = base_db!()
+    :ok = DB.execute(db, File.read!("test/fixtures/toplines_v5.sql"))
+    insert_topline!(db, "Valid")
+    :ok = DB.execute(db, "PRAGMA ignore_check_constraints=ON")
+    :ok = DB.execute(db, "UPDATE toplines SET state='invalid'")
+    :ok = DB.execute(db, "PRAGMA ignore_check_constraints=OFF")
+    before = snapshot(db)
+
+    assert_raise MatchError, ~r/CHECK constraint failed/, fn ->
+      ToplinesSchema.activate(db, 124)
+    end
+
+    assert snapshot(db) == before
+    assert {:ok, [[1]]} = DB.query(db, "PRAGMA foreign_keys")
+    assert {:ok, [[0]]} = DB.query(db, "PRAGMA defer_foreign_keys")
+    assert {:ok, []} = DB.query(db, "SELECT name FROM sqlite_temp_schema")
+  end
+
+  test "a pre-existing relationship violation cannot acquire a V6 success stamp" do
+    db = base_db!()
+    :ok = DB.execute(db, File.read!("test/fixtures/toplines_v5.sql"))
+    :ok = DB.execute(db, "PRAGMA foreign_keys=OFF")
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO topline_concerns VALUES('tlc_orphan','tl_missing','Concern','user','mike',1)
+      """)
+
+    :ok = DB.execute(db, "PRAGMA foreign_keys=ON")
+    before = snapshot(db)
+
+    assert_raise RuntimeError, ~r/invalid foreign keys/, fn ->
+      ToplinesSchema.activate(db, 124)
+    end
+
+    assert snapshot(db) == before
+    assert {:ok, [[1]]} = DB.query(db, "PRAGMA foreign_keys")
+    assert {:ok, [[0]]} = DB.query(db, "PRAGMA defer_foreign_keys")
   end
 
   defp base_db! do

@@ -31,7 +31,7 @@ defmodule Tightbeam.ToplinesRailsTest do
     %{db: db}
   end
 
-  test "AC65 rejects every invalid Topline shape through direct SQL", %{db: db} do
+  test "AC65 keeps structural SQL checks and enforces canonical titles through the API", %{db: db} do
     invalid = [
       %{state: "other"},
       %{createdActorRef: nil},
@@ -39,16 +39,22 @@ defmodule Tightbeam.ToplinesRailsTest do
       %{state: "closed", closedAt: nil},
       %{state: "closed", closedAt: "later"},
       %{updatedAt: 9},
-      %{title: 1},
-      %{title: "\u00a0Intent"},
-      %{title: "Cafe\u0301"},
-      %{title: ""},
-      %{title: String.duplicate("a", 2_001)}
+      %{title: 1}
     ]
 
     Enum.each(invalid, fn overrides ->
       assert_rejected(db, "toplines", Map.merge(topline_row("tl_invalid"), overrides))
     end)
+
+    # Mike a5c3e7d9 moves Unicode enforcement out of persisted SQL so bare
+    # SQLite tools can read the schema. Keep the title oracles at the API seam.
+    for title <- ["", String.duplicate("a", 2_001)] do
+      assert %{code: "invalid_message"} = Toplines.create(db, title_call(%{title: title}))
+    end
+
+    for {title, canonical} <- [{"\u00a0Intent", "Intent"}, {"Cafe\u0301", "Café"}] do
+      assert Toplines.create(db, title_call(%{title: title})).topline.title == canonical
+    end
   end
 
   test "AC66 rejects invalid membership actors, reasons, and end tuples", %{db: db} do
@@ -78,8 +84,7 @@ defmodule Tightbeam.ToplinesRailsTest do
     invalid = [
       %{createdActorRef: nil},
       %{createdAt: "later"},
-      %{title: " Intent"},
-      %{title: String.duplicate("a", 2_001)}
+      %{title: 1}
     ]
 
     Enum.each(invalid, fn overrides ->
@@ -89,6 +94,17 @@ defmodule Tightbeam.ToplinesRailsTest do
         Map.merge(concern_row("tlc_invalid", "tl_one"), overrides)
       )
     end)
+
+    assert %{code: "invalid_message"} =
+             Toplines.create_concern(
+               db,
+               title_call(%{topline_id: "tl_one", title: String.duplicate("a", 2_001)})
+             )
+
+    assert Toplines.create_concern(
+             db,
+             title_call(%{topline_id: "tl_one", title: " Intent"})
+           ).concern.title == "Intent"
   end
 
   test "AC68 rejects invalid Concern-tag actors, reasons, and times", %{db: db} do
@@ -457,6 +473,14 @@ defmodule Tightbeam.ToplinesRailsTest do
                """,
                [id, "Work #{id}", owner]
              )
+  end
+
+  defp title_call(params) do
+    %{
+      principal: {:user, "flynn"},
+      now: 20,
+      params: Map.put(params, :idempotency_key, "title-#{System.unique_integer([:positive])}")
+    }
   end
 
   defp assert_rejected(db, table, row) do
