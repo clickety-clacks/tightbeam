@@ -366,7 +366,8 @@ defmodule Tightbeam.LiveBaseAdmissionTest do
     assert File.read!(Path.join(ctx.base, "operator-note")) == "synthetic neighbor"
   end
 
-  test "orphan SQLite state and unsafe preboot entries refuse", ctx do
+  test "freshness observes only DB and marker, leaving neighbor validation to their owners",
+       ctx do
     cases = [
       {"state.db-wal", :file},
       {"state.db-shm", :file},
@@ -385,7 +386,7 @@ defmodule Tightbeam.LiveBaseAdmissionTest do
     ]
 
     for {{name, type}, index} <- Enum.with_index(cases) do
-      base = ctx.base <> "-negative-#{index}"
+      base = ctx.base <> "-observation-#{index}"
       File.mkdir_p!(base)
       path = Path.join(base, name)
 
@@ -395,14 +396,22 @@ defmodule Tightbeam.LiveBaseAdmissionTest do
         :symlink -> File.ln_s!("missing-target", path)
       end
 
-      if name == "state.db" do
-        assert_raise RuntimeError, ~r/schema inspection file refused/, fn ->
-          LiveBaseAdmission.prepare!(base, ctx.options)
-        end
-      else
-        assert_raise LiveBaseAdmission.Refusal, fn ->
-          LiveBaseAdmission.prepare!(base, ctx.options)
-        end
+      case name do
+        "state.db" ->
+          assert_raise RuntimeError, ~r/schema inspection file refused/, fn ->
+            LiveBaseAdmission.prepare!(base, ctx.options)
+          end
+
+        "build-owner.json" ->
+          assert_raise LiveBaseAdmission.Refusal, ~r/invalid marker file/, fn ->
+            LiveBaseAdmission.prepare!(base, ctx.options)
+          end
+
+        _ ->
+          admission = LiveBaseAdmission.prepare!(base, ctx.options)
+          assert admission.stamp == :fresh
+          assert admission.marker == :absent
+          assert LiveBaseAdmission.revalidate!(admission) == admission
       end
 
       assert File.ls!(base) == [name]

@@ -162,48 +162,21 @@ defmodule Tightbeam.LiveBaseAdmission do
 
   # Onboarding, CLI provisioning and launchers write neighboring files before
   # first boot. Only the DB and marker determine whether history already exists.
-  # Keep orphan SQLite state and unsafe entry types out of the fresh path;
-  # internal configuration validation remains with each file's owner.
+  # Do not inspect neighboring entries. Their validation belongs to their owners.
+  # lstat keeps a dangling DB link from being mistaken for an absent database.
   defp observe_base!(base, marker) do
-    case File.ls(base) do
-      {:error, :enoent} ->
+    case File.lstat(Path.join(base, "state.db")) do
+      {:error, :enoent} when marker == :absent ->
         :new_empty
 
-      {:ok, entries} ->
-        if marker != :absent or "state.db" in entries do
-          :existing
-        else
-          for entry <- entries do
-            expected =
-              case entry do
-                name when name in ["state.db-wal", "state.db-shm", "state.db-journal"] ->
-                  refuse!("orphan database sidecar: #{inspect(name)}")
+      {:error, :enoent} ->
+        :existing
 
-                name when name in ["adapters", "homes", "identity"] ->
-                  :directory
-
-                "gateway.log" ->
-                  :regular
-
-                _ ->
-                  nil
-              end
-
-            case File.lstat(Path.join(base, entry)) do
-              {:ok, %{type: type}}
-              when type in [:regular, :directory] and (is_nil(expected) or type == expected) ->
-                :ok
-
-              other ->
-                refuse!("invalid preboot entry #{inspect(entry)}: #{inspect(other)}")
-            end
-          end
-
-          :new_empty
-        end
+      {:ok, _} ->
+        :existing
 
       other ->
-        refuse!("invalid base: #{inspect(other)}")
+        refuse!("invalid persistent database: #{inspect(other)}")
     end
   end
 
