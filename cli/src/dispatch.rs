@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -1957,7 +1958,7 @@ fn send_to_with_timeout(
     if let Some(attempt) = attempt.as_mut() {
         attempt.observe_response(&response);
     }
-    let encoded = match response.into_string() {
+    let encoded = match read_dispatch_body(response) {
         Ok(encoded) => encoded,
         Err(error) => {
             return Err(match attempt.take() {
@@ -2007,6 +2008,16 @@ fn send_to_with_timeout(
             });
     }
     parse_response_with_attempt(status, &encoded, attempt_render)
+}
+
+fn read_dispatch_body(response: ureq::Response) -> std::io::Result<String> {
+    // Dispatch lists have no fixed size ceiling. Keep the response reader's
+    // framing/deadlines and propagate incomplete-body errors before parsing.
+    // Like ureq's into_string (without its optional charset feature), retain
+    // lossy UTF-8 decoding. This still materializes the full body and JSON.
+    let mut bytes = Vec::new();
+    response.into_reader().read_to_end(&mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Read from the verb the body actually names, not from a substring of it: any other
@@ -5958,6 +5969,57 @@ mod tests {
             human.to_owned(),
             serde_json::from_str(machine).expect("machine line is JSON"),
         )
+    }
+
+    #[test]
+    fn dispatch_body_reader_preserves_total_and_read_deadlines() {
+        use std::io::{BufRead, BufReader, Write};
+
+        for total_deadline in [true, false] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let (release, held) = std::sync::mpsc::channel();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{",
+                    )
+                    .unwrap();
+                // Hold the connection open: only the reader's configured
+                // deadline, not EOF or a JSON parser, can end this read.
+                held.recv_timeout(Duration::from_secs(10)).unwrap();
+            });
+            let builder = ureq::AgentBuilder::new();
+            let builder = if total_deadline {
+                builder.timeout(Duration::from_secs(1))
+            } else {
+                builder.timeout_read(Duration::from_secs(1))
+            };
+            let response = builder
+                .build()
+                .get(&format!("http://{address}/body"))
+                .call()
+                .unwrap();
+            let result = read_dispatch_body(response);
+            release.send(()).unwrap();
+            server.join().unwrap();
+            assert!(matches!(
+                result.unwrap_err().kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            ));
+        }
     }
 
     fn local_response(
