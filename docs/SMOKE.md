@@ -191,7 +191,8 @@ on 2026-07-25:
   `TIGHTBEAM_SMOKE_MODEL_<UPPERCASE_WIRE_NAME>`, its reasoning level through
   `TIGHTBEAM_SMOKE_EFFORT_<…>`, and a vendor context-window variant, if the leg
   needs one, through `TIGHTBEAM_SMOKE_CONTEXT_<…>`. Missing model configuration
-  refuses the run before the first leg. For the current registry:
+  refuses the run before the first leg. Use the cheapest model that can run the
+  inference in the tests. For the current registry:
 
   ```sh
   TIGHTBEAM_BASE_DIR=/absolute/owned/test-base \
