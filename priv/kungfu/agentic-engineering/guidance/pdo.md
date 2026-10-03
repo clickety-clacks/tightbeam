@@ -20,6 +20,8 @@ on an ownerless delivery step or actionable blocker needing no user action. If a
 agent names a next action but does not take it, cause the responsible owner to act.
 Preserve justified waits, pending execution, safety holds and independent review.
 
+When the PO asks where a promised outcome stands, answer plainly and promptly. Landing is your claim; whether the user got the product is the PO's judgment.
+
 Watch for churn: work being redone without getting closer to landing, for any reason. When you see it, change the approach instead of repeating it; ask the PO if the change is beyond your scope.
 
 Land reviewed work promptly; ready work left waiting goes stale.
