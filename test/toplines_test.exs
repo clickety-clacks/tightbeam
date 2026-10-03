@@ -960,6 +960,59 @@ defmodule Tightbeam.ToplinesTest do
              )
   end
 
+  test "portable schema retains API normalization and scalar boundaries on every title write", %{
+    db: db
+  } do
+    for {input, expected} <- [
+          {"\u3000Cafe\u0301\u00a0", "Café"},
+          {String.duplicate("💩", 2_000), String.duplicate("💩", 2_000)},
+          {"a\0b", "a\0b"}
+        ] do
+      key = "unicode-#{System.unique_integer([:positive])}"
+      created = Toplines.create(db, call({:user, "flynn"}, %{title: input, idempotency_key: key}))
+      assert created.topline.title == expected
+      id = created.topline.id
+
+      concern =
+        Toplines.create_concern(
+          db,
+          call({:user, "flynn"}, %{
+            topline_id: id,
+            title: input,
+            idempotency_key: key <> "-concern"
+          })
+        )
+
+      assert concern.concern.title == expected
+
+      for invalid <- [nil, 1, "", "\u00a0\u3000", <<255>>, String.duplicate("💩", 2_001)] do
+        params = %{title: invalid, idempotency_key: key <> "-invalid"}
+        assert %{code: "invalid_message"} = Toplines.create(db, call({:user, "flynn"}, params))
+
+        assert %{code: "invalid_message"} =
+                 Toplines.update(
+                   db,
+                   call(
+                     {:user, "flynn"},
+                     Map.merge(params, %{topline_id: id, reason: "rename"})
+                   )
+                 )
+
+        assert %{code: "invalid_message"} =
+                 Toplines.create_concern(
+                   db,
+                   call(
+                     {:user, "flynn"},
+                     Map.put(params, :topline_id, id)
+                   )
+                 )
+      end
+
+      assert Toplines.get(db, read_call({:user, "flynn"}, %{topline_id: id})).topline.title ==
+               expected
+    end
+  end
+
   test "invalid, invisible, cross-owner, duplicate, and process operations refuse without writes",
        ctx do
     work_item!(ctx.db, "wi_mine", "flynn")

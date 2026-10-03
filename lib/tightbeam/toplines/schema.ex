@@ -1,12 +1,14 @@
 defmodule Tightbeam.Toplines.Schema do
-  @moduledoc "The closed Standalone Toplines V5 schema manifest and activation rail."
+  @moduledoc "The closed Toplines schema manifest and transactional V5-to-V6 activation rail."
 
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
 
-  @shape "standalone-toplines-v5"
+  @shape "standalone-toplines-v6"
+  @previous_shape "standalone-toplines-v5"
 
-  @objects [
+  # Immutable released predecessor; only the two title CHECK groups change in V6.
+  @v5_objects [
     %{
       type: "table",
       name: "toplines",
@@ -367,11 +369,29 @@ defmodule Tightbeam.Toplines.Schema do
     }
   ]
 
+  @title_tables ["toplines", "topline_concerns"]
+  @title_indexes ["toplines_id_owner", "topline_concerns_id_topline"]
+  @objects Enum.map(@v5_objects, fn object ->
+             if object.name in @title_tables do
+               # Unicode normalization and scalar limits are enforced by the
+               # product API. Persisted DDL must also work in bare SQLite.
+               sql =
+                 object.sql
+                 |> String.split("\n")
+                 |> Enum.reject(&String.contains?(&1, "tightbeam_"))
+                 |> Enum.join("\n")
+
+               %{object | sql: sql}
+             else
+               object
+             end
+           end)
+
   @doc "Return the exact closed Toplines object manifest."
   @spec manifest() :: [map()]
   def manifest, do: @objects
 
-  @doc "Activate or verify the exact V5 schema without inferring or repairing old state."
+  @doc "Activate V6 or migrate its exact stamped V5 predecessor without inferring old state."
   @spec activate(DB.server(), non_neg_integer(), keyword()) :: :ok | {:error, map()}
   def activate(db, stamped_at \\ System.system_time(:millisecond), opts \\ [])
 
@@ -398,7 +418,7 @@ defmodule Tightbeam.Toplines.Schema do
         refusal("schema_shape_mismatch")
 
       _exact ->
-        activate_with_stamp(txn, stored)
+        activate_with_stamp(txn, stored, stamped_at, opts)
     end
   end
 
@@ -425,7 +445,7 @@ defmodule Tightbeam.Toplines.Schema do
     end
   end
 
-  defp activate_with_stamp(txn, stored) do
+  defp activate_with_stamp(txn, stored, activated_at, opts) do
     case Txn.q(
            txn,
            "SELECT singleton, typeof(singleton), shape, typeof(shape), stampedAt, typeof(stampedAt) FROM topline_schema_stamp"
@@ -435,15 +455,102 @@ defmodule Tightbeam.Toplines.Schema do
 
       [[1, "integer", shape, "text", stamped_at, "integer"]]
       when is_binary(shape) and shape != "" and is_integer(stamped_at) and stamped_at >= 0 ->
-        if shape != @shape do
-          refusal("unknown_toplines_schema_stamp")
-        else
-          if exact_manifest?(stored), do: :ok, else: refusal("schema_shape_mismatch")
+        case shape do
+          @shape ->
+            if exact_manifest?(stored), do: :ok, else: refusal("schema_shape_mismatch")
+
+          @previous_shape ->
+            if exact_manifest?(stored, @v5_objects) and portable_rebuild_allowed?(txn) do
+              migrate_v5!(txn, activated_at, opts)
+            else
+              refusal("schema_shape_mismatch")
+            end
+
+          _ ->
+            refusal("unknown_toplines_schema_stamp")
         end
 
       _invalid ->
         refusal("schema_shape_mismatch")
     end
+  end
+
+  defp portable_rebuild_allowed?(txn) do
+    # DROP recreates only these known tables and their indexes. Refuse extra
+    # attached objects or foreign-key dependants rather than losing extensions
+    # or invoking an unregistered ON DELETE action during the rebuild.
+    attached =
+      Txn.q(txn, """
+      SELECT name FROM sqlite_schema
+      WHERE tbl_name IN ('toplines','topline_concerns') AND sql IS NOT NULL
+      ORDER BY name
+      """)
+
+    expected = Enum.sort(@title_tables ++ @title_indexes) |> Enum.map(&[&1])
+    known_tables = for object <- @objects, object.type == "table", do: object.name
+
+    attached == expected and
+      Enum.all?(Txn.q(txn, "SELECT name FROM sqlite_schema WHERE type='table'"), fn [name] ->
+        quoted = String.replace(name, "\"", "\"\"")
+        refs = Txn.q(txn, "PRAGMA foreign_key_list(\"#{quoted}\")")
+
+        name in known_tables or
+          Enum.all?(refs, fn row -> String.downcase(Enum.at(row, 2)) not in @title_tables end)
+      end)
+  end
+
+  defp migrate_v5!(txn, stamped_at, opts) do
+    # Defer, never disable, FK enforcement. Copy back into the original table
+    # names so each reinsert resolves the deferred parent deletion; renaming a
+    # populated shadow table would not resolve SQLite's deferred FK counters.
+    # COMMIT still checks every deferred constraint and rolls back on failure.
+    Enum.each(@title_tables, fn name ->
+      unless Txn.q(txn, """
+             SELECT 1 FROM #{name}
+             WHERE typeof(title) != 'text' OR tightbeam_canonical_title(title) IS NULL
+                OR title != tightbeam_canonical_title(title)
+                OR tightbeam_unicode_scalar_length(title) NOT BETWEEN 1 AND 2000
+             LIMIT 1
+             """) == [] do
+        raise "Toplines migration found invalid titles in #{name}"
+      end
+    end)
+
+    :ok = Txn.exec(txn, "PRAGMA defer_foreign_keys=ON")
+
+    Enum.each(@title_tables, fn name ->
+      %{sql: sql} = Enum.find(@objects, &(&1.name == name))
+      columns = Txn.q(txn, "PRAGMA table_info(#{name})") |> Enum.map(&Enum.at(&1, 1))
+      columns = Enum.join(["rowid" | columns], ", ")
+      copy = "toplines_v6_#{name}_copy"
+      :ok = Txn.exec(txn, "CREATE TEMP TABLE #{copy} AS SELECT #{columns} FROM #{name}")
+      :ok = Txn.exec(txn, "DROP TABLE #{name}")
+      maybe_interrupt!(opts, {:dropped, name})
+      :ok = Txn.exec(txn, sql)
+
+      index = if name == "toplines", do: "toplines_id_owner", else: "topline_concerns_id_topline"
+      :ok = Txn.exec(txn, Enum.find(@objects, &(&1.name == index)).sql)
+      :ok = Txn.exec(txn, "INSERT INTO #{name} (#{columns}) SELECT #{columns} FROM #{copy}")
+      :ok = Txn.exec(txn, "DROP TABLE #{copy}")
+      maybe_interrupt!(opts, {:copied, name})
+    end)
+
+    # Check the preserved Toplines relationships as well as COMMIT's deferred
+    # checks; a pre-existing violation must not acquire a successful V6 stamp.
+    for object <- @objects, object.type == "table" do
+      unless Txn.q(txn, "PRAGMA foreign_key_check(#{object.name})") == [],
+        do: raise("Toplines migration found invalid foreign keys in #{object.name}")
+    end
+
+    verify_manifest!(txn)
+
+    Txn.q(txn, "UPDATE topline_schema_stamp SET shape=?1, stampedAt=?2 WHERE singleton=1", [
+      @shape,
+      stamped_at
+    ])
+
+    maybe_interrupt!(opts, :after_stamp)
+    :ok
   end
 
   defp stored_objects(txn) do
@@ -458,8 +565,8 @@ defmodule Tightbeam.Toplines.Schema do
     |> Map.new(fn [type, name, sql] -> {name, %{type: type, sql: sql}} end)
   end
 
-  defp exact_manifest?(stored) do
-    Enum.all?(@objects, fn object ->
+  defp exact_manifest?(stored, objects \\ @objects) do
+    Enum.all?(objects, fn object ->
       Map.get(stored, object.name) == %{type: object.type, sql: object.sql}
     end)
   end
