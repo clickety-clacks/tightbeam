@@ -324,21 +324,50 @@ defmodule Tightbeam.LiveBaseAdmissionTest do
     refute File.exists?(Path.join(ctx.base, "build-owner.json"))
     assert File.read!(Path.join(ctx.base, "identity/synthetic")) == "public fixture"
 
-    File.write!(Path.join(ctx.base, "stray"), "preserve")
-
-    assert_raise LiveBaseAdmission.Refusal, ~r/unexpected content.*stray/, fn ->
-      LiveBaseAdmission.revalidate!(admission)
-    end
-
-    assert File.read!(Path.join(ctx.base, "stray")) == "preserve"
+    File.write!(Path.join(ctx.base, "operator-note"), "preserve")
+    assert LiveBaseAdmission.revalidate!(admission) == admission
+    assert File.read!(Path.join(ctx.base, "operator-note")) == "preserve"
     refute File.exists?(Path.join(ctx.base, "state.db"))
   end
 
-  test "database-absent stray content and wrongly typed preboot entries refuse", ctx do
+  test "preboot neighbors remain fresh until a database appears", ctx do
+    for name <- ~w(auth bin cli-bin discovered-bin home work diagnostics),
+        do: File.mkdir_p!(Path.join(ctx.base, name))
+
+    for name <- ~w(harnesses.json gateway.json gateway.err.log operator-note),
+        do: File.write!(Path.join(ctx.base, name), "synthetic neighbor")
+
+    admission = LiveBaseAdmission.prepare!(ctx.base, ctx.options)
+    assert admission.stamp == :fresh
+    assert admission.marker == :absent
+    assert LiveBaseAdmission.revalidate!(admission) == admission
+    refute File.exists?(Path.join(ctx.base, "state.db"))
+    refute File.exists?(Path.join(ctx.base, "build-owner.json"))
+
+    path = Path.join(ctx.base, "state.db")
+    {:ok, conn} = Exqlite.Sqlite3.open(path)
+    stamp = hd(Tightbeam.Schema.guard_compatible_stamps())
+
+    :ok =
+      Exqlite.Sqlite3.execute(
+        conn,
+        "CREATE TABLE schema_stamp(shape TEXT); INSERT INTO schema_stamp VALUES ('#{stamp}');"
+      )
+
+    :ok = Exqlite.Sqlite3.close(conn)
+    bytes = File.read!(path)
+
+    assert_raise LiveBaseAdmission.Refusal, ~r/build_transition_required/, fn ->
+      LiveBaseAdmission.revalidate!(admission)
+    end
+
+    assert File.read!(path) == bytes
+    refute File.exists?(Path.join(ctx.base, "build-owner.json"))
+    assert File.read!(Path.join(ctx.base, "operator-note")) == "synthetic neighbor"
+  end
+
+  test "orphan SQLite state and unsafe preboot entries refuse", ctx do
     cases = [
-      {"stray", :file},
-      {"work", :directory},
-      {"gateway.json", :file},
       {"state.db-wal", :file},
       {"state.db-shm", :file},
       {"state.db-journal", :file},
@@ -348,6 +377,9 @@ defmodule Tightbeam.LiveBaseAdmissionTest do
       {"adapters", :symlink},
       {"homes", :symlink},
       {"identity", :symlink},
+      {"auth", :symlink},
+      {"state.db", :symlink},
+      {"build-owner.json", :symlink},
       {"gateway.log", :directory},
       {"gateway.log", :symlink}
     ]
@@ -363,8 +395,14 @@ defmodule Tightbeam.LiveBaseAdmissionTest do
         :symlink -> File.ln_s!("missing-target", path)
       end
 
-      assert_raise LiveBaseAdmission.Refusal, fn ->
-        LiveBaseAdmission.prepare!(base, ctx.options)
+      if name == "state.db" do
+        assert_raise RuntimeError, ~r/schema inspection file refused/, fn ->
+          LiveBaseAdmission.prepare!(base, ctx.options)
+        end
+      else
+        assert_raise LiveBaseAdmission.Refusal, fn ->
+          LiveBaseAdmission.prepare!(base, ctx.options)
+        end
       end
 
       assert File.ls!(base) == [name]

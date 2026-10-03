@@ -23,6 +23,19 @@ Tightbeam.ClientE2E.LegGateway.provision!(template, base)
 ["adapters", "homes", "identity"] = File.ls!(base) |> Enum.sort()
 # The supported boot redirection opens this log before starting the gateway.
 File.write!(Path.join(base, "gateway.log"), "synthetic preboot log\n")
+# Public synthetic shapes only: no real onboarding, credentials or providers.
+# Admission must not confuse CLI/onboarding state with an existing history DB.
+neighbors = ~w(auth/claude auth/github/gh bin cli-bin discovered-bin home work diagnostics)
+
+for directory <- neighbors do
+  File.mkdir_p!(Path.join(base, directory))
+  File.write!(Path.join([base, directory, "preboot-note"]), "synthetic preserved neighbor\n")
+end
+
+projection = "[" <> Enum.map_join(Harness.all(), ",", & &1.wire_projection()) <> "]"
+File.write!(Path.join(base, "harnesses.json"), projection)
+File.write!(Path.join(base, "gateway.err.log"), "synthetic preboot stderr\n")
+File.write!(Path.join(base, "operator-note"), "synthetic operator note\n")
 false = File.exists?(Path.join(base, "state.db"))
 false = File.exists?(Path.join(base, "build-owner.json"))
 tripwire = Path.join(arena, "forbidden-execution.log")
@@ -110,6 +123,14 @@ try do
   {:ok, [["synthetic-admin", 1]]} = DB.query(DB, "SELECT userId, isAdmin FROM users", [])
   {:ok, [[0]]} = DB.query(DB, "SELECT COUNT(*) FROM turns", [])
   "no credentials\n" = File.read!(Path.join(base, "homes/testhost/synthetic.txt"))
+  ^projection = File.read!(Path.join(base, "harnesses.json"))
+
+  for directory <- neighbors do
+    "synthetic preserved neighbor\n" = File.read!(Path.join([base, directory, "preboot-note"]))
+  end
+
+  "synthetic preboot stderr\n" = File.read!(Path.join(base, "gateway.err.log"))
+  "synthetic operator note\n" = File.read!(Path.join(base, "operator-note"))
   false = File.exists?(tripwire)
 after
   :ok = Application.stop(:tightbeam)

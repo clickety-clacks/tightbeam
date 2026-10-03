@@ -160,11 +160,10 @@ defmodule Tightbeam.LiveBaseAdmission do
     }
   end
 
-  # Provisioning copies these directories without a database. LegGateway and
-  # launchd may also open gateway.log before DB admission. This is still a new
-  # history store, not an unmarked existing database or an arbitrary populated
-  # directory. Inspect the entries themselves: a dangling link is not absence.
-  # Internal template validation remains with the identity/harness owners.
+  # Onboarding, CLI provisioning and launchers write neighboring files before
+  # first boot. Only the DB and marker determine whether history already exists.
+  # Keep orphan SQLite state and unsafe entry types out of the fresh path;
+  # internal configuration validation remains with each file's owner.
   defp observe_base!(base, marker) do
     case File.ls(base) do
       {:error, :enoent} ->
@@ -177,14 +176,26 @@ defmodule Tightbeam.LiveBaseAdmission do
           for entry <- entries do
             expected =
               case entry do
-                name when name in ["adapters", "homes", "identity"] -> :directory
-                "gateway.log" -> :regular
-                _ -> refuse!("unexpected content in database-absent base: #{inspect(entry)}")
+                name when name in ["state.db-wal", "state.db-shm", "state.db-journal"] ->
+                  refuse!("orphan database sidecar: #{inspect(name)}")
+
+                name when name in ["adapters", "homes", "identity"] ->
+                  :directory
+
+                "gateway.log" ->
+                  :regular
+
+                _ ->
+                  nil
               end
 
             case File.lstat(Path.join(base, entry)) do
-              {:ok, %{type: ^expected}} -> :ok
-              other -> refuse!("invalid preboot entry #{inspect(entry)}: #{inspect(other)}")
+              {:ok, %{type: type}}
+              when type in [:regular, :directory] and (is_nil(expected) or type == expected) ->
+                :ok
+
+              other ->
+                refuse!("invalid preboot entry #{inspect(entry)}: #{inspect(other)}")
             end
           end
 

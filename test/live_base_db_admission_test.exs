@@ -43,7 +43,9 @@ defmodule Tightbeam.LiveBaseDBAdmissionTest do
 
   @tag :provisioned_runtime
   @tag timeout: 180_000
-  test "supported provision boots a fresh gateway and bootstraps the first admin", %{tmp_dir: tmp} do
+  test "preboot auth, harness cache and CLI neighbors allow fresh gateway and first admin", %{
+    tmp_dir: tmp
+  } do
     cli_dir = Path.expand("../cli", __DIR__)
     target = Path.join(cli_dir, "target/cli-integration")
 
