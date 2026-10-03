@@ -308,6 +308,88 @@ defmodule Tightbeam.LiveBaseAdmissionTest do
     }
   end
 
+  test "supported provisioning is fresh without creating a database", ctx do
+    template = Path.join(Path.dirname(ctx.base), "template")
+    for name <- ~w(adapters homes identity), do: File.mkdir_p!(Path.join(template, name))
+    File.write!(Path.join(template, "identity/synthetic"), "public fixture")
+    # Adapter packages legitimately contain internal links.
+    File.ln_s!("../identity/synthetic", Path.join(template, "adapters/link"))
+    Tightbeam.ClientE2E.LegGateway.provision!(template, ctx.base)
+    File.write!(Path.join(ctx.base, "gateway.log"), "pre-admission boot log\n")
+    admission = LiveBaseAdmission.prepare!(ctx.base, ctx.options)
+    assert admission.stamp == :fresh
+    assert admission.marker == :absent
+    assert LiveBaseAdmission.revalidate!(admission) == admission
+    refute File.exists?(Path.join(ctx.base, "state.db"))
+    refute File.exists?(Path.join(ctx.base, "build-owner.json"))
+    assert File.read!(Path.join(ctx.base, "identity/synthetic")) == "public fixture"
+
+    File.write!(Path.join(ctx.base, "stray"), "preserve")
+
+    assert_raise LiveBaseAdmission.Refusal, ~r/unexpected content.*stray/, fn ->
+      LiveBaseAdmission.revalidate!(admission)
+    end
+
+    assert File.read!(Path.join(ctx.base, "stray")) == "preserve"
+    refute File.exists?(Path.join(ctx.base, "state.db"))
+  end
+
+  test "database-absent stray content and wrongly typed preboot entries refuse", ctx do
+    cases = [
+      {"stray", :file},
+      {"work", :directory},
+      {"gateway.json", :file},
+      {"state.db-wal", :file},
+      {"state.db-shm", :file},
+      {"state.db-journal", :file},
+      {"adapters", :file},
+      {"homes", :file},
+      {"identity", :file},
+      {"adapters", :symlink},
+      {"homes", :symlink},
+      {"identity", :symlink},
+      {"gateway.log", :directory},
+      {"gateway.log", :symlink}
+    ]
+
+    for {{name, type}, index} <- Enum.with_index(cases) do
+      base = ctx.base <> "-negative-#{index}"
+      File.mkdir_p!(base)
+      path = Path.join(base, name)
+
+      case type do
+        :file -> File.write!(path, "preserve")
+        :directory -> File.mkdir!(path)
+        :symlink -> File.ln_s!("missing-target", path)
+      end
+
+      assert_raise LiveBaseAdmission.Refusal, fn ->
+        LiveBaseAdmission.prepare!(base, ctx.options)
+      end
+
+      assert File.ls!(base) == [name]
+
+      case type do
+        :file -> assert File.read!(path) == "preserve"
+        :directory -> assert File.ls!(path) == []
+        :symlink -> assert File.read_link!(path) == "missing-target"
+      end
+    end
+  end
+
+  test "matching marker without a database cannot become a fresh provision", ctx do
+    File.mkdir_p!(Path.join(ctx.base, "homes"))
+    write_owner(ctx.base, ctx.identity)
+    marker = File.read!(Path.join(ctx.base, "build-owner.json"))
+
+    assert_raise LiveBaseAdmission.Refusal, ~r/invalid persistent database/, fn ->
+      LiveBaseAdmission.prepare!(ctx.base, ctx.options)
+    end
+
+    assert File.read!(Path.join(ctx.base, "build-owner.json")) == marker
+    refute File.exists?(Path.join(ctx.base, "state.db"))
+  end
+
   test "wrong marker refuses before SQLite can open", ctx do
     File.mkdir_p!(ctx.base)
     File.write!(Path.join(ctx.base, "state.db"), "not SQLite: must never be opened")

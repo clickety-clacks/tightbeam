@@ -122,13 +122,7 @@ defmodule Tightbeam.LiveBaseAdmission do
           refuse!("invalid marker file: #{inspect(other)}")
       end
 
-    state =
-      case File.ls(base) do
-        {:error, :enoent} -> :new_empty
-        {:ok, []} -> :new_empty
-        {:ok, _} -> :existing
-        other -> refuse!("invalid base: #{inspect(other)}")
-      end
+    state = observe_base!(base, marker)
 
     database = Path.join(base, "state.db")
 
@@ -164,6 +158,42 @@ defmodule Tightbeam.LiveBaseAdmission do
       files: files,
       marker: marker
     }
+  end
+
+  # Provisioning copies these directories without a database. LegGateway and
+  # launchd may also open gateway.log before DB admission. This is still a new
+  # history store, not an unmarked existing database or an arbitrary populated
+  # directory. Inspect the entries themselves: a dangling link is not absence.
+  # Internal template validation remains with the identity/harness owners.
+  defp observe_base!(base, marker) do
+    case File.ls(base) do
+      {:error, :enoent} ->
+        :new_empty
+
+      {:ok, entries} ->
+        if marker != :absent or "state.db" in entries do
+          :existing
+        else
+          for entry <- entries do
+            expected =
+              case entry do
+                name when name in ["adapters", "homes", "identity"] -> :directory
+                "gateway.log" -> :regular
+                _ -> refuse!("unexpected content in database-absent base: #{inspect(entry)}")
+              end
+
+            case File.lstat(Path.join(base, entry)) do
+              {:ok, %{type: ^expected}} -> :ok
+              other -> refuse!("invalid preboot entry #{inspect(entry)}: #{inspect(other)}")
+            end
+          end
+
+          :new_empty
+        end
+
+      other ->
+        refuse!("invalid base: #{inspect(other)}")
+    end
   end
 
   defp qualify_readonly!(path, state, admission) do
