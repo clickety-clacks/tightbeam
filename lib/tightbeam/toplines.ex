@@ -56,6 +56,10 @@ defmodule Tightbeam.Toplines do
   def ensure_schema(db \\ Tightbeam.DB), do: ToplinesSchema.activate(db)
 
   @doc false
+  def ensure_historical_schema(db),
+    do: ToplinesSchema.activate(db, System.system_time(:millisecond), defer_v5_migration: true)
+
+  @doc false
   def __handle__(db, "topline-create", call), do: create(db, call)
   def __handle__(db, "topline-update", call), do: update(db, call)
   def __handle__(db, "topline-close", call), do: close(db, call)

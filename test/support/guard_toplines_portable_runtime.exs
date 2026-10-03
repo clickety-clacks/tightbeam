@@ -274,14 +274,16 @@ try do
     assert F.snapshot(db) == before
   end
 
-  assert :ok = TS.activate(DB.migration_context(db), 456)
+  # Exercise the production boot ordering, not only the standalone activator.
+  assert :ok = Schema.ensure_all(db)
   {old_schema, old_rows} = before
   {new_schema, new_rows} = F.snapshot(db)
 
   assert Map.delete(new_rows, "topline_schema_stamp") ==
            Map.delete(old_rows, "topline_schema_stamp")
 
-  assert new_rows["topline_schema_stamp"] == [[1, 1, "standalone-toplines-v6", 456]]
+  assert [[1, 1, "standalone-toplines-v6", activated_at]] = new_rows["topline_schema_stamp"]
+  assert is_integer(activated_at) and activated_at > 123
 
   unaffected = fn rows ->
     Enum.reject(rows, fn [_, name, _] -> name in ["toplines", "topline_concerns"] end)

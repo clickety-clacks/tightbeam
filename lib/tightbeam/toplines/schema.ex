@@ -461,7 +461,13 @@ defmodule Tightbeam.Toplines.Schema do
 
           @previous_shape ->
             if exact_manifest?(stored, @v5_objects) and portable_rebuild_allowed?(txn) do
-              migrate_v5!(txn, activated_at, opts)
+              # Bootstrap must qualify the predecessor without rewriting it:
+              # a later unrelated migration can still refuse this database.
+              # Final activation repeats this qualification inside its rebuild
+              # transaction after the other boot migrations have succeeded.
+              if Keyword.get(opts, :defer_v5_migration, false),
+                do: :ok,
+                else: migrate_v5!(txn, activated_at, opts)
             else
               refusal("schema_shape_mismatch")
             end

@@ -59,6 +59,30 @@ defmodule Tightbeam.ToplinesSchemaTest do
     assert {:error, %DB.Error{}} = insert_topline(db, 1)
   end
 
+  test "boot qualification preserves exact V5 until final activation and refuses drift" do
+    db = base_db!()
+    :ok = DB.execute(db, File.read!("test/fixtures/toplines_v5.sql"))
+    insert_topline!(db, "Café")
+    before = snapshot(db)
+
+    assert :ok = Tightbeam.Toplines.ensure_historical_schema(db)
+    assert snapshot(db) == before
+    assert :ok = Tightbeam.Toplines.ensure_schema(db)
+
+    assert {:ok, [["standalone-toplines-v6"]]} =
+             DB.query(db, "SELECT shape FROM topline_schema_stamp")
+
+    assert {:ok, [["Café"]]} = DB.query(db, "SELECT title FROM toplines")
+
+    :ok = DB.execute(db, "DROP INDEX toplines_id_owner")
+    before = snapshot(db)
+
+    assert {:error, %{code: "schema_shape_mismatch"}} =
+             Tightbeam.Toplines.ensure_historical_schema(db)
+
+    assert snapshot(db) == before
+  end
+
   test "an empty, unknown, or altered stamp refuses before any write" do
     stamp = Enum.find(ToplinesSchema.manifest(), &(&1.name == "topline_schema_stamp"))
 
@@ -192,6 +216,11 @@ defmodule Tightbeam.ToplinesSchemaTest do
       :ok = DB.execute(db, File.read!("test/fixtures/toplines_v5.sql"))
       :ok = DB.execute(db, sql)
       before = snapshot(db)
+
+      assert {:error, %{code: "schema_shape_mismatch"}} =
+               Tightbeam.Toplines.ensure_historical_schema(db)
+
+      assert snapshot(db) == before
       assert {:error, %{code: "schema_shape_mismatch"}} = ToplinesSchema.activate(db, 124)
       assert snapshot(db) == before
       assert {:ok, [[1]]} = DB.query(db, "PRAGMA foreign_keys")

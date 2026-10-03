@@ -1537,6 +1537,7 @@ defmodule Tightbeam.Schema do
 
     Enum.each(@schema_modules, fn
       Tightbeam.Ledger -> :ok
+      Tightbeam.Toplines -> :ok = Tightbeam.Toplines.ensure_historical_schema(db)
       module -> :ok = module.ensure_schema(db)
     end)
 
@@ -1546,6 +1547,7 @@ defmodule Tightbeam.Schema do
 
     Enum.each(@schema_modules, fn
       Tightbeam.Ledger -> :ok
+      Tightbeam.Toplines -> :ok = Tightbeam.Toplines.ensure_historical_schema(db)
       module -> :ok = module.ensure_schema(db)
     end)
 
@@ -1559,6 +1561,10 @@ defmodule Tightbeam.Schema do
     :ok = upgrade_identity_publication_denial_diagnostic(db)
     :ok = upgrade_work_item_delivery_owner_link(db)
     :ok = upgrade_supervision_receipt_cancellation_v1(db)
+
+    # Preserve exact historical Toplines DDL and its stamp if a preceding
+    # migration refuses. Bootstrap already qualified it; now activate V6.
+    :ok = Tightbeam.Toplines.ensure_schema(db)
 
     # Refused predecessors must retain their exact schema, including indexes.
     # Build these additive access paths only after the existing migrations and
@@ -2777,6 +2783,9 @@ defmodule Tightbeam.Schema do
   # succeed. Existing wake storage still bootstraps before those migrations.
   defp bootstrap_module(db, Tightbeam.Wakes, _current?),
     do: Tightbeam.Wakes.ensure_historical_schema(db)
+
+  defp bootstrap_module(db, Tightbeam.Toplines, _current?),
+    do: Tightbeam.Toplines.ensure_historical_schema(db)
 
   # The correction table is additive current-build storage. Keep its DDL out
   # of the bootstrap pass so a refused migration preserves the exact
