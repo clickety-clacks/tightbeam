@@ -122,13 +122,7 @@ defmodule Tightbeam.LiveBaseAdmission do
           refuse!("invalid marker file: #{inspect(other)}")
       end
 
-    state =
-      case File.ls(base) do
-        {:error, :enoent} -> :new_empty
-        {:ok, []} -> :new_empty
-        {:ok, _} -> :existing
-        other -> refuse!("invalid base: #{inspect(other)}")
-      end
+    state = observe_base!(base, marker)
 
     database = Path.join(base, "state.db")
 
@@ -164,6 +158,26 @@ defmodule Tightbeam.LiveBaseAdmission do
       files: files,
       marker: marker
     }
+  end
+
+  # Onboarding, CLI provisioning and launchers write neighboring files before
+  # first boot. Only the DB and marker determine whether history already exists.
+  # Do not inspect neighboring entries. Their validation belongs to their owners.
+  # lstat keeps a dangling DB link from being mistaken for an absent database.
+  defp observe_base!(base, marker) do
+    case File.lstat(Path.join(base, "state.db")) do
+      {:error, :enoent} when marker == :absent ->
+        :new_empty
+
+      {:error, :enoent} ->
+        :existing
+
+      {:ok, _} ->
+        :existing
+
+      other ->
+        refuse!("invalid persistent database: #{inspect(other)}")
+    end
   end
 
   defp qualify_readonly!(path, state, admission) do

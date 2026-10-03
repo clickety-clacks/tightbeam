@@ -308,6 +308,135 @@ defmodule Tightbeam.LiveBaseAdmissionTest do
     }
   end
 
+  test "supported provisioning is fresh without creating a database", ctx do
+    template = Path.join(Path.dirname(ctx.base), "template")
+    for name <- ~w(adapters homes identity), do: File.mkdir_p!(Path.join(template, name))
+    File.write!(Path.join(template, "identity/synthetic"), "public fixture")
+    # Adapter packages legitimately contain internal links.
+    File.ln_s!("../identity/synthetic", Path.join(template, "adapters/link"))
+    Tightbeam.ClientE2E.LegGateway.provision!(template, ctx.base)
+    File.write!(Path.join(ctx.base, "gateway.log"), "pre-admission boot log\n")
+    admission = LiveBaseAdmission.prepare!(ctx.base, ctx.options)
+    assert admission.stamp == :fresh
+    assert admission.marker == :absent
+    assert LiveBaseAdmission.revalidate!(admission) == admission
+    refute File.exists?(Path.join(ctx.base, "state.db"))
+    refute File.exists?(Path.join(ctx.base, "build-owner.json"))
+    assert File.read!(Path.join(ctx.base, "identity/synthetic")) == "public fixture"
+
+    File.write!(Path.join(ctx.base, "operator-note"), "preserve")
+    assert LiveBaseAdmission.revalidate!(admission) == admission
+    assert File.read!(Path.join(ctx.base, "operator-note")) == "preserve"
+    refute File.exists?(Path.join(ctx.base, "state.db"))
+  end
+
+  test "preboot neighbors remain fresh until a database appears", ctx do
+    for name <- ~w(auth bin cli-bin discovered-bin home work diagnostics),
+        do: File.mkdir_p!(Path.join(ctx.base, name))
+
+    for name <- ~w(harnesses.json gateway.json gateway.err.log operator-note),
+        do: File.write!(Path.join(ctx.base, name), "synthetic neighbor")
+
+    admission = LiveBaseAdmission.prepare!(ctx.base, ctx.options)
+    assert admission.stamp == :fresh
+    assert admission.marker == :absent
+    assert LiveBaseAdmission.revalidate!(admission) == admission
+    refute File.exists?(Path.join(ctx.base, "state.db"))
+    refute File.exists?(Path.join(ctx.base, "build-owner.json"))
+
+    path = Path.join(ctx.base, "state.db")
+    {:ok, conn} = Exqlite.Sqlite3.open(path)
+    stamp = hd(Tightbeam.Schema.guard_compatible_stamps())
+
+    :ok =
+      Exqlite.Sqlite3.execute(
+        conn,
+        "CREATE TABLE schema_stamp(shape TEXT); INSERT INTO schema_stamp VALUES ('#{stamp}');"
+      )
+
+    :ok = Exqlite.Sqlite3.close(conn)
+    bytes = File.read!(path)
+
+    assert_raise LiveBaseAdmission.Refusal, ~r/build_transition_required/, fn ->
+      LiveBaseAdmission.revalidate!(admission)
+    end
+
+    assert File.read!(path) == bytes
+    refute File.exists?(Path.join(ctx.base, "build-owner.json"))
+    assert File.read!(Path.join(ctx.base, "operator-note")) == "synthetic neighbor"
+  end
+
+  test "freshness observes only DB and marker, leaving neighbor validation to their owners",
+       ctx do
+    cases = [
+      {"state.db-wal", :file},
+      {"state.db-shm", :file},
+      {"state.db-journal", :file},
+      {"adapters", :file},
+      {"homes", :file},
+      {"identity", :file},
+      {"adapters", :symlink},
+      {"homes", :symlink},
+      {"identity", :symlink},
+      {"auth", :symlink},
+      {"state.db", :symlink},
+      {"build-owner.json", :symlink},
+      {"gateway.log", :directory},
+      {"gateway.log", :symlink}
+    ]
+
+    for {{name, type}, index} <- Enum.with_index(cases) do
+      base = ctx.base <> "-observation-#{index}"
+      File.mkdir_p!(base)
+      path = Path.join(base, name)
+
+      case type do
+        :file -> File.write!(path, "preserve")
+        :directory -> File.mkdir!(path)
+        :symlink -> File.ln_s!("missing-target", path)
+      end
+
+      case name do
+        "state.db" ->
+          assert_raise RuntimeError, ~r/schema inspection file refused/, fn ->
+            LiveBaseAdmission.prepare!(base, ctx.options)
+          end
+
+        "build-owner.json" ->
+          assert_raise LiveBaseAdmission.Refusal, ~r/invalid marker file/, fn ->
+            LiveBaseAdmission.prepare!(base, ctx.options)
+          end
+
+        _ ->
+          admission = LiveBaseAdmission.prepare!(base, ctx.options)
+          assert admission.stamp == :fresh
+          assert admission.marker == :absent
+          assert LiveBaseAdmission.revalidate!(admission) == admission
+      end
+
+      assert File.ls!(base) == [name]
+
+      case type do
+        :file -> assert File.read!(path) == "preserve"
+        :directory -> assert File.ls!(path) == []
+        :symlink -> assert File.read_link!(path) == "missing-target"
+      end
+    end
+  end
+
+  test "matching marker without a database cannot become a fresh provision", ctx do
+    File.mkdir_p!(Path.join(ctx.base, "homes"))
+    write_owner(ctx.base, ctx.identity)
+    marker = File.read!(Path.join(ctx.base, "build-owner.json"))
+
+    assert_raise LiveBaseAdmission.Refusal, ~r/invalid persistent database/, fn ->
+      LiveBaseAdmission.prepare!(ctx.base, ctx.options)
+    end
+
+    assert File.read!(Path.join(ctx.base, "build-owner.json")) == marker
+    refute File.exists?(Path.join(ctx.base, "state.db"))
+  end
+
   test "wrong marker refuses before SQLite can open", ctx do
     File.mkdir_p!(ctx.base)
     File.write!(Path.join(ctx.base, "state.db"), "not SQLite: must never be opened")

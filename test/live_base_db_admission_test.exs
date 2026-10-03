@@ -41,6 +41,31 @@ defmodule Tightbeam.LiveBaseDBAdmissionTest do
     run_cold_runtime(tmp, "live_base_application_runtime.exs", "guarded-application-startup: ok")
   end
 
+  @tag :provisioned_runtime
+  @tag timeout: 180_000
+  test "preboot auth, harness cache and CLI neighbors allow fresh gateway and first admin", %{
+    tmp_dir: tmp
+  } do
+    cli_dir = Path.expand("../cli", __DIR__)
+    target = Path.join(cli_dir, "target/cli-integration")
+
+    {output, status} =
+      System.cmd("cargo", ["build", "--release"],
+        cd: cli_dir,
+        env: [{"CARGO_TARGET_DIR", target}],
+        stderr_to_stdout: true
+      )
+
+    assert status == 0, output
+
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "live_base_provisioned_runtime.exs",
+      "provisioned-gateway-bootstrap: ok",
+      args: [Path.join(target, "release/tightbeam")]
+    )
+  end
+
   defp run_cold_runtime(tmp, script, expected),
     do: Tightbeam.GuardRuntimeFixture.run!(tmp, script, expected)
 
