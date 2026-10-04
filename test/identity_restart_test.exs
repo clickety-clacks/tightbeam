@@ -9,10 +9,6 @@ defmodule Tightbeam.IdentityRestartTest do
        } do
     binary = Path.expand("cli/target/release/tightbeam")
 
-    {build, status} =
-      System.cmd("cargo", ["build", "--release"], cd: "cli", stderr_to_stdout: true)
-
-    assert status == 0, build
     fixture = Tightbeam.GuardRuntimeFixture.prepare!(tmp, "identity_restart.exs")
 
     for phase <- ["conflict", "abort", "resolve", "normal"] do
