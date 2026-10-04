@@ -5008,9 +5008,12 @@ defmodule Tightbeam.Gateway do
   @spec load_law!(config(), Enumerable.t() | nil) :: [Rules.rule()]
   def load_law!(config, verbs \\ nil) do
     verbs = verbs || config |> handlers() |> Map.keys()
-    Archetypes.load!(config.base_dir)
-    Rails.load!(config.base_dir)
-    Rules.load!(config.base_dir, verbs)
+
+    Identity.with_recovery_law!(config.base_dir, fn law_base, revision ->
+      Archetypes.load!(law_base)
+      Rails.load!(law_base)
+      Rules.load!(config.base_dir, verbs, law_base: law_base, revision: revision)
+    end)
   end
 
   defp identity_status_result(config, db, call) do

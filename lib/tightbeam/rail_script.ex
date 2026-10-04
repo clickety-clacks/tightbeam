@@ -63,7 +63,7 @@ defmodule Tightbeam.RailScript do
       {:ok, context, cwd} ->
         input = invocation_input(call, context)
         profile = Containment.rail_profile([scratch])
-        script = Path.join([base_dir, "identity", "rails", "scripts", rule.check.script])
+        script = check_script!(base_dir, scratch, rule.check)
         wrapper = Path.join([base_dir, "bin", "tightbeam"])
 
         {result, diagnostic} =
@@ -87,6 +87,16 @@ defmodule Tightbeam.RailScript do
         {{:error, "script_error", @unreported}, context, nil}
     end
   end
+
+  defp check_script!(_base_dir, scratch, %{published_bytes: bytes}) do
+    path = Path.join(scratch, "published-check")
+    File.write!(path, bytes)
+    File.chmod!(path, 0o700)
+    path
+  end
+
+  defp check_script!(base_dir, _scratch, check),
+    do: Path.join([base_dir, "identity", "rails", "scripts", check.script])
 
   defp invocation_context(_db, _base_dir, nil) do
     context = empty_context()
