@@ -5322,12 +5322,17 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp onboard_result(_config, %{params: %{provider: provider}}) do
+  defp onboard_result(_config, %{params: %{provider: provider}})
+       when provider in @onboarding_providers do
     %{
       code: "interactive_required",
       message:
-        "run #{Tightbeam.Credentials.onboard_command(provider)} from a terminal on this machine"
+        "run #{Tightbeam.Credentials.onboard_command(provider_atom(provider))} from a terminal on this machine"
     }
+  end
+
+  defp onboard_result(_config, %{params: %{provider: _provider}}) do
+    %{code: "invalid_message", message: "unsupported onboarding provider"}
   end
 
   defp onboard_phase(
