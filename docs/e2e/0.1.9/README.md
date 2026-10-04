@@ -68,8 +68,13 @@ unset TIGHTBEAM_URL TIGHTBEAM_TOKEN TIGHTBEAM_HOME
 tb() { TIGHTBEAM_BASE_DIR="${AREA_BASE:?}" "${PKG:?}/bin/tightbeam" "$@"; }
 ```
 
-`tb` acts as the area gateway's operator. Rows that need an admin add
-`--as-user <adminUserId>` with an admin user of that test base.
+`tb` acts as the area gateway's operator, and the CLI names that operator
+only through an explicit flag: every `tb` call carries `--as-user <userId>` of
+a user in that test base, because from a marker-free directory the CLI stops
+with `identity required` before it contacts any gateway. The one exception is
+the first `add-user <id> --admin` on an empty base, the local first-user
+bootstrap, which needs no flag. Rows that need an admin pass the test admin;
+rows that exercise a non-admin pass that user.
 
 ### Fresh-base actors
 
@@ -84,9 +89,35 @@ Never insert fixture rows in the database or copy a live session/token into
 this base. A missing admitted actor is `INCOMPLETE` with the refused operation;
 it does not authorize relaxing admission.
 
-For a local test session, run the packaged CLI from its returned workdir so
-the CLI carries that session's own identity. In the area tables, `as_actor
-<workdir> <verb> ...` means:
+`spawn` returns only `stream`, `sessionKey` and `handle`; it does not return
+or create a workdir. The gateway creates a local session's workdir, writes its
+`.tightbeam-session` marker (mode 0600) and projects its skills the first time
+a supported lifecycle step needs them: a provider turn, a `tune` harness or
+model change, a local rail script, or `identity apply`. The path is
+deterministic: `$AREA_BASE/work/<first 12 hex of sha256(sessionKey)>`.
+
+To get a usable actor without a provider turn, apply the fresh base's
+published identity to the new session as the test admin. A session with no
+harness pointer (it has never run a turn) gets its files and identity stamp
+and no prompt is queued; a session that has run a turn also receives an
+ordinary re-read prompt, which is an incidental turn to record.
+
+```sh
+actor_workdir() { # actor_workdir SESSION_KEY -> the gateway's local workdir path
+  printf '%s/work/%s\n' "${AREA_BASE:?}" \
+    "$(printf %s "${1:?session key}" | sha256sum | cut -c1-12)"
+}
+tb identity apply "$session_key" --as-user "$test_admin"
+test -f "$(actor_workdir "$session_key")/.tightbeam-session" || echo "INCOMPLETE: no marker"
+```
+
+The apply response names the session in `applied`. A refusal
+(`not_found` with `no matching session` for a session that is not active, also
+what `identity apply --all` returns when the base has no active session, or
+`apply_failed`) is recorded with the row; it does not authorize creating the
+marker by hand. Then run the
+packaged CLI from that workdir so the CLI carries that session's own identity.
+In the area tables, `as_actor <workdir> <verb> ...` means:
 
 ```sh
 as_actor() {
@@ -99,17 +130,48 @@ as_actor() {
 }
 ```
 
-Use only workdirs created in this base and verified to belong to the recorded
-test sessions. For an authorized satellite actor, use its own workdir on that
+Use only workdirs created in this base by the gateway and verified to belong to
+the recorded test sessions. For an authorized satellite actor, use its own workdir on that
 satellite, its matching packaged CLI, and its configured test gateway route;
 record those paths separately. Do not copy a bearer into command arguments or
 evidence. Reads of named non-secret database columns are allowed in private
-test scratch. Never `SELECT * FROM sessions`.
+test scratch. Never `SELECT * FROM sessions`. Run `sqlite3 -readonly` reads
+while the area gateway is up: the database is in WAL mode, and once the gateway
+has stopped and removed its `-shm` file a read-only open fails with
+`unable to open database file`, which is not evidence about the rows.
 
 `Fresh / records` rows need admitted actors and normal public record operations;
 they do not require a model to demonstrate the record's semantics. Spawn,
 dispatch, automatic remedies or identity apply can still require working host
 or provider setup. Record those real prerequisites and any incidental turns.
+
+Spawn admission in a fresh base has three concrete prerequisites, none of which
+a records row may fake:
+
+- A credential for the chosen harness on the admitted host. `spawn` reads the
+  base's own credential store under `$AREA_BASE/homes/<host>/<harness>/`; an
+  empty base has none, and spawn refuses with `needs_onboarding` naming
+  `onboard <provider>`. Subscription onboarding is a provider sign-in at the
+  keyboard, so a fresh base without that authorized ceremony records its actor
+  rows as `INCOMPLETE` with the `needs_onboarding` refusal. Copying a credential
+  or home from another base is never the remedy.
+- A derived model catalog. The gateway derives the catalog for each host and
+  harness from that credential by asking the provider for its model list (a
+  provider read, not a turn). The gateway logs nothing on a successful
+  derivation; the observable is `tb list`, whose `models.<host>.<harness>` is
+  non-empty once the catalog exists. On a base with no credential the boot log
+  and every spawn repeat `model catalog <harness> on <host> refresh degraded:
+  {:needs_onboarding, :missing}`, `models.<host>` lists every harness empty, and
+  spawn is refused as above. With a credential present, a spawn refused with a
+  catalog code is retried once `tb list` shows the model; record both attempts.
+- Node and npm with network access. Spawn's spinup installs the pinned ACP
+  adapter for the harness into `$AREA_BASE/adapters` on first use, which can
+  take minutes on a cold cache; a failure is `host_unready`. Record the adapter
+  versions it installed.
+
+`--host` defaults to the gateway machine's own hostname when the launcher below
+runs the gateway with `TIGHTBEAM_LOCAL_HOST_NAME` unset; record that name as the
+admitted local host and request it explicitly on `spawn`.
 `Fresh / online` rows require actual provider, satellite, GitHub or human
 interaction. A command returning a queued wake is not proof of a model reply.
 

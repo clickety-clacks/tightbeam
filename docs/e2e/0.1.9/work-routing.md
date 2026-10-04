@@ -152,8 +152,11 @@ this runbook grants neither. Record the repository, branch, PR, head and
 checks. Missing queue support leaves settlement/landing evidence `skipped`
 even if checks-completed succeeds; do not use a production PR to fill it.
 
-Before learning the bundle, inspect `sentinel list`; enabling an unlearned
-landing watcher refuses `kungfu_not_learned` or `unknown_sentinel`. Learn
+Before learning the bundle, inspect `sentinel list` (empty `sentinels` and
+`setup`); enabling the unlearned landing watcher refuses `unknown_sentinel`
+("no learned bundle declares sentinel ...; learned sentinels: none"), while
+`kungfu setup` of an unlearned bundle is the call that refuses
+`kungfu_not_learned`. Learn
 `agentic-engineering`, inspect `kungfu setup agentic-engineering` and
 `sentinel list`, and require disabled state plus missing `GH_CONFIG_DIR` and
 `LANDING_REPOS`. Enable while those settings are absent: require
