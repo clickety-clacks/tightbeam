@@ -68,8 +68,13 @@ unset TIGHTBEAM_URL TIGHTBEAM_TOKEN TIGHTBEAM_HOME
 tb() { TIGHTBEAM_BASE_DIR="${AREA_BASE:?}" "${PKG:?}/bin/tightbeam" "$@"; }
 ```
 
-`tb` acts as the area gateway's operator. Rows that need an admin add
-`--as-user <adminUserId>` with an admin user of that test base.
+`tb` acts as the area gateway's operator, and the CLI names that operator
+only through an explicit flag: every `tb` call carries `--as-user <userId>` of
+a user in that test base, because from a marker-free directory the CLI stops
+with `identity required` before it contacts any gateway. The one exception is
+the first `add-user <id> --admin` on an empty base, the local first-user
+bootstrap, which needs no flag. Rows that need an admin pass the test admin;
+rows that exercise a non-admin pass that user.
 
 ### Fresh-base actors
 
@@ -107,8 +112,10 @@ test -f "$(actor_workdir "$session_key")/.tightbeam-session" || echo "INCOMPLETE
 ```
 
 The apply response names the session in `applied`. A refusal
-(`not_found` for a session that is not active, or `apply_failed`) is recorded
-with the row; it does not authorize creating the marker by hand. Then run the
+(`not_found` with `no matching session` for a session that is not active, also
+what `identity apply --all` returns when the base has no active session, or
+`apply_failed`) is recorded with the row; it does not authorize creating the
+marker by hand. Then run the
 packaged CLI from that workdir so the CLI carries that session's own identity.
 In the area tables, `as_actor <workdir> <verb> ...` means:
 
@@ -128,7 +135,10 @@ the recorded test sessions. For an authorized satellite actor, use its own workd
 satellite, its matching packaged CLI, and its configured test gateway route;
 record those paths separately. Do not copy a bearer into command arguments or
 evidence. Reads of named non-secret database columns are allowed in private
-test scratch. Never `SELECT * FROM sessions`.
+test scratch. Never `SELECT * FROM sessions`. Run `sqlite3 -readonly` reads
+while the area gateway is up: the database is in WAL mode, and once the gateway
+has stopped and removed its `-shm` file a read-only open fails with
+`unable to open database file`, which is not evidence about the rows.
 
 `Fresh / records` rows need admitted actors and normal public record operations;
 they do not require a model to demonstrate the record's semantics. Spawn,
@@ -147,9 +157,13 @@ a records row may fake:
   or home from another base is never the remedy.
 - A derived model catalog. The gateway derives the catalog for each host and
   harness from that credential by asking the provider for its model list (a
-  provider read, not a turn). The first spawn after boot may be refused with a
-  catalog-unavailable code; retry after the derivation log line for that host and
-  harness appears, and record both attempts.
+  provider read, not a turn). The gateway logs nothing on a successful
+  derivation; the observable is `tb list`, whose `models.<host>.<harness>` is
+  non-empty once the catalog exists. On a base with no credential the boot log
+  and every spawn repeat `model catalog <harness> on <host> refresh degraded:
+  {:needs_onboarding, :missing}`, `models.<host>` lists every harness empty, and
+  spawn is refused as above. With a credential present, a spawn refused with a
+  catalog code is retried once `tb list` shows the model; record both attempts.
 - Node and npm with network access. Spawn's spinup installs the pinned ACP
   adapter for the harness into `$AREA_BASE/adapters` on first use, which can
   take minutes on a cold cache; a failure is `host_unready`. Record the adapter

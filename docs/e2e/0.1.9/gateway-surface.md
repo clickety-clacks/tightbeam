@@ -244,14 +244,19 @@ Source visibility/filter permutations remain in `test/d1_read_test.exs`.
 
 The CLI reports an unreachable gateway as a typed transport failure and records a
 receipt. Point it at a loopback port with nothing listening and a new scratch
-base, from the CLI shell's marker-free directory:
+base, from the CLI shell's marker-free directory. The call still names its
+caller with `--as-user`: identity resolution runs before transport, so without
+the flag the CLI exits 1 with `identity required`, contacts nothing and writes
+no diagnostics log, and the row cannot pass. The user id is only the caller's
+name here; nothing checks it against the scratch base.
 
 ```sh
 diag_base="$(mktemp -d "${SCRATCH:?}/diag.XXXXXX")"
 closed_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
 status=0
 TIGHTBEAM_URL="http://127.0.0.1:$closed_port" TIGHTBEAM_TOKEN=not-a-token \
-  TIGHTBEAM_BASE_DIR="$diag_base" "${PKG:?}/bin/tightbeam" list >"$diag_base/out.json" 2>"$diag_base/err.txt" || status=$?
+  TIGHTBEAM_BASE_DIR="$diag_base" "${PKG:?}/bin/tightbeam" list --as-user "${test_admin:?}" \
+  >"$diag_base/out.json" 2>"$diag_base/err.txt" || status=$?
 echo "exit: $status"
 cat "$diag_base/out.json" "$diag_base/err.txt"
 wc -l "$diag_base/diagnostics/cli-transport-v1.log"
