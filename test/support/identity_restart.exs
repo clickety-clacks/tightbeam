@@ -92,15 +92,22 @@ before = if phase in ["abort", "resolve"], do: File.read!(Path.join(root, "pendi
 {:ok, _} = Application.ensure_all_started(:tightbeam)
 
 {_, listener, _, _} =
-  Enum.find(Supervisor.which_children(Tightbeam.Supervisor), fn {id, _, _, _} -> id == Bandit end)
+  Enum.find(Supervisor.which_children(Tightbeam.Supervisor), fn {id, _, _, modules} ->
+    id == Bandit or (is_list(modules) and Bandit in modules)
+  end)
 
 {:ok, {_, port}} = ThousandIsland.listener_info(listener)
+
+%{"cliToken" => fixture_token} =
+  base |> Path.join("gateway.json") |> File.read!() |> JSON.decode!()
+
+cli_env = [{"TIGHTBEAM_URL", "http://127.0.0.1:#{port}"}, {"TIGHTBEAM_TOKEN", fixture_token}]
 
 cli = fn args, user ->
   {output, status} =
     System.cmd(binary, args ++ ["--as-user", user],
       cd: base,
-      env: [{"TIGHTBEAM_URL", "http://127.0.0.1:#{port}"}],
+      env: cli_env,
       stderr_to_stdout: true
     )
 
@@ -154,7 +161,7 @@ case phase do
     {denial, status} =
       System.cmd(binary, ["identity", "relearn", "--abort", "--as-user", "recovery-reader"],
         cd: base,
-        env: [{"TIGHTBEAM_URL", "http://127.0.0.1:#{port}"}],
+        env: cli_env,
         stderr_to_stdout: true
       )
 
