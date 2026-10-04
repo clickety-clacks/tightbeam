@@ -1,0 +1,40 @@
+# Org-local topology enforcement using the installed 0.1.8 facts.
+# Initial PDO/orchestrator intake and PO consultation remain possible.
+# This is record-level enforcement, not a file-write sandbox.
+
+[[rule]]
+name = "assign-worker-staffing-needs-topology"
+verb = "assign"
+text = "Ask the PO for topology advice on this work item with a coordination assignment; record the returned recommendation as topology-decided, then staff workers."
+external_producer = true
+edges = ["verb"]
+effect = "deny"
+deny_when = [
+  { fact = "target.archetype", op = "not_in", value = ["pdo", "orchestrator", "product-owner"] },
+  { fact = "work_item.verdict_kinds", op = "not_in", value = ["topology-decided"] },
+]
+
+[[rule]]
+name = "dispatch-worker-staffing-needs-topology"
+verb = "dispatch"
+text = "Ask the PO for topology advice on this work item with a coordination assignment; record the returned recommendation as topology-decided, then staff workers."
+external_producer = true
+edges = ["verb"]
+effect = "deny"
+deny_when = [
+  { fact = "target.archetype", op = "not_in", value = ["pdo", "orchestrator", "product-owner"] },
+  { fact = "work_item.verdict_kinds", op = "not_in", value = ["topology-decided"] },
+]
+
+[[rule]]
+name = "orchestrator-completion-needs-topology"
+verb = "attest"
+text = "Obtain and record the PO's returned topology recommendation as topology-decided on this work item before completing delivery coordination. Small tasks also require consultation."
+external_producer = true
+edges = ["verb"]
+effect = "deny"
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "completion" },
+  { fact = "assignment.holder_archetype", op = "in", value = ["pdo", "orchestrator"] },
+  { fact = "work_item.verdict_kinds", op = "not_in", value = ["topology-decided"] },
+]

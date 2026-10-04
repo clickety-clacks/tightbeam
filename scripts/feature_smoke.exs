@@ -106,13 +106,24 @@ defmodule FeatureSmoke do
       preflight!(leg, base_dir)
       state = %{port: gw["port"], token: gw["cliToken"], base_dir: base_dir, leg: leg, pass: 0}
 
+      wi = ok!(state, "work-item-create", %{"title" => "smoke readiness #{unique()}"})
+      wi_id = wi["workItemId"] || wi["id"]
+      topology = prepare_fixture_topology!(state, wi_id, "One readiness reply worker")
+
       proof =
-        Tightbeam.DeployReadiness.run!(
-          fn verb, params -> post(state, verb, params) end,
-          fn session, wake ->
-            Tightbeam.DeployReadiness.observe!(Path.join(base_dir, "state.db"), session, wake)
-          end
-        )
+        try do
+          Tightbeam.DeployReadiness.run!(
+            fn verb, params ->
+              params = if verb == "spawn", do: Map.put(params, "workItemId", wi_id), else: params
+              post(state, verb, params)
+            end,
+            fn session, wake ->
+              Tightbeam.DeployReadiness.observe!(Path.join(base_dir, "state.db"), session, wake)
+            end
+          )
+        after
+          retire(state, topology)
+        end
 
       IO.puts("PASS fresh-agent readiness #{leg.wire_name}: #{JSON.encode!(proof)}")
     end
@@ -339,10 +350,16 @@ defmodule FeatureSmoke do
   defp check_local_deployment(state) do
     harness = state.leg.harness.id()
     machine = Tightbeam.Placement.local_host_name()
+    wi = ok!(state, "work-item-create", %{"title" => "smoke local deployment #{unique()}"})
+    wi_id = wi["workItemId"] || wi["id"]
+
+    topology =
+      prepare_fixture_topology!(state, wi_id, "One local deployment and redelivery worker")
 
     session =
       ok!(state, "spawn", %{
         "archetype" => "reviewer-code",
+        "workItemId" => wi_id,
         "displayName" => "smoke-local-deploy-#{unique()}",
         "idempotencyKey" => "local-deploy-#{unique()}"
       })
@@ -436,6 +453,7 @@ defmodule FeatureSmoke do
     after
       File.rm(sentinel)
       retire(state, session)
+      retire(state, topology)
     end
 
     pass(
@@ -558,6 +576,10 @@ defmodule FeatureSmoke do
     reviewer_leg = independent_leg(state)
     state = preflight_independent!(state, reviewer_leg)
 
+    wi = ok!(state, "work-item-create", %{"title" => "gate chain #{u}"})
+    wi_id = wi["workItemId"] || wi["id"]
+    holder = open_grounded_assignment!(state, u, wi_id, "gate chain #{u}", "g")
+
     prior = role_binding(state, "reviewer-code")
     post(state, "role-create", %{"name" => "reviewer-code"})
 
@@ -568,6 +590,8 @@ defmodule FeatureSmoke do
     # session instead of whatever retired one a previous group left behind.
     reviewer =
       ok!(%{state | leg: reviewer_leg}, "spawn", %{
+        "archetype" => "reviewer-code",
+        "workItemId" => wi_id,
         "displayName" => "smoke-gate-reviewer-#{u}",
         "idempotencyKey" => "grv-#{u}"
       })
@@ -575,30 +599,36 @@ defmodule FeatureSmoke do
     reviewer_key = get_in(reviewer, ["stream", "sessionKey"]) || reviewer["sessionKey"]
 
     with_role_binding(state, "reviewer-code", prior, reviewer_key, fn ->
-      gate_chain_enforced(state, u, reviewer_leg, reviewer, reviewer_key)
+      gate_chain_enforced(state, u, reviewer_leg, reviewer, reviewer_key, wi_id, holder)
     end)
   end
 
-  defp gate_chain_enforced(state, u, reviewer_leg, reviewer, reviewer_key) do
+  defp gate_chain_enforced(state, u, reviewer_leg, reviewer, reviewer_key, wi_id, holder) do
     reviewer_tok = session_token(state, reviewer_key)
-
-    wi =
-      ok!(state, "work-item-create", %{
-        "title" => "gate chain #{u}",
-        "idempotencyKey" => "gwi-#{u}"
-      })
-
-    wi_id = wi["workItemId"] || wi["id"]
-    holder = open_grounded_assignment!(state, u, wi_id, "gate chain #{u}", "g")
     asg_id = holder.assignment_id
 
     complete = fn ->
-      post_as(state, holder.token, "attest", %{"assignmentId" => asg_id, "kind" => "completion"})
+      post_as(state, holder.token, "attest", %{
+        "assignmentId" => asg_id,
+        "kind" => "completion",
+        "commitRefs" => holder.check.commit_refs
+      })
     end
 
     try do
-      # 1. Review gate. Its remedy assigns the bound reviewer, synchronously inside the
-      # attest, so the review exists by the time the denial response returns.
+      # This is the operator's real fixture run, filed using the holder's credential;
+      # it is not an inferred claim that the holder or a provider ran the check.
+      ok_as!(state, holder.token, "attest", %{
+        "assignmentId" => asg_id,
+        "kind" => "verdict",
+        "verdictKind" => "tests-passed",
+        "note" =>
+          "Operator-executed disposable fixture #{inspect(holder.check.commit_refs)}: " <>
+            holder.check.note
+      })
+
+      # 1. Review gate. Current rules notify the accountable owner; older installed
+      # rules assign the bound reviewer. Either way the denial must remain real.
       denied!(state, "completion-requires-review", asg_id, complete)
 
       reviews = ok!(state, "assignments", %{"sessionKey" => reviewer_key})
@@ -608,24 +638,27 @@ defmodule FeatureSmoke do
         |> List.wrap()
         |> Enum.find(fn a -> (a["reviewsAssignmentId"] || a["reviews"]) == asg_id end)
 
-      assert(
-        state,
-        is_map(review),
-        "gate chain: the review remedy did not assign the #{reviewer_leg.wire_name} reviewer a " <>
-          "review of #{asg_id}. The role is rebound to this group's live reviewer, so an " <>
-          "unresolved target here is a real remedy failure. Got: #{brief(reviews)}"
-      )
+      review =
+        review ||
+          ok!(state, "assign", %{
+            "sessionKey" => reviewer_key,
+            "workItemId" => wi_id,
+            "reviews" => asg_id,
+            "subject" => "Review exact disposable check #{holder.check.name}"
+          })
 
-      # Independence is a property of the SESSION, never of the harness:
-      # `commissioned_review_authors/3` counts a verdict only when the review's
-      # `openedBySession` differs from the holder and the author is the review's own holder.
-      # A remedy-opened review has `openedBySession` NULL, so it qualifies, and on a
-      # filtered single-leg run a fresh same-harness reviewer qualifies just as fully.
+      # Review the actual tiny fixture before filing its scripted conclusion. This
+      # proves the review gate's wire/provenance behavior, not independent inference.
+      # Changed bytes or output refuse; no product source review is manufactured.
+      review_note = Tightbeam.FeatureSmokeTopology.review_check!(holder.check)
+
       v =
         post_as(state, reviewer_tok, "attest", %{
           "assignmentId" => review["id"] || review["assignmentId"],
           "kind" => "verdict",
-          "verdictKind" => "reviewed-clean"
+          "verdictKind" => "reviewed-clean",
+          "commitRefs" => holder.check.commit_refs,
+          "note" => review_note
         })
 
       assert(
@@ -642,6 +675,7 @@ defmodule FeatureSmoke do
           "assignmentId" => asg_id,
           "kind" => "verdict",
           "verdictKind" => "verified",
+          "commitRefs" => holder.check.commit_refs,
           "note" => holder.check.note
         })
 
@@ -812,6 +846,7 @@ defmodule FeatureSmoke do
       # moved below would read teardown's revocation as this group's result.
       retire(state, reviewer)
       retire(state, holder.session)
+      retire(state, holder.topology)
     end
   end
 
@@ -941,6 +976,7 @@ defmodule FeatureSmoke do
         prompted
       after
         retire(state, holder.session)
+        retire(state, holder.topology)
       end
 
     artifact_id = prompted["artifactId"]
@@ -1009,11 +1045,19 @@ defmodule FeatureSmoke do
   # by name, which is the right failure: about the org's law, not about a file that
   # mysteriously is not there.
   defp open_grounded_assignment!(state, u, wi_id, subject, tag) do
+    topology =
+      prepare_fixture_topology!(
+        state,
+        wi_id,
+        "One grounded coder for #{subject}; existing review gates apply"
+      )
+
     session =
       ok!(state, "spawn", %{
         "archetype" => "coder",
         "host" => Tightbeam.Placement.local_host_name(),
         "displayName" => "smoke-#{tag}-coder-#{u}",
+        "workItemId" => wi_id,
         "idempotencyKey" => "#{tag}cd-#{u}"
       })
 
@@ -1033,6 +1077,7 @@ defmodule FeatureSmoke do
 
     %{
       session: session,
+      topology: topology,
       key: key,
       token: session_token(state, key),
       check: check,
@@ -1094,10 +1139,50 @@ defmodule FeatureSmoke do
         "group refuses to hand a holder work it could not verify itself."
     )
 
+    # This new session owns a disposable repository containing only its check.
+    # Code completion requires real immutable review/verification refs; never
+    # substitute a fabricated hash or a product repository's unrelated commit.
+    assert(
+      state,
+      not File.exists?(Path.join(workdir, ".git")),
+      "fixture repository already exists"
+    )
+
+    for args <- [
+          ["init", "--quiet"],
+          ["add", "--", name],
+          [
+            "-c",
+            "user.name=Smoke Fixture",
+            "-c",
+            "user.email=smoke@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "-m",
+            "Disposable smoke check"
+          ]
+        ] do
+      {git_output, git_status} = System.cmd("git", args, cd: workdir, stderr_to_stdout: true)
+      assert(state, git_status == 0, "fixture git failed: #{git_output}")
+    end
+
+    {commit, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: workdir)
+
+    refs = [
+      %{
+        "repo" => "#{Tightbeam.Placement.local_host_name()}:#{workdir}",
+        "commit" => String.trim(commit)
+      }
+    ]
+
     %{
       name: name,
       path: path,
+      commit_refs: refs,
       output: output,
+      source: File.read!(path),
       note:
         "Ran `sh #{name}` in this assignment's workdir (#{workdir}); it exited 0 and printed " <>
           "exactly #{inspect(output)}"
@@ -1687,8 +1772,15 @@ defmodule FeatureSmoke do
 
         assert(state, got == "reviewer-code", "config: set did not persist (#{inspect(got)})")
 
+        wi = ok!(state, "work-item-create", %{"title" => "smoke default archetype #{unique()}"})
+        wi_id = wi["workItemId"] || wi["id"]
+
+        topology =
+          prepare_fixture_topology!(state, wi_id, "One default-archetype selection probe")
+
         spawn =
           ok!(state, "spawn", %{
+            "workItemId" => wi_id,
             "displayName" => "smoke-cfg-#{unique()}",
             "idempotencyKey" => "cfg-#{unique()}"
           })
@@ -1703,6 +1795,7 @@ defmodule FeatureSmoke do
           )
 
         retire(state, spawn)
+        retire(state, topology)
         assert(state, arch == "reviewer-code", "config: spawn archetype was #{inspect(arch)}")
       end
     )
@@ -1723,8 +1816,16 @@ defmodule FeatureSmoke do
     wi_id = wi["workItemId"] || wi["id"]
     assert(state, is_binary(wi_id), "work-item-create returned no id: #{inspect(wi)}")
 
+    topology =
+      prepare_fixture_topology!(
+        state,
+        wi_id,
+        "One holder for assignment-get round-trip and not-found checks"
+      )
+
     holder =
       ok!(state, "spawn", %{
+        "workItemId" => wi_id,
         "displayName" => "smoke-holder-#{unique()}",
         "idempotencyKey" => "h-#{unique()}"
       })
@@ -1759,6 +1860,7 @@ defmodule FeatureSmoke do
     )
 
     retire(state, holder)
+    retire(state, topology)
     pass(state, "work-item-create + assign + assignment-get round-trip (and not_found)")
   end
 
@@ -1777,8 +1879,16 @@ defmodule FeatureSmoke do
 
     wi_id = wi["workItemId"] || wi["id"]
 
+    topology =
+      prepare_fixture_topology!(
+        state,
+        wi_id,
+        "One holder for atomic dispatch and work-item linkage checks"
+      )
+
     holder =
       ok!(state, "spawn", %{
+        "workItemId" => wi_id,
         "displayName" => "smoke-dh-#{unique()}",
         "idempotencyKey" => "dh-#{unique()}"
       })
@@ -1813,6 +1923,7 @@ defmodule FeatureSmoke do
     )
 
     retire(state, holder)
+    retire(state, topology)
     pass(state, "dispatch opens an assignment linked to its work item (brackets F7)")
   end
 
@@ -1896,6 +2007,7 @@ defmodule FeatureSmoke do
 
     parent =
       ok!(state, "spawn", %{
+        "archetype" => "orchestrator",
         "displayName" => "smoke-effort-parent-#{u}",
         "idempotencyKey" => "effort-parent-#{u}"
       })
@@ -1910,8 +2022,20 @@ defmodule FeatureSmoke do
     parent_state =
       %{state | token: session_token(state, parent_key)} |> Map.put(:as_session, true)
 
+    wi = ok!(state, "work-item-create", %{"title" => "smoke effort #{u}"})
+    wi_id = wi["workItemId"] || wi["id"]
+
+    topology =
+      prepare_fixture_topology!(
+        state,
+        wi_id,
+        "One parent replaces its first holder with a second to test effort request supersession",
+        parent_key
+      )
+
     first_holder =
       ok!(parent_state, "spawn", %{
+        "workItemId" => wi_id,
         "displayName" => "smoke-effort-a-#{u}",
         "idempotencyKey" => "effort-a-#{u}"
       })
@@ -1920,13 +2044,21 @@ defmodule FeatureSmoke do
       get_in(first_holder, ["stream", "sessionKey"]) || first_holder["sessionKey"]
 
     first =
-      ok!(parent_state, "dispatch", %{
+      dispatch_after_rumination!(parent_state, parent_key, %{
+        "workItemId" => wi_id,
         "sessionKey" => first_holder_key,
         "subject" => "effort smoke #{u}",
         "brief" => "Hold position for the parent check-in."
       })
 
     first_id = first["id"] || first["assignmentId"]
+
+    assert(
+      state,
+      is_binary(first_id),
+      "effort dispatch returned no assignment: #{inspect(first)}"
+    )
+
     request1 = await_effort_request!(parent_state, first_id, nil)
     request1_id = request1["id"]
 
@@ -1965,6 +2097,7 @@ defmodule FeatureSmoke do
 
     second_holder =
       ok!(parent_state, "spawn", %{
+        "workItemId" => wi_id,
         "displayName" => "smoke-effort-b-#{u}",
         "idempotencyKey" => "effort-b-#{u}"
       })
@@ -1973,13 +2106,21 @@ defmodule FeatureSmoke do
       get_in(second_holder, ["stream", "sessionKey"]) || second_holder["sessionKey"]
 
     second =
-      ok!(parent_state, "dispatch", %{
+      dispatch_after_rumination!(parent_state, parent_key, %{
+        "workItemId" => wi_id,
         "sessionKey" => second_holder_key,
         "subject" => "effort smoke replacement #{u}",
         "brief" => "Take over the reassigned smoke obligation."
       })
 
     second_id = second["id"] || second["assignmentId"]
+
+    assert(
+      state,
+      is_binary(second_id),
+      "effort replacement returned no assignment: #{inspect(second)}"
+    )
+
     assert(state, second_id != first_id, "effort smoke re-dispatch reused the old assignment")
 
     replacement_request = await_effort_request!(parent_state, second_id, nil)
@@ -1998,6 +2139,7 @@ defmodule FeatureSmoke do
     retire(state, first_holder)
     retire(state, second_holder)
     retire(state, parent)
+    retire(state, topology)
 
     pass(
       state,
@@ -2275,6 +2417,50 @@ defmodule FeatureSmoke do
   end
 
   # --- helpers ---------------------------------------------------------------
+  # Disposable-fixture prerequisite, not a provider-authored product decision.
+  # Keep this coordinator active until the staffing checks finish; retiring it
+  # earlier would invalidate the item's delivery owner.
+  defp prepare_fixture_topology!(state, wi_id, plan, owner \\ nil) do
+    u = unique()
+
+    # Ownerless intake uses the office spawn path, then opens a same-item
+    # coordination card. Supplying workItemId to spawn would request production
+    # staffing before this item's first delivery owner exists.
+    coordinator =
+      ok!(state, "spawn", %{
+        "archetype" => "product-owner",
+        "displayName" => "smoke-topology-#{u}",
+        "idempotencyKey" => "topology-#{u}"
+      })
+
+    key = get_in(coordinator, ["stream", "sessionKey"]) || coordinator["sessionKey"]
+    role = "smoke-topology-#{u}"
+    ok!(state, "role-create", %{"name" => role})
+    ok!(state, "role-bind", %{"name" => role, "sessionKey" => key})
+
+    Tightbeam.FeatureSmokeTopology.prepare!(
+      fn verb, params -> ok!(state, verb, params) end,
+      fn session, verb, params -> ok_as!(state, session_token(state, session), verb, params) end,
+      wi_id,
+      coordinator,
+      plan,
+      owner
+    )
+
+    coordinator
+  end
+
+  defp dispatch_after_rumination!(state, parent_key, params) do
+    result = ok!(state, "dispatch", params)
+
+    if result["ruminationRequired"] || result["rumination_required"] do
+      await_lane_idle!(state, parent_key, "after the staffing work item's rumination")
+      ok!(state, "dispatch", params)
+    else
+      result
+    end
+  end
+
   defp ok!(state, verb, params) do
     res = post(state, verb, params)
 
