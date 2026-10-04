@@ -349,8 +349,6 @@ defmodule FeatureSmoke do
 
     session_key = get_in(session, ["stream", "sessionKey"]) || session["sessionKey"]
     home = Tightbeam.Homes.home_path(state.base_dir, machine, harness)
-    expected_home = MapSet.new(Tightbeam.Homes.owned_entries(harness))
-    before_home = if File.dir?(home), do: MapSet.new(leaf_entries(home)), else: MapSet.new()
     sentinel = Path.join(home, ".feature-smoke-durable-#{unique()}")
 
     cwd = local_workdir_path(state.base_dir, session_key)
@@ -360,28 +358,14 @@ defmodule FeatureSmoke do
 
       assert(state, File.dir?(home), "local deployment HOME missing: #{home}")
 
-      actual_home = home |> leaf_entries() |> MapSet.new()
-
-      expected_home
-      |> MapSet.difference(actual_home)
-      |> Enum.each(fn relative ->
-        assert(
-          state,
-          false,
-          "local deployment HOME missing owned path: #{Path.join(home, relative)}"
-        )
-      end)
-
-      actual_home
-      |> MapSet.difference(before_home)
-      |> MapSet.difference(expected_home)
-      |> Enum.each(fn relative ->
-        assert(
-          state,
-          false,
-          "local deployment HOME contains stray path: #{Path.join(home, relative)}"
-        )
-      end)
+      # This HOME is shared with an active harness, so newly observed leaves do
+      # not identify deployment's writer. Check the owned projection here; the
+      # isolated real-projector tests retain strict unexpected-write detection.
+      try do
+        Tightbeam.FeatureSmokeHome.verify_owned!(home, harness)
+      rescue
+        error in RuntimeError -> fail(state, Exception.message(error))
+      end
 
       snapshot = Tightbeam.Identity.snapshot!(state.base_dir, "reviewer-code", harness)
 
@@ -456,7 +440,7 @@ defmodule FeatureSmoke do
 
     pass(
       state,
-      "local deployment HOME path + exact owned projection + cwd skills + no strays + durable redelivery"
+      "local deployment HOME path + required owned projection + cwd skills + durable redelivery"
     )
   end
 
