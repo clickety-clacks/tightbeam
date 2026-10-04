@@ -161,9 +161,10 @@ Run this paired case on a fresh test base, using the
 [fresh-base actors](README.md#fresh-base-actors). Reuse the endpoint/envelope
 assertions above; do not repeat all six collections. Create one non-admin
 test user with `add-user <unique>` (no `--admin`) and an admitted local session
-owned by that user. Record its user, session key and workdir. Verify the
-user's `isAdmin` is false and that the marker belongs to this fresh base.
-No copied session token is needed.
+owned by that user. Materialize its workdir with `identity apply` as described
+there, and record its user, session key and the derived workdir as
+`reader_workdir`. Verify the user's `isAdmin` is false and that the marker
+belongs to this fresh base. No copied session token is needed.
 
 Choose a unique harmless environment name for the admitted local test host
 and harness. The paired probe below sets it as the test admin and removes it
