@@ -244,6 +244,13 @@ defmodule Tightbeam.Acp.AdapterTest do
       case "default":
         return { value, name: "Default", description: opus5Vocabulary ? "Opus 5 with 1M context" : "Sonnet 5" };
       case "opus[1m]":
+        // Synthetic version-confirmation cases; actual CLI availability is a separate live gate.
+        if (failMode === "canonical-opus55-alias") {
+          return { value, name: "Opus (1M context)", description: "Opus 5.5 with 1M context" };
+        }
+        if (failMode === "canonical-opus55-drift") {
+          return { value, name: "Opus (1M context)", description: "Opus 5" };
+        }
         return { value, name: "Opus (1M context)", description: opus5Vocabulary ? "Opus 5 with 1M context" : "Opus 4.8 with 1M context" };
       case "sonnet":
         return { value, name: "Sonnet", description: "Sonnet 5" };
@@ -412,6 +419,12 @@ defmodule Tightbeam.Acp.AdapterTest do
         if (failMode === "canonical-opus5-alias" &&
             m.params.configId === "model" &&
             m.params.value === "claude-opus-5") {
+          models[m.params.sessionId] = "opus[1m]";
+          return send({ id: m.id, result: configOptions(m.params.sessionId) });
+        }
+        if ((failMode === "canonical-opus55-alias" || failMode === "canonical-opus55-drift") &&
+            m.params.configId === "model" &&
+            m.params.value === "claude-opus-5-5") {
           models[m.params.sessionId] = "opus[1m]";
           return send({ id: m.id, result: configOptions(m.params.sessionId) });
         }
@@ -993,6 +1006,88 @@ defmodule Tightbeam.Acp.AdapterTest do
       end)
 
     assert Enum.map(model_writes, & &1["value"]) == ["claude-opus-5"]
+  end
+
+  test "Claude model switch accepts Opus 5.5 with 1M context for the exact requested version" do
+    {adapter, capture_path} =
+      start_adapter(harness: :claude, fail_mode: "canonical-opus55-alias")
+
+    assert {:ok, "sess-1"} =
+             Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+
+    assert {:ok, _turn} = Adapter.prompt(adapter, "sess-1", "persist this conversation")
+    requested = Model.new("claude-opus-5-5")
+
+    assert {:ok, "sess-fork-1"} =
+             Adapter.switch_model_session(adapter, "sess-1", requested, "/tmp", [], "guidance")
+
+    assert {:ok, ^requested} = Adapter.current_model(adapter, "sess-fork-1")
+    assert {:ok, switchable} = Adapter.switchable_models(adapter, "sess-fork-1")
+    assert requested in switchable
+    refute Model.new("claude-opus-5") in switchable
+    refute Model.new("claude-opus-4-8", context: "1m") in switchable
+
+    model_writes =
+      captured_requests(capture_path)
+      |> Enum.filter(fn request ->
+        request["method"] == "session/set_config_option" and
+          request["sessionId"] == "sess-fork-1" and request["configId"] == "model"
+      end)
+
+    assert Enum.map(model_writes, & &1["value"]) == ["claude-opus-5-5"]
+  end
+
+  test "Claude Opus 5.5 switch rejects Opus 5 readback and preserves the prior session" do
+    {adapter, capture_path} =
+      start_adapter(harness: :claude, fail_mode: "canonical-opus55-drift")
+
+    assert {:ok, "sess-1"} =
+             Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+
+    assert {:ok, _turn} = Adapter.prompt(adapter, "sess-1", "persist this conversation")
+    assert {:ok, prior_model} = Adapter.current_model(adapter, "sess-1")
+
+    result =
+      Adapter.switch_model_session(
+        adapter,
+        "sess-1",
+        Model.new("claude-opus-5-5"),
+        "/tmp",
+        [],
+        "guidance"
+      )
+
+    assert {:error, {:model_apply_failed, :model_readback_unavailable}} =
+             ErrorDiagnostic.classified(result)
+
+    assert %{
+             "kind" => "unconfirmed",
+             "phase" => "readback",
+             "configId" => "model",
+             "cleanup" => %{"status" => "verified", "sessionId" => "sess-fork-1"}
+           } = ErrorDiagnostic.of(result)
+
+    assert {:error, :model_readback_unavailable} = Adapter.current_model(adapter, "sess-fork-1")
+    assert {:ok, ^prior_model} = Adapter.current_model(adapter, "sess-1")
+    assert {:ok, %{stop_reason: "end_turn"}} = Adapter.prompt(adapter, "sess-1", "still usable")
+
+    requests = captured_requests(capture_path)
+
+    model_writes =
+      Enum.filter(requests, fn request ->
+        request["method"] == "session/set_config_option" and
+          request["sessionId"] == "sess-fork-1" and request["configId"] == "model"
+      end)
+
+    assert Enum.map(model_writes, & &1["value"]) == ["claude-opus-5-5"]
+
+    assert Enum.any?(requests, fn request ->
+             request["method"] == "session/close" and request["sessionId"] == "sess-fork-1"
+           end)
+
+    refute Enum.any?(requests, fn request ->
+             request["method"] == "session/close" and request["sessionId"] == "sess-1"
+           end)
   end
 
   test "Claude model switch rejects an alias whose public meaning drifted" do
