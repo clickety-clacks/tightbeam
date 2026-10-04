@@ -45,6 +45,8 @@ defmodule Tightbeam.FeatureSmokeTopologyTest do
     # shipped engineering admission. These are loaded, not disabled or stubbed.
     for {source, name} <- [
           {"support/fixtures/feature_smoke_topology.toml", "topology.toml"},
+          {"support/fixtures/feature_smoke_engineering.toml", "engineering.toml"},
+          {"support/fixtures/feature_smoke_verification.toml", "verification.toml"},
           {"../priv/kungfu/agentic-engineering/rules/delivery.toml", "delivery.toml"}
         ] do
       File.cp!(Path.expand(source, __DIR__), Path.join(base, "identity/rules/#{name}"))
@@ -158,6 +160,34 @@ defmodule Tightbeam.FeatureSmokeTopologyTest do
     for assigned <- [first, second] do
       assert assigned["workItemId"] == wi
       assert assigned["openedBySession"] == "parent"
+    end
+  end
+
+  test "topology alone does not waive the real coder posture gate", ctx do
+    call = fn verb, params -> ok!(ctx, nil, verb, params) end
+    wi = call.("work-item-create", %{"title" => "posture negative control"})["id"]
+
+    coordinator =
+      call.("assign", %{
+        "sessionKey" => "coordinator",
+        "workItemId" => wi,
+        "subject" => "fixture coordination",
+        "effectKind" => "coordination"
+      })
+
+    call.("work-item-update", %{"workItemId" => wi, "deliveryOwnerSessionKey" => "coordinator"})
+
+    ok!(ctx, "coordinator", "attest", %{
+      "assignmentId" => coordinator["id"],
+      "kind" => "verdict",
+      "verdictKind" => "topology-decided",
+      "note" => "One synthetic worker, no provider claim"
+    })
+
+    for verb <- ["assign", "dispatch"] do
+      refused = wire(ctx, nil, verb, staffing(wi))
+      assert refused["error"]["code"] == "rule_denied"
+      assert refused["error"]["message"] =~ "posture"
     end
   end
 

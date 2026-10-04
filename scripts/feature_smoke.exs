@@ -106,13 +106,24 @@ defmodule FeatureSmoke do
       preflight!(leg, base_dir)
       state = %{port: gw["port"], token: gw["cliToken"], base_dir: base_dir, leg: leg, pass: 0}
 
+      wi = ok!(state, "work-item-create", %{"title" => "smoke readiness #{unique()}"})
+      wi_id = wi["workItemId"] || wi["id"]
+      topology = prepare_fixture_topology!(state, wi_id, "One readiness reply worker")
+
       proof =
-        Tightbeam.DeployReadiness.run!(
-          fn verb, params -> post(state, verb, params) end,
-          fn session, wake ->
-            Tightbeam.DeployReadiness.observe!(Path.join(base_dir, "state.db"), session, wake)
-          end
-        )
+        try do
+          Tightbeam.DeployReadiness.run!(
+            fn verb, params ->
+              params = if verb == "spawn", do: Map.put(params, "workItemId", wi_id), else: params
+              post(state, verb, params)
+            end,
+            fn session, wake ->
+              Tightbeam.DeployReadiness.observe!(Path.join(base_dir, "state.db"), session, wake)
+            end
+          )
+        after
+          retire(state, topology)
+        end
 
       IO.puts("PASS fresh-agent readiness #{leg.wire_name}: #{JSON.encode!(proof)}")
     end
@@ -339,10 +350,16 @@ defmodule FeatureSmoke do
   defp check_local_deployment(state) do
     harness = state.leg.harness.id()
     machine = Tightbeam.Placement.local_host_name()
+    wi = ok!(state, "work-item-create", %{"title" => "smoke local deployment #{unique()}"})
+    wi_id = wi["workItemId"] || wi["id"]
+
+    topology =
+      prepare_fixture_topology!(state, wi_id, "One local deployment and redelivery worker")
 
     session =
       ok!(state, "spawn", %{
         "archetype" => "reviewer-code",
+        "workItemId" => wi_id,
         "displayName" => "smoke-local-deploy-#{unique()}",
         "idempotencyKey" => "local-deploy-#{unique()}"
       })
@@ -436,6 +453,7 @@ defmodule FeatureSmoke do
     after
       File.rm(sentinel)
       retire(state, session)
+      retire(state, topology)
     end
 
     pass(
@@ -558,6 +576,10 @@ defmodule FeatureSmoke do
     reviewer_leg = independent_leg(state)
     state = preflight_independent!(state, reviewer_leg)
 
+    wi = ok!(state, "work-item-create", %{"title" => "gate chain #{u}"})
+    wi_id = wi["workItemId"] || wi["id"]
+    holder = open_grounded_assignment!(state, u, wi_id, "gate chain #{u}", "g")
+
     prior = role_binding(state, "reviewer-code")
     post(state, "role-create", %{"name" => "reviewer-code"})
 
@@ -568,6 +590,8 @@ defmodule FeatureSmoke do
     # session instead of whatever retired one a previous group left behind.
     reviewer =
       ok!(%{state | leg: reviewer_leg}, "spawn", %{
+        "archetype" => "reviewer-code",
+        "workItemId" => wi_id,
         "displayName" => "smoke-gate-reviewer-#{u}",
         "idempotencyKey" => "grv-#{u}"
       })
@@ -575,30 +599,36 @@ defmodule FeatureSmoke do
     reviewer_key = get_in(reviewer, ["stream", "sessionKey"]) || reviewer["sessionKey"]
 
     with_role_binding(state, "reviewer-code", prior, reviewer_key, fn ->
-      gate_chain_enforced(state, u, reviewer_leg, reviewer, reviewer_key)
+      gate_chain_enforced(state, u, reviewer_leg, reviewer, reviewer_key, wi_id, holder)
     end)
   end
 
-  defp gate_chain_enforced(state, u, reviewer_leg, reviewer, reviewer_key) do
+  defp gate_chain_enforced(state, u, reviewer_leg, reviewer, reviewer_key, wi_id, holder) do
     reviewer_tok = session_token(state, reviewer_key)
-
-    wi =
-      ok!(state, "work-item-create", %{
-        "title" => "gate chain #{u}",
-        "idempotencyKey" => "gwi-#{u}"
-      })
-
-    wi_id = wi["workItemId"] || wi["id"]
-    holder = open_grounded_assignment!(state, u, wi_id, "gate chain #{u}", "g")
     asg_id = holder.assignment_id
 
     complete = fn ->
-      post_as(state, holder.token, "attest", %{"assignmentId" => asg_id, "kind" => "completion"})
+      post_as(state, holder.token, "attest", %{
+        "assignmentId" => asg_id,
+        "kind" => "completion",
+        "commitRefs" => holder.check.commit_refs
+      })
     end
 
     try do
-      # 1. Review gate. Its remedy assigns the bound reviewer, synchronously inside the
-      # attest, so the review exists by the time the denial response returns.
+      # This is the operator's real fixture run, filed using the holder's credential;
+      # it is not an inferred claim that the holder or a provider ran the check.
+      ok_as!(state, holder.token, "attest", %{
+        "assignmentId" => asg_id,
+        "kind" => "verdict",
+        "verdictKind" => "tests-passed",
+        "note" =>
+          "Operator-executed disposable fixture #{inspect(holder.check.commit_refs)}: " <>
+            holder.check.note
+      })
+
+      # 1. Review gate. Current rules notify the accountable owner; older installed
+      # rules assign the bound reviewer. Either way the denial must remain real.
       denied!(state, "completion-requires-review", asg_id, complete)
 
       reviews = ok!(state, "assignments", %{"sessionKey" => reviewer_key})
@@ -608,24 +638,27 @@ defmodule FeatureSmoke do
         |> List.wrap()
         |> Enum.find(fn a -> (a["reviewsAssignmentId"] || a["reviews"]) == asg_id end)
 
-      assert(
-        state,
-        is_map(review),
-        "gate chain: the review remedy did not assign the #{reviewer_leg.wire_name} reviewer a " <>
-          "review of #{asg_id}. The role is rebound to this group's live reviewer, so an " <>
-          "unresolved target here is a real remedy failure. Got: #{brief(reviews)}"
-      )
+      review =
+        review ||
+          ok!(state, "assign", %{
+            "sessionKey" => reviewer_key,
+            "workItemId" => wi_id,
+            "reviews" => asg_id,
+            "subject" => "Review exact disposable check #{holder.check.name}"
+          })
 
-      # Independence is a property of the SESSION, never of the harness:
-      # `commissioned_review_authors/3` counts a verdict only when the review's
-      # `openedBySession` differs from the holder and the author is the review's own holder.
-      # A remedy-opened review has `openedBySession` NULL, so it qualifies, and on a
-      # filtered single-leg run a fresh same-harness reviewer qualifies just as fully.
+      # Review the actual tiny fixture before filing its scripted conclusion. This
+      # proves the review gate's wire/provenance behavior, not independent inference.
+      # Changed bytes or output refuse; no product source review is manufactured.
+      review_note = Tightbeam.FeatureSmokeTopology.review_check!(holder.check)
+
       v =
         post_as(state, reviewer_tok, "attest", %{
           "assignmentId" => review["id"] || review["assignmentId"],
           "kind" => "verdict",
-          "verdictKind" => "reviewed-clean"
+          "verdictKind" => "reviewed-clean",
+          "commitRefs" => holder.check.commit_refs,
+          "note" => review_note
         })
 
       assert(
@@ -642,6 +675,7 @@ defmodule FeatureSmoke do
           "assignmentId" => asg_id,
           "kind" => "verdict",
           "verdictKind" => "verified",
+          "commitRefs" => holder.check.commit_refs,
           "note" => holder.check.note
         })
 
@@ -1105,10 +1139,50 @@ defmodule FeatureSmoke do
         "group refuses to hand a holder work it could not verify itself."
     )
 
+    # This new session owns a disposable repository containing only its check.
+    # Code completion requires real immutable review/verification refs; never
+    # substitute a fabricated hash or a product repository's unrelated commit.
+    assert(
+      state,
+      not File.exists?(Path.join(workdir, ".git")),
+      "fixture repository already exists"
+    )
+
+    for args <- [
+          ["init", "--quiet"],
+          ["add", "--", name],
+          [
+            "-c",
+            "user.name=Smoke Fixture",
+            "-c",
+            "user.email=smoke@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "-m",
+            "Disposable smoke check"
+          ]
+        ] do
+      {git_output, git_status} = System.cmd("git", args, cd: workdir, stderr_to_stdout: true)
+      assert(state, git_status == 0, "fixture git failed: #{git_output}")
+    end
+
+    {commit, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: workdir)
+
+    refs = [
+      %{
+        "repo" => "#{Tightbeam.Placement.local_host_name()}:#{workdir}",
+        "commit" => String.trim(commit)
+      }
+    ]
+
     %{
       name: name,
       path: path,
+      commit_refs: refs,
       output: output,
+      source: File.read!(path),
       note:
         "Ran `sh #{name}` in this assignment's workdir (#{workdir}); it exited 0 and printed " <>
           "exactly #{inspect(output)}"
@@ -1698,8 +1772,15 @@ defmodule FeatureSmoke do
 
         assert(state, got == "reviewer-code", "config: set did not persist (#{inspect(got)})")
 
+        wi = ok!(state, "work-item-create", %{"title" => "smoke default archetype #{unique()}"})
+        wi_id = wi["workItemId"] || wi["id"]
+
+        topology =
+          prepare_fixture_topology!(state, wi_id, "One default-archetype selection probe")
+
         spawn =
           ok!(state, "spawn", %{
+            "workItemId" => wi_id,
             "displayName" => "smoke-cfg-#{unique()}",
             "idempotencyKey" => "cfg-#{unique()}"
           })
@@ -1714,6 +1795,7 @@ defmodule FeatureSmoke do
           )
 
         retire(state, spawn)
+        retire(state, topology)
         assert(state, arch == "reviewer-code", "config: spawn archetype was #{inspect(arch)}")
       end
     )
@@ -2341,11 +2423,13 @@ defmodule FeatureSmoke do
   defp prepare_fixture_topology!(state, wi_id, plan, owner \\ nil) do
     u = unique()
 
+    # Ownerless intake uses the office spawn path, then opens a same-item
+    # coordination card. Supplying workItemId to spawn would request production
+    # staffing before this item's first delivery owner exists.
     coordinator =
       ok!(state, "spawn", %{
         "archetype" => "product-owner",
         "displayName" => "smoke-topology-#{u}",
-        "workItemId" => wi_id,
         "idempotencyKey" => "topology-#{u}"
       })
 
