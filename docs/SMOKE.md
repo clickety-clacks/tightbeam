@@ -197,8 +197,8 @@ on 2026-07-25:
   ```sh
   TIGHTBEAM_BASE_DIR=/absolute/owned/test-base \
   TIGHTBEAM_SMOKE_OWNED_BASE=/absolute/owned/test-base \
-  TIGHTBEAM_SMOKE_MODEL_CLAUDE='claude-sonnet-5' TIGHTBEAM_SMOKE_EFFORT_CLAUDE='medium' \
-  TIGHTBEAM_SMOKE_MODEL_CODEX='gpt-5.6-sol' TIGHTBEAM_SMOKE_EFFORT_CODEX='medium' \
+  TIGHTBEAM_SMOKE_MODEL_CLAUDE='claude-haiku-4-5' TIGHTBEAM_SMOKE_EFFORT_CLAUDE='medium' \
+  TIGHTBEAM_SMOKE_MODEL_CODEX='gpt-5.6-luna' TIGHTBEAM_SMOKE_EFFORT_CODEX='medium' \
   TIGHTBEAM_SMOKE_MODEL_CURSOR='<catalog-listed-cursor-model>' \
   TIGHTBEAM_SMOKE_MODEL_PI='opencode-go/gpt-5.6-luna' TIGHTBEAM_SMOKE_EFFORT_PI='medium' \
   mix run --no-start scripts/feature_smoke.exs
