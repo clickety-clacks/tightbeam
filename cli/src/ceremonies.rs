@@ -3514,10 +3514,13 @@ mod tests {
         fs::create_dir_all(&staging).unwrap();
         fs::create_dir_all(&bin).unwrap();
         let codex = bin.join("codex");
+        // Keep the owned group signalable through the graceful cleanup window.
+        // Otherwise the forwarded TERM can empty it before settle's TERM/KILL pass,
+        // which Darwin may report as EPERM.
         fs::write(
             &codex,
             format!(
-                "#!/bin/sh\nsleep 300 & printf '%s' \"$!\" > '{}'\nwait\n",
+                "#!/bin/sh\ntrap '' TERM\nsleep 300 & printf '%s' \"$!\" > '{}'\nwait\n",
                 marker.display()
             ),
         )
@@ -3575,8 +3578,15 @@ mod tests {
         let stderr = String::from_utf8_lossy(&drain.join().unwrap()).into_owned();
 
         let grandchild_pid: libc::pid_t = grandchild.trim().parse().unwrap();
-        let alive = unsafe { libc::kill(grandchild_pid, 0) } == 0
+        let mut alive = unsafe { libc::kill(grandchild_pid, 0) } == 0
             || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH);
+        // Keep descendant cleanup inside the same five-second deadline used for the
+        // inner process; SIGKILL can complete just after its group leader is reaped.
+        while alive && Instant::now() < exit_by {
+            thread::sleep(Duration::from_millis(10));
+            alive = unsafe { libc::kill(grandchild_pid, 0) } == 0
+                || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH);
+        }
         let canceled_lease = fs::read_to_string(&cancel).ok();
         let staging_survived = staging.exists();
         let _ = fs::remove_dir_all(&root);
