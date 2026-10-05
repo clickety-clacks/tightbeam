@@ -38,7 +38,7 @@ jobs:
           - os: macos-latest
             name: macos
     name: ${{ matrix.name }}
-    runs-on: ${{ matrix.name == 'macos' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "tb-macos"]') || matrix.os }}
+    runs-on: ${{ matrix.name == 'linux' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "tb-linux"]') || matrix.name == 'macos' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "tb-macos"]') || matrix.os }}
     steps:
       - name: Validate exact source SHA
         shell: bash
@@ -204,7 +204,7 @@ jobs:
           - os: macos-latest
             name: darwin-aarch64
     name: release ${{ matrix.name }}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.name == 'linux-x86_64' && fromJSON('["self-hosted", "tb-linux"]') || matrix.os }}
     steps:
       - name: Validate exact source SHA
         shell: bash
@@ -271,7 +271,7 @@ jobs:
   publish-release:
     needs: release
     if: github.event_name != 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, tb-linux]
     permissions:
       contents: write
     steps:

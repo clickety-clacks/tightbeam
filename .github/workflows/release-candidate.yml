@@ -20,7 +20,7 @@ permissions:
 
 jobs:
   metadata:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, tb-linux]
     outputs:
       candidate_branch: ${{ steps.candidate.outputs.branch }}
       candidate_ref: ${{ steps.candidate.outputs.ref }}
@@ -87,7 +87,7 @@ jobs:
           - os: macos-latest
             platform: darwin-aarch64
     name: test ${{ matrix.platform }}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.platform == 'linux-x86_64' && fromJSON('["self-hosted", "tb-linux"]') || matrix.os }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -256,7 +256,7 @@ jobs:
           - os: macos-latest
             platform: darwin-aarch64
     name: package ${{ matrix.platform }}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.platform == 'linux-x86_64' && fromJSON('["self-hosted", "tb-linux"]') || matrix.os }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -303,7 +303,7 @@ jobs:
   proof:
     needs: [metadata, package]
     if: ${{ success() }}
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, tb-linux]
     steps:
       - uses: actions/checkout@v4
         with:
