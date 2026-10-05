@@ -20,7 +20,7 @@ permissions:
 
 jobs:
   metadata:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, tb-linux]
     outputs:
       candidate_branch: ${{ steps.candidate.outputs.branch }}
       candidate_ref: ${{ steps.candidate.outputs.ref }}
@@ -87,7 +87,7 @@ jobs:
           - os: macos-latest
             platform: darwin-aarch64
     name: test ${{ matrix.platform }}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.platform == 'linux-x86_64' && fromJSON('["self-hosted", "tb-linux"]') || matrix.os }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -101,6 +101,10 @@ jobs:
 
       - name: Public rule facts never shrink
         run: python3 scripts/verify_public_rule_facts.py
+
+      - name: Set setup-beam target for the self-hosted Linux runner
+        if: matrix.platform == 'linux-x86_64' && runner.environment == 'self-hosted'
+        run: echo "ImageOS=ubuntu24" >> "$GITHUB_ENV"
 
       - uses: erlef/setup-beam@v1
         with:
@@ -256,7 +260,7 @@ jobs:
           - os: macos-latest
             platform: darwin-aarch64
     name: package ${{ matrix.platform }}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.platform == 'linux-x86_64' && fromJSON('["self-hosted", "tb-linux"]') || matrix.os }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -267,6 +271,10 @@ jobs:
         env:
           CANDIDATE_SHA: ${{ needs.metadata.outputs.candidate_sha }}
         run: test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+
+      - name: Set setup-beam target for the self-hosted Linux runner
+        if: matrix.platform == 'linux-x86_64' && runner.environment == 'self-hosted'
+        run: echo "ImageOS=ubuntu24" >> "$GITHUB_ENV"
 
       - uses: erlef/setup-beam@v1
         with:
@@ -303,7 +311,7 @@ jobs:
   proof:
     needs: [metadata, package]
     if: ${{ success() }}
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, tb-linux]
     steps:
       - uses: actions/checkout@v4
         with:
