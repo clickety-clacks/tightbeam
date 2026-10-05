@@ -172,6 +172,16 @@ defmodule Tightbeam.PublicWireFourVerbsTest do
     assert accepted_json["result"]["correction"]["assignmentId"] == "asg_wire_commit"
     assert correction_count(ctx.db) == before + 1
 
+    correction_exists =
+      dispatch_cli(ctx, caller.cli_token, %{
+        body
+        | params: %{params | idempotencyKey: "wire-commit-existing"}
+      })
+
+    assert correction_exists.status == 400, correction_exists.resp_body
+    assert JSON.decode!(correction_exists.resp_body)["error"]["code"] == "correction_exists"
+    assert correction_count(ctx.db) == before + 1
+
     replay = dispatch_cli(ctx, caller.cli_token, body)
     assert replay.status == 200, replay.resp_body
     assert JSON.decode!(replay.resp_body)["result"] == accepted_json["result"]
