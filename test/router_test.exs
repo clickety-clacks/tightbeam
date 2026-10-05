@@ -2200,16 +2200,35 @@ defmodule Tightbeam.Wire.RouterTest do
     assert_receive {:call,
                     %{verb: "wake", origin: "agent:orchestrator:demo", session_key: "orch"}}
 
+    # `post` remains an internal handler-backed verb: the public wire must
+    # reject it before the handler can append a message or enqueue a turn.
+    {:ok, [[before_events]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM events")
+    {:ok, [[before_messages]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM messages")
+    {:ok, [[before_turns]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
+
     disallowed =
-      conn(:post, "/agent/dispatch", JSON.encode!(%{verb: "post", as_user: "flynn"}))
-      |> put_req_header("authorization", "Bearer tbc_test")
-      |> put_req_header(
-        "x-tightbeam-cli-version",
-        Tightbeam.CliCompatibility.required_version()
-      )
-      |> Router.call(Router.init(ctx.opts))
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "post",
+        asUser: "flynn",
+        params: %{content: "must not be delivered", clientMessageId: "internal-post-negative"}
+      })
 
     assert disallowed.status == 400
+
+    assert JSON.decode!(disallowed.resp_body) == %{
+             "error" => %{
+               "code" => "invalid_message",
+               "message" => "verb not allowed: post"
+             }
+           }
+
+    {:ok, [[after_events]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM events")
+    {:ok, [[after_messages]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM messages")
+    {:ok, [[after_turns]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
+
+    assert after_events == before_events
+    assert after_messages == before_messages
+    assert after_turns == before_turns
   end
 
   test "the dispatch boundary strips a wake's substrate-only carriers", ctx do
