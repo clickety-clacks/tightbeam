@@ -69,6 +69,10 @@ jobs:
         if: matrix.name == 'macos' && runner.environment == 'self-hosted'
         run: echo "ImageOS=macos26" >> "$GITHUB_ENV"
 
+      - name: Set setup-beam target for the self-hosted Linux runner
+        if: matrix.name == 'linux' && runner.environment == 'self-hosted'
+        run: echo "ImageOS=ubuntu24" >> "$GITHUB_ENV"
+
       # ONE pinned BEAM for every platform. erlef/setup-beam does support macOS
       # runners (OTP 25-29 on macOS-14/15/26) — the earlier "linux and windows
       # only" reading was wrong, and brew cost us the parity the matrix exists
@@ -228,6 +232,10 @@ jobs:
       - name: Record validated release provenance gate
         if: github.event_name != 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v')
         run: echo "TIGHTBEAM_RELEASE_TAG_VALIDATED=1" >> "$GITHUB_ENV"
+
+      - name: Set setup-beam target for the self-hosted Linux runner
+        if: matrix.name == 'linux-x86_64' && runner.environment == 'self-hosted'
+        run: echo "ImageOS=ubuntu24" >> "$GITHUB_ENV"
 
       - name: Install BEAM (pinned, same as the gate)
         uses: erlef/setup-beam@v1
