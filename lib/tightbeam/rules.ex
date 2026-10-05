@@ -241,17 +241,35 @@ defmodule Tightbeam.Rules do
 
   @doc "Load and validate all rule files, replacing the currently active set."
   @spec load!(String.t(), Enumerable.t()) :: [rule()]
-  def load!(base_dir, valid_verbs) do
+  def load!(base_dir, valid_verbs, opts \\ []) do
     verbs = MapSet.new(valid_verbs)
-
-    identity_manifest_sha = identity_manifest_sha(base_dir)
+    law_base = Keyword.get(opts, :law_base, base_dir)
+    revision = Keyword.get(opts, :revision)
+    identity_manifest_sha = revision || identity_manifest_sha(base_dir)
 
     entries =
-      base_dir
+      law_base
       |> Path.join("identity/rules/*.toml")
       |> Path.wildcard()
       |> Enum.sort()
-      |> Enum.flat_map(&load_file!(&1, verbs, base_dir, identity_manifest_sha))
+      |> Enum.flat_map(&load_file!(&1, verbs, law_base, identity_manifest_sha))
+      |> Enum.map(fn
+        {:rule, rule} ->
+          # Keep runtime effects in the real base. A recovery snapshot is removed
+          # after loading, so pin executable checks as well as their declarations.
+          check =
+            if revision && rule.check do
+              path = Path.join([law_base, "identity", "rails", "scripts", rule.check.script])
+              Map.put(rule.check, :published_bytes, File.read!(path))
+            else
+              rule.check
+            end
+
+          {:rule, %{rule | base_dir: base_dir, check: check}}
+
+        entry ->
+          entry
+      end)
 
     rules = for {:rule, rule} <- entries, do: rule
     policies = for {:policy, policy} <- entries, do: policy

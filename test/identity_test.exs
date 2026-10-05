@@ -611,6 +611,124 @@ defmodule Tightbeam.IdentityTest do
     assert Identity.live_revision!(ctx.base) == stable
   end
 
+  test "pending recovery loads published law and runs published checks without changing the merge",
+       ctx do
+    alias Tightbeam.{DB, Gateway, Rails, RailScript, Schema}
+
+    # Rail containment requires canonical write roots, including macOS /var aliases.
+    {root, 0} = System.cmd("/bin/realpath", [ctx.root])
+    ctx = %{ctx | base: Path.join(String.trim(root), "runtime")}
+
+    for path <- ["rails/scripts", "rules"], do: File.mkdir_p!(Path.join(ctx.source, path))
+
+    File.write!(Path.join(ctx.source, "rails/synthetic.toml"), """
+    [[statute]]
+    name = "synthetic-published-gate"
+    on = "tool-call"
+    mode = "gate"
+    tool = "Bash"
+    pattern = "synthetic-forbidden"
+    text = "synthetic published refusal"
+    """)
+
+    File.write!(Path.join(ctx.source, "rules/synthetic.toml"), """
+    [[rule]]
+    name = "synthetic-published-check"
+    verb = "post"
+    text = "synthetic published check"
+    [rule.check]
+    script = "synthetic-check"
+    returns = ["pass"]
+    [rule.check.effects]
+    pass = "allow"
+    """)
+
+    script = Path.join(ctx.source, "rails/scripts/synthetic-check")
+    File.write!(script, "#!/bin/sh\nprintf pass\n")
+    File.chmod!(script, 0o755)
+    learn_test_bundle!(ctx)
+    dir = Path.join(ctx.base, "identity")
+    File.chmod!(Path.join(dir, "rails/scripts/synthetic-check"), 0o755)
+    git!(dir, ["add", "rails/scripts/synthetic-check"])
+    git!(dir, ["commit", "-m", "synthetic executable check"], "test")
+    edit!(ctx.base, "coder", :guidance, "local customization", "test")
+    Gateway.load_law!(%{base_dir: ctx.base}, ["post"])
+    hooks = Rails.hook_settings()
+    File.write!(Path.join(ctx.source, "guidance/coder.md"), "incoming guidance")
+    assert {:conflict, [_]} = relearn!(ctx.base, "test")
+    index = File.read!(Path.join(dir, ".git/index"))
+    merge = File.read!(Path.join(dir, ".git/MERGE_HEAD"))
+    live = Identity.live_revision!(ctx.base)
+    File.write!(Path.join(dir, "rails/synthetic.toml"), "unpublished invalid law")
+    File.write!(Path.join(dir, "rules/synthetic.toml"), "unpublished invalid law")
+
+    File.write!(
+      Path.join(dir, "rails/scripts/synthetic-check"),
+      "#!/bin/sh\nprintf unpublished\n"
+    )
+
+    assert [rule] = Gateway.load_law!(%{base_dir: ctx.base}, ["post"])
+    assert Rails.hook_settings() == hooks
+    assert rule.base_dir == ctx.base
+    assert rule.identity_manifest_sha == live
+    assert Path.wildcard(Path.join(ctx.base, ".identity-law-*")) == []
+    assert File.read!(Path.join(dir, ".git/index")) == index
+    assert File.read!(Path.join(dir, ".git/MERGE_HEAD")) == merge
+    assert Identity.live_revision!(ctx.base) == live
+
+    db = start_supervised!({DB, path: ":memory:", name: nil})
+    :ok = Schema.ensure_all(db)
+    File.mkdir_p!(Path.join(ctx.base, "bin"))
+    File.cp!(Path.expand("cli/target/release/tightbeam"), Path.join(ctx.base, "bin/tightbeam"))
+
+    call = %{
+      verb: "post",
+      origin: "user:test",
+      principal: {:user, "test"},
+      session_key: nil,
+      params: %{}
+    }
+
+    assert {:ok, "pass", "returned"} = RailScript.run(db, ctx.base, rule, call, nil)
+    assert Path.wildcard(Path.join(ctx.base, "rails/scratch/*")) == []
+  end
+
+  test "recovery refuses invalid published law and a missing published ref without touching the merge",
+       ctx do
+    alias Tightbeam.Gateway
+    learn_test_bundle!(ctx)
+    dir = Path.join(ctx.base, "identity")
+    File.mkdir_p!(Path.join(dir, "rules"))
+    File.write!(Path.join(dir, "rules/invalid.toml"), "[[rule]]\nname = 'incomplete'\n")
+    git!(dir, ["add", "rules/invalid.toml"])
+    git!(dir, ["commit", "-m", "synthetic invalid published law"], "test")
+    git!(dir, ["branch", "-f", "tightbeam/live", "HEAD"])
+
+    assert_raise ArgumentError, ~r/missing or blank verb/, fn ->
+      Gateway.load_law!(%{base_dir: ctx.base}, ["post"])
+    end
+
+    edit!(ctx.base, "coder", :guidance, "local customization", "test")
+    File.write!(Path.join(ctx.source, "guidance/coder.md"), "incoming guidance")
+    assert {:conflict, [_]} = relearn!(ctx.base, "test")
+    index = File.read!(Path.join(dir, ".git/index"))
+    merge = File.read!(Path.join(dir, ".git/MERGE_HEAD"))
+
+    assert_raise ArgumentError, ~r/missing or blank verb/, fn ->
+      Gateway.load_law!(%{base_dir: ctx.base}, ["post"])
+    end
+
+    assert Path.wildcard(Path.join(ctx.base, ".identity-law-*")) == []
+    git!(dir, ["branch", "-D", "tightbeam/live"])
+
+    assert_raise RuntimeError, ~r/git .* failed/, fn ->
+      Gateway.load_law!(%{base_dir: ctx.base}, ["post"])
+    end
+
+    assert File.read!(Path.join(dir, ".git/index")) == index
+    assert File.read!(Path.join(dir, ".git/MERGE_HEAD")) == merge
+  end
+
   test "relearn surfaces a non-conflict merge failure with git's reason", ctx do
     learn_test_bundle!(ctx)
     dir = Path.join(ctx.base, "identity")

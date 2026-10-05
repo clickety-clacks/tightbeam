@@ -293,6 +293,39 @@ defmodule Tightbeam.Identity do
     git_output!(identity_dir(base_dir), ["rev-parse", @live])
   end
 
+  @doc false
+  def with_recovery_law!(base_dir, load) do
+    dir = identity_dir(base_dir)
+
+    if merge_pending?(dir) do
+      # Recovery needs the published law, never a partially merged working tree.
+      # Export one pinned revision without touching the index or merge metadata.
+      revision = git_output!(dir, ["rev-parse", @live])
+      snapshot = Path.join(base_dir, ".identity-law-#{Tightbeam.Id.uuid4()}")
+      tree = Path.join(snapshot, "identity")
+
+      try do
+        File.mkdir_p!(tree)
+        File.chmod!(snapshot, 0o700)
+        env = [{"GIT_INDEX_FILE", Path.join(snapshot, "index")}]
+        export_law!(dir, ["read-tree", revision], env)
+        export_law!(dir, ["checkout-index", "--all", "--prefix=#{tree}/"], env)
+        load.(snapshot, revision)
+      after
+        File.rm_rf!(snapshot)
+      end
+    else
+      load.(base_dir, nil)
+    end
+  end
+
+  defp export_law!(dir, args, env) do
+    case System.cmd("git", args, cd: dir, env: env, stderr_to_stdout: true) do
+      {_output, 0} -> :ok
+      {output, status} -> raise "published identity export failed (#{status}): #{output}"
+    end
+  end
+
   @doc "Read one archetype's complete immutable served snapshot."
   @spec snapshot!(String.t(), String.t(), harness()) :: snapshot()
   def snapshot!(base_dir, archetype_name, harness) do
