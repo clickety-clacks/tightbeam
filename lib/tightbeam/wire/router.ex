@@ -71,6 +71,10 @@ defmodule Tightbeam.Wire.Router do
   @agent_verbs @agent_verbs ++
                  [
                    "artifact-content-fetch",
+                   "assignment-commitref-correct",
+                   "harness-health-observe-other",
+                   "harness-health-resolve-other",
+                   "harness-health-close-promotion",
                    "harness-health-review-other",
                    "harness-health-evidence-other"
                  ]
@@ -1779,7 +1783,14 @@ defmodule Tightbeam.Wire.Router do
   # oracle. Both verbs' selectors travel as ordinary body params.
   @non_target_verbs ~w(settle-turn answer return transcript execution-map execution-map-select breathing toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list)
 
-  @non_target_verbs @non_target_verbs ++ ["artifact-content-fetch"]
+  @non_target_verbs @non_target_verbs ++
+                      [
+                        "artifact-content-fetch",
+                        "assignment-commitref-correct",
+                        "harness-health-observe-other",
+                        "harness-health-resolve-other",
+                        "harness-health-close-promotion"
+                      ]
 
   # PRESENCE of the field, not the type of its value. `sessionKey: null` — and a
   # number, a boolean or an object — is still a caller volunteering a typed target
