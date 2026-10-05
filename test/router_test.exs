@@ -804,16 +804,78 @@ defmodule Tightbeam.Wire.RouterTest do
     reviewed = dispatch_cli(ctx, source.cli_token, review)
     assert reviewed.status == 200
     assert JSON.decode!(reviewed.resp_body)["result"]["review"]["outcome"] == "confirmed_other"
+  end
 
-    internal =
-      dispatch_cli(ctx, source.cli_token, %{
-        verb: "repair-assignment",
-        as: "coder:health-wire-source",
-        params: %{}
+  test "repair-assignment crosses the agent wire with opener auth, no-incident refusal, and replay",
+       ctx do
+    owner = ctx.device.user_id
+    holder = create_session(ctx.db, "repair-wire-holder", owner)
+
+    assignment =
+      Assignments.__handle__(ctx.db, "assign", %{
+        principal: {:user, owner},
+        session_key: holder.session_key,
+        target_role: nil,
+        role_fallback: false,
+        supervision_interval_ms: 1_000,
+        params: %{subject: "repair wire", work_item_id: nil}
       })
 
-    assert internal.status == 400
-    assert JSON.decode!(internal.resp_body)["error"]["code"] == "invalid_message"
+    handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})
+    ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, handlers)}
+
+    request = %{
+      verb: "repair-assignment",
+      asUser: owner,
+      params: %{
+        assignmentId: assignment.id,
+        action: "restart",
+        idempotencyKey: "repair-wire-no-incident"
+      }
+    }
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM assignment_repair_attempts WHERE assignmentId=?1",
+               [assignment.id]
+             )
+
+    unauthorized = dispatch_cli(ctx, "tbc_test", %{request | asUser: "not-the-opener"})
+    assert unauthorized.status == 403
+    assert JSON.decode!(unauthorized.resp_body)["error"]["code"] == "not_authorized"
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM assignment_repair_attempts WHERE assignmentId=?1",
+               [assignment.id]
+             )
+
+    refused = dispatch_cli(ctx, "tbc_test", request)
+    assert refused.status == 400
+
+    assert JSON.decode!(refused.resp_body) == %{
+             "error" => %{
+               "code" => "no_open_incident",
+               "message" =>
+                 "no open harness incident covers this assignment; use relaunch only for a holder with no turn"
+             }
+           }
+
+    replay = dispatch_cli(ctx, "tbc_test", request)
+    assert replay.status == 400
+    assert JSON.decode!(replay.resp_body) == JSON.decode!(refused.resp_body)
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM assignment_repair_attempts WHERE assignmentId=?1",
+               [assignment.id]
+             )
+
+    assert {:ok, [["open", nil]]} =
+             DB.query(ctx.db, "SELECT state,outcome FROM assignments WHERE id=?1", [assignment.id])
   end
 
   # The seam gh#11 named: operator-ask/-rule/-withdraw had a working Escalation
