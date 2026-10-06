@@ -11,6 +11,13 @@ older guidance, specs, or cards name another default integration branch, read
 "highest `0.1.*` branch" on this line. If a card names a branch explicitly, the
 card wins.
 
+## Keep the substrate neutral
+
+The substrate (`priv/seed`, `priv/guidance`, `priv/skills`, and Main's default
+archetype) stays neutral. Put ways of working — such as PO/PDO roles, delivery
+and review process, and how to build a product org — in the applicable kungfu
+bundle, never in substrate guidance.
+
 ## ACP / harness facts (for anyone touching the adapter layer)
 
 - **Zed is the ACP reference implementation.** For ANY protocol capability/semantics
@@ -23,9 +30,10 @@ card wins.
   yesterday's diagnosis against today's binary.
 - **codex hooks run under `codex app-server` (the adapter path), TRUST-GATED** — not
   inert (that earlier conclusion was a 0.144.x bundled-binary + untrusted-state
-  artifact, refuted 2026-07-23). A hook handler arms only if trusted or
-  `bypass_hook_trust` is set; that key is a thread/start REQUEST override only (not
-  config.toml, not a CLI flag). tightbeam delivers it via `CODEX_CONFIG={"bypass_hook_trust":true}`
+  artifact, refuted 2026-07-23). The same core engine serves every frontend. A
+  hook handler arms only if trusted or `bypass_hook_trust` is set; that key is a
+  thread/start REQUEST override only, not config.toml or an app-server CLI flag.
+  tightbeam delivers it via `CODEX_CONFIG={"bypass_hook_trust":true}`
   on the adapter spawn, which codex-acp spreads into every thread/start config map.
   Verified at rust-v0.145.0: PreToolUse fires for shell + unified_exec (tool "Bash",
   full command text) and deny actually blocks. Two prerequisites: CODEX_PATH must pin
