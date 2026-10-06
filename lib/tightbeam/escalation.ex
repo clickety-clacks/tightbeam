@@ -2286,7 +2286,7 @@ defmodule Tightbeam.Escalation do
             session_key: notification_session,
             origin: "process:tightbeam",
             prompt: terminal_notification(request.id),
-            due_at: ruled_at + (request.deadline_at - request.raised_at),
+            due_at: ruled_at,
             target_gate: 0,
             creator_session_key: via,
             condition_kind: @terminal_condition_kind,
@@ -3583,10 +3583,7 @@ defmodule Tightbeam.Escalation do
   defp terminal_cardinality(_count), do: "unknown"
 
   defp terminal_notification_count_in_txn(txn, request) do
-    expected_due_at =
-      if Enum.all?([request.ruled_at, request.deadline_at, request.raised_at], &is_integer/1),
-        do: request.ruled_at + (request.deadline_at - request.raised_at),
-        else: nil
+    {settlement_due_at, deadline_relative_due_at} = terminal_notification_due_at_contract(request)
 
     [[count]] =
       Txn.q(
@@ -3596,7 +3593,7 @@ defmodule Tightbeam.Escalation do
         WHERE targetRole IS NULL AND origin = 'process:tightbeam'
           AND prompt = ?2 AND consumer = 'prompt' AND conditionKind = ?3
           AND conditionScope = ?4 AND conditionAfterId < ?5
-          AND dueAt = ?6 AND targetGate = 0
+          AND dueAt IN (?6, ?9) AND targetGate = 0
           AND reresolve IS NULL AND reresolveSeed IS NULL AND reresolveRung IS NULL
           AND ((?7 IS NULL AND creatorSessionKey IS NULL) OR creatorSessionKey = ?7)
           AND ((state = 'pending' AND firedAt IS NULL AND firedBy IS NULL) OR
@@ -3609,13 +3606,29 @@ defmodule Tightbeam.Escalation do
           @terminal_condition_kind,
           request.id,
           request.ruling_fact_id,
-          expected_due_at,
+          settlement_due_at,
           request.ruled_via_session_key,
-          if(late_route_marker_count_in_txn(txn, request.id) == 1, do: 1, else: 0)
+          if(late_route_marker_count_in_txn(txn, request.id) == 1, do: 1, else: 0),
+          deadline_relative_due_at
         ]
       )
 
     count
+  end
+
+  # New rulings commit a wake that is immediately eligible for durable recovery.
+  # The deadline-relative form is accepted only for historical post-activation
+  # rows written before settlement-time delivery; every other dueAt remains dirt.
+  defp terminal_notification_due_at_contract(request) do
+    settlement = if is_integer(request.ruled_at), do: request.ruled_at, else: nil
+
+    deadline_relative =
+      if is_integer(settlement) and is_integer(request.deadline_at) and
+           is_integer(request.raised_at) and request.deadline_at > request.raised_at,
+         do: settlement + (request.deadline_at - request.raised_at),
+         else: nil
+
+    {settlement, deadline_relative}
   end
 
   defp terminal_performer_principal_valid?(request, :post_activation),
