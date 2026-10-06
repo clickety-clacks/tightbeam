@@ -14,8 +14,12 @@ reverse it.
    `release-provenance.json`. For the package commands, follow the
    [stage/select instructions](../README.md#from-a-release-package) below the
    README's release-package heading; `stage` leaves the running build selected.
+   If the service still starts an npm-installed executable, follow
+   [the selector move](#moving-an-npm-installed-systemd-gateway-to-the-selector)
+   before restart.
 3. Review [runtime overrides](#runtime-overrides-during-an-upgrade). At the
-   authorized idle boundary, select the staged build and restart the service.
+   authorized idle boundary, select the staged build, update any npm-based
+   systemd unit to the selector path, and restart the service.
    The gateway performs the supported database migration on first boot; do not
    issue manual schema changes.
 4. Require `/version` to match the selected receipt's version and source SHA,
@@ -23,7 +27,11 @@ reverse it.
    the runtime checks below. If the gateway fails to boot or verification
    fails, stop and use the retained package and backup only after checking
    schema compatibility; an executable rollback does not undo migration.
-5. Recommend refreshing each learned kungfu when the user chooses. Main can
+5. For each registered satellite whose CLI came from assimilation, refresh it
+   with the selected 0.1.9 CLI by [re-assimilating that host](#refreshing-satellite-clis)
+   with its recorded destination and settings. Verify the remote CLI version;
+   upgrading the gateway does not replace a satellite CLI.
+6. Recommend refreshing each learned kungfu when the user chooses. Main can
    run the single relearn command and walk the user through any conflicts as
    described below. Relearning is a user choice after the upgrade, not a
    prerequisite to restart the gateway.
@@ -68,18 +76,40 @@ rechecks those files and switches `current` atomically. A failed or interrupted
 stage cannot change the selected build. Incomplete temporary stage directories
 are inert and are never selected.
 
-An installation still using a global npm path must first be migrated to the
-selector. Identify the actual running build from `GET /version` (`version` and
-`sha`). The `sha` is a short source commit stamp, not an artifact digest. Stage
-the published package only when deployment records establish that the running
-process came from that release and its provenance `commit` begins with the
-reported `sha`. Select that same package, point the service at
-`/opt/tightbeam/current/tightbeam/bin/tightbeam-gateway`, and reload its service
-configuration. If the running stamp does not match a verified package, stop the
-migration until the exact prior build is recovered; the executable currently
-on disk can already differ from the process in memory. If the running artifact's
-origin is unknown, the source stamp alone is not enough to claim it as a verified
-rollback build.
+### Moving an npm-installed systemd gateway to the selector
+
+An existing system unit may start an npm-installed executable through
+`~/.local/bin`, with the package under `~/.local/lib/node_modules`. Read
+`systemctl cat tightbeam.service`, its `ExecStart` and `Environment` properties,
+the resolved executable path, and the running gateway's `GET /version` before
+changing either one. The `sha` in `/version` is a short source commit stamp, not
+an artifact digest. Match the running build to its exact prior release package
+and provenance; stage and retain that verified package for rollback. If the
+running stamp does not match a verified package, stop until the prior build is
+recovered. Executable bytes on disk can already differ from the running process.
+
+```sh
+systemctl cat tightbeam.service
+systemctl show tightbeam.service -p ExecStart -p Environment
+readlink -f "$HOME/.local/bin/tightbeam-gateway"
+```
+
+The last command applies when that symlink exists; otherwise resolve the actual
+`ExecStart` path. Do not assume the interactive shell uses the service's binary.
+
+Stage the verified 0.1.9 target using the README's release-package commands.
+At the authorized idle boundary, select that target and change only the system
+unit's executable path to
+`/opt/tightbeam/current/tightbeam/bin/tightbeam-gateway`; include the selected
+`tightbeam/bin` directory in the unit's `PATH` while preserving its existing
+`User`, `WorkingDirectory`, base directory, port, advertised URL, credentials,
+and other intended environment. For a systemd `ExecStart` drop-in, clear the
+old value with an empty `ExecStart=` before setting the selector path. Run
+`sudo systemctl daemon-reload`, inspect the
+effective unit again, then `sudo systemctl restart tightbeam.service` once.
+Wait for migration to finish before requiring the new `/version`. The old npm
+files are not a verified rollback merely because they remain on disk. If the
+running artifact's origin is unknown, its source stamp alone is insufficient.
 
 After selection, `readlink /opt/tightbeam/current` identifies the selected
 build. The running process may still report the previous version until its
@@ -92,6 +122,20 @@ boundary, then compare `GET /version`'s `version` with the selected receipt's
 after you confirm that it supports the current database schema. Selecting old
 executable bytes does not reverse a SQLite migration or make an incompatible
 schema safe.
+
+### Refreshing satellite CLIs
+
+For every registered satellite that received `<base_dir>/bin/tightbeam` from
+`assimilate`, record its SSH destination, host name, base directory, and harness
+selection. Once the new gateway is healthy and affected remote sessions are
+idle, run `/opt/tightbeam/current/tightbeam/bin/tightbeam assimilate <ssh-dest> --name
+<host-name> [--base-dir <path>] [--harness <names>]
+--as-user <adminUserId>` with those same recorded values. Re-assimilation is
+idempotent: it refreshes the satellite CLI and adapters without creating a
+second host or carrying credentials. Check the command's actual result and the
+remote `<base_dir>/bin/tightbeam --version`; require 0.1.9 before considering
+that satellite upgraded. Do not infer that the gateway package changed a
+remote CLI or re-onboard credentials as part of this step.
 
 ## Runtime overrides during an upgrade
 
