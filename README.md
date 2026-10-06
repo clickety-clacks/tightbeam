@@ -287,7 +287,8 @@ installation, verify and stage the release, select it at the authorized idle
 boundary, let the gateway migrate on first boot, verify the running build, and
 then decide when to relearn each kungfu with Main. That guide also covers
 moving an npm-installed systemd service to the selector, refreshing satellite
-CLIs, runtime overrides, conflict handling, and rollback limits.
+CLIs, removing the obsolete npm package and links, runtime overrides, conflict
+handling, and rollback limits.
 
 ### Cutting a release
 

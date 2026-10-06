@@ -7,9 +7,12 @@ first boot before it can answer `/version`, and a large database can take time.
 Do not interrupt that migration or assume selecting old executable bytes can
 reverse it.
 
-1. Identify the running build and every registered base directory. Take a
-   consistent backup of each base as described in [Take a backup first](#take-a-backup-first),
-   including the non-database configuration named in [BACKUP.md](BACKUP.md).
+1. Identify the running build and every registered base directory. Take and
+   verify a consistent backup of each base as described in
+   [Take a backup first](#take-a-backup-first), including the non-database
+   configuration named in [BACKUP.md](BACKUP.md). Check each copied database
+   with `PRAGMA quick_check` and confirm the backup files are readable before
+   selecting a new build.
 2. Verify the target release package, `SHA256SUMS`, and
    `release-provenance.json`. For the package commands, follow the
    [stage/select instructions](../README.md#from-a-release-package) below the
@@ -31,7 +34,11 @@ reverse it.
    with the selected 0.1.9 CLI by [re-assimilating that host](#refreshing-satellite-clis)
    with its recorded destination and settings. Verify the remote CLI version;
    upgrading the gateway does not replace a satellite CLI.
-6. Recommend refreshing each learned kungfu when the user chooses. Main can
+6. After the service and satellites pass, follow
+   [old-install cleanup](#remove-the-old-npm-installation). Remove only the
+   verified obsolete npm package and links, then check that the service,
+   operator shell, and satellites cannot load the stale CLI or gateway.
+7. Recommend refreshing each learned kungfu when the user chooses. Main can
    run the single relearn command and walk the user through any conflicts as
    described below. Relearning is a user choice after the upgrade, not a
    prerequisite to restart the gateway.
@@ -105,8 +112,8 @@ unit's executable path to
 `User`, `WorkingDirectory`, base directory, port, advertised URL, credentials,
 and other intended environment. For a systemd `ExecStart` drop-in, clear the
 old value with an empty `ExecStart=` before setting the selector path. Run
-`sudo systemctl daemon-reload`, inspect the
-effective unit again, then `sudo systemctl restart tightbeam.service` once.
+`sudo systemctl daemon-reload`, inspect the effective unit again, then
+`sudo systemctl restart tightbeam.service` once.
 Wait for migration to finish before requiring the new `/version`. The old npm
 files are not a verified rollback merely because they remain on disk. If the
 running artifact's origin is unknown, its source stamp alone is insufficient.
@@ -128,14 +135,45 @@ schema safe.
 For every registered satellite that received `<base_dir>/bin/tightbeam` from
 `assimilate`, record its SSH destination, host name, base directory, and harness
 selection. Once the new gateway is healthy and affected remote sessions are
-idle, run `/opt/tightbeam/current/tightbeam/bin/tightbeam assimilate <ssh-dest> --name
-<host-name> [--base-dir <path>] [--harness <names>]
---as-user <adminUserId>` with those same recorded values. Re-assimilation is
+idle, run the selected CLI with those same recorded values:
+
+```sh
+/opt/tightbeam/current/tightbeam/bin/tightbeam assimilate <ssh-dest> \
+  --name <host-name> [--base-dir <path>] [--harness <names>] \
+  --as-user <adminUserId>
+```
+
+Re-assimilation is
 idempotent: it refreshes the satellite CLI and adapters without creating a
 second host or carrying credentials. Check the command's actual result and the
 remote `<base_dir>/bin/tightbeam --version`; require 0.1.9 before considering
 that satellite upgraded. Do not infer that the gateway package changed a
 remote CLI or re-onboard credentials as part of this step.
+
+### Remove the old npm installation
+
+Do this only after the selected gateway, migrated database, and satellite CLIs
+have passed verification. First read the effective systemd `ExecStart` and
+`PATH`, `/opt/tightbeam/current`, the operator shell's
+`type -a tightbeam tightbeam-gateway`, and the exact old npm package name with
+`npm ls --global --prefix "$HOME/.local" --depth=0`. Inspect the `tightbeam` and
+`tightbeam-gateway` links under `~/.local/bin` and record their resolved targets.
+Require the unit to use `/opt/tightbeam/current/tightbeam/bin/tightbeam-gateway`
+and the selected CLI to report 0.1.9 before removing the old package.
+
+Uninstall only the recorded old Tightbeam npm package from its recorded prefix
+(`npm uninstall --global --prefix "$HOME/.local" <exact-old-package-name>`).
+Remove any remaining `~/.local/bin` Tightbeam links only after confirming that
+each resolves into that old package; keep unrelated npm packages and links.
+Require the recorded old package directory to be absent. If npm leaves it
+behind, identify its exact contents and references before removing only that
+obsolete directory. Recheck the unit, `type -a tightbeam tightbeam-gateway`, and each registered
+satellite's CLI version: no executable path used by the service or agents may
+resolve to the removed package, and the selected gateway and CLI must still
+answer as 0.1.9. Remove transient package-extraction directories and downloads
+after their hashes and release receipt are recorded. Retain the verified
+database/configuration backup and any deliberately retained selector rollback
+build; name those retained items to the user instead of treating them as trash.
 
 ## Runtime overrides during an upgrade
 
@@ -208,7 +246,8 @@ any incident remains open, explicitly acknowledge that it cannot honor the durab
 suppression and the automatic provider credential probe loop will return.
 
 After the upgraded gateway is running, recommend refreshing each learned
-kungfu when the user chooses. Ask Main to walk through the relearn; the single
+kungfu when the user chooses. Ask Main to load the
+`tightbeam-operating-manual` skill and walk through the relearn; the single
 `tightbeam identity relearn` command imports the 0.1.9 version of every learned
 bundle and merges it with the user's identity. If a conflict appears, Main
 should explain the 0.1.9 version's intent and the user's current version, then

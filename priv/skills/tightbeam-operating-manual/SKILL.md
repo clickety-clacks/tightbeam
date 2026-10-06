@@ -80,13 +80,16 @@ and `tightbeam identity status`. Explain that one `tightbeam identity relearn`
 imports the installed version of every learned kungfu and merges it with the
 user's identity. Run it when the user chooses; do not run a trial relearn.
 If it reports conflicts, inspect each named path and compare the installed
-0.1.9 bundle's text with the user's current text. For each conflict, tell the
-user why the two changes collide, what the 0.1.9 version intends, and what
-their version does. Let the user choose the resulting text. Resolve only the
-chosen conflicts and use `tightbeam identity relearn --resolve` after all are
-resolved; use `--abort` if the user chooses to keep the current identity for
-now. Read `identity status` afterward and report the actual live revision or
-remaining conflict. Never silently prefer the shipped or user version.
+0.1.9 bundle's text with the user's current text. Each reported path is under
+`<base_dir>/identity/`. For each conflict, tell the user why the two changes
+collide, what the 0.1.9 version intends, and what their version does. Let the
+user choose the resulting text. Write that choice to the conflicted path and
+stage it with `git -C <base_dir>/identity add -A -- <path>`; `identity edit`
+cannot resolve a merge in progress. Repeat for every conflicted path. Only
+when no unmerged path remains, run `tightbeam identity relearn --resolve` and
+read `identity status` to verify the live revision. If the user does not want
+to settle every conflict now, use `tightbeam identity relearn --abort`; a
+partial merge cannot be published. Never silently prefer either version.
 
 ## Repeated effort requests
 
