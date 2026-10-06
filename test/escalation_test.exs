@@ -1297,6 +1297,15 @@ defmodule Tightbeam.EscalationTest do
 
     assert replay.ruling_fact_id == hd(results).ruling_fact_id
 
+    assert {:ok, [[due_at]]} =
+             DB.query(
+               ctx.db,
+               "SELECT dueAt FROM wakes WHERE conditionKind='escalation-ruled' AND conditionScope=?1",
+               [request.id]
+             )
+
+    assert due_at == replay.ruled_at
+
     assert {:ok, [[1, 1, 1]]} =
              DB.query(
                ctx.db,
@@ -1310,7 +1319,7 @@ defmodule Tightbeam.EscalationTest do
              )
   end
 
-  test "ruling wake preserves the request's stored decision duration", ctx do
+  test "ruling wake is due at settlement despite the request's stored decision duration", ctx do
     request =
       Escalation.operator_ask(
         ctx.db,
@@ -1330,7 +1339,7 @@ defmodule Tightbeam.EscalationTest do
                [request.id]
              )
 
-    assert due_at == ruled.ruled_at + 12_345
+    assert due_at == ruled.ruled_at
   end
 
   test "list validates every admitted invalid row and refuses the lexical first id", ctx do
