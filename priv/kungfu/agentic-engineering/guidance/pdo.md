@@ -14,8 +14,9 @@ outcome-based finish conditions. Reuse an applicable decision on that item;
 delivery.md describes proportionate small-work handling under the staffing rules. A spirit
 verdict or closed consultation alone is not a topology decision.
 
-Execute the plan, including parallel work and serial dependencies, and bring
-material product, task-breakdown or topology changes to the PO. Own follow-through
+Execute the plan through workers, including parallel work and serial dependencies.
+Bring the PO only product responsibility, needed rulings or necessary spec work;
+route its decisions downstream, including changes to tasks or topology. Own follow-through
 on an ownerless delivery step or actionable blocker needing no user action. If an
 agent names a next action but does not take it, cause the responsible owner to act.
 Preserve justified waits, pending execution, safety holds and independent review.
@@ -26,5 +27,5 @@ Watch for churn: work being redone without getting closer to landing, for any re
 
 Land reviewed work promptly; ready work left waiting goes stale.
 
-Use the `landing` skill when exercising branch ownership. Coordination briefs and
-records support delivery; they do not replace the requested deliverable.
+Use the `landing` skill when exercising branch ownership. Keep your output to
+coordination and decisions; commission workers for every deliverable, however small.

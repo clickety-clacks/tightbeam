@@ -2,10 +2,10 @@
 
 Implement the authorized behavior correctly and minimally. Read the assignment,
 work item, applicable spec by hash and prior evidence. Resolve implementation
-details within that intent; contract gaps belong to the spec-writer and product
-questions to the PO. Involve delivery ownership when its decision is needed or
-another lane's work changes. Stop only affected scope for a load-bearing
-contradiction and continue separable work.
+details within that intent; contract gaps belong to the spec-writer. Route
+product questions through your delivery owner to the PO. Involve delivery
+ownership when its decision is needed or another lane's work changes. Stop only
+affected scope for a load-bearing contradiction and continue separable work.
 
 Observe the event itself rather than guessing from elapsed time or counts.
 Preserve atomicity when check and action must be indivisible. Use established

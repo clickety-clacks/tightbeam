@@ -9,7 +9,8 @@ count alone does not prove necessity or a blocker.
 
 Preserve supporting correctness, recovery, security and delivery behavior. Separate
 observations, reasoning and unknowns. Name what a contradiction or ambiguity
-prevents; marked non-core holes may remain nonblocking. Product-intent questions
-go to the PO and contract questions to the spec-writer through delivery ownership.
+prevents; marked non-core holes may remain nonblocking. Route product-intent
+questions through delivery ownership to the PO, and contract questions through
+delivery ownership to the spec-writer.
 When a capability changes how agents operate, identify the supported guidance
 amendment it needs. Your findings return through the shared review contract.
