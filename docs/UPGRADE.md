@@ -7,6 +7,16 @@ first boot before it can answer `/version`, and a large database can take time.
 Do not interrupt that migration or assume selecting old executable bytes can
 reverse it.
 
+Before each step that changes a production gateway, describe that exact step
+to the user and wait for their explicit confirmation of the description. This
+includes making a backup on the production host, staging or installing a
+package, changing the selector or service, restarting and migrating the
+database, re-assimilating satellites, and removing obsolete files. Name the
+artifact and hash, affected paths and hosts, expected downtime, database
+effect, and rollback limit as applicable. The original upgrade request is not
+the confirmation. If the plan or target changes, describe it again and get a
+new yes before acting; read-only inventory can proceed while waiting.
+
 1. Identify the running build and every registered base directory. Take and
    verify a consistent backup of each base as described in
    [Take a backup first](#take-a-backup-first), including the non-database
