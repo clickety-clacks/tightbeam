@@ -4017,6 +4017,39 @@ defmodule Tightbeam.Wakes do
   @spec cancel_in_txn(Txn.t(), map()) :: cancellation_result()
   def cancel_in_txn(%Txn{} = txn, command), do: cancel_in_txn(txn, command, &now/0)
 
+  @doc """
+  Derive the liveness outcome for a public requester cancellation in `txn`.
+
+  This is deliberately read-only and repeats the cancellation's pending-wake,
+  origin and primary-work checks. `cancel_in_txn/2` performs those checks again
+  before committing, so the trigger and the cancellation remain one transaction
+  and the central no-stranding validator remains authoritative.
+  """
+  @spec public_cancellation_outcome_in_txn(Txn.t(), map()) :: {:ok, map()} | :error
+  def public_cancellation_outcome_in_txn(%Txn{} = txn, command) when is_map(command) do
+    with {:ok, wake} <- pending_wake(txn, command),
+         :ok <- authorize_cancel(command, wake),
+         {:ok, primary} <- primary_work(txn, wake) do
+      {:ok, public_cancellation_outcome(txn, primary)}
+    else
+      _ -> :error
+    end
+  end
+
+  def public_cancellation_outcome_in_txn(%Txn{}, _command), do: :error
+
+  defp public_cancellation_outcome(txn, %{impact: "linked_work_open"} = primary) do
+    kind = if primary.kind == "assignment", do: :assignment, else: :work_item
+
+    case Supervision.liveness_trigger_in_txn(txn, {kind, primary.id}) do
+      {:ok, trigger} -> %{kind: "no_replacement", liveness_trigger: trigger}
+      :none -> %{kind: "no_replacement"}
+      {:error, _reason} -> %{kind: "no_replacement"}
+    end
+  end
+
+  defp public_cancellation_outcome(_txn, _primary), do: %{kind: "no_replacement"}
+
   @doc false
   @spec cancel_in_txn(Txn.t(), map(), (-> non_neg_integer())) :: cancellation_result()
   def cancel_in_txn(%Txn{} = txn, command, clock)

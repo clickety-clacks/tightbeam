@@ -6283,6 +6283,12 @@ defmodule Tightbeam.Gateway do
       }
 
       case DB.transaction(db, fn txn ->
+             command =
+               case Wakes.public_cancellation_outcome_in_txn(txn, command) do
+                 {:ok, outcome} -> Map.put(command, :outcome, outcome)
+                 :error -> command
+               end
+
              result = Wakes.cancel_in_txn(txn, command)
              # The central cancellation winner owns the state notice.
              Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
