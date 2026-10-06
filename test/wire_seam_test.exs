@@ -127,6 +127,172 @@ defmodule Tightbeam.Wire.SeamTest do
     assert Wakes.get(ctx.db, wrong_origin.wake_id).state == "pending"
   end
 
+  test "a holder cancels a dependency wake through the wire with liveness provenance", ctx do
+    holder = create_session(ctx.db, "g23-holder", "flynn")
+    resolver = create_session(ctx.db, "g23-resolver", "flynn")
+    verifier = create_session(ctx.db, "g23-verifier", "flynn")
+    stranger = create_session(ctx.db, "g23-stranger", "flynn")
+
+    Roles.create!(ctx.db, "g23-holder-role", "flynn", holder.session_key)
+    Roles.create!(ctx.db, "g23-stranger-role", "flynn", stranger.session_key)
+
+    rules_dir = Path.join(ctx.opts[:base_dir], "identity/rules")
+    File.mkdir_p!(rules_dir)
+
+    File.write!(Path.join(rules_dir, "verification.toml"), """
+    [[policy]]
+    name = "accountable-dependency-verifier"
+    purpose = "wait-verification-admission"
+    when = [
+      { fact = "verifier.open", op = "eq", value = true },
+      { fact = "verifier.holder_is_other", op = "eq", value = true },
+    ]
+    verification = { trigger = "registration", terminal = "bound-verdict-or-obligation-terminal", fallback = "wake-due-at" }
+    """)
+
+    Rules.load!(ctx.opts[:base_dir], Map.keys(ctx.opts[:handlers]))
+
+    for {session, subject} <- [
+          {holder, "g23 holder assignment"},
+          {resolver, "g23 resolver assignment"},
+          {verifier, "g23 verifier assignment"}
+        ] do
+      assert is_map(
+               ok!(
+                 dispatch_cli(ctx, holder.cli_token, %{
+                   verb: "assign",
+                   as: "g23-holder-role",
+                   sessionKey: session.session_key,
+                   params: %{subject: subject}
+                 })
+               )
+             )
+    end
+
+    holder_assignment = assignment_id(ctx.db, "g23 holder assignment")
+    resolver_assignment = assignment_id(ctx.db, "g23 resolver assignment")
+    verifier_assignment = assignment_id(ctx.db, "g23 verifier assignment")
+
+    assert {:ok, [["open"], ["open"], ["open"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state FROM assignments WHERE id IN (?1, ?2, ?3) ORDER BY id",
+               [holder_assignment, resolver_assignment, verifier_assignment]
+             )
+
+    predicate = %{
+      "conditions" => [
+        %{"fact" => "assignment.state", "op" => "eq", "value" => "completed"}
+      ],
+      "bindings" => %{"assignmentId" => resolver_assignment},
+      "resolverRef" => %{"kind" => "assignment", "id" => resolver_assignment},
+      "necessity" => "The named resolver owns the prerequisite output.",
+      "verificationRef" => %{"kind" => "assignment", "id" => verifier_assignment}
+    }
+
+    assert is_map(
+             ok!(
+               dispatch_cli(ctx, holder.cli_token, %{
+                 verb: "wake",
+                 as: "g23-holder-role",
+                 sessionKey: holder.session_key,
+                 params: %{
+                   prompt: "wait for the resolver",
+                   afterMs: 60_000,
+                   assignmentId: holder_assignment,
+                   predicate: predicate,
+                   nudge: false
+                 }
+               })
+             )
+           )
+
+    assert {:ok, [[wake_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND waitMode='dependency'",
+               [holder_assignment]
+             )
+
+    assert Wakes.get(ctx.db, wake_id).state == "pending"
+
+    # A different session principal cannot cancel the holder's origin, and the
+    # refusal must not consume the pending wake or write provenance.
+    assert ok!(
+             dispatch_cli(ctx, stranger.cli_token, %{
+               verb: "wake",
+               as: "g23-stranger-role",
+               sessionKey: holder.session_key,
+               params: %{"cancelWakeId" => wake_id}
+             })
+           ) == %{"canceled" => false}
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM wake_cancellations WHERE wakeId=?1", [wake_id])
+
+    assert Wakes.get(ctx.db, wake_id).state == "pending"
+
+    assert ok!(
+             dispatch_cli(ctx, holder.cli_token, %{
+               verb: "wake",
+               as: "g23-holder-role",
+               sessionKey: holder.session_key,
+               params: %{"cancelWakeId" => wake_id}
+             })
+           ) == %{"canceled" => true}
+
+    assert Wakes.get(ctx.db, wake_id).state == "canceled"
+    assert assignment_state(ctx.db, holder_assignment) == "open"
+    assert assignment_state(ctx.db, resolver_assignment) == "open"
+
+    assert {:ok,
+            [
+              [
+                "session",
+                holder_session_key,
+                "requester_withdrew",
+                "verb_call",
+                causal_source_id,
+                "no_replacement",
+                "assignment",
+                ^holder_assignment,
+                "linked_work_open",
+                "supervision_entitlement",
+                liveness_trigger_id,
+                1
+              ]
+            ]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT requesterKind, requesterId, reasonKind, causalSourceKind, causalSourceId,
+                      outcomeKind, primaryWorkKind, primaryWorkId, workImpactKind,
+                      livenessTriggerKind, livenessTriggerId, actionNeeded
+               FROM wake_cancellations WHERE wakeId=?1
+               """,
+               [wake_id]
+             )
+
+    assert holder_session_key == holder.session_key
+    assert is_binary(causal_source_id) and causal_source_id != ""
+    assert String.starts_with?(liveness_trigger_id, holder_assignment <> "#")
+
+    # Replay is a refusal, not a second cancellation or a second liveness action.
+    assert ok!(
+             dispatch_cli(ctx, holder.cli_token, %{
+               verb: "wake",
+               as: "g23-holder-role",
+               sessionKey: holder.session_key,
+               params: %{"cancelWakeId" => wake_id}
+             })
+           ) == %{"canceled" => false}
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM wake_cancellations WHERE wakeId=?1", [wake_id])
+
+    assert {:ok, []} = DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [wake_id])
+  end
+
   test "authenticated session-po-set dispatch returns and inspects the exact association", ctx do
     target = create_session(ctx.db, "po-target", "flynn")
     po = create_session(ctx.db, "po-reader", "flynn")
@@ -285,6 +451,13 @@ defmodule Tightbeam.Wire.SeamTest do
   defp assignment_id(db, subject) do
     case DB.query(db, "SELECT id FROM assignments WHERE subject = ?1", [subject]) do
       {:ok, [[id]]} -> id
+      {:ok, []} -> nil
+    end
+  end
+
+  defp assignment_state(db, assignment_id) do
+    case DB.query(db, "SELECT state FROM assignments WHERE id=?1", [assignment_id]) do
+      {:ok, [[state]]} -> state
       {:ok, []} -> nil
     end
   end
