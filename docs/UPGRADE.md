@@ -1,5 +1,33 @@
 # Upgrading a running instance
 
+## 0.1.8 to 0.1.9: follow this order
+
+Expect downtime at the service restart: the gateway migrates its database on
+first boot before it can answer `/version`, and a large database can take time.
+Do not interrupt that migration or assume selecting old executable bytes can
+reverse it.
+
+1. Identify the running build and every registered base directory. Take a
+   consistent backup of each base as described in [Take a backup first](#take-a-backup-first),
+   including the non-database configuration named in [BACKUP.md](BACKUP.md).
+2. Verify the target release package, `SHA256SUMS`, and
+   `release-provenance.json`. For the package commands, follow the
+   [stage/select instructions](../README.md#from-a-release-package) below the
+   README's release-package heading; `stage` leaves the running build selected.
+3. Review [runtime overrides](#runtime-overrides-during-an-upgrade). At the
+   authorized idle boundary, select the staged build and restart the service.
+   The gateway performs the supported database migration on first boot; do not
+   issue manual schema changes.
+4. Require `/version` to match the selected receipt's version and source SHA,
+   verify the migrated database and important existing records, and complete
+   the runtime checks below. If the gateway fails to boot or verification
+   fails, stop and use the retained package and backup only after checking
+   schema compatibility; an executable rollback does not undo migration.
+5. Recommend refreshing each learned kungfu when the user chooses. Main can
+   run the single relearn command and walk the user through any conflicts as
+   described below. Relearning is a user choice after the upgrade, not a
+   prerequisite to restart the gateway.
+
 ## 0.1.8 to 0.1.9 database rehearsal
 
 The canonical standalone E2E migration procedure is
@@ -64,6 +92,76 @@ boundary, then compare `GET /version`'s `version` with the selected receipt's
 after you confirm that it supports the current database schema. Selecting old
 executable bytes does not reverse a SQLite migration or make an incompatible
 schema safe.
+
+## Runtime overrides during an upgrade
+
+Review runtime overrides before replacing an existing installation. A persisted
+override can select an older executable instead of a new adapter's bundled
+runtime. Cleanup is conditional: keep intentional pins that the target supports.
+
+1. Inventory every host and harness before the upgrade. As an admin, run:
+
+   ```sh
+   tightbeam host-env-list --as-user <adminUserId>
+   ```
+
+   Record each persisted `CODEX_PATH` and `CLAUDE_CODE_EXECUTABLE` value,
+   including its host and harness. Separately inspect the gateway service's
+   environment: systemd unit, drop-ins and environment files, or launchd plist.
+   Record those values too; your interactive shell is not the service environment.
+   Keep the record private if other environment entries contain secrets.
+
+2. Record the current Tightbeam package/build, each effective harness executable
+   path, exact version and SHA-256, and each installed ACP adapter's exact package version.
+   Retain the prior runtime/package and service configuration for rollback.
+   Check the target's release notes and compatibility evidence for those exact
+   runtime/adapter combinations. Do not infer compatibility from a branch name
+   or assume an upgrade refreshes every adapter.
+
+3. Keep each intentional, supported pin. Remove an override only when you confirm
+   it was temporary, is obsolete for the target, and its replacement is compatible.
+   For a persisted host/harness overlay, use the matching command below; replace
+   the placeholders with the recorded host and admin user:
+
+   ```sh
+   tightbeam host-env-unset --host <host> --harness codex CODEX_PATH --as-user <adminUserId>
+   tightbeam host-env-unset --host <host> --harness claude CLAUDE_CODE_EXECUTABLE --as-user <adminUserId>
+   ```
+
+   These commands remove only the named overlay. They do not edit a service's
+   environment. Remove an obsolete service override separately from its recorded
+   configuration source, using that service manager's configuration reload procedure.
+   Removing one source can expose a value from another; inspect both.
+
+4. Wait until affected sessions finish their turns before activation. An overlay
+   change takes effect on the next adapter start; it does not replace a running
+   adapter. Stage and select the verified target package as described above, then
+   restart the installed service at the authorized idle boundary. Apply the same
+   idle boundary to affected remote adapters before their next start.
+   Do not treat a successful unset or an active service as proof of activation.
+
+5. After activation, verify the effective executable path, exact runtime
+   version and SHA-256 for each affected host/harness, plus the adapter package version.
+   Use the actual adapter launch/process information and the selected binary's
+   version output and file hash, not just the executable on your shell's PATH.
+   Package-managed vendor paths can move or contain different bytes after an
+   update; a saved path alone does not pin a runtime version.
+   Run one real model turn per affected host/harness. Verify the expected hook
+   fires and enforces its result, then resume an existing session and verify
+   its conversation continues. Record the results before calling the upgrade
+   successful. This checklist is not proof that an untested release works.
+
+If verification fails, stop the rollout. Restore each changed overlay to its
+recorded value with `tightbeam host-env-set --host <host> --harness <harness>
+'NAME=previous-value' --as-user <adminUserId>`. Restore the prior service
+environment and compatible runtime/adapter versions through the supported
+installation procedure. Use the same idle/restart boundary and repeat verification.
+Check the target's state-migration rollback restrictions before reverting a
+Tightbeam package; restoring an executable alone does not undo a database migration.
+Before rolling back a database that contains terminal credential incidents, use the
+new code to prove that every such incident recovered. If older code will run while
+any incident remains open, explicitly acknowledge that it cannot honor the durable
+suppression and the automatic provider credential probe loop will return.
 
 After the upgraded gateway is running, recommend refreshing each learned
 kungfu when the user chooses. Ask Main to walk through the relearn; the single
