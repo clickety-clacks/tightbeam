@@ -37,3 +37,6 @@ state. The PDO explicitly accepts delivery custody, then staffs spec-writers, co
 independent reviewers only as actual tasks require. Use orchestrators for delegated lanes
 or cross-product coordination when needed; do not create a standing role for every
 available archetype.
+
+Main creates the product owner and the PDO directly under itself as siblings; neither
+is parented under the other.
