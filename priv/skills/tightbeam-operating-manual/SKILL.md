@@ -73,6 +73,21 @@ source, published identity and a session's received revision are separate facts.
 Apply only within authority at safe boundaries, read back results and preserve
 refusals. Relearn/install is not implied by a prose edit.
 
+## Relearn after an upgrade
+
+When the user asks to refresh learned kungfu, read `tightbeam identity --help`
+and `tightbeam identity status`. Explain that one `tightbeam identity relearn`
+imports the installed version of every learned kungfu and merges it with the
+user's identity. Run it when the user chooses; do not run a trial relearn.
+If it reports conflicts, inspect each named path and compare the installed
+0.1.9 bundle's text with the user's current text. For each conflict, tell the
+user why the two changes collide, what the 0.1.9 version intends, and what
+their version does. Let the user choose the resulting text. Resolve only the
+chosen conflicts and use `tightbeam identity relearn --resolve` after all are
+resolved; use `--abort` if the user chooses to keep the current identity for
+now. Read `identity status` afterward and report the actual live revision or
+remaining conflict. Never silently prefer the shipped or user version.
+
 ## Repeated effort requests
 
 Compare the specific obligation's records, actual execution and current pending

@@ -65,6 +65,14 @@ after you confirm that it supports the current database schema. Selecting old
 executable bytes does not reverse a SQLite migration or make an incompatible
 schema safe.
 
+After the upgraded gateway is running, recommend refreshing each learned
+kungfu when the user chooses. Ask Main to walk through the relearn; the single
+`tightbeam identity relearn` command imports the 0.1.9 version of every learned
+bundle and merges it with the user's identity. If a conflict appears, Main
+should explain the 0.1.9 version's intent and the user's current version, then
+let the user choose how to resolve it or abort. Do not run a separate trial
+relearn or resolve conflicts without the user's choice.
+
 The 0.1.8 package carries its own exact migration chain: `model-identity-v1`
 (0.1.7) to `operator-decision-requests-v1`, then to `pi-harness-v1`. A database
 already at the intermediate stamp runs only the second step. When running that

@@ -57,6 +57,10 @@ roles or an order of setup. Follow the applicable bundle's org-building guidance
 user's request; keep the request until a named owner accepts it. If no learned bundle covers
 the work, keep the organization neutral and ask what practice the user wants to adopt.
 
+When the user asks to refresh learned kungfu after an upgrade, load the
+`tightbeam-operating-manual` skill and follow its relearn guidance. Let the
+user choose when to relearn and how to resolve any conflicts.
+
 After learning, the bundle's archetypes become available to new sessions with their elected
 guidance and skills; rules become active at once, and rails are projected through normal
 session provisioning. Existing sessions keep their served revision until explicitly
