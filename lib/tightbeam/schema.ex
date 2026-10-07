@@ -1570,6 +1570,7 @@ defmodule Tightbeam.Schema do
     # Build these additive access paths only after the existing migrations and
     # qualifications succeed, but before publishing a successful boot marker.
     :ok = ensure_lifecycle_runtime_indexes(db)
+    :ok = ensure_idle_cleanup_runtime_indexes(db)
 
     case DB.finish_schema(db) do
       :ok -> :ok
@@ -1621,6 +1622,65 @@ defmodule Tightbeam.Schema do
       {:error, error} ->
         raise ShapeError,
           message: "lifecycle runtime index migration failed: #{Exception.message(error)}"
+    end
+  end
+
+  # Idle cleanup examines per-session activity inside each sweep transaction.
+  # These paths make each activity source a keyed lookup instead of a table scan;
+  # the assignment work-item path also bounds the cleanup custody check.
+  defp ensure_idle_cleanup_runtime_indexes(db) do
+    indexes = [
+      {"idle_cleanup_assignments_activity",
+       "CREATE INDEX IF NOT EXISTS idle_cleanup_assignments_activity " <>
+         "ON assignments(holderKey, state, openedAt DESC, id DESC)"},
+      {"idle_cleanup_assignments_closed_activity",
+       "CREATE INDEX IF NOT EXISTS idle_cleanup_assignments_closed_activity " <>
+         "ON assignments(holderKey, state, closedAt DESC, id DESC)"},
+      {"idle_cleanup_assignments_work_item",
+       "CREATE INDEX IF NOT EXISTS idle_cleanup_assignments_work_item " <>
+         "ON assignments(workItemId, state, holderKey)"},
+      {"idle_cleanup_attests_activity",
+       "CREATE INDEX IF NOT EXISTS idle_cleanup_attests_activity " <>
+         "ON attests(bySession, ts DESC, id DESC)"},
+      {"idle_cleanup_wakes_created_activity",
+       "CREATE INDEX IF NOT EXISTS idle_cleanup_wakes_created_activity " <>
+         "ON wakes(creatorSessionKey, createdAt DESC, wakeId DESC)"},
+      {"idle_cleanup_wakes_fired_activity",
+       "CREATE INDEX IF NOT EXISTS idle_cleanup_wakes_fired_activity " <>
+         "ON wakes(sessionKey, firedAt DESC, wakeId DESC) WHERE firedAt IS NOT NULL"},
+      {"idle_cleanup_wakes_pending_session",
+       "CREATE INDEX IF NOT EXISTS idle_cleanup_wakes_pending_session " <>
+         "ON wakes(sessionKey, wakeId) WHERE state='pending' AND consumer='prompt'"},
+      {"idle_cleanup_wakes_delivery_history",
+       "CREATE INDEX IF NOT EXISTS idle_cleanup_wakes_delivery_history " <>
+         "ON wakes(obligationRef COLLATE NOCASE) " <>
+         "WHERE origin='process:tightbeam' AND state='fired' AND obligationRef IS NOT NULL"},
+      {"idle_cleanup_wakes_pending_group",
+       "CREATE INDEX IF NOT EXISTS idle_cleanup_wakes_pending_group " <>
+         "ON wakes(obligationRef COLLATE NOCASE) " <>
+         "WHERE origin='process:tightbeam' AND state='pending' AND consumer='prompt' AND obligationRef IS NOT NULL"}
+    ]
+
+    case DB.migration_transaction(db, :idle_cleanup_runtime_indexes, [], [], fn txn ->
+           Enum.each(indexes, fn {name, sql} ->
+             started = System.monotonic_time(:millisecond)
+             Logger.info("database migration idle-cleanup index #{name}: begin")
+             :ok = Txn.exec(txn, sql)
+             elapsed = System.monotonic_time(:millisecond) - started
+
+             Logger.info(
+               "database migration idle-cleanup index #{name}: finished elapsed_ms=#{elapsed}"
+             )
+           end)
+
+           :ok
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, error} ->
+        raise ShapeError,
+          message: "idle-cleanup runtime index migration failed: #{Exception.message(error)}"
     end
   end
 

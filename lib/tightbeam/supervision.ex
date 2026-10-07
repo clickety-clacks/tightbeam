@@ -135,6 +135,54 @@ defmodule Tightbeam.Supervision do
   @idle_cleanup_default_horizon_ms 14_400_000
   @idle_cleanup_default_priority 4
   @idle_cleanup_max_sql_integer 9_223_372_036_854_775_807
+  @idle_cleanup_activity_sql """
+  SELECT activityAt,activityRank,activityId FROM (
+    SELECT MAX(createdAt,updatedAt) AS activityAt,1 AS activityRank,
+           'session:' || sessionKey AS activityId
+    FROM sessions WHERE sessionKey=?1
+    UNION ALL
+    SELECT openedAt,2,'assignment:' || id || ':open'
+    FROM (
+      SELECT openedAt,id FROM assignments
+      WHERE holderKey=?1 AND state='open'
+      ORDER BY openedAt DESC,id DESC LIMIT 1
+    )
+    UNION ALL
+    SELECT closedAt,3,'assignment:' || id || ':close'
+    FROM (
+      SELECT closedAt,id FROM assignments
+      WHERE holderKey=?1 AND state='closed' AND closedAt IS NOT NULL
+      ORDER BY closedAt DESC,id DESC LIMIT 1
+    )
+    UNION ALL
+    SELECT ts,4,'attest:' || id
+    FROM (
+      SELECT ts,id FROM attests
+      WHERE bySession=?1 AND ts IS NOT NULL
+      ORDER BY ts DESC,id DESC LIMIT 1
+    )
+    UNION ALL
+    SELECT createdAt,5,'wake:' || wakeId || ':create'
+    FROM (
+      SELECT createdAt,wakeId FROM wakes
+      WHERE creatorSessionKey=?1 AND createdAt IS NOT NULL
+      ORDER BY createdAt DESC,wakeId DESC LIMIT 1
+    )
+    UNION ALL
+    SELECT firedAt,6,'wake:' || wakeId || ':fire'
+    FROM (
+      SELECT firedAt,wakeId FROM wakes
+      WHERE sessionKey=?1 AND firedAt IS NOT NULL
+      ORDER BY firedAt DESC,wakeId DESC LIMIT 1
+    )
+  )
+  WHERE activityAt IS NOT NULL
+  ORDER BY activityAt DESC,activityRank DESC,activityId DESC
+  LIMIT 1
+  """
+
+  @doc false
+  def idle_cleanup_activity_sql, do: @idle_cleanup_activity_sql
 
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
@@ -4014,31 +4062,7 @@ defmodule Tightbeam.Supervision do
   defp idle_cleanup_activity_in_txn(txn, session) do
     case Txn.q(
            txn,
-           """
-           SELECT activityAt,activityRank,activityId FROM (
-             SELECT MAX(createdAt,updatedAt) AS activityAt,1 AS activityRank,
-                    'session:' || sessionKey AS activityId
-             FROM sessions WHERE sessionKey=?1
-             UNION ALL
-             SELECT openedAt,2,'assignment:' || id || ':open'
-             FROM assignments WHERE holderKey=?1 AND state='open'
-             UNION ALL
-             SELECT closedAt,3,'assignment:' || id || ':close'
-             FROM assignments WHERE holderKey=?1 AND state='closed' AND closedAt IS NOT NULL
-             UNION ALL
-             SELECT ts,4,'attest:' || id
-             FROM attests WHERE bySession=?1 AND ts IS NOT NULL
-             UNION ALL
-             SELECT createdAt,5,'wake:' || wakeId || ':create'
-             FROM wakes WHERE creatorSessionKey=?1 AND createdAt IS NOT NULL
-             UNION ALL
-             SELECT firedAt,6,'wake:' || wakeId || ':fire'
-             FROM wakes WHERE sessionKey=?1 AND firedAt IS NOT NULL
-           )
-           WHERE activityAt IS NOT NULL
-           ORDER BY activityAt DESC,activityRank DESC,activityId DESC
-           LIMIT 1
-           """,
+           @idle_cleanup_activity_sql,
            [session.session_key]
          ) do
       [[at, rank, id]] -> {:ok, %{at: at, rank: rank, id: id}}
@@ -4051,8 +4075,21 @@ defmodule Tightbeam.Supervision do
            txn,
            """
            SELECT id,state,outcome,workItemId,openedAt,closedAt
-           FROM assignments
-           WHERE holderKey=?1
+           FROM (
+             SELECT * FROM (
+               SELECT id,state,outcome,workItemId,openedAt,closedAt
+               FROM assignments
+               WHERE holderKey=?1 AND state='open'
+               ORDER BY openedAt DESC,id DESC LIMIT 1
+             )
+             UNION ALL
+             SELECT * FROM (
+               SELECT id,state,outcome,workItemId,openedAt,closedAt
+               FROM assignments
+               WHERE holderKey=?1 AND state='closed' AND closedAt IS NOT NULL
+               ORDER BY closedAt DESC,id DESC LIMIT 1
+             )
+           )
            ORDER BY COALESCE(closedAt,openedAt) DESC,id DESC
            LIMIT 1
            """,
