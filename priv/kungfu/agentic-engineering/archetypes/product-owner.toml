@@ -1,6 +1,6 @@
 name = "product-owner"
-idle_cleanup = false
 owner_open_child_prod = true
+idle_cleanup = false
 skills = ["repository-retirement", "tightbeam-dispatching", "delivery-bootstrap", "model-release-intake"]
 
 [guidance]

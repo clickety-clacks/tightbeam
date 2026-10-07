@@ -1,6 +1,6 @@
 name = "pdo"
-idle_cleanup = false
 owner_open_child_prod = true
+idle_cleanup = false
 skills = ["repository-retirement", "human-communication", "landing", "delivery-bootstrap"]
 
 [defaults]
