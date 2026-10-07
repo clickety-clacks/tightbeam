@@ -3537,8 +3537,7 @@ defmodule Tightbeam.Assignments do
       base_dir: Application.get_env(:tightbeam, :base_dir, System.tmp_dir!()),
       db: db,
       port: Application.get_env(:tightbeam, :port, 11_373),
-      effort_checkins_enabled:
-        Application.get_env(:tightbeam, :effort_checkins_enabled, false),
+      effort_checkins_enabled: Application.get_env(:tightbeam, :effort_checkins_enabled, false),
       effort_checkin_horizon_ms:
         Application.get_env(:tightbeam, :effort_checkin_horizon_ms, 14_400_000)
     }

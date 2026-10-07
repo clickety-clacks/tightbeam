@@ -1875,6 +1875,7 @@ defmodule Tightbeam.SupervisionTest do
       })
 
     seq = terminal!(ctx.db, "holder")
+
     assert :owner_child_continuation =
              Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq)
 
@@ -1889,6 +1890,7 @@ defmodule Tightbeam.SupervisionTest do
 
   test "marked owner does not get a child prompt before the no-filing deadline", ctx do
     enable_owner_open_child_prod!(ctx)
+
     insert_entitlement!(
       ctx.db,
       "asg_1",
@@ -1949,6 +1951,7 @@ defmodule Tightbeam.SupervisionTest do
              )
 
     next_seq = terminal!(ctx.db, "holder")
+
     assert :owner_child_prompted =
              Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", next_seq)
 

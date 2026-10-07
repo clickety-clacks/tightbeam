@@ -1985,7 +1985,6 @@ defmodule Tightbeam.Supervision do
          rail_allowed?,
          evaluation_clock
        ) do
-
     outcome =
       transaction!(db, fn txn ->
         case Txn.q(
@@ -3520,13 +3519,13 @@ defmodule Tightbeam.Supervision do
     [artifact_max, attest_max, event_max, wake_max] = receipt_source_maxima_in_txn(txn)
 
     effects =
-        artifact_receipts_in_txn(
+      artifact_receipts_in_txn(
         txn,
         work_item_id,
         holder,
         artifact_cursor,
         artifact_max
-        ) ++
+      ) ++
         attest_receipts_in_txn(txn, assignment_id, generation, attest_cursor, attest_max) ++
         work_item_receipts_in_txn(txn, work_item_id, event_cursor, event_max)
 
