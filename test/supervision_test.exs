@@ -2030,12 +2030,6 @@ defmodule Tightbeam.SupervisionTest do
     assert {:match, %{id: "asg_1"}} =
              Supervision.prod_production_matches?(ctx.db, "holder", seq)
 
-    {:ok, _} =
-      DB.query(ctx.db, "UPDATE assignments SET state='open', openedAt=?2 WHERE id=?1", [
-        "asg_descendant_continuation",
-        System.system_time(:millisecond)
-      ])
-
     parent = child.session_key
 
     deepest =
