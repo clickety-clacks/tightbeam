@@ -732,31 +732,31 @@ defmodule Tightbeam.ArchetypesTest do
     end
   end
 
-  test "descendant activity credit is a default-off optional boolean" do
-    assert Archetypes.builtin_default().descendant_activity_credit == false
+  test "owner child prod marker is a default-off optional boolean" do
+    assert Archetypes.builtin_default().owner_open_child_prod == false
 
     for {body, expected} <- [
           {"name = \"quiet\"\n", false},
-          {"name = \"quiet\"\ndescendant_activity_credit = false\n", false},
-          {"name = \"quiet\"\ndescendant_activity_credit = true\n", true}
+          {"name = \"quiet\"\nowner_open_child_prod = false\n", false},
+          {"name = \"quiet\"\nowner_open_child_prod = true\n", true}
         ] do
-      assert Archetypes.parse_manifest!(body, "quiet.toml").descendant_activity_credit ==
+      assert Archetypes.parse_manifest!(body, "quiet.toml").owner_open_child_prod ==
                expected
     end
 
     for value <- ["\"false\"", "0", "[]"] do
       assert_raise ArgumentError,
-                   ~r/archetype descendant_activity_credit must be a boolean/,
+                   ~r/archetype owner_open_child_prod must be a boolean/,
                    fn ->
                      Archetypes.parse_manifest!(
-                       "name = \"quiet\"\ndescendant_activity_credit = #{value}\n",
+                       "name = \"quiet\"\nowner_open_child_prod = #{value}\n",
                        "quiet.toml"
                      )
                    end
     end
   end
 
-  test "shipped standing-seat manifests keep cleanup off and descendant credit on" do
+  test "shipped owner-role manifests opt into the child follow-up prod" do
     for name <- ["product-owner", "pdo", "orchestrator"] do
       path =
         Application.app_dir(
@@ -766,7 +766,7 @@ defmodule Tightbeam.ArchetypesTest do
 
       archetype = Archetypes.parse_manifest!(File.read!(path), path)
 
-      assert archetype.descendant_activity_credit == true
+      assert archetype.owner_open_child_prod == true
       if name in ["product-owner", "pdo"], do: assert(archetype.idle_cleanup == false)
     end
   end

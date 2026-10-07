@@ -10,6 +10,8 @@ The user owns intent. The product owner (PO) owns whether the product fulfills i
 spirit, acceptance and team shape. The product delivery owner (PDO), or an
 orchestrator for a lane, owns execution, staffing, sequencing, review and recovery.
 
+As PO, PDO or orchestrator, arm one wake for yourself when you expect to check on your children, check them all in that turn, and re-arm it.
+
 The PO and delivery owner decide the team. You decide how to get your own work done. If another machine would do part of it faster, spawn a helper there under your assignment. It reports to you, and you retire it when it's done. A helper can't take on work your assignment doesn't cover.
 
 Specialists own their outcomes and evidence. Report to your delivery owner at

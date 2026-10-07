@@ -91,6 +91,20 @@ defmodule Tightbeam.EffortCheckinTest do
     %{db: db, base_dir: base_dir, config: config, parent: parent, holder: holder, root: root}
   end
 
+  test "assignment opt-out retains the code and schema without arming a generation", ctx do
+    disabled = %{ctx | config: Map.put(ctx.config, :effort_checkins_enabled, false)}
+    assigned = assignment(disabled, "assign", {:user, "h1"}, "holder", %{subject: "no check-in"})
+
+    assert is_binary(assigned.id)
+
+    assert rows(ctx.db, "SELECT count(*) FROM effort_checkin_generations WHERE assignmentId=?1", [
+             assigned.id
+           ]) == [[0]]
+
+    assert {:ok, columns} = DB.query(ctx.db, "PRAGMA table_info(effort_checkin_generations)")
+    assert "assignmentId" in Enum.map(columns, &Enum.at(&1, 1))
+  end
+
   test "a new effort request follows corrected coordination while preserving its opener", ctx do
     session(ctx.db, "corrected-parent", "h2", Placement.local_host_name())
 
