@@ -377,7 +377,10 @@ defmodule Tightbeam.ArchetypesTest do
              MapSet.new(["repository-retirement", "delivery-bootstrap", "model-release-intake"])
 
     assert product_owner.guidance =~ "Retain content judgment"
-    assert product_owner.guidance =~ "same-item topology consultation light"
+
+    assert product_owner.guidance =~
+             "When creating a product work item, record its topology once in a `topology-decided` verdict on a same-item assignment."
+
     assert product_owner.guidance =~ "Review new specs and intent-sensitive results"
 
     assert coder.guidance =~ "Use your own clone in your workdir"
