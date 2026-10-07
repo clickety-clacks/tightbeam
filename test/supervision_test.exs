@@ -155,6 +155,26 @@ defmodule Tightbeam.SupervisionTest do
   end
 
   test "idle cleanup activity sources use keyed query-plan paths", ctx do
+    # Give SQLite enough representative cardinality and statistics to choose the
+    # selective creator-session index instead of scanning a nearly empty test DB.
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        WITH RECURSIVE wake_rows(n) AS (
+          SELECT 1
+          UNION ALL
+          SELECT n + 1 FROM wake_rows WHERE n < 512
+        )
+        INSERT INTO wakes (wakeId, sessionKey, origin, dueAt, createdAt, creatorSessionKey)
+        SELECT 'idle-cleanup-plan-' || n, 'unrelated-' || n, 'test', n, n,
+               'unrelated-' || n
+        FROM wake_rows
+        """
+      )
+
+    {:ok, _} = DB.query(ctx.db, "ANALYZE wakes")
+
     {:ok, rows} =
       DB.query(
         ctx.db,
