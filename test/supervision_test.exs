@@ -175,6 +175,20 @@ defmodule Tightbeam.SupervisionTest do
 
     {:ok, _} = DB.query(ctx.db, "ANALYZE wakes")
 
+    {:ok, wake_stats} =
+      DB.query(ctx.db, "SELECT idx, stat FROM sqlite_stat1 WHERE tbl='wakes'")
+
+    IO.puts("idle-cleanup wake index stats: " <> inspect(wake_stats))
+
+    {:ok, created_wake_plan} =
+      DB.query(
+        ctx.db,
+        "EXPLAIN QUERY PLAN SELECT wakeId,createdAt FROM wakes WHERE creatorSessionKey=?1 AND createdAt IS NOT NULL",
+        [ctx.supervisor.session_key]
+      )
+
+    IO.puts("idle-cleanup created-wake source plan: " <> inspect(created_wake_plan))
+
     {:ok, rows} =
       DB.query(
         ctx.db,
