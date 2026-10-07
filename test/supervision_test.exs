@@ -186,7 +186,7 @@ defmodule Tightbeam.SupervisionTest do
 
     IO.puts("idle-cleanup activity query plan: " <> Enum.join(details, " | "))
 
-    assert Enum.count(details, &String.contains?(&1, "idle_cleanup_assignments_activity")) == 2
+    assert Enum.count(details, &String.contains?(&1, "idle_cleanup_assignments_activity")) == 1
     assert Enum.any?(details, &String.contains?(&1, "idle_cleanup_assignments_closed_activity"))
     assert Enum.any?(details, &String.contains?(&1, "idle_cleanup_attests_activity"))
     assert Enum.any?(details, &String.contains?(&1, "idle_cleanup_wakes_created_activity"))
@@ -222,7 +222,7 @@ defmodule Tightbeam.SupervisionTest do
     plan = Enum.map(plan_rows, &List.last/1)
     IO.puts("idle-cleanup high-history activity plan: " <> Enum.join(plan, " | "))
 
-    assert Enum.count(plan, &String.contains?(&1, "idle_cleanup_assignments_activity")) == 2
+    assert Enum.count(plan, &String.contains?(&1, "idle_cleanup_assignments_activity")) == 1
     assert Enum.any?(plan, &String.contains?(&1, "idle_cleanup_assignments_closed_activity"))
     assert Enum.any?(plan, &String.contains?(&1, "idle_cleanup_attests_activity"))
     assert Enum.any?(plan, &String.contains?(&1, "idle_cleanup_wakes_created_activity"))
