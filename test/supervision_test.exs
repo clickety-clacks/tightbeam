@@ -164,7 +164,7 @@ defmodule Tightbeam.SupervisionTest do
         WITH RECURSIVE wake_rows(n) AS (
           SELECT 1
           UNION ALL
-          SELECT n + 1 FROM wake_rows WHERE n < 512
+          SELECT n + 1 FROM wake_rows WHERE n < 32768
         )
         INSERT INTO wakes (wakeId, sessionKey, origin, prompt, dueAt, createdAt, creatorSessionKey)
         SELECT 'idle-cleanup-plan-' || n, 'unrelated-' || n, 'test', 'plan fixture', n, n,
