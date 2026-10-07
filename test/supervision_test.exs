@@ -1989,6 +1989,8 @@ defmodule Tightbeam.SupervisionTest do
         child.session_key
       ])
 
+    ensure_work_item!(ctx.db, "wi_other")
+
     {:ok, _} =
       DB.query(
         ctx.db,
