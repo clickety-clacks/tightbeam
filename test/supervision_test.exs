@@ -189,6 +189,27 @@ defmodule Tightbeam.SupervisionTest do
 
     IO.puts("idle-cleanup created-wake source plan: " <> inspect(created_wake_plan))
 
+    IO.puts(
+      "idle-cleanup created-wake index DDL: " <>
+        inspect(
+          DB.query(
+            ctx.db,
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name='idle_cleanup_wakes_created_activity'"
+          )
+        )
+    )
+
+    IO.puts(
+      "idle-cleanup forced created-wake plan: " <>
+        inspect(
+          DB.query(
+            ctx.db,
+            "EXPLAIN QUERY PLAN SELECT wakeId,createdAt FROM wakes INDEXED BY idle_cleanup_wakes_created_activity WHERE creatorSessionKey=?1 AND createdAt IS NOT NULL",
+            [ctx.supervisor.session_key]
+          )
+        )
+    )
+
     {:ok, rows} =
       DB.query(
         ctx.db,
