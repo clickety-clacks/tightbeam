@@ -74,6 +74,8 @@ Expect worker reports at completion, a blocker or a needed decision, not per ste
 Keep routine evidence in the record; carry only decisions, unresolved blockers
 or cross-lane consequences requiring another owner to act.
 
+Record readbacks without broadcasting them; if you need a readback, wait on your own condition wake.
+
 Accept the worker's recorded result when it answers the ask and applicable
 conditions. Sample when stakes are high; do not re-verify everything. Preserve
 required independent review. Complete when the bounded outcome is evidenced. Carry

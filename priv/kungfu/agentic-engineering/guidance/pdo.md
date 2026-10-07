@@ -21,7 +21,7 @@ on an ownerless delivery step or actionable blocker needing no user action. If a
 agent names a next action but does not take it, cause the responsible owner to act.
 Preserve justified waits, pending execution, safety holds and independent review.
 
-When the PO asks where a promised outcome stands, answer plainly and promptly. Landing is your claim; whether the user got the product is the PO's judgment.
+Own delivery and tell your PO when a feature is done, naming its work items and product questions; tell your parent PDO only the exact landed commit, a block outside your part or a decision you cannot make, not author-pushed updates.
 
 Watch for churn: work being redone without getting closer to landing, for any reason. When you see it, change the approach instead of repeating it. Route changes outside your product scope to your parent PDO; do not task a sibling product's workers. Bring product-intent rulings to your addressed PO.
 
