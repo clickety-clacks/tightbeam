@@ -1816,8 +1816,22 @@ defmodule Tightbeam.SupervisionTest do
     insert_entitlement!(ctx.db, "asg_1", generation: 2, due_at: 0, interval: 60_000)
 
     worker = session(ctx.db, "unmarked-descendant", "holder")
-    insert_artifact!(ctx.db, "art_unmarked_owner", "holder", "wi_unmarked_descendant", System.system_time(:millisecond))
-    insert_artifact!(ctx.db, "art_unmarked_child", worker.session_key, "wi_unmarked_descendant", System.system_time(:millisecond))
+
+    insert_artifact!(
+      ctx.db,
+      "art_unmarked_owner",
+      "holder",
+      "wi_unmarked_descendant",
+      System.system_time(:millisecond)
+    )
+
+    insert_artifact!(
+      ctx.db,
+      "art_unmarked_child",
+      worker.session_key,
+      "wi_unmarked_descendant",
+      System.system_time(:millisecond)
+    )
 
     _name = start_liveness!(ctx, sweep_ms: 60_000)
 
@@ -1838,7 +1852,14 @@ defmodule Tightbeam.SupervisionTest do
     attach_work_item!(ctx.db, "asg_descendant", "wi_descendant_effects")
 
     now = System.system_time(:millisecond)
-    insert_artifact!(ctx.db, "art_descendant_current", worker.session_key, "wi_descendant_effects", now)
+
+    insert_artifact!(
+      ctx.db,
+      "art_descendant_current",
+      worker.session_key,
+      "wi_descendant_effects",
+      now
+    )
     insert_artifact!(ctx.db, "art_descendant_other_item", worker.session_key, "wi_other", now)
 
     insert_artifact!(
@@ -1895,6 +1916,7 @@ defmodule Tightbeam.SupervisionTest do
     attach_work_item!(ctx.db, "asg_descendant_turn", "wi_descendant_turn")
 
     now = System.system_time(:millisecond)
+
     wake =
       Wakes.schedule(ctx.db, %{
         session_key: worker.session_key,
@@ -1945,21 +1967,37 @@ defmodule Tightbeam.SupervisionTest do
     assert {:no_match, :descendant_moving} =
              Supervision.prod_production_matches?(ctx.db, "holder", seq)
 
-    {:ok, _} = DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [child.session_key])
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [
+        child.session_key
+      ])
 
     assert {:match, %{id: "asg_1"}} =
              Supervision.prod_production_matches?(ctx.db, "holder", seq)
 
-    {:ok, _} = DB.query(ctx.db, "UPDATE sessions SET state='active' WHERE sessionKey=?1", [child.session_key])
-    {:ok, _} = DB.query(ctx.db, "UPDATE assignments SET workItemId='wi_other' WHERE id='asg_descendant_continuation'")
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE sessions SET state='active' WHERE sessionKey=?1", [
+        child.session_key
+      ])
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE assignments SET workItemId='wi_other' WHERE id='asg_descendant_continuation'"
+      )
 
     assert {:match, %{id: "asg_1"}} =
              Supervision.prod_production_matches?(ctx.db, "holder", seq)
 
-    {:ok, _} = DB.query(ctx.db, "UPDATE assignments SET workItemId='wi_descendant_continuation', openedAt=?2 WHERE id=?1", [
-      "asg_descendant_continuation",
-      System.system_time(:millisecond) - 14_400_001
-    ])
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE assignments SET workItemId='wi_descendant_continuation', openedAt=?2 WHERE id=?1",
+        [
+          "asg_descendant_continuation",
+          System.system_time(:millisecond) - 14_400_001
+        ]
+      )
 
     assert {:match, %{id: "asg_1"}} =
              Supervision.prod_production_matches?(ctx.db, "holder", seq)
@@ -1981,10 +2019,11 @@ defmodule Tightbeam.SupervisionTest do
     assert {:match, %{id: "asg_1"}} =
              Supervision.prod_production_matches?(ctx.db, "holder", seq)
 
-    {:ok, _} = DB.query(ctx.db, "UPDATE assignments SET state='open', openedAt=?2 WHERE id=?1", [
-      "asg_descendant_continuation",
-      System.system_time(:millisecond)
-    ])
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE assignments SET state='open', openedAt=?2 WHERE id=?1", [
+        "asg_descendant_continuation",
+        System.system_time(:millisecond)
+      ])
 
     parent = child.session_key
 
@@ -1995,7 +2034,13 @@ defmodule Tightbeam.SupervisionTest do
         key
       end)
 
-    assignment(ctx.db, "asg_descendant_too_deep", deepest, "deep child work", System.system_time(:millisecond))
+    assignment(
+      ctx.db,
+      "asg_descendant_too_deep",
+      deepest,
+      "deep child work",
+      System.system_time(:millisecond)
+    )
     attach_work_item!(ctx.db, "asg_descendant_too_deep", "wi_descendant_continuation")
 
     assert {:match, %{id: "asg_1"}} =

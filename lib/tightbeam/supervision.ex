@@ -1508,13 +1508,13 @@ defmodule Tightbeam.Supervision do
           Enum.any?(candidates, fn [id, _subject, holder, prior, work_item_id, archetype] ->
             not is_nil(terminal_seq) and (is_nil(prior) or prior < terminal_seq) and
               not Wakes.covering_continuation_in_txn?(txn, id) and
-              descendant_continuation_in_txn?(
-                txn,
-                holder,
-                work_item_id,
-                archetype,
-                snapshot_at
-              )
+                descendant_continuation_in_txn?(
+                  txn,
+                  holder,
+                  work_item_id,
+                  archetype,
+                  snapshot_at
+                )
           end) ->
             {:no_match, :descendant_moving}
 
@@ -3657,7 +3657,14 @@ defmodule Tightbeam.Supervision do
           since,
           snapshot_at
         ) ++
-        descendant_turn_receipt_in_txn(txn, assignment_id, holder, work_item_id, since, snapshot_at)
+        descendant_turn_receipt_in_txn(
+          txn,
+          assignment_id,
+          holder,
+          work_item_id,
+          since,
+          snapshot_at
+        )
     else
       []
     end
