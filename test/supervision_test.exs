@@ -254,7 +254,10 @@ defmodule Tightbeam.SupervisionTest do
     pending_session_plan = Enum.map(pending_session_rows, &List.last/1)
     IO.puts("idle-cleanup pending-session plan: " <> Enum.join(pending_session_plan, " | "))
 
-    assert Enum.any?(pending_session_plan, &String.contains?(&1, "idle_cleanup_wakes_pending_session"))
+    assert Enum.any?(
+             pending_session_plan,
+             &String.contains?(&1, "idle_cleanup_wakes_pending_session")
+           )
 
     identity = first_wake.obligation_ref |> String.split("\n", parts: 2) |> hd()
     identity_parts = String.split(identity, "|")
@@ -296,7 +299,10 @@ defmodule Tightbeam.SupervisionTest do
     pending_group_plan = Enum.map(pending_group_rows, &List.last/1)
     IO.puts("idle-cleanup pending-group plan: " <> Enum.join(pending_group_plan, " | "))
 
-    assert Enum.any?(pending_group_plan, &String.contains?(&1, "idle_cleanup_wakes_pending_group"))
+    assert Enum.any?(
+             pending_group_plan,
+             &String.contains?(&1, "idle_cleanup_wakes_pending_group")
+           )
 
     repeated_sweep_us =
       for _ <- 1..3 do
