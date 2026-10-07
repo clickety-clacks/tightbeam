@@ -2156,7 +2156,7 @@ defmodule Tightbeam.Supervision do
 
   defp owner_child_followup(db, session_key, terminal_seq, assignment, evaluation_clock) do
     transaction!(db, fn txn ->
-      if owner_child_prod_active_in_txn?(txn, session_key) and
+      if owner_child_prod_active_in_txn?(txn, session_key, assignment.id) and
            owner_child_prod_due_in_txn?(txn, assignment.id, evaluation_clock) do
         case Txn.q(
                txn,
@@ -2269,11 +2269,11 @@ defmodule Tightbeam.Supervision do
     end
   end
 
-  defp owner_child_prod_active_in_txn?(txn, session_key) do
+  defp owner_child_prod_active_in_txn?(txn, session_key, assignment_id) do
     case Txn.q(txn, "SELECT archetype FROM sessions WHERE sessionKey=?1", [session_key]) do
       [[archetype]] ->
         owner_open_child_prod_enabled?(archetype) and
-          owner_has_open_child_assignment_in_txn?(txn, session_key)
+          owner_has_open_child_assignment_in_txn?(txn, session_key, assignment_id)
 
       [] ->
         false
@@ -2290,15 +2290,22 @@ defmodule Tightbeam.Supervision do
     ArgumentError -> false
   end
 
-  defp owner_has_open_child_assignment_in_txn?(txn, session_key) do
+  defp owner_has_open_child_assignment_in_txn?(txn, session_key, assignment_id) do
     Txn.q(
       txn,
       """
-      SELECT 1 FROM assignments
-      WHERE openedBySession=?1 AND holderKey<>?1 AND state='open'
+      SELECT 1
+      FROM assignments AS owner_assignment
+      JOIN assignments AS delegated_assignment
+        ON delegated_assignment.workItemId=owner_assignment.workItemId
+      WHERE owner_assignment.id=?1
+        AND owner_assignment.workItemId IS NOT NULL
+        AND delegated_assignment.openedBySession=?2
+        AND delegated_assignment.holderKey<>?2
+        AND delegated_assignment.state='open'
       LIMIT 1
       """,
-      [session_key]
+      [assignment_id, session_key]
     ) != []
   end
 

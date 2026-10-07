@@ -1878,6 +1878,7 @@ defmodule Tightbeam.SupervisionTest do
 
   test "marked owner with an own pending wake gets no child prod", ctx do
     enable_owner_open_child_prod!(ctx)
+    attach_work_item!(ctx.db, "asg_1", "wi_wake_owner")
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
     child = session(ctx.db, "wake-child", "holder")
 
@@ -1887,7 +1888,8 @@ defmodule Tightbeam.SupervisionTest do
       child.session_key,
       "child work",
       1,
-      "holder"
+      "holder",
+      "wi_wake_owner"
     )
 
     own_wake =
@@ -1916,6 +1918,7 @@ defmodule Tightbeam.SupervisionTest do
 
   test "marked owner does not get a child prompt before the no-filing deadline", ctx do
     enable_owner_open_child_prod!(ctx)
+    attach_work_item!(ctx.db, "asg_1", "wi_not_due_owner")
 
     insert_entitlement!(
       ctx.db,
@@ -1932,7 +1935,8 @@ defmodule Tightbeam.SupervisionTest do
       reused.session_key,
       "child work",
       1,
-      "holder"
+      "holder",
+      "wi_not_due_owner"
     )
 
     seq = terminal!(ctx.db, "holder")
@@ -1977,7 +1981,8 @@ defmodule Tightbeam.SupervisionTest do
       child.session_key,
       "child work",
       1,
-      "holder"
+      "holder",
+      "wi_periodic_owner"
     )
 
     liveness = start_liveness!(ctx, sweep_ms: 60_000)
@@ -2011,15 +2016,15 @@ defmodule Tightbeam.SupervisionTest do
              )
   end
 
-  test "marked owner gets one prod per missing-self-wake lapse across delegated items", ctx do
+  test "marked owner gets one prod per missing-self-wake lapse for a reused seat on its item",
+       ctx do
     enable_owner_open_child_prod!(ctx)
     attach_work_item!(ctx.db, "asg_1", "wi_owner_turn")
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
 
-    # A reused seat outside the owner's parent tree is still work the owner
-    # explicitly delegated on another work item.
+    # A reused seat outside the owner's parent tree still counts when the
+    # owner explicitly delegated it on the same work item.
     reused = session(ctx.db, "owner-reused-seat", ctx.main.session_key)
-    ensure_work_item!(ctx.db, "wi_owner_delegated")
 
     delegated_assignment!(
       ctx.db,
@@ -2028,7 +2033,7 @@ defmodule Tightbeam.SupervisionTest do
       "delegated item",
       1,
       "holder",
-      "wi_owner_delegated"
+      "wi_owner_turn"
     )
 
     first_seq = terminal!(ctx.db, "holder")
@@ -2092,6 +2097,35 @@ defmodule Tightbeam.SupervisionTest do
              Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", same_lapse_seq)
 
     assert {:ok, [[2]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM wakes WHERE wakeId LIKE 'w_owner_child_prod_%'"
+             )
+  end
+
+  test "marked owner ignores its delegated assignment on another work item", ctx do
+    enable_owner_open_child_prod!(ctx)
+    attach_work_item!(ctx.db, "asg_1", "wi_owner_current")
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
+
+    reused = session(ctx.db, "owner-other-item-seat", ctx.main.session_key)
+    ensure_work_item!(ctx.db, "wi_owner_other")
+
+    delegated_assignment!(
+      ctx.db,
+      "asg_owner_other_item",
+      reused.session_key,
+      "other item work",
+      1,
+      "holder",
+      "wi_owner_other"
+    )
+
+    seq = terminal!(ctx.db, "holder")
+
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq)
+
+    assert {:ok, [[0]]} =
              DB.query(
                ctx.db,
                "SELECT count(*) FROM wakes WHERE wakeId LIKE 'w_owner_child_prod_%'"
