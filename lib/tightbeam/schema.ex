@@ -1641,7 +1641,7 @@ defmodule Tightbeam.Schema do
          "ON attests(bySession, ts)"},
       {"idle_cleanup_wakes_created_activity",
        "CREATE INDEX IF NOT EXISTS idle_cleanup_wakes_created_activity " <>
-         "ON wakes(creatorSessionKey, createdAt) WHERE createdAt IS NOT NULL"},
+         "ON wakes(creatorSessionKey, createdAt)"},
       {"idle_cleanup_wakes_fired_activity",
        "CREATE INDEX IF NOT EXISTS idle_cleanup_wakes_fired_activity " <>
          "ON wakes(sessionKey, firedAt) WHERE firedAt IS NOT NULL"}

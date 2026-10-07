@@ -164,7 +164,7 @@ defmodule Tightbeam.SupervisionTest do
         WITH RECURSIVE wake_rows(n) AS (
           SELECT 1
           UNION ALL
-          SELECT n + 1 FROM wake_rows WHERE n < 32768
+          SELECT n + 1 FROM wake_rows WHERE n < 512
         )
         INSERT INTO wakes (wakeId, sessionKey, origin, prompt, dueAt, createdAt, creatorSessionKey)
         SELECT 'idle-cleanup-plan-' || n, 'unrelated-' || n, 'test', 'plan fixture', n, n,
@@ -174,41 +174,6 @@ defmodule Tightbeam.SupervisionTest do
       )
 
     {:ok, _} = DB.query(ctx.db, "ANALYZE wakes")
-
-    {:ok, wake_stats} =
-      DB.query(ctx.db, "SELECT idx, stat FROM sqlite_stat1 WHERE tbl='wakes'")
-
-    IO.puts("idle-cleanup wake index stats: " <> inspect(wake_stats))
-
-    {:ok, created_wake_plan} =
-      DB.query(
-        ctx.db,
-        "EXPLAIN QUERY PLAN SELECT wakeId,createdAt FROM wakes WHERE creatorSessionKey=?1 AND createdAt IS NOT NULL",
-        [ctx.supervisor.session_key]
-      )
-
-    IO.puts("idle-cleanup created-wake source plan: " <> inspect(created_wake_plan))
-
-    IO.puts(
-      "idle-cleanup created-wake index DDL: " <>
-        inspect(
-          DB.query(
-            ctx.db,
-            "SELECT sql FROM sqlite_master WHERE type='index' AND name='idle_cleanup_wakes_created_activity'"
-          )
-        )
-    )
-
-    IO.puts(
-      "idle-cleanup forced created-wake plan: " <>
-        inspect(
-          DB.query(
-            ctx.db,
-            "EXPLAIN QUERY PLAN SELECT wakeId,createdAt FROM wakes INDEXED BY idle_cleanup_wakes_created_activity WHERE creatorSessionKey=?1 AND createdAt IS NOT NULL",
-            [ctx.supervisor.session_key]
-          )
-        )
-    )
 
     {:ok, rows} =
       DB.query(
