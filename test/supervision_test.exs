@@ -1957,7 +1957,15 @@ defmodule Tightbeam.SupervisionTest do
     attach_work_item!(ctx.db, "asg_1", "wi_descendant_continuation")
     seq = terminal!(ctx.db, "holder")
     child = session(ctx.db, "descendant-continuation", "holder")
-    assignment(ctx.db, "asg_descendant_continuation", child.session_key, "child work", 1)
+
+    assignment(
+      ctx.db,
+      "asg_descendant_continuation",
+      child.session_key,
+      "child work",
+      System.system_time(:millisecond)
+    )
+
     attach_work_item!(ctx.db, "asg_descendant_continuation", "wi_descendant_continuation")
 
     assert {:match, %{id: "asg_1"}} =
