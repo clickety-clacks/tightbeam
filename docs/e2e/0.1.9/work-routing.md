@@ -34,8 +34,51 @@ Do not repeat their CRUD lifecycles in smoke.
 | <a id="landing-watcher"></a>One sentinel/PR lifecycle (U4) | Fresh / online, disposable repository | Follow [sentinel and PR](#sentinel-and-pr) with two eligible test owners and one wrong-scope control. | The same real PR yields the checks-completed fact and queue/landing settlement fact, both eligible owners wake from the process fact, and disabling stops the owned sentinel. Fallback expiry is never fact evidence. |
 | Orchestrator defaults | Fresh / records | After learning `agentic-engineering`, inspect its composed `identity/archetypes/orchestrator.toml` and the matching `identity status orchestrator` readback. | Defaults are harness `codex`, model `gpt-6-luna`, effort `max`. This checks shipped defaults without a provider placement; actual availability and configured-model forwarding remain distinct evidence. |
 
-0.1.9 has no command that turns on notice batching, so these runbooks do not
-check it.
+## Notice batching (Fresh / online)
+
+Run this as one hand-run journey with disposable work and sessions O (the
+ordinary sender), H (the recipient), R (the reviewer) and a human user. Do not
+write a helper script or edit queue rows. First, while H is idle, have H open a
+review assignment A to R on the area item. Then have O dispatch a bounded
+harmless task to H and wait until its turn is actually running. Record that
+turn's sequence and assignment attribution.
+
+While H's turn is running, send H ordinary prompts from more than one source:
+use `wake --session <H> --class blocker --prompt ...`,
+`wake --session <H> --class input-needed --prompt ...`, and a lower-priority
+`fyi` prompt. As the human user, also send an ordinary wake to H. Have R file
+`attest <A> --kind verdict --verdict reviewed-clean`. That ruling must create a
+source wake for A's opener H through the ordinary batchable route. Record each
+returned or read-back wake ID and its actual origin and class.
+
+Before H's running turn ends, cancel one still-pending source with
+`cancel-wake <wakeId>` as that wake's original caller, then send its correction
+as a new wake with a class that changes its position in the priority order.
+With `sqlite3 -readonly "$AREA_BASE/state.db"`, read `wakes.wakeId`,
+`sessionKey`, `origin`, `creatorSessionKey`, `assignmentId`, `class`,
+`deliveryRule` and `state`; `notice_delivery_policies.sourceWakeId`, `enabled`
+and `deadlineAt`; `notice_batch_members.sourceWakeId`, `batchId`,
+`publicationSeq` and `state`, joined to its source `wakes.class`;
+`notice_batches.batchId`, `state`,
+`releaseCause` and `deliveryWakeId`; and `turns.seq`, `sessionKey`, `status`
+and `wakeId`. The original source remains canceled and auditable; every
+surviving or corrected source remains its own pending wake with its own origin
+and ID; no recipient batch membership or individual delivery turn is committed
+while H is busy. H's running turn is unchanged.
+
+After H's turn finishes, wait for that ready lane to form and deliver its
+batch. Require one next turn for the batch carrier, containing all surviving
+sources—including the human message and R's ruling—in class priority order.
+The delivered envelope and member rows retain each source's origin, class and
+wake ID. No source gets a separate turn. Use the materialized member order as
+the assertion (the seed order is `algedonic`, `blocker`, `input-needed`,
+`status-query`, `fyi`, then other classes; equal classes retain publication order).
+
+After H becomes idle again, send one first ordinary wake and read its source,
+batch and turn rows. It starts one delivery without waiting for a timed
+batching window. Keep the separate algedonic human-channel route intact; it is
+not folded into this ordinary recipient batch. This journey is part of the
+core-flow smoke before the initial Gibson install.
 
 ## Queue correction
 

@@ -20,6 +20,7 @@ defmodule Tightbeam.EscalationDeliveryFixture do
     EffortCheckin,
     Escalation,
     Gateway,
+    NoticeBatcher,
     Org,
     Placement,
     Wakes,
@@ -202,8 +203,10 @@ defmodule Tightbeam.EscalationDeliveryFixture do
     assert wake.assignment_id == assignment.id
     drain!(ctx)
 
+    carrier = delivery_wake(ctx.db, wake)
+
     assert rows(ctx.db, "SELECT assignmentId, jobRef FROM turns WHERE wakeId = ?1", [
-             wake.wake_id
+             carrier.wake_id
            ]) == [[assignment.id, job_ref(ctx.db, assignment.id)]]
   end
 
@@ -283,10 +286,12 @@ defmodule Tightbeam.EscalationDeliveryFixture do
     name = :"delivery_boot_#{System.unique_integer([:positive])}"
     start_supervised!({Wakes, Keyword.put(opts, :name, name)}, id: name)
 
-    assert eventually(fn -> Wakes.get(restarted, wake.wake_id).state == "fired" end)
+    assert eventually(fn -> delivery_wake(restarted, wake).state == "fired" end)
 
-    assert rows(restarted, "SELECT wakeId FROM turns WHERE wakeId = ?1", [wake.wake_id]) == [
-             [wake.wake_id]
+    carrier = delivery_wake(restarted, wake)
+
+    assert rows(restarted, "SELECT wakeId FROM turns WHERE wakeId = ?1", [carrier.wake_id]) == [
+             [carrier.wake_id]
            ]
 
     assert count(restarted, "SELECT COUNT(*) FROM decision_requests WHERE id = ?1", [id]) == 1
@@ -323,8 +328,9 @@ defmodule Tightbeam.EscalationDeliveryFixture do
 
     # PASS-AFTER: a restart with a healthy delivery drains it on the ordinary tick.
     drain!(ctx)
-    assert Wakes.get(ctx.db, wake.wake_id).state == "fired"
-    assert count(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId = ?1", [wake.wake_id]) == 1
+    carrier = delivery_wake(ctx.db, wake)
+    assert carrier.state == "fired"
+    assert count(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId = ?1", [carrier.wake_id]) == 1
   end
 
   ## Proof 6 — exactly one initial delivery, and the dedupe backstop
@@ -338,8 +344,9 @@ defmodule Tightbeam.EscalationDeliveryFixture do
 
     drain!(ctx)
 
-    assert Wakes.get(ctx.db, wake.wake_id).state == "fired"
-    assert count(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId = ?1", [wake.wake_id]) == 1
+    carrier = delivery_wake(ctx.db, wake)
+    assert carrier.state == "fired"
+    assert count(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId = ?1", [carrier.wake_id]) == 1
 
     assert count(ctx.db, "SELECT COUNT(*) FROM messages WHERE sessionKey = ?1", [owner_session]) ==
              1
@@ -358,33 +365,54 @@ defmodule Tightbeam.EscalationDeliveryFixture do
     assert [first, synthetic] = notification_wakes(ctx.db)
     assert first.wake_id == wake.wake_id
 
+    [synthetic_carrier_id] = NoticeBatcher.recover(ctx.db, synthetic.due_at)
+    synthetic_carrier = delivery_wake(ctx.db, synthetic)
+    assert synthetic_carrier.wake_id == synthetic_carrier_id
+
     assert :appended =
-             Gateway.deliver_prompt(synthetic.session_key, synthetic.origin, synthetic.prompt,
+             Gateway.deliver_prompt(
+               synthetic_carrier.session_key,
+               synthetic_carrier.origin,
+               synthetic_carrier.prompt,
                db: ctx.db,
-               wake_id: synthetic.wake_id,
-               sender: synthetic.origin
+               wake_id: synthetic_carrier.wake_id,
+               sender: synthetic_carrier.origin
              )
 
     assert :duplicate =
-             Gateway.deliver_prompt(synthetic.session_key, synthetic.origin, synthetic.prompt,
+             Gateway.deliver_prompt(
+               synthetic_carrier.session_key,
+               synthetic_carrier.origin,
+               synthetic_carrier.prompt,
                db: ctx.db,
-               wake_id: synthetic.wake_id,
-               sender: synthetic.origin
+               wake_id: synthetic_carrier.wake_id,
+               sender: synthetic_carrier.origin
              )
 
     assert Wakes.get(ctx.db, synthetic.wake_id).state == "pending"
-    assert count(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId = ?1", [synthetic.wake_id]) == 1
+
+    assert count(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId = ?1", [
+             synthetic_carrier.wake_id
+           ]) == 1
 
     drain!(ctx)
 
-    assert count(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId = ?1", [synthetic.wake_id]) == 1
+    synthetic_carrier = delivery_wake(ctx.db, synthetic)
+    assert synthetic_carrier.state == "fired"
 
-    assert count(ctx.db, "SELECT COUNT(*) FROM messages WHERE sessionKey = ?1 AND content = ?2", [
-             owner_session,
-             "[from #{@origin}]\n\n" <> synthetic.prompt
+    assert count(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId = ?1", [
+             synthetic_carrier.wake_id
            ]) == 1
 
-    assert Wakes.get(ctx.db, synthetic.wake_id).state == "fired"
+    assert [[content]] =
+             rows(
+               ctx.db,
+               "SELECT content FROM messages WHERE sessionKey = ?1 ORDER BY rowid DESC LIMIT 1",
+               [owner_session]
+             )
+
+    assert content =~ synthetic.wake_id
+    assert content =~ synthetic.prompt
   end
 
   ## Proof 7 — replay and conflict are silent
@@ -492,8 +520,9 @@ defmodule Tightbeam.EscalationDeliveryFixture do
     drain!(%{ctx | config: config})
 
     for wake <- [effort_wake, statute_wake] do
-      assert Wakes.get(ctx.db, wake.wake_id).state == "fired"
-      key = wake.session_key
+      carrier = delivery_wake(ctx.db, wake)
+      assert carrier.state == "fired"
+      key = carrier.session_key
       assert_received {:published, :injected_registry, ^key}
       assert_received {:lane_nudged, :injected_lanes, ^key}
     end
@@ -659,14 +688,16 @@ defmodule Tightbeam.EscalationDeliveryFixture do
     drain!(ctx)
 
     for wake <- [effort_wake, statute_wake] do
-      assert Wakes.get(ctx.db, wake.wake_id).state == "fired"
+      carrier = delivery_wake(ctx.db, wake)
+      assert carrier.state == "fired"
 
-      assert rows(ctx.db, "SELECT sessionKey FROM turns WHERE wakeId = ?1", [wake.wake_id]) == [
-               [wake.session_key]
-             ]
+      assert rows(ctx.db, "SELECT sessionKey FROM turns WHERE wakeId = ?1", [carrier.wake_id]) ==
+               [
+                 [carrier.session_key]
+               ]
 
       assert count(ctx.db, "SELECT COUNT(*) FROM messages WHERE sessionKey = ?1", [
-               wake.session_key
+               carrier.session_key
              ]) >= 1
     end
 
@@ -891,8 +922,21 @@ defmodule Tightbeam.EscalationDeliveryFixture do
 
   defp notification_wakes(db) do
     db
-    |> rows("SELECT wakeId FROM wakes WHERE targetGate = 0 ORDER BY rowid")
+    |> rows("SELECT wakeId FROM wakes WHERE targetGate = 0 AND digest=0 ORDER BY rowid")
     |> Enum.map(fn [wake_id] -> Wakes.get(db, wake_id) end)
+  end
+
+  defp delivery_wake(db, source) do
+    case NoticeBatcher.source_refs(db, source.wake_id) do
+      [%{batch_id: batch_id}] ->
+        case NoticeBatcher.batch(db, batch_id) do
+          %{delivery_wake_id: wake_id} when is_binary(wake_id) -> Wakes.get(db, wake_id)
+          _ -> source
+        end
+
+      _ ->
+        source
+    end
   end
 
   defp wakes_child(config) do

@@ -1,5 +1,5 @@
 import ExUnit.Assertions
-alias Tightbeam.{DB, Gateway, Model, Org, Wakes}
+alias Tightbeam.{DB, Gateway, Model, NoticeBatcher, Org, Wakes}
 
 Application.put_env(:tightbeam, :effort_checkins_enabled, true)
 
@@ -101,10 +101,15 @@ Tightbeam.GuardGatewayFixture.run!(fn %{db: db, config: config} ->
     # The next ordinary tick delivers it through the gateway's own configured
     # prompt closure — real ConnRegistry, real lane nudge, one turn.
     assert :ok = Wakes.fire_due(scheduler)
-    assert Wakes.get(db, notify_id).state == "fired"
+    assert Wakes.get(db, notify_id).state == "pending"
+
+    assert [%{delivery_wake_id: notify_carrier, batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(db, notify_id)
+
+    assert Wakes.get(db, notify_carrier).state == "fired"
 
     assert {:ok, [[1]]} =
-             DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId = ?1", [notify_id])
+             DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId = ?1", [notify_carrier])
 
     assert_receive {:ensure_lane, ^expecter}, 1_000
 

@@ -10,6 +10,7 @@ defmodule Tightbeam.EscalationTest do
     Escalation,
     EventLog,
     Gateway,
+    NoticeBatcher,
     Org,
     Wakes
   }
@@ -121,7 +122,7 @@ defmodule Tightbeam.EscalationTest do
              Escalation.escalate(ctx.db, call, statute(), Map.put(escalation_ctx(), :dr_id, id))
   end
 
-  test "owner delivery is one durable wake armed with the open transaction", ctx do
+  test "owner delivery is one durable source notice armed with the open transaction", ctx do
     parent = self()
     call = call(ctx.raiser, %{assignment_id: "a-delivery", kind: "completion"})
     owner_session = Org.personal_session_key("flynn")
@@ -154,7 +155,12 @@ defmodule Tightbeam.EscalationTest do
 
     :ok = Wakes.fire_due(deliverer)
     assert_receive {:delivered, ^owner_session, ^id, "open"}
-    assert Wakes.get(ctx.db, wake.wake_id).state == "fired"
+    assert Wakes.get(ctx.db, wake.wake_id).state == "pending"
+
+    assert [%{delivery_wake_id: carrier_id, batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(ctx.db, wake.wake_id)
+
+    assert Wakes.get(ctx.db, carrier_id).state == "fired"
 
     # A decision-pending replay arms nothing and redelivers nothing.
     assert {:decision_pending, ^id} =
@@ -1969,7 +1975,12 @@ defmodule Tightbeam.EscalationTest do
       })
 
     assert :ok = Wakes.fire_due(ctx.scheduler)
-    assert %{state: "fired", condition_kind: nil} = Wakes.get(ctx.db, manual.wake_id)
+    assert %{state: "pending", condition_kind: nil} = Wakes.get(ctx.db, manual.wake_id)
+
+    assert [%{delivery_wake_id: manual_carrier, batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(ctx.db, manual.wake_id)
+
+    assert Wakes.get(ctx.db, manual_carrier).state == "fired"
 
     Escalation.operator_rule(
       ctx.db,
@@ -1985,7 +1996,7 @@ defmodule Tightbeam.EscalationTest do
              )
 
     refute automatic_id == manual.wake_id
-    assert Wakes.get(ctx.db, manual.wake_id).state == "fired"
+    assert Wakes.get(ctx.db, manual.wake_id).state == "pending"
   end
 
   test "list integrity refusal covers missing and duplicate fact event and wake relations", ctx do
@@ -2518,7 +2529,9 @@ defmodule Tightbeam.EscalationTest do
 
     assert [wake] = response_wakes
     assert wake.target_gate == 0
-    assert wake.class == nil
+    assert wake.class == "fyi"
+    assert wake.class_election == "classifier"
+    assert wake.delivery_rule == "notice-batching-v1 r2"
     assert wake.prompt =~ "behind a flag"
 
     user_request =
@@ -2618,7 +2631,9 @@ defmodule Tightbeam.EscalationTest do
 
     assert [wake] = response_wakes
     assert wake.target_gate == 0
-    assert wake.class == nil
+    assert wake.class == "fyi"
+    assert wake.class_election == "classifier"
+    assert wake.delivery_rule == "notice-batching-v1 r2"
     assert wake.prompt =~ returned.return_reason
   end
 
@@ -3119,10 +3134,13 @@ defmodule Tightbeam.EscalationTest do
     Escalation.get(ctx.db, rule_call(id, "allow"), id, owner_user_id: "flynn")
   end
 
-  # Decision notification wakes are the only ungated (targetGate = 0) wakes.
+  # Read the durable notification sources, excluding their batch carriers.
   defp notification_wakes(ctx) do
     {:ok, rows} =
-      DB.query(ctx.db, "SELECT wakeId FROM wakes WHERE targetGate = 0 ORDER BY rowid")
+      DB.query(
+        ctx.db,
+        "SELECT wakeId FROM wakes WHERE targetGate = 0 AND digest = 0 ORDER BY rowid"
+      )
 
     Enum.map(rows, fn [wake_id] -> Wakes.get(ctx.db, wake_id) end)
   end

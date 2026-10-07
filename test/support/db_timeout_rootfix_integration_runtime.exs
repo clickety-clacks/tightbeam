@@ -9,7 +9,7 @@ Application.put_env(:tightbeam, :autostart, false)
 Application.put_env(:tightbeam, :base_dir, base)
 Application.put_env(:ex_unit, :assert_receive_timeout, 1_000)
 
-alias Tightbeam.{Boot, DB, Ledger, Model, ModelCatalog, Org, SessionLane, Wakes}
+alias Tightbeam.{Boot, DB, Ledger, Model, ModelCatalog, NoticeBatcher, Org, SessionLane, Wakes}
 import ExUnit.Assertions
 
 {:ok, db} =
@@ -145,12 +145,16 @@ assert {:ok, inventories} = catalog_before_release
 assert is_map(inventories)
 assert :ignore = boot_before_release
 
-assert_receive {:wake_delivered, ^wake_id}
+assert_receive {:wake_delivered, carrier_wake_id}
+
+assert [%{delivery_wake_id: ^carrier_wake_id, batch_state: "delivered"}] =
+         NoticeBatcher.source_refs(db, wake_id)
 
 send(publication_pid, :release_publication)
 assert {:ok, :published} = Task.await(publication)
 
-assert Wakes.get(db, wake.wake_id).state == "fired"
+assert Wakes.get(db, wake.wake_id).state == "pending"
+assert Wakes.get(db, carrier_wake_id).state == "fired"
 assert {:ok, [["delivered"]]} = DB.query(db, "SELECT status FROM turns WHERE seq=?1", [lane_seq])
 assert Process.alive?(catalog)
 assert Process.alive?(scheduler)

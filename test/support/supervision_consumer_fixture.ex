@@ -413,7 +413,9 @@ defmodule Tightbeam.SupervisionConsumerFixture do
     assert {:prodded, 1} =
              Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", terminal!(ctx.db, "holder"))
 
-    assert [%{wake_id: wake_id}] = Wakes.list_pending(ctx.db)
+    assert [%{wake_id: wake_id}] =
+             Wakes.list_pending(ctx.db)
+             |> Enum.filter(&(&1.origin == "process:tightbeam"))
 
     newer = %{payload | "revision" => "two", "attentionRequestId" => "request-two"}
 

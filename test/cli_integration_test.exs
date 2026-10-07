@@ -1580,6 +1580,8 @@ defmodule Tightbeam.CliIntegrationTest do
 
     assert denied_again_status != 0
     assert denied_again =~ "completion-requires-results-artifact"
+    assert_receive {:wake_delivered, attest_batch}, 5_000
+    assert attest_batch.prompt =~ "Attest "
     assert_receive {:wake_delivered, artifact_wake}, 5_000
     assert artifact_wake.prompt =~ "no artifact is recorded on its work item"
 

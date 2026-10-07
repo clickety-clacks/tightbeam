@@ -49,6 +49,100 @@ defmodule Tightbeam.AssignmentsTest do
     %{db: db, holder: holder, other: other, handlers: handlers}
   end
 
+  describe "attest notices to assignment openers" do
+    test "session-opened cards retain one batchable source row for each new attest", ctx do
+      session(ctx.db, "notice-parent", "flynn")
+
+      assignment =
+        handle(ctx, "assign", assign_call({:session, "notice-parent"}, "attest notice"))
+
+      assignment_id = assignment.id
+
+      result = handle(ctx, "attest", attest_call({:session, "holder"}, assignment_id, "progress"))
+      assert result.attest.assignmentId == assignment_id
+
+      assert {:ok,
+              [
+                [
+                  wake_id,
+                  "notice-parent",
+                  "agent:holder",
+                  "holder",
+                  prompt,
+                  ^assignment_id,
+                  "fyi",
+                  "classifier",
+                  "notice-batching-v1 r2",
+                  due_at
+                ]
+              ]} =
+               DB.query(
+                 ctx.db,
+                 """
+                 SELECT wakeId, sessionKey, origin, creatorSessionKey, prompt, assignmentId,
+                        class, classElection, deliveryRule, dueAt
+                 FROM wakes WHERE sessionKey='notice-parent' AND assignmentId=?1
+                 """,
+                 [assignment.id]
+               )
+
+      assert prompt =~ result.attest.id
+      assert prompt =~ "progress"
+      assert due_at == result.attest.ts
+
+      assert {:ok, [[1, due_at]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT enabled, deadlineAt FROM notice_delivery_policies WHERE sourceWakeId=?1",
+                 [wake_id]
+               )
+
+      assert {:ok, [[0]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM notice_batch_members WHERE sourceWakeId=?1",
+                 [
+                   wake_id
+                 ]
+               )
+    end
+
+    test "user-opened cards route a ruling notice to the opener's Main session", ctx do
+      personal = Org.personal_session_key("flynn")
+      session(ctx.db, personal, "flynn")
+      assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "user-opened card"))
+
+      result =
+        attest_call({:session, "other-session"}, assignment.id, "verdict")
+        |> put_in([:params, :verdict_kind], "reviewed")
+        |> then(&handle(ctx, "attest", &1))
+
+      assert result.attest.bySession == "other-session"
+
+      assert {:ok, [[wake_id, ^personal, "agent:other-session", "other-session", prompt]]} =
+               DB.query(
+                 ctx.db,
+                 """
+                 SELECT wakeId, sessionKey, origin, creatorSessionKey, prompt
+                 FROM wakes WHERE sessionKey=?1 AND assignmentId=?2
+                 """,
+                 [personal, assignment.id]
+               )
+
+      assert prompt =~ result.attest.id
+      assert prompt =~ "verdict"
+
+      assert {:ok, [[1]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT enabled FROM notice_delivery_policies WHERE sourceWakeId=?1",
+                 [
+                   wake_id
+                 ]
+               )
+    end
+  end
+
   describe "terminal notification atomic admission" do
     for {kind, outcome} <- [{"completion", "completed"}] do
       @terminal_kind kind
@@ -590,7 +684,7 @@ defmodule Tightbeam.AssignmentsTest do
                DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [wake.wake_id])
     end
 
-    test "ordinary unmarked skipped wakes keep their existing scheduler semantics", ctx do
+    test "ordinary sender-scheduled wakes keep their existing scheduler semantics", ctx do
       session(ctx.db, "notice-parent", "flynn")
 
       ordinary =
@@ -598,7 +692,8 @@ defmodule Tightbeam.AssignmentsTest do
           session_key: "notice-parent",
           origin: "process:tightbeam",
           prompt: "ordinary",
-          due_at: 0
+          due_at: 0,
+          sender_scheduled: true
         })
 
       {:ok, _} =
@@ -5995,7 +6090,8 @@ defmodule Tightbeam.AssignmentsTest do
       session_key: "other-session",
       origin: "process:tightbeam",
       prompt: prompt,
-      due_at: 0
+      due_at: 0,
+      sender_scheduled: true
     })
   end
 

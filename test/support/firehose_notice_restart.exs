@@ -21,7 +21,7 @@ try do
       Org.apply_notice_batching_lane_policy_in_txn(
         txn,
         %{session_key: "agent:recipient", target_role: nil},
-        true,
+        false,
         "notice-batching-test-policy:cold-restart",
         "agent:test-policy",
         "acceptance-fixture",
@@ -29,7 +29,7 @@ try do
       )
     end)
 
-  assert policy.enabled
+  refute policy.enabled
 
   source =
     Wakes.schedule(db, %{
@@ -41,7 +41,10 @@ try do
       class: "fyi"
     })
 
-  [%{batch_id: batch_id}] = NoticeBatcher.source_refs(db, source.wake_id)
+  assert NoticeBatcher.source_refs(db, source.wake_id) == []
+
+  policy_ref = NoticeBatcher.policy_ref(source.wake_id)
+  %{batch_id: batch_id} = NoticeBatcher.enqueue_or_recover(db, source.wake_id, policy_ref)
 
   assert {:ok, :sealed} =
            DB.transaction(db, fn txn ->

@@ -8,6 +8,7 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
     Devices,
     Gateway,
     Model,
+    NoticeBatcher,
     Org,
     Projection,
     Roles,
@@ -85,20 +86,22 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
     assert %{provider: :anthropic, credential_kind: "subscription", status: "onboarded"} =
              finish(onboard, "anthropic", lease_id, "subscription")
 
-    assert {:ok, [[wake_id]]} = DB.query(ctx.db, "SELECT wakeId FROM wakes")
-    assert_main_wake!(ctx, wake_id, "anthropic")
+    assert {:ok, [[wake_id]]} = DB.query(ctx.db, "SELECT wakeId FROM wakes WHERE digest=0")
+    carrier_id = assert_main_wake!(ctx, wake_id, "anthropic")
 
-    delivered = "[from process:tightbeam]\n\n" <> recovery_prompt("anthropic")
-
-    assert [%{session_key: @main, sender: "process:tightbeam", content: ^delivered}] =
+    assert [%{session_key: @main, sender: "process:tightbeam", content: content}] =
              Projection.list_after(ctx.db, @main, nil, 10)
 
-    assert {:ok, [[@main, ^delivered, ^wake_id, "queued"]]} =
+    assert content =~ recovery_prompt("anthropic")
+
+    assert {:ok, [[@main, carrier_content, ^carrier_id, "queued"]]} =
              DB.query(
                ctx.db,
                "SELECT sessionKey, prompt, wakeId, status FROM turns WHERE wakeId=?1",
-               [wake_id]
+               [carrier_id]
              )
+
+    assert carrier_content =~ recovery_prompt("anthropic")
 
     assert_received {:lane_started, @main}
 
@@ -133,8 +136,8 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
     assert %{provider: :openai, credential_kind: "subscription", status: "onboarded"} =
              onboard.(call)
 
-    assert {:ok, [[wake_id]]} = DB.query(ctx.db, "SELECT wakeId FROM wakes")
-    assert_main_wake!(ctx, wake_id, "openai", operator_session)
+    assert {:ok, [[wake_id]]} = DB.query(ctx.db, "SELECT wakeId FROM wakes WHERE digest=0")
+    _carrier_id = assert_main_wake!(ctx, wake_id, "openai", operator_session)
     assert_received {:lane_started, @main}
     refute_received {:lane_started, ^other_main}
   end
@@ -375,19 +378,25 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
              creator_session_key: ^creator_session_key,
              prompt: prompt,
              consumer: "prompt",
-             state: "fired",
+             state: "pending",
              condition_kind: nil,
              work_item_id: nil,
              assignment_id: nil,
              target_gate: 1,
              reresolve: nil,
-             class: nil,
-             class_election: nil,
-             delivery_rule: nil
+             class: "fyi",
+             class_election: "classifier",
+             delivery_rule: "notice-batching-v1 r2"
            } = Wakes.get(ctx.db, wake_id)
 
     assert prompt == recovery_prompt(provider)
     assert prompt =~ @prompt_prefix
+
+    assert [%{delivery_wake_id: carrier_id, batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(ctx.db, wake_id)
+
+    assert Wakes.get(ctx.db, carrier_id).state == "fired"
+    carrier_id
   end
 
   defp recovery_prompt(provider) do
