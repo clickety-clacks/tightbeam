@@ -2181,26 +2181,33 @@ defmodule Tightbeam.Supervision do
                   owner_self_wake_pending_in_txn?(txn, session_key) ->
                     :owner_child_continuation
 
-                  owner_child_prod_wake_exists_in_txn?(txn, assignment.id) ->
-                    :owner_child_prompted
-
                   true ->
-                    [[work_item_id]] =
-                      Txn.q(txn, "SELECT workItemId FROM assignments WHERE id=?1", [assignment.id])
+                    case owner_child_prod_lapse_in_txn(txn, session_key) do
+                      :already_prompted ->
+                        :owner_child_prompted
 
-                    Wakes.schedule_in_txn(txn, %{
-                      wake_id: owner_child_prod_wake_id(assignment.id),
-                      session_key: session_key,
-                      target_role: nil,
-                      origin: "process:tightbeam",
-                      prompt: @owner_child_prod_prompt,
-                      due_at: evaluation_clock,
-                      creator_session_key: nil,
-                      work_item_id: work_item_id,
-                      assignment_id: assignment.id
-                    })
+                      {:eligible, lapse_key} ->
+                        wake_id = owner_child_prod_wake_id(session_key, lapse_key)
 
-                    :owner_child_prompted
+                        [[work_item_id]] =
+                          Txn.q(txn, "SELECT workItemId FROM assignments WHERE id=?1", [
+                            assignment.id
+                          ])
+
+                        Wakes.schedule_in_txn(txn, %{
+                          wake_id: wake_id,
+                          session_key: session_key,
+                          target_role: nil,
+                          origin: "process:tightbeam",
+                          prompt: @owner_child_prod_prompt,
+                          due_at: evaluation_clock,
+                          creator_session_key: nil,
+                          work_item_id: work_item_id,
+                          assignment_id: assignment.id
+                        })
+
+                        :owner_child_prompted
+                    end
                 end
             end
         end
@@ -2208,6 +2215,36 @@ defmodule Tightbeam.Supervision do
         :not_applicable
       end
     end)
+  end
+
+  defp owner_child_prod_lapse_in_txn(txn, session_key) do
+    latest_prompt =
+      Txn.q(
+        txn,
+        "SELECT rowid FROM wakes WHERE sessionKey=?1 AND origin='process:tightbeam' AND prompt=?2 ORDER BY rowid DESC LIMIT 1",
+        [session_key, @owner_child_prod_prompt]
+      )
+
+    latest_self_wake =
+      Txn.q(
+        txn,
+        "SELECT rowid,wakeId FROM wakes WHERE sessionKey=?1 AND creatorSessionKey=?1 AND consumer='prompt' ORDER BY rowid DESC LIMIT 1",
+        [session_key]
+      )
+
+    case {latest_prompt, latest_self_wake} do
+      {[], []} ->
+        {:eligible, "initial"}
+
+      {[], [[_rowid, wake_id]]} ->
+        {:eligible, wake_id}
+
+      {[[prompt_rowid]], [[self_rowid, wake_id]]} when self_rowid > prompt_rowid ->
+        {:eligible, wake_id}
+
+      _ ->
+        :already_prompted
+    end
   end
 
   defp owner_child_prod_due_in_txn?(txn, assignment_id, evaluation_clock) do
@@ -2254,16 +2291,11 @@ defmodule Tightbeam.Supervision do
   end
 
   defp owner_has_open_child_assignment_in_txn?(txn, session_key) do
-    current_parent = Org.current_parent_sql("child")
-
     Txn.q(
       txn,
       """
-      SELECT 1
-      FROM sessions child
-      JOIN assignments assignment ON assignment.holderKey=child.sessionKey
-      WHERE child.sessionKey<>?1 AND #{current_parent}=?1
-        AND assignment.state='open'
+      SELECT 1 FROM assignments
+      WHERE openedBySession=?1 AND holderKey<>?1 AND state='open'
       LIMIT 1
       """,
       [session_key]
@@ -2283,15 +2315,12 @@ defmodule Tightbeam.Supervision do
     ) != []
   end
 
-  defp owner_child_prod_wake_exists_in_txn?(txn, assignment_id) do
-    Txn.q(txn, "SELECT 1 FROM wakes WHERE wakeId=?1 LIMIT 1", [
-      owner_child_prod_wake_id(assignment_id)
-    ]) != []
-  end
+  defp owner_child_prod_wake_id(session_key, lapse_key) do
+    digest =
+      :crypto.hash(:sha256, "owner-open-child-prod-v2\0" <> session_key <> "\0" <> lapse_key)
+      |> Base.encode16(case: :lower)
 
-  defp owner_child_prod_wake_id(assignment_id) do
-    digest = :crypto.hash(:sha256, "owner-open-child-prod-v1\0" <> assignment_id)
-    "w_owner_child_prod_" <> Base.encode16(digest, case: :lower)
+    "w_owner_child_prod_" <> digest
   end
 
   defp write_terminal_watermark_in_txn(_txn, _session_key, nil, _assignment_id), do: :ok

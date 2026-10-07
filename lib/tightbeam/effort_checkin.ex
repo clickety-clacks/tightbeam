@@ -467,36 +467,44 @@ defmodule Tightbeam.EffortCheckin do
 
   @spec probe(DB.server(), map(), Wakes.wake()) :: :ok
   def probe(db, config, wake) do
-    snapshot = generation_for_wake(db, wake.wake_id)
+    if enabled?(config) do
+      snapshot = generation_for_wake(db, wake.wake_id)
 
-    # Only an ARMED generation is observed: an observation consumes the stamp it
-    # probed and lays the next one, so replaying a probe against an already
-    # probed generation would destroy the stamp its row still points at.
-    inspection =
-      case snapshot do
-        %{state: "armed"} = generation ->
-          observe(
-            config,
-            %{session_key: generation.holder_key, host: generation.host},
-            generation.root,
-            generation.baseline
-          )
+      # Only an ARMED generation is observed: an observation consumes the stamp it
+      # probed and lays the next one, so replaying a probe against an already
+      # probed generation would destroy the stamp its row still points at.
+      inspection =
+        case snapshot do
+          %{state: "armed"} = generation ->
+            observe(
+              config,
+              %{session_key: generation.holder_key, host: generation.host},
+              generation.root,
+              generation.baseline
+            )
 
-        _ ->
-          {:error, "generation unavailable"}
+          _ ->
+            {:error, "generation unavailable"}
+        end
+
+      case DB.transaction(db, fn txn -> probe_in_txn(txn, config, wake, inspection) end) do
+        {:ok, _request} -> :ok
+        {:error, error} -> raise error
       end
-
-    case DB.transaction(db, fn txn -> probe_in_txn(txn, config, wake, inspection) end) do
-      {:ok, _request} -> :ok
-      {:error, error} -> raise error
+    else
+      :ok
     end
   end
 
   @spec deadline(DB.server(), map(), Wakes.wake()) :: :ok
   def deadline(db, config, wake) do
-    case DB.transaction(db, fn txn -> deadline_in_txn(txn, config, wake) end) do
-      {:ok, _request} -> :ok
-      {:error, error} -> raise error
+    if enabled?(config) do
+      case DB.transaction(db, fn txn -> deadline_in_txn(txn, config, wake) end) do
+        {:ok, _request} -> :ok
+        {:error, error} -> raise error
+      end
+    else
+      :ok
     end
   end
 
@@ -522,6 +530,9 @@ defmodule Tightbeam.EffortCheckin do
 
       not authorized?(call.principal, request) ->
         error("not_authorized", "current expecter required")
+
+      not enabled?(config) ->
+        error("disabled", "effort check-ins are disabled")
 
       request.status == "ruled" and request.decision == action and request.ruled_by == actor ->
         {:ok, :ok} =
