@@ -1108,9 +1108,9 @@ defmodule Tightbeam.SupervisionTest do
           WHERE sessionKey GLOB 'idle-sweep-child-[0-9][0-9][0-9]'
         )
         INSERT INTO assignments
-          (id,subject,holderKey,openedByUser,openedAt,state,outcome,closedAt,closedByUser)
+          (id,subject,holderKey,openedByUser,openedAt)
         SELECT 'idle-sweep-assignment-' || c.sessionKey || '-' || printf('%03d',h.n),
-               'historical cleanup fixture',c.sessionKey,'flynn',h.n,'closed','revoked',h.n,'flynn'
+               'historical cleanup fixture',c.sessionKey,'flynn',h.n
         FROM children c CROSS JOIN history h
         """
       )
@@ -1130,8 +1130,19 @@ defmodule Tightbeam.SupervisionTest do
         INSERT INTO attests (id,assignmentId,kind,bySession,ts)
         SELECT 'idle-sweep-attest-' || c.sessionKey || '-' || printf('%03d',h.n),
                'idle-sweep-assignment-' || c.sessionKey || '-' || printf('%03d',h.n),
-               'progress',c.sessionKey,h.n
+               'completion',c.sessionKey,h.n
         FROM children c CROSS JOIN history h
+        """
+      )
+
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        UPDATE assignments
+        SET state='closed',outcome='completed',closedAt=openedAt,closedByUser='flynn',
+            closingAttestId='idle-sweep-attest-' || holderKey || '-' || printf('%03d',openedAt)
+        WHERE id GLOB 'idle-sweep-assignment-idle-sweep-child-[0-9][0-9][0-9]-*'
         """
       )
 
