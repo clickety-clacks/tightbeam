@@ -3797,6 +3797,10 @@ defmodule Tightbeam.Supervision do
       %{descendant_activity_credit: true} -> true
       _ -> false
     end
+  rescue
+    # Direct prod evaluations can run before served archetypes are loaded.
+    # This is an opt-in feature, so absent configuration stays disabled.
+    ArgumentError -> false
   end
 
   defp descendant_sessions_cte do

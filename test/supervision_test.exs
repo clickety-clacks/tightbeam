@@ -1811,6 +1811,18 @@ defmodule Tightbeam.SupervisionTest do
     assert Wakes.list_pending(ctx.db) == []
   end
 
+  test "prod evaluation keeps descendant credit off before archetypes load", ctx do
+    seq = terminal!(ctx.db, "holder")
+    assert true = :persistent_term.erase(Tightbeam.Archetypes)
+
+    try do
+      assert {:match, %{id: "asg_1"}} =
+               Supervision.prod_production_matches?(ctx.db, "holder", seq)
+    after
+      Archetypes.load!(ctx.base)
+    end
+  end
+
   test "unmarked owner archetype keeps its own effect and ignores descendant artifacts", ctx do
     attach_work_item!(ctx.db, "asg_1", "wi_unmarked_descendant")
     insert_entitlement!(ctx.db, "asg_1", generation: 2, due_at: 0, interval: 60_000)
