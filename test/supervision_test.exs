@@ -166,8 +166,8 @@ defmodule Tightbeam.SupervisionTest do
           UNION ALL
           SELECT n + 1 FROM wake_rows WHERE n < 512
         )
-        INSERT INTO wakes (wakeId, sessionKey, origin, dueAt, createdAt, creatorSessionKey)
-        SELECT 'idle-cleanup-plan-' || n, 'unrelated-' || n, 'test', n, n,
+        INSERT INTO wakes (wakeId, sessionKey, origin, prompt, dueAt, createdAt, creatorSessionKey)
+        SELECT 'idle-cleanup-plan-' || n, 'unrelated-' || n, 'test', 'plan fixture', n, n,
                'unrelated-' || n
         FROM wake_rows
         """
