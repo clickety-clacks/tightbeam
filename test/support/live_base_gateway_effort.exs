@@ -1,6 +1,8 @@
 import ExUnit.Assertions
 alias Tightbeam.{DB, Gateway, Model, Org, Wakes}
 
+Application.put_env(:tightbeam, :effort_checkins_enabled, true)
+
 defmodule GuardEffortDoorbell do
   use GenServer
   def init(parent), do: {:ok, parent}

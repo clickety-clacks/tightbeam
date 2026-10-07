@@ -8,6 +8,7 @@ fresh = phase == "first"
 {:ok, _} = Application.ensure_all_started(:exqlite)
 {:ok, _} = Application.ensure_all_started(:crypto)
 Application.put_env(:tightbeam, :autostart, false)
+Application.put_env(:tightbeam, :effort_checkins_enabled, true)
 Application.put_env(:tightbeam, :base_dir, base)
 Application.put_env(:tightbeam, :fixture_harness, true)
 Application.put_env(:tightbeam, :local_host_name, "testhost")
