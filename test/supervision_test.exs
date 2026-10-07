@@ -154,6 +154,27 @@ defmodule Tightbeam.SupervisionTest do
     refute "pendingTarget" in names
   end
 
+  test "idle cleanup activity sources use keyed query-plan paths", ctx do
+    {:ok, rows} =
+      DB.query(
+        ctx.db,
+        "EXPLAIN QUERY PLAN " <> Supervision.idle_cleanup_activity_sql(),
+        [ctx.supervisor.session_key]
+      )
+
+    details = Enum.map(rows, &List.last/1)
+
+    IO.puts("idle-cleanup activity query plan: " <> Enum.join(details, " | "))
+
+    assert Enum.count(details, &String.contains?(&1, "idle_cleanup_assignments_activity")) == 2
+    assert Enum.any?(details, &String.contains?(&1, "idle_cleanup_attests_activity"))
+    assert Enum.any?(details, &String.contains?(&1, "idle_cleanup_wakes_created_activity"))
+    assert Enum.any?(details, &String.contains?(&1, "idle_cleanup_wakes_fired_activity"))
+    refute Enum.any?(details, &String.contains?(&1, "SCAN assignments"))
+    refute Enum.any?(details, &String.contains?(&1, "SCAN attests"))
+    refute Enum.any?(details, &String.contains?(&1, "SCAN wakes"))
+  end
+
   test "the prod-shape gate authorizes assignment prodding and rejects other consumers", ctx do
     assert {:ok, :acted} =
              DB.transaction(ctx.db, fn txn ->

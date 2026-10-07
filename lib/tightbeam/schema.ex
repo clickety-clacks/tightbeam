@@ -1570,6 +1570,7 @@ defmodule Tightbeam.Schema do
     # Build these additive access paths only after the existing migrations and
     # qualifications succeed, but before publishing a successful boot marker.
     :ok = ensure_lifecycle_runtime_indexes(db)
+    :ok = ensure_idle_cleanup_runtime_indexes(db)
 
     case DB.finish_schema(db) do
       :ok -> :ok
@@ -1621,6 +1622,50 @@ defmodule Tightbeam.Schema do
       {:error, error} ->
         raise ShapeError,
           message: "lifecycle runtime index migration failed: #{Exception.message(error)}"
+    end
+  end
+
+  # Idle cleanup examines per-session activity inside one startup transaction.
+  # These paths make each activity source a keyed lookup instead of a table scan;
+  # the assignment work-item path also bounds the cleanup custody check.
+  defp ensure_idle_cleanup_runtime_indexes(db) do
+    indexes = [
+      {"idle_cleanup_assignments_activity",
+       "CREATE INDEX IF NOT EXISTS idle_cleanup_assignments_activity " <>
+         "ON assignments(holderKey, state, openedAt, closedAt)"},
+      {"idle_cleanup_assignments_work_item",
+       "CREATE INDEX IF NOT EXISTS idle_cleanup_assignments_work_item " <>
+         "ON assignments(workItemId, state, holderKey)"},
+      {"idle_cleanup_attests_activity",
+       "CREATE INDEX IF NOT EXISTS idle_cleanup_attests_activity " <>
+         "ON attests(bySession, ts)"},
+      {"idle_cleanup_wakes_created_activity",
+       "CREATE INDEX IF NOT EXISTS idle_cleanup_wakes_created_activity " <>
+         "ON wakes(creatorSessionKey, createdAt) WHERE createdAt IS NOT NULL"},
+      {"idle_cleanup_wakes_fired_activity",
+       "CREATE INDEX IF NOT EXISTS idle_cleanup_wakes_fired_activity " <>
+         "ON wakes(sessionKey, firedAt) WHERE firedAt IS NOT NULL"}
+    ]
+
+    case DB.migration_transaction(db, :idle_cleanup_runtime_indexes, [], [], fn txn ->
+           Enum.each(indexes, fn {name, sql} ->
+             started = System.monotonic_time(:millisecond)
+             Logger.info("database migration idle-cleanup index #{name}: begin")
+             :ok = Txn.exec(txn, sql)
+             elapsed = System.monotonic_time(:millisecond) - started
+
+             Logger.info(
+               "database migration idle-cleanup index #{name}: finished elapsed_ms=#{elapsed}"
+             )
+           end)
+
+           :ok
+         end) do
+      {:ok, :ok} -> :ok
+
+      {:error, error} ->
+        raise ShapeError,
+          message: "idle-cleanup runtime index migration failed: #{Exception.message(error)}"
     end
   end
 
