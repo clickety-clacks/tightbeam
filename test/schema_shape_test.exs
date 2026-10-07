@@ -2066,6 +2066,8 @@ defmodule Tightbeam.SchemaShapeTest do
         DROP INDEX condition_facts_owner_match;
         ALTER TABLE condition_facts DROP COLUMN ownerUserId;
         ALTER TABLE wakes DROP COLUMN ownerUserId;
+        DROP INDEX IF EXISTS idle_cleanup_wakes_delivery_history;
+        DROP INDEX IF EXISTS idle_cleanup_wakes_pending_group;
         ALTER TABLE wakes DROP COLUMN obligationRef;
         ALTER TABLE wakes DROP COLUMN waitMode;
         ALTER TABLE wakes DROP COLUMN predicate;
