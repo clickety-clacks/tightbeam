@@ -38,5 +38,6 @@ independent reviewers only as actual tasks require. Use orchestrators for delega
 or cross-product coordination when needed; do not create a standing role for every
 available archetype.
 
-Main creates the product owner and the PDO directly under itself as siblings; neither
-is parented under the other.
+For a top-level product, Main creates the PO and PDO directly under itself as
+siblings. For a sub-product, the parent PDO creates the sub-product PO and PDO
+as siblings under itself; neither is parented under the other.
