@@ -142,19 +142,39 @@ defmodule Tightbeam.Supervision do
     FROM sessions WHERE sessionKey=?1
     UNION ALL
     SELECT openedAt,2,'assignment:' || id || ':open'
-    FROM assignments WHERE holderKey=?1 AND state='open'
+    FROM (
+      SELECT openedAt,id FROM assignments
+      WHERE holderKey=?1 AND state='open'
+      ORDER BY openedAt DESC,id DESC LIMIT 1
+    )
     UNION ALL
     SELECT closedAt,3,'assignment:' || id || ':close'
-    FROM assignments WHERE holderKey=?1 AND state='closed' AND closedAt IS NOT NULL
+    FROM (
+      SELECT closedAt,id FROM assignments
+      WHERE holderKey=?1 AND state='closed' AND closedAt IS NOT NULL
+      ORDER BY closedAt DESC,id DESC LIMIT 1
+    )
     UNION ALL
     SELECT ts,4,'attest:' || id
-    FROM attests WHERE bySession=?1 AND ts IS NOT NULL
+    FROM (
+      SELECT ts,id FROM attests
+      WHERE bySession=?1 AND ts IS NOT NULL
+      ORDER BY ts DESC,id DESC LIMIT 1
+    )
     UNION ALL
     SELECT createdAt,5,'wake:' || wakeId || ':create'
-    FROM wakes WHERE creatorSessionKey=?1 AND createdAt IS NOT NULL
+    FROM (
+      SELECT createdAt,wakeId FROM wakes
+      WHERE creatorSessionKey=?1 AND createdAt IS NOT NULL
+      ORDER BY createdAt DESC,wakeId DESC LIMIT 1
+    )
     UNION ALL
     SELECT firedAt,6,'wake:' || wakeId || ':fire'
-    FROM wakes WHERE sessionKey=?1 AND firedAt IS NOT NULL
+    FROM (
+      SELECT firedAt,wakeId FROM wakes
+      WHERE sessionKey=?1 AND firedAt IS NOT NULL
+      ORDER BY firedAt DESC,wakeId DESC LIMIT 1
+    )
   )
   WHERE activityAt IS NOT NULL
   ORDER BY activityAt DESC,activityRank DESC,activityId DESC
@@ -4055,8 +4075,21 @@ defmodule Tightbeam.Supervision do
            txn,
            """
            SELECT id,state,outcome,workItemId,openedAt,closedAt
-           FROM assignments
-           WHERE holderKey=?1
+           FROM (
+             SELECT * FROM (
+               SELECT id,state,outcome,workItemId,openedAt,closedAt
+               FROM assignments
+               WHERE holderKey=?1 AND state='open'
+               ORDER BY openedAt DESC,id DESC LIMIT 1
+             )
+             UNION ALL
+             SELECT * FROM (
+               SELECT id,state,outcome,workItemId,openedAt,closedAt
+               FROM assignments
+               WHERE holderKey=?1 AND state='closed' AND closedAt IS NOT NULL
+               ORDER BY closedAt DESC,id DESC LIMIT 1
+             )
+           )
            ORDER BY COALESCE(closedAt,openedAt) DESC,id DESC
            LIMIT 1
            """,

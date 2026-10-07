@@ -187,12 +187,132 @@ defmodule Tightbeam.SupervisionTest do
     IO.puts("idle-cleanup activity query plan: " <> Enum.join(details, " | "))
 
     assert Enum.count(details, &String.contains?(&1, "idle_cleanup_assignments_activity")) == 2
+    assert Enum.any?(details, &String.contains?(&1, "idle_cleanup_assignments_closed_activity"))
     assert Enum.any?(details, &String.contains?(&1, "idle_cleanup_attests_activity"))
     assert Enum.any?(details, &String.contains?(&1, "idle_cleanup_wakes_created_activity"))
     assert Enum.any?(details, &String.contains?(&1, "idle_cleanup_wakes_fired_activity"))
     refute Enum.any?(details, &String.contains?(&1, "SCAN assignments"))
     refute Enum.any?(details, &String.contains?(&1, "SCAN attests"))
     refute Enum.any?(details, &String.contains?(&1, "SCAN wakes"))
+  end
+
+  test "idle cleanup repeated sweeps stay indexed across 129 high-history candidates", ctx do
+    children =
+      for n <- 1..129 do
+        "idle-sweep-child-" <> String.pad_leading(Integer.to_string(n), 3, "0")
+      end
+
+    idle_cleanup_fixture!(ctx, children)
+    seed_idle_cleanup_history!(ctx.db, 256)
+
+    for table <- ~w(assignments attests wakes) do
+      {:ok, _} = DB.query(ctx.db, "ANALYZE #{table}")
+    end
+
+    {:ok, [[256, 6, "wake:idle-sweep-fire-idle-sweep-child-001-256-zz:fire"]]} =
+      DB.query(ctx.db, Supervision.idle_cleanup_activity_sql(), [hd(children)])
+
+    {:ok, plan_rows} =
+      DB.query(
+        ctx.db,
+        "EXPLAIN QUERY PLAN " <> Supervision.idle_cleanup_activity_sql(),
+        [hd(children)]
+      )
+
+    plan = Enum.map(plan_rows, &List.last/1)
+    IO.puts("idle-cleanup high-history activity plan: " <> Enum.join(plan, " | "))
+
+    assert Enum.count(plan, &String.contains?(&1, "idle_cleanup_assignments_activity")) == 2
+    assert Enum.any?(plan, &String.contains?(&1, "idle_cleanup_assignments_closed_activity"))
+    assert Enum.any?(plan, &String.contains?(&1, "idle_cleanup_attests_activity"))
+    assert Enum.any?(plan, &String.contains?(&1, "idle_cleanup_wakes_created_activity"))
+    assert Enum.any?(plan, &String.contains?(&1, "idle_cleanup_wakes_fired_activity"))
+    refute Enum.any?(plan, &String.contains?(&1, "SCAN assignments"))
+    refute Enum.any?(plan, &String.contains?(&1, "SCAN attests"))
+    refute Enum.any?(plan, &String.contains?(&1, "SCAN wakes"))
+
+    started_at = System.monotonic_time(:microsecond)
+    name = start_liveness!(ctx, sweep_ms: 60_000, name: :idle_cleanup_high_history)
+    first_sweep_us = System.monotonic_time(:microsecond) - started_at
+
+    assert [first_wake] = idle_cleanup_wakes(ctx.db)
+    assert Enum.count(Regex.scan(~r/^- child=/m, first_wake.prompt)) == 129
+
+    {:ok, pending_session_rows} =
+      DB.query(
+        ctx.db,
+        """
+        EXPLAIN QUERY PLAN
+        SELECT 1 FROM wakes
+        WHERE state='pending' AND consumer='prompt' AND sessionKey=?1
+          AND (?2 IS NULL OR wakeId<>?2)
+        LIMIT 1
+        """,
+        [hd(children), nil]
+      )
+
+    pending_session_plan = Enum.map(pending_session_rows, &List.last/1)
+    IO.puts("idle-cleanup pending-session plan: " <> Enum.join(pending_session_plan, " | "))
+
+    assert Enum.any?(pending_session_plan, &String.contains?(&1, "idle_cleanup_wakes_pending_session"))
+
+    identity = first_wake.obligation_ref |> String.split("\n", parts: 2) |> hd()
+    identity_parts = String.split(identity, "|")
+    group_prefix = Enum.take(identity_parts, 2) |> Enum.join("|")
+    member_token = Enum.at(identity_parts, 2)
+
+    {:ok, delivery_rows} =
+      DB.query(
+        ctx.db,
+        """
+        EXPLAIN QUERY PLAN
+        SELECT w.firedAt,w.obligationRef
+        FROM wakes w
+        WHERE w.origin='process:tightbeam' AND w.state='fired'
+          AND w.obligationRef LIKE ?1 AND w.obligationRef LIKE ?2
+          AND EXISTS (SELECT 1 FROM turns t WHERE t.wakeId=w.wakeId)
+        """,
+        [group_prefix <> "|%", "%|" <> member_token <> "|%"]
+      )
+
+    delivery_plan = Enum.map(delivery_rows, &List.last/1)
+    IO.puts("idle-cleanup delivery-history plan: " <> Enum.join(delivery_plan, " | "))
+
+    assert Enum.any?(delivery_plan, &String.contains?(&1, "idle_cleanup_wakes_delivery_history"))
+
+    {:ok, pending_group_rows} =
+      DB.query(
+        ctx.db,
+        """
+        EXPLAIN QUERY PLAN
+        SELECT 1 FROM wakes
+        WHERE origin='process:tightbeam' AND consumer='prompt' AND state='pending'
+          AND obligationRef LIKE ?1
+        LIMIT 1
+        """,
+        [group_prefix <> "|%"]
+      )
+
+    pending_group_plan = Enum.map(pending_group_rows, &List.last/1)
+    IO.puts("idle-cleanup pending-group plan: " <> Enum.join(pending_group_plan, " | "))
+
+    assert Enum.any?(pending_group_plan, &String.contains?(&1, "idle_cleanup_wakes_pending_group"))
+
+    repeated_sweep_us =
+      for _ <- 1..3 do
+        started_at = System.monotonic_time(:microsecond)
+        sweep_liveness!(name)
+        elapsed_us = System.monotonic_time(:microsecond) - started_at
+
+        assert [repeated_wake] = idle_cleanup_wakes(ctx.db)
+        assert repeated_wake.wake_id == first_wake.wake_id
+        assert repeated_wake.prompt == first_wake.prompt
+        elapsed_us
+      end
+
+    IO.puts(
+      "idle-cleanup 129-candidate sweeps: history_rows=33024 assignments,33024 attests,33025 wakes first_sweep_us=#{first_sweep_us} repeated_sweep_us=#{inspect(repeated_sweep_us)}"
+    )
   end
 
   test "the prod-shape gate authorizes assignment prodding and rejects other consumers", ctx do
@@ -966,6 +1086,82 @@ defmodule Tightbeam.SupervisionTest do
           child
         ])
     end
+  end
+
+  defp seed_idle_cleanup_history!(db, rows_per_source) do
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        WITH RECURSIVE history(n) AS (
+          SELECT 1
+          UNION ALL
+          SELECT n + 1 FROM history WHERE n < #{rows_per_source}
+        ), children(sessionKey) AS (
+          SELECT sessionKey FROM sessions
+          WHERE sessionKey GLOB 'idle-sweep-child-[0-9][0-9][0-9]'
+        )
+        INSERT INTO assignments
+          (id,subject,holderKey,openedByUser,openedAt,state,outcome,closedAt,closedByUser)
+        SELECT 'idle-sweep-assignment-' || c.sessionKey || '-' || printf('%03d',h.n),
+               'historical cleanup fixture',c.sessionKey,'flynn',h.n,'closed','revoked',h.n,'flynn'
+        FROM children c CROSS JOIN history h
+        """
+      )
+
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        WITH RECURSIVE history(n) AS (
+          SELECT 1
+          UNION ALL
+          SELECT n + 1 FROM history WHERE n < #{rows_per_source}
+        ), children(sessionKey) AS (
+          SELECT sessionKey FROM sessions
+          WHERE sessionKey GLOB 'idle-sweep-child-[0-9][0-9][0-9]'
+        )
+        INSERT INTO attests (id,assignmentId,kind,bySession,ts)
+        SELECT 'idle-sweep-attest-' || c.sessionKey || '-' || printf('%03d',h.n),
+               'idle-sweep-assignment-' || c.sessionKey || '-' || printf('%03d',h.n),
+               'progress',c.sessionKey,h.n
+        FROM children c CROSS JOIN history h
+        """
+      )
+
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        WITH RECURSIVE history(n) AS (
+          SELECT 1
+          UNION ALL
+          SELECT n + 1 FROM history WHERE n < #{rows_per_source}
+        ), children(sessionKey) AS (
+          SELECT sessionKey FROM sessions
+          WHERE sessionKey GLOB 'idle-sweep-child-[0-9][0-9][0-9]'
+        )
+        INSERT INTO wakes
+          (wakeId,sessionKey,origin,prompt,dueAt,createdAt,firedAt,state,creatorSessionKey)
+        SELECT 'idle-sweep-fire-' || c.sessionKey || '-' || printf('%03d',h.n) ||
+                 CASE WHEN h.n = #{rows_per_source} THEN '-z' ELSE '' END,
+               c.sessionKey,'user:flynn','historical cleanup fixture',h.n,h.n,h.n,'fired',c.sessionKey
+        FROM children c CROSS JOIN history h
+        """
+      )
+
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT INTO wakes
+          (wakeId,sessionKey,origin,prompt,dueAt,createdAt,firedAt,state,creatorSessionKey)
+        SELECT 'idle-sweep-fire-' || sessionKey || '-256-zz', sessionKey,
+               'user:flynn','historical cleanup tie fixture',256,256,256,'fired',sessionKey
+        FROM sessions
+        WHERE sessionKey='idle-sweep-child-001'
+        """
+      )
   end
 
   defp idle_cleanup_wakes(db) do
