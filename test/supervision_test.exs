@@ -1860,6 +1860,7 @@ defmodule Tightbeam.SupervisionTest do
       "wi_descendant_effects",
       now
     )
+
     insert_artifact!(ctx.db, "art_descendant_other_item", worker.session_key, "wi_other", now)
 
     insert_artifact!(
@@ -2041,6 +2042,7 @@ defmodule Tightbeam.SupervisionTest do
       "deep child work",
       System.system_time(:millisecond)
     )
+
     attach_work_item!(ctx.db, "asg_descendant_too_deep", "wi_descendant_continuation")
 
     assert {:match, %{id: "asg_1"}} =
