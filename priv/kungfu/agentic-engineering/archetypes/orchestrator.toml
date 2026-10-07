@@ -1,4 +1,5 @@
 name = "orchestrator"
+owner_open_child_prod = true
 skills = ["repository-retirement", "landing", "delivery-bootstrap"]
 
 [defaults]
