@@ -267,7 +267,7 @@ defmodule Tightbeam.ArchetypesTest do
       |> File.read!()
     end
 
-    assert role_guidance.("product-owner") =~ "hand the authored\nbytes to delivery ownership"
+    assert role_guidance.("product-owner") =~ "have delivery ownership commission its\nbytes"
     assert role_guidance.("pdo") =~ "You own landing order and branch health"
 
     for role <- ~w(product-owner orchestrator) do
