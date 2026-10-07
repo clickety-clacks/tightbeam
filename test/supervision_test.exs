@@ -230,6 +230,7 @@ defmodule Tightbeam.SupervisionTest do
     refute Enum.any?(plan, &String.contains?(&1, "SCAN assignments"))
     refute Enum.any?(plan, &String.contains?(&1, "SCAN attests"))
     refute Enum.any?(plan, &String.contains?(&1, "SCAN wakes"))
+    assert Enum.count(plan, &String.contains?(&1, "USE TEMP B-TREE FOR ORDER BY")) == 1
 
     started_at = System.monotonic_time(:microsecond)
     name = start_liveness!(ctx, sweep_ms: 60_000, name: :idle_cleanup_high_history)
