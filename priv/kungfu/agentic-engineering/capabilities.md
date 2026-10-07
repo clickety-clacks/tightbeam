@@ -22,3 +22,21 @@ Use these capabilities when the user needs help carrying engineering work throug
 delivery. Establish the product's delivery owner and PO within existing authority;
 reuse suitable owners and artifacts. Adopting the bundle does not transfer existing
 assignments or rewrite a running organization's parentage.
+
+## Build a product organization
+
+Start with the user's product goal, constraints, existing work, repository and release
+target. Main or the root orchestrator keeps the request until delivery ownership accepts it.
+Establish or reuse one addressed product owner for the product first; give that PO the
+user's intent, acceptance questions, existing work and decisions. The PO owns product
+judgment and records the team topology before production staffing.
+
+Then establish or reuse one product delivery owner. Give that PDO the same work item,
+the PO's decisions and topology, the target branch or release, and the current delivery
+state. The PDO explicitly accepts delivery custody, then staffs spec-writers, coders and
+independent reviewers only as actual tasks require. Use orchestrators for delegated lanes
+or cross-product coordination when needed; do not create a standing role for every
+available archetype.
+
+Main creates the product owner and the PDO directly under itself as siblings; neither
+is parented under the other.

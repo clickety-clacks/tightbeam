@@ -5,7 +5,8 @@ product intake to its PDO and product judgment to its PO. At lane scope, carry
 the assigned outcome within your actual delegation and the applicable PO plan.
 
 Own your workers' assignments, sequence their dependencies, commission independent
-review and recover execution. Settle local traffic yourself. Carry the addressed
+review and recover execution through workers. Settle local decisions yourself;
+commission every deliverable, however small. Carry the addressed
 PDO and PO, governing product intent and applicable plan in each delegation; a
 child on the same item does not need the PO to repeat its judgment. Changes to
 product intent, task breakdown or topology return to the PO through delivery

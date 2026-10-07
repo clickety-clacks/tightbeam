@@ -1,5 +1,66 @@
 # Upgrading a running instance
 
+## 0.1.8 to 0.1.9: follow this order
+
+Expect downtime at the service restart: the gateway migrates its database on
+first boot before it can answer `/version`, and a large database can take time.
+Do not interrupt that migration or assume selecting old executable bytes can
+reverse it.
+
+Before each step that changes a production gateway, describe that exact step
+to the user and wait for their explicit confirmation of the description. This
+includes making a backup on the production host, staging or installing a
+package, changing the selector or service, restarting and migrating the
+database, re-assimilating satellites, and removing obsolete files. Name the
+artifact and hash, affected paths and hosts, expected downtime, database
+effect, and rollback limit as applicable. The original upgrade request is not
+the confirmation. If the plan or target changes, describe it again and get a
+new yes before acting; read-only inventory can proceed while waiting.
+
+1. Identify the running build and every registered base directory. Take and
+   verify a consistent backup of each base as described in
+   [Take a backup first](#take-a-backup-first), including the non-database
+   configuration named in [BACKUP.md](BACKUP.md). Check each copied database
+   with `PRAGMA quick_check` and confirm the backup files are readable before
+   selecting a new build.
+2. Verify the target release package, `SHA256SUMS`, and
+   `release-provenance.json`. For the package commands, follow the
+   [stage/select instructions](../README.md#from-a-release-package) below the
+   README's release-package heading; `stage` leaves the running build selected.
+   If the service still starts an npm-installed executable, follow
+   [the selector move](#moving-an-npm-installed-gateway-to-the-selector)
+   before restart.
+3. Review [runtime overrides](#runtime-overrides-during-an-upgrade). At the
+   authorized idle boundary, select the staged build, update the npm-based
+   systemd unit or LaunchDaemon to the selector path, and restart the service
+   through its service manager as described in the selector move.
+   The gateway performs the supported database migration on first boot; do not
+   issue manual schema changes.
+4. Require `/version` to match the selected receipt's version and source SHA,
+   verify the migrated database and important existing records, and complete
+   the runtime checks below. If the gateway fails to boot or verification
+   fails, stop and use the retained package and backup only after checking
+   schema compatibility; an executable rollback does not undo migration.
+5. For each registered satellite whose CLI came from assimilation, refresh it
+   with the selected 0.1.9 CLI by [re-assimilating that host](#refreshing-satellite-clis)
+   with its recorded destination and settings. Verify the remote CLI version;
+   upgrading the gateway does not replace a satellite CLI.
+6. After the service and satellites pass, follow
+   [old-install cleanup](#remove-the-old-npm-installation). Remove only the
+   verified obsolete npm package and links, then check that the service,
+   operator shell, and satellites cannot load the stale CLI or gateway.
+7. Recommend refreshing each learned kungfu when the user chooses. Main can
+   run the single relearn command and walk the user through any conflicts as
+   described below. Relearning is a user choice after the upgrade, not a
+   prerequisite to restart the gateway.
+   Before refreshing sessions, explain that `tightbeam identity apply --all`
+   updates their Tightbeam-owned skill files and asks them to re-read without
+   reloading their current model context, and obtain the user's confirmation.
+   After relearn (or `relearn --resolve`) publishes the merged identity, run
+   `tightbeam identity apply --all` at a boundary that does not interrupt running
+   turns, then read `tightbeam identity status`. Do not call the relearn done
+   while any session you are responsible for remains stale.
+
 ## 0.1.8 to 0.1.9 database rehearsal
 
 The canonical standalone E2E migration procedure is
@@ -40,18 +101,64 @@ rechecks those files and switches `current` atomically. A failed or interrupted
 stage cannot change the selected build. Incomplete temporary stage directories
 are inert and are never selected.
 
-An installation still using a global npm path must first be migrated to the
-selector. Identify the actual running build from `GET /version` (`version` and
-`sha`). The `sha` is a short source commit stamp, not an artifact digest. Stage
-the published package only when deployment records establish that the running
-process came from that release and its provenance `commit` begins with the
-reported `sha`. Select that same package, point the service at
-`/opt/tightbeam/current/tightbeam/bin/tightbeam-gateway`, and reload its service
-configuration. If the running stamp does not match a verified package, stop the
-migration until the exact prior build is recovered; the executable currently
-on disk can already differ from the process in memory. If the running artifact's
-origin is unknown, the source stamp alone is not enough to claim it as a verified
-rollback build.
+### Moving an npm-installed gateway to the selector
+
+Inspect the service's executable path and environment, resolve the executable's
+symlink target, and read the running gateway's `GET /version` before changing
+anything. Discover the npm installation with `npm prefix -g` and
+`npm ls --global --prefix <recorded-prefix> --depth=0`, and match that prefix and
+package to the service's resolved executable. The prefix may be `~/.local`,
+`/opt/homebrew`, or another configured directory; do not assume the interactive
+shell's npm or Tightbeam binary is the service's. If they differ, trace the
+service's actual npm package and record its prefix before proceeding.
+
+The `sha` in `/version` is a short source commit stamp, not an artifact digest.
+Match the running build to its exact prior release package and provenance;
+stage and retain that verified package for rollback. If the running stamp does
+not match a verified package, stop until the prior build is recovered.
+Executable bytes on disk can already differ from the running process.
+
+Use the service-manager branch that applies, within this same upgrade order:
+
+- **Linux — systemd:** inspect the unit with `systemctl cat tightbeam.service`
+  and `systemctl show tightbeam.service -p ExecStart -p Environment`. Resolve
+  the actual `ExecStart` executable, using `readlink -f` when it is a symlink.
+- **macOS — LaunchDaemon:** inspect the installed
+  `/Library/LaunchDaemons/com.tightbeam.gateway.plist` with `plutil -p` and the
+  loaded job with `sudo launchctl print system/com.tightbeam.gateway`. Read
+  `ProgramArguments` and `EnvironmentVariables`, including `PATH`; resolve the
+  executable's symlink chain with `readlink`. Use the system LaunchDaemon from
+  the [README plist](../README.md#macos--launchd), not a per-login LaunchAgent.
+
+Stage the verified 0.1.9 target using the README's release-package commands.
+At the authorized idle boundary, select that target and move the service to
+`/opt/tightbeam/current/tightbeam/bin/tightbeam-gateway`, with
+`/opt/tightbeam/current/tightbeam/bin` first in its `PATH`. Preserve its existing
+service user, working directory, base directory, port, advertised URL,
+credentials, remaining environment and logging settings.
+
+- **Linux — systemd:** change only the unit's executable path and `PATH`,
+  preserving `User` and `WorkingDirectory`. For an `ExecStart` drop-in, clear
+  the old value with an empty `ExecStart=` before setting the selector path.
+  Run `sudo systemctl daemon-reload`, inspect the effective unit again, then
+  `sudo systemctl restart tightbeam.service` once.
+- **macOS — LaunchDaemon:** in the installed plist, change the gateway
+  executable in `ProgramArguments` to the selector path and put the selected
+  bin directory first in `EnvironmentVariables.PATH`. Preserve `UserName`,
+  `WorkingDirectory`, other arguments, `RunAtLoad`, `KeepAlive` and other
+  settings; retain the README's `root:wheel` ownership and mode `644`.
+  Validate the edited plist with `plutil -lint`, then reload it at the authorized
+  restart boundary so launchd reads the changed paths:
+
+  ```sh
+  sudo launchctl bootout system/com.tightbeam.gateway
+  sudo launchctl bootstrap system /Library/LaunchDaemons/com.tightbeam.gateway.plist
+  sudo launchctl print system/com.tightbeam.gateway
+  ```
+
+Wait for migration to finish before requiring the new `/version`. The old npm
+files are not a verified rollback merely because they remain on disk. If the
+running artifact's origin is unknown, its source stamp alone is insufficient.
 
 After selection, `readlink /opt/tightbeam/current` identifies the selected
 build. The running process may still report the previous version until its
@@ -64,6 +171,137 @@ boundary, then compare `GET /version`'s `version` with the selected receipt's
 after you confirm that it supports the current database schema. Selecting old
 executable bytes does not reverse a SQLite migration or make an incompatible
 schema safe.
+
+### Refreshing satellite CLIs
+
+For every registered satellite that received `<base_dir>/bin/tightbeam` from
+`assimilate`, record its SSH destination, host name, base directory, and harness
+selection. Once the new gateway is healthy and affected remote sessions are
+idle, run the selected CLI with those same recorded values:
+
+```sh
+/opt/tightbeam/current/tightbeam/bin/tightbeam assimilate <ssh-dest> \
+  --name <host-name> [--base-dir <path>] [--harness <names>] \
+  --as-user <adminUserId>
+```
+
+Re-assimilation is
+idempotent: it refreshes the satellite CLI and adapters without creating a
+second host or carrying credentials. Check the command's actual result and the
+remote `<base_dir>/bin/tightbeam --version`; require 0.1.9 before considering
+that satellite upgraded. Do not infer that the gateway package changed a
+remote CLI or re-onboard credentials as part of this step.
+
+### Remove the old npm installation
+
+Do this only after the selected gateway, migrated database, and satellite CLIs
+have passed verification. Recheck the effective systemd `ExecStart` and `PATH`
+or LaunchDaemon `ProgramArguments` and `EnvironmentVariables.PATH`, the
+`/opt/tightbeam/current` target, and the operator shell's
+`type -a tightbeam tightbeam-gateway`. Run `npm prefix -g` and reconcile it with
+the old prefix recorded during the selector move; it may be `/opt/homebrew`,
+`~/.local`, or another location. Use the prefix that actually owns the old
+package, not a different current npm default. Inspect that exact package with
+`npm ls --global --prefix <recorded-old-prefix> --depth=0` and record the targets
+of its `tightbeam` and `tightbeam-gateway` links under `<recorded-old-prefix>/bin`.
+Require the service to use
+`/opt/tightbeam/current/tightbeam/bin/tightbeam-gateway` and the selected CLI to
+report 0.1.9 before removing the old package.
+
+Uninstall only the recorded old Tightbeam npm package from its recorded prefix
+(`npm uninstall --global --prefix <recorded-old-prefix> <exact-old-package-name>`),
+using only the permissions authorized for that installation. Remove any remaining
+Tightbeam links under `<recorded-old-prefix>/bin` only after confirming that each
+resolves into that old package; keep unrelated npm packages and links. Require
+the recorded old package directory to be absent. If npm leaves it behind,
+identify its exact contents and references before removing only that obsolete
+directory. Recheck the loaded service configuration, shell executable resolution,
+and each registered satellite's CLI version: no executable path used by the
+service or agents may resolve to the removed package, and the selected gateway
+and CLI must still answer as 0.1.9. Remove transient package-extraction directories
+and downloads after their hashes and release receipt are recorded. Retain the
+verified database/configuration backup and any deliberately retained selector
+rollback build; name those retained items to the user instead of treating them
+as trash.
+
+## Runtime overrides during an upgrade
+
+Review runtime overrides before replacing an existing installation. A persisted
+override can select an older executable instead of a new adapter's bundled
+runtime. Cleanup is conditional: keep intentional pins that the target supports.
+
+1. Inventory every host and harness before the upgrade. As an admin, run:
+
+   ```sh
+   tightbeam host-env-list --as-user <adminUserId>
+   ```
+
+   Record each persisted `CODEX_PATH` and `CLAUDE_CODE_EXECUTABLE` value,
+   including its host and harness. Separately inspect the gateway service's
+   environment: systemd unit, drop-ins and environment files, or launchd plist.
+   Record those values too; your interactive shell is not the service environment.
+   Keep the record private if other environment entries contain secrets.
+
+2. Record the current Tightbeam package/build, each effective harness executable
+   path, exact version and SHA-256, and each installed ACP adapter's exact package version.
+   Retain the prior runtime/package and service configuration for rollback.
+   Check the target's release notes and compatibility evidence for those exact
+   runtime/adapter combinations. Do not infer compatibility from a branch name
+   or assume an upgrade refreshes every adapter.
+
+3. Keep each intentional, supported pin. Remove an override only when you confirm
+   it was temporary, is obsolete for the target, and its replacement is compatible.
+   For a persisted host/harness overlay, use the matching command below; replace
+   the placeholders with the recorded host and admin user:
+
+   ```sh
+   tightbeam host-env-unset --host <host> --harness codex CODEX_PATH --as-user <adminUserId>
+   tightbeam host-env-unset --host <host> --harness claude CLAUDE_CODE_EXECUTABLE --as-user <adminUserId>
+   ```
+
+   These commands remove only the named overlay. They do not edit a service's
+   environment. Remove an obsolete service override separately from its recorded
+   configuration source, using that service manager's configuration reload procedure.
+   Removing one source can expose a value from another; inspect both.
+
+4. Wait until affected sessions finish their turns before activation. An overlay
+   change takes effect on the next adapter start; it does not replace a running
+   adapter. Stage and select the verified target package as described above, then
+   restart the installed service at the authorized idle boundary. Apply the same
+   idle boundary to affected remote adapters before their next start.
+   Do not treat a successful unset or an active service as proof of activation.
+
+5. After activation, verify the effective executable path, exact runtime
+   version and SHA-256 for each affected host/harness, plus the adapter package version.
+   Use the actual adapter launch/process information and the selected binary's
+   version output and file hash, not just the executable on your shell's PATH.
+   Package-managed vendor paths can move or contain different bytes after an
+   update; a saved path alone does not pin a runtime version.
+   Run one real model turn per affected host/harness. Verify the expected hook
+   fires and enforces its result, then resume an existing session and verify
+   its conversation continues. Record the results before calling the upgrade
+   successful. This checklist is not proof that an untested release works.
+
+If verification fails, stop the rollout. Restore each changed overlay to its
+recorded value with `tightbeam host-env-set --host <host> --harness <harness>
+'NAME=previous-value' --as-user <adminUserId>`. Restore the prior service
+environment and compatible runtime/adapter versions through the supported
+installation procedure. Use the same idle/restart boundary and repeat verification.
+Check the target's state-migration rollback restrictions before reverting a
+Tightbeam package; restoring an executable alone does not undo a database migration.
+Before rolling back a database that contains terminal credential incidents, use the
+new code to prove that every such incident recovered. If older code will run while
+any incident remains open, explicitly acknowledge that it cannot honor the durable
+suppression and the automatic provider credential probe loop will return.
+
+After the upgraded gateway is running, recommend refreshing each learned
+kungfu when the user chooses. Ask Main to load the
+`tightbeam-operating-manual` skill and walk through the relearn; the single
+`tightbeam identity relearn` command imports the 0.1.9 version of every learned
+bundle and merges it with the user's identity. If a conflict appears, Main
+should explain the 0.1.9 version's intent and the user's current version, then
+let the user choose how to resolve it or abort. Do not run a separate trial
+relearn or resolve conflicts without the user's choice.
 
 The 0.1.8 package carries its own exact migration chain: `model-identity-v1`
 (0.1.7) to `operator-decision-requests-v1`, then to `pi-harness-v1`. A database

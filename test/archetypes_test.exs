@@ -267,7 +267,7 @@ defmodule Tightbeam.ArchetypesTest do
       |> File.read!()
     end
 
-    assert role_guidance.("product-owner") =~ "hand the authored\nbytes to delivery ownership"
+    assert role_guidance.("product-owner") =~ "have delivery ownership commission its\nbytes"
     assert role_guidance.("pdo") =~ "You own landing order and branch health"
 
     for role <- ~w(product-owner orchestrator) do
@@ -376,7 +376,7 @@ defmodule Tightbeam.ArchetypesTest do
     assert MapSet.new(Map.keys(product_owner.skills)) ==
              MapSet.new(["repository-retirement", "delivery-bootstrap", "model-release-intake"])
 
-    assert product_owner.guidance =~ "you retain content judgment"
+    assert product_owner.guidance =~ "Retain content judgment"
     assert product_owner.guidance =~ "same-item topology consultation light"
     assert product_owner.guidance =~ "Review new specs and intent-sensitive results"
 

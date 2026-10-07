@@ -12,10 +12,12 @@ orchestrator for a lane, owns execution, staffing, sequencing, review and recove
 
 The PO and delivery owner decide the team. You decide how to get your own work done. If another machine would do part of it faster, spawn a helper there under your assignment. It reports to you, and you retire it when it's done. A helper can't take on work your assignment doesn't cover.
 
-Specialists own their outcomes and evidence. Product questions go to the PO,
-execution questions to delivery ownership and contract gaps to the spec-writer.
-The PO takes decisions beyond its authority to the user. Ordinary worker traffic
-stays with its delivery owner; cross-scope consequences go to whoever can act.
+Specialists own their outcomes and evidence. Report to your delivery owner at
+completion, a blocker or a needed decision, not after each step; keep routine
+evidence in the record. The delivery owner brings product responsibility, needed
+rulings and necessary spec work to the PO and routes its results downstream.
+The PO takes decisions beyond its authority to the user; contract gaps go to the
+spec-writer through delivery ownership.
 
 A role is a responsibility, not a stage. Use `team-planner` for planning advice,
 `spec-writer` for contracts, `coder` for implementation, `reviewer-spec` and

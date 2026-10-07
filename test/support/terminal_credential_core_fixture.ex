@@ -180,7 +180,7 @@ defmodule Tightbeam.TerminalCredentialCoreFixture do
   end
 
   def proof!("rollback-documentation", _db, _base) do
-    readme = Path.expand("../../README.md", __DIR__) |> File.read!()
+    readme = Path.expand("../../docs/UPGRADE.md", __DIR__) |> File.read!()
 
     assert readme =~
              "Before rolling back a database that contains terminal credential incidents"
