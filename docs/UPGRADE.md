@@ -53,6 +53,13 @@ new yes before acting; read-only inventory can proceed while waiting.
    run the single relearn command and walk the user through any conflicts as
    described below. Relearning is a user choice after the upgrade, not a
    prerequisite to restart the gateway.
+   Before refreshing sessions, explain that `tightbeam identity apply --all`
+   updates their Tightbeam-owned skill files and asks them to re-read without
+   reloading their current model context, and obtain the user's confirmation.
+   After relearn (or `relearn --resolve`) publishes the merged identity, run
+   `tightbeam identity apply --all` at a boundary that does not interrupt running
+   turns, then read `tightbeam identity status`. Do not call the relearn done
+   while any session you are responsible for remains stale.
 
 ## 0.1.8 to 0.1.9 database rehearsal
 

@@ -91,6 +91,14 @@ read `identity status` to verify the live revision. If the user does not want
 to settle every conflict now, use `tightbeam identity relearn --abort`; a
 partial merge cannot be published. Never silently prefer either version.
 
+Before refreshing sessions, explain that `tightbeam identity apply --all`
+updates their Tightbeam-owned skill files and asks them to re-read, without
+reloading their current model context, and obtain the user's confirmation.
+After relearn (or `relearn --resolve`) publishes the merged identity, run
+`tightbeam identity apply --all` at a boundary that does not interrupt running
+turns, then read `tightbeam identity status`. Do not call the relearn done while
+any session you are responsible for remains stale.
+
 ## Repeated effort requests
 
 Compare the specific obligation's records, actual execution and current pending
