@@ -1861,6 +1861,7 @@ defmodule Tightbeam.SupervisionTest do
 
   test "marked owner with an own pending wake gets no child prod", ctx do
     enable_owner_open_child_prod!(ctx)
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
     child = session(ctx.db, "wake-child", "holder")
     assignment(ctx.db, "asg_wake_child", child.session_key, "child work", 1)
 
