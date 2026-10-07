@@ -28,11 +28,12 @@ new yes before acting; read-only inventory can proceed while waiting.
    [stage/select instructions](../README.md#from-a-release-package) below the
    README's release-package heading; `stage` leaves the running build selected.
    If the service still starts an npm-installed executable, follow
-   [the selector move](#moving-an-npm-installed-systemd-gateway-to-the-selector)
+   [the selector move](#moving-an-npm-installed-gateway-to-the-selector)
    before restart.
 3. Review [runtime overrides](#runtime-overrides-during-an-upgrade). At the
-   authorized idle boundary, select the staged build, update any npm-based
-   systemd unit to the selector path, and restart the service.
+   authorized idle boundary, select the staged build, update the npm-based
+   systemd unit or LaunchDaemon to the selector path, and restart the service
+   through its service manager as described in the selector move.
    The gateway performs the supported database migration on first boot; do not
    issue manual schema changes.
 4. Require `/version` to match the selected receipt's version and source SHA,
@@ -93,37 +94,61 @@ rechecks those files and switches `current` atomically. A failed or interrupted
 stage cannot change the selected build. Incomplete temporary stage directories
 are inert and are never selected.
 
-### Moving an npm-installed systemd gateway to the selector
+### Moving an npm-installed gateway to the selector
 
-An existing system unit may start an npm-installed executable through
-`~/.local/bin`, with the package under `~/.local/lib/node_modules`. Read
-`systemctl cat tightbeam.service`, its `ExecStart` and `Environment` properties,
-the resolved executable path, and the running gateway's `GET /version` before
-changing either one. The `sha` in `/version` is a short source commit stamp, not
-an artifact digest. Match the running build to its exact prior release package
-and provenance; stage and retain that verified package for rollback. If the
-running stamp does not match a verified package, stop until the prior build is
-recovered. Executable bytes on disk can already differ from the running process.
+Inspect the service's executable path and environment, resolve the executable's
+symlink target, and read the running gateway's `GET /version` before changing
+anything. Discover the npm installation with `npm prefix -g` and
+`npm ls --global --prefix <recorded-prefix> --depth=0`, and match that prefix and
+package to the service's resolved executable. The prefix may be `~/.local`,
+`/opt/homebrew`, or another configured directory; do not assume the interactive
+shell's npm or Tightbeam binary is the service's. If they differ, trace the
+service's actual npm package and record its prefix before proceeding.
 
-```sh
-systemctl cat tightbeam.service
-systemctl show tightbeam.service -p ExecStart -p Environment
-readlink -f "$HOME/.local/bin/tightbeam-gateway"
-```
+The `sha` in `/version` is a short source commit stamp, not an artifact digest.
+Match the running build to its exact prior release package and provenance;
+stage and retain that verified package for rollback. If the running stamp does
+not match a verified package, stop until the prior build is recovered.
+Executable bytes on disk can already differ from the running process.
 
-The last command applies when that symlink exists; otherwise resolve the actual
-`ExecStart` path. Do not assume the interactive shell uses the service's binary.
+Use the service-manager branch that applies, within this same upgrade order:
+
+- **Linux — systemd:** inspect the unit with `systemctl cat tightbeam.service`
+  and `systemctl show tightbeam.service -p ExecStart -p Environment`. Resolve
+  the actual `ExecStart` executable, using `readlink -f` when it is a symlink.
+- **macOS — LaunchDaemon:** inspect the installed
+  `/Library/LaunchDaemons/com.tightbeam.gateway.plist` with `plutil -p` and the
+  loaded job with `sudo launchctl print system/com.tightbeam.gateway`. Read
+  `ProgramArguments` and `EnvironmentVariables`, including `PATH`; resolve the
+  executable's symlink chain with `readlink`. Use the system LaunchDaemon from
+  the [README plist](../README.md#macos--launchd), not a per-login LaunchAgent.
 
 Stage the verified 0.1.9 target using the README's release-package commands.
-At the authorized idle boundary, select that target and change only the system
-unit's executable path to
-`/opt/tightbeam/current/tightbeam/bin/tightbeam-gateway`; include the selected
-`tightbeam/bin` directory in the unit's `PATH` while preserving its existing
-`User`, `WorkingDirectory`, base directory, port, advertised URL, credentials,
-and other intended environment. For a systemd `ExecStart` drop-in, clear the
-old value with an empty `ExecStart=` before setting the selector path. Run
-`sudo systemctl daemon-reload`, inspect the effective unit again, then
-`sudo systemctl restart tightbeam.service` once.
+At the authorized idle boundary, select that target and move the service to
+`/opt/tightbeam/current/tightbeam/bin/tightbeam-gateway`, with
+`/opt/tightbeam/current/tightbeam/bin` first in its `PATH`. Preserve its existing
+service user, working directory, base directory, port, advertised URL,
+credentials, remaining environment and logging settings.
+
+- **Linux — systemd:** change only the unit's executable path and `PATH`,
+  preserving `User` and `WorkingDirectory`. For an `ExecStart` drop-in, clear
+  the old value with an empty `ExecStart=` before setting the selector path.
+  Run `sudo systemctl daemon-reload`, inspect the effective unit again, then
+  `sudo systemctl restart tightbeam.service` once.
+- **macOS — LaunchDaemon:** in the installed plist, change the gateway
+  executable in `ProgramArguments` to the selector path and put the selected
+  bin directory first in `EnvironmentVariables.PATH`. Preserve `UserName`,
+  `WorkingDirectory`, other arguments, `RunAtLoad`, `KeepAlive` and other
+  settings; retain the README's `root:wheel` ownership and mode `644`.
+  Validate the edited plist with `plutil -lint`, then reload it at the authorized
+  restart boundary so launchd reads the changed paths:
+
+  ```sh
+  sudo launchctl bootout system/com.tightbeam.gateway
+  sudo launchctl bootstrap system /Library/LaunchDaemons/com.tightbeam.gateway.plist
+  sudo launchctl print system/com.tightbeam.gateway
+  ```
+
 Wait for migration to finish before requiring the new `/version`. The old npm
 files are not a verified rollback merely because they remain on disk. If the
 running artifact's origin is unknown, its source stamp alone is insufficient.
@@ -163,27 +188,34 @@ remote CLI or re-onboard credentials as part of this step.
 ### Remove the old npm installation
 
 Do this only after the selected gateway, migrated database, and satellite CLIs
-have passed verification. First read the effective systemd `ExecStart` and
-`PATH`, `/opt/tightbeam/current`, the operator shell's
-`type -a tightbeam tightbeam-gateway`, and the exact old npm package name with
-`npm ls --global --prefix "$HOME/.local" --depth=0`. Inspect the `tightbeam` and
-`tightbeam-gateway` links under `~/.local/bin` and record their resolved targets.
-Require the unit to use `/opt/tightbeam/current/tightbeam/bin/tightbeam-gateway`
-and the selected CLI to report 0.1.9 before removing the old package.
+have passed verification. Recheck the effective systemd `ExecStart` and `PATH`
+or LaunchDaemon `ProgramArguments` and `EnvironmentVariables.PATH`, the
+`/opt/tightbeam/current` target, and the operator shell's
+`type -a tightbeam tightbeam-gateway`. Run `npm prefix -g` and reconcile it with
+the old prefix recorded during the selector move; it may be `/opt/homebrew`,
+`~/.local`, or another location. Use the prefix that actually owns the old
+package, not a different current npm default. Inspect that exact package with
+`npm ls --global --prefix <recorded-old-prefix> --depth=0` and record the targets
+of its `tightbeam` and `tightbeam-gateway` links under `<recorded-old-prefix>/bin`.
+Require the service to use
+`/opt/tightbeam/current/tightbeam/bin/tightbeam-gateway` and the selected CLI to
+report 0.1.9 before removing the old package.
 
 Uninstall only the recorded old Tightbeam npm package from its recorded prefix
-(`npm uninstall --global --prefix "$HOME/.local" <exact-old-package-name>`).
-Remove any remaining `~/.local/bin` Tightbeam links only after confirming that
-each resolves into that old package; keep unrelated npm packages and links.
-Require the recorded old package directory to be absent. If npm leaves it
-behind, identify its exact contents and references before removing only that
-obsolete directory. Recheck the unit, `type -a tightbeam tightbeam-gateway`, and each registered
-satellite's CLI version: no executable path used by the service or agents may
-resolve to the removed package, and the selected gateway and CLI must still
-answer as 0.1.9. Remove transient package-extraction directories and downloads
-after their hashes and release receipt are recorded. Retain the verified
-database/configuration backup and any deliberately retained selector rollback
-build; name those retained items to the user instead of treating them as trash.
+(`npm uninstall --global --prefix <recorded-old-prefix> <exact-old-package-name>`),
+using only the permissions authorized for that installation. Remove any remaining
+Tightbeam links under `<recorded-old-prefix>/bin` only after confirming that each
+resolves into that old package; keep unrelated npm packages and links. Require
+the recorded old package directory to be absent. If npm leaves it behind,
+identify its exact contents and references before removing only that obsolete
+directory. Recheck the loaded service configuration, shell executable resolution,
+and each registered satellite's CLI version: no executable path used by the
+service or agents may resolve to the removed package, and the selected gateway
+and CLI must still answer as 0.1.9. Remove transient package-extraction directories
+and downloads after their hashes and release receipt are recorded. Retain the
+verified database/configuration backup and any deliberately retained selector
+rollback build; name those retained items to the user instead of treating them
+as trash.
 
 ## Runtime overrides during an upgrade
 
