@@ -1897,6 +1897,7 @@ defmodule Tightbeam.SupervisionTest do
       generation: 1,
       due_at: System.system_time(:millisecond) + 60_000
     )
+
     child = session(ctx.db, "not-due-child", "holder")
     assignment(ctx.db, "asg_not_due_child", child.session_key, "child work", 1)
 
