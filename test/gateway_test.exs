@@ -2616,19 +2616,6 @@ defmodule Tightbeam.GatewayTest do
     Archetypes.load!(base_dir)
     other = create_session(ctx.db, "agent:batch-other-owner", "tron")
 
-    {:ok, _policy} =
-      DB.transaction(ctx.db, fn txn ->
-        Org.apply_notice_batching_lane_policy_in_txn(
-          txn,
-          %{session_key: "k1", target_role: nil},
-          true,
-          "notice-batching-test-policy:inspect",
-          "agent:test-policy",
-          "inspect-authorization-regression",
-          1
-        )
-      end)
-
     first =
       Wakes.schedule(ctx.db, %{
         session_key: "k1",
@@ -2647,7 +2634,20 @@ defmodule Tightbeam.GatewayTest do
         class: "fyi"
       })
 
+    assert NoticeBatcher.source_refs(ctx.db, first.wake_id) == []
+    assert NoticeBatcher.source_refs(ctx.db, second.wake_id) == []
+    assert [carrier_id] = Wakes.materialize_digests(ctx.db)
+
     [%{batch_id: batch_id}] = NoticeBatcher.source_refs(ctx.db, first.wake_id)
+
+    assert [%{batch_id: ^batch_id, delivery_wake_id: ^carrier_id}] =
+             NoticeBatcher.source_refs(ctx.db, first.wake_id)
+
+    assert [%{batch_id: ^batch_id}] = NoticeBatcher.source_refs(ctx.db, second.wake_id)
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM notice_batching_lane_policies")
+
     inspect = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["inspect"]
 
     readable =

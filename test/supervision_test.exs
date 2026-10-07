@@ -1404,7 +1404,8 @@ defmodule Tightbeam.SupervisionTest do
         origin: "user:flynn",
         prompt: "self continuation",
         due_at: System.system_time(:millisecond) + 60_000,
-        creator_session_key: "holder"
+        creator_session_key: "holder",
+        sender_scheduled: true
       })
 
     seq = terminal!(ctx.db, "holder")
@@ -3483,7 +3484,8 @@ defmodule Tightbeam.SupervisionTest do
         origin: "user:flynn",
         prompt: "self continuation",
         due_at: System.system_time(:millisecond) + 60_000,
-        creator_session_key: "holder"
+        creator_session_key: "holder",
+        sender_scheduled: true
       })
 
     assert Wakes.self_pending_count(ctx.db, "holder") == 1
@@ -3559,7 +3561,7 @@ defmodule Tightbeam.SupervisionTest do
     assert Wakes.get(ctx.db, held.wake_id).state == "pending"
   end
 
-  test "a default-off legacy fyi wake does not suppress the turn-end remedy", ctx do
+  test "a held default-on fyi source does not suppress the turn-end remedy", ctx do
     prepare_review_gate(ctx)
 
     held =
@@ -3573,7 +3575,7 @@ defmodule Tightbeam.SupervisionTest do
         class: "fyi"
       })
 
-    assert held.delivery_rule == "turn-boundary-digest r1"
+    assert held.delivery_rule == Wakes.digest_rule()
     assert NoticeBatcher.source_refs(ctx.db, held.wake_id) == []
     assert Wakes.self_pending_count(ctx.db, "holder") == 0
 
@@ -3756,7 +3758,8 @@ defmodule Tightbeam.SupervisionTest do
         target_role: nil,
         origin: "process:ci",
         prompt: "external",
-        due_at: 0
+        due_at: 0,
+        sender_scheduled: true
       })
 
     parent = self()
@@ -4660,7 +4663,14 @@ defmodule Tightbeam.SupervisionTest do
 
     assert :ok = Wakes.fire_due(scheduler)
     assert_receive {:delivered, delivered_id}, 500
-    assert delivered_id == agent_wake.wake_id
+
+    assert [%{delivery_wake_id: ^delivered_id, batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(ctx.db, agent_wake.wake_id)
+
+    assert [%{wake_id: source_wake_id, sender_principal: "session:supervisor"}] =
+             NoticeBatcher.carrier_members(ctx.db, delivered_id)
+
+    assert source_wake_id == agent_wake.wake_id
   end
 
   test "work-blocked standing on another session leaves this holder's prods matching", ctx do

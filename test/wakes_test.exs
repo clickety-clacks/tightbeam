@@ -3,7 +3,7 @@ defmodule Tightbeam.WakesTest do
 
   import ExUnit.CaptureLog
 
-  alias Tightbeam.{DB, EventLog, Wakes}
+  alias Tightbeam.{DB, EventLog, NoticeBatcher, Wakes}
   alias Tightbeam.DB.Txn
 
   describe "terminal notification identity and payload (no admission)" do
@@ -519,7 +519,7 @@ defmodule Tightbeam.WakesTest do
 
     assert original.class == "fyi"
     assert original.class_election == "sender"
-    assert original.delivery_rule == "turn-boundary-digest r1"
+    assert original.delivery_rule == NoticeBatcher.rule()
     refute original.digest
     refute original.summon
 
@@ -671,7 +671,8 @@ defmodule Tightbeam.WakesTest do
         session_key: "k1",
         origin: "system",
         prompt: "now",
-        due_at: System.system_time(:millisecond)
+        due_at: System.system_time(:millisecond),
+        sender_scheduled: true
       })
 
     assert :ok = Wakes.fire_due(scheduler)
@@ -710,7 +711,8 @@ defmodule Tightbeam.WakesTest do
         session_key: "k1",
         origin: "system",
         prompt: "flaky",
-        due_at: System.system_time(:millisecond)
+        due_at: System.system_time(:millisecond),
+        sender_scheduled: true
       })
 
     assert :ok = Wakes.fire_due(scheduler)
@@ -840,7 +842,8 @@ defmodule Tightbeam.WakesTest do
                session_key: "k2",
                origin: "system",
                prompt: "nested",
-               due_at: System.system_time(:millisecond)
+               due_at: System.system_time(:millisecond),
+               sender_scheduled: true
              })
 
            :ok = Wakes.fire_due(self())
@@ -912,7 +915,8 @@ defmodule Tightbeam.WakesTest do
         prompt: "digest: think first",
         due_at: System.system_time(:millisecond),
         rumination: true,
-        work_item_id: "wi_one"
+        work_item_id: "wi_one",
+        sender_scheduled: true
       })
 
     assert wake.rumination

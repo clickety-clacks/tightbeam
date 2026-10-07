@@ -2430,6 +2430,7 @@ defmodule Tightbeam.Assignments do
   end
 
   defp apply_lifecycle_attest(txn, %{params: %{kind: "progress"}}, assignment, attest, _holder) do
+    notify_assignment_opener_of_attest_in_txn(txn, assignment, attest)
     append_attest_marker(txn, attest)
     %{assignment: assignment, attest: attest}
   end
@@ -2459,7 +2460,14 @@ defmodule Tightbeam.Assignments do
     Tightbeam.WorkItems.arm_slate_in_txn(txn, closed_assignment.workItemId)
 
     case Wakes.admit_terminal_notification_in_txn(txn, assignment.id) do
-      {:ok, _wake} ->
+      {:ok, wake} ->
+        # The typed terminal notice already reports this attest when it reaches
+        # the card opener. Preserve the separate source only when the canonical
+        # terminal route selects another currently accountable recipient.
+        if wake.session_key != assignment_opener_session(assignment) do
+          notify_assignment_opener_of_attest_in_txn(txn, assignment, attest)
+        end
+
         :ok
 
       {:error, refusal} ->
@@ -2735,6 +2743,7 @@ defmodule Tightbeam.Assignments do
                      do: raise(TransitionRace)
 
                   attest = insert_attest(txn, call, assignment_id)
+                  notify_assignment_opener_of_attest_in_txn(txn, assignment, attest)
 
                   :ok =
                     Wakes.verification_verdict_in_txn(txn, %{
@@ -2784,6 +2793,7 @@ defmodule Tightbeam.Assignments do
         [] ->
           resolved_call = put_in(call, [:params, :verdict_kind], verdict_kind)
           attest = insert_attest(txn, resolved_call, assignment.id, true)
+          notify_assignment_opener_of_attest_in_txn(txn, assignment, attest)
 
           append_attest_marker(txn, attest)
           %{assignment: assignment, attest: attest}
@@ -3265,6 +3275,42 @@ defmodule Tightbeam.Assignments do
 
     append_substrate(txn, attest.bySession, text)
   end
+
+  defp notify_assignment_opener_of_attest_in_txn(txn, assignment, attest) do
+    recipient = assignment_opener_session(assignment)
+
+    recipient_exists? =
+      case assignment do
+        %{openedByUser: user} when is_binary(user) ->
+          Txn.q(
+            txn,
+            "SELECT 1 FROM sessions WHERE sessionKey=?1 AND ownerUserId=?2",
+            [recipient, user]
+          ) == [[1]]
+
+        _ ->
+          Txn.q(txn, "SELECT 1 FROM sessions WHERE sessionKey=?1", [recipient]) == [[1]]
+      end
+
+    if recipient_exists? do
+      Wakes.schedule_in_txn(txn, %{
+        session_key: recipient,
+        origin: attest_notice_origin(attest),
+        creator_session_key: attest.bySession,
+        prompt: "Attest #{attest.id} (#{attest.kind}) was filed on assignment #{assignment.id}.",
+        due_at: attest.ts,
+        assignment_id: assignment.id,
+        work_item_id: assignment.workItemId
+      })
+    else
+      :ok
+    end
+  end
+
+  defp attest_notice_origin(%{bySession: session}) when is_binary(session),
+    do: "agent:" <> session
+
+  defp attest_notice_origin(%{byUser: user}) when is_binary(user), do: "user:" <> user
 
   defp append_assignment_marker(txn, assignment, :opened) do
     append_substrate(txn, assignment.holderKey, "[assignment opened: #{assignment.id}]")

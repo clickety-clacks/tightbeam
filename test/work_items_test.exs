@@ -101,7 +101,8 @@ defmodule Tightbeam.WorkItemsTest do
         session_key: ctx.holder.session_key,
         origin: "user:flynn",
         prompt: "Synthetic timer",
-        due_at: System.system_time(:millisecond)
+        due_at: System.system_time(:millisecond),
+        sender_scheduled: true
       })
 
     assert {:error, %RuntimeError{message: "rollback publication"}} =

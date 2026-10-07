@@ -278,22 +278,21 @@ defmodule Tightbeam.Wakes do
 
   ## Delivery policy (coordination-fabric-v1 §5 `classifier` + `batcher`, §7 table)
   #
-  # THE MAXIM: a wake's class decides WHEN a mind's turn is spent, never WHETHER
-  # the message is recorded (Law 2). Every row below lands durably at its own
-  # `schedule_in_txn`; batching only moves the moment the turn materializes, and
-  # every batched delivery exits on TIME or a TURN BOUNDARY — never on anyone's
-  # decision (Invariant 3).
+  # Every source wake lands durably at its own `schedule_in_txn`. Ordinary
+  # prompt wakes batch by default regardless of origin or class election. The
+  # class remains on the source and controls only in-batch priority and its
+  # visible marker. Scheduled, conditioned, and internal wakes keep their own
+  # trigger mechanics.
   #
-  # LAYER. The mechanism — stamp a class, look up an immediacy, enforce a
-  # ceiling, sign the result — is PHYSICS. The names and the numbers are
+  # LAYER. The mechanism — stamp a class, look up special-trigger timing, and
+  # sign a batch result — is PHYSICS. The names and the numbers are
   # ANATOMY: seed defaults, verbatim from §7's table, reshapeable by an org
   # through the identity tree. Phase 6 lifts them into policy rows; until a row
   # exists these hardcoded defaults are the fallback (§5). Nothing here judges
   # the CONTENT of a message — the sender elects, the substrate obeys.
   #
-  # §7's immediacy column reads "desk exists / no desk". No desk exists on this
-  # line (Phase 3 stands up the first one), so the NO-DESK column governs every
-  # row below, and each is annotated with the phrase it implements.
+  # The legacy immediacy table remains for scheduled, conditioned, and
+  # internal traffic. Default prompt batching does not consult it.
 
   @doc "The class the classifier stamps on unclassified traffic (fabric §5 seed default)."
   @spec classifier_default() :: String.t()
@@ -307,7 +306,7 @@ defmodule Tightbeam.Wakes do
   # the old revision stays honest about which reflex produced it.
   @rules_rev "r1"
 
-  @digest_rule "notice-batching-v1 r1"
+  @digest_rule "notice-batching-v1 r2"
   @legacy_digest_rule "turn-boundary-digest r1"
   @immediate_rule "immediate-delivery #{@rules_rev}"
   @bypass_rule "algedonic-bypass #{@rules_rev}"
@@ -1687,22 +1686,10 @@ defmodule Tightbeam.Wakes do
 
     file_policy_skew(txn, wake)
 
-    if batch_source?(wake) do
-      policy_ref = NoticeBatcher.record_policy_in_txn(txn, wake, enabled: true)
+    if batch_source?(wake),
+      do: NoticeBatcher.record_policy_in_txn(txn, wake, enabled: true)
 
-      case NoticeBatcher.enqueue_or_recover_in_txn(txn, wake.wake_id, policy_ref) do
-        %{member_id: _, batch_id: _} ->
-          wake
-
-        {:bypass, refusal} ->
-          bypass_v1_batching_in_txn(txn, wake, policy_ref, refusal)
-
-        {:error, refusal} ->
-          raise "notice batching admission refused: #{inspect(refusal)}"
-      end
-    else
-      wake
-    end
+    wake
   end
 
   @doc "Return typed delivery evidence for an explicit remedy wake lineage."
@@ -3637,33 +3624,35 @@ defmodule Tightbeam.Wakes do
     )
   end
 
-  defp bypass_v1_batching_in_txn(txn, wake, policy_ref, refusal) do
+  @doc false
+  def bypass_batching_in_txn(%Txn{} = txn, wake_id, policy_ref, refusal)
+      when is_binary(wake_id) and is_binary(policy_ref) and is_map(refusal) do
     Txn.q(
       txn,
       "UPDATE wakes SET deliveryRule=?2 WHERE wakeId=?1 AND state='pending'",
-      [wake.wake_id, @legacy_digest_rule]
+      [wake_id, @legacy_digest_rule]
     )
 
     Txn.q(
       txn,
       "UPDATE notice_delivery_policies SET enabled=0 WHERE policyRef=?1 AND sourceWakeId=?2",
-      [policy_ref, wake.wake_id]
+      [policy_ref, wake_id]
     )
 
     EventLog.lifecycle_in_txn(
       txn,
       "notice_batching_admission_bypassed",
-      wake.wake_id,
+      wake_id,
       "rule=#{@digest_rule} fallback=#{@legacy_digest_rule} code=#{refusal.code}"
     )
 
-    %{wake | delivery_rule: @legacy_digest_rule}
+    :ok
   end
 
   # The class this wake carries, and who put it there. A caller that names
   # `:class` elects; a caller that asks to be `:classify`-ed accepts the
-  # classifier's stamp; a caller that does neither gets no class at all, which
-  # is how every wake predating the fabric keeps behaving exactly as it did.
+  # classifier's stamp. An ordinary unclassed prompt receives the classifier's
+  # default so it can share the recipient's next-turn batch.
   #
   # A DIGEST CARRIER is neither of those: the batcher built the row, so
   # `classify/1`'s "sender" stamp would be a false audit fact (Sol xhigh
@@ -3680,16 +3669,27 @@ defmodule Tightbeam.Wakes do
       Map.get(input, :classify, false) ->
         classify(nil)
 
+      Map.get(input, :consumer, "prompt") == "prompt" ->
+        classify(nil)
+
       true ->
         {nil, nil}
     end
   end
 
-  # An unclassed wake is not fabric traffic and the policy does not touch it.
-  defp apply_delivery_policy(_txn, input, nil, _created_at, _condition_kind),
+  defp apply_delivery_policy(txn, input, class, created_at, condition_kind) do
+    if is_binary(class) and not Map.get(input, :digest, false) and
+         not batcher_inhibited?(input, condition_kind) do
+      {@digest_rule, Map.fetch!(input, :due_at)}
+    else
+      apply_class_delivery_policy(txn, input, class, created_at, condition_kind)
+    end
+  end
+
+  defp apply_class_delivery_policy(_txn, input, nil, _created_at, _condition_kind),
     do: {nil, Map.fetch!(input, :due_at)}
 
-  defp apply_delivery_policy(txn, input, class, created_at, condition_kind) do
+  defp apply_class_delivery_policy(txn, input, class, created_at, condition_kind) do
     policy = delivery_policy(class)
 
     cond do
@@ -3746,53 +3746,33 @@ defmodule Tightbeam.Wakes do
   # THE INHIBITION SEAM, named (philosophy gate Q2). The batcher is a default,
   # not a cage: a sender that elected its own delivery moment keeps it, a
   # condition wake keeps its own firing mechanics, and an internal consumer is
-  # not an agent's attention to protect. In every case the class is still
-  # RECORDED — inhibiting the reflex never erases what the sender said.
+  # not an agent's attention to protect. Typed terminal notices carry their own
+  # recipient revalidation and recovery protocol, and rumination prompts are
+  # dispatch gates; both keep their own trigger mechanics. In every case the
+  # class is still RECORDED — inhibiting the reflex never erases what the sender
+  # said.
   defp batcher_inhibited?(input, condition_kind) do
     Map.get(input, :sender_scheduled, false) or is_binary(condition_kind) or
-      Map.get(input, :consumer, "prompt") != "prompt"
+      Map.get(input, :rumination, false) or
+      is_binary(Map.get(input, :obligation_ref)) or
+      not is_nil(Map.get(input, :wait_mode)) or Map.get(input, :consumer, "prompt") != "prompt"
   end
 
-  defp v1_batch_eligible?(input, class, condition_kind) do
-    origin = Map.fetch!(input, :origin)
-
-    class == "fyi" and not String.starts_with?(origin, "user:") and
-      not agent_message?(input) and
-      not Map.get(input, :digest, false) and not Map.get(input, :sender_scheduled, false) and
-      not is_binary(condition_kind) and Map.get(input, :consumer, "prompt") == "prompt"
+  defp batch_eligible?(input, class, condition_kind) do
+    is_binary(class) and not Map.get(input, :digest, false) and
+      not Map.get(input, :sender_scheduled, false) and not is_binary(condition_kind) and
+      Map.get(input, :consumer, "prompt") == "prompt" and
+      is_nil(Map.get(input, :wait_mode))
   end
-
-  defp v2_batch_eligible?(input, class, condition_kind) do
-    class == "information" and agent_message?(input) and
-      not Map.get(input, :digest, false) and not Map.get(input, :sender_scheduled, false) and
-      not is_binary(condition_kind) and Map.get(input, :consumer, "prompt") == "prompt"
-  end
-
-  defp batch_eligible?(input, class, condition_kind),
-    do:
-      v1_batch_eligible?(input, class, condition_kind) or
-        v2_batch_eligible?(input, class, condition_kind)
 
   defp batch_source?(wake), do: v1_batch_source?(wake) or v2_batch_source?(wake)
 
   defp v1_batch_source?(wake) do
-    wake.class == "fyi" and wake.delivery_rule == @digest_rule and not wake.digest and
-      not String.starts_with?(wake.origin, "user:") and not agent_message?(wake)
+    wake.delivery_rule == @digest_rule and not wake.digest and wake.consumer == "prompt" and
+      is_binary(wake.class) and is_nil(wake.condition_kind) and is_nil(wake.wait_mode)
   end
 
-  defp v2_batch_source?(wake) do
-    wake.class == "information" and wake.class_election == "sender" and
-      wake.delivery_rule == @digest_rule and not wake.digest and agent_message?(wake)
-  end
-
-  defp agent_message?(message) do
-    Tightbeam.Origin.class(Map.get(message, :origin)) == "agent" and
-      agent_session?(Map.get(message, :creator_session_key)) and
-      agent_session?(Map.get(message, :session_key))
-  end
-
-  defp agent_session?("agent:" <> principal) when principal != "", do: true
-  defp agent_session?(_principal), do: false
+  defp v2_batch_source?(_wake), do: false
 
   # FAIL QUIET AND VISIBLE (§5 policy-skew rule). An extended class this build
   # has no mapping for is delivered as `fyi` — never dropped, never promoted —
@@ -3964,6 +3944,31 @@ defmodule Tightbeam.Wakes do
   # the whole mechanism. Nothing about WHEN it is due needs to move for that
   # to be true.
   defp retarget_delivery(source, _created_at), do: {source.delivery_rule, source.due_at}
+
+  @doc false
+  @spec dispose_closed_remedy_sources(DB.server(), integer()) :: :ok
+  def dispose_closed_remedy_sources(db, at \\ now()) when is_integer(at) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT wakeId FROM wakes
+        WHERE state='pending' AND consumer='prompt' AND origin LIKE 'remedy:%'
+          AND dueAt<=?1 AND conditionKind IS NULL AND waitMode IS NULL
+        ORDER BY dueAt,wakeId
+        """,
+        [at]
+      )
+
+    Enum.each(rows, fn [wake_id] ->
+      case get(db, wake_id) do
+        %{state: "pending"} = wake -> dispose_closed_remedy(db, wake)
+        _ -> :ok
+      end
+    end)
+
+    :ok
+  end
 
   @requester_kinds ~w(user session process)
   @reason_kinds ~w(requester_withdrew superseded obligation_disposed cannot_proceed_released routing_bracket_satisfied target_retired production_unmatched consumer_unavailable target_unresolvable)
@@ -5274,13 +5279,11 @@ defmodule Tightbeam.Wakes do
   Count pending wakes targeting a session that were durably created by that
   same session.
 
-  HELD CLASSED MEMBERS DO NOT COUNT (Sol xhigh review, finding 8). A row still
-  waiting on the batcher (`digest = 0` under `deliveryRule = digest_rule`) is
-  not a queued continuation supervision can rely on — it may not actually
-  reach the session for up to a class ceiling's worth of time. Counting it
-  here let an unrelated `fyi` self-wake suppress the turn-end remedy for as
-  long as four hours. The materialized CARRIER (`digest = 1`) is not held —
-  it is what the batcher already decided to deliver — and counts normally.
+  HELD BATCH MEMBERS DO NOT COUNT. A source row still waiting in an open
+  recipient batch is not a queued continuation supervision can rely on: it
+  remains editable until the recipient is ready for its next turn. The
+  materialized CARRIER (`digest = 1`) is what the batcher decided to deliver
+  and counts normally.
   """
   @spec self_pending_count(db(), String.t()) :: non_neg_integer()
   def self_pending_count(db \\ Tightbeam.DB, session_key) do
@@ -5307,44 +5310,21 @@ defmodule Tightbeam.Wakes do
   ## The batcher (fabric §5 `batcher`; Invariant 3)
 
   @doc """
-  Materialize every digest whose delivery moment has arrived.
+  Materialize each default-on batch from the recipient's due prompt queue only
+  when that recipient is ready to take a turn. While a turn is running, source
+  wakes have no batch membership and remain individually editable. Readiness,
+  enrollment, sealing, and carrier creation happen in one transaction so a
+  cancellation or retarget cannot race into a frozen envelope.
 
-  ONE TURN FOR N PAYLOADS. Members are grouped by target AND class — per-class,
-  because the ceiling is per-class and mixing a four-hour `fyi` with a
-  thirty-minute `input-needed` would either delay one or promote the other.
-  The TARGET half of the group key is the session for a session-addressed
-  member, but the ROLE itself for a role-addressed one (O2): a role's bound
-  session can change between two members' filing times, and grouping by
-  whatever session each one happened to resolve to at that moment would
-  split one audience into several groups and leave the carrier unable to
-  re-resolve at delivery. A role group's carrier carries `targetRole`
-  forward so it re-resolves the SAME way any other role-addressed wake does.
+  Every due prompt class shares the recipient batch. Class controls only member
+  priority and stays visible in each source mark. Session, user, and role
+  addresses remain separate groups; role carriers preserve `targetRole` so
+  delivery resolves the same audience again.
 
-  THE EXIT IS TIME OR A TURN BOUNDARY, never a decision (Invariant 3):
-
-    * the target's next turn boundary — a turn of its own ended at or after
-      THIS member was filed; a turn boundary is a turn ENDING, so queued or
-      running work behind it is not a reason to hold (the wake joins the
-      queue — that IS what "materializing one turn" means); or
-    * the class ceiling — which is the member's own `dueAt`, so an idle session
-      that never takes another turn still has its digest materialize one.
-
-  ELIGIBILITY AND MEMBERSHIP ARE ONE TRANSACTIONALLY COHERENT SNAPSHOT (Sol
-  xhigh review, finding 2). There is no outer "is this group due" query whose
-  answer the transaction later trusts: each member's OWN ceiling and OWN
-  filing time are re-read and re-judged from the SAME snapshot the transaction
-  uses to select members, so a wake filed after another member's boundary or
-  ceiling already passed waits for its own — never absorbed by somebody
-  else's trigger. `due_reason` is computed exactly once, from that snapshot,
-  per member (finding 4): a member with no named reason is left pending, never
-  materialized under an empty `trigger=`.
-
-  SOURCE ROWS ARE PRESERVED (Law 2, wi_1100e078's title). A member is consumed
-  through the typed cancellation seam as `superseded` with the digest named as
-  its REPLACEMENT — the same shape re-resolution already uses. Its prompt, its
-  sender, its class and its election all stay on the row; the digest-member
-  audit is one join over `wake_cancellations`. Nothing is deleted and nothing
-  is summarized away.
+  Batch and rendered-payload limits split the ready queue into bounded
+  carriers. A source too large to fit by itself is moved to the compatibility
+  digest path without truncating or rewriting its payload. Source rows remain
+  durable and are never deleted by materialization.
   """
   @spec materialize_digests(db()) :: [String.t()]
   def materialize_digests(db \\ Tightbeam.DB), do: materialize_digests(db, now())

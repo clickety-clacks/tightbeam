@@ -12,6 +12,7 @@ defmodule Tightbeam.EffortNotificationFixture do
     Escalation,
     Gateway,
     Ledger,
+    NoticeBatcher,
     Org,
     Placement,
     Wakes,
@@ -159,7 +160,7 @@ defmodule Tightbeam.EffortNotificationFixture do
     assert Enum.all?(notices, &(&1.assignment_id == item.id))
     drain_notifications!(ctx)
 
-    assert [[3]] =
+    assert [[2]] =
              rows(
                ctx.db,
                "SELECT count(*) FROM turns WHERE assignmentId=?1 AND prompt LIKE '%effort check-in%'",
@@ -171,7 +172,14 @@ defmodule Tightbeam.EffortNotificationFixture do
 
     assert Wakes.get(ctx.db, ordinary.wake_id).state == "pending"
     assert [] == rows(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [ordinary.wake_id])
-    assert Enum.all?(notices, &(Wakes.get(ctx.db, &1.wake_id).state == "fired"))
+
+    assert Enum.all?(notices, fn notice ->
+             Wakes.get(ctx.db, notice.wake_id).state == "pending" and
+               match?(
+                 [%{batch_state: "delivered"}],
+                 NoticeBatcher.source_refs(ctx.db, notice.wake_id)
+               )
+           end)
   end
 
   defp scenario(1, ctx) do
@@ -217,11 +225,7 @@ defmodule Tightbeam.EffortNotificationFixture do
              ORDER BY seq
              """,
              []
-           ) == [
-             [assignment.id, item.id],
-             [assignment.id, item.id],
-             [assignment.id, item.id]
-           ]
+           ) == [[assignment.id, item.id], [assignment.id, item.id]]
   end
 
   defp scenario(2, ctx) do
@@ -251,8 +255,14 @@ defmodule Tightbeam.EffortNotificationFixture do
 
     # Ordinary wake recovery surfaces it without waiting for the deadline.
     scheduler = drain_notifications!(ctx)
-    assert Wakes.get(ctx.db, opened.wake_id).state == "fired"
-    assert rows(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [opened.wake_id]) == [[1]]
+    assert Wakes.get(ctx.db, opened.wake_id).state == "pending"
+
+    assert [%{delivery_wake_id: opened_carrier, batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(ctx.db, opened.wake_id)
+
+    assert Wakes.get(ctx.db, opened_carrier).state == "fired"
+    assert rows(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [opened.wake_id]) == [[0]]
+    assert rows(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [opened_carrier]) == [[1]]
     assert Wakes.get(ctx.db, old_deadline_id).state == "pending"
 
     # Proof 8b: the winning deadline advance commits the new rung, its
@@ -263,15 +273,21 @@ defmodule Tightbeam.EffortNotificationFixture do
     assert Wakes.get(ctx.db, advanced.deadline_wake_id).state == "pending"
     assert Wakes.get(ctx.db, old_deadline_id).state == "fired"
 
-    assert [%{state: "fired"}, %{state: "pending", target_gate: 0} = rung] =
+    assert [%{state: "pending"}, %{state: "pending", target_gate: 0} = rung] =
              notification_wakes(ctx.db)
 
     assert rung.session_key == (advanced.expecter_session_key || personal_key)
     assert rung.prompt =~ "Effort check-in #{request_id}"
 
     :ok = Wakes.fire_due(scheduler)
-    assert Wakes.get(ctx.db, rung.wake_id).state == "fired"
-    assert rows(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [rung.wake_id]) == [[1]]
+    assert Wakes.get(ctx.db, rung.wake_id).state == "pending"
+
+    assert [%{delivery_wake_id: rung_carrier, batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(ctx.db, rung.wake_id)
+
+    assert Wakes.get(ctx.db, rung_carrier).state == "fired"
+    assert rows(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [rung.wake_id]) == [[0]]
+    assert rows(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [rung_carrier]) == [[1]]
 
     # A stale deadline replay still no-ops on deadlineWakeId mismatch: no rung
     # rotation, no third notification.
@@ -399,7 +415,7 @@ defmodule Tightbeam.EffortNotificationFixture do
 
   defp notification_wakes(db) do
     db
-    |> rows("SELECT wakeId FROM wakes WHERE targetGate = 0 ORDER BY rowid", [])
+    |> rows("SELECT wakeId FROM wakes WHERE targetGate = 0 AND digest = 0 ORDER BY rowid", [])
     |> Enum.map(fn [wake_id] -> Wakes.get(db, wake_id) end)
   end
 

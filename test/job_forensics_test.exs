@@ -500,6 +500,7 @@ defmodule Tightbeam.JobForensicsTest do
         origin: "user:flynn",
         prompt: "cancel first",
         due_at: 0,
+        sender_scheduled: true,
         work_item_id: "wi_cancel_first"
       })
 
@@ -520,6 +521,7 @@ defmodule Tightbeam.JobForensicsTest do
         origin: "user:flynn",
         prompt: "fire first",
         due_at: 0,
+        sender_scheduled: true,
         work_item_id: "wi_fire_first"
       })
 

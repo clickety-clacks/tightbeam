@@ -2895,7 +2895,8 @@ defmodule Tightbeam.ConformanceSupport do
         origin: "process:conformance",
         prompt: "conformance continuation",
         due_at: wake["at"],
-        creator_session_key: wake["creatorSessionKey"]
+        creator_session_key: wake["creatorSessionKey"],
+        sender_scheduled: true
       })
     end)
 

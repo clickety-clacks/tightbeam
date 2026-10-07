@@ -8,33 +8,33 @@ defmodule Tightbeam.NoticeBatcherTest do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 0)
   end
 
-  test "acceptance 2: user-authored fyi bypasses membership and keeps the ordinary path", %{
+  test "acceptance 2: user-authored fyi joins the default recipient batch", %{
     tmp_dir: tmp
   } do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 1)
   end
 
-  test "acceptance 3: urgent classes and agent-authored fyi keep their pre-V2 paths", %{
+  test "acceptance 3: every prompt class and origin joins the default batch", %{
     tmp_dir: tmp
   } do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 2)
   end
 
-  test "acceptance 4: blocker publication leaves the fyi batch unchanged", %{tmp_dir: tmp} do
+  test "acceptance 4: blocker joins the ordinary recipient batch", %{tmp_dir: tmp} do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 3)
   end
 
-  test "acceptance 5: rows-only status query creates no batch state", %{tmp_dir: tmp} do
+  test "acceptance 5: internal status query remains outside prompt batching", %{tmp_dir: tmp} do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 4)
   end
 
-  test "acceptance 6: ceiling seals then arms without a decision or desk dependency", %{
+  test "acceptance 6: an idle recipient forms its batch at the due time", %{
     tmp_dir: tmp
   } do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 5)
   end
 
-  test "acceptance 7: a terminal turn boundary releases before the ceiling", %{tmp_dir: tmp} do
+  test "acceptance 7: a busy recipient forms its batch after the turn boundary", %{tmp_dir: tmp} do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 6)
   end
 
@@ -58,7 +58,7 @@ defmodule Tightbeam.NoticeBatcherTest do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 10)
   end
 
-  test "an overflow-sealed prefix arms at the recipient boundary before its ceiling", %{
+  test "bounded queue chunks become carriers in the recipient-ready pass", %{
     tmp_dir: tmp
   } do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 11)
@@ -104,13 +104,13 @@ defmodule Tightbeam.NoticeBatcherTest do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 19)
   end
 
-  test "acceptance 21: default-off selection and rollback preserve the ordinary path", %{
+  test "acceptance 21: legacy lane settings cannot disable automatic batching", %{
     tmp_dir: tmp
   } do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 20)
   end
 
-  test "default-off digest preserves the legacy rule through suppression and provenance", %{
+  test "unclassed prompt traffic gets the default class and batches immediately when idle", %{
     tmp_dir: tmp
   } do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 21)
@@ -136,10 +136,20 @@ defmodule Tightbeam.NoticeBatcherTest do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 25)
   end
 
-  test "V2 public authenticated --user, session and role lanes isolate information recipients", %{
+  test "authenticated user, session and role targets batch by default with source privacy", %{
     tmp_dir: tmp
   } do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 26)
+  end
+
+  test "class priority marks every source and unclassed prompts use the classifier default", %{
+    tmp_dir: tmp
+  } do
+    Tightbeam.NoticeBatcherFixture.run!(tmp, 27)
+  end
+
+  test "a busy recipient keeps sources editable until the next turn boundary", %{tmp_dir: tmp} do
+    Tightbeam.NoticeBatcherFixture.run!(tmp, 28)
   end
 
   @tag notice_guarded_restart: true
