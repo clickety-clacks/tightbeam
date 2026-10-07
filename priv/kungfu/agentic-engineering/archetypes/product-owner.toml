@@ -1,5 +1,6 @@
 name = "product-owner"
 idle_cleanup = false
+descendant_activity_credit = true
 skills = ["repository-retirement", "tightbeam-dispatching", "delivery-bootstrap", "model-release-intake"]
 
 [guidance]

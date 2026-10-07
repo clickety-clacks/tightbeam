@@ -131,6 +131,8 @@ defmodule Tightbeam.Supervision do
   """
 
   @failure_threshold 6
+  @descendant_activity_max_depth 8
+  @descendant_activity_window_ms 14_400_000
   @idle_cleanup_prefix "idle-cleanup-v1:"
   @idle_cleanup_default_horizon_ms 14_400_000
   @idle_cleanup_default_priority 4
@@ -1437,7 +1439,8 @@ defmodule Tightbeam.Supervision do
 
   Liveness receipts are deliberately NOT match conditions. The act consumes
   only typed durable sources: an assignment artifact, work-item update,
-  verdict fact, or one unexpired assignment-bound checkpoint. Progress prose
+  verdict fact, one unexpired assignment-bound checkpoint, and (for marked
+  archetypes only) bounded same-work-item descendant activity. Progress prose
   is never parsed and never resets the ladder by itself.
 
   A no-match verdict names the failing conjunct. Verdicts the turn-end
@@ -1447,15 +1450,19 @@ defmodule Tightbeam.Supervision do
   @spec prod_production_matches?(DB.server(), String.t(), integer() | nil) ::
           {:match, map()} | {:no_match, atom()} | {:no_match, atom(), map()}
   def prod_production_matches?(db, session_key, terminal_seq) do
+    snapshot_at = System.system_time(:millisecond)
+
     selection =
       transaction!(db, fn txn ->
         candidates =
           Txn.q(
             txn,
             """
-            SELECT a.id,a.subject,a.holderKey,p.lastEvaluatedTerminal
+            SELECT a.id,a.subject,a.holderKey,p.lastEvaluatedTerminal,
+                   a.workItemId,s.archetype
             FROM assignments a LEFT JOIN supervision_watermarks p
               ON p.assignmentId=a.id AND p.sessionKey=a.holderKey
+            JOIN sessions s ON s.sessionKey=a.holderKey
             WHERE a.holderKey=?1 AND a.state='open'
               AND NOT EXISTS (
                 SELECT 1 FROM assignment_cannot_proceed cp
@@ -1467,9 +1474,17 @@ defmodule Tightbeam.Supervision do
           )
 
         assignment =
-          Enum.find_value(candidates, fn [id, subject, holder, prior] ->
+          Enum.find_value(candidates, fn [id, subject, holder, prior, work_item_id, archetype] ->
             if (is_nil(terminal_seq) or is_nil(prior) or prior < terminal_seq) and
-                 not Wakes.covering_continuation_in_txn?(txn, id),
+                 not Wakes.covering_continuation_in_txn?(txn, id) and
+                 (is_nil(terminal_seq) or
+                    not descendant_continuation_in_txn?(
+                      txn,
+                      holder,
+                      work_item_id,
+                      archetype,
+                      snapshot_at
+                    )),
                do: %{id: id, subject: subject, holderKey: holder}
           end)
 
@@ -1480,13 +1495,28 @@ defmodule Tightbeam.Supervision do
           candidates == [] ->
             {:no_match, :no_open_obligation}
 
-          Enum.any?(candidates, fn [id, _, _, _] ->
+          Enum.any?(candidates, fn [id | _] ->
             Wakes.covering_continuation_in_txn?(txn, id)
           end) ->
             {:no_match, :strand_moving}
 
-          Enum.any?(candidates, fn [_, _, _, prior] -> prior == terminal_seq end) ->
+          Enum.any?(candidates, fn [_id, _subject, _holder, prior | _] ->
+            prior == terminal_seq
+          end) ->
             {:no_match, :terminal_already_evaluated}
+
+          Enum.any?(candidates, fn [id, _subject, holder, prior, work_item_id, archetype] ->
+            not is_nil(terminal_seq) and (is_nil(prior) or prior < terminal_seq) and
+              not Wakes.covering_continuation_in_txn?(txn, id) and
+              descendant_continuation_in_txn?(
+                txn,
+                holder,
+                work_item_id,
+                archetype,
+                snapshot_at
+              )
+          end) ->
+            {:no_match, :descendant_moving}
 
           true ->
             {:no_match, :terminal_coalesced}
@@ -3328,10 +3358,14 @@ defmodule Tightbeam.Supervision do
   defp absorb_receipt_candidates_in_txn(txn, assignment_id, generation, interval) do
     evaluation_clock = now()
 
-    [[holder, work_item_id]] =
+    [[holder, work_item_id, archetype]] =
       Txn.q(
         txn,
-        "SELECT holderKey, workItemId FROM assignments WHERE id=?1 AND state='open'",
+        """
+        SELECT a.holderKey, a.workItemId, s.archetype
+        FROM assignments a JOIN sessions s ON s.sessionKey=a.holderKey
+        WHERE a.id=?1 AND a.state='open'
+        """,
         [assignment_id]
       )
 
@@ -3356,7 +3390,19 @@ defmodule Tightbeam.Supervision do
         artifact_max
       ) ++
         attest_receipts_in_txn(txn, assignment_id, generation, attest_cursor, attest_max) ++
-        work_item_receipts_in_txn(txn, work_item_id, event_cursor, event_max)
+        work_item_receipts_in_txn(txn, work_item_id, event_cursor, event_max) ++
+        descendant_activity_receipts_in_txn(
+          txn,
+          assignment_id,
+          holder,
+          work_item_id,
+          archetype,
+          artifact_cursor,
+          artifact_max,
+          attest_cursor,
+          attest_max,
+          evaluation_clock
+        )
 
     checkpoint =
       checkpoint_receipt_in_txn(
@@ -3562,6 +3608,205 @@ defmodule Tightbeam.Supervision do
     |> Enum.map(fn [id, at] ->
       %{kind: "work_item_update", id: to_string(id), at: at, expires_at: nil}
     end)
+  end
+
+  defp descendant_activity_receipts_in_txn(
+         _txn,
+         _assignment_id,
+         _holder,
+         nil,
+         _archetype,
+         _artifact_cursor,
+         _artifact_max,
+         _attest_cursor,
+         _attest_max,
+         _snapshot_at
+       ),
+       do: []
+
+  defp descendant_activity_receipts_in_txn(
+         txn,
+         assignment_id,
+         holder,
+         work_item_id,
+         archetype,
+         artifact_cursor,
+         artifact_max,
+         attest_cursor,
+         attest_max,
+         snapshot_at
+       ) do
+    if descendant_activity_credit?(archetype) do
+      since = snapshot_at - @descendant_activity_window_ms
+
+      descendant_artifact_receipts_in_txn(
+        txn,
+        holder,
+        work_item_id,
+        artifact_cursor,
+        artifact_max,
+        since,
+        snapshot_at
+      ) ++
+        descendant_attest_receipts_in_txn(
+          txn,
+          holder,
+          work_item_id,
+          attest_cursor,
+          attest_max,
+          since,
+          snapshot_at
+        ) ++
+        descendant_turn_receipt_in_txn(txn, assignment_id, holder, work_item_id, since, snapshot_at)
+    else
+      []
+    end
+  end
+
+  defp descendant_artifact_receipts_in_txn(
+         txn,
+         holder,
+         work_item_id,
+         cursor,
+         maximum,
+         since,
+         snapshot_at
+       ) do
+    (descendant_sessions_cte() <>
+       """
+       SELECT artifact.artifactId, artifact.createdAt
+       FROM artifacts artifact
+       WHERE artifact.rowid > ?2 AND artifact.rowid <= ?3
+         AND artifact.workItemId=?4
+         AND artifact.createdBySession IN (SELECT sessionKey FROM descendant_sessions)
+         AND artifact.createdAt >= ?5 AND artifact.createdAt <= ?6
+       ORDER BY artifact.rowid
+       """)
+    |> then(&Txn.q(txn, &1, [holder, cursor, maximum, work_item_id, since, snapshot_at]))
+    |> Enum.map(fn [id, at] ->
+      %{kind: "artifact", id: id, at: at, expires_at: nil}
+    end)
+  end
+
+  defp descendant_attest_receipts_in_txn(
+         txn,
+         holder,
+         work_item_id,
+         cursor,
+         maximum,
+         since,
+         snapshot_at
+       ) do
+    (descendant_sessions_cte() <>
+       """
+       SELECT attest.id, attest.kind, attest.ts
+       FROM attests attest
+       JOIN assignments child_assignment ON child_assignment.id=attest.assignmentId
+       WHERE attest.rowid > ?2 AND attest.rowid <= ?3
+         AND child_assignment.workItemId=?4
+         AND attest.bySession IN (SELECT sessionKey FROM descendant_sessions)
+         AND attest.ts >= ?5 AND attest.ts <= ?6
+       ORDER BY attest.rowid
+       """)
+    |> then(&Txn.q(txn, &1, [holder, cursor, maximum, work_item_id, since, snapshot_at]))
+    |> Enum.map(fn [id, kind, at] ->
+      source_kind = if kind == "verdict", do: "verdict", else: "progress"
+
+      %{
+        kind: source_kind,
+        id: "descendant-attest:#{kind}:#{id}",
+        at: at,
+        expires_at: nil
+      }
+    end)
+  end
+
+  defp descendant_turn_receipt_in_txn(
+         txn,
+         assignment_id,
+         holder,
+         work_item_id,
+         since,
+         snapshot_at
+       ) do
+    (descendant_sessions_cte() <>
+       """
+       SELECT recent.seq, recent.activityAt
+       FROM (
+         SELECT turn.seq, COALESCE(turn.endedAt, turn.startedAt, turn.createdAt) AS activityAt
+         FROM turns turn
+         JOIN wakes wake ON wake.wakeId=turn.wakeId
+         WHERE turn.sessionKey IN (SELECT sessionKey FROM descendant_sessions)
+           AND wake.work_item_id=?2
+           AND COALESCE(turn.endedAt, turn.startedAt, turn.createdAt) >= ?3
+           AND COALESCE(turn.endedAt, turn.startedAt, turn.createdAt) <= ?4
+         ORDER BY activityAt DESC, turn.seq DESC
+         LIMIT 1
+       ) recent
+       WHERE NOT EXISTS (
+         SELECT 1 FROM supervision_liveness_receipts receipt
+         WHERE receipt.assignmentId=?5 AND receipt.sourceKind='progress'
+           AND receipt.sourceId='descendant-turn:' || CAST(recent.seq AS TEXT)
+       )
+       """)
+    |> then(&Txn.q(txn, &1, [holder, work_item_id, since, snapshot_at, assignment_id]))
+    |> case do
+      [[seq, at]] ->
+        [%{kind: "progress", id: "descendant-turn:#{seq}", at: at, expires_at: nil}]
+
+      [] ->
+        []
+    end
+  end
+
+  defp descendant_continuation_in_txn?(_txn, _holder, nil, _archetype, _snapshot_at),
+    do: false
+
+  defp descendant_continuation_in_txn?(txn, holder, work_item_id, archetype, snapshot_at) do
+    if descendant_activity_credit?(archetype) do
+      since = snapshot_at - @descendant_activity_window_ms
+
+      (descendant_sessions_cte() <>
+         """
+         SELECT 1
+         FROM assignments child_assignment
+         JOIN sessions child_session ON child_session.sessionKey=child_assignment.holderKey
+         WHERE child_assignment.holderKey IN (SELECT sessionKey FROM descendant_sessions)
+           AND child_assignment.workItemId=?2
+           AND child_assignment.state='open'
+           AND child_session.state='active'
+           AND child_assignment.openedAt >= ?3 AND child_assignment.openedAt <= ?4
+         LIMIT 1
+         """)
+      |> then(&Txn.q(txn, &1, [holder, work_item_id, since, snapshot_at]))
+      |> Kernel.!=([])
+    else
+      false
+    end
+  end
+
+  defp descendant_activity_credit?(archetype_name) do
+    case Archetypes.get(archetype_name) do
+      %{descendant_activity_credit: true} -> true
+      _ -> false
+    end
+  end
+
+  defp descendant_sessions_cte do
+    current_parent = Org.current_parent_sql("child")
+
+    """
+    WITH RECURSIVE descendant_sessions(sessionKey, depth) AS (
+      SELECT child.sessionKey, 1
+      FROM sessions child
+      WHERE child.sessionKey != ?1 AND #{current_parent}=?1
+      UNION
+      SELECT child.sessionKey, parent.depth+1
+      FROM sessions child
+      JOIN descendant_sessions parent ON #{current_parent}=parent.sessionKey
+      WHERE parent.depth < #{@descendant_activity_max_depth}
+    )
+    """
   end
 
   defp checkpoint_receipt_in_txn(

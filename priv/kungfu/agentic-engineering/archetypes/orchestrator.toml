@@ -1,4 +1,5 @@
 name = "orchestrator"
+descendant_activity_credit = true
 skills = ["repository-retirement", "landing", "delivery-bootstrap"]
 
 [defaults]

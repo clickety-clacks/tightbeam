@@ -22,6 +22,7 @@ defmodule Tightbeam.Archetypes do
           references: [%{name: String.t(), location: String.t(), access: String.t() | nil}],
           model_preferences: [Tightbeam.Model.t()],
           idle_cleanup: boolean(),
+          descendant_activity_credit: boolean(),
           containment: %{fs: :off, network: :open},
           mcp: [
             %{
@@ -593,6 +594,7 @@ defmodule Tightbeam.Archetypes do
       references: [],
       model_preferences: [],
       idle_cleanup: true,
+      descendant_activity_credit: false,
       containment: %{fs: :off, network: :open},
       mcp: [],
       guidance: nil,
@@ -610,6 +612,7 @@ defmodule Tightbeam.Archetypes do
         "references",
         "model_preferences",
         "idle_cleanup",
+        "descendant_activity_credit",
         "guidance",
         "mcp",
         "containment"
@@ -632,9 +635,15 @@ defmodule Tightbeam.Archetypes do
     where = Map.get(manifest, "where", [Tightbeam.Placement.local_host_name()])
     skills = Map.get(manifest, "skills", [])
     idle_cleanup = Map.get(manifest, "idle_cleanup", true)
+    descendant_activity_credit = Map.get(manifest, "descendant_activity_credit", false)
 
     unless is_boolean(idle_cleanup) do
       raise ArgumentError, "archetype idle_cleanup must be a boolean: #{path}"
+    end
+
+    unless is_boolean(descendant_activity_credit) do
+      raise ArgumentError,
+            "archetype descendant_activity_credit must be a boolean: #{path}"
     end
 
     unless is_list(skills) and Enum.all?(skills, &is_binary/1) do
@@ -694,6 +703,7 @@ defmodule Tightbeam.Archetypes do
       where: where,
       model_preferences: model_preferences,
       idle_cleanup: idle_cleanup,
+      descendant_activity_credit: descendant_activity_credit,
       containment: containment,
       defaults: defaults,
       references: references,

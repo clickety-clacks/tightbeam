@@ -1811,6 +1811,197 @@ defmodule Tightbeam.SupervisionTest do
     assert Wakes.list_pending(ctx.db) == []
   end
 
+  test "unmarked owner archetype keeps its own effect and ignores descendant artifacts", ctx do
+    attach_work_item!(ctx.db, "asg_1", "wi_unmarked_descendant")
+    insert_entitlement!(ctx.db, "asg_1", generation: 2, due_at: 0, interval: 60_000)
+
+    worker = session(ctx.db, "unmarked-descendant", "holder")
+    insert_artifact!(ctx.db, "art_unmarked_owner", "holder", "wi_unmarked_descendant", System.system_time(:millisecond))
+    insert_artifact!(ctx.db, "art_unmarked_child", worker.session_key, "wi_unmarked_descendant", System.system_time(:millisecond))
+
+    _name = start_liveness!(ctx, sweep_ms: 60_000)
+
+    assert {:ok, [["artifact", "art_unmarked_owner"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sourceKind,sourceId FROM supervision_liveness_receipts"
+             )
+  end
+
+  test "marked owner liveness credits only recent same-work-item descendant effects", ctx do
+    enable_descendant_activity_credit!(ctx)
+    attach_work_item!(ctx.db, "asg_1", "wi_descendant_effects")
+    insert_entitlement!(ctx.db, "asg_1", generation: 2, due_at: 0, interval: 60_000)
+
+    worker = session(ctx.db, "descendant-worker", "holder")
+    assignment(ctx.db, "asg_descendant", worker.session_key, "descendant work", 1)
+    attach_work_item!(ctx.db, "asg_descendant", "wi_descendant_effects")
+
+    now = System.system_time(:millisecond)
+    insert_artifact!(ctx.db, "art_descendant_current", worker.session_key, "wi_descendant_effects", now)
+    insert_artifact!(ctx.db, "art_descendant_other_item", worker.session_key, "wi_other", now)
+
+    insert_artifact!(
+      ctx.db,
+      "art_descendant_stale",
+      worker.session_key,
+      "wi_descendant_effects",
+      now - 14_400_001
+    )
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO attests (id, assignmentId, kind, note, bySession, ts) VALUES ('att_descendant_current','asg_descendant','progress','worked','descendant-worker',?1)",
+        [now]
+      )
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO work_item_events (ts, workItemId, kind) VALUES (?1, 'wi_descendant_effects', 'metadata')",
+        [now]
+      )
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO work_item_events (ts, workItemId, kind) VALUES (?1, 'wi_other', 'metadata')",
+        [now]
+      )
+
+    _name = start_liveness!(ctx, sweep_ms: 60_000)
+
+    assert {:ok, receipts} =
+             DB.query(
+               ctx.db,
+               "SELECT sourceKind,sourceId FROM supervision_liveness_receipts ORDER BY sourceKind,sourceId"
+             )
+
+    assert receipts == [
+             ["artifact", "art_descendant_current"],
+             ["progress", "descendant-attest:progress:att_descendant_current"],
+             ["work_item_update", "1"]
+           ]
+  end
+
+  test "marked owner liveness credits one recent same-work-item descendant turn", ctx do
+    enable_descendant_activity_credit!(ctx)
+    attach_work_item!(ctx.db, "asg_1", "wi_descendant_turn")
+    insert_entitlement!(ctx.db, "asg_1", generation: 2, due_at: 0, interval: 60_000)
+
+    worker = session(ctx.db, "descendant-turn-worker", "holder")
+    assignment(ctx.db, "asg_descendant_turn", worker.session_key, "turn work", 1)
+    attach_work_item!(ctx.db, "asg_descendant_turn", "wi_descendant_turn")
+
+    now = System.system_time(:millisecond)
+    wake =
+      Wakes.schedule(ctx.db, %{
+        session_key: worker.session_key,
+        target_role: nil,
+        origin: "user:flynn",
+        prompt: "same work item",
+        due_at: now,
+        creator_session_key: "holder",
+        work_item_id: "wi_descendant_turn",
+        assignment_id: "asg_descendant_turn"
+      })
+
+    assert {:ok, seq} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: worker.session_key,
+               message_id: "descendant-turn-message",
+               wake_id: wake.wake_id,
+               origin: "user:flynn",
+               prompt: "same work item",
+               assignment_id: "asg_descendant_turn",
+               job_ref: "wi_descendant_turn"
+             })
+
+    _name = start_liveness!(ctx, sweep_ms: 60_000)
+
+    assert {:ok, [["progress", "descendant-turn:" <> turn_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sourceKind,sourceId FROM supervision_liveness_receipts"
+             )
+
+    assert turn_id == Integer.to_string(seq)
+  end
+
+  test "descendant continuation credit is default-off and requires a recent open active same-item child",
+       ctx do
+    attach_work_item!(ctx.db, "asg_1", "wi_descendant_continuation")
+    seq = terminal!(ctx.db, "holder")
+    child = session(ctx.db, "descendant-continuation", "holder")
+    assignment(ctx.db, "asg_descendant_continuation", child.session_key, "child work", 1)
+    attach_work_item!(ctx.db, "asg_descendant_continuation", "wi_descendant_continuation")
+
+    assert {:match, %{id: "asg_1"}} =
+             Supervision.prod_production_matches?(ctx.db, "holder", seq)
+
+    enable_descendant_activity_credit!(ctx)
+
+    assert {:no_match, :descendant_moving} =
+             Supervision.prod_production_matches?(ctx.db, "holder", seq)
+
+    {:ok, _} = DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [child.session_key])
+
+    assert {:match, %{id: "asg_1"}} =
+             Supervision.prod_production_matches?(ctx.db, "holder", seq)
+
+    {:ok, _} = DB.query(ctx.db, "UPDATE sessions SET state='active' WHERE sessionKey=?1", [child.session_key])
+    {:ok, _} = DB.query(ctx.db, "UPDATE assignments SET workItemId='wi_other' WHERE id='asg_descendant_continuation'")
+
+    assert {:match, %{id: "asg_1"}} =
+             Supervision.prod_production_matches?(ctx.db, "holder", seq)
+
+    {:ok, _} = DB.query(ctx.db, "UPDATE assignments SET workItemId='wi_descendant_continuation', openedAt=?2 WHERE id=?1", [
+      "asg_descendant_continuation",
+      System.system_time(:millisecond) - 14_400_001
+    ])
+
+    assert {:match, %{id: "asg_1"}} =
+             Supervision.prod_production_matches?(ctx.db, "holder", seq)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO attests (id,assignmentId,kind,bySession,ts) VALUES ('att_child_close','asg_descendant_continuation','completion',?1,?2)",
+        [child.session_key, System.system_time(:millisecond)]
+      )
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE assignments SET state='closed', outcome='completed', closedAt=?2, closedBySession=?3, closingAttestId='att_child_close' WHERE id=?1",
+        ["asg_descendant_continuation", System.system_time(:millisecond), child.session_key]
+      )
+
+    assert {:match, %{id: "asg_1"}} =
+             Supervision.prod_production_matches?(ctx.db, "holder", seq)
+
+    {:ok, _} = DB.query(ctx.db, "UPDATE assignments SET state='open', openedAt=?2 WHERE id=?1", [
+      "asg_descendant_continuation",
+      System.system_time(:millisecond)
+    ])
+
+    parent = child.session_key
+
+    deepest =
+      Enum.reduce(1..9, parent, fn depth, parent_key ->
+        key = "descendant-depth-#{depth}"
+        session(ctx.db, key, parent_key)
+        key
+      end)
+
+    assignment(ctx.db, "asg_descendant_too_deep", deepest, "deep child work", System.system_time(:millisecond))
+    attach_work_item!(ctx.db, "asg_descendant_too_deep", "wi_descendant_continuation")
+
+    assert {:match, %{id: "asg_1"}} =
+             Supervision.prod_production_matches?(ctx.db, "holder", seq)
+  end
+
   test "one bounded assignment checkpoint resets; repeats need a later effect", ctx do
     attach_work_item!(ctx.db, "asg_1", "wi_checkpoint")
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0, interval: 60_000)
@@ -5404,6 +5595,34 @@ defmodule Tightbeam.SupervisionTest do
         assignment_id,
         work_item_id
       ])
+
+    :ok
+  end
+
+  defp enable_descendant_activity_credit!(ctx) do
+    archetype_dir = Path.join(ctx.base, "identity/archetypes")
+    File.mkdir_p!(archetype_dir)
+    manifest = Path.join(archetype_dir, "pdo.toml")
+
+    File.write!(manifest, "name = \"pdo\"\ndescendant_activity_credit = false\n")
+    Archetypes.load!(ctx.base)
+
+    {:ok, _} = DB.query(ctx.db, "UPDATE sessions SET archetype='pdo' WHERE sessionKey='holder'")
+
+    {:ok, [session_identity_before]} =
+      DB.query(
+        ctx.db,
+        "SELECT archetype,identityRevision,identityGuidanceDigest FROM sessions WHERE sessionKey='holder'"
+      )
+
+    File.write!(manifest, "name = \"pdo\"\ndescendant_activity_credit = true\n")
+    Archetypes.load!(ctx.base)
+
+    {:ok, [^session_identity_before]} =
+      DB.query(
+        ctx.db,
+        "SELECT archetype,identityRevision,identityGuidanceDigest FROM sessions WHERE sessionKey='holder'"
+      )
 
     :ok
   end

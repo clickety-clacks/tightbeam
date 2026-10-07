@@ -732,15 +732,42 @@ defmodule Tightbeam.ArchetypesTest do
     end
   end
 
-  test "the two shipped standing-seat manifests opt out of idle cleanup" do
-    for name <- ["product-owner", "pdo"] do
+  test "descendant activity credit is a default-off optional boolean" do
+    assert Archetypes.builtin_default().descendant_activity_credit == false
+
+    for {body, expected} <- [
+          {"name = \"quiet\"\n", false},
+          {"name = \"quiet\"\ndescendant_activity_credit = false\n", false},
+          {"name = \"quiet\"\ndescendant_activity_credit = true\n", true}
+        ] do
+      assert Archetypes.parse_manifest!(body, "quiet.toml").descendant_activity_credit ==
+               expected
+    end
+
+    for value <- ["\"false\"", "0", "[]"] do
+      assert_raise ArgumentError,
+                   ~r/archetype descendant_activity_credit must be a boolean/,
+                   fn ->
+                     Archetypes.parse_manifest!(
+                       "name = \"quiet\"\ndescendant_activity_credit = #{value}\n",
+                       "quiet.toml"
+                     )
+                   end
+    end
+  end
+
+  test "shipped standing-seat manifests keep cleanup off and descendant credit on" do
+    for name <- ["product-owner", "pdo", "orchestrator"] do
       path =
         Application.app_dir(
           :tightbeam,
           "priv/kungfu/agentic-engineering/archetypes/#{name}.toml"
         )
 
-      assert Archetypes.parse_manifest!(File.read!(path), path).idle_cleanup == false
+      archetype = Archetypes.parse_manifest!(File.read!(path), path)
+
+      assert archetype.descendant_activity_credit == true
+      if name in ["product-owner", "pdo"], do: assert(archetype.idle_cleanup == false)
     end
   end
 
