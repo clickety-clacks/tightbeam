@@ -133,11 +133,29 @@ defmodule Tightbeam.LiveBaseAdmission do
         _ -> refuse!("transition must be exact serialized input")
       end
 
+    source_marker =
+      case marker do
+        :absent ->
+          :absent
+
+        %{"buildIdentity" => source} when source != identity ->
+          marker
+
+        _ ->
+          nil
+      end
+
     transition =
-      if transition == nil and state == :existing and marker == :absent do
+      if transition == nil and state == :existing and source_marker != nil do
         stamp = read_schema_stamp!(database)
 
-        case Tightbeam.LiveBaseRelease.automatic_transition(payload, base, identity, stamp) do
+        case Tightbeam.LiveBaseRelease.automatic_transition(
+               payload,
+               base,
+               identity,
+               stamp,
+               source_marker
+             ) do
           {:ok, generated} -> generated
           :none -> nil
         end
