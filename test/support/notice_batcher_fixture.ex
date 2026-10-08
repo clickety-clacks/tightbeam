@@ -292,6 +292,7 @@ defmodule Tightbeam.NoticeBatcherFixture do
     unresolved = eligible(db, session: "agent:unresolved")
     [unresolved_carrier] = Wakes.materialize_digests(db, unresolved.due_at)
     {:ok, _} = DB.query(db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [unresolved_carrier])
+
     {:ok, _} =
       DB.query(db, "UPDATE sessions SET state='retired' WHERE sessionKey='agent:unresolved'")
 

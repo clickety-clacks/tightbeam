@@ -6376,8 +6376,8 @@ defmodule Tightbeam.AssignmentsTest do
                  DB.query(
                    ctx.db,
                    "SELECT livenessTriggerKind,livenessTriggerId FROM wake_cancellations WHERE wakeId=?1",
-                 [notice.wake_id]
-               )
+                   [notice.wake_id]
+                 )
 
         assert item_id == assignment.workItemId
         assert Wakes.get(ctx.db, slate_id).state == "pending"
