@@ -147,7 +147,8 @@ defmodule Tightbeam.LiveBaseAdmission do
 
     transition =
       if transition == nil and state == :existing and source_marker != nil and
-           Tightbeam.LiveBaseRelease.automatic_transition_candidate?(payload) do
+           (source_marker == :absent or
+              Tightbeam.LiveBaseRelease.automatic_transition_candidate?(payload)) do
         stamp = read_schema_stamp!(database)
 
         case Tightbeam.LiveBaseRelease.automatic_transition(
