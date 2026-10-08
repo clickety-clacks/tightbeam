@@ -32,6 +32,9 @@ defmodule Tightbeam.Credentials do
   @ssh_opts ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
   @status_budget_ms 5_000
   @status_cleanup_ms 500
+  # The adapter's first logged-out report can be transient during startup. Ignore
+  # one such report only shortly after a subscription was successfully banked.
+  @fresh_subscription_auth_none_window_ms 15_000
   @fixture_provider? Application.compile_env(:tightbeam, :fixture_harness, false)
 
   @type provider ::
@@ -201,6 +204,12 @@ defmodule Tightbeam.Credentials do
   @spec mark_terminal(provider(), term(), GenServer.server()) :: :ok | {:error, term()}
   def mark_terminal(provider, evidence, server \\ __MODULE__),
     do: GenServer.call(server, {:mark_terminal, provider, evidence}, :infinity)
+
+  @doc "Consume the one-time grace for a fresh Claude subscription's first logged-out status."
+  @spec suppress_fresh_subscription_auth_none(provider(), term(), GenServer.server()) ::
+          :ignored | :continue
+  def suppress_fresh_subscription_auth_none(provider, evidence, server \\ __MODULE__),
+    do: GenServer.call(server, {:suppress_fresh_subscription_auth_none, provider, evidence})
 
   @doc "Classify only pinned terminal evidence. Unknown is always non-terminal."
   @spec terminal_evidence?(provider(), term()) :: boolean()
@@ -601,6 +610,10 @@ defmodule Tightbeam.Credentials do
     {:reply, credential_kind(state, provider), state}
   end
 
+  def handle_call({:suppress_fresh_subscription_auth_none, provider, evidence}, _from, state) do
+    {:reply, consume_fresh_subscription_auth_none(state, provider, evidence), state}
+  end
+
   def handle_call({:mark_terminal, provider, evidence}, from, state) do
     state =
       if terminal_evidence?(provider, evidence),
@@ -790,6 +803,52 @@ defmodule Tightbeam.Credentials do
         {:reply, {:error, :onboarding_lease_superseded}, state}
     end
   end
+
+  defp consume_fresh_subscription_auth_none(state, provider, evidence) do
+    case fresh_subscription_auth_none_metadata(state, provider, evidence) do
+      {:ignore, metadata} ->
+        write_metadata!(
+          state,
+          provider,
+          Map.put(metadata, "initial_auth_none_ignored", true)
+        )
+
+        :ignored
+
+      :continue ->
+        :continue
+    end
+  end
+
+  defp fresh_subscription_auth_none_metadata(
+         state,
+         :anthropic,
+         %{"authStatus" => %{"kind" => "none"}} = evidence
+       ) do
+    if terminal_evidence?(:anthropic, evidence) do
+      case read_metadata(state, :anthropic) do
+        {:ok, metadata} ->
+          now = System.system_time(:millisecond)
+          onboarded_at = metadata["onboarded_at_ms"]
+
+          if metadata["kind"] == "subscription" and metadata["onboarded"] == true and
+               metadata["terminal"] != true and metadata["initial_auth_none_ignored"] != true and
+               is_integer(onboarded_at) and onboarded_at <= now and
+               now - onboarded_at <= @fresh_subscription_auth_none_window_ms do
+            {:ignore, metadata}
+          else
+            :continue
+          end
+
+        {:error, _reason} ->
+          :continue
+      end
+    else
+      :continue
+    end
+  end
+
+  defp fresh_subscription_auth_none_metadata(_state, _provider, _evidence), do: :continue
 
   @impl true
   def handle_info({:status_result, ref, result}, state) do
@@ -1653,14 +1712,25 @@ defmodule Tightbeam.Credentials do
   end
 
   defp mark_onboarded!(state, provider, kind, credential) do
-    write_metadata!(state, provider, %{
+    metadata = %{
       "provider" => Atom.to_string(provider),
       "kind" => Atom.to_string(kind),
       "onboarded" => true,
       "terminal" => false,
       "last_health" => "onboarded",
       "subscription_status" => Map.get(credential, :subscription_status)
-    })
+    }
+
+    metadata =
+      if provider == :anthropic and kind == :subscription do
+        # Non-secret timing evidence lets the credential owner distinguish the
+        # first adapter status from later terminal reports without a provider probe.
+        Map.put(metadata, "onboarded_at_ms", System.system_time(:millisecond))
+      else
+        metadata
+      end
+
+    write_metadata!(state, provider, metadata)
 
     :ok
   end

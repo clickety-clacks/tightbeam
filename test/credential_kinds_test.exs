@@ -237,6 +237,7 @@ defmodule Tightbeam.CredentialKindsTest do
         |> JSON.decode!()
 
       assert metadata["kind"] == "subscription"
+      assert is_integer(metadata["onboarded_at_ms"])
       refute Map.has_key?(metadata, "expires_at")
       assert metadata["subscription_status"] == "supported"
       assert Credentials.kind(:anthropic, server) == :subscription

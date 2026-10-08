@@ -96,6 +96,49 @@ defmodule Tightbeam.ModelCatalogTest do
     refute Enum.any?(claude ++ codex, &(&1.context != nil))
   end
 
+  test "an expired local subscription uses catalog-probe on the initial catalog derivation",
+       ctx do
+    credential_path =
+      Path.join([ctx.base_dir, "homes", @host, "claude", ".credentials.json"])
+
+    File.write!(
+      credential_path,
+      ~s({"claudeAiOauth":{"accessToken":"expired-fixture","refreshToken":"refresh-fixture","expiresAt":0}})
+    )
+
+    parent = self()
+
+    sh = fn command ->
+      if claude_probe?(command) do
+        send(parent, {:claude_probe, command})
+
+        body =
+          if Enum.any?(command, &String.contains?(&1, "/v1/models?limit=100")) do
+            fixture_body("claude_models.jsonc")
+          else
+            fixture_body("claude_model_detail.jsonc")
+          end
+
+        catalog_reply(body)
+      else
+        catalog_reply(ctx.codex_json)
+      end
+    end
+
+    # ModelCatalog's initial derive is the startup catalog read. The expired fixture
+    # takes the local subscription through the same renewal command used remotely.
+    catalog = start_catalog(ctx, claude_fetch: nil, sh: sh)
+    await_fresh(catalog, "claude")
+    await_fresh(catalog, "codex")
+
+    assert_receive {:claude_probe, ["sh", "-c", script]}
+    assert script =~ "catalog-probe anthropic subscription"
+    assert script =~ credential_path
+    assert script =~ "https://api.anthropic.com/v1/models?limit=100"
+    refute script =~ "expired-fixture"
+    refute script =~ "refresh-fixture"
+  end
+
   test "an unavailable credential status never becomes missing or a fresh catalog", ctx do
     detail = %{host: @host, provider: :anthropic, reason: :timeout}
 

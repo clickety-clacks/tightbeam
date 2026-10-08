@@ -386,15 +386,11 @@ defmodule Tightbeam.Harness.Claude do
   end
 
   # A catalog is an account's entitlements, so it is derived on the host whose
-  # account it describes. This is a plain vendor HTTPS GET with a bearer token
-  # read off local disk — NOT an ACP or harness surface — which is exactly why
-  # it can run remotely at all.
-  #
-  # Local: read the token, call the API from here. Remote: one bounded ssh whose
-  # script reads the token with `$(cat …)` in the REMOTE shell, the same pattern
-  # turn launch uses (`prepare_launch/3`). No token byte is interpolated into any
-  # command line, so none appears in a process table on either machine, and no
-  # credential moves between them — only the model list comes back.
+  # account it describes. Subscription credentials use the installed
+  # `catalog-probe` on that host: it renews an expired record before the vendor
+  # request and keeps the credential out of the gateway's process arguments.
+  # Local API keys retain the direct HTTP path; remote probes run over one
+  # bounded ssh and return only the model list.
   defp catalog_getter(state) do
     kind = Map.fetch!(state, :credential_kind)
 
@@ -407,13 +403,36 @@ defmodule Tightbeam.Harness.Claude do
 
     case Map.get(state, :host_config, %{ssh: nil}).ssh do
       nil -> local_getter(state, credential_path, kind)
-      dest -> {:ok, remote_getter(state, dest, credential_path, kind)}
+      dest -> {:ok, catalog_probe_getter(state, dest, credential_path, kind)}
+    end
+  end
+
+  # Production local subscriptions follow the same renewal path as remote
+  # subscriptions. `claude_fetch` is an explicit in-process test seam; it keeps
+  # the existing header/body unit tests independent of the installed CLI.
+  defp local_getter(state, credential_path, :subscription) do
+    case Map.get(state.options, :claude_fetch) do
+      nil ->
+        with {:ok, raw} <- read_token(credential_path),
+             {:ok, credential} <- bearer_secret(:subscription, raw),
+             true <- credential != "" do
+          {:ok, catalog_probe_getter(state, nil, credential_path, :subscription)}
+        else
+          {:error, reason} -> {:error, reason}
+          false -> {:error, :missing_token}
+        end
+
+      fetch ->
+        local_fetch_getter(credential_path, :subscription, fetch)
     end
   end
 
   defp local_getter(state, credential_path, kind) do
     fetch = Map.get(state.options, :claude_fetch, &http_get/2)
+    local_fetch_getter(credential_path, kind, fetch)
+  end
 
+  defp local_fetch_getter(credential_path, kind, fetch) do
     with {:ok, raw} <- read_token(credential_path),
          {:ok, credential} <- bearer_secret(kind, raw),
          true <- credential != "" do
@@ -470,19 +489,16 @@ defmodule Tightbeam.Harness.Claude do
   # introducing one.
   defp cli_path(state), do: Path.join([state.base_dir, "bin", "tightbeam"])
 
-  defp remote_getter(state, dest, credential_path, kind) do
+  defp catalog_probe_getter(state, dest, credential_path, kind) do
     sh = Map.get(state.options, :sh, &Support.system_cmd_out/1)
 
     fn path ->
       # The script's own stderr is folded into its stdout so a failure carries a
       # reason; ssh's is NOT, because an ssh warning on a SUCCESSFUL connection
       # would land in the middle of the JSON body.
-      # The CLI reads the credential, not this shell. It is already installed on every
-      # assimilated host and the gateway already execs it there for `harness-group`, so
-      # this is the same transport with the credential reader moved into the binary that
-      # WROTE the file. What it replaced was a `python3` one-liner parsing a vendor JSON
-      # shape -- a runtime dependency added to every satellite, and a third copy of an
-      # extraction that already existed twice.
+      # The CLI reads the credential, not this shell. It is installed in the local base
+      # dir and on every assimilated host, and the gateway already execs it there for
+      # `harness-group`. Only remote calls carry this script over ssh.
       script = """
       exec 2>&1
       set -eu
