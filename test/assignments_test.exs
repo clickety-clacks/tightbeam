@@ -264,6 +264,104 @@ defmodule Tightbeam.AssignmentsTest do
                )
     end
 
+    test "a busy fact wait, timed notice, and human post share one carrier with source refs",
+         ctx do
+      running = start_running_turn(ctx.db, "holder", "active holder turn")
+      scheduler = terminal_notice_scheduler(ctx.db)
+
+      condition =
+        Wakes.schedule(ctx.db, %{
+          session_key: "holder",
+          origin: "agent:holder",
+          creator_session_key: "holder",
+          prompt: "continue after the fact",
+          due_at: System.system_time(:millisecond) + 60_000,
+          condition_kind: "queue-ready",
+          condition_scope: "holder"
+        })
+
+      timed =
+        Wakes.schedule(ctx.db, %{
+          session_key: "holder",
+          origin: "agent:owner",
+          prompt: "timed blocker",
+          due_at: 0,
+          class: "blocker",
+          sender_scheduled: true
+        })
+
+      assert :queued =
+               Gateway.deliver_prompt("holder", "user:flynn", "human follow-up",
+                 db: ctx.db,
+                 class: "information",
+                 sender: "user:flynn",
+                 wake_scheduler: scheduler
+               )
+
+      {:ok, [[human_id]]} =
+        DB.query(
+          ctx.db,
+          "SELECT wakeId FROM wakes WHERE sessionKey='holder' AND prompt='human follow-up'"
+        )
+
+      fact =
+        ConditionFacts.file(ctx.db, scheduler, %{
+          kind: "queue-ready",
+          scope: "holder",
+          origin: "process:tightbeam"
+        })
+
+      assert %{state: "pending", fired_by: "condition"} = Wakes.get(ctx.db, condition.wake_id)
+
+      assert Enum.all?([condition.wake_id, timed.wake_id, human_id], fn source_id ->
+               NoticeBatcher.source_refs(ctx.db, source_id) == []
+             end)
+
+      assert :ok = finish_running_turn(ctx.db, running)
+      assert :ok = Wakes.fire_due(scheduler)
+
+      refs =
+        Enum.map([condition.wake_id, timed.wake_id, human_id], fn source_id ->
+          assert [ref] = NoticeBatcher.source_refs(ctx.db, source_id)
+          ref
+        end)
+
+      [batch_id] = refs |> Enum.map(& &1.batch_id) |> Enum.uniq()
+      [carrier_id] = refs |> Enum.map(& &1.delivery_wake_id) |> Enum.uniq()
+
+      assert Enum.all?(refs, &(&1.member_state == "included" and &1.batch_state == "delivered"))
+
+      assert Enum.map(NoticeBatcher.members(ctx.db, batch_id), & &1.source_wake_id) == [
+               timed.wake_id,
+               condition.wake_id,
+               human_id
+             ]
+
+      assert Enum.map(NoticeBatcher.members(ctx.db, batch_id), & &1.class) == [
+               "blocker",
+               "fyi",
+               "information"
+             ]
+
+      assert source_delivery_turns(ctx.db, condition.wake_id) ==
+               source_delivery_turns(ctx.db, timed.wake_id)
+
+      assert source_delivery_turns(ctx.db, condition.wake_id) ==
+               source_delivery_turns(ctx.db, human_id)
+
+      assert [[_, "holder", "queued", ^carrier_id]] =
+               source_delivery_turns(ctx.db, condition.wake_id)
+
+      carrier = Wakes.get(ctx.db, carrier_id)
+      assert carrier.prompt =~ "source=#{condition.wake_id}"
+      assert carrier.prompt =~ "source=#{timed.wake_id}"
+      assert carrier.prompt =~ "source=#{human_id}"
+      assert carrier.prompt =~ "sender=agent:holder"
+      assert carrier.prompt =~ "sender=agent:owner"
+      assert carrier.prompt =~ "sender=user:flynn"
+      assert %{kind: "queue-ready", scope: "holder"} = fact
+    end
+
     test "only review conclusions and explicit blocked attestations file their fact", ctx do
       producer = handle(ctx, "assign", assign_call({:user, "flynn"}, "review target"))
 
