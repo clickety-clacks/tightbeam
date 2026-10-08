@@ -29,29 +29,22 @@ for the procedure and, more importantly, for what `state.db` does *not* cover
 ## The cycle
 
 Follow the [README upgrade procedure](../README.md#upgrading-an-earlier-installation)
-to verify the release package, replace it and restart the service. Perform the
-runtime checks below, then finish the guidance refresh before reporting the
-upgrade complete, unless the user explicitly defers it.
+and the upgrade guide at the target release's tag to verify the release package,
+replace it and restart the service. Use that release's migration and rollback
+instructions, not a checkout build or assumptions from `main`. Perform the
+runtime checks below, then complete guided relearn or record the user's deferral.
 
 ## Complete guided relearn or record deferral
 
-Have Main explain the installed guidance changes and run
-`tightbeam identity relearn` when the user chooses. If it reports conflicts,
-explain each conflict and let the user choose the resulting text; never silently
-prefer either version. Resolve every conflict before publishing the merged
-identity, or abort the relearn if the user defers.
-
-Before refreshing sessions, explain that `tightbeam identity apply --all`
-updates their Tightbeam-owned skill files and asks them to re-read without
-reloading their current model context, and obtain the user's confirmation.
-After relearn or `relearn --resolve`, apply to all sessions at a boundary that
-does not interrupt running turns, then require `tightbeam identity status` to
-show no conflicts and no stale sessions. The upgrade is complete only after
-guided relearn, apply to all, and that clean status, or a recorded user deferral
-naming the remaining guidance/session mismatch. Without relearn, new code can
-run with old guidance (for example, 0.1.9 code with 0.1.8 guidance), and no
-staleness notice appears until a new identity is published. Do not report a
-deferred refresh as completed relearn.
+Before reporting the upgrade complete, have Main guide the user's choices through
+`tightbeam identity relearn`, including each conflict; never silently prefer
+either version. Explain the session refresh and obtain the user's confirmation,
+then run `tightbeam identity apply --all` without interrupting running turns and
+require `tightbeam identity status` to show no conflicts and no stale sessions.
+Otherwise record the user's explicit deferral and name the degraded state: new
+code running with old guidance or sessions retaining the prior identity.
+Without relearn, no staleness notice appears until a new identity is published;
+do not report deferred refresh as completed relearn.
 
 ## What the stop actually does
 
