@@ -1,9 +1,11 @@
 # Upgrading a running instance
 
-Stop it, swap the code, start it, check four things. There is no upgrade
-machinery and none is needed — the ledger is durable, so a restart is an
-ordinary event. What follows is what the stop actually does, established by
-running it rather than by reading `application.ex`.
+Upgrade only with a verified release package, following the
+[README release instructions](../README.md#from-a-release-package).
+Restart and verify the running service, then complete guided relearn or record
+the user's deferral as described below. A checkout build is for development,
+not an upgrade. The stop behavior below was established by running it rather
+than by reading `application.ex`.
 
 If the gateway is service-managed, installing a new package only swaps the
 executable on disk; it does not restart the running process. After the package
@@ -26,15 +28,30 @@ for the procedure and, more importantly, for what `state.db` does *not* cover
 
 ## The cycle
 
-```sh
-# 1. stop, and let it drain — SIGTERM is enough
-kill -TERM <gateway pid>          # verified: this runs prep_stop, which drains
-# 2. swap the code
-git -C <checkout> pull            # or checkout the tag you are deploying
-mix deps.get && mix compile
-# 3. start
-# 4. verify — the four checks below
-```
+Follow the [README upgrade procedure](../README.md#upgrading-an-earlier-installation)
+to verify the release package, replace it and restart the service. Perform the
+runtime checks below, then finish the guidance refresh before reporting the
+upgrade complete, unless the user explicitly defers it.
+
+## Complete guided relearn or record deferral
+
+Have Main explain the installed guidance changes and run
+`tightbeam identity relearn` when the user chooses. If it reports conflicts,
+explain each conflict and let the user choose the resulting text; never silently
+prefer either version. Resolve every conflict before publishing the merged
+identity, or abort the relearn if the user defers.
+
+Before refreshing sessions, explain that `tightbeam identity apply --all`
+updates their Tightbeam-owned skill files and asks them to re-read without
+reloading their current model context, and obtain the user's confirmation.
+After relearn or `relearn --resolve`, apply to all sessions at a boundary that
+does not interrupt running turns, then require `tightbeam identity status` to
+show no conflicts and no stale sessions. The upgrade is complete only after
+guided relearn, apply to all, and that clean status, or a recorded user deferral
+naming the remaining guidance/session mismatch. Without relearn, new code can
+run with old guidance (for example, 0.1.9 code with 0.1.8 guidance), and no
+staleness notice appears until a new identity is published. Do not report a
+deferred refresh as completed relearn.
 
 ## What the stop actually does
 
