@@ -404,7 +404,17 @@ defmodule Tightbeam.CliIntegrationTest do
        db: ctx.db,
        name: Tightbeam.WakeScheduler,
        tick_ms: 60_000,
-       deliver: fn _wake -> true end,
+       deliver: fn wake ->
+         Gateway.deliver_prompt(wake.session_key, wake.origin, wake.prompt,
+           db: ctx.db,
+           wake_id: wake.wake_id,
+           sender: wake.origin,
+           target_gate: if(wake.target_gate == 0, do: nil, else: wake),
+           fire_wake_in_txn: wake.origin == "process:tightbeam",
+           conn_registry: registry,
+           lane_manager: lane
+         )
+       end,
        delivery_opts: [conn_registry: registry, lane_manager: lane]}
     )
 
@@ -530,6 +540,14 @@ defmodule Tightbeam.CliIntegrationTest do
              DB.query(ctx.db, "SELECT prompt FROM turns WHERE wakeId=?1", [after_delivery_wake_id])
 
     assert after_delivered =~ after_prompt
+
+    assert {:ok, after_turn_carrier_turn} =
+             Ledger.claim_next(ctx.db, "cli-holder", "manual-obligation-test")
+
+    assert :ok =
+             Ledger.finish(ctx.db, after_turn_carrier_turn.seq, "delivered", nil,
+               owner_lease: after_turn_carrier_turn.owner_lease
+             )
 
     {_, 0} =
       System.cmd(ctx.binary, ["revoke-assignment", resolver, "--reason", "Resolver disposition"],
