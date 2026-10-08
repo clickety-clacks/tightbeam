@@ -228,7 +228,7 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
         class: "fyi"
       })
 
-    assert replacement_wake.delivery_rule == "batcher-inhibited r1"
+    assert replacement_wake.delivery_rule == "notice-batching-v1 r2"
 
     assert {:ok, [["asg_replace"]]} =
              DB.query(

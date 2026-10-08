@@ -56,11 +56,14 @@ Tightbeam.GuardGatewayFixture.run!(fn %{db: db, config: config} ->
 
     assert :ok = Wakes.fire_due(scheduler)
 
+    assert [%{delivery_wake_id: carrier_id, batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(db, scheduled.wake_id)
+
     assert {:ok, [["agent:new", "reviewer", 0]]} =
              DB.query(
                db,
                "SELECT sessionKey, roleRef, roleFallback FROM turns WHERE wakeId = ?1",
-               [scheduled.wake_id]
+               [carrier_id]
              )
 
     deleted =

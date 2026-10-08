@@ -777,10 +777,12 @@ defmodule Tightbeam.Gateway do
             db: db,
             device_id: p.device_id,
             client_message_id: p.client_message_id,
-            attachments: Map.get(p, :attachments, [])
+            attachments: Map.get(p, :attachments, []),
+            creator_session_key: call.session_key,
+            queue_when_busy: true
           )
 
-        if outcome == :appended,
+        if outcome in [:appended, :queued],
           do: %{ack: p.client_message_id},
           else: %{dedupe: to_string(outcome)}
       end,
@@ -872,6 +874,17 @@ defmodule Tightbeam.Gateway do
                   error
 
                 {fact, filed?} ->
+                  fact =
+                    if is_map(fact) and is_integer(fact[:fact_id]) do
+                      Map.put(
+                        fact,
+                        :condition_wake_hint,
+                        ConditionFacts.wake_hint(fact.kind, fact.scope)
+                      )
+                    else
+                      fact
+                    end
+
                   if call[:firehose_effect_requested],
                     do: {:firehose_effect, fact, filed?},
                     else: fact
@@ -1343,6 +1356,7 @@ defmodule Tightbeam.Gateway do
           |> maybe_put_progress_interval(config)
           |> Map.put(:supervision_interval_ms, supervision_interval_ms(config))
           |> Map.put(:on_assignment_change, assignment_change)
+          |> Map.put(:wake_scheduler, Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler))
           # Referent verification reaches hosts, so it needs the same placement
           # config (and the same injectable runner) the effort probe uses.
           |> Map.put(:effort_config, config)
@@ -1924,7 +1938,12 @@ defmodule Tightbeam.Gateway do
   then broadcasts the echo and nudges the lane. Returns the dedupe outcome.
   """
   @spec deliver_prompt(String.t(), String.t(), String.t(), keyword()) ::
-          :appended | :duplicate | :conflict | :skipped | {:terminal_notice_undeliverable, map()}
+          :appended
+          | :queued
+          | :duplicate
+          | :conflict
+          | :skipped
+          | {:terminal_notice_undeliverable, map()}
   def deliver_prompt(session_key, origin, prompt, opts \\ []) do
     db = Keyword.get(opts, :db, Tightbeam.DB)
 
@@ -1939,6 +1958,15 @@ defmodule Tightbeam.Gateway do
       )
 
     case result do
+      {:ok, {:staged, _wake}} ->
+        try do
+          Wakes.fire_due(Keyword.get(opts, :wake_scheduler, Tightbeam.WakeScheduler))
+        catch
+          :exit, {:noproc, _call} -> :ok
+        end
+
+        :queued
+
       {:ok, delivery} ->
         complete_delivery(db, delivery)
 
@@ -1955,6 +1983,7 @@ defmodule Tightbeam.Gateway do
   @doc "Delivery's DB-only core for callers already inside the DB owner transaction."
   @spec deliver_prompt_in_txn(DB.Txn.t(), String.t(), String.t(), String.t(), keyword()) ::
           {:appended, String.t(), map(), keyword()}
+          | {:staged, map()}
           | {:duplicate, map()}
           | {:conflict, map()}
           | :skipped
@@ -2111,20 +2140,37 @@ defmodule Tightbeam.Gateway do
 
       {target, role_ref, role_fallback} when not is_nil(target) ->
         if Ledger.enqueueable_in_txn?(txn, target) do
-          case admit_supervision_controller_in_txn(txn, opts, target) do
-            :canceled ->
-              :skipped
+          case staged_message_dedupe_in_txn(txn, target, prompt, opts) do
+            :new ->
+              if stage_for_queue?(txn, target, opts) do
+                stage_prompt_in_txn(
+                  txn,
+                  target,
+                  origin,
+                  prompt,
+                  opts,
+                  role_ref || opts[:role_ref]
+                )
+              else
+                case admit_supervision_controller_in_txn(txn, opts, target) do
+                  :canceled ->
+                    :skipped
 
-            controller ->
-              append_and_enqueue_in_txn(
-                txn,
-                target,
-                role_ref,
-                role_fallback,
-                origin,
-                stamped,
-                Keyword.put(opts, :supervision_controller, controller)
-              )
+                  controller ->
+                    append_and_enqueue_in_txn(
+                      txn,
+                      target,
+                      role_ref,
+                      role_fallback,
+                      origin,
+                      stamped,
+                      Keyword.put(opts, :supervision_controller, controller)
+                    )
+                end
+              end
+
+            duplicate_or_conflict ->
+              duplicate_or_conflict
           end
         else
           case cancel_unavailable_supervision_controller_in_txn(txn, opts, target) do
@@ -2142,6 +2188,106 @@ defmodule Tightbeam.Gateway do
         end
     end
   end
+
+  defp stage_for_queue?(txn, target, opts) do
+    Keyword.get(opts, :queue_when_busy, false) and
+      Keyword.get(opts, :attachments, []) in [nil, []] and
+      NoticeBatcher.queued_sources_ready_in_txn?(txn, target, opts[:role_ref])
+  end
+
+  defp stage_prompt_in_txn(txn, target, origin, prompt, opts, role_ref) do
+    case staged_message_dedupe_in_txn(txn, target, prompt, opts) do
+      :new ->
+        insert_staged_prompt_in_txn(txn, target, origin, prompt, opts, role_ref)
+
+      duplicate_or_conflict ->
+        duplicate_or_conflict
+    end
+  end
+
+  defp staged_message_dedupe_in_txn(txn, target, prompt, opts) do
+    case {opts[:device_id], opts[:client_message_id]} do
+      {device_id, client_message_id}
+      when is_binary(device_id) and device_id != "" and is_binary(client_message_id) and
+             client_message_id != "" ->
+        payload_sha256 = staged_message_sha256(prompt)
+
+        case DB.Txn.q(
+               txn,
+               "SELECT payloadSha256,sourceWakeId FROM staged_message_dedupes WHERE targetSessionKey=?1 AND deviceId=?2 AND clientMessageId=?3",
+               [target, device_id, client_message_id]
+             ) do
+          [[^payload_sha256, wake_id]] ->
+            {:duplicate, %{wake_id: wake_id}}
+
+          [[_other_hash, _wake_id]] ->
+            {:conflict, %{code: "client_message_conflict"}}
+
+          [] ->
+            :new
+        end
+
+      _ ->
+        :new
+    end
+  end
+
+  defp staged_message_sha256(prompt) when is_binary(prompt),
+    do: :crypto.hash(:sha256, prompt) |> Base.encode16(case: :lower)
+
+  defp insert_staged_prompt_in_txn(txn, target, origin, prompt, opts, role_ref) do
+    creator_session_key = opts[:creator_session_key] || staged_prompt_creator_in_txn(txn, origin)
+    device_id = opts[:device_id]
+    client_message_id = opts[:client_message_id]
+
+    payload_sha256 =
+      if is_binary(device_id) and device_id != "" and is_binary(client_message_id) and
+           client_message_id != "",
+         do: staged_message_sha256(prompt)
+
+    wake =
+      Wakes.schedule_in_txn(txn, %{
+        session_key: target,
+        target_role: role_ref,
+        origin: origin,
+        creator_session_key: creator_session_key,
+        prompt: prompt,
+        due_at: System.system_time(:millisecond),
+        class: opts[:class],
+        assignment_id: opts[:assignment_id],
+        work_item_id: opts[:job_ref],
+        target_gate: staged_prompt_target_gate(opts[:target_gate]),
+        replacement_assignment_id: opts[:replacement_assignment_id]
+      })
+
+    if is_binary(device_id) and device_id != "" and is_binary(client_message_id) and
+         client_message_id != "" and is_binary(payload_sha256) do
+      DB.Txn.q(
+        txn,
+        "INSERT INTO staged_message_dedupes(targetSessionKey,deviceId,clientMessageId,sourceWakeId,payloadSha256,createdAt) VALUES (?1,?2,?3,?4,?5,?6)",
+        [target, device_id, client_message_id, wake.wake_id, payload_sha256, wake.created_at]
+      )
+    end
+
+    Wakes.publish_change_in_txn(txn, "wake.scheduled", wake.wake_id)
+    {:staged, wake}
+  end
+
+  defp staged_prompt_creator_in_txn(_txn, "session:" <> session_key), do: session_key
+
+  defp staged_prompt_creator_in_txn(txn, "agent:" <> role) do
+    case DB.Txn.q(txn, "SELECT boundSessionKey FROM roles WHERE name=?1", [role]) do
+      [[session_key]] -> session_key
+      [] -> nil
+    end
+  end
+
+  defp staged_prompt_creator_in_txn(_txn, _origin), do: nil
+
+  defp staged_prompt_target_gate(%{target_gate: target_gate}) when target_gate in [0, 1],
+    do: target_gate
+
+  defp staged_prompt_target_gate(_target_gate), do: 1
 
   defp append_and_enqueue_in_txn(txn, target, role_ref, role_fallback, origin, stamped, opts) do
     input = %{
@@ -2176,6 +2322,17 @@ defmodule Tightbeam.Gateway do
         case enqueued do
           {:ok, seq} ->
             settle_supervision_controller_in_txn(txn, opts, target, seq)
+
+            opts[:wake_id]
+            |> case do
+              wake_id when is_binary(wake_id) ->
+                NoticeBatcher.carrier_source_ids_in_txn(txn, wake_id)
+                |> Enum.each(&Wakes.batch_source_delivered_in_txn(txn, &1, target))
+
+              _ ->
+                :ok
+            end
+
             fire_wake_in_txn(txn, opts)
 
             # Nag-by-re-arm: a bracket wake that just fired re-arms its
@@ -2375,7 +2532,12 @@ defmodule Tightbeam.Gateway do
 
   @doc "Publish and lane-nudge a delivery after its transaction commits."
   @spec complete_delivery(DB.server(), term()) ::
-          :appended | :duplicate | :conflict | :skipped | {:terminal_notice_undeliverable, map()}
+          :appended
+          | :queued
+          | :duplicate
+          | :conflict
+          | :skipped
+          | {:terminal_notice_undeliverable, map()}
   def complete_delivery(db, {:appended, actual_session_key, message, opts}) do
     registry = Keyword.get(opts, :conn_registry, Tightbeam.ConnRegistry)
     publish_message(db, actual_session_key, message, registry)
@@ -2395,6 +2557,16 @@ defmodule Tightbeam.Gateway do
     )
 
     :appended
+  end
+
+  def complete_delivery(_db, {:staged, _wake}) do
+    try do
+      Wakes.fire_due()
+    catch
+      :exit, {:noproc, _call} -> :ok
+    end
+
+    :queued
   end
 
   def complete_delivery(_db, :skipped), do: :skipped
@@ -6345,6 +6517,7 @@ defmodule Tightbeam.Gateway do
              do: Wakes.fire_due(Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler))
 
           wake_response(wake)
+          |> maybe_add_after_fact_hint(db, p)
         else
           wake
         end
@@ -6880,6 +7053,30 @@ defmodule Tightbeam.Gateway do
 
   defp wake_response(wake) do
     %{wake_id: wake.wake_id, due_at: wake.due_at, state: wake.state}
+  end
+
+  defp maybe_add_after_fact_hint(response, db, params) do
+    if is_integer(params[:after_ms]) and params.after_ms > 0 and is_nil(params[:at]) and
+         is_nil(params[:condition_kind]) and is_nil(params[:predicate]) and
+         params[:after_turn] != true and is_binary(params[:assignment_id]) do
+      case Assignments.condition_wait_hint(db, params.assignment_id) do
+        %{kind: kind, scope: scope} = hint ->
+          Map.put(
+            response,
+            :fact_hint,
+            Map.merge(hint, %{
+              advisory: true,
+              message:
+                "Advisory: this recheck can wait on #{kind} at scope #{scope} with --when-fact #{kind} --when-scope #{scope} --fallback-after 2h."
+            })
+          )
+
+        _ ->
+          response
+      end
+    else
+      response
+    end
   end
 
   defp wait_response_eligible?(%{originating_turn_seq: nil}), do: true

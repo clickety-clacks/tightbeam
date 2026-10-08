@@ -35,7 +35,8 @@ defmodule Tightbeam.Wakes do
     Ledger,
     NoticeBatcher,
     RuleRuntime,
-    Supervision
+    Supervision,
+    WorkItems
   }
 
   alias Tightbeam.DB.Txn
@@ -641,6 +642,56 @@ defmodule Tightbeam.Wakes do
   def terminal_notice_delivered_in_txn(%Txn{}, _wake_id, _delivered_to), do: :ok
 
   @doc false
+  def batch_source_delivered_in_txn(%Txn{} = txn, wake_id, delivered_to)
+      when is_binary(wake_id) and is_binary(delivered_to) do
+    case get_in_txn(txn, wake_id) do
+      %{state: "pending", session_key: ^delivered_to} = wake ->
+        case terminal_notice_delivery_in_txn(txn, wake_id) do
+          {:terminal_notice, %{session_key: ^delivered_to}} ->
+            terminal_notice_delivered_in_txn(txn, wake_id, delivered_to)
+
+          {:terminal_notice, %{session_key: current_target}} ->
+            raise DB.Error,
+              message: "batch target changed for terminal notice #{wake_id}: #{current_target}"
+
+          {:terminal_notice_undeliverable, evidence} ->
+            raise DB.Error,
+              message:
+                "batch contains undeliverable terminal notice #{wake_id}: #{inspect(evidence)}"
+
+          :ordinary ->
+            maybe_schedule_terminal_action_successor_in_txn(
+              txn,
+              wake,
+              {:appended, delivered_to, nil, []}
+            )
+        end
+
+        Txn.q(
+          txn,
+          "UPDATE wakes SET state='fired',firedAt=COALESCE(firedAt,?2) WHERE wakeId=?1 AND state='pending'",
+          [wake_id, now()]
+        )
+
+        if Txn.changes(txn) == 1 do
+          publish_change_in_txn(txn, "wake.fired", wake_id)
+
+          # A batch carrier has a different wake ID from each editable source.
+          # Re-arm work-item routing/slate sources by their own IDs so batching
+          # preserves the same follow-up transition as direct delivery.
+          WorkItems.rearm_on_fire_in_txn(txn, wake_id, %{work_item_id: wake.work_item_id})
+        end
+
+        :ok
+
+      _ ->
+        :ok
+    end
+  end
+
+  def batch_source_delivered_in_txn(%Txn{}, _wake_id, _delivered_to), do: :ok
+
+  @doc false
   def record_terminal_handoff_action_in_txn(%Txn{} = txn, holder, attest)
       when is_binary(holder) and is_map(attest) do
     if attest.kind == "progress" and attest.bySession == holder do
@@ -710,9 +761,21 @@ defmodule Tightbeam.Wakes do
          true <-
            Txn.q(
              txn,
-             "SELECT sessionKey FROM turns WHERE wakeId=?1 AND sessionKey=?2 LIMIT 1",
+             """
+             SELECT 1 FROM turns t
+             WHERE t.sessionKey=?2 AND (
+               t.wakeId=?1 OR EXISTS (
+                 SELECT 1
+                 FROM notice_batch_members m
+                 JOIN notice_batches b ON b.batchId=m.batchId
+                 WHERE m.sourceWakeId=?1 AND m.state='included'
+                   AND b.deliveryWakeId=t.wakeId
+               )
+             )
+             LIMIT 1
+             """,
              [wake.wake_id, wake.session_key]
-           ) == [[wake.session_key]] do
+           ) == [[1]] do
       :ok
     else
       false ->
@@ -1502,12 +1565,10 @@ defmodule Tightbeam.Wakes do
 
   CLASSED TRAFFIC. When the input carries `:class` (or `:classify` to request the
   classifier's stamp on unclassified traffic), the delivery policy above decides
-  the wake's `dueAt` and signs the row with the rule that decided it. The
-  BATCHER's inhibition seam is named and small: a caller that elected its own
-  delivery time (`:sender_scheduled`), a condition wake, a digest carrier, or a
-  non-prompt consumer is stamped `batcher-inhibited` and keeps the `due_at` it
-  was given. The class is still recorded either way — timing is shaped, truth
-  is not.
+  the wake's `dueAt` and signs the row with the rule that decided it. Ordinary
+  prompt wakes use the batch route across origins and class elections; an
+  explicit time or condition still controls when its source becomes ready.
+  Rumination and non-prompt consumers remain outside recipient batching.
   """
   @spec schedule_in_txn(Txn.t(), map()) :: wake()
   def schedule_in_txn(%Txn{} = txn, input) do
@@ -1673,6 +1734,12 @@ defmodule Tightbeam.Wakes do
         wake.wake_id,
         input.replacement_assignment_id
       )
+
+      Tightbeam.QueuedMessageSuppression.replace_pending_wakes_in_txn(
+        txn,
+        wake,
+        input.replacement_assignment_id
+      )
     end
 
     if is_binary(condition_kind) do
@@ -1686,8 +1753,18 @@ defmodule Tightbeam.Wakes do
 
     file_policy_skew(txn, wake)
 
-    if batch_source?(wake),
-      do: NoticeBatcher.record_policy_in_txn(txn, wake, enabled: true)
+    if batch_source?(wake) do
+      policy_opts =
+        case Map.get(input, :visibility_scope) do
+          scope when is_binary(scope) and scope != "" ->
+            [enabled: true, visibility_scope: scope]
+
+          _ ->
+            [enabled: true]
+        end
+
+      NoticeBatcher.record_policy_in_txn(txn, wake, policy_opts)
+    end
 
     wake
   end
@@ -1722,7 +1799,21 @@ defmodule Tightbeam.Wakes do
         wake_rows =
           Txn.q(txn, "SELECT state,consumer,sessionKey FROM wakes WHERE wakeId=?1", [wake_id])
 
-        turns = Txn.q(txn, "SELECT seq,status FROM turns WHERE wakeId=?1 ORDER BY seq", [wake_id])
+        turns =
+          Txn.q(
+            txn,
+            """
+            SELECT seq,status FROM turns WHERE wakeId=?1
+            UNION ALL
+            SELECT t.seq,t.status
+            FROM notice_batch_members m
+            JOIN notice_batches b ON b.batchId=m.batchId
+            JOIN turns t ON t.wakeId=b.deliveryWakeId
+            WHERE m.sourceWakeId=?1 AND m.state='included'
+            ORDER BY seq
+            """,
+            [wake_id]
+          )
 
         retry_turns =
           Txn.q(
@@ -2079,7 +2170,17 @@ defmodule Tightbeam.Wakes do
     continuation_state =
       case Txn.q(
              txn,
-             "SELECT status FROM turns WHERE wakeId=?1 AND assignmentId=?2 AND sessionKey=?3",
+             """
+             SELECT status FROM turns
+             WHERE wakeId=?1 AND assignmentId=?2 AND sessionKey=?3
+             UNION ALL
+             SELECT t.status
+             FROM notice_batch_members m
+             JOIN notice_batches b ON b.batchId=m.batchId
+             JOIN turns t ON t.wakeId=b.deliveryWakeId
+             WHERE m.sourceWakeId=?1 AND t.assignmentId=?2 AND t.sessionKey=?3
+             LIMIT 1
+             """,
              [wake.wake_id, assignment_id, wake.session_key]
            ) do
         [[status]] when status in ~w(queued running) -> status
@@ -3627,10 +3728,15 @@ defmodule Tightbeam.Wakes do
   @doc false
   def bypass_batching_in_txn(%Txn{} = txn, wake_id, policy_ref, refusal)
       when is_binary(wake_id) and is_binary(policy_ref) and is_map(refusal) do
+    fallback_rule =
+      if Map.get(refusal, :direct_delivery, false),
+        do: @inhibited_rule,
+        else: @legacy_digest_rule
+
     Txn.q(
       txn,
       "UPDATE wakes SET deliveryRule=?2 WHERE wakeId=?1 AND state='pending'",
-      [wake_id, @legacy_digest_rule]
+      [wake_id, fallback_rule]
     )
 
     Txn.q(
@@ -3643,7 +3749,7 @@ defmodule Tightbeam.Wakes do
       txn,
       "notice_batching_admission_bypassed",
       wake_id,
-      "rule=#{@digest_rule} fallback=#{@legacy_digest_rule} code=#{refusal.code}"
+      "rule=#{@digest_rule} fallback=#{fallback_rule} code=#{refusal.code}"
     )
 
     :ok
@@ -3709,16 +3815,6 @@ defmodule Tightbeam.Wakes do
       # rule stays `algedonic-bypass`/`immediate-delivery`, never
       # `batcher-inhibited`. `due_at` is exactly what the caller supplied
       # either way — scheduled or not, an alarm is never delayed BY POLICY.
-      policy.immediacy == :digest and class == "fyi" and
-          String.starts_with?(Map.fetch!(input, :origin), "user:") ->
-        due_at =
-          if Map.get(input, :sender_scheduled, false) or
-               String.starts_with?(Map.fetch!(input, :origin), "user:"),
-             do: Map.fetch!(input, :due_at),
-             else: created_at + policy.ceiling_ms
-
-        {@inhibited_rule, due_at}
-
       policy.immediacy == :digest and batcher_inhibited?(input, condition_kind) ->
         {@inhibited_rule, Map.fetch!(input, :due_at)}
 
@@ -3743,33 +3839,44 @@ defmodule Tightbeam.Wakes do
     end
   end
 
-  # THE INHIBITION SEAM, named (philosophy gate Q2). The batcher is a default,
-  # not a cage: a sender that elected its own delivery moment keeps it, a
-  # condition wake keeps its own firing mechanics, and an internal consumer is
-  # not an agent's attention to protect. Typed terminal notices carry their own
-  # recipient revalidation and recovery protocol, and rumination prompts are
-  # dispatch gates; both keep their own trigger mechanics. In every case the
-  # class is still RECORDED — inhibiting the reflex never erases what the sender
-  # said.
-  defp batcher_inhibited?(input, condition_kind) do
-    Map.get(input, :sender_scheduled, false) or is_binary(condition_kind) or
-      Map.get(input, :rumination, false) or
-      is_binary(Map.get(input, :obligation_ref)) or
-      not is_nil(Map.get(input, :wait_mode)) or Map.get(input, :consumer, "prompt") != "prompt"
+  # Trigger mechanics decide when a source becomes ready. They do not grant it
+  # a separate recipient turn: timed, condition, dependency, replacement, and
+  # typed terminal prompt sources join the same ordered batch once ready.
+  # Rumination is a dispatch gate rather than a recipient notice, and internal
+  # consumers are not agent attention; both remain outside this lane.
+  defp batcher_inhibited?(input, _condition_kind) do
+    Map.get(input, :rumination, false) or Map.get(input, :consumer, "prompt") != "prompt"
   end
 
-  defp batch_eligible?(input, class, condition_kind) do
+  defp batch_eligible?(input, class, _condition_kind) do
     is_binary(class) and not Map.get(input, :digest, false) and
-      not Map.get(input, :sender_scheduled, false) and not is_binary(condition_kind) and
-      Map.get(input, :consumer, "prompt") == "prompt" and
-      is_nil(Map.get(input, :wait_mode))
+      Map.get(input, :consumer, "prompt") == "prompt" and not Map.get(input, :rumination, false)
   end
 
   defp batch_source?(wake), do: v1_batch_source?(wake) or v2_batch_source?(wake)
 
+  defp batchable_delivery?(wake) do
+    wake.delivery_rule in [@digest_rule, @legacy_digest_rule] and
+      is_binary(wake.class) and wake.consumer == "prompt" and not wake.digest and
+      not wake.rumination
+  end
+
+  defp batchable_for_recipient?(txn, wake) do
+    if batchable_delivery?(wake) do
+      target_gate = if wake.target_gate == 0, do: nil, else: wake
+
+      case Gateway.delivery_target(txn, wake.session_key, target_gate) do
+        {target, _role_ref, _role_fallback} -> Ledger.enqueueable_in_txn?(txn, target)
+        nil -> false
+      end
+    else
+      false
+    end
+  end
+
   defp v1_batch_source?(wake) do
     wake.delivery_rule == @digest_rule and not wake.digest and wake.consumer == "prompt" and
-      is_binary(wake.class) and is_nil(wake.condition_kind) and is_nil(wake.wait_mode)
+      is_binary(wake.class) and not wake.rumination
   end
 
   defp v2_batch_source?(_wake), do: false
@@ -3778,12 +3885,11 @@ defmodule Tightbeam.Wakes do
   # has no mapping for is delivered as `fyi` — never dropped, never promoted —
   # and the gap is a durable row somebody can act on, not a silent downgrade.
   #
-  # THE ROW NAMES THE RULE THAT ACTUALLY DECIDED (O6 / §8 legibility): a
-  # batcher-inhibited wake (a sender's own `--after`, a condition wake, an
-  # internal consumer) never reaches the digest rule at all — hardcoding
-  # `@digest_rule` here claimed a reflex that never fired. `wake.delivery_rule`
-  # is the row's own already-computed fact, so the skew row and the wake it
-  # describes can never disagree about which rule produced it.
+  # THE ROW NAMES THE RULE THAT ACTUALLY DECIDED (O6 / §8 legibility): an
+  # ordinary notice records the batch rule, while a source may use a direct
+  # route — hardcoding `@digest_rule` here could claim a reflex that never
+  # fired. `wake.delivery_rule` is the row's own already-computed fact, so the
+  # skew row and the wake it describes cannot disagree about its rule.
   defp file_policy_skew(txn, %{class: class, wake_id: wake_id, delivery_rule: delivery_rule})
        when is_binary(class) do
     if delivery_policy(class).skew do
@@ -4837,6 +4943,13 @@ defmodule Tightbeam.Wakes do
                 :ok
 
               {replacement_primary.kind, replacement_primary.id} == {primary.kind, primary.id} ->
+                :ok
+
+              requester_id == "tightbeam:assignments" and primary.kind == "assignment" and
+                  Tightbeam.QueuedMessageSuppression.replacement_assignment_id_in_txn(
+                    txn,
+                    replacement_id
+                  ) == primary.id ->
                 :ok
 
               digest_carrier_exemption?(requester_id, digest) ->
@@ -5917,7 +6030,8 @@ defmodule Tightbeam.Wakes do
       SELECT w.wakeId
       FROM condition_facts f
       JOIN wakes w INDEXED BY wakes_condition ON w.conditionKind=f.kind
-      WHERE f.id=?1 AND w.state='pending' AND f.id>w.conditionAfterId
+      WHERE f.id=?1 AND w.state='pending' AND w.firedAt IS NULL
+        AND f.id>w.conditionAfterId
       ORDER BY w.rowid
       """,
       [fact_id]
@@ -5926,6 +6040,7 @@ defmodule Tightbeam.Wakes do
       case Txn.q(txn, select_wake_sql() <> " WHERE wakeId=?1", [wake_id]) do
         [row] ->
           case fire_in_txn(txn, to_wake(row), fact_id) do
+            {:fired, :staged} -> [{:condition_batch_ready, wake_id}]
             {:fired, delivery} -> [delivery]
             :noop -> []
           end
@@ -5961,11 +6076,13 @@ defmodule Tightbeam.Wakes do
 
   def handle_call({:fire_matching, fact_id}, _from, state) do
     eager_step(state, fact_id)
+    deliver_due(state)
     {:reply, :ok, state}
   end
 
   def handle_call({:fire_matching_seq, fact_ids}, _from, state) do
     drain_seq(state, fact_ids)
+    deliver_due(state)
     {:reply, :ok, state}
   end
 
@@ -6028,10 +6145,12 @@ defmodule Tightbeam.Wakes do
 
     recognize_due_dependency_waits(db)
     deliver_eligible_waits(db, state.delivery_opts)
+    evaluate_conditions(state, :tick)
 
-    # THE BATCHER RUNS FIRST, so a digest that just came due is delivered in
-    # this same pass rather than waiting a tick. Held members are consumed here
-    # and never reach the loop below as individual deliveries.
+    # Materialize after condition recognition so a fallback or matching fact
+    # that becomes due in this pass joins the same recipient-ready batch.
+    # Held members remain individual source rows and never reach the delivery
+    # loop below.
     materialize_digests(db)
 
     {:ok, rows} =
@@ -6117,7 +6236,6 @@ defmodule Tightbeam.Wakes do
       end
     end
 
-    evaluate_conditions(state, :tick)
     :ok
   end
 
@@ -6174,6 +6292,7 @@ defmodule Tightbeam.Wakes do
         """
         SELECT wakeId FROM wakes
         WHERE state='pending' AND waitMode IS NOT NULL AND recognitionAt IS NOT NULL
+          AND firedAt IS NULL
         ORDER BY recognitionAt,wakeId
         """
       )
@@ -6188,6 +6307,7 @@ defmodule Tightbeam.Wakes do
              end
            ) do
         {:ok, {:delivery, delivery}} -> Gateway.complete_delivery(db, delivery)
+        {:ok, :staged} -> :ok
         {:ok, _} -> :ok
         {:error, error} -> raise error
       end
@@ -6198,44 +6318,55 @@ defmodule Tightbeam.Wakes do
     case wait_in_txn(txn, wake_id) do
       %{state: "pending", recognition_path: path} = wake when is_binary(path) ->
         if wait_eligible_in_txn?(txn, wake) do
+          batchable? = batchable_for_recipient?(txn, wake)
           fired_at = now()
+          stamped_prompt = wait_stamp(wake) <> "\n\n" <> wake.prompt
 
           Txn.q(
             txn,
-            "UPDATE wakes SET state='fired',firedAt=?2 WHERE wakeId=?1 AND state='pending'",
-            [wake.wake_id, fired_at]
+            if(batchable?,
+              do:
+                "UPDATE wakes SET firedAt=?2,prompt=?3 WHERE wakeId=?1 AND state='pending' AND firedAt IS NULL",
+              else:
+                "UPDATE wakes SET state='fired',firedAt=?2,prompt=?3 WHERE wakeId=?1 AND state='pending' AND firedAt IS NULL"
+            ),
+            [wake.wake_id, fired_at, stamped_prompt]
           )
 
-          if Txn.changes(txn) == 1 do
-            Txn.q(
-              txn,
-              "UPDATE supervision_liveness_sidecar SET controllerState='settled' WHERE wakeId=?1 AND controllerOrigin='holder_continuation' AND controllerState='pending'",
-              [wake.wake_id]
-            )
+          updated? = Txn.changes(txn) == 1
 
+          if updated? do
             delivery =
-              Gateway.deliver_prompt_in_txn(
-                txn,
-                wake.session_key,
-                wake.origin,
-                wait_stamp(wake) <> "\n\n" <> wake.prompt,
-                [
-                  wake_id: wake.wake_id,
-                  sender: wake.origin,
-                  target_gate: wake,
-                  role_ref: wake.target_role
-                ] ++ delivery_opts
-              )
+              if batchable? do
+                :staged
+              else
+                Gateway.deliver_prompt_in_txn(
+                  txn,
+                  wake.session_key,
+                  wake.origin,
+                  stamped_prompt,
+                  [
+                    wake_id: wake.wake_id,
+                    sender: wake.origin,
+                    target_gate: wake,
+                    role_ref: wake.target_role
+                  ] ++ delivery_opts
+                )
+              end
 
-            EventLog.lifecycle_in_txn(
-              txn,
-              "wake_wait_delivered",
-              wake.wake_id,
-              "path=#{wake.recognition_path} assignment=#{wake.assignment_id}"
-            )
+            if delivery == :staged do
+              EventLog.lifecycle_in_txn(
+                txn,
+                "wake_wait_staged",
+                wake.wake_id,
+                "path=#{wake.recognition_path} assignment=#{wake.assignment_id}"
+              )
+            else
+              settle_wait_continuation_in_txn(txn, wake)
+            end
 
             publish_change_in_txn(txn, "wake.fired", wake.wake_id)
-            {:delivery, delivery}
+            if delivery == :staged, do: :staged, else: {:delivery, delivery}
           else
             :noop
           end
@@ -6246,6 +6377,54 @@ defmodule Tightbeam.Wakes do
       _ ->
         :noop
     end
+  end
+
+  @doc false
+  def settle_batched_wait_in_txn(%Txn{} = txn, wake_id, outcome)
+      when outcome in ["delivered", "delivery-failed"] do
+    case Txn.q(
+           txn,
+           "SELECT recognitionPath,assignmentId FROM wakes WHERE wakeId=?1 AND waitMode IS NOT NULL",
+           [wake_id]
+         ) do
+      [[path, assignment_id]] when is_binary(path) ->
+        settle_wait_continuation_in_txn(txn, wake_id, path, assignment_id, outcome)
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp settle_wait_continuation_in_txn(txn, wake) do
+    settle_wait_continuation_in_txn(
+      txn,
+      wake.wake_id,
+      wake.recognition_path,
+      wake.assignment_id,
+      "delivered"
+    )
+  end
+
+  defp settle_wait_continuation_in_txn(txn, wake_id, path, assignment_id, outcome) do
+    Txn.q(
+      txn,
+      "UPDATE supervision_liveness_sidecar SET controllerState='settled' WHERE wakeId=?1 AND controllerOrigin='holder_continuation' AND controllerState='pending'",
+      [wake_id]
+    )
+
+    if Txn.changes(txn) == 1 do
+      lifecycle_kind =
+        if outcome == "delivered", do: "wake_wait_delivered", else: "wake_wait_delivery_failed"
+
+      EventLog.lifecycle_in_txn(
+        txn,
+        lifecycle_kind,
+        wake_id,
+        "path=#{path} assignment=#{assignment_id} outcome=#{outcome}"
+      )
+    end
+
+    :ok
   end
 
   defp wait_eligible_in_txn?(_txn, %{originating_turn_seq: nil}), do: true
@@ -6645,7 +6824,8 @@ defmodule Tightbeam.Wakes do
             SELECT 'C' AS branch, w.wakeId, f.id AS factId, f.scope, w.rowid AS rid
             FROM condition_facts f
             JOIN wakes w INDEXED BY wakes_condition ON w.conditionKind=f.kind
-            WHERE f.id>?1 AND f.id<=?2 AND w.state='pending' AND f.id>w.conditionAfterId
+            WHERE f.id>?1 AND f.id<=?2 AND w.state='pending' AND w.firedAt IS NULL
+              AND f.id>w.conditionAfterId
             ORDER BY f.id, w.rowid
             """,
             [after_fact, processed_fact]
@@ -6658,7 +6838,8 @@ defmodule Tightbeam.Wakes do
           """
           SELECT 'F' AS branch, w.wakeId, NULL AS factId, NULL AS scope, w.rowid AS rid
           FROM wakes w INDEXED BY wakes_due
-          WHERE w.state='pending' AND w.dueAt<=?1 AND w.conditionKind IS NOT NULL
+          WHERE w.state='pending' AND w.firedAt IS NULL
+            AND w.dueAt<=?1 AND w.conditionKind IS NOT NULL
           ORDER BY w.rowid LIMIT ?2
           """,
           [now(), batch]
@@ -6678,7 +6859,8 @@ defmodule Tightbeam.Wakes do
           SELECT 'C' AS branch, w.wakeId, f.id AS factId, f.scope, w.rowid AS rid
           FROM condition_facts f
           JOIN wakes w INDEXED BY wakes_condition ON w.conditionKind=f.kind
-          WHERE f.id=?1 AND w.state='pending' AND f.id>w.conditionAfterId
+          WHERE f.id=?1 AND w.state='pending' AND w.firedAt IS NULL
+            AND f.id>w.conditionAfterId
           ORDER BY w.rowid
           """,
           [fact_id]
@@ -6690,7 +6872,8 @@ defmodule Tightbeam.Wakes do
           """
           SELECT 'F' AS branch, w.wakeId, NULL AS factId, NULL AS scope, w.rowid AS rid
           FROM wakes w INDEXED BY wakes_due
-          WHERE w.state='pending' AND w.dueAt<=?1 AND w.conditionKind IS NOT NULL
+          WHERE w.state='pending' AND w.firedAt IS NULL
+            AND w.dueAt<=?1 AND w.conditionKind IS NOT NULL
           ORDER BY w.rowid LIMIT ?2
           """,
           [now(), batch]
@@ -6724,6 +6907,7 @@ defmodule Tightbeam.Wakes do
       )
 
     case result do
+      {:ok, {:fired, :staged}} -> send(self(), :fire_due)
       {:ok, {:fired, delivery}} -> Gateway.complete_delivery(db, delivery)
       {:ok, _} -> :ok
       {:error, error} -> raise error
@@ -6732,6 +6916,8 @@ defmodule Tightbeam.Wakes do
 
   defp fire_in_txn(txn, %{state: "pending", condition_kind: kind} = wake, fact_id)
        when is_binary(kind) do
+    batchable? = batchable_for_recipient?(txn, wake)
+
     # Owner provenance moves onto condition facts in G-B. Until that migration,
     # unresolved legacy targets still need the common evaluator to preserve their
     # existing fire-and-record behavior.
@@ -6782,30 +6968,48 @@ defmodule Tightbeam.Wakes do
         true ->
           fired_at = now()
 
+          stamp =
+            if cause == "condition",
+              do: "[woke: fact #{kind}/#{match.scope || "nil"}]",
+              else: "[woke: fallback deadline]"
+
+          stamped_prompt = stamp <> "\n\n" <> wake.prompt
+
           Txn.q(
             txn,
-            "UPDATE wakes SET state = 'fired', firedAt = ?2, firedBy = ?3 WHERE wakeId = ?1 AND state = 'pending'",
-            [wake.wake_id, fired_at, cause]
+            if(batchable?,
+              do:
+                "UPDATE wakes SET firedAt = ?2, firedBy = ?3, prompt = ?4 WHERE wakeId = ?1 AND state = 'pending' AND firedAt IS NULL",
+              else:
+                "UPDATE wakes SET state = 'fired', firedAt = ?2, firedBy = ?3, prompt = ?4 WHERE wakeId = ?1 AND state = 'pending' AND firedAt IS NULL"
+            ),
+            [wake.wake_id, fired_at, cause, stamped_prompt]
           )
 
-          if Txn.changes(txn) == 1 do
-            stamp =
-              if cause == "condition",
-                do: "[woke: fact #{kind}/#{match.scope || "nil"}]",
-                else: "[woke: fallback deadline]"
+          updated? = Txn.changes(txn) == 1
 
-            delivery =
-              Gateway.deliver_prompt_in_txn(
-                txn,
-                wake.session_key,
-                wake.origin,
-                stamp <> "\n\n" <> wake.prompt,
-                wake_id: wake.wake_id,
-                sender: wake.origin,
-                target_gate: wake,
-                role_ref: wake.target_role
-              )
+          delivery =
+            cond do
+              not updated? ->
+                :noop
 
+              batchable? ->
+                :staged
+
+              true ->
+                Gateway.deliver_prompt_in_txn(
+                  txn,
+                  wake.session_key,
+                  wake.origin,
+                  stamped_prompt,
+                  wake_id: wake.wake_id,
+                  sender: wake.origin,
+                  target_gate: wake,
+                  role_ref: wake.target_role
+                )
+            end
+
+          if updated? do
             maybe_schedule_terminal_action_successor_in_txn(txn, wake, delivery)
             lifecycle_for_fire(txn, wake, cause, match, delivery)
             publish_change_in_txn(txn, "wake.fired", wake.wake_id)

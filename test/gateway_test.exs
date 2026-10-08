@@ -640,6 +640,75 @@ defmodule Tightbeam.GatewayTest do
     %{db: db, registry: registry, lane: lane, catalog_base: catalog_base, device: device}
   end
 
+  test "a busy post remains a deduplicated editable source until the recipient is ready", ctx do
+    assert :appended =
+             Gateway.deliver_prompt("k1", "session:k1", "current queued work",
+               db: ctx.db,
+               conn_registry: ctx.registry,
+               lane_manager: Tightbeam.LaneManager
+             )
+
+    post = Gateway.handlers(%{db: ctx.db})["post"]
+
+    call = %{
+      session_key: "k1",
+      origin: "session:k1",
+      params: %{
+        content: "queued human message",
+        device_id: "post-device",
+        client_message_id: "post-queued-1",
+        attachments: []
+      }
+    }
+
+    assert %{ack: "post-queued-1"} = post.(call)
+
+    assert {:ok, [[source_wake_id, "pending", "queued human message", "fyi"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId,state,prompt,class FROM wakes WHERE prompt='queued human message'"
+             )
+
+    assert NoticeBatcher.recover(ctx.db) == []
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM staged_message_dedupes WHERE sourceWakeId=?1 AND deviceId='post-device' AND clientMessageId='post-queued-1'",
+               [source_wake_id]
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM notice_batch_members WHERE sourceWakeId=?1", [
+               source_wake_id
+             ])
+
+    assert %{dedupe: "duplicate"} = post.(call)
+
+    assert %{dedupe: "conflict"} =
+             post.(put_in(call, [:params, :content], "different payload"))
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM wakes WHERE prompt='queued human message'")
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE wakes SET state='fired',firedAt=?2 WHERE wakeId=?1", [
+               source_wake_id,
+               System.system_time(:millisecond)
+             ])
+
+    assert %{dedupe: "duplicate"} = post.(call)
+
+    assert %{dedupe: "conflict"} =
+             post.(put_in(call, [:params, :content], "different payload"))
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM messages WHERE clientMessageId='post-queued-1'"
+             )
+  end
+
   for {cadence, expected_interval} <- [
         {%{}, 1_000},
         {%{wake_tick_ms: 1_234}, 1_234},

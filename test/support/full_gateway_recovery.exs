@@ -1,7 +1,7 @@
 defmodule Tightbeam.RecoveryScenario do
   import ExUnit.Assertions
 
-  alias Tightbeam.{DB, Gateway, Model, Org, Placement, Wakes}
+  alias Tightbeam.{DB, Gateway, Model, NoticeBatcher, Org, Placement, Wakes}
 
   def await!(predicate, deadline \\ nil, diagnostic \\ nil) do
     deadline = deadline || System.monotonic_time(:millisecond) + 60_000
@@ -159,7 +159,7 @@ defmodule Tightbeam.RecoveryScenario do
           ["delivered"],
           ["delivered"]
         ] and
-          rows("SELECT status FROM turns WHERE wakeId='w_recovery_b'") == [["delivered"]] and
+          delivered_source_statuses("w_recovery_b") == [["delivered"]] and
           rows(
             "SELECT state FROM wakes WHERE wakeId IN ('w_recovery_b','w_recovery_c') ORDER BY wakeId"
           ) == [["fired"], ["fired"]] and
@@ -207,7 +207,16 @@ defmodule Tightbeam.RecoveryScenario do
     [["delivered"]] = rows("SELECT status FROM turns WHERE wakeId='w_recovery_c'")
     # Publication/fired and consumer terminal are independent assertions.
     for suffix <- ~w(b c) do
-      [[1]] = rows("SELECT COUNT(*) FROM turns WHERE wakeId=?1", ["w_recovery_#{suffix}"])
+      source_wake_id = "w_recovery_#{suffix}"
+
+      case NoticeBatcher.source_refs(DB, source_wake_id) do
+        [%{delivery_wake_id: carrier_wake_id}] when is_binary(carrier_wake_id) ->
+          [[1]] = rows("SELECT COUNT(*) FROM turns WHERE wakeId=?1", [carrier_wake_id])
+          [["delivered"]] = rows("SELECT status FROM turns WHERE wakeId=?1", [carrier_wake_id])
+
+        [] ->
+          [[1]] = rows("SELECT COUNT(*) FROM turns WHERE wakeId=?1", [source_wake_id])
+      end
 
       [[1]] =
         rows("SELECT COUNT(*) FROM messages WHERE sessionKey=?1 AND content LIKE ?2", [
@@ -240,6 +249,16 @@ defmodule Tightbeam.RecoveryScenario do
       assignment_notice:
         rows("SELECT reminderState FROM assignments WHERE id='asg_recovery_preserve'")
     }
+  end
+
+  defp delivered_source_statuses(source_wake_id) do
+    case NoticeBatcher.source_refs(DB, source_wake_id) do
+      [%{delivery_wake_id: carrier_wake_id}] when is_binary(carrier_wake_id) ->
+        rows("SELECT status FROM turns WHERE wakeId=?1", [carrier_wake_id])
+
+      [] ->
+        rows("SELECT status FROM turns WHERE wakeId=?1", [source_wake_id])
+    end
   end
 end
 

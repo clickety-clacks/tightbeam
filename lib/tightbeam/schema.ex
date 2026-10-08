@@ -327,6 +327,7 @@ defmodule Tightbeam.Schema do
   @artifact_origin_shape "artifact-origin-v1-019"
   @fresh_owner_link_origin_table "schema_bootstrap_origin"
   @work_item_owner_link_shape "work-item-delivery-owner-v1-019"
+  @assignment_source_replacement_shape "assignment-source-replacement-v1-019"
   @identity_publication_denial_diagnostic_previous_shape @artifact_origin_shape
   @identity_publication_denial_diagnostic_shape "identity-publication-denial-diagnostic-v1-019"
   @supervision_receipt_cancellation_shape "supervision-receipt-cancellation-v1-019"
@@ -1404,12 +1405,48 @@ defmodule Tightbeam.Schema do
       end)
   ]
 
+  # Explicit sender replacement of an unsealed assignment notice is a distinct
+  # typed cancellation route. Its caller proves the durable replacement request
+  # and exact assignment before this shape admits the cancellation row.
+  @assignment_source_replacement_liveness_objects Enum.map(
+                                                    @supervision_receipt_cancellation_liveness_objects,
+                                                    fn
+                                                      %{name: "wake_cancellations", sql: sql} =
+                                                          object ->
+                                                        anchor =
+                                                          "(requesterId = 'tightbeam:effort-checkin' AND"
+
+                                                        assignment_replacement = """
+                                                        (requesterId = 'tightbeam:assignments' AND reasonKind = 'superseded' AND
+                                                         causalSourceKind = 'wake' AND outcomeKind = 'replacement')
+                                                        OR
+                                                        """
+
+                                                        true = String.contains?(sql, anchor)
+
+                                                        %{
+                                                          object
+                                                          | sql:
+                                                              String.replace(
+                                                                sql,
+                                                                anchor,
+                                                                assignment_replacement <> anchor,
+                                                                global: false
+                                                              )
+                                                        }
+
+                                                      object ->
+                                                        object
+                                                    end
+                                                  )
+
   @doc false
   def live_base_upgrade_predecessor, do: @operator_decision_shape
 
   @doc false
   def guard_compatible_stamps do
     [
+      @assignment_source_replacement_shape,
       @work_item_owner_link_shape,
       @identity_publication_denial_diagnostic_shape,
       @artifact_origin_shape,
@@ -1494,6 +1531,7 @@ defmodule Tightbeam.Schema do
             @agent_reparent_shape,
             @artifact_origin_shape,
             @identity_publication_denial_diagnostic_shape,
+            @assignment_source_replacement_shape,
             @work_item_owner_link_shape
           ]
         )
@@ -1533,11 +1571,11 @@ defmodule Tightbeam.Schema do
     :ok = upgrade_artifact_durability(db)
     :ok = upgrade_pi_providers(db)
     :ok = upgrade_addressed_po_consultation(db)
-    :ok = Tightbeam.QueuedMessageSuppression.ensure_schema(db)
 
     Enum.each(@schema_modules, fn
       Tightbeam.Ledger -> :ok
       Tightbeam.Toplines -> :ok = Tightbeam.Toplines.ensure_historical_schema(db)
+      Tightbeam.NoticeBatcher -> :ok = Tightbeam.NoticeBatcher.ensure_bootstrap_schema(db)
       module -> :ok = module.ensure_schema(db)
     end)
 
@@ -1548,6 +1586,7 @@ defmodule Tightbeam.Schema do
     Enum.each(@schema_modules, fn
       Tightbeam.Ledger -> :ok
       Tightbeam.Toplines -> :ok = Tightbeam.Toplines.ensure_historical_schema(db)
+      Tightbeam.NoticeBatcher -> :ok = Tightbeam.NoticeBatcher.ensure_bootstrap_schema(db)
       module -> :ok = module.ensure_schema(db)
     end)
 
@@ -1561,6 +1600,9 @@ defmodule Tightbeam.Schema do
     :ok = upgrade_identity_publication_denial_diagnostic(db)
     :ok = upgrade_work_item_delivery_owner_link(db)
     :ok = upgrade_supervision_receipt_cancellation_v1(db)
+    :ok = upgrade_assignment_source_replacement_v1(db)
+    :ok = Tightbeam.QueuedMessageSuppression.ensure_schema(db)
+    :ok = Tightbeam.NoticeBatcher.ensure_schema(db)
 
     # Preserve exact historical Toplines DDL and its stamp if a preceding
     # migration refuses. Bootstrap already qualified it; now activate V6.
@@ -1783,9 +1825,16 @@ defmodule Tightbeam.Schema do
     liveness_objects =
       cond do
         supervision_receipt_cancellation_active?(txn, shape) ->
-          Enum.reject(
-            @supervision_receipt_cancellation_liveness_objects,
-            &(&1.name == "supervision_receipt_cancellation_epoch")
+          liveness_objects =
+            if shape == @assignment_source_replacement_shape,
+              do: @assignment_source_replacement_liveness_objects,
+              else: @supervision_receipt_cancellation_liveness_objects
+
+          Enum.reject(liveness_objects, &(&1.name == "supervision_receipt_cancellation_epoch"))
+
+        shape == @assignment_source_replacement_shape ->
+          incompatible_supervision_liveness!(
+            "assignment source replacement stamp lacks its exact cancellation activation marker"
           )
 
         shape in [
@@ -1856,6 +1905,7 @@ defmodule Tightbeam.Schema do
            @agent_reparent_shape,
            @artifact_origin_shape,
            @identity_publication_denial_diagnostic_shape,
+           @assignment_source_replacement_shape,
            @work_item_owner_link_shape
          ],
          do: reparent_liveness_enforcement_objects(),
@@ -2325,7 +2375,13 @@ defmodule Tightbeam.Schema do
   end
 
   defp upgrade_supervision_receipt_cancellation_v1_in_txn(%Txn{} = txn) do
-    [[@work_item_owner_link_shape]] = Txn.q(txn, "SELECT shape FROM schema_stamp")
+    [[shape]] = Txn.q(txn, "SELECT shape FROM schema_stamp")
+
+    unless shape in [@work_item_owner_link_shape, @assignment_source_replacement_shape] do
+      incompatible_supervision_liveness!(
+        "receipt cancellation predecessor stamp #{inspect(shape)}"
+      )
+    end
 
     marker =
       Enum.find(@supervision_receipt_cancellation_liveness_objects, fn object ->
@@ -2429,6 +2485,175 @@ defmodule Tightbeam.Schema do
       rows ->
         raise ShapeError,
           message: "receipt cancellation migration left invalid foreign keys: #{inspect(rows)}"
+    end
+  end
+
+  @doc false
+  @spec upgrade_assignment_source_replacement_v1(DB.server()) :: :ok
+  def upgrade_assignment_source_replacement_v1(db) do
+    {:ok, [[foreign_keys]]} = DB.query(db, "PRAGMA foreign_keys")
+    {:ok, [[legacy_alter_table]]} = DB.query(db, "PRAGMA legacy_alter_table")
+    :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
+    :ok = DB.execute(db, "PRAGMA legacy_alter_table = ON")
+
+    try do
+      case DB.transaction(db, &upgrade_assignment_source_replacement_v1_in_txn/1) do
+        {:ok, :ok} ->
+          :ok
+
+        {:error, %ShapeError{} = error} ->
+          raise error
+
+        {:error, error} ->
+          raise ShapeError,
+            message:
+              "incompatible_assignment_source_replacement_v1: migration failed: #{Exception.message(error)}"
+      end
+    after
+      :ok = DB.execute(db, "PRAGMA legacy_alter_table = #{legacy_alter_table}")
+      :ok = DB.execute(db, "PRAGMA foreign_keys = #{foreign_keys}")
+    end
+  end
+
+  defp upgrade_assignment_source_replacement_v1_in_txn(%Txn{} = txn) do
+    marker =
+      Enum.find(@supervision_receipt_cancellation_liveness_objects, fn object ->
+        object.name == "supervision_receipt_cancellation_epoch"
+      end)
+
+    marker_shape = fn ->
+      validate_owned_object!(txn, marker)
+
+      case Txn.q(
+             txn,
+             "SELECT shape FROM supervision_receipt_cancellation_epoch WHERE id=0"
+           ) do
+        [[@supervision_receipt_cancellation_shape]] ->
+          :ok
+
+        rows ->
+          incompatible_supervision_liveness!(
+            "malformed receipt cancellation marker #{inspect(rows)}"
+          )
+      end
+    end
+
+    case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+      [[@assignment_source_replacement_shape]] ->
+        :ok = marker_shape.()
+
+        Enum.each(
+          Enum.filter(@assignment_source_replacement_liveness_objects, fn object ->
+            object.name in [
+              "wake_cancellations",
+              "wake_cancellations_pending_insert",
+              "wakes_typed_cancellation_required"
+            ]
+          end),
+          &validate_owned_object!(txn, &1)
+        )
+
+        :ok
+
+      [[@work_item_owner_link_shape]] ->
+        :ok = marker_shape.()
+
+        old_table =
+          Enum.find(@supervision_receipt_cancellation_liveness_objects, fn object ->
+            object.name == "wake_cancellations"
+          end)
+
+        new_table =
+          Enum.find(@assignment_source_replacement_liveness_objects, fn object ->
+            object.name == "wake_cancellations"
+          end)
+
+        old_triggers =
+          Enum.filter(@supervision_receipt_cancellation_liveness_objects, fn object ->
+            object.type == "trigger" and
+              object.name in [
+                "wake_cancellations_pending_insert",
+                "wakes_typed_cancellation_required"
+              ]
+          end)
+
+        new_triggers =
+          Enum.filter(@assignment_source_replacement_liveness_objects, fn object ->
+            object.type == "trigger" and
+              object.name in [
+                "wake_cancellations_pending_insert",
+                "wakes_typed_cancellation_required"
+              ]
+          end)
+
+        validate_owned_object!(txn, old_table)
+        Enum.each(old_triggers, &validate_owned_object!(txn, &1))
+
+        Enum.each(old_triggers, fn trigger ->
+          :ok = Txn.exec(txn, "DROP TRIGGER #{trigger.name}")
+        end)
+
+        [[cancellation_count]] = Txn.q(txn, "SELECT COUNT(*) FROM wake_cancellations")
+
+        :ok =
+          Txn.exec(
+            txn,
+            "ALTER TABLE wake_cancellations RENAME TO wake_cancellations_assignment_replacement_previous_v1"
+          )
+
+        :ok = Txn.exec(txn, new_table.sql)
+
+        columns =
+          "wakeId,wakeState,canceledAt,requesterKind,requesterId,reasonKind," <>
+            "causalSourceKind,causalSourceId,outcomeKind,replacementWakeId," <>
+            "dispositionKind,dispositionId,primaryWorkKind,primaryWorkId,workImpactKind," <>
+            "livenessTriggerKind,livenessTriggerId,actionNeeded"
+
+        Txn.q(
+          txn,
+          "INSERT INTO wake_cancellations (#{columns}) SELECT #{columns} FROM wake_cancellations_assignment_replacement_previous_v1"
+        )
+
+        if Txn.changes(txn) != cancellation_count do
+          raise ShapeError,
+            message:
+              "assignment source replacement migration copied #{Txn.changes(txn)} of #{cancellation_count} wake cancellations"
+        end
+
+        [[^cancellation_count]] = Txn.q(txn, "SELECT COUNT(*) FROM wake_cancellations")
+
+        :ok = Txn.exec(txn, "DROP TABLE wake_cancellations_assignment_replacement_previous_v1")
+        Enum.each(new_triggers, fn trigger -> :ok = Txn.exec(txn, trigger.sql) end)
+        validate_owned_object!(txn, new_table)
+        Enum.each(new_triggers, &validate_owned_object!(txn, &1))
+
+        case Txn.q(txn, "PRAGMA foreign_key_check") do
+          [] ->
+            :ok
+
+          rows ->
+            raise ShapeError,
+              message:
+                "assignment source replacement migration left invalid foreign keys: #{inspect(rows)}"
+        end
+
+        Txn.q(txn, "UPDATE schema_stamp SET shape=?1,stampedAt=?2 WHERE shape=?3", [
+          @assignment_source_replacement_shape,
+          System.system_time(:millisecond),
+          @work_item_owner_link_shape
+        ])
+
+        if Txn.changes(txn) != 1 do
+          raise ShapeError,
+            message:
+              "migration #{@work_item_owner_link_shape} -> #{@assignment_source_replacement_shape} lost its exact stamp transition"
+        end
+
+        :ok
+
+      rows ->
+        raise ShapeError,
+          message: "incompatible assignment source replacement predecessor: #{inspect(rows)}"
     end
   end
 
@@ -2580,6 +2805,9 @@ defmodule Tightbeam.Schema do
       {:ok, [[@work_item_owner_link_shape]]} ->
         check_work_item_owner_link_shape(db)
 
+      {:ok, [[@assignment_source_replacement_shape]]} ->
+        check_work_item_owner_link_shape(db)
+
       {:ok, [[shape]]}
       when shape in [
              @cursor_provider_shape,
@@ -2686,7 +2914,7 @@ defmodule Tightbeam.Schema do
         this Tightbeam database was written by a different build.
 
           stamped: #{found}
-          this build: #{@work_item_owner_link_shape}
+          this build: #{@assignment_source_replacement_shape}
         This build can migrate #{@model_identity_shape} or #{@operator_decision_shape}
         to #{@terminal_decision_liveness_shape}, then #{@effort_request_exit_previous_shape}.
         It can migrate #{@terminal_decision_shape} through
@@ -2699,7 +2927,7 @@ defmodule Tightbeam.Schema do
         It then migrates to #{@cannot_proceed_shape}, followed atomically by
         #{@settlement_shape}, #{@terminal_credential_shape}, #{@agent_reparent_shape},
         #{@artifact_origin_shape}, #{@identity_publication_denial_diagnostic_shape},
-        then #{@work_item_owner_link_shape}.
+        then #{@work_item_owner_link_shape} and #{@assignment_source_replacement_shape}.
         No migration is defined for the stamped shape above. Keep the database
         in place and run a Tightbeam build that recognizes that exact stamp.
         """
@@ -2712,7 +2940,7 @@ defmodule Tightbeam.Schema do
         this Tightbeam database carries MORE THAN ONE shape stamp.
 
           stamped: #{rows |> List.flatten() |> Enum.join(", ")}
-          this build: #{@work_item_owner_link_shape}
+          this build: #{@assignment_source_replacement_shape}
         Nothing in Tightbeam writes a second stamp, so this database was
         assembled by something else. Move it aside and let it be recreated.
         """
@@ -2785,6 +3013,7 @@ defmodule Tightbeam.Schema do
                     @agent_reparent_shape,
                     @artifact_origin_shape,
                     @identity_publication_denial_diagnostic_shape,
+                    @assignment_source_replacement_shape,
                     @work_item_owner_link_shape
                   ] ->
                :ok
@@ -2844,6 +3073,9 @@ defmodule Tightbeam.Schema do
   defp bootstrap_module(db, Tightbeam.Wakes, _current?),
     do: Tightbeam.Wakes.ensure_historical_schema(db)
 
+  defp bootstrap_module(db, Tightbeam.NoticeBatcher, _current?),
+    do: Tightbeam.NoticeBatcher.ensure_bootstrap_schema(db)
+
   defp bootstrap_module(db, Tightbeam.Toplines, _current?),
     do: Tightbeam.Toplines.ensure_historical_schema(db)
 
@@ -2869,6 +3101,7 @@ defmodule Tightbeam.Schema do
              @agent_reparent_shape,
              @artifact_origin_shape,
              @identity_publication_denial_diagnostic_shape,
+             @assignment_source_replacement_shape,
              @work_item_owner_link_shape
            ] ->
         Tightbeam.Assignments.ensure_schema(db)
@@ -2891,6 +3124,7 @@ defmodule Tightbeam.Schema do
              @agent_reparent_shape,
              @artifact_origin_shape,
              @identity_publication_denial_diagnostic_shape,
+             @assignment_source_replacement_shape,
              @work_item_owner_link_shape
            ] ->
         :ok
@@ -2988,6 +3222,7 @@ defmodule Tightbeam.Schema do
                     @agent_reparent_shape,
                     @artifact_origin_shape,
                     @identity_publication_denial_diagnostic_shape,
+                    @assignment_source_replacement_shape,
                     @work_item_owner_link_shape
                   ] ->
                :ok
@@ -3058,6 +3293,7 @@ defmodule Tightbeam.Schema do
                     @agent_reparent_shape,
                     @artifact_origin_shape,
                     @identity_publication_denial_diagnostic_shape,
+                    @assignment_source_replacement_shape,
                     @work_item_owner_link_shape
                   ] ->
                validate_artifact_content_schema!(txn)
@@ -3156,6 +3392,7 @@ defmodule Tightbeam.Schema do
              @agent_reparent_shape,
              @artifact_origin_shape,
              @identity_publication_denial_diagnostic_shape,
+             @assignment_source_replacement_shape,
              @work_item_owner_link_shape
            ] ->
         :ok
@@ -4205,6 +4442,7 @@ defmodule Tightbeam.Schema do
              @agent_reparent_shape,
              @artifact_origin_shape,
              @identity_publication_denial_diagnostic_shape,
+             @assignment_source_replacement_shape,
              @work_item_owner_link_shape
            ] ->
         :ok
@@ -4239,6 +4477,7 @@ defmodule Tightbeam.Schema do
              @agent_reparent_shape,
              @artifact_origin_shape,
              @identity_publication_denial_diagnostic_shape,
+             @assignment_source_replacement_shape,
              @work_item_owner_link_shape
            ] ->
         :ok
@@ -4345,6 +4584,7 @@ defmodule Tightbeam.Schema do
              @agent_reparent_shape,
              @artifact_origin_shape,
              @identity_publication_denial_diagnostic_shape,
+             @assignment_source_replacement_shape,
              @work_item_owner_link_shape
            ] ->
         :ok
@@ -4595,6 +4835,7 @@ defmodule Tightbeam.Schema do
              @agent_reparent_shape,
              @artifact_origin_shape,
              @identity_publication_denial_diagnostic_shape,
+             @assignment_source_replacement_shape,
              @work_item_owner_link_shape
            ] ->
         :ok
@@ -4617,6 +4858,7 @@ defmodule Tightbeam.Schema do
                     @agent_reparent_shape,
                     @artifact_origin_shape,
                     @identity_publication_denial_diagnostic_shape,
+                    @assignment_source_replacement_shape,
                     @work_item_owner_link_shape
                   ] ->
                :ok
@@ -4652,6 +4894,7 @@ defmodule Tightbeam.Schema do
              [[shape]]
              when shape in [
                     @work_item_owner_link_shape,
+                    @assignment_source_replacement_shape,
                     @identity_publication_denial_diagnostic_shape
                   ] ->
                :ok
@@ -4705,6 +4948,7 @@ defmodule Tightbeam.Schema do
              [[shape]]
              when shape in [
                     @work_item_owner_link_shape,
+                    @assignment_source_replacement_shape,
                     @identity_publication_denial_diagnostic_shape
                   ] ->
                :ok
@@ -4756,6 +5000,7 @@ defmodule Tightbeam.Schema do
              [[shape]]
              when shape in [
                     @work_item_owner_link_shape,
+                    @assignment_source_replacement_shape,
                     @identity_publication_denial_diagnostic_shape
                   ] ->
                validate_artifact_origins!(txn)
@@ -4816,6 +5061,7 @@ defmodule Tightbeam.Schema do
              [[shape]]
              when shape in [
                     @identity_publication_denial_diagnostic_shape,
+                    @assignment_source_replacement_shape,
                     @work_item_owner_link_shape
                   ] ->
                :ok
@@ -4856,7 +5102,8 @@ defmodule Tightbeam.Schema do
   defp upgrade_work_item_delivery_owner_link(db) do
     case DB.transaction(db, fn txn ->
            case Txn.q(txn, "SELECT shape FROM schema_stamp") do
-             [[@work_item_owner_link_shape]] ->
+             [[shape]]
+             when shape in [@work_item_owner_link_shape, @assignment_source_replacement_shape] ->
                :ok
 
              [[@identity_publication_denial_diagnostic_shape]] ->

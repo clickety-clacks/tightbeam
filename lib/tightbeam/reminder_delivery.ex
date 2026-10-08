@@ -104,10 +104,41 @@ defmodule Tightbeam.ReminderDelivery do
            "SELECT assignmentId, wakeId, endedAt FROM turns WHERE seq=?1 AND status='delivered'",
            [turn_seq]
          ) do
-      [[assignment, wake, finished_at]] when is_binary(assignment) ->
-        transition_in_txn(txn, assignment, turn_seq, wake, fn state, consumer, epoch ->
-          delivered(state, consumer, epoch, finished_at)
-        end)
+      [[assignment, wake, finished_at]] ->
+        direct =
+          if is_binary(assignment) do
+            transition_in_txn(txn, assignment, turn_seq, wake, fn state, consumer, epoch ->
+              delivered(state, consumer, epoch, finished_at)
+            end)
+          else
+            :no_claim
+          end
+
+        batched =
+          Txn.q(
+            txn,
+            """
+            SELECT source.assignmentId, source.wakeId
+            FROM notice_batch_members m
+            JOIN notice_batches b ON b.batchId=m.batchId
+            JOIN wakes source ON source.wakeId=m.sourceWakeId
+            JOIN turns carrier ON carrier.wakeId=b.deliveryWakeId
+            WHERE carrier.seq=?1 AND carrier.status='delivered' AND m.state='included'
+              AND source.assignmentId IS NOT NULL
+            """,
+            [turn_seq]
+          )
+          |> Enum.map(fn [source_assignment, source_wake] ->
+            transition_in_txn(
+              txn,
+              source_assignment,
+              turn_seq,
+              source_wake,
+              fn state, consumer, epoch -> delivered(state, consumer, epoch, finished_at) end
+            )
+          end)
+
+        if :recorded in batched, do: :recorded, else: direct
 
       _ ->
         :no_claim

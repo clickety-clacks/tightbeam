@@ -782,7 +782,12 @@ defmodule Tightbeam.Escalation do
              end
            ) do
         {:ok, {result, deliveries}} ->
-          ConditionFacts.complete_deliveries(db, deliveries)
+          ConditionFacts.complete_deliveries(
+            db,
+            opts[:scheduler] || Tightbeam.WakeScheduler,
+            deliveries
+          )
+
           nudge(opts, result[:ruling_fact_id] && [result.ruling_fact_id])
           result
 
@@ -2839,7 +2844,12 @@ defmodule Tightbeam.Escalation do
         end
       )
 
-    ConditionFacts.complete_deliveries(db, deliveries)
+    ConditionFacts.complete_deliveries(
+      db,
+      opts[:scheduler] || Tightbeam.WakeScheduler,
+      deliveries
+    )
+
     nudge(opts, result[:ruling_fact_id] && [result.ruling_fact_id])
     result
   end
@@ -2928,7 +2938,12 @@ defmodule Tightbeam.Escalation do
         end
       )
 
-    ConditionFacts.complete_deliveries(db, deliveries)
+    ConditionFacts.complete_deliveries(
+      db,
+      opts[:scheduler] || Tightbeam.WakeScheduler,
+      deliveries
+    )
+
     nudge(opts, fact_ids)
     waiver
   end

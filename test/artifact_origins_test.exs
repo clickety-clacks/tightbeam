@@ -172,7 +172,7 @@ defmodule Tightbeam.ArtifactOriginsTest do
     assert :ok = Schema.ensure_all(db)
     assert Artifacts.get(db, row.artifact_id) == migrated
 
-    assert {:ok, [["work-item-delivery-owner-v1-019"]]} =
+    assert {:ok, [["assignment-source-replacement-v1-019"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
   end
 

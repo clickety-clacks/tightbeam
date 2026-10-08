@@ -89,7 +89,7 @@ Tightbeam.GuardGatewayFixture.run!(fn %{db: db, config: config} ->
     assert Wakes.get(db, wake_id).state == "fired"
 
     # The expecter notification is a durable ungated wake armed with the request,
-    # still pending: the same tick that opened the request delivers nothing.
+    # still pending until the following scheduler pass forms its ready carrier.
     assert {:ok, [[notify_id]]} =
              DB.query(
                db,
@@ -101,7 +101,7 @@ Tightbeam.GuardGatewayFixture.run!(fn %{db: db, config: config} ->
     # The next ordinary tick delivers it through the gateway's own configured
     # prompt closure — real ConnRegistry, real lane nudge, one turn.
     assert :ok = Wakes.fire_due(scheduler)
-    assert Wakes.get(db, notify_id).state == "pending"
+    assert Wakes.get(db, notify_id).state == "fired"
 
     assert [%{delivery_wake_id: notify_carrier, batch_state: "delivered"}] =
              NoticeBatcher.source_refs(db, notify_id)

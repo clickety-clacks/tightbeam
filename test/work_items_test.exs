@@ -113,12 +113,24 @@ defmodule Tightbeam.WorkItemsTest do
 
     refute_receive {:firehose_notice, _}
     assert :ok = Wakes.fire_due(scheduler)
-    assert_receive {:timer_delivered, wake_id}
-    assert wake_id == wake.wake_id
+    assert_receive {:timer_delivered, carrier_id}
+    assert carrier_id != wake.wake_id
+    assert Wakes.get(ctx.db, carrier_id).digest
+
+    assert [%{delivery_wake_id: ^carrier_id, member_state: "included"}] =
+             Tightbeam.NoticeBatcher.source_refs(ctx.db, wake.wake_id)
+
     assert_receive {:firehose_notice, %{"class" => "wake.fired", "payload" => payload}}
-    assert payload["wakeId"] == wake.wake_id
+    assert payload["wakeId"] == carrier_id
+    assert payload["digest"] == true
     assert payload["state"] == "fired"
     Hub.delivered(hub, self())
+
+    assert_receive {:firehose_notice, %{"class" => "wake.fired", "payload" => source_payload}}
+    assert source_payload["wakeId"] == wake.wake_id
+    assert source_payload["digest"] == false
+    Hub.delivered(hub, self())
+
     assert :ok = Wakes.fire_due(scheduler)
     refute_receive {:timer_delivered, _}
     refute_receive {:firehose_notice, _}

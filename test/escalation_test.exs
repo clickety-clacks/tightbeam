@@ -10,8 +10,10 @@ defmodule Tightbeam.EscalationTest do
     Escalation,
     EventLog,
     Gateway,
+    Ledger,
     NoticeBatcher,
     Org,
+    Projection,
     Wakes
   }
 
@@ -174,6 +176,91 @@ defmodule Tightbeam.EscalationTest do
     assert Enum.map(notification_wakes(ctx), & &1.wake_id) == [wake.wake_id]
     :ok = Wakes.fire_due(deliverer)
     refute_receive {:delivered, _, _, _}
+  end
+
+  test "an operator ruling condition notice stays an editable source while its recipient is busy",
+       ctx do
+    request =
+      Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "route ruling?"}))
+
+    # The request's separate owner notice is unrelated to the raiser lane.
+    _owner_notice_carriers = NoticeBatcher.recover(ctx.db)
+
+    {:appended, queued_message} =
+      Projection.append(ctx.db, %{
+        session_key: ctx.raiser.session_key,
+        role: "user",
+        content: "already queued work",
+        sender: "session:raiser"
+      })
+
+    {:ok, busy_turn} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: ctx.raiser.session_key,
+        message_id: queued_message.id,
+        origin: "session:raiser",
+        prompt: "already queued work"
+      })
+
+    wake =
+      Wakes.schedule(ctx.db, %{
+        session_key: ctx.raiser.session_key,
+        origin: "agent:raiser",
+        creator_session_key: ctx.raiser.session_key,
+        prompt: "re-read the ruling",
+        due_at: System.system_time(:millisecond) + 60_000,
+        condition_kind: "escalation-ruled",
+        condition_scope: request.id,
+        class: "input-needed",
+        target_gate: 0
+      })
+
+    ruled =
+      Escalation.operator_rule(
+        ctx.db,
+        owner_operator_rule(request.id, %{decision: "accept"}),
+        scheduler: ctx.scheduler
+      )
+
+    assert is_integer(ruled.ruling_fact_id)
+
+    assert %{state: "pending", fired_by: "condition", fired_at: fired_at} =
+             Wakes.get(ctx.db, wake.wake_id)
+
+    assert is_integer(fired_at)
+    assert [] == NoticeBatcher.recover(ctx.db)
+
+    assert {:ok, [[^busy_turn]]} =
+             DB.query(
+               ctx.db,
+               "SELECT seq FROM turns WHERE sessionKey=?1 AND status='queued'",
+               [ctx.raiser.session_key]
+             )
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "SELECT sourceWakeId FROM notice_batch_members WHERE sourceWakeId=?1",
+               [wake.wake_id]
+             )
+
+    assert {:ok, busy} = Ledger.claim_next(ctx.db, ctx.raiser.session_key, "route-test")
+    assert busy.seq == busy_turn
+    assert :ok = Ledger.finish(ctx.db, busy.seq, "delivered", nil, owner_lease: busy.owner_lease)
+
+    assert [carrier_id] = NoticeBatcher.recover(ctx.db)
+
+    assert [
+             %{class: "input-needed", wake_id: source_wake_id},
+             %{class: "fyi", wake_id: ruling_notice_wake_id}
+           ] = NoticeBatcher.carrier_members(ctx.db, carrier_id)
+
+    assert source_wake_id == wake.wake_id
+    refute ruling_notice_wake_id == source_wake_id
+    assert Wakes.get(ctx.db, wake.wake_id).state == "pending"
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [wake.wake_id])
   end
 
   test "digest drops note and idempotency key but changes for effect-bearing params", ctx do

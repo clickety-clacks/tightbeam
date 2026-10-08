@@ -13,7 +13,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
   alias Tightbeam.{Assignments, ConnRegistry, DB, Schema, SessionPoAssociations, Wakes}
 
-  @shape "work-item-delivery-owner-v1-019"
+  @shape "assignment-source-replacement-v1-019"
   @agent_reparent_shape "delivery-owner-reparent-v1-019"
   @owner_link_history_ddl """
   CREATE TABLE work_item_delivery_scope_events (
@@ -1673,6 +1673,8 @@ defmodule Tightbeam.SchemaShapeTest do
                "ALTER TABLE identity_publication_markers DROP COLUMN denialDiagnostic; ALTER TABLE work_items DROP COLUMN deliveryOwnerSessionKey;"
              )
 
+    downgrade_assignment_source_replacement_cancellation!(db)
+
     assert {:ok, _} =
              DB.query(
                db,
@@ -1739,6 +1741,8 @@ defmodule Tightbeam.SchemaShapeTest do
                db,
                "ALTER TABLE identity_publication_markers DROP COLUMN denialDiagnostic; ALTER TABLE work_items DROP COLUMN deliveryOwnerSessionKey;"
              )
+
+    downgrade_assignment_source_replacement_cancellation!(db)
 
     assert {:ok, _} =
              DB.query(
@@ -1936,6 +1940,8 @@ defmodule Tightbeam.SchemaShapeTest do
   end
 
   defp rewind_to_agent_reparent!(db) do
+    downgrade_assignment_source_replacement_cancellation!(db)
+
     assert :ok =
              DB.execute(db, """
              DROP TRIGGER artifacts_origin_immutable;
@@ -2042,6 +2048,7 @@ defmodule Tightbeam.SchemaShapeTest do
   end
 
   defp downgrade_row_driven_waits(db) do
+    downgrade_assignment_source_replacement_cancellation!(db)
     :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
 
     try do
@@ -2094,6 +2101,51 @@ defmodule Tightbeam.SchemaShapeTest do
         """)
     after
       :ok = DB.execute(db, "PRAGMA foreign_keys = ON")
+    end
+  end
+
+  defp downgrade_assignment_source_replacement_cancellation!(db) do
+    {:ok, [[current_ddl]]} =
+      DB.query(
+        db,
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='wake_cancellations'"
+      )
+
+    assignment_route =
+      ~r/\n\s+OR\n\s+\(requesterId = 'tightbeam:assignments' AND reasonKind = 'superseded' AND\n\s+causalSourceKind = 'wake' AND outcomeKind = 'replacement'\)/
+
+    if Regex.match?(assignment_route, current_ddl) do
+      predecessor_ddl = Regex.replace(assignment_route, current_ddl, "", global: false)
+
+      {:ok, columns} = DB.query(db, "PRAGMA table_info(wake_cancellations)")
+      column_names = Enum.map_join(columns, ",", &Enum.at(&1, 1))
+
+      {:ok, trigger_rows} =
+        DB.query(
+          db,
+          "SELECT sql FROM sqlite_master WHERE type='trigger' AND name IN ('wake_cancellations_pending_insert','wakes_typed_cancellation_required') ORDER BY name"
+        )
+
+      trigger_ddls = Enum.map_join(trigger_rows, ";\n", &hd/1)
+      {:ok, [[foreign_keys]]} = DB.query(db, "PRAGMA foreign_keys")
+
+      assert :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
+
+      try do
+        assert :ok =
+                 DB.execute(db, """
+                 DROP TRIGGER wake_cancellations_pending_insert;
+                 DROP TRIGGER wakes_typed_cancellation_required;
+                 ALTER TABLE wake_cancellations RENAME TO wake_cancellations_assignment_replacement_current;
+                 #{predecessor_ddl};
+                 INSERT INTO wake_cancellations (#{column_names})
+                   SELECT #{column_names} FROM wake_cancellations_assignment_replacement_current;
+                 DROP TABLE wake_cancellations_assignment_replacement_current;
+                 #{trigger_ddls};
+                 """)
+      after
+        assert :ok = DB.execute(db, "PRAGMA foreign_keys = #{foreign_keys}")
+      end
     end
   end
 

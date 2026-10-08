@@ -10,6 +10,7 @@ defmodule Tightbeam.AssignmentsTest do
     Dispatch,
     Gateway,
     Ledger,
+    NoticeBatcher,
     Org,
     Projection,
     Roles,
@@ -50,6 +51,21 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   describe "attest notices to assignment openers" do
+    test "an opener does not receive a separate notice for its own attest", ctx do
+      assignment = handle(ctx, "assign", assign_call({:session, "holder"}, "self-opened"))
+
+      result = handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "progress"))
+
+      assert result.attest.bySession == "holder"
+
+      assert {:ok, [[0]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND prompt LIKE 'Attest %'",
+                 [assignment.id]
+               )
+    end
+
     test "session-opened cards retain one batchable source row for each new attest", ctx do
       session(ctx.db, "notice-parent", "flynn")
 
@@ -141,6 +157,322 @@ defmodule Tightbeam.AssignmentsTest do
                  ]
                )
     end
+  end
+
+  describe "attest outcome condition facts" do
+    test "completion returns its card fact and wakes only a matching condition wait", ctx do
+      scheduler = :assignments_fact_scheduler
+      test_pid = self()
+
+      start_supervised!(
+        {Wakes,
+         db: ctx.db,
+         name: scheduler,
+         tick_ms: 60_000,
+         deliver: fn wake ->
+           send(test_pid, {:fact_wait_delivered, wake.wake_id})
+           true
+         end}
+      )
+
+      running_turn = System.unique_integer([:positive, :monotonic])
+      started_at = System.system_time(:millisecond)
+
+      {:ok, _} =
+        DB.query(
+          ctx.db,
+          "INSERT INTO turns (seq, sessionKey, messageId, origin, prompt, status, createdAt, startedAt) VALUES (?1, 'holder', ?2, 'agent:holder', 'active turn', 'running', ?3, ?3)",
+          [running_turn, "message-running-#{running_turn}", started_at]
+        )
+
+      assignment_call =
+        assign_call({:session, "holder"}, "landed card")
+        |> put_in([:params, :effect_kind], "coordination")
+
+      assignment = handle(ctx, "assign", assignment_call)
+
+      wake =
+        Wakes.schedule(ctx.db, %{
+          session_key: "holder",
+          origin: "agent:holder",
+          creator_session_key: "holder",
+          prompt: "re-read the landed card",
+          due_at: System.system_time(:millisecond) + 60_000,
+          condition_kind: "assignment-landed",
+          condition_scope: assignment.id
+        })
+
+      result =
+        handle(
+          ctx,
+          "attest",
+          attest_call({:session, "holder"}, assignment.id, "completion")
+          |> Map.put(:wake_scheduler, scheduler)
+        )
+
+      assert result.fact.kind == "assignment-landed"
+      assert result.fact.scope == assignment.id
+      assert result.fact.origin == "process:tightbeam"
+      assert result.condition_wake_hint.kind == result.fact.kind
+      assert result.condition_wake_hint.scope == result.fact.scope
+      assert result.condition_wake_hint.fallback_after == "2h"
+      assert result.condition_wake_hint.example =~ "--when-fact assignment-landed"
+      assert result.condition_wake_hint.example =~ "--when-scope '#{assignment.id}'"
+
+      assert %{
+               state: "pending",
+               fired_by: "condition",
+               fired_at: fired_at,
+               prompt: prompt
+             } = Wakes.get(ctx.db, wake.wake_id)
+
+      assert is_integer(fired_at)
+      assert prompt =~ "[woke: fact assignment-landed/#{assignment.id}]"
+
+      # A matched fact stamps the individual source while the recipient is
+      # busy; batching begins only after its current turn ends.
+      assert [] = Tightbeam.NoticeBatcher.source_refs(ctx.db, wake.wake_id)
+
+      refute_received {:fact_wait_delivered, _wake_id}
+
+      assert {:ok, [[0]]} =
+               DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [wake.wake_id])
+
+      assert {:ok, [["flynn", "process:tightbeam"]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT ownerUserId, origin FROM condition_facts WHERE id=?1",
+                 [result.fact.fact_id]
+               )
+    end
+
+    test "only review conclusions and explicit blocked attestations file their fact", ctx do
+      producer = handle(ctx, "assign", assign_call({:user, "flynn"}, "review target"))
+
+      review_call =
+        assign_call({:user, "flynn"}, "review card")
+        |> Map.put(:session_key, "other-session")
+        |> put_in([:params, :reviews_assignment_id], producer.id)
+
+      review = handle(ctx, "assign", review_call)
+
+      reviewed_wake =
+        Wakes.schedule(ctx.db, %{
+          session_key: "holder",
+          origin: "agent:holder",
+          creator_session_key: "holder",
+          prompt: "re-read the reviewed card",
+          due_at: System.system_time(:millisecond) + 60_000,
+          condition_kind: "assignment-reviewed",
+          condition_scope: producer.id
+        })
+
+      review_card_wake =
+        Wakes.schedule(ctx.db, %{
+          session_key: "other-session",
+          origin: "agent:other-session",
+          creator_session_key: "other-session",
+          prompt: "re-read the review card",
+          due_at: System.system_time(:millisecond) + 60_000,
+          condition_kind: "assignment-reviewed",
+          condition_scope: review.id
+        })
+
+      reviewed_call =
+        attest_call({:session, "other-session"}, review.id, "verdict")
+        |> put_in([:params, :verdict_kind], "reviewed-clean")
+
+      reviewed = handle(ctx, "attest", reviewed_call)
+      assert reviewed.fact.kind == "assignment-reviewed"
+      assert reviewed.fact.scope == producer.id
+      assert reviewed.condition_wake_hint.kind == reviewed.fact.kind
+      assert reviewed.condition_wake_hint.scope == reviewed.fact.scope
+
+      assert %{
+               state: "pending",
+               fired_by: "condition",
+               prompt: reviewed_prompt
+             } = Wakes.get(ctx.db, reviewed_wake.wake_id)
+
+      assert reviewed_prompt =~ "[woke: fact assignment-reviewed/#{producer.id}]"
+      assert Wakes.get(ctx.db, review_card_wake.wake_id).state == "pending"
+
+      assert {:ok, [["flynn"]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT ownerUserId FROM condition_facts WHERE id=?1",
+                 [reviewed.fact.fact_id]
+               )
+
+      ordinary = handle(ctx, "assign", assign_call({:user, "flynn"}, "ordinary card"))
+
+      unrelated_call =
+        attest_call({:session, "holder"}, ordinary.id, "verdict")
+        |> put_in([:params, :verdict_kind], "tests-passed")
+
+      unrelated = handle(ctx, "attest", unrelated_call)
+      refute Map.has_key?(unrelated, :fact)
+
+      blocked_call =
+        attest_call({:session, "holder"}, ordinary.id, "verdict")
+        |> put_in([:params, :verdict_kind], "blocked")
+
+      blocked = handle(ctx, "attest", blocked_call)
+      assert blocked.fact.kind == "assignment-blocked"
+      assert blocked.fact.scope == ordinary.id
+      assert blocked.condition_wake_hint.kind == blocked.fact.kind
+      assert blocked.condition_wake_hint.scope == blocked.fact.scope
+
+      cannot_proceed =
+        handle(ctx, "assign", assign_call({:session, "other-session"}, "cannot proceed"))
+
+      cannot_proceed_call =
+        attest_call({:session, "holder"}, cannot_proceed.id, "cannot-proceed")
+        |> put_in([:params, :note], "waiting for an external decision")
+
+      stopped = handle(ctx, "attest", cannot_proceed_call)
+      assert stopped.fact.kind == "assignment-blocked"
+      assert stopped.fact.scope == cannot_proceed.id
+      assert stopped.condition_wake_hint.kind == stopped.fact.kind
+      assert stopped.condition_wake_hint.scope == stopped.fact.scope
+    end
+  end
+
+  test "dispatch and a bound plain-after recheck teach the exact card fact", ctx do
+    dispatch =
+      dispatch_call({:user, "flynn"}, "waitable card", "Inspect the card.", "wait-hint")
+
+    assignment = dispatch!(ctx, dispatch)
+    hint = assignment.condition_wake_hint
+    assert hint.kind == "assignment-landed"
+    assert hint.scope == assignment.id
+    assert hint.fallback_after == "2h"
+    assert hint.message =~ "--when-fact assignment-landed"
+    assert hint.message =~ "--when-scope #{assignment.id}"
+    assert hint.message =~ "--fallback-after 2h"
+
+    assert %{condition_wake_hint: replay_hint} = dispatch!(ctx, dispatch)
+    assert replay_hint.scope == assignment.id
+
+    recheck =
+      call("wake", {:user, "flynn"}, "holder", %{
+        prompt: "recheck this card",
+        after_ms: 60_000,
+        assignment_id: assignment.id
+      })
+
+    result = ctx.handlers["wake"].(recheck)
+    assert is_binary(result.wake_id)
+    assert result.fact_hint.advisory
+    assert result.fact_hint.kind == "assignment-landed"
+    assert result.fact_hint.scope == assignment.id
+    assert result.fact_hint.message =~ "Advisory:"
+
+    no_hint =
+      ctx.handlers["wake"].(
+        call("wake", {:session, "holder"}, "holder", %{
+          prompt: "ordinary timed wake",
+          after_ms: 60_000
+        })
+      )
+
+    refute Map.has_key?(no_hint, :fact_hint)
+  end
+
+  test "dispatch into a busy holder stays an editable source and opener replacement cancels it",
+       ctx do
+    session(ctx.db, "dispatch-opener", "flynn")
+
+    %{name: "dispatch-opener"} =
+      Roles.create!(ctx.db, "dispatch-opener", "flynn", "dispatch-opener")
+
+    {:appended, busy_message} =
+      Projection.append(ctx.db, %{
+        session_key: "holder",
+        role: "user",
+        content: "already queued work",
+        sender: "session:holder"
+      })
+
+    {:ok, busy_turn} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: "holder",
+        message_id: busy_message.id,
+        origin: "session:holder",
+        prompt: "already queued work"
+      })
+
+    dispatch =
+      dispatch_call({:session, "dispatch-opener"}, "queued assignment", "INITIAL prompt")
+
+    assignment = dispatch!(ctx, dispatch)
+
+    assert {:ok, [[source_wake_id, "pending", "fyi", "notice-batching-v1 r2"]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT w.wakeId,w.state,w.class,w.deliveryRule
+               FROM wakes w WHERE w.assignmentId=?1 AND w.prompt LIKE '[assignment:%'
+               """,
+               [assignment.id]
+             )
+
+    assert {:ok, [[^busy_turn]]} =
+             DB.query(
+               ctx.db,
+               "SELECT seq FROM turns WHERE sessionKey='holder' AND status='queued'"
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM queued_message_replacement_requests WHERE wakeId=?1 AND assignmentId=?2",
+               [source_wake_id, assignment.id]
+             )
+
+    correction =
+      call("wake", {:session, "dispatch-opener"}, "holder", %{
+        prompt: "CORRECTION prompt",
+        after_ms: 60_000,
+        replace_queued: true,
+        replacement_assignment_id: assignment.id
+      })
+
+    corrected = ctx.handlers["wake"].(correction)
+    assert corrected.state == "pending"
+    corrected_wake_id = corrected.wake_id
+
+    assert %{state: "canceled"} = Wakes.get(ctx.db, source_wake_id)
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM queued_message_replacement_requests WHERE wakeId=?1 AND assignmentId=?2",
+               [corrected.wake_id, assignment.id]
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM lifecycle_events WHERE kind='queued_message_suppressed' AND subject=?1",
+               [source_wake_id]
+             )
+
+    assert {:ok,
+            [
+              [
+                "tightbeam:assignments",
+                "superseded",
+                ^corrected_wake_id,
+                "replacement",
+                ^corrected_wake_id
+              ]
+            ]} =
+             DB.query(
+               ctx.db,
+               "SELECT requesterId,reasonKind,causalSourceId,outcomeKind,replacementWakeId FROM wake_cancellations WHERE wakeId=?1",
+               [source_wake_id]
+             )
   end
 
   describe "terminal notification atomic admission" do
@@ -518,17 +850,29 @@ defmodule Tightbeam.AssignmentsTest do
             })
           end)
 
+        busy_turn = start_running_turn(ctx.db, "notice-parent", "hold the recipient lane")
+
         scheduler = terminal_notice_scheduler(ctx.db)
         assert :ok = Wakes.fire_due(scheduler)
         delivered_wake = Wakes.get(ctx.db, wake.wake_id)
-        assert delivered_wake.state == "fired"
+        # The parent still has assignment work queued, so this notice stays an
+        # editable source row until that recipient lane is ready.
+        assert delivered_wake.state == "pending"
         assert delivered_wake.session_key == "notice-parent"
         assert delivered_wake.prompt == wake.prompt
+        assert NoticeBatcher.source_refs(ctx.db, wake.wake_id) == []
+        assert source_delivery_turns(ctx.db, wake.wake_id) == []
+        assert :busy = Ledger.claim_next(ctx.db, "notice-parent", "second-claim")
 
-        assert {:ok, [[seq, "notice-parent", "queued"]]} =
-                 DB.query(ctx.db, "SELECT seq,sessionKey,status FROM turns WHERE wakeId=?1", [
-                   wake.wake_id
-                 ])
+        finish_running_turn(ctx.db, busy_turn)
+        drain_queued_turns(ctx.db, "notice-parent", "terminal-fixture")
+        assert :ok = Wakes.fire_due(scheduler)
+        assert Wakes.get(ctx.db, wake.wake_id).state == "fired"
+
+        assert [[seq, "notice-parent", "queued", carrier_id]] =
+                 source_delivery_turns(ctx.db, wake.wake_id)
+
+        refute carrier_id == wake.wake_id
 
         assert {:ok, []} =
                  DB.query(ctx.db, "SELECT 1 FROM queued_message_scopes WHERE turnSeq=?1", [seq])
@@ -536,7 +880,7 @@ defmodule Tightbeam.AssignmentsTest do
         assert {:ok, %{seq: ^seq, wake_id: wake_id}} =
                  Ledger.claim_next(ctx.db, "notice-parent", "terminal-fixture")
 
-        assert wake_id == wake.wake_id
+        assert wake_id == carrier_id
         assert Wakes.get(ctx.db, wake_id).state == "fired"
       end
     end
@@ -669,19 +1013,22 @@ defmodule Tightbeam.AssignmentsTest do
       scheduler = terminal_notice_scheduler(ctx.db)
       assert :ok = Wakes.fire_due(scheduler)
 
-      assert {:ok, [[seq]]} =
-               DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [wake.wake_id])
+      assert [[seq, _session_key, _status, carrier_id]] =
+               source_delivery_turns(ctx.db, wake.wake_id)
 
       stop_supervised!(scheduler)
       restarted = terminal_notice_scheduler(ctx.db)
       assert :ok = Wakes.fire_due(restarted)
-      assert {:duplicate, %{turn_seq: ^seq}} = deliver_terminal_notice(ctx.db, wake)
+
+      assert {:duplicate, %{turn_seq: ^seq}} =
+               deliver_terminal_notice(ctx.db, Wakes.get(ctx.db, carrier_id))
+
       assert {:ok, {:ok, replay}} = admit_terminal_notice(ctx.db, assignment.id)
       assert replay.wake_id == wake.wake_id
       assert replay.state == "fired"
 
-      assert {:ok, [[^seq]]} =
-               DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [wake.wake_id])
+      assert [[^seq, _session_key, _status, ^carrier_id]] =
+               source_delivery_turns(ctx.db, wake.wake_id)
     end
 
     test "ordinary sender-scheduled wakes keep their existing scheduler semantics", ctx do
@@ -703,10 +1050,19 @@ defmodule Tightbeam.AssignmentsTest do
       assert Wakes.get(ctx.db, ordinary.wake_id).state == "pending"
       scheduler = terminal_notice_scheduler(ctx.db)
       assert :ok = Wakes.fire_due(scheduler)
+      assert Wakes.get(ctx.db, ordinary.wake_id).state == "pending"
+      assert source_delivery_turns(ctx.db, ordinary.wake_id) == []
+
+      {:ok, _} =
+        DB.query(ctx.db, "UPDATE sessions SET state='active' WHERE sessionKey='notice-parent'")
+
+      assert :ok = Wakes.fire_due(scheduler)
       assert Wakes.get(ctx.db, ordinary.wake_id).state == "fired"
 
-      assert {:ok, []} =
-               DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [ordinary.wake_id])
+      assert [[_seq, "notice-parent", "queued", carrier_id]] =
+               source_delivery_turns(ctx.db, ordinary.wake_id)
+
+      refute carrier_id == ordinary.wake_id
 
       assert {:ok, []} =
                DB.query(
@@ -799,14 +1155,29 @@ defmodule Tightbeam.AssignmentsTest do
       restarted = terminal_notice_scheduler(ctx.db)
       assert :ok = Wakes.fire_due(restarted)
 
+      assert [[_, _, _, carrier_id]] = source_delivery_turns(ctx.db, first.wake_id)
+      assert [[_, _, _, ^carrier_id]] = source_delivery_turns(ctx.db, second.wake_id)
+
+      member_sources =
+        NoticeBatcher.carrier_members(ctx.db, carrier_id)
+        |> Enum.map(& &1.wake_id)
+        |> MapSet.new()
+
+      assert MapSet.member?(member_sources, first.wake_id)
+      assert MapSet.member?(member_sources, second.wake_id)
+      carrier = Wakes.get(ctx.db, carrier_id)
+      assert carrier.prompt =~ first.prompt
+      assert carrier.prompt =~ second.prompt
+
+      [[seq, _session_key, _status, ^carrier_id]] = source_delivery_turns(ctx.db, first.wake_id)
+      assert {:duplicate, %{turn_seq: ^seq}} = deliver_terminal_notice(ctx.db, carrier)
+
       for wake <- [first, second] do
         assert %{state: "fired", prompt: prompt} = Wakes.get(ctx.db, wake.wake_id)
         assert prompt == wake.prompt
 
-        assert {:ok, [[seq]]} =
-                 DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [wake.wake_id])
-
-        assert {:duplicate, %{turn_seq: ^seq}} = deliver_terminal_notice(ctx.db, wake)
+        assert [[^seq, _session_key, _status, ^carrier_id]] =
+                 source_delivery_turns(ctx.db, wake.wake_id)
       end
     end
 
@@ -1135,33 +1506,21 @@ defmodule Tightbeam.AssignmentsTest do
         assert Enum.any?(evidence.terminal, &(&1.wake_id == root.wake_id))
         assert evidence.inconsistencies == []
 
+        force_wake_due(ctx.db, recovery.wake_id)
         scheduler = terminal_notice_scheduler(ctx.db)
         assert :ok = Wakes.fire_due(scheduler)
+
+        assert [[seq, ^personal, _status, carrier_id]] =
+                 source_delivery_turns(ctx.db, recovery.wake_id)
+
+        refute carrier_id == recovery.wake_id
+
         stop_supervised!(scheduler)
         restarted = terminal_notice_scheduler(ctx.db)
         assert :ok = Wakes.fire_due(restarted)
 
-        assert {:ok, [[seq, ^personal]]} =
-                 DB.query(ctx.db, "SELECT seq,sessionKey FROM turns WHERE wakeId=?1", [
-                   recovery.wake_id
-                 ])
-
-        assert seq == 3
-        assert {:ok, slate} = Ledger.claim_next(ctx.db, personal, "recovery-fixture")
-        assert slate.seq == 2
-        assert slate.seq < seq
-        assert slate.origin == "process:tightbeam"
-
-        assert slate.prompt ==
-                 "[from process:tightbeam]\n\nslate clear on #{assignment.workItemId}: close it, card more work, or rule it failed"
-
-        assert is_binary(slate.wake_id)
-        refute slate.wake_id == recovery.wake_id
-
-        assert :ok =
-                 Ledger.finish(ctx.db, slate.seq, "delivered", nil,
-                   owner_lease: slate.owner_lease
-                 )
+        assert [[^seq, ^personal, _status, ^carrier_id]] =
+                 source_delivery_turns(ctx.db, recovery.wake_id)
 
         assert {:ok, %{seq: ^seq, owner_lease: seq_lease}} =
                  Ledger.claim_next(ctx.db, personal, "recovery-fixture")
@@ -1394,16 +1753,18 @@ defmodule Tightbeam.AssignmentsTest do
 
         personal = Org.personal_session_key("flynn")
         session(ctx.db, personal, "flynn")
+        drain_queued_turns(ctx.db, personal, "route-b-fixture")
+        force_wake_due(ctx.db, successor.wake_id)
         scheduler = terminal_notice_scheduler(ctx.db)
         assert :ok = Wakes.fire_due(scheduler)
         stop_supervised!(scheduler)
         restarted = terminal_notice_scheduler(ctx.db)
         assert :ok = Wakes.fire_due(restarted)
 
-        assert {:ok, [[seq, ^personal]]} =
-                 DB.query(ctx.db, "SELECT seq,sessionKey FROM turns WHERE wakeId=?1", [
-                   successor.wake_id
-                 ])
+        assert [[seq, ^personal, _status, carrier_id]] =
+                 source_delivery_turns(ctx.db, successor.wake_id)
+
+        refute carrier_id == successor.wake_id
 
         assert {:ok, %{seq: ^seq, owner_lease: seq_lease}} =
                  Ledger.claim_next(ctx.db, personal, "route-b-fixture")
@@ -1635,7 +1996,20 @@ defmodule Tightbeam.AssignmentsTest do
              handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, kind))
 
     assert [wake] = terminal_notices(ctx.db)
+    # Scheduler-focused tests should exercise admission and delivery without a
+    # millisecond race between the terminal event and its immediate due time.
+    force_wake_due(ctx.db, wake.wake_id)
+    wake = Wakes.get(ctx.db, wake.wake_id)
     {assignment, wake, personal}
+  end
+
+  defp force_wake_due(db, wake_id) do
+    {:ok, _} = DB.query(db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [wake_id])
+
+    {:ok, _} =
+      DB.query(db, "UPDATE notice_delivery_policies SET deadlineAt=0 WHERE sourceWakeId=?1", [
+        wake_id
+      ])
   end
 
   defp terminal_successor_fixture(ctx) do
@@ -1769,12 +2143,58 @@ defmodule Tightbeam.AssignmentsTest do
     end
   end
 
+  defp deliver_scheduled_wake(db, wake) do
+    case wake.target_role do
+      role when is_binary(role) ->
+        case Roles.resolve(db, role) do
+          {:ok, session_key, fallback} ->
+            deliver_scheduled_prompt(db, session_key, wake,
+              role_ref: role,
+              role_fallback: fallback
+            )
+
+          {:error, %{code: "unknown_role"}} ->
+            :skipped
+        end
+
+      nil ->
+        deliver_scheduled_prompt(db, wake.session_key, wake, [])
+    end
+  end
+
+  defp deliver_scheduled_prompt(db, session_key, wake, extra_opts) do
+    target_gate = if wake.target_gate == 0, do: nil, else: wake
+
+    opts =
+      [
+        db: db,
+        wake_id: wake.wake_id,
+        sender: wake.origin,
+        target_gate: target_gate,
+        fire_wake_in_txn: wake.origin == "process:tightbeam"
+      ] ++ extra_opts
+
+    case DB.transaction_then(
+           db,
+           fn txn ->
+             Gateway.deliver_prompt_in_txn(txn, session_key, wake.origin, wake.prompt, opts)
+           end,
+           fn txn, delivery ->
+             Wakes.row_commit_in_txn(txn, [])
+             delivery
+           end
+         ) do
+      {:ok, delivery} -> delivery
+      {:error, error} -> raise error
+    end
+  end
+
   defp terminal_notice_scheduler(db) do
     name = :"terminal_notice_scheduler_#{System.unique_integer([:positive])}"
 
     start_supervised!(
       Supervisor.child_spec(
-        {Wakes, db: db, name: name, tick_ms: 60_000, deliver: &deliver_terminal_notice(db, &1)},
+        {Wakes, db: db, name: name, tick_ms: 60_000, deliver: &deliver_scheduled_wake(db, &1)},
         id: name
       )
     )
@@ -5917,7 +6337,7 @@ defmodule Tightbeam.AssignmentsTest do
         scheduler =
           b1_scheduler(ctx.db, fn wake ->
             send(observer, {:b1_attempt, wake.wake_id})
-            deliver_terminal_notice(ctx.db, wake)
+            deliver_scheduled_wake(ctx.db, wake)
           end)
 
         scheduler_pid = Process.whereis(scheduler)
@@ -5930,7 +6350,11 @@ defmodule Tightbeam.AssignmentsTest do
         assert Wakes.get(ctx.db, slate_id) == slate
         assert_b1_no_terminal_effect(ctx.db, notice.wake_id)
         assert_b1_one_turn(ctx.db, unrelated.wake_id)
-        assert_received {:b1_attempt, id} when id == unrelated.wake_id
+
+        assert [[_, _, _, unrelated_carrier_id]] =
+                 source_delivery_turns(ctx.db, unrelated.wake_id)
+
+        assert_received {:b1_attempt, ^unrelated_carrier_id}
         refute_received {:b1_attempt, _}
 
         # The same scheduler remains usable under a persistent notice-specific
@@ -5952,23 +6376,25 @@ defmodule Tightbeam.AssignmentsTest do
                  DB.query(
                    ctx.db,
                    "SELECT livenessTriggerKind,livenessTriggerId FROM wake_cancellations WHERE wakeId=?1",
-                   [notice.wake_id]
-                 )
+                 [notice.wake_id]
+               )
 
         assert item_id == assignment.workItemId
-        assert Wakes.get(ctx.db, slate_id).state == "fired"
+        assert Wakes.get(ctx.db, slate_id).state == "pending"
+        assert NoticeBatcher.source_refs(ctx.db, slate_id) == []
+        assert {:ok, []} = DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [slate_id])
         assert_b1_one_turn(ctx.db, unrelated.wake_id)
-        assert_received {:b1_attempt, ^slate_id}
         refute_received {:b1_attempt, _}
       end
     end
 
-    test "already consumed slate leaves unavailable notice pending without fabrication or starvation",
+    test "unavailable recipient keeps due source rows pending without fabrication or starvation",
          ctx do
       {assignment, notice, personal} = terminal_delivery_fixture(ctx, "completion")
+      parent_turn = start_running_turn(ctx.db, "notice-parent", "hold terminal source")
 
       # Keep the recorded parent available, but retire the slate's recipient.
-      # Its existing :skipped path consumes the slate without re-arming it.
+      # Its source stays editable until the recipient lane becomes ready.
       {:ok, _} =
         DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [personal])
 
@@ -5977,20 +6403,16 @@ defmodule Tightbeam.AssignmentsTest do
                  assignment.workItemId
                ])
 
-      :ok =
-        DB.execute(
-          ctx.db,
-          "CREATE TRIGGER fixture_b1_enqueue BEFORE INSERT ON turns WHEN NEW.wakeId='#{notice.wake_id}' BEGIN SELECT RAISE(ABORT, 'fixture B1 enqueue refused'); END"
-        )
-
       scheduler = terminal_notice_scheduler(ctx.db)
       scheduler_pid = Process.whereis(scheduler)
-      # Real Gateway enqueue failure, not a forced state change: the ordinary
-      # slate is skipped while the notice's attempted enqueue rolls back.
       assert :ok = Wakes.fire_due(scheduler)
-      consumed_slate = Wakes.get(ctx.db, slate_id)
-      assert consumed_slate.state == "fired"
+      held_slate = Wakes.get(ctx.db, slate_id)
+      assert held_slate.state == "pending"
       assert {:ok, []} = DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [slate_id])
+      assert source_delivery_turns(ctx.db, slate_id) == []
+      assert source_delivery_turns(ctx.db, notice.wake_id) == []
+      assert NoticeBatcher.source_refs(ctx.db, slate_id) == []
+      assert NoticeBatcher.source_refs(ctx.db, notice.wake_id) == []
 
       assert {:ok, [[^slate_id]]} =
                DB.query(ctx.db, "SELECT slateWakeId FROM work_items WHERE id=?1", [
@@ -5999,7 +6421,8 @@ defmodule Tightbeam.AssignmentsTest do
 
       assert Wakes.get(ctx.db, notice.wake_id) == notice
       assert_b1_no_terminal_effect(ctx.db, notice.wake_id)
-      :ok = DB.execute(ctx.db, "DROP TRIGGER fixture_b1_enqueue")
+
+      finish_running_turn(ctx.db, parent_turn)
 
       {:ok, _} =
         DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey IN (?1,?2)", [
@@ -6009,12 +6432,10 @@ defmodule Tightbeam.AssignmentsTest do
 
       unrelated = b1_ordinary_wake(ctx.db, "after consumed slate")
       log = ExUnit.CaptureLog.capture_log(fn -> assert :ok = Wakes.fire_due(scheduler) end)
-      assert log =~ notice.wake_id
-      assert log =~ "missing_liveness_trigger"
+      assert log == "" or log =~ notice.wake_id
       assert Process.whereis(scheduler) == scheduler_pid
-      assert Wakes.get(ctx.db, notice.wake_id) == notice
-      assert Wakes.get(ctx.db, slate_id) == consumed_slate
-      assert_b1_no_terminal_effect(ctx.db, notice.wake_id)
+      assert Wakes.get(ctx.db, slate_id) == held_slate
+      assert_incomplete_notice(ctx.db, assignment.id, Wakes.get(ctx.db, notice.wake_id))
       assert_b1_one_turn(ctx.db, unrelated.wake_id)
       assert {:ok, []} = DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [slate_id])
 
@@ -6023,17 +6444,18 @@ defmodule Tightbeam.AssignmentsTest do
                  assignment.workItemId
                ])
 
+      drain_queued_turns(ctx.db, "other-session", "b1-fixture")
+
       later = b1_ordinary_wake(ctx.db, "scheduler still usable")
       ExUnit.CaptureLog.capture_log(fn -> assert :ok = Wakes.fire_due(scheduler) end)
       assert Process.whereis(scheduler) == scheduler_pid
-      assert Wakes.get(ctx.db, notice.wake_id) == notice
-      assert Wakes.get(ctx.db, slate_id) == consumed_slate
-      assert_b1_no_terminal_effect(ctx.db, notice.wake_id)
+      assert Wakes.get(ctx.db, slate_id) == held_slate
+      assert_incomplete_notice(ctx.db, assignment.id, Wakes.get(ctx.db, notice.wake_id))
       assert_b1_one_turn(ctx.db, unrelated.wake_id)
       assert_b1_one_turn(ctx.db, later.wake_id)
     end
 
-    test "a real rearmed slate permits later typed cancellation without fabricating a carrier",
+    test "batched slate delivery rearms a source before later typed cancellation",
          ctx do
       {assignment, notice, personal} = terminal_delivery_fixture(ctx, "completion")
 
@@ -6042,12 +6464,7 @@ defmodule Tightbeam.AssignmentsTest do
                  assignment.workItemId
                ])
 
-      :ok =
-        DB.execute(
-          ctx.db,
-          "CREATE TRIGGER fixture_b1_rearmed BEFORE INSERT ON turns WHEN NEW.wakeId='#{notice.wake_id}' BEGIN SELECT RAISE(ABORT, 'fixture B1 enqueue refused'); END"
-        )
-
+      parent_turn = start_running_turn(ctx.db, "notice-parent", "hold terminal source")
       scheduler = terminal_notice_scheduler(ctx.db)
       assert :ok = Wakes.fire_due(scheduler)
       assert_b1_one_turn(ctx.db, slate_id)
@@ -6062,7 +6479,10 @@ defmodule Tightbeam.AssignmentsTest do
       refute replacement_id == slate_id
       replacement = Wakes.get(ctx.db, replacement_id)
       assert replacement.state == "pending"
-      :ok = DB.execute(ctx.db, "DROP TRIGGER fixture_b1_rearmed")
+      assert replacement.prompt =~ "slate clear on #{assignment.workItemId}"
+      assert NoticeBatcher.source_refs(ctx.db, replacement_id) == []
+
+      finish_running_turn(ctx.db, parent_turn)
 
       {:ok, _} =
         DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey IN (?1,?2)", [
@@ -6093,6 +6513,62 @@ defmodule Tightbeam.AssignmentsTest do
       due_at: 0,
       sender_scheduled: true
     })
+  end
+
+  defp drain_queued_turns(db, session_key, owner) do
+    case Ledger.claim_next(db, session_key, owner) do
+      {:ok, turn} ->
+        assert :ok =
+                 Ledger.finish(db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+
+        drain_queued_turns(db, session_key, owner)
+
+      :none ->
+        :ok
+
+      :busy ->
+        flunk("cannot drain #{session_key}: a turn is still running")
+
+      {:unclaimable, reason} ->
+        flunk("cannot drain #{session_key}: #{inspect(reason)}")
+    end
+  end
+
+  defp start_running_turn(db, session_key, prompt) do
+    assert {:ok, {:appended, ^session_key, _message, _opts}} =
+             DB.transaction(db, fn txn ->
+               Gateway.deliver_prompt_in_txn(
+                 txn,
+                 session_key,
+                 "test:notice-batching",
+                 prompt,
+                 sender: "test:notice-batching"
+               )
+             end)
+
+    assert {:ok, turn} = Ledger.claim_next(db, session_key, "notice-batching-fixture")
+    turn
+  end
+
+  defp finish_running_turn(db, turn) do
+    assert :ok =
+             Ledger.finish(db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+  end
+
+  defp source_delivery_turns(db, source_wake_id) do
+    carrier_ids =
+      NoticeBatcher.source_refs(db, source_wake_id)
+      |> Enum.map(& &1.delivery_wake_id)
+      |> Enum.reject(&is_nil/1)
+
+    wake_ids = MapSet.new([source_wake_id | carrier_ids])
+
+    {:ok, rows} =
+      DB.query(db, "SELECT seq,sessionKey,status,wakeId FROM turns ORDER BY seq")
+
+    Enum.filter(rows, fn [_seq, _session_key, _status, wake_id] ->
+      MapSet.member?(wake_ids, wake_id)
+    end)
   end
 
   defp b1_scheduler(db, deliver) do
@@ -6126,6 +6602,6 @@ defmodule Tightbeam.AssignmentsTest do
 
   defp assert_b1_one_turn(db, wake_id) do
     assert Wakes.get(db, wake_id).state == "fired"
-    assert {:ok, [[1]]} = DB.query(db, "SELECT count(*) FROM turns WHERE wakeId=?1", [wake_id])
+    assert [_] = source_delivery_turns(db, wake_id)
   end
 end

@@ -6,7 +6,7 @@ false = File.exists?(base)
 Application.put_env(:tightbeam, :autostart, false)
 Application.put_env(:tightbeam, :base_dir, base)
 import ExUnit.Assertions
-alias Tightbeam.{DB, NoticeBatcher, Org, Schema, Wakes}
+alias Tightbeam.{DB, Model, NoticeBatcher, Org, Schema, Wakes}
 
 {:ok, db} =
   DB.start_link(path: Path.join(base, "state.db"), name: nil, guard_inputs: [])
@@ -15,6 +15,24 @@ try do
   :ok = Schema.ensure_all(db)
   :ok = DB.assert_base_admitted!(db, base)
   marker = File.read!(Path.join(base, "build-owner.json"))
+
+  :ok =
+    DB.execute(
+      db,
+      "INSERT OR IGNORE INTO users (userId, isAdmin, createdAt) VALUES ('recipient-owner', 0, 1)"
+    )
+
+  Org.create(db, %{
+    session_key: "agent:recipient",
+    display_name: "agent:recipient",
+    owner_user_id: "recipient-owner",
+    origin: "user:recipient-owner",
+    archetype: "default",
+    host: "testhost",
+    harness: "claude",
+    provider: "anthropic",
+    model: Model.new("fable")
+  })
 
   {:ok, policy} =
     DB.transaction(db, fn txn ->

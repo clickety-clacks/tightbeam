@@ -1,4 +1,6 @@
 defmodule Tightbeam.NoticeBatcher do
+  require Logger
+
   @moduledoc """
   Source-preserving, default-on delivery batching for prompt wakes. Class and
   origin remain on every source row; they affect only ordering and envelope
@@ -118,10 +120,30 @@ defmodule Tightbeam.NoticeBatcher do
 
   CREATE INDEX IF NOT EXISTS notice_batch_members_batch
     ON notice_batch_members(batchId, publicationSeq);
+
+  """
+
+  @staged_message_dedupes_ddl """
+  CREATE TABLE IF NOT EXISTS staged_message_dedupes (
+    targetSessionKey TEXT NOT NULL,
+    deviceId TEXT NOT NULL,
+    clientMessageId TEXT NOT NULL,
+    sourceWakeId TEXT NOT NULL UNIQUE REFERENCES wakes(wakeId),
+    payloadSha256 TEXT NOT NULL CHECK (length(payloadSha256)=64),
+    createdAt INTEGER NOT NULL CHECK (createdAt >= 0),
+    PRIMARY KEY (targetSessionKey, deviceId, clientMessageId)
+  );
   """
 
   @spec ensure_schema(GenServer.server()) :: :ok | {:error, term()}
-  def ensure_schema(db \\ Tightbeam.DB), do: DB.execute(db, @ddl)
+  def ensure_schema(db \\ Tightbeam.DB) do
+    with :ok <- ensure_bootstrap_schema(db) do
+      DB.execute(db, @staged_message_dedupes_ddl)
+    end
+  end
+
+  @doc false
+  def ensure_bootstrap_schema(db \\ Tightbeam.DB), do: DB.execute(db, @ddl)
 
   @spec rule() :: String.t()
   def rule, do: @rule
@@ -563,8 +585,10 @@ defmodule Tightbeam.NoticeBatcher do
         JOIN wakes w ON w.wakeId=p.sourceWakeId
         WHERE p.enabled=1 AND p.policyRevision=?1
           AND w.state='pending' AND w.consumer='prompt' AND w.digest=0
-          AND w.deliveryRule=?2 AND w.conditionKind IS NULL AND w.waitMode IS NULL
-          AND w.dueAt<=?3
+          AND w.deliveryRule=?2
+          AND (w.conditionKind IS NULL OR w.firedAt IS NOT NULL)
+          AND (w.waitMode IS NULL OR w.recognitionAt IS NOT NULL)
+          AND (w.dueAt<=?3 OR w.firedAt IS NOT NULL OR w.recognitionAt IS NOT NULL)
           AND NOT EXISTS (
             SELECT 1 FROM notice_batch_members m
             WHERE m.sourceWakeId=w.wakeId AND m.recipientAddress=p.recipientAddress
@@ -576,10 +600,56 @@ defmodule Tightbeam.NoticeBatcher do
       )
 
     Enum.flat_map(rows, fn [recipient_address, visibility_scope] ->
-      transaction!(db, fn txn ->
-        form_due_group_in_txn(txn, recipient_address, visibility_scope, at)
-      end)
+      try do
+        transaction!(db, fn txn ->
+          form_due_group_in_txn(txn, recipient_address, visibility_scope, at)
+        end)
+      rescue
+        error in DB.Error ->
+          # One recipient's durable notice may be temporarily unwriteable (for
+          # example, a trigger refusing terminal-recognition evidence). Its
+          # transaction has rolled back, so keep those source rows pending and
+          # continue recovering independent recipient groups in this pass.
+          source_ids = due_source_ids(db, recipient_address, visibility_scope, at)
+          reason = String.replace(error.message, ~r/\s+/, "_")
+
+          Logger.error(
+            "notice batch recipient recovery refused recipient=#{recipient_address} " <>
+              "scope=#{visibility_scope} sources=#{Enum.join(source_ids, ",")} " <>
+              "persistence_refused=#{reason}"
+          )
+
+          []
+      end
     end)
+  end
+
+  defp due_source_ids(db, recipient_address, visibility_scope, at) do
+    case DB.query(
+           db,
+           """
+           SELECT p.sourceWakeId
+           FROM notice_delivery_policies p
+           JOIN wakes w ON w.wakeId=p.sourceWakeId
+           WHERE p.recipientAddress=?1 AND p.visibilityScope=?2
+             AND p.enabled=1 AND p.policyRevision=?3
+             AND w.state='pending' AND w.consumer='prompt' AND w.digest=0
+             AND w.deliveryRule=?4
+             AND (w.conditionKind IS NULL OR w.firedAt IS NOT NULL)
+             AND (w.waitMode IS NULL OR w.recognitionAt IS NOT NULL)
+             AND (w.dueAt<=?5 OR w.firedAt IS NOT NULL OR w.recognitionAt IS NOT NULL)
+             AND NOT EXISTS (
+               SELECT 1 FROM notice_batch_members m
+               WHERE m.sourceWakeId=w.wakeId AND m.recipientAddress=p.recipientAddress
+                 AND m.visibilityScope=p.visibilityScope
+             )
+           ORDER BY w.createdAt, w.rowid
+           """,
+           [recipient_address, visibility_scope, @policy_revision, @rule, at]
+         ) do
+      {:ok, rows} -> Enum.map(rows, fn [wake_id] -> wake_id end)
+      {:error, _} -> []
+    end
   end
 
   defp form_due_group_in_txn(txn, recipient_address, visibility_scope, at) do
@@ -593,8 +663,10 @@ defmodule Tightbeam.NoticeBatcher do
         WHERE p.recipientAddress=?1 AND p.visibilityScope=?2
           AND p.enabled=1 AND p.policyRevision=?3
           AND w.state='pending' AND w.consumer='prompt' AND w.digest=0
-          AND w.deliveryRule=?4 AND w.conditionKind IS NULL AND w.waitMode IS NULL
-          AND w.dueAt<=?5
+          AND w.deliveryRule=?4
+          AND (w.conditionKind IS NULL OR w.firedAt IS NOT NULL)
+          AND (w.waitMode IS NULL OR w.recognitionAt IS NOT NULL)
+          AND (w.dueAt<=?5 OR w.firedAt IS NOT NULL OR w.recognitionAt IS NOT NULL)
           AND NOT EXISTS (
             SELECT 1 FROM notice_batch_members m
             WHERE m.sourceWakeId=w.wakeId AND m.recipientAddress=p.recipientAddress
@@ -604,6 +676,7 @@ defmodule Tightbeam.NoticeBatcher do
         """,
         [recipient_address, visibility_scope, @policy_revision, @rule, at]
       )
+      |> Enum.filter(fn [wake_id, _policy_ref] -> prepare_due_source_in_txn(txn, wake_id) end)
 
     case rows do
       [[first_wake_id, first_policy_ref] | _] ->
@@ -682,6 +755,72 @@ defmodule Tightbeam.NoticeBatcher do
       [] ->
         []
     end
+  end
+
+  defp prepare_due_source_in_txn(txn, wake_id) do
+    case Wakes.terminal_notice_delivery_in_txn(txn, wake_id) do
+      {:terminal_notice, wake} ->
+        update_source_lane_in_txn(txn, wake)
+        prepare_liveness_source_in_txn(txn, wake_id)
+
+      {:terminal_notice_undeliverable, _evidence} ->
+        false
+
+      :ordinary ->
+        prepare_liveness_source_in_txn(txn, wake_id)
+    end
+  end
+
+  defp prepare_liveness_source_in_txn(txn, wake_id) do
+    case Tightbeam.Supervision.idle_cleanup_delivery_in_txn(
+           txn,
+           wake_id,
+           now()
+         ) do
+      :ordinary ->
+        true
+
+      :stale ->
+        Txn.q(
+          txn,
+          "UPDATE wakes SET state='fired',firedAt=?2,firedBy='stale-suppressed' WHERE wakeId=?1 AND state='pending'",
+          [wake_id, now()]
+        )
+
+        if Txn.changes(txn) == 1, do: Wakes.publish_change_in_txn(txn, "wake.fired", wake_id)
+        false
+
+      {:idle_cleanup_deferred, _reason} ->
+        false
+
+      {:deliver, wake} ->
+        update_source_lane_in_txn(txn, wake)
+        true
+    end
+  end
+
+  defp update_source_lane_in_txn(txn, wake) do
+    {recipient_address, default_scope} = recipient_lane(wake)
+    visibility_scope = delivery_gate_scope(default_scope, Map.get(wake, :target_gate, 1))
+
+    Txn.q(
+      txn,
+      """
+      UPDATE notice_delivery_policies
+      SET recipientAddress=?2, sessionKey=?3, targetRole=?4, visibilityScope=?5
+      WHERE sourceWakeId=?1 AND enabled=1 AND policyRevision=?6
+      """,
+      [
+        wake.wake_id,
+        recipient_address,
+        wake.session_key,
+        wake.target_role,
+        visibility_scope,
+        @policy_revision
+      ]
+    )
+
+    :ok
   end
 
   @spec deliver_batch(GenServer.server(), String.t(), String.t()) :: map() | {:error, map()}
@@ -910,6 +1049,24 @@ defmodule Tightbeam.NoticeBatcher do
     end)
   end
 
+  @doc false
+  @spec carrier_source_ids_in_txn(Txn.t(), String.t()) :: [String.t()]
+  def carrier_source_ids_in_txn(%Txn{} = txn, delivery_wake_id)
+      when is_binary(delivery_wake_id) do
+    Txn.q(
+      txn,
+      """
+      SELECT m.sourceWakeId
+      FROM notice_batches b
+      JOIN notice_batch_members m ON m.batchId=b.batchId
+      WHERE b.deliveryWakeId=?1 AND m.state='included'
+      ORDER BY m.publicationSeq
+      """,
+      [delivery_wake_id]
+    )
+    |> Enum.map(&hd/1)
+  end
+
   @spec pending?(Txn.t(), String.t()) :: boolean()
   def pending?(%Txn{} = txn, source_wake_id) do
     case Txn.q(
@@ -934,7 +1091,8 @@ defmodule Tightbeam.NoticeBatcher do
            txn,
            """
            SELECT w.wakeId, w.sessionKey, w.targetRole, w.origin, w.creatorSessionKey, w.prompt,
-                  w.consumer, w.state, w.createdAt, w.work_item_id, w.assignmentId,
+                  w.consumer, w.state, w.targetGate, w.reresolve, w.reresolveSeed,
+                  w.reresolveRung, w.createdAt, w.work_item_id, w.assignmentId,
                   w.class, w.classElection, w.digest, p.policyRef, p.recipientAddress,
                   p.visibilityScope, p.policyRevision, p.deadlineAt, p.enabled
            FROM wakes w
@@ -977,15 +1135,56 @@ defmodule Tightbeam.NoticeBatcher do
   defp refusal(code, message), do: {:error, %{code: code, message: message}}
 
   defp recipient_ready_for_membership(txn, source) do
-    if recipient_running?(txn, source.session_key, source.target_role) do
-      {:deferred,
-       %{
-         code: "recipient_busy",
-         message: "source remains an individual queued wake until the current turn ends"
-       }}
-    else
-      :ok
+    case source_delivery_target(txn, source) do
+      nil ->
+        if deleted_role_target?(txn, source) do
+          {:bypass,
+           %{
+             code: "unknown_role",
+             direct_delivery: true,
+             message: "a deleted role remains an individual wake for visible scheduler refusal"
+           }}
+        else
+          {:deferred,
+           %{
+             code: "recipient_unavailable",
+             message: "source remains an individual pending wake until its target is available"
+           }}
+        end
+
+      {_session_key, _role_ref, _fallback} ->
+        if recipient_running?(txn, source.session_key, source.target_role) do
+          {:deferred,
+           %{
+             code: "recipient_busy",
+             message: "source remains an individual queued wake until the current turn ends"
+           }}
+        else
+          :ok
+        end
     end
+  end
+
+  defp deleted_role_target?(txn, %{target_role: role}) when is_binary(role) do
+    Txn.q(txn, "SELECT 1 FROM roles WHERE name=?1", [role]) == []
+  end
+
+  defp deleted_role_target?(_txn, _source), do: false
+
+  defp source_delivery_target(txn, %{target_role: role}) when is_binary(role),
+    do: Gateway.delivery_target(txn, nil, %{target_role: role})
+
+  defp source_delivery_target(txn, %{target_gate: 0, session_key: session_key}),
+    do: Gateway.delivery_target(txn, session_key, nil)
+
+  defp source_delivery_target(txn, source) do
+    gate = %{
+      reresolve: source.reresolve,
+      reresolve_seed: source.reresolve_seed,
+      reresolve_rung: source.reresolve_rung
+    }
+
+    Gateway.delivery_target(txn, source.session_key, gate)
   end
 
   defp recipient_lane(recipient) do
@@ -1247,8 +1446,28 @@ defmodule Tightbeam.NoticeBatcher do
     is_binary(resolved) and
       Txn.q(
         txn,
-        "SELECT 1 FROM turns WHERE sessionKey=?1 AND status='running' LIMIT 1",
+        "SELECT 1 FROM turns WHERE sessionKey=?1 AND status IN ('running','queued') LIMIT 1",
         [resolved]
+      ) != []
+  end
+
+  @doc false
+  def queued_sources_ready_in_txn?(%Txn{} = txn, session_key, target_role, at \\ now()) do
+    recipient_running?(txn, session_key, target_role) or
+      Txn.q(
+        txn,
+        """
+        SELECT 1 FROM wakes w
+        JOIN notice_delivery_policies p ON p.sourceWakeId=w.wakeId
+        WHERE w.state='pending' AND w.consumer='prompt' AND w.digest=0
+          AND w.deliveryRule=?1 AND p.enabled=1 AND p.policyRevision=?2
+          AND (w.conditionKind IS NULL OR w.firedAt IS NOT NULL)
+          AND (w.waitMode IS NULL OR w.recognitionAt IS NOT NULL)
+          AND (w.dueAt<=?3 OR w.firedAt IS NOT NULL OR w.recognitionAt IS NOT NULL)
+          AND (p.sessionKey=?5 OR (?4 IS NOT NULL AND w.targetRole=?4))
+        LIMIT 1
+        """,
+        [@rule, @policy_revision, at, target_role, session_key]
       ) != []
   end
 
@@ -1546,6 +1765,21 @@ defmodule Tightbeam.NoticeBatcher do
     )
 
     lifecycle_for_wake(txn, "delivery_delivered", wake_id, "wake-committed")
+
+    source_ids = carrier_source_ids_in_txn(txn, wake_id)
+
+    Enum.each(source_ids, fn source_id ->
+      Txn.q(
+        txn,
+        "UPDATE wakes SET state='fired',firedAt=COALESCE(firedAt,?2) WHERE wakeId=?1 AND state='pending'",
+        [source_id, at]
+      )
+
+      source_updated? = Txn.changes(txn) == 1
+      Wakes.settle_batched_wait_in_txn(txn, source_id, "delivered")
+      if source_updated?, do: Wakes.publish_change_in_txn(txn, "wake.fired", source_id)
+    end)
+
     :ok
   end
 
@@ -1746,6 +1980,10 @@ defmodule Tightbeam.NoticeBatcher do
          prompt,
          consumer,
          state,
+         target_gate,
+         reresolve,
+         reresolve_seed,
+         reresolve_rung,
          created_at,
          work_item_id,
          assignment_id,
@@ -1768,6 +2006,10 @@ defmodule Tightbeam.NoticeBatcher do
       prompt: prompt,
       consumer: consumer,
       state: state,
+      target_gate: target_gate,
+      reresolve: reresolve,
+      reresolve_seed: reresolve_seed,
+      reresolve_rung: reresolve_rung,
       created_at: created_at,
       work_item_id: work_item_id,
       assignment_id: assignment_id,

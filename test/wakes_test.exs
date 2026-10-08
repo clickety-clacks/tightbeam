@@ -585,7 +585,7 @@ defmodule Tightbeam.WakesTest do
       })
 
     assert original.summon
-    assert original.delivery_rule == Wakes.inhibited_rule()
+    assert original.delivery_rule == Wakes.digest_rule()
 
     assert {:ok, replacement} =
              DB.transaction(db, fn txn ->
@@ -597,9 +597,9 @@ defmodule Tightbeam.WakesTest do
     assert replacement.class_election == "sender"
     assert replacement.session_key == "b"
 
-    # The sender already named this moment (batcher-inhibited); retarget
-    # must not start batching it now.
-    assert replacement.delivery_rule == Wakes.inhibited_rule()
+    # Retarget preserves the selected ordinary batch route and sender-named
+    # delivery time; it does not restart the timing window.
+    assert replacement.delivery_rule == Wakes.digest_rule()
     assert replacement.due_at == original.due_at
   end
 
@@ -656,6 +656,7 @@ defmodule Tightbeam.WakesTest do
     db: db,
     scheduler: scheduler
   } do
+    active_sessions!(db, ["k1"])
     test_pid = self()
 
     start_supervised!(
@@ -676,8 +677,9 @@ defmodule Tightbeam.WakesTest do
       })
 
     assert :ok = Wakes.fire_due(scheduler)
-    assert_receive {:delivered, %{wake_id: wake_id, prompt: "now"}}
-    assert wake_id == wake.wake_id
+    assert_receive {:delivered, %{wake_id: carrier_id, prompt: prompt}}
+    assert prompt =~ "now"
+    assert [%{delivery_wake_id: ^carrier_id}] = NoticeBatcher.source_refs(db, wake.wake_id)
     assert Wakes.get(db, wake.wake_id).state == "fired"
 
     assert :ok = Wakes.fire_due(scheduler)
@@ -688,6 +690,7 @@ defmodule Tightbeam.WakesTest do
     db: db,
     scheduler: scheduler
   } do
+    active_sessions!(db, ["k1"])
     test_pid = self()
     fail_first = :counters.new(1, [])
 
@@ -720,8 +723,9 @@ defmodule Tightbeam.WakesTest do
     assert Wakes.get(db, wake.wake_id).state == "pending"
 
     assert :ok = Wakes.fire_due(scheduler)
-    assert_receive {:delivered, %{wake_id: wake_id}}
-    assert wake_id == wake.wake_id
+    assert_receive {:delivered, %{wake_id: carrier_id, prompt: prompt}}
+    assert prompt =~ "flaky"
+    assert [%{delivery_wake_id: ^carrier_id}] = NoticeBatcher.source_refs(db, wake.wake_id)
     assert %{state: "fired", fired_at: fired_at} = Wakes.get(db, wake.wake_id)
     assert is_integer(fired_at)
   end
@@ -827,6 +831,7 @@ defmodule Tightbeam.WakesTest do
     db: db,
     scheduler: scheduler
   } do
+    active_sessions!(db, ["k1", "k2"])
     test_pid = self()
 
     start_supervised!(
@@ -864,7 +869,8 @@ defmodule Tightbeam.WakesTest do
     assert :ok = Wakes.fire_due(scheduler)
     assert_received {:self_fire_returned, wake_id, nested_wake_id}
     assert wake_id == wake.wake_id
-    assert_receive {:nested_fired, ^nested_wake_id}
+    assert_receive {:nested_fired, carrier_id}
+    assert [%{delivery_wake_id: ^carrier_id}] = NoticeBatcher.source_refs(db, nested_wake_id)
     assert Wakes.get(db, wake.wake_id).state == "canceled"
     assert Wakes.get(db, nested_wake_id).state == "fired"
   end
@@ -897,6 +903,7 @@ defmodule Tightbeam.WakesTest do
     db: db,
     scheduler: scheduler
   } do
+    active_sessions!(db, ["k1"])
     test_pid = self()
 
     start_supervised!(

@@ -28,6 +28,7 @@ defmodule Tightbeam.NoticeBatcherFixture do
     try do
       :ok = ensure_all_schemas(db)
       :ok = DB.assert_base_admitted!(db, base)
+      seed_session(db, "agent:recipient", "recipient-owner")
       marker = File.read!(Path.join(base, "build-owner.json"))
       scenario(scenario, db)
       assert File.read!(Path.join(base, "build-owner.json")) == marker
@@ -77,9 +78,9 @@ defmodule Tightbeam.NoticeBatcherFixture do
     assert count(db, "notice_batches") == 0
     scheduler = start_scheduler(db, fn wake -> commit_turn(db, wake) end)
     assert :ok = Wakes.fire_due(scheduler)
-    assert Wakes.get(db, user.wake_id).state == "pending"
+    assert Wakes.get(db, user.wake_id).state == "fired"
 
-    assert [%{batch_id: user_batch_id, member_state: "included"}] =
+    assert [%{batch_id: user_batch_id, member_state: "included", batch_state: "delivered"}] =
              NoticeBatcher.source_refs(db, user.wake_id)
 
     assert user_batch_id == batch_id(db, routine)
@@ -287,9 +288,12 @@ defmodule Tightbeam.NoticeBatcherFixture do
     assert batch.state == "delivered"
     assert count(db, "turns", "wakeId=?1", [carrier_id]) == 1
 
+    seed_session(db, "agent:unresolved", "unresolved-owner")
     unresolved = eligible(db, session: "agent:unresolved")
     [unresolved_carrier] = Wakes.materialize_digests(db, unresolved.due_at)
     {:ok, _} = DB.query(db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [unresolved_carrier])
+    {:ok, _} =
+      DB.query(db, "UPDATE sessions SET state='retired' WHERE sessionKey='agent:unresolved'")
 
     terminal =
       start_scheduler(db, fn wake ->
@@ -342,6 +346,9 @@ defmodule Tightbeam.NoticeBatcherFixture do
   end
 
   defp scenario(16, db) do
+    seed_session(db, "agent:cancel-before", "cancel-before-owner")
+    seed_session(db, "agent:cancel-after", "cancel-after-owner")
+
     early =
       eligible(db,
         session: "agent:cancel-before",
@@ -389,6 +396,7 @@ defmodule Tightbeam.NoticeBatcherFixture do
   defp scenario(17, db) do
     seed_session(db, "agent:scope-a", "owner-a")
     seed_session(db, "agent:scope-b", "owner-b")
+    Roles.create!(db, "shared", "owner-a", "agent:scope-a")
 
     first =
       manual_member(db, "role:shared:scope-a", target_role: "shared", session: "agent:scope-a")
@@ -437,6 +445,7 @@ defmodule Tightbeam.NoticeBatcherFixture do
 
   defp scenario(20, db) do
     lane = [session: "agent:rollback"]
+    seed_session(db, "agent:rollback", "rollback-owner")
     legacy_disabled = set_lane_policy(db, lane, false)
     source = fyi(db, lane)
 
@@ -498,6 +507,7 @@ defmodule Tightbeam.NoticeBatcherFixture do
 
   defp scenario(23, db) do
     lane = [session: "agent:payload-floor"]
+    seed_session(db, "agent:payload-floor", "payload-floor-owner")
     set_lane_policy(db, lane, false)
 
     source =
@@ -558,6 +568,8 @@ defmodule Tightbeam.NoticeBatcherFixture do
     overflow_id = "w_rendered_boundary_over"
     fitting_header = rendered_member_header(fitting_id)
     overflow_header = rendered_member_header(overflow_id)
+    seed_session(db, "agent:rendered-fit", "rendered-fit-owner")
+    seed_session(db, "agent:rendered-over", "rendered-over-owner")
 
     fitting =
       eligible(db,
@@ -897,6 +909,7 @@ defmodule Tightbeam.NoticeBatcherFixture do
         creator_session_key: "agent:sender",
         prompt: Keyword.get(opts, :prompt, "manual"),
         due_at: Keyword.get(opts, :due_at, 10_000),
+        visibility_scope: scope,
         sender_scheduled: true,
         class: "fyi"
       })

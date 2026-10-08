@@ -210,6 +210,7 @@ defmodule Tightbeam.TerminalCredentialFailure do
                  "delivery-owner-reparent-v1-019",
                  "artifact-origin-v1-019",
                  "identity-publication-denial-diagnostic-v1-019",
+                 "assignment-source-replacement-v1-019",
                  "work-item-delivery-owner-v1-019"
                ] ->
             readonly_views_from_conn(conn)
