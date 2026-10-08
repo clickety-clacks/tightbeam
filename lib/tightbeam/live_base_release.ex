@@ -10,6 +10,19 @@ defmodule Tightbeam.LiveBaseRelease do
   end
 
   @doc false
+  def automatic_transition_candidate?(payload_root) do
+    with :packaged <- package_kind(payload_root),
+         {:ok, _provenance} <- read_provenance(payload_root) do
+      true
+    else
+      :not_packaged -> false
+      :missing -> false
+      :unsupported -> false
+      {:error, message} -> raise Refusal, message: message
+    end
+  end
+
+  @doc false
   def automatic_transition(payload_root, base, target, stamp, source_marker \\ :absent) do
     with :packaged <- package_kind(payload_root),
          {:ok, _provenance} <- read_provenance(payload_root),
