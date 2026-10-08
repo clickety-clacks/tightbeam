@@ -758,16 +758,26 @@ defmodule Tightbeam.NoticeBatcher do
   end
 
   defp prepare_due_source_in_txn(txn, wake_id) do
-    case Wakes.terminal_notice_delivery_in_txn(txn, wake_id) do
-      {:terminal_notice, wake} ->
-        update_source_lane_in_txn(txn, wake)
-        prepare_liveness_source_in_txn(txn, wake_id)
-
-      {:terminal_notice_undeliverable, _evidence} ->
+    case Txn.q(txn, "SELECT sessionKey FROM turns WHERE wakeId=?1 ORDER BY seq LIMIT 1", [wake_id]) do
+      [[delivered_to]] ->
+        # A pre-batching delivery may have committed its turn before the wake
+        # row was marked fired. On recovery, acknowledge that exact source
+        # instead of creating a second carrier for an already-visible message.
+        Wakes.batch_source_delivered_in_txn(txn, wake_id, delivered_to)
         false
 
-      :ordinary ->
-        prepare_liveness_source_in_txn(txn, wake_id)
+      [] ->
+        case Wakes.terminal_notice_delivery_in_txn(txn, wake_id) do
+          {:terminal_notice, wake} ->
+            update_source_lane_in_txn(txn, wake)
+            prepare_liveness_source_in_txn(txn, wake_id)
+
+          {:terminal_notice_undeliverable, _evidence} ->
+            false
+
+          :ordinary ->
+            prepare_liveness_source_in_txn(txn, wake_id)
+        end
     end
   end
 
