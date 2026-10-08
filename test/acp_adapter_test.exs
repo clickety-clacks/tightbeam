@@ -3012,6 +3012,140 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert Process.alive?(adapter)
   end
 
+  test "Claude none status is confirmed against a fresh subscription before terminalizing" do
+    owner = self()
+
+    base =
+      Path.join(
+        System.tmp_dir!(),
+        "tb-claude-auth-confirm-#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf!(base) end)
+    home = Tightbeam.Homes.home_path(base, "testhost", :claude)
+    metadata_dir = Path.join(home, ".tightbeam")
+    File.mkdir_p!(metadata_dir)
+
+    access_token = "subscription-access-fixture"
+    refresh_token = "refresh-token-fixture"
+
+    File.write!(
+      Path.join(home, ".credentials.json"),
+      JSON.encode!(%{
+        "claudeAiOauth" => %{
+          "accessToken" => access_token,
+          "refreshToken" => refresh_token,
+          "expiresAt" => System.system_time(:millisecond) + 600_000
+        }
+      })
+    )
+
+    File.write!(
+      Path.join(metadata_dir, "credential.json"),
+      JSON.encode!(%{
+        "provider" => "anthropic",
+        "onboarded" => true,
+        "terminal" => false,
+        "kind" => "subscription",
+        "last_health" => "onboarded"
+      })
+    )
+
+    db = String.to_atom("claude_auth_confirm_db_#{System.unique_integer([:positive])}")
+    start_supervised!({Tightbeam.DB, path: ":memory:", name: db})
+    :ok = Tightbeam.Schema.ensure_all(db)
+    Tightbeam.Archetypes.load!(base)
+    Tightbeam.Rails.load!(base)
+    start_supervised!({Task.Supervisor, name: Tightbeam.TurnTaskSupervisor})
+
+    response = start_supervised!({Agent, fn -> 200 end})
+
+    sh = fn
+      ["node", "--no-warnings", "-e", script | _args] = argv ->
+        if String.contains?(script, "https://api.anthropic.com/v1/models?limit=1") do
+          status = Agent.get(response, & &1)
+          send(owner, {:claude_auth_confirmation, status, argv})
+          {JSON.encode!(%{status: status, headers: %{}, body: "{}"}), 0}
+        else
+          {"", 0}
+        end
+
+      _argv ->
+        {"", 0}
+    end
+
+    park_receiver =
+      start_supervised!(
+        {Tightbeam.CredentialParkTestReceiver,
+         fn :anthropic ->
+           send(owner, :claude_credential_parked)
+           :ok
+         end}
+      )
+
+    credential_owner = Tightbeam.Credentials.server("testhost")
+
+    start_supervised!(
+      {Tightbeam.Credentials,
+       name: credential_owner,
+       base_dir: base,
+       machine: "testhost",
+       park_edge: Tightbeam.CommandEdge.request_to(park_receiver)}
+    )
+
+    placement_opts =
+      Tightbeam.Placement.adapter_opts!(
+        %{
+          base_dir: base,
+          db: db,
+          cwd: "/tmp",
+          cli_bin: Path.join(base, "bin"),
+          credential_kind: :subscription,
+          sh: sh
+        },
+        {:claude, "default", "testhost"}
+      )
+
+    {adapter, _capture_path} =
+      start_adapter(
+        harness: :claude,
+        on_auth_event: placement_opts[:on_auth_event],
+        on_ready: fn -> send(owner, :claude_adapter_booted) end
+      )
+
+    assert_ready(adapter, :claude_adapter_booted)
+
+    none = %{"authStatus" => %{"kind" => "none"}}
+    send(adapter, {:acp_notification, "_auth/status_update", none})
+
+    assert_receive {:claude_auth_confirmation, 200, argv}
+    script = Enum.at(argv, 3)
+    assert script =~ "expiresAt"
+    assert script =~ "Date.now() + 60000"
+    refute Enum.join(argv, " ") =~ access_token
+    refute Enum.join(argv, " ") =~ refresh_token
+    refute_receive :claude_credential_parked, 100
+    assert Tightbeam.Credentials.status(:anthropic, credential_owner) == :onboarded
+
+    Agent.update(response, fn _ -> 0 end)
+    send(adapter, {:acp_notification, "_auth/status_update", none})
+
+    assert_receive {:claude_auth_confirmation, 0, _argv}
+    refute_receive :claude_credential_parked, 100
+    assert Tightbeam.Credentials.status(:anthropic, credential_owner) == :onboarded
+
+    Agent.update(response, fn _ -> 401 end)
+    send(adapter, {:acp_notification, "_auth/status_update", none})
+
+    assert_receive {:claude_auth_confirmation, 401, _argv}
+    assert_receive :claude_credential_parked
+
+    assert Tightbeam.Credentials.status(:anthropic, credential_owner) ==
+             {:needs_onboarding, :revoked}
+
+    assert Process.alive?(adapter)
+  end
+
   test "session updates reach the subagent marker callback with harness session identity" do
     owner = self()
 

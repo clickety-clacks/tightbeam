@@ -16,6 +16,7 @@ defmodule Tightbeam.Harness.Claude do
   @adapter_package "claude-agent-acp"
   @adapter_bundle "acp-agent.js"
   @warm_timeout_ms 30_000
+  @auth_confirmation_skew_ms 60_000
   @credential_env_vars %{
     subscription: "CLAUDE_CODE_OAUTH_TOKEN",
     api_key: "ANTHROPIC_API_KEY"
@@ -273,42 +274,57 @@ defmodule Tightbeam.Harness.Claude do
   def credential_live?(target, home, opts) do
     kind = Keyword.fetch!(opts, :credential_kind)
     {header, scheme} = credential_header(kind)
+    require_fresh_access_token = Keyword.get(opts, :require_fresh_access_token, false)
 
     script = """
     const fs = require("node:fs");
     const raw = fs.readFileSync(process.argv[1], "utf8");
-    const credential = process.argv[4] === "subscription"
-      ? JSON.parse(raw).claudeAiOauth.accessToken.trim()
-      : raw.trim();
-    fetch("https://api.anthropic.com/v1/models?limit=1", {
-      headers: {
-        [process.argv[2]]: process.argv[3] + credential,
-        "anthropic-version": "2023-06-01",
-        "User-Agent": "claude-cli/2.1.220"
-      }
-    }).then(async response => {
+    const isSubscription = process.argv[4] === "subscription";
+    const oauth = isSubscription ? JSON.parse(raw).claudeAiOauth : null;
+    const credential = isSubscription ? oauth.accessToken.trim() : raw.trim();
+    const expiresAt = isSubscription ? oauth.expiresAt : null;
+    const requiresRenewal = process.argv[5] === "true" &&
+      (!Number.isSafeInteger(expiresAt) || Date.now() + #{@auth_confirmation_skew_ms} >= expiresAt);
+
+    if (requiresRenewal) {
+      // An expired or undated access token can be renewed by catalog-probe. Do not
+      // mistake its expected 401 for proof that the refreshable credential is revoked.
       process.stdout.write(JSON.stringify({
-        status: response.status,
-        headers: {"content-type": response.headers.get("content-type")},
-        body: await response.text()
+        status: 0,
+        headers: {},
+        body: "access token requires renewal before liveness can be confirmed"
       }));
-    }).catch(error => {
-      // NAME WHAT ACTUALLY FAILED. `error.code || error.message` reported the string
-      // "fetch failed" for every transport failure there is: on a fetch rejection undici
-      // leaves `code` UNDEFINED on the outer error and puts the real reason -- ENOTFOUND,
-      // ECONNRESET, UND_ERR_CONNECT_TIMEOUT, a TLS failure -- in `error.cause`. So the
-      // fallback always won, and a refusal that exists to report dirt named none of it.
-      // Measured 2026-08-04: a client-e2e leg blocked twice at two SHAs on
-      // `{:transport_exit, 70, "fetch failed"}` with a credential proven live by a 200
-      // from this same endpoint, and the message could not say which transport failed.
-      const cause = error.cause;
-      process.stderr.write(
-        [cause && cause.code, cause && cause.message, error.code, error.message]
-          .filter(Boolean)
-          .join(": ") || "unknown transport failure"
-      );
-      process.exitCode = 70;
-    });
+    } else {
+      fetch("https://api.anthropic.com/v1/models?limit=1", {
+        headers: {
+          [process.argv[2]]: process.argv[3] + credential,
+          "anthropic-version": "2023-06-01",
+          "User-Agent": "claude-cli/2.1.220"
+        }
+      }).then(async response => {
+        process.stdout.write(JSON.stringify({
+          status: response.status,
+          headers: {"content-type": response.headers.get("content-type")},
+          body: await response.text()
+        }));
+      }).catch(error => {
+        // NAME WHAT ACTUALLY FAILED. `error.code || error.message` reported the string
+        // "fetch failed" for every transport failure there is: on a fetch rejection undici
+        // leaves `code` UNDEFINED on the outer error and puts the real reason -- ENOTFOUND,
+        // ECONNRESET, UND_ERR_CONNECT_TIMEOUT, a TLS failure -- in `error.cause`. So the
+        // fallback always won, and a refusal that exists to report dirt named none of it.
+        // Measured 2026-08-04: a client-e2e leg blocked twice at two SHAs on
+        // `{:transport_exit, 70, "fetch failed"}` with a credential proven live by a 200
+        // from this same endpoint, and the message could not say which transport failed.
+        const cause = error.cause;
+        process.stderr.write(
+          [cause && cause.code, cause && cause.message, error.code, error.message]
+            .filter(Boolean)
+            .join(": ") || "unknown transport failure"
+        );
+        process.exitCode = 70;
+      });
+    }
     """
 
     # The header NAME and its scheme ride in argv; the credential never does --
@@ -322,7 +338,8 @@ defmodule Tightbeam.Harness.Claude do
         Path.join(home, @credential_file),
         header,
         scheme,
-        Atom.to_string(kind)
+        Atom.to_string(kind),
+        to_string(require_fresh_access_token)
       ]
     }
 
@@ -349,6 +366,30 @@ defmodule Tightbeam.Harness.Claude do
       do: :transient
 
   def classify_auth_event(_event), do: :unknown
+
+  @impl true
+  def confirm_terminal_auth_event(target, %{"authStatus" => %{"kind" => "none"}}) do
+    if Map.get(target, :credential_kind) == :subscription do
+      case credential_live?(target, Map.fetch!(target, :home),
+             transport: &Support.credential_transport/2,
+             timeout_ms: 5_000,
+             credential_kind: :subscription,
+             require_fresh_access_token: true
+           ) do
+        :live -> :transient
+        {:dead, _reason} -> :terminal
+        {:unknown, _reason} -> :unknown
+      end
+    else
+      :not_checked
+    end
+  rescue
+    _error -> :unknown
+  catch
+    _kind, _reason -> :unknown
+  end
+
+  def confirm_terminal_auth_event(_target, _event), do: :not_checked
 
   @impl true
   def classify_subagent_event(%{

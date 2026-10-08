@@ -1439,6 +1439,7 @@ defmodule Tightbeam.Placement do
 
     with {:ok, _} <- cursor_locality_before_kind(module, target, projected_home),
          kind = credential_kind(config, module.credential_provider(), host, module.wire_name()),
+         target = Map.merge(target, %{home: projected_home, credential_kind: kind}),
          {:ok, checked_opts} <-
            Harness.preflight_launch(module, target, projected_home, credential_kind: kind) do
       build_adapter_opts(
@@ -1554,7 +1555,7 @@ defmodule Tightbeam.Placement do
       process_ssh: host_config.ssh,
       process_identity_dir: process_identity_dir,
       process_helper: Path.join(host_config[:cli_bin] || config.cli_bin, "tightbeam"),
-      on_auth_event: auth_event_handler(config, host, module),
+      on_auth_event: auth_event_handler(config, target, module),
       on_subagent_event: subagent_event_handler(config, host, module),
       env: []
     ]
@@ -1764,48 +1765,81 @@ defmodule Tightbeam.Placement do
     })
   end
 
-  defp auth_event_handler(config, host, module) do
+  defp auth_event_handler(config, target, module) do
+    host = Map.fetch!(target, :host_name)
     db = Map.get(config, :db, DB)
 
     fn classification, event ->
       if classification == :terminal do
         Task.Supervisor.start_child(Tightbeam.TurnTaskSupervisor, fn ->
-          try do
-            HarnessHealth.observe_provider_invalidation(db, module.id(), host, event,
-              principal: "process:tightbeam/provider:#{module.credential_provider()}"
-            )
-          rescue
-            error ->
-              Logger.error(
-                "harness auth incident record failed for #{module.id()} on #{host}: " <>
-                  Exception.format(:error, error, __STACKTRACE__)
-              )
-          end
-
-          mark_result =
-            try do
-              Tightbeam.Credentials.mark_terminal(
-                module.credential_provider(),
-                event,
-                Tightbeam.Credentials.server(host)
-              )
-            catch
-              :exit, reason -> {:error, {:credential_owner_exit, reason}}
-            end
-
-          case mark_result do
-            :ok ->
+          case confirm_terminal_auth_event(module, target, event) do
+            :transient ->
               :ok
 
-            {:error, reason} ->
-              Logger.error(
-                "credential park failed for #{module.credential_provider()} on #{host}: #{inspect(reason)}"
+            :unknown ->
+              Logger.warning(
+                "harness auth status confirmation unavailable for #{module.id()} on #{host}; credential state unchanged"
+              )
+
+            status when status in [:terminal, :not_checked] ->
+              persist_terminal_auth_event(db, host, module, event)
+
+            _status ->
+              Logger.warning(
+                "harness auth status confirmation returned an unsupported result for #{module.id()} on #{host}; credential state unchanged"
               )
           end
         end)
 
         :ok
       end
+    end
+  end
+
+  defp confirm_terminal_auth_event(module, target, event) do
+    if function_exported?(module, :confirm_terminal_auth_event, 2) do
+      module.confirm_terminal_auth_event(target, event)
+    else
+      :not_checked
+    end
+  rescue
+    _error -> :unknown
+  catch
+    _kind, _reason -> :unknown
+  end
+
+  defp persist_terminal_auth_event(db, host, module, event) do
+    try do
+      HarnessHealth.observe_provider_invalidation(db, module.id(), host, event,
+        principal: "process:tightbeam/provider:#{module.credential_provider()}"
+      )
+    rescue
+      error ->
+        Logger.error(
+          "harness auth incident record failed for #{module.id()} on #{host}: " <>
+            Exception.format(:error, error, __STACKTRACE__)
+        )
+    end
+
+    mark_result =
+      try do
+        Tightbeam.Credentials.mark_terminal(
+          module.credential_provider(),
+          event,
+          Tightbeam.Credentials.server(host)
+        )
+      catch
+        :exit, reason -> {:error, {:credential_owner_exit, reason}}
+      end
+
+    case mark_result do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.error(
+          "credential park failed for #{module.credential_provider()} on #{host}: #{inspect(reason)}"
+        )
     end
   end
 
