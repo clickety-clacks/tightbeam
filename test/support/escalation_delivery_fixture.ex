@@ -20,6 +20,7 @@ defmodule Tightbeam.EscalationDeliveryFixture do
     EffortCheckin,
     Escalation,
     Gateway,
+    Ledger,
     NoticeBatcher,
     Org,
     Placement,
@@ -351,9 +352,8 @@ defmodule Tightbeam.EscalationDeliveryFixture do
     assert count(ctx.db, "SELECT COUNT(*) FROM messages WHERE sessionKey = ?1", [owner_session]) ==
              1
 
-    # The otherwise-unreachable legacy/synthetic state: a committed turn for a
-    # wake that is still pending. Only `turns.wakeId UNIQUE` stands between that
-    # and a second turn.
+    # A second source lands while the first carrier's recipient turn is still
+    # queued. It remains an editable row until that recipient becomes ready.
     assert {:decision_pending, _} =
              Escalation.escalate(
                ctx.db,
@@ -365,19 +365,42 @@ defmodule Tightbeam.EscalationDeliveryFixture do
     assert [first, synthetic] = notification_wakes(ctx.db)
     assert first.wake_id == wake.wake_id
 
-    [synthetic_carrier_id] = NoticeBatcher.recover(ctx.db, synthetic.due_at)
-    synthetic_carrier = delivery_wake(ctx.db, synthetic)
-    assert synthetic_carrier.wake_id == synthetic_carrier_id
+    assert Wakes.get(ctx.db, synthetic.wake_id).state == "pending"
+    assert NoticeBatcher.source_refs(ctx.db, synthetic.wake_id) == []
+    assert [] == NoticeBatcher.recover(ctx.db, synthetic.due_at)
+    assert message_count(ctx.db) == 1
 
-    assert :appended =
-             Gateway.deliver_prompt(
-               synthetic_carrier.session_key,
-               synthetic_carrier.origin,
-               synthetic_carrier.prompt,
-               db: ctx.db,
-               wake_id: synthetic_carrier.wake_id,
-               sender: synthetic_carrier.origin
+    assert {:ok, recipient_turn} = Ledger.claim_next(ctx.db, owner_session, "delivery-fixture")
+
+    assert :ok =
+             Ledger.finish(ctx.db, recipient_turn.seq, "delivered", nil,
+               owner_lease: recipient_turn.owner_lease
              )
+
+    drain!(ctx)
+
+    synthetic_carrier = delivery_wake(ctx.db, synthetic)
+    assert synthetic_carrier.wake_id != synthetic.wake_id
+    assert synthetic_carrier.state == "fired"
+    assert Wakes.get(ctx.db, synthetic.wake_id).state == "fired"
+
+    assert [%{delivery_wake_id: synthetic_carrier_id, batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(ctx.db, synthetic.wake_id)
+
+    assert synthetic_carrier_id == synthetic_carrier.wake_id
+
+    assert count(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId = ?1", [
+             synthetic.wake_id
+           ]) == 0
+
+    assert count(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId = ?1", [
+             synthetic_carrier.wake_id
+           ]) == 1
+
+    assert count(ctx.db, "SELECT COUNT(*) FROM messages WHERE sessionKey = ?1", [owner_session]) ==
+             2
+
+    message_count_before_retry = message_count(ctx.db)
 
     assert :duplicate =
              Gateway.deliver_prompt(
@@ -389,16 +412,9 @@ defmodule Tightbeam.EscalationDeliveryFixture do
                sender: synthetic_carrier.origin
              )
 
-    assert Wakes.get(ctx.db, synthetic.wake_id).state == "pending"
-
-    assert count(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId = ?1", [
-             synthetic_carrier.wake_id
-           ]) == 1
+    assert message_count(ctx.db) == message_count_before_retry
 
     drain!(ctx)
-
-    synthetic_carrier = delivery_wake(ctx.db, synthetic)
-    assert synthetic_carrier.state == "fired"
 
     assert count(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId = ?1", [
              synthetic_carrier.wake_id

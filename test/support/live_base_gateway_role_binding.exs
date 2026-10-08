@@ -1,5 +1,5 @@
 import ExUnit.Assertions
-alias Tightbeam.{DB, EventLog, Gateway, Model, Org, Roles, Wakes}
+alias Tightbeam.{DB, EventLog, Gateway, Model, NoticeBatcher, Org, Roles, Wakes}
 # Same inert post-commit doorbell boundary as GatewayTest.LaneDoorbell.
 defmodule GuardRoleDoorbell do
   use GenServer

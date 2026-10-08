@@ -17,6 +17,7 @@ defmodule Tightbeam.CliIntegrationTest do
     Gateway,
     Idempotency,
     Ledger,
+    NoticeBatcher,
     Org,
     Projection,
     RailRemedy,
@@ -519,10 +520,16 @@ defmodule Tightbeam.CliIntegrationTest do
     assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
     Wakes.fire_due(Tightbeam.WakeScheduler)
 
-    assert {:ok, [[after_delivered]]} =
-             DB.query(ctx.db, "SELECT prompt FROM turns WHERE wakeId=?1", [after_id])
+    assert [
+             %{delivery_wake_id: after_delivery_wake_id, batch_state: "delivered"}
+           ] = NoticeBatcher.source_refs(ctx.db, after_id)
 
-    assert String.ends_with?(after_delivered, after_prompt)
+    assert Wakes.get(ctx.db, after_id).state == "fired"
+
+    assert {:ok, [[after_delivered]]} =
+             DB.query(ctx.db, "SELECT prompt FROM turns WHERE wakeId=?1", [after_delivery_wake_id])
+
+    assert after_delivered =~ after_prompt
 
     {_, 0} =
       System.cmd(ctx.binary, ["revoke-assignment", resolver, "--reason", "Resolver disposition"],
@@ -532,18 +539,34 @@ defmodule Tightbeam.CliIntegrationTest do
 
     Wakes.fire_due(Tightbeam.WakeScheduler)
 
-    assert {:ok, [[dependency_delivered]]} =
-             DB.query(ctx.db, "SELECT prompt FROM turns WHERE wakeId=?1", [dependency_id])
+    assert [
+             %{delivery_wake_id: dependency_delivery_wake_id, batch_state: "delivered"}
+           ] = NoticeBatcher.source_refs(ctx.db, dependency_id)
 
-    assert String.ends_with?(dependency_delivered, dependency_prompt)
+    assert Wakes.get(ctx.db, dependency_id).state == "fired"
+
+    assert {:ok, [[dependency_delivered]]} =
+             DB.query(
+               ctx.db,
+               "SELECT prompt FROM turns WHERE wakeId=?1",
+               [dependency_delivery_wake_id]
+             )
+
+    assert dependency_delivered =~ dependency_prompt
 
     Wakes.fire_due(Tightbeam.WakeScheduler)
 
     assert {:ok, [[1]]} =
-             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [after_id])
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [
+               after_delivery_wake_id
+             ])
 
     assert {:ok, [[1]]} =
-             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [dependency_id])
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM turns WHERE wakeId=?1",
+               [dependency_delivery_wake_id]
+             )
   end
 
   test "real CLI states its built version when it connects", ctx do
@@ -1549,8 +1572,9 @@ defmodule Tightbeam.CliIntegrationTest do
     assert %{status: "live"} =
              RailRemedy.episode(ctx.db, "completion-requires-verification", work_id)
 
-    assert_receive {:wake_delivered, verification_wake}, 5_000
-    assert verification_wake.session_key == "cli-coder"
+    # Opener-attest notices can be delivered in the same scheduler pass. Match
+    # the remedy by its exact assignee instead of relying on mailbox order.
+    assert_receive {:wake_delivered, %{session_key: "cli-coder"} = verification_wake}, 5_000
     assert verification_wake.prompt =~ "no verification verdict is filed"
     assert verification_wake.prompt =~ work_id
 
