@@ -163,9 +163,10 @@ defmodule Tightbeam.RecoveryScenario do
           rows(
             "SELECT state FROM wakes WHERE wakeId IN ('w_recovery_b','w_recovery_c') ORDER BY wakeId"
           ) == [["fired"], ["fired"]] and
-          rows("SELECT state FROM wakes WHERE assignmentId='asg_recovery_preserve'") == [
-            ["fired"]
-          ] and
+          rows("SELECT state FROM wakes WHERE assignmentId='asg_recovery_preserve' AND digest=0") ==
+            [
+              ["fired"]
+            ] and
           rows("SELECT status FROM turns WHERE assignmentId='asg_recovery_preserve'") == [
             ["delivered"]
           ]
@@ -242,12 +243,34 @@ defmodule Tightbeam.RecoveryScenario do
         rows(
           "SELECT wakeId,sessionKey,state,firedAt FROM wakes WHERE wakeId IN ('w_recovery_b','w_recovery_c') ORDER BY wakeId"
         ),
+      batch_sources:
+        Enum.map(~w(w_recovery_b w_recovery_c), fn source_wake_id ->
+          {source_wake_id, NoticeBatcher.source_refs(DB, source_wake_id)}
+        end),
+      carrier_turns:
+        Enum.flat_map(~w(w_recovery_b w_recovery_c), fn source_wake_id ->
+          Enum.map(NoticeBatcher.source_refs(DB, source_wake_id), fn reference ->
+            {reference.delivery_wake_id,
+             rows(
+               "SELECT sessionKey,status,error FROM turns WHERE wakeId=?1",
+               [reference.delivery_wake_id]
+             )}
+          end)
+        end),
       redelivery:
         rows(
           "SELECT sessionKey,sourceTurnSeq,restorationTurnSeq,redeliveryTurnSeq,failureClass,parentSessionKey FROM health_redelivery_attempts WHERE sessionKey='agent:recovery:a'"
         ),
       assignment_notice:
-        rows("SELECT reminderState FROM assignments WHERE id='asg_recovery_preserve'")
+        rows("SELECT reminderState FROM assignments WHERE id='asg_recovery_preserve'"),
+      assignment_wakes:
+        rows(
+          "SELECT wakeId,state,digest FROM wakes WHERE assignmentId='asg_recovery_preserve' ORDER BY digest,wakeId"
+        ),
+      assignment_turns:
+        rows(
+          "SELECT seq,wakeId,status,assignmentId FROM turns WHERE assignmentId='asg_recovery_preserve' ORDER BY seq"
+        )
     }
   end
 

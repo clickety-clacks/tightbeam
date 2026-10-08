@@ -469,6 +469,8 @@ defmodule Tightbeam.NoticeBatcherFixture do
   end
 
   defp scenario(21, db) do
+    seed_session(db, "agent:legacy-recipient", "legacy-owner")
+
     source =
       Wakes.schedule(db, %{
         session_key: "agent:legacy-recipient",

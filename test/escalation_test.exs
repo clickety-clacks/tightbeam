@@ -157,7 +157,7 @@ defmodule Tightbeam.EscalationTest do
 
     :ok = Wakes.fire_due(deliverer)
     assert_receive {:delivered, ^owner_session, ^id, "open"}
-    assert Wakes.get(ctx.db, wake.wake_id).state == "pending"
+    assert Wakes.get(ctx.db, wake.wake_id).state == "fired"
 
     assert [%{delivery_wake_id: carrier_id, batch_state: "delivered"}] =
              NoticeBatcher.source_refs(ctx.db, wake.wake_id)
@@ -315,7 +315,8 @@ defmodule Tightbeam.EscalationTest do
         creator_session_key: ctx.raiser.session_key
       })
 
-    handlers = Gateway.handlers(%{db: ctx.db, wake_scheduler: ctx.scheduler})
+    scheduler = start_gateway_scheduler(ctx)
+    handlers = Gateway.handlers(%{db: ctx.db, wake_scheduler: scheduler})
 
     assert %{code: "not_owner"} =
              handlers["rule"].(%{
@@ -334,6 +335,10 @@ defmodule Tightbeam.EscalationTest do
     ruled = handlers["rule"].(rule_call(id, "allow"))
     assert ruled.status == "ruled"
     assert Wakes.get(ctx.db, wake.wake_id).state == "fired"
+
+    assert [%{delivery_wake_id: _carrier_id, batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(ctx.db, wake.wake_id)
+
     assert_receive {:lane_nudged, _}
 
     assert handlers["rule"].(rule_call(id, "allow")).ruling_fact_id == ruled.ruling_fact_id
@@ -812,11 +817,13 @@ defmodule Tightbeam.EscalationTest do
                owner_operator_rule(direct.id, %{decision: "accept", response: "yes"})
              )
 
+    scheduler = start_gateway_scheduler(ctx)
+
     ruled =
       Escalation.operator_rule(
         ctx.db,
         owner_operator_rule(direct.id, %{decision: "accept"}),
-        scheduler: ctx.scheduler
+        scheduler: scheduler
       )
 
     assert ruled.status == "ruled"
@@ -845,7 +852,8 @@ defmodule Tightbeam.EscalationTest do
              )
 
     expected_prompt =
-      "Decision request #{direct.id} was ruled. Read it with tightbeam decision-request --request #{direct.id}."
+      "[woke: fact escalation-ruled/#{direct.id}]\n\n" <>
+        "Decision request #{direct.id} was ruled. Read it with tightbeam decision-request --request #{direct.id}."
 
     assert {:ok, [[1]]} =
              DB.query(
@@ -861,8 +869,10 @@ defmodule Tightbeam.EscalationTest do
                [direct.id]
              )
 
-    assert {:ok, [[1]]} =
-             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [wake_id])
+    assert [%{delivery_wake_id: carrier_id, batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(ctx.db, wake_id)
+
+    assert turn_count(ctx.db, carrier_id) == 1
 
     [listed] = Escalation.list(ctx.db, operator_call(ctx.raiser, %{}), "ruled")
     detailed = Escalation.get(ctx.db, operator_call(ctx.raiser, %{}), direct.id)
@@ -1678,25 +1688,26 @@ defmodule Tightbeam.EscalationTest do
              )
            )
 
-    assert {:ok, [["ruled", fact_id, wake_id, "fired"]]} =
+    assert {:ok, [["ruled", fact_id, wake_id, "pending", "condition", fired_at]]} =
              DB.query(
                ctx.db,
-               "SELECT d.status,d.rulingFactId,w.wakeId,w.state FROM decision_requests d JOIN wakes w ON w.conditionKind='escalation-ruled' AND w.conditionScope=d.id WHERE d.id=?1",
+               "SELECT d.status,d.rulingFactId,w.wakeId,w.state,w.firedBy,w.firedAt FROM decision_requests d JOIN wakes w ON w.conditionKind='escalation-ruled' AND w.conditionScope=d.id WHERE d.id=?1",
                [request.id]
              )
 
+    assert is_integer(fired_at)
+
     restarted = :"terminal_nudge_restart_#{System.unique_integer([:positive])}"
 
-    start_supervised!(
-      {Wakes, db: ctx.db, name: restarted, tick_ms: 60_000, deliver: fn _ -> :ok end},
-      id: restarted
-    )
+    start_gateway_scheduler(ctx, restarted)
 
     assert :ok = Wakes.fire_matching(restarted, fact_id)
     assert %{state: "fired", fired_by: "condition"} = Wakes.get(ctx.db, wake_id)
 
-    assert {:ok, [[1]]} =
-             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [wake_id])
+    assert [%{delivery_wake_id: carrier_id, batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(ctx.db, wake_id)
+
+    assert turn_count(ctx.db, carrier_id) == 1
   end
 
   test "future incomplete terminal transition is refused by the database trigger", ctx do
@@ -1933,6 +1944,8 @@ defmodule Tightbeam.EscalationTest do
   end
 
   test "automatic raiser delivery stays at most once across evaluators restart and replay", ctx do
+    scheduler = start_gateway_scheduler(ctx)
+
     request =
       Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "deliver once?"}))
 
@@ -1940,7 +1953,7 @@ defmodule Tightbeam.EscalationTest do
       Escalation.operator_rule(
         ctx.db,
         owner_operator_rule(request.id, %{decision: "accept"}),
-        scheduler: ctx.scheduler
+        scheduler: scheduler
       )
 
     assert {:ok, [[wake_id, "fired", "condition"]]} =
@@ -1950,46 +1963,35 @@ defmodule Tightbeam.EscalationTest do
                [request.id]
              )
 
-    assert turn_count(ctx.db, wake_id) == 1
+    assert [%{delivery_wake_id: carrier_id, batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(ctx.db, wake_id)
 
-    :ok =
-      DB.execute(
-        ctx.db,
-        "UPDATE wakes SET state='pending',firedAt=NULL,firedBy=NULL,dueAt=0 WHERE wakeId='#{wake_id}'"
-      )
+    assert turn_count(ctx.db, carrier_id) == 1
 
     tasks =
       for evaluator <- 1..8 do
         Task.async(fn ->
           if rem(evaluator, 2) == 0,
-            do: Wakes.fire_matching(ctx.scheduler, ruled.ruling_fact_id),
-            else: Wakes.fire_due(ctx.scheduler)
+            do: Wakes.fire_matching(scheduler, ruled.ruling_fact_id),
+            else: Wakes.fire_due(scheduler)
         end)
       end
 
     assert Enum.uniq(Task.await_many(tasks)) == [:ok]
-    assert turn_count(ctx.db, wake_id) == 1
+    assert turn_count(ctx.db, carrier_id) == 1
 
-    assert :ok = stop_supervised(Wakes)
+    assert :ok = stop_supervised(scheduler)
+    start_gateway_scheduler(ctx, scheduler)
 
-    start_supervised!(
-      {Wakes, db: ctx.db, name: ctx.scheduler, tick_ms: 60_000, deliver: fn _wake -> :ok end}
-    )
-
-    :ok =
-      DB.execute(
-        ctx.db,
-        "UPDATE wakes SET state='pending',firedAt=NULL,firedBy=NULL,dueAt=0 WHERE wakeId='#{wake_id}'"
-      )
-
-    assert :ok = Wakes.fire_due(ctx.scheduler)
-    assert turn_count(ctx.db, wake_id) == 1
+    assert :ok = Wakes.fire_due(scheduler)
+    assert turn_count(ctx.db, carrier_id) == 1
 
     assert {:ok, [["fired", "condition", prompt]]} =
              DB.query(ctx.db, "SELECT state,firedBy,prompt FROM wakes WHERE wakeId=?1", [wake_id])
 
     assert prompt ==
-             "Decision request #{request.id} was ruled. Read it with tightbeam decision-request --request #{request.id}."
+             "[woke: fact escalation-ruled/#{request.id}]\n\n" <>
+               "Decision request #{request.id} was ruled. Read it with tightbeam decision-request --request #{request.id}."
   end
 
   test "only escalation-ruled matches while wrong condition names fall back", ctx do
@@ -2062,7 +2064,7 @@ defmodule Tightbeam.EscalationTest do
       })
 
     assert :ok = Wakes.fire_due(ctx.scheduler)
-    assert %{state: "pending", condition_kind: nil} = Wakes.get(ctx.db, manual.wake_id)
+    assert %{state: "fired", condition_kind: nil} = Wakes.get(ctx.db, manual.wake_id)
 
     assert [%{delivery_wake_id: manual_carrier, batch_state: "delivered"}] =
              NoticeBatcher.source_refs(ctx.db, manual.wake_id)
@@ -2083,7 +2085,7 @@ defmodule Tightbeam.EscalationTest do
              )
 
     refute automatic_id == manual.wake_id
-    assert Wakes.get(ctx.db, manual.wake_id).state == "pending"
+    assert Wakes.get(ctx.db, manual.wake_id).state == "fired"
   end
 
   test "list integrity refusal covers missing and duplicate fact event and wake relations", ctx do
@@ -2125,6 +2127,13 @@ defmodule Tightbeam.EscalationTest do
                ctx.db,
                "DELETE FROM lifecycle_events WHERE kind='decision_request_ruled' AND subject=?1",
                [missing_event.id]
+             )
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "DELETE FROM notice_delivery_policies WHERE sourceWakeId IN (SELECT wakeId FROM wakes WHERE conditionKind='escalation-ruled' AND conditionScope=?1)",
+               [missing_wake.id]
              )
 
     assert {:ok, _} =
@@ -2289,6 +2298,13 @@ defmodule Tightbeam.EscalationTest do
     assert {:ok, _} =
              DB.query(
                ctx.db,
+               "DELETE FROM notice_delivery_policies WHERE sourceWakeId IN (SELECT wakeId FROM wakes WHERE conditionKind='escalation-ruled' AND conditionScope=?1)",
+               [legacy.id]
+             )
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
                "DELETE FROM wakes WHERE conditionKind='escalation-ruled' AND conditionScope=?1",
                [legacy.id]
              )
@@ -2300,8 +2316,9 @@ defmodule Tightbeam.EscalationTest do
       owner_operator_rule(known.id, %{decision: "accept"})
       |> Map.put(:transport_session_key, ctx.raiser.session_key)
 
+    scheduler = start_gateway_scheduler(ctx)
     known_ruled = Escalation.operator_rule(ctx.db, known_call)
-    assert :ok = Wakes.fire_matching(ctx.scheduler, known_ruled.ruling_fact_id)
+    assert :ok = Wakes.fire_matching(scheduler, known_ruled.ruling_fact_id)
 
     wrong_name =
       Wakes.schedule(ctx.db, %{
@@ -2314,8 +2331,10 @@ defmodule Tightbeam.EscalationTest do
         target_gate: 0
       })
 
-    assert :ok = Wakes.fire_due(ctx.scheduler)
-    assert %{state: "fired", fired_by: "fallback"} = Wakes.get(ctx.db, wrong_name.wake_id)
+    assert :ok = Wakes.fire_due(scheduler)
+
+    assert %{state: "pending", fired_by: "fallback"} =
+             Wakes.get(ctx.db, wrong_name.wake_id)
 
     invalid =
       Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "trace refusal?"}))
@@ -2335,15 +2354,18 @@ defmodule Tightbeam.EscalationTest do
     assert %{code: "decision_request_integrity_invalid"} =
              Escalation.get(ctx.db, operator_call(ctx.raiser, %{}), invalid.id)
 
-    assert {:ok, [[known_fact_id, "escalation-ruled", known_id, 1, wake_id, "condition", 1]]} =
+    assert {:ok, [[known_fact_id, "escalation-ruled", known_id, 1, wake_id, "condition"]]} =
              DB.query(
                ctx.db,
-               "SELECT d.rulingFactId,f.kind,f.scope,(SELECT COUNT(*) FROM lifecycle_events e WHERE e.kind='decision_request_ruled' AND e.subject=d.id),w.wakeId,w.firedBy,(SELECT COUNT(*) FROM turns t WHERE t.wakeId=w.wakeId) FROM decision_requests d JOIN condition_facts f ON f.id=d.rulingFactId JOIN wakes w ON w.conditionKind='escalation-ruled' AND w.conditionScope=d.id WHERE d.id=?1",
+               "SELECT d.rulingFactId,f.kind,f.scope,(SELECT COUNT(*) FROM lifecycle_events e WHERE e.kind='decision_request_ruled' AND e.subject=d.id),w.wakeId,w.firedBy FROM decision_requests d JOIN condition_facts f ON f.id=d.rulingFactId JOIN wakes w ON w.conditionKind='escalation-ruled' AND w.conditionScope=d.id WHERE d.id=?1",
                [known.id]
              )
 
     assert known_fact_id == known_ruled.ruling_fact_id
     assert known_id == known.id
+
+    assert [%{delivery_wake_id: carrier_id, batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(ctx.db, wake_id)
 
     assert %{
              ruling_attribution: %{
@@ -2383,12 +2405,17 @@ defmodule Tightbeam.EscalationTest do
                [invalid.id]
              )
 
-    assert {:ok, [["condition", "fallback", 1]]} =
+    assert {:ok, [["condition", "fallback"]]} =
              DB.query(
                ctx.db,
-               "SELECT automatic.firedBy,wrong.firedBy,(SELECT COUNT(*) FROM turns WHERE wakeId=automatic.wakeId) FROM wakes automatic JOIN wakes wrong ON wrong.wakeId=?2 WHERE automatic.wakeId=?1",
+               "SELECT automatic.firedBy,wrong.firedBy FROM wakes automatic JOIN wakes wrong ON wrong.wakeId=?2 WHERE automatic.wakeId=?1",
                [wake_id, wrong_name.wake_id]
              )
+
+    assert [%{delivery_wake_id: carrier_id, batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(ctx.db, wake_id)
+
+    assert turn_count(ctx.db, carrier_id) == 1
   end
 
   test "agent ask files one non-blocking carrier and classed target wake atomically", ctx do
@@ -3175,6 +3202,30 @@ defmodule Tightbeam.EscalationTest do
       transport_session_key: session.session_key,
       params: params
     }
+  end
+
+  defp start_gateway_scheduler(ctx, name \\ nil) do
+    name = name || :"escalation_gateway_scheduler_#{System.unique_integer([:positive])}"
+
+    start_supervised!(
+      {Wakes,
+       db: ctx.db,
+       name: name,
+       tick_ms: 60_000,
+       deliver: fn wake ->
+         Gateway.deliver_prompt(wake.session_key, wake.origin, wake.prompt,
+           db: ctx.db,
+           wake_id: wake.wake_id,
+           sender: wake.origin,
+           target_gate: if(wake.target_gate == 0, do: nil, else: wake),
+           fire_wake_in_txn: wake.origin == "process:tightbeam",
+           wake_scheduler: name
+         )
+       end},
+      id: name
+    )
+
+    name
   end
 
   defp turn_count(db, wake_id) do
