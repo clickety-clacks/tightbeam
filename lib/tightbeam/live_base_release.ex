@@ -10,19 +10,33 @@ defmodule Tightbeam.LiveBaseRelease do
   end
 
   @doc false
-  def automatic_transition(payload_root, base, target, stamp) do
+  def automatic_transition_candidate?(payload_root) do
+    with :packaged <- package_kind(payload_root),
+         {:ok, _provenance} <- read_provenance(payload_root) do
+      true
+    else
+      :not_packaged -> false
+      :missing -> false
+      :unsupported -> false
+      {:error, message} -> raise Refusal, message: message
+    end
+  end
+
+  @doc false
+  def automatic_transition(payload_root, base, target, stamp, source_marker \\ :absent) do
     with :packaged <- package_kind(payload_root),
          {:ok, _provenance} <- read_provenance(payload_root),
-         :ok <- validate_source_stamp(stamp) do
-      [[expected_schema]] = stamp
+         {:ok, source, expected_schema} <- validate_source_stamp(stamp, source_marker, target) do
+      transition = %{"base" => base, "source" => source, "target" => target}
 
-      {:ok,
-       %{
-         "base" => base,
-         "expectedSchema" => expected_schema,
-         "source" => "unmarked",
-         "target" => target
-       }}
+      transition =
+        if expected_schema do
+          Map.put(transition, "expectedSchema", expected_schema)
+        else
+          transition
+        end
+
+      {:ok, transition}
     else
       :not_packaged -> :none
       :missing -> :none
@@ -142,9 +156,28 @@ defmodule Tightbeam.LiveBaseRelease do
     end
   end
 
-  defp validate_source_stamp(stamp) do
-    if stamp == [[Tightbeam.Schema.live_base_upgrade_predecessor()]],
-      do: :ok,
+  defp validate_source_stamp([[stamp]], :absent, _target) do
+    if stamp == Tightbeam.Schema.live_base_upgrade_predecessor(),
+      do: {:ok, "unmarked", stamp},
       else: :unsupported
   end
+
+  defp validate_source_stamp(
+         [[stamp]],
+         %{"format" => "tightbeam-build-owner/v1", "buildIdentity" => source} = marker,
+         target
+       ) do
+    valid_marker =
+      Enum.sort(Map.keys(marker)) == ["buildIdentity", "format"] and
+        identity?(source) and source != target
+
+    if valid_marker and stamp in Tightbeam.Schema.guard_compatible_stamps(),
+      do: {:ok, source, nil},
+      else: :unsupported
+  end
+
+  defp validate_source_stamp(_, _, _), do: :unsupported
+
+  defp identity?(value),
+    do: is_binary(value) and Regex.match?(~r/\A[0-9a-f]{64}\z/, value)
 end

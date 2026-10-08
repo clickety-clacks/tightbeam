@@ -270,18 +270,20 @@ the CLI from: if they disagree, the CLI looks for its gateway in a directory
 that does not have one.
 
 An assembled tagged 0.1.9 release carries exact release provenance beside its
-payload. When it sees an existing unmarked base stamped with the supported
-`operator-decision-requests-v1` 0.1.8 predecessor, it derives the transition,
-runs the normal migration, and writes the verified build marker only after the
-current schema commits. A development or work-branch build has no release
-provenance and still refuses before migration; a missing, malformed, or
-ambiguous provenance file is refused rather than guessed.
+payload. It automatically derives the transition for an existing unmarked base
+stamped with the supported `operator-decision-requests-v1` 0.1.8 predecessor,
+and for an existing base marked by an earlier build when its database stamp is
+one of the explicitly supported schema shapes. Both paths use the normal
+migrations and write the verified current build marker only after the current
+schema commits. A development or work-branch build has no release provenance
+and still refuses before migration; a missing, malformed, or ambiguous
+provenance file is refused rather than guessed.
 
-For an explicit transition, set `TIGHTBEAM_LIVE_BASE_TRANSITION` to the exact
-JSON supplied by the operator's release procedure. This remains useful for a
-supported non-automatic rehearsal or a release carrying a different approved
-predecessor. For example (with the real canonical base, target build identity,
-and schema stamp substituted):
+For a supported non-automatic rehearsal or a release carrying a different
+approved predecessor, set `TIGHTBEAM_LIVE_BASE_TRANSITION` to the exact JSON
+supplied by the operator's release procedure. It is not needed for the
+supported 0.1.8 or earlier 0.1.9 automatic upgrades. For example (with the real
+canonical base, target build identity, and schema stamp substituted):
 
 ```sh
 export TIGHTBEAM_LIVE_BASE_TRANSITION='{"base":"/srv/tightbeam","expectedSchema":"<0.1.8-schema-stamp>","source":"unmarked","target":"<64-hex-0.1.9-build-identity>"}'
@@ -516,7 +518,7 @@ The service must **start with no interactive login**, **survive logout**,
 |---|---|
 | `TIGHTBEAM_LOCAL_HOST_NAME` | **Set this. It is the one that bites.** The homes tree is keyed `homes/<machine>/<harness>`, and the machine name defaults to the OS hostname. If the hostname is unstable — a container that gets a new id per start, a renamed machine — every restart projects a NEW home tree and silently orphans the durable harness state (codex `sessions/`, claude `projects/`) under the old name. It does not fail; it just quietly stops finding the old conversations. Pin it to a name you choose and never change it. |
 | `TIGHTBEAM_BASE_DIR` | The org: `auth/`, `identity/`, `homes/`, `state.db`, `work/`. Defaults to `TIGHTBEAM_HOME`, else `~/.tightbeam`. |
-| `TIGHTBEAM_LIVE_BASE_TRANSITION` | Optional exact JSON transition for a packaged 0.1.9 gateway adopting an unmarked 0.1.8 base; malformed, mismatched, or schema-incompatible values are refused. |
+| `TIGHTBEAM_LIVE_BASE_TRANSITION` | Optional exact JSON transition for an approved non-automatic transition; supported 0.1.8 and earlier 0.1.9 upgrades derive it automatically. Malformed, mismatched, or schema-incompatible values are refused. |
 | `TIGHTBEAM_PORT` | Rewritten into `gateway.json` at every boot. |
 | `TIGHTBEAM_NODE` | The release's Erlang node name. Defaults to `tightbeam_gateway_<port>`, which is already unique per instance — set it only if you want to choose the name. |
 | `TIGHTBEAM_ADVERTISED_URL` | The URL clients are told to connect back on. `mix tightbeam.doctor` fails without it. |

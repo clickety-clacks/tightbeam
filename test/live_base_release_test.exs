@@ -115,6 +115,78 @@ defmodule Tightbeam.LiveBaseReleaseTest do
     :ok = GenServer.stop(restarted)
   end
 
+  test "a released package automatically upgrades an earlier marked build", %{
+    root: root,
+    app: app,
+    base: base
+  } do
+    write_provenance!(root)
+    {:ok, manifest} = LiveBaseGuard.generate_manifest(LiveBaseAdmission.payload_files!(app))
+    File.write!(Path.join(app, "build-manifest.json"), JSON.encode!(manifest))
+    seed_real_predecessor!(base, app)
+
+    {:ok, previous_db} =
+      DB.start_link(
+        path: Path.join(base, "state.db"),
+        name: nil,
+        guard_inputs: [],
+        payload_root: app
+      )
+
+    :ok = Schema.ensure_all(previous_db)
+    :ok = GenServer.stop(previous_db)
+
+    previous_identity = String.duplicate("b", 64)
+    previous_marker = owner_marker(previous_identity)
+    marker_path = Path.join(base, "build-owner.json")
+    File.write!(marker_path, JSON.encode!(previous_marker))
+
+    admission = LiveBaseAdmission.prepare!(base, payload_root: app)
+    assert admission.marker == previous_marker
+    assert admission.decision.source == previous_identity
+    assert admission.decision.target == manifest["buildIdentity"]
+    assert admission.decision.expected_schema == nil
+    assert File.read!(marker_path) == JSON.encode!(previous_marker)
+
+    {:ok, db} =
+      DB.start_link(
+        path: Path.join(base, "state.db"),
+        name: nil,
+        guard_inputs: [],
+        payload_root: app
+      )
+
+    :ok = Schema.ensure_all(db)
+    target = hd(Schema.guard_compatible_stamps())
+    assert {:ok, [[^target]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert JSON.decode!(File.read!(marker_path)) == owner_marker(manifest["buildIdentity"])
+    :ok = GenServer.stop(db)
+  end
+
+  test "a released package refuses a marked build with an unknown schema without rewriting it", %{
+    root: root,
+    app: app,
+    base: base
+  } do
+    write_provenance!(root)
+    {:ok, manifest} = LiveBaseGuard.generate_manifest(LiveBaseAdmission.payload_files!(app))
+    File.write!(Path.join(app, "build-manifest.json"), JSON.encode!(manifest))
+    seed_schema!(base, "unknown-schema-shape")
+
+    previous_marker = owner_marker(String.duplicate("b", 64))
+    marker_path = Path.join(base, "build-owner.json")
+    File.write!(marker_path, JSON.encode!(previous_marker))
+    before = File.read!(Path.join(base, "state.db"))
+
+    assert_raise LiveBaseAdmission.Refusal, ~r/build_transition_required/, fn ->
+      LiveBaseAdmission.prepare!(base, payload_root: app)
+    end
+
+    assert File.read!(Path.join(base, "state.db")) == before
+    assert File.read!(marker_path) == JSON.encode!(previous_marker)
+  end
+
   test "a failed released migration leaves the predecessor and no marker", %{
     root: root,
     app: app,
@@ -147,6 +219,40 @@ defmodule Tightbeam.LiveBaseReleaseTest do
     assert {:ok, columns} = DB.query(db, "PRAGMA table_info(decision_requests)")
     refute Enum.any?(columns, fn [_, name | _] -> name == "ruledViaPrincipal" end)
     refute File.exists?(Path.join(base, "build-owner.json"))
+    :ok = GenServer.stop(db)
+  end
+
+  test "a failed automatic marked-build migration preserves the previous marker", %{
+    root: root,
+    app: app,
+    base: base
+  } do
+    write_provenance!(root)
+    {:ok, manifest} = LiveBaseGuard.generate_manifest(LiveBaseAdmission.payload_files!(app))
+    File.write!(Path.join(app, "build-manifest.json"), JSON.encode!(manifest))
+    seed_real_predecessor!(base, app)
+
+    previous_marker = owner_marker(String.duplicate("b", 64))
+    marker_path = Path.join(base, "build-owner.json")
+    previous_bytes = JSON.encode!(previous_marker)
+    File.write!(marker_path, previous_bytes)
+    install_migration_failure_trigger!(base)
+
+    {:ok, db} =
+      DB.start_link(
+        path: Path.join(base, "state.db"),
+        name: nil,
+        guard_inputs: [],
+        payload_root: app
+      )
+
+    assert_raise Schema.ShapeError, ~r/migration .* failed: .*synthetic migration failure/, fn ->
+      Schema.ensure_all(db)
+    end
+
+    predecessor = Schema.live_base_upgrade_predecessor()
+    assert {:ok, [[^predecessor]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+    assert File.read!(marker_path) == previous_bytes
     :ok = GenServer.stop(db)
   end
 
@@ -469,6 +575,18 @@ defmodule Tightbeam.LiveBaseReleaseTest do
       Path.join(base, "state.db"),
       app
     )
+  end
+
+  defp seed_schema!(base, stamp) do
+    File.mkdir_p!(base)
+    {:ok, conn} = Sqlite3.open(Path.join(base, "state.db"))
+    :ok = Sqlite3.execute(conn, "CREATE TABLE schema_stamp(shape TEXT);")
+    :ok = Sqlite3.execute(conn, "INSERT INTO schema_stamp VALUES ('#{stamp}')")
+    :ok = Sqlite3.close(conn)
+  end
+
+  defp owner_marker(identity) do
+    %{"format" => "tightbeam-build-owner/v1", "buildIdentity" => identity}
   end
 
   defp seed_migration_population!(base) do

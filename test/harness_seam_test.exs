@@ -152,13 +152,15 @@ defmodule Tightbeam.HarnessSeamTest do
     refute source =~ "@adapter_selectable_models"
     refute source =~ "claude_selectable_models"
     refute source =~ "keep_selectable"
-    assert source =~ ~s(@adapter_version "0.79.0")
+  end
+
+  test "Claude ACP pin supports Opus 5.5's minimum CLI version" do
+    assert Tightbeam.Harness.Claude.adapter_version() == "0.81.0"
   end
 
   test "claude carries no model alias table" do
     config = Tightbeam.Harness.Claude.session_config(%{}, "guidance")
 
     refute Map.has_key?(config, :model_option_aliases)
-    assert Tightbeam.Harness.Claude.adapter_version() == "0.79.0"
   end
 end
