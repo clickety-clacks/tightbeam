@@ -35,6 +35,7 @@ defmodule Tightbeam.TerminalCredentialMigrationTest do
     db = :"terminal_credential_migration_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Schema.ensure_all(db)
+    Tightbeam.SchemaShapeRuntimeFixture.downgrade_assignment_source_replacement_cancellation!(db)
 
     # The credential successor is additive, so removing exactly its owned objects
     # recreates the landed settlement predecessor without rewriting any historical

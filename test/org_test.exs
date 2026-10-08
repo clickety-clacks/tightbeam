@@ -310,7 +310,10 @@ defmodule Tightbeam.OrgTest do
     assert_receive {:delivered, ^carrier_id}
     refute_receive {:delivered, ^replacement_wake_id}
     assert Wakes.get(db, carrier_id).state == "fired"
-    assert Wakes.get(db, replacement_wake_id).state == "pending"
+    assert Wakes.get(db, replacement_wake_id).state == "fired"
+
+    assert [%{delivery_wake_id: ^carrier_id, batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(db, replacement_wake_id)
 
     assert {:ok, [[1]]} =
              DB.query(db, "SELECT count(*) FROM wakes WHERE digest=1 AND wakeId=?1", [carrier_id])

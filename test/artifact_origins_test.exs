@@ -149,6 +149,7 @@ defmodule Tightbeam.ArtifactOriginsTest do
   test "exact predecessor upgrade leaves legacy origins unknown and preserves every named byte of the row",
        %{db: db} do
     row = record(db, "/same/base/report.md")
+    Tightbeam.SchemaShapeRuntimeFixture.downgrade_assignment_source_replacement_cancellation!(db)
 
     :ok =
       DB.execute(db, """
@@ -177,6 +178,8 @@ defmodule Tightbeam.ArtifactOriginsTest do
   end
 
   test "migration stamp failure rolls the provenance columns back", %{db: db} do
+    Tightbeam.SchemaShapeRuntimeFixture.downgrade_assignment_source_replacement_cancellation!(db)
+
     :ok =
       DB.execute(db, """
       DROP TRIGGER artifacts_origin_immutable;

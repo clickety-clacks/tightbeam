@@ -28,7 +28,7 @@ Do not repeat their CRUD lifecycles in smoke.
 | <a id="wake-delivery-options"></a>Dependency wait | Fresh / records | On a test item, open assignment H (the waiter), R (the resolver) and V (the verifier). As H's holder, run `wake --session <H holder> --assignment <H> --fallback-after 1h --prompt "resolver closed" --predicate '{"conditions":[{"fact":"assignment.state","op":"eq","value":"closed"}],"bindings":{"assignmentId":"<R>"},"resolverRef":{"kind":"assignment","id":"<R>"},"necessity":"R owns the required output.","verificationRef":{"kind":"assignment","id":"<V>"}}'`. Read the `turns` table for its `wakeId`. Revoke R with a reason, wait one wake tick, and read again. Also run the same wake as a user. | Before R closes, no turn carries the wake's ID. After R is revoked, one turn does, with the prompt. The user caller is refused `invalid_wait`. |
 | Ready-now continuation | Fresh / online | From inside a harmless running turn of H's holder, have it run `wake --session <itself> --assignment <H> --after-turn --prompt "continue"`. Read the `turns` table after the turn ends. Run the same command from a session with no running turn. | Exactly one later turn carries the continuation's wake ID, and it starts only after the capturing turn ended. With no running turn: `no_running_turn`. |
 | Delivery class | Fresh / records | As a test session, send `wake --session <other> --class blocker --prompt ...` and `wake --session <other> --class not-a-class --prompt ...`. Read `class` for both wake IDs from the `wakes` table. | Each wake stores the class its sender gave. The unknown class is accepted, not refused. |
-| <a id="replace-unread-messages"></a>Replace, stop and resume (U5) | Fresh / online | Follow [queue correction](#queue-correction), including the still-queued dispatch prompt, another sender, and the real resumed correction. | Superseded source messages stay auditable; stop records its actor/reason; the newest correction runs next in the same session. The running turn and different-sender message survive replacement; only the authorized stop cancels the current turn. |
+| <a id="replace-unread-messages"></a>Replace, stop and resume (U5) | Fresh / online | Follow [queue correction](#queue-correction), including a pending dispatch source, another sender, and the resumed correction in a carrier turn. | Superseded source messages stay auditable; stop records its actor/reason; the newest correction runs next in the same session. The running turn and different-sender source survive replacement; only the authorized stop cancels the current turn. |
 | <a id="wake-cancellation-history"></a>Wake cancellation history | Fresh / records | As H's holder, register another [dependency wait](#wake-delivery-options) on H naming a resolver that stays open, and a third as a control. Run `cancel-wake <wakeId>` from the holder, then again. Try cancelling the control from a different session. Read `work-item-trace <wi>` and the `turns` table. | The first cancel returns `canceled: true`, the second `canceled: false`. The trace shows `wake_canceled` for that wake with reason `requester_withdrew`. No turn carries its ID. The other session's cancel leaves the control pending. |
 | Consequence condition fact | Fresh / records | On an assignment with at least one attest, as its holder, publish `condition --kind obligation-consequence-changed --scope <asg> --key <unique> --payload '<object>'` with exactly `assignmentId` (the scope), `consequenceKey`, `revision`, `attentionRequestId`, `evidenceAttestId` and boolean `explicitAttention`. | The fact is kept with its payload. |
 | <a id="landing-watcher"></a>One sentinel/PR lifecycle (U4) | Fresh / online, disposable repository | Follow [sentinel and PR](#sentinel-and-pr) with two eligible test owners and one wrong-scope control. | The same real PR yields the checks-completed fact and queue/landing settlement fact, both eligible owners wake from the process fact, and disabling stops the owned sentinel. Fallback expiry is never fact evidence. |
@@ -52,8 +52,8 @@ helper script or edit queue rows.
    prerequisite and retry the hand-run journey.
 3. While X is running, O dispatches a second bounded task B to H with
    `dispatch --to <H> --work-item <W> --subject "queued fixture" --brief "Handle this harmless queued fixture task." --key <unique>`.
-   Confirm B remains an individual pending source row and has no delivery
-   turn. As O, run
+   Confirm B's initial dispatch prompt remains an individual pending source
+   wake and has no delivery turn while X is running. As O, run
    `wake --session <H> --assignment <B> --replace-queued --class fyi --prompt "DRAFT <nonce>"`,
    then run `wake --session <H> --assignment <B> --replace-queued --class blocker --prompt "CORRECTION <nonce>"`.
 4. While X is still running, have C send two ordinary `input-needed` wakes to H;
@@ -107,56 +107,71 @@ an area item W. O dispatches a harmless bounded task to H on assignment A.
 Fixture briefs leave assignments open for the opener's cleanup after checks.
 Record the actual running turn sequence and assignment attribution. Do not
 freeze a lane or edit turn rows to hold this window. If the task ends before
-the observations below, record the missed running/queued prerequisite and
-retry this bounded journey; no race outcome is presumed.
+the observations below, record the missed running prerequisite and retry this
+bounded journey; no race outcome is presumed.
 
-While A's turn is running:
+While A's turn is running, B's dispatch prompt and ordinary wakes remain
+individual pending source rows. They have no turns or batch memberships until
+H is ready. A carrier envelope records each surviving source with its ID,
+origin, cause and class; one delivered batch has one carrier turn, not one turn
+per source.
 
 1. O uses `dispatch --to <H> --work-item <W> --subject <fixture>
    --brief "INITIAL <nonce>" --key <unique>` to open assignment B. Confirm
-   its initial prompt is one pending editable source row with no delivery
-   turn. C sends the ordinary control
+   the initial dispatch wake is `pending` in `wakes` and has no turn or row in
+   `notice_batch_members` while A is running. C sends the ordinary control
    `wake --session <H> --prompt "CONTROL <nonce>: reply with this nonce"`,
-   without `--assignment`. Require exactly these two individual pending source
-   rows, no new queued turns, and record their source IDs, publication order,
-   classes and origins.
+   without `--assignment`. Require exactly these two pending source wakes and
+   record their IDs, creation times, publication order, classes and origins.
+   The telemetry queue has no delivered turn for either source yet; do not
+   treat a pending source as a queued turn or as turn attribution for B.
 2. O sends `wake --session <H> --assignment <B> --replace-queued
-   --prompt "CORRECTION <nonce>: reply with this nonce"`. Read source and
-   cancellation records: B's INITIAL source is canceled with reason
-   `sender_requested_replacement`; C's ordinary control remains pending. An
-   ordinary wake is not replacement consent. Retain the original prompt and
-   source IDs. A's running turn remains running.
+   --prompt "CORRECTION <nonce>: reply with this nonce"`. Read
+   `wake_cancellations` by INITIAL's `wakeId`: its `reasonKind` is
+   `superseded`, its `causalSourceKind` is `wake`, and `replacementWakeId`
+   names the correction. Read the matching `queued_message_suppressed` event
+   by source wake ID and retain the original prompt and source IDs. C's
+   unbound control remains pending and is not canceled. An ordinary wake is
+   not replacement consent. A's running turn remains running.
 3. O sends a newer correction using the same B-bound `--replace-queued`
-   command and a new nonce. Require the prior replacement-consenting source to
-   be canceled and C's control to remain pending. Let A's bounded task finish.
-   **Assert:** C's control and the newest correction form one carrier turn in
-   priority order, with publication order preserved within their class. Both
-   source rows remain individually auditable; neither got its own turn.
+   command and a new nonce. Require the prior replacement-consenting
+   correction source to be canceled with the same reasoned wake-cancellation
+   and lifecycle evidence; C's control remains pending. Let A's bounded task
+   finish. Require one carrier turn whose envelope contains C's control and
+   the newest correction in their recorded source order. Both source wakes
+   refer to that carrier with `batch_state='delivered'`; neither has its own
+   turn. Preserve the earlier source position; do not demand that a correction
+   overtake another sender.
 4. Still in H, O dispatches one bounded harmless task on a new assignment D
-   under W. Observe its immediate first turn running and attributed to D.
-   A replacement wake does not stamp a turn with an assignment and cannot
-   supply this attributed running-turn prerequisite. With no other source
-   ahead of it, O sends
+   under W. Observe its initial dispatch turn running and attributed to D.
+   A replacement wake scopes suppression but does not stamp its carrier turn
+   with an assignment; it cannot supply this attributed running-turn
+   prerequisite. With no surviving control ahead of it, O sends
    `wake --session <H> --assignment <D> --replace-queued
    --prompt "OLDER <nonce>"`, then another such `--replace-queued` wake with
-   the final correction and a fresh nonce. Require OLDER canceled and the
-   final correction pending as a source row. Both correction wakes explicitly consent to
-   replacement; do not use an ordinary wake for OLDER.
+   the final correction and a fresh nonce. Require OLDER's source wake to be
+   canceled and the final correction to remain pending with no turn while D's
+   task runs. Both correction wakes explicitly consent to replacement; do not
+   use an ordinary wake for OLDER.
    As a non-opener, try `assignment-stop-turn <D> --reason <fixture reason>`;
    require `not_authorized` and no change. As O, run that stop once. Its result
    names D, H, the exact current `turnSeq` and `acpCancel`. That turn becomes
    `canceled`; its lifecycle event records cause `assignment-opener-stop`.
    The `assignment_turn_stopped` lifecycle event records O's actor and exact
-   reason. The final pending correction source is unchanged by the stop.
-5. Require that final correction to run next and produce its nonce reply in H.
-   Tie its wake ID to D through `queued_message_replacement_requests` and D
-   to W through the assignment record; do not claim automatic assignment turn
-   attribution from a replacement request. All suppressed INITIAL, OLDER and
-   replaced correction sources remain readable but never execute. C's
-   preserved control appears once in its carrier. Record the actual sequences
-   and terminal results, not only accepted wakes. The second bounded window
-   isolates stop/resume ordering without discarding C's message.
-   Dispose all three fixture assignments with recorded reasons after the checks.
+   reason. The final correction source remains pending and unchanged by the
+   stop.
+5. Require one carrier turn after the stop, with the final correction source
+   in its envelope, and capture H's nonce reply. Tie the source wake ID to D
+   through `queued_message_replacement_requests` and D to W through the
+   assignment record; do not claim automatic turn attribution from a
+   replacement request. All suppressed INITIAL, OLDER and replaced correction
+   messages remain readable but never execute. C's control has one delivered
+   source reference to the first carrier from step 3; D's final correction has
+   one reference to the later carrier. Record both carrier sequences, source
+   order and terminal results, not only accepted wakes. The second bounded
+   window isolates stop/resume ordering without discarding C's already-delivered
+   message. Dispose all three fixture assignments with recorded reasons after
+   the checks.
 
 The decisions stop row cites this result. `test/queued_message_suppression_test.exs`
 owns clock-regression/retry ordering and the wider protected-traffic matrix;

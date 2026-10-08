@@ -6,7 +6,18 @@ false = File.exists?(base)
 Application.put_env(:tightbeam, :autostart, false)
 Application.put_env(:tightbeam, :base_dir, base)
 import ExUnit.Assertions
-alias Tightbeam.{DB, Gateway, Model, Org, Roles, Schema, SessionPoAssociations, Wakes}
+
+alias Tightbeam.{
+  DB,
+  Gateway,
+  Model,
+  NoticeBatcher,
+  Org,
+  Roles,
+  Schema,
+  SessionPoAssociations,
+  Wakes
+}
 
 opts = [path: Path.join(base, "state.db"), name: nil, guard_inputs: []]
 {:ok, db} = DB.start_link(opts)
@@ -87,16 +98,27 @@ try do
 
   :ok = Wakes.fire_due(:session_po_restart_wakes)
 
-  receive do
-    {:delivered_before_ack, ^wake_id, {:appended, "orchestrator", _, _}} -> :ok
-  after
-    1_000 -> flunk("delivery-before-ack cut was not reached")
-  end
+  carrier_id =
+    receive do
+      {:delivered_before_ack, observed_carrier_id, {:appended, "orchestrator", _, _}} ->
+        assert [%{delivery_wake_id: ^observed_carrier_id}] =
+                 NoticeBatcher.source_refs(reopened, wake_id)
 
-  assert %{wake_id: ^wake_id, state: "pending"} = Wakes.get(reopened, wake_id)
+        observed_carrier_id
+    after
+      1_000 -> flunk("delivery-before-ack cut was not reached")
+    end
+
+  assert %{wake_id: ^wake_id, state: "fired"} = Wakes.get(reopened, wake_id)
+
+  assert [%{delivery_wake_id: ^carrier_id, batch_state: "delivery_pending"}] =
+           NoticeBatcher.source_refs(reopened, wake_id)
+
+  assert {:ok, [[0]]} =
+           DB.query(reopened, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [wake_id])
 
   assert {:ok, [[1]]} =
-           DB.query(reopened, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [wake_id])
+           DB.query(reopened, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [carrier_id])
 
   GenServer.stop(first_scheduler)
 after
@@ -134,14 +156,27 @@ try do
 
   :ok = Wakes.fire_due(:session_po_restart_wakes)
 
-  receive do
-    {:retried_delivery, ^wake_id, {:duplicate, _}} -> :ok
-  after
-    1_000 -> flunk("restart retry did not reuse the logical wake delivery")
-  end
+  retry_carrier_id =
+    receive do
+      {:retried_delivery, observed_carrier_id, {:duplicate, _}} ->
+        assert [%{delivery_wake_id: ^observed_carrier_id}] =
+                 NoticeBatcher.source_refs(retried, wake_id)
+
+        observed_carrier_id
+    after
+      1_000 -> flunk("restart retry did not reuse the logical wake delivery")
+    end
 
   assert %{wake_id: ^wake_id, state: "fired"} = Wakes.get(retried, wake_id)
-  assert {:ok, [[1]]} = DB.query(retried, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [wake_id])
+
+  assert [%{batch_state: "delivered", delivery_wake_id: ^retry_carrier_id}] =
+           NoticeBatcher.source_refs(retried, wake_id)
+
+  assert {:ok, [[0]]} = DB.query(retried, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [wake_id])
+
+  assert {:ok, [[1]]} =
+           DB.query(retried, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [retry_carrier_id])
+
   GenServer.stop(second_scheduler)
   IO.puts("session-po-association-restart: ok")
 after

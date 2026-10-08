@@ -576,7 +576,7 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
     end
   end
 
-  defp downgrade_assignment_source_replacement_cancellation!(db) do
+  def downgrade_assignment_source_replacement_cancellation!(db) do
     {:ok, [[current_ddl]]} =
       DB.query(
         db,

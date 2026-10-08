@@ -160,12 +160,23 @@ defmodule Tightbeam.EffortNotificationFixture do
     assert Enum.all?(notices, &(&1.assignment_id == item.id))
     drain_notifications!(ctx)
 
-    assert [[2]] =
-             rows(
-               ctx.db,
-               "SELECT count(*) FROM turns WHERE assignmentId=?1 AND prompt LIKE '%effort check-in%'",
-               [item.id]
-             )
+    [first_notice, second_notice] = notices
+
+    assert [%{delivery_wake_id: carrier_id, batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(ctx.db, first_notice.wake_id)
+
+    assert [%{delivery_wake_id: ^carrier_id, batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(ctx.db, second_notice.wake_id)
+
+    assert Wakes.get(ctx.db, first_notice.wake_id).state == "fired"
+    assert Wakes.get(ctx.db, second_notice.wake_id).state == "fired"
+
+    assert [[1]] = rows(ctx.db, "SELECT count(*) FROM turns WHERE wakeId=?1", [carrier_id])
+
+    assert [[carrier_assignment_id, _job_id]] =
+             rows(ctx.db, "SELECT assignmentId, jobRef FROM turns WHERE wakeId=?1", [carrier_id])
+
+    assert carrier_assignment_id == item.id
 
     assert [[^claim]] =
              rows(ctx.db, "SELECT reminderState FROM assignments WHERE id=?1", [item.id])
@@ -174,7 +185,7 @@ defmodule Tightbeam.EffortNotificationFixture do
     assert [] == rows(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [ordinary.wake_id])
 
     assert Enum.all?(notices, fn notice ->
-             Wakes.get(ctx.db, notice.wake_id).state == "pending" and
+             Wakes.get(ctx.db, notice.wake_id).state == "fired" and
                match?(
                  [%{batch_state: "delivered"}],
                  NoticeBatcher.source_refs(ctx.db, notice.wake_id)
@@ -216,16 +227,19 @@ defmodule Tightbeam.EffortNotificationFixture do
     # Delivery derives the SAME attribution through `wake_attribution/2` — for
     # the agent prod that opened the bracket's first rung as well as for the two
     # owner notifications.
-    assert rows(
-             ctx.db,
-             """
-             SELECT assignmentId, jobRef
-             FROM turns
-             WHERE prompt LIKE '%effort check-in%'
-             ORDER BY seq
-             """,
-             []
-           ) == [[assignment.id, item.id], [assignment.id, item.id]]
+    [first_notice, second_notice] = notification_wakes(ctx.db)
+
+    assert [%{delivery_wake_id: carrier_id, batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(ctx.db, first_notice.wake_id)
+
+    assert [%{delivery_wake_id: ^carrier_id, batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(ctx.db, second_notice.wake_id)
+
+    assert [[carrier_assignment_id, carrier_job_id]] =
+             rows(ctx.db, "SELECT assignmentId, jobRef FROM turns WHERE wakeId=?1", [carrier_id])
+
+    assert carrier_assignment_id == assignment.id
+    assert carrier_job_id == item.id
   end
 
   defp scenario(2, ctx) do
@@ -255,7 +269,7 @@ defmodule Tightbeam.EffortNotificationFixture do
 
     # Ordinary wake recovery surfaces it without waiting for the deadline.
     scheduler = drain_notifications!(ctx)
-    assert Wakes.get(ctx.db, opened.wake_id).state == "pending"
+    assert Wakes.get(ctx.db, opened.wake_id).state == "fired"
 
     assert [%{delivery_wake_id: opened_carrier, batch_state: "delivered"}] =
              NoticeBatcher.source_refs(ctx.db, opened.wake_id)
@@ -273,14 +287,14 @@ defmodule Tightbeam.EffortNotificationFixture do
     assert Wakes.get(ctx.db, advanced.deadline_wake_id).state == "pending"
     assert Wakes.get(ctx.db, old_deadline_id).state == "fired"
 
-    assert [%{state: "pending"}, %{state: "pending", target_gate: 0} = rung] =
+    assert [%{state: "fired"}, %{state: "pending", target_gate: 0} = rung] =
              notification_wakes(ctx.db)
 
     assert rung.session_key == (advanced.expecter_session_key || personal_key)
     assert rung.prompt =~ "Effort check-in #{request_id}"
 
     :ok = Wakes.fire_due(scheduler)
-    assert Wakes.get(ctx.db, rung.wake_id).state == "pending"
+    assert Wakes.get(ctx.db, rung.wake_id).state == "fired"
 
     assert [%{delivery_wake_id: rung_carrier, batch_state: "delivered"}] =
              NoticeBatcher.source_refs(ctx.db, rung.wake_id)

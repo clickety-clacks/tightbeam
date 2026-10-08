@@ -378,7 +378,7 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
              creator_session_key: ^creator_session_key,
              prompt: prompt,
              consumer: "prompt",
-             state: "pending",
+             state: "fired",
              condition_kind: nil,
              work_item_id: nil,
              assignment_id: nil,

@@ -2,10 +2,13 @@ defmodule Tightbeam.SettlementMigrationTest do
   use Tightbeam.TestCase, async: false
   alias Tightbeam.{DB, Schema}
 
+  @assignment_replacement_route ~r/\(requesterId = 'tightbeam:assignments' AND reasonKind = 'superseded' AND\s+causalSourceKind = 'wake' AND outcomeKind = 'replacement'\)\s+OR/
+
   setup do
     db = :"settlement_migration_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Schema.ensure_all(db)
+    Tightbeam.SchemaShapeRuntimeFixture.downgrade_assignment_source_replacement_cancellation!(db)
 
     # Build the exact six-column predecessor, including reparent and PO replay contracts.
     # This is an isolated fixture, never a live downgrade or runtime repair.
@@ -42,12 +45,20 @@ defmodule Tightbeam.SettlementMigrationTest do
 
   test "named transition preserves reparent and PO replay and is idempotent", %{db: db} do
     preserved_sql =
-      "SELECT name,sql FROM sqlite_master WHERE name IN ('wake_cancellations','assignments','attests','assignment_cannot_proceed') ORDER BY name"
+      "SELECT name,sql FROM sqlite_master WHERE name IN ('assignments','attests','assignment_cannot_proceed') ORDER BY name"
 
     assert {:ok, before_ddl} = DB.query(db, preserved_sql)
-    assert length(before_ddl) == 4
+    assert length(before_ddl) == 3
     assert :ok = Schema.ensure_all(db)
     assert {:ok, ^before_ddl} = DB.query(db, preserved_sql)
+
+    assert {:ok, [[wake_cancellations_ddl]]} =
+             DB.query(
+               db,
+               "SELECT sql FROM sqlite_master WHERE type='table' AND name='wake_cancellations'"
+             )
+
+    assert Regex.match?(@assignment_replacement_route, wake_cancellations_ddl)
     assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
 
     assert {:ok, [["assignment-source-replacement-v1-019"]]} =
