@@ -36,49 +36,63 @@ Do not repeat their CRUD lifecycles in smoke.
 
 ## Notice batching (Fresh / online)
 
-Run this as one hand-run journey with disposable work and sessions O (the
-ordinary sender), H (the recipient), R (the reviewer) and a human user. Do not
-write a helper script or edit queue rows. First, while H is idle, have H open a
-review assignment A to R on the area item. Then have O dispatch a bounded
-harmless task to H and wait until its turn is actually running. Record that
-turn's sequence and assignment attribution.
+Run this journey by hand on a disposable area with O (an agent sender), H (the
+recipient), C (a second agent sender), R (a reviewer), and a human user. Do not
+write a helper script or edit queue rows.
 
-While H's turn is running, send H ordinary prompts from more than one source:
-use `wake --session <H> --class blocker --prompt ...`,
-`wake --session <H> --class input-needed --prompt ...`, and a lower-priority
-`fyi` prompt. As the human user, also send an ordinary wake to H. Have R file
-`attest <A> --kind verdict --verdict reviewed-clean`. That ruling must create a
-source wake for A's opener H through the ordinary batchable route. Record each
-returned or read-back wake ID and its actual origin and class.
+1. Create work item W. As O, open a harmless producer assignment P for H with
+   `assign --session <H> --work-item <W> --subject "producer fixture"`. While H
+   is idle, H opens review assignment A for P to R with
+   `assign --reviews <P> --work-item <W> --session <R> --subject "review fixture"`.
+2. As O, dispatch a separate harmless bounded task X to H with
+   `dispatch --to <H> --work-item <W> --subject "running fixture" --brief "Continue this harmless fixture task." --key <unique>`.
+   Wait until X's turn is actually running; record its sequence and assignment.
+   If it ends before the queued observations below, record the missed
+   prerequisite and retry the hand-run journey.
+3. While X runs, O dispatches a second bounded task B to H with
+   `dispatch --to <H> --work-item <W> --subject "queued fixture" --brief "Handle this harmless queued fixture task." --key <unique>`.
+   Confirm B's prompt is queued. As O, run
+   `wake --session <H> --assignment <B> --replace-queued --class fyi --prompt "DRAFT <nonce>"`,
+   then run `wake --session <H> --assignment <B> --replace-queued --class blocker --prompt "CORRECTION <nonce>"`.
+4. While X is still running, have C send two ordinary `input-needed` wakes to H;
+   O send a `status-query` wake; the human user send an ordinary `fyi` wake; and
+   R file `attest <A> --kind verdict --verdict reviewed-clean`. Record every
+   source wake ID and read back its actual origin and class. The ruling must
+   notify A's opener H through the ordinary batchable route. The human wake is
+   an ordinary `fyi` message; do not use the separate `algedonic` human-channel
+   route for it. Before X ends, C cancels one of its pending sources with
+   `cancel-wake <wakeId>`.
+5. Use read-only SQLite inspection with `sqlite3 -readonly "$AREA_BASE/state.db"`
+   to compare each source in `wakes` (`wakeId`, `sessionKey`, `origin`,
+   `creatorSessionKey`, `assignmentId`, `class`, `state`, `prompt`) with
+   `notice_batch_members` (`sourceWakeId`, `batchId`, `publicationSeq`, `state`)
+   and `notice_batches` (`batchId`, `state`, `releaseCause`, `deliveryWakeId`);
+   read the batch `envelope` and also inspect `turns` (`seq`, `sessionKey`,
+   `status`, `wakeId`). Do not mutate the database.
 
-Before H's running turn ends, cancel one still-pending source with
-`cancel-wake <wakeId>` as that wake's original caller, then send its correction
-as a new wake with a class that changes its position in the priority order.
-With `sqlite3 -readonly "$AREA_BASE/state.db"`, read `wakes.wakeId`,
-`sessionKey`, `origin`, `creatorSessionKey`, `assignmentId`, `class`,
-`deliveryRule` and `state`; `notice_delivery_policies.sourceWakeId`, `enabled`
-and `deadlineAt`; `notice_batch_members.sourceWakeId`, `batchId`,
-`publicationSeq` and `state`, joined to its source `wakes.class`;
-`notice_batches.batchId`, `state`,
-`releaseCause` and `deliveryWakeId`; and `turns.seq`, `sessionKey`, `status`
-and `wakeId`. The original source remains canceled and auditable; every
-surviving or corrected source remains its own pending wake with its own origin
-and ID; no recipient batch membership or individual delivery turn is committed
-while H is busy. H's running turn is unchanged.
-
-After H's turn finishes, wait for that ready lane to form and deliver its
-batch. Require one next turn for the batch carrier, containing all surviving
-sources—including the human message and R's ruling—in class priority order.
-The delivered envelope and member rows retain each source's origin, class and
-wake ID. No source gets a separate turn. Use the materialized member order as
-the assertion (the seed order is `algedonic`, `blocker`, `input-needed`,
-`status-query`, `fyi`, then other classes; equal classes retain publication order).
-
-After H becomes idle again, send one first ordinary wake and read its source,
-batch and turn rows. It starts one delivery without waiting for a timed
-batching window. Keep the separate algedonic human-channel route intact; it is
-not folded into this ordinary recipient batch. This journey is part of the
-core-flow smoke before the initial Gibson install.
+   **Assert while X is running:** B's dispatch prompt and O's first replacement
+   remain auditable as superseded sources; O's correction is a distinct pending
+   row with class `blocker`; C's canceled source remains auditable and is
+   excluded from delivery; every other prompt remains an individual row with
+   its own source ID, origin and class. The correction reorders only O's
+   selected source ahead of `input-needed`, `status-query` and `fyi` in priority
+   order. This demonstrates that a queued source can be replaced, canceled or
+   reordered before readiness without changing the other source rows. No source
+   has batch membership or its own delivery turn yet, and X's running turn is
+   unchanged.
+6. After X ends, wait for the ready lane to deliver. **Assert:** exactly one
+   next turn is created for the carrier; its envelope has a visible marker for
+   each included source, with its ID, origin in `sender=`, cause in `cause=`,
+   and class; and surviving members appear in class priority order with
+   publication order within a class (`algedonic`, `blocker`, `input-needed`,
+   `status-query`, `fyi`, then other classes). This ordinary-message sample
+   excludes `algedonic`, whose human-channel route stays separate. Both the
+   human message and R's ruling are in the same carrier turn; neither starts a
+   separate turn, and the canceled source is absent.
+7. After the carrier turn finishes and H is idle, O sends one ordinary first
+   wake. **Assert:** it starts one delivery immediately, without waiting for a
+   timed batching window. This journey is part of the core-flow smoke before
+   the initial Gibson install.
 
 ## Queue correction
 
