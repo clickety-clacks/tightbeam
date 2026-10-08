@@ -4566,7 +4566,51 @@ defmodule Tightbeam.AssignmentsTest do
                [work_item.id]
              )
 
-    refute Wakes.rumination_exists?(ctx.db, work_item.id, "dispatcher")
+    # A prompt delivery can reach Gateway while the dispatcher is still running.
+    # It must retain this exact wake as an editable batch source, and a retry
+    # with the same wake ID must not insert a second source.
+    assert :queued =
+             Gateway.deliver_prompt(wake.session_key, wake.origin, wake.prompt,
+               db: ctx.db,
+               wake_id: wake.wake_id,
+               sender: wake.origin,
+               target_gate: wake
+             )
+
+    assert Wakes.rumination_exists?(ctx.db, work_item.id, "dispatcher")
+
+    assert {:ok, :staged} =
+             DB.transaction(ctx.db, fn txn ->
+               Wakes.rumination_status_in_txn(txn, work_item.id, "dispatcher")
+             end)
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE wakeId=?1 AND state='pending' AND firedAt IS NOT NULL",
+               [wake.wake_id]
+             )
+
+    assert :queued =
+             Gateway.deliver_prompt(wake.session_key, wake.origin, wake.prompt,
+               db: ctx.db,
+               wake_id: wake.wake_id,
+               sender: wake.origin,
+               target_gate: wake
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE rumination=1 AND work_item_id=?1 AND creatorSessionKey='dispatcher'",
+               [work_item.id]
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM turns WHERE sessionKey='dispatcher' AND status IN ('queued','running')"
+             )
 
     assert :ok =
              Ledger.finish(ctx.db, current_seq, "delivered", nil,
@@ -4575,6 +4619,9 @@ defmodule Tightbeam.AssignmentsTest do
 
     [carrier_id] = NoticeBatcher.recover(ctx.db, System.system_time(:millisecond) + 1_000)
     assert Wakes.rumination_exists?(ctx.db, work_item.id, "dispatcher")
+
+    assert [%{delivery_wake_id: ^carrier_id}] =
+             NoticeBatcher.source_refs(ctx.db, wake.wake_id)
 
     carrier = Wakes.get(ctx.db, carrier_id)
 
@@ -4590,6 +4637,11 @@ defmodule Tightbeam.AssignmentsTest do
                  target_gate: carrier,
                  fire_wake_in_txn: true
                )
+             end)
+
+    assert {:ok, :delivered} =
+             DB.transaction(ctx.db, fn txn ->
+               Wakes.rumination_status_in_txn(txn, work_item.id, "dispatcher")
              end)
 
     # F7 amendment: the re-dispatch persists workItemId exactly as assign does.

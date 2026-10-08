@@ -336,6 +336,46 @@ defmodule Tightbeam.Schema do
     SELECT RAISE(ABORT, 'supervision lineage wake requires controller sidecar');
   END
   """
+  @supervision_batch_delivery_previous_triggers [
+    {
+      "supervision_lineage_fire_requires_sidecar",
+      @supervision_batch_delivery_previous_trigger
+    },
+    {
+      "supervision_fired_lineage_sidecar_required_delete",
+      """
+      CREATE TRIGGER IF NOT EXISTS supervision_fired_lineage_sidecar_required_delete
+      BEFORE DELETE ON supervision_liveness_sidecar
+      WHEN EXISTS (
+        SELECT 1 FROM wakes w
+        WHERE w.wakeId = OLD.wakeId AND w.assignmentId = OLD.assignmentId
+          AND w.state = 'fired' AND w.consumer = 'prompt'
+          AND w.origin = 'process:tightbeam' AND w.reresolve = 'lineage'
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'fired supervision lineage sidecar is required');
+      END
+      """
+    },
+    {
+      "supervision_fired_lineage_sidecar_identity_immutable",
+      """
+      CREATE TRIGGER IF NOT EXISTS supervision_fired_lineage_sidecar_identity_immutable
+      BEFORE UPDATE OF wakeId, assignmentId, controllerOrigin, wakeKind, controllerState,
+                       chargedGeneration
+      ON supervision_liveness_sidecar
+      WHEN EXISTS (
+        SELECT 1 FROM wakes w
+        WHERE w.wakeId = OLD.wakeId AND w.assignmentId = OLD.assignmentId
+          AND w.state = 'fired' AND w.consumer = 'prompt'
+          AND w.origin = 'process:tightbeam' AND w.reresolve = 'lineage'
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'fired supervision lineage sidecar identity is immutable');
+      END
+      """
+    }
+  ]
   @admission_previous_shape "row-driven-coverage-v1-019"
   @admission_pre_liveness_previous_shape "row-driven-coverage-pre-liveness-v1-019"
   @row_driven_coverage_previous_shape "row-driven-waits-v1-019"
@@ -1589,7 +1629,7 @@ defmodule Tightbeam.Schema do
 
     case DB.transaction(db, fn txn ->
            :ok = Tightbeam.Escalation.ensure_terminal_parity_in_txn(txn, activated_at)
-           :ok = migrate_supervision_lineage_batch_fire_guard_in_txn(txn)
+           :ok = migrate_supervision_batch_delivery_guards_in_txn(txn)
            :ok = ensure_supervision_liveness_v1_in_txn(txn, activated_at)
 
            # Activation and its stamp commit together. A restart before this
@@ -2396,12 +2436,16 @@ defmodule Tightbeam.Schema do
     raise ShapeError, message: "incompatible_supervision_liveness_v1: #{detail}"
   end
 
-  defp migrate_supervision_lineage_batch_fire_guard_in_txn(%Txn{} = txn) do
-    expected =
-      Enum.find(@supervision_liveness_enforcement_objects, fn object ->
-        object.name == "supervision_lineage_fire_requires_sidecar"
-      end)
+  defp migrate_supervision_batch_delivery_guards_in_txn(%Txn{} = txn) do
+    Enum.each(@supervision_batch_delivery_previous_triggers, fn {name, previous_sql} ->
+      expected = Enum.find(@supervision_liveness_enforcement_objects, &(&1.name == name))
+      migrate_owned_liveness_trigger_in_txn(txn, expected, previous_sql)
+    end)
 
+    :ok
+  end
+
+  defp migrate_owned_liveness_trigger_in_txn(txn, expected, previous_sql) do
     case Txn.q(
            txn,
            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
@@ -2413,7 +2457,7 @@ defmodule Tightbeam.Schema do
       [[actual_sql]] when is_binary(actual_sql) ->
         current = normalize_schema_sql(expected.sql)
         actual = normalize_schema_sql(actual_sql)
-        previous = normalize_schema_sql(@supervision_batch_delivery_previous_trigger)
+        previous = normalize_schema_sql(previous_sql)
 
         cond do
           actual == current ->
@@ -2435,8 +2479,6 @@ defmodule Tightbeam.Schema do
           "malformed owned object #{expected.name}: #{inspect(rows)}"
         )
     end
-
-    :ok
   end
 
   @doc false
