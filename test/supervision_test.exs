@@ -1811,6 +1811,371 @@ defmodule Tightbeam.SupervisionTest do
     assert Wakes.list_pending(ctx.db) == []
   end
 
+  test "an unloaded identity leaves owner child prod unmarked", ctx do
+    enable_owner_open_child_prod!(ctx)
+    attach_work_item!(ctx.db, "asg_1", "wi_unloaded_owner")
+    reused = session(ctx.db, "unloaded-reused-seat", ctx.main.session_key)
+
+    delegated_assignment!(
+      ctx.db,
+      "asg_unloaded_child",
+      reused.session_key,
+      "child work",
+      1,
+      "holder"
+    )
+
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
+    seq = terminal!(ctx.db, "holder")
+
+    assert true = :persistent_term.erase(Tightbeam.Archetypes)
+
+    try do
+      assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq)
+
+      assert {:ok, [[0]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT count(*) FROM wakes WHERE wakeId LIKE 'w_owner_child_prod_%'"
+               )
+    after
+      Archetypes.load!(ctx.base)
+    end
+  end
+
+  test "marked owner filing an own effect keeps it and gets no no-filing prompt", ctx do
+    enable_owner_open_child_prod!(ctx)
+    attach_work_item!(ctx.db, "asg_1", "wi_owner_followup")
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 9_000_000_000)
+    insert_artifact!(ctx.db, "art_owner_effect", "holder", "wi_owner_followup", 9_000_000_001)
+
+    child = session(ctx.db, "owner-child", "holder")
+
+    delegated_assignment!(
+      ctx.db,
+      "asg_owner_child",
+      child.session_key,
+      "child work",
+      1,
+      "holder"
+    )
+
+    seq = terminal!(ctx.db, "holder")
+    assert :rebased = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq)
+
+    assert {:ok, [["artifact", "art_owner_effect"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sourceKind,sourceId FROM supervision_liveness_receipts WHERE assignmentId='asg_1'"
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM wakes WHERE wakeId LIKE 'w_owner_child_prod_%'"
+             )
+  end
+
+  test "marked owner with an own pending wake gets no child prod", ctx do
+    enable_owner_open_child_prod!(ctx)
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
+    child = session(ctx.db, "wake-child", "holder")
+
+    delegated_assignment!(
+      ctx.db,
+      "asg_wake_child",
+      child.session_key,
+      "child work",
+      1,
+      "holder"
+    )
+
+    own_wake =
+      Wakes.schedule(ctx.db, %{
+        session_key: "holder",
+        target_role: nil,
+        origin: "user:flynn",
+        prompt: "I will check my children later",
+        due_at: System.system_time(:millisecond),
+        creator_session_key: "holder"
+      })
+
+    seq = terminal!(ctx.db, "holder")
+
+    assert :owner_child_continuation =
+             Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq)
+
+    assert %{state: "pending"} = Wakes.get(ctx.db, own_wake.wake_id)
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM wakes WHERE wakeId LIKE 'w_owner_child_prod_%'"
+             )
+  end
+
+  test "marked owner does not get a child prompt before the no-filing deadline", ctx do
+    enable_owner_open_child_prod!(ctx)
+
+    insert_entitlement!(
+      ctx.db,
+      "asg_1",
+      generation: 1,
+      due_at: System.system_time(:millisecond) + 60_000
+    )
+
+    reused = session(ctx.db, "not-due-reused-seat", ctx.main.session_key)
+
+    delegated_assignment!(
+      ctx.db,
+      "asg_not_due_child",
+      reused.session_key,
+      "child work",
+      1,
+      "holder"
+    )
+
+    seq = terminal!(ctx.db, "holder")
+    assert :not_due = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq)
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM wakes WHERE wakeId LIKE 'w_owner_child_prod_%'"
+             )
+  end
+
+  test "marked owner with no open child assignment uses the ordinary prod", ctx do
+    enable_owner_open_child_prod!(ctx)
+
+    # A child can hold work that a different session delegated. The marker
+    # follows only assignments opened by this owner session.
+    unrelated_child = session(ctx.db, "unrelated-child", "holder")
+    unrelated_owner = session(ctx.db, "unrelated-owner", ctx.main.session_key)
+    ensure_work_item!(ctx.db, "wi_unrelated_child")
+
+    delegated_assignment!(
+      ctx.db,
+      "asg_unrelated_child",
+      unrelated_child.session_key,
+      "unrelated",
+      1,
+      unrelated_owner.session_key,
+      "wi_unrelated_child"
+    )
+
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
+    seq = terminal!(ctx.db, "holder")
+
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq)
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM wakes WHERE wakeId LIKE 'w_owner_child_prod_%'"
+             )
+  end
+
+  test "marked owner skips periodic prod ladder while children remain open", ctx do
+    enable_owner_open_child_prod!(ctx)
+    attach_work_item!(ctx.db, "asg_1", "wi_periodic_owner")
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
+    child = session(ctx.db, "periodic-child", "holder")
+
+    delegated_assignment!(
+      ctx.db,
+      "asg_periodic_child",
+      child.session_key,
+      "child work",
+      1,
+      "holder"
+    )
+
+    liveness = start_liveness!(ctx, sweep_ms: 60_000)
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM wakes WHERE assignmentId='asg_1' AND origin='process:tightbeam'"
+             )
+
+    seq = terminal!(ctx.db, "holder")
+    assert :owner_child_prompted = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq)
+
+    sweep_liveness!(liveness)
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM wakes WHERE wakeId LIKE 'w_owner_child_prod_%'"
+             )
+
+    next_seq = terminal!(ctx.db, "holder")
+
+    assert :owner_child_prompted =
+             Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", next_seq)
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM wakes WHERE wakeId LIKE 'w_owner_child_prod_%'"
+             )
+  end
+
+  test "marked owner gets one prod per missing-self-wake lapse across delegated items", ctx do
+    enable_owner_open_child_prod!(ctx)
+    attach_work_item!(ctx.db, "asg_1", "wi_owner_turn")
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
+
+    # A reused seat outside the owner's parent tree is still work the owner
+    # explicitly delegated on another work item.
+    reused = session(ctx.db, "owner-reused-seat", ctx.main.session_key)
+    ensure_work_item!(ctx.db, "wi_owner_delegated")
+
+    delegated_assignment!(
+      ctx.db,
+      "asg_owner_delegated_elsewhere",
+      reused.session_key,
+      "delegated item",
+      1,
+      "holder",
+      "wi_owner_delegated"
+    )
+
+    first_seq = terminal!(ctx.db, "holder")
+
+    assert :owner_child_prompted =
+             Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", first_seq)
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM wakes WHERE wakeId LIKE 'w_owner_child_prod_%'"
+             )
+
+    repeated_seq = terminal!(ctx.db, "holder")
+
+    assert :owner_child_prompted =
+             Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", repeated_seq)
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM wakes WHERE wakeId LIKE 'w_owner_child_prod_%'"
+             )
+
+    self_wake =
+      Wakes.schedule(ctx.db, %{
+        session_key: "holder",
+        target_role: nil,
+        origin: "user:flynn",
+        prompt: "I will check all delegated work",
+        due_at: System.system_time(:millisecond),
+        creator_session_key: "holder"
+      })
+
+    while_armed_seq = terminal!(ctx.db, "holder")
+
+    assert :owner_child_continuation =
+             Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", while_armed_seq)
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE wakes SET state='fired',firedAt=1 WHERE wakeId=?1 AND state='pending'",
+               [self_wake.wake_id]
+             )
+
+    after_wake_seq = terminal!(ctx.db, "holder")
+
+    assert :owner_child_prompted =
+             Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", after_wake_seq)
+
+    assert {:ok, [[2]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM wakes WHERE wakeId LIKE 'w_owner_child_prod_%'"
+             )
+
+    same_lapse_seq = terminal!(ctx.db, "holder")
+
+    assert :owner_child_prompted =
+             Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", same_lapse_seq)
+
+    assert {:ok, [[2]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM wakes WHERE wakeId LIKE 'w_owner_child_prod_%'"
+             )
+  end
+
+  test "marked owner counts another-item delegation, not unrelated child-held work", ctx do
+    enable_owner_open_child_prod!(ctx)
+    attach_work_item!(ctx.db, "asg_1", "wi_owner_current")
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
+
+    reused = session(ctx.db, "owner-other-item-seat", ctx.main.session_key)
+    ensure_work_item!(ctx.db, "wi_owner_other")
+
+    delegated_assignment!(
+      ctx.db,
+      "asg_owner_other_item",
+      reused.session_key,
+      "other item work",
+      1,
+      "holder",
+      "wi_owner_other"
+    )
+
+    unrelated_child = session(ctx.db, "owner-unrelated-child", "holder")
+    unrelated_owner = session(ctx.db, "owner-unrelated-delegator", ctx.main.session_key)
+    ensure_work_item!(ctx.db, "wi_owner_unrelated")
+
+    delegated_assignment!(
+      ctx.db,
+      "asg_owner_unrelated_child",
+      unrelated_child.session_key,
+      "unrelated child work",
+      1,
+      unrelated_owner.session_key,
+      "wi_owner_unrelated"
+    )
+
+    seq = terminal!(ctx.db, "holder")
+
+    assert :owner_child_prompted = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq)
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM wakes WHERE wakeId LIKE 'w_owner_child_prod_%'"
+             )
+  end
+
+  test "unmarked worker keeps the ordinary prod with an open child assignment", ctx do
+    child = session(ctx.db, "worker-child", "holder")
+
+    delegated_assignment!(
+      ctx.db,
+      "asg_worker_child",
+      child.session_key,
+      "child work",
+      1,
+      "holder"
+    )
+
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
+    seq = terminal!(ctx.db, "holder")
+
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq)
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM wakes WHERE wakeId LIKE 'w_owner_child_prod_%'"
+             )
+  end
+
   test "one bounded assignment checkpoint resets; repeats need a later effect", ctx do
     attach_work_item!(ctx.db, "asg_1", "wi_checkpoint")
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0, interval: 60_000)
@@ -5396,6 +5761,25 @@ defmodule Tightbeam.SupervisionTest do
       )
   end
 
+  defp delegated_assignment!(
+         db,
+         id,
+         holder,
+         subject,
+         opened_at,
+         owner_session,
+         work_item_id \\ nil
+       ) do
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO assignments (id, subject, holderKey, openedBySession, openedAt, workItemId) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        [id, subject, holder, owner_session, opened_at, work_item_id]
+      )
+
+    :ok
+  end
+
   defp attach_work_item!(db, assignment_id, work_item_id) do
     ensure_work_item!(db, work_item_id)
 
@@ -5404,6 +5788,34 @@ defmodule Tightbeam.SupervisionTest do
         assignment_id,
         work_item_id
       ])
+
+    :ok
+  end
+
+  defp enable_owner_open_child_prod!(ctx) do
+    archetype_dir = Path.join(ctx.base, "identity/archetypes")
+    File.mkdir_p!(archetype_dir)
+    manifest = Path.join(archetype_dir, "pdo.toml")
+
+    File.write!(manifest, "name = \"pdo\"\nowner_open_child_prod = false\n")
+    Archetypes.load!(ctx.base)
+
+    {:ok, _} = DB.query(ctx.db, "UPDATE sessions SET archetype='pdo' WHERE sessionKey='holder'")
+
+    {:ok, [session_identity_before]} =
+      DB.query(
+        ctx.db,
+        "SELECT archetype,identityRevision,identityGuidanceDigest FROM sessions WHERE sessionKey='holder'"
+      )
+
+    File.write!(manifest, "name = \"pdo\"\nowner_open_child_prod = true\n")
+    Archetypes.load!(ctx.base)
+
+    {:ok, [^session_identity_before]} =
+      DB.query(
+        ctx.db,
+        "SELECT archetype,identityRevision,identityGuidanceDigest FROM sessions WHERE sessionKey='holder'"
+      )
 
     :ok
   end

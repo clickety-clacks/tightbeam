@@ -20,6 +20,7 @@ config :tightbeam,
        Path.join(suite_tmp, "app")
 
 config :tightbeam, :autostart, false
+config :tightbeam, :effort_checkins_enabled, true
 config :tightbeam, :local_host_name, "testhost"
 config :tightbeam, :fixture_harness, true
 config :tightbeam, :test_suite_tmp, suite_tmp

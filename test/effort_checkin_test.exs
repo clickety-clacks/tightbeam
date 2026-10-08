@@ -75,6 +75,7 @@ defmodule Tightbeam.EffortCheckinTest do
       base_dir: base_dir,
       port: 4_321,
       effort_checkin_horizon_ms: 10,
+      effort_checkins_enabled: true,
       cwd: base_dir,
       default_harness: :claude,
       default_model: Model.new("claude-fable-5"),
@@ -89,6 +90,78 @@ defmodule Tightbeam.EffortCheckinTest do
     init_workspace(root)
 
     %{db: db, base_dir: base_dir, config: config, parent: parent, holder: holder, root: root}
+  end
+
+  test "assignment opt-out retains the code and schema without arming a generation", ctx do
+    disabled = %{ctx | config: Map.put(ctx.config, :effort_checkins_enabled, false)}
+    assigned = assignment(disabled, "assign", {:user, "h1"}, "holder", %{subject: "no check-in"})
+
+    assert is_binary(assigned.id)
+
+    assert rows(ctx.db, "SELECT count(*) FROM effort_checkin_generations WHERE assignmentId=?1", [
+             assigned.id
+           ]) == [[0]]
+
+    assert {:ok, columns} = DB.query(ctx.db, "PRAGMA table_info(effort_checkin_generations)")
+    assert "assignmentId" in Enum.map(columns, &Enum.at(&1, 1))
+  end
+
+  test "turning effort check-ins off leaves already-armed rows and requests inert", ctx do
+    enabled = %{ctx | config: Map.put(ctx.config, :effort_checkins_enabled, true)}
+
+    assigned =
+      assignment(enabled, "dispatch", {:session, "parent"}, "holder", %{
+        subject: "armed before opt-out",
+        brief: "armed before opt-out"
+      })
+
+    first_wake = current_wake(ctx.db, assigned.id)
+    disabled_config = Map.put(ctx.config, :effort_checkins_enabled, false)
+
+    assert :ok = EffortCheckin.probe(ctx.db, disabled_config, first_wake)
+
+    assert [[1, "armed", first_wake_id]] =
+             rows(
+               ctx.db,
+               "SELECT generation,state,wakeId FROM effort_checkin_generations WHERE assignmentId=?1",
+               [assigned.id]
+             )
+
+    assert first_wake_id == first_wake.wake_id
+    assert rows(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE kind='effort'", []) == [[0]]
+    assert prods(ctx.db, "holder") == []
+
+    assert nil == fire_probe(enabled, assigned.id)
+    open_request = fire_probe(enabled, assigned.id)
+    assert open_request.status == "open"
+    request_deadline = Wakes.get(ctx.db, open_request.deadline_wake_id)
+
+    assert :ok = EffortCheckin.deadline(ctx.db, disabled_config, request_deadline)
+
+    assert request(ctx.db, open_request.id).status == "open"
+
+    assert %{code: "disabled", message: "effort check-ins are disabled"} =
+             EffortCheckin.rule(
+               ctx.db,
+               disabled_config,
+               effort_call(open_request.id, "continue", {:session, "parent"})
+             )
+
+    assert request(ctx.db, open_request.id).status == "open"
+    assert [prod] = prods(ctx.db, "holder")
+    assert prod.assignment_id == assigned.id
+
+    assert rows(
+             ctx.db,
+             "SELECT generation,state FROM effort_checkin_generations WHERE assignmentId=?1 ORDER BY generation",
+             [assigned.id]
+           ) == [[1, "probed"], [2, "probed"]]
+
+    assert rows(
+             ctx.db,
+             "SELECT wakeId FROM wakes WHERE consumer='effort_deadline' AND assignmentId=?1",
+             [assigned.id]
+           ) == [[open_request.deadline_wake_id]]
   end
 
   test "a new effort request follows corrected coordination while preserving its opener", ctx do

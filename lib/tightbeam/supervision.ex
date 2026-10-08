@@ -131,6 +131,7 @@ defmodule Tightbeam.Supervision do
   """
 
   @failure_threshold 6
+  @owner_child_prod_prompt "You have open child assignments. Arm one wake for yourself to check on your children; check them all in that turn, and re-arm it."
   @idle_cleanup_prefix "idle-cleanup-v1:"
   @idle_cleanup_default_horizon_ms 14_400_000
   @idle_cleanup_default_priority 4
@@ -1384,6 +1385,8 @@ defmodule Tightbeam.Supervision do
           | :coalesced
           | :rebased
           | :not_due
+          | :owner_child_prompted
+          | :owner_child_continuation
           | {:prodded, pos_integer()}
           | {:escalated, pos_integer(), String.t()}
           | :terminus
@@ -1952,6 +1955,36 @@ defmodule Tightbeam.Supervision do
        ) do
     evaluation_clock = now()
 
+    case owner_child_followup(db, session_key, terminal_seq, assignment, evaluation_clock) do
+      :not_applicable ->
+        terminal_prod_ladder_normal(
+          db,
+          handlers,
+          n,
+          session_key,
+          terminal_seq,
+          assignment,
+          replacement_interval,
+          rail_allowed?,
+          evaluation_clock
+        )
+
+      result ->
+        result
+    end
+  end
+
+  defp terminal_prod_ladder_normal(
+         db,
+         handlers,
+         n,
+         session_key,
+         terminal_seq,
+         assignment,
+         replacement_interval,
+         rail_allowed?,
+         evaluation_clock
+       ) do
     outcome =
       transaction!(db, fn txn ->
         case Txn.q(
@@ -2119,6 +2152,175 @@ defmodule Tightbeam.Supervision do
       :duplicate ->
         :duplicate
     end
+  end
+
+  defp owner_child_followup(db, session_key, terminal_seq, assignment, evaluation_clock) do
+    transaction!(db, fn txn ->
+      if owner_child_prod_active_in_txn?(txn, session_key) and
+           owner_child_prod_due_in_txn?(txn, assignment.id, evaluation_clock) do
+        case Txn.q(
+               txn,
+               "SELECT lastEvaluatedTerminal FROM supervision_watermarks WHERE sessionKey=?1 AND assignmentId=?2",
+               [session_key, assignment.id]
+             ) do
+          [[prior]] when is_integer(prior) and prior == terminal_seq ->
+            :duplicate
+
+          [[prior]] when is_integer(prior) and prior > terminal_seq ->
+            :coalesced
+
+          _ ->
+            write_terminal_watermark_in_txn(txn, session_key, terminal_seq, assignment.id)
+
+            case absorb_owner_liveness_receipts_in_txn(txn, assignment.id) do
+              :rebased ->
+                :rebased
+
+              _ ->
+                cond do
+                  owner_self_wake_pending_in_txn?(txn, session_key) ->
+                    :owner_child_continuation
+
+                  true ->
+                    case owner_child_prod_lapse_in_txn(txn, session_key) do
+                      :already_prompted ->
+                        :owner_child_prompted
+
+                      {:eligible, lapse_key} ->
+                        wake_id = owner_child_prod_wake_id(session_key, lapse_key)
+
+                        [[work_item_id]] =
+                          Txn.q(txn, "SELECT workItemId FROM assignments WHERE id=?1", [
+                            assignment.id
+                          ])
+
+                        Wakes.schedule_in_txn(txn, %{
+                          wake_id: wake_id,
+                          session_key: session_key,
+                          target_role: nil,
+                          origin: "process:tightbeam",
+                          prompt: @owner_child_prod_prompt,
+                          due_at: evaluation_clock,
+                          creator_session_key: nil,
+                          work_item_id: work_item_id,
+                          assignment_id: assignment.id
+                        })
+
+                        :owner_child_prompted
+                    end
+                end
+            end
+        end
+      else
+        :not_applicable
+      end
+    end)
+  end
+
+  defp owner_child_prod_lapse_in_txn(txn, session_key) do
+    latest_prompt =
+      Txn.q(
+        txn,
+        "SELECT rowid FROM wakes WHERE sessionKey=?1 AND origin='process:tightbeam' AND prompt=?2 ORDER BY rowid DESC LIMIT 1",
+        [session_key, @owner_child_prod_prompt]
+      )
+
+    latest_self_wake =
+      Txn.q(
+        txn,
+        "SELECT rowid,wakeId FROM wakes WHERE sessionKey=?1 AND creatorSessionKey=?1 AND consumer='prompt' ORDER BY rowid DESC LIMIT 1",
+        [session_key]
+      )
+
+    case {latest_prompt, latest_self_wake} do
+      {[], []} ->
+        {:eligible, "initial"}
+
+      {[], [[_rowid, wake_id]]} ->
+        {:eligible, wake_id}
+
+      {[[prompt_rowid]], [[self_rowid, wake_id]]} when self_rowid > prompt_rowid ->
+        {:eligible, wake_id}
+
+      _ ->
+        :already_prompted
+    end
+  end
+
+  defp owner_child_prod_due_in_txn?(txn, assignment_id, evaluation_clock) do
+    Txn.q(
+      txn,
+      "SELECT 1 FROM supervision_entitlements WHERE assignmentId=?1 AND state='armed' AND dueAt<=?2 LIMIT 1",
+      [assignment_id, evaluation_clock]
+    ) != []
+  end
+
+  defp absorb_owner_liveness_receipts_in_txn(txn, assignment_id) do
+    case Txn.q(
+           txn,
+           "SELECT supervisionIntervalMs FROM supervision_entitlements WHERE assignmentId=?1 AND state IN ('armed','claimed')",
+           [assignment_id]
+         ) do
+      [[interval]] when is_integer(interval) and interval > 0 ->
+        absorb_liveness_receipts_in_txn(txn, assignment_id, interval)
+
+      _ ->
+        :duplicate
+    end
+  end
+
+  defp owner_child_prod_active_in_txn?(txn, session_key) do
+    case Txn.q(txn, "SELECT archetype FROM sessions WHERE sessionKey=?1", [session_key]) do
+      [[archetype]] ->
+        owner_open_child_prod_enabled?(archetype) and
+          owner_has_open_child_assignment_in_txn?(txn, session_key)
+
+      [] ->
+        false
+    end
+  end
+
+  defp owner_open_child_prod_enabled?(archetype_name) do
+    case Archetypes.get(archetype_name) do
+      %{owner_open_child_prod: true} -> true
+      _ -> false
+    end
+  rescue
+    # Missing served archetypes are unmarked by default.
+    ArgumentError -> false
+  end
+
+  defp owner_has_open_child_assignment_in_txn?(txn, session_key) do
+    Txn.q(
+      txn,
+      """
+      SELECT 1 FROM assignments
+      WHERE openedBySession=?1 AND holderKey<>?1 AND state='open'
+      LIMIT 1
+      """,
+      [session_key]
+    ) != []
+  end
+
+  defp owner_self_wake_pending_in_txn?(txn, session_key) do
+    Txn.q(
+      txn,
+      """
+      SELECT 1 FROM wakes
+      WHERE state='pending' AND consumer='prompt'
+        AND sessionKey=?1 AND creatorSessionKey=?1
+      LIMIT 1
+      """,
+      [session_key]
+    ) != []
+  end
+
+  defp owner_child_prod_wake_id(session_key, lapse_key) do
+    digest =
+      :crypto.hash(:sha256, "owner-open-child-prod-v2\0" <> session_key <> "\0" <> lapse_key)
+      |> Base.encode16(case: :lower)
+
+    "w_owner_child_prod_" <> digest
   end
 
   defp write_terminal_watermark_in_txn(_txn, _session_key, nil, _assignment_id), do: :ok
@@ -3329,11 +3531,9 @@ defmodule Tightbeam.Supervision do
     evaluation_clock = now()
 
     [[holder, work_item_id]] =
-      Txn.q(
-        txn,
-        "SELECT holderKey, workItemId FROM assignments WHERE id=?1 AND state='open'",
-        [assignment_id]
-      )
+      Txn.q(txn, "SELECT holderKey, workItemId FROM assignments WHERE id=?1 AND state='open'", [
+        assignment_id
+      ])
 
     [[artifact_cursor, attest_cursor, event_cursor, wake_cursor]] =
       Txn.q(
@@ -3667,6 +3867,12 @@ defmodule Tightbeam.Supervision do
       _acc ->
         cond do
           MapSet.member?(rebased, assignment_id) ->
+            {:cont, :not_due}
+
+          owner_child_prod_active_in_txn?(txn, holder) ->
+            # Marked owners get one turn-end continuation prompt for open child
+            # work. Periodic deadline sweeps must not restart the worker prod
+            # ladder while that owner is supervising children.
             {:cont, :not_due}
 
           due_gate?(txn, assignment_id, holder) ->

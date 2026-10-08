@@ -159,21 +159,37 @@ defmodule Tightbeam.EffortCheckin do
 
   def valid_workdir_root(_), do: invalid_root()
 
-  @doc "Capture an arm baseline without holding the DB transaction."
-  @spec prepare_arm(map(), map(), String.t() | nil) :: map()
-  def prepare_arm(config, session, workdir_root \\ nil) do
-    root = root_path(config, session, workdir_root)
-
-    %{
-      session_key: session.session_key,
-      host: session.host,
-      root: root,
-      baseline: observe(config, session, root)
-    }
+  @doc false
+  @spec enabled?(map()) :: boolean()
+  def enabled?(config) do
+    Map.get(
+      config,
+      :effort_checkins_enabled,
+      Application.get_env(:tightbeam, :effort_checkins_enabled, false)
+    ) == true
   end
 
-  @spec arm_in_txn(Txn.t(), map(), map(), map()) :: map()
+  @doc "Capture an arm baseline without holding the DB transaction."
+  @spec prepare_arm(map(), map(), String.t() | nil) :: map() | nil
+  def prepare_arm(config, session, workdir_root \\ nil) do
+    if enabled?(config) do
+      root = root_path(config, session, workdir_root)
+
+      %{
+        session_key: session.session_key,
+        host: session.host,
+        root: root,
+        baseline: observe(config, session, root)
+      }
+    end
+  end
+
+  @spec arm_in_txn(Txn.t(), map(), map(), map()) :: map() | :ok
   def arm_in_txn(%Txn{} = txn, config, assignment, prepared) do
+    if enabled?(config), do: arm_prepared_in_txn(txn, config, assignment, prepared), else: :ok
+  end
+
+  defp arm_prepared_in_txn(%Txn{} = txn, config, assignment, prepared) do
     session = session_in_txn(txn, assignment.holderKey)
 
     {root, baseline} =
@@ -197,8 +213,12 @@ defmodule Tightbeam.EffortCheckin do
   end
 
   @doc "Arm an assignment that has no dispatch-time workspace preparation."
-  @spec arm_in_txn(Txn.t(), map(), map()) :: map()
+  @spec arm_in_txn(Txn.t(), map(), map()) :: map() | :ok
   def arm_in_txn(%Txn{} = txn, config, assignment) do
+    if enabled?(config), do: arm_unprepared_in_txn(txn, config, assignment), else: :ok
+  end
+
+  defp arm_unprepared_in_txn(%Txn{} = txn, config, assignment) do
     session = session_in_txn(txn, assignment.holderKey)
     root = unobserved_root(config, session)
 
@@ -225,6 +245,10 @@ defmodule Tightbeam.EffortCheckin do
   @doc "Capture a fresh workspace baseline before reopening a monitored assignment."
   @spec prepare_reopen_arm(DB.server(), map(), String.t()) :: map() | nil
   def prepare_reopen_arm(db, config, assignment_id) do
+    if enabled?(config), do: prepare_reopen_arm_enabled(db, config, assignment_id), else: nil
+  end
+
+  defp prepare_reopen_arm_enabled(db, config, assignment_id) do
     case generation_for_assignment(db, assignment_id, :current) do
       nil ->
         nil
@@ -257,6 +281,12 @@ defmodule Tightbeam.EffortCheckin do
   @doc "Capture monitored assignments on a holder against a destination placement."
   @spec prepare_holder_rearms(DB.server(), map(), map()) :: [map()]
   def prepare_holder_rearms(db, config, destination_session) do
+    if enabled?(config),
+      do: prepare_holder_rearms_enabled(db, config, destination_session),
+      else: []
+  end
+
+  defp prepare_holder_rearms_enabled(db, config, destination_session) do
     {:ok, rows} =
       DB.query(
         db,
@@ -290,6 +320,12 @@ defmodule Tightbeam.EffortCheckin do
   @doc "Capture selected monitored assignments against a new holder."
   @spec prepare_transferred_rearms(DB.server(), map(), map(), [String.t()]) :: [map()]
   def prepare_transferred_rearms(db, config, destination_session, assignment_ids) do
+    if enabled?(config),
+      do: prepare_transferred_rearms_enabled(db, config, destination_session, assignment_ids),
+      else: []
+  end
+
+  defp prepare_transferred_rearms_enabled(db, config, destination_session, assignment_ids) do
     Enum.flat_map(assignment_ids, fn assignment_id ->
       case generation_for_assignment(db, assignment_id, :current) do
         nil ->
@@ -431,36 +467,44 @@ defmodule Tightbeam.EffortCheckin do
 
   @spec probe(DB.server(), map(), Wakes.wake()) :: :ok
   def probe(db, config, wake) do
-    snapshot = generation_for_wake(db, wake.wake_id)
+    if enabled?(config) do
+      snapshot = generation_for_wake(db, wake.wake_id)
 
-    # Only an ARMED generation is observed: an observation consumes the stamp it
-    # probed and lays the next one, so replaying a probe against an already
-    # probed generation would destroy the stamp its row still points at.
-    inspection =
-      case snapshot do
-        %{state: "armed"} = generation ->
-          observe(
-            config,
-            %{session_key: generation.holder_key, host: generation.host},
-            generation.root,
-            generation.baseline
-          )
+      # Only an ARMED generation is observed: an observation consumes the stamp it
+      # probed and lays the next one, so replaying a probe against an already
+      # probed generation would destroy the stamp its row still points at.
+      inspection =
+        case snapshot do
+          %{state: "armed"} = generation ->
+            observe(
+              config,
+              %{session_key: generation.holder_key, host: generation.host},
+              generation.root,
+              generation.baseline
+            )
 
-        _ ->
-          {:error, "generation unavailable"}
+          _ ->
+            {:error, "generation unavailable"}
+        end
+
+      case DB.transaction(db, fn txn -> probe_in_txn(txn, config, wake, inspection) end) do
+        {:ok, _request} -> :ok
+        {:error, error} -> raise error
       end
-
-    case DB.transaction(db, fn txn -> probe_in_txn(txn, config, wake, inspection) end) do
-      {:ok, _request} -> :ok
-      {:error, error} -> raise error
+    else
+      :ok
     end
   end
 
   @spec deadline(DB.server(), map(), Wakes.wake()) :: :ok
   def deadline(db, config, wake) do
-    case DB.transaction(db, fn txn -> deadline_in_txn(txn, config, wake) end) do
-      {:ok, _request} -> :ok
-      {:error, error} -> raise error
+    if enabled?(config) do
+      case DB.transaction(db, fn txn -> deadline_in_txn(txn, config, wake) end) do
+        {:ok, _request} -> :ok
+        {:error, error} -> raise error
+      end
+    else
+      :ok
     end
   end
 
@@ -486,6 +530,9 @@ defmodule Tightbeam.EffortCheckin do
 
       not authorized?(call.principal, request) ->
         error("not_authorized", "current expecter required")
+
+      not enabled?(config) ->
+        error("disabled", "effort check-ins are disabled")
 
       request.status == "ruled" and request.decision == action and request.ruled_by == actor ->
         {:ok, :ok} =
