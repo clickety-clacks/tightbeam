@@ -3012,7 +3012,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert Process.alive?(adapter)
   end
 
-  test "Claude none status is confirmed against a fresh subscription before terminalizing" do
+  test "the first Claude logged-out status after a fresh subscription bank is nonterminal" do
     owner = self()
 
     base =
@@ -3026,27 +3026,27 @@ defmodule Tightbeam.Acp.AdapterTest do
     metadata_dir = Path.join(home, ".tightbeam")
     File.mkdir_p!(metadata_dir)
 
-    access_token = "subscription-access-fixture"
-    refresh_token = "refresh-token-fixture"
-
     File.write!(
       Path.join(home, ".credentials.json"),
       JSON.encode!(%{
         "claudeAiOauth" => %{
-          "accessToken" => access_token,
-          "refreshToken" => refresh_token,
+          "accessToken" => "subscription-access-fixture",
+          "refreshToken" => "refresh-token-fixture",
           "expiresAt" => System.system_time(:millisecond) + 600_000
         }
       })
     )
 
+    credential_metadata_path = Path.join(metadata_dir, "credential.json")
+
     File.write!(
-      Path.join(metadata_dir, "credential.json"),
+      credential_metadata_path,
       JSON.encode!(%{
         "provider" => "anthropic",
         "onboarded" => true,
         "terminal" => false,
         "kind" => "subscription",
+        "onboarded_at_ms" => System.system_time(:millisecond),
         "last_health" => "onboarded"
       })
     )
@@ -3058,19 +3058,12 @@ defmodule Tightbeam.Acp.AdapterTest do
     Tightbeam.Rails.load!(base)
     start_supervised!({Task.Supervisor, name: Tightbeam.TurnTaskSupervisor})
 
-    response = start_supervised!({Agent, fn -> 200 end})
-
     sh = fn
-      ["node", "--no-warnings", "-e", script | _args] = argv ->
-        if String.contains?(script, "https://api.anthropic.com/v1/models?limit=1") do
-          status = Agent.get(response, & &1)
-          send(owner, {:claude_auth_confirmation, status, argv})
-          {JSON.encode!(%{status: status, headers: %{}, body: "{}"}), 0}
-        else
-          {"", 0}
+      argv ->
+        if Enum.any?(argv, &String.contains?(&1, "api.anthropic.com")) do
+          send(owner, {:unexpected_provider_probe, argv})
         end
 
-      _argv ->
         {"", 0}
     end
 
@@ -3118,30 +3111,40 @@ defmodule Tightbeam.Acp.AdapterTest do
     none = %{"authStatus" => %{"kind" => "none"}}
     send(adapter, {:acp_notification, "_auth/status_update", none})
 
-    assert_receive {:claude_auth_confirmation, 200, argv}
-    script = Enum.at(argv, 3)
-    assert script =~ "expiresAt"
-    assert script =~ "Date.now() + 60000"
-    refute Enum.join(argv, " ") =~ access_token
-    refute Enum.join(argv, " ") =~ refresh_token
+    assert eventually(fn ->
+             credential_metadata_path
+             |> File.read!()
+             |> JSON.decode!()
+             |> Map.get("initial_auth_none_ignored") == true
+           end)
+
     refute_receive :claude_credential_parked, 100
+    refute_receive {:unexpected_provider_probe, _argv}, 0
     assert Tightbeam.Credentials.status(:anthropic, credential_owner) == :onboarded
 
-    Agent.update(response, fn _ -> 0 end)
+    assert {:ok, [[0]]} =
+             Tightbeam.DB.query(
+               db,
+               "SELECT COUNT(*) FROM harness_health_observations WHERE failureClass='auth-dead'"
+             )
+
+    # A later logged-out status remains terminal; the one-shot fresh-bank guard
+    # does not turn off legitimate revocation handling.
     send(adapter, {:acp_notification, "_auth/status_update", none})
-
-    assert_receive {:claude_auth_confirmation, 0, _argv}
-    refute_receive :claude_credential_parked, 100
-    assert Tightbeam.Credentials.status(:anthropic, credential_owner) == :onboarded
-
-    Agent.update(response, fn _ -> 401 end)
-    send(adapter, {:acp_notification, "_auth/status_update", none})
-
-    assert_receive {:claude_auth_confirmation, 401, _argv}
     assert_receive :claude_credential_parked
 
     assert Tightbeam.Credentials.status(:anthropic, credential_owner) ==
              {:needs_onboarding, :revoked}
+
+    assert eventually(fn ->
+             case Tightbeam.DB.query(
+                    db,
+                    "SELECT COUNT(*) FROM harness_health_observations WHERE failureClass='auth-dead'"
+                  ) do
+               {:ok, [[1]]} -> true
+               _ -> false
+             end
+           end)
 
     assert Process.alive?(adapter)
   end

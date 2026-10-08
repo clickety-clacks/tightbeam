@@ -237,6 +237,7 @@ defmodule Tightbeam.CredentialKindsTest do
         |> JSON.decode!()
 
       assert metadata["kind"] == "subscription"
+      assert is_integer(metadata["onboarded_at_ms"])
       refute Map.has_key?(metadata, "expires_at")
       assert metadata["subscription_status"] == "supported"
       assert Credentials.kind(:anthropic, server) == :subscription
@@ -1165,35 +1166,6 @@ defmodule Tightbeam.CredentialKindsTest do
       # disk inside the script, on the host that owns it.
       assert "x-api-key" in command
       refute Enum.any?(command, &(&1 == "Bearer "))
-    end
-
-    test "a stale subscription access token stays inconclusive until catalog renewal", ctx do
-      home = Path.join(ctx.base, "expired-subscription-home")
-      File.mkdir_p!(home)
-
-      File.write!(
-        Path.join(home, ".credentials.json"),
-        ~s({"claudeAiOauth":{"accessToken":"expired-access","refreshToken":"refresh-fixture","expiresAt":0}})
-      )
-
-      transport = fn _target, %{command: ["node", "--no-warnings", "-e", script | args]} ->
-        mock_fetch =
-          "global.fetch = async () => { throw new Error('unexpected provider call'); };"
-
-        {output, 0} = System.cmd("node", ["--no-warnings", "-e", mock_fetch <> script | args])
-        decoded = JSON.decode!(output)
-        {:ok, %{status: decoded["status"], headers: decoded["headers"], body: decoded["body"]}}
-      end
-
-      assert {:unknown, {:http_status, 0}} =
-               Claude.credential_live?(
-                 %{host_config: %{ssh: nil}, sh: fn _ -> {"", 0} end},
-                 home,
-                 transport: transport,
-                 timeout_ms: 5_000,
-                 credential_kind: :subscription,
-                 require_fresh_access_token: true
-               )
     end
 
     defp fixture_transport(name) do

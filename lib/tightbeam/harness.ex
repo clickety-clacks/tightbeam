@@ -113,9 +113,6 @@ defmodule Tightbeam.Harness do
               {:ok, %{bin: String.t(), version: String.t()}}
               | {:error, :not_found | {:exec_failed, String.t()} | launch_refusal()}
   @callback classify_auth_event(map()) :: :terminal | :transient | :unknown
-  @doc "Optionally confirm a terminal adapter status against the provider before persisting it."
-  @callback confirm_terminal_auth_event(target(), map()) ::
-              :terminal | :transient | :unknown | :not_checked
   @callback classify_subagent_event(map()) ::
               {:subagent_start | :subagent_stop, map()} | :skip
   @callback fetch_catalog(map()) :: {:ok, [map()]} | {:error, term()}
@@ -127,8 +124,7 @@ defmodule Tightbeam.Harness do
                       warm_home: 2,
                       local_client_model_authority?: 1,
                       project_session_identity: 3,
-                      verify_session_identity_hook: 2,
-                      confirm_terminal_auth_event: 2
+                      verify_session_identity_hook: 2
 
   @spec preflight_launch(module(), target(), String.t(), keyword()) :: preflight_result()
   def preflight_launch(module, target, home, opts) do
