@@ -3416,7 +3416,7 @@ defmodule Tightbeam.Assignments do
           Txn.q(txn, "SELECT 1 FROM sessions WHERE sessionKey=?1", [recipient]) == [[1]]
       end
 
-    if recipient_exists? and recipient != attest.bySession do
+    if recipient_exists? and not same_attest_principal_as_opener?(assignment, attest) do
       Wakes.schedule_in_txn(txn, %{
         session_key: recipient,
         origin: attest_notice_origin(attest),
@@ -3430,6 +3430,22 @@ defmodule Tightbeam.Assignments do
       :ok
     end
   end
+
+  defp same_attest_principal_as_opener?(
+         %{openedByUser: opener, openedBySession: nil},
+         %{byUser: opener, bySession: nil}
+       )
+       when is_binary(opener),
+       do: true
+
+  defp same_attest_principal_as_opener?(
+         %{openedByUser: nil, openedBySession: opener},
+         %{byUser: nil, bySession: opener}
+       )
+       when is_binary(opener),
+       do: true
+
+  defp same_attest_principal_as_opener?(_assignment, _attest), do: false
 
   defp attest_notice_origin(%{bySession: session}) when is_binary(session),
     do: "agent:" <> session

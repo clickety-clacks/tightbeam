@@ -37,8 +37,9 @@ Do not repeat their CRUD lifecycles in smoke.
 ## Notice batching (Fresh / online)
 
 Run this journey by hand on a disposable area with O (an agent sender), H (the
-recipient), C (a second agent sender), R (a reviewer), and a human user. Do not
-write a helper script or edit queue rows.
+recipient), C (a second agent sender), R (a reviewer), and a human user. Use
+the normal `dispatch`, `wake`, `attest`, and chat-post routes. Do not write a
+helper script or edit queue rows.
 
 1. Create work item W. As O, open a harmless producer assignment P for H with
    `assign --session <H> --work-item <W> --subject "producer fixture"`. While H
@@ -49,46 +50,51 @@ write a helper script or edit queue rows.
    Wait until X's turn is actually running; record its sequence and assignment.
    If it ends before the queued observations below, record the missed
    prerequisite and retry the hand-run journey.
-3. While X runs, O dispatches a second bounded task B to H with
+3. While X is running, O dispatches a second bounded task B to H with
    `dispatch --to <H> --work-item <W> --subject "queued fixture" --brief "Handle this harmless queued fixture task." --key <unique>`.
-   Confirm B's prompt is queued. As O, run
+   Confirm B remains an individual pending source row and has no delivery
+   turn. As O, run
    `wake --session <H> --assignment <B> --replace-queued --class fyi --prompt "DRAFT <nonce>"`,
    then run `wake --session <H> --assignment <B> --replace-queued --class blocker --prompt "CORRECTION <nonce>"`.
 4. While X is still running, have C send two ordinary `input-needed` wakes to H;
-   O send a `status-query` wake; the human user send an ordinary `fyi` wake; and
-   R file `attest <A> --kind verdict --verdict reviewed-clean`. Record every
-   source wake ID and read back its actual origin and class. The ruling must
-   notify A's opener H through the ordinary batchable route. The human wake is
-   an ordinary `fyi` message; do not use the separate `algedonic` human-channel
-   route for it. Before X ends, C cancels one of its pending sources with
-   `cancel-wake <wakeId>`.
+   O send a `status-query` wake; and C schedule a timed `input-needed` wake with
+   `wake --session <H> --after 5s --class input-needed --prompt "TIMED <nonce>"`.
+   Wait for its due time while X remains running. The human user posts an
+   ordinary chat message with one harmless attachment, and R files
+   `attest <A> --kind verdict --verdict reviewed-clean`. Record every source
+   wake ID and read back its actual origin and class. The ruling must notify
+   A's opener H through the ordinary batchable route. Do not send the human
+   message as a `wake` or use the separate `algedonic` human-channel route.
+   Before X ends, C cancels one pending source with `cancel-wake <wakeId>`.
 5. Use read-only SQLite inspection with `sqlite3 -readonly "$AREA_BASE/state.db"`
    to compare each source in `wakes` (`wakeId`, `sessionKey`, `origin`,
    `creatorSessionKey`, `assignmentId`, `class`, `state`, `prompt`) with
    `notice_batch_members` (`sourceWakeId`, `batchId`, `publicationSeq`, `state`)
    and `notice_batches` (`batchId`, `state`, `releaseCause`, `deliveryWakeId`);
-   read the batch `envelope` and also inspect `turns` (`seq`, `sessionKey`,
-   `status`, `wakeId`). Do not mutate the database.
+   inspect `notice_batch_source_attachments`, read the batch `envelope`, and
+   inspect `turns` (`seq`, `sessionKey`, `status`, `wakeId`). Do not mutate the
+   database.
 
    **Assert while X is running:** B's dispatch prompt and O's first replacement
    remain auditable as superseded sources; O's correction is a distinct pending
    row with class `blocker`; C's canceled source remains auditable and is
    excluded from delivery; every other prompt remains an individual row with
-   its own source ID, origin and class. The correction reorders only O's
-   selected source ahead of `input-needed`, `status-query` and `fyi` in priority
-   order. This demonstrates that a queued source can be replaced, canceled or
-   reordered before readiness without changing the other source rows. No source
-   has batch membership or its own delivery turn yet, and X's running turn is
-   unchanged.
+   its own source ID, origin and class. No second queued turn exists beside X;
+   every next-turn prompt is in this one editable source queue. The correction
+   moves only O's selected source ahead of `input-needed`, `status-query` and
+   `fyi` by class priority. This demonstrates that a source can be replaced,
+   canceled or reordered before readiness without changing other source rows.
+   No source has batch membership or its own delivery turn yet, and X's running
+   turn is unchanged.
 6. After X ends, wait for the ready lane to deliver. **Assert:** exactly one
    next turn is created for the carrier; its envelope has a visible marker for
    each included source, with its ID, origin in `sender=`, cause in `cause=`,
    and class; and surviving members appear in class priority order with
-   publication order within a class (`algedonic`, `blocker`, `input-needed`,
-   `status-query`, `fyi`, then other classes). This ordinary-message sample
-   excludes `algedonic`, whose human-channel route stays separate. Both the
-   human message and R's ruling are in the same carrier turn; neither starts a
-   separate turn, and the canceled source is absent.
+   publication order within a class (`blocker`, `input-needed`, `status-query`,
+   `fyi`, then other classes). The human post, its attachment, and R's ruling
+   are in the same carrier turn; none starts a separate turn, and the canceled
+   source is absent. The attachment payload is carried with its source and is
+   present on the delivered carrier message.
 7. After the carrier turn finishes and H is idle, O sends one ordinary first
    wake. **Assert:** it starts one delivery immediately, without waiting for a
    timed batching window. This journey is part of the core-flow smoke before
@@ -108,49 +114,48 @@ While A's turn is running:
 
 1. O uses `dispatch --to <H> --work-item <W> --subject <fixture>
    --brief "INITIAL <nonce>" --key <unique>` to open assignment B. Confirm
-   its initial prompt is still queued. C sends the ordinary control
+   its initial prompt is one pending editable source row with no delivery
+   turn. C sends the ordinary control
    `wake --session <H> --prompt "CONTROL <nonce>: reply with this nonce"`,
-   without `--assignment`. Require exactly these two queued turns and record
-   their source IDs, enqueue times and origins. Read the telemetry queue
-   summary for B now if selected: only INITIAL is attributed to B, so that
-   summary counts one turn, excluding C's unbound control.
+   without `--assignment`. Require exactly these two individual pending source
+   rows, no new queued turns, and record their source IDs, publication order,
+   classes and origins.
 2. O sends `wake --session <H> --assignment <B> --replace-queued
-   --prompt "CORRECTION <nonce>: reply with this nonce"`. Read H's turn
-   records: B's INITIAL dispatch is canceled with
-   `queued-message-suppressed: sender_requested_replacement`; C's ordinary
-   control stays queued. An ordinary wake is not replacement consent.
-   Read the `queued_message_suppressed` audit and retain the original message
-   contents/IDs. A's running turn remains running.
+   --prompt "CORRECTION <nonce>: reply with this nonce"`. Read source and
+   cancellation records: B's INITIAL source is canceled with reason
+   `sender_requested_replacement`; C's ordinary control remains pending. An
+   ordinary wake is not replacement consent. Retain the original prompt and
+   source IDs. A's running turn remains running.
 3. O sends a newer correction using the same B-bound `--replace-queued`
-   command and a new nonce. Require the prior replacement-consenting
-   correction to be canceled and C's control to remain queued. Let A's bounded
-   task finish and the two surviving messages drain once in recorded order:
-   C's control, then the newest correction. Preserve that earlier queue
-   position; do not demand that a correction overtake another sender.
+   command and a new nonce. Require the prior replacement-consenting source to
+   be canceled and C's control to remain pending. Let A's bounded task finish.
+   **Assert:** C's control and the newest correction form one carrier turn in
+   priority order, with publication order preserved within their class. Both
+   source rows remain individually auditable; neither got its own turn.
 4. Still in H, O dispatches one bounded harmless task on a new assignment D
-   under W. Observe its initial dispatch turn running and attributed to D.
-   A replacement wake scopes suppression but does not stamp its turn with an
-   assignment; it cannot supply this attributed running-turn prerequisite.
-   With no surviving control ahead of it, O sends
+   under W. Observe its immediate first turn running and attributed to D.
+   A replacement wake does not stamp a turn with an assignment and cannot
+   supply this attributed running-turn prerequisite. With no other source
+   ahead of it, O sends
    `wake --session <H> --assignment <D> --replace-queued
    --prompt "OLDER <nonce>"`, then another such `--replace-queued` wake with
    the final correction and a fresh nonce. Require OLDER canceled and the
-   final correction queued. Both correction wakes explicitly consent to
+   final correction pending as a source row. Both correction wakes explicitly consent to
    replacement; do not use an ordinary wake for OLDER.
    As a non-opener, try `assignment-stop-turn <D> --reason <fixture reason>`;
    require `not_authorized` and no change. As O, run that stop once. Its result
    names D, H, the exact current `turnSeq` and `acpCancel`. That turn becomes
    `canceled`; its lifecycle event records cause `assignment-opener-stop`.
    The `assignment_turn_stopped` lifecycle event records O's actor and exact
-   reason. The final queued correction is unchanged by the stop.
+   reason. The final pending correction source is unchanged by the stop.
 5. Require that final correction to run next and produce its nonce reply in H.
    Tie its wake ID to D through `queued_message_replacement_requests` and D
-   to W through the assignment record; do not claim automatic turn attribution
-   from a replacement request. All suppressed INITIAL, OLDER and
-   replaced correction messages remain readable but never execute. C's
-   previously preserved control has exactly one delivered turn. Record the
-   actual sequences and terminal results, not only accepted wakes. The second
-   bounded window isolates stop/resume ordering without discarding C's message.
+   to W through the assignment record; do not claim automatic assignment turn
+   attribution from a replacement request. All suppressed INITIAL, OLDER and
+   replaced correction sources remain readable but never execute. C's
+   preserved control appears once in its carrier. Record the actual sequences
+   and terminal results, not only accepted wakes. The second bounded window
+   isolates stop/resume ordering without discarding C's message.
    Dispose all three fixture assignments with recorded reasons after the checks.
 
 The decisions stop row cites this result. `test/queued_message_suppression_test.exs`

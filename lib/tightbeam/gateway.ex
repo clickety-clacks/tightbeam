@@ -2120,6 +2120,8 @@ defmodule Tightbeam.Gateway do
   end
 
   defp deliver_prompt_once_in_txn(txn, session_key, origin, prompt, opts) do
+    opts = delivery_attachments_in_txn(txn, opts)
+
     stamped =
       case opts[:sender] do
         sender when is_binary(sender) -> "[from #{sender}]\n\n" <> prompt
@@ -2190,18 +2192,86 @@ defmodule Tightbeam.Gateway do
   end
 
   defp stage_for_queue?(txn, target, opts) do
-    Keyword.get(opts, :queue_when_busy, false) and
-      Keyword.get(opts, :attachments, []) in [nil, []] and
+    not batch_carrier_wake?(txn, opts[:wake_id]) and
       NoticeBatcher.queued_sources_ready_in_txn?(txn, target, opts[:role_ref])
   end
 
-  defp stage_prompt_in_txn(txn, target, origin, prompt, opts, role_ref) do
-    case staged_message_dedupe_in_txn(txn, target, prompt, opts) do
-      :new ->
-        insert_staged_prompt_in_txn(txn, target, origin, prompt, opts, role_ref)
+  defp batch_carrier_wake?(_txn, wake_id) when not is_binary(wake_id), do: false
 
-      duplicate_or_conflict ->
-        duplicate_or_conflict
+  defp batch_carrier_wake?(txn, wake_id) do
+    DB.Txn.q(txn, "SELECT digest FROM wakes WHERE wakeId=?1", [wake_id]) == [[1]]
+  end
+
+  defp delivery_attachments_in_txn(txn, opts) do
+    case opts[:wake_id] do
+      wake_id when is_binary(wake_id) ->
+        if batch_carrier_wake?(txn, wake_id) do
+          Keyword.put(
+            opts,
+            :attachments,
+            NoticeBatcher.delivery_attachments_in_txn(txn, wake_id)
+          )
+        else
+          Keyword.put_new(
+            opts,
+            :attachments,
+            NoticeBatcher.delivery_attachments_in_txn(txn, wake_id)
+          )
+        end
+
+      _ ->
+        opts
+    end
+  end
+
+  defp stage_prompt_in_txn(txn, target, origin, prompt, opts, role_ref) do
+    case existing_staged_source_in_txn(txn, target, prompt, opts[:wake_id]) do
+      {:ok, wake} ->
+        {:staged, wake}
+
+      :none ->
+        case staged_message_dedupe_in_txn(txn, target, prompt, opts) do
+          :new ->
+            insert_staged_prompt_in_txn(txn, target, origin, prompt, opts, role_ref)
+
+          duplicate_or_conflict ->
+            duplicate_or_conflict
+        end
+    end
+  end
+
+  defp existing_staged_source_in_txn(_txn, _target, _prompt, wake_id)
+       when not is_binary(wake_id),
+       do: :none
+
+  defp existing_staged_source_in_txn(txn, target, prompt, wake_id) do
+    case DB.Txn.q(
+           txn,
+           "SELECT wakeId,sessionKey,origin,prompt,class,deliveryRule,state,consumer,digest FROM wakes WHERE wakeId=?1",
+           [wake_id]
+         ) do
+      [[^wake_id, ^target, origin, ^prompt, class, delivery_rule, "pending", "prompt", 0]] ->
+        if delivery_rule == Wakes.digest_rule() and
+             DB.Txn.q(
+               txn,
+               "SELECT 1 FROM notice_delivery_policies WHERE sourceWakeId=?1 AND enabled=1",
+               [wake_id]
+             ) == [[1]] do
+          {:ok,
+           %{
+             wake_id: wake_id,
+             session_key: target,
+             origin: origin,
+             prompt: prompt,
+             class: class
+           }}
+        else
+          raise DB.Error,
+            message: "busy prompt source #{wake_id} has no active batch delivery policy"
+        end
+
+      _ ->
+        :none
     end
   end
 
@@ -2245,20 +2315,33 @@ defmodule Tightbeam.Gateway do
            client_message_id != "",
          do: staged_message_sha256(prompt)
 
-    wake =
-      Wakes.schedule_in_txn(txn, %{
-        session_key: target,
-        target_role: role_ref,
-        origin: origin,
-        creator_session_key: creator_session_key,
-        prompt: prompt,
-        due_at: System.system_time(:millisecond),
-        class: opts[:class],
-        assignment_id: opts[:assignment_id],
-        work_item_id: opts[:job_ref],
-        target_gate: staged_prompt_target_gate(opts[:target_gate]),
-        replacement_assignment_id: opts[:replacement_assignment_id]
-      })
+    wake_input = %{
+      session_key: target,
+      target_role: role_ref,
+      origin: origin,
+      creator_session_key: creator_session_key,
+      prompt: prompt,
+      due_at: System.system_time(:millisecond),
+      class: opts[:class],
+      assignment_id: opts[:assignment_id],
+      work_item_id: opts[:job_ref],
+      target_gate: staged_prompt_target_gate(opts[:target_gate]),
+      replacement_assignment_id: opts[:replacement_assignment_id]
+    }
+
+    wake_input =
+      case opts[:wake_id] do
+        wake_id when is_binary(wake_id) -> Map.put(wake_input, :wake_id, wake_id)
+        _ -> wake_input
+      end
+
+    wake = Wakes.schedule_in_txn(txn, wake_input)
+
+    NoticeBatcher.persist_source_attachments_in_txn(
+      txn,
+      wake.wake_id,
+      Keyword.get(opts, :attachments, []) || []
+    )
 
     if is_binary(device_id) and device_id != "" and is_binary(client_message_id) and
          client_message_id != "" and is_binary(payload_sha256) do
@@ -2327,7 +2410,17 @@ defmodule Tightbeam.Gateway do
             |> case do
               wake_id when is_binary(wake_id) ->
                 NoticeBatcher.carrier_source_ids_in_txn(txn, wake_id)
-                |> Enum.each(&Wakes.batch_source_delivered_in_txn(txn, &1, target))
+                |> Enum.each(fn source_wake_id ->
+                  Supervision.batch_source_delivered_in_txn(
+                    txn,
+                    source_wake_id,
+                    target,
+                    seq
+                  )
+
+                  Wakes.batch_source_delivered_in_txn(txn, source_wake_id, target)
+                  HarnessHealth.batch_source_delivered_in_txn(txn, source_wake_id, seq)
+                end)
 
               _ ->
                 :ok

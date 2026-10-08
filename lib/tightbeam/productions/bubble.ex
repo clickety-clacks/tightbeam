@@ -327,12 +327,36 @@ defmodule Tightbeam.Productions.Bubble do
   end
 
   defp patrol_coverage(db, request_ref) do
-    {:ok, rows} =
+    {:ok, turn_rows} =
       DB.query(
         db,
         "SELECT sessionKey, status FROM turns WHERE requestRef=?1 ORDER BY seq",
         [request_ref]
       )
+
+    {:ok, source_rows} =
+      DB.query(
+        db,
+        """
+        SELECT source.sessionKey,
+               CASE
+                 WHEN turn.status IS NOT NULL THEN turn.status
+                 WHEN source.state='pending' THEN 'queued'
+                 ELSE source.state
+               END
+        FROM wakes source
+        LEFT JOIN notice_batch_members member
+          ON member.sourceWakeId=source.wakeId AND member.state='included'
+        LEFT JOIN notice_batches batch ON batch.batchId=member.batchId
+        LEFT JOIN turns turn ON turn.wakeId=batch.deliveryWakeId
+        WHERE substr(source.wakeId,1,length(?1)+1)=?1 || ':'
+          AND source.state IN ('pending','fired')
+        ORDER BY source.createdAt,source.wakeId
+        """,
+        [request_ref]
+      )
+
+    rows = turn_rows ++ source_rows
 
     cond do
       Enum.any?(rows, fn [_session, status] -> status == "delivered" end) ->

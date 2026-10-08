@@ -1106,6 +1106,68 @@ defmodule Tightbeam.Supervision do
 
   def transition_in_txn(%Txn{}, _observation), do: :duplicate
 
+  @doc false
+  def prepare_batch_source_in_txn(%Txn{} = txn, wake_id) when is_binary(wake_id) do
+    case Txn.q(
+           txn,
+           """
+           SELECT s.assignmentId, w.sessionKey
+           FROM supervision_liveness_sidecar s
+           JOIN wakes w ON w.wakeId=s.wakeId
+           WHERE s.wakeId=?1 AND s.controllerOrigin='scheduled'
+             AND s.controllerState='pending'
+           """,
+           [wake_id]
+         ) do
+      [[assignment_id, target]] ->
+        case transition_in_txn(txn, %{
+               kind: "controller_fire",
+               wake_id: wake_id,
+               assignment_id: assignment_id,
+               target_session_key: target
+             }) do
+          {:admit, _wake_kind} -> :ready
+          :canceled -> :stale
+        end
+
+      [] ->
+        :ready
+    end
+  end
+
+  @doc false
+  def batch_source_delivered_in_txn(%Txn{} = txn, wake_id, target, turn_seq)
+      when is_binary(wake_id) and is_binary(target) and is_integer(turn_seq) and turn_seq > 0 do
+    case Txn.q(
+           txn,
+           """
+           SELECT assignmentId
+           FROM supervision_liveness_sidecar
+           WHERE wakeId=?1 AND controllerOrigin='scheduled' AND controllerState='pending'
+           """,
+           [wake_id]
+         ) do
+      [[assignment_id]] ->
+        case transition_in_txn(txn, %{
+               kind: "controller_fire",
+               wake_id: wake_id,
+               assignment_id: assignment_id,
+               target_session_key: target,
+               turn_seq: turn_seq
+             }) do
+          {:admit, _wake_kind} ->
+            :ok
+
+          :canceled ->
+            raise DB.Error,
+              message: "supervision source #{wake_id} became stale after its batch was sealed"
+        end
+
+      [] ->
+        :ok
+    end
+  end
+
   defp cancel_rebased_controller_in_txn(txn, wake_id, assignment_id) do
     case Txn.q(
            txn,
@@ -5188,6 +5250,20 @@ defmodule Tightbeam.Supervision do
         WHERE t.assignmentId=?1 AND w.assignmentId=?1
           AND (?2 IS NULL OR t.seq=?2)
           AND (w.reresolve='lineage' OR s.wakeKind='escalation')
+        UNION ALL
+        SELECT t.seq, t.sessionKey, source.assignmentId,
+               source.wakeId, source.state, source.assignmentId, source.origin,
+               source.createdAt, source.firedAt, source.reresolve, source.reresolveSeed,
+               source.reresolveRung, sidecar.assignmentId, sidecar.controllerOrigin,
+               sidecar.wakeKind, sidecar.controllerState, sidecar.chargedGeneration,
+               sidecar.transferEvidenceId
+        FROM turns t
+        JOIN notice_batches b ON b.deliveryWakeId=t.wakeId
+        JOIN notice_batch_members m ON m.batchId=b.batchId AND m.state='included'
+        JOIN wakes source ON source.wakeId=m.sourceWakeId
+        LEFT JOIN supervision_liveness_sidecar sidecar ON sidecar.wakeId=source.wakeId
+        WHERE source.assignmentId=?1 AND (?2 IS NULL OR t.seq=?2)
+          AND (source.reresolve='lineage' OR sidecar.wakeKind='escalation')
         ORDER BY t.seq
         """,
         [assignment_id, requested_turn_seq]
@@ -5413,6 +5489,20 @@ defmodule Tightbeam.Supervision do
       LEFT JOIN supervision_liveness_sidecar s ON s.wakeId=w.wakeId
       WHERE t.assignmentId=?1 AND w.assignmentId=?1
         AND (w.reresolve='lineage' OR s.wakeKind='escalation')
+      UNION ALL
+      SELECT t.seq, t.sessionKey, source.assignmentId,
+             source.wakeId, source.state, source.assignmentId, source.origin,
+             source.createdAt, source.firedAt, source.reresolve, source.reresolveSeed,
+             source.reresolveRung, sidecar.assignmentId, sidecar.controllerOrigin,
+             sidecar.wakeKind, sidecar.controllerState, sidecar.chargedGeneration,
+             sidecar.transferEvidenceId
+      FROM turns t
+      JOIN notice_batches b ON b.deliveryWakeId=t.wakeId
+      JOIN notice_batch_members m ON m.batchId=b.batchId AND m.state='included'
+      JOIN wakes source ON source.wakeId=m.sourceWakeId
+      LEFT JOIN supervision_liveness_sidecar sidecar ON sidecar.wakeId=source.wakeId
+      WHERE source.assignmentId=?1
+        AND (source.reresolve='lineage' OR sidecar.wakeKind='escalation')
       ORDER BY t.seq
       """,
       [assignment_id]
@@ -5503,6 +5593,7 @@ defmodule Tightbeam.Supervision do
             candidate.reresolve_rung
           ),
         due_at: activation_epoch,
+        class: "fyi",
         assignment_id: assignment_id,
         reresolve: "lineage",
         reresolve_seed: candidate.reresolve_seed,
@@ -5520,29 +5611,19 @@ defmodule Tightbeam.Supervision do
       [wake.wake_id, assignment_id]
     )
 
-    case Gateway.deliver_prompt_in_txn(
-           txn,
-           target,
-           wake.origin,
-           wake.prompt,
-           wake_id: wake.wake_id,
-           sender: wake.origin,
-           fire_wake_in_txn: true,
-           assignment_id: assignment_id
-         ) do
-      {:appended, ^target, _message, _opts} ->
-        :ok
+    delivery =
+      Gateway.deliver_prompt_in_txn(
+        txn,
+        target,
+        wake.origin,
+        wake.prompt,
+        wake_id: wake.wake_id,
+        sender: wake.origin,
+        fire_wake_in_txn: true,
+        assignment_id: assignment_id
+      )
 
-      other ->
-        legacy_refusal!(
-          assignment_id,
-          "legacy_parent_successor_conflict delivery=#{inspect(other)}",
-          candidate
-        )
-    end
-
-    [[turn_seq]] = Txn.q(txn, "SELECT seq FROM turns WHERE wakeId=?1", [wake.wake_id])
-    outcome_id = "#{assignment_id}##{turn_seq}"
+    outcome_id = retirement_outcome_id_in_txn(txn, assignment_id, target, wake.wake_id, delivery)
 
     store_legacy_retirement_outcome_in_txn(
       txn,
@@ -5623,6 +5704,30 @@ defmodule Tightbeam.Supervision do
     end
   end
 
+  defp retirement_outcome_id_in_txn(txn, assignment_id, target, wake_id, delivery) do
+    case delivery do
+      {:appended, ^target, _message, _opts} ->
+        case Txn.q(txn, "SELECT seq FROM turns WHERE wakeId=?1 ORDER BY seq DESC LIMIT 1", [
+               wake_id
+             ]) do
+          [[turn_seq]] -> "#{assignment_id}##{turn_seq}"
+          [] -> legacy_refusal!(assignment_id, "retirement_outcome_turn_missing")
+        end
+
+      {:duplicate, %{turn_seq: turn_seq}} when is_integer(turn_seq) ->
+        "#{assignment_id}##{turn_seq}"
+
+      {:staged, %{wake_id: source_wake_id}} when is_binary(source_wake_id) ->
+        "#{assignment_id}#source:#{source_wake_id}"
+
+      other ->
+        legacy_refusal!(
+          assignment_id,
+          "retirement_delivery_refused delivery=#{inspect(other)}"
+        )
+    end
+  end
+
   defp legacy_refusal!(assignment_id, detail, candidate \\ nil) do
     suffix =
       if is_map(candidate) do
@@ -5638,6 +5743,15 @@ defmodule Tightbeam.Supervision do
     if candidate.sidecar_assignment_id == assignment_id and
          candidate.controller_state == "settled" and candidate.wake_kind == "escalation" and
          is_nil(candidate.charged_generation) do
+      batch_source_outcome_id = "#{assignment_id}#source:#{candidate.wake_id}"
+
+      predecessor_outcome_id =
+        if retirement_source_in_carrier?(db_or_txn, candidate.turn_seq, candidate.wake_id) do
+          batch_source_outcome_id
+        else
+          evidence_id
+        end
+
       predecessors =
         query(
           db_or_txn,
@@ -5648,7 +5762,7 @@ defmodule Tightbeam.Supervision do
           FROM supervision_liveness_sidecar
           WHERE retirementOutcomeId=?1 AND wakeId<>?2
           """,
-          [evidence_id, candidate.wake_id]
+          [predecessor_outcome_id, candidate.wake_id]
         )
 
       case predecessors do
@@ -5657,6 +5771,7 @@ defmodule Tightbeam.Supervision do
             db_or_txn,
             assignment_id,
             evidence_id,
+            predecessor_outcome_id,
             candidate,
             predecessor
           )
@@ -5669,10 +5784,26 @@ defmodule Tightbeam.Supervision do
     end
   end
 
+  defp retirement_source_in_carrier?(db_or_txn, turn_seq, source_wake_id) do
+    query(
+      db_or_txn,
+      """
+      SELECT 1
+      FROM turns t
+      JOIN notice_batches b ON b.deliveryWakeId=t.wakeId
+      JOIN notice_batch_members m ON m.batchId=b.batchId AND m.state='included'
+      WHERE t.seq=?1 AND m.sourceWakeId=?2
+      LIMIT 1
+      """,
+      [turn_seq, source_wake_id]
+    ) != []
+  end
+
   defp validate_retirement_predecessor(
          db_or_txn,
          assignment_id,
          evidence_id,
+         expected_outcome_id,
          candidate,
          [
            _source_wake_id,
@@ -5690,7 +5821,7 @@ defmodule Tightbeam.Supervision do
     owner_main = assignment_owner_main(db_or_txn, assignment_id)
 
     shared? =
-      predecessor_outcome_id == evidence_id and invalidated_evidence_id != evidence_id and
+      predecessor_outcome_id == expected_outcome_id and invalidated_evidence_id != evidence_id and
         is_integer(epoch) and epoch >= 0 and target == candidate.session_key
 
     runtime? =
@@ -5710,7 +5841,7 @@ defmodule Tightbeam.Supervision do
          principal: principal,
          retirement_epoch: epoch,
          retirement_outcome_kind: outcome_kind,
-         retirement_outcome_id: evidence_id,
+         retirement_outcome_id: expected_outcome_id,
          action_needed: action_needed == 1
        }}
     else
@@ -5879,6 +6010,7 @@ defmodule Tightbeam.Supervision do
               transfer.reresolve_rung
             ),
           due_at: retirement_epoch,
+          class: "fyi",
           assignment_id: assignment_id,
           reresolve: "lineage",
           reresolve_seed: transfer.reresolve_seed,
@@ -5896,25 +6028,20 @@ defmodule Tightbeam.Supervision do
         [wake.wake_id, assignment_id]
       )
 
-      case Gateway.deliver_prompt_in_txn(
-             txn,
-             target,
-             wake.origin,
-             wake.prompt,
-             wake_id: wake.wake_id,
-             sender: wake.origin,
-             fire_wake_in_txn: true,
-             assignment_id: assignment_id
-           ) do
-        {:appended, ^target, _message, _opts} ->
-          :ok
+      delivery =
+        Gateway.deliver_prompt_in_txn(
+          txn,
+          target,
+          wake.origin,
+          wake.prompt,
+          wake_id: wake.wake_id,
+          sender: wake.origin,
+          fire_wake_in_txn: true,
+          assignment_id: assignment_id
+        )
 
-        other ->
-          raise "incompatible_supervision_liveness_v1: retirement delivery #{inspect(other)}"
-      end
-
-      [[turn_seq]] = Txn.q(txn, "SELECT seq FROM turns WHERE wakeId=?1", [wake.wake_id])
-      outcome_id = "#{assignment_id}##{turn_seq}"
+      outcome_id =
+        retirement_outcome_id_in_txn(txn, assignment_id, target, wake.wake_id, delivery)
 
       store_retirement_outcome_in_txn(
         txn,

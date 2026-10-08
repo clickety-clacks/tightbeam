@@ -66,6 +66,24 @@ defmodule Tightbeam.AssignmentsTest do
                )
     end
 
+    test "a user opener does not receive its own attest notice", ctx do
+      assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "self-opened by user"))
+
+      result =
+        attest_call({:user, "flynn"}, assignment.id, "verdict")
+        |> put_in([:params, :verdict_kind], "self-reviewed")
+        |> then(&handle(ctx, "attest", &1))
+
+      assert result.attest.byUser == "flynn"
+
+      assert {:ok, [[0]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND prompt LIKE 'Attest %'",
+                 [assignment.id]
+               )
+    end
+
     test "session-opened cards retain one batchable source row for each new attest", ctx do
       session(ctx.db, "notice-parent", "flynn")
 
@@ -379,7 +397,7 @@ defmodule Tightbeam.AssignmentsTest do
     refute Map.has_key?(no_hint, :fact_hint)
   end
 
-  test "dispatch into a busy holder stays an editable source and opener replacement cancels it",
+  test "dispatch into a running holder stays in the editable source queue and opener replacement cancels it",
        ctx do
     session(ctx.db, "dispatch-opener", "flynn")
 
@@ -402,6 +420,8 @@ defmodule Tightbeam.AssignmentsTest do
         prompt: "already queued work"
       })
 
+    assert {:ok, %{seq: ^busy_turn}} = Ledger.claim_next(ctx.db, "holder", "batching-test")
+
     dispatch =
       dispatch_call({:session, "dispatch-opener"}, "queued assignment", "INITIAL prompt")
 
@@ -417,7 +437,14 @@ defmodule Tightbeam.AssignmentsTest do
                [assignment.id]
              )
 
-    assert {:ok, [[^busy_turn]]} =
+    assert {:ok, [["running"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT status FROM turns WHERE seq=?1",
+               [busy_turn]
+             )
+
+    assert {:ok, []} =
              DB.query(
                ctx.db,
                "SELECT seq FROM turns WHERE sessionKey='holder' AND status='queued'"

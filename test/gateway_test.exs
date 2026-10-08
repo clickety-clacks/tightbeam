@@ -641,14 +641,28 @@ defmodule Tightbeam.GatewayTest do
   end
 
   test "a busy post remains a deduplicated editable source until the recipient is ready", ctx do
-    assert :appended =
-             Gateway.deliver_prompt("k1", "session:k1", "current queued work",
-               db: ctx.db,
-               conn_registry: ctx.registry,
-               lane_manager: Tightbeam.LaneManager
-             )
+    {:appended, current_message} =
+      Tightbeam.Projection.append(ctx.db, %{
+        session_key: "k1",
+        role: "user",
+        content: "current running work",
+        sender: "session:k1"
+      })
+
+    {:ok, current_seq} =
+      Tightbeam.Ledger.enqueue(ctx.db, %{
+        session_key: "k1",
+        message_id: current_message.id,
+        origin: "session:k1",
+        prompt: "current running work"
+      })
+
+    assert {:ok, %{seq: ^current_seq, owner_lease: lease}} =
+             Tightbeam.Ledger.claim_next(ctx.db, "k1", "post-batch-test")
 
     post = Gateway.handlers(%{db: ctx.db})["post"]
+
+    attachment = %{"type" => "image", "name" => "diagram.png", "url" => "attachment://diagram"}
 
     call = %{
       session_key: "k1",
@@ -657,7 +671,7 @@ defmodule Tightbeam.GatewayTest do
         content: "queued human message",
         device_id: "post-device",
         client_message_id: "post-queued-1",
-        attachments: []
+        attachments: [attachment]
       }
     }
 
@@ -668,6 +682,21 @@ defmodule Tightbeam.GatewayTest do
                ctx.db,
                "SELECT wakeId,state,prompt,class FROM wakes WHERE prompt='queued human message'"
              )
+
+    assert {:ok, [[encoded_attachments]]} =
+             DB.query(
+               ctx.db,
+               "SELECT attachments FROM notice_batch_source_attachments WHERE sourceWakeId=?1",
+               [source_wake_id]
+             )
+
+    assert JSON.decode!(encoded_attachments) == [attachment]
+
+    assert {:ok, [["running"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [current_seq])
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "SELECT seq FROM turns WHERE sessionKey='k1' AND status='queued'")
 
     assert NoticeBatcher.recover(ctx.db) == []
 
@@ -691,11 +720,36 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, [[1]]} =
              DB.query(ctx.db, "SELECT COUNT(*) FROM wakes WHERE prompt='queued human message'")
 
-    assert {:ok, _} =
-             DB.query(ctx.db, "UPDATE wakes SET state='fired',firedAt=?2 WHERE wakeId=?1", [
-               source_wake_id,
-               System.system_time(:millisecond)
-             ])
+    assert :ok =
+             Tightbeam.Ledger.finish(ctx.db, current_seq, "delivered", nil, owner_lease: lease)
+
+    [carrier_id] =
+      Tightbeam.NoticeBatcher.recover(ctx.db, System.system_time(:millisecond) + 1_000)
+
+    carrier = Tightbeam.Wakes.get(ctx.db, carrier_id)
+
+    assert {:ok, {:appended, "k1", delivered_message, _opts}} =
+             DB.transaction(ctx.db, fn txn ->
+               Gateway.deliver_prompt_in_txn(
+                 txn,
+                 carrier.session_key,
+                 carrier.origin,
+                 carrier.prompt,
+                 wake_id: carrier.wake_id,
+                 sender: carrier.origin,
+                 target_gate: carrier,
+                 fire_wake_in_txn: true
+               )
+             end)
+
+    assert delivered_message.attachments == [attachment]
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM turns WHERE wakeId=?1 AND status='queued'",
+               [carrier_id]
+             )
 
     assert %{dedupe: "duplicate"} = post.(call)
 
@@ -707,6 +761,54 @@ defmodule Tightbeam.GatewayTest do
                ctx.db,
                "SELECT COUNT(*) FROM messages WHERE clientMessageId='post-queued-1'"
              )
+  end
+
+  test "a busy direct prompt joins the editable source queue without opt-in", ctx do
+    {:appended, current_message} =
+      Tightbeam.Projection.append(ctx.db, %{
+        session_key: "k1",
+        role: "user",
+        content: "current running turn",
+        sender: "session:k1"
+      })
+
+    {:ok, current_seq} =
+      Tightbeam.Ledger.enqueue(ctx.db, %{
+        session_key: "k1",
+        message_id: current_message.id,
+        origin: "session:k1",
+        prompt: "current running turn"
+      })
+
+    assert {:ok, %{seq: ^current_seq}} =
+             Tightbeam.Ledger.claim_next(ctx.db, "k1", "direct-prompt-batch-test")
+
+    assert :queued =
+             Gateway.deliver_prompt("k1", "process:tightbeam", "direct process prompt",
+               db: ctx.db,
+               sender: "process:tightbeam",
+               conn_registry: ctx.registry,
+               lane_manager: Tightbeam.LaneManager
+             )
+
+    assert {:ok, [[wake_id, "process:tightbeam", "direct process prompt", "pending"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId,origin,prompt,state FROM wakes WHERE prompt='direct process prompt'"
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM notice_delivery_policies WHERE sourceWakeId=?1 AND enabled=1",
+               [wake_id]
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [wake_id])
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "SELECT seq FROM turns WHERE sessionKey='k1' AND status='queued'")
   end
 
   for {cadence, expected_interval} <- [

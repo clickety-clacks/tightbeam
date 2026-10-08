@@ -18,6 +18,7 @@ defmodule Tightbeam.HarnessHealth do
     ConditionFacts,
     DB,
     EventLog,
+    Gateway,
     Harness,
     HarnessProcess,
     Id,
@@ -3618,31 +3619,47 @@ defmodule Tightbeam.HarnessHealth do
         lifecycle_detail(input, input.correlation_id)
       )
 
-      {:appended, marker} = Projection.append_substrate_in_txn(txn, target_ref, message, :high)
-
       wake_id = "other-review:#{incident_id}:#{target_ref}"
+      [[owner]] = Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [target_ref])
 
-      {:ok, turn_seq} =
-        Ledger.enqueue_in_txn(txn, %{
-          session_key: target_ref,
-          message_id: marker.id,
+      delivery =
+        Gateway.deliver_prompt_in_txn(
+          txn,
+          target_ref,
+          "process:tightbeam",
+          message,
           wake_id: wake_id,
           request_ref: "other-review:#{incident_id}",
-          origin: "process:tightbeam",
-          prompt: message
-        })
+          sender: "process:tightbeam",
+          class: "fyi"
+        )
 
-      [[owner]] = Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [target_ref])
+      {source_wake_id, turn_seq, plan, staged?} =
+        case delivery do
+          {:appended, ^target_ref, delivered_message, _opts} ->
+            {wake_id, delivered_message.seq,
+             [
+               {target_ref, owner, delivered_message.seq,
+                Payloads.server_message(delivered_message)}
+             ], false}
+
+          {:staged, %{wake_id: source_wake_id}} ->
+            {source_wake_id, nil, [], true}
+
+          other ->
+            raise "harness health other-route delivery refused: #{inspect(other)}"
+        end
 
       Txn.q(
         txn,
         "UPDATE harness_health_other_routes SET state='pending',noticeWakeId=?3,turnSeq=?4,settledAt=NULL WHERE incidentId=?1 AND ordinal=?2 AND state='pending' AND noticeWakeId IS NULL AND turnSeq IS NULL",
-        [incident_id, route_ordinal, wake_id, turn_seq]
+        [incident_id, route_ordinal, source_wake_id, turn_seq]
       )
 
       %{
         kind: :other_route,
-        plan: [{target_ref, owner, marker.seq, Payloads.server_message(marker)}],
+        plan: if(staged?, do: [], else: plan),
+        staged?: staged?,
         tokenless: false,
         incident_id: incident_id,
         ordinal: route_ordinal,
@@ -3987,6 +4004,20 @@ defmodule Tightbeam.HarnessHealth do
   end
 
   @doc false
+  def batch_source_delivered_in_txn(%Txn{} = txn, source_wake_id, turn_seq)
+      when is_binary(source_wake_id) and is_integer(turn_seq) and turn_seq > 0 do
+    Txn.q(
+      txn,
+      "UPDATE harness_health_other_routes SET turnSeq=?2 WHERE noticeWakeId=?1 AND state='pending' AND turnSeq IS NULL",
+      [source_wake_id, turn_seq]
+    )
+
+    :ok
+  end
+
+  def batch_source_delivered_in_txn(%Txn{}, _source_wake_id, _turn_seq), do: :ok
+
+  @doc false
   @spec settle_other_route_in_txn(Txn.t(), integer(), String.t(), integer()) :: map() | nil
   def settle_other_route_in_txn(%Txn{} = txn, turn_seq, terminal_state, settled_at)
       when is_integer(turn_seq) do
@@ -4245,7 +4276,8 @@ defmodule Tightbeam.HarnessHealth do
       # A non-empty publication is only an enqueue into the connection
       # registry. Keep the route pending until the delivery/terminal callback
       # settles it; treating publication as delivery loses the retry rung.
-      if publication.plan == [] and not Map.get(publication, :tokenless, false) do
+      if publication.plan == [] and not Map.get(publication, :tokenless, false) and
+           not Map.get(publication, :staged?, false) do
         case DB.transaction(db, fn txn ->
                settle_other_route_notice_in_txn(
                  txn,

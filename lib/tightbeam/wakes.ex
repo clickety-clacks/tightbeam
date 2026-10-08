@@ -675,6 +675,7 @@ defmodule Tightbeam.Wakes do
 
         if Txn.changes(txn) == 1 do
           publish_change_in_txn(txn, "wake.fired", wake_id)
+          settle_batched_wait_in_txn(txn, wake_id, "delivered")
 
           # A batch carrier has a different wake ID from each editable source.
           # Re-arm work-item routing/slate sources by their own IDs so batching
@@ -5389,14 +5390,11 @@ defmodule Tightbeam.Wakes do
   end
 
   @doc """
-  Count pending wakes targeting a session that were durably created by that
-  same session.
-
-  HELD BATCH MEMBERS DO NOT COUNT. A source row still waiting in an open
-  recipient batch is not a queued continuation supervision can rely on: it
-  remains editable until the recipient is ready for its next turn. The
-  materialized CARRIER (`digest = 1`) is what the batcher decided to deliver
-  and counts normally.
+  Count pending prompt wakes targeting a session that were durably created by
+  that same session. A held self-created continuation still suppresses the
+  turn-end remedy: its source row remains pending until the recipient is ready.
+  Process-origin notices do not count as session-created continuations even if
+  a caller supplied a creator key while constructing a fixture or system notice.
   """
   @spec self_pending_count(db(), String.t()) :: non_neg_integer()
   def self_pending_count(db \\ Tightbeam.DB, session_key) do
@@ -5407,14 +5405,9 @@ defmodule Tightbeam.Wakes do
         SELECT count(*) FROM wakes
         WHERE state = 'pending' AND consumer = 'prompt'
           AND sessionKey = ?1 AND creatorSessionKey = ?1
-          -- `IS`, not `=`: an unclassed wake's deliveryRule is NULL, and
-          -- `NULL = ?2` is NULL (neither true nor false) under SQL's
-          -- three-valued logic, which would silently exclude it too. `IS`
-          -- compares NULL correctly and only a held digest source under one
-          -- of the two mechanically distinct rule revisions matches.
-          AND NOT (digest = 0 AND (deliveryRule IS ?2 OR deliveryRule IS ?3))
+          AND origin NOT LIKE 'process:%'
         """,
-        [session_key, @digest_rule, @legacy_digest_rule]
+        [session_key]
       )
 
     count
@@ -6600,59 +6593,78 @@ defmodule Tightbeam.Wakes do
   # controller is withdrawn by recognition, consumed as `canceled` with the
   # reason named — never a turn.
   defp suppressed_by_recognition?(db, wake) do
+    transaction!(db, fn txn -> suppress_supervision_if_blocked_in_txn?(txn, wake.wake_id) end)
+  end
+
+  @doc false
+  def suppress_supervision_if_blocked_in_txn?(%Txn{} = txn, wake_id) when is_binary(wake_id) do
+    case Txn.q(
+           txn,
+           "SELECT wakeId,assignmentId,sessionKey,reresolveSeed FROM wakes WHERE wakeId=?1 AND state='pending'",
+           [wake_id]
+         ) do
+      [[^wake_id, assignment_id, session_key, reresolve_seed]] ->
+        suppress_supervision_wake_in_txn?(txn, %{
+          wake_id: wake_id,
+          assignment_id: assignment_id,
+          session_key: session_key,
+          reresolve_seed: reresolve_seed
+        })
+
+      [] ->
+        false
+    end
+  end
+
+  defp suppress_supervision_wake_in_txn?(txn, wake) do
     holder = wake.reresolve_seed || wake.session_key
 
-    if pending_supervision_controller?(db, wake) and
-         ConditionFacts.standing?(db, "work-blocked", holder) do
+    if pending_supervision_controller?(txn, wake) and standing_block(txn, holder) != [] do
       Logger.info(
         "supervision wake #{wake.wake_id} suppressed: work-blocked stands for #{holder}"
       )
 
       canceled =
-        transaction!(db, fn txn ->
-          with [[fact_id]] <- standing_block(txn, holder),
-               [[generation]] <-
-                 Txn.q(
-                   txn,
-                   "SELECT generation FROM supervision_entitlements WHERE assignmentId=?1 AND state IN ('armed','claimed')",
-                   [wake.assignment_id]
-                 ),
-               true <-
-                 cancel_in_txn(txn, %{
-                   wake_id: wake.wake_id,
-                   requester: %{kind: "process", id: "tightbeam:wake-scheduler"},
-                   reason_kind: "production_unmatched",
-                   causal_source: %{kind: "condition_fact", id: to_string(fact_id)},
-                   outcome: %{
-                     kind: "no_replacement",
-                     liveness_trigger: %{
-                       kind: "supervision_entitlement",
-                       id: "#{wake.assignment_id}##{generation}"
-                     }
+        with [[fact_id]] <- standing_block(txn, holder),
+             [[generation]] <-
+               Txn.q(
+                 txn,
+                 "SELECT generation FROM supervision_entitlements WHERE assignmentId=?1 AND state IN ('armed','claimed')",
+                 [wake.assignment_id]
+               ),
+             true <-
+               cancel_in_txn(txn, %{
+                 wake_id: wake.wake_id,
+                 requester: %{kind: "process", id: "tightbeam:wake-scheduler"},
+                 reason_kind: "production_unmatched",
+                 causal_source: %{kind: "condition_fact", id: to_string(fact_id)},
+                 outcome: %{
+                   kind: "no_replacement",
+                   liveness_trigger: %{
+                     kind: "supervision_entitlement",
+                     id: "#{wake.assignment_id}##{generation}"
                    }
-                 }) do
-            # REFUND THE RUNG. The prodder's bookkeeping increments prodCount
-            # when the wake is scheduled, but suppression voids that act.
-            Txn.q(
-              txn,
-              "UPDATE assignment_prods SET prodCount = MAX(prodCount - 1, 0) WHERE assignmentId = ?1",
-              [wake.assignment_id]
-            )
+                 }
+               }) do
+          # REFUND THE RUNG. The prodder's bookkeeping increments prodCount
+          # when the wake is scheduled, but suppression voids that act.
+          Txn.q(
+            txn,
+            "UPDATE assignment_prods SET prodCount = MAX(prodCount - 1, 0) WHERE assignmentId = ?1",
+            [wake.assignment_id]
+          )
 
-            true
-          else
-            _ -> false
-          end
-        end)
+          EventLog.lifecycle_in_txn(
+            txn,
+            "supervision_wake_suppressed",
+            wake.wake_id,
+            "holder=#{holder}"
+          )
 
-      if canceled do
-        best_effort_lifecycle(
-          db,
-          "supervision_wake_suppressed",
-          wake.wake_id,
-          "holder=#{holder}"
-        )
-      end
+          true
+        else
+          _ -> false
+        end
 
       canceled
     else
@@ -6660,16 +6672,16 @@ defmodule Tightbeam.Wakes do
     end
   end
 
-  defp pending_supervision_controller?(db, wake) do
-    DB.query(
-      db,
+  defp pending_supervision_controller?(txn, wake) do
+    Txn.q(
+      txn,
       """
       SELECT 1 FROM supervision_liveness_sidecar
       WHERE wakeId=?1 AND assignmentId=?2 AND controllerOrigin='scheduled'
         AND controllerState='pending'
       """,
       [wake.wake_id, wake.assignment_id]
-    ) == {:ok, [[1]]}
+    ) == [[1]]
   end
 
   defp standing_block(txn, holder) do

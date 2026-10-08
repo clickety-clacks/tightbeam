@@ -3285,6 +3285,8 @@ defmodule Tightbeam.SupervisionTest do
   end
 
   test "startup migrates one legacy retired parent transfer to Main exactly once", ctx do
+    main_key = ctx.main.session_key
+
     {:ok, _} =
       DB.query(
         ctx.db,
@@ -3308,10 +3310,39 @@ defmodule Tightbeam.SupervisionTest do
              Supervision.evaluate(ctx.db, ctx.handlers, 0, "holder", terminal_seq)
 
     assert [source_wake] = Wakes.list_pending(ctx.db)
-    assert :appended = admit_supervision_wake!(ctx.db, source_wake)
+    assert {:staged, _source} = admit_supervision_wake!(ctx.db, source_wake)
+
+    [initial_carrier_id] =
+      NoticeBatcher.recover(ctx.db, System.system_time(:millisecond) + 1_000)
+
+    initial_carrier = Wakes.get(ctx.db, initial_carrier_id)
+
+    assert {:ok, {:appended, "supervisor", _message, _opts}} =
+             DB.transaction(ctx.db, fn txn ->
+               Gateway.deliver_prompt_in_txn(
+                 txn,
+                 initial_carrier.session_key,
+                 initial_carrier.origin,
+                 initial_carrier.prompt,
+                 wake_id: initial_carrier.wake_id,
+                 sender: initial_carrier.origin,
+                 target_gate: initial_carrier,
+                 fire_wake_in_txn: true
+               )
+             end)
 
     assert {:ok, [[source_turn_seq]]} =
-             DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [source_wake.wake_id])
+             DB.query(
+               ctx.db,
+               """
+               SELECT t.seq
+               FROM turns t
+               JOIN notice_batches b ON b.deliveryWakeId=t.wakeId
+               JOIN notice_batch_members m ON m.batchId=b.batchId AND m.state='included'
+               WHERE m.sourceWakeId=?1
+               """,
+               [source_wake.wake_id]
+             )
 
     assert {:ok, [["running"]]} =
              DB.query(
@@ -3332,6 +3363,26 @@ defmodule Tightbeam.SupervisionTest do
 
     _name = start_liveness!(ctx, sweep_ms: 60_000)
 
+    assert [%{wake_id: successor_wake_id}] = Wakes.list_pending(ctx.db)
+    [successor_carrier_id] = NoticeBatcher.recover(ctx.db, activation_epoch + 1_000)
+    successor_carrier = Wakes.get(ctx.db, successor_carrier_id)
+
+    assert {:ok, {:appended, ^main_key, _message, _opts}} =
+             DB.transaction(ctx.db, fn txn ->
+               Gateway.deliver_prompt_in_txn(
+                 txn,
+                 successor_carrier.session_key,
+                 successor_carrier.origin,
+                 successor_carrier.prompt,
+                 wake_id: successor_carrier.wake_id,
+                 sender: successor_carrier.origin,
+                 target_gate: successor_carrier,
+                 fire_wake_in_txn: true
+               )
+             end)
+
+    successor_id = "asg_1#source:#{successor_wake_id}"
+
     assert {:ok,
             [
               [
@@ -3339,7 +3390,7 @@ defmodule Tightbeam.SupervisionTest do
                 ^activation_epoch,
                 "supervisor",
                 "main_elevation",
-                successor_id,
+                ^successor_id,
                 main_key,
                 "legacy_parent_target_retired",
                 "process:tightbeam",
@@ -3372,8 +3423,18 @@ defmodule Tightbeam.SupervisionTest do
                source_turn_seq
              ])
 
-    ["asg_1", successor_turn] = String.split(successor_id, "#", parts: 2)
-    {successor_turn_seq, ""} = Integer.parse(successor_turn)
+    assert {:ok, [[successor_turn_seq]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT t.seq
+               FROM turns t
+               JOIN notice_batches b ON b.deliveryWakeId=t.wakeId
+               JOIN notice_batch_members m ON m.batchId=b.batchId AND m.state='included'
+               WHERE m.sourceWakeId=?1
+               """,
+               [successor_wake_id]
+             )
 
     assert {:ok,
             [
@@ -3393,11 +3454,13 @@ defmodule Tightbeam.SupervisionTest do
                SELECT w.wakeId, t.sessionKey, w.state, s.controllerOrigin, s.wakeKind,
                       s.controllerState, s.chargedGeneration
                FROM turns t
-               JOIN wakes w ON w.wakeId=t.wakeId
+               JOIN notice_batches b ON b.deliveryWakeId=t.wakeId
+               JOIN notice_batch_members m ON m.batchId=b.batchId AND m.state='included'
+               JOIN wakes w ON w.wakeId=m.sourceWakeId
                JOIN supervision_liveness_sidecar s ON s.wakeId=w.wakeId
-               WHERE t.seq=?1
+               WHERE t.seq=?1 AND w.wakeId=?2
                """,
-               [successor_turn_seq]
+               [successor_turn_seq, successor_wake_id]
              )
 
     assert successor_wake_id != source_wake.wake_id
@@ -3427,6 +3490,149 @@ defmodule Tightbeam.SupervisionTest do
              DB.query(
                ctx.db,
                "SELECT COUNT(*), COUNT(DISTINCT wakeId) FROM turns WHERE assignmentId='asg_1'"
+             )
+  end
+
+  test "a staged retirement elevation keeps immutable source evidence and validates through its carrier",
+       ctx do
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO work_items
+          (id, title, ownerUserId, state, createdByUser, createdAt)
+        VALUES ('wi_batched_transfer', 'batched transfer', 'flynn', 'open', 'flynn', 1)
+        """
+      )
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE assignments SET workItemId='wi_batched_transfer' WHERE id='asg_1'"
+      )
+
+    terminal_seq = terminal!(ctx.db, "holder")
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
+
+    assert {:escalated, 1, "supervisor"} =
+             Supervision.evaluate(ctx.db, ctx.handlers, 0, "holder", terminal_seq)
+
+    assert [source_wake] = Wakes.list_pending(ctx.db)
+    assert {:staged, _source} = admit_supervision_wake!(ctx.db, source_wake)
+
+    [initial_carrier_id] =
+      NoticeBatcher.recover(ctx.db, System.system_time(:millisecond) + 1_000)
+
+    initial_carrier = Wakes.get(ctx.db, initial_carrier_id)
+
+    assert {:ok, {:appended, "supervisor", _message, _opts}} =
+             DB.transaction(ctx.db, fn txn ->
+               Gateway.deliver_prompt_in_txn(
+                 txn,
+                 initial_carrier.session_key,
+                 initial_carrier.origin,
+                 initial_carrier.prompt,
+                 wake_id: initial_carrier.wake_id,
+                 sender: initial_carrier.origin,
+                 target_gate: initial_carrier,
+                 fire_wake_in_txn: true
+               )
+             end)
+
+    {:appended, current_message} =
+      Projection.append(ctx.db, %{
+        session_key: ctx.main.session_key,
+        role: "user",
+        content: "main current turn",
+        sender: "session:#{ctx.main.session_key}"
+      })
+
+    {:ok, current_seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: ctx.main.session_key,
+        message_id: current_message.id,
+        origin: "session:#{ctx.main.session_key}",
+        prompt: "main current turn"
+      })
+
+    assert {:ok, %{seq: ^current_seq, owner_lease: lease}} =
+             Ledger.claim_next(ctx.db, ctx.main.session_key, "retirement-batch-test")
+
+    main_key = ctx.main.session_key
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE sessions SET state='retired', updatedAt=2 WHERE sessionKey='supervisor'"
+      )
+
+    assert {:ok, [[activation_epoch]]} =
+             DB.query(ctx.db, "SELECT activatedAt FROM supervision_liveness_epoch WHERE id=0")
+
+    _name = start_liveness!(ctx, sweep_ms: 60_000)
+
+    assert {:ok, [[successor_wake_id, "pending", ^main_key, "fyi"]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT w.wakeId, w.state, w.sessionKey, w.class
+               FROM wakes w
+               JOIN supervision_liveness_sidecar s ON s.wakeId=w.wakeId
+               WHERE w.assignmentId='asg_1' AND s.controllerOrigin='retirement_elevation'
+               """
+             )
+
+    expected_source_outcome = "asg_1#source:#{successor_wake_id}"
+
+    assert {:ok, [[^expected_source_outcome]]} =
+             DB.query(
+               ctx.db,
+               "SELECT retirementOutcomeId FROM supervision_liveness_sidecar WHERE wakeId=?1",
+               [source_wake.wake_id]
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [successor_wake_id])
+
+    assert :ok = Ledger.finish(ctx.db, current_seq, "delivered", nil, owner_lease: lease)
+
+    [carrier_id] =
+      NoticeBatcher.recover(ctx.db, System.system_time(:millisecond) + 1_000)
+
+    carrier = Wakes.get(ctx.db, carrier_id)
+
+    assert {:ok, {:appended, target, _message, _opts}} =
+             DB.transaction(ctx.db, fn txn ->
+               Gateway.deliver_prompt_in_txn(
+                 txn,
+                 carrier.session_key,
+                 carrier.origin,
+                 carrier.prompt,
+                 wake_id: carrier.wake_id,
+                 sender: carrier.origin,
+                 target_gate: carrier,
+                 fire_wake_in_txn: true
+               )
+             end)
+
+    assert target == main_key
+    assert :ok = stop_supervised(Supervision)
+    _replay = start_liveness!(ctx, sweep_ms: 60_000)
+
+    assert %{supervisionState: "parent_elevated", supervisionTransferSessionKey: target} =
+             Supervision.prod_state(ctx.db, "asg_1")
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT COUNT(*)
+               FROM notice_batches b
+               JOIN notice_batch_members m ON m.batchId=b.batchId
+               JOIN turns t ON t.wakeId=b.deliveryWakeId
+               WHERE m.sourceWakeId=?1 AND t.sessionKey=?2
+               """,
+               [successor_wake_id, target]
              )
   end
 
@@ -3924,6 +4130,31 @@ defmodule Tightbeam.SupervisionTest do
              RailRemedy.episode(ctx.db, "completion-needs-review", "asg_1")
 
     assert Wakes.get(ctx.db, held.wake_id).state == "pending"
+  end
+
+  test "a held self-created continuation still suppresses the turn-end remedy", ctx do
+    prepare_review_gate(ctx)
+
+    wake =
+      Wakes.schedule(ctx.db, %{
+        session_key: "holder",
+        target_role: nil,
+        origin: "agent:holder",
+        prompt: "self continuation held for the next recipient turn",
+        due_at: System.system_time(:millisecond) + 60_000,
+        creator_session_key: "holder",
+        class: "fyi",
+        sender_scheduled: true
+      })
+
+    assert wake.delivery_rule == Wakes.digest_rule()
+    assert NoticeBatcher.source_refs(ctx.db, wake.wake_id) == []
+    assert Wakes.self_pending_count(ctx.db, "holder") == 1
+
+    seq = terminal!(ctx.db, "holder")
+    assert :idle = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
+    assert RailRemedy.episode(ctx.db, "completion-needs-review", "asg_1") == nil
+    assert Supervision.prod_state(ctx.db, "asg_1") == nil
   end
 
   test "a held default-on fyi source does not suppress the turn-end remedy", ctx do

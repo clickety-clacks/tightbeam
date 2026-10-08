@@ -11,7 +11,7 @@ defmodule Tightbeam.NoticeBatcher do
   wake is never rewritten merely because it became a batch member.
   """
 
-  alias Tightbeam.{DB, EventLog, Gateway, Wakes}
+  alias Tightbeam.{DB, EventLog, Gateway, Supervision, Wakes}
   alias Tightbeam.DB.Txn
 
   @rule "notice-batching-v1 r2"
@@ -135,10 +135,65 @@ defmodule Tightbeam.NoticeBatcher do
   );
   """
 
+  @staged_prompt_attachments_ddl """
+  CREATE TABLE IF NOT EXISTS notice_batch_source_attachments (
+    sourceWakeId TEXT PRIMARY KEY REFERENCES wakes(wakeId),
+    attachments TEXT NOT NULL CHECK (json_valid(attachments))
+  );
+  """
+
   @spec ensure_schema(GenServer.server()) :: :ok | {:error, term()}
   def ensure_schema(db \\ Tightbeam.DB) do
     with :ok <- ensure_bootstrap_schema(db) do
-      DB.execute(db, @staged_message_dedupes_ddl)
+      with :ok <- DB.execute(db, @staged_message_dedupes_ddl) do
+        DB.execute(db, @staged_prompt_attachments_ddl)
+      end
+    end
+  end
+
+  @doc false
+  def persist_source_attachments_in_txn(%Txn{} = txn, source_wake_id, attachments)
+      when is_binary(source_wake_id) and is_list(attachments) do
+    if attachments != [] do
+      Txn.q(
+        txn,
+        "INSERT INTO notice_batch_source_attachments(sourceWakeId,attachments) VALUES (?1,?2)",
+        [source_wake_id, JSON.encode!(attachments)]
+      )
+    end
+
+    :ok
+  end
+
+  @doc false
+  def delivery_attachments_in_txn(%Txn{} = txn, wake_id) when is_binary(wake_id) do
+    rows =
+      Txn.q(
+        txn,
+        """
+        SELECT a.attachments
+        FROM notice_batches b
+        JOIN notice_batch_members m ON m.batchId=b.batchId AND m.state='included'
+        JOIN notice_batch_source_attachments a ON a.sourceWakeId=m.sourceWakeId
+        WHERE b.deliveryWakeId=?1
+        ORDER BY m.publicationSeq
+        """,
+        [wake_id]
+      )
+
+    case rows do
+      [] ->
+        case Txn.q(
+               txn,
+               "SELECT attachments FROM notice_batch_source_attachments WHERE sourceWakeId=?1",
+               [wake_id]
+             ) do
+          [[encoded]] -> JSON.decode!(encoded)
+          [] -> []
+        end
+
+      encoded_rows ->
+        Enum.flat_map(encoded_rows, fn [encoded] -> JSON.decode!(encoded) end)
     end
   end
 
@@ -758,6 +813,17 @@ defmodule Tightbeam.NoticeBatcher do
   end
 
   defp prepare_due_source_in_txn(txn, wake_id) do
+    if Wakes.suppress_supervision_if_blocked_in_txn?(txn, wake_id) do
+      false
+    else
+      case Supervision.prepare_batch_source_in_txn(txn, wake_id) do
+        :stale -> false
+        :ready -> prepare_due_source_after_suppression_in_txn(txn, wake_id)
+      end
+    end
+  end
+
+  defp prepare_due_source_after_suppression_in_txn(txn, wake_id) do
     case Txn.q(txn, "SELECT sessionKey FROM turns WHERE wakeId=?1 ORDER BY seq LIMIT 1", [wake_id]) do
       [[delivered_to]] ->
         # A pre-batching delivery may have committed its turn before the wake

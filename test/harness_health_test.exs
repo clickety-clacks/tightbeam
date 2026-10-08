@@ -304,6 +304,105 @@ defmodule Tightbeam.HarnessHealthTest do
              )
   end
 
+  test "a busy other-route recipient keeps the recovery notice as a source until ready", ctx do
+    [child, parent | _] = ctx.sessions
+    parent_session = parent.session
+    at = System.system_time(:millisecond)
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "UPDATE sessions SET spawnedBy=?2 WHERE sessionKey=?1", [
+               child.session,
+               parent.session
+             ])
+
+    {:appended, current_message} =
+      Projection.append(ctx.db, %{
+        session_key: parent.session,
+        role: "user",
+        content: "current bounded work",
+        sender: "session:#{parent.session}"
+      })
+
+    {:ok, current_seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: parent.session,
+        message_id: current_message.id,
+        origin: "session:#{parent.session}",
+        prompt: "current bounded work"
+      })
+
+    assert {:ok, %{seq: ^current_seq, owner_lease: lease}} =
+             Ledger.claim_next(ctx.db, parent.session, "other-route-batching")
+
+    assert {:opened, opened} =
+             HarnessHealth.observe_other(ctx.db, %{
+               harness: "claude",
+               host: "gibson",
+               source_session_key: child.session,
+               principal: {:session, child.session},
+               description: "busy route batching evidence",
+               evidence_mode: "exact_error",
+               observed_state: "provider route failed",
+               exact_observed_error: "busy route reset",
+               exact_probe: "provider health probe",
+               recovery_condition: "a normal provider turn completes",
+               not_known_class_reason: "not one of the named classes",
+               observed_at: at,
+               accepted_at: at,
+               valid_until: at + 500,
+               world_status: "UNKNOWN",
+               redaction_confirmed: true,
+               idempotency_key: "busy-route-batching"
+             })
+
+    expected_wake_id = "other-review:#{opened.id}:#{parent_session}"
+
+    assert {:ok, [["pending", nil, ^expected_wake_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,turnSeq,noticeWakeId FROM harness_health_other_routes WHERE incidentId=?1 AND recipient=?2 ORDER BY ordinal LIMIT 1",
+               [opened.id, parent_session]
+             )
+
+    assert {:ok, [["pending", "fyi", "notice-batching-v1 r2"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,class,deliveryRule FROM wakes WHERE wakeId=?1",
+               [expected_wake_id]
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [expected_wake_id])
+
+    assert :ok = Ledger.finish(ctx.db, current_seq, "delivered", nil, owner_lease: lease)
+    [carrier_id] = Tightbeam.NoticeBatcher.recover(ctx.db, at + 1_000)
+    carrier = Wakes.get(ctx.db, carrier_id)
+
+    assert {:ok, {:appended, ^parent_session, message, _opts}} =
+             DB.transaction(ctx.db, fn txn ->
+               Gateway.deliver_prompt_in_txn(
+                 txn,
+                 carrier.session_key,
+                 carrier.origin,
+                 carrier.prompt,
+                 wake_id: carrier.wake_id,
+                 sender: carrier.origin,
+                 target_gate: carrier,
+                 fire_wake_in_txn: true
+               )
+             end)
+
+    assert {:ok, [[turn_seq]]} =
+             DB.query(ctx.db, "SELECT seq FROM turns WHERE messageId=?1", [message.id])
+
+    assert {:ok, [["pending", ^turn_seq, ^expected_wake_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,turnSeq,noticeWakeId FROM harness_health_other_routes WHERE incidentId=?1 AND recipient=?2 ORDER BY ordinal LIMIT 1",
+               [opened.id, parent.session]
+             )
+  end
+
   test "non-delivered route settlement publishes the next rung once", ctx do
     [child, parent | _] = ctx.sessions
     at = System.system_time(:millisecond)
