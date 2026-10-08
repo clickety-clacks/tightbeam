@@ -93,7 +93,7 @@ defmodule Tightbeam.FullGatewayRecoveryTest do
         assert is_integer(notice["firedAt"])
 
         carrier_wake_id =
-          case after_state["notice_source_refs"][notice_id] do
+          case Map.fetch!(after_state["notice_source_refs"], notice_id) do
             [id] when is_binary(id) ->
               id
 

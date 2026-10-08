@@ -41,12 +41,14 @@ defmodule Tightbeam.RecoveryScenario do
     )
     |> Map.put(
       "notice_source_refs",
-      Map.new(~w(w_recovery_b w_recovery_c), fn source_wake_id ->
-        delivery_wakes =
+      Map.new(rows("SELECT wakeId FROM wakes WHERE digest=0 AND consumer='prompt'"), fn [
+                                                                                          source_wake_id
+                                                                                        ] ->
+        {
+          source_wake_id,
           NoticeBatcher.source_refs(DB, source_wake_id)
           |> Enum.map(& &1.delivery_wake_id)
-
-        {source_wake_id, delivery_wakes}
+        }
       end)
     )
   end
