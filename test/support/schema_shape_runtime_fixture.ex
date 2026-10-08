@@ -11,6 +11,11 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
   @operator_decision_shape "operator-decision-requests-v1"
   @model_identity_shape "model-identity-v1"
   @be61_shape "model-identity-message-envelope-v2"
+  @batch_delivery_guard_names [
+    "supervision_lineage_fire_requires_sidecar",
+    "supervision_fired_lineage_sidecar_required_delete",
+    "supervision_fired_lineage_sidecar_identity_immutable"
+  ]
 
   # Captured from Schema.ensure_all/1 at be61cfc98df6b18c0cc280adeca42cba3fbf14b5.
   # Keep the old table exact: its missing ruledViaSessionKey column is why this
@@ -303,6 +308,8 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
                "SELECT schemaVersion, legacyRulingFactMaxId FROM decision_request_terminal_epoch WHERE id=0"
              )
 
+    assert_batch_delivery_guards!(second)
+
     :ok = stop_db!(second_pid)
   end
 
@@ -351,6 +358,12 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
                "SELECT name FROM sqlite_master WHERE name='supervision_liveness_sidecar_insert_coherent'"
              )
 
+    refute table?(first, "notice_batches")
+
+    Enum.each(@batch_delivery_guard_names, fn name ->
+      refute object_sql(first, "trigger", name) =~ "notice_batches"
+    end)
+
     :ok = GenServer.stop(interposer)
     :ok = stop_db!(first_pid)
 
@@ -365,6 +378,8 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
 
     assert object_sql(second, "trigger", "wakes_typed_cancellation_required") =~
              "pendingwakecancellationrequirestypedprovenance"
+
+    assert_batch_delivery_guards!(second)
 
     :ok = stop_db!(second_pid)
   end
@@ -716,6 +731,12 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
     |> String.downcase()
     |> String.replace("\"", "")
     |> String.replace(~r/\s+/u, "")
+  end
+
+  defp assert_batch_delivery_guards!(db) do
+    Enum.each(@batch_delivery_guard_names, fn name ->
+      assert object_sql(db, "trigger", name) =~ "notice_batches"
+    end)
   end
 
   defp table_columns(db, name) do

@@ -3975,8 +3975,17 @@ defmodule Tightbeam.Schema do
                  :ok = Txn.exec(txn, index.sql)
                end
 
+               # O2 activation and the remaining bootstrap pass still follow
+               # this predecessor migration. Keep batch-table references out
+               # of its triggers until NoticeBatcher has created those tables;
+               # the exact current guards are installed by the later guarded
+               # trigger migration in ensure_all/1.
+               previous_batch_delivery_triggers =
+                 Map.new(@supervision_batch_delivery_previous_triggers)
+
                Enum.each(@supervision_liveness_enforcement_objects, fn trigger ->
-                 :ok = Txn.exec(txn, trigger.sql)
+                 sql = Map.get(previous_batch_delivery_triggers, trigger.name, trigger.sql)
+                 :ok = Txn.exec(txn, sql)
                end)
              end
 
@@ -4533,9 +4542,21 @@ defmodule Tightbeam.Schema do
 
     # The sidecar admission trigger belongs to the final wake shape. Recreate
     # it only after the row-driven wait columns exist, not on legacy wakes.
+    # The three batch-aware supervision guards are installed later, after the
+    # batch tables have been bootstrapped. Older predecessor migrations still
+    # perform table renames after this transaction, and SQLite reparses every
+    # trigger during those renames. Keep the exact prior guards in place until
+    # `migrate_supervision_batch_delivery_guards_in_txn/1` can validate and
+    # replace them against an existing notice_batches schema.
+    previous_batch_delivery_triggers =
+      Map.new(@supervision_batch_delivery_previous_triggers)
+
     wake_bound_objects
     |> Enum.reject(&(&1.name == "supervision_liveness_sidecar_insert_coherent"))
-    |> Enum.each(fn object -> :ok = Txn.exec(txn, object.sql) end)
+    |> Enum.each(fn object ->
+      sql = Map.get(previous_batch_delivery_triggers, object.name, object.sql)
+      :ok = Txn.exec(txn, sql)
+    end)
 
     case Txn.q(txn, "PRAGMA foreign_key_check") do
       [] ->
