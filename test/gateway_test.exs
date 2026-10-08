@@ -9053,7 +9053,9 @@ defmodule Tightbeam.GatewayTest do
                prompt: "a turn already in flight"
              })
 
-    assert {:ok, %{seq: ^seq}} = Ledger.claim_next(ctx.db, session.session_key, "test")
+    assert {:ok, %{seq: ^seq, owner_lease: lease}} =
+             Ledger.claim_next(ctx.db, session.session_key, "test")
+
     assert Ledger.running?(ctx.db, session.session_key)
 
     # What the running turn read BEFORE apply: a complete old document.
@@ -9076,6 +9078,56 @@ defmodule Tightbeam.GatewayTest do
     # The turn is untouched: not cancelled, not finished, not bounced.
     assert Ledger.running?(ctx.db, session.session_key)
     assert Org.get(ctx.db, session.session_key).identity_revision == next
+
+    prompt =
+      "Your Tightbeam-owned skill files changed to identity revision #{next}.\n" <>
+        "Re-read your Tightbeam skills before you continue work. This update does not\n" <>
+        "reload your current model context."
+
+    assert [source] =
+             Enum.filter(Wakes.list_for_session(ctx.db, session.session_key), fn wake ->
+               wake.origin == "process:tightbeam" and wake.prompt == prompt
+             end)
+
+    assert source.state == "pending"
+    assert NoticeBatcher.source_refs(ctx.db, source.wake_id) == []
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [source.wake_id])
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM turns WHERE sessionKey=?1 AND status='queued'",
+               [session.session_key]
+             )
+
+    :ok = Ledger.finish(ctx.db, seq, "delivered", nil, owner_lease: lease)
+
+    [carrier_id] =
+      NoticeBatcher.recover(ctx.db, System.system_time(:millisecond) + 1_000)
+
+    carrier = Wakes.get(ctx.db, carrier_id)
+
+    assert {:ok, {:appended, ^session_key, delivery_message, _opts}} =
+             DB.transaction(ctx.db, fn txn ->
+               Gateway.deliver_prompt_in_txn(
+                 txn,
+                 carrier.session_key,
+                 carrier.origin,
+                 carrier.prompt,
+                 wake_id: carrier.wake_id,
+                 sender: carrier.origin,
+                 target_gate: carrier,
+                 fire_wake_in_txn: true
+               )
+             end)
+
+    assert delivery_message.content =~ "[from process:tightbeam]"
+    assert delivery_message.content =~ prompt
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [carrier_id])
   end
 
   # Regression: spawn creates the harness session LAZILY, so a freshly spawned

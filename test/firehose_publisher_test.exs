@@ -44,10 +44,10 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     assert {:error, %RuntimeError{message: "rollback winning fire"}} =
              DB.transaction(db, fn txn ->
-               assert {:appended, ^target, _, _} =
+               assert {:staged, _source} =
                         Gateway.deliver_prompt_in_txn(txn, target, wake.origin, wake.prompt, opts)
 
-               assert [["fired"]] =
+               assert [["pending"]] =
                         DB.Txn.q(txn, "SELECT state FROM wakes WHERE wakeId=?1", [wake.wake_id])
 
                raise "rollback winning fire"
@@ -60,24 +60,34 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     assert observed_classes() == []
 
-    assert {:ok, {:appended, ^target, _, _}} =
+    assert {:ok, {:staged, _source}} =
              DB.transaction(
                db,
                &Gateway.deliver_prompt_in_txn(&1, target, wake.origin, wake.prompt, opts)
              )
 
-    notices = for _ <- 1..3, do: receive_notice()
+    assert [carrier_id] = Wakes.materialize_digests(db)
 
-    assert Enum.map(notices, & &1["class"]) == [
-             "session.updated",
-             "wake.fired",
-             "message.created"
-           ]
+    assert [%{delivery_wake_id: ^carrier_id, batch_state: "delivery_pending"}] =
+             NoticeBatcher.source_refs(db, wake.wake_id)
 
-    fired = Enum.at(notices, 1)
-    assert fired["refs"]["wakeId"] == wake.wake_id
-    assert fired["payload"]["state"] == "fired"
+    start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
+    start_supervised!({LaneStub, name: Tightbeam.LaneManager})
+    scheduler = start_delivery_scheduler(db)
+    assert :ok = Wakes.fire_due(scheduler)
+
+    assert [%{delivery_wake_id: ^carrier_id, batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(db, wake.wake_id)
+
+    notices = observed_classes()
+    assert "session.updated" in notices
+    assert "wake.fired" in notices
+    assert "message.created" in notices
     assert Wakes.get(db, wake.wake_id).state == "fired"
+
+    assert {:ok, [[0]]} =
+             DB.query(db, "SELECT count(*) FROM turns WHERE wakeId=?1", [wake.wake_id])
+
     assert {:ok, before_turns} = DB.query(db, "SELECT * FROM turns ORDER BY seq")
     assert {:ok, before_wakes} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
 
@@ -101,7 +111,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     _seed_notices = observed_classes()
 
-    assert {:ok, {:appended, ^target, _, _}} =
+    assert {:ok, {:staged, _source}} =
              DB.transaction(
                db,
                &Gateway.deliver_prompt_in_txn(&1, target, external.origin, external.prompt,
@@ -111,8 +121,11 @@ defmodule Tightbeam.Firehose.PublisherTest do
              )
 
     assert Wakes.get(db, external.wake_id).state == "pending"
-    # A second queued turn leaves mechanical status unchanged.
-    assert observed_classes() == ["message.created"]
+
+    assert {:ok, [[0]]} =
+             DB.query(db, "SELECT count(*) FROM turns WHERE wakeId=?1", [external.wake_id])
+
+    assert observed_classes() == []
   end
 
   test "work-item-create emits its committed routing wake once, never on keyed replay" do
@@ -1317,6 +1330,39 @@ defmodule Tightbeam.Firehose.PublisherTest do
     _ = observed_state_classes()
 
     turn
+  end
+
+  defp start_delivery_scheduler(db) do
+    name = String.to_atom("firehose_batch_delivery_#{System.unique_integer([:positive])}")
+
+    start_supervised!(
+      Supervisor.child_spec(
+        {Wakes,
+         db: db,
+         name: name,
+         tick_ms: 60_000,
+         deliver: fn wake ->
+           {:ok, delivery} =
+             DB.transaction(db, fn txn ->
+               Gateway.deliver_prompt_in_txn(
+                 txn,
+                 wake.session_key,
+                 wake.origin,
+                 wake.prompt,
+                 wake_id: wake.wake_id,
+                 sender: wake.origin,
+                 target_gate: wake,
+                 fire_wake_in_txn: true
+               )
+             end)
+
+           Gateway.complete_delivery(db, delivery)
+         end},
+        id: name
+      )
+    )
+
+    name
   end
 
   defp register_testhost(db) do

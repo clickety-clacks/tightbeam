@@ -195,7 +195,8 @@ defmodule Tightbeam.SupervisionConsumerFixture do
              )
 
     [wake] = Wakes.list_pending(ctx.db)
-    assert :appended = admit_supervision_wake!(ctx.db, wake)
+    assert :staged = admit_supervision_wake!(ctx.db, wake)
+    _carrier_id = deliver_supervision_source_via_carrier!(ctx.db, wake)
     assert {:ok, source} = Ledger.claim_next(ctx.db, "holder", "interrupted-notice")
 
     assert :ok =
@@ -335,13 +336,15 @@ defmodule Tightbeam.SupervisionConsumerFixture do
   defp proof!(2, ctx, authority) do
     consume = real_consumer_fixture!(ctx, expire_gap: false)
 
+    api_lane = start_supervised!({LaneDoorbell, :r1_api_lane})
+
     scheduler =
       start_supervised!(
         {Wakes,
          db: ctx.db,
          name: :r1_api_scheduler,
          tick_ms: 60_000,
-         deliver: fn _wake -> flunk("condition admission must not deliver an unrelated wake") end}
+         deliver: delivery_fun(ctx.db, Tightbeam.ConnRegistry, api_lane)}
       )
 
     ctx = %{
@@ -415,7 +418,7 @@ defmodule Tightbeam.SupervisionConsumerFixture do
 
     assert [%{wake_id: wake_id}] =
              Wakes.list_pending(ctx.db)
-             |> Enum.filter(&(&1.origin == "process:tightbeam"))
+             |> Enum.filter(&(&1.origin == "process:tightbeam" and not &1.digest))
 
     newer = %{payload | "revision" => "two", "attentionRequestId" => "request-two"}
 
@@ -428,7 +431,11 @@ defmodule Tightbeam.SupervisionConsumerFixture do
              DB.query(ctx.db, "SELECT reminderState FROM assignments WHERE id='asg_1'")
 
     assert JSON.decode!(pending_json)["pending"]["snapshot"]["consequence"] == payload
-    assert :appended = admit_supervision_wake!(ctx.db, Wakes.get(ctx.db, wake_id))
+
+    assert [%{delivery_wake_id: _carrier_id, batch_state: state}] =
+             NoticeBatcher.source_refs(ctx.db, wake_id)
+
+    assert state in ["delivery_pending", "delivered"]
     %{seq: seq} = consume.("holder")
 
     assert {:ok, [[delivered_json]]} =
@@ -482,7 +489,8 @@ defmodule Tightbeam.SupervisionConsumerFixture do
     insert_entitlement!(ctx.db, "asg_1", generation: 4, due_at: 0, interval: 60_000)
     first = start_liveness!(ctx, sweep_ms: 60_000)
     assert [%{assignment_id: "asg_1"} = charged] = Wakes.list_pending(ctx.db)
-    assert :appended = admit_supervision_wake!(ctx.db, charged)
+    assert :staged = admit_supervision_wake!(ctx.db, charged)
+    _carrier_id = deliver_supervision_source_via_carrier!(ctx.db, charged)
     assert {:ok, turn} = Ledger.claim_next(ctx.db, "holder", "composed-controller")
     assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
     sweep_liveness!(first)
@@ -620,7 +628,8 @@ defmodule Tightbeam.SupervisionConsumerFixture do
              Supervision.evaluate(ctx.db, ctx.handlers, 0, "holder", first_terminal_seq)
 
     assert [first_wake] = Wakes.list_pending(ctx.db)
-    assert :appended = admit_supervision_wake!(ctx.db, first_wake)
+    assert :staged = admit_supervision_wake!(ctx.db, first_wake)
+    _carrier_id = deliver_supervision_source_via_carrier!(ctx.db, first_wake)
     consume.(first_wake.session_key)
 
     second_terminal_seq = terminal!(ctx.db, "holder")
@@ -632,7 +641,8 @@ defmodule Tightbeam.SupervisionConsumerFixture do
     assert main_session_key == ctx.main.session_key
 
     assert [second_wake] = Wakes.list_pending(ctx.db)
-    assert :appended = admit_supervision_wake!(ctx.db, second_wake)
+    assert :staged = admit_supervision_wake!(ctx.db, second_wake)
+    _carrier_id = deliver_supervision_source_via_carrier!(ctx.db, second_wake)
 
     name = start_liveness!(ctx, sweep_ms: 60_000)
 
@@ -665,7 +675,11 @@ defmodule Tightbeam.SupervisionConsumerFixture do
           fn "holder" ->
             state_at_nudge = Wakes.get(ctx.db, originating.wake_id).state
             turn = consume.("holder")
-            assert turn.wake_id == originating.wake_id
+
+            assert [%{delivery_wake_id: carrier_id}] =
+                     NoticeBatcher.source_refs(ctx.db, originating.wake_id)
+
+            assert turn.wake_id == carrier_id
 
             {:ok, _} =
               DB.query(
@@ -690,7 +704,11 @@ defmodule Tightbeam.SupervisionConsumerFixture do
     assert :ok = Wakes.fire_due(scheduler)
     assert_receive {:race_result, "fired", {:prodded, 2}}
     assert Wakes.get(ctx.db, originating.wake_id).state == "fired"
-    assert [%{prompt: next_prompt}] = Wakes.list_pending(ctx.db)
+
+    assert [%{prompt: next_prompt, digest: false}] =
+             Wakes.list_pending(ctx.db)
+             |> Enum.filter(&(&1.assignment_id == "asg_1" and not &1.digest))
+
     assert next_prompt =~ "prod 2 of 2"
   end
 
@@ -713,7 +731,15 @@ defmodule Tightbeam.SupervisionConsumerFixture do
          {:repeated_race_lane,
           fn session_key ->
             turn = consume.(session_key)
-            state_at_nudge = Wakes.get(ctx.db, turn.wake_id).state
+
+            [source] =
+              NoticeBatcher.carrier_members(ctx.db, turn.wake_id)
+              |> Enum.filter(
+                &String.starts_with?(&1.prompt, "Your turn ended with no qualifying receipt")
+              )
+
+            source_wake_id = source.wake_id
+            state_at_nudge = Wakes.get(ctx.db, source_wake_id).state
 
             {:ok, _} =
               DB.query(
@@ -722,7 +748,7 @@ defmodule Tightbeam.SupervisionConsumerFixture do
               )
 
             result = Supervision.evaluate(ctx.db, ctx.handlers, n, session_key, turn.seq)
-            send(parent, {:iteration_result, turn.wake_id, state_at_nudge, result})
+            send(parent, {:iteration_result, source_wake_id, state_at_nudge, result})
           end}}
       )
 
@@ -884,6 +910,29 @@ defmodule Tightbeam.SupervisionConsumerFixture do
                  [key]
                )
 
+      expected_consumer =
+        cond do
+          is_nil(wake_id) ->
+            %{"turn" => seq}
+
+          is_binary(assignment_id) ->
+            case DB.query(ctx.db, "SELECT reminderState FROM assignments WHERE id=?1", [
+                   assignment_id
+                 ]) do
+              {:ok, [[encoded]]} ->
+                case get_in(JSON.decode!(encoded), ["pending", "consumer"]) do
+                  consumer when is_map(consumer) -> consumer
+                  _ -> %{"wake" => wake_id}
+                end
+
+              _ ->
+                %{"wake" => wake_id}
+            end
+
+          true ->
+            %{"wake" => wake_id}
+        end
+
       receiver = self()
 
       {:ok, lane} =
@@ -910,7 +959,6 @@ defmodule Tightbeam.SupervisionConsumerFixture do
 
         state = JSON.decode!(encoded)
         assert state["pending"] == nil
-        expected_consumer = if is_nil(wake_id), do: %{"turn" => seq}, else: %{"wake" => wake_id}
         assert state["lastConsumer"] == expected_consumer
 
         assert (state["nextEligibleAt"] - state["lastDeliveredAt"]) in [
@@ -1470,7 +1518,8 @@ defmodule Tightbeam.SupervisionConsumerFixture do
              [wake.wake_id]
            ) do
         {:ok, [[1]]} ->
-          assert :appended = admit_supervision_wake!(db, wake)
+          assert :staged = admit_supervision_wake!(db, wake)
+          _carrier_id = deliver_supervision_source_via_carrier!(db, wake)
 
           if consume do
             consume.(wake.session_key)
@@ -1526,8 +1575,38 @@ defmodule Tightbeam.SupervisionConsumerFixture do
 
     case delivery do
       {:appended, _target, _message, _opts} -> :appended
+      {:staged, _wake} -> :staged
       other -> other
     end
+  end
+
+  defp deliver_supervision_source_via_carrier!(db, source) do
+    _carrier_ids = NoticeBatcher.recover(db, System.system_time(:millisecond) + 1_000)
+
+    assert [%{delivery_wake_id: carrier_id, member_state: "included"}] =
+             Enum.filter(
+               NoticeBatcher.source_refs(db, source.wake_id),
+               &is_binary(&1.delivery_wake_id)
+             )
+
+    carrier = Wakes.get(db, carrier_id)
+
+    assert {:ok, {:appended, _target, _message, _opts}} =
+             DB.transaction(db, fn txn ->
+               Gateway.deliver_prompt_in_txn(
+                 txn,
+                 carrier.session_key,
+                 carrier.origin,
+                 carrier.prompt,
+                 wake_id: carrier.wake_id,
+                 sender: carrier.origin,
+                 target_gate: carrier,
+                 fire_wake_in_txn: true
+               )
+             end)
+
+    assert :ok = NoticeBatcher.delivery_delivered(db, carrier_id)
+    carrier_id
   end
 
   defp start_retirement_supervision(ctx) do

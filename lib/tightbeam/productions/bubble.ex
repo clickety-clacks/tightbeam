@@ -234,7 +234,8 @@ defmodule Tightbeam.Productions.Bubble do
                assignment_id: cause.assignment_id
              )
 
-           if match?({:appended, ^recipient, _, _}, delivery) do
+           if match?({:appended, ^recipient, _, _}, delivery) or
+                match?({:staged, _source}, delivery) do
              transfer_cannot_proceed_disposers_for_cause_in_txn(
                txn,
                turn.cause_seq,

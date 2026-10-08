@@ -150,12 +150,36 @@ defmodule Tightbeam.ReminderDelivery do
   def rebind_turn_in_txn(txn, assignment, source_seq, successor_seq) do
     case Txn.q(
            txn,
-           "SELECT wakeId FROM turns WHERE seq=?1 AND assignmentId=?2 AND status IN ('failed','failed_unknown')",
-           [source_seq, assignment]
+           "SELECT 1 FROM turns WHERE seq=?1 AND status IN ('failed','failed_unknown')",
+           [source_seq]
          ) do
-      [[wake]] ->
-        transition_in_txn(txn, assignment, source_seq, wake, fn state, consumer, epoch ->
-          rebind(state, consumer, epoch, %{"turn" => successor_seq})
+      [[1]] ->
+        wake_ids =
+          Txn.q(
+            txn,
+            """
+            SELECT wakeId FROM turns WHERE seq=?1 AND assignmentId=?2
+            UNION ALL
+            SELECT source.wakeId
+            FROM turns carrier
+            JOIN notice_batches batch ON batch.deliveryWakeId=carrier.wakeId
+            JOIN notice_batch_members member
+              ON member.batchId=batch.batchId AND member.state='included'
+            JOIN wakes source ON source.wakeId=member.sourceWakeId
+            WHERE carrier.seq=?1 AND source.assignmentId=?2
+            ORDER BY wakeId
+            """,
+            [source_seq, assignment]
+          )
+          |> Enum.map(&hd/1)
+
+        Enum.reduce_while(wake_ids, :no_claim, fn wake_id, _result ->
+          result =
+            transition_in_txn(txn, assignment, source_seq, wake_id, fn state, consumer, epoch ->
+              rebind(state, consumer, epoch, %{"turn" => successor_seq})
+            end)
+
+          if result == :recorded, do: {:halt, result}, else: {:cont, :no_claim}
         end)
 
       _ ->

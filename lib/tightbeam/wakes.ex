@@ -805,24 +805,7 @@ defmodule Tightbeam.Wakes do
          true <- wake.prompt == notice.prompt,
          true <- Map.take(wake, Map.keys(relation)) == relation,
          true <- wake.origin == "process:tightbeam",
-         true <-
-           Txn.q(
-             txn,
-             """
-             SELECT 1 FROM turns t
-             WHERE t.sessionKey=?2 AND (
-               t.wakeId=?1 OR EXISTS (
-                 SELECT 1
-                 FROM notice_batch_members m
-                 JOIN notice_batches b ON b.batchId=m.batchId
-                 WHERE m.sourceWakeId=?1 AND m.state='included'
-                   AND b.deliveryWakeId=t.wakeId
-               )
-             )
-             LIMIT 1
-             """,
-             [wake.wake_id, wake.session_key]
-           ) == [[1]] do
+         true <- terminal_notice_has_delivery_turn_in_txn?(txn, wake.wake_id, wake.session_key) do
       :ok
     else
       false ->
@@ -894,6 +877,27 @@ defmodule Tightbeam.Wakes do
       "A refusal or failed action must be reported truthfully. Notice #{root_wake_id}."
   end
 
+  defp terminal_action_prompt_matches?(wake, event, root_wake_id) do
+    prompt = terminal_action_prompt(event, root_wake_id)
+
+    expected =
+      case wake.fired_by do
+        nil ->
+          prompt
+
+        "condition" ->
+          "[woke: fact #{wake.condition_kind}/#{wake.condition_scope || "nil"}]\n\n" <> prompt
+
+        "fallback" ->
+          "[woke: fallback deadline]\n\n" <> prompt
+
+        _ ->
+          nil
+      end
+
+    wake.prompt == expected
+  end
+
   defp terminal_action_reminder_matches?(wake, expected) do
     fields =
       ~w(wake_id session_key origin prompt condition_kind condition_scope creator_session_key owner_user_id obligation_ref)a
@@ -958,7 +962,7 @@ defmodule Tightbeam.Wakes do
          true <- root.owner_user_id == wake.owner_user_id,
          true <- wake.condition_scope == root.wake_id,
          true <- wake.condition_kind == terminal_action_condition_kind(root.wake_id),
-         true <- wake.prompt == terminal_action_prompt(event, root.wake_id),
+         true <- terminal_action_prompt_matches?(wake, event, root.wake_id),
          true <- wake.origin == "process:tightbeam",
          true <- wake.creator_session_key == event.child_session_key,
          true <- is_nil(wake.assignment_id) and is_nil(wake.work_item_id),
@@ -969,12 +973,7 @@ defmodule Tightbeam.Wakes do
              "SELECT sessionKey FROM sessions WHERE sessionKey=?1 AND ownerUserId=?2 AND state='active'",
              [wake.session_key, event.owner_user_id]
            ) == [[wake.session_key]],
-         true <-
-           Txn.q(
-             txn,
-             "SELECT sessionKey FROM turns WHERE wakeId=?1 AND sessionKey=?2 LIMIT 1",
-             [root.wake_id, root.session_key]
-           ) == [[root.session_key]] do
+         true <- terminal_notice_has_delivery_turn_in_txn?(txn, root.wake_id, root.session_key) do
       {:ok, root, event}
     else
       _ -> :error
@@ -982,6 +981,26 @@ defmodule Tightbeam.Wakes do
   end
 
   defp terminal_action_root_event_in_txn(_txn, _wake), do: :error
+
+  defp terminal_notice_has_delivery_turn_in_txn?(txn, source_wake_id, session_key) do
+    Txn.q(
+      txn,
+      """
+      SELECT 1 FROM turns t
+      WHERE t.sessionKey=?2 AND (
+        t.wakeId=?1 OR EXISTS (
+          SELECT 1
+          FROM notice_batch_members m
+          JOIN notice_batches b ON b.batchId=m.batchId
+          WHERE m.sourceWakeId=?1 AND m.state='included'
+            AND b.deliveryWakeId=t.wakeId
+        )
+      )
+      LIMIT 1
+      """,
+      [source_wake_id, session_key]
+    ) == [[1]]
+  end
 
   defp terminal_action_note_matches?(note, event) when is_binary(note) do
     case Regex.run(

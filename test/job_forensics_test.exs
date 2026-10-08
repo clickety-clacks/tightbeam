@@ -476,6 +476,7 @@ defmodule Tightbeam.JobForensicsTest do
   test "cancel and fire ordering has one winner and never writes losing provenance", %{db: db} do
     work_item(db, "wi_cancel_first")
     work_item(db, "wi_fire_first")
+    session(db, "target")
 
     :ok =
       DB.execute(
@@ -526,14 +527,19 @@ defmodule Tightbeam.JobForensicsTest do
       })
 
     assert :ok = Wakes.fire_due(scheduler)
-    assert_received {:delivered, fire_id}
-    assert fire_id == fire_first.wake_id
+
+    [%{delivery_wake_id: fire_carrier_id}] =
+      Tightbeam.NoticeBatcher.source_refs(db, fire_first.wake_id)
+
+    assert_received {:delivered, ^fire_carrier_id}
 
     assert %{canceled: false} =
              cancel_via_gateway(db, fire_first.wake_id, "user:flynn", {:user, "flynn"})
 
     fire_timeline = trace(db, "wi_fire_first").timeline
-    assert Enum.count(fire_timeline, &(&1.type == "wake_fired")) == 1
+    fired_ids = fire_timeline |> Enum.filter(&(&1.type == "wake_fired")) |> Enum.map(& &1.id)
+    assert Enum.count(fired_ids, &(&1 == fire_first.wake_id)) == 1
+    assert Enum.count(fired_ids, &(&1 == fire_carrier_id)) == 1
     refute Enum.any?(fire_timeline, &(&1.type == "wake_canceled"))
   end
 

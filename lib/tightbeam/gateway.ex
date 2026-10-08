@@ -2117,7 +2117,21 @@ defmodule Tightbeam.Gateway do
   defp existing_wake_turn_in_txn(_txn, wake_id) when not is_binary(wake_id), do: nil
 
   defp existing_wake_turn_in_txn(txn, wake_id) do
-    case DB.Txn.q(txn, "SELECT seq FROM turns WHERE wakeId=?1 LIMIT 1", [wake_id]) do
+    case DB.Txn.q(
+           txn,
+           """
+           SELECT seq FROM turns WHERE wakeId=?1
+           UNION ALL
+           SELECT t.seq
+           FROM notice_batch_members m
+           JOIN notice_batches b ON b.batchId=m.batchId
+           JOIN turns t ON t.wakeId=b.deliveryWakeId
+           WHERE m.sourceWakeId=?1 AND m.state='included'
+             AND b.state IN ('delivery_pending','delivered')
+           LIMIT 1
+           """,
+           [wake_id]
+         ) do
       [[seq]] -> {:duplicate, %{wake_id: wake_id, turn_seq: seq}}
       [] -> nil
     end

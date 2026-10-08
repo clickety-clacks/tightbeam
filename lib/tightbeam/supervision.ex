@@ -1120,14 +1120,38 @@ defmodule Tightbeam.Supervision do
            [wake_id]
          ) do
       [[assignment_id, target]] ->
-        case transition_in_txn(txn, %{
-               kind: "controller_fire",
-               wake_id: wake_id,
-               assignment_id: assignment_id,
-               target_session_key: target
-             }) do
-          {:admit, _wake_kind} -> :ready
-          :canceled -> :stale
+        case Txn.q(txn, "SELECT 1 FROM sessions WHERE sessionKey=?1 AND state='active'", [target]) do
+          [] ->
+            {:ok, liveness_trigger} = liveness_trigger_in_txn(txn, {:assignment, assignment_id})
+
+            true =
+              Wakes.cancel_in_txn(txn, %{
+                wake_id: wake_id,
+                requester: %{kind: "process", id: "tightbeam:wake-scheduler"},
+                reason_kind: "target_unresolvable",
+                causal_source: %{kind: "scheduler_delivery", id: wake_id},
+                outcome: %{kind: "no_replacement", liveness_trigger: liveness_trigger}
+              })
+
+            EventLog.lifecycle_in_txn(
+              txn,
+              "supervision_controller_unavailable",
+              assignment_id,
+              "wakeId=#{wake_id} target=#{target}"
+            )
+
+            :stale
+
+          [[1]] ->
+            case transition_in_txn(txn, %{
+                   kind: "controller_fire",
+                   wake_id: wake_id,
+                   assignment_id: assignment_id,
+                   target_session_key: target
+                 }) do
+              {:admit, _wake_kind} -> :ready
+              :canceled -> :stale
+            end
         end
 
       [] ->
@@ -4524,7 +4548,16 @@ defmodule Tightbeam.Supervision do
       WHERE w.origin='process:tightbeam' AND w.state='fired'
         AND w.obligationRef LIKE ?1
         AND w.obligationRef LIKE ?2
-        AND EXISTS (SELECT 1 FROM turns t WHERE t.wakeId=w.wakeId)
+        AND (
+          EXISTS (SELECT 1 FROM turns t WHERE t.wakeId=w.wakeId)
+          OR EXISTS (
+            SELECT 1
+            FROM notice_batch_members m
+            JOIN notice_batches b ON b.batchId=m.batchId
+            JOIN turns t ON t.wakeId=b.deliveryWakeId
+            WHERE m.sourceWakeId=w.wakeId AND m.state='included'
+          )
+        )
       """,
       [@idle_cleanup_prefix <> group_digest <> "|%", "%|" <> member_token <> "|%"]
     )
