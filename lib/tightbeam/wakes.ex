@@ -693,6 +693,52 @@ defmodule Tightbeam.Wakes do
   def batch_source_delivered_in_txn(%Txn{}, _wake_id, _delivered_to), do: :ok
 
   @doc false
+  @spec prepare_prompt_source_for_batch_in_txn(Txn.t(), String.t(), String.t(), String.t()) ::
+          {:ok, wake()} | :not_found
+  def prepare_prompt_source_for_batch_in_txn(%Txn{} = txn, wake_id, session_key, prompt)
+      when is_binary(wake_id) and is_binary(session_key) and is_binary(prompt) do
+    case get_in_txn(txn, wake_id) do
+      %{
+        wake_id: ^wake_id,
+        session_key: ^session_key,
+        consumer: "prompt",
+        digest: false,
+        state: state,
+        class: class
+      } = wake
+      when state in ["pending", "fired"] and is_binary(class) ->
+        fired_at = wake.fired_at || now()
+
+        Txn.q(
+          txn,
+          "UPDATE wakes SET state='pending',firedAt=COALESCE(firedAt,?3),prompt=?2 WHERE wakeId=?1 AND state IN ('pending','fired')",
+          [wake_id, prompt, fired_at]
+        )
+
+        if Txn.changes(txn) == 1 do
+          source = %{wake | state: "pending", fired_at: fired_at, prompt: prompt}
+          policy_ref = NoticeBatcher.record_policy_in_txn(txn, source, enabled: true)
+
+          Txn.q(
+            txn,
+            "UPDATE notice_delivery_policies SET enabled=1 WHERE policyRef=?1 AND sourceWakeId=?2",
+            [policy_ref, wake_id]
+          )
+
+          {:ok, source}
+        else
+          :not_found
+        end
+
+      _ ->
+        :not_found
+    end
+  end
+
+  def prepare_prompt_source_for_batch_in_txn(%Txn{}, _wake_id, _session_key, _prompt),
+    do: :not_found
+
+  @doc false
   def record_terminal_handoff_action_in_txn(%Txn{} = txn, holder, attest)
       when is_binary(holder) and is_map(attest) do
     if attest.kind == "progress" and attest.bySession == holder do
@@ -1569,7 +1615,8 @@ defmodule Tightbeam.Wakes do
   the wake's `dueAt` and signs the row with the rule that decided it. Ordinary
   prompt wakes use the batch route across origins and class elections; an
   explicit time or condition still controls when its source becomes ready.
-  Rumination and non-prompt consumers remain outside recipient batching.
+  Dispatch rumination is also a prompt wake and joins that recipient's next-turn
+  batch. Non-prompt consumers remain outside recipient batching.
   """
   @spec schedule_in_txn(Txn.t(), map()) :: wake()
   def schedule_in_txn(%Txn{} = txn, input) do
@@ -3841,25 +3888,23 @@ defmodule Tightbeam.Wakes do
   end
 
   # Trigger mechanics decide when a source becomes ready. They do not grant it
-  # a separate recipient turn: timed, condition, dependency, replacement, and
-  # typed terminal prompt sources join the same ordered batch once ready.
-  # Rumination is a dispatch gate rather than a recipient notice, and internal
-  # consumers are not agent attention; both remain outside this lane.
+  # a separate recipient turn: timed, condition, dependency, replacement,
+  # rumination, and typed terminal prompt sources join the same ordered batch.
+  # Internal consumers are not agent attention and remain outside this lane.
   defp batcher_inhibited?(input, _condition_kind) do
-    Map.get(input, :rumination, false) or Map.get(input, :consumer, "prompt") != "prompt"
+    Map.get(input, :consumer, "prompt") != "prompt"
   end
 
   defp batch_eligible?(input, class, _condition_kind) do
     is_binary(class) and not Map.get(input, :digest, false) and
-      Map.get(input, :consumer, "prompt") == "prompt" and not Map.get(input, :rumination, false)
+      Map.get(input, :consumer, "prompt") == "prompt"
   end
 
   defp batch_source?(wake), do: v1_batch_source?(wake) or v2_batch_source?(wake)
 
   defp batchable_delivery?(wake) do
     wake.delivery_rule in [@digest_rule, @legacy_digest_rule] and
-      is_binary(wake.class) and wake.consumer == "prompt" and not wake.digest and
-      not wake.rumination
+      is_binary(wake.class) and wake.consumer == "prompt" and not wake.digest
   end
 
   defp batchable_for_recipient?(txn, wake) do
@@ -3877,7 +3922,7 @@ defmodule Tightbeam.Wakes do
 
   defp v1_batch_source?(wake) do
     wake.delivery_rule == @digest_rule and not wake.digest and wake.consumer == "prompt" and
-      is_binary(wake.class) and not wake.rumination
+      is_binary(wake.class)
   end
 
   defp v2_batch_source?(_wake), do: false
@@ -5947,7 +5992,7 @@ defmodule Tightbeam.Wakes do
     }
   end
 
-  @doc "Whether a delivered rumination wake exists for this work-item and caller session."
+  @doc "Whether a rumination wake is staged for, or has reached, this caller's next turn."
   @spec rumination_exists?(db(), String.t(), String.t()) :: boolean()
   def rumination_exists?(db \\ Tightbeam.DB, work_item_id, caller_session) do
     {:ok, rows} =
@@ -5956,13 +6001,51 @@ defmodule Tightbeam.Wakes do
         """
         SELECT 1 FROM wakes
         WHERE rumination = 1 AND work_item_id = ?1 AND creatorSessionKey = ?2
-          AND state = 'fired'
+          AND (state = 'fired' OR (state = 'pending' AND (
+            firedAt IS NOT NULL OR EXISTS (
+              SELECT 1 FROM notice_batch_members m
+              JOIN notice_batches b ON b.batchId=m.batchId
+              WHERE m.sourceWakeId=wakes.wakeId
+                AND m.state IN ('active','included')
+                AND b.state IN ('open','sealed','delivery_pending')
+            )
+          )))
         LIMIT 1
         """,
         [work_item_id, caller_session]
       )
 
     rows != []
+  end
+
+  @doc false
+  @spec rumination_status_in_txn(Txn.t(), String.t(), String.t()) ::
+          :delivered | :staged | :pending | :none
+  def rumination_status_in_txn(%Txn{} = txn, work_item_id, caller_session) do
+    case Txn.q(
+           txn,
+           """
+           SELECT state, firedAt,
+             EXISTS (
+               SELECT 1 FROM notice_batch_members m
+               JOIN notice_batches b ON b.batchId=m.batchId
+               WHERE m.sourceWakeId=wakes.wakeId
+                 AND m.state IN ('active','included')
+                 AND b.state IN ('open','sealed','delivery_pending')
+             )
+           FROM wakes
+           WHERE rumination=1 AND work_item_id=?1 AND creatorSessionKey=?2
+             AND state IN ('pending','fired')
+           ORDER BY CASE state WHEN 'fired' THEN 0 ELSE 1 END, createdAt, wakeId
+           LIMIT 1
+           """,
+           [work_item_id, caller_session]
+         ) do
+      [["fired", _fired_at, _member]] -> :delivered
+      [["pending", fired_at, member]] when not is_nil(fired_at) or member == 1 -> :staged
+      [["pending", nil, 0]] -> :pending
+      [] -> :none
+    end
   end
 
   ## Scheduler process
@@ -6153,9 +6236,9 @@ defmodule Tightbeam.Wakes do
           ", (SELECT routingWakeId FROM work_items WHERE id=wakes.work_item_id), (SELECT slateWakeId FROM work_items WHERE id=wakes.work_item_id)"
         ) <>
           " WHERE state = 'pending' AND dueAt <= ?1 AND conditionKind IS NULL AND waitMode IS NULL" <>
-          " AND NOT (digest = 0 AND (deliveryRule IS ?2 OR deliveryRule IS ?3))" <>
+          " AND NOT (digest = 0 AND EXISTS (SELECT 1 FROM notice_delivery_policies p WHERE p.sourceWakeId=wakes.wakeId AND p.enabled=1 AND p.policyRevision=?2))" <>
           " ORDER BY dueAt ASC",
-        [now(), @digest_rule, @legacy_digest_rule]
+        [now(), NoticeBatcher.policy_revision()]
       )
 
     # Keep the exact carrier references from this due snapshot. A failed
@@ -6214,6 +6297,13 @@ defmodule Tightbeam.Wakes do
           :ok
 
         {"prompt", {:ok, {:terminal_notice_undeliverable, _evidence}}} ->
+          :ok
+
+        # Gateway returns :queued only when it staged the same pending source
+        # into the recipient's editable next-turn queue. Leave that source
+        # pending for NoticeBatcher recovery; marking it fired here would erase
+        # the very row the carrier must preserve.
+        {"prompt", {:ok, :queued}} ->
           :ok
 
         {"prompt", {:ok, :skipped}} when wake.digest ->

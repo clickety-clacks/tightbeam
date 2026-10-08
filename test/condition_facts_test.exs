@@ -8,7 +8,9 @@ defmodule Tightbeam.ConditionFactsTest do
     DB,
     EventLog,
     Gateway,
+    Ledger,
     Org,
+    Projection,
     Rules,
     Wakes
   }
@@ -1194,5 +1196,96 @@ defmodule Tightbeam.ConditionFactsTest do
                  [carrier_id, ended_at]
                )
     end)
+  end
+
+  test "a fired immediate condition source joins the existing busy recipient batch once", ctx do
+    {:appended, current_message} =
+      Projection.append(ctx.db, %{
+        session_key: ctx.session.session_key,
+        role: "user",
+        content: "current running turn",
+        sender: "session:" <> ctx.session.session_key
+      })
+
+    {:ok, current_seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: ctx.session.session_key,
+        message_id: current_message.id,
+        origin: "session:" <> ctx.session.session_key,
+        prompt: "current running turn"
+      })
+
+    assert {:ok, %{seq: ^current_seq} = current_turn} =
+             Ledger.claim_next(ctx.db, ctx.session.session_key, "condition-batch-test")
+
+    wake =
+      Wakes.schedule(ctx.db, %{
+        session_key: ctx.session.session_key,
+        origin: "agent:owner",
+        prompt: "urgent condition notice",
+        due_at: System.system_time(:millisecond) + 60_000,
+        condition_kind: "urgent-condition",
+        condition_scope: "prod",
+        owner_user_id: "flynn",
+        creator_session_key: "agent:owner:app",
+        class: "algedonic"
+      })
+
+    # Represent a persisted immediate-rule condition wake from before every
+    # prompt was admitted to the editable batch.
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE wakes SET deliveryRule=?2 WHERE wakeId=?1", [
+               wake.wake_id,
+               "algedonic-bypass r1"
+             ])
+
+    wake = Wakes.get(ctx.db, wake.wake_id)
+    assert wake.delivery_rule == "algedonic-bypass r1"
+
+    ConditionFacts.file(ctx.db, ctx.scheduler, %{
+      kind: "urgent-condition",
+      scope: "prod",
+      origin: "process:ci",
+      owner_user_id: "flynn"
+    })
+
+    staged = Wakes.get(ctx.db, wake.wake_id)
+    assert staged.state == "pending"
+    assert staged.fired_by == "condition"
+    assert is_integer(staged.fired_at)
+    assert staged.delivery_rule == wake.delivery_rule
+    assert Tightbeam.NoticeBatcher.source_refs(ctx.db, wake.wake_id) == []
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM notice_delivery_policies WHERE sourceWakeId=?1 AND enabled=1",
+               [wake.wake_id]
+             )
+
+    assert :ok =
+             Ledger.finish(ctx.db, current_seq, "delivered", nil,
+               owner_lease: current_turn.owner_lease
+             )
+
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+
+    assert [
+             %{
+               member_state: "included",
+               batch_state: "delivered",
+               delivery_wake_id: carrier_id
+             }
+           ] = Tightbeam.NoticeBatcher.source_refs(ctx.db, wake.wake_id)
+
+    assert Wakes.get(ctx.db, wake.wake_id).state == "fired"
+    assert turn_count(ctx.db, wake.wake_id) == 0
+    assert delivery_turn_count(ctx.db, wake.wake_id) == 1
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM wakes WHERE wakeId=?1", [wake.wake_id])
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [carrier_id])
   end
 end

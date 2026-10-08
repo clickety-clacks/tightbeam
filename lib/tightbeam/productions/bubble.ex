@@ -39,7 +39,8 @@ defmodule Tightbeam.Productions.Bubble do
     HarnessHealth,
     Org,
     Projection,
-    Supervision
+    Supervision,
+    Wakes
   }
 
   alias Tightbeam.Wire.Payloads
@@ -229,7 +230,8 @@ defmodule Tightbeam.Productions.Bubble do
                device_id: "process:tightbeam",
                client_message_id: "bubble:#{turn.cause_seq}:#{recipient}",
                wake_id: "bubble:#{turn.cause_seq}:#{recipient}",
-               request_ref: "bubble:#{turn.cause_seq}"
+               request_ref: "bubble:#{turn.cause_seq}",
+               assignment_id: cause.assignment_id
              )
 
            if match?({:appended, ^recipient, _, _}, delivery) do
@@ -256,6 +258,50 @@ defmodule Tightbeam.Productions.Bubble do
         raise error
     end
   end
+
+  @doc false
+  def batch_source_delivered_in_txn(%DB.Txn{} = txn, source_wake_id, recipient, _turn_seq)
+      when is_binary(source_wake_id) and is_binary(recipient) do
+    with %{origin: "process:tightbeam", session_key: ^recipient, assignment_id: assignment_id} <-
+           Wakes.get_in_txn(txn, source_wake_id),
+         assignment_id when is_binary(assignment_id) <- assignment_id,
+         {:ok, cause_seq, ^recipient} <- bubble_source(source_wake_id, recipient),
+         [[decision_wake_id]] <-
+           DB.Txn.q(
+             txn,
+             "SELECT decisionWakeId FROM assignment_cannot_proceed WHERE assignmentId=?1 AND state='standing'",
+             [assignment_id]
+           ),
+         decision_wake_id when is_binary(decision_wake_id) <- decision_wake_id do
+      Assignments.transfer_cannot_proceed_disposer_to_session_in_txn(
+        txn,
+        assignment_id,
+        recipient,
+        cause_seq,
+        decision_wake_id
+      )
+    else
+      _ -> :ok
+    end
+  end
+
+  def batch_source_delivered_in_txn(%DB.Txn{}, _source_wake_id, _recipient, _turn_seq),
+    do: :ok
+
+  defp bubble_source("bubble:" <> rest, recipient) do
+    case String.split(rest, ":", parts: 2) do
+      [cause, ^recipient] ->
+        case Integer.parse(cause) do
+          {cause_seq, ""} -> {:ok, cause_seq, recipient}
+          _ -> :error
+        end
+
+      _ ->
+        :error
+    end
+  end
+
+  defp bubble_source(_source_wake_id, _recipient), do: :error
 
   defp route_patrol_escalation(db, escalation) do
     request_ref = "bubble:patrol:#{escalation.id}"

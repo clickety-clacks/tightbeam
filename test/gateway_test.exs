@@ -1852,6 +1852,25 @@ defmodule Tightbeam.GatewayTest do
   test "an opener can relaunch a never-launched holder without revoking custody", ctx do
     session = Org.get(ctx.db, "k1")
 
+    {:appended, current_message} =
+      Tightbeam.Projection.append(ctx.db, %{
+        session_key: "k1",
+        role: "user",
+        content: "current holder turn",
+        sender: "session:k1"
+      })
+
+    {:ok, current_seq} =
+      Tightbeam.Ledger.enqueue(ctx.db, %{
+        session_key: "k1",
+        message_id: current_message.id,
+        origin: "session:k1",
+        prompt: "current holder turn"
+      })
+
+    assert {:ok, %{seq: ^current_seq}} =
+             Tightbeam.Ledger.claim_next(ctx.db, "k1", "relaunch-busy-test")
+
     assert {:ok, []} =
              DB.transaction(ctx.db, fn txn ->
                DB.Txn.q(
@@ -1883,21 +1902,27 @@ defmodule Tightbeam.GatewayTest do
     }
 
     assert %{ok: true, action: "relaunch"} = launched = handler.(call)
-    assert handler.(call) == launched
+    retry = put_in(call, [:params, :idempotency_key], "launch-two")
+    assert %{ok: true, action: "relaunch"} = handler.(retry)
 
-    assert_receive {:ensure_lane, "k1"}
-    refute_receive {:ensure_lane, "k1"}, 50
-
-    assert {:ok, [["queued", "asg_never_launched"]]} =
+    assert {:ok, [[1]]} =
              DB.query(
                ctx.db,
-               "SELECT status,assignmentId FROM turns WHERE assignmentId='asg_never_launched'"
+               "SELECT COUNT(*) FROM wakes WHERE wakeId='repair-relaunch:asg_never_launched' AND state='pending'"
+             )
+
+    refute_receive {:ensure_lane, "k1"}, 50
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "SELECT seq FROM turns WHERE assignmentId='asg_never_launched'"
              )
 
     assert {:ok, [["open"]]} =
              DB.query(ctx.db, "SELECT state FROM assignments WHERE id='asg_never_launched'")
 
-    assert {:ok, [[1]]} =
+    assert {:ok, [[2]]} =
              DB.query(
                ctx.db,
                "SELECT COUNT(*) FROM assignment_repair_attempts WHERE assignmentId='asg_never_launched'"

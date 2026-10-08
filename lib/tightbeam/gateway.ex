@@ -1822,11 +1822,15 @@ defmodule Tightbeam.Gateway do
              assignment_id: assignment.id,
              job_ref: assignment.work_item_id,
              sender: "assignment repair",
+             wake_id: "repair-relaunch:#{assignment.id}",
              conn_registry: Map.get(call, :conn_registry, Tightbeam.ConnRegistry),
              lane_manager: Map.get(call, :lane_manager, Tightbeam.LaneManager)
            ) do
-        :appended -> %{ok: true, action: "relaunch", assignmentId: assignment.id}
-        result -> repair_failed(result, operation: "deliver_prompt", phase: "repair_relaunch")
+        result when result in [:appended, :queued, :duplicate] ->
+          %{ok: true, action: "relaunch", assignmentId: assignment.id}
+
+        result ->
+          repair_failed(result, operation: "deliver_prompt", phase: "repair_relaunch")
       end
     else
       %{
@@ -2247,27 +2251,14 @@ defmodule Tightbeam.Gateway do
   defp existing_staged_source_in_txn(txn, target, prompt, wake_id) do
     case DB.Txn.q(
            txn,
-           "SELECT wakeId,sessionKey,origin,prompt,class,deliveryRule,state,consumer,digest FROM wakes WHERE wakeId=?1",
+           "SELECT wakeId,sessionKey,origin,prompt,class,state,consumer,digest FROM wakes WHERE wakeId=?1",
            [wake_id]
          ) do
-      [[^wake_id, ^target, origin, ^prompt, class, delivery_rule, "pending", "prompt", 0]] ->
-        if delivery_rule == Wakes.digest_rule() and
-             DB.Txn.q(
-               txn,
-               "SELECT 1 FROM notice_delivery_policies WHERE sourceWakeId=?1 AND enabled=1",
-               [wake_id]
-             ) == [[1]] do
-          {:ok,
-           %{
-             wake_id: wake_id,
-             session_key: target,
-             origin: origin,
-             prompt: prompt,
-             class: class
-           }}
-        else
-          raise DB.Error,
-            message: "busy prompt source #{wake_id} has no active batch delivery policy"
+      [[^wake_id, ^target, origin, ^prompt, class, state, "prompt", 0]]
+      when state in ["pending", "fired"] and is_binary(class) ->
+        case Wakes.prepare_prompt_source_for_batch_in_txn(txn, wake_id, target, prompt) do
+          {:ok, wake} -> {:ok, wake}
+          :not_found -> :none
         end
 
       _ ->
@@ -2412,6 +2403,13 @@ defmodule Tightbeam.Gateway do
                 NoticeBatcher.carrier_source_ids_in_txn(txn, wake_id)
                 |> Enum.each(fn source_wake_id ->
                   Supervision.batch_source_delivered_in_txn(
+                    txn,
+                    source_wake_id,
+                    target,
+                    seq
+                  )
+
+                  Tightbeam.Productions.Bubble.batch_source_delivered_in_txn(
                     txn,
                     source_wake_id,
                     target,

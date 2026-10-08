@@ -899,20 +899,8 @@ defmodule Tightbeam.WakesTest do
     assert Wakes.get(db, wake.wake_id).state == "pending"
   end
 
-  test "rumination markers count only after firing and are scoped by work-item and caller", %{
-    db: db,
-    scheduler: scheduler
-  } do
-    active_sessions!(db, ["k1"])
-    test_pid = self()
-
-    start_supervised!(
-      {Wakes,
-       db: db,
-       name: scheduler,
-       tick_ms: 60_000,
-       deliver: fn wake -> send(test_pid, {:delivered, wake}) end}
-    )
+  test "rumination markers count staged or delivered sources by work-item and caller", %{db: db} do
+    active_sessions!(db, ["k1", "caller"])
 
     wake =
       Wakes.schedule(db, %{
@@ -928,16 +916,34 @@ defmodule Tightbeam.WakesTest do
 
     assert wake.rumination
     assert wake.work_item_id == "wi_one"
+    assert wake.delivery_rule == NoticeBatcher.rule()
     refute Wakes.rumination_exists?(db, "wi_one", "caller")
     refute Wakes.rumination_exists?(db, "wi_other", "caller")
     refute Wakes.rumination_exists?(db, "wi_one", "other-caller")
 
-    assert :ok = Wakes.fire_due(scheduler)
-    assert_receive {:delivered, %{wake_id: wake_id}}
-    assert wake_id == wake.wake_id
+    [carrier_id] = NoticeBatcher.recover(db, System.system_time(:millisecond) + 1_000)
     assert Wakes.rumination_exists?(db, "wi_one", "caller")
     refute Wakes.rumination_exists?(db, "wi_other", "caller")
     refute Wakes.rumination_exists?(db, "wi_one", "other-caller")
+
+    carrier = Wakes.get(db, carrier_id)
+
+    assert {:ok, {:appended, "caller", _message, _opts}} =
+             DB.transaction(db, fn txn ->
+               Tightbeam.Gateway.deliver_prompt_in_txn(
+                 txn,
+                 carrier.session_key,
+                 carrier.origin,
+                 carrier.prompt,
+                 wake_id: carrier.wake_id,
+                 sender: carrier.origin,
+                 target_gate: carrier,
+                 fire_wake_in_txn: true
+               )
+             end)
+
+    assert Wakes.get(db, wake.wake_id).state == "fired"
+    assert Wakes.rumination_exists?(db, "wi_one", "caller")
   end
 
   defp public_cancel(

@@ -4367,6 +4367,25 @@ defmodule Tightbeam.AssignmentsTest do
        ctx do
     session(ctx.db, "dispatcher", "flynn")
 
+    {:appended, current_message} =
+      Projection.append(ctx.db, %{
+        session_key: "dispatcher",
+        role: "user",
+        content: "current dispatcher turn",
+        sender: "session:dispatcher"
+      })
+
+    {:ok, current_seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: "dispatcher",
+        message_id: current_message.id,
+        origin: "session:dispatcher",
+        prompt: "current dispatcher turn"
+      })
+
+    {:ok, current_turn} = Ledger.claim_next(ctx.db, "dispatcher", "dispatch-rumination-test")
+    assert current_turn.seq == current_seq
+
     work_item =
       handle(
         ctx,
@@ -4436,21 +4455,44 @@ defmodule Tightbeam.AssignmentsTest do
     assert wake.prompt ==
              "digest: Ruminate on work-item #{work_item.id} against the whole spec and its spirit before you fan out. Intent you were about to dispatch: subject=ship the rail brief=Implement the ratified behavior. When you've thought it through, re-issue the dispatch."
 
-    scheduler = :"rumination_wake_#{System.unique_integer([:positive])}"
-    test_pid = self()
+    assert wake.delivery_rule == NoticeBatcher.rule()
 
-    start_supervised!(
-      {Wakes,
-       db: ctx.db,
-       name: scheduler,
-       tick_ms: 60_000,
-       deliver: fn delivered -> send(test_pid, {:rumination_delivered, delivered}) end}
-    )
+    # A repeated attempt in this same active turn keeps the gate closed while
+    # reusing the one pending rumination source.
+    assert {:ok, %{rumination_required: true}} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
 
-    assert :ok = Wakes.fire_due(scheduler)
-    assert_receive {:rumination_delivered, %{wake_id: wake_id}}
-    assert wake_id == wake.wake_id
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE rumination=1 AND work_item_id=?1 AND creatorSessionKey='dispatcher' AND state='pending'",
+               [work_item.id]
+             )
+
+    refute Wakes.rumination_exists?(ctx.db, work_item.id, "dispatcher")
+
+    assert :ok =
+             Ledger.finish(ctx.db, current_seq, "delivered", nil,
+               owner_lease: current_turn.owner_lease
+             )
+
+    [carrier_id] = NoticeBatcher.recover(ctx.db, System.system_time(:millisecond) + 1_000)
     assert Wakes.rumination_exists?(ctx.db, work_item.id, "dispatcher")
+
+    carrier = Wakes.get(ctx.db, carrier_id)
+
+    assert {:ok, {:appended, "dispatcher", _message, _opts}} =
+             DB.transaction(ctx.db, fn txn ->
+               Gateway.deliver_prompt_in_txn(
+                 txn,
+                 carrier.session_key,
+                 carrier.origin,
+                 carrier.prompt,
+                 wake_id: carrier.wake_id,
+                 sender: carrier.origin,
+                 target_gate: carrier,
+                 fire_wake_in_txn: true
+               )
+             end)
 
     # F7 amendment: the re-dispatch persists workItemId exactly as assign does.
     assert {:ok, assignment} = Dispatch.dispatch(ctx.db, ctx.handlers, call)

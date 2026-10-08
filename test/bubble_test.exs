@@ -9,6 +9,7 @@ defmodule Tightbeam.Productions.BubbleTest do
     HarnessHealth,
     Ledger,
     Model,
+    NoticeBatcher,
     Org
   }
 
@@ -635,6 +636,8 @@ defmodule Tightbeam.Productions.BubbleTest do
         params: %{subject: "decision bubble disposer", idempotency_key: nil, work_item_id: nil}
       })
 
+    assignment_id = assignment.id
+
     blocked =
       Assignments.__handle__(ctx.db, "attest", %{
         verb: "attest",
@@ -650,7 +653,7 @@ defmodule Tightbeam.Productions.BubbleTest do
 
     decision_wake = blocked.decisionWake
 
-    assert :appended =
+    assert :queued =
              Tightbeam.Gateway.deliver_prompt(
                decision_wake.session_key,
                decision_wake.origin,
@@ -664,6 +667,26 @@ defmodule Tightbeam.Productions.BubbleTest do
                fire_wake_in_txn: true
              )
 
+    [decision_carrier_id] =
+      NoticeBatcher.recover(ctx.db, System.system_time(:millisecond) + 1_000)
+
+    decision_carrier = Tightbeam.Wakes.get(ctx.db, decision_carrier_id)
+    supervisor_session = ctx.supervisor.session_key
+
+    assert {:ok, {:appended, ^supervisor_session, _message, _opts}} =
+             DB.transaction(ctx.db, fn txn ->
+               Tightbeam.Gateway.deliver_prompt_in_txn(
+                 txn,
+                 decision_carrier.session_key,
+                 decision_carrier.origin,
+                 decision_carrier.prompt,
+                 wake_id: decision_carrier.wake_id,
+                 sender: decision_carrier.origin,
+                 target_gate: decision_carrier,
+                 fire_wake_in_txn: true
+               )
+             end)
+
     assert {:ok, decision_turn} =
              Ledger.claim_next(ctx.db, ctx.supervisor.session_key, "decision-wake")
 
@@ -672,7 +695,64 @@ defmodule Tightbeam.Productions.BubbleTest do
                owner_lease: decision_turn.owner_lease
              )
 
+    {:appended, busy_message} =
+      Tightbeam.Projection.append(ctx.db, %{
+        session_key: ctx.main.session_key,
+        role: "user",
+        content: "current main turn",
+        sender: "session:#{ctx.main.session_key}"
+      })
+
+    {:ok, busy_seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: ctx.main.session_key,
+        message_id: busy_message.id,
+        origin: "session:#{ctx.main.session_key}",
+        prompt: "current main turn"
+      })
+
+    assert {:ok, %{seq: ^busy_seq, owner_lease: busy_lease}} =
+             Ledger.claim_next(ctx.db, ctx.main.session_key, "bubble-busy-ancestor")
+
     assert :ok = Bubble.recognize_terminal(ctx.db, decision_turn.seq)
+
+    bubble_wake_id = "bubble:#{decision_turn.seq}:#{ctx.main.session_key}"
+
+    assert {:ok, [["pending", "process:tightbeam", ^assignment_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,origin,assignmentId FROM wakes WHERE wakeId=?1",
+               [bubble_wake_id]
+             )
+
+    expected_before_delivery = "session:" <> ctx.supervisor.session_key
+
+    assert {:ok, [[^expected_before_delivery]]} =
+             DB.query(
+               ctx.db,
+               "SELECT disposerRef FROM assignment_cannot_proceed WHERE id=?1",
+               [blocked.cannotProceed.id]
+             )
+
+    assert :ok = Ledger.finish(ctx.db, busy_seq, "delivered", nil, owner_lease: busy_lease)
+    [carrier_id] = NoticeBatcher.recover(ctx.db, System.system_time(:millisecond) + 1_000)
+    carrier = Tightbeam.Wakes.get(ctx.db, carrier_id)
+
+    assert {:ok, {:appended, main_session, _message, _opts}} =
+             DB.transaction(ctx.db, fn txn ->
+               Tightbeam.Gateway.deliver_prompt_in_txn(
+                 txn,
+                 carrier.session_key,
+                 carrier.origin,
+                 carrier.prompt,
+                 wake_id: carrier.wake_id,
+                 sender: carrier.origin,
+                 target_gate: carrier,
+                 fire_wake_in_txn: true
+               )
+             end)
+
+    assert main_session == ctx.main.session_key
     assert {:ok, notice} = Ledger.claim_next(ctx.db, ctx.main.session_key, "assigned-cause")
 
     expected_disposer = "session:" <> ctx.main.session_key

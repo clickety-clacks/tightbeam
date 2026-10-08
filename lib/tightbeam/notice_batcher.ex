@@ -640,10 +640,9 @@ defmodule Tightbeam.NoticeBatcher do
         JOIN wakes w ON w.wakeId=p.sourceWakeId
         WHERE p.enabled=1 AND p.policyRevision=?1
           AND w.state='pending' AND w.consumer='prompt' AND w.digest=0
-          AND w.deliveryRule=?2
           AND (w.conditionKind IS NULL OR w.firedAt IS NOT NULL)
           AND (w.waitMode IS NULL OR w.recognitionAt IS NOT NULL)
-          AND (w.dueAt<=?3 OR w.firedAt IS NOT NULL OR w.recognitionAt IS NOT NULL)
+          AND (w.dueAt<=?2 OR w.firedAt IS NOT NULL OR w.recognitionAt IS NOT NULL)
           AND NOT EXISTS (
             SELECT 1 FROM notice_batch_members m
             WHERE m.sourceWakeId=w.wakeId AND m.recipientAddress=p.recipientAddress
@@ -651,7 +650,7 @@ defmodule Tightbeam.NoticeBatcher do
           )
         ORDER BY p.recipientAddress, p.visibilityScope
         """,
-        [@policy_revision, @rule, at]
+        [@policy_revision, at]
       )
 
     Enum.flat_map(rows, fn [recipient_address, visibility_scope] ->
@@ -689,10 +688,9 @@ defmodule Tightbeam.NoticeBatcher do
            WHERE p.recipientAddress=?1 AND p.visibilityScope=?2
              AND p.enabled=1 AND p.policyRevision=?3
              AND w.state='pending' AND w.consumer='prompt' AND w.digest=0
-             AND w.deliveryRule=?4
              AND (w.conditionKind IS NULL OR w.firedAt IS NOT NULL)
              AND (w.waitMode IS NULL OR w.recognitionAt IS NOT NULL)
-             AND (w.dueAt<=?5 OR w.firedAt IS NOT NULL OR w.recognitionAt IS NOT NULL)
+             AND (w.dueAt<=?4 OR w.firedAt IS NOT NULL OR w.recognitionAt IS NOT NULL)
              AND NOT EXISTS (
                SELECT 1 FROM notice_batch_members m
                WHERE m.sourceWakeId=w.wakeId AND m.recipientAddress=p.recipientAddress
@@ -700,7 +698,7 @@ defmodule Tightbeam.NoticeBatcher do
              )
            ORDER BY w.createdAt, w.rowid
            """,
-           [recipient_address, visibility_scope, @policy_revision, @rule, at]
+           [recipient_address, visibility_scope, @policy_revision, at]
          ) do
       {:ok, rows} -> Enum.map(rows, fn [wake_id] -> wake_id end)
       {:error, _} -> []
@@ -718,10 +716,9 @@ defmodule Tightbeam.NoticeBatcher do
         WHERE p.recipientAddress=?1 AND p.visibilityScope=?2
           AND p.enabled=1 AND p.policyRevision=?3
           AND w.state='pending' AND w.consumer='prompt' AND w.digest=0
-          AND w.deliveryRule=?4
           AND (w.conditionKind IS NULL OR w.firedAt IS NOT NULL)
           AND (w.waitMode IS NULL OR w.recognitionAt IS NOT NULL)
-          AND (w.dueAt<=?5 OR w.firedAt IS NOT NULL OR w.recognitionAt IS NOT NULL)
+          AND (w.dueAt<=?4 OR w.firedAt IS NOT NULL OR w.recognitionAt IS NOT NULL)
           AND NOT EXISTS (
             SELECT 1 FROM notice_batch_members m
             WHERE m.sourceWakeId=w.wakeId AND m.recipientAddress=p.recipientAddress
@@ -729,7 +726,7 @@ defmodule Tightbeam.NoticeBatcher do
           )
         ORDER BY w.createdAt, w.rowid
         """,
-        [recipient_address, visibility_scope, @policy_revision, @rule, at]
+        [recipient_address, visibility_scope, @policy_revision, at]
       )
       |> Enum.filter(fn [wake_id, _policy_ref] -> prepare_due_source_in_txn(txn, wake_id) end)
 
@@ -1536,14 +1533,14 @@ defmodule Tightbeam.NoticeBatcher do
         SELECT 1 FROM wakes w
         JOIN notice_delivery_policies p ON p.sourceWakeId=w.wakeId
         WHERE w.state='pending' AND w.consumer='prompt' AND w.digest=0
-          AND w.deliveryRule=?1 AND p.enabled=1 AND p.policyRevision=?2
+          AND p.enabled=1 AND p.policyRevision=?1
           AND (w.conditionKind IS NULL OR w.firedAt IS NOT NULL)
           AND (w.waitMode IS NULL OR w.recognitionAt IS NOT NULL)
-          AND (w.dueAt<=?3 OR w.firedAt IS NOT NULL OR w.recognitionAt IS NOT NULL)
-          AND (p.sessionKey=?5 OR (?4 IS NOT NULL AND w.targetRole=?4))
+          AND (w.dueAt<=?2 OR w.firedAt IS NOT NULL OR w.recognitionAt IS NOT NULL)
+          AND (p.sessionKey=?4 OR (?3 IS NOT NULL AND w.targetRole=?3))
         LIMIT 1
         """,
-        [@rule, @policy_revision, at, target_role, session_key]
+        [@policy_revision, at, target_role, session_key]
       ) != []
   end
 

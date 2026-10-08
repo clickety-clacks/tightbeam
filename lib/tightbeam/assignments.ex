@@ -1395,37 +1395,48 @@ defmodule Tightbeam.Assignments do
   defp dispatch_result(db, call) do
     case {call.params[:work_item_id], call.principal} do
       {work_item_id, {:session, caller_session}} when not is_nil(work_item_id) ->
-        if Wakes.rumination_exists?(db, work_item_id, caller_session) do
-          open_dispatch_result(db, call)
-        else
-          transaction(db, fn txn ->
-            wake =
-              Wakes.schedule_in_txn(txn, %{
-                session_key: caller_session,
-                origin: call.origin,
-                creator_session_key: caller_session,
-                prompt:
-                  "digest: Ruminate on work-item #{work_item_id} against the whole spec and its spirit before you fan out. Intent you were about to dispatch: subject=#{call.params[:subject]} brief=#{call.params[:brief]}. When you've thought it through, re-issue the dispatch.",
-                due_at: now(),
-                rumination: true,
-                work_item_id: work_item_id
-              })
+        case transaction(db, fn txn ->
+               case Wakes.rumination_status_in_txn(txn, work_item_id, caller_session) do
+                 :delivered ->
+                   :delivered
 
-            Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
-            Wakes.publish_change_in_txn(txn, "wake.scheduled", wake.wake_id)
+                 status when status in [:pending, :staged] ->
+                   rumination_required_result(work_item_id)
 
-            %{
-              rumination_required: true,
-              work_item_id: work_item_id,
-              message:
-                "Sent you to ruminate on #{work_item_id} first — re-dispatch when you're done thinking."
-            }
-          end)
+                 :none ->
+                   wake =
+                     Wakes.schedule_in_txn(txn, %{
+                       session_key: caller_session,
+                       origin: call.origin,
+                       creator_session_key: caller_session,
+                       prompt:
+                         "digest: Ruminate on work-item #{work_item_id} against the whole spec and its spirit before you fan out. Intent you were about to dispatch: subject=#{call.params[:subject]} brief=#{call.params[:brief]}. When you've thought it through, re-issue the dispatch.",
+                       due_at: now(),
+                       rumination: true,
+                       work_item_id: work_item_id
+                     })
+
+                   Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
+                   Wakes.publish_change_in_txn(txn, "wake.scheduled", wake.wake_id)
+                   rumination_required_result(work_item_id)
+               end
+             end) do
+          :delivered -> open_dispatch_result(db, call)
+          result -> result
         end
 
       _ ->
         open_dispatch_result(db, call)
     end
+  end
+
+  defp rumination_required_result(work_item_id) do
+    %{
+      rumination_required: true,
+      work_item_id: work_item_id,
+      message:
+        "Sent you to ruminate on #{work_item_id} first — re-dispatch when you're done thinking."
+    }
   end
 
   defp open_dispatch_result(db, call) do
