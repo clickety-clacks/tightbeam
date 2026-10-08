@@ -39,6 +39,16 @@ defmodule Tightbeam.RecoveryScenario do
         {table, Enum.map(rows("PRAGMA table_info(#{table})"), &Enum.at(&1, 1))}
       end)
     )
+    |> Map.put(
+      "notice_source_refs",
+      Map.new(~w(w_recovery_b w_recovery_c), fn source_wake_id ->
+        delivery_wakes =
+          NoticeBatcher.source_refs(DB, source_wake_id)
+          |> Enum.map(& &1.delivery_wake_id)
+
+        {source_wake_id, delivery_wakes}
+      end)
+    )
   end
 
   def prepare! do

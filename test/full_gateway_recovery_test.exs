@@ -93,9 +93,17 @@ defmodule Tightbeam.FullGatewayRecoveryTest do
         assert is_integer(notice["firedAt"])
 
         carrier_wake_id =
-          case Tightbeam.NoticeBatcher.source_refs(Tightbeam.DB, notice_id) do
-            [%{delivery_wake_id: id}] when is_binary(id) -> id
-            [] -> notice_id
+          case after_state["notice_source_refs"][notice_id] do
+            [id] when is_binary(id) ->
+              id
+
+            [] ->
+              notice_id
+
+            other ->
+              flunk(
+                "expected at most one carrier reference for #{notice_id}, got #{inspect(other)}"
+              )
           end
 
         turn_columns = after_state["columns"]["turns"]
