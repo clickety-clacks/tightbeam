@@ -235,12 +235,10 @@ defmodule Tightbeam.Productions.Bubble do
              )
 
            if match?({:appended, ^recipient, _, _}, delivery) do
-             Assignments.transfer_cannot_proceed_disposer_to_session_in_txn(
+             transfer_cannot_proceed_disposers_for_cause_in_txn(
                txn,
-               cause.assignment_id,
-               recipient,
                turn.cause_seq,
-               cause.wake_id
+               recipient
              )
            end
 
@@ -262,24 +260,10 @@ defmodule Tightbeam.Productions.Bubble do
   @doc false
   def batch_source_delivered_in_txn(%DB.Txn{} = txn, source_wake_id, recipient, _turn_seq)
       when is_binary(source_wake_id) and is_binary(recipient) do
-    with %{origin: "process:tightbeam", session_key: ^recipient, assignment_id: assignment_id} <-
+    with %{origin: "process:tightbeam", session_key: ^recipient} <-
            Wakes.get_in_txn(txn, source_wake_id),
-         assignment_id when is_binary(assignment_id) <- assignment_id,
-         {:ok, cause_seq, ^recipient} <- bubble_source(source_wake_id, recipient),
-         [[decision_wake_id]] <-
-           DB.Txn.q(
-             txn,
-             "SELECT decisionWakeId FROM assignment_cannot_proceed WHERE assignmentId=?1 AND state='standing'",
-             [assignment_id]
-           ),
-         decision_wake_id when is_binary(decision_wake_id) <- decision_wake_id do
-      Assignments.transfer_cannot_proceed_disposer_to_session_in_txn(
-        txn,
-        assignment_id,
-        recipient,
-        cause_seq,
-        decision_wake_id
-      )
+         {:ok, cause_seq, ^recipient} <- bubble_source(source_wake_id, recipient) do
+      transfer_cannot_proceed_disposers_for_cause_in_txn(txn, cause_seq, recipient)
     else
       _ -> :ok
     end
@@ -287,6 +271,140 @@ defmodule Tightbeam.Productions.Bubble do
 
   def batch_source_delivered_in_txn(%DB.Txn{}, _source_wake_id, _recipient, _turn_seq),
     do: :ok
+
+  # A failed turn can carry a cannot-proceed decision wake directly, or as one
+  # member of a mixed notice carrier whose assignmentId is nil. Resolve the
+  # decision from the failed turn's durable wake and the batch membership, so
+  # direct delivery and carrier delivery apply the same authority rule.
+  defp transfer_cannot_proceed_disposers_for_cause_in_txn(txn, cause_seq, recipient) do
+    case DB.Txn.q(txn, "SELECT sessionKey,wakeId FROM turns WHERE seq=?1", [cause_seq]) do
+      [[cause_session, cause_wake_id]] when is_binary(cause_wake_id) ->
+        decision_wakes =
+          DB.Txn.q(
+            txn,
+            """
+            SELECT cp.assignmentId, cp.decisionWakeId
+            FROM assignment_cannot_proceed cp
+            JOIN wakes decision ON decision.wakeId=cp.decisionWakeId
+            WHERE cp.state='standing'
+              AND decision.sessionKey=?1
+              AND decision.assignmentId=cp.assignmentId
+              AND (
+                decision.wakeId=?2
+                OR EXISTS (
+                  SELECT 1
+                  FROM notice_batch_members member
+                  JOIN notice_batches batch ON batch.batchId=member.batchId
+                  WHERE member.sourceWakeId=decision.wakeId
+                    AND member.state='included'
+                    AND batch.deliveryWakeId=?2
+                )
+              )
+            ORDER BY cp.assignmentId, cp.decisionWakeId
+            """,
+            [cause_session, cause_wake_id]
+          )
+
+        Enum.each(decision_wakes, fn [assignment_id, decision_wake_id] ->
+          Assignments.transfer_cannot_proceed_disposer_to_session_in_txn(
+            txn,
+            assignment_id,
+            recipient,
+            cause_seq,
+            decision_wake_id
+          )
+        end)
+
+        :ok
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp transfer_cannot_proceed_disposers_to_user_for_cause_in_txn(txn, cause_seq, owner) do
+    cause_assignment_ids =
+      cause_assignment_ids_in_txn(txn, [cause_seq], MapSet.new(), MapSet.new(), 64)
+
+    Enum.each(cause_assignment_ids, fn assignment_id ->
+      Assignments.transfer_cannot_proceed_disposer_to_user_in_txn(
+        txn,
+        assignment_id,
+        owner,
+        cause_seq
+      )
+    end)
+
+    :ok
+  end
+
+  defp cause_assignment_ids_in_txn(_txn, _pending, _seen, assignment_ids, 0),
+    do: assignment_ids
+
+  defp cause_assignment_ids_in_txn(_txn, [], _seen, assignment_ids, _budget),
+    do: assignment_ids
+
+  defp cause_assignment_ids_in_txn(txn, [cause_seq | rest], seen, assignment_ids, budget) do
+    if MapSet.member?(seen, cause_seq) do
+      cause_assignment_ids_in_txn(txn, rest, seen, assignment_ids, budget - 1)
+    else
+      seen = MapSet.put(seen, cause_seq)
+
+      case DB.Txn.q(txn, "SELECT wakeId,assignmentId FROM turns WHERE seq=?1", [cause_seq]) do
+        [[cause_wake_id, turn_assignment_id]] ->
+          source_rows =
+            if is_binary(cause_wake_id) do
+              DB.Txn.q(
+                txn,
+                """
+                SELECT wakeId,assignmentId,sessionKey FROM wakes WHERE wakeId=?1
+                UNION
+                SELECT source.wakeId,source.assignmentId,source.sessionKey
+                FROM notice_batch_members member
+                JOIN notice_batches batch ON batch.batchId=member.batchId
+                JOIN wakes source ON source.wakeId=member.sourceWakeId
+                WHERE batch.deliveryWakeId=?1 AND member.state='included'
+                """,
+                [cause_wake_id]
+              )
+            else
+              []
+            end
+
+          assignment_ids =
+            Enum.reduce(source_rows, assignment_ids, fn [_wake_id, source_assignment_id, _session],
+                                                        acc ->
+              if is_binary(source_assignment_id),
+                do: MapSet.put(acc, source_assignment_id),
+                else: acc
+            end)
+
+          assignment_ids =
+            if is_binary(turn_assignment_id),
+              do: MapSet.put(assignment_ids, turn_assignment_id),
+              else: assignment_ids
+
+          bubble_causes =
+            Enum.flat_map(source_rows, fn [source_wake_id, _source_assignment_id, source_session] ->
+              case bubble_source(source_wake_id, source_session) do
+                {:ok, earlier_cause_seq, _recipient} -> [earlier_cause_seq]
+                _ -> []
+              end
+            end)
+
+          cause_assignment_ids_in_txn(
+            txn,
+            rest ++ bubble_causes,
+            seen,
+            assignment_ids,
+            budget - 1
+          )
+
+        _ ->
+          cause_assignment_ids_in_txn(txn, rest, seen, assignment_ids, budget - 1)
+      end
+    end
+  end
 
   defp bubble_source("bubble:" <> rest, recipient) do
     case String.split(rest, ":", parts: 2) do
@@ -555,13 +673,11 @@ defmodule Tightbeam.Productions.Bubble do
             "cause_seq=#{turn.cause_seq} session=#{cause.session_key}"
           )
 
-          :ok =
-            Assignments.transfer_cannot_proceed_disposer_to_user_in_txn(
-              txn,
-              cause.assignment_id,
-              turn.owner,
-              turn.cause_seq
-            )
+          transfer_cannot_proceed_disposers_to_user_for_cause_in_txn(
+            txn,
+            turn.cause_seq,
+            turn.owner
+          )
 
           fact =
             ConditionFacts.file_in_txn(txn, %{
@@ -639,7 +755,7 @@ defmodule Tightbeam.Productions.Bubble do
       DB.query(
         db,
         """
-        SELECT t.sessionKey, t.requestRef, s.ownerUserId, t.status, s.harness, s.host
+        SELECT t.sessionKey, t.requestRef, s.ownerUserId, t.status, s.harness, s.host, t.wakeId
         FROM turns AS t JOIN sessions AS s ON s.sessionKey = t.sessionKey
         WHERE t.seq = ?1
         """,
@@ -647,7 +763,9 @@ defmodule Tightbeam.Productions.Bubble do
       )
 
     case rows do
-      [[session_key, request_ref, owner, status, current_harness, current_host]] ->
+      [[session_key, request_ref, owner, status, current_harness, current_host, wake_id]] ->
+        request_ref = request_ref || carrier_request_ref(db, wake_id)
+
         case parse_cause_seq(request_ref, seq) do
           :malformed ->
             Logger.error(
@@ -754,12 +872,68 @@ defmodule Tightbeam.Productions.Bubble do
            harness: harness,
            host: host,
            assignment_id: assignment_id,
-           wake_id: wake_id
+           wake_id: wake_id,
+           source_wake_ids: carrier_source_wake_ids(db, wake_id)
          }}
 
       [] ->
         :missing
     end
+  end
+
+  defp carrier_request_ref(_db, nil), do: nil
+
+  defp carrier_request_ref(db, wake_id) when is_binary(wake_id) do
+    case DB.query(
+           db,
+           """
+           SELECT source.sessionKey,source.wakeId
+           FROM notice_batches batch
+           JOIN notice_batch_members member
+             ON member.batchId=batch.batchId AND member.state='included'
+           JOIN wakes source ON source.wakeId=member.sourceWakeId
+           WHERE batch.deliveryWakeId=?1
+           ORDER BY member.publicationSeq
+           """,
+           [wake_id]
+         ) do
+      {:ok, rows} ->
+        Enum.find_value(rows, fn [source_session, source_wake_id] ->
+          case bubble_source(source_wake_id, source_session) do
+            {:ok, cause_seq, ^source_session} -> "bubble:#{cause_seq}"
+            _ -> nil
+          end
+        end)
+
+      _ ->
+        nil
+    end
+  end
+
+  defp carrier_source_wake_ids(_db, nil), do: []
+
+  defp carrier_source_wake_ids(db, wake_id) when is_binary(wake_id) do
+    case DB.query(
+           db,
+           """
+           SELECT source.wakeId
+           FROM notice_batches batch
+           JOIN notice_batch_members member
+             ON member.batchId=batch.batchId AND member.state='included'
+           JOIN wakes source ON source.wakeId=member.sourceWakeId
+           WHERE batch.deliveryWakeId=?1
+           ORDER BY member.publicationSeq
+           """,
+           [wake_id]
+         ) do
+      {:ok, rows} -> Enum.map(rows, fn [source_wake_id] -> source_wake_id end)
+      _ -> []
+    end
+  end
+
+  defp carried_wake(%{wake_id: wake_id, source_wake_ids: [_ | _] = source_wake_ids})
+       when is_binary(wake_id) do
+    " carrying delivery wake #{wake_id} for source wake(s) #{Enum.join(source_wake_ids, ", ")}"
   end
 
   defp carried_wake(%{wake_id: wake_id}) when is_binary(wake_id), do: " carrying wake #{wake_id}"
