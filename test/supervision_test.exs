@@ -999,7 +999,7 @@ defmodule Tightbeam.SupervisionTest do
 
     assert first.session_key == "grandparent"
     assert first.prompt =~ "requestedDepth=0; targetDepth=1"
-    assert :staged = admit_supervision_wake!(ctx.db, first)
+    stage_supervision_source_while_busy!(ctx.db, first)
     _carrier_id = deliver_supervision_source_via_carrier!(ctx.db, first, complete_turn: true)
     idle_cleanup_elapsed!(ctx.db, first)
 

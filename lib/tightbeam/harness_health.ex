@@ -3637,7 +3637,14 @@ defmodule Tightbeam.HarnessHealth do
       {source_wake_id, turn_seq, plan, staged?} =
         case delivery do
           {:appended, ^target_ref, delivered_message, _opts} ->
-            {wake_id, delivered_message.seq,
+            [[delivery_turn_seq]] =
+              Txn.q(
+                txn,
+                "SELECT seq FROM turns WHERE sessionKey=?1 AND messageId=?2 AND wakeId=?3",
+                [target_ref, delivered_message.id, wake_id]
+              )
+
+            {wake_id, delivery_turn_seq,
              [
                {target_ref, owner, delivered_message.seq,
                 Payloads.server_message(delivered_message)}
