@@ -28,6 +28,7 @@ defmodule Tightbeam.Supervision do
     Gateway,
     HarnessHealth,
     Ledger,
+    NoticeBatcher,
     Org,
     RailEpisodes,
     RailRemedy,
@@ -4548,15 +4549,9 @@ defmodule Tightbeam.Supervision do
       WHERE w.origin='process:tightbeam' AND w.state='fired'
         AND w.obligationRef LIKE ?1
         AND w.obligationRef LIKE ?2
-        AND (
-          EXISTS (SELECT 1 FROM turns t WHERE t.wakeId=w.wakeId)
-          OR EXISTS (
-            SELECT 1
-            FROM notice_batch_members m
-            JOIN notice_batches b ON b.batchId=m.batchId
-            JOIN turns t ON t.wakeId=b.deliveryWakeId
-            WHERE m.sourceWakeId=w.wakeId AND m.state='included'
-          )
+        AND EXISTS (
+          SELECT 1 FROM (#{NoticeBatcher.source_deliveries_sql()}) d
+          WHERE d.sourceWakeId=w.wakeId
         )
       """,
       [@idle_cleanup_prefix <> group_digest <> "|%", "%|" <> member_token <> "|%"]
@@ -5269,38 +5264,7 @@ defmodule Tightbeam.Supervision do
 
   defp accepted_transfer(db_or_txn, assignment_id, requested_turn_seq) do
     candidates =
-      query(
-        db_or_txn,
-        """
-        SELECT t.seq, t.sessionKey, t.assignmentId,
-               w.wakeId, w.state, w.assignmentId, w.origin, w.createdAt, w.firedAt,
-               w.reresolve, w.reresolveSeed, w.reresolveRung,
-               s.assignmentId, s.controllerOrigin, s.wakeKind, s.controllerState,
-               s.chargedGeneration, s.transferEvidenceId
-        FROM turns t
-        JOIN wakes w ON w.wakeId=t.wakeId
-        LEFT JOIN supervision_liveness_sidecar s ON s.wakeId=w.wakeId
-        WHERE t.assignmentId=?1 AND w.assignmentId=?1
-          AND (?2 IS NULL OR t.seq=?2)
-          AND (w.reresolve='lineage' OR s.wakeKind='escalation')
-        UNION ALL
-        SELECT t.seq, t.sessionKey, source.assignmentId,
-               source.wakeId, source.state, source.assignmentId, source.origin,
-               source.createdAt, source.firedAt, source.reresolve, source.reresolveSeed,
-               source.reresolveRung, sidecar.assignmentId, sidecar.controllerOrigin,
-               sidecar.wakeKind, sidecar.controllerState, sidecar.chargedGeneration,
-               sidecar.transferEvidenceId
-        FROM turns t
-        JOIN notice_batches b ON b.deliveryWakeId=t.wakeId
-        JOIN notice_batch_members m ON m.batchId=b.batchId AND m.state='included'
-        JOIN wakes source ON source.wakeId=m.sourceWakeId
-        LEFT JOIN supervision_liveness_sidecar sidecar ON sidecar.wakeId=source.wakeId
-        WHERE source.assignmentId=?1 AND (?2 IS NULL OR t.seq=?2)
-          AND (source.reresolve='lineage' OR sidecar.wakeKind='escalation')
-        ORDER BY t.seq
-        """,
-        [assignment_id, requested_turn_seq]
-      )
+      transfer_candidate_rows(db_or_txn, assignment_id, requested_turn_seq)
       |> Enum.map(&decode_transfer_row/1)
       |> Enum.reject(fn candidate ->
         candidate.transfer_evidence_id == "#{assignment_id}##{candidate.turn_seq}"
@@ -5509,38 +5473,30 @@ defmodule Tightbeam.Supervision do
   end
 
   defp transfer_candidates(txn, assignment_id) do
-    Txn.q(
-      txn,
+    transfer_candidate_rows(txn, assignment_id, nil)
+    |> Enum.map(&decode_transfer_row/1)
+  end
+
+  defp transfer_candidate_rows(db_or_txn, assignment_id, requested_turn_seq) do
+    query(
+      db_or_txn,
       """
-      SELECT t.seq, t.sessionKey, t.assignmentId,
-             w.wakeId, w.state, w.assignmentId, w.origin, w.createdAt, w.firedAt,
-             w.reresolve, w.reresolveSeed, w.reresolveRung,
-             s.assignmentId, s.controllerOrigin, s.wakeKind, s.controllerState,
-             s.chargedGeneration, s.transferEvidenceId
-      FROM turns t
-      JOIN wakes w ON w.wakeId=t.wakeId
-      LEFT JOIN supervision_liveness_sidecar s ON s.wakeId=w.wakeId
-      WHERE t.assignmentId=?1 AND w.assignmentId=?1
-        AND (w.reresolve='lineage' OR s.wakeKind='escalation')
-      UNION ALL
-      SELECT t.seq, t.sessionKey, source.assignmentId,
-             source.wakeId, source.state, source.assignmentId, source.origin,
-             source.createdAt, source.firedAt, source.reresolve, source.reresolveSeed,
-             source.reresolveRung, sidecar.assignmentId, sidecar.controllerOrigin,
-             sidecar.wakeKind, sidecar.controllerState, sidecar.chargedGeneration,
-             sidecar.transferEvidenceId
-      FROM turns t
-      JOIN notice_batches b ON b.deliveryWakeId=t.wakeId
-      JOIN notice_batch_members m ON m.batchId=b.batchId AND m.state='included'
-      JOIN wakes source ON source.wakeId=m.sourceWakeId
-      LEFT JOIN supervision_liveness_sidecar sidecar ON sidecar.wakeId=source.wakeId
-      WHERE source.assignmentId=?1
-        AND (source.reresolve='lineage' OR sidecar.wakeKind='escalation')
+      WITH source_deliveries AS (#{NoticeBatcher.source_deliveries_sql()})
+      SELECT t.seq,t.sessionKey,d.assignmentId,
+             w.wakeId,w.state,w.assignmentId,w.origin,w.createdAt,w.firedAt,
+             w.reresolve,w.reresolveSeed,w.reresolveRung,
+             sidecar.assignmentId,sidecar.controllerOrigin,sidecar.wakeKind,
+             sidecar.controllerState,sidecar.chargedGeneration,sidecar.transferEvidenceId
+      FROM source_deliveries d JOIN turns t ON t.seq=d.turnSeq
+      JOIN wakes w ON w.wakeId=d.sourceWakeId
+      LEFT JOIN supervision_liveness_sidecar sidecar ON sidecar.wakeId=w.wakeId
+      WHERE d.assignmentId=?1 AND w.assignmentId=?1
+        AND (?2 IS NULL OR t.seq=?2)
+        AND (w.reresolve='lineage' OR sidecar.wakeKind='escalation')
       ORDER BY t.seq
       """,
-      [assignment_id]
+      [assignment_id, requested_turn_seq]
     )
-    |> Enum.map(&decode_transfer_row/1)
   end
 
   defp potential_legacy_candidate?(
@@ -5740,11 +5696,9 @@ defmodule Tightbeam.Supervision do
   defp retirement_outcome_id_in_txn(txn, assignment_id, target, wake_id, delivery) do
     case delivery do
       {:appended, ^target, _message, _opts} ->
-        case Txn.q(txn, "SELECT seq FROM turns WHERE wakeId=?1 ORDER BY seq DESC LIMIT 1", [
-               wake_id
-             ]) do
-          [[turn_seq]] -> "#{assignment_id}##{turn_seq}"
-          [] -> legacy_refusal!(assignment_id, "retirement_outcome_turn_missing")
+        case List.last(NoticeBatcher.source_delivery_turns_in_txn(txn, wake_id)) do
+          [turn_seq, _status, _source_assignment] -> "#{assignment_id}##{turn_seq}"
+          nil -> legacy_refusal!(assignment_id, "retirement_outcome_turn_missing")
         end
 
       {:duplicate, %{turn_seq: turn_seq}} when is_integer(turn_seq) ->
@@ -5821,12 +5775,9 @@ defmodule Tightbeam.Supervision do
     query(
       db_or_txn,
       """
-      SELECT 1
-      FROM turns t
-      JOIN notice_batches b ON b.deliveryWakeId=t.wakeId
-      JOIN notice_batch_members m ON m.batchId=b.batchId AND m.state='included'
-      WHERE t.seq=?1 AND m.sourceWakeId=?2
-      LIMIT 1
+      WITH source_deliveries AS (#{NoticeBatcher.source_deliveries_sql()})
+      SELECT 1 FROM source_deliveries d
+      WHERE d.turnSeq=?1 AND d.sourceWakeId=?2 AND d.carrier=1 LIMIT 1
       """,
       [turn_seq, source_wake_id]
     ) != []

@@ -3565,6 +3565,13 @@ defmodule Tightbeam.SupervisionTest do
 
   test "a staged retirement elevation keeps immutable source evidence and validates through its carrier",
        ctx do
+    suffix = System.unique_integer([:positive])
+    registry = :"retirement_carrier_registry_#{suffix}"
+    lane = :"retirement_carrier_lane_#{suffix}"
+    start_supervised!({ConnRegistry, name: registry})
+    start_supervised!({LaneDoorbell, lane})
+    delivery_opts = [conn_registry: registry, lane_manager: lane]
+
     {:ok, _} =
       DB.query(
         ctx.db,
@@ -3591,22 +3598,20 @@ defmodule Tightbeam.SupervisionTest do
     stage_supervision_source_while_busy!(ctx.db, source_wake)
 
     [initial_carrier_id] =
-      NoticeBatcher.recover(ctx.db, System.system_time(:millisecond) + 1_000)
+      NoticeBatcher.recover(ctx.db, System.system_time(:millisecond) + 1_000, delivery_opts)
 
     initial_carrier = Wakes.get(ctx.db, initial_carrier_id)
 
-    assert {:ok, {:appended, "supervisor", _message, _opts}} =
+    assert initial_carrier.session_key == "supervisor"
+
+    assert {:ok, [[initial_seq, "supervisor", "queued"]]} =
+             DB.query(ctx.db, "SELECT seq,sessionKey,status FROM turns WHERE wakeId=?1", [
+               initial_carrier_id
+             ])
+
+    assert {:ok, [[^initial_seq, "queued", "asg_1"]]} =
              DB.transaction(ctx.db, fn txn ->
-               Gateway.deliver_prompt_in_txn(
-                 txn,
-                 initial_carrier.session_key,
-                 initial_carrier.origin,
-                 initial_carrier.prompt,
-                 wake_id: initial_carrier.wake_id,
-                 sender: initial_carrier.origin,
-                 target_gate: initial_carrier,
-                 fire_wake_in_txn: true
-               )
+               NoticeBatcher.source_delivery_turns_in_txn(txn, source_wake.wake_id)
              end)
 
     {:appended, current_message} =
@@ -3667,22 +3672,20 @@ defmodule Tightbeam.SupervisionTest do
     assert :ok = Ledger.finish(ctx.db, current_seq, "delivered", nil, owner_lease: lease)
 
     [carrier_id] =
-      NoticeBatcher.recover(ctx.db, System.system_time(:millisecond) + 1_000)
+      NoticeBatcher.recover(ctx.db, System.system_time(:millisecond) + 1_000, delivery_opts)
 
     carrier = Wakes.get(ctx.db, carrier_id)
 
-    assert {:ok, {:appended, target, _message, _opts}} =
+    target = carrier.session_key
+
+    assert {:ok, [[carrier_seq, ^target, "queued"]]} =
+             DB.query(ctx.db, "SELECT seq,sessionKey,status FROM turns WHERE wakeId=?1", [
+               carrier_id
+             ])
+
+    assert {:ok, [[^carrier_seq, "queued", "asg_1"]]} =
              DB.transaction(ctx.db, fn txn ->
-               Gateway.deliver_prompt_in_txn(
-                 txn,
-                 carrier.session_key,
-                 carrier.origin,
-                 carrier.prompt,
-                 wake_id: carrier.wake_id,
-                 sender: carrier.origin,
-                 target_gate: carrier,
-                 fire_wake_in_txn: true
-               )
+               NoticeBatcher.source_delivery_turns_in_txn(txn, successor_wake_id)
              end)
 
     assert target == main_key

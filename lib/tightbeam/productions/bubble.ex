@@ -37,6 +37,7 @@ defmodule Tightbeam.Productions.Bubble do
     EventLog,
     Gateway,
     HarnessHealth,
+    NoticeBatcher,
     Org,
     Projection,
     Supervision,
@@ -290,20 +291,13 @@ defmodule Tightbeam.Productions.Bubble do
             WHERE cp.state='standing'
               AND decision.sessionKey=?1
               AND decision.assignmentId=cp.assignmentId
-              AND (
-                decision.wakeId=?2
-                OR EXISTS (
-                  SELECT 1
-                  FROM notice_batch_members member
-                  JOIN notice_batches batch ON batch.batchId=member.batchId
-                  WHERE member.sourceWakeId=decision.wakeId
-                    AND member.state='included'
-                    AND batch.deliveryWakeId=?2
-                )
+              AND EXISTS (
+                SELECT 1 FROM (#{NoticeBatcher.source_deliveries_sql()}) d
+                WHERE d.turnSeq=?2 AND d.sourceWakeId=decision.wakeId
               )
             ORDER BY cp.assignmentId, cp.decisionWakeId
             """,
-            [cause_session, cause_wake_id]
+            [cause_session, cause_seq]
           )
 
         Enum.each(decision_wakes, fn [assignment_id, decision_wake_id] ->
@@ -358,15 +352,12 @@ defmodule Tightbeam.Productions.Bubble do
               DB.Txn.q(
                 txn,
                 """
-                SELECT wakeId,assignmentId,sessionKey FROM wakes WHERE wakeId=?1
-                UNION
+                WITH source_deliveries AS (#{NoticeBatcher.source_deliveries_sql()})
                 SELECT source.wakeId,source.assignmentId,source.sessionKey
-                FROM notice_batch_members member
-                JOIN notice_batches batch ON batch.batchId=member.batchId
-                JOIN wakes source ON source.wakeId=member.sourceWakeId
-                WHERE batch.deliveryWakeId=?1 AND member.state='included'
+                FROM source_deliveries d JOIN wakes source ON source.wakeId=d.sourceWakeId
+                WHERE d.turnSeq=?1
                 """,
-                [cause_wake_id]
+                [cause_seq]
               )
             else
               []
@@ -503,6 +494,7 @@ defmodule Tightbeam.Productions.Bubble do
       DB.query(
         db,
         """
+        WITH source_deliveries AS (#{NoticeBatcher.source_deliveries_sql()})
         SELECT source.sessionKey,
                CASE
                  WHEN turn.status IS NOT NULL THEN turn.status
@@ -510,10 +502,8 @@ defmodule Tightbeam.Productions.Bubble do
                  ELSE source.state
                END
         FROM wakes source
-        LEFT JOIN notice_batch_members member
-          ON member.sourceWakeId=source.wakeId AND member.state='included'
-        LEFT JOIN notice_batches batch ON batch.batchId=member.batchId
-        LEFT JOIN turns turn ON turn.wakeId=batch.deliveryWakeId
+        LEFT JOIN source_deliveries d ON d.sourceWakeId=source.wakeId
+        LEFT JOIN turns turn ON turn.seq=d.turnSeq
         WHERE substr(source.wakeId,1,length(?1)+1)=?1 || ':'
           AND source.state IN ('pending','fired')
         ORDER BY source.createdAt,source.wakeId
@@ -888,13 +878,11 @@ defmodule Tightbeam.Productions.Bubble do
     case DB.query(
            db,
            """
+           WITH source_deliveries AS (#{NoticeBatcher.source_deliveries_sql()})
            SELECT source.sessionKey,source.wakeId
-           FROM notice_batches batch
-           JOIN notice_batch_members member
-             ON member.batchId=batch.batchId AND member.state='included'
-           JOIN wakes source ON source.wakeId=member.sourceWakeId
-           WHERE batch.deliveryWakeId=?1
-           ORDER BY member.publicationSeq
+           FROM source_deliveries d JOIN wakes source ON source.wakeId=d.sourceWakeId
+           JOIN turns turn ON turn.seq=d.turnSeq
+           WHERE turn.wakeId=?1 AND d.carrier=1 ORDER BY d.publicationSeq
            """,
            [wake_id]
          ) do
@@ -917,13 +905,10 @@ defmodule Tightbeam.Productions.Bubble do
     case DB.query(
            db,
            """
-           SELECT source.wakeId
-           FROM notice_batches batch
-           JOIN notice_batch_members member
-             ON member.batchId=batch.batchId AND member.state='included'
-           JOIN wakes source ON source.wakeId=member.sourceWakeId
-           WHERE batch.deliveryWakeId=?1
-           ORDER BY member.publicationSeq
+           WITH source_deliveries AS (#{NoticeBatcher.source_deliveries_sql()})
+           SELECT d.sourceWakeId
+           FROM source_deliveries d JOIN turns turn ON turn.seq=d.turnSeq
+           WHERE turn.wakeId=?1 AND d.carrier=1 ORDER BY d.publicationSeq
            """,
            [wake_id]
          ) do

@@ -1541,7 +1541,28 @@ defmodule Tightbeam.AssignmentsTest do
     end
   end
 
+  defmodule RecoveryDoorbell do
+    use GenServer
+
+    def start_link(parent),
+      do: GenServer.start_link(__MODULE__, parent, name: Tightbeam.LaneManager)
+
+    def init(parent), do: {:ok, parent}
+
+    def handle_call({:ensure_lane, key}, _from, parent) do
+      send(parent, {:recovery_lane_ready, key})
+      {:reply, :ok, parent}
+    end
+  end
+
   describe "terminal notice explicit recovery" do
+    setup do
+      start_supervised!(Tightbeam.ConnRegistry)
+      start_supervised!({RecoveryDoorbell, self()})
+      :ok
+    end
+
+    @tag terminal_root_replay: true
     test "independent terminal roots in one failed carrier recover separately", ctx do
       {first, _sibling, _delegation} = terminal_delegated_fixture(ctx)
 
@@ -2462,25 +2483,22 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   defp deliver_terminal_notice_carrier(db, source_wake_id) do
-    _carrier_ids = NoticeBatcher.recover(db, System.system_time(:millisecond) + 60_000)
-    [%{delivery_wake_id: carrier_wake_id}] = NoticeBatcher.source_refs(db, source_wake_id)
-    carrier = Wakes.get(db, carrier_wake_id)
+    carrier_ids = NoticeBatcher.recover(db, System.system_time(:millisecond) + 60_000)
 
-    {:ok, result} =
-      DB.transaction(db, fn txn ->
-        Gateway.deliver_prompt_in_txn(
-          txn,
-          carrier.session_key,
-          carrier.origin,
-          carrier.prompt,
-          wake_id: carrier.wake_id,
-          sender: carrier.origin,
-          target_gate: carrier,
-          fire_wake_in_txn: true
-        )
-      end)
+    [%{delivery_wake_id: carrier_wake_id, member_state: "included"}] =
+      NoticeBatcher.source_refs(db, source_wake_id)
 
-    result
+    assert carrier_wake_id in carrier_ids
+
+    assert {:ok, [[target, message_id]]} =
+             DB.query(
+               db,
+               "SELECT sessionKey,messageId FROM turns WHERE wakeId=?1 AND status='queued'",
+               [carrier_wake_id]
+             )
+
+    # recover now commits the actual turn atomically; a second append would be a duplicate.
+    {:appended, target, Projection.get(db, message_id), []}
   end
 
   defp deliver_scheduled_wake(db, wake) do

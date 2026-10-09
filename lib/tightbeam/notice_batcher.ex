@@ -1259,19 +1259,33 @@ defmodule Tightbeam.NoticeBatcher do
   end
 
   @doc false
+  # One read-only relation for actual delivery history. Transport membership
+  # before a turn exists is deliberately not delivery evidence. Callers keep
+  # their domain/assignment/authority predicates outside this relation.
+  def source_deliveries_sql do
+    """
+    SELECT t.seq AS turnSeq,t.wakeId AS sourceWakeId,t.assignmentId AS assignmentId,
+           0 AS carrier,NULL AS publicationSeq
+    FROM turns t WHERE t.wakeId IS NOT NULL
+    UNION ALL
+    SELECT t.seq,m.sourceWakeId,w.assignmentId,1,m.publicationSeq
+    FROM notice_batch_members m
+    JOIN notice_batches b ON b.batchId=m.batchId
+    JOIN wakes w ON w.wakeId=m.sourceWakeId
+    JOIN turns t ON t.wakeId=b.deliveryWakeId
+    WHERE m.state='included'
+    """
+  end
+
+  @doc false
   def source_delivery_turns_in_txn(%Txn{} = txn, source_wake_id) do
     Txn.q(
       txn,
       """
-      SELECT seq,status,assignmentId FROM turns WHERE wakeId=?1
-      UNION ALL
-      SELECT t.seq,t.status,w.assignmentId
-      FROM notice_batch_members m
-      JOIN notice_batches b ON b.batchId=m.batchId
-      JOIN wakes w ON w.wakeId=m.sourceWakeId
-      JOIN turns t ON t.wakeId=b.deliveryWakeId
-      WHERE m.sourceWakeId=?1 AND m.state='included'
-      ORDER BY seq
+      WITH source_deliveries AS (#{source_deliveries_sql()})
+      SELECT t.seq,t.status,d.assignmentId
+      FROM source_deliveries d JOIN turns t ON t.seq=d.turnSeq
+      WHERE d.sourceWakeId=?1 ORDER BY t.seq
       """,
       [source_wake_id]
     )

@@ -5,6 +5,7 @@ defmodule Tightbeam.ReminderDelivery do
   # terminal transaction. Enqueue, running, and unknown outcomes are not success.
   @gaps [300_000, 900_000, 1_800_000, 1_800_000]
 
+  alias Tightbeam.NoticeBatcher
   alias Tightbeam.DB.Txn
 
   # The caller has already established ordinary supervision eligibility. This
@@ -72,7 +73,13 @@ defmodule Tightbeam.ReminderDelivery do
     proven =
       Txn.q(
         txn,
-        "SELECT 1 FROM wakes w JOIN wake_cancellations c ON c.wakeId=w.wakeId WHERE w.wakeId=?1 AND w.assignmentId=?2 AND w.state='canceled' AND c.outcomeKind='no_replacement' AND NOT EXISTS (SELECT 1 FROM turns t WHERE t.wakeId=w.wakeId)",
+        """
+        WITH source_deliveries AS (#{NoticeBatcher.source_deliveries_sql()})
+        SELECT 1 FROM wakes w JOIN wake_cancellations c ON c.wakeId=w.wakeId
+        WHERE w.wakeId=?1 AND w.assignmentId=?2 AND w.state='canceled'
+          AND c.outcomeKind='no_replacement'
+          AND NOT EXISTS (SELECT 1 FROM source_deliveries d WHERE d.sourceWakeId=w.wakeId)
+        """,
         [wake, assignment]
       )
 
@@ -118,13 +125,10 @@ defmodule Tightbeam.ReminderDelivery do
           Txn.q(
             txn,
             """
-            SELECT source.assignmentId, source.wakeId
-            FROM notice_batch_members m
-            JOIN notice_batches b ON b.batchId=m.batchId
-            JOIN wakes source ON source.wakeId=m.sourceWakeId
-            JOIN turns carrier ON carrier.wakeId=b.deliveryWakeId
-            WHERE carrier.seq=?1 AND carrier.status='delivered' AND m.state='included'
-              AND source.assignmentId IS NOT NULL
+            WITH source_deliveries AS (#{NoticeBatcher.source_deliveries_sql()})
+            SELECT d.assignmentId,d.sourceWakeId
+            FROM source_deliveries d
+            WHERE d.turnSeq=?1 AND d.carrier=1 AND d.assignmentId IS NOT NULL
             """,
             [turn_seq]
           )
@@ -158,16 +162,9 @@ defmodule Tightbeam.ReminderDelivery do
           Txn.q(
             txn,
             """
-            SELECT wakeId FROM turns WHERE seq=?1 AND assignmentId=?2
-            UNION ALL
-            SELECT source.wakeId
-            FROM turns carrier
-            JOIN notice_batches batch ON batch.deliveryWakeId=carrier.wakeId
-            JOIN notice_batch_members member
-              ON member.batchId=batch.batchId AND member.state='included'
-            JOIN wakes source ON source.wakeId=member.sourceWakeId
-            WHERE carrier.seq=?1 AND source.assignmentId=?2
-            ORDER BY wakeId
+            WITH source_deliveries AS (#{NoticeBatcher.source_deliveries_sql()})
+            SELECT d.sourceWakeId FROM source_deliveries d
+            WHERE d.turnSeq=?1 AND d.assignmentId=?2 ORDER BY d.sourceWakeId
             """,
             [source_seq, assignment]
           )
