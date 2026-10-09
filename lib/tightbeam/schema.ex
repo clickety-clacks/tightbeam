@@ -398,6 +398,7 @@ defmodule Tightbeam.Schema do
   @fresh_owner_link_origin_table "schema_bootstrap_origin"
   @work_item_owner_link_shape "work-item-delivery-owner-v1-019"
   @assignment_source_replacement_shape "assignment-source-replacement-v1-019"
+  @notice_source_payload_shape "notice-source-storage-v1-019"
   @identity_publication_denial_diagnostic_previous_shape @artifact_origin_shape
   @identity_publication_denial_diagnostic_shape "identity-publication-denial-diagnostic-v1-019"
   @supervision_receipt_cancellation_shape "supervision-receipt-cancellation-v1-019"
@@ -1534,6 +1535,7 @@ defmodule Tightbeam.Schema do
   @doc false
   def guard_compatible_stamps do
     [
+      @notice_source_payload_shape,
       @assignment_source_replacement_shape,
       @work_item_owner_link_shape,
       @identity_publication_denial_diagnostic_shape,
@@ -1619,6 +1621,7 @@ defmodule Tightbeam.Schema do
             @agent_reparent_shape,
             @artifact_origin_shape,
             @identity_publication_denial_diagnostic_shape,
+            @notice_source_payload_shape,
             @assignment_source_replacement_shape,
             @work_item_owner_link_shape
           ]
@@ -1707,10 +1710,431 @@ defmodule Tightbeam.Schema do
     # and the complete batch schema exists.
     :ok = migrate_supervision_batch_delivery_guards(db)
     :ok = migrate_wake_retry_source_scope(db)
+    :ok = upgrade_notice_source_payload(db)
 
     case DB.finish_schema(db) do
       :ok -> :ok
       {:error, error} -> raise error
+    end
+  end
+
+  @source_client_column """
+  sourceClientIdentity TEXT CHECK (
+    sourceClientIdentity IS NULL OR (
+      json_valid(sourceClientIdentity) AND json_type(sourceClientIdentity)='object'
+      AND json_type(sourceClientIdentity,'$.targetSessionKey')='text'
+      AND json_type(sourceClientIdentity,'$.deviceId')='text'
+      AND json_type(sourceClientIdentity,'$.clientMessageId')='text'
+      AND json_type(sourceClientIdentity,'$.sourceWakeId')='text'
+      AND json_type(sourceClientIdentity,'$.payloadSha256')='text'
+      AND length(json_extract(sourceClientIdentity,'$.payloadSha256'))=64
+      AND json_type(sourceClientIdentity,'$.createdAt')='integer'
+      AND json_extract(sourceClientIdentity,'$.createdAt')>=0
+      AND json_extract(sourceClientIdentity,'$.sourceWakeId')=wakeId
+    )
+  )
+  """
+  @source_address_column "sourceAddress TEXT CHECK (sourceAddress IS NULL OR length(trim(sourceAddress))>0)"
+  @source_visibility_column "sourceVisibilityScope TEXT CHECK (sourceVisibilityScope IS NULL OR length(trim(sourceVisibilityScope))>0)"
+  @source_attachments_column "sourceAttachments TEXT CHECK (sourceAttachments IS NULL OR json_valid(sourceAttachments))"
+  @source_client_index """
+  CREATE UNIQUE INDEX notice_source_client_identity ON wakes (
+    json_extract(sourceClientIdentity,'$.targetSessionKey'),
+    json_extract(sourceClientIdentity,'$.deviceId'),
+    json_extract(sourceClientIdentity,'$.clientMessageId')
+  ) WHERE sourceClientIdentity IS NOT NULL
+  """
+
+  # Move payload authority onto the editable source itself. Each historical row
+  # is copied before its table is dropped; the successor stamp commits with it.
+  # Retired selections remain exact historical evidence, never delivery authority.
+  defp upgrade_notice_source_payload(db) do
+    case DB.migration_transaction(
+           db,
+           :notice_source_payload,
+           ["PRAGMA foreign_keys=OFF", "PRAGMA legacy_alter_table=ON"],
+           ["PRAGMA legacy_alter_table=OFF", "PRAGMA foreign_keys=ON"],
+           fn txn ->
+             case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+               [[@notice_source_payload_shape]] ->
+                 validate_notice_source_payload_in_txn!(txn)
+
+               [[@assignment_source_replacement_shape]] ->
+                 unless Txn.q(
+                          txn,
+                          "SELECT name FROM pragma_table_info('wakes') WHERE name IN ('sourceAttachments','sourceClientIdentity','sourceVisibilityScope','sourceAddress')"
+                        ) == [] do
+                   raise ShapeError,
+                     message: "incompatible_notice_source_payload: unstamped source columns"
+                 end
+
+                 present =
+                   for {name, expected} <-
+                         Tightbeam.NoticeBatcher.previous_source_payload_objects(),
+                       reduce: [] do
+                     names ->
+                       case Txn.q(
+                              txn,
+                              "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+                              [name]
+                            ) do
+                         [] ->
+                           names
+
+                         [[sql]] ->
+                           unless normalize_schema_sql(sql) == normalize_schema_sql(expected),
+                             do:
+                               raise(ShapeError,
+                                 message: "incompatible_notice_source_payload: malformed #{name}"
+                               )
+
+                           unless Txn.q(
+                                    txn,
+                                    "SELECT name FROM sqlite_master WHERE tbl_name=?1 AND type IN ('index','trigger') AND sql IS NOT NULL",
+                                    [name]
+                                  ) == [],
+                                  do:
+                                    raise(ShapeError,
+                                      message:
+                                        "incompatible_notice_source_payload: unknown objects on #{name}"
+                                    )
+
+                           unless Txn.q(
+                                    txn,
+                                    "SELECT name FROM sqlite_master WHERE sql LIKE ?1 AND name<>?2 AND sql IS NOT NULL
+                                    AND NOT (?2='notice_delivery_policies' AND name='notice_batch_members')",
+                                    ["%#{name}%", name]
+                                  ) == [],
+                                  do:
+                                    raise(ShapeError,
+                                      message:
+                                        "incompatible_notice_source_payload: external dependency on #{name}"
+                                    )
+
+                           [name | names]
+                       end
+                   end
+
+                 if Txn.q(
+                      txn,
+                      "SELECT name FROM sqlite_master WHERE name='notice_source_client_identity'"
+                    ) != [],
+                    do:
+                      raise(ShapeError,
+                        message: "incompatible_notice_source_payload: unstamped client index"
+                      )
+
+                 :ok = Txn.exec(txn, "ALTER TABLE wakes ADD COLUMN " <> @source_client_column)
+
+                 :ok =
+                   Txn.exec(txn, "ALTER TABLE wakes ADD COLUMN " <> @source_attachments_column)
+
+                 :ok = Txn.exec(txn, @source_client_index)
+                 :ok = Txn.exec(txn, "ALTER TABLE wakes ADD COLUMN " <> @source_visibility_column)
+                 :ok = Txn.exec(txn, "ALTER TABLE wakes ADD COLUMN " <> @source_address_column)
+                 retire_notice_policy_storage_in_txn!(txn, present)
+
+                 if "staged_message_dedupes" in present do
+                   rows =
+                     Txn.q(
+                       txn,
+                       "SELECT targetSessionKey,deviceId,clientMessageId,sourceWakeId,payloadSha256,createdAt FROM staged_message_dedupes"
+                     )
+
+                   for [target, device, client, wake, hash, created] <- rows do
+                     identity = %{
+                       "targetSessionKey" => target,
+                       "deviceId" => device,
+                       "clientMessageId" => client,
+                       "sourceWakeId" => wake,
+                       "payloadSha256" => hash,
+                       "createdAt" => created
+                     }
+
+                     :ok =
+                       Tightbeam.NoticeBatcher.persist_source_client_in_txn(txn, wake, identity)
+                   end
+
+                   [[copied]] =
+                     Txn.q(
+                       txn,
+                       "SELECT COUNT(*) FROM wakes WHERE sourceClientIdentity IS NOT NULL"
+                     )
+
+                   unless copied == length(rows),
+                     do:
+                       raise(ShapeError,
+                         message: "incompatible_notice_source_payload: client copy count"
+                       )
+                 end
+
+                 if "notice_batch_source_attachments" in present do
+                   rows =
+                     Txn.q(
+                       txn,
+                       "SELECT sourceWakeId,attachments FROM notice_batch_source_attachments"
+                     )
+
+                   for [wake, encoded] <- rows do
+                     Txn.q(
+                       txn,
+                       "UPDATE wakes SET sourceAttachments=?2 WHERE wakeId=?1 AND sourceAttachments IS NULL",
+                       [wake, encoded]
+                     )
+
+                     unless Txn.changes(txn) == 1,
+                       do:
+                         raise(ShapeError,
+                           message:
+                             "incompatible_notice_source_payload: attachment source missing"
+                         )
+
+                     unless Txn.q(txn, "SELECT sourceAttachments FROM wakes WHERE wakeId=?1", [
+                              wake
+                            ]) ==
+                              [[encoded]],
+                            do:
+                              raise(ShapeError,
+                                message:
+                                  "incompatible_notice_source_payload: attachment bytes changed"
+                              )
+                   end
+
+                   [[copied]] =
+                     Txn.q(txn, "SELECT COUNT(*) FROM wakes WHERE sourceAttachments IS NOT NULL")
+
+                   unless copied == length(rows),
+                     do:
+                       raise(ShapeError,
+                         message: "incompatible_notice_source_payload: attachment copy count"
+                       )
+                 end
+
+                 for name <- present, do: :ok = Txn.exec(txn, "DROP TABLE " <> name)
+
+                 unless Txn.q(txn, "PRAGMA foreign_key_check") == [],
+                   do:
+                     raise(ShapeError,
+                       message: "incompatible_notice_source_payload: invalid foreign keys"
+                     )
+
+                 Txn.q(txn, "UPDATE schema_stamp SET shape=?1,stampedAt=?2 WHERE shape=?3", [
+                   @notice_source_payload_shape,
+                   System.system_time(:millisecond),
+                   @assignment_source_replacement_shape
+                 ])
+
+                 unless Txn.changes(txn) == 1,
+                   do:
+                     raise(ShapeError, message: "incompatible_notice_source_payload: stamp race")
+
+                 validate_notice_source_payload_in_txn!(txn)
+
+               rows ->
+                 raise ShapeError,
+                   message: "incompatible_notice_source_payload: predecessor #{inspect(rows)}"
+             end
+           end
+         ) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message: "notice source payload migration rolled back: #{Exception.message(error)}"
+    end
+  end
+
+  defp validate_notice_source_payload_in_txn!(txn) do
+    [[sql]] = Txn.q(txn, "SELECT sql FROM sqlite_master WHERE type='table' AND name='wakes'")
+
+    for definition <- [
+          @source_client_column,
+          @source_attachments_column,
+          @source_visibility_column,
+          @source_address_column
+        ] do
+      unless String.contains?(normalize_schema_sql(sql), normalize_schema_sql(definition)),
+        do:
+          raise(ShapeError,
+            message: "incompatible_notice_source_payload: malformed source columns"
+          )
+    end
+
+    case Txn.q(
+           txn,
+           "SELECT sql FROM sqlite_master WHERE type='index' AND name='notice_source_client_identity'"
+         ) do
+      [[sql]] ->
+        unless normalize_schema_sql(sql) == normalize_schema_sql(@source_client_index),
+          do:
+            raise(ShapeError,
+              message: "incompatible_notice_source_payload: malformed client index"
+            )
+
+      _ ->
+        raise ShapeError, message: "incompatible_notice_source_payload: missing client index"
+    end
+
+    unless Txn.q(
+             txn,
+             "SELECT name FROM sqlite_master WHERE name IN ('staged_message_dedupes','notice_batch_source_attachments','notice_delivery_policies','notice_batching_lane_policies')"
+           ) == [],
+           do:
+             raise(ShapeError,
+               message: "incompatible_notice_source_payload: retired payload tables remain"
+             )
+
+    [[members]] =
+      Txn.q(
+        txn,
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='notice_batch_members'"
+      )
+
+    unless normalize_schema_sql(
+             String.replace(members, ~s("notice_batch_members"), "notice_batch_members")
+           ) ==
+             normalize_schema_sql(Tightbeam.NoticeBatcher.source_member_ddl()),
+           do:
+             raise(ShapeError,
+               message: "incompatible_notice_source_payload: malformed source members"
+             )
+
+    :ok
+  end
+
+  defp retire_notice_policy_storage_in_txn!(txn, present) do
+    if "notice_delivery_policies" in present do
+      rows =
+        Txn.q(
+          txn,
+          "SELECT policyRef,sourceWakeId,recipientAddress,sessionKey,targetRole,visibilityScope,policyRevision,deadlineAt,enabled,createdAt FROM notice_delivery_policies ORDER BY policyRef"
+        )
+
+      keys =
+        ~w(policyRef sourceWakeId recipientAddress sessionKey targetRole visibilityScope policyRevision deadlineAt enabled createdAt)
+
+      for [ref, wake, address, _session, _role, scope | _] = row <- rows do
+        Txn.q(
+          txn,
+          "UPDATE wakes SET sourceVisibilityScope=?2,sourceAddress=?3 WHERE wakeId=?1 AND sourceVisibilityScope IS NULL",
+          [wake, scope, address]
+        )
+
+        unless Txn.changes(txn) == 1,
+          do:
+            raise(ShapeError,
+              message: "incompatible_notice_source_payload: policy source missing"
+            )
+
+        Tightbeam.EventLog.lifecycle_in_txn(
+          txn,
+          "notice_source_policy_retired",
+          ref,
+          JSON.encode!(Map.new(Enum.zip(keys, row)))
+        )
+      end
+    end
+
+    if "notice_batching_lane_policies" in present do
+      keys =
+        ~w(recipientAddress visibilityScope enabled policyRevision policyRef selectedBy cause selectedAt)
+
+      for row <-
+            Txn.q(
+              txn,
+              "SELECT recipientAddress,visibilityScope,enabled,policyRevision,policyRef,selectedBy,cause,selectedAt FROM notice_batching_lane_policies ORDER BY recipientAddress,visibilityScope"
+            ) do
+        Tightbeam.EventLog.lifecycle_in_txn(
+          txn,
+          "notice_lane_policy_retired",
+          Enum.at(row, 4),
+          JSON.encode!(Map.new(Enum.zip(keys, row)))
+        )
+      end
+    end
+
+    [[actual]] =
+      Txn.q(
+        txn,
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='notice_batch_members'"
+      )
+
+    actual =
+      normalize_schema_sql(
+        String.replace(actual, ~s("notice_batch_members"), "notice_batch_members")
+      )
+
+    current = Tightbeam.NoticeBatcher.source_member_ddl()
+    predecessor = Tightbeam.NoticeBatcher.previous_source_member_ddl()
+
+    cond do
+      actual == normalize_schema_sql(current) ->
+        :ok
+
+      actual == normalize_schema_sql(predecessor) ->
+        objects =
+          Txn.q(
+            txn,
+            "SELECT type,name,sql FROM sqlite_master WHERE tbl_name='notice_batch_members' AND sql IS NOT NULL AND type IN ('index','trigger') ORDER BY type,name"
+          )
+
+        expected_index =
+          "CREATE INDEX IF NOT EXISTS notice_batch_members_batch ON notice_batch_members(batchId, publicationSeq)"
+
+        unless match?([["index", "notice_batch_members_batch", _]], objects) and
+                 normalize_schema_sql(objects |> hd() |> List.last()) ==
+                   normalize_schema_sql(expected_index),
+               do:
+                 raise(ShapeError,
+                   message: "incompatible_notice_source_payload: unknown member objects"
+                 )
+
+        unless Txn.q(
+                 txn,
+                 "SELECT name FROM sqlite_master WHERE name='notice_source_members_migration'"
+               ) == [],
+               do:
+                 raise(ShapeError,
+                   message: "incompatible_notice_source_payload: member migration object exists"
+                 )
+
+        before = Txn.q(txn, "SELECT rowid,* FROM notice_batch_members ORDER BY rowid")
+
+        :ok =
+          Txn.exec(
+            txn,
+            String.replace(current, "notice_batch_members", "notice_source_members_migration")
+          )
+
+        :ok =
+          Txn.exec(
+            txn,
+            "INSERT INTO notice_source_members_migration (rowid,memberId,batchId,sourceWakeId,policyRef,recipientAddress,visibilityScope,publicationSeq,policyRevision,senderPrincipal,cause,class,payload,renderedBytes,state,addedAt,canceledAt,cancellationRef) SELECT rowid,* FROM notice_batch_members"
+          )
+
+        # Explicit rowid is preserved as well as every member payload and history slot.
+        after_rows =
+          Txn.q(txn, "SELECT rowid,* FROM notice_source_members_migration ORDER BY rowid")
+
+        unless before == after_rows,
+          do:
+            raise(ShapeError, message: "incompatible_notice_source_payload: member bytes changed")
+
+        :ok =
+          Txn.exec(
+            txn,
+            "DROP TABLE notice_batch_members; ALTER TABLE notice_source_members_migration RENAME TO notice_batch_members"
+          )
+
+        :ok = Txn.exec(txn, objects |> hd() |> List.last())
+
+      true ->
+        raise ShapeError,
+          message: "incompatible_notice_source_payload: malformed predecessor members"
     end
   end
 
@@ -2045,13 +2469,13 @@ defmodule Tightbeam.Schema do
       cond do
         supervision_receipt_cancellation_active?(txn, shape) ->
           liveness_objects =
-            if shape == @assignment_source_replacement_shape,
+            if shape in [@assignment_source_replacement_shape, @notice_source_payload_shape],
               do: @assignment_source_replacement_liveness_objects,
               else: @supervision_receipt_cancellation_liveness_objects
 
           Enum.reject(liveness_objects, &(&1.name == "supervision_receipt_cancellation_epoch"))
 
-        shape == @assignment_source_replacement_shape ->
+        shape in [@assignment_source_replacement_shape, @notice_source_payload_shape] ->
           incompatible_supervision_liveness!(
             "assignment source replacement stamp lacks its exact cancellation activation marker"
           )
@@ -2124,6 +2548,7 @@ defmodule Tightbeam.Schema do
            @agent_reparent_shape,
            @artifact_origin_shape,
            @identity_publication_denial_diagnostic_shape,
+           @notice_source_payload_shape,
            @assignment_source_replacement_shape,
            @work_item_owner_link_shape
          ],
@@ -2662,7 +3087,11 @@ defmodule Tightbeam.Schema do
   defp upgrade_supervision_receipt_cancellation_v1_in_txn(%Txn{} = txn) do
     [[shape]] = Txn.q(txn, "SELECT shape FROM schema_stamp")
 
-    unless shape in [@work_item_owner_link_shape, @assignment_source_replacement_shape] do
+    unless shape in [
+             @work_item_owner_link_shape,
+             @assignment_source_replacement_shape,
+             @notice_source_payload_shape
+           ] do
       incompatible_supervision_liveness!(
         "receipt cancellation predecessor stamp #{inspect(shape)}"
       )
@@ -2824,7 +3253,8 @@ defmodule Tightbeam.Schema do
     end
 
     case Txn.q(txn, "SELECT shape FROM schema_stamp") do
-      [[@assignment_source_replacement_shape]] ->
+      [[shape]]
+      when shape in [@assignment_source_replacement_shape, @notice_source_payload_shape] ->
         :ok = marker_shape.()
 
         Enum.each(
@@ -3090,7 +3520,8 @@ defmodule Tightbeam.Schema do
       {:ok, [[@work_item_owner_link_shape]]} ->
         check_work_item_owner_link_shape(db)
 
-      {:ok, [[@assignment_source_replacement_shape]]} ->
+      {:ok, [[shape]]}
+      when shape in [@assignment_source_replacement_shape, @notice_source_payload_shape] ->
         check_work_item_owner_link_shape(db)
 
       {:ok, [[shape]]}
@@ -3298,6 +3729,7 @@ defmodule Tightbeam.Schema do
                     @agent_reparent_shape,
                     @artifact_origin_shape,
                     @identity_publication_denial_diagnostic_shape,
+                    @notice_source_payload_shape,
                     @assignment_source_replacement_shape,
                     @work_item_owner_link_shape
                   ] ->
@@ -3385,6 +3817,7 @@ defmodule Tightbeam.Schema do
              @agent_reparent_shape,
              @artifact_origin_shape,
              @identity_publication_denial_diagnostic_shape,
+             @notice_source_payload_shape,
              @assignment_source_replacement_shape,
              @work_item_owner_link_shape
            ] ->
@@ -3408,6 +3841,7 @@ defmodule Tightbeam.Schema do
              @agent_reparent_shape,
              @artifact_origin_shape,
              @identity_publication_denial_diagnostic_shape,
+             @notice_source_payload_shape,
              @assignment_source_replacement_shape,
              @work_item_owner_link_shape
            ] ->
@@ -3506,6 +3940,7 @@ defmodule Tightbeam.Schema do
                     @agent_reparent_shape,
                     @artifact_origin_shape,
                     @identity_publication_denial_diagnostic_shape,
+                    @notice_source_payload_shape,
                     @assignment_source_replacement_shape,
                     @work_item_owner_link_shape
                   ] ->
@@ -3577,6 +4012,7 @@ defmodule Tightbeam.Schema do
                     @agent_reparent_shape,
                     @artifact_origin_shape,
                     @identity_publication_denial_diagnostic_shape,
+                    @notice_source_payload_shape,
                     @assignment_source_replacement_shape,
                     @work_item_owner_link_shape
                   ] ->
@@ -3676,6 +4112,7 @@ defmodule Tightbeam.Schema do
              @agent_reparent_shape,
              @artifact_origin_shape,
              @identity_publication_denial_diagnostic_shape,
+             @notice_source_payload_shape,
              @assignment_source_replacement_shape,
              @work_item_owner_link_shape
            ] ->
@@ -4747,6 +5184,7 @@ defmodule Tightbeam.Schema do
              @agent_reparent_shape,
              @artifact_origin_shape,
              @identity_publication_denial_diagnostic_shape,
+             @notice_source_payload_shape,
              @assignment_source_replacement_shape,
              @work_item_owner_link_shape
            ] ->
@@ -4782,6 +5220,7 @@ defmodule Tightbeam.Schema do
              @agent_reparent_shape,
              @artifact_origin_shape,
              @identity_publication_denial_diagnostic_shape,
+             @notice_source_payload_shape,
              @assignment_source_replacement_shape,
              @work_item_owner_link_shape
            ] ->
@@ -4889,6 +5328,7 @@ defmodule Tightbeam.Schema do
              @agent_reparent_shape,
              @artifact_origin_shape,
              @identity_publication_denial_diagnostic_shape,
+             @notice_source_payload_shape,
              @assignment_source_replacement_shape,
              @work_item_owner_link_shape
            ] ->
@@ -5140,6 +5580,7 @@ defmodule Tightbeam.Schema do
              @agent_reparent_shape,
              @artifact_origin_shape,
              @identity_publication_denial_diagnostic_shape,
+             @notice_source_payload_shape,
              @assignment_source_replacement_shape,
              @work_item_owner_link_shape
            ] ->
@@ -5163,6 +5604,7 @@ defmodule Tightbeam.Schema do
                     @agent_reparent_shape,
                     @artifact_origin_shape,
                     @identity_publication_denial_diagnostic_shape,
+                    @notice_source_payload_shape,
                     @assignment_source_replacement_shape,
                     @work_item_owner_link_shape
                   ] ->
@@ -5199,6 +5641,7 @@ defmodule Tightbeam.Schema do
              [[shape]]
              when shape in [
                     @work_item_owner_link_shape,
+                    @notice_source_payload_shape,
                     @assignment_source_replacement_shape,
                     @identity_publication_denial_diagnostic_shape
                   ] ->
@@ -5253,6 +5696,7 @@ defmodule Tightbeam.Schema do
              [[shape]]
              when shape in [
                     @work_item_owner_link_shape,
+                    @notice_source_payload_shape,
                     @assignment_source_replacement_shape,
                     @identity_publication_denial_diagnostic_shape
                   ] ->
@@ -5305,6 +5749,7 @@ defmodule Tightbeam.Schema do
              [[shape]]
              when shape in [
                     @work_item_owner_link_shape,
+                    @notice_source_payload_shape,
                     @assignment_source_replacement_shape,
                     @identity_publication_denial_diagnostic_shape
                   ] ->
@@ -5366,6 +5811,7 @@ defmodule Tightbeam.Schema do
              [[shape]]
              when shape in [
                     @identity_publication_denial_diagnostic_shape,
+                    @notice_source_payload_shape,
                     @assignment_source_replacement_shape,
                     @work_item_owner_link_shape
                   ] ->
@@ -5408,7 +5854,11 @@ defmodule Tightbeam.Schema do
     case DB.transaction(db, fn txn ->
            case Txn.q(txn, "SELECT shape FROM schema_stamp") do
              [[shape]]
-             when shape in [@work_item_owner_link_shape, @assignment_source_replacement_shape] ->
+             when shape in [
+                    @work_item_owner_link_shape,
+                    @assignment_source_replacement_shape,
+                    @notice_source_payload_shape
+                  ] ->
                :ok
 
              [[@identity_publication_denial_diagnostic_shape]] ->

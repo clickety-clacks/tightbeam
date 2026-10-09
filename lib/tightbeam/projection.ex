@@ -217,7 +217,14 @@ defmodule Tightbeam.Projection do
 
             case Txn.q(
                    txn,
-                   "SELECT payloadSha256,sourceWakeId FROM staged_message_dedupes WHERE targetSessionKey=?1 AND deviceId=?2 AND clientMessageId=?3",
+                   """
+                   SELECT json_extract(sourceClientIdentity,'$.payloadSha256'),wakeId
+                   FROM wakes
+                   WHERE json_extract(sourceClientIdentity,'$.targetSessionKey')=?1
+                     AND json_extract(sourceClientIdentity,'$.deviceId')=?2
+                     AND json_extract(sourceClientIdentity,'$.clientMessageId')=?3
+                     AND sourceClientIdentity IS NOT NULL
+                   """,
                    [input.session_key, device, client]
                  ) do
               [[^hash, wake_id]] -> {:duplicate, %{wake_id: wake_id}}

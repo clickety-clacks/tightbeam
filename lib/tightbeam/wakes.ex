@@ -742,13 +742,7 @@ defmodule Tightbeam.Wakes do
 
         if Txn.changes(txn) == 1 do
           source = %{wake | state: "pending", fired_at: fired_at}
-          policy_ref = NoticeBatcher.record_policy_in_txn(txn, source, enabled: true)
-
-          Txn.q(
-            txn,
-            "UPDATE notice_delivery_policies SET enabled=1 WHERE policyRef=?1 AND sourceWakeId=?2",
-            [policy_ref, wake_id]
-          )
+          NoticeBatcher.record_policy_in_txn(txn, source)
 
           {:ok, source}
         else
@@ -1723,7 +1717,7 @@ defmodule Tightbeam.Wakes do
     }
 
     # Only typed user targets carry this transient address. Existing wake result
-    # maps retain their shape, while the durable policy row records user:<id>.
+    # maps retain their shape; sourceAddress preserves user:<id> on the wake.
     wake =
       case Map.get(input, :target_user_id) do
         user_id when is_binary(user_id) and user_id != "" ->
@@ -3804,12 +3798,6 @@ defmodule Tightbeam.Wakes do
       txn,
       "UPDATE wakes SET deliveryRule=?2 WHERE wakeId=?1 AND state='pending'",
       [wake_id, fallback_rule]
-    )
-
-    Txn.q(
-      txn,
-      "UPDATE notice_delivery_policies SET enabled=0 WHERE policyRef=?1 AND sourceWakeId=?2",
-      [policy_ref, wake_id]
     )
 
     EventLog.lifecycle_in_txn(

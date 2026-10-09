@@ -21,7 +21,7 @@ defmodule Tightbeam.NoticeBatcher do
 
   @states ~w(open sealed delivery_pending delivered delivery_failed canceled)
 
-  @ddl """
+  @previous_policy_ddl """
   CREATE TABLE IF NOT EXISTS notice_batching_lane_policies (
     recipientAddress TEXT NOT NULL,
     visibilityScope TEXT NOT NULL,
@@ -48,6 +48,9 @@ defmodule Tightbeam.NoticeBatcher do
     createdAt INTEGER NOT NULL CHECK (createdAt >= 0)
   );
 
+  """
+
+  @ddl """
   CREATE TABLE IF NOT EXISTS notice_batches (
     batchId TEXT PRIMARY KEY,
     recipientAddress TEXT NOT NULL,
@@ -95,7 +98,7 @@ defmodule Tightbeam.NoticeBatcher do
     memberId TEXT PRIMARY KEY,
     batchId TEXT NOT NULL REFERENCES notice_batches(batchId),
     sourceWakeId TEXT NOT NULL REFERENCES wakes(wakeId),
-    policyRef TEXT NOT NULL REFERENCES notice_delivery_policies(policyRef),
+    policyRef TEXT NOT NULL,
     recipientAddress TEXT NOT NULL,
     visibilityScope TEXT NOT NULL,
     publicationSeq INTEGER NOT NULL CHECK (publicationSeq > 0),
@@ -142,13 +145,58 @@ defmodule Tightbeam.NoticeBatcher do
   );
   """
 
+  @doc false
+  def source_member_ddl do
+    @ddl
+    |> String.split(";", trim: true)
+    |> Enum.find(&String.contains?(&1, "CREATE TABLE IF NOT EXISTS notice_batch_members"))
+    |> Kernel.<>(";")
+  end
+
+  @doc false
+  def previous_source_member_ddl do
+    String.replace(
+      source_member_ddl(),
+      "policyRef TEXT NOT NULL,",
+      "policyRef TEXT NOT NULL REFERENCES notice_delivery_policies(policyRef),"
+    )
+  end
+
   @spec ensure_schema(GenServer.server()) :: :ok | {:error, term()}
   def ensure_schema(db \\ Tightbeam.DB) do
-    with :ok <- ensure_bootstrap_schema(db) do
-      with :ok <- DB.execute(db, @staged_message_dedupes_ddl) do
-        DB.execute(db, @staged_prompt_attachments_ddl)
-      end
-    end
+    ensure_bootstrap_schema(db)
+  end
+
+  @doc false
+  def previous_source_payload_objects do
+    policy_objects =
+      @previous_policy_ddl
+      |> String.split(";", trim: true)
+      |> Enum.reject(&(String.trim(&1) == ""))
+      |> Enum.map(fn sql ->
+        [_, name] = Regex.run(~r/CREATE TABLE IF NOT EXISTS (\w+)/, sql)
+        {name, sql <> ";"}
+      end)
+
+    policy_objects ++
+      [
+        {"staged_message_dedupes", @staged_message_dedupes_ddl},
+        {"notice_batch_source_attachments", @staged_prompt_attachments_ddl}
+      ]
+  end
+
+  @doc false
+  def persist_source_client_in_txn(%Txn{} = txn, wake_id, identity) when is_map(identity) do
+    Txn.q(
+      txn,
+      "UPDATE wakes SET sourceClientIdentity=?2 WHERE wakeId=?1 AND sourceClientIdentity IS NULL",
+      [wake_id, JSON.encode!(identity)]
+    )
+
+    if Txn.changes(txn) != 1,
+      do: raise(DB.Error, message: "source_client_identity_already_bound_or_missing")
+
+    :ok
   end
 
   @doc false
@@ -157,9 +205,12 @@ defmodule Tightbeam.NoticeBatcher do
     if attachments != [] do
       Txn.q(
         txn,
-        "INSERT INTO notice_batch_source_attachments(sourceWakeId,attachments) VALUES (?1,?2)",
+        "UPDATE wakes SET sourceAttachments=?2 WHERE wakeId=?1 AND sourceAttachments IS NULL",
         [source_wake_id, JSON.encode!(attachments)]
       )
+
+      if Txn.changes(txn) != 1,
+        do: raise(DB.Error, message: "source_attachments_already_bound_or_missing")
     end
 
     :ok
@@ -171,11 +222,11 @@ defmodule Tightbeam.NoticeBatcher do
       Txn.q(
         txn,
         """
-        SELECT a.attachments
+        SELECT source.sourceAttachments
         FROM notice_batches b
         JOIN notice_batch_members m ON m.batchId=b.batchId AND m.state='included'
-        JOIN notice_batch_source_attachments a ON a.sourceWakeId=m.sourceWakeId
-        WHERE b.deliveryWakeId=?1
+        JOIN wakes source ON source.wakeId=m.sourceWakeId
+        WHERE b.deliveryWakeId=?1 AND source.sourceAttachments IS NOT NULL
         ORDER BY m.publicationSeq
         """,
         [wake_id]
@@ -185,7 +236,7 @@ defmodule Tightbeam.NoticeBatcher do
       [] ->
         case Txn.q(
                txn,
-               "SELECT attachments FROM notice_batch_source_attachments WHERE sourceWakeId=?1",
+               "SELECT sourceAttachments FROM wakes WHERE wakeId=?1 AND sourceAttachments IS NOT NULL",
                [wake_id]
              ) do
           [[encoded]] -> JSON.decode!(encoded)
@@ -220,7 +271,7 @@ defmodule Tightbeam.NoticeBatcher do
           non_neg_integer()
         ) :: map()
   def apply_lane_policy_in_txn(
-        %Txn{} = txn,
+        %Txn{} = _txn,
         recipient,
         enabled,
         policy_ref,
@@ -233,37 +284,11 @@ defmodule Tightbeam.NoticeBatcher do
              is_integer(at) and at >= 0 do
     {recipient_address, visibility_scope} = recipient_lane(recipient)
 
-    Txn.q(
-      txn,
-      """
-      INSERT INTO notice_batching_lane_policies
-        (recipientAddress, visibilityScope, enabled, policyRevision, policyRef,
-         selectedBy, cause, selectedAt)
-      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-      ON CONFLICT(recipientAddress, visibilityScope) DO UPDATE SET
-        enabled=excluded.enabled,
-        policyRevision=excluded.policyRevision,
-        policyRef=excluded.policyRef,
-        selectedBy=excluded.selectedBy,
-        cause=excluded.cause,
-        selectedAt=excluded.selectedAt
-      """,
-      [
-        recipient_address,
-        visibility_scope,
-        if(enabled, do: 1, else: 0),
-        @policy_revision,
-        policy_ref,
-        selected_by,
-        cause,
-        at
-      ]
-    )
-
     %{
       recipient_address: recipient_address,
       visibility_scope: visibility_scope,
       enabled: enabled,
+      effective_enabled: true,
       policy_revision: @policy_revision,
       policy_ref: policy_ref,
       selected_by: selected_by,
@@ -274,61 +299,26 @@ defmodule Tightbeam.NoticeBatcher do
 
   @doc false
   @spec lane_enabled_in_txn(Txn.t(), map()) :: boolean()
-  def lane_enabled_in_txn(%Txn{} = txn, recipient) do
-    {recipient_address, visibility_scope} = recipient_lane(recipient)
+  def lane_enabled_in_txn(%Txn{}, _recipient), do: true
 
-    case Txn.q(
-           txn,
-           """
-           SELECT enabled FROM notice_batching_lane_policies
-           WHERE recipientAddress=?1 AND visibilityScope=?2 AND policyRevision=?3
-             AND length(trim(policyRef)) > 0
-             AND length(trim(selectedBy)) > 0
-             AND length(trim(cause)) > 0
-           """,
-           [recipient_address, visibility_scope, @policy_revision]
-         ) do
-      [[1]] -> true
-      _ -> false
-    end
-  end
-
-  @doc "Record the publisher's durable policy decision before admission."
+  @doc "Keep visibility on the authored source; a reference never selects delivery policy."
   @spec record_policy_in_txn(Txn.t(), map(), keyword()) :: String.t()
   def record_policy_in_txn(%Txn{} = txn, wake, opts \\ []) do
-    ref = policy_ref(wake.wake_id)
-    {recipient_address, default_scope} = recipient_lane(wake)
+    {address, default_scope} = recipient_lane(wake)
 
-    visibility_scope =
+    scope =
       case Keyword.fetch(opts, :visibility_scope) do
-        {:ok, scope} -> delivery_gate_scope(scope, Map.get(wake, :target_gate, 1))
+        {:ok, explicit} -> delivery_gate_scope(explicit, Map.get(wake, :target_gate, 1))
         :error -> default_scope
       end
 
     Txn.q(
       txn,
-      """
-      INSERT INTO notice_delivery_policies
-        (policyRef, sourceWakeId, recipientAddress, sessionKey, targetRole,
-         visibilityScope, policyRevision, deadlineAt, enabled, createdAt)
-      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-      ON CONFLICT(policyRef) DO NOTHING
-      """,
-      [
-        ref,
-        wake.wake_id,
-        recipient_address,
-        wake.session_key,
-        wake[:target_role],
-        visibility_scope,
-        @policy_revision,
-        wake.due_at,
-        if(Keyword.get(opts, :enabled, false), do: 1, else: 0),
-        wake.created_at
-      ]
+      "UPDATE wakes SET sourceVisibilityScope=COALESCE(sourceVisibilityScope,?2), sourceAddress=COALESCE(sourceAddress,?3) WHERE wakeId=?1",
+      [wake.wake_id, scope, address]
     )
 
-    ref
+    policy_ref(wake.wake_id)
   end
 
   @doc "The spec-named mutation interface for one source notice delivery."
@@ -406,20 +396,17 @@ defmodule Tightbeam.NoticeBatcher do
     case Txn.q(
            txn,
            """
-           SELECT p.visibilityScope, p.deadlineAt, m.memberId, m.batchId,
+           SELECT w.sourceVisibilityScope, w.dueAt, m.memberId, m.batchId,
                   m.state, b.state, b.deliveryWakeId
-           FROM notice_delivery_policies p
-           JOIN notice_batch_members m
-             ON m.sourceWakeId=p.sourceWakeId
-            AND m.recipientAddress=p.recipientAddress
-            AND m.visibilityScope=p.visibilityScope
+           FROM wakes w
+           JOIN notice_batch_members m ON m.sourceWakeId=w.wakeId
            JOIN notice_batches b ON b.batchId=m.batchId
-           WHERE p.sourceWakeId=?1 AND p.enabled=1 AND p.policyRevision=?2
+           WHERE w.wakeId=?1
              AND ((m.state='active' AND b.state='open')
                   OR (m.state='included' AND b.state IN
                       ('sealed','delivery_pending','delivered','delivery_failed')))
            """,
-           [source_wake_id, @policy_revision]
+           [source_wake_id]
          ) do
       [[visibility_scope, deadline_at, _member_id, _batch_id, "active", "open", nil]] ->
         replacement_policy_ref =
@@ -507,11 +494,10 @@ defmodule Tightbeam.NoticeBatcher do
         case Txn.q(
                txn,
                """
-               SELECT visibilityScope, deadlineAt
-               FROM notice_delivery_policies
-               WHERE sourceWakeId=?1 AND enabled=1 AND policyRevision=?2
+               SELECT sourceVisibilityScope, dueAt
+               FROM wakes WHERE wakeId=?1 AND sourceVisibilityScope IS NOT NULL
                """,
-               [source_wake_id, @policy_revision]
+               [source_wake_id]
              ) do
           [[visibility_scope, deadline_at]] ->
             _replacement_policy_ref =
@@ -534,35 +520,17 @@ defmodule Tightbeam.NoticeBatcher do
          txn,
          replacement_wake_id,
          visibility_scope,
-         deadline_at
+         _deadline_at
        ) do
-    replacement_policy_ref = policy_ref(replacement_wake_id)
-
+    # Target changes produce a new source address; an explicit visibility scope
+    # is carried forward without changing an already formed historical member.
     Txn.q(
       txn,
-      """
-      INSERT INTO notice_delivery_policies
-        (policyRef, sourceWakeId, recipientAddress, sessionKey, targetRole,
-         visibilityScope, policyRevision, deadlineAt, enabled, createdAt)
-      SELECT ?2, w.wakeId,
-             CASE WHEN w.targetRole IS NULL
-                  THEN 'session:' || w.sessionKey
-                  ELSE 'role:' || w.targetRole END,
-             w.sessionKey, w.targetRole, ?3, ?4, ?5, 1, w.createdAt
-      FROM wakes w
-      WHERE w.wakeId=?1 AND w.state='pending'
-      ON CONFLICT(policyRef) DO NOTHING
-      """,
-      [
-        replacement_wake_id,
-        replacement_policy_ref,
-        visibility_scope,
-        @policy_revision,
-        deadline_at
-      ]
+      "UPDATE wakes SET sourceVisibilityScope=?2,sourceAddress=CASE WHEN targetRole IS NULL THEN 'session:' || sessionKey ELSE 'role:' || targetRole END WHERE wakeId=?1 AND state='pending'",
+      [replacement_wake_id, visibility_scope]
     )
 
-    replacement_policy_ref
+    policy_ref(replacement_wake_id)
   end
 
   defp delivery_wake_id_in_txn(txn, batch_id) do
@@ -991,25 +959,13 @@ defmodule Tightbeam.NoticeBatcher do
   end
 
   defp update_source_lane_in_txn(txn, wake) do
-    {recipient_address, default_scope} = recipient_lane(wake)
-    visibility_scope = delivery_gate_scope(default_scope, Map.get(wake, :target_gate, 1))
+    {address, scope} = recipient_lane(wake)
 
-    Txn.q(
-      txn,
-      """
-      UPDATE notice_delivery_policies
-      SET recipientAddress=?2, sessionKey=?3, targetRole=?4, visibilityScope=?5
-      WHERE sourceWakeId=?1 AND enabled=1 AND policyRevision=?6
-      """,
-      [
-        wake.wake_id,
-        recipient_address,
-        wake.session_key,
-        wake.target_role,
-        visibility_scope,
-        @policy_revision
-      ]
-    )
+    Txn.q(txn, "UPDATE wakes SET sourceVisibilityScope=?2,sourceAddress=?3 WHERE wakeId=?1", [
+      wake.wake_id,
+      scope,
+      address
+    ])
 
     :ok
   end
@@ -1317,13 +1273,14 @@ defmodule Tightbeam.NoticeBatcher do
            SELECT w.wakeId, w.sessionKey, w.targetRole, w.origin, w.creatorSessionKey, w.prompt,
                   w.consumer, w.state, w.targetGate, w.reresolve, w.reresolveSeed,
                   w.reresolveRung, w.createdAt, w.work_item_id, w.assignmentId,
-                  w.class, w.classElection, w.digest, p.policyRef, p.recipientAddress,
-                  p.visibilityScope, p.policyRevision, p.deadlineAt, p.enabled
+                  w.class, w.classElection, w.digest, ?2,
+                  w.sourceAddress,
+                  w.sourceVisibilityScope, ?3, w.dueAt, 1
            FROM wakes w
-           JOIN notice_delivery_policies p ON p.sourceWakeId=w.wakeId
-           WHERE w.wakeId=?1 AND p.policyRef=?2
+           WHERE w.wakeId=?1 AND ?2='notice-policy:' || w.wakeId
+             AND w.sourceVisibilityScope IS NOT NULL
            """,
-           [source_wake_id, policy_ref]
+           [source_wake_id, policy_ref, @policy_revision]
          ) do
       [row] ->
         {:ok, source_from_row(row)}
@@ -1480,14 +1437,6 @@ defmodule Tightbeam.NoticeBatcher do
        }}
     else
       cond do
-        not is_nil(batch = open_batch(txn, source)) and
-            batch.policy_revision != source.policy_revision ->
-          {:deferred,
-           %{
-             code: "batch_revision_waiting",
-             message: "the prior policy batch must seal before this source joins"
-           }}
-
         not is_nil(batch = open_batch(txn, source)) and overflow?(batch, rendered_bytes) ->
           {:deferred,
            %{

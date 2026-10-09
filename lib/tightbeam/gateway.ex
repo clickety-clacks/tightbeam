@@ -2325,11 +2325,14 @@ defmodule Tightbeam.Gateway do
 
     if is_binary(device_id) and device_id != "" and is_binary(client_message_id) and
          client_message_id != "" and is_binary(payload_sha256) do
-      DB.Txn.q(
-        txn,
-        "INSERT INTO staged_message_dedupes(targetSessionKey,deviceId,clientMessageId,sourceWakeId,payloadSha256,createdAt) VALUES (?1,?2,?3,?4,?5,?6)",
-        [target, device_id, client_message_id, wake.wake_id, payload_sha256, wake.created_at]
-      )
+      NoticeBatcher.persist_source_client_in_txn(txn, wake.wake_id, %{
+        "targetSessionKey" => target,
+        "deviceId" => device_id,
+        "clientMessageId" => client_message_id,
+        "sourceWakeId" => wake.wake_id,
+        "payloadSha256" => payload_sha256,
+        "createdAt" => wake.created_at
+      })
     end
 
     Wakes.publish_change_in_txn(txn, "wake.scheduled", wake.wake_id)

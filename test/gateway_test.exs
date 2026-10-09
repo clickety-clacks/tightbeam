@@ -713,11 +713,10 @@ defmodule Tightbeam.GatewayTest do
 
     assert :ok = Roles.bind(ctx.db, "recipient-r", "k2")
     # Enrollment revisions and address aliases are provenance, not a delay gate.
-    assert {:ok, _} =
+    assert {:ok, []} =
              DB.query(
                ctx.db,
-               "UPDATE notice_delivery_policies SET policyRevision='old-dev-revision' WHERE sourceWakeId=?1",
-               [role_q.wake_id]
+               "SELECT name FROM sqlite_master WHERE name='notice_delivery_policies'"
              )
 
     for turn <- busy do
@@ -771,7 +770,7 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, [["user:flynn"]]} =
              DB.query(
                ctx.db,
-               "SELECT recipientAddress FROM notice_delivery_policies WHERE sourceWakeId=?1",
+               "SELECT sourceAddress FROM wakes WHERE wakeId=?1",
                [user_a.wake_id]
              )
 
@@ -823,11 +822,10 @@ defmodule Tightbeam.GatewayTest do
 
     assert :ok = Roles.bind(ctx.db, "post-recipient", "k1")
 
-    assert {:ok, _} =
+    assert {:ok, []} =
              DB.query(
                ctx.db,
-               "UPDATE notice_delivery_policies SET policyRevision='old-dev-revision' WHERE sourceWakeId=?1",
-               [source.wake_id]
+               "SELECT name FROM sqlite_master WHERE name='notice_delivery_policies'"
              )
 
     post = Gateway.handlers(%{db: ctx.db})["post"]
@@ -911,7 +909,7 @@ defmodule Tightbeam.GatewayTest do
         assert {:ok, [[policy]]} =
                  DB.query(
                    ctx.db,
-                   "SELECT policyRef FROM notice_delivery_policies WHERE sourceWakeId=?1",
+                   "SELECT 'notice-policy:' || wakeId FROM wakes WHERE wakeId=?1",
                    [source.wake_id]
                  )
 
@@ -1073,7 +1071,7 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, [[encoded_attachments]]} =
              DB.query(
                ctx.db,
-               "SELECT attachments FROM notice_batch_source_attachments WHERE sourceWakeId=?1",
+               "SELECT sourceAttachments FROM wakes WHERE wakeId=?1",
                [source_wake_id]
              )
 
@@ -1090,7 +1088,7 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, [[1]]} =
              DB.query(
                ctx.db,
-               "SELECT COUNT(*) FROM staged_message_dedupes WHERE sourceWakeId=?1 AND deviceId='post-device' AND clientMessageId='post-queued-1'",
+               "SELECT COUNT(*) FROM wakes WHERE wakeId=?1 AND json_extract(sourceClientIdentity,'$.deviceId')='post-device' AND json_extract(sourceClientIdentity,'$.clientMessageId')='post-queued-1'",
                [source_wake_id]
              )
 
@@ -1192,7 +1190,7 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, [[0]]} =
              DB.query(
                ctx.db,
-               "SELECT COUNT(*) FROM staged_message_dedupes WHERE clientMessageId='direct-post-1'"
+               "SELECT COUNT(*) FROM wakes WHERE json_extract(sourceClientIdentity,'$.clientMessageId')='direct-post-1'"
              )
 
     assert {:ok, [[0]]} =
@@ -1240,7 +1238,7 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, [[1]]} =
              DB.query(
                ctx.db,
-               "SELECT COUNT(*) FROM notice_delivery_policies WHERE sourceWakeId=?1 AND enabled=1",
+               "SELECT COUNT(*) FROM wakes WHERE wakeId=?1 AND sourceVisibilityScope IS NOT NULL AND deliveryRule='notice-batching-v1 r2'",
                [wake_id]
              )
 
@@ -3282,7 +3280,10 @@ defmodule Tightbeam.GatewayTest do
     assert [%{batch_id: ^batch_id}] = NoticeBatcher.source_refs(ctx.db, second.wake_id)
 
     assert {:ok, [[0]]} =
-             DB.query(ctx.db, "SELECT COUNT(*) FROM notice_batching_lane_policies")
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='notice_batching_lane_policies'"
+             )
 
     inspect = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["inspect"]
 
