@@ -653,29 +653,70 @@ defmodule Tightbeam.OrgTest do
   end
 
   test "retirement after terminal carrier preserves the one fired delivery path", %{db: db} do
-    %{original: original, batch_id: batch_id} =
-      selected_retirement_source(db, "after terminal carrier")
+    ensure_legacy_main(db)
+    Org.create(db, base(%{session_key: "retiring"}))
+    Roles.create!(db, "reviewer", "flynn", "retiring")
+    start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
+    start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, Tightbeam.LaneManager})
+
+    original =
+      Wakes.schedule(db, %{
+        session_key: "retiring",
+        target_role: "reviewer",
+        origin: "process:tightbeam",
+        creator_session_key: "agent:sender",
+        prompt: "after terminal carrier",
+        due_at: 0,
+        class: "fyi"
+      })
 
     assert [carrier_id] = Wakes.materialize_digests(db, original.due_at)
-    NoticeBatcher.delivery_terminal_failure(db, carrier_id, :skipped, 1_000)
 
-    terminal = NoticeBatcher.batch(db, batch_id)
-    assert terminal.state == "delivery_failed"
+    assert [%{batch_id: batch_id, member_state: "included", batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(db, original.wake_id)
+
+    committed = NoticeBatcher.batch(db, batch_id)
+    assert committed.delivery_wake_id == carrier_id
+    assert committed.envelope =~ original.prompt
+
+    assert {:ok, %{seq: seq, wake_id: ^carrier_id, owner_lease: lease}} =
+             Tightbeam.Ledger.claim_next(db, "retiring", "org-terminal-carrier-fixture")
+
+    assert :ok =
+             Tightbeam.Ledger.finish(db, seq, "failed", "fixture terminal failure",
+               owner_lease: lease
+             )
+
+    assert {:ok, [["failed", "fixture terminal failure", actual_prompt]]} =
+             DB.query(db, "SELECT status,error,prompt FROM turns WHERE seq=?1", [seq])
+
+    assert actual_prompt == "[from process:tightbeam]\n\n" <> committed.envelope
+
+    # A terminal turn does not undo the already committed delivery boundary.
+    NoticeBatcher.delivery_terminal_failure(db, carrier_id, :skipped, 1_000)
+    assert NoticeBatcher.batch(db, batch_id) == committed
+
+    assert {:ok, [terminal_turn]} = DB.query(db, "SELECT * FROM turns WHERE seq=?1", [seq])
+    members = NoticeBatcher.members(db, batch_id)
+    carrier = Wakes.get(db, carrier_id)
+    assert Wakes.get(db, original.wake_id).state == "fired"
     assert Wakes.get(db, carrier_id).state == "fired"
 
     assert %{state: "retired"} = Org.retire(db, "retiring", "user:flynn", 1_000)
-    assert NoticeBatcher.batch(db, batch_id).state == "delivery_failed"
-    assert Wakes.get(db, carrier_id).state == "fired"
+    assert NoticeBatcher.batch(db, batch_id) == committed
+    assert NoticeBatcher.members(db, batch_id) == members
+    assert Wakes.get(db, carrier_id) == carrier
     assert Enum.map(Wakes.digest_members(db, carrier_id), & &1.wake_id) == [original.wake_id]
-
-    assert %{state: "canceled"} = Wakes.get(db, original.wake_id)
-
-    assert %{outcome: "replacement", replacement_wake_id: replacement_wake_id} =
-             cancellation(db, original.wake_id)
-
-    assert %{state: "canceled"} = Wakes.get(db, replacement_wake_id)
-    assert NoticeBatcher.source_refs(db, replacement_wake_id) == []
+    assert Wakes.get(db, original.wake_id).state == "fired"
+    assert Wakes.get(db, original.wake_id).prompt == original.prompt
+    assert cancellation(db, original.wake_id) == nil
+    assert {:ok, [^terminal_turn]} = DB.query(db, "SELECT * FROM turns WHERE seq=?1", [seq])
+    assert NoticeBatcher.recover(db) == []
+    assert Wakes.materialize_digests(db) == []
+    assert {:ok, [[1]]} = DB.query(db, "SELECT count(*) FROM turns")
     assert {:ok, [[1]]} = DB.query(db, "SELECT count(*) FROM wakes WHERE digest=1")
+    assert {:ok, [[1]]} = DB.query(db, "SELECT count(*) FROM wakes WHERE digest=0")
+    assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
   end
 
   test "retirement validates its explicit caller context before state or wake mutation", %{db: db} do
