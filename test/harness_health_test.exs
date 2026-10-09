@@ -447,6 +447,11 @@ defmodule Tightbeam.HarnessHealthTest do
   end
 
   test "a busy other-route recipient keeps the recovery notice as a source until ready", ctx do
+    registry = :"health_batch_registry_#{System.unique_integer([:positive])}"
+    lane = :"health_batch_lane_#{System.unique_integer([:positive])}"
+    start_supervised!({Tightbeam.ConnRegistry, name: registry})
+    start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, lane})
+
     [child, parent | _] = ctx.sessions
     parent_session = parent.session
     at = System.system_time(:millisecond)
@@ -517,10 +522,31 @@ defmodule Tightbeam.HarnessHealthTest do
              DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [expected_wake_id])
 
     assert :ok = Ledger.finish(ctx.db, current_seq, "delivered", nil, owner_lease: lease)
-    [carrier_id] = Tightbeam.NoticeBatcher.recover(ctx.db, at + 1_000)
+    original_prompt = Wakes.get(ctx.db, expected_wake_id).prompt
+    [carrier_id] =
+      Tightbeam.NoticeBatcher.recover(ctx.db, at + 1_000,
+        conn_registry: registry,
+        lane_manager: lane
+      )
     carrier = Wakes.get(ctx.db, carrier_id)
 
-    assert {:ok, {:appended, ^parent_session, message, _opts}} =
+    assert carrier.state == "fired"
+    assert carrier_id != expected_wake_id
+    assert Wakes.get(ctx.db, expected_wake_id).state == "fired"
+    assert Wakes.get(ctx.db, expected_wake_id).prompt == original_prompt
+    assert [%{delivery_wake_id: ^carrier_id, member_state: "included", batch_state: "delivered"}] =
+             Tightbeam.NoticeBatcher.source_refs(ctx.db, expected_wake_id)
+    assert {:ok, [[turn_seq, "queued", ^parent_session, content]]} =
+             DB.query(ctx.db,
+               "SELECT t.seq,t.status,t.sessionKey,m.content FROM turns t JOIN messages m ON m.id=t.messageId WHERE t.wakeId=?1",
+               [carrier_id])
+    assert content =~ original_prompt
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [expected_wake_id])
+    assert {:ok, before_turns} = DB.query(ctx.db, "SELECT * FROM turns ORDER BY seq")
+    assert {:ok, before_messages} = DB.query(ctx.db, "SELECT * FROM messages ORDER BY seq")
+
+    assert {:ok, {:duplicate, %{wake_id: ^carrier_id, turn_seq: ^turn_seq}}} =
              DB.transaction(ctx.db, fn txn ->
                Gateway.deliver_prompt_in_txn(
                  txn,
@@ -534,8 +560,8 @@ defmodule Tightbeam.HarnessHealthTest do
                )
              end)
 
-    assert {:ok, [[turn_seq]]} =
-             DB.query(ctx.db, "SELECT seq FROM turns WHERE messageId=?1", [message.id])
+    assert {:ok, ^before_turns} = DB.query(ctx.db, "SELECT * FROM turns ORDER BY seq")
+    assert {:ok, ^before_messages} = DB.query(ctx.db, "SELECT * FROM messages ORDER BY seq")
 
     assert {:ok, [["pending", ^turn_seq, ^expected_wake_id]]} =
              DB.query(
