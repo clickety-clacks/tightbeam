@@ -124,10 +124,10 @@ defmodule Tightbeam.AssignmentsTest do
       assert prompt =~ "progress"
       assert due_at == result.attest.ts
 
-      assert {:ok, [[1, due_at]]} =
+      assert {:ok, [["pending", "prompt", 0, ^due_at]]} =
                DB.query(
                  ctx.db,
-                 "SELECT enabled, deadlineAt FROM notice_delivery_policies WHERE sourceWakeId=?1",
+                 "SELECT state,consumer,digest,dueAt FROM wakes WHERE wakeId=?1",
                  [wake_id]
                )
 
@@ -166,13 +166,20 @@ defmodule Tightbeam.AssignmentsTest do
       assert prompt =~ result.attest.id
       assert prompt =~ "verdict"
 
-      assert {:ok, [[1]]} =
+      assert {:ok, [["pending", "prompt", 0, ^prompt]]} =
                DB.query(
                  ctx.db,
-                 "SELECT enabled FROM notice_delivery_policies WHERE sourceWakeId=?1",
+                 "SELECT state,consumer,digest,prompt FROM wakes WHERE wakeId=?1",
                  [
                    wake_id
                  ]
+               )
+
+      assert {:ok, [[0]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM notice_batch_members WHERE sourceWakeId=?1",
+                 [wake_id]
                )
     end
   end
