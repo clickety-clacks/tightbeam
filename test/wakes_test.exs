@@ -1060,6 +1060,11 @@ defmodule Tightbeam.WakesTest do
 
   test "rumination markers count staged or delivered sources by work-item and caller", %{db: db} do
     active_sessions!(db, ["k1", "caller"])
+    registry = :"registry_#{System.unique_integer([:positive])}"
+    lane = :"lane_#{System.unique_integer([:positive])}"
+    start_supervised!({Tightbeam.ConnRegistry, name: registry})
+    start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, lane})
+    delivery_opts = [conn_registry: registry, lane_manager: lane]
 
     wake =
       Wakes.schedule(db, %{
@@ -1076,18 +1081,51 @@ defmodule Tightbeam.WakesTest do
     assert wake.rumination
     assert wake.work_item_id == "wi_one"
     assert wake.delivery_rule == NoticeBatcher.rule()
+    assert wake.creator_session_key == "caller"
+    assert Wakes.get(db, wake.wake_id).state == "pending"
+    assert NoticeBatcher.source_refs(db, wake.wake_id) == []
+    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM turns")
     refute Wakes.rumination_exists?(db, "wi_one", "caller")
     refute Wakes.rumination_exists?(db, "wi_other", "caller")
     refute Wakes.rumination_exists?(db, "wi_one", "other-caller")
 
-    [carrier_id] = NoticeBatcher.recover(db, System.system_time(:millisecond) + 1_000)
+    at = System.system_time(:millisecond) + 1_000
+    [carrier_id] = NoticeBatcher.recover(db, at, delivery_opts)
+    assert carrier_id != wake.wake_id
+
+    assert [%{delivery_wake_id: ^carrier_id, member_state: "included", batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(db, wake.wake_id)
+
+    assert {:ok, [[turn_seq, "caller", "queued", content]]} =
+             DB.query(
+               db,
+               "SELECT t.seq,t.sessionKey,t.status,m.content FROM turns t JOIN messages m ON m.id=t.messageId WHERE t.wakeId=?1",
+               [carrier_id]
+             )
+
+    assert content =~ wake.wake_id
+    assert content =~ wake.prompt
+    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM turns")
+
+    assert {:ok, [[0]]} =
+             DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [wake.wake_id])
+
     assert Wakes.rumination_exists?(db, "wi_one", "caller")
     refute Wakes.rumination_exists?(db, "wi_other", "caller")
     refute Wakes.rumination_exists?(db, "wi_one", "other-caller")
 
     carrier = Wakes.get(db, carrier_id)
+    assert carrier.state == "fired"
+    assert {:ok, before_turns} = DB.query(db, "SELECT * FROM turns ORDER BY seq")
+    assert {:ok, before_messages} = DB.query(db, "SELECT * FROM messages ORDER BY id")
+    assert {:ok, before_wakes} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
 
-    assert {:ok, {:appended, "caller", _message, _opts}} =
+    assert {:ok, before_members} =
+             DB.query(db, "SELECT * FROM notice_batch_members ORDER BY memberId")
+
+    # Recovery already committed the actual carrier. Replaying that carrier
+    # must identify the same turn without appending or changing its source.
+    assert {:ok, {:duplicate, %{wake_id: ^carrier_id, turn_seq: ^turn_seq}}} =
              DB.transaction(db, fn txn ->
                Tightbeam.Gateway.deliver_prompt_in_txn(
                  txn,
@@ -1103,6 +1141,16 @@ defmodule Tightbeam.WakesTest do
 
     assert Wakes.get(db, wake.wake_id).state == "fired"
     assert Wakes.rumination_exists?(db, "wi_one", "caller")
+    assert NoticeBatcher.recover(db, at, delivery_opts) == []
+    assert {:ok, ^before_turns} = DB.query(db, "SELECT * FROM turns ORDER BY seq")
+    assert {:ok, ^before_messages} = DB.query(db, "SELECT * FROM messages ORDER BY id")
+    assert {:ok, ^before_wakes} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
+
+    assert {:ok, ^before_members} =
+             DB.query(db, "SELECT * FROM notice_batch_members ORDER BY memberId")
+
+    refute Wakes.rumination_exists?(db, "wi_other", "caller")
+    refute Wakes.rumination_exists?(db, "wi_one", "other-caller")
   end
 
   defp public_cancel(
