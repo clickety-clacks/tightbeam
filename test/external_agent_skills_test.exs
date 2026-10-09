@@ -79,13 +79,15 @@ defmodule Tightbeam.ExternalAgentSkillsTest do
     assert cli =~ "`decision_pending`"
   end
 
-  test "the README installs only the CLI skill before source installation" do
+  test "the README installs only the CLI skill before verified-release-only installation" do
     readme = File.read!(Path.join(repo_root(), "README.md"))
 
     section = "## External-agent operation skill"
-    install = "## Two ways to install"
+    install = "## Install only a verified release package"
 
-    assert :binary.match(readme, section) < :binary.match(readme, install)
+    assert {section_offset, _} = :binary.match(readme, section)
+    assert {install_offset, _} = :binary.match(readme, install)
+    assert section_offset < install_offset
     assert readme =~ "priv/skills/tightbeam-cli/SKILL.md"
     assert readme =~ ".codex/skills/tightbeam-cli/"
     assert readme =~ ".claude/skills/tightbeam-cli/"

@@ -26,24 +26,23 @@ rediscovers the skill metadata.
 The skill does not install Tightbeam, create a session, supply a credential, operate a
 kungfu bundle, or change a Tightbeam identity. Provision those prerequisites separately.
 
-## Two ways to install
+## Install only a verified release package
 
-**From a release package** (below) — a per-platform npm tarball carrying the
-gateway *and* the CLI, with Erlang bundled. No Elixir, no Rust, no C toolchain
-on the target machine. This is the shorter path and the one to prefer.
+To install Tightbeam, follow [From a release package](#from-a-release-package)
+and verify the package against its published checksums and release provenance.
+This is the only installation path for users and agents installing for them.
 
-**From source** — clone and build. Use this to develop Tightbeam or to produce a
-local package from an unreleased commit.
-
-The prerequisites below are split accordingly; everything else in this document
-applies to both.
+A git checkout is for developing Tightbeam. Nothing built from a checkout is a
+release, including a build from `main` or a release tag. See
+[Developing Tightbeam](#developing-tightbeam) for source builds; do not use them
+as an installation or upgrade substitute.
 
 ## Prerequisites
 
 None of these are installed for you, and a missing one is not always obvious
 from the failure — see `mix tightbeam.doctor` and the notes below.
 
-Needed by **both** paths:
+Needed to install and run a release package:
 
 - **A registered harness CLI** — `claude`, `codex`, and/or `pi` — installed and on
   PATH *before* you start. Boot refuses by name when it cannot find a usable
@@ -54,32 +53,6 @@ Needed by **both** paths:
   install fails and no turn can start. The release package is also an npm
   package, so this is how you install it.
 - **git**, for the identity repository.
-
-Needed to build **from source only** — a release package has all of these
-already compiled into it:
-
-- **Elixir + OTP.** Built against Elixir 1.19 / OTP 28. With no Elixir on PATH
-  every command below fails as `mix: command not found`; nothing in this
-  repository can report that for you.
-- **Rust >= 1.85**, to build the `tightbeam` CLI (`cargo build --release
-  --manifest-path cli/Cargo.toml`). The CLI is edition 2024, so older toolchains
-  cannot build it at all. **Install via [rustup](https://rustup.rs), not your
-  distro** — Ubuntu 24.04 LTS packages 1.75, which looks like a satisfied
-  prerequisite and then fails the build. `cargo --version` must report 1.85 or
-  newer before you start.
-
-  Do not skip this step and continue. Gateway boot still succeeds without the
-  CLI and installs a `bin/tightbeam` that refuses to run — but the very next
-  documented step, onboarding a credential, *is* that binary. You would get a
-  gateway that looks healthy, cannot be onboarded, cannot run a turn, and
-  reports its problem as missing credentials rather than a missing CLI.
-- **A C toolchain** (`gcc`/`clang` + `make`) — `exqlite` builds a native NIF.
-- **Hex and rebar3**, Elixir's package and build tools. They do NOT ship with
-  Elixir. Without them `mix deps.get` cannot fetch anything, and on a machine
-  that has never had them it stops on an interactive prompt — `Shall I install
-  Hex? [Yn]` — which fails outright under any non-interactive install. Install
-  them explicitly with the first two commands below rather than answering that
-  prompt; `--if-missing` makes both a no-op when you already have them.
 
 ## Linux: unprivileged user namespaces, and the Codex sandbox
 
@@ -268,8 +241,7 @@ source stamp, while `readlink /opt/tightbeam/current` reports the selected build
 foreground process, same environment contract, same first-boot behaviour. It
 creates the base dir, seeds the identity repository, creates `state.db` and
 `bin/`, and prints the NOT READY summary described below. Continue from
-**Connect your first client**; everything after this point is identical for
-both install paths.
+**Connect your first client** to continue setting up the installed release.
 
 The CLI and gateway ship in one package, so their version handshake holds by
 construction. Add `/opt/tightbeam/current/tightbeam/bin` to `PATH` for the CLI,
@@ -285,49 +257,10 @@ instance starts from the same selected path after its service restart.
 Start with the complete [upgrade procedure](docs/UPGRADE.md): back up the
 installation, verify and stage the release, select it at the authorized idle
 boundary, let the gateway migrate on first boot, verify the running build, and
-then decide when to relearn each kungfu with Main. That guide also covers
+then complete guided relearn with Main or record the user’s deferral. That guide also covers
 moving an npm-installed service to the selector, refreshing satellite
 CLIs, removing the obsolete npm package and links, runtime overrides, conflict
 handling, and rollback limits.
-
-### Cutting a release
-
-Releases are version tags on canonical `main`, not release branches. First set
-the version in `cli/Cargo.toml`, land it on `main`, and wait for the ordinary
-`main` CI run to pass. Then create and push the matching annotated tag:
-
-```sh
-git fetch origin
-git merge --ff-only origin/main
-git tag -a v<version> -m "Tightbeam v<version>"
-git push origin v<version>
-```
-
-The tag must be exactly `v<major>.<minor>.<patch>`, must match the Cargo package
-version, and must point to the current `origin/main` tip. The tag workflow reruns
-the unchanged macOS and Linux test gates, builds both packages from that tagged
-commit, and creates one GitHub Release containing the packages, checksums, and
-provenance record. If any gate or either platform build fails, no GitHub Release
-is created.
-
-### From source
-
-Only after a harness is on PATH, install Tightbeam:
-
-```sh
-git clone https://github.com/clickety-clacks/tightbeam.git
-cd tightbeam
-
-mix local.hex --force --if-missing      # Hex; no-op if already installed
-mix local.rebar --force --if-missing    # rebar3, to build Erlang deps
-
-mix deps.get
-mix compile
-cargo build --release --manifest-path cli/Cargo.toml
-
-mix tightbeam.init                 # creates <base_dir>/identity
-mix run --no-halt                  # boots the gateway; creates state.db and bin/
-```
 
 Set `TIGHTBEAM_BASE_DIR` to choose `base_dir`; the gateway otherwise uses
 `TIGHTBEAM_HOME`, then `~/.tightbeam`. The CLI uses the same fallback order. The
@@ -754,3 +687,73 @@ cannot run a single turn.
   authoritative fresh-org install path.
 - `docs/ARCHITECTURE.md` — the substrate's shape.
 - `docs/SATELLITE.md` — adding a machine to an existing org.
+
+## Developing Tightbeam
+
+Use a checkout only for development, outside any service-selected installation.
+Development builds and local packages are not verified releases.
+
+Needed to build **from source only** — a release package has all of these
+already compiled into it:
+
+- **Elixir + OTP.** Built against Elixir 1.19 / OTP 28. With no Elixir on PATH
+  every command below fails as `mix: command not found`; nothing in this
+  repository can report that for you.
+- **Rust >= 1.85**, to build the `tightbeam` CLI (`cargo build --release
+  --manifest-path cli/Cargo.toml`). The CLI is edition 2024, so older toolchains
+  cannot build it at all. **Install via [rustup](https://rustup.rs), not your
+  distro** — Ubuntu 24.04 LTS packages 1.75, which looks like a satisfied
+  prerequisite and then fails the build. `cargo --version` must report 1.85 or
+  newer before you start.
+
+  Do not skip this step and continue. Gateway boot still succeeds without the
+  CLI and installs a `bin/tightbeam` that refuses to run — but the very next
+  documented step, onboarding a credential, *is* that binary. You would get a
+  gateway that looks healthy, cannot be onboarded, cannot run a turn, and
+  reports its problem as missing credentials rather than a missing CLI.
+- **A C toolchain** (`gcc`/`clang` + `make`) — `exqlite` builds a native NIF.
+- **Hex and rebar3**, Elixir's package and build tools. They do NOT ship with
+  Elixir. Without them `mix deps.get` cannot fetch anything, and on a machine
+  that has never had them it stops on an interactive prompt — `Shall I install
+  Hex? [Yn]` — which fails outright under any non-interactive install. Install
+  them explicitly with the first two commands below rather than answering that
+  prompt; `--if-missing` makes both a no-op when you already have them.
+
+### From source
+
+Only after a harness is on PATH, build and run a development checkout:
+
+```sh
+git clone https://github.com/clickety-clacks/tightbeam.git
+cd tightbeam
+
+mix local.hex --force --if-missing      # Hex; no-op if already installed
+mix local.rebar --force --if-missing    # rebar3, to build Erlang deps
+
+mix deps.get
+mix compile
+cargo build --release --manifest-path cli/Cargo.toml
+
+mix tightbeam.init                 # creates <base_dir>/identity
+mix run --no-halt                  # boots the gateway; creates state.db and bin/
+```
+
+### Cutting a release
+
+Releases are version tags on canonical `main`, not release branches. First set
+the version in `cli/Cargo.toml`, land it on `main`, and wait for the ordinary
+`main` CI run to pass. Then create and push the matching annotated tag:
+
+```sh
+git fetch origin
+git merge --ff-only origin/main
+git tag -a v<version> -m "Tightbeam v<version>"
+git push origin v<version>
+```
+
+The tag must be exactly `v<major>.<minor>.<patch>`, must match the Cargo package
+version, and must point to the current `origin/main` tip. The tag workflow reruns
+the unchanged macOS and Linux test gates, builds both packages from that tagged
+commit, and creates one GitHub Release containing the packages, checksums, and
+provenance record. If any gate or either platform build fails, no GitHub Release
+is created.
