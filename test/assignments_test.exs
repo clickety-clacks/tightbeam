@@ -2343,11 +2343,6 @@ defmodule Tightbeam.AssignmentsTest do
 
   defp force_wake_due(db, wake_id) do
     {:ok, _} = DB.query(db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [wake_id])
-
-    {:ok, _} =
-      DB.query(db, "UPDATE notice_delivery_policies SET deadlineAt=0 WHERE sourceWakeId=?1", [
-        wake_id
-      ])
   end
 
   defp terminal_successor_fixture(ctx) do

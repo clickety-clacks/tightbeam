@@ -724,31 +724,26 @@ defmodule Tightbeam.SchemaShapeTest do
     assert is_integer(staged_marker.fired_at)
     finish_marker_queue(db, "marker-b")
 
-    [carrier_id] = NoticeBatcher.recover(db, System.system_time(:millisecond) + 1_000)
+    registry = :"marker_migration_registry_#{System.unique_integer([:positive])}"
+    lane = :"marker_migration_lane_#{System.unique_integer([:positive])}"
+    start_supervised!({ConnRegistry, name: registry})
+    start_supervised!({Tightbeam.SchemaShapeTest.LaneStub, lane})
+    delivery_opts = [conn_registry: registry, lane_manager: lane]
+
+    # Readiness commits the actual carrier turn; the migration must not append it again.
+    [carrier_id] =
+      NoticeBatcher.recover(db, System.system_time(:millisecond) + 1_000, delivery_opts)
+
     carrier = Wakes.get(db, carrier_id)
-
-    assert {:ok, {:appended, _target, _message, _opts}} =
-             DB.transaction(db, fn txn ->
-               Gateway.deliver_prompt_in_txn(
-                 txn,
-                 carrier.session_key,
-                 carrier.origin,
-                 carrier.prompt,
-                 wake_id: carrier.wake_id,
-                 sender: carrier.origin,
-                 target_gate: carrier,
-                 fire_wake_in_txn: true
-               )
-             end)
-
-    assert :ok = NoticeBatcher.delivery_delivered(db, carrier_id)
+    assert carrier.session_key == "marker-b"
+    assert carrier.state == "fired"
 
     assert Wakes.get(db, "marker-1-marker-b").state == "fired"
 
-    assert {:ok, [[1]]} =
-             DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [carrier_id])
+    assert {:ok, [["marker-b", 1]]} =
+             DB.query(db, "SELECT sessionKey,COUNT(*) FROM turns WHERE wakeId=?1", [carrier_id])
 
-    assert [%{delivery_wake_id: ^carrier_id, batch_state: "delivered"}] =
+    assert [%{delivery_wake_id: ^carrier_id, member_state: "included", batch_state: "delivered"}] =
              NoticeBatcher.source_refs(db, "marker-1-marker-b")
 
     assert {:ok, [[10]]} =
@@ -757,11 +752,21 @@ defmodule Tightbeam.SchemaShapeTest do
     # A second startup must not relabel ambiguous facts or duplicate recognition.
     assert :ok = Schema.ensure_all(db)
 
+    assert NoticeBatcher.recover(db, System.system_time(:millisecond) + 1_000, delivery_opts) ==
+             []
+
     assert {:ok, [[10]]} =
              DB.query(
                db,
                "SELECT COUNT(*) FROM turns WHERE wakeId LIKE 'marker-%'"
              )
+
+    assert {:ok, [[1]]} =
+             DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [carrier_id])
+
+    assert {:ok,
+            [[1, "marker-a"], [2, "marker-a"], [3, nil], [4, nil], [5, nil], [6, nil], [7, nil]]} =
+             DB.query(db, "SELECT id,ownerUserId FROM condition_facts ORDER BY id")
   end
 
   test "the row-driven-rules predecessor scopes legacy facts without rewriting wake history", %{
@@ -873,12 +878,37 @@ defmodule Tightbeam.SchemaShapeTest do
     )
 
     assert :ok = Wakes.fire_due(scheduler)
-    assert_receive {:legacy_migration_delivery, "w_timed"}
+    # Readiness delivers these legacy sources through one real carrier, before callbacks.
+    refute_received {:legacy_migration_delivery, _}
     assert Wakes.get(db, "w_pending").state == "fired"
     assert Wakes.get(db, "w_timed").state == "fired"
-    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId='w_pending'")
+
+    assert [%{delivery_wake_id: carrier_id, member_state: "included", batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(db, "w_pending")
+
+    assert [%{delivery_wake_id: ^carrier_id, member_state: "included", batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(db, "w_timed")
+
+    assert {:ok, [["owner-a-session", 1]]} =
+             DB.query(db, "SELECT sessionKey,COUNT(*) FROM turns WHERE wakeId=?1", [carrier_id])
+
+    assert {:ok, [[0]]} =
+             DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId IN ('w_pending','w_timed')")
+
+    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM turns")
+
+    assert {:ok, [[2]]} =
+             DB.query(db, "SELECT COUNT(*) FROM notice_batch_members WHERE state='included'")
+
+    delivery_before_restart =
+      DB.query(db, "SELECT seq,sessionKey,wakeId,messageId,prompt FROM turns ORDER BY seq")
+
+    assert Wakes.get(db, carrier_id).state == "fired"
+    assert NoticeBatcher.source_refs(db, "w_fired") == []
+    assert NoticeBatcher.source_refs(db, "w_canceled") == []
 
     assert :ok = stop_supervised(Wakes)
+    assert :ok = Schema.ensure_all(db)
 
     start_supervised!(
       {Wakes,
@@ -892,8 +922,19 @@ defmodule Tightbeam.SchemaShapeTest do
     )
 
     assert :ok = Wakes.fire_due(scheduler)
-    refute_receive {:legacy_migration_delivery, "w_timed"}
-    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId='w_pending'")
+    refute_received {:legacy_migration_delivery, _}
+
+    assert DB.query(db, "SELECT seq,sessionKey,wakeId,messageId,prompt FROM turns ORDER BY seq") ==
+             delivery_before_restart
+
+    assert {:ok, [[2]]} =
+             DB.query(db, "SELECT COUNT(*) FROM notice_batch_members WHERE state='included'")
+
+    assert {:ok, [["w_timed", "w_timed", 0, "pending", 1]]} =
+             DB.query(
+               db,
+               "SELECT wakeId,rootWakeId,attempt,outcome,observedAt FROM wake_retry_attempts"
+             )
 
     assert {:ok,
             [
@@ -901,7 +942,13 @@ defmodule Tightbeam.SchemaShapeTest do
               ["w_fired", "fired"],
               ["w_pending", "fired"],
               ["w_timed", "fired"]
-            ]} = DB.query(db, "SELECT wakeId,state FROM wakes ORDER BY wakeId")
+            ]} =
+             DB.query(db, "SELECT wakeId,state FROM wakes WHERE wakeId<>?1 ORDER BY wakeId", [
+               carrier_id
+             ])
+
+    assert Wakes.get(db, carrier_id).state == "fired"
+    assert {:ok, [[5]]} = DB.query(db, "SELECT COUNT(*) FROM wakes")
   end
 
   test "the exact effort-request predecessor gains nullable identity render stamps", %{db: db} do

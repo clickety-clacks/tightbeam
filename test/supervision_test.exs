@@ -748,25 +748,81 @@ defmodule Tightbeam.SupervisionTest do
     name = start_liveness!(ctx, sweep_ms: 60_000, name: :idle_formed_carrier_revalidation)
     [source] = idle_cleanup_wakes(ctx.db)
 
-    assert {:ok, [[policy_ref]]} =
+    # A formed development-era transport is predecessor input. Readiness no
+    # longer exposes a separate form/seal/arm route, so seed its frozen evidence
+    # before testing the actual Gateway member revalidation seam.
+    assert {:ok, [[address, scope]]} =
              DB.query(
                ctx.db,
-               "SELECT policyRef FROM notice_delivery_policies WHERE sourceWakeId=?1 AND enabled=1",
+               "SELECT sourceAddress,sourceVisibilityScope FROM wakes WHERE wakeId=?1",
                [source.wake_id]
              )
 
-    assert %{batch_id: batch_id, state: "active"} =
-             NoticeBatcher.enqueue_or_recover(ctx.db, source.wake_id, policy_ref)
-
     at = System.system_time(:millisecond) + 1000
+    batch_id = "idle-historical-batch:" <> source.wake_id
+    carrier_id = "idle-historical-carrier:" <> source.wake_id
+    envelope = "frozen idle cleanup transport\n" <> source.prompt
 
-    assert {:ok, {:new, carrier_id}} =
-             DB.transaction(ctx.db, fn txn ->
-               assert :sealed =
-                        NoticeBatcher.enqueue_or_recover_in_txn(txn, {:seal_if_due, batch_id, at})
+    Wakes.schedule(ctx.db, %{
+      wake_id: carrier_id,
+      session_key: source.session_key,
+      target_role: source.target_role,
+      target_gate: source.target_gate,
+      origin: "process:tightbeam",
+      prompt: envelope,
+      due_at: at,
+      digest: true
+    })
 
-               NoticeBatcher.enqueue_or_recover_in_txn(txn, {:arm_if_due, batch_id, at})
-             end)
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO notice_batches(batchId,recipientAddress,sessionKey,targetRole,
+                 visibilityScope,policyRevision,state,dueAt,openedAt,sealedAt,deliveryToken,
+                 envelope,envelopeSha256,deliveryWakeId,memberCount,renderedBytes)
+               VALUES(?1,?2,?3,?4,?5,'old-dev-revision','delivery_pending',?6,?7,?8,
+                 ?9,?10,?11,?12,1,?13)
+               """,
+               [
+                 batch_id,
+                 address,
+                 source.session_key,
+                 source.target_role,
+                 scope,
+                 source.due_at,
+                 source.created_at,
+                 at,
+                 "idle-historical-token",
+                 envelope,
+                 Base.encode16(:crypto.hash(:sha256, envelope), case: :lower),
+                 carrier_id,
+                 byte_size(envelope)
+               ]
+             )
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO notice_batch_members(memberId,batchId,sourceWakeId,policyRef,
+                 recipientAddress,visibilityScope,publicationSeq,policyRevision,senderPrincipal,
+                 cause,class,payload,renderedBytes,state,addedAt)
+               VALUES(?1,?2,?3,?4,?5,?6,1,'old-dev-revision',?7,'idle_cleanup','fyi',?8,?9,'included',?10)
+               """,
+               [
+                 "idle-historical-member:" <> source.wake_id,
+                 batch_id,
+                 source.wake_id,
+                 NoticeBatcher.policy_ref(source.wake_id),
+                 address,
+                 scope,
+                 source.origin,
+                 source.prompt,
+                 byte_size(source.prompt),
+                 source.created_at
+               ]
+             )
 
     frozen = NoticeBatcher.batch(ctx.db, batch_id)
     assert frozen.state == "delivery_pending"
