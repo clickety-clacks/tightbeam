@@ -120,8 +120,15 @@ defmodule Tightbeam.RecoveryScenario do
       rows("SELECT status FROM turns WHERE sessionKey=?1", ["agent:recovery:a"]) == [["running"]]
     end)
 
-    :appended =
-      Gateway.deliver_prompt("agent:recovery:a", "user:recovery-admin", "RECOVERY_SUCCESSOR_A")
+    :queued =
+      Gateway.deliver_prompt("agent:recovery:a", "user:recovery-admin", "RECOVERY_SUCCESSOR_A",
+        wake_id: "w_recovery_successor_a")
+    # The running recipient retains the successor as an editable source; no
+    # second actual turn is preformed before readiness or OS death.
+    assert %{state: "pending", prompt: "RECOVERY_SUCCESSOR_A"} =
+             Wakes.get(DB, "w_recovery_successor_a")
+    assert NoticeBatcher.source_refs(DB, "w_recovery_successor_a") == []
+    [] = rows("SELECT seq FROM turns WHERE wakeId='w_recovery_successor_a'")
 
     # Freeze only the test arena scheduler while constructing the two durable
     # delivery boundaries. Process death removes this suspension; normal restart
@@ -148,7 +155,7 @@ defmodule Tightbeam.RecoveryScenario do
       rows("SELECT status FROM turns WHERE wakeId='w_recovery_c'") == [["delivered"]]
     end)
 
-    [["running"], ["queued"]] =
+    [["running"]] =
       rows("SELECT status FROM turns WHERE sessionKey='agent:recovery:a' ORDER BY seq")
 
     [] = rows("SELECT seq FROM turns WHERE wakeId='w_recovery_b'")
@@ -168,9 +175,9 @@ defmodule Tightbeam.RecoveryScenario do
           "SELECT status FROM turns WHERE sessionKey='agent:recovery:a' AND wakeId IS NULL ORDER BY seq"
         ) == [
           ["failed_unknown"],
-          ["delivered"],
           ["delivered"]
         ] and
+          delivered_source_statuses("w_recovery_successor_a") == [["delivered"]] and
           delivered_source_statuses("w_recovery_b") == [["delivered"]] and
           rows(
             "SELECT state FROM wakes WHERE wakeId IN ('w_recovery_b','w_recovery_c') ORDER BY wakeId"
@@ -200,11 +207,24 @@ defmodule Tightbeam.RecoveryScenario do
     ] =
       rows("""
       SELECT seq,status,messageId,origin,prompt
-      FROM turns WHERE sessionKey='agent:recovery:a' AND wakeId IS NULL ORDER BY seq
+      FROM turns t WHERE sessionKey='agent:recovery:a' AND (
+        wakeId IS NULL OR EXISTS (
+          SELECT 1 FROM notice_batches b JOIN notice_batch_members m ON m.batchId=b.batchId
+          WHERE b.deliveryWakeId=t.wakeId AND m.sourceWakeId='w_recovery_successor_a'
+            AND m.state='included' AND b.state='delivered'
+        )
+      ) ORDER BY seq
       """)
 
     assert source_turn_seq < successor_turn_seq
     assert successor_turn_seq < redelivery_turn_seq
+    assert %{state: "fired", prompt: "RECOVERY_SUCCESSOR_A"} =
+             Wakes.get(DB, "w_recovery_successor_a")
+    assert [%{delivery_wake_id: successor_carrier_id, member_state: "included", batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(DB, "w_recovery_successor_a")
+    [[^successor_turn_seq]] = rows("SELECT seq FROM turns WHERE wakeId=?1", [successor_carrier_id])
+    [[0]] = rows("SELECT count(*) FROM turns WHERE wakeId='w_recovery_successor_a'")
+    [[1]] = rows("SELECT count(*) FROM messages WHERE sessionKey='agent:recovery:a' AND content LIKE '%RECOVERY_SUCCESSOR_A%'")
 
     [[1]] =
       rows(

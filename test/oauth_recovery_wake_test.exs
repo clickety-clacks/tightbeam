@@ -322,7 +322,8 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
     start_supervised!(%{
       id: name,
       start:
-        {Wakes, :start_link, [[name: name, db: ctx.db, deliver: deliver, tick_ms: 86_400_000]]}
+        {Wakes, :start_link, [[name: name, db: ctx.db, deliver: deliver, tick_ms: 86_400_000,
+          delivery_opts: [conn_registry: ctx.registry, lane_manager: ctx.lane]]]}
     })
 
     name

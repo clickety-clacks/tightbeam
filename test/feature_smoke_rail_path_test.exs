@@ -44,6 +44,9 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
 
     :ok = Schema.ensure_all(db)
     start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
+    # Real readiness admission publishes and rings a lane after committing;
+    # this fixture has no provider lane, but must own that local doorbell.
+    start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, Tightbeam.LaneManager})
     register_hosts(db, %{"testhost" => %{ssh: nil, base_dir: base, cli_bin: nil}})
     {:ok, _} = DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES('mike',1,1)")
 
@@ -117,7 +120,8 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
     )
 
     Rules.load!(base, Map.keys(handlers))
-    # Real wake scheduling/durable states; delivery ends at an inert sink.
+    # Real wake scheduling and atomic carrier admission; the local doorbell
+    # does not execute a provider or synthesize an assistant turn.
     # Nothing calls an adapter or manufactures an inference/tool-call result.
     start_supervised!(
       {Tightbeam.Wakes,

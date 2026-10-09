@@ -185,6 +185,12 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   describe "attest outcome condition facts" do
+    setup do
+      start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
+      start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, Tightbeam.LaneManager})
+      :ok
+    end
+
     test "completion returns its card fact and wakes only a matching condition wait", ctx do
       scheduler = :assignments_fact_scheduler
       test_pid = self()
@@ -200,15 +206,7 @@ defmodule Tightbeam.AssignmentsTest do
          end}
       )
 
-      running_turn = System.unique_integer([:positive, :monotonic])
-      started_at = System.system_time(:millisecond)
-
-      {:ok, _} =
-        DB.query(
-          ctx.db,
-          "INSERT INTO turns (seq, sessionKey, messageId, origin, prompt, status, createdAt, startedAt) VALUES (?1, 'holder', ?2, 'agent:holder', 'active turn', 'running', ?3, ?3)",
-          [running_turn, "message-running-#{running_turn}", started_at]
-        )
+      running_turn = start_running_turn(ctx.db, "holder", "active turn")
 
       assignment_call =
         assign_call({:session, "holder"}, "landed card")
@@ -252,7 +250,9 @@ defmodule Tightbeam.AssignmentsTest do
              } = Wakes.get(ctx.db, wake.wake_id)
 
       assert is_integer(fired_at)
-      assert prompt =~ "[woke: fact assignment-landed/#{assignment.id}]"
+      assert prompt == wake.prompt
+      assert {:ok, rendered} = DB.transaction(ctx.db, &Wakes.delivery_prompt_in_txn(&1, wake.wake_id))
+      assert rendered == "[woke: fact assignment-landed/#{assignment.id}]\n\n" <> wake.prompt
 
       # A matched fact stamps the individual source while the recipient is
       # busy; batching begins only after its current turn ends.
@@ -269,6 +269,10 @@ defmodule Tightbeam.AssignmentsTest do
                  "SELECT ownerUserId, origin FROM condition_facts WHERE id=?1",
                  [result.fact.fact_id]
                )
+      assert :ok = finish_running_turn(ctx.db, running_turn)
+      assert :ok = Wakes.fire_due(scheduler)
+      assert_fact_carrier!(ctx.db, wake, rendered)
+      refute_received {:fact_wait_delivered, _wake_id}
     end
 
     test "a busy fact wait, timed notice, and human post share one carrier with source refs",
@@ -417,7 +421,10 @@ defmodule Tightbeam.AssignmentsTest do
                prompt: reviewed_prompt
              } = Wakes.get(ctx.db, reviewed_wake.wake_id)
 
-      assert reviewed_prompt =~ "[woke: fact assignment-reviewed/#{producer.id}]"
+      assert reviewed_prompt == reviewed_wake.prompt
+      assert {:ok, rendered} =
+               DB.transaction(ctx.db, &Wakes.delivery_prompt_in_txn(&1, reviewed_wake.wake_id))
+      assert rendered == "[woke: fact assignment-reviewed/#{producer.id}]\n\n" <> reviewed_wake.prompt
       assert Wakes.get(ctx.db, review_card_wake.wake_id).state == "pending"
 
       assert {:ok, [["flynn"]]} =
@@ -458,7 +465,24 @@ defmodule Tightbeam.AssignmentsTest do
       assert stopped.fact.scope == cannot_proceed.id
       assert stopped.condition_wake_hint.kind == stopped.fact.kind
       assert stopped.condition_wake_hint.scope == stopped.fact.scope
+      _carriers = NoticeBatcher.recover(ctx.db)
+      assert_fact_carrier!(ctx.db, reviewed_wake, rendered)
+      assert Wakes.get(ctx.db, review_card_wake.wake_id).state == "pending"
     end
+  end
+
+  defp assert_fact_carrier!(db, source, rendered) do
+    assert [%{delivery_wake_id: carrier_id, member_state: "included", batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(db, source.wake_id)
+    assert carrier_id != source.wake_id
+    assert %{state: "fired", prompt: prompt} = Wakes.get(db, source.wake_id)
+    assert prompt == source.prompt
+    assert {:ok, [[target, "queued", content]]} =
+             DB.query(db, "SELECT t.sessionKey,t.status,m.content FROM turns t JOIN messages m ON m.id=t.messageId WHERE t.wakeId=?1", [carrier_id])
+    assert target == source.session_key
+    assert content =~ source.wake_id
+    assert content =~ rendered
+    assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM turns WHERE wakeId=?1", [source.wake_id])
   end
 
   test "dispatch and a bound plain-after recheck teach the exact card fact", ctx do
@@ -1367,6 +1391,12 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   describe "terminal revocation notice admission" do
+    setup do
+      start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
+      start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, Tightbeam.LaneManager})
+      :ok
+    end
+
     for principal <- [{:session, "notice-parent"}, {:user, "flynn"}, {:user, "admin"}] do
       @notice_revoker principal
       test "ordinary revocation by #{inspect(principal)} binds exact immutable evidence", ctx do
@@ -2175,6 +2205,12 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   describe "route B unavailable-recipient intent" do
+    setup do
+      start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
+      start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, Tightbeam.LaneManager})
+      :ok
+    end
+
     for kind <- ["completion", "revocation"] do
       @incomplete_kind kind
       test "#{kind} survives unavailable replay and restart then resolves the current owner once",
@@ -4852,6 +4888,8 @@ defmodule Tightbeam.AssignmentsTest do
 
   test "unowned dispatch defers through its exact routing bracket, then admits exact fired rumination",
        ctx do
+    start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
+    start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, Tightbeam.LaneManager})
     session(ctx.db, "dispatcher", "flynn")
 
     {:appended, current_message} =
@@ -6903,6 +6941,12 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   describe "B1 terminal recognition failure isolation" do
+    setup do
+      start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
+      start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, Tightbeam.LaneManager})
+      :ok
+    end
+
     for persistence <- [:cancellation, :lifecycle] do
       @failure_persistence persistence
       test "#{persistence} refusal preserves its notice and carrier while unrelated work advances",
@@ -6962,7 +7006,7 @@ defmodule Tightbeam.AssignmentsTest do
         assert [[_, _, _, unrelated_carrier_id]] =
                  source_delivery_turns(ctx.db, unrelated.wake_id)
 
-        assert_received {:b1_attempt, ^unrelated_carrier_id}
+        assert Wakes.get(ctx.db, unrelated_carrier_id).state == "fired"
         refute_received {:b1_attempt, _}
 
         # The same scheduler remains usable under a persistent notice-specific
@@ -7214,7 +7258,17 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   defp assert_b1_one_turn(db, wake_id) do
-    assert Wakes.get(db, wake_id).state == "fired"
+    source = Wakes.get(db, wake_id)
+    assert source.state == "fired"
     assert [_] = source_delivery_turns(db, wake_id)
+    assert [%{delivery_wake_id: carrier_id, member_state: "included", batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(db, wake_id)
+    assert carrier_id != wake_id
+    assert Wakes.get(db, carrier_id).state == "fired"
+    assert {:ok, [[content]]} =
+             DB.query(db, "SELECT m.content FROM turns t JOIN messages m ON m.id=t.messageId WHERE t.wakeId=?1", [carrier_id])
+    assert content =~ wake_id
+    assert content =~ source.prompt
+    assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM turns WHERE wakeId=?1", [wake_id])
   end
 end

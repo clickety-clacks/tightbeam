@@ -1369,6 +1369,7 @@ defmodule Tightbeam.SupervisionTest do
        db: ctx.db,
        deliver: delivery_fun(ctx.db, registry, lane),
        tick_ms: 60_000,
+       delivery_opts: [conn_registry: registry, lane_manager: lane],
        name: :idle_cleanup_delivery_scheduler}
     )
   end
@@ -4505,6 +4506,7 @@ defmodule Tightbeam.SupervisionTest do
          db: ctx.db,
          deliver: delivery_fun(ctx.db, registry, lane),
          tick_ms: 60_000,
+         delivery_opts: [conn_registry: registry, lane_manager: lane],
          name: :external_order_scheduler}
       )
 
@@ -5348,6 +5350,10 @@ defmodule Tightbeam.SupervisionTest do
   # scheduled by a pre-block drain is suppressed at delivery, consumed as
   # canceled with the reason named, never delivered.
   test "a prod wake scheduled before work-blocked is suppressed at fire, not delivered", ctx do
+    registry = :"suppression_registry_#{System.unique_integer([:positive])}"
+    lane = :"suppression_lane_#{System.unique_integer([:positive])}"
+    start_supervised!({ConnRegistry, name: registry})
+    start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, lane})
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
     seq = terminal!(ctx.db, "holder")
     assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
@@ -5366,6 +5372,7 @@ defmodule Tightbeam.SupervisionTest do
            true
          end,
          tick_ms: 60_000,
+         delivery_opts: [conn_registry: registry, lane_manager: lane],
          name: :suppression_scheduler}
       )
 
@@ -5396,10 +5403,16 @@ defmodule Tightbeam.SupervisionTest do
       })
 
     assert :ok = Wakes.fire_due(scheduler)
-    assert_receive {:delivered, delivered_id}, 500
+    refute_receive {:delivered, _}
 
-    assert [%{delivery_wake_id: ^delivered_id, batch_state: "delivered"}] =
+    assert [%{delivery_wake_id: delivered_id, member_state: "included", batch_state: "delivered"}] =
              NoticeBatcher.source_refs(ctx.db, agent_wake.wake_id)
+    assert Wakes.get(ctx.db, delivered_id).state == "fired"
+    assert Wakes.get(ctx.db, agent_wake.wake_id).state == "fired"
+    assert {:ok, [[content]]} =
+             DB.query(ctx.db, "SELECT m.content FROM turns t JOIN messages m ON m.id=t.messageId WHERE t.wakeId=?1", [delivered_id])
+    assert content =~ agent_wake.prompt
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM turns WHERE wakeId=?1", [agent_wake.wake_id])
 
     assert [%{wake_id: source_wake_id, sender_principal: "session:supervisor"}] =
              NoticeBatcher.carrier_members(ctx.db, delivered_id)
@@ -6335,7 +6348,12 @@ defmodule Tightbeam.SupervisionTest do
   end
 
   defp deliver_supervision_source_via_carrier!(db, source, opts \\ []) do
-    _carrier_ids = NoticeBatcher.recover(db, System.system_time(:millisecond) + 1_000)
+    registry = :"supervision_carrier_registry_#{System.unique_integer([:positive])}"
+    lane = :"supervision_carrier_lane_#{System.unique_integer([:positive])}"
+    start_supervised!({ConnRegistry, name: registry})
+    start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, lane})
+    _carrier_ids = NoticeBatcher.recover(db, System.system_time(:millisecond) + 1_000,
+      conn_registry: registry, lane_manager: lane)
 
     assert [%{delivery_wake_id: carrier_id, member_state: "included"}] =
              Enum.filter(
@@ -6345,7 +6363,19 @@ defmodule Tightbeam.SupervisionTest do
 
     carrier = Wakes.get(db, carrier_id)
 
-    assert {:ok, {:appended, _target, _message, _opts}} =
+    assert carrier.state == "fired"
+    assert Wakes.get(db, source.wake_id).state == "fired"
+    assert Wakes.get(db, source.wake_id).prompt == source.prompt
+    assert {:ok, [[seq, target, content]]} =
+             DB.query(db, "SELECT t.seq,t.sessionKey,m.content FROM turns t JOIN messages m ON m.id=t.messageId WHERE t.wakeId=?1", [carrier_id])
+    assert target == carrier.session_key
+    assert content =~ source.wake_id
+    assert content =~ source.prompt
+    assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM turns WHERE wakeId=?1", [source.wake_id])
+
+    # recover committed the real turn; an old append call must now return
+    # that exact durable turn rather than manufacture a second delivery.
+    assert {:ok, {:duplicate, %{turn_seq: ^seq}}} =
              DB.transaction(db, fn txn ->
                Gateway.deliver_prompt_in_txn(
                  txn,
@@ -6358,6 +6388,7 @@ defmodule Tightbeam.SupervisionTest do
                  fire_wake_in_txn: true
                )
              end)
+    assert {:ok, [[1]]} = DB.query(db, "SELECT count(*) FROM turns WHERE wakeId=?1", [carrier_id])
 
     assert :ok = NoticeBatcher.delivery_delivered(db, carrier_id)
 

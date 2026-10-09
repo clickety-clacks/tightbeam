@@ -145,13 +145,25 @@ defmodule Tightbeam.FeatureSmokeTopologyTest do
                [wi]
              )
 
-    # The real scheduler delivers the synthetic rumination to an inert sink.
-    # No provider is started and no topology or wake rows are stamped by SQL.
+    # Own the real normal-path local publication/doorbell dependencies. No
+    # provider is started and no topology or wake rows are stamped by SQL.
+    start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
+    start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, Tightbeam.LaneManager})
     scheduler =
-      start_supervised!({Wakes, db: ctx.db, name: nil, tick_ms: 60_000, deliver: fn _ -> :ok end})
+      start_supervised!({Wakes, db: ctx.db, name: nil, tick_ms: 60_000,
+        deliver: fn _ -> flunk("normal rumination used legacy callback") end})
 
     assert :ok = Wakes.fire_due(scheduler)
     assert Wakes.rumination_exists?(ctx.db, wi, "parent")
+    assert {:ok, [[source_id, prompt, "fired"]]} =
+             DB.query(ctx.db, "SELECT wakeId,prompt,state FROM wakes WHERE rumination=1 AND work_item_id=?1 AND creatorSessionKey='parent'", [wi])
+    assert [%{delivery_wake_id: carrier_id, member_state: "included", batch_state: "delivered"}] =
+             Tightbeam.NoticeBatcher.source_refs(ctx.db, source_id)
+    assert {:ok, [["parent", "queued", content]]} =
+             DB.query(ctx.db, "SELECT t.sessionKey,t.status,m.content FROM turns t JOIN messages m ON m.id=t.messageId WHERE t.wakeId=?1", [carrier_id])
+    assert content =~ source_id
+    assert content =~ prompt
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM turns WHERE wakeId=?1", [source_id])
 
     first = call_as.("parent", "dispatch", staffing(wi))
     second = call_as.("parent", "dispatch", Map.put(staffing(wi), "sessionKey", "replacement"))

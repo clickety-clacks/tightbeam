@@ -344,6 +344,7 @@ defmodule Tightbeam.SupervisionConsumerFixture do
          db: ctx.db,
          name: :r1_api_scheduler,
          tick_ms: 60_000,
+         delivery_opts: [conn_registry: Tightbeam.ConnRegistry, lane_manager: api_lane],
          deliver: delivery_fun(ctx.db, Tightbeam.ConnRegistry, api_lane)}
       )
 
@@ -698,6 +699,7 @@ defmodule Tightbeam.SupervisionConsumerFixture do
          db: ctx.db,
          deliver: delivery_fun(ctx.db, registry, lane),
          tick_ms: 60_000,
+         delivery_opts: [conn_registry: registry, lane_manager: lane],
          name: :atomic_fire_scheduler}
       )
 
@@ -758,6 +760,7 @@ defmodule Tightbeam.SupervisionConsumerFixture do
          db: ctx.db,
          deliver: delivery_fun(ctx.db, registry, lane),
          tick_ms: 60_000,
+         delivery_opts: [conn_registry: registry, lane_manager: lane],
          name: :repeated_race_scheduler}
       )
 

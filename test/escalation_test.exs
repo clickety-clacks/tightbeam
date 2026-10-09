@@ -156,13 +156,24 @@ defmodule Tightbeam.EscalationTest do
     )
 
     :ok = Wakes.fire_due(deliverer)
-    assert_receive {:delivered, ^owner_session, ^id, "open"}
+    refute_receive {:delivered, _, _, _}
+    assert request(ctx, id).status == "open"
     assert Wakes.get(ctx.db, wake.wake_id).state == "fired"
 
     assert [%{delivery_wake_id: carrier_id, batch_state: "delivered"}] =
              NoticeBatcher.source_refs(ctx.db, wake.wake_id)
 
     assert Wakes.get(ctx.db, carrier_id).state == "fired"
+    assert carrier_id != wake.wake_id
+    assert {:ok, [[^owner_session, "queued", content]]} =
+             DB.query(ctx.db,
+               "SELECT t.sessionKey,t.status,m.content FROM turns t JOIN messages m ON m.id=t.messageId WHERE t.wakeId=?1",
+               [carrier_id])
+    assert content =~ wake.wake_id
+    assert content =~ wake.prompt
+    assert Wakes.get(ctx.db, wake.wake_id).prompt == wake.prompt
+    assert turn_count(ctx.db, wake.wake_id) == 0
+    assert turn_count(ctx.db, carrier_id) == 1
 
     # A decision-pending replay arms nothing and redelivers nothing.
     assert {:decision_pending, ^id} =
@@ -174,8 +185,12 @@ defmodule Tightbeam.EscalationTest do
              )
 
     assert Enum.map(notification_wakes(ctx), & &1.wake_id) == [wake.wake_id]
+    assert {:ok, before_turns} = DB.query(ctx.db, "SELECT * FROM turns ORDER BY seq")
+    assert {:ok, before_messages} = DB.query(ctx.db, "SELECT * FROM messages ORDER BY id")
     :ok = Wakes.fire_due(deliverer)
     refute_receive {:delivered, _, _, _}
+    assert {:ok, ^before_turns} = DB.query(ctx.db, "SELECT * FROM turns ORDER BY seq")
+    assert {:ok, ^before_messages} = DB.query(ctx.db, "SELECT * FROM messages ORDER BY id")
   end
 
   test "an operator ruling condition notice stays an editable source while its recipient is busy",
@@ -257,10 +272,27 @@ defmodule Tightbeam.EscalationTest do
 
     assert source_wake_id == wake.wake_id
     refute ruling_notice_wake_id == source_wake_id
-    assert Wakes.get(ctx.db, wake.wake_id).state == "pending"
+    # The source stayed editable while busy; readiness now committed its one
+    # actual carrier turn, so both included sources truthfully become fired.
+    for source_id <- [source_wake_id, ruling_notice_wake_id] do
+      assert Wakes.get(ctx.db, source_id).state == "fired"
+      assert [%{delivery_wake_id: ^carrier_id, member_state: "included", batch_state: "delivered"}] =
+               NoticeBatcher.source_refs(ctx.db, source_id)
+    end
+    assert Wakes.get(ctx.db, wake.wake_id).prompt == "re-read the ruling"
+    assert Wakes.get(ctx.db, carrier_id).state == "fired"
+    assert {:ok, [[content]]} =
+             DB.query(ctx.db, "SELECT m.content FROM turns t JOIN messages m ON m.id=t.messageId WHERE t.wakeId=?1", [carrier_id])
+    assert content =~ wake.wake_id
+    assert content =~ "[woke: fact escalation-ruled/#{request.id}]"
+    assert content =~ wake.prompt
+    assert turn_count(ctx.db, carrier_id) == 1
 
     assert {:ok, [[0]]} =
              DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [wake.wake_id])
+    assert {:ok, before_turns} = DB.query(ctx.db, "SELECT * FROM turns ORDER BY seq")
+    assert [] == NoticeBatcher.recover(ctx.db)
+    assert {:ok, ^before_turns} = DB.query(ctx.db, "SELECT * FROM turns ORDER BY seq")
   end
 
   test "digest drops note and idempotency key but changes for effect-bearing params", ctx do
@@ -852,8 +884,7 @@ defmodule Tightbeam.EscalationTest do
              )
 
     expected_prompt =
-      "[woke: fact escalation-ruled/#{direct.id}]\n\n" <>
-        "Decision request #{direct.id} was ruled. Read it with tightbeam decision-request --request #{direct.id}."
+      "Decision request #{direct.id} was ruled. Read it with tightbeam decision-request --request #{direct.id}."
 
     assert {:ok, [[1]]} =
              DB.query(
@@ -873,6 +904,10 @@ defmodule Tightbeam.EscalationTest do
              NoticeBatcher.source_refs(ctx.db, wake_id)
 
     assert turn_count(ctx.db, carrier_id) == 1
+
+    assert {:ok, [[content]]} =
+             DB.query(ctx.db, "SELECT m.content FROM turns t JOIN messages m ON m.id=t.messageId WHERE t.wakeId=?1", [carrier_id])
+    assert content =~ "[woke: fact escalation-ruled/#{direct.id}]\n\n" <> expected_prompt
 
     [listed] = Escalation.list(ctx.db, operator_call(ctx.raiser, %{}), "ruled")
     detailed = Escalation.get(ctx.db, operator_call(ctx.raiser, %{}), direct.id)
@@ -1990,8 +2025,10 @@ defmodule Tightbeam.EscalationTest do
              DB.query(ctx.db, "SELECT state,firedBy,prompt FROM wakes WHERE wakeId=?1", [wake_id])
 
     assert prompt ==
-             "[woke: fact escalation-ruled/#{request.id}]\n\n" <>
-               "Decision request #{request.id} was ruled. Read it with tightbeam decision-request --request #{request.id}."
+             "Decision request #{request.id} was ruled. Read it with tightbeam decision-request --request #{request.id}."
+    assert {:ok, [[content]]} =
+             DB.query(ctx.db, "SELECT m.content FROM turns t JOIN messages m ON m.id=t.messageId WHERE t.wakeId=?1", [carrier_id])
+    assert content =~ "[woke: fact escalation-ruled/#{request.id}]\n\n" <> prompt
   end
 
   test "only escalation-ruled matches while wrong condition names fall back", ctx do
@@ -2029,6 +2066,11 @@ defmodule Tightbeam.EscalationTest do
       assert Wakes.get(ctx.db, wake.wake_id).state == "pending"
     end
 
+    # The matched ruling already queued one raiser turn. Fallback sources stay
+    # editable until that turn actually finishes; then they share one snapshot.
+    assert {:ok, turn} = Ledger.claim_next(ctx.db, ctx.raiser.session_key, "fallback-test")
+    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+
     for wake <- wrong do
       assert {:ok, _} =
                DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [wake.wake_id])
@@ -2038,7 +2080,15 @@ defmodule Tightbeam.EscalationTest do
 
     for wake <- wrong do
       assert %{state: "fired", fired_by: "fallback"} = Wakes.get(ctx.db, wake.wake_id)
+      assert Wakes.get(ctx.db, wake.wake_id).prompt == wake.prompt
+      assert [%{delivery_wake_id: carrier_id, member_state: "included", batch_state: "delivered"}] =
+               NoticeBatcher.source_refs(ctx.db, wake.wake_id)
+      assert turn_count(ctx.db, carrier_id) == 1
+      assert turn_count(ctx.db, wake.wake_id) == 0
     end
+    [first, second] = wrong
+    assert [%{delivery_wake_id: carrier_id}] = NoticeBatcher.source_refs(ctx.db, first.wake_id)
+    assert [%{delivery_wake_id: ^carrier_id}] = NoticeBatcher.source_refs(ctx.db, second.wake_id)
 
     assert {:ok, [["condition"]]} =
              DB.query(

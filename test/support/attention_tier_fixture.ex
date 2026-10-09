@@ -340,14 +340,33 @@ defmodule Tightbeam.AttentionTierFixture do
                params: %{high: true}
              })
 
-    # With a running turn, the election lands on THAT turn.
-    assert :appended =
+    # A later human source joins the editable queue behind the first turn.
+    assert :queued =
              Gateway.deliver_prompt("k1", "user:flynn", "queued work",
                db: ctx.db,
                client_message_id: "c_running"
              )
 
+    assert {:ok, [[source_id, "pending", "queued work"]]} =
+             DB.query(ctx.db,
+               "SELECT wakeId,state,prompt FROM wakes WHERE sessionKey='k1' AND origin='user:flynn' AND prompt='queued work' AND consumer='prompt'")
+    assert Tightbeam.NoticeBatcher.source_refs(ctx.db, source_id) == []
+
+    # Finish the first queued turn, then admit the successor at readiness.
+    assert {:ok, first} = Ledger.claim_next(ctx.db, "k1", "lane")
+    assert :ok = Ledger.finish(ctx.db, first.seq, "delivered", nil, owner_lease: first.owner_lease)
+    assert [carrier_id] = Tightbeam.NoticeBatcher.recover(ctx.db)
+    assert [%{delivery_wake_id: ^carrier_id, member_state: "included", batch_state: "delivered"}] =
+             Tightbeam.NoticeBatcher.source_refs(ctx.db, source_id)
+    assert {:ok, [[content]]} =
+             DB.query(ctx.db, "SELECT m.content FROM turns t JOIN messages m ON m.id=t.messageId WHERE t.wakeId=?1", [carrier_id])
+    assert content =~ source_id
+    assert content =~ "queued work"
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM turns WHERE wakeId=?1", [source_id])
+
+    # With a running successor, the election lands on THAT actual turn.
     assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "lane")
+    assert turn.wake_id == carrier_id
 
     assert %{turn_seq: seq, attention: "high"} =
              handlers["attend"].(%{
