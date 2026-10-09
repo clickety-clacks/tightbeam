@@ -12,6 +12,8 @@ defmodule Tightbeam.WorkItemBracketsTest do
     DB,
     Dispatch,
     Gateway,
+    Ledger,
+    NoticeBatcher,
     Org,
     Projection,
     RailRemedy,
@@ -912,7 +914,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
   end
 
   defp deliver_bracket_wake(db, wake) do
-    {:ok, _} =
+    {:ok, result} =
       DB.transaction(db, fn txn ->
         Gateway.deliver_prompt_in_txn(txn, wake.session_key, wake.origin, wake.prompt,
           wake_id: wake.wake_id,
@@ -921,6 +923,52 @@ defmodule Tightbeam.WorkItemBracketsTest do
           fire_wake_in_txn: true
         )
       end)
+
+    case result do
+      {:staged, %{wake_id: source_wake_id}} ->
+        finish_delivery_queue(db, wake.session_key)
+        _ = NoticeBatcher.recover(db, System.system_time(:millisecond) + 60_000)
+        [%{delivery_wake_id: carrier_wake_id}] = NoticeBatcher.source_refs(db, source_wake_id)
+        carrier = Wakes.get(db, carrier_wake_id)
+
+        {:ok, {:appended, _, _, _}} =
+          DB.transaction(db, fn txn ->
+            Gateway.deliver_prompt_in_txn(
+              txn,
+              carrier.session_key,
+              carrier.origin,
+              carrier.prompt,
+              wake_id: carrier.wake_id,
+              sender: carrier.origin,
+              target_gate: carrier,
+              fire_wake_in_txn: true
+            )
+          end)
+
+        finish_delivery_queue(db, carrier.session_key)
+
+      {:appended, _, _, _} ->
+        finish_delivery_queue(db, wake.session_key)
+
+      other ->
+        flunk("expected bracket wake delivery, got: #{inspect(other)}")
+    end
+  end
+
+  defp finish_delivery_queue(db, session_key) do
+    case Ledger.claim_next(db, session_key, "work-item-bracket-fixture") do
+      {:ok, turn} ->
+        assert :ok =
+                 Ledger.finish(db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+
+        finish_delivery_queue(db, session_key)
+
+      :none ->
+        :ok
+
+      other ->
+        flunk("expected an idle bracket delivery queue, got: #{inspect(other)}")
+    end
   end
 
   defp routing_wake_id(db, id), do: column(db, id, "routingWakeId")

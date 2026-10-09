@@ -135,6 +135,24 @@ defmodule Tightbeam.Productions.BubbleTest do
     {assignment.id, blocked}
   end
 
+  defp hold_recipient!(db, session_key) do
+    assert {:ok, seq} =
+             Ledger.enqueue(db, %{
+               session_key: session_key,
+               message_id: "busy-recipient-#{System.unique_integer([:positive])}",
+               origin: "user:flynn",
+               prompt: "hold recipient before carrier delivery"
+             })
+
+    assert {:ok, turn} = Ledger.claim_next(db, session_key, "bubble-busy-recipient")
+    assert turn.seq == seq
+    turn
+  end
+
+  defp finish_busy_recipient!(db, turn) do
+    assert :ok = Ledger.finish(db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+  end
+
   defp queue_decision_wake!(ctx, decision_wake) do
     assert :queued =
              Tightbeam.Gateway.deliver_prompt(
@@ -212,6 +230,7 @@ defmodule Tightbeam.Productions.BubbleTest do
 
   defp fail_wake!(ctx, status, error \\ "private provider detail") do
     sender = session(ctx.db, "wake-sender", ctx.main.session_key)
+    busy = hold_recipient!(ctx.db, ctx.holder.session_key)
 
     wake =
       Tightbeam.Wakes.schedule(ctx.db, %{
@@ -229,8 +248,9 @@ defmodule Tightbeam.Productions.BubbleTest do
         fire_wake_in_txn: true
       )
 
-    assert delivery in [:appended, :queued]
-    if delivery == :queued, do: deliver_ready_carriers!(ctx, ctx.holder.session_key)
+    assert delivery == :queued
+    finish_busy_recipient!(ctx.db, busy)
+    deliver_ready_carriers!(ctx, ctx.holder.session_key)
 
     assert {:ok, turn} = Ledger.claim_next(ctx.db, ctx.holder.session_key, "wake-fixture")
     assert :ok = Ledger.finish(ctx.db, turn.seq, status, error, owner_lease: turn.owner_lease)
@@ -922,7 +942,9 @@ defmodule Tightbeam.Productions.BubbleTest do
       )
 
     decision_wake = blocked.decisionWake
+    busy = hold_recipient!(ctx.db, decision_wake.session_key)
     queue_decision_wake!(ctx, decision_wake)
+    finish_busy_recipient!(ctx.db, busy)
     decision_carrier = deliver_decision_carrier!(ctx, ctx.supervisor.session_key)
     supervisor_session = ctx.supervisor.session_key
     assert decision_carrier.session_key == supervisor_session

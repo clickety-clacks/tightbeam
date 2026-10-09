@@ -188,6 +188,44 @@ defmodule Tightbeam.Projection do
     end
   end
 
+  @doc false
+  @spec client_message_result_in_txn(Txn.t(), map()) ::
+          :new | {:duplicate, message()} | {:conflict, message()}
+  def client_message_result_in_txn(%Txn{} = txn, input) do
+    existing =
+      case {Map.get(input, :client_message_id), Map.get(input, :device_id)} do
+        {client_message_id, device_id}
+        when is_binary(client_message_id) and is_binary(device_id) ->
+          Txn.q(
+            txn,
+            """
+              SELECT seq, id, sessionKey, role, content, timestamp, sender, deviceId,
+                     clientMessageId, replyToMessageId, replyToClientMessageId,
+                     llmVisibleMessageId, attachments, attentionTier,
+                     messageType, markerKind, markerFrom, markerTo
+              FROM messages
+              WHERE sessionKey = ?1 AND deviceId = ?2 AND clientMessageId = ?3
+            """,
+            [Map.fetch!(input, :session_key), device_id, client_message_id]
+          )
+
+        _ ->
+          []
+      end
+
+    case existing do
+      [row] ->
+        message = to_message(row)
+
+        if message.content == Map.fetch!(input, :content),
+          do: {:duplicate, message},
+          else: {:conflict, message}
+
+      [] ->
+        :new
+    end
+  end
+
   @doc """
   Append a Tightbeam-authored substrate notice inside an existing transaction.
   Notices are records, not structural boundaries. Their readable content is

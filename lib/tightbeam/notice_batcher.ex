@@ -1526,6 +1526,21 @@ defmodule Tightbeam.NoticeBatcher do
 
   @doc false
   def queued_sources_ready_in_txn?(%Txn{} = txn, session_key, target_role, at \\ now()) do
+    queued_sources_ready_excluding_in_txn?(txn, session_key, target_role, nil, at)
+  end
+
+  @doc false
+  def queued_sources_ready_for_delivery_in_txn?(
+        %Txn{} = txn,
+        session_key,
+        target_role,
+        source_wake_id,
+        at \\ now()
+      ) do
+    queued_sources_ready_excluding_in_txn?(txn, session_key, target_role, source_wake_id, at)
+  end
+
+  defp queued_sources_ready_excluding_in_txn?(txn, session_key, target_role, source_wake_id, at) do
     recipient_running?(txn, session_key, target_role) or
       Txn.q(
         txn,
@@ -1538,9 +1553,10 @@ defmodule Tightbeam.NoticeBatcher do
           AND (w.waitMode IS NULL OR w.recognitionAt IS NOT NULL)
           AND (w.dueAt<=?2 OR w.firedAt IS NOT NULL OR w.recognitionAt IS NOT NULL)
           AND (p.sessionKey=?4 OR (?3 IS NOT NULL AND w.targetRole=?3))
+          AND (?5 IS NULL OR w.wakeId<>?5)
         LIMIT 1
         """,
-        [@policy_revision, at, target_role, session_key]
+        [@policy_revision, at, target_role, session_key, source_wake_id]
       ) != []
   end
 

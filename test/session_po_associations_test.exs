@@ -6,6 +6,7 @@ defmodule Tightbeam.SessionPoAssociationsTest do
     Gateway,
     Ledger,
     Model,
+    NoticeBatcher,
     Org,
     Roles,
     Schema,
@@ -308,20 +309,47 @@ defmodule Tightbeam.SessionPoAssociationsTest do
     assert second["association"]["poRole"] == "product-owner:two"
     assert second["association"]["revision"] == 2
 
-    assert {:ok, {:appended, "orchestrator", _message, _opts}} =
-             DB.transaction(ctx.db, fn txn ->
-               Gateway.deliver_prompt_in_txn(
-                 txn,
-                 wake.session_key,
-                 wake.origin,
-                 wake.prompt,
-                 wake_id: wake.wake_id,
-                 sender: wake.origin,
-                 device_id: "session-po-delayed-notice-test",
-                 client_message_id: wake.wake_id,
-                 target_gate: wake
-               )
-             end)
+    delivery =
+      DB.transaction(ctx.db, fn txn ->
+        Gateway.deliver_prompt_in_txn(
+          txn,
+          wake.session_key,
+          wake.origin,
+          wake.prompt,
+          wake_id: wake.wake_id,
+          sender: wake.origin,
+          device_id: "session-po-delayed-notice-test",
+          client_message_id: wake.wake_id,
+          target_gate: wake
+        )
+      end)
+
+    case delivery do
+      {:ok, {:staged, %{wake_id: source_wake_id}}} ->
+        _ = NoticeBatcher.recover(ctx.db, System.system_time(:millisecond) + 60_000)
+        [%{delivery_wake_id: carrier_wake_id}] = NoticeBatcher.source_refs(ctx.db, source_wake_id)
+        carrier = Wakes.get(ctx.db, carrier_wake_id)
+
+        assert {:ok, {:appended, "orchestrator", _message, _opts}} =
+                 DB.transaction(ctx.db, fn txn ->
+                   Gateway.deliver_prompt_in_txn(
+                     txn,
+                     carrier.session_key,
+                     carrier.origin,
+                     carrier.prompt,
+                     wake_id: carrier.wake_id,
+                     sender: carrier.origin,
+                     target_gate: carrier,
+                     fire_wake_in_txn: true
+                   )
+                 end)
+
+      {:ok, {:appended, "orchestrator", _message, _opts}} ->
+        :ok
+
+      other ->
+        flunk("expected delayed association notice delivery, got: #{inspect(other)}")
+    end
 
     assert {:ok, %{prompt: prompt}} =
              Ledger.claim_next(ctx.db, "orchestrator", "delayed-association-notice")

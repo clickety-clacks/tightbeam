@@ -1035,10 +1035,17 @@ defmodule Tightbeam.AssignmentsTest do
       assert routed.obligation_ref == wake.obligation_ref
       assert routed.state == "fired"
 
-      assert {:ok, [[seq, ^personal]]} =
-               DB.query(ctx.db, "SELECT seq,sessionKey FROM turns WHERE wakeId=?1", [wake.wake_id])
+      assert [[seq, ^personal, "queued", carrier_id]] =
+               source_delivery_turns(ctx.db, wake.wake_id)
 
-      assert {:ok, %{seq: ^seq}} = Ledger.claim_next(ctx.db, personal, "terminal-fixture")
+      refute carrier_id == wake.wake_id
+
+      assert [%{delivery_wake_id: ^carrier_id, member_state: "included"}] =
+               NoticeBatcher.source_refs(ctx.db, wake.wake_id)
+
+      assert {:ok, %{seq: ^seq, wake_id: ^carrier_id}} =
+               Ledger.claim_next(ctx.db, personal, "terminal-fixture")
+
       assert Ledger.pending_count(ctx.db, "notice-decoy") == 0
     end
 
@@ -1550,6 +1557,16 @@ defmodule Tightbeam.AssignmentsTest do
       assert {:appended, "notice-parent", _, _} = deliver_terminal_notice(ctx.db, root)
       assert {:ok, source} = Ledger.claim_next(ctx.db, "notice-parent", "fixture")
 
+      assert [[source_seq, "notice-parent", "running", delivery_wake_id]] =
+               source_delivery_turns(ctx.db, root.wake_id)
+
+      assert source.seq == source_seq
+      assert source.wake_id == delivery_wake_id
+      refute delivery_wake_id == root.wake_id
+
+      assert [%{delivery_wake_id: ^delivery_wake_id, member_state: "included"}] =
+               NoticeBatcher.source_refs(ctx.db, root.wake_id)
+
       assert :ok =
                Ledger.finish(ctx.db, source.seq, "failed", "fixture delivery failure",
                  owner_lease: source.owner_lease
@@ -1561,6 +1578,26 @@ defmodule Tightbeam.AssignmentsTest do
       assert recovery.session_key == "notice-parent"
       assert recovery.prompt == root.prompt
       assert recovery.obligation_ref == root.obligation_ref
+
+      assert {:ok, [[source_seq, "failed", recovery_id]]} =
+               DB.query(
+                 ctx.db,
+                 """
+                 SELECT sourceTurnSeq,outcome,retryWakeId FROM wake_retry_attempts
+                 WHERE wakeId=?1 AND rootWakeId=?1 AND predecessorWakeId IS NULL
+                 """,
+                 [root.wake_id]
+               )
+
+      assert source_seq == source.seq
+      assert recovery_id == recovery.wake_id
+
+      before_replay = recovery_snapshot(ctx.db)
+
+      assert {:ok, {:ok, %{wake: ^recovery, replay: true}}} =
+               recover_notice(ctx.db, root.wake_id, "session:" <> recovery.session_key)
+
+      assert recovery_snapshot(ctx.db) == before_replay
     end
 
     test "failed delivery recovers to the current accountable successor", ctx do
@@ -1578,6 +1615,16 @@ defmodule Tightbeam.AssignmentsTest do
       assert {:appended, "delivery-successor", _, _} = deliver_terminal_notice(ctx.db, root)
       assert {:ok, source} = Ledger.claim_next(ctx.db, "delivery-successor", "fixture")
 
+      assert [[source_seq, "delivery-successor", "running", delivery_wake_id]] =
+               source_delivery_turns(ctx.db, root.wake_id)
+
+      assert source.seq == source_seq
+      assert source.wake_id == delivery_wake_id
+      refute delivery_wake_id == root.wake_id
+
+      assert [%{delivery_wake_id: ^delivery_wake_id, member_state: "included"}] =
+               NoticeBatcher.source_refs(ctx.db, root.wake_id)
+
       assert :ok =
                Ledger.finish(ctx.db, source.seq, "failed", "fixture delivery failure",
                  owner_lease: source.owner_lease
@@ -1589,6 +1636,26 @@ defmodule Tightbeam.AssignmentsTest do
       assert recovery.session_key == "delivery-successor"
       assert recovery.prompt == root.prompt
       assert recovery.obligation_ref == root.obligation_ref
+
+      assert {:ok, [[source_seq, "failed", recovery_id]]} =
+               DB.query(
+                 ctx.db,
+                 """
+                 SELECT sourceTurnSeq,outcome,retryWakeId FROM wake_retry_attempts
+                 WHERE wakeId=?1 AND rootWakeId=?1 AND predecessorWakeId IS NULL
+                 """,
+                 [root.wake_id]
+               )
+
+      assert source_seq == source.seq
+      assert recovery_id == recovery.wake_id
+
+      before_replay = recovery_snapshot(ctx.db)
+
+      assert {:ok, {:ok, %{wake: ^recovery, replay: true}}} =
+               recover_notice(ctx.db, root.wake_id, "session:" <> recovery.session_key)
+
+      assert recovery_snapshot(ctx.db) == before_replay
     end
 
     for status <- ["failed", "failed_unknown"] do
@@ -2264,8 +2331,31 @@ defmodule Tightbeam.AssignmentsTest do
 
     case result do
       {:terminal_notice_undeliverable, _} -> Gateway.complete_delivery(db, result)
+      {:staged, %{wake_id: source_wake_id}} -> deliver_terminal_notice_carrier(db, source_wake_id)
       other -> other
     end
+  end
+
+  defp deliver_terminal_notice_carrier(db, source_wake_id) do
+    _carrier_ids = NoticeBatcher.recover(db, System.system_time(:millisecond) + 60_000)
+    [%{delivery_wake_id: carrier_wake_id}] = NoticeBatcher.source_refs(db, source_wake_id)
+    carrier = Wakes.get(db, carrier_wake_id)
+
+    {:ok, result} =
+      DB.transaction(db, fn txn ->
+        Gateway.deliver_prompt_in_txn(
+          txn,
+          carrier.session_key,
+          carrier.origin,
+          carrier.prompt,
+          wake_id: carrier.wake_id,
+          sender: carrier.origin,
+          target_gate: carrier,
+          fire_wake_in_txn: true
+        )
+      end)
+
+    result
   end
 
   defp deliver_scheduled_wake(db, wake) do
@@ -6754,16 +6844,21 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   defp start_running_turn(db, session_key, prompt) do
-    assert {:ok, {:appended, ^session_key, _message, _opts}} =
-             DB.transaction(db, fn txn ->
-               Gateway.deliver_prompt_in_txn(
-                 txn,
-                 session_key,
-                 "test:notice-batching",
-                 prompt,
-                 sender: "test:notice-batching"
-               )
-             end)
+    {:appended, message} =
+      Projection.append(db, %{
+        session_key: session_key,
+        role: "user",
+        content: "[from test:notice-batching]\n\n" <> prompt,
+        sender: "test:notice-batching"
+      })
+
+    {:ok, _seq} =
+      Ledger.enqueue(db, %{
+        session_key: session_key,
+        message_id: message.id,
+        origin: "test:notice-batching",
+        prompt: prompt
+      })
 
     assert {:ok, turn} = Ledger.claim_next(db, session_key, "notice-batching-fixture")
     turn

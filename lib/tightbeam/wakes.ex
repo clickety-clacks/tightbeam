@@ -703,10 +703,9 @@ defmodule Tightbeam.Wakes do
         session_key: ^session_key,
         consumer: "prompt",
         digest: false,
-        state: state,
-        class: class
+        state: state
       } = wake
-      when state in ["pending", "fired"] and is_binary(class) ->
+      when state in ["pending", "fired"] ->
         fired_at = wake.fired_at || now()
 
         Txn.q(
@@ -1159,8 +1158,7 @@ defmodule Tightbeam.Wakes do
   defp recover_terminal_evidence_in_txn(txn, root, recipient, principal, evidence) do
     successor_id = retry_wake_id(root.wake_id, 1)
 
-    source =
-      Txn.q(txn, "SELECT seq,status,assignmentId FROM turns WHERE wakeId=?1", [root.wake_id])
+    source = source_delivery_turns_in_txn(txn, root.wake_id)
 
     existing = get_in_txn(txn, successor_id)
 
@@ -1867,20 +1865,8 @@ defmodule Tightbeam.Wakes do
           Txn.q(txn, "SELECT state,consumer,sessionKey FROM wakes WHERE wakeId=?1", [wake_id])
 
         turns =
-          Txn.q(
-            txn,
-            """
-            SELECT seq,status FROM turns WHERE wakeId=?1
-            UNION ALL
-            SELECT t.seq,t.status
-            FROM notice_batch_members m
-            JOIN notice_batches b ON b.batchId=m.batchId
-            JOIN turns t ON t.wakeId=b.deliveryWakeId
-            WHERE m.sourceWakeId=?1 AND m.state='included'
-            ORDER BY seq
-            """,
-            [wake_id]
-          )
+          source_delivery_turns_in_txn(txn, wake_id)
+          |> Enum.map(fn [seq, status, _assignment_id] -> [seq, status] end)
 
         retry_turns =
           Txn.q(
@@ -1967,6 +1953,27 @@ defmodule Tightbeam.Wakes do
       end
     )
     |> Map.new(fn {kind, rows} -> {kind, Enum.reverse(rows)} end)
+  end
+
+  # A carrier turn serves several independently owned sources. Preserve each
+  # source's assignment identity when recognizing its delivery or recovery,
+  # rather than treating the carrier's transport wake as the semantic notice.
+  defp source_delivery_turns_in_txn(txn, wake_id) do
+    Txn.q(
+      txn,
+      """
+      SELECT seq,status,assignmentId FROM turns WHERE wakeId=?1
+      UNION ALL
+      SELECT t.seq,t.status,w.assignmentId
+      FROM notice_batch_members m
+      JOIN notice_batches b ON b.batchId=m.batchId
+      JOIN wakes w ON w.wakeId=m.sourceWakeId
+      JOIN turns t ON t.wakeId=b.deliveryWakeId
+      WHERE m.sourceWakeId=?1 AND m.state='included'
+      ORDER BY seq
+      """,
+      [wake_id]
+    )
   end
 
   @doc false

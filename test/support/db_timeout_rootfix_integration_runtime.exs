@@ -153,7 +153,7 @@ assert [%{delivery_wake_id: ^carrier_wake_id, batch_state: "delivered"}] =
 send(publication_pid, :release_publication)
 assert {:ok, :published} = Task.await(publication)
 
-assert Wakes.get(db, wake.wake_id).state == "pending"
+assert Wakes.get(db, wake.wake_id).state == "fired"
 assert Wakes.get(db, carrier_wake_id).state == "fired"
 assert {:ok, [["delivered"]]} = DB.query(db, "SELECT status FROM turns WHERE seq=?1", [lane_seq])
 assert Process.alive?(catalog)

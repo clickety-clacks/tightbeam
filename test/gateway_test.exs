@@ -763,6 +763,58 @@ defmodule Tightbeam.GatewayTest do
              )
   end
 
+  test "retrying an idle post after its direct turn starts does not stage a second delivery",
+       ctx do
+    start_supervised!(
+      Supervisor.child_spec({ConnRegistry, name: Tightbeam.ConnRegistry},
+        id: :direct_post_retry_registry
+      )
+    )
+
+    post = Gateway.handlers(%{db: ctx.db})["post"]
+
+    call = %{
+      session_key: "k1",
+      origin: "session:k1",
+      params: %{
+        content: "first immediate human message",
+        device_id: "direct-post-device",
+        client_message_id: "direct-post-1"
+      }
+    }
+
+    assert %{ack: "direct-post-1"} = post.(call)
+    assert {:ok, turn} = Tightbeam.Ledger.claim_next(ctx.db, "k1", "direct-post-retry")
+    assert %{dedupe: "duplicate"} = post.(call)
+    assert %{dedupe: "duplicate"} = post.(call)
+
+    assert %{dedupe: "conflict"} =
+             post.(put_in(call, [:params, :content], "changed direct payload"))
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM messages WHERE clientMessageId='direct-post-1'"
+             )
+
+    assert {:ok, [[seq, "running"]]} =
+             DB.query(ctx.db, "SELECT seq,status FROM turns WHERE sessionKey='k1'")
+
+    assert seq == turn.seq
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM staged_message_dedupes WHERE clientMessageId='direct-post-1'"
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE prompt='first immediate human message'"
+             )
+  end
+
   test "a busy direct prompt joins the editable source queue without opt-in", ctx do
     {:appended, current_message} =
       Tightbeam.Projection.append(ctx.db, %{
@@ -7933,6 +7985,12 @@ defmodule Tightbeam.GatewayTest do
     ]
 
     assert :appended = Gateway.deliver_prompt("k1", "user:flynn", "conversation", common)
+    assert {:ok, conversation_turn} = Ledger.claim_next(ctx.db, "k1", "conversation-fixture")
+
+    assert :ok =
+             Ledger.finish(ctx.db, conversation_turn.seq, "delivered", nil,
+               owner_lease: conversation_turn.owner_lease
+             )
 
     assert :appended =
              Gateway.deliver_prompt(
@@ -9882,22 +9940,36 @@ defmodule Tightbeam.GatewayTest do
 
     assert File.read!(skill) == "lost-response served skill"
     assert Org.get(ctx.db, session.session_key).identity_revision == next
-    assert Ledger.pending_count(ctx.db, session.session_key) == 2
+    # The retry remains a distinct durable nudge, but the first immediate
+    # prompt already owns the recipient's pending turn. Keep the retry as an
+    # editable source row until that turn ends instead of queuing a second
+    # ungrouped turn ahead of recipient readiness.
+    assert Ledger.pending_count(ctx.db, session.session_key) == 1
 
     assert {:ok, rows} =
              DB.query(ctx.db, "SELECT prompt FROM turns WHERE sessionKey=?1 ORDER BY seq", [
                session.session_key
              ])
 
-    assert length(rows) == 2
+    assert length(rows) == 1
 
-    for [prompt] <- rows do
-      assert prompt ==
-               "[from process:tightbeam]\n\n" <>
-                 "Your Tightbeam-owned skill files changed to identity revision #{next}.\n" <>
-                 "Re-read your Tightbeam skills before you continue work. This update does not\n" <>
-                 "reload your current model context."
-    end
+    expected =
+      "[from process:tightbeam]\n\n" <>
+        "Your Tightbeam-owned skill files changed to identity revision #{next}.\n" <>
+        "Re-read your Tightbeam skills before you continue work. This update does not\n" <>
+        "reload your current model context."
+
+    assert rows == [[expected]]
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE sessionKey=?1 AND state='pending' AND consumer='prompt' AND prompt=?2",
+               [
+                 session.session_key,
+                 String.replace_prefix(expected, "[from process:tightbeam]\n\n", "")
+               ]
+             )
   end
 
   # The refusal is the existing privacy-preserving one, and it happens before any
@@ -10461,13 +10533,26 @@ defmodule Tightbeam.GatewayTest do
   end
 
   defp enqueue_gateway_prompt!(db, session_key, sender, prompt) do
-    {:ok, {:appended, ^session_key, message, _opts}} =
-      DB.transaction(db, fn txn ->
-        Gateway.deliver_prompt_in_txn(txn, session_key, sender, prompt, sender: sender)
-      end)
+    # Seed an already-materialized queue for the handoff fixture. Prompts
+    # admitted through Gateway while that queue is busy must stay editable
+    # source rows until recipient readiness.
+    stamped = "[from #{sender}]\n\n#{prompt}"
 
-    {:ok, [[seq]]} =
-      DB.query(db, "SELECT seq FROM turns WHERE messageId=?1", [message.id])
+    {:appended, message} =
+      Projection.append(db, %{
+        session_key: session_key,
+        role: "user",
+        sender: sender,
+        content: stamped
+      })
+
+    {:ok, seq} =
+      Ledger.enqueue(db, %{
+        session_key: session_key,
+        message_id: message.id,
+        origin: sender,
+        prompt: stamped
+      })
 
     {seq, message}
   end

@@ -11,7 +11,17 @@ end
 defmodule Tightbeam.SchemaShapeTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{Assignments, ConnRegistry, DB, Schema, SessionPoAssociations, Wakes}
+  alias Tightbeam.{
+    Assignments,
+    ConnRegistry,
+    DB,
+    Gateway,
+    Ledger,
+    NoticeBatcher,
+    Schema,
+    SessionPoAssociations,
+    Wakes
+  }
 
   @shape "assignment-source-replacement-v1-019"
   @agent_reparent_shape "delivery-owner-reparent-v1-019"
@@ -623,6 +633,11 @@ defmodule Tightbeam.SchemaShapeTest do
              )
 
     for fact_id <- 1..6 do
+      # This migration proof isolates ownership recognition. Complete each
+      # marker turn before the next fact so every historical source is seen
+      # while its recipient is ready.
+      Enum.each(["marker-a", "marker-b"], &finish_marker_queue(db, &1))
+
       assert {:ok, _} =
                DB.transaction(db, fn txn ->
                  Wakes.recognize_condition_fact_in_txn(txn, fact_id)
@@ -650,18 +665,45 @@ defmodule Tightbeam.SchemaShapeTest do
                Wakes.recognize_condition_fact_in_txn(txn, 7)
              end)
 
+    staged_marker = Wakes.get(db, "marker-1-marker-b")
+    assert staged_marker.state == "pending"
+    assert is_integer(staged_marker.fired_at)
+    finish_marker_queue(db, "marker-b")
+
+    [carrier_id] = NoticeBatcher.recover(db, System.system_time(:millisecond) + 1_000)
+    carrier = Wakes.get(db, carrier_id)
+
+    assert {:ok, {:appended, _target, _message, _opts}} =
+             DB.transaction(db, fn txn ->
+               Gateway.deliver_prompt_in_txn(
+                 txn,
+                 carrier.session_key,
+                 carrier.origin,
+                 carrier.prompt,
+                 wake_id: carrier.wake_id,
+                 sender: carrier.origin,
+                 target_gate: carrier,
+                 fire_wake_in_txn: true
+               )
+             end)
+
+    assert :ok = NoticeBatcher.delivery_delivered(db, carrier_id)
+
     assert Wakes.get(db, "marker-1-marker-b").state == "fired"
 
     assert {:ok, [[1]]} =
-             DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId='marker-1-marker-b'")
+             DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [carrier_id])
 
-    assert {:ok, [[11]]} =
+    assert [%{delivery_wake_id: ^carrier_id, batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(db, "marker-1-marker-b")
+
+    assert {:ok, [[10]]} =
              DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId LIKE 'marker-%'")
 
     # A second startup must not relabel ambiguous facts or duplicate recognition.
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [[11]]} =
+    assert {:ok, [[10]]} =
              DB.query(
                db,
                "SELECT COUNT(*) FROM turns WHERE wakeId LIKE 'marker-%'"
@@ -2324,5 +2366,21 @@ defmodule Tightbeam.SchemaShapeTest do
       DROP TABLE IF EXISTS supervision_liveness_migrations;
       DROP INDEX IF EXISTS wakes_cancellation_state;
       """)
+  end
+
+  defp finish_marker_queue(db, session_key) do
+    case Ledger.claim_next(db, session_key, "schema-shape-fixture") do
+      {:ok, turn} ->
+        assert :ok =
+                 Ledger.finish(db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+
+        finish_marker_queue(db, session_key)
+
+      :none ->
+        :ok
+
+      other ->
+        flunk("expected an idle historical marker recipient, got: #{inspect(other)}")
+    end
   end
 end

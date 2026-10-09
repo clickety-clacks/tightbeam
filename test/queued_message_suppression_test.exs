@@ -4,8 +4,8 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
   alias Tightbeam.{
     Assignments,
     DB,
-    Gateway,
     Ledger,
+    Projection,
     QueuedMessageSuppression,
     Roles,
     Rules,
@@ -950,23 +950,32 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
   end
 
   defp deliver_wake!(db, wake) do
-    assert {:ok, {:appended, "k1", _message, _opts}} =
-             DB.transaction(db, fn txn ->
-               Gateway.deliver_prompt_in_txn(
-                 txn,
-                 wake.session_key,
-                 wake.origin,
-                 wake.prompt,
-                 wake_id: wake.wake_id,
-                 sender: wake.origin,
-                 device_id: "test",
-                 client_message_id: wake.wake_id,
-                 target_gate: wake
-               )
-             end)
+    # This suite isolates the pre-claim suppression rules for an already
+    # materialized queue row. Seed that legacy source/turn pair below the
+    # recipient batching admission path; notice-batch readiness and carrier
+    # delivery have their own integration coverage.
+    stamped = "[from #{wake.origin}]\n\n#{wake.prompt}"
 
-    assert {:ok, [[seq]]} =
-             DB.query(db, "SELECT seq FROM turns WHERE wakeId=?1", [wake.wake_id])
+    {:appended, message} =
+      Projection.append(db, %{
+        session_key: wake.session_key,
+        role: "user",
+        content: stamped,
+        sender: wake.origin,
+        device_id: "test",
+        client_message_id: wake.wake_id
+      })
+
+    {:ok, seq} =
+      Ledger.enqueue(db, %{
+        session_key: wake.session_key,
+        message_id: message.id,
+        wake_id: wake.wake_id,
+        origin: wake.origin,
+        prompt: stamped,
+        assignment_id: wake.assignment_id,
+        job_ref: wake.work_item_id
+      })
 
     seq
   end

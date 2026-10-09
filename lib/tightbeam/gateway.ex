@@ -2160,33 +2160,45 @@ defmodule Tightbeam.Gateway do
 
       {target, role_ref, role_fallback} when not is_nil(target) ->
         if Ledger.enqueueable_in_txn?(txn, target) do
-          case staged_message_dedupe_in_txn(txn, target, prompt, opts) do
+          case Projection.client_message_result_in_txn(txn, %{
+                 session_key: target,
+                 role: "user",
+                 content: stamped,
+                 device_id: opts[:device_id],
+                 client_message_id: opts[:client_message_id]
+               }) do
             :new ->
-              if stage_for_queue?(txn, target, opts) do
-                stage_prompt_in_txn(
-                  txn,
-                  target,
-                  origin,
-                  prompt,
-                  opts,
-                  role_ref || opts[:role_ref]
-                )
-              else
-                case admit_supervision_controller_in_txn(txn, opts, target) do
-                  :canceled ->
-                    :skipped
-
-                  controller ->
-                    append_and_enqueue_in_txn(
+              case staged_message_dedupe_in_txn(txn, target, prompt, opts) do
+                :new ->
+                  if stage_for_queue?(txn, target, opts) do
+                    stage_prompt_in_txn(
                       txn,
                       target,
-                      role_ref,
-                      role_fallback,
                       origin,
-                      stamped,
-                      Keyword.put(opts, :supervision_controller, controller)
+                      prompt,
+                      opts,
+                      role_ref || opts[:role_ref]
                     )
-                end
+                  else
+                    case admit_supervision_controller_in_txn(txn, opts, target) do
+                      :canceled ->
+                        :skipped
+
+                      controller ->
+                        append_and_enqueue_in_txn(
+                          txn,
+                          target,
+                          role_ref,
+                          role_fallback,
+                          origin,
+                          stamped,
+                          Keyword.put(opts, :supervision_controller, controller)
+                        )
+                    end
+                  end
+
+                duplicate_or_conflict ->
+                  duplicate_or_conflict
               end
 
             duplicate_or_conflict ->
@@ -2211,7 +2223,12 @@ defmodule Tightbeam.Gateway do
 
   defp stage_for_queue?(txn, target, opts) do
     not batch_carrier_wake?(txn, opts[:wake_id]) and
-      NoticeBatcher.queued_sources_ready_in_txn?(txn, target, opts[:role_ref])
+      NoticeBatcher.queued_sources_ready_for_delivery_in_txn?(
+        txn,
+        target,
+        opts[:role_ref],
+        opts[:wake_id]
+      )
   end
 
   defp batch_carrier_wake?(_txn, wake_id) when not is_binary(wake_id), do: false
@@ -2265,11 +2282,11 @@ defmodule Tightbeam.Gateway do
   defp existing_staged_source_in_txn(txn, target, prompt, wake_id) do
     case DB.Txn.q(
            txn,
-           "SELECT wakeId,sessionKey,origin,prompt,class,state,consumer,digest FROM wakes WHERE wakeId=?1",
+           "SELECT wakeId,sessionKey,origin,prompt,state,consumer,digest FROM wakes WHERE wakeId=?1",
            [wake_id]
          ) do
-      [[^wake_id, ^target, origin, ^prompt, class, state, "prompt", 0]]
-      when state in ["pending", "fired"] and is_binary(class) ->
+      [[^wake_id, ^target, origin, ^prompt, state, "prompt", 0]]
+      when state in ["pending", "fired"] ->
         case Wakes.prepare_prompt_source_for_batch_in_txn(txn, wake_id, target, prompt) do
           {:ok, wake} -> {:ok, wake}
           :not_found -> :none

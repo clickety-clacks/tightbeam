@@ -1629,7 +1629,6 @@ defmodule Tightbeam.Schema do
 
     case DB.transaction(db, fn txn ->
            :ok = Tightbeam.Escalation.ensure_terminal_parity_in_txn(txn, activated_at)
-           :ok = migrate_supervision_batch_delivery_guards_in_txn(txn)
            :ok = ensure_supervision_liveness_v1_in_txn(txn, activated_at)
 
            # Activation and its stamp commit together. A restart before this
@@ -1664,7 +1663,7 @@ defmodule Tightbeam.Schema do
     Enum.each(@schema_modules, fn
       Tightbeam.Ledger -> :ok
       Tightbeam.Toplines -> :ok = Tightbeam.Toplines.ensure_historical_schema(db)
-      Tightbeam.NoticeBatcher -> :ok = Tightbeam.NoticeBatcher.ensure_bootstrap_schema(db)
+      Tightbeam.NoticeBatcher -> :ok
       module -> :ok = module.ensure_schema(db)
     end)
 
@@ -1675,7 +1674,7 @@ defmodule Tightbeam.Schema do
     Enum.each(@schema_modules, fn
       Tightbeam.Ledger -> :ok
       Tightbeam.Toplines -> :ok = Tightbeam.Toplines.ensure_historical_schema(db)
-      Tightbeam.NoticeBatcher -> :ok = Tightbeam.NoticeBatcher.ensure_bootstrap_schema(db)
+      Tightbeam.NoticeBatcher -> :ok
       module -> :ok = module.ensure_schema(db)
     end)
 
@@ -1702,6 +1701,11 @@ defmodule Tightbeam.Schema do
     # qualifications succeed, but before publishing a successful boot marker.
     :ok = ensure_lifecycle_runtime_indexes(db)
     :ok = ensure_idle_cleanup_runtime_indexes(db)
+
+    # Batch-aware supervision guards reference notice_batches, so install them
+    # only after all predecessor migrations and refusal checks have completed
+    # and the complete batch schema exists.
+    :ok = migrate_supervision_batch_delivery_guards(db)
 
     case DB.finish_schema(db) do
       :ok -> :ok
@@ -2000,7 +2004,12 @@ defmodule Tightbeam.Schema do
          do: reparent_liveness_enforcement_objects(),
          else: @supervision_liveness_enforcement_objects
 
-    Enum.each(enforcement_objects, fn object ->
+    batch_delivery_guard_names =
+      Enum.map(@supervision_batch_delivery_previous_triggers, &elem(&1, 0))
+
+    enforcement_objects
+    |> Enum.reject(&(&1.name in batch_delivery_guard_names))
+    |> Enum.each(fn object ->
       if owned_object_present?(txn, object) do
         validate_owned_object!(txn, object)
       else
@@ -2445,6 +2454,21 @@ defmodule Tightbeam.Schema do
     :ok
   end
 
+  defp migrate_supervision_batch_delivery_guards(db) do
+    case DB.transaction(db, fn txn -> migrate_supervision_batch_delivery_guards_in_txn(txn) end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "incompatible_supervision_liveness_v1: batch guard migration failed: #{Exception.message(error)}"
+    end
+  end
+
   defp migrate_owned_liveness_trigger_in_txn(txn, expected, previous_sql) do
     case Txn.q(
            txn,
@@ -2452,7 +2476,8 @@ defmodule Tightbeam.Schema do
            [expected.name]
          ) do
       [] ->
-        :ok
+        :ok = Txn.exec(txn, expected.sql)
+        validate_owned_object!(txn, expected)
 
       [[actual_sql]] when is_binary(actual_sql) ->
         current = normalize_schema_sql(expected.sql)
@@ -3207,8 +3232,7 @@ defmodule Tightbeam.Schema do
   defp bootstrap_module(db, Tightbeam.Wakes, _current?),
     do: Tightbeam.Wakes.ensure_historical_schema(db)
 
-  defp bootstrap_module(db, Tightbeam.NoticeBatcher, _current?),
-    do: Tightbeam.NoticeBatcher.ensure_bootstrap_schema(db)
+  defp bootstrap_module(_db, Tightbeam.NoticeBatcher, _current?), do: :ok
 
   defp bootstrap_module(db, Tightbeam.Toplines, _current?),
     do: Tightbeam.Toplines.ensure_historical_schema(db)
