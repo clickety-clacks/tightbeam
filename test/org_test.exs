@@ -590,16 +590,66 @@ defmodule Tightbeam.OrgTest do
     assert length(Wakes.digest_members(db, carrier_id)) == 50
   end
 
-  test "retirement after arm preserves the one carrier and closes the replacement", %{db: db} do
-    %{original: original, batch_id: batch_id} = selected_retirement_source(db, "after arm")
+  test "retirement after actual admission preserves the immutable carrier and turn", %{db: db} do
+    ensure_legacy_main(db)
+    Org.create(db, base(%{session_key: "retiring"}))
+    Roles.create!(db, "reviewer", "flynn", "retiring")
+    start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
+    start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, Tightbeam.LaneManager})
+
+    original =
+      Wakes.schedule(db, %{
+        session_key: "retiring",
+        target_role: "reviewer",
+        origin: "process:tightbeam",
+        creator_session_key: "agent:sender",
+        prompt: "retirement after actual admission",
+        due_at: 0,
+        class: "fyi"
+      })
+
     assert [carrier_id] = Wakes.materialize_digests(db, original.due_at)
 
-    armed = NoticeBatcher.batch(db, batch_id)
-    assert armed.state == "delivery_pending"
-    assert armed.delivery_wake_id == carrier_id
+    assert [%{batch_id: batch_id, member_state: "included", batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(db, original.wake_id)
+
+    committed = NoticeBatcher.batch(db, batch_id)
+    assert committed.delivery_wake_id == carrier_id
+    assert committed.envelope =~ original.prompt
+    assert Wakes.get(db, original.wake_id).state == "fired"
+    assert Wakes.get(db, carrier_id).state == "fired"
+
+    assert {:ok, [["retiring", "queued", actual_prompt]]} =
+             DB.query(db, "SELECT sessionKey,status,prompt FROM turns WHERE wakeId=?1", [
+               carrier_id
+             ])
+
+    assert actual_prompt == "[from process:tightbeam]\n\n" <> committed.envelope
+
+    assert {:ok, [actual_turn]} =
+             DB.query(db, "SELECT * FROM turns WHERE wakeId=?1", [carrier_id])
+
+    members = NoticeBatcher.members(db, batch_id)
+    carrier = Wakes.get(db, carrier_id)
 
     assert %{state: "retired"} = Org.retire(db, "retiring", "user:flynn", 1_000)
-    assert_immutable_retirement_chain(db, original, armed)
+    assert NoticeBatcher.batch(db, batch_id) == committed
+    assert NoticeBatcher.members(db, batch_id) == members
+    assert Wakes.get(db, carrier_id) == carrier
+    assert Wakes.get(db, original.wake_id).state == "fired"
+    assert Wakes.get(db, original.wake_id).prompt == original.prompt
+    assert cancellation(db, original.wake_id) == nil
+    assert Enum.map(Wakes.digest_members(db, carrier_id), & &1.wake_id) == [original.wake_id]
+
+    assert {:ok, [^actual_turn]} =
+             DB.query(db, "SELECT * FROM turns WHERE wakeId=?1", [carrier_id])
+
+    assert NoticeBatcher.recover(db) == []
+    assert Wakes.materialize_digests(db) == []
+    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM turns")
+    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM wakes WHERE digest=1")
+    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM wakes WHERE digest=0")
+    assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
   end
 
   test "retirement after terminal carrier preserves the one fired delivery path", %{db: db} do
