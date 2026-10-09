@@ -386,9 +386,7 @@ defmodule Tightbeam.NoticeBatcher do
   @doc false
   @spec preserve_retargeted_source_in_txn(Txn.t(), String.t(), String.t()) ::
           :not_batched
-          | map()
           | {:immutable_delivery, map()}
-          | {:immutable_delivery_pending, map()}
           | {:error, map()}
   def preserve_retargeted_source_in_txn(
         %Txn{} = txn,
@@ -1252,9 +1250,9 @@ defmodule Tightbeam.NoticeBatcher do
      delivery_gate_scope(visibility_scope, Map.get(recipient, :target_gate, 1))}
   end
 
-  # targetGate=0 explicitly authorizes delivery to a recorded session after it
-  # retires. It must not share a carrier with the schema-default targetGate=1
-  # path, whose carrier remains subject to the active-session gate.
+  # Retain the authored gate in source visibility metadata. Each source's gate
+  # is validated before the single concrete-session snapshot; this suffix does
+  # not split that snapshot into separate delivery lanes.
   defp delivery_gate_scope(visibility_scope, 0),
     do: visibility_scope <> ":delivery-target-gate-0"
 

@@ -187,6 +187,31 @@ defmodule Tightbeam.OrgTest do
         target_gate: 0
       })
 
+    encoded_attachments = "[ {\"name\": \"retained.png\", \"url\": \"attachment://original\"} ]"
+
+    identity = %{
+      "targetSessionKey" => "retiring",
+      "deviceId" => "original-device",
+      "clientMessageId" => "original-client",
+      "sourceWakeId" => role.wake_id,
+      "payloadSha256" => Base.encode16(:crypto.hash(:sha256, role.prompt), case: :lower),
+      "createdAt" => role.created_at
+    }
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "UPDATE wakes SET sourceAttachments=?2,sourceClientIdentity=?3 WHERE wakeId=?1",
+               [role.wake_id, encoded_attachments, JSON.encode!(identity)]
+             )
+
+    assert {:ok, [[address, scope]]} =
+             DB.query(
+               db,
+               "SELECT sourceAddress,sourceVisibilityScope FROM wakes WHERE wakeId=?1",
+               [role.wake_id]
+             )
+
     assert %{state: "retired"} = Org.retire(db, "retiring", "user:flynn", 1_000)
     assert %{state: "canceled"} = Wakes.get(db, direct.wake_id)
 
@@ -217,6 +242,38 @@ defmodule Tightbeam.OrgTest do
              prompt: "role",
              due_at: 9_001
            } = Wakes.get(db, replacement_wake_id)
+
+    assert {:ok, [[^encoded_attachments, ^address, ^scope, nil]]} =
+             DB.query(
+               db,
+               "SELECT sourceAttachments,sourceAddress,sourceVisibilityScope,sourceClientIdentity FROM wakes WHERE wakeId=?1",
+               [replacement_wake_id]
+             )
+
+    assert {:ok, [[^encoded_attachments, original_identity]]} =
+             DB.query(
+               db,
+               "SELECT sourceAttachments,sourceClientIdentity FROM wakes WHERE wakeId=?1",
+               [role.wake_id]
+             )
+
+    assert JSON.decode!(original_identity) == identity
+
+    assert {:ok, [[role_id]]} =
+             DB.query(
+               db,
+               "SELECT wakeId FROM wakes WHERE json_extract(sourceClientIdentity,'$.clientMessageId')='original-client'"
+             )
+
+    assert role_id == role.wake_id
+
+    assert {:ok, retained} =
+             DB.transaction(
+               db,
+               &NoticeBatcher.delivery_attachments_in_txn(&1, replacement_wake_id)
+             )
+
+    assert retained == JSON.decode!(encoded_attachments)
 
     assert %{state: "pending"} = Wakes.get(db, ungated.wake_id)
     assert cancellation(db, ungated.wake_id) == nil

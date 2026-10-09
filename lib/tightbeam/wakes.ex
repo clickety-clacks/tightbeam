@@ -4018,6 +4018,20 @@ defmodule Tightbeam.Wakes do
       )
 
       if Txn.changes(txn) == 1 do
+        # Retarget preserves the source payload and authored provenance. Client
+        # identity stays bound to the original source, reserving its dedupe key.
+        Txn.q(
+          txn,
+          """
+          UPDATE wakes SET
+            sourceAttachments=(SELECT sourceAttachments FROM wakes WHERE wakeId=?2),
+            sourceVisibilityScope=(SELECT sourceVisibilityScope FROM wakes WHERE wakeId=?2),
+            sourceAddress=(SELECT sourceAddress FROM wakes WHERE wakeId=?2)
+          WHERE wakeId=?1
+          """,
+          [replacement_id, wake_id]
+        )
+
         Tightbeam.QueuedMessageSuppression.copy_replacement_request_in_txn(
           txn,
           wake_id,
@@ -4096,12 +4110,8 @@ defmodule Tightbeam.Wakes do
   # There is nothing to recompute here, and nothing to tighten either —
   # `source.due_at` already IS the anchor.
   #
-  # The new target's own turn-boundary eligibility needs no help from this
-  # function: `materialize_due/4` re-reads `group_boundary/2` FRESH every
-  # materialization pass, against whatever session or role the row names
-  # NOW — retargeting a digest-held member into the new target's group is
-  # the whole mechanism. Nothing about WHEN it is due needs to move for that
-  # to be true.
+  # Recipient readiness re-resolves the source at the concrete-session snapshot.
+  # A retargeted source joins that same queue with its original due time.
   defp retarget_delivery(source, _created_at), do: {source.delivery_rule, source.due_at}
 
   @doc false
