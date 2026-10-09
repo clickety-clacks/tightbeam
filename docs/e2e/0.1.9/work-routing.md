@@ -68,10 +68,12 @@ helper script or edit queue rows.
    Before X ends, C cancels one pending source with `cancel-wake <wakeId>`.
 5. Use read-only SQLite inspection with `sqlite3 -readonly "$AREA_BASE/state.db"`
    to compare each source in `wakes` (`wakeId`, `sessionKey`, `origin`,
-   `creatorSessionKey`, `assignmentId`, `class`, `state`, `prompt`) with
+   `creatorSessionKey`, `assignmentId`, `class`, `state`, `prompt`,
+   `sourceAttachments`, `sourceClientIdentity`, `sourceAddress`,
+   `sourceVisibilityScope`) with
    `notice_batch_members` (`sourceWakeId`, `batchId`, `publicationSeq`, `state`)
    and `notice_batches` (`batchId`, `state`, `releaseCause`, `deliveryWakeId`);
-   inspect `notice_batch_source_attachments`, read the batch `envelope`, and
+   retain each source's attachment payload from `wakes`, read the batch `envelope`, and
    inspect `turns` (`seq`, `sessionKey`, `status`, `wakeId`). Do not mutate the
    database.
 
@@ -90,11 +92,14 @@ helper script or edit queue rows.
    next turn is created for the carrier; its envelope has a visible marker for
    each included source, with its ID, origin in `sender=`, cause in `cause=`,
    and class; and surviving members appear in class priority order with
-   publication order within a class (`blocker`, `input-needed`, `status-query`,
+   source creation order within a class (`blocker`, `input-needed`, `status-query`,
    `fyi`, then other classes). The human post, its attachment, and R's ruling
    are in the same carrier turn; none starts a separate turn, and the canceled
    source is absent. The attachment payload is carried with its source and is
-   present on the delivered carrier message.
+   present on the delivered carrier message. Correlate that message and its
+   attachment payload with the carrier's actual turn sequence; an accepted
+   source or a batch record alone does not prove delivery. Attachment evidence
+   lives on the source wake and carrier message.
 7. After the carrier turn finishes and H is idle, O sends one ordinary first
    wake. **Assert:** it starts one delivery immediately, without waiting for a
    timed batching window. This journey is part of the core-flow smoke before
@@ -121,8 +126,11 @@ per source.
    the initial dispatch wake is `pending` in `wakes` and has no turn or row in
    `notice_batch_members` while A is running. C sends the ordinary control
    `wake --session <H> --prompt "CONTROL <nonce>: reply with this nonce"`,
-   without `--assignment`. Require exactly these two pending source wakes and
-   record their IDs, creation times, publication order, classes and origins.
+   without `--assignment`. Require exactly these two due ordinary prompt sources
+   for H's next turn and
+   record their IDs, creation times, same-time row order, classes and origins.
+   Both ordinary sources use class `fyi`; record any additional pending source
+   as a missed isolated-window prerequisite rather than silently excluding it.
    The telemetry queue has no delivered turn for either source yet; do not
    treat a pending source as a queued turn or as turn attribution for B.
 2. O sends `wake --session <H> --assignment <B> --replace-queued
@@ -132,16 +140,24 @@ per source.
    names the correction. Read the matching `queued_message_suppressed` event
    by source wake ID and retain the original prompt and source IDs. C's
    unbound control remains pending and is not canceled. An ordinary wake is
-   not replacement consent. A's running turn remains running.
+   not replacement consent. Read the correction's
+   `queued_message_replacement_requests` row: it scopes replacement to B while
+   the conversational wake's own `assignmentId` remains null. Compare INITIAL's
+   retained prompt with its pre-replacement bytes. A's running turn remains running.
 3. O sends a newer correction using the same B-bound `--replace-queued`
    command and a new nonce. Require the prior replacement-consenting
    correction source to be canceled with the same reasoned wake-cancellation
-   and lifecycle evidence; C's control remains pending. Let A's bounded task
+   and lifecycle evidence; its original prompt remains intact and it has no
+   batch membership or delivery turn. If it remains pending, record the failed
+   replacement assertion before proceeding to the delivery observations.
+   C's control remains pending. Let A's bounded task
    finish. Require one carrier turn whose envelope contains C's control and
    the newest correction in their recorded source order. Both source wakes
    refer to that carrier with `batch_state='delivered'`; neither has its own
-   turn. Preserve the earlier source position; do not demand that a correction
-   overtake another sender.
+   turn. Compare the surviving sources' recorded creation order (and row order
+   for equal timestamps) with their envelope positions: C's earlier control
+   precedes the newer correction at the same class. Replacement consent does
+   not move a correction into its superseded source's earlier position.
 4. Still in H, O dispatches one bounded harmless task on a new assignment D
    under W. Observe its initial dispatch turn running and attributed to D.
    A replacement wake scopes suppression but does not stamp its carrier turn
@@ -174,7 +190,8 @@ per source.
    the checks.
 
 The decisions stop row cites this result. `test/queued_message_suppression_test.exs`
-owns clock-regression/retry ordering and the wider protected-traffic matrix;
+owns pending dispatch replacement, the actual carrier boundary, successive
+correction consent, clock-regression/retry ordering and the protected-traffic matrix;
 `test/lane_test.exs` owns deterministic stop races. A normal-stop test
 is not evidence for automatic incident recovery.
 
