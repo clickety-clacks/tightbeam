@@ -122,11 +122,14 @@ defmodule Tightbeam.RecoveryScenario do
 
     :queued =
       Gateway.deliver_prompt("agent:recovery:a", "user:recovery-admin", "RECOVERY_SUCCESSOR_A",
-        wake_id: "w_recovery_successor_a")
+        wake_id: "w_recovery_successor_a"
+      )
+
     # The running recipient retains the successor as an editable source; no
     # second actual turn is preformed before readiness or OS death.
     assert %{state: "pending", prompt: "RECOVERY_SUCCESSOR_A"} =
              Wakes.get(DB, "w_recovery_successor_a")
+
     assert NoticeBatcher.source_refs(DB, "w_recovery_successor_a") == []
     [] = rows("SELECT seq FROM turns WHERE wakeId='w_recovery_successor_a'")
 
@@ -218,13 +221,28 @@ defmodule Tightbeam.RecoveryScenario do
 
     assert source_turn_seq < successor_turn_seq
     assert successor_turn_seq < redelivery_turn_seq
+
     assert %{state: "fired", prompt: "RECOVERY_SUCCESSOR_A"} =
              Wakes.get(DB, "w_recovery_successor_a")
-    assert [%{delivery_wake_id: successor_carrier_id, member_state: "included", batch_state: "delivered"}] =
+
+    assert [
+             %{
+               delivery_wake_id: successor_carrier_id,
+               member_state: "included",
+               batch_state: "delivered"
+             }
+           ] =
              NoticeBatcher.source_refs(DB, "w_recovery_successor_a")
-    [[^successor_turn_seq]] = rows("SELECT seq FROM turns WHERE wakeId=?1", [successor_carrier_id])
+
+    [[^successor_turn_seq]] =
+      rows("SELECT seq FROM turns WHERE wakeId=?1", [successor_carrier_id])
+
     [[0]] = rows("SELECT count(*) FROM turns WHERE wakeId='w_recovery_successor_a'")
-    [[1]] = rows("SELECT count(*) FROM messages WHERE sessionKey='agent:recovery:a' AND content LIKE '%RECOVERY_SUCCESSOR_A%'")
+
+    [[1]] =
+      rows(
+        "SELECT count(*) FROM messages WHERE sessionKey='agent:recovery:a' AND content LIKE '%RECOVERY_SUCCESSOR_A%'"
+      )
 
     [[1]] =
       rows(

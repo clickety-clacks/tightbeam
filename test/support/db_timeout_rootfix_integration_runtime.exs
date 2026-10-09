@@ -49,6 +49,7 @@ true = is_map(catalog_before)
 
 parent = self()
 {:ok, conn_registry} = Tightbeam.ConnRegistry.start_link(name: :rootfix_conn_registry)
+
 {:ok, delivery_lane} =
   Tightbeam.NoticeBatcherFixture.LaneStub.start_link(:rootfix_delivery_lane)
 
@@ -151,17 +152,25 @@ assert :ignore = boot_before_release
 
 assert [%{delivery_wake_id: carrier_wake_id, member_state: "included", batch_state: "delivered"}] =
          NoticeBatcher.source_refs(db, wake_id)
+
 assert carrier_wake_id != wake_id
 assert Wakes.get(db, wake_id).state == "fired"
 assert Wakes.get(db, wake_id).prompt == wake.prompt
 assert Wakes.get(db, carrier_wake_id).state == "fired"
+
 assert {:ok, [["wake-rootfix", "queued", content]]} =
-         DB.query(db,
+         DB.query(
+           db,
            "SELECT t.sessionKey,t.status,m.content FROM turns t JOIN messages m ON m.id=t.messageId WHERE t.wakeId=?1",
-           [carrier_wake_id])
+           [carrier_wake_id]
+         )
+
 assert content =~ wake.prompt
 assert content =~ wake_id
-assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [carrier_wake_id])
+
+assert {:ok, [[1]]} =
+         DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [carrier_wake_id])
+
 assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [wake_id])
 assert {:ok, before_turns} = DB.query(db, "SELECT * FROM turns ORDER BY seq")
 assert {:ok, before_messages} = DB.query(db, "SELECT * FROM messages ORDER BY seq")

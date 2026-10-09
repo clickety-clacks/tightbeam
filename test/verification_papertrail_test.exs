@@ -45,16 +45,16 @@ defmodule Tightbeam.VerificationPapertrailTest do
     start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
     start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, Tightbeam.LaneManager})
 
-    start_supervised!(
-      {Wakes,
-       db: db,
-       # Normal readiness admission uses the actual Gateway/registry/lane
-       # dependencies, never this former per-source delivery callback.
-       deliver: fn _wake -> flunk("normal remedy used legacy callback") end,
-       delivery_opts: [conn_registry: Tightbeam.ConnRegistry, lane_manager: Tightbeam.LaneManager],
-       tick_ms: 60_000,
-       name: Tightbeam.WakeScheduler}
-    )
+    start_supervised!({
+      Wakes,
+      # Normal readiness admission uses the actual Gateway/registry/lane
+      # dependencies, never this former per-source delivery callback.
+      db: db,
+      deliver: fn _wake -> flunk("normal remedy used legacy callback") end,
+      delivery_opts: [conn_registry: Tightbeam.ConnRegistry, lane_manager: Tightbeam.LaneManager],
+      tick_ms: 60_000,
+      name: Tightbeam.WakeScheduler
+    })
 
     base_dir =
       Path.join(
@@ -180,18 +180,27 @@ defmodule Tightbeam.VerificationPapertrailTest do
   defp admitted_remedy!(ctx, source_id) do
     source = Wakes.get(ctx.db, source_id)
     assert source.state == "fired"
+
     assert [%{delivery_wake_id: carrier_id, member_state: "included", batch_state: "delivered"}] =
              NoticeBatcher.source_refs(ctx.db, source_id)
+
     assert carrier_id != source_id
     assert Wakes.get(ctx.db, carrier_id).state == "fired"
+
     assert {:ok, [[target, "queued", content]]} =
-             DB.query(ctx.db,
+             DB.query(
+               ctx.db,
                "SELECT t.sessionKey,t.status,m.content FROM turns t JOIN messages m ON m.id=t.messageId WHERE t.wakeId=?1",
-               [carrier_id])
+               [carrier_id]
+             )
+
     assert target == ctx.holder.session_key
     assert content =~ source_id
     assert content =~ source.prompt
-    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM turns WHERE wakeId=?1", [source_id])
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT count(*) FROM turns WHERE wakeId=?1", [source_id])
+
     source
   end
 

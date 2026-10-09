@@ -1421,7 +1421,10 @@ defmodule Tightbeam.CliIntegrationTest do
 
     assert :ok = Wakes.fire_due(Tightbeam.WakeScheduler)
     association_source_id = JSON.decode!(association_output)["association"]["noticeWakeId"]
-    association_delivery = assert_cli_source_delivery!(ctx.db, association_source_id, "cli-holder")
+
+    association_delivery =
+      assert_cli_source_delivery!(ctx.db, association_source_id, "cli-holder")
+
     association_wake = association_delivery.source
     assert association_wake.prompt =~ "Your addressed PO is `product-owner:papertrail`"
     finish_cli_delivery!(ctx.db, "cli-holder", association_delivery.seq)
@@ -1466,10 +1469,14 @@ defmodule Tightbeam.CliIntegrationTest do
     # Consume this exact notice turn before the next card's notice is eligible;
     # filing an attest does not finish a recipient turn.
     assert :ok = Wakes.fire_due(Tightbeam.WakeScheduler)
+
     assert {:ok, [[topology_notice_id]]} =
-             DB.query(ctx.db,
+             DB.query(
+               ctx.db,
                "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND sessionKey='cli-holder' AND prompt LIKE 'Attest %'",
-               [topology_id])
+               [topology_id]
+             )
+
     topology_delivery = assert_cli_source_delivery!(ctx.db, topology_notice_id, "cli-holder")
     assert topology_delivery.source.prompt =~ topology_id
     finish_cli_delivery!(ctx.db, "cli-holder", topology_delivery.seq)
@@ -1603,14 +1610,20 @@ defmodule Tightbeam.CliIntegrationTest do
     assert %{status: "live", producer_key: verification_source_id} =
              RailRemedy.episode(ctx.db, "completion-requires-verification", work_id)
 
-    verification_delivery = assert_cli_source_delivery!(ctx.db, verification_source_id, "cli-coder")
+    verification_delivery =
+      assert_cli_source_delivery!(ctx.db, verification_source_id, "cli-coder")
+
     verification_wake = verification_delivery.source
     assert verification_wake.prompt =~ "no verification verdict is filed"
     assert verification_wake.prompt =~ work_id
+
     assert {:ok, [[receipt_notice_id]]} =
-             DB.query(ctx.db,
+             DB.query(
+               ctx.db,
                "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND sessionKey='cli-holder' AND prompt LIKE 'Attest %'",
-               [work_id])
+               [work_id]
+             )
+
     receipt_delivery = assert_cli_source_delivery!(ctx.db, receipt_notice_id, "cli-holder")
     assert receipt_delivery.source.prompt =~ "Attest "
     finish_cli_delivery!(ctx.db, "cli-holder", receipt_delivery.seq)
@@ -1643,15 +1656,21 @@ defmodule Tightbeam.CliIntegrationTest do
 
     assert denied_again_status != 0
     assert denied_again =~ "completion-requires-results-artifact"
+
     assert {:ok, [[verified_notice_id]]} =
-             DB.query(ctx.db,
+             DB.query(
+               ctx.db,
                "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND sessionKey='cli-holder' AND prompt LIKE 'Attest %' AND wakeId<>?2",
-               [work_id, receipt_notice_id])
+               [work_id, receipt_notice_id]
+             )
+
     attest_delivery = assert_cli_source_delivery!(ctx.db, verified_notice_id, "cli-holder")
     attest_batch = Wakes.get(ctx.db, attest_delivery.carrier_id)
     assert attest_batch.prompt =~ "Attest "
+
     assert %{status: "live", producer_key: artifact_source_id} =
              RailRemedy.episode(ctx.db, "completion-requires-results-artifact", work_id)
+
     artifact_delivery = assert_cli_source_delivery!(ctx.db, artifact_source_id, "cli-coder")
     artifact_wake = artifact_delivery.source
     assert artifact_wake.prompt =~ "no artifact is recorded on its work item"
@@ -1682,6 +1701,7 @@ defmodule Tightbeam.CliIntegrationTest do
 
     assert {:ok, %{seq: ^observation_seq, message_id: observation_message_id}} =
              Ledger.claim_next(ctx.db, "cli-coder", "cli-integration")
+
     assert observation_message_id == message.id
 
     assert fire_observation_hook(
@@ -1902,29 +1922,53 @@ defmodule Tightbeam.CliIntegrationTest do
     source = Wakes.get(db, source_id)
     assert source.state == "fired"
     assert source.session_key == expected_target
+
     assert [%{delivery_wake_id: carrier_id, member_state: "included", batch_state: "delivered"}] =
              NoticeBatcher.source_refs(db, source_id)
+
     refute carrier_id == source_id
     assert Wakes.get(db, carrier_id).state == "fired"
+
     assert {:ok, [[seq, "queued", ^expected_target, content]]} =
-             DB.query(db,
+             DB.query(
+               db,
                "SELECT t.seq,t.status,t.sessionKey,m.content FROM turns t JOIN messages m ON m.id=t.messageId WHERE t.wakeId=?1",
-               [carrier_id])
+               [carrier_id]
+             )
+
     assert content =~ source_id
     assert content =~ source.prompt
+
     assert {:ok, [[payload]]} =
-             DB.query(db,
+             DB.query(
+               db,
                "SELECT payload FROM notice_batch_members WHERE sourceWakeId=?1 AND state='included'",
-               [source_id])
+               [source_id]
+             )
+
     assert payload == source.prompt
     assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [source_id])
     assert {:ok, before_turns} = DB.query(db, "SELECT * FROM turns WHERE wakeId=?1", [carrier_id])
+
     assert {:ok, before_messages} =
-             DB.query(db, "SELECT * FROM messages WHERE id IN (SELECT messageId FROM turns WHERE wakeId=?1)", [carrier_id])
+             DB.query(
+               db,
+               "SELECT * FROM messages WHERE id IN (SELECT messageId FROM turns WHERE wakeId=?1)",
+               [carrier_id]
+             )
+
     assert :ok = Wakes.fire_due(Tightbeam.WakeScheduler)
-    assert {:ok, ^before_turns} = DB.query(db, "SELECT * FROM turns WHERE wakeId=?1", [carrier_id])
+
+    assert {:ok, ^before_turns} =
+             DB.query(db, "SELECT * FROM turns WHERE wakeId=?1", [carrier_id])
+
     assert {:ok, ^before_messages} =
-             DB.query(db, "SELECT * FROM messages WHERE id IN (SELECT messageId FROM turns WHERE wakeId=?1)", [carrier_id])
+             DB.query(
+               db,
+               "SELECT * FROM messages WHERE id IN (SELECT messageId FROM turns WHERE wakeId=?1)",
+               [carrier_id]
+             )
+
     assert Wakes.get(db, source_id).prompt == source.prompt
     %{source: source, carrier_id: carrier_id, seq: seq}
   end
@@ -1932,6 +1976,7 @@ defmodule Tightbeam.CliIntegrationTest do
   defp finish_cli_delivery!(db, target, expected_seq) do
     assert {:ok, %{seq: ^expected_seq, owner_lease: lease}} =
              Ledger.claim_next(db, target, "cli-papertrail-readiness")
+
     assert :ok = Ledger.finish(db, expected_seq, "delivered", nil, owner_lease: lease)
   end
 

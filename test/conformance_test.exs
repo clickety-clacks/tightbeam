@@ -1972,20 +1972,28 @@ defmodule Tightbeam.ConformanceSupport do
 
       park_wake = Wakes.get(db, park_wake_id)
       assert %{state: "fired", fired_by: "condition"} = park_wake
+
       assert [%{delivery_wake_id: carrier_id, member_state: "included", batch_state: "delivered"}] =
                NoticeBatcher.source_refs(db, park_wake_id)
+
       refute carrier_id == park_wake_id
       assert Wakes.get(db, carrier_id).state == "fired"
+
       assert {:ok, [[0]]} =
                DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [park_wake_id])
 
       assert {:ok, %{seq: continuation_seq, owner_lease: continuation_seq_lease}} =
                Ledger.claim_next(db, session_key, "conformance-ruling-wake")
+
       assert {:ok, [[^continuation_seq, ^carrier_id, content]]} =
-               DB.query(db,
+               DB.query(
+                 db,
                  "SELECT t.seq,t.wakeId,m.content FROM turns t JOIN messages m ON m.id=t.messageId WHERE t.seq=?1",
-                 [continuation_seq])
+                 [continuation_seq]
+               )
+
       assert content =~ park_wake.prompt
+
       assert {:ok, [[1]]} =
                DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [carrier_id])
 

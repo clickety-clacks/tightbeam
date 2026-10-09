@@ -309,19 +309,27 @@ defmodule Tightbeam.EscalationDeliveryFixture do
 
     # Fail the NORMAL path at its actual durable turn admission. The legacy
     # callback below is still exercised separately; normal sources never use it.
-    assert :ok = DB.execute(ctx.db, """
-    CREATE TRIGGER refuse_escalation_carrier BEFORE INSERT ON turns
-    WHEN EXISTS (
-      SELECT 1 FROM notice_batches b JOIN notice_batch_members m ON m.batchId=b.batchId
-      WHERE b.deliveryWakeId=NEW.wakeId AND m.sourceWakeId='#{wake.wake_id}'
-    )
-    BEGIN SELECT RAISE(ABORT,'forced escalation readiness failure'); END
-    """)
-    assert {:ok, before_source} = DB.query(ctx.db, "SELECT * FROM wakes WHERE wakeId=?1", [wake.wake_id])
+    assert :ok =
+             DB.execute(ctx.db, """
+             CREATE TRIGGER refuse_escalation_carrier BEFORE INSERT ON turns
+             WHEN EXISTS (
+               SELECT 1 FROM notice_batches b JOIN notice_batch_members m ON m.batchId=b.batchId
+               WHERE b.deliveryWakeId=NEW.wakeId AND m.sourceWakeId='#{wake.wake_id}'
+             )
+             BEGIN SELECT RAISE(ABORT,'forced escalation readiness failure'); END
+             """)
+
+    assert {:ok, before_source} =
+             DB.query(ctx.db, "SELECT * FROM wakes WHERE wakeId=?1", [wake.wake_id])
+
     drain!(ctx)
     assert Wakes.get(ctx.db, wake.wake_id).state == "pending"
-    assert {:ok, ^before_source} = DB.query(ctx.db, "SELECT * FROM wakes WHERE wakeId=?1", [wake.wake_id])
+
+    assert {:ok, ^before_source} =
+             DB.query(ctx.db, "SELECT * FROM wakes WHERE wakeId=?1", [wake.wake_id])
+
     assert NoticeBatcher.source_refs(ctx.db, wake.wake_id) == []
+
     for table <- ["turns", "messages", "notice_batches", "notice_batch_members"] do
       assert count(ctx.db, "SELECT COUNT(*) FROM #{table}") == 0
     end
@@ -332,18 +340,21 @@ defmodule Tightbeam.EscalationDeliveryFixture do
           {:raise, fn _wake -> raise "delivery down" end},
           {:exit, fn _wake -> exit(:delivery_down) end}
         ] do
-      probe = Wakes.schedule(ctx.db, %{
-        session_key: owner_session,
-        origin: "process:tightbeam",
-        prompt: "#{tag} callback control",
-        due_at: wake.due_at,
-        target_gate: 0,
-        digest: true,
-        class: "fyi",
-        delivery_rule: "turn-boundary-digest r1"
-      })
+      probe =
+        Wakes.schedule(ctx.db, %{
+          session_key: owner_session,
+          origin: "process:tightbeam",
+          prompt: "#{tag} callback control",
+          due_at: wake.due_at,
+          target_gate: 0,
+          digest: true,
+          class: "fyi",
+          delivery_rule: "turn-boundary-digest r1"
+        })
+
       name = :"delivery_broken_#{tag}_#{System.unique_integer([:positive])}"
       attempts = :counters.new(1, [])
+
       failing = fn current ->
         assert current.wake_id == probe.wake_id
         :counters.add(attempts, 1, 1)
@@ -366,8 +377,19 @@ defmodule Tightbeam.EscalationDeliveryFixture do
       assert NoticeBatcher.source_refs(ctx.db, wake.wake_id) == []
       parent = self()
       healthy = :"delivery_healthy_#{tag}_#{System.unique_integer([:positive])}"
-      start_supervised!({Wakes, db: ctx.db, name: healthy, tick_ms: 60_000,
-        deliver: fn current -> send(parent, {:callback_retry, current.wake_id}); :ok end}, id: healthy)
+
+      start_supervised!(
+        {Wakes,
+         db: ctx.db,
+         name: healthy,
+         tick_ms: 60_000,
+         deliver: fn current ->
+           send(parent, {:callback_retry, current.wake_id})
+           :ok
+         end},
+        id: healthy
+      )
+
       assert :ok = Wakes.fire_due(healthy)
       assert_receive {:callback_retry, probe_id}
       assert probe_id == probe.wake_id
@@ -387,10 +409,19 @@ defmodule Tightbeam.EscalationDeliveryFixture do
     assert count(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId = ?1", [carrier.wake_id]) == 1
     assert Wakes.get(ctx.db, wake.wake_id).state == "fired"
     assert Wakes.get(ctx.db, wake.wake_id).prompt == wake.prompt
+
     assert [%{delivery_wake_id: carrier_id, member_state: "included", batch_state: "delivered"}] =
              NoticeBatcher.source_refs(ctx.db, wake.wake_id)
+
     assert carrier_id == carrier.wake_id
-    assert [[content]] = rows(ctx.db, "SELECT m.content FROM turns t JOIN messages m ON m.id=t.messageId WHERE t.wakeId=?1", [carrier.wake_id])
+
+    assert [[content]] =
+             rows(
+               ctx.db,
+               "SELECT m.content FROM turns t JOIN messages m ON m.id=t.messageId WHERE t.wakeId=?1",
+               [carrier.wake_id]
+             )
+
     assert content =~ wake.wake_id
     assert content =~ wake.prompt
     assert count(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [wake.wake_id]) == 0

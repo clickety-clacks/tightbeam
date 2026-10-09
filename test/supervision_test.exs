@@ -5407,12 +5407,21 @@ defmodule Tightbeam.SupervisionTest do
 
     assert [%{delivery_wake_id: delivered_id, member_state: "included", batch_state: "delivered"}] =
              NoticeBatcher.source_refs(ctx.db, agent_wake.wake_id)
+
     assert Wakes.get(ctx.db, delivered_id).state == "fired"
     assert Wakes.get(ctx.db, agent_wake.wake_id).state == "fired"
+
     assert {:ok, [[content]]} =
-             DB.query(ctx.db, "SELECT m.content FROM turns t JOIN messages m ON m.id=t.messageId WHERE t.wakeId=?1", [delivered_id])
+             DB.query(
+               ctx.db,
+               "SELECT m.content FROM turns t JOIN messages m ON m.id=t.messageId WHERE t.wakeId=?1",
+               [delivered_id]
+             )
+
     assert content =~ agent_wake.prompt
-    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM turns WHERE wakeId=?1", [agent_wake.wake_id])
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT count(*) FROM turns WHERE wakeId=?1", [agent_wake.wake_id])
 
     assert [%{wake_id: source_wake_id, sender_principal: "session:supervisor"}] =
              NoticeBatcher.carrier_members(ctx.db, delivered_id)
@@ -6352,8 +6361,12 @@ defmodule Tightbeam.SupervisionTest do
     lane = :"supervision_carrier_lane_#{System.unique_integer([:positive])}"
     start_supervised!({ConnRegistry, name: registry})
     start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, lane})
-    _carrier_ids = NoticeBatcher.recover(db, System.system_time(:millisecond) + 1_000,
-      conn_registry: registry, lane_manager: lane)
+
+    _carrier_ids =
+      NoticeBatcher.recover(db, System.system_time(:millisecond) + 1_000,
+        conn_registry: registry,
+        lane_manager: lane
+      )
 
     assert [%{delivery_wake_id: carrier_id, member_state: "included"}] =
              Enum.filter(
@@ -6366,12 +6379,20 @@ defmodule Tightbeam.SupervisionTest do
     assert carrier.state == "fired"
     assert Wakes.get(db, source.wake_id).state == "fired"
     assert Wakes.get(db, source.wake_id).prompt == source.prompt
+
     assert {:ok, [[seq, target, content]]} =
-             DB.query(db, "SELECT t.seq,t.sessionKey,m.content FROM turns t JOIN messages m ON m.id=t.messageId WHERE t.wakeId=?1", [carrier_id])
+             DB.query(
+               db,
+               "SELECT t.seq,t.sessionKey,m.content FROM turns t JOIN messages m ON m.id=t.messageId WHERE t.wakeId=?1",
+               [carrier_id]
+             )
+
     assert target == carrier.session_key
     assert content =~ source.wake_id
     assert content =~ source.prompt
-    assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM turns WHERE wakeId=?1", [source.wake_id])
+
+    assert {:ok, [[0]]} =
+             DB.query(db, "SELECT count(*) FROM turns WHERE wakeId=?1", [source.wake_id])
 
     # recover committed the real turn; an old append call must now return
     # that exact durable turn rather than manufacture a second delivery.
@@ -6388,6 +6409,7 @@ defmodule Tightbeam.SupervisionTest do
                  fire_wake_in_txn: true
                )
              end)
+
     assert {:ok, [[1]]} = DB.query(db, "SELECT count(*) FROM turns WHERE wakeId=?1", [carrier_id])
 
     assert :ok = NoticeBatcher.delivery_delivered(db, carrier_id)

@@ -251,7 +251,10 @@ defmodule Tightbeam.AssignmentsTest do
 
       assert is_integer(fired_at)
       assert prompt == wake.prompt
-      assert {:ok, rendered} = DB.transaction(ctx.db, &Wakes.delivery_prompt_in_txn(&1, wake.wake_id))
+
+      assert {:ok, rendered} =
+               DB.transaction(ctx.db, &Wakes.delivery_prompt_in_txn(&1, wake.wake_id))
+
       assert rendered == "[woke: fact assignment-landed/#{assignment.id}]\n\n" <> wake.prompt
 
       # A matched fact stamps the individual source while the recipient is
@@ -269,6 +272,7 @@ defmodule Tightbeam.AssignmentsTest do
                  "SELECT ownerUserId, origin FROM condition_facts WHERE id=?1",
                  [result.fact.fact_id]
                )
+
       assert :ok = finish_running_turn(ctx.db, running_turn)
       assert :ok = Wakes.fire_due(scheduler)
       assert_fact_carrier!(ctx.db, wake, rendered)
@@ -422,9 +426,13 @@ defmodule Tightbeam.AssignmentsTest do
              } = Wakes.get(ctx.db, reviewed_wake.wake_id)
 
       assert reviewed_prompt == reviewed_wake.prompt
+
       assert {:ok, rendered} =
                DB.transaction(ctx.db, &Wakes.delivery_prompt_in_txn(&1, reviewed_wake.wake_id))
-      assert rendered == "[woke: fact assignment-reviewed/#{producer.id}]\n\n" <> reviewed_wake.prompt
+
+      assert rendered ==
+               "[woke: fact assignment-reviewed/#{producer.id}]\n\n" <> reviewed_wake.prompt
+
       assert Wakes.get(ctx.db, review_card_wake.wake_id).state == "pending"
 
       assert {:ok, [["flynn"]]} =
@@ -474,15 +482,24 @@ defmodule Tightbeam.AssignmentsTest do
   defp assert_fact_carrier!(db, source, rendered) do
     assert [%{delivery_wake_id: carrier_id, member_state: "included", batch_state: "delivered"}] =
              NoticeBatcher.source_refs(db, source.wake_id)
+
     assert carrier_id != source.wake_id
     assert %{state: "fired", prompt: prompt} = Wakes.get(db, source.wake_id)
     assert prompt == source.prompt
+
     assert {:ok, [[target, "queued", content]]} =
-             DB.query(db, "SELECT t.sessionKey,t.status,m.content FROM turns t JOIN messages m ON m.id=t.messageId WHERE t.wakeId=?1", [carrier_id])
+             DB.query(
+               db,
+               "SELECT t.sessionKey,t.status,m.content FROM turns t JOIN messages m ON m.id=t.messageId WHERE t.wakeId=?1",
+               [carrier_id]
+             )
+
     assert target == source.session_key
     assert content =~ source.wake_id
     assert content =~ rendered
-    assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM turns WHERE wakeId=?1", [source.wake_id])
+
+    assert {:ok, [[0]]} =
+             DB.query(db, "SELECT count(*) FROM turns WHERE wakeId=?1", [source.wake_id])
   end
 
   test "dispatch and a bound plain-after recheck teach the exact card fact", ctx do
@@ -7261,12 +7278,20 @@ defmodule Tightbeam.AssignmentsTest do
     source = Wakes.get(db, wake_id)
     assert source.state == "fired"
     assert [_] = source_delivery_turns(db, wake_id)
+
     assert [%{delivery_wake_id: carrier_id, member_state: "included", batch_state: "delivered"}] =
              NoticeBatcher.source_refs(db, wake_id)
+
     assert carrier_id != wake_id
     assert Wakes.get(db, carrier_id).state == "fired"
+
     assert {:ok, [[content]]} =
-             DB.query(db, "SELECT m.content FROM turns t JOIN messages m ON m.id=t.messageId WHERE t.wakeId=?1", [carrier_id])
+             DB.query(
+               db,
+               "SELECT m.content FROM turns t JOIN messages m ON m.id=t.messageId WHERE t.wakeId=?1",
+               [carrier_id]
+             )
+
     assert content =~ wake_id
     assert content =~ source.prompt
     assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM turns WHERE wakeId=?1", [wake_id])

@@ -165,10 +165,14 @@ defmodule Tightbeam.EscalationTest do
 
     assert Wakes.get(ctx.db, carrier_id).state == "fired"
     assert carrier_id != wake.wake_id
+
     assert {:ok, [[^owner_session, "queued", content]]} =
-             DB.query(ctx.db,
+             DB.query(
+               ctx.db,
                "SELECT t.sessionKey,t.status,m.content FROM turns t JOIN messages m ON m.id=t.messageId WHERE t.wakeId=?1",
-               [carrier_id])
+               [carrier_id]
+             )
+
     assert content =~ wake.wake_id
     assert content =~ wake.prompt
     assert Wakes.get(ctx.db, wake.wake_id).prompt == wake.prompt
@@ -276,13 +280,27 @@ defmodule Tightbeam.EscalationTest do
     # actual carrier turn, so both included sources truthfully become fired.
     for source_id <- [source_wake_id, ruling_notice_wake_id] do
       assert Wakes.get(ctx.db, source_id).state == "fired"
-      assert [%{delivery_wake_id: ^carrier_id, member_state: "included", batch_state: "delivered"}] =
+
+      assert [
+               %{
+                 delivery_wake_id: ^carrier_id,
+                 member_state: "included",
+                 batch_state: "delivered"
+               }
+             ] =
                NoticeBatcher.source_refs(ctx.db, source_id)
     end
+
     assert Wakes.get(ctx.db, wake.wake_id).prompt == "re-read the ruling"
     assert Wakes.get(ctx.db, carrier_id).state == "fired"
+
     assert {:ok, [[content]]} =
-             DB.query(ctx.db, "SELECT m.content FROM turns t JOIN messages m ON m.id=t.messageId WHERE t.wakeId=?1", [carrier_id])
+             DB.query(
+               ctx.db,
+               "SELECT m.content FROM turns t JOIN messages m ON m.id=t.messageId WHERE t.wakeId=?1",
+               [carrier_id]
+             )
+
     assert content =~ wake.wake_id
     assert content =~ "[woke: fact escalation-ruled/#{request.id}]"
     assert content =~ wake.prompt
@@ -290,6 +308,7 @@ defmodule Tightbeam.EscalationTest do
 
     assert {:ok, [[0]]} =
              DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [wake.wake_id])
+
     assert {:ok, before_turns} = DB.query(ctx.db, "SELECT * FROM turns ORDER BY seq")
     assert [] == NoticeBatcher.recover(ctx.db)
     assert {:ok, ^before_turns} = DB.query(ctx.db, "SELECT * FROM turns ORDER BY seq")
@@ -906,7 +925,12 @@ defmodule Tightbeam.EscalationTest do
     assert turn_count(ctx.db, carrier_id) == 1
 
     assert {:ok, [[content]]} =
-             DB.query(ctx.db, "SELECT m.content FROM turns t JOIN messages m ON m.id=t.messageId WHERE t.wakeId=?1", [carrier_id])
+             DB.query(
+               ctx.db,
+               "SELECT m.content FROM turns t JOIN messages m ON m.id=t.messageId WHERE t.wakeId=?1",
+               [carrier_id]
+             )
+
     assert content =~ "[woke: fact escalation-ruled/#{direct.id}]\n\n" <> expected_prompt
 
     [listed] = Escalation.list(ctx.db, operator_call(ctx.raiser, %{}), "ruled")
@@ -2026,8 +2050,14 @@ defmodule Tightbeam.EscalationTest do
 
     assert prompt ==
              "Decision request #{request.id} was ruled. Read it with tightbeam decision-request --request #{request.id}."
+
     assert {:ok, [[content]]} =
-             DB.query(ctx.db, "SELECT m.content FROM turns t JOIN messages m ON m.id=t.messageId WHERE t.wakeId=?1", [carrier_id])
+             DB.query(
+               ctx.db,
+               "SELECT m.content FROM turns t JOIN messages m ON m.id=t.messageId WHERE t.wakeId=?1",
+               [carrier_id]
+             )
+
     assert content =~ "[woke: fact escalation-ruled/#{request.id}]\n\n" <> prompt
   end
 
@@ -2081,11 +2111,14 @@ defmodule Tightbeam.EscalationTest do
     for wake <- wrong do
       assert %{state: "fired", fired_by: "fallback"} = Wakes.get(ctx.db, wake.wake_id)
       assert Wakes.get(ctx.db, wake.wake_id).prompt == wake.prompt
+
       assert [%{delivery_wake_id: carrier_id, member_state: "included", batch_state: "delivered"}] =
                NoticeBatcher.source_refs(ctx.db, wake.wake_id)
+
       assert turn_count(ctx.db, carrier_id) == 1
       assert turn_count(ctx.db, wake.wake_id) == 0
     end
+
     [first, second] = wrong
     assert [%{delivery_wake_id: carrier_id}] = NoticeBatcher.source_refs(ctx.db, first.wake_id)
     assert [%{delivery_wake_id: ^carrier_id}] = NoticeBatcher.source_refs(ctx.db, second.wake_id)

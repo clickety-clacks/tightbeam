@@ -152,6 +152,7 @@ defmodule Tightbeam.WorkItemsTest do
     # before the Hub can release the committed source/carrier notices.
     assert_receive {:firehose_notice,
                     %{"class" => "session.updated", "payload" => session_payload}}
+
     assert session_payload["sessionKey"] == ctx.holder.session_key
     assert session_payload["ownerUserId"] == "flynn"
     assert session_payload["mechanicalStatus"] == "running"
@@ -171,6 +172,7 @@ defmodule Tightbeam.WorkItemsTest do
 
     assert_receive {:firehose_notice,
                     %{"class" => "message.created", "payload" => message_payload}}
+
     assert message_payload["id"] == message_id
     assert message_payload["sessionKey"] == ctx.holder.session_key
     assert message_payload["content"] == content

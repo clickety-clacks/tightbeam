@@ -330,13 +330,20 @@ defmodule Tightbeam.SessionPoAssociationsTest do
 
     case delivery do
       {:ok, {:staged, %{wake_id: source_wake_id}}} ->
-        _ = NoticeBatcher.recover(ctx.db, System.system_time(:millisecond) + 60_000,
-          conn_registry: registry, lane_manager: lane)
+        _ =
+          NoticeBatcher.recover(ctx.db, System.system_time(:millisecond) + 60_000,
+            conn_registry: registry,
+            lane_manager: lane
+          )
+
         [%{delivery_wake_id: carrier_wake_id}] = NoticeBatcher.source_refs(ctx.db, source_wake_id)
         carrier = Wakes.get(ctx.db, carrier_wake_id)
 
         assert {:ok, [[seq, "orchestrator"]]} =
-                 DB.query(ctx.db, "SELECT seq,sessionKey FROM turns WHERE wakeId=?1", [carrier_wake_id])
+                 DB.query(ctx.db, "SELECT seq,sessionKey FROM turns WHERE wakeId=?1", [
+                   carrier_wake_id
+                 ])
+
         assert {:ok, {:duplicate, %{turn_seq: ^seq}}} =
                  DB.transaction(ctx.db, fn txn ->
                    Gateway.deliver_prompt_in_txn(
@@ -350,7 +357,10 @@ defmodule Tightbeam.SessionPoAssociationsTest do
                      fire_wake_in_txn: true
                    )
                  end)
-        assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT count(*) FROM turns WHERE wakeId=?1", [carrier_wake_id])
+
+        assert {:ok, [[1]]} =
+                 DB.query(ctx.db, "SELECT count(*) FROM turns WHERE wakeId=?1", [carrier_wake_id])
+
         assert Wakes.get(ctx.db, source_wake_id).prompt == wake.prompt
 
       {:ok, {:appended, "orchestrator", _message, _opts}} ->
