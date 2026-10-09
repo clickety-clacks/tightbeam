@@ -149,7 +149,10 @@ defmodule Tightbeam.QueuedMessageSuppression do
             FROM wakes w
             JOIN queued_message_replacement_requests r ON r.wakeId=w.wakeId
             WHERE w.state='pending' AND w.sessionKey=?1 AND w.origin=?2
-              AND w.creatorSessionKey=?3 AND w.assignmentId=?4
+              AND w.creatorSessionKey=?3
+              -- Ordinary correction wakes retain NULL assignment attribution;
+              -- the explicit request row carries their replacement scope.
+              AND (w.assignmentId IS NULL OR w.assignmentId=?4)
               AND w.consumer='prompt' AND w.digest=0 AND w.targetGate<>0
               AND w.conditionKind IS NULL AND w.waitMode IS NULL
               AND w.obligationRef IS NULL AND r.assignmentId=?4
