@@ -457,6 +457,17 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert turn_count(ctx.db, wake.wake_id) == 1
+    assert Wakes.get(ctx.db, wake.wake_id).prompt == wake.prompt
+
+    assert {:ok, [[delivered_prompt]]} =
+             DB.query(
+               ctx.db,
+               "SELECT t.prompt FROM turns t JOIN notice_batches b ON b.deliveryWakeId=t.wakeId JOIN notice_batch_members m ON m.batchId=b.batchId WHERE m.sourceWakeId=?1",
+               [wake.wake_id]
+             )
+
+    assert delivered_prompt =~ "[woke: wait #{wake.wake_id};"
+    assert delivered_prompt =~ wake.prompt
   end
 
   test "after-turn captures the running turn and becomes eligible on every terminal outcome",

@@ -2285,11 +2285,15 @@ defmodule Tightbeam.Gateway do
            "SELECT wakeId,sessionKey,origin,prompt,state,consumer,digest FROM wakes WHERE wakeId=?1",
            [wake_id]
          ) do
-      [[^wake_id, ^target, origin, ^prompt, state, "prompt", 0]]
+      [[^wake_id, ^target, _origin, raw_prompt, state, "prompt", 0]]
       when state in ["pending", "fired"] ->
-        case Wakes.prepare_prompt_source_for_batch_in_txn(txn, wake_id, target, prompt) do
-          {:ok, wake} -> {:ok, wake}
-          :not_found -> :none
+        if prompt == raw_prompt or prompt == Wakes.delivery_prompt_in_txn(txn, wake_id) do
+          case Wakes.prepare_prompt_source_for_batch_in_txn(txn, wake_id, target, prompt) do
+            {:ok, wake} -> {:ok, wake}
+            :not_found -> :none
+          end
+        else
+          :none
         end
 
       _ ->

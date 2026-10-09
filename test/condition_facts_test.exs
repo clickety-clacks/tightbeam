@@ -471,6 +471,16 @@ defmodule Tightbeam.ConditionFactsTest do
     fallback = condition_wake(ctx, "build-green", nil, 0)
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert %{state: "fired", fired_by: "fallback"} = Wakes.get(ctx.db, fallback.wake_id)
+    assert Wakes.get(ctx.db, fallback.wake_id).prompt == fallback.prompt
+
+    assert {:ok, [[fallback_envelope]]} =
+             DB.query(
+               ctx.db,
+               "SELECT t.prompt FROM turns t JOIN notice_batches b ON b.deliveryWakeId=t.wakeId JOIN notice_batch_members m ON m.batchId=b.batchId WHERE m.sourceWakeId=?1",
+               [fallback.wake_id]
+             )
+
+    assert fallback_envelope =~ "[woke: fallback deadline]\n\n" <> fallback.prompt
     assert delivery_turn_count(ctx.db, fallback.wake_id) == 1
 
     unresolved =
@@ -1222,10 +1232,10 @@ defmodule Tightbeam.ConditionFactsTest do
       Wakes.schedule(ctx.db, %{
         session_key: ctx.session.session_key,
         origin: "agent:owner",
-        prompt: "urgent condition notice",
+        prompt: "[woke: fallback deadline]\n\nauthored literal marker; urgent condition notice",
         due_at: System.system_time(:millisecond) + 60_000,
         condition_kind: "urgent-condition",
-        condition_scope: "prod",
+        condition_scope: nil,
         owner_user_id: "flynn",
         creator_session_key: "agent:owner:app",
         class: "algedonic"
@@ -1254,6 +1264,20 @@ defmodule Tightbeam.ConditionFactsTest do
     assert staged.fired_by == "condition"
     assert is_integer(staged.fired_at)
     assert staged.delivery_rule == wake.delivery_rule
+    assert staged.prompt == wake.prompt
+
+    assert %{"condition_fact" => %{"kind" => "urgent-condition", "scope" => "prod"}} =
+             staged.recognition_evidence
+
+    # A later match must not replace the exact fact scope already recognized.
+    ConditionFacts.file(ctx.db, ctx.scheduler, %{
+      kind: "urgent-condition",
+      scope: "later",
+      origin: "process:ci",
+      owner_user_id: "flynn"
+    })
+
+    assert Wakes.get(ctx.db, wake.wake_id).prompt == wake.prompt
     assert Tightbeam.NoticeBatcher.source_refs(ctx.db, wake.wake_id) == []
 
     assert {:ok, [[1]]} =
@@ -1279,6 +1303,21 @@ defmodule Tightbeam.ConditionFactsTest do
            ] = Tightbeam.NoticeBatcher.source_refs(ctx.db, wake.wake_id)
 
     assert Wakes.get(ctx.db, wake.wake_id).state == "fired"
+    assert Wakes.get(ctx.db, wake.wake_id).prompt == wake.prompt
+
+    assert {:ok, [[raw_payload]]} =
+             DB.query(ctx.db, "SELECT payload FROM notice_batch_members WHERE sourceWakeId=?1", [
+               wake.wake_id
+             ])
+
+    assert raw_payload == wake.prompt
+
+    assert {:ok, [[envelope]]} =
+             DB.query(ctx.db, "SELECT prompt FROM turns WHERE wakeId=?1", [carrier_id])
+
+    assert envelope =~ "[woke: fact urgent-condition/prod]\n\n" <> wake.prompt
+    refute envelope =~ "[woke: fact urgent-condition/later]"
+    assert :ok = Wakes.fire_due(ctx.scheduler)
     assert turn_count(ctx.db, wake.wake_id) == 0
     assert delivery_turn_count(ctx.db, wake.wake_id) == 1
 

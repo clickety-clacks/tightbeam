@@ -1319,7 +1319,7 @@ defmodule Tightbeam.NoticeBatcher do
   end
 
   defp admit_member(txn, source) do
-    rendered_bytes = rendered_member_bytes(source, next_publication_seq(txn, source))
+    rendered_bytes = rendered_member_bytes(txn, source, next_publication_seq(txn, source))
 
     if rendered_bytes > @max_rendered_bytes do
       {:bypass,
@@ -1937,6 +1937,9 @@ defmodule Tightbeam.NoticeBatcher do
       """,
       [batch_id]
     )
+    |> Enum.map(fn [wake_id, sender, cause, class, seq, _raw_payload] ->
+      [wake_id, sender, cause, class, seq, Wakes.delivery_prompt_in_txn(txn, wake_id)]
+    end)
   end
 
   defp envelope(batch_id, cause, rows) do
@@ -1961,7 +1964,7 @@ defmodule Tightbeam.NoticeBatcher do
     |> String.trim()
   end
 
-  defp rendered_member_bytes(source, seq) do
+  defp rendered_member_bytes(txn, source, seq) do
     byte_size(
       render_member([
         source.wake_id,
@@ -1969,7 +1972,7 @@ defmodule Tightbeam.NoticeBatcher do
         source.work_item_id || source.assignment_id || "wake",
         source.class,
         seq,
-        source.prompt
+        Wakes.delivery_prompt_in_txn(txn, source.wake_id)
       ])
     )
   end

@@ -693,6 +693,32 @@ defmodule Tightbeam.Wakes do
   def batch_source_delivered_in_txn(%Txn{}, _wake_id, _delivered_to), do: :ok
 
   @doc false
+  def delivery_prompt_in_txn(%Txn{} = txn, wake_id) when is_binary(wake_id) do
+    case get_in_txn(txn, wake_id) do
+      nil -> nil
+      wake -> render_delivery_prompt(wake)
+    end
+  end
+
+  defp render_delivery_prompt(%{wait_mode: mode, recognition_path: path} = wake)
+       when is_binary(mode) and is_binary(path),
+       do: wait_stamp(wake) <> "\n\n" <> wake.prompt
+
+  defp render_delivery_prompt(%{condition_kind: kind, fired_by: "condition"} = wake)
+       when is_binary(kind) do
+    # Recognition keeps the exact matched fact, including a wildcard wait's
+    # actual scope. Presentation never alters the authored queue row.
+    %{"condition_fact" => %{"kind" => ^kind, "scope" => scope}} = wake.recognition_evidence
+    "[woke: fact #{kind}/#{scope || "nil"}]\n\n" <> wake.prompt
+  end
+
+  defp render_delivery_prompt(%{condition_kind: kind, fired_by: "fallback"} = wake)
+       when is_binary(kind),
+       do: "[woke: fallback deadline]\n\n" <> wake.prompt
+
+  defp render_delivery_prompt(wake), do: wake.prompt
+
+  @doc false
   @spec prepare_prompt_source_for_batch_in_txn(Txn.t(), String.t(), String.t(), String.t()) ::
           {:ok, wake()} | :not_found
   def prepare_prompt_source_for_batch_in_txn(%Txn{} = txn, wake_id, session_key, prompt)
@@ -710,12 +736,12 @@ defmodule Tightbeam.Wakes do
 
         Txn.q(
           txn,
-          "UPDATE wakes SET state='pending',firedAt=COALESCE(firedAt,?3),prompt=?2 WHERE wakeId=?1 AND state IN ('pending','fired')",
-          [wake_id, prompt, fired_at]
+          "UPDATE wakes SET state='pending',firedAt=COALESCE(firedAt,?2) WHERE wakeId=?1 AND state IN ('pending','fired')",
+          [wake_id, fired_at]
         )
 
         if Txn.changes(txn) == 1 do
-          source = %{wake | state: "pending", fired_at: fired_at, prompt: prompt}
+          source = %{wake | state: "pending", fired_at: fired_at}
           policy_ref = NoticeBatcher.record_policy_in_txn(txn, source, enabled: true)
 
           Txn.q(
@@ -876,26 +902,8 @@ defmodule Tightbeam.Wakes do
       "A refusal or failed action must be reported truthfully. Notice #{root_wake_id}."
   end
 
-  defp terminal_action_prompt_matches?(wake, event, root_wake_id) do
-    prompt = terminal_action_prompt(event, root_wake_id)
-
-    expected =
-      case wake.fired_by do
-        nil ->
-          prompt
-
-        "condition" ->
-          "[woke: fact #{wake.condition_kind}/#{wake.condition_scope || "nil"}]\n\n" <> prompt
-
-        "fallback" ->
-          "[woke: fallback deadline]\n\n" <> prompt
-
-        _ ->
-          nil
-      end
-
-    wake.prompt == expected
-  end
+  defp terminal_action_prompt_matches?(wake, event, root_wake_id),
+    do: wake.prompt == terminal_action_prompt(event, root_wake_id)
 
   defp terminal_action_reminder_matches?(wake, expected) do
     fields =
@@ -6491,11 +6499,11 @@ defmodule Tightbeam.Wakes do
             txn,
             if(batchable?,
               do:
-                "UPDATE wakes SET firedAt=?2,prompt=?3 WHERE wakeId=?1 AND state='pending' AND firedAt IS NULL",
+                "UPDATE wakes SET firedAt=?2 WHERE wakeId=?1 AND state='pending' AND firedAt IS NULL",
               else:
-                "UPDATE wakes SET state='fired',firedAt=?2,prompt=?3 WHERE wakeId=?1 AND state='pending' AND firedAt IS NULL"
+                "UPDATE wakes SET state='fired',firedAt=?2 WHERE wakeId=?1 AND state='pending' AND firedAt IS NULL"
             ),
-            [wake.wake_id, fired_at, stamped_prompt]
+            [wake.wake_id, fired_at]
           )
 
           updated? = Txn.changes(txn) == 1
@@ -7163,11 +7171,19 @@ defmodule Tightbeam.Wakes do
             txn,
             if(batchable?,
               do:
-                "UPDATE wakes SET firedAt = ?2, firedBy = ?3, prompt = ?4 WHERE wakeId = ?1 AND state = 'pending' AND firedAt IS NULL",
+                "UPDATE wakes SET firedAt = ?2, firedBy = ?3, recognitionEvidence = ?4 WHERE wakeId = ?1 AND state = 'pending' AND firedAt IS NULL",
               else:
-                "UPDATE wakes SET state = 'fired', firedAt = ?2, firedBy = ?3, prompt = ?4 WHERE wakeId = ?1 AND state = 'pending' AND firedAt IS NULL"
+                "UPDATE wakes SET state = 'fired', firedAt = ?2, firedBy = ?3, recognitionEvidence = ?4 WHERE wakeId = ?1 AND state = 'pending' AND firedAt IS NULL"
             ),
-            [wake.wake_id, fired_at, cause, stamped_prompt]
+            [
+              wake.wake_id,
+              fired_at,
+              cause,
+              if(match,
+                do:
+                  JSON.encode!(%{condition_fact: %{id: match.id, kind: kind, scope: match.scope}})
+              )
+            ]
           )
 
           updated? = Txn.changes(txn) == 1
