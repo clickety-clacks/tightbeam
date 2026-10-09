@@ -129,10 +129,10 @@ defmodule Tightbeam.WorkItemsTest do
     assert %{digest: true, state: "fired"} = Wakes.get(ctx.db, carrier_id)
     assert Wakes.get(ctx.db, wake.wake_id).state == "fired"
 
-    assert {:ok, [[actual_session, "queued", content]]} =
+    assert {:ok, [[actual_session, "queued", message_id, content]]} =
              DB.query(
                ctx.db,
-               "SELECT t.sessionKey,t.status,m.content FROM turns t JOIN messages m ON m.id=t.messageId WHERE t.wakeId=?1",
+               "SELECT t.sessionKey,t.status,m.id,m.content FROM turns t JOIN messages m ON m.id=t.messageId WHERE t.wakeId=?1",
                [carrier_id]
              )
 
@@ -148,16 +148,34 @@ defmodule Tightbeam.WorkItemsTest do
     # legacy callback must not deliver it a second time.
     refute_receive {:timer_delivered, _}
 
+    # This all-class subscriber must acknowledge the actual session change
+    # before the Hub can release the committed source/carrier notices.
+    assert_receive {:firehose_notice,
+                    %{"class" => "session.updated", "payload" => session_payload}}
+    assert session_payload["sessionKey"] == ctx.holder.session_key
+    assert session_payload["ownerUserId"] == "flynn"
+    assert session_payload["mechanicalStatus"] == "running"
+    Hub.delivered(hub, self())
+
+    assert_receive {:firehose_notice, %{"class" => "wake.fired", "payload" => source_payload}}
+    assert source_payload["wakeId"] == wake.wake_id
+    assert source_payload["digest"] == false
+    assert source_payload["state"] == "fired"
+    Hub.delivered(hub, self())
+
     assert_receive {:firehose_notice, %{"class" => "wake.fired", "payload" => payload}}
     assert payload["wakeId"] == carrier_id
     assert payload["digest"] == true
     assert payload["state"] == "fired"
     Hub.delivered(hub, self())
 
-    assert_receive {:firehose_notice, %{"class" => "wake.fired", "payload" => source_payload}}
-    assert source_payload["wakeId"] == wake.wake_id
-    assert source_payload["digest"] == false
+    assert_receive {:firehose_notice,
+                    %{"class" => "message.created", "payload" => message_payload}}
+    assert message_payload["id"] == message_id
+    assert message_payload["sessionKey"] == ctx.holder.session_key
+    assert message_payload["content"] == content
     Hub.delivered(hub, self())
+    assert %{queued: 0, in_flight: false, overflowed: false} = Hub.connection_stats(hub, self())
 
     assert {:ok, before_turns} = DB.query(ctx.db, "SELECT * FROM turns ORDER BY seq")
     assert {:ok, before_messages} = DB.query(ctx.db, "SELECT * FROM messages ORDER BY id")
