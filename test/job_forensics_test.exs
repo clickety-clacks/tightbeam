@@ -867,9 +867,9 @@ defmodule Tightbeam.JobForensicsTest do
     assert canceled_entry(db, "wi_restart_cancel", proven.wake_id) == before_restart
     assert_proven_cancellation(before_restart, %{provenanceStatus: "proven"})
 
-    # Capture the real current wake-table blueprint and seed the preserved
-    # production specimen before activation. Historical absence remains absence;
-    # the shared epoch proves chronology without a per-wake marker.
+    # Reconstruct the pre-payload wake table before seeding the preserved
+    # specimen. Successor source columns cannot accompany a predecessor stamp;
+    # the shared epoch still proves chronology without a per-wake marker.
     assert {:ok, [[wakes_ddl]]} =
              DB.query(db, "SELECT sql FROM sqlite_master WHERE type='table' AND name='wakes'")
 
@@ -881,6 +881,20 @@ defmodule Tightbeam.JobForensicsTest do
     })
 
     :ok = DB.execute(legacy_db, wakes_ddl <> ";")
+
+    :ok =
+      DB.execute(legacy_db, """
+      ALTER TABLE wakes DROP COLUMN sourceClientIdentity;
+      ALTER TABLE wakes DROP COLUMN sourceAttachments;
+      ALTER TABLE wakes DROP COLUMN sourceVisibilityScope;
+      ALTER TABLE wakes DROP COLUMN sourceAddress;
+      """)
+
+    assert {:ok, []} =
+             DB.query(legacy_db, """
+             SELECT name FROM pragma_table_info('wakes')
+             WHERE name IN ('sourceClientIdentity','sourceAttachments','sourceVisibilityScope','sourceAddress')
+             """)
 
     :ok =
       DB.execute(
@@ -898,6 +912,19 @@ defmodule Tightbeam.JobForensicsTest do
       )
 
     :ok = Tightbeam.Schema.ensure_all(legacy_db)
+
+    assert {:ok,
+            [
+              ["sourceAddress"],
+              ["sourceAttachments"],
+              ["sourceClientIdentity"],
+              ["sourceVisibilityScope"]
+            ]} =
+             DB.query(legacy_db, """
+             SELECT name FROM pragma_table_info('wakes')
+             WHERE name IN ('sourceClientIdentity','sourceAttachments','sourceVisibilityScope','sourceAddress')
+             ORDER BY name
+             """)
 
     :ok =
       DB.execute(legacy_db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn',1,1)")
