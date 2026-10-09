@@ -906,26 +906,79 @@ defmodule Tightbeam.GatewayTest do
 
     historical =
       for source <- [direct, role] do
-        assert {:ok, [[policy]]} =
+        # A captured-development transport is historical input, never a new
+        # admission route. Seed its frozen bytes before exercising real recovery.
+        batch_id = "legacy-batch:" <> source.wake_id
+        carrier = "legacy-carrier:" <> source.wake_id
+        frozen = "original frozen transport\n" <> source.prompt
+
+        {:ok, [[address, scope]]} =
+          DB.query(
+            ctx.db,
+            "SELECT sourceAddress,sourceVisibilityScope FROM wakes WHERE wakeId=?1",
+            [source.wake_id]
+          )
+
+        Wakes.schedule(ctx.db, %{
+          wake_id: carrier,
+          session_key: source.session_key,
+          target_role: source.target_role,
+          origin: "process:tightbeam",
+          prompt: frozen,
+          due_at: at,
+          class: "fyi",
+          digest: true,
+          target_gate: source.target_gate
+        })
+
+        assert {:ok, _} =
                  DB.query(
                    ctx.db,
-                   "SELECT 'notice-policy:' || wakeId FROM wakes WHERE wakeId=?1",
-                   [source.wake_id]
+                   """
+                   INSERT INTO notice_batches(batchId,recipientAddress,sessionKey,targetRole,
+                     visibilityScope,policyRevision,state,dueAt,openedAt,sealedAt,releaseCause,
+                     deliveryToken,envelope,envelopeSha256,deliveryWakeId,memberCount,renderedBytes)
+                   VALUES(?1,?2,?3,?4,?5,'old-dev-revision','delivery_pending',?6,?7,?8,'idle',?9,?10,?11,?12,1,?13)
+                   """,
+                   [
+                     batch_id,
+                     address,
+                     source.session_key,
+                     source.target_role,
+                     scope,
+                     source.due_at,
+                     source.created_at,
+                     at,
+                     "legacy-token:" <> source.wake_id,
+                     frozen,
+                     Base.encode16(:crypto.hash(:sha256, frozen), case: :lower),
+                     carrier,
+                     byte_size(frozen)
+                   ]
                  )
 
-        assert %{batch_id: batch_id} =
-                 NoticeBatcher.enqueue_or_recover(ctx.db, source.wake_id, policy)
-
-        assert {:ok, {:new, carrier}} =
-                 DB.transaction(ctx.db, fn txn ->
-                   assert :sealed =
-                            NoticeBatcher.enqueue_or_recover_in_txn(
-                              txn,
-                              {:seal_if_due, batch_id, at}
-                            )
-
-                   NoticeBatcher.enqueue_or_recover_in_txn(txn, {:arm_if_due, batch_id, at})
-                 end)
+        assert {:ok, _} =
+                 DB.query(
+                   ctx.db,
+                   """
+                   INSERT INTO notice_batch_members(memberId,batchId,sourceWakeId,policyRef,
+                     recipientAddress,visibilityScope,publicationSeq,policyRevision,senderPrincipal,
+                     cause,class,payload,renderedBytes,state,addedAt)
+                   VALUES(?1,?2,?3,?4,?5,?6,1,'old-dev-revision',?7,'wake','fyi',?8,?9,'included',?10)
+                   """,
+                   [
+                     "legacy-member:" <> source.wake_id,
+                     batch_id,
+                     source.wake_id,
+                     NoticeBatcher.policy_ref(source.wake_id),
+                     address,
+                     scope,
+                     source.origin,
+                     source.prompt,
+                     byte_size(source.prompt),
+                     source.created_at
+                   ]
+                 )
 
         assert {:ok, [[0]]} =
                  DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [carrier])

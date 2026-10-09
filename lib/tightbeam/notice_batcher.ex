@@ -338,13 +338,22 @@ defmodule Tightbeam.NoticeBatcher do
   end
 
   def enqueue_or_recover_in_txn(%Txn{} = txn, {:enqueue, source_wake_id, policy_ref}) do
-    with {:ok, source} <- authoritative_source(txn, source_wake_id, policy_ref),
-         :ok <- recipient_ready_for_membership(txn, source),
-         :ok <- eligible(source) do
-      case existing_member(txn, source) do
-        nil -> admit_member(txn, source)
-        member -> member_result(member)
-      end
+    case Wakes.get_in_txn(txn, source_wake_id) do
+      %{consumer: "prompt", digest: false, state: "pending"} ->
+        if policy_ref == policy_ref(source_wake_id) do
+          {:deferred,
+           %{
+             code: "recipient_readiness_required",
+             message: "the source stays editable until the recipient's session snapshot"
+           }}
+        else
+          {:error,
+           %{code: "invalid_policy_delivery_ref", message: "source reference does not match"}}
+        end
+
+      _ ->
+        {:error,
+         %{code: "stale_source_notice", message: "source is not an editable pending prompt"}}
     end
   end
 
@@ -352,17 +361,11 @@ defmodule Tightbeam.NoticeBatcher do
     cancel_member_in_txn(txn, source_wake_id, cancellation_ref)
   end
 
-  def enqueue_or_recover_in_txn(%Txn{} = txn, {:seal_if_due, batch_id, at}) do
-    seal_if_due_in_txn(txn, batch_id, at)
-  end
-
-  def enqueue_or_recover_in_txn(%Txn{} = txn, {:arm, batch_id}) do
-    arm_if_due_in_txn(txn, batch_id, now())
-  end
-
-  def enqueue_or_recover_in_txn(%Txn{} = txn, {:arm_if_due, batch_id, at}) do
-    arm_if_due_in_txn(txn, batch_id, at)
-  end
+  # Historical open/sealed rows are recovered through the same session queue.
+  # Compatibility requests cannot form or arm a second per-address queue.
+  def enqueue_or_recover_in_txn(%Txn{}, {:seal_if_due, _batch_id, _at}), do: :noop
+  def enqueue_or_recover_in_txn(%Txn{}, {:arm, _batch_id}), do: :noop
+  def enqueue_or_recover_in_txn(%Txn{}, {:arm_if_due, _batch_id, _at}), do: :noop
 
   def enqueue_or_recover_in_txn(%Txn{} = txn, {:attempt, delivery_wake_id, at}) do
     update_attempt_in_txn(txn, delivery_wake_id, at)
@@ -393,159 +396,62 @@ defmodule Tightbeam.NoticeBatcher do
         replacement_wake_id
       )
       when is_binary(source_wake_id) and is_binary(replacement_wake_id) do
+    case Txn.q(txn, "SELECT sourceVisibilityScope FROM wakes WHERE wakeId=?1", [source_wake_id]) do
+      [[scope]] ->
+        Txn.q(
+          txn,
+          """
+          UPDATE wakes SET sourceVisibilityScope=COALESCE(?2,sourceVisibilityScope)
+          WHERE wakeId=?1 AND state='pending'
+          """,
+          [replacement_wake_id, scope]
+        )
+
+      [] ->
+        :ok
+    end
+
     case Txn.q(
            txn,
            """
-           SELECT w.sourceVisibilityScope, w.dueAt, m.memberId, m.batchId,
-                  m.state, b.state, b.deliveryWakeId
-           FROM wakes w
-           JOIN notice_batch_members m ON m.sourceWakeId=w.wakeId
-           JOIN notice_batches b ON b.batchId=m.batchId
-           WHERE w.wakeId=?1
-             AND ((m.state='active' AND b.state='open')
-                  OR (m.state='included' AND b.state IN
-                      ('sealed','delivery_pending','delivered','delivery_failed')))
+           SELECT m.batchId,b.state,b.deliveryWakeId
+           FROM notice_batch_members m JOIN notice_batches b ON b.batchId=m.batchId
+           WHERE m.sourceWakeId=?1 AND m.state IN ('active','included')
            """,
            [source_wake_id]
          ) do
-      [[visibility_scope, deadline_at, _member_id, _batch_id, "active", "open", nil]] ->
-        replacement_policy_ref =
-          copy_retargeted_policy_in_txn(
-            txn,
-            replacement_wake_id,
-            visibility_scope,
-            deadline_at
-          )
-
-        enqueue_or_recover_in_txn(txn, replacement_wake_id, replacement_policy_ref)
-
-      [
-        [
-          visibility_scope,
-          deadline_at,
-          member_id,
-          batch_id,
-          "included",
-          batch_state,
-          delivery_wake_id
-        ]
-      ] ->
-        _replacement_policy_ref =
-          copy_retargeted_policy_in_txn(
-            txn,
-            replacement_wake_id,
-            visibility_scope,
-            deadline_at
-          )
-
-        delivery_wake_id =
-          case {batch_state, delivery_wake_id} do
-            {"sealed", nil} ->
-              case arm_if_due_in_txn(txn, batch_id, now()) do
-                {:new, wake_id} -> wake_id
-                :noop -> delivery_wake_id_in_txn(txn, batch_id)
-              end
-
-            {_state, wake_id} when is_binary(wake_id) ->
-              wake_id
-
-            _ ->
-              nil
-          end
+      [[batch_id, state, carrier]] ->
+        committed? =
+          is_binary(carrier) and
+            Txn.q(txn, "SELECT 1 FROM turns WHERE wakeId=?1 LIMIT 1", [carrier]) != []
 
         cond do
-          is_binary(delivery_wake_id) ->
-            lifecycle(
-              txn,
-              "retarget_preserved_by_immutable_delivery",
-              batch_id,
-              member_id,
-              replacement_wake_id,
-              delivery_wake_id
-            )
-
-            {:immutable_delivery,
-             %{
-               batch_id: batch_id,
-               batch_state: batch_state,
-               delivery_wake_id: delivery_wake_id
-             }}
-
-          overflow_waiting_for_trigger?(txn, batch_id) ->
-            lifecycle(
-              txn,
-              "retarget_preserved_by_immutable_delivery",
-              batch_id,
-              member_id,
-              replacement_wake_id,
-              "pending-original-trigger"
-            )
-
-            {:immutable_delivery_pending, %{batch_id: batch_id, batch_state: batch_state}}
+          committed? or state in ["delivered", "delivery_failed"] ->
+            if is_binary(carrier) do
+              {:immutable_delivery,
+               %{batch_id: batch_id, batch_state: state, delivery_wake_id: carrier}}
+            else
+              {:error,
+               %{
+                 code: "immutable_delivery_missing_carrier",
+                 message: "historical delivery has no carrier"
+               }}
+            end
 
           true ->
-            refusal(
-              "immutable_delivery_missing_carrier",
-              "a sealed selected source has no durable carrier"
-            )
+            :released =
+              invalidate_unclaimed_batch_in_txn(txn, batch_id, "source-retargeted", now())
+
+            :not_batched
         end
 
       [] ->
-        case Txn.q(
-               txn,
-               """
-               SELECT sourceVisibilityScope, dueAt
-               FROM wakes WHERE wakeId=?1 AND sourceVisibilityScope IS NOT NULL
-               """,
-               [source_wake_id]
-             ) do
-          [[visibility_scope, deadline_at]] ->
-            _replacement_policy_ref =
-              copy_retargeted_policy_in_txn(
-                txn,
-                replacement_wake_id,
-                visibility_scope,
-                deadline_at
-              )
+        :not_batched
 
-            :not_batched
-
-          [] ->
-            :not_batched
-        end
+      _ ->
+        {:error,
+         %{code: "ambiguous_source_delivery", message: "source has several live memberships"}}
     end
-  end
-
-  defp copy_retargeted_policy_in_txn(
-         txn,
-         replacement_wake_id,
-         visibility_scope,
-         _deadline_at
-       ) do
-    # Target changes produce a new source address; an explicit visibility scope
-    # is carried forward without changing an already formed historical member.
-    Txn.q(
-      txn,
-      "UPDATE wakes SET sourceVisibilityScope=?2,sourceAddress=CASE WHEN targetRole IS NULL THEN 'session:' || sessionKey ELSE 'role:' || targetRole END WHERE wakeId=?1 AND state='pending'",
-      [replacement_wake_id, visibility_scope]
-    )
-
-    policy_ref(replacement_wake_id)
-  end
-
-  defp delivery_wake_id_in_txn(txn, batch_id) do
-    case Txn.q(txn, "SELECT deliveryWakeId FROM notice_batches WHERE batchId=?1", [batch_id]) do
-      [[wake_id]] when is_binary(wake_id) -> wake_id
-      _ -> nil
-    end
-  end
-
-  defp overflow_waiting_for_trigger?(txn, batch_id) do
-    Txn.q(
-      txn,
-      "SELECT 1 FROM notice_batches WHERE batchId=?1 AND state='sealed' AND releaseCause='overflow' AND deliveryWakeId IS NULL",
-      [batch_id]
-    ) == [[1]]
   end
 
   @doc "Resolve and admit one ready snapshot per concrete session atomically."
@@ -1313,92 +1219,6 @@ defmodule Tightbeam.NoticeBatcher do
     end
   end
 
-  defp authoritative_source(txn, source_wake_id, policy_ref) do
-    case Txn.q(
-           txn,
-           """
-           SELECT w.wakeId, w.sessionKey, w.targetRole, w.origin, w.creatorSessionKey, w.prompt,
-                  w.consumer, w.state, w.targetGate, w.reresolve, w.reresolveSeed,
-                  w.reresolveRung, w.createdAt, w.work_item_id, w.assignmentId,
-                  w.class, w.classElection, w.digest, ?2,
-                  w.sourceAddress,
-                  w.sourceVisibilityScope, ?3, w.dueAt, 1
-           FROM wakes w
-           WHERE w.wakeId=?1 AND ?2='notice-policy:' || w.wakeId
-             AND w.sourceVisibilityScope IS NOT NULL
-           """,
-           [source_wake_id, policy_ref, @policy_revision]
-         ) do
-      [row] ->
-        {:ok, source_from_row(row)}
-
-      [] ->
-        {:error,
-         %{
-           code: "invalid_policy_delivery_ref",
-           message: "source policy reference is missing or stale"
-         }}
-    end
-  end
-
-  defp eligible(source) do
-    cond do
-      source.enabled != 1 ->
-        refusal("batching_disabled", "source delivery policy is disabled")
-
-      source.state != "pending" ->
-        refusal("stale_source_notice", "source notice is not pending")
-
-      source.consumer != "prompt" ->
-        refusal("ineligible_source_notice", "source notice is not principal delivery traffic")
-
-      source.digest == 1 ->
-        refusal("ineligible_source_notice", "a batch carrier cannot become a member")
-
-      true ->
-        :ok
-    end
-  end
-
-  defp refusal(code, message), do: {:error, %{code: code, message: message}}
-
-  defp recipient_ready_for_membership(txn, source) do
-    case source_delivery_target(txn, source) do
-      nil ->
-        if deleted_role_target?(txn, source) do
-          {:bypass,
-           %{
-             code: "unknown_role",
-             direct_delivery: true,
-             message: "a deleted role remains an individual wake for visible scheduler refusal"
-           }}
-        else
-          {:deferred,
-           %{
-             code: "recipient_unavailable",
-             message: "source remains an individual pending wake until its target is available"
-           }}
-        end
-
-      {_session_key, _role_ref, _fallback} ->
-        if recipient_running?(txn, source.session_key, source.target_role) do
-          {:deferred,
-           %{
-             code: "recipient_busy",
-             message: "source remains an individual queued wake until the current turn ends"
-           }}
-        else
-          :ok
-        end
-    end
-  end
-
-  defp deleted_role_target?(txn, %{target_role: role}) when is_binary(role) do
-    Txn.q(txn, "SELECT 1 FROM roles WHERE name=?1", [role]) == []
-  end
-
-  defp deleted_role_target?(_txn, _source), do: false
-
   defp source_delivery_target(txn, %{target_role: role}) when is_binary(role),
     do: Gateway.delivery_target(txn, nil, %{target_role: role})
 
@@ -1439,218 +1259,6 @@ defmodule Tightbeam.NoticeBatcher do
     do: visibility_scope <> ":delivery-target-gate-0"
 
   defp delivery_gate_scope(visibility_scope, _target_gate), do: visibility_scope
-
-  defp batch_target_gate(txn, batch_id) do
-    case Txn.q(
-           txn,
-           """
-           SELECT w.targetGate
-           FROM notice_batch_members m
-           JOIN wakes w ON w.wakeId=m.sourceWakeId
-           WHERE m.batchId=?1 AND m.state='included'
-           ORDER BY m.publicationSeq
-           LIMIT 1
-           """,
-           [batch_id]
-         ) do
-      [[target_gate]] when target_gate in [0, 1] -> target_gate
-      _ -> raise "notice batch has no included source with a valid target gate"
-    end
-  end
-
-  defp existing_member(txn, source) do
-    case Txn.q(
-           txn,
-           """
-           SELECT memberId, batchId, state
-           FROM notice_batch_members
-           WHERE sourceWakeId=?1 AND recipientAddress=?2 AND visibilityScope=?3
-           """,
-           [source.wake_id, source.recipient_address, source.visibility_scope]
-         ) do
-      [row] -> row
-      [] -> nil
-    end
-  end
-
-  defp admit_member(txn, source) do
-    rendered_bytes = rendered_member_bytes(txn, source, next_publication_seq(txn, source))
-
-    if rendered_bytes > @max_rendered_bytes do
-      {:bypass,
-       %{
-         code: "member_payload_too_large",
-         message: "one source notice exceeds the v1 rendered payload floor"
-       }}
-    else
-      cond do
-        not is_nil(batch = open_batch(txn, source)) and overflow?(batch, rendered_bytes) ->
-          {:deferred,
-           %{
-             code: "batch_capacity_waiting",
-             message: "source remains individually editable until the recipient is ready"
-           }}
-
-        true ->
-          batch = open_batch(txn, source) || create_batch(txn, source, 0)
-          publication_seq = next_publication_seq(txn, source)
-          member_id = "nbm_" <> Tightbeam.Id.uuid4()
-          cause = source.work_item_id || source.assignment_id || "wake"
-
-          # The current schema keeps this historical slot constrained to fyi;
-          # the authoritative class and its visible marker are read from the
-          # immutable source wake in every member query and envelope render.
-          Txn.q(
-            txn,
-            """
-            INSERT INTO notice_batch_members
-              (memberId, batchId, sourceWakeId, policyRef, recipientAddress,
-               visibilityScope, publicationSeq, policyRevision, senderPrincipal,
-               cause, class, payload, renderedBytes, state, addedAt, canceledAt,
-               cancellationRef)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'fyi', ?11, ?12,
-                    'active', ?13, NULL, NULL)
-            """,
-            [
-              member_id,
-              batch.batch_id,
-              source.wake_id,
-              source.policy_ref,
-              source.recipient_address,
-              source.visibility_scope,
-              publication_seq,
-              source.policy_revision,
-              source.origin,
-              cause,
-              source.prompt,
-              rendered_bytes,
-              source.created_at
-            ]
-          )
-
-          Txn.q(
-            txn,
-            """
-            UPDATE notice_batches
-            SET dueAt=MIN(dueAt, ?2), memberCount=memberCount+1,
-                renderedBytes=renderedBytes+?3
-            WHERE batchId=?1 AND state='open'
-            """,
-            [batch.batch_id, source.deadline_at, rendered_bytes]
-          )
-
-          lifecycle(txn, "member_added", batch.batch_id, member_id, source.wake_id, "admitted")
-          %{member_id: member_id, batch_id: batch.batch_id, state: "active"}
-      end
-    end
-  end
-
-  defp open_batch(txn, source) do
-    case Txn.q(
-           txn,
-           """
-           SELECT batchId, memberCount, renderedBytes, openedAt, sessionKey, targetRole,
-                  policyRevision
-           FROM notice_batches
-           WHERE recipientAddress=?1 AND visibilityScope=?2 AND state='open'
-           """,
-           [source.recipient_address, source.visibility_scope]
-         ) do
-      [[batch_id, count, bytes, opened_at, session_key, target_role, policy_revision]] ->
-        %{
-          batch_id: batch_id,
-          member_count: count,
-          rendered_bytes: bytes,
-          opened_at: opened_at,
-          session_key: session_key,
-          target_role: target_role,
-          policy_revision: policy_revision
-        }
-
-      [] ->
-        nil
-    end
-  end
-
-  defp create_batch(txn, source, overflow_count) do
-    batch_id = "nb_" <> Tightbeam.Id.uuid4()
-
-    Txn.q(
-      txn,
-      """
-      INSERT INTO notice_batches
-        (batchId, recipientAddress, sessionKey, targetRole, visibilityScope,
-         policyRevision, state, dueAt, openedAt, retryCount, overflowCount,
-         memberCount, renderedBytes)
-      VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', ?7, ?8, 0, ?9, 0, 0)
-      """,
-      [
-        batch_id,
-        source.recipient_address,
-        source.session_key,
-        source.target_role,
-        source.visibility_scope,
-        source.policy_revision,
-        source.deadline_at,
-        source.created_at,
-        overflow_count
-      ]
-    )
-
-    lifecycle(txn, "batch_opened", batch_id, nil, source.wake_id, "first-member")
-    %{batch_id: batch_id, member_count: 0, rendered_bytes: 0}
-  end
-
-  defp overflow?(batch, candidate_bytes) do
-    batch.member_count >= @max_members or
-      batch.rendered_bytes + candidate_bytes > @max_rendered_bytes
-  end
-
-  defp next_publication_seq(txn, source) do
-    [[seq]] =
-      Txn.q(
-        txn,
-        """
-        SELECT COALESCE(MAX(publicationSeq), 0) + 1
-        FROM notice_batch_members
-        WHERE recipientAddress=?1 AND visibilityScope=?2
-        """,
-        [source.recipient_address, source.visibility_scope]
-      )
-
-    seq
-  end
-
-  defp seal_if_due_in_txn(txn, batch_id, at) do
-    case Txn.q(
-           txn,
-           """
-           SELECT batchId, sessionKey, targetRole, dueAt, openedAt
-           FROM notice_batches WHERE batchId=?1 AND state='open'
-           """,
-           [batch_id]
-         ) do
-      [[^batch_id, session_key, target_role, due_at, opened_at]] ->
-        boundary = latest_turn_end(txn, session_key, target_role)
-
-        cond do
-          at < due_at ->
-            :noop
-
-          recipient_running?(txn, session_key, target_role) ->
-            :noop
-
-          is_integer(boundary) and boundary > opened_at ->
-            seal_open_batch_in_txn(txn, batch_id, "turn-boundary", at)
-
-          true ->
-            seal_open_batch_in_txn(txn, batch_id, "idle", at)
-        end
-
-      [] ->
-        :noop
-    end
-  end
 
   defp recipient_running?(txn, session_key, target_role) do
     resolved =
@@ -1721,180 +1329,6 @@ defmodule Tightbeam.NoticeBatcher do
     end
   end
 
-  defp seal_open_batch_in_txn(txn, batch_id, cause, at) do
-    rows = active_member_rows(txn, batch_id)
-
-    if rows == [] do
-      Txn.q(
-        txn,
-        """
-        UPDATE notice_batches
-        SET state='canceled', terminalCause='no-active-members',
-            terminalPrincipal='process:tightbeam:batcher'
-        WHERE batchId=?1 AND state='open'
-        """,
-        [batch_id]
-      )
-
-      lifecycle(txn, "batch_canceled", batch_id, nil, nil, "no-active-members")
-      :canceled
-    else
-      envelope = envelope(batch_id, cause, rows)
-      sha = sha256(envelope)
-      token = delivery_token(batch_id)
-
-      Txn.q(
-        txn,
-        """
-        UPDATE notice_batches
-        SET state='sealed', sealedAt=?2, releaseCause=?3, deliveryToken=?4,
-            envelope=?5, envelopeSha256=?6
-        WHERE batchId=?1 AND state='open'
-        """,
-        [batch_id, at, cause, token, envelope, sha]
-      )
-
-      Txn.q(
-        txn,
-        "UPDATE notice_batch_members SET state='included' WHERE batchId=?1 AND state='active'",
-        [batch_id]
-      )
-
-      lifecycle(txn, "batch_sealed", batch_id, nil, nil, cause)
-      :sealed
-    end
-  end
-
-  # Overflow freezes a bounded prefix; it is not a delivery trigger. Keep the
-  # sealed bytes immutable, then arm only when that prefix's original ceiling
-  # or recipient turn boundary becomes observable.
-  defp arm_if_due_in_txn(txn, batch_id, at) do
-    case Txn.q(
-           txn,
-           """
-           SELECT releaseCause, dueAt, openedAt, sessionKey, targetRole, sealedAt
-           FROM notice_batches WHERE batchId=?1 AND state='sealed'
-           """,
-           [batch_id]
-         ) do
-      [["overflow", due_at, opened_at, session_key, target_role, _sealed_at]] ->
-        boundary = latest_turn_end(txn, session_key, target_role)
-
-        cond do
-          at >= due_at ->
-            arm_in_txn(txn, batch_id, due_at, "ceiling")
-
-          is_integer(boundary) and boundary > opened_at ->
-            arm_in_txn(txn, batch_id, boundary, "turn-boundary")
-
-          true ->
-            :noop
-        end
-
-      [[cause, _due_at, _opened_at, _session_key, _target_role, sealed_at]] ->
-        arm_in_txn(txn, batch_id, sealed_at, cause)
-
-      [] ->
-        :noop
-    end
-  end
-
-  defp arm_in_txn(txn, batch_id, delivery_at, delivery_trigger) do
-    case Txn.q(
-           txn,
-           """
-           SELECT sessionKey, targetRole, envelope, deliveryToken, deliveryWakeId, sealedAt
-           FROM notice_batches WHERE batchId=?1 AND state='sealed'
-           """,
-           [batch_id]
-         ) do
-      [[session_key, target_role, envelope, token, nil, sealed_at]] ->
-        delivery_at = delivery_at || sealed_at
-        delivery_trigger = delivery_trigger || release_cause(txn, batch_id)
-        wake_id = delivery_wake_id(batch_id)
-        existing = Txn.q(txn, "SELECT 1 FROM wakes WHERE wakeId=?1", [wake_id])
-        {work_item_id, assignment_id} = shared_work(txn, batch_id)
-        target_gate = batch_target_gate(txn, batch_id)
-
-        {carrier_session_key, owner_field} = carrier_identity(txn, session_key, target_role)
-
-        if existing == [] do
-          Wakes.schedule_in_txn(txn, %{
-            wake_id: wake_id,
-            session_key: carrier_session_key,
-            target_role: target_role,
-            origin: "process:tightbeam",
-            prompt: envelope,
-            due_at: delivery_at,
-            class: "fyi",
-            digest: true,
-            target_gate: target_gate,
-            work_item_id: work_item_id,
-            assignment_id: assignment_id
-          })
-        end
-
-        Txn.q(
-          txn,
-          """
-          UPDATE notice_batches
-          SET state='delivery_pending', deliveryWakeId=?2
-          WHERE batchId=?1 AND state='sealed' AND deliveryToken=?3
-          """,
-          [batch_id, wake_id, token]
-        )
-
-        supersede_deferred_retargets_in_txn(txn, batch_id, wake_id)
-
-        lifecycle(txn, "delivery_armed", batch_id, nil, nil, wake_id)
-
-        EventLog.lifecycle_in_txn(
-          txn,
-          "wake_digest_materialized",
-          wake_id,
-          "rule=#{@rule} batchId=#{batch_id} members=#{member_count(txn, batch_id)} " <>
-            "trigger=#{delivery_trigger}#{owner_field}"
-        )
-
-        {:new, wake_id}
-
-      [] ->
-        :noop
-    end
-  end
-
-  defp supersede_deferred_retargets_in_txn(txn, batch_id, delivery_wake_id) do
-    replacements =
-      Txn.q(
-        txn,
-        """
-        SELECT DISTINCT c.replacementWakeId
-        FROM notice_batch_members m
-        JOIN wake_cancellations c ON c.wakeId=m.sourceWakeId
-        JOIN wakes replacement ON replacement.wakeId=c.replacementWakeId
-        WHERE m.batchId=?1 AND m.state='included'
-          AND c.reasonKind='target_retired' AND c.outcomeKind='replacement'
-          AND replacement.state='pending'
-        """,
-        [batch_id]
-      )
-
-    Enum.each(replacements, fn [replacement_wake_id] ->
-      canceled =
-        Wakes.cancel_in_txn(txn, %{
-          wake_id: replacement_wake_id,
-          requester: %{kind: "process", id: "tightbeam:batcher"},
-          reason_kind: "superseded",
-          causal_source: %{kind: "wake", id: delivery_wake_id},
-          outcome: %{kind: "replacement", replacement_wake_id: delivery_wake_id}
-        })
-
-      if not canceled do
-        raise "deferred retirement replacement carrier supersession refused for #{replacement_wake_id}"
-      end
-    end)
-  end
-
   defp cancel_member_in_txn(txn, source_wake_id, cancellation_ref) do
     case Txn.q(
            txn,
@@ -1926,8 +1360,15 @@ defmodule Tightbeam.NoticeBatcher do
                "SELECT COUNT(*) FROM notice_batch_members WHERE batchId=?1 AND state='active'",
                [batch_id]
              ) do
-          [[0]] -> seal_open_batch_in_txn(txn, batch_id, "empty-after-cancellation", at)
-          _ -> :ok
+          [[0]] ->
+            Txn.q(
+              txn,
+              "UPDATE notice_batches SET state='canceled',terminalCause='no-active-members',terminalPrincipal='process:tightbeam:batcher' WHERE batchId=?1 AND state='open'",
+              [batch_id]
+            )
+
+          _ ->
+            :ok
         end
 
         :ok
@@ -2054,32 +1495,6 @@ defmodule Tightbeam.NoticeBatcher do
     end)
   end
 
-  defp active_member_rows(txn, batch_id) do
-    Txn.q(
-      txn,
-      """
-      SELECT m.sourceWakeId, m.senderPrincipal, m.cause, w.class,
-             m.publicationSeq, m.payload
-      FROM notice_batch_members m
-      JOIN wakes w ON w.wakeId=m.sourceWakeId
-      WHERE m.batchId=?1 AND m.state='active'
-      ORDER BY CASE w.class
-        WHEN 'algedonic' THEN 0
-        WHEN 'blocker' THEN 1
-        WHEN 'input-needed' THEN 2
-        WHEN 'status-query' THEN 3
-        WHEN 'fyi' THEN 4
-        WHEN 'information' THEN 4
-        ELSE 5
-      END, m.publicationSeq
-      """,
-      [batch_id]
-    )
-    |> Enum.map(fn [wake_id, sender, cause, class, seq, _raw_payload] ->
-      [wake_id, sender, cause, class, seq, Wakes.delivery_prompt_in_txn(txn, wake_id)]
-    end)
-  end
-
   defp envelope(batch_id, cause, rows) do
     body =
       rows
@@ -2102,57 +1517,8 @@ defmodule Tightbeam.NoticeBatcher do
     |> String.trim()
   end
 
-  defp rendered_member_bytes(txn, source, seq) do
-    byte_size(
-      render_member([
-        source.wake_id,
-        source.origin,
-        source.work_item_id || source.assignment_id || "wake",
-        source.class,
-        seq,
-        Wakes.delivery_prompt_in_txn(txn, source.wake_id)
-      ])
-    )
-  end
-
   defp render_member([source, sender, cause, class, seq, payload]) do
     "[#{seq}] source=#{source} sender=#{sender} cause=#{cause} class=#{class}\n" <> payload
-  end
-
-  defp carrier_identity(_txn, session_key, nil), do: {session_key, ""}
-
-  defp carrier_identity(txn, _session_key, target_role) do
-    session_key =
-      case Gateway.delivery_target(txn, nil, %{target_role: target_role}) do
-        {resolved, _role, _fallback} -> resolved
-        nil -> "role:" <> target_role
-      end
-
-    owner_field =
-      case Txn.q(txn, "SELECT ownerUserId FROM roles WHERE name=?1", [target_role]) do
-        [[owner]] -> " ownerUserId=" <> URI.encode_www_form(owner)
-        [] -> ""
-      end
-
-    {session_key, owner_field}
-  end
-
-  defp member_count(txn, batch_id) do
-    [[count]] =
-      Txn.q(
-        txn,
-        "SELECT COUNT(*) FROM notice_batch_members WHERE batchId=?1 AND state='included'",
-        [
-          batch_id
-        ]
-      )
-
-    count
-  end
-
-  defp release_cause(txn, batch_id) do
-    [[cause]] = Txn.q(txn, "SELECT releaseCause FROM notice_batches WHERE batchId=?1", [batch_id])
-    cause
   end
 
   defp delivery_token(batch_id), do: "nbt_" <> sha256(batch_id)
@@ -2181,82 +1547,6 @@ defmodule Tightbeam.NoticeBatcher do
       [] -> :ok
     end
   end
-
-  defp shared_work(txn, batch_id) do
-    rows =
-      Txn.q(
-        txn,
-        """
-        SELECT DISTINCT w.work_item_id, w.assignmentId
-        FROM notice_batch_members m
-        JOIN wakes w ON w.wakeId=m.sourceWakeId
-        WHERE m.batchId=?1 AND (w.work_item_id IS NOT NULL OR w.assignmentId IS NOT NULL)
-        """,
-        [batch_id]
-      )
-
-    case rows do
-      [[work_item_id, assignment_id]] -> {work_item_id, assignment_id}
-      _ -> {nil, nil}
-    end
-  end
-
-  defp source_from_row([
-         wake_id,
-         session_key,
-         target_role,
-         origin,
-         creator_session_key,
-         prompt,
-         consumer,
-         state,
-         target_gate,
-         reresolve,
-         reresolve_seed,
-         reresolve_rung,
-         created_at,
-         work_item_id,
-         assignment_id,
-         class,
-         class_election,
-         digest,
-         policy_ref,
-         recipient_address,
-         visibility_scope,
-         policy_revision,
-         deadline_at,
-         enabled
-       ]) do
-    %{
-      wake_id: wake_id,
-      session_key: session_key,
-      target_role: target_role,
-      origin: origin,
-      creator_session_key: creator_session_key,
-      prompt: prompt,
-      consumer: consumer,
-      state: state,
-      target_gate: target_gate,
-      reresolve: reresolve,
-      reresolve_seed: reresolve_seed,
-      reresolve_rung: reresolve_rung,
-      created_at: created_at,
-      work_item_id: work_item_id,
-      assignment_id: assignment_id,
-      class: class,
-      class_election: class_election,
-      digest: digest,
-      policy_ref: policy_ref,
-      recipient_address: recipient_address,
-      visibility_scope: visibility_scope,
-      policy_revision: policy_revision,
-      deadline_at: deadline_at,
-      enabled: enabled
-    }
-  end
-
-  defp member_result([member_id, batch_id, state]),
-    do: %{member_id: member_id, batch_id: batch_id, state: state}
 
   defp member_from_row([
          member_id,
