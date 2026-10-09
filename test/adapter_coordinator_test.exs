@@ -1997,7 +1997,10 @@ defmodule Tightbeam.AdapterCoordinatorTest do
 
     Process.unlink(coordinator)
     key = {:claude, "shared", "shutdown-failure-host"}
-    assert {:ok, _adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+    assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+
+    # Identity capture runs in handle_continue; finish boot before corrupting its evidence.
+    assert %Tightbeam.Acp.Adapter{} = :sys.get_state(adapter, :infinity)
 
     assert eventually(fn -> match?([%{state: "running"}], HarnessProcess.list(ctx.db)) end)
     [%{identity_path: identity_path}] = HarnessProcess.list(ctx.db)
