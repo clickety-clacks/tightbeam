@@ -31,6 +31,19 @@ defmodule Tightbeam.Firehose.PublisherTest do
     register_testhost(db)
     target = Org.personal_session_key("flynn")
 
+    start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
+    start_supervised!({LaneStub, name: Tightbeam.LaneManager})
+
+    assert {:ok, _} =
+             Ledger.enqueue(db, %{
+               session_key: target,
+               message_id: "firehose-busy-boundary",
+               origin: "user:flynn",
+               prompt: "hold recipient busy"
+             })
+
+    assert {:ok, busy_turn} = Ledger.claim_next(db, target, "lane:firehose-boundary")
+
     wake =
       Wakes.schedule(db, %{
         session_key: target,
@@ -66,13 +79,17 @@ defmodule Tightbeam.Firehose.PublisherTest do
                &Gateway.deliver_prompt_in_txn(&1, target, wake.origin, wake.prompt, opts)
              )
 
+    assert NoticeBatcher.source_refs(db, wake.wake_id) == []
+    assert Wakes.get(db, wake.wake_id).state == "pending"
+    assert observed_classes() == []
+
+    assert :ok =
+             Ledger.finish(db, busy_turn.seq, "delivered", nil,
+               owner_lease: busy_turn.owner_lease
+             )
+
+    _busy_terminal_notices = observed_classes()
     assert [carrier_id] = Wakes.materialize_digests(db)
-
-    assert [%{delivery_wake_id: ^carrier_id, batch_state: "delivery_pending"}] =
-             NoticeBatcher.source_refs(db, wake.wake_id)
-
-    start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
-    start_supervised!({LaneStub, name: Tightbeam.LaneManager})
     scheduler = start_delivery_scheduler(db)
     assert :ok = Wakes.fire_due(scheduler)
 
@@ -100,6 +117,10 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert observed_classes() == []
     assert {:ok, ^before_turns} = DB.query(db, "SELECT * FROM turns ORDER BY seq")
     assert {:ok, ^before_wakes} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
+
+    assert {:ok, carrier_turn} = Ledger.claim_next(db, target, "lane:firehose-boundary")
+    assert carrier_turn.wake_id == carrier_id
+    _claim_notices = observed_classes()
 
     external =
       Wakes.schedule(db, %{
