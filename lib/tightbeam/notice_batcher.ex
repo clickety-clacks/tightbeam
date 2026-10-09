@@ -904,7 +904,7 @@ defmodule Tightbeam.NoticeBatcher do
              Keyword.merge(delivery_opts,
                wake_id: wake_id,
                sender: carrier.origin,
-               target_gate: carrier,
+               target_gate: if(carrier.target_gate == 0, do: nil, else: carrier),
                fire_wake_in_txn: true
              )
            ) do

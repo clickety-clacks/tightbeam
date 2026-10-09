@@ -708,8 +708,20 @@ defmodule Tightbeam.EscalationDeliveryFixture do
     drain!(ctx)
 
     for wake <- [effort_wake, statute_wake] do
+      assert wake.target_gate == 0
       carrier = delivery_wake(ctx.db, wake)
+      assert carrier.wake_id != wake.wake_id
+      assert carrier.target_gate == 0
+      assert carrier.session_key == wake.session_key
       assert carrier.state == "fired"
+      assert Wakes.get(ctx.db, wake.wake_id).state == "fired"
+      assert Wakes.get(ctx.db, wake.wake_id).prompt == wake.prompt
+
+      assert [%{delivery_wake_id: carrier_id, member_state: "included", batch_state: "delivered"}] =
+               NoticeBatcher.source_refs(ctx.db, wake.wake_id)
+
+      assert carrier_id == carrier.wake_id
+      assert count(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId = ?1", [wake.wake_id]) == 0
 
       assert rows(ctx.db, "SELECT sessionKey FROM turns WHERE wakeId = ?1", [carrier.wake_id]) ==
                [
@@ -723,6 +735,13 @@ defmodule Tightbeam.EscalationDeliveryFixture do
 
     # The control wake keeps the active-session gate: nothing was committed for it.
     assert count(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId = ?1", [control.wake_id]) == 0
+    assert NoticeBatcher.source_refs(ctx.db, control.wake_id) == []
+
+    before_turns = rows(ctx.db, "SELECT * FROM turns ORDER BY seq")
+    before_messages = rows(ctx.db, "SELECT * FROM messages ORDER BY id")
+    drain!(ctx)
+    assert rows(ctx.db, "SELECT * FROM turns ORDER BY seq") == before_turns
+    assert rows(ctx.db, "SELECT * FROM messages ORDER BY id") == before_messages
   end
 
   ## Helpers — world
