@@ -1542,6 +1542,131 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   describe "terminal notice explicit recovery" do
+    test "independent terminal roots in one failed carrier recover separately", ctx do
+      {first, _sibling, _delegation} = terminal_delegated_fixture(ctx)
+
+      second =
+        handle(
+          ctx,
+          "assign",
+          terminal_notice_assign_call(
+            {:session, "notice-parent"},
+            "second delegated child",
+            first.workItemId
+          )
+        )
+
+      for assignment <- [first, second] do
+        assert %{assignment: %{state: "closed"}} =
+                 handle(
+                   ctx,
+                   "attest",
+                   attest_call({:session, "holder"}, assignment.id, "completion")
+                 )
+      end
+
+      assert [root_a, root_b] = terminal_notices(ctx.db)
+      assert root_a.session_key == "notice-parent"
+      assert root_b.session_key == "notice-parent"
+      force_wake_due(ctx.db, root_a.wake_id)
+      force_wake_due(ctx.db, root_b.wake_id)
+
+      assert {:appended, "notice-parent", _, _} = deliver_terminal_notice(ctx.db, root_a)
+
+      assert [%{delivery_wake_id: carrier_id, member_state: "included"}] =
+               NoticeBatcher.source_refs(ctx.db, root_a.wake_id)
+
+      assert [%{delivery_wake_id: ^carrier_id, member_state: "included"}] =
+               NoticeBatcher.source_refs(ctx.db, root_b.wake_id)
+
+      assert {:ok, source} = Ledger.claim_next(ctx.db, "notice-parent", "shared-carrier")
+      assert source.wake_id == carrier_id
+
+      assert :ok =
+               Ledger.finish(ctx.db, source.seq, "failed", "shared carrier failed",
+                 owner_lease: source.owner_lease
+               )
+
+      for root <- [root_a, root_b] do
+        assert {:ok, {:ok, %{wake: recovery, replay: false}}} =
+                 recover_notice(ctx.db, root.wake_id, "session:notice-parent")
+
+        assert recovery.obligation_ref == root.obligation_ref
+
+        assert {:ok, [[source_seq]]} =
+                 DB.query(
+                   ctx.db,
+                   "SELECT sourceTurnSeq FROM wake_retry_attempts WHERE wakeId=?1",
+                   [root.wake_id]
+                 )
+
+        assert source_seq == source.seq
+        before_replay = recovery_snapshot(ctx.db)
+
+        assert {:ok, {:ok, %{wake: ^recovery, replay: true}}} =
+                 recover_notice(ctx.db, root.wake_id, "session:notice-parent")
+
+        assert recovery_snapshot(ctx.db) == before_replay
+
+        if root == root_a do
+          # Rehearse a populated predecessor, not merely a fresh empty table.
+          [[historical_ddl]] =
+            Regex.scan(
+              ~r/CREATE TABLE wake_retry_attempts \(.*?\n\);/s,
+              File.read!(Path.join(__DIR__, "fixtures/r1_o2_v1.sql"))
+            )
+
+          before_rows = DB.query(ctx.db, "SELECT rowid,* FROM wake_retry_attempts ORDER BY rowid")
+
+          assert {:ok, :ok} =
+                   DB.migration_transaction(
+                     ctx.db,
+                     :fixture_retry_predecessor,
+                     ["PRAGMA foreign_keys=OFF", "PRAGMA legacy_alter_table=ON"],
+                     ["PRAGMA legacy_alter_table=OFF", "PRAGMA foreign_keys=ON"],
+                     fn txn ->
+                       :ok =
+                         DB.Txn.exec(
+                           txn,
+                           String.replace(
+                             historical_ddl,
+                             "wake_retry_attempts",
+                             "fixture_retry_predecessor"
+                           )
+                         )
+
+                       :ok =
+                         DB.Txn.exec(txn, """
+                         INSERT INTO fixture_retry_predecessor SELECT * FROM wake_retry_attempts;
+                         DROP TABLE wake_retry_attempts;
+                         ALTER TABLE fixture_retry_predecessor RENAME TO wake_retry_attempts;
+                         CREATE INDEX wake_retry_root ON wake_retry_attempts (rootWakeId,attempt);
+                         """)
+
+                       :ok
+                     end
+                   )
+
+          assert :ok = Tightbeam.Schema.ensure_all(ctx.db)
+
+          assert DB.query(ctx.db, "SELECT rowid,* FROM wake_retry_attempts ORDER BY rowid") ==
+                   before_rows
+
+          assert :ok = Tightbeam.Schema.ensure_all(ctx.db)
+
+          assert DB.query(ctx.db, "SELECT rowid,* FROM wake_retry_attempts ORDER BY rowid") ==
+                   before_rows
+
+          assert {:ok, [[1]]} = DB.query(ctx.db, "PRAGMA foreign_keys")
+          assert {:ok, [[0]]} = DB.query(ctx.db, "PRAGMA legacy_alter_table")
+          assert {:ok, []} = DB.query(ctx.db, "PRAGMA foreign_key_check")
+
+          assert {:ok, {:ok, %{wake: ^recovery, replay: true}}} =
+                   recover_notice(ctx.db, root.wake_id, "session:notice-parent")
+        end
+      end
+    end
+
     test "failed delegated delivery recovers to the still-active exact-item opener", ctx do
       {assignment, _sibling, _delegation} = terminal_delegated_fixture(ctx)
 

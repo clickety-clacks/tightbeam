@@ -248,6 +248,60 @@ defmodule Tightbeam.SchemaShapeTest do
     %{db: name}
   end
 
+  test "retry source migration refuses unknown columns without rewriting the table", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    assert :ok =
+             DB.execute(
+               db,
+               "ALTER TABLE wake_retry_attempts ADD COLUMN unknownRetryContract TEXT"
+             )
+
+    before =
+      DB.query(
+        db,
+        "SELECT type,name,sql FROM sqlite_master WHERE tbl_name='wake_retry_attempts' ORDER BY type,name"
+      )
+
+    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
+    assert error.message =~ "incompatible_wake_retry_source_scope: malformed retry table"
+
+    assert DB.query(
+             db,
+             "SELECT type,name,sql FROM sqlite_master WHERE tbl_name='wake_retry_attempts' ORDER BY type,name"
+           ) == before
+
+    assert {:ok, [[1]]} = DB.query(db, "PRAGMA foreign_keys")
+    assert {:ok, [[0]]} = DB.query(db, "PRAGMA legacy_alter_table")
+  end
+
+  test "retry source migration preserves an unknown table-bound object by refusing it", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    assert :ok =
+             DB.execute(
+               db,
+               "CREATE INDEX custom_retry_contract ON wake_retry_attempts(observedAt)"
+             )
+
+    before =
+      DB.query(
+        db,
+        "SELECT type,name,sql FROM sqlite_master WHERE tbl_name='wake_retry_attempts' ORDER BY type,name"
+      )
+
+    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
+    assert error.message =~ "incompatible_wake_retry_source_scope: unknown table-bound objects"
+
+    assert DB.query(
+             db,
+             "SELECT type,name,sql FROM sqlite_master WHERE tbl_name='wake_retry_attempts' ORDER BY type,name"
+           ) == before
+
+    assert {:ok, [[1]]} = DB.query(db, "PRAGMA foreign_keys")
+    assert {:ok, [[0]]} = DB.query(db, "PRAGMA legacy_alter_table")
+  end
+
   @tag firehose_final_stamp: true
   test "a fresh database is created and stamped", %{db: db} do
     assert :ok = Schema.ensure_all(db)

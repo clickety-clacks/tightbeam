@@ -1706,10 +1706,136 @@ defmodule Tightbeam.Schema do
     # only after all predecessor migrations and refusal checks have completed
     # and the complete batch schema exists.
     :ok = migrate_supervision_batch_delivery_guards(db)
+    :ok = migrate_wake_retry_source_scope(db)
 
     case DB.finish_schema(db) do
       :ok -> :ok
       {:error, error} -> raise error
+    end
+  end
+
+  @wake_retry_previous_ddl """
+  CREATE TABLE wake_retry_attempts (
+    wakeId TEXT PRIMARY KEY REFERENCES wakes(wakeId),
+    rootWakeId TEXT NOT NULL REFERENCES wakes(wakeId),
+    predecessorWakeId TEXT UNIQUE REFERENCES wakes(wakeId),
+    attempt INTEGER NOT NULL CHECK (attempt >= 0),
+    sourceTurnSeq INTEGER UNIQUE REFERENCES turns(seq),
+    outcome TEXT NOT NULL CHECK (outcome IN ('pending','failed','acted','canceled')),
+    retryWakeId TEXT UNIQUE REFERENCES wakes(wakeId),
+    observedAt INTEGER NOT NULL,
+    UNIQUE (rootWakeId, attempt)
+  );
+  """
+  @wake_retry_source_scoped_ddl @wake_retry_previous_ddl
+                                |> String.replace(
+                                  "sourceTurnSeq INTEGER UNIQUE",
+                                  "sourceTurnSeq INTEGER"
+                                )
+                                |> String.replace(
+                                  "UNIQUE (rootWakeId, attempt)",
+                                  "UNIQUE (rootWakeId, attempt), UNIQUE (rootWakeId, sourceTurnSeq)"
+                                )
+  @wake_retry_root_index_ddl "CREATE INDEX wake_retry_root ON wake_retry_attempts (rootWakeId, attempt)"
+
+  # A failed carrier is one invocation of several independent semantic sources.
+  # Each source retains its own retry root and may bind to that same invocation.
+  # Qualify the exact historical/current table; preserve rows and all other guards.
+  # This final pass runs only after predecessor qualifications have succeeded.
+  defp migrate_wake_retry_source_scope(db) do
+    case DB.migration_transaction(
+           db,
+           :wake_retry_source_scope,
+           ["PRAGMA foreign_keys=OFF", "PRAGMA legacy_alter_table=ON"],
+           ["PRAGMA legacy_alter_table=OFF", "PRAGMA foreign_keys=ON"],
+           fn txn ->
+             [[actual]] =
+               Txn.q(
+                 txn,
+                 "SELECT sql FROM sqlite_master WHERE type='table' AND name='wake_retry_attempts'"
+               )
+
+             actual =
+               actual
+               |> String.replace(~s("wake_retry_attempts"), "wake_retry_attempts")
+               |> normalize_schema_sql()
+
+             objects =
+               Txn.q(txn, """
+               SELECT type,name,sql FROM sqlite_master
+               WHERE tbl_name='wake_retry_attempts' AND sql IS NOT NULL AND type IN ('index','trigger')
+               ORDER BY type,name
+               """)
+
+             unless match?([["index", "wake_retry_root", _]], objects) and
+                      normalize_schema_sql(objects |> hd() |> List.last()) ==
+                        normalize_schema_sql(@wake_retry_root_index_ddl) do
+               raise ShapeError,
+                 message: "incompatible_wake_retry_source_scope: unknown table-bound objects"
+             end
+
+             root_index_sql = objects |> hd() |> List.last()
+
+             cond do
+               actual == normalize_schema_sql(@wake_retry_source_scoped_ddl) ->
+                 :ok
+
+               actual == normalize_schema_sql(@wake_retry_previous_ddl) ->
+                 unless Txn.q(
+                          txn,
+                          "SELECT name FROM sqlite_master WHERE name='wake_retry_attempts_source_scope'"
+                        ) == [] do
+                   raise ShapeError,
+                     message:
+                       "incompatible_wake_retry_source_scope: temporary object already exists"
+                 end
+
+                 target =
+                   String.replace(
+                     @wake_retry_source_scoped_ddl,
+                     "wake_retry_attempts",
+                     "wake_retry_attempts_source_scope"
+                   )
+
+                 :ok = Txn.exec(txn, target)
+
+                 :ok =
+                   Txn.exec(txn, """
+                   INSERT INTO wake_retry_attempts_source_scope
+                     (rowid,wakeId,rootWakeId,predecessorWakeId,attempt,sourceTurnSeq,outcome,retryWakeId,observedAt)
+                   SELECT rowid,wakeId,rootWakeId,predecessorWakeId,attempt,sourceTurnSeq,outcome,retryWakeId,observedAt
+                   FROM wake_retry_attempts;
+                   DROP TABLE wake_retry_attempts;
+                   ALTER TABLE wake_retry_attempts_source_scope RENAME TO wake_retry_attempts;
+                   """)
+
+                 # Preserve the qualified predecessor index's exact stored SQL.
+                 :ok = Txn.exec(txn, root_index_sql)
+
+                 unless Txn.q(txn, "PRAGMA foreign_key_check(wake_retry_attempts)") == [] do
+                   raise ShapeError,
+                     message:
+                       "incompatible_wake_retry_source_scope: invalid retry lineage references"
+                 end
+
+                 :ok
+
+               true ->
+                 raise ShapeError,
+                   message: "incompatible_wake_retry_source_scope: malformed retry table"
+             end
+           end
+         ) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "wake retry source migration failed and rolled back: #{Exception.message(error)}"
     end
   end
 
