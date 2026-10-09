@@ -62,6 +62,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
     db = :"brackets_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
     start_supervised!({ConnRegistry, name: ConnRegistry})
+    start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, Tightbeam.LaneManager})
 
     :ok = Tightbeam.Schema.ensure_all(db)
 
@@ -931,20 +932,28 @@ defmodule Tightbeam.WorkItemBracketsTest do
         [%{delivery_wake_id: carrier_wake_id}] = NoticeBatcher.source_refs(db, source_wake_id)
         carrier = Wakes.get(db, carrier_wake_id)
 
-        {:ok, {:appended, _, _, _}} =
-          DB.transaction(db, fn txn ->
-            Gateway.deliver_prompt_in_txn(
-              txn,
-              carrier.session_key,
-              carrier.origin,
-              carrier.prompt,
-              wake_id: carrier.wake_id,
-              sender: carrier.origin,
-              target_gate: carrier,
-              fire_wake_in_txn: true
-            )
-          end)
+        # Recovery has already committed the actual carrier turn. Replaying
+        # that carrier must return its existing turn, never append again.
+        assert {:ok, {:duplicate, %{wake_id: ^carrier_wake_id, turn_seq: turn_seq}}} =
+                 DB.transaction(db, fn txn ->
+                   Gateway.deliver_prompt_in_txn(
+                     txn,
+                     carrier.session_key,
+                     carrier.origin,
+                     carrier.prompt,
+                     wake_id: carrier.wake_id,
+                     sender: carrier.origin,
+                     target_gate: carrier,
+                     fire_wake_in_txn: true
+                   )
+                 end)
 
+        assert {:ok, [[^turn_seq]]} =
+                 DB.query(db, "SELECT seq FROM turns WHERE wakeId=?1", [carrier_wake_id])
+
+        assert source_wake_id in Enum.map(Wakes.digest_members(db, carrier_wake_id), & &1.wake_id)
+        assert Wakes.get(db, source_wake_id).state == "fired"
+        assert Wakes.get(db, carrier_wake_id).state == "fired"
         finish_delivery_queue(db, carrier.session_key)
 
       {:appended, _, _, _} ->
