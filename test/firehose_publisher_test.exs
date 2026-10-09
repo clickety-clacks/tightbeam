@@ -754,6 +754,14 @@ defmodule Tightbeam.Firehose.PublisherTest do
   end
 
   test "0.1.9 operator decisions emit opened, ruled, and withdrawn classes" do
+    start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
+
+    start_supervised!(
+      Supervisor.child_spec({LaneStub, name: Tightbeam.LaneManager},
+        id: :operator_decisions_delivery_lane
+      )
+    )
+
     db = :firehose_operator_decisions_db
     scheduler = :firehose_operator_decisions_scheduler
     start_supervised!({DB, path: ":memory:", name: db})
