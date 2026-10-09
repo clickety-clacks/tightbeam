@@ -49,17 +49,23 @@ new yes before acting; read-only inventory can proceed while waiting.
    [old-install cleanup](#remove-the-old-npm-installation). Remove only the
    verified obsolete npm package and links, then check that the service,
    operator shell, and satellites cannot load the stale CLI or gateway.
-7. Recommend refreshing each learned kungfu when the user chooses. Main can
-   run the single relearn command and walk the user through any conflicts as
-   described below. Relearning is a user choice after the upgrade, not a
-   prerequisite to restart the gateway.
+7. Complete the upgrade with guided relearn, or record the user's explicit
+   deferral. Have Main explain the installed guidance changes, run
+   `tightbeam identity relearn` when the user chooses, and guide each conflict
+   choice as described below; never silently select either version. Restarting
+   the gateway is not upgrade completion: without relearn, 0.1.9 code can run
+   with 0.1.8 guidance, and no staleness notice appears until a new identity is
+   published.
    Before refreshing sessions, explain that `tightbeam identity apply --all`
    updates their Tightbeam-owned skill files and asks them to re-read without
    reloading their current model context, and obtain the user's confirmation.
    After relearn (or `relearn --resolve`) publishes the merged identity, run
    `tightbeam identity apply --all` at a boundary that does not interrupt running
-   turns, then read `tightbeam identity status`. Do not call the relearn done
-   while any session you are responsible for remains stale.
+   turns, then require `tightbeam identity status` to show no conflicts and no
+   stale sessions. The upgrade is complete only after guided relearn, apply to
+   all sessions, and that clean status, or a recorded user deferral that names
+   the remaining guidance/session mismatch; do not report deferred refresh as
+   completed relearn.
 
 ## 0.1.8 to 0.1.9 database rehearsal
 

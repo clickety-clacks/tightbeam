@@ -1770,42 +1770,65 @@ defmodule Tightbeam.Placement do
     fn classification, event ->
       if classification == :terminal do
         Task.Supervisor.start_child(Tightbeam.TurnTaskSupervisor, fn ->
-          try do
-            HarnessHealth.observe_provider_invalidation(db, module.id(), host, event,
-              principal: "process:tightbeam/provider:#{module.credential_provider()}"
-            )
-          rescue
-            error ->
-              Logger.error(
-                "harness auth incident record failed for #{module.id()} on #{host}: " <>
-                  Exception.format(:error, error, __STACKTRACE__)
-              )
-          end
-
-          mark_result =
-            try do
-              Tightbeam.Credentials.mark_terminal(
-                module.credential_provider(),
-                event,
-                Tightbeam.Credentials.server(host)
-              )
-            catch
-              :exit, reason -> {:error, {:credential_owner_exit, reason}}
-            end
-
-          case mark_result do
-            :ok ->
-              :ok
-
-            {:error, reason} ->
-              Logger.error(
-                "credential park failed for #{module.credential_provider()} on #{host}: #{inspect(reason)}"
-              )
-          end
+          persist_terminal_auth_event(db, host, module, event)
         end)
 
         :ok
       end
+    end
+  end
+
+  defp persist_terminal_auth_event(db, host, module, event) do
+    suppression_result =
+      try do
+        Tightbeam.Credentials.suppress_fresh_subscription_auth_none(
+          module.credential_provider(),
+          event,
+          Tightbeam.Credentials.server(host)
+        )
+      catch
+        :exit, reason -> {:error, {:credential_owner_exit, reason}}
+      end
+
+    case suppression_result do
+      :ignored ->
+        Logger.warning(
+          "ignored the first Claude logged-out status within the fresh subscription window on #{host}; waiting for another adapter status"
+        )
+
+      _continue ->
+        try do
+          HarnessHealth.observe_provider_invalidation(db, module.id(), host, event,
+            principal: "process:tightbeam/provider:#{module.credential_provider()}"
+          )
+        rescue
+          error ->
+            Logger.error(
+              "harness auth incident record failed for #{module.id()} on #{host}: " <>
+                Exception.format(:error, error, __STACKTRACE__)
+            )
+        end
+
+        mark_result =
+          try do
+            Tightbeam.Credentials.mark_terminal(
+              module.credential_provider(),
+              event,
+              Tightbeam.Credentials.server(host)
+            )
+          catch
+            :exit, reason -> {:error, {:credential_owner_exit, reason}}
+          end
+
+        case mark_result do
+          :ok ->
+            :ok
+
+          {:error, reason} ->
+            Logger.error(
+              "credential park failed for #{module.credential_provider()} on #{host}: #{inspect(reason)}"
+            )
+        end
     end
   end
 

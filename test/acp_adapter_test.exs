@@ -3012,6 +3012,143 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert Process.alive?(adapter)
   end
 
+  test "the first Claude logged-out status after a fresh subscription bank is nonterminal" do
+    owner = self()
+
+    base =
+      Path.join(
+        System.tmp_dir!(),
+        "tb-claude-auth-confirm-#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf!(base) end)
+    home = Tightbeam.Homes.home_path(base, "testhost", :claude)
+    metadata_dir = Path.join(home, ".tightbeam")
+    File.mkdir_p!(metadata_dir)
+
+    File.write!(
+      Path.join(home, ".credentials.json"),
+      JSON.encode!(%{
+        "claudeAiOauth" => %{
+          "accessToken" => "subscription-access-fixture",
+          "refreshToken" => "refresh-token-fixture",
+          "expiresAt" => System.system_time(:millisecond) + 600_000
+        }
+      })
+    )
+
+    credential_metadata_path = Path.join(metadata_dir, "credential.json")
+
+    File.write!(
+      credential_metadata_path,
+      JSON.encode!(%{
+        "provider" => "anthropic",
+        "onboarded" => true,
+        "terminal" => false,
+        "kind" => "subscription",
+        "onboarded_at_ms" => System.system_time(:millisecond),
+        "last_health" => "onboarded"
+      })
+    )
+
+    db = String.to_atom("claude_auth_confirm_db_#{System.unique_integer([:positive])}")
+    start_supervised!({Tightbeam.DB, path: ":memory:", name: db})
+    :ok = Tightbeam.Schema.ensure_all(db)
+    Tightbeam.Archetypes.load!(base)
+    Tightbeam.Rails.load!(base)
+    start_supervised!({Task.Supervisor, name: Tightbeam.TurnTaskSupervisor})
+
+    sh = fn
+      argv ->
+        if Enum.any?(argv, &String.contains?(&1, "api.anthropic.com")) do
+          send(owner, {:unexpected_provider_probe, argv})
+        end
+
+        {"", 0}
+    end
+
+    park_receiver =
+      start_supervised!(
+        {Tightbeam.CredentialParkTestReceiver,
+         fn :anthropic ->
+           send(owner, :claude_credential_parked)
+           :ok
+         end}
+      )
+
+    credential_owner = Tightbeam.Credentials.server("testhost")
+
+    start_supervised!(
+      {Tightbeam.Credentials,
+       name: credential_owner,
+       base_dir: base,
+       machine: "testhost",
+       park_edge: Tightbeam.CommandEdge.request_to(park_receiver)}
+    )
+
+    placement_opts =
+      Tightbeam.Placement.adapter_opts!(
+        %{
+          base_dir: base,
+          db: db,
+          cwd: "/tmp",
+          cli_bin: Path.join(base, "bin"),
+          credential_kind: :subscription,
+          sh: sh
+        },
+        {:claude, "default", "testhost"}
+      )
+
+    {adapter, _capture_path} =
+      start_adapter(
+        harness: :claude,
+        on_auth_event: placement_opts[:on_auth_event],
+        on_ready: fn -> send(owner, :claude_adapter_booted) end
+      )
+
+    assert_ready(adapter, :claude_adapter_booted)
+
+    none = %{"authStatus" => %{"kind" => "none"}}
+    send(adapter, {:acp_notification, "_auth/status_update", none})
+
+    assert eventually(fn ->
+             credential_metadata_path
+             |> File.read!()
+             |> JSON.decode!()
+             |> Map.get("initial_auth_none_ignored") == true
+           end)
+
+    refute_receive :claude_credential_parked, 100
+    refute_receive {:unexpected_provider_probe, _argv}, 0
+    assert Tightbeam.Credentials.status(:anthropic, credential_owner) == :onboarded
+
+    assert {:ok, [[0]]} =
+             Tightbeam.DB.query(
+               db,
+               "SELECT COUNT(*) FROM harness_health_observations WHERE failureClass='auth-dead'"
+             )
+
+    # A later logged-out status remains terminal; the one-shot fresh-bank guard
+    # does not turn off legitimate revocation handling.
+    send(adapter, {:acp_notification, "_auth/status_update", none})
+    assert_receive :claude_credential_parked
+
+    assert Tightbeam.Credentials.status(:anthropic, credential_owner) ==
+             {:needs_onboarding, :revoked}
+
+    assert eventually(fn ->
+             case Tightbeam.DB.query(
+                    db,
+                    "SELECT COUNT(*) FROM harness_health_observations WHERE failureClass='auth-dead'"
+                  ) do
+               {:ok, [[1]]} -> true
+               _ -> false
+             end
+           end)
+
+    assert Process.alive?(adapter)
+  end
+
   test "session updates reach the subagent marker callback with harness session identity" do
     owner = self()
 

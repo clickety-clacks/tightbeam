@@ -976,6 +976,57 @@ defmodule Tightbeam.CredentialsTest do
     assert Credentials.status(:openai, server) == :onboarded
   end
 
+  test "an established Claude subscription still terminalizes a logged-out status", ctx do
+    owner = self()
+
+    park_receiver =
+      start_supervised!(
+        {Tightbeam.CredentialParkTestReceiver,
+         fn :anthropic ->
+           send(owner, :claude_credential_parked)
+           :ok
+         end}
+      )
+
+    {:ok, server} =
+      start_credentials(
+        name: nil,
+        base_dir: ctx.base,
+        machine: "eezo",
+        park_edge: Tightbeam.CommandEdge.request_to(park_receiver)
+      )
+
+    home = Tightbeam.Homes.home_path(ctx.base, "eezo", :claude)
+    metadata_path = Path.join([home, ".tightbeam", "credential.json"])
+    File.mkdir_p!(Path.dirname(metadata_path))
+
+    File.write!(
+      metadata_path,
+      JSON.encode!(%{
+        "provider" => "anthropic",
+        "kind" => "subscription",
+        "onboarded" => true,
+        "terminal" => false,
+        "last_health" => "onboarded"
+      })
+    )
+
+    File.write!(
+      Tightbeam.Credentials.credential_path(ctx.base, "eezo", :anthropic),
+      ~s({"claudeAiOauth":{"accessToken":"established-access","refreshToken":"fixture"}})
+    )
+
+    assert :ok =
+             Credentials.mark_terminal(
+               :anthropic,
+               %{"authStatus" => %{"kind" => "none"}},
+               server
+             )
+
+    assert_receive :claude_credential_parked
+    assert Credentials.status(:anthropic, server) == {:needs_onboarding, :revoked}
+  end
+
   test "Claude no-subscription is a stable unsupported status", ctx do
     {:ok, server} =
       start_credentials(
