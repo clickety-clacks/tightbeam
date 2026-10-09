@@ -6472,7 +6472,19 @@ defmodule Tightbeam.Gateway do
     case call.params[:batch_id] do
       batch_id when is_binary(batch_id) and batch_id != "" ->
         principal = inspect_principal(call, caller)
-        Map.put(result, :batch, NoticeBatcher.read_batch(db, batch_id, principal))
+
+        sources =
+          NoticeBatcher.read_batch_sources(db, batch_id, principal)
+          |> Enum.map(fn source ->
+            if caller.owner_user_id == nil,
+              do: Map.take(source, [:wake_id, :session_key, :due_at, :prompt]),
+              else: source
+          end)
+          |> Enum.map(&inspect_wake(db, &1))
+
+        result
+        |> Map.put(:wakes, Enum.uniq_by(result.wakes ++ sources, & &1.wake_id))
+        |> Map.put(:batch, NoticeBatcher.read_batch(db, batch_id, principal))
 
       _ ->
         result

@@ -3279,6 +3279,7 @@ defmodule Tightbeam.GatewayTest do
   end
 
   @tag cold_gateway: true, gateway_role_binding: true, tmp_dir: true
+  @tag pr230_behavior_repair: true
   test "role wakes late-bind at fire time and deleted roles fail visibly", %{tmp_dir: tmp} do
     Tightbeam.GuardRuntimeFixture.run!(
       tmp,
@@ -3288,7 +3289,8 @@ defmodule Tightbeam.GatewayTest do
   end
 
   @tag cold_gateway: true, gateway_removed_batch: true, tmp_dir: true
-  test "removed role makes a notice batch terminally fail instead of claiming delivery", %{
+  @tag pr230_behavior_repair: true
+  test "removed role at readiness fails visibly without claiming delivery", %{
     tmp_dir: tmp
   } do
     Tightbeam.GuardRuntimeFixture.run!(
@@ -3298,6 +3300,7 @@ defmodule Tightbeam.GatewayTest do
     )
   end
 
+  @tag pr230_behavior_repair: true
   test "inspect exposes batch refs and denies a batch when any source is unauthorized", ctx do
     base_dir = role_test_base("notice-batch-inspect")
     Archetypes.load!(base_dir)
@@ -3323,7 +3326,12 @@ defmodule Tightbeam.GatewayTest do
 
     assert NoticeBatcher.source_refs(ctx.db, first.wake_id) == []
     assert NoticeBatcher.source_refs(ctx.db, second.wake_id) == []
-    assert [carrier_id] = Wakes.materialize_digests(ctx.db)
+
+    assert [carrier_id] =
+             NoticeBatcher.recover(ctx.db, System.system_time(:millisecond),
+               conn_registry: ctx.registry,
+               lane_manager: ctx.lane
+             )
 
     [%{batch_id: batch_id}] = NoticeBatcher.source_refs(ctx.db, first.wake_id)
 
@@ -4660,9 +4668,21 @@ defmodule Tightbeam.GatewayTest do
     refute message =~ "Run on #{machine}: tightbeam onboard"
   end
 
+  @tag pr230_behavior_repair: true
   test "register-host supervises credentials and refuses spawn until onboarding", ctx do
     machine = "credential-worker-registration"
     base_dir = move_test_base(ctx.db, "credential-server-registration", machine)
+
+    # The credential runner below is injected. Supply its executable discovery
+    # prerequisite even on a test image without SSH; actual SSH is forbidden.
+    probe_bin = Path.join(base_dir, "credential-probe-bin")
+    File.mkdir_p!(probe_bin)
+    probe_ssh = Path.join(probe_bin, "ssh")
+    File.write!(probe_ssh, "#!/bin/sh\nprintf unexpected > \"$0.executed\"\nexit 64\n")
+    File.chmod!(probe_ssh, 0o755)
+    previous_path = System.fetch_env!("PATH")
+    System.put_env("PATH", probe_bin <> ":" <> previous_path)
+    on_exit(fn -> System.put_env("PATH", previous_path) end)
 
     File.write!(
       Path.join(base_dir, "gateway.json"),
@@ -4769,6 +4789,7 @@ defmodule Tightbeam.GatewayTest do
     assert is_pid(second_pid)
     refute second_pid == first_pid
     assert Credentials.status(:anthropic, server) == {:needs_onboarding, :missing}
+    refute File.exists?(probe_ssh <> ".executed")
     second_commands = collect_credential_commands([])
     assert second_commands != []
     assert Enum.all?(second_commands, &(Enum.join(&1, " ") =~ "/remote/new-tb"))
@@ -9501,6 +9522,7 @@ defmodule Tightbeam.GatewayTest do
   # T-CONCURRENCY, settled the other way: apply changes FILES, not the world a
   # running turn has already composed, so there is no boundary to wait for and no
   # turn to refuse. A running turn is applied through, not deferred.
+  @tag pr230_behavior_repair: true
   test "identity apply proceeds through a running turn without refusing or waiting", ctx do
     base_dir = role_test_base("identity-apply-running")
     learn_engineering_identity!(base_dir)
@@ -9605,11 +9627,15 @@ defmodule Tightbeam.GatewayTest do
     :ok = Ledger.finish(ctx.db, seq, "delivered", nil, owner_lease: lease)
 
     [carrier_id] =
-      NoticeBatcher.recover(ctx.db, System.system_time(:millisecond) + 1_000)
+      NoticeBatcher.recover(ctx.db, System.system_time(:millisecond) + 1_000,
+        lane_manager: ctx.lane
+      )
 
     carrier = Wakes.get(ctx.db, carrier_id)
 
-    assert {:ok, {:appended, ^session_key, delivery_message, _opts}} =
+    # The readiness transaction already committed the delivery. Replaying the
+    # same carrier must return that message rather than append a second turn.
+    assert {:ok, {:duplicate, %{wake_id: ^carrier_id, turn_seq: delivery_seq}}} =
              DB.transaction(ctx.db, fn txn ->
                Gateway.deliver_prompt_in_txn(
                  txn,
@@ -9623,11 +9649,23 @@ defmodule Tightbeam.GatewayTest do
                )
              end)
 
-    assert delivery_message.content =~ "[from process:tightbeam]"
-    assert delivery_message.content =~ prompt
+    assert {:ok, [[^session_key, delivery_content]]} =
+             DB.query(
+               ctx.db,
+               "SELECT t.sessionKey,m.content FROM turns t JOIN messages m ON m.id=t.messageId WHERE t.seq=?1",
+               [delivery_seq]
+             )
+
+    assert delivery_content =~ "[from process:tightbeam]"
+    assert delivery_content =~ prompt
 
     assert {:ok, [[1]]} =
              DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [carrier_id])
+
+    assert [%{delivery_wake_id: ^carrier_id, member_state: "included"}] =
+             NoticeBatcher.source_refs(ctx.db, source.wake_id)
+
+    assert [] = NoticeBatcher.recover(ctx.db, System.system_time(:millisecond) + 1_000)
   end
 
   # Regression: spawn creates the harness session LAZILY, so a freshly spawned
@@ -10103,6 +10141,7 @@ defmodule Tightbeam.GatewayTest do
   # set, and that is allowed. Apply makes no atomic-snapshot and no single-revision
   # claim, so nothing rolls the written file back and nothing repairs it; the
   # unwritten one stays as it was and the prior stamp stands.
+  @tag pr230_behavior_repair: true
   test "a failure between two skill writes leaves the partial file set and no stamp", ctx do
     base_dir = role_test_base("identity-apply-partial")
     learn_engineering_identity!(base_dir)

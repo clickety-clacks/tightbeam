@@ -464,22 +464,33 @@ defmodule Tightbeam.NoticeBatcher do
     restore_unclaimed_sources(db, at)
 
     {:ok, recipients} =
-      DB.transaction(db, fn txn ->
-        ready_sources_in_txn(txn, at)
-        |> Enum.flat_map(fn wake_id ->
-          case Wakes.get_in_txn(txn, wake_id) do
-            nil ->
-              []
+      DB.transaction_then(
+        db,
+        fn txn ->
+          ready_sources_in_txn(txn, at)
+          |> Enum.flat_map(fn wake_id ->
+            case Wakes.get_in_txn(txn, wake_id) do
+              nil ->
+                []
 
-            wake ->
-              case source_delivery_target(txn, wake) do
-                {target, _, _} -> [target]
-                nil -> []
-              end
-          end
-        end)
-        |> Enum.uniq()
-      end)
+              wake ->
+                case source_delivery_target(txn, wake) do
+                  {target, _, _} ->
+                    [target]
+
+                  nil ->
+                    dispose_missing_role_in_txn(txn, wake, at)
+                    []
+                end
+            end
+          end)
+          |> Enum.uniq()
+        end,
+        fn txn, recipients ->
+          Wakes.row_commit_in_txn(txn, [])
+          recipients
+        end
+      )
 
     deliveries =
       Enum.flat_map(recipients, fn target ->
@@ -612,6 +623,40 @@ defmodule Tightbeam.NoticeBatcher do
 
   defp same_delivery_target?({key, _, _}, {key, _, _}) when is_binary(key), do: true
   defp same_delivery_target?(_, _), do: false
+
+  # A removed role cannot produce a recipient boundary. Preserve the source
+  # and the scheduler's visible unresolved disposition instead of silently
+  # leaving it pending forever. Other unresolved targets retain their existing
+  # supervision/terminal-recognition obligations.
+  defp dispose_missing_role_in_txn(txn, %{target_role: role} = wake, at)
+       when is_binary(role) do
+    with [] <- Txn.q(txn, "SELECT 1 FROM roles WHERE name=?1", [role]),
+         true <- prepare_due_source_in_txn(txn, wake.wake_id),
+         %{state: "pending", target_role: ^role} = source <- Wakes.get_in_txn(txn, wake.wake_id),
+         nil <- source_delivery_target(txn, source) do
+      Txn.q(
+        txn,
+        "UPDATE wakes SET state='fired',firedAt=COALESCE(firedAt,?2) WHERE wakeId=?1 AND state='pending'",
+        [wake.wake_id, at]
+      )
+
+      if Txn.changes(txn) == 1 do
+        EventLog.lifecycle_in_txn(
+          txn,
+          "wake_unresolved",
+          wake.wake_id,
+          "role #{role} no longer exists"
+        )
+
+        Wakes.publish_change_in_txn(txn, "wake.fired", wake.wake_id)
+        Wakes.settle_batched_wait_in_txn(txn, wake.wake_id, "delivery-failed")
+      end
+    else
+      _ -> :ok
+    end
+  end
+
+  defp dispose_missing_role_in_txn(_txn, _wake, _at), do: :ok
 
   defp ready_sources_in_txn(txn, at) do
     Txn.q(
@@ -1005,6 +1050,30 @@ defmodule Tightbeam.NoticeBatcher do
     end
   end
 
+  @doc "Read individually authorized sources without disclosing a denied batch envelope."
+  def read_batch_sources(db, batch_id, principal) do
+    {:ok, sources} =
+      DB.transaction(db, fn txn ->
+        Txn.q(
+          txn,
+          "SELECT sourceWakeId FROM notice_batch_members WHERE batchId=?1 ORDER BY publicationSeq",
+          [batch_id]
+        )
+        |> Enum.flat_map(fn [wake_id] ->
+          if source_readable?(txn, wake_id, principal) do
+            case Wakes.get_in_txn(txn, wake_id) do
+              nil -> []
+              source -> [source]
+            end
+          else
+            []
+          end
+        end)
+      end)
+
+    sources
+  end
+
   @spec members(GenServer.server(), String.t()) :: [map()]
   def members(db \\ Tightbeam.DB, batch_id) do
     {:ok, rows} =
@@ -1099,6 +1168,8 @@ defmodule Tightbeam.NoticeBatcher do
   end
 
   defp source_readable?(_db, _source_wake_id, _principal), do: false
+
+  defp row_exists?(%Txn{} = txn, sql, params), do: Txn.q(txn, sql, params) == [[1]]
 
   defp row_exists?(db, sql, params) do
     case DB.query(db, sql, params) do

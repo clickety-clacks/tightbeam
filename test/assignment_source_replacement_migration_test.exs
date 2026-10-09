@@ -4,7 +4,7 @@ defmodule Tightbeam.AssignmentSourceReplacementMigrationTest do
   alias Tightbeam.{DB, Model, Org, Schema, Wakes}
 
   @predecessor "work-item-delivery-owner-v1-019"
-  @successor "assignment-source-replacement-v1-019"
+  @successor "notice-source-storage-v1-019"
   @replacement_route ~r/\(requesterId = 'tightbeam:assignments' AND reasonKind = 'superseded' AND\s+causalSourceKind = 'wake' AND outcomeKind = 'replacement'\)\s+OR/
   @cancellation_columns "wakeId,wakeState,canceledAt,requesterKind,requesterId,reasonKind," <>
                           "causalSourceKind,causalSourceId,outcomeKind,replacementWakeId," <>
@@ -91,6 +91,8 @@ defmodule Tightbeam.AssignmentSourceReplacementMigrationTest do
   end
 
   defp downgrade_to_receipt_cancellation_predecessor!(db) do
+    Tightbeam.SchemaShapeRuntimeFixture.downgrade_notice_source_storage!(db)
+
     assert [[current_sql]] =
              rows(
                db,
