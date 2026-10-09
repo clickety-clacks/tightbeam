@@ -2129,10 +2129,10 @@ defmodule Tightbeam.EscalationTest do
                [missing_event.id]
              )
 
-    assert {:ok, _} =
+    assert {:ok, [[1]]} =
              DB.query(
                ctx.db,
-               "DELETE FROM notice_delivery_policies WHERE sourceWakeId IN (SELECT wakeId FROM wakes WHERE conditionKind='escalation-ruled' AND conditionScope=?1)",
+               "SELECT COUNT(*) FROM wakes WHERE conditionKind='escalation-ruled' AND conditionScope=?1",
                [missing_wake.id]
              )
 
@@ -2140,6 +2140,13 @@ defmodule Tightbeam.EscalationTest do
              DB.query(
                ctx.db,
                "DELETE FROM wakes WHERE conditionKind='escalation-ruled' AND conditionScope=?1",
+               [missing_wake.id]
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE conditionKind='escalation-ruled' AND conditionScope=?1",
                [missing_wake.id]
              )
 
@@ -2295,10 +2302,10 @@ defmodule Tightbeam.EscalationTest do
                [legacy_ruled.ruling_fact_id]
              )
 
-    assert {:ok, _} =
+    assert {:ok, [[1]]} =
              DB.query(
                ctx.db,
-               "DELETE FROM notice_delivery_policies WHERE sourceWakeId IN (SELECT wakeId FROM wakes WHERE conditionKind='escalation-ruled' AND conditionScope=?1)",
+               "SELECT COUNT(*) FROM wakes WHERE conditionKind='escalation-ruled' AND conditionScope=?1",
                [legacy.id]
              )
 
@@ -2306,6 +2313,13 @@ defmodule Tightbeam.EscalationTest do
              DB.query(
                ctx.db,
                "DELETE FROM wakes WHERE conditionKind='escalation-ruled' AND conditionScope=?1",
+               [legacy.id]
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE conditionKind='escalation-ruled' AND conditionScope=?1",
                [legacy.id]
              )
 
