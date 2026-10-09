@@ -211,6 +211,7 @@ defmodule Tightbeam.TerminalCredentialFailure do
                  "artifact-origin-v1-019",
                  "identity-publication-denial-diagnostic-v1-019",
                  "assignment-source-replacement-v1-019",
+                 "notice-source-storage-v1-019",
                  "work-item-delivery-owner-v1-019"
                ] ->
             readonly_views_from_conn(conn)

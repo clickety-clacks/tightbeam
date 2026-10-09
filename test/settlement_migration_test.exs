@@ -61,7 +61,7 @@ defmodule Tightbeam.SettlementMigrationTest do
     assert Regex.match?(@assignment_replacement_route, wake_cancellations_ddl)
     assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
 
-    assert {:ok, [["assignment-source-replacement-v1-019"]]} =
+    assert {:ok, [["notice-source-storage-v1-019"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert {:ok, [["prior-fingerprint", ~s({"prior":true}), nil]]} =
