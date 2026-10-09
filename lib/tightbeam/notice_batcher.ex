@@ -805,21 +805,74 @@ defmodule Tightbeam.NoticeBatcher do
     else
       first = hd(sources)
 
-      context = %{
-        session_key: target,
-        target_role: nil,
-        recipient_address: address,
-        visibility_scope: scope,
-        policy_revision: @policy_revision,
-        deadline_at: Enum.min(Enum.map(sources, & &1.due_at)),
-        created_at: first.created_at,
-        wake_id: first.wake_id
-      }
+      boundary = latest_turn_end(txn, target, nil)
 
-      batch = create_batch(txn, context, 0)
+      cause =
+        if is_integer(boundary) and boundary > first.created_at, do: "turn-boundary", else: "idle"
+
+      batch_id = "nb_" <> Tightbeam.Id.uuid4()
+      wake_id = delivery_wake_id(batch_id)
+      token = delivery_token(batch_id)
+      rendered = envelope(batch_id, cause, rows)
+
+      work =
+        sources
+        |> Enum.map(&[&1.work_item_id, &1.assignment_id])
+        |> Enum.reject(&(&1 == [nil, nil]))
+        |> Enum.uniq()
+
+      {work_item_id, assignment_id} =
+        case work do
+          [[item, assignment]] -> {item, assignment}
+          _ -> {nil, nil}
+        end
+
+      # Selection, frozen membership and the actual turn share this transaction.
+      # There is no provisional per-address open/seal/arm delivery queue.
+      carrier =
+        Wakes.schedule_in_txn(txn, %{
+          wake_id: wake_id,
+          session_key: target,
+          target_role: nil,
+          origin: "process:tightbeam",
+          prompt: rendered,
+          due_at: at,
+          class: "fyi",
+          digest: true,
+          target_gate: first.target_gate,
+          work_item_id: work_item_id,
+          assignment_id: assignment_id
+        })
+
+      Txn.q(
+        txn,
+        """
+        INSERT INTO notice_batches(batchId,recipientAddress,sessionKey,targetRole,
+          visibilityScope,policyRevision,state,dueAt,openedAt,sealedAt,releaseCause,
+          deliveryToken,envelope,envelopeSha256,deliveryWakeId,memberCount,renderedBytes)
+        VALUES(?1,?2,?3,NULL,?4,?5,'delivery_pending',?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+        """,
+        [
+          batch_id,
+          address,
+          target,
+          scope,
+          @policy_revision,
+          Enum.min(Enum.map(sources, & &1.due_at)),
+          first.created_at,
+          at,
+          cause,
+          token,
+          rendered,
+          sha256(rendered),
+          wake_id,
+          length(rows),
+          bytes
+        ]
+      )
 
       for {wake, row} <- Enum.zip(sources, rows) do
-        policy_ref = record_policy_in_txn(txn, wake, enabled: true)
+        policy_ref = policy_ref(wake.wake_id)
         member_id = "nbm_" <> Tightbeam.Id.uuid4()
         [_, _, cause, _, publication_seq, _] = row
 
@@ -829,11 +882,11 @@ defmodule Tightbeam.NoticeBatcher do
           INSERT INTO notice_batch_members(memberId,batchId,sourceWakeId,policyRef,
             recipientAddress,visibilityScope,publicationSeq,policyRevision,senderPrincipal,
             cause,class,payload,renderedBytes,state,addedAt)
-          VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'fyi',?11,?12,'active',?13)
+          VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'fyi',?11,?12,'included',?13)
           """,
           [
             member_id,
-            batch.batch_id,
+            batch_id,
             wake.wake_id,
             policy_ref,
             address,
@@ -851,27 +904,21 @@ defmodule Tightbeam.NoticeBatcher do
         lifecycle(
           txn,
           "member_added",
-          batch.batch_id,
+          batch_id,
           member_id,
           wake.wake_id,
           "session-readiness"
         )
       end
 
-      Txn.q(txn, "UPDATE notice_batches SET memberCount=?2,renderedBytes=?3 WHERE batchId=?1", [
-        batch.batch_id,
-        length(rows),
-        bytes
-      ])
+      lifecycle(txn, "session_snapshot_admitted", batch_id, nil, nil, cause)
 
-      boundary = latest_turn_end(txn, target, nil)
-
-      cause =
-        if is_integer(boundary) and boundary > first.created_at, do: "turn-boundary", else: "idle"
-
-      :sealed = seal_open_batch_in_txn(txn, batch.batch_id, cause, at)
-      {:new, wake_id} = arm_in_txn(txn, batch.batch_id, at, cause)
-      carrier = Wakes.get_in_txn(txn, wake_id)
+      EventLog.lifecycle_in_txn(
+        txn,
+        "wake_digest_materialized",
+        wake_id,
+        "rule=#{@rule} batchId=#{batch_id} members=#{length(rows)} trigger=session-readiness"
+      )
 
       case Gateway.deliver_prompt_in_txn(
              txn,
