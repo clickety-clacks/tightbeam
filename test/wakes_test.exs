@@ -3,7 +3,7 @@ defmodule Tightbeam.WakesTest do
 
   import ExUnit.CaptureLog
 
-  alias Tightbeam.{DB, EventLog, Wakes}
+  alias Tightbeam.{DB, EventLog, NoticeBatcher, Wakes}
   alias Tightbeam.DB.Txn
 
   describe "terminal notification identity and payload (no admission)" do
@@ -519,7 +519,7 @@ defmodule Tightbeam.WakesTest do
 
     assert original.class == "fyi"
     assert original.class_election == "sender"
-    assert original.delivery_rule == "turn-boundary-digest r1"
+    assert original.delivery_rule == NoticeBatcher.rule()
     refute original.digest
     refute original.summon
 
@@ -585,7 +585,7 @@ defmodule Tightbeam.WakesTest do
       })
 
     assert original.summon
-    assert original.delivery_rule == Wakes.inhibited_rule()
+    assert original.delivery_rule == Wakes.digest_rule()
 
     assert {:ok, replacement} =
              DB.transaction(db, fn txn ->
@@ -597,9 +597,9 @@ defmodule Tightbeam.WakesTest do
     assert replacement.class_election == "sender"
     assert replacement.session_key == "b"
 
-    # The sender already named this moment (batcher-inhibited); retarget
-    # must not start batching it now.
-    assert replacement.delivery_rule == Wakes.inhibited_rule()
+    # Retarget preserves the selected ordinary batch route and sender-named
+    # delivery time; it does not restart the timing window.
+    assert replacement.delivery_rule == Wakes.digest_rule()
     assert replacement.due_at == original.due_at
   end
 
@@ -656,13 +656,19 @@ defmodule Tightbeam.WakesTest do
     db: db,
     scheduler: scheduler
   } do
+    active_sessions!(db, ["k1"])
     test_pid = self()
+    registry = :"registry_#{System.unique_integer([:positive])}"
+    lane = :"lane_#{System.unique_integer([:positive])}"
+    start_supervised!({Tightbeam.ConnRegistry, name: registry})
+    start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, lane})
 
     start_supervised!(
       {Wakes,
        db: db,
        name: scheduler,
        tick_ms: 60_000,
+       delivery_opts: [conn_registry: registry, lane_manager: lane],
        deliver: fn wake -> send(test_pid, {:delivered, wake}) end}
     )
 
@@ -671,38 +677,76 @@ defmodule Tightbeam.WakesTest do
         session_key: "k1",
         origin: "system",
         prompt: "now",
-        due_at: System.system_time(:millisecond)
+        due_at: System.system_time(:millisecond),
+        sender_scheduled: true
       })
 
+    assert Wakes.get(db, wake.wake_id).state == "pending"
+    assert NoticeBatcher.source_refs(db, wake.wake_id) == []
+    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM turns")
+
     assert :ok = Wakes.fire_due(scheduler)
-    assert_receive {:delivered, %{wake_id: wake_id, prompt: "now"}}
-    assert wake_id == wake.wake_id
-    assert Wakes.get(db, wake.wake_id).state == "fired"
+
+    assert [%{delivery_wake_id: carrier_id, member_state: "included", batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(db, wake.wake_id)
+
+    assert {:ok, [["k1", "queued", content]]} =
+             DB.query(
+               db,
+               "SELECT t.sessionKey,t.status,m.content FROM turns t JOIN messages m ON m.id=t.messageId WHERE t.wakeId=?1",
+               [carrier_id]
+             )
+
+    assert content =~ wake.wake_id
+    assert content =~ wake.prompt
+    assert %{state: "fired", fired_at: fired_at, prompt: "now"} = Wakes.get(db, wake.wake_id)
+    assert is_integer(fired_at)
+    assert Wakes.get(db, carrier_id).state == "fired"
+    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM turns")
+
+    assert {:ok, [[0]]} =
+             DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [wake.wake_id])
+
+    # Readiness committed the actual carrier; the legacy callback must not
+    # append it again, and another scheduler pass must leave all rows intact.
+    refute_receive {:delivered, _}
+    assert {:ok, before_turns} = DB.query(db, "SELECT * FROM turns ORDER BY seq")
+    assert {:ok, before_wakes} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
 
     assert :ok = Wakes.fire_due(scheduler)
     refute_receive {:delivered, _}
+    assert {:ok, ^before_turns} = DB.query(db, "SELECT * FROM turns ORDER BY seq")
+    assert {:ok, ^before_wakes} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
   end
 
   test "failed delivery leaves the wake pending; it retries and then fires", %{
     db: db,
     scheduler: scheduler
   } do
+    active_sessions!(db, ["k1"])
     test_pid = self()
     fail_first = :counters.new(1, [])
+    registry = :"registry_#{System.unique_integer([:positive])}"
+    lane = :"lane_#{System.unique_integer([:positive])}"
+    start_supervised!({Tightbeam.ConnRegistry, name: registry})
+    start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, lane})
+
+    deliver = fn wake ->
+      if :counters.get(fail_first, 1) == 0 do
+        :counters.add(fail_first, 1, 1)
+        raise "delivery blew up"
+      end
+
+      send(test_pid, {:delivered, wake})
+    end
 
     start_supervised!(
       {Wakes,
        db: db,
        name: scheduler,
        tick_ms: 60_000,
-       deliver: fn wake ->
-         if :counters.get(fail_first, 1) == 0 do
-           :counters.add(fail_first, 1, 1)
-           raise "delivery blew up"
-         end
-
-         send(test_pid, {:delivered, wake})
-       end}
+       delivery_opts: [conn_registry: registry, lane_manager: lane],
+       deliver: deliver}
     )
 
     wake =
@@ -710,18 +754,108 @@ defmodule Tightbeam.WakesTest do
         session_key: "k1",
         origin: "system",
         prompt: "flaky",
-        due_at: System.system_time(:millisecond)
+        due_at: System.system_time(:millisecond),
+        sender_scheduled: true
+      })
+
+    sibling =
+      Wakes.schedule(db, %{
+        session_key: "k1",
+        origin: "system",
+        prompt: "sibling survives retry",
+        due_at: wake.due_at,
+        sender_scheduled: true
+      })
+
+    assert {:ok, pending_roots} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
+
+    # Fail at actual Gateway turn insertion, after tentative membership and
+    # message creation. The entire recipient admission must roll back.
+    assert :ok =
+             DB.execute(db, """
+             CREATE TRIGGER refuse_retry_carrier BEFORE INSERT ON turns
+             WHEN EXISTS (
+               SELECT 1 FROM notice_batches b JOIN notice_batch_members m ON m.batchId=b.batchId
+               WHERE b.deliveryWakeId=NEW.wakeId AND m.sourceWakeId='#{wake.wake_id}'
+             )
+             BEGIN SELECT RAISE(ABORT,'forced readiness admission failure'); END
+             """)
+
+    log = capture_log(fn -> assert :ok = Wakes.fire_due(scheduler) end)
+    assert log =~ "notice session drain refused recipient=k1"
+    assert log =~ "forced readiness admission failure"
+    refute_receive {:delivered, _}
+    assert Wakes.get(db, wake.wake_id).state == "pending"
+    assert Wakes.get(db, sibling.wake_id).state == "pending"
+    assert {:ok, ^pending_roots} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
+    assert NoticeBatcher.source_refs(db, wake.wake_id) == []
+    assert NoticeBatcher.source_refs(db, sibling.wake_id) == []
+
+    for table <- ["turns", "messages", "notice_batches", "notice_batch_members"] do
+      assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM #{table}")
+    end
+
+    assert :counters.get(fail_first, 1) == 0
+    assert :ok = DB.execute(db, "DROP TRIGGER refuse_retry_carrier")
+
+    assert :ok = Wakes.fire_due(scheduler)
+
+    assert [%{delivery_wake_id: carrier_id, batch_id: batch_id, member_state: "included"}] =
+             NoticeBatcher.source_refs(db, wake.wake_id)
+
+    assert [%{delivery_wake_id: ^carrier_id, batch_id: ^batch_id, member_state: "included"}] =
+             NoticeBatcher.source_refs(db, sibling.wake_id)
+
+    assert {:ok, [["k1", "queued", content]]} =
+             DB.query(
+               db,
+               "SELECT t.sessionKey,t.status,m.content FROM turns t JOIN messages m ON m.id=t.messageId WHERE t.wakeId=?1",
+               [carrier_id]
+             )
+
+    for source <- [wake, sibling] do
+      assert content =~ source.wake_id
+      assert content =~ source.prompt
+      assert Wakes.get(db, source.wake_id).state == "fired"
+      assert Wakes.get(db, source.wake_id).prompt == source.prompt
+    end
+
+    assert %{state: "fired", fired_at: fired_at} = Wakes.get(db, wake.wake_id)
+    assert is_integer(fired_at)
+    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM turns")
+    assert {:ok, [[2]]} = DB.query(db, "SELECT COUNT(*) FROM notice_batch_members")
+    assert {:ok, before_turns} = DB.query(db, "SELECT * FROM turns ORDER BY seq")
+    assert {:ok, before_wakes} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
+    assert :ok = Wakes.fire_due(scheduler)
+    refute_receive {:delivered, _}
+    assert {:ok, ^before_turns} = DB.query(db, "SELECT * FROM turns ORDER BY seq")
+    assert {:ok, ^before_wakes} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
+
+    # Keep the original throwing callback as an exercised control on a
+    # supported legacy carrier; it is not normal source admission.
+    probe =
+      Wakes.schedule(db, %{
+        session_key: "k1",
+        origin: "process:tightbeam",
+        prompt: "callback retry control",
+        due_at: wake.due_at,
+        digest: true,
+        class: "fyi",
+        delivery_rule: "turn-boundary-digest r1"
       })
 
     assert :ok = Wakes.fire_due(scheduler)
+    assert Wakes.get(db, probe.wake_id).state == "pending"
+    assert :counters.get(fail_first, 1) == 1
     refute_receive {:delivered, _}
-    assert Wakes.get(db, wake.wake_id).state == "pending"
 
     assert :ok = Wakes.fire_due(scheduler)
-    assert_receive {:delivered, %{wake_id: wake_id}}
-    assert wake_id == wake.wake_id
-    assert %{state: "fired", fired_at: fired_at} = Wakes.get(db, wake.wake_id)
-    assert is_integer(fired_at)
+    assert_receive {:delivered, %{wake_id: probe_id, prompt: "callback retry control"}}
+    assert probe_id == probe.wake_id
+    assert Wakes.get(db, probe.wake_id).state == "fired"
+    assert :ok = Wakes.fire_due(scheduler)
+    refute_receive {:delivered, _}
+    assert {:ok, ^before_turns} = DB.query(db, "SELECT * FROM turns ORDER BY seq")
   end
 
   test "unknown internal consumer is consumed as canceled, never claimed as fired", %{
@@ -825,13 +959,19 @@ defmodule Tightbeam.WakesTest do
     db: db,
     scheduler: scheduler
   } do
+    active_sessions!(db, ["k1", "k2"])
     test_pid = self()
+    registry = :"registry_#{System.unique_integer([:positive])}"
+    lane = :"lane_#{System.unique_integer([:positive])}"
+    start_supervised!({Tightbeam.ConnRegistry, name: registry})
+    start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, lane})
 
     start_supervised!(
       {Wakes,
        db: db,
        name: scheduler,
        tick_ms: 60_000,
+       delivery_opts: [conn_registry: registry, lane_manager: lane],
        deliver: fn wake -> send(test_pid, {:nested_fired, wake.wake_id}) end,
        internal_consumers: %{
          "self_fire" => fn wake ->
@@ -840,7 +980,8 @@ defmodule Tightbeam.WakesTest do
                session_key: "k2",
                origin: "system",
                prompt: "nested",
-               due_at: System.system_time(:millisecond)
+               due_at: System.system_time(:millisecond),
+               sender_scheduled: true
              })
 
            :ok = Wakes.fire_due(self())
@@ -861,9 +1002,36 @@ defmodule Tightbeam.WakesTest do
     assert :ok = Wakes.fire_due(scheduler)
     assert_received {:self_fire_returned, wake_id, nested_wake_id}
     assert wake_id == wake.wake_id
-    assert_receive {:nested_fired, ^nested_wake_id}
+
+    # The self-enqueued pass precedes this mailbox barrier. This does not
+    # request another delivery pass and cannot mask a missing continuation.
+    _ = :sys.get_state(scheduler)
+    assert Process.alive?(GenServer.whereis(scheduler))
+
+    assert [%{delivery_wake_id: carrier_id, member_state: "included", batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(db, nested_wake_id)
+
+    assert {:ok, [["k2", "queued", content]]} =
+             DB.query(
+               db,
+               "SELECT t.sessionKey,t.status,m.content FROM turns t JOIN messages m ON m.id=t.messageId WHERE t.wakeId=?1",
+               [carrier_id]
+             )
+
+    assert content =~ nested_wake_id
+    assert content =~ "nested"
     assert Wakes.get(db, wake.wake_id).state == "canceled"
     assert Wakes.get(db, nested_wake_id).state == "fired"
+    assert Wakes.get(db, carrier_id).state == "fired"
+    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM turns")
+    refute_received {:nested_fired, _}
+
+    assert {:ok, before_turns} = DB.query(db, "SELECT * FROM turns ORDER BY seq")
+    assert {:ok, before_wakes} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
+    assert :ok = Wakes.fire_due(scheduler)
+    assert {:ok, ^before_turns} = DB.query(db, "SELECT * FROM turns ORDER BY seq")
+    assert {:ok, ^before_wakes} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
+    refute_received {:nested_fired, _}
   end
 
   test "future wakes are not claimed", %{db: db, scheduler: scheduler} do
@@ -890,19 +1058,13 @@ defmodule Tightbeam.WakesTest do
     assert Wakes.get(db, wake.wake_id).state == "pending"
   end
 
-  test "rumination markers count only after firing and are scoped by work-item and caller", %{
-    db: db,
-    scheduler: scheduler
-  } do
-    test_pid = self()
-
-    start_supervised!(
-      {Wakes,
-       db: db,
-       name: scheduler,
-       tick_ms: 60_000,
-       deliver: fn wake -> send(test_pid, {:delivered, wake}) end}
-    )
+  test "rumination markers count staged or delivered sources by work-item and caller", %{db: db} do
+    active_sessions!(db, ["k1", "caller"])
+    registry = :"registry_#{System.unique_integer([:positive])}"
+    lane = :"lane_#{System.unique_integer([:positive])}"
+    start_supervised!({Tightbeam.ConnRegistry, name: registry})
+    start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, lane})
+    delivery_opts = [conn_registry: registry, lane_manager: lane]
 
     wake =
       Wakes.schedule(db, %{
@@ -912,19 +1074,81 @@ defmodule Tightbeam.WakesTest do
         prompt: "digest: think first",
         due_at: System.system_time(:millisecond),
         rumination: true,
-        work_item_id: "wi_one"
+        work_item_id: "wi_one",
+        sender_scheduled: true
       })
 
     assert wake.rumination
     assert wake.work_item_id == "wi_one"
+    assert wake.delivery_rule == NoticeBatcher.rule()
+    assert wake.creator_session_key == "caller"
+    assert Wakes.get(db, wake.wake_id).state == "pending"
+    assert NoticeBatcher.source_refs(db, wake.wake_id) == []
+    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM turns")
     refute Wakes.rumination_exists?(db, "wi_one", "caller")
     refute Wakes.rumination_exists?(db, "wi_other", "caller")
     refute Wakes.rumination_exists?(db, "wi_one", "other-caller")
 
-    assert :ok = Wakes.fire_due(scheduler)
-    assert_receive {:delivered, %{wake_id: wake_id}}
-    assert wake_id == wake.wake_id
+    at = System.system_time(:millisecond) + 1_000
+    [carrier_id] = NoticeBatcher.recover(db, at, delivery_opts)
+    assert carrier_id != wake.wake_id
+
+    assert [%{delivery_wake_id: ^carrier_id, member_state: "included", batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(db, wake.wake_id)
+
+    assert {:ok, [[turn_seq, "caller", "queued", content]]} =
+             DB.query(
+               db,
+               "SELECT t.seq,t.sessionKey,t.status,m.content FROM turns t JOIN messages m ON m.id=t.messageId WHERE t.wakeId=?1",
+               [carrier_id]
+             )
+
+    assert content =~ wake.wake_id
+    assert content =~ wake.prompt
+    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM turns")
+
+    assert {:ok, [[0]]} =
+             DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [wake.wake_id])
+
     assert Wakes.rumination_exists?(db, "wi_one", "caller")
+    refute Wakes.rumination_exists?(db, "wi_other", "caller")
+    refute Wakes.rumination_exists?(db, "wi_one", "other-caller")
+
+    carrier = Wakes.get(db, carrier_id)
+    assert carrier.state == "fired"
+    assert {:ok, before_turns} = DB.query(db, "SELECT * FROM turns ORDER BY seq")
+    assert {:ok, before_messages} = DB.query(db, "SELECT * FROM messages ORDER BY id")
+    assert {:ok, before_wakes} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
+
+    assert {:ok, before_members} =
+             DB.query(db, "SELECT * FROM notice_batch_members ORDER BY memberId")
+
+    # Recovery already committed the actual carrier. Replaying that carrier
+    # must identify the same turn without appending or changing its source.
+    assert {:ok, {:duplicate, %{wake_id: ^carrier_id, turn_seq: ^turn_seq}}} =
+             DB.transaction(db, fn txn ->
+               Tightbeam.Gateway.deliver_prompt_in_txn(
+                 txn,
+                 carrier.session_key,
+                 carrier.origin,
+                 carrier.prompt,
+                 wake_id: carrier.wake_id,
+                 sender: carrier.origin,
+                 target_gate: carrier,
+                 fire_wake_in_txn: true
+               )
+             end)
+
+    assert Wakes.get(db, wake.wake_id).state == "fired"
+    assert Wakes.rumination_exists?(db, "wi_one", "caller")
+    assert NoticeBatcher.recover(db, at, delivery_opts) == []
+    assert {:ok, ^before_turns} = DB.query(db, "SELECT * FROM turns ORDER BY seq")
+    assert {:ok, ^before_messages} = DB.query(db, "SELECT * FROM messages ORDER BY id")
+    assert {:ok, ^before_wakes} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
+
+    assert {:ok, ^before_members} =
+             DB.query(db, "SELECT * FROM notice_batch_members ORDER BY memberId")
+
     refute Wakes.rumination_exists?(db, "wi_other", "caller")
     refute Wakes.rumination_exists?(db, "wi_one", "other-caller")
   end

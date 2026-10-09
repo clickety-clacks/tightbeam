@@ -24,6 +24,7 @@ defmodule Tightbeam.Assignments do
   @effect_kind_sql Enum.map_join(@effect_kinds, ", ", &"'#{&1}'")
   @completion_blocking_verdict_kinds ~w(blocked waiting)
   @completion_state_verdict_kinds @completion_blocking_verdict_kinds ++ ["cleared"]
+  @review_conclusion_verdict_kinds ~w(reviewed-clean changes-requested)
 
   defmodule TransitionRace do
     @moduledoc false
@@ -1304,7 +1305,8 @@ defmodule Tightbeam.Assignments do
 
       case replay do
         %{} = assignment ->
-          {:replay, assignment}
+          {:replay,
+           if(verb == "dispatch", do: add_dispatch_condition_hint(assignment), else: assignment)}
 
         nil ->
           case call.params[:work_item_id] do
@@ -1355,40 +1357,86 @@ defmodule Tightbeam.Assignments do
     end)
   end
 
+  @doc false
+  def condition_wait_hint(db, assignment_id) when is_binary(assignment_id) do
+    case DB.query(db, "SELECT state FROM assignments WHERE id=?1", [assignment_id]) do
+      {:ok, [["open"]]} -> condition_wait_hint(assignment_id)
+      _ -> nil
+    end
+  end
+
+  def condition_wait_hint(_db, _assignment_id), do: nil
+
+  defp condition_wait_hint(assignment_id) do
+    kind = "assignment-landed"
+
+    %{
+      kind: kind,
+      scope: assignment_id,
+      fallback_after: "2h",
+      message:
+        "Wait for this card with --when-fact #{kind} --when-scope #{assignment_id} --fallback-after 2h.",
+      example:
+        "tightbeam wake --session <session> --when-fact #{kind} --when-scope #{assignment_id} --fallback-after 2h --prompt \"re-read this card\""
+    }
+  end
+
+  defp add_dispatch_condition_hint({:accepted_in_txn, event_id, %{assignment: assignment}}) do
+    {:accepted_in_txn, event_id, %{assignment: add_dispatch_condition_hint(assignment)}}
+  end
+
+  defp add_dispatch_condition_hint(%{id: assignment_id, state: "open"} = assignment)
+       when is_binary(assignment_id) do
+    Map.put(assignment, :condition_wake_hint, condition_wait_hint(assignment_id))
+  end
+
+  defp add_dispatch_condition_hint(result), do: result
+
   defp dispatch_result(db, call) do
     case {call.params[:work_item_id], call.principal} do
       {work_item_id, {:session, caller_session}} when not is_nil(work_item_id) ->
-        if Wakes.rumination_exists?(db, work_item_id, caller_session) do
-          open_dispatch_result(db, call)
-        else
-          transaction(db, fn txn ->
-            wake =
-              Wakes.schedule_in_txn(txn, %{
-                session_key: caller_session,
-                origin: call.origin,
-                creator_session_key: caller_session,
-                prompt:
-                  "digest: Ruminate on work-item #{work_item_id} against the whole spec and its spirit before you fan out. Intent you were about to dispatch: subject=#{call.params[:subject]} brief=#{call.params[:brief]}. When you've thought it through, re-issue the dispatch.",
-                due_at: now(),
-                rumination: true,
-                work_item_id: work_item_id
-              })
+        case transaction(db, fn txn ->
+               case Wakes.rumination_status_in_txn(txn, work_item_id, caller_session) do
+                 :delivered ->
+                   :delivered
 
-            Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
-            Wakes.publish_change_in_txn(txn, "wake.scheduled", wake.wake_id)
+                 status when status in [:pending, :staged] ->
+                   rumination_required_result(work_item_id)
 
-            %{
-              rumination_required: true,
-              work_item_id: work_item_id,
-              message:
-                "Sent you to ruminate on #{work_item_id} first — re-dispatch when you're done thinking."
-            }
-          end)
+                 :none ->
+                   wake =
+                     Wakes.schedule_in_txn(txn, %{
+                       session_key: caller_session,
+                       origin: call.origin,
+                       creator_session_key: caller_session,
+                       prompt:
+                         "digest: Ruminate on work-item #{work_item_id} against the whole spec and its spirit before you fan out. Intent you were about to dispatch: subject=#{call.params[:subject]} brief=#{call.params[:brief]}. When you've thought it through, re-issue the dispatch.",
+                       due_at: now(),
+                       rumination: true,
+                       work_item_id: work_item_id
+                     })
+
+                   Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
+                   Wakes.publish_change_in_txn(txn, "wake.scheduled", wake.wake_id)
+                   rumination_required_result(work_item_id)
+               end
+             end) do
+          :delivered -> open_dispatch_result(db, call)
+          result -> result
         end
 
       _ ->
         open_dispatch_result(db, call)
     end
+  end
+
+  defp rumination_required_result(work_item_id) do
+    %{
+      rumination_required: true,
+      work_item_id: work_item_id,
+      message:
+        "Sent you to ruminate on #{work_item_id} first — re-dispatch when you're done thinking."
+    }
   end
 
   defp open_dispatch_result(db, call) do
@@ -1422,8 +1470,15 @@ defmodule Tightbeam.Assignments do
                       sender: call.origin,
                       role_ref: assignment.holderRole,
                       role_fallback: assignment.holderFallback,
+                      creator_session_key:
+                        case call.principal do
+                          {:session, session_key} -> session_key
+                          _ -> nil
+                        end,
+                      queue_when_busy: true,
                       assignment_id: assignment.id,
-                      job_ref: assignment.workItemId
+                      job_ref: assignment.workItemId,
+                      replacement_assignment_id: assignment.id
                     )
 
                   {:created, assignment, delivery}
@@ -1440,7 +1495,7 @@ defmodule Tightbeam.Assignments do
           end
 
         assignment ->
-          assignment
+          add_dispatch_condition_hint(assignment)
       end
     else
       error -> error
@@ -1526,7 +1581,10 @@ defmodule Tightbeam.Assignments do
     end
 
     if delivery, do: best_effort(fn -> notify(call, :on_dispatch_delivery, delivery, nil) end)
-    assignment
+
+    if call.verb == "dispatch",
+      do: add_dispatch_condition_hint(assignment),
+      else: assignment
   end
 
   defp accept_assignment_in_txn({:created, assignment, _delivery} = result, txn, call) do
@@ -1596,6 +1654,13 @@ defmodule Tightbeam.Assignments do
             result
           end,
           &attest_commits(&1, &2, call)
+        )
+
+      result =
+        complete_attest_condition_fact_deliveries(
+          db,
+          Map.get(call, :wake_scheduler, Tightbeam.WakeScheduler),
+          result
         )
 
       if not Map.has_key?(result, :code) and not Map.get(result, :replayed, false) and
@@ -2426,10 +2491,12 @@ defmodule Tightbeam.Assignments do
   defp insert_and_apply_lifecycle_attest(txn, call, assignment, holder) do
     attest = insert_attest(txn, call, assignment.id)
     Wakes.record_terminal_handoff_action_in_txn(txn, holder, attest)
-    apply_lifecycle_attest(txn, call, assignment, attest, holder)
+    result = apply_lifecycle_attest(txn, call, assignment, attest, holder)
+    file_attest_condition_fact(txn, assignment, attest, result)
   end
 
   defp apply_lifecycle_attest(txn, %{params: %{kind: "progress"}}, assignment, attest, _holder) do
+    notify_assignment_opener_of_attest_in_txn(txn, assignment, attest)
     append_attest_marker(txn, attest)
     %{assignment: assignment, attest: attest}
   end
@@ -2459,7 +2526,14 @@ defmodule Tightbeam.Assignments do
     Tightbeam.WorkItems.arm_slate_in_txn(txn, closed_assignment.workItemId)
 
     case Wakes.admit_terminal_notification_in_txn(txn, assignment.id) do
-      {:ok, _wake} ->
+      {:ok, wake} ->
+        # The typed terminal notice already reports this attest when it reaches
+        # the card opener. Preserve the separate source only when the canonical
+        # terminal route selects another currently accountable recipient.
+        if wake.session_key != assignment_opener_session(assignment) do
+          notify_assignment_opener_of_attest_in_txn(txn, assignment, attest)
+        end
+
         :ok
 
       {:error, refusal} ->
@@ -2735,6 +2809,7 @@ defmodule Tightbeam.Assignments do
                      do: raise(TransitionRace)
 
                   attest = insert_attest(txn, call, assignment_id)
+                  notify_assignment_opener_of_attest_in_txn(txn, assignment, attest)
 
                   :ok =
                     Wakes.verification_verdict_in_txn(txn, %{
@@ -2747,7 +2822,8 @@ defmodule Tightbeam.Assignments do
                     })
 
                   append_attest_marker(txn, attest)
-                  %{assignment: assignment, attest: attest}
+                  result = %{assignment: assignment, attest: attest}
+                  file_attest_condition_fact(txn, assignment, attest, result)
                 else
                   {:error, error} -> error
                   %{code: _} = error -> error
@@ -2756,6 +2832,74 @@ defmodule Tightbeam.Assignments do
         end
     end
   end
+
+  # These facts report the exact card-level attest that was filed. They do not
+  # claim that a PR or a session independently reached a state: completion is
+  # the holder's landed report, review conclusions are scoped to the card that
+  # the review card names, and blocked is an explicit blocked/cannot-proceed
+  # attest.
+  defp file_attest_condition_fact(_txn, _assignment, _attest, %{code: _} = result),
+    do: result
+
+  defp file_attest_condition_fact(txn, assignment, attest, result) do
+    fact_identity =
+      case {attest.kind, attest.verdictKind, assignment.reviewsAssignmentId} do
+        {"completion", _, _} ->
+          {"assignment-landed", assignment.id}
+
+        {"cannot-proceed", _, _} ->
+          {"assignment-blocked", assignment.id}
+
+        {"verdict", verdict, reviewed_assignment}
+        when is_binary(reviewed_assignment) and verdict in @review_conclusion_verdict_kinds ->
+          {"assignment-reviewed", reviewed_assignment}
+
+        {"verdict", "blocked", _} ->
+          {"assignment-blocked", assignment.id}
+
+        _ ->
+          nil
+      end
+
+    case fact_identity do
+      {kind, scope} ->
+        fact =
+          ConditionFacts.file_in_txn(txn, %{
+            kind: kind,
+            scope: scope,
+            origin: "process:tightbeam",
+            owner_user_id: assignment_owner_in_txn(txn, scope)
+          })
+
+        deliveries = ConditionFacts.recognize_in_txn(txn, fact.fact_id)
+
+        result
+        |> Map.put(:fact, fact)
+        |> Map.put(:condition_wake_hint, ConditionFacts.wake_hint(kind, scope))
+        |> Map.put(:condition_fact_deliveries, deliveries)
+
+      nil ->
+        result
+    end
+  end
+
+  defp complete_attest_condition_fact_deliveries(
+         db,
+         scheduler,
+         %{condition_fact_deliveries: deliveries, fact: %{fact_id: fact_id}} = result
+       ) do
+    ConditionFacts.complete_deliveries(db, scheduler, deliveries)
+
+    try do
+      Wakes.fire_matching(scheduler, fact_id)
+    catch
+      :exit, _unavailable_scheduler -> :ok
+    end
+
+    Map.delete(result, :condition_fact_deliveries)
+  end
+
+  defp complete_attest_condition_fact_deliveries(_db, _scheduler, result), do: result
 
   defp late_ruling_receipt_request_id(verdict_kind) when is_binary(verdict_kind) do
     case Regex.run(
@@ -2784,6 +2928,7 @@ defmodule Tightbeam.Assignments do
         [] ->
           resolved_call = put_in(call, [:params, :verdict_kind], verdict_kind)
           attest = insert_attest(txn, resolved_call, assignment.id, true)
+          notify_assignment_opener_of_attest_in_txn(txn, assignment, attest)
 
           append_attest_marker(txn, attest)
           %{assignment: assignment, attest: attest}
@@ -3265,6 +3410,58 @@ defmodule Tightbeam.Assignments do
 
     append_substrate(txn, attest.bySession, text)
   end
+
+  defp notify_assignment_opener_of_attest_in_txn(txn, assignment, attest) do
+    recipient = assignment_opener_session(assignment)
+
+    recipient_exists? =
+      case assignment do
+        %{openedByUser: user} when is_binary(user) ->
+          Txn.q(
+            txn,
+            "SELECT 1 FROM sessions WHERE sessionKey=?1 AND ownerUserId=?2",
+            [recipient, user]
+          ) == [[1]]
+
+        _ ->
+          Txn.q(txn, "SELECT 1 FROM sessions WHERE sessionKey=?1", [recipient]) == [[1]]
+      end
+
+    if recipient_exists? and not same_attest_principal_as_opener?(assignment, attest) do
+      Wakes.schedule_in_txn(txn, %{
+        session_key: recipient,
+        origin: attest_notice_origin(attest),
+        creator_session_key: attest.bySession,
+        prompt: "Attest #{attest.id} (#{attest.kind}) was filed on assignment #{assignment.id}.",
+        due_at: attest.ts,
+        assignment_id: assignment.id,
+        work_item_id: assignment.workItemId
+      })
+    else
+      :ok
+    end
+  end
+
+  defp same_attest_principal_as_opener?(
+         %{openedByUser: opener, openedBySession: nil},
+         %{byUser: opener, bySession: nil}
+       )
+       when is_binary(opener),
+       do: true
+
+  defp same_attest_principal_as_opener?(
+         %{openedByUser: nil, openedBySession: opener},
+         %{byUser: nil, bySession: opener}
+       )
+       when is_binary(opener),
+       do: true
+
+  defp same_attest_principal_as_opener?(_assignment, _attest), do: false
+
+  defp attest_notice_origin(%{bySession: session}) when is_binary(session),
+    do: "agent:" <> session
+
+  defp attest_notice_origin(%{byUser: user}) when is_binary(user), do: "user:" <> user
 
   defp append_assignment_marker(txn, assignment, :opened) do
     append_substrate(txn, assignment.holderKey, "[assignment opened: #{assignment.id}]")

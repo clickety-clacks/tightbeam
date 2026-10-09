@@ -306,6 +306,76 @@ defmodule Tightbeam.Schema do
   @o2_shape "row-driven-o2-v1-019"
   @o2_pre_liveness_shape "row-driven-o2-pre-liveness-v1-019"
   @shape "row-driven-admission-v1-019"
+  @supervision_batch_delivery_previous_trigger """
+  CREATE TRIGGER IF NOT EXISTS supervision_lineage_fire_requires_sidecar
+  BEFORE UPDATE OF state ON wakes
+  WHEN OLD.state = 'pending' AND NEW.state = 'fired'
+    AND NEW.consumer = 'prompt'
+    AND NEW.origin = 'process:tightbeam'
+    AND NEW.assignmentId IS NOT NULL
+    AND NEW.reresolve = 'lineage'
+    AND (
+      NOT EXISTS (
+        SELECT 1 FROM supervision_liveness_sidecar s
+        WHERE s.wakeId = NEW.wakeId AND s.assignmentId = NEW.assignmentId
+          AND s.wakeKind = 'escalation'
+          AND (
+            (s.controllerOrigin = 'scheduled' AND s.controllerState = 'settled'
+             AND s.chargedGeneration > 0)
+            OR
+            (s.controllerOrigin = 'retirement_elevation' AND s.controllerState = 'settled'
+             AND s.chargedGeneration IS NULL)
+          )
+      )
+      OR NOT EXISTS (
+        SELECT 1 FROM turns t
+        WHERE t.wakeId = NEW.wakeId AND t.assignmentId = NEW.assignmentId
+      )
+    )
+  BEGIN
+    SELECT RAISE(ABORT, 'supervision lineage wake requires controller sidecar');
+  END
+  """
+  @supervision_batch_delivery_previous_triggers [
+    {
+      "supervision_lineage_fire_requires_sidecar",
+      @supervision_batch_delivery_previous_trigger
+    },
+    {
+      "supervision_fired_lineage_sidecar_required_delete",
+      """
+      CREATE TRIGGER IF NOT EXISTS supervision_fired_lineage_sidecar_required_delete
+      BEFORE DELETE ON supervision_liveness_sidecar
+      WHEN EXISTS (
+        SELECT 1 FROM wakes w
+        WHERE w.wakeId = OLD.wakeId AND w.assignmentId = OLD.assignmentId
+          AND w.state = 'fired' AND w.consumer = 'prompt'
+          AND w.origin = 'process:tightbeam' AND w.reresolve = 'lineage'
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'fired supervision lineage sidecar is required');
+      END
+      """
+    },
+    {
+      "supervision_fired_lineage_sidecar_identity_immutable",
+      """
+      CREATE TRIGGER IF NOT EXISTS supervision_fired_lineage_sidecar_identity_immutable
+      BEFORE UPDATE OF wakeId, assignmentId, controllerOrigin, wakeKind, controllerState,
+                       chargedGeneration
+      ON supervision_liveness_sidecar
+      WHEN EXISTS (
+        SELECT 1 FROM wakes w
+        WHERE w.wakeId = OLD.wakeId AND w.assignmentId = OLD.assignmentId
+          AND w.state = 'fired' AND w.consumer = 'prompt'
+          AND w.origin = 'process:tightbeam' AND w.reresolve = 'lineage'
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'fired supervision lineage sidecar identity is immutable');
+      END
+      """
+    }
+  ]
   @admission_previous_shape "row-driven-coverage-v1-019"
   @admission_pre_liveness_previous_shape "row-driven-coverage-pre-liveness-v1-019"
   @row_driven_coverage_previous_shape "row-driven-waits-v1-019"
@@ -327,6 +397,8 @@ defmodule Tightbeam.Schema do
   @artifact_origin_shape "artifact-origin-v1-019"
   @fresh_owner_link_origin_table "schema_bootstrap_origin"
   @work_item_owner_link_shape "work-item-delivery-owner-v1-019"
+  @assignment_source_replacement_shape "assignment-source-replacement-v1-019"
+  @notice_source_payload_shape "notice-source-storage-v1-019"
   @identity_publication_denial_diagnostic_previous_shape @artifact_origin_shape
   @identity_publication_denial_diagnostic_shape "identity-publication-denial-diagnostic-v1-019"
   @supervision_receipt_cancellation_shape "supervision-receipt-cancellation-v1-019"
@@ -1165,6 +1237,12 @@ defmodule Tightbeam.Schema do
           OR NOT EXISTS (
             SELECT 1 FROM turns t
             WHERE t.wakeId = NEW.wakeId AND t.assignmentId = NEW.assignmentId
+            UNION ALL
+            SELECT 1 FROM turns t
+            JOIN notice_batches b ON b.deliveryWakeId=t.wakeId
+            JOIN notice_batch_members m ON m.batchId=b.batchId AND m.state='included'
+            JOIN wakes source ON source.wakeId=m.sourceWakeId
+            WHERE source.wakeId=NEW.wakeId AND source.assignmentId=NEW.assignmentId
           )
         )
       BEGIN
@@ -1183,6 +1261,12 @@ defmodule Tightbeam.Schema do
         WHERE w.wakeId = OLD.wakeId AND w.assignmentId = OLD.assignmentId
           AND w.state = 'fired' AND w.consumer = 'prompt'
           AND w.origin = 'process:tightbeam' AND w.reresolve = 'lineage'
+        UNION ALL
+        SELECT 1 FROM notice_batch_members m
+        JOIN notice_batches b ON b.batchId=m.batchId AND b.deliveryWakeId=OLD.wakeId
+        JOIN wakes w ON w.wakeId=m.sourceWakeId
+        WHERE m.state='included' AND w.state='fired' AND w.consumer='prompt'
+          AND w.origin='process:tightbeam' AND w.reresolve='lineage'
       )
       BEGIN
         SELECT RAISE(ABORT, 'fired supervision lineage sidecar is required');
@@ -1202,6 +1286,12 @@ defmodule Tightbeam.Schema do
         WHERE w.wakeId = OLD.wakeId AND w.assignmentId = OLD.assignmentId
           AND w.state = 'fired' AND w.consumer = 'prompt'
           AND w.origin = 'process:tightbeam' AND w.reresolve = 'lineage'
+        UNION ALL
+        SELECT 1 FROM notice_batch_members m
+        JOIN notice_batches b ON b.batchId=m.batchId AND b.deliveryWakeId=OLD.wakeId
+        JOIN wakes w ON w.wakeId=m.sourceWakeId
+        WHERE m.state='included' AND w.state='fired' AND w.consumer='prompt'
+          AND w.origin='process:tightbeam' AND w.reresolve='lineage'
       )
       BEGIN
         SELECT RAISE(ABORT, 'fired supervision lineage sidecar identity is immutable');
@@ -1404,12 +1494,49 @@ defmodule Tightbeam.Schema do
       end)
   ]
 
+  # Explicit sender replacement of an unsealed assignment notice is a distinct
+  # typed cancellation route. Its caller proves the durable replacement request
+  # and exact assignment before this shape admits the cancellation row.
+  @assignment_source_replacement_liveness_objects Enum.map(
+                                                    @supervision_receipt_cancellation_liveness_objects,
+                                                    fn
+                                                      %{name: "wake_cancellations", sql: sql} =
+                                                          object ->
+                                                        anchor =
+                                                          "(requesterId = 'tightbeam:effort-checkin' AND"
+
+                                                        assignment_replacement = """
+                                                        (requesterId = 'tightbeam:assignments' AND reasonKind = 'superseded' AND
+                                                         causalSourceKind = 'wake' AND outcomeKind = 'replacement')
+                                                        OR
+                                                        """
+
+                                                        true = String.contains?(sql, anchor)
+
+                                                        %{
+                                                          object
+                                                          | sql:
+                                                              String.replace(
+                                                                sql,
+                                                                anchor,
+                                                                assignment_replacement <> anchor,
+                                                                global: false
+                                                              )
+                                                        }
+
+                                                      object ->
+                                                        object
+                                                    end
+                                                  )
+
   @doc false
   def live_base_upgrade_predecessor, do: @operator_decision_shape
 
   @doc false
   def guard_compatible_stamps do
     [
+      @notice_source_payload_shape,
+      @assignment_source_replacement_shape,
       @work_item_owner_link_shape,
       @identity_publication_denial_diagnostic_shape,
       @artifact_origin_shape,
@@ -1494,6 +1621,8 @@ defmodule Tightbeam.Schema do
             @agent_reparent_shape,
             @artifact_origin_shape,
             @identity_publication_denial_diagnostic_shape,
+            @notice_source_payload_shape,
+            @assignment_source_replacement_shape,
             @work_item_owner_link_shape
           ]
         )
@@ -1533,11 +1662,11 @@ defmodule Tightbeam.Schema do
     :ok = upgrade_artifact_durability(db)
     :ok = upgrade_pi_providers(db)
     :ok = upgrade_addressed_po_consultation(db)
-    :ok = Tightbeam.QueuedMessageSuppression.ensure_schema(db)
 
     Enum.each(@schema_modules, fn
       Tightbeam.Ledger -> :ok
       Tightbeam.Toplines -> :ok = Tightbeam.Toplines.ensure_historical_schema(db)
+      Tightbeam.NoticeBatcher -> :ok
       module -> :ok = module.ensure_schema(db)
     end)
 
@@ -1548,6 +1677,7 @@ defmodule Tightbeam.Schema do
     Enum.each(@schema_modules, fn
       Tightbeam.Ledger -> :ok
       Tightbeam.Toplines -> :ok = Tightbeam.Toplines.ensure_historical_schema(db)
+      Tightbeam.NoticeBatcher -> :ok
       module -> :ok = module.ensure_schema(db)
     end)
 
@@ -1561,6 +1691,9 @@ defmodule Tightbeam.Schema do
     :ok = upgrade_identity_publication_denial_diagnostic(db)
     :ok = upgrade_work_item_delivery_owner_link(db)
     :ok = upgrade_supervision_receipt_cancellation_v1(db)
+    :ok = upgrade_assignment_source_replacement_v1(db)
+    :ok = Tightbeam.QueuedMessageSuppression.ensure_schema(db)
+    :ok = Tightbeam.NoticeBatcher.ensure_schema(db)
 
     # Preserve exact historical Toplines DDL and its stamp if a preceding
     # migration refuses. Bootstrap already qualified it; now activate V6.
@@ -1572,9 +1705,581 @@ defmodule Tightbeam.Schema do
     :ok = ensure_lifecycle_runtime_indexes(db)
     :ok = ensure_idle_cleanup_runtime_indexes(db)
 
+    # Batch-aware supervision guards reference notice_batches, so install them
+    # only after all predecessor migrations and refusal checks have completed
+    # and the complete batch schema exists.
+    :ok = migrate_supervision_batch_delivery_guards(db)
+    :ok = migrate_wake_retry_source_scope(db)
+    :ok = upgrade_notice_source_payload(db)
+
     case DB.finish_schema(db) do
       :ok -> :ok
       {:error, error} -> raise error
+    end
+  end
+
+  @source_client_column """
+  sourceClientIdentity TEXT CHECK (
+    sourceClientIdentity IS NULL OR (
+      json_valid(sourceClientIdentity) AND json_type(sourceClientIdentity)='object'
+      AND json_type(sourceClientIdentity,'$.targetSessionKey')='text'
+      AND json_type(sourceClientIdentity,'$.deviceId')='text'
+      AND json_type(sourceClientIdentity,'$.clientMessageId')='text'
+      AND json_type(sourceClientIdentity,'$.sourceWakeId')='text'
+      AND json_type(sourceClientIdentity,'$.payloadSha256')='text'
+      AND length(json_extract(sourceClientIdentity,'$.payloadSha256'))=64
+      AND json_type(sourceClientIdentity,'$.createdAt')='integer'
+      AND json_extract(sourceClientIdentity,'$.createdAt')>=0
+      AND json_extract(sourceClientIdentity,'$.sourceWakeId')=wakeId
+    )
+  )
+  """
+  @source_address_column "sourceAddress TEXT CHECK (sourceAddress IS NULL OR length(trim(sourceAddress))>0)"
+  @source_visibility_column "sourceVisibilityScope TEXT CHECK (sourceVisibilityScope IS NULL OR length(trim(sourceVisibilityScope))>0)"
+  @source_attachments_column "sourceAttachments TEXT CHECK (sourceAttachments IS NULL OR json_valid(sourceAttachments))"
+  @source_client_index """
+  CREATE UNIQUE INDEX notice_source_client_identity ON wakes (
+    json_extract(sourceClientIdentity,'$.targetSessionKey'),
+    json_extract(sourceClientIdentity,'$.deviceId'),
+    json_extract(sourceClientIdentity,'$.clientMessageId')
+  ) WHERE sourceClientIdentity IS NOT NULL
+  """
+
+  # Move payload authority onto the editable source itself. Each historical row
+  # is copied before its table is dropped; the successor stamp commits with it.
+  # Retired selections remain exact historical evidence, never delivery authority.
+  defp upgrade_notice_source_payload(db) do
+    case DB.migration_transaction(
+           db,
+           :notice_source_payload,
+           ["PRAGMA foreign_keys=OFF", "PRAGMA legacy_alter_table=ON"],
+           ["PRAGMA legacy_alter_table=OFF", "PRAGMA foreign_keys=ON"],
+           fn txn ->
+             case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+               [[@notice_source_payload_shape]] ->
+                 validate_notice_source_payload_in_txn!(txn)
+
+               [[@assignment_source_replacement_shape]] ->
+                 unless Txn.q(
+                          txn,
+                          "SELECT name FROM pragma_table_info('wakes') WHERE name IN ('sourceAttachments','sourceClientIdentity','sourceVisibilityScope','sourceAddress')"
+                        ) == [] do
+                   raise ShapeError,
+                     message: "incompatible_notice_source_payload: unstamped source columns"
+                 end
+
+                 present =
+                   for {name, expected} <-
+                         Tightbeam.NoticeBatcher.previous_source_payload_objects(),
+                       reduce: [] do
+                     names ->
+                       case Txn.q(
+                              txn,
+                              "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+                              [name]
+                            ) do
+                         [] ->
+                           names
+
+                         [[sql]] ->
+                           unless normalize_schema_sql(sql) == normalize_schema_sql(expected),
+                             do:
+                               raise(ShapeError,
+                                 message: "incompatible_notice_source_payload: malformed #{name}"
+                               )
+
+                           unless Txn.q(
+                                    txn,
+                                    "SELECT name FROM sqlite_master WHERE tbl_name=?1 AND type IN ('index','trigger') AND sql IS NOT NULL",
+                                    [name]
+                                  ) == [],
+                                  do:
+                                    raise(ShapeError,
+                                      message:
+                                        "incompatible_notice_source_payload: unknown objects on #{name}"
+                                    )
+
+                           unless Txn.q(
+                                    txn,
+                                    "SELECT name FROM sqlite_master WHERE sql LIKE ?1 AND name<>?2 AND sql IS NOT NULL
+                                    AND NOT (?2='notice_delivery_policies' AND name='notice_batch_members')",
+                                    ["%#{name}%", name]
+                                  ) == [],
+                                  do:
+                                    raise(ShapeError,
+                                      message:
+                                        "incompatible_notice_source_payload: external dependency on #{name}"
+                                    )
+
+                           [name | names]
+                       end
+                   end
+
+                 if Txn.q(
+                      txn,
+                      "SELECT name FROM sqlite_master WHERE name='notice_source_client_identity'"
+                    ) != [],
+                    do:
+                      raise(ShapeError,
+                        message: "incompatible_notice_source_payload: unstamped client index"
+                      )
+
+                 validate_notice_source_recognition_in_txn!(txn)
+
+                 :ok = Txn.exec(txn, "ALTER TABLE wakes ADD COLUMN " <> @source_client_column)
+
+                 :ok =
+                   Txn.exec(txn, "ALTER TABLE wakes ADD COLUMN " <> @source_attachments_column)
+
+                 :ok = Txn.exec(txn, @source_client_index)
+                 :ok = Txn.exec(txn, "ALTER TABLE wakes ADD COLUMN " <> @source_visibility_column)
+                 :ok = Txn.exec(txn, "ALTER TABLE wakes ADD COLUMN " <> @source_address_column)
+                 retire_notice_policy_storage_in_txn!(txn, present)
+
+                 if "staged_message_dedupes" in present do
+                   rows =
+                     Txn.q(
+                       txn,
+                       "SELECT targetSessionKey,deviceId,clientMessageId,sourceWakeId,payloadSha256,createdAt FROM staged_message_dedupes"
+                     )
+
+                   for [target, device, client, wake, hash, created] <- rows do
+                     identity = %{
+                       "targetSessionKey" => target,
+                       "deviceId" => device,
+                       "clientMessageId" => client,
+                       "sourceWakeId" => wake,
+                       "payloadSha256" => hash,
+                       "createdAt" => created
+                     }
+
+                     :ok =
+                       Tightbeam.NoticeBatcher.persist_source_client_in_txn(txn, wake, identity)
+                   end
+
+                   [[copied]] =
+                     Txn.q(
+                       txn,
+                       "SELECT COUNT(*) FROM wakes WHERE sourceClientIdentity IS NOT NULL"
+                     )
+
+                   unless copied == length(rows),
+                     do:
+                       raise(ShapeError,
+                         message: "incompatible_notice_source_payload: client copy count"
+                       )
+                 end
+
+                 if "notice_batch_source_attachments" in present do
+                   rows =
+                     Txn.q(
+                       txn,
+                       "SELECT sourceWakeId,attachments FROM notice_batch_source_attachments"
+                     )
+
+                   for [wake, encoded] <- rows do
+                     Txn.q(
+                       txn,
+                       "UPDATE wakes SET sourceAttachments=?2 WHERE wakeId=?1 AND sourceAttachments IS NULL",
+                       [wake, encoded]
+                     )
+
+                     unless Txn.changes(txn) == 1,
+                       do:
+                         raise(ShapeError,
+                           message:
+                             "incompatible_notice_source_payload: attachment source missing"
+                         )
+
+                     unless Txn.q(txn, "SELECT sourceAttachments FROM wakes WHERE wakeId=?1", [
+                              wake
+                            ]) ==
+                              [[encoded]],
+                            do:
+                              raise(ShapeError,
+                                message:
+                                  "incompatible_notice_source_payload: attachment bytes changed"
+                              )
+                   end
+
+                   [[copied]] =
+                     Txn.q(txn, "SELECT COUNT(*) FROM wakes WHERE sourceAttachments IS NOT NULL")
+
+                   unless copied == length(rows),
+                     do:
+                       raise(ShapeError,
+                         message: "incompatible_notice_source_payload: attachment copy count"
+                       )
+                 end
+
+                 for name <- present, do: :ok = Txn.exec(txn, "DROP TABLE " <> name)
+
+                 unless Txn.q(txn, "PRAGMA foreign_key_check") == [],
+                   do:
+                     raise(ShapeError,
+                       message: "incompatible_notice_source_payload: invalid foreign keys"
+                     )
+
+                 Txn.q(txn, "UPDATE schema_stamp SET shape=?1,stampedAt=?2 WHERE shape=?3", [
+                   @notice_source_payload_shape,
+                   System.system_time(:millisecond),
+                   @assignment_source_replacement_shape
+                 ])
+
+                 unless Txn.changes(txn) == 1,
+                   do:
+                     raise(ShapeError, message: "incompatible_notice_source_payload: stamp race")
+
+                 validate_notice_source_payload_in_txn!(txn)
+
+               rows ->
+                 raise ShapeError,
+                   message: "incompatible_notice_source_payload: predecessor #{inspect(rows)}"
+             end
+           end
+         ) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message: "notice source payload migration rolled back: #{Exception.message(error)}"
+    end
+  end
+
+  defp validate_notice_source_payload_in_txn!(txn) do
+    [[sql]] = Txn.q(txn, "SELECT sql FROM sqlite_master WHERE type='table' AND name='wakes'")
+
+    for definition <- [
+          @source_client_column,
+          @source_attachments_column,
+          @source_visibility_column,
+          @source_address_column
+        ] do
+      unless String.contains?(normalize_schema_sql(sql), normalize_schema_sql(definition)),
+        do:
+          raise(ShapeError,
+            message: "incompatible_notice_source_payload: malformed source columns"
+          )
+    end
+
+    case Txn.q(
+           txn,
+           "SELECT sql FROM sqlite_master WHERE type='index' AND name='notice_source_client_identity'"
+         ) do
+      [[sql]] ->
+        unless normalize_schema_sql(sql) == normalize_schema_sql(@source_client_index),
+          do:
+            raise(ShapeError,
+              message: "incompatible_notice_source_payload: malformed client index"
+            )
+
+      _ ->
+        raise ShapeError, message: "incompatible_notice_source_payload: missing client index"
+    end
+
+    unless Txn.q(
+             txn,
+             "SELECT name FROM sqlite_master WHERE name IN ('staged_message_dedupes','notice_batch_source_attachments','notice_delivery_policies','notice_batching_lane_policies')"
+           ) == [],
+           do:
+             raise(ShapeError,
+               message: "incompatible_notice_source_payload: retired payload tables remain"
+             )
+
+    [[members]] =
+      Txn.q(
+        txn,
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='notice_batch_members'"
+      )
+
+    unless normalize_schema_sql(
+             String.replace(members, ~s("notice_batch_members"), "notice_batch_members")
+           ) ==
+             normalize_schema_sql(Tightbeam.NoticeBatcher.source_member_ddl()),
+           do:
+             raise(ShapeError,
+               message: "incompatible_notice_source_payload: malformed source members"
+             )
+
+    validate_notice_source_recognition_in_txn!(txn)
+  end
+
+  # The admitted development predecessor stamped the prompt without retaining
+  # the actual matched fact. Earlier candidates could carry those rows into the
+  # current shape, so both admissions must refuse without inferring fact scope
+  # or rewriting authored history.
+  defp validate_notice_source_recognition_in_txn!(txn) do
+    unless Txn.q(
+             txn,
+             "SELECT wakeId FROM wakes WHERE state='pending' AND consumer='prompt' AND conditionKind IS NOT NULL AND firedBy='condition' AND recognitionEvidence IS NULL LIMIT 1"
+           ) == [],
+           do:
+             raise(ShapeError,
+               message:
+                 "incompatible_notice_source_payload: unsupported_pending_condition_recognition"
+             )
+
+    :ok
+  end
+
+  defp retire_notice_policy_storage_in_txn!(txn, present) do
+    if "notice_delivery_policies" in present do
+      rows =
+        Txn.q(
+          txn,
+          "SELECT policyRef,sourceWakeId,recipientAddress,sessionKey,targetRole,visibilityScope,policyRevision,deadlineAt,enabled,createdAt FROM notice_delivery_policies ORDER BY policyRef"
+        )
+
+      keys =
+        ~w(policyRef sourceWakeId recipientAddress sessionKey targetRole visibilityScope policyRevision deadlineAt enabled createdAt)
+
+      for [ref, wake, address, _session, _role, scope | _] = row <- rows do
+        Txn.q(
+          txn,
+          "UPDATE wakes SET sourceVisibilityScope=?2,sourceAddress=?3 WHERE wakeId=?1 AND sourceVisibilityScope IS NULL",
+          [wake, scope, address]
+        )
+
+        unless Txn.changes(txn) == 1,
+          do:
+            raise(ShapeError,
+              message: "incompatible_notice_source_payload: policy source missing"
+            )
+
+        Tightbeam.EventLog.lifecycle_in_txn(
+          txn,
+          "notice_source_policy_retired",
+          ref,
+          JSON.encode!(Map.new(Enum.zip(keys, row)))
+        )
+      end
+    end
+
+    if "notice_batching_lane_policies" in present do
+      keys =
+        ~w(recipientAddress visibilityScope enabled policyRevision policyRef selectedBy cause selectedAt)
+
+      for row <-
+            Txn.q(
+              txn,
+              "SELECT recipientAddress,visibilityScope,enabled,policyRevision,policyRef,selectedBy,cause,selectedAt FROM notice_batching_lane_policies ORDER BY recipientAddress,visibilityScope"
+            ) do
+        Tightbeam.EventLog.lifecycle_in_txn(
+          txn,
+          "notice_lane_policy_retired",
+          Enum.at(row, 4),
+          JSON.encode!(Map.new(Enum.zip(keys, row)))
+        )
+      end
+    end
+
+    [[actual]] =
+      Txn.q(
+        txn,
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='notice_batch_members'"
+      )
+
+    actual =
+      normalize_schema_sql(
+        String.replace(actual, ~s("notice_batch_members"), "notice_batch_members")
+      )
+
+    current = Tightbeam.NoticeBatcher.source_member_ddl()
+    predecessor = Tightbeam.NoticeBatcher.previous_source_member_ddl()
+
+    cond do
+      actual == normalize_schema_sql(current) ->
+        :ok
+
+      actual == normalize_schema_sql(predecessor) ->
+        objects =
+          Txn.q(
+            txn,
+            "SELECT type,name,sql FROM sqlite_master WHERE tbl_name='notice_batch_members' AND sql IS NOT NULL AND type IN ('index','trigger') ORDER BY type,name"
+          )
+
+        expected_index =
+          "CREATE INDEX IF NOT EXISTS notice_batch_members_batch ON notice_batch_members(batchId, publicationSeq)"
+
+        unless match?([["index", "notice_batch_members_batch", _]], objects) and
+                 normalize_schema_sql(objects |> hd() |> List.last()) ==
+                   normalize_schema_sql(expected_index),
+               do:
+                 raise(ShapeError,
+                   message: "incompatible_notice_source_payload: unknown member objects"
+                 )
+
+        unless Txn.q(
+                 txn,
+                 "SELECT name FROM sqlite_master WHERE name='notice_source_members_migration'"
+               ) == [],
+               do:
+                 raise(ShapeError,
+                   message: "incompatible_notice_source_payload: member migration object exists"
+                 )
+
+        before = Txn.q(txn, "SELECT rowid,* FROM notice_batch_members ORDER BY rowid")
+
+        :ok =
+          Txn.exec(
+            txn,
+            String.replace(current, "notice_batch_members", "notice_source_members_migration")
+          )
+
+        :ok =
+          Txn.exec(
+            txn,
+            "INSERT INTO notice_source_members_migration (rowid,memberId,batchId,sourceWakeId,policyRef,recipientAddress,visibilityScope,publicationSeq,policyRevision,senderPrincipal,cause,class,payload,renderedBytes,state,addedAt,canceledAt,cancellationRef) SELECT rowid,* FROM notice_batch_members"
+          )
+
+        # Explicit rowid is preserved as well as every member payload and history slot.
+        after_rows =
+          Txn.q(txn, "SELECT rowid,* FROM notice_source_members_migration ORDER BY rowid")
+
+        unless before == after_rows,
+          do:
+            raise(ShapeError, message: "incompatible_notice_source_payload: member bytes changed")
+
+        :ok =
+          Txn.exec(
+            txn,
+            "DROP TABLE notice_batch_members; ALTER TABLE notice_source_members_migration RENAME TO notice_batch_members"
+          )
+
+        :ok = Txn.exec(txn, objects |> hd() |> List.last())
+
+      true ->
+        raise ShapeError,
+          message: "incompatible_notice_source_payload: malformed predecessor members"
+    end
+  end
+
+  @wake_retry_previous_ddl """
+  CREATE TABLE wake_retry_attempts (
+    wakeId TEXT PRIMARY KEY REFERENCES wakes(wakeId),
+    rootWakeId TEXT NOT NULL REFERENCES wakes(wakeId),
+    predecessorWakeId TEXT UNIQUE REFERENCES wakes(wakeId),
+    attempt INTEGER NOT NULL CHECK (attempt >= 0),
+    sourceTurnSeq INTEGER UNIQUE REFERENCES turns(seq),
+    outcome TEXT NOT NULL CHECK (outcome IN ('pending','failed','acted','canceled')),
+    retryWakeId TEXT UNIQUE REFERENCES wakes(wakeId),
+    observedAt INTEGER NOT NULL,
+    UNIQUE (rootWakeId, attempt)
+  );
+  """
+  @wake_retry_source_scoped_ddl @wake_retry_previous_ddl
+                                |> String.replace(
+                                  "sourceTurnSeq INTEGER UNIQUE",
+                                  "sourceTurnSeq INTEGER"
+                                )
+                                |> String.replace(
+                                  "UNIQUE (rootWakeId, attempt)",
+                                  "UNIQUE (rootWakeId, attempt), UNIQUE (rootWakeId, sourceTurnSeq)"
+                                )
+  @wake_retry_root_index_ddl "CREATE INDEX wake_retry_root ON wake_retry_attempts (rootWakeId, attempt)"
+
+  # A failed carrier is one invocation of several independent semantic sources.
+  # Each source retains its own retry root and may bind to that same invocation.
+  # Qualify the exact historical/current table; preserve rows and all other guards.
+  # This final pass runs only after predecessor qualifications have succeeded.
+  defp migrate_wake_retry_source_scope(db) do
+    case DB.migration_transaction(
+           db,
+           :wake_retry_source_scope,
+           ["PRAGMA foreign_keys=OFF", "PRAGMA legacy_alter_table=ON"],
+           ["PRAGMA legacy_alter_table=OFF", "PRAGMA foreign_keys=ON"],
+           fn txn ->
+             [[actual]] =
+               Txn.q(
+                 txn,
+                 "SELECT sql FROM sqlite_master WHERE type='table' AND name='wake_retry_attempts'"
+               )
+
+             actual =
+               actual
+               |> String.replace(~s("wake_retry_attempts"), "wake_retry_attempts")
+               |> normalize_schema_sql()
+
+             objects =
+               Txn.q(txn, """
+               SELECT type,name,sql FROM sqlite_master
+               WHERE tbl_name='wake_retry_attempts' AND sql IS NOT NULL AND type IN ('index','trigger')
+               ORDER BY type,name
+               """)
+
+             unless match?([["index", "wake_retry_root", _]], objects) and
+                      normalize_schema_sql(objects |> hd() |> List.last()) ==
+                        normalize_schema_sql(@wake_retry_root_index_ddl) do
+               raise ShapeError,
+                 message: "incompatible_wake_retry_source_scope: unknown table-bound objects"
+             end
+
+             root_index_sql = objects |> hd() |> List.last()
+
+             cond do
+               actual == normalize_schema_sql(@wake_retry_source_scoped_ddl) ->
+                 :ok
+
+               actual == normalize_schema_sql(@wake_retry_previous_ddl) ->
+                 unless Txn.q(
+                          txn,
+                          "SELECT name FROM sqlite_master WHERE name='wake_retry_attempts_source_scope'"
+                        ) == [] do
+                   raise ShapeError,
+                     message:
+                       "incompatible_wake_retry_source_scope: temporary object already exists"
+                 end
+
+                 target =
+                   String.replace(
+                     @wake_retry_source_scoped_ddl,
+                     "wake_retry_attempts",
+                     "wake_retry_attempts_source_scope"
+                   )
+
+                 :ok = Txn.exec(txn, target)
+
+                 :ok =
+                   Txn.exec(txn, """
+                   INSERT INTO wake_retry_attempts_source_scope
+                     (rowid,wakeId,rootWakeId,predecessorWakeId,attempt,sourceTurnSeq,outcome,retryWakeId,observedAt)
+                   SELECT rowid,wakeId,rootWakeId,predecessorWakeId,attempt,sourceTurnSeq,outcome,retryWakeId,observedAt
+                   FROM wake_retry_attempts;
+                   DROP TABLE wake_retry_attempts;
+                   ALTER TABLE wake_retry_attempts_source_scope RENAME TO wake_retry_attempts;
+                   """)
+
+                 # Preserve the qualified predecessor index's exact stored SQL.
+                 :ok = Txn.exec(txn, root_index_sql)
+
+                 unless Txn.q(txn, "PRAGMA foreign_key_check(wake_retry_attempts)") == [] do
+                   raise ShapeError,
+                     message:
+                       "incompatible_wake_retry_source_scope: invalid retry lineage references"
+                 end
+
+                 :ok
+
+               true ->
+                 raise ShapeError,
+                   message: "incompatible_wake_retry_source_scope: malformed retry table"
+             end
+           end
+         ) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "wake retry source migration failed and rolled back: #{Exception.message(error)}"
     end
   end
 
@@ -1783,9 +2488,16 @@ defmodule Tightbeam.Schema do
     liveness_objects =
       cond do
         supervision_receipt_cancellation_active?(txn, shape) ->
-          Enum.reject(
-            @supervision_receipt_cancellation_liveness_objects,
-            &(&1.name == "supervision_receipt_cancellation_epoch")
+          liveness_objects =
+            if shape in [@assignment_source_replacement_shape, @notice_source_payload_shape],
+              do: @assignment_source_replacement_liveness_objects,
+              else: @supervision_receipt_cancellation_liveness_objects
+
+          Enum.reject(liveness_objects, &(&1.name == "supervision_receipt_cancellation_epoch"))
+
+        shape in [@assignment_source_replacement_shape, @notice_source_payload_shape] ->
+          incompatible_supervision_liveness!(
+            "assignment source replacement stamp lacks its exact cancellation activation marker"
           )
 
         shape in [
@@ -1856,12 +2568,19 @@ defmodule Tightbeam.Schema do
            @agent_reparent_shape,
            @artifact_origin_shape,
            @identity_publication_denial_diagnostic_shape,
+           @notice_source_payload_shape,
+           @assignment_source_replacement_shape,
            @work_item_owner_link_shape
          ],
          do: reparent_liveness_enforcement_objects(),
          else: @supervision_liveness_enforcement_objects
 
-    Enum.each(enforcement_objects, fn object ->
+    batch_delivery_guard_names =
+      Enum.map(@supervision_batch_delivery_previous_triggers, &elem(&1, 0))
+
+    enforcement_objects
+    |> Enum.reject(&(&1.name in batch_delivery_guard_names))
+    |> Enum.each(fn object ->
       if owned_object_present?(txn, object) do
         validate_owned_object!(txn, object)
       else
@@ -2297,6 +3016,67 @@ defmodule Tightbeam.Schema do
     raise ShapeError, message: "incompatible_supervision_liveness_v1: #{detail}"
   end
 
+  defp migrate_supervision_batch_delivery_guards_in_txn(%Txn{} = txn) do
+    Enum.each(@supervision_batch_delivery_previous_triggers, fn {name, previous_sql} ->
+      expected = Enum.find(@supervision_liveness_enforcement_objects, &(&1.name == name))
+      migrate_owned_liveness_trigger_in_txn(txn, expected, previous_sql)
+    end)
+
+    :ok
+  end
+
+  defp migrate_supervision_batch_delivery_guards(db) do
+    case DB.transaction(db, fn txn -> migrate_supervision_batch_delivery_guards_in_txn(txn) end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "incompatible_supervision_liveness_v1: batch guard migration failed: #{Exception.message(error)}"
+    end
+  end
+
+  defp migrate_owned_liveness_trigger_in_txn(txn, expected, previous_sql) do
+    case Txn.q(
+           txn,
+           "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
+           [expected.name]
+         ) do
+      [] ->
+        :ok = Txn.exec(txn, expected.sql)
+        validate_owned_object!(txn, expected)
+
+      [[actual_sql]] when is_binary(actual_sql) ->
+        current = normalize_schema_sql(expected.sql)
+        actual = normalize_schema_sql(actual_sql)
+        previous = normalize_schema_sql(previous_sql)
+
+        cond do
+          actual == current ->
+            :ok
+
+          actual == previous ->
+            :ok = Txn.exec(txn, "DROP TRIGGER #{expected.name}")
+            :ok = Txn.exec(txn, expected.sql)
+            validate_owned_object!(txn, expected)
+
+          true ->
+            incompatible_supervision_liveness!(
+              "malformed owned object #{expected.name} before batched delivery migration"
+            )
+        end
+
+      rows ->
+        incompatible_supervision_liveness!(
+          "malformed owned object #{expected.name}: #{inspect(rows)}"
+        )
+    end
+  end
+
   @doc false
   @spec upgrade_supervision_receipt_cancellation_v1(DB.server()) :: :ok
   def upgrade_supervision_receipt_cancellation_v1(db) do
@@ -2325,7 +3105,17 @@ defmodule Tightbeam.Schema do
   end
 
   defp upgrade_supervision_receipt_cancellation_v1_in_txn(%Txn{} = txn) do
-    [[@work_item_owner_link_shape]] = Txn.q(txn, "SELECT shape FROM schema_stamp")
+    [[shape]] = Txn.q(txn, "SELECT shape FROM schema_stamp")
+
+    unless shape in [
+             @work_item_owner_link_shape,
+             @assignment_source_replacement_shape,
+             @notice_source_payload_shape
+           ] do
+      incompatible_supervision_liveness!(
+        "receipt cancellation predecessor stamp #{inspect(shape)}"
+      )
+    end
 
     marker =
       Enum.find(@supervision_receipt_cancellation_liveness_objects, fn object ->
@@ -2429,6 +3219,176 @@ defmodule Tightbeam.Schema do
       rows ->
         raise ShapeError,
           message: "receipt cancellation migration left invalid foreign keys: #{inspect(rows)}"
+    end
+  end
+
+  @doc false
+  @spec upgrade_assignment_source_replacement_v1(DB.server()) :: :ok
+  def upgrade_assignment_source_replacement_v1(db) do
+    {:ok, [[foreign_keys]]} = DB.query(db, "PRAGMA foreign_keys")
+    {:ok, [[legacy_alter_table]]} = DB.query(db, "PRAGMA legacy_alter_table")
+    :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
+    :ok = DB.execute(db, "PRAGMA legacy_alter_table = ON")
+
+    try do
+      case DB.transaction(db, &upgrade_assignment_source_replacement_v1_in_txn/1) do
+        {:ok, :ok} ->
+          :ok
+
+        {:error, %ShapeError{} = error} ->
+          raise error
+
+        {:error, error} ->
+          raise ShapeError,
+            message:
+              "incompatible_assignment_source_replacement_v1: migration failed: #{Exception.message(error)}"
+      end
+    after
+      :ok = DB.execute(db, "PRAGMA legacy_alter_table = #{legacy_alter_table}")
+      :ok = DB.execute(db, "PRAGMA foreign_keys = #{foreign_keys}")
+    end
+  end
+
+  defp upgrade_assignment_source_replacement_v1_in_txn(%Txn{} = txn) do
+    marker =
+      Enum.find(@supervision_receipt_cancellation_liveness_objects, fn object ->
+        object.name == "supervision_receipt_cancellation_epoch"
+      end)
+
+    marker_shape = fn ->
+      validate_owned_object!(txn, marker)
+
+      case Txn.q(
+             txn,
+             "SELECT shape FROM supervision_receipt_cancellation_epoch WHERE id=0"
+           ) do
+        [[@supervision_receipt_cancellation_shape]] ->
+          :ok
+
+        rows ->
+          incompatible_supervision_liveness!(
+            "malformed receipt cancellation marker #{inspect(rows)}"
+          )
+      end
+    end
+
+    case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+      [[shape]]
+      when shape in [@assignment_source_replacement_shape, @notice_source_payload_shape] ->
+        :ok = marker_shape.()
+
+        Enum.each(
+          Enum.filter(@assignment_source_replacement_liveness_objects, fn object ->
+            object.name in [
+              "wake_cancellations",
+              "wake_cancellations_pending_insert",
+              "wakes_typed_cancellation_required"
+            ]
+          end),
+          &validate_owned_object!(txn, &1)
+        )
+
+        :ok
+
+      [[@work_item_owner_link_shape]] ->
+        :ok = marker_shape.()
+
+        old_table =
+          Enum.find(@supervision_receipt_cancellation_liveness_objects, fn object ->
+            object.name == "wake_cancellations"
+          end)
+
+        new_table =
+          Enum.find(@assignment_source_replacement_liveness_objects, fn object ->
+            object.name == "wake_cancellations"
+          end)
+
+        old_triggers =
+          Enum.filter(@supervision_receipt_cancellation_liveness_objects, fn object ->
+            object.type == "trigger" and
+              object.name in [
+                "wake_cancellations_pending_insert",
+                "wakes_typed_cancellation_required"
+              ]
+          end)
+
+        new_triggers =
+          Enum.filter(@assignment_source_replacement_liveness_objects, fn object ->
+            object.type == "trigger" and
+              object.name in [
+                "wake_cancellations_pending_insert",
+                "wakes_typed_cancellation_required"
+              ]
+          end)
+
+        validate_owned_object!(txn, old_table)
+        Enum.each(old_triggers, &validate_owned_object!(txn, &1))
+
+        Enum.each(old_triggers, fn trigger ->
+          :ok = Txn.exec(txn, "DROP TRIGGER #{trigger.name}")
+        end)
+
+        [[cancellation_count]] = Txn.q(txn, "SELECT COUNT(*) FROM wake_cancellations")
+
+        :ok =
+          Txn.exec(
+            txn,
+            "ALTER TABLE wake_cancellations RENAME TO wake_cancellations_assignment_replacement_previous_v1"
+          )
+
+        :ok = Txn.exec(txn, new_table.sql)
+
+        columns =
+          "wakeId,wakeState,canceledAt,requesterKind,requesterId,reasonKind," <>
+            "causalSourceKind,causalSourceId,outcomeKind,replacementWakeId," <>
+            "dispositionKind,dispositionId,primaryWorkKind,primaryWorkId,workImpactKind," <>
+            "livenessTriggerKind,livenessTriggerId,actionNeeded"
+
+        Txn.q(
+          txn,
+          "INSERT INTO wake_cancellations (#{columns}) SELECT #{columns} FROM wake_cancellations_assignment_replacement_previous_v1"
+        )
+
+        if Txn.changes(txn) != cancellation_count do
+          raise ShapeError,
+            message:
+              "assignment source replacement migration copied #{Txn.changes(txn)} of #{cancellation_count} wake cancellations"
+        end
+
+        [[^cancellation_count]] = Txn.q(txn, "SELECT COUNT(*) FROM wake_cancellations")
+
+        :ok = Txn.exec(txn, "DROP TABLE wake_cancellations_assignment_replacement_previous_v1")
+        Enum.each(new_triggers, fn trigger -> :ok = Txn.exec(txn, trigger.sql) end)
+        validate_owned_object!(txn, new_table)
+        Enum.each(new_triggers, &validate_owned_object!(txn, &1))
+
+        case Txn.q(txn, "PRAGMA foreign_key_check") do
+          [] ->
+            :ok
+
+          rows ->
+            raise ShapeError,
+              message:
+                "assignment source replacement migration left invalid foreign keys: #{inspect(rows)}"
+        end
+
+        Txn.q(txn, "UPDATE schema_stamp SET shape=?1,stampedAt=?2 WHERE shape=?3", [
+          @assignment_source_replacement_shape,
+          System.system_time(:millisecond),
+          @work_item_owner_link_shape
+        ])
+
+        if Txn.changes(txn) != 1 do
+          raise ShapeError,
+            message:
+              "migration #{@work_item_owner_link_shape} -> #{@assignment_source_replacement_shape} lost its exact stamp transition"
+        end
+
+        :ok
+
+      rows ->
+        raise ShapeError,
+          message: "incompatible assignment source replacement predecessor: #{inspect(rows)}"
     end
   end
 
@@ -2581,6 +3541,10 @@ defmodule Tightbeam.Schema do
         check_work_item_owner_link_shape(db)
 
       {:ok, [[shape]]}
+      when shape in [@assignment_source_replacement_shape, @notice_source_payload_shape] ->
+        check_work_item_owner_link_shape(db)
+
+      {:ok, [[shape]]}
       when shape in [
              @cursor_provider_shape,
              @cannot_proceed_shape,
@@ -2686,7 +3650,7 @@ defmodule Tightbeam.Schema do
         this Tightbeam database was written by a different build.
 
           stamped: #{found}
-          this build: #{@work_item_owner_link_shape}
+          this build: #{@notice_source_payload_shape}
         This build can migrate #{@model_identity_shape} or #{@operator_decision_shape}
         to #{@terminal_decision_liveness_shape}, then #{@effort_request_exit_previous_shape}.
         It can migrate #{@terminal_decision_shape} through
@@ -2699,7 +3663,8 @@ defmodule Tightbeam.Schema do
         It then migrates to #{@cannot_proceed_shape}, followed atomically by
         #{@settlement_shape}, #{@terminal_credential_shape}, #{@agent_reparent_shape},
         #{@artifact_origin_shape}, #{@identity_publication_denial_diagnostic_shape},
-        then #{@work_item_owner_link_shape}.
+        then #{@work_item_owner_link_shape}, #{@assignment_source_replacement_shape},
+        and #{@notice_source_payload_shape}.
         No migration is defined for the stamped shape above. Keep the database
         in place and run a Tightbeam build that recognizes that exact stamp.
         """
@@ -2712,7 +3677,7 @@ defmodule Tightbeam.Schema do
         this Tightbeam database carries MORE THAN ONE shape stamp.
 
           stamped: #{rows |> List.flatten() |> Enum.join(", ")}
-          this build: #{@work_item_owner_link_shape}
+          this build: #{@notice_source_payload_shape}
         Nothing in Tightbeam writes a second stamp, so this database was
         assembled by something else. Move it aside and let it be recreated.
         """
@@ -2785,6 +3750,8 @@ defmodule Tightbeam.Schema do
                     @agent_reparent_shape,
                     @artifact_origin_shape,
                     @identity_publication_denial_diagnostic_shape,
+                    @notice_source_payload_shape,
+                    @assignment_source_replacement_shape,
                     @work_item_owner_link_shape
                   ] ->
                :ok
@@ -2844,6 +3811,8 @@ defmodule Tightbeam.Schema do
   defp bootstrap_module(db, Tightbeam.Wakes, _current?),
     do: Tightbeam.Wakes.ensure_historical_schema(db)
 
+  defp bootstrap_module(_db, Tightbeam.NoticeBatcher, _current?), do: :ok
+
   defp bootstrap_module(db, Tightbeam.Toplines, _current?),
     do: Tightbeam.Toplines.ensure_historical_schema(db)
 
@@ -2869,6 +3838,8 @@ defmodule Tightbeam.Schema do
              @agent_reparent_shape,
              @artifact_origin_shape,
              @identity_publication_denial_diagnostic_shape,
+             @notice_source_payload_shape,
+             @assignment_source_replacement_shape,
              @work_item_owner_link_shape
            ] ->
         Tightbeam.Assignments.ensure_schema(db)
@@ -2891,6 +3862,8 @@ defmodule Tightbeam.Schema do
              @agent_reparent_shape,
              @artifact_origin_shape,
              @identity_publication_denial_diagnostic_shape,
+             @notice_source_payload_shape,
+             @assignment_source_replacement_shape,
              @work_item_owner_link_shape
            ] ->
         :ok
@@ -2988,6 +3961,8 @@ defmodule Tightbeam.Schema do
                     @agent_reparent_shape,
                     @artifact_origin_shape,
                     @identity_publication_denial_diagnostic_shape,
+                    @notice_source_payload_shape,
+                    @assignment_source_replacement_shape,
                     @work_item_owner_link_shape
                   ] ->
                :ok
@@ -3058,6 +4033,8 @@ defmodule Tightbeam.Schema do
                     @agent_reparent_shape,
                     @artifact_origin_shape,
                     @identity_publication_denial_diagnostic_shape,
+                    @notice_source_payload_shape,
+                    @assignment_source_replacement_shape,
                     @work_item_owner_link_shape
                   ] ->
                validate_artifact_content_schema!(txn)
@@ -3156,6 +4133,8 @@ defmodule Tightbeam.Schema do
              @agent_reparent_shape,
              @artifact_origin_shape,
              @identity_publication_denial_diagnostic_shape,
+             @notice_source_payload_shape,
+             @assignment_source_replacement_shape,
              @work_item_owner_link_shape
            ] ->
         :ok
@@ -3604,8 +4583,17 @@ defmodule Tightbeam.Schema do
                  :ok = Txn.exec(txn, index.sql)
                end
 
+               # O2 activation and the remaining bootstrap pass still follow
+               # this predecessor migration. Keep batch-table references out
+               # of its triggers until NoticeBatcher has created those tables;
+               # the exact current guards are installed by the later guarded
+               # trigger migration in ensure_all/1.
+               previous_batch_delivery_triggers =
+                 Map.new(@supervision_batch_delivery_previous_triggers)
+
                Enum.each(@supervision_liveness_enforcement_objects, fn trigger ->
-                 :ok = Txn.exec(txn, trigger.sql)
+                 sql = Map.get(previous_batch_delivery_triggers, trigger.name, trigger.sql)
+                 :ok = Txn.exec(txn, sql)
                end)
              end
 
@@ -4162,9 +5150,21 @@ defmodule Tightbeam.Schema do
 
     # The sidecar admission trigger belongs to the final wake shape. Recreate
     # it only after the row-driven wait columns exist, not on legacy wakes.
+    # The three batch-aware supervision guards are installed later, after the
+    # batch tables have been bootstrapped. Older predecessor migrations still
+    # perform table renames after this transaction, and SQLite reparses every
+    # trigger during those renames. Keep the exact prior guards in place until
+    # `migrate_supervision_batch_delivery_guards_in_txn/1` can validate and
+    # replace them against an existing notice_batches schema.
+    previous_batch_delivery_triggers =
+      Map.new(@supervision_batch_delivery_previous_triggers)
+
     wake_bound_objects
     |> Enum.reject(&(&1.name == "supervision_liveness_sidecar_insert_coherent"))
-    |> Enum.each(fn object -> :ok = Txn.exec(txn, object.sql) end)
+    |> Enum.each(fn object ->
+      sql = Map.get(previous_batch_delivery_triggers, object.name, object.sql)
+      :ok = Txn.exec(txn, sql)
+    end)
 
     case Txn.q(txn, "PRAGMA foreign_key_check") do
       [] ->
@@ -4205,6 +5205,8 @@ defmodule Tightbeam.Schema do
              @agent_reparent_shape,
              @artifact_origin_shape,
              @identity_publication_denial_diagnostic_shape,
+             @notice_source_payload_shape,
+             @assignment_source_replacement_shape,
              @work_item_owner_link_shape
            ] ->
         :ok
@@ -4239,6 +5241,8 @@ defmodule Tightbeam.Schema do
              @agent_reparent_shape,
              @artifact_origin_shape,
              @identity_publication_denial_diagnostic_shape,
+             @notice_source_payload_shape,
+             @assignment_source_replacement_shape,
              @work_item_owner_link_shape
            ] ->
         :ok
@@ -4345,6 +5349,8 @@ defmodule Tightbeam.Schema do
              @agent_reparent_shape,
              @artifact_origin_shape,
              @identity_publication_denial_diagnostic_shape,
+             @notice_source_payload_shape,
+             @assignment_source_replacement_shape,
              @work_item_owner_link_shape
            ] ->
         :ok
@@ -4595,6 +5601,8 @@ defmodule Tightbeam.Schema do
              @agent_reparent_shape,
              @artifact_origin_shape,
              @identity_publication_denial_diagnostic_shape,
+             @notice_source_payload_shape,
+             @assignment_source_replacement_shape,
              @work_item_owner_link_shape
            ] ->
         :ok
@@ -4617,6 +5625,8 @@ defmodule Tightbeam.Schema do
                     @agent_reparent_shape,
                     @artifact_origin_shape,
                     @identity_publication_denial_diagnostic_shape,
+                    @notice_source_payload_shape,
+                    @assignment_source_replacement_shape,
                     @work_item_owner_link_shape
                   ] ->
                :ok
@@ -4652,6 +5662,8 @@ defmodule Tightbeam.Schema do
              [[shape]]
              when shape in [
                     @work_item_owner_link_shape,
+                    @notice_source_payload_shape,
+                    @assignment_source_replacement_shape,
                     @identity_publication_denial_diagnostic_shape
                   ] ->
                :ok
@@ -4705,6 +5717,8 @@ defmodule Tightbeam.Schema do
              [[shape]]
              when shape in [
                     @work_item_owner_link_shape,
+                    @notice_source_payload_shape,
+                    @assignment_source_replacement_shape,
                     @identity_publication_denial_diagnostic_shape
                   ] ->
                :ok
@@ -4756,6 +5770,8 @@ defmodule Tightbeam.Schema do
              [[shape]]
              when shape in [
                     @work_item_owner_link_shape,
+                    @notice_source_payload_shape,
+                    @assignment_source_replacement_shape,
                     @identity_publication_denial_diagnostic_shape
                   ] ->
                validate_artifact_origins!(txn)
@@ -4816,6 +5832,8 @@ defmodule Tightbeam.Schema do
              [[shape]]
              when shape in [
                     @identity_publication_denial_diagnostic_shape,
+                    @notice_source_payload_shape,
+                    @assignment_source_replacement_shape,
                     @work_item_owner_link_shape
                   ] ->
                :ok
@@ -4856,7 +5874,12 @@ defmodule Tightbeam.Schema do
   defp upgrade_work_item_delivery_owner_link(db) do
     case DB.transaction(db, fn txn ->
            case Txn.q(txn, "SELECT shape FROM schema_stamp") do
-             [[@work_item_owner_link_shape]] ->
+             [[shape]]
+             when shape in [
+                    @work_item_owner_link_shape,
+                    @assignment_source_replacement_shape,
+                    @notice_source_payload_shape
+                  ] ->
                :ok
 
              [[@identity_publication_denial_diagnostic_shape]] ->

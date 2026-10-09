@@ -15,7 +15,7 @@ defmodule Tightbeam.O2SchemaMigrationTest do
 
   test "fresh O2 bootstrap and restart preserve nullable notice state", %{db: db} do
     assert :ok = Schema.ensure_all(db)
-    assert stamp(db) == "work-item-delivery-owner-v1-019"
+    assert stamp(db) == "notice-source-storage-v1-019"
     seed_episode(db)
     assert rows(db, "SELECT noticeState FROM rail_remedy_episodes") == [[nil]]
     assert :ok = Schema.ensure_all(db)
@@ -46,13 +46,21 @@ defmodule Tightbeam.O2SchemaMigrationTest do
              )
 
     before_rows = rows(db, "SELECT * FROM wake_cancellations")
+    wake_columns = rows(db, "PRAGMA table_info(wakes)") |> Enum.map(&Enum.at(&1, 1))
     before_wakes = rows(db, "SELECT * FROM wakes ORDER BY wakeId")
     before_episode = rows(db, "SELECT * FROM rail_remedy_episodes")
     before_triggers = triggers(db)
     assert :ok = Schema.ensure_all(db)
-    assert stamp(db) == "work-item-delivery-owner-v1-019"
+    assert stamp(db) == "notice-source-storage-v1-019"
     assert rows(db, "SELECT * FROM wake_cancellations") == before_rows
-    assert rows(db, "SELECT * FROM wakes ORDER BY wakeId") == before_wakes
+
+    assert rows(db, "SELECT #{Enum.join(wake_columns, ",")} FROM wakes ORDER BY wakeId") ==
+             before_wakes
+
+    assert rows(
+             db,
+             "SELECT sourceAttachments,sourceClientIdentity,sourceVisibilityScope,sourceAddress FROM wakes ORDER BY wakeId"
+           ) == [[nil, nil, nil, nil]]
 
     assert rows(
              db,
@@ -113,7 +121,7 @@ defmodule Tightbeam.O2SchemaMigrationTest do
     assert rows(db, "PRAGMA foreign_keys") == [[1]]
     assert :ok = Schema.ensure_all(db)
     assert rows(db, "SELECT * FROM wake_cancellations") == before_rows
-    assert stamp(db) == "work-item-delivery-owner-v1-019"
+    assert stamp(db) == "notice-source-storage-v1-019"
 
     assert rows(db, "SELECT kind FROM attests WHERE id='att_historical_surrender'") == [
              ["surrender"]
@@ -261,7 +269,7 @@ defmodule Tightbeam.O2SchemaMigrationTest do
     assert rows(db, "SELECT name FROM sqlite_master WHERE name='wake_cancellations'") == []
     :ok = DB.execute(db, "DROP TRIGGER o2_test_refuse_activation")
     assert :ok = Schema.ensure_all(db)
-    assert stamp(db) == "work-item-delivery-owner-v1-019"
+    assert stamp(db) == "notice-source-storage-v1-019"
     assert rows(db, "SELECT noticeState FROM rail_remedy_episodes") == [[nil]]
     assert_two_shapes(db)
   end
@@ -380,6 +388,41 @@ defmodule Tightbeam.O2SchemaMigrationTest do
       "SELECT ancestor.sessionKey,ancestor.spawnedBy",
       "SELECT ancestor.sessionKey,#{Tightbeam.Org.current_parent_sql("ancestor")}"
     )
+  end
+
+  defp successor_guard(name, sql)
+       when name in [
+              "supervision_fired_lineage_sidecar_identity_immutable",
+              "supervision_fired_lineage_sidecar_required_delete"
+            ] do
+    marker = "w.reresolve = 'lineage'\n)"
+
+    replacement =
+      "w.reresolve = 'lineage'\n  UNION ALL\n" <>
+        "  SELECT 1 FROM notice_batch_members m\n" <>
+        "  JOIN notice_batches b ON b.batchId=m.batchId AND b.deliveryWakeId=OLD.wakeId\n" <>
+        "  JOIN wakes w ON w.wakeId=m.sourceWakeId\n" <>
+        "  WHERE m.state='included' AND w.state='fired' AND w.consumer='prompt'\n" <>
+        "    AND w.origin='process:tightbeam' AND w.reresolve='lineage'\n)"
+
+    assert String.contains?(sql, marker)
+    String.replace(sql, marker, replacement)
+  end
+
+  defp successor_guard("supervision_lineage_fire_requires_sidecar", sql) do
+    marker = "WHERE t.wakeId = NEW.wakeId AND t.assignmentId = NEW.assignmentId\n    )"
+
+    replacement =
+      "WHERE t.wakeId = NEW.wakeId AND t.assignmentId = NEW.assignmentId\n" <>
+        "      UNION ALL\n" <>
+        "      SELECT 1 FROM turns t\n" <>
+        "      JOIN notice_batches b ON b.deliveryWakeId=t.wakeId\n" <>
+        "      JOIN notice_batch_members m ON m.batchId=b.batchId AND m.state='included'\n" <>
+        "      JOIN wakes source ON source.wakeId=m.sourceWakeId\n" <>
+        "      WHERE source.wakeId=NEW.wakeId AND source.assignmentId=NEW.assignmentId\n    )"
+
+    assert String.contains?(sql, marker)
+    String.replace(sql, marker, replacement)
   end
 
   defp successor_guard(_name, sql), do: sql

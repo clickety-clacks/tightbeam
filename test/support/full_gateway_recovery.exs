@@ -1,7 +1,7 @@
 defmodule Tightbeam.RecoveryScenario do
   import ExUnit.Assertions
 
-  alias Tightbeam.{DB, Gateway, Model, Org, Placement, Wakes}
+  alias Tightbeam.{DB, Gateway, Model, NoticeBatcher, Org, Placement, Wakes}
 
   def await!(predicate, deadline \\ nil, diagnostic \\ nil) do
     deadline = deadline || System.monotonic_time(:millisecond) + 60_000
@@ -37,6 +37,18 @@ defmodule Tightbeam.RecoveryScenario do
       "columns",
       Map.new(~w(assignments wakes turns), fn table ->
         {table, Enum.map(rows("PRAGMA table_info(#{table})"), &Enum.at(&1, 1))}
+      end)
+    )
+    |> Map.put(
+      "notice_source_refs",
+      Map.new(rows("SELECT wakeId FROM wakes WHERE digest=0 AND consumer='prompt'"), fn [
+                                                                                          source_wake_id
+                                                                                        ] ->
+        {
+          source_wake_id,
+          NoticeBatcher.source_refs(DB, source_wake_id)
+          |> Enum.map(& &1.delivery_wake_id)
+        }
       end)
     )
   end
@@ -108,8 +120,18 @@ defmodule Tightbeam.RecoveryScenario do
       rows("SELECT status FROM turns WHERE sessionKey=?1", ["agent:recovery:a"]) == [["running"]]
     end)
 
-    :appended =
-      Gateway.deliver_prompt("agent:recovery:a", "user:recovery-admin", "RECOVERY_SUCCESSOR_A")
+    :queued =
+      Gateway.deliver_prompt("agent:recovery:a", "user:recovery-admin", "RECOVERY_SUCCESSOR_A",
+        wake_id: "w_recovery_successor_a"
+      )
+
+    # The running recipient retains the successor as an editable source; no
+    # second actual turn is preformed before readiness or OS death.
+    assert %{state: "pending", prompt: "RECOVERY_SUCCESSOR_A"} =
+             Wakes.get(DB, "w_recovery_successor_a")
+
+    assert NoticeBatcher.source_refs(DB, "w_recovery_successor_a") == []
+    [] = rows("SELECT seq FROM turns WHERE wakeId='w_recovery_successor_a'")
 
     # Freeze only the test arena scheduler while constructing the two durable
     # delivery boundaries. Process death removes this suspension; normal restart
@@ -136,7 +158,7 @@ defmodule Tightbeam.RecoveryScenario do
       rows("SELECT status FROM turns WHERE wakeId='w_recovery_c'") == [["delivered"]]
     end)
 
-    [["running"], ["queued"]] =
+    [["running"]] =
       rows("SELECT status FROM turns WHERE sessionKey='agent:recovery:a' ORDER BY seq")
 
     [] = rows("SELECT seq FROM turns WHERE wakeId='w_recovery_b'")
@@ -156,16 +178,17 @@ defmodule Tightbeam.RecoveryScenario do
           "SELECT status FROM turns WHERE sessionKey='agent:recovery:a' AND wakeId IS NULL ORDER BY seq"
         ) == [
           ["failed_unknown"],
-          ["delivered"],
           ["delivered"]
         ] and
-          rows("SELECT status FROM turns WHERE wakeId='w_recovery_b'") == [["delivered"]] and
+          delivered_source_statuses("w_recovery_successor_a") == [["delivered"]] and
+          delivered_source_statuses("w_recovery_b") == [["delivered"]] and
           rows(
             "SELECT state FROM wakes WHERE wakeId IN ('w_recovery_b','w_recovery_c') ORDER BY wakeId"
           ) == [["fired"], ["fired"]] and
-          rows("SELECT state FROM wakes WHERE assignmentId='asg_recovery_preserve'") == [
-            ["fired"]
-          ] and
+          rows("SELECT state FROM wakes WHERE assignmentId='asg_recovery_preserve' AND digest=0") ==
+            [
+              ["fired"]
+            ] and
           rows("SELECT status FROM turns WHERE assignmentId='asg_recovery_preserve'") == [
             ["delivered"]
           ]
@@ -187,11 +210,39 @@ defmodule Tightbeam.RecoveryScenario do
     ] =
       rows("""
       SELECT seq,status,messageId,origin,prompt
-      FROM turns WHERE sessionKey='agent:recovery:a' AND wakeId IS NULL ORDER BY seq
+      FROM turns t WHERE sessionKey='agent:recovery:a' AND (
+        wakeId IS NULL OR EXISTS (
+          SELECT 1 FROM notice_batches b JOIN notice_batch_members m ON m.batchId=b.batchId
+          WHERE b.deliveryWakeId=t.wakeId AND m.sourceWakeId='w_recovery_successor_a'
+            AND m.state='included' AND b.state='delivered'
+        )
+      ) ORDER BY seq
       """)
 
     assert source_turn_seq < successor_turn_seq
     assert successor_turn_seq < redelivery_turn_seq
+
+    assert %{state: "fired", prompt: "RECOVERY_SUCCESSOR_A"} =
+             Wakes.get(DB, "w_recovery_successor_a")
+
+    assert [
+             %{
+               delivery_wake_id: successor_carrier_id,
+               member_state: "included",
+               batch_state: "delivered"
+             }
+           ] =
+             NoticeBatcher.source_refs(DB, "w_recovery_successor_a")
+
+    [[^successor_turn_seq]] =
+      rows("SELECT seq FROM turns WHERE wakeId=?1", [successor_carrier_id])
+
+    [[0]] = rows("SELECT count(*) FROM turns WHERE wakeId='w_recovery_successor_a'")
+
+    [[1]] =
+      rows(
+        "SELECT count(*) FROM messages WHERE sessionKey='agent:recovery:a' AND content LIKE '%RECOVERY_SUCCESSOR_A%'"
+      )
 
     [[1]] =
       rows(
@@ -207,7 +258,16 @@ defmodule Tightbeam.RecoveryScenario do
     [["delivered"]] = rows("SELECT status FROM turns WHERE wakeId='w_recovery_c'")
     # Publication/fired and consumer terminal are independent assertions.
     for suffix <- ~w(b c) do
-      [[1]] = rows("SELECT COUNT(*) FROM turns WHERE wakeId=?1", ["w_recovery_#{suffix}"])
+      source_wake_id = "w_recovery_#{suffix}"
+
+      case NoticeBatcher.source_refs(DB, source_wake_id) do
+        [%{delivery_wake_id: carrier_wake_id}] when is_binary(carrier_wake_id) ->
+          [[1]] = rows("SELECT COUNT(*) FROM turns WHERE wakeId=?1", [carrier_wake_id])
+          [["delivered"]] = rows("SELECT status FROM turns WHERE wakeId=?1", [carrier_wake_id])
+
+        [] ->
+          [[1]] = rows("SELECT COUNT(*) FROM turns WHERE wakeId=?1", [source_wake_id])
+      end
 
       [[1]] =
         rows("SELECT COUNT(*) FROM messages WHERE sessionKey=?1 AND content LIKE ?2", [
@@ -233,13 +293,45 @@ defmodule Tightbeam.RecoveryScenario do
         rows(
           "SELECT wakeId,sessionKey,state,firedAt FROM wakes WHERE wakeId IN ('w_recovery_b','w_recovery_c') ORDER BY wakeId"
         ),
+      batch_sources:
+        Enum.map(~w(w_recovery_b w_recovery_c), fn source_wake_id ->
+          {source_wake_id, NoticeBatcher.source_refs(DB, source_wake_id)}
+        end),
+      carrier_turns:
+        Enum.flat_map(~w(w_recovery_b w_recovery_c), fn source_wake_id ->
+          Enum.map(NoticeBatcher.source_refs(DB, source_wake_id), fn reference ->
+            {reference.delivery_wake_id,
+             rows(
+               "SELECT sessionKey,status,error FROM turns WHERE wakeId=?1",
+               [reference.delivery_wake_id]
+             )}
+          end)
+        end),
       redelivery:
         rows(
           "SELECT sessionKey,sourceTurnSeq,restorationTurnSeq,redeliveryTurnSeq,failureClass,parentSessionKey FROM health_redelivery_attempts WHERE sessionKey='agent:recovery:a'"
         ),
       assignment_notice:
-        rows("SELECT reminderState FROM assignments WHERE id='asg_recovery_preserve'")
+        rows("SELECT reminderState FROM assignments WHERE id='asg_recovery_preserve'"),
+      assignment_wakes:
+        rows(
+          "SELECT wakeId,state,digest FROM wakes WHERE assignmentId='asg_recovery_preserve' ORDER BY digest,wakeId"
+        ),
+      assignment_turns:
+        rows(
+          "SELECT seq,wakeId,status,assignmentId FROM turns WHERE assignmentId='asg_recovery_preserve' ORDER BY seq"
+        )
     }
+  end
+
+  defp delivered_source_statuses(source_wake_id) do
+    case NoticeBatcher.source_refs(DB, source_wake_id) do
+      [%{delivery_wake_id: carrier_wake_id}] when is_binary(carrier_wake_id) ->
+        rows("SELECT status FROM turns WHERE wakeId=?1", [carrier_wake_id])
+
+      [] ->
+        rows("SELECT status FROM turns WHERE wakeId=?1", [source_wake_id])
+    end
   end
 end
 

@@ -777,10 +777,12 @@ defmodule Tightbeam.Gateway do
             db: db,
             device_id: p.device_id,
             client_message_id: p.client_message_id,
-            attachments: Map.get(p, :attachments, [])
+            attachments: Map.get(p, :attachments, []),
+            creator_session_key: call.session_key,
+            queue_when_busy: true
           )
 
-        if outcome == :appended,
+        if outcome in [:appended, :queued],
           do: %{ack: p.client_message_id},
           else: %{dedupe: to_string(outcome)}
       end,
@@ -872,6 +874,17 @@ defmodule Tightbeam.Gateway do
                   error
 
                 {fact, filed?} ->
+                  fact =
+                    if is_map(fact) and is_integer(fact[:fact_id]) do
+                      Map.put(
+                        fact,
+                        :condition_wake_hint,
+                        ConditionFacts.wake_hint(fact.kind, fact.scope)
+                      )
+                    else
+                      fact
+                    end
+
                   if call[:firehose_effect_requested],
                     do: {:firehose_effect, fact, filed?},
                     else: fact
@@ -1343,6 +1356,7 @@ defmodule Tightbeam.Gateway do
           |> maybe_put_progress_interval(config)
           |> Map.put(:supervision_interval_ms, supervision_interval_ms(config))
           |> Map.put(:on_assignment_change, assignment_change)
+          |> Map.put(:wake_scheduler, Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler))
           # Referent verification reaches hosts, so it needs the same placement
           # config (and the same injectable runner) the effort probe uses.
           |> Map.put(:effort_config, config)
@@ -1808,11 +1822,15 @@ defmodule Tightbeam.Gateway do
              assignment_id: assignment.id,
              job_ref: assignment.work_item_id,
              sender: "assignment repair",
+             wake_id: "repair-relaunch:#{assignment.id}",
              conn_registry: Map.get(call, :conn_registry, Tightbeam.ConnRegistry),
              lane_manager: Map.get(call, :lane_manager, Tightbeam.LaneManager)
            ) do
-        :appended -> %{ok: true, action: "relaunch", assignmentId: assignment.id}
-        result -> repair_failed(result, operation: "deliver_prompt", phase: "repair_relaunch")
+        result when result in [:appended, :queued, :duplicate] ->
+          %{ok: true, action: "relaunch", assignmentId: assignment.id}
+
+        result ->
+          repair_failed(result, operation: "deliver_prompt", phase: "repair_relaunch")
       end
     else
       %{
@@ -1924,7 +1942,12 @@ defmodule Tightbeam.Gateway do
   then broadcasts the echo and nudges the lane. Returns the dedupe outcome.
   """
   @spec deliver_prompt(String.t(), String.t(), String.t(), keyword()) ::
-          :appended | :duplicate | :conflict | :skipped | {:terminal_notice_undeliverable, map()}
+          :appended
+          | :queued
+          | :duplicate
+          | :conflict
+          | :skipped
+          | {:terminal_notice_undeliverable, map()}
   def deliver_prompt(session_key, origin, prompt, opts \\ []) do
     db = Keyword.get(opts, :db, Tightbeam.DB)
 
@@ -1939,6 +1962,15 @@ defmodule Tightbeam.Gateway do
       )
 
     case result do
+      {:ok, {:staged, _wake}} ->
+        try do
+          Wakes.fire_due(Keyword.get(opts, :wake_scheduler, Tightbeam.WakeScheduler))
+        catch
+          :exit, {:noproc, _call} -> :ok
+        end
+
+        :queued
+
       {:ok, delivery} ->
         complete_delivery(db, delivery)
 
@@ -1955,6 +1987,7 @@ defmodule Tightbeam.Gateway do
   @doc "Delivery's DB-only core for callers already inside the DB owner transaction."
   @spec deliver_prompt_in_txn(DB.Txn.t(), String.t(), String.t(), String.t(), keyword()) ::
           {:appended, String.t(), map(), keyword()}
+          | {:staged, map()}
           | {:duplicate, map()}
           | {:conflict, map()}
           | :skipped
@@ -1966,8 +1999,14 @@ defmodule Tightbeam.Gateway do
 
       :continue ->
         case existing_wake_turn_in_txn(txn, opts[:wake_id]) do
-          nil -> deliver_resolved_prompt_in_txn(txn, session_key, origin, prompt, opts)
-          duplicate -> duplicate
+          nil ->
+            case NoticeBatcher.carrier_admission_in_txn(txn, opts[:wake_id]) do
+              :ready -> deliver_resolved_prompt_in_txn(txn, session_key, origin, prompt, opts)
+              :skipped -> :skipped
+            end
+
+          duplicate ->
+            duplicate
         end
     end
   end
@@ -2084,13 +2123,15 @@ defmodule Tightbeam.Gateway do
   defp existing_wake_turn_in_txn(_txn, wake_id) when not is_binary(wake_id), do: nil
 
   defp existing_wake_turn_in_txn(txn, wake_id) do
-    case DB.Txn.q(txn, "SELECT seq FROM turns WHERE wakeId=?1 LIMIT 1", [wake_id]) do
-      [[seq]] -> {:duplicate, %{wake_id: wake_id, turn_seq: seq}}
+    case NoticeBatcher.source_delivery_turns_in_txn(txn, wake_id) do
+      [[seq, _status, _assignment] | _] -> {:duplicate, %{wake_id: wake_id, turn_seq: seq}}
       [] -> nil
     end
   end
 
   defp deliver_prompt_once_in_txn(txn, session_key, origin, prompt, opts) do
+    opts = delivery_attachments_in_txn(txn, opts)
+
     stamped =
       case opts[:sender] do
         sender when is_binary(sender) -> "[from #{sender}]\n\n" <> prompt
@@ -2111,20 +2152,44 @@ defmodule Tightbeam.Gateway do
 
       {target, role_ref, role_fallback} when not is_nil(target) ->
         if Ledger.enqueueable_in_txn?(txn, target) do
-          case admit_supervision_controller_in_txn(txn, opts, target) do
-            :canceled ->
-              :skipped
+          case Projection.prompt_message_result_in_txn(txn, %{
+                 session_key: target,
+                 role: "user",
+                 content: stamped,
+                 raw_content: prompt,
+                 device_id: opts[:device_id],
+                 client_message_id: opts[:client_message_id]
+               }) do
+            :new ->
+              if stage_for_queue?(txn, target, opts) do
+                stage_prompt_in_txn(
+                  txn,
+                  target,
+                  origin,
+                  prompt,
+                  opts,
+                  role_ref || opts[:role_ref]
+                )
+              else
+                case admit_supervision_controller_in_txn(txn, opts, target) do
+                  :canceled ->
+                    :skipped
 
-            controller ->
-              append_and_enqueue_in_txn(
-                txn,
-                target,
-                role_ref,
-                role_fallback,
-                origin,
-                stamped,
-                Keyword.put(opts, :supervision_controller, controller)
-              )
+                  controller ->
+                    append_and_enqueue_in_txn(
+                      txn,
+                      target,
+                      role_ref,
+                      role_fallback,
+                      origin,
+                      stamped,
+                      Keyword.put(opts, :supervision_controller, controller)
+                    )
+                end
+              end
+
+            duplicate_or_conflict ->
+              duplicate_or_conflict
           end
         else
           case cancel_unavailable_supervision_controller_in_txn(txn, opts, target) do
@@ -2142,6 +2207,153 @@ defmodule Tightbeam.Gateway do
         end
     end
   end
+
+  defp stage_for_queue?(txn, target, opts) do
+    not batch_carrier_wake?(txn, opts[:wake_id]) and
+      NoticeBatcher.queued_sources_ready_for_delivery_in_txn?(
+        txn,
+        target,
+        opts[:role_ref],
+        opts[:wake_id]
+      )
+  end
+
+  defp batch_carrier_wake?(_txn, wake_id) when not is_binary(wake_id), do: false
+
+  defp batch_carrier_wake?(txn, wake_id) do
+    DB.Txn.q(txn, "SELECT digest FROM wakes WHERE wakeId=?1", [wake_id]) == [[1]]
+  end
+
+  defp delivery_attachments_in_txn(txn, opts) do
+    case opts[:wake_id] do
+      wake_id when is_binary(wake_id) ->
+        if batch_carrier_wake?(txn, wake_id) do
+          Keyword.put(
+            opts,
+            :attachments,
+            NoticeBatcher.delivery_attachments_in_txn(txn, wake_id)
+          )
+        else
+          Keyword.put_new(
+            opts,
+            :attachments,
+            NoticeBatcher.delivery_attachments_in_txn(txn, wake_id)
+          )
+        end
+
+      _ ->
+        opts
+    end
+  end
+
+  defp stage_prompt_in_txn(txn, target, origin, prompt, opts, role_ref) do
+    case existing_staged_source_in_txn(txn, target, prompt, opts[:wake_id]) do
+      {:ok, wake} ->
+        {:staged, wake}
+
+      :none ->
+        insert_staged_prompt_in_txn(txn, target, origin, prompt, opts, role_ref)
+    end
+  end
+
+  defp existing_staged_source_in_txn(_txn, _target, _prompt, wake_id)
+       when not is_binary(wake_id),
+       do: :none
+
+  defp existing_staged_source_in_txn(txn, target, prompt, wake_id) do
+    case DB.Txn.q(
+           txn,
+           "SELECT wakeId,sessionKey,origin,prompt,state,consumer,digest FROM wakes WHERE wakeId=?1",
+           [wake_id]
+         ) do
+      [[^wake_id, ^target, _origin, raw_prompt, state, "prompt", 0]]
+      when state in ["pending", "fired"] ->
+        if prompt == raw_prompt or prompt == Wakes.delivery_prompt_in_txn(txn, wake_id) do
+          case Wakes.prepare_prompt_source_for_batch_in_txn(txn, wake_id, target, prompt) do
+            {:ok, wake} -> {:ok, wake}
+            :not_found -> :none
+          end
+        else
+          :none
+        end
+
+      _ ->
+        :none
+    end
+  end
+
+  defp staged_message_sha256(prompt) when is_binary(prompt),
+    do: :crypto.hash(:sha256, prompt) |> Base.encode16(case: :lower)
+
+  defp insert_staged_prompt_in_txn(txn, target, origin, prompt, opts, role_ref) do
+    creator_session_key = opts[:creator_session_key] || staged_prompt_creator_in_txn(txn, origin)
+    device_id = opts[:device_id]
+    client_message_id = opts[:client_message_id]
+
+    payload_sha256 =
+      if is_binary(device_id) and device_id != "" and is_binary(client_message_id) and
+           client_message_id != "",
+         do: staged_message_sha256(prompt)
+
+    wake_input = %{
+      session_key: target,
+      target_role: role_ref,
+      origin: origin,
+      creator_session_key: creator_session_key,
+      prompt: prompt,
+      due_at: System.system_time(:millisecond),
+      class: opts[:class],
+      assignment_id: opts[:assignment_id],
+      work_item_id: opts[:job_ref],
+      target_gate: staged_prompt_target_gate(opts[:target_gate]),
+      replacement_assignment_id: opts[:replacement_assignment_id]
+    }
+
+    wake_input =
+      case opts[:wake_id] do
+        wake_id when is_binary(wake_id) -> Map.put(wake_input, :wake_id, wake_id)
+        _ -> wake_input
+      end
+
+    wake = Wakes.schedule_in_txn(txn, wake_input)
+
+    NoticeBatcher.persist_source_attachments_in_txn(
+      txn,
+      wake.wake_id,
+      Keyword.get(opts, :attachments, []) || []
+    )
+
+    if is_binary(device_id) and device_id != "" and is_binary(client_message_id) and
+         client_message_id != "" and is_binary(payload_sha256) do
+      NoticeBatcher.persist_source_client_in_txn(txn, wake.wake_id, %{
+        "targetSessionKey" => target,
+        "deviceId" => device_id,
+        "clientMessageId" => client_message_id,
+        "sourceWakeId" => wake.wake_id,
+        "payloadSha256" => payload_sha256,
+        "createdAt" => wake.created_at
+      })
+    end
+
+    Wakes.publish_change_in_txn(txn, "wake.scheduled", wake.wake_id)
+    {:staged, wake}
+  end
+
+  defp staged_prompt_creator_in_txn(_txn, "session:" <> session_key), do: session_key
+
+  defp staged_prompt_creator_in_txn(txn, "agent:" <> role) do
+    case DB.Txn.q(txn, "SELECT boundSessionKey FROM roles WHERE name=?1", [role]) do
+      [[session_key]] -> session_key
+      [] -> nil
+    end
+  end
+
+  defp staged_prompt_creator_in_txn(_txn, _origin), do: nil
+
+  defp staged_prompt_target_gate(%{target_gate: target_gate}) when target_gate in [0, 1],
+    do: target_gate
+
+  defp staged_prompt_target_gate(_target_gate), do: 1
 
   defp append_and_enqueue_in_txn(txn, target, role_ref, role_fallback, origin, stamped, opts) do
     input = %{
@@ -2176,6 +2388,34 @@ defmodule Tightbeam.Gateway do
         case enqueued do
           {:ok, seq} ->
             settle_supervision_controller_in_txn(txn, opts, target, seq)
+
+            opts[:wake_id]
+            |> case do
+              wake_id when is_binary(wake_id) ->
+                NoticeBatcher.carrier_source_ids_in_txn(txn, wake_id)
+                |> Enum.each(fn source_wake_id ->
+                  Supervision.batch_source_delivered_in_txn(
+                    txn,
+                    source_wake_id,
+                    target,
+                    seq
+                  )
+
+                  Tightbeam.Productions.Bubble.batch_source_delivered_in_txn(
+                    txn,
+                    source_wake_id,
+                    target,
+                    seq
+                  )
+
+                  Wakes.batch_source_delivered_in_txn(txn, source_wake_id, target)
+                  HarnessHealth.batch_source_delivered_in_txn(txn, source_wake_id, seq)
+                end)
+
+              _ ->
+                :ok
+            end
+
             fire_wake_in_txn(txn, opts)
 
             # Nag-by-re-arm: a bracket wake that just fired re-arms its
@@ -2291,7 +2531,8 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp cancel_unavailable_supervision_controller_in_txn(txn, opts, target) do
+  @doc false
+  def cancel_unavailable_supervision_controller_in_txn(txn, opts, target) do
     case opts[:wake_id] do
       wake_id when is_binary(wake_id) ->
         case DB.Txn.q(
@@ -2375,7 +2616,12 @@ defmodule Tightbeam.Gateway do
 
   @doc "Publish and lane-nudge a delivery after its transaction commits."
   @spec complete_delivery(DB.server(), term()) ::
-          :appended | :duplicate | :conflict | :skipped | {:terminal_notice_undeliverable, map()}
+          :appended
+          | :queued
+          | :duplicate
+          | :conflict
+          | :skipped
+          | {:terminal_notice_undeliverable, map()}
   def complete_delivery(db, {:appended, actual_session_key, message, opts}) do
     registry = Keyword.get(opts, :conn_registry, Tightbeam.ConnRegistry)
     publish_message(db, actual_session_key, message, registry)
@@ -2395,6 +2641,16 @@ defmodule Tightbeam.Gateway do
     )
 
     :appended
+  end
+
+  def complete_delivery(_db, {:staged, _wake}) do
+    try do
+      Wakes.fire_due()
+    catch
+      :exit, {:noproc, _call} -> :ok
+    end
+
+    :queued
   end
 
   def complete_delivery(_db, :skipped), do: :skipped
@@ -6217,7 +6473,19 @@ defmodule Tightbeam.Gateway do
     case call.params[:batch_id] do
       batch_id when is_binary(batch_id) and batch_id != "" ->
         principal = inspect_principal(call, caller)
-        Map.put(result, :batch, NoticeBatcher.read_batch(db, batch_id, principal))
+
+        sources =
+          NoticeBatcher.read_batch_sources(db, batch_id, principal)
+          |> Enum.map(fn source ->
+            if caller.owner_user_id == nil,
+              do: Map.take(source, [:wake_id, :session_key, :due_at, :prompt]),
+              else: source
+          end)
+          |> Enum.map(&inspect_wake(db, &1))
+
+        result
+        |> Map.put(:wakes, Enum.uniq_by(result.wakes ++ sources, & &1.wake_id))
+        |> Map.put(:batch, NoticeBatcher.read_batch(db, batch_id, principal))
 
       _ ->
         result
@@ -6345,6 +6613,7 @@ defmodule Tightbeam.Gateway do
              do: Wakes.fire_due(Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler))
 
           wake_response(wake)
+          |> maybe_add_after_fact_hint(db, p)
         else
           wake
         end
@@ -6880,6 +7149,30 @@ defmodule Tightbeam.Gateway do
 
   defp wake_response(wake) do
     %{wake_id: wake.wake_id, due_at: wake.due_at, state: wake.state}
+  end
+
+  defp maybe_add_after_fact_hint(response, db, params) do
+    if is_integer(params[:after_ms]) and params.after_ms > 0 and is_nil(params[:at]) and
+         is_nil(params[:condition_kind]) and is_nil(params[:predicate]) and
+         params[:after_turn] != true and is_binary(params[:assignment_id]) do
+      case Assignments.condition_wait_hint(db, params.assignment_id) do
+        %{kind: kind, scope: scope} = hint ->
+          Map.put(
+            response,
+            :fact_hint,
+            Map.merge(hint, %{
+              advisory: true,
+              message:
+                "Advisory: this recheck can wait on #{kind} at scope #{scope} with --when-fact #{kind} --when-scope #{scope} --fallback-after 2h."
+            })
+          )
+
+        _ ->
+          response
+      end
+    else
+      response
+    end
   end
 
   defp wait_response_eligible?(%{originating_turn_seq: nil}), do: true

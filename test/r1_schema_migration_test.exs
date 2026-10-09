@@ -12,7 +12,7 @@ defmodule Tightbeam.R1SchemaMigrationTest do
     db: db
   } do
     assert :ok = Schema.ensure_all(db)
-    assert shape(db) == [["work-item-delivery-owner-v1-019"]]
+    assert shape(db) == [["notice-source-storage-v1-019"]]
     assert_columns(db)
     seed(db)
     assert rows(db, "SELECT reminderState FROM assignments") == [[nil]]
@@ -32,7 +32,7 @@ defmodule Tightbeam.R1SchemaMigrationTest do
     facts = rows(db, "SELECT * FROM condition_facts")
     objects = guards(db)
     assert :ok = Schema.ensure_all(db)
-    assert shape(db) == [["work-item-delivery-owner-v1-019"]]
+    assert shape(db) == [["notice-source-storage-v1-019"]]
     # Preserve every historical value despite Firehose's explicit table rebuild.
     assert rows(db, "SELECT #{Enum.join(assignment_columns, ",")} FROM assignments") ==
              assignments
@@ -158,6 +158,41 @@ defmodule Tightbeam.R1SchemaMigrationTest do
       "SELECT ancestor.sessionKey,ancestor.spawnedBy",
       "SELECT ancestor.sessionKey,#{Tightbeam.Org.current_parent_sql("ancestor")}"
     )
+  end
+
+  defp successor_guard(name, sql)
+       when name in [
+              "supervision_fired_lineage_sidecar_identity_immutable",
+              "supervision_fired_lineage_sidecar_required_delete"
+            ] do
+    marker = "w.reresolve = 'lineage'\n)"
+
+    replacement =
+      "w.reresolve = 'lineage'\n  UNION ALL\n" <>
+        "  SELECT 1 FROM notice_batch_members m\n" <>
+        "  JOIN notice_batches b ON b.batchId=m.batchId AND b.deliveryWakeId=OLD.wakeId\n" <>
+        "  JOIN wakes w ON w.wakeId=m.sourceWakeId\n" <>
+        "  WHERE m.state='included' AND w.state='fired' AND w.consumer='prompt'\n" <>
+        "    AND w.origin='process:tightbeam' AND w.reresolve='lineage'\n)"
+
+    assert String.contains?(sql, marker)
+    String.replace(sql, marker, replacement)
+  end
+
+  defp successor_guard("supervision_lineage_fire_requires_sidecar", sql) do
+    marker = "WHERE t.wakeId = NEW.wakeId AND t.assignmentId = NEW.assignmentId\n    )"
+
+    replacement =
+      "WHERE t.wakeId = NEW.wakeId AND t.assignmentId = NEW.assignmentId\n" <>
+        "      UNION ALL\n" <>
+        "      SELECT 1 FROM turns t\n" <>
+        "      JOIN notice_batches b ON b.deliveryWakeId=t.wakeId\n" <>
+        "      JOIN notice_batch_members m ON m.batchId=b.batchId AND m.state='included'\n" <>
+        "      JOIN wakes source ON source.wakeId=m.sourceWakeId\n" <>
+        "      WHERE source.wakeId=NEW.wakeId AND source.assignmentId=NEW.assignmentId\n    )"
+
+    assert String.contains?(sql, marker)
+    String.replace(sql, marker, replacement)
   end
 
   defp successor_guard(_name, sql), do: sql

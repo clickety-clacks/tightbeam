@@ -18,7 +18,8 @@ defmodule Tightbeam.ConditionFacts do
 
   @reserved_kinds ~w(
     quota-recovered escalation-ruled operator-ruling-late-routed
-    assignment-successor-created user-alerted user-alert-cleared credential-present
+    assignment-successor-created assignment-landed assignment-reviewed assignment-blocked
+    user-alerted user-alert-cleared credential-present
     harness-auth-dead harness-auth-restored
     harness-rate-limit-dead harness-rate-limit-restored
     harness-adapter-unavailable harness-adapter-restored
@@ -84,6 +85,22 @@ defmodule Tightbeam.ConditionFacts do
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
   def ensure_schema(db \\ DB), do: DB.execute(db, @ddl)
 
+  @doc false
+  def wake_hint(kind, scope) when is_binary(kind) do
+    scope_arg = if is_binary(scope), do: " --when-scope #{shell_quote(scope)}", else: ""
+
+    %{
+      kind: kind,
+      scope: scope,
+      fallback_after: "2h",
+      message: "Wait for this fact with --when-fact #{kind}#{scope_arg} --fallback-after 2h.",
+      example:
+        "tightbeam wake --session <session> --when-fact #{kind}#{scope_arg} --fallback-after 2h --prompt \"re-read the fact\""
+    }
+  end
+
+  defp shell_quote(value), do: "'" <> String.replace(value, "'", "'\\''") <> "'"
+
   @spec file(DB.server(), GenServer.server(), map()) :: map() | {:error, map()}
   def file(db, scheduler, input) do
     case DB.transaction_then(db, &file_in_txn(&1, input), fn txn, result ->
@@ -91,7 +108,7 @@ defmodule Tightbeam.ConditionFacts do
            recognize_after_commit(txn, result)
          end) do
       {:ok, {result, deliveries}} ->
-        complete_deliveries(db, deliveries)
+        complete_deliveries(db, scheduler, deliveries)
         notify_scheduler(scheduler, result)
         result
 
@@ -365,7 +382,7 @@ defmodule Tightbeam.ConditionFacts do
            end
          ) do
       {:ok, {result, deliveries, filed?}} ->
-        complete_deliveries(db, deliveries)
+        complete_deliveries(db, scheduler, deliveries)
         if filed?, do: notify_scheduler(scheduler, result)
         {result, filed?}
 
@@ -425,8 +442,15 @@ defmodule Tightbeam.ConditionFacts do
   defp owner_for_origin_in_txn(_txn, _origin), do: nil
 
   @doc false
-  def complete_deliveries(db, deliveries) do
-    Enum.each(deliveries, fn delivery ->
+  def complete_deliveries(db, deliveries),
+    do: complete_deliveries(db, Tightbeam.WakeScheduler, deliveries)
+
+  @doc false
+  def complete_deliveries(db, _scheduler, deliveries) do
+    {_batch_ready, direct} =
+      Enum.split_with(deliveries, &match?({:condition_batch_ready, _}, &1))
+
+    Enum.each(direct, fn delivery ->
       try do
         Gateway.complete_delivery(db, delivery)
       catch
@@ -434,6 +458,9 @@ defmodule Tightbeam.ConditionFacts do
       end
     end)
 
+    # The caller nudges the scheduler after this post-commit step. It owns the
+    # batch-ready delivery turn; do not call :fire_due on a nudge-only test or
+    # adapter scheduler here.
     :ok
   end
 

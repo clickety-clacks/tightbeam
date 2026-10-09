@@ -1,8 +1,8 @@
 defmodule Tightbeam.SchemaShapeRuntimeFixture do
   @moduledoc false
   import ExUnit.Assertions
-  alias Tightbeam.{DB, Schema}
-  @shape "work-item-delivery-owner-v1-019"
+  alias Tightbeam.{DB, NoticeBatcher, Schema}
+  @shape "notice-source-storage-v1-019"
   @row_driven_rules_shape "row-driven-rules-v1-019"
   @identity_render_stamp_previous_shape "effort-request-exit-v1-019"
   @effort_request_exit_previous_shape "notice-batching-v1-019"
@@ -11,6 +11,11 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
   @operator_decision_shape "operator-decision-requests-v1"
   @model_identity_shape "model-identity-v1"
   @be61_shape "model-identity-message-envelope-v2"
+  @batch_delivery_guard_names [
+    "supervision_lineage_fire_requires_sidecar",
+    "supervision_fired_lineage_sidecar_required_delete",
+    "supervision_fired_lineage_sidecar_identity_immutable"
+  ]
 
   # Captured from Schema.ensure_all/1 at be61cfc98df6b18c0cc280adeca42cba3fbf14b5.
   # Keep the old table exact: its missing ruledViaSessionKey column is why this
@@ -303,6 +308,8 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
                "SELECT schemaVersion, legacyRulingFactMaxId FROM decision_request_terminal_epoch WHERE id=0"
              )
 
+    assert_batch_delivery_guards!(second)
+
     :ok = stop_db!(second_pid)
   end
 
@@ -351,6 +358,12 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
                "SELECT name FROM sqlite_master WHERE name='supervision_liveness_sidecar_insert_coherent'"
              )
 
+    refute table?(first, "notice_batches")
+
+    Enum.each(@batch_delivery_guard_names, fn name ->
+      refute object_sql(first, "trigger", name) =~ "notice_batches"
+    end)
+
     :ok = GenServer.stop(interposer)
     :ok = stop_db!(first_pid)
 
@@ -365,6 +378,8 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
 
     assert object_sql(second, "trigger", "wakes_typed_cancellation_required") =~
              "pendingwakecancellationrequirestypedprovenance"
+
+    assert_batch_delivery_guards!(second)
 
     :ok = stop_db!(second_pid)
   end
@@ -519,6 +534,7 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
   end
 
   defp downgrade_row_driven_waits(db) do
+    downgrade_assignment_source_replacement_cancellation!(db)
     :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
 
     try do
@@ -575,6 +591,132 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
     end
   end
 
+  def downgrade_assignment_source_replacement_cancellation!(db) do
+    downgrade_notice_source_storage!(db)
+
+    {:ok, [[current_ddl]]} =
+      DB.query(
+        db,
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='wake_cancellations'"
+      )
+
+    assignment_route =
+      ~r/\n\s+OR\n\s+\(requesterId = 'tightbeam:assignments' AND reasonKind = 'superseded' AND\n\s+causalSourceKind = 'wake' AND outcomeKind = 'replacement'\)/
+
+    if Regex.match?(assignment_route, current_ddl) do
+      predecessor_ddl = Regex.replace(assignment_route, current_ddl, "", global: false)
+
+      {:ok, columns} = DB.query(db, "PRAGMA table_info(wake_cancellations)")
+      column_names = Enum.map_join(columns, ",", &Enum.at(&1, 1))
+
+      {:ok, trigger_rows} =
+        DB.query(
+          db,
+          "SELECT sql FROM sqlite_master WHERE type='trigger' AND name IN ('wake_cancellations_pending_insert','wakes_typed_cancellation_required') ORDER BY name"
+        )
+
+      trigger_ddls = Enum.map_join(trigger_rows, ";\n", &hd/1)
+      {:ok, [[foreign_keys]]} = DB.query(db, "PRAGMA foreign_keys")
+      :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
+
+      try do
+        assert :ok =
+                 DB.execute(db, """
+                 DROP TRIGGER wake_cancellations_pending_insert;
+                 DROP TRIGGER wakes_typed_cancellation_required;
+                 ALTER TABLE wake_cancellations RENAME TO wake_cancellations_assignment_replacement_current;
+                 #{predecessor_ddl};
+                 INSERT INTO wake_cancellations (#{column_names})
+                   SELECT #{column_names} FROM wake_cancellations_assignment_replacement_current;
+                 DROP TABLE wake_cancellations_assignment_replacement_current;
+                 #{trigger_ddls};
+                 """)
+      after
+        :ok = DB.execute(db, "PRAGMA foreign_keys = #{foreign_keys}")
+      end
+    end
+  end
+
+  def downgrade_notice_source_storage!(db) do
+    case DB.query(db, "SELECT shape FROM schema_stamp") do
+      {:ok, [[@shape]]} ->
+        # Reconstruct the known predecessor representation, including source
+        # notices emitted while seeding association history; never erase them.
+        assert {:ok, [[0]]} =
+                 DB.query(
+                   db,
+                   "SELECT COUNT(*) FROM wakes WHERE sourceClientIdentity IS NOT NULL OR sourceAttachments IS NOT NULL"
+                 )
+
+        assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM notice_batch_members")
+
+        assert {:ok, source_before} =
+                 DB.query(
+                   db,
+                   "SELECT wakeId,sessionKey,origin,prompt,dueAt,state,createdAt FROM wakes ORDER BY wakeId"
+                 )
+
+        for {_name, ddl} <- NoticeBatcher.previous_source_payload_objects(),
+            do: assert(:ok = DB.execute(db, ddl))
+
+        assert {:ok, scopes} =
+                 DB.query(
+                   db,
+                   "SELECT sourceAddress,sourceVisibilityScope FROM wakes WHERE sourceVisibilityScope IS NOT NULL ORDER BY wakeId"
+                 )
+
+        assert {:ok, _} =
+                 DB.query(
+                   db,
+                   """
+                   INSERT INTO notice_delivery_policies(policyRef,sourceWakeId,recipientAddress,sessionKey,targetRole,visibilityScope,policyRevision,deadlineAt,enabled,createdAt)
+                   SELECT 'notice-policy:' || wakeId,wakeId,sourceAddress,sessionKey,targetRole,sourceVisibilityScope,?1,dueAt,1,createdAt
+                   FROM wakes WHERE sourceVisibilityScope IS NOT NULL
+                   """,
+                   [NoticeBatcher.policy_revision()]
+                 )
+
+        assert {:ok, ^scopes} =
+                 DB.query(
+                   db,
+                   "SELECT recipientAddress,visibilityScope FROM notice_delivery_policies ORDER BY sourceWakeId"
+                 )
+
+        assert :ok =
+                 DB.execute(
+                   db,
+                   "DROP INDEX notice_source_client_identity; ALTER TABLE wakes DROP COLUMN sourceClientIdentity; ALTER TABLE wakes DROP COLUMN sourceAttachments; ALTER TABLE wakes DROP COLUMN sourceVisibilityScope; ALTER TABLE wakes DROP COLUMN sourceAddress"
+                 )
+
+        assert {:ok, ^source_before} =
+                 DB.query(
+                   db,
+                   "SELECT wakeId,sessionKey,origin,prompt,dueAt,state,createdAt FROM wakes ORDER BY wakeId"
+                 )
+
+        assert {:ok, :ok} =
+                 DB.migration_transaction(
+                   db,
+                   :schema_shape_source_predecessor,
+                   ["PRAGMA foreign_keys=OFF", "PRAGMA legacy_alter_table=ON"],
+                   ["PRAGMA legacy_alter_table=OFF", "PRAGMA foreign_keys=ON"],
+                   fn txn ->
+                     :ok = Tightbeam.DB.Txn.exec(txn, "DROP TABLE notice_batch_members")
+                     :ok = Tightbeam.DB.Txn.exec(txn, NoticeBatcher.previous_source_member_ddl())
+
+                     :ok =
+                       Tightbeam.DB.Txn.exec(
+                         txn,
+                         "CREATE INDEX notice_batch_members_batch ON notice_batch_members(batchId,publicationSeq)"
+                       )
+                   end
+                 )
+
+      {:ok, [[_fixture_predecessor]]} ->
+        refute "sourceAddress" in table_columns(db, "wakes")
+    end
+  end
+
   defp downgrade_wakes_to_terminal_decision(db) do
     :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
 
@@ -583,8 +725,10 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
         DB.execute(db, """
         DROP TABLE notice_batch_members;
         DROP TABLE notice_batches;
-        DROP TABLE notice_delivery_policies;
-        DROP TABLE notice_batching_lane_policies;
+        DROP TABLE IF EXISTS notice_delivery_policies;
+        DROP TABLE IF EXISTS notice_batching_lane_policies;
+        DROP TABLE IF EXISTS staged_message_dedupes;
+        DROP TABLE IF EXISTS notice_batch_source_attachments;
         DROP TABLE admin_projection_versions;
         DROP INDEX wakes_due;
         DROP INDEX wakes_delivery;
@@ -671,6 +815,12 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
     |> String.downcase()
     |> String.replace("\"", "")
     |> String.replace(~r/\s+/u, "")
+  end
+
+  defp assert_batch_delivery_guards!(db) do
+    Enum.each(@batch_delivery_guard_names, fn name ->
+      assert object_sql(db, "trigger", name) =~ "notice_batches"
+    end)
   end
 
   defp table_columns(db, name) do

@@ -6,7 +6,7 @@ false = File.exists?(base)
 Application.put_env(:tightbeam, :autostart, false)
 Application.put_env(:tightbeam, :base_dir, base)
 import ExUnit.Assertions
-alias Tightbeam.{DB, NoticeBatcher, Org, Schema, Wakes}
+alias Tightbeam.{DB, Model, NoticeBatcher, Org, Schema, Wakes}
 
 {:ok, db} =
   DB.start_link(path: Path.join(base, "state.db"), name: nil, guard_inputs: [])
@@ -16,12 +16,30 @@ try do
   :ok = DB.assert_base_admitted!(db, base)
   marker = File.read!(Path.join(base, "build-owner.json"))
 
+  :ok =
+    DB.execute(
+      db,
+      "INSERT OR IGNORE INTO users (userId, isAdmin, createdAt) VALUES ('recipient-owner', 0, 1)"
+    )
+
+  Org.create(db, %{
+    session_key: "agent:recipient",
+    display_name: "agent:recipient",
+    owner_user_id: "recipient-owner",
+    origin: "user:recipient-owner",
+    archetype: "default",
+    host: "testhost",
+    harness: "claude",
+    provider: "anthropic",
+    model: Model.new("fable")
+  })
+
   {:ok, policy} =
     DB.transaction(db, fn txn ->
       Org.apply_notice_batching_lane_policy_in_txn(
         txn,
         %{session_key: "agent:recipient", target_role: nil},
-        true,
+        false,
         "notice-batching-test-policy:cold-restart",
         "agent:test-policy",
         "acceptance-fixture",
@@ -29,7 +47,7 @@ try do
       )
     end)
 
-  assert policy.enabled
+  refute policy.enabled
 
   source =
     Wakes.schedule(db, %{
@@ -41,7 +59,10 @@ try do
       class: "fyi"
     })
 
-  [%{batch_id: batch_id}] = NoticeBatcher.source_refs(db, source.wake_id)
+  assert NoticeBatcher.source_refs(db, source.wake_id) == []
+
+  policy_ref = NoticeBatcher.policy_ref(source.wake_id)
+  %{batch_id: batch_id} = NoticeBatcher.enqueue_or_recover(db, source.wake_id, policy_ref)
 
   assert {:ok, :sealed} =
            DB.transaction(db, fn txn ->

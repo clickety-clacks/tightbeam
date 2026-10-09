@@ -3,6 +3,17 @@ defmodule Tightbeam.ReminderTransactionTest do
   alias Tightbeam.{DB, Ledger, ReminderDelivery, Schema}
   alias Tightbeam.DB.Txn
 
+  defmodule CarrierDoorbell do
+    use GenServer
+    def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
+    def init(parent), do: {:ok, parent}
+
+    def handle_call({:ensure_lane, key}, _from, parent) do
+      send(parent, {:reminder_carrier_ready, key})
+      {:reply, :ok, parent}
+    end
+  end
+
   setup do
     db = start_supervised!({DB, name: :r1_transaction_db, path: ":memory:"})
     :ok = Schema.ensure_all(db)
@@ -20,6 +31,91 @@ defmodule Tightbeam.ReminderTransactionTest do
       )
 
     %{db: db}
+  end
+
+  test "a mixed actual carrier settles its reminder source once without borrowing carrier assignment",
+       %{db: db} do
+    registry = :"reminder_carrier_registry_#{System.unique_integer([:positive])}"
+    start_supervised!({Tightbeam.ConnRegistry, name: registry})
+    lane = start_supervised!({CarrierDoorbell, self()})
+
+    assert {:ok, reminder} =
+             DB.transaction(db, fn txn ->
+               ReminderDelivery.schedule_in_txn(txn, "r1-assignment", "prod", "r1-holder", fn ->
+                 Tightbeam.Wakes.schedule_in_txn(txn, %{
+                   session_key: "r1-holder",
+                   origin: "process:tightbeam",
+                   prompt: "one reminder root",
+                   assignment_id: "r1-assignment",
+                   due_at: 0
+                 })
+               end)
+             end)
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "INSERT INTO assignments(id,subject,holderKey,openedByUser,openedAt) " <>
+                 "VALUES('r1-sibling-assignment','independent sibling','r1-holder','fixture',1)"
+             )
+
+    sibling =
+      Tightbeam.Wakes.schedule(db, %{
+        session_key: "r1-holder",
+        origin: "agent:sibling",
+        prompt: "unrelated information",
+        assignment_id: "r1-sibling-assignment",
+        class: "information",
+        due_at: 0
+      })
+
+    before = state(db)
+
+    assert [carrier] =
+             Tightbeam.NoticeBatcher.recover(db, System.system_time(:millisecond) + 1_000,
+               conn_registry: registry,
+               lane_manager: lane
+             )
+
+    assert_receive {:reminder_carrier_ready, "r1-holder"}
+
+    assert {:ok, source_ids} =
+             DB.transaction(
+               db,
+               &Tightbeam.NoticeBatcher.carrier_source_ids_in_txn(&1, carrier)
+             )
+
+    assert Enum.sort(source_ids) == Enum.sort([reminder.wake_id, sibling.wake_id])
+    assert {:ok, turn} = Ledger.claim_next(db, "r1-holder", "actual-reminder-carrier")
+    assert turn.wake_id == carrier
+
+    assert {:ok, [[nil]]} =
+             DB.query(db, "SELECT assignmentId FROM turns WHERE seq=?1", [turn.seq])
+
+    assert {:ok, [[seq, "running", "r1-assignment"]]} =
+             DB.transaction(
+               db,
+               &Tightbeam.NoticeBatcher.source_delivery_turns_in_txn(&1, reminder.wake_id)
+             )
+
+    assert seq == turn.seq
+    assert {:ok, :no_claim} = DB.transaction(db, &ReminderDelivery.delivered_in_txn(&1, turn.seq))
+    assert state(db) == before
+
+    assert {:ok, :recorded} =
+             DB.transaction(db, fn txn ->
+               assert Ledger.finish_in_txn(txn, turn.seq, "delivered", nil,
+                        owner_lease: turn.owner_lease
+                      )
+
+               ReminderDelivery.delivered_in_txn(txn, turn.seq)
+             end)
+
+    after_delivery = state(db)
+    assert is_nil(after_delivery["pending"])
+    assert after_delivery["nextEligibleAt"] - after_delivery["lastDeliveredAt"] == 300_000
+    assert {:ok, :no_claim} = DB.transaction(db, &ReminderDelivery.delivered_in_txn(&1, turn.seq))
+    assert state(db) == after_delivery
   end
 
   for recovery <- [:wake, :turn] do

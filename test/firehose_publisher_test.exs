@@ -2,6 +2,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
   use Tightbeam.TestCase, async: false
 
   alias Tightbeam.{ConnRegistry, DB, Dispatch, Gateway, Ledger, Org, Wakes}
+  alias Tightbeam.NoticeBatcher
   alias Tightbeam.Firehose.{Hub, Publisher}
 
   defmodule LaneStub do
@@ -30,6 +31,19 @@ defmodule Tightbeam.Firehose.PublisherTest do
     register_testhost(db)
     target = Org.personal_session_key("flynn")
 
+    start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
+    start_supervised!({LaneStub, name: Tightbeam.LaneManager})
+
+    assert {:ok, _} =
+             Ledger.enqueue(db, %{
+               session_key: target,
+               message_id: "firehose-busy-boundary",
+               origin: "user:flynn",
+               prompt: "hold recipient busy"
+             })
+
+    assert {:ok, busy_turn} = Ledger.claim_next(db, target, "lane:firehose-boundary")
+
     wake =
       Wakes.schedule(db, %{
         session_key: target,
@@ -43,10 +57,10 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     assert {:error, %RuntimeError{message: "rollback winning fire"}} =
              DB.transaction(db, fn txn ->
-               assert {:appended, ^target, _, _} =
+               assert {:staged, _source} =
                         Gateway.deliver_prompt_in_txn(txn, target, wake.origin, wake.prompt, opts)
 
-               assert [["fired"]] =
+               assert [["pending"]] =
                         DB.Txn.q(txn, "SELECT state FROM wakes WHERE wakeId=?1", [wake.wake_id])
 
                raise "rollback winning fire"
@@ -59,24 +73,38 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     assert observed_classes() == []
 
-    assert {:ok, {:appended, ^target, _, _}} =
+    assert {:ok, {:staged, _source}} =
              DB.transaction(
                db,
                &Gateway.deliver_prompt_in_txn(&1, target, wake.origin, wake.prompt, opts)
              )
 
-    notices = for _ <- 1..3, do: receive_notice()
+    assert NoticeBatcher.source_refs(db, wake.wake_id) == []
+    assert Wakes.get(db, wake.wake_id).state == "pending"
+    assert observed_classes() == []
 
-    assert Enum.map(notices, & &1["class"]) == [
-             "session.updated",
-             "wake.fired",
-             "message.created"
-           ]
+    assert :ok =
+             Ledger.finish(db, busy_turn.seq, "delivered", nil,
+               owner_lease: busy_turn.owner_lease
+             )
 
-    fired = Enum.at(notices, 1)
-    assert fired["refs"]["wakeId"] == wake.wake_id
-    assert fired["payload"]["state"] == "fired"
+    _busy_terminal_notices = observed_classes()
+    assert [carrier_id] = Wakes.materialize_digests(db)
+    scheduler = start_delivery_scheduler(db)
+    assert :ok = Wakes.fire_due(scheduler)
+
+    assert [%{delivery_wake_id: ^carrier_id, batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(db, wake.wake_id)
+
+    notices = observed_classes()
+    assert "session.updated" in notices
+    assert "wake.fired" in notices
+    assert "message.created" in notices
     assert Wakes.get(db, wake.wake_id).state == "fired"
+
+    assert {:ok, [[0]]} =
+             DB.query(db, "SELECT count(*) FROM turns WHERE wakeId=?1", [wake.wake_id])
+
     assert {:ok, before_turns} = DB.query(db, "SELECT * FROM turns ORDER BY seq")
     assert {:ok, before_wakes} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
 
@@ -90,6 +118,10 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert {:ok, ^before_turns} = DB.query(db, "SELECT * FROM turns ORDER BY seq")
     assert {:ok, ^before_wakes} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
 
+    assert {:ok, carrier_turn} = Ledger.claim_next(db, target, "lane:firehose-boundary")
+    assert carrier_turn.wake_id == carrier_id
+    _claim_notices = observed_classes()
+
     external =
       Wakes.schedule(db, %{
         session_key: target,
@@ -100,7 +132,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     _seed_notices = observed_classes()
 
-    assert {:ok, {:appended, ^target, _, _}} =
+    assert {:ok, {:staged, _source}} =
              DB.transaction(
                db,
                &Gateway.deliver_prompt_in_txn(&1, target, external.origin, external.prompt,
@@ -110,8 +142,11 @@ defmodule Tightbeam.Firehose.PublisherTest do
              )
 
     assert Wakes.get(db, external.wake_id).state == "pending"
-    # A second queued turn leaves mechanical status unchanged.
-    assert observed_classes() == ["message.created"]
+
+    assert {:ok, [[0]]} =
+             DB.query(db, "SELECT count(*) FROM turns WHERE wakeId=?1", [external.wake_id])
+
+    assert observed_classes() == []
   end
 
   test "work-item-create emits its committed routing wake once, never on keyed replay" do
@@ -370,6 +405,8 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert {:ok, assignment} = Dispatch.dispatch(db, handlers, dispatch)
     dispatch_observed = observed_state_classes()
 
+    _dispatched_turn = finish_next_turn!(db, "effect-target", "lane:effects")
+
     work_item_create = %{
       verb: "work-item-create",
       origin: "user:flynn",
@@ -402,11 +439,23 @@ defmodule Tightbeam.Firehose.PublisherTest do
     rumination_classes = observed_classes()
     assert rumination_classes == ["verb.accepted", "wake.scheduled"]
 
+    assert :ok = Wakes.fire_due(scheduler)
+    dispatch_delivery_effects = observed_state_classes()
+
+    dispatch_events =
+      dispatch_observed ++ state_classes(rumination_classes) ++ dispatch_delivery_effects
+
+    # The rumination's asynchronous wake delivery has its own wake.fired event;
+    # the dispatch handler's declared effects describe its direct commit effects.
+    assert "wake.fired" in dispatch_events
+
     assert_per_verb_effects!(
       config,
       "dispatch",
-      dispatch_observed ++ state_classes(rumination_classes)
+      Enum.reject(dispatch_events, &(&1 == "wake.fired"))
     )
+
+    _rumination_turn = finish_next_turn!(db, "effect-dispatcher", "lane:effects")
 
     tests_passed = %{
       verb: "attest",
@@ -514,7 +563,16 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert {:ok, %{assignment: %{state: "closed", outcome: "completed"}}} =
              Dispatch.dispatch(db, handlers, completion)
 
-    assert_per_verb_effects!(config, "attest", observed_state_classes())
+    completion_effects = observed_state_classes()
+    asynchronous_delivery = ~w(message.created session.updated wake.fired)
+
+    assert Enum.all?(asynchronous_delivery, &(&1 in completion_effects))
+
+    assert_per_verb_effects!(
+      config,
+      "attest",
+      Enum.reject(completion_effects, &(&1 in asynchronous_delivery))
+    )
 
     reopen = %{
       verb: "reopen-assignment",
@@ -717,6 +775,14 @@ defmodule Tightbeam.Firehose.PublisherTest do
   end
 
   test "0.1.9 operator decisions emit opened, ruled, and withdrawn classes" do
+    start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
+
+    start_supervised!(
+      Supervisor.child_spec({LaneStub, name: Tightbeam.LaneManager},
+        id: :operator_decisions_delivery_lane
+      )
+    )
+
     db = :firehose_operator_decisions_db
     scheduler = :firehose_operator_decisions_scheduler
     start_supervised!({DB, path: ":memory:", name: db})
@@ -739,6 +805,31 @@ defmodule Tightbeam.Firehose.PublisherTest do
     })
 
     handlers = Gateway.handlers(%{db: db, wake_scheduler: scheduler})
+
+    delivery_scheduler = :firehose_operator_decisions_delivery_scheduler
+
+    start_supervised!(
+      {Wakes,
+       db: db,
+       name: delivery_scheduler,
+       tick_ms: 60_000,
+       deliver: fn wake ->
+         {:ok, delivery} =
+           DB.transaction(db, fn txn ->
+             Gateway.deliver_prompt_in_txn(
+               txn,
+               wake.session_key,
+               wake.origin,
+               wake.prompt,
+               wake_id: wake.wake_id,
+               sender: wake.origin,
+               target_gate: wake
+             )
+           end)
+
+         delivery
+       end}
+    )
 
     ask = %{
       verb: "operator-ask",
@@ -768,14 +859,36 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     assert {:ok, %{status: "ruled"}} = Dispatch.dispatch(db, handlers, rule)
 
-    assert observed_state_classes() == [
-             "decision_request.ruled",
-             "session.updated",
-             "message.created",
-             "wake.fired"
-           ]
+    ruling_effects = observed_state_classes()
+    assert "decision_request.ruled" in ruling_effects
+    refute "session.updated" in ruling_effects
+    refute "message.created" in ruling_effects
 
-    assert {:ok, [["operator-raiser"]]} = DB.query(db, "SELECT sessionKey FROM turns")
+    assert {:ok, [[source_wake_id]]} =
+             DB.query(
+               db,
+               "SELECT wakeId FROM wakes WHERE conditionKind='escalation-ruled' AND conditionScope=?1",
+               [request.id]
+             )
+
+    assert {:ok, []} = DB.query(db, "SELECT seq FROM turns WHERE wakeId=?1", [source_wake_id])
+
+    assert :ok = Wakes.fire_due(delivery_scheduler)
+
+    assert [%{delivery_wake_id: carrier_id, batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(db, source_wake_id)
+
+    assert Wakes.get(db, source_wake_id).state == "fired"
+    assert Wakes.get(db, carrier_id).state == "fired"
+
+    assert {:ok, [["operator-raiser"]]} =
+             DB.query(db, "SELECT sessionKey FROM turns WHERE wakeId=?1", [carrier_id])
+
+    delivered_effects = observed_state_classes()
+    assert "session.updated" in delivered_effects
+    assert "message.created" in delivered_effects
+    assert Enum.any?(ruling_effects ++ delivered_effects, &(&1 == "wake.fired"))
+
     assert {:ok, committed_turns} = DB.query(db, "SELECT * FROM turns ORDER BY seq")
     assert {:ok, committed_wakes} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
     # The declared direct decision effect remains distinct from the normal
@@ -1233,6 +1346,52 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
   defp state_classes(classes) do
     Enum.filter(classes, &match?({:ok, _row}, Tightbeam.Firehose.Registry.fetch(&1)))
+  end
+
+  defp finish_next_turn!(db, session_key, lane) do
+    {:ok, turn} = Ledger.claim_next(db, session_key, lane)
+
+    :ok =
+      Ledger.finish(db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+
+    # Turn lifecycle effects belong to the test's explicit queue drain, not
+    # to the handler effect set asserted by the surrounding matrix case.
+    _ = observed_state_classes()
+
+    turn
+  end
+
+  defp start_delivery_scheduler(db) do
+    name = String.to_atom("firehose_batch_delivery_#{System.unique_integer([:positive])}")
+
+    start_supervised!(
+      Supervisor.child_spec(
+        {Wakes,
+         db: db,
+         name: name,
+         tick_ms: 60_000,
+         deliver: fn wake ->
+           {:ok, delivery} =
+             DB.transaction(db, fn txn ->
+               Gateway.deliver_prompt_in_txn(
+                 txn,
+                 wake.session_key,
+                 wake.origin,
+                 wake.prompt,
+                 wake_id: wake.wake_id,
+                 sender: wake.origin,
+                 target_gate: wake,
+                 fire_wake_in_txn: true
+               )
+             end)
+
+           Gateway.complete_delivery(db, delivery)
+         end},
+        id: name
+      )
+    )
+
+    name
   end
 
   defp register_testhost(db) do

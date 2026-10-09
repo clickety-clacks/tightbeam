@@ -1,7 +1,19 @@
 defmodule Tightbeam.CompletionHandoffLightRailTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{Assignments, ConnRegistry, DB, Gateway, Model, Org, Rules, Wakes, WorkItems}
+  alias Tightbeam.{
+    Assignments,
+    ConnRegistry,
+    DB,
+    Gateway,
+    Ledger,
+    Model,
+    NoticeBatcher,
+    Org,
+    Rules,
+    Wakes,
+    WorkItems
+  }
 
   defmodule LaneDoorbell do
     use GenServer
@@ -61,9 +73,14 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
 
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert Wakes.get(ctx.db, root.wake_id).state == "fired"
+    root_carrier_id = assert_delivered_carrier(ctx.db, root.wake_id)
 
     assert {:ok, [[root_seq, "notice-parent"]]} =
-             DB.query(ctx.db, "SELECT seq,sessionKey FROM turns WHERE wakeId=?1", [root.wake_id])
+             DB.query(ctx.db, "SELECT seq,sessionKey FROM turns WHERE wakeId=?1", [
+               root_carrier_id
+             ])
+
+    finish_carrier_turn!(ctx.db, root_carrier_id)
 
     [first] = pending_reminders(ctx.db, root.wake_id)
     assert String.starts_with?(first.condition_kind, "terminal-child-owner-action-")
@@ -88,8 +105,12 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     set_due_now(ctx.db, first.wake_id)
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert Wakes.get(ctx.db, first.wake_id).state == "fired"
-    assert turn_count(ctx.db, first.wake_id) == 1
-    [second] = pending_reminders(ctx.db, root.wake_id)
+    first_carrier_id = assert_delivered_carrier(ctx.db, first.wake_id)
+    finish_carrier_turn!(ctx.db, first_carrier_id)
+
+    assert [second] = pending_reminders(ctx.db, root.wake_id),
+           inspect(reminders(ctx.db, root.wake_id))
+
     refute second.wake_id == first.wake_id
 
     stop_supervised!(ctx.scheduler)
@@ -100,8 +121,8 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     set_due_now(ctx.db, second.wake_id)
     assert :ok = Wakes.fire_due(restarted)
     assert Wakes.get(ctx.db, second.wake_id).state == "fired"
-    assert turn_count(ctx.db, first.wake_id) == 1
-    assert turn_count(ctx.db, second.wake_id) == 1
+    assert assert_delivered_carrier(ctx.db, first.wake_id) == first_carrier_id
+    assert_delivered_carrier(ctx.db, second.wake_id)
     [third] = pending_reminders(ctx.db, root.wake_id)
     refute third.wake_id in [first.wake_id, second.wake_id]
   end
@@ -147,7 +168,7 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     refute recovered.wake_id == root.wake_id
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert Wakes.get(ctx.db, recovered.wake_id).state == "fired"
-    assert turn_count(ctx.db, recovered.wake_id) == 1
+    assert_delivered_carrier(ctx.db, recovered.wake_id)
     assert reminders(ctx.db, recovered.wake_id) == []
   end
 
@@ -156,7 +177,7 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
 
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert Wakes.get(ctx.db, root.wake_id).state == "fired"
-    assert turn_count(ctx.db, root.wake_id) == 1
+    assert_delivered_carrier(ctx.db, root.wake_id)
     assert reminders(ctx.db, root.wake_id) == []
 
     _later_assignment =
@@ -200,7 +221,12 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     set_due_now(ctx.db, pending.wake_id)
     assert :ok = Wakes.fire_due(ctx.scheduler)
 
-    assert Wakes.get(ctx.db, pending.wake_id).state == "canceled"
+    assert Wakes.get(ctx.db, pending.wake_id).state == "canceled",
+           inspect(
+             {root, pending, reminders(ctx.db, root.wake_id),
+              NoticeBatcher.source_refs(ctx.db, root.wake_id)}
+           )
+
     assert turn_count(ctx.db, pending.wake_id) == 0
     assert pending_reminders(ctx.db, root.wake_id) == []
 
@@ -220,12 +246,16 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
       completed_child(ctx, parent_opener: "other-parent")
 
     assert :ok = Wakes.fire_due(ctx.scheduler)
+    root_carrier_id = hd(NoticeBatcher.source_refs(ctx.db, root.wake_id)).delivery_wake_id
+    finish_carrier_turn!(ctx.db, root_carrier_id)
     [first] = pending_reminders(ctx.db, root.wake_id)
     set_due_now(ctx.db, first.wake_id)
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert Wakes.get(ctx.db, first.wake_id).state == "fired"
-    assert turn_count(ctx.db, first.wake_id) == 1
-    [successor] = pending_reminders(ctx.db, root.wake_id)
+    assert_delivered_carrier(ctx.db, first.wake_id)
+
+    assert [successor] = pending_reminders(ctx.db, root.wake_id),
+           inspect(reminders(ctx.db, root.wake_id))
 
     assert %{assignment: %{state: "closed"}} =
              handle(
@@ -398,6 +428,8 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
        ctx do
     {parent_assignment, child_assignment, root} = completed_child(ctx)
     assert :ok = Wakes.fire_due(ctx.scheduler)
+    root_carrier_id = hd(NoticeBatcher.source_refs(ctx.db, root.wake_id)).delivery_wake_id
+    finish_carrier_turn!(ctx.db, root_carrier_id)
     [pending] = pending_reminders(ctx.db, root.wake_id)
     set_due_now(ctx.db, pending.wake_id)
 
@@ -420,11 +452,13 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
        ctx do
     {parent_assignment, child_assignment, root} = completed_child(ctx)
     assert :ok = Wakes.fire_due(ctx.scheduler)
+    root_carrier_id = hd(NoticeBatcher.source_refs(ctx.db, root.wake_id)).delivery_wake_id
+    finish_carrier_turn!(ctx.db, root_carrier_id)
     [pending] = pending_reminders(ctx.db, root.wake_id)
     set_due_now(ctx.db, pending.wake_id)
     assert :ok = Wakes.fire_due(ctx.scheduler)
     [successor] = pending_reminders(ctx.db, root.wake_id)
-    assert turn_count(ctx.db, pending.wake_id) == 1
+    assert_delivered_carrier(ctx.db, pending.wake_id)
 
     action = action_note(child_assignment.id, root, "retired", "retired the idle child session")
 
@@ -542,6 +576,34 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
   defp turn_count(db, wake_id) do
     {:ok, [[count]]} = DB.query(db, "SELECT count(*) FROM turns WHERE wakeId=?1", [wake_id])
     count
+  end
+
+  defp assert_delivered_carrier(db, source_wake_id) do
+    assert [%{delivery_wake_id: carrier_id, batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(db, source_wake_id)
+
+    assert Wakes.get(db, source_wake_id).state == "fired"
+    assert Wakes.get(db, carrier_id).state == "fired"
+    assert turn_count(db, source_wake_id) == 0
+    assert turn_count(db, carrier_id) == 1
+    carrier_id
+  end
+
+  defp finish_carrier_turn!(db, carrier_id) do
+    assert {:ok, [[seq]]} =
+             DB.query(
+               db,
+               "SELECT seq FROM turns WHERE wakeId=?1 AND sessionKey='notice-parent'",
+               [
+                 carrier_id
+               ]
+             )
+
+    assert {:ok, turn} = Ledger.claim_next(db, "notice-parent", "completion-handoff-test")
+    assert turn.seq == seq
+
+    assert :ok =
+             Ledger.finish(db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
   end
 
   defp start_scheduler(db) do

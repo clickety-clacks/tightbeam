@@ -16,6 +16,8 @@ defmodule Tightbeam.VerificationPapertrailTest do
     EventLog,
     Gateway,
     Identity,
+    Ledger,
+    NoticeBatcher,
     Org,
     RailRemedy,
     Roles,
@@ -40,18 +42,19 @@ defmodule Tightbeam.VerificationPapertrailTest do
     reviewer = session(db, "vp-reviewer", "reviewer-code", "codex", "openai")
     Roles.create!(db, "reviewer-code", "flynn", reviewer.session_key)
 
-    test_pid = self()
+    start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
+    start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, Tightbeam.LaneManager})
 
-    start_supervised!(
-      {Wakes,
-       db: db,
-       deliver: fn wake ->
-         send(test_pid, {:wake_delivered, wake})
-         true
-       end,
-       tick_ms: 60_000,
-       name: Tightbeam.WakeScheduler}
-    )
+    start_supervised!({
+      Wakes,
+      # Normal readiness admission uses the actual Gateway/registry/lane
+      # dependencies, never this former per-source delivery callback.
+      db: db,
+      deliver: fn _wake -> flunk("normal remedy used legacy callback") end,
+      delivery_opts: [conn_registry: Tightbeam.ConnRegistry, lane_manager: Tightbeam.LaneManager],
+      tick_ms: 60_000,
+      name: Tightbeam.WakeScheduler
+    })
 
     base_dir =
       Path.join(
@@ -142,7 +145,7 @@ defmodule Tightbeam.VerificationPapertrailTest do
 
     assert %{session_key: holder_key} = Wakes.get(ctx.db, producer)
     assert holder_key == ctx.holder.session_key
-    assert_receive {:wake_delivered, wake}
+    wake = admitted_remedy!(ctx, producer)
     assert wake.session_key == ctx.holder.session_key
     assert wake.prompt =~ "no verification verdict is filed"
     assert wake.prompt =~ work.id
@@ -158,15 +161,47 @@ defmodule Tightbeam.VerificationPapertrailTest do
              )
 
     # Second denial: the results artifact is missing, and the sentence says so.
-    assert {:error, %{reason: "remedy_fired", rule: @artifact_rule}} =
+    # The first actual recipient turn must finish before the next remedy can
+    # leave the editable queue; filing a verdict alone does not end a turn.
+    assert {:ok, turn} = Ledger.claim_next(ctx.db, ctx.holder.session_key, "papertrail-test")
+    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+
+    assert {:error, %{reason: "remedy_fired", rule: @artifact_rule, producer: artifact_producer}} =
              Dispatch.dispatch(ctx.db, ctx.handlers, completion)
 
-    assert_receive {:wake_delivered, artifact_wake}
+    artifact_wake = admitted_remedy!(ctx, artifact_producer)
     assert artifact_wake.session_key == ctx.holder.session_key
     assert artifact_wake.prompt =~ "no artifact is recorded on its work item"
     assert %{status: "live"} = RailRemedy.episode(ctx.db, @artifact_rule, work.id)
     # The satisfied verification statute's episode closed through maybe_close.
     assert %{status: "closed"} = RailRemedy.episode(ctx.db, @verification_rule, work.id)
+  end
+
+  defp admitted_remedy!(ctx, source_id) do
+    source = Wakes.get(ctx.db, source_id)
+    assert source.state == "fired"
+
+    assert [%{delivery_wake_id: carrier_id, member_state: "included", batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(ctx.db, source_id)
+
+    assert carrier_id != source_id
+    assert Wakes.get(ctx.db, carrier_id).state == "fired"
+
+    assert {:ok, [[target, "queued", content]]} =
+             DB.query(
+               ctx.db,
+               "SELECT t.sessionKey,t.status,m.content FROM turns t JOIN messages m ON m.id=t.messageId WHERE t.wakeId=?1",
+               [carrier_id]
+             )
+
+    assert target == ctx.holder.session_key
+    assert content =~ source_id
+    assert content =~ source.prompt
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT count(*) FROM turns WHERE wakeId=?1", [source_id])
+
+    source
   end
 
   test "A2: the complete papertrail passes and the episodes close", ctx do

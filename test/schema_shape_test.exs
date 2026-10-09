@@ -11,9 +11,19 @@ end
 defmodule Tightbeam.SchemaShapeTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{Assignments, ConnRegistry, DB, Schema, SessionPoAssociations, Wakes}
+  alias Tightbeam.{
+    Assignments,
+    ConnRegistry,
+    DB,
+    Gateway,
+    Ledger,
+    NoticeBatcher,
+    Schema,
+    SessionPoAssociations,
+    Wakes
+  }
 
-  @shape "work-item-delivery-owner-v1-019"
+  @shape "notice-source-storage-v1-019"
   @agent_reparent_shape "delivery-owner-reparent-v1-019"
   @owner_link_history_ddl """
   CREATE TABLE work_item_delivery_scope_events (
@@ -236,6 +246,60 @@ defmodule Tightbeam.SchemaShapeTest do
     name = :"schema_shape_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: name})
     %{db: name}
+  end
+
+  test "retry source migration refuses unknown columns without rewriting the table", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    assert :ok =
+             DB.execute(
+               db,
+               "ALTER TABLE wake_retry_attempts ADD COLUMN unknownRetryContract TEXT"
+             )
+
+    before =
+      DB.query(
+        db,
+        "SELECT type,name,sql FROM sqlite_master WHERE tbl_name='wake_retry_attempts' ORDER BY type,name"
+      )
+
+    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
+    assert error.message =~ "incompatible_wake_retry_source_scope: malformed retry table"
+
+    assert DB.query(
+             db,
+             "SELECT type,name,sql FROM sqlite_master WHERE tbl_name='wake_retry_attempts' ORDER BY type,name"
+           ) == before
+
+    assert {:ok, [[1]]} = DB.query(db, "PRAGMA foreign_keys")
+    assert {:ok, [[0]]} = DB.query(db, "PRAGMA legacy_alter_table")
+  end
+
+  test "retry source migration preserves an unknown table-bound object by refusing it", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    assert :ok =
+             DB.execute(
+               db,
+               "CREATE INDEX custom_retry_contract ON wake_retry_attempts(observedAt)"
+             )
+
+    before =
+      DB.query(
+        db,
+        "SELECT type,name,sql FROM sqlite_master WHERE tbl_name='wake_retry_attempts' ORDER BY type,name"
+      )
+
+    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
+    assert error.message =~ "incompatible_wake_retry_source_scope: unknown table-bound objects"
+
+    assert DB.query(
+             db,
+             "SELECT type,name,sql FROM sqlite_master WHERE tbl_name='wake_retry_attempts' ORDER BY type,name"
+           ) == before
+
+    assert {:ok, [[1]]} = DB.query(db, "PRAGMA foreign_keys")
+    assert {:ok, [[0]]} = DB.query(db, "PRAGMA legacy_alter_table")
   end
 
   @tag firehose_final_stamp: true
@@ -623,6 +687,11 @@ defmodule Tightbeam.SchemaShapeTest do
              )
 
     for fact_id <- 1..6 do
+      # This migration proof isolates ownership recognition. Complete each
+      # marker turn before the next fact so every historical source is seen
+      # while its recipient is ready.
+      Enum.each(["marker-a", "marker-b"], &finish_marker_queue(db, &1))
+
       assert {:ok, _} =
                DB.transaction(db, fn txn ->
                  Wakes.recognize_condition_fact_in_txn(txn, fact_id)
@@ -650,22 +719,54 @@ defmodule Tightbeam.SchemaShapeTest do
                Wakes.recognize_condition_fact_in_txn(txn, 7)
              end)
 
+    staged_marker = Wakes.get(db, "marker-1-marker-b")
+    assert staged_marker.state == "pending"
+    assert is_integer(staged_marker.fired_at)
+    finish_marker_queue(db, "marker-b")
+
+    registry = :"marker_migration_registry_#{System.unique_integer([:positive])}"
+    lane = :"marker_migration_lane_#{System.unique_integer([:positive])}"
+    start_supervised!({ConnRegistry, name: registry})
+    start_supervised!({Tightbeam.SchemaShapeTest.LaneStub, lane})
+    delivery_opts = [conn_registry: registry, lane_manager: lane]
+
+    # Readiness commits the actual carrier turn; the migration must not append it again.
+    [carrier_id] =
+      NoticeBatcher.recover(db, System.system_time(:millisecond) + 1_000, delivery_opts)
+
+    carrier = Wakes.get(db, carrier_id)
+    assert carrier.session_key == "marker-b"
+    assert carrier.state == "fired"
+
     assert Wakes.get(db, "marker-1-marker-b").state == "fired"
 
-    assert {:ok, [[1]]} =
-             DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId='marker-1-marker-b'")
+    assert {:ok, [["marker-b", 1]]} =
+             DB.query(db, "SELECT sessionKey,COUNT(*) FROM turns WHERE wakeId=?1", [carrier_id])
 
-    assert {:ok, [[11]]} =
+    assert [%{delivery_wake_id: ^carrier_id, member_state: "included", batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(db, "marker-1-marker-b")
+
+    assert {:ok, [[10]]} =
              DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId LIKE 'marker-%'")
 
     # A second startup must not relabel ambiguous facts or duplicate recognition.
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [[11]]} =
+    assert NoticeBatcher.recover(db, System.system_time(:millisecond) + 1_000, delivery_opts) ==
+             []
+
+    assert {:ok, [[10]]} =
              DB.query(
                db,
                "SELECT COUNT(*) FROM turns WHERE wakeId LIKE 'marker-%'"
              )
+
+    assert {:ok, [[1]]} =
+             DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [carrier_id])
+
+    assert {:ok,
+            [[1, "marker-a"], [2, "marker-a"], [3, nil], [4, nil], [5, nil], [6, nil], [7, nil]]} =
+             DB.query(db, "SELECT id,ownerUserId FROM condition_facts ORDER BY id")
   end
 
   test "the row-driven-rules predecessor scopes legacy facts without rewriting wake history", %{
@@ -777,12 +878,37 @@ defmodule Tightbeam.SchemaShapeTest do
     )
 
     assert :ok = Wakes.fire_due(scheduler)
-    assert_receive {:legacy_migration_delivery, "w_timed"}
+    # Readiness delivers these legacy sources through one real carrier, before callbacks.
+    refute_received {:legacy_migration_delivery, _}
     assert Wakes.get(db, "w_pending").state == "fired"
     assert Wakes.get(db, "w_timed").state == "fired"
-    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId='w_pending'")
+
+    assert [%{delivery_wake_id: carrier_id, member_state: "included", batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(db, "w_pending")
+
+    assert [%{delivery_wake_id: ^carrier_id, member_state: "included", batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(db, "w_timed")
+
+    assert {:ok, [["owner-a-session", 1]]} =
+             DB.query(db, "SELECT sessionKey,COUNT(*) FROM turns WHERE wakeId=?1", [carrier_id])
+
+    assert {:ok, [[0]]} =
+             DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId IN ('w_pending','w_timed')")
+
+    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM turns")
+
+    assert {:ok, [[2]]} =
+             DB.query(db, "SELECT COUNT(*) FROM notice_batch_members WHERE state='included'")
+
+    delivery_before_restart =
+      DB.query(db, "SELECT seq,sessionKey,wakeId,messageId,prompt FROM turns ORDER BY seq")
+
+    assert Wakes.get(db, carrier_id).state == "fired"
+    assert NoticeBatcher.source_refs(db, "w_fired") == []
+    assert NoticeBatcher.source_refs(db, "w_canceled") == []
 
     assert :ok = stop_supervised(Wakes)
+    assert :ok = Schema.ensure_all(db)
 
     start_supervised!(
       {Wakes,
@@ -796,8 +922,19 @@ defmodule Tightbeam.SchemaShapeTest do
     )
 
     assert :ok = Wakes.fire_due(scheduler)
-    refute_receive {:legacy_migration_delivery, "w_timed"}
-    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId='w_pending'")
+    refute_received {:legacy_migration_delivery, _}
+
+    assert DB.query(db, "SELECT seq,sessionKey,wakeId,messageId,prompt FROM turns ORDER BY seq") ==
+             delivery_before_restart
+
+    assert {:ok, [[2]]} =
+             DB.query(db, "SELECT COUNT(*) FROM notice_batch_members WHERE state='included'")
+
+    assert {:ok, [["w_timed", "w_timed", 0, "pending", 1]]} =
+             DB.query(
+               db,
+               "SELECT wakeId,rootWakeId,attempt,outcome,observedAt FROM wake_retry_attempts"
+             )
 
     assert {:ok,
             [
@@ -805,7 +942,13 @@ defmodule Tightbeam.SchemaShapeTest do
               ["w_fired", "fired"],
               ["w_pending", "fired"],
               ["w_timed", "fired"]
-            ]} = DB.query(db, "SELECT wakeId,state FROM wakes ORDER BY wakeId")
+            ]} =
+             DB.query(db, "SELECT wakeId,state FROM wakes WHERE wakeId<>?1 ORDER BY wakeId", [
+               carrier_id
+             ])
+
+    assert Wakes.get(db, carrier_id).state == "fired"
+    assert {:ok, [[5]]} = DB.query(db, "SELECT COUNT(*) FROM wakes")
   end
 
   test "the exact effort-request predecessor gains nullable identity render stamps", %{db: db} do
@@ -1673,6 +1816,8 @@ defmodule Tightbeam.SchemaShapeTest do
                "ALTER TABLE identity_publication_markers DROP COLUMN denialDiagnostic; ALTER TABLE work_items DROP COLUMN deliveryOwnerSessionKey;"
              )
 
+    downgrade_assignment_source_replacement_cancellation!(db)
+
     assert {:ok, _} =
              DB.query(
                db,
@@ -1739,6 +1884,8 @@ defmodule Tightbeam.SchemaShapeTest do
                db,
                "ALTER TABLE identity_publication_markers DROP COLUMN denialDiagnostic; ALTER TABLE work_items DROP COLUMN deliveryOwnerSessionKey;"
              )
+
+    downgrade_assignment_source_replacement_cancellation!(db)
 
     assert {:ok, _} =
              DB.query(
@@ -1936,6 +2083,8 @@ defmodule Tightbeam.SchemaShapeTest do
   end
 
   defp rewind_to_agent_reparent!(db) do
+    downgrade_assignment_source_replacement_cancellation!(db)
+
     assert :ok =
              DB.execute(db, """
              DROP TRIGGER artifacts_origin_immutable;
@@ -2042,6 +2191,7 @@ defmodule Tightbeam.SchemaShapeTest do
   end
 
   defp downgrade_row_driven_waits(db) do
+    downgrade_assignment_source_replacement_cancellation!(db)
     :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
 
     try do
@@ -2097,7 +2247,63 @@ defmodule Tightbeam.SchemaShapeTest do
     end
   end
 
+  defp downgrade_assignment_source_replacement_cancellation!(db) do
+    downgrade_notice_source_storage!(db)
+
+    {:ok, [[current_ddl]]} =
+      DB.query(
+        db,
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='wake_cancellations'"
+      )
+
+    assignment_route =
+      ~r/\n\s+OR\n\s+\(requesterId = 'tightbeam:assignments' AND reasonKind = 'superseded' AND\n\s+causalSourceKind = 'wake' AND outcomeKind = 'replacement'\)/
+
+    if Regex.match?(assignment_route, current_ddl) do
+      predecessor_ddl = Regex.replace(assignment_route, current_ddl, "", global: false)
+
+      {:ok, columns} = DB.query(db, "PRAGMA table_info(wake_cancellations)")
+      column_names = Enum.map_join(columns, ",", &Enum.at(&1, 1))
+
+      {:ok, trigger_rows} =
+        DB.query(
+          db,
+          "SELECT sql FROM sqlite_master WHERE type='trigger' AND name IN ('wake_cancellations_pending_insert','wakes_typed_cancellation_required') ORDER BY name"
+        )
+
+      trigger_ddls = Enum.map_join(trigger_rows, ";\n", &hd/1)
+      {:ok, [[foreign_keys]]} = DB.query(db, "PRAGMA foreign_keys")
+
+      assert :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
+
+      try do
+        assert :ok =
+                 DB.execute(db, """
+                 DROP TRIGGER wake_cancellations_pending_insert;
+                 DROP TRIGGER wakes_typed_cancellation_required;
+                 ALTER TABLE wake_cancellations RENAME TO wake_cancellations_assignment_replacement_current;
+                 #{predecessor_ddl};
+                 INSERT INTO wake_cancellations (#{column_names})
+                   SELECT #{column_names} FROM wake_cancellations_assignment_replacement_current;
+                 DROP TABLE wake_cancellations_assignment_replacement_current;
+                 #{trigger_ddls};
+                 """)
+      after
+        assert :ok = DB.execute(db, "PRAGMA foreign_keys = #{foreign_keys}")
+      end
+    end
+  end
+
+  defp downgrade_notice_source_storage!(db),
+    do: Tightbeam.SchemaShapeRuntimeFixture.downgrade_notice_source_storage!(db)
+
   defp downgrade_wakes_to_terminal_decision(db) do
+    assert {:ok, []} =
+             DB.query(
+               db,
+               "SELECT name FROM sqlite_master WHERE name IN ('notice_delivery_policies','notice_batching_lane_policies')"
+             )
+
     :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
 
     try do
@@ -2105,8 +2311,6 @@ defmodule Tightbeam.SchemaShapeTest do
         DB.execute(db, """
         DROP TABLE notice_batch_members;
         DROP TABLE notice_batches;
-        DROP TABLE notice_delivery_policies;
-        DROP TABLE notice_batching_lane_policies;
         DROP TABLE admin_projection_versions;
         DROP INDEX wakes_due;
         DROP INDEX wakes_delivery;
@@ -2272,5 +2476,21 @@ defmodule Tightbeam.SchemaShapeTest do
       DROP TABLE IF EXISTS supervision_liveness_migrations;
       DROP INDEX IF EXISTS wakes_cancellation_state;
       """)
+  end
+
+  defp finish_marker_queue(db, session_key) do
+    case Ledger.claim_next(db, session_key, "schema-shape-fixture") do
+      {:ok, turn} ->
+        assert :ok =
+                 Ledger.finish(db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+
+        finish_marker_queue(db, session_key)
+
+      :none ->
+        :ok
+
+      other ->
+        flunk("expected an idle historical marker recipient, got: #{inspect(other)}")
+    end
   end
 end

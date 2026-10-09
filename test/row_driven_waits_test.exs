@@ -47,7 +47,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
        name: scheduler,
        db: db,
        tick_ms: 60_000,
-       deliver: fn _wake -> :ok end,
+       deliver: delivery_fun(db, registry, lane),
        delivery_opts: [conn_registry: registry, lane_manager: lane]}
     )
 
@@ -137,12 +137,8 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert Wakes.get(ctx.db, notice.wake_id).state == "fired"
 
-    assert {:ok, [["verifier", "V", "wi-verification", "queued"]]} =
-             DB.query(
-               ctx.db,
-               "SELECT sessionKey,assignmentId,jobRef,status FROM turns WHERE wakeId=?1",
-               [notice.wake_id]
-             )
+    assert [["verifier", "V", "wi-verification", "queued", _prompt]] =
+             turn_rows_for_source(ctx.db, notice.wake_id)
 
     assert supervision_counts(ctx.db, "V") == before
   end
@@ -243,10 +239,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
 
     verifier_wake_id = wake.verification_notice_wake_id
 
-    assert_receive {:firehose_notice,
-                    %{"class" => "wake.fired", "payload" => %{"wakeId" => ^verifier_wake_id}}}
-
-    Hub.delivered(hub, self())
+    receive_wake_fired(hub, verifier_wake_id, "fired")
 
     refute_receive {:firehose_notice,
                     %{"class" => "wake.fired", "payload" => %{"wakeId" => ^exact_wake_id}}}
@@ -260,19 +253,12 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert turn_count(ctx.db, wake.wake_id) == 1
 
-    assert_receive {:firehose_notice,
-                    %{
-                      "class" => "wake.fired",
-                      "payload" => %{"wakeId" => ^exact_wake_id, "state" => "fired"}
-                    }}
-
-    Hub.delivered(hub, self())
+    receive_wake_fired(hub, exact_wake_id, "fired")
 
     refute_receive {:firehose_notice,
                     %{"class" => "wake.fired", "payload" => %{"wakeId" => ^exact_wake_id}}}
 
-    assert {:ok, [[prompt]]} =
-             DB.query(ctx.db, "SELECT prompt FROM turns WHERE wakeId=?1", [wake.wake_id])
+    assert [prompt] = delivery_prompts_for_source(ctx.db, wake.wake_id)
 
     assert prompt =~ "[woke: wait #{wake.wake_id}; assignment A; path reconsideration;"
     assert prompt =~ "assignment:R"
@@ -280,7 +266,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assert prompt =~ "revoked"
     assert prompt =~ "disposition revoked"
     assert prompt =~ "predicate {"
-    assert String.ends_with?(prompt, "Continue from durable state without rewriting this prompt.")
+    assert prompt =~ "Continue from durable state without rewriting this prompt."
   end
 
   test "registration evaluates success and terminal resolver paths before returning", ctx do
@@ -302,11 +288,12 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assert success.verification_notice_wake_id == nil
 
     assert :ok = Wakes.fire_due(ctx.scheduler)
-    assert turn_count(ctx.db, terminal.wake_id) == 1
+    assert turn_count(ctx.db, terminal.wake_id) == 0
     assert turn_count(ctx.db, success.wake_id) == 0
 
     assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
     assert :ok = Wakes.fire_due(ctx.scheduler)
+    assert turn_count(ctx.db, terminal.wake_id) == 1
     assert turn_count(ctx.db, success.wake_id) == 1
   end
 
@@ -470,6 +457,17 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert turn_count(ctx.db, wake.wake_id) == 1
+    assert Wakes.get(ctx.db, wake.wake_id).prompt == wake.prompt
+
+    assert {:ok, [[delivered_prompt]]} =
+             DB.query(
+               ctx.db,
+               "SELECT t.prompt FROM turns t JOIN notice_batches b ON b.deliveryWakeId=t.wakeId JOIN notice_batch_members m ON m.batchId=b.batchId WHERE m.sourceWakeId=?1",
+               [wake.wake_id]
+             )
+
+    assert delivered_prompt =~ "[woke: wait #{wake.wake_id};"
+    assert delivered_prompt =~ wake.prompt
   end
 
   test "after-turn captures the running turn and becomes eligible on every terminal outcome",
@@ -721,8 +719,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert turn_count(ctx.db, latched.wake_id) == 1
 
-    assert {:ok, [[prompt]]} =
-             DB.query(ctx.db, "SELECT prompt FROM turns WHERE wakeId=?1", [latched.wake_id])
+    assert [prompt] = delivery_prompts_for_source(ctx.db, latched.wake_id)
 
     assert prompt =~ "work_item:wi-latched"
     assert prompt =~ ~s(state "open"→"iceboxed")
@@ -765,7 +762,14 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assert %{outcome: "revoked"} = revoke(ctx.db, "R-before-fallback")
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert Wakes.get(ctx.db, resolver_first.wake_id).recognition_path == "reconsideration"
+
+    assert turn_count(ctx.db, resolver_first.wake_id) == 0
+    assert Wakes.get(ctx.db, resolver_first.wake_id).state == "pending"
+    assert Tightbeam.NoticeBatcher.source_refs(ctx.db, resolver_first.wake_id) == []
+    drain_queued_turns(ctx.db, "holder")
+    assert :ok = Wakes.fire_due(ctx.scheduler)
     assert turn_count(ctx.db, resolver_first.wake_id) == 1
+    drain_queued_turns(ctx.db, "holder")
 
     assignment(ctx.db, "R-after-fallback", "resolver")
 
@@ -781,6 +785,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assert %{outcome: "revoked"} = revoke(ctx.db, "R-after-fallback")
     assert Wakes.get(ctx.db, fallback_first.wake_id).recognition_path == "fallback"
     assert :ok = Wakes.fire_due(ctx.scheduler)
+
     assert turn_count(ctx.db, fallback_first.wake_id) == 1
   end
 
@@ -1397,6 +1402,18 @@ defmodule Tightbeam.RowDrivenWaitsTest do
       assert :ok = Wakes.fire_due(ctx.scheduler)
       assert {:ok, turn} = Ledger.claim_next(ctx.db, "holder", "fixture")
       assert covered?(ctx.db, "A")
+
+      assert [
+               %{delivery_wake_id: carrier_id}
+             ] = Tightbeam.NoticeBatcher.source_refs(ctx.db, wake.wake_id)
+
+      assert turn.wake_id == carrier_id
+
+      assert {:ok, [["A", "holder", ^carrier_id]]} =
+               DB.query(ctx.db, "SELECT assignmentId,sessionKey,wakeId FROM turns WHERE seq=?1", [
+                 turn.seq
+               ])
+
       before = {attest_count(ctx.db, "A"), supervision_counts(ctx.db, "A")}
 
       assert :ok =
@@ -1409,8 +1426,6 @@ defmodule Tightbeam.RowDrivenWaitsTest do
 
       assert {:ok, [["open", nil]]} =
                DB.query(ctx.db, "SELECT state,outcome FROM assignments WHERE id='A'")
-
-      assert turn.wake_id == wake.wake_id
     end
   end
 
@@ -1640,8 +1655,88 @@ defmodule Tightbeam.RowDrivenWaitsTest do
   end
 
   defp turn_count(db, wake_id) do
-    {:ok, [[count]]} = DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [wake_id])
+    {:ok, [[count]]} =
+      DB.query(
+        db,
+        """
+        SELECT COUNT(DISTINCT t.seq) FROM turns t
+        WHERE t.wakeId=?1 OR t.wakeId IN (
+          SELECT b.deliveryWakeId
+          FROM notice_batch_members m
+          JOIN notice_batches b ON b.batchId=m.batchId
+          WHERE m.sourceWakeId=?1 AND b.deliveryWakeId IS NOT NULL
+        )
+        """,
+        [wake_id]
+      )
+
     count
+  end
+
+  defp drain_queued_turns(db, session_key) do
+    case Ledger.claim_next(db, session_key, "fixture") do
+      {:ok, turn} ->
+        assert :ok = Ledger.finish(db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+        drain_queued_turns(db, session_key)
+
+      :none ->
+        :ok
+    end
+  end
+
+  defp receive_wake_fired(hub, wake_id, state, attempts \\ 12)
+
+  defp receive_wake_fired(_hub, _wake_id, _state, 0) do
+    flunk("did not receive the expected wake event")
+  end
+
+  defp receive_wake_fired(hub, wake_id, state, attempts) do
+    assert_receive {:firehose_notice, %{"class" => "wake.fired", "payload" => payload}}
+    Tightbeam.Firehose.Hub.delivered(hub, self())
+
+    if payload["wakeId"] == wake_id and payload["state"] == state do
+      payload
+    else
+      receive_wake_fired(hub, wake_id, state, attempts - 1)
+    end
+  end
+
+  defp turn_rows_for_source(db, wake_id) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT sessionKey, assignmentId, jobRef, status, prompt FROM turns WHERE wakeId=?1
+        UNION ALL
+        SELECT t.sessionKey, t.assignmentId, t.jobRef, t.status, t.prompt
+        FROM notice_batch_members m
+        JOIN notice_batches b ON b.batchId=m.batchId
+        JOIN turns t ON t.wakeId=b.deliveryWakeId
+        WHERE m.sourceWakeId=?1
+        """,
+        [wake_id]
+      )
+
+    rows
+  end
+
+  defp delivery_prompts_for_source(db, wake_id) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT prompt FROM turns WHERE wakeId=?1
+        UNION ALL
+        SELECT t.prompt
+        FROM notice_batch_members m
+        JOIN notice_batches b ON b.batchId=m.batchId
+        JOIN turns t ON t.wakeId=b.deliveryWakeId
+        WHERE m.sourceWakeId=?1
+        """,
+        [wake_id]
+      )
+
+    Enum.map(rows, fn [prompt] -> prompt end)
   end
 
   defp artifact_predicate(producer_id, expected_hash, reviewed?, resolver_id \\ nil) do

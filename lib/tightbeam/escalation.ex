@@ -782,7 +782,12 @@ defmodule Tightbeam.Escalation do
              end
            ) do
         {:ok, {result, deliveries}} ->
-          ConditionFacts.complete_deliveries(db, deliveries)
+          ConditionFacts.complete_deliveries(
+            db,
+            opts[:scheduler] || Tightbeam.WakeScheduler,
+            deliveries
+          )
+
           nudge(opts, result[:ruling_fact_id] && [result.ruling_fact_id])
           result
 
@@ -2839,7 +2844,12 @@ defmodule Tightbeam.Escalation do
         end
       )
 
-    ConditionFacts.complete_deliveries(db, deliveries)
+    ConditionFacts.complete_deliveries(
+      db,
+      opts[:scheduler] || Tightbeam.WakeScheduler,
+      deliveries
+    )
+
     nudge(opts, result[:ruling_fact_id] && [result.ruling_fact_id])
     result
   end
@@ -2928,7 +2938,12 @@ defmodule Tightbeam.Escalation do
         end
       )
 
-    ConditionFacts.complete_deliveries(db, deliveries)
+    ConditionFacts.complete_deliveries(
+      db,
+      opts[:scheduler] || Tightbeam.WakeScheduler,
+      deliveries
+    )
+
     nudge(opts, fact_ids)
     waiver
   end
@@ -3591,12 +3606,17 @@ defmodule Tightbeam.Escalation do
         """
         SELECT COUNT(*) FROM wakes
         WHERE targetRole IS NULL AND origin = 'process:tightbeam'
-          AND prompt = ?2 AND consumer = 'prompt' AND conditionKind = ?3
+          AND prompt IN (
+                ?2,
+                '[woke: fact ' || ?3 || '/' || ?4 || ']' || char(10) || char(10) || ?2
+              )
+          AND consumer = 'prompt' AND conditionKind = ?3
           AND conditionScope = ?4 AND conditionAfterId < ?5
           AND dueAt IN (?6, ?9) AND targetGate = 0
           AND reresolve IS NULL AND reresolveSeed IS NULL AND reresolveRung IS NULL
           AND ((?7 IS NULL AND creatorSessionKey IS NULL) OR creatorSessionKey = ?7)
           AND ((state = 'pending' AND firedAt IS NULL AND firedBy IS NULL) OR
+               (state = 'pending' AND firedAt IS NOT NULL AND firedBy = 'condition') OR
                (state = 'fired' AND firedAt IS NOT NULL AND firedBy = 'condition'))
           AND ((?8 = 0 AND sessionKey = ?1) OR (?8 = 1 AND sessionKey != ?1))
         """,

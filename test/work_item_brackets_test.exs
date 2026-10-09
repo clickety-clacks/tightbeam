@@ -12,6 +12,8 @@ defmodule Tightbeam.WorkItemBracketsTest do
     DB,
     Dispatch,
     Gateway,
+    Ledger,
+    NoticeBatcher,
     Org,
     Projection,
     RailRemedy,
@@ -60,6 +62,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
     db = :"brackets_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
     start_supervised!({ConnRegistry, name: ConnRegistry})
+    start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, Tightbeam.LaneManager})
 
     :ok = Tightbeam.Schema.ensure_all(db)
 
@@ -912,7 +915,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
   end
 
   defp deliver_bracket_wake(db, wake) do
-    {:ok, _} =
+    {:ok, result} =
       DB.transaction(db, fn txn ->
         Gateway.deliver_prompt_in_txn(txn, wake.session_key, wake.origin, wake.prompt,
           wake_id: wake.wake_id,
@@ -921,6 +924,60 @@ defmodule Tightbeam.WorkItemBracketsTest do
           fire_wake_in_txn: true
         )
       end)
+
+    case result do
+      {:staged, %{wake_id: source_wake_id}} ->
+        finish_delivery_queue(db, wake.session_key)
+        _ = NoticeBatcher.recover(db, System.system_time(:millisecond) + 60_000)
+        [%{delivery_wake_id: carrier_wake_id}] = NoticeBatcher.source_refs(db, source_wake_id)
+        carrier = Wakes.get(db, carrier_wake_id)
+
+        # Recovery has already committed the actual carrier turn. Replaying
+        # that carrier must return its existing turn, never append again.
+        assert {:ok, {:duplicate, %{wake_id: ^carrier_wake_id, turn_seq: turn_seq}}} =
+                 DB.transaction(db, fn txn ->
+                   Gateway.deliver_prompt_in_txn(
+                     txn,
+                     carrier.session_key,
+                     carrier.origin,
+                     carrier.prompt,
+                     wake_id: carrier.wake_id,
+                     sender: carrier.origin,
+                     target_gate: carrier,
+                     fire_wake_in_txn: true
+                   )
+                 end)
+
+        assert {:ok, [[^turn_seq]]} =
+                 DB.query(db, "SELECT seq FROM turns WHERE wakeId=?1", [carrier_wake_id])
+
+        assert source_wake_id in Enum.map(Wakes.digest_members(db, carrier_wake_id), & &1.wake_id)
+        assert Wakes.get(db, source_wake_id).state == "fired"
+        assert Wakes.get(db, carrier_wake_id).state == "fired"
+        finish_delivery_queue(db, carrier.session_key)
+
+      {:appended, _, _, _} ->
+        finish_delivery_queue(db, wake.session_key)
+
+      other ->
+        flunk("expected bracket wake delivery, got: #{inspect(other)}")
+    end
+  end
+
+  defp finish_delivery_queue(db, session_key) do
+    case Ledger.claim_next(db, session_key, "work-item-bracket-fixture") do
+      {:ok, turn} ->
+        assert :ok =
+                 Ledger.finish(db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+
+        finish_delivery_queue(db, session_key)
+
+      :none ->
+        :ok
+
+      other ->
+        flunk("expected an idle bracket delivery queue, got: #{inspect(other)}")
+    end
   end
 
   defp routing_wake_id(db, id), do: column(db, id, "routingWakeId")

@@ -304,6 +304,282 @@ defmodule Tightbeam.HarnessHealthTest do
              )
   end
 
+  test "an idle health route binds its actual turn, not an unrelated message sequence", ctx do
+    [child, parent | _] = ctx.sessions
+    parent_session = parent.session
+    at = System.system_time(:millisecond)
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "UPDATE sessions SET spawnedBy=?2 WHERE sessionKey=?1", [
+               child.session,
+               parent_session
+             ])
+
+    # Assistant messages advance this session's message counter without turns.
+    for index <- 1..2 do
+      assert {:appended, _} =
+               Projection.append(ctx.db, %{
+                 session_key: parent_session,
+                 role: "assistant",
+                 content: "prior reply #{index}",
+                 sender: "agent:#{parent_session}"
+               })
+    end
+
+    # Completed unrelated turns skew the independently allocated counters.
+    for index <- 1..3 do
+      assert {:appended, message} =
+               Projection.append(ctx.db, %{
+                 session_key: ctx.outside_session,
+                 role: "user",
+                 content: "other work #{index}",
+                 sender: "user:flynn"
+               })
+
+      assert {:ok, seq} =
+               Ledger.enqueue(ctx.db, %{
+                 session_key: ctx.outside_session,
+                 message_id: message.id,
+                 origin: "user:flynn",
+                 prompt: message.content
+               })
+
+      assert {:ok, turn} = Ledger.claim_next(ctx.db, ctx.outside_session, "sequence-skew")
+      assert turn.seq == seq
+      assert :ok = Ledger.finish(ctx.db, seq, "delivered", nil, owner_lease: turn.owner_lease)
+    end
+
+    assert {:opened, opened} =
+             HarnessHealth.observe_other(ctx.db, %{
+               harness: "claude",
+               host: "gibson",
+               source_session_key: child.session,
+               principal: {:session, child.session},
+               description: "idle route identity evidence",
+               evidence_mode: "exact_error",
+               observed_state: "provider route failed",
+               exact_observed_error: "route reset",
+               exact_probe: "provider health probe",
+               recovery_condition: "a normal provider turn completes",
+               not_known_class_reason: "not one of the named classes",
+               observed_at: at,
+               accepted_at: at,
+               valid_until: at + 500,
+               world_status: "UNKNOWN",
+               redaction_confirmed: true,
+               idempotency_key: "idle-route-identity"
+             })
+
+    expected_wake = "other-review:#{opened.id}:#{parent_session}"
+
+    assert {:ok, [[turn_seq, message_seq]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT t.seq,m.seq FROM turns t JOIN messages m ON m.id=t.messageId
+               WHERE t.sessionKey=?1 AND t.wakeId=?2
+               """,
+               [parent_session, expected_wake]
+             )
+
+    assert message_seq > turn_seq
+
+    # Make the wrong message sequence name a real, unrelated terminal turn.
+    for expected_seq <- (turn_seq + 1)..message_seq do
+      assert {:appended, message} =
+               Projection.append(ctx.db, %{
+                 session_key: ctx.outside_session,
+                 role: "user",
+                 content: "false witness #{expected_seq}",
+                 sender: "user:flynn"
+               })
+
+      assert {:ok, seq} =
+               Ledger.enqueue(ctx.db, %{
+                 session_key: ctx.outside_session,
+                 message_id: message.id,
+                 origin: "user:flynn",
+                 prompt: message.content
+               })
+
+      assert seq == expected_seq
+      assert {:ok, unrelated} = Ledger.claim_next(ctx.db, ctx.outside_session, "false-witness")
+      assert unrelated.seq == seq
+
+      assert :ok =
+               Ledger.finish(ctx.db, seq, "delivered", nil, owner_lease: unrelated.owner_lease)
+    end
+
+    assert {:ok, [["delivered", outside]]} =
+             DB.query(ctx.db, "SELECT status,sessionKey FROM turns WHERE seq=?1", [message_seq])
+
+    assert outside == ctx.outside_session
+
+    assert {:ok, [["pending", ^turn_seq, ^expected_wake]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,turnSeq,noticeWakeId FROM harness_health_other_routes WHERE incidentId=?1 AND recipient=?2 ORDER BY ordinal LIMIT 1",
+               [opened.id, parent_session]
+             )
+
+    # Restart reconciliation must not settle against the unrelated delivered turn.
+    assert :ok = HarnessHealth.resume_other_routes(ctx.db)
+    assert :ok = HarnessHealth.resume_other_routes(ctx.db)
+
+    assert {:ok, [["pending", ^turn_seq]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,turnSeq FROM harness_health_other_routes WHERE incidentId=?1 AND recipient=?2 ORDER BY ordinal LIMIT 1",
+               [opened.id, parent_session]
+             )
+
+    assert {:ok, turn} = Ledger.claim_next(ctx.db, parent_session, "idle-health-route")
+    assert turn.seq == turn_seq
+    assert :ok = Ledger.finish(ctx.db, turn.seq, "failed", nil, owner_lease: turn.owner_lease)
+    assert :ok = HarnessHealth.resume_other_routes(ctx.db)
+
+    assert {:ok, [["non_delivered", "failed"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,closedReason FROM harness_health_other_routes WHERE incidentId=?1 AND recipient=?2 ORDER BY ordinal LIMIT 1",
+               [opened.id, parent_session]
+             )
+  end
+
+  test "a busy other-route recipient keeps the recovery notice as a source until ready", ctx do
+    registry = :"health_batch_registry_#{System.unique_integer([:positive])}"
+    lane = :"health_batch_lane_#{System.unique_integer([:positive])}"
+    start_supervised!({Tightbeam.ConnRegistry, name: registry})
+    start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, lane})
+
+    [child, parent | _] = ctx.sessions
+    parent_session = parent.session
+    at = System.system_time(:millisecond)
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "UPDATE sessions SET spawnedBy=?2 WHERE sessionKey=?1", [
+               child.session,
+               parent.session
+             ])
+
+    {:appended, current_message} =
+      Projection.append(ctx.db, %{
+        session_key: parent.session,
+        role: "user",
+        content: "current bounded work",
+        sender: "session:#{parent.session}"
+      })
+
+    {:ok, current_seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: parent.session,
+        message_id: current_message.id,
+        origin: "session:#{parent.session}",
+        prompt: "current bounded work"
+      })
+
+    assert {:ok, %{seq: ^current_seq, owner_lease: lease}} =
+             Ledger.claim_next(ctx.db, parent.session, "other-route-batching")
+
+    assert {:opened, opened} =
+             HarnessHealth.observe_other(ctx.db, %{
+               harness: "claude",
+               host: "gibson",
+               source_session_key: child.session,
+               principal: {:session, child.session},
+               description: "busy route batching evidence",
+               evidence_mode: "exact_error",
+               observed_state: "provider route failed",
+               exact_observed_error: "busy route reset",
+               exact_probe: "provider health probe",
+               recovery_condition: "a normal provider turn completes",
+               not_known_class_reason: "not one of the named classes",
+               observed_at: at,
+               accepted_at: at,
+               valid_until: at + 500,
+               world_status: "UNKNOWN",
+               redaction_confirmed: true,
+               idempotency_key: "busy-route-batching"
+             })
+
+    expected_wake_id = "other-review:#{opened.id}:#{parent_session}"
+
+    assert {:ok, [["pending", nil, ^expected_wake_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,turnSeq,noticeWakeId FROM harness_health_other_routes WHERE incidentId=?1 AND recipient=?2 ORDER BY ordinal LIMIT 1",
+               [opened.id, parent_session]
+             )
+
+    assert {:ok, [["pending", "fyi", "notice-batching-v1 r2"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,class,deliveryRule FROM wakes WHERE wakeId=?1",
+               [expected_wake_id]
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [expected_wake_id])
+
+    assert :ok = Ledger.finish(ctx.db, current_seq, "delivered", nil, owner_lease: lease)
+    original_prompt = Wakes.get(ctx.db, expected_wake_id).prompt
+
+    [carrier_id] =
+      Tightbeam.NoticeBatcher.recover(ctx.db, at + 1_000,
+        conn_registry: registry,
+        lane_manager: lane
+      )
+
+    carrier = Wakes.get(ctx.db, carrier_id)
+
+    assert carrier.state == "fired"
+    assert carrier_id != expected_wake_id
+    assert Wakes.get(ctx.db, expected_wake_id).state == "fired"
+    assert Wakes.get(ctx.db, expected_wake_id).prompt == original_prompt
+
+    assert [%{delivery_wake_id: ^carrier_id, member_state: "included", batch_state: "delivered"}] =
+             Tightbeam.NoticeBatcher.source_refs(ctx.db, expected_wake_id)
+
+    assert {:ok, [[turn_seq, "queued", ^parent_session, content]]} =
+             DB.query(
+               ctx.db,
+               "SELECT t.seq,t.status,t.sessionKey,m.content FROM turns t JOIN messages m ON m.id=t.messageId WHERE t.wakeId=?1",
+               [carrier_id]
+             )
+
+    assert content =~ original_prompt
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [expected_wake_id])
+
+    assert {:ok, before_turns} = DB.query(ctx.db, "SELECT * FROM turns ORDER BY seq")
+    assert {:ok, before_messages} = DB.query(ctx.db, "SELECT * FROM messages ORDER BY seq")
+
+    assert {:ok, {:duplicate, %{wake_id: ^carrier_id, turn_seq: ^turn_seq}}} =
+             DB.transaction(ctx.db, fn txn ->
+               Gateway.deliver_prompt_in_txn(
+                 txn,
+                 carrier.session_key,
+                 carrier.origin,
+                 carrier.prompt,
+                 wake_id: carrier.wake_id,
+                 sender: carrier.origin,
+                 target_gate: carrier,
+                 fire_wake_in_txn: true
+               )
+             end)
+
+    assert {:ok, ^before_turns} = DB.query(ctx.db, "SELECT * FROM turns ORDER BY seq")
+    assert {:ok, ^before_messages} = DB.query(ctx.db, "SELECT * FROM messages ORDER BY seq")
+
+    assert {:ok, [["pending", ^turn_seq, ^expected_wake_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,turnSeq,noticeWakeId FROM harness_health_other_routes WHERE incidentId=?1 AND recipient=?2 ORDER BY ordinal LIMIT 1",
+               [opened.id, parent.session]
+             )
+  end
+
   test "non-delivered route settlement publishes the next rung once", ctx do
     [child, parent | _] = ctx.sessions
     at = System.system_time(:millisecond)

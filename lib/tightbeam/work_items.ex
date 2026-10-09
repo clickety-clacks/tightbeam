@@ -744,6 +744,7 @@ defmodule Tightbeam.WorkItems do
               prompt:
                 "slate clear on #{work_item_id}: close it, card more work, or rule it failed",
               due_at: now(),
+              sender_scheduled: true,
               work_item_id: work_item_id
             })
 
@@ -789,6 +790,7 @@ defmodule Tightbeam.WorkItems do
                 origin: @origin,
                 prompt: "slate clear on #{item_id}: close it, card more work, or rule it failed",
                 due_at: now() + triage_deadline_ms(),
+                sender_scheduled: true,
                 work_item_id: item_id
               })
 
@@ -817,6 +819,7 @@ defmodule Tightbeam.WorkItems do
         origin: @origin,
         prompt: "route it or icebox it — work item #{id}: #{title}",
         due_at: now() + triage_deadline_ms(),
+        sender_scheduled: true,
         work_item_id: id
       })
 
