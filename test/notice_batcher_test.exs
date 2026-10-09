@@ -48,19 +48,23 @@ defmodule Tightbeam.NoticeBatcherTest do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 8)
   end
 
-  test "acceptance 10: the 51st member starts the next ordered batch", %{tmp_dir: tmp} do
+  test "acceptance 10: a 51-member snapshot stays editable until withdrawal makes it fit", %{
+    tmp_dir: tmp
+  } do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 9)
   end
 
-  test "acceptance 11: the payload limit seals a prefix and never truncates the candidate", %{
-    tmp_dir: tmp
-  } do
+  test "acceptance 11: the payload limit holds the whole snapshot without truncating the candidate",
+       %{
+         tmp_dir: tmp
+       } do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 10)
   end
 
-  test "bounded queue chunks become carriers in the recipient-ready pass", %{
-    tmp_dir: tmp
-  } do
+  test "separate eligibility boundaries form ordered carriers without splitting an over-cap snapshot",
+       %{
+         tmp_dir: tmp
+       } do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 11)
   end
 
@@ -82,15 +86,17 @@ defmodule Tightbeam.NoticeBatcherTest do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 15)
   end
 
-  test "acceptance 17: cancellation before seal excludes; cancellation after seal preserves", %{
-    tmp_dir: tmp
-  } do
+  test "acceptance 17: cancellation before admission excludes; cancellation after commit preserves history",
+       %{
+         tmp_dir: tmp
+       } do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 16)
   end
 
-  test "acceptance 18: visibility scopes split one role lane and gate batch reads", %{
-    tmp_dir: tmp
-  } do
+  test "acceptance 18: source visibility survives session coalescing and gates the entire batch read",
+       %{
+         tmp_dir: tmp
+       } do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 17)
   end
 
@@ -116,17 +122,18 @@ defmodule Tightbeam.NoticeBatcherTest do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 21)
   end
 
-  test "acceptance 22: a later earlier deadline atomically shortens the lane", %{tmp_dir: tmp} do
+  test "acceptance 22: an earlier due source delivers without prematurely including a later deadline",
+       %{tmp_dir: tmp} do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 22)
   end
 
-  test "a selected 65,536-byte source stays durable on the ordinary fallback lane", %{
+  test "a selected 65,536-byte payload stays editable without a fallback bypass", %{
     tmp_dir: tmp
   } do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 23)
   end
 
-  test "the rendered V1 member boundary admits 65,536 bytes and bypasses the next byte", %{
+  test "the rendered V1 member boundary admits 65,536 bytes and holds the next byte", %{
     tmp_dir: tmp
   } do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 24)
@@ -153,13 +160,11 @@ defmodule Tightbeam.NoticeBatcherTest do
   end
 
   @tag notice_guarded_restart: true
-  test "acceptance 13: a reopened file arms one wake from an already sealed batch", %{
-    tmp_dir: tmp
-  } do
-    Tightbeam.GuardRuntimeFixture.run!(
-      tmp,
-      "firehose_notice_restart.exs",
-      "guarded-notice-batch-reopen: ok"
-    )
+  test "acceptance 13: a reopened file regroups unclaimed sealed history and commits one carrier",
+       %{
+         tmp_dir: tmp
+       } do
+    # Historical seal/arm is replaced by one readiness transaction; retain the file-reopen proof.
+    Tightbeam.NoticeBatcherFixture.run!(tmp, 29)
   end
 end
