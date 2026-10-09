@@ -611,6 +611,10 @@ defmodule Tightbeam.EscalationDeliveryFixture do
               "append_and_enqueue_in_txn/7"} => 1,
              {"lib/tightbeam/harness_health.ex", "Gateway.deliver_prompt_in_txn/5",
               "incident_notice_in_txn/4"} => 1,
+             # One concrete-session snapshot admits its carrier and actual turn
+             # together; the inventory still rejects any additional turn sink.
+             {"lib/tightbeam/notice_batcher.ex", "Gateway.deliver_prompt_in_txn/5",
+              "admit_session_snapshot_in_txn/5"} => 1,
              {"lib/tightbeam/wakes.ex", "Ledger.enqueue_in_txn/2",
               "redeliver_health_source_in_txn/3"} => 1,
              {"lib/tightbeam/ledger.ex", "Ledger.enqueue_in_txn/2", "enqueue/2"} => 1,
