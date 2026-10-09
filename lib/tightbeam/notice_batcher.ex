@@ -586,9 +586,10 @@ defmodule Tightbeam.NoticeBatcher do
     :ok = Wakes.dispose_closed_remedy_sources(db, at)
     reconcile_committed_deliveries(db, at)
 
-    # These records are recovery compatibility, not ordinary enrollment. A
-    # historical committed carrier is immutable and never joins a new snapshot.
-    legacy_ids = recover_ready_batches(db, at, [])
+    # Only carriers with no actual turn can return to the editable queue.
+    # Their frozen bytes remain historical evidence; committed deliveries do
+    # not participate in a later recipient snapshot.
+    restore_unclaimed_sources(db, at)
 
     {:ok, recipients} =
       DB.transaction(db, fn txn ->
@@ -634,8 +635,111 @@ defmodule Tightbeam.NoticeBatcher do
         end
       end)
 
-    legacy_ids ++ deliveries
+    deliveries
   end
+
+  defp restore_unclaimed_sources(db, at) do
+    transaction!(db, fn txn ->
+      Txn.q(
+        txn,
+        "SELECT batchId FROM notice_batches WHERE state IN ('open','sealed','delivery_pending')"
+      )
+      |> Enum.each(fn [batch_id] ->
+        invalidate_unclaimed_batch_in_txn(txn, batch_id, "recipient-readiness-regroup", at)
+      end)
+    end)
+  end
+
+  # This invalidates transport membership, never the underlying source mail.
+  # The no-turn predicate fences running, committed and unknown-effect history.
+  defp invalidate_unclaimed_batch_in_txn(txn, batch_id, cause, at) do
+    case Txn.q(
+           txn,
+           """
+           SELECT b.deliveryWakeId FROM notice_batches b
+           WHERE b.batchId=?1 AND b.state IN ('open','sealed','delivery_pending')
+             AND (b.deliveryWakeId IS NULL OR EXISTS (
+               SELECT 1 FROM wakes w WHERE w.wakeId=b.deliveryWakeId AND w.state='pending' AND w.digest=1))
+             AND NOT EXISTS (SELECT 1 FROM turns t WHERE t.wakeId=b.deliveryWakeId)
+           """,
+           [batch_id]
+         ) do
+      [[wake_id]] ->
+        Txn.q(
+          txn,
+          """
+          UPDATE notice_batch_members SET state='canceled',canceledAt=?2,cancellationRef=?3
+          WHERE batchId=?1 AND state IN ('active','included')
+          """,
+          [batch_id, at, "transport:" <> batch_id <> ":" <> cause]
+        )
+
+        if is_binary(wake_id) do
+          mark_delivery_failed_in_txn(txn, wake_id, cause, at)
+        else
+          Txn.q(
+            txn,
+            """
+            UPDATE notice_batches SET state='canceled',terminalCause=?2,
+              terminalPrincipal='process:tightbeam:batcher' WHERE batchId=?1
+            """,
+            [batch_id, cause]
+          )
+        end
+
+        lifecycle(txn, "unclaimed_membership_released", batch_id, nil, nil, cause)
+        :released
+
+      [] ->
+        :immutable
+    end
+  end
+
+  @doc false
+  def carrier_admission_in_txn(%Txn{} = txn, wake_id) when is_binary(wake_id) do
+    case Txn.q(
+           txn,
+           """
+           SELECT b.batchId,m.sourceWakeId,m.payload FROM notice_batches b
+           JOIN notice_batch_members m ON m.batchId=b.batchId AND m.state='included'
+           WHERE b.deliveryWakeId=?1 AND b.state='delivery_pending'
+           ORDER BY m.publicationSeq
+           """,
+           [wake_id]
+         ) do
+      [] ->
+        :ready
+
+      rows ->
+        carrier = Wakes.get_in_txn(txn, wake_id)
+        target = source_delivery_target(txn, carrier)
+
+        valid? =
+          Enum.reduce(rows, true, fn [_, source_id, payload], valid ->
+            prepared? = prepare_due_source_in_txn(txn, source_id)
+            source = Wakes.get_in_txn(txn, source_id)
+
+            prepared? and source.prompt == payload and
+              same_delivery_target?(source_delivery_target(txn, source), target) and valid
+          end)
+
+        if valid? do
+          :ready
+        else
+          [batch_id, _, _] = hd(rows)
+
+          :released =
+            invalidate_unclaimed_batch_in_txn(txn, batch_id, "source-changed-at-admission", now())
+
+          :skipped
+        end
+    end
+  end
+
+  def carrier_admission_in_txn(%Txn{}, _wake_id), do: :ready
+
+  defp same_delivery_target?({key, _, _}, {key, _, _}) when is_binary(key), do: true
+  defp same_delivery_target?(_, _), do: false
 
   defp ready_sources_in_txn(txn, at) do
     Txn.q(
@@ -823,48 +927,6 @@ defmodule Tightbeam.NoticeBatcher do
     end
   end
 
-  defp recover_ready_batches(db, at, armed) do
-    newly_formed = []
-
-    {:ok, open_ids} =
-      DB.query(
-        db,
-        "SELECT batchId FROM notice_batches WHERE state='open' ORDER BY openedAt, batchId"
-      )
-
-    sealed =
-      Enum.count(open_ids, fn [batch_id] ->
-        transaction!(db, fn txn ->
-          enqueue_or_recover_in_txn(txn, {:seal_if_due, batch_id, at}) == :sealed
-        end)
-      end)
-
-    {:ok, sealed_ids} =
-      DB.query(
-        db,
-        "SELECT batchId FROM notice_batches WHERE state='sealed' ORDER BY sealedAt, batchId"
-      )
-
-    newly_armed =
-      Enum.flat_map(sealed_ids, fn [batch_id] ->
-        case transaction!(db, fn txn ->
-               enqueue_or_recover_in_txn(txn, {:arm_if_due, batch_id, at})
-             end) do
-          {:new, wake_id} -> [wake_id]
-          _ -> []
-        end
-      end)
-
-    # A full or payload-bounded open batch leaves later source rows pending and
-    # individually editable. Once the recipient is ready, seal and arm that
-    # prefix, then fill the next bounded carrier from the still-pending rows.
-    if sealed > 0 do
-      recover_ready_batches(db, at, armed ++ newly_formed ++ newly_armed)
-    else
-      armed ++ newly_formed ++ newly_armed
-    end
-  end
-
   defp prepare_due_source_in_txn(txn, wake_id) do
     if Wakes.suppress_supervision_if_blocked_in_txn?(txn, wake_id) do
       false
@@ -912,7 +974,7 @@ defmodule Tightbeam.NoticeBatcher do
       :stale ->
         Txn.q(
           txn,
-          "UPDATE wakes SET state='fired',firedAt=?2,firedBy='stale-suppressed' WHERE wakeId=?1 AND state='pending'",
+          "UPDATE wakes SET state='fired',firedAt=?2 WHERE wakeId=?1 AND state='pending'",
           [wake_id, now()]
         )
 

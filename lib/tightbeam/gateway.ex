@@ -1999,8 +1999,14 @@ defmodule Tightbeam.Gateway do
 
       :continue ->
         case existing_wake_turn_in_txn(txn, opts[:wake_id]) do
-          nil -> deliver_resolved_prompt_in_txn(txn, session_key, origin, prompt, opts)
-          duplicate -> duplicate
+          nil ->
+            case NoticeBatcher.carrier_admission_in_txn(txn, opts[:wake_id]) do
+              :ready -> deliver_resolved_prompt_in_txn(txn, session_key, origin, prompt, opts)
+              :skipped -> :skipped
+            end
+
+          duplicate ->
+            duplicate
         end
     end
   end

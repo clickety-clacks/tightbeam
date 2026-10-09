@@ -866,6 +866,132 @@ defmodule Tightbeam.GatewayTest do
   end
 
   @tag recipient_readiness: true
+  test "unclaimed address carriers regroup without rewriting committed or unknown-effect history",
+       ctx do
+    alias Tightbeam.{Roles, Wakes}
+
+    Org.create(ctx.db, %{
+      session_key: "k2",
+      display_name: "Second",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("fable")
+    })
+
+    Roles.create!(ctx.db, "legacy-recipient", "flynn", "k2")
+
+    direct =
+      Wakes.schedule(ctx.db, %{
+        session_key: "k1",
+        origin: "user:flynn",
+        prompt: "original direct",
+        due_at: 0,
+        class: "fyi"
+      })
+
+    role =
+      Wakes.schedule(ctx.db, %{
+        session_key: "k2",
+        target_role: "legacy-recipient",
+        origin: "agent:k2",
+        creator_session_key: "k2",
+        prompt: "original role",
+        due_at: 0,
+        class: "blocker"
+      })
+
+    at = System.system_time(:millisecond) + 1000
+
+    historical =
+      for source <- [direct, role] do
+        assert {:ok, [[policy]]} =
+                 DB.query(
+                   ctx.db,
+                   "SELECT policyRef FROM notice_delivery_policies WHERE sourceWakeId=?1",
+                   [source.wake_id]
+                 )
+
+        assert %{batch_id: batch_id} =
+                 NoticeBatcher.enqueue_or_recover(ctx.db, source.wake_id, policy)
+
+        assert {:ok, {:new, carrier}} =
+                 DB.transaction(ctx.db, fn txn ->
+                   assert :sealed =
+                            NoticeBatcher.enqueue_or_recover_in_txn(
+                              txn,
+                              {:seal_if_due, batch_id, at}
+                            )
+
+                   NoticeBatcher.enqueue_or_recover_in_txn(txn, {:arm_if_due, batch_id, at})
+                 end)
+
+        assert {:ok, [[0]]} =
+                 DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [carrier])
+
+        {source, carrier, NoticeBatcher.batch(ctx.db, batch_id)}
+      end
+
+    assert :ok = Roles.bind(ctx.db, "legacy-recipient", "k1")
+    opts = [conn_registry: ctx.registry, lane_manager: ctx.lane]
+    assert [carrier] = NoticeBatcher.recover(ctx.db, at, opts)
+
+    assert {:ok, [[seq, "k1", prompt]]} =
+             DB.query(ctx.db, "SELECT seq,sessionKey,prompt FROM turns", [])
+
+    assert prompt =~ "original direct"
+    assert prompt =~ "original role"
+    assert :binary.match(prompt, "original role") < :binary.match(prompt, "original direct")
+
+    for {source, old_carrier, frozen} <- historical do
+      assert old_carrier != carrier
+      assert Wakes.get(ctx.db, old_carrier).state == "fired"
+
+      assert {:ok, [[0]]} =
+               DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [old_carrier])
+
+      batch = NoticeBatcher.batch(ctx.db, frozen.batch_id)
+      assert batch.state == "delivery_failed"
+      assert batch.envelope == frozen.envelope
+      assert batch.envelope_sha256 == frozen.envelope_sha256
+      assert batch.terminal_cause == "recipient-readiness-regroup"
+
+      assert Enum.count(
+               NoticeBatcher.source_refs(ctx.db, source.wake_id),
+               &(&1.member_state == "included" and &1.delivery_wake_id == carrier)
+             ) == 1
+
+      assert Enum.count(
+               NoticeBatcher.source_refs(ctx.db, source.wake_id),
+               &(&1.member_state == "canceled" and &1.delivery_wake_id == old_carrier)
+             ) == 1
+
+      assert Wakes.get(ctx.db, source.wake_id).prompt == source.prompt
+      assert Wakes.get(ctx.db, source.wake_id).target_role == source.target_role
+    end
+
+    [frozen] =
+      NoticeBatcher.source_refs(ctx.db, direct.wake_id)
+      |> Enum.filter(&(&1.delivery_wake_id == carrier))
+
+    committed = NoticeBatcher.batch(ctx.db, frozen.batch_id)
+    assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "unknown-effect-carrier")
+    assert turn.seq == seq
+
+    assert :ok =
+             Ledger.finish(ctx.db, seq, "failed_unknown", "unknown effects",
+               owner_lease: turn.owner_lease
+             )
+
+    assert NoticeBatcher.recover(ctx.db, at, opts) == []
+    assert NoticeBatcher.batch(ctx.db, frozen.batch_id) == committed
+    assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
+  end
+
+  @tag recipient_readiness: true
   test "over-cap ready snapshot stays editable under a named capacity refusal", ctx do
     sources =
       for i <- 1..51 do

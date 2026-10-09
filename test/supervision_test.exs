@@ -698,6 +698,7 @@ defmodule Tightbeam.SupervisionTest do
              )
   end
 
+  @tag idle_carrier_guard: true
   test "idle cleanup declines a stale batch at actual delivery and replaces only due siblings",
        ctx do
     idle_cleanup_fixture!(ctx, ["idle-a", "idle-b", "idle-c"])
@@ -739,6 +740,81 @@ defmodule Tightbeam.SupervisionTest do
 
     assert {:ok, [[1]]} =
              DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [delivery_wake_id])
+  end
+
+  @tag idle_carrier_guard: true
+  test "idle cleanup refuses a stale source after an included transport carrier is formed", ctx do
+    idle_cleanup_fixture!(ctx, ["idle-a", "idle-b", "idle-c"])
+    name = start_liveness!(ctx, sweep_ms: 60_000, name: :idle_formed_carrier_revalidation)
+    [source] = idle_cleanup_wakes(ctx.db)
+
+    assert {:ok, [[policy_ref]]} =
+             DB.query(
+               ctx.db,
+               "SELECT policyRef FROM notice_delivery_policies WHERE sourceWakeId=?1 AND enabled=1",
+               [source.wake_id]
+             )
+
+    assert %{batch_id: batch_id, state: "active"} =
+             NoticeBatcher.enqueue_or_recover(ctx.db, source.wake_id, policy_ref)
+
+    at = System.system_time(:millisecond) + 1000
+
+    assert {:ok, {:new, carrier_id}} =
+             DB.transaction(ctx.db, fn txn ->
+               assert :sealed =
+                        NoticeBatcher.enqueue_or_recover_in_txn(txn, {:seal_if_due, batch_id, at})
+
+               NoticeBatcher.enqueue_or_recover_in_txn(txn, {:arm_if_due, batch_id, at})
+             end)
+
+    frozen = NoticeBatcher.batch(ctx.db, batch_id)
+    assert frozen.state == "delivery_pending"
+
+    assert [%{delivery_wake_id: ^carrier_id, member_state: "included"}] =
+             NoticeBatcher.source_refs(ctx.db, source.wake_id)
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [carrier_id])
+
+    assert Wakes.get(ctx.db, source.wake_id).state == "pending"
+
+    assignment(
+      ctx.db,
+      "idle-formed-new-assignment",
+      "idle-a",
+      "new work",
+      System.system_time(:millisecond)
+    )
+
+    operator_notice =
+      Wakes.schedule(ctx.db, %{
+        session_key: "idle-b",
+        origin: "user:flynn",
+        prompt: "causal operator notice",
+        due_at: System.system_time(:millisecond) + 60_000
+      })
+
+    assert :skipped = admit_supervision_wake!(ctx.db, Wakes.get(ctx.db, carrier_id))
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [carrier_id])
+
+    assert Wakes.get(ctx.db, operator_notice.wake_id).state == "pending"
+    assert NoticeBatcher.batch(ctx.db, batch_id).envelope == frozen.envelope
+    assert NoticeBatcher.batch(ctx.db, batch_id).envelope_sha256 == frozen.envelope_sha256
+    assert Wakes.get(ctx.db, source.wake_id).prompt == source.prompt
+
+    assert Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
+             event.kind == "idle_cleanup_stale" and event.subject == source.wake_id
+           end)
+
+    sweep_liveness!(name)
+    [replacement] = idle_cleanup_wakes(ctx.db)
+    assert replacement.wake_id != source.wake_id
+    assert replacement.prompt =~ "child=idle-c;"
+    refute replacement.prompt =~ "child=idle-a;"
+    refute replacement.prompt =~ "child=idle-b;"
   end
 
   test "idle cleanup declines changed claimed evidence without changing activity or eligibility",
@@ -846,6 +922,7 @@ defmodule Tightbeam.SupervisionTest do
     assert :appended = admit_supervision_wake!(ctx.db, batch)
   end
 
+  @tag idle_carrier_guard: true
   test "idle cleanup delivery reroutes a retired or newly dormant parent in the enqueue transaction",
        ctx do
     idle_cleanup_fixture!(ctx, ["idle-child"])
@@ -888,6 +965,21 @@ defmodule Tightbeam.SupervisionTest do
     assert delivered.session_key == ctx.main.session_key
     assert delivered.prompt =~ "requestedDepth=0; targetDepth=1"
     assert delivered.state == "fired"
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM turns WHERE wakeId=?1 AND sessionKey='supervisor'",
+               [batch.wake_id]
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1 AND sessionKey=?2", [
+               batch.wake_id,
+               ctx.main.session_key
+             ])
+
+    assert NoticeBatcher.source_refs(ctx.db, batch.wake_id) == []
   end
 
   test "idle cleanup resets only sweep-observed canceled wakes and preserves cancellation-first history",
