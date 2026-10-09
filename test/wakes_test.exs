@@ -658,12 +658,17 @@ defmodule Tightbeam.WakesTest do
   } do
     active_sessions!(db, ["k1"])
     test_pid = self()
+    registry = :"registry_#{System.unique_integer([:positive])}"
+    lane = :"lane_#{System.unique_integer([:positive])}"
+    start_supervised!({Tightbeam.ConnRegistry, name: registry})
+    start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, lane})
 
     start_supervised!(
       {Wakes,
        db: db,
        name: scheduler,
        tick_ms: 60_000,
+       delivery_opts: [conn_registry: registry, lane_manager: lane],
        deliver: fn wake -> send(test_pid, {:delivered, wake}) end}
     )
 
@@ -676,14 +681,42 @@ defmodule Tightbeam.WakesTest do
         sender_scheduled: true
       })
 
+    assert Wakes.get(db, wake.wake_id).state == "pending"
+    assert NoticeBatcher.source_refs(db, wake.wake_id) == []
+    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM turns")
+
     assert :ok = Wakes.fire_due(scheduler)
-    assert_receive {:delivered, %{wake_id: carrier_id, prompt: prompt}}
-    assert prompt =~ "now"
-    assert [%{delivery_wake_id: ^carrier_id}] = NoticeBatcher.source_refs(db, wake.wake_id)
-    assert Wakes.get(db, wake.wake_id).state == "fired"
+
+    assert [%{delivery_wake_id: carrier_id, member_state: "included", batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(db, wake.wake_id)
+
+    assert {:ok, [["k1", "queued", content]]} =
+             DB.query(
+               db,
+               "SELECT t.sessionKey,t.status,m.content FROM turns t JOIN messages m ON m.id=t.messageId WHERE t.wakeId=?1",
+               [carrier_id]
+             )
+
+    assert content =~ wake.wake_id
+    assert content =~ wake.prompt
+    assert %{state: "fired", fired_at: fired_at, prompt: "now"} = Wakes.get(db, wake.wake_id)
+    assert is_integer(fired_at)
+    assert Wakes.get(db, carrier_id).state == "fired"
+    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM turns")
+
+    assert {:ok, [[0]]} =
+             DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [wake.wake_id])
+
+    # Readiness committed the actual carrier; the legacy callback must not
+    # append it again, and another scheduler pass must leave all rows intact.
+    refute_receive {:delivered, _}
+    assert {:ok, before_turns} = DB.query(db, "SELECT * FROM turns ORDER BY seq")
+    assert {:ok, before_wakes} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
 
     assert :ok = Wakes.fire_due(scheduler)
     refute_receive {:delivered, _}
+    assert {:ok, ^before_turns} = DB.query(db, "SELECT * FROM turns ORDER BY seq")
+    assert {:ok, ^before_wakes} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
   end
 
   test "failed delivery leaves the wake pending; it retries and then fires", %{
