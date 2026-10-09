@@ -3630,7 +3630,7 @@ defmodule Tightbeam.Schema do
         this Tightbeam database was written by a different build.
 
           stamped: #{found}
-          this build: #{@assignment_source_replacement_shape}
+          this build: #{@notice_source_payload_shape}
         This build can migrate #{@model_identity_shape} or #{@operator_decision_shape}
         to #{@terminal_decision_liveness_shape}, then #{@effort_request_exit_previous_shape}.
         It can migrate #{@terminal_decision_shape} through
@@ -3643,7 +3643,8 @@ defmodule Tightbeam.Schema do
         It then migrates to #{@cannot_proceed_shape}, followed atomically by
         #{@settlement_shape}, #{@terminal_credential_shape}, #{@agent_reparent_shape},
         #{@artifact_origin_shape}, #{@identity_publication_denial_diagnostic_shape},
-        then #{@work_item_owner_link_shape} and #{@assignment_source_replacement_shape}.
+        then #{@work_item_owner_link_shape}, #{@assignment_source_replacement_shape},
+        and #{@notice_source_payload_shape}.
         No migration is defined for the stamped shape above. Keep the database
         in place and run a Tightbeam build that recognizes that exact stamp.
         """
@@ -3656,7 +3657,7 @@ defmodule Tightbeam.Schema do
         this Tightbeam database carries MORE THAN ONE shape stamp.
 
           stamped: #{rows |> List.flatten() |> Enum.join(", ")}
-          this build: #{@assignment_source_replacement_shape}
+          this build: #{@notice_source_payload_shape}
         Nothing in Tightbeam writes a second stamp, so this database was
         assembled by something else. Move it aside and let it be recreated.
         """
