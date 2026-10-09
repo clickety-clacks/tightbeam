@@ -388,27 +388,145 @@ defmodule Tightbeam.OrgTest do
              DB.query(db, "SELECT count(*) FROM turns WHERE wakeId=?1", [carrier_id])
   end
 
-  test "retirement after seal preserves the immutable carrier and closes the replacement", %{
+  test "retirement preserves sealed historical bytes but regroups an unclaimed source", %{
     db: db
   } do
-    %{original: original, batch_id: batch_id} = selected_retirement_source(db, "after seal")
+    main_key = Org.personal_session_key("flynn")
+    ensure_legacy_main(db)
+    Org.create(db, base(%{session_key: "retiring"}))
+    Roles.create!(db, "reviewer", "flynn", "retiring")
+    start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
+    start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, Tightbeam.LaneManager})
 
-    assert {:ok, :sealed} =
-             DB.transaction(db, fn txn ->
-               NoticeBatcher.enqueue_or_recover_in_txn(
-                 txn,
-                 {:seal_if_due, batch_id, original.due_at}
-               )
-             end)
+    original =
+      Wakes.schedule(db, %{
+        session_key: "retiring",
+        target_role: "reviewer",
+        origin: "process:tightbeam",
+        creator_session_key: "agent:sender",
+        prompt: "historical sealed retirement source",
+        due_at: 0,
+        class: "fyi"
+      })
+
+    assert {:ok, [[address, scope]]} =
+             DB.query(
+               db,
+               "SELECT sourceAddress,sourceVisibilityScope FROM wakes WHERE wakeId=?1",
+               [
+                 original.wake_id
+               ]
+             )
+
+    # Captured predecessor transport is historical input, not normal seal/arm admission.
+    batch_id = "historical-sealed:" <> original.wake_id
+    envelope = "historical sealed bytes\n" <> original.prompt
+    envelope_sha256 = Base.encode16(:crypto.hash(:sha256, envelope), case: :lower)
+
+    assert {:ok, []} =
+             DB.query(
+               db,
+               """
+               INSERT INTO notice_batches(batchId,recipientAddress,sessionKey,targetRole,visibilityScope,
+                 policyRevision,state,dueAt,openedAt,sealedAt,releaseCause,deliveryToken,envelope,
+                 envelopeSha256,memberCount,renderedBytes)
+               VALUES(?1,?2,'retiring','reviewer',?3,'captured-predecessor','sealed',0,1,1,'idle',?4,?5,?6,1,?7)
+               """,
+               [
+                 batch_id,
+                 address,
+                 scope,
+                 "historical-token:" <> original.wake_id,
+                 envelope,
+                 envelope_sha256,
+                 byte_size(envelope)
+               ]
+             )
+
+    assert {:ok, []} =
+             DB.query(
+               db,
+               """
+               INSERT INTO notice_batch_members(memberId,batchId,sourceWakeId,policyRef,recipientAddress,
+                 visibilityScope,publicationSeq,policyRevision,senderPrincipal,cause,class,payload,
+                 renderedBytes,state,addedAt)
+               VALUES(?1,?2,?3,?4,?5,?6,1,'captured-predecessor',?7,'wake','fyi',?8,?9,'included',1)
+               """,
+               [
+                 "historical-member:" <> original.wake_id,
+                 batch_id,
+                 original.wake_id,
+                 NoticeBatcher.policy_ref(original.wake_id),
+                 address,
+                 scope,
+                 original.origin,
+                 original.prompt,
+                 byte_size(original.prompt)
+               ]
+             )
 
     sealed = NoticeBatcher.batch(db, batch_id)
     assert sealed.state == "sealed"
-    assert is_binary(sealed.envelope)
-    assert is_binary(sealed.envelope_sha256)
+    assert sealed.envelope == envelope
+    assert sealed.envelope_sha256 == envelope_sha256
     assert sealed.delivery_wake_id == nil
+    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM turns")
 
     assert %{state: "retired"} = Org.retire(db, "retiring", "user:flynn", 1_000)
-    assert_immutable_retirement_chain(db, original, sealed)
+
+    assert %{
+             requester: "tightbeam:retirement",
+             reason: "target_retired",
+             source_kind: "session_transition",
+             source_id: "retiring",
+             outcome: "replacement",
+             replacement_wake_id: replacement_id
+           } = cancellation(db, original.wake_id)
+
+    replacement = Wakes.get(db, replacement_id)
+    assert replacement.state == "pending"
+    assert replacement.session_key == main_key
+    assert replacement.target_role == original.target_role
+    assert replacement.prompt == original.prompt
+    assert replacement.origin == original.origin
+    assert replacement.creator_session_key == original.creator_session_key
+    assert replacement.due_at == original.due_at
+    assert replacement.delivery_rule == original.delivery_rule
+    assert NoticeBatcher.source_refs(db, replacement_id) == []
+    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM turns")
+
+    [carrier_id] = NoticeBatcher.recover(db)
+    historical = NoticeBatcher.batch(db, batch_id)
+    assert historical.state == "canceled"
+    assert historical.envelope == sealed.envelope
+    assert historical.envelope_sha256 == sealed.envelope_sha256
+    assert historical.delivery_token == sealed.delivery_token
+    assert historical.sealed_at == sealed.sealed_at
+    assert historical.delivery_wake_id == nil
+
+    assert [%{member_state: "canceled", batch_id: ^batch_id, batch_state: "canceled"}] =
+             NoticeBatcher.source_refs(db, original.wake_id)
+
+    assert Enum.map(NoticeBatcher.members(db, batch_id), & &1.payload) == [original.prompt]
+    assert Wakes.get(db, original.wake_id).state == "canceled"
+    assert Wakes.get(db, original.wake_id).prompt == original.prompt
+    assert Wakes.get(db, replacement_id).state == "fired"
+    assert Enum.map(Wakes.digest_members(db, carrier_id), & &1.wake_id) == [replacement_id]
+
+    assert [%{member_state: "included", delivery_wake_id: ^carrier_id, batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(db, replacement_id)
+
+    assert {:ok, [[^main_key, "queued", actual_prompt]]} =
+             DB.query(db, "SELECT sessionKey,status,prompt FROM turns WHERE wakeId=?1", [
+               carrier_id
+             ])
+
+    assert actual_prompt =~ original.prompt
+    assert NoticeBatcher.recover(db) == []
+    assert Wakes.materialize_digests(db) == []
+    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM turns")
+    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM wakes WHERE digest=1")
+    assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
   end
 
   test "retirement preserves an immutable bounded carrier formed from the ready queue", %{db: db} do
