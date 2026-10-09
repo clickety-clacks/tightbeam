@@ -227,6 +227,86 @@ defmodule Tightbeam.NoticeSourcePayloadTest do
              )
   end
 
+  for requested_scope <- ["actual-recipient", nil] do
+    @legacy_requested_scope requested_scope
+    test "recognized predecessor condition with scope #{inspect(@legacy_requested_scope)} refuses atomically without rewriting authored markers",
+         %{db: db, db_opts: db_opts} do
+      authored = "[woke: fact authored/marker-looking-prefix]\n\nkeep this authored text"
+
+      condition =
+        Wakes.schedule(db, %{
+          session_key: "payload-recipient",
+          origin: "user:owner",
+          prompt: authored,
+          due_at: 9_999_999_999_999,
+          condition_kind: "queue-ready",
+          condition_scope: @legacy_requested_scope
+        })
+
+      ordinary =
+        Wakes.schedule(db, %{
+          session_key: "payload-recipient",
+          origin: "user:owner",
+          prompt: "ordinary sibling",
+          due_at: 0
+        })
+
+      predecessor!(db, db_opts)
+      stamped = "[woke: fact queue-ready/actual-recipient]\n\n" <> authored
+
+      assert {:ok, _} =
+               DB.query(
+                 db,
+                 "UPDATE wakes SET prompt=?2,firedAt=17,firedBy='condition',recognitionEvidence=NULL WHERE wakeId=?1",
+                 [condition.wake_id, stamped]
+               )
+
+      assert {:ok, sources_before} = DB.query(db, "SELECT rowid,* FROM wakes ORDER BY rowid")
+      objects_before = payload_snapshot(db)
+
+      assert {:ok, ddl_before} =
+               DB.query(db, "SELECT type,name,sql FROM sqlite_master ORDER BY type,name")
+
+      assert_raise Schema.ShapeError,
+                   ~r/incompatible_notice_source_payload: unsupported_pending_condition_recognition/,
+                   fn -> Schema.ensure_all(db) end
+
+      assert {:ok, ^sources_before} = DB.query(db, "SELECT rowid,* FROM wakes ORDER BY rowid")
+      assert payload_snapshot(db) == objects_before
+
+      assert {:ok, ^ddl_before} =
+               DB.query(db, "SELECT type,name,sql FROM sqlite_master ORDER BY type,name")
+
+      assert %{
+               state: "pending",
+               prompt: ^stamped,
+               recognition_evidence: nil,
+               fired_by: "condition",
+               fired_at: 17
+             } = Wakes.get(db, condition.wake_id)
+
+      assert Wakes.get(db, ordinary.wake_id).state == "pending"
+
+      assert {:ok, [["assignment-source-replacement-v1-019"]]} =
+               DB.query(db, "SELECT shape FROM schema_stamp")
+
+      assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM turns")
+      assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
+      stop_supervised!(db)
+      start_supervised!(Supervisor.child_spec({DB, db_opts}, id: db))
+
+      assert_raise Schema.ShapeError, ~r/unsupported_pending_condition_recognition/, fn ->
+        Schema.ensure_all(db)
+      end
+
+      assert {:ok, ^sources_before} = DB.query(db, "SELECT rowid,* FROM wakes ORDER BY rowid")
+      assert payload_snapshot(db) == objects_before
+
+      assert {:ok, ^ddl_before} =
+               DB.query(db, "SELECT type,name,sql FROM sqlite_master ORDER BY type,name")
+    end
+  end
+
   test "unknown predecessor columns refuse without copying or dropping payload data", %{
     db: db,
     db_opts: db_opts

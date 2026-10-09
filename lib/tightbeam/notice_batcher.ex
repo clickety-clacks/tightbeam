@@ -463,40 +463,57 @@ defmodule Tightbeam.NoticeBatcher do
     # not participate in a later recipient snapshot.
     restore_unclaimed_sources(db, at)
 
-    {:ok, recipients} =
-      DB.transaction_then(
-        db,
-        fn txn ->
-          ready_sources_in_txn(txn, at)
-          |> Enum.flat_map(fn wake_id ->
-            case Wakes.get_in_txn(txn, wake_id) do
-              nil ->
-                []
+    {:ok, ready_ids} = DB.transaction(db, &ready_sources_in_txn(&1, at))
 
-              wake ->
-                case source_delivery_target(txn, wake) do
-                  {target, _, _} ->
-                    [target]
+    # Resolve semantic authority before selecting recipients. A failed source
+    # preparation rolls back only that source, never an unrelated recipient.
+    {recipients, deferred_ids} =
+      Enum.reduce(ready_ids, {[], MapSet.new()}, fn wake_id, {targets, deferred} ->
+        case DB.transaction_then(
+               db,
+               fn txn ->
+                 case prepared_source_in_txn(txn, wake_id) do
+                   nil ->
+                     nil
 
-                  nil ->
-                    dispose_missing_role_in_txn(txn, wake, at)
-                    []
-                end
-            end
-          end)
-          |> Enum.uniq()
-        end,
-        fn txn, recipients ->
-          Wakes.row_commit_in_txn(txn, [])
-          recipients
+                   source ->
+                     case source_delivery_target(txn, source) do
+                       {target, _, _} ->
+                         target
+
+                       nil ->
+                         dispose_missing_role_in_txn(txn, source, at)
+                         nil
+                     end
+                 end
+               end,
+               fn txn, target ->
+                 Wakes.row_commit_in_txn(txn, [])
+                 target
+               end
+             ) do
+          {:ok, nil} ->
+            {targets, deferred}
+
+          {:ok, target} ->
+            {[target | targets], deferred}
+
+          {:error, error} ->
+            reason =
+              if match?(%DB.Error{}, error), do: :persistence_refused, else: :recognition_failed
+
+            Logger.warning("notice source #{wake_id} preparation deferred: #{reason}")
+            {targets, MapSet.put(deferred, wake_id)}
         end
-      )
+      end)
+
+    recipients = recipients |> Enum.reverse() |> Enum.uniq()
 
     deliveries =
       Enum.flat_map(recipients, fn target ->
         case DB.transaction_then(
                db,
-               fn txn -> drain_session_in_txn(txn, target, at, delivery_opts) end,
+               fn txn -> drain_session_in_txn(txn, target, at, delivery_opts, deferred_ids) end,
                fn txn, result ->
                  Wakes.row_commit_in_txn(txn, [])
                  result
@@ -680,37 +697,36 @@ defmodule Tightbeam.NoticeBatcher do
     |> Enum.map(&hd/1)
   end
 
-  defp drain_session_in_txn(txn, target, at, delivery_opts) do
-    if recipient_running?(txn, target, nil) do
-      :busy
-    else
-      sources =
-        ready_sources_in_txn(txn, at)
-        |> Enum.flat_map(fn wake_id ->
-          wake = Wakes.get_in_txn(txn, wake_id)
-
-          case source_delivery_target(txn, wake) do
-            {^target, _, _} ->
-              if prepare_due_source_in_txn(txn, wake_id) do
-                source = Wakes.get_in_txn(txn, wake_id)
-
-                case source_delivery_target(txn, source) do
-                  {^target, _, _} -> [source]
-                  _ -> []
-                end
-              else
-                []
-              end
-
-            _ ->
-              []
-          end
-        end)
-
-      case sources do
-        [] -> :empty
-        _ -> admit_session_snapshot_in_txn(txn, target, sources, at, delivery_opts)
+  defp prepared_source_in_txn(txn, wake_id) do
+    if prepare_due_source_in_txn(txn, wake_id) do
+      case Wakes.get_in_txn(txn, wake_id) do
+        %{state: "pending"} = source -> source
+        _ -> nil
       end
+    end
+  end
+
+  defp drain_session_in_txn(txn, target, at, delivery_opts, deferred_ids) do
+    sources =
+      ready_sources_in_txn(txn, at)
+      |> Enum.reject(&MapSet.member?(deferred_ids, &1))
+      |> Enum.flat_map(fn wake_id ->
+        case prepared_source_in_txn(txn, wake_id) do
+          nil ->
+            []
+
+          source ->
+            case source_delivery_target(txn, source) do
+              {^target, _, _} -> [source]
+              _ -> []
+            end
+        end
+      end)
+
+    cond do
+      sources == [] -> :empty
+      recipient_running?(txn, target, nil) -> :busy
+      true -> admit_session_snapshot_in_txn(txn, target, sources, at, delivery_opts)
     end
   end
 

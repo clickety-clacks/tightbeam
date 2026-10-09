@@ -960,6 +960,12 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   describe "terminal notice delivery composition" do
+    setup do
+      start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
+      start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, Tightbeam.LaneManager})
+      :ok
+    end
+
     for kind <- ["completion"] do
       @delivery_kind kind
       test "#{kind} remains claimable through liveness suppression for its active parent", ctx do
@@ -1010,6 +1016,152 @@ defmodule Tightbeam.AssignmentsTest do
       end
     end
 
+    @tag pr230_authority_repair: true
+    test "scheduler resolves a retired terminal recipient to its authorized fallback exactly once",
+         ctx do
+      {_assignment, wake, personal} = terminal_delivery_fixture(ctx, "completion")
+
+      assert {:ok, _} =
+               DB.query(
+                 ctx.db,
+                 "UPDATE sessions SET state='retired' WHERE sessionKey='notice-parent'"
+               )
+
+      scheduler = terminal_notice_scheduler(ctx.db)
+      assert :ok = Wakes.fire_due(scheduler)
+      routed = Wakes.get(ctx.db, wake.wake_id)
+      assert routed.state == "fired"
+      assert routed.session_key == personal
+      assert routed.prompt == wake.prompt
+      assert routed.obligation_ref == wake.obligation_ref
+
+      assert [[seq, ^personal, "queued", carrier_id]] =
+               source_delivery_turns(ctx.db, wake.wake_id)
+
+      refute carrier_id == wake.wake_id
+
+      assert [%{delivery_wake_id: ^carrier_id, member_state: "included"}] =
+               NoticeBatcher.source_refs(ctx.db, wake.wake_id)
+
+      assert {:ok, [[0]]} =
+               DB.query(ctx.db, "SELECT count(*) FROM turns WHERE wakeId=?1", [wake.wake_id])
+
+      assert :ok = Wakes.fire_due(scheduler)
+
+      assert [[^seq, ^personal, "queued", ^carrier_id]] =
+               source_delivery_turns(ctx.db, wake.wake_id)
+
+      assert {:duplicate, %{turn_seq: ^seq}} =
+               deliver_terminal_notice(ctx.db, Wakes.get(ctx.db, carrier_id))
+
+      assert Ledger.pending_count(ctx.db, "notice-decoy") == 0
+    end
+
+    for old_state <- [:queued, :running] do
+      @old_recipient_state old_state
+      @tag pr230_authority_repair: true
+      test "scheduler resolves changed terminal owner before #{@old_recipient_state} old recipient readiness",
+           ctx do
+        {assignment, wake, personal} = terminal_delivery_fixture(ctx, "completion")
+
+        if @old_recipient_state == :running do
+          start_running_turn(ctx.db, "notice-parent", "hold the former recipient")
+        else
+          {:appended, message} =
+            Projection.append(ctx.db, %{
+              session_key: "notice-parent",
+              role: "user",
+              content: "hold the former recipient queue",
+              sender: "test:notice-batching"
+            })
+
+          assert {:ok, _} =
+                   Ledger.enqueue(ctx.db, %{
+                     session_key: "notice-parent",
+                     message_id: message.id,
+                     origin: "test:notice-batching",
+                     prompt: "hold the former recipient queue"
+                   })
+
+          assert Ledger.pending_count(ctx.db, "notice-parent") == 1
+        end
+
+        set_delivery_owner(ctx, assignment.workItemId, personal)
+
+        scheduler = terminal_notice_scheduler(ctx.db)
+        assert :ok = Wakes.fire_due(scheduler)
+        routed = Wakes.get(ctx.db, wake.wake_id)
+        assert routed.state == "fired"
+        assert routed.session_key == personal
+        assert routed.prompt == wake.prompt
+        assert routed.obligation_ref == wake.obligation_ref
+
+        assert [[seq, ^personal, "queued", carrier_id]] =
+                 source_delivery_turns(ctx.db, wake.wake_id)
+
+        refute carrier_id == wake.wake_id
+        assert :ok = Wakes.fire_due(scheduler)
+
+        assert [[^seq, ^personal, "queued", ^carrier_id]] =
+                 source_delivery_turns(ctx.db, wake.wake_id)
+
+        assert Ledger.pending_count(ctx.db, "notice-decoy") == 0
+      end
+    end
+
+    @tag pr230_authority_repair: true
+    test "a refused terminal preparation preserves its source while the scheduler delivers an unrelated recipient",
+         ctx do
+      {_assignment, notice, personal} = terminal_delivery_fixture(ctx, "completion")
+
+      assert {:ok, _} =
+               DB.query(
+                 ctx.db,
+                 "UPDATE sessions SET state='retired' WHERE sessionKey IN (?1,?2)",
+                 ["notice-parent", personal]
+               )
+
+      assert :ok =
+               DB.execute(ctx.db, """
+               CREATE TRIGGER fixture_terminal_preparation_refused BEFORE INSERT ON wake_cancellations
+               WHEN NEW.wakeId='#{notice.wake_id}'
+               BEGIN SELECT RAISE(ABORT, 'fixture terminal preparation refused'); END
+               """)
+
+      unrelated =
+        Wakes.schedule(ctx.db, %{
+          session_key: "notice-decoy",
+          origin: "process:tightbeam",
+          prompt: "unrelated recipient",
+          due_at: 0
+        })
+
+      scheduler = terminal_notice_scheduler(ctx.db)
+      log = ExUnit.CaptureLog.capture_log(fn -> assert :ok = Wakes.fire_due(scheduler) end)
+      assert log =~ notice.wake_id
+      assert log =~ "persistence_refused"
+      assert Wakes.get(ctx.db, notice.wake_id) == notice
+      assert source_delivery_turns(ctx.db, notice.wake_id) == []
+
+      assert {:ok, []} =
+               DB.query(ctx.db, "SELECT wakeId FROM wake_cancellations WHERE wakeId=?1", [
+                 notice.wake_id
+               ])
+
+      assert [[seq, "notice-decoy", "queued", carrier_id]] =
+               source_delivery_turns(ctx.db, unrelated.wake_id)
+
+      assert Wakes.get(ctx.db, unrelated.wake_id).state == "fired"
+
+      assert ExUnit.CaptureLog.capture_log(fn -> assert :ok = Wakes.fire_due(scheduler) end) =~
+               "persistence_refused"
+
+      assert [[^seq, "notice-decoy", "queued", ^carrier_id]] =
+               source_delivery_turns(ctx.db, unrelated.wake_id)
+
+      assert Wakes.get(ctx.db, notice.wake_id) == notice
+    end
+
     test "retired-after-admission parent routes the same event to owner main, not lineage or prompt",
          ctx do
       {_assignment, wake, personal} = terminal_delivery_fixture(ctx, "completion")
@@ -1049,6 +1201,7 @@ defmodule Tightbeam.AssignmentsTest do
       assert Ledger.pending_count(ctx.db, "notice-decoy") == 0
     end
 
+    @tag pr230_authority_repair: true
     test "no authorized recipient leaves typed non-fired evidence without a turn or retry", ctx do
       {assignment, wake, personal} = terminal_delivery_fixture(ctx, "completion")
 
@@ -1116,6 +1269,7 @@ defmodule Tightbeam.AssignmentsTest do
                )
     end
 
+    @tag pr230_authority_repair: true
     test "delivery revalidates owner relation even when recorded parent remains active", ctx do
       {_assignment, wake, _personal} = terminal_delivery_fixture(ctx, "completion")
 

@@ -1824,6 +1824,19 @@ defmodule Tightbeam.Schema do
                         message: "incompatible_notice_source_payload: unstamped client index"
                       )
 
+                 # This admitted development predecessor stamped the prompt
+                 # without storing the actual matched fact separately. Do not
+                 # infer wildcard scope or rewrite authored history at upgrade.
+                 unless Txn.q(
+                          txn,
+                          "SELECT wakeId FROM wakes WHERE state='pending' AND consumer='prompt' AND conditionKind IS NOT NULL AND firedBy='condition' AND recognitionEvidence IS NULL LIMIT 1"
+                        ) == [],
+                        do:
+                          raise(ShapeError,
+                            message:
+                              "incompatible_notice_source_payload: unsupported_pending_condition_recognition"
+                          )
+
                  :ok = Txn.exec(txn, "ALTER TABLE wakes ADD COLUMN " <> @source_client_column)
 
                  :ok =
