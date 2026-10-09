@@ -961,12 +961,17 @@ defmodule Tightbeam.WakesTest do
   } do
     active_sessions!(db, ["k1", "k2"])
     test_pid = self()
+    registry = :"registry_#{System.unique_integer([:positive])}"
+    lane = :"lane_#{System.unique_integer([:positive])}"
+    start_supervised!({Tightbeam.ConnRegistry, name: registry})
+    start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, lane})
 
     start_supervised!(
       {Wakes,
        db: db,
        name: scheduler,
        tick_ms: 60_000,
+       delivery_opts: [conn_registry: registry, lane_manager: lane],
        deliver: fn wake -> send(test_pid, {:nested_fired, wake.wake_id}) end,
        internal_consumers: %{
          "self_fire" => fn wake ->
@@ -997,10 +1002,36 @@ defmodule Tightbeam.WakesTest do
     assert :ok = Wakes.fire_due(scheduler)
     assert_received {:self_fire_returned, wake_id, nested_wake_id}
     assert wake_id == wake.wake_id
-    assert_receive {:nested_fired, carrier_id}
-    assert [%{delivery_wake_id: ^carrier_id}] = NoticeBatcher.source_refs(db, nested_wake_id)
+
+    # The self-enqueued pass precedes this mailbox barrier. This does not
+    # request another delivery pass and cannot mask a missing continuation.
+    _ = :sys.get_state(scheduler)
+    assert Process.alive?(GenServer.whereis(scheduler))
+
+    assert [%{delivery_wake_id: carrier_id, member_state: "included", batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(db, nested_wake_id)
+
+    assert {:ok, [["k2", "queued", content]]} =
+             DB.query(
+               db,
+               "SELECT t.sessionKey,t.status,m.content FROM turns t JOIN messages m ON m.id=t.messageId WHERE t.wakeId=?1",
+               [carrier_id]
+             )
+
+    assert content =~ nested_wake_id
+    assert content =~ "nested"
     assert Wakes.get(db, wake.wake_id).state == "canceled"
     assert Wakes.get(db, nested_wake_id).state == "fired"
+    assert Wakes.get(db, carrier_id).state == "fired"
+    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM turns")
+    refute_received {:nested_fired, _}
+
+    assert {:ok, before_turns} = DB.query(db, "SELECT * FROM turns ORDER BY seq")
+    assert {:ok, before_wakes} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
+    assert :ok = Wakes.fire_due(scheduler)
+    assert {:ok, ^before_turns} = DB.query(db, "SELECT * FROM turns ORDER BY seq")
+    assert {:ok, ^before_wakes} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
+    refute_received {:nested_fired, _}
   end
 
   test "future wakes are not claimed", %{db: db, scheduler: scheduler} do
