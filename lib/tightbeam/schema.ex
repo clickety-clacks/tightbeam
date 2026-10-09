@@ -1824,18 +1824,7 @@ defmodule Tightbeam.Schema do
                         message: "incompatible_notice_source_payload: unstamped client index"
                       )
 
-                 # This admitted development predecessor stamped the prompt
-                 # without storing the actual matched fact separately. Do not
-                 # infer wildcard scope or rewrite authored history at upgrade.
-                 unless Txn.q(
-                          txn,
-                          "SELECT wakeId FROM wakes WHERE state='pending' AND consumer='prompt' AND conditionKind IS NOT NULL AND firedBy='condition' AND recognitionEvidence IS NULL LIMIT 1"
-                        ) == [],
-                        do:
-                          raise(ShapeError,
-                            message:
-                              "incompatible_notice_source_payload: unsupported_pending_condition_recognition"
-                          )
+                 validate_notice_source_recognition_in_txn!(txn)
 
                  :ok = Txn.exec(txn, "ALTER TABLE wakes ADD COLUMN " <> @source_client_column)
 
@@ -2014,6 +2003,24 @@ defmodule Tightbeam.Schema do
            do:
              raise(ShapeError,
                message: "incompatible_notice_source_payload: malformed source members"
+             )
+
+    validate_notice_source_recognition_in_txn!(txn)
+  end
+
+  # The admitted development predecessor stamped the prompt without retaining
+  # the actual matched fact. Earlier candidates could carry those rows into the
+  # current shape, so both admissions must refuse without inferring fact scope
+  # or rewriting authored history.
+  defp validate_notice_source_recognition_in_txn!(txn) do
+    unless Txn.q(
+             txn,
+             "SELECT wakeId FROM wakes WHERE state='pending' AND consumer='prompt' AND conditionKind IS NOT NULL AND firedBy='condition' AND recognitionEvidence IS NULL LIMIT 1"
+           ) == [],
+           do:
+             raise(ShapeError,
+               message:
+                 "incompatible_notice_source_payload: unsupported_pending_condition_recognition"
              )
 
     :ok

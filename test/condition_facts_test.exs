@@ -1280,12 +1280,14 @@ defmodule Tightbeam.ConditionFactsTest do
     assert Wakes.get(ctx.db, wake.wake_id).prompt == wake.prompt
     assert Tightbeam.NoticeBatcher.source_refs(ctx.db, wake.wake_id) == []
 
-    assert {:ok, [[1]]} =
+    assert {:ok, [["pending", "prompt", 0, raw_prompt]]} =
              DB.query(
                ctx.db,
-               "SELECT COUNT(*) FROM notice_delivery_policies WHERE sourceWakeId=?1 AND enabled=1",
+               "SELECT state,consumer,digest,prompt FROM wakes WHERE wakeId=?1",
                [wake.wake_id]
              )
+
+    assert raw_prompt == wake.prompt
 
     assert :ok =
              Ledger.finish(ctx.db, current_seq, "delivered", nil,

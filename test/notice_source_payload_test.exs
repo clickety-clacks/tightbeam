@@ -1,6 +1,18 @@
 defmodule Tightbeam.NoticeSourcePayloadTest do
   use Tightbeam.TestCase, async: false
-  alias Tightbeam.{DB, NoticeBatcher, Projection, Schema, Wakes}
+
+  alias Tightbeam.{
+    ConditionFacts,
+    DB,
+    Ledger,
+    Model,
+    NoticeBatcher,
+    Org,
+    Projection,
+    Schema,
+    Wakes
+  }
+
   alias Tightbeam.DB.Txn
 
   setup do
@@ -307,6 +319,170 @@ defmodule Tightbeam.NoticeSourcePayloadTest do
     end
   end
 
+  for requested_scope <- ["actual-recipient", nil] do
+    @carried_requested_scope requested_scope
+    test "current stamp refuses preserved legacy recognition with scope #{inspect(@carried_requested_scope)} on persistent reopen",
+         %{db: db, db_opts: db_opts} do
+      authored = "[woke: fact authored/marker-looking-prefix]\n\nkeep this authored text"
+
+      condition =
+        Wakes.schedule(db, %{
+          session_key: "payload-recipient",
+          origin: "user:owner",
+          prompt: authored,
+          due_at: 9_999_999_999_999,
+          condition_kind: "queue-ready",
+          condition_scope: @carried_requested_scope
+        })
+
+      ordinary =
+        Wakes.schedule(db, %{
+          session_key: "payload-recipient",
+          origin: "user:owner",
+          prompt: "ordinary sibling",
+          due_at: 0
+        })
+
+      # Model the exact preservation transition accepted by parent 8dbc: it
+      # added source columns, copied the selected address/visibility, and retained
+      # the legacy prompt, condition state and nil evidence at the current stamp.
+      # No stamp is changed here; this is the actual current table layout.
+      stamped = "[woke: fact queue-ready/actual-recipient]\n\n" <> authored
+
+      assert {:ok, _} =
+               DB.query(
+                 db,
+                 "UPDATE wakes SET prompt=?2,firedAt=17,firedBy='condition',recognitionEvidence=NULL WHERE wakeId=?1",
+                 [condition.wake_id, stamped]
+               )
+
+      assert {:ok,
+              [
+                [nil, nil, "session:payload-recipient:recipient", "session:payload-recipient"]
+              ]} =
+               DB.query(
+                 db,
+                 "SELECT sourceClientIdentity,sourceAttachments,sourceVisibilityScope,sourceAddress FROM wakes WHERE wakeId=?1",
+                 [condition.wake_id]
+               )
+
+      assert {:ok, [["notice-source-storage-v1-019"]]} =
+               DB.query(db, "SELECT shape FROM schema_stamp")
+
+      before = current_storage_snapshot(db)
+
+      assert_raise Schema.ShapeError, ~r/unsupported_pending_condition_recognition/, fn ->
+        Schema.ensure_all(db)
+      end
+
+      assert current_storage_snapshot(db) == before
+      stop_supervised!(db)
+      start_supervised!(Supervisor.child_spec({DB, db_opts}, id: db))
+
+      assert_raise Schema.ShapeError, ~r/unsupported_pending_condition_recognition/, fn ->
+        Schema.ensure_all(db)
+      end
+
+      assert current_storage_snapshot(db) == before
+
+      assert %{state: "pending", prompt: ^stamped, recognition_evidence: nil} =
+               Wakes.get(db, condition.wake_id)
+
+      assert Wakes.get(db, ordinary.wake_id).state == "pending"
+      assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM turns")
+      assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
+    end
+  end
+
+  test "current stamp admits an actual recognized fact and preserves its scope on reopen", %{
+    db: db,
+    db_opts: db_opts
+  } do
+    assert {:ok, _} =
+             DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES('owner',0,1)")
+
+    session =
+      Org.create(db, %{
+        session_key: "payload-recipient",
+        display_name: "Payload recipient",
+        owner_user_id: "owner",
+        origin: "user:owner",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+
+    assert {:appended, current} =
+             Projection.append(db, %{
+               session_key: session.session_key,
+               role: "user",
+               content: "already queued work"
+             })
+
+    assert {:ok, _} =
+             Ledger.enqueue(db, %{
+               session_key: session.session_key,
+               message_id: current.id,
+               origin: "user:owner",
+               prompt: "already queued work"
+             })
+
+    authored = "[woke: fact authored/prefix]\n\nraw condition source"
+
+    source =
+      Wakes.schedule(db, %{
+        session_key: "payload-recipient",
+        origin: "user:owner",
+        owner_user_id: "owner",
+        prompt: authored,
+        due_at: 9_999_999_999_999,
+        condition_kind: "queue-ready",
+        condition_scope: nil
+      })
+
+    scheduler =
+      start_supervised!(
+        {Wakes,
+         db: db,
+         name: :current_payload_condition_scheduler,
+         tick_ms: 60_000,
+         deliver: fn _ -> flunk("busy fixture recipient must not admit another turn") end}
+      )
+
+    fact =
+      ConditionFacts.file(db, scheduler, %{
+        kind: "queue-ready",
+        scope: "actual-recipient",
+        origin: "user:owner",
+        owner_user_id: "owner"
+      })
+
+    assert fact.scope == "actual-recipient"
+
+    assert %{state: "pending", fired_by: "condition", prompt: ^authored} =
+             recognized = Wakes.get(db, source.wake_id)
+
+    assert %{"condition_fact" => %{"kind" => "queue-ready", "scope" => "actual-recipient"}} =
+             recognized.recognition_evidence
+
+    before = current_storage_snapshot(db)
+    assert :ok = Schema.ensure_all(db)
+    assert current_storage_snapshot(db) == before
+    stop_supervised!(Wakes)
+    stop_supervised!(db)
+    start_supervised!(Supervisor.child_spec({DB, db_opts}, id: db))
+    assert :ok = Schema.ensure_all(db)
+    assert current_storage_snapshot(db) == before
+
+    assert {:ok, rendered} =
+             DB.transaction(db, &Wakes.delivery_prompt_in_txn(&1, source.wake_id))
+
+    assert rendered == "[woke: fact queue-ready/actual-recipient]\n\n" <> authored
+    assert Wakes.get(db, source.wake_id) == recognized
+  end
+
   test "unknown predecessor columns refuse without copying or dropping payload data", %{
     db: db,
     db_opts: db_opts
@@ -437,6 +613,21 @@ defmodule Tightbeam.NoticeSourcePayloadTest do
       )
 
     rows
+  end
+
+  defp current_storage_snapshot(db) do
+    for sql <- [
+          "SELECT rowid,* FROM wakes ORDER BY rowid",
+          "SELECT * FROM schema_stamp",
+          "SELECT type,name,sql FROM sqlite_master ORDER BY type,name",
+          "SELECT rowid,* FROM notice_batch_members ORDER BY rowid",
+          "SELECT * FROM turns ORDER BY seq",
+          "SELECT * FROM lifecycle_events ORDER BY id",
+          "PRAGMA foreign_key_check"
+        ] do
+      assert {:ok, rows} = DB.query(db, sql)
+      rows
+    end
   end
 
   defp payload_snapshot(db) do

@@ -482,7 +482,7 @@ defmodule Tightbeam.NoticeBatcher do
                          target
 
                        nil ->
-                         dispose_missing_role_in_txn(txn, source, at)
+                         dispose_unresolved_source_in_txn(txn, source, at)
                          nil
                      end
                  end
@@ -640,6 +640,17 @@ defmodule Tightbeam.NoticeBatcher do
 
   defp same_delivery_target?({key, _, _}, {key, _, _}) when is_binary(key), do: true
   defp same_delivery_target?(_, _), do: false
+
+  defp dispose_unresolved_source_in_txn(txn, source, at) do
+    case Gateway.cancel_unavailable_supervision_controller_in_txn(
+           txn,
+           [wake_id: source.wake_id],
+           source.session_key
+         ) do
+      :canceled -> :ok
+      :ordinary -> dispose_missing_role_in_txn(txn, source, at)
+    end
+  end
 
   # A removed role cannot produce a recipient boundary. Preserve the source
   # and the scheduler's visible unresolved disposition instead of silently

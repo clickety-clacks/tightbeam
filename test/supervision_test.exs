@@ -4882,6 +4882,14 @@ defmodule Tightbeam.SupervisionTest do
     assert {:ok, []} = DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [wake.wake_id])
     assert Wakes.list_pending(ctx.db) == []
 
+    assert :ok = Wakes.fire_due(scheduler)
+    assert %{state: "canceled", fired_at: nil} = Wakes.get(ctx.db, wake.wake_id)
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM wake_cancellations WHERE wakeId=?1", [
+               wake.wake_id
+             ])
+
     assert Enum.any?(
              EventLog.lifecycle_events(ctx.db),
              &(&1.kind == "supervision_controller_unavailable" and &1.subject == "asg_1")

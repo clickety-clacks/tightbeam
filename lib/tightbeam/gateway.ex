@@ -2531,7 +2531,8 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp cancel_unavailable_supervision_controller_in_txn(txn, opts, target) do
+  @doc false
+  def cancel_unavailable_supervision_controller_in_txn(txn, opts, target) do
     case opts[:wake_id] do
       wake_id when is_binary(wake_id) ->
         case DB.Txn.q(
