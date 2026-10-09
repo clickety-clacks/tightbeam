@@ -288,28 +288,22 @@ defmodule Tightbeam.OrgTest do
              DB.query(db, "SELECT count(*) FROM wake_cancellations")
   end
 
-  test "retirement transaction preserves one selected V1 delivery path on the replacement", %{
+  test "retirement before readiness preserves one delivery path on the replacement", %{
     db: db
   } do
     main_key = Org.personal_session_key("flynn")
     ensure_legacy_main(db)
     Org.create(db, base(%{session_key: "retiring"}))
     Roles.create!(db, "reviewer", "flynn", "retiring")
+    start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
+    start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, Tightbeam.LaneManager})
 
-    lane = %{session_key: "retiring", target_role: "reviewer"}
-
-    {:ok, _policy} =
-      DB.transaction(db, fn txn ->
-        Org.apply_notice_batching_lane_policy_in_txn(
-          txn,
-          lane,
-          true,
-          "notice-batching-org-retirement-test",
-          "agent:test-policy",
-          "retirement-fixture",
-          1_000
-        )
-      end)
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "INSERT INTO turns(seq,sessionKey,messageId,origin,prompt,status,createdAt,startedAt) VALUES (1,?1,'busy-main','user:flynn','active turn','running',1,1)",
+               [main_key]
+             )
 
     original =
       Wakes.schedule(db, %{
@@ -322,58 +316,76 @@ defmodule Tightbeam.OrgTest do
         class: "fyi"
       })
 
-    _member = enqueue_ready_source!(db, original)
+    assert {:deferred, %{code: "recipient_readiness_required"}} =
+             NoticeBatcher.enqueue_or_recover(
+               db,
+               original.wake_id,
+               NoticeBatcher.policy_ref(original.wake_id)
+             )
 
     assert original.delivery_rule == NoticeBatcher.rule()
-
-    assert [%{member_state: "active", batch_id: batch_id}] =
-             NoticeBatcher.source_refs(db, original.wake_id)
+    assert NoticeBatcher.source_refs(db, original.wake_id) == []
+    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM notice_batches")
 
     assert %{state: "retired"} = Org.retire(db, "retiring", "user:flynn", 1_000)
-    assert %{replacement_wake_id: replacement_wake_id} = cancellation(db, original.wake_id)
 
+    assert %{
+             requester: "tightbeam:retirement",
+             reason: "target_retired",
+             source_kind: "session_transition",
+             source_id: "retiring",
+             outcome: "replacement",
+             replacement_wake_id: replacement_wake_id
+           } = cancellation(db, original.wake_id)
+
+    assert %{state: "canceled", prompt: original_prompt} = Wakes.get(db, original.wake_id)
+    assert original_prompt == original.prompt
     replacement = Wakes.get(db, replacement_wake_id)
+    assert replacement.state == "pending"
     assert replacement.session_key == main_key
     assert replacement.target_role == "reviewer"
+    assert replacement.prompt == original.prompt
+    assert replacement.origin == original.origin
+    assert replacement.creator_session_key == original.creator_session_key
     assert replacement.delivery_rule == NoticeBatcher.rule()
     assert replacement.due_at == original.due_at
+    assert NoticeBatcher.source_refs(db, original.wake_id) == []
+    assert NoticeBatcher.source_refs(db, replacement_wake_id) == []
 
-    assert [%{member_state: "canceled", batch_id: ^batch_id}] =
-             NoticeBatcher.source_refs(db, original.wake_id)
+    # The replacement is still its own editable source while Main is busy.
+    assert NoticeBatcher.recover(db) == []
+    assert Wakes.get(db, replacement_wake_id).state == "pending"
+    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM notice_batches")
+    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM turns")
 
-    assert [%{member_state: "active", batch_id: ^batch_id}] =
-             NoticeBatcher.source_refs(db, replacement_wake_id)
+    assert {:ok, _} =
+             DB.query(db, "UPDATE turns SET status='delivered',endedAt=2 WHERE seq=1")
 
-    assert [carrier_id] = Wakes.materialize_digests(db, replacement.due_at)
+    assert [carrier_id] = Wakes.materialize_digests(db)
     assert Enum.map(Wakes.digest_members(db, carrier_id), & &1.wake_id) == [replacement_wake_id]
-
-    {:ok, _} = DB.query(db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [carrier_id])
-    scheduler = :"org_retirement_batch_scheduler_#{System.unique_integer([:positive])}"
-    test_pid = self()
-
-    start_supervised!(
-      {Wakes,
-       name: scheduler,
-       db: db,
-       tick_ms: 60_000,
-       deliver: fn wake ->
-         send(test_pid, {:delivered, wake.wake_id})
-         true
-       end},
-      id: scheduler
-    )
-
-    assert :ok = Wakes.fire_due(scheduler)
-    assert_receive {:delivered, ^carrier_id}
-    refute_receive {:delivered, ^replacement_wake_id}
     assert Wakes.get(db, carrier_id).state == "fired"
     assert Wakes.get(db, replacement_wake_id).state == "fired"
+    assert Wakes.get(db, original.wake_id).state == "canceled"
 
-    assert [%{delivery_wake_id: ^carrier_id, batch_state: "delivered"}] =
+    assert [%{member_state: "included", delivery_wake_id: ^carrier_id, batch_state: "delivered"}] =
              NoticeBatcher.source_refs(db, replacement_wake_id)
+
+    assert NoticeBatcher.source_refs(db, original.wake_id) == []
+
+    assert {:ok, [[^main_key, "queued", delivered_prompt]]} =
+             DB.query(db, "SELECT sessionKey,status,prompt FROM turns WHERE wakeId=?1", [
+               carrier_id
+             ])
+
+    assert delivered_prompt =~ original.prompt
+    assert Wakes.materialize_digests(db) == []
+    assert NoticeBatcher.recover(db) == []
 
     assert {:ok, [[1]]} =
              DB.query(db, "SELECT count(*) FROM wakes WHERE digest=1 AND wakeId=?1", [carrier_id])
+
+    assert {:ok, [[1]]} =
+             DB.query(db, "SELECT count(*) FROM turns WHERE wakeId=?1", [carrier_id])
   end
 
   test "retirement after seal preserves the immutable carrier and closes the replacement", %{
