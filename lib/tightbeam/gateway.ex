@@ -2117,22 +2117,8 @@ defmodule Tightbeam.Gateway do
   defp existing_wake_turn_in_txn(_txn, wake_id) when not is_binary(wake_id), do: nil
 
   defp existing_wake_turn_in_txn(txn, wake_id) do
-    case DB.Txn.q(
-           txn,
-           """
-           SELECT seq FROM turns WHERE wakeId=?1
-           UNION ALL
-           SELECT t.seq
-           FROM notice_batch_members m
-           JOIN notice_batches b ON b.batchId=m.batchId
-           JOIN turns t ON t.wakeId=b.deliveryWakeId
-           WHERE m.sourceWakeId=?1 AND m.state='included'
-             AND b.state IN ('delivery_pending','delivered')
-           LIMIT 1
-           """,
-           [wake_id]
-         ) do
-      [[seq]] -> {:duplicate, %{wake_id: wake_id, turn_seq: seq}}
+    case NoticeBatcher.source_delivery_turns_in_txn(txn, wake_id) do
+      [[seq, _status, _assignment] | _] -> {:duplicate, %{wake_id: wake_id, turn_seq: seq}}
       [] -> nil
     end
   end
@@ -2160,45 +2146,40 @@ defmodule Tightbeam.Gateway do
 
       {target, role_ref, role_fallback} when not is_nil(target) ->
         if Ledger.enqueueable_in_txn?(txn, target) do
-          case Projection.client_message_result_in_txn(txn, %{
+          case Projection.prompt_message_result_in_txn(txn, %{
                  session_key: target,
                  role: "user",
                  content: stamped,
+                 raw_content: prompt,
                  device_id: opts[:device_id],
                  client_message_id: opts[:client_message_id]
                }) do
             :new ->
-              case staged_message_dedupe_in_txn(txn, target, prompt, opts) do
-                :new ->
-                  if stage_for_queue?(txn, target, opts) do
-                    stage_prompt_in_txn(
+              if stage_for_queue?(txn, target, opts) do
+                stage_prompt_in_txn(
+                  txn,
+                  target,
+                  origin,
+                  prompt,
+                  opts,
+                  role_ref || opts[:role_ref]
+                )
+              else
+                case admit_supervision_controller_in_txn(txn, opts, target) do
+                  :canceled ->
+                    :skipped
+
+                  controller ->
+                    append_and_enqueue_in_txn(
                       txn,
                       target,
+                      role_ref,
+                      role_fallback,
                       origin,
-                      prompt,
-                      opts,
-                      role_ref || opts[:role_ref]
+                      stamped,
+                      Keyword.put(opts, :supervision_controller, controller)
                     )
-                  else
-                    case admit_supervision_controller_in_txn(txn, opts, target) do
-                      :canceled ->
-                        :skipped
-
-                      controller ->
-                        append_and_enqueue_in_txn(
-                          txn,
-                          target,
-                          role_ref,
-                          role_fallback,
-                          origin,
-                          stamped,
-                          Keyword.put(opts, :supervision_controller, controller)
-                        )
-                    end
-                  end
-
-                duplicate_or_conflict ->
-                  duplicate_or_conflict
+                end
               end
 
             duplicate_or_conflict ->
@@ -2265,13 +2246,7 @@ defmodule Tightbeam.Gateway do
         {:staged, wake}
 
       :none ->
-        case staged_message_dedupe_in_txn(txn, target, prompt, opts) do
-          :new ->
-            insert_staged_prompt_in_txn(txn, target, origin, prompt, opts, role_ref)
-
-          duplicate_or_conflict ->
-            duplicate_or_conflict
-        end
+        insert_staged_prompt_in_txn(txn, target, origin, prompt, opts, role_ref)
     end
   end
 
@@ -2298,33 +2273,6 @@ defmodule Tightbeam.Gateway do
 
       _ ->
         :none
-    end
-  end
-
-  defp staged_message_dedupe_in_txn(txn, target, prompt, opts) do
-    case {opts[:device_id], opts[:client_message_id]} do
-      {device_id, client_message_id}
-      when is_binary(device_id) and device_id != "" and is_binary(client_message_id) and
-             client_message_id != "" ->
-        payload_sha256 = staged_message_sha256(prompt)
-
-        case DB.Txn.q(
-               txn,
-               "SELECT payloadSha256,sourceWakeId FROM staged_message_dedupes WHERE targetSessionKey=?1 AND deviceId=?2 AND clientMessageId=?3",
-               [target, device_id, client_message_id]
-             ) do
-          [[^payload_sha256, wake_id]] ->
-            {:duplicate, %{wake_id: wake_id}}
-
-          [[_other_hash, _wake_id]] ->
-            {:conflict, %{code: "client_message_conflict"}}
-
-          [] ->
-            :new
-        end
-
-      _ ->
-        :new
     end
   end
 

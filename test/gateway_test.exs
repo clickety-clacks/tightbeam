@@ -640,6 +640,267 @@ defmodule Tightbeam.GatewayTest do
     %{db: db, registry: registry, lane: lane, catalog_base: catalog_base, device: device}
   end
 
+  @tag recipient_readiness: true
+  test "readiness admits one priority-ordered turn across aliases and resolves moved roles",
+       ctx do
+    alias Tightbeam.{Projection, Roles, Wakes}
+
+    Org.create(ctx.db, %{
+      session_key: "k2",
+      display_name: "Second",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("fable")
+    })
+
+    Roles.create!(ctx.db, "recipient-r", "flynn", "k1")
+    Roles.create!(ctx.db, "recipient-q", "flynn", "k1")
+
+    busy =
+      for key <- ["k1", "k2"] do
+        {:appended, message} =
+          Projection.append(ctx.db, %{session_key: key, role: "user", content: "hold readiness"})
+
+        {:ok, seq} =
+          Ledger.enqueue(ctx.db, %{
+            session_key: key,
+            message_id: message.id,
+            origin: "user:flynn",
+            prompt: message.content
+          })
+
+        {:ok, turn} = Ledger.claim_next(ctx.db, key, "alias-readiness")
+        assert turn.seq == seq
+        turn
+      end
+
+    inputs = [
+      {"direct-a", "k1", nil, "fyi"},
+      {"role-r", "k1", "recipient-r", "blocker"},
+      {"role-q", "k1", "recipient-q", "algedonic"},
+      {"direct-b", "k2", nil, "fyi"},
+      {"user-a", "k1", nil, "fyi"}
+    ]
+
+    sources =
+      for {prompt, key, role, class} <- inputs do
+        Wakes.schedule(ctx.db, %{
+          session_key: key,
+          target_role: role,
+          origin: "user:flynn",
+          prompt: prompt,
+          due_at: 0,
+          class: class,
+          target_user_id: if(prompt == "user-a", do: "flynn")
+        })
+      end
+
+    [direct_a, role_r, role_q, direct_b, user_a] = sources
+    attachment = %{"name" => "original.png", "url" => "attachment://original"}
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               NoticeBatcher.persist_source_attachments_in_txn(txn, direct_a.wake_id, [attachment])
+             end)
+
+    assert NoticeBatcher.recover(ctx.db) == []
+
+    assert Enum.all?(sources, fn wake -> NoticeBatcher.source_refs(ctx.db, wake.wake_id) == [] end)
+
+    assert :ok = Roles.bind(ctx.db, "recipient-r", "k2")
+    # Enrollment revisions and address aliases are provenance, not a delay gate.
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE notice_delivery_policies SET policyRevision='old-dev-revision' WHERE sourceWakeId=?1",
+               [role_q.wake_id]
+             )
+
+    for turn <- busy do
+      assert :ok =
+               Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+    end
+
+    opts = [conn_registry: ctx.registry, lane_manager: ctx.lane]
+
+    drains =
+      for _ <- 1..2 do
+        Task.async(fn ->
+          NoticeBatcher.recover(ctx.db, System.system_time(:millisecond) + 1000, opts)
+        end)
+      end
+
+    assert drains |> Enum.flat_map(&Task.await/1) |> Enum.uniq() |> length() == 2
+
+    assert {:ok, [["k1", a_id, a_prompt], ["k2", b_id, b_prompt]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sessionKey,wakeId,prompt FROM turns WHERE status='queued' ORDER BY sessionKey"
+             )
+
+    assert a_prompt =~ "direct-a"
+    assert a_prompt =~ "role-q"
+    assert a_prompt =~ "user-a"
+    refute a_prompt =~ "role-r"
+    refute a_prompt =~ "direct-b"
+    assert b_prompt =~ "role-r"
+    assert b_prompt =~ "direct-b"
+    refute b_prompt =~ "direct-a"
+    refute b_prompt =~ "role-q"
+    assert :binary.match(a_prompt, "role-q") < :binary.match(a_prompt, "direct-a")
+    assert :binary.match(b_prompt, "role-r") < :binary.match(b_prompt, "direct-b")
+
+    for {wake, carrier} <- [
+          {direct_a, a_id},
+          {role_q, a_id},
+          {user_a, a_id},
+          {role_r, b_id},
+          {direct_b, b_id}
+        ] do
+      assert [%{delivery_wake_id: ^carrier, member_state: "included", batch_state: "delivered"}] =
+               NoticeBatcher.source_refs(ctx.db, wake.wake_id)
+
+      assert Wakes.get(ctx.db, wake.wake_id).prompt == wake.prompt
+      assert Wakes.get(ctx.db, wake.wake_id).target_role == wake.target_role
+    end
+
+    assert {:ok, [["user:flynn"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT recipientAddress FROM notice_delivery_policies WHERE sourceWakeId=?1",
+               [user_a.wake_id]
+             )
+
+    assert {:ok, [[encoded]]} =
+             DB.query(
+               ctx.db,
+               "SELECT attachments FROM messages WHERE id=(SELECT messageId FROM turns WHERE wakeId=?1)",
+               [a_id]
+             )
+
+    assert JSON.decode!(encoded) == [attachment]
+
+    assert {:ok, [[nil], [nil]]} =
+             DB.query(
+               ctx.db,
+               "SELECT roleRef FROM turns WHERE status='queued' ORDER BY sessionKey"
+             )
+
+    assert NoticeBatcher.recover(ctx.db, System.system_time(:millisecond) + 1000, opts) == []
+  end
+
+  @tag recipient_readiness: true
+  test "an idle post joins an eligible role source after its role moves", ctx do
+    alias Tightbeam.{Roles, Wakes}
+
+    Org.create(ctx.db, %{
+      session_key: "k2",
+      display_name: "Second",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("fable")
+    })
+
+    Roles.create!(ctx.db, "post-recipient", "flynn", "k2")
+
+    source =
+      Wakes.schedule(ctx.db, %{
+        session_key: "k2",
+        target_role: "post-recipient",
+        origin: "user:flynn",
+        prompt: "urgent role source",
+        due_at: 0,
+        class: "blocker"
+      })
+
+    assert :ok = Roles.bind(ctx.db, "post-recipient", "k1")
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE notice_delivery_policies SET policyRevision='old-dev-revision' WHERE sourceWakeId=?1",
+               [source.wake_id]
+             )
+
+    post = Gateway.handlers(%{db: ctx.db})["post"]
+
+    call = %{
+      session_key: "k1",
+      origin: "user:flynn",
+      params: %{
+        content: "new direct post",
+        device_id: "alias-post-device",
+        client_message_id: "alias-post-1"
+      }
+    }
+
+    assert %{ack: "alias-post-1"} = post.(call)
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
+    assert %{dedupe: "duplicate"} = post.(call)
+
+    assert [carrier] =
+             NoticeBatcher.recover(ctx.db, System.system_time(:millisecond) + 1000,
+               conn_registry: ctx.registry,
+               lane_manager: ctx.lane
+             )
+
+    assert {:ok, [["k1", prompt]]} =
+             DB.query(ctx.db, "SELECT sessionKey,prompt FROM turns WHERE wakeId=?1", [carrier])
+
+    assert prompt =~ "urgent role source"
+    assert prompt =~ "new direct post"
+    assert :binary.match(prompt, "urgent role source") < :binary.match(prompt, "new direct post")
+    assert [%{delivery_wake_id: ^carrier}] = NoticeBatcher.source_refs(ctx.db, source.wake_id)
+    assert Wakes.get(ctx.db, source.wake_id).session_key == "k2"
+    assert Wakes.get(ctx.db, source.wake_id).target_role == "post-recipient"
+    assert %{dedupe: "duplicate"} = post.(call)
+    assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
+  end
+
+  @tag recipient_readiness: true
+  test "over-cap ready snapshot stays editable under a named capacity refusal", ctx do
+    sources =
+      for i <- 1..51 do
+        Tightbeam.Wakes.schedule(ctx.db, %{
+          session_key: "k1",
+          origin: "user:flynn",
+          prompt: "source #{i}",
+          due_at: 0,
+          class: if(i == 51, do: "algedonic", else: "fyi")
+        })
+      end
+
+    assert NoticeBatcher.recover(ctx.db, System.system_time(:millisecond) + 1000,
+             conn_registry: ctx.registry,
+             lane_manager: ctx.lane
+           ) == []
+
+    assert Enum.all?(sources, fn wake ->
+             Tightbeam.Wakes.get(ctx.db, wake.wake_id).state == "pending" and
+               NoticeBatcher.source_refs(ctx.db, wake.wake_id) == []
+           end)
+
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey='k1'")
+
+    assert {:ok, [[detail]]} =
+             DB.query(
+               ctx.db,
+               "SELECT detail FROM lifecycle_events WHERE kind='notice_session_capacity_refused' AND subject='k1'"
+             )
+
+    assert detail =~ "members=51"
+    assert detail =~ "decision=dr_58874264"
+  end
+
+  @tag recipient_readiness: true
   test "a busy post remains a deduplicated editable source until the recipient is ready", ctx do
     {:appended, current_message} =
       Tightbeam.Projection.append(ctx.db, %{
@@ -724,25 +985,24 @@ defmodule Tightbeam.GatewayTest do
              Tightbeam.Ledger.finish(ctx.db, current_seq, "delivered", nil, owner_lease: lease)
 
     [carrier_id] =
-      Tightbeam.NoticeBatcher.recover(ctx.db, System.system_time(:millisecond) + 1_000)
+      Tightbeam.NoticeBatcher.recover(ctx.db, System.system_time(:millisecond) + 1_000,
+        conn_registry: ctx.registry,
+        lane_manager: ctx.lane
+      )
 
-    carrier = Tightbeam.Wakes.get(ctx.db, carrier_id)
+    assert {:ok, [[encoded_attachments]]} =
+             DB.query(
+               ctx.db,
+               "SELECT attachments FROM messages WHERE id=(SELECT messageId FROM turns WHERE wakeId=?1)",
+               [carrier_id]
+             )
 
-    assert {:ok, {:appended, "k1", delivered_message, _opts}} =
-             DB.transaction(ctx.db, fn txn ->
-               Gateway.deliver_prompt_in_txn(
-                 txn,
-                 carrier.session_key,
-                 carrier.origin,
-                 carrier.prompt,
-                 wake_id: carrier.wake_id,
-                 sender: carrier.origin,
-                 target_gate: carrier,
-                 fire_wake_in_txn: true
-               )
-             end)
+    assert JSON.decode!(encoded_attachments) == [attachment]
 
-    assert delivered_message.attachments == [attachment]
+    assert {:ok, [["delivered"]]} =
+             DB.query(ctx.db, "SELECT state FROM notice_batches WHERE deliveryWakeId=?1", [
+               carrier_id
+             ])
 
     assert {:ok, [[1]]} =
              DB.query(
@@ -763,6 +1023,7 @@ defmodule Tightbeam.GatewayTest do
              )
   end
 
+  @tag recipient_readiness: true
   test "retrying an idle post after its direct turn starts does not stage a second delivery",
        ctx do
     start_supervised!(
@@ -815,6 +1076,7 @@ defmodule Tightbeam.GatewayTest do
              )
   end
 
+  @tag recipient_readiness: true
   test "a busy direct prompt joins the editable source queue without opt-in", ctx do
     {:appended, current_message} =
       Tightbeam.Projection.append(ctx.db, %{

@@ -117,36 +117,14 @@ defmodule Tightbeam.Projection do
   @spec append_in_txn(Txn.t(), map()) ::
           {:appended, message()} | {:duplicate, message()} | {:conflict, message()}
   def append_in_txn(%Txn{} = txn, input) do
-    existing =
-      case {Map.get(input, :client_message_id), Map.get(input, :device_id)} do
-        {client_message_id, device_id}
-        when is_binary(client_message_id) and is_binary(device_id) ->
-          Txn.q(
-            txn,
-            """
-              SELECT seq, id, sessionKey, role, content, timestamp, sender, deviceId,
-                     clientMessageId, replyToMessageId, replyToClientMessageId,
-                     llmVisibleMessageId, attachments, attentionTier,
-                     messageType, markerKind, markerFrom, markerTo
-              FROM messages
-              WHERE sessionKey = ?1 AND deviceId = ?2 AND clientMessageId = ?3
-            """,
-            [Map.fetch!(input, :session_key), device_id, client_message_id]
-          )
+    case client_message_result_in_txn(txn, input) do
+      {:duplicate, _} = duplicate ->
+        duplicate
 
-        _ ->
-          []
-      end
+      {:conflict, _} = conflict ->
+        conflict
 
-    case existing do
-      [row] ->
-        message = to_message(row)
-
-        if message.content == Map.fetch!(input, :content),
-          do: {:duplicate, message},
-          else: {:conflict, message}
-
-      [] ->
+      :new ->
         id = "s_" <> Tightbeam.Id.uuid4()
         client_message_id = Map.get(input, :client_message_id)
         message_type = message_type(input)
@@ -223,6 +201,36 @@ defmodule Tightbeam.Projection do
 
       [] ->
         :new
+    end
+  end
+
+  @doc false
+  def prompt_message_result_in_txn(%Txn{} = txn, input) do
+    case client_message_result_in_txn(txn, input) do
+      :new ->
+        case {input[:device_id], input[:client_message_id]} do
+          {device, client}
+          when is_binary(device) and device != "" and is_binary(client) and client != "" ->
+            hash =
+              :crypto.hash(:sha256, Map.fetch!(input, :raw_content))
+              |> Base.encode16(case: :lower)
+
+            case Txn.q(
+                   txn,
+                   "SELECT payloadSha256,sourceWakeId FROM staged_message_dedupes WHERE targetSessionKey=?1 AND deviceId=?2 AND clientMessageId=?3",
+                   [input.session_key, device, client]
+                 ) do
+              [[^hash, wake_id]] -> {:duplicate, %{wake_id: wake_id}}
+              [[_, _]] -> {:conflict, %{code: "client_message_conflict"}}
+              [] -> :new
+            end
+
+          _ ->
+            :new
+        end
+
+      existing ->
+        existing
     end
   end
 

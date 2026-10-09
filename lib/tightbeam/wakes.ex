@@ -1966,23 +1966,8 @@ defmodule Tightbeam.Wakes do
   # A carrier turn serves several independently owned sources. Preserve each
   # source's assignment identity when recognizing its delivery or recovery,
   # rather than treating the carrier's transport wake as the semantic notice.
-  defp source_delivery_turns_in_txn(txn, wake_id) do
-    Txn.q(
-      txn,
-      """
-      SELECT seq,status,assignmentId FROM turns WHERE wakeId=?1
-      UNION ALL
-      SELECT t.seq,t.status,w.assignmentId
-      FROM notice_batch_members m
-      JOIN notice_batches b ON b.batchId=m.batchId
-      JOIN wakes w ON w.wakeId=m.sourceWakeId
-      JOIN turns t ON t.wakeId=b.deliveryWakeId
-      WHERE m.sourceWakeId=?1 AND m.state='included'
-      ORDER BY seq
-      """,
-      [wake_id]
-    )
-  end
+  defp source_delivery_turns_in_txn(txn, wake_id),
+    do: NoticeBatcher.source_delivery_turns_in_txn(txn, wake_id)
 
   @doc false
   def consume_internal_in_txn(%Txn{} = txn, wake_id) when is_binary(wake_id) do
@@ -6317,7 +6302,8 @@ defmodule Tightbeam.Wakes do
     # that becomes due in this pass joins the same recipient-ready batch.
     # Held members remain individual source rows and never reach the delivery
     # loop below.
-    materialize_digests(db)
+    NoticeBatcher.recover(db, now(), state.delivery_opts)
+    legacy_materialize_digests(db, now())
 
     {:ok, rows} =
       DB.query(
@@ -6326,9 +6312,9 @@ defmodule Tightbeam.Wakes do
           ", (SELECT routingWakeId FROM work_items WHERE id=wakes.work_item_id), (SELECT slateWakeId FROM work_items WHERE id=wakes.work_item_id)"
         ) <>
           " WHERE state = 'pending' AND dueAt <= ?1 AND conditionKind IS NULL AND waitMode IS NULL" <>
-          " AND NOT (digest = 0 AND EXISTS (SELECT 1 FROM notice_delivery_policies p WHERE p.sourceWakeId=wakes.wakeId AND p.enabled=1 AND p.policyRevision=?2))" <>
+          " AND NOT (consumer='prompt' AND digest=0 AND COALESCE(deliveryRule,'')<>'turn-boundary-digest r1')" <>
           " ORDER BY dueAt ASC",
-        [now(), NoticeBatcher.policy_revision()]
+        [now()]
       )
 
     # Keep the exact carrier references from this due snapshot. A failed

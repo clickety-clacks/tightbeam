@@ -580,16 +580,251 @@ defmodule Tightbeam.NoticeBatcher do
     ) == [[1]]
   end
 
-  @doc "Seal due batches, arm sealed batches, and reconcile committed deliveries."
-  @spec recover(GenServer.server(), integer()) :: [String.t()]
-  def recover(db \\ Tightbeam.DB, at \\ now()) do
+  @doc "Resolve and admit one ready snapshot per concrete session atomically."
+  @spec recover(GenServer.server(), integer(), keyword()) :: [String.t()]
+  def recover(db \\ Tightbeam.DB, at \\ now(), delivery_opts \\ []) do
     :ok = Wakes.dispose_closed_remedy_sources(db, at)
     reconcile_committed_deliveries(db, at)
-    recover_ready_batches(db, at, [])
+
+    # These records are recovery compatibility, not ordinary enrollment. A
+    # historical committed carrier is immutable and never joins a new snapshot.
+    legacy_ids = recover_ready_batches(db, at, [])
+
+    {:ok, recipients} =
+      DB.transaction(db, fn txn ->
+        ready_sources_in_txn(txn, at)
+        |> Enum.flat_map(fn wake_id ->
+          case Wakes.get_in_txn(txn, wake_id) do
+            nil ->
+              []
+
+            wake ->
+              case source_delivery_target(txn, wake) do
+                {target, _, _} -> [target]
+                nil -> []
+              end
+          end
+        end)
+        |> Enum.uniq()
+      end)
+
+    deliveries =
+      Enum.flat_map(recipients, fn target ->
+        case DB.transaction_then(
+               db,
+               fn txn -> drain_session_in_txn(txn, target, at, delivery_opts) end,
+               fn txn, result ->
+                 Wakes.row_commit_in_txn(txn, [])
+                 result
+               end
+             ) do
+          {:ok, {:delivered, wake_id, delivery}} ->
+            Gateway.complete_delivery(db, delivery)
+            [wake_id]
+
+          {:ok, _} ->
+            []
+
+          {:error, error} ->
+            Logger.error(
+              "notice session drain refused recipient=#{target} reason=#{inspect(error)}"
+            )
+
+            []
+        end
+      end)
+
+    legacy_ids ++ deliveries
+  end
+
+  defp ready_sources_in_txn(txn, at) do
+    Txn.q(
+      txn,
+      """
+      SELECT w.wakeId FROM wakes w
+      WHERE w.state='pending' AND w.consumer='prompt' AND w.digest=0
+        AND COALESCE(w.deliveryRule,'')<>'turn-boundary-digest r1'
+        AND (w.conditionKind IS NULL OR w.firedAt IS NOT NULL)
+        AND (w.waitMode IS NULL OR w.recognitionAt IS NOT NULL)
+        AND (w.dueAt<=?1 OR w.firedAt IS NOT NULL OR w.recognitionAt IS NOT NULL)
+        AND NOT EXISTS (SELECT 1 FROM notice_batch_members m
+          WHERE m.sourceWakeId=w.wakeId AND m.state IN ('active','included'))
+      ORDER BY CASE w.class WHEN 'algedonic' THEN 0 WHEN 'blocker' THEN 1
+        WHEN 'input-needed' THEN 2 WHEN 'status-query' THEN 3
+        WHEN 'fyi' THEN 4 WHEN 'information' THEN 4 ELSE 5 END,
+        w.createdAt,w.rowid
+      """,
+      [at]
+    )
+    |> Enum.map(&hd/1)
+  end
+
+  defp drain_session_in_txn(txn, target, at, delivery_opts) do
+    if recipient_running?(txn, target, nil) do
+      :busy
+    else
+      sources =
+        ready_sources_in_txn(txn, at)
+        |> Enum.flat_map(fn wake_id ->
+          wake = Wakes.get_in_txn(txn, wake_id)
+
+          case source_delivery_target(txn, wake) do
+            {^target, _, _} ->
+              if prepare_due_source_in_txn(txn, wake_id) do
+                source = Wakes.get_in_txn(txn, wake_id)
+
+                case source_delivery_target(txn, source) do
+                  {^target, _, _} -> [source]
+                  _ -> []
+                end
+              else
+                []
+              end
+
+            _ ->
+              []
+          end
+        end)
+
+      case sources do
+        [] -> :empty
+        _ -> admit_session_snapshot_in_txn(txn, target, sources, at, delivery_opts)
+      end
+    end
+  end
+
+  defp admit_session_snapshot_in_txn(txn, target, sources, at, delivery_opts) do
+    address = "session:" <> target
+    scope = address <> ":readiness-v3"
+
+    [[seq]] =
+      Txn.q(
+        txn,
+        "SELECT COALESCE(MAX(publicationSeq),0)+1 FROM notice_batch_members WHERE recipientAddress=?1 AND visibilityScope=?2",
+        [address, scope]
+      )
+
+    rows =
+      Enum.with_index(sources, seq)
+      |> Enum.map(fn {wake, publication_seq} ->
+        [
+          wake.wake_id,
+          wake.origin,
+          wake.work_item_id || wake.assignment_id || "wake",
+          wake.class,
+          publication_seq,
+          Wakes.delivery_prompt_in_txn(txn, wake.wake_id)
+        ]
+      end)
+
+    bytes = Enum.reduce(rows, 0, fn row, sum -> sum + byte_size(render_member(row)) end)
+
+    # Until the owner rules overflow, do not change either cap or freeze a
+    # partial snapshot into additional future invocations.
+    if length(rows) > @max_members or bytes > @max_rendered_bytes do
+      EventLog.lifecycle_in_txn(
+        txn,
+        "notice_session_capacity_refused",
+        target,
+        "members=#{length(rows)} renderedBytes=#{bytes} decision=dr_58874264"
+      )
+
+      {:capacity_refused, target}
+    else
+      first = hd(sources)
+
+      context = %{
+        session_key: target,
+        target_role: nil,
+        recipient_address: address,
+        visibility_scope: scope,
+        policy_revision: @policy_revision,
+        deadline_at: Enum.min(Enum.map(sources, & &1.due_at)),
+        created_at: first.created_at,
+        wake_id: first.wake_id
+      }
+
+      batch = create_batch(txn, context, 0)
+
+      for {wake, row} <- Enum.zip(sources, rows) do
+        policy_ref = record_policy_in_txn(txn, wake, enabled: true)
+        member_id = "nbm_" <> Tightbeam.Id.uuid4()
+        [_, _, cause, _, publication_seq, _] = row
+
+        Txn.q(
+          txn,
+          """
+          INSERT INTO notice_batch_members(memberId,batchId,sourceWakeId,policyRef,
+            recipientAddress,visibilityScope,publicationSeq,policyRevision,senderPrincipal,
+            cause,class,payload,renderedBytes,state,addedAt)
+          VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'fyi',?11,?12,'active',?13)
+          """,
+          [
+            member_id,
+            batch.batch_id,
+            wake.wake_id,
+            policy_ref,
+            address,
+            scope,
+            publication_seq,
+            @policy_revision,
+            wake.origin,
+            cause,
+            wake.prompt,
+            byte_size(render_member(row)),
+            wake.created_at
+          ]
+        )
+
+        lifecycle(
+          txn,
+          "member_added",
+          batch.batch_id,
+          member_id,
+          wake.wake_id,
+          "session-readiness"
+        )
+      end
+
+      Txn.q(txn, "UPDATE notice_batches SET memberCount=?2,renderedBytes=?3 WHERE batchId=?1", [
+        batch.batch_id,
+        length(rows),
+        bytes
+      ])
+
+      boundary = latest_turn_end(txn, target, nil)
+
+      cause =
+        if is_integer(boundary) and boundary > first.created_at, do: "turn-boundary", else: "idle"
+
+      :sealed = seal_open_batch_in_txn(txn, batch.batch_id, cause, at)
+      {:new, wake_id} = arm_in_txn(txn, batch.batch_id, at, cause)
+      carrier = Wakes.get_in_txn(txn, wake_id)
+
+      case Gateway.deliver_prompt_in_txn(
+             txn,
+             target,
+             carrier.origin,
+             carrier.prompt,
+             Keyword.merge(delivery_opts,
+               wake_id: wake_id,
+               sender: carrier.origin,
+               target_gate: carrier,
+               fire_wake_in_txn: true
+             )
+           ) do
+        {:appended, ^target, _, _} = delivery ->
+          mark_delivered_in_txn(txn, wake_id, at)
+          {:delivered, wake_id, delivery}
+
+        other ->
+          raise DB.Error, message: "notice_session_admission_refused: #{inspect(other)}"
+      end
+    end
   end
 
   defp recover_ready_batches(db, at, armed) do
-    newly_formed = admit_due_sources(db, at)
+    newly_formed = []
 
     {:ok, open_ids} =
       DB.query(
@@ -627,185 +862,6 @@ defmodule Tightbeam.NoticeBatcher do
       recover_ready_batches(db, at, armed ++ newly_formed ++ newly_armed)
     else
       armed ++ newly_formed ++ newly_armed
-    end
-  end
-
-  defp admit_due_sources(db, at) do
-    {:ok, rows} =
-      DB.query(
-        db,
-        """
-        SELECT DISTINCT p.recipientAddress, p.visibilityScope
-        FROM notice_delivery_policies p
-        JOIN wakes w ON w.wakeId=p.sourceWakeId
-        WHERE p.enabled=1 AND p.policyRevision=?1
-          AND w.state='pending' AND w.consumer='prompt' AND w.digest=0
-          AND (w.conditionKind IS NULL OR w.firedAt IS NOT NULL)
-          AND (w.waitMode IS NULL OR w.recognitionAt IS NOT NULL)
-          AND (w.dueAt<=?2 OR w.firedAt IS NOT NULL OR w.recognitionAt IS NOT NULL)
-          AND NOT EXISTS (
-            SELECT 1 FROM notice_batch_members m
-            WHERE m.sourceWakeId=w.wakeId AND m.recipientAddress=p.recipientAddress
-              AND m.visibilityScope=p.visibilityScope
-          )
-        ORDER BY p.recipientAddress, p.visibilityScope
-        """,
-        [@policy_revision, at]
-      )
-
-    Enum.flat_map(rows, fn [recipient_address, visibility_scope] ->
-      try do
-        transaction!(db, fn txn ->
-          form_due_group_in_txn(txn, recipient_address, visibility_scope, at)
-        end)
-      rescue
-        error in DB.Error ->
-          # One recipient's durable notice may be temporarily unwriteable (for
-          # example, a trigger refusing terminal-recognition evidence). Its
-          # transaction has rolled back, so keep those source rows pending and
-          # continue recovering independent recipient groups in this pass.
-          source_ids = due_source_ids(db, recipient_address, visibility_scope, at)
-          reason = String.replace(error.message, ~r/\s+/, "_")
-
-          Logger.error(
-            "notice batch recipient recovery refused recipient=#{recipient_address} " <>
-              "scope=#{visibility_scope} sources=#{Enum.join(source_ids, ",")} " <>
-              "persistence_refused=#{reason}"
-          )
-
-          []
-      end
-    end)
-  end
-
-  defp due_source_ids(db, recipient_address, visibility_scope, at) do
-    case DB.query(
-           db,
-           """
-           SELECT p.sourceWakeId
-           FROM notice_delivery_policies p
-           JOIN wakes w ON w.wakeId=p.sourceWakeId
-           WHERE p.recipientAddress=?1 AND p.visibilityScope=?2
-             AND p.enabled=1 AND p.policyRevision=?3
-             AND w.state='pending' AND w.consumer='prompt' AND w.digest=0
-             AND (w.conditionKind IS NULL OR w.firedAt IS NOT NULL)
-             AND (w.waitMode IS NULL OR w.recognitionAt IS NOT NULL)
-             AND (w.dueAt<=?4 OR w.firedAt IS NOT NULL OR w.recognitionAt IS NOT NULL)
-             AND NOT EXISTS (
-               SELECT 1 FROM notice_batch_members m
-               WHERE m.sourceWakeId=w.wakeId AND m.recipientAddress=p.recipientAddress
-                 AND m.visibilityScope=p.visibilityScope
-             )
-           ORDER BY w.createdAt, w.rowid
-           """,
-           [recipient_address, visibility_scope, @policy_revision, at]
-         ) do
-      {:ok, rows} -> Enum.map(rows, fn [wake_id] -> wake_id end)
-      {:error, _} -> []
-    end
-  end
-
-  defp form_due_group_in_txn(txn, recipient_address, visibility_scope, at) do
-    rows =
-      Txn.q(
-        txn,
-        """
-        SELECT p.sourceWakeId, p.policyRef
-        FROM notice_delivery_policies p
-        JOIN wakes w ON w.wakeId=p.sourceWakeId
-        WHERE p.recipientAddress=?1 AND p.visibilityScope=?2
-          AND p.enabled=1 AND p.policyRevision=?3
-          AND w.state='pending' AND w.consumer='prompt' AND w.digest=0
-          AND (w.conditionKind IS NULL OR w.firedAt IS NOT NULL)
-          AND (w.waitMode IS NULL OR w.recognitionAt IS NOT NULL)
-          AND (w.dueAt<=?4 OR w.firedAt IS NOT NULL OR w.recognitionAt IS NOT NULL)
-          AND NOT EXISTS (
-            SELECT 1 FROM notice_batch_members m
-            WHERE m.sourceWakeId=w.wakeId AND m.recipientAddress=p.recipientAddress
-              AND m.visibilityScope=p.visibilityScope
-          )
-        ORDER BY w.createdAt, w.rowid
-        """,
-        [recipient_address, visibility_scope, @policy_revision, at]
-      )
-      |> Enum.filter(fn [wake_id, _policy_ref] -> prepare_due_source_in_txn(txn, wake_id) end)
-
-    case rows do
-      [[first_wake_id, first_policy_ref] | _] ->
-        with {:ok, first} <- authoritative_source(txn, first_wake_id, first_policy_ref),
-             false <- recipient_running?(txn, first.session_key, first.target_role) do
-          boundary = latest_turn_end(txn, first.session_key, first.target_role)
-
-          release_cause =
-            if is_integer(boundary) and boundary > first.created_at,
-              do: "turn-boundary",
-              else: "idle"
-
-          formed =
-            Enum.reduce(rows, [], fn [wake_id, policy_ref], armed ->
-              case enqueue_or_recover_in_txn(txn, {:enqueue, wake_id, policy_ref}) do
-                {:bypass, refusal_detail} ->
-                  Wakes.bypass_batching_in_txn(txn, wake_id, policy_ref, refusal_detail)
-                  armed
-
-                {:deferred, %{code: code}}
-                when code in ["batch_capacity_waiting", "batch_revision_waiting"] ->
-                  case open_batch(txn, first) do
-                    %{batch_id: batch_id} ->
-                      _ = seal_open_batch_in_txn(txn, batch_id, release_cause, at)
-                      newly_armed = arm_in_txn(txn, batch_id, at, release_cause)
-
-                      case enqueue_or_recover_in_txn(txn, {:enqueue, wake_id, policy_ref}) do
-                        %{batch_id: _} ->
-                          armed ++ [newly_armed]
-
-                        {:bypass, refusal_detail} ->
-                          Wakes.bypass_batching_in_txn(txn, wake_id, policy_ref, refusal_detail)
-                          armed ++ [newly_armed]
-
-                        other ->
-                          raise "notice batching could not admit a ready source: #{inspect(other)}"
-                      end
-
-                    nil ->
-                      raise "notice batching deferred a source without an open bounded batch"
-                  end
-
-                {:deferred, _reason} ->
-                  armed
-
-                {:error, refusal_detail} ->
-                  raise "notice batching admission refused: #{inspect(refusal_detail)}"
-
-                %{batch_id: _} ->
-                  armed
-              end
-            end)
-
-          armed =
-            case open_batch(txn, first) do
-              %{batch_id: batch_id} ->
-                _ = seal_open_batch_in_txn(txn, batch_id, release_cause, at)
-                [arm_in_txn(txn, batch_id, at, release_cause) | formed]
-
-              nil ->
-                formed
-            end
-
-          Enum.map(armed, fn
-            {:new, wake_id} -> wake_id
-            other -> raise "notice batching could not arm a ready batch: #{inspect(other)}"
-          end)
-        else
-          true ->
-            []
-
-          {:error, refusal_detail} ->
-            raise "notice batch source changed before readiness: #{inspect(refusal_detail)}"
-        end
-
-      [] ->
-        []
     end
   end
 
@@ -1138,6 +1194,25 @@ defmodule Tightbeam.NoticeBatcher do
       [delivery_wake_id]
     )
     |> Enum.map(&hd/1)
+  end
+
+  @doc false
+  def source_delivery_turns_in_txn(%Txn{} = txn, source_wake_id) do
+    Txn.q(
+      txn,
+      """
+      SELECT seq,status,assignmentId FROM turns WHERE wakeId=?1
+      UNION ALL
+      SELECT t.seq,t.status,w.assignmentId
+      FROM notice_batch_members m
+      JOIN notice_batches b ON b.batchId=m.batchId
+      JOIN wakes w ON w.wakeId=m.sourceWakeId
+      JOIN turns t ON t.wakeId=b.deliveryWakeId
+      WHERE m.sourceWakeId=?1 AND m.state='included'
+      ORDER BY seq
+      """,
+      [source_wake_id]
+    )
   end
 
   @spec pending?(Txn.t(), String.t()) :: boolean()
@@ -1542,22 +1617,13 @@ defmodule Tightbeam.NoticeBatcher do
 
   defp queued_sources_ready_excluding_in_txn?(txn, session_key, target_role, source_wake_id, at) do
     recipient_running?(txn, session_key, target_role) or
-      Txn.q(
-        txn,
-        """
-        SELECT 1 FROM wakes w
-        JOIN notice_delivery_policies p ON p.sourceWakeId=w.wakeId
-        WHERE w.state='pending' AND w.consumer='prompt' AND w.digest=0
-          AND p.enabled=1 AND p.policyRevision=?1
-          AND (w.conditionKind IS NULL OR w.firedAt IS NOT NULL)
-          AND (w.waitMode IS NULL OR w.recognitionAt IS NOT NULL)
-          AND (w.dueAt<=?2 OR w.firedAt IS NOT NULL OR w.recognitionAt IS NOT NULL)
-          AND (p.sessionKey=?4 OR (?3 IS NOT NULL AND w.targetRole=?3))
-          AND (?5 IS NULL OR w.wakeId<>?5)
-        LIMIT 1
-        """,
-        [@policy_revision, at, target_role, session_key, source_wake_id]
-      ) != []
+      Enum.any?(ready_sources_in_txn(txn, at), fn wake_id ->
+        wake_id != source_wake_id and
+          case source_delivery_target(txn, Wakes.get_in_txn(txn, wake_id)) do
+            {^session_key, _, _} -> true
+            _ -> false
+          end
+      end)
   end
 
   defp latest_turn_end(txn, session_key, target_role) do
