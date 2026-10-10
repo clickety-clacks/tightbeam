@@ -72,8 +72,19 @@ defmodule Tightbeam.Keyset do
   defp page_flags(_query, _from, _where, _params, _order, :earliest, _rows, extra?, _tuple, :asc),
     do: {false, extra?}
 
-  defp page_flags(_query, _from, _where, _params, _order, :earliest, _rows, extra?, _tuple, :desc),
-    do: {false, extra?}
+  defp page_flags(
+         _query,
+         _from,
+         _where,
+         _params,
+         _order,
+         :earliest,
+         _rows,
+         extra?,
+         _tuple,
+         :desc
+       ),
+       do: {false, extra?}
 
   defp page_flags(query, from, where, params, order, {:before, cursor}, rows, extra?, tuple, sort) do
     after? =
@@ -103,11 +114,17 @@ defmodule Tightbeam.Keyset do
   defp exists?(query, from, base_where, base_params, order, operator, values) do
     {cursor_where, cursor_params} = tuple_predicate(order, operator, values)
     where = join_where(base_where, cursor_where)
-    query.("SELECT 1 FROM " <> from <> where_clause(where) <> " LIMIT 1", base_params ++ cursor_params) != []
+
+    query.(
+      "SELECT 1 FROM " <> from <> where_clause(where) <> " LIMIT 1",
+      base_params ++ cursor_params
+    ) != []
   end
 
   defp cursor_predicate(_order, nil, _boundary), do: {nil, []}
-  defp cursor_predicate(order, operator, {_, values}), do: tuple_predicate(order, operator, values)
+
+  defp cursor_predicate(order, operator, {_, values}),
+    do: tuple_predicate(order, operator, values)
 
   defp tuple_predicate(order, operator, values)
        when operator in ["<", "<=", ">", ">="] and length(order) == length(values) do

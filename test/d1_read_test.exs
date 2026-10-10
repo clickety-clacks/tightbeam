@@ -71,7 +71,8 @@ defmodule Tightbeam.D1ReadTest do
     db: db
   } do
     for index <- 1..80 do
-      :ok = Org.put_setting(db, "page-setting-#{String.pad_leading(to_string(index), 3, "0")}", "x")
+      :ok =
+        Org.put_setting(db, "page-setting-#{String.pad_leading(to_string(index), 3, "0")}", "x")
     end
 
     page = D1Read.page(db, "/unused", :config, %{}, :latest, 5)
@@ -311,9 +312,11 @@ defmodule Tightbeam.D1ReadRouteTest do
     :ok = Org.put_setting(ctx.db, "rest-page-b", "b")
 
     config_path = "/api/config?key=rest-page-a&key=rest-page-b&limit=1"
+
     newest_config =
       get(ctx.opts, config_path, ctx.admin.token)
       |> then(&JSON.decode!(&1.resp_body))
+
     assert Enum.map(newest_config["items"], & &1["key"]) == ["rest-page-b"]
     assert newest_config["page"]["hasMoreBefore"] == true
 
@@ -391,7 +394,8 @@ defmodule Tightbeam.D1ReadRouteTest do
       |> then(&JSON.decode!(&1.resp_body))
 
     for direction <- ["before", "after"] do
-      cursor = identity["page"][if(direction == "before", do: "oldestCursor", else: "newestCursor")]
+      cursor =
+        identity["page"][if(direction == "before", do: "oldestCursor", else: "newestCursor")]
 
       empty =
         get(ctx.opts, "/api/identity?limit=1&#{direction}=" <> cursor, ctx.admin.token)
