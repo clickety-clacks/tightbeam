@@ -1074,8 +1074,10 @@ defmodule Tightbeam.GatewayTest do
            ) == []
 
     assert length(sources) == 51
+
     assert Enum.all?(sources, fn wake ->
              current = Tightbeam.Wakes.get(ctx.db, wake.wake_id)
+
              current.state == "pending" and current.prompt == wake.prompt and
                current.session_key == "k1" and
                NoticeBatcher.source_refs(ctx.db, wake.wake_id) == []
@@ -1093,7 +1095,10 @@ defmodule Tightbeam.GatewayTest do
              )
 
     assert [_, chars] =
-             Regex.run(~r/^receiver=codex textChars=(\d+) limitChars=1048576 recipient=k1$/, detail)
+             Regex.run(
+               ~r/^receiver=codex textChars=(\d+) limitChars=1048576 recipient=k1$/,
+               detail
+             )
 
     assert String.to_integer(chars) > 1_048_576
   end

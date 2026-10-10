@@ -823,6 +823,7 @@ defmodule Tightbeam.NoticeBatcherFixture do
     assert NoticeBatcher.source_refs(db, fitting.wake_id) == []
     [fitting_carrier] = Wakes.materialize_digests(db, fitting.due_at)
     fitting_batch_id = batch_id(db, fitting)
+
     assert [%{rendered_bytes: rendered_bytes, payload: fitting_payload}] =
              NoticeBatcher.members(db, fitting_batch_id)
 
@@ -850,6 +851,7 @@ defmodule Tightbeam.NoticeBatcherFixture do
     assert_capacity_hold!(db, [overflow], overflow.due_at)
     assert Wakes.get(db, overflow.wake_id).delivery_rule == NoticeBatcher.rule()
     assert Wakes.get(db, overflow.wake_id).prompt == overflow.prompt
+
     assert Enum.any?(EventLog.lifecycle_events(db), fn event ->
              event.kind == "notice_source_submission_too_large" and
                event.subject == overflow.wake_id and event.detail =~ "textChars=1048577 "
@@ -1083,6 +1085,7 @@ defmodule Tightbeam.NoticeBatcherFixture do
 
   defp scenario(30, db) do
     codex_recipient!(db, "agent:recipient")
+
     sources =
       for n <- 1..51 do
         payload =

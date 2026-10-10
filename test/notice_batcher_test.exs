@@ -48,9 +48,10 @@ defmodule Tightbeam.NoticeBatcherTest do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 8)
   end
 
-  test "acceptance 10: Claude priority-ordered 51-member snapshot commits one lossless carrier", %{
-    tmp_dir: tmp
-  } do
+  test "acceptance 10: Claude priority-ordered 51-member snapshot commits one lossless carrier",
+       %{
+         tmp_dir: tmp
+       } do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 9)
   end
 
@@ -168,9 +169,10 @@ defmodule Tightbeam.NoticeBatcherTest do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 29)
   end
 
-  test "failure of the second Codex size-bounded turn rolls back every chunk before exact retry", %{
-    tmp_dir: tmp
-  } do
+  test "failure of the second Codex size-bounded turn rolls back every chunk before exact retry",
+       %{
+         tmp_dir: tmp
+       } do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 30)
   end
 end
