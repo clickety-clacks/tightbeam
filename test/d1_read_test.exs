@@ -66,6 +66,46 @@ defmodule Tightbeam.D1ReadTest do
     assert Enum.map(users, & &1["userId"]) == ["alpha", "zeta"]
     assert Enum.all?(users, &(is_boolean(&1["isAdmin"]) and is_integer(&1["rowVersion"])))
   end
+
+  test "database collection pages materialize no more than one bounded lookahead row", %{
+    db: db
+  } do
+    for index <- 1..80 do
+      :ok = Org.put_setting(db, "page-setting-#{String.pad_leading(to_string(index), 3, "0")}", "x")
+    end
+
+    page = D1Read.page(db, "/unused", :config, %{}, :latest, 5)
+
+    assert length(page.items) == 5
+    assert page.flags.candidate_count == 6
+    assert page.flags.has_more_before == true
+    assert page.flags.has_more_after == false
+
+    exact_keys =
+      Enum.map(1..5, fn index ->
+        "page-setting-#{String.pad_leading(to_string(index), 3, "0")}"
+      end)
+
+    exact = D1Read.page(db, "/unused", :config, %{"key" => exact_keys}, :earliest, 5)
+    assert length(exact.items) == 5
+    assert exact.flags.candidate_count == 5
+    assert exact.flags.has_more_before == false
+    assert exact.flags.has_more_after == false
+
+    empty = D1Read.page(db, "/unused", :config, %{"key" => ["absent-setting"]}, :latest, 5)
+    assert empty.items == []
+    assert empty.flags.has_more_before == false
+    assert empty.flags.has_more_after == false
+
+    {:ok, plan} =
+      DB.query(
+        db,
+        "EXPLAIN QUERY PLAN SELECT key FROM org_settings ORDER BY key LIMIT ?",
+        [6]
+      )
+
+    refute inspect(plan) =~ "USE TEMP B-TREE"
+  end
 end
 
 defmodule Tightbeam.D1ReadRouteTest do
@@ -264,6 +304,118 @@ defmodule Tightbeam.D1ReadRouteTest do
       |> then(&JSON.decode!(&1.resp_body))
 
     assert Enum.map(hosts_after["items"], & &1["host"]) == ["zeta"]
+  end
+
+  test "config and host-environment collections page through filtered composite keys", ctx do
+    :ok = Org.put_setting(ctx.db, "rest-page-a", "a")
+    :ok = Org.put_setting(ctx.db, "rest-page-b", "b")
+
+    config_path = "/api/config?key=rest-page-a&key=rest-page-b&limit=1"
+    newest_config =
+      get(ctx.opts, config_path, ctx.admin.token)
+      |> then(&JSON.decode!(&1.resp_body))
+    assert Enum.map(newest_config["items"], & &1["key"]) == ["rest-page-b"]
+    assert newest_config["page"]["hasMoreBefore"] == true
+
+    explicit_tail =
+      get(ctx.opts, config_path <> "&tail=true", ctx.admin.token)
+      |> then(&JSON.decode!(&1.resp_body))
+
+    explicit_head =
+      get(ctx.opts, config_path <> "&tail=false", ctx.admin.token)
+      |> then(&JSON.decode!(&1.resp_body))
+
+    assert Enum.map(explicit_tail["items"], & &1["key"]) == ["rest-page-b"]
+    assert Enum.map(explicit_head["items"], & &1["key"]) == ["rest-page-a"]
+    assert explicit_head["page"]["hasMoreBefore"] == false
+    assert explicit_head["page"]["hasMoreAfter"] == true
+
+    older_config =
+      get(
+        ctx.opts,
+        config_path <> "&before=" <> newest_config["page"]["oldestCursor"],
+        ctx.admin.token
+      )
+      |> then(&JSON.decode!(&1.resp_body))
+
+    assert Enum.map(older_config["items"], & &1["key"]) == ["rest-page-a"]
+    assert older_config["page"]["hasMoreBefore"] == false
+    assert older_config["page"]["hasMoreAfter"] == true
+
+    harness = hd(Harness.all()).wire_name()
+
+    for name <- ~w(REST_PAGE_A REST_PAGE_B) do
+      assert {:ok, _overlay} =
+               Placement.set_env_overlay(
+                 ctx.db,
+                 "alpha",
+                 harness,
+                 name,
+                 "secret",
+                 "user:admin"
+               )
+    end
+
+    environment_path =
+      "/api/host-env?host=alpha&harness=#{URI.encode_www_form(harness)}" <>
+        "&name=REST_PAGE_A&name=REST_PAGE_B&limit=1"
+
+    newest_environment =
+      get(ctx.opts, environment_path, ctx.admin.token)
+      |> then(&JSON.decode!(&1.resp_body))
+
+    assert Enum.map(newest_environment["items"], & &1["name"]) == ["REST_PAGE_B"]
+    assert newest_environment["page"]["hasMoreBefore"] == true
+    assert is_nil(hd(newest_environment["items"])["value"])
+
+    older_environment =
+      get(
+        ctx.opts,
+        environment_path <> "&before=" <> newest_environment["page"]["oldestCursor"],
+        ctx.admin.token
+      )
+      |> then(&JSON.decode!(&1.resp_body))
+
+    assert Enum.map(older_environment["items"], & &1["name"]) == ["REST_PAGE_A"]
+
+    for path <- ["/api/identity?limit=1", "/api/kungfu?limit=1"] do
+      response = get(ctx.opts, path, ctx.admin.token)
+      assert response.status == 200, "#{path}: #{response.resp_body}"
+      assert length(JSON.decode!(response.resp_body)["items"]) <= 1
+      assert JSON.decode!(response.resp_body)["page"]["hasMoreBefore"] in [false, true]
+      assert JSON.decode!(response.resp_body)["page"]["hasMoreAfter"] in [false, true]
+    end
+
+    identity =
+      get(ctx.opts, "/api/identity?limit=1", ctx.admin.token)
+      |> then(&JSON.decode!(&1.resp_body))
+
+    for direction <- ["before", "after"] do
+      cursor = identity["page"][if(direction == "before", do: "oldestCursor", else: "newestCursor")]
+
+      empty =
+        get(ctx.opts, "/api/identity?limit=1&#{direction}=" <> cursor, ctx.admin.token)
+        |> then(&JSON.decode!(&1.resp_body))
+
+      assert empty["items"] == []
+      assert empty["page"]["hasMoreBefore"] == false
+      assert empty["page"]["hasMoreAfter"] == false
+    end
+
+    for {sql, params} <- [
+          {"SELECT key FROM org_settings WHERE key > ? ORDER BY key LIMIT ?", ["A", 6]},
+          {
+            "SELECT host, harness, name FROM host_environment_projection " <>
+              "WHERE host = ? AND (harness > ? OR (harness = ? AND name > ?)) " <>
+              "ORDER BY host, harness, name LIMIT ?",
+            ["alpha", "claude", "claude", "A", 6]
+          },
+          {"SELECT name FROM hosts WHERE name > ? ORDER BY name LIMIT ?", ["A", 6]},
+          {"SELECT userId FROM users WHERE userId > ? ORDER BY userId LIMIT ?", ["A", 6]}
+        ] do
+      {:ok, plan} = DB.query(ctx.db, "EXPLAIN QUERY PLAN " <> sql, params)
+      refute inspect(plan) =~ "USE TEMP B-TREE"
+    end
   end
 
   @tag rest_r7_encoder: true

@@ -2,6 +2,7 @@ defmodule Tightbeam.WorkState do
   @moduledoc "Grain-agnostic, query-time work observability."
 
   alias Tightbeam.DB
+  alias Tightbeam.Keyset
   alias Tightbeam.DB.Txn
 
   @ddl """
@@ -30,16 +31,7 @@ defmodule Tightbeam.WorkState do
     ON work_item_events (workItemId, id);
   """
 
-  @assignment_columns """
-  a.id, a.subject, a.holderKey, a.holderRole, a.holderFallback,
-  a.openedByUser, a.openedBySession, a.openedAt, a.state, a.outcome,
-  a.closedAt, a.closedByUser, a.closedBySession, a.closedByProcess, a.closingAttestId,
-  (SELECT r.reason FROM assignment_revocation_generations g
-   JOIN assignment_revocations r ON r.id = g.revocationId
-   WHERE g.assignmentId = a.id AND g.reopeningId IS
-     (SELECT reopening.id FROM assignment_reopenings reopening
-      WHERE reopening.assignmentId = a.id ORDER BY reopening.id DESC LIMIT 1)),
-  a.workItemId, s.state,
+  @assignment_status """
   CASE
     WHEN a.state = 'closed' AND a.outcome IN ('surrendered', 'revoked') THEN 'abandoned'
     WHEN a.state = 'closed' AND a.outcome = 'completed' AND EXISTS (
@@ -52,7 +44,20 @@ defmodule Tightbeam.WorkState do
       SELECT 1 FROM attests f WHERE f.assignmentId = a.id
     ) THEN 'open'
     ELSE 'active'
-  END,
+  END
+  """
+
+  @assignment_columns """
+  a.id, a.subject, a.holderKey, a.holderRole, a.holderFallback,
+  a.openedByUser, a.openedBySession, a.openedAt, a.state, a.outcome,
+  a.closedAt, a.closedByUser, a.closedBySession, a.closedByProcess, a.closingAttestId,
+  (SELECT r.reason FROM assignment_revocation_generations g
+   JOIN assignment_revocations r ON r.id = g.revocationId
+   WHERE g.assignmentId = a.id AND g.reopeningId IS
+     (SELECT reopening.id FROM assignment_reopenings reopening
+      WHERE reopening.assignmentId = a.id ORDER BY reopening.id DESC LIMIT 1)),
+  a.workItemId, s.state,
+  #{@assignment_status},
   COALESCE(
     (SELECT priority FROM assignment_priorities WHERE assignmentId=a.id),
     (SELECT priority FROM work_item_priorities WHERE workItemId=a.workItemId),
@@ -80,6 +85,48 @@ defmodule Tightbeam.WorkState do
       work = txn |> assignment_rows(filters) |> Enum.map(&assignment/1)
       %{work: work, cursor: cursor(txn, "work_state_events")}
     end)
+  end
+
+  @doc "Return one bounded page of assignment observability in its existing order."
+  def page(db, filters, boundary, limit) do
+    select_from =
+      "SELECT #{@assignment_columns}, s.ownerUserId FROM assignments a " <>
+        "JOIN sessions s ON s.sessionKey = a.holderKey"
+
+    probe_from = "assignments a JOIN sessions s ON s.sessionKey = a.holderKey"
+
+    {where, params} = assignment_page_filters(filters)
+
+    case DB.transaction(db, fn txn ->
+           query = fn sql, query_params -> Txn.q(txn, sql, query_params) end
+
+           page =
+             Keyset.page(
+               query,
+               select_from,
+               probe_from,
+               where,
+               params,
+               ["a.openedAt", "a.id"],
+               boundary,
+               limit,
+               fn row -> [Enum.at(row, 7), hd(row)] end,
+               :desc
+             )
+
+           {page, cursor(txn, "work_state_events")}
+         end) do
+      {:ok, {result, event_cursor}} ->
+        %{
+          work: Enum.map(result.rows, fn row -> row |> List.delete_at(-1) |> assignment() end),
+          has_more_before: result.has_more_before,
+          has_more_after: result.has_more_after,
+          cursor: event_cursor
+        }
+
+      {:error, error} ->
+        raise error
+    end
   end
 
   @doc "Return an atomic assignment detail snapshot, or nil."
@@ -331,6 +378,40 @@ defmodule Tightbeam.WorkState do
   defp assignment_query(where) do
     "SELECT #{@assignment_columns} FROM assignments a JOIN sessions s ON s.sessionKey = a.holderKey " <>
       "WHERE #{where} ORDER BY a.openedAt DESC, a.id DESC"
+  end
+
+  defp assignment_page_filters(filters) do
+    {where, params} = {"1 = 1", []}
+
+    {where, params} =
+      case Map.get(filters, :state, "all") do
+        "all" -> {where, params}
+        state -> {where <> " AND a.state = ?", params ++ [state]}
+      end
+
+    {where, params} =
+      case Map.get(filters, :status) do
+        nil -> {where, params}
+        statuses -> append_in(where, params, "(#{@assignment_status})", statuses)
+      end
+
+    {where, params} =
+      case Map.get(filters, :session_key) do
+        nil -> {where, params}
+        session_key -> {where <> " AND a.holderKey = ?", params ++ [session_key]}
+      end
+
+    case Map.get(filters, :owner_user_id) do
+      nil -> {where, params}
+      owner -> {where <> " AND s.ownerUserId = ?", params ++ [owner]}
+    end
+  end
+
+  defp append_in(where, params, _column, []), do: {where, params}
+
+  defp append_in(where, params, column, values) do
+    placeholders = Enum.map_join(values, ", ", fn _ -> "?" end)
+    {where <> " AND #{column} IN (#{placeholders})", params ++ values}
   end
 
   defp item_columns,

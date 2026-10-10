@@ -38,6 +38,7 @@ defmodule Tightbeam.StateResources do
 
   @message_select """
   SELECT m.seq, m.id, m.sessionKey, m.role, m.messageType, m.content,
+         m.markerKind, m.markerFrom, m.markerTo,
          m.timestamp, m.sender, m.deviceId, m.clientMessageId,
          m.replyToMessageId, m.replyToClientMessageId, m.llmVisibleMessageId,
          m.attachments, m.attentionTier,
@@ -65,6 +66,7 @@ defmodule Tightbeam.StateResources do
   }
 
   alias Tightbeam.DB.Txn
+  alias Tightbeam.Keyset
 
   @admin_field_order %{
     "config" => ~w(key value updatedAt rowVersion),
@@ -98,7 +100,7 @@ defmodule Tightbeam.StateResources do
       ~w(artifactId kind title description createdBySession workItemId parentSession originPath contentSha256 recordedMessageId recordedTurnEvidence state home createdAt updatedAt rowVersion),
     "read markers" => ~w(userId scopeKey marker updatedAt rowVersion),
     "transcript messages" =>
-      ~w(id seq sessionKey role messageType content at sender deviceId clientMessageId replyToMessageId replyToClientMessageId llmVisibleMessageId attachments attentionTier turnSeq assignmentId jobRef harness provider model effort context rowVersion),
+      ~w(id seq sessionKey role messageType marker content at sender deviceId clientMessageId replyToMessageId replyToClientMessageId llmVisibleMessageId attachments attentionTier turnSeq assignmentId jobRef harness provider model effort context rowVersion),
     "condition facts" => ~w(id ts kind scope origin rowVersion),
     "critical state" =>
       ~w(sessionKey reason startedAt expiresAt hardDeadline updatedAt rowVersion),
@@ -272,6 +274,7 @@ defmodule Tightbeam.StateResources do
     {"sessions", "overrides"} => :session_overrides,
     {"sessions", "capabilities"} => :session_capabilities,
     {"transcript messages", "attachments"} => {:array, :attachment, :preserve},
+    {"transcript messages", "marker"} => :transition_marker,
     {"transcript messages", "context"} => :json,
     {"identity", "sessionRevisions"} => :string_map,
     {"identity", "staleness"} => {:array, :string, :sort},
@@ -419,6 +422,78 @@ defmodule Tightbeam.StateResources do
     if is_map(selection), do: rows, else: List.first(rows)
   end
 
+  @doc "Return one bounded, principal-visible work-item page in creation order."
+  def query_work_item_page(db, filters, call, boundary, limit) do
+    {principal_kind, principal_id, is_admin} = detail_principal(call)
+    principal = Map.get(call, :rest_principal)
+    trace_core_detail(principal, {:au4_visibility, "work items"})
+
+    {visibility, visibility_params} =
+      cond do
+        is_admin ->
+          {"1 = 1", []}
+
+        principal_kind == "user" ->
+          {"wi.ownerUserId = ?", [principal_id]}
+
+        principal_kind == "session" ->
+          {"(wi.createdBySession = ? OR EXISTS (" <>
+             "SELECT 1 FROM assignments AS held WHERE held.workItemId = wi.id AND held.holderKey = ?))",
+           [principal_id, principal_id]}
+      end
+
+    {where, params} =
+      append_work_item_filters(
+        visibility,
+        visibility_params,
+        filters
+      )
+
+    select_from = """
+    SELECT wi.id, wi.title, wi.specRefName, wi.specRefSha256, wi.isBug,
+           wi.ownerUserId, wi.state, wi.failReason, wi.routingWakeId,
+           wi.slateWakeId, wi.createdByUser, wi.createdBySession,
+           wi.createdInTurnSeq, wi.createdContextKnown, wi.createdAt,
+           CASE WHEN p.workItemId IS NULL THEN
+             CAST(COALESCE((SELECT value FROM org_settings WHERE key='default-priority'),'4') AS INTEGER)
+           ELSE p.priority END,
+           COALESCE(v.rowVersion, wi.createdAt)
+    FROM work_items AS wi
+    LEFT JOIN work_item_versions AS v ON v.workItemId = wi.id
+    LEFT JOIN work_item_priorities AS p ON p.workItemId = wi.id
+    """
+
+    probe_from =
+      "work_items AS wi LEFT JOIN work_item_versions AS v ON v.workItemId = wi.id " <>
+        "LEFT JOIN work_item_priorities AS p ON p.workItemId = wi.id"
+
+    case DB.transaction(db, fn txn ->
+           query = fn sql, query_params -> observed_query(txn, principal, sql, query_params) end
+
+           Keyset.page(
+             query,
+             select_from,
+             probe_from,
+             where,
+             params,
+             ["wi.createdAt", "wi.id"],
+             boundary,
+             limit,
+             fn row -> [Enum.at(row, 14), hd(row)] end
+           )
+         end) do
+      {:ok, page} ->
+        %{
+          rows: Enum.map(page.rows, &work_item_query_row/1),
+          has_more_before: page.has_more_before,
+          has_more_after: page.has_more_after
+        }
+
+      {:error, error} ->
+        raise error
+    end
+  end
+
   def query_assignment(db, id, call) do
     {principal_kind, principal_id, is_admin} = detail_principal(call)
     principal = Map.get(call, :rest_principal)
@@ -544,6 +619,37 @@ defmodule Tightbeam.StateResources do
     |> Enum.map(&session_query_row/1)
   end
 
+  @doc "Return a bounded page of sessions visible to one REST principal."
+  def query_sessions_page(db, principal, boundary, limit) do
+    trace_core_detail(principal, {:au4_visibility, "sessions"})
+
+    {where, params} =
+      cond do
+        principal.is_admin -> {nil, []}
+        principal.kind == "session" -> {"sessions.sessionKey = ?", [principal.id]}
+        true -> {"sessions.ownerUserId = ?", [principal.id]}
+      end
+
+    case DB.transaction(db, fn txn ->
+           query = fn sql, query_params -> observed_query(txn, principal, sql, query_params) end
+
+           Keyset.page(
+             query,
+             @session_select,
+             "sessions",
+             where,
+             params,
+             ["sessions.createdAt", "sessions.sessionKey"],
+             boundary,
+             limit,
+             fn row -> [Enum.at(row, 22), hd(row)] end
+           )
+         end) do
+      {:ok, page} -> %{rows: Enum.map(page.rows, &session_query_row/1), flags: page}
+      {:error, error} -> raise error
+    end
+  end
+
   def query_session(db, id) when is_binary(id) do
     case query(db, @session_select <> " WHERE sessions.sessionKey = ?1", [id]) do
       [row] -> session_query_row(row)
@@ -558,15 +664,58 @@ defmodule Tightbeam.StateResources do
     |> Enum.map(&message_row/1)
   end
 
+  @doc "Return one bounded page of the retained transcript for a session."
+  def query_messages_for_session_page(source, session_key, boundary, limit) do
+    with_read_transaction(source, fn txn ->
+      query = fn sql, params -> query(txn, sql, params) end
+
+      Keyset.page(
+        query,
+        @message_select,
+        "messages AS m",
+        "m.sessionKey = ?",
+        [session_key],
+        ["m.seq"],
+        boundary,
+        limit,
+        fn [seq | _] -> [seq] end
+      )
+    end)
+    |> then(fn page -> %{rows: Enum.map(page.rows, &message_row/1), flags: page} end)
+  end
+
   @doc "Return the complete wake projection for one session."
   def query_wakes_for_session(db, session_key),
     do: Wakes.list_for_session(db, session_key)
+
+  def query_wakes_for_session_page(db, session_key, boundary, limit),
+    do: Wakes.list_for_session_page(db, session_key, boundary, limit)
 
   @doc "Return the complete turn projection for one session."
   def query_turns_for_session(source, session_key) do
     source
     |> query(@turn_select <> " WHERE t.sessionKey = ?1 ORDER BY t.seq ASC", [session_key])
     |> Enum.map(&turn_row/1)
+  end
+
+  @doc "Return one bounded page of a session's turn history."
+  def query_turns_for_session_page(source, session_key, boundary, limit) do
+    with_read_transaction(source, fn txn ->
+      query = fn sql, params -> query(txn, sql, params) end
+
+      Keyset.page(
+        query,
+        @turn_select,
+        "turns AS t",
+        "t.sessionKey = ?",
+        [session_key],
+        ["t.seq"],
+        boundary,
+        limit,
+        fn [seq | _] -> [seq] end
+      )
+    end)
+    |> then(fn page -> %{rows: Enum.map(page.rows, &turn_row/1), flags: page} end)
   end
 
   defp session_query_row([
@@ -1051,6 +1200,54 @@ defmodule Tightbeam.StateResources do
   defp detail_principal(%{principal: {:session, id}}), do: {"session", id, false}
   defp detail_principal(%{principal: {:remedy, %{owner: id}}}), do: {"user", id, false}
 
+  defp append_work_item_filters(where, params, filters) do
+    {where, params} =
+      Enum.reduce(
+        [
+          {"state", "wi.state"},
+          {"ownerUserId", "wi.ownerUserId"},
+          {"createdBySession", "wi.createdBySession"},
+          {"createdByUser", "wi.createdByUser"},
+          {"specRefName", "wi.specRefName"}
+        ],
+        {where, params},
+        fn {field, column}, {where, params} ->
+          append_in_filter(where, params, column, Map.get(filters, field, []))
+        end
+      )
+
+    {where, params} =
+      Map.get(filters, "isBug", [])
+      |> Enum.map(fn
+        "true" -> 1
+        "false" -> 0
+      end)
+      |> then(&append_in_filter(where, params, "wi.isBug", &1))
+
+    holder_keys = Map.get(filters, "holderKey", [])
+
+    if holder_keys == [] do
+      {where, params}
+    else
+      placeholders = Enum.map_join(holder_keys, ", ", fn _ -> "?" end)
+
+      {
+        where <>
+          " AND EXISTS (SELECT 1 FROM assignments AS selected_holder " <>
+          "WHERE selected_holder.workItemId = wi.id " <>
+          "AND selected_holder.holderKey IN (#{placeholders}))",
+        params ++ holder_keys
+      }
+    end
+  end
+
+  defp append_in_filter(where, params, _column, []), do: {where, params}
+
+  defp append_in_filter(where, params, column, values) do
+    placeholders = Enum.map_join(values, ", ", fn _ -> "?" end)
+    {where <> " AND #{column} IN (#{placeholders})", params ++ values}
+  end
+
   defp work_item_query_row([
          id,
          title,
@@ -1380,6 +1577,12 @@ defmodule Tightbeam.StateResources do
       "rowVersion" => message_row_version!(row)
     }
 
+    item =
+      case message_marker(row) do
+        nil -> item
+        marker -> Map.put(item, "marker", marker)
+      end
+
     item = if is_nil(message_type), do: Map.delete(item, "messageType"), else: item
     exact!("transcript messages", item)
   end
@@ -1606,6 +1809,8 @@ defmodule Tightbeam.StateResources do
   end
 
   defp conditional_fields!("transcript messages", fields, item) do
+    fields = if Map.has_key?(item, "marker"), do: fields, else: List.delete(fields, "marker")
+
     case Map.fetch(item, "messageType") do
       {:ok, value} when is_binary(value) ->
         fields
@@ -1745,6 +1950,18 @@ defmodule Tightbeam.StateResources do
     validate_closed_wire_object!(
       value,
       %{"assetId" => :string, "mimeType" => :string, "filename" => :string, "size" => :integer},
+      label
+    )
+  end
+
+  defp validate_wire_value!(value, :transition_marker, label) do
+    validate_closed_wire_object!(
+      value,
+      %{
+        "kind" => {:enum, ~w(harness-switch model-retune session-restart)},
+        "from" => :string,
+        "to" => :string
+      },
       label
     )
   end
@@ -1998,6 +2215,9 @@ defmodule Tightbeam.StateResources do
     )
   end
 
+  defp encode_item_field("transcript messages", "marker", value),
+    do: encode_closed_object!(value, ~w(kind from to), "transcript messages.marker")
+
   defp encode_item_field("transcript messages", "context", value), do: encode_j!(value)
 
   defp encode_item_field("attests", "commitRefs", nil), do: "null"
@@ -2162,6 +2382,9 @@ defmodule Tightbeam.StateResources do
          role,
          message_type,
          content,
+         marker_kind,
+         marker_from,
+         marker_to,
          at,
          sender,
          device_id,
@@ -2190,6 +2413,9 @@ defmodule Tightbeam.StateResources do
       session_key: session_key,
       role: role,
       message_type: message_type,
+      marker_kind: marker_kind,
+      marker_from: marker_from,
+      marker_to: marker_to,
       content: content,
       at: at,
       sender: sender,
@@ -2209,6 +2435,24 @@ defmodule Tightbeam.StateResources do
       context: context,
       row_version: seq
     }
+  end
+
+  defp message_marker(row) do
+    case {value(row, :marker_kind), value(row, :marker_from), value(row, :marker_to)} do
+      {nil, nil, nil} ->
+        nil
+
+      {kind, from, to}
+      when is_binary(kind) and is_binary(from) and is_binary(to) ->
+        unless kind in ~w(harness-switch model-retune session-restart) do
+          raise ArgumentError, "message marker kind is projection_invalid"
+        end
+
+        %{"kind" => kind, "from" => from, "to" => to}
+
+      _incomplete ->
+        raise ArgumentError, "message marker is projection_invalid"
+    end
   end
 
   defp correlate(row, primary, source) do
@@ -2578,6 +2822,15 @@ defmodule Tightbeam.StateResources do
   end
 
   defp query(%Txn{} = txn, sql, params), do: Txn.q(txn, sql, params)
+
+  defp with_read_transaction(%Txn{} = txn, fun), do: fun.(txn)
+
+  defp with_read_transaction(db, fun) do
+    case DB.transaction(db, fun) do
+      {:ok, result} -> result
+      {:error, error} -> raise error
+    end
+  end
 
   defp query(db, sql, params) do
     {:ok, rows} = DB.query(db, sql, params)

@@ -1820,6 +1820,157 @@ defmodule Tightbeam.Wire.RouterTest do
     end
   end
 
+  test "dynamic work wrapper pages filtered assignments at both ends", ctx do
+    :ok = Tightbeam.Schema.ensure_all(ctx.db)
+    holder = create_session(ctx.db, "work-tail-holder", ctx.device.user_id)
+
+    assignments =
+      for title <- ["Tail alpha", "Tail beta", "Tail gamma"] do
+        item =
+          WorkItems.__handle__(ctx.db, "work-item-create", %{
+            principal: {:user, ctx.device.user_id},
+            params: %{title: title}
+          })
+
+        assignment =
+          Assignments.__handle__(ctx.db, "assign", %{
+            principal: {:user, ctx.device.user_id},
+            session_key: holder.session_key,
+            target_role: nil,
+            role_fallback: false,
+            supervision_interval_ms: 1_000,
+            params: %{subject: title, work_item_id: item.id}
+          })
+
+        WorkState.emit(ctx.db, assignment.id, nil)
+        assignment
+      end
+
+    filters = %{
+      state: "all",
+      status: ["open"],
+      session_key: holder.session_key,
+      owner_user_id: ctx.device.user_id
+    }
+
+    expected_ids = Enum.map(WorkState.list(ctx.db, filters).work, & &1.id)
+    assert Enum.sort(expected_ids) == Enum.sort(Enum.map(assignments, & &1.id))
+
+    newest =
+      get_device(
+        ctx,
+        ctx.device,
+        "/api/work?state=all&status=open&sessionKey=#{holder.session_key}&limit=1"
+      )
+      |> then(&JSON.decode!(&1.resp_body))
+
+    explicit_head =
+      get_device(
+        ctx,
+        ctx.device,
+        "/api/work?state=all&status=open&sessionKey=#{holder.session_key}&limit=1&tail=false"
+      )
+      |> then(&JSON.decode!(&1.resp_body))
+
+    oldest_tail =
+      get_device(
+        ctx,
+        ctx.device,
+        "/api/work?state=all&status=open&sessionKey=#{holder.session_key}&limit=1&tail=true"
+      )
+      |> then(&JSON.decode!(&1.resp_body))
+
+    assert newest["work"] |> Enum.map(& &1["id"]) == [hd(expected_ids)]
+    assert newest["page"]["hasMoreBefore"] == true
+    assert newest["page"]["hasMoreAfter"] == false
+    assert newest["cursor"] == WorkState.list(ctx.db, filters).cursor
+    assert explicit_head["work"] == newest["work"]
+    assert oldest_tail["work"] |> Enum.map(& &1["id"]) == [List.last(expected_ids)]
+    assert oldest_tail["page"]["hasMoreBefore"] == false
+    assert oldest_tail["page"]["hasMoreAfter"] == true
+
+    older_page =
+      get_device(
+        ctx,
+        ctx.device,
+        "/api/work?state=all&status=open&sessionKey=#{holder.session_key}&limit=1&before=" <>
+          newest["page"]["oldestCursor"]
+      )
+      |> then(&JSON.decode!(&1.resp_body))
+
+    assert older_page["work"] |> Enum.map(& &1["id"]) == [Enum.at(expected_ids, 1)]
+    assert older_page["page"]["hasMoreBefore"] == true
+    assert older_page["page"]["hasMoreAfter"] == true
+
+    newer_page =
+      get_device(
+        ctx,
+        ctx.device,
+        "/api/work?state=all&status=open&sessionKey=#{holder.session_key}&limit=1&after=" <>
+          older_page["page"]["newestCursor"]
+      )
+      |> then(&JSON.decode!(&1.resp_body))
+
+    assert newer_page["work"] |> Enum.map(& &1["id"]) == [hd(expected_ids)]
+
+    mismatched_filter =
+      get_device(
+        ctx,
+        ctx.device,
+        "/api/work?state=all&status=open&sessionKey=other&limit=1&before=" <>
+          newest["page"]["oldestCursor"]
+      )
+
+    assert mismatched_filter.status == 400
+    assert JSON.decode!(mismatched_filter.resp_body)["error"]["code"] == "invalid_cursor"
+
+    other = approved_device(ctx.db, "work-tail-other-device", "Other")
+
+    mismatched_principal =
+      get_device(
+        ctx,
+        other,
+        "/api/work?state=all&status=open&sessionKey=#{holder.session_key}&limit=1&after=" <>
+          newest["page"]["newestCursor"]
+      )
+
+    assert mismatched_principal.status == 400
+    assert JSON.decode!(mismatched_principal.resp_body)["error"]["code"] == "invalid_cursor"
+
+    invalid_status = get_device(ctx, ctx.device, "/api/work?status=blocked")
+    assert invalid_status.status == 400
+    assert JSON.decode!(invalid_status.resp_body)["error"]["code"] == "invalid_status"
+
+    unknown_filter = get_device(ctx, ctx.device, "/api/work?unexpected=value")
+    assert unknown_filter.status == 400
+    assert JSON.decode!(unknown_filter.resp_body)["error"]["code"] == "invalid_filter"
+
+    non_admin = approved_device(ctx.db, "work-tail-non-admin", "work-tail-non-admin")
+    non_admin_holder = create_session(ctx.db, "work-tail-non-admin-holder", non_admin.user_id)
+
+    non_admin_item =
+      WorkItems.__handle__(ctx.db, "work-item-create", %{
+        principal: {:user, non_admin.user_id},
+        params: %{title: "Non-admin work"}
+      })
+
+    non_admin_assignment =
+      Assignments.__handle__(ctx.db, "assign", %{
+        principal: {:user, non_admin.user_id},
+        session_key: non_admin_holder.session_key,
+        target_role: nil,
+        role_fallback: false,
+        supervision_interval_ms: 1_000,
+        params: %{subject: "Non-admin work", work_item_id: non_admin_item.id}
+      })
+
+    non_admin_page =
+      get_device(ctx, non_admin, "/api/work?state=all&limit=10")
+      |> then(&JSON.decode!(&1.resp_body))
+
+    assert Enum.map(non_admin_page["work"], & &1["id"]) == [non_admin_assignment.id]
+  end
+
   test "all work-item verbs route, preserve generic target behavior, and map unknown ids", ctx do
     target = create_session(ctx.db, "work-item-target", "flynn")
 
@@ -1863,6 +2014,63 @@ defmodule Tightbeam.Wire.RouterTest do
 
     conn = Router.call(conn, Router.init(ctx.opts))
     assert conn.status == 200
+  end
+
+  test "/api/streams pages owner-visible active sessions with its legacy envelope", ctx do
+    owner = ctx.device.user_id
+    assert %{is_admin: true} = Devices.user(ctx.db, owner)
+
+    for suffix <- ~w(a b c d) do
+      create_session(ctx.db, "stream-page-#{suffix}", owner)
+    end
+
+    other = approved_device(ctx.db, "stream-other-device", "Other")
+    _hidden = create_session(ctx.db, "stream-page-hidden", other.user_id)
+
+    expected =
+      Org.list_for_user(ctx.db, owner, false)
+      |> Enum.sort_by(fn row -> {row.order_index, row.created_at, row.session_key} end)
+      |> Enum.map(& &1.session_key)
+
+    first_page =
+      get_device(ctx, ctx.device, "/api/streams?limit=2&tail=false")
+      |> then(&JSON.decode!(&1.resp_body))
+
+    assert Map.keys(first_page) |> Enum.sort() == ["page", "streams"]
+    assert Enum.map(first_page["streams"], & &1["sessionKey"]) == Enum.take(expected, 2)
+    assert first_page["page"]["hasMoreBefore"] == false
+    assert first_page["page"]["hasMoreAfter"] == true
+
+    next_page =
+      get_device(
+        ctx,
+        ctx.device,
+        "/api/streams?limit=2&after=" <> first_page["page"]["newestCursor"]
+      )
+      |> then(&JSON.decode!(&1.resp_body))
+
+    assert Enum.map(next_page["streams"], & &1["sessionKey"]) == Enum.drop(expected, 2)
+    assert Enum.all?(next_page["streams"], &(&1["sessionKey"] != "stream-page-hidden"))
+    assert next_page["page"]["hasMoreBefore"] == true
+    assert next_page["page"]["hasMoreAfter"] == false
+
+    tail_page =
+      get_device(ctx, ctx.device, "/api/streams?limit=2&tail=true")
+      |> then(&JSON.decode!(&1.resp_body))
+
+    assert Enum.map(tail_page["streams"], & &1["sessionKey"]) == Enum.take(expected, -2)
+    assert tail_page["page"]["hasMoreBefore"] == true
+    assert tail_page["page"]["hasMoreAfter"] == false
+
+    cross_principal =
+      get_device(
+        ctx,
+        other,
+        "/api/streams?limit=2&after=" <> first_page["page"]["newestCursor"]
+      )
+
+    assert cross_principal.status == 400
+    assert JSON.decode!(cross_principal.resp_body)["error"]["code"] == "invalid_cursor"
   end
 
   test "/api/streams refuses overrides as an unsupported transport", ctx do
