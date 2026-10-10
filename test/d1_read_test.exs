@@ -348,14 +348,20 @@ defmodule Tightbeam.D1ReadRouteTest do
     harness = hd(Harness.all()).wire_name()
 
     for name <- ~w(REST_PAGE_A REST_PAGE_B) do
-      assert {:ok, _overlay} =
-               Placement.set_env_overlay(
+      assert %{changed: true} =
+               Placement.set_env_overlay_with_firehose(
                  ctx.db,
                  "alpha",
                  harness,
                  name,
                  "secret",
-                 "user:admin"
+                 "user:admin",
+                 %{
+                   verb: "host-env-set",
+                   origin: "user:admin",
+                   principal: {:user, "admin"},
+                   params: %{}
+                 }
                )
     end
 

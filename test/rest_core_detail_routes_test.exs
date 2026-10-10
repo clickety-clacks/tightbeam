@@ -391,12 +391,23 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert decoded_collection["schemaVersion"] == 1
     assert decoded_collection["resource"] == "sessions"
     assert decoded_collection["items"] == [item]
-    assert decoded_collection["page"]["oldestCursor"] == nil
+    assert is_binary(decoded_collection["page"]["oldestCursor"])
     assert is_binary(decoded_collection["page"]["newestCursor"])
     assert decoded_collection["page"]["hasMoreBefore"] == false
     assert decoded_collection["page"]["hasMoreAfter"] == false
     assert collection.resp_body =~ item_bytes
     refute collection.resp_body =~ ctx.admin_session.session_key
+
+    before_only_visible_session =
+      get(
+        ctx,
+        "/api/sessions?before=" <> decoded_collection["page"]["oldestCursor"],
+        outsider_device.token
+      )
+      |> then(&JSON.decode!(&1.resp_body))
+
+    assert before_only_visible_session["items"] == []
+    assert before_only_visible_session["page"]["hasMoreBefore"] == false
 
     detail = get(ctx, "/api/sessions/#{outsider_session.session_key}", outsider_device.token)
     assert detail.status == 200
@@ -549,12 +560,12 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
 
     original_seqs = Enum.map(original_history, & &1.seq)
 
-    :ok =
-      DB.execute(
-        ctx.db,
-        "UPDATE sessions SET clearedThroughSeq = ? WHERE sessionKey = ?",
-        [history_12_to_13 |> List.last() |> Map.fetch!(:seq), session.session_key]
-      )
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "UPDATE sessions SET clearedThroughSeq = ? WHERE sessionKey = ?",
+               [history_12_to_13 |> List.last() |> Map.fetch!(:seq), session.session_key]
+             )
 
     direct_exact_page =
       StateResources.query_messages_for_session_page(ctx.db, session.session_key, :earliest, 17)
@@ -612,19 +623,20 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
 
     new_arrival = append_history.(18, %{})
 
-    :ok =
-      DB.execute(ctx.db, "UPDATE messages SET content = ? WHERE id = ?", [
-        "updated history-17",
-        List.last(history_15_to_17).id
-      ])
+    assert {:ok, []} =
+             DB.query(ctx.db, "UPDATE messages SET content = ? WHERE id = ?", [
+               "updated history-17",
+               List.last(history_15_to_17).id
+             ])
 
-    :ok = DB.execute(ctx.db, "DELETE FROM messages WHERE id = ?", [session_restart.id])
+    assert {:ok, []} =
+             DB.query(ctx.db, "DELETE FROM messages WHERE id = ?", [session_restart.id])
 
-    :ok =
-      DB.execute(ctx.db, "UPDATE sessions SET clearedThroughSeq = ? WHERE sessionKey = ?", [
-        new_arrival.seq,
-        session.session_key
-      ])
+    assert {:ok, []} =
+             DB.query(ctx.db, "UPDATE sessions SET clearedThroughSeq = ? WHERE sessionKey = ?", [
+               new_arrival.seq,
+               session.session_key
+             ])
 
     before_tail = fn cursor ->
       get(
