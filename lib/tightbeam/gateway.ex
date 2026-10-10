@@ -2394,7 +2394,13 @@ defmodule Tightbeam.Gateway do
               wake_id when is_binary(wake_id) ->
                 NoticeBatcher.carrier_source_ids_in_txn(txn, wake_id)
                 |> Enum.each(fn source_wake_id ->
-                  :ok = Tightbeam.Assignments.assert_retry_decision_in_txn!(txn, source_wake_id, target)
+                  :ok =
+                    Tightbeam.Assignments.assert_retry_decision_in_txn!(
+                      txn,
+                      source_wake_id,
+                      target
+                    )
+
                   Supervision.batch_source_delivered_in_txn(
                     txn,
                     source_wake_id,
@@ -3478,7 +3484,9 @@ defmodule Tightbeam.Gateway do
             diagnostic = ErrorDiagnostic.of(reason)
             classified_reason = ErrorDiagnostic.classified(reason)
             raw_reason = model_selection_record_reason(classified_reason)
-            prewrite_evidence = Tightbeam.NoticeSubmission.prewrite_evidence(failed_stage, raw_reason)
+
+            prewrite_evidence =
+              Tightbeam.NoticeSubmission.prewrite_evidence(failed_stage, raw_reason)
 
             reason =
               case turn_credential_refusal(active_session) do

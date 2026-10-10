@@ -537,12 +537,14 @@ defmodule Tightbeam.OrgTest do
     # Codex: 1,048,576 combined text scalars, including Tightbeam wrappers.
     # Pinned Claude has no evidenced fixed ACP prompt cap; coalesce the ready queue.
     prepared = Tightbeam.GuardRuntimeFixture.prepare!(tmp, "notice_batcher_runtime.exs")
+
     db_opts = [
       path: Path.join(prepared.base, "state.db"),
       name: nil,
       payload_root: prepared.payload,
       guard_inputs: []
     ]
+
     db = start_supervised!({DB, db_opts}, id: :retirement_history_db)
     assert :ok = Tightbeam.Schema.ensure_all(db)
     assert :ok = DB.assert_base_admitted!(db, prepared.base)
@@ -554,8 +556,13 @@ defmodule Tightbeam.OrgTest do
     second = retirement_source(db, "admitted retirement second")
     assert enqueue_ready_source!(db, second) == second
     admitted_by_id = Map.new([original, second], &{&1.wake_id, &1})
-    assert {:ok, admitted_order} = DB.query(db,
-      "SELECT wakeId FROM wakes WHERE state='pending' AND sessionKey='retiring' AND consumer='prompt' AND digest=0 ORDER BY createdAt,rowid")
+
+    assert {:ok, admitted_order} =
+             DB.query(
+               db,
+               "SELECT wakeId FROM wakes WHERE state='pending' AND sessionKey='retiring' AND consumer='prompt' AND digest=0 ORDER BY createdAt,rowid"
+             )
+
     admitted = Enum.map(admitted_order, fn [id] -> Map.fetch!(admitted_by_id, id) end)
     assert length(admitted) == map_size(admitted_by_id)
     finish_retirement_turn!(db, running, admitted)
@@ -564,35 +571,52 @@ defmodule Tightbeam.OrgTest do
 
     main_key = Org.personal_session_key("flynn")
     main_running = running_retirement_turn!(db, main_key)
-    pending = [retirement_source(db, "pending retirement first"),
-               retirement_source(db, "pending retirement second")]
+
+    pending = [
+      retirement_source(db, "pending retirement first"),
+      retirement_source(db, "pending retirement second")
+    ]
+
     for source <- pending, do: assert(enqueue_ready_source!(db, source) == source)
 
     # Authored attachment/address/scope bytes survive retargeting. Client identity
     # remains reserved on the original, rather than being forged on its successor.
     attachment = "[ {\"name\": \"retained.txt\", \"url\": \"attachment://retirement\"} ]"
     first_pending = hd(pending)
-    identity = JSON.encode!(%{
-      "targetSessionKey" => "retiring",
-      "deviceId" => "retirement-device",
-      "clientMessageId" => "retirement-client",
-      "sourceWakeId" => first_pending.wake_id,
-      "payloadSha256" => Base.encode16(:crypto.hash(:sha256, first_pending.prompt), case: :lower),
-      "createdAt" => first_pending.created_at
-    })
-    assert {:ok, []} = DB.query(db,
-      "UPDATE wakes SET sourceAttachments=?2,sourceClientIdentity=?3 WHERE wakeId=?1",
-      [first_pending.wake_id, attachment, identity])
+
+    identity =
+      JSON.encode!(%{
+        "targetSessionKey" => "retiring",
+        "deviceId" => "retirement-device",
+        "clientMessageId" => "retirement-client",
+        "sourceWakeId" => first_pending.wake_id,
+        "payloadSha256" =>
+          Base.encode16(:crypto.hash(:sha256, first_pending.prompt), case: :lower),
+        "createdAt" => first_pending.created_at
+      })
+
+    assert {:ok, []} =
+             DB.query(
+               db,
+               "UPDATE wakes SET sourceAttachments=?2,sourceClientIdentity=?3 WHERE wakeId=?1",
+               [first_pending.wake_id, attachment, identity]
+             )
 
     assert %{state: "retired"} = Org.retire(db, "retiring", "user:flynn", 1_000)
     assert_immutable_retirement_chain(db, admitted, history)
 
     replacements =
       for source <- pending do
-        assert %{requester: "tightbeam:retirement", reason: "target_retired",
-                 source_kind: "session_transition", source_id: "retiring",
-                 outcome: "replacement", replacement_wake_id: replacement_id} =
+        assert %{
+                 requester: "tightbeam:retirement",
+                 reason: "target_retired",
+                 source_kind: "session_transition",
+                 source_id: "retiring",
+                 outcome: "replacement",
+                 replacement_wake_id: replacement_id
+               } =
                  cancellation(db, source.wake_id)
+
         assert is_binary(replacement_id)
         replacement = Wakes.get(db, replacement_id)
         assert replacement.state == "pending"
@@ -602,30 +626,66 @@ defmodule Tightbeam.OrgTest do
         assert NoticeBatcher.source_refs(db, source.wake_id) == []
         assert NoticeBatcher.source_refs(db, replacement_id) == []
         assert cancellation(db, replacement_id) == nil
-        for field <- [:prompt, :origin, :creator_session_key, :target_role, :class,
-                      :class_election, :delivery_rule, :due_at, :assignment_id, :work_item_id] do
+
+        for field <- [
+              :prompt,
+              :origin,
+              :creator_session_key,
+              :target_role,
+              :class,
+              :class_election,
+              :delivery_rule,
+              :due_at,
+              :assignment_id,
+              :work_item_id
+            ] do
           assert Map.fetch!(replacement, field) == Map.fetch!(source, field)
         end
-        assert {:ok, [raw]} = DB.query(db,
-          "SELECT sourceAttachments,sourceAddress,sourceVisibilityScope FROM wakes WHERE wakeId=?1",
-          [source.wake_id])
-        assert {:ok, [^raw]} = DB.query(db,
-          "SELECT sourceAttachments,sourceAddress,sourceVisibilityScope FROM wakes WHERE wakeId=?1",
-          [replacement_id])
-        assert {:ok, [[nil]]} = DB.query(db,
-          "SELECT sourceClientIdentity FROM wakes WHERE wakeId=?1", [replacement_id])
+
+        assert {:ok, [raw]} =
+                 DB.query(
+                   db,
+                   "SELECT sourceAttachments,sourceAddress,sourceVisibilityScope FROM wakes WHERE wakeId=?1",
+                   [source.wake_id]
+                 )
+
+        assert {:ok, [^raw]} =
+                 DB.query(
+                   db,
+                   "SELECT sourceAttachments,sourceAddress,sourceVisibilityScope FROM wakes WHERE wakeId=?1",
+                   [replacement_id]
+                 )
+
+        assert {:ok, [[nil]]} =
+                 DB.query(db, "SELECT sourceClientIdentity FROM wakes WHERE wakeId=?1", [
+                   replacement_id
+                 ])
+
         replacement
       end
 
-    assert {:ok, [[^attachment, ^identity]]} = DB.query(db,
-      "SELECT sourceAttachments,sourceClientIdentity FROM wakes WHERE wakeId=?1",
-      [first_pending.wake_id])
-    assert {:ok, [[reserved_id]]} = DB.query(db,
-      "SELECT wakeId FROM wakes WHERE json_extract(sourceClientIdentity,'$.clientMessageId')='retirement-client'")
+    assert {:ok, [[^attachment, ^identity]]} =
+             DB.query(
+               db,
+               "SELECT sourceAttachments,sourceClientIdentity FROM wakes WHERE wakeId=?1",
+               [first_pending.wake_id]
+             )
+
+    assert {:ok, [[reserved_id]]} =
+             DB.query(
+               db,
+               "SELECT wakeId FROM wakes WHERE json_extract(sourceClientIdentity,'$.clientMessageId')='retirement-client'"
+             )
+
     assert reserved_id == first_pending.wake_id
+
     for replacement <- replacements do
-      refute replacement.wake_id in Enum.map(Wakes.digest_members(db, history.carrier.wake_id), & &1.wake_id)
+      refute replacement.wake_id in Enum.map(
+               Wakes.digest_members(db, history.carrier.wake_id),
+               & &1.wake_id
+             )
     end
+
     assert NoticeBatcher.recover(db) == []
     before_restart = retirement_delivery_snapshot(db)
     assert :ok = stop_supervised(:retirement_history_db)
@@ -639,9 +699,13 @@ defmodule Tightbeam.OrgTest do
 
     # Replacement creation order is its own durable order, not the canceled
     # source's old position. Observe that order before the readiness transition.
-    assert {:ok, replacement_order} = DB.query(db,
-      "SELECT wakeId FROM wakes WHERE state='pending' AND sessionKey=?1 AND consumer='prompt' AND digest=0 ORDER BY createdAt,rowid",
-      [main_key])
+    assert {:ok, replacement_order} =
+             DB.query(
+               db,
+               "SELECT wakeId FROM wakes WHERE state='pending' AND sessionKey=?1 AND consumer='prompt' AND digest=0 ORDER BY createdAt,rowid",
+               [main_key]
+             )
+
     by_id = Map.new(replacements, &{&1.wake_id, &1})
     ordered = Enum.map(replacement_order, fn [id] -> Map.fetch!(by_id, id) end)
     assert length(ordered) == length(pending)
@@ -654,15 +718,24 @@ defmodule Tightbeam.OrgTest do
     for source <- pending do
       assert Wakes.get(db, source.wake_id).state == "canceled"
       assert NoticeBatcher.source_refs(db, source.wake_id) == []
-      assert {:ok, [[0]]} = DB.query(db,
-        "SELECT count(*) FROM turns WHERE wakeId=?1", [source.wake_id])
+
+      assert {:ok, [[0]]} =
+               DB.query(db, "SELECT count(*) FROM turns WHERE wakeId=?1", [source.wake_id])
+
       assert cancellation(db, source.wake_id).reason == "target_retired"
     end
+
     for replacement <- ordered, do: assert(cancellation(db, replacement.wake_id) == nil)
+
     assert Enum.map(NoticeBatcher.members(db, replacement_history.batch.batch_id), & &1.payload) ==
              Enum.map(ordered, & &1.prompt)
-    assert {:ok, retained} = DB.transaction(db,
-      &NoticeBatcher.delivery_attachments_in_txn(&1, replacement_history.carrier.wake_id))
+
+    assert {:ok, retained} =
+             DB.transaction(
+               db,
+               &NoticeBatcher.delivery_attachments_in_txn(&1, replacement_history.carrier.wake_id)
+             )
+
     assert retained == JSON.decode!(attachment)
     assert {:ok, [[2]]} = DB.query(db, "SELECT count(*) FROM wakes WHERE digest=1")
     assert {:ok, [[4]]} = DB.query(db, "SELECT count(*) FROM turns")
@@ -1049,8 +1122,13 @@ defmodule Tightbeam.OrgTest do
 
   defp retirement_source(db, prompt) do
     Wakes.schedule(db, %{
-      session_key: "retiring", target_role: "reviewer", origin: "process:tightbeam",
-      creator_session_key: "agent:sender", prompt: prompt, due_at: 0, class: "fyi"
+      session_key: "retiring",
+      target_role: "reviewer",
+      origin: "process:tightbeam",
+      creator_session_key: "agent:sender",
+      prompt: prompt,
+      due_at: 0,
+      class: "fyi"
     })
   end
 
@@ -1060,60 +1138,93 @@ defmodule Tightbeam.OrgTest do
     assert NoticeBatcher.recover(db) == []
     assert Wakes.get(db, wake.wake_id).state == "pending"
     assert NoticeBatcher.source_refs(db, wake.wake_id) == []
-    assert {:ok, [[0]]} = DB.query(db,
-      "SELECT count(*) FROM turns WHERE wakeId=?1", [wake.wake_id])
+
+    assert {:ok, [[0]]} =
+             DB.query(db, "SELECT count(*) FROM turns WHERE wakeId=?1", [wake.wake_id])
+
     wake
   end
 
   defp running_retirement_turn!(db, session_key) do
-    assert {:ok, seq} = Tightbeam.Ledger.enqueue(db, %{
-      session_key: session_key, message_id: "retirement-busy-#{session_key}",
-      origin: "agent:recipient", prompt: "owned retirement busy fixture"
-    })
+    assert {:ok, seq} =
+             Tightbeam.Ledger.enqueue(db, %{
+               session_key: session_key,
+               message_id: "retirement-busy-#{session_key}",
+               origin: "agent:recipient",
+               prompt: "owned retirement busy fixture"
+             })
+
     assert {:ok, %{seq: ^seq, owner_lease: lease} = turn} =
              Tightbeam.Ledger.claim_next(db, session_key, "org-retirement-fixture")
+
     assert is_binary(lease)
     turn
   end
 
   defp finish_retirement_turn!(db, turn, sources) do
-    assert :ok = Tightbeam.Ledger.finish(db, turn.seq, "delivered", nil,
-      owner_lease: turn.owner_lease)
+    assert :ok =
+             Tightbeam.Ledger.finish(db, turn.seq, "delivered", nil,
+               owner_lease: turn.owner_lease
+             )
+
     # Pin only the eligibility clock after completing the genuinely owned turn.
     boundary = Enum.max(Enum.map(sources, & &1.created_at)) + 1
-    assert {:ok, []} = DB.query(db,
-      "UPDATE turns SET endedAt=?2 WHERE seq=?1 AND status='delivered'", [turn.seq, boundary])
-    assert {:ok, [["delivered", ^boundary]]} = DB.query(db,
-      "SELECT status,endedAt FROM turns WHERE seq=?1", [turn.seq])
+
+    assert {:ok, []} =
+             DB.query(db, "UPDATE turns SET endedAt=?2 WHERE seq=?1 AND status='delivered'", [
+               turn.seq,
+               boundary
+             ])
+
+    assert {:ok, [["delivered", ^boundary]]} =
+             DB.query(db, "SELECT status,endedAt FROM turns WHERE seq=?1", [turn.seq])
   end
 
   defp admit_retirement_sources!(db, session_key, sources) do
     assert [carrier_id] = NoticeBatcher.recover(db)
     first = hd(sources)
+
     assert [%{batch_id: batch_id, member_state: "included", batch_state: "delivered"}] =
              NoticeBatcher.source_refs(db, first.wake_id)
+
     batch = NoticeBatcher.batch(db, batch_id)
     assert batch.state == "delivered"
     assert batch.delivery_wake_id == carrier_id
     assert batch.member_count == length(sources)
+
     assert Enum.map(Wakes.digest_members(db, carrier_id), & &1.wake_id) ==
              Enum.map(sources, & &1.wake_id)
+
     assert Enum.map(NoticeBatcher.members(db, batch_id), & &1.payload) ==
              Enum.map(sources, & &1.prompt)
-    positions = for source <- sources do
-      assert source.prompt != ""
-      {position, _} = :binary.match(batch.envelope, source.prompt)
-      position
-    end
+
+    positions =
+      for source <- sources do
+        assert source.prompt != ""
+        {position, _} = :binary.match(batch.envelope, source.prompt)
+        position
+      end
+
     assert positions == Enum.sort(positions)
     assert length(Enum.uniq(positions)) == length(sources)
-    assert {:ok, [[^session_key, "queued", actual_prompt]]} = DB.query(db,
-      "SELECT sessionKey,status,prompt FROM turns WHERE wakeId=?1", [carrier_id])
+
+    assert {:ok, [[^session_key, "queued", actual_prompt]]} =
+             DB.query(db, "SELECT sessionKey,status,prompt FROM turns WHERE wakeId=?1", [
+               carrier_id
+             ])
+
     assert actual_prompt == "[from process:tightbeam]\n\n" <> batch.envelope
-    assert {:ok, [actual_turn]} = DB.query(db,
-      "SELECT * FROM turns WHERE wakeId=?1", [carrier_id])
-    history = %{batch: batch, members: NoticeBatcher.members(db, batch_id),
-                carrier: Wakes.get(db, carrier_id), turn: actual_turn}
+
+    assert {:ok, [actual_turn]} =
+             DB.query(db, "SELECT * FROM turns WHERE wakeId=?1", [carrier_id])
+
+    history = %{
+      batch: batch,
+      members: NoticeBatcher.members(db, batch_id),
+      carrier: Wakes.get(db, carrier_id),
+      turn: actual_turn
+    }
+
     assert_immutable_retirement_chain(db, sources, history)
     history
   end
@@ -1141,16 +1252,23 @@ defmodule Tightbeam.OrgTest do
     assert Wakes.get(db, carrier_id) == history.carrier
     assert history.carrier.state == "fired"
     assert history.batch.state == "delivered"
+
     assert history.batch.envelope_sha256 ==
              Base.encode16(:crypto.hash(:sha256, history.batch.envelope), case: :lower)
+
     assert is_binary(carrier_id)
-    assert {:ok, [[1]]} = DB.query(db,
-      "SELECT count(*) FROM wakes WHERE digest=1 AND wakeId=?1", [carrier_id])
-    assert {:ok, [actual_turn]} = DB.query(db,
-      "SELECT * FROM turns WHERE wakeId=?1", [carrier_id])
+
+    assert {:ok, [[1]]} =
+             DB.query(db, "SELECT count(*) FROM wakes WHERE digest=1 AND wakeId=?1", [carrier_id])
+
+    assert {:ok, [actual_turn]} =
+             DB.query(db, "SELECT * FROM turns WHERE wakeId=?1", [carrier_id])
+
     assert actual_turn == history.turn
+
     assert Enum.map(Wakes.digest_members(db, carrier_id), & &1.wake_id) ==
              Enum.map(sources, & &1.wake_id)
+
     for {source, member} <- Enum.zip(sources, history.members) do
       assert member.source_wake_id == source.wake_id
       assert member.sender_principal == source.origin
@@ -1159,10 +1277,17 @@ defmodule Tightbeam.OrgTest do
       assert Wakes.get(db, source.wake_id).state == "fired"
       assert Wakes.get(db, source.wake_id).prompt == source.prompt
       assert cancellation(db, source.wake_id) == nil
-      assert [%{member_state: "included", delivery_wake_id: ^carrier_id,
-                batch_state: "delivered"}] = NoticeBatcher.source_refs(db, source.wake_id)
-      assert {:ok, [[0]]} = DB.query(db,
-        "SELECT count(*) FROM turns WHERE wakeId=?1", [source.wake_id])
+
+      assert [
+               %{
+                 member_state: "included",
+                 delivery_wake_id: ^carrier_id,
+                 batch_state: "delivered"
+               }
+             ] = NoticeBatcher.source_refs(db, source.wake_id)
+
+      assert {:ok, [[0]]} =
+               DB.query(db, "SELECT count(*) FROM turns WHERE wakeId=?1", [source.wake_id])
     end
   end
 end

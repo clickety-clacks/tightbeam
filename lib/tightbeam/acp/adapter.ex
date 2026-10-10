@@ -1714,7 +1714,11 @@ defmodule Tightbeam.Acp.Adapter do
   defp remember_context_usage(state, sid, %{"sessionUpdate" => "usage_update"} = update)
        when is_binary(sid) do
     observation =
-      ContextUsage.observe(update, Map.get(state.models, sid), System.monotonic_time(:millisecond))
+      ContextUsage.observe(
+        update,
+        Map.get(state.models, sid),
+        System.monotonic_time(:millisecond)
+      )
 
     put_in(state.context_usage[sid], observation)
   end

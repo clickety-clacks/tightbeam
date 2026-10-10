@@ -825,13 +825,20 @@ defmodule Tightbeam.Ledger do
   def finish_in_txn(%Txn{} = txn, seq, terminal, error \\ nil, opts \\ [])
       when terminal in ~w(delivered canceled failed failed_unknown) do
     evidence = Keyword.get(opts, :prewrite_evidence)
-    if evidence and Txn.q(txn, "SELECT 1 FROM turns WHERE seq=?1 AND status='running'", [seq]) == [[1]] do
+
+    if evidence and
+         Txn.q(txn, "SELECT 1 FROM turns WHERE seq=?1 AND status='running'", [seq]) == [[1]] do
       unless terminal == "failed",
         do: raise(ArgumentError, "prewrite refusal requires a failed terminal")
 
-      :ok = Tightbeam.NoticeSubmission.assert_owner_in_txn!(
-        txn, seq, Keyword.get(opts, :owner_lease), evidence, "running"
-      )
+      :ok =
+        Tightbeam.NoticeSubmission.assert_owner_in_txn!(
+          txn,
+          seq,
+          Keyword.get(opts, :owner_lease),
+          evidence,
+          "running"
+        )
     end
 
     now = System.system_time(:millisecond)
@@ -1378,6 +1385,7 @@ defmodule Tightbeam.Ledger do
   defp append_terminal_in_txn(txn, seq, terminal, opts) do
     opts = Map.new(opts)
     detail = %{v: 1, status: terminal}
+
     detail =
       case Map.get(opts, :prewrite_evidence) do
         nil -> detail

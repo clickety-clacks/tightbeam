@@ -1113,11 +1113,15 @@ defmodule Tightbeam.Supervision do
     :ok = Tightbeam.NoticeSubmission.assert_restoration_in_txn!(txn, turn, evidence)
     NoticeAuthority.resolve!(txn, successor)
 
-    case Txn.q(txn, """
-         SELECT assignmentId,controllerOrigin,wakeKind,controllerState,chargedGeneration,
-                transferEvidenceId
-         FROM supervision_liveness_sidecar WHERE wakeId=?1
-         """, [source]) do
+    case Txn.q(
+           txn,
+           """
+           SELECT assignmentId,controllerOrigin,wakeKind,controllerState,chargedGeneration,
+                  transferEvidenceId
+           FROM supervision_liveness_sidecar WHERE wakeId=?1
+           """,
+           [source]
+         ) do
       [] ->
         :ok
 
@@ -1125,50 +1129,76 @@ defmodule Tightbeam.Supervision do
         # controller_scheduled charged this generation. controller_fire only
         # revalidates and settles it. Preserve the old source/sidecar and move
         # the live entitlement basis, never schedule or charge a new controller.
-        qualified = Txn.q(txn, """
-        WITH deliveries AS (#{NoticeBatcher.source_deliveries_sql()})
-        SELECT 1 FROM supervision_entitlements e
-        JOIN assignments a ON a.id=e.assignmentId
-        JOIN wakes old ON old.wakeId=?2 AND old.assignmentId=a.id
-        JOIN wakes next ON next.wakeId=?3 AND next.assignmentId=a.id
-        JOIN wake_retry_attempts previous ON previous.wakeId=old.wakeId
-        JOIN wake_retry_attempts retry ON retry.wakeId=next.wakeId
-        JOIN sessions holder ON holder.sessionKey=a.holderKey
-        WHERE e.assignmentId=?1 AND e.state='armed' AND e.generation=?4
-          AND e.basisKind='prod_scheduled' AND e.basisId=old.wakeId
-          AND e.cause='prod_scheduled' AND e.principal='process:tightbeam'
-          AND a.state='open' AND holder.state='active' AND old.sessionKey=a.holderKey
-          AND old.state='fired' AND old.consumer='prompt' AND old.digest=0
-          AND old.origin='process:tightbeam' AND old.reresolve IS NULL
-          AND next.state='pending' AND next.sessionKey=old.sessionKey
-          AND previous.sourceTurnSeq=?5 AND previous.outcome='failed'
-          AND previous.retryWakeId=next.wakeId
-          AND retry.rootWakeId=previous.rootWakeId AND retry.predecessorWakeId=old.wakeId
-          AND retry.attempt=previous.attempt+1 AND retry.outcome='pending'
-          AND EXISTS (SELECT 1 FROM deliveries d WHERE d.sourceWakeId=old.wakeId AND d.turnSeq=?5)
-          AND NOT EXISTS (SELECT 1 FROM supervision_liveness_sidecar s
-            WHERE s.assignmentId=a.id AND s.controllerOrigin='scheduled' AND s.controllerState='pending')
-          AND NOT EXISTS (SELECT 1 FROM supervision_liveness_sidecar s WHERE s.wakeId=next.wakeId)
-        """, [assignment, source, successor, generation, turn.seq])
+        qualified =
+          Txn.q(
+            txn,
+            """
+            WITH deliveries AS (#{NoticeBatcher.source_deliveries_sql()})
+            SELECT 1 FROM supervision_entitlements e
+            JOIN assignments a ON a.id=e.assignmentId
+            JOIN wakes old ON old.wakeId=?2 AND old.assignmentId=a.id
+            JOIN wakes next ON next.wakeId=?3 AND next.assignmentId=a.id
+            JOIN wake_retry_attempts previous ON previous.wakeId=old.wakeId
+            JOIN wake_retry_attempts retry ON retry.wakeId=next.wakeId
+            JOIN sessions holder ON holder.sessionKey=a.holderKey
+            WHERE e.assignmentId=?1 AND e.state='armed' AND e.generation=?4
+              AND e.basisKind='prod_scheduled' AND e.basisId=old.wakeId
+              AND e.cause='prod_scheduled' AND e.principal='process:tightbeam'
+              AND a.state='open' AND holder.state='active' AND old.sessionKey=a.holderKey
+              AND old.state='fired' AND old.consumer='prompt' AND old.digest=0
+              AND old.origin='process:tightbeam' AND old.reresolve IS NULL
+              AND next.state='pending' AND next.sessionKey=old.sessionKey
+              AND previous.sourceTurnSeq=?5 AND previous.outcome='failed'
+              AND previous.retryWakeId=next.wakeId
+              AND retry.rootWakeId=previous.rootWakeId AND retry.predecessorWakeId=old.wakeId
+              AND retry.attempt=previous.attempt+1 AND retry.outcome='pending'
+              AND EXISTS (SELECT 1 FROM deliveries d WHERE d.sourceWakeId=old.wakeId AND d.turnSeq=?5)
+              AND NOT EXISTS (SELECT 1 FROM supervision_liveness_sidecar s
+                WHERE s.assignmentId=a.id AND s.controllerOrigin='scheduled' AND s.controllerState='pending')
+              AND NOT EXISTS (SELECT 1 FROM supervision_liveness_sidecar s WHERE s.wakeId=next.wakeId)
+            """,
+            [assignment, source, successor, generation, turn.seq]
+          )
 
         unless qualified == [[1]],
-          do: raise(DB.Error, message: "notice_prewrite_restoration_refused: prod entitlement binding changed")
+          do:
+            raise(DB.Error,
+              message: "notice_prewrite_restoration_refused: prod entitlement binding changed"
+            )
 
-        Txn.q(txn, """
-        UPDATE supervision_entitlements SET basisId=?4
-        WHERE assignmentId=?1 AND generation=?2 AND state='armed'
-          AND basisKind='prod_scheduled' AND basisId=?3
-        """, [assignment, generation, source, successor])
+        Txn.q(
+          txn,
+          """
+          UPDATE supervision_entitlements SET basisId=?4
+          WHERE assignmentId=?1 AND generation=?2 AND state='armed'
+            AND basisKind='prod_scheduled' AND basisId=?3
+          """,
+          [assignment, generation, source, successor]
+        )
+
         unless Txn.changes(txn) == 1,
-          do: raise(DB.Error, message: "notice_prewrite_restoration_refused: prod entitlement CAS lost")
+          do:
+            raise(DB.Error,
+              message: "notice_prewrite_restoration_refused: prod entitlement CAS lost"
+            )
 
-        Txn.q(txn, """
-        INSERT INTO supervision_liveness_sidecar
-          (wakeId,assignmentId,controllerOrigin,wakeKind,controllerState,chargedGeneration)
-        VALUES (?1,?2,'scheduled','prod','pending',?3)
-        """, [successor, assignment, generation])
-        EventLog.lifecycle_in_txn(txn, "supervision_controller_restored", assignment,
-          "generation=#{generation} predecessor=#{source} successor=#{successor} sourceTurnSeq=#{turn.seq} cause=not-dispatched")
+        Txn.q(
+          txn,
+          """
+          INSERT INTO supervision_liveness_sidecar
+            (wakeId,assignmentId,controllerOrigin,wakeKind,controllerState,chargedGeneration)
+          VALUES (?1,?2,'scheduled','prod','pending',?3)
+          """,
+          [successor, assignment, generation]
+        )
+
+        EventLog.lifecycle_in_txn(
+          txn,
+          "supervision_controller_restored",
+          assignment,
+          "generation=#{generation} predecessor=#{source} successor=#{successor} sourceTurnSeq=#{turn.seq} cause=not-dispatched"
+        )
+
         :ok
 
       [[assignment, origin, "escalation", "settled", generation, nil]]
@@ -1177,13 +1207,23 @@ defmodule Tightbeam.Supervision do
         # recreated and no controller is charged. The retry lineage delegates
         # the original evidence; both admission sites validate it afresh.
         transfer = retry_transfer_in_txn!(txn, assignment, successor)
+
         unless transfer.wake_id == source and transfer.turn_seq == turn.seq,
-          do: raise(DB.Error, message: "notice_prewrite_restoration_refused: parent transfer changed")
-        Txn.q(txn, """
-        INSERT INTO supervision_liveness_sidecar
-          (wakeId,assignmentId,controllerOrigin,wakeKind,controllerState,chargedGeneration)
-        VALUES (?1,?2,?3,'escalation','settled',?4)
-        """, [successor, assignment, origin, generation])
+          do:
+            raise(DB.Error,
+              message: "notice_prewrite_restoration_refused: parent transfer changed"
+            )
+
+        Txn.q(
+          txn,
+          """
+          INSERT INTO supervision_liveness_sidecar
+            (wakeId,assignmentId,controllerOrigin,wakeKind,controllerState,chargedGeneration)
+          VALUES (?1,?2,?3,'escalation','settled',?4)
+          """,
+          [successor, assignment, origin, generation]
+        )
+
         :ok
 
       _ ->
@@ -1195,6 +1235,7 @@ defmodule Tightbeam.Supervision do
   @doc false
   def prepare_batch_source_in_txn(%Txn{} = txn, wake_id) when is_binary(wake_id) do
     revalidate_retry_transfer_in_txn!(txn, wake_id)
+
     case Txn.q(
            txn,
            """
@@ -1250,6 +1291,7 @@ defmodule Tightbeam.Supervision do
   def batch_source_delivered_in_txn(%Txn{} = txn, wake_id, target, turn_seq)
       when is_binary(wake_id) and is_binary(target) and is_integer(turn_seq) and turn_seq > 0 do
     revalidate_retry_transfer_in_txn!(txn, wake_id, target)
+
     case Txn.q(
            txn,
            """
@@ -1281,11 +1323,15 @@ defmodule Tightbeam.Supervision do
   end
 
   defp revalidate_retry_transfer_in_txn!(txn, wake_id, target \\ nil) do
-    case Txn.q(txn, """
-         SELECT s.assignmentId FROM supervision_liveness_sidecar s
-         JOIN wake_retry_attempts r ON r.wakeId=s.wakeId AND r.attempt>0
-         WHERE s.wakeId=?1 AND s.wakeKind='escalation' AND s.controllerState='settled'
-         """, [wake_id]) do
+    case Txn.q(
+           txn,
+           """
+           SELECT s.assignmentId FROM supervision_liveness_sidecar s
+           JOIN wake_retry_attempts r ON r.wakeId=s.wakeId AND r.attempt>0
+           WHERE s.wakeId=?1 AND s.wakeKind='escalation' AND s.controllerState='settled'
+           """,
+           [wake_id]
+         ) do
       [[assignment]] -> retry_transfer_in_txn!(txn, assignment, wake_id, target)
       [] -> :ok
     end
@@ -1293,23 +1339,39 @@ defmodule Tightbeam.Supervision do
 
   defp retry_transfer_in_txn!(txn, assignment, wake_id, target \\ nil) do
     authority = NoticeAuthority.resolve!(txn, wake_id)
-    unless authority.root_wake_id != wake_id and Txn.q(txn, """
-           SELECT 1 FROM assignments a JOIN wakes w ON w.wakeId=?2 AND w.assignmentId=a.id
-           JOIN sessions recipient ON recipient.sessionKey=w.sessionKey
-           WHERE a.id=?1 AND a.state='open' AND recipient.state='active'
-             AND NOT EXISTS (SELECT 1 FROM supervision_entitlements e WHERE e.assignmentId=a.id)
-           """, [assignment, wake_id]) == [[1]],
-      do: raise(DB.Error, message: "notice_retry_authority_refused: parent disposition changed")
+
+    unless authority.root_wake_id != wake_id and
+             Txn.q(
+               txn,
+               """
+               SELECT 1 FROM assignments a JOIN wakes w ON w.wakeId=?2 AND w.assignmentId=a.id
+               JOIN sessions recipient ON recipient.sessionKey=w.sessionKey
+               WHERE a.id=?1 AND a.state='open' AND recipient.state='active'
+                 AND NOT EXISTS (SELECT 1 FROM supervision_entitlements e WHERE e.assignmentId=a.id)
+               """,
+               [assignment, wake_id]
+             ) == [[1]],
+           do:
+             raise(DB.Error,
+               message: "notice_retry_authority_refused: parent disposition changed"
+             )
 
     case accepted_transfer(txn, assignment, nil) do
       {:ok, transfer} ->
         previous = NoticeAuthority.resolve!(txn, transfer.wake_id)
         [[recipient]] = Txn.q(txn, "SELECT sessionKey FROM wakes WHERE wakeId=?1", [wake_id])
+
         unless previous.root_wake_id == authority.root_wake_id and
-             transfer.session_key == recipient and target in [nil, recipient],
-          do: raise(DB.Error, message: "notice_retry_authority_refused: parent transfer changed")
+                 transfer.session_key == recipient and target in [nil, recipient],
+               do:
+                 raise(DB.Error,
+                   message: "notice_retry_authority_refused: parent transfer changed"
+                 )
+
         transfer
-      _ -> raise DB.Error, message: "notice_retry_authority_refused: parent transfer unavailable"
+
+      _ ->
+        raise DB.Error, message: "notice_retry_authority_refused: parent transfer unavailable"
     end
   end
 
@@ -5450,12 +5512,15 @@ defmodule Tightbeam.Supervision do
 
   defp validate_transfer(db_or_txn, assignment_id, candidate) do
     authority = NoticeAuthority.for_delivery!(db_or_txn, candidate.wake_id)
+
     if authority.root_wake_id == candidate.wake_id do
       validate_original_transfer(db_or_txn, assignment_id, candidate)
     else
-      roots = transfer_candidate_rows(db_or_txn, assignment_id, authority.root_turn_seq)
+      roots =
+        transfer_candidate_rows(db_or_txn, assignment_id, authority.root_turn_seq)
         |> Enum.map(&decode_transfer_row/1)
         |> Enum.filter(&(&1.wake_id == authority.root_wake_id))
+
       case roots do
         [root] ->
           case validate_original_transfer(db_or_txn, assignment_id, root) do
@@ -5470,14 +5535,23 @@ defmodule Tightbeam.Supervision do
                 # Retain the original retirement predecessor/outcome identity.
                 # This actual delivery delegates it; it does not mint another
                 # retirement outcome or repeat the entitlement transfer.
-                {:ok, %{transfer | turn_seq: candidate.turn_seq, wake_id: candidate.wake_id,
-                  evidence_id: "#{assignment_id}##{candidate.turn_seq}"}}
+                {:ok,
+                 %{
+                   transfer
+                   | turn_seq: candidate.turn_seq,
+                     wake_id: candidate.wake_id,
+                     evidence_id: "#{assignment_id}##{candidate.turn_seq}"
+                 }}
               else
                 {:error, :invalid_parent_transfer}
               end
-            other -> other
+
+            other ->
+              other
           end
-        _ -> {:error, :invalid_parent_transfer}
+
+        _ ->
+          {:error, :invalid_parent_transfer}
       end
     end
   end

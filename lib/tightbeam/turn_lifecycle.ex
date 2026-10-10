@@ -354,9 +354,9 @@ defmodule Tightbeam.TurnLifecycle do
       do: raise(ArgumentError, "#{kind} detail requires v=1")
 
     if Map.has_key?(normalized, "prewrite") and
-        (normalized["status"] != "failed" or
-          not Tightbeam.NoticeSubmission.valid_evidence?(normalized["prewrite"])),
-      do: raise(ArgumentError, "terminal prewrite evidence is not a qualified refusal")
+         (normalized["status"] != "failed" or
+            not Tightbeam.NoticeSubmission.valid_evidence?(normalized["prewrite"])),
+       do: raise(ArgumentError, "terminal prewrite evidence is not a qualified refusal")
 
     encoded = JSON.encode!(normalized)
 

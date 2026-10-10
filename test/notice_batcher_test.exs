@@ -168,8 +168,9 @@ defmodule Tightbeam.NoticeBatcherTest do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 29)
   end
 
-  test "failure of the second capped turn rolls back every chunk before exact retry", %{tmp_dir: tmp} do
+  test "failure of the second capped turn rolls back every chunk before exact retry", %{
+    tmp_dir: tmp
+  } do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 30)
   end
-
 end

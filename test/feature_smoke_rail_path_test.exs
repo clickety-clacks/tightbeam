@@ -258,9 +258,13 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
         assert Tightbeam.Wakes.get(ctx.db, source_id).state == "fired"
 
         assert {:ok, [[1]]} =
-                 DB.query(ctx.db, "SELECT COUNT(*) FROM notice_batch_members WHERE sourceWakeId=?1", [
-                   source_id
-                 ])
+                 DB.query(
+                   ctx.db,
+                   "SELECT COUNT(*) FROM notice_batch_members WHERE sourceWakeId=?1",
+                   [
+                     source_id
+                   ]
+                 )
 
         assert {:ok, [[0]]} =
                  DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [source_id])

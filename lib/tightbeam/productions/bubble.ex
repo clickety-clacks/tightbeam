@@ -284,23 +284,42 @@ defmodule Tightbeam.Productions.Bubble do
   def assert_retry_disposer_in_txn!(%DB.Txn{} = txn, source, target \\ nil) do
     %{session_key: recipient} = Wakes.get_in_txn(txn, source)
     root = NoticeAuthority.candidate_root(txn, source)
+
     if root != source do
       case resolved_bubble_source(txn, source, recipient) do
         {:ok, cause_seq, ^recipient} ->
           unless DB.Txn.q(txn, "SELECT 1 FROM turns WHERE seq=?1", [cause_seq]) == [[1]],
-            do: raise(DB.Error, message: "notice_retry_authority_refused: bubble cause unavailable")
-          unless target in [nil, recipient] and DB.Txn.q(txn,
-               "SELECT 1 FROM sessions WHERE sessionKey=?1 AND state='active'", [recipient]) == [[1]],
-            do: raise(DB.Error, message: "notice_retry_authority_refused: bubble recipient changed")
+            do:
+              raise(DB.Error, message: "notice_retry_authority_refused: bubble cause unavailable")
+
+          unless target in [nil, recipient] and
+                   DB.Txn.q(
+                     txn,
+                     "SELECT 1 FROM sessions WHERE sessionKey=?1 AND state='active'",
+                     [recipient]
+                   ) == [[1]],
+                 do:
+                   raise(DB.Error,
+                     message: "notice_retry_authority_refused: bubble recipient changed"
+                   )
+
           Assignments.decision_conditions_for_delivery_in_txn(txn, cause_seq)
           |> Enum.each(fn [assignment, _decision, state, disposer] ->
             unless state == "standing" and disposer == "session:" <> recipient and
-                 DB.Txn.q(txn, "SELECT 1 FROM assignments WHERE id=?1 AND state='open'", [assignment]) == [[1]],
-              do: raise(DB.Error, message: "notice_retry_authority_refused: bubble disposer changed")
+                     DB.Txn.q(txn, "SELECT 1 FROM assignments WHERE id=?1 AND state='open'", [
+                       assignment
+                     ]) == [[1]],
+                   do:
+                     raise(DB.Error,
+                       message: "notice_retry_authority_refused: bubble disposer changed"
+                     )
           end)
-        _ -> :ok
+
+        _ ->
+          :ok
       end
     end
+
     :ok
   end
 
@@ -316,7 +335,12 @@ defmodule Tightbeam.Productions.Bubble do
         Enum.each(decision_wakes, fn [assignment_id, decision_wake_id, state, _disposer] ->
           if state == "standing" do
             Assignments.transfer_cannot_proceed_disposer_to_session_in_txn(
-              txn, assignment_id, recipient, cause_seq, decision_wake_id)
+              txn,
+              assignment_id,
+              recipient,
+              cause_seq,
+              decision_wake_id
+            )
           end
         end)
 
@@ -425,11 +449,14 @@ defmodule Tightbeam.Productions.Bubble do
 
   defp resolved_bubble_source(db, source, recipient) do
     candidate = NoticeAuthority.candidate_root(db, source)
+
     case bubble_source(candidate, recipient) do
       {:ok, _cause, ^recipient} ->
         %{root_wake_id: root} = NoticeAuthority.for_delivery!(db, source)
         bubble_source(root, recipient)
-      _ -> :error
+
+      _ ->
+        :error
     end
   end
 

@@ -12,30 +12,47 @@ defmodule Tightbeam.Acp.RequestCapacityTest do
     # An explicitly configured transport limit is still enforced before writing.
     assert {:error, {:transport_capacity_exceeded, actual, limit}} =
              Conn.request_frame(7, "session/prompt", params, byte_size(frame) - 1, "claude")
+
     assert actual == byte_size(frame)
     assert limit == actual - 1
   end
 
   test "actual submission prewrite checks combined Codex text and retains unresolved requests" do
     limit = Tightbeam.SubmissionSize.codex_text_limit()
-    params = %{sessionId: "s", prompt: [
-      %{type: "text", text: String.duplicate("🙂", limit - 1)},
-      %{type: "text", text: "e\u0301"}]}
+
+    params = %{
+      sessionId: "s",
+      prompt: [
+        %{type: "text", text: String.duplicate("🙂", limit - 1)},
+        %{type: "text", text: "e\u0301"}
+      ]
+    }
+
     reason = {:submission_text_limit_exceeded, limit + 1, limit}
     assert {:error, ^reason} = Conn.request_frame(7, "session/prompt", params, nil, "codex")
     unresolved = %{method: "session/prompt", prompt_session_id: "other", orphaned: true}
     state = %Conn{port: nil, next_id: 7, pending: %{6 => unresolved}}
     ref = make_ref()
+
     assert {:reply, {:error, {:acp_request_not_dispatched, ^reason}}, ^state} =
-      Conn.handle_call({:request, "session/prompt", params,
-        [submission_harness: "codex", notify_dispatched: {self(), ref}]},
-        {self(), make_ref()}, state)
+             Conn.handle_call(
+               {:request, "session/prompt", params,
+                [submission_harness: "codex", notify_dispatched: {self(), ref}]},
+               {self(), make_ref()},
+               state
+             )
+
     assert_receive {:acp_request_not_dispatched, ^ref, ^reason}
     refute_receive {:acp_request_dispatched, ^ref, _}
     assert state.pending[6] == unresolved
     assert state.next_id == 7
-    evidence = Tightbeam.NoticeSubmission.prewrite_evidence(:prompt,
-      {:acp_request_not_dispatched, reason})
+
+    evidence =
+      Tightbeam.NoticeSubmission.prewrite_evidence(
+        :prompt,
+        {:acp_request_not_dispatched, reason}
+      )
+
     assert Tightbeam.NoticeSubmission.valid_evidence?(evidence)
     refute Tightbeam.NoticeSubmission.valid_evidence?(Map.put(evidence, "invented", true))
   end
@@ -45,8 +62,10 @@ defmodule Tightbeam.Acp.RequestCapacityTest do
     params = %{sessionId: "s", prompt: [%{type: "text", text: String.duplicate("🙂", limit)}]}
     assert {:ok, frame} = Conn.request_frame(7, "session/prompt", params, nil, "codex")
     assert byte_size(frame) > limit * 4
+
     assert {:error, {:transport_capacity_exceeded, actual, 1}} =
-      Conn.request_frame(7, "session/prompt", params, 1, "codex")
+             Conn.request_frame(7, "session/prompt", params, 1, "codex")
+
     assert actual == byte_size(frame)
   end
 

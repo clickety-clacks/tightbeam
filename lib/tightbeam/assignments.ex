@@ -740,24 +740,38 @@ defmodule Tightbeam.Assignments do
   @doc false
   def assert_retry_decision_in_txn!(%Txn{} = txn, wake_id, target \\ nil) do
     root = Tightbeam.NoticeAuthority.candidate_root(txn, wake_id)
-    if root != wake_id and Txn.q(txn,
-         "SELECT 1 FROM assignment_cannot_proceed WHERE decisionWakeId=?1", [root]) != [] do
+
+    if root != wake_id and
+         Txn.q(txn, "SELECT 1 FROM assignment_cannot_proceed WHERE decisionWakeId=?1", [root]) !=
+           [] do
       authority = Tightbeam.NoticeAuthority.for_delivery!(txn, wake_id)
-      rows = Txn.q(txn, """
-      SELECT cp.state,a.state,cp.disposerRef,w.sessionKey,s.ownerUserId,s.state
-      FROM assignment_cannot_proceed cp LEFT JOIN assignments a ON a.id=cp.assignmentId
-      LEFT JOIN wakes w ON w.wakeId=?2 AND w.assignmentId=a.id
-      LEFT JOIN sessions s ON s.sessionKey=w.sessionKey
-      WHERE cp.decisionWakeId=?1
-      """, [authority.root_wake_id, wake_id])
+
+      rows =
+        Txn.q(
+          txn,
+          """
+          SELECT cp.state,a.state,cp.disposerRef,w.sessionKey,s.ownerUserId,s.state
+          FROM assignment_cannot_proceed cp LEFT JOIN assignments a ON a.id=cp.assignmentId
+          LEFT JOIN wakes w ON w.wakeId=?2 AND w.assignmentId=a.id
+          LEFT JOIN sessions s ON s.sessionKey=w.sessionKey
+          WHERE cp.decisionWakeId=?1
+          """,
+          [authority.root_wake_id, wake_id]
+        )
+
       Enum.each(rows, fn [state, assignment_state, disposer, recipient, owner, session_state] ->
         unless state == "standing" and assignment_state == "open" and session_state == "active" and
-             is_binary(recipient) and is_binary(owner) and
-             target in [nil, recipient] and (disposer == "session:" <> recipient or
-               (disposer == "user:" <> owner and recipient == Org.personal_session_key(owner))),
-          do: raise(DB.Error, message: "notice_retry_authority_refused: decision disposer changed")
+                 is_binary(recipient) and is_binary(owner) and
+                 target in [nil, recipient] and
+                 (disposer == "session:" <> recipient or
+                    (disposer == "user:" <> owner and recipient == Org.personal_session_key(owner))),
+               do:
+                 raise(DB.Error,
+                   message: "notice_retry_authority_refused: decision disposer changed"
+                 )
       end)
     end
+
     :ok
   end
 
@@ -765,18 +779,29 @@ defmodule Tightbeam.Assignments do
   # anchored to its authored root; no disposition or audit row is rewritten.
   @doc false
   def decision_conditions_for_delivery_in_txn(%Txn{} = txn, turn_seq) do
-    Txn.q(txn, """
-    SELECT d.sourceWakeId FROM (#{Tightbeam.NoticeBatcher.source_deliveries_sql()}) d
-    JOIN wakes w ON w.wakeId=d.sourceWakeId JOIN turns t ON t.seq=d.turnSeq
-    WHERE d.turnSeq=?1 AND w.sessionKey=t.sessionKey
-    """, [turn_seq])
+    Txn.q(
+      txn,
+      """
+      SELECT d.sourceWakeId FROM (#{Tightbeam.NoticeBatcher.source_deliveries_sql()}) d
+      JOIN wakes w ON w.wakeId=d.sourceWakeId JOIN turns t ON t.seq=d.turnSeq
+      WHERE d.turnSeq=?1 AND w.sessionKey=t.sessionKey
+      """,
+      [turn_seq]
+    )
     |> Enum.flat_map(fn [source] ->
       %{root_wake_id: candidate} = Tightbeam.NoticeAuthority.for_delivery!(txn, source)
-      rows = Txn.q(txn, """
-      SELECT cp.assignmentId,cp.decisionWakeId,cp.state,cp.disposerRef
-      FROM assignment_cannot_proceed cp JOIN wakes w ON w.wakeId=cp.decisionWakeId
-      WHERE cp.decisionWakeId=?1 AND w.assignmentId=cp.assignmentId
-      """, [candidate])
+
+      rows =
+        Txn.q(
+          txn,
+          """
+          SELECT cp.assignmentId,cp.decisionWakeId,cp.state,cp.disposerRef
+          FROM assignment_cannot_proceed cp JOIN wakes w ON w.wakeId=cp.decisionWakeId
+          WHERE cp.decisionWakeId=?1 AND w.assignmentId=cp.assignmentId
+          """,
+          [candidate]
+        )
+
       rows
     end)
     |> Enum.uniq()
@@ -820,6 +845,7 @@ defmodule Tightbeam.Assignments do
           )
 
         wake_id = Tightbeam.NoticeAuthority.current!(txn, wake_id)
+
         case Txn.q(txn, "SELECT state FROM wakes WHERE wakeId=?1", [wake_id]) do
           [["pending"]] ->
             trigger = liveness_trigger!(txn, {:assignment, assignment_id})
@@ -901,7 +927,9 @@ defmodule Tightbeam.Assignments do
         decision_wake_id
       )
       when is_binary(assignment_id) and is_binary(session_key) and is_binary(decision_wake_id) do
-    %{root_wake_id: decision_wake_id} = Tightbeam.NoticeAuthority.for_delivery!(txn, decision_wake_id)
+    %{root_wake_id: decision_wake_id} =
+      Tightbeam.NoticeAuthority.for_delivery!(txn, decision_wake_id)
+
     disposer_ref = "session:" <> session_key
 
     Txn.q(
@@ -3220,6 +3248,7 @@ defmodule Tightbeam.Assignments do
           )
 
         wake_id = Tightbeam.NoticeAuthority.current!(txn, wake_id)
+
         case Txn.q(txn, "SELECT state FROM wakes WHERE wakeId=?1", [wake_id]) do
           [["pending"]] ->
             true =

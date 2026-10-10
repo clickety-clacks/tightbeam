@@ -106,7 +106,13 @@ defmodule Tightbeam.Productions.BubbleTest do
     seq
   end
 
-  defp cannot_proceed_assignment!(ctx, holder_session, opener_session, subject, extra_params \\ %{}) do
+  defp cannot_proceed_assignment!(
+         ctx,
+         holder_session,
+         opener_session,
+         subject,
+         extra_params \\ %{}
+       ) do
     assignment =
       Assignments.__handle__(ctx.db, "assign", %{
         verb: "assign",
@@ -125,24 +131,37 @@ defmodule Tightbeam.Productions.BubbleTest do
         origin: "agent:#{holder_session}",
         principal: {:session, holder_session},
         session_key: nil,
-        params: Map.merge(%{
-          assignment_id: assignment.id,
-          kind: "cannot-proceed",
-          note: "the opener must decide"
-        }, extra_params)
+        params:
+          Map.merge(
+            %{
+              assignment_id: assignment.id,
+              kind: "cannot-proceed",
+              note: "the opener must decide"
+            },
+            extra_params
+          )
       })
 
     {assignment.id, blocked}
   end
 
   defp prewrite_restore!(db, turn, expected_finish \\ true) do
-    evidence = Tightbeam.NoticeSubmission.prewrite_evidence(:prompt,
-      {:acp_request_not_dispatched, {:transport_capacity_exceeded, 201, 200}})
-    assert {:ok, successors} = DB.transaction(db, fn txn ->
-      assert Ledger.finish_in_txn(txn, turn.seq, "failed", "local prewrite refusal",
-        owner_lease: turn.owner_lease, prewrite_evidence: evidence) == expected_finish
-      Tightbeam.NoticeSubmission.restore_in_txn(txn, turn, evidence)
-    end)
+    evidence =
+      Tightbeam.NoticeSubmission.prewrite_evidence(
+        :prompt,
+        {:acp_request_not_dispatched, {:transport_capacity_exceeded, 201, 200}}
+      )
+
+    assert {:ok, successors} =
+             DB.transaction(db, fn txn ->
+               assert Ledger.finish_in_txn(txn, turn.seq, "failed", "local prewrite refusal",
+                        owner_lease: turn.owner_lease,
+                        prewrite_evidence: evidence
+                      ) == expected_finish
+
+               Tightbeam.NoticeSubmission.restore_in_txn(txn, turn, evidence)
+             end)
+
     successors
   end
 
@@ -804,82 +823,182 @@ defmodule Tightbeam.Productions.BubbleTest do
 
   test "a restored decision retains root authority and release cancels its current leaf", ctx do
     busy = hold_recipient!(ctx.db, ctx.supervisor.session_key)
-    {assignment, blocked} = cannot_proceed_assignment!(ctx, ctx.holder.session_key,
-      ctx.supervisor.session_key, "retry-root decision", %{
-        release_fact_kind: "reviewed", release_fact_scope: "retry-decision-release",
-        release_fact_principal_ref: "process:tightbeam"})
+
+    {assignment, blocked} =
+      cannot_proceed_assignment!(
+        ctx,
+        ctx.holder.session_key,
+        ctx.supervisor.session_key,
+        "retry-root decision",
+        %{
+          release_fact_kind: "reviewed",
+          release_fact_scope: "retry-decision-release",
+          release_fact_principal_ref: "process:tightbeam"
+        }
+      )
+
     queue_decision_wake!(ctx, blocked.decisionWake)
     finish_busy_recipient!(ctx.db, busy)
     carrier = deliver_decision_carrier!(ctx, ctx.supervisor.session_key)
-    assert {:ok, turn} = Ledger.claim_next(ctx.db, ctx.supervisor.session_key, "prewrite-decision")
+
+    assert {:ok, turn} =
+             Ledger.claim_next(ctx.db, ctx.supervisor.session_key, "prewrite-decision")
+
     assert turn.wake_id == carrier.wake_id
     root = blocked.decisionWake.wake_id
-    {:ok, cp_before} = DB.query(ctx.db, "SELECT * FROM assignment_cannot_proceed WHERE id=?1", [blocked.cannotProceed.id])
+
+    {:ok, cp_before} =
+      DB.query(ctx.db, "SELECT * FROM assignment_cannot_proceed WHERE id=?1", [
+        blocked.cannotProceed.id
+      ])
+
     successors = prewrite_restore!(ctx.db, turn)
     leaf = Tightbeam.NoticeAuthority.current!(ctx.db, root)
     assert leaf in successors
     assert leaf != root
-    assert Tightbeam.NoticeAuthority.resolve!(ctx.db, leaf) == %{root_wake_id: root, root_turn_seq: turn.seq}
-    assert {:ok, ^cp_before} = DB.query(ctx.db, "SELECT * FROM assignment_cannot_proceed WHERE id=?1", [blocked.cannotProceed.id])
+
+    assert Tightbeam.NoticeAuthority.resolve!(ctx.db, leaf) == %{
+             root_wake_id: root,
+             root_turn_seq: turn.seq
+           }
+
+    assert {:ok, ^cp_before} =
+             DB.query(ctx.db, "SELECT * FROM assignment_cannot_proceed WHERE id=?1", [
+               blocked.cannotProceed.id
+             ])
+
     assert :ok = Bubble.recognize_terminal(ctx.db, turn.seq)
-    assert {:ok, [[0]]} = DB.query(ctx.db,
-      "SELECT count(*) FROM wakes WHERE wakeId LIKE ?1", ["bubble:#{turn.seq}:%"])
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT count(*) FROM wakes WHERE wakeId LIKE ?1", [
+               "bubble:#{turn.seq}:%"
+             ])
+
     # A later, legitimate disposer change cannot be overridden by stale retry
     # admission. Release still acts on the immutable decision root's live leaf.
-    assert {:ok, :ok} = DB.transaction(ctx.db, fn txn ->
-      Assignments.transfer_cannot_proceed_disposer_to_session_in_txn(
-        txn, assignment, ctx.holder.session_key, turn.seq, root)
-    end)
-    assert {:error, error} = DB.transaction(ctx.db,
-      &Assignments.assert_retry_decision_in_txn!(&1, leaf, ctx.supervisor.session_key))
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               Assignments.transfer_cannot_proceed_disposer_to_session_in_txn(
+                 txn,
+                 assignment,
+                 ctx.holder.session_key,
+                 turn.seq,
+                 root
+               )
+             end)
+
+    assert {:error, error} =
+             DB.transaction(
+               ctx.db,
+               &Assignments.assert_retry_decision_in_txn!(&1, leaf, ctx.supervisor.session_key)
+             )
+
     assert Exception.message(error) =~ "decision disposer changed"
     assert Tightbeam.Wakes.get(ctx.db, leaf).state == "pending"
-    assert {:ok, %{fact_id: _}} = DB.transaction(ctx.db, fn txn ->
-      ConditionFacts.file_in_txn(txn, %{kind: "reviewed", scope: "retry-decision-release",
-        origin: "process:tightbeam", owner_user_id: "flynn"})
-    end)
+
+    assert {:ok, %{fact_id: _}} =
+             DB.transaction(ctx.db, fn txn ->
+               ConditionFacts.file_in_txn(txn, %{
+                 kind: "reviewed",
+                 scope: "retry-decision-release",
+                 origin: "process:tightbeam",
+                 owner_user_id: "flynn"
+               })
+             end)
+
     assert Tightbeam.Wakes.get(ctx.db, root).state == "fired"
     assert Tightbeam.Wakes.get(ctx.db, leaf).state == "canceled"
-    assert {:ok, [[^root, "settled"]]} = DB.query(ctx.db,
-      "SELECT decisionWakeId,state FROM assignment_cannot_proceed WHERE id=?1", [blocked.cannotProceed.id])
+
+    assert {:ok, [[^root, "settled"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT decisionWakeId,state FROM assignment_cannot_proceed WHERE id=?1",
+               [blocked.cannotProceed.id]
+             )
+
     assert prewrite_restore!(ctx.db, turn, false) == successors
     assert Tightbeam.Wakes.get(ctx.db, leaf).state == "canceled"
-    assert {:ok, [[1]]} = DB.query(ctx.db,
-      "SELECT count(*) FROM wake_cancellations WHERE wakeId=?1 AND reasonKind='cannot_proceed_released'", [leaf])
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM wake_cancellations WHERE wakeId=?1 AND reasonKind='cannot_proceed_released'",
+               [leaf]
+             )
   end
 
   test "a prewrite bubble retry preserves transferred disposal and original cause once", ctx do
     busy = hold_recipient!(ctx.db, ctx.supervisor.session_key)
-    {_assignment, blocked} = cannot_proceed_assignment!(ctx, ctx.holder.session_key,
-      ctx.supervisor.session_key, "transferred decision retry")
+
+    {_assignment, blocked} =
+      cannot_proceed_assignment!(
+        ctx,
+        ctx.holder.session_key,
+        ctx.supervisor.session_key,
+        "transferred decision retry"
+      )
+
     queue_decision_wake!(ctx, blocked.decisionWake)
     finish_busy_recipient!(ctx.db, busy)
     _ = deliver_decision_carrier!(ctx, ctx.supervisor.session_key)
-    assert {:ok, decision} = Ledger.claim_next(ctx.db, ctx.supervisor.session_key, "failed-decision")
-    assert :ok = Ledger.finish(ctx.db, decision.seq, "failed", "ordinary failure",
-      owner_lease: decision.owner_lease)
+
+    assert {:ok, decision} =
+             Ledger.claim_next(ctx.db, ctx.supervisor.session_key, "failed-decision")
+
+    assert :ok =
+             Ledger.finish(ctx.db, decision.seq, "failed", "ordinary failure",
+               owner_lease: decision.owner_lease
+             )
+
     assert :ok = Bubble.recognize_terminal(ctx.db, decision.seq)
     _ = deliver_ready_carriers!(ctx, ctx.main.session_key)
     root = "bubble:#{decision.seq}:#{ctx.main.session_key}"
     assert Tightbeam.Wakes.get(ctx.db, root).state == "fired"
     assert {:ok, turn} = Ledger.claim_next(ctx.db, ctx.main.session_key, "prewrite-bubble")
-    {:ok, cp_before} = DB.query(ctx.db, "SELECT * FROM assignment_cannot_proceed WHERE id=?1", [blocked.cannotProceed.id])
+
+    {:ok, cp_before} =
+      DB.query(ctx.db, "SELECT * FROM assignment_cannot_proceed WHERE id=?1", [
+        blocked.cannotProceed.id
+      ])
+
     expected = "session:" <> ctx.main.session_key
-    assert {:ok, [[^expected]]} = DB.query(ctx.db,
-      "SELECT disposerRef FROM assignment_cannot_proceed WHERE id=?1", [blocked.cannotProceed.id])
+
+    assert {:ok, [[^expected]]} =
+             DB.query(ctx.db, "SELECT disposerRef FROM assignment_cannot_proceed WHERE id=?1", [
+               blocked.cannotProceed.id
+             ])
+
     successors = prewrite_restore!(ctx.db, turn)
     retry = Tightbeam.NoticeAuthority.current!(ctx.db, root)
     assert retry in successors
     assert :ok = Bubble.recognize_terminal(ctx.db, turn.seq)
-    assert {:ok, ^cp_before} = DB.query(ctx.db, "SELECT * FROM assignment_cannot_proceed WHERE id=?1", [blocked.cannotProceed.id])
+
+    assert {:ok, ^cp_before} =
+             DB.query(ctx.db, "SELECT * FROM assignment_cannot_proceed WHERE id=?1", [
+               blocked.cannotProceed.id
+             ])
+
     assert prewrite_restore!(ctx.db, turn, false) == successors
     _ = NoticeBatcher.recover(ctx.db, Tightbeam.Wakes.get(ctx.db, retry).due_at)
     assert Tightbeam.Wakes.get(ctx.db, retry).state == "fired"
-    assert {:ok, ^cp_before} = DB.query(ctx.db, "SELECT * FROM assignment_cannot_proceed WHERE id=?1", [blocked.cannotProceed.id])
-    assert {:ok, [[1]]} = DB.query(ctx.db,
-      "SELECT count(*) FROM (#{NoticeBatcher.source_deliveries_sql()}) d WHERE d.sourceWakeId=?1", [retry])
-    assert {:ok, [[0]]} = DB.query(ctx.db,
-      "SELECT count(*) FROM condition_facts WHERE kind='user-alerted'")
+
+    assert {:ok, ^cp_before} =
+             DB.query(ctx.db, "SELECT * FROM assignment_cannot_proceed WHERE id=?1", [
+               blocked.cannotProceed.id
+             ])
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM (#{NoticeBatcher.source_deliveries_sql()}) d WHERE d.sourceWakeId=?1",
+               [retry]
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM condition_facts WHERE kind='user-alerted'"
+             )
   end
 
   test "an ordinary assignment failure does not displace the cannot-proceed opener", ctx do

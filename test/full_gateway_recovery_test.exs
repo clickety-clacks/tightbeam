@@ -110,15 +110,23 @@ defmodule Tightbeam.FullGatewayRecoveryTest do
         after_turns = Enum.map(after_state["turns"], &Map.new(Enum.zip(turn_columns, &1)))
         a_turns = Enum.filter(after_turns, &(&1["sessionKey"] == prior["holderKey"]))
         assert length(a_turns) == 4
+
         assert [successor_carrier_id] =
                  Map.fetch!(after_state["notice_source_refs"], "w_recovery_successor_a")
+
         assert successor_carrier_id != carrier_wake_id
 
         # The three recovery turns remain exact: the interrupted direct turn,
         # the queued successor's actual carrier, and the direct health replay.
         recovery_turns = Enum.reject(a_turns, &(&1["wakeId"] == carrier_wake_id))
+
         assert Enum.map(recovery_turns, &{&1["wakeId"], &1["status"]}) ==
-                 [{nil, "failed_unknown"}, {successor_carrier_id, "delivered"}, {nil, "delivered"}]
+                 [
+                   {nil, "failed_unknown"},
+                   {successor_carrier_id, "delivered"},
+                   {nil, "delivered"}
+                 ]
+
         assert Enum.count(a_turns, &is_nil(&1["wakeId"])) == 2
         [interrupted, successor, replay] = recovery_turns
         assert interrupted["messageId"] == replay["messageId"]

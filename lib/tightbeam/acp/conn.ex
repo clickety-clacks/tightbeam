@@ -198,8 +198,13 @@ defmodule Tightbeam.Acp.Conn do
       true ->
         id = state.next_id
 
-        case request_frame(id, method, params, Keyword.get(opts, :max_request_bytes),
-               Keyword.get(opts, :submission_harness)) do
+        case request_frame(
+               id,
+               method,
+               params,
+               Keyword.get(opts, :max_request_bytes),
+               Keyword.get(opts, :submission_harness)
+             ) do
           {:error, reason} ->
             notify_not_dispatched(opts, reason)
             {:reply, {:error, {:acp_request_not_dispatched, reason}}, state}
@@ -220,7 +225,8 @@ defmodule Tightbeam.Acp.Conn do
                     max(deadline - System.monotonic_time(:millisecond), 0)
                   )
                 else
-                  if timeout != :infinity, do: Process.send_after(self(), {:req_timeout, id}, timeout)
+                  if timeout != :infinity,
+                    do: Process.send_after(self(), {:req_timeout, id}, timeout)
                 end
 
               entry = %{

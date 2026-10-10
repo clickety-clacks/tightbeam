@@ -775,16 +775,17 @@ defmodule Tightbeam.NoticeBatcher do
     plan =
       case receiver do
         "codex" ->
-          SubmissionSize.pack_codex(pairs, fn {_, row} -> render_member(row) end,
-            fn {first, _}, count ->
-              cause = release_cause(boundary, first)
-              # UUIDs, SHA256 values and token identifiers have fixed scalar
-              # widths. Use the real renderer with an empty body to measure
-              # every header/footer character, then add inter-member newlines.
-              overhead = envelope_body("nb_00000000-0000-0000-0000-000000000000", cause, count, "")
-              SubmissionSize.text_chars("[from process:tightbeam]\n\n" <> overhead) +
-                2 * (count - 1)
-            end)
+          SubmissionSize.pack_codex(pairs, fn {_, row} -> render_member(row) end, fn {first, _},
+                                                                                     count ->
+            cause = release_cause(boundary, first)
+            # UUIDs, SHA256 values and token identifiers have fixed scalar
+            # widths. Use the real renderer with an empty body to measure
+            # every header/footer character, then add inter-member newlines.
+            overhead = envelope_body("nb_00000000-0000-0000-0000-000000000000", cause, count, "")
+
+            SubmissionSize.text_chars("[from process:tightbeam]\n\n" <> overhead) +
+              2 * (count - 1)
+          end)
 
         _ ->
           # The pinned Claude ACP/SDK exposes no evidenced fixed ACP text
@@ -797,15 +798,22 @@ defmodule Tightbeam.NoticeBatcher do
       {:ok, chunks} ->
         # Every chunk belongs to this one locked eligibility snapshot. Failure
         # of any admission rolls all chunks back; later arrivals remain editable.
-        deliveries = Enum.map(chunks, fn chunk ->
-          {chunk_sources, chunk_rows} = Enum.unzip(chunk)
-          admit_session_chunk_in_txn(txn, target, chunk_sources, chunk_rows, at, delivery_opts)
-        end)
+        deliveries =
+          Enum.map(chunks, fn chunk ->
+            {chunk_sources, chunk_rows} = Enum.unzip(chunk)
+            admit_session_chunk_in_txn(txn, target, chunk_sources, chunk_rows, at, delivery_opts)
+          end)
+
         {:deliveries, deliveries}
 
       {:error, {:source_submission_too_large, {source, _}, chars, limit}} ->
-        EventLog.lifecycle_in_txn(txn, "notice_source_submission_too_large", source.wake_id,
-          "receiver=#{receiver} textChars=#{chars} limitChars=#{limit} recipient=#{target}")
+        EventLog.lifecycle_in_txn(
+          txn,
+          "notice_source_submission_too_large",
+          source.wake_id,
+          "receiver=#{receiver} textChars=#{chars} limitChars=#{limit} recipient=#{target}"
+        )
+
         {:submission_size_refused, target}
     end
   end
@@ -961,6 +969,7 @@ defmodule Tightbeam.NoticeBatcher do
     else
       :ok = Tightbeam.Assignments.assert_retry_decision_in_txn!(txn, wake_id)
       :ok = Tightbeam.Productions.Bubble.assert_retry_disposer_in_txn!(txn, wake_id)
+
       case Supervision.prepare_batch_source_in_txn(txn, wake_id) do
         :stale -> false
         :ready -> prepare_due_source_after_suppression_in_txn(txn, wake_id)

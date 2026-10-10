@@ -546,8 +546,10 @@ defmodule Tightbeam.JobForensicsTest do
 
     assert actual_prompt =~ fire_first.prompt
     assert actual_prompt =~ fire_first.wake_id
+
     assert {:ok, [[0]]} =
              DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [fire_first.wake_id])
+
     assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM turns")
 
     assert %{canceled: false} =

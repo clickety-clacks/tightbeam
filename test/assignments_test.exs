@@ -5084,6 +5084,7 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert carrier_prompt =~ wake.prompt
     assert carrier_prompt =~ wake.wake_id
+
     assert {:ok, [[0]]} =
              DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [wake.wake_id])
 
@@ -7144,8 +7145,10 @@ defmodule Tightbeam.AssignmentsTest do
         ExUnit.CaptureLog.capture_log([level: :warning], fn ->
           assert :ok = Wakes.fire_due(scheduler)
         end)
+
       assert log == "" or log =~ notice.wake_id,
              "unattributed recognition diagnostic for #{notice.wake_id}: #{log}"
+
       assert Process.whereis(scheduler) == scheduler_pid
       assert Wakes.get(ctx.db, slate_id) == held_slate
       assert_incomplete_notice(ctx.db, assignment.id, Wakes.get(ctx.db, notice.wake_id))

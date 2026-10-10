@@ -687,6 +687,7 @@ defmodule Tightbeam.SessionLane do
       end
 
     terminal_opts = [owner_lease: state.current_owner_lease]
+
     terminal_opts =
       if prewrite_evidence,
         do: Keyword.put(terminal_opts, :prewrite_evidence, prewrite_evidence),
@@ -810,8 +811,16 @@ defmodule Tightbeam.SessionLane do
 
         case fallback do
           {:ok, {won, recorded}} ->
-            finish_result(state, seq, terminal, error, publish,
-              if(prewrite_evidence, do: after_commit, else: nil), won, recorded)
+            finish_result(
+              state,
+              seq,
+              terminal,
+              error,
+              publish,
+              if(prewrite_evidence, do: after_commit, else: nil),
+              won,
+              recorded
+            )
 
           {:error, fallback_reason} ->
             EventLog.lifecycle(
