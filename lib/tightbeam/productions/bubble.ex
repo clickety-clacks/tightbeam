@@ -37,9 +37,12 @@ defmodule Tightbeam.Productions.Bubble do
     EventLog,
     Gateway,
     HarnessHealth,
+    NoticeAuthority,
+    NoticeBatcher,
     Org,
     Projection,
-    Supervision
+    Supervision,
+    Wakes
   }
 
   alias Tightbeam.Wire.Payloads
@@ -62,9 +65,13 @@ defmodule Tightbeam.Productions.Bubble do
   def recognize_terminal(db, seq) do
     Tightbeam.Wakes.report_failed_delivery(db, seq)
 
-    case turn_context(db, seq) do
-      %{status: status} = turn -> recognize(db, seq, status, turn)
-      nil -> :ok
+    if NoticeAuthority.restored_turn?(db, seq) do
+      :ok
+    else
+      case turn_context(db, seq) do
+        %{status: status} = turn -> recognize(db, seq, status, turn)
+        nil -> :ok
+      end
     end
   end
 
@@ -229,16 +236,16 @@ defmodule Tightbeam.Productions.Bubble do
                device_id: "process:tightbeam",
                client_message_id: "bubble:#{turn.cause_seq}:#{recipient}",
                wake_id: "bubble:#{turn.cause_seq}:#{recipient}",
-               request_ref: "bubble:#{turn.cause_seq}"
+               request_ref: "bubble:#{turn.cause_seq}",
+               assignment_id: cause.assignment_id
              )
 
-           if match?({:appended, ^recipient, _, _}, delivery) do
-             Assignments.transfer_cannot_proceed_disposer_to_session_in_txn(
+           if match?({:appended, ^recipient, _, _}, delivery) or
+                match?({:staged, _source}, delivery) do
+             transfer_cannot_proceed_disposers_for_cause_in_txn(
                txn,
-               cause.assignment_id,
-               recipient,
                turn.cause_seq,
-               cause.wake_id
+               recipient
              )
            end
 
@@ -254,6 +261,175 @@ defmodule Tightbeam.Productions.Bubble do
 
       {:error, error} ->
         raise error
+    end
+  end
+
+  @doc false
+  def batch_source_delivered_in_txn(%DB.Txn{} = txn, source_wake_id, recipient, _turn_seq)
+      when is_binary(source_wake_id) and is_binary(recipient) do
+    with %{origin: "process:tightbeam", session_key: ^recipient} <-
+           Wakes.get_in_txn(txn, source_wake_id),
+         {:ok, cause_seq, ^recipient} <- resolved_bubble_source(txn, source_wake_id, recipient) do
+      assert_retry_disposer_in_txn!(txn, source_wake_id, recipient)
+      transfer_cannot_proceed_disposers_for_cause_in_txn(txn, cause_seq, recipient)
+    else
+      _ -> :ok
+    end
+  end
+
+  def batch_source_delivered_in_txn(%DB.Txn{}, _source_wake_id, _recipient, _turn_seq),
+    do: :ok
+
+  @doc false
+  def assert_retry_disposer_in_txn!(%DB.Txn{} = txn, source, target \\ nil) do
+    %{session_key: recipient} = Wakes.get_in_txn(txn, source)
+    root = NoticeAuthority.candidate_root(txn, source)
+    if root != source do
+      case resolved_bubble_source(txn, source, recipient) do
+        {:ok, cause_seq, ^recipient} ->
+          unless DB.Txn.q(txn, "SELECT 1 FROM turns WHERE seq=?1", [cause_seq]) == [[1]],
+            do: raise(DB.Error, message: "notice_retry_authority_refused: bubble cause unavailable")
+          unless target in [nil, recipient] and DB.Txn.q(txn,
+               "SELECT 1 FROM sessions WHERE sessionKey=?1 AND state='active'", [recipient]) == [[1]],
+            do: raise(DB.Error, message: "notice_retry_authority_refused: bubble recipient changed")
+          Assignments.decision_conditions_for_delivery_in_txn(txn, cause_seq)
+          |> Enum.each(fn [assignment, _decision, state, disposer] ->
+            unless state == "standing" and disposer == "session:" <> recipient and
+                 DB.Txn.q(txn, "SELECT 1 FROM assignments WHERE id=?1 AND state='open'", [assignment]) == [[1]],
+              do: raise(DB.Error, message: "notice_retry_authority_refused: bubble disposer changed")
+          end)
+        _ -> :ok
+      end
+    end
+    :ok
+  end
+
+  # A failed turn can carry a cannot-proceed decision wake directly, or as one
+  # member of a mixed notice carrier whose assignmentId is nil. Resolve the
+  # decision from the failed turn's durable wake and the batch membership, so
+  # direct delivery and carrier delivery apply the same authority rule.
+  defp transfer_cannot_proceed_disposers_for_cause_in_txn(txn, cause_seq, recipient) do
+    case DB.Txn.q(txn, "SELECT sessionKey,wakeId FROM turns WHERE seq=?1", [cause_seq]) do
+      [[_cause_session, cause_wake_id]] when is_binary(cause_wake_id) ->
+        decision_wakes = Assignments.decision_conditions_for_delivery_in_txn(txn, cause_seq)
+
+        Enum.each(decision_wakes, fn [assignment_id, decision_wake_id, state, _disposer] ->
+          if state == "standing" do
+            Assignments.transfer_cannot_proceed_disposer_to_session_in_txn(
+              txn, assignment_id, recipient, cause_seq, decision_wake_id)
+          end
+        end)
+
+        :ok
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp transfer_cannot_proceed_disposers_to_user_for_cause_in_txn(txn, cause_seq, owner) do
+    cause_assignment_ids =
+      cause_assignment_ids_in_txn(txn, [cause_seq], MapSet.new(), MapSet.new(), 64)
+
+    Enum.each(cause_assignment_ids, fn assignment_id ->
+      Assignments.transfer_cannot_proceed_disposer_to_user_in_txn(
+        txn,
+        assignment_id,
+        owner,
+        cause_seq
+      )
+    end)
+
+    :ok
+  end
+
+  defp cause_assignment_ids_in_txn(_txn, _pending, _seen, assignment_ids, 0),
+    do: assignment_ids
+
+  defp cause_assignment_ids_in_txn(_txn, [], _seen, assignment_ids, _budget),
+    do: assignment_ids
+
+  defp cause_assignment_ids_in_txn(txn, [cause_seq | rest], seen, assignment_ids, budget) do
+    if MapSet.member?(seen, cause_seq) do
+      cause_assignment_ids_in_txn(txn, rest, seen, assignment_ids, budget - 1)
+    else
+      seen = MapSet.put(seen, cause_seq)
+
+      case DB.Txn.q(txn, "SELECT wakeId,assignmentId FROM turns WHERE seq=?1", [cause_seq]) do
+        [[cause_wake_id, turn_assignment_id]] ->
+          source_rows =
+            if is_binary(cause_wake_id) do
+              DB.Txn.q(
+                txn,
+                """
+                WITH source_deliveries AS (#{NoticeBatcher.source_deliveries_sql()})
+                SELECT source.wakeId,source.assignmentId,source.sessionKey
+                FROM source_deliveries d JOIN wakes source ON source.wakeId=d.sourceWakeId
+                WHERE d.turnSeq=?1
+                """,
+                [cause_seq]
+              )
+            else
+              []
+            end
+
+          assignment_ids =
+            Enum.reduce(source_rows, assignment_ids, fn [_wake_id, source_assignment_id, _session],
+                                                        acc ->
+              if is_binary(source_assignment_id),
+                do: MapSet.put(acc, source_assignment_id),
+                else: acc
+            end)
+
+          assignment_ids =
+            if is_binary(turn_assignment_id),
+              do: MapSet.put(assignment_ids, turn_assignment_id),
+              else: assignment_ids
+
+          bubble_causes =
+            Enum.flat_map(source_rows, fn [source_wake_id, _source_assignment_id, source_session] ->
+              case resolved_bubble_source(txn, source_wake_id, source_session) do
+                {:ok, earlier_cause_seq, _recipient} -> [earlier_cause_seq]
+                _ -> []
+              end
+            end)
+
+          cause_assignment_ids_in_txn(
+            txn,
+            rest ++ bubble_causes,
+            seen,
+            assignment_ids,
+            budget - 1
+          )
+
+        _ ->
+          cause_assignment_ids_in_txn(txn, rest, seen, assignment_ids, budget - 1)
+      end
+    end
+  end
+
+  defp bubble_source("bubble:" <> rest, recipient) do
+    case String.split(rest, ":", parts: 2) do
+      [cause, ^recipient] ->
+        case Integer.parse(cause) do
+          {cause_seq, ""} -> {:ok, cause_seq, recipient}
+          _ -> :error
+        end
+
+      _ ->
+        :error
+    end
+  end
+
+  defp bubble_source(_source_wake_id, _recipient), do: :error
+
+  defp resolved_bubble_source(db, source, recipient) do
+    candidate = NoticeAuthority.candidate_root(db, source)
+    case bubble_source(candidate, recipient) do
+      {:ok, _cause, ^recipient} ->
+        %{root_wake_id: root} = NoticeAuthority.for_delivery!(db, source)
+        bubble_source(root, recipient)
+      _ -> :error
     end
   end
 
@@ -327,12 +503,35 @@ defmodule Tightbeam.Productions.Bubble do
   end
 
   defp patrol_coverage(db, request_ref) do
-    {:ok, rows} =
+    {:ok, turn_rows} =
       DB.query(
         db,
         "SELECT sessionKey, status FROM turns WHERE requestRef=?1 ORDER BY seq",
         [request_ref]
       )
+
+    {:ok, source_rows} =
+      DB.query(
+        db,
+        """
+        WITH source_deliveries AS (#{NoticeBatcher.source_deliveries_sql()})
+        SELECT source.sessionKey,
+               CASE
+                 WHEN turn.status IS NOT NULL THEN turn.status
+                 WHEN source.state='pending' THEN 'queued'
+                 ELSE source.state
+               END
+        FROM wakes source
+        LEFT JOIN source_deliveries d ON d.sourceWakeId=source.wakeId
+        LEFT JOIN turns turn ON turn.seq=d.turnSeq
+        WHERE substr(source.wakeId,1,length(?1)+1)=?1 || ':'
+          AND source.state IN ('pending','fired')
+        ORDER BY source.createdAt,source.wakeId
+        """,
+        [request_ref]
+      )
+
+    rows = turn_rows ++ source_rows
 
     cond do
       Enum.any?(rows, fn [_session, status] -> status == "delivered" end) ->
@@ -485,13 +684,11 @@ defmodule Tightbeam.Productions.Bubble do
             "cause_seq=#{turn.cause_seq} session=#{cause.session_key}"
           )
 
-          :ok =
-            Assignments.transfer_cannot_proceed_disposer_to_user_in_txn(
-              txn,
-              cause.assignment_id,
-              turn.owner,
-              turn.cause_seq
-            )
+          transfer_cannot_proceed_disposers_to_user_for_cause_in_txn(
+            txn,
+            turn.cause_seq,
+            turn.owner
+          )
 
           fact =
             ConditionFacts.file_in_txn(txn, %{
@@ -569,7 +766,7 @@ defmodule Tightbeam.Productions.Bubble do
       DB.query(
         db,
         """
-        SELECT t.sessionKey, t.requestRef, s.ownerUserId, t.status, s.harness, s.host
+        SELECT t.sessionKey, t.requestRef, s.ownerUserId, t.status, s.harness, s.host, t.wakeId
         FROM turns AS t JOIN sessions AS s ON s.sessionKey = t.sessionKey
         WHERE t.seq = ?1
         """,
@@ -577,7 +774,9 @@ defmodule Tightbeam.Productions.Bubble do
       )
 
     case rows do
-      [[session_key, request_ref, owner, status, current_harness, current_host]] ->
+      [[session_key, request_ref, owner, status, current_harness, current_host, wake_id]] ->
+        request_ref = request_ref || carrier_request_ref(db, wake_id)
+
         case parse_cause_seq(request_ref, seq) do
           :malformed ->
             Logger.error(
@@ -684,12 +883,63 @@ defmodule Tightbeam.Productions.Bubble do
            harness: harness,
            host: host,
            assignment_id: assignment_id,
-           wake_id: wake_id
+           wake_id: wake_id,
+           source_wake_ids: carrier_source_wake_ids(db, wake_id)
          }}
 
       [] ->
         :missing
     end
+  end
+
+  defp carrier_request_ref(_db, nil), do: nil
+
+  defp carrier_request_ref(db, wake_id) when is_binary(wake_id) do
+    case DB.query(
+           db,
+           """
+           WITH source_deliveries AS (#{NoticeBatcher.source_deliveries_sql()})
+           SELECT source.sessionKey,source.wakeId
+           FROM source_deliveries d JOIN wakes source ON source.wakeId=d.sourceWakeId
+           JOIN turns turn ON turn.seq=d.turnSeq
+           WHERE turn.wakeId=?1 AND d.carrier=1 ORDER BY d.publicationSeq
+           """,
+           [wake_id]
+         ) do
+      {:ok, rows} ->
+        Enum.find_value(rows, fn [source_session, source_wake_id] ->
+          case resolved_bubble_source(db, source_wake_id, source_session) do
+            {:ok, cause_seq, ^source_session} -> "bubble:#{cause_seq}"
+            _ -> nil
+          end
+        end)
+
+      _ ->
+        nil
+    end
+  end
+
+  defp carrier_source_wake_ids(_db, nil), do: []
+
+  defp carrier_source_wake_ids(db, wake_id) when is_binary(wake_id) do
+    case DB.query(
+           db,
+           """
+           WITH source_deliveries AS (#{NoticeBatcher.source_deliveries_sql()})
+           SELECT d.sourceWakeId
+           FROM source_deliveries d JOIN turns turn ON turn.seq=d.turnSeq
+           WHERE turn.wakeId=?1 AND d.carrier=1 ORDER BY d.publicationSeq
+           """,
+           [wake_id]
+         ) do
+      {:ok, rows} -> Enum.map(rows, fn [source_wake_id] -> source_wake_id end)
+      _ -> []
+    end
+  end
+
+  defp carried_wake(%{wake_id: wake_id, source_wake_ids: [_ | _] = source_wake_ids})
+       when is_binary(wake_id) do
+    " carrying delivery wake #{wake_id} for source wake(s) #{Enum.join(source_wake_ids, ", ")}"
   end
 
   defp carried_wake(%{wake_id: wake_id}) when is_binary(wake_id), do: " carrying wake #{wake_id}"

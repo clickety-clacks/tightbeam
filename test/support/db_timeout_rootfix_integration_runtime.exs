@@ -9,7 +9,7 @@ Application.put_env(:tightbeam, :autostart, false)
 Application.put_env(:tightbeam, :base_dir, base)
 Application.put_env(:ex_unit, :assert_receive_timeout, 1_000)
 
-alias Tightbeam.{Boot, DB, Ledger, Model, ModelCatalog, Org, SessionLane, Wakes}
+alias Tightbeam.{Boot, DB, Ledger, Model, ModelCatalog, NoticeBatcher, Org, SessionLane, Wakes}
 import ExUnit.Assertions
 
 {:ok, db} =
@@ -48,13 +48,18 @@ catalog_before = ModelCatalog.get(catalog)
 true = is_map(catalog_before)
 
 parent = self()
+{:ok, conn_registry} = Tightbeam.ConnRegistry.start_link(name: :rootfix_conn_registry)
+
+{:ok, delivery_lane} =
+  Tightbeam.NoticeBatcherFixture.LaneStub.start_link(:rootfix_delivery_lane)
 
 {:ok, scheduler} =
   Wakes.start_link(
     db: db,
     name: :rootfix_wake_scheduler,
     tick_ms: 60_000,
-    deliver: fn wake -> send(parent, {:wake_delivered, wake.wake_id}) end
+    delivery_opts: [conn_registry: conn_registry, lane_manager: delivery_lane],
+    deliver: fn _wake -> flunk("normal wake must commit its actual recipient turn") end
   )
 
 wake =
@@ -145,12 +150,39 @@ assert {:ok, inventories} = catalog_before_release
 assert is_map(inventories)
 assert :ignore = boot_before_release
 
-assert_receive {:wake_delivered, ^wake_id}
+assert [%{delivery_wake_id: carrier_wake_id, member_state: "included", batch_state: "delivered"}] =
+         NoticeBatcher.source_refs(db, wake_id)
+
+assert carrier_wake_id != wake_id
+assert Wakes.get(db, wake_id).state == "fired"
+assert Wakes.get(db, wake_id).prompt == wake.prompt
+assert Wakes.get(db, carrier_wake_id).state == "fired"
+
+assert {:ok, [["wake-rootfix", "queued", content]]} =
+         DB.query(
+           db,
+           "SELECT t.sessionKey,t.status,m.content FROM turns t JOIN messages m ON m.id=t.messageId WHERE t.wakeId=?1",
+           [carrier_wake_id]
+         )
+
+assert content =~ wake.prompt
+assert content =~ wake_id
+
+assert {:ok, [[1]]} =
+         DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [carrier_wake_id])
+
+assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [wake_id])
+assert {:ok, before_turns} = DB.query(db, "SELECT * FROM turns ORDER BY seq")
+assert {:ok, before_messages} = DB.query(db, "SELECT * FROM messages ORDER BY seq")
+assert :ok = Wakes.fire_due(scheduler)
+assert {:ok, ^before_turns} = DB.query(db, "SELECT * FROM turns ORDER BY seq")
+assert {:ok, ^before_messages} = DB.query(db, "SELECT * FROM messages ORDER BY seq")
 
 send(publication_pid, :release_publication)
 assert {:ok, :published} = Task.await(publication)
 
 assert Wakes.get(db, wake.wake_id).state == "fired"
+assert Wakes.get(db, carrier_wake_id).state == "fired"
 assert {:ok, [["delivered"]]} = DB.query(db, "SELECT status FROM turns WHERE seq=?1", [lane_seq])
 assert Process.alive?(catalog)
 assert Process.alive?(scheduler)
@@ -158,6 +190,8 @@ assert Process.alive?(lane)
 assert :ok = GenServer.stop(lane)
 assert :ok = GenServer.stop(catalog)
 assert :ok = GenServer.stop(scheduler)
+assert :ok = GenServer.stop(delivery_lane)
+assert :ok = GenServer.stop(conn_registry)
 assert :ok = GenServer.stop(task_sup)
 assert :ok = GenServer.stop(db)
 

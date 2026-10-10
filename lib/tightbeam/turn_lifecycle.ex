@@ -18,7 +18,7 @@ defmodule Tightbeam.TurnLifecycle do
   @detail_keys %{
     "claimed" => ~w(v owner),
     "prompt_dispatched" => ~w(v),
-    "terminal_committed" => ~w(v status)
+    "terminal_committed" => ~w(v status prewrite)
   }
 
   @ddl """
@@ -352,6 +352,11 @@ defmodule Tightbeam.TurnLifecycle do
 
     if normalized["v"] != 1,
       do: raise(ArgumentError, "#{kind} detail requires v=1")
+
+    if Map.has_key?(normalized, "prewrite") and
+        (normalized["status"] != "failed" or
+          not Tightbeam.NoticeSubmission.valid_evidence?(normalized["prewrite"])),
+      do: raise(ArgumentError, "terminal prewrite evidence is not a qualified refusal")
 
     encoded = JSON.encode!(normalized)
 

@@ -7,7 +7,7 @@ defmodule Tightbeam.TerminalCredentialMigrationTest do
   @terminal_shape "terminal-credential-failure-v1-019"
   @artifact_origin_shape "artifact-origin-v1-019"
   @agent_reparent_shape "delivery-owner-reparent-v1-019"
-  @successor "work-item-delivery-owner-v1-019"
+  @successor "notice-source-storage-v1-019"
   @identity_publication_denial_diagnostic_shape "identity-publication-denial-diagnostic-v1-019"
 
   @terminal_objects ~w(
@@ -35,6 +35,7 @@ defmodule Tightbeam.TerminalCredentialMigrationTest do
     db = :"terminal_credential_migration_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Schema.ensure_all(db)
+    Tightbeam.SchemaShapeRuntimeFixture.downgrade_assignment_source_replacement_cancellation!(db)
 
     # The credential successor is additive, so removing exactly its owned objects
     # recreates the landed settlement predecessor without rewriting any historical
@@ -86,6 +87,8 @@ defmodule Tightbeam.TerminalCredentialMigrationTest do
 
     assert [
              @successor,
+             "assignment-source-replacement-v1-019",
+             "work-item-delivery-owner-v1-019",
              @identity_publication_denial_diagnostic_shape,
              @artifact_origin_shape,
              @agent_reparent_shape,

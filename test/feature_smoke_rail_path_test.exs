@@ -44,6 +44,9 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
 
     :ok = Schema.ensure_all(db)
     start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
+    # Real readiness admission publishes and rings a lane after committing;
+    # this fixture has no provider lane, but must own that local doorbell.
+    start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, Tightbeam.LaneManager})
     register_hosts(db, %{"testhost" => %{ssh: nil, base_dir: base, cli_bin: nil}})
     {:ok, _} = DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES('mike',1,1)")
 
@@ -117,7 +120,8 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
     )
 
     Rules.load!(base, Map.keys(handlers))
-    # Real wake scheduling/durable states; delivery ends at an inert sink.
+    # Real wake scheduling and atomic carrier admission; the local doorbell
+    # does not execute a provider or synthesize an assistant turn.
     # Nothing calls an adapter or manufactures an inference/tool-call result.
     start_supervised!(
       {Tightbeam.Wakes,
@@ -167,8 +171,110 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
     assert {:ok, [[count]]} = DB.query(ctx.db, "SELECT count(*) FROM assignments")
     assert count >= 4
 
-    assert {:ok, [[1]]} =
-             DB.query(ctx.db, "SELECT count(*) FROM turns WHERE assignmentId IS NOT NULL")
+    assert {:ok, [[dispatch_id, dispatch_holder]]} =
+             DB.query(
+               ctx.db,
+               "SELECT id,holderKey FROM assignments WHERE subject LIKE 'smoke fanout %'"
+             )
+
+    assert {:ok, [[^dispatch_holder, dispatch_prompt]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sessionKey,prompt FROM turns WHERE assignmentId=?1",
+               [dispatch_id]
+             )
+
+    assert dispatch_prompt =~ "ship the smoke feature"
+
+    # Each scripted topology files two holder-authored verdicts. Idle readiness
+    # may admit those notices in distinct snapshots; every additional turn must
+    # still be an exact opener notice, never an unexplained second dispatch.
+    assert {:ok, coordination_rows} =
+             DB.query(ctx.db, """
+             SELECT a.id,a.subject,a.openedByUser,a.openedBySession
+             FROM assignments a JOIN assignment_effects effect ON effect.assignmentId=a.id
+             WHERE effect.effectKind='coordination'
+             """)
+
+    expected_subjects =
+      Enum.map(
+        [
+          "One default-archetype selection probe",
+          "One holder for assignment-get round-trip and not-found checks",
+          "One holder for atomic dispatch and work-item linkage checks"
+        ],
+        &("Coordinate disposable smoke fixture: " <> &1)
+      )
+
+    assert Enum.sort(Enum.map(coordination_rows, fn [_, subject, _, _] -> subject end)) ==
+             Enum.sort(expected_subjects)
+
+    for [_, _, opener, opened_by_session] <- coordination_rows do
+      assert opener == ctx.state.user_id
+      assert opened_by_session == nil
+    end
+
+    coordination_ids = Enum.map(coordination_rows, fn [id, _, _, _] -> id end)
+
+    assert {:ok, notice_turns} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId,assignmentId,sessionKey FROM turns WHERE assignmentId IS NOT NULL AND assignmentId<>?1",
+               [dispatch_id]
+             )
+
+    refute notice_turns == []
+
+    for [notice_carrier, notice_assignment, notice_recipient] <- notice_turns do
+      assert notice_assignment in coordination_ids
+      assert notice_recipient == Org.personal_session_key(ctx.state.user_id)
+
+      assert %{state: "fired", digest: true} = Tightbeam.Wakes.get(ctx.db, notice_carrier)
+
+      assert {:ok, notices} =
+               DB.query(
+                 ctx.db,
+                 """
+                 SELECT source.wakeId,source.prompt
+                 FROM notice_batches batch
+                 JOIN notice_batch_members member ON member.batchId=batch.batchId AND member.state='included'
+                 JOIN wakes source ON source.wakeId=member.sourceWakeId
+                 JOIN attests attest ON attest.assignmentId=source.assignmentId
+                 JOIN assignments coordination ON coordination.id=source.assignmentId
+                   AND coordination.holderKey=attest.bySession
+                   AND coordination.workItemId=source.work_item_id
+                   AND source.origin='agent:'||attest.bySession
+                   AND source.prompt='Attest '||attest.id||' ('||attest.kind||') was filed on assignment '||attest.assignmentId||'.'
+                   AND attest.kind='verdict' AND attest.verdictKind IN ('topology-decided','posture-light')
+                 WHERE batch.deliveryWakeId=?1 AND source.assignmentId=?2 AND batch.state='delivered'
+                 """,
+                 [notice_carrier, notice_assignment]
+               )
+
+      refute notices == []
+
+      for [source_id, raw_notice] <- notices do
+        assert Tightbeam.Wakes.get(ctx.db, source_id).prompt == raw_notice
+        assert Tightbeam.Wakes.get(ctx.db, source_id).state == "fired"
+
+        assert {:ok, [[1]]} =
+                 DB.query(ctx.db, "SELECT COUNT(*) FROM notice_batch_members WHERE sourceWakeId=?1", [
+                   source_id
+                 ])
+
+        assert {:ok, [[0]]} =
+                 DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [source_id])
+      end
+
+      notice_count = length(notices)
+
+      assert {:ok, [[^notice_count]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM notice_batch_members member JOIN notice_batches batch ON batch.batchId=member.batchId WHERE batch.deliveryWakeId=?1 AND member.state='included'",
+                 [notice_carrier]
+               )
+    end
   end
 
   test "scripted review refuses changed source, wrong commit bytes, and false output", ctx do

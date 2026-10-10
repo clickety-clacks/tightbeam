@@ -678,6 +678,20 @@ defmodule Tightbeam.SessionLane do
   end
 
   defp finalize(state, seq, outcome) do
+    # A qualified prewrite refusal must commit its root successors with the
+    # terminal CAS. The ordinary diagnostic fallback must never omit them.
+    prewrite_evidence =
+      case outcome do
+        {:error, %{prewrite_evidence: evidence}} -> evidence
+        _ -> nil
+      end
+
+    terminal_opts = [owner_lease: state.current_owner_lease]
+    terminal_opts =
+      if prewrite_evidence,
+        do: Keyword.put(terminal_opts, :prewrite_evidence, prewrite_evidence),
+        else: terminal_opts
+
     {terminal, error, publish, in_txn, after_commit} =
       case outcome do
         {:ok, %{terminal_publish: fun, record_in_txn: action}}
@@ -731,9 +745,7 @@ defmodule Tightbeam.SessionLane do
       DB.transaction_then(
         state.db,
         fn txn ->
-          if Ledger.finish_in_txn(txn, seq, terminal, error,
-               owner_lease: state.current_owner_lease
-             ) do
+          if Ledger.finish_in_txn(txn, seq, terminal, error, terminal_opts) do
             recorded = if is_function(in_txn, 1), do: in_txn.(txn), else: nil
 
             route_publication =
@@ -771,9 +783,12 @@ defmodule Tightbeam.SessionLane do
           DB.transaction_then(
             state.db,
             fn txn ->
-              if Ledger.finish_in_txn(txn, seq, terminal, error,
-                   owner_lease: state.current_owner_lease
-                 ) do
+              if Ledger.finish_in_txn(txn, seq, terminal, error, terminal_opts) do
+                recorded =
+                  if prewrite_evidence and is_function(in_txn, 1),
+                    do: in_txn.(txn),
+                    else: nil
+
                 route_publication =
                   HarnessHealth.settle_other_route_in_txn(
                     txn,
@@ -782,7 +797,7 @@ defmodule Tightbeam.SessionLane do
                     System.system_time(:millisecond)
                   )
 
-                {true, {:terminal_recorded, nil, route_publication}}
+                {true, {:terminal_recorded, recorded, route_publication}}
               else
                 {false, nil}
               end
@@ -795,7 +810,8 @@ defmodule Tightbeam.SessionLane do
 
         case fallback do
           {:ok, {won, recorded}} ->
-            finish_result(state, seq, terminal, error, publish, nil, won, recorded)
+            finish_result(state, seq, terminal, error, publish,
+              if(prewrite_evidence, do: after_commit, else: nil), won, recorded)
 
           {:error, fallback_reason} ->
             EventLog.lifecycle(

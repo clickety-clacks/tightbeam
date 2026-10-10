@@ -22,7 +22,7 @@ defmodule Tightbeam.Acp.Adapter do
   use GenServer
   require Logger
   alias Tightbeam.{ErrorDiagnostic, Harness, Model}
-  alias Tightbeam.Acp.Conn
+  alias Tightbeam.Acp.{Conn, ContextUsage}
 
   # Boot may spend 60s initializing ACP before the separate 120s gate
   # deadline starts. Residency calls queue behind handle_continue, so their
@@ -72,7 +72,8 @@ defmodule Tightbeam.Acp.Adapter do
     models: %{},
     unprompted: MapSet.new(),
     switchable_models: %{},
-    config_options: %{}
+    config_options: %{},
+    context_usage: %{}
   ]
 
   ## Client
@@ -166,6 +167,16 @@ defmodule Tightbeam.Acp.Adapter do
         {:switch_model_session, session_id, model, cwd, mcp_servers, guidance},
         @boot_boundary_timeout
       )
+
+  @doc """
+  Read the latest resident session's reported context usage without provider I/O.
+  This is an observation, not a safe prompt-size allowance. The caller supplies
+  its maximum acceptable observation age; an active prompt has no stable
+  boundary observation. See `Tightbeam.Acp.ContextUsage` for the missing budget
+  qualifications.
+  """
+  def context_usage(adapter, session_id, max_age_ms),
+    do: call(adapter, {:context_usage, session_id, max_age_ms}, @boot_boundary_timeout)
 
   @doc "Canonical models the harness currently offers for a history-preserving session switch."
   @spec switchable_models(adapter(), String.t()) ::
@@ -296,6 +307,12 @@ defmodule Tightbeam.Acp.Adapter do
   If it never arrives, the owning local connection and workers are released;
   healthy prompts sharing it report interruption, and nothing is replayed.
   Local teardown does not establish remote provider completion.
+
+  `:max_request_bytes`, when supplied by the configured transport caller,
+  checks the complete transport frame before writing. Its refusal is explicitly
+  not dispatched; it is neither a token budget nor a provider rejection.
+  Codex's fixed combined-text scalar limit is also checked at that boundary.
+  ACP frame bytes do not certify Claude's complete Messages request size.
 
   A harness that dies MID-PROMPT kills this adapter before it can reply, so the
   call must be caught like every other adapter-boundary call: otherwise the turn
@@ -585,6 +602,7 @@ defmodule Tightbeam.Acp.Adapter do
           state
           | known: MapSet.delete(state.known, sid),
             models: Map.delete(state.models, sid),
+            context_usage: Map.delete(state.context_usage, sid),
             unprompted: MapSet.delete(state.unprompted, sid),
             switchable_models: Map.delete(state.switchable_models, sid),
             config_options: Map.delete(state.config_options, sid),
@@ -609,7 +627,7 @@ defmodule Tightbeam.Acp.Adapter do
         case Map.fetch(state.models, sid) do
           {:ok, ^prior_model} ->
             case strict_apply(state, sid, model, caller_deadline) do
-              :ok -> {:reply, {:ok, model}, put_in(state.models[sid], model)}
+              :ok -> {:reply, {:ok, model}, remember_model(state, sid, model)}
               error -> {:reply, error, drop_model_residency(state, sid)}
             end
 
@@ -626,14 +644,14 @@ defmodule Tightbeam.Acp.Adapter do
 
   def handle_call({:apply_model, sid, model}, _from, state) do
     case apply_model_to_session(state, sid, model) do
-      {:ok, applied_model} -> {:reply, :ok, put_in(state.models[sid], applied_model)}
+      {:ok, applied_model} -> {:reply, :ok, remember_model(state, sid, applied_model)}
       error -> {:reply, error, drop_model_residency(state, sid)}
     end
   end
 
   def handle_call({:apply_model, sid, model, request_timeout}, _from, state) do
     case apply_model_to_session(state, sid, model, request_timeout) do
-      {:ok, applied_model} -> {:reply, :ok, put_in(state.models[sid], applied_model)}
+      {:ok, applied_model} -> {:reply, :ok, remember_model(state, sid, applied_model)}
       error -> {:reply, error, drop_model_residency(state, sid)}
     end
   end
@@ -646,6 +664,22 @@ defmodule Tightbeam.Acp.Adapter do
       {:ok, model} -> {:reply, {:ok, model}, state}
       :error -> {:reply, {:error, :model_readback_unavailable}, state}
     end
+  end
+
+  def handle_call({:context_usage, sid, max_age_ms}, _from, state) do
+    result =
+      if Map.has_key?(state.prompts, sid) do
+        {:error, :context_usage_in_flight}
+      else
+        ContextUsage.read(
+          Map.get(state.context_usage, sid),
+          Map.get(state.models, sid),
+          System.monotonic_time(:millisecond),
+          max_age_ms
+        )
+      end
+
+    {:reply, result, state}
   end
 
   def handle_call({:switchable_models, sid}, _from, state) do
@@ -718,10 +752,10 @@ defmodule Tightbeam.Acp.Adapter do
   defp switch_model_in_place_reply(state, sid, model, request_timeout) do
     case apply_verified_in_place_model(state, sid, model, request_timeout) do
       {:ok, applied_model} ->
-        {:reply, {:ok, sid}, put_in(state.models[sid], applied_model)}
+        {:reply, {:ok, sid}, remember_model(state, sid, applied_model)}
 
       {:error, {:runtime_config_mismatch, %Model{} = actual}} = error ->
-        {:reply, error, put_in(state.models[sid], actual)}
+        {:reply, error, remember_model(state, sid, actual)}
 
       {:error, reason} = error ->
         if ErrorDiagnostic.classified(reason) == :model_unavailable,
@@ -792,6 +826,7 @@ defmodule Tightbeam.Acp.Adapter do
       {:ok, %{"sessionId" => sid} = result} when is_binary(sid) ->
         # The apply below resolves wire-by-name candidates from the cached
         # option list, so the session/new options must be remembered first.
+        state = %{state | context_usage: Map.delete(state.context_usage, sid)}
         state = remember_config_options(state, sid, result)
 
         with :ok <- project_guidance(state, sid, guidance),
@@ -865,6 +900,7 @@ defmodule Tightbeam.Acp.Adapter do
               state
               |> put_in([Access.key(:known)], MapSet.put(state.known, sid))
               |> put_in([Access.key(:models)], Map.delete(state.models, sid))
+              |> put_in([Access.key(:context_usage)], Map.delete(state.context_usage, sid))
               |> put_in([Access.key(:unprompted)], MapSet.delete(state.unprompted, sid))
               |> remember_switchable_models(sid, result)
               |> remember_config_options(sid, result)
@@ -874,7 +910,7 @@ defmodule Tightbeam.Acp.Adapter do
               %Model{} = model ->
                 case apply_model_to_session(state, sid, model, request_timeout) do
                   {:ok, applied_model} ->
-                    {:reply, {:ok, applied_model}, put_in(state.models[sid], applied_model)}
+                    {:reply, {:ok, applied_model}, remember_model(state, sid, applied_model)}
 
                   {:error, reason} ->
                     {:reply, {:error, {:model_apply_failed, reason}},
@@ -1150,6 +1186,8 @@ defmodule Tightbeam.Acp.Adapter do
             cancel_grace: Keyword.fetch!(opts, :cancel_grace),
             session_id: sid,
             owner: elem(from, 0),
+            max_request_bytes: Keyword.get(opts, :max_request_bytes),
+            submission_harness: state.harness,
             notify_dispatched: {parent, dispatched}
           )
 
@@ -1170,6 +1208,9 @@ defmodule Tightbeam.Acp.Adapter do
       {:acp_request_dispatched, ^dispatched, request_id} ->
         Process.demonitor(conn_monitor, [:flush])
 
+        # Only a confirmed port write invalidates the occupied-context snapshot.
+        # A local capacity refusal has not changed the receiver history.
+        state = %{state | context_usage: Map.delete(state.context_usage, sid)}
         state = put_in(state.prompts[sid].request_id, request_id)
 
         case trace_dispatch(opts, request_id) do
@@ -1253,6 +1294,7 @@ defmodule Tightbeam.Acp.Adapter do
     state = maybe_emit_subagent_event(state, sid, update)
     state = emit_progress(state, sid, update)
     state = remember_config_model(state, sid, update)
+    state = remember_context_usage(state, sid, update)
 
     if update["sessionUpdate"] == "agent_message_chunk" do
       text = get_in(update, ["content", "text"])
@@ -1652,11 +1694,32 @@ defmodule Tightbeam.Acp.Adapter do
     end
   end
 
-  defp remember_model(state, sid, %Model{} = model),
-    do: put_in(state.models[sid], model)
+  defp remember_model(state, sid, %Model{} = model) do
+    usage =
+      if Map.get(state.models, sid) == model,
+        do: state.context_usage,
+        else: Map.delete(state.context_usage, sid)
 
-  defp remember_model(state, sid, _unknown),
-    do: put_in(state.models, Map.delete(state.models, sid))
+    %{state | models: Map.put(state.models, sid, model), context_usage: usage}
+  end
+
+  defp remember_model(state, sid, _unknown) do
+    %{
+      state
+      | models: Map.delete(state.models, sid),
+        context_usage: Map.delete(state.context_usage, sid)
+    }
+  end
+
+  defp remember_context_usage(state, sid, %{"sessionUpdate" => "usage_update"} = update)
+       when is_binary(sid) do
+    observation =
+      ContextUsage.observe(update, Map.get(state.models, sid), System.monotonic_time(:millisecond))
+
+    put_in(state.context_usage[sid], observation)
+  end
+
+  defp remember_context_usage(state, _sid, _update), do: state
 
   defp apply_model_to_session(state, sid, model_ref) do
     apply_model_to_session(state, sid, model_ref, 60_000)
@@ -1929,6 +1992,7 @@ defmodule Tightbeam.Acp.Adapter do
       state
       | known: MapSet.delete(state.known, sid),
         models: Map.delete(state.models, sid),
+        context_usage: Map.delete(state.context_usage, sid),
         unprompted: MapSet.delete(state.unprompted, sid),
         switchable_models: Map.delete(state.switchable_models, sid),
         config_options: Map.delete(state.config_options, sid)
@@ -2182,7 +2246,7 @@ defmodule Tightbeam.Acp.Adapter do
 
   defp remember_reported_config_model(state, sid, options) do
     case model_ref_from_config(%{"configOptions" => options}, state.preset.effort_config) do
-      {:ok, model} -> put_in(state.models[sid], model)
+      {:ok, model} -> remember_model(state, sid, model)
       :error -> state
     end
   end
@@ -2195,7 +2259,7 @@ defmodule Tightbeam.Acp.Adapter do
         effort -> %{cached | effort: effort}
       end
 
-    put_in(state.models[sid], model)
+    remember_model(state, sid, model)
   end
 
   defp model_ref_from_config(%{"configOptions" => options}, effort_id)

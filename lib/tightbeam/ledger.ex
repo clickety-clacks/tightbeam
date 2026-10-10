@@ -824,13 +824,30 @@ defmodule Tightbeam.Ledger do
   @spec finish_in_txn(Txn.t(), integer(), terminal(), String.t() | nil) :: boolean()
   def finish_in_txn(%Txn{} = txn, seq, terminal, error \\ nil, opts \\ [])
       when terminal in ~w(delivered canceled failed failed_unknown) do
+    evidence = Keyword.get(opts, :prewrite_evidence)
+    if evidence and Txn.q(txn, "SELECT 1 FROM turns WHERE seq=?1 AND status='running'", [seq]) == [[1]] do
+      unless terminal == "failed",
+        do: raise(ArgumentError, "prewrite refusal requires a failed terminal")
+
+      :ok = Tightbeam.NoticeSubmission.assert_owner_in_txn!(
+        txn, seq, Keyword.get(opts, :owner_lease), evidence, "running"
+      )
+    end
+
     now = System.system_time(:millisecond)
     transition = turn_terminal_transition_in_txn(txn, seq, "running", terminal)
+    restoration_lease = if evidence, do: Keyword.get(opts, :owner_lease), else: nil
 
     Txn.q(
       txn,
-      "UPDATE turns SET status = ?2, endedAt = ?3, error = ?4 WHERE seq = ?1 AND status = 'running'",
-      [seq, terminal, now, error]
+      """
+      UPDATE turns SET status = ?2, endedAt = ?3, error = ?4
+      WHERE seq = ?1 AND status = 'running'
+        AND (?5 IS NULL OR EXISTS (
+          SELECT 1 FROM turn_lifecycle_events c
+          WHERE c.turnSeq=turns.seq AND c.kind='claimed' AND c.ownerLease=?5))
+      """,
+      [seq, terminal, now, error, restoration_lease]
     )
 
     won = Txn.changes(txn) == 1
@@ -1360,6 +1377,12 @@ defmodule Tightbeam.Ledger do
 
   defp append_terminal_in_txn(txn, seq, terminal, opts) do
     opts = Map.new(opts)
+    detail = %{v: 1, status: terminal}
+    detail =
+      case Map.get(opts, :prewrite_evidence) do
+        nil -> detail
+        evidence -> Map.put(detail, :prewrite, evidence)
+      end
 
     TurnLifecycle.append_in_txn(txn, seq, %{
       event_key: "terminal:committed",
@@ -1369,7 +1392,7 @@ defmodule Tightbeam.Ledger do
       cause: Map.get(opts, :cause, "turn:#{seq}"),
       principal: Map.get(opts, :principal, "process:tightbeam"),
       owner_lease: Map.get(opts, :owner_lease),
-      detail: %{v: 1, status: terminal}
+      detail: detail
     })
   end
 

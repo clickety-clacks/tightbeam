@@ -80,12 +80,53 @@ defmodule Tightbeam.FullGatewayRecoveryTest do
         claim = JSON.decode!(encoded)
         assert %{"lastConsumer" => %{"wake" => notice_id}} = claim
 
+        wake_columns = after_state["columns"]["wakes"]
+        before_wakes = Enum.map(before["wakes"], &Map.new(Enum.zip(wake_columns, &1)))
+        after_wakes = Enum.map(after_state["wakes"], &Map.new(Enum.zip(wake_columns, &1)))
+        refute Enum.any?(before_wakes, &(&1["wakeId"] == notice_id))
+        assert [notice] = Enum.filter(after_wakes, &(&1["wakeId"] == notice_id))
+        assert notice["assignmentId"] == prior["id"]
+        assert notice["sessionKey"] == prior["holderKey"]
+        assert notice["ownerUserId"] == prior["openedByUser"]
+        assert notice["origin"] == "process:tightbeam"
+        assert notice["state"] == "fired"
+        assert is_integer(notice["firedAt"])
+
+        carrier_wake_id =
+          case Map.fetch!(after_state["notice_source_refs"], notice_id) do
+            [id] when is_binary(id) ->
+              id
+
+            [] ->
+              notice_id
+
+            other ->
+              flunk(
+                "expected at most one carrier reference for #{notice_id}, got #{inspect(other)}"
+              )
+          end
+
         turn_columns = after_state["columns"]["turns"]
         after_turns = Enum.map(after_state["turns"], &Map.new(Enum.zip(turn_columns, &1)))
         a_turns = Enum.filter(after_turns, &(&1["sessionKey"] == prior["holderKey"]))
         assert length(a_turns) == 4
-        assert Enum.count(a_turns, &is_nil(&1["wakeId"])) == 3
-        assert [notice_turn] = Enum.filter(a_turns, &(&1["wakeId"] == notice_id))
+        assert [successor_carrier_id] =
+                 Map.fetch!(after_state["notice_source_refs"], "w_recovery_successor_a")
+        assert successor_carrier_id != carrier_wake_id
+
+        # The three recovery turns remain exact: the interrupted direct turn,
+        # the queued successor's actual carrier, and the direct health replay.
+        recovery_turns = Enum.reject(a_turns, &(&1["wakeId"] == carrier_wake_id))
+        assert Enum.map(recovery_turns, &{&1["wakeId"], &1["status"]}) ==
+                 [{nil, "failed_unknown"}, {successor_carrier_id, "delivered"}, {nil, "delivered"}]
+        assert Enum.count(a_turns, &is_nil(&1["wakeId"])) == 2
+        [interrupted, successor, replay] = recovery_turns
+        assert interrupted["messageId"] == replay["messageId"]
+        assert interrupted["prompt"] == replay["prompt"]
+        assert successor["prompt"] =~ "w_recovery_successor_a"
+        assert successor["prompt"] =~ "RECOVERY_SUCCESSOR_A"
+        refute Enum.any?(a_turns, &(&1["wakeId"] == "w_recovery_successor_a"))
+        assert [notice_turn] = Enum.filter(a_turns, &(&1["wakeId"] == carrier_wake_id))
         assert notice_turn["assignmentId"] == prior["id"]
         assert notice_turn["status"] == "delivered"
         assert is_integer(notice_turn["endedAt"])
@@ -108,19 +149,16 @@ defmodule Tightbeam.FullGatewayRecoveryTest do
                  "nextEligibleAt" => notice_turn["endedAt"] + 300_000
                }
 
-        wake_columns = before["columns"]["wakes"]
-        before_wakes = Enum.map(before["wakes"], &Map.new(Enum.zip(wake_columns, &1)))
-        after_wakes = Enum.map(after_state["wakes"], &Map.new(Enum.zip(wake_columns, &1)))
-        refute Enum.any?(before_wakes, &(&1["wakeId"] == notice_id))
-        assert [notice] = Enum.filter(after_wakes, &(&1["wakeId"] == notice_id))
-        assert notice["assignmentId"] == prior["id"]
-        assert notice["sessionKey"] == prior["holderKey"]
-        assert notice["ownerUserId"] == prior["openedByUser"]
-        assert notice["origin"] == "process:tightbeam"
-        assert notice["state"] == "fired"
-        assert is_integer(notice["firedAt"])
         assert notice_turn["origin"] == notice["origin"]
-        assert notice_turn["prompt"] == "[from #{notice["origin"]}]\n\n#{notice["prompt"]}"
+
+        if carrier_wake_id == notice_id do
+          assert notice_turn["prompt"] ==
+                   "[from #{notice["origin"]}]\n\n#{notice["prompt"]}"
+        else
+          assert notice_turn["prompt"] =~ "[batched notices: 1]"
+          assert notice_turn["prompt"] =~ notice_id
+          assert notice_turn["prompt"] =~ notice["prompt"]
+        end
 
         # Every committed pre-crash message remains byte-identical exactly once.
         assert length(before["artifacts"]) >= 1
@@ -212,6 +250,7 @@ defmodule Tightbeam.FullGatewayRecoveryTest do
       "test/support/recovery_fixture.ex",
       "test/support/recovery_acp_fixture.js",
       "test/support/full_gateway_recovery.exs",
+      "test/assignment_source_replacement_migration_test.exs",
       "test/recovery_fixture_contract_test.exs",
       "test/full_gateway_recovery_test.exs"
     ])

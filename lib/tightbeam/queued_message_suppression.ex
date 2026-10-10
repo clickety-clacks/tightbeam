@@ -108,6 +108,118 @@ defmodule Tightbeam.QueuedMessageSuppression do
     end
   end
 
+  @doc false
+  def replace_pending_wakes_in_txn(%Txn{} = txn, replacement_wake, assignment_id)
+      when is_map(replacement_wake) and is_binary(assignment_id) do
+    requester_session = replacement_wake.creator_session_key
+
+    attrs = %{
+      wake_id: replacement_wake.wake_id,
+      session_key: replacement_wake.session_key,
+      origin: replacement_wake.origin,
+      queue_message_kind: nil,
+      request_ref: nil
+    }
+
+    if valid_replacement_request?(
+         txn,
+         assignment_id,
+         replacement_wake.session_key,
+         replacement_wake.origin,
+         requester_session,
+         replacement_wake.wake_id,
+         attrs
+       ) do
+      incoming_requested_at =
+        case Txn.q(
+               txn,
+               "SELECT requestedAt FROM queued_message_replacement_requests WHERE wakeId=?1 AND assignmentId=?2",
+               [replacement_wake.wake_id, assignment_id]
+             ) do
+          [[requested_at]] -> requested_at
+          [] -> nil
+        end
+
+      if is_integer(incoming_requested_at) do
+        sources =
+          Txn.q(
+            txn,
+            """
+            SELECT w.wakeId,w.createdAt,r.requestedAt
+            FROM wakes w
+            JOIN queued_message_replacement_requests r ON r.wakeId=w.wakeId
+            WHERE w.state='pending' AND w.sessionKey=?1 AND w.origin=?2
+              AND w.creatorSessionKey=?3
+              -- Ordinary correction wakes retain NULL assignment attribution;
+              -- the explicit request row carries their replacement scope.
+              AND (w.assignmentId IS NULL OR w.assignmentId=?4)
+              AND w.consumer='prompt' AND w.digest=0 AND w.targetGate<>0
+              AND w.conditionKind IS NULL AND w.waitMode IS NULL
+              AND w.obligationRef IS NULL AND r.assignmentId=?4
+              AND r.requestedAt<?5
+              AND NOT EXISTS (
+                SELECT 1 FROM notice_batch_members m
+                JOIN notice_batches b ON b.batchId=m.batchId
+                WHERE m.sourceWakeId=w.wakeId AND m.state='included'
+                  AND b.state IN ('sealed','delivery_pending','delivered','delivery_failed')
+              )
+            ORDER BY r.requestedAt,w.rowid
+            """,
+            [
+              replacement_wake.session_key,
+              replacement_wake.origin,
+              requester_session,
+              assignment_id,
+              incoming_requested_at
+            ]
+          )
+
+        Enum.each(sources, fn [source_wake_id, source_created_at, _requested_at] ->
+          at = System.system_time(:millisecond)
+
+          canceled =
+            Wakes.cancel_in_txn(txn, %{
+              wake_id: source_wake_id,
+              requester: %{kind: "process", id: "tightbeam:assignments"},
+              reason_kind: "superseded",
+              causal_source: %{kind: "wake", id: replacement_wake.wake_id},
+              outcome: %{kind: "replacement", replacement_wake_id: replacement_wake.wake_id}
+            })
+
+          case canceled do
+            true ->
+              EventLog.lifecycle_in_txn(
+                txn,
+                "queued_message_suppressed",
+                source_wake_id,
+                JSON.encode!(%{
+                  messageKind: "sender-replacement",
+                  scopeKind: "assignment",
+                  scopeId: assignment_id,
+                  cause: "sender_requested_replacement",
+                  sourceKind: "wake",
+                  sourceId: source_wake_id,
+                  sourceCreatedAt: source_created_at,
+                  senderOrigin: replacement_wake.origin,
+                  senderSessionKey: requester_session,
+                  holderSessionKey: replacement_wake.session_key,
+                  replacementWakeId: replacement_wake.wake_id
+                })
+              )
+
+              :ok
+
+            _ ->
+              raise DB.Error,
+                message: "assignment-scoped sender replacement refused for wake #{source_wake_id}"
+          end
+        end)
+      end
+    end
+
+    :ok
+  end
+
   @doc "Terminalize this sender's older eligible turns for the exact holder and assignment."
   @spec replace_own_queued_in_txn(Txn.t(), pos_integer(), map()) :: [pos_integer()]
   def replace_own_queued_in_txn(%Txn{} = txn, replacement_seq, attrs) do

@@ -3,6 +3,8 @@ true = Path.expand(payload) == Path.expand(Application.app_dir(:tightbeam))
 false = File.exists?(base)
 {:ok, _} = Application.ensure_all_started(:exqlite)
 {:ok, _} = Application.ensure_all_started(:crypto)
+# Load the assertion defaults, including the unchanged negative receive budget.
+{:ok, _} = Application.ensure_all_started(:ex_unit)
 Application.put_env(:ex_unit, :assert_receive_timeout, 1_000)
 Application.put_env(:tightbeam, :autostart, false)
 Application.put_env(:tightbeam, :effort_checkins_enabled, true)

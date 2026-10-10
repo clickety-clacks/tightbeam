@@ -26,18 +26,60 @@ defmodule Tightbeam.LateRulingHandoffTest do
     assert Tightbeam.Wakes.get(ctx.db, same.wake_id).state == "fired"
     assert Tightbeam.Wakes.get(ctx.db, other.wake_id).state == "pending"
 
-    assert {:ok, [[1]]} =
+    assert [%{delivery_wake_id: carrier_id, batch_state: "delivered"}] =
+             Tightbeam.NoticeBatcher.source_refs(ctx.db, same.wake_id)
+
+    assert Tightbeam.Wakes.get(ctx.db, carrier_id).state == "fired"
+
+    assert {:ok, [[0]]} =
              Tightbeam.DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [
                same.wake_id
              ])
+
+    assert {:ok, [[1]]} =
+             Tightbeam.DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [
+               carrier_id
+             ])
+
+    assert Tightbeam.NoticeBatcher.source_refs(ctx.db, other.wake_id) == []
 
     assert {:ok, [[0]]} =
              Tightbeam.DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [
                other.wake_id
              ])
+
+    carrier_id
   end
 
-  alias Tightbeam.{Assignments, ConnRegistry, DB, Escalation, Model, Org, Wakes, WorkItems}
+  defp drain_ready_turns!(db, session_key, lane) do
+    case Tightbeam.Ledger.claim_next(db, session_key, lane) do
+      {:ok, turn} ->
+        assert :ok =
+                 Tightbeam.Ledger.finish(db, turn.seq, "delivered", nil,
+                   owner_lease: turn.owner_lease
+                 )
+
+        drain_ready_turns!(db, session_key, lane)
+
+      :none ->
+        :ok
+
+      other ->
+        flunk("expected the recipient queue to drain, got #{inspect(other)}")
+    end
+  end
+
+  alias Tightbeam.{
+    Assignments,
+    ConnRegistry,
+    DB,
+    Escalation,
+    Ledger,
+    Model,
+    Org,
+    Wakes,
+    WorkItems
+  }
 
   @incident_request_id "dr_07bdef13-45ae-435f-bc79-b2dc6b0a5ebf"
 
@@ -77,9 +119,24 @@ defmodule Tightbeam.LateRulingHandoffTest do
     raiser = session(db, "agent:raiser:test", "flynn")
     replacement_holder = session(db, "agent:replacement:test", "flynn")
 
-    start_supervised!(
-      {Wakes, db: db, name: scheduler, tick_ms: 60_000, deliver: fn _wake -> :ok end}
-    )
+    deliver = fn wake ->
+      {:ok, delivery} =
+        DB.transaction(db, fn txn ->
+          Tightbeam.Gateway.deliver_prompt_in_txn(
+            txn,
+            wake.session_key,
+            wake.origin,
+            wake.prompt,
+            wake_id: wake.wake_id,
+            sender: wake.origin,
+            target_gate: wake
+          )
+        end)
+
+      delivery
+    end
+
+    start_supervised!({Wakes, db: db, name: scheduler, tick_ms: 60_000, deliver: deliver})
 
     %{
       db: db,
@@ -184,12 +241,23 @@ defmodule Tightbeam.LateRulingHandoffTest do
                [@incident_request_id]
              )
 
-    assert_marker_recognition(
-      ctx,
-      late_waits,
-      "operator-ruling-late-routed",
-      @incident_request_id
-    )
+    late_carrier_id =
+      assert_marker_recognition(
+        ctx,
+        late_waits,
+        "operator-ruling-late-routed",
+        @incident_request_id
+      )
+
+    {:ok, late_turn} = Ledger.claim_next(ctx.db, ctx.opener.session_key, "late-ruling-handoff")
+    assert late_turn.wake_id == late_carrier_id
+
+    assert :ok =
+             Ledger.finish(ctx.db, late_turn.seq, "delivered", nil,
+               owner_lease: late_turn.owner_lease
+             )
+
+    drain_ready_turns!(ctx.db, ctx.opener.session_key, "late-ruling-handoff")
 
     assert {:ok, [[session_key]]} =
              DB.query(
