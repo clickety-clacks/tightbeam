@@ -40,9 +40,18 @@ class ExactHeadCI(unittest.TestCase):
         self.assertRegex(self.text, r'workflow_dispatch:\n    inputs:\n      candidate_sha:')
         self.assertIn('        required: true\n        type: string', self.text)
         self.assertIn(
-            "CI_SOURCE_SHA: ${{ github.event_name != 'workflow_dispatch' && github.sha || inputs.candidate_sha }}",
+            "CI_SOURCE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event_name != 'workflow_dispatch' && github.sha || inputs.candidate_sha }}",
             self.text)
         self.assertNotIn('branches: [main]', self.text)
+
+    def test_pull_request_checks_its_head_and_other_events_keep_their_source(self):
+        source = re.search(r'CI_SOURCE_SHA: \$\{\{ (.*?) \}\}', self.text).group(1)
+        for event, expected in [('pull_request', 'a' * 40), ('push', 'b' * 40),
+                                ('merge_group', 'b' * 40), ('workflow_dispatch', 'c' * 40)]:
+            context = {'github.event_name': event, 'github.sha': 'b' * 40,
+                       'github.event.pull_request.head.sha': 'a' * 40,
+                       'inputs.candidate_sha': 'c' * 40}
+            self.assertEqual(evaluate(source, context), expected, event)
 
     def test_both_jobs_validate_before_exact_checkout(self):
         for name in ('test', 'release'):
@@ -99,6 +108,7 @@ class ExactHeadCI(unittest.TestCase):
                 self.assertEqual(result.returncode, expected)
 
     def test_platforms_and_existing_gates(self):
+        self.assertRegex(self.jobs['test'], r'(?m)^    runs-on: \$\{\{ matrix\.os \}\}$')
         for name in ('test', 'release'):
             for platform in ('ubuntu-latest', 'macos-latest'):
                 self.assertIn('os: ' + platform, self.jobs[name])
@@ -141,6 +151,7 @@ class ExactHeadCI(unittest.TestCase):
         self.assertRegex(self.text, r'(?m)^  merge_group:$')
         source = re.search(r'CI_SOURCE_SHA: \$\{\{ (.*?) \}\}', self.text).group(1)
         context = {'github.event_name': 'merge_group', 'github.sha': 'c' * 40,
+                   'github.event.pull_request.head.sha': '',
                    'github.ref': 'refs/heads/gh-readonly-queue/0.1.9/pr-12-' + 'a' * 40,
                    'inputs.candidate_sha': ''}
         self.assertEqual(evaluate(source, context), 'c' * 40)
