@@ -1707,6 +1707,7 @@ defmodule Tightbeam.Schema do
     # qualifications succeed, but before publishing a successful boot marker.
     :ok = ensure_lifecycle_runtime_indexes(db)
     :ok = ensure_idle_cleanup_runtime_indexes(db)
+    :ok = ensure_rest_collection_indexes(db)
 
     # Batch-aware supervision guards reference notice_batches, so install them
     # only after all predecessor migrations and refusal checks have completed
@@ -2394,6 +2395,63 @@ defmodule Tightbeam.Schema do
       {:error, error} ->
         raise ShapeError,
           message: "idle-cleanup runtime index migration failed: #{Exception.message(error)}"
+    end
+  end
+
+  # Public REST collections use stable keyset predicates. Build their order
+  # paths through the same post-qualification migration lane as other additive
+  # runtime indexes so ordinary reads never fall back to materializing history.
+  defp ensure_rest_collection_indexes(db) do
+    indexes = [
+      {"sessions_rest_created_order",
+       "CREATE INDEX IF NOT EXISTS sessions_rest_created_order " <>
+         "ON sessions(createdAt, sessionKey)"},
+      {"sessions_rest_owner_created_order",
+       "CREATE INDEX IF NOT EXISTS sessions_rest_owner_created_order " <>
+         "ON sessions(ownerUserId, createdAt, sessionKey)"},
+      {"sessions_rest_stream_owner_order",
+       "CREATE INDEX IF NOT EXISTS sessions_rest_stream_owner_order " <>
+         "ON sessions(ownerUserId, state, orderIndex, createdAt, sessionKey)"},
+      {"wakes_rest_session_created_order",
+       "CREATE INDEX IF NOT EXISTS wakes_rest_session_created_order " <>
+         "ON wakes(sessionKey, createdAt, wakeId)"},
+      {"assignments_rest_opened_order",
+       "CREATE INDEX IF NOT EXISTS assignments_rest_opened_order " <>
+         "ON assignments(openedAt DESC, id DESC)"},
+      {"attests_rest_assignment_status",
+       "CREATE INDEX IF NOT EXISTS attests_rest_assignment_status " <>
+         "ON attests(assignmentId, kind, verdictKind)"},
+      {"work_items_rest_created_order",
+       "CREATE INDEX IF NOT EXISTS work_items_rest_created_order " <>
+         "ON work_items(createdAt, id)"},
+      {"work_items_rest_owner_order",
+       "CREATE INDEX IF NOT EXISTS work_items_rest_owner_order " <>
+         "ON work_items(ownerUserId, createdAt, id)"},
+      {"work_items_rest_state_order",
+       "CREATE INDEX IF NOT EXISTS work_items_rest_state_order " <>
+         "ON work_items(state, createdAt, id)"},
+      {"work_items_rest_created_session_order",
+       "CREATE INDEX IF NOT EXISTS work_items_rest_created_session_order " <>
+         "ON work_items(createdBySession, createdAt, id)"},
+      {"work_items_rest_created_user_order",
+       "CREATE INDEX IF NOT EXISTS work_items_rest_created_user_order " <>
+         "ON work_items(createdByUser, createdAt, id)"},
+      {"work_items_rest_bug_order",
+       "CREATE INDEX IF NOT EXISTS work_items_rest_bug_order " <>
+         "ON work_items(isBug, createdAt, id)"},
+      {"work_items_rest_spec_order",
+       "CREATE INDEX IF NOT EXISTS work_items_rest_spec_order " <>
+         "ON work_items(specRefName, createdAt, id)"}
+    ]
+
+    case DB.migration_transaction(db, :rest_collection_indexes, [], [], fn txn ->
+           Enum.each(indexes, fn {_name, sql} -> :ok = Txn.exec(txn, sql) end)
+           :ok
+         end) do
+      {:ok, :ok} -> :ok
+      {:error, error} ->
+        raise ShapeError,
+          message: "REST collection index migration failed: #{Exception.message(error)}"
     end
   end
 

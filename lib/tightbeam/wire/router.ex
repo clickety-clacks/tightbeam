@@ -97,8 +97,13 @@ defmodule Tightbeam.Wire.Router do
     read_markers: %{resource: "read markers", query: :query_read_marker, serializer: :read_marker}
   }
 
+  # D1, streams, and work open at 50; session and nested history preserve 500.
+  # Every pageable route caps a request at 500 rows.
   @d1_default_limit 50
   @d1_max_limit 500
+  @state_default_limit 50
+  @state_history_default_limit 500
+  @state_max_limit 500
   @d1_cursor_version 1
   @d1_resources %{
     work_items: %{
@@ -315,11 +320,37 @@ defmodule Tightbeam.Wire.Router do
   end
 
   get "/api/streams" do
-    with {:ok, device} <- device_auth(conn) do
-      streams =
-        Org.list_for_user(db(conn), device.user_id, false) |> Enum.map(&Payloads.stream_session/1)
+    with {:ok, device} <- device_auth(conn),
+         {:ok, query} <- decode_state_query(conn),
+         :ok <- stream_collection_request(query),
+         {:ok, limit, boundary} <-
+           state_page_request(
+             query,
+             "streams.collection",
+             "streams",
+             %{},
+             %{kind: "user", id: device.user_id, is_admin: device.is_admin},
+             &stream_tuple?/1,
+             @state_default_limit,
+             :earliest,
+             :earliest,
+             :latest
+           ) do
+      result = Org.list_for_user_page(db(conn), device.user_id, boundary, limit)
+      page =
+        state_page_metadata(
+          result.rows,
+          result.flags,
+          &stream_tuple/1,
+          "streams.collection",
+          "streams",
+          %{},
+          %{kind: "user", id: device.user_id, is_admin: device.is_admin},
+          :asc
+        )
 
-      json(conn, 200, %{"streams" => streams})
+      streams = Enum.map(result.rows, &Payloads.stream_session/1)
+      json(conn, 200, %{"streams" => streams, "page" => page})
     else
       {:error, status, code, message} -> error(conn, status, code, message)
     end
@@ -420,17 +451,17 @@ defmodule Tightbeam.Wire.Router do
       conn,
       session_key,
       "transcript messages",
-      :query_messages_for_session,
+      :query_messages_for_session_page,
       :message
     )
   end
 
   get "/api/sessions/:session_key/wakes" do
-    session_collection(conn, session_key, "wakes", :query_wakes_for_session, :wake)
+    session_collection(conn, session_key, "wakes", :query_wakes_for_session_page, :wake)
   end
 
   get "/api/sessions/:session_key/turns" do
-    session_collection(conn, session_key, "turns", :query_turns_for_session, :turn)
+    session_collection(conn, session_key, "turns", :query_turns_for_session_page, :turn)
   end
 
   get "/api/devices/:device_id" do
@@ -545,19 +576,49 @@ defmodule Tightbeam.Wire.Router do
   end
 
   get "/api/work" do
-    conn = Plug.Conn.fetch_query_params(conn)
-
     with {:ok, device} <- device_auth(conn),
-         {:ok, statuses} <- work_status_filter(conn.query_params["status"]),
-         {:ok, state} <- work_state_filter(conn.query_params["state"]) do
-      filters = %{
-        status: statuses,
-        state: state,
-        session_key: conn.query_params["sessionKey"],
-        owner_user_id: if(device.is_admin, do: nil, else: device.user_id)
-      }
+         {:ok, query} <- decode_state_query(conn),
+         :ok <- work_collection_request(query),
+         {:ok, status_value} <- one_query_value(query, "status"),
+         {:ok, state_value} <- one_query_value(query, "state"),
+         {:ok, session_key} <- one_query_value(query, "sessionKey"),
+         :ok <- work_session_filter(session_key),
+         {:ok, statuses} <- work_status_filter(status_value),
+         {:ok, state} <- work_state_filter(state_value),
+         filters <- %{
+           status: if(is_nil(statuses), do: nil, else: Enum.sort(Enum.uniq(statuses))),
+           state: state,
+           session_key: session_key,
+           owner_user_id: if(device.is_admin, do: nil, else: device.user_id)
+         },
+         cursor_filters <- work_cursor_filters(filters),
+         {:ok, limit, boundary} <-
+           state_page_request(
+             query,
+             "work.collection",
+             "work",
+             cursor_filters,
+             %{kind: "user", id: device.user_id, is_admin: device.is_admin},
+             &work_tuple?/1,
+             @state_default_limit,
+             :latest,
+             :latest,
+             :earliest
+           ) do
+      result = WorkState.page(db(conn), filters, boundary, limit)
+      page =
+        state_page_metadata(
+          result.work,
+          %{has_more_before: result.has_more_before, has_more_after: result.has_more_after},
+          &work_tuple/1,
+          "work.collection",
+          "work",
+          cursor_filters,
+          %{kind: "user", id: device.user_id, is_admin: device.is_admin},
+          :desc
+        )
 
-      json(conn, 200, WorkState.list(db(conn), filters))
+      json(conn, 200, %{"work" => result.work, "cursor" => result.cursor, "page" => page})
     else
       {:error, status, code, message} -> error(conn, status, code, message)
     end
@@ -733,18 +794,43 @@ defmodule Tightbeam.Wire.Router do
            core_detail_operation(conn, "sessions", :request_validation, fn ->
              session_index_request(query)
            end),
+         {:ok, limit, boundary} <-
+           state_page_request(
+             query,
+             "sessions.collection",
+             "sessions",
+             %{},
+             principal,
+             &session_tuple?/1,
+             @state_history_default_limit,
+             :earliest,
+             :earliest,
+             :latest
+           ),
          :ok <- core_detail_probe(conn, "sessions", :lookup),
-         rows <-
+         page_result <-
            core_detail_operation(conn, "sessions", :row_lookup, fn ->
-             StateResources.query_sessions(
+             StateResources.query_sessions_page(
                db(conn),
-               core_detail_trace_principal(conn, principal)
+               core_detail_trace_principal(conn, principal),
+               boundary,
+               limit
              )
            end),
-         {:ok, page_rows, page} <- state_session_page(rows, query),
+         page <-
+           state_page_metadata(
+             page_result.rows,
+             page_result.flags,
+             &session_tuple/1,
+             "sessions.collection",
+             "sessions",
+             %{},
+             principal,
+             :asc
+           ),
          :ok <- core_detail_probe(conn, "sessions", :schema),
          :ok <- core_detail_probe(conn, "sessions", :serializer),
-         item_bytes <- session_index_item_bytes(page_rows, state_catalog(conn)),
+         item_bytes <- session_index_item_bytes(page_result.rows, state_catalog(conn)),
          :ok <- core_detail_probe(conn, "sessions", :encoder),
          :ok <- core_detail_probe(conn, "sessions", :envelope) do
       core_detail_trace(conn, {:envelope, "sessions"})
@@ -769,25 +855,245 @@ defmodule Tightbeam.Wire.Router do
   end
 
   defp session_index_request(query) do
-    if Enum.all?(Map.keys(query), &(&1 in ["asUser", "limit", "after"])),
+    if Enum.all?(Map.keys(query), &(&1 in ["asUser", "limit", "before", "after", "tail"])),
       do: :ok,
       else: {:error, 400, "invalid_filter", nil}
   end
+
+  defp stream_collection_request(query) do
+    if Enum.all?(Map.keys(query), &(&1 in ["limit", "before", "after", "tail"])),
+      do: :ok,
+      else: {:error, 400, "invalid_filter", nil}
+  end
+
+  defp work_collection_request(query) do
+    if Enum.all?(Map.keys(query),
+         &(&1 in ["status", "state", "sessionKey", "limit", "before", "after", "tail"])
+       ),
+      do: :ok,
+      else: {:error, 400, "invalid_filter", nil}
+  end
+
+  defp work_session_filter(nil), do: :ok
+  defp work_session_filter(value) when is_binary(value) and value != "", do: :ok
+  defp work_session_filter(_value), do: {:error, 400, "invalid_filter", nil}
+
+  defp work_cursor_filters(filters) do
+    %{"state" => [filters.state]}
+    |> maybe_put_filter("status", filters.status)
+    |> maybe_put_filter("sessionKey", filters.session_key)
+  end
+
+  defp maybe_put_filter(filters, _field, nil), do: filters
+  defp maybe_put_filter(filters, field, values) when is_list(values), do: Map.put(filters, field, values)
+  defp maybe_put_filter(filters, field, value), do: Map.put(filters, field, [value])
+
+  defp state_page_request(
+         query,
+         route,
+         resource,
+         filters,
+         principal,
+         tuple_valid?,
+         default_limit,
+         default,
+         head_boundary,
+         tail_boundary
+       ) do
+    with {:ok, limit} <- state_page_limit(Map.get(query, "limit", []), default_limit),
+         {:ok, before_cursor} <- state_page_cursor_value(query, "before"),
+         {:ok, after_cursor} <- state_page_cursor_value(query, "after"),
+         true <- is_nil(before_cursor) or is_nil(after_cursor),
+         {:ok, tail_option} <- state_page_tail(Map.get(query, "tail", [])) do
+      case {before_cursor, after_cursor, tail_option} do
+        {cursor, nil, nil} when is_binary(cursor) ->
+          with {:ok, tuple} <- state_cursor_decode(cursor, "before", route, resource, filters, principal, tuple_valid?) do
+            {:ok, limit, {:before, tuple}}
+          end
+
+        {nil, cursor, nil} when is_binary(cursor) ->
+          with {:ok, tuple} <- state_cursor_decode(cursor, "after", route, resource, filters, principal, tuple_valid?) do
+            {:ok, limit, {:after, tuple}}
+          end
+
+        {nil, nil, nil} ->
+          {:ok, limit, default}
+
+        {nil, nil, true} ->
+          {:ok, limit, tail_boundary}
+
+        {nil, nil, false} ->
+          {:ok, limit, head_boundary}
+
+        _ ->
+          {:error, 400, "invalid_cursor", nil}
+      end
+    else
+      false -> {:error, 400, "invalid_cursor", nil}
+      {:error, _status, _code, _message} = error -> error
+      _ -> {:error, 400, "invalid_cursor", nil}
+    end
+  end
+
+  defp state_page_limit([], default), do: {:ok, default}
+
+  defp state_page_limit([value], _default) do
+    if value =~ ~r/^[1-9][0-9]*$/ and String.to_integer(value) <= @state_max_limit,
+      do: {:ok, String.to_integer(value)},
+      else: {:error, 400, "invalid_limit", nil}
+  end
+
+  defp state_page_limit(_values, _default), do: {:error, 400, "invalid_limit", nil}
+
+  defp state_page_cursor_value(query, key) do
+    case Map.get(query, key, []) do
+      [] -> {:ok, nil}
+      [value] when value != "" -> {:ok, value}
+      _ -> {:error, 400, "invalid_cursor", nil}
+    end
+  end
+
+  defp state_page_tail([]), do: {:ok, nil}
+  defp state_page_tail(["true"]), do: {:ok, true}
+  defp state_page_tail(["false"]), do: {:ok, false}
+  defp state_page_tail(_values), do: {:error, 400, "invalid_filter", nil}
+
+  defp state_cursor_decode(cursor, direction, route, resource, filters, principal, tuple_valid?) do
+    with {:ok, bytes} <- Base.url_decode64(cursor, padding: false),
+         {:ok, payload} when is_map(payload) <- JSON.decode(bytes),
+         true <- Enum.sort(Map.keys(payload)) == d1_cursor_keys(),
+         true <- payload["version"] == @d1_cursor_version,
+         true <- payload["route"] == route and payload["resource"] == resource,
+         true <- payload["direction"] == direction,
+         true <- payload["filters"] == d1_filter_fingerprint(filters),
+         true <- payload["principalKind"] == state_cursor_principal_kind(principal),
+         true <- payload["principalId"] == principal.id,
+         true <- tuple_valid?.(payload["tuple"]) do
+      {:ok, payload["tuple"]}
+    else
+      _ -> {:error, 400, "invalid_cursor", nil}
+    end
+  rescue
+    _error in [ArgumentError, KeyError, MatchError] -> {:error, 400, "invalid_cursor", nil}
+  end
+
+  defp state_page_metadata(rows, flags, tuple, route, resource, filters, principal, sort) do
+    {oldest, newest} =
+      case {rows, sort} do
+        {[], _} -> {nil, nil}
+        {items, :asc} -> {hd(items), List.last(items)}
+        {items, :desc} -> {List.last(items), hd(items)}
+      end
+
+    %{
+      "oldestCursor" =>
+        if(oldest, do: state_cursor_encode(tuple.(oldest), "before", route, resource, filters, principal)),
+      "newestCursor" =>
+        if(newest, do: state_cursor_encode(tuple.(newest), "after", route, resource, filters, principal)),
+      "hasMoreBefore" => flags.has_more_before,
+      "hasMoreAfter" => flags.has_more_after
+    }
+  end
+
+  defp state_cursor_encode(tuple, direction, route, resource, filters, principal) do
+    JSON.encode!(%{
+      "version" => @d1_cursor_version,
+      "route" => route,
+      "resource" => resource,
+      "direction" => direction,
+      "filters" => d1_filter_fingerprint(filters),
+      "principalKind" => state_cursor_principal_kind(principal),
+      "principalId" => principal.id,
+      "tuple" => tuple
+    })
+    |> Base.url_encode64(padding: false)
+  end
+
+  defp state_cursor_principal_kind(%{kind: "user", is_admin: true}), do: "user-admin"
+  defp state_cursor_principal_kind(%{kind: kind}), do: kind
+
+  defp one_query_value(query, key) do
+    case Map.get(query, key, []) do
+      [] -> {:ok, nil}
+      [value] -> {:ok, value}
+      _ -> {:error, 400, "invalid_filter", nil}
+    end
+  end
+
+  defp session_tuple(%{created_at: created_at, session_key: session_key}),
+    do: [created_at, session_key]
+
+  defp session_tuple?([created_at, session_key]),
+    do: is_integer(created_at) and is_binary(session_key) and session_key != ""
+
+  defp session_tuple?(_tuple), do: false
+
+  defp session_collection_tuple("transcript messages", %{seq: seq}), do: [seq]
+  defp session_collection_tuple("turns", %{seq: seq}), do: [seq]
+  defp session_collection_tuple("wakes", %{created_at: created_at, wake_id: wake_id}),
+    do: [created_at, wake_id]
+
+  defp session_collection_tuple?(_resource, [seq]) when is_integer(seq) and seq > 0, do: true
+
+  defp session_collection_tuple?(
+         "wakes",
+         [created_at, wake_id]
+       ),
+       do: is_integer(created_at) and is_binary(wake_id) and wake_id != ""
+
+  defp session_collection_tuple?(_resource, _tuple), do: false
+
+  defp stream_tuple(%{order_index: order_index, created_at: created_at, session_key: session_key}),
+    do: [order_index, created_at, session_key]
+
+  defp stream_tuple?([order_index, created_at, session_key]),
+    do:
+      is_integer(order_index) and is_integer(created_at) and is_binary(session_key) and
+        session_key != ""
+
+  defp stream_tuple?(_tuple), do: false
+
+  defp work_tuple(%{openedAt: opened_at, id: id}), do: [opened_at, id]
+  defp work_tuple?([opened_at, id]), do: is_integer(opened_at) and is_binary(id) and id != ""
+  defp work_tuple?(_tuple), do: false
 
   defp session_collection(conn, session_key, resource, query_fun, serializer) do
     with {:ok, auth} <- selected_session_auth(conn),
          {:ok, request} <- decode_state_query(conn),
          {:ok, principal} <- selected_session_principal(auth, request),
          :ok <- session_collection_request(request, session_key),
+         {:ok, limit, boundary} <-
+           state_page_request(
+             request,
+             "session.#{resource}.collection:#{session_key}",
+             resource,
+             %{},
+             principal,
+             &session_collection_tuple?(resource, &1),
+             @state_history_default_limit,
+             if(resource == "transcript messages", do: :latest, else: :earliest),
+             :earliest,
+             :latest
+           ),
          session when not is_nil(session) <-
            StateResources.query_session(db(conn), %{key: session_key, principal: principal}),
-         rows <- apply(StateResources, query_fun, [db(conn), session_key]),
-         items <- Enum.map(rows, &apply(StateResources, serializer, [&1])),
-         {:ok, page_items, page} <- state_session_page(items, request) do
+         page_result <- apply(StateResources, query_fun, [db(conn), session_key, boundary, limit]),
+         page <-
+           state_page_metadata(
+             page_result.rows,
+             page_result.flags,
+             &session_collection_tuple(resource, &1),
+             "session.#{resource}.collection:#{session_key}",
+             resource,
+             %{},
+             principal,
+             :asc
+           ),
+         items <- Enum.map(page_result.rows, &apply(StateResources, serializer, [&1])) do
       body = %{
         "schemaVersion" => 1,
         "resource" => resource,
-        "items" => page_items,
+        "items" => items,
         "page" => page
       }
 
@@ -803,52 +1109,12 @@ defmodule Tightbeam.Wire.Router do
 
   defp session_collection_request(query, session_key) do
     valid_keys? =
-      Enum.all?(Map.keys(query), &(&1 in ["sessionKey", "limit", "after"]))
+      Enum.all?(Map.keys(query), &(&1 in ["sessionKey", "limit", "before", "after", "tail"]))
 
     selected? = Map.get(query, "sessionKey", []) in [[], [session_key]]
 
     if valid_keys? and selected?, do: :ok, else: {:error, 400, "invalid_filter", nil}
   end
-
-  defp state_session_page(items, request) do
-    with {:ok, limit} <- session_collection_limit(Map.get(request, "limit", [])),
-         {:ok, offset} <- session_collection_offset(Map.get(request, "after", [])) do
-      page_items = items |> Enum.drop(offset) |> Enum.take(limit)
-      next_offset = offset + length(page_items)
-      has_more = next_offset < length(items)
-
-      {:ok, page_items,
-       %{
-         "oldestCursor" =>
-           if(offset > 0, do: Integer.to_string(max(offset - limit, 0)), else: nil),
-         "newestCursor" => if(page_items != [], do: Integer.to_string(next_offset), else: nil),
-         "hasMoreBefore" => offset > 0,
-         "hasMoreAfter" => has_more
-       }}
-    end
-  end
-
-  defp session_collection_limit([]), do: {:ok, 500}
-
-  defp session_collection_limit([value]) do
-    case Integer.parse(value) do
-      {limit, ""} when limit > 0 and limit <= 500 -> {:ok, limit}
-      _ -> {:error, 400, "invalid_limit", nil}
-    end
-  end
-
-  defp session_collection_limit(_), do: {:error, 400, "invalid_limit", nil}
-
-  defp session_collection_offset([]), do: {:ok, 0}
-
-  defp session_collection_offset([value]) do
-    case Integer.parse(value) do
-      {offset, ""} when offset >= 0 -> {:ok, offset}
-      _ -> {:error, 400, "invalid_cursor", nil}
-    end
-  end
-
-  defp session_collection_offset(_), do: {:error, 400, "invalid_cursor", nil}
 
   defp selected_session_auth(conn) do
     case bearer_token(conn) do
@@ -1151,28 +1417,6 @@ defmodule Tightbeam.Wire.Router do
     end
   end
 
-  defp d1_work_item_rows(conn, filters, principal) do
-    selections =
-      Enum.reduce(filters, [%{}], fn {field, values}, selections ->
-        for selection <- selections, value <- values, do: Map.put(selection, field, value)
-      end)
-
-    selections
-    |> Enum.flat_map(fn selection ->
-      selection =
-        case selection["isBug"] do
-          "true" -> Map.put(selection, "isBug", 1)
-          "false" -> Map.put(selection, "isBug", 0)
-          _ -> selection
-        end
-
-      StateResources.query_work_item(db(conn), selection, %{rest_principal: principal})
-    end)
-    |> Enum.uniq_by(& &1.id)
-    |> Enum.map(&StateResources.work_item/1)
-    |> Enum.sort_by(&[&1["createdAt"], &1["id"]])
-  end
-
   defp d1_row_tuple(:work_items, item),
     do: [Map.fetch!(item, "createdAt"), Map.fetch!(item, "id")]
 
@@ -1186,19 +1430,41 @@ defmodule Tightbeam.Wire.Router do
          {:ok, principal} <- d1_principal(auth, query, conn),
          {:ok, request} <- d1_collection_request(query, spec),
          {:ok, boundary} <- d1_boundary(request, principal, spec, conn) do
-      rows =
+      result =
         cond do
           spec.resource == "work items" ->
-            d1_work_item_rows(conn, request.filters, principal)
+            page =
+              StateResources.query_work_item_page(
+                db(conn),
+                request.filters,
+                %{rest_principal: principal},
+                boundary,
+                request.limit
+              )
+
+            %{
+              items: Enum.map(page.rows, &StateResources.work_item/1),
+              flags: %{
+                has_more_before: page.has_more_before,
+                has_more_after: page.has_more_after
+              }
+            }
 
           D1Read.visible?(d1_resource(spec), principal.is_admin) ->
-            D1Read.collection(db(conn), deps(conn).base_dir, d1_resource(spec), request.filters)
+            D1Read.page(
+              db(conn),
+              deps(conn).base_dir,
+              d1_resource(spec),
+              request.filters,
+              boundary,
+              request.limit
+            )
 
           true ->
-            []
+            %{items: [], flags: %{has_more_before: false, has_more_after: false}}
         end
 
-      {items, page} = d1_page(rows, boundary, request, principal, spec, conn)
+      {items, page} = d1_keyset_page(result, request, principal, spec, conn)
       d1_send(conn, 200, d1_collection_envelope(spec, items, page))
     else
       {:error, status, code, message} -> d1_error(conn, spec.resource, status, code, message)
@@ -1318,16 +1584,19 @@ defmodule Tightbeam.Wire.Router do
   end
 
   defp d1_collection_request(query, spec) do
-    allowed = spec.filters ++ ~w(asUser before after limit)
+    allowed = spec.filters ++ ~w(asUser before after limit tail)
 
     with true <- Enum.all?(Map.keys(query), &(&1 in allowed)),
          {:ok, before} <- d1_single(query, "before"),
          {:ok, after_cursor} <- d1_single(query, "after"),
          true <- is_nil(before) or is_nil(after_cursor),
+         {:ok, tail_value} <- d1_single(query, "tail"),
+         {:ok, tail} <- d1_tail_value(tail_value),
+         true <- is_nil(tail) or (is_nil(before) and is_nil(after_cursor)),
          {:ok, limit_value} <- d1_single(query, "limit"),
          {:ok, limit} <- d1_limit(limit_value),
          {:ok, filters} <- d1_filters(query, spec.filters, spec.resource) do
-      {:ok, %{before: before, after: after_cursor, limit: limit, filters: filters}}
+      {:ok, %{before: before, after: after_cursor, tail: tail, limit: limit, filters: filters}}
     else
       _ -> {:error, 400, "invalid_filter", nil}
     end
@@ -1340,6 +1609,11 @@ defmodule Tightbeam.Wire.Router do
       _ -> :error
     end
   end
+
+  defp d1_tail_value(nil), do: {:ok, nil}
+  defp d1_tail_value("true"), do: {:ok, true}
+  defp d1_tail_value("false"), do: {:ok, false}
+  defp d1_tail_value(_value), do: :error
 
   defp d1_limit(nil), do: {:ok, @d1_default_limit}
 
@@ -1382,6 +1656,12 @@ defmodule Tightbeam.Wire.Router do
   defp d1_filter_value?("status", value), do: value in ~w(available installed)
   defp d1_filter_value?(_field, value), do: is_binary(value) and value != ""
 
+  defp d1_boundary(%{before: nil, after: nil, tail: true}, _principal, _spec, _conn),
+    do: {:ok, :latest}
+
+  defp d1_boundary(%{before: nil, after: nil, tail: false}, _principal, _spec, _conn),
+    do: {:ok, :earliest}
+
   defp d1_boundary(%{before: nil, after: nil}, _principal, _spec, _conn), do: {:ok, :latest}
 
   defp d1_boundary(%{before: cursor} = request, principal, spec, conn) when is_binary(cursor),
@@ -1418,59 +1698,33 @@ defmodule Tightbeam.Wire.Router do
       is_list(tuple) and length(tuple) == length(D1Read.spec(resource).order) and
         Enum.all?(tuple, &(is_binary(&1) and &1 != ""))
 
-  defp d1_page(rows, boundary, request, principal, spec, conn) do
-    selected =
-      case boundary do
-        :latest ->
-          Enum.take(rows, -request.limit)
-
-        {:before, tuple} ->
-          rows
-          |> Enum.filter(&(d1_row_tuple(d1_resource(spec), &1) < tuple))
-          |> Enum.take(-request.limit)
-
-        {:after, tuple} ->
-          rows
-          |> Enum.filter(&(d1_row_tuple(d1_resource(spec), &1) > tuple))
-          |> Enum.take(request.limit)
-      end
-
-    tuples = Enum.map(selected, &d1_row_tuple(d1_resource(spec), &1))
+  defp d1_keyset_page(result, request, principal, spec, conn) do
+    selected = result.items
+    flags = result.flags
 
     page =
-      case tuples do
+      case selected do
         [] ->
-          d1_empty_page(rows, boundary, spec)
+          %{
+            oldest: nil,
+            newest: nil,
+            before: flags.has_more_before,
+            after: flags.has_more_after
+          }
 
         _ ->
-          oldest = hd(tuples)
-          newest = List.last(tuples)
+          oldest = d1_row_tuple(d1_resource(spec), hd(selected))
+          newest = d1_row_tuple(d1_resource(spec), List.last(selected))
 
           %{
             oldest: d1_cursor(oldest, "before", request.filters, principal, spec, conn),
             newest: d1_cursor(newest, "after", request.filters, principal, spec, conn),
-            before: Enum.any?(rows, &(d1_row_tuple(d1_resource(spec), &1) < oldest)),
-            after: Enum.any?(rows, &(d1_row_tuple(d1_resource(spec), &1) > newest))
+            before: flags.has_more_before,
+            after: flags.has_more_after
           }
       end
 
     {selected, page}
-  end
-
-  defp d1_empty_page(rows, boundary, spec) do
-    {before_more, after_more} =
-      case boundary do
-        :latest ->
-          {false, false}
-
-        {:before, tuple} ->
-          {false, Enum.any?(rows, &(d1_row_tuple(d1_resource(spec), &1) >= tuple))}
-
-        {:after, tuple} ->
-          {Enum.any?(rows, &(d1_row_tuple(d1_resource(spec), &1) <= tuple)), false}
-      end
-
-    %{oldest: nil, newest: nil, before: before_more, after: after_more}
   end
 
   defp d1_cursor(tuple, direction, filters, principal, spec, _conn) do
