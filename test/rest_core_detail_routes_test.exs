@@ -728,8 +728,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert mismatched_session_filter.status == 400
     assert JSON.decode!(mismatched_session_filter.resp_body)["error"]["code"] == "invalid_filter"
 
-    single_message_session =
-      ensure_main_session(ctx.db, "outsider-single-message-page")
+    single_message_session = session
 
     {:appended, single_message} =
       Projection.append(ctx.db, %{
