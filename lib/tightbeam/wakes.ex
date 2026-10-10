@@ -781,7 +781,7 @@ defmodule Tightbeam.Wakes do
       "based on current purpose and obligations, act within your existing authority, then record " <>
       "what you did on an open assignment with a progress attest naming this child and occurrence. " <>
       "Use note: completion-handoff-action #{event.assignment_id} #{event.source_kind} " <>
-      "#{event.source_token} kept|parked|retired — <what you did>. " <>
+      "#{event.source_token} kept|parked|retired: <what you did>. " <>
       "A refusal or failed action must be reported truthfully. Notice #{root_wake_id}."
   end
 
@@ -876,7 +876,7 @@ defmodule Tightbeam.Wakes do
 
   defp terminal_action_note_matches?(note, event) when is_binary(note) do
     case Regex.run(
-           ~r/\Acompletion-handoff-action ([^\s]+) ([^\s]+) ([^\s]+) (kept|parked|retired) — (.+)\z/u,
+           ~r/\Acompletion-handoff-action ([^\s]+) ([^\s]+) ([^\s]+) (kept|parked|retired): (.+)\z/u,
            note,
            capture: :all_but_first
          ) do
