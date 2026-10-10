@@ -728,7 +728,21 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert mismatched_session_filter.status == 400
     assert JSON.decode!(mismatched_session_filter.resp_body)["error"]["code"] == "invalid_filter"
 
-    single_message_session = session
+    single_message_session =
+      Org.create(ctx.db, %{
+        session_key: "#{owner}-single-message-page",
+        display_name: "#{owner}-single-message-page",
+        kind: "custom",
+        owner_user_id: owner,
+        origin: "user:#{owner}",
+        archetype: "default",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable"),
+        host: "testhost"
+      })
+
+    assert single_message_session.owner_user_id == owner
 
     {:appended, single_message} =
       Projection.append(ctx.db, %{
@@ -739,31 +753,50 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
         attachments: []
       })
 
-    single_message_page =
+    {:ok, [[single_message_count]]} =
+      DB.query(ctx.db, "SELECT COUNT(*) FROM messages WHERE sessionKey = ?", [
+        single_message_session.session_key
+      ])
+
+    assert single_message_count == 1
+
+    single_message_response =
       get(
         ctx,
         "/api/sessions/#{single_message_session.session_key}/messages",
         outsider_device.token
       )
-      |> then(&JSON.decode!(&1.resp_body))
 
-    before_single_message =
+    assert single_message_response.status == 200
+    single_message_page = JSON.decode!(single_message_response.resp_body)
+    assert Enum.map(single_message_page["items"], & &1["seq"]) == [single_message.seq]
+
+    oldest_cursor = single_message_page["page"]["oldestCursor"]
+    newest_cursor = single_message_page["page"]["newestCursor"]
+    assert is_binary(oldest_cursor) and oldest_cursor != ""
+    assert is_binary(newest_cursor) and newest_cursor != ""
+    assert single_message_page["page"]["hasMoreBefore"] == false
+    assert single_message_page["page"]["hasMoreAfter"] == false
+
+    before_single_message_response =
       get(
         ctx,
-        "/api/sessions/#{single_message_session.session_key}/messages?before=" <>
-          single_message_page["page"]["oldestCursor"],
+        "/api/sessions/#{single_message_session.session_key}/messages?before=" <> oldest_cursor,
         outsider_device.token
       )
-      |> then(&JSON.decode!(&1.resp_body))
 
-    after_single_message =
+    assert before_single_message_response.status == 200
+    before_single_message = JSON.decode!(before_single_message_response.resp_body)
+
+    after_single_message_response =
       get(
         ctx,
-        "/api/sessions/#{single_message_session.session_key}/messages?after=" <>
-          single_message_page["page"]["newestCursor"],
+        "/api/sessions/#{single_message_session.session_key}/messages?after=" <> newest_cursor,
         outsider_device.token
       )
-      |> then(&JSON.decode!(&1.resp_body))
+
+    assert after_single_message_response.status == 200
+    after_single_message = JSON.decode!(after_single_message_response.resp_body)
 
     assert before_single_message["items"] == []
     assert before_single_message["page"]["hasMoreBefore"] == false
@@ -771,8 +804,6 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert after_single_message["items"] == []
     assert after_single_message["page"]["hasMoreBefore"] == false
     assert after_single_message["page"]["hasMoreAfter"] == false
-    assert Enum.map(single_message_page["items"], & &1["seq"]) == [single_message.seq]
-
     wakes =
       for index <- 1..3 do
         Wakes.schedule(ctx.db, %{
