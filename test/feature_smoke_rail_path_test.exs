@@ -146,6 +146,7 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
     }
 
     state = %{
+      user_id: Org.get(db, Org.personal_session_key("mike")).owner_user_id,
       port: port,
       token: "tbc_fixture",
       base_dir: base,

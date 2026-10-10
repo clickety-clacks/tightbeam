@@ -369,6 +369,7 @@ defmodule Tightbeam.NoticeBatcherFixture do
   end
 
   defp scenario(9, db) do
+    assert Org.get(db, "agent:recipient").harness == "claude"
     routine = for n <- 1..50, do: eligible(db, prompt: "notice #{n}")
     alarm = ordinary(db, "algedonic", "priority before capacity")
     withdrawn = eligible(db, prompt: "withdraw before readiness")
@@ -376,24 +377,24 @@ defmodule Tightbeam.NoticeBatcherFixture do
     assert Enum.all?(sources, &(NoticeBatcher.source_refs(db, &1.wake_id) == []))
     withdraw!(db, withdrawn)
 
-    [first_carrier, second_carrier] = NoticeBatcher.recover(db, alarm.due_at)
+    # Claude has no evidenced fixed prompt-string cap: member 51 belongs to
+    # this same eligible snapshot, with priority and raw sources preserved.
+    [carrier] = NoticeBatcher.recover(db, alarm.due_at)
     ordered_ids = [alarm.wake_id | Enum.map(routine, & &1.wake_id)]
-    assert_actual_carrier!(db, first_carrier, Enum.take(ordered_ids, 50))
-    assert_actual_carrier!(db, second_carrier, Enum.drop(ordered_ids, 50))
-    assert source_ids(db, first_carrier) ++ source_ids(db, second_carrier) == ordered_ids
+    assert_actual_carrier!(db, carrier, ordered_ids)
+    assert source_ids(db, carrier) == ordered_ids
     assert NoticeBatcher.source_refs(db, withdrawn.wake_id) == []
     assert Wakes.get(db, withdrawn.wake_id).state == "canceled"
     assert Wakes.get(db, withdrawn.wake_id).prompt == withdrawn.prompt
 
     for source <- sources, do: assert(Wakes.get(db, source.wake_id).prompt == source.prompt)
-    assert count(db, "notice_batches") == 2
+    assert count(db, "notice_batches") == 1
     assert count(db, "notice_batch_members") == 51
-    assert NoticeBatcher.batch(db, batch_id(db, alarm)).member_count == 50
-    assert NoticeBatcher.batch(db, batch_id(db, List.last(routine))).member_count == 1
+    assert NoticeBatcher.batch(db, batch_id(db, alarm)).member_count == 51
+    assert batch_id(db, List.last(routine)) == batch_id(db, alarm)
     assert NoticeBatcher.batch(db, batch_id(db, alarm)).release_cause == "idle"
 
-    assert {:ok, [[^first_carrier], [^second_carrier]]} =
-             DB.query(db, "SELECT wakeId FROM turns ORDER BY seq")
+    assert {:ok, [[^carrier]]} = DB.query(db, "SELECT wakeId FROM turns ORDER BY seq")
 
     committed = delivery_snapshot(db)
     assert NoticeBatcher.recover(db, alarm.due_at) == []
@@ -401,19 +402,33 @@ defmodule Tightbeam.NoticeBatcherFixture do
   end
 
   defp scenario(10, db) do
-    first = eligible(db, prompt: String.duplicate("a", 1_000))
-    payload = String.duplicate("b", 65_000)
+    codex_recipient!(db, "agent:recipient")
+    first = eligible(db, prompt: String.duplicate("🙂", 550_000))
+    payload = String.duplicate("e\u0301", 275_000)
     candidate = eligible(db, prompt: payload)
+    assert scalar_count(first.prompt) == 550_000
+    assert scalar_count(payload) == 550_000
+    assert String.length(payload) == 275_000
     [first_carrier, second_carrier] = NoticeBatcher.recover(db, candidate.due_at)
     assert_actual_carrier!(db, first_carrier, [first.wake_id])
     assert_actual_carrier!(db, second_carrier, [candidate.wake_id])
     assert [%{payload: ^payload}] = NoticeBatcher.members(db, batch_id(db, candidate))
     assert Wakes.get(db, candidate.wake_id).prompt == payload
+    assert Wakes.get(db, first.wake_id).prompt == first.prompt
     first_batch = NoticeBatcher.batch(db, batch_id(db, first))
     second_batch = NoticeBatcher.batch(db, batch_id(db, candidate))
-    assert first_batch.rendered_bytes <= 65_536
-    assert second_batch.rendered_bytes <= 65_536
-    assert first_batch.rendered_bytes + second_batch.rendered_bytes > 65_536
+    first_prompt = codex_submission!(db, first_carrier)
+    second_prompt = codex_submission!(db, second_carrier)
+    assert first_prompt =~ first.prompt
+    assert second_prompt =~ payload
+    assert byte_size(first_prompt) > scalar_count(first_prompt)
+    assert byte_size(second_prompt) > scalar_count(second_prompt)
+    # The next indivisible ordered source cannot fit with the first, even
+    # before its header; both complete submissions separately fit in scalars.
+    assert scalar_count(first_prompt) + scalar_count(payload) > 1_048_576
+    assert scalar_count(first_prompt) + scalar_count(second_prompt) > 1_048_576
+    assert first_batch.rendered_bytes > 65_536
+    assert second_batch.rendered_bytes > 65_536
     assert count(db, "notice_batches") == 2
     assert count(db, "notice_batch_members") == 2
     committed = delivery_snapshot(db)
@@ -734,15 +749,21 @@ defmodule Tightbeam.NoticeBatcherFixture do
   defp scenario(23, db) do
     lane = [session: "agent:payload-floor"]
     seed_session(db, "agent:payload-floor", "payload-floor-owner")
+    codex_recipient!(db, "agent:payload-floor")
     set_lane_policy(db, lane, false)
 
     source =
       fyi(
         db,
-        Keyword.merge(lane, wake_id: "w_payload_floor", prompt: String.duplicate("x", 65_536))
+        Keyword.merge(lane,
+          wake_id: "w_payload_floor",
+          prompt: String.duplicate("🙂", 1_048_576)
+        )
       )
 
-    assert byte_size(source.prompt) == 65_536
+    # Raw text reaches the scalar limit; every real wrapper is additional.
+    assert scalar_count(source.prompt) == 1_048_576
+    assert byte_size(source.prompt) == 4 * 1_048_576
     assert source.delivery_rule == NoticeBatcher.rule()
     assert_retired_tables_absent!(db)
     assert_capacity_hold!(db, [source], source.due_at)
@@ -753,45 +774,91 @@ defmodule Tightbeam.NoticeBatcherFixture do
     withdraw!(db, source)
     [carrier] = Wakes.materialize_digests(db, later.due_at)
     assert_actual_carrier!(db, carrier, [later.wake_id])
+    assert Wakes.get(db, source.wake_id).state == "canceled"
+    assert NoticeBatcher.source_refs(db, source.wake_id) == []
+    assert count(db, "notice_batch_members") == 1
+    assert count(db, "notice_batches") == 1
     assert_retired_tables_absent!(db)
   end
 
   defp scenario(24, db) do
+    probe_id = "w_rendered_boundary_probe"
     fitting_id = "w_rendered_boundary_fit"
     overflow_id = "w_rendered_boundary_over"
-    fitting_header = rendered_member_header(fitting_id)
-    overflow_header = rendered_member_header(overflow_id)
-    seed_session(db, "agent:rendered-fit", "rendered-fit-owner")
-    seed_session(db, "agent:rendered-over", "rendered-over-owner")
+
+    for {session, owner} <- [
+          {"agent:rendered-probe", "rendered-probe-owner"},
+          {"agent:rendered-fit", "rendered-fit-owner"},
+          {"agent:rendered-over", "rendered-over-owner"}
+        ] do
+      seed_session(db, session, owner)
+      codex_recipient!(db, session)
+    end
+
+    # Measure the complete real turn prompt, including Gateway's sender stamp
+    # and the immutable carrier envelope. Each fresh recipient starts at seq 1;
+    # only the source identifier width differs, not UUID/hash/token widths.
+    probe =
+      eligible(db,
+        session: "agent:rendered-probe",
+        wake_id: probe_id,
+        prompt: "nonempty wrapper measurement"
+      )
+
+    [probe_carrier] = Wakes.materialize_digests(db, probe.due_at)
+    assert_actual_carrier!(db, probe_carrier, [probe.wake_id])
+    probe_prompt = codex_submission!(db, probe_carrier)
+    assert probe_prompt =~ rendered_member_header(probe_id) <> probe.prompt
+    wrapper_chars = scalar_count(probe_prompt) - scalar_count(probe.prompt)
+    fitting_overhead = wrapper_chars - scalar_count(probe_id) + scalar_count(fitting_id)
+    overflow_overhead = wrapper_chars - scalar_count(probe_id) + scalar_count(overflow_id)
 
     fitting =
       eligible(db,
         session: "agent:rendered-fit",
         wake_id: fitting_id,
-        prompt: String.duplicate("a", 65_536 - byte_size(fitting_header))
+        prompt: String.duplicate("🙂", 1_048_576 - fitting_overhead)
       )
 
     assert NoticeBatcher.source_refs(db, fitting.wake_id) == []
     [fitting_carrier] = Wakes.materialize_digests(db, fitting.due_at)
     fitting_batch_id = batch_id(db, fitting)
+    assert [%{rendered_bytes: rendered_bytes, payload: fitting_payload}] =
+             NoticeBatcher.members(db, fitting_batch_id)
 
-    assert [%{rendered_bytes: 65_536}] = NoticeBatcher.members(db, fitting_batch_id)
+    assert fitting_payload == fitting.prompt
+    assert rendered_bytes == byte_size(rendered_member_header(fitting_id) <> fitting.prompt)
+    assert rendered_bytes > 65_536
     assert NoticeBatcher.batch(db, fitting_batch_id).delivery_wake_id == fitting_carrier
+    submitted = codex_submission!(db, fitting_carrier)
+    assert scalar_count(submitted) == 1_048_576
+    assert byte_size(submitted) > 1_048_576
+    assert submitted =~ rendered_member_header(fitting_id) <> fitting.prompt
+    assert Wakes.get(db, fitting.wake_id).prompt == fitting.prompt
 
     overflow =
       eligible(db,
         session: "agent:rendered-over",
         wake_id: overflow_id,
-        prompt: String.duplicate("b", 65_537 - byte_size(overflow_header))
+        prompt: String.duplicate("🙂", 1_048_577 - overflow_overhead)
       )
 
+    assert scalar_count(overflow.prompt) + overflow_overhead == 1_048_577
     assert overflow.delivery_rule == NoticeBatcher.rule()
     assert Wakes.get(db, overflow.wake_id).state == "pending"
     assert NoticeBatcher.source_refs(db, overflow.wake_id) == []
     assert_capacity_hold!(db, [overflow], overflow.due_at)
     assert Wakes.get(db, overflow.wake_id).delivery_rule == NoticeBatcher.rule()
     assert Wakes.get(db, overflow.wake_id).prompt == overflow.prompt
+    assert Enum.any?(EventLog.lifecycle_events(db), fn event ->
+             event.kind == "notice_source_submission_too_large" and
+               event.subject == overflow.wake_id and event.detail =~ "textChars=1048577 "
+           end)
+
     assert_actual_carrier!(db, fitting_carrier, [fitting.wake_id])
+    assert count(db, "notice_batches") == 2
+    assert count(db, "notice_batch_members") == 2
+    assert count(db, "turns") == 2
   end
 
   defp scenario(25, db) do
@@ -1015,8 +1082,21 @@ defmodule Tightbeam.NoticeBatcherFixture do
   end
 
   defp scenario(30, db) do
-    sources = for n <- 1..51, do: eligible(db, prompt: "atomic capped notice #{n}")
+    codex_recipient!(db, "agent:recipient")
+    sources =
+      for n <- 1..51 do
+        payload =
+          case n do
+            20 -> String.duplicate("🙂", 550_000)
+            40 -> String.duplicate("e\u0301", 275_000)
+            _ -> "atomic size-bounded notice #{n}"
+          end
 
+        eligible(db, prompt: payload)
+      end
+
+    # These two large Unicode sources require two ordered fitting bundles;
+    # the boundary is source 40 because of text size, never a member-count cap.
     :ok =
       DB.execute(db, """
       CREATE TRIGGER second_capped_turn_failure BEFORE INSERT ON turns
@@ -1039,8 +1119,17 @@ defmodule Tightbeam.NoticeBatcherFixture do
     :ok = DB.execute(db, "DROP TRIGGER second_capped_turn_failure")
     [first, second] = NoticeBatcher.recover(db, hd(sources).due_at)
     ids = Enum.map(sources, & &1.wake_id)
-    assert_actual_carrier!(db, first, Enum.take(ids, 50))
-    assert_actual_carrier!(db, second, Enum.drop(ids, 50))
+    assert_actual_carrier!(db, first, Enum.take(ids, 39))
+    assert_actual_carrier!(db, second, Enum.drop(ids, 39))
+    assert source_ids(db, first) ++ source_ids(db, second) == ids
+    first_prompt = codex_submission!(db, first)
+    second_prompt = codex_submission!(db, second)
+    assert scalar_count(first_prompt) + scalar_count(Enum.at(sources, 39).prompt) > 1_048_576
+    assert scalar_count(first_prompt) + scalar_count(second_prompt) > 1_048_576
+    assert count(db, "notice_batch_members") == 51
+    assert count(db, "notice_batches") == 2
+    assert count(db, "turns") == 2
+    for source <- sources, do: assert(Wakes.get(db, source.wake_id).prompt == source.prompt)
     committed = delivery_snapshot(db)
     assert NoticeBatcher.recover(db, hd(sources).due_at) == []
     assert delivery_snapshot(db) == committed
@@ -1997,6 +2086,27 @@ defmodule Tightbeam.NoticeBatcherFixture do
     end
   end
 
+  # These helpers serve only the amended Codex capacity scenarios above.
+  defp codex_recipient!(db, session) do
+    assert {:ok, []} =
+             DB.query(
+               db,
+               "UPDATE sessions SET harness='codex',provider='openai' WHERE sessionKey=?1",
+               [session]
+             )
+
+    assert Org.get(db, session).harness == "codex"
+  end
+
+  defp scalar_count(text), do: length(String.to_charlist(text))
+
+  defp codex_submission!(db, carrier) do
+    assert {:ok, [[prompt]]} = DB.query(db, "SELECT prompt FROM turns WHERE wakeId=?1", [carrier])
+    assert prompt == "[from process:tightbeam]\n\n" <> Wakes.get(db, carrier).prompt
+    assert scalar_count(prompt) <= 1_048_576
+    prompt
+  end
+
   defp assert_capacity_hold!(db, sources, at) do
     assert NoticeBatcher.recover(db, at) == []
 
@@ -2015,8 +2125,17 @@ defmodule Tightbeam.NoticeBatcherFixture do
              0
 
     assert Enum.any?(EventLog.lifecycle_events(db), fn event ->
-             event.kind == "notice_session_capacity_refused" and
-               event.subject == hd(sources).session_key and event.detail =~ "decision=dr_58874264"
+             if event.kind == "notice_source_submission_too_large" and
+                  event.subject == hd(sources).wake_id and
+                  event.detail =~ "receiver=codex " and
+                  event.detail =~ "limitChars=1048576 recipient=#{hd(sources).session_key}" do
+               case Regex.run(~r/textChars=(\d+) /, event.detail) do
+                 [_, chars] -> String.to_integer(chars) > 1_048_576
+                 _ -> false
+               end
+             else
+               false
+             end
            end)
   end
 

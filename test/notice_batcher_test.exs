@@ -48,13 +48,13 @@ defmodule Tightbeam.NoticeBatcherTest do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 8)
   end
 
-  test "acceptance 10: priority-ordered 51-member snapshot commits two lossless capped turns", %{
+  test "acceptance 10: Claude priority-ordered 51-member snapshot commits one lossless carrier", %{
     tmp_dir: tmp
   } do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 9)
   end
 
-  test "acceptance 11: the payload cap splits fitting sources without truncating either",
+  test "acceptance 11: Codex scalar limit splits fitting Unicode sources without truncation",
        %{
          tmp_dir: tmp
        } do
@@ -127,13 +127,13 @@ defmodule Tightbeam.NoticeBatcherTest do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 22)
   end
 
-  test "a selected 65,536-byte payload stays editable without a fallback bypass", %{
+  test "a Codex source exceeding the wrapped scalar limit stays editable without a bypass", %{
     tmp_dir: tmp
   } do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 23)
   end
 
-  test "the rendered V1 member boundary admits 65,536 bytes and holds the next byte", %{
+  test "the complete Codex submission admits 1048576 scalars and holds the next scalar", %{
     tmp_dir: tmp
   } do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 24)
@@ -168,7 +168,7 @@ defmodule Tightbeam.NoticeBatcherTest do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 29)
   end
 
-  test "failure of the second capped turn rolls back every chunk before exact retry", %{
+  test "failure of the second Codex size-bounded turn rolls back every chunk before exact retry", %{
     tmp_dir: tmp
   } do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 30)

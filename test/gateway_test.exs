@@ -1043,13 +1043,26 @@ defmodule Tightbeam.GatewayTest do
   end
 
   @tag recipient_readiness: true
-  test "over-cap ready snapshot stays editable under a named capacity refusal", ctx do
+  test "Codex oversized source keeps the ready snapshot editable under a named refusal", ctx do
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "UPDATE sessions SET harness='codex',provider='openai' WHERE sessionKey='k1'"
+             )
+
+    assert Org.get(ctx.db, "k1").harness == "codex"
+    # The priority source alone consumes the scalar limit; its real carrier
+    # wrapper makes it indivisible and oversized, independently of member count.
+    oversized_payload = String.duplicate("🙂", 1_048_576)
+    assert length(String.to_charlist(oversized_payload)) == 1_048_576
+    assert byte_size(oversized_payload) == 4 * 1_048_576
+
     sources =
       for i <- 1..51 do
         Tightbeam.Wakes.schedule(ctx.db, %{
           session_key: "k1",
           origin: "user:flynn",
-          prompt: "source #{i}",
+          prompt: if(i == 51, do: oversized_payload, else: "source #{i}"),
           due_at: 0,
           class: if(i == 51, do: "algedonic", else: "fyi")
         })
@@ -1060,21 +1073,29 @@ defmodule Tightbeam.GatewayTest do
              lane_manager: ctx.lane
            ) == []
 
+    assert length(sources) == 51
     assert Enum.all?(sources, fn wake ->
-             Tightbeam.Wakes.get(ctx.db, wake.wake_id).state == "pending" and
+             current = Tightbeam.Wakes.get(ctx.db, wake.wake_id)
+             current.state == "pending" and current.prompt == wake.prompt and
+               current.session_key == "k1" and
                NoticeBatcher.source_refs(ctx.db, wake.wake_id) == []
            end)
 
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey='k1'")
 
+    oversized_id = List.last(sources).wake_id
+
     assert {:ok, [[detail]]} =
              DB.query(
                ctx.db,
-               "SELECT detail FROM lifecycle_events WHERE kind='notice_session_capacity_refused' AND subject='k1'"
+               "SELECT detail FROM lifecycle_events WHERE kind='notice_source_submission_too_large' AND subject=?1",
+               [oversized_id]
              )
 
-    assert detail =~ "members=51"
-    assert detail =~ "decision=dr_58874264"
+    assert [_, chars] =
+             Regex.run(~r/^receiver=codex textChars=(\d+) limitChars=1048576 recipient=k1$/, detail)
+
+    assert String.to_integer(chars) > 1_048_576
   end
 
   @tag recipient_readiness: true
