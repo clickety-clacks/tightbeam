@@ -337,6 +337,7 @@ defmodule Tightbeam.Wire.Router do
              :latest
            ) do
       result = Org.list_for_user_page(db(conn), device.user_id, boundary, limit)
+
       page =
         state_page_metadata(
           result.rows,
@@ -606,6 +607,7 @@ defmodule Tightbeam.Wire.Router do
              :earliest
            ) do
       result = WorkState.page(db(conn), filters, boundary, limit)
+
       page =
         state_page_metadata(
           result.work,
@@ -867,11 +869,12 @@ defmodule Tightbeam.Wire.Router do
   end
 
   defp work_collection_request(query) do
-    if Enum.all?(Map.keys(query),
+    if Enum.all?(
+         Map.keys(query),
          &(&1 in ["status", "state", "sessionKey", "limit", "before", "after", "tail"])
        ),
-      do: :ok,
-      else: {:error, 400, "invalid_filter", nil}
+       do: :ok,
+       else: {:error, 400, "invalid_filter", nil}
   end
 
   defp work_session_filter(nil), do: :ok
@@ -885,7 +888,10 @@ defmodule Tightbeam.Wire.Router do
   end
 
   defp maybe_put_filter(filters, _field, nil), do: filters
-  defp maybe_put_filter(filters, field, values) when is_list(values), do: Map.put(filters, field, values)
+
+  defp maybe_put_filter(filters, field, values) when is_list(values),
+    do: Map.put(filters, field, values)
+
   defp maybe_put_filter(filters, field, value), do: Map.put(filters, field, [value])
 
   defp state_page_request(
@@ -907,12 +913,30 @@ defmodule Tightbeam.Wire.Router do
          {:ok, tail_option} <- state_page_tail(Map.get(query, "tail", [])) do
       case {before_cursor, after_cursor, tail_option} do
         {cursor, nil, nil} when is_binary(cursor) ->
-          with {:ok, tuple} <- state_cursor_decode(cursor, "before", route, resource, filters, principal, tuple_valid?) do
+          with {:ok, tuple} <-
+                 state_cursor_decode(
+                   cursor,
+                   "before",
+                   route,
+                   resource,
+                   filters,
+                   principal,
+                   tuple_valid?
+                 ) do
             {:ok, limit, {:before, tuple}}
           end
 
         {nil, cursor, nil} when is_binary(cursor) ->
-          with {:ok, tuple} <- state_cursor_decode(cursor, "after", route, resource, filters, principal, tuple_valid?) do
+          with {:ok, tuple} <-
+                 state_cursor_decode(
+                   cursor,
+                   "after",
+                   route,
+                   resource,
+                   filters,
+                   principal,
+                   tuple_valid?
+                 ) do
             {:ok, limit, {:after, tuple}}
           end
 
@@ -987,9 +1011,13 @@ defmodule Tightbeam.Wire.Router do
 
     %{
       "oldestCursor" =>
-        if(oldest, do: state_cursor_encode(tuple.(oldest), "before", route, resource, filters, principal)),
+        if(oldest,
+          do: state_cursor_encode(tuple.(oldest), "before", route, resource, filters, principal)
+        ),
       "newestCursor" =>
-        if(newest, do: state_cursor_encode(tuple.(newest), "after", route, resource, filters, principal)),
+        if(newest,
+          do: state_cursor_encode(tuple.(newest), "after", route, resource, filters, principal)
+        ),
       "hasMoreBefore" => flags.has_more_before,
       "hasMoreAfter" => flags.has_more_after
     }
@@ -1030,6 +1058,7 @@ defmodule Tightbeam.Wire.Router do
 
   defp session_collection_tuple("transcript messages", %{seq: seq}), do: [seq]
   defp session_collection_tuple("turns", %{seq: seq}), do: [seq]
+
   defp session_collection_tuple("wakes", %{created_at: created_at, wake_id: wake_id}),
     do: [created_at, wake_id]
 
@@ -1043,8 +1072,12 @@ defmodule Tightbeam.Wire.Router do
 
   defp session_collection_tuple?(_resource, _tuple), do: false
 
-  defp stream_tuple(%{order_index: order_index, created_at: created_at, session_key: session_key}),
-    do: [order_index, created_at, session_key]
+  defp stream_tuple(%{
+         order_index: order_index,
+         created_at: created_at,
+         session_key: session_key
+       }),
+       do: [order_index, created_at, session_key]
 
   defp stream_tuple?([order_index, created_at, session_key]),
     do:

@@ -755,6 +755,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     assert marker_notice["class"] == "message.created"
     assert marker_notice["payload"] == marker_canonical
+
     assert marker_notice["payload"]["marker"] == %{
              "kind" => "harness-switch",
              "from" => "claude",

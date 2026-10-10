@@ -472,7 +472,9 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       get(ctx, "/api/sessions?limit=2&tail=true", outsider_device.token)
       |> then(&JSON.decode!(&1.resp_body))
 
-    assert Enum.map(tail_sessions["items"], & &1["sessionKey"]) == Enum.take(expected_sessions, -2)
+    assert Enum.map(tail_sessions["items"], & &1["sessionKey"]) ==
+             Enum.take(expected_sessions, -2)
+
     assert tail_sessions["page"]["hasMoreBefore"] == true
     assert tail_sessions["page"]["hasMoreAfter"] == false
 
@@ -574,10 +576,15 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert exact_history["page"]["hasMoreBefore"] == false
     assert exact_history["page"]["hasMoreAfter"] == false
 
-    first_history_item = Enum.find(exact_history["items"], &(&1["seq"] == first_history_message.seq))
+    first_history_item =
+      Enum.find(exact_history["items"], &(&1["seq"] == first_history_message.seq))
+
     assert first_history_item["id"] == first_history_message.id
     assert first_history_item["clientMessageId"] == "history-client-1"
-    assert first_history_item["llmVisibleMessageId"] == first_history_message.llm_visible_message_id
+
+    assert first_history_item["llmVisibleMessageId"] ==
+             first_history_message.llm_visible_message_id
+
     assert first_history_item["rowVersion"] == first_history_message.seq
 
     direct_tail =
@@ -597,6 +604,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert Enum.map(tail_page["items"], & &1["seq"]) == Enum.take(original_seqs, -4)
     assert tail_page["page"]["hasMoreBefore"] == true
     assert tail_page["page"]["hasMoreAfter"] == false
+
     assert hd(tail_page["items"])["marker"] == %{
              "kind" => "session-restart",
              "from" => "s_before",
@@ -633,9 +641,15 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     page_2_to_5 = before_tail.(page_6_to_9["page"]["oldestCursor"])
     page_1 = before_tail.(page_2_to_5["page"]["oldestCursor"])
 
-    assert Enum.map(page_10_to_13["items"], & &1["seq"]) == Enum.take(Enum.drop(original_seqs, 9), 4)
-    assert Enum.map(page_6_to_9["items"], & &1["seq"]) == Enum.take(Enum.drop(original_seqs, 5), 4)
-    assert Enum.map(page_2_to_5["items"], & &1["seq"]) == Enum.take(Enum.drop(original_seqs, 1), 4)
+    assert Enum.map(page_10_to_13["items"], & &1["seq"]) ==
+             Enum.take(Enum.drop(original_seqs, 9), 4)
+
+    assert Enum.map(page_6_to_9["items"], & &1["seq"]) ==
+             Enum.take(Enum.drop(original_seqs, 5), 4)
+
+    assert Enum.map(page_2_to_5["items"], & &1["seq"]) ==
+             Enum.take(Enum.drop(original_seqs, 1), 4)
+
     assert Enum.map(page_1["items"], & &1["seq"]) == [hd(original_seqs)]
     assert page_1["page"]["hasMoreBefore"] == false
     assert page_1["page"]["hasMoreAfter"] == true
@@ -653,7 +667,9 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
            }
 
     visited =
-      (tail_page["items"] ++ page_10_to_13["items"] ++ page_6_to_9["items"] ++
+      (tail_page["items"] ++
+         page_10_to_13["items"] ++
+         page_6_to_9["items"] ++
          page_2_to_5["items"] ++ page_1["items"])
       |> Enum.map(& &1["seq"])
 
@@ -814,7 +830,9 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
         seq
       end
 
-    direct_turns = StateResources.query_turns_for_session_page(ctx.db, session.session_key, :earliest, 2)
+    direct_turns =
+      StateResources.query_turns_for_session_page(ctx.db, session.session_key, :earliest, 2)
+
     assert direct_turns.flags.candidate_count == 3
 
     first_turns =

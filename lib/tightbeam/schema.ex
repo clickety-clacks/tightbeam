@@ -2448,7 +2448,9 @@ defmodule Tightbeam.Schema do
            Enum.each(indexes, fn {_name, sql} -> :ok = Txn.exec(txn, sql) end)
            :ok
          end) do
-      {:ok, :ok} -> :ok
+      {:ok, :ok} ->
+        :ok
+
       {:error, error} ->
         raise ShapeError,
           message: "REST collection index migration failed: #{Exception.message(error)}"
