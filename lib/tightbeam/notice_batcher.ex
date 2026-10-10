@@ -11,7 +11,7 @@ defmodule Tightbeam.NoticeBatcher do
   wake is never rewritten merely because it became a batch member.
   """
 
-  alias Tightbeam.{DB, EventLog, Gateway, Org, SubmissionSize, Supervision, Wakes}
+  alias Tightbeam.{DB, EventLog, Gateway, Harness, Org, SubmissionSize, Supervision, Wakes}
   alias Tightbeam.DB.Txn
 
   @rule "notice-batching-v1 r2"
@@ -773,26 +773,20 @@ defmodule Tightbeam.NoticeBatcher do
     receiver = Org.get_in_txn(txn, target).harness
 
     plan =
-      case receiver do
-        "codex" ->
-          SubmissionSize.pack_codex(pairs, fn {_, row} -> render_member(row) end, fn {first, _},
-                                                                                     count ->
-            cause = release_cause(boundary, first)
-            # UUIDs, SHA256 values and token identifiers have fixed scalar
-            # widths. Use the real renderer with an empty body to measure
-            # every header/footer character, then add inter-member newlines.
-            overhead = envelope_body("nb_00000000-0000-0000-0000-000000000000", cause, count, "")
+      SubmissionSize.pack_text(
+        pairs,
+        fn {_, row} -> render_member(row) end,
+        fn {first, _}, count ->
+          cause = release_cause(boundary, first)
+          # UUIDs, SHA256 values and token identifiers have fixed scalar
+          # widths. Measure the real header/footer and inter-member newlines.
+          overhead = envelope_body("nb_00000000-0000-0000-0000-000000000000", cause, count, "")
 
-            SubmissionSize.text_chars("[from process:tightbeam]\n\n" <> overhead) +
-              2 * (count - 1)
-          end)
-
-        _ ->
-          # The pinned Claude ACP/SDK exposes no evidenced fixed ACP text
-          # maximum. Preserve the complete eligible session snapshot in one
-          # carrier; downstream acceptance is not certified by this admission.
-          {:ok, [pairs]}
-      end
+          SubmissionSize.text_chars("[from process:tightbeam]\n\n" <> overhead) +
+            2 * (count - 1)
+        end,
+        Harness.submission_text_limit(receiver)
+      )
 
     case plan do
       {:ok, chunks} ->

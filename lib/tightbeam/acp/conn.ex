@@ -89,8 +89,12 @@ defmodule Tightbeam.Acp.Conn do
     payload = JSON.encode!(%{jsonrpc: "2.0", id: id, method: method, params: params}) <> "\n"
 
     submission =
-      if method == "session/prompt" and submission_harness == "codex",
-        do: Tightbeam.SubmissionSize.check_codex(params[:prompt] || params["prompt"] || []),
+      if method == "session/prompt",
+        do:
+          Tightbeam.SubmissionSize.check_text(
+            params[:prompt] || params["prompt"] || [],
+            Tightbeam.Harness.submission_text_limit(submission_harness)
+          ),
         else: :ok
 
     cond do

@@ -1,6 +1,50 @@
 defmodule Tightbeam.SubmissionSizeTest do
   use ExUnit.Case, async: true
-  alias Tightbeam.SubmissionSize
+  alias Tightbeam.{Harness, SubmissionSize}
+
+  test "registered receiver behavior supplies the same scalar ceiling at both boundaries" do
+    parts = [%{type: "text", text: String.duplicate("🙂", 1_048_576)}, %{type: "text", text: "x"}]
+
+    for receiver <- ["codex", :codex, Tightbeam.Harness.Codex] do
+      limit = Harness.submission_text_limit(receiver)
+      assert limit == 1_048_576
+
+      assert {:error, {:submission_text_limit_exceeded, 1_048_577, ^limit}} =
+               SubmissionSize.check_text(parts, limit)
+
+      first = {1, "first"}
+      huge = {2, String.duplicate("🙂", limit)}
+
+      assert {:ok, [[^first], [^huge]]} =
+               SubmissionSize.pack_text([first, huge], &elem(&1, 1), fn _, _ -> 0 end, limit)
+    end
+  end
+
+  test "registered receiver without a fixed text maximum retains the complete ordered snapshot" do
+    limit = Harness.submission_text_limit("claude")
+    assert limit == nil
+    assert Harness.submission_text_limit(:claude) == nil
+    text = String.duplicate("🙂", 1_048_577)
+    parts = [%{type: "text", text: text}]
+    assert SubmissionSize.check_text(parts, limit) == :ok
+    items = [{1, "before"}, {2, text}, {3, "after"}]
+
+    assert {:ok, [^items]} =
+             SubmissionSize.pack_text(
+               items,
+               fn _ -> flunk("an unknown text maximum must not install a guessed limit") end,
+               fn _, _ -> flunk("an unknown text maximum must not reserve guessed overhead") end,
+               limit
+             )
+  end
+
+  test "an explicit unknown receiver cannot inherit another registered size policy" do
+    assert_raise ArgumentError, ~r/unknown harness/, fn ->
+      Harness.submission_text_limit("not-a-registered-receiver")
+    end
+
+    assert Harness.submission_text_limit(nil) == nil
+  end
 
   test "Codex counts Unicode scalar values across all text parts, not graphemes or bytes" do
     text = "e\u0301🙂"
