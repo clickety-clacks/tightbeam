@@ -826,7 +826,7 @@ defmodule Tightbeam.Ledger do
       when terminal in ~w(delivered canceled failed failed_unknown) do
     evidence = Keyword.get(opts, :prewrite_evidence)
 
-    if evidence and
+    if not is_nil(evidence) and
          Txn.q(txn, "SELECT 1 FROM turns WHERE seq=?1 AND status='running'", [seq]) == [[1]] do
       unless terminal == "failed",
         do: raise(ArgumentError, "prewrite refusal requires a failed terminal")

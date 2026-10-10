@@ -38,6 +38,52 @@ defmodule Tightbeam.LedgerTest do
     seq
   end
 
+  test "ordinary terminals without prewrite evidence commit once", %{db: db} do
+    for terminal <- ~w(delivered canceled failed failed_unknown),
+        evidence_opts <- [[], [prewrite_evidence: nil]] do
+      seq = enqueue!(db, "k1", "ordinary #{terminal}")
+      assert {:ok, turn} = Ledger.claim_next(db, "k1", "owner")
+      opts = [owner_lease: turn.owner_lease] ++ evidence_opts
+
+      assert :ok = Ledger.finish(db, seq, terminal, nil, opts)
+      assert :already_terminal = Ledger.finish(db, seq, terminal, nil, opts)
+
+      assert {:ok, [[^terminal]]} = DB.query(db, "SELECT status FROM turns WHERE seq=?1", [seq])
+
+      assert {:ok, [[1]]} =
+               DB.query(
+                 db,
+                 "SELECT COUNT(*) FROM turn_lifecycle_events WHERE turnSeq=?1 AND kind='terminal_committed'",
+                 [seq]
+               )
+    end
+
+    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM wake_retry_attempts")
+  end
+
+  test "non-nil invalid prewrite evidence refuses before changing the terminal", %{db: db} do
+    seq = enqueue!(db, "k1", "invalid prewrite evidence")
+    assert {:ok, turn} = Ledger.claim_next(db, "k1", "owner")
+
+    for evidence <- [false, %{}, %{"disposition" => "not_dispatched"}] do
+      assert {:error, %DB.Error{message: message}} =
+               DB.transaction(db, fn txn ->
+                 Ledger.finish_in_txn(txn, seq, "failed", "not dispatched",
+                   owner_lease: turn.owner_lease,
+                   prewrite_evidence: evidence
+                 )
+               end)
+
+      assert message =~ "notice_prewrite_restoration_refused"
+
+      assert {:ok, [["running", nil]]} =
+               DB.query(db, "SELECT status,endedAt FROM turns WHERE seq=?1", [seq])
+
+      assert {:ok, [["claimed"]]} =
+               DB.query(db, "SELECT kind FROM turn_lifecycle_events WHERE turnSeq=?1", [seq])
+    end
+  end
+
   test "a foreign claim lease rolls back terminal state and lifecycle evidence", %{db: db} do
     seq = enqueue!(db, "k1", "lease-fenced terminal")
     assert {:ok, turn} = Ledger.claim_next(db, "k1", "owner")

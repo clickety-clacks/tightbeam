@@ -91,7 +91,7 @@ defmodule Tightbeam.Acp.ContextUsageTest do
 
     state = %Adapter{
       harness: :codex,
-      preset: %{effort_config: "reasoning_effort"},
+      preset: Tightbeam.Harness.Codex.session_config(%{}, ""),
       models: %{"s" => model}
     }
 
@@ -109,6 +109,8 @@ defmodule Tightbeam.Acp.ContextUsageTest do
             "sessionUpdate" => "config_option_update",
             "configOptions" => [%{"id" => "model", "currentValue" => next_model}]
           })
+
+        assert state.models["s"] == Model.new(next_model)
 
         assert {:reply, {:error, :context_usage_unavailable}, ^state} =
                  Adapter.handle_call({:context_usage, "s", 1000}, nil, state)
