@@ -200,6 +200,10 @@ defmodule Tightbeam.Wire.Router do
     end
   end
 
+  post "/agent/session-diagnose" do
+    Tightbeam.SessionDiagnose.handle(conn, deps(conn))
+  end
+
   post "/agent/dispatch" do
     with {:ok, auth} <- cli_auth(conn),
          {:ok, body, conn} <- read_json(conn),

@@ -12,6 +12,10 @@ if config_env() != :test do
     config :tightbeam, :live_base_guard, transition: value
   end
 
+  if value = System.get_env("TIGHTBEAM_DIAGNOSTIC_SCOPE") do
+    config :tightbeam, :diagnostic_scope, Tightbeam.SessionDiagnose.scope(value)
+  end
+
   if value = System.get_env("TIGHTBEAM_PORT") do
     config :tightbeam, :port, String.to_integer(value)
   end

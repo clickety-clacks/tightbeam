@@ -220,6 +220,18 @@ defmodule Tightbeam.SessionLane do
   end
 
   @impl true
+  def handle_call(:diagnostic_snapshot, _from, state) do
+    {:reply,
+     %{
+       currentSeq: state.current_seq,
+       reservationPresent: not is_nil(state.reservation_token),
+       settlementRechecking: state.settlement_rechecking,
+       deferredDrain: state.deferred_drain,
+       taskPresent: not is_nil(state.task_ref),
+       taskAlive: is_pid(state.task_pid) and Process.alive?(state.task_pid)
+     }, state}
+  end
+
   def handle_call(:cancel_current, _from, %{task_ref: nil} = state),
     do: {:reply, :not_running, state}
 

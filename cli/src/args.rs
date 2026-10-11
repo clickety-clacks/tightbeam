@@ -567,6 +567,10 @@ pub enum Command {
         host: String,
         dirs: Vec<String>,
     },
+    SessionDiagnose {
+        identity: Identity,
+        session_key: String,
+    },
     HarnessProcesses {
         identity: Identity,
     },
@@ -1016,6 +1020,9 @@ COMMANDS:
       the inherited PATH. The result previews the PATH shape adapters will use.
   harness-process list
       List the durable harness launch ledger, newest launch first.
+
+  session-diagnose --session EXACT --as-user USER [--json]
+      Read scoped process metadata without querying or changing the database.
 
   doctor [--json] [--base-dir p] [--as <role> | --as-user <userId>]
       Check the local Tightbeam installation and report its health, with each
@@ -1713,6 +1720,28 @@ fn parse_with_optional_catalog(
                 identity: identity(flags)?,
                 json: flags.contains_key("json"),
                 base_dir,
+            })
+        }
+        "session-diagnose" => {
+            if parsed.positional.len() != 1
+                || flags
+                    .keys()
+                    .any(|flag| !matches!(flag.as_str(), "session" | "as-user" | "json"))
+            {
+                return Err(
+                    "usage: tightbeam session-diagnose --session EXACT --as-user USER [--json]"
+                        .to_owned(),
+                );
+            }
+            let user = nonempty(flags, "as-user").ok_or("session-diagnose requires --as-user")?;
+            let session_key =
+                nonempty(flags, "session").ok_or("session-diagnose requires --session")?;
+            if session_key.len() > 512 || user.len() > 128 {
+                return Err("diagnostic_request_limit".to_owned());
+            }
+            Ok(Command::SessionDiagnose {
+                identity: Identity::User(user),
+                session_key,
             })
         }
         "harness-process" => parse_harness_process(&parsed, flags),
@@ -4826,6 +4855,7 @@ mod tests {
                 "decision-requests",
                 "dispatch",
                 "doctor",
+                "session-diagnose",
                 "effort-rule",
                 "harness-process",
                 "harness-health-observe-other",
