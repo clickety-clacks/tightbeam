@@ -1125,6 +1125,9 @@ defmodule Tightbeam.Supervision do
       [] ->
         :ok
 
+      [[_assignment, "holder_continuation", nil, "settled", nil, nil]] ->
+        Wakes.rebind_not_dispatched_continuation_in_txn(txn, source, successor, turn)
+
       [[assignment, "scheduled", "prod", "settled", generation, nil]] ->
         # controller_scheduled charged this generation. controller_fire only
         # revalidates and settles it. Preserve the old source/sidecar and move

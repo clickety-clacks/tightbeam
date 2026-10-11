@@ -2232,14 +2232,10 @@ defmodule Tightbeam.Wakes do
       case Txn.q(
              txn,
              """
-             SELECT status FROM turns
-             WHERE wakeId=?1 AND assignmentId=?2 AND sessionKey=?3
-             UNION ALL
-             SELECT t.status
-             FROM notice_batch_members m
-             JOIN notice_batches b ON b.batchId=m.batchId
-             JOIN turns t ON t.wakeId=b.deliveryWakeId
-             WHERE m.sourceWakeId=?1 AND t.assignmentId=?2 AND t.sessionKey=?3
+             WITH deliveries AS (#{NoticeBatcher.source_deliveries_sql()})
+             SELECT t.status FROM deliveries d JOIN turns t ON t.seq=d.turnSeq
+             WHERE d.sourceWakeId=?1 AND d.assignmentId=?2 AND t.sessionKey=?3
+             ORDER BY t.seq DESC
              LIMIT 1
              """,
              [wake.wake_id, assignment_id, wake.session_key]
@@ -2292,6 +2288,75 @@ defmodule Tightbeam.Wakes do
         dependency and
           resolver.holder != "session:" <> wake.session_key
     }
+  end
+
+  @doc false
+  def rebind_not_dispatched_continuation_in_txn(%Txn{} = txn, source, successor, turn) do
+    old = wait_in_txn(txn, source)
+    next = wait_in_txn(txn, successor)
+    facts = continuation_facts_in_txn(txn, old, old.assignment_id)
+    mutable = [:wake_id, :state, :due_at, :canceled_at]
+    recognition_valid =
+      case old.wait_mode do
+        "after-turn" ->
+          old.recognition_path == "after-turn" and is_integer(old.originating_turn_seq) and
+            match?(%{"domain" => "turn", "row_id" => seq} when seq == old.originating_turn_seq,
+              old.recognition_transition)
+
+        "dependency" ->
+          old.recognition_path in ~w(success reconsideration fallback) and
+            facts["wait.declaration_complete"]
+
+        _ -> false
+      end
+
+    originating_valid =
+      is_nil(old.originating_turn_seq) or
+        Txn.q(txn, "SELECT 1 FROM turns WHERE seq=?1 AND sessionKey=?2 AND status IN ('delivered','canceled','failed','failed_unknown')",
+          [old.originating_turn_seq, old.creator_session_key]) == [[1]]
+
+    # The retry delegates an admitted declaration, never a new controller or
+    # recognition. Recheck live obligation/verification and originating-turn
+    # eligibility while preserving the entire stored declaration and evidence.
+    qualified =
+      old.state == "fired" and next.state == "pending" and
+        Map.drop(old, mutable) == Map.drop(next, mutable) and
+        facts["wait.obligation_matches"] and facts["wait.admitted"] and
+        facts["wait.after_turn_eligible"] and facts["wait.coverage_valid"] and
+        facts["wait.recognized"] and is_binary(old.recognition_path) and
+        is_map(old.recognition_evidence) and is_map(old.recognition_transition) and
+        recognition_valid and originating_valid and
+        Txn.q(
+          txn,
+          """
+          WITH deliveries AS (#{NoticeBatcher.source_deliveries_sql()})
+          SELECT 1 FROM deliveries d JOIN turns t ON t.seq=d.turnSeq
+          JOIN sessions holder ON holder.sessionKey=t.sessionKey
+          JOIN supervision_liveness_sidecar sidecar ON sidecar.wakeId=d.sourceWakeId
+            AND sidecar.assignmentId=d.assignmentId AND sidecar.controllerOrigin='holder_continuation'
+            AND sidecar.controllerState='settled' AND sidecar.wakeKind IS NULL
+            AND sidecar.chargedGeneration IS NULL AND sidecar.transferEvidenceId IS NULL
+          JOIN wake_retry_attempts previous ON previous.wakeId=d.sourceWakeId
+          JOIN wake_retry_attempts retry ON retry.wakeId=?2
+          WHERE d.sourceWakeId=?1 AND d.assignmentId=?3 AND d.turnSeq=?4
+            AND t.sessionKey=?5 AND holder.state='active' AND holder.ownerUserId=?6
+            AND previous.sourceTurnSeq=t.seq AND previous.outcome='failed'
+            AND previous.retryWakeId=retry.wakeId AND retry.predecessorWakeId=previous.wakeId
+            AND retry.rootWakeId=previous.rootWakeId AND retry.attempt=previous.attempt+1
+            AND retry.outcome='pending'
+            AND NOT EXISTS (SELECT 1 FROM supervision_liveness_sidecar WHERE wakeId=retry.wakeId)
+          """,
+          [source, successor, old.assignment_id, turn.seq, old.session_key, old.owner_user_id]
+        ) == [[1]]
+
+    unless qualified,
+      do:
+        raise(DB.Error,
+          message: "notice_prewrite_restoration_refused: continuation authority changed"
+        )
+
+    admit_continuation_in_txn(txn, next)
+    :ok
   end
 
   defp capture_condition_cursor_in_txn(txn, declaration) do

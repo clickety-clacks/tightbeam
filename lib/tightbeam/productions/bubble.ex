@@ -68,10 +68,18 @@ defmodule Tightbeam.Productions.Bubble do
     if NoticeAuthority.restored_turn?(db, seq) do
       :ok
     else
-      case turn_context(db, seq) do
-        %{status: status} = turn -> recognize(db, seq, status, turn)
-        nil -> :ok
-      end
+      # Decide admission for all causes before any sibling can file the owner
+      # suppression fact. Exhausting one cause must not strand another cause
+      # carried by this same terminal turn.
+      turn_contexts(db, seq)
+      |> Enum.filter(fn turn ->
+        turn.status == "delivered" or
+          (is_binary(turn[:patrol_escalation_id]) and turn.status in @climbing_notice_terminals) or
+          bubble_production_matches?(db, turn.status, turn)
+      end)
+      |> Enum.each(fn turn -> recognize(db, seq, turn.status, turn) end)
+
+      :ok
     end
   end
 
@@ -133,19 +141,13 @@ defmodule Tightbeam.Productions.Bubble do
     recognize_patrol_escalation(db, escalation_id)
   end
 
-  defp recognize(db, _seq, terminal, turn) do
-    if bubble_production_matches?(db, terminal, turn) do
-      climb(db, turn)
-    else
-      :ok
-    end
-  end
+  defp recognize(db, _seq, _terminal, turn), do: climb(db, turn)
 
   @doc """
   The production's complete LHS, in one site, over durable state only (spec
   production-machine-v1 §Legibility): the terminal starts or continues a
   bubble ∧ no standing `user-alerted` fact for the owner. The turn's-session-
-  exists conjunct is enforced upstream by `turn_context/2` answering at all —
+  exists conjunct is enforced upstream by `turn_contexts/2` answering at all —
   a context this function receives has already passed it. Where to climb TO
   is the RHS's problem: a parentless cause session matches and then ends
   silently, because its own marker already told the only audience there is.
@@ -786,9 +788,9 @@ defmodule Tightbeam.Productions.Bubble do
 
   # One read serving both the LHS and the RHS: the turn row joined to its
   # session's lineage and owner. `cause_seq` is the ORIGINAL failed turn —
-  # this turn's own seq unless its requestRef marks it as a rung of an
-  # existing climb.
-  defp turn_context(db, seq) do
+  # this turn's own seq unless its requestRef or included source deliveries
+  # identify rungs of existing climbs. Each independent cause keeps a context.
+  defp turn_contexts(db, seq) do
     {:ok, rows} =
       DB.query(
         db,
@@ -802,68 +804,74 @@ defmodule Tightbeam.Productions.Bubble do
 
     case rows do
       [[session_key, request_ref, owner, status, current_harness, current_host, wake_id]] ->
-        request_ref = request_ref || carrier_request_ref(db, wake_id)
+        request_refs =
+          if is_nil(request_ref), do: carrier_request_refs(db, wake_id), else: [request_ref]
 
-        case parse_cause_seq(request_ref, seq) do
-          :malformed ->
-            Logger.error(
-              "turn #{seq} in #{session_key} carries a malformed bubble marker " <>
-                "(requestRef=#{inspect(request_ref)}); recognition declines rather " <>
-                "than climbing on a reference that names nothing"
-            )
+        request_refs = if request_refs == [], do: [nil], else: request_refs
 
-            EventLog.lifecycle(db, "bubble_marker_malformed", session_key, "seq=#{seq}")
-            nil
+        Enum.flat_map(request_refs, fn request_ref ->
+          case parse_cause_seq(request_ref, seq) do
+            :malformed ->
+              Logger.error(
+                "turn #{seq} in #{session_key} carries a malformed bubble marker " <>
+                  "(requestRef=#{inspect(request_ref)}); recognition declines rather " <>
+                  "than climbing on a reference that names nothing"
+              )
 
-          {:patrol_notice, escalation_id} ->
-            case Supervision.failure_escalation(db, escalation_id) do
-              nil ->
-                EventLog.lifecycle(
-                  db,
-                  "bubble_cause_missing",
-                  session_key,
-                  "patrolEscalationId=#{escalation_id} seq=#{seq}"
-                )
+              EventLog.lifecycle(db, "bubble_marker_malformed", session_key, "seq=#{seq}")
+              nil
 
-                nil
+            {:patrol_notice, escalation_id} ->
+              case Supervision.failure_escalation(db, escalation_id) do
+                nil ->
+                  EventLog.lifecycle(
+                    db,
+                    "bubble_cause_missing",
+                    session_key,
+                    "patrolEscalationId=#{escalation_id} seq=#{seq}"
+                  )
 
-              escalation ->
-                %{
-                  session_key: session_key,
-                  owner: escalation.owner_user_id,
-                  status: status,
-                  cause_seq: escalation.threshold_turn_seq,
-                  notice?: true,
-                  patrol_escalation_id: escalation_id,
-                  harness: current_harness,
-                  host: current_host
-                }
-            end
+                  nil
 
-          {kind, cause_seq} ->
-            {harness, host} =
-              if kind == :notice do
-                case cause_row(db, cause_seq) do
-                  {:ok, cause} -> {cause.harness, cause.host}
-                  :missing -> {current_harness, current_host}
-                end
-              else
-                {current_harness, current_host}
+                escalation ->
+                  %{
+                    session_key: session_key,
+                    owner: escalation.owner_user_id,
+                    status: status,
+                    cause_seq: escalation.threshold_turn_seq,
+                    notice?: true,
+                    patrol_escalation_id: escalation_id,
+                    harness: current_harness,
+                    host: current_host
+                  }
               end
 
-            %{
-              session_key: session_key,
-              owner: owner,
-              status: status,
-              cause_seq: cause_seq,
-              notice?: kind == :notice,
-              harness: harness,
-              host: host
-            }
-        end
+            {kind, cause_seq} ->
+              {harness, host} =
+                if kind == :notice do
+                  case cause_row(db, cause_seq) do
+                    {:ok, cause} -> {cause.harness, cause.host}
+                    :missing -> {current_harness, current_host}
+                  end
+                else
+                  {current_harness, current_host}
+                end
+
+              %{
+                session_key: session_key,
+                owner: owner,
+                status: status,
+                cause_seq: cause_seq,
+                notice?: kind == :notice,
+                harness: harness,
+                host: host
+              }
+          end
+          |> List.wrap()
+        end)
 
       [] ->
-        nil
+        []
     end
   end
 
@@ -919,9 +927,9 @@ defmodule Tightbeam.Productions.Bubble do
     end
   end
 
-  defp carrier_request_ref(_db, nil), do: nil
+  defp carrier_request_refs(_db, nil), do: []
 
-  defp carrier_request_ref(db, wake_id) when is_binary(wake_id) do
+  defp carrier_request_refs(db, wake_id) when is_binary(wake_id) do
     case DB.query(
            db,
            """
@@ -934,15 +942,17 @@ defmodule Tightbeam.Productions.Bubble do
            [wake_id]
          ) do
       {:ok, rows} ->
-        Enum.find_value(rows, fn [source_session, source_wake_id] ->
+        rows
+        |> Enum.flat_map(fn [source_session, source_wake_id] ->
           case resolved_bubble_source(db, source_wake_id, source_session) do
-            {:ok, cause_seq, ^source_session} -> "bubble:#{cause_seq}"
-            _ -> nil
+            {:ok, cause_seq, ^source_session} -> ["bubble:#{cause_seq}"]
+            _ -> []
           end
         end)
+        |> Enum.uniq()
 
       _ ->
-        nil
+        []
     end
   end
 

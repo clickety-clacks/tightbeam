@@ -29,7 +29,7 @@ defmodule Tightbeam.Productions.BubbleTest do
   #   main (flynn's personal session, parentless)
   #     └─ supervisor
   #          └─ holder
-  setup do
+  setup tags do
     case ConnRegistry.start_link(name: Tightbeam.ConnRegistry) do
       {:ok, _pid} -> :ok
       {:error, {:already_started, _pid}} -> :ok
@@ -40,7 +40,17 @@ defmodule Tightbeam.Productions.BubbleTest do
     start_supervised!({LaneDoorbell, Tightbeam.LaneManager})
 
     db = :"bubble_db_#{System.unique_integer([:positive])}"
-    start_supervised!({DB, path: ":memory:", name: db})
+    db_opts =
+      if tags[:persistent] do
+        base = Path.join(System.tmp_dir!(), "bubble-persistent-#{System.unique_integer([:positive])}")
+        prepared = Tightbeam.GuardRuntimeFixture.prepare!(base, "schema_shape_runtime.exs")
+        on_exit(fn -> File.rm_rf!(base) end)
+        [path: Path.join(prepared.base, "state.db"), name: db, guard_inputs: [], payload_root: prepared.payload]
+      else
+        [path: ":memory:", name: db]
+      end
+
+    start_supervised!({DB, db_opts})
     :ok = Tightbeam.Schema.ensure_all(db)
 
     {:ok, _} =
@@ -50,7 +60,7 @@ defmodule Tightbeam.Productions.BubbleTest do
     supervisor = session(db, "supervisor", main.session_key)
     holder = session(db, "holder", supervisor.session_key)
 
-    %{db: db, main: main, supervisor: supervisor, holder: holder}
+    %{db: db, db_opts: db_opts, main: main, supervisor: supervisor, holder: holder}
   end
 
   defp session(db, key, spawned_by, built_in? \\ false) do
@@ -1149,6 +1159,70 @@ defmodule Tightbeam.Productions.BubbleTest do
     end
 
     assert assignment_a != assignment_b
+  end
+
+  for terminal <- ~w(failed canceled) do
+    @tag persistent: true
+    test "separate failed decisions share a #{terminal} bubble carrier without losing either cause", ctx do
+      busy = hold_recipient!(ctx.db, ctx.supervisor.session_key)
+      causes =
+        for suffix <- ~w(a b) do
+          opener = session(ctx.db, "decision-#{suffix}", ctx.supervisor.session_key)
+          holder = session(ctx.db, "decision-holder-#{suffix}", opener.session_key)
+          {_assignment, blocked} = cannot_proceed_assignment!(ctx, holder.session_key, opener.session_key, "independent decision #{suffix}")
+          queue_decision_wake!(ctx, blocked.decisionWake)
+          _ = deliver_ready_carriers!(ctx, opener.session_key)
+          assert {:ok, decision} = Ledger.claim_next(ctx.db, opener.session_key, "original-decision-#{suffix}")
+          assert :ok = Ledger.finish(ctx.db, decision.seq, "failed", "original decision #{suffix} failed", owner_lease: decision.owner_lease)
+          assert :ok = Bubble.recognize_terminal(ctx.db, decision.seq)
+          {decision.seq, blocked, opener.session_key}
+        end
+
+      finish_busy_recipient!(ctx.db, busy)
+      [carrier] = deliver_ready_carriers!(ctx, ctx.supervisor.session_key)
+      expected = Enum.map(causes, fn {seq, _, _} -> "bubble:#{seq}:#{ctx.supervisor.session_key}" end)
+      assert Enum.map(Tightbeam.Wakes.digest_members(ctx.db, carrier), & &1.wake_id) == expected
+      assert {:ok, intermediate} = Ledger.claim_next(ctx.db, ctx.supervisor.session_key, "combined-bubble")
+      assert intermediate.wake_id == carrier
+      assert {:ok, [[nil]]} = DB.query(ctx.db, "SELECT requestRef FROM turns WHERE seq=?1", [intermediate.seq])
+      assert :ok = Ledger.finish(ctx.db, intermediate.seq, unquote(terminal), "combined notice could not run", owner_lease: intermediate.owner_lease)
+      assert :ok = stop_supervised(DB)
+      start_supervised!({DB, ctx.db_opts})
+      assert :ok = Tightbeam.Schema.ensure_all(ctx.db)
+      assert :ok = Bubble.recognize_terminal(ctx.db, intermediate.seq)
+      assert :ok = Bubble.recognize_terminal(ctx.db, intermediate.seq)
+      [main_carrier] = deliver_ready_carriers!(ctx, ctx.main.session_key)
+      expected_main = Enum.map(causes, fn {seq, _, _} -> "bubble:#{seq}:#{ctx.main.session_key}" end)
+      assert Enum.map(Tightbeam.Wakes.digest_members(ctx.db, main_carrier), & &1.wake_id) == expected_main
+      assert {:ok, main_notice} = Ledger.claim_next(ctx.db, ctx.main.session_key, "combined-main-bubble")
+      assert main_notice.wake_id == main_carrier
+      for {seq, blocked, _original_recipient} <- causes do
+        assert main_notice.prompt =~ "Turn #{seq}"
+        assert {:ok, [[disposer]]} = DB.query(ctx.db, "SELECT disposerRef FROM assignment_cannot_proceed WHERE id=?1", [blocked.cannotProceed.id])
+        assert disposer == "session:" <> ctx.main.session_key
+      end
+      assert :ok = Ledger.finish(ctx.db, main_notice.seq, "failed", "final recipient failed", owner_lease: main_notice.owner_lease)
+      assert :ok = Bubble.recognize_terminal(ctx.db, main_notice.seq)
+      assert ConditionFacts.standing?(ctx.db, "user-alerted", "flynn")
+      for {seq, blocked, original_recipient} <- causes do
+        assert {:ok, [["user:flynn"]]} = DB.query(ctx.db, "SELECT disposerRef FROM assignment_cannot_proceed WHERE id=?1", [blocked.cannotProceed.id])
+        assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM lifecycle_events WHERE kind='lineage_exhausted' AND detail=?1", ["cause_seq=#{seq} session=#{original_recipient}"])
+      end
+      snapshot = bubble_history(ctx.db)
+      assert :ok = stop_supervised(DB)
+      start_supervised!({DB, ctx.db_opts})
+      assert :ok = Tightbeam.Schema.ensure_all(ctx.db)
+      for terminal_seq <- [intermediate.seq, main_notice.seq], do: assert(:ok = Bubble.recognize_terminal(ctx.db, terminal_seq))
+      assert bubble_history(ctx.db) == snapshot
+      assert {:ok, []} = DB.query(ctx.db, "PRAGMA foreign_key_check")
+    end
+  end
+
+  defp bubble_history(db) do
+    Map.new(["turns", "wakes", "notice_batch_members", "assignment_cannot_proceed", "condition_facts", "lifecycle_events"], fn table ->
+      {:ok, rows} = DB.query(db, "SELECT rowid,* FROM #{table} ORDER BY rowid")
+      {table, rows}
+    end)
   end
 
   test "a staged decision bubble transfers disposal to its busy recipient", ctx do
