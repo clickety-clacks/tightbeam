@@ -1184,6 +1184,83 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     end
   end
 
+  @tag persistent: true
+  test "current-stamped continuation guard admits only the exact qualified retry migration",
+       ctx do
+    originating = running_turn(ctx.db, "holder")
+    original = after_turn_wait!(ctx.db, "A")
+
+    previous =
+      File.read!(Path.join(__DIR__, "fixtures/row_wakes/prewrite-continuation-21a4cb0e.sql"))
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               :ok = DB.Txn.exec(txn, "DROP TRIGGER supervision_liveness_sidecar_insert_coherent")
+               DB.Txn.exec(txn, previous)
+             end)
+
+    before = restoration_snapshot(ctx.db)
+    assert {:ok, stamp} = DB.query(ctx.db, "SELECT * FROM schema_stamp")
+    assert :ok = stop_supervised(DB)
+    start_supervised!({DB, ctx.db_opts})
+    assert :ok = Tightbeam.Schema.ensure_all(ctx.db)
+    assert restoration_snapshot(ctx.db) == before
+    assert {:ok, ^stamp} = DB.query(ctx.db, "SELECT * FROM schema_stamp")
+    assert {:ok, []} = DB.query(ctx.db, "PRAGMA foreign_key_check")
+
+    assert {:ok, [[current]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sql FROM sqlite_master WHERE name='supervision_liveness_sidecar_insert_coherent'"
+             )
+
+    assert current =~ "terminal.ownerLease=claim.ownerLease"
+    assert current =~ "t.status='running'"
+
+    assert :ok =
+             Ledger.finish(ctx.db, originating.seq, "delivered", nil,
+               owner_lease: originating.owner_lease
+             )
+
+    unbound = Wakes.schedule(ctx.db, Map.put(original, :wake_id, "unbound-continuation"))
+    before = restoration_snapshot(ctx.db)
+
+    assert {:error, %DB.Error{message: refusal}} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO supervision_liveness_sidecar(wakeId,assignmentId,controllerOrigin,controllerState) VALUES (?1,'A','holder_continuation','pending')",
+               [unbound.wake_id]
+             )
+
+    assert refusal =~ "supervision sidecar requires coherent pending wake"
+    assert restoration_snapshot(ctx.db) == before
+
+    malformed = String.replace(previous, "t.status='running'", "t.status='delivered'")
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               :ok = DB.Txn.exec(txn, "DROP TRIGGER supervision_liveness_sidecar_insert_coherent")
+               DB.Txn.exec(txn, malformed)
+             end)
+
+    before = restoration_snapshot(ctx.db)
+
+    assert {:ok, ddl} =
+             DB.query(ctx.db, "SELECT type,name,sql FROM sqlite_master ORDER BY type,name")
+
+    assert_raise Tightbeam.Schema.ShapeError, ~r/malformed owned object/, fn ->
+      Tightbeam.Schema.ensure_all(ctx.db)
+    end
+
+    assert restoration_snapshot(ctx.db) == before
+
+    assert {:ok, ^ddl} =
+             DB.query(ctx.db, "SELECT type,name,sql FROM sqlite_master ORDER BY type,name")
+
+    assert {:ok, ^stamp} = DB.query(ctx.db, "SELECT * FROM schema_stamp")
+    assert {:ok, []} = DB.query(ctx.db, "PRAGMA foreign_key_check")
+  end
+
   for mode <- [:after_turn, :dependency], sibling <- [:none, :ordinary, :controller] do
     @tag persistent: true
     test "#{mode} continuation restores with #{sibling} through the lane terminal callback and reopen",

@@ -1711,6 +1711,7 @@ defmodule Tightbeam.Schema do
     :ok = migrate_supervision_batch_delivery_guards(db)
     :ok = migrate_wake_retry_source_scope(db)
     :ok = upgrade_notice_source_payload(db)
+    :ok = migrate_continuation_retry_guard(db)
 
     case DB.finish_schema(db) do
       :ok -> :ok
@@ -2582,7 +2583,12 @@ defmodule Tightbeam.Schema do
     |> Enum.reject(&(&1.name in batch_delivery_guard_names))
     |> Enum.each(fn object ->
       if owned_object_present?(txn, object) do
-        validate_owned_object!(txn, object)
+        if shape in [@assignment_source_replacement_shape, @notice_source_payload_shape] and
+             object.name == "supervision_liveness_sidecar_insert_coherent" do
+          validate_continuation_retry_guard_in_txn!(txn, object)
+        else
+          validate_owned_object!(txn, object)
+        end
       else
         :ok = Txn.exec(txn, object.sql)
         validate_owned_object!(txn, object)
@@ -3023,6 +3029,115 @@ defmodule Tightbeam.Schema do
     end)
 
     :ok
+  end
+
+  # Registration still requires the creator's running turn. A restored leaf
+  # retains that immutable originating turn after it ends, so only a proved
+  # NOT-DISPATCHED retry may re-admit its existing continuation authority.
+  defp continuation_retry_guard(previous) do
+    proof = """
+    EXISTS (
+      SELECT 1 FROM wake_retry_attempts retry
+      JOIN wake_retry_attempts prior ON prior.wakeId=retry.predecessorWakeId
+      JOIN wakes old ON old.wakeId=prior.wakeId
+      JOIN supervision_liveness_sidecar sidecar ON sidecar.wakeId=old.wakeId
+      JOIN turns failed ON failed.seq=prior.sourceTurnSeq
+      JOIN turn_lifecycle_events claim ON claim.turnSeq=failed.seq AND claim.kind='claimed'
+      JOIN turn_lifecycle_events terminal ON terminal.turnSeq=failed.seq
+        AND terminal.kind='terminal_committed' AND terminal.outcome='failed'
+      JOIN turns originating ON originating.seq=w.originatingTurnSeq
+      WHERE retry.wakeId=w.wakeId AND retry.attempt=prior.attempt+1
+        AND retry.rootWakeId=prior.rootWakeId AND prior.retryWakeId=retry.wakeId
+        AND retry.outcome='pending' AND prior.outcome='failed'
+        AND old.state='fired' AND old.consumer=w.consumer AND old.digest=0 AND w.digest=0
+        AND old.assignmentId=w.assignmentId AND old.obligationRef IS w.obligationRef
+        AND old.sessionKey=w.sessionKey AND old.targetRole IS w.targetRole
+        AND old.origin=w.origin AND old.creatorSessionKey IS w.creatorSessionKey
+        AND old.ownerUserId=w.ownerUserId AND old.waitMode=w.waitMode
+        AND old.originatingTurnSeq IS w.originatingTurnSeq
+        AND old.recognitionAt IS w.recognitionAt AND w.recognitionAt IS NOT NULL
+        AND old.recognitionPath IS w.recognitionPath
+        AND old.recognitionEvidence IS w.recognitionEvidence
+        AND old.recognitionTransition IS w.recognitionTransition
+        AND s.state='active' AND originating.sessionKey=w.creatorSessionKey
+        AND originating.status IN ('delivered','canceled','failed','failed_unknown')
+        AND sidecar.assignmentId=w.assignmentId
+        AND sidecar.controllerOrigin='holder_continuation' AND sidecar.controllerState='settled'
+        AND sidecar.wakeKind IS NULL AND sidecar.chargedGeneration IS NULL
+        AND sidecar.transferEvidenceId IS NULL
+        AND failed.status='failed' AND failed.sessionKey=w.sessionKey
+        AND claim.ownerLease IS NOT NULL AND length(claim.ownerLease)>0
+        AND terminal.ownerLease=claim.ownerLease
+        AND NOT EXISTS (SELECT 1 FROM turn_lifecycle_events dispatched
+          WHERE dispatched.turnSeq=failed.seq AND dispatched.kind='prompt_dispatched')
+        AND EXISTS (SELECT 1 FROM (#{Tightbeam.NoticeBatcher.source_deliveries_sql()}) delivery
+          WHERE delivery.sourceWakeId=old.wakeId AND delivery.turnSeq=failed.seq
+            AND delivery.assignmentId=w.assignmentId)
+        AND json_extract(terminal.detail,'$.prewrite.disposition')='not_dispatched'
+        AND (SELECT count(*) FROM json_each(terminal.detail,'$.prewrite'))=4
+        AND (
+          (json_extract(terminal.detail,'$.prewrite.reason')='transport_capacity_exceeded'
+            AND json_type(terminal.detail,'$.prewrite.requestBytes')='integer'
+            AND json_type(terminal.detail,'$.prewrite.limitBytes')='integer'
+            AND json_extract(terminal.detail,'$.prewrite.limitBytes')>0
+            AND json_extract(terminal.detail,'$.prewrite.requestBytes')>
+              json_extract(terminal.detail,'$.prewrite.limitBytes'))
+          OR
+          (json_extract(terminal.detail,'$.prewrite.reason')='submission_text_limit_exceeded'
+            AND json_type(terminal.detail,'$.prewrite.textChars')='integer'
+            AND json_extract(terminal.detail,'$.prewrite.limitChars')=1048576
+            AND json_extract(terminal.detail,'$.prewrite.textChars')>1048576)
+        )
+    )
+    """
+
+    anchor = "AND (w.originatingTurnSeq IS NULL OR EXISTS ("
+    true = String.contains?(previous.sql, anchor)
+
+    %{
+      previous
+      | sql:
+          String.replace(
+            previous.sql,
+            anchor,
+            "AND (w.originatingTurnSeq IS NULL OR #{proof} OR EXISTS (",
+            global: false
+          )
+    }
+  end
+
+  defp validate_continuation_retry_guard_in_txn!(txn, previous) do
+    current = continuation_retry_guard(previous)
+
+    [[actual]] =
+      Txn.q(txn, "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1", [previous.name])
+
+    unless normalize_schema_sql(actual) in [
+             normalize_schema_sql(previous.sql),
+             normalize_schema_sql(current.sql)
+           ],
+           do: incompatible_supervision_liveness!("malformed owned object #{previous.name}")
+
+    :ok
+  end
+
+  defp migrate_continuation_retry_guard(db) do
+    previous =
+      Enum.find(
+        reparent_liveness_enforcement_objects(),
+        &(&1.name == "supervision_liveness_sidecar_insert_coherent")
+      )
+
+    case DB.transaction(db, fn txn ->
+           migrate_owned_liveness_trigger_in_txn(
+             txn,
+             continuation_retry_guard(previous),
+             previous.sql
+           )
+         end) do
+      {:ok, :ok} -> :ok
+      {:error, error} -> raise error
+    end
   end
 
   defp migrate_supervision_batch_delivery_guards(db) do

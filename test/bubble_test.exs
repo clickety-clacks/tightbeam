@@ -1238,8 +1238,10 @@ defmodule Tightbeam.Productions.BubbleTest do
       assert :ok = stop_supervised(DB)
       start_supervised!({DB, ctx.db_opts})
       assert :ok = Tightbeam.Schema.ensure_all(ctx.db)
+      main_busy = hold_recipient!(ctx.db, ctx.main.session_key)
       assert :ok = Bubble.recognize_terminal(ctx.db, intermediate.seq)
       assert :ok = Bubble.recognize_terminal(ctx.db, intermediate.seq)
+      finish_busy_recipient!(ctx.db, main_busy)
       [main_carrier] = deliver_ready_carriers!(ctx, ctx.main.session_key)
 
       expected_main =
