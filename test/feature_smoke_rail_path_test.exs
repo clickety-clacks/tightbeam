@@ -191,18 +191,124 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
                "SELECT id,holderKey FROM assignments WHERE subject LIKE 'smoke fanout %'"
              )
 
-    assert {:ok, [[^dispatch_holder, dispatch_prompt]]} =
+    owner_id = ctx.state.user_id
+    owner_session = Org.personal_session_key(owner_id)
+    assert Org.get(ctx.db, dispatch_holder).owner_user_id == owner_id
+
+    assert {:ok, [[revocation_id, terminal_at, dispatch_work_item, ^owner_id]]} =
              DB.query(
                ctx.db,
-               "SELECT sessionKey,prompt FROM turns WHERE assignmentId=?1",
+               """
+               SELECT revocation.id,revocation.revokedAt,assignment.workItemId,assignment.openedByUser
+               FROM assignments assignment
+               JOIN assignment_revocation_generations generation ON generation.assignmentId=assignment.id
+                 AND generation.reopeningId IS (
+                   SELECT MAX(id) FROM assignment_reopenings WHERE assignmentId=assignment.id)
+               JOIN assignment_revocations revocation ON revocation.id=generation.revocationId
+                 AND revocation.assignmentId=assignment.id AND revocation.revokedAt=assignment.closedAt
+                 AND revocation.revokedByUser IS assignment.closedByUser
+                 AND revocation.revokedBySession IS assignment.closedBySession
+                 AND revocation.revokedByProcess IS assignment.closedByProcess
+               WHERE assignment.id=?1 AND assignment.holderKey=?2
+                 AND assignment.state='closed' AND assignment.outcome='revoked'
+                 AND assignment.openedBySession IS NULL AND revocation.reason='holder session retired'
+               """,
+               [dispatch_id, dispatch_holder]
+             )
+
+    assert {:ok, %{wake_id: terminal_source, prompt: terminal_raw}} =
+             Tightbeam.Wakes.terminal_notification(%{
+               source_kind: "assignment_revocation",
+               source_token: revocation_id,
+               assignment_id: dispatch_id,
+               work_item_id: dispatch_work_item,
+               child_session_key: dispatch_holder,
+               owner_user_id: owner_id,
+               opened_by_kind: "user",
+               opened_by_id: owner_id,
+               outcome: "revoked",
+               terminal_at: terminal_at
+             })
+
+    # The script retires the real dispatch holder. Drive its required owner
+    # notice through the same readiness boundary, without a provider turn.
+    NoticeBatcher.recover(ctx.db)
+
+    assert {:ok, dispatch_rows} =
+             DB.query(
+               ctx.db,
+               "SELECT seq,sessionKey,prompt FROM turns WHERE assignmentId=?1 ORDER BY seq",
                [dispatch_id]
              )
 
+    {dispatch_briefs, other_dispatch_turns} =
+      Enum.split_with(dispatch_rows, fn [_, recipient, _] -> recipient == dispatch_holder end)
+
+    assert [[dispatch_seq, ^dispatch_holder, dispatch_prompt]] = dispatch_briefs
     assert dispatch_prompt =~ "ship the smoke feature"
+    assert dispatch_prompt ==
+             "[from user:#{owner_id}]\n\n[assignment: #{dispatch_id}]\n\nship the smoke feature"
+
+    assert %{
+             state: "fired",
+             prompt: ^terminal_raw,
+             origin: "process:tightbeam",
+             consumer: "prompt",
+             assignment_id: ^dispatch_id,
+             work_item_id: ^dispatch_work_item,
+             creator_session_key: ^dispatch_holder,
+             owner_user_id: ^owner_id
+           } = Tightbeam.Wakes.get(ctx.db, terminal_source)
+
+    assert Tightbeam.Wakes.get(ctx.db, terminal_source).obligation_ref ==
+             "terminal-child-owner-notification:" <> dispatch_id
+
+    assert {:ok,
+            [[terminal_seq, terminal_carrier, ^owner_session, terminal_prompt,
+              terminal_assignment, terminal_envelope, terminal_hash]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT turn.seq,turn.wakeId,turn.sessionKey,turn.prompt,turn.assignmentId,
+                 batch.envelope,batch.envelopeHash
+               FROM (#{NoticeBatcher.source_deliveries_sql()}) delivery
+               JOIN turns turn ON turn.seq=delivery.turnSeq AND turn.origin='process:tightbeam'
+               JOIN messages message ON message.id=turn.messageId
+                 AND message.sender=turn.origin AND message.content=turn.prompt
+               JOIN notice_batches batch ON batch.deliveryWakeId=turn.wakeId AND batch.state='delivered'
+               WHERE delivery.sourceWakeId=?1 AND delivery.assignmentId=?2 AND delivery.carrier=1
+               """,
+               [terminal_source, dispatch_id]
+             )
+
+    assert %{state: "fired", digest: true, prompt: ^terminal_envelope} =
+             Tightbeam.Wakes.get(ctx.db, terminal_carrier)
+
+    assert terminal_carrier != terminal_source
+    assert terminal_prompt == Gateway.decorate_delivery_prompt(terminal_envelope, "process:tightbeam")
+    assert terminal_envelope =~ terminal_raw
+    assert terminal_hash == Base.encode16(:crypto.hash(:sha256, terminal_envelope), case: :lower)
+
+    expected_other_dispatch_turns =
+      if terminal_assignment == dispatch_id,
+        do: [[terminal_seq, owner_session, terminal_prompt]],
+        else: []
+
+    # Enumerate every assignment-linked row; no unexpected turn is filtered out.
+    assert other_dispatch_turns == expected_other_dispatch_turns
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM notice_batch_members WHERE sourceWakeId=?1", [
+               terminal_source
+             ])
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [terminal_source])
 
     # Each scripted topology files two holder-authored verdicts. Idle readiness
     # may admit those notices in distinct snapshots; every additional turn must
-    # still be an exact opener notice, never an unexplained second dispatch.
+    # be an exact opener notice or the required revocation, never an unexplained
+    # second dispatch. A single carrier can contain sources from both subjects.
     assert {:ok, coordination_rows} =
              DB.query(ctx.db, """
              SELECT a.id,a.subject,a.openedByUser,a.openedBySession
@@ -233,66 +339,105 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
     assert {:ok, notice_turns} =
              DB.query(
                ctx.db,
-               "SELECT wakeId,assignmentId,sessionKey FROM turns WHERE assignmentId IS NOT NULL AND assignmentId<>?1",
-               [dispatch_id]
+               "SELECT wakeId,assignmentId,sessionKey FROM turns WHERE seq<>?1 ORDER BY seq",
+               [dispatch_seq]
              )
 
     refute notice_turns == []
 
-    for [notice_carrier, notice_assignment, notice_recipient] <- notice_turns do
-      assert notice_assignment in coordination_ids
-      assert notice_recipient == Org.personal_session_key(ctx.state.user_id)
+    seen_attests =
+      for [notice_carrier, notice_assignment, notice_recipient] <- notice_turns do
+        assert notice_assignment in [nil, dispatch_id | coordination_ids]
+        assert notice_recipient == owner_session
 
-      assert %{state: "fired", digest: true} = Tightbeam.Wakes.get(ctx.db, notice_carrier)
+        assert %{state: "fired", digest: true} = Tightbeam.Wakes.get(ctx.db, notice_carrier)
 
-      assert {:ok, notices} =
-               DB.query(
-                 ctx.db,
-                 """
-                 SELECT source.wakeId,source.prompt
-                 FROM notice_batches batch
-                 JOIN notice_batch_members member ON member.batchId=batch.batchId AND member.state='included'
-                 JOIN wakes source ON source.wakeId=member.sourceWakeId
-                 JOIN attests attest ON attest.assignmentId=source.assignmentId
-                 JOIN assignments coordination ON coordination.id=source.assignmentId
-                   AND coordination.holderKey=attest.bySession
-                   AND coordination.workItemId=source.work_item_id
-                   AND source.origin='agent:'||attest.bySession
-                   AND source.prompt='Attest '||attest.id||' ('||attest.kind||') was filed on assignment '||attest.assignmentId||'.'
-                   AND attest.kind='verdict' AND attest.verdictKind IN ('topology-decided','posture-light')
-                 WHERE batch.deliveryWakeId=?1 AND source.assignmentId=?2 AND batch.state='delivered'
-                 """,
-                 [notice_carrier, notice_assignment]
-               )
-
-      refute notices == []
-
-      for [source_id, raw_notice] <- notices do
-        assert Tightbeam.Wakes.get(ctx.db, source_id).prompt == raw_notice
-        assert Tightbeam.Wakes.get(ctx.db, source_id).state == "fired"
-
-        assert {:ok, [[1]]} =
+        assert {:ok, notices} =
                  DB.query(
                    ctx.db,
-                   "SELECT COUNT(*) FROM notice_batch_members WHERE sourceWakeId=?1",
-                   [
-                     source_id
-                   ]
+                   """
+                   SELECT source.wakeId,source.prompt,source.assignmentId,attest.id
+                   FROM notice_batches batch
+                   JOIN notice_batch_members member ON member.batchId=batch.batchId AND member.state='included'
+                   JOIN wakes source ON source.wakeId=member.sourceWakeId
+                   JOIN attests attest ON attest.assignmentId=source.assignmentId
+                   JOIN assignments coordination ON coordination.id=source.assignmentId
+                     AND coordination.holderKey=attest.bySession
+                     AND coordination.workItemId=source.work_item_id
+                     AND source.origin='agent:'||attest.bySession
+                     AND source.prompt='Attest '||attest.id||' ('||attest.kind||') was filed on assignment '||attest.assignmentId||'.'
+                     AND attest.kind='verdict' AND attest.verdictKind IN ('topology-decided','posture-light')
+                   WHERE batch.deliveryWakeId=?1 AND batch.state='delivered'
+                   """,
+                   [notice_carrier]
                  )
 
-        assert {:ok, [[0]]} =
-                 DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [source_id])
+        assert notices != [] or notice_carrier == terminal_carrier
+
+        attest_ids =
+          for [source_id, raw_notice, source_assignment, attest_id] <- notices do
+            assert source_assignment in coordination_ids
+            assert Tightbeam.Wakes.get(ctx.db, source_id).prompt == raw_notice
+            assert Tightbeam.Wakes.get(ctx.db, source_id).state == "fired"
+
+            assert {:ok, [[1]]} =
+                     DB.query(
+                       ctx.db,
+                       "SELECT COUNT(*) FROM notice_batch_members WHERE sourceWakeId=?1",
+                       [
+                         source_id
+                       ]
+                     )
+
+            assert {:ok, [[0]]} =
+                     DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [source_id])
+
+            attest_id
+          end
+
+        assert {:ok, [[terminal_count]]} =
+                 DB.query(
+                   ctx.db,
+                   """
+                   SELECT COUNT(*) FROM notice_batch_members member
+                   JOIN notice_batches batch ON batch.batchId=member.batchId
+                   WHERE batch.deliveryWakeId=?1 AND member.state='included' AND member.sourceWakeId=?2
+                   """,
+                   [notice_carrier, terminal_source]
+                 )
+
+        assert terminal_count == if(notice_carrier == terminal_carrier, do: 1, else: 0)
+        notice_count = length(notices) + terminal_count
+
+        assert {:ok, [[^notice_count]]} =
+                 DB.query(
+                   ctx.db,
+                   "SELECT COUNT(*) FROM notice_batch_members member JOIN notice_batches batch ON batch.batchId=member.batchId WHERE batch.deliveryWakeId=?1 AND member.state='included'",
+                   [notice_carrier]
+                 )
+
+        attest_ids
       end
 
-      notice_count = length(notices)
+    expected_attests =
+      Enum.flat_map(coordination_ids, fn assignment_id ->
+        assert {:ok, [[posture, "posture-light"], [topology, "topology-decided"]]} =
+                 DB.query(
+                   ctx.db,
+                   """
+                   SELECT attest.id,attest.verdictKind FROM attests attest
+                   JOIN assignments assignment ON assignment.id=attest.assignmentId
+                     AND assignment.holderKey=attest.bySession
+                   WHERE attest.assignmentId=?1 AND attest.kind='verdict'
+                   ORDER BY attest.verdictKind
+                   """,
+                   [assignment_id]
+                 )
 
-      assert {:ok, [[^notice_count]]} =
-               DB.query(
-                 ctx.db,
-                 "SELECT COUNT(*) FROM notice_batch_members member JOIN notice_batches batch ON batch.batchId=member.batchId WHERE batch.deliveryWakeId=?1 AND member.state='included'",
-                 [notice_carrier]
-               )
-    end
+        [posture, topology]
+      end)
+
+    assert Enum.sort(List.flatten(seen_attests)) == Enum.sort(expected_attests)
   end
 
   test "scripted review refuses changed source, wrong commit bytes, and false output", ctx do
