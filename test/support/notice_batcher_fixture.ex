@@ -1664,7 +1664,9 @@ defmodule Tightbeam.NoticeBatcherFixture do
              })
 
     closed = delivery_snapshot(db)
-    assert {:ok, retries_before} = DB.query(db, "SELECT * FROM wake_retry_attempts ORDER BY wakeId")
+
+    assert {:ok, retries_before} =
+             DB.query(db, "SELECT * FROM wake_retry_attempts ORDER BY wakeId")
 
     assert {:error, error} =
              DB.transaction(db, fn txn ->
@@ -1673,6 +1675,7 @@ defmodule Tightbeam.NoticeBatcherFixture do
 
     assert Exception.message(error) =~ "parent disposition changed"
     assert delivery_snapshot(db) == closed
+
     assert {:ok, [["closed", "revoked"]]} =
              DB.query(db, "SELECT state,outcome FROM assignments WHERE id='prewrite-controller'")
 
@@ -1685,14 +1688,18 @@ defmodule Tightbeam.NoticeBatcherFixture do
     assert NoticeBatcher.source_refs(db, second_retry) == []
     assert Wakes.get(db, second_retry).state == "pending"
     assert count(db, "turns", "wakeId=?1", [second_retry]) == 0
-    assert {:ok, ^retries_before} = DB.query(db, "SELECT * FROM wake_retry_attempts ORDER BY wakeId")
+
+    assert {:ok, ^retries_before} =
+             DB.query(db, "SELECT * FROM wake_retry_attempts ORDER BY wakeId")
+
     assert {:ok, ^counters} = DB.query(db, "SELECT * FROM assignment_prods")
+
     assert {:ok, [["closed", "revoked"]]} =
              DB.query(db, "SELECT state,outcome FROM assignments WHERE id='prewrite-controller'")
+
     frozen = delivery_snapshot(db)
     assert NoticeBatcher.recover(db, at) == []
     assert delivery_snapshot(db) == frozen
-
   end
 
   defp scenario(37, db) do

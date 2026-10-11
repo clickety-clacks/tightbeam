@@ -572,6 +572,7 @@ defmodule Tightbeam.NoticeSourcePayloadTest do
       )
 
     frozen = File.read!(Path.expand("fixtures/notice_source_payload_6642ee93.sql", __DIR__))
+
     assert Base.encode16(:crypto.hash(:sha256, frozen), case: :lower) ==
              "3bb006a3ae09f0bf310af1b0390958f3dbebfe2c7bbb3bad08cb6c5044ae8665"
 

@@ -235,9 +235,11 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
     NoticeBatcher.recover(ctx.db)
 
     assert {:ok, [[dispatch_prompt]]} =
-             DB.query(ctx.db,
+             DB.query(
+               ctx.db,
                "SELECT prompt FROM turns WHERE assignmentId=?1 AND sessionKey=?2",
-               [dispatch_id, dispatch_holder])
+               [dispatch_id, dispatch_holder]
+             )
 
     assert dispatch_prompt ==
              "[from user:#{owner_id}]\n\n[assignment: #{dispatch_id}]\n\nship the smoke feature"
@@ -257,7 +259,15 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
              "terminal-child-owner-notification:" <> dispatch_id
 
     assert {:ok,
-            [[terminal_carrier, ^owner_session, terminal_prompt, terminal_envelope, terminal_hash]]} =
+            [
+              [
+                terminal_carrier,
+                ^owner_session,
+                terminal_prompt,
+                terminal_envelope,
+                terminal_hash
+              ]
+            ]} =
              DB.query(
                ctx.db,
                """
@@ -277,7 +287,10 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
              Tightbeam.Wakes.get(ctx.db, terminal_carrier)
 
     assert terminal_carrier != terminal_source
-    assert terminal_prompt == Gateway.decorate_delivery_prompt(terminal_envelope, "process:tightbeam")
+
+    assert terminal_prompt ==
+             Gateway.decorate_delivery_prompt(terminal_envelope, "process:tightbeam")
+
     assert terminal_envelope =~ terminal_raw
     assert terminal_hash == Base.encode16(:crypto.hash(:sha256, terminal_envelope), case: :lower)
 
