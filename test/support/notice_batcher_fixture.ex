@@ -1676,19 +1676,75 @@ defmodule Tightbeam.NoticeBatcherFixture do
 
     assert Exception.message(error) =~ "changed_retry_authority"
     assert delivery_snapshot(db) == snapshot
+    assert {:ok, assignments_before} = DB.query(db, "SELECT * FROM assignments ORDER BY id")
+
+    assert {:ok, revocations_before} =
+             DB.query(db, "SELECT * FROM assignment_revocations ORDER BY id")
+
+    assert {:ok, generations_before} =
+             DB.query(db, "SELECT * FROM assignment_revocation_generations ORDER BY revocationId")
+
     # An intervening assignment disposition also holds the pending derivative
     # before admission, with no controller charge or partial queue mutation.
     assert {:error, error} =
              DB.transaction(db, fn txn ->
+               closed_at = System.system_time(:millisecond)
+
+               assert [] =
+                        DB.Txn.q(
+                          txn,
+                          "SELECT id FROM assignment_reopenings WHERE assignmentId='prewrite-controller'"
+                        )
+
+               # Admit a complete revoked row with the same provenance/generation
+               # binding required by Assignments; an invalid close would stop at
+               # the schema CHECK before the retry authority guard is exercised.
                DB.Txn.q(
                  txn,
-                 "UPDATE assignments SET state='closed' WHERE id='prewrite-controller'"
+                 """
+                 INSERT INTO assignment_revocations
+                   (id,assignmentId,revokedAt,revokedByUser,reason)
+                 VALUES ('rev_prewrite_parent_changed','prewrite-controller',?1,
+                   'recipient-owner','fixture parent disposition changed')
+                 """,
+                 [closed_at]
                )
+
+               DB.Txn.q(txn, """
+               INSERT INTO assignment_revocation_generations
+                 (revocationId,assignmentId,reopeningId)
+               VALUES ('rev_prewrite_parent_changed','prewrite-controller',NULL)
+               """)
+
+               DB.Txn.q(
+                 txn,
+                 """
+                 UPDATE assignments SET state='closed',outcome='revoked',closedAt=?1,
+                   closedByUser='recipient-owner'
+                 WHERE id='prewrite-controller' AND state='open'
+                 """,
+                 [closed_at]
+               )
+
+               assert 1 = DB.Txn.changes(txn)
+
+               assert [["closed", "revoked", ^closed_at, "recipient-owner"]] =
+                        DB.Txn.q(
+                          txn,
+                          "SELECT state,outcome,closedAt,closedByUser FROM assignments WHERE id='prewrite-controller'"
+                        )
 
                Tightbeam.Supervision.prepare_batch_source_in_txn(txn, second_retry)
              end)
 
     assert Exception.message(error) =~ "parent disposition changed"
+    assert {:ok, ^assignments_before} = DB.query(db, "SELECT * FROM assignments ORDER BY id")
+
+    assert {:ok, ^revocations_before} =
+             DB.query(db, "SELECT * FROM assignment_revocations ORDER BY id")
+
+    assert {:ok, ^generations_before} =
+             DB.query(db, "SELECT * FROM assignment_revocation_generations ORDER BY revocationId")
 
     assert {:ok, [["open"]]} =
              DB.query(
