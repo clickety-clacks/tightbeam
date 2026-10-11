@@ -1194,7 +1194,18 @@ defmodule Tightbeam.NoticeBatcherFixture do
 
     assert Wakes.get(db, first.wake_id) == old_first
     assert Wakes.get(db, second.wake_id) == old_second
-    assert Wakes.get(db, carrier).prompt == turn.prompt
+    raw_carrier = Wakes.get(db, carrier)
+    assert raw_carrier.origin == "process:tightbeam"
+    assert turn.origin == raw_carrier.origin
+    assert turn.prompt == "[from process:tightbeam]\n\n" <> raw_carrier.prompt
+
+    assert {:ok, [[raw_envelope, envelope_hash]]} =
+             DB.query(db, "SELECT envelope,envelopeSha256 FROM notice_batches WHERE deliveryWakeId=?1", [
+               carrier
+             ])
+
+    assert raw_envelope == raw_carrier.prompt
+    assert envelope_hash == Base.encode16(:crypto.hash(:sha256, raw_envelope), case: :lower)
 
     assert delivery_snapshot(db) |> Map.take(["notice_batches", "notice_batch_members"]) ==
              batch_history
@@ -1320,6 +1331,81 @@ defmodule Tightbeam.NoticeBatcherFixture do
     assert count(db, "turn_lifecycle_events", "turnSeq=?1 AND kind='terminal_committed'", [
              turn.seq
            ]) == 0
+  end
+
+  defp scenario(42, db) do
+    first = eligible(db, prompt: "[from forged sender]\n\nraw source remains literal")
+    second = eligible(db, prompt: "independent sibling")
+    [carrier] = NoticeBatcher.recover(db, second.due_at)
+    assert {:ok, turn} = Ledger.claim_next(db, "agent:recipient", "binding-test")
+    assert turn.wake_id == carrier
+    raw_carrier = Wakes.get(db, carrier)
+    assert turn.prompt == "[from process:tightbeam]\n\n" <> raw_carrier.prompt
+    evidence = prewrite_evidence()
+
+    # Every forgery is applied inside the terminal/restoration transaction.
+    # Refusal must roll back the terminal and every tampered durable row too.
+    for forged <- [
+          %{turn | prompt: raw_carrier.prompt},
+          %{turn | origin: "process:forged"},
+          %{turn | message_id: "forged-message"},
+          %{turn | wake_id: first.wake_id},
+          %{turn | owner_lease: "wrong-owner"}
+        ] do
+      before = delivery_snapshot(db)
+
+      assert {:error, %{message: message}} =
+               DB.transaction(db, fn txn ->
+                 assert Ledger.finish_in_txn(txn, turn.seq, "failed", "not dispatched",
+                          owner_lease: turn.owner_lease,
+                          prewrite_evidence: evidence
+                        )
+
+                 Tightbeam.NoticeSubmission.restore_in_txn(txn, forged, evidence)
+               end)
+
+      assert message in [
+               "notice_prewrite_restoration_refused: claimed turn changed",
+               "notice_prewrite_restoration_refused: stale lease or uncertain dispatch"
+             ]
+
+      assert delivery_snapshot(db) == before
+    end
+
+    mutations = [
+      {"UPDATE wakes SET prompt='forged envelope' WHERE wakeId=?1", [carrier]},
+      {"UPDATE wakes SET origin='process:forged' WHERE wakeId=?1", [carrier]},
+      {"UPDATE wakes SET sessionKey='agent:sender' WHERE wakeId=?1", [carrier]},
+      {"UPDATE messages SET sender='process:forged' WHERE id=?1", [turn.message_id]},
+      {"UPDATE notice_batches SET envelopeSha256='forged hash' WHERE deliveryWakeId=?1", [carrier]},
+      {"UPDATE notice_batches SET memberCount=memberCount+1 WHERE deliveryWakeId=?1", [carrier]},
+      {"UPDATE notice_batch_members SET payload='forged member' WHERE sourceWakeId=?1", [first.wake_id]},
+      {"UPDATE notice_batch_members SET senderPrincipal='process:forged' WHERE sourceWakeId=?1", [first.wake_id]},
+      {"UPDATE wakes SET prompt='forged raw source' WHERE wakeId=?1", [first.wake_id]}
+    ]
+
+    for {sql, params} <- mutations do
+      before = delivery_snapshot(db)
+
+      assert {:error, %{message: "notice_prewrite_restoration_refused: inconsistent carrier"}} =
+               DB.transaction(db, fn txn ->
+                 DB.Txn.q(txn, sql, params)
+
+                 assert Ledger.finish_in_txn(txn, turn.seq, "failed", "not dispatched",
+                          owner_lease: turn.owner_lease,
+                          prewrite_evidence: evidence
+                        )
+
+                 Tightbeam.NoticeSubmission.restore_in_txn(txn, turn, evidence)
+               end)
+
+      assert delivery_snapshot(db) == before
+    end
+
+    assert count(db, "wake_retry_attempts") == 0
+    assert count(db, "turns", "wakeId=?1 AND status='running'", [carrier]) == 1
+    assert Wakes.get(db, carrier) == raw_carrier
+    assert source_ids(db, carrier) == [first.wake_id, second.wake_id]
   end
 
   defp scenario(33, db) do
@@ -1847,6 +1933,7 @@ defmodule Tightbeam.NoticeBatcherFixture do
     Map.new(
       [
         {"turns", "seq"},
+        {"turn_lifecycle_events", "id"},
         {"messages", "id"},
         {"wakes", "wakeId"},
         {"notice_batches", "batchId"},

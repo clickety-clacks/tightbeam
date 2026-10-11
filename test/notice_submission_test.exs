@@ -31,6 +31,12 @@ defmodule Tightbeam.NoticeSubmissionTest do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 32)
   end
 
+  test "forged claimed-turn, envelope, sender or member provenance refuses with zero writes", %{
+    tmp_dir: tmp
+  } do
+    Tightbeam.NoticeBatcherFixture.run!(tmp, 42)
+  end
+
   test "a changed controller entitlement rolls back terminal and sibling restoration atomically",
        %{tmp_dir: tmp} do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 33)

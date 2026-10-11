@@ -2129,14 +2129,15 @@ defmodule Tightbeam.Gateway do
     end
   end
 
+  @doc false
+  def decorate_delivery_prompt(prompt, sender) when is_binary(sender),
+    do: "[from #{sender}]\n\n" <> prompt
+
+  def decorate_delivery_prompt(prompt, _sender), do: prompt
+
   defp deliver_prompt_once_in_txn(txn, session_key, origin, prompt, opts) do
     opts = delivery_attachments_in_txn(txn, opts)
-
-    stamped =
-      case opts[:sender] do
-        sender when is_binary(sender) -> "[from #{sender}]\n\n" <> prompt
-        _ -> prompt
-      end
+    stamped = decorate_delivery_prompt(prompt, opts[:sender])
 
     case delivery_target(txn, session_key, opts[:target_gate]) do
       nil ->

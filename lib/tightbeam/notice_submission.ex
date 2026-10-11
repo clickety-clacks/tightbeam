@@ -5,6 +5,7 @@ defmodule Tightbeam.NoticeSubmission do
     Assignments,
     DB,
     EventLog,
+    Gateway,
     NoticeAuthority,
     NoticeBatcher,
     QueuedMessageSuppression,
@@ -119,6 +120,19 @@ defmodule Tightbeam.NoticeSubmission do
   def restore_in_txn(%Txn{} = txn, turn, evidence) do
     :ok = assert_restoration_in_txn!(txn, turn, evidence)
 
+    unless Txn.q(
+             txn,
+             """
+             SELECT 1 FROM turns WHERE seq=?1 AND wakeId IS ?2
+               AND messageId=?3 AND origin=?4 AND prompt=?5
+             """,
+             [turn.seq, turn.wake_id, turn.message_id, turn.origin, turn.prompt]
+           ) == [[1]],
+           do:
+             raise(DB.Error,
+               message: "notice_prewrite_restoration_refused: claimed turn changed"
+             )
+
     sources =
       if is_binary(turn.wake_id),
         do: NoticeBatcher.carrier_source_ids_in_txn(txn, turn.wake_id),
@@ -137,23 +151,59 @@ defmodule Tightbeam.NoticeSubmission do
             raise DB.Error, message: "notice_prewrite_restoration_refused: carrier has no sources"
         end
       else
-        unless Txn.q(
-                 txn,
-                 """
-                 SELECT 1 FROM notice_batches b JOIN turns t ON t.wakeId=b.deliveryWakeId
-                 WHERE t.seq=?1 AND b.state='delivered' AND b.envelope=t.prompt
-                 """,
-                 [turn.seq]
-               ) == [[1]],
-               do:
-                 raise(DB.Error,
-                   message: "notice_prewrite_restoration_refused: inconsistent carrier"
-                 )
-
+        :ok = assert_carrier_in_txn!(txn, turn, length(sources))
         sources
       end
 
     Enum.map(sources, &restore_source_in_txn(txn, &1, turn, evidence))
+  end
+
+  defp assert_carrier_in_txn!(txn, turn, source_count) do
+    # Gateway stores the raw envelope on the carrier and the sender-decorated
+    # prompt on its actual turn/message. Bind all three durable rows; never
+    # recover by stripping a prefix from caller-supplied text.
+    binding =
+      Txn.q(
+        txn,
+        """
+        SELECT b.envelope,b.envelopeSha256,w.origin,t.prompt
+        FROM notice_batches b JOIN wakes w ON w.wakeId=b.deliveryWakeId
+        JOIN turns t ON t.wakeId=w.wakeId
+        JOIN messages message ON message.id=t.messageId
+        WHERE t.seq=?1 AND b.state='delivered' AND b.memberCount=?2
+          AND w.consumer='prompt' AND w.digest=1 AND w.state='fired'
+          AND b.sessionKey=t.sessionKey AND w.sessionKey=t.sessionKey
+          AND b.envelope=w.prompt AND w.origin='process:tightbeam'
+          AND t.origin=w.origin AND message.sender=w.origin
+          AND message.sessionKey=t.sessionKey AND message.role='user'
+          AND message.content=t.prompt
+          AND NOT EXISTS (
+            SELECT 1 FROM notice_batch_members m JOIN wakes source ON source.wakeId=m.sourceWakeId
+            WHERE m.batchId=b.batchId AND m.state='included'
+              AND (m.payload!=source.prompt OR m.senderPrincipal!=source.origin
+                OR m.recipientAddress!=b.recipientAddress OR m.visibilityScope!=b.visibilityScope
+                OR source.consumer!='prompt' OR source.digest!=0 OR source.state!='fired'))
+        """,
+        [turn.seq, source_count]
+      )
+
+    valid? =
+      case binding do
+        [[envelope, hash, sender, prompt]] when is_binary(envelope) ->
+          hash == Base.encode16(:crypto.hash(:sha256, envelope), case: :lower) and
+            prompt == Gateway.decorate_delivery_prompt(envelope, sender)
+
+        _ ->
+          false
+      end
+
+    unless valid?,
+      do:
+        raise(DB.Error,
+          message: "notice_prewrite_restoration_refused: inconsistent carrier"
+        )
+
+    :ok
   end
 
   defp restore_source_in_txn(txn, source_id, turn, evidence) do

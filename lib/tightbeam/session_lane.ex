@@ -786,7 +786,7 @@ defmodule Tightbeam.SessionLane do
             fn txn ->
               if Ledger.finish_in_txn(txn, seq, terminal, error, terminal_opts) do
                 recorded =
-                  if prewrite_evidence and is_function(in_txn, 1),
+                  if not is_nil(prewrite_evidence) and is_function(in_txn, 1),
                     do: in_txn.(txn),
                     else: nil
 
