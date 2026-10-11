@@ -147,17 +147,9 @@ defmodule Tightbeam.R1SchemaMigrationTest do
   end
 
   defp successor_guard("supervision_liveness_sidecar_insert_coherent", sql) do
-    # Event-derived ancestry is the only change to this historical trigger;
-    # admission behavior is exercised separately in SessionReparentTest.
-    sql
-    |> String.replace(
-      "SELECT sessionKey,spawnedBy FROM sessions",
-      "SELECT sessionKey,#{Tightbeam.Org.current_parent_sql("sessions")} FROM sessions"
-    )
-    |> String.replace(
-      "SELECT ancestor.sessionKey,ancestor.spawnedBy",
-      "SELECT ancestor.sessionKey,#{Tightbeam.Org.current_parent_sql("ancestor")}"
-    )
+    # Qualify the exact historical guard before expecting its lineage and
+    # leased continuation-retry successor; all other objects stay byte exact.
+    Tightbeam.SchemaShapeRuntimeFixture.continuation_retry_successor_guard!(sql)
   end
 
   defp successor_guard(name, sql)

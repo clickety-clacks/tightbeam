@@ -649,6 +649,7 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
                  )
 
         assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM notice_batch_members")
+        downgrade_continuation_retry_guard!(db)
 
         assert {:ok, source_before} =
                  DB.query(
@@ -716,6 +717,85 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
         refute "sourceAddress" in table_columns(db, "wakes")
     end
   end
+
+  # Recreating an older stamp also retires the source-bound retry trigger,
+  # before that fixture removes any lifecycle or batch tables it references.
+  # Neither unknown DDL nor current restored-continuation data is relabeled.
+  defp downgrade_continuation_retry_guard!(db) do
+    previous = previous_continuation_guard!()
+    current = current_continuation_guard!()
+
+    assert {:ok, [[sql]]} =
+             DB.query(
+               db,
+               "SELECT sql FROM sqlite_master WHERE name='supervision_liveness_sidecar_insert_coherent'"
+             )
+
+    assert normalize_guard(sql) in [normalize_guard(previous), normalize_guard(current)]
+
+    assert {:ok, [[0]]} =
+             DB.query(db, """
+             SELECT count(*) FROM supervision_liveness_sidecar sidecar
+             JOIN wake_retry_attempts retry ON retry.wakeId=sidecar.wakeId
+             WHERE sidecar.controllerOrigin='holder_continuation' AND retry.predecessorWakeId IS NOT NULL
+             """)
+
+    assert {:ok, before} =
+             DB.query(db, "SELECT rowid,* FROM supervision_liveness_sidecar ORDER BY rowid")
+
+    assert {:ok, :ok} =
+             DB.transaction(db, fn txn ->
+               :ok = DB.Txn.exec(txn, "DROP TRIGGER supervision_liveness_sidecar_insert_coherent")
+               DB.Txn.exec(txn, previous)
+             end)
+
+    assert {:ok, ^before} =
+             DB.query(db, "SELECT rowid,* FROM supervision_liveness_sidecar ORDER BY rowid")
+  end
+
+  def continuation_retry_successor_guard!(sql) do
+    reparented =
+      sql
+      |> String.replace(
+        "SELECT sessionKey,spawnedBy FROM sessions",
+        "SELECT sessionKey,#{Tightbeam.Org.current_parent_sql("sessions")} FROM sessions"
+      )
+      |> String.replace(
+        "SELECT ancestor.sessionKey,ancestor.spawnedBy",
+        "SELECT ancestor.sessionKey,#{Tightbeam.Org.current_parent_sql("ancestor")}"
+      )
+
+    assert normalize_guard(reparented) == normalize_guard(previous_continuation_guard!())
+    current_continuation_guard!() |> String.trim()
+  end
+
+  defp previous_continuation_guard!(),
+    do:
+      continuation_guard_fixture!(
+        "prewrite-continuation-21a4cb0e.sql",
+        "6a0ae873164c029d98345843c7bdf744adcf5c512eefd910f1a456dec9df3313"
+      )
+
+  defp current_continuation_guard!(),
+    do:
+      continuation_guard_fixture!(
+        "prewrite-continuation-b7a97f5c.sql",
+        "ad15e01ed001f6b6cb694f0ac085bcc0724db140e7e193e92052197be1843fc3"
+      )
+
+  defp continuation_guard_fixture!(name, expected) do
+    sql = File.read!(Path.join(Path.expand("..", __DIR__), "fixtures/row_wakes/#{name}"))
+    assert Base.encode16(:crypto.hash(:sha256, sql), case: :lower) == expected
+    sql
+  end
+
+  defp normalize_guard(sql),
+    do:
+      sql
+      |> String.downcase()
+      |> String.replace(~r/\bif\s+not\s+exists\b/u, "")
+      |> String.replace(~r/\s+/u, "")
+      |> String.trim_trailing(";")
 
   defp downgrade_wakes_to_terminal_decision(db) do
     :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
