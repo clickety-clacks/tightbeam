@@ -148,7 +148,39 @@ class ExactHeadCI(unittest.TestCase):
         self.assertIn('    name: ${{ matrix.name }}', test_job)
         self.assertEqual(re.findall(r'(?m)^            name: (\S+)$', test_job),
                          ['linux', 'macos'])
-        self.assertNotRegex(test_job, r'(?m)^    if:')
+        condition = re.search(r'(?m)^    if: (.*)$', test_job).group(1)
+        for event in ('merge_group', 'pull_request', 'push'):
+            for mode in ('', 'off', 'on'):
+                self.assertTrue(evaluate(condition, {
+                    'github.event_name': event, 'inputs.docs_validation': mode}))
+
+    def test_only_explicit_docs_dispatch_skips_existing_matrix(self):
+        condition = re.search(r'(?m)^    if: (.*)$', self.jobs['test']).group(1)
+        for mode, expected in (('', True), ('off', True), ('on', False)):
+            self.assertEqual(evaluate(condition, {
+                'github.event_name': 'workflow_dispatch',
+                'inputs.docs_validation': mode}), expected)
+
+    def test_docs_dispatch_is_hosted_read_only_and_subject_bound(self):
+        job = self.text.split('\n  docs-validation:\n', 1)[1]
+        condition = re.search(r'(?m)^    if: (.*)$', job).group(1)
+        for event in ('push', 'pull_request', 'merge_group', 'workflow_dispatch'):
+            for mode in ('', 'off', 'on'):
+                self.assertEqual(evaluate(condition, {
+                    'github.event_name': event, 'inputs.docs_validation': mode}),
+                    event == 'workflow_dispatch' and mode == 'on')
+        self.assertIn('runs-on: ${{ matrix.os }}', job)
+        self.assertIn('os: [ubuntu-latest, macos-latest]', job)
+        self.assertNotIn('self-hosted', job)
+        self.assertIn('permissions:\n      contents: read', job)
+        self.assertNotIn('contents: write', job)
+        self.assertIn('persist-credentials: false', job)
+        self.assertIn('test "$DISPATCH_SHA" = "$CI_SOURCE_SHA"', job)
+        self.assertIn('test "$(git rev-parse HEAD^{tree})" = "$EXPECTED_TREE"', job)
+        self.assertIn('python3 scripts/verify_shipped_privacy.py', job)
+        self.assertIn('sh packaging/assemble.sh', job)
+        self.assertIn('mix run --no-start scripts/docs_composition_52.exs', job)
+        self.assertIn('if: always() && steps.evidence.outputs.path', job)
 
     def test_merge_group_never_packages_or_publishes(self):
         queue_ref = 'refs/heads/gh-readonly-queue/0.1.9/pr-12-' + 'a' * 40
