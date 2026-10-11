@@ -270,7 +270,7 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
                ctx.db,
                """
                SELECT turn.seq,turn.wakeId,turn.sessionKey,turn.prompt,turn.assignmentId,
-                 batch.envelope,batch.envelopeHash
+                 batch.envelope,batch.envelopeSha256
                FROM (#{NoticeBatcher.source_deliveries_sql()}) delivery
                JOIN turns turn ON turn.seq=delivery.turnSeq AND turn.origin='process:tightbeam'
                JOIN messages message ON message.id=turn.messageId
