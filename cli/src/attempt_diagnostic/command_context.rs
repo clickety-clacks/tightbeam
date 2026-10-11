@@ -48,7 +48,9 @@ impl CommandContext {
             // than the shared RequestSpec dispatcher and attempt/receipt path.
             // Do not claim that this command has that metadata until its
             // dedicated transport callers are explicitly integrated.
-            IdentityCurrent | GithubAuthCheck | SessionConnect { .. } => return None,
+            IdentityCurrent | GithubAuthCheck | SessionConnect { .. } | SessionDiagnose { .. } => {
+                return None;
+            }
             Help => ("cli.help", Catalog),
             CommandHelp(_) => ("cli.command_help", Catalog),
             Doctor { .. } => ("cli.doctor", CatalogAndDispatch),
@@ -292,6 +294,7 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         Help
         | CommandHelp(_)
         | Doctor { .. }
+        | SessionDiagnose { .. }
         | HarnessHealthEvidenceOther { .. }
         | ArtifactContentFetch { .. }
         | Artifacts { .. }
