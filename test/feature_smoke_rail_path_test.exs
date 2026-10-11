@@ -192,7 +192,6 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
              )
 
     owner_id = ctx.state.user_id
-    owner_session = Org.personal_session_key(owner_id)
     assert Org.get(ctx.db, dispatch_holder).owner_user_id == owner_id
 
     assert {:ok, [[revocation_id, terminal_at, dispatch_work_item, ^owner_id]]} =
@@ -216,6 +215,18 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
                [dispatch_id, dispatch_holder]
              )
 
+    assert {:ok, [[owner_session, ^owner_id, "retired"]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT work_item.deliveryOwnerSessionKey,recipient.ownerUserId,recipient.state
+               FROM work_items work_item
+               JOIN sessions recipient ON recipient.sessionKey=work_item.deliveryOwnerSessionKey
+               WHERE work_item.id=?1
+               """,
+               [dispatch_work_item]
+             )
+
     assert {:ok, %{wake_id: terminal_source, prompt: terminal_raw}} =
              Tightbeam.Wakes.terminal_notification(%{
                source_kind: "assignment_revocation",
@@ -230,8 +241,9 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
                terminal_at: terminal_at
              })
 
-    # The script retires the real dispatch holder. Drive its required owner
-    # notice through the same readiness boundary, without a provider turn.
+    # The script retires both the holder and its accountable owner. Admission
+    # before owner retirement leaves immutable delivery; retirement first must
+    # leave a typed cancellation, never invented fired history.
     NoticeBatcher.recover(ctx.db)
 
     assert {:ok, [[dispatch_prompt]]} =
@@ -244,8 +256,10 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
     assert dispatch_prompt ==
              "[from user:#{owner_id}]\n\n[assignment: #{dispatch_id}]\n\nship the smoke feature"
 
+    terminal = Tightbeam.Wakes.get(ctx.db, terminal_source)
+
     assert %{
-             state: "fired",
+             session_key: ^owner_session,
              prompt: ^terminal_raw,
              origin: "process:tightbeam",
              consumer: "prompt",
@@ -253,46 +267,103 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
              work_item_id: ^dispatch_work_item,
              creator_session_key: ^dispatch_holder,
              owner_user_id: ^owner_id
-           } = Tightbeam.Wakes.get(ctx.db, terminal_source)
+           } = terminal
 
-    assert Tightbeam.Wakes.get(ctx.db, terminal_source).obligation_ref ==
+    assert terminal.obligation_ref ==
              "terminal-child-owner-notification:" <> dispatch_id
 
-    assert {:ok,
-            [
-              [
-                terminal_carrier,
-                ^owner_session,
-                terminal_prompt,
-                terminal_envelope,
-                terminal_hash
-              ]
-            ]} =
-             DB.query(
-               ctx.db,
-               """
-               SELECT turn.wakeId,turn.sessionKey,turn.prompt,
-                 batch.envelope,batch.envelopeSha256
-               FROM (#{NoticeBatcher.source_deliveries_sql()}) delivery
-               JOIN turns turn ON turn.seq=delivery.turnSeq AND turn.origin='process:tightbeam'
-               JOIN messages message ON message.id=turn.messageId
-                 AND message.sender=turn.origin AND message.content=turn.prompt
-               JOIN notice_batches batch ON batch.deliveryWakeId=turn.wakeId AND batch.state='delivered'
-               WHERE delivery.sourceWakeId=?1 AND delivery.assignmentId=?2 AND delivery.carrier=1
-               """,
-               [terminal_source, dispatch_id]
-             )
+    case terminal.state do
+      "fired" ->
+        assert {:ok,
+                [
+                  [
+                    terminal_carrier,
+                    ^owner_session,
+                    terminal_prompt,
+                    terminal_envelope,
+                    terminal_hash
+                  ]
+                ]} =
+                 DB.query(
+                   ctx.db,
+                   """
+                   SELECT turn.wakeId,turn.sessionKey,turn.prompt,
+                     batch.envelope,batch.envelopeSha256
+                   FROM (#{NoticeBatcher.source_deliveries_sql()}) delivery
+                   JOIN turns turn ON turn.seq=delivery.turnSeq AND turn.origin='process:tightbeam'
+                   JOIN messages message ON message.id=turn.messageId
+                     AND message.sender=turn.origin AND message.content=turn.prompt
+                   JOIN notice_batches batch ON batch.deliveryWakeId=turn.wakeId AND batch.state='delivered'
+                   WHERE delivery.sourceWakeId=?1 AND delivery.assignmentId=?2 AND delivery.carrier=1
+                   """,
+                   [terminal_source, dispatch_id]
+                 )
 
-    assert %{state: "fired", digest: true, prompt: ^terminal_envelope} =
-             Tightbeam.Wakes.get(ctx.db, terminal_carrier)
+        assert %{state: "fired", digest: true, prompt: ^terminal_envelope} =
+                 Tightbeam.Wakes.get(ctx.db, terminal_carrier)
 
-    assert terminal_carrier != terminal_source
+        assert terminal_carrier != terminal_source
 
-    assert terminal_prompt ==
-             Gateway.decorate_delivery_prompt(terminal_envelope, "process:tightbeam")
+        assert terminal_prompt ==
+                 Gateway.decorate_delivery_prompt(terminal_envelope, "process:tightbeam")
 
-    assert terminal_envelope =~ terminal_raw
-    assert terminal_hash == Base.encode16(:crypto.hash(:sha256, terminal_envelope), case: :lower)
+        assert terminal_envelope =~ terminal_raw
+        assert terminal_hash == Base.encode16(:crypto.hash(:sha256, terminal_envelope), case: :lower)
+
+        assert {:ok, [[0]]} =
+                 DB.query(ctx.db, "SELECT count(*) FROM wake_cancellations WHERE wakeId=?1", [
+                   terminal_source
+                 ])
+
+      "canceled" ->
+        assert terminal.fired_at == nil
+        assert terminal.fired_by == nil
+        canceled_at = terminal.canceled_at
+        assert is_integer(canceled_at)
+
+        assert {:ok,
+                [
+                  [
+                    ^canceled_at,
+                    "process",
+                    "tightbeam:retirement",
+                    "target_retired",
+                    "session_transition",
+                    ^owner_session,
+                    "no_replacement",
+                    nil,
+                    nil,
+                    nil,
+                    "work_item",
+                    ^dispatch_work_item,
+                    "linked_work_open",
+                    "routing_bracket",
+                    ^dispatch_work_item,
+                    1
+                  ]
+                ]} =
+                 DB.query(
+                   ctx.db,
+                   """
+                   SELECT canceledAt,requesterKind,requesterId,reasonKind,
+                     causalSourceKind,causalSourceId,outcomeKind,replacementWakeId,
+                     dispositionKind,dispositionId,primaryWorkKind,primaryWorkId,
+                     workImpactKind,livenessTriggerKind,livenessTriggerId,actionNeeded
+                   FROM wake_cancellations WHERE wakeId=?1 AND wakeState='canceled'
+                   """,
+                   [terminal_source]
+                 )
+
+        assert {:ok, [[0]]} =
+                 DB.query(
+                   ctx.db,
+                   "SELECT count(*) FROM (#{NoticeBatcher.source_deliveries_sql()}) WHERE sourceWakeId=?1",
+                   [terminal_source]
+                 )
+
+        assert {:ok, [[0]]} =
+                 DB.query(ctx.db, "SELECT count(*) FROM turns WHERE wakeId=?1", [terminal_source])
+    end
 
     # Detailed member corruption/replay/privacy checks belong to the focused
     # notice fixtures; this script proves one brief and its required owner notice.
