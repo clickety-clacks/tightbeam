@@ -3062,6 +3062,11 @@ fn spaces(text: &[u8]) -> usize {
 /// The length of the value the gateway's secret-assignment rule masks, in the order it
 /// tries them: an auth scheme and its credential, a quoted string, then a bare word.
 fn secret_value(text: &[u8]) -> Option<usize> {
+    const REDACTED_MARKER: &[u8] = b"[REDACTED:secret_field]";
+    if text.starts_with(REDACTED_MARKER) {
+        return Some(REDACTED_MARKER.len());
+    }
+
     let scheme = ["bearer", "basic", "token"].iter().find_map(|scheme| {
         let named = text
             .get(..scheme.len())
@@ -6410,6 +6415,10 @@ mod tests {
                 "login failed: password=[REDACTED:secret_field], retry later",
             ),
             (
+                "primary DB failure password=[REDACTED:secret_field]",
+                "primary DB failure password=[REDACTED:secret_field]",
+            ),
+            (
                 r#"{"detail": "x", "client_secret": "fixture\"SENTINEL"}"#,
                 r#"{"detail": "x", "client_secret": "[REDACTED:secret_field]"}"#,
             ),
@@ -6480,7 +6489,9 @@ mod tests {
             ),
         ];
         for (body, expected) in cases {
-            assert_eq!(redact_body(body), expected, "{body}");
+            let redacted = redact_body(body);
+            assert_eq!(redacted, expected, "{body}");
+            assert_eq!(redact_body(&redacted), expected, "redacting {body} twice");
         }
     }
 
