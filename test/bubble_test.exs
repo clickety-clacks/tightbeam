@@ -950,11 +950,19 @@ defmodule Tightbeam.Productions.BubbleTest do
                owner_lease: decision.owner_lease
              )
 
+    # Hold the actual next recipient so the bubble has an editable source
+    # before readiness admission, rather than taking the lone idle direct path.
+    main_busy = hold_recipient!(ctx.db, ctx.main.session_key)
     assert :ok = Bubble.recognize_terminal(ctx.db, decision.seq)
-    _ = deliver_ready_carriers!(ctx, ctx.main.session_key)
     root = "bubble:#{decision.seq}:#{ctx.main.session_key}"
+    assert Tightbeam.Wakes.get(ctx.db, root).state == "pending"
+    assert Tightbeam.NoticeAuthority.current!(ctx.db, root) == root
+    finish_busy_recipient!(ctx.db, main_busy)
+    [bubble_carrier] = deliver_ready_carriers!(ctx, ctx.main.session_key)
     assert Tightbeam.Wakes.get(ctx.db, root).state == "fired"
     assert {:ok, turn} = Ledger.claim_next(ctx.db, ctx.main.session_key, "prewrite-bubble")
+    assert turn.wake_id == bubble_carrier
+    refute turn.wake_id == root
 
     {:ok, cp_before} =
       DB.query(ctx.db, "SELECT * FROM assignment_cannot_proceed WHERE id=?1", [
@@ -971,6 +979,11 @@ defmodule Tightbeam.Productions.BubbleTest do
     successors = prewrite_restore!(ctx.db, turn)
     retry = Tightbeam.NoticeAuthority.current!(ctx.db, root)
     assert retry in successors
+    refute retry == root
+    assert Tightbeam.NoticeAuthority.resolve!(ctx.db, retry) == %{
+             root_wake_id: root,
+             root_turn_seq: turn.seq
+           }
     assert :ok = Bubble.recognize_terminal(ctx.db, turn.seq)
 
     assert {:ok, ^cp_before} =

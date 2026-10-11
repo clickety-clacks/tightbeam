@@ -1,7 +1,7 @@
 defmodule Tightbeam.FeatureSmokeRailPathTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{Archetypes, DB, Gateway, Model, ModelCatalog, Org, Roles, Rules, Schema}
+  alias Tightbeam.{Archetypes, DB, Gateway, Ledger, Model, ModelCatalog, NoticeBatcher, Org, Roles, Rules, Schema}
   alias Tightbeam.Wire.Router
   alias Tightbeam.FeatureSmokeDriverFixture, as: Driver
 
@@ -321,14 +321,31 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
        name: Tightbeam.Supervision}
     )
 
-    # The real dispatch leaves a turn queued. Without a lane/provider it cannot
-    # become idle execution evidence. Keep the driver's refusal and name that
-    # boundary instead of fabricating a reply or terminalizing the turn by SQL.
+    # Drain only the preparatory rumination through the real claim/terminal
+    # seams, explicitly canceled as fixture setup. No provider reply or model
+    # execution is fabricated. The subsequent holder dispatch stays queued.
+    rumination =
+      Task.async(fn ->
+        drain_effort_rumination!(ctx.db, System.monotonic_time(:millisecond) + 10_000)
+      end)
+
     ExUnit.CaptureIO.capture_io(fn ->
       assert_raise Tightbeam.FeatureSmokeDriverFixture.Failure, ~r/effort smoke timed out/, fn ->
         Driver.check_effort_without_effect(ctx.state)
       end
     end)
+
+    {source, carrier, seq} = Task.await(rumination, 1_000)
+    refute source == carrier
+    assert Tightbeam.Wakes.get(ctx.db, source).state == "fired"
+
+    assert {:ok, [["canceled"]]} = DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [seq])
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, """
+             SELECT count(*) FROM turn_lifecycle_events
+             WHERE turnSeq=?1 AND kind='terminal_committed' AND outcome='canceled'
+             """, [seq])
 
     assert {:ok, [["open", nil, "queued"]]} =
              DB.query(ctx.db, """
@@ -341,6 +358,40 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
                ctx.db,
                "SELECT count(*) FROM decision_requests WHERE kind='effort'"
              )
+  end
+
+  defp drain_effort_rumination!(db, deadline) do
+    assert {:ok, rows} =
+             DB.query(db, """
+             SELECT source.wakeId,source.sessionKey,t.seq,t.wakeId
+             FROM wakes source JOIN sessions s ON s.sessionKey=source.sessionKey
+             JOIN (#{NoticeBatcher.source_deliveries_sql()}) d ON d.sourceWakeId=source.wakeId
+             JOIN turns t ON t.seq=d.turnSeq
+             WHERE source.rumination=1 AND source.state='fired' AND d.carrier=1
+               AND s.displayName LIKE 'smoke-effort-parent-%' AND t.status='queued'
+             """)
+
+    case rows do
+      [[source, recipient, seq, carrier]] ->
+        assert {:ok, turn} = Ledger.claim_next(db, recipient, "fixture-rumination-drain")
+        assert turn.seq == seq
+        assert turn.wake_id == carrier
+        refute carrier == source
+
+        assert :ok =
+                 Ledger.finish(db, seq, "canceled", "provider-free fixture preparation only",
+                   owner_lease: turn.owner_lease
+                 )
+
+        {source, carrier, seq}
+
+      [] ->
+        assert System.monotonic_time(:millisecond) < deadline,
+               "actual effort rumination carrier was not admitted"
+
+        Process.sleep(10)
+        drain_effort_rumination!(db, deadline)
+    end
   end
 
   for profile <- [:installed, :published] do
