@@ -1180,6 +1180,7 @@ defmodule Tightbeam.Productions.BubbleTest do
         for suffix <- ~w(a b) do
           opener = session(ctx.db, "decision-#{suffix}", ctx.supervisor.session_key)
           holder = session(ctx.db, "decision-holder-#{suffix}", opener.session_key)
+          opener_busy = hold_recipient!(ctx.db, opener.session_key)
 
           {_assignment, blocked} =
             cannot_proceed_assignment!(
@@ -1190,6 +1191,7 @@ defmodule Tightbeam.Productions.BubbleTest do
             )
 
           queue_decision_wake!(ctx, blocked.decisionWake)
+          finish_busy_recipient!(ctx.db, opener_busy)
           _ = deliver_ready_carriers!(ctx, opener.session_key)
 
           assert {:ok, decision} =

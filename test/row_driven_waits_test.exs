@@ -1097,6 +1097,18 @@ defmodule Tightbeam.RowDrivenWaitsTest do
       qualification_policy(ctx)
       assignment(ctx.db, "B", "holder")
       assignment(ctx.db, "C", "holder")
+
+      assert {:ok, :armed} =
+               DB.transaction(ctx.db, fn txn ->
+                 Supervision.transition_in_txn(txn, %{
+                   kind: "assignment_open",
+                   assignment_id: "C",
+                   opened_at: 0,
+                   principal: "user:owner-a",
+                   supervision_interval_ms: 1
+                 })
+               end)
+
       originating = running_turn(ctx.db, "holder")
       first = after_turn_wait!(ctx.db, "A")
       canceled = after_turn_wait!(ctx.db, "C")
@@ -1773,9 +1785,12 @@ defmodule Tightbeam.RowDrivenWaitsTest do
   defp lane_prewrite_refusal!(ctx, tasks, seq) do
     parent = self()
     evidence = wait_prewrite_evidence()
+    refute Tightbeam.Application.draining?()
+    refute Tightbeam.HarnessProcess.parked?(ctx.db, {:claude, "shared", "testhost"})
 
     runner = fn turn ->
       assert turn.seq == seq
+      send(parent, {:wait_claimed, seq})
 
       {:error,
        %{
@@ -1797,8 +1812,24 @@ defmodule Tightbeam.RowDrivenWaitsTest do
       )
 
     try do
-      assert_receive {:restored_wait, ^seq, result}, 5_000
-      result
+      deadline = System.monotonic_time(:millisecond) + 5_000
+      assert_receive {:wait_claimed, ^seq}, 5_000
+      remaining = max(deadline - System.monotonic_time(:millisecond), 0)
+
+      receive do
+        {:restored_wait, ^seq, result} ->
+          result
+      after
+        remaining ->
+          assert {:ok, events} =
+                   DB.query(
+                     ctx.db,
+                     "SELECT kind,detail FROM lifecycle_events WHERE subject=?1 AND kind IN ('turn_finalize_transaction_failed','turn_finalize_fallback_failed') ORDER BY id",
+                     ["holder:#{seq}"]
+                   )
+
+          flunk("claimed continuation did not restore: #{inspect(events)}")
+      end
     after
       GenServer.stop(lane)
     end
