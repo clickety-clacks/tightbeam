@@ -976,6 +976,10 @@ defmodule Tightbeam.RailRemedyTest do
   end
 
   test "bootstrap uses the configured supervision interval rather than scheduler tick", ctx do
+    registry = :"o2_interval_registry_#{System.unique_integer([:positive])}"
+    lane = :"o2_interval_lane_#{System.unique_integer([:positive])}"
+    start_supervised!({ConnRegistry, name: registry})
+    start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, lane})
     assignment = notice_assignment(ctx, "interval configuration")
 
     {:ok, _} =
@@ -999,7 +1003,8 @@ defmodule Tightbeam.RailRemedyTest do
          db: ctx.db,
          tick_ms: 60_000,
          review_remedy_interval_ms: 4_321,
-         deliver: fn _ -> :ok end,
+         delivery_opts: [conn_registry: registry, lane_manager: lane],
+         deliver: fn _ -> flunk("normal notice delivery must use actual recipient admission") end,
          internal_consumers: %{"review_remedy_reconcile" => fn _ -> flunk("not due") end}
        ]}
     )

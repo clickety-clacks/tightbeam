@@ -44,6 +44,9 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
 
     :ok = Schema.ensure_all(db)
     start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
+    # Real readiness admission publishes and rings a lane after committing;
+    # this fixture has no provider lane, but must own that local doorbell.
+    start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, Tightbeam.LaneManager})
     register_hosts(db, %{"testhost" => %{ssh: nil, base_dir: base, cli_bin: nil}})
     {:ok, _} = DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES('mike',1,1)")
 
@@ -117,7 +120,8 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
     )
 
     Rules.load!(base, Map.keys(handlers))
-    # Real wake scheduling/durable states; delivery ends at an inert sink.
+    # Real wake scheduling and atomic carrier admission; the local doorbell
+    # does not execute a provider or synthesize an assistant turn.
     # Nothing calls an adapter or manufactures an inference/tool-call result.
     start_supervised!(
       {Tightbeam.Wakes,
@@ -167,8 +171,67 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
     assert {:ok, [[count]]} = DB.query(ctx.db, "SELECT count(*) FROM assignments")
     assert count >= 4
 
-    assert {:ok, [[1]]} =
-             DB.query(ctx.db, "SELECT count(*) FROM turns WHERE assignmentId IS NOT NULL")
+    assert {:ok, [[dispatch_id, dispatch_holder]]} =
+             DB.query(
+               ctx.db,
+               "SELECT id,holderKey FROM assignments WHERE subject LIKE 'smoke fanout %'"
+             )
+
+    assert {:ok, [[^dispatch_holder, dispatch_prompt]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sessionKey,prompt FROM turns WHERE assignmentId=?1",
+               [dispatch_id]
+             )
+
+    assert dispatch_prompt =~ "ship the smoke feature"
+
+    # The topology verdict also notifies its opener through ordinary delivery.
+    # Account for that actual turn by exact authored attest provenance instead
+    # of relaxing a global count or treating it as another dispatch.
+    assert {:ok, [[notice_carrier, notice_assignment]]} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId,assignmentId FROM turns WHERE assignmentId IS NOT NULL AND assignmentId<>?1",
+               [dispatch_id]
+             )
+
+    assert %{state: "fired", digest: true} = Tightbeam.Wakes.get(ctx.db, notice_carrier)
+
+    assert {:ok, notices} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT source.wakeId,source.prompt
+               FROM notice_batches batch
+               JOIN notice_batch_members member ON member.batchId=batch.batchId AND member.state='included'
+               JOIN wakes source ON source.wakeId=member.sourceWakeId
+               JOIN attests attest ON attest.assignmentId=source.assignmentId
+                 AND source.origin='agent:'||attest.bySession
+                 AND source.prompt='Attest '||attest.id||' ('||attest.kind||') was filed on assignment '||attest.assignmentId||'.'
+               WHERE batch.deliveryWakeId=?1 AND source.assignmentId=?2 AND batch.state='delivered'
+               """,
+               [notice_carrier, notice_assignment]
+             )
+
+    refute notices == []
+
+    for [source_id, raw_notice] <- notices do
+      assert Tightbeam.Wakes.get(ctx.db, source_id).prompt == raw_notice
+      assert Tightbeam.Wakes.get(ctx.db, source_id).state == "fired"
+
+      assert {:ok, [[0]]} =
+               DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [source_id])
+    end
+
+    notice_count = length(notices)
+
+    assert {:ok, [[^notice_count]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM notice_batch_members member JOIN notice_batches batch ON batch.batchId=member.batchId WHERE batch.deliveryWakeId=?1 AND member.state='included'",
+               [notice_carrier]
+             )
   end
 
   test "scripted review refuses changed source, wrong commit bytes, and false output", ctx do

@@ -476,6 +476,7 @@ defmodule Tightbeam.JobForensicsTest do
   test "cancel and fire ordering has one winner and never writes losing provenance", %{db: db} do
     work_item(db, "wi_cancel_first")
     work_item(db, "wi_fire_first")
+    session(db, "target")
 
     :ok =
       DB.execute(
@@ -500,6 +501,7 @@ defmodule Tightbeam.JobForensicsTest do
         origin: "user:flynn",
         prompt: "cancel first",
         due_at: 0,
+        sender_scheduled: true,
         work_item_id: "wi_cancel_first"
       })
 
@@ -520,18 +522,24 @@ defmodule Tightbeam.JobForensicsTest do
         origin: "user:flynn",
         prompt: "fire first",
         due_at: 0,
+        sender_scheduled: true,
         work_item_id: "wi_fire_first"
       })
 
     assert :ok = Wakes.fire_due(scheduler)
-    assert_received {:delivered, fire_id}
-    assert fire_id == fire_first.wake_id
+
+    [%{delivery_wake_id: fire_carrier_id}] =
+      Tightbeam.NoticeBatcher.source_refs(db, fire_first.wake_id)
+
+    assert_received {:delivered, ^fire_carrier_id}
 
     assert %{canceled: false} =
              cancel_via_gateway(db, fire_first.wake_id, "user:flynn", {:user, "flynn"})
 
     fire_timeline = trace(db, "wi_fire_first").timeline
-    assert Enum.count(fire_timeline, &(&1.type == "wake_fired")) == 1
+    fired_ids = fire_timeline |> Enum.filter(&(&1.type == "wake_fired")) |> Enum.map(& &1.id)
+    assert Enum.count(fired_ids, &(&1 == fire_first.wake_id)) == 1
+    assert Enum.count(fired_ids, &(&1 == fire_carrier_id)) == 1
     refute Enum.any?(fire_timeline, &(&1.type == "wake_canceled"))
   end
 
@@ -859,9 +867,9 @@ defmodule Tightbeam.JobForensicsTest do
     assert canceled_entry(db, "wi_restart_cancel", proven.wake_id) == before_restart
     assert_proven_cancellation(before_restart, %{provenanceStatus: "proven"})
 
-    # Capture the real current wake-table blueprint and seed the preserved
-    # production specimen before activation. Historical absence remains absence;
-    # the shared epoch proves chronology without a per-wake marker.
+    # Reconstruct the pre-payload wake table before seeding the preserved
+    # specimen. Successor source columns cannot accompany a predecessor stamp;
+    # the shared epoch still proves chronology without a per-wake marker.
     assert {:ok, [[wakes_ddl]]} =
              DB.query(db, "SELECT sql FROM sqlite_master WHERE type='table' AND name='wakes'")
 
@@ -873,6 +881,20 @@ defmodule Tightbeam.JobForensicsTest do
     })
 
     :ok = DB.execute(legacy_db, wakes_ddl <> ";")
+
+    :ok =
+      DB.execute(legacy_db, """
+      ALTER TABLE wakes DROP COLUMN sourceClientIdentity;
+      ALTER TABLE wakes DROP COLUMN sourceAttachments;
+      ALTER TABLE wakes DROP COLUMN sourceVisibilityScope;
+      ALTER TABLE wakes DROP COLUMN sourceAddress;
+      """)
+
+    assert {:ok, []} =
+             DB.query(legacy_db, """
+             SELECT name FROM pragma_table_info('wakes')
+             WHERE name IN ('sourceClientIdentity','sourceAttachments','sourceVisibilityScope','sourceAddress')
+             """)
 
     :ok =
       DB.execute(
@@ -890,6 +912,19 @@ defmodule Tightbeam.JobForensicsTest do
       )
 
     :ok = Tightbeam.Schema.ensure_all(legacy_db)
+
+    assert {:ok,
+            [
+              ["sourceAddress"],
+              ["sourceAttachments"],
+              ["sourceClientIdentity"],
+              ["sourceVisibilityScope"]
+            ]} =
+             DB.query(legacy_db, """
+             SELECT name FROM pragma_table_info('wakes')
+             WHERE name IN ('sourceClientIdentity','sourceAttachments','sourceVisibilityScope','sourceAddress')
+             ORDER BY name
+             """)
 
     :ok =
       DB.execute(legacy_db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn',1,1)")

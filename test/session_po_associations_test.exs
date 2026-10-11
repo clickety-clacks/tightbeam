@@ -6,6 +6,7 @@ defmodule Tightbeam.SessionPoAssociationsTest do
     Gateway,
     Ledger,
     Model,
+    NoticeBatcher,
     Org,
     Roles,
     Schema,
@@ -301,6 +302,10 @@ defmodule Tightbeam.SessionPoAssociationsTest do
 
   test "delayed replaced-association notice preserves its revision and directs current readback",
        ctx do
+    registry = :"po_notice_registry_#{System.unique_integer([:positive])}"
+    lane = :"po_notice_lane_#{System.unique_integer([:positive])}"
+    start_supervised!({Tightbeam.ConnRegistry, name: registry})
+    start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, lane})
     first = set(ctx.db, {:user, "owner"}, "product-owner:one", "delayed-a")
     second = set(ctx.db, {:user, "owner"}, "product-owner:two", "replace-with-b")
     wake = Wakes.get(ctx.db, first["association"]["noticeWakeId"])
@@ -308,20 +313,62 @@ defmodule Tightbeam.SessionPoAssociationsTest do
     assert second["association"]["poRole"] == "product-owner:two"
     assert second["association"]["revision"] == 2
 
-    assert {:ok, {:appended, "orchestrator", _message, _opts}} =
-             DB.transaction(ctx.db, fn txn ->
-               Gateway.deliver_prompt_in_txn(
-                 txn,
-                 wake.session_key,
-                 wake.origin,
-                 wake.prompt,
-                 wake_id: wake.wake_id,
-                 sender: wake.origin,
-                 device_id: "session-po-delayed-notice-test",
-                 client_message_id: wake.wake_id,
-                 target_gate: wake
-               )
-             end)
+    delivery =
+      DB.transaction(ctx.db, fn txn ->
+        Gateway.deliver_prompt_in_txn(
+          txn,
+          wake.session_key,
+          wake.origin,
+          wake.prompt,
+          wake_id: wake.wake_id,
+          sender: wake.origin,
+          device_id: "session-po-delayed-notice-test",
+          client_message_id: wake.wake_id,
+          target_gate: wake
+        )
+      end)
+
+    case delivery do
+      {:ok, {:staged, %{wake_id: source_wake_id}}} ->
+        _ =
+          NoticeBatcher.recover(ctx.db, System.system_time(:millisecond) + 60_000,
+            conn_registry: registry,
+            lane_manager: lane
+          )
+
+        [%{delivery_wake_id: carrier_wake_id}] = NoticeBatcher.source_refs(ctx.db, source_wake_id)
+        carrier = Wakes.get(ctx.db, carrier_wake_id)
+
+        assert {:ok, [[seq, "orchestrator"]]} =
+                 DB.query(ctx.db, "SELECT seq,sessionKey FROM turns WHERE wakeId=?1", [
+                   carrier_wake_id
+                 ])
+
+        assert {:ok, {:duplicate, %{turn_seq: ^seq}}} =
+                 DB.transaction(ctx.db, fn txn ->
+                   Gateway.deliver_prompt_in_txn(
+                     txn,
+                     carrier.session_key,
+                     carrier.origin,
+                     carrier.prompt,
+                     wake_id: carrier.wake_id,
+                     sender: carrier.origin,
+                     target_gate: carrier,
+                     fire_wake_in_txn: true
+                   )
+                 end)
+
+        assert {:ok, [[1]]} =
+                 DB.query(ctx.db, "SELECT count(*) FROM turns WHERE wakeId=?1", [carrier_wake_id])
+
+        assert Wakes.get(ctx.db, source_wake_id).prompt == wake.prompt
+
+      {:ok, {:appended, "orchestrator", _message, _opts}} ->
+        :ok
+
+      other ->
+        flunk("expected delayed association notice delivery, got: #{inspect(other)}")
+    end
 
     assert {:ok, %{prompt: prompt}} =
              Ledger.claim_next(ctx.db, "orchestrator", "delayed-association-notice")

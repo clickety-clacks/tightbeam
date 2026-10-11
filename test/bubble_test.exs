@@ -9,6 +9,7 @@ defmodule Tightbeam.Productions.BubbleTest do
     HarnessHealth,
     Ledger,
     Model,
+    NoticeBatcher,
     Org
   }
 
@@ -105,6 +106,111 @@ defmodule Tightbeam.Productions.BubbleTest do
     seq
   end
 
+  defp cannot_proceed_assignment!(ctx, holder_session, opener_session, subject) do
+    assignment =
+      Assignments.__handle__(ctx.db, "assign", %{
+        verb: "assign",
+        origin: "agent:#{opener_session}",
+        principal: {:session, opener_session},
+        session_key: holder_session,
+        target_role: nil,
+        role_fallback: false,
+        supervision_interval_ms: 1_000,
+        params: %{subject: subject, idempotency_key: nil, work_item_id: nil}
+      })
+
+    blocked =
+      Assignments.__handle__(ctx.db, "attest", %{
+        verb: "attest",
+        origin: "agent:#{holder_session}",
+        principal: {:session, holder_session},
+        session_key: nil,
+        params: %{
+          assignment_id: assignment.id,
+          kind: "cannot-proceed",
+          note: "the opener must decide"
+        }
+      })
+
+    {assignment.id, blocked}
+  end
+
+  defp hold_recipient!(db, session_key) do
+    assert {:ok, seq} =
+             Ledger.enqueue(db, %{
+               session_key: session_key,
+               message_id: "busy-recipient-#{System.unique_integer([:positive])}",
+               origin: "user:flynn",
+               prompt: "hold recipient before carrier delivery"
+             })
+
+    assert {:ok, turn} = Ledger.claim_next(db, session_key, "bubble-busy-recipient")
+    assert turn.seq == seq
+    turn
+  end
+
+  defp finish_busy_recipient!(db, turn) do
+    assert :ok = Ledger.finish(db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+  end
+
+  defp queue_decision_wake!(ctx, decision_wake) do
+    assert :queued =
+             Tightbeam.Gateway.deliver_prompt(
+               decision_wake.session_key,
+               decision_wake.origin,
+               decision_wake.prompt,
+               db: ctx.db,
+               wake_id: decision_wake.wake_id,
+               sender: decision_wake.origin,
+               device_id: "test",
+               client_message_id: decision_wake.wake_id,
+               target_gate: decision_wake,
+               fire_wake_in_txn: true
+             )
+  end
+
+  defp deliver_decision_carrier!(ctx, recipient) do
+    [carrier_id] = deliver_ready_carriers!(ctx, recipient)
+    Tightbeam.Wakes.get(ctx.db, carrier_id)
+  end
+
+  defp deliver_ready_carriers!(ctx, recipient, delivered \\ [], rounds \\ 0)
+
+  defp deliver_ready_carriers!(_ctx, _recipient, delivered, rounds) when rounds >= 8,
+    do: Enum.reverse(delivered)
+
+  defp deliver_ready_carriers!(ctx, recipient, delivered, rounds) do
+    carrier_ids = NoticeBatcher.recover(ctx.db, System.system_time(:millisecond) + 1_000)
+
+    matching_carriers =
+      carrier_ids
+      |> Enum.map(&Tightbeam.Wakes.get(ctx.db, &1))
+      |> Enum.filter(&(&1.session_key == recipient))
+
+    Enum.each(matching_carriers, fn carrier ->
+      assert {:ok, [[^recipient, "queued"]]} =
+               DB.query(ctx.db, "SELECT sessionKey,status FROM turns WHERE wakeId=?1", [
+                 carrier.wake_id
+               ])
+
+      # The readiness transaction already appended the actual turn. Re-appending
+      # here would test an artificial duplicate, not the carrier's admission.
+    end)
+
+    case matching_carriers do
+      [] ->
+        Enum.reverse(delivered)
+
+      carriers ->
+        deliver_ready_carriers!(
+          ctx,
+          recipient,
+          Enum.map(carriers, & &1.wake_id) ++ delivered,
+          rounds + 1
+        )
+    end
+  end
+
   defp notice_turn(db, session_key) do
     {:ok, rows} =
       DB.query(
@@ -118,6 +224,7 @@ defmodule Tightbeam.Productions.BubbleTest do
 
   defp fail_wake!(ctx, status, error \\ "private provider detail") do
     sender = session(ctx.db, "wake-sender", ctx.main.session_key)
+    busy = hold_recipient!(ctx.db, ctx.holder.session_key)
 
     wake =
       Tightbeam.Wakes.schedule(ctx.db, %{
@@ -128,12 +235,16 @@ defmodule Tightbeam.Productions.BubbleTest do
         due_at: 0
       })
 
-    assert :appended =
-             Tightbeam.Gateway.deliver_prompt(ctx.holder.session_key, wake.origin, wake.prompt,
-               db: ctx.db,
-               wake_id: wake.wake_id,
-               fire_wake_in_txn: true
-             )
+    delivery =
+      Tightbeam.Gateway.deliver_prompt(ctx.holder.session_key, wake.origin, wake.prompt,
+        db: ctx.db,
+        wake_id: wake.wake_id,
+        fire_wake_in_txn: true
+      )
+
+    assert delivery == :queued
+    finish_busy_recipient!(ctx.db, busy)
+    deliver_ready_carriers!(ctx, ctx.holder.session_key)
 
     assert {:ok, turn} = Ledger.claim_next(ctx.db, ctx.holder.session_key, "wake-fixture")
     assert :ok = Ledger.finish(ctx.db, turn.seq, status, error, owner_lease: turn.owner_lease)
@@ -148,7 +259,8 @@ defmodule Tightbeam.Productions.BubbleTest do
       assert :ok = Bubble.recognize_terminal(ctx.db, turn.seq)
 
       assert [[_, _, _, _, prompt]] = notice_turn(ctx.db, ctx.supervisor.session_key)
-      assert prompt =~ "carrying wake #{wake.wake_id}"
+      assert prompt =~ "carrying delivery wake #{turn.wake_id}"
+      assert prompt =~ "source wake(s) #{wake.wake_id}"
 
       assert {:ok, [[content, "substrate", "process:tightbeam", 1]]} =
                DB.query(
@@ -169,8 +281,8 @@ defmodule Tightbeam.Productions.BubbleTest do
       assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM wake_retry_attempts")
       assert Tightbeam.Wakes.get(ctx.db, wake.wake_id).state == "fired"
 
-      # Exhaust the actual ancestor climb. Every rung keeps the original wake,
-      # not the synthetic bubble-notice transport identity.
+      # Exhaust the actual ancestor climb. Each rung names both the failed
+      # delivery carrier and the durable source wake it carried.
       assert {:ok, parent_notice} =
                Ledger.claim_next(ctx.db, ctx.supervisor.session_key, "fixture")
 
@@ -196,7 +308,78 @@ defmodule Tightbeam.Productions.BubbleTest do
                  [ctx.main.session_key]
                )
 
-      assert alert =~ "carrying wake #{wake.wake_id}"
+      assert alert =~ "carrying delivery wake #{turn.wake_id}"
+      assert alert =~ "source wake(s) #{wake.wake_id}"
+    end
+  end
+
+  test "a failed mixed carrier reports each source only to its own sender", ctx do
+    sender_a = session(ctx.db, "mixed-sender-a", ctx.main.session_key)
+    sender_b = session(ctx.db, "mixed-sender-b", ctx.main.session_key)
+
+    wake_a =
+      Tightbeam.Wakes.schedule(ctx.db, %{
+        session_key: ctx.holder.session_key,
+        creator_session_key: sender_a.session_key,
+        origin: "user:flynn",
+        prompt: "private intent alpha",
+        due_at: 0
+      })
+
+    wake_b =
+      Tightbeam.Wakes.schedule(ctx.db, %{
+        session_key: ctx.holder.session_key,
+        creator_session_key: sender_b.session_key,
+        origin: "user:flynn",
+        prompt: "private intent beta",
+        due_at: 0
+      })
+
+    for wake <- [wake_a, wake_b] do
+      assert :queued =
+               Tightbeam.Gateway.deliver_prompt(
+                 ctx.holder.session_key,
+                 wake.origin,
+                 wake.prompt,
+                 db: ctx.db,
+                 wake_id: wake.wake_id,
+                 fire_wake_in_txn: true
+               )
+    end
+
+    [carrier_id] = deliver_ready_carriers!(ctx, ctx.holder.session_key)
+
+    assert [%{delivery_wake_id: ^carrier_id}] =
+             Tightbeam.NoticeBatcher.source_refs(ctx.db, wake_a.wake_id)
+
+    assert [%{delivery_wake_id: ^carrier_id}] =
+             Tightbeam.NoticeBatcher.source_refs(ctx.db, wake_b.wake_id)
+
+    assert {:ok, turn} = Ledger.claim_next(ctx.db, ctx.holder.session_key, "mixed-failure")
+    assert turn.wake_id == carrier_id
+
+    assert :ok =
+             Ledger.finish(ctx.db, turn.seq, "failed", "carrier failed",
+               owner_lease: turn.owner_lease
+             )
+
+    assert :ok = Bubble.recognize_terminal(ctx.db, turn.seq)
+
+    for {sender, own_wake, other_wake, own_prompt, other_prompt} <- [
+          {sender_a, wake_a, wake_b, "private intent alpha", "private intent beta"},
+          {sender_b, wake_b, wake_a, "private intent beta", "private intent alpha"}
+        ] do
+      assert {:ok, [[content]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT content FROM messages WHERE sessionKey=?1 AND clientMessageId=?2",
+                 [sender.session_key, "wake-undelivered:#{turn.seq}"]
+               )
+
+      assert content =~ own_wake.wake_id
+      refute content =~ other_wake.wake_id
+      refute content =~ own_prompt
+      refute content =~ other_prompt
     end
   end
 
@@ -227,22 +410,64 @@ defmodule Tightbeam.Productions.BubbleTest do
              )
   end
 
-  test "a spawned session's failed turn produces one deduped notice to its parent", ctx do
+  test "a spawned session's failed turn stages one deduped notice behind its busy parent", ctx do
+    {:appended, current_message} =
+      Tightbeam.Projection.append(ctx.db, %{
+        session_key: ctx.supervisor.session_key,
+        role: "user",
+        content: "current parent work",
+        sender: "session:#{ctx.supervisor.session_key}"
+      })
+
+    {:ok, current_seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: ctx.supervisor.session_key,
+        message_id: current_message.id,
+        origin: "session:#{ctx.supervisor.session_key}",
+        prompt: "current parent work"
+      })
+
+    assert {:ok, %{seq: ^current_seq, owner_lease: lease}} =
+             Ledger.claim_next(ctx.db, ctx.supervisor.session_key, "bubble-batching-test")
+
     seq = fail_turn!(ctx.db, "holder")
 
     :ok = Bubble.recognize_terminal(ctx.db, seq)
 
-    assert [[_, request_ref, wake_id, origin, prompt]] = notice_turn(ctx.db, "supervisor")
-    assert request_ref == "bubble:#{seq}"
-    assert wake_id == "bubble:#{seq}:supervisor"
-    assert origin == "process:tightbeam"
-    assert prompt =~ "holder"
-    assert prompt =~ "quota exhausted"
+    source_id = "bubble:#{seq}:supervisor"
+    assert notice_turn(ctx.db, "supervisor") == []
+
+    assert [%{wake_id: ^source_id, state: "pending", origin: "process:tightbeam"} = source] =
+             Enum.filter(Tightbeam.Wakes.list_for_session(ctx.db, "supervisor"), fn wake ->
+               wake.wake_id == source_id
+             end)
+
+    assert source.prompt =~ "holder"
+    assert source.prompt =~ "quota exhausted"
+    assert NoticeBatcher.source_refs(ctx.db, source_id) == []
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [source_id])
 
     # Recognizing the same terminal again is a rung of the SAME climb: the
     # deterministic wakeId absorbs it. One notice, not two.
     :ok = Bubble.recognize_terminal(ctx.db, seq)
-    assert [_] = notice_turn(ctx.db, "supervisor")
+
+    assert 1 ==
+             Enum.count(Tightbeam.Wakes.list_for_session(ctx.db, "supervisor"), fn wake ->
+               wake.wake_id == source_id
+             end)
+
+    assert :ok =
+             Ledger.finish(ctx.db, current_seq, "delivered", nil, owner_lease: lease)
+
+    [carrier_id] = deliver_ready_carriers!(ctx, "supervisor")
+    carrier = Tightbeam.Wakes.get(ctx.db, carrier_id)
+    assert carrier.prompt =~ "holder"
+    assert carrier.prompt =~ "quota exhausted"
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [carrier_id])
   end
 
   test "an open incident suppresses only its affected harness", ctx do
@@ -567,35 +792,42 @@ defmodule Tightbeam.Productions.BubbleTest do
   end
 
   test "an ordinary assignment failure does not displace the cannot-proceed opener", ctx do
-    assignment =
-      Assignments.__handle__(ctx.db, "assign", %{
-        verb: "assign",
-        origin: "agent:#{ctx.main.session_key}",
-        principal: {:session, ctx.main.session_key},
-        session_key: "holder",
-        target_role: nil,
-        role_fallback: false,
-        supervision_interval_ms: 1_000,
-        params: %{subject: "running bubble disposer", idempotency_key: nil, work_item_id: nil}
+    {assignment_id, blocked} =
+      cannot_proceed_assignment!(
+        ctx,
+        ctx.holder.session_key,
+        ctx.main.session_key,
+        "running bubble disposer"
+      )
+
+    {:appended, busy_message} =
+      Tightbeam.Projection.append(ctx.db, %{
+        session_key: ctx.supervisor.session_key,
+        role: "user",
+        content: "busy supervisor turn",
+        sender: "session:#{ctx.supervisor.session_key}"
       })
 
-    blocked =
-      Assignments.__handle__(ctx.db, "attest", %{
-        verb: "attest",
-        origin: "agent:holder",
-        principal: {:session, "holder"},
-        session_key: nil,
-        params: %{
-          assignment_id: assignment.id,
-          kind: "cannot-proceed",
-          note: "the opener cannot act"
-        }
+    {:ok, busy_seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: ctx.supervisor.session_key,
+        message_id: busy_message.id,
+        origin: "session:#{ctx.supervisor.session_key}",
+        prompt: "busy supervisor turn"
       })
 
-    cause_seq = fail_assigned_turn!(ctx.db, ctx.holder.session_key, assignment.id)
+    assert {:ok, %{seq: ^busy_seq, owner_lease: busy_lease}} =
+             Ledger.claim_next(ctx.db, ctx.supervisor.session_key, "busy-supervisor")
+
+    cause_seq = fail_assigned_turn!(ctx.db, ctx.holder.session_key, assignment_id)
     assert :ok = Bubble.recognize_terminal(ctx.db, cause_seq)
 
-    assert {:ok, notice} = Ledger.claim_next(ctx.db, ctx.supervisor.session_key, "assigned-cause")
+    bubble_wake_id = "bubble:#{cause_seq}:#{ctx.supervisor.session_key}"
+
+    assert {:ok, [["pending", ^assignment_id]]} =
+             DB.query(ctx.db, "SELECT state,assignmentId FROM wakes WHERE wakeId=?1", [
+               bubble_wake_id
+             ])
 
     expected_disposer = "session:" <> ctx.main.session_key
 
@@ -606,8 +838,18 @@ defmodule Tightbeam.Productions.BubbleTest do
                [blocked.cannotProceed.id]
              )
 
-    assert {:ok, [["running"]]} =
-             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [notice.seq])
+    assert :ok = Ledger.finish(ctx.db, busy_seq, "delivered", nil, owner_lease: busy_lease)
+    _carriers = deliver_ready_carriers!(ctx, ctx.supervisor.session_key)
+
+    assert [%{batch_state: "delivered", delivery_wake_id: _}] =
+             NoticeBatcher.source_refs(ctx.db, bubble_wake_id)
+
+    assert {:ok, [[^expected_disposer]]} =
+             DB.query(
+               ctx.db,
+               "SELECT disposerRef FROM assignment_cannot_proceed WHERE id=?1",
+               [blocked.cannotProceed.id]
+             )
 
     assert %{outcome: "revoked"} =
              Assignments.__handle__(ctx.db, "revoke-assignment", %{
@@ -616,53 +858,90 @@ defmodule Tightbeam.Productions.BubbleTest do
                principal: {:session, ctx.main.session_key},
                session_key: nil,
                params: %{
-                 assignment_id: assignment.id,
+                 assignment_id: assignment_id,
                  reason: "ordinary failure does not transfer authority"
                }
              })
   end
 
-  test "a running decision bubble recipient becomes the current cannot-proceed disposer", ctx do
-    assignment =
-      Assignments.__handle__(ctx.db, "assign", %{
-        verb: "assign",
-        origin: "agent:#{ctx.supervisor.session_key}",
-        principal: {:session, ctx.supervisor.session_key},
-        session_key: "holder",
-        target_role: nil,
-        role_fallback: false,
-        supervision_interval_ms: 1_000,
-        params: %{subject: "decision bubble disposer", idempotency_key: nil, work_item_id: nil}
-      })
+  test "an idle ancestor receives a mixed decision carrier and inherits each matched disposer",
+       ctx do
+    holder_two = session(ctx.db, "holder-two", ctx.supervisor.session_key)
 
-    blocked =
-      Assignments.__handle__(ctx.db, "attest", %{
-        verb: "attest",
-        origin: "agent:holder",
-        principal: {:session, "holder"},
-        session_key: nil,
-        params: %{
-          assignment_id: assignment.id,
-          kind: "cannot-proceed",
-          note: "the opener must decide"
-        }
-      })
+    {assignment_a, blocked_a} =
+      cannot_proceed_assignment!(
+        ctx,
+        ctx.holder.session_key,
+        ctx.supervisor.session_key,
+        "first decision in mixed carrier"
+      )
+
+    {assignment_b, blocked_b} =
+      cannot_proceed_assignment!(
+        ctx,
+        holder_two.session_key,
+        ctx.supervisor.session_key,
+        "second decision in mixed carrier"
+      )
+
+    queue_decision_wake!(ctx, blocked_a.decisionWake)
+    queue_decision_wake!(ctx, blocked_b.decisionWake)
+
+    decision_carrier_ids = deliver_ready_carriers!(ctx, ctx.supervisor.session_key)
+    assert length(decision_carrier_ids) == 1
+    decision_carrier = Tightbeam.Wakes.get(ctx.db, hd(decision_carrier_ids))
+    assert is_nil(decision_carrier.assignment_id)
+
+    assert [%{delivery_wake_id: carrier_id}] =
+             NoticeBatcher.source_refs(ctx.db, blocked_a.decisionWake.wake_id)
+
+    assert carrier_id == decision_carrier.wake_id
+
+    assert [%{delivery_wake_id: ^carrier_id}] =
+             NoticeBatcher.source_refs(ctx.db, blocked_b.decisionWake.wake_id)
+
+    assert {:ok, decision_turn} =
+             Ledger.claim_next(ctx.db, ctx.supervisor.session_key, "mixed-decision-wake")
+
+    assert :ok =
+             Ledger.finish(ctx.db, decision_turn.seq, "failed", "decision carrier failed",
+               owner_lease: decision_turn.owner_lease
+             )
+
+    assert :ok = Bubble.recognize_terminal(ctx.db, decision_turn.seq)
+    _ = deliver_ready_carriers!(ctx, ctx.main.session_key)
+    assert length(notice_turn(ctx.db, ctx.main.session_key)) == 1
+
+    expected_disposer = "session:" <> ctx.main.session_key
+
+    for blocked <- [blocked_a, blocked_b] do
+      assert {:ok, [[^expected_disposer]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT disposerRef FROM assignment_cannot_proceed WHERE id=?1",
+                 [blocked.cannotProceed.id]
+               )
+    end
+
+    assert assignment_a != assignment_b
+  end
+
+  test "a staged decision bubble transfers disposal to its busy recipient", ctx do
+    {assignment_id, blocked} =
+      cannot_proceed_assignment!(
+        ctx,
+        ctx.holder.session_key,
+        ctx.supervisor.session_key,
+        "decision bubble disposer"
+      )
 
     decision_wake = blocked.decisionWake
-
-    assert :appended =
-             Tightbeam.Gateway.deliver_prompt(
-               decision_wake.session_key,
-               decision_wake.origin,
-               decision_wake.prompt,
-               db: ctx.db,
-               wake_id: decision_wake.wake_id,
-               sender: decision_wake.origin,
-               device_id: "test",
-               client_message_id: decision_wake.wake_id,
-               target_gate: decision_wake,
-               fire_wake_in_txn: true
-             )
+    busy = hold_recipient!(ctx.db, decision_wake.session_key)
+    queue_decision_wake!(ctx, decision_wake)
+    finish_busy_recipient!(ctx.db, busy)
+    decision_carrier = deliver_decision_carrier!(ctx, ctx.supervisor.session_key)
+    supervisor_session = ctx.supervisor.session_key
+    assert decision_carrier.session_key == supervisor_session
 
     assert {:ok, decision_turn} =
              Ledger.claim_next(ctx.db, ctx.supervisor.session_key, "decision-wake")
@@ -672,7 +951,55 @@ defmodule Tightbeam.Productions.BubbleTest do
                owner_lease: decision_turn.owner_lease
              )
 
+    {:appended, busy_message} =
+      Tightbeam.Projection.append(ctx.db, %{
+        session_key: ctx.main.session_key,
+        role: "user",
+        content: "current main turn",
+        sender: "session:#{ctx.main.session_key}"
+      })
+
+    {:ok, busy_seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: ctx.main.session_key,
+        message_id: busy_message.id,
+        origin: "session:#{ctx.main.session_key}",
+        prompt: "current main turn"
+      })
+
+    assert {:ok, %{seq: ^busy_seq, owner_lease: busy_lease}} =
+             Ledger.claim_next(ctx.db, ctx.main.session_key, "bubble-busy-ancestor")
+
     assert :ok = Bubble.recognize_terminal(ctx.db, decision_turn.seq)
+
+    bubble_wake_id = "bubble:#{decision_turn.seq}:#{ctx.main.session_key}"
+
+    assert {:ok, [["pending", "process:tightbeam", ^assignment_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,origin,assignmentId FROM wakes WHERE wakeId=?1",
+               [bubble_wake_id]
+             )
+
+    expected_disposer = "session:" <> ctx.main.session_key
+
+    assert {:ok, [[^expected_disposer]]} =
+             DB.query(
+               ctx.db,
+               "SELECT disposerRef FROM assignment_cannot_proceed WHERE id=?1",
+               [blocked.cannotProceed.id]
+             )
+
+    assert :ok = Ledger.finish(ctx.db, busy_seq, "delivered", nil, owner_lease: busy_lease)
+    [carrier_id] = NoticeBatcher.recover(ctx.db, System.system_time(:millisecond) + 1_000)
+    carrier = Tightbeam.Wakes.get(ctx.db, carrier_id)
+
+    assert {:ok, [[main_session, "queued"]]} =
+             DB.query(ctx.db, "SELECT sessionKey,status FROM turns WHERE wakeId=?1", [
+               carrier.wake_id
+             ])
+
+    assert main_session == ctx.main.session_key
     assert {:ok, notice} = Ledger.claim_next(ctx.db, ctx.main.session_key, "assigned-cause")
 
     expected_disposer = "session:" <> ctx.main.session_key
@@ -693,7 +1020,7 @@ defmodule Tightbeam.Productions.BubbleTest do
                origin: "agent:#{ctx.main.session_key}",
                principal: {:session, ctx.main.session_key},
                session_key: nil,
-               params: %{assignment_id: assignment.id, reason: "decision recipient disposition"}
+               params: %{assignment_id: assignment_id, reason: "decision recipient disposition"}
              })
   end
 
@@ -724,8 +1051,38 @@ defmodule Tightbeam.Productions.BubbleTest do
         }
       })
 
+    # The initial decision is already queued for Main. Consume that genuine
+    # earlier turn before testing failure of the later bubble, rather than
+    # accidentally failing the decision notice and treating it as a bubble.
+    _ = deliver_ready_carriers!(ctx, ctx.main.session_key)
+
+    assert {:ok, decision_turn} =
+             Ledger.claim_next(ctx.db, ctx.main.session_key, "initial-decision")
+
+    assert {:ok, [[decision_wake_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT decisionWakeId FROM assignment_cannot_proceed WHERE id=?1",
+               [blocked.cannotProceed.id]
+             )
+
+    assert {:ok, [[decision_seq, "running", source_assignment]]} =
+             DB.transaction(
+               ctx.db,
+               &NoticeBatcher.source_delivery_turns_in_txn(&1, decision_wake_id)
+             )
+
+    assert decision_seq == decision_turn.seq
+    assert source_assignment == assignment.id
+
+    assert :ok =
+             Ledger.finish(ctx.db, decision_turn.seq, "delivered", nil,
+               owner_lease: decision_turn.owner_lease
+             )
+
     cause_seq = fail_assigned_turn!(ctx.db, ctx.holder.session_key, assignment.id)
     assert :ok = Bubble.recognize_terminal(ctx.db, cause_seq)
+    _ = deliver_ready_carriers!(ctx, ctx.supervisor.session_key)
 
     assert {:ok, supervisor_notice} =
              Ledger.claim_next(ctx.db, ctx.supervisor.session_key, "assigned-cause")
@@ -736,6 +1093,7 @@ defmodule Tightbeam.Productions.BubbleTest do
              )
 
     assert :ok = Bubble.recognize_terminal(ctx.db, supervisor_notice.seq)
+    _ = deliver_ready_carriers!(ctx, ctx.main.session_key)
 
     assert {:ok, main_notice} = Ledger.claim_next(ctx.db, ctx.main.session_key, "assigned-cause")
 

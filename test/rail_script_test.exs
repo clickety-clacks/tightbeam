@@ -44,6 +44,7 @@ defmodule Tightbeam.RailScriptTest do
       :ok = ConditionFacts.ensure_schema(db)
       :ok = Escalation.ensure_schema(db)
       :ok = Wakes.ensure_schema(db)
+      :ok = Tightbeam.NoticeBatcher.ensure_schema(db)
       :ok = Placement.ensure_schema(db)
       # Current session reads require the event relation even in this deliberately
       # incomplete fixture. Keep assignments absent: that is the tested fault.

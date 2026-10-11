@@ -513,6 +513,15 @@ defmodule Tightbeam.IdentityTest do
       System.delete_env(key)
     end
 
+    # Command-scope configuration also overrides the bare global/system files.
+    # TestCase restores the environment; this case must prove a truly unaided
+    # commit even when the runner supplied its own nonsecret fixture identity.
+    for key <- Map.keys(System.get_env()),
+        key in ~w(GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS) or
+          Regex.match?(~r/^GIT_CONFIG_(KEY|VALUE)_\d+$/, key) do
+      System.delete_env(key)
+    end
+
     learn_test_bundle!(ctx)
     dir = Path.join(ctx.base, "identity")
 

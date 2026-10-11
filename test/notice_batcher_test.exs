@@ -8,33 +8,33 @@ defmodule Tightbeam.NoticeBatcherTest do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 0)
   end
 
-  test "acceptance 2: user-authored fyi bypasses membership and keeps the ordinary path", %{
+  test "acceptance 2: user-authored fyi joins the default recipient batch", %{
     tmp_dir: tmp
   } do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 1)
   end
 
-  test "acceptance 3: urgent classes and agent-authored fyi keep their pre-V2 paths", %{
+  test "acceptance 3: every prompt class and origin joins the default batch", %{
     tmp_dir: tmp
   } do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 2)
   end
 
-  test "acceptance 4: blocker publication leaves the fyi batch unchanged", %{tmp_dir: tmp} do
+  test "acceptance 4: blocker joins the ordinary recipient batch", %{tmp_dir: tmp} do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 3)
   end
 
-  test "acceptance 5: rows-only status query creates no batch state", %{tmp_dir: tmp} do
+  test "acceptance 5: internal status query remains outside prompt batching", %{tmp_dir: tmp} do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 4)
   end
 
-  test "acceptance 6: ceiling seals then arms without a decision or desk dependency", %{
+  test "acceptance 6: an idle recipient forms its batch at the due time", %{
     tmp_dir: tmp
   } do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 5)
   end
 
-  test "acceptance 7: a terminal turn boundary releases before the ceiling", %{tmp_dir: tmp} do
+  test "acceptance 7: a busy recipient forms its batch after the turn boundary", %{tmp_dir: tmp} do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 6)
   end
 
@@ -48,19 +48,23 @@ defmodule Tightbeam.NoticeBatcherTest do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 8)
   end
 
-  test "acceptance 10: the 51st member starts the next ordered batch", %{tmp_dir: tmp} do
+  test "acceptance 10: a 51-member snapshot stays editable until withdrawal makes it fit", %{
+    tmp_dir: tmp
+  } do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 9)
   end
 
-  test "acceptance 11: the payload limit seals a prefix and never truncates the candidate", %{
-    tmp_dir: tmp
-  } do
+  test "acceptance 11: the payload limit holds the whole snapshot without truncating the candidate",
+       %{
+         tmp_dir: tmp
+       } do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 10)
   end
 
-  test "an overflow-sealed prefix arms at the recipient boundary before its ceiling", %{
-    tmp_dir: tmp
-  } do
+  test "separate eligibility boundaries form ordered carriers without splitting an over-cap snapshot",
+       %{
+         tmp_dir: tmp
+       } do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 11)
   end
 
@@ -82,15 +86,17 @@ defmodule Tightbeam.NoticeBatcherTest do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 15)
   end
 
-  test "acceptance 17: cancellation before seal excludes; cancellation after seal preserves", %{
-    tmp_dir: tmp
-  } do
+  test "acceptance 17: cancellation before admission excludes; cancellation after commit preserves history",
+       %{
+         tmp_dir: tmp
+       } do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 16)
   end
 
-  test "acceptance 18: visibility scopes split one role lane and gate batch reads", %{
-    tmp_dir: tmp
-  } do
+  test "acceptance 18: source visibility survives session coalescing and gates the entire batch read",
+       %{
+         tmp_dir: tmp
+       } do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 17)
   end
 
@@ -104,29 +110,30 @@ defmodule Tightbeam.NoticeBatcherTest do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 19)
   end
 
-  test "acceptance 21: default-off selection and rollback preserve the ordinary path", %{
+  test "acceptance 21: legacy lane settings cannot disable automatic batching", %{
     tmp_dir: tmp
   } do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 20)
   end
 
-  test "default-off digest preserves the legacy rule through suppression and provenance", %{
+  test "unclassed prompt traffic gets the default class and batches immediately when idle", %{
     tmp_dir: tmp
   } do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 21)
   end
 
-  test "acceptance 22: a later earlier deadline atomically shortens the lane", %{tmp_dir: tmp} do
+  test "acceptance 22: an earlier due source delivers without prematurely including a later deadline",
+       %{tmp_dir: tmp} do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 22)
   end
 
-  test "a selected 65,536-byte source stays durable on the ordinary fallback lane", %{
+  test "a selected 65,536-byte payload stays editable without a fallback bypass", %{
     tmp_dir: tmp
   } do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 23)
   end
 
-  test "the rendered V1 member boundary admits 65,536 bytes and bypasses the next byte", %{
+  test "the rendered V1 member boundary admits 65,536 bytes and holds the next byte", %{
     tmp_dir: tmp
   } do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 24)
@@ -136,20 +143,28 @@ defmodule Tightbeam.NoticeBatcherTest do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 25)
   end
 
-  test "V2 public authenticated --user, session and role lanes isolate information recipients", %{
+  test "authenticated user, session and role targets batch by default with source privacy", %{
     tmp_dir: tmp
   } do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 26)
   end
 
-  @tag notice_guarded_restart: true
-  test "acceptance 13: a reopened file arms one wake from an already sealed batch", %{
+  test "class priority marks every source and unclassed prompts use the classifier default", %{
     tmp_dir: tmp
   } do
-    Tightbeam.GuardRuntimeFixture.run!(
-      tmp,
-      "firehose_notice_restart.exs",
-      "guarded-notice-batch-reopen: ok"
-    )
+    Tightbeam.NoticeBatcherFixture.run!(tmp, 27)
+  end
+
+  test "a busy recipient keeps sources editable until the next turn boundary", %{tmp_dir: tmp} do
+    Tightbeam.NoticeBatcherFixture.run!(tmp, 28)
+  end
+
+  @tag notice_guarded_restart: true
+  test "acceptance 13: a reopened file regroups unclaimed sealed history and commits one carrier",
+       %{
+         tmp_dir: tmp
+       } do
+    # Historical seal/arm is replaced by one readiness transaction; retain the file-reopen proof.
+    Tightbeam.NoticeBatcherFixture.run!(tmp, 29)
   end
 end
