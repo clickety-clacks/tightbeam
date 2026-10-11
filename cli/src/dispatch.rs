@@ -466,6 +466,23 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             path: "/agent/tool-call-observed",
             body_json: "{}".to_owned(),
         }),
+        Command::SessionDiagnose {
+            identity,
+            session_key,
+        } => {
+            let Identity::User(user) = identity else {
+                return Err("session-diagnose requires --as-user".to_owned());
+            };
+            Ok(RequestSpec {
+                attempt_context: None,
+                receipt_base_override: None,
+                path: "/agent/session-diagnose",
+                body_json: object(vec![
+                    string_field("asUser", user),
+                    string_field("sessionKey", session_key),
+                ]),
+            })
+        }
         Command::Spawn {
             identity,
             display_name,
@@ -1890,6 +1907,15 @@ pub(crate) fn send_to_with_deadline(
     request: &RequestSpec,
     deadline: Option<Instant>,
 ) -> Result<Option<Value>, String> {
+    if request.path == "/agent/session-diagnose" {
+        let limit = (Instant::now() + Duration::from_secs(2))
+            .min(deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(2)));
+        let endpoint = endpoint.clone();
+        let request = request.clone();
+        return diagnostic_exchange(limit, move |remaining| {
+            send_diagnostic_with_timeout(&endpoint, &request, Some(remaining))
+        });
+    }
     if let Some(deadline) = deadline {
         let endpoint = endpoint.clone();
         let request = request.clone();
@@ -1900,6 +1926,60 @@ pub(crate) fn send_to_with_deadline(
     }
 
     send_to_with_timeout(endpoint, request, None)
+}
+
+// Bounds the caller's whole exchange, including synchronous DNS/proxy lookup.
+// As in lease::until, an uninterruptible resolver can outlive the deadline in
+// the detached thread until it returns or this CLI process exits. This request
+// is read-only; a client timeout does not cancel server work or a pending tune.
+fn diagnostic_exchange<F>(deadline: Instant, work: F) -> Result<Option<Value>, String>
+where
+    F: FnOnce(Duration) -> Result<Option<Value>, String> + Send + 'static,
+{
+    crate::lease::until(deadline, work)
+        .map_err(|()| "diagnostic_transport_unavailable".to_owned())?
+}
+
+fn send_diagnostic_with_timeout(
+    endpoint: &Endpoint,
+    request: &RequestSpec,
+    timeout: Option<Duration>,
+) -> Result<Option<Value>, String> {
+    let call = gateway_request("POST", endpoint, request.path, timeout)
+        .set("Content-Type", "application/json")
+        .send_string(&request.body_json);
+    let (status, response) = match call {
+        Ok(response) => (response.status(), response),
+        Err(ureq::Error::Status(status, response)) => (status, response),
+        Err(ureq::Error::Transport(_)) => return Err("diagnostic_transport_unavailable".to_owned()),
+    };
+    let mut encoded = String::new();
+    response
+        .into_reader()
+        .take(4097)
+        .read_to_string(&mut encoded)
+        .map_err(|_| "diagnostic_response_unavailable".to_owned())?;
+    if encoded.len() > 4096 {
+        return Err("diagnostic_response_limit".to_owned());
+    }
+    let json: Value =
+        serde_json::from_str(&encoded).map_err(|_| "diagnostic_response_invalid".to_owned())?;
+    if !(200..300).contains(&status) {
+        return Err(match json["error"]["code"].as_str().unwrap_or("") {
+            "unauthorized"
+            | "incompatible_cli"
+            | "diagnostic_scope_refused"
+            | "invalid_diagnostic_request"
+            | "diagnostic_snapshot_timeout"
+            | "diagnostic_unavailable"
+            | "diagnostic_response_limit" => json["error"]["code"].as_str().unwrap().to_owned(),
+            _ => "diagnostic_response_invalid".to_owned(),
+        });
+    }
+    json.get("result")
+        .cloned()
+        .map(Some)
+        .ok_or_else(|| "diagnostic_response_invalid".to_owned())
 }
 
 fn send_to_with_timeout(
@@ -3486,6 +3566,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::SentinelEnvList { identity, .. }
         | Command::SentinelEnvUnset { identity, .. }
         | Command::HostToolchainSet { identity, .. }
+        | Command::SessionDiagnose { identity, .. }
         | Command::HarnessProcesses { identity } => Some(identity),
         Command::Help
         | Command::CommandHelp(_)
@@ -7095,5 +7176,119 @@ mod tests {
             body(&["breathing", "assignment", "asg_1", "--as-user", "flynn"]),
             r#"{"asUser":"flynn","verb":"breathing","params":{"targetKind":"assignment","targetId":"asg_1"}}"#
         );
+    }
+}
+
+#[cfg(test)]
+mod session_diagnose_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    fn command(args: &[&str]) -> Result<Command, String> {
+        crate::args::parse(args.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn exact_user_target_builds_dedicated_read_only_request() {
+        let parsed = command(&[
+            "session-diagnose",
+            "--session",
+            "seat",
+            "--as-user",
+            "mike",
+            "--json",
+        ])
+        .unwrap();
+        let request = build_request(&parsed).unwrap();
+        assert_eq!(request.path, "/agent/session-diagnose");
+        assert!(request.attempt_context.is_none());
+        assert!(request.receipt_base_override.is_none());
+        assert_eq!(
+            serde_json::from_str::<Value>(&request.body_json).unwrap(),
+            serde_json::json!({"asUser":"mike", "sessionKey":"seat"})
+        );
+        for args in [
+            vec!["session-diagnose", "--session", "seat", "--as", "po"],
+            vec!["session-diagnose", "--as-user", "mike"],
+            vec![
+                "session-diagnose",
+                "--session",
+                "seat",
+                "--as-user",
+                "mike",
+                "--all",
+            ],
+        ] {
+            assert!(command(&args).is_err());
+        }
+    }
+
+    fn fixture(
+        status: u16,
+        body: String,
+        delay: Duration,
+    ) -> (Endpoint, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = Endpoint {
+            base: format!("http://{}", listener.local_addr().unwrap()),
+            token: "CANARY_AUTH_229693e2".to_owned(),
+            origin: Origin::Named,
+        };
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut bytes = [0u8; 2048];
+            let _ = stream.read(&mut bytes);
+            std::thread::sleep(delay);
+            let response = format!(
+                "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+        (endpoint, worker)
+    }
+
+    #[test]
+    fn oversized_and_secret_bearing_error_responses_are_not_printed() {
+        for (status, body, expected) in [(200, "x".repeat(4097), "diagnostic_response_limit"),
+            (503, r#"{"error":{"code":"CANARY_AUTH_SQL_229693e2","message":"CANARY_AUTH_SQL_229693e2"}}"#.to_owned(), "diagnostic_response_invalid")] {
+            let (endpoint, worker) = fixture(status, body, Duration::ZERO);
+            let request = build_request(&command(&["session-diagnose", "--session", "seat", "--as-user", "mike"]).unwrap()).unwrap();
+            assert_eq!(send_to(&endpoint, &request).unwrap_err(), expected);
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn stalled_pre_connection_work_is_inside_the_absolute_deadline() {
+        let started = Instant::now();
+        let result = diagnostic_exchange(started + Duration::from_millis(40), |_| {
+            // Models an uninterruptible resolver before any HTTP connection.
+            std::thread::sleep(Duration::from_millis(250));
+            Ok(None)
+        });
+        assert_eq!(result.unwrap_err(), "diagnostic_transport_unavailable");
+        assert!(started.elapsed() < Duration::from_millis(200));
+    }
+
+    #[test]
+    fn stalled_http_response_has_finite_client_deadline() {
+        let (endpoint, worker) = fixture(
+            200,
+            r#"{"result":{}}"#.to_owned(),
+            Duration::from_millis(2400),
+        );
+        let request = build_request(
+            &command(&["session-diagnose", "--session", "seat", "--as-user", "mike"]).unwrap(),
+        )
+        .unwrap();
+        let started = Instant::now();
+        assert_eq!(
+            send_to(&endpoint, &request).unwrap_err(),
+            "diagnostic_transport_unavailable"
+        );
+        assert!(started.elapsed() < Duration::from_millis(2300));
+        worker.join().unwrap();
     }
 }
