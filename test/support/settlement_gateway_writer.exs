@@ -202,7 +202,9 @@ defmodule SettlementGatewayWriter do
         assert Wakes.get(db, source.wake_id).prompt == raw
         Org.set_harness(db, key, "codex", "openai", model)
 
-        {:ok, sid} = Adapter.new_session(adapter, model, home, [], "OUR-side #{key} boundary proof")
+        {:ok, sid} =
+          Adapter.new_session(adapter, model, home, [], "OUR-side #{key} boundary proof")
+
         Org.append_pointer(db, key, sid, "created")
 
         {:ok, lane} =

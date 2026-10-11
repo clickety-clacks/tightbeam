@@ -308,7 +308,9 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
                  Gateway.decorate_delivery_prompt(terminal_envelope, "process:tightbeam")
 
         assert terminal_envelope =~ terminal_raw
-        assert terminal_hash == Base.encode16(:crypto.hash(:sha256, terminal_envelope), case: :lower)
+
+        assert terminal_hash ==
+                 Base.encode16(:crypto.hash(:sha256, terminal_envelope), case: :lower)
 
         assert {:ok, [[0]]} =
                  DB.query(ctx.db, "SELECT count(*) FROM wake_cancellations WHERE wakeId=?1", [
