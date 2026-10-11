@@ -2296,24 +2296,31 @@ defmodule Tightbeam.Wakes do
     next = wait_in_txn(txn, successor)
     facts = continuation_facts_in_txn(txn, old, old.assignment_id)
     mutable = [:wake_id, :state, :due_at, :canceled_at]
+
     recognition_valid =
       case old.wait_mode do
         "after-turn" ->
           old.recognition_path == "after-turn" and is_integer(old.originating_turn_seq) and
-            match?(%{"domain" => "turn", "row_id" => seq} when seq == old.originating_turn_seq,
-              old.recognition_transition)
+            match?(
+              %{"domain" => "turn", "row_id" => seq} when seq == old.originating_turn_seq,
+              old.recognition_transition
+            )
 
         "dependency" ->
           old.recognition_path in ~w(success reconsideration fallback) and
             facts["wait.declaration_complete"]
 
-        _ -> false
+        _ ->
+          false
       end
 
     originating_valid =
       is_nil(old.originating_turn_seq) or
-        Txn.q(txn, "SELECT 1 FROM turns WHERE seq=?1 AND sessionKey=?2 AND status IN ('delivered','canceled','failed','failed_unknown')",
-          [old.originating_turn_seq, old.creator_session_key]) == [[1]]
+        Txn.q(
+          txn,
+          "SELECT 1 FROM turns WHERE seq=?1 AND sessionKey=?2 AND status IN ('delivered','canceled','failed','failed_unknown')",
+          [old.originating_turn_seq, old.creator_session_key]
+        ) == [[1]]
 
     # The retry delegates an admitted declaration, never a new controller or
     # recognition. Recheck live obligation/verification and originating-turn
