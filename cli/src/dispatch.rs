@@ -3075,10 +3075,16 @@ fn secret_value(text: &[u8]) -> Option<usize> {
             return None;
         }
         let gap = spaces(&text[scheme.len()..]);
-        let credential = text[scheme.len() + gap..]
-            .iter()
-            .take_while(|byte| !is_space_byte(**byte) && !b",;\"'&}]".contains(*byte))
-            .count();
+        let credential_start = scheme.len() + gap;
+        let credential_bytes = &text[credential_start..];
+        let credential = if credential_bytes.starts_with(REDACTED_MARKER) {
+            REDACTED_MARKER.len()
+        } else {
+            credential_bytes
+                .iter()
+                .take_while(|byte| !is_space_byte(**byte) && !b",;\"'&}]".contains(*byte))
+                .count()
+        };
         (gap > 0 && credential > 0).then_some(scheme.len() + gap + credential)
     });
     if scheme.is_some() {
