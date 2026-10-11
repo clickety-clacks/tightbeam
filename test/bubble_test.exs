@@ -980,10 +980,12 @@ defmodule Tightbeam.Productions.BubbleTest do
     retry = Tightbeam.NoticeAuthority.current!(ctx.db, root)
     assert retry in successors
     refute retry == root
+
     assert Tightbeam.NoticeAuthority.resolve!(ctx.db, retry) == %{
              root_wake_id: root,
              root_turn_seq: turn.seq
            }
+
     assert :ok = Bubble.recognize_terminal(ctx.db, turn.seq)
 
     assert {:ok, ^cp_before} =

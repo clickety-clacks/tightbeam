@@ -1,7 +1,20 @@
 defmodule Tightbeam.FeatureSmokeRailPathTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{Archetypes, DB, Gateway, Ledger, Model, ModelCatalog, NoticeBatcher, Org, Roles, Rules, Schema}
+  alias Tightbeam.{
+    Archetypes,
+    DB,
+    Gateway,
+    Ledger,
+    Model,
+    ModelCatalog,
+    NoticeBatcher,
+    Org,
+    Roles,
+    Rules,
+    Schema
+  }
+
   alias Tightbeam.Wire.Router
   alias Tightbeam.FeatureSmokeDriverFixture, as: Driver
 
@@ -339,13 +352,18 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
     refute source == carrier
     assert Tightbeam.Wakes.get(ctx.db, source).state == "fired"
 
-    assert {:ok, [["canceled"]]} = DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [seq])
+    assert {:ok, [["canceled"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [seq])
 
     assert {:ok, [[1]]} =
-             DB.query(ctx.db, """
-             SELECT count(*) FROM turn_lifecycle_events
-             WHERE turnSeq=?1 AND kind='terminal_committed' AND outcome='canceled'
-             """, [seq])
+             DB.query(
+               ctx.db,
+               """
+               SELECT count(*) FROM turn_lifecycle_events
+               WHERE turnSeq=?1 AND kind='terminal_committed' AND outcome='canceled'
+               """,
+               [seq]
+             )
 
     assert {:ok, [["open", nil, "queued"]]} =
              DB.query(ctx.db, """

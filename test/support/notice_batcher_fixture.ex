@@ -1200,9 +1200,13 @@ defmodule Tightbeam.NoticeBatcherFixture do
     assert turn.prompt == "[from process:tightbeam]\n\n" <> raw_carrier.prompt
 
     assert {:ok, [[raw_envelope, envelope_hash]]} =
-             DB.query(db, "SELECT envelope,envelopeSha256 FROM notice_batches WHERE deliveryWakeId=?1", [
-               carrier
-             ])
+             DB.query(
+               db,
+               "SELECT envelope,envelopeSha256 FROM notice_batches WHERE deliveryWakeId=?1",
+               [
+                 carrier
+               ]
+             )
 
     assert raw_envelope == raw_carrier.prompt
     assert envelope_hash == Base.encode16(:crypto.hash(:sha256, raw_envelope), case: :lower)
@@ -1377,10 +1381,13 @@ defmodule Tightbeam.NoticeBatcherFixture do
       {"UPDATE wakes SET origin='process:forged' WHERE wakeId=?1", [carrier]},
       {"UPDATE wakes SET sessionKey='agent:sender' WHERE wakeId=?1", [carrier]},
       {"UPDATE messages SET sender='process:forged' WHERE id=?1", [turn.message_id]},
-      {"UPDATE notice_batches SET envelopeSha256='forged hash' WHERE deliveryWakeId=?1", [carrier]},
+      {"UPDATE notice_batches SET envelopeSha256='forged hash' WHERE deliveryWakeId=?1",
+       [carrier]},
       {"UPDATE notice_batches SET memberCount=memberCount+1 WHERE deliveryWakeId=?1", [carrier]},
-      {"UPDATE notice_batch_members SET payload='forged member' WHERE sourceWakeId=?1", [first.wake_id]},
-      {"UPDATE notice_batch_members SET senderPrincipal='process:forged' WHERE sourceWakeId=?1", [first.wake_id]},
+      {"UPDATE notice_batch_members SET payload='forged member' WHERE sourceWakeId=?1",
+       [first.wake_id]},
+      {"UPDATE notice_batch_members SET senderPrincipal='process:forged' WHERE sourceWakeId=?1",
+       [first.wake_id]},
       {"UPDATE wakes SET prompt='forged raw source' WHERE wakeId=?1", [first.wake_id]}
     ]
 
