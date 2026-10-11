@@ -1200,7 +1200,9 @@ defmodule Tightbeam.Productions.BubbleTest do
                      ctx.db,
                      decision.seq,
                      "failed",
-                     "original decision #{suffix} failed", owner_lease: decision.owner_lease)
+                     "original decision #{suffix} failed",
+                     owner_lease: decision.owner_lease
+                   )
 
           assert :ok = Bubble.recognize_terminal(ctx.db, decision.seq)
           {decision.seq, blocked, opener.session_key}
@@ -1227,7 +1229,9 @@ defmodule Tightbeam.Productions.BubbleTest do
                  ctx.db,
                  intermediate.seq,
                  unquote(terminal),
-                 "combined notice could not run", owner_lease: intermediate.owner_lease)
+                 "combined notice could not run",
+                 owner_lease: intermediate.owner_lease
+               )
 
       assert :ok = stop_supervised(DB)
       start_supervised!({DB, ctx.db_opts})
