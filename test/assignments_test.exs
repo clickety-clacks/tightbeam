@@ -3470,6 +3470,24 @@ defmodule Tightbeam.AssignmentsTest do
       |> put_in([:params, :effect_kind], "coordination")
       |> then(&handle(ctx, "assign", &1))
 
+    # The selector orders by openedAt, then UUID; consecutive admissions can
+    # share a millisecond. Establish the older-card premise explicitly.
+    first_opened_at = first.openedAt
+    second_opened_at = first_opened_at + 1
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE assignments SET openedAt=?2 WHERE id=?1", [
+               second.id,
+               second_opened_at
+             ])
+
+    assert {:ok, [[^first_opened_at, ^second_opened_at]]} =
+             DB.query(
+               ctx.db,
+               "SELECT a.openedAt,b.openedAt FROM assignments a,assignments b WHERE a.id=?1 AND b.id=?2",
+               [first.id, second.id]
+             )
+
     assert %{code: "missing_reason"} =
              handle(
                ctx,
@@ -3625,6 +3643,15 @@ defmodule Tightbeam.AssignmentsTest do
              end)
 
     assert is_integer(fact.fact_id)
+    fact_id = fact.fact_id
+
+    assert {:ok, [["settled", "release-fact", ^fact_id, "agent:holder"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,settlementKind,settlementFactId,settledBy FROM assignment_cannot_proceed WHERE assignmentId=?1",
+               [first.id]
+             )
+
     assert {:match, %{id: id}} = Supervision.prod_production_matches?(ctx.db, "holder", 1)
     assert id == first.id
 
