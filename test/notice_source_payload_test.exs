@@ -571,8 +571,9 @@ defmodule Tightbeam.NoticeSourcePayloadTest do
         "DROP INDEX notice_source_client_identity; ALTER TABLE wakes DROP COLUMN sourceClientIdentity; ALTER TABLE wakes DROP COLUMN sourceAttachments; ALTER TABLE wakes DROP COLUMN sourceVisibilityScope; ALTER TABLE wakes DROP COLUMN sourceAddress;"
       )
 
-    for {_name, sql} <- NoticeBatcher.previous_source_payload_objects(),
-        do: :ok = DB.execute(db, sql)
+    frozen = File.read!(Path.expand("fixtures/notice_source_payload_6642ee93.sql", __DIR__))
+    assert Base.encode16(:crypto.hash(:sha256, frozen), case: :lower) ==
+             "3bb006a3ae09f0bf310af1b0390958f3dbebfe2c7bbb3bad08cb6c5044ae8665"
 
     assert {:ok, :ok} =
              DB.migration_transaction(
@@ -582,13 +583,7 @@ defmodule Tightbeam.NoticeSourcePayloadTest do
                ["PRAGMA legacy_alter_table=OFF", "PRAGMA foreign_keys=ON"],
                fn txn ->
                  :ok = Txn.exec(txn, "DROP TABLE notice_batch_members")
-                 :ok = Txn.exec(txn, NoticeBatcher.previous_source_member_ddl())
-
-                 :ok =
-                   Txn.exec(
-                     txn,
-                     "CREATE INDEX notice_batch_members_batch ON notice_batch_members(batchId,publicationSeq)"
-                   )
+                 :ok = Txn.exec(txn, frozen)
                end
              )
 

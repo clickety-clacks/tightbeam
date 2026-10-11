@@ -40,10 +40,14 @@ const reply = (id, result) => send({ id, result });
 const reject = (id, message, code = -32602) => send({ id, error: { code, message } });
 const sessions = new Map();
 let nextSession = 0;
+// Optional fixture selection exercises OUR registered Codex text guard only.
+const selectedModel = process.env.RECOVERY_FIXTURE_MODEL || "fixture-model";
+const effortId = process.env.RECOVERY_FIXTURE_MODEL ? "reasoning_effort" : "effort";
+const modeId = process.env.RECOVERY_FIXTURE_MODEL ? "agent-full-access" : "full";
 const options = () => ({ configOptions: [
-  { id: "model", name: "Model", type: "select", currentValue: "fixture-model",
-    options: [{ value: "fixture-model", name: "Fixture Model" }] },
-  { id: "effort", name: "Effort", type: "select", currentValue: "medium",
+  { id: "model", name: "Model", type: "select", currentValue: selectedModel,
+    options: [{ value: selectedModel, name: "Fixture Model" }] },
+  { id: effortId, name: "Effort", type: "select", currentValue: "medium",
     options: [{ value: "medium", name: "Medium" }] }
 ] });
 const pending = new Map();
@@ -72,14 +76,14 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
       return reply(frame.id, options());
     case "session/set_config_option":
       if (!sessions.has(p.sessionId)) return reject(frame.id, "unknown session");
-      if (!((p.configId === "model" && p.value === "fixture-model") ||
-            (p.configId === "effort" && p.value === "medium"))) {
+      if (!((p.configId === "model" && p.value === selectedModel) ||
+            (p.configId === effortId && p.value === "medium"))) {
         return reject(frame.id, "unsupported fixture selection");
       }
       return reply(frame.id, options());
     case "session/set_mode":
       if (!sessions.has(p.sessionId)) return reject(frame.id, "unknown session");
-      if (p.modeId !== "full") return reject(frame.id, "unsupported fixture mode");
+      if (p.modeId !== modeId) return reject(frame.id, "unsupported fixture mode");
       return reply(frame.id, {});
     case "session/prompt": {
       if (!sessions.has(p.sessionId) || !Array.isArray(p.prompt) ||

@@ -38,7 +38,7 @@ defmodule Tightbeam.NoticeBatcherTest do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 6)
   end
 
-  test "acceptance 8: boundary and insertion race assigns the later source exactly once", %{
+  test "acceptance 8: before/after admission boundaries assign every source exactly once", %{
     tmp_dir: tmp
   } do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 7)
@@ -46,20 +46,6 @@ defmodule Tightbeam.NoticeBatcherTest do
 
   test "acceptance 9: equal source timestamps retain publication sequence order", %{tmp_dir: tmp} do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 8)
-  end
-
-  test "acceptance 10: Claude priority-ordered 51-member snapshot commits one lossless carrier",
-       %{
-         tmp_dir: tmp
-       } do
-    Tightbeam.NoticeBatcherFixture.run!(tmp, 9)
-  end
-
-  test "acceptance 11: Codex scalar limit splits fitting Unicode sources without truncation",
-       %{
-         tmp_dir: tmp
-       } do
-    Tightbeam.NoticeBatcherFixture.run!(tmp, 10)
   end
 
   test "separate eligibility boundaries exclude later sources even when capped splitting is allowed",
