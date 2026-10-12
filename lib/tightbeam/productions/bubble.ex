@@ -68,20 +68,35 @@ defmodule Tightbeam.Productions.Bubble do
     if NoticeAuthority.restored_turn?(db, seq) do
       :ok
     else
-      # Decide admission for all causes before any sibling can file the owner
-      # suppression fact. Exhausting one cause must not strand another cause
-      # carried by this same terminal turn.
-      turn_contexts(db, seq)
-      |> Enum.filter(fn turn ->
-        turn.status == "delivered" or
-          (is_binary(turn[:patrol_escalation_id]) and turn.status in @climbing_notice_terminals) or
-          bubble_production_matches?(db, turn.status, turn)
+      # All ordinary causes share this recipient's next rung. If it is
+      # exhausted, their dispositions and owner alerts must commit together;
+      # an interrupted wire publication cannot suppress an unfinished sibling.
+      admitted =
+        turn_contexts(db, seq)
+        |> Enum.filter(fn turn ->
+          turn.status == "delivered" or
+            (is_binary(turn[:patrol_escalation_id]) and turn.status in @climbing_notice_terminals) or
+            bubble_production_matches?(db, turn.status, turn)
+        end)
+
+      ordinary = Enum.filter(admitted, &ordinary_cause?/1)
+
+      Enum.reduce(admitted, false, fn turn, climbed? ->
+        if ordinary_cause?(turn) do
+          if not climbed?, do: climb(db, ordinary)
+          true
+        else
+          recognize(db, seq, turn.status, turn)
+          climbed?
+        end
       end)
-      |> Enum.each(fn turn -> recognize(db, seq, turn.status, turn) end)
 
       :ok
     end
   end
+
+  defp ordinary_cause?(turn),
+    do: turn.status != "delivered" and is_nil(turn[:patrol_escalation_id])
 
   @doc "Route one durable patrol threshold through the capable-ancestor climb."
   @spec recognize_patrol_escalation(DB.server(), String.t()) :: :ok
@@ -141,8 +156,6 @@ defmodule Tightbeam.Productions.Bubble do
     recognize_patrol_escalation(db, escalation_id)
   end
 
-  defp recognize(db, _seq, _terminal, turn), do: climb(db, turn)
-
   @doc """
   The production's complete LHS, in one site, over durable state only (spec
   production-machine-v1 §Legibility): the terminal starts or continues a
@@ -186,16 +199,16 @@ defmodule Tightbeam.Productions.Bubble do
   # HAS a lineage and no rung of it is active — a retired rung can never run
   # a turn, so this is the climb ending, and the climb ending is the alert
   # (spec §5), whether what died here was a notice or the cause itself.
-  defp climb(db, turn) do
+  defp climb(db, [turn | _] = turns) do
     case next_active_ancestor(db, turn.session_key) do
       :parentless ->
-        if turn.notice?, do: terminal_alert(db, turn), else: :ok
+        terminal_alerts(db, Enum.filter(turns, & &1.notice?))
 
       :exhausted ->
-        terminal_alert(db, turn)
+        terminal_alerts(db, turns)
 
       {:ok, recipient} ->
-        enqueue_notice(db, turn, recipient)
+        Enum.each(turns, &enqueue_notice(db, &1, recipient))
     end
   end
 
@@ -674,100 +687,125 @@ defmodule Tightbeam.Productions.Bubble do
     :ok
   end
 
-  # The terminal rung. Ordering is deliberate: the user is TOLD first, the
-  # fact files second — a crash between them re-alerts on the next failure (a
-  # duplicate sentence), where the other order would file suppression without
-  # anyone having been told (a silent fault, the one unforgivable outcome).
-  defp terminal_alert(db, turn) do
-    case cause_row(db, turn.cause_seq) do
-      {:ok, cause} -> terminal_alert(db, turn, cause)
-      :missing -> report_missing_cause(db, turn)
-    end
-  end
+  # One terminal carrier can represent several independent causes. Store all
+  # their dispositions and transcript markers in the same transaction as the
+  # common suppression fact. Publication is only a post-commit projection.
+  defp terminal_alerts(db, turns) do
+    causes =
+      Enum.flat_map(turns, fn turn ->
+        case cause_row(db, turn.cause_seq) do
+          {:ok, cause} ->
+            [{turn, cause}]
 
-  # ONE TRANSACTION (spec §5, literally: "in the same transaction it files
-  # user-alerted"): the lifecycle record, the marker in the owner's main
-  # stream, and the standing fact commit together — no window where the fact
-  # suppresses climbs for an alert nobody received, and none where the user
-  # was told but the machine forgot. The wire push happens after commit and
-  # may find nobody connected; store is truth, replay serves them.
-  defp terminal_alert(db, turn, cause) do
-    message =
-      "[no agent can act]\n\nWork owned by you cannot run, and no agent in " <>
-        "its lineage could be told: every ancestor's notice turn also " <>
-        "failed. Original failure — turn #{turn.cause_seq}#{carried_wake(cause)} in " <>
-        "#{cause.session_key}: #{cause.error || "reason unrecorded"}. " <>
-        "Tightbeam will not repeat this alert until a turn is observed to " <>
-        "run; any turn delivering clears it."
-
-    main_key = Org.personal_session_key(turn.owner)
-
-    {:ok, {published, deliveries}} =
-      DB.transaction_then(
-        db,
-        fn txn ->
-          EventLog.lifecycle_in_txn(
-            txn,
-            "lineage_exhausted",
-            turn.owner,
-            "cause_seq=#{turn.cause_seq} session=#{cause.session_key}"
-          )
-
-          transfer_cannot_proceed_disposers_to_user_for_cause_in_txn(
-            txn,
-            turn.cause_seq,
-            turn.owner
-          )
-
-          fact =
-            ConditionFacts.file_in_txn(txn, %{
-              kind: "user-alerted",
-              scope: turn.owner,
-              origin: "process:tightbeam",
-              owner_user_id: turn.owner
-            })
-
-          # The owner's main-session key is COMPOSED; when no row carries the
-          # stream, the fact and the record still commit — log it and be done;
-          # the alert becomes product surface when a main session exists.
-          case DB.Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey = ?1", [main_key]) do
-            [["active"]] ->
-              {:appended, marker} =
-                Projection.append_substrate_in_txn(txn, main_key, message, :high)
-
-              {{:ok, marker}, fact.fact_id}
-
-            _ ->
-              {:no_stream, fact.fact_id}
-          end
-        end,
-        fn txn, {published, fact_id} ->
-          Tightbeam.Wakes.row_commit_in_txn(txn, [])
-          {published, ConditionFacts.recognize_in_txn(txn, fact_id)}
+          :missing ->
+            report_missing_cause(db, turn)
+            []
         end
-      )
+      end)
 
-    ConditionFacts.complete_deliveries(db, deliveries)
+    if causes != [] do
+      {:ok, {published, deliveries}} =
+        DB.transaction_then(
+          db,
+          fn txn ->
+            # Admission was decided for this carrier before any sibling or
+            # patrol alert could file suppression. The original-cause records
+            # also fence concurrent/repeated completion of the admitted group.
+            admitted =
+              Enum.reject(causes, fn {turn, cause} ->
+                DB.Txn.q(
+                  txn,
+                  "SELECT 1 FROM lifecycle_events WHERE kind='lineage_exhausted' AND subject=?1 AND detail=?2 LIMIT 1",
+                  [turn.owner, "cause_seq=#{turn.cause_seq} session=#{cause.session_key}"]
+                ) != []
+              end)
 
-    case published do
-      {:ok, marker} ->
-        ConnRegistry.publish_message(
-          Tightbeam.ConnRegistry,
-          main_key,
-          turn.owner,
-          marker.seq,
-          Payloads.server_message(marker),
-          fn pid, payload -> send(pid, {:push_message, main_key, marker.seq, payload}) end
+            published =
+              Enum.map(admitted, fn {turn, cause} ->
+                EventLog.lifecycle_in_txn(
+                  txn,
+                  "lineage_exhausted",
+                  turn.owner,
+                  "cause_seq=#{turn.cause_seq} session=#{cause.session_key}"
+                )
+
+                transfer_cannot_proceed_disposers_to_user_for_cause_in_txn(
+                  txn,
+                  turn.cause_seq,
+                  turn.owner
+                )
+
+                main_key = Org.personal_session_key(turn.owner)
+
+                case DB.Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey = ?1", [main_key]) do
+                  [["active"]] ->
+                    {:appended, marker} =
+                      Projection.append_substrate_in_txn(
+                        txn,
+                        main_key,
+                        terminal_alert_message(turn, cause),
+                        :high
+                      )
+
+                    {:ok, main_key, turn.owner, marker}
+
+                  _ ->
+                    {:no_stream, turn.owner}
+                end
+              end)
+
+            facts =
+              admitted
+              |> Enum.map(fn {turn, _} -> turn.owner end)
+              |> Enum.uniq()
+              |> Enum.map(fn owner ->
+                ConditionFacts.file_in_txn(txn, %{
+                  kind: "user-alerted",
+                  scope: owner,
+                  origin: "process:tightbeam",
+                  owner_user_id: owner
+                }).fact_id
+              end)
+
+            {published, facts}
+          end,
+          fn txn, {published, facts} ->
+            Tightbeam.Wakes.row_commit_in_txn(txn, [])
+            {published, Enum.flat_map(facts, &ConditionFacts.recognize_in_txn(txn, &1))}
+          end
         )
 
-      :no_stream ->
-        Logger.info(
-          "lineage exhausted for #{turn.owner} with no active main session: " <>
-            "alert recorded and standing; no stream to carry it yet"
-        )
+      ConditionFacts.complete_deliveries(db, deliveries)
+
+      Enum.each(published, fn
+        {:ok, main_key, owner, marker} ->
+          ConnRegistry.publish_message(
+            Tightbeam.ConnRegistry,
+            main_key,
+            owner,
+            marker.seq,
+            Payloads.server_message(marker),
+            fn pid, payload -> send(pid, {:push_message, main_key, marker.seq, payload}) end
+          )
+
+        {:no_stream, owner} ->
+          Logger.info(
+            "lineage exhausted for #{owner} with no active main session: " <>
+              "alert recorded and standing; no stream to carry it yet"
+          )
+      end)
     end
 
     :ok
+  end
+
+  defp terminal_alert_message(turn, cause) do
+    "[no agent can act]\n\nWork owned by you cannot run, and no agent in " <>
+      "its lineage could be told: every ancestor's notice turn also " <>
+      "failed. Original failure — turn #{turn.cause_seq}#{carried_wake(cause)} in " <>
+      "#{cause.session_key}: #{cause.error || "reason unrecorded"}. " <>
+      "Tightbeam will not repeat this alert until a turn is observed to " <>
+      "run; any turn delivering clears it."
   end
 
   defp report_missing_cause(db, turn) do
