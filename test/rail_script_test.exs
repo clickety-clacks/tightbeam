@@ -36,23 +36,15 @@ defmodule Tightbeam.RailScriptTest do
     db = :"rail_script_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
 
-    if context[:missing_assignments] do
-      # These two fault cases deliberately exercise an unavailable assignment
-      # context, not a normal fresh database or an absent assignment row.
-      :ok = Org.ensure_schema(db)
-      :ok = EventLog.ensure_schema(db)
-      :ok = ConditionFacts.ensure_schema(db)
-      :ok = Escalation.ensure_schema(db)
-      :ok = Wakes.ensure_schema(db)
-      :ok = Placement.ensure_schema(db)
-      # Current session reads require the event relation even in this deliberately
-      # incomplete fixture. Keep assignments absent: that is the tested fault.
-      assert {:ok, :ok} =
-               DB.transaction(db, &Tightbeam.SessionReparent.migrate_in_txn/1)
+    :ok = Tightbeam.Schema.ensure_all(db)
 
+    if context[:missing_assignments] do
+      # Inject only the named unavailable assignment relation into a qualified
+      # current schema. Historical wake storage would also break the decision
+      # outbox and hide whether this invocation failure is durably escalated.
+      assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM assignments")
+      :ok = DB.execute(db, "DROP TABLE assignments")
       assert {:ok, []} = DB.query(db, "SELECT name FROM sqlite_master WHERE name='assignments'")
-    else
-      :ok = Tightbeam.Schema.ensure_all(db)
     end
 
     {tmp, 0} = System.cmd("/bin/realpath", [System.tmp_dir!()])

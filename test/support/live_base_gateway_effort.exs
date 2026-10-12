@@ -1,5 +1,5 @@
 import ExUnit.Assertions
-alias Tightbeam.{DB, Gateway, Model, Org, Wakes}
+alias Tightbeam.{DB, Gateway, Model, NoticeBatcher, Org, Wakes}
 
 Application.put_env(:tightbeam, :effort_checkins_enabled, true)
 
@@ -89,7 +89,7 @@ Tightbeam.GuardGatewayFixture.run!(fn %{db: db, config: config} ->
     assert Wakes.get(db, wake_id).state == "fired"
 
     # The expecter notification is a durable ungated wake armed with the request,
-    # still pending: the same tick that opened the request delivers nothing.
+    # still pending until the following scheduler pass forms its ready carrier.
     assert {:ok, [[notify_id]]} =
              DB.query(
                db,
@@ -103,8 +103,13 @@ Tightbeam.GuardGatewayFixture.run!(fn %{db: db, config: config} ->
     assert :ok = Wakes.fire_due(scheduler)
     assert Wakes.get(db, notify_id).state == "fired"
 
+    assert [%{delivery_wake_id: notify_carrier, batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(db, notify_id)
+
+    assert Wakes.get(db, notify_carrier).state == "fired"
+
     assert {:ok, [[1]]} =
-             DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId = ?1", [notify_id])
+             DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId = ?1", [notify_carrier])
 
     assert_receive {:ensure_lane, ^expecter}, 1_000
 

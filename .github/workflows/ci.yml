@@ -20,15 +20,26 @@ on:
         description: "Exact 40-hex candidate commit to verify; no release publication"
         required: true
         type: string
+      docs_validation:
+        description: "Run only the hosted docs package/privacy/52-view validation"
+        required: false
+        default: "off"
+        type: choice
+        options: ["off", "on"]
+      candidate_tree:
+        description: "Exact 40-hex tree required when docs_validation is on"
+        required: false
+        type: string
 
 permissions:
   contents: read
 
 env:
-  CI_SOURCE_SHA: ${{ github.event_name != 'workflow_dispatch' && github.sha || inputs.candidate_sha }}
+  CI_SOURCE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event_name != 'workflow_dispatch' && github.sha || inputs.candidate_sha }}
 
 jobs:
   test:
+    if: github.event_name != 'workflow_dispatch' || inputs.docs_validation != 'on'
     strategy:
       fail-fast: false
       matrix:
@@ -38,7 +49,7 @@ jobs:
           - os: macos-latest
             name: macos
     name: ${{ matrix.name }}
-    runs-on: ${{ matrix.name == 'linux' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "tb-linux"]') || matrix.name == 'macos' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "tb-macos"]') || matrix.os }}
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Validate exact source SHA
         shell: bash
@@ -333,3 +344,127 @@ jobs:
             release/tightbeam-*.tgz
             release/SHA256SUMS
             release/release-provenance.json
+
+
+  docs-validation:
+    if: github.event_name == 'workflow_dispatch' && inputs.docs_validation == 'on'
+    name: docs validation ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    defaults:
+      run:
+        shell: bash
+    env:
+      EXPECTED_TREE: ${{ inputs.candidate_tree }}
+      DISPATCH_SHA: ${{ github.sha }}
+      MIX_ENV: prod
+      GIT_AUTHOR_NAME: Offline docs evidence
+      GIT_AUTHOR_EMAIL: docs@invalid
+      GIT_COMMITTER_NAME: Offline docs evidence
+      GIT_COMMITTER_EMAIL: docs@invalid
+    steps:
+      - name: Validate dispatch subject
+        run: |
+          [[ "$CI_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          [[ "$EXPECTED_TREE" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          test "$DISPATCH_SHA" = "$CI_SOURCE_SHA"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CI_SOURCE_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify exact source and reviewed manual
+        run: |
+          test "$(git rev-parse HEAD)" = "$CI_SOURCE_SHA"
+          test "$(git rev-parse HEAD^{tree})" = "$EXPECTED_TREE"
+          test -z "$(git status --porcelain)"
+          test "$(git rev-parse HEAD^)" = 28d217988f2db1beb0300a6115b7f7b7e72c7214
+          git diff --exit-code 28d217988f2db1beb0300a6115b7f7b7e72c7214 HEAD -- priv
+      - name: Create isolated evidence directory
+        id: evidence
+        run: |
+          directory=$(mktemp -d "$RUNNER_TEMP/docs-validation.XXXXXXXX")
+          directory=$(cd "$directory" && pwd -P)
+          printf 'DOCS_EVIDENCE=%s\n' "$directory" >> "$GITHUB_ENV"
+          printf 'path=%s\n' "$directory" >> "$GITHUB_OUTPUT"
+          git show -s --format='%H%n%T%n%P' HEAD > "$directory/source.txt"
+          cp scripts/docs_composition_52.json "$directory/inventory.json"
+          python3 -c 'import hashlib,json,pathlib,sys; print(json.dumps({p:hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest() for p in sys.argv[1:]},sort_keys=True))' .github/workflows/ci.yml scripts/docs_composition_52.exs scripts/docs_composition_52.json priv/guidance/operating-manual.md > "$directory/input-hashes.json"
+      - name: Shipped privacy
+        id: privacy
+        run: |
+          set -euo pipefail
+          python3 scripts/verify_shipped_privacy.py 2>&1 | tee "$DOCS_EVIDENCE/privacy.log"
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "28"
+          elixir-version: "1.19.5"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Toolchain and platform evidence
+        run: |
+          { uname -sm; elixir --version; rustc --version; node --version; } > "$DOCS_EVIDENCE/toolchains.txt"
+      - name: Resolve locked build prerequisites
+        run: |
+          set -euo pipefail
+          for name in ${!TIGHTBEAM_@} ${!RELEASE_@}; do unset "$name"; done
+          mix deps.get --only prod 2>&1 | tee "$DOCS_EVIDENCE/dependencies.log"
+          git diff --exit-code -- mix.lock cli/Cargo.lock
+      - name: Assemble exact source package
+        id: package
+        run: |
+          set -euo pipefail
+          for name in ${!TIGHTBEAM_@} ${!RELEASE_@}; do unset "$name"; done
+          sh packaging/assemble.sh 2>&1 | tee "$DOCS_EVIDENCE/package.log"
+          git diff --exit-code -- mix.lock cli/Cargo.lock
+          mkdir "$DOCS_EVIDENCE/packages"
+          cp _build/npm/tightbeam-*.tgz "$DOCS_EVIDENCE/packages/"
+          python3 - <<'PACKAGES'
+          import hashlib, json, os, pathlib, tarfile
+          root = pathlib.Path(os.environ['DOCS_EVIDENCE'])
+          files = sorted((root / 'packages').glob('*.tgz'))
+          assert len(files) == 1, 'expected exactly one native package'
+          with tarfile.open(files[0], 'r:gz') as archive:
+              manuals = [m for m in archive.getmembers() if m.name.endswith('/priv/guidance/operating-manual.md')]
+              assert len(manuals) == 1 and manuals[0].isfile(), 'packaged manual inventory'
+              manual = archive.extractfile(manuals[0]).read()
+              assert hashlib.sha256(manual).hexdigest() == '9327561e174d9cd45e0a2f04d93ea71ab040fb30a30e557f3e69e46be64d7dff', 'packaged manual differs'
+          (root / 'package-hashes.json').write_text(json.dumps({p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in files}))
+          PACKAGES
+      - name: Compose 52 supported parent and candidate views without starting the app
+        id: composition
+        run: |
+          set -euo pipefail
+          for name in ${!TIGHTBEAM_@} ${!RELEASE_@}; do unset "$name"; done
+          mix run --no-start scripts/docs_composition_52.exs 2>&1 | tee "$DOCS_EVIDENCE/composition.log"
+          test -z "$(git status --porcelain)"
+      - name: Record gate outcomes
+        if: always() && steps.evidence.outputs.path != ''
+        env:
+          PRIVACY_OUTCOME: ${{ steps.privacy.outcome }}
+          PACKAGE_OUTCOME: ${{ steps.package.outcome }}
+          COMPOSITION_OUTCOME: ${{ steps.composition.outcome }}
+        run: |
+          python3 - <<'RECEIPT'
+          import json, os, pathlib
+          keys = ['CI_SOURCE_SHA', 'EXPECTED_TREE', 'DISPATCH_SHA', 'GITHUB_RUN_ID',
+                  'GITHUB_RUN_ATTEMPT', 'PRIVACY_OUTCOME', 'PACKAGE_OUTCOME', 'COMPOSITION_OUTCOME']
+          receipt = {k: os.environ[k] for k in keys}
+          receipt['passed'] = all(receipt[k] == 'success' for k in ['PRIVACY_OUTCOME', 'PACKAGE_OUTCOME', 'COMPOSITION_OUTCOME'])
+          pathlib.Path(os.environ['DOCS_EVIDENCE'], 'receipt.json').write_text(json.dumps(receipt, indent=2))
+          RECEIPT
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.evidence.outputs.path != ''
+        with:
+          name: docs-validation-${{ matrix.os }}-${{ env.CI_SOURCE_SHA }}-${{ github.run_attempt }}
+          path: ${{ steps.evidence.outputs.path }}
+          retention-days: 14
+          if-no-files-found: error

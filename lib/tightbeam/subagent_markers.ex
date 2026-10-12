@@ -66,7 +66,7 @@ defmodule Tightbeam.SubagentMarkers do
         end
       )
 
-    ConditionFacts.complete_deliveries(db, deliveries)
+    ConditionFacts.complete_deliveries(db, scheduler, deliveries)
     if is_integer(result[:fact_id]), do: Wakes.fire_matching(scheduler, result.fact_id)
     result
   end

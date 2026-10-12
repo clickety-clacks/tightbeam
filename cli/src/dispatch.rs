@@ -466,6 +466,23 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             path: "/agent/tool-call-observed",
             body_json: "{}".to_owned(),
         }),
+        Command::SessionDiagnose {
+            identity,
+            session_key,
+        } => {
+            let Identity::User(user) = identity else {
+                return Err("session-diagnose requires --as-user".to_owned());
+            };
+            Ok(RequestSpec {
+                attempt_context: None,
+                receipt_base_override: None,
+                path: "/agent/session-diagnose",
+                body_json: object(vec![
+                    string_field("asUser", user),
+                    string_field("sessionKey", session_key),
+                ]),
+            })
+        }
         Command::Spawn {
             identity,
             display_name,
@@ -1890,6 +1907,15 @@ pub(crate) fn send_to_with_deadline(
     request: &RequestSpec,
     deadline: Option<Instant>,
 ) -> Result<Option<Value>, String> {
+    if request.path == "/agent/session-diagnose" {
+        let limit = (Instant::now() + Duration::from_secs(2))
+            .min(deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(2)));
+        let endpoint = endpoint.clone();
+        let request = request.clone();
+        return diagnostic_exchange(limit, move |remaining| {
+            send_diagnostic_with_timeout(&endpoint, &request, Some(remaining))
+        });
+    }
     if let Some(deadline) = deadline {
         let endpoint = endpoint.clone();
         let request = request.clone();
@@ -1900,6 +1926,60 @@ pub(crate) fn send_to_with_deadline(
     }
 
     send_to_with_timeout(endpoint, request, None)
+}
+
+// Bounds the caller's whole exchange, including synchronous DNS/proxy lookup.
+// As in lease::until, an uninterruptible resolver can outlive the deadline in
+// the detached thread until it returns or this CLI process exits. This request
+// is read-only; a client timeout does not cancel server work or a pending tune.
+fn diagnostic_exchange<F>(deadline: Instant, work: F) -> Result<Option<Value>, String>
+where
+    F: FnOnce(Duration) -> Result<Option<Value>, String> + Send + 'static,
+{
+    crate::lease::until(deadline, work)
+        .map_err(|()| "diagnostic_transport_unavailable".to_owned())?
+}
+
+fn send_diagnostic_with_timeout(
+    endpoint: &Endpoint,
+    request: &RequestSpec,
+    timeout: Option<Duration>,
+) -> Result<Option<Value>, String> {
+    let call = gateway_request("POST", endpoint, request.path, timeout)
+        .set("Content-Type", "application/json")
+        .send_string(&request.body_json);
+    let (status, response) = match call {
+        Ok(response) => (response.status(), response),
+        Err(ureq::Error::Status(status, response)) => (status, response),
+        Err(ureq::Error::Transport(_)) => return Err("diagnostic_transport_unavailable".to_owned()),
+    };
+    let mut encoded = String::new();
+    response
+        .into_reader()
+        .take(4097)
+        .read_to_string(&mut encoded)
+        .map_err(|_| "diagnostic_response_unavailable".to_owned())?;
+    if encoded.len() > 4096 {
+        return Err("diagnostic_response_limit".to_owned());
+    }
+    let json: Value =
+        serde_json::from_str(&encoded).map_err(|_| "diagnostic_response_invalid".to_owned())?;
+    if !(200..300).contains(&status) {
+        return Err(match json["error"]["code"].as_str().unwrap_or("") {
+            "unauthorized"
+            | "incompatible_cli"
+            | "diagnostic_scope_refused"
+            | "invalid_diagnostic_request"
+            | "diagnostic_snapshot_timeout"
+            | "diagnostic_unavailable"
+            | "diagnostic_response_limit" => json["error"]["code"].as_str().unwrap().to_owned(),
+            _ => "diagnostic_response_invalid".to_owned(),
+        });
+    }
+    json.get("result")
+        .cloned()
+        .map(Some)
+        .ok_or_else(|| "diagnostic_response_invalid".to_owned())
 }
 
 fn send_to_with_timeout(
@@ -2982,6 +3062,11 @@ fn spaces(text: &[u8]) -> usize {
 /// The length of the value the gateway's secret-assignment rule masks, in the order it
 /// tries them: an auth scheme and its credential, a quoted string, then a bare word.
 fn secret_value(text: &[u8]) -> Option<usize> {
+    const REDACTED_MARKER: &[u8] = b"[REDACTED:secret_field]";
+    if text.starts_with(REDACTED_MARKER) {
+        return Some(REDACTED_MARKER.len());
+    }
+
     let scheme = ["bearer", "basic", "token"].iter().find_map(|scheme| {
         let named = text
             .get(..scheme.len())
@@ -2990,10 +3075,16 @@ fn secret_value(text: &[u8]) -> Option<usize> {
             return None;
         }
         let gap = spaces(&text[scheme.len()..]);
-        let credential = text[scheme.len() + gap..]
-            .iter()
-            .take_while(|byte| !is_space_byte(**byte) && !b",;\"'&}]".contains(*byte))
-            .count();
+        let credential_start = scheme.len() + gap;
+        let credential_bytes = &text[credential_start..];
+        let credential = if credential_bytes.starts_with(REDACTED_MARKER) {
+            REDACTED_MARKER.len()
+        } else {
+            credential_bytes
+                .iter()
+                .take_while(|byte| !is_space_byte(**byte) && !b",;\"'&}]".contains(*byte))
+                .count()
+        };
         (gap > 0 && credential > 0).then_some(scheme.len() + gap + credential)
     });
     if scheme.is_some() {
@@ -3486,6 +3577,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::SentinelEnvList { identity, .. }
         | Command::SentinelEnvUnset { identity, .. }
         | Command::HostToolchainSet { identity, .. }
+        | Command::SessionDiagnose { identity, .. }
         | Command::HarnessProcesses { identity } => Some(identity),
         Command::Help
         | Command::CommandHelp(_)
@@ -6329,6 +6421,10 @@ mod tests {
                 "login failed: password=[REDACTED:secret_field], retry later",
             ),
             (
+                "primary DB failure password=[REDACTED:secret_field]",
+                "primary DB failure password=[REDACTED:secret_field]",
+            ),
+            (
                 r#"{"detail": "x", "client_secret": "fixture\"SENTINEL"}"#,
                 r#"{"detail": "x", "client_secret": "[REDACTED:secret_field]"}"#,
             ),
@@ -6399,7 +6495,9 @@ mod tests {
             ),
         ];
         for (body, expected) in cases {
-            assert_eq!(redact_body(body), expected, "{body}");
+            let redacted = redact_body(body);
+            assert_eq!(redacted, expected, "{body}");
+            assert_eq!(redact_body(&redacted), expected, "redacting {body} twice");
         }
     }
 
@@ -7095,5 +7193,206 @@ mod tests {
             body(&["breathing", "assignment", "asg_1", "--as-user", "flynn"]),
             r#"{"asUser":"flynn","verb":"breathing","params":{"targetKind":"assignment","targetId":"asg_1"}}"#
         );
+    }
+}
+
+#[cfg(test)]
+mod session_diagnose_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    struct FixtureIo {
+        request_headers_complete: bool,
+        declared_request_body_bytes: usize,
+        request_body_bytes_read: usize,
+        response_bytes_to_write: usize,
+        response_bytes_written: usize,
+    }
+
+    fn command(args: &[&str]) -> Result<Command, String> {
+        crate::args::parse(args.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn exact_user_target_builds_dedicated_read_only_request() {
+        let parsed = command(&[
+            "session-diagnose",
+            "--session",
+            "seat",
+            "--as-user",
+            "mike",
+            "--json",
+        ])
+        .unwrap();
+        let request = build_request(&parsed).unwrap();
+        assert_eq!(request.path, "/agent/session-diagnose");
+        assert!(request.attempt_context.is_none());
+        assert!(request.receipt_base_override.is_none());
+        assert_eq!(
+            serde_json::from_str::<Value>(&request.body_json).unwrap(),
+            serde_json::json!({"asUser":"mike", "sessionKey":"seat"})
+        );
+        for args in [
+            vec!["session-diagnose", "--session", "seat", "--as", "po"],
+            vec!["session-diagnose", "--as-user", "mike"],
+            vec![
+                "session-diagnose",
+                "--session",
+                "seat",
+                "--as-user",
+                "mike",
+                "--all",
+            ],
+        ] {
+            assert!(command(&args).is_err());
+        }
+    }
+
+    fn fixture(
+        status: u16,
+        body: String,
+        delay: Duration,
+    ) -> (
+        Endpoint,
+        std::thread::JoinHandle<Result<FixtureIo, &'static str>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = Endpoint {
+            base: format!("http://{}", listener.local_addr().unwrap()),
+            token: "CANARY_AUTH_229693e2".to_owned(),
+            origin: Origin::Named,
+        };
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().map_err(|_| "accept")?;
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .map_err(|_| "read_timeout")?;
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .map_err(|_| "write_timeout")?;
+
+            // Read the complete request before replying. Reading only once can
+            // stop at the headers and turn the intended response-body test into
+            // a client transport failure. Never include request bytes in errors.
+            let mut received = Vec::new();
+            let mut header_end = None;
+            let mut declared_request_body_bytes = None;
+            loop {
+                let mut chunk = [0_u8; 1024];
+                let count = stream.read(&mut chunk).map_err(|_| "request_read")?;
+                if count == 0 {
+                    return Err("request_incomplete");
+                }
+                received.extend_from_slice(&chunk[..count]);
+                if received.len() > 8192 {
+                    return Err("request_too_large");
+                }
+
+                if header_end.is_none() {
+                    if let Some(end) = received.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let headers =
+                            std::str::from_utf8(&received[..end]).map_err(|_| "request_headers")?;
+                        let mut content_length = None;
+                        for line in headers.lines().skip(1) {
+                            let Some((name, value)) = line.split_once(':') else {
+                                return Err("request_headers");
+                            };
+                            if name.eq_ignore_ascii_case("content-length") {
+                                content_length = Some(
+                                    value
+                                        .trim()
+                                        .parse::<usize>()
+                                        .map_err(|_| "request_content_length")?,
+                                );
+                            }
+                        }
+                        header_end = Some(end + 4);
+                        declared_request_body_bytes =
+                            Some(content_length.ok_or("request_content_length_missing")?);
+                    }
+                }
+
+                if let (Some(end), Some(body_bytes)) = (header_end, declared_request_body_bytes) {
+                    if received.len() >= end + body_bytes {
+                        break;
+                    }
+                }
+            }
+
+            let request_body_bytes_read = received.len() - header_end.ok_or("request_headers")?;
+            std::thread::sleep(delay);
+            let response = format!(
+                "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .map_err(|_| "response_write")?;
+            Ok(FixtureIo {
+                request_headers_complete: true,
+                declared_request_body_bytes: declared_request_body_bytes
+                    .ok_or("request_content_length_missing")?,
+                request_body_bytes_read,
+                response_bytes_to_write: response.len(),
+                response_bytes_written: response.len(),
+            })
+        });
+        (endpoint, worker)
+    }
+
+    #[test]
+    fn oversized_and_secret_bearing_error_responses_are_not_printed() {
+        for (status, body, expected) in [(200, "x".repeat(4097), "diagnostic_response_limit"),
+            (503, r#"{"error":{"code":"CANARY_AUTH_SQL_229693e2","message":"CANARY_AUTH_SQL_229693e2"}}"#.to_owned(), "diagnostic_response_invalid")] {
+            let (endpoint, worker) = fixture(status, body, Duration::ZERO);
+            let request = build_request(&command(&["session-diagnose", "--session", "seat", "--as-user", "mike"]).unwrap()).unwrap();
+            assert_eq!(send_to(&endpoint, &request).unwrap_err(), expected);
+            let io = worker.join().expect("fixture thread panicked").expect(
+                "fixture must consume the complete request and write the complete response",
+            );
+            assert!(io.request_headers_complete);
+            assert_eq!(
+                io.request_body_bytes_read,
+                io.declared_request_body_bytes,
+                "fixture must consume the declared request body"
+            );
+            assert_eq!(
+                io.response_bytes_written, io.response_bytes_to_write,
+                "fixture must complete the response write"
+            );
+        }
+    }
+
+    #[test]
+    fn stalled_pre_connection_work_is_inside_the_absolute_deadline() {
+        let started = Instant::now();
+        let result = diagnostic_exchange(started + Duration::from_millis(40), |_| {
+            // Models an uninterruptible resolver before any HTTP connection.
+            std::thread::sleep(Duration::from_millis(250));
+            Ok(None)
+        });
+        assert_eq!(result.unwrap_err(), "diagnostic_transport_unavailable");
+        assert!(started.elapsed() < Duration::from_millis(200));
+    }
+
+    #[test]
+    fn stalled_http_response_has_finite_client_deadline() {
+        let (endpoint, worker) = fixture(
+            200,
+            r#"{"result":{}}"#.to_owned(),
+            Duration::from_millis(2400),
+        );
+        let request = build_request(
+            &command(&["session-diagnose", "--session", "seat", "--as-user", "mike"]).unwrap(),
+        )
+        .unwrap();
+        let started = Instant::now();
+        assert_eq!(
+            send_to(&endpoint, &request).unwrap_err(),
+            "diagnostic_transport_unavailable"
+        );
+        assert!(started.elapsed() < Duration::from_millis(2300));
+        worker.join().unwrap();
     }
 }

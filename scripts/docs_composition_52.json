@@ -1,0 +1,11 @@
+{
+  "contract": "dependency-fallback-parent-candidate-52-v1",
+  "parent": "5b30316ef431017db70850a93d9dcf735c4db3f4",
+  "reviewed_manual_commit": "28d217988f2db1beb0300a6115b7f7b7e72c7214",
+  "manual_sha256": "9327561e174d9cd45e0a2f04d93ea71ab040fb30a30e557f3e69e46be64d7dff",
+  "parent_manual_sha256": "e6bd01b34f14dd8783fbd6bc25ea7fb40cdd36d436b02efb0e27106e08e4cf6a",
+  "roles": ["coder", "default", "guidance-reviewer", "guidance-writer", "integrator", "orchestrator", "pdo", "product-owner", "recon", "reviewer-code", "reviewer-spec", "spec-writer", "team-planner"],
+  "harnesses": ["claude", "codex"],
+  "versions": ["parent", "candidate"],
+  "count": 52
+}

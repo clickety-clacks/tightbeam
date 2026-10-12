@@ -1,8 +1,29 @@
+defmodule Tightbeam.NoticeBatcherFixture.LaneStub do
+  use GenServer
+  def start_link(name), do: GenServer.start_link(__MODULE__, :ok, name: name)
+  @impl true
+  def init(:ok), do: {:ok, :ok}
+  @impl true
+  def handle_call({:ensure_lane, _session}, _from, state), do: {:reply, :ok, state}
+end
+
 defmodule Tightbeam.NoticeBatcherFixture do
   @moduledoc false
   import ExUnit.Assertions
   import Tightbeam.TestCase, only: [ensure_all_schemas: 1, ensure_main_session: 2]
-  alias Tightbeam.{AdminProjection, DB, EventLog, Gateway, NoticeBatcher, Org, Roles, Wakes}
+
+  alias Tightbeam.{
+    ConnRegistry,
+    DB,
+    EventLog,
+    Gateway,
+    Ledger,
+    NoticeBatcher,
+    Org,
+    Roles,
+    Schema,
+    Wakes
+  }
 
   def run!(tmp, scenario) do
     %{executable: executable, args: args, env: env} =
@@ -23,11 +44,16 @@ defmodule Tightbeam.NoticeBatcherFixture do
     {:ok, db} =
       DB.start_link(path: Path.join(base, "state.db"), name: nil, guard_inputs: [])
 
+    # The child owns these local delivery services; no adapter or live lane starts.
+    {:ok, registry} = ConnRegistry.start_link(name: Tightbeam.ConnRegistry)
+    {:ok, lane} = Tightbeam.NoticeBatcherFixture.LaneStub.start_link(Tightbeam.LaneManager)
+    Process.put({__MODULE__, :db}, db)
     Process.put({__MODULE__, :schedulers}, [])
 
     try do
       :ok = ensure_all_schemas(db)
       :ok = DB.assert_base_admitted!(db, base)
+      seed_session(db, "agent:recipient", "recipient-owner")
       marker = File.read!(Path.join(base, "build-owner.json"))
       scenario(scenario, db)
       assert File.read!(Path.join(base, "build-owner.json")) == marker
@@ -36,10 +62,186 @@ defmodule Tightbeam.NoticeBatcherFixture do
         if Process.alive?(scheduler), do: GenServer.stop(scheduler)
       end
 
-      if Process.alive?(db), do: GenServer.stop(db)
+      current_db = Process.get({__MODULE__, :db})
+      if Process.alive?(current_db), do: GenServer.stop(current_db)
+      if Process.alive?(lane), do: GenServer.stop(lane)
+      if Process.alive?(registry), do: GenServer.stop(registry)
     end
 
     IO.puts("notice-batcher-case: #{scenario}: ok")
+  end
+
+  defp scenario(41, db) do
+    assert Org.get(db, "agent:recipient").harness == "claude"
+    running = running_turn(db, "agent:recipient")
+
+    sources =
+      for n <- 1..2,
+          do: eligible(db, prompt: "Claude source #{n} " <> String.duplicate("🙂", 550_000))
+
+    priority = ordinary(db, "algedonic", "priority before readiness")
+    canceled = eligible(db, prompt: "withdraw before readiness")
+    scheduler = start_scheduler(db, fn wake -> deliver(db, wake) end)
+    assert :ok = Wakes.fire_due(scheduler)
+    assert count(db, "notice_batches") == 0
+
+    for source <- sources do
+      assert Wakes.get(db, source.wake_id).state == "pending"
+      assert NoticeBatcher.source_refs(db, source.wake_id) == []
+    end
+
+    withdraw!(db, canceled)
+    finish_running_turn(db, running, System.system_time(:millisecond))
+    assert :ok = Wakes.fire_due(scheduler)
+
+    assert {:ok, [[carrier]]} =
+             DB.query(db, "SELECT deliveryWakeId FROM notice_batches WHERE sessionKey=?1", [
+               "agent:recipient"
+             ])
+
+    ordered = [priority | sources]
+    expected = Enum.map(ordered, & &1.wake_id)
+    assert_actual_carrier!(db, carrier, expected)
+
+    assert {:ok, [[submitted]]} =
+             DB.query(db, "SELECT prompt FROM turns WHERE wakeId=?1", [carrier])
+
+    assert String.starts_with?(submitted, "[from process:tightbeam]\n\n[batched notices: 3]")
+
+    # Compare the complete submitted body, in priority/publication order,
+    # including every source's exact raw text; presence-only checks miss loss.
+    body =
+      ordered
+      |> Enum.with_index(1)
+      |> Enum.map_join("\n\n", fn {source, index} ->
+        "[#{index}] source=#{source.wake_id} sender=#{source.origin} cause=wake class=#{source.class}\n" <>
+          source.prompt
+      end)
+
+    raw = Wakes.get(db, carrier).prompt
+    assert submitted == Gateway.decorate_delivery_prompt(raw, "process:tightbeam")
+    [header, submitted_body] = String.split(raw, "\n\n", parts: 2)
+    assert submitted_body == body <> "\n\n" <> Wakes.digest_signature(length(ordered))
+    assert header =~ "[batched notices: #{length(ordered)}]"
+    assert count(db, "notice_batches") == 1
+    assert NoticeBatcher.batch(db, batch_id(db, priority)).member_count == length(ordered)
+    assert NoticeBatcher.batch(db, batch_id(db, priority)).release_cause == "turn-boundary"
+
+    assert Tightbeam.SubmissionSize.text_chars(submitted) >
+             Tightbeam.SubmissionSize.codex_text_limit()
+
+    assert byte_size(submitted) > 65_536
+    for source <- sources, do: assert(Wakes.get(db, source.wake_id).prompt == source.prompt)
+    assert Wakes.get(db, canceled.wake_id).state == "canceled"
+    assert NoticeBatcher.source_refs(db, canceled.wake_id) == []
+
+    refute Enum.any?(
+             EventLog.lifecycle_events(db),
+             &(&1.kind == "notice_submission_size_unavailable")
+           )
+
+    # Admission is durable and exactly once, not a downstream/provider success claim.
+    frozen = delivery_snapshot(db)
+    assert :ok = Wakes.fire_due(scheduler)
+    assert delivery_snapshot(db) == frozen
+    :ok = GenServer.stop(scheduler)
+
+    assert {:ok, [[path]]} =
+             DB.query(db, "SELECT file FROM pragma_database_list WHERE name='main'")
+
+    :ok = GenServer.stop(db)
+    {:ok, reopened} = DB.start_link(path: path, name: nil, guard_inputs: [])
+    Process.put({__MODULE__, :db}, reopened)
+    assert :ok = Schema.ensure_all(reopened)
+    assert NoticeBatcher.recover(reopened) == []
+    assert delivery_snapshot(reopened) == frozen
+    assert {:ok, []} = DB.query(reopened, "PRAGMA foreign_key_check")
+  end
+
+  defp scenario(39, db) do
+    # OUR-side queue/submission-size proof; this does not pretend to exercise
+    # the receiving executable or Claude's opaque complete Messages request.
+    {:ok, _} =
+      DB.query(
+        db,
+        "UPDATE sessions SET harness='codex',provider='openai' WHERE sessionKey='agent:recipient'"
+      )
+
+    sources =
+      for n <- 1..101, do: eligible(db, prompt: "notice #{n} " <> String.duplicate("🙂", 1_000))
+
+    priority = ordinary(db, "algedonic", "priority before submission size")
+    withdrawn = eligible(db, prompt: "withdraw before readiness")
+    withdraw!(db, withdrawn)
+    [carrier] = NoticeBatcher.recover(db, priority.due_at)
+    expected = [priority.wake_id | Enum.map(sources, & &1.wake_id)]
+    assert_actual_carrier!(db, carrier, expected)
+    assert source_ids(db, carrier) == expected
+    assert count(db, "turns", "wakeId=?1", [carrier]) == 1
+    assert Wakes.get(db, withdrawn.wake_id).state == "canceled"
+    assert NoticeBatcher.source_refs(db, withdrawn.wake_id) == []
+    {:ok, [[submitted]]} = DB.query(db, "SELECT prompt FROM turns WHERE wakeId=?1", [carrier])
+    assert String.starts_with?(submitted, "[from process:tightbeam]\n\n[batched notices: 102]")
+    assert Tightbeam.SubmissionSize.check_codex([%{type: "text", text: submitted}]) == :ok
+    assert byte_size(submitted) > 65_536
+    for source <- sources, do: assert(Wakes.get(db, source.wake_id).prompt == source.prompt)
+    frozen = delivery_snapshot(db)
+    assert NoticeBatcher.recover(db, priority.due_at) == []
+    assert delivery_snapshot(db) == frozen
+  end
+
+  defp scenario(40, db) do
+    {:ok, _} =
+      DB.query(
+        db,
+        "UPDATE sessions SET harness='codex',provider='openai' WHERE sessionKey='agent:recipient'"
+      )
+
+    running = running_turn(db, "agent:recipient")
+    first = eligible(db, prompt: String.duplicate("🙂", 550_000), class: "blocker")
+    second = eligible(db, prompt: String.duplicate("e\u0301", 275_000), class: "fyi")
+    assert scalar_count(first.prompt) == 550_000
+    assert scalar_count(second.prompt) == 550_000
+    assert String.length(second.prompt) == 275_000
+    canceled = eligible(db, prompt: "cancel before readiness")
+    assert NoticeBatcher.recover(db, second.due_at) == []
+    assert NoticeBatcher.source_refs(db, first.wake_id) == []
+    assert NoticeBatcher.source_refs(db, second.wake_id) == []
+    withdraw!(db, canceled)
+    finish_running_turn(db, running, second.created_at + 5)
+    [first_carrier, second_carrier] = NoticeBatcher.recover(db, second.created_at + 6)
+    assert_actual_carrier!(db, first_carrier, [first.wake_id])
+    assert_actual_carrier!(db, second_carrier, [second.wake_id])
+    assert Wakes.get(db, first.wake_id).prompt == first.prompt
+    assert Wakes.get(db, second.wake_id).prompt == second.prompt
+    assert [%{payload: payload}] = NoticeBatcher.members(db, batch_id(db, second))
+    assert payload == second.prompt
+    assert Wakes.get(db, canceled.wake_id).state == "canceled"
+    assert NoticeBatcher.source_refs(db, canceled.wake_id) == []
+
+    {:ok, submitted} =
+      DB.query(db, "SELECT prompt FROM turns WHERE wakeId IN (?1,?2) ORDER BY seq", [
+        first_carrier,
+        second_carrier
+      ])
+
+    for [text] <- submitted,
+        do: assert(Tightbeam.SubmissionSize.check_codex([%{type: "text", text: text}]) == :ok)
+
+    assert Enum.sum(
+             Enum.map(submitted, fn [text] -> Tightbeam.SubmissionSize.text_chars(text) end)
+           ) >
+             Tightbeam.SubmissionSize.codex_text_limit()
+
+    frozen = delivery_snapshot(db)
+    {:ok, [[path]]} = DB.query(db, "SELECT file FROM pragma_database_list WHERE name='main'")
+    :ok = GenServer.stop(db)
+    {:ok, reopened} = DB.start_link(path: path, name: nil, guard_inputs: [])
+    Process.put({__MODULE__, :db}, reopened)
+    :ok = Schema.ensure_all(reopened)
+    assert NoticeBatcher.recover(reopened, second.created_at + 6) == []
+    assert delivery_snapshot(reopened) == frozen
+    assert {:ok, []} = DB.query(reopened, "PRAGMA foreign_key_check")
   end
 
   defp scenario(0, db) do
@@ -55,13 +257,13 @@ defmodule Tightbeam.NoticeBatcherFixture do
     assert source_ids(db, carrier_id) == [first.wake_id, second.wake_id]
 
     {:ok, _} = DB.query(db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [carrier_id])
-    scheduler = start_scheduler(db, fn wake -> commit_turn(db, wake) end)
+    scheduler = start_scheduler(db, fn wake -> deliver(db, wake) end)
     assert :ok = Wakes.fire_due(scheduler)
     assert count(db, "turns", "wakeId=?1", [carrier_id]) == 1
   end
 
   defp scenario(1, db) do
-    _open = eligible(db, prompt: "routine")
+    routine = eligible(db, prompt: "routine")
 
     user =
       Wakes.schedule(db, %{
@@ -72,10 +274,19 @@ defmodule Tightbeam.NoticeBatcherFixture do
         class: "fyi"
       })
 
+    assert NoticeBatcher.source_refs(db, routine.wake_id) == []
     assert NoticeBatcher.source_refs(db, user.wake_id) == []
-    scheduler = start_scheduler(db, fn _wake -> true end)
+    assert count(db, "notice_batches") == 0
+    scheduler = start_scheduler(db, fn wake -> deliver(db, wake) end)
     assert :ok = Wakes.fire_due(scheduler)
     assert Wakes.get(db, user.wake_id).state == "fired"
+
+    assert [%{batch_id: user_batch_id, member_state: "included", batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(db, user.wake_id)
+
+    assert user_batch_id == batch_id(db, routine)
+    assert count(db, "turns", "wakeId IN (SELECT deliveryWakeId FROM notice_batches)") == 1
+    assert length(NoticeBatcher.members(db, batch_id(db, routine))) == 2
   end
 
   defp scenario(2, db) do
@@ -88,20 +299,28 @@ defmodule Tightbeam.NoticeBatcherFixture do
 
     agent_fyi = ordinary(db, "fyi", "pre-v2 agent message")
     assert NoticeBatcher.source_refs(db, agent_fyi.wake_id) == []
+    assert NoticeBatcher.source_refs(db, routine.wake_id) == []
+    assert count(db, "notice_batches") == 0
 
-    assert NoticeBatcher.batch(db, batch_id(db, routine)).member_count == 1
+    _carriers = Wakes.materialize_digests(db, agent_fyi.due_at)
+
+    assert NoticeBatcher.batch(db, batch_id(db, routine)).member_count == 5
   end
 
   defp scenario(3, db) do
     routine = eligible(db)
-    before = NoticeBatcher.batch(db, batch_id(db, routine))
     blocker = ordinary(db, "blocker", "stop")
-    after_batch = NoticeBatcher.batch(db, before.batch_id)
 
+    assert NoticeBatcher.source_refs(db, routine.wake_id) == []
     assert NoticeBatcher.source_refs(db, blocker.wake_id) == []
+    assert count(db, "notice_batches") == 0
 
-    assert {after_batch.member_count, after_batch.rendered_bytes, after_batch.due_at} ==
-             {before.member_count, before.rendered_bytes, before.due_at}
+    _carriers = Wakes.materialize_digests(db, blocker.due_at)
+    batch = NoticeBatcher.batch(db, batch_id(db, routine))
+
+    assert batch.member_count == 2
+    assert batch.rendered_bytes > byte_size(routine.prompt)
+    assert batch.due_at == routine.due_at
   end
 
   defp scenario(4, db) do
@@ -126,35 +345,55 @@ defmodule Tightbeam.NoticeBatcherFixture do
     [carrier_id] = Wakes.materialize_digests(db, source.due_at)
     batch = NoticeBatcher.batch(db, batch_id(db, source))
 
-    assert batch.state == "delivery_pending"
-    assert batch.release_cause == "ceiling"
+    assert batch.state == "delivered"
+    assert batch.release_cause == "idle"
     assert batch.delivery_wake_id == carrier_id
     assert count(db, "decision_requests") == 0
   end
 
   defp scenario(6, db) do
+    running_seq = running_turn(db, "agent:recipient")
     source = eligible(db)
     boundary = source.created_at + 5
-    terminal_turn(db, source.session_key, boundary)
+    assert NoticeBatcher.recover(db, source.due_at) == []
+    assert NoticeBatcher.source_refs(db, source.wake_id) == []
+    finish_running_turn(db, running_seq, boundary)
     [carrier_id] = Wakes.materialize_digests(db, boundary + 1)
 
     assert Wakes.get(db, carrier_id).due_at == boundary + 1
     assert NoticeBatcher.batch(db, batch_id(db, source)).release_cause == "turn-boundary"
-    assert boundary + 1 < source.due_at
+    assert source.due_at < boundary
   end
 
   defp scenario(7, db) do
-    first = eligible(db, prompt: "first")
-    terminal_turn(db, first.session_key, first.created_at + 1)
+    # Both orders around the atomic boundary are deliberate, not whichever
+    # Task happens to win: before joins this snapshot; after joins the next.
+    for {suffix, before?} <- [{"before", true}, {"after", false}] do
+      session = "agent:race-" <> suffix
+      seed_session(db, session, "race-owner-" <> suffix)
+      running = running_turn(db, session)
+      first = eligible(db, session: session, prompt: "first")
+      later = if before?, do: eligible(db, session: session, prompt: "later"), else: nil
+      finish_running_turn(db, running, first.created_at + 1)
+      [carrier] = NoticeBatcher.recover(db, first.created_at + 2)
 
-    insert = Task.async(fn -> eligible(db, prompt: "racing") end)
-    seal = Task.async(fn -> Wakes.materialize_digests(db, first.created_at + 2) end)
-    later = Task.await(insert)
-    _ = Task.await(seal)
-    _ = Wakes.materialize_digests(db, later.due_at)
+      if before? do
+        assert_actual_carrier!(db, carrier, [first.wake_id, later.wake_id])
+      else
+        late = eligible(db, session: session, prompt: "later")
+        assert_actual_carrier!(db, carrier, [first.wake_id])
+        frozen = Wakes.get(db, carrier).prompt
+        assert Wakes.get(db, late.wake_id).state == "pending"
+        assert NoticeBatcher.source_refs(db, late.wake_id) == []
+        finish_queued_turns!(db, session)
+        [next] = NoticeBatcher.recover(db, late.due_at)
+        assert_actual_carrier!(db, next, [late.wake_id])
+        assert Wakes.get(db, carrier).prompt == frozen
+      end
 
-    assert count(db, "notice_batch_members", "sourceWakeId=?1", [later.wake_id]) == 1
-    assert length(NoticeBatcher.source_refs(db, later.wake_id)) == 1
+      assert count(db, "notice_batch_members", "sourceWakeId=?1", [first.wake_id]) == 1
+      assert NoticeBatcher.recover(db) == []
+    end
   end
 
   defp scenario(8, db) do
@@ -170,73 +409,33 @@ defmodule Tightbeam.NoticeBatcherFixture do
     assert source_ids(db, carrier_id) == Enum.map(sources, & &1.wake_id)
   end
 
-  defp scenario(9, db) do
-    sources = for n <- 1..51, do: eligible(db, prompt: "notice #{n}")
-    first_batch = batch_id(db, hd(sources))
-    second_batch = batch_id(db, List.last(sources))
-
-    assert first_batch != second_batch
-    assert NoticeBatcher.batch(db, first_batch).member_count == 50
-
-    assert NoticeBatcher.members(db, first_batch) |> Enum.map(& &1.source_wake_id) ==
-             Enum.take(Enum.map(sources, & &1.wake_id), 50)
-
-    assert NoticeBatcher.members(db, second_batch) |> Enum.map(& &1.source_wake_id) ==
-             [List.last(sources).wake_id]
-
-    sealed = NoticeBatcher.batch(db, first_batch)
-    assert sealed.state == "sealed"
-    assert sealed.release_cause == "overflow"
-    assert sealed.delivery_wake_id == nil
-
-    assert {:ok, :noop} =
-             DB.transaction(db, fn txn ->
-               NoticeBatcher.enqueue_or_recover_in_txn(txn, {:arm, first_batch})
-             end)
-
-    assert NoticeBatcher.recover(db, sealed.due_at - 1) == []
-    assert NoticeBatcher.batch(db, first_batch).delivery_wake_id == nil
-
-    carrier_ids = NoticeBatcher.recover(db, sealed.due_at)
-    armed = NoticeBatcher.batch(db, first_batch)
-    assert armed.delivery_wake_id in carrier_ids
-    assert Wakes.get(db, armed.delivery_wake_id).due_at == sealed.due_at
-  end
-
-  defp scenario(10, db) do
-    first = eligible(db, prompt: String.duplicate("a", 1_000))
-    payload = String.duplicate("b", 65_000)
-    candidate = eligible(db, prompt: payload)
-
-    assert batch_id(db, first) != batch_id(db, candidate)
-    assert [%{payload: ^payload}] = NoticeBatcher.members(db, batch_id(db, candidate))
-    sealed = NoticeBatcher.batch(db, batch_id(db, first))
-    assert sealed.state == "sealed"
-    assert sealed.release_cause == "overflow"
-    assert NoticeBatcher.recover(db, sealed.due_at - 1) == []
-    assert NoticeBatcher.batch(db, sealed.batch_id).delivery_wake_id == nil
-  end
-
   defp scenario(11, db) do
-    sources = for n <- 1..51, do: eligible(db, prompt: "boundary notice #{n}")
-    first_batch_id = batch_id(db, hd(sources))
-    sealed = NoticeBatcher.batch(db, first_batch_id)
-    boundary = sealed.opened_at + 1
+    sources = for n <- 1..3, do: eligible(db, prompt: "boundary notice #{n}")
+    boundary = List.last(sources).created_at + 1
+    terminal_turn(db, hd(sources).session_key, boundary)
+    # A later deadline remains outside the ready snapshot, independently of
+    # the ruled ability to split an already eligible snapshot into capped turns.
+    last = List.last(sources)
 
-    assert sealed.release_cause == "overflow"
-    assert boundary < sealed.due_at
-    terminal_turn(db, sealed.session_key, boundary)
+    {:ok, []} =
+      DB.query(db, "UPDATE wakes SET dueAt=?2 WHERE wakeId=?1", [last.wake_id, boundary + 100])
 
-    carrier_ids = NoticeBatcher.recover(db, boundary)
-    armed = NoticeBatcher.batch(db, first_batch_id)
-
-    assert armed.delivery_wake_id in carrier_ids
-    assert Wakes.get(db, armed.delivery_wake_id).due_at == boundary
+    [first_carrier] = NoticeBatcher.recover(db, boundary)
+    assert_actual_carrier!(db, first_carrier, Enum.map(Enum.take(sources, 2), & &1.wake_id))
+    first_batch = NoticeBatcher.batch(db, batch_id(db, hd(sources)))
+    assert first_batch.release_cause == "turn-boundary"
+    assert Wakes.get(db, first_carrier).due_at == boundary
+    assert NoticeBatcher.source_refs(db, last.wake_id) == []
+    assert Wakes.get(db, last.wake_id).state == "pending"
+    finish_queued_turns!(db, "agent:recipient")
+    [last_carrier] = NoticeBatcher.recover(db, boundary + 100)
+    assert_actual_carrier!(db, last_carrier, [last.wake_id])
+    assert first_carrier != last_carrier
+    assert count(db, "notice_batches") == 2
 
     assert Enum.any?(EventLog.lifecycle_events(db), fn event ->
-             event.kind == "wake_digest_materialized" and
-               event.subject == armed.delivery_wake_id and
-               event.detail =~ "trigger=turn-boundary"
+             event.kind == "wake_digest_materialized" and event.subject == first_carrier and
+               event.detail =~ "trigger=session-readiness"
            end)
   end
 
@@ -245,59 +444,68 @@ defmodule Tightbeam.NoticeBatcherFixture do
     ref = NoticeBatcher.policy_ref(source.wake_id)
     first = NoticeBatcher.enqueue_or_recover(db, source.wake_id, ref)
     second = NoticeBatcher.enqueue_or_recover(db, source.wake_id, ref)
-
     assert first == second
+    assert {:deferred, %{code: "recipient_readiness_required"}} = first
+    assert count(db, "notice_batch_members") == 0
+    [carrier] = NoticeBatcher.recover(db, source.due_at)
+    refs = NoticeBatcher.source_refs(db, source.wake_id)
+    assert NoticeBatcher.recover(db, source.due_at) == []
+    assert NoticeBatcher.source_refs(db, source.wake_id) == refs
     assert count(db, "notice_batch_members", "sourceWakeId=?1", [source.wake_id]) == 1
+    assert_actual_carrier!(db, carrier, [source.wake_id])
   end
 
   defp scenario(13, db) do
     source = eligible(db)
-    [carrier_id] = Wakes.materialize_digests(db, source.due_at)
-    {:ok, _} = DB.query(db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [carrier_id])
+    # A storage fault rolls back the whole admission, including carrier and turn.
+    :ok =
+      DB.execute(
+        db,
+        "CREATE TRIGGER transient_notice_failure BEFORE INSERT ON turns BEGIN SELECT RAISE(ABORT, 'transient delivery failure'); END;"
+      )
 
-    failed = start_scheduler(db, fn _ -> raise "transient delivery failure" end)
-    assert :ok = Wakes.fire_due(failed)
-    GenServer.stop(failed)
-    assert NoticeBatcher.batch(db, batch_id(db, source)).retry_count == 1
-
-    succeeded = start_scheduler(db, fn wake -> commit_turn(db, wake) end)
-    assert :ok = Wakes.fire_due(succeeded)
+    assert NoticeBatcher.recover(db, source.due_at) == []
+    assert Wakes.get(db, source.wake_id).state == "pending"
+    assert count(db, "notice_batches") == 0
+    assert count(db, "notice_batch_members") == 0
+    assert count(db, "wakes", "digest=1") == 0
+    assert count(db, "turns") == 0
+    :ok = DB.execute(db, "DROP TRIGGER transient_notice_failure;")
+    [carrier] = NoticeBatcher.recover(db, source.due_at)
+    assert_actual_carrier!(db, carrier, [source.wake_id])
     batch = NoticeBatcher.batch(db, batch_id(db, source))
-    assert batch.delivery_wake_id == carrier_id
     assert batch.state == "delivered"
-    assert count(db, "turns", "wakeId=?1", [carrier_id]) == 1
+    assert batch.retry_count == 0
+    assert NoticeBatcher.recover(db, source.due_at) == []
+    assert count(db, "turns", "wakeId=?1", [carrier]) == 1
 
+    seed_session(db, "agent:unresolved", "unresolved-owner")
     unresolved = eligible(db, session: "agent:unresolved")
-    [unresolved_carrier] = Wakes.materialize_digests(db, unresolved.due_at)
-    {:ok, _} = DB.query(db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [unresolved_carrier])
+    {old_batch, old_carrier} = historical_transport!(db, unresolved)
 
-    terminal =
-      start_scheduler(db, fn wake ->
-        Gateway.deliver_prompt(wake.session_key, wake.origin, wake.prompt,
-          db: db,
-          wake_id: wake.wake_id,
-          sender: wake.origin,
-          target_gate: if(wake.target_gate == 0, do: nil, else: wake),
-          fire_wake_in_txn: true
-        )
-      end)
+    {:ok, []} =
+      DB.query(db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [
+        unresolved.session_key
+      ])
 
-    assert :ok = Wakes.fire_due(terminal)
-    failed_batch = NoticeBatcher.batch(db, batch_id(db, unresolved))
-    assert failed_batch.state == "delivery_failed"
-    assert failed_batch.terminal_cause == ":skipped"
-    assert failed_batch.terminal_principal == "process:tightbeam:wake-scheduler"
-    assert failed_batch.retry_count == 0
-    assert Wakes.get(db, unresolved_carrier).state == "fired"
-
-    assert :ok = Wakes.fire_due(terminal)
-    assert NoticeBatcher.batch(db, failed_batch.batch_id).retry_count == 0
+    assert NoticeBatcher.recover(db, unresolved.due_at) == []
+    failed = NoticeBatcher.batch(db, old_batch)
+    assert failed.state == "delivery_failed"
+    assert failed.terminal_cause == "recipient-readiness-regroup"
+    assert failed.terminal_principal == "process:tightbeam:wake-scheduler"
+    assert failed.retry_count == 0
+    assert Wakes.get(db, old_carrier).state == "fired"
+    assert deliver(db, Wakes.get(db, unresolved.wake_id)) == :skipped
+    assert Wakes.get(db, unresolved.wake_id).state == "pending"
+    assert count(db, "turns", "sessionKey=?1", [unresolved.session_key]) == 0
+    assert NoticeBatcher.recover(db, unresolved.due_at) == []
+    assert NoticeBatcher.batch(db, old_batch) == failed
   end
 
   defp scenario(14, db) do
     source = eligible(db)
     [carrier_id] = Wakes.materialize_digests(db, source.due_at)
-    commit_turn(db, Wakes.get(db, carrier_id))
+    assert_actual_carrier!(db, carrier_id, [source.wake_id])
 
     assert NoticeBatcher.recover(db, source.due_at + 1) == []
     assert NoticeBatcher.batch(db, batch_id(db, source)).state == "delivered"
@@ -311,7 +519,11 @@ defmodule Tightbeam.NoticeBatcherFixture do
     before = Wakes.get(db, carrier_id).prompt
     later = eligible(db, prompt: "later")
 
+    assert NoticeBatcher.source_refs(db, later.wake_id) == []
     assert Wakes.get(db, carrier_id).prompt == before
+
+    finish_queued_turns!(db, source.session_key)
+    _carriers = Wakes.materialize_digests(db, later.due_at)
     assert batch_id(db, later) != batch_id(db, source)
 
     assert NoticeBatcher.members(db, batch_id(db, later)) |> Enum.map(& &1.source_wake_id) ==
@@ -319,28 +531,54 @@ defmodule Tightbeam.NoticeBatcherFixture do
   end
 
   defp scenario(16, db) do
-    early = eligible(db, session: "agent:cancel-before", prompt: "exclude")
-    early_batch = batch_id(db, early)
+    seed_session(db, "agent:cancel-before", "cancel-before-owner")
+    seed_session(db, "agent:cancel-after", "cancel-after-owner")
 
-    assert {:ok, :ok} =
+    early =
+      eligible(db,
+        session: "agent:cancel-before",
+        origin: "agent:sender",
+        prompt: "exclude"
+      )
+
+    assert {:ok, {:accepted_in_txn, _event_id, %{canceled: true}}} =
              DB.transaction(db, fn txn ->
-               NoticeBatcher.enqueue_or_recover_in_txn(txn, {:cancel, early.wake_id, "cancel:1"})
+               Wakes.cancel_in_txn(txn, requester_withdrawal(early))
              end)
 
-    assert NoticeBatcher.batch(db, early_batch).state == "canceled"
+    assert Wakes.get(db, early.wake_id).state == "canceled"
 
-    assert [%{state: "canceled", cancellation_ref: "cancel:1"}] =
-             NoticeBatcher.members(db, early_batch)
+    assert {:ok, [["requester_withdrew", "no_replacement"]]} =
+             DB.query(
+               db,
+               "SELECT reasonKind, outcomeKind FROM wake_cancellations WHERE wakeId=?1",
+               [early.wake_id]
+             )
 
-    sealed = eligible(db, session: "agent:cancel-after", prompt: "immutable")
+    assert NoticeBatcher.source_refs(db, early.wake_id) == []
+    assert count(db, "notice_batches") == 0
+
+    sealed =
+      eligible(db,
+        session: "agent:cancel-after",
+        origin: "agent:sender",
+        prompt: "immutable"
+      )
+
     [carrier_id] = Wakes.materialize_digests(db, sealed.due_at)
     envelope = Wakes.get(db, carrier_id).prompt
 
-    assert {:ok, :ok} =
+    before = Wakes.get(db, sealed.wake_id)
+    assert before.state == "fired"
+
+    assert {:ok, false} =
              DB.transaction(db, fn txn ->
-               NoticeBatcher.enqueue_or_recover_in_txn(txn, {:cancel, sealed.wake_id, "cancel:2"})
+               Wakes.cancel_in_txn(txn, requester_withdrawal(sealed))
              end)
 
+    assert Wakes.get(db, sealed.wake_id) == before
+    assert count(db, "wake_cancellations", "wakeId=?1", [sealed.wake_id]) == 0
+    assert_actual_carrier!(db, carrier_id, [sealed.wake_id])
     assert Wakes.get(db, carrier_id).prompt == envelope
     assert [%{state: "included"}] = NoticeBatcher.members(db, batch_id(db, sealed))
   end
@@ -348,35 +586,61 @@ defmodule Tightbeam.NoticeBatcherFixture do
   defp scenario(17, db) do
     seed_session(db, "agent:scope-a", "owner-a")
     seed_session(db, "agent:scope-b", "owner-b")
+    Roles.create!(db, "shared", "owner-a", "agent:scope-a")
 
     first =
-      manual_member(db, "role:shared:scope-a", target_role: "shared", session: "agent:scope-a")
+      manual_member(db, "role:shared:scope-a",
+        target_role: "shared",
+        session: "agent:scope-a",
+        due_at: 0
+      )
 
     second =
-      manual_member(db, "role:shared:scope-b", target_role: "shared", session: "agent:scope-b")
+      manual_member(db, "role:shared:scope-b",
+        target_role: "shared",
+        session: "agent:scope-b",
+        due_at: 0
+      )
 
-    assert first.batch_id != second.batch_id
-    assert NoticeBatcher.read_batch(db, first.batch_id, {:user, "owner-a"}).member_count == 1
-    assert NoticeBatcher.read_batch(db, second.batch_id, {:user, "owner-a"}) == nil
+    [carrier] = NoticeBatcher.recover(db, second.due_at)
+    batch = batch_id(db, first)
+    assert batch_id(db, second) == batch
+    assert_actual_carrier!(db, carrier, [first.wake_id, second.wake_id])
+    # A concrete-session carrier cannot disclose a subset of mixed-owner sources.
+    assert NoticeBatcher.read_batch(db, batch, {:user, "owner-a"}) == nil
+    assert NoticeBatcher.read_batch(db, batch, {:user, "owner-b"}) == nil
+
+    assert {:ok,
+            [["agent:scope-a", "role:shared:scope-a"], ["agent:scope-b", "role:shared:scope-b"]]} =
+             DB.query(
+               db,
+               "SELECT sessionKey,sourceVisibilityScope FROM wakes WHERE wakeId IN (?1,?2) ORDER BY rowid",
+               [first.wake_id, second.wake_id]
+             )
+
+    assert count(db, "turns", "sessionKey='agent:scope-a'") == 1
+    assert count(db, "turns", "sessionKey='agent:scope-b'") == 0
   end
 
   defp scenario(18, db) do
     seed_session(db, "agent:desk", "owner")
     Roles.create!(db, "exec-desk", "owner", "agent:desk")
     source = eligible(db, target_role: "exec-desk", session: "agent:desk")
-    [carrier_id] = Wakes.materialize_digests(db, source.due_at)
-    {:ok, _} = DB.query(db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [carrier_id])
-    parent = self()
+    [carrier] = Wakes.materialize_digests(db, source.due_at)
+    assert_actual_carrier!(db, carrier, [source.wake_id])
+    assert Wakes.get(db, carrier).session_key == "agent:desk"
+    assert Wakes.get(db, source.wake_id).target_role == "exec-desk"
 
-    scheduler =
-      start_scheduler(db, fn wake ->
-        send(parent, {:desk_inbound, wake.target_role, wake.prompt})
-        true
-      end)
+    assert {:ok, [["agent:desk", prompt]]} =
+             DB.query(db, "SELECT sessionKey,prompt FROM turns WHERE wakeId=?1", [carrier])
 
-    assert :ok = Wakes.fire_due(scheduler)
-    assert_receive {:desk_inbound, "exec-desk", envelope}
-    assert envelope =~ source.wake_id
+    assert prompt =~ source.wake_id
+
+    assert {:ok, []} =
+             DB.query(
+               db,
+               "SELECT name FROM sqlite_schema WHERE type='table' AND name LIKE 'exec_desk%'"
+             )
   end
 
   defp scenario(19, db) do
@@ -396,59 +660,23 @@ defmodule Tightbeam.NoticeBatcherFixture do
 
   defp scenario(20, db) do
     lane = [session: "agent:rollback"]
-    unselected = fyi(db, lane)
-    assert unselected.delivery_rule == "turn-boundary-digest r1"
-    assert NoticeBatcher.source_refs(db, unselected.wake_id) == []
-
-    selected = set_lane_policy(db, lane, true)
-
-    assert selected.enabled
-    assert selected.policy_revision == NoticeBatcher.policy_revision()
-    assert selected.selected_by == "agent:test-policy"
-    assert selected.cause == "acceptance-fixture"
-    assert selected.policy_ref =~ "notice-batching-test-policy:"
-
-    assert AdminProjection.version(
-             db,
-             "notice batching lane policies",
-             [selected.recipient_address, selected.visibility_scope]
-           ) == 1
-
-    assert {:ok,
-            [[1, revision, policy_ref, "agent:test-policy", "acceptance-fixture", selected_at]]} =
-             DB.query(
-               db,
-               """
-               SELECT enabled, policyRevision, policyRef, selectedBy, cause, selectedAt
-               FROM notice_batching_lane_policies
-               WHERE recipientAddress=?1 AND visibilityScope=?2
-               """,
-               [selected.recipient_address, selected.visibility_scope]
-             )
-
-    assert revision == NoticeBatcher.policy_revision()
-    assert policy_ref == selected.policy_ref
-    assert selected_at == selected.selected_at
-
-    active = fyi(db, lane)
-    assert active.delivery_rule == NoticeBatcher.rule()
-    assert [%{batch_id: _}] = NoticeBatcher.source_refs(db, active.wake_id)
-    _carrier_ids = Wakes.materialize_digests(db, active.due_at)
-    carrier_id = NoticeBatcher.batch(db, batch_id(db, active)).delivery_wake_id
-
-    disabled_policy = set_lane_policy(db, lane, false)
-    assert disabled_policy.row_version == 2
-    disabled = fyi(db, Keyword.put(lane, :prompt, "after rollback"))
-
-    assert disabled.delivery_rule == "turn-boundary-digest r1"
-    assert NoticeBatcher.source_refs(db, disabled.wake_id) == []
-    NoticeBatcher.delivery_delivered(db, carrier_id)
-    assert NoticeBatcher.batch(db, batch_id(db, active)).state == "delivered"
-    assert count(db, "notice_batch_members", "sourceWakeId=?1", [unselected.wake_id]) == 0
-    assert count(db, "notice_batch_members", "sourceWakeId=?1", [disabled.wake_id]) == 0
+    seed_session(db, "agent:rollback", "rollback-owner")
+    legacy_disabled = set_lane_policy(db, lane, false)
+    refute legacy_disabled.enabled
+    assert legacy_disabled.effective_enabled
+    source = fyi(db, lane)
+    assert source.delivery_rule == NoticeBatcher.rule()
+    assert NoticeBatcher.source_refs(db, source.wake_id) == []
+    assert_retired_tables_absent!(db)
+    [carrier] = Wakes.materialize_digests(db, source.due_at)
+    assert_actual_carrier!(db, carrier, [source.wake_id])
+    assert NoticeBatcher.batch(db, batch_id(db, source)).member_count == 1
+    assert_retired_tables_absent!(db)
   end
 
   defp scenario(21, db) do
+    seed_session(db, "agent:legacy-recipient", "legacy-owner")
+
     source =
       Wakes.schedule(db, %{
         session_key: "agent:legacy-recipient",
@@ -459,99 +687,153 @@ defmodule Tightbeam.NoticeBatcherFixture do
         class: "fyi"
       })
 
-    assert source.delivery_rule == "turn-boundary-digest r1"
+    assert source.delivery_rule == NoticeBatcher.rule()
     assert NoticeBatcher.source_refs(db, source.wake_id) == []
     assert Wakes.self_pending_count(db, source.session_key) == 0
 
     [carrier_id] = Wakes.materialize_digests(db, source.due_at)
     carrier = Wakes.get(db, carrier_id)
 
-    assert carrier.delivery_rule == "turn-boundary-digest r1"
-    assert carrier.prompt =~ "coalesced by turn-boundary-digest r1"
-    refute carrier.prompt =~ "coalesced by notice-batching-v1 r1"
+    assert carrier.delivery_rule == NoticeBatcher.rule()
+    assert carrier.prompt =~ "coalesced by notice-batching-v1 r2"
 
     assert Enum.any?(EventLog.lifecycle_events(db), fn event ->
              event.kind == "wake_digest_materialized" and event.subject == carrier_id and
-               event.detail =~ "rule=turn-boundary-digest r1"
+               event.detail =~ "rule=notice-batching-v1 r2"
            end)
   end
 
   defp scenario(22, db) do
     first = manual_member(db, "deadline-scope", due_at: 9_000)
     second = manual_member(db, "deadline-scope", due_at: 4_000)
-    batch = NoticeBatcher.batch(db, first.batch_id)
-
-    assert second.batch_id == first.batch_id
-    assert batch.due_at == 4_000
-    [carrier_id] = NoticeBatcher.recover(db, 4_000)
-    assert Wakes.get(db, carrier_id).due_at == 4_000
+    assert NoticeBatcher.recover(db, 3_999) == []
+    [carrier] = NoticeBatcher.recover(db, 4_000)
+    assert_actual_carrier!(db, carrier, [second.wake_id])
+    assert NoticeBatcher.batch(db, batch_id(db, second)).due_at == 4_000
+    assert Wakes.get(db, carrier).due_at == 4_000
+    assert Wakes.get(db, first.wake_id).state == "pending"
+    assert NoticeBatcher.source_refs(db, first.wake_id) == []
+    finish_queued_turns!(db, "agent:recipient")
+    [later_carrier] = NoticeBatcher.recover(db, 9_000)
+    assert_actual_carrier!(db, later_carrier, [first.wake_id])
+    assert later_carrier != carrier
   end
 
   defp scenario(23, db) do
     lane = [session: "agent:payload-floor"]
-    set_lane_policy(db, lane, true)
+    seed_session(db, "agent:payload-floor", "payload-floor-owner")
+    codex_recipient!(db, "agent:payload-floor")
+    set_lane_policy(db, lane, false)
 
     source =
       fyi(
         db,
         Keyword.merge(lane,
           wake_id: "w_payload_floor",
-          prompt: String.duplicate("x", 65_536)
+          prompt: String.duplicate("🙂", 1_048_576)
         )
       )
 
-    assert byte_size(source.prompt) == 65_536
-    assert source.delivery_rule == "turn-boundary-digest r1"
-    assert Wakes.get(db, source.wake_id).state == "pending"
+    # Raw text reaches the scalar limit; every real wrapper is additional.
+    assert scalar_count(source.prompt) == 1_048_576
+    assert byte_size(source.prompt) == 4 * 1_048_576
+    assert source.delivery_rule == NoticeBatcher.rule()
+    assert_retired_tables_absent!(db)
+    assert_capacity_hold!(db, [source], source.due_at)
+    later = fyi(db, Keyword.put(lane, :prompt, "fits after withdrawal"))
+    assert_capacity_hold!(db, [source, later], later.due_at)
+    assert Wakes.get(db, source.wake_id).prompt == source.prompt
+    assert Wakes.get(db, source.wake_id).delivery_rule == NoticeBatcher.rule()
+    withdraw!(db, source)
+    [carrier] = Wakes.materialize_digests(db, later.due_at)
+    assert_actual_carrier!(db, carrier, [later.wake_id])
+    assert Wakes.get(db, source.wake_id).state == "canceled"
     assert NoticeBatcher.source_refs(db, source.wake_id) == []
-
-    assert {:ok, [[0]]} =
-             DB.query(
-               db,
-               "SELECT enabled FROM notice_delivery_policies WHERE sourceWakeId=?1",
-               [source.wake_id]
-             )
-
-    assert {:ok, [[1]]} =
-             DB.query(
-               db,
-               "SELECT enabled FROM notice_batching_lane_policies WHERE recipientAddress=?1",
-               ["session:agent:payload-floor"]
-             )
-
-    later = fyi(db, Keyword.put(lane, :prompt, "fits after fallback"))
-    assert later.delivery_rule == NoticeBatcher.rule()
-    assert [%{member_state: "active"}] = NoticeBatcher.source_refs(db, later.wake_id)
+    assert count(db, "notice_batch_members") == 1
+    assert count(db, "notice_batches") == 1
+    assert_retired_tables_absent!(db)
   end
 
   defp scenario(24, db) do
+    probe_id = "w_rendered_boundary_probe"
     fitting_id = "w_rendered_boundary_fit"
     overflow_id = "w_rendered_boundary_over"
-    fitting_header = rendered_member_header(fitting_id)
-    overflow_header = rendered_member_header(overflow_id)
+
+    for {session, owner} <- [
+          {"agent:rendered-probe", "rendered-probe-owner"},
+          {"agent:rendered-fit", "rendered-fit-owner"},
+          {"agent:rendered-over", "rendered-over-owner"}
+        ] do
+      seed_session(db, session, owner)
+      codex_recipient!(db, session)
+    end
+
+    # Measure the complete real turn prompt, including Gateway's sender stamp
+    # and the immutable carrier envelope. Each fresh recipient starts at seq 1;
+    # only the source identifier width differs, not UUID/hash/token widths.
+    probe =
+      eligible(db,
+        session: "agent:rendered-probe",
+        wake_id: probe_id,
+        prompt: "nonempty wrapper measurement"
+      )
+
+    [probe_carrier] = Wakes.materialize_digests(db, probe.due_at)
+    assert_actual_carrier!(db, probe_carrier, [probe.wake_id])
+    probe_prompt = codex_submission!(db, probe_carrier)
+    assert probe_prompt =~ rendered_member_header(probe_id) <> probe.prompt
+    wrapper_chars = scalar_count(probe_prompt) - scalar_count(probe.prompt)
+    fitting_overhead = wrapper_chars - scalar_count(probe_id) + scalar_count(fitting_id)
+    overflow_overhead = wrapper_chars - scalar_count(probe_id) + scalar_count(overflow_id)
 
     fitting =
       eligible(db,
         session: "agent:rendered-fit",
         wake_id: fitting_id,
-        prompt: String.duplicate("a", 65_536 - byte_size(fitting_header))
+        prompt: String.duplicate("🙂", 1_048_576 - fitting_overhead)
       )
 
-    assert [%{member_state: "active", batch_id: fitting_batch_id}] =
-             NoticeBatcher.source_refs(db, fitting.wake_id)
+    assert NoticeBatcher.source_refs(db, fitting.wake_id) == []
+    [fitting_carrier] = Wakes.materialize_digests(db, fitting.due_at)
+    fitting_batch_id = batch_id(db, fitting)
 
-    assert [%{rendered_bytes: 65_536}] = NoticeBatcher.members(db, fitting_batch_id)
+    assert [%{rendered_bytes: rendered_bytes, payload: fitting_payload}] =
+             NoticeBatcher.members(db, fitting_batch_id)
+
+    assert fitting_payload == fitting.prompt
+    assert rendered_bytes == byte_size(rendered_member_header(fitting_id) <> fitting.prompt)
+    assert rendered_bytes > 65_536
+    assert NoticeBatcher.batch(db, fitting_batch_id).delivery_wake_id == fitting_carrier
+    submitted = codex_submission!(db, fitting_carrier)
+    assert scalar_count(submitted) == 1_048_576
+    assert byte_size(submitted) > 1_048_576
+    assert submitted =~ rendered_member_header(fitting_id) <> fitting.prompt
+    assert Wakes.get(db, fitting.wake_id).prompt == fitting.prompt
 
     overflow =
       eligible(db,
         session: "agent:rendered-over",
         wake_id: overflow_id,
-        prompt: String.duplicate("b", 65_537 - byte_size(overflow_header))
+        prompt: String.duplicate("🙂", 1_048_577 - overflow_overhead)
       )
 
-    assert overflow.delivery_rule == "turn-boundary-digest r1"
+    assert scalar_count(overflow.prompt) + overflow_overhead == 1_048_577
+    assert overflow.delivery_rule == NoticeBatcher.rule()
     assert Wakes.get(db, overflow.wake_id).state == "pending"
     assert NoticeBatcher.source_refs(db, overflow.wake_id) == []
+    assert_capacity_hold!(db, [overflow], overflow.due_at)
+    assert Wakes.get(db, overflow.wake_id).delivery_rule == NoticeBatcher.rule()
+    assert Wakes.get(db, overflow.wake_id).prompt == overflow.prompt
+
+    assert Enum.any?(EventLog.lifecycle_events(db), fn event ->
+             event.kind == "notice_source_submission_too_large" and
+               event.subject == overflow.wake_id and event.detail =~ "textChars=1048577 "
+           end)
+
+    assert_actual_carrier!(db, fitting_carrier, [fitting.wake_id])
+    assert count(db, "notice_batches") == 2
+    assert count(db, "notice_batch_members") == 2
+    assert count(db, "turns") == 2
   end
 
   defp scenario(25, db) do
@@ -570,9 +852,6 @@ defmodule Tightbeam.NoticeBatcherFixture do
     Roles.create!(db, "sender", "owner", "agent:sender-session")
     owner_session = Org.personal_session_key("owner")
     Roles.create!(db, "recipient", "owner", owner_session)
-    set_lane_policy(db, [session: owner_session, target_user_id: "owner"], true)
-    set_lane_policy(db, [session: owner_session], true)
-    set_lane_policy(db, [session: owner_session, target_role: "recipient"], true)
 
     sender = Org.get(db, "agent:sender-session")
     scheduler = start_scheduler(db, fn _wake -> true end)
@@ -585,76 +864,1111 @@ defmodule Tightbeam.NoticeBatcherFixture do
         session_status: fn _ -> nil end
       )
 
+    owner_busy = running_turn(db, owner_session)
+    other_session = Org.personal_session_key("other")
+    other_busy = running_turn(db, other_session)
     user = public_information(router, sender, "userId", "owner")
     session = public_information(router, sender, "sessionKey", owner_session)
     role = public_information(router, sender, "role", "recipient")
+    other = public_information(router, sender, "userId", "other")
 
-    assert Enum.map([user, session, role], &Wakes.get(db, &1).session_key) ==
-             [owner_session, owner_session, owner_session]
+    assert Enum.map([user, session, role], &Wakes.get(db, &1).session_key) == [
+             owner_session,
+             owner_session,
+             owner_session
+           ]
 
-    for wake_id <- [user, session, role] do
+    for wake_id <- [user, session, role, other] do
       source = Wakes.get(db, wake_id)
       assert source.class == "information"
       assert source.class_election == "sender"
       assert source.creator_session_key == sender.session_key
       assert source.origin == "agent:sender"
-      assert [%{batch_id: _}] = NoticeBatcher.source_refs(db, wake_id)
+      assert NoticeBatcher.source_refs(db, wake_id) == []
     end
 
     addresses =
       for wake_id <- [user, session, role] do
-        {:ok, [[address, 1]]} =
-          DB.query(
-            db,
-            "SELECT recipientAddress, enabled FROM notice_delivery_policies WHERE sourceWakeId=?1",
-            [wake_id]
-          )
+        {:ok, [[address]]} =
+          DB.query(db, "SELECT sourceAddress FROM wakes WHERE wakeId=?1", [wake_id])
 
         address
       end
 
     assert addresses == ["user:owner", "session:" <> owner_session, "role:recipient"]
+    assert_retired_tables_absent!(db)
+    assert count(db, "notice_batches") == 0
+    at = Enum.max(Enum.map([user, session, role, other], &Wakes.get(db, &1).due_at))
+    finish_running_turn(db, owner_busy, at)
+    finish_running_turn(db, other_busy, at)
+    carriers = NoticeBatcher.recover(db, at)
+    assert length(carriers) == 2
     batch_ids = Enum.map([user, session, role], &batch_id(db, Wakes.get(db, &1)))
-    assert length(Enum.uniq(batch_ids)) == 3
+    assert length(Enum.uniq(batch_ids)) == 1
+    owner_batch = hd(batch_ids)
 
-    for {wake_id, batch_id} <- Enum.zip([user, session, role], batch_ids) do
-      assert [%{source_wake_id: ^wake_id, class: "information"}] =
-               NoticeBatcher.members(db, batch_id)
+    assert Enum.map(NoticeBatcher.members(db, owner_batch), & &1.source_wake_id) == [
+             user,
+             session,
+             role
+           ]
 
-      assert NoticeBatcher.read_batch(db, batch_id, {:user, "other"}) == nil
-    end
-
-    # The same public --user path is default-off for another intended recipient.
-    off = public_information(router, sender, "userId", "other")
-    assert NoticeBatcher.source_refs(db, off) == []
-
-    set_lane_policy(
-      db,
-      [session: Org.personal_session_key("other"), target_user_id: "other"],
-      true
-    )
-
-    other = public_information(router, sender, "userId", "other")
+    assert Enum.all?(NoticeBatcher.members(db, owner_batch), &(&1.class == "information"))
+    assert NoticeBatcher.read_batch(db, owner_batch, {:user, "owner"}).member_count == 3
+    assert NoticeBatcher.read_batch(db, owner_batch, {:user, "other"}) == nil
     other_batch = batch_id(db, Wakes.get(db, other))
     refute other_batch in batch_ids
-    assert [%{source_wake_id: ^other}] = NoticeBatcher.members(db, other_batch)
+
+    assert [%{source_wake_id: ^other, class: "information"}] =
+             NoticeBatcher.members(db, other_batch)
+
     assert NoticeBatcher.read_batch(db, other_batch, {:user, "owner"}) == nil
     assert NoticeBatcher.read_batch(db, other_batch, {:user, "other"}).member_count == 1
-
-    deadlines = Enum.map([user, session, role, other], &Wakes.get(db, &1).due_at)
-    _carriers = Wakes.materialize_digests(db, Enum.max(deadlines))
-    user_carrier_id = NoticeBatcher.batch(db, hd(batch_ids)).delivery_wake_id
-    user_carrier = Wakes.get(db, user_carrier_id)
-    assert user_carrier.session_key == owner_session
-    assert user_carrier.prompt =~ "class=information"
-    assert user_carrier.prompt =~ user
-    refute user_carrier.prompt =~ session
-    refute user_carrier.prompt =~ role
-    refute user_carrier.prompt =~ other
-
-    {:ok, _} = DB.query(db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [user_carrier_id])
+    owner_carrier = NoticeBatcher.batch(db, owner_batch).delivery_wake_id
+    assert_actual_carrier!(db, owner_carrier, [user, session, role])
+    assert Wakes.get(db, owner_carrier).session_key == owner_session
+    assert Wakes.get(db, owner_carrier).prompt =~ "class=information"
+    refute Wakes.get(db, owner_carrier).prompt =~ other
+    other_carrier = NoticeBatcher.batch(db, other_batch).delivery_wake_id
+    assert_actual_carrier!(db, other_carrier, [other])
     assert :ok = Wakes.fire_due(scheduler)
-    assert Wakes.get(db, user_carrier_id).state == "fired"
+    assert count(db, "turns", "wakeId IN (SELECT deliveryWakeId FROM notice_batches)") == 2
+  end
+
+  defp scenario(27, db) do
+    user =
+      Wakes.schedule(db, %{
+        session_key: "agent:recipient",
+        origin: "user:mike",
+        prompt: "human note",
+        due_at: 0,
+        class: "fyi"
+      })
+
+    dispatch = ordinary(db, "information", "dispatch note")
+    query = ordinary(db, "status-query", "status query")
+    decision = ordinary(db, "input-needed", "decision needed")
+    blocker = ordinary(db, "blocker", "blocked")
+    alarm = ordinary(db, "algedonic", "alarm")
+
+    unclassed =
+      Wakes.schedule(db, %{
+        session_key: "agent:recipient",
+        origin: "agent:sender",
+        creator_session_key: "agent:sender",
+        prompt: "unclassified prompt",
+        due_at: 0
+      })
+
+    sources = [user, dispatch, query, decision, blocker, alarm, unclassed]
+    assert Enum.all?(sources, &(NoticeBatcher.source_refs(db, &1.wake_id) == []))
+    assert count(db, "notice_batches") == 0
+
+    [carrier_id] = Wakes.materialize_digests(db, user.due_at)
+    batch_ids = Enum.map(sources, &batch_id(db, &1))
+    assert length(Enum.uniq(batch_ids)) == 1
+    assert_retired_tables_absent!(db)
+
+    batch_key = hd(batch_ids)
+    assert NoticeBatcher.batch(db, batch_key).state == "delivered"
+    assert is_binary(NoticeBatcher.batch(db, batch_key).envelope)
+
+    assert Enum.map(NoticeBatcher.members(db, batch_key), & &1.class) ==
+             ["algedonic", "blocker", "input-needed", "status-query", "fyi", "information", "fyi"]
+
+    assert Enum.all?(NoticeBatcher.members(db, batch_key), &(&1.state == "included"))
+
+    assert Wakes.get(db, unclassed.wake_id).class == "fyi"
+    assert Wakes.get(db, unclassed.wake_id).class_election == "classifier"
+
+    carrier = Wakes.get(db, carrier_id)
+
+    assert carrier.prompt =~ "source=#{alarm.wake_id}"
+    assert carrier.prompt =~ "class=algedonic"
+    assert carrier.prompt =~ "source=#{user.wake_id}"
+    assert carrier.prompt =~ "sender=user:mike"
+    assert carrier.prompt =~ "class=information"
+
+    assert source_ids(db, carrier_id) == [
+             alarm.wake_id,
+             blocker.wake_id,
+             decision.wake_id,
+             query.wake_id,
+             user.wake_id,
+             dispatch.wake_id,
+             unclassed.wake_id
+           ]
+  end
+
+  defp scenario(28, db) do
+    running_seq = running_turn(db, "agent:recipient")
+    first = ordinary(db, "blocker", "withdraw while recipient is busy")
+    second = ordinary(db, "fyi", "keep for the next turn")
+
+    assert NoticeBatcher.source_refs(db, first.wake_id) == []
+    assert NoticeBatcher.source_refs(db, second.wake_id) == []
+    assert count(db, "notice_batches") == 0
+    assert NoticeBatcher.recover(db, System.system_time(:millisecond)) == []
+
+    assert {:ok, {:accepted_in_txn, _event_id, %{canceled: true}}} =
+             DB.transaction(db, fn txn ->
+               Wakes.cancel_in_txn(txn, requester_withdrawal(first))
+             end)
+
+    boundary = System.system_time(:millisecond) + 10
+    finish_running_turn(db, running_seq, boundary)
+
+    [carrier_id] = NoticeBatcher.recover(db, boundary + 1)
+    batch_key = batch_id(db, second)
+    batch = NoticeBatcher.batch(db, batch_key)
+
+    assert batch.state == "delivered"
+    assert batch.release_cause == "turn-boundary"
+    assert NoticeBatcher.members(db, batch_key) |> Enum.map(& &1.state) == ["included"]
+    assert Wakes.get(db, carrier_id).prompt =~ second.wake_id
+    refute Wakes.get(db, carrier_id).prompt =~ first.wake_id
+    assert source_ids(db, carrier_id) == [second.wake_id]
+  end
+
+  defp scenario(29, db) do
+    source = eligible(db, prompt: "cold-restart source")
+    {old_batch, old_carrier} = historical_transport!(db, source)
+    old_envelope = Wakes.get(db, old_carrier).prompt
+    base = Application.fetch_env!(:tightbeam, :base_dir)
+    marker = File.read!(Path.join(base, "build-owner.json"))
+    :ok = GenServer.stop(db)
+
+    {:ok, reopened} =
+      DB.start_link(path: Path.join(base, "state.db"), name: nil, guard_inputs: [])
+
+    Process.put({__MODULE__, :db}, reopened)
+    :ok = Schema.ensure_all(reopened)
+    :ok = DB.assert_base_admitted!(reopened, base)
+    [carrier] = NoticeBatcher.recover(reopened, source.due_at)
+    assert carrier != old_carrier
+    assert_actual_carrier_history!(reopened, carrier, source.wake_id)
+    assert NoticeBatcher.batch(reopened, old_batch).state == "delivery_failed"
+    assert Wakes.get(reopened, old_carrier).prompt == old_envelope
+    assert count(reopened, "turns", "wakeId=?1", [old_carrier]) == 0
+    assert NoticeBatcher.recover(reopened, source.due_at) == []
+    assert count(reopened, "turns", "wakeId=?1", [carrier]) == 1
+    assert File.read!(Path.join(base, "build-owner.json")) == marker
+    assert {:ok, []} = DB.query(reopened, "PRAGMA foreign_key_check")
+  end
+
+  defp scenario(30, db) do
+    codex_recipient!(db, "agent:recipient")
+
+    sources =
+      for n <- 1..3 do
+        payload =
+          case n do
+            1 -> String.duplicate("🙂", 550_000)
+            2 -> String.duplicate("e\u0301", 275_000)
+            _ -> "atomic size-bounded notice #{n}"
+          end
+
+        eligible(db, prompt: payload)
+      end
+
+    # These two large Unicode sources require two ordered fitting bundles;
+    # the boundary is source 2 because of text size, never a member-count cap.
+    :ok =
+      DB.execute(db, """
+      CREATE TRIGGER second_capped_turn_failure BEFORE INSERT ON turns
+      WHEN (SELECT COUNT(*) FROM notice_batches)=2
+      BEGIN SELECT RAISE(ABORT, 'second capped turn failed'); END;
+      """)
+
+    assert NoticeBatcher.recover(db, hd(sources).due_at) == []
+    assert count(db, "turns") == 0
+    assert count(db, "notice_batches") == 0
+    assert count(db, "notice_batch_members") == 0
+    assert count(db, "wakes", "digest=1") == 0
+
+    for source <- sources do
+      assert Wakes.get(db, source.wake_id).state == "pending"
+      assert Wakes.get(db, source.wake_id).prompt == source.prompt
+      assert NoticeBatcher.source_refs(db, source.wake_id) == []
+    end
+
+    :ok = DB.execute(db, "DROP TRIGGER second_capped_turn_failure")
+    [first, second] = NoticeBatcher.recover(db, hd(sources).due_at)
+    ids = Enum.map(sources, & &1.wake_id)
+    assert_actual_carrier!(db, first, Enum.take(ids, 1))
+    assert_actual_carrier!(db, second, Enum.drop(ids, 1))
+    assert source_ids(db, first) ++ source_ids(db, second) == ids
+    first_prompt = codex_submission!(db, first)
+    second_prompt = codex_submission!(db, second)
+    assert scalar_count(first_prompt) + scalar_count(Enum.at(sources, 1).prompt) > 1_048_576
+    assert scalar_count(first_prompt) + scalar_count(second_prompt) > 1_048_576
+    assert count(db, "notice_batch_members") == 3
+    assert count(db, "notice_batches") == 2
+    assert count(db, "turns") == 2
+    for source <- sources, do: assert(Wakes.get(db, source.wake_id).prompt == source.prompt)
+    committed = delivery_snapshot(db)
+    assert NoticeBatcher.recover(db, hd(sources).due_at) == []
+    assert delivery_snapshot(db) == committed
+  end
+
+  defp scenario(31, db) do
+    first = eligible(db, prompt: "raw first \"source\"", class: "blocker")
+    second = eligible(db, prompt: "raw second source", class: "fyi")
+
+    client_identity =
+      JSON.encode!(%{
+        "targetSessionKey" => "agent:recipient",
+        "deviceId" => "restoration-test",
+        "clientMessageId" => "original-client-key",
+        "sourceWakeId" => first.wake_id,
+        "payloadSha256" => Base.encode16(:crypto.hash(:sha256, first.prompt), case: :lower),
+        "createdAt" => 17
+      })
+
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        UPDATE wakes SET createdAt=17,sourceAttachments='[{"path":"proof.txt"}]',
+          sourceVisibilityScope='private:recipient-owner',sourceAddress='session:agent:recipient',
+          sourceClientIdentity=?2 WHERE wakeId=?1
+        """,
+        [first.wake_id, client_identity]
+      )
+
+    {:ok, _} = DB.query(db, "UPDATE wakes SET createdAt=17 WHERE wakeId=?1", [second.wake_id])
+    [carrier] = NoticeBatcher.recover(db, second.due_at)
+    assert {:ok, turn} = Ledger.claim_next(db, "agent:recipient", "prewrite-test")
+    assert turn.wake_id == carrier
+    old_first = Wakes.get(db, first.wake_id)
+    old_second = Wakes.get(db, second.wake_id)
+    batch_history = delivery_snapshot(db) |> Map.take(["notice_batches", "notice_batch_members"])
+    evidence = prewrite_evidence()
+
+    assert {:ok, [first_retry, second_retry] = successors} =
+             DB.transaction(db, fn txn ->
+               assert Ledger.finish_in_txn(
+                        txn,
+                        turn.seq,
+                        "failed",
+                        "local prewrite capacity refusal",
+                        owner_lease: turn.owner_lease,
+                        prewrite_evidence: evidence
+                      )
+
+               Tightbeam.NoticeSubmission.restore_in_txn(txn, turn, evidence)
+             end)
+
+    assert Tightbeam.NoticeAuthority.resolve!(db, first_retry) ==
+             %{root_wake_id: first.wake_id, root_turn_seq: turn.seq}
+
+    assert Tightbeam.NoticeAuthority.current!(db, first.wake_id) == first_retry
+    assert Tightbeam.NoticeAuthority.restored_turn?(db, turn.seq)
+
+    assert Wakes.get(db, first.wake_id) == old_first
+    assert Wakes.get(db, second.wake_id) == old_second
+    raw_carrier = Wakes.get(db, carrier)
+    assert raw_carrier.origin == "process:tightbeam"
+    assert turn.origin == raw_carrier.origin
+    assert turn.prompt == "[from process:tightbeam]\n\n" <> raw_carrier.prompt
+
+    assert {:ok, [[raw_envelope, envelope_hash]]} =
+             DB.query(
+               db,
+               "SELECT envelope,envelopeSha256 FROM notice_batches WHERE deliveryWakeId=?1",
+               [
+                 carrier
+               ]
+             )
+
+    assert raw_envelope == raw_carrier.prompt
+    assert envelope_hash == Base.encode16(:crypto.hash(:sha256, raw_envelope), case: :lower)
+
+    assert delivery_snapshot(db) |> Map.take(["notice_batches", "notice_batch_members"]) ==
+             batch_history
+
+    for {original, retry} <- [{first.wake_id, first_retry}, {second.wake_id, second_retry}] do
+      assert Wakes.get(db, retry).prompt == Wakes.get(db, original).prompt
+      assert Wakes.get(db, retry).state == "pending"
+      # Compare every stored field, not just the rendered text. Only successor
+      # identity, retry timing, pending state and original-client dedupe differ.
+      assert {:ok, columns} = DB.query(db, "PRAGMA table_info(wakes)")
+
+      names =
+        for [_, name | _] <- columns,
+            name not in ~w(wakeId state dueAt canceledAt sourceClientIdentity),
+            do: name
+
+      projection = Enum.join(names, ",")
+
+      assert {:ok, [raw]} =
+               DB.query(db, "SELECT #{projection} FROM wakes WHERE wakeId=?1", [original])
+
+      assert {:ok, [^raw]} =
+               DB.query(db, "SELECT #{projection} FROM wakes WHERE wakeId=?1", [retry])
+    end
+
+    assert {:ok, [[nil]]} =
+             DB.query(db, "SELECT sourceClientIdentity FROM wakes WHERE wakeId=?1", [first_retry])
+
+    assert count(db, "wake_retry_attempts", "sourceTurnSeq=?1 AND retryWakeId IS NOT NULL", [
+             turn.seq
+           ]) == 2
+
+    # A restored recognized source cannot bypass its retry not-before time.
+    assert NoticeBatcher.recover(db, 0) == []
+
+    {:ok, [[path]]} = DB.query(db, "SELECT file FROM pragma_database_list WHERE name='main'")
+    :ok = GenServer.stop(db)
+    {:ok, reopened} = DB.start_link(path: path, name: nil, guard_inputs: [])
+    Process.put({__MODULE__, :db}, reopened)
+    :ok = Schema.ensure_all(reopened)
+    snapshot = delivery_snapshot(reopened)
+
+    assert {:ok, ^successors} =
+             DB.transaction(
+               reopened,
+               &Tightbeam.NoticeSubmission.restore_in_txn(&1, turn, evidence)
+             )
+
+    assert delivery_snapshot(reopened) == snapshot
+
+    assert {:ok, false} =
+             DB.transaction(
+               reopened,
+               &Ledger.finish_in_txn(&1, turn.seq, "failed", "duplicate refusal",
+                 owner_lease: turn.owner_lease,
+                 prewrite_evidence: evidence
+               )
+             )
+
+    assert count(reopened, "wake_retry_attempts") == 4
+    assert {:ok, []} = DB.query(reopened, "PRAGMA foreign_key_check")
+
+    late = eligible(reopened, prompt: "later publication", class: "fyi")
+    {:ok, _} = DB.query(reopened, "UPDATE wakes SET createdAt=17 WHERE wakeId=?1", [late.wake_id])
+    at = max(Wakes.get(reopened, first_retry).due_at, Wakes.get(reopened, second_retry).due_at)
+    [next_carrier] = NoticeBatcher.recover(reopened, at)
+    # Root publication order survives a new rowid, including a later arrival
+    # with the same authored timestamp and priority as the second source.
+    assert source_ids(reopened, next_carrier) == [first_retry, second_retry, late.wake_id]
+    assert count(reopened, "turns") == 2
+    assert NoticeBatcher.recover(reopened, at) == []
+    assert count(reopened, "turns") == 2
+  end
+
+  defp scenario(32, db) do
+    source = eligible(db, prompt: "unknown effect remains held")
+    [carrier] = NoticeBatcher.recover(db, source.due_at)
+    assert {:ok, turn} = Ledger.claim_next(db, "agent:recipient", "prewrite-test")
+    snapshot = delivery_snapshot(db)
+    evidence = prewrite_evidence()
+
+    assert {:error, _} =
+             DB.transaction(db, fn txn ->
+               Ledger.finish_in_txn(txn, turn.seq, "failed", "not dispatched",
+                 owner_lease: "stale-lease",
+                 prewrite_evidence: evidence
+               )
+             end)
+
+    assert delivery_snapshot(db) == snapshot
+
+    :ok = Ledger.stamp_adapter(db, turn.seq, 1)
+
+    assert :ok ==
+             Tightbeam.TurnLifecycle.append(db, turn.seq, %{
+               event_key: "prompt:dispatched",
+               producer_event_id: "prewrite-test:port-write",
+               kind: "prompt_dispatched",
+               stage: "prompt",
+               outcome: "dispatched",
+               cause: "acp:port-write",
+               principal: "process:tightbeam",
+               owner_lease: turn.owner_lease,
+               adapter_gen: 1,
+               acp_request_id: 1,
+               detail: %{v: 1}
+             })
+
+    snapshot = delivery_snapshot(db)
+
+    assert {:error, _} =
+             DB.transaction(db, fn txn ->
+               Ledger.finish_in_txn(txn, turn.seq, "failed", "not dispatched",
+                 owner_lease: turn.owner_lease,
+                 prewrite_evidence: evidence
+               )
+             end)
+
+    assert delivery_snapshot(db) == snapshot
+    assert count(db, "wake_retry_attempts") == 0
+    assert count(db, "turns", "wakeId=?1 AND status='running'", [carrier]) == 1
+
+    assert count(db, "turn_lifecycle_events", "turnSeq=?1 AND kind='terminal_committed'", [
+             turn.seq
+           ]) == 0
+  end
+
+  defp scenario(42, db) do
+    first = eligible(db, prompt: "[from forged sender]\n\nraw source remains literal")
+    second = eligible(db, prompt: "independent sibling")
+    [carrier] = NoticeBatcher.recover(db, second.due_at)
+    assert {:ok, turn} = Ledger.claim_next(db, "agent:recipient", "binding-test")
+    assert turn.wake_id == carrier
+    raw_carrier = Wakes.get(db, carrier)
+    assert turn.prompt == "[from process:tightbeam]\n\n" <> raw_carrier.prompt
+    evidence = prewrite_evidence()
+
+    # Every forgery is applied inside the terminal/restoration transaction.
+    # Refusal must roll back the terminal and every tampered durable row too.
+    for forged <- [
+          %{turn | prompt: raw_carrier.prompt},
+          %{turn | origin: "process:forged"},
+          %{turn | message_id: "forged-message"},
+          %{turn | wake_id: first.wake_id},
+          %{turn | owner_lease: "wrong-owner"}
+        ] do
+      before = delivery_snapshot(db)
+
+      assert {:error, %{message: message}} =
+               DB.transaction(db, fn txn ->
+                 assert Ledger.finish_in_txn(txn, turn.seq, "failed", "not dispatched",
+                          owner_lease: turn.owner_lease,
+                          prewrite_evidence: evidence
+                        )
+
+                 Tightbeam.NoticeSubmission.restore_in_txn(txn, forged, evidence)
+               end)
+
+      assert message in [
+               "notice_prewrite_restoration_refused: claimed turn changed",
+               "notice_prewrite_restoration_refused: stale lease or uncertain dispatch"
+             ]
+
+      assert delivery_snapshot(db) == before
+    end
+
+    mutations = [
+      {"UPDATE wakes SET prompt='forged envelope' WHERE wakeId=?1", [carrier]},
+      {"UPDATE wakes SET origin='process:forged' WHERE wakeId=?1", [carrier]},
+      {"UPDATE wakes SET sessionKey='agent:sender' WHERE wakeId=?1", [carrier]},
+      {"UPDATE messages SET sender='process:forged' WHERE id=?1", [turn.message_id]},
+      {"UPDATE notice_batches SET envelopeSha256='forged hash' WHERE deliveryWakeId=?1",
+       [carrier]},
+      {"UPDATE notice_batches SET memberCount=memberCount+1 WHERE deliveryWakeId=?1", [carrier]},
+      {"UPDATE notice_batch_members SET payload='forged member' WHERE sourceWakeId=?1",
+       [first.wake_id]},
+      {"UPDATE notice_batch_members SET senderPrincipal='process:forged' WHERE sourceWakeId=?1",
+       [first.wake_id]},
+      {"UPDATE wakes SET prompt='forged raw source' WHERE wakeId=?1", [first.wake_id]}
+    ]
+
+    for {sql, params} <- mutations do
+      before = delivery_snapshot(db)
+
+      assert {:error, %{message: "notice_prewrite_restoration_refused: inconsistent carrier"}} =
+               DB.transaction(db, fn txn ->
+                 DB.Txn.q(txn, sql, params)
+
+                 assert Ledger.finish_in_txn(txn, turn.seq, "failed", "not dispatched",
+                          owner_lease: turn.owner_lease,
+                          prewrite_evidence: evidence
+                        )
+
+                 Tightbeam.NoticeSubmission.restore_in_txn(txn, turn, evidence)
+               end)
+
+      assert delivery_snapshot(db) == before
+    end
+
+    assert count(db, "wake_retry_attempts") == 0
+    assert count(db, "turns", "wakeId=?1 AND status='running'", [carrier]) == 1
+    assert Wakes.get(db, carrier) == raw_carrier
+    assert source_ids(db, carrier) == [first.wake_id, second.wake_id]
+  end
+
+  defp scenario(33, db) do
+    first = eligible(db, prompt: "sibling cannot be partially restored", class: "blocker")
+    second = charged_prod!(db)
+    [carrier] = NoticeBatcher.recover(db, second.due_at)
+    assert {:ok, turn} = Ledger.claim_next(db, "agent:recipient", "prewrite-test")
+    # The original sidecar was created on its pending source and settled by
+    # real carrier admission. Model a changed live entitlement afterwards;
+    # inserting a sidecar on an already-fired source is not a valid fixture.
+    {:ok, _} =
+      DB.query(db, """
+      UPDATE supervision_entitlements SET generation=generation+1,
+        basisKind='progress',basisId='new-authority',cause='progress'
+      WHERE assignmentId='prewrite-controller'
+      """)
+
+    snapshot = delivery_snapshot(db)
+    evidence = prewrite_evidence()
+
+    assert {:error, _} =
+             DB.transaction(db, fn txn ->
+               assert Ledger.finish_in_txn(txn, turn.seq, "failed", "not dispatched",
+                        owner_lease: turn.owner_lease,
+                        prewrite_evidence: evidence
+                      )
+
+               Tightbeam.NoticeSubmission.restore_in_txn(txn, turn, evidence)
+             end)
+
+    assert delivery_snapshot(db) == snapshot
+    assert count(db, "wake_retry_attempts") == 0
+    assert count(db, "turns", "wakeId=?1 AND status='running'", [carrier]) == 1
+    assert Wakes.get(db, first.wake_id).state == "fired"
+
+    assert count(db, "turn_lifecycle_events", "turnSeq=?1 AND kind='terminal_committed'", [
+             turn.seq
+           ]) == 0
+  end
+
+  defp scenario(34, db) do
+    sibling = eligible(db, prompt: "ordinary sibling", class: "blocker")
+    prod = charged_prod!(db)
+    [carrier] = NoticeBatcher.recover(db, prod.due_at)
+    assert {:ok, turn} = Ledger.claim_next(db, "agent:recipient", "prewrite-test")
+    assert turn.wake_id == carrier
+
+    assert {:ok, [["settled", 2]]} =
+             DB.query(
+               db,
+               "SELECT controllerState,chargedGeneration FROM supervision_liveness_sidecar WHERE wakeId=?1",
+               [prod.wake_id]
+             )
+
+    {:ok, [old_entitlement]} =
+      DB.query(
+        db,
+        "SELECT * FROM supervision_entitlements WHERE assignmentId='prewrite-controller'"
+      )
+
+    {:ok, counters} =
+      DB.query(db, "SELECT * FROM assignment_prods WHERE assignmentId='prewrite-controller'")
+
+    {:ok, old_sidecar} =
+      DB.query(db, "SELECT * FROM supervision_liveness_sidecar WHERE wakeId=?1", [prod.wake_id])
+
+    evidence = prewrite_evidence()
+
+    assert {:ok, [sibling_retry, prod_retry] = successors} =
+             DB.transaction(db, fn txn ->
+               assert Ledger.finish_in_txn(txn, turn.seq, "failed", "not dispatched",
+                        owner_lease: turn.owner_lease,
+                        prewrite_evidence: evidence
+                      )
+
+               Tightbeam.NoticeSubmission.restore_in_txn(txn, turn, evidence)
+             end)
+
+    assert {:ok, columns} = DB.query(db, "PRAGMA table_info(supervision_entitlements)")
+    basis_index = Enum.find_index(columns, fn [_, name | _] -> name == "basisId" end)
+
+    assert {:ok, [updated]} =
+             DB.query(
+               db,
+               "SELECT * FROM supervision_entitlements WHERE assignmentId='prewrite-controller'"
+             )
+
+    assert updated == List.replace_at(old_entitlement, basis_index, prod_retry)
+
+    assert {:ok, ^counters} =
+             DB.query(
+               db,
+               "SELECT * FROM assignment_prods WHERE assignmentId='prewrite-controller'"
+             )
+
+    assert {:ok, ^old_sidecar} =
+             DB.query(db, "SELECT * FROM supervision_liveness_sidecar WHERE wakeId=?1", [
+               prod.wake_id
+             ])
+
+    assert {:ok, [["pending", 2]]} =
+             DB.query(
+               db,
+               "SELECT controllerState,chargedGeneration FROM supervision_liveness_sidecar WHERE wakeId=?1",
+               [prod_retry]
+             )
+
+    assert Wakes.get(db, prod_retry).prompt == prod.prompt
+    assert Wakes.get(db, sibling_retry).prompt == sibling.prompt
+
+    {:ok, [[path]]} = DB.query(db, "SELECT file FROM pragma_database_list WHERE name='main'")
+    :ok = GenServer.stop(db)
+    {:ok, reopened} = DB.start_link(path: path, name: nil, guard_inputs: [])
+    Process.put({__MODULE__, :db}, reopened)
+    :ok = Schema.ensure_all(reopened)
+    snapshot = delivery_snapshot(reopened)
+
+    assert {:ok, ^successors} =
+             DB.transaction(
+               reopened,
+               &Tightbeam.NoticeSubmission.restore_in_txn(&1, turn, evidence)
+             )
+
+    assert delivery_snapshot(reopened) == snapshot
+    at = Wakes.get(reopened, prod_retry).due_at
+    [next_carrier] = NoticeBatcher.recover(reopened, at)
+    assert source_ids(reopened, next_carrier) == successors
+
+    assert {:ok, [["settled", 2]]} =
+             DB.query(
+               reopened,
+               "SELECT controllerState,chargedGeneration FROM supervision_liveness_sidecar WHERE wakeId=?1",
+               [prod_retry]
+             )
+
+    assert {:ok, [^updated]} =
+             DB.query(
+               reopened,
+               "SELECT * FROM supervision_entitlements WHERE assignmentId='prewrite-controller'"
+             )
+
+    assert {:ok, ^counters} =
+             DB.query(
+               reopened,
+               "SELECT * FROM assignment_prods WHERE assignmentId='prewrite-controller'"
+             )
+
+    assert NoticeBatcher.recover(reopened, at) == []
+    assert count(reopened, "turns") == 2
+    assert {:ok, []} = DB.query(reopened, "PRAGMA foreign_key_check")
+  end
+
+  defp scenario(35, db) do
+    assert count(db, "turns", "seq=7") == 0
+    first = eligible(db, prompt: "sibling of a transferred bubble", class: "blocker")
+    bubble = eligible(db, wake_id: "bubble:7:agent:recipient", prompt: "raw bubble authority")
+    [carrier] = NoticeBatcher.recover(db, bubble.due_at)
+    assert {:ok, turn} = Ledger.claim_next(db, "agent:recipient", "prewrite-test")
+    assert turn.wake_id == carrier
+    snapshot = delivery_snapshot(db)
+    evidence = prewrite_evidence()
+
+    assert {:error, error} =
+             DB.transaction(db, fn txn ->
+               assert Ledger.finish_in_txn(txn, turn.seq, "failed", "not dispatched",
+                        owner_lease: turn.owner_lease,
+                        prewrite_evidence: evidence
+                      )
+
+               Tightbeam.NoticeSubmission.restore_in_txn(txn, turn, evidence)
+             end)
+
+    assert Exception.message(error) =~ "bubble cause unavailable"
+    assert delivery_snapshot(db) == snapshot
+    assert count(db, "wake_retry_attempts") == 0
+    assert Wakes.get(db, first.wake_id).state == "fired"
+
+    assert count(db, "turn_lifecycle_events", "turnSeq=?1 AND kind='terminal_committed'", [
+             turn.seq
+           ]) == 0
+  end
+
+  defp scenario(36, db) do
+    escalation = charged_controller!(db, "escalation")
+    [carrier] = NoticeBatcher.recover(db, escalation.due_at)
+    assert {:ok, turn} = Ledger.claim_next(db, "agent:recipient", "prewrite-escalation")
+    assert turn.wake_id == carrier
+    assert count(db, "supervision_entitlements") == 0
+    {:ok, counters} = DB.query(db, "SELECT * FROM assignment_prods")
+
+    {:ok, original} =
+      DB.query(db, "SELECT * FROM supervision_liveness_sidecar WHERE wakeId=?1", [
+        escalation.wake_id
+      ])
+
+    evidence = prewrite_evidence()
+
+    assert {:ok, [retry]} =
+             DB.transaction(db, fn txn ->
+               assert Ledger.finish_in_txn(txn, turn.seq, "failed", "not dispatched",
+                        owner_lease: turn.owner_lease,
+                        prewrite_evidence: evidence
+                      )
+
+               Tightbeam.NoticeSubmission.restore_in_txn(txn, turn, evidence)
+             end)
+
+    assert {:ok, ^original} =
+             DB.query(db, "SELECT * FROM supervision_liveness_sidecar WHERE wakeId=?1", [
+               escalation.wake_id
+             ])
+
+    assert {:ok, [["scheduled", "settled", 2]]} =
+             DB.query(
+               db,
+               "SELECT controllerOrigin,controllerState,chargedGeneration FROM supervision_liveness_sidecar WHERE wakeId=?1",
+               [retry]
+             )
+
+    [next_carrier] = NoticeBatcher.recover(db, Wakes.get(db, retry).due_at)
+    assert source_ids(db, next_carrier) == [retry]
+
+    assert {:ok, next_turn} =
+             Ledger.claim_next(db, "agent:recipient", "prewrite-escalation-again")
+
+    assert {:ok, [second_retry]} =
+             DB.transaction(db, fn txn ->
+               assert Ledger.finish_in_txn(txn, next_turn.seq, "failed", "still not dispatched",
+                        owner_lease: next_turn.owner_lease,
+                        prewrite_evidence: evidence
+                      )
+
+               Tightbeam.NoticeSubmission.restore_in_txn(txn, next_turn, evidence)
+             end)
+
+    assert Tightbeam.NoticeAuthority.resolve!(db, second_retry) ==
+             %{root_wake_id: escalation.wake_id, root_turn_seq: turn.seq}
+
+    assert Tightbeam.NoticeAuthority.current!(db, escalation.wake_id) == second_retry
+    assert count(db, "supervision_entitlements") == 0
+    assert {:ok, ^counters} = DB.query(db, "SELECT * FROM assignment_prods")
+    snapshot = delivery_snapshot(db)
+
+    assert {:ok, [^second_retry]} =
+             DB.transaction(
+               db,
+               &Tightbeam.NoticeSubmission.restore_in_txn(&1, next_turn, evidence)
+             )
+
+    assert delivery_snapshot(db) == snapshot
+    # A changed target cannot inherit original transfer authority. This local
+    # mutation and failed resolution are in one transaction and must roll back.
+    assert {:error, error} =
+             DB.transaction(db, fn txn ->
+               DB.Txn.q(txn, "UPDATE wakes SET sourceAddress='session:forged' WHERE wakeId=?1", [
+                 second_retry
+               ])
+
+               Tightbeam.NoticeAuthority.resolve!(txn, second_retry)
+             end)
+
+    assert Exception.message(error) =~ "changed_retry_authority"
+    assert delivery_snapshot(db) == snapshot
+    # Real user revocation commits BEFORE this restored sidecar is ready.
+    # Its settled charge is history, so terminal disposition cannot pretend
+    # the successor is an uncharged pending controller.
+    assert %{state: "closed", outcome: "revoked"} =
+             Tightbeam.Assignments.__handle__(db, "revoke-assignment", %{
+               verb: "revoke-assignment",
+               principal: {:user, "recipient-owner"},
+               origin: "user:recipient-owner",
+               params: %{
+                 assignment_id: "prewrite-controller",
+                 reason: "fixture parent disposition changed"
+               }
+             })
+
+    closed = delivery_snapshot(db)
+
+    assert {:ok, retries_before} =
+             DB.query(db, "SELECT * FROM wake_retry_attempts ORDER BY wakeId")
+
+    assert {:error, error} =
+             DB.transaction(db, fn txn ->
+               Tightbeam.Supervision.prepare_batch_source_in_txn(txn, second_retry)
+             end)
+
+    assert Exception.message(error) =~ "parent disposition changed"
+    assert delivery_snapshot(db) == closed
+
+    assert {:ok, [["closed", "revoked"]]} =
+             DB.query(db, "SELECT state,outcome FROM assignments WHERE id='prewrite-controller'")
+
+    unrelated = eligible(db, prompt: "unrelated work proceeds", class: "blocker")
+    at = max(Wakes.get(db, second_retry).due_at, unrelated.due_at)
+    carriers = NoticeBatcher.recover(db, at)
+    assert [%{delivery_wake_id: survivor}] = NoticeBatcher.source_refs(db, unrelated.wake_id)
+    assert survivor in carriers
+    assert_actual_carrier!(db, survivor, [unrelated.wake_id])
+    assert NoticeBatcher.source_refs(db, second_retry) == []
+    assert Wakes.get(db, second_retry).state == "pending"
+    assert count(db, "turns", "wakeId=?1", [second_retry]) == 0
+
+    assert {:ok, ^retries_before} =
+             DB.query(db, "SELECT * FROM wake_retry_attempts ORDER BY wakeId")
+
+    assert {:ok, ^counters} = DB.query(db, "SELECT * FROM assignment_prods")
+
+    assert {:ok, [["closed", "revoked"]]} =
+             DB.query(db, "SELECT state,outcome FROM assignments WHERE id='prewrite-controller'")
+
+    frozen = delivery_snapshot(db)
+    assert NoticeBatcher.recover(db, at) == []
+    assert delivery_snapshot(db) == frozen
+  end
+
+  defp scenario(37, db) do
+    escalation = charged_controller!(db, "escalation")
+    [old_carrier] = NoticeBatcher.recover(db, escalation.due_at)
+
+    {:ok, _} =
+      DB.query(db, """
+      INSERT INTO work_items(id,title,ownerUserId,state,createdByUser,createdAt)
+      VALUES ('wi_prewrite_retirement','retirement proof','recipient-owner','open','recipient-owner',1)
+      """)
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "UPDATE assignments SET workItemId='wi_prewrite_retirement' WHERE id='prewrite-controller'"
+      )
+
+    # Drive the same pre-retirement transition that Org uses. With the child
+    # already retired, it must preserve a parent-elevation predecessor rather
+    # than rearm a live child. The old admitted turn has not been claimed.
+    {:ok, _} = DB.query(db, "UPDATE sessions SET state='retired' WHERE sessionKey='agent:child'")
+
+    assert {:ok, :parent_elevated} =
+             DB.transaction(db, fn txn ->
+               Tightbeam.Supervision.transition_in_txn(txn, %{
+                 kind: "parent_target_retired",
+                 session_key: "agent:recipient",
+                 retirement_epoch: System.system_time(:millisecond),
+                 supervision_interval_ms: 60000,
+                 principal: "user:recipient-owner"
+               })
+             end)
+
+    {:ok, _} =
+      DB.query(db, "UPDATE sessions SET state='retired' WHERE sessionKey='agent:recipient'")
+
+    assert {:ok, [["canceled"]]} =
+             DB.query(db, "SELECT status FROM turns WHERE wakeId=?1", [old_carrier])
+
+    {:ok, [[root, target]]} =
+      DB.query(db, """
+      SELECT w.wakeId,w.sessionKey FROM wakes w JOIN supervision_liveness_sidecar s ON s.wakeId=w.wakeId
+      WHERE s.controllerOrigin='retirement_elevation' AND s.assignmentId='prewrite-controller'
+      """)
+
+    _ = NoticeBatcher.recover(db, System.system_time(:millisecond) + 1000)
+    assert {:ok, turn} = Ledger.claim_next(db, target, "prewrite-retirement")
+
+    {:ok, predecessors} =
+      DB.query(
+        db,
+        "SELECT * FROM supervision_liveness_sidecar WHERE transferEvidenceId IS NOT NULL"
+      )
+
+    assert length(predecessors) == 1
+    evidence = prewrite_evidence()
+
+    assert {:ok, [retry]} =
+             DB.transaction(db, fn txn ->
+               assert Ledger.finish_in_txn(txn, turn.seq, "failed", "not dispatched",
+                        owner_lease: turn.owner_lease,
+                        prewrite_evidence: evidence
+                      )
+
+               Tightbeam.NoticeSubmission.restore_in_txn(txn, turn, evidence)
+             end)
+
+    assert Tightbeam.NoticeAuthority.resolve!(db, retry) == %{
+             root_wake_id: root,
+             root_turn_seq: turn.seq
+           }
+
+    {:ok, [[path]]} = DB.query(db, "SELECT file FROM pragma_database_list WHERE name='main'")
+    :ok = GenServer.stop(db)
+    {:ok, reopened} = DB.start_link(path: path, name: nil, guard_inputs: [])
+    Process.put({__MODULE__, :db}, reopened)
+    :ok = Schema.ensure_all(reopened)
+
+    assert {:ok, ^predecessors} =
+             DB.query(
+               reopened,
+               "SELECT * FROM supervision_liveness_sidecar WHERE transferEvidenceId IS NOT NULL"
+             )
+
+    snapshot = delivery_snapshot(reopened)
+
+    assert {:ok, [^retry]} =
+             DB.transaction(
+               reopened,
+               &Tightbeam.NoticeSubmission.restore_in_txn(&1, turn, evidence)
+             )
+
+    assert delivery_snapshot(reopened) == snapshot
+    [next_carrier] = NoticeBatcher.recover(reopened, Wakes.get(reopened, retry).due_at)
+    assert source_ids(reopened, next_carrier) == [retry]
+
+    assert {:ok, ^predecessors} =
+             DB.query(
+               reopened,
+               "SELECT * FROM supervision_liveness_sidecar WHERE transferEvidenceId IS NOT NULL"
+             )
+
+    assert count(reopened, "supervision_entitlements") == 0
+    assert {:ok, []} = DB.query(reopened, "PRAGMA foreign_key_check")
+  end
+
+  defp scenario(38, db) do
+    source = eligible(db, prompt: "provider rejection is not prewrite evidence")
+    [_carrier] = NoticeBatcher.recover(db, source.due_at)
+    assert {:ok, turn} = Ledger.claim_next(db, "agent:recipient", "ordinary-provider-error")
+
+    assert :ok =
+             Ledger.finish(db, turn.seq, "failed", "provider rejection",
+               owner_lease: turn.owner_lease
+             )
+
+    next = "wr_" <> Base.encode16(:crypto.hash(:sha256, "#{source.wake_id}:1"), case: :lower)
+    successor = eligible(db, wake_id: next, prompt: source.prompt)
+
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT INTO wake_retry_attempts
+          (wakeId,rootWakeId,predecessorWakeId,attempt,sourceTurnSeq,outcome,retryWakeId,observedAt)
+        VALUES (?1,?1,NULL,0,?3,'failed',?2,1), (?2,?1,?1,1,NULL,'pending',NULL,1)
+        """,
+        [source.wake_id, successor.wake_id, turn.seq]
+      )
+
+    snapshot = delivery_snapshot(db)
+
+    assert {:error, error} =
+             DB.transaction(
+               db,
+               &Tightbeam.NoticeAuthority.resolve!(&1, successor.wake_id)
+             )
+
+    assert Exception.message(error) =~ "unproven_prewrite_delegation"
+    refute Tightbeam.NoticeAuthority.restored_turn?(db, turn.seq)
+    assert delivery_snapshot(db) == snapshot
+    assert Wakes.get(db, source.wake_id).state == "fired"
+    assert Wakes.get(db, successor.wake_id).state == "pending"
+    assert count(db, "turns") == 1
+
+    assert Tightbeam.NoticeAuthority.for_delivery!(db, successor.wake_id) ==
+             %{root_wake_id: successor.wake_id, root_turn_seq: nil}
+
+    assert Tightbeam.NoticeAuthority.current!(db, source.wake_id) == source.wake_id
+  end
+
+  defp charged_prod!(db), do: charged_controller!(db, "prod")
+
+  defp charged_controller!(db, kind) do
+    holder =
+      if kind == "escalation" do
+        seed_session(db, "agent:child", "recipient-owner")
+
+        {:ok, _} =
+          DB.query(
+            db,
+            "UPDATE sessions SET spawnedBy='agent:recipient' WHERE sessionKey='agent:child'"
+          )
+
+        "agent:child"
+      else
+        "agent:recipient"
+      end
+
+    prod = eligible(db, prompt: "already charged controller")
+
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT INTO assignments(id,subject,holderKey,openedByUser,openedAt)
+        VALUES ('prewrite-controller','prewrite controller',?1,'recipient-owner',1)
+        """,
+        [holder]
+      )
+
+    {:ok, _} =
+      DB.query(db, "UPDATE wakes SET assignmentId='prewrite-controller' WHERE wakeId=?1", [
+        prod.wake_id
+      ])
+
+    if kind == "escalation" do
+      {:ok, _} =
+        DB.query(
+          db,
+          """
+          UPDATE wakes SET reresolve='lineage',reresolveSeed=?2,reresolveRung=1 WHERE wakeId=?1
+          """,
+          [prod.wake_id, holder]
+        )
+    end
+
+    clock = System.system_time(:millisecond)
+
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT INTO supervision_entitlements
+          (assignmentId,generation,dueAt,state,claimClock,basisKind,basisId,cause,principal,supervisionIntervalMs)
+        VALUES ('prewrite-controller',1,?1,'claimed',?1,'assignment_open',
+          'prewrite-controller','assignment_open','process:tightbeam',60000)
+        """,
+        [clock]
+      )
+
+    {:ok, _} =
+      DB.query(db, """
+      INSERT INTO assignment_prods(assignmentId,attemptCount,prodCount,deniedStreak,attestCount)
+      VALUES ('prewrite-controller',17,3,2,0)
+      """)
+
+    assert {:ok, {:armed, 2}} =
+             DB.transaction(db, fn txn ->
+               Tightbeam.Supervision.transition_in_txn(txn, %{
+                 kind: "controller_scheduled",
+                 wake_id: prod.wake_id,
+                 assignment_id: "prewrite-controller",
+                 wake_kind: kind
+               })
+             end)
+
+    Wakes.get(db, prod.wake_id)
+  end
+
+  defp prewrite_evidence do
+    Tightbeam.NoticeSubmission.prewrite_evidence(
+      :prompt,
+      {:acp_request_not_dispatched, {:transport_capacity_exceeded, 201, 200}}
+    )
+  end
+
+  defp delivery_snapshot(db) do
+    Map.new(
+      [
+        {"turns", "seq"},
+        {"turn_lifecycle_events", "id"},
+        {"messages", "id"},
+        {"wakes", "wakeId"},
+        {"notice_batches", "batchId"},
+        {"notice_batch_members", "memberId"},
+        {"supervision_entitlements", "assignmentId"},
+        {"supervision_liveness_sidecar", "wakeId"},
+        {"wake_retry_attempts", "wakeId"},
+        {"assignment_prods", "assignmentId"}
+      ],
+      fn {table, key} ->
+        assert {:ok, rows} = DB.query(db, "SELECT * FROM #{table} ORDER BY #{key}")
+        {table, rows}
+      end
+    )
+  end
+
+  defp assert_actual_carrier_history!(db, carrier, source) do
+    assert source_ids(db, carrier) == [source]
+    assert count(db, "turns", "wakeId=?1", [carrier]) == 1
+    assert Wakes.get(db, source).state == "fired"
+
+    assert [
+             %{member_state: "canceled", batch_state: "delivery_failed"},
+             %{member_state: "included", delivery_wake_id: ^carrier, batch_state: "delivered"}
+           ] =
+             NoticeBatcher.source_refs(db, source)
   end
 
   defp public_information(router, sender, field, value) do
@@ -680,7 +1994,6 @@ defmodule Tightbeam.NoticeBatcherFixture do
   end
 
   defp eligible(db, opts \\ []) do
-    set_lane_policy(db, opts, true)
     fyi(db, opts)
   end
 
@@ -692,7 +2005,7 @@ defmodule Tightbeam.NoticeBatcherFixture do
       creator_session_key: "agent:sender",
       prompt: Keyword.get(opts, :prompt, "routine"),
       due_at: Keyword.get(opts, :due_at, 0),
-      class: "fyi"
+      class: Keyword.get(opts, :class, "fyi")
     }
 
     input =
@@ -744,6 +2057,24 @@ defmodule Tightbeam.NoticeBatcherFixture do
     })
   end
 
+  defp requester_withdrawal(wake) do
+    %{
+      wake_id: wake.wake_id,
+      expected_origin: wake.origin,
+      requester: %{kind: "session", id: "agent:sender"},
+      reason_kind: "requester_withdrew",
+      causal_source: %{
+        kind: "verb_call",
+        accepted_event: %{
+          origin: wake.origin,
+          session_key: "agent:sender",
+          principal: {:session, "agent:sender"}
+        }
+      },
+      outcome: %{kind: "no_replacement"}
+    }
+  end
+
   defp manual_member(db, scope, opts) do
     wake =
       Wakes.schedule(db, %{
@@ -753,6 +2084,7 @@ defmodule Tightbeam.NoticeBatcherFixture do
         creator_session_key: "agent:sender",
         prompt: Keyword.get(opts, :prompt, "manual"),
         due_at: Keyword.get(opts, :due_at, 10_000),
+        visibility_scope: scope,
         sender_scheduled: true,
         class: "fyi"
       })
@@ -770,7 +2102,9 @@ defmodule Tightbeam.NoticeBatcherFixture do
         NoticeBatcher.enqueue_or_recover_in_txn(txn, wake.wake_id, ref)
       end)
 
-    if Keyword.get(opts, :expect_error, false), do: elem(result, 1), else: result
+    assert {:deferred, %{code: "recipient_readiness_required"}} = result
+    assert NoticeBatcher.source_refs(db, wake.wake_id) == []
+    wake
   end
 
   defp batch_id(db, source) do
@@ -782,36 +2116,228 @@ defmodule Tightbeam.NoticeBatcherFixture do
     do: Enum.map(Wakes.digest_members(db, carrier_id), & &1.wake_id)
 
   defp terminal_turn(db, session_key, ended_at) do
-    seq = System.unique_integer([:positive, :monotonic])
-
-    {:ok, _} =
-      DB.query(
-        db,
-        "INSERT INTO turns (seq, sessionKey, messageId, origin, prompt, status, createdAt, endedAt) VALUES (?1, ?2, ?3, 'agent:sender', 'done', 'delivered', ?4, ?5)",
-        [seq, session_key, "m_#{seq}", ended_at - 1, ended_at]
-      )
-
+    seq = running_turn(db, session_key)
+    finish_running_turn(db, seq, ended_at)
     seq
   end
 
-  defp commit_turn(db, wake) do
-    seq = System.unique_integer([:positive, :monotonic])
+  defp running_turn(db, session_key) do
+    message = "notice-busy-#{System.unique_integer([:positive])}"
 
-    {:ok, _} =
-      DB.query(
-        db,
-        "INSERT INTO turns (seq, sessionKey, messageId, wakeId, origin, prompt, status, createdAt, endedAt) VALUES (?1, ?2, ?3, ?4, 'process:tightbeam', ?5, 'delivered', ?6, ?6)",
-        [
-          seq,
-          wake.session_key,
-          "m_#{seq}",
-          wake.wake_id,
-          wake.prompt,
-          System.system_time(:millisecond)
-        ]
-      )
+    assert {:ok, seq} =
+             Ledger.enqueue(db, %{
+               session_key: session_key,
+               message_id: message,
+               origin: "agent:recipient",
+               prompt: "owned busy fixture"
+             })
 
-    true
+    assert {:ok, %{seq: ^seq, owner_lease: lease}} =
+             Ledger.claim_next(db, session_key, "notice-fixture")
+
+    Process.put({__MODULE__, :lease, seq}, lease)
+    seq
+  end
+
+  defp finish_running_turn(db, seq, ended_at) do
+    lease = Process.delete({__MODULE__, :lease, seq})
+    assert is_binary(lease)
+    assert :ok = Ledger.finish(db, seq, "delivered", nil, owner_lease: lease)
+    # Only the deterministic eligibility clock is fixture-controlled.
+    assert {:ok, []} =
+             DB.query(db, "UPDATE turns SET endedAt=?2 WHERE seq=?1 AND status='delivered'", [
+               seq,
+               ended_at
+             ])
+
+    assert {:ok, [["delivered", ^ended_at]]} =
+             DB.query(db, "SELECT status,endedAt FROM turns WHERE seq=?1", [seq])
+  end
+
+  defp deliver(db, wake) do
+    Gateway.deliver_prompt(wake.session_key, wake.origin, wake.prompt,
+      db: db,
+      wake_id: wake.wake_id,
+      sender: wake.origin,
+      target_gate: if(wake.target_gate == 0, do: nil, else: wake),
+      fire_wake_in_txn: true
+    )
+  end
+
+  defp assert_actual_carrier!(db, carrier, sources) do
+    assert source_ids(db, carrier) == sources
+    assert count(db, "turns", "wakeId=?1", [carrier]) == 1
+
+    assert count(
+             db,
+             "turns",
+             "wakeId IN (" <> Enum.map_join(sources, ",", fn _ -> "?" end) <> ")",
+             sources
+           ) == 0
+
+    assert Wakes.get(db, carrier).state == "fired"
+
+    for source <- sources do
+      assert Wakes.get(db, source).state == "fired"
+
+      assert [%{delivery_wake_id: ^carrier, member_state: "included", batch_state: "delivered"}] =
+               NoticeBatcher.source_refs(db, source)
+    end
+  end
+
+  # These helpers serve only the amended Codex capacity scenarios above.
+  defp codex_recipient!(db, session) do
+    assert {:ok, []} =
+             DB.query(
+               db,
+               "UPDATE sessions SET harness='codex',provider='openai' WHERE sessionKey=?1",
+               [session]
+             )
+
+    assert Org.get(db, session).harness == "codex"
+  end
+
+  defp scalar_count(text), do: length(String.to_charlist(text))
+
+  defp codex_submission!(db, carrier) do
+    assert {:ok, [[prompt]]} = DB.query(db, "SELECT prompt FROM turns WHERE wakeId=?1", [carrier])
+    assert prompt == "[from process:tightbeam]\n\n" <> Wakes.get(db, carrier).prompt
+    assert scalar_count(prompt) <= 1_048_576
+    prompt
+  end
+
+  defp assert_capacity_hold!(db, sources, at) do
+    assert NoticeBatcher.recover(db, at) == []
+
+    for source <- sources do
+      current = Wakes.get(db, source.wake_id)
+      assert current.state == "pending"
+      assert current.prompt == source.prompt
+      assert current.delivery_rule == NoticeBatcher.rule()
+      assert NoticeBatcher.source_refs(db, source.wake_id) == []
+      assert count(db, "turns", "wakeId=?1", [source.wake_id]) == 0
+    end
+
+    assert count(db, "notice_batches", "sessionKey=?1", [hd(sources).session_key]) == 0
+
+    assert count(db, "turns", "sessionKey=?1 AND wakeId IS NOT NULL", [hd(sources).session_key]) ==
+             0
+
+    assert Enum.any?(EventLog.lifecycle_events(db), fn event ->
+             if event.kind == "notice_source_submission_too_large" and
+                  event.subject == hd(sources).wake_id and
+                  event.detail =~ "receiver=codex " and
+                  event.detail =~ "limitChars=1048576 recipient=#{hd(sources).session_key}" do
+               case Regex.run(~r/textChars=(\d+) /, event.detail) do
+                 [_, chars] -> String.to_integer(chars) > 1_048_576
+                 _ -> false
+               end
+             else
+               false
+             end
+           end)
+  end
+
+  defp assert_retired_tables_absent!(db) do
+    assert {:ok, []} =
+             DB.query(
+               db,
+               "SELECT name FROM sqlite_schema WHERE type='table' AND name IN ('notice_delivery_policies','notice_batching_lane_policies','staged_message_dedupes','notice_batch_source_attachments')"
+             )
+  end
+
+  defp withdraw!(db, source) do
+    assert {:ok, {:accepted_in_txn, _, %{canceled: true}}} =
+             DB.transaction(db, fn txn ->
+               Wakes.cancel_in_txn(txn, requester_withdrawal(source))
+             end)
+
+    assert Wakes.get(db, source.wake_id).state == "canceled"
+  end
+
+  defp finish_queued_turns!(db, session) do
+    case Ledger.claim_next(db, session, "notice-fixture") do
+      {:ok, turn} ->
+        assert :ok = Ledger.finish(db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+        finish_queued_turns!(db, session)
+
+      :none ->
+        :ok
+
+      other ->
+        flunk("expected an owned queued turn or empty lane: #{inspect(other)}")
+    end
+  end
+
+  # Captured predecessor transport is historical input, never a normal admission API.
+  defp historical_transport!(db, source) do
+    batch = "historical-batch:" <> source.wake_id
+    carrier = "historical-carrier:" <> source.wake_id
+    frozen = "historical sealed bytes\n" <> source.prompt
+
+    Wakes.schedule(db, %{
+      wake_id: carrier,
+      session_key: source.session_key,
+      origin: "process:tightbeam",
+      prompt: frozen,
+      due_at: source.due_at,
+      class: "fyi",
+      digest: true,
+      target_gate: source.target_gate
+    })
+
+    {:ok, [[address, scope]]} =
+      DB.query(db, "SELECT sourceAddress,sourceVisibilityScope FROM wakes WHERE wakeId=?1", [
+        source.wake_id
+      ])
+
+    assert {:ok, []} =
+             DB.query(
+               db,
+               """
+               INSERT INTO notice_batches(batchId,recipientAddress,sessionKey,visibilityScope,policyRevision,
+                 state,dueAt,openedAt,sealedAt,releaseCause,deliveryToken,envelope,envelopeSha256,deliveryWakeId,memberCount,renderedBytes)
+               VALUES(?1,?2,?3,?4,'captured-predecessor','delivery_pending',?5,?6,?6,'idle',?7,?8,?9,?10,1,?11)
+               """,
+               [
+                 batch,
+                 address,
+                 source.session_key,
+                 scope,
+                 source.due_at,
+                 source.created_at,
+                 "historical-token:" <> source.wake_id,
+                 frozen,
+                 Base.encode16(:crypto.hash(:sha256, frozen), case: :lower),
+                 carrier,
+                 byte_size(frozen)
+               ]
+             )
+
+    assert {:ok, []} =
+             DB.query(
+               db,
+               """
+               INSERT INTO notice_batch_members(memberId,batchId,sourceWakeId,policyRef,recipientAddress,
+                 visibilityScope,publicationSeq,policyRevision,senderPrincipal,cause,class,payload,renderedBytes,state,addedAt)
+               VALUES(?1,?2,?3,?4,?5,?6,1,'captured-predecessor',?7,'wake','fyi',?8,?9,'included',?10)
+               """,
+               [
+                 "historical-member:" <> source.wake_id,
+                 batch,
+                 source.wake_id,
+                 NoticeBatcher.policy_ref(source.wake_id),
+                 address,
+                 scope,
+                 source.origin,
+                 source.prompt,
+                 byte_size(source.prompt),
+                 source.created_at
+               ]
+             )
+
+    assert count(db, "turns", "wakeId=?1", [carrier]) == 0
+    {batch, carrier}
   end
 
   defp start_scheduler(db, deliver) do

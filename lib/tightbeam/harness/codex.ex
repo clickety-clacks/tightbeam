@@ -9,6 +9,9 @@ defmodule Tightbeam.Harness.Codex do
 
   @adapter_version "1.12.0"
   @adapter_package "codex-acp"
+  # rust-v0.154.0 MAX_USER_INPUT_TEXT_CHARS and validate_v2_input_limit:
+  # Unicode scalar values summed across every submitted text item.
+  @submission_text_limit 1_048_576
   # Two routes, one per credential kind, because they are two different accounts'
   # worth of entitlement expressed two different ways.
   #
@@ -162,6 +165,9 @@ defmodule Tightbeam.Harness.Codex do
   def ensure_adapter(target) do
     Tightbeam.Spinup.ensure_adapter(target, __MODULE__, adapter_binary(target))
   end
+
+  @impl true
+  def submission_text_limit, do: @submission_text_limit
 
   @impl true
   def session_config(session, guidance) do

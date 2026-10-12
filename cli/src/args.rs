@@ -567,6 +567,10 @@ pub enum Command {
         host: String,
         dirs: Vec<String>,
     },
+    SessionDiagnose {
+        identity: Identity,
+        session_key: String,
+    },
     HarnessProcesses {
         identity: Identity,
     },
@@ -679,10 +683,13 @@ COMMANDS:
       --class elects the receiver's delivery policy. Without --class the wake
       follows the existing one-notice path. An explicit --after or --at keeps
       the sender's chosen delivery time.
-        tightbeam wake --role reviewer-code --prompt "review PR 12" --as coder
-        tightbeam wake --session agent:coder:app --prompt "check CI" --after 5m --as coder
-        tightbeam wake --role owner --when-fact build-finished --when-scope app \
-          --fallback-after 2h --prompt "re-read the work and decide" --as-process ci
+      Immediate:
+        tightbeam wake --role owner --prompt "check the next step" --as coder
+      Timed:
+        tightbeam wake --session agent:coder:app --prompt "recheck the card" --after 5m --as coder
+      Condition:
+        tightbeam wake --session agent:owner:app --when-fact assignment-landed \
+          --when-scope asg_123 --fallback-after 2h --prompt "re-read the card" --as coder
 
   condition --kind <kind> [--scope <scope>] [--key <idempotencyKey>]
       File an observable fact. Matching condition wakes receive the fact as a new
@@ -1013,6 +1020,9 @@ COMMANDS:
       the inherited PATH. The result previews the PATH shape adapters will use.
   harness-process list
       List the durable harness launch ledger, newest launch first.
+
+  session-diagnose --session EXACT --as-user USER [--json]
+      Read scoped process metadata without querying or changing the database.
 
   doctor [--json] [--base-dir p] [--as <role> | --as-user <userId>]
       Check the local Tightbeam installation and report its health, with each
@@ -1712,6 +1722,28 @@ fn parse_with_optional_catalog(
                 base_dir,
             })
         }
+        "session-diagnose" => {
+            if parsed.positional.len() != 1
+                || flags
+                    .keys()
+                    .any(|flag| !matches!(flag.as_str(), "session" | "as-user" | "json"))
+            {
+                return Err(
+                    "usage: tightbeam session-diagnose --session EXACT --as-user USER [--json]"
+                        .to_owned(),
+                );
+            }
+            let user = nonempty(flags, "as-user").ok_or("session-diagnose requires --as-user")?;
+            let session_key =
+                nonempty(flags, "session").ok_or("session-diagnose requires --session")?;
+            if session_key.len() > 512 || user.len() > 128 {
+                return Err("diagnostic_request_limit".to_owned());
+            }
+            Ok(Command::SessionDiagnose {
+                identity: Identity::User(user),
+                session_key,
+            })
+        }
         "harness-process" => parse_harness_process(&parsed, flags),
         "wake" => {
             let targets = [
@@ -1799,8 +1831,10 @@ fn parse_with_optional_catalog(
                         .to_owned(),
                 );
             }
-            if !wait && assignment_id.is_some() && !replace_queued {
-                return Err("--assignment requires --predicate or --after-turn".to_owned());
+            if !wait && assignment_id.is_some() && !replace_queued && after_ms.is_none() {
+                return Err(
+                    "--assignment requires --predicate, --after-turn, or --after".to_owned(),
+                );
             }
             if predicate.is_some() && fallback_after_ms.is_none() && at.is_none() {
                 return Err(
@@ -4821,6 +4855,7 @@ mod tests {
                 "decision-requests",
                 "dispatch",
                 "doctor",
+                "session-diagnose",
                 "effort-rule",
                 "harness-process",
                 "harness-health-observe-other",
@@ -4931,6 +4966,62 @@ mod tests {
         assert!(help.contains("third"));
         assert!(!help.contains("claude"));
         assert!(!help.contains("codex"));
+    }
+
+    #[test]
+    fn help_keeps_one_immediate_timed_and_condition_wake_example() {
+        let help = render_help(None);
+        let examples = help
+            .split_once("      Immediate:\n")
+            .unwrap()
+            .1
+            .split_once("\n\n  condition --kind")
+            .unwrap()
+            .0;
+
+        assert_eq!(examples.matches("tightbeam wake --").count(), 3);
+        assert!(examples.contains("tightbeam wake --role owner --prompt"));
+        assert!(examples.contains("--after 5m"));
+        assert!(examples.contains("--when-fact assignment-landed"));
+        assert!(examples.contains("--fallback-after 2h"));
+    }
+
+    #[test]
+    fn timed_assignment_recheck_keeps_its_context_for_the_advisory() {
+        let parsed = parse(strings(&[
+            "wake",
+            "--session",
+            "agent:holder:app",
+            "--assignment",
+            "asg_123",
+            "--after",
+            "5m",
+            "--prompt",
+            "recheck the card",
+        ]));
+
+        assert!(matches!(
+            parsed,
+            Ok(Command::Wake {
+                assignment_id: Some(ref assignment_id),
+                after_ms: Some(ref after_ms),
+                condition_kind: None,
+                ..
+            }) if assignment_id == "asg_123" && after_ms == "300000"
+        ));
+
+        assert_eq!(
+            parse(strings(&[
+                "wake",
+                "--session",
+                "agent:holder:app",
+                "--assignment",
+                "asg_123",
+                "--prompt",
+                "no trigger",
+            ])),
+            Err("--assignment requires --predicate, --after-turn, or --after".to_owned())
+        );
     }
 
     #[test]

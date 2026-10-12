@@ -132,6 +132,11 @@ defmodule Tightbeam.Harness.Claude do
   end
 
   @impl true
+  # The pinned ACP/SDK exposes no evidenced fixed ACP text maximum. This is
+  # not a downstream acceptance guarantee or a provider/transport allowance.
+  def submission_text_limit, do: nil
+
+  @impl true
   def session_config(session, guidance) do
     prefix =
       "Your Tight Beam archetype identity arrives as this Claude system prompt. " <>

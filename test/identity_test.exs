@@ -272,16 +272,17 @@ defmodule Tightbeam.IdentityTest do
     assert coder.guidance =~ "completion still needs verified evidence"
     assert coder.guidance =~ "A card is the unit of review"
 
-    for archetype <- ["coder", "orchestrator", "product-owner"] do
-      guidance = Identity.snapshot!(base, archetype, :codex).guidance
-      assert guidance =~ "attach the mandatory evidence block"
-      assert guidance =~ "projection-broken-stale-overlay"
-      assert guidance =~ "projection-broken-session-predates-reservation"
-    end
-
     capabilities = File.read!(Path.join(shipped, "capabilities.md"))
     assert capabilities =~ "GitHub auth looks missing"
     assert capabilities =~ "$TIGHTBEAM_HOME/auth/github/gh"
+
+    # The evidence recipe is product documentation. The served bundle points to it
+    # without copying the recipe into every archetype's guidance.
+    github_auth = File.read!(Path.expand("docs/GITHUB-AUTH.md"))
+    assert capabilities =~ "docs/GITHUB-AUTH.md"
+    assert github_auth =~ "Attach this mandatory evidence block to the ask:"
+    assert github_auth =~ "projection-broken-stale-overlay"
+    assert github_auth =~ "projection-broken-session-predates-reservation"
   end
 
   test "init refuses an identity repository missing the live ref with repair guidance", ctx do
@@ -521,6 +522,15 @@ defmodule Tightbeam.IdentityTest do
     System.put_env("GIT_CONFIG_SYSTEM", bare_config)
 
     for key <- ~w(GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL) do
+      System.delete_env(key)
+    end
+
+    # Command-scope configuration also overrides the bare global/system files.
+    # TestCase restores the environment; this case must prove a truly unaided
+    # commit even when the runner supplied its own nonsecret fixture identity.
+    for key <- Map.keys(System.get_env()),
+        key in ~w(GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS) or
+          Regex.match?(~r/^GIT_CONFIG_(KEY|VALUE)_\d+$/, key) do
       System.delete_env(key)
     end
 

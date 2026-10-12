@@ -70,14 +70,15 @@ defmodule Tightbeam.EscalationGuardFixture do
 
       ruled = Task.await(task)
 
-      assert {:ok, [[cursor, "fired", "condition"]]} =
+      assert {:ok, [[cursor, "pending", "condition", fired_at]]} =
                DB.query(
                  db,
-                 "SELECT conditionAfterId,state,firedBy FROM wakes WHERE conditionKind='escalation-ruled' AND conditionScope=?1",
+                 "SELECT conditionAfterId,state,firedBy,firedAt FROM wakes WHERE conditionKind='escalation-ruled' AND conditionScope=?1",
                  [request.id]
                )
 
       assert cursor < ruled.ruling_fact_id
+      assert is_integer(fired_at)
 
       rollback =
         Escalation.operator_ask(db, operator_call(raiser, %{question: "transaction rollback?"}))

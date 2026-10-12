@@ -45,6 +45,18 @@ defmodule Tightbeam.ErrorDiagnosticTest do
       assert ErrorDiagnostic.redact_text(text) == text
     end
 
+    test "keeps an existing secret marker stable across redaction passes" do
+      messages = [
+        "primary DB failure password=[REDACTED:secret_field]",
+        "Authorization: Basic [REDACTED:secret_field]\nHost: db.test"
+      ]
+
+      Enum.each(messages, fn message ->
+        assert ErrorDiagnostic.redact_text(message) == message
+        assert ErrorDiagnostic.redact_text(ErrorDiagnostic.redact_text(message)) == message
+      end)
+    end
+
     test "an unterminated private key block is masked to the end" do
       assert ErrorDiagnostic.redact_text("x -----BEGIN PRIVATE KEY-----\nfixtureSENTINEL") ==
                "x [REDACTED:private_key]"

@@ -30,14 +30,32 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     WorkItems
   }
 
-  setup do
+  setup tags do
     db = :"row_wait_db_#{System.unique_integer([:positive])}"
     scheduler = :"row_wait_scheduler_#{System.unique_integer([:positive])}"
     registry = :"row_wait_registry_#{System.unique_integer([:positive])}"
     lane = :"row_wait_lane_#{System.unique_integer([:positive])}"
     base = Path.join(System.tmp_dir!(), "row-wait-rules-#{System.unique_integer([:positive])}")
 
-    start_supervised!({DB, path: ":memory:", name: db})
+    db_opts =
+      if tags[:persistent] do
+        prepared =
+          Tightbeam.GuardRuntimeFixture.prepare!(
+            Path.join(base, "database"),
+            "schema_shape_runtime.exs"
+          )
+
+        [
+          path: Path.join(prepared.base, "state.db"),
+          name: db,
+          guard_inputs: [],
+          payload_root: prepared.payload
+        ]
+      else
+        [path: ":memory:", name: db]
+      end
+
+    start_supervised!({DB, db_opts})
     :ok = ensure_all_schemas(db)
     start_supervised!({ConnRegistry, name: registry})
     start_supervised!({Tightbeam.RowDrivenWaitsTest.LaneStub, lane})
@@ -47,7 +65,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
        name: scheduler,
        db: db,
        tick_ms: 60_000,
-       deliver: fn _wake -> :ok end,
+       deliver: delivery_fun(db, registry, lane),
        delivery_opts: [conn_registry: registry, lane_manager: lane]}
     )
 
@@ -93,7 +111,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
       Rules.load!(System.tmp_dir!() <> "/missing-row-wait-rules", [])
     end)
 
-    %{db: db, scheduler: scheduler, registry: registry, lane: lane, base: base}
+    %{db: db, db_opts: db_opts, scheduler: scheduler, registry: registry, lane: lane, base: base}
   end
 
   test "verifier notice is ordinary blocked-holder mail attributed only to V", ctx do
@@ -137,12 +155,8 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert Wakes.get(ctx.db, notice.wake_id).state == "fired"
 
-    assert {:ok, [["verifier", "V", "wi-verification", "queued"]]} =
-             DB.query(
-               ctx.db,
-               "SELECT sessionKey,assignmentId,jobRef,status FROM turns WHERE wakeId=?1",
-               [notice.wake_id]
-             )
+    assert [["verifier", "V", "wi-verification", "queued", _prompt]] =
+             turn_rows_for_source(ctx.db, notice.wake_id)
 
     assert supervision_counts(ctx.db, "V") == before
   end
@@ -243,10 +257,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
 
     verifier_wake_id = wake.verification_notice_wake_id
 
-    assert_receive {:firehose_notice,
-                    %{"class" => "wake.fired", "payload" => %{"wakeId" => ^verifier_wake_id}}}
-
-    Hub.delivered(hub, self())
+    receive_wake_fired(hub, verifier_wake_id, "fired")
 
     refute_receive {:firehose_notice,
                     %{"class" => "wake.fired", "payload" => %{"wakeId" => ^exact_wake_id}}}
@@ -260,19 +271,12 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert turn_count(ctx.db, wake.wake_id) == 1
 
-    assert_receive {:firehose_notice,
-                    %{
-                      "class" => "wake.fired",
-                      "payload" => %{"wakeId" => ^exact_wake_id, "state" => "fired"}
-                    }}
-
-    Hub.delivered(hub, self())
+    receive_wake_fired(hub, exact_wake_id, "fired")
 
     refute_receive {:firehose_notice,
                     %{"class" => "wake.fired", "payload" => %{"wakeId" => ^exact_wake_id}}}
 
-    assert {:ok, [[prompt]]} =
-             DB.query(ctx.db, "SELECT prompt FROM turns WHERE wakeId=?1", [wake.wake_id])
+    assert [prompt] = delivery_prompts_for_source(ctx.db, wake.wake_id)
 
     assert prompt =~ "[woke: wait #{wake.wake_id}; assignment A; path reconsideration;"
     assert prompt =~ "assignment:R"
@@ -280,7 +284,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assert prompt =~ "revoked"
     assert prompt =~ "disposition revoked"
     assert prompt =~ "predicate {"
-    assert String.ends_with?(prompt, "Continue from durable state without rewriting this prompt.")
+    assert prompt =~ "Continue from durable state without rewriting this prompt."
   end
 
   test "registration evaluates success and terminal resolver paths before returning", ctx do
@@ -302,11 +306,12 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assert success.verification_notice_wake_id == nil
 
     assert :ok = Wakes.fire_due(ctx.scheduler)
-    assert turn_count(ctx.db, terminal.wake_id) == 1
+    assert turn_count(ctx.db, terminal.wake_id) == 0
     assert turn_count(ctx.db, success.wake_id) == 0
 
     assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
     assert :ok = Wakes.fire_due(ctx.scheduler)
+    assert turn_count(ctx.db, terminal.wake_id) == 1
     assert turn_count(ctx.db, success.wake_id) == 1
   end
 
@@ -470,6 +475,17 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert turn_count(ctx.db, wake.wake_id) == 1
+    assert Wakes.get(ctx.db, wake.wake_id).prompt == wake.prompt
+
+    assert {:ok, [[delivered_prompt]]} =
+             DB.query(
+               ctx.db,
+               "SELECT t.prompt FROM turns t JOIN notice_batches b ON b.deliveryWakeId=t.wakeId JOIN notice_batch_members m ON m.batchId=b.batchId WHERE m.sourceWakeId=?1",
+               [wake.wake_id]
+             )
+
+    assert delivered_prompt =~ "[woke: wait #{wake.wake_id};"
+    assert delivered_prompt =~ wake.prompt
   end
 
   test "after-turn captures the running turn and becomes eligible on every terminal outcome",
@@ -721,8 +737,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert turn_count(ctx.db, latched.wake_id) == 1
 
-    assert {:ok, [[prompt]]} =
-             DB.query(ctx.db, "SELECT prompt FROM turns WHERE wakeId=?1", [latched.wake_id])
+    assert [prompt] = delivery_prompts_for_source(ctx.db, latched.wake_id)
 
     assert prompt =~ "work_item:wi-latched"
     assert prompt =~ ~s(state "open"→"iceboxed")
@@ -765,7 +780,14 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assert %{outcome: "revoked"} = revoke(ctx.db, "R-before-fallback")
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert Wakes.get(ctx.db, resolver_first.wake_id).recognition_path == "reconsideration"
+
+    assert turn_count(ctx.db, resolver_first.wake_id) == 0
+    assert Wakes.get(ctx.db, resolver_first.wake_id).state == "pending"
+    assert Tightbeam.NoticeBatcher.source_refs(ctx.db, resolver_first.wake_id) == []
+    drain_queued_turns(ctx.db, "holder")
+    assert :ok = Wakes.fire_due(ctx.scheduler)
     assert turn_count(ctx.db, resolver_first.wake_id) == 1
+    drain_queued_turns(ctx.db, "holder")
 
     assignment(ctx.db, "R-after-fallback", "resolver")
 
@@ -781,6 +803,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assert %{outcome: "revoked"} = revoke(ctx.db, "R-after-fallback")
     assert Wakes.get(ctx.db, fallback_first.wake_id).recognition_path == "fallback"
     assert :ok = Wakes.fire_due(ctx.scheduler)
+
     assert turn_count(ctx.db, fallback_first.wake_id) == 1
   end
 
@@ -1067,6 +1090,384 @@ defmodule Tightbeam.RowDrivenWaitsTest do
 
     refute covered?(ctx.db, "A")
     refute covered?(ctx.db, "B")
+  end
+
+  for sibling <- [:continuation, :ordinary], terminal <- ~w(delivered failed canceled) do
+    test "mixed #{sibling} carrier retains source wait coverage until #{terminal}", ctx do
+      qualification_policy(ctx)
+      assignment(ctx.db, "B", "holder")
+      assignment(ctx.db, "C", "holder")
+
+      assert {:ok, :armed} =
+               DB.transaction(ctx.db, fn txn ->
+                 Supervision.transition_in_txn(txn, %{
+                   kind: "assignment_open",
+                   assignment_id: "C",
+                   opened_at: 0,
+                   principal: "user:owner-a",
+                   supervision_interval_ms: 1
+                 })
+               end)
+
+      originating = running_turn(ctx.db, "holder")
+      first = after_turn_wait!(ctx.db, "A")
+      canceled = after_turn_wait!(ctx.db, "C")
+
+      second =
+        if unquote(sibling) == :continuation,
+          do: after_turn_wait!(ctx.db, "B"),
+          else: ordinary_wait_sibling!(ctx.db)
+
+      assert {:ok, {:accepted_in_txn, _, %{canceled: true}}} =
+               DB.transaction(ctx.db, fn txn ->
+                 {:ok, trigger} = Supervision.liveness_trigger_in_txn(txn, {:assignment, "C"})
+
+                 Wakes.cancel_in_txn(txn, %{
+                   wake_id: canceled.wake_id,
+                   expected_origin: canceled.origin,
+                   requester: %{kind: "session", id: "holder"},
+                   reason_kind: "requester_withdrew",
+                   causal_source: %{
+                     kind: "verb_call",
+                     accepted_event: %{
+                       origin: canceled.origin,
+                       session_key: "holder",
+                       principal: {:session, "holder"}
+                     }
+                   },
+                   outcome: %{kind: "no_replacement", liveness_trigger: trigger}
+                 })
+               end)
+
+      assert :ok =
+               Ledger.finish(ctx.db, originating.seq, "delivered", nil,
+                 owner_lease: originating.owner_lease
+               )
+
+      assert :ok = Wakes.fire_due(ctx.scheduler)
+
+      assert {:ok, [[carrier, nil, "queued"]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT wakeId,assignmentId,status FROM turns WHERE sessionKey='holder' AND status='queued'"
+               )
+
+      assert Enum.map(Tightbeam.Wakes.digest_members(ctx.db, carrier), & &1.wake_id) == [
+               first.wake_id,
+               second.wake_id
+             ]
+
+      assert covered?(ctx.db, "A")
+      assert covered?(ctx.db, "B") == (unquote(sibling) == :continuation)
+      refute covered?(ctx.db, "C")
+      uncovered = if unquote(sibling) == :continuation, do: "C", else: "B"
+
+      assert {:match, %{id: ^uncovered}} =
+               Supervision.prod_production_matches?(ctx.db, "holder", originating.seq)
+
+      assert turn_count(ctx.db, canceled.wake_id) == 0
+      assert {:ok, turn} = Ledger.claim_next(ctx.db, "holder", "mixed-wait")
+      assert covered?(ctx.db, "A")
+      assert covered?(ctx.db, "B") == (unquote(sibling) == :continuation)
+
+      assert {:match, %{id: ^uncovered}} =
+               Supervision.prod_production_matches?(ctx.db, "holder", originating.seq)
+
+      assert :ok =
+               Ledger.finish(ctx.db, turn.seq, unquote(terminal), nil,
+                 owner_lease: turn.owner_lease
+               )
+
+      refute covered?(ctx.db, "A")
+      refute covered?(ctx.db, "B")
+      refute covered?(ctx.db, "C")
+    end
+  end
+
+  @tag persistent: true
+  test "current-stamped continuation guard admits only the exact qualified retry migration",
+       ctx do
+    originating = running_turn(ctx.db, "holder")
+    original = after_turn_wait!(ctx.db, "A")
+
+    previous =
+      File.read!(Path.join(__DIR__, "fixtures/row_wakes/prewrite-continuation-21a4cb0e.sql"))
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               :ok = DB.Txn.exec(txn, "DROP TRIGGER supervision_liveness_sidecar_insert_coherent")
+               DB.Txn.exec(txn, previous)
+             end)
+
+    before = restoration_snapshot(ctx.db)
+    assert {:ok, stamp} = DB.query(ctx.db, "SELECT * FROM schema_stamp")
+    assert :ok = stop_supervised(DB)
+    start_supervised!({DB, ctx.db_opts})
+    assert :ok = Tightbeam.Schema.ensure_all(ctx.db)
+    assert restoration_snapshot(ctx.db) == before
+    assert {:ok, ^stamp} = DB.query(ctx.db, "SELECT * FROM schema_stamp")
+    assert {:ok, []} = DB.query(ctx.db, "PRAGMA foreign_key_check")
+
+    assert {:ok, [[current]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sql FROM sqlite_master WHERE name='supervision_liveness_sidecar_insert_coherent'"
+             )
+
+    assert current =~ "terminal.ownerLease=claim.ownerLease"
+    assert current =~ "t.status='running'"
+
+    assert :ok =
+             Ledger.finish(ctx.db, originating.seq, "delivered", nil,
+               owner_lease: originating.owner_lease
+             )
+
+    unbound = Wakes.schedule(ctx.db, Map.put(original, :wake_id, "unbound-continuation"))
+    before = restoration_snapshot(ctx.db)
+
+    assert {:error, %DB.Error{message: refusal}} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO supervision_liveness_sidecar(wakeId,assignmentId,controllerOrigin,controllerState) VALUES (?1,'A','holder_continuation','pending')",
+               [unbound.wake_id]
+             )
+
+    assert refusal =~ "supervision sidecar requires coherent pending wake"
+    assert restoration_snapshot(ctx.db) == before
+
+    malformed = String.replace(previous, "t.status='running'", "t.status='delivered'")
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               :ok = DB.Txn.exec(txn, "DROP TRIGGER supervision_liveness_sidecar_insert_coherent")
+               DB.Txn.exec(txn, malformed)
+             end)
+
+    before = restoration_snapshot(ctx.db)
+
+    assert {:ok, ddl} =
+             DB.query(ctx.db, "SELECT type,name,sql FROM sqlite_master ORDER BY type,name")
+
+    assert_raise Tightbeam.Schema.ShapeError, ~r/malformed owned object/, fn ->
+      Tightbeam.Schema.ensure_all(ctx.db)
+    end
+
+    assert restoration_snapshot(ctx.db) == before
+
+    assert {:ok, ^ddl} =
+             DB.query(ctx.db, "SELECT type,name,sql FROM sqlite_master ORDER BY type,name")
+
+    assert {:ok, ^stamp} = DB.query(ctx.db, "SELECT * FROM schema_stamp")
+    assert {:ok, []} = DB.query(ctx.db, "PRAGMA foreign_key_check")
+  end
+
+  for mode <- [:after_turn, :dependency], sibling <- [:none, :ordinary, :controller] do
+    @tag persistent: true
+    test "#{mode} continuation restores with #{sibling} through the lane terminal callback and reopen",
+         ctx do
+      qualification_policy(ctx)
+      assignment(ctx.db, "B", "holder")
+      originating = running_turn(ctx.db, "holder")
+
+      source =
+        if unquote(mode) == :after_turn,
+          do: after_turn_wait!(ctx.db, "A"),
+          else: register_wait(ctx.db, due_after(), predicate("R"))
+
+      if unquote(mode) == :dependency,
+        do: assert(%{assignment: _} = attest(ctx.db, "R", "resolver", "completion"))
+
+      ordinary = if unquote(sibling) == :ordinary, do: ordinary_wait_sibling!(ctx.db)
+
+      assert :ok =
+               Ledger.finish(ctx.db, originating.seq, "delivered", nil,
+                 owner_lease: originating.owner_lease
+               )
+
+      if unquote(sibling) == :controller do
+        assert {:ok, :armed} =
+                 DB.transaction(ctx.db, fn txn ->
+                   Supervision.transition_in_txn(txn, %{
+                     kind: "assignment_open",
+                     assignment_id: "B",
+                     opened_at: 0,
+                     principal: "user:owner-a",
+                     supervision_interval_ms: 1
+                   })
+                 end)
+
+        handlers = Gateway.handlers(%{db: ctx.db, wake_tick_ms: 60_000})
+
+        assert {:prodded, 1} =
+                 Supervision.evaluate(
+                   ctx.db,
+                   handlers,
+                   System.system_time(:millisecond),
+                   "holder",
+                   originating.seq
+                 )
+      end
+
+      assert :ok = Wakes.fire_due(ctx.scheduler)
+
+      assert {:ok, [[carrier, seq]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT wakeId,seq FROM turns WHERE sessionKey='holder' AND status='queued'"
+               )
+
+      expected = if unquote(sibling) == :none, do: 1, else: 2
+      members = Tightbeam.Wakes.digest_members(ctx.db, carrier)
+      assert length(members) == expected
+      assert source.wake_id in Enum.map(members, & &1.wake_id)
+      if ordinary, do: assert(ordinary.wake_id in Enum.map(members, & &1.wake_id))
+      history = wait_history(ctx.db)
+      charges = controller_charges(ctx.db)
+      start_supervised!({Registry, keys: :unique, name: Tightbeam.LaneRegistry})
+      tasks = start_supervised!(Task.Supervisor)
+      {turn, successors} = lane_prewrite_refusal!(ctx, tasks, seq)
+      assert length(successors) == expected
+      assert_wait_history!(ctx.db, history)
+      assert controller_charges(ctx.db) == charges
+      assert covered?(ctx.db, "A")
+      retry = Tightbeam.NoticeAuthority.current!(ctx.db, source.wake_id)
+      assert retry in successors
+
+      assert Map.drop(Wakes.get(ctx.db, source.wake_id), [:wake_id, :state, :due_at, :canceled_at]) ==
+               Map.drop(Wakes.get(ctx.db, retry), [:wake_id, :state, :due_at, :canceled_at])
+
+      assert {:ok, [["holder_continuation", nil, nil, "pending"]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT controllerOrigin,wakeKind,chargedGeneration,controllerState FROM supervision_liveness_sidecar WHERE wakeId=?1",
+                 [retry]
+               )
+
+      assert :ok = stop_supervised(DB)
+      start_supervised!({DB, ctx.db_opts})
+      assert :ok = Tightbeam.Schema.ensure_all(ctx.db)
+      before = restoration_snapshot(ctx.db)
+      evidence = wait_prewrite_evidence()
+
+      assert {:ok, ^successors} =
+               DB.transaction(
+                 ctx.db,
+                 &Tightbeam.NoticeSubmission.restore_in_txn(&1, turn, evidence)
+               )
+
+      assert restoration_snapshot(ctx.db) == before
+      assert covered?(ctx.db, "A")
+      at = successors |> Enum.map(&Wakes.get(ctx.db, &1).due_at) |> Enum.max()
+
+      [next_carrier] =
+        Tightbeam.NoticeBatcher.recover(ctx.db, at,
+          conn_registry: ctx.registry,
+          lane_manager: ctx.lane
+        )
+
+      assert {:ok, [[next_seq]]} =
+               DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [next_carrier])
+
+      {next_turn, next_successors} = lane_prewrite_refusal!(ctx, tasks, next_seq)
+      assert length(next_successors) == expected
+      assert controller_charges(ctx.db) == charges
+      assert Tightbeam.NoticeAuthority.current!(ctx.db, source.wake_id) in next_successors
+      assert Tightbeam.NoticeAuthority.restored_turn?(ctx.db, next_turn.seq)
+      at = next_successors |> Enum.map(&Wakes.get(ctx.db, &1).due_at) |> Enum.max()
+
+      [final_carrier] =
+        Tightbeam.NoticeBatcher.recover(ctx.db, at,
+          conn_registry: ctx.registry,
+          lane_manager: ctx.lane
+        )
+
+      assert {:ok, final_turn} =
+               Ledger.claim_next(ctx.db, "holder", "restored-continuation-delivery")
+
+      assert final_turn.wake_id == final_carrier
+      assert covered?(ctx.db, "A")
+
+      assert :ok =
+               Ledger.finish(ctx.db, final_turn.seq, "delivered", nil,
+                 owner_lease: final_turn.owner_lease
+               )
+
+      refute covered?(ctx.db, "A")
+      assert controller_charges(ctx.db) == charges
+
+      assert Tightbeam.NoticeBatcher.recover(ctx.db, at,
+               conn_registry: ctx.registry,
+               lane_manager: ctx.lane
+             ) == []
+
+      assert_wait_history!(ctx.db, history)
+      assert {:ok, []} = DB.query(ctx.db, "PRAGMA foreign_key_check")
+    end
+  end
+
+  for change <- [:obligation, :verification, :lease, :write] do
+    test "continuation #{change} change refuses prewrite restoration atomically", ctx do
+      qualification_policy(ctx)
+      originating = running_turn(ctx.db, "holder")
+      source = register_wait(ctx.db, due_after(), predicate("R"))
+      assert %{assignment: _} = attest(ctx.db, "R", "resolver", "completion")
+      assignment(ctx.db, "B", "holder")
+      ordinary_wait_sibling!(ctx.db)
+
+      assert :ok =
+               Ledger.finish(ctx.db, originating.seq, "delivered", nil,
+                 owner_lease: originating.owner_lease
+               )
+
+      assert :ok = Wakes.fire_due(ctx.scheduler)
+      assert {:ok, turn} = Ledger.claim_next(ctx.db, "holder", "refusal-control")
+
+      case unquote(change) do
+        :obligation ->
+          revoke(ctx.db, "A")
+
+        :verification ->
+          revoke(ctx.db, "V")
+
+        :lease ->
+          :ok
+
+        :write ->
+          assert :ok = Ledger.stamp_adapter(ctx.db, turn.seq, 1)
+
+          assert :ok =
+                   Tightbeam.TurnLifecycle.append(ctx.db, turn.seq, %{
+                     event_key: "prompt:dispatched",
+                     producer_event_id: "wait:port-write",
+                     kind: "prompt_dispatched",
+                     stage: "prompt",
+                     outcome: "dispatched",
+                     cause: "acp:port-write",
+                     principal: "process:tightbeam",
+                     owner_lease: turn.owner_lease,
+                     adapter_gen: 1,
+                     acp_request_id: 1,
+                     detail: %{v: 1}
+                   })
+      end
+
+      before = restoration_snapshot(ctx.db)
+      evidence = wait_prewrite_evidence()
+      lease = if unquote(change) == :lease, do: "stale-lease", else: turn.owner_lease
+
+      assert {:error, _} =
+               DB.transaction(ctx.db, fn txn ->
+                 Ledger.finish_in_txn(txn, turn.seq, "failed", "prewrite refusal",
+                   owner_lease: lease,
+                   prewrite_evidence: evidence
+                 )
+
+                 Tightbeam.NoticeSubmission.restore_in_txn(txn, turn, evidence)
+               end)
+
+      assert restoration_snapshot(ctx.db) == before
+      assert Tightbeam.NoticeAuthority.current!(ctx.db, source.wake_id) == source.wake_id
+    end
   end
 
   test "C2-C3: one covered card cannot suppress another card's actual prod or watermark", ctx do
@@ -1397,6 +1798,18 @@ defmodule Tightbeam.RowDrivenWaitsTest do
       assert :ok = Wakes.fire_due(ctx.scheduler)
       assert {:ok, turn} = Ledger.claim_next(ctx.db, "holder", "fixture")
       assert covered?(ctx.db, "A")
+
+      assert [
+               %{delivery_wake_id: carrier_id}
+             ] = Tightbeam.NoticeBatcher.source_refs(ctx.db, wake.wake_id)
+
+      assert turn.wake_id == carrier_id
+
+      assert {:ok, [["A", "holder", ^carrier_id]]} =
+               DB.query(ctx.db, "SELECT assignmentId,sessionKey,wakeId FROM turns WHERE seq=?1", [
+                 turn.seq
+               ])
+
       before = {attest_count(ctx.db, "A"), supervision_counts(ctx.db, "A")}
 
       assert :ok =
@@ -1409,9 +1822,137 @@ defmodule Tightbeam.RowDrivenWaitsTest do
 
       assert {:ok, [["open", nil]]} =
                DB.query(ctx.db, "SELECT state,outcome FROM assignments WHERE id='A'")
-
-      assert turn.wake_id == wake.wake_id
     end
+  end
+
+  defp after_turn_wait!(db, assignment_id) do
+    assert {:ok, wake} =
+             DB.transaction(db, fn txn ->
+               Wakes.register_wait_in_txn(txn, %{
+                 session_key: "holder",
+                 origin: "agent:holder",
+                 prompt: "Resume #{assignment_id} exactly.",
+                 assignment_id: assignment_id,
+                 after_turn: true,
+                 registrant_session_key: "holder",
+                 owner_user_id: "owner-a"
+               })
+             end)
+
+    wake
+  end
+
+  defp ordinary_wait_sibling!(db) do
+    Wakes.schedule(db, %{
+      session_key: "holder",
+      origin: "user:owner-a",
+      prompt: "Unrelated attributed ordinary source.",
+      assignment_id: "B",
+      due_at: 0
+    })
+  end
+
+  defp wait_prewrite_evidence do
+    Tightbeam.NoticeSubmission.prewrite_evidence(
+      :prompt,
+      {:acp_request_not_dispatched, {:transport_capacity_exceeded, 201, 200}}
+    )
+  end
+
+  defp lane_prewrite_refusal!(ctx, tasks, seq) do
+    parent = self()
+    evidence = wait_prewrite_evidence()
+    refute Tightbeam.Application.draining?()
+    refute Tightbeam.HarnessProcess.parked?(ctx.db, {:claude, "shared", "testhost"})
+
+    runner = fn turn ->
+      assert turn.seq == seq
+      send(parent, {:wait_claimed, seq})
+
+      {:error,
+       %{
+         reason: :local_prewrite_refusal,
+         prewrite_evidence: evidence,
+         record_in_txn: fn txn ->
+           {turn, Tightbeam.NoticeSubmission.restore_in_txn(txn, turn, evidence)}
+         end,
+         after_commit: fn result -> send(parent, {:restored_wait, seq, result}) end
+       }}
+    end
+
+    {:ok, lane} =
+      Tightbeam.SessionLane.start_link(
+        session_key: "holder",
+        db: ctx.db,
+        task_sup: tasks,
+        runner: runner
+      )
+
+    try do
+      deadline = System.monotonic_time(:millisecond) + 5_000
+      assert_receive {:wait_claimed, ^seq}, 5_000
+      remaining = max(deadline - System.monotonic_time(:millisecond), 0)
+
+      receive do
+        {:restored_wait, ^seq, result} ->
+          result
+      after
+        remaining ->
+          assert {:ok, events} =
+                   DB.query(
+                     ctx.db,
+                     "SELECT kind,detail FROM lifecycle_events WHERE subject=?1 AND kind IN ('turn_finalize_transaction_failed','turn_finalize_fallback_failed') ORDER BY id",
+                     ["holder:#{seq}"]
+                   )
+
+          flunk("claimed continuation did not restore: #{inspect(events)}")
+      end
+    after
+      GenServer.stop(lane)
+    end
+  end
+
+  defp wait_history(db) do
+    Map.new(["wakes", "notice_batches", "notice_batch_members"], fn table ->
+      {:ok, rows} = DB.query(db, "SELECT rowid,* FROM #{table} ORDER BY rowid")
+      {table, rows}
+    end)
+  end
+
+  defp assert_wait_history!(db, history) do
+    current = wait_history(db)
+
+    for {table, rows} <- history do
+      ids = MapSet.new(rows, &hd/1)
+      assert Enum.filter(current[table], &MapSet.member?(ids, hd(&1))) == rows
+    end
+  end
+
+  defp controller_charges(db) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT assignmentId,generation,prodCount FROM supervision_entitlements LEFT JOIN assignment_prods USING(assignmentId) ORDER BY assignmentId"
+      )
+
+    rows
+  end
+
+  defp restoration_snapshot(db) do
+    Map.new(
+      [
+        "turns",
+        "turn_lifecycle_events",
+        "wakes",
+        "wake_retry_attempts",
+        "supervision_liveness_sidecar",
+        "supervision_entitlements"
+      ],
+      fn table ->
+        {:ok, rows} = DB.query(db, "SELECT rowid,* FROM #{table} ORDER BY rowid")
+        {table, rows}
+      end
+    )
   end
 
   defp qualification_policy(ctx, other \\ true) do
@@ -1640,8 +2181,88 @@ defmodule Tightbeam.RowDrivenWaitsTest do
   end
 
   defp turn_count(db, wake_id) do
-    {:ok, [[count]]} = DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [wake_id])
+    {:ok, [[count]]} =
+      DB.query(
+        db,
+        """
+        SELECT COUNT(DISTINCT t.seq) FROM turns t
+        WHERE t.wakeId=?1 OR t.wakeId IN (
+          SELECT b.deliveryWakeId
+          FROM notice_batch_members m
+          JOIN notice_batches b ON b.batchId=m.batchId
+          WHERE m.sourceWakeId=?1 AND b.deliveryWakeId IS NOT NULL
+        )
+        """,
+        [wake_id]
+      )
+
     count
+  end
+
+  defp drain_queued_turns(db, session_key) do
+    case Ledger.claim_next(db, session_key, "fixture") do
+      {:ok, turn} ->
+        assert :ok = Ledger.finish(db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+        drain_queued_turns(db, session_key)
+
+      :none ->
+        :ok
+    end
+  end
+
+  defp receive_wake_fired(hub, wake_id, state, attempts \\ 12)
+
+  defp receive_wake_fired(_hub, _wake_id, _state, 0) do
+    flunk("did not receive the expected wake event")
+  end
+
+  defp receive_wake_fired(hub, wake_id, state, attempts) do
+    assert_receive {:firehose_notice, %{"class" => "wake.fired", "payload" => payload}}
+    Tightbeam.Firehose.Hub.delivered(hub, self())
+
+    if payload["wakeId"] == wake_id and payload["state"] == state do
+      payload
+    else
+      receive_wake_fired(hub, wake_id, state, attempts - 1)
+    end
+  end
+
+  defp turn_rows_for_source(db, wake_id) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT sessionKey, assignmentId, jobRef, status, prompt FROM turns WHERE wakeId=?1
+        UNION ALL
+        SELECT t.sessionKey, t.assignmentId, t.jobRef, t.status, t.prompt
+        FROM notice_batch_members m
+        JOIN notice_batches b ON b.batchId=m.batchId
+        JOIN turns t ON t.wakeId=b.deliveryWakeId
+        WHERE m.sourceWakeId=?1
+        """,
+        [wake_id]
+      )
+
+    rows
+  end
+
+  defp delivery_prompts_for_source(db, wake_id) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT prompt FROM turns WHERE wakeId=?1
+        UNION ALL
+        SELECT t.prompt
+        FROM notice_batch_members m
+        JOIN notice_batches b ON b.batchId=m.batchId
+        JOIN turns t ON t.wakeId=b.deliveryWakeId
+        WHERE m.sourceWakeId=?1
+        """,
+        [wake_id]
+      )
+
+    Enum.map(rows, fn [prompt] -> prompt end)
   end
 
   defp artifact_predicate(producer_id, expected_hash, reviewed?, resolver_id \\ nil) do
