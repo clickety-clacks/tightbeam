@@ -2342,15 +2342,28 @@ defmodule Tightbeam.SupervisionTest do
              )
   end
 
-  test "one bounded assignment checkpoint resets; repeats need a later effect", ctx do
+  test "a checkpoint skipped by the repeat cap is reconsidered after a later effect", ctx do
     attach_work_item!(ctx.db, "asg_1", "wi_checkpoint")
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0, interval: 60_000)
     now = System.system_time(:millisecond)
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='supervision_liveness_checkpoint_bindings_assignment'"
+             )
 
     {first, seq1} =
       schedule_checkpoint_via_gateway!(ctx, "resume receipt work", 60_000)
 
     assert :rebased = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq1)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE supervision_liveness_receipts SET acceptedAt=0, expiresAt=1 WHERE assignmentId='asg_1' AND sourceKind='checkpoint' AND sourceId=?1",
+        [first.wake_id]
+      )
 
     {second, seq2} =
       schedule_checkpoint_via_gateway!(ctx, "same checkpoint again", 120_000)
@@ -2360,22 +2373,46 @@ defmodule Tightbeam.SupervisionTest do
 
     assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq2)
     prod = Enum.find(Wakes.list_pending(ctx.db), &(&1.origin == "process:tightbeam"))
+    assert prod.prompt =~ "without a newly eligible liveness receipt"
+    assert prod.prompt =~ "This does not mean that no filing or continuation exists"
+    refute prod.prompt =~ "no qualifying receipt or admitted continuation"
+
+    assert {:ok, [[cursor, wake_row]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state.wakeCursor, wakes.rowid FROM supervision_liveness_receipt_state state JOIN wakes ON wakes.wakeId=?1 WHERE state.assignmentId='asg_1'",
+               [second.wake_id]
+             )
+
+    assert cursor >= wake_row
+
     cancel_wake!(ctx.db, prod)
 
     insert_artifact!(ctx.db, "art_checkpoint_reset", "holder", "wi_checkpoint", now + 1)
     seq3 = terminal!(ctx.db, "holder")
     assert :rebased = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq3)
 
-    {third, seq4} =
-      schedule_checkpoint_via_gateway!(ctx, "checkpoint after durable effect", 180_000)
+    assert {:ok, [[cursor, wake_row]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state.wakeCursor, wakes.rowid FROM supervision_liveness_receipt_state state JOIN wakes ON wakes.wakeId=?1 WHERE state.assignmentId='asg_1'",
+               [second.wake_id]
+             )
 
+    assert cursor >= wake_row
+    assert Wakes.get(ctx.db, second.wake_id).state == "pending"
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE supervision_entitlements SET dueAt=0 WHERE assignmentId='asg_1'")
+
+    seq4 = terminal!(ctx.db, "holder")
     assert :rebased = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq4)
 
     assert {:ok,
             [
               ["checkpoint", first_id],
               ["artifact", "art_checkpoint_reset"],
-              ["checkpoint", third_id]
+              ["checkpoint", second_id]
             ]} =
              DB.query(
                ctx.db,
@@ -2383,8 +2420,15 @@ defmodule Tightbeam.SupervisionTest do
              )
 
     assert first_id == first.wake_id
-    assert third_id == third.wake_id
-    refute second.wake_id in [first_id, third_id]
+    assert second_id == second.wake_id
+    assert Wakes.get(ctx.db, second.wake_id).state == "pending"
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM supervision_liveness_receipts WHERE assignmentId='asg_1' AND sourceKind='checkpoint' AND sourceId=?1",
+               [second.wake_id]
+             )
   end
 
   test "unrelated progress and unbound, unrelated, or expired wakes are not receipts", ctx do
@@ -2555,7 +2599,18 @@ defmodule Tightbeam.SupervisionTest do
                [controller.wake_id]
              )
 
-    assert {:ok, [[4]]} =
+    assert {:ok,
+            [
+              ["checkpoint", checkpoint_id, 7]
+            ]} =
+             DB.query(
+               ctx.db,
+               "SELECT sourceKind,sourceId,generation FROM supervision_liveness_receipts WHERE assignmentId='asg_1' AND sourceKind='checkpoint'"
+             )
+
+    assert checkpoint_id == checkpoint.wake_id
+
+    assert {:ok, [[5]]} =
              DB.query(
                ctx.db,
                "SELECT COUNT(*) FROM supervision_liveness_receipts WHERE assignmentId='asg_1'"
@@ -2564,7 +2619,7 @@ defmodule Tightbeam.SupervisionTest do
     assert {:ok, [[receipt_id]]} =
              DB.query(
                ctx.db,
-               "SELECT CAST(MAX(receiptId) AS TEXT) FROM supervision_liveness_receipts WHERE assignmentId='asg_1'"
+               "SELECT CAST(MAX(receiptId) AS TEXT) FROM supervision_liveness_receipts WHERE assignmentId='asg_1' AND generation=6"
              )
 
     assert {:ok,
@@ -4543,8 +4598,9 @@ defmodule Tightbeam.SupervisionTest do
 
     expected_prod =
       "[from process:tightbeam]\n\n" <>
-        "Your turn ended with no qualifying receipt or admitted continuation covering assignment asg_1 — \"ship it\". " <>
-        "File a qualifying receipt, register an obligation-scoped continuation, or file truthful completion or typed cannot-proceed with a reason. This is prod 1 of 3; " <>
+        "Your turn ended without a newly eligible liveness receipt for assignment asg_1 — \"ship it\". " <>
+        "This does not mean that no filing or continuation exists; a pending continuation may remain scheduled without earning renewed credit. " <>
+        "File a qualifying durable effect or truthful completion or typed cannot-proceed with a reason. This is prod 1 of 3; " <>
         "a reply without a row escalates to your spawner."
 
     assert {:ok, [[^expected_prod]]} =
@@ -4641,8 +4697,9 @@ defmodule Tightbeam.SupervisionTest do
 
     expected_escalation =
       "[from process:tightbeam]\n\n" <>
-        "Assignment asg_escalation — \"investigate\" — held by escalating-holder is stalled: " <>
-        "0 prods produced no qualifying receipt and no admitted continuation covering it. This is escalation 1 for this assignment. " <>
+        "Assignment asg_escalation — \"investigate\" — held by escalating-holder reached escalation after 0 prods without a newly eligible liveness receipt " <>
+        "resetting supervision. This does not mean that no filing or continuation exists; a pending continuation may remain scheduled without earning renewed credit. " <>
+        "This is escalation 1 for this assignment. " <>
         "Why, and what happens next, is your judgment — the substrate only reports the rows."
 
     assert {:ok, [[^expected_escalation]]} =

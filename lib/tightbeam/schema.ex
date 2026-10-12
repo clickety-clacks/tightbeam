@@ -1702,6 +1702,7 @@ defmodule Tightbeam.Schema do
     # Refused predecessors must retain their exact schema, including indexes.
     # Build these additive access paths only after the existing migrations and
     # qualifications succeed, but before publishing a successful boot marker.
+    :ok = ensure_supervision_checkpoint_runtime_index(db)
     :ok = ensure_lifecycle_runtime_indexes(db)
     :ok = ensure_idle_cleanup_runtime_indexes(db)
 
@@ -2287,7 +2288,8 @@ defmodule Tightbeam.Schema do
   # Additive access paths, built before runtime consumers start. A copied
   # predecessor can contain tens of millions of lifecycle rows; index creation
   # belongs to the unbounded migration context, never an ordinary DB call.
-  # Both indexes commit together, and IF NOT EXISTS makes restart inexpensive.
+  # Both lifecycle indexes commit together, and IF NOT EXISTS makes restart
+  # inexpensive.
   defp ensure_lifecycle_runtime_indexes(db) do
     indexes = [
       {"lifecycle_events_subject_kind",
@@ -2328,6 +2330,34 @@ defmodule Tightbeam.Schema do
       {:error, error} ->
         raise ShapeError,
           message: "lifecycle runtime index migration failed: #{Exception.message(error)}"
+    end
+  end
+
+  # Checkpoint admission rescans assignment-bound wakes after the general wake
+  # cursor advances. Build this lookup only after migration/refusal checks so
+  # an unsupported predecessor keeps its exact schema.
+  defp ensure_supervision_checkpoint_runtime_index(db) do
+    name = "supervision_liveness_checkpoint_bindings_assignment"
+
+    sql =
+      "CREATE INDEX IF NOT EXISTS #{name} " <>
+        "ON supervision_liveness_checkpoint_bindings(assignmentId, holderSessionKey, wakeId)"
+
+    case DB.migration_transaction(db, :supervision_checkpoint_runtime_index, [], [], fn txn ->
+           Logger.info("database migration runtime index #{name}: begin")
+           started = System.monotonic_time(:millisecond)
+           :ok = Txn.exec(txn, sql)
+           elapsed = System.monotonic_time(:millisecond) - started
+           Logger.info("database migration runtime index #{name}: finished elapsed_ms=#{elapsed}")
+           :ok
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "supervision checkpoint runtime index migration failed: #{Exception.message(error)}"
     end
   end
 

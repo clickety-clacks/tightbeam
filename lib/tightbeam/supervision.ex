@@ -3807,7 +3807,7 @@ defmodule Tightbeam.Supervision do
         assignment_id
       ])
 
-    [[artifact_cursor, attest_cursor, event_cursor, wake_cursor]] =
+    [[artifact_cursor, attest_cursor, event_cursor, _wake_cursor]] =
       Txn.q(
         txn,
         """
@@ -3835,12 +3835,14 @@ defmodule Tightbeam.Supervision do
         txn,
         assignment_id,
         holder,
-        wake_cursor,
         wake_max,
         effects,
         evaluation_clock
       )
 
+    # Keep the source watermark for the ordinary wake scan, but checkpoint
+    # eligibility is also checked against the durable binding/receipt ledger:
+    # an effect-priority scan can pass a still-pending checkpoint row.
     Txn.q(
       txn,
       """
@@ -4040,7 +4042,6 @@ defmodule Tightbeam.Supervision do
          _txn,
          _assignment_id,
          _holder,
-         _cursor,
          _maximum,
          effects,
          _evaluation_clock
@@ -4052,7 +4053,6 @@ defmodule Tightbeam.Supervision do
          txn,
          assignment_id,
          holder,
-         cursor,
          maximum,
          [],
          evaluation_clock
@@ -4073,21 +4073,32 @@ defmodule Tightbeam.Supervision do
     if latest_kind == "checkpoint" do
       nil
     else
+      # The general wake cursor can pass a checkpoint while a durable effect
+      # takes priority, or while the one-checkpoint-per-effect rule blocks it.
+      # Revisit still-pending bound wakes until one is credited; the receipt
+      # ledger below makes that retry idempotent.
       case Txn.q(
              txn,
              """
              SELECT w.wakeId, w.createdAt, w.dueAt
              FROM wakes w
              JOIN supervision_liveness_checkpoint_bindings b ON b.wakeId=w.wakeId
-             WHERE w.rowid > ?1 AND w.rowid <= ?2
-               AND b.assignmentId=?3 AND b.holderSessionKey=?4
-               AND w.sessionKey=?4 AND w.creatorSessionKey=?4
+             WHERE w.rowid <= ?1
+               AND b.assignmentId=?2 AND b.holderSessionKey=?3
+               AND w.sessionKey=?3 AND w.creatorSessionKey=?3
                AND w.consumer='prompt' AND w.state='pending'
-               AND w.dueAt > ?5 AND w.dueAt > w.createdAt
+               AND w.dueAt > ?4 AND w.dueAt > w.createdAt
+               AND NOT EXISTS (
+                 SELECT 1
+                 FROM supervision_liveness_receipts r
+                 WHERE r.assignmentId=b.assignmentId
+                   AND r.sourceKind='checkpoint'
+                   AND r.sourceId=w.wakeId
+               )
              ORDER BY w.dueAt, w.rowid
              LIMIT 1
              """,
-             [cursor, maximum, assignment_id, holder, evaluation_clock]
+             [maximum, assignment_id, holder, evaluation_clock]
            ) do
         [[id, at, due_at]] ->
           %{kind: "checkpoint", id: id, at: at, expires_at: due_at}
@@ -6442,14 +6453,16 @@ defmodule Tightbeam.Supervision do
   end
 
   defp prod_prompt(id, subject, k, n) do
-    "Your turn ended with no qualifying receipt or admitted continuation covering assignment #{id} — \"#{subject}\". " <>
-      "File a qualifying receipt, register an obligation-scoped continuation, or file truthful completion or typed cannot-proceed with a reason. This is prod #{k} of #{n}; " <>
+    "Your turn ended without a newly eligible liveness receipt for assignment #{id} — \"#{subject}\". " <>
+      "This does not mean that no filing or continuation exists; a pending continuation may remain scheduled without earning renewed credit. " <>
+      "File a qualifying durable effect or truthful completion or typed cannot-proceed with a reason. This is prod #{k} of #{n}; " <>
       "a reply without a row escalates to your spawner."
   end
 
   defp escalation_prompt(id, subject, holder, n, rung) do
-    "Assignment #{id} — \"#{subject}\" — held by #{holder} is stalled: #{n} prods produced no qualifying receipt " <>
-      "and no admitted continuation covering it. This is escalation #{rung} for this assignment. Why, and what happens next, " <>
+    "Assignment #{id} — \"#{subject}\" — held by #{holder} reached escalation after #{n} prods without a newly eligible liveness receipt " <>
+      "resetting supervision. This does not mean that no filing or continuation exists; a pending continuation may remain scheduled without earning renewed credit. " <>
+      "This is escalation #{rung} for this assignment. Why, and what happens next, " <>
       "is your judgment — the substrate only reports the rows."
   end
 

@@ -737,7 +737,10 @@ defmodule Tightbeam.SupervisionConsumerFixture do
             [source] =
               NoticeBatcher.carrier_members(ctx.db, turn.wake_id)
               |> Enum.filter(
-                &String.starts_with?(&1.prompt, "Your turn ended with no qualifying receipt")
+                &String.starts_with?(
+                  &1.prompt,
+                  "Your turn ended without a newly eligible liveness receipt"
+                )
               )
 
             source_wake_id = source.wake_id
