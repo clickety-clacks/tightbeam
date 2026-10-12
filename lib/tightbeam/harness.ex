@@ -80,6 +80,8 @@ defmodule Tightbeam.Harness do
   @callback prepare_launch(target(), String.t(), keyword()) :: launch_plan() | launch_result()
   @callback ensure_adapter(target()) :: ensure_result()
   @callback session_config(map(), binary()) :: map()
+  @doc "An evidenced ACP submission limit across all text parts, in Unicode scalar values."
+  @callback submission_text_limit() :: pos_integer() | nil
   @doc "Optional per-thread guidance projection before the first model turn."
   @callback project_session_identity(target(), String.t(), binary()) :: :ok | {:error, term()}
   @doc "Optional verification that the projected hook ran during an adapter gate."
@@ -123,6 +125,7 @@ defmodule Tightbeam.Harness do
   @optional_callbacks preflight_launch: 3,
                       warm_home: 2,
                       local_client_model_authority?: 1,
+                      submission_text_limit: 0,
                       project_session_identity: 3,
                       verify_session_identity_hook: 2
 
@@ -153,6 +156,26 @@ defmodule Tightbeam.Harness do
 
   @spec probe_cli(module(), target()) :: probe_result()
   def probe_cli(module, target), do: module.probe_cli(target)
+
+  @doc "Resolve the registered receiver's text limit; nil claims no fixed ACP text maximum."
+  def submission_text_limit(nil), do: nil
+
+  def submission_text_limit(harness) when is_binary(harness) do
+    module =
+      Enum.find(known(), &(&1.wire_name() == harness)) ||
+        raise ArgumentError, "unknown harness: #{inspect(harness)}"
+
+    submission_text_limit(module)
+  end
+
+  def submission_text_limit(harness) when is_atom(harness) do
+    module = module!(harness)
+    Code.ensure_loaded!(module)
+
+    if function_exported?(module, :submission_text_limit, 0),
+      do: module.submission_text_limit(),
+      else: nil
+  end
 
   @doc "Ask a harness whether its installed local client, rather than its catalog, accepts this id."
   @spec local_client_model_authority?(binary(), Tightbeam.Model.t()) :: boolean()

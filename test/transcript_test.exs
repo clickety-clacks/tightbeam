@@ -460,7 +460,6 @@ defmodule Tightbeam.TranscriptTest do
 
     assert Enum.filter(qualified, &(elem(&1, 2) == :enqueue_in_txn)) == [
              {"lib/tightbeam/gateway.ex", "append_and_enqueue_in_txn/7", :enqueue_in_txn},
-             {"lib/tightbeam/harness_health.ex", "incident_notice_in_txn/4", :enqueue_in_txn},
              {"lib/tightbeam/wakes.ex", "redeliver_health_source_in_txn/3", :enqueue_in_txn}
            ]
 

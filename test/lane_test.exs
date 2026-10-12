@@ -1048,6 +1048,21 @@ defmodule Tightbeam.LaneTest do
     assert_receive {:provider_terminal, "failed"}
     assert eventually(fn -> Ledger.pending_sessions(ctx.db) == [] end)
 
+    finalize_events =
+      EventLog.lifecycle_events(ctx.db)
+      |> Enum.filter(&(&1.subject == "k1:#{seq}"))
+      |> Enum.map(& &1.kind)
+
+    assert "turn_finalize_transaction_failed" in finalize_events
+    refute "turn_finalize_fallback_failed" in finalize_events
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM turn_lifecycle_events WHERE turnSeq=?1 AND kind='terminal_committed' AND outcome='failed'",
+               [seq]
+             )
+
     assert {:ok, [["failed", error]]} =
              DB.query(ctx.db, "SELECT status,error FROM turns WHERE seq=?1", [seq])
 

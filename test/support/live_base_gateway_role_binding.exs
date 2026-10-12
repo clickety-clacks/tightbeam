@@ -1,5 +1,5 @@
 import ExUnit.Assertions
-alias Tightbeam.{DB, EventLog, Gateway, Model, Org, Roles, Wakes}
+alias Tightbeam.{DB, EventLog, Gateway, Model, NoticeBatcher, Org, Roles, Wakes}
 # Same inert post-commit doorbell boundary as GatewayTest.LaneDoorbell.
 defmodule GuardRoleDoorbell do
   use GenServer
@@ -56,12 +56,26 @@ Tightbeam.GuardGatewayFixture.run!(fn %{db: db, config: config} ->
 
     assert :ok = Wakes.fire_due(scheduler)
 
-    assert {:ok, [["agent:new", "reviewer", 0]]} =
+    assert [%{delivery_wake_id: carrier_id, batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(db, scheduled.wake_id)
+
+    assert {:ok, [["agent:new", nil, 0]]} =
              DB.query(
                db,
                "SELECT sessionKey, roleRef, roleFallback FROM turns WHERE wakeId = ?1",
-               [scheduled.wake_id]
+               [carrier_id]
              )
+
+    # The carrier addresses the resolved concrete session; the source retains
+    # the role authority used to resolve it at this boundary.
+    assert Wakes.get(db, scheduled.wake_id).target_role == "reviewer"
+    assert :ok = Wakes.fire_due(scheduler)
+
+    assert {:ok, [[1]]} =
+             DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [carrier_id])
+
+    assert {:ok, [[0]]} =
+             DB.query(db, "SELECT COUNT(*) FROM turns WHERE sessionKey=?1", [old.session_key])
 
     deleted =
       wake_handler.(%{
@@ -76,14 +90,17 @@ Tightbeam.GuardGatewayFixture.run!(fn %{db: db, config: config} ->
     {:ok, _} = DB.query(db, "UPDATE wakes SET dueAt = 0 WHERE wakeId = ?1", [deleted.wake_id])
     assert :ok = Wakes.fire_due(scheduler)
     assert Wakes.get(db, deleted.wake_id).state == "fired"
+    assert Wakes.get(db, deleted.wake_id).prompt == "will disappear"
+    assert [] = NoticeBatcher.source_refs(db, deleted.wake_id)
+    assert :ok = Wakes.fire_due(scheduler)
 
     assert {:ok, [[0]]} =
              DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId = ?1", [deleted.wake_id])
 
-    assert Enum.any?(EventLog.lifecycle_events(db), fn event ->
+    assert Enum.count(EventLog.lifecycle_events(db), fn event ->
              event.kind == "wake_unresolved" and event.subject == deleted.wake_id and
                event.detail == "role reviewer no longer exists"
-           end)
+           end) == 1
 
     assert_receive {:ensure_lane, "agent:new"}, 1_000
   after

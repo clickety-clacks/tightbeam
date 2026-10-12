@@ -80,6 +80,41 @@ defmodule Tightbeam.Acp.Conn do
       else: ErrorDiagnostic.classified(reply)
   end
 
+  @doc false
+  # Measure the exact NDJSON frame, including the actual request id, JSON
+  # escaping and delimiter. A transport ceiling is not a token allowance.
+  # Its caller must obtain it from the configured receiver; nil means unknown,
+  # not unlimited receiver capacity. No synthetic ceiling is installed here.
+  def request_frame(id, method, params, max_request_bytes \\ nil, submission_harness \\ nil) do
+    payload = JSON.encode!(%{jsonrpc: "2.0", id: id, method: method, params: params}) <> "\n"
+
+    submission =
+      if method == "session/prompt",
+        do:
+          Tightbeam.SubmissionSize.check_text(
+            params[:prompt] || params["prompt"] || [],
+            Tightbeam.Harness.submission_text_limit(submission_harness)
+          ),
+        else: :ok
+
+    cond do
+      submission != :ok ->
+        submission
+
+      is_nil(max_request_bytes) ->
+        {:ok, payload}
+
+      not is_integer(max_request_bytes) or max_request_bytes <= 0 ->
+        {:error, :invalid_transport_capacity}
+
+      byte_size(payload) > max_request_bytes ->
+        {:error, {:transport_capacity_exceeded, byte_size(payload), max_request_bytes}}
+
+      true ->
+        {:ok, payload}
+    end
+  end
+
   @doc "Fire-and-forget JSON-RPC notification (no id, no reply)."
   @spec notify(conn(), String.t(), map()) :: :ok
   def notify(conn, method, params), do: GenServer.cast(conn, {:notify, method, params})
@@ -167,53 +202,62 @@ defmodule Tightbeam.Acp.Conn do
       true ->
         id = state.next_id
 
-        if send_request_json(state.port, %{
-             jsonrpc: "2.0",
-             id: id,
-             method: method,
-             params: params
-           }) do
-          notify_dispatched(opts, id)
-          timeout = Keyword.get(opts, :timeout, 60_000)
+        case request_frame(
+               id,
+               method,
+               params,
+               Keyword.get(opts, :max_request_bytes),
+               Keyword.get(opts, :submission_harness)
+             ) do
+          {:error, reason} ->
+            notify_not_dispatched(opts, reason)
+            {:reply, {:error, {:acp_request_not_dispatched, reason}}, state}
 
-          deadline = Keyword.get(opts, :prompt_deadline)
-          token = make_ref()
+          {:ok, payload} ->
+            if send_request_payload(state.port, payload) do
+              notify_dispatched(opts, id)
+              timeout = Keyword.get(opts, :timeout, 60_000)
 
-          timer =
-            if is_integer(deadline) do
-              Process.send_after(
-                self(),
-                {:prompt_deadline, id, token},
-                max(deadline - System.monotonic_time(:millisecond), 0)
-              )
+              deadline = Keyword.get(opts, :prompt_deadline)
+              token = make_ref()
+
+              timer =
+                if is_integer(deadline) do
+                  Process.send_after(
+                    self(),
+                    {:prompt_deadline, id, token},
+                    max(deadline - System.monotonic_time(:millisecond), 0)
+                  )
+                else
+                  if timeout != :infinity,
+                    do: Process.send_after(self(), {:req_timeout, id}, timeout)
+                end
+
+              entry = %{
+                from: from,
+                monitor: Process.monitor(pid),
+                owner_monitor: if(is_pid(opts[:owner]), do: Process.monitor(opts[:owner])),
+                deadline: deadline,
+                timer: timer,
+                cancel_timer: nil,
+                token: token,
+                cancel_reason: nil,
+                cancel_grace: Keyword.get(opts, :cancel_grace, 5_000),
+                session_id: Keyword.get(opts, :session_id),
+                prompt_session_id:
+                  if(method == "session/prompt", do: params[:sessionId] || params["sessionId"]),
+                method: method,
+                timeout: timeout,
+                orphaned: false,
+                replied: false
+              }
+
+              {:noreply, %{state | next_id: id + 1, pending: Map.put(state.pending, id, entry)}}
             else
-              if timeout != :infinity, do: Process.send_after(self(), {:req_timeout, id}, timeout)
+              notify_not_dispatched(opts, :closed)
+              state = %{state | closed: true, closed_by: :send_failed}
+              {:reply, {:error, transport_failure(state, :closed, method, nil)}, state}
             end
-
-          entry = %{
-            from: from,
-            monitor: Process.monitor(pid),
-            owner_monitor: if(is_pid(opts[:owner]), do: Process.monitor(opts[:owner])),
-            deadline: deadline,
-            timer: timer,
-            cancel_timer: nil,
-            token: token,
-            cancel_reason: nil,
-            cancel_grace: Keyword.get(opts, :cancel_grace, 5_000),
-            session_id: Keyword.get(opts, :session_id),
-            prompt_session_id:
-              if(method == "session/prompt", do: params[:sessionId] || params["sessionId"]),
-            method: method,
-            timeout: timeout,
-            orphaned: false,
-            replied: false
-          }
-
-          {:noreply, %{state | next_id: id + 1, pending: Map.put(state.pending, id, entry)}}
-        else
-          notify_not_dispatched(opts, :closed)
-          state = %{state | closed: true, closed_by: :send_failed}
-          {:reply, {:error, transport_failure(state, :closed, method, nil)}, state}
         end
     end
   end
@@ -578,6 +622,10 @@ defmodule Tightbeam.Acp.Conn do
   defp send_request_json(port, map) do
     payload = JSON.encode!(map) <> "\n"
 
+    send_request_payload(port, payload)
+  end
+
+  defp send_request_payload(port, payload) do
     try do
       Port.command(port, payload)
     rescue

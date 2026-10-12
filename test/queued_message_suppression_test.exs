@@ -3,9 +3,11 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
 
   alias Tightbeam.{
     Assignments,
+    ConnRegistry,
     DB,
-    Gateway,
     Ledger,
+    NoticeBatcher,
+    Projection,
     QueuedMessageSuppression,
     Roles,
     Rules,
@@ -228,7 +230,7 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
         class: "fyi"
       })
 
-    assert replacement_wake.delivery_rule == "batcher-inhibited r1"
+    assert replacement_wake.delivery_rule == "notice-batching-v1 r2"
 
     assert {:ok, [["asg_replace"]]} =
              DB.query(
@@ -639,6 +641,198 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
     assert {:ok, [[2]]} = DB.query(db, "SELECT COUNT(*) FROM turns WHERE sessionKey=?1", ["k1"])
   end
 
+  test "pending dispatch correction shares one real carrier with the other sender", %{db: db} do
+    %{turn: turn, assignment: assignment, initial: initial, control: control} =
+      busy_dispatch_queue!(db)
+
+    correction = replacement_source!(db, assignment.id, "CORRECTION queue nonce")
+    assert_superseded_source!(db, initial, correction)
+    assert Wakes.get(db, control.wake_id).state == "pending"
+    assert NoticeBatcher.recover(db) == []
+    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM turns WHERE sessionKey='k1'")
+    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM notice_batch_members")
+
+    assert {:ok, [["running"]]} =
+             DB.query(db, "SELECT status FROM turns WHERE seq=?1", [turn.seq])
+
+    # End the owned durable turn; no sleeps or process timing establish readiness.
+    assert :ok = Ledger.finish(db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+    [carrier] = NoticeBatcher.recover(db)
+    assert carrier not in [initial.wake_id, control.wake_id, correction.wake_id]
+
+    for source <- [control, correction] do
+      assert [%{delivery_wake_id: ^carrier, batch_state: "delivered", member_state: "included"}] =
+               NoticeBatcher.source_refs(db, source.wake_id)
+    end
+
+    assert NoticeBatcher.source_refs(db, initial.wake_id) == []
+
+    assert {:ok, [[seq, "queued", prompt]]} =
+             DB.query(db, "SELECT seq,status,prompt FROM turns WHERE wakeId=?1", [carrier])
+
+    assert prompt =~ control.prompt
+    assert prompt =~ correction.prompt
+    refute prompt =~ "INITIAL queue nonce"
+    assert {control_pos, _} = :binary.match(prompt, control.wake_id)
+    assert {correction_pos, _} = :binary.match(prompt, correction.wake_id)
+    assert control_pos < correction_pos
+    assert {:ok, [[2]]} = DB.query(db, "SELECT COUNT(*) FROM notice_batch_members")
+
+    assert {:ok, [[0]]} =
+             DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId IN (?1,?2,?3)", [
+               initial.wake_id,
+               control.wake_id,
+               correction.wake_id
+             ])
+
+    assert NoticeBatcher.recover(db) == []
+    assert {:ok, [[2]]} = DB.query(db, "SELECT COUNT(*) FROM turns WHERE sessionKey='k1'")
+    assert {:ok, %{seq: ^seq, prompt: ^prompt}} = Ledger.claim_next(db, "k1", "lane")
+  end
+
+  test "a second conversational correction supersedes the first pending correction", %{db: db} do
+    %{turn: turn, assignment: assignment, initial: initial, control: control} =
+      busy_dispatch_queue!(db)
+
+    older = replacement_source!(db, assignment.id, "OLDER queue nonce")
+    newest = replacement_source!(db, assignment.id, "NEWEST queue nonce")
+
+    # CLI --replace-queued scopes suppression; it cannot forge wake/turn attribution.
+    assert older.assignment_id == nil
+    assert newest.assignment_id == nil
+    assert_superseded_source!(db, initial, older)
+    assert_superseded_source!(db, older, newest)
+    assert Wakes.get(db, control.wake_id).state == "pending"
+    assert Wakes.get(db, newest.wake_id).state == "pending"
+    assert NoticeBatcher.source_refs(db, older.wake_id) == []
+    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM turns WHERE sessionKey='k1'")
+    assert :ok = Ledger.finish(db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+    [carrier] = NoticeBatcher.recover(db)
+    assert {:ok, [[prompt]]} = DB.query(db, "SELECT prompt FROM turns WHERE wakeId=?1", [carrier])
+    assert prompt =~ control.prompt
+    assert prompt =~ newest.prompt
+    refute prompt =~ "INITIAL queue nonce"
+    refute prompt =~ older.prompt
+
+    for source <- [control, newest] do
+      assert [%{delivery_wake_id: ^carrier, batch_state: "delivered", member_state: "included"}] =
+               NoticeBatcher.source_refs(db, source.wake_id)
+    end
+
+    assert {:ok, [[2]]} = DB.query(db, "SELECT COUNT(*) FROM notice_batch_members")
+    assert NoticeBatcher.recover(db) == []
+    assert {:ok, [[2]]} = DB.query(db, "SELECT COUNT(*) FROM turns WHERE sessionKey='k1'")
+  end
+
+  defp busy_dispatch_queue!(db) do
+    start_supervised!({ConnRegistry, name: ConnRegistry})
+    start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, Tightbeam.LaneManager})
+    session!(db, "sender")
+    session!(db, "other")
+    assert %{name: "sender"} = Roles.create!(db, "sender", "flynn", "sender")
+
+    {:appended, message} =
+      Projection.append(db, %{
+        session_key: "k1",
+        role: "user",
+        sender: "user:flynn",
+        content: "running bounded task"
+      })
+
+    {:ok, seq} =
+      Ledger.enqueue(db, %{
+        session_key: "k1",
+        message_id: message.id,
+        origin: "user:flynn",
+        prompt: "running bounded task"
+      })
+
+    assert {:ok, %{seq: ^seq} = turn} = Ledger.claim_next(db, "k1", "lane")
+
+    assignment =
+      Assignments.__handle__(db, "dispatch", %{
+        verb: "dispatch",
+        origin: "agent:sender",
+        principal: {:session, "sender"},
+        session_key: "k1",
+        target_role: nil,
+        role_fallback: false,
+        supervision_interval_ms: 1_000,
+        params: %{
+          subject: "pending queue correction",
+          brief: "INITIAL queue nonce",
+          idempotency_key: "pending-dispatch-once",
+          work_item_id: nil
+        }
+      })
+
+    assert is_binary(assignment.id)
+
+    assert {:ok, [[initial_id]]} =
+             DB.query(
+               db,
+               "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND consumer='prompt' AND digest=0",
+               [assignment.id]
+             )
+
+    initial = Wakes.get(db, initial_id)
+    assert initial.state == "pending"
+    assert initial.prompt =~ "INITIAL queue nonce"
+
+    control =
+      Wakes.schedule(db, %{
+        session_key: "k1",
+        origin: "session:other",
+        creator_session_key: "other",
+        prompt: "CONTROL queue nonce",
+        due_at: System.system_time(:millisecond),
+        class: "fyi"
+      })
+
+    %{turn: turn, assignment: assignment, initial: initial, control: control}
+  end
+
+  defp replacement_source!(db, assignment_id, prompt) do
+    Wakes.schedule(db, %{
+      session_key: "k1",
+      origin: "agent:sender",
+      creator_session_key: "sender",
+      prompt: prompt,
+      due_at: System.system_time(:millisecond),
+      class: "fyi",
+      replacement_assignment_id: assignment_id
+    })
+  end
+
+  defp assert_superseded_source!(db, source, replacement) do
+    assert %{state: "canceled", prompt: prompt} = Wakes.get(db, source.wake_id)
+    assert prompt == source.prompt
+
+    assert {:ok, [["superseded", "wake", replacement_id, replacement_id]]} =
+             DB.query(
+               db,
+               "SELECT reasonKind,causalSourceKind,causalSourceId,replacementWakeId FROM wake_cancellations WHERE wakeId=?1",
+               [source.wake_id]
+             )
+
+    assert replacement_id == replacement.wake_id
+
+    assert {:ok, [[event]]} =
+             DB.query(
+               db,
+               "SELECT detail FROM lifecycle_events WHERE kind='queued_message_suppressed' AND subject=?1",
+               [source.wake_id]
+             )
+
+    assert %{
+             "sourceId" => source_id,
+             "replacementWakeId" => ^replacement_id,
+             "cause" => "sender_requested_replacement"
+           } = JSON.decode!(event)
+
+    assert source_id == source.wake_id
+  end
+
   test "replacement leaves a turn that became running untouched", %{db: db} do
     assignment!(db, "asg_running")
     session!(db, "sender")
@@ -950,23 +1144,32 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
   end
 
   defp deliver_wake!(db, wake) do
-    assert {:ok, {:appended, "k1", _message, _opts}} =
-             DB.transaction(db, fn txn ->
-               Gateway.deliver_prompt_in_txn(
-                 txn,
-                 wake.session_key,
-                 wake.origin,
-                 wake.prompt,
-                 wake_id: wake.wake_id,
-                 sender: wake.origin,
-                 device_id: "test",
-                 client_message_id: wake.wake_id,
-                 target_gate: wake
-               )
-             end)
+    # This suite isolates the pre-claim suppression rules for an already
+    # materialized queue row. Seed that legacy source/turn pair below the
+    # recipient batching admission path; notice-batch readiness and carrier
+    # delivery have their own integration coverage.
+    stamped = "[from #{wake.origin}]\n\n#{wake.prompt}"
 
-    assert {:ok, [[seq]]} =
-             DB.query(db, "SELECT seq FROM turns WHERE wakeId=?1", [wake.wake_id])
+    {:appended, message} =
+      Projection.append(db, %{
+        session_key: wake.session_key,
+        role: "user",
+        content: stamped,
+        sender: wake.origin,
+        device_id: "test",
+        client_message_id: wake.wake_id
+      })
+
+    {:ok, seq} =
+      Ledger.enqueue(db, %{
+        session_key: wake.session_key,
+        message_id: message.id,
+        wake_id: wake.wake_id,
+        origin: wake.origin,
+        prompt: stamped,
+        assignment_id: wake.assignment_id,
+        job_ref: wake.work_item_id
+      })
 
     seq
   end

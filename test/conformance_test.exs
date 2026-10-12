@@ -25,6 +25,7 @@ defmodule Tightbeam.ConformanceSupport do
     Gateway,
     Ledger,
     ModelCatalog,
+    NoticeBatcher,
     Org,
     Placement,
     RailRemedy,
@@ -1562,7 +1563,7 @@ defmodule Tightbeam.ConformanceSupport do
               assert_one_park_and_one_notification!(db)
 
             "resolve-deny-reobligates" ->
-              {request_id, _park_wake_id} = open_and_park.()
+              {request_id, park_wake_id} = open_and_park.()
               assert kase["phase2"]["call"]["params"]["decision"] == "deny"
 
               assert %{status: "ruled"} =
@@ -1572,6 +1573,8 @@ defmodule Tightbeam.ConformanceSupport do
                          authorized: true,
                          scheduler: scheduler
                        )
+
+              deliver_condition_source!(db, park_wake_id)
 
               assert {{:deny, %{code: "escalation_denied", rule: ^statute}}, [], []} =
                        Rules.decide(db, turn_call)
@@ -1595,7 +1598,7 @@ defmodule Tightbeam.ConformanceSupport do
               assert Supervision.prod_state(db, call.params.assignment_id).prodCount == 1
 
             "resolve-allow-continues-without-consuming" ->
-              {request_id, _park_wake_id} = open_and_park.()
+              {request_id, park_wake_id} = open_and_park.()
               assert kase["phase2"]["call"]["params"]["decision"] == "allow"
 
               assert %{status: "ruled"} =
@@ -1605,6 +1608,8 @@ defmodule Tightbeam.ConformanceSupport do
                          authorized: true,
                          scheduler: scheduler
                        )
+
+              deliver_condition_source!(db, park_wake_id)
 
               assert {{:deny, %{rule: "later-sweep-statute"}}, [], [^request_id]} =
                        Rules.decide(db, turn_call)
@@ -1941,6 +1946,7 @@ defmodule Tightbeam.ConformanceSupport do
     prepare_rule_base!(base, fixture)
     Rules.load!(base, Map.keys(Gateway.handlers(%{})))
     {db, pid} = memory_db!()
+    service_pids = start_wake_delivery_services()
 
     try do
       sample = Enum.find(fixture["cases"], &(&1["case"] == "sweep-allow-leaves-ruling-ruled"))
@@ -1962,11 +1968,34 @@ defmodule Tightbeam.ConformanceSupport do
       assert %{status: "ruled"} =
                Escalation.rule(db, escalation_rule_call(request_id, "allow"), authorized: true)
 
+      deliver_condition_source!(db, park_wake_id)
+
       park_wake = Wakes.get(db, park_wake_id)
       assert %{state: "fired", fired_by: "condition"} = park_wake
 
+      assert [%{delivery_wake_id: carrier_id, member_state: "included", batch_state: "delivered"}] =
+               NoticeBatcher.source_refs(db, park_wake_id)
+
+      refute carrier_id == park_wake_id
+      assert Wakes.get(db, carrier_id).state == "fired"
+
+      assert {:ok, [[0]]} =
+               DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [park_wake_id])
+
       assert {:ok, %{seq: continuation_seq, owner_lease: continuation_seq_lease}} =
                Ledger.claim_next(db, session_key, "conformance-ruling-wake")
+
+      assert {:ok, [[^continuation_seq, ^carrier_id, content]]} =
+               DB.query(
+                 db,
+                 "SELECT t.seq,t.wakeId,m.content FROM turns t JOIN messages m ON m.id=t.messageId WHERE t.seq=?1",
+                 [continuation_seq]
+               )
+
+      assert content =~ park_wake.prompt
+
+      assert {:ok, [[1]]} =
+               DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [carrier_id])
 
       assert :ok =
                Ledger.finish(db, continuation_seq, "delivered", nil,
@@ -1990,6 +2019,7 @@ defmodule Tightbeam.ConformanceSupport do
 
       refute new_request_id == request_id
     after
+      Enum.each(service_pids, &GenServer.stop/1)
       GenServer.stop(pid)
       File.rm_rf!(base)
       :persistent_term.erase(Rules)
@@ -2465,6 +2495,44 @@ defmodule Tightbeam.ConformanceSupport do
     |> Enum.reject(&is_nil/1)
   end
 
+  defp deliver_condition_source!(db, source_wake_id) do
+    _ = NoticeBatcher.recover(db, System.system_time(:millisecond) + 60_000)
+
+    delivery_wake_id =
+      case NoticeBatcher.source_refs(db, source_wake_id) do
+        [%{delivery_wake_id: carrier_wake_id}] when is_binary(carrier_wake_id) ->
+          carrier_wake_id
+
+        [] ->
+          source_wake_id
+      end
+
+    case DB.query(db, "SELECT status FROM turns WHERE wakeId=?1", [delivery_wake_id]) do
+      {:ok, [[status]]} when status in ["queued", "running"] ->
+        :ok
+
+      {:ok, [[_status]]} ->
+        flunk("condition source already has a terminal turn: #{delivery_wake_id}")
+
+      {:ok, []} ->
+        wake = Wakes.get(db, delivery_wake_id)
+
+        assert {:ok, {:appended, _, _, _}} =
+                 DB.transaction(db, fn txn ->
+                   Gateway.deliver_prompt_in_txn(
+                     txn,
+                     wake.session_key,
+                     wake.origin,
+                     wake.prompt,
+                     wake_id: wake.wake_id,
+                     sender: wake.origin,
+                     target_gate: wake,
+                     fire_wake_in_txn: true
+                   )
+                 end)
+    end
+  end
+
   defp run_escalation_fold_contract(fixture) do
     base = temp_dir!("conformance-escalation-fold")
     prepare_rule_base!(base, fixture)
@@ -2889,13 +2957,20 @@ defmodule Tightbeam.ConformanceSupport do
     end)
 
     Enum.each(Map.get(world, "wakes", []), fn wake ->
+      creator_session_key = wake["creatorSessionKey"]
+
       Wakes.schedule(db, %{
         session_key: wake["target"],
         target_role: nil,
-        origin: "process:conformance",
+        origin:
+          if(is_binary(creator_session_key),
+            do: "agent:#{creator_session_key}",
+            else: "process:conformance"
+          ),
         prompt: "conformance continuation",
         due_at: wake["at"],
-        creator_session_key: wake["creatorSessionKey"]
+        creator_session_key: creator_session_key,
+        sender_scheduled: true
       })
     end)
 

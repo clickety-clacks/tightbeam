@@ -35,7 +35,7 @@ permissions:
   contents: read
 
 env:
-  CI_SOURCE_SHA: ${{ github.event_name != 'workflow_dispatch' && github.sha || inputs.candidate_sha }}
+  CI_SOURCE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event_name != 'workflow_dispatch' && github.sha || inputs.candidate_sha }}
 
 jobs:
   test:
@@ -49,7 +49,7 @@ jobs:
           - os: macos-latest
             name: macos
     name: ${{ matrix.name }}
-    runs-on: ${{ matrix.name == 'linux' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "tb-linux"]') || matrix.name == 'macos' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "tb-macos"]') || matrix.os }}
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Validate exact source SHA
         shell: bash
