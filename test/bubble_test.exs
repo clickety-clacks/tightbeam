@@ -22,6 +22,42 @@ defmodule Tightbeam.Productions.BubbleTest do
     def handle_call({:ensure_lane, _key}, _from, state), do: {:reply, :ok, state}
   end
 
+  # Exercise the real registry implementation until the first terminal-alert
+  # transaction has committed, then disconnect that local publication handoff.
+  defmodule OwnerAlertDisconnect do
+    use GenServer
+    def start_link(args), do: GenServer.start_link(__MODULE__, args, name: Tightbeam.ConnRegistry)
+
+    def init({db, observer}) do
+      {:ok, registry} = Tightbeam.ConnRegistry.init(:ok)
+      {:ok, %{db: db, observer: observer, registry: registry}}
+    end
+
+    def handle_call({:publish_message, _, _, _, _, _} = request, from, state) do
+      {:ok, [[completed]]} =
+        Tightbeam.DB.query(
+          state.db,
+          "SELECT COUNT(*) FROM lifecycle_events WHERE kind='lineage_exhausted'"
+        )
+
+      if completed > 0 do
+        send(state.observer, {:owner_alert_committed, completed})
+        {:stop, :owner_alert_publication_interrupted, state}
+      else
+        forward(request, from, state)
+      end
+    end
+
+    def handle_call(request, from, state), do: forward(request, from, state)
+
+    defp forward(request, from, state) do
+      {:reply, reply, registry} =
+        Tightbeam.ConnRegistry.handle_call(request, from, state.registry)
+
+      {:reply, reply, %{state | registry: registry}}
+    end
+  end
+
   # The spec's proofs 2–4 (production-machine-v1 §Proofs): the climb is
   # delivery-driven, the terminal alert is tokenless and stands as a fact,
   # and retraction is observed. Lineage under test:
@@ -1170,9 +1206,20 @@ defmodule Tightbeam.Productions.BubbleTest do
     assert assignment_a != assignment_b
   end
 
-  for terminal <- ~w(failed canceled) do
+  for {terminal, boundary} <- [
+        {"failed", :complete},
+        {"canceled", :complete},
+        {"failed", :publication_interrupted},
+        {"failed", :transaction_refused}
+      ] do
+    description =
+      "separate failed decisions share a #{terminal} bubble carrier without losing either cause"
+
+    description =
+      if boundary == :complete, do: description, else: description <> " at #{boundary}"
+
     @tag persistent: true
-    test "separate failed decisions share a #{terminal} bubble carrier without losing either cause",
+    test description,
          ctx do
       busy = hold_recipient!(ctx.db, ctx.supervisor.session_key)
 
@@ -1273,7 +1320,54 @@ defmodule Tightbeam.Productions.BubbleTest do
                  owner_lease: main_notice.owner_lease
                )
 
-      assert :ok = Bubble.recognize_terminal(ctx.db, main_notice.seq)
+      case unquote(boundary) do
+        :publication_interrupted ->
+          registry = Process.whereis(Tightbeam.ConnRegistry)
+          assert :ok = GenServer.stop(registry)
+          start_supervised!({OwnerAlertDisconnect, {ctx.db, self()}}, restart: :temporary)
+
+          on_exit(fn ->
+            if is_nil(Process.whereis(Tightbeam.ConnRegistry)),
+              do: ConnRegistry.start_link(name: Tightbeam.ConnRegistry)
+          end)
+
+          assert {:owner_alert_publication_interrupted, _call} =
+                   catch_exit(Bubble.recognize_terminal(ctx.db, main_notice.seq))
+
+          assert_receive {:owner_alert_committed, 2}
+          _ = stop_supervised(OwnerAlertDisconnect)
+          {:ok, _registry} = ConnRegistry.start_link(name: Tightbeam.ConnRegistry)
+          assert :ok = stop_supervised(DB)
+          start_supervised!({DB, ctx.db_opts})
+          assert :ok = Tightbeam.Schema.ensure_all(ctx.db)
+          assert :ok = Bubble.recognize_terminal(ctx.db, main_notice.seq)
+
+        :transaction_refused ->
+          {last_cause, _blocked, original_recipient} = List.last(causes)
+          detail = "cause_seq=#{last_cause} session=#{original_recipient}"
+          assert :ok = Tightbeam.Wakes.report_failed_delivery(ctx.db, main_notice.seq)
+          before = bubble_history(ctx.db)
+
+          assert :ok =
+                   DB.execute(ctx.db, """
+                   CREATE TRIGGER refuse_second_owner_alert BEFORE INSERT ON lifecycle_events
+                   WHEN NEW.kind='lineage_exhausted' AND NEW.detail='#{detail}'
+                   BEGIN SELECT RAISE(ABORT,'second owner alert refused'); END
+                   """)
+
+          assert_raise MatchError, fn -> Bubble.recognize_terminal(ctx.db, main_notice.seq) end
+          assert bubble_history(ctx.db) == before
+          refute ConditionFacts.standing?(ctx.db, "user-alerted", "flynn")
+          assert :ok = DB.execute(ctx.db, "DROP TRIGGER refuse_second_owner_alert")
+          assert :ok = stop_supervised(DB)
+          start_supervised!({DB, ctx.db_opts})
+          assert :ok = Tightbeam.Schema.ensure_all(ctx.db)
+          assert :ok = Bubble.recognize_terminal(ctx.db, main_notice.seq)
+
+        :complete ->
+          assert :ok = Bubble.recognize_terminal(ctx.db, main_notice.seq)
+      end
+
       assert ConditionFacts.standing?(ctx.db, "user-alerted", "flynn")
 
       for {seq, blocked, original_recipient} <- causes do
@@ -1289,6 +1383,13 @@ defmodule Tightbeam.Productions.BubbleTest do
                    ctx.db,
                    "SELECT COUNT(*) FROM lifecycle_events WHERE kind='lineage_exhausted' AND detail=?1",
                    ["cause_seq=#{seq} session=#{original_recipient}"]
+                 )
+
+        assert {:ok, [[1]]} =
+                 DB.query(
+                   ctx.db,
+                   "SELECT COUNT(*) FROM messages WHERE sessionKey=?1 AND content LIKE ?2",
+                   [ctx.main.session_key, "[no agent can act]%Original failure — turn #{seq} %"]
                  )
       end
 
@@ -1313,7 +1414,8 @@ defmodule Tightbeam.Productions.BubbleTest do
         "notice_batch_members",
         "assignment_cannot_proceed",
         "condition_facts",
-        "lifecycle_events"
+        "lifecycle_events",
+        "messages"
       ],
       fn table ->
         {:ok, rows} = DB.query(db, "SELECT rowid,* FROM #{table} ORDER BY rowid")
