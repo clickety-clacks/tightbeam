@@ -208,74 +208,98 @@ defmodule Tightbeam.Productions.Bubble do
         terminal_alerts(db, turns)
 
       {:ok, recipient} ->
-        Enum.each(turns, &enqueue_notice(db, &1, recipient))
+        enqueue_notices(db, turns, recipient)
     end
   end
 
-  defp enqueue_notice(db, turn, recipient) do
-    case cause_row(db, turn.cause_seq) do
-      {:ok, cause} -> enqueue_notice(db, turn, recipient, cause)
-      :missing -> report_missing_cause(db, turn)
-    end
+  defp enqueue_notices(db, turns, recipient) do
+    causes =
+      Enum.flat_map(turns, fn turn ->
+        case cause_row(db, turn.cause_seq) do
+          {:ok, cause} ->
+            [{turn, cause}]
+
+          :missing ->
+            report_missing_cause(db, turn)
+            []
+        end
+      end)
+
+    # A selected recipient cannot disappear between sibling admissions in
+    # this transaction. A missing row yields real skipped deliveries for the
+    # whole group, with no notice turn to continue the climb later.
+    {:ok, results} =
+      DB.transaction(db, fn txn ->
+        Enum.map(causes, fn {turn, cause} ->
+          {turn, deliver_bubble_notice_in_txn(txn, recipient, turn, cause)}
+        end)
+      end)
+
+    skipped =
+      for {turn, :skipped} <- results,
+          do: %{turn | session_key: recipient, notice?: true}
+
+    # Recover before external publication can interrupt this invocation.
+    if skipped != [], do: climb(db, skipped)
+
+    Enum.each(results, fn
+      {_turn, result} when result in [:skipped, :duplicate] -> :ok
+      {_turn, delivery} -> Gateway.complete_delivery(db, delivery)
+    end)
+
+    :ok
   end
 
-  defp enqueue_notice(db, turn, recipient, cause) do
+  defp deliver_bubble_notice_in_txn(txn, recipient, turn, cause) do
     prompt =
       "Turn #{turn.cause_seq}#{carried_wake(cause)} in #{cause.session_key} could not run: " <>
         "#{cause.error || "reason unrecorded"}. You are the nearest ancestor " <>
         "shown able to run a turn. What to do about it is your judgment."
 
-    result = deliver_bubble_notice(db, recipient, prompt, turn, cause)
+    # Retain the existing per-cause UNIQUE replay handling. A duplicate must
+    # not roll back or mislabel another member's admission as a duplicate.
+    DB.Txn.exec(txn, "SAVEPOINT bubble_notice_member")
 
-    case result do
-      # :duplicate is the dedupe working — a crash between recognition and
-      # enqueue re-attempted into the UNIQUE key, exactly as designed.
-      r when r in [:appended, :duplicate] -> :ok
-      # :skipped means the target evaporated between our read and the
-      # delivery transaction. The notice turn was never created, so nothing
-      # will terminalize and continue the climb — do it now.
-      :skipped -> climb(db, %{turn | session_key: recipient, notice?: true})
-      _ -> :ok
-    end
-  end
+    try do
+      delivery =
+        Gateway.deliver_prompt_in_txn(
+          txn,
+          recipient,
+          "process:tightbeam",
+          prompt,
+          sender: "process:tightbeam",
+          device_id: "process:tightbeam",
+          client_message_id: "bubble:#{turn.cause_seq}:#{recipient}",
+          wake_id: "bubble:#{turn.cause_seq}:#{recipient}",
+          request_ref: "bubble:#{turn.cause_seq}",
+          assignment_id: cause.assignment_id
+        )
 
-  defp deliver_bubble_notice(db, recipient, prompt, turn, cause) do
-    case DB.transaction(db, fn txn ->
-           delivery =
-             Gateway.deliver_prompt_in_txn(
-               txn,
-               recipient,
-               "process:tightbeam",
-               prompt,
-               sender: "process:tightbeam",
-               device_id: "process:tightbeam",
-               client_message_id: "bubble:#{turn.cause_seq}:#{recipient}",
-               wake_id: "bubble:#{turn.cause_seq}:#{recipient}",
-               request_ref: "bubble:#{turn.cause_seq}",
-               assignment_id: cause.assignment_id
-             )
+      if match?({:appended, ^recipient, _, _}, delivery) or
+           match?({:staged, _source}, delivery) do
+        transfer_cannot_proceed_disposers_for_cause_in_txn(
+          txn,
+          turn.cause_seq,
+          recipient
+        )
+      end
 
-           if match?({:appended, ^recipient, _, _}, delivery) or
-                match?({:staged, _source}, delivery) do
-             transfer_cannot_proceed_disposers_for_cause_in_txn(
-               txn,
-               turn.cause_seq,
-               recipient
-             )
-           end
+      DB.Txn.exec(txn, "RELEASE bubble_notice_member")
+      delivery
+    rescue
+      error ->
+        DB.Txn.exec(txn, "ROLLBACK TO bubble_notice_member")
+        DB.Txn.exec(txn, "RELEASE bubble_notice_member")
 
-           delivery
-         end) do
-      {:ok, delivery} ->
-        Gateway.complete_delivery(db, delivery)
+        case error do
+          %{message: message} when is_binary(message) ->
+            if String.contains?(message, "UNIQUE"),
+              do: :duplicate,
+              else: reraise(error, __STACKTRACE__)
 
-      {:error, %{message: message}} when is_binary(message) ->
-        if String.contains?(message, "UNIQUE"),
-          do: :duplicate,
-          else: raise(DB.Error, message: message)
-
-      {:error, error} ->
-        raise error
+          _ ->
+            reraise(error, __STACKTRACE__)
+        end
     end
   end
 
