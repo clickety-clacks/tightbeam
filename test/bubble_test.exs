@@ -58,6 +58,74 @@ defmodule Tightbeam.Productions.BubbleTest do
     end
   end
 
+  # Select a real active ancestor, then temporarily remove its row only
+  # during the real delivery transaction. Gateway must observe no_session_row;
+  # the exact row is restored before commit and FK enforcement is restored.
+  defmodule MissingTargetDB do
+    use GenServer
+    import ExUnit.Assertions
+    def start_link(args), do: GenServer.start_link(__MODULE__, args)
+
+    def init({db, target, observer}),
+      do: {:ok, %{db: db, target: target, observer: observer, armed: false, used: false}}
+
+    def handle_call(
+          {:query, "SELECT state FROM sessions WHERE sessionKey = ?1", [target]} = request,
+          _from,
+          %{target: target, used: false} = state
+        ) do
+      response = GenServer.call(state.db, request)
+      assert {:ok, [["active"]]} = response
+      {:reply, response, %{state | armed: true}}
+    end
+
+    def handle_call({:transaction, fun}, _from, %{armed: true} = state) do
+      response =
+        Tightbeam.DB.migration_transaction(
+          state.db,
+          :bubble_missing_target,
+          ["PRAGMA foreign_keys=OFF"],
+          ["PRAGMA foreign_keys=ON"],
+          fn txn ->
+            [row] =
+              Tightbeam.DB.Txn.q(txn, "SELECT rowid,* FROM sessions WHERE sessionKey=?1", [
+                state.target
+              ])
+
+            Tightbeam.DB.Txn.q(txn, "DELETE FROM sessions WHERE sessionKey=?1", [state.target])
+
+            assert [] ==
+                     Tightbeam.DB.Txn.q(txn, "SELECT 1 FROM sessions WHERE sessionKey=?1", [
+                       state.target
+                     ])
+
+            result = fun.(txn)
+
+            columns = [
+              "rowid"
+              | Enum.map(Tightbeam.DB.Txn.q(txn, "PRAGMA table_info(sessions)"), &Enum.at(&1, 1))
+            ]
+
+            names = Enum.map_join(columns, ",", &"\"#{&1}\"")
+            placeholders = 1..length(row) |> Enum.map_join(",", &"?#{&1}")
+            Tightbeam.DB.Txn.q(txn, "INSERT INTO sessions(#{names}) VALUES(#{placeholders})", row)
+
+            assert [row] ==
+                     Tightbeam.DB.Txn.q(txn, "SELECT rowid,* FROM sessions WHERE sessionKey=?1", [
+                       state.target
+                     ])
+
+            result
+          end
+        )
+
+      send(state.observer, {:real_missing_target_delivery, state.target})
+      {:reply, response, %{state | armed: false, used: true}}
+    end
+
+    def handle_call(request, _from, state), do: {:reply, GenServer.call(state.db, request), state}
+  end
+
   # The spec's proofs 2–4 (production-machine-v1 §Proofs): the climb is
   # delivery-driven, the terminal alert is tokenless and stands as a fact,
   # and retraction is observed. Lineage under test:
@@ -1210,7 +1278,9 @@ defmodule Tightbeam.Productions.BubbleTest do
         {"failed", :complete},
         {"canceled", :complete},
         {"failed", :publication_interrupted},
-        {"failed", :transaction_refused}
+        {"failed", :transaction_refused},
+        {"failed", :target_skipped},
+        {"failed", :target_skipped_publication_interrupted}
       ] do
     description =
       "separate failed decisions share a #{terminal} bubble carrier without losing either cause"
@@ -1285,88 +1355,147 @@ defmodule Tightbeam.Productions.BubbleTest do
       assert :ok = stop_supervised(DB)
       start_supervised!({DB, ctx.db_opts})
       assert :ok = Tightbeam.Schema.ensure_all(ctx.db)
-      main_busy = hold_recipient!(ctx.db, ctx.main.session_key)
-      assert :ok = Bubble.recognize_terminal(ctx.db, intermediate.seq)
-      assert :ok = Bubble.recognize_terminal(ctx.db, intermediate.seq)
-      finish_busy_recipient!(ctx.db, main_busy)
-      [main_carrier] = deliver_ready_carriers!(ctx, ctx.main.session_key)
 
-      expected_main =
-        Enum.map(causes, fn {seq, _, _} -> "bubble:#{seq}:#{ctx.main.session_key}" end)
+      terminal_seqs =
+        if unquote(boundary) in [:target_skipped, :target_skipped_publication_interrupted] do
+          assert :ok = Tightbeam.Productions.BubbleSweeper.ensure_schema(ctx.db)
 
-      assert Enum.map(Tightbeam.Wakes.digest_members(ctx.db, main_carrier), & &1.wake_id) ==
-               expected_main
+          assert {:ok, _} =
+                   DB.query(
+                     ctx.db,
+                     "INSERT INTO production_cursors(name,seq) VALUES('bubble',?1) ON CONFLICT(name) DO UPDATE SET seq=excluded.seq",
+                     [intermediate.seq - 1]
+                   )
 
-      assert {:ok, main_notice} =
-               Ledger.claim_next(ctx.db, ctx.main.session_key, "combined-main-bubble")
+          proxy = start_supervised!({MissingTargetDB, {ctx.db, ctx.main.session_key, self()}})
+          interrupted? = unquote(boundary) == :target_skipped_publication_interrupted
+          if interrupted?, do: disconnect_owner_alert!(ctx.db)
 
-      assert main_notice.wake_id == main_carrier
+          sweeper =
+            start_supervised!(
+              {Tightbeam.Productions.BubbleSweeper,
+               db: proxy, interval: 3_600_000, name: :"skipped_bubble_sweeper_#{ctx.db}"}
+            )
 
-      for {seq, blocked, _original_recipient} <- causes do
-        assert main_notice.prompt =~ "Turn #{seq}"
+          # The boot tick precedes this call: containment must not advance the
+          # cursor past a group whose original causes have not been completed.
+          assert Tightbeam.Productions.BubbleSweeper.sweep_now(sweeper) == 0
+          assert_receive {:real_missing_target_delivery, selected_target}
+          assert selected_target == ctx.main.session_key
 
-        assert {:ok, [[disposer]]} =
-                 DB.query(
-                   ctx.db,
-                   "SELECT disposerRef FROM assignment_cannot_proceed WHERE id=?1",
-                   [blocked.cannotProceed.id]
-                 )
+          assert {:ok, [[cursor]]} =
+                   DB.query(
+                     ctx.db,
+                     "SELECT seq FROM production_cursors WHERE name='bubble'"
+                   )
 
-        assert disposer == "session:" <> ctx.main.session_key
-      end
+          assert cursor == intermediate.seq
+          assert notice_turn(ctx.db, ctx.main.session_key) == []
 
-      assert :ok =
-               Ledger.finish(ctx.db, main_notice.seq, "failed", "final recipient failed",
-                 owner_lease: main_notice.owner_lease
-               )
+          for {seq, _, _} <- causes do
+            assert {:ok, [[detail]]} =
+                     DB.query(
+                       ctx.db,
+                       "SELECT detail FROM lifecycle_events WHERE kind='turn_undeliverable' AND subject=?1",
+                       ["bubble:#{seq}:#{ctx.main.session_key}"]
+                     )
 
-      case unquote(boundary) do
-        :publication_interrupted ->
-          registry = Process.whereis(Tightbeam.ConnRegistry)
-          assert :ok = GenServer.stop(registry)
-          start_supervised!({OwnerAlertDisconnect, {ctx.db, self()}}, restart: :temporary)
+            assert detail =~ "reason=no_session_row target=#{ctx.main.session_key}"
+          end
 
-          on_exit(fn ->
-            if is_nil(Process.whereis(Tightbeam.ConnRegistry)),
-              do: ConnRegistry.start_link(name: Tightbeam.ConnRegistry)
-          end)
+          if interrupted? do
+            assert_receive {:owner_alert_committed, 2}
+            restore_owner_registry!()
+          end
 
-          assert {:owner_alert_publication_interrupted, _call} =
-                   catch_exit(Bubble.recognize_terminal(ctx.db, main_notice.seq))
-
-          assert_receive {:owner_alert_committed, 2}
-          _ = stop_supervised(OwnerAlertDisconnect)
-          {:ok, _registry} = ConnRegistry.start_link(name: Tightbeam.ConnRegistry)
+          assert :ok = stop_supervised(Tightbeam.Productions.BubbleSweeper)
+          assert :ok = stop_supervised(MissingTargetDB)
           assert :ok = stop_supervised(DB)
           start_supervised!({DB, ctx.db_opts})
           assert :ok = Tightbeam.Schema.ensure_all(ctx.db)
-          assert :ok = Bubble.recognize_terminal(ctx.db, main_notice.seq)
+          assert :ok = Bubble.recognize_terminal(ctx.db, intermediate.seq)
+          [intermediate.seq]
+        else
+          main_busy = hold_recipient!(ctx.db, ctx.main.session_key)
+          assert :ok = Bubble.recognize_terminal(ctx.db, intermediate.seq)
+          assert :ok = Bubble.recognize_terminal(ctx.db, intermediate.seq)
+          finish_busy_recipient!(ctx.db, main_busy)
+          [main_carrier] = deliver_ready_carriers!(ctx, ctx.main.session_key)
 
-        :transaction_refused ->
-          {last_cause, _blocked, original_recipient} = List.last(causes)
-          detail = "cause_seq=#{last_cause} session=#{original_recipient}"
-          assert :ok = Tightbeam.Wakes.report_failed_delivery(ctx.db, main_notice.seq)
-          before = bubble_history(ctx.db)
+          expected_main =
+            Enum.map(causes, fn {seq, _, _} -> "bubble:#{seq}:#{ctx.main.session_key}" end)
+
+          assert Enum.map(Tightbeam.Wakes.digest_members(ctx.db, main_carrier), & &1.wake_id) ==
+                   expected_main
+
+          assert {:ok, main_notice} =
+                   Ledger.claim_next(ctx.db, ctx.main.session_key, "combined-main-bubble")
+
+          assert main_notice.wake_id == main_carrier
+
+          for {seq, blocked, _original_recipient} <- causes do
+            assert main_notice.prompt =~ "Turn #{seq}"
+
+            assert {:ok, [[disposer]]} =
+                     DB.query(
+                       ctx.db,
+                       "SELECT disposerRef FROM assignment_cannot_proceed WHERE id=?1",
+                       [blocked.cannotProceed.id]
+                     )
+
+            assert disposer == "session:" <> ctx.main.session_key
+          end
 
           assert :ok =
-                   DB.execute(ctx.db, """
-                   CREATE TRIGGER refuse_second_owner_alert BEFORE INSERT ON lifecycle_events
-                   WHEN NEW.kind='lineage_exhausted' AND NEW.detail='#{detail}'
-                   BEGIN SELECT RAISE(ABORT,'second owner alert refused'); END
-                   """)
+                   Ledger.finish(ctx.db, main_notice.seq, "failed", "final recipient failed",
+                     owner_lease: main_notice.owner_lease
+                   )
 
-          assert_raise MatchError, fn -> Bubble.recognize_terminal(ctx.db, main_notice.seq) end
-          assert bubble_history(ctx.db) == before
-          refute ConditionFacts.standing?(ctx.db, "user-alerted", "flynn")
-          assert :ok = DB.execute(ctx.db, "DROP TRIGGER refuse_second_owner_alert")
-          assert :ok = stop_supervised(DB)
-          start_supervised!({DB, ctx.db_opts})
-          assert :ok = Tightbeam.Schema.ensure_all(ctx.db)
-          assert :ok = Bubble.recognize_terminal(ctx.db, main_notice.seq)
+          case unquote(boundary) do
+            :publication_interrupted ->
+              disconnect_owner_alert!(ctx.db)
 
-        :complete ->
-          assert :ok = Bubble.recognize_terminal(ctx.db, main_notice.seq)
-      end
+              assert {:owner_alert_publication_interrupted, _call} =
+                       catch_exit(Bubble.recognize_terminal(ctx.db, main_notice.seq))
+
+              assert_receive {:owner_alert_committed, 2}
+              restore_owner_registry!()
+              assert :ok = stop_supervised(DB)
+              start_supervised!({DB, ctx.db_opts})
+              assert :ok = Tightbeam.Schema.ensure_all(ctx.db)
+              assert :ok = Bubble.recognize_terminal(ctx.db, main_notice.seq)
+
+            :transaction_refused ->
+              {last_cause, _blocked, original_recipient} = List.last(causes)
+              detail = "cause_seq=#{last_cause} session=#{original_recipient}"
+              assert :ok = Tightbeam.Wakes.report_failed_delivery(ctx.db, main_notice.seq)
+              before = bubble_history(ctx.db)
+
+              assert :ok =
+                       DB.execute(ctx.db, """
+                       CREATE TRIGGER refuse_second_owner_alert BEFORE INSERT ON lifecycle_events
+                       WHEN NEW.kind='lineage_exhausted' AND NEW.detail='#{detail}'
+                       BEGIN SELECT RAISE(ABORT,'second owner alert refused'); END
+                       """)
+
+              assert_raise MatchError, fn ->
+                Bubble.recognize_terminal(ctx.db, main_notice.seq)
+              end
+
+              assert bubble_history(ctx.db) == before
+              refute ConditionFacts.standing?(ctx.db, "user-alerted", "flynn")
+              assert :ok = DB.execute(ctx.db, "DROP TRIGGER refuse_second_owner_alert")
+              assert :ok = stop_supervised(DB)
+              start_supervised!({DB, ctx.db_opts})
+              assert :ok = Tightbeam.Schema.ensure_all(ctx.db)
+              assert :ok = Bubble.recognize_terminal(ctx.db, main_notice.seq)
+
+            :complete ->
+              assert :ok = Bubble.recognize_terminal(ctx.db, main_notice.seq)
+          end
+
+          [intermediate.seq, main_notice.seq]
+        end
 
       assert ConditionFacts.standing?(ctx.db, "user-alerted", "flynn")
 
@@ -1398,12 +1527,28 @@ defmodule Tightbeam.Productions.BubbleTest do
       start_supervised!({DB, ctx.db_opts})
       assert :ok = Tightbeam.Schema.ensure_all(ctx.db)
 
-      for terminal_seq <- [intermediate.seq, main_notice.seq],
+      for terminal_seq <- terminal_seqs,
           do: assert(:ok = Bubble.recognize_terminal(ctx.db, terminal_seq))
 
       assert bubble_history(ctx.db) == snapshot
       assert {:ok, []} = DB.query(ctx.db, "PRAGMA foreign_key_check")
     end
+  end
+
+  defp disconnect_owner_alert!(db) do
+    assert :ok = GenServer.stop(Process.whereis(Tightbeam.ConnRegistry))
+    start_supervised!({OwnerAlertDisconnect, {db, self()}}, restart: :temporary)
+
+    on_exit(fn ->
+      if is_nil(Process.whereis(Tightbeam.ConnRegistry)),
+        do: ConnRegistry.start_link(name: Tightbeam.ConnRegistry)
+    end)
+  end
+
+  defp restore_owner_registry!() do
+    _ = stop_supervised(OwnerAlertDisconnect)
+    {:ok, _registry} = ConnRegistry.start_link(name: Tightbeam.ConnRegistry)
+    :ok
   end
 
   defp bubble_history(db) do
@@ -1415,7 +1560,8 @@ defmodule Tightbeam.Productions.BubbleTest do
         "assignment_cannot_proceed",
         "condition_facts",
         "lifecycle_events",
-        "messages"
+        "messages",
+        "sessions"
       ],
       fn table ->
         {:ok, rows} = DB.query(db, "SELECT rowid,* FROM #{table} ORDER BY rowid")
