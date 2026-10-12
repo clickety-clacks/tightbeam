@@ -2342,6 +2342,59 @@ defmodule Tightbeam.SupervisionTest do
              )
   end
 
+  test "a bound pending checkpoint behind the wake cursor is admitted without a prior receipt",
+       ctx do
+    attach_work_item!(ctx.db, "asg_1", "wi_checkpoint")
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0, interval: 60_000)
+
+    {wake, seq} =
+      schedule_checkpoint_via_gateway!(ctx, "resume the pending checkpoint", 60_000)
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM supervision_liveness_receipts WHERE assignmentId='asg_1' AND sourceKind='checkpoint' AND sourceId=?1",
+               [wake.wake_id]
+             )
+
+    assert {:ok, [[wake_row]]} =
+             DB.query(ctx.db, "SELECT rowid FROM wakes WHERE wakeId=?1", [wake.wake_id])
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE supervision_liveness_receipt_state SET wakeCursor=?2 WHERE assignmentId='asg_1'",
+        ["asg_1", wake_row]
+      )
+
+    assert {:ok, [[cursor]]} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeCursor FROM supervision_liveness_receipt_state WHERE assignmentId='asg_1'"
+             )
+
+    assert cursor >= wake_row
+    assert Wakes.get(ctx.db, wake.wake_id).state == "pending"
+
+    assert :rebased = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq)
+
+    assert {:ok, [["checkpoint", source_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sourceKind,sourceId FROM supervision_liveness_receipts WHERE assignmentId='asg_1'"
+             )
+
+    assert source_id == wake.wake_id
+    assert Wakes.get(ctx.db, wake.wake_id).state == "pending"
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM supervision_liveness_receipts WHERE assignmentId='asg_1' AND sourceKind='checkpoint' AND sourceId=?1",
+               [wake.wake_id]
+             )
+  end
+
   test "a checkpoint skipped by the repeat cap is reconsidered after a later effect", ctx do
     attach_work_item!(ctx.db, "asg_1", "wi_checkpoint")
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0, interval: 60_000)
