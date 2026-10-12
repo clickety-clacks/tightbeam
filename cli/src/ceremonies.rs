@@ -3546,10 +3546,26 @@ mod tests {
         let mut inner = inner.spawn().unwrap();
 
         let ready_by = Instant::now() + Duration::from_secs(5);
-        while !marker.exists() && Instant::now() < ready_by {
-            thread::sleep(Duration::from_millis(10));
-        }
-        let grandchild = fs::read_to_string(&marker).expect("codex fixture recorded descendant");
+        let grandchild_pid = loop {
+            assert!(
+                Instant::now() < ready_by,
+                "codex fixture did not publish a valid descendant PID before readiness deadline"
+            );
+            if let Ok(contents) = fs::read_to_string(&marker) {
+                if let Ok(pid) = contents.trim().parse::<libc::pid_t>() {
+                    if pid > 0 {
+                        assert!(
+                            Instant::now() < ready_by,
+                            "codex fixture did not publish a valid descendant PID before readiness deadline"
+                        );
+                        break pid;
+                    }
+                }
+            }
+            thread::sleep(
+                Duration::from_millis(10).min(ready_by.saturating_duration_since(Instant::now())),
+            );
+        };
         assert_eq!(
             unsafe { libc::kill(inner.id() as libc::pid_t, libc::SIGTERM) },
             0
@@ -3577,7 +3593,6 @@ mod tests {
         }
         let stderr = String::from_utf8_lossy(&drain.join().unwrap()).into_owned();
 
-        let grandchild_pid: libc::pid_t = grandchild.trim().parse().unwrap();
         let mut alive = unsafe { libc::kill(grandchild_pid, 0) } == 0
             || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH);
         // Keep descendant cleanup inside the same five-second deadline used for the
@@ -3607,7 +3622,7 @@ mod tests {
             Some("signal-fixture-lease"),
             "TERM did not cancel the lease returned by begin"
         );
-        assert!(!alive, "codex descendant {grandchild} survived TERM");
+        assert!(!alive, "codex descendant {grandchild_pid} survived TERM");
         assert!(!staging_survived, "TERM left codex staging behind");
     }
 

@@ -3062,6 +3062,11 @@ fn spaces(text: &[u8]) -> usize {
 /// The length of the value the gateway's secret-assignment rule masks, in the order it
 /// tries them: an auth scheme and its credential, a quoted string, then a bare word.
 fn secret_value(text: &[u8]) -> Option<usize> {
+    const REDACTED_MARKER: &[u8] = b"[REDACTED:secret_field]";
+    if text.starts_with(REDACTED_MARKER) {
+        return Some(REDACTED_MARKER.len());
+    }
+
     let scheme = ["bearer", "basic", "token"].iter().find_map(|scheme| {
         let named = text
             .get(..scheme.len())
@@ -3070,10 +3075,16 @@ fn secret_value(text: &[u8]) -> Option<usize> {
             return None;
         }
         let gap = spaces(&text[scheme.len()..]);
-        let credential = text[scheme.len() + gap..]
-            .iter()
-            .take_while(|byte| !is_space_byte(**byte) && !b",;\"'&}]".contains(*byte))
-            .count();
+        let credential_start = scheme.len() + gap;
+        let credential_bytes = &text[credential_start..];
+        let credential = if credential_bytes.starts_with(REDACTED_MARKER) {
+            REDACTED_MARKER.len()
+        } else {
+            credential_bytes
+                .iter()
+                .take_while(|byte| !is_space_byte(**byte) && !b",;\"'&}]".contains(*byte))
+                .count()
+        };
         (gap > 0 && credential > 0).then_some(scheme.len() + gap + credential)
     });
     if scheme.is_some() {
@@ -6410,6 +6421,10 @@ mod tests {
                 "login failed: password=[REDACTED:secret_field], retry later",
             ),
             (
+                "primary DB failure password=[REDACTED:secret_field]",
+                "primary DB failure password=[REDACTED:secret_field]",
+            ),
+            (
                 r#"{"detail": "x", "client_secret": "fixture\"SENTINEL"}"#,
                 r#"{"detail": "x", "client_secret": "[REDACTED:secret_field]"}"#,
             ),
@@ -6480,7 +6495,9 @@ mod tests {
             ),
         ];
         for (body, expected) in cases {
-            assert_eq!(redact_body(body), expected, "{body}");
+            let redacted = redact_body(body);
+            assert_eq!(redacted, expected, "{body}");
+            assert_eq!(redact_body(&redacted), expected, "redacting {body} twice");
         }
     }
 
@@ -7185,6 +7202,14 @@ mod session_diagnose_tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
+    struct FixtureIo {
+        request_headers_complete: bool,
+        declared_request_body_bytes: usize,
+        request_body_bytes_read: usize,
+        response_bytes_to_write: usize,
+        response_bytes_written: usize,
+    }
+
     fn command(args: &[&str]) -> Result<Command, String> {
         crate::args::parse(args.iter().map(|s| s.to_string()).collect())
     }
@@ -7228,7 +7253,10 @@ mod session_diagnose_tests {
         status: u16,
         body: String,
         delay: Duration,
-    ) -> (Endpoint, std::thread::JoinHandle<()>) {
+    ) -> (
+        Endpoint,
+        std::thread::JoinHandle<Result<FixtureIo, &'static str>>,
+    ) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = Endpoint {
             base: format!("http://{}", listener.local_addr().unwrap()),
@@ -7236,15 +7264,79 @@ mod session_diagnose_tests {
             origin: Origin::Named,
         };
         let worker = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut bytes = [0u8; 2048];
-            let _ = stream.read(&mut bytes);
+            let (mut stream, _) = listener.accept().map_err(|_| "accept")?;
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .map_err(|_| "read_timeout")?;
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .map_err(|_| "write_timeout")?;
+
+            // Read the complete request before replying. Reading only once can
+            // stop at the headers and turn the intended response-body test into
+            // a client transport failure. Never include request bytes in errors.
+            let mut received = Vec::new();
+            let mut header_end = None;
+            let mut declared_request_body_bytes = None;
+            loop {
+                let mut chunk = [0_u8; 1024];
+                let count = stream.read(&mut chunk).map_err(|_| "request_read")?;
+                if count == 0 {
+                    return Err("request_incomplete");
+                }
+                received.extend_from_slice(&chunk[..count]);
+                if received.len() > 8192 {
+                    return Err("request_too_large");
+                }
+
+                if header_end.is_none() {
+                    if let Some(end) = received.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let headers =
+                            std::str::from_utf8(&received[..end]).map_err(|_| "request_headers")?;
+                        let mut content_length = None;
+                        for line in headers.lines().skip(1) {
+                            let Some((name, value)) = line.split_once(':') else {
+                                return Err("request_headers");
+                            };
+                            if name.eq_ignore_ascii_case("content-length") {
+                                content_length = Some(
+                                    value
+                                        .trim()
+                                        .parse::<usize>()
+                                        .map_err(|_| "request_content_length")?,
+                                );
+                            }
+                        }
+                        header_end = Some(end + 4);
+                        declared_request_body_bytes =
+                            Some(content_length.ok_or("request_content_length_missing")?);
+                    }
+                }
+
+                if let (Some(end), Some(body_bytes)) = (header_end, declared_request_body_bytes) {
+                    if received.len() >= end + body_bytes {
+                        break;
+                    }
+                }
+            }
+
+            let request_body_bytes_read = received.len() - header_end.ok_or("request_headers")?;
             std::thread::sleep(delay);
             let response = format!(
                 "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
-            let _ = stream.write_all(response.as_bytes());
+            stream
+                .write_all(response.as_bytes())
+                .map_err(|_| "response_write")?;
+            Ok(FixtureIo {
+                request_headers_complete: true,
+                declared_request_body_bytes: declared_request_body_bytes
+                    .ok_or("request_content_length_missing")?,
+                request_body_bytes_read,
+                response_bytes_to_write: response.len(),
+                response_bytes_written: response.len(),
+            })
         });
         (endpoint, worker)
     }
@@ -7256,7 +7348,19 @@ mod session_diagnose_tests {
             let (endpoint, worker) = fixture(status, body, Duration::ZERO);
             let request = build_request(&command(&["session-diagnose", "--session", "seat", "--as-user", "mike"]).unwrap()).unwrap();
             assert_eq!(send_to(&endpoint, &request).unwrap_err(), expected);
-            worker.join().unwrap();
+            let io = worker.join().expect("fixture thread panicked").expect(
+                "fixture must consume the complete request and write the complete response",
+            );
+            assert!(io.request_headers_complete);
+            assert_eq!(
+                io.request_body_bytes_read,
+                io.declared_request_body_bytes,
+                "fixture must consume the declared request body"
+            );
+            assert_eq!(
+                io.response_bytes_written, io.response_bytes_to_write,
+                "fixture must complete the response write"
+            );
         }
     }
 
