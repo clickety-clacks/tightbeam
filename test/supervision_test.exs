@@ -2395,8 +2395,7 @@ defmodule Tightbeam.SupervisionTest do
              )
   end
 
-  test "same-turn holder progress prevents a false prod after an expired checkpoint receipt",
-       ctx do
+  test "both post-turn scans credit progress and one bound checkpoint without false prods", ctx do
     attach_work_item!(ctx.db, "asg_1", "wi_checkpoint")
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0, interval: 60_000)
 
@@ -2440,6 +2439,9 @@ defmodule Tightbeam.SupervisionTest do
     assert :rebased = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq2)
     assert Wakes.get(ctx.db, second.wake_id).state == "pending"
 
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT count(*) FROM wakes WHERE origin='process:tightbeam'")
+
     assert {:ok,
             [["checkpoint", first_id], ["progress", "att_progress_before_cursor_checkpoint"]]} =
              DB.query(
@@ -2459,8 +2461,12 @@ defmodule Tightbeam.SupervisionTest do
     {:ok, _} =
       DB.query(ctx.db, "UPDATE supervision_entitlements SET dueAt=0 WHERE assignmentId='asg_1'")
 
+    # Recheck the same bound wake from a later turn with no new eligible row.
     seq3 = terminal!(ctx.db, "holder")
     assert :rebased = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq3)
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT count(*) FROM wakes WHERE origin='process:tightbeam'")
 
     assert {:ok, [[1]]} =
              DB.query(
