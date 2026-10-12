@@ -2395,6 +2395,83 @@ defmodule Tightbeam.SupervisionTest do
              )
   end
 
+  test "same-turn holder progress prevents a false prod after an expired checkpoint receipt",
+       ctx do
+    attach_work_item!(ctx.db, "asg_1", "wi_checkpoint")
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0, interval: 60_000)
+
+    {first, seq1} = schedule_checkpoint_via_gateway!(ctx, "first checkpoint", 60_000)
+    assert :rebased = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq1)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE supervision_liveness_receipts SET acceptedAt=0, expiresAt=1 WHERE assignmentId='asg_1' AND sourceKind='checkpoint' AND sourceId=?1",
+        [first.wake_id]
+      )
+
+    file_progress = fn test_ctx, _source_seq ->
+      {:ok, _} =
+        DB.query(
+          test_ctx.db,
+          "INSERT INTO attests (id,assignmentId,kind,note,bySession,ts) VALUES ('att_progress_before_cursor_checkpoint','asg_1','progress','bounded implementation update','holder',?1)",
+          [System.system_time(:millisecond)]
+        )
+
+      :ok
+    end
+
+    {second, seq2} =
+      schedule_checkpoint_via_gateway!(ctx, "follow-up checkpoint", 120_000, file_progress)
+
+    assert {:ok, [[wake_row]]} =
+             DB.query(ctx.db, "SELECT rowid FROM wakes WHERE wakeId=?1", [second.wake_id])
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE supervision_liveness_receipt_state SET wakeCursor=?2 WHERE assignmentId='asg_1'",
+        ["asg_1", wake_row + 26]
+      )
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE supervision_entitlements SET dueAt=0 WHERE assignmentId='asg_1'")
+
+    assert :rebased = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq2)
+    assert Wakes.get(ctx.db, second.wake_id).state == "pending"
+
+    assert {:ok,
+            [["checkpoint", first_id], ["progress", "att_progress_before_cursor_checkpoint"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sourceKind,sourceId FROM supervision_liveness_receipts WHERE assignmentId='asg_1' ORDER BY receiptId"
+             )
+
+    assert first_id == first.wake_id
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM supervision_liveness_receipts WHERE assignmentId='asg_1' AND sourceKind='checkpoint' AND sourceId=?1",
+               [second.wake_id]
+             )
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE supervision_entitlements SET dueAt=0 WHERE assignmentId='asg_1'")
+
+    seq3 = terminal!(ctx.db, "holder")
+    assert :rebased = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq3)
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM supervision_liveness_receipts WHERE assignmentId='asg_1' AND sourceKind='checkpoint' AND sourceId=?1",
+               [second.wake_id]
+             )
+
+    assert Wakes.get(ctx.db, second.wake_id).state == "pending"
+  end
+
   test "a checkpoint skipped by the repeat cap is reconsidered after a later effect", ctx do
     attach_work_item!(ctx.db, "asg_1", "wi_checkpoint")
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0, interval: 60_000)
@@ -6031,7 +6108,12 @@ defmodule Tightbeam.SupervisionTest do
     seq
   end
 
-  defp schedule_checkpoint_via_gateway!(ctx, prompt, after_ms) do
+  defp schedule_checkpoint_via_gateway!(
+         ctx,
+         prompt,
+         after_ms,
+         before_wake \\ fn _ctx, _seq -> :ok end
+       ) do
     message_id = "checkpoint-turn-#{System.unique_integer([:positive])}"
 
     assert {:ok, seq} =
@@ -6046,6 +6128,8 @@ defmodule Tightbeam.SupervisionTest do
 
     assert {:ok, %{seq: ^seq, owner_lease: seq_lease}} =
              Ledger.claim_next(ctx.db, "holder", "checkpoint-writer")
+
+    assert :ok = before_wake.(ctx, seq)
 
     assert %{wake_id: wake_id, state: "pending"} =
              ctx.handlers["wake"].(%{
