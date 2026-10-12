@@ -2364,7 +2364,7 @@ defmodule Tightbeam.SupervisionTest do
       DB.query(
         ctx.db,
         "UPDATE supervision_liveness_receipt_state SET wakeCursor=?2 WHERE assignmentId='asg_1'",
-        ["asg_1", wake_row]
+        ["asg_1", wake_row + 11]
       )
 
     assert {:ok, [[cursor]]} =
@@ -2373,7 +2373,7 @@ defmodule Tightbeam.SupervisionTest do
                "SELECT wakeCursor FROM supervision_liveness_receipt_state WHERE assignmentId='asg_1'"
              )
 
-    assert cursor >= wake_row
+    assert cursor > wake_row
     assert Wakes.get(ctx.db, wake.wake_id).state == "pending"
 
     assert :rebased = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq)
@@ -2386,6 +2386,9 @@ defmodule Tightbeam.SupervisionTest do
 
     assert source_id == wake.wake_id
     assert Wakes.get(ctx.db, wake.wake_id).state == "pending"
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT count(*) FROM wakes WHERE origin='process:tightbeam'")
 
     assert {:ok, [[1]]} =
              DB.query(
