@@ -143,7 +143,30 @@ defmodule Tightbeam.SessionDiagnoseTest do
     started = System.monotonic_time(:millisecond)
     response = request(%{deps | db: db}, body())
     elapsed = System.monotonic_time(:millisecond) - started
-    assert response.status == 200
+
+    diagnostic_code =
+      case response.resp_body do
+        body when is_binary(body) and byte_size(body) <= 4096 ->
+          case JSON.decode(body) do
+            {:ok, %{"error" => %{"code" => code}}}
+            when code in [
+                   "diagnostic_snapshot_timeout",
+                   "diagnostic_unavailable",
+                   "diagnostic_response_limit"
+                 ] ->
+              code
+
+            _ ->
+              "unrecognized"
+          end
+
+        _ ->
+          "unavailable"
+      end
+
+    assert response.status == 200,
+           "expected HTTP 200, got #{response.status}; error_code=#{diagnostic_code}; elapsed_ms=#{elapsed}"
+
     assert elapsed < 1000
     data = JSON.decode!(response.resp_body)["result"]
     assert data["db"]["exists"]
