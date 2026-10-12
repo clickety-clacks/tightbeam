@@ -313,20 +313,31 @@ before that release was installed, diagnose
 session. The restarted session ignores the stale overlay, so an unset is not
 required. Neither branch needs onboarding or a PAT.
 
-Only a matching projection plus a non-live probe is `needs-onboarding`. Repair
-that state with `tightbeam onboard github --hostname <host>`. Never ask for a
-PAT.
+With a matching projection, keep the probe's actual state and failed phase:
+
+| State | Diagnosis and next step |
+| --- | --- |
+| `needs_onboarding` | `needs-onboarding` only when the probe demonstrates that no active authenticated account is usable; run `tightbeam onboard github --hostname <host>`. |
+| `missing_cli` | `missing-cli`; restore `gh` on the operation host's supported `PATH`, then probe again. |
+| `insufficient_scope` | `insufficient-scope`; report the refused operation and required grant to the operator for a scoped repair, then probe again. |
+| `git_unready` | `git-unready`; repair the remote, protocol, or credential helper identified by `git ls-remote`, then probe again. |
+| `unknown` | `unknown`; report the failed phase and reason (including a timeout or transport failure) as unresolved, then diagnose that cause before another bounded probe. Do not infer missing authentication. |
+
+The live probe, not a stale capability fact, selects the row. Never ask for a
+PAT. A matching bank with a timed-out `gh auth status` is `unknown`, not
+`needs-onboarding`; a live `gh` result followed by a failed `git ls-remote` is
+`git-unready` only when that phase establishes a Git-specific failure.
 
 Attach this mandatory evidence block to the ask:
 
 - projected `$GH_CONFIG_DIR` path;
 - expected `$TIGHTBEAM_HOME/auth/github/gh` path;
 - `MATCH` or `MISMATCH`;
-- live-probe state and account, if known;
+- live-probe state, failed phase and nonsecret reason, and account if known;
 - diagnosis: `projection-broken-stale-overlay`,
-  `projection-broken-session-predates-reservation`, `needs-onboarding`, or
-  `git-unready`;
-- repair command.
+  `projection-broken-session-predates-reservation`, `needs-onboarding`,
+  `missing-cli`, `insufficient-scope`, `git-unready`, or `unknown`;
+- state-appropriate repair command, or the unresolved diagnostic for `unknown`.
 
 Record paths and state only. Never record token bytes or `hosts.yml` contents.
 `tightbeam github-auth-check` is the rails hook that guards tool calls. It is
