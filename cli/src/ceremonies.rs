@@ -3622,7 +3622,7 @@ mod tests {
             Some("signal-fixture-lease"),
             "TERM did not cancel the lease returned by begin"
         );
-        assert!(!alive, "codex descendant {grandchild} survived TERM");
+        assert!(!alive, "codex descendant {grandchild_pid} survived TERM");
         assert!(!staging_survived, "TERM left codex staging behind");
     }
 
