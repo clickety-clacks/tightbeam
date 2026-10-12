@@ -679,7 +679,7 @@ defmodule Tightbeam.EscalationDeliveryFixture do
              # ancestor, deduped by deterministic wakeId and committed with
              # the current cannot-proceed disposer.
              {"lib/tightbeam/productions/bubble.ex", "Gateway.deliver_prompt_in_txn/5",
-              "deliver_bubble_notice/5"} => 1,
+              "deliver_bubble_notice_in_txn/4"} => 1,
              {"lib/tightbeam/productions/bubble.ex", "Gateway.deliver_prompt_in_txn/5",
               "route_patrol_escalation/2"} => 1,
              {"lib/tightbeam/supervision.ex", "Gateway.deliver_prompt/4",
