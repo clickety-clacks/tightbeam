@@ -76,6 +76,7 @@ defmodule Tightbeam.D1ReadTest do
     page = D1Read.page(db, "/unused", :config, %{}, :latest, 5)
 
     assert length(page.items) == 5
+
     assert Enum.map(page.items, & &1["key"]) ==
              Enum.map(76..80, fn index ->
                "page-setting-" <> String.pad_leading(to_string(index), 3, "0")
