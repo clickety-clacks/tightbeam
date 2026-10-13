@@ -56,7 +56,7 @@ defmodule Tightbeam.FirehoseR1SchemaTest do
     assert :ok = Schema.ensure_all(db)
 
     assert rows(db, "SELECT shape FROM schema_stamp") ==
-             [["notice-source-storage-v1-019"]]
+             [["decision-request-row-schema-v2-019"]]
 
     for {table, column} <- [
           {"assignments", "reminderState"},

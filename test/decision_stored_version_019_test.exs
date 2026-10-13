@@ -340,6 +340,9 @@ defmodule Tightbeam.DecisionStoredVersion019Test do
 
     assert :ok = Schema.ensure_all(db)
 
+    assert {:ok, [["decision-request-row-schema-v2-019"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+
     assert {:ok, [[1], [1], [1]]} =
              DB.query(db, "SELECT rowSchemaRevision FROM decision_requests ORDER BY id")
 
@@ -347,6 +350,57 @@ defmodule Tightbeam.DecisionStoredVersion019Test do
              DB.query(db, "SELECT rowVersion FROM decision_requests WHERE id='old-1'")
 
     assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
+  end
+
+  test "decision row revision adoption requires the exact stamped predecessor shape", %{db: db} do
+    :ok = DB.execute(db, "UPDATE schema_stamp SET shape='notice-source-storage-v1-019'")
+    before = decision_schema_snapshot(db)
+
+    assert_raise Schema.ShapeError, ~r/decision request row schema migration failed/, fn ->
+      Schema.ensure_all(db)
+    end
+
+    assert decision_schema_snapshot(db) == before
+  end
+
+  test "decision row revision and successor stamp roll back as one migration", %{db: db} do
+    :ok = DB.execute(db, "ALTER TABLE decision_requests DROP COLUMN rowSchemaRevision")
+    :ok = DB.execute(db, "UPDATE schema_stamp SET shape='notice-source-storage-v1-019'")
+
+    :ok =
+      DB.execute(db, """
+      CREATE TRIGGER reject_decision_revision_stamp
+      BEFORE UPDATE ON schema_stamp
+      WHEN NEW.shape='decision-request-row-schema-v2-019'
+      BEGIN
+        SELECT RAISE(ABORT, 'fixture decision revision stamp refusal');
+      END
+      """)
+
+    before = decision_schema_snapshot(db)
+
+    assert_raise Schema.ShapeError, ~r/decision request row schema migration failed/, fn ->
+      Schema.ensure_all(db)
+    end
+
+    assert decision_schema_snapshot(db) == before
+
+    :ok = DB.execute(db, "DROP TRIGGER reject_decision_revision_stamp")
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:ok, [["decision-request-row-schema-v2-019"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+  end
+
+  test "current decision row revision stamp refuses a missing revision column", %{db: db} do
+    :ok = DB.execute(db, "ALTER TABLE decision_requests DROP COLUMN rowSchemaRevision")
+    before = decision_schema_snapshot(db)
+
+    assert_raise Schema.ShapeError, ~r/incompatible decision request row schema stamp/, fn ->
+      Schema.ensure_all(db)
+    end
+
+    assert decision_schema_snapshot(db) == before
   end
 
   test "decision projections require an explicit compatible row schema revision", %{db: db} do
@@ -616,6 +670,17 @@ defmodule Tightbeam.DecisionStoredVersion019Test do
 
     assert {:error, _} =
              DB.query(db, "UPDATE decision_requests SET rowVersion=-1 WHERE id='dr_agent_r7'")
+  end
+
+  defp decision_schema_snapshot(db) do
+    for sql <- [
+          "SELECT type,name,sql FROM sqlite_master ORDER BY type,name",
+          "SELECT * FROM schema_stamp",
+          "SELECT * FROM decision_requests ORDER BY id"
+        ] do
+      assert {:ok, rows} = DB.query(db, sql)
+      rows
+    end
   end
 
   defp insert_decision_rows(db) do

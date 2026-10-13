@@ -95,8 +95,6 @@ defmodule Tightbeam.Escalation do
     returnedAt        INTEGER,
     rowVersion        INTEGER NOT NULL DEFAULT 1
                       CHECK (typeof(rowVersion) = 'integer' AND rowVersion > 0),
-    rowSchemaRevision INTEGER NOT NULL DEFAULT 2
-                      CHECK (typeof(rowSchemaRevision) = 'integer' AND rowSchemaRevision IN (1,2)),
     CHECK (
       (kind = 'statute' AND statuteName IS NOT NULL AND actionKey IS NOT NULL
        AND expecterSessionKey IS NULL AND expecterUserId IS NULL
@@ -277,6 +275,25 @@ defmodule Tightbeam.Escalation do
     ON escalation_waivers (raiserId, statuteName, revokedAt);
   """
 
+  @decision_requests_pre_revision_ddl
+    case Regex.run(~r/CREATE TABLE IF NOT EXISTS decision_requests \([\s\S]*?\n  \);/u, @ddl) do
+      [ddl] ->
+        ddl
+        |> String.trim_trailing(";")
+        |> String.replace_prefix("CREATE TABLE IF NOT EXISTS", "CREATE TABLE")
+
+      _ ->
+        raise "decision_requests DDL not found"
+    end
+
+  @decision_request_revision_ddl
+    "rowSchemaRevision INTEGER NOT NULL DEFAULT 1 " <>
+      "CHECK (typeof(rowSchemaRevision) = 'integer' AND rowSchemaRevision IN (1,2))"
+
+  @decision_requests_current_ddl
+    String.trim_trailing(@decision_requests_pre_revision_ddl, ")") <>
+      ", " <> @decision_request_revision_ddl <> ")"
+
   @terminal_request_columns """
   id, kind, raiserId, raiserSessionKey, ownerUserId, assignmentId,
   expecterSessionKey, expecterUserId, lineageRung, effortGeneration, deadlineWakeId,
@@ -440,57 +457,13 @@ defmodule Tightbeam.Escalation do
   def ensure_r1_schema(db), do: DB.execute(db, @r1_ddl)
 
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
-  def ensure_schema(db \\ DB) do
-    with :ok <- DB.execute(db, @ddl),
-         :ok <- ensure_decision_row_schema_revision(db) do
-      :ok
-    end
-  end
+  def ensure_schema(db \\ DB), do: DB.execute(db, @ddl)
 
-  defp ensure_decision_row_schema_revision(db) do
-    case DB.transaction(db, &ensure_decision_row_schema_revision_in_txn/1) do
-      {:ok, :ok} -> :ok
-      {:error, error} -> {:error, error}
-    end
-  end
+  @doc false
+  @spec migrate_decision_row_schema_revision_in_txn(Txn.t()) :: :ok
+  def migrate_decision_row_schema_revision_in_txn(txn) do
+    :ok = validate_decision_row_schema_revision_in_txn(txn, :predecessor)
 
-  defp ensure_decision_row_schema_revision_in_txn(txn) do
-    revision_column =
-      Enum.find(
-        Txn.q(txn, "PRAGMA table_info(decision_requests)"),
-        &(Enum.at(&1, 1) == "rowSchemaRevision")
-      )
-
-    case revision_column do
-      nil ->
-        adopt_decision_row_schema_revision_in_txn(txn)
-
-      [_cid, "rowSchemaRevision", "INTEGER", 1, default, 0] when default in ["1", "2"] ->
-        validate_decision_revision_column_sql!(txn, default)
-        validate_decision_row_revisions_in_txn(txn)
-
-      _ ->
-        raise DB.Error, message: "incompatible decision request rowSchemaRevision column"
-    end
-  end
-
-  defp validate_decision_revision_column_sql!(txn, default) do
-    [[sql]] =
-      Txn.q(txn, "SELECT sql FROM sqlite_master WHERE type='table' AND name='decision_requests'")
-
-    normalized = String.replace(String.downcase(sql), ~r/\s+/u, "")
-
-    expected =
-      "rowschemarevisionintegernotnulldefault#{default}check(typeof(rowschemarevision)='integer'androwschemarevisionin(1,2))"
-
-    unless String.contains?(normalized, expected) do
-      raise DB.Error, message: "incompatible decision request rowSchemaRevision constraint"
-    end
-
-    :ok
-  end
-
-  defp adopt_decision_row_schema_revision_in_txn(txn) do
     statuses = Txn.q(txn, "SELECT DISTINCT status FROM decision_requests") |> List.flatten()
 
     unless Enum.all?(statuses, &(&1 in @decision_revision_2_statuses)) do
@@ -501,8 +474,7 @@ defmodule Tightbeam.Escalation do
     :ok =
       Txn.exec(
         txn,
-        "ALTER TABLE decision_requests ADD COLUMN rowSchemaRevision INTEGER NOT NULL DEFAULT 1 " <>
-          "CHECK (typeof(rowSchemaRevision) = 'integer' AND rowSchemaRevision IN (1,2))"
+        "ALTER TABLE decision_requests ADD COLUMN " <> @decision_request_revision_ddl
       )
 
     Txn.q(
@@ -510,7 +482,54 @@ defmodule Tightbeam.Escalation do
       "UPDATE decision_requests SET rowSchemaRevision=2 WHERE status='returned'"
     )
 
-    validate_decision_row_revisions_in_txn(txn)
+    :ok = validate_decision_row_schema_revision_in_txn(txn, :current)
+  end
+
+  @doc false
+  @spec validate_decision_row_schema_revision_in_txn(Txn.t(), :predecessor | :current) :: :ok
+  def validate_decision_row_schema_revision_in_txn(txn, :predecessor) do
+    validate_decision_requests_ddl!(txn, @decision_requests_pre_revision_ddl, :predecessor)
+  end
+
+  def validate_decision_row_schema_revision_in_txn(txn, :current) do
+    validate_decision_requests_ddl!(txn, @decision_requests_current_ddl, :current)
+
+    case Enum.find(
+           Txn.q(txn, "PRAGMA table_info(decision_requests)"),
+           &(Enum.at(&1, 1) == "rowSchemaRevision")
+         ) do
+      [_cid, "rowSchemaRevision", "INTEGER", 1, "1", 0] ->
+        validate_decision_row_revisions_in_txn(txn)
+
+      _ ->
+        raise DB.Error, message: "incompatible decision request rowSchemaRevision column"
+    end
+  end
+
+  defp validate_decision_requests_ddl!(txn, expected_ddl, revision_state) do
+    case Txn.q(
+           txn,
+           "SELECT sql FROM sqlite_master WHERE type='table' AND name='decision_requests'"
+         ) do
+      [[sql]] ->
+        unless normalize_decision_schema_sql(sql) == normalize_decision_schema_sql(expected_ddl) do
+          raise DB.Error,
+            message: "incompatible decision request table at #{revision_state} revision stamp"
+        end
+
+        :ok
+
+      rows ->
+        raise DB.Error,
+          message:
+            "incompatible decision request table at #{revision_state} revision stamp: #{inspect(rows)}"
+    end
+  end
+
+  defp normalize_decision_schema_sql(sql) do
+    sql
+    |> String.downcase()
+    |> String.replace(~r/\s+/u, "")
   end
 
   defp validate_decision_row_revisions_in_txn(txn) do
@@ -1197,18 +1216,7 @@ defmodule Tightbeam.Escalation do
   defp file_agent_request(db, input) do
     case DB.transaction(db, fn txn ->
            case file_agent_request_in_txn(txn, input) do
-             %{request: request} = filed ->
-               Publisher.maybe_accepted_in_txn(txn, input.firehose_call, request)
-
-               request =
-                 publish_decision_transition_in_txn(
-                   txn,
-                   nil,
-                   request,
-                   Map.get(input.firehose_call || %{}, :firehose_hub, Hub)
-                 )
-
-               %{filed | request: request}
+             %{request: _request} = filed -> filed
 
              error ->
                error
@@ -1291,7 +1299,20 @@ defmodule Tightbeam.Escalation do
           })
         end
 
-      %{request: request_in_txn(txn, request_id), wake: wake}
+      request = request_in_txn(txn, request_id)
+      firehose_call = Map.get(input, :firehose_call)
+
+      Publisher.maybe_accepted_in_txn(txn, firehose_call, request)
+
+      request =
+        publish_decision_transition_in_txn(
+          txn,
+          nil,
+          request,
+          Map.get(firehose_call || %{}, :firehose_hub, Hub)
+        )
+
+      %{request: request, wake: wake}
     else
       {:error, error} -> error
     end
