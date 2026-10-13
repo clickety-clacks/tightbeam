@@ -1069,11 +1069,16 @@ defmodule Tightbeam.CredentialKindsTest do
         script = List.last(command)
         send(owner, {:probe, script})
 
-        if String.contains?(script, "api.openai.com") do
-          {~s({"data":[{"id":"gpt-5.6-sol","object":"model"}]}) <> "\n200", 0}
-        else
-          {~s({"models":[{"slug":"gpt-5.6-sol","display_name":"GPT-5.6 Sol","supported_reasoning_levels":[{"effort":"medium"}]}]}) <>
-             "\n200 0.145.0", 0}
+        cond do
+          String.contains?(script, "model/list") ->
+            {~s({"models":[{"id":"gpt-5.6-sol","hidden":false}],"engineVersion":"test"}), 0}
+
+          String.contains?(script, "api.openai.com") ->
+            {~s({"data":[{"id":"gpt-5.6-sol","object":"model"}]}) <> "\n200", 0}
+
+          true ->
+            {~s({"models":[{"slug":"gpt-5.6-sol","display_name":"GPT-5.6 Sol","supported_reasoning_levels":[{"effort":"medium"}]}]}) <>
+               "\n200 0.145.0", 0}
         end
       end
 

@@ -1280,11 +1280,18 @@ defmodule Tightbeam.Harness.Codex do
         Enum.reduce_while(matched, {:ok, []}, fn entry, {:ok, qualified} ->
           case selected_efforts(selected[entry.family]) do
             {:ok, levels} ->
+              capabilities =
+                if levels == [] do
+                  entry.capabilities
+                else
+                  %{"supported_reasoning_levels" => levels}
+                end
+
               enriched =
                 %{
                   entry
                   | efforts: Enum.map(levels, & &1["reasoningEffort"]),
-                    capabilities: %{"supported_reasoning_levels" => levels}
+                    capabilities: capabilities
                 }
 
               {:cont, {:ok, [enriched | qualified]}}
