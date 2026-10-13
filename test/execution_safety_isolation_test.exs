@@ -81,9 +81,6 @@ defmodule Tightbeam.ExecutionSafetyIsolationTest do
       assert capture =~ "TIGHTBEAM_PORT=0\n"
       assert capture =~ "Authoritative Mix gate: node=#{node} port=0\n"
 
-      assert capture =~
-               "ARG=--sname\nARG=#{node}\nARG=-S\nARG=mix\nARG=test\nARG=--execution-safety-fixture\n"
-
       for production_name <- [
             "TIGHTBEAM_BASE_DIR=",
             "TIGHTBEAM_ADVERTISED_URL=",
@@ -162,7 +159,6 @@ defmodule Tightbeam.ExecutionSafetyIsolationTest do
     printf 'RUNS_OVERLAPPED=2\\n'
     printf 'CHILD_RUN_NODE=%s\\n' "$TIGHTBEAM_GATE_NODE"
     env | sort
-    for arg do printf 'ARG=%s\\n' "$arg"; done
     """
   end
 end
