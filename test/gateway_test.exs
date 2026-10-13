@@ -6999,6 +6999,57 @@ defmodule Tightbeam.GatewayTest do
     assert Org.get(ctx.db, "k-round-trip").provider == "openai"
   end
 
+  test "set_model accepts an arbitrary model id from the current harness catalog", ctx do
+    base_dir = role_test_base("set-model-provider-offered")
+    Archetypes.load!(base_dir)
+    config = gateway_config(base_dir, ctx.db, 0)
+    provider_model = "provider-offered-model-x91"
+
+    Org.create(ctx.db, %{
+      session_key: "k-provider-offered",
+      display_name: "Codex",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "codex",
+      provider: "openai",
+      model: Model.new("current-model", effort: "medium")
+    })
+
+    put_host_catalog("testhost", "codex", [])
+
+    put_host_catalog_entry("testhost", "codex", %{
+      family: provider_model,
+      name: provider_model,
+      display_name: provider_model,
+      efforts: ["medium"],
+      provider: :openai
+    })
+
+    adapter = start_supervised!({AdapterStub, self()})
+    start_supervised!({CoordinatorStub, {adapter, self()}})
+    start_lane!(ctx.db, "k-provider-offered")
+
+    offered =
+      Gateway.session_status("k-provider-offered", ctx.db).modelCatalog.models
+      |> Enum.find(&(&1.ref == provider_model))
+
+    assert offered.name == provider_model
+
+    assert %{ok: true} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: "user:flynn",
+               session_key: "k-provider-offered",
+               params: %{setting: "set_model", model: offered.ref}
+             })
+
+    assert Org.get(ctx.db, "k-provider-offered").model ==
+             Model.new(provider_model, effort: "medium")
+
+    assert Org.get(ctx.db, "k-provider-offered").provider == "openai"
+  end
+
   test "set_model with a bare model id keeps the current effort tier", ctx do
     base_dir = role_test_base("set-model-bare-keeps-effort")
     Archetypes.load!(base_dir)
