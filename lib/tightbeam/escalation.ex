@@ -275,24 +275,36 @@ defmodule Tightbeam.Escalation do
     ON escalation_waivers (raiserId, statuteName, revokedAt);
   """
 
-  @decision_requests_pre_revision_ddl (case String.split(
-                                              @ddl,
-                                              "CREATE TABLE IF NOT EXISTS decision_requests (",
-                                              parts: 2
-                                            ) do
-                                         [_prefix, suffix] ->
-                                           case String.split(suffix, "\n);", parts: 2) do
-                                             [table_body, _rest] ->
-                                               "CREATE TABLE decision_requests (" <>
-                                                 table_body <> ")"
+  # Fresh databases traverse the stamped historical bootstrap. Its rowVersion
+  # column is added by ALTER TABLE, so the predecessor lacks the check used by
+  # the current fresh-table DDL below. Model that exact migration result here.
+  @decision_requests_pre_revision_ddl (
+                                        predecessor =
+                                          case String.split(
+                                                 @ddl,
+                                                 "CREATE TABLE IF NOT EXISTS decision_requests (",
+                                                 parts: 2
+                                               ) do
+                                            [_prefix, suffix] ->
+                                              case String.split(suffix, "\n);", parts: 2) do
+                                                [table_body, _rest] ->
+                                                  "CREATE TABLE decision_requests (" <>
+                                                    table_body <> ")"
 
-                                             _ ->
-                                               raise "decision_requests DDL terminator not found"
-                                           end
+                                                _ ->
+                                                  raise "decision_requests DDL terminator not found"
+                                              end
 
-                                         _ ->
-                                           raise "decision_requests DDL not found"
-                                       end)
+                                            _ ->
+                                              raise "decision_requests DDL not found"
+                                          end
+
+                                        String.replace(
+                                          predecessor,
+                                          "CHECK (typeof(rowVersion) = 'integer' AND rowVersion > 0)",
+                                          ""
+                                        )
+                                      )
 
   @decision_request_revision_ddl "rowSchemaRevision INTEGER NOT NULL DEFAULT 1 " <>
                                    "CHECK (typeof(rowSchemaRevision) = 'integer' AND rowSchemaRevision IN (1,2))"
@@ -544,6 +556,7 @@ defmodule Tightbeam.Escalation do
   defp normalize_decision_schema_sql(sql) do
     sql
     |> String.downcase()
+    |> String.replace("\"decision_requests\"", "decision_requests")
     |> String.replace(~r/\s+/u, "")
   end
 
