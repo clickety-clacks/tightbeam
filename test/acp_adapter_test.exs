@@ -316,6 +316,7 @@ defmodule Tightbeam.Acp.AdapterTest do
         const sid = gateMode !== "none" && gateMode !== "delay-setup" && newCalls === 1 ? "probe-sess" : "sess-1";
         models[sid] = models[sid] || "haiku";
         offeredModels[sid] = [...defaultOfferedModels];
+        if (failMode === "resident-default-context-variant") offeredModels[sid].push("orbit-9[1m]");
         if (gateMode === "delay-setup") return setTimeout(() => send({ id: m.id, result: { sessionId: sid, ...configOptions(sid) } }), 75);
         return send({ id: m.id, result: { sessionId: sid, ...configOptions(sid) } });
       }
@@ -424,14 +425,19 @@ defmodule Tightbeam.Acp.AdapterTest do
         }
         if (failMode === "canonical-opus5-alias" &&
             m.params.configId === "model" &&
-            m.params.value === "claude-opus-5") {
+            m.params.value === "claude-opus-5[1m]") {
           models[m.params.sessionId] = "opus[1m]";
           return send({ id: m.id, result: configOptions(m.params.sessionId) });
         }
         if ((failMode === "canonical-opus55-alias" || failMode === "canonical-opus55-drift") &&
             m.params.configId === "model" &&
-            m.params.value === "claude-opus-5-5") {
+            ["claude-opus-5-5", "claude-opus-5-5[1m]"].includes(m.params.value)) {
           models[m.params.sessionId] = "opus[1m]";
+          return send({ id: m.id, result: configOptions(m.params.sessionId) });
+        }
+        if (failMode === "resident-default-context-variant" &&
+            m.params.configId === "model" && m.params.value === "orbit-9") {
+          models[m.params.sessionId] = "orbit-9[1m]";
           return send({ id: m.id, result: configOptions(m.params.sessionId) });
         }
         if (failMode === "default-context-variant" &&
@@ -442,7 +448,7 @@ defmodule Tightbeam.Acp.AdapterTest do
         }
         if ((failMode === "future-alias" || failMode === "future-alias-drift" || failMode === "future-name-only") &&
             m.params.configId === "model" &&
-            m.params.value === "claude-nova-7-3") {
+            m.params.value === "claude-nova-7-3[1m]") {
           models[m.params.sessionId] = "nova[1m]";
           return send({ id: m.id, result: configOptions(m.params.sessionId) });
         }
@@ -999,7 +1005,7 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     assert {:ok, _turn} = Adapter.prompt(adapter, "sess-1", "persist this conversation")
 
-    switched_model = Model.new("claude-opus-5")
+    switched_model = Model.new("claude-opus-5", context: "1m")
 
     assert {:ok, "sess-fork-1"} =
              Adapter.switch_model_session(
@@ -1023,7 +1029,7 @@ defmodule Tightbeam.Acp.AdapterTest do
           request["sessionId"] == "sess-fork-1" and request["configId"] == "model"
       end)
 
-    assert Enum.map(model_writes, & &1["value"]) == ["claude-opus-5"]
+    assert Enum.map(model_writes, & &1["value"]) == ["claude-opus-5[1m]"]
   end
 
   test "Claude model switch accepts Opus 5.5 with 1M context for the exact requested version" do
@@ -1034,7 +1040,7 @@ defmodule Tightbeam.Acp.AdapterTest do
              Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
 
     assert {:ok, _turn} = Adapter.prompt(adapter, "sess-1", "persist this conversation")
-    requested = Model.new("claude-opus-5-5")
+    requested = Model.new("claude-opus-5-5", context: "1m")
 
     assert {:ok, "sess-fork-1"} =
              Adapter.switch_model_session(adapter, "sess-1", requested, "/tmp", [], "guidance")
@@ -1052,7 +1058,7 @@ defmodule Tightbeam.Acp.AdapterTest do
           request["sessionId"] == "sess-fork-1" and request["configId"] == "model"
       end)
 
-    assert Enum.map(model_writes, & &1["value"]) == ["claude-opus-5-5"]
+    assert Enum.map(model_writes, & &1["value"]) == ["claude-opus-5-5[1m]"]
   end
 
   test "Claude Opus 5.5 switch rejects Opus 5 readback and preserves the prior session" do
@@ -1069,7 +1075,7 @@ defmodule Tightbeam.Acp.AdapterTest do
       Adapter.switch_model_session(
         adapter,
         "sess-1",
-        Model.new("claude-opus-5-5"),
+        Model.new("claude-opus-5-5", context: "1m"),
         "/tmp",
         [],
         "guidance"
@@ -1097,7 +1103,7 @@ defmodule Tightbeam.Acp.AdapterTest do
           request["sessionId"] == "sess-fork-1" and request["configId"] == "model"
       end)
 
-    assert Enum.map(model_writes, & &1["value"]) == ["claude-opus-5-5"]
+    assert Enum.map(model_writes, & &1["value"]) == ["claude-opus-5-5[1m]"]
 
     assert Enum.any?(requests, fn request ->
              request["method"] == "session/close" and request["sessionId"] == "sess-fork-1"
@@ -2439,7 +2445,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     {adapter, capture_path} =
       start_adapter(harness: :claude, fail_mode: "canonical-opus55-alias")
 
-    requested = Model.new("claude-opus-5-5", effort: "high")
+    requested = Model.new("claude-opus-5-5", context: "1m", effort: "high")
 
     assert {:ok, "sess-1"} =
              Adapter.new_candidate_session(adapter, requested, "/tmp", [], "guidance")
@@ -2451,7 +2457,7 @@ defmodule Tightbeam.Acp.AdapterTest do
       |> Enum.filter(&(&1["method"] == "session/set_config_option"))
 
     assert Enum.map(writes, &{&1["configId"], &1["value"]}) ==
-             [{"model", "claude-opus-5-5"}, {"effort", "high"}]
+             [{"model", "claude-opus-5-5[1m]"}, {"effort", "high"}]
 
     refute Enum.any?(captured_requests(capture_path), fn request ->
              request["method"] == "session/close" and request["sessionId"] == "sess-1"
@@ -2479,16 +2485,60 @@ defmodule Tightbeam.Acp.AdapterTest do
            end)
   end
 
+  test "a resident switch refuses a variant when the default context was requested" do
+    {adapter, capture_path} =
+      start_adapter(harness: :codex, fail_mode: "resident-default-context-variant")
+
+    assert {:ok, "sess-1"} =
+             Adapter.new_session(adapter, Model.new("gpt-5.6-sol"), "/tmp", [], "guidance")
+
+    assert {:error, {:runtime_config_mismatch, %Model{family: "orbit-9", context: "1m"}}} =
+             Adapter.switch_model_session(
+               adapter,
+               "sess-1",
+               Model.new("orbit-9"),
+               "/tmp",
+               [],
+               "guidance"
+             )
+
+    assert {:ok, %Model{family: "orbit-9", context: "1m"}} =
+             Adapter.current_model(adapter, "sess-1")
+
+    refute Enum.any?(captured_requests(capture_path), &(&1["method"] == "session/fork"))
+  end
+
+  test "an opaque Claude alias refuses a variant when default context was requested" do
+    {adapter, capture_path} =
+      start_adapter(harness: :claude, fail_mode: "canonical-opus55-alias")
+
+    assert {:error,
+            {:session_prepare_failed,
+             {:runtime_config_mismatch, %Model{family: "claude-opus-5-5", context: "1m"}},
+             "sess-1", %{status: "verified"}}} =
+             Adapter.new_candidate_session(
+               adapter,
+               Model.new("claude-opus-5-5"),
+               "/tmp",
+               [],
+               "guidance"
+             )
+
+    assert Enum.any?(captured_requests(capture_path), fn request ->
+             request["method"] == "session/close" and request["sessionId"] == "sess-1"
+           end)
+  end
+
   test "an unseen offered Claude model verifies across harnesses and after a same-harness fork" do
     {adapter, capture_path} = start_adapter(harness: :claude, fail_mode: "future-alias")
-    requested = Model.new("claude-nova-7-3", effort: "high")
+    requested = Model.new("claude-nova-7-3", context: "1m", effort: "high")
 
     assert {:ok, "sess-1"} =
              Adapter.new_candidate_session(adapter, requested, "/tmp", [], "guidance")
 
     assert {:ok, ^requested} = Adapter.current_model(adapter, "sess-1")
     assert {:ok, offered} = Adapter.switchable_models(adapter, "sess-1")
-    assert Model.new("claude-nova-7-3") in offered
+    assert Model.new("claude-nova-7-3", context: "1m") in offered
     assert {:ok, _turn} = Adapter.prompt(adapter, "sess-1", "persist this conversation")
 
     assert {:ok, "sess-fork-1"} =
@@ -2498,7 +2548,7 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     assert Enum.count(captured_requests(capture_path), fn request ->
              request["method"] == "session/set_config_option" and
-               request["configId"] == "model" and request["value"] == "claude-nova-7-3"
+               request["configId"] == "model" and request["value"] == "claude-nova-7-3[1m]"
            end) == 2
   end
 
@@ -2521,7 +2571,7 @@ defmodule Tightbeam.Acp.AdapterTest do
 
   test "an unseen alias verifies when its version is in the offered name" do
     {adapter, _capture_path} = start_adapter(harness: :claude, fail_mode: "future-name-only")
-    requested = Model.new("claude-nova-7-3")
+    requested = Model.new("claude-nova-7-3", context: "1m")
 
     assert {:ok, "sess-1"} =
              Adapter.new_candidate_session(adapter, requested, "/tmp", [], "guidance")

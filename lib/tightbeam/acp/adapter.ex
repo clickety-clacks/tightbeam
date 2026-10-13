@@ -2281,7 +2281,7 @@ defmodule Tightbeam.Acp.Adapter do
     # without a compiled list of model families.
 
     if "claude-" in preset.canonical_model_prefixes do
-      Enum.find_value([option["description"], option["name"]], fn
+      public = Enum.find_value([option["description"], option["name"]], fn
         label when is_binary(label) ->
           case Regex.run(
                  ~r/\b([[:alpha:]][[:alnum:]-]*)\s+(\d+)(?:[. -](\d+))?(?=\s|$)/iu,
@@ -2300,24 +2300,38 @@ defmodule Tightbeam.Acp.Adapter do
         _ ->
           nil
       end)
+
+      wire_context = Model.parse_ref(option["value"]).context
+      label_context = offered_label_context(option)
+
+      case {public, wire_context, label_context} do
+        {%Model{} = model, context, context} -> %{model | context: context}
+        {%Model{} = model, nil, context} -> %{model | context: context}
+        {%Model{} = model, context, nil} -> %{model | context: context}
+        {%Model{}, _, _} -> nil
+        {nil, _, _} -> nil
+      end
     else
       nil
     end
   end
 
-  defp public_option_confirms_model?(option, %Model{} = public, %Model{} = requested) do
-    public.family == requested.family and
-      context_confirmed?(option, public.context, requested.context)
+  defp offered_label_context(option) do
+    Enum.find_value([option["description"], option["name"]], fn
+      label when is_binary(label) ->
+        case Regex.run(~r/\b(\d+(?:\.\d+)?[kmg])\s+context\b/iu, label) do
+          [_, context] -> String.downcase(context)
+          _ -> nil
+        end
+
+      _ ->
+        nil
+    end)
   end
 
-  defp context_confirmed?(_option, context, context), do: true
-  defp context_confirmed?(_option, _public_context, nil), do: true
-
-  defp context_confirmed?(option, _public_context, requested_context) do
-    option
-    |> then(&Enum.join([&1["value"], &1["name"], &1["description"]], " "))
-    |> String.downcase()
-    |> String.contains?(String.downcase(requested_context))
+  defp public_option_confirms_model?(_option, %Model{} = public, %Model{} = requested) do
+    public.family == requested.family and
+      public.context == requested.context
   end
 
   defp remember_reported_config_model(state, sid, options) do
