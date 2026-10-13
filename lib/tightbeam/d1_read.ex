@@ -1,7 +1,8 @@
 defmodule Tightbeam.D1Read do
   @moduledoc false
 
-  alias Tightbeam.{DB, Identity, StateResources}
+  alias Tightbeam.{DB, Identity, Keyset, StateResources}
+  alias Tightbeam.DB.Txn
 
   @resources %{
     config: %{resource: "config", route: "config.collection", filters: ~w(key), order: ~w(key)},
@@ -46,6 +47,72 @@ defmodule Tightbeam.D1Read do
     |> rows(db, base_dir)
     |> Enum.filter(&matches?(&1, filters))
     |> Enum.sort_by(&tuple(resource, &1))
+  end
+
+  @doc "Fetch a bounded keyset page from a database-backed D1 collection."
+  def page(db, base_dir, resource, filters, boundary, limit) do
+    case resource do
+      :config ->
+        sql_page(
+          db,
+          "SELECT key, value, updatedAt FROM org_settings",
+          "org_settings",
+          filters,
+          ["key"],
+          boundary,
+          limit,
+          fn [key, _value, _updated_at] -> [key] end,
+          &config_item/1
+        )
+
+      :host_environment ->
+        sql_page(
+          db,
+          "SELECT host, harness, name, valuePresent, updatedAt, rowVersion FROM host_environment_projection",
+          "host_environment_projection",
+          filters,
+          ["host", "harness", "name"],
+          boundary,
+          limit,
+          fn [host, harness, name | _] -> [host, harness, name] end,
+          &host_environment_item/1
+        )
+
+      :hosts ->
+        sql_page(
+          db,
+          "SELECT name FROM hosts",
+          "hosts",
+          Map.new(filters, fn
+            {"host", values} -> {"name", values}
+            pair -> pair
+          end),
+          ["name"],
+          boundary,
+          limit,
+          fn [host] -> [host] end,
+          fn [host] -> %{"host" => host, "rowVersion" => 1} end
+        )
+
+      :users ->
+        sql_page(
+          db,
+          "SELECT userId, isAdmin, createdAt FROM users",
+          "users",
+          filters,
+          ["userId"],
+          boundary,
+          limit,
+          fn [user_id | _] -> [user_id] end,
+          &user_item/1
+        )
+
+      :identity ->
+        finite_page(collection(db, base_dir, resource, filters), resource, boundary, limit)
+
+      :kungfu ->
+        finite_page(collection(db, base_dir, resource, filters), resource, boundary, limit)
+    end
   end
 
   def detail(db, _base_dir, :host_environment, {host, harness, name}) do
@@ -161,6 +228,116 @@ defmodule Tightbeam.D1Read do
   defp rows(:kungfu, _db, base_dir) do
     Identity.public_kungfu_names(base_dir)
     |> Enum.map(&Identity.public_kungfu(base_dir, &1))
+  end
+
+  defp sql_page(db, select_from, probe_from, filters, order, boundary, limit, tuple, mapper) do
+    {where, params} = in_filters(filters)
+
+    case DB.transaction(db, fn txn ->
+           query = fn sql, query_params -> Txn.q(txn, sql, query_params) end
+
+           page =
+             Keyset.page(
+               query,
+               select_from,
+               probe_from,
+               where,
+               params,
+               order,
+               boundary,
+               limit,
+               tuple
+             )
+
+           %{items: Enum.map(page.rows, mapper), flags: page}
+         end) do
+      {:ok, page} -> page
+      {:error, error} -> raise error
+    end
+  end
+
+  defp finite_page(rows, resource, boundary, limit) do
+    tuple = &tuple(resource, &1)
+
+    selected =
+      case boundary do
+        :latest -> Enum.take(rows, -limit)
+        :earliest -> Enum.take(rows, limit)
+        {:before, cursor} -> rows |> Enum.filter(&(tuple.(&1) < cursor)) |> Enum.take(-limit)
+        {:after, cursor} -> rows |> Enum.filter(&(tuple.(&1) > cursor)) |> Enum.take(limit)
+      end
+
+    flags =
+      case {boundary, selected} do
+        {{:before, cursor}, []} ->
+          %{has_more_before: false, has_more_after: Enum.any?(rows, &(tuple.(&1) > cursor))}
+
+        {{:after, cursor}, []} ->
+          %{has_more_before: Enum.any?(rows, &(tuple.(&1) < cursor)), has_more_after: false}
+
+        {_boundary, []} ->
+          %{has_more_before: false, has_more_after: false}
+
+        {_boundary, page} ->
+          first = tuple.(hd(page))
+          last = tuple.(List.last(page))
+
+          %{
+            has_more_before: Enum.any?(rows, &(tuple.(&1) < first)),
+            has_more_after: Enum.any?(rows, &(tuple.(&1) > last))
+          }
+      end
+
+    %{items: selected, flags: flags}
+  end
+
+  defp in_filters(filters) do
+    filters
+    |> Enum.sort()
+    |> Enum.reduce({[], []}, fn {field, values}, {clauses, params} ->
+      placeholders = Enum.map_join(values, ", ", fn _ -> "?" end)
+      {clauses ++ ["#{filter_column(field)} IN (#{placeholders})"], params ++ values}
+    end)
+    |> case do
+      {[], _params} -> {nil, []}
+      {clauses, params} -> {Enum.join(clauses, " AND "), params}
+    end
+  end
+
+  defp filter_column("key"), do: "key"
+  defp filter_column("host"), do: "host"
+  defp filter_column("harness"), do: "harness"
+  defp filter_column("name"), do: "name"
+  defp filter_column("userId"), do: "userId"
+
+  defp config_item([key, value, updated_at]) do
+    %{
+      "key" => key,
+      "value" => if(key == "default-archetype", do: value, else: nil),
+      "updatedAt" => updated_at,
+      "rowVersion" => updated_at
+    }
+  end
+
+  defp host_environment_item([host, harness, name, value_present, updated_at, row_version]) do
+    %{
+      "host" => host,
+      "harness" => harness,
+      "name" => name,
+      "value" => nil,
+      "valuePresent" => value_present == 1,
+      "updatedAt" => updated_at,
+      "rowVersion" => row_version
+    }
+  end
+
+  defp user_item([user_id, is_admin, created_at]) do
+    %{
+      "userId" => user_id,
+      "isAdmin" => is_admin == 1,
+      "createdAt" => created_at,
+      "rowVersion" => created_at
+    }
   end
 
   defp matches?(item, filters) do
