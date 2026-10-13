@@ -41,6 +41,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       ~w(id kind raiserId raiserSessionKey ownerUserId assignmentId expecterSessionKey expecterUserId lineageRung effortGeneration deadlineWakeId raisedAt deadlineAt statuteName question options context status decision rationale ruledBy ruledAt consumedAt withdrawnBy withdrawnReason withdrawnAt askedOfRole answer answeredBy answeredAt rowVersion),
     "sessions" =>
       ~w(sessionKey displayName kind orderIndex isBuiltIn adopted ownerUserId origin spawnedBy topologyParent handle archetype overrides identityName identityRevision harness provider model thinkingLevel modelContext host clearedThroughSeq state createdAt updatedAt mechanicalStatus capabilities rowVersion),
+    "roles" => ~w(name boundSessionKey ownerUserId createdAt updatedAt rowVersion),
     "devices" => ~w(deviceId userId claimedName status platform model createdAt rowVersion),
     "artifacts" =>
       ~w(artifactId kind title description createdBySession workItemId parentSession originPath contentSha256 recordedMessageId recordedTurnEvidence state home createdAt updatedAt rowVersion),
@@ -2157,6 +2158,11 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
 
     assert Enum.sort(Map.keys(item)) == Enum.sort(expected_fields)
 
+    assert StateResources.query_role(ctx.db, %{
+             key: role_name,
+             principal: %{kind: "process", id: "fixture", is_admin: false}
+           }) == nil
+
     notice = Publisher.committed_notice("role.created", role, %{})
     assert notice["resource"] == "roles"
     assert notice["refs"] == %{"role" => role_name}
@@ -2184,5 +2190,10 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     invalid_query = get(ctx, "/api/roles/#{role_name}?unexpected=value")
     assert_error(invalid_query, 400, "roles", "invalid_filter")
     assert_application_headers(invalid_query)
+
+    assert :ok = Tightbeam.Roles.rm(ctx.db, role_name)
+    deleted = get(ctx, "/api/roles/#{role_name}")
+    assert_error(deleted, 404, "roles", "not_found")
+    assert_application_headers(deleted)
   end
 end

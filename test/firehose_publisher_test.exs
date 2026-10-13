@@ -1152,11 +1152,6 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     %{name: "worker"} = Tightbeam.Roles.create!(db, "worker", "flynn", nil)
 
-    expected_item =
-      db
-      |> Tightbeam.StateResources.query_role("worker")
-      |> Tightbeam.StateResources.role()
-
     call = %{
       verb: "role-rm",
       origin: "user:flynn",
@@ -1165,6 +1160,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     }
 
     captured = Publisher.capture_before(db, call)
+    expected_item = captured.firehose_before |> Tightbeam.StateResources.role()
     :ok = Tightbeam.Roles.rm(db, "worker")
     :ok = Publisher.accepted(db, captured, %{removed: "worker"})
 
@@ -1175,6 +1171,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert notice["op"] == "delete"
     assert notice["refs"]["role"] == "worker"
     assert notice["payload"] == expected_item
+    assert notice["payload"]["rowVersion"] > notice["payload"]["updatedAt"]
     refute Map.has_key?(notice["payload"], "role")
   end
 

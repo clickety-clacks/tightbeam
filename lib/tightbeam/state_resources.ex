@@ -633,7 +633,7 @@ defmodule Tightbeam.StateResources do
     detail_selection(db, "roles", principal, fn txn -> role_query(txn, id) end)
   end
 
-  def query_role(db, id), do: role_query(db, id)
+  def query_role(db, id) when is_binary(id), do: role_query(db, id)
 
   defp role_query(db, id) do
     case query(
