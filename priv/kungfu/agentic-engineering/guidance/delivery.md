@@ -15,8 +15,9 @@ items and summarizes them for you; when a coordinator backs up, add another.
 Watch for this; no fixed threshold decides it. Moving an existing worker requires the supported owner-authorized
 reparent capability and preservation of its open obligations; use the installed
 command help and verify accepted custody rather than inferring it from a new card.
-Existing admission rules still apply; a refusal goes to its responsible owner,
-not around the supported seam.
+An installed admission refusal goes to its responsible owner for resolution
+under the engineering core's Evidence rule, not around the supported seam; do
+not make a preferred workflow an acceptance condition.
 
 Staff the PO's same-item plan. Pass its actual prompts with
 current references and execution context, preserving each task and finish

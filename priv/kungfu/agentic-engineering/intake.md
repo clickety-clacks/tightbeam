@@ -22,11 +22,12 @@ within authority to actual availability. Selection mechanics live in
 `guidance/preferred-models.md`; engineering rows live in
 `kungfu/agentic-engineering/preferred-models.md`.
 
-Read the repository's verification requirements and the organization's completion
-rules. Preserve truthful evidence, independent review and explicit user acceptance
-where required. Independent reviewers need separate authorship and adequate
-capability under the shared actual-producer opposite-harness policy. A family or
-access conflict remains an explicit review limitation, not a silent substitution.
+Read the engineering core's Evidence rule alongside repository checks and the
+organization's completion rules. Preserve truthful evidence, independent review
+and explicit user acceptance where required. Select qualified independent
+nonauthor reviewers under the engineering core's opposite-harness preference and
+available fallback; record actual authorship and reviewer harness. Report unmet
+capability or access rather than claiming a review that did not occur.
 
 Record material product or capability decisions in their existing homes. A new
 bundle election is not authority to change another owner's product commitments,

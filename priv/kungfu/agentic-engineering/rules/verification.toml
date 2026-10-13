@@ -15,7 +15,7 @@ action = "wake"
 produces = "verified"
 target_session = "{holder_key}"
 [rule.remedy.params]
-prompt = "Your completion of {assignment_id} is blocked: no verification verdict is filed. Verify the work the way this repository defines verification (its AGENTS.md or equivalent prose), then file `tightbeam attest {assignment_id} --kind verdict --verdict verified` with a note saying what you ran and what you observed."
+prompt = "Your completion of {assignment_id} is blocked: no verification verdict is filed. Verify the work under the Evidence section of guidance/engineering-core.md, then file `tightbeam attest {assignment_id} --kind verdict --verdict verified` with a note saying what you ran and what you observed."
 
 # Widened 2026-08-18 from coder-only to the other archetypes whose deliverable is
 # a FILE. The shape was right and already proven; only its reach was short, and
