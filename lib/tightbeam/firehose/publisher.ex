@@ -105,7 +105,14 @@ defmodule Tightbeam.Firehose.Publisher do
   @doc "Capture state needed to authorize and serialize a delete after it commits."
   @spec capture_before(GenServer.server(), map()) :: map()
   def capture_before(db, %{verb: "role-rm"} = call) do
-    Map.put(call, :firehose_before, StateResources.query_role(db, call.params[:name]))
+    case StateResources.query_role(db, call.params[:name]) do
+      nil ->
+        Map.put(call, :firehose_before, nil)
+
+      role ->
+        delete_version = max(System.system_time(:millisecond), role.updated_at + 1)
+        Map.put(call, :firehose_before, Map.put(role, :row_version, delete_version))
+    end
   end
 
   def capture_before(_db, call), do: call
@@ -441,6 +448,8 @@ defmodule Tightbeam.Firehose.Publisher do
   defp projection_primary_ref(projection, "turnSeq"),
     do: projection["turnSeq"] || projection["seq"]
 
+  defp projection_primary_ref(projection, "role"), do: projection["name"]
+
   defp projection_primary_ref(projection, primary_ref),
     do: projection[primary_ref] || projection["id"]
 
@@ -646,8 +655,12 @@ defmodule Tightbeam.Firehose.Publisher do
     params = Map.get(call, :params, %{})
     atom_key = primary_param(key)
 
-    payload[key] || payload["id"] || params[atom_key] ||
-      if(key == "sessionKey", do: Map.get(call, :session_key), else: nil)
+    if key == "role" do
+      Map.get(payload, "name") || Map.get(payload, :name) || params[atom_key]
+    else
+      payload[key] || payload["id"] || params[atom_key] ||
+        if(key == "sessionKey", do: Map.get(call, :session_key), else: nil)
+    end
   end
 
   defp primary_param("workItemId"), do: :work_item_id

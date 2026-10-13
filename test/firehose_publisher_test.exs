@@ -1221,17 +1221,20 @@ defmodule Tightbeam.Firehose.PublisherTest do
     }
 
     captured = Publisher.capture_before(db, call)
+    expected_item = captured.firehose_before |> Tightbeam.StateResources.role()
     :ok = Tightbeam.Roles.rm(db, "worker")
     :ok = Publisher.accepted(db, captured, %{removed: "worker"})
 
     assert %{"class" => "verb.accepted"} = receive_notice()
 
-    assert %{
-             "class" => "role.removed",
-             "op" => "delete",
-             "refs" => %{"role" => "worker"},
-             "payload" => %{"role" => "worker", "ownerUserId" => "flynn"}
-           } = receive_notice()
+    notice = receive_notice()
+    assert notice["class"] == "role.removed"
+    assert notice["op"] == "delete"
+    assert notice["refs"]["role"] == "worker"
+    assert notice["payload"] == expected_item
+    assert notice["payload"]["name"] == "worker"
+    assert notice["payload"]["rowVersion"] > notice["payload"]["updatedAt"]
+    refute Map.has_key?(notice["payload"], "role")
   end
 
   test "a rail denial emits both observational classes" do
@@ -1255,15 +1258,28 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
   @tag firehose_full_projection: true
   test "condition and critical projections carry stable ids and last-version-wins" do
-    fact = %{fact_id: 4, ts: 100, kind: "ready", scope: "synthetic", origin: "process:fixture"}
+    fact = %{id: 4, ts: 100, kind: "ready", scope: "synthetic", origin: "process:fixture"}
     older_fact = Tightbeam.StateResources.condition_fact(fact)
-    newer_fact = Tightbeam.StateResources.condition_fact(%{fact | fact_id: 5, ts: 90})
+    newer_fact = Tightbeam.StateResources.condition_fact(%{fact | id: 5, ts: 90})
 
     assert Enum.sort(Map.keys(older_fact)) ==
-             Enum.sort(~w(factId ts kind scope origin rowVersion))
+             Enum.sort(~w(id ts kind scope origin rowVersion))
 
     assert older_fact["scope"] == "synthetic"
     assert older_fact["origin"] == "process:fixture"
+    assert older_fact["id"] == 4
+    refute Map.has_key?(older_fact, "factId")
+
+    filed_fact =
+      Tightbeam.StateResources.condition_fact(%{
+        fact_id: 4,
+        ts: 100,
+        kind: "ready",
+        scope: "synthetic",
+        origin: "process:fixture"
+      })
+
+    assert filed_fact == older_fact
 
     assert_raise ArgumentError, ~r/extra or missing field/, fn ->
       Tightbeam.StateResources.condition_fact(Map.delete(fact, :scope))
@@ -1273,11 +1289,35 @@ defmodule Tightbeam.Firehose.PublisherTest do
       Tightbeam.StateResources.condition_fact(Map.put(older_fact, "unexpected", true))
     end
 
-    assert older_fact["factId"] == older_fact["rowVersion"]
-    assert newer_fact["factId"] == newer_fact["rowVersion"]
+    assert older_fact["id"] == older_fact["rowVersion"]
+    assert newer_fact["id"] == newer_fact["rowVersion"]
     assert lww(older_fact, newer_fact) == newer_fact
     assert lww(newer_fact, older_fact) == newer_fact
     assert lww(newer_fact, newer_fact) == newer_fact
+
+    db = :firehose_condition_fact_identity_db
+    start_supervised!({DB, path: ":memory:", name: db})
+    :ok = Tightbeam.Schema.ensure_all(db)
+
+    assert {:ok, _rows} =
+             DB.query(
+               db,
+               "INSERT INTO condition_facts (id, ts, kind, scope, origin) VALUES (4, 100, 'ready', 'synthetic', 'process:fixture')"
+             )
+
+    queried_fact = Tightbeam.StateResources.query_condition_fact(db, 4)
+    assert queried_fact == fact
+
+    notice =
+      Tightbeam.Firehose.Publisher.committed_notice("condition_fact.filed", queried_fact, %{})
+
+    assert notice["refs"] == %{"factId" => 4}
+    assert notice["payload"] == older_fact
+
+    encoded_notice = Tightbeam.Firehose.Publisher.encode_wire_notice(notice, %{})
+
+    assert encoded_notice =~
+             ~s("payload":{"id":4,"ts":100,"kind":"ready","scope":"synthetic","origin":"process:fixture","rowVersion":4})
 
     older_lease =
       Tightbeam.StateResources.critical_state(%{session_key: "agent:one", updated_at: 10})

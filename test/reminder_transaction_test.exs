@@ -456,8 +456,18 @@ defmodule Tightbeam.ReminderTransactionTest do
     assert {fact, true} = file.(input)
     assert_receive {:firehose_notice, %{"class" => "verb.accepted"}}
     Hub.delivered(hub, self())
-    assert_receive {:firehose_notice, %{"class" => "condition_fact.filed", "payload" => notice}}
-    assert notice["factId"] == fact.fact_id
+
+    assert_receive {:firehose_notice,
+                    %{
+                      "class" => "condition_fact.filed",
+                      "refs" => %{"factId" => ref_fact_id},
+                      "payload" => notice
+                    }}
+
+    assert ref_fact_id == fact.fact_id
+    assert notice["id"] == fact.fact_id
+    assert notice["rowVersion"] == fact.fact_id
+    refute Map.has_key?(notice, "factId")
     Hub.delivered(hub, self())
     assert {^fact, false} = file.(input)
     assert_receive {:firehose_notice, %{"class" => "verb.accepted"}}

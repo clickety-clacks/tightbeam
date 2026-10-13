@@ -778,13 +778,19 @@ defmodule Tightbeam.StateResources do
     }
   end
 
-  def query_role(db, id) do
-    case Tightbeam.DB.query(
+  def query_role(db, %{key: id, principal: principal}) do
+    detail_selection(db, "roles", principal, fn txn -> role_query(txn, id) end)
+  end
+
+  def query_role(db, id) when is_binary(id), do: role_query(db, id)
+
+  defp role_query(db, id) do
+    case query(
            db,
            "SELECT name, boundSessionKey, ownerUserId, createdAt, updatedAt FROM roles WHERE name = ?1",
            [id]
          ) do
-      {:ok, [[name, bound_session_key, owner_user_id, created_at, updated_at]]} ->
+      [[name, bound_session_key, owner_user_id, created_at, updated_at]] ->
         %{
           name: name,
           bound_session_key: bound_session_key,
@@ -793,7 +799,7 @@ defmodule Tightbeam.StateResources do
           updated_at: updated_at
         }
 
-      {:ok, []} ->
+      [] ->
         nil
     end
   end
@@ -809,6 +815,10 @@ defmodule Tightbeam.StateResources do
       {:ok, row} -> row
       {:error, error} -> raise error
     end
+  end
+
+  def query_attest(db, %{key: id, principal: principal}) do
+    detail_selection(db, "attests", principal, fn txn -> query_attest(txn, id) end)
   end
 
   def query_attest(db, id) do
@@ -862,13 +872,19 @@ defmodule Tightbeam.StateResources do
     end
   end
 
+  def query_condition_fact(db, %{key: id, principal: principal}) do
+    detail_selection(db, "condition facts", principal, fn txn ->
+      query_condition_fact(txn, id)
+    end)
+  end
+
   def query_condition_fact(db, id) do
     {:ok, rows} =
       DB.query(db, "SELECT id, ts, kind, scope, origin FROM condition_facts WHERE id = ?1", [id])
 
     case rows do
-      [[fact_id, ts, kind, scope, origin]] ->
-        %{fact_id: fact_id, ts: ts, kind: kind, scope: scope, origin: origin}
+      [[id, ts, kind, scope, origin]] ->
+        %{id: id, ts: ts, kind: kind, scope: scope, origin: origin}
 
       [] ->
         nil
@@ -880,6 +896,15 @@ defmodule Tightbeam.StateResources do
   # production enqueue path is the sole turn-bearing writer, so one message
   # resolves to zero or one turn. Refuse duplicate dirt instead of selecting a
   # row by timing or count.
+  def query_message(source, %{key: {session_key, id}, principal: principal}) do
+    detail_selection(source, "transcript messages", principal, fn txn ->
+      case query_message(txn, id) do
+        %{session_key: ^session_key} = row -> row
+        _ -> nil
+      end
+    end)
+  end
+
   def query_message(source, id) do
     case query(source, @message_select <> " WHERE m.id = ?1", [id]) do
       [row] -> message_row(row)
@@ -926,6 +951,12 @@ defmodule Tightbeam.StateResources do
   end
 
   @doc "Canonical host-environment detail query. It never selects the secret value table."
+  def query_host_environment(source, %{key: {host, harness, name}, principal: principal}) do
+    detail_selection(source, "host environment", principal, fn txn ->
+      query_host_environment(txn, host, harness, name)
+    end)
+  end
+
   def query_host_environment(source, filters) when is_map(filters) do
     host = filters[:host] || filters["host"]
     harness = filters[:harness] || filters["harness"]
@@ -1093,6 +1124,13 @@ defmodule Tightbeam.StateResources do
   end
 
   def query_read_marker(db, user_id, scope_key), do: ReadMarkers.get(db, user_id, scope_key)
+
+  def query_critical_state(db, %{key: session_key, principal: principal}) do
+    detail_selection(db, "critical state", principal, fn txn ->
+      query_critical_state(txn, session_key)
+    end)
+  end
+
   def query_critical_state(db, session_key), do: Tightbeam.CriticalLeases.get(db, session_key)
 
   def query_production(db, seq) do
@@ -1555,7 +1593,7 @@ defmodule Tightbeam.StateResources do
   defp validate_harness_registry!(_registry),
     do: raise(ArgumentError, "harness registry must be an ordered list")
 
-  def role(row), do: row |> public() |> correlate("role", "name")
+  def role(row), do: row |> public() |> closed_projection("roles")
 
   def artifact(row) do
     reject_public_shape_drift!(row, "artifacts")
@@ -1611,19 +1649,22 @@ defmodule Tightbeam.StateResources do
   end
 
   def condition_fact(row) do
-    fields = ~w(factId ts kind scope origin rowVersion)
+    fields = ~w(id ts kind scope origin rowVersion)
 
     if Enum.all?(Map.keys(row), &is_binary/1) do
       exact_item_keys!("condition-facts notice", row, fields)
     end
 
-    row = public(row)
-    fact_id = row["factId"] || row["id"]
+    id = value(row, :id) || value(row, :fact_id)
+
+    unless is_integer(id), do: raise(ArgumentError, "id must be an integer")
 
     item =
       row
-      |> Map.put_new("factId", fact_id)
-      |> Map.put("rowVersion", fact_id)
+      |> public()
+      |> Map.delete("factId")
+      |> Map.put("id", id)
+      |> Map.put("rowVersion", id)
       |> Map.take(fields)
 
     exact_item_keys!("condition-facts notice", item, fields)
