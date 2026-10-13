@@ -2281,25 +2281,26 @@ defmodule Tightbeam.Acp.Adapter do
     # without a compiled list of model families.
 
     if "claude-" in preset.canonical_model_prefixes do
-      public = Enum.find_value([option["description"], option["name"]], fn
-        label when is_binary(label) ->
-          case Regex.run(
-                 ~r/\b([[:alpha:]][[:alnum:]-]*)\s+(\d+)(?:[. -](\d+))?(?=\s|$)/iu,
-                 label
-               ) do
-            [_, family, major, minor] when minor not in [nil, ""] ->
-              Model.new("claude-#{String.downcase(family)}-#{major}-#{minor}")
+      public =
+        Enum.find_value([option["description"], option["name"]], fn
+          label when is_binary(label) ->
+            case Regex.run(
+                   ~r/\b([[:alpha:]][[:alnum:]-]*)\s+(\d+)(?:[. -](\d+))?(?=\s|$)/iu,
+                   label
+                 ) do
+              [_, family, major, minor] when minor not in [nil, ""] ->
+                Model.new("claude-#{String.downcase(family)}-#{major}-#{minor}")
 
-            [_, family, major | _] ->
-              Model.new("claude-#{String.downcase(family)}-#{major}")
+              [_, family, major | _] ->
+                Model.new("claude-#{String.downcase(family)}-#{major}")
 
-            _ ->
-              nil
-          end
+              _ ->
+                nil
+            end
 
-        _ ->
-          nil
-      end)
+          _ ->
+            nil
+        end)
 
       wire_context = Model.parse_ref(option["value"]).context
       label_context = offered_label_context(option)
