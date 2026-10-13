@@ -500,7 +500,7 @@ defmodule Tightbeam.D1ReadRouteTest do
     assert get_resp_header(first, "cache-control") == ["no-store"]
     decoded = JSON.decode!(first.resp_body)
     assert decoded["resource"] == "decision requests"
-    assert Enum.map(decoded["items"], & &1["id"]) == ["dr_page_3", "dr_page_tie_z"]
+    assert Enum.map(decoded["items"], & &1["id"]) == ["dr_page_tie_z", "dr_page_3"]
     assert decoded["page"]["hasMoreBefore"]
     refute decoded["page"]["hasMoreAfter"]
 
@@ -516,8 +516,8 @@ defmodule Tightbeam.D1ReadRouteTest do
     older = get(ctx.opts, older_path, ctx.admin.token)
 
     assert Enum.map(JSON.decode!(older.resp_body)["items"], & &1["id"]) == [
-             "dr_page_tie_a",
-             "dr_page_2"
+             "dr_page_2",
+             "dr_page_tie_a"
            ]
 
     oldest_cursor = JSON.decode!(older.resp_body)["page"]["oldestCursor"]
