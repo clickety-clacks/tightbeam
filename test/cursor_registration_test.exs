@@ -155,7 +155,7 @@ defmodule Tightbeam.CursorRegistrationTest do
     assert default.effort == nil
   end
 
-  test "Cursor advertises only the selectable refs present in authenticated inventory" do
+  test "Cursor does not hide newly listed model candidates behind a compiled name table" do
     parent = self()
     target = cursor_target()
 
@@ -163,7 +163,8 @@ defmodule Tightbeam.CursorRegistrationTest do
       send(parent, {:catalog_probe, argv})
 
       {"Available models\n\nauto - Auto (default)\ngpt-5.3-codex - Codex 5.3\n" <>
-         "gpt-5.3-codex-low - Codex 5.3 Low\ncomposer-2.5-fast - Composer 2.5 Fast\n\n" <>
+         "gpt-5.3-codex-low - Codex 5.3 Low\ncomposer-2.5-fast - Composer 2.5 Fast\n" <>
+         "horizon-8 - Horizon 8\n\n" <>
          "Tip: use --model <id> to select a model.\n", 0}
     end
 
@@ -182,10 +183,13 @@ defmodule Tightbeam.CursorRegistrationTest do
 
     families = Enum.map(entries, & &1.family)
 
-    assert families == ["auto", "gpt-5.3-codex"]
-    refute "composer-2.5" in families
-    refute "gpt-5.3-codex-low" in families
-    refute "composer-2.5-fast" in families
+    assert families == [
+             "auto",
+             "gpt-5.3-codex",
+             "gpt-5.3-codex-low",
+             "composer-2.5-fast",
+             "horizon-8"
+           ]
 
     auto = Enum.find(entries, &(&1.family == "auto"))
     assert auto.display_name == "Auto"

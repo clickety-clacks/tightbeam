@@ -236,6 +236,7 @@ defmodule Tightbeam.Acp.AdapterTest do
   const cursorWireOptions = [
     { value: "auto-smart[optimize_for=balanced]", name: "Auto Balance" },
     { value: "composer-2.5[fast=true]", name: "composer-2.5" },
+    { value: "horizon-8[fast=true]", name: "horizon-8" },
     { value: "claude-opus-5[thinking=true,context=300k,effort=high,fast=false]", name: "claude-opus-5" }
   ];
   const publicModelOption = (value) => {
@@ -2338,6 +2339,22 @@ defmodule Tightbeam.Acp.AdapterTest do
     # Only the canonical ref is ever sent: no option is named for it, so no
     # wire candidate exists and no invented decoration is guessed at.
     assert model_writes == ["composer-2.5-fast"]
+  end
+
+  test "Cursor verifies a newly offered public model through its live decorated wire option" do
+    {adapter, capture} = start_adapter(harness: :cursor, fail_mode: "cursor-wire-enum")
+    requested = Model.new("horizon-8")
+
+    assert {:ok, "sess-1"} =
+             Adapter.new_candidate_session(adapter, requested, "/tmp", [], "guidance")
+
+    assert {:ok, ^requested} = Adapter.current_model(adapter, "sess-1")
+
+    assert ["horizon-8", "horizon-8[fast=true]"] ==
+             capture
+             |> captured_requests()
+             |> Enum.filter(&(&1["method"] == "session/set_config_option" and &1["configId"] == "model"))
+             |> Enum.map(& &1["value"])
   end
 
   test "a rejected candidate reports verified teardown" do
