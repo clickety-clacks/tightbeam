@@ -1,9 +1,10 @@
 # Tightbeam 0.1.9 end-to-end acceptance
 
-These are runbooks. They record no result, and nobody runs them until Mike calls
-the run. The branch's source CI does not execute them. Writing or reviewing a
-runbook authorizes no host, container runtime, `sudo` route, database copy,
-credential or execution.
+These are runbooks, not execution grants or recorded results. Use the existing
+authorized scope for the selected behavior; do not require a new Mike approval
+for each already-authorized run. Source CI does not execute these journeys.
+Writing or reviewing this page grants no host, database, credential or execution
+authority. Mike's approval of the specific release cut remains separate.
 
 The procedure migrates one real 0.1.8 database once and preserves the migrated
 result. Historical preservation and a migrated-state read sample use copies of
@@ -22,9 +23,9 @@ repeats the migration or changes the preserved copy.
 | [telemetry.md](telemetry.md) | Breathing, queue summary, execution map, durable Toplines, fourth-review notice | Fresh base; historical sample may reuse a migrated copy |
 | [artifacts.md](artifacts.md) | Producer and verdict binding, gate enforcement, uncaptured content, original-host retirement cleanup | Fresh base; contained migrated copy only for the unreachable historical-host control |
 
-Each runbook runs on its own. A later change reruns only the runbooks it
-touches, with the fixture class its row names. The
-[aggregate run](#aggregate-run) runs them all.
+Select the business or specification behavior affected by the change and reuse
+applicable exact-build evidence. Each runbook can run on its own; the
+[aggregate run](#aggregate-run) combines selected journeys, not every row.
 
 ## Execution contract
 
@@ -332,13 +333,13 @@ PKG=/operator-supplied/verified-0.1.9/package
 sha256() { if command -v sha256sum >/dev/null; then sha256sum "$1"; else shasum -a 256 "$1"; fi | awk '{print $1}'; }
 ```
 
-1. **Authority and capacity.** The recorded approval for this run names this
+1. **Authority and capacity.** The existing execution scope covers this
    environment. The tools are present, and scratch holds at least three times
    the source database (the migration base copy, the `VACUUM INTO` output and
    one area copy).
 
    ```sh
-   echo "approval: <record id naming this environment>"
+   echo "execution scope: <existing record covering this environment>"
    for tool in sh sqlite3 python3 curl git ps find; do
      command -v "$tool" >/dev/null || echo "missing: $tool"
    done
@@ -460,8 +461,8 @@ output, and discard the environment at the end.
 <a id="reference-environment"></a>
 
 The six conditions describe the environment; this is one way to build it that
-satisfies them, on a Linux host with Docker. The approval for the run names
-the image ID, and the container is started by that ID, not by a tag that can
+satisfies them, on a Linux host with Docker. Record the image ID under the
+existing execution scope and start the container by that ID, not by a tag that can
 move. Nothing here touches the host's own Tightbeam base.
 
 ```Dockerfile
@@ -581,6 +582,13 @@ process cannot safely identify the interrupted run's leftover rows.
 
 ## Aggregate run
 
+Select only the journeys needed for the changed business or specification
+behavior. A migrated-state journey needs the preserved migration result; an
+independent fresh-base journey does not wait for it. Full-matrix completion,
+fixture clock equality, tooling setup and unavailable observer fields are not
+release acceptance requirements. Preserve their historical evidence without
+rerunning them or claiming product behavior from a setup result.
+
 1. Verify [containment](#containment) and record each condition's result.
 2. Run [migration.md](migration.md) once. It ends with a preserved `state.db`,
    the gateway-written `build-owner.json` and a manifest. If migration fails,
@@ -590,16 +598,16 @@ process cannot safely identify the interrupted run's leftover rows.
    breathing sample; the artifact unreachable-original-host control remains
    conditional on copied-token/actor authority. Stop its gateway and discard
    only this disposable copy. Keep the preserved migration output.
-4. Run the fresh-base gateway checks, then each manual area's fresh-base
-   journeys once. Retain their result IDs; use the ownership table above.
-5. In the separately authorized online environment, run the feature smoke
-   with `TIGHTBEAM_SMOKE_AREAS=all` once, recording its shared results and real
-   harness results separately. Run the distinct manual online extensions
-   once. Reuse accounts and evidence, not a second full lifecycle for a row
+4. Run the selected fresh-base gateway and manual journeys once. Reuse
+   applicable result IDs and the ownership table above; do not require every area.
+5. For selected online behavior within its authorized environment, run only
+   the applicable feature-smoke areas and distinct manual extensions, recording
+   shared results and real harness results separately. Reuse accounts and
+   evidence, not a second full lifecycle for a row
    already owned by smoke. Never reconnect a copied-data base to the network.
-6. Complete the scorecard: package and source identity, host, harness, model
-   and effort per leg, commands, the status of every row and every missing
-   prerequisite.
+6. Record package/source identity, commands, selected behavior results and
+   their actual prerequisites. Retain named skips, partials and first-red
+   evidence; unrun rows are not failures or a release-completion threshold.
 
 A standalone rerun checks the applicable containment and package inputs, then
 runs only the selected area's owner journeys on their stated fixture class.
