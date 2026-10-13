@@ -275,31 +275,30 @@ defmodule Tightbeam.Escalation do
     ON escalation_waivers (raiserId, statuteName, revokedAt);
   """
 
-  @decision_requests_pre_revision_ddl (
-                                           case Regex.run(
-                                                  ~r/CREATE TABLE IF NOT EXISTS decision_requests \([\s\S]*?\n  \);/u,
-                                                  @ddl
-                                                ) do
-                                             [ddl] ->
-                                               ddl
-                                               |> String.trim_trailing(";")
-                                               |> String.replace_prefix(
-                                                 "CREATE TABLE IF NOT EXISTS",
-                                                 "CREATE TABLE"
-                                               )
+  @decision_requests_pre_revision_ddl (case String.split(
+                                              @ddl,
+                                              "CREATE TABLE IF NOT EXISTS decision_requests (",
+                                              parts: 2
+                                            ) do
+                                         [_prefix, suffix] ->
+                                           case String.split(suffix, "\n  );", parts: 2) do
+                                             [table_body, _rest] ->
+                                               "CREATE TABLE decision_requests (" <>
+                                                 table_body <> ")"
 
                                              _ ->
-                                               raise "decision_requests DDL not found"
+                                               raise "decision_requests DDL terminator not found"
                                            end
-                                         )
+
+                                         _ ->
+                                           raise "decision_requests DDL not found"
+                                       end)
 
   @decision_request_revision_ddl "rowSchemaRevision INTEGER NOT NULL DEFAULT 1 " <>
                                    "CHECK (typeof(rowSchemaRevision) = 'integer' AND rowSchemaRevision IN (1,2))"
 
-  @decision_requests_current_ddl (
-                                    String.trim_trailing(@decision_requests_pre_revision_ddl, ")") <>
-                                      ", " <> @decision_request_revision_ddl <> ")"
-                                  )
+  @decision_requests_current_ddl String.trim_trailing(@decision_requests_pre_revision_ddl, ")") <>
+                                   ", " <> @decision_request_revision_ddl <> ")"
 
   @terminal_request_columns """
   id, kind, raiserId, raiserSessionKey, ownerUserId, assignmentId,
