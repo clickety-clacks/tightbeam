@@ -6999,6 +6999,68 @@ defmodule Tightbeam.GatewayTest do
     assert Org.get(ctx.db, "k-round-trip").provider == "openai"
   end
 
+  test "set_model accepts an arbitrary model id from the current harness catalog", ctx do
+    base_dir = role_test_base("set-model-provider-offered")
+    Archetypes.load!(base_dir)
+
+    config =
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.put(:conn_registry, ctx.registry)
+      |> Map.put(:lane_manager, ctx.lane)
+
+    provider_model = "provider-offered-model-x91"
+
+    Org.create(ctx.db, %{
+      session_key: "k-provider-offered",
+      display_name: "Codex",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "codex",
+      provider: "openai",
+      model: Model.new("current-model", effort: "medium")
+    })
+
+    put_host_catalog("testhost", "codex", [])
+
+    put_host_catalog_entry("testhost", "codex", %{
+      family: provider_model,
+      name: provider_model,
+      display_name: provider_model,
+      efforts: ["medium"],
+      provider: :openai
+    })
+
+    adapter = start_supervised!({AdapterStub, self()})
+    start_supervised!({CoordinatorStub, {adapter, self()}})
+
+    start_supervised!(%{
+      id: :set_model_provider_offered_conn_registry,
+      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+    })
+
+    start_lane!(ctx.db, "k-provider-offered")
+
+    offered =
+      Gateway.session_status("k-provider-offered", ctx.db).modelCatalog.models
+      |> Enum.find(&(&1.ref == provider_model))
+
+    assert offered.name == provider_model
+
+    assert %{ok: true} =
+             Gateway.handlers(config)["tune"].(%{
+               origin: "user:flynn",
+               session_key: "k-provider-offered",
+               params: %{setting: "set_model", model: offered.ref}
+             })
+
+    assert Org.get(ctx.db, "k-provider-offered").model ==
+             Model.new(provider_model, effort: "medium")
+
+    assert Org.get(ctx.db, "k-provider-offered").provider == "openai"
+  end
+
   test "set_model with a bare model id keeps the current effort tier", ctx do
     base_dir = role_test_base("set-model-bare-keeps-effort")
     Archetypes.load!(base_dir)
@@ -8343,12 +8405,25 @@ defmodule Tightbeam.GatewayTest do
   # effort-bearing model as `id[effort]`. `set_model` composes the two and has since
   # cbc8d2e; `set_harness` did not, so the same bare id round-tripped through one verb
   # and was refused by the other as "not offered by codex on testhost" (#69).
-  test "set_harness accepts the bare model id the picker advertises", ctx do
+  test "set_harness resolves the bare model id advertised by its destination catalog", ctx do
     base_dir = role_test_base("harness-bare-model")
     codex_auth = Tightbeam.Homes.home_path(base_dir, "testhost", :codex)
     File.mkdir_p!(codex_auth)
     File.write!(Path.join(codex_auth, "auth.json"), "test-token")
     Archetypes.load!(base_dir)
+    session = Org.get(ctx.db, "k1")
+    provider_model = "provider-offered-model-x91"
+
+    put_host_catalog(session.host, "codex", [])
+
+    put_host_catalog_entry(session.host, "codex", %{
+      family: provider_model,
+      name: provider_model,
+      display_name: provider_model,
+      efforts: ["medium"],
+      provider: :openai
+    })
+
     candidate = start_supervised!({CandidateAdapterStub, self()})
     start_supervised!({CoordinatorStub, candidate})
 
@@ -8368,12 +8443,12 @@ defmodule Tightbeam.GatewayTest do
              Gateway.handlers(config)["tune"].(%{
                origin: "user:flynn",
                session_key: "k1",
-               params: %{setting: "set_harness", harness: "codex", model: "gpt-5.6-sol"}
+               params: %{setting: "set_harness", harness: "codex", model: provider_model}
              })
 
     # Composed, not passed through: the tier is real information and the session must
     # end up on a ref the catalog actually offers.
-    assert Org.get(ctx.db, "k1").model == Model.new("gpt-5.6-sol", effort: "medium")
+    assert Org.get(ctx.db, "k1").model == Model.new(provider_model, effort: "medium")
 
     # And the value under test is one the picker really does advertise for this
     # session, so the case cannot keep passing if the advertised shape drifts. Read
@@ -8382,7 +8457,7 @@ defmodule Tightbeam.GatewayTest do
       Gateway.session_status("k1", ctx.db).capabilities.setModel.options
       |> Enum.map(& &1.value)
 
-    assert "gpt-5.6-sol" in advertised
+    assert provider_model in advertised
     refute Enum.any?(advertised, &String.contains?(&1, "["))
   end
 
