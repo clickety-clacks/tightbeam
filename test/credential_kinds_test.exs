@@ -765,11 +765,14 @@ defmodule Tightbeam.CredentialKindsTest do
         "hidden" => false,
         "supportedReasoningEfforts" => [%{"reasoningEffort" => "high"}]
       }
+
       future_untiered = %{"id" => "orbit-lite-10"}
 
       sh = fn command ->
         if String.contains?(Enum.join(command, " "), "model/list"),
-          do: {JSON.encode!(%{engine | "models" => [future, future_untiered | engine["models"]]}), 0},
+          do:
+            {JSON.encode!(%{engine | "models" => [future, future_untiered | engine["models"]]}),
+             0},
           else:
             {~s({"data":[{"id":"orbit-9"},{"id":"orbit-lite-10"},{"id":"provider-only-8"}]}) <>
                "\n200", 0}
