@@ -23,6 +23,224 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
     %{db: db, session: session}
   end
 
+  test "initial and queued decision notices use the REST decision grants", %{db: db} do
+    alias Tightbeam.StateVisibility
+
+    statute_notice = %{
+      "class" => "decision_request.opened",
+      "payload" => %{
+        "kind" => "statute",
+        "raiserId" => "user:statute-raiser",
+        "ownerUserId" => "statute-owner"
+      }
+    }
+
+    assert StateVisibility.visible?(db, statute_notice, "statute-raiser", false)
+    assert StateVisibility.visible?(db, statute_notice, "statute-owner", false)
+    refute StateVisibility.visible?(db, statute_notice, "unrelated-user", false)
+
+    malformed_notice = %{
+      "class" => "decision_request.opened",
+      "refs" => %{"ownerUserId" => "unrelated-user"}
+    }
+
+    refute StateVisibility.visible?(db, malformed_notice, "unrelated-user", false)
+    refute StateVisibility.visible?(db, malformed_notice, %{kind: "session", id: "unrelated"})
+
+    for session_key <- ["effort-holder", "unrelated-holder"] do
+      Org.create(db, %{
+        session_key: session_key,
+        display_name: session_key,
+        owner_user_id: "synthetic-owner",
+        origin: "user:synthetic-owner",
+        archetype: "default",
+        host: "synthetic-host",
+        harness: "fixture",
+        provider: "fixture_provider",
+        model: Model.new("fixture-model")
+      })
+    end
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO assignments(id,subject,holderKey,openedByUser,openedAt)
+      VALUES
+        ('effort-assignment','Effort decision holder','effort-holder','synthetic-owner',1),
+        ('unrelated-assignment','Unrelated holder','unrelated-holder','synthetic-owner',1)
+      """)
+
+    effort_notice = %{
+      "class" => "decision_request.updated",
+      "payload" => %{
+        "kind" => "effort",
+        "expecterUserId" => "effort-expecter",
+        "assignmentId" => "effort-assignment"
+      }
+    }
+
+    for class <- ~w(opened updated answered returned ruled consumed withdrawn superseded) do
+      notice = put_in(effort_notice, ["class"], "decision_request.#{class}")
+      assert StateVisibility.visible?(db, notice, "effort-expecter", false)
+      assert StateVisibility.visible?(db, notice, %{kind: "session", id: "effort-holder"})
+      refute StateVisibility.visible?(db, notice, %{kind: "session", id: "unrelated-holder"})
+      refute StateVisibility.visible?(db, notice, "unrelated-user", false)
+    end
+
+    agent_notice = %{
+      "class" => "decision_request.opened",
+      "payload" => %{
+        "kind" => "agent",
+        "raiserSessionKey" => "agent-asker",
+        "expecterSessionKey" => "agent-asked",
+        "ownerUserId" => "agent-owner"
+      }
+    }
+
+    assert StateVisibility.visible?(db, agent_notice, %{kind: "session", id: "agent-asker"})
+    assert StateVisibility.visible?(db, agent_notice, %{kind: "session", id: "agent-asked"})
+    refute StateVisibility.visible?(db, agent_notice, %{kind: "session", id: "unrelated"})
+    assert StateVisibility.visible?(db, agent_notice, "agent-owner", false)
+    refute StateVisibility.visible?(db, agent_notice, "unrelated-user", false)
+  end
+
+  test "operator decision notices retain their established owner and raiser grants", %{db: db} do
+    alias Tightbeam.StateVisibility
+
+    raiser =
+      Org.create(db, %{
+        session_key: "operator-raiser",
+        display_name: "operator raiser",
+        owner_user_id: "raiser-owner",
+        origin: "user:raiser-owner",
+        archetype: "default",
+        host: "synthetic-host",
+        harness: "fixture",
+        provider: "fixture_provider",
+        model: Model.new("fixture-model")
+      })
+
+    notice = %{
+      "class" => "decision_request.opened",
+      "payload" => %{
+        "kind" => "operator",
+        "ownerUserId" => "operator-owner",
+        "raiserSessionKey" => raiser.session_key
+      }
+    }
+
+    for class <- ~w(opened ruled withdrawn) do
+      event = put_in(notice, ["class"], "decision_request.#{class}")
+
+      assert StateVisibility.visible?(db, event, "operator-owner", false)
+      assert StateVisibility.visible?(db, event, "raiser-owner", false)
+      refute StateVisibility.visible?(db, event, "unrelated-user", false)
+      assert StateVisibility.visible?(db, event, %{kind: "session", id: raiser.session_key})
+      refute StateVisibility.visible?(db, event, %{kind: "session", id: "unrelated-session"})
+      assert StateVisibility.visible?(db, event, "admin", true)
+    end
+  end
+
+  test "cannot-proceed publishes one rollback-safe opened snapshot through the agent seam", %{
+    db: db,
+    session: session
+  } do
+    alias Tightbeam.{Assignments, Firehose.Hub, WorkItems}
+
+    holder =
+      Org.create(db, %{
+        session_key: "cannot-proceed-holder",
+        display_name: "cannot-proceed-holder",
+        owner_user_id: "synthetic-owner",
+        origin: "user:synthetic-owner",
+        archetype: "default",
+        host: "synthetic-host",
+        harness: "fixture",
+        provider: "fixture_provider",
+        model: Model.new("fixture-model")
+      })
+
+    work =
+      WorkItems.__handle__(db, "work-item-create", %{
+        verb: "work-item-create",
+        origin: "agent:#{session.session_key}",
+        principal: {:session, session.session_key},
+        session_key: nil,
+        params: %{title: "cannot-proceed firehose"}
+      })
+
+    assignment =
+      Assignments.__handle__(db, "assign", %{
+        verb: "assign",
+        origin: "agent:#{session.session_key}",
+        principal: {:session, session.session_key},
+        session_key: holder.session_key,
+        target_role: nil,
+        role_fallback: false,
+        supervision_interval_ms: 1_000,
+        params: %{
+          subject: "cannot-proceed firehose",
+          work_item_id: work.id,
+          effect_kind: "coordination"
+        }
+      })
+
+    hub = start_supervised!({Hub, name: Hub})
+
+    :ok =
+      Hub.register(hub, self(), %{
+        mode: :all,
+        db: db,
+        user_id: "synthetic-owner",
+        is_admin: true
+      })
+
+    call = %{
+      verb: "attest",
+      origin: "agent:#{holder.session_key}",
+      principal: {:session, holder.session_key},
+      session_key: nil,
+      params: %{
+        assignment_id: assignment.id,
+        kind: "cannot-proceed",
+        note: "Resolve the blocked assignment."
+      }
+    }
+
+    :ok =
+      DB.execute(db, """
+      CREATE TRIGGER reject_cannot_proceed
+      BEFORE INSERT ON assignment_cannot_proceed
+      BEGIN
+        SELECT RAISE(ABORT, 'fixture rollback after decision creation');
+      END
+      """)
+
+    assert_raise DB.Error, ~r/fixture rollback after decision creation/, fn ->
+      Assignments.__handle__(db, "attest", call)
+    end
+
+    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM decision_requests")
+
+    _ = Hub.connection_stats(hub, self())
+    refute_receive {:firehose_notice, %{"class" => "decision_request.opened"}}, 0
+
+    :ok = DB.execute(db, "DROP TRIGGER reject_cannot_proceed")
+
+    assert %{decisionRequest: request} = Assignments.__handle__(db, "attest", call)
+
+    assert_receive {:firehose_notice, notice}
+    assert notice["class"] == "decision_request.opened"
+    assert notice["schemaVersion"] == 2
+    assert notice["resource"] == "decision requests"
+    assert notice["op"] == "upsert"
+    assert notice["refs"] == %{"decisionRequestId" => request.id}
+    assert notice["payload"] == Tightbeam.StateResources.decision_request(request)
+
+    Hub.delivered(hub, self())
+    _ = Hub.connection_stats(hub, self())
+    refute_receive {:firehose_notice, %{"class" => "decision_request.opened"}}
+  end
+
   test "holder marker invalidation requires assignment and tenant grants", %{db: db} do
     alias Tightbeam.{Assignments, WorkItems, SubagentMarkers, StateVisibility}
     alias Tightbeam.Firehose.Hub
@@ -619,7 +837,7 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
     handlers = Tightbeam.Gateway.handlers(%{db: db})
 
     for {verb, field, text, status, class} <- [
-          {"answer", :answer, "Actual answer", "answered", "decision_request.ruled"},
+          {"answer", :answer, "Actual answer", "answered", "decision_request.answered"},
           {"return", :reason, "Need exact source", "returned", "decision_request.returned"}
         ] do
       ask = %{

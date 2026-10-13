@@ -564,7 +564,7 @@ defmodule Tightbeam.EffortCheckin do
         case DB.transaction_then(
                db,
                fn txn ->
-                 before = request_for_id(txn, request.id)
+                 before = Escalation.raw_by_id_in_txn(txn, request.id)
 
                  result =
                    rule_in_txn(
@@ -581,6 +581,14 @@ defmodule Tightbeam.EffortCheckin do
                    if before.status == "open" do
                      snapshot = Escalation.raw_by_id_in_txn(txn, result.id)
                      Tightbeam.Firehose.Publisher.maybe_accepted_in_txn(txn, call, snapshot)
+
+                     _snapshot =
+                       Escalation.publish_decision_transition_in_txn(
+                         txn,
+                         before,
+                         snapshot,
+                         Map.get(call, :firehose_hub, Tightbeam.Firehose.Hub)
+                       )
                    else
                      Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
                    end
@@ -775,6 +783,7 @@ defmodule Tightbeam.EffortCheckin do
         nil
 
       request ->
+        before = Escalation.raw_by_id_in_txn(txn, request.id)
         next = advance_expecter(txn, request)
         deadline = now() + deadline_ms(config)
         assignment = assignment_in_txn(txn, request.assignment_id)
@@ -831,6 +840,8 @@ defmodule Tightbeam.EffortCheckin do
           })
 
           advanced = request_for_id(txn, request.id)
+          after_row = Escalation.raw_by_id_in_txn(txn, request.id)
+          _after_row = Escalation.publish_decision_transition_in_txn(txn, before, after_row)
           arm_notification_in_txn(txn, advanced)
           advanced
         else
@@ -894,7 +905,7 @@ defmodule Tightbeam.EffortCheckin do
         )
 
         if Txn.changes(txn) == 1 do
-          ruled = request_for_id(txn, current.id)
+          ruled = Escalation.raw_by_id_in_txn(txn, current.id)
 
           DB.record_row_commit(
             txn,
@@ -976,6 +987,23 @@ defmodule Tightbeam.EffortCheckin do
 
     context = Map.put(evidence, :actions, menu)
 
+    supersede_command = %{
+      requester: %{kind: "process", id: "tightbeam:effort-checkin"},
+      reason_kind: "superseded",
+      causal_source: %{
+        kind: "monitor_generation",
+        id: "#{generation.assignment_id}##{generation.generation}"
+      },
+      outcome: %{kind: "replacement", replacement_wake_id: deadline.wake_id}
+    }
+
+    supersede_requests_in_txn(
+      txn,
+      generation.assignment_id,
+      supersede_command,
+      generation.generation
+    )
+
     Txn.q(
       txn,
       """
@@ -983,10 +1011,10 @@ defmodule Tightbeam.EffortCheckin do
         (id, kind, raiserId, ownerUserId, assignmentId, expecterSessionKey,
          expecterUserId, lineageRung, effortGeneration, deadlineWakeId,
          raisedAt, deadlineAt, statuteName, actionKey, question, options,
-         context, status)
+         context, status, rowSchemaRevision)
       VALUES
         (?1, 'effort', 'process:tightbeam', ?2, ?3, ?4, ?5, ?6, ?7, ?8,
-         ?9, ?10, NULL, NULL, ?11, ?12, ?13, 'open')
+         ?9, ?10, NULL, NULL, ?11, ?12, ?13, 'open', 2)
       ON CONFLICT DO NOTHING
       """,
       [
@@ -1013,7 +1041,8 @@ defmodule Tightbeam.EffortCheckin do
     )
 
     if Txn.changes(txn) == 1 do
-      request = request_for_id(txn, request_id)
+      request = Escalation.raw_by_id_in_txn(txn, request_id)
+      request = Escalation.publish_decision_transition_in_txn(txn, nil, request)
       arm_notification_in_txn(txn, request)
       request
     else
@@ -1177,21 +1206,28 @@ defmodule Tightbeam.EffortCheckin do
     :ok
   end
 
-  defp supersede_requests_in_txn(txn, assignment_id, command) do
+  defp supersede_requests_in_txn(txn, assignment_id, command, excluding_generation \\ nil) do
     requests =
       Txn.q(
         txn,
-        "SELECT id, ownerUserId, deadlineWakeId FROM decision_requests WHERE kind = 'effort' AND assignmentId = ?1 AND status = 'open'",
-        [assignment_id]
+        "SELECT id, ownerUserId, deadlineWakeId FROM decision_requests WHERE kind = 'effort' AND assignmentId = ?1 AND status = 'open' AND (?2 IS NULL OR effortGeneration != ?2)",
+        [assignment_id, excluding_generation]
       )
 
-    Txn.q(
-      txn,
-      "UPDATE decision_requests SET status = 'superseded' WHERE kind = 'effort' AND assignmentId = ?1 AND status = 'open'",
-      [assignment_id]
-    )
-
     Enum.each(requests, fn [id, owner_user_id, wake_id] ->
+      before = Escalation.raw_by_id_in_txn(txn, id)
+
+      Txn.q(
+        txn,
+        "UPDATE decision_requests SET status = 'superseded' WHERE id = ?1 AND kind = 'effort' AND status = 'open'",
+        [id]
+      )
+
+      if Txn.changes(txn) == 1 do
+        after_row = Escalation.raw_by_id_in_txn(txn, id)
+        _after_row = Escalation.publish_decision_transition_in_txn(txn, before, after_row)
+      end
+
       cancel_pending_wake_in_txn!(txn, wake_id, command)
 
       DB.record_row_commit(
@@ -1217,13 +1253,20 @@ defmodule Tightbeam.EffortCheckin do
         [assignment_id]
       )
 
-    Txn.q(
-      txn,
-      "UPDATE decision_requests SET status = 'superseded' WHERE kind = 'effort' AND assignmentId = ?1 AND status = 'open'",
-      [assignment_id]
-    )
-
     Enum.each(requests, fn [id, owner_user_id, wake_id] ->
+      before = Escalation.raw_by_id_in_txn(txn, id)
+
+      Txn.q(
+        txn,
+        "UPDATE decision_requests SET status = 'superseded' WHERE id = ?1 AND kind = 'effort' AND status = 'open'",
+        [id]
+      )
+
+      if Txn.changes(txn) == 1 do
+        after_row = Escalation.raw_by_id_in_txn(txn, id)
+        _after_row = Escalation.publish_decision_transition_in_txn(txn, before, after_row)
+      end
+
       cancel_pending_wake_in_txn!(txn, wake_id, command)
 
       DB.record_row_commit(

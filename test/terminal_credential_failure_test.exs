@@ -17,6 +17,11 @@ defmodule Tightbeam.TerminalCredentialFailureTest do
   end
 
   @tag tmp_dir: true, guard_runtime: true
+  test "read-only views include incidents on the current G6 schema stamp", %{tmp_dir: tmp} do
+    run_core_proof!(tmp, "current-stamped-readonly")
+  end
+
+  @tag tmp_dir: true, guard_runtime: true
   test "one open incident owns the canonical statement and current admin delivery", %{
     tmp_dir: tmp
   } do

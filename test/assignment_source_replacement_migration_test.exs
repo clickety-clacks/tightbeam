@@ -4,7 +4,7 @@ defmodule Tightbeam.AssignmentSourceReplacementMigrationTest do
   alias Tightbeam.{DB, Model, Org, Schema, Wakes}
 
   @predecessor "work-item-delivery-owner-v1-019"
-  @successor "notice-source-storage-v1-019"
+  @successor "decision-request-row-schema-v2-019"
   @replacement_route ~r/\(requesterId = 'tightbeam:assignments' AND reasonKind = 'superseded' AND\s+causalSourceKind = 'wake' AND outcomeKind = 'replacement'\)\s+OR/
   @cancellation_columns "wakeId,wakeState,canceledAt,requesterKind,requesterId,reasonKind," <>
                           "causalSourceKind,causalSourceId,outcomeKind,replacementWakeId," <>

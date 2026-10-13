@@ -96,6 +96,54 @@ defmodule Tightbeam.EscalationTest do
     assert {:deny, %{code: "escalation_denied"}} = Escalation.resolve(ctx.db, call, statute)
   end
 
+  test "statute open, ruling, and consume publish their committed decision snapshots", ctx do
+    alias Tightbeam.Firehose.Hub
+
+    start_supervised!({Hub, name: Hub})
+
+    :ok =
+      Hub.register(Hub, self(), %{mode: :filtered, db: ctx.db, user_id: "flynn", is_admin: true})
+
+    :ok = Hub.subscribe(Hub, self(), "g6-decision", %{"classes" => ["decision_request."]})
+
+    call = call(ctx.raiser, %{assignment_id: "a1", kind: "completion"})
+    {:decision_pending, id} = open(ctx, call, statute())
+
+    assert_receive {:firehose_notice, opened}
+    assert opened["class"] == "decision_request.opened"
+    assert opened["schemaVersion"] == 2
+    assert opened["resource"] == "decision requests"
+    assert opened["refs"] == %{"decisionRequestId" => id}
+    assert opened["payload"]["status"] == "open"
+    Hub.delivered(Hub, self())
+
+    assert %{status: "ruled"} =
+             Escalation.rule(ctx.db, rule_call(id, "allow"),
+               authorized: true,
+               scheduler: ctx.scheduler
+             )
+
+    assert_receive {:firehose_notice, ruled}
+    assert ruled["class"] == "decision_request.ruled"
+    assert ruled["schemaVersion"] == 2
+    assert ruled["resource"] == "decision requests"
+    assert ruled["refs"] == %{"decisionRequestId" => id}
+    assert ruled["payload"]["status"] == "ruled"
+    Hub.delivered(Hub, self())
+
+    assert Escalation.consume(ctx.db, id)
+    assert_receive {:firehose_notice, consumed}
+    assert consumed["class"] == "decision_request.consumed"
+    assert consumed["schemaVersion"] == 2
+    assert consumed["resource"] == "decision requests"
+    assert consumed["refs"] == %{"decisionRequestId" => id}
+    assert consumed["payload"]["status"] == "consumed"
+    assert consumed["payload"]["rowVersion"] > ruled["payload"]["rowVersion"]
+    assert Escalation.raw_by_id(ctx.db, id).row_schema_revision == 2
+    Hub.delivered(Hub, self())
+    :ok = Hub.unsubscribe(Hub, self(), "g6-decision")
+  end
+
   test "concurrent nil-branch racers return the one partial-index winner", ctx do
     call = call(ctx.raiser, %{assignment_id: "a-race", kind: "completion"})
     parent = self()

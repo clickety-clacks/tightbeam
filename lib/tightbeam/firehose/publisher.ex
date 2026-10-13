@@ -21,14 +21,8 @@ defmodule Tightbeam.Firehose.Publisher do
     "condition" => {"condition_fact.filed", &StateResources.condition_fact/1},
     "artifact-record" => {"artifact.recorded", &StateResources.artifact/1},
     "operator-ask" => {"decision_request.opened", &StateResources.decision_request/1},
-    "ask" => {"decision_request.opened", &StateResources.decision_request/1},
-    "answer" => {"decision_request.ruled", &StateResources.decision_request/1},
-    "return" => {"decision_request.returned", &StateResources.decision_request/1},
     "operator-rule" => {"decision_request.ruled", &StateResources.decision_request/1},
     "operator-withdraw" => {"decision_request.withdrawn", &StateResources.decision_request/1},
-    "rule" => {"decision_request.ruled", &StateResources.decision_request/1},
-    "effort-rule" => {"decision_request.ruled", &StateResources.decision_request/1},
-    "withdraw" => {"decision_request.withdrawn", &StateResources.decision_request/1},
     "approve-device" => {"device.approved", &StateResources.device/1},
     "deny-device" => {"device.denied", &StateResources.device/1},
     "revoke-device" => {"device.revoked", &StateResources.device/1},
@@ -78,6 +72,12 @@ defmodule Tightbeam.Firehose.Publisher do
        when verb in ~w(assign dispatch revoke-assignment reopen-assignment) do
     id = result[:id] || result["id"] || result[:assignment_id] || call.params[:assignment_id]
     StateResources.query_assignment(txn, id, call) || result
+  end
+
+  defp canonical_in_txn(txn, %{verb: verb} = call, result)
+       when verb in ~w(operator-ask operator-rule operator-withdraw) do
+    id = result[:id] || result["id"] || call.params[:request] || call.params[:request_id]
+    StateResources.query_decision_request_in_txn(txn, id) || result
   end
 
   defp canonical_in_txn(_txn, _call, result), do: result
@@ -156,11 +156,16 @@ defmodule Tightbeam.Firehose.Publisher do
 
   @doc "Queue one committed state notice on the transaction that produced it."
   @spec committed_in_txn(Txn.t(), String.t(), map(), map()) :: :ok
-  def committed_in_txn(%Txn{} = txn, class, payload, refs \\ %{}) do
+  @spec committed_in_txn(Txn.t(), String.t(), map(), map(), term()) :: :ok
+  def committed_in_txn(%Txn{} = txn, class, payload, refs \\ %{}),
+    do: committed_in_txn(txn, class, payload, refs, Hub)
+
+  @doc false
+  def committed_in_txn(%Txn{} = txn, class, payload, refs, hub) do
     if class == "kungfu.updated" do
-      Txn.handoff(txn, Hub, {:publish, committed_notice(class, payload, refs)})
+      Txn.handoff(txn, hub, {:publish, committed_notice(class, payload, refs)})
     else
-      Txn.handoff(txn, Hub, {:committed, class, payload, refs})
+      Txn.handoff(txn, hub, {:committed, class, payload, refs})
     end
   end
 
@@ -400,7 +405,14 @@ defmodule Tightbeam.Firehose.Publisher do
 
   def committed_notice(class, payload, refs) do
     {:ok, row} = Registry.fetch(class)
-    projection = apply(StateResources, row.serializer, [payload])
+
+    projection =
+      if row.serializer == :decision_request do
+        revision = payload[:row_schema_revision] || payload["rowSchemaRevision"]
+        StateResources.decision_request(%{"rowSchemaRevision" => revision, "item" => payload})
+      else
+        apply(StateResources, row.serializer, [payload])
+      end
 
     resolved_refs =
       Enum.reduce(row.primary_refs, refs, fn primary_ref, resolved ->
@@ -414,7 +426,7 @@ defmodule Tightbeam.Firehose.Publisher do
 
     require_primary_refs!(class, row.primary_refs, resolved_refs)
 
-    %{
+    notice = %{
       "class" => class,
       "resource" => row.resource,
       "op" => row.op,
@@ -422,6 +434,8 @@ defmodule Tightbeam.Firehose.Publisher do
       "refs" => resolved_refs,
       "payload" => projection
     }
+
+    if row.serializer == :decision_request, do: Map.put(notice, "schemaVersion", 2), else: notice
   end
 
   defp projection_primary_ref(projection, "turnSeq"),
@@ -465,6 +479,12 @@ defmodule Tightbeam.Firehose.Publisher do
        when verb in ~w(assign dispatch revoke-assignment reopen-assignment) do
     id = result[:id] || result["id"] || result[:assignment_id] || call.params[:assignment_id]
     StateResources.query_assignment(db, id, call) || result
+  end
+
+  defp canonical_result(db, %{verb: verb} = call, result)
+       when verb in ~w(operator-ask operator-rule operator-withdraw) do
+    id = result[:id] || result["id"] || call.params[:request] || call.params[:request_id]
+    StateResources.query_decision_request(db, id) || result
   end
 
   defp canonical_result(db, %{verb: "wake"} = call, result) do
@@ -578,7 +598,7 @@ defmodule Tightbeam.Firehose.Publisher do
   defp unwrap(result, "attests"), do: wrapped(result, [:attest, "attest"])
   defp unwrap(result, "wakes"), do: wrapped(result, [:wake, "wake"])
 
-  defp unwrap(result, "decision-requests"),
+  defp unwrap(result, resource) when resource in ["decision-requests", "decision requests"],
     do: wrapped(result, [:decision_request, "decisionRequest"])
 
   defp unwrap(result, "sessions"), do: wrapped(result, [:session, "session"])

@@ -928,7 +928,7 @@ defmodule Tightbeam.Gateway do
       end,
       {"withdraw", ["decision_request.withdrawn"]} => fn call -> Escalation.withdraw(db, call) end,
       {"ask", ["decision_request.opened"]} => fn call -> Escalation.ask(db, call) end,
-      {"answer", ["decision_request.ruled"]} => fn call -> Escalation.answer(db, call) end,
+      {"answer", ["decision_request.answered"]} => fn call -> Escalation.answer(db, call) end,
       {"return", ["decision_request.returned"]} => fn call ->
         Escalation.return_request(db, call)
       end,
@@ -1470,7 +1470,7 @@ defmodule Tightbeam.Gateway do
     |> compile_handler_specs!()
   end
 
-  @direct_state_classes ~w(message.created wake.fired turn.started turn.ended artifact.archived artifact.released)
+  @direct_state_classes ~w(message.created wake.fired turn.started turn.ended artifact.archived artifact.released decision_request.consumed decision_request.superseded decision_request.updated)
 
   @doc false
   @spec compile_handler_specs!(map()) ::

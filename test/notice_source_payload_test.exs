@@ -186,7 +186,7 @@ defmodule Tightbeam.NoticeSourcePayloadTest do
                "SELECT name FROM sqlite_master WHERE name IN ('notice_batch_source_attachments','staged_message_dedupes','notice_delivery_policies','notice_batching_lane_policies')"
              )
 
-    assert {:ok, [["notice-source-storage-v1-019"]]} =
+    assert {:ok, [["decision-request-row-schema-v2-019"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
@@ -366,7 +366,7 @@ defmodule Tightbeam.NoticeSourcePayloadTest do
                  [condition.wake_id]
                )
 
-      assert {:ok, [["notice-source-storage-v1-019"]]} =
+      assert {:ok, [["decision-request-row-schema-v2-019"]]} =
                DB.query(db, "SELECT shape FROM schema_stamp")
 
       before = current_storage_snapshot(db)
@@ -568,7 +568,14 @@ defmodule Tightbeam.NoticeSourcePayloadTest do
     :ok =
       DB.execute(
         db,
-        "DROP INDEX notice_source_client_identity; ALTER TABLE wakes DROP COLUMN sourceClientIdentity; ALTER TABLE wakes DROP COLUMN sourceAttachments; ALTER TABLE wakes DROP COLUMN sourceVisibilityScope; ALTER TABLE wakes DROP COLUMN sourceAddress;"
+        "DROP TRIGGER decision_requests_row_schema_revision_insert_guard; " <>
+          "DROP TRIGGER decision_requests_row_schema_revision_update_guard; " <>
+          "ALTER TABLE decision_requests DROP COLUMN rowSchemaRevision; " <>
+          "DROP INDEX notice_source_client_identity; " <>
+          "ALTER TABLE wakes DROP COLUMN sourceClientIdentity; " <>
+          "ALTER TABLE wakes DROP COLUMN sourceAttachments; " <>
+          "ALTER TABLE wakes DROP COLUMN sourceVisibilityScope; " <>
+          "ALTER TABLE wakes DROP COLUMN sourceAddress;"
       )
 
     frozen = File.read!(Path.expand("fixtures/notice_source_payload_6642ee93.sql", __DIR__))
