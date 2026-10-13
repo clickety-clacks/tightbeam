@@ -9,7 +9,7 @@ defmodule Tightbeam.Escalation do
 
   alias Tightbeam.{ConditionFacts, DB, EventLog, Org, Roles, Wakes}
   alias Tightbeam.DB.Txn
-  alias Tightbeam.Firehose.Publisher
+  alias Tightbeam.Firehose.{Hub, Publisher}
 
   defmodule IntegrityEvidenceConflict do
     @moduledoc false
@@ -37,6 +37,8 @@ defmodule Tightbeam.Escalation do
   # the status predicate, and any other value is refused by `list_status/1`.
   @request_statuses ~w(open ruled consumed withdrawn superseded returned)
   @list_status_filters @request_statuses ++ ["all"]
+  @decision_revision_1_statuses ~w(open answered ruled consumed withdrawn superseded)
+  @decision_revision_2_statuses ["returned" | @decision_revision_1_statuses]
 
   # Marks an `actionKey` as naming a CONDITION rather than one caller's action. Reserved
   # here because `digest/1` is a hex SHA-256 and can never collide with it.
@@ -93,6 +95,8 @@ defmodule Tightbeam.Escalation do
     returnedAt        INTEGER,
     rowVersion        INTEGER NOT NULL DEFAULT 1
                       CHECK (typeof(rowVersion) = 'integer' AND rowVersion > 0),
+    rowSchemaRevision INTEGER NOT NULL DEFAULT 2
+                      CHECK (typeof(rowSchemaRevision) = 'integer' AND rowSchemaRevision IN (1,2)),
     CHECK (
       (kind = 'statute' AND statuteName IS NOT NULL AND actionKey IS NOT NULL
        AND expecterSessionKey IS NULL AND expecterUserId IS NULL
@@ -289,7 +293,7 @@ defmodule Tightbeam.Escalation do
   statuteName, actionKey, question, options, context, status, decision, rationale,
   ruledBy, ruledViaPrincipal, ruledViaSessionKey, ruledViaSessionState, ruledAt, rulingFactId, consumedAt, parkWakeId, withdrawnBy,
   withdrawnReason, withdrawnAt, askedOfRole, answer, answeredBy, answeredAt,
-  returnedBy, returnReason, returnedAt, rowVersion
+  returnedBy, returnReason, returnedAt, rowVersion, rowSchemaRevision
   """
 
   @agent_request_fields ~w(
@@ -436,7 +440,86 @@ defmodule Tightbeam.Escalation do
   def ensure_r1_schema(db), do: DB.execute(db, @r1_ddl)
 
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
-  def ensure_schema(db \\ DB), do: DB.execute(db, @ddl)
+  def ensure_schema(db \\ DB) do
+    with :ok <- DB.execute(db, @ddl),
+         :ok <- ensure_decision_row_schema_revision(db) do
+      :ok
+    end
+  end
+
+  defp ensure_decision_row_schema_revision(db) do
+    case DB.transaction(db, &ensure_decision_row_schema_revision_in_txn/1) do
+      {:ok, :ok} -> :ok
+      {:error, error} -> {:error, error}
+    end
+  end
+
+  defp ensure_decision_row_schema_revision_in_txn(txn) do
+    revision_column =
+      Enum.find(Txn.q(txn, "PRAGMA table_info(decision_requests)"), &(Enum.at(&1, 1) == "rowSchemaRevision"))
+
+    case revision_column do
+      nil -> adopt_decision_row_schema_revision_in_txn(txn)
+      [_cid, "rowSchemaRevision", "INTEGER", 1, default, 0] when default in ["1", "2"] ->
+        validate_decision_revision_column_sql!(txn, default)
+        validate_decision_row_revisions_in_txn(txn)
+      _ ->
+        raise DB.Error, message: "incompatible decision request rowSchemaRevision column"
+    end
+  end
+
+  defp validate_decision_revision_column_sql!(txn, default) do
+    [[sql]] =
+      Txn.q(txn, "SELECT sql FROM sqlite_master WHERE type='table' AND name='decision_requests'")
+
+    normalized = String.replace(String.downcase(sql), ~r/\s+/u, "")
+    expected =
+      "rowschemarevisionintegernotnulldefault#{default}check(typeof(rowschemarevision)='integer'androwschemarevisionin(1,2))"
+
+    unless String.contains?(normalized, expected) do
+      raise DB.Error, message: "incompatible decision request rowSchemaRevision constraint"
+    end
+
+    :ok
+  end
+
+  defp adopt_decision_row_schema_revision_in_txn(txn) do
+    statuses = Txn.q(txn, "SELECT DISTINCT status FROM decision_requests") |> List.flatten()
+
+    unless Enum.all?(statuses, &(&1 in @decision_revision_2_statuses)) do
+      raise DB.Error, message: "incompatible decision request status at rowSchemaRevision adoption"
+    end
+
+    :ok =
+      Txn.exec(
+        txn,
+        "ALTER TABLE decision_requests ADD COLUMN rowSchemaRevision INTEGER NOT NULL DEFAULT 1 " <>
+          "CHECK (typeof(rowSchemaRevision) = 'integer' AND rowSchemaRevision IN (1,2))"
+      )
+
+    Txn.q(
+      txn,
+      "UPDATE decision_requests SET rowSchemaRevision=2 WHERE status='returned'"
+    )
+
+    validate_decision_row_revisions_in_txn(txn)
+  end
+
+  defp validate_decision_row_revisions_in_txn(txn) do
+    invalid =
+      Txn.q(
+        txn,
+        "SELECT id FROM decision_requests WHERE " <>
+          "typeof(rowSchemaRevision) <> 'integer' OR rowSchemaRevision NOT IN (1,2) OR " <>
+          "(rowSchemaRevision=1 AND status NOT IN ('open','answered','ruled','consumed','withdrawn','superseded')) OR " <>
+          "(rowSchemaRevision=2 AND status NOT IN ('open','answered','returned','ruled','consumed','withdrawn','superseded')) LIMIT 1"
+      )
+
+    case invalid do
+      [] -> :ok
+      [[id]] -> raise DB.Error, message: "incompatible decision request row revision for #{id}"
+    end
+  end
 
   @doc false
   @spec migrate_decision_request_row_version_v1_in_txn(Txn.t()) :: :ok
@@ -634,8 +717,9 @@ defmodule Tightbeam.Escalation do
               """
               INSERT INTO decision_requests
                 (id, raiserId, raiserSessionKey, ownerUserId, assignmentId, raisedAt,
-                 deadlineAt, statuteName, actionKey, question, options, context, status)
-              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'open')
+                 deadlineAt, statuteName, actionKey, question, options, context, status,
+                 rowSchemaRevision)
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'open', 2)
               ON CONFLICT DO NOTHING
               """,
               [
@@ -664,6 +748,11 @@ defmodule Tightbeam.Escalation do
               )
 
             request = request_from_row(row)
+
+            request =
+              if inserted?,
+                do: publish_decision_transition_in_txn(txn, nil, request),
+                else: request
 
             if inserted? do
               EventLog.lifecycle_in_txn(
@@ -1102,7 +1191,14 @@ defmodule Tightbeam.Escalation do
            case file_agent_request_in_txn(txn, input) do
              %{request: request} = filed ->
                Publisher.maybe_accepted_in_txn(txn, input.firehose_call, request)
-               filed
+               request =
+                 publish_decision_transition_in_txn(
+                   txn,
+                   nil,
+                   request,
+                   Map.get(input.firehose_call || %{}, :firehose_hub, Hub)
+                 )
+               %{filed | request: request}
 
              error ->
                error
@@ -1137,8 +1233,8 @@ defmodule Tightbeam.Escalation do
         INSERT INTO decision_requests
           (id, kind, raiserId, raiserSessionKey, ownerUserId, assignmentId,
            expecterSessionKey, expecterUserId, raisedAt, deadlineAt,
-           question, context, status, askedOfRole)
-        VALUES (?1, 'agent', ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10, 'open', ?11)
+           question, context, status, askedOfRole, rowSchemaRevision)
+        VALUES (?1, 'agent', ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10, 'open', ?11, 2)
         """,
         [
           request_id,
@@ -1207,6 +1303,9 @@ defmodule Tightbeam.Escalation do
     )
 
     if Txn.changes(txn) == 1 do
+      settled = request_in_txn(txn, request_id)
+      _settled = publish_decision_transition_in_txn(txn, request, settled)
+
       DB.record_row_commit(
         txn,
         decision_transition(request, "open", "withdrawn", by, "withdraw")
@@ -1238,6 +1337,8 @@ defmodule Tightbeam.Escalation do
 
     {:ok, result} =
       DB.transaction(db, fn txn ->
+        before = request_in_txn(txn, request.id)
+
         Txn.q(
           txn,
           """
@@ -1256,10 +1357,8 @@ defmodule Tightbeam.Escalation do
             "by=#{answered_by} askedOf=#{request.expecter_session_key}"
           )
 
-          # The asker asked to be told, so this carries NO class: it is delivered
-          # the way every wake was before Phase 1. Classing it would be the
-          # substrate electing a coordination tier over somebody else's traffic
-          # — the one thing §7 says only a sender may do.
+          # Preserve the asker's existing prompt wake; the state notice below
+          # is a separate best-effort snapshot for Firehose clients.
           Wakes.schedule_in_txn(txn, %{
             session_key: request.raiser_session_key,
             origin: "process:tightbeam",
@@ -1270,6 +1369,13 @@ defmodule Tightbeam.Escalation do
 
           answered = request_in_txn(txn, request.id)
           Publisher.maybe_accepted_in_txn(txn, call, answered)
+               answered =
+                 publish_decision_transition_in_txn(
+                   txn,
+                   before,
+                   answered,
+                   Map.get(call, :firehose_hub, Hub)
+                 )
           answered
         else
           current = request_in_txn(txn, request.id)
@@ -1292,6 +1398,8 @@ defmodule Tightbeam.Escalation do
 
     {:ok, result} =
       DB.transaction(db, fn txn ->
+        before = request_in_txn(txn, request.id)
+
         Txn.q(
           txn,
           """
@@ -1320,6 +1428,13 @@ defmodule Tightbeam.Escalation do
 
           returned = request_in_txn(txn, request.id)
           Publisher.maybe_accepted_in_txn(txn, call, returned)
+               returned =
+                 publish_decision_transition_in_txn(
+                   txn,
+                   before,
+                   returned,
+                   Map.get(call, :firehose_hub, Hub)
+                 )
           returned
         else
           current = request_in_txn(txn, request.id)
@@ -1488,6 +1603,11 @@ defmodule Tightbeam.Escalation do
           )
 
           consumed? = Txn.changes(txn) == 1
+
+          if consumed? do
+            consumed = request_in_txn(txn, ruling_id)
+            _consumed = publish_decision_transition_in_txn(txn, request, consumed)
+          end
 
           transition =
             if consumed?, do: decision_transition(request, "ruled", "consumed", principal, verb)
@@ -1699,6 +1819,8 @@ defmodule Tightbeam.Escalation do
             end)
 
           Enum.each(rows, fn [id, _owner_user_id, _context] ->
+            request = request_in_txn(txn, id)
+
             Txn.q(
               txn,
               "UPDATE decision_requests SET status = 'withdrawn', withdrawnBy = 'process:tightbeam', withdrawnReason = 'raiser-retired', withdrawnAt = ?2 WHERE id = ?1 AND status = 'open'",
@@ -1706,6 +1828,9 @@ defmodule Tightbeam.Escalation do
             )
 
             if Txn.changes(txn) == 1 do
+              withdrawn = request_in_txn(txn, id)
+              _withdrawn = publish_decision_transition_in_txn(txn, request, withdrawn)
+
               EventLog.lifecycle_in_txn(
                 txn,
                 "decision_request_withdrawn",
@@ -1810,6 +1935,9 @@ defmodule Tightbeam.Escalation do
               )
 
               if Txn.changes(txn) == 1 do
+                withdrawn = request_in_txn(txn, id)
+                _withdrawn = publish_decision_transition_in_txn(txn, request, withdrawn)
+
                 EventLog.lifecycle_in_txn(
                   txn,
                   "decision_request_withdrawn",
@@ -1948,6 +2076,121 @@ defmodule Tightbeam.Escalation do
       [] -> nil
     end
   end
+
+  @doc false
+  @spec publish_decision_transition_in_txn(Txn.t(), map() | nil, map()) :: map()
+  @spec publish_decision_transition_in_txn(Txn.t(), map() | nil, map(), term()) :: map()
+  def publish_decision_transition_in_txn(%Txn{} = txn, before, after_row, hub \\ Hub) do
+    after_row = request_in_txn(txn, after_row.id)
+
+    if public_transition_candidate?(before, after_row) do
+      Txn.q(
+        txn,
+        "UPDATE decision_requests SET rowSchemaRevision=2 WHERE id=?1 AND rowSchemaRevision IN (1,2)",
+        [after_row.id]
+      )
+
+      if Txn.changes(txn) != 1,
+        do: raise(DB.Error, message: "decision request revision transition lost its row")
+
+      after_row = request_in_txn(txn, after_row.id)
+      before_item = if before, do: Tightbeam.StateResources.decision_request(before)
+      after_item = Tightbeam.StateResources.decision_request(after_row)
+      class = public_transition_class(before_item, after_item)
+
+      if class do
+        Publisher.committed_in_txn(
+          txn,
+          class,
+          after_row,
+          %{"decisionRequestId" => after_row.id},
+          hub
+        )
+      else
+        if before_item != after_item do
+          raise DB.Error, message: "invalid decision request public transition"
+        else
+          restore_decision_revision_in_txn(txn, before, after_row)
+        end
+      end
+
+      after_row
+    else
+      after_row
+    end
+  end
+
+  defp restore_decision_revision_in_txn(_txn, nil, _after_row), do: :ok
+
+  defp restore_decision_revision_in_txn(txn, before, after_row) do
+    Txn.q(
+      txn,
+      "UPDATE decision_requests SET rowSchemaRevision=?2 WHERE id=?1",
+      [after_row.id, before.row_schema_revision]
+    )
+
+    :ok
+  end
+
+  defp public_transition_candidate?(nil, %{kind: kind, status: "open"}) when kind in ~w(statute effort agent),
+    do: true
+
+  defp public_transition_candidate?(%{id: id}, %{id: id, kind: kind}) when kind in ~w(statute effort agent),
+    do: true
+
+  defp public_transition_candidate?(_before, _after), do: false
+
+  defp public_transition_class(nil, %{"kind" => kind, "status" => "open"})
+       when kind in ~w(statute effort agent),
+       do: "decision_request.opened"
+
+  defp public_transition_class(%{"kind" => "effort", "status" => "open"} = before, %{
+         "kind" => "effort",
+         "status" => "open"
+       } = after_item) do
+    if before != after_item, do: "decision_request.updated"
+  end
+
+  defp public_transition_class(%{"kind" => "agent", "status" => "open"}, %{
+         "kind" => "agent",
+         "status" => "answered"
+       }),
+       do: "decision_request.answered"
+
+  defp public_transition_class(%{"kind" => "agent", "status" => "open"}, %{
+         "kind" => "agent",
+         "status" => "returned"
+       }),
+       do: "decision_request.returned"
+
+  defp public_transition_class(%{"kind" => kind, "status" => "open"}, %{
+         "kind" => kind,
+         "status" => "ruled"
+       })
+       when kind in ~w(statute effort),
+       do: "decision_request.ruled"
+
+  defp public_transition_class(%{"kind" => kind, "status" => "ruled"}, %{
+         "kind" => kind,
+         "status" => "consumed"
+       })
+       when kind in ~w(statute effort),
+       do: "decision_request.consumed"
+
+  defp public_transition_class(%{"kind" => kind, "status" => "open"}, %{
+         "kind" => kind,
+         "status" => "withdrawn"
+       })
+       when kind in ~w(statute effort agent),
+       do: "decision_request.withdrawn"
+
+  defp public_transition_class(%{"kind" => "effort", "status" => "open"}, %{
+         "kind" => "effort",
+         "status" => "superseded"
+       }),
+       do: "decision_request.superseded"
+
+  defp public_transition_class(_before, _after), do: nil
 
   @doc "Canonical SHA-256 action fingerprint."
   @spec digest(map()) :: String.t()
@@ -2121,8 +2364,8 @@ defmodule Tightbeam.Escalation do
       """
       INSERT INTO decision_requests
         (id, kind, raiserId, raiserSessionKey, ownerUserId, assignmentId,
-         raisedAt, deadlineAt, actionKey, question, options, context, status)
-      VALUES (?1, 'operator', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'open')
+         raisedAt, deadlineAt, actionKey, question, options, context, status, rowSchemaRevision)
+      VALUES (?1, 'operator', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'open', 2)
       """,
       [
         request_id,
@@ -2819,6 +3062,13 @@ defmodule Tightbeam.Escalation do
 
             ruled = request_in_txn(txn, request.id)
             Publisher.maybe_accepted_in_txn(txn, opts[:firehose_call], ruled)
+            ruled =
+              publish_decision_transition_in_txn(
+                txn,
+                request,
+                ruled,
+                Map.get(opts[:firehose_call] || %{}, :firehose_hub, Hub)
+              )
 
             {ruled, fact_id, decision_transition(request, "open", "ruled", origin, "rule")}
           else
@@ -2895,6 +3145,9 @@ defmodule Tightbeam.Escalation do
                 )
 
                 if Txn.changes(txn) == 1 do
+                  ruled = request_in_txn(txn, id)
+                  _ruled = publish_decision_transition_in_txn(txn, request, ruled)
+
                   %{fact_id: fact_id} =
                     ConditionFacts.file_in_txn(txn, %{
                       kind: "escalation-ruled",
@@ -2971,6 +3224,13 @@ defmodule Tightbeam.Escalation do
 
             withdrawn = request_in_txn(txn, request.id)
             Publisher.maybe_accepted_in_txn(txn, request.firehose_call, withdrawn)
+            withdrawn =
+              publish_decision_transition_in_txn(
+                txn,
+                request,
+                withdrawn,
+                Map.get(request.firehose_call || %{}, :firehose_hub, Hub)
+              )
             {withdrawn, decision_transition(request, "open", "withdrawn", by, "withdraw")}
           else
             {error("not_open", "decision request is not open"), nil}
@@ -3127,7 +3387,8 @@ defmodule Tightbeam.Escalation do
          returned_by,
          return_reason,
          returned_at,
-         row_version
+         row_version,
+         row_schema_revision
        ]) do
     %{
       id: id,
@@ -3169,12 +3430,13 @@ defmodule Tightbeam.Escalation do
       returned_by: returned_by,
       return_reason: return_reason,
       returned_at: returned_at,
-      row_version: row_version
+      row_version: row_version,
+      row_schema_revision: row_schema_revision
     }
   end
 
   defp request_from_terminal_row(row) do
-    request_from_row(row ++ [nil, nil, nil, nil, nil, nil, nil, 1])
+    request_from_row(row ++ [nil, nil, nil, nil, nil, nil, nil, 1, 1])
   end
 
   defp list_projection(%{kind: "operator"} = request) do

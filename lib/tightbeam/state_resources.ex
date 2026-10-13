@@ -13,7 +13,7 @@ defmodule Tightbeam.StateResources do
     row_version: "rowVersion"
   }
 
-  @secret_keys MapSet.new(["cliToken", "token", "identityToken"])
+  @secret_keys MapSet.new(["cliToken", "token", "identityToken", "rowSchemaRevision"])
 
   @session_select """
   SELECT sessions.sessionKey, sessions.displayName, sessions.kind, sessions.orderIndex,
@@ -342,7 +342,7 @@ defmodule Tightbeam.StateResources do
     {"turns", "status"} => ~w(queued running delivered canceled failed failed_unknown),
     {"decision requests", "kind"} => ~w(statute effort agent),
     {"decision requests", "status"} =>
-      ~w(open ruled consumed withdrawn superseded answered returned),
+      ~w(open answered returned ruled consumed withdrawn superseded),
     {"sessions", "kind"} => ~w(main dm custom),
     {"sessions", "state"} => ~w(active retired),
     {"sessions", "mechanicalStatus"} => ~w(idle running),
@@ -1012,11 +1012,9 @@ defmodule Tightbeam.StateResources do
   end
 
   def query_decision_request(db, %{key: id, principal: principal}) do
-    detail_selection(db, "decision requests", principal, fn txn ->
-      txn
-      |> Tightbeam.Escalation.raw_by_id_in_txn(id)
-      |> decision_request_query_row()
-    end)
+    db
+    |> detail_selection("decision requests", principal, &Tightbeam.Escalation.raw_by_id_in_txn(&1, id))
+    |> decision_request_query_row()
   end
 
   def query_decision_request(db, id) do
@@ -1026,6 +1024,8 @@ defmodule Tightbeam.StateResources do
   defp decision_request_query_row(nil), do: nil
 
   defp decision_request_query_row(row) do
+    revision = value(row, :row_schema_revision)
+
     row =
       Map.drop(row, [
         :action_key,
@@ -1033,7 +1033,8 @@ defmodule Tightbeam.StateResources do
         :ruled_via_principal,
         :ruled_via_session_state,
         :ruling_fact_id,
-        :park_wake_id
+        :park_wake_id,
+        :row_schema_revision
       ])
 
     row =
@@ -1041,7 +1042,7 @@ defmodule Tightbeam.StateResources do
         do: row,
         else: Map.drop(row, [:returned_by, :return_reason, :returned_at])
 
-    row
+    %{"rowSchemaRevision" => revision, "item" => row}
   end
 
   defp detail_principal(%{rest_principal: %{kind: kind, id: id, is_admin: is_admin}}),
@@ -1238,8 +1239,21 @@ defmodule Tightbeam.StateResources do
     end
   end
 
-  def decision_request(%{kind: "operator"} = row), do: public(row)
-  def decision_request(row), do: decision_request_projection(row)
+  def decision_request(%{"rowSchemaRevision" => revision, "item" => %{kind: "operator"} = row}) do
+    validate_decision_revision!(revision, value(row, :status))
+    public(row) |> Map.drop(["rowSchemaRevision"])
+  end
+
+  def decision_request(%{"rowSchemaRevision" => revision, "item" => row}) when is_map(row),
+    do: decision_request_projection(row, revision)
+
+  def decision_request(%{kind: "operator"} = row) do
+    revision = value(row, :row_schema_revision)
+    validate_decision_revision!(revision, value(row, :status))
+    public(row) |> Map.drop(["rowSchemaRevision"])
+  end
+
+  def decision_request(row), do: decision_request_projection(row, value(row, :row_schema_revision))
 
   def session(row) do
     reject_public_shape_drift!(row, "sessions")
@@ -2225,8 +2239,11 @@ defmodule Tightbeam.StateResources do
     item
   end
 
-  defp decision_request_projection(row) do
+  defp decision_request_projection(row, revision) do
     row_version = value(row, :row_version)
+    status = value(row, :status)
+
+    validate_decision_revision!(revision, status)
 
     unless is_integer(row_version) and row_version > 0 do
       raise ArgumentError, "decision request rowVersion is projection_invalid"
@@ -2277,6 +2294,22 @@ defmodule Tightbeam.StateResources do
     validate_item_invariants!("decision requests", row)
     closed_projection(row, "decision requests")
   end
+
+  defp validate_decision_revision!(revision, status) when revision in [1, 2] do
+    allowed =
+      if revision == 1,
+        do: ~w(open answered ruled consumed withdrawn superseded),
+        else: ~w(open answered returned ruled consumed withdrawn superseded)
+
+    if status in allowed do
+      :ok
+    else
+      raise ArgumentError, "decision request status is projection_invalid for rowSchemaRevision"
+    end
+  end
+
+  defp validate_decision_revision!(_revision, _status),
+    do: raise(ArgumentError, "decision request rowSchemaRevision is projection_invalid")
 
   defp validate_decision_deadline!(%{"kind" => "agent", "deadlineAt" => nil}), do: :ok
 
