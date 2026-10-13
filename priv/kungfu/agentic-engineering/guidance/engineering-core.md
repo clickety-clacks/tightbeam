@@ -21,6 +21,10 @@ rulings and necessary spec work to the PO and routes its results downstream.
 The PO takes decisions beyond its authority to the user; contract gaps go to the
 spec-writer through delivery ownership.
 
+Your delivery owner is whoever is accountable for your assignment now: your lane
+orchestrator if your work is in a lane, otherwise the PDO. Report to it, and do not
+report past it.
+
 A role is a responsibility, not a stage. Use `team-planner` for planning advice,
 `spec-writer` for contracts, `coder` for implementation, `reviewer-spec` and
 `reviewer-code` for independent judgment, `recon` for a bounded question and
