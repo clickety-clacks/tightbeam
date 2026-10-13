@@ -6,8 +6,10 @@ check it names already lives in the area runbooks or
 [UPGRADE.md](../../UPGRADE.md); this page classifies them, records what is
 missing, and says who supplies it.
 
-The answer is either **YES, run** with every input named, or a finite list of
-blockers. Nothing runs until Mike calls the run and that call is recorded.
+For each selected behavior, name its required inputs and any missing technical
+prerequisite. Use existing execution authority; do not require a new Mike call
+or completion of every runbook row before already-authorized work proceeds.
+Keep release-cut approval separate from test execution.
 
 ## Historical readiness snapshot, 2026-09-30
 
@@ -47,8 +49,9 @@ interchangeable and the runbook now tells them apart by the presence of
 
 ## Prerequisites
 
-Each row is one of: **every run** (a runbook step), **one-time** (set up once,
-then reused), or a **blocker in the dated snapshot** (owner and action given).
+Apply prerequisites only to the selected journey: copied-data checks need the
+snapshot and containment; independent fresh-base checks do not. Each row is
+**every applicable run**, **one-time**, or a **blocker in the dated snapshot**.
 The status column preserves that assessment; it is not a fresh host probe.
 
 ### Candidate package
@@ -78,11 +81,11 @@ The status column preserves that assessment; it is not a fresh host probe.
 | Six containment checks pass inside the container before the first gateway start | every run (STOP) | README containment | Ready. Docker's own bind mounts of `/etc/hosts`, `/etc/hostname` and `/etc/resolv.conf` are expected under condition 2 and are now named there. |
 | Boot preflight finds a runnable harness CLI (`no_harness_cli` otherwise) | every run | README containment condition 6 | Satisfied by the image |
 
-### Approvals and inputs Mike supplies
+### Execution scope and conditional inputs
 
 | Prerequisite | Class | Where documented | Status |
 |---|---|---|---|
-| A recorded approval naming the environment and the package (README condition 1 `approval:` line) | every run (STOP) | README containment | **Blocker.** Owner: Mike. Action: one ruling, recorded as an attest on the E2E card, naming Racter, the container image digest and the candidate SHA. |
+| Existing execution scope covers the environment and selected effects; record the exact package and image | applicable run | README containment | Use the current recorded scope; no fresh per-run approval requirement. This page grants no additional effects. |
 | `COPIED_TOKEN_APPROVAL`: whether rows that act as a copied live session run | every run | README copied session tokens | **Decision pending.** Owner: Mike. Without it those rows record `INCOMPLETE`, and the run is still valid. |
 | Online tier: a separately authorized environment with test-owned Claude and Codex accounts, models per leg (`TIGHTBEAM_SMOKE_MODEL_*`), `TIGHTBEAM_EFFORT_CHECKIN_HORIZON_MS=2500` | one-time (accounts), every run (env) | README tiers, [SMOKE.md](../../SMOKE.md) | **Blocker.** No test-owned accounts are recorded anywhere. Owner: Mike. Action: name the accounts and the host. Cursor and Pi legs record `INCOMPLETE(parity)` as SMOKE.md already says. |
 
@@ -115,23 +118,25 @@ is a setup result, never permission for raw fixture writes.
 | U9 retirement | Owned disposable workspace on the recorded original host and a no-artifact companion | Name the unavailable host/workspace; local absence cannot prove remote cleanup. |
 | U10 D1 | Fresh non-admin test session and known harmless host-environment entry with cleanup | Named authorization/redaction setup gap. |
 
-The run's approval names the host, package/source and fixtures it actually
-covers. This page supplies no approval for a provider, GitHub or live-org action.
+Record the host, package/source and selected effects covered by the existing
+execution scope. This page grants no provider, GitHub or live-org action.
 
 ## What a YES looks like
 
-All of these are true, and each is recorded on the E2E card:
+Record the inputs applicable to the selected journey on the E2E card:
 
 1. Candidate proof artifact downloaded and hash-verified; `PKG` extracted from it.
-2. Snapshot taken, `quick_check` ok, manifest written, 0.1.8 package beside it.
+2. For copied-data checks: snapshot qualified, `quick_check` ok, manifest
+   written and source package identified.
 3. Container image built; Racter has the space; the six containment checks pass
    inside a fresh container.
-4. Mike's approval attest names the environment, image and package.
-5. The copied-token decision is recorded either way.
+4. The existing execution scope covers the environment and selected effects.
+5. For copied-session actions: explicit copied-token authority is recorded;
+   absent authority skips those actions, not independent checks.
 
-Then the [aggregate run](README.md#aggregate-run) starts at step 1. The online
-tier waits for its own authorization and accounts; the offline tier does not
-depend on it.
+Run only the selected journeys in the [aggregate procedure](README.md#aggregate-run).
+Reuse applicable evidence and record named skips/partials. Online checks need
+their own authorized accounts; independent offline checks do not wait for them.
 
 ## Corrections made with this page
 
