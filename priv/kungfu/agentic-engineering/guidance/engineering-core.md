@@ -54,9 +54,13 @@ no replacement spec. Use the installed binding route described in the manual.
 ## Acceptance is independent and recorded
 
 A producer verifies its work; a judge who did not make it assesses acceptance.
-Review runs on the opposite harness from actual authorship: Codex-authored work
-uses Claude, Claude-authored work uses Codex, and mixed authorship gets each
-portion covered on the exact integrated subject. Defaults do not prove authorship.
+Prefer a qualified, available independent reviewer on the opposite harness from
+actual authorship; this is a preference, never a gate. If that route is unavailable,
+use the configured capable, qualified independent nonauthor fallback, including a
+reviewer on the same harness. Do not force an attempt on a known exhausted route.
+Cover every authored portion on the exact integrated subject and record actual
+authorship and reviewer harness. Defaults do not prove authorship; harness choice
+does not replace substantive review.
 Reviewers edit nothing; delivery owners decide scope disputes and whether earlier
 evidence covers changed work. Contest a blocker through that owner, not by ignoring it.
 

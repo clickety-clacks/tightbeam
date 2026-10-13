@@ -12,7 +12,7 @@ owns configured ring-down and its exhaustion route.
 - `sol`: `gpt-6-sol`, PDO low-effort default and stronger implementation when needed.
 - `luna`: `gpt-6-luna`, orchestrator and understood-architecture coder at max effort.
 - `terra`: `gpt-5.6-terra`, retained bounded mechanical choice, not a generation-6 alias.
-- `opus`: `claude-opus-5-5`, spec writing and review of Codex-authored work at high.
+- `opus`: `claude-opus-5-5`, spec writing and preferred independent review of Codex-authored work at high.
 - `fable`: `claude-fable-5`, qualified product, planning and implementation choice.
 - `sonnet`: `claude-sonnet-5`, bounded work under an understood contract.
 - `haiku`: `claude-haiku-4-5-20251001`, narrow factual work; no effort is assumed.
@@ -25,11 +25,13 @@ default. Do not retry a known unavailable route without new evidence. Diagnose
 poor results before changing effort or approach; preserve custody and possible
 external effects. Explicit settings do not authorize live tuning or migration.
 
-The engineering core owns opposite-actual-producer review. Its exact selections
-are Claude `claude-opus-5-5/high` for Codex production and Codex
-`gpt-6-astra/high` for Claude production. Mixed authorship needs portion coverage
-and integrated review. Do not silently substitute same-harness review or an old
-reviewer default when access is missing.
+Follow the engineering core's qualified independent nonauthor review and exact
+integrated-subject coverage. Prefer Claude `claude-opus-5-5/high` for Codex-authored
+work and Codex `gpt-6-sol/high` for Claude-authored work when an eligible qualified
+independent reviewer is available; these are preferences, never gates. If the
+preferred opposite-harness route is unavailable, use the configured capable,
+qualified independent nonauthor fallback, including a reviewer on the same harness.
+Do not force an attempt on a known exhausted route.
 
 ## Activities
 
@@ -49,8 +51,10 @@ reviewer default when access is missing.
 | Guidance or law authoring | astra[high], sol[xhigh], fable[high] | coherent authority and composed behavior |
 
 The complete workflow requires both Codex and Claude. Claude-only operation lacks
-the configured Codex PDO/orchestration and implementation choices and Codex review
-of Claude-authored work. Codex-only operation lacks Claude specification and Claude
-review of Codex-authored work. Preserve permitted useful work, but state the unmet
-activity instead of claiming end-to-end support or overriding family restrictions.
+the configured Codex PDO/orchestration and implementation choices. Codex-only
+operation lacks Claude specification. Opposite-harness review is preferred, never
+mandatory; when the preferred route is unavailable, use the configured capable,
+qualified independent nonauthor fallback described above. Preserve permitted useful
+work, but state the unmet activity instead of claiming end-to-end support or
+overriding family restrictions.
 Model access remains its existing owner's obligation; Main is not a fallback worker.
