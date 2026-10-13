@@ -309,8 +309,20 @@ defmodule Tightbeam.Escalation do
   @decision_request_revision_ddl "rowSchemaRevision INTEGER NOT NULL DEFAULT 1 " <>
                                    "CHECK (typeof(rowSchemaRevision) = 'integer' AND rowSchemaRevision IN (1,2))"
 
-  @decision_requests_current_ddl String.trim_trailing(@decision_requests_pre_revision_ddl, ")") <>
-                                   ", " <> @decision_request_revision_ddl <> ")"
+  @decision_requests_current_ddl (case String.split(
+                                         @decision_requests_pre_revision_ddl,
+                                         "\n  CHECK (\n    (kind = 'statute'",
+                                         parts: 2
+                                       ) do
+                                    [columns, constraints] ->
+                                      columns <>
+                                        " " <>
+                                        @decision_request_revision_ddl <>
+                                        "\n  CHECK (\n    (kind = 'statute'" <> constraints
+
+                                    _ ->
+                                      raise "decision_requests table constraint boundary not found"
+                                  end)
 
   @terminal_request_columns """
   id, kind, raiserId, raiserSessionKey, ownerUserId, assignmentId,
