@@ -1151,6 +1151,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
       Tightbeam.DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES ('flynn', 1, 1)")
 
     %{name: "worker"} = Tightbeam.Roles.create!(db, "worker", "flynn", nil)
+
     expected_item =
       db
       |> Tightbeam.StateResources.query_role("worker")
