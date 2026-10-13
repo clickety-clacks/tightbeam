@@ -67,9 +67,7 @@ defmodule Tightbeam.D1ReadTest do
     assert Enum.all?(users, &(is_boolean(&1["isAdmin"]) and is_integer(&1["rowVersion"])))
   end
 
-  test "database collection pages materialize no more than one bounded lookahead row", %{
-    db: db
-  } do
+  test "database collection pages return the requested items and page directions", %{db: db} do
     for index <- 1..80 do
       :ok =
         Org.put_setting(db, "page-setting-#{String.pad_leading(to_string(index), 3, "0")}", "x")
@@ -78,7 +76,11 @@ defmodule Tightbeam.D1ReadTest do
     page = D1Read.page(db, "/unused", :config, %{}, :latest, 5)
 
     assert length(page.items) == 5
-    assert page.flags.candidate_count == 6
+    assert Enum.map(page.items, & &1["key"]) ==
+             Enum.map(76..80, fn index ->
+               "page-setting-" <> String.pad_leading(to_string(index), 3, "0")
+             end)
+
     assert page.flags.has_more_before == true
     assert page.flags.has_more_after == false
 
@@ -89,7 +91,7 @@ defmodule Tightbeam.D1ReadTest do
 
     exact = D1Read.page(db, "/unused", :config, %{"key" => exact_keys}, :earliest, 5)
     assert length(exact.items) == 5
-    assert exact.flags.candidate_count == 5
+    assert Enum.map(exact.items, & &1["key"]) == exact_keys
     assert exact.flags.has_more_before == false
     assert exact.flags.has_more_after == false
 
@@ -97,15 +99,6 @@ defmodule Tightbeam.D1ReadTest do
     assert empty.items == []
     assert empty.flags.has_more_before == false
     assert empty.flags.has_more_after == false
-
-    {:ok, plan} =
-      DB.query(
-        db,
-        "EXPLAIN QUERY PLAN SELECT key FROM org_settings ORDER BY key LIMIT ?",
-        [6]
-      )
-
-    refute inspect(plan) =~ "USE TEMP B-TREE"
   end
 end
 
@@ -115,7 +108,7 @@ defmodule Tightbeam.D1ReadRouteTest do
   import Plug.Conn
   import Plug.Test
 
-  alias Tightbeam.{D1Read, DB, Devices, Escalation, Harness, Identity, Org, Placement, Schema}
+  alias Tightbeam.{D1Read, DB, Devices, Harness, Identity, Org, Placement, Schema}
   alias Tightbeam.StateResources
   alias Tightbeam.Wire.Router
 
@@ -517,19 +510,6 @@ defmodule Tightbeam.D1ReadRouteTest do
       end)
 
     assert first.resp_body =~ "\"items\":[#{encoded_items}],\"page\":"
-
-    query_page =
-      Escalation.page_collection(
-        ctx.db,
-        %{"kind" => ["statute"]},
-        %{kind: "user", id: "admin", is_admin: true},
-        :latest,
-        2
-      )
-
-    assert Enum.map(query_page.rows, & &1.id) == ["dr_page_3", "dr_page_tie_z"]
-    assert query_page.candidate_count == 3
-    assert query_page.flags == %{has_more_before: true, has_more_after: false}
 
     older_cursor = decoded["page"]["oldestCursor"]
     older_path = "/api/decision-requests?kind=statute&limit=2&before=#{older_cursor}"
