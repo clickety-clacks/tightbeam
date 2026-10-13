@@ -137,7 +137,10 @@ defmodule Tightbeam.DBCallTimeoutTest do
     :sys.suspend(db)
 
     try do
-      assert catch_exit(DB.query(db, "SELECT 1")) |> elem(0) == :timeout
+      error = assert_raise(DB.Timeout, fn -> DB.query(db, "SELECT 1") end)
+
+      assert error.operation == "db.query"
+      assert error.budget_ms == 20
     after
       :sys.resume(db)
     end
@@ -210,24 +213,25 @@ defmodule Tightbeam.DBCallTimeoutTest do
             receive do: (:finish_old_migration -> :ok)
             DB.Txn.exec(txn, "CREATE TABLE old_migration_committed(id INTEGER)")
           end)
-        catch
-          :exit, reason ->
-            send(parent, {:primary_timeout, reason})
-            exit(reason)
+        rescue
+          error in DB.Timeout ->
+            send(parent, {:primary_timeout, error})
+            reraise error, __STACKTRACE__
         after
-          DB.execute(db, "PRAGMA ignore_check_constraints=OFF")
+          try do
+            DB.execute(db, "PRAGMA ignore_check_constraints=OFF")
+          rescue
+            error in DB.Timeout -> reraise error, __STACKTRACE__
+          end
         end
       end)
 
     assert_receive :old_migration_entered
 
-    assert_receive {:primary_timeout,
-                    {:timeout, {GenServer, :call, [^db, {:transaction, _}, 25]}}}
+    assert_receive {:primary_timeout, %DB.Timeout{operation: "db.transaction", budget_ms: 25}}
 
     assert_receive {:DOWN, ^monitor, :process, ^caller,
-                    {:timeout,
-                     {GenServer, :call,
-                      [^db, {:execute, "PRAGMA ignore_check_constraints=OFF"}, 25]}}}
+                    {%DB.Timeout{operation: "db.execute", budget_ms: 25}, _stack}}
 
     send(db, :finish_old_migration)
 

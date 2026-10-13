@@ -12,6 +12,7 @@ defmodule Tightbeam.Wire.SocketTest do
     Rules
   }
 
+  alias Tightbeam.TestSupport.DBFailureReportingFixture
   alias Tightbeam.Wire.Socket
 
   defmodule LaneDoorbell do
@@ -272,6 +273,65 @@ defmodule Tightbeam.Wire.SocketTest do
     {:ok, [[payload]]} = DB.query(ctx.db, "SELECT payload FROM events WHERE verb='post'")
     assert payload =~ "[REDACTED:secret_field]"
     refute payload =~ "SENTINEL"
+  end
+
+  test "chat error frame preserves a DB failure and its failed rollback diagnostic", ctx do
+    {:paired, device} =
+      Devices.pair(ctx.db, %{
+        device_id: "chat-db-failure",
+        claimed_name: "Flynn",
+        platform: nil,
+        model: nil
+      })
+
+    sentinel = "socket-db-failure-sentinel"
+    handler = DBFailureReportingFixture.handler(ctx.db, self(), sentinel)
+    {:ok, socket} = Socket.init(%{ctx.deps | handlers: %{"post" => handler}})
+    auth = %{"type" => "auth", "token" => device.token, "deviceId" => device.device_id}
+
+    {:push, _auth_frames, replaying} =
+      Socket.handle_in({JSON.encode!(auth), opcode: :text}, socket)
+
+    {:push, _sync_frame, live} = Socket.handle_info(:finish_replay, replaying)
+
+    message = %{
+      "type" => "message",
+      "id" => "c_db_failure",
+      "content" => "hello",
+      "sessionKey" => Org.personal_session_key(device.user_id)
+    }
+
+    {:push, {:text, frame}, _live} =
+      Socket.handle_in({JSON.encode!(message), opcode: :text}, live)
+
+    refute frame =~ sentinel
+
+    assert %{
+             "type" => "error",
+             "code" => "server_error",
+             "messageId" => "c_db_failure",
+             "message" => "primary DB failure password=[REDACTED:secret_field]",
+             "diagnostic" => %{
+               "kind" => "exception",
+               "operation" => "db.transaction",
+               "origin" => "db_owner",
+               "phase" => "callback",
+               "exception" => %{"stacktrace" => stacktrace},
+               "cleanup" => %{
+                 "kind" => "cleanup",
+                 "status" => "unverified",
+                 "operation" => "db.rollback",
+                 "phase" => "rollback",
+                 "resultClass" => "sqlite_error"
+               }
+             }
+           } = JSON.decode!(frame)
+
+    assert Enum.any?(stacktrace, &String.contains?(&1, "db_failure_reporting_fixture.ex"))
+    assert_receive {:db_failure_reporting_handler_called, handler_pid} when is_pid(handler_pid)
+    refute_receive {:db_failure_reporting_handler_called, _handler_pid}, 0
+    assert_receive {:db_failure_reporting_callback_called, db_pid} when is_pid(db_pid)
+    refute_receive {:db_failure_reporting_callback_called, _db_pid}, 0
   end
 
   test "pair and auth failures use the contract reasons", ctx do

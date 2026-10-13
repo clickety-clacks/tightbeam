@@ -529,7 +529,12 @@ defmodule Tightbeam.Org do
   @spec by_cli_token(db(), String.t()) :: session() | nil
   def by_cli_token(db \\ Tightbeam.DB, token) do
     {:ok, rows} =
-      DB.query(db, select_session_sql() <> " WHERE cliToken = ?1 AND state = 'active'", [token])
+      DB.query_for(
+        db,
+        "auth.session_by_cli_token",
+        select_session_sql() <> " WHERE cliToken = ?1 AND state = 'active'",
+        [token]
+      )
 
     case rows do
       [row] -> to_session(row)
@@ -542,8 +547,9 @@ defmodule Tightbeam.Org do
   def active_session_key_by_cli_token(db \\ Tightbeam.DB, token)
 
   def active_session_key_by_cli_token(db, token) when is_binary(token) do
-    case DB.query(
+    case DB.query_for(
            db,
+           "auth.session_by_cli_token",
            "SELECT sessionKey FROM sessions WHERE cliToken = ?1 AND state = 'active'",
            [token]
          ) do

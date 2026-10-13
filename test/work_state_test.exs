@@ -146,8 +146,16 @@ defmodule Tightbeam.WorkStateTest do
     assert_receive {:trace_delivered, ^db, ^delivered}
 
     requests = received_db_requests(db, [])
+
     assert [{:transaction, transaction}] = requests
+
     assert is_function(transaction, 1)
+
+    assert {:ok, envelope, _original_callback} =
+             Tightbeam.DBObservation.transaction_metadata(transaction)
+
+    assert envelope.operation == "db.transaction"
+    assert envelope.effect_kind == "write"
   end
 
   test "filters, ordering, item composition, and detail shapes are mechanical", ctx do

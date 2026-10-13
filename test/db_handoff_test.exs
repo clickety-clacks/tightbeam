@@ -53,7 +53,16 @@ defmodule Tightbeam.DBHandoffTest do
         end)
       end)
 
-    assert_receive {:trace, ^db_pid, :receive, {:"$gen_call", _from, {:transaction, _fun}}}
+    assert_receive {:trace, ^db_pid, :receive, {:"$gen_call", _from, {:transaction, callback}}}
+
+    assert is_function(callback, 1)
+
+    assert {:ok, envelope, _original_callback} =
+             Tightbeam.DBObservation.transaction_metadata(callback)
+
+    assert envelope.operation == "db.transaction"
+    assert envelope.effect_kind == "write"
+
     :erlang.trace(db_pid, false, [:receive])
     send(db_pid, :release_first)
 
