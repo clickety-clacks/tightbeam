@@ -108,6 +108,12 @@ defmodule Tightbeam.Wire.Router do
       filters: ~w(state ownerUserId createdBySession createdByUser isBug specRefName holderKey),
       order: ~w(createdAt id)
     },
+    decision_requests: %{
+      resource: "decision requests",
+      route: "decision_requests.collection",
+      filters: ~w(status kind ownerUserId assignmentId raiserSessionKey expecterSessionKey),
+      order: ~w(raisedAt id)
+    },
     config: D1Read.spec(:config),
     host_environment: D1Read.spec(:host_environment),
     hosts: D1Read.spec(:hosts),
@@ -582,6 +588,10 @@ defmodule Tightbeam.Wire.Router do
 
   get "/api/work-items" do
     d1_collection(conn, Map.fetch!(@d1_resources, :work_items))
+  end
+
+  get "/api/decision-requests" do
+    d1_collection(conn, Map.fetch!(@d1_resources, :decision_requests))
   end
 
   get "/api/work-items/:id" do
@@ -1178,11 +1188,27 @@ defmodule Tightbeam.Wire.Router do
     |> Enum.sort_by(&[&1["createdAt"], &1["id"]])
   end
 
+  defp d1_decision_request_rows(conn, filters, principal) do
+    db = db(conn)
+
+    db
+    |> Tightbeam.Escalation.raw_collection(filters)
+    |> Enum.filter(fn row ->
+      Tightbeam.StateVisibility.core_detail_visible?(db, "decision requests", row, principal)
+    end)
+    |> Enum.map(&StateResources.decision_request/1)
+    |> Enum.sort_by(&[&1["raisedAt"], &1["id"]])
+  end
+
   defp d1_row_tuple(:work_items, item),
     do: [Map.fetch!(item, "createdAt"), Map.fetch!(item, "id")]
 
+  defp d1_row_tuple(:decision_requests, item),
+    do: [Map.fetch!(item, "raisedAt"), Map.fetch!(item, "id")]
+
   defp d1_row_tuple(resource, item), do: D1Read.tuple(resource, item)
   defp d1_encode(:work_items, item), do: StateResources.encode_item("work items", item, %{})
+  defp d1_encode(:decision_requests, item), do: JSON.encode!(item)
   defp d1_encode(resource, item), do: D1Read.encode(resource, item)
 
   defp d1_collection(conn, spec) do
@@ -1195,6 +1221,9 @@ defmodule Tightbeam.Wire.Router do
         cond do
           spec.resource == "work items" ->
             d1_work_item_rows(conn, request.filters, principal)
+
+          spec.resource == "decision requests" ->
+            d1_decision_request_rows(conn, request.filters, principal)
 
           D1Read.visible?(d1_resource(spec), principal.is_admin) ->
             D1Read.collection(db(conn), deps(conn).base_dir, d1_resource(spec), request.filters)
@@ -1379,6 +1408,12 @@ defmodule Tightbeam.Wire.Router do
   defp d1_filter_value?("work items", "state", value),
     do: value in ~w(open iceboxed closed failed)
 
+  defp d1_filter_value?("decision requests", "kind", value),
+    do: value in ~w(statute effort agent)
+
+  defp d1_filter_value?("decision requests", "status", value),
+    do: value in ~w(open ruled consumed withdrawn superseded answered returned)
+
   defp d1_filter_value?("work items", "isBug", value), do: value in ~w(true false)
   defp d1_filter_value?("work items", _field, value), do: is_binary(value) and value != ""
   defp d1_filter_value?(_resource, field, value), do: d1_filter_value?(field, value)
@@ -1417,6 +1452,11 @@ defmodule Tightbeam.Wire.Router do
     do: is_integer(created_at) and is_binary(id) and id != ""
 
   defp d1_tuple?(_tuple, :work_items), do: false
+
+  defp d1_tuple?([raised_at, id], :decision_requests),
+    do: is_integer(raised_at) and is_binary(id) and id != ""
+
+  defp d1_tuple?(_tuple, :decision_requests), do: false
 
   defp d1_tuple?(tuple, resource),
     do:

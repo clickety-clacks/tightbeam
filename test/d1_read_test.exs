@@ -316,6 +316,40 @@ defmodule Tightbeam.D1ReadRouteTest do
     assert get_resp_header(missing, "cache-control") == ["no-store"]
   end
 
+  test "decision-request collection filters and pages by raisedAt and id", ctx do
+    for {id, raised_at} <- [{"dr_page_1", 10}, {"dr_page_2", 20}, {"dr_page_3", 30}] do
+      {:ok, _rows} =
+        DB.query(
+          ctx.db,
+          """
+          INSERT INTO decision_requests
+            (id, kind, raiserId, ownerUserId, raisedAt, deadlineAt, statuteName,
+             actionKey, question, context, status)
+          VALUES (?1, 'statute', 'user:admin', 'admin', ?2, ?3, ?4,
+                  'read', 'Allow the read?', '{}', 'open')
+          """,
+          [id, raised_at, raised_at + 60_000, id]
+        )
+    end
+
+    first = get(ctx.opts, "/api/decision-requests?kind=statute&limit=2", ctx.admin.token)
+
+    assert first.status == 200
+    assert get_resp_header(first, "cache-control") == ["no-store"]
+    decoded = JSON.decode!(first.resp_body)
+    assert decoded["resource"] == "decision requests"
+    assert Enum.map(decoded["items"], & &1["id"]) == ["dr_page_2", "dr_page_3"]
+    assert decoded["page"]["hasMoreBefore"]
+    refute decoded["page"]["hasMoreAfter"]
+
+    older_cursor = decoded["page"]["oldestCursor"]
+    older_path = "/api/decision-requests?kind=statute&limit=2&before=#{older_cursor}"
+    older = get(ctx.opts, older_path, ctx.admin.token)
+
+    assert Enum.map(JSON.decode!(older.resp_body)["items"], & &1["id"]) == ["dr_page_1"]
+    assert get(ctx.opts, "/api/decision-requests?status=unknown", ctx.admin.token).status == 400
+  end
+
   test "session asUser distinguishes absent, empty, matching, and unauthorized identities", ctx do
     assert get(ctx.opts, "/api/hosts", ctx.session.cli_token).status == 200
     assert get(ctx.opts, "/api/hosts?asUser=admin", ctx.session.cli_token).status == 200

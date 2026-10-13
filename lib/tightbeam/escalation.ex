@@ -343,6 +343,15 @@ defmodule Tightbeam.Escalation do
   returnedBy, returnReason, returnedAt, rowVersion, rowSchemaRevision
   """
 
+  @decision_request_collection_columns %{
+    "status" => "status",
+    "kind" => "kind",
+    "ownerUserId" => "ownerUserId",
+    "assignmentId" => "assignmentId",
+    "raiserSessionKey" => "raiserSessionKey",
+    "expecterSessionKey" => "expecterSessionKey"
+  }
+
   @agent_request_fields ~w(
     asked_of_role answer answered_by answered_at returned_by return_reason returned_at
   )a
@@ -2263,6 +2272,39 @@ defmodule Tightbeam.Escalation do
        do: "decision_request.superseded"
 
   defp public_transition_class(_before, _after), do: nil
+
+  @spec raw_collection(DB.server(), map()) :: [map()]
+  def raw_collection(db, filters) when is_map(filters) do
+    {clauses, params, _next_index} =
+      filters
+      |> Enum.sort_by(&elem(&1, 0))
+      |> Enum.reduce({[], [], 1}, fn {field, values}, {clauses, params, next_index} ->
+        column = Map.fetch!(@decision_request_collection_columns, field)
+        values = Enum.uniq(values)
+        last_index = next_index + length(values) - 1
+        placeholders =
+          Enum.map_join(next_index..last_index, ",", fn index ->
+            "?" <> Integer.to_string(index)
+          end)
+
+        {
+          ["#{column} IN (#{placeholders})" | clauses],
+          params ++ values,
+          next_index + length(values)
+        }
+      end)
+
+    where = if clauses == [], do: "1=1", else: Enum.join(Enum.reverse(clauses), " AND ")
+
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT #{@request_columns} FROM decision_requests WHERE #{where} ORDER BY raisedAt, id",
+        params
+      )
+
+    Enum.map(rows, &request_from_row/1)
+  end
 
   @doc "Canonical SHA-256 action fingerprint."
   @spec digest(map()) :: String.t()
