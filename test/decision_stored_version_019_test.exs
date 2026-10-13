@@ -56,11 +56,17 @@ defmodule Tightbeam.DecisionStoredVersion019Test do
       assert_field_order(bytes, fields)
     end
 
+    stored_effort = Escalation.raw_by_id(db, effort["id"])
+
     notice =
-      Tightbeam.Firehose.Publisher.committed_notice("decision_request.opened", effort, %{
+      Tightbeam.Firehose.Publisher.committed_notice("decision_request.opened", stored_effort, %{
         "decisionRequestId" => effort["id"]
       })
 
+    assert notice["schemaVersion"] == 2
+    assert notice["resource"] == "decision requests"
+    assert notice["op"] == "upsert"
+    assert notice["refs"] == %{"decisionRequestId" => effort["id"]}
     assert notice["payload"] == effort
 
     assert JSON.decode!(Tightbeam.Firehose.Publisher.encode_wire_notice(notice))["payload"] ==
@@ -94,15 +100,20 @@ defmodule Tightbeam.DecisionStoredVersion019Test do
   end
 
   @tag rest_r7_closure: true
-  test "decision option projection preserves ruled exact objects and refuses malformed values", %{
+  test "decision option projection hides stored effects and refuses malformed values", %{
     db: db
   } do
     insert_decision_rows(db)
     statute = Escalation.raw_by_id(db, "dr_statute_r7")
 
+    assert StateResources.decision_request(statute)["options"] == []
+
     assert StateResources.decision_request(%{
              statute
-             | options: [%{"label" => "allow"}, %{"label" => "deny"}]
+             | options: [
+                 %{"label" => "allow", "effect" => "allow"},
+                 %{"label" => "deny", "effect" => "deny"}
+               ]
            })["options"] == [%{"label" => "allow"}, %{"label" => "deny"}]
 
     for malformed <- [
@@ -110,7 +121,8 @@ defmodule Tightbeam.DecisionStoredVersion019Test do
           "allow",
           [1],
           [%{"label" => 1}],
-          [%{"label" => "allow", "effect" => "allow"}]
+          [%{"label" => "allow", "effect" => "defer"}],
+          [%{"label" => "allow", "unexpected" => "field"}]
         ] do
       assert_raise ArgumentError, ~r/projection_invalid/, fn ->
         StateResources.decision_request(%{statute | options: malformed})
@@ -328,10 +340,107 @@ defmodule Tightbeam.DecisionStoredVersion019Test do
 
     assert :ok = Schema.ensure_all(db)
 
+    assert {:ok, [["decision-request-row-schema-v2-019"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok, [[1], [1], [1]]} =
+             DB.query(db, "SELECT rowSchemaRevision FROM decision_requests ORDER BY id")
+
     assert {:ok, [[2]]} =
              DB.query(db, "SELECT rowVersion FROM decision_requests WHERE id='old-1'")
 
     assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
+  end
+
+  test "decision row revision adoption requires the exact stamped predecessor shape", %{db: db} do
+    :ok = DB.execute(db, "UPDATE schema_stamp SET shape='notice-source-storage-v1-019'")
+    before = decision_schema_snapshot(db)
+
+    assert_raise Schema.ShapeError, ~r/decision request row schema migration failed/, fn ->
+      Schema.ensure_all(db)
+    end
+
+    assert decision_schema_snapshot(db) == before
+  end
+
+  test "decision row revision and successor stamp roll back as one migration", %{db: db} do
+    :ok = DB.execute(db, "ALTER TABLE decision_requests DROP COLUMN rowSchemaRevision")
+    :ok = DB.execute(db, "UPDATE schema_stamp SET shape='notice-source-storage-v1-019'")
+
+    :ok =
+      DB.execute(db, """
+      CREATE TRIGGER reject_decision_revision_stamp
+      BEFORE UPDATE ON schema_stamp
+      WHEN NEW.shape='decision-request-row-schema-v2-019'
+      BEGIN
+        SELECT RAISE(ABORT, 'fixture decision revision stamp refusal');
+      END
+      """)
+
+    before = decision_schema_snapshot(db)
+
+    assert_raise Schema.ShapeError, ~r/decision request row schema migration failed/, fn ->
+      Schema.ensure_all(db)
+    end
+
+    assert decision_schema_snapshot(db) == before
+
+    :ok = DB.execute(db, "DROP TRIGGER reject_decision_revision_stamp")
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:ok, [["decision-request-row-schema-v2-019"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+  end
+
+  test "current decision row revision stamp refuses a missing revision column", %{db: db} do
+    :ok = DB.execute(db, "ALTER TABLE decision_requests DROP COLUMN rowSchemaRevision")
+    before = decision_schema_snapshot(db)
+
+    assert_raise Schema.ShapeError, ~r/incompatible decision request row schema stamp/, fn ->
+      Schema.ensure_all(db)
+    end
+
+    assert decision_schema_snapshot(db) == before
+  end
+
+  test "decision projections require an explicit compatible row schema revision", %{db: db} do
+    insert_decision_rows(db)
+    agent = Escalation.raw_by_id(db, "dr_agent_r7")
+
+    assert agent.row_schema_revision == 2
+    assert StateResources.decision_request(%{agent | row_schema_revision: 1})["status"] == "open"
+
+    assert StateResources.decision_request(%{
+             agent
+             | status: "answered",
+               row_schema_revision: 1
+           })["status"] == "answered"
+
+    returned = %{
+      agent
+      | status: "returned",
+        returned_by: "session:agent-reader",
+        return_reason: "Need evidence",
+        returned_at: agent.raised_at,
+        row_schema_revision: 2
+    }
+
+    assert StateResources.decision_request(returned)["status"] == "returned"
+
+    for malformed <- [
+          %{agent | row_schema_revision: nil},
+          %{agent | row_schema_revision: 3},
+          %{returned | row_schema_revision: 1}
+        ] do
+      assert_raise ArgumentError, ~r/rowSchemaRevision|for rowSchemaRevision/, fn ->
+        StateResources.decision_request(malformed)
+      end
+    end
+
+    queried = StateResources.query_decision_request(db, agent.id)
+    assert queried["rowSchemaRevision"] == 2
+    refute Map.has_key?(queried["item"], :row_schema_revision)
+    refute Map.has_key?(StateResources.decision_request(queried), "rowSchemaRevision")
   end
 
   @tag historical_r1: true
@@ -488,7 +597,8 @@ defmodule Tightbeam.DecisionStoredVersion019Test do
 
     assert {:ok, _} =
              DB.query(db, """
-             UPDATE decision_requests SET status='returned', returnedBy='session:agent:asked',
+             UPDATE decision_requests SET status='returned', rowSchemaRevision=2,
+               returnedBy='session:agent:asked',
                returnReason='clarify', returnedAt=raisedAt WHERE id='dr_agent_r7'
              """)
 
@@ -562,6 +672,17 @@ defmodule Tightbeam.DecisionStoredVersion019Test do
              DB.query(db, "UPDATE decision_requests SET rowVersion=-1 WHERE id='dr_agent_r7'")
   end
 
+  defp decision_schema_snapshot(db) do
+    for sql <- [
+          "SELECT type,name,sql FROM sqlite_master ORDER BY type,name",
+          "SELECT * FROM schema_stamp",
+          "SELECT * FROM decision_requests ORDER BY id"
+        ] do
+      assert {:ok, rows} = DB.query(db, sql)
+      rows
+    end
+  end
+
   defp insert_decision_rows(db) do
     assert {:ok, _} =
              DB.query(
@@ -569,11 +690,12 @@ defmodule Tightbeam.DecisionStoredVersion019Test do
                """
                INSERT INTO decision_requests
                  (id,kind,raiserId,raiserSessionKey,ownerUserId,assignmentId,
-                  raisedAt,deadlineAt,statuteName,actionKey,question,options,context,status)
+                  raisedAt,deadlineAt,statuteName,actionKey,question,options,context,status,
+                  rowSchemaRevision)
                VALUES
                  ('dr_statute_r7','statute','session:raiser','agent:raiser','mike','asg_r7',
                   10,20,'ship-law','ship-action','May this ship?',
-                  NULL,'{"verb":"ship"}','open')
+                  NULL,'{"verb":"ship"}','open',2)
                """
              )
 
@@ -583,10 +705,11 @@ defmodule Tightbeam.DecisionStoredVersion019Test do
                """
                INSERT INTO decision_requests
                  (id,kind,raiserId,raiserSessionKey,ownerUserId,assignmentId,
-                  expecterSessionKey,expecterUserId,raisedAt,question,context,status,askedOfRole)
+                  expecterSessionKey,expecterUserId,raisedAt,question,context,status,askedOfRole,
+                  rowSchemaRevision)
                VALUES
                  ('dr_agent_r7','agent','session:agent:raiser','agent:raiser','mike','asg_r7',
-                  'agent:asked','mike',11,'Which path?','{"verb":"ask"}','open','reviewer:r7')
+                  'agent:asked','mike',11,'Which path?','{"verb":"ask"}','open','reviewer:r7',2)
                """
              )
 
@@ -597,11 +720,11 @@ defmodule Tightbeam.DecisionStoredVersion019Test do
                INSERT INTO decision_requests
                  (id,kind,raiserId,ownerUserId,assignmentId,expecterSessionKey,
                   lineageRung,effortGeneration,deadlineWakeId,raisedAt,deadlineAt,
-                  question,options,context,status)
+                  question,options,context,status,rowSchemaRevision)
                VALUES
                  ('dr_effort_r7','effort','process:tightbeam','mike','asg_r7','agent:expecter',
                   4,7,'w_effort_r7',12,22,'Continue or dismiss?',
-                  '["wake","continue","dismiss"]','{"actions":["wake","continue","dismiss"]}','open')
+                  '["wake","continue","dismiss"]','{"actions":["wake","continue","dismiss"]}','open',2)
                """
              )
   end

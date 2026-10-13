@@ -1,7 +1,7 @@
 defmodule Tightbeam.Firehose.PublisherTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{ConnRegistry, DB, Dispatch, Gateway, Ledger, Org, Wakes}
+  alias Tightbeam.{ConnRegistry, DB, Dispatch, Escalation, Gateway, Ledger, Org, Wakes}
   alias Tightbeam.NoticeBatcher
   alias Tightbeam.Firehose.{Hub, Publisher}
 
@@ -962,7 +962,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     }
 
     for {verb, payload, status, class} <- [
-          {"answer", %{answer: "Ready"}, "answered", "decision_request.ruled"},
+          {"answer", %{answer: "Ready"}, "answered", "decision_request.answered"},
           {"return", %{reason: "Need evidence"}, "returned", "decision_request.returned"}
         ] do
       assert {:ok, request} = Dispatch.dispatch(db, handlers, ask)
@@ -982,6 +982,10 @@ defmodule Tightbeam.Firehose.PublisherTest do
       assert %{"class" => "verb.accepted"} = receive_notice()
       notice = receive_notice()
       assert notice["class"] == class
+      assert notice["schemaVersion"] == 2
+      assert notice["resource"] == "decision requests"
+      assert notice["op"] == "upsert"
+      assert notice["refs"] == %{"decisionRequestId" => request.id}
 
       canonical =
         db
@@ -990,6 +994,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
       assert notice["payload"] == canonical
       assert JSON.decode!(Publisher.encode_wire_notice(notice))["payload"] == canonical
+      assert Escalation.raw_by_id(db, request.id).row_schema_revision == 2
 
       if status == "returned" do
         assert canonical["returnedBy"] == "session:agent-reader"
@@ -1005,6 +1010,27 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
       assert observed_classes() == ["verb.accepted"]
     end
+
+    assert {:ok, request} = Dispatch.dispatch(db, handlers, ask)
+    assert observed_state_classes() == ["decision_request.opened"]
+
+    withdraw = %{
+      ask
+      | verb: "withdraw",
+        session_key: nil,
+        params: %{request: request.id, reason: "No longer needed"}
+    }
+
+    assert {:ok, %{status: "withdrawn"}} = Dispatch.dispatch(db, handlers, withdraw)
+    assert %{"class" => "verb.accepted"} = receive_notice()
+    notice = receive_notice()
+    assert notice["class"] == "decision_request.withdrawn"
+    assert notice["schemaVersion"] == 2
+    assert notice["resource"] == "decision requests"
+    assert notice["op"] == "upsert"
+    assert notice["refs"] == %{"decisionRequestId" => request.id}
+    assert notice["payload"]["status"] == "withdrawn"
+    assert Escalation.raw_by_id(db, request.id).row_schema_revision == 2
   end
 
   test "ledger transitions hand off turn notices only after their commits" do

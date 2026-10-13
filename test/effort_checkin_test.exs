@@ -651,13 +651,18 @@ defmodule Tightbeam.EffortCheckinTest do
       Hub.delivered(hub, self())
 
       assert_receive {:firehose_notice,
-                      %{"class" => "decision_request.ruled", "payload" => payload}}
+                      %{"class" => "decision_request.ruled", "payload" => payload} = notice}
 
       assert payload["id"] == request.id
       assert payload["rowVersion"] == canonical.row_version
+      assert notice["schemaVersion"] == 2
+      assert notice["resource"] == "decision requests"
+      assert notice["op"] == "upsert"
+      assert notice["refs"] == %{"decisionRequestId" => request.id}
       assert payload["ownerUserId"] == canonical.owner_user_id
       assert payload["assignmentId"] == item.id
       assert payload["decision"] == @publication_action
+      assert canonical.row_schema_revision == 2
       Hub.delivered(hub, self())
 
       before_generations =
@@ -690,6 +695,88 @@ defmodule Tightbeam.EffortCheckinTest do
       refute_receive {:firehose_notice, _}
       assert {:ok, []} = DB.query(ctx.db, "PRAGMA foreign_key_check")
     end
+  end
+
+  test "effort deadline changes publish the updated R2 decision snapshot", ctx do
+    alias Tightbeam.Firehose.Hub
+
+    item = dispatch(ctx, {:session, "parent"}, "holder", "updated effort")
+    request = escalate(ctx, item.id)
+    start_supervised!({Hub, name: Hub})
+
+    :ok =
+      Hub.register(Hub, self(), %{mode: :filtered, db: ctx.db, user_id: "admin", is_admin: true})
+
+    :ok = Hub.subscribe(Hub, self(), "g6-decision", %{"classes" => ["decision_request."]})
+
+    old_deadline = request.deadline_wake_id
+    assert :ok = EffortCheckin.deadline(ctx.db, ctx.config, Wakes.get(ctx.db, old_deadline))
+    _barrier = Hub.sequence(Hub, self())
+
+    assert_receive {:firehose_notice, notice}
+    assert notice["class"] == "decision_request.updated"
+    assert notice["schemaVersion"] == 2
+    assert notice["resource"] == "decision requests"
+    assert notice["op"] == "upsert"
+    assert notice["refs"] == %{"decisionRequestId" => request.id}
+
+    canonical =
+      ctx.db
+      |> Escalation.raw_by_id(request.id)
+      |> Tightbeam.StateResources.decision_request()
+
+    assert notice["payload"] == canonical
+    assert canonical["deadlineWakeId"] != old_deadline
+    assert Escalation.raw_by_id(ctx.db, request.id).row_schema_revision == 2
+    Hub.delivered(Hub, self())
+    :ok = Hub.unsubscribe(Hub, self(), "g6-decision")
+  end
+
+  test "replacing an open effort request commits superseded before opened", ctx do
+    alias Tightbeam.Firehose.Hub
+
+    item = dispatch(ctx, {:session, "parent"}, "holder", "replacement effort")
+    old = escalate(ctx, item.id)
+    start_supervised!({Hub, name: Hub})
+
+    :ok =
+      Hub.register(Hub, self(), %{mode: :filtered, db: ctx.db, user_id: "admin", is_admin: true})
+
+    :ok = Hub.subscribe(Hub, self(), "g6-decision", %{"classes" => ["decision_request."]})
+
+    assert {:ok, _generation} =
+             DB.transaction(ctx.db, fn txn ->
+               EffortCheckin.arm_in_txn(txn, ctx.config, %{id: item.id, holderKey: "holder"})
+             end)
+
+    replacement = escalate(ctx, item.id)
+    assert replacement.status == "open"
+    assert replacement.id != old.id
+    _barrier = Hub.sequence(Hub, self())
+
+    assert_receive {:firehose_notice,
+                    %{"class" => "decision_request.superseded", "payload" => old_payload} =
+                      old_notice}
+
+    assert old_notice["schemaVersion"] == 2
+    assert old_notice["resource"] == "decision requests"
+    assert old_notice["refs"] == %{"decisionRequestId" => old.id}
+    assert old_payload["status"] == "superseded"
+    Hub.delivered(Hub, self())
+
+    assert_receive {:firehose_notice,
+                    %{"class" => "decision_request.opened", "payload" => new_payload} =
+                      new_notice}
+
+    assert new_notice["schemaVersion"] == 2
+    assert new_notice["resource"] == "decision requests"
+    assert new_notice["refs"] == %{"decisionRequestId" => replacement.id}
+    assert new_payload["status"] == "open"
+    assert new_payload["id"] == replacement.id
+    assert Escalation.raw_by_id(ctx.db, old.id).status == "superseded"
+    assert Escalation.raw_by_id(ctx.db, replacement.id).row_schema_revision == 2
+    Hub.delivered(Hub, self())
+    :ok = Hub.unsubscribe(Hub, self(), "g6-decision")
   end
 
   test "proofs 5 and 8b: continue doubles/caps, effect resets, dismiss refreshes, close supersedes",

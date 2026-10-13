@@ -6,10 +6,32 @@ defmodule Tightbeam.StateVisibility do
 
   @admin_classes ~w(config.updated host_env.updated host.registered user.added user.promoted user.demoted identity.updated kungfu.updated)
   @topline_invalidation_classes ~w(topline.created topline_work_membership.linked topline_work_membership.unlinked)
+  @decision_request_classes ~w(
+    decision_request.opened decision_request.updated decision_request.answered
+    decision_request.returned decision_request.ruled decision_request.consumed
+    decision_request.withdrawn decision_request.superseded
+  )
 
   @spec visible?(DB.server(), map(), map()) :: boolean()
   @spec visible?(DB.server(), map(), String.t(), boolean()) :: boolean()
   @doc "Apply Firehose visibility for a credential-derived session principal."
+  def visible?(db, %{"class" => class, "payload" => item}, %{
+        kind: "session",
+        id: session_key
+      })
+      when class in @decision_request_classes and is_map(item) and is_binary(session_key) and
+             session_key != "" do
+    core_detail_visible?(db, "decision requests", item, %{
+      kind: "session",
+      id: session_key,
+      is_admin: false
+    })
+  end
+
+  def visible?(_db, %{"class" => class}, %{kind: "session"})
+      when class in @decision_request_classes,
+      do: false
+
   def visible?(db, notice, %{kind: "session", id: session_key})
       when is_binary(session_key) and session_key != "" do
     session_principal_notice_visible?(db, notice, session_key)
@@ -20,6 +42,19 @@ defmodule Tightbeam.StateVisibility do
 
   def visible?(_db, _notice, user_id, _is_admin)
       when not is_binary(user_id) or user_id == "", do: false
+
+  def visible?(db, %{"class" => class, "payload" => item}, user_id, is_admin)
+      when class in @decision_request_classes and is_map(item) do
+    core_detail_visible?(db, "decision requests", item, %{
+      kind: "user",
+      id: user_id,
+      is_admin: is_admin
+    })
+  end
+
+  def visible?(_db, %{"class" => class}, _user_id, _is_admin)
+      when class in @decision_request_classes,
+      do: false
 
   def visible?(db, %{"class" => class} = notice, user_id, is_admin)
       when class in @topline_invalidation_classes do

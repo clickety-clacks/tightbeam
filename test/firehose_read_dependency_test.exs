@@ -150,7 +150,7 @@ defmodule Tightbeam.FirehoseReadDependencyTest do
     alias Tightbeam.StateResources
 
     fields =
-      ~w(id kind raiserId raiserSessionKey ownerUserId assignmentId expecterSessionKey expecterUserId lineageRung effortGeneration deadlineWakeId raisedAt deadlineAt statuteName question options context status decision rationale ruledBy ruledAt consumedAt withdrawnBy withdrawnReason withdrawnAt askedOfRole answer answeredBy answeredAt returnedBy returnReason returnedAt rowVersion)
+      ~w(id kind raiserId raiserSessionKey ownerUserId assignmentId expecterSessionKey expecterUserId lineageRung effortGeneration deadlineWakeId raisedAt deadlineAt statuteName question options context status decision rationale ruledBy ruledAt consumedAt withdrawnBy withdrawnReason withdrawnAt askedOfRole answer answeredBy answeredAt returnedBy returnReason returnedAt rowVersion rowSchemaRevision)
 
     raw =
       Map.new(fields, &{&1, nil})
@@ -160,7 +160,8 @@ defmodule Tightbeam.FirehoseReadDependencyTest do
         "question" => "Which path?",
         "status" => "open",
         "raisedAt" => 1,
-        "rowVersion" => 1
+        "rowVersion" => 1,
+        "rowSchemaRevision" => 1
       })
 
     open = StateResources.decision_request(raw)
@@ -171,7 +172,8 @@ defmodule Tightbeam.FirehoseReadDependencyTest do
         "status" => "returned",
         "returnedBy" => "owner",
         "returnReason" => "retry",
-        "returnedAt" => 2
+        "returnedAt" => 2,
+        "rowSchemaRevision" => 2
       })
 
     item = StateResources.decision_request(returned)

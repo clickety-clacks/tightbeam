@@ -2,7 +2,7 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
   @moduledoc false
   import ExUnit.Assertions
   alias Tightbeam.{DB, NoticeBatcher, Schema}
-  @shape "notice-source-storage-v1-019"
+  @shape "decision-request-row-schema-v2-019"
   @row_driven_rules_shape "row-driven-rules-v1-019"
   @identity_render_stamp_previous_shape "effort-request-exit-v1-019"
   @effort_request_exit_previous_shape "notice-batching-v1-019"
@@ -688,6 +688,8 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
                    db,
                    "DROP INDEX notice_source_client_identity; ALTER TABLE wakes DROP COLUMN sourceClientIdentity; ALTER TABLE wakes DROP COLUMN sourceAttachments; ALTER TABLE wakes DROP COLUMN sourceVisibilityScope; ALTER TABLE wakes DROP COLUMN sourceAddress"
                  )
+
+        assert :ok = DB.execute(db, "ALTER TABLE decision_requests DROP COLUMN rowSchemaRevision")
 
         assert {:ok, ^source_before} =
                  DB.query(
