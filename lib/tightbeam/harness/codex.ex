@@ -1118,7 +1118,8 @@ defmodule Tightbeam.Harness.Codex do
             # regardless would pass while the probe called the wrong endpoint.
             "valid_api_key" ->
               if String.contains?(script, "model/list") do
-                {~s({"models":[{"id":"codex-vector","hidden":false,"supportedReasoningEfforts":[]}],"engineVersion":"test"}), 0}
+                {~s({"models":[{"id":"codex-vector","hidden":false,"supportedReasoningEfforts":[]}],"engineVersion":"test"}),
+                 0}
               else
                 unless String.contains?(script, "api.openai.com/v1/models") do
                   raise "codex api-key probe did not call the platform route: #{script}"
@@ -1280,9 +1281,10 @@ defmodule Tightbeam.Harness.Codex do
           case selected_efforts(selected[entry.family]) do
             {:ok, levels} ->
               enriched =
-                %{entry |
-                  efforts: Enum.map(levels, & &1["reasoningEffort"]),
-                  capabilities: %{"supported_reasoning_levels" => levels}
+                %{
+                  entry
+                  | efforts: Enum.map(levels, & &1["reasoningEffort"]),
+                    capabilities: %{"supported_reasoning_levels" => levels}
                 }
 
               {:cont, {:ok, [enriched | qualified]}}

@@ -2224,24 +2224,29 @@ defmodule Tightbeam.Acp.Adapter do
 
   defp public_model_from_label(preset, option) do
     # Claude's wire aliases (for example `opus[1m]`) are not versioned.
-    # Its offered description is, so derive the identity from that description
+    # Its offered label is, so derive the identity from the description or name
     # without a compiled list of model families.
-    description = option["description"] || ""
 
     if "claude-" in preset.canonical_model_prefixes do
-      case Regex.run(
-             ~r/\b([[:alpha:]][[:alnum:]-]*)\s+(\d+)(?:[. -](\d+))?(?=\s|$)/iu,
-             description
-           ) do
-        [_, family, major, minor] when minor not in [nil, ""] ->
-          Model.new("claude-#{String.downcase(family)}-#{major}-#{minor}")
+      Enum.find_value([option["description"], option["name"]], fn
+        label when is_binary(label) ->
+          case Regex.run(
+                 ~r/\b([[:alpha:]][[:alnum:]-]*)\s+(\d+)(?:[. -](\d+))?(?=\s|$)/iu,
+                 label
+               ) do
+            [_, family, major, minor] when minor not in [nil, ""] ->
+              Model.new("claude-#{String.downcase(family)}-#{major}-#{minor}")
 
-        [_, family, major | _] ->
-          Model.new("claude-#{String.downcase(family)}-#{major}")
+            [_, family, major | _] ->
+              Model.new("claude-#{String.downcase(family)}-#{major}")
+
+            _ ->
+              nil
+          end
 
         _ ->
           nil
-      end
+      end)
     else
       nil
     end

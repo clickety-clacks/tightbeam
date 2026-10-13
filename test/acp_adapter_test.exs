@@ -259,6 +259,9 @@ defmodule Tightbeam.Acp.AdapterTest do
       case "claude-fable-5[1m]":
         return { value, name: "Fable", description: "Fable 5 with 1M context" };
       case "nova[1m]":
+        if (failMode === "future-name-only") {
+          return { value, name: "Nova 7.3", description: "1M context" };
+        }
         return { value, name: "Nova (1M context)", description: failMode === "future-alias-drift" ? "Nova 7.2 with 1M context" : "Nova 7.3 with 1M context" };
       default:
         return { value, name: value };
@@ -430,7 +433,7 @@ defmodule Tightbeam.Acp.AdapterTest do
           models[m.params.sessionId] = "opus[1m]";
           return send({ id: m.id, result: configOptions(m.params.sessionId) });
         }
-        if ((failMode === "future-alias" || failMode === "future-alias-drift") &&
+        if ((failMode === "future-alias" || failMode === "future-alias-drift" || failMode === "future-name-only") &&
             m.params.configId === "model" &&
             m.params.value === "claude-nova-7-3") {
           models[m.params.sessionId] = "nova[1m]";
@@ -2445,13 +2448,23 @@ defmodule Tightbeam.Acp.AdapterTest do
            end)
   end
 
+  test "an unseen alias verifies when its version is in the offered name" do
+    {adapter, _capture_path} = start_adapter(harness: :claude, fail_mode: "future-name-only")
+    requested = Model.new("claude-nova-7-3")
+
+    assert {:ok, "sess-1"} =
+             Adapter.new_candidate_session(adapter, requested, "/tmp", [], "guidance")
+
+    assert {:ok, ^requested} = Adapter.current_model(adapter, "sess-1")
+  end
+
   test "an unseen alias naming a different version does not verify the candidate" do
     {adapter, capture_path} = start_adapter(harness: :claude, fail_mode: "future-alias-drift")
 
     assert {:error,
             {:session_prepare_failed,
-             {:runtime_config_mismatch, %Model{family: "nova", context: "1m"}},
-             "sess-1", %{status: "verified"}}} =
+             {:runtime_config_mismatch, %Model{family: "nova", context: "1m"}}, "sess-1",
+             %{status: "verified"}}} =
              Adapter.new_candidate_session(
                adapter,
                Model.new("claude-nova-7-3"),

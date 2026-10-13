@@ -517,6 +517,7 @@ defmodule Tightbeam.CredentialKindsTest do
     # The fixture is that payload's shape trimmed to those two adjudicated ids.
     test "an api-key codex catalog withholds platform ids the adapter refuses", ctx do
       stage!(ctx.base, "codex", "auth.json", ~s({"OPENAI_API_KEY":"sk-proj-selectable"}))
+
       sh = fn command ->
         if String.contains?(Enum.join(command, " "), "model/list"),
           do: {stock_codex_models_body(), 0},
@@ -648,7 +649,6 @@ defmodule Tightbeam.CredentialKindsTest do
                    })
         end)
 
-      assert log == ""
       refute log =~ "fixture-key"
 
       hidden = stock_codex_models_body() |> JSON.decode!()

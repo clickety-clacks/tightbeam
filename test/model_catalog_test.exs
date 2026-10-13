@@ -1982,7 +1982,8 @@ defmodule Tightbeam.ModelCatalogTest do
         send(parent, {:probe, command})
 
         if String.contains?(Enum.join(command, " "), "model/list") do
-          {~s({"models":[{"id":"gpt-5.6-sol","hidden":false,"supportedReasoningEfforts":[{"reasoningEffort":"medium"}]}],"engineVersion":"test"}), 0}
+          {~s({"models":[{"id":"gpt-5.6-sol","hidden":false,"supportedReasoningEfforts":[{"reasoningEffort":"medium"}]}],"engineVersion":"test"}),
+           0}
         else
           catalog_reply(~s({"data":[{"id":"gpt-5.6-sol","object":"model"}]}))
         end
