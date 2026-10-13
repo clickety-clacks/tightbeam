@@ -7002,7 +7002,10 @@ defmodule Tightbeam.GatewayTest do
   test "set_model accepts an arbitrary model id from the current harness catalog", ctx do
     base_dir = role_test_base("set-model-provider-offered")
     Archetypes.load!(base_dir)
-    config = gateway_config(base_dir, ctx.db, 0)
+    config =
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.put(:conn_registry, ctx.registry)
+      |> Map.put(:lane_manager, ctx.lane)
     provider_model = "provider-offered-model-x91"
 
     Org.create(ctx.db, %{
@@ -7029,6 +7032,12 @@ defmodule Tightbeam.GatewayTest do
 
     adapter = start_supervised!({AdapterStub, self()})
     start_supervised!({CoordinatorStub, {adapter, self()}})
+
+    start_supervised!(%{
+      id: :set_model_provider_offered_conn_registry,
+      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+    })
+
     start_lane!(ctx.db, "k-provider-offered")
 
     offered =
