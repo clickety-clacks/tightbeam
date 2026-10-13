@@ -446,6 +446,13 @@ defmodule Tightbeam.Acp.AdapterTest do
           models[m.params.sessionId] = "claude-fable-5[1m]";
           return send({ id: m.id, result: configOptions(m.params.sessionId) });
         }
+        if (failMode === "fork-mode-fail" &&
+            m.params.configId === "model" &&
+            m.params.sessionId.startsWith("sess-fork-") &&
+            m.params.value === "claude-sonnet-5") {
+          models[m.params.sessionId] = "sonnet";
+          return send({ id: m.id, result: configOptions(m.params.sessionId) });
+        }
         if ((failMode === "future-alias" || failMode === "future-alias-drift" || failMode === "future-name-only" || failMode === "future-alias-fork-effort-drift") &&
             m.params.configId === "model" &&
             m.params.value === "claude-nova-7-3[1m]") {
