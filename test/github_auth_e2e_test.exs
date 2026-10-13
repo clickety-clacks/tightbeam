@@ -126,7 +126,7 @@ defmodule Tightbeam.GithubAuthE2ETest do
 
     metadata = File.read!(metadata_path)
     refute metadata =~ @secret
-    refute metadata =~ config_dir
+    assert metadata =~ config_dir
     assert metadata =~ ~s("storage": "file")
     assert metadata =~ ~s("status": "live")
 
@@ -402,7 +402,7 @@ defmodule Tightbeam.GithubAuthE2ETest do
       |> File.read!()
 
     refute metadata =~ @secret
-    refute metadata =~ GithubAuth.config_dir(ctx.local)
+    assert metadata =~ GithubAuth.config_dir(ctx.local)
   end
 
   test "placement projects the host-local bank into local and satellite agents", ctx do

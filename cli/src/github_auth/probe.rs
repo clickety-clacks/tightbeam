@@ -386,6 +386,7 @@ fn write_metadata(
         "status": status.state.as_str(),
         "source": "gh",
         "storage": "file",
+        "config_dir": gh_config_dir(base_dir),
     });
     fs::write(
         &path,

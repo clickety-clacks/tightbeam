@@ -4913,6 +4913,7 @@ defmodule Tightbeam.GatewayTest do
          "PATH",
          "CLAUDE_CONFIG_DIR",
          "CODEX_HOME",
+         "GH_CONFIG_DIR",
          "TIGHTBEAM_URL"
        ] ++ declared_credentials)
       |> Enum.uniq()
@@ -4932,6 +4933,19 @@ defmodule Tightbeam.GatewayTest do
       assert message =~ "reserved_env_name rule"
       assert message =~ name
     end
+
+    assert %{code: "reserved_env_name", message: github_message} =
+             set.(%{
+               origin: "user:flynn",
+               params: %{
+                 host: host,
+                 harness: "claude",
+                 name: "GH_CONFIG_DIR",
+                 value: "example"
+               }
+             })
+
+    assert github_message =~ "tightbeam onboard github"
 
     assert %{code: "invalid_env_name", message: invalid_message} =
              set.(%{

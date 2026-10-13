@@ -271,6 +271,18 @@ defmodule Tightbeam.IdentityTest do
     assert coder.guidance =~ "Independent review may start before tests pass"
     assert coder.guidance =~ "completion still needs verified evidence"
     assert coder.guidance =~ "A card is the unit of review"
+
+    capabilities = File.read!(Path.join(shipped, "capabilities.md"))
+    assert capabilities =~ "GitHub auth looks missing"
+    assert capabilities =~ "$TIGHTBEAM_HOME/auth/github/gh"
+
+    # The evidence recipe is product documentation. The served bundle points to it
+    # without copying the recipe into every archetype's guidance.
+    github_auth = File.read!(Path.expand("docs/GITHUB-AUTH.md"))
+    assert capabilities =~ "docs/GITHUB-AUTH.md"
+    assert github_auth =~ "Attach this mandatory evidence block to the ask:"
+    assert github_auth =~ "projection-broken-stale-overlay"
+    assert github_auth =~ "projection-broken-session-predates-reservation"
   end
 
   test "init refuses an identity repository missing the live ref with repair guidance", ctx do

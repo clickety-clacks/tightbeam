@@ -111,22 +111,26 @@ Suggested metadata path:
 auth/github/<hostname>/.tightbeam/capability.json
 ```
 
-Suggested metadata fields:
+Capability metadata contains ten fields:
 
 ```json
 {
   "hostname": "github.com",
   "account": "gdiab",
   "git_protocol": "https",
-  "checked_at": "2026-08-15T00:00:00Z",
+  "git_remote": "https://github.com/example/repository.git",
+  "git_ready": true,
+  "checked_at_unix": 1788566400,
   "status": "live",
   "source": "gh",
-  "storage": "file"
+  "storage": "file",
+  "config_dir": "/home/example/.tightbeam/auth/github/gh"
 }
 ```
 
-Do not store tokens, token hashes, keychain paths, or `gh auth status
---show-token` output.
+`config_dir` is a path to the banked store. It is not a credential. Do not
+store tokens, token hashes, keychain paths, the store's contents, or `gh auth
+status --show-token` output.
 
 ## Onboarding
 
@@ -282,6 +286,63 @@ report GitHub as unavailable instead of falling back to PAT prompts.
 For remote sessions, do not assume the gateway's `HOME`, keychain, or
 `~/.config/gh` applies. The remote host must pass its own readiness probe.
 
+### Evidence before escalating GitHub access
+
+Before filing an `operator-ask` that claims GitHub auth or write access is
+missing, run the evidence recipe from the environment where the operation will
+actually run. Usually, this is the agent's own shell. For a different host, use
+a session on that host and attach its result.
+
+1. Compare the projected `$GH_CONFIG_DIR` with
+   `$TIGHTBEAM_HOME/auth/github/gh`.
+2. Run `gh auth status --active --hostname <host>`.
+3. If the operation has a remote, run `git ls-remote <remote> HEAD`.
+
+The live probe is authoritative. The capability metadata under
+`$TIGHTBEAM_HOME/auth/github/<host>/.tightbeam/capability.json` is supporting
+evidence only. A stale `live` fact cannot suppress a genuine escalation.
+
+If the two paths differ, do not treat the probe as an auth verdict. Treat an
+absent projected path plus a `live` capability fact the same way. On a release
+without the `GH_CONFIG_DIR` reservation, diagnose
+`projection-broken-stale-overlay` and repair the stored overlay with
+`tightbeam host-env-unset --host <host> --harness <harness> GH_CONFIG_DIR` or by
+fixing it. If the release includes the reservation but the session started
+before that release was installed, diagnose
+`projection-broken-session-predates-reservation` and restart or respawn the
+session. The restarted session ignores the stale overlay, so an unset is not
+required. Neither branch needs onboarding or a PAT.
+
+With a matching projection, keep the probe's actual state and failed phase:
+
+| State | Diagnosis and next step |
+| --- | --- |
+| `needs_onboarding` | `needs-onboarding` only when the probe demonstrates that no active authenticated account is usable; run `tightbeam onboard github --hostname <host>`. |
+| `missing_cli` | `missing-cli`; restore `gh` on the operation host's supported `PATH`, then probe again. |
+| `insufficient_scope` | `insufficient-scope`; report the refused operation and required grant to the operator for a scoped repair, then probe again. |
+| `git_unready` | `git-unready`; repair the remote, protocol, or credential helper identified by `git ls-remote`, then probe again. |
+| `unknown` | `unknown`; report the failed phase and reason (including a timeout or transport failure) as unresolved, then diagnose that cause before another bounded probe. Do not infer missing authentication. |
+
+The live probe, not a stale capability fact, selects the row. Never ask for a
+PAT. A matching bank with a timed-out `gh auth status` is `unknown`, not
+`needs-onboarding`; a live `gh` result followed by a failed `git ls-remote` is
+`git-unready` only when that phase establishes a Git-specific failure.
+
+Attach this mandatory evidence block to the ask:
+
+- projected `$GH_CONFIG_DIR` path;
+- expected `$TIGHTBEAM_HOME/auth/github/gh` path;
+- `MATCH` or `MISMATCH`;
+- live-probe state, failed phase and nonsecret reason, and account if known;
+- diagnosis: `projection-broken-stale-overlay`,
+  `projection-broken-session-predates-reservation`, `needs-onboarding`,
+  `missing-cli`, `insufficient-scope`, `git-unready`, or `unknown`;
+- state-appropriate repair command, or the unresolved diagnostic for `unknown`.
+
+Record paths and state only. Never record token bytes or `hosts.yml` contents.
+`tightbeam github-auth-check` is the rails hook that guards tool calls. It is
+not the command that gathers this evidence.
+
 The following names are reserved for future policy, not required by this spec:
 
 - `TIGHTBEAM_GITHUB_HOST`
@@ -388,6 +449,11 @@ temporary directory. They do not contact GitHub. The timeout row takes about 32
 seconds because both the Rust and Elixir probes exercise the real 15-second
 deadline.
 
+Use the fixture E2E's probe-states row for the empty-bank
+`needs_onboarding` case. Do not create an empty live bank for this smoke. The
+well-formed-ask half is a check of the mandatory evidence-block guidance above;
+it is not a mechanism smoke.
+
 The 0.1.8 GitHub E2E inventory is:
 
 | Row | Required evidence |
@@ -397,7 +463,7 @@ The 0.1.8 GitHub E2E inventory is:
 | Environment projection | Local adapter options and satellite SSH commands receive the correct host-local `GH_CONFIG_DIR` and `TIGHTBEAM_MACHINE`. No token bytes are projected. |
 | Refusal and repair | A GitHub operation is refused before `git` runs. The refusal names host, hostname, failed phase, state, exact onboarding command, and the no-PAT rule. Quoted brief text and description prose do not trigger the guard. |
 | Probe states | Fixture probes prove `live`, `needs_onboarding`, `insufficient_scope`, `git_unready`, and timeout or provider failure as `unknown`. Unknown never authorizes work. |
-| Redaction and agreement | Rust and Elixir classify the same API failures. Refusals, doctor output, JSON, and capability metadata omit fixture secrets and bank paths. |
+| Redaction and agreement | Rust and Elixir classify the same API failures. All outputs omit fixture secrets. Capability metadata and onboarding success JSON contain only the PATH-only `config_dir` or `configDir`; refusals and doctor output do not disclose bank paths. |
 
 The later installed-build live E2E should use **tars**, the sanctioned
 non-production macOS gateway test host. It must run only after separate authority
