@@ -1030,9 +1030,15 @@ defmodule Tightbeam.Acp.Adapter do
   defp apply_fork_model(state, sid, %Model{} = model, offered, request_timeout) do
     with {:ok, model_result} <-
            apply_fork_model_candidates(state, sid, model, offered, request_timeout),
-         {:ok, _verified_result} <-
+         {:ok, verified_result} <-
            apply_verified_effort(state, sid, model.effort, model_result, request_timeout) do
-      {:ok, model}
+      case confirmed_public_model(verified_result, state.preset, model) do
+        %Model{} ->
+          {:ok, model}
+
+        nil ->
+          verified_model_mismatch(verified_result, state.preset, "model", Model.to_ref(model))
+      end
     end
   end
 

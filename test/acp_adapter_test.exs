@@ -316,7 +316,7 @@ defmodule Tightbeam.Acp.AdapterTest do
         const sid = gateMode !== "none" && gateMode !== "delay-setup" && newCalls === 1 ? "probe-sess" : "sess-1";
         models[sid] = models[sid] || "haiku";
         offeredModels[sid] = [...defaultOfferedModels];
-        if (failMode === "resident-default-context-variant") offeredModels[sid].push("orbit-9[1m]");
+        if (failMode === "resident-default-context-variant" || failMode === "fork-effort-context-drift") offeredModels[sid].push("orbit-9[1m]");
         if (gateMode === "delay-setup") return setTimeout(() => send({ id: m.id, result: { sessionId: sid, ...configOptions(sid) } }), 75);
         return send({ id: m.id, result: { sessionId: sid, ...configOptions(sid) } });
       }
@@ -335,6 +335,7 @@ defmodule Tightbeam.Acp.AdapterTest do
         const sid = "sess-fork-" + forkCalls;
         models[sid] = models[m.params.sessionId] || "haiku";
         offeredModels[sid] = [...defaultOfferedModels];
+        if (failMode === "fork-effort-context-drift") offeredModels[sid].push("orbit-9[1m]");
         return send({ id: m.id, result: { sessionId: sid, ...configOptions(sid) } });
       }
       case "session/close": capture(m); return send({ id: m.id, result: {} });
@@ -466,6 +467,13 @@ defmodule Tightbeam.Acp.AdapterTest do
           return send({ id: m.id, result: configOptions(m.params.sessionId) });
         }
         if (failMode === "candidate-concrete-default-effort" && m.params.configId === "effort") {
+          return send({ id: m.id, result: configOptions(m.params.sessionId) });
+        }
+        if (failMode === "fork-effort-context-drift" &&
+            m.params.configId === "reasoning_effort" &&
+            m.params.sessionId.startsWith("sess-fork-")) {
+          models[m.params.sessionId] = "orbit-9[1m]";
+          efforts[m.params.sessionId] = m.params.value;
           return send({ id: m.id, result: configOptions(m.params.sessionId) });
         }
         if (m.params.configId === "model") models[m.params.sessionId] = m.params.value;
@@ -2508,13 +2516,37 @@ defmodule Tightbeam.Acp.AdapterTest do
     refute Enum.any?(captured_requests(capture_path), &(&1["method"] == "session/fork"))
   end
 
+  test "a fork refuses a context change in the final effort readback" do
+    {adapter, capture_path} = start_adapter(harness: :codex, fail_mode: "fork-effort-context-drift")
+    requested = Model.new("orbit-9", effort: "high")
+
+    assert {:ok, "sess-1"} =
+             Adapter.new_candidate_session(adapter, requested, "/tmp", [], "guidance")
+
+    result = Adapter.switch_model_session(adapter, "sess-1", requested, "/tmp", [], "guidance")
+
+    assert {:error,
+            {:model_apply_failed,
+             {:runtime_config_mismatch, %Model{family: "orbit-9", context: "1m"}}}} =
+             ErrorDiagnostic.classified(result)
+
+    assert %{"cleanup" => %{"status" => "verified", "sessionId" => "sess-fork-1"}} =
+             ErrorDiagnostic.of(result)
+
+    assert {:ok, ^requested} = Adapter.current_model(adapter, "sess-1")
+
+    assert Enum.any?(captured_requests(capture_path), fn request ->
+             request["method"] == "session/close" and request["sessionId"] == "sess-fork-1"
+           end)
+  end
+
   test "an opaque Claude alias refuses a variant when default context was requested" do
     {adapter, capture_path} =
       start_adapter(harness: :claude, fail_mode: "canonical-opus55-alias")
 
     assert {:error,
             {:session_prepare_failed,
-             {:runtime_config_mismatch, %Model{family: "claude-opus-5-5", context: "1m"}},
+             {:runtime_config_mismatch, %Model{family: "opus", context: "1m"}},
              "sess-1", %{status: "verified"}}} =
              Adapter.new_candidate_session(
                adapter,
@@ -2588,7 +2620,7 @@ defmodule Tightbeam.Acp.AdapterTest do
              %{status: "verified"}}} =
              Adapter.new_candidate_session(
                adapter,
-               Model.new("claude-nova-7-3"),
+               Model.new("claude-nova-7-3", context: "1m"),
                "/tmp",
                [],
                "guidance"
