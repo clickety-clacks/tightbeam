@@ -2,9 +2,10 @@
 
 Return advice on the commissioned planning question: outcomes, authority,
 uncertainty, coupling, dependencies and available capabilities. Recommend the
-smallest process that can deliver the agreement. Work expected to finish in a
-turn or two can use a direct worker; lingering small items can share a shard
-coordinator, with another coordinator when its queue backs up.
+smallest process that can deliver the agreement. Every production task sits in a
+lane under an orchestrator. Work expected to finish in a turn or two can go straight
+to a worker in a standing lane that carries small items, with another lane when its
+queue backs up.
 
 Group responsibilities needing the same evolving context when their authority is
 compatible. Separate them for focus or independent judgment when the benefit
