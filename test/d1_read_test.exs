@@ -74,7 +74,8 @@ defmodule Tightbeam.D1ReadRouteTest do
   import Plug.Conn
   import Plug.Test
 
-  alias Tightbeam.{D1Read, DB, Devices, Harness, Identity, Org, Placement, Schema}
+  alias Tightbeam.{D1Read, DB, Devices, Escalation, Harness, Identity, Org, Placement, Schema}
+  alias Tightbeam.StateResources
   alias Tightbeam.Wire.Router
 
   setup do
@@ -342,12 +343,58 @@ defmodule Tightbeam.D1ReadRouteTest do
     assert decoded["page"]["hasMoreBefore"]
     refute decoded["page"]["hasMoreAfter"]
 
+    encoded_items =
+      Enum.map_join(decoded["items"], ",", fn item ->
+        StateResources.encode_item("decision requests", item, %{})
+      end)
+
+    assert first.resp_body =~ "\"items\":[#{encoded_items}],\"page\":"
+
+    query_page =
+      Escalation.page_collection(
+        ctx.db,
+        %{"kind" => ["statute"]},
+        %{kind: "user", id: "admin", is_admin: true},
+        :latest,
+        2
+      )
+
+    assert Enum.map(query_page.rows, & &1.id) == ["dr_page_2", "dr_page_3"]
+    assert query_page.candidate_count == 3
+    assert query_page.flags == %{has_more_before: true, has_more_after: false}
+
     older_cursor = decoded["page"]["oldestCursor"]
     older_path = "/api/decision-requests?kind=statute&limit=2&before=#{older_cursor}"
     older = get(ctx.opts, older_path, ctx.admin.token)
 
     assert Enum.map(JSON.decode!(older.resp_body)["items"], & &1["id"]) == ["dr_page_1"]
     assert get(ctx.opts, "/api/decision-requests?status=unknown", ctx.admin.token).status == 400
+
+    for {id, owner_user_id, raised_at} <- [
+          {"dr_hidden_1", "admin", 100},
+          {"dr_hidden_2", "admin", 200},
+          {"dr_owner_visible", "operator", 40}
+        ] do
+      {:ok, _rows} =
+        DB.query(
+          ctx.db,
+          """
+          INSERT INTO decision_requests
+            (id, kind, raiserId, ownerUserId, raisedAt, deadlineAt, statuteName,
+             actionKey, question, context, status)
+          VALUES (?1, 'statute', 'user:admin', ?2, ?3, ?4, ?5,
+                  'read', 'Allow the read?', '{}', 'open')
+          """,
+          [id, owner_user_id, raised_at, raised_at + 60_000, id]
+        )
+    end
+
+    owner_page =
+      get(ctx.opts, "/api/decision-requests?kind=statute&limit=1", ctx.operator.token)
+
+    assert Enum.map(JSON.decode!(owner_page.resp_body)["items"], & &1["id"]) == [
+             "dr_owner_visible"
+           ]
   end
 
   test "session asUser distinguishes absent, empty, matching, and unauthorized identities", ctx do

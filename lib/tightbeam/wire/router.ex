@@ -1188,16 +1188,39 @@ defmodule Tightbeam.Wire.Router do
     |> Enum.sort_by(&[&1["createdAt"], &1["id"]])
   end
 
-  defp d1_decision_request_rows(conn, filters, principal) do
-    db = db(conn)
+  defp d1_decision_request_page(conn, request, boundary, principal, spec) do
+    result =
+      Tightbeam.Escalation.page_collection(
+        db(conn),
+        request.filters,
+        principal,
+        boundary,
+        request.limit
+      )
 
-    db
-    |> Tightbeam.Escalation.raw_collection(filters)
-    |> Enum.filter(fn row ->
-      Tightbeam.StateVisibility.core_detail_visible?(db, "decision requests", row, principal)
-    end)
-    |> Enum.map(&StateResources.decision_request/1)
-    |> Enum.sort_by(&[&1["raisedAt"], &1["id"]])
+    items = Enum.map(result.rows, &StateResources.decision_request/1)
+    tuples = Enum.map(items, &d1_row_tuple(:decision_requests, &1))
+
+    page =
+      case tuples do
+        [] ->
+          %{
+            oldest: nil,
+            newest: nil,
+            before: result.flags.has_more_before,
+            after: result.flags.has_more_after
+          }
+
+        _ ->
+          %{
+            oldest: d1_cursor(hd(tuples), "before", request.filters, principal, spec, conn),
+            newest: d1_cursor(List.last(tuples), "after", request.filters, principal, spec, conn),
+            before: result.flags.has_more_before,
+            after: result.flags.has_more_after
+          }
+      end
+
+    {items, page}
   end
 
   defp d1_row_tuple(:work_items, item),
@@ -1208,7 +1231,9 @@ defmodule Tightbeam.Wire.Router do
 
   defp d1_row_tuple(resource, item), do: D1Read.tuple(resource, item)
   defp d1_encode(:work_items, item), do: StateResources.encode_item("work items", item, %{})
-  defp d1_encode(:decision_requests, item), do: JSON.encode!(item)
+  defp d1_encode(:decision_requests, item),
+    do: StateResources.encode_item("decision requests", item, %{})
+
   defp d1_encode(resource, item), do: D1Read.encode(resource, item)
 
   defp d1_collection(conn, spec) do
@@ -1217,23 +1242,25 @@ defmodule Tightbeam.Wire.Router do
          {:ok, principal} <- d1_principal(auth, query, conn),
          {:ok, request} <- d1_collection_request(query, spec),
          {:ok, boundary} <- d1_boundary(request, principal, spec, conn) do
-      rows =
-        cond do
-          spec.resource == "work items" ->
-            d1_work_item_rows(conn, request.filters, principal)
+      if d1_resource(spec) == :decision_requests do
+        {items, page} = d1_decision_request_page(conn, request, boundary, principal, spec)
+        d1_send(conn, 200, d1_collection_envelope(spec, items, page))
+      else
+        rows =
+          cond do
+            spec.resource == "work items" ->
+              d1_work_item_rows(conn, request.filters, principal)
 
-          spec.resource == "decision requests" ->
-            d1_decision_request_rows(conn, request.filters, principal)
+            D1Read.visible?(d1_resource(spec), principal.is_admin) ->
+              D1Read.collection(db(conn), deps(conn).base_dir, d1_resource(spec), request.filters)
 
-          D1Read.visible?(d1_resource(spec), principal.is_admin) ->
-            D1Read.collection(db(conn), deps(conn).base_dir, d1_resource(spec), request.filters)
+            true ->
+              []
+          end
 
-          true ->
-            []
-        end
-
-      {items, page} = d1_page(rows, boundary, request, principal, spec, conn)
-      d1_send(conn, 200, d1_collection_envelope(spec, items, page))
+        {items, page} = d1_page(rows, boundary, request, principal, spec, conn)
+        d1_send(conn, 200, d1_collection_envelope(spec, items, page))
+      end
     else
       {:error, status, code, message} -> d1_error(conn, spec.resource, status, code, message)
     end
