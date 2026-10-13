@@ -228,8 +228,8 @@ defmodule Tightbeam.Acp.AdapterTest do
   const fastValues = {};
   const offeredModels = {};
   const defaultOfferedModels = [
-    "default", "opus[1m]", "claude-fable-5[1m]", "sonnet", "haiku",
-    "gpt-old", "gpt-new", "gpt-blocking", "gpt-5.6-sol"
+    "default", "opus[1m]", "claude-fable-5[1m]", "nova[1m]", "sonnet", "haiku",
+    "gpt-old", "gpt-new", "gpt-blocking", "gpt-5.6-sol", "orbit-9"
   ];
   // Cursor's live grammar, recorded 2026-08-24: a closed enum of decorated
   // wire values whose option name is the public ref; anything else is -32602.
@@ -258,6 +258,8 @@ defmodule Tightbeam.Acp.AdapterTest do
         return { value, name: "Haiku", description: "Haiku 4.5" };
       case "claude-fable-5[1m]":
         return { value, name: "Fable", description: "Fable 5 with 1M context" };
+      case "nova[1m]":
+        return { value, name: "Nova (1M context)", description: failMode === "future-alias-drift" ? "Nova 7.2 with 1M context" : "Nova 7.3 with 1M context" };
       default:
         return { value, name: value };
     }
@@ -426,6 +428,12 @@ defmodule Tightbeam.Acp.AdapterTest do
             m.params.configId === "model" &&
             m.params.value === "claude-opus-5-5") {
           models[m.params.sessionId] = "opus[1m]";
+          return send({ id: m.id, result: configOptions(m.params.sessionId) });
+        }
+        if ((failMode === "future-alias" || failMode === "future-alias-drift") &&
+            m.params.configId === "model" &&
+            m.params.value === "claude-nova-7-3") {
+          models[m.params.sessionId] = "nova[1m]";
           return send({ id: m.id, result: configOptions(m.params.sessionId) });
         }
 
@@ -2393,6 +2401,66 @@ defmodule Tightbeam.Acp.AdapterTest do
              [{"model", "claude-opus-5-5"}, {"effort", "high"}]
 
     refute Enum.any?(captured_requests(capture_path), fn request ->
+             request["method"] == "session/close" and request["sessionId"] == "sess-1"
+           end)
+  end
+
+  test "an unseen offered Claude model verifies across harnesses and after a same-harness fork" do
+    {adapter, capture_path} = start_adapter(harness: :claude, fail_mode: "future-alias")
+    requested = Model.new("claude-nova-7-3", effort: "high")
+
+    assert {:ok, "sess-1"} =
+             Adapter.new_candidate_session(adapter, requested, "/tmp", [], "guidance")
+
+    assert {:ok, ^requested} = Adapter.current_model(adapter, "sess-1")
+    assert {:ok, offered} = Adapter.switchable_models(adapter, "sess-1")
+    assert Model.new("claude-nova-7-3") in offered
+    assert {:ok, _turn} = Adapter.prompt(adapter, "sess-1", "persist this conversation")
+
+    assert {:ok, "sess-fork-1"} =
+             Adapter.switch_model_session(adapter, "sess-1", requested, "/tmp", [], "guidance")
+
+    assert {:ok, ^requested} = Adapter.current_model(adapter, "sess-fork-1")
+
+    assert Enum.count(captured_requests(capture_path), fn request ->
+             request["method"] == "session/set_config_option" and
+               request["configId"] == "model" and request["value"] == "claude-nova-7-3"
+           end) == 2
+  end
+
+  test "an unseen offered Codex model verifies as a cross-harness candidate" do
+    {adapter, capture_path} = start_adapter(harness: :codex)
+    requested = Model.new("orbit-9", effort: "high")
+
+    assert {:ok, "sess-1"} =
+             Adapter.new_candidate_session(adapter, requested, "/tmp", [], "guidance")
+
+    assert {:ok, ^requested} = Adapter.current_model(adapter, "sess-1")
+    assert {:ok, offered} = Adapter.switchable_models(adapter, "sess-1")
+    assert Model.new("orbit-9") in offered
+
+    assert Enum.any?(captured_requests(capture_path), fn request ->
+             request["method"] == "session/set_config_option" and
+               request["configId"] == "model" and request["value"] == "orbit-9"
+           end)
+  end
+
+  test "an unseen alias naming a different version does not verify the candidate" do
+    {adapter, capture_path} = start_adapter(harness: :claude, fail_mode: "future-alias-drift")
+
+    assert {:error,
+            {:session_prepare_failed,
+             {:runtime_config_mismatch, %Model{family: "nova", context: "1m"}},
+             "sess-1", %{status: "verified"}}} =
+             Adapter.new_candidate_session(
+               adapter,
+               Model.new("claude-nova-7-3"),
+               "/tmp",
+               [],
+               "guidance"
+             )
+
+    assert Enum.any?(captured_requests(capture_path), fn request ->
              request["method"] == "session/close" and request["sessionId"] == "sess-1"
            end)
   end

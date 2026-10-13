@@ -1759,19 +1759,12 @@ defmodule Tightbeam.Acp.Adapter do
             end) do
       case model_ref_from_config(effort_result, effort_config) do
         {:ok, applied_model} ->
-          # Claude reports the canonical Opus 5.5 selection as `opus[1m]`.
-          # Accept that alias only when its public option still names 5.5;
-          # an Opus 5 readback must remain a mismatch.
-          case {model_ref, applied_model} do
-            {%Model{family: "claude-opus-5-5", context: nil},
-             %Model{family: "opus", context: "1m"}} ->
-              if readback_confirms_model?(effort_result, state.preset, model_ref),
-                do: {:ok, %{model_ref | effort: applied_model.effort}},
-                else: {:ok, applied_model}
-
-            _ ->
-              {:ok, applied_model}
-          end
+          # Some clients return an opaque wire alias after accepting a public
+          # model ref. Trust the selected offered option only when it names the
+          # requested model and context; never infer identity from the alias.
+          if readback_confirms_model?(effort_result, state.preset, model_ref),
+            do: {:ok, %{model_ref | effort: applied_model.effort}},
+            else: {:ok, applied_model}
 
         :error ->
           unconfirmed = readback_node(effort_result, "model", Model.to_ref(model_ref), "readback")
@@ -2205,10 +2198,6 @@ defmodule Tightbeam.Acp.Adapter do
       ^value -> %{"value" => value, "name" => value}
       _ -> nil
     end)
-    |> case do
-      nil -> %{"value" => value, "name" => value}
-      option -> option
-    end
   end
 
   defp public_option_model(preset, %{"value" => value} = option) when is_binary(value) do
@@ -2223,25 +2212,38 @@ defmodule Tightbeam.Acp.Adapter do
           not Map.has_key?(Map.get(preset, :model_option_aliases, %{}), value) ->
         Model.parse_ref(option["name"])
 
+      option["name"] == value and String.contains?(value, "-") ->
+        Model.parse_ref(value)
+
       true ->
-        public_model_from_label(option)
+        public_model_from_label(preset, option)
     end
   end
 
   defp public_option_model(_preset, _option), do: nil
 
-  defp public_model_from_label(option) do
-    label = Enum.join([option["name"], option["description"]], " ")
+  defp public_model_from_label(preset, option) do
+    # Claude's wire aliases (for example `opus[1m]`) are not versioned.
+    # Its offered description is, so derive the identity from that description
+    # without a compiled list of model families.
+    description = option["description"] || ""
 
-    case Regex.run(~r/\b(opus|sonnet|haiku|fable)\s+(\d+)(?:[. -](\d+))?/i, label) do
-      [_, family, major, minor] when minor not in [nil, ""] ->
-        Model.new("claude-#{String.downcase(family)}-#{major}-#{minor}")
+    if "claude-" in preset.canonical_model_prefixes do
+      case Regex.run(
+             ~r/\b([[:alpha:]][[:alnum:]-]*)\s+(\d+)(?:[. -](\d+))?(?=\s|$)/iu,
+             description
+           ) do
+        [_, family, major, minor] when minor not in [nil, ""] ->
+          Model.new("claude-#{String.downcase(family)}-#{major}-#{minor}")
 
-      [_, family, major | _] ->
-        Model.new("claude-#{String.downcase(family)}-#{major}")
+        [_, family, major | _] ->
+          Model.new("claude-#{String.downcase(family)}-#{major}")
 
-      _ ->
-        nil
+        _ ->
+          nil
+      end
+    else
+      nil
     end
   end
 

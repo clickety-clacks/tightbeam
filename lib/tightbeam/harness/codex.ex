@@ -2,8 +2,6 @@ defmodule Tightbeam.Harness.Codex do
   @moduledoc false
   @behaviour Tightbeam.Harness
 
-  require Logger
-
   alias Tightbeam.Harness.Support
   alias Tightbeam.{ErrorDiagnostic, Model, Placement}
 
@@ -29,15 +27,13 @@ defmodule Tightbeam.Harness.Codex do
   # VERIFIED WITH A VALID KEY 2026-07-28 (the #89 api-key exercise, throwaway
   # org): the route answered 200 with 125 bare ids in the platform shape
   # `derive_platform_entries/1` decodes, and codex-acp ran a real turn on
-  # api-key auth (gpt-5.6-sol[medium]). What the exercise DISPROVED is that the
-  # adapter accepts everything this route lists — see
-  # `@adapter_selectable_models` below.
+  # api-key auth (gpt-5.6-sol[medium]). The provider route alone does not
+  # prove that the selected Codex engine offers every listed model.
   @api_models_url "https://api.openai.com/v1/models"
 
-  # Candidate values for the API-key catalog. The platform route lists the
-  # account's whole model universe; the stock adapter accepts only models its
-  # selected Codex engine returns from ordinary `model/list`. Astra is checked
-  # against that exact executable at discovery time before it is advertised.
+  # The platform route lists the account's whole model universe; the stock
+  # adapter accepts only models its selected Codex engine returns from ordinary
+  # `model/list`. Discovery intersects those two live sets by exact ID.
   #
   # RECORDED LIVE 2026-07-28 (the #89 api-key exercise, throwaway org,
   # codex-acp 1.1.4): GET /v1/models answered 125 bare ids; the adapter REFUSED
@@ -46,13 +42,8 @@ defmodule Tightbeam.Harness.Codex do
   # auth. `gpt-5.1-codex` is spelled exactly like a codex slug and was refused
   # anyway, so a platform id is NOT translatable into the adapter's vocabulary
   # by any mapping this repo can compute from spelling — substituting a
-  # near-miss would be the silent-downgrade `harness/claude.ex` refuses. Hence a
-  # FILTER to the bounded candidate set for the platform route.
-  #
-  # Injectable (`codex_selectable_models` in the catalog's options, `:all` to
-  # disable) for the existing catalog tests. This is a scope filter, not a claim
-  # that every selected engine offers both values.
-  @adapter_selectable_models ~w(gpt-5.6-sol gpt-6-astra)
+  # near-miss would be the silent-downgrade `harness/claude.ex` refuses. Hence
+  # provider IDs are intersected with the selected engine's offered IDs.
 
   # The gate probe's own model, as fields — it crosses the adapter seam like any
   # other selection.
@@ -62,12 +53,6 @@ defmodule Tightbeam.Harness.Codex do
 
   @doc false
   def adapter_version, do: @adapter_version
-
-  @doc """
-  Bounded API-key candidates. Astra still needs a matching selected-engine
-  `model/list` result before `fetch_catalog/1` admits it.
-  """
-  def adapter_selectable_models, do: @adapter_selectable_models
 
   @impl true
   def id, do: :codex
@@ -673,8 +658,7 @@ defmodule Tightbeam.Harness.Codex do
       {:ok, body, trailer} ->
         with {:ok, models} <- decode_catalog(kind, body),
              {:ok, entries} <- derive_catalog_entries(kind, models),
-             entries <- keep_selectable(entries, selectable_models(state, kind)),
-             {:ok, entries} <- qualify_api_key_astra(state, kind, entries),
+             {:ok, entries} <- qualify_selected_engine(state, kind, entries),
              entries when entries != [] <- entries do
           {:ok, entries}
         else
@@ -782,8 +766,7 @@ defmodule Tightbeam.Harness.Codex do
       } else if (reply.id === requestId) {
         if (!reply.result || !Array.isArray(reply.result.data))
           return finish({error: "model_list_failed"});
-        models.push(...reply.result.data.filter(model =>
-          model && (model.id === "gpt-6-astra" || model.id === "gpt-5.6-sol")));
+        models.push(...reply.result.data);
         const cursor = reply.result.nextCursor;
         if (cursor === null || cursor === undefined)
           return finish({models, engineVersion: version});
@@ -1134,19 +1117,23 @@ defmodule Tightbeam.Harness.Codex do
             # the route and the credential field, and a stand-in that answered
             # regardless would pass while the probe called the wrong endpoint.
             "valid_api_key" ->
-              unless String.contains?(script, "api.openai.com/v1/models") do
-                raise "codex api-key probe did not call the platform route: #{script}"
-              end
+              if String.contains?(script, "model/list") do
+                {~s({"models":[{"id":"codex-vector","hidden":false,"supportedReasoningEfforts":[]}],"engineVersion":"test"}), 0}
+              else
+                unless String.contains?(script, "api.openai.com/v1/models") do
+                  raise "codex api-key probe did not call the platform route: #{script}"
+                end
 
-              unless String.contains?(script, "OPENAI_API_KEY") do
-                raise "codex api-key probe did not read the native api-key field: #{script}"
-              end
+                unless String.contains?(script, "OPENAI_API_KEY") do
+                  raise "codex api-key probe did not read the native api-key field: #{script}"
+                end
 
-              if String.contains?(script, "codex --version") do
-                raise "codex api-key probe asked for a client_version the route ignores"
-              end
+                if String.contains?(script, "codex --version") do
+                  raise "codex api-key probe asked for a client_version the route ignores"
+                end
 
-              {~s({"data":[{"id":"codex-vector","object":"model"}]}) <> "\n200", 0}
+                {~s({"data":[{"id":"codex-vector","object":"model"}]}) <> "\n200", 0}
+              end
 
             "malformed" ->
               {"{}\n200 0.145.0", 0}
@@ -1157,16 +1144,13 @@ defmodule Tightbeam.Harness.Codex do
           end
         end
 
-        # The vector's subject is catalog DERIVATION — route, credential field,
-        # shape — using a synthetic model id. The selectable pin is a separate
-        # concern with its own tests, so it is disabled here; leaving it on
-        # would filter the synthetic id out and fail the case for the wrong
-        # reason.
+        # The vector's subject is catalog derivation and intersection using a
+        # synthetic model id, not a compiled allowlist.
         %{
           base_dir: base,
           host_name: "vector",
           credential_kind: if(case_name == "valid_api_key", do: :api_key, else: :subscription),
-          options: %{sh: sh, codex_selectable_models: :all}
+          options: %{sh: sh}
         }
       end,
       wire_projection: %{
@@ -1277,108 +1261,56 @@ defmodule Tightbeam.Harness.Codex do
     end)
   end
 
-  defp qualify_api_key_astra(_state, :subscription, entries), do: {:ok, entries}
+  defp qualify_selected_engine(_state, :subscription, entries), do: {:ok, entries}
+  defp qualify_selected_engine(_state, :api_key, []), do: {:ok, []}
 
-  defp qualify_api_key_astra(state, :api_key, entries) do
-    if Enum.any?(entries, &(&1.family == "gpt-6-astra")) do
-      with {:ok, models, version} <- probe_engine_models(state),
-           {:ok, levels} <- selected_astra_efforts(models, version) do
-        efforts = Enum.map(levels, & &1["reasoningEffort"])
+  defp qualify_selected_engine(state, :api_key, entries) do
+    with {:ok, models, version} <- probe_engine_models(state) do
+      selected =
+        models
+        |> Enum.filter(&(is_map(&1) and is_binary(&1["id"]) and &1["hidden"] == false))
+        |> Map.new(&{&1["id"], &1})
 
-        {:ok,
-         Enum.map(entries, fn
-           %{family: "gpt-6-astra"} = entry ->
-             %{entry | efforts: efforts, capabilities: %{"supported_reasoning_levels" => levels}}
+      matched = Enum.filter(entries, &Map.has_key?(selected, &1.family))
 
-           entry ->
-             entry
-         end)}
+      if matched == [] do
+        {:error, {:no_provider_model_selectable_on_selected_engine, version}}
       else
-        {:error, {:astra_not_selectable_on_selected_engine, _version} = reason} ->
-          # A provider entitlement is not a stock ACP option when the selected
-          # engine omits Astra from ordinary model/list. Preserve existing Sol
-          # if it remains available, but make the rejected Astra fact explicit.
-          Logger.warning("codex catalog: provider lists gpt-6-astra but #{inspect(reason)}")
-          remaining = Enum.reject(entries, &(&1.family == "gpt-6-astra"))
-          if remaining == [], do: {:error, reason}, else: {:ok, remaining}
+        Enum.reduce_while(matched, {:ok, []}, fn entry, {:ok, qualified} ->
+          case selected_efforts(selected[entry.family]) do
+            {:ok, levels} ->
+              enriched =
+                %{entry |
+                  efforts: Enum.map(levels, & &1["reasoningEffort"]),
+                  capabilities: %{"supported_reasoning_levels" => levels}
+                }
 
-        {:error, reason} ->
-          {:error, reason}
-      end
-    else
-      {:ok, entries}
-    end
-  end
+              {:cont, {:ok, [enriched | qualified]}}
 
-  defp selected_astra_efforts(models, version) do
-    case Enum.filter(models, &(is_map(&1) and &1["id"] == "gpt-6-astra")) do
-      [] ->
-        {:error, {:astra_not_selectable_on_selected_engine, version}}
-
-      [%{"hidden" => false, "supportedReasoningEfforts" => levels}] when is_list(levels) ->
-        efforts =
-          Enum.map(levels, fn
-            %{"reasoningEffort" => effort} when is_binary(effort) and effort != "" ->
-              effort
-
-            _ ->
-              nil
-          end)
-
-        if efforts != [] and Enum.all?(efforts, &is_binary/1) and
-             length(efforts) == length(Enum.uniq(efforts)) do
-          {:ok, levels}
-        else
-          {:error, :malformed_selected_engine_model_list}
+            error ->
+              {:halt, error}
+          end
+        end)
+        |> case do
+          {:ok, qualified} -> {:ok, Enum.reverse(qualified)}
+          error -> error
         end
-
-      [%{"hidden" => true}] ->
-        {:error, {:astra_not_selectable_on_selected_engine, version}}
-
-      _ ->
-        {:error, :malformed_selected_engine_model_list}
+      end
     end
   end
 
-  # The platform route lists the account's full model universe, most of which
-  # stock ACP refuses. This bounded filter preserves Sol and considers Astra;
-  # qualify_api_key_astra/3 additionally requires a selected-engine model/list
-  # result with exact ID and effort metadata before admitting Astra.
-  #
-  # The SUBSCRIPTION kind stays unfiltered: its catalog comes from the account
-  # route the CLI itself consults, so the two vocabularies share one source
-  # there. That claim is now kind-scoped — it was once believed to cover codex
-  # wholesale, and the api-key exercise disproved it for the platform route.
-  #
-  # Injectable through `state.options` (`:all` disables): the accepted set is
-  # the adapter version's, and a test
-  # must be able to exercise derivation without coupling to the table.
-  defp selectable_models(state, :subscription),
-    do: Map.get(state.options, :codex_selectable_models, :all)
+  defp selected_efforts(%{"supportedReasoningEfforts" => levels}) when is_list(levels) do
+    efforts = Enum.map(levels, & &1["reasoningEffort"])
 
-  defp selectable_models(state, :api_key),
-    do: Map.get(state.options, :codex_selectable_models, @adapter_selectable_models)
-
-  defp keep_selectable(entries, :all), do: entries
-
-  defp keep_selectable(entries, selectable) do
-    {kept, dropped} =
-      Enum.split_with(entries, &(vendor_ref(&1) in selectable))
-
-    if dropped != [] do
-      Logger.info(
-        "codex catalog: #{length(dropped)} model(s) the platform lists are not selectable by " <>
-          "codex-acp #{@adapter_version} and were withheld: " <>
-          Enum.map_join(dropped, ", ", &vendor_ref/1) <>
-          " — re-probe @adapter_selectable_models in harness/codex.ex if this looks wrong"
-      )
+    if Enum.all?(efforts, &(is_binary(&1) and &1 != "")) and
+         length(efforts) == length(Enum.uniq(efforts)) do
+      {:ok, levels}
+    else
+      {:error, :malformed_selected_engine_model_list}
     end
-
-    kept
   end
 
-  defp vendor_ref(entry),
-    do: Model.to_ref(Model.new(entry.family, context: entry.context))
+  defp selected_efforts(_model), do: {:error, :malformed_selected_engine_model_list}
 
   defp adapter_binary(target) do
     # One path for both localities, as fixture.ex already does: the adapter lives

@@ -474,8 +474,12 @@ defmodule Tightbeam.CredentialKindsTest do
       owner = self()
 
       sh = fn command ->
-        send(owner, {:codex_probe, Enum.join(command, " ")})
-        {~s({"data":[{"id":"gpt-5.6-sol","object":"model"}]}) <> "\n200", 0}
+        script = Enum.join(command, " ")
+        send(owner, {:codex_probe, script})
+
+        if String.contains?(script, "model/list"),
+          do: {stock_codex_models_body(), 0},
+          else: {~s({"data":[{"id":"gpt-5.6-sol","object":"model"}]}) <> "\n200", 0}
       end
 
       assert {:ok, [entry]} =
@@ -501,7 +505,7 @@ defmodule Tightbeam.CredentialKindsTest do
       # tiers, no context window. The catalog says so rather than inventing them.
       assert entry.family == "gpt-5.6-sol"
       assert entry.display_name == "gpt-5.6-sol"
-      assert entry.efforts == []
+      assert entry.efforts == ~w(low medium high xhigh max ultra)
       assert entry.max_input_tokens == nil
       assert entry.provider == :openai
     end
@@ -513,7 +517,11 @@ defmodule Tightbeam.CredentialKindsTest do
     # The fixture is that payload's shape trimmed to those two adjudicated ids.
     test "an api-key codex catalog withholds platform ids the adapter refuses", ctx do
       stage!(ctx.base, "codex", "auth.json", ~s({"OPENAI_API_KEY":"sk-proj-selectable"}))
-      sh = fn _command -> {platform_fixture_body() <> "\n200", 0} end
+      sh = fn command ->
+        if String.contains?(Enum.join(command, " "), "model/list"),
+          do: {stock_codex_models_body(), 0},
+          else: {platform_fixture_body() <> "\n200", 0}
+      end
 
       assert {:ok, entries} =
                Codex.fetch_catalog(%{
@@ -550,7 +558,7 @@ defmodule Tightbeam.CredentialKindsTest do
                  options: %{sh: sh, db: ctx.db}
                })
 
-      assert {sol.family, sol.efforts} == {"gpt-5.6-sol", []}
+      assert {sol.family, sol.efforts} == {"gpt-5.6-sol", ~w(low medium high xhigh max ultra)}
       assert astra.family == "gpt-6-astra"
       assert astra.efforts == ~w(low medium high xhigh max ultra)
       assert Tightbeam.ModelCatalog.offers_effort?(astra, "high")
@@ -562,16 +570,20 @@ defmodule Tightbeam.CredentialKindsTest do
       refute script =~ "fixture-key"
     end
 
-    test "no provider Astra leaves Sol available without a native capability call", ctx do
+    test "provider models are verified against the selected engine", ctx do
       stage!(ctx.base, "codex", "auth.json", ~s({"OPENAI_API_KEY":"fixture-key"}))
       owner = self()
 
       sh = fn command ->
-        send(owner, {:catalog_command, Enum.join(command, " ")})
-        {~s({"data":[{"id":"gpt-5.6-sol"}]}) <> "\n200", 0}
+        script = Enum.join(command, " ")
+        send(owner, {:catalog_command, script})
+
+        if String.contains?(script, "model/list"),
+          do: {stock_codex_models_body(), 0},
+          else: {~s({"data":[{"id":"gpt-5.6-sol"}]}) <> "\n200", 0}
       end
 
-      assert {:ok, [%{family: "gpt-5.6-sol", efforts: []}]} =
+      assert {:ok, [%{family: "gpt-5.6-sol", efforts: efforts}]} =
                Codex.fetch_catalog(%{
                  base_dir: ctx.base,
                  credential_kind: :api_key,
@@ -580,7 +592,9 @@ defmodule Tightbeam.CredentialKindsTest do
 
       assert_receive {:catalog_command, script}
       refute script =~ "model/list"
-      refute_receive {:catalog_command, _}
+      assert_receive {:catalog_command, native_script}
+      assert native_script =~ "model/list"
+      assert efforts == ~w(low medium high xhigh max ultra)
     end
 
     test "Astra effort choices follow selected engine metadata rather than a compiled ladder",
@@ -634,7 +648,7 @@ defmodule Tightbeam.CredentialKindsTest do
                    })
         end)
 
-      assert log =~ "astra_not_selectable_on_selected_engine"
+      assert log == ""
       refute log =~ "fixture-key"
 
       hidden = stock_codex_models_body() |> JSON.decode!()
@@ -658,7 +672,7 @@ defmodule Tightbeam.CredentialKindsTest do
                  options: %{sh: hidden_sh}
                })
 
-      assert {:error, {:astra_not_selectable_on_selected_engine, "0.154.0"}} =
+      assert {:error, {:no_provider_model_selectable_on_selected_engine, "0.154.0"}} =
                Codex.fetch_catalog(%{
                  base_dir: ctx.base,
                  credential_kind: :api_key,
@@ -742,18 +756,30 @@ defmodule Tightbeam.CredentialKindsTest do
       refute script =~ "fixture-key"
     end
 
-    test "the injectable seam lifts the api-key selectable pin", ctx do
+    test "a future provider model is admitted only when the selected engine offers it", ctx do
       stage!(ctx.base, "codex", "auth.json", ~s({"OPENAI_API_KEY":"sk-proj-unpinned"}))
-      sh = fn _command -> {platform_fixture_body() <> "\n200", 0} end
+      engine = stock_codex_models_body() |> JSON.decode!()
+
+      future = %{
+        "id" => "orbit-9",
+        "hidden" => false,
+        "supportedReasoningEfforts" => [%{"reasoningEffort" => "high"}]
+      }
+
+      sh = fn command ->
+        if String.contains?(Enum.join(command, " "), "model/list"),
+          do: {JSON.encode!(%{engine | "models" => [future | engine["models"]]}), 0},
+          else: {~s({"data":[{"id":"orbit-9"},{"id":"provider-only-8"}]}) <> "\n200", 0}
+      end
 
       assert {:ok, entries} =
                Codex.fetch_catalog(%{
                  base_dir: ctx.base,
                  credential_kind: :api_key,
-                 options: %{sh: sh, codex_selectable_models: :all}
+                 options: %{sh: sh}
                })
 
-      assert Enum.map(entries, & &1.family) == ["gpt-5.1-codex", "gpt-5.6-sol"]
+      assert Enum.map(entries, &{&1.family, &1.efforts}) == [{"orbit-9", ["high"]}]
     end
 
     test "the subscription catalog is not filtered by the api-key pin", ctx do
