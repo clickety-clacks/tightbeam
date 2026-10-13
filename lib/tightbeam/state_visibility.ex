@@ -15,6 +15,14 @@ defmodule Tightbeam.StateVisibility do
   @spec visible?(DB.server(), map(), map()) :: boolean()
   @spec visible?(DB.server(), map(), String.t(), boolean()) :: boolean()
   @doc "Apply Firehose visibility for a credential-derived session principal."
+  def visible?(db, %{"class" => class, "payload" => %{"kind" => "operator"}} = notice, %{
+        kind: "session",
+        id: session_key
+      })
+      when class in @decision_request_classes and is_binary(session_key) and session_key != "" do
+    session_principal_notice_visible?(db, notice, session_key)
+  end
+
   def visible?(db, %{"class" => class, "payload" => item}, %{
         kind: "session",
         id: session_key
@@ -43,12 +51,18 @@ defmodule Tightbeam.StateVisibility do
   def visible?(_db, _notice, user_id, _is_admin)
       when not is_binary(user_id) or user_id == "", do: false
 
-  # Operator requests use the existing admin-only operator decision surface;
-  # they are not one of the public R7 decision-request kinds below.
-  def visible?(_db, %{"class" => class, "payload" => %{"kind" => "operator"}}, _user_id, true)
-      when class in @decision_request_classes,
-      do: true
+  def visible?(
+        db,
+        %{"class" => class, "payload" => %{"kind" => "operator"}} = notice,
+        user_id,
+        is_admin
+      )
+      when class in @decision_request_classes do
+    is_admin or user_owned_notice_visible?(db, notice, user_id)
+  end
 
+  # Operator notices keep their established ownership grants; the public R7
+  # decision-request kinds below use narrower detail grants.
   def visible?(db, %{"class" => class, "payload" => item}, user_id, is_admin)
       when class in @decision_request_classes and is_map(item) do
     core_detail_visible?(db, "decision requests", item, %{
@@ -80,6 +94,10 @@ defmodule Tightbeam.StateVisibility do
   def visible?(_db, %{"class" => "critical_lease.updated"}, _user_id, false), do: false
 
   def visible?(db, notice, user_id, false) do
+    user_owned_notice_visible?(db, notice, user_id)
+  end
+
+  defp user_owned_notice_visible?(db, notice, user_id) do
     refs = notice["refs"] || %{}
     payload = notice["payload"] || %{}
 

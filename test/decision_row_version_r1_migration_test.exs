@@ -317,6 +317,46 @@ defmodule Tightbeam.DecisionRowVersionR1MigrationTest do
     assert snapshot(db) == before
   end
 
+  test "R1 row-version migration preserves malformed legacy returned rows", %{db: db} do
+    seed(db)
+    assert {:ok, :ok} = prerequisites(db)
+
+    for {id, actor, at} <- [
+          {"valid", "session:holder", 3},
+          {"bad-time", "session:holder", 0},
+          {"bad-actor", " ", 3}
+        ] do
+      assert {:ok, []} =
+               DB.query(
+                 db,
+                 """
+                 INSERT INTO decision_requests(id,kind,raiserId,raiserSessionKey,ownerUserId,
+                   expecterSessionKey,expecterUserId,raisedAt,question,context,status,
+                   returnedBy,returnReason,returnedAt)
+                 VALUES (?1,'agent','session:raiser','raiser','fixture','holder','fixture',1,
+                   'question','{}','returned',?2,'original',?3)
+                 """,
+                 [id, actor, at]
+               )
+    end
+
+    columns = rows(db, "PRAGMA table_info(decision_requests)") |> Enum.map(&Enum.at(&1, 1))
+    before = snapshot(db)
+    assert {:ok, :ok} = version(db)
+
+    assert rows(db, "SELECT " <> Enum.join(columns, ",") <> " FROM decision_requests ORDER BY id") ==
+             before.decisions
+
+    assert others(db) == before.other
+    assert rows(db, "SELECT shape FROM schema_stamp") == [["row-driven-r1-v1-019"]]
+    assert rows(db, "PRAGMA foreign_key_check") == []
+
+    assert rows(
+             db,
+             "SELECT rowVersion FROM decision_requests WHERE id IN ('valid','bad-time','bad-actor') ORDER BY id"
+           ) == [[1], [1], [1]]
+  end
+
   @tag rest_r7_boundary: true
   test "returned snapshots retain R2 shape and version same-millisecond changes", %{db: db} do
     :ok = Schema.ensure_all(db)
@@ -340,6 +380,11 @@ defmodule Tightbeam.DecisionRowVersionR1MigrationTest do
                  [id, actor, at]
                )
     end
+
+    assert rows(
+             db,
+             "SELECT DISTINCT rowSchemaRevision FROM decision_requests WHERE id IN ('valid','bad-time','bad-actor')"
+           ) == [[2]]
 
     for id <- ["bad-time", "bad-actor"] do
       preserved = snapshot(db)
