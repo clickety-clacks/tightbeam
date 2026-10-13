@@ -354,7 +354,10 @@ defmodule Tightbeam.DecisionRowVersionR1MigrationTest do
 
     :ok = Escalation.ensure_schema(db)
 
-    assert rows(db, "SELECT DISTINCT rowSchemaRevision FROM decision_requests WHERE status='open'") ==
+    assert rows(
+             db,
+             "SELECT DISTINCT rowSchemaRevision FROM decision_requests WHERE status='open'"
+           ) ==
              [[1]]
 
     assert rows(
