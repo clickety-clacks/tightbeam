@@ -54,24 +54,26 @@ intentional.
 
 ## Verification
 
-- `.github/workflows/ci.yml` defines the verification gate. When it and this
-  section disagree, `ci.yml` is right and this section is a bug.
-- Run the halves your change touches; run both when unsure. Run each applicable half
-  exactly as CI defines it:
-  - Elixir: `mix format --check-formatted && scripts/verify_mix.sh`.
-  - Rust, from `cli/`: `cargo fmt --check && cargo test`.
+- Choose checks under the Evidence section of
+  `priv/kungfu/agentic-engineering/guidance/engineering-core.md`. Existing CI
+  configuration does not by itself justify a test or gate; route a conflicting
+  enforced check to its owner for removal through the authorized source path.
+- Use the applicable repository commands for qualifying checks:
+  - Elixir: `mix format --check-formatted` and `scripts/verify_mix.sh`.
+  - Rust, from `cli/`: `cargo fmt --check` and `cargo test`.
 - The canonical gate handles environment hygiene. For ad-hoc Mix runs outside the
   script, such as `mix test path/to/file.exs`, use `env -u NAME` to remove every
   inherited `TIGHTBEAM_*` and `RELEASE_*` variable.
   After `wi_8f90c5b3` merges, the suite is immune to the
   known `TIGHTBEAM_*` config leaks. Keep stripping both prefixes: that proof covers
   only config, while `RELEASE_ROOT` is read directly from the environment in `lib/`.
-- Make the requested change first. Then run the focused tests that exercise it, followed
-  by only the broader verification that its risk warrants. Do not run a full-suite
+- Make the requested change first, then select focused verification under the
+  engineering core's Evidence rule and broaden it for affected required behavior. Do not run a full-suite
   baseline before writing code; an untouched-tree replay delays the change without
   proving its result.
-- A docs-only change (`*.md`) skips these gates. Run `sh packaging/assemble.sh`
-  instead; it must succeed.
+- For a change to shipped documentation, use `sh packaging/assemble.sh` when
+  package inclusion or assembly is the behavior under examination; documentation
+  alone does not require a build or full suite.
 
 ## Tests — a green run is not the goal, a correct one is
 
@@ -79,17 +81,17 @@ intentional.
 worse than a red one: it reports safety it does not have, and it hides the regression from
 everyone downstream.
 
-- **Never delete a test to make a run pass.** Not the file, not the case, not the assertion.
+- Preserve tests of required behavior; removing their assertions to hide a defect
+  is not a passing result. Apply the engineering core's Evidence rule to checks
+  that do not qualify for retention.
 - **Never stub a test out** — no `assert true`, no emptied body, no permanent skip/tag, no
   assertion weakened until it stops failing. A test that asserts nothing is a lie.
 - **Reconcile instead.** When a test fails, first decide which side is wrong. If the code is
   wrong, fix the code. If the test encodes behavior the spec has since changed, rewrite it to
   assert the NEW correct behavior — the test keeps its subject and its teeth.
-- **Deletion is a proposal, not an action.** If you believe a test or a feature genuinely
-  should go — its subject is gone, it duplicates another, the spec retired it — say so as a
-  finding in your report and leave the code in place. Someone reviews that call. This applies
-  to features and modules as much as to tests: removing something that merely conflicts with
-  the new shape is how invariants get silently gutted while the suite stays green.
+- Remove nonqualifying tests and gates through their existing source ownership;
+  preserve product behavior and explicit constraints. A feature or module removal
+  still needs authority for that behavior change.
 - **Make sure the test is real.** It must be able to fail: it exercises the actual subject, it
   asserts a specific observable outcome, and breaking the code it covers turns it red. If you
   cannot state what regression it would catch, it is not a test yet.
@@ -100,9 +102,9 @@ everyone downstream.
   depends on what the OTHER side actually does is circular through a mock: it verifies our
   handling of a reply we authored. Every boundary assumption a mock encodes (which methods
   exist, what replies carry, which config options a harness declares) must be backed by
-  recorded real responses (re-capture fixtures) or a live gate. Any lane that touches the
-  adapter seam runs the LIVE feature_smoke matrix (both harnesses, fresh org) as part of its
-  own gates — before merge, not after.
+  recorded real responses or applicable live evidence. Choose `feature_smoke` cases for
+  the affected required adapter behavior under the engineering core's Evidence rule;
+  touching the adapter seam alone does not require the full matrix.
 
 ## Report dirt, never accommodate it
 

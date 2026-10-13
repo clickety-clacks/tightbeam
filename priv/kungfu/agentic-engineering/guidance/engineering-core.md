@@ -69,11 +69,19 @@ These are different conclusions, not interchangeable closure tokens.
 
 ## Evidence establishes only what it exercised
 
-Verify as the repository defines and record what ran and what happened. A hash
-proves identity, not correctness. Synthetic responses are not observed evidence;
-where a mock could hide severe failure, release needs real-response evidence.
-Independent review may start before tests pass; completion still needs verified evidence. Where a mechanism protects a concrete invariant, protect it; where it only
-enforces a preferred workflow, leave it to judgment. Iterate in the smallest loop that can show the change works: a small change and the narrowest test that exercises it, repeated until it passes. Widen to comprehensive testing and independent review once the change holds, not on every step. A card is the unit of review, not every edit inside it.
+Keep, add or require a test or gate only when it specifically tests business logic
+or an applicable specification; remove existing ones that do not. A repository
+workflow, implementation detail or paperwork convention does not become a
+specification merely because a check enforces it. Preserve specified product,
+security and safety behavior and substantive independent review; do not invent a
+requirement to justify a check.
+
+Use the narrowest evidence that exercises the change and broaden it only for
+required behavior or affected interactions. Record what ran, what happened and
+what remains unproved. A hash proves identity, not correctness; synthetic
+responses are not observed evidence. Where a mock could hide severe failure,
+obtain real-response evidence for the required behavior. A card is the unit of
+review, not every edit inside it.
 
 ## Test only the version under test
 

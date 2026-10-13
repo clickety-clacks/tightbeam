@@ -27,8 +27,10 @@ does not create it:
       --prompt "Read PR <n>'s current checks and act on their result"
 
 The fact reports that checks finished, on pass or fail; read the latest required
-results for the current head. The coordinator who owns review opens it when they
-are green. Coders do not open their own review. A fallback is a reason to read the
+results for the current head. The coordinator owns review timing; green checks
+are not a blanket prerequisite for substantive review. Route an installed
+admission refusal to its owner under the engineering core's Evidence rule.
+Coders do not open their own review. A fallback is a reason to read the
 current state, not evidence that checks passed.
 
 ## Landing your own change
