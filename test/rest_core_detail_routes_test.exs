@@ -911,11 +911,11 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
 
     matches =
       Regex.scan(
-        ~r/get "\/api\/(?:work-items|assignments|wakes|turns|decision-requests|sessions|devices|artifacts|read-markers)\/:/,
+        ~r/get "\/api\/(?:work-items|assignments|wakes|turns|decision-requests|sessions|roles|devices|artifacts|read-markers)\/:/,
         router
       )
 
-    assert length(matches) == 12
+    assert length(matches) == 13
   end
 
   defp core_detail_cases(ctx) do
@@ -2144,5 +2144,45 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       "cache-control" => get_resp_header(response, "cache-control"),
       "content-type" => get_resp_header(response, "content-type")
     }
+  end
+
+  test "role detail shares canonical item bytes for user and session principals", ctx do
+    role_name = "g7-route-role"
+    _role = Tightbeam.Roles.create!(ctx.db, role_name, "flynn", nil)
+    principal = %{kind: "user", id: "flynn", is_admin: true}
+    role = StateResources.query_role(ctx.db, %{key: role_name, principal: principal})
+    item = StateResources.role(role)
+    expected = StateResources.encode_item("roles", item, ctx.catalog)
+    expected_fields = ~w(name boundSessionKey ownerUserId createdAt updatedAt rowVersion)
+
+    assert Enum.sort(Map.keys(item)) == Enum.sort(expected_fields)
+
+    notice = Publisher.committed_notice("role.created", role, %{})
+    assert notice["resource"] == "roles"
+    assert notice["refs"] == %{"role" => role_name}
+    assert notice["payload"] == item
+
+    for {token, path} <- [
+          {ctx.token, "/api/roles/#{role_name}"},
+          {ctx.admin_session.cli_token, "/api/roles/#{role_name}?asUser=flynn"}
+        ] do
+      response = get(ctx, path, token)
+      body = JSON.decode!(response.resp_body)
+
+      assert response.status == 200
+      assert_application_headers(response)
+      assert body["schemaVersion"] == 1
+      assert body["resource"] == "roles"
+      assert raw_json_value(response.resp_body, "item") == expected
+      assert body["item"] == notice["payload"]
+    end
+
+    missing = get(ctx, "/api/roles/no-such-role")
+    assert_error(missing, 404, "roles", "not_found")
+    assert_application_headers(missing)
+
+    invalid_query = get(ctx, "/api/roles/#{role_name}?unexpected=value")
+    assert_error(invalid_query, 400, "roles", "invalid_filter")
+    assert_application_headers(invalid_query)
   end
 end

@@ -92,6 +92,7 @@ defmodule Tightbeam.Wire.Router do
       serializer: :decision_request
     },
     sessions: %{resource: "sessions", query: :query_session, serializer: :session},
+    roles: %{resource: "roles", query: :query_role, serializer: :role},
     devices: %{resource: "devices", query: :query_device, serializer: :device},
     artifacts: %{resource: "artifacts", query: :query_artifact, serializer: :artifact},
     read_markers: %{resource: "read markers", query: :query_read_marker, serializer: :read_marker}
@@ -413,6 +414,10 @@ defmodule Tightbeam.Wire.Router do
 
   get "/api/sessions/:session_key" do
     core_detail(conn, Map.fetch!(@core_detail_specs, :sessions), session_key)
+  end
+
+  get "/api/roles/:name" do
+    core_detail(conn, Map.fetch!(@core_detail_specs, :roles), name)
   end
 
   get "/api/sessions/:session_key/messages" do

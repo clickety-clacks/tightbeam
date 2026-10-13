@@ -76,6 +76,12 @@ defmodule Tightbeam.StateVisibility do
        when resource in ["work items", "assignments"],
        do: true
 
+  defp do_core_detail_visible?(_db, "roles", _row, %{kind: kind})
+       when kind in ["user", "session"],
+       do: true
+
+  defp do_core_detail_visible?(_db, "roles", _row, _principal), do: false
+
   defp do_core_detail_visible?(db, "decision requests", row, principal) do
     admin = principal.is_admin
     assignment_holder = assignment_holder?(db, value(row, :assignment_id), principal)

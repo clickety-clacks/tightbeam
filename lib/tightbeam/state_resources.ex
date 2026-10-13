@@ -629,13 +629,19 @@ defmodule Tightbeam.StateResources do
     }
   end
 
-  def query_role(db, id) do
-    case Tightbeam.DB.query(
+  def query_role(db, %{key: id, principal: principal}) do
+    detail_selection(db, "roles", principal, fn txn -> role_query(txn, id) end)
+  end
+
+  def query_role(db, id), do: role_query(db, id)
+
+  defp role_query(db, id) do
+    case query(
            db,
            "SELECT name, boundSessionKey, ownerUserId, createdAt, updatedAt FROM roles WHERE name = ?1",
            [id]
          ) do
-      {:ok, [[name, bound_session_key, owner_user_id, created_at, updated_at]]} ->
+      [[name, bound_session_key, owner_user_id, created_at, updated_at]] ->
         %{
           name: name,
           bound_session_key: bound_session_key,
@@ -644,7 +650,7 @@ defmodule Tightbeam.StateResources do
           updated_at: updated_at
         }
 
-      {:ok, []} ->
+      [] ->
         nil
     end
   end
@@ -1335,7 +1341,7 @@ defmodule Tightbeam.StateResources do
   defp validate_harness_registry!(_registry),
     do: raise(ArgumentError, "harness registry must be an ordered list")
 
-  def role(row), do: row |> public() |> correlate("role", "name")
+  def role(row), do: row |> public() |> closed_projection("roles")
 
   def artifact(row) do
     reject_public_shape_drift!(row, "artifacts")

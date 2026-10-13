@@ -427,6 +427,8 @@ defmodule Tightbeam.Firehose.Publisher do
   defp projection_primary_ref(projection, "turnSeq"),
     do: projection["turnSeq"] || projection["seq"]
 
+  defp projection_primary_ref(projection, "role"), do: projection["name"]
+
   defp projection_primary_ref(projection, primary_ref),
     do: projection[primary_ref] || projection["id"]
 
