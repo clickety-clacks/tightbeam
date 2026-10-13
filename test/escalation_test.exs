@@ -99,7 +99,7 @@ defmodule Tightbeam.EscalationTest do
   test "statute open, ruling, and consume publish their committed decision snapshots", ctx do
     alias Tightbeam.Firehose.Hub
 
-    start_supervised!({Hub})
+    start_supervised!({Hub, name: Hub})
 
     :ok =
       Hub.register(Hub, self(), %{mode: :filtered, db: ctx.db, user_id: "flynn", is_admin: true})

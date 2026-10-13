@@ -1690,7 +1690,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
           :agent -> [admin, owner, session]
         end
 
-      {Atom.to_string(kind), row.row["item"], allowed, denied}
+      {Atom.to_string(kind), row["item"], allowed, denied}
     end
   end
 

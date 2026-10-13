@@ -74,6 +74,12 @@ defmodule Tightbeam.Firehose.Publisher do
     StateResources.query_assignment(txn, id, call) || result
   end
 
+  defp canonical_in_txn(txn, %{verb: verb} = call, result)
+       when verb in ~w(operator-ask operator-rule operator-withdraw) do
+    id = result[:id] || result["id"] || call.params[:request] || call.params[:request_id]
+    StateResources.query_decision_request_in_txn(txn, id) || result
+  end
+
   defp canonical_in_txn(_txn, _call, result), do: result
 
   @spec maybe_accepted_in_txn(Txn.t(), map(), term()) :: :ok
