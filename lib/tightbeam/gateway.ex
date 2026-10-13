@@ -1470,7 +1470,7 @@ defmodule Tightbeam.Gateway do
     |> compile_handler_specs!()
   end
 
-  @direct_state_classes ~w(message.created wake.fired turn.started turn.ended artifact.archived artifact.released)
+  @direct_state_classes ~w(message.created wake.fired turn.started turn.ended artifact.archived artifact.released decision_request.consumed decision_request.superseded decision_request.updated)
 
   @doc false
   @spec compile_handler_specs!(map()) ::

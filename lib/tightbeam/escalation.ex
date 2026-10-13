@@ -275,54 +275,26 @@ defmodule Tightbeam.Escalation do
     ON escalation_waivers (raiserId, statuteName, revokedAt);
   """
 
-  # Fresh databases traverse the stamped historical bootstrap. Its rowVersion
-  # column is added by ALTER TABLE, so the predecessor lacks the check used by
-  # the current fresh-table DDL below. Model that exact migration result here.
-  @decision_requests_pre_revision_ddl (
-                                        predecessor =
-                                          case String.split(
-                                                 @ddl,
-                                                 "CREATE TABLE IF NOT EXISTS decision_requests (",
-                                                 parts: 2
-                                               ) do
-                                            [_prefix, suffix] ->
-                                              case String.split(suffix, "\n);", parts: 2) do
-                                                [table_body, _rest] ->
-                                                  "CREATE TABLE decision_requests (" <>
-                                                    table_body <> ")"
-
-                                                _ ->
-                                                  raise "decision_requests DDL terminator not found"
-                                              end
-
-                                            _ ->
-                                              raise "decision_requests DDL not found"
-                                          end
-
-                                        String.replace(
-                                          predecessor,
-                                          "CHECK (typeof(rowVersion) = 'integer' AND rowVersion > 0)",
-                                          ""
-                                        )
-                                      )
-
-  @decision_request_revision_ddl "rowSchemaRevision INTEGER NOT NULL DEFAULT 1 " <>
-                                   "CHECK (typeof(rowSchemaRevision) = 'integer' AND rowSchemaRevision IN (1,2))"
-
-  @decision_requests_current_ddl (case String.split(
-                                         @decision_requests_pre_revision_ddl,
-                                         "\n  CHECK (\n    (kind = 'statute'",
-                                         parts: 2
-                                       ) do
-                                    [columns, constraints] ->
-                                      columns <>
-                                        " " <>
-                                        @decision_request_revision_ddl <>
-                                        ",\n  CHECK (\n    (kind = 'statute'" <> constraints
-
-                                    _ ->
-                                      raise "decision_requests table constraint boundary not found"
-                                  end)
+  # Schema-stamp identity selects the complete predecessor. Keep revision
+  # enforcement in triggers: adding a CHECK column makes SQLite revalidate
+  # unrelated historical row CHECKs that the predecessor migration preserves.
+  @decision_request_revision_ddl "rowSchemaRevision INTEGER NOT NULL DEFAULT 1"
+  @decision_revision_insert_guard """
+  CREATE TRIGGER decision_requests_row_schema_revision_insert_guard
+  BEFORE INSERT ON decision_requests
+  WHEN typeof(NEW.rowSchemaRevision) <> 'integer' OR NEW.rowSchemaRevision NOT IN (1,2)
+  BEGIN
+    SELECT RAISE(ABORT, 'decision_request_row_revision_invalid');
+  END
+  """
+  @decision_revision_update_guard """
+  CREATE TRIGGER decision_requests_row_schema_revision_update_guard
+  BEFORE UPDATE OF rowSchemaRevision ON decision_requests
+  WHEN typeof(NEW.rowSchemaRevision) <> 'integer' OR NEW.rowSchemaRevision NOT IN (1,2)
+  BEGIN
+    SELECT RAISE(ABORT, 'decision_request_row_revision_invalid');
+  END
+  """
 
   @terminal_request_columns """
   id, kind, raiserId, raiserSessionKey, ownerUserId, assignmentId,
@@ -512,23 +484,39 @@ defmodule Tightbeam.Escalation do
       "UPDATE decision_requests SET rowSchemaRevision=2 WHERE status='returned'"
     )
 
+    :ok = Txn.exec(txn, @decision_revision_insert_guard)
+    :ok = Txn.exec(txn, @decision_revision_update_guard)
+
     :ok = validate_decision_row_schema_revision_in_txn(txn, :current)
   end
 
   @doc false
   @spec validate_decision_row_schema_revision_in_txn(Txn.t(), :predecessor | :current) :: :ok
   def validate_decision_row_schema_revision_in_txn(txn, :predecessor) do
-    validate_decision_requests_ddl!(txn, @decision_requests_pre_revision_ddl, :predecessor)
+    columns = Txn.q(txn, "PRAGMA table_info(decision_requests)")
+    names = Enum.map(columns, &Enum.at(&1, 1))
+    row_version = Enum.find(columns, &(Enum.at(&1, 1) == "rowVersion"))
+
+    cond do
+      not match?([_, "rowVersion", "INTEGER", 1, "1", 0], row_version) ->
+        raise DB.Error, message: "incompatible decision request rowVersion predecessor column"
+
+      "rowSchemaRevision" in names ->
+        raise DB.Error,
+          message: "decision request rowSchemaRevision exists at its predecessor schema stamp"
+
+      true ->
+        validate_decision_revision_guards_in_txn(txn, :absent)
+    end
   end
 
   def validate_decision_row_schema_revision_in_txn(txn, :current) do
-    validate_decision_requests_ddl!(txn, @decision_requests_current_ddl, :current)
-
     case Enum.find(
            Txn.q(txn, "PRAGMA table_info(decision_requests)"),
            &(Enum.at(&1, 1) == "rowSchemaRevision")
          ) do
       [_cid, "rowSchemaRevision", "INTEGER", 1, "1", 0] ->
+        validate_decision_revision_guards_in_txn(txn, :present)
         validate_decision_row_revisions_in_txn(txn)
 
       _ ->
@@ -536,24 +524,34 @@ defmodule Tightbeam.Escalation do
     end
   end
 
-  defp validate_decision_requests_ddl!(txn, expected_ddl, revision_state) do
-    case Txn.q(
-           txn,
-           "SELECT sql FROM sqlite_master WHERE type='table' AND name='decision_requests'"
-         ) do
-      [[sql]] ->
-        unless normalize_decision_schema_sql(sql) == normalize_decision_schema_sql(expected_ddl) do
+  defp validate_decision_revision_guards_in_txn(txn, expected) do
+    guards = [
+      {"decision_requests_row_schema_revision_insert_guard", @decision_revision_insert_guard},
+      {"decision_requests_row_schema_revision_update_guard", @decision_revision_update_guard}
+    ]
+
+    Enum.each(guards, fn {name, ddl} ->
+      case Txn.q(
+             txn,
+             "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
+             [name]
+           ) do
+        [] when expected == :absent ->
+          :ok
+
+        [[actual_sql]] when expected == :present ->
+          unless normalize_decision_schema_sql(actual_sql) == normalize_decision_schema_sql(ddl) do
+            raise DB.Error, message: "incompatible decision request row revision guard #{name}"
+          end
+
+        rows ->
           raise DB.Error,
-            message: "incompatible decision request table at #{revision_state} revision stamp"
-        end
+            message:
+              "incompatible decision request row revision #{expected} guard #{name}: #{inspect(rows)}"
+      end
+    end)
 
-        :ok
-
-      rows ->
-        raise DB.Error,
-          message:
-            "incompatible decision request table at #{revision_state} revision stamp: #{inspect(rows)}"
-    end
+    :ok
   end
 
   defp normalize_decision_schema_sql(sql) do
@@ -561,6 +559,7 @@ defmodule Tightbeam.Escalation do
     |> String.downcase()
     |> String.replace("\"decision_requests\"", "decision_requests")
     |> String.replace(~r/\s+/u, "")
+    |> String.trim_trailing(";")
   end
 
   defp validate_decision_row_revisions_in_txn(txn) do
@@ -3619,7 +3618,12 @@ defmodule Tightbeam.Escalation do
       else
         request
         |> without_agent_fields()
-        |> Map.drop([:ruled_via_principal, :ruled_via_session_state, :row_version])
+        |> Map.drop([
+          :ruled_via_principal,
+          :ruled_via_session_state,
+          :row_version,
+          :row_schema_revision
+        ])
       end
     end
   end

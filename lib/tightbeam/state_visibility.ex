@@ -43,6 +43,12 @@ defmodule Tightbeam.StateVisibility do
   def visible?(_db, _notice, user_id, _is_admin)
       when not is_binary(user_id) or user_id == "", do: false
 
+  # Operator requests use the existing admin-only operator decision surface;
+  # they are not one of the public R7 decision-request kinds below.
+  def visible?(_db, %{"class" => class, "payload" => %{"kind" => "operator"}}, _user_id, true)
+      when class in @decision_request_classes,
+      do: true
+
   def visible?(db, %{"class" => class, "payload" => item}, user_id, is_admin)
       when class in @decision_request_classes and is_map(item) do
     core_detail_visible?(db, "decision requests", item, %{
