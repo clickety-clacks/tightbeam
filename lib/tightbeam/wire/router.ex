@@ -1127,7 +1127,9 @@ defmodule Tightbeam.Wire.Router do
   defp session_collection_tuple("wakes", %{created_at: created_at, wake_id: wake_id}),
     do: [created_at, wake_id]
 
-  defp session_collection_tuple?(_resource, [seq]) when is_integer(seq) and seq > 0, do: true
+  defp session_collection_tuple?(resource, [seq])
+       when resource in ["transcript messages", "turns"] and is_integer(seq) and seq > 0,
+       do: true
 
   defp session_collection_tuple?(
          "wakes",

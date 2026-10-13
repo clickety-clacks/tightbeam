@@ -916,6 +916,38 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert tail_turns["page"]["hasMoreAfter"] == false
   end
 
+  test "a wakes cursor with a one-field tuple refuses as invalid_cursor", ctx do
+    outsider_device = outsider_device(ctx)
+    session = ensure_main_session(ctx.db, "outsider")
+
+    for index <- 1..2 do
+      Wakes.schedule(ctx.db, %{
+        session_key: session.session_key,
+        origin: "user:outsider",
+        prompt: "cursor wake #{index}",
+        due_at: System.system_time(:millisecond) + 60_000,
+        creator_session_key: session.session_key
+      })
+    end
+
+    path = "/api/sessions/#{session.session_key}/wakes"
+    first = get(ctx, path <> "?limit=1", outsider_device.token)
+    assert first.status == 200
+    cursor = JSON.decode!(first.resp_body)["page"]["newestCursor"]
+
+    one_field =
+      cursor
+      |> Base.url_decode64!(padding: false)
+      |> JSON.decode!()
+      |> Map.put("tuple", [1])
+      |> JSON.encode!()
+      |> Base.url_encode64(padding: false)
+
+    response = get(ctx, path <> "?after=" <> one_field, outsider_device.token)
+    assert response.status == 400
+    assert JSON.decode!(response.resp_body)["error"]["code"] == "invalid_cursor"
+  end
+
   test "bounded message reads stay fixed as retained history grows", ctx do
     session = ensure_main_session(ctx.db, "outsider-growing-message-history")
 
