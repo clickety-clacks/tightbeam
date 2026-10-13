@@ -1174,6 +1174,10 @@ defmodule Tightbeam.StateResources do
     db |> Tightbeam.Escalation.raw_by_id(id) |> decision_request_query_row()
   end
 
+  def query_decision_request_in_txn(txn, id) do
+    txn |> Tightbeam.Escalation.raw_by_id_in_txn(id) |> decision_request_query_row()
+  end
+
   defp decision_request_query_row(nil), do: nil
 
   defp decision_request_query_row(row) do
