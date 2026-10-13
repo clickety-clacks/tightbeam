@@ -8343,12 +8343,25 @@ defmodule Tightbeam.GatewayTest do
   # effort-bearing model as `id[effort]`. `set_model` composes the two and has since
   # cbc8d2e; `set_harness` did not, so the same bare id round-tripped through one verb
   # and was refused by the other as "not offered by codex on testhost" (#69).
-  test "set_harness accepts the bare model id the picker advertises", ctx do
+  test "set_harness resolves the bare model id advertised by its destination catalog", ctx do
     base_dir = role_test_base("harness-bare-model")
     codex_auth = Tightbeam.Homes.home_path(base_dir, "testhost", :codex)
     File.mkdir_p!(codex_auth)
     File.write!(Path.join(codex_auth, "auth.json"), "test-token")
     Archetypes.load!(base_dir)
+    session = Org.get(ctx.db, "k1")
+    provider_model = "provider-offered-model-x91"
+
+    put_host_catalog(session.host, "codex", [])
+
+    put_host_catalog_entry(session.host, "codex", %{
+      family: provider_model,
+      name: provider_model,
+      display_name: provider_model,
+      efforts: ["medium"],
+      provider: :openai
+    })
+
     candidate = start_supervised!({CandidateAdapterStub, self()})
     start_supervised!({CoordinatorStub, candidate})
 
@@ -8368,12 +8381,12 @@ defmodule Tightbeam.GatewayTest do
              Gateway.handlers(config)["tune"].(%{
                origin: "user:flynn",
                session_key: "k1",
-               params: %{setting: "set_harness", harness: "codex", model: "gpt-5.6-sol"}
+               params: %{setting: "set_harness", harness: "codex", model: provider_model}
              })
 
     # Composed, not passed through: the tier is real information and the session must
     # end up on a ref the catalog actually offers.
-    assert Org.get(ctx.db, "k1").model == Model.new("gpt-5.6-sol", effort: "medium")
+    assert Org.get(ctx.db, "k1").model == Model.new(provider_model, effort: "medium")
 
     # And the value under test is one the picker really does advertise for this
     # session, so the case cannot keep passing if the advertised shape drifts. Read
@@ -8382,7 +8395,7 @@ defmodule Tightbeam.GatewayTest do
       Gateway.session_status("k1", ctx.db).capabilities.setModel.options
       |> Enum.map(& &1.value)
 
-    assert "gpt-5.6-sol" in advertised
+    assert provider_model in advertised
     refute Enum.any?(advertised, &String.contains?(&1, "["))
   end
 

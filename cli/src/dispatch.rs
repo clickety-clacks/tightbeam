@@ -582,12 +582,18 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
                     model,
                     effort,
                     context,
-                } => tune_model_params("set_harness", Some(harness), model, effort, context),
+                } => tune_model_params(
+                    "set_harness",
+                    Some(harness),
+                    model.as_ref(),
+                    effort,
+                    context,
+                ),
                 TuneControl::Model {
                     model,
                     effort,
                     context,
-                } => tune_model_params("set_model", None, model, effort, context),
+                } => tune_model_params("set_model", None, Some(model), effort, context),
                 TuneControl::Effort(effort) => vec![
                     string_field("setting", "set_reasoning"),
                     string_field("reasoningLevel", effort),
@@ -3593,14 +3599,14 @@ fn command_identity(command: &Command) -> Option<&Identity> {
 fn tune_model_params(
     setting: &str,
     harness: Option<&String>,
-    model: &String,
+    model: Option<&String>,
     effort: &Option<String>,
     context: &Option<String>,
 ) -> Vec<String> {
-    let mut params = vec![
-        string_field("setting", setting),
-        string_field("model", model),
-    ];
+    let mut params = vec![string_field("setting", setting)];
+    if let Some(model) = model {
+        params.push(string_field("model", model));
+    }
     if let Some(harness) = harness {
         params.push(string_field("harness", harness));
     }

@@ -31,7 +31,7 @@ pub enum Target {
 pub enum TuneControl {
     Harness {
         harness: String,
-        model: String,
+        model: Option<String>,
         effort: Option<String>,
         context: Option<String>,
     },
@@ -765,7 +765,7 @@ COMMANDS:
   retire --session <key> [--key <idempotencyKey>]
       End a session deliberately.
 
-  tune --session <key> (--harness <harness> --model <model> |
+  tune --session <key> (--harness <harness> [--model <model>] |
        --model <model> | --effort <level> | --fast on|off)
        [--effort <level>] [--context <variant>]
       Change one runtime control on an existing session. Model identity remains
@@ -3346,7 +3346,7 @@ fn parse_host_toolchain_set(
 }
 
 fn parse_tune(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Command, String> {
-    const USAGE: &str = "usage: tightbeam tune --session <key> (--harness <harness> --model <model> [--effort <level>] [--context <variant>] | --model <model> [--effort <level>] [--context <variant>] | --effort <level> | --fast on|off)";
+    const USAGE: &str = "usage: tightbeam tune --session <key> (--harness <harness> [--model <model>] [--effort <level>] [--context <variant>] | --model <model> [--effort <level>] [--context <variant>] | --effort <level> | --fast on|off)";
     const ALLOWED: &[&str] = &[
         "session",
         "harness",
@@ -3385,7 +3385,7 @@ fn parse_tune(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Command
     }
 
     let control = match (harness, model, effort, context, fast) {
-        (Some(harness), Some(model), effort, context, None) => TuneControl::Harness {
+        (Some(harness), model, effort, context, None) => TuneControl::Harness {
             harness,
             model,
             effort,
@@ -3401,7 +3401,6 @@ fn parse_tune(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Command
             TuneControl::Fast(fast)
         }
         (None, None, None, None, Some(_)) => return Err("--fast must be on or off".to_owned()),
-        (Some(_), None, _, _, None) => return Err("--harness requires --model".to_owned()),
         (None, None, None, Some(_), None) => return Err("--context requires --model".to_owned()),
         (_, _, _, _, Some(_)) => {
             return Err(
@@ -4363,7 +4362,7 @@ mod tests {
                     "--harness",
                     "codex",
                     "--model",
-                    "gpt-5.6-sol",
+                    "provider-offered-model-x91",
                     "--effort",
                     "high",
                     "--context",
@@ -4378,10 +4377,18 @@ mod tests {
                     "params": {
                         "setting": "set_harness",
                         "harness": "codex",
-                        "model": "gpt-5.6-sol",
+                        "model": "provider-offered-model-x91",
                         "effort": "high",
                         "context": "1m"
                     }
+                }),
+            ),
+            (
+                strings(&["tune", "--session", "agent:coder:x s_1", "--harness", "codex"]),
+                serde_json::json!({
+                    "verb": "tune",
+                    "sessionKey": "agent:coder:x s_1",
+                    "params": {"setting": "set_harness", "harness": "codex"}
                 }),
             ),
             (
@@ -4447,8 +4454,16 @@ mod tests {
         for args in [
             strings(&["tune", "--model", "gpt-5.6-sol"]),
             strings(&["tune", "--session", "s_1"]),
-            strings(&["tune", "--session", "s_1", "--harness", "codex"]),
             strings(&["tune", "--session", "s_1", "--context", "1m"]),
+            strings(&[
+                "tune",
+                "--session",
+                "s_1",
+                "--harness",
+                "codex",
+                "--fast",
+                "on",
+            ]),
             strings(&[
                 "tune",
                 "--session",
