@@ -281,7 +281,7 @@ defmodule Tightbeam.Escalation do
                                               parts: 2
                                             ) do
                                          [_prefix, suffix] ->
-                                           case String.split(suffix, "\n  );", parts: 2) do
+        case String.split(suffix, "\n);", parts: 2) do
                                              [table_body, _rest] ->
                                                "CREATE TABLE decision_requests (" <>
                                                  table_body <> ")"
