@@ -619,7 +619,7 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
     handlers = Tightbeam.Gateway.handlers(%{db: db})
 
     for {verb, field, text, status, class} <- [
-          {"answer", :answer, "Actual answer", "answered", "decision_request.ruled"},
+          {"answer", :answer, "Actual answer", "answered", "decision_request.answered"},
           {"return", :reason, "Need exact source", "returned", "decision_request.returned"}
         ] do
       ask = %{

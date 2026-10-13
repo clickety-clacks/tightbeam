@@ -352,6 +352,16 @@ defmodule Tightbeam.DecisionRowVersionR1MigrationTest do
     assert rows(db, "SELECT shape FROM schema_stamp") == [["row-driven-r1-v1-019"]]
     assert rows(db, "PRAGMA foreign_key_check") == []
 
+    :ok = Escalation.ensure_schema(db)
+
+    assert rows(db, "SELECT DISTINCT rowSchemaRevision FROM decision_requests WHERE status='open'") ==
+             [[1]]
+
+    assert rows(
+             db,
+             "SELECT DISTINCT rowSchemaRevision FROM decision_requests WHERE status='returned'"
+           ) == [[2]]
+
     for id <- ["bad-time", "bad-actor"] do
       preserved = snapshot(db)
 

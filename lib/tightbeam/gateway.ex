@@ -928,7 +928,7 @@ defmodule Tightbeam.Gateway do
       end,
       {"withdraw", ["decision_request.withdrawn"]} => fn call -> Escalation.withdraw(db, call) end,
       {"ask", ["decision_request.opened"]} => fn call -> Escalation.ask(db, call) end,
-      {"answer", ["decision_request.ruled"]} => fn call -> Escalation.answer(db, call) end,
+      {"answer", ["decision_request.answered"]} => fn call -> Escalation.answer(db, call) end,
       {"return", ["decision_request.returned"]} => fn call ->
         Escalation.return_request(db, call)
       end,

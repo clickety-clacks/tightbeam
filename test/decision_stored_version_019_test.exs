@@ -56,11 +56,17 @@ defmodule Tightbeam.DecisionStoredVersion019Test do
       assert_field_order(bytes, fields)
     end
 
+    stored_effort = Escalation.raw_by_id(db, effort["id"])
+
     notice =
-      Tightbeam.Firehose.Publisher.committed_notice("decision_request.opened", effort, %{
+      Tightbeam.Firehose.Publisher.committed_notice("decision_request.opened", stored_effort, %{
         "decisionRequestId" => effort["id"]
       })
 
+    assert notice["schemaVersion"] == 2
+    assert notice["resource"] == "decision requests"
+    assert notice["op"] == "upsert"
+    assert notice["refs"] == %{"decisionRequestId" => effort["id"]}
     assert notice["payload"] == effort
 
     assert JSON.decode!(Tightbeam.Firehose.Publisher.encode_wire_notice(notice))["payload"] ==
@@ -328,10 +334,53 @@ defmodule Tightbeam.DecisionStoredVersion019Test do
 
     assert :ok = Schema.ensure_all(db)
 
+    assert {:ok, [[1], [1], [1]]} =
+             DB.query(db, "SELECT rowSchemaRevision FROM decision_requests ORDER BY id")
+
     assert {:ok, [[2]]} =
              DB.query(db, "SELECT rowVersion FROM decision_requests WHERE id='old-1'")
 
     assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
+  end
+
+  test "decision projections require an explicit compatible row schema revision", %{db: db} do
+    insert_decision_rows(db)
+    agent = Escalation.raw_by_id(db, "dr_agent_r7")
+
+    assert agent.row_schema_revision == 2
+    assert StateResources.decision_request(%{agent | row_schema_revision: 1})["status"] == "open"
+
+    assert StateResources.decision_request(%{
+             agent
+             | status: "answered",
+               row_schema_revision: 1
+           })["status"] == "answered"
+
+    returned = %{
+      agent
+      | status: "returned",
+        returned_by: "session:agent-reader",
+        return_reason: "Need evidence",
+        returned_at: agent.raised_at,
+        row_schema_revision: 2
+    }
+
+    assert StateResources.decision_request(returned)["status"] == "returned"
+
+    for malformed <- [
+          %{agent | row_schema_revision: nil},
+          %{agent | row_schema_revision: 3},
+          %{returned | row_schema_revision: 1}
+        ] do
+      assert_raise ArgumentError, ~r/rowSchemaRevision|for rowSchemaRevision/, fn ->
+        StateResources.decision_request(malformed)
+      end
+    end
+
+    queried = StateResources.query_decision_request(db, agent.id)
+    assert queried["rowSchemaRevision"] == 2
+    refute Map.has_key?(queried["item"], :row_schema_revision)
+    refute Map.has_key?(StateResources.decision_request(queried), "rowSchemaRevision")
   end
 
   @tag historical_r1: true
@@ -488,7 +537,8 @@ defmodule Tightbeam.DecisionStoredVersion019Test do
 
     assert {:ok, _} =
              DB.query(db, """
-             UPDATE decision_requests SET status='returned', returnedBy='session:agent:asked',
+             UPDATE decision_requests SET status='returned', rowSchemaRevision=2,
+               returnedBy='session:agent:asked',
                returnReason='clarify', returnedAt=raisedAt WHERE id='dr_agent_r7'
              """)
 

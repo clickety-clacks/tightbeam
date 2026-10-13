@@ -104,7 +104,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     {"wakes", "classElection"} => ~w(sender classifier batcher),
     {"turns", "status"} => ~w(queued running delivered canceled failed failed_unknown),
     {"decision requests", "kind"} => ~w(statute effort agent),
-    {"decision requests", "status"} => ~w(open ruled consumed withdrawn superseded answered),
+    {"decision requests", "status"} => ~w(open answered returned ruled consumed withdrawn superseded),
     {"sessions", "kind"} => ~w(main dm custom),
     {"sessions", "state"} => ~w(active retired),
     {"sessions", "mechanicalStatus"} => ~w(idle running),
