@@ -7,7 +7,8 @@ settles scope and renewed-review applicability; you retain independent judgment.
 
 Use the engineering core's blocking/post-mvp distinction. Explain the required
 consequence and evidence behind each blocker: a metric, unfamiliar structure,
-missing test or preferred format alone is not a defect. Necessary supporting
+missing test or preferred format alone is not a defect. Assess proposed checks
+under the engineering core's Evidence rule. Necessary supporting
 behavior can be in scope without being named in the ask. Route contested scope
 to the delivery owner and product questions to the PO; revise your conclusion
 when governing decisions or evidence change.

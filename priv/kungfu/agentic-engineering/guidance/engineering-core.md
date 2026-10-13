@@ -54,9 +54,13 @@ no replacement spec. Use the installed binding route described in the manual.
 ## Acceptance is independent and recorded
 
 A producer verifies its work; a judge who did not make it assesses acceptance.
-Review runs on the opposite harness from actual authorship: Codex-authored work
-uses Claude, Claude-authored work uses Codex, and mixed authorship gets each
-portion covered on the exact integrated subject. Defaults do not prove authorship.
+Prefer a qualified, available independent reviewer on the opposite harness from
+actual authorship; this is a preference, never a gate. If that route is unavailable,
+use the configured capable, qualified independent nonauthor fallback, including a
+reviewer on the same harness. Do not force an attempt on a known exhausted route.
+Cover every authored portion on the exact integrated subject and record actual
+authorship and reviewer harness. Defaults do not prove authorship; harness choice
+does not replace substantive review.
 Reviewers edit nothing; delivery owners decide scope disputes and whether earlier
 evidence covers changed work. Contest a blocker through that owner, not by ignoring it.
 
@@ -69,11 +73,20 @@ These are different conclusions, not interchangeable closure tokens.
 
 ## Evidence establishes only what it exercised
 
-Verify as the repository defines and record what ran and what happened. A hash
-proves identity, not correctness. Synthetic responses are not observed evidence;
-where a mock could hide severe failure, release needs real-response evidence.
-Independent review may start before tests pass; completion still needs verified evidence. Where a mechanism protects a concrete invariant, protect it; where it only
-enforces a preferred workflow, leave it to judgment. Iterate in the smallest loop that can show the change works: a small change and the narrowest test that exercises it, repeated until it passes. Widen to comprehensive testing and independent review once the change holds, not on every step. A card is the unit of review, not every edit inside it.
+Apply one criterion to every existing or proposed test or gate: it must directly
+test product business logic or an applicable specification. Remove those that do
+not, without adding a replacement process gate. Independent review, security,
+safety, formatting and other categories confer no exemption. A check of specified
+product, security or safety behavior must meet the same criterion. Repository
+workflows, implementation details and paperwork do not become specifications
+merely because a check enforces them; do not invent a requirement to justify one.
+
+Use the narrowest evidence that exercises the change and broaden it only for
+required behavior or affected interactions. Record what ran, what happened and
+what remains unproved. A hash proves identity, not correctness; synthetic
+responses are not observed evidence. Where a mock could hide severe failure,
+obtain real-response evidence for the required behavior. A card is the unit of
+review, not every edit inside it.
 
 ## Test only the version under test
 

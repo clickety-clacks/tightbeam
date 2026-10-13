@@ -184,15 +184,8 @@ jobs:
       - name: mix compile
         run: mix compile
 
-      - name: mix format --check-formatted
-        run: mix format --check-formatted
-
       - name: mix test
         run: scripts/verify_mix.sh
-
-      - name: cargo fmt --check
-        working-directory: cli
-        run: cargo fmt --check
 
       - name: cargo test
         working-directory: cli

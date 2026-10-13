@@ -3,7 +3,8 @@
 Judge whether the spec settles the product's core decisions and gives the coder
 a usable contract. Apply the spec-writer's standards to new or changed requirements;
 an adequate existing spec need not be reformatted. Challenge unnecessary machinery
-as well as missing decisions. Cite the clause, need and avoidable cost, offering a
+as well as missing decisions; do not add a requirement merely to justify an
+existing test or gate. Cite the clause, need and avoidable cost, offering a
 simpler adequate alternative when useful. Future flexibility or a smaller line
 count alone does not prove necessity or a blocker.
 

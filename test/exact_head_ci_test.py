@@ -114,8 +114,7 @@ class ExactHeadCI(unittest.TestCase):
                 self.assertIn('os: ' + platform, self.jobs[name])
             self.assertIn('otp-version: "28"', self.jobs[name])
             self.assertIn('elixir-version: "1.19.5"', self.jobs[name])
-        for command in ('scripts/verify_mix.sh', 'cargo test', 'cargo fmt --check',
-                        'mix format --check-formatted'):
+        for command in ('scripts/verify_mix.sh', 'cargo test'):
             self.assertIn('run: ' + command, self.jobs['test'])
         self.assertIn('run: sh packaging/assemble.sh', self.jobs['release'])
 

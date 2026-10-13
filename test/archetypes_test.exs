@@ -828,8 +828,7 @@ defmodule Tightbeam.ArchetypesTest do
     end
   end
 
-  test "the engineering bundle resolves current defaults and actual-producer review policy",
-       ctx do
+  test "the engineering bundle resolves current defaults", ctx do
     Identity.init!(ctx.base_dir)
     assert {:ok, _revision} = learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
     loaded = Archetypes.load!(ctx.base_dir)
@@ -846,30 +845,6 @@ defmodule Tightbeam.ArchetypesTest do
       assert loaded[role].defaults == %{harness: harness, model: model}
       assert loaded[role].model_preferences == [model]
     end
-
-    policy =
-      Identity.snapshot_at!(
-        ctx.base_dir,
-        Identity.live_revision!(ctx.base_dir),
-        "pdo",
-        :codex
-      ).guidance
-
-    activities =
-      Application.app_dir(:tightbeam, "priv/kungfu/agentic-engineering/preferred-models.md")
-      |> File.read!()
-
-    assert activities =~ "The single engineering activity table and canonical model names are in"
-    assert policy =~ "| Product delivery orchestration | gpt-6-sol[low] |"
-    assert policy =~ "| Executive or delegated lane orchestration | gpt-6-luna[max] |"
-    assert policy =~ "Claude `claude-opus-5-5/high` for Codex production"
-    assert policy =~ "`gpt-6-astra/high` for Claude production"
-
-    assert policy =~
-             "Expand nicknames and pass supported model, effort and matching harness explicitly"
-
-    assert policy =~ "catalog presence does not prove access"
-    refute policy =~ "gpt-6-sol/high for Claude production"
   end
 
   test "where wildcard must stand alone and where must be non-empty", ctx do
