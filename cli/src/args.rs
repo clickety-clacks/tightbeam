@@ -4384,7 +4384,13 @@ mod tests {
                 }),
             ),
             (
-                strings(&["tune", "--session", "agent:coder:x s_1", "--harness", "codex"]),
+                strings(&[
+                    "tune",
+                    "--session",
+                    "agent:coder:x s_1",
+                    "--harness",
+                    "codex",
+                ]),
                 serde_json::json!({
                     "verb": "tune",
                     "sessionKey": "agent:coder:x s_1",
