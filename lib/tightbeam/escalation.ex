@@ -318,7 +318,7 @@ defmodule Tightbeam.Escalation do
                                       columns <>
                                         " " <>
                                         @decision_request_revision_ddl <>
-                                        "\n  CHECK (\n    (kind = 'statute'" <> constraints
+                                        ",\n  CHECK (\n    (kind = 'statute'" <> constraints
 
                                     _ ->
                                       raise "decision_requests table constraint boundary not found"
