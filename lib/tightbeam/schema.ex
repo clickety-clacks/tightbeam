@@ -399,6 +399,7 @@ defmodule Tightbeam.Schema do
   @work_item_owner_link_shape "work-item-delivery-owner-v1-019"
   @assignment_source_replacement_shape "assignment-source-replacement-v1-019"
   @notice_source_payload_shape "notice-source-storage-v1-019"
+  @decision_request_row_schema_shape "decision-request-row-schema-v2-019"
   @identity_publication_denial_diagnostic_previous_shape @artifact_origin_shape
   @identity_publication_denial_diagnostic_shape "identity-publication-denial-diagnostic-v1-019"
   @supervision_receipt_cancellation_shape "supervision-receipt-cancellation-v1-019"
@@ -1535,6 +1536,7 @@ defmodule Tightbeam.Schema do
   @doc false
   def guard_compatible_stamps do
     [
+      @decision_request_row_schema_shape,
       @notice_source_payload_shape,
       @assignment_source_replacement_shape,
       @work_item_owner_link_shape,
@@ -1622,6 +1624,7 @@ defmodule Tightbeam.Schema do
             @artifact_origin_shape,
             @identity_publication_denial_diagnostic_shape,
             @notice_source_payload_shape,
+            @decision_request_row_schema_shape,
             @assignment_source_replacement_shape,
             @work_item_owner_link_shape
           ]
@@ -1714,6 +1717,7 @@ defmodule Tightbeam.Schema do
     :ok = migrate_wake_retry_source_scope(db)
     :ok = upgrade_notice_source_payload(db)
     :ok = migrate_continuation_retry_guard(db)
+    :ok = upgrade_decision_request_row_schema_revision(db)
 
     case DB.finish_schema(db) do
       :ok -> :ok
@@ -1761,6 +1765,9 @@ defmodule Tightbeam.Schema do
              case Txn.q(txn, "SELECT shape FROM schema_stamp") do
                [[@notice_source_payload_shape]] ->
                  validate_notice_source_payload_in_txn!(txn)
+
+             [[@decision_request_row_schema_shape]] ->
+               validate_notice_source_payload_in_txn!(txn)
 
                [[@assignment_source_replacement_shape]] ->
                  unless Txn.q(
@@ -2599,13 +2606,21 @@ defmodule Tightbeam.Schema do
       cond do
         supervision_receipt_cancellation_active?(txn, shape) ->
           liveness_objects =
-            if shape in [@assignment_source_replacement_shape, @notice_source_payload_shape],
+            if shape in [
+                 @assignment_source_replacement_shape,
+                 @notice_source_payload_shape,
+                 @decision_request_row_schema_shape
+               ],
               do: @assignment_source_replacement_liveness_objects,
               else: @supervision_receipt_cancellation_liveness_objects
 
           Enum.reject(liveness_objects, &(&1.name == "supervision_receipt_cancellation_epoch"))
 
-        shape in [@assignment_source_replacement_shape, @notice_source_payload_shape] ->
+        shape in [
+          @assignment_source_replacement_shape,
+          @notice_source_payload_shape,
+          @decision_request_row_schema_shape
+        ] ->
           incompatible_supervision_liveness!(
             "assignment source replacement stamp lacks its exact cancellation activation marker"
           )
@@ -2679,6 +2694,7 @@ defmodule Tightbeam.Schema do
            @artifact_origin_shape,
            @identity_publication_denial_diagnostic_shape,
            @notice_source_payload_shape,
+           @decision_request_row_schema_shape,
            @assignment_source_replacement_shape,
            @work_item_owner_link_shape
          ],
@@ -2692,7 +2708,11 @@ defmodule Tightbeam.Schema do
     |> Enum.reject(&(&1.name in batch_delivery_guard_names))
     |> Enum.each(fn object ->
       if owned_object_present?(txn, object) do
-        if shape in [@assignment_source_replacement_shape, @notice_source_payload_shape] and
+        if shape in [
+             @assignment_source_replacement_shape,
+             @notice_source_payload_shape,
+             @decision_request_row_schema_shape
+           ] and
              object.name == "supervision_liveness_sidecar_insert_coherent" do
           validate_continuation_retry_guard_in_txn!(txn, object)
         else
@@ -3249,6 +3269,52 @@ defmodule Tightbeam.Schema do
     end
   end
 
+  defp upgrade_decision_request_row_schema_revision(db) do
+    case DB.transaction(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@notice_source_payload_shape]] ->
+               :ok = Tightbeam.Escalation.migrate_decision_row_schema_revision_in_txn(txn)
+
+               Txn.q(txn, "UPDATE schema_stamp SET shape=?1,stampedAt=?2 WHERE shape=?3", [
+                 @decision_request_row_schema_shape,
+                 System.system_time(:millisecond),
+                 @notice_source_payload_shape
+               ])
+
+               if Txn.changes(txn) != 1 do
+                 raise ShapeError,
+                   message:
+                     "decision request row schema migration lost its exact stamp transition"
+               end
+
+               :ok
+
+             [[@decision_request_row_schema_shape]] ->
+               :ok =
+                 Tightbeam.Escalation.validate_decision_row_schema_revision_in_txn(
+                   txn,
+                   :current
+                 )
+
+             rows ->
+               raise ShapeError,
+                 message:
+                   "incompatible decision request row schema predecessor: #{inspect(rows)}"
+           end
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "decision request row schema migration failed and was rolled back: #{Exception.message(error)}"
+    end
+  end
+
   defp migrate_supervision_batch_delivery_guards(db) do
     case DB.transaction(db, fn txn -> migrate_supervision_batch_delivery_guards_in_txn(txn) end) do
       {:ok, :ok} ->
@@ -3334,7 +3400,8 @@ defmodule Tightbeam.Schema do
     unless shape in [
              @work_item_owner_link_shape,
              @assignment_source_replacement_shape,
-             @notice_source_payload_shape
+             @notice_source_payload_shape,
+             @decision_request_row_schema_shape
            ] do
       incompatible_supervision_liveness!(
         "receipt cancellation predecessor stamp #{inspect(shape)}"
@@ -3498,7 +3565,11 @@ defmodule Tightbeam.Schema do
 
     case Txn.q(txn, "SELECT shape FROM schema_stamp") do
       [[shape]]
-      when shape in [@assignment_source_replacement_shape, @notice_source_payload_shape] ->
+      when shape in [
+             @assignment_source_replacement_shape,
+             @notice_source_payload_shape,
+             @decision_request_row_schema_shape
+           ] ->
         :ok = marker_shape.()
 
         Enum.each(
@@ -3768,6 +3839,10 @@ defmodule Tightbeam.Schema do
       when shape in [@assignment_source_replacement_shape, @notice_source_payload_shape] ->
         check_work_item_owner_link_shape(db)
 
+      {:ok, [[@decision_request_row_schema_shape]]} ->
+        :ok = check_work_item_owner_link_shape(db)
+        check_decision_request_row_schema_shape(db)
+
       {:ok, [[shape]]}
       when shape in [
              @cursor_provider_shape,
@@ -3874,7 +3949,7 @@ defmodule Tightbeam.Schema do
         this Tightbeam database was written by a different build.
 
           stamped: #{found}
-          this build: #{@notice_source_payload_shape}
+          this build: #{@decision_request_row_schema_shape}
         This build can migrate #{@model_identity_shape} or #{@operator_decision_shape}
         to #{@terminal_decision_liveness_shape}, then #{@effort_request_exit_previous_shape}.
         It can migrate #{@terminal_decision_shape} through
@@ -3888,7 +3963,7 @@ defmodule Tightbeam.Schema do
         #{@settlement_shape}, #{@terminal_credential_shape}, #{@agent_reparent_shape},
         #{@artifact_origin_shape}, #{@identity_publication_denial_diagnostic_shape},
         then #{@work_item_owner_link_shape}, #{@assignment_source_replacement_shape},
-        and #{@notice_source_payload_shape}.
+        and #{@notice_source_payload_shape}, #{@decision_request_row_schema_shape}.
         No migration is defined for the stamped shape above. Keep the database
         in place and run a Tightbeam build that recognizes that exact stamp.
         """
@@ -3901,10 +3976,24 @@ defmodule Tightbeam.Schema do
         this Tightbeam database carries MORE THAN ONE shape stamp.
 
           stamped: #{rows |> List.flatten() |> Enum.join(", ")}
-          this build: #{@notice_source_payload_shape}
+          this build: #{@decision_request_row_schema_shape}
         Nothing in Tightbeam writes a second stamp, so this database was
         assembled by something else. Move it aside and let it be recreated.
         """
+    end
+  end
+
+  defp check_decision_request_row_schema_shape(db) do
+    case DB.transaction(db, fn txn ->
+           Tightbeam.Escalation.validate_decision_row_schema_revision_in_txn(txn, :current)
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "incompatible decision request row schema stamp: #{Exception.message(error)}"
     end
   end
 
@@ -3975,6 +4064,7 @@ defmodule Tightbeam.Schema do
                     @artifact_origin_shape,
                     @identity_publication_denial_diagnostic_shape,
                     @notice_source_payload_shape,
+                    @decision_request_row_schema_shape,
                     @assignment_source_replacement_shape,
                     @work_item_owner_link_shape
                   ] ->
@@ -4063,6 +4153,7 @@ defmodule Tightbeam.Schema do
              @artifact_origin_shape,
              @identity_publication_denial_diagnostic_shape,
              @notice_source_payload_shape,
+             @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
              @work_item_owner_link_shape
            ] ->
@@ -4087,6 +4178,7 @@ defmodule Tightbeam.Schema do
              @artifact_origin_shape,
              @identity_publication_denial_diagnostic_shape,
              @notice_source_payload_shape,
+             @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
              @work_item_owner_link_shape
            ] ->
@@ -4186,6 +4278,7 @@ defmodule Tightbeam.Schema do
                     @artifact_origin_shape,
                     @identity_publication_denial_diagnostic_shape,
                     @notice_source_payload_shape,
+                    @decision_request_row_schema_shape,
                     @assignment_source_replacement_shape,
                     @work_item_owner_link_shape
                   ] ->
@@ -4258,6 +4351,7 @@ defmodule Tightbeam.Schema do
                     @artifact_origin_shape,
                     @identity_publication_denial_diagnostic_shape,
                     @notice_source_payload_shape,
+                    @decision_request_row_schema_shape,
                     @assignment_source_replacement_shape,
                     @work_item_owner_link_shape
                   ] ->
@@ -4358,6 +4452,7 @@ defmodule Tightbeam.Schema do
              @artifact_origin_shape,
              @identity_publication_denial_diagnostic_shape,
              @notice_source_payload_shape,
+             @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
              @work_item_owner_link_shape
            ] ->
@@ -5430,6 +5525,7 @@ defmodule Tightbeam.Schema do
              @artifact_origin_shape,
              @identity_publication_denial_diagnostic_shape,
              @notice_source_payload_shape,
+             @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
              @work_item_owner_link_shape
            ] ->
@@ -5466,6 +5562,7 @@ defmodule Tightbeam.Schema do
              @artifact_origin_shape,
              @identity_publication_denial_diagnostic_shape,
              @notice_source_payload_shape,
+             @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
              @work_item_owner_link_shape
            ] ->
@@ -5574,6 +5671,7 @@ defmodule Tightbeam.Schema do
              @artifact_origin_shape,
              @identity_publication_denial_diagnostic_shape,
              @notice_source_payload_shape,
+             @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
              @work_item_owner_link_shape
            ] ->
@@ -5826,6 +5924,7 @@ defmodule Tightbeam.Schema do
              @artifact_origin_shape,
              @identity_publication_denial_diagnostic_shape,
              @notice_source_payload_shape,
+             @decision_request_row_schema_shape,
              @assignment_source_replacement_shape,
              @work_item_owner_link_shape
            ] ->
@@ -5850,6 +5949,7 @@ defmodule Tightbeam.Schema do
                     @artifact_origin_shape,
                     @identity_publication_denial_diagnostic_shape,
                     @notice_source_payload_shape,
+                    @decision_request_row_schema_shape,
                     @assignment_source_replacement_shape,
                     @work_item_owner_link_shape
                   ] ->
@@ -5887,6 +5987,7 @@ defmodule Tightbeam.Schema do
              when shape in [
                     @work_item_owner_link_shape,
                     @notice_source_payload_shape,
+                    @decision_request_row_schema_shape,
                     @assignment_source_replacement_shape,
                     @identity_publication_denial_diagnostic_shape
                   ] ->
@@ -5942,6 +6043,7 @@ defmodule Tightbeam.Schema do
              when shape in [
                     @work_item_owner_link_shape,
                     @notice_source_payload_shape,
+                    @decision_request_row_schema_shape,
                     @assignment_source_replacement_shape,
                     @identity_publication_denial_diagnostic_shape
                   ] ->
@@ -5995,6 +6097,7 @@ defmodule Tightbeam.Schema do
              when shape in [
                     @work_item_owner_link_shape,
                     @notice_source_payload_shape,
+                    @decision_request_row_schema_shape,
                     @assignment_source_replacement_shape,
                     @identity_publication_denial_diagnostic_shape
                   ] ->
@@ -6057,6 +6160,7 @@ defmodule Tightbeam.Schema do
              when shape in [
                     @identity_publication_denial_diagnostic_shape,
                     @notice_source_payload_shape,
+                    @decision_request_row_schema_shape,
                     @assignment_source_replacement_shape,
                     @work_item_owner_link_shape
                   ] ->
@@ -6102,7 +6206,8 @@ defmodule Tightbeam.Schema do
              when shape in [
                     @work_item_owner_link_shape,
                     @assignment_source_replacement_shape,
-                    @notice_source_payload_shape
+                    @notice_source_payload_shape,
+                    @decision_request_row_schema_shape
                   ] ->
                :ok
 

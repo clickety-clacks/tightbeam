@@ -199,7 +199,7 @@ defmodule Tightbeam.DecisionRowVersionR1MigrationTest do
     seed(db)
     :ok = DB.execute(db, "UPDATE decision_requests SET decision='allow' WHERE id='statute-ruled'")
     assert {:ok, :ok} = upgrade(db)
-    :ok = Escalation.ensure_schema(db)
+    :ok = Schema.ensure_all(db)
     pid = GenServer.whereis(db)
     :erlang.trace_pattern({Wakes, :row_commit_in_txn, 2}, true, [:local])
     :erlang.trace(pid, true, [:call, {:tracer, self()}])
@@ -353,7 +353,8 @@ defmodule Tightbeam.DecisionRowVersionR1MigrationTest do
     assert rows(db, "SELECT shape FROM schema_stamp") == [["row-driven-r1-v1-019"]]
     assert rows(db, "PRAGMA foreign_key_check") == []
 
-    :ok = Escalation.ensure_schema(db)
+    :ok = Schema.ensure_all(db)
+    assert rows(db, "SELECT shape FROM schema_stamp") == [["decision-request-row-schema-v2-019"]]
 
     assert rows(
              db,
