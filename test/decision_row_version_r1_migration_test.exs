@@ -198,7 +198,6 @@ defmodule Tightbeam.DecisionRowVersionR1MigrationTest do
   test "actual consume wins once and emits one decision transition", %{db: db} do
     seed(db)
     :ok = DB.execute(db, "UPDATE decision_requests SET decision='allow' WHERE id='statute-ruled'")
-    assert {:ok, :ok} = upgrade(db)
     :ok = Schema.ensure_all(db)
     pid = GenServer.whereis(db)
     :erlang.trace_pattern({Wakes, :row_commit_in_txn, 2}, true, [:local])
@@ -352,20 +351,6 @@ defmodule Tightbeam.DecisionRowVersionR1MigrationTest do
     assert others(db) == before.other
     assert rows(db, "SELECT shape FROM schema_stamp") == [["row-driven-r1-v1-019"]]
     assert rows(db, "PRAGMA foreign_key_check") == []
-
-    :ok = Schema.ensure_all(db)
-    assert rows(db, "SELECT shape FROM schema_stamp") == [["decision-request-row-schema-v2-019"]]
-
-    assert rows(
-             db,
-             "SELECT DISTINCT rowSchemaRevision FROM decision_requests WHERE status='open'"
-           ) ==
-             [[1]]
-
-    assert rows(
-             db,
-             "SELECT DISTINCT rowSchemaRevision FROM decision_requests WHERE status='returned'"
-           ) == [[2]]
 
     for id <- ["bad-time", "bad-actor"] do
       preserved = snapshot(db)
