@@ -434,6 +434,12 @@ defmodule Tightbeam.Acp.AdapterTest do
           models[m.params.sessionId] = "opus[1m]";
           return send({ id: m.id, result: configOptions(m.params.sessionId) });
         }
+        if (failMode === "default-context-variant" &&
+            m.params.configId === "model" &&
+            m.params.value === "claude-fable-5") {
+          models[m.params.sessionId] = "claude-fable-5[1m]";
+          return send({ id: m.id, result: configOptions(m.params.sessionId) });
+        }
         if ((failMode === "future-alias" || failMode === "future-alias-drift" || failMode === "future-name-only") &&
             m.params.configId === "model" &&
             m.params.value === "claude-nova-7-3") {
@@ -2313,6 +2319,31 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert strict_writes == ["composer-2.5", "composer-2.5[fast=true]"]
   end
 
+  test "Cursor resident switch accepts a newly offered decorated wire option" do
+    {adapter, capture} = start_adapter(harness: :cursor, fail_mode: "cursor-wire-enum")
+
+    assert {:ok, "sess-1"} =
+             Adapter.new_session(adapter, Model.new("auto"), "/tmp", [], "guidance")
+
+    requested = Model.new("horizon-8")
+
+    assert {:ok, "sess-1"} =
+             Adapter.switch_model_session(adapter, "sess-1", requested, "/tmp", [], "guidance")
+
+    assert {:ok, ^requested} = Adapter.current_model(adapter, "sess-1")
+
+    assert ["horizon-8", "horizon-8[fast=true]"] ==
+             capture
+             |> captured_requests()
+             |> Enum.filter(
+               &(&1["method"] == "session/set_config_option" and &1["configId"] == "model")
+             )
+             |> Enum.map(& &1["value"])
+             |> Enum.drop_while(&(&1 != "horizon-8"))
+
+    refute Enum.any?(captured_requests(capture), &(&1["method"] == "session/fork"))
+  end
+
   test "Cursor refuses a ref no wire option is named for" do
     {adapter, capture} = start_adapter(harness: :cursor, fail_mode: "cursor-wire-enum")
 
@@ -2423,6 +2454,27 @@ defmodule Tightbeam.Acp.AdapterTest do
              [{"model", "claude-opus-5-5"}, {"effort", "high"}]
 
     refute Enum.any?(captured_requests(capture_path), fn request ->
+             request["method"] == "session/close" and request["sessionId"] == "sess-1"
+           end)
+  end
+
+  test "a default-context candidate refuses a different selected context variant" do
+    {adapter, capture_path} =
+      start_adapter(harness: :claude, fail_mode: "default-context-variant")
+
+    assert {:error,
+            {:session_prepare_failed,
+             {:runtime_config_mismatch, %Model{family: "claude-fable-5", context: "1m"}},
+             "sess-1", %{status: "verified"}}} =
+             Adapter.new_candidate_session(
+               adapter,
+               Model.new("claude-fable-5"),
+               "/tmp",
+               [],
+               "guidance"
+             )
+
+    assert Enum.any?(captured_requests(capture_path), fn request ->
              request["method"] == "session/close" and request["sessionId"] == "sess-1"
            end)
   end

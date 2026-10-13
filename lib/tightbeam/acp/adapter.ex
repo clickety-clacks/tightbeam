@@ -767,39 +767,69 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   defp apply_verified_in_place_model(state, sid, %Model{} = model, request_timeout) do
-    value = Model.to_ref(model)
-
-    case map_switch_model_refusal(
-           Conn.request(
-             state.conn,
-             "session/set_config_option",
-             %{sessionId: sid, configId: "model", value: value},
-             timeout: request_timeout,
-             diagnostic: true
-           ),
-           value
+    case try_in_place_model_values(
+           state,
+           sid,
+           model,
+           request_timeout,
+           model_candidates(state, sid, model)
          ) do
       {:ok, model_result} ->
-        cond do
-          not read_back?(model_result, "model", value) ->
-            verified_model_mismatch(model_result, state.preset, "model", value)
+        case apply_verified_effort(
+               state,
+               sid,
+               model.effort,
+               model_result,
+               request_timeout
+             ) do
+          {:ok, verified_result} ->
+            case confirmed_public_model(verified_result, state.preset, model) do
+              %Model{} = public ->
+                {:ok, %{model | context: public.context || model.context}}
 
-          true ->
-            case apply_verified_effort(
-                   state,
-                   sid,
-                   model.effort,
-                   model_result,
-                   request_timeout
-                 ) do
-              {:ok, _verified_result} -> {:ok, model}
-              {:error, {:runtime_config_mismatch, %Model{}}} = mismatch -> mismatch
-              {:error, _reason} = error -> error
+              nil ->
+                verified_model_mismatch(
+                  verified_result,
+                  state.preset,
+                  "model",
+                  Model.to_ref(model)
+                )
             end
+          {:error, {:runtime_config_mismatch, %Model{}}} = mismatch -> mismatch
+          {:error, _reason} = error -> error
         end
 
       {:error, _reason} = error ->
         error
+    end
+  end
+
+  defp try_in_place_model_values(_state, _sid, _model, _timeout, []),
+    do: {:error, :model_unavailable}
+
+  defp try_in_place_model_values(state, sid, model, timeout, [value | remaining]) do
+    result =
+      map_switch_model_refusal(
+        Conn.request(
+          state.conn,
+          "session/set_config_option",
+          %{sessionId: sid, configId: "model", value: value},
+          timeout: timeout,
+          diagnostic: true
+        ),
+        value
+      )
+
+    case result do
+      {:ok, model_result} ->
+        if readback_confirms_model?(model_result, state.preset, model),
+          do: {:ok, model_result},
+          else: verified_model_mismatch(model_result, state.preset, "model", value)
+
+      {:error, reason} = error ->
+        if ErrorDiagnostic.classified(reason) == :model_unavailable and remaining != [],
+          do: try_in_place_model_values(state, sid, model, timeout, remaining),
+          else: error
     end
   end
 
@@ -1762,9 +1792,18 @@ defmodule Tightbeam.Acp.Adapter do
           # Some clients return an opaque wire alias after accepting a public
           # model ref. Trust the selected offered option only when it names the
           # requested model and context; never infer identity from the alias.
-          if readback_confirms_model?(effort_result, state.preset, model_ref),
-            do: {:ok, %{model_ref | effort: applied_model.effort}},
-            else: {:ok, applied_model}
+          case confirmed_public_model(effort_result, state.preset, model_ref) do
+            %Model{} = public_model ->
+              {:ok,
+               %{
+                 model_ref
+                 | context: public_model.context || model_ref.context,
+                   effort: applied_model.effort
+               }}
+
+            nil ->
+              {:ok, applied_model}
+          end
 
         :error ->
           unconfirmed = readback_node(effort_result, "model", Model.to_ref(model_ref), "readback")
@@ -1774,16 +1813,7 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   defp apply_model_value(state, sid, %Model{} = model_ref, request) do
-    canonical = Model.to_ref(model_ref)
-
-    aliases =
-      Map.get(state.preset, :model_option_aliases, %{})
-      |> Enum.filter(fn {_wire, public} -> public == canonical end)
-      |> Enum.map(&elem(&1, 0))
-
-    wire_candidates = cached_wire_values_by_name(state, sid, model_ref)
-
-    candidates = Enum.uniq([canonical | aliases] ++ wire_candidates)
+    candidates = model_candidates(state, sid, model_ref)
 
     candidates
     |> Enum.reduce_while({:error, []}, fn value, {:error, attempts} ->
@@ -1823,6 +1853,17 @@ defmodule Tightbeam.Acp.Adapter do
       {:error, attempts} when is_list(attempts) -> {:error, refused_all(attempts)}
       result -> result
     end
+  end
+
+  defp model_candidates(state, sid, %Model{} = model_ref) do
+    canonical = Model.to_ref(model_ref)
+
+    aliases =
+      Map.get(state.preset, :model_option_aliases, %{})
+      |> Enum.filter(fn {_wire, public} -> public == canonical end)
+      |> Enum.map(&elem(&1, 0))
+
+    Enum.uniq([canonical | aliases] ++ cached_wire_values_by_name(state, sid, model_ref))
   end
 
   # The adapter's own refusal of a model value — JSON-RPC -32602 Invalid params,
@@ -2171,13 +2212,18 @@ defmodule Tightbeam.Acp.Adapter do
   defp model_option_values(_result), do: []
 
   defp readback_confirms_model?(result, preset, %Model{} = model) do
+    match?(%Model{}, confirmed_public_model(result, preset, model))
+  end
+
+  defp confirmed_public_model(result, preset, %Model{} = model) do
     with %{} = config <- model_config_option(result),
          value when is_binary(value) <- config["currentValue"] || config["value"],
          %{} = option <- selected_model_option(config, value),
-         %Model{} = public_model <- public_option_model(preset, option) do
-      public_option_confirms_model?(option, public_model, model)
+         %Model{} = public_model <- public_option_model(preset, option),
+         true <- public_option_confirms_model?(option, public_model, model) do
+      public_model
     else
-      _ -> false
+      _ -> nil
     end
   end
 
@@ -2204,6 +2250,9 @@ defmodule Tightbeam.Acp.Adapter do
     cond do
       Enum.any?(preset.canonical_model_prefixes, &String.starts_with?(value, &1)) ->
         Model.parse_ref(value)
+
+      is_binary(Map.get(Map.get(preset, :model_option_aliases, %{}), value)) ->
+        Model.parse_ref(preset.model_option_aliases[value])
 
       # Wire-by-name presets: the option name IS the public ref — except where
       # the static alias table already names the option's public identity
