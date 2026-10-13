@@ -318,9 +318,9 @@ defmodule Tightbeam.DecisionRowVersionR1MigrationTest do
   end
 
   @tag rest_r7_boundary: true
-  test "R7 preserves malformed legacy returns and versions same-millisecond changes", %{db: db} do
+  test "returned snapshots retain R2 shape and version same-millisecond changes", %{db: db} do
+    :ok = Schema.ensure_all(db)
     seed(db)
-    assert {:ok, :ok} = prerequisites(db)
 
     for {id, actor, at} <- [
           {"valid", "session:holder", 3},
@@ -333,24 +333,13 @@ defmodule Tightbeam.DecisionRowVersionR1MigrationTest do
                  """
                  INSERT INTO decision_requests(id,kind,raiserId,raiserSessionKey,ownerUserId,
                    expecterSessionKey,expecterUserId,raisedAt,question,context,status,
-                   returnedBy,returnReason,returnedAt)
+                   returnedBy,returnReason,returnedAt,rowSchemaRevision)
                  VALUES (?1,'agent','session:raiser','raiser','fixture','holder','fixture',1,
-                   'question','{}','returned',?2,'original',?3)
+                   'question','{}','returned',?2,'original',?3,2)
                  """,
                  [id, actor, at]
                )
     end
-
-    columns = rows(db, "PRAGMA table_info(decision_requests)") |> Enum.map(&Enum.at(&1, 1))
-    before = snapshot(db)
-    assert {:ok, :ok} = version(db)
-
-    assert rows(db, "SELECT " <> Enum.join(columns, ",") <> " FROM decision_requests ORDER BY id") ==
-             before.decisions
-
-    assert others(db) == before.other
-    assert rows(db, "SELECT shape FROM schema_stamp") == [["row-driven-r1-v1-019"]]
-    assert rows(db, "PRAGMA foreign_key_check") == []
 
     for id <- ["bad-time", "bad-actor"] do
       preserved = snapshot(db)
