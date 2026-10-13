@@ -2571,7 +2571,6 @@ defmodule Tightbeam.Escalation do
     )
 
     request = request_in_txn(txn, request_id)
-    request = publish_decision_transition_in_txn(txn, nil, request)
 
     EventLog.lifecycle_in_txn(
       txn,
