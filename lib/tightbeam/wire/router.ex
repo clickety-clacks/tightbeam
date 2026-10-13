@@ -112,6 +112,12 @@ defmodule Tightbeam.Wire.Router do
       filters: ~w(state ownerUserId createdBySession createdByUser isBug specRefName holderKey),
       order: ~w(createdAt id)
     },
+    decision_requests: %{
+      resource: "decision requests",
+      route: "decision_requests.collection",
+      filters: ~w(status kind ownerUserId assignmentId raiserSessionKey expecterSessionKey),
+      order: ~w(raisedAt id)
+    },
     config: D1Read.spec(:config),
     host_environment: D1Read.spec(:host_environment),
     hosts: D1Read.spec(:hosts),
@@ -640,6 +646,10 @@ defmodule Tightbeam.Wire.Router do
 
   get "/api/work-items" do
     d1_collection(conn, Map.fetch!(@d1_resources, :work_items))
+  end
+
+  get "/api/decision-requests" do
+    d1_collection(conn, Map.fetch!(@d1_resources, :decision_requests))
   end
 
   get "/api/work-items/:id" do
@@ -1450,11 +1460,50 @@ defmodule Tightbeam.Wire.Router do
     end
   end
 
+  defp d1_decision_request_page(conn, request, boundary, principal, spec) do
+    result =
+      Tightbeam.Escalation.page_collection(
+        db(conn),
+        request.filters,
+        principal,
+        boundary,
+        request.limit
+      )
+
+    items = Enum.map(result.rows, &StateResources.decision_request/1)
+    tuples = Enum.map(items, &d1_row_tuple(:decision_requests, &1))
+
+    page =
+      case tuples do
+        [] ->
+          %{
+            oldest: nil,
+            newest: nil,
+            before: result.flags.has_more_before,
+            after: result.flags.has_more_after
+          }
+
+        _ ->
+          %{
+            oldest: d1_cursor(hd(tuples), "before", request.filters, principal, spec, conn),
+            newest: d1_cursor(List.last(tuples), "after", request.filters, principal, spec, conn),
+            before: result.flags.has_more_before,
+            after: result.flags.has_more_after
+          }
+      end
+
+    {items, page}
+  end
   defp d1_row_tuple(:work_items, item),
     do: [Map.fetch!(item, "createdAt"), Map.fetch!(item, "id")]
 
+  defp d1_row_tuple(:decision_requests, item),
+    do: [Map.fetch!(item, "raisedAt"), Map.fetch!(item, "id")]
+
   defp d1_row_tuple(resource, item), do: D1Read.tuple(resource, item)
   defp d1_encode(:work_items, item), do: StateResources.encode_item("work items", item, %{})
+  defp d1_encode(:decision_requests, item),
+    do: StateResources.encode_item("decision requests", item, %{})
   defp d1_encode(resource, item), do: D1Read.encode(resource, item)
 
   defp d1_collection(conn, spec) do
@@ -1463,42 +1512,47 @@ defmodule Tightbeam.Wire.Router do
          {:ok, principal} <- d1_principal(auth, query, conn),
          {:ok, request} <- d1_collection_request(query, spec),
          {:ok, boundary} <- d1_boundary(request, principal, spec, conn) do
-      result =
-        cond do
-          spec.resource == "work items" ->
-            page =
-              StateResources.query_work_item_page(
+      if d1_resource(spec) == :decision_requests do
+        {items, page} = d1_decision_request_page(conn, request, boundary, principal, spec)
+        d1_send(conn, 200, d1_collection_envelope(spec, items, page))
+      else
+        result =
+          cond do
+            spec.resource == "work items" ->
+              page =
+                StateResources.query_work_item_page(
+                  db(conn),
+                  request.filters,
+                  %{rest_principal: principal},
+                  boundary,
+                  request.limit
+                )
+
+              %{
+                items: Enum.map(page.rows, &StateResources.work_item/1),
+                flags: %{
+                  has_more_before: page.has_more_before,
+                  has_more_after: page.has_more_after
+                }
+              }
+
+            D1Read.visible?(d1_resource(spec), principal.is_admin) ->
+              D1Read.page(
                 db(conn),
+                deps(conn).base_dir,
+                d1_resource(spec),
                 request.filters,
-                %{rest_principal: principal},
                 boundary,
                 request.limit
               )
 
-            %{
-              items: Enum.map(page.rows, &StateResources.work_item/1),
-              flags: %{
-                has_more_before: page.has_more_before,
-                has_more_after: page.has_more_after
-              }
-            }
+            true ->
+              %{items: [], flags: %{has_more_before: false, has_more_after: false}}
+          end
 
-          D1Read.visible?(d1_resource(spec), principal.is_admin) ->
-            D1Read.page(
-              db(conn),
-              deps(conn).base_dir,
-              d1_resource(spec),
-              request.filters,
-              boundary,
-              request.limit
-            )
-
-          true ->
-            %{items: [], flags: %{has_more_before: false, has_more_after: false}}
-        end
-
-      {items, page} = d1_keyset_page(result, request, principal, spec, conn)
-      d1_send(conn, 200, d1_collection_envelope(spec, items, page))
+        {items, page} = d1_keyset_page(result, request, principal, spec, conn)
+        d1_send(conn, 200, d1_collection_envelope(spec, items, page))
+      end
     else
       {:error, status, code, message} -> d1_error(conn, spec.resource, status, code, message)
     end
@@ -1681,6 +1735,12 @@ defmodule Tightbeam.Wire.Router do
   defp d1_filter_value?("work items", "state", value),
     do: value in ~w(open iceboxed closed failed)
 
+  defp d1_filter_value?("decision requests", "kind", value),
+    do: value in ~w(statute effort agent)
+
+  defp d1_filter_value?("decision requests", "status", value),
+    do: value in ~w(open ruled consumed withdrawn superseded answered returned)
+
   defp d1_filter_value?("work items", "isBug", value), do: value in ~w(true false)
   defp d1_filter_value?("work items", _field, value), do: is_binary(value) and value != ""
   defp d1_filter_value?(_resource, field, value), do: d1_filter_value?(field, value)
@@ -1725,6 +1785,11 @@ defmodule Tightbeam.Wire.Router do
     do: is_integer(created_at) and is_binary(id) and id != ""
 
   defp d1_tuple?(_tuple, :work_items), do: false
+
+  defp d1_tuple?([raised_at, id], :decision_requests),
+    do: is_integer(raised_at) and is_binary(id) and id != ""
+
+  defp d1_tuple?(_tuple, :decision_requests), do: false
 
   defp d1_tuple?(tuple, resource),
     do:

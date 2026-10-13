@@ -1705,6 +1705,7 @@ defmodule Tightbeam.Schema do
     :ok = ensure_lifecycle_runtime_indexes(db)
     :ok = ensure_idle_cleanup_runtime_indexes(db)
     :ok = ensure_rest_collection_indexes(db)
+    :ok = ensure_decision_request_collection_indexes(db)
 
     # Batch-aware supervision guards reference notice_batches, so install them
     # only after all predecessor migrations and refusal checks have completed
@@ -2447,6 +2448,54 @@ defmodule Tightbeam.Schema do
       {:error, error} ->
         raise ShapeError,
           message: "REST collection index migration failed: #{Exception.message(error)}"
+    end
+  end
+
+  # Keep decision-request keyset pages on indexed filter and order paths.
+  # This is a separate migration so databases that already recorded
+  # :rest_collection_indexes still receive these access paths.
+  defp ensure_decision_request_collection_indexes(db) do
+    indexes = [
+      {"decision_requests_rest_raised_order",
+       "CREATE INDEX IF NOT EXISTS decision_requests_rest_raised_order " <>
+         "ON decision_requests(raisedAt, id)"},
+      {"decision_requests_rest_status_order",
+       "CREATE INDEX IF NOT EXISTS decision_requests_rest_status_order " <>
+         "ON decision_requests(status, raisedAt, id)"},
+      {"decision_requests_rest_kind_order",
+       "CREATE INDEX IF NOT EXISTS decision_requests_rest_kind_order " <>
+         "ON decision_requests(kind, raisedAt, id)"},
+      {"decision_requests_rest_owner_order",
+       "CREATE INDEX IF NOT EXISTS decision_requests_rest_owner_order " <>
+         "ON decision_requests(ownerUserId, raisedAt, id)"},
+      {"decision_requests_rest_assignment_order",
+       "CREATE INDEX IF NOT EXISTS decision_requests_rest_assignment_order " <>
+         "ON decision_requests(assignmentId, raisedAt, id)"},
+      {"decision_requests_rest_raiser_order",
+       "CREATE INDEX IF NOT EXISTS decision_requests_rest_raiser_order " <>
+         "ON decision_requests(raiserId, raisedAt, id)"},
+      {"decision_requests_rest_raiser_session_order",
+       "CREATE INDEX IF NOT EXISTS decision_requests_rest_raiser_session_order " <>
+         "ON decision_requests(raiserSessionKey, raisedAt, id)"},
+      {"decision_requests_rest_expecter_session_order",
+       "CREATE INDEX IF NOT EXISTS decision_requests_rest_expecter_session_order " <>
+         "ON decision_requests(expecterSessionKey, raisedAt, id)"},
+      {"decision_requests_rest_expecter_user_order",
+       "CREATE INDEX IF NOT EXISTS decision_requests_rest_expecter_user_order " <>
+         "ON decision_requests(expecterUserId, raisedAt, id)"}
+    ]
+
+    case DB.migration_transaction(db, :decision_request_collection_indexes, [], [], fn txn ->
+           Enum.each(indexes, fn {_name, sql} -> :ok = Txn.exec(txn, sql) end)
+           :ok
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "REST decision-request collection index migration failed: #{Exception.message(error)}"
     end
   end
 
