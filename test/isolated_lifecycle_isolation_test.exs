@@ -1,7 +1,7 @@
 defmodule Tightbeam.IsolatedLifecycleIsolationTest do
-  # Phase-1 regression suite for teardown-isolation v4-final-r2. Reuses the
-  # shape of merge_gate_isolation_test.exs (shim/env-poison harness) and the
-  # shared production-identity scrub definition (scripts/production-identity-env,
+  # Phase-1 regression suite for teardown-isolation v4-final-r2. Reuses a
+  # shim/env-poison harness and the shared production-identity scrub definition
+  # (scripts/production-identity-env,
   # via Tightbeam.ProductionIdentityEnv).
   #
   # The incident: a test teardown ran `stop` in an environment where the
