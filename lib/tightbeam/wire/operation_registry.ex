@@ -44,6 +44,7 @@ defmodule Tightbeam.Wire.OperationRegistry do
     {{"GET", "/api/wakes/:wake_id"}, "http.api_wakes.get"},
     {{"GET", "/api/turns/:turn_seq"}, "http.api_turns.get"},
     {{"GET", "/api/decision-requests/:decision_request_id"}, "http.api_decision_requests.get"},
+    {{"GET", "/api/decision-requests"}, "http.api_decision_requests.list"},
     {{"GET", "/api/sessions"}, "http.api_sessions.list"},
     {{"GET", "/api/sessions/:session_key"}, "http.api_sessions.get"},
     {{"GET", "/api/sessions/:session_key/messages"}, "http.api_sessions.messages"},

@@ -22,8 +22,7 @@ defmodule Tightbeam.DispatchTest do
     :persistent_term.erase(Rules)
     name = :"db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: name})
-    :ok = EventLog.ensure_schema(name)
-    :ok = Escalation.ensure_schema(name)
+    :ok = Tightbeam.Schema.ensure_all(name)
 
     on_exit(fn -> :persistent_term.erase(Rules) end)
 

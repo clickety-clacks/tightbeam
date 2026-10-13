@@ -2761,6 +2761,7 @@ defmodule Tightbeam.Wire.Router do
       {key, value} when is_atom(key) -> {lower_camel(Atom.to_string(key)), wire_value(value)}
       {key, value} -> {key, wire_value(value)}
     end)
+    |> Map.delete("rowSchemaRevision")
   end
 
   defp wire_value(list) when is_list(list), do: Enum.map(list, &wire_value/1)

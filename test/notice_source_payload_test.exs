@@ -568,7 +568,7 @@ defmodule Tightbeam.NoticeSourcePayloadTest do
     :ok =
       DB.execute(
         db,
-        "DROP INDEX notice_source_client_identity; ALTER TABLE wakes DROP COLUMN sourceClientIdentity; ALTER TABLE wakes DROP COLUMN sourceAttachments; ALTER TABLE wakes DROP COLUMN sourceVisibilityScope; ALTER TABLE wakes DROP COLUMN sourceAddress;"
+        "DROP INDEX notice_source_client_identity; ALTER TABLE wakes DROP COLUMN sourceClientIdentity; ALTER TABLE wakes DROP COLUMN sourceAttachments; ALTER TABLE wakes DROP COLUMN sourceVisibilityScope; ALTER TABLE wakes DROP COLUMN sourceAddress; ALTER TABLE decision_requests DROP COLUMN rowSchemaRevision;"
       )
 
     frozen = File.read!(Path.expand("fixtures/notice_source_payload_6642ee93.sql", __DIR__))

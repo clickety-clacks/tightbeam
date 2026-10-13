@@ -510,16 +510,27 @@ defmodule Tightbeam.Escalation do
         message: "incompatible decision request status at rowSchemaRevision adoption"
     end
 
-    :ok =
-      Txn.exec(
-        txn,
-        "ALTER TABLE decision_requests ADD COLUMN " <> @decision_request_revision_ddl
-      )
+    [[previous_ignore_check_constraints]] = Txn.q(txn, "PRAGMA ignore_check_constraints")
+    :ok = Txn.exec(txn, "PRAGMA ignore_check_constraints=ON")
 
-    Txn.q(
-      txn,
-      "UPDATE decision_requests SET rowSchemaRevision=2 WHERE status='returned'"
-    )
+    try do
+      :ok =
+        Txn.exec(
+          txn,
+          "ALTER TABLE decision_requests ADD COLUMN " <> @decision_request_revision_ddl
+        )
+
+      Txn.q(
+        txn,
+        "UPDATE decision_requests SET rowSchemaRevision=2 WHERE status='returned'"
+      )
+    after
+      :ok =
+        Txn.exec(
+          txn,
+          "PRAGMA ignore_check_constraints=#{previous_ignore_check_constraints}"
+        )
+    end
 
     :ok = validate_decision_row_schema_revision_in_txn(txn, :current)
   end
@@ -2304,17 +2315,17 @@ defmodule Tightbeam.Escalation do
   end
 
   defp public_transition_candidate?(nil, %{kind: kind, status: "open"})
-       when kind in ~w(statute effort agent),
+       when kind in ~w(statute effort agent operator),
        do: true
 
   defp public_transition_candidate?(%{id: id}, %{id: id, kind: kind})
-       when kind in ~w(statute effort agent),
+       when kind in ~w(statute effort agent operator),
        do: true
 
   defp public_transition_candidate?(_before, _after), do: false
 
   defp public_transition_class(nil, %{"kind" => kind, "status" => "open"})
-       when kind in ~w(statute effort agent),
+       when kind in ~w(statute effort agent operator),
        do: "decision_request.opened"
 
   defp public_transition_class(
@@ -2343,7 +2354,7 @@ defmodule Tightbeam.Escalation do
          "kind" => kind,
          "status" => "ruled"
        })
-       when kind in ~w(statute effort),
+       when kind in ~w(statute effort operator),
        do: "decision_request.ruled"
 
   defp public_transition_class(%{"kind" => kind, "status" => "ruled"}, %{
@@ -2357,13 +2368,14 @@ defmodule Tightbeam.Escalation do
          "kind" => kind,
          "status" => "withdrawn"
        })
-       when kind in ~w(statute effort agent),
+       when kind in ~w(statute effort agent operator),
        do: "decision_request.withdrawn"
 
-  defp public_transition_class(%{"kind" => "effort", "status" => "open"}, %{
-         "kind" => "effort",
+  defp public_transition_class(%{"kind" => kind, "status" => "open"}, %{
+         "kind" => kind,
          "status" => "superseded"
-       }),
+       })
+       when kind in ~w(effort operator),
        do: "decision_request.superseded"
 
   defp public_transition_class(_before, _after), do: nil
