@@ -5569,7 +5569,7 @@ defmodule Tightbeam.Wakes do
 
   @doc "Return one bounded page of wakes targeting a session in stable creation order."
   def list_for_session_page(db, session_key, boundary, limit) do
-    select_from = String.replace_suffix(select_wake_sql(), "wakes", "")
+    select_from = select_wake_sql()
 
     case DB.transaction(db, fn txn ->
            query = fn sql, params -> Txn.q(txn, sql, params) end

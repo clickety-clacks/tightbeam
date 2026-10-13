@@ -322,6 +322,7 @@ defmodule Tightbeam.DispatchTest do
     rule = %{
       name: "cas-rule",
       verb: "post",
+      verbs: ["post"],
       text: "owner approval required",
       conditions: [],
       edges: ["verb"],
