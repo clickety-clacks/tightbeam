@@ -1151,6 +1151,10 @@ defmodule Tightbeam.Firehose.PublisherTest do
       Tightbeam.DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES ('flynn', 1, 1)")
 
     %{name: "worker"} = Tightbeam.Roles.create!(db, "worker", "flynn", nil)
+    expected_item =
+      db
+      |> Tightbeam.StateResources.query_role("worker")
+      |> Tightbeam.StateResources.role()
 
     call = %{
       verb: "role-rm",
@@ -1165,12 +1169,12 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     assert %{"class" => "verb.accepted"} = receive_notice()
 
-    assert %{
-             "class" => "role.removed",
-             "op" => "delete",
-             "refs" => %{"role" => "worker"},
-             "payload" => %{"role" => "worker", "ownerUserId" => "flynn"}
-           } = receive_notice()
+    notice = receive_notice()
+    assert notice["class"] == "role.removed"
+    assert notice["op"] == "delete"
+    assert notice["refs"]["role"] == "worker"
+    assert notice["payload"] == expected_item
+    refute Map.has_key?(notice["payload"], "role")
   end
 
   test "a rail denial emits both observational classes" do
