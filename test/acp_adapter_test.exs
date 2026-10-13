@@ -316,7 +316,7 @@ defmodule Tightbeam.Acp.AdapterTest do
         const sid = gateMode !== "none" && gateMode !== "delay-setup" && newCalls === 1 ? "probe-sess" : "sess-1";
         models[sid] = models[sid] || "haiku";
         offeredModels[sid] = [...defaultOfferedModels];
-        if (failMode === "resident-default-context-variant" || failMode === "fork-effort-context-drift") offeredModels[sid].push("orbit-9[1m]");
+        if (failMode === "resident-default-context-variant") offeredModels[sid].push("orbit-9[1m]");
         if (gateMode === "delay-setup") return setTimeout(() => send({ id: m.id, result: { sessionId: sid, ...configOptions(sid) } }), 75);
         return send({ id: m.id, result: { sessionId: sid, ...configOptions(sid) } });
       }
@@ -335,7 +335,6 @@ defmodule Tightbeam.Acp.AdapterTest do
         const sid = "sess-fork-" + forkCalls;
         models[sid] = models[m.params.sessionId] || "haiku";
         offeredModels[sid] = [...defaultOfferedModels];
-        if (failMode === "fork-effort-context-drift") offeredModels[sid].push("orbit-9[1m]");
         return send({ id: m.id, result: { sessionId: sid, ...configOptions(sid) } });
       }
       case "session/close": capture(m); return send({ id: m.id, result: {} });
@@ -447,7 +446,7 @@ defmodule Tightbeam.Acp.AdapterTest do
           models[m.params.sessionId] = "claude-fable-5[1m]";
           return send({ id: m.id, result: configOptions(m.params.sessionId) });
         }
-        if ((failMode === "future-alias" || failMode === "future-alias-drift" || failMode === "future-name-only") &&
+        if ((failMode === "future-alias" || failMode === "future-alias-drift" || failMode === "future-name-only" || failMode === "future-alias-fork-effort-drift") &&
             m.params.configId === "model" &&
             m.params.value === "claude-nova-7-3[1m]") {
           models[m.params.sessionId] = "nova[1m]";
@@ -469,10 +468,10 @@ defmodule Tightbeam.Acp.AdapterTest do
         if (failMode === "candidate-concrete-default-effort" && m.params.configId === "effort") {
           return send({ id: m.id, result: configOptions(m.params.sessionId) });
         }
-        if (failMode === "fork-effort-context-drift" &&
-            m.params.configId === "reasoning_effort" &&
+        if (failMode === "future-alias-fork-effort-drift" &&
+            m.params.configId === "effort" &&
             m.params.sessionId.startsWith("sess-fork-")) {
-          models[m.params.sessionId] = "orbit-9[1m]";
+          models[m.params.sessionId] = "opus[1m]";
           efforts[m.params.sessionId] = m.params.value;
           return send({ id: m.id, result: configOptions(m.params.sessionId) });
         }
@@ -2516,19 +2515,22 @@ defmodule Tightbeam.Acp.AdapterTest do
     refute Enum.any?(captured_requests(capture_path), &(&1["method"] == "session/fork"))
   end
 
-  test "a fork refuses a context change in the final effort readback" do
+  test "a fork refuses a model change in the final effort readback" do
     {adapter, capture_path} =
-      start_adapter(harness: :codex, fail_mode: "fork-effort-context-drift")
-    requested = Model.new("orbit-9", effort: "high")
+      start_adapter(harness: :claude, fail_mode: "future-alias-fork-effort-drift")
+
+    requested = Model.new("claude-nova-7-3", context: "1m", effort: "high")
 
     assert {:ok, "sess-1"} =
              Adapter.new_candidate_session(adapter, requested, "/tmp", [], "guidance")
+
+    assert {:ok, _turn} = Adapter.prompt(adapter, "sess-1", "persist this conversation")
 
     result = Adapter.switch_model_session(adapter, "sess-1", requested, "/tmp", [], "guidance")
 
     assert {:error,
             {:model_apply_failed,
-             {:runtime_config_mismatch, %Model{family: "orbit-9", context: "1m"}}}} =
+             {:runtime_config_mismatch, %Model{family: "opus", context: "1m"}}}} =
              ErrorDiagnostic.classified(result)
 
     assert %{"cleanup" => %{"status" => "verified", "sessionId" => "sess-fork-1"}} =
