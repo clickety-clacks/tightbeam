@@ -8,6 +8,7 @@ defmodule Tightbeam.Org do
     AdminProjection,
     DB,
     EventLog,
+    Keyset,
     NoticeBatcher,
     Supervision,
     TerminalCredentialFailure,
@@ -613,6 +614,28 @@ defmodule Tightbeam.Org do
       DB.query(db, select_session_sql() <> " WHERE #{where} ORDER BY #{order}", params)
 
     Enum.map(rows, &to_session/1)
+  end
+
+  @doc "Return one bounded owner-only active-session page in the existing UI order."
+  def list_for_user_page(db, user_id, boundary, limit) do
+    case DB.transaction(db, fn txn ->
+           query = fn sql, params -> Txn.q(txn, sql, params) end
+
+           Keyset.page(
+             query,
+             select_session_sql(),
+             "sessions",
+             "ownerUserId = ? AND state = 'active'",
+             [user_id],
+             ["orderIndex", "createdAt", "sessionKey"],
+             boundary,
+             limit,
+             fn row -> [Enum.at(row, 3), Enum.at(row, 26), hd(row)] end
+           )
+         end) do
+      {:ok, page} -> %{rows: Enum.map(page.rows, &to_session/1), flags: page}
+      {:error, error} -> raise error
+    end
   end
 
   @doc "Every session, including retired rows, in deterministic creation order."

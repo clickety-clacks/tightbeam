@@ -16,6 +16,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     Ledger,
     Model,
     Org,
+    Projection,
     ReadMarkers,
     Schema,
     StateResources,
@@ -384,36 +385,669 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     item = StateResources.session(outsider_session)
     item_bytes = StateResources.encode_item("sessions", item, ctx.catalog)
 
-    page = %{
-      "oldestCursor" => nil,
-      "newestCursor" => "1",
-      "hasMoreBefore" => false,
-      "hasMoreAfter" => false
-    }
-
-    expected =
-      ~s({"schemaVersion":1,"resource":"sessions","items":[#{item_bytes}],"page":) <>
-        JSON.encode!(page) <> "}"
-
     collection = get(ctx, "/api/sessions", outsider_device.token)
     assert collection.status == 200
     assert_application_headers(collection)
-    assert collection.resp_body == expected
-    assert JSON.decode!(collection.resp_body)["items"] == [item]
+    decoded_collection = JSON.decode!(collection.resp_body)
+    assert decoded_collection["schemaVersion"] == 1
+    assert decoded_collection["resource"] == "sessions"
+    assert decoded_collection["items"] == [item]
+    assert is_binary(decoded_collection["page"]["oldestCursor"])
+    assert is_binary(decoded_collection["page"]["newestCursor"])
+    assert decoded_collection["page"]["hasMoreBefore"] == false
+    assert decoded_collection["page"]["hasMoreAfter"] == false
+    assert collection.resp_body =~ item_bytes
     refute collection.resp_body =~ ctx.admin_session.session_key
+
+    before_only_visible_session =
+      get(
+        ctx,
+        "/api/sessions?before=" <> decoded_collection["page"]["oldestCursor"],
+        outsider_device.token
+      )
+      |> then(&JSON.decode!(&1.resp_body))
+
+    assert before_only_visible_session["items"] == []
+    assert before_only_visible_session["page"]["hasMoreBefore"] == false
 
     detail = get(ctx, "/api/sessions/#{outsider_session.session_key}", outsider_device.token)
     assert detail.status == 200
     assert JSON.decode!(detail.resp_body)["item"] == item
 
     session_collection = get(ctx, "/api/sessions", outsider_session.cli_token)
-    assert session_collection.resp_body == expected
+    assert JSON.decode!(session_collection.resp_body)["items"] == [item]
 
     admin_collection = get(ctx, "/api/sessions", ctx.admin_device.token)
     assert admin_collection.status == 200
     admin_items = JSON.decode!(admin_collection.resp_body)["items"]
     assert Enum.any?(admin_items, &(&1["sessionKey"] == ctx.admin_session.session_key))
     assert Enum.any?(admin_items, &(&1["sessionKey"] == outsider_session.session_key))
+  end
+
+  test "session and retained transcript collections use bounded exclusive keysets", ctx do
+    outsider_device = outsider_device(ctx)
+    owner = "outsider"
+    session = ensure_main_session(ctx.db, owner)
+
+    for suffix <- ~w(a b c) do
+      Org.create(ctx.db, %{
+        session_key: "#{owner}-page-#{suffix}",
+        display_name: "#{owner}-page-#{suffix}",
+        kind: "custom",
+        owner_user_id: owner,
+        origin: "user:#{owner}",
+        archetype: "default",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable"),
+        host: "testhost"
+      })
+    end
+
+    expected_sessions =
+      Org.list_for_user(ctx.db, owner, false)
+      |> Enum.sort_by(fn row -> {row.order_index, row.created_at, row.session_key} end)
+      |> Enum.map(& &1.session_key)
+
+    direct_sessions =
+      StateResources.query_sessions_page(
+        ctx.db,
+        %{kind: "user", id: owner, is_admin: false},
+        :earliest,
+        2
+      )
+
+    assert direct_sessions.flags.candidate_count == 3
+
+    sessions =
+      get(ctx, "/api/sessions?limit=2&tail=false", outsider_device.token)
+      |> then(&JSON.decode!(&1.resp_body))
+
+    assert Enum.map(sessions["items"], & &1["sessionKey"]) == Enum.take(expected_sessions, 2)
+    assert sessions["page"]["hasMoreBefore"] == false
+    assert sessions["page"]["hasMoreAfter"] == true
+
+    next_sessions =
+      get(
+        ctx,
+        "/api/sessions?limit=2&after=" <> sessions["page"]["newestCursor"],
+        outsider_device.token
+      )
+      |> then(&JSON.decode!(&1.resp_body))
+
+    assert Enum.map(next_sessions["items"], & &1["sessionKey"]) == Enum.drop(expected_sessions, 2)
+    assert next_sessions["page"]["hasMoreBefore"] == true
+    assert next_sessions["page"]["hasMoreAfter"] == false
+
+    tail_sessions =
+      get(ctx, "/api/sessions?limit=2&tail=true", outsider_device.token)
+      |> then(&JSON.decode!(&1.resp_body))
+
+    assert Enum.map(tail_sessions["items"], & &1["sessionKey"]) ==
+             Enum.take(expected_sessions, -2)
+
+    assert tail_sessions["page"]["hasMoreBefore"] == true
+    assert tail_sessions["page"]["hasMoreAfter"] == false
+
+    wrong_principal =
+      get(
+        ctx,
+        "/api/sessions?limit=2&after=" <> sessions["page"]["newestCursor"],
+        ctx.admin_device.token
+      )
+
+    assert wrong_principal.status == 400
+    assert JSON.decode!(wrong_principal.resp_body)["error"]["code"] == "invalid_cursor"
+
+    append_history = fn index, extra ->
+      {:appended, row} =
+        Projection.append(
+          ctx.db,
+          Map.merge(
+            %{
+              session_key: session.session_key,
+              role: if(rem(index, 2) == 1, do: "user", else: "assistant"),
+              content: "history-#{String.pad_leading(to_string(index), 2, "0")}",
+              timestamp: 100 + index,
+              attachments: []
+            },
+            extra
+          )
+        )
+
+      row
+    end
+
+    first_history_message =
+      append_history.(
+        1,
+        %{client_message_id: "history-client-1", device_id: outsider_device.device_id}
+      )
+
+    history_2_to_8 = Enum.map(2..8, &append_history.(&1, %{}))
+    history_1_to_8 = [first_history_message | history_2_to_8]
+
+    assert {:appended, harness_switch} =
+             Projection.append_marker(ctx.db, session.session_key, %{
+               kind: "harness-switch",
+               from: "claude",
+               to: "codex"
+             })
+
+    history_10 = append_history.(10, %{})
+
+    assert {:appended, model_retune} =
+             Projection.append_marker(ctx.db, session.session_key, %{
+               kind: "model-retune",
+               from: "fable",
+               to: "scribe"
+             })
+
+    history_12_to_13 = Enum.map(12..13, &append_history.(&1, %{}))
+
+    assert {:appended, session_restart} =
+             Projection.append_marker(ctx.db, session.session_key, %{
+               kind: "session-restart",
+               from: "s_before",
+               to: "s_after"
+             })
+
+    history_15_to_17 = Enum.map(15..17, &append_history.(&1, %{}))
+
+    original_history =
+      history_1_to_8 ++
+        [harness_switch, history_10, model_retune] ++
+        history_12_to_13 ++ [session_restart] ++ history_15_to_17
+
+    original_seqs = Enum.map(original_history, & &1.seq)
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "UPDATE sessions SET clearedThroughSeq = ? WHERE sessionKey = ?",
+               [history_12_to_13 |> List.last() |> Map.fetch!(:seq), session.session_key]
+             )
+
+    direct_exact_page =
+      StateResources.query_messages_for_session_page(ctx.db, session.session_key, :earliest, 17)
+
+    assert direct_exact_page.flags.candidate_count == 17
+    assert direct_exact_page.flags.has_more_before == false
+    assert direct_exact_page.flags.has_more_after == false
+
+    exact_history =
+      get(
+        ctx,
+        "/api/sessions/#{session.session_key}/messages?limit=17&tail=false",
+        outsider_device.token
+      )
+      |> then(&JSON.decode!(&1.resp_body))
+
+    assert Enum.map(exact_history["items"], & &1["seq"]) == original_seqs
+    assert exact_history["page"]["hasMoreBefore"] == false
+    assert exact_history["page"]["hasMoreAfter"] == false
+
+    first_history_item =
+      Enum.find(exact_history["items"], &(&1["seq"] == first_history_message.seq))
+
+    assert first_history_item["id"] == first_history_message.id
+    assert first_history_item["clientMessageId"] == "history-client-1"
+
+    assert first_history_item["llmVisibleMessageId"] ==
+             first_history_message.llm_visible_message_id
+
+    assert first_history_item["rowVersion"] == first_history_message.seq
+
+    direct_tail =
+      StateResources.query_messages_for_session_page(ctx.db, session.session_key, :latest, 4)
+
+    assert direct_tail.flags.candidate_count == 5
+    assert Enum.map(direct_tail.rows, & &1.seq) == Enum.take(original_seqs, -4)
+
+    tail_page =
+      get(
+        ctx,
+        "/api/sessions/#{session.session_key}/messages?limit=4&tail=true",
+        outsider_device.token
+      )
+      |> then(&JSON.decode!(&1.resp_body))
+
+    assert Enum.map(tail_page["items"], & &1["seq"]) == Enum.take(original_seqs, -4)
+    assert tail_page["page"]["hasMoreBefore"] == true
+    assert tail_page["page"]["hasMoreAfter"] == false
+
+    assert hd(tail_page["items"])["marker"] == %{
+             "kind" => "session-restart",
+             "from" => "s_before",
+             "to" => "s_after"
+           }
+
+    new_arrival = append_history.(18, %{})
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "UPDATE messages SET content = ? WHERE id = ?", [
+               "updated history-17",
+               List.last(history_15_to_17).id
+             ])
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "DELETE FROM messages WHERE id = ?", [session_restart.id])
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "UPDATE sessions SET clearedThroughSeq = ? WHERE sessionKey = ?", [
+               new_arrival.seq,
+               session.session_key
+             ])
+
+    before_tail = fn cursor ->
+      get(
+        ctx,
+        "/api/sessions/#{session.session_key}/messages?limit=4&before=" <> cursor,
+        outsider_device.token
+      )
+      |> then(&JSON.decode!(&1.resp_body))
+    end
+
+    page_10_to_13 = before_tail.(tail_page["page"]["oldestCursor"])
+    page_6_to_9 = before_tail.(page_10_to_13["page"]["oldestCursor"])
+    page_2_to_5 = before_tail.(page_6_to_9["page"]["oldestCursor"])
+    page_1 = before_tail.(page_2_to_5["page"]["oldestCursor"])
+
+    assert Enum.map(page_10_to_13["items"], & &1["seq"]) ==
+             Enum.take(Enum.drop(original_seqs, 9), 4)
+
+    assert Enum.map(page_6_to_9["items"], & &1["seq"]) ==
+             Enum.take(Enum.drop(original_seqs, 5), 4)
+
+    assert Enum.map(page_2_to_5["items"], & &1["seq"]) ==
+             Enum.take(Enum.drop(original_seqs, 1), 4)
+
+    assert Enum.map(page_1["items"], & &1["seq"]) == [hd(original_seqs)]
+    assert page_1["page"]["hasMoreBefore"] == false
+    assert page_1["page"]["hasMoreAfter"] == true
+
+    assert Enum.find(page_10_to_13["items"], &(&1["seq"] == model_retune.seq))["marker"] == %{
+             "kind" => "model-retune",
+             "from" => "fable",
+             "to" => "scribe"
+           }
+
+    assert Enum.find(page_6_to_9["items"], &(&1["seq"] == harness_switch.seq))["marker"] == %{
+             "kind" => "harness-switch",
+             "from" => "claude",
+             "to" => "codex"
+           }
+
+    visited =
+      (tail_page["items"] ++
+         page_10_to_13["items"] ++
+         page_6_to_9["items"] ++
+         page_2_to_5["items"] ++ page_1["items"])
+      |> Enum.map(& &1["seq"])
+
+    assert Enum.sort(visited) == Enum.sort(original_seqs)
+    assert length(Enum.uniq(visited)) == length(original_seqs)
+
+    empty_before_oldest = before_tail.(page_1["page"]["oldestCursor"])
+    assert empty_before_oldest["items"] == []
+    assert empty_before_oldest["page"]["hasMoreBefore"] == false
+    assert empty_before_oldest["page"]["hasMoreAfter"] == true
+
+    current_after_page =
+      get(
+        ctx,
+        "/api/sessions/#{session.session_key}/messages?limit=4&after=" <>
+          page_10_to_13["page"]["newestCursor"],
+        outsider_device.token
+      )
+      |> then(&JSON.decode!(&1.resp_body))
+
+    assert Enum.map(current_after_page["items"], & &1["seq"]) ==
+             Enum.map(history_15_to_17, & &1.seq) ++ [new_arrival.seq]
+
+    assert Enum.find(current_after_page["items"], &(&1["seq"] == List.last(history_15_to_17).seq))[
+             "content"
+           ] == "updated history-17"
+
+    malformed =
+      get(
+        ctx,
+        "/api/sessions/#{session.session_key}/messages?after=not-a-cursor",
+        outsider_device.token
+      )
+
+    assert malformed.status == 400
+    assert JSON.decode!(malformed.resp_body)["error"]["code"] == "invalid_cursor"
+
+    mismatched_session_filter =
+      get(
+        ctx,
+        "/api/sessions/#{session.session_key}/messages?sessionKey=elsewhere",
+        outsider_device.token
+      )
+
+    assert mismatched_session_filter.status == 400
+    assert JSON.decode!(mismatched_session_filter.resp_body)["error"]["code"] == "invalid_filter"
+
+    single_message_session =
+      Org.create(ctx.db, %{
+        session_key: "#{owner}-single-message-page",
+        display_name: "#{owner}-single-message-page",
+        kind: "custom",
+        owner_user_id: owner,
+        origin: "user:#{owner}",
+        archetype: "default",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable"),
+        host: "testhost"
+      })
+
+    assert single_message_session.owner_user_id == owner
+
+    {:appended, single_message} =
+      Projection.append(ctx.db, %{
+        session_key: single_message_session.session_key,
+        role: "user",
+        content: "one retained message",
+        timestamp: 900,
+        attachments: []
+      })
+
+    {:ok, [[single_message_count]]} =
+      DB.query(ctx.db, "SELECT COUNT(*) FROM messages WHERE sessionKey = ?", [
+        single_message_session.session_key
+      ])
+
+    assert single_message_count == 1
+
+    single_message_response =
+      get(
+        ctx,
+        "/api/sessions/#{single_message_session.session_key}/messages",
+        outsider_device.token
+      )
+
+    assert single_message_response.status == 200
+    single_message_page = JSON.decode!(single_message_response.resp_body)
+    assert Enum.map(single_message_page["items"], & &1["seq"]) == [single_message.seq]
+
+    oldest_cursor = single_message_page["page"]["oldestCursor"]
+    newest_cursor = single_message_page["page"]["newestCursor"]
+    assert is_binary(oldest_cursor) and oldest_cursor != ""
+    assert is_binary(newest_cursor) and newest_cursor != ""
+    assert single_message_page["page"]["hasMoreBefore"] == false
+    assert single_message_page["page"]["hasMoreAfter"] == false
+
+    before_single_message_response =
+      get(
+        ctx,
+        "/api/sessions/#{single_message_session.session_key}/messages?before=" <> oldest_cursor,
+        outsider_device.token
+      )
+
+    assert before_single_message_response.status == 200
+    before_single_message = JSON.decode!(before_single_message_response.resp_body)
+
+    after_single_message_response =
+      get(
+        ctx,
+        "/api/sessions/#{single_message_session.session_key}/messages?after=" <> newest_cursor,
+        outsider_device.token
+      )
+
+    assert after_single_message_response.status == 200
+    after_single_message = JSON.decode!(after_single_message_response.resp_body)
+
+    assert before_single_message["items"] == []
+    assert before_single_message["page"]["hasMoreBefore"] == false
+    assert before_single_message["page"]["hasMoreAfter"] == false
+    assert after_single_message["items"] == []
+    assert after_single_message["page"]["hasMoreBefore"] == false
+    assert after_single_message["page"]["hasMoreAfter"] == false
+    wakes =
+      for index <- 1..3 do
+        Wakes.schedule(ctx.db, %{
+          session_key: session.session_key,
+          origin: "user:#{owner}",
+          prompt: "page wake #{index}",
+          due_at: System.system_time(:millisecond) + 60_000,
+          creator_session_key: session.session_key
+        })
+      end
+
+    expected_wakes =
+      Enum.sort_by(wakes, &{&1.created_at, &1.wake_id})
+      |> Enum.map(& &1.wake_id)
+
+    direct_wakes = Wakes.list_for_session_page(ctx.db, session.session_key, :earliest, 2)
+    assert direct_wakes.flags.candidate_count == 3
+
+    first_wakes =
+      get(
+        ctx,
+        "/api/sessions/#{session.session_key}/wakes?limit=2",
+        outsider_device.token
+      )
+      |> then(&JSON.decode!(&1.resp_body))
+
+    assert Enum.map(first_wakes["items"], & &1["wakeId"]) == Enum.take(expected_wakes, 2)
+    assert first_wakes["page"]["hasMoreAfter"] == true
+
+    last_wakes =
+      get(
+        ctx,
+        "/api/sessions/#{session.session_key}/wakes?limit=2&after=" <>
+          first_wakes["page"]["newestCursor"],
+        outsider_device.token
+      )
+      |> then(&JSON.decode!(&1.resp_body))
+
+    assert Enum.map(last_wakes["items"], & &1["wakeId"]) == Enum.drop(expected_wakes, 2)
+    assert last_wakes["page"]["hasMoreBefore"] == true
+    assert last_wakes["page"]["hasMoreAfter"] == false
+
+    tail_wakes =
+      get(
+        ctx,
+        "/api/sessions/#{session.session_key}/wakes?limit=1&tail=true",
+        outsider_device.token
+      )
+      |> then(&JSON.decode!(&1.resp_body))
+
+    assert Enum.map(tail_wakes["items"], & &1["wakeId"]) == [List.last(expected_wakes)]
+    assert tail_wakes["page"]["hasMoreBefore"] == true
+    assert tail_wakes["page"]["hasMoreAfter"] == false
+
+    turns =
+      for index <- 1..3 do
+        {:ok, seq} =
+          Ledger.enqueue(ctx.db, %{
+            session_key: session.session_key,
+            message_id: "page-turn-message-#{index}",
+            origin: "user:#{owner}",
+            prompt: "page turn #{index}"
+          })
+
+        seq
+      end
+
+    direct_turns =
+      StateResources.query_turns_for_session_page(ctx.db, session.session_key, :earliest, 2)
+
+    assert direct_turns.flags.candidate_count == 3
+
+    first_turns =
+      get(
+        ctx,
+        "/api/sessions/#{session.session_key}/turns?limit=2",
+        outsider_device.token
+      )
+      |> then(&JSON.decode!(&1.resp_body))
+
+    assert Enum.map(first_turns["items"], & &1["seq"]) == Enum.take(turns, 2)
+    assert first_turns["page"]["hasMoreAfter"] == true
+
+    last_turns =
+      get(
+        ctx,
+        "/api/sessions/#{session.session_key}/turns?limit=2&after=" <>
+          first_turns["page"]["newestCursor"],
+        outsider_device.token
+      )
+      |> then(&JSON.decode!(&1.resp_body))
+
+    assert Enum.map(last_turns["items"], & &1["seq"]) == Enum.drop(turns, 2)
+    assert last_turns["page"]["hasMoreBefore"] == true
+    assert last_turns["page"]["hasMoreAfter"] == false
+
+    tail_turns =
+      get(
+        ctx,
+        "/api/sessions/#{session.session_key}/turns?limit=1&tail=true",
+        outsider_device.token
+      )
+      |> then(&JSON.decode!(&1.resp_body))
+
+    assert Enum.map(tail_turns["items"], & &1["seq"]) == [List.last(turns)]
+    assert tail_turns["page"]["hasMoreBefore"] == true
+    assert tail_turns["page"]["hasMoreAfter"] == false
+  end
+
+  test "bounded message reads stay fixed as retained history grows", ctx do
+    session = ensure_main_session(ctx.db, "outsider-growing-message-history")
+
+    {:ok, inserted} =
+      DB.transaction(ctx.db, fn txn ->
+        Enum.map(1..512, fn index ->
+          {:appended, row} =
+            Projection.append_in_txn(txn, %{
+              session_key: session.session_key,
+              role: if(rem(index, 2) == 1, do: "user", else: "assistant"),
+              content: "bounded-history-#{index}",
+              timestamp: index,
+              attachments: []
+            })
+
+          row
+        end)
+      end)
+
+    assert length(inserted) == 512
+
+    page = StateResources.query_messages_for_session_page(ctx.db, session.session_key, :latest, 8)
+
+    assert length(page.rows) == 8
+    assert page.flags.candidate_count == 9
+    assert Enum.map(page.rows, & &1.seq) == Enum.map(Enum.take(inserted, -8), & &1.seq)
+    assert page.flags.has_more_before == true
+    assert page.flags.has_more_after == false
+
+    {:ok, [[history_count]]} =
+      DB.query(ctx.db, "SELECT COUNT(*) FROM messages WHERE sessionKey = ?", [session.session_key])
+
+    assert history_count == 512
+  end
+
+  test "collection keysets have indexed total-order query plans", %{db: db} do
+    plans = [
+      {
+        "SELECT sessionKey FROM sessions ORDER BY createdAt, sessionKey LIMIT ?",
+        [6],
+        "sessions_rest_created_order"
+      },
+      {
+        "SELECT sessionKey FROM sessions WHERE ownerUserId = ? ORDER BY createdAt, sessionKey LIMIT ?",
+        ["flynn", 6],
+        "sessions_rest_owner_created_order"
+      },
+      {
+        "SELECT sessionKey FROM sessions WHERE ownerUserId = ? " <>
+          "AND (createdAt > ? OR (createdAt = ? AND sessionKey > ?)) " <>
+          "ORDER BY createdAt, sessionKey LIMIT ?",
+        ["flynn", 1, 1, "session_0", 6],
+        "sessions_rest_owner_created_order"
+      },
+      {
+        "SELECT sessionKey FROM sessions WHERE ownerUserId = ? AND state = 'active' " <>
+          "ORDER BY orderIndex, createdAt, sessionKey LIMIT ?",
+        ["flynn", 6],
+        "sessions_rest_stream_owner_order"
+      },
+      {
+        "SELECT sessionKey FROM sessions WHERE ownerUserId = ? AND state = 'active' AND " <>
+          "(orderIndex > ? OR (orderIndex = ? AND createdAt > ?) OR " <>
+          "(orderIndex = ? AND createdAt = ? AND sessionKey > ?)) " <>
+          "ORDER BY orderIndex, createdAt, sessionKey LIMIT ?",
+        ["flynn", 0, 0, 1, 0, 1, "session_0", 6],
+        "sessions_rest_stream_owner_order"
+      },
+      {
+        "SELECT wakeId FROM wakes WHERE sessionKey = ? ORDER BY createdAt, wakeId LIMIT ?",
+        ["agent:main:clawline:flynn:main", 6],
+        "wakes_rest_session_created_order"
+      },
+      {
+        "SELECT seq FROM messages WHERE sessionKey = ? ORDER BY seq LIMIT ?",
+        ["agent:main:clawline:flynn:main", 6],
+        "messages_session"
+      },
+      {
+        "SELECT seq FROM messages WHERE sessionKey = ? AND seq > ? ORDER BY seq LIMIT ?",
+        ["agent:main:clawline:flynn:main", 10, 6],
+        "messages_session"
+      },
+      {
+        "SELECT seq FROM turns WHERE sessionKey = ? ORDER BY seq LIMIT ?",
+        ["agent:main:clawline:flynn:main", 6],
+        "turns_session"
+      },
+      {
+        "SELECT seq FROM turns WHERE sessionKey = ? AND seq > ? ORDER BY seq LIMIT ?",
+        ["agent:main:clawline:flynn:main", 10, 6],
+        "turns_session"
+      },
+      {
+        "SELECT id FROM assignments ORDER BY openedAt DESC, id DESC LIMIT ?",
+        [6],
+        "assignments_rest_opened_order"
+      },
+      {
+        "SELECT id FROM assignments WHERE (openedAt < ? OR (openedAt = ? AND id < ?)) " <>
+          "ORDER BY openedAt DESC, id DESC LIMIT ?",
+        [1, 1, "asg_synthetic", 6],
+        "assignments_rest_opened_order"
+      },
+      {
+        "SELECT 1 FROM attests WHERE assignmentId = ? AND kind = 'verdict' " <>
+          "AND verdictKind = 'verified' LIMIT 1",
+        ["asg_synthetic"],
+        "attests_rest_assignment_status"
+      },
+      {
+        "SELECT id FROM work_items WHERE ownerUserId = ? ORDER BY createdAt, id LIMIT ?",
+        ["flynn", 6],
+        "work_items_rest_owner_order"
+      },
+      {
+        "SELECT id FROM work_items WHERE ownerUserId = ? " <>
+          "AND (createdAt > ? OR (createdAt = ? AND id > ?)) " <>
+          "ORDER BY createdAt, id LIMIT ?",
+        ["flynn", 1, 1, "wi_synthetic", 6],
+        "work_items_rest_owner_order"
+      },
+      {
+        "SELECT id FROM work_items ORDER BY createdAt, id LIMIT ?",
+        [6],
+        "work_items_rest_created_order"
+      }
+    ]
+
+    for {sql, params, index} <- plans do
+      {:ok, plan} = DB.query(db, "EXPLAIN QUERY PLAN " <> sql, params)
+      assert inspect(plan) =~ index, inspect(plan)
+      refute inspect(plan) =~ "USE TEMP B-TREE", inspect(plan)
+    end
   end
 
   test "CLI inspect capabilities match the REST session detail", ctx do

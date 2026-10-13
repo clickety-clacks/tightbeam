@@ -66,6 +66,40 @@ defmodule Tightbeam.D1ReadTest do
     assert Enum.map(users, & &1["userId"]) == ["alpha", "zeta"]
     assert Enum.all?(users, &(is_boolean(&1["isAdmin"]) and is_integer(&1["rowVersion"])))
   end
+
+  test "database collection pages return the requested items and page directions", %{db: db} do
+    for index <- 1..80 do
+      :ok =
+        Org.put_setting(db, "page-setting-#{String.pad_leading(to_string(index), 3, "0")}", "x")
+    end
+
+    page = D1Read.page(db, "/unused", :config, %{}, :latest, 5)
+
+    assert length(page.items) == 5
+    assert Enum.map(page.items, & &1["key"]) ==
+             Enum.map(76..80, fn index ->
+               "page-setting-" <> String.pad_leading(to_string(index), 3, "0")
+             end)
+
+    assert page.flags.has_more_before == true
+    assert page.flags.has_more_after == false
+
+    exact_keys =
+      Enum.map(1..5, fn index ->
+        "page-setting-#{String.pad_leading(to_string(index), 3, "0")}"
+      end)
+
+    exact = D1Read.page(db, "/unused", :config, %{"key" => exact_keys}, :earliest, 5)
+    assert length(exact.items) == 5
+    assert Enum.map(exact.items, & &1["key"]) == exact_keys
+    assert exact.flags.has_more_before == false
+    assert exact.flags.has_more_after == false
+
+    empty = D1Read.page(db, "/unused", :config, %{"key" => ["absent-setting"]}, :latest, 5)
+    assert empty.items == []
+    assert empty.flags.has_more_before == false
+    assert empty.flags.has_more_after == false
+  end
 end
 
 defmodule Tightbeam.D1ReadRouteTest do
@@ -74,7 +108,7 @@ defmodule Tightbeam.D1ReadRouteTest do
   import Plug.Conn
   import Plug.Test
 
-  alias Tightbeam.{D1Read, DB, Devices, Escalation, Harness, Identity, Org, Placement, Schema}
+  alias Tightbeam.{D1Read, DB, Devices, Harness, Identity, Org, Placement, Schema}
   alias Tightbeam.StateResources
   alias Tightbeam.Wire.Router
 
@@ -267,6 +301,127 @@ defmodule Tightbeam.D1ReadRouteTest do
     assert Enum.map(hosts_after["items"], & &1["host"]) == ["zeta"]
   end
 
+  test "config and host-environment collections page through filtered composite keys", ctx do
+    :ok = Org.put_setting(ctx.db, "rest-page-a", "a")
+    :ok = Org.put_setting(ctx.db, "rest-page-b", "b")
+
+    config_path = "/api/config?key=rest-page-a&key=rest-page-b&limit=1"
+
+    newest_config =
+      get(ctx.opts, config_path, ctx.admin.token)
+      |> then(&JSON.decode!(&1.resp_body))
+
+    assert Enum.map(newest_config["items"], & &1["key"]) == ["rest-page-b"]
+    assert newest_config["page"]["hasMoreBefore"] == true
+
+    explicit_tail =
+      get(ctx.opts, config_path <> "&tail=true", ctx.admin.token)
+      |> then(&JSON.decode!(&1.resp_body))
+
+    explicit_head =
+      get(ctx.opts, config_path <> "&tail=false", ctx.admin.token)
+      |> then(&JSON.decode!(&1.resp_body))
+
+    assert Enum.map(explicit_tail["items"], & &1["key"]) == ["rest-page-b"]
+    assert Enum.map(explicit_head["items"], & &1["key"]) == ["rest-page-a"]
+    assert explicit_head["page"]["hasMoreBefore"] == false
+    assert explicit_head["page"]["hasMoreAfter"] == true
+
+    older_config =
+      get(
+        ctx.opts,
+        config_path <> "&before=" <> newest_config["page"]["oldestCursor"],
+        ctx.admin.token
+      )
+      |> then(&JSON.decode!(&1.resp_body))
+
+    assert Enum.map(older_config["items"], & &1["key"]) == ["rest-page-a"]
+    assert older_config["page"]["hasMoreBefore"] == false
+    assert older_config["page"]["hasMoreAfter"] == true
+
+    harness = hd(Harness.all()).wire_name()
+
+    for name <- ~w(REST_PAGE_A REST_PAGE_B) do
+      assert %{changed: true} =
+               Placement.set_env_overlay_with_firehose(
+                 ctx.db,
+                 "alpha",
+                 harness,
+                 name,
+                 "secret",
+                 "user:admin",
+                 %{
+                   verb: "host-env-set",
+                   origin: "user:admin",
+                   principal: {:user, "admin"},
+                   params: %{}
+                 }
+               )
+    end
+
+    environment_path =
+      "/api/host-env?host=alpha&harness=#{URI.encode_www_form(harness)}" <>
+        "&name=REST_PAGE_A&name=REST_PAGE_B&limit=1"
+
+    newest_environment =
+      get(ctx.opts, environment_path, ctx.admin.token)
+      |> then(&JSON.decode!(&1.resp_body))
+
+    assert Enum.map(newest_environment["items"], & &1["name"]) == ["REST_PAGE_B"]
+    assert newest_environment["page"]["hasMoreBefore"] == true
+    assert is_nil(hd(newest_environment["items"])["value"])
+
+    older_environment =
+      get(
+        ctx.opts,
+        environment_path <> "&before=" <> newest_environment["page"]["oldestCursor"],
+        ctx.admin.token
+      )
+      |> then(&JSON.decode!(&1.resp_body))
+
+    assert Enum.map(older_environment["items"], & &1["name"]) == ["REST_PAGE_A"]
+
+    for path <- ["/api/identity?limit=1", "/api/kungfu?limit=1"] do
+      response = get(ctx.opts, path, ctx.admin.token)
+      assert response.status == 200, "#{path}: #{response.resp_body}"
+      assert length(JSON.decode!(response.resp_body)["items"]) <= 1
+      assert JSON.decode!(response.resp_body)["page"]["hasMoreBefore"] in [false, true]
+      assert JSON.decode!(response.resp_body)["page"]["hasMoreAfter"] in [false, true]
+    end
+
+    identity =
+      get(ctx.opts, "/api/identity?limit=1", ctx.admin.token)
+      |> then(&JSON.decode!(&1.resp_body))
+
+    for direction <- ["before", "after"] do
+      cursor =
+        identity["page"][if(direction == "before", do: "oldestCursor", else: "newestCursor")]
+
+      empty =
+        get(ctx.opts, "/api/identity?limit=1&#{direction}=" <> cursor, ctx.admin.token)
+        |> then(&JSON.decode!(&1.resp_body))
+
+      assert empty["items"] == []
+      assert empty["page"]["hasMoreBefore"] == false
+      assert empty["page"]["hasMoreAfter"] == false
+    end
+
+    for {sql, params} <- [
+          {"SELECT key FROM org_settings WHERE key > ? ORDER BY key LIMIT ?", ["A", 6]},
+          {
+            "SELECT host, harness, name FROM host_environment_projection " <>
+              "WHERE host = ? AND (harness > ? OR (harness = ? AND name > ?)) " <>
+              "ORDER BY host, harness, name LIMIT ?",
+            ["alpha", "claude", "claude", "A", 6]
+          },
+          {"SELECT name FROM hosts WHERE name > ? ORDER BY name LIMIT ?", ["A", 6]},
+          {"SELECT userId FROM users WHERE userId > ? ORDER BY userId LIMIT ?", ["A", 6]}
+        ] do
+      {:ok, plan} = DB.query(ctx.db, "EXPLAIN QUERY PLAN " <> sql, params)
+      refute inspect(plan) =~ "USE TEMP B-TREE"
+    end
+  end
+
   @tag rest_r7_encoder: true
   test "all shared collections retain exact missing and repeated principal refusals", ctx do
     for {path, resource} <- [
@@ -318,7 +473,13 @@ defmodule Tightbeam.D1ReadRouteTest do
   end
 
   test "decision-request collection filters and pages by raisedAt and id", ctx do
-    for {id, raised_at} <- [{"dr_page_1", 10}, {"dr_page_2", 20}, {"dr_page_3", 30}] do
+    for {id, raised_at} <- [
+          {"dr_page_1", 10},
+          {"dr_page_2", 20},
+          {"dr_page_tie_a", 20},
+          {"dr_page_tie_z", 20},
+          {"dr_page_3", 30}
+        ] do
       {:ok, _rows} =
         DB.query(
           ctx.db,
@@ -339,7 +500,7 @@ defmodule Tightbeam.D1ReadRouteTest do
     assert get_resp_header(first, "cache-control") == ["no-store"]
     decoded = JSON.decode!(first.resp_body)
     assert decoded["resource"] == "decision requests"
-    assert Enum.map(decoded["items"], & &1["id"]) == ["dr_page_2", "dr_page_3"]
+    assert Enum.map(decoded["items"], & &1["id"]) == ["dr_page_3", "dr_page_tie_z"]
     assert decoded["page"]["hasMoreBefore"]
     refute decoded["page"]["hasMoreAfter"]
 
@@ -350,24 +511,19 @@ defmodule Tightbeam.D1ReadRouteTest do
 
     assert first.resp_body =~ "\"items\":[#{encoded_items}],\"page\":"
 
-    query_page =
-      Escalation.page_collection(
-        ctx.db,
-        %{"kind" => ["statute"]},
-        %{kind: "user", id: "admin", is_admin: true},
-        :latest,
-        2
-      )
-
-    assert Enum.map(query_page.rows, & &1.id) == ["dr_page_2", "dr_page_3"]
-    assert query_page.candidate_count == 3
-    assert query_page.flags == %{has_more_before: true, has_more_after: false}
-
     older_cursor = decoded["page"]["oldestCursor"]
     older_path = "/api/decision-requests?kind=statute&limit=2&before=#{older_cursor}"
     older = get(ctx.opts, older_path, ctx.admin.token)
 
-    assert Enum.map(JSON.decode!(older.resp_body)["items"], & &1["id"]) == ["dr_page_1"]
+    assert Enum.map(JSON.decode!(older.resp_body)["items"], & &1["id"]) == [
+             "dr_page_tie_a",
+             "dr_page_2"
+           ]
+
+    oldest_cursor = JSON.decode!(older.resp_body)["page"]["oldestCursor"]
+    oldest_path = "/api/decision-requests?kind=statute&limit=2&before=#{oldest_cursor}"
+    oldest = get(ctx.opts, oldest_path, ctx.admin.token)
+    assert Enum.map(JSON.decode!(oldest.resp_body)["items"], & &1["id"]) == ["dr_page_1"]
     assert get(ctx.opts, "/api/decision-requests?status=unknown", ctx.admin.token).status == 400
 
     for {id, owner_user_id, raised_at} <- [

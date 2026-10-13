@@ -318,7 +318,7 @@ defmodule Tightbeam.Escalation do
                                       columns <>
                                         " " <>
                                         @decision_request_revision_ddl <>
-                                        "\n  CHECK (\n    (kind = 'statute'" <> constraints
+                                        ",\n  CHECK (\n    (kind = 'statute'" <> constraints
 
                                     _ ->
                                       raise "decision_requests table constraint boundary not found"
@@ -2154,6 +2154,101 @@ defmodule Tightbeam.Escalation do
   end
 
   @doc false
+  @spec page_collection(
+          DB.server(),
+          map(),
+          map(),
+          Tightbeam.Keyset.boundary(),
+          pos_integer()
+        ) :: map()
+  def page_collection(db, filters, principal, boundary, limit)
+      when is_map(filters) and is_map(principal) and is_integer(limit) and limit > 0 and
+             limit <= 500 do
+    {visibility, visibility_params} = decision_request_collection_visibility(principal)
+    {filter_clauses, filter_params} = decision_request_collection_filters(filters)
+    where = Enum.join(["(" <> visibility <> ")" | filter_clauses], " AND ")
+    params = visibility_params ++ filter_params
+    select_from = "SELECT #{@request_columns} FROM decision_requests"
+
+    page =
+      case DB.transaction(db, fn txn ->
+             query = fn sql, query_params ->
+               rows = Txn.q(txn, sql, query_params)
+
+               if String.starts_with?(sql, select_from),
+                 do: Enum.map(rows, &request_from_row/1),
+                 else: rows
+             end
+
+             Tightbeam.Keyset.page(
+               query,
+               select_from,
+               "decision_requests",
+               where,
+               params,
+               ["raisedAt", "id"],
+               boundary,
+               limit,
+               fn row -> [row.raised_at, row.id] end
+             )
+           end) do
+        {:ok, result} -> result
+        {:error, error} -> raise error
+      end
+
+    %{
+      rows: page.rows,
+      flags: %{
+        has_more_before: page.has_more_before,
+        has_more_after: page.has_more_after
+      },
+      candidate_count: page.candidate_count
+    }
+  end
+
+  defp decision_request_collection_filters(filters) do
+    filters
+    |> Enum.sort_by(&elem(&1, 0))
+    |> Enum.reduce({[], []}, fn {field, values}, {clauses, params} ->
+      column = Map.fetch!(@decision_request_collection_columns, field)
+      values = Enum.uniq(values)
+
+      if values == [] do
+        {["0 = 1" | clauses], params}
+      else
+        placeholders = Enum.map_join(values, ",", fn _value -> "?" end)
+        {["#{column} IN (#{placeholders})" | clauses], params ++ values}
+      end
+    end)
+    |> then(fn {clauses, params} -> {Enum.reverse(clauses), params} end)
+  end
+
+  defp decision_request_collection_visibility(%{is_admin: true}),
+    do: {"kind IN ('statute', 'effort', 'agent')", []}
+
+  defp decision_request_collection_visibility(%{kind: "user", id: user_id})
+       when is_binary(user_id) and user_id != "" do
+    {
+      "(kind = 'statute' AND (raiserId = ? OR ownerUserId = ?)) OR " <>
+        "(kind = 'effort' AND expecterUserId = ?) OR " <>
+        "(kind = 'agent' AND ownerUserId = ?)",
+      ["user:#{user_id}", user_id, user_id, user_id]
+    }
+  end
+
+  defp decision_request_collection_visibility(%{kind: "session", id: session_key})
+       when is_binary(session_key) and session_key != "" do
+    {
+      "(kind = 'statute' AND raiserId = ?) OR " <>
+        "(kind = 'effort' AND (expecterSessionKey = ? OR EXISTS (" <>
+        "SELECT 1 FROM assignments AS held " <>
+        "WHERE held.id = decision_requests.assignmentId AND held.holderKey = ?))) OR " <>
+        "(kind = 'agent' AND (raiserSessionKey = ? OR expecterSessionKey = ?))",
+      ["session:#{session_key}", session_key, session_key, session_key, session_key]
+    }
+  end
+
+  defp decision_request_collection_visibility(_principal), do: {"0 = 1", []}
   @spec publish_decision_transition_in_txn(Txn.t(), map() | nil, map()) :: map()
   @spec publish_decision_transition_in_txn(Txn.t(), map() | nil, map(), term()) :: map()
   def publish_decision_transition_in_txn(%Txn{} = txn, before, after_row, hub \\ Hub) do
@@ -2272,102 +2367,6 @@ defmodule Tightbeam.Escalation do
        do: "decision_request.superseded"
 
   defp public_transition_class(_before, _after), do: nil
-
-  @spec page_collection(
-          DB.server(),
-          map(),
-          map(),
-          Tightbeam.Keyset.boundary(),
-          pos_integer()
-        ) :: map()
-  def page_collection(db, filters, principal, boundary, limit)
-      when is_map(filters) and is_map(principal) and is_integer(limit) and limit > 0 and
-             limit <= 500 do
-    {visibility, visibility_params} = decision_request_collection_visibility(principal)
-    {filter_clauses, filter_params} = decision_request_collection_filters(filters)
-    where = Enum.join(["(" <> visibility <> ")" | filter_clauses], " AND ")
-    params = visibility_params ++ filter_params
-    select_from = "SELECT #{@request_columns} FROM decision_requests"
-
-    page =
-      case DB.transaction(db, fn txn ->
-             query = fn sql, query_params ->
-               rows = Txn.q(txn, sql, query_params)
-
-               if String.starts_with?(sql, select_from),
-                 do: Enum.map(rows, &request_from_row/1),
-                 else: rows
-             end
-
-             Tightbeam.Keyset.page(
-               query,
-               select_from,
-               "decision_requests",
-               where,
-               params,
-               ["raisedAt", "id"],
-               boundary,
-               limit,
-               fn row -> [row.raised_at, row.id] end
-             )
-           end) do
-        {:ok, result} -> result
-        {:error, error} -> raise error
-      end
-
-    %{
-      rows: page.rows,
-      flags: %{
-        has_more_before: page.has_more_before,
-        has_more_after: page.has_more_after
-      },
-      candidate_count: page.candidate_count
-    }
-  end
-
-  defp decision_request_collection_filters(filters) do
-    filters
-    |> Enum.sort_by(&elem(&1, 0))
-    |> Enum.reduce({[], []}, fn {field, values}, {clauses, params} ->
-      column = Map.fetch!(@decision_request_collection_columns, field)
-      values = Enum.uniq(values)
-
-      if values == [] do
-        {["0 = 1" | clauses], params}
-      else
-        placeholders = Enum.map_join(values, ",", fn _value -> "?" end)
-        {["#{column} IN (#{placeholders})" | clauses], params ++ values}
-      end
-    end)
-    |> then(fn {clauses, params} -> {Enum.reverse(clauses), params} end)
-  end
-
-  defp decision_request_collection_visibility(%{is_admin: true}),
-    do: {"kind IN ('statute', 'effort', 'agent')", []}
-
-  defp decision_request_collection_visibility(%{kind: "user", id: user_id})
-       when is_binary(user_id) and user_id != "" do
-    {
-      "(kind = 'statute' AND (raiserId = ? OR ownerUserId = ?)) OR " <>
-        "(kind = 'effort' AND expecterUserId = ?) OR " <>
-        "(kind = 'agent' AND ownerUserId = ?)",
-      ["user:#{user_id}", user_id, user_id, user_id]
-    }
-  end
-
-  defp decision_request_collection_visibility(%{kind: "session", id: session_key})
-       when is_binary(session_key) and session_key != "" do
-    {
-      "(kind = 'statute' AND raiserId = ?) OR " <>
-        "(kind = 'effort' AND (expecterSessionKey = ? OR EXISTS (" <>
-        "SELECT 1 FROM assignments AS held " <>
-        "WHERE held.id = decision_requests.assignmentId AND held.holderKey = ?))) OR " <>
-        "(kind = 'agent' AND (raiserSessionKey = ? OR expecterSessionKey = ?))",
-      ["session:#{session_key}", session_key, session_key, session_key, session_key]
-    }
-  end
-
-  defp decision_request_collection_visibility(_principal), do: {"0 = 1", []}
 
   @doc "Canonical SHA-256 action fingerprint."
   @spec digest(map()) :: String.t()

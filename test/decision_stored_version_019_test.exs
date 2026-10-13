@@ -364,6 +364,16 @@ defmodule Tightbeam.DecisionStoredVersion019Test do
   end
 
   test "decision row revision and successor stamp roll back as one migration", %{db: db} do
+    insert_decision_rows(db)
+
+    :ok =
+      DB.execute(db, """
+      UPDATE decision_requests
+      SET status='returned', returnedBy='session:agent-reader',
+          returnReason='Need evidence', returnedAt=13
+      WHERE id='dr_agent_r7'
+      """)
+
     :ok = DB.execute(db, "ALTER TABLE decision_requests DROP COLUMN rowSchemaRevision")
     :ok = DB.execute(db, "UPDATE schema_stamp SET shape='notice-source-storage-v1-019'")
 
@@ -390,6 +400,18 @@ defmodule Tightbeam.DecisionStoredVersion019Test do
 
     assert {:ok, [["decision-request-row-schema-v2-019"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok, [[1], [1]]} =
+             DB.query(
+               db,
+               "SELECT rowSchemaRevision FROM decision_requests WHERE status='open' ORDER BY id"
+             )
+
+    assert {:ok, [[2]]} =
+             DB.query(
+               db,
+               "SELECT rowSchemaRevision FROM decision_requests WHERE status='returned'"
+             )
   end
 
   test "current decision row revision stamp refuses a missing revision column", %{db: db} do
