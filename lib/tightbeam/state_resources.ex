@@ -724,8 +724,8 @@ defmodule Tightbeam.StateResources do
       DB.query(db, "SELECT id, ts, kind, scope, origin FROM condition_facts WHERE id = ?1", [id])
 
     case rows do
-      [[fact_id, ts, kind, scope, origin]] ->
-        %{fact_id: fact_id, ts: ts, kind: kind, scope: scope, origin: origin}
+      [[id, ts, kind, scope, origin]] ->
+        %{id: id, ts: ts, kind: kind, scope: scope, origin: origin}
 
       [] ->
         nil
@@ -1414,19 +1414,20 @@ defmodule Tightbeam.StateResources do
   end
 
   def condition_fact(row) do
-    fields = ~w(factId ts kind scope origin rowVersion)
+    fields = ~w(id ts kind scope origin rowVersion)
 
     if Enum.all?(Map.keys(row), &is_binary/1) do
       exact_item_keys!("condition-facts notice", row, fields)
     end
 
     row = public(row)
-    fact_id = row["factId"] || row["id"]
+    id = row["id"]
+
+    unless is_integer(id), do: raise(ArgumentError, "id must be an integer")
 
     item =
       row
-      |> Map.put_new("factId", fact_id)
-      |> Map.put("rowVersion", fact_id)
+      |> Map.put("rowVersion", id)
       |> Map.take(fields)
 
     exact_item_keys!("condition-facts notice", item, fields)
