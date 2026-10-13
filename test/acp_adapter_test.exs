@@ -2517,7 +2517,8 @@ defmodule Tightbeam.Acp.AdapterTest do
   end
 
   test "a fork refuses a context change in the final effort readback" do
-    {adapter, capture_path} = start_adapter(harness: :codex, fail_mode: "fork-effort-context-drift")
+    {adapter, capture_path} =
+      start_adapter(harness: :codex, fail_mode: "fork-effort-context-drift")
     requested = Model.new("orbit-9", effort: "high")
 
     assert {:ok, "sess-1"} =
@@ -2546,8 +2547,8 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     assert {:error,
             {:session_prepare_failed,
-             {:runtime_config_mismatch, %Model{family: "opus", context: "1m"}},
-             "sess-1", %{status: "verified"}}} =
+             {:runtime_config_mismatch, %Model{family: "opus", context: "1m"}}, "sess-1",
+             %{status: "verified"}}} =
              Adapter.new_candidate_session(
                adapter,
                Model.new("claude-opus-5-5"),
