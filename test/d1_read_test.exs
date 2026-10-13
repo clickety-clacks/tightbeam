@@ -480,7 +480,13 @@ defmodule Tightbeam.D1ReadRouteTest do
   end
 
   test "decision-request collection filters and pages by raisedAt and id", ctx do
-    for {id, raised_at} <- [{"dr_page_1", 10}, {"dr_page_2", 20}, {"dr_page_3", 30}] do
+    for {id, raised_at} <- [
+          {"dr_page_1", 10},
+          {"dr_page_2", 20},
+          {"dr_page_tie_a", 20},
+          {"dr_page_tie_z", 20},
+          {"dr_page_3", 30}
+        ] do
       {:ok, _rows} =
         DB.query(
           ctx.db,
@@ -501,7 +507,7 @@ defmodule Tightbeam.D1ReadRouteTest do
     assert get_resp_header(first, "cache-control") == ["no-store"]
     decoded = JSON.decode!(first.resp_body)
     assert decoded["resource"] == "decision requests"
-    assert Enum.map(decoded["items"], & &1["id"]) == ["dr_page_2", "dr_page_3"]
+    assert Enum.map(decoded["items"], & &1["id"]) == ["dr_page_3", "dr_page_tie_z"]
     assert decoded["page"]["hasMoreBefore"]
     refute decoded["page"]["hasMoreAfter"]
 
@@ -521,7 +527,7 @@ defmodule Tightbeam.D1ReadRouteTest do
         2
       )
 
-    assert Enum.map(query_page.rows, & &1.id) == ["dr_page_2", "dr_page_3"]
+    assert Enum.map(query_page.rows, & &1.id) == ["dr_page_3", "dr_page_tie_z"]
     assert query_page.candidate_count == 3
     assert query_page.flags == %{has_more_before: true, has_more_after: false}
 
@@ -529,7 +535,15 @@ defmodule Tightbeam.D1ReadRouteTest do
     older_path = "/api/decision-requests?kind=statute&limit=2&before=#{older_cursor}"
     older = get(ctx.opts, older_path, ctx.admin.token)
 
-    assert Enum.map(JSON.decode!(older.resp_body)["items"], & &1["id"]) == ["dr_page_1"]
+    assert Enum.map(JSON.decode!(older.resp_body)["items"], & &1["id"]) == [
+             "dr_page_tie_a",
+             "dr_page_2"
+           ]
+
+    oldest_cursor = JSON.decode!(older.resp_body)["page"]["oldestCursor"]
+    oldest_path = "/api/decision-requests?kind=statute&limit=2&before=#{oldest_cursor}"
+    oldest = get(ctx.opts, oldest_path, ctx.admin.token)
+    assert Enum.map(JSON.decode!(oldest.resp_body)["items"], & &1["id"]) == ["dr_page_1"]
     assert get(ctx.opts, "/api/decision-requests?status=unknown", ctx.admin.token).status == 400
 
     for {id, owner_user_id, raised_at} <- [
