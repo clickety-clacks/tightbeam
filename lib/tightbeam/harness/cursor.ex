@@ -29,25 +29,9 @@ defmodule Tightbeam.Harness.Cursor do
   @rails_file ".cursor/hooks.json"
   @initial_cli_config JSON.encode!(%{"version" => 1})
 
-  # The catalog must not advertise what the adapter will refuse. `cursor-agent
-  # --list-models` publishes ~200 refs; ACP `session/new` exposes a closed enum
-  # of ~35 decorated wire values whose option `name` is the public ref. Re-probe
-  # live against cursor-agent #{@adapter_version} before changing this pin.
-  @adapter_selectable_models ~w(auto grok-4.6 composer-2.5 claude-opus-5 claude-opus-4-8
-                                gpt-5.6-sol gpt-5.5 claude-fable-5 grok-4.5 gemini-3.7-flash
-                                gpt-5.6-terra claude-sonnet-5 claude-sonnet-4-6 gpt-5.3-codex
-                                claude-opus-4-7 gpt-5.4 claude-opus-4-6 claude-opus-4-5 gpt-5.2
-                                gpt-5.6-luna gemini-3.6-flash gemini-3.1-pro gpt-5.4-mini
-                                gpt-5.4-nano claude-haiku-4-5 claude-sonnet-4-5 gpt-5.1
-                                gemini-3-flash gemini-3.5-flash claude-sonnet-4 gpt-5-mini
-                                gemini-2.5-flash kimi-k3 kimi-k2.7-code glm-5.2)
-
-  @doc """
-  Model values this adapter version accepts at `session/set_config_option`.
-
-  Narrower than `cursor-agent --list-models` — see the note above the attribute.
-  """
-  def adapter_selectable_models, do: @adapter_selectable_models
+  # The CLI catalog lists candidates. ACP's live model options are authoritative
+  # for a switch: the adapter resolves each public ref to an offered wire value
+  # and requires the selected option's readback before committing it.
 
   @impl true
   def id, do: :cursor
@@ -531,7 +515,6 @@ defmodule Tightbeam.Harness.Cursor do
     with {:ok, %{launcher: launcher}} <- verify_installed_cli(target),
          {output, 0} <- sh.(catalog_argv(host_config, launcher, state.base_dir)),
          {:ok, entries} <- parse_catalog(output),
-         entries <- build_selectable_catalog(entries, selectable_models(state)),
          true <- entries != [] do
       {:ok, entries}
     else
@@ -802,28 +785,6 @@ defmodule Tightbeam.Harness.Cursor do
       end
     end
   end
-
-  defp selectable_models(state),
-    do: Map.get(state.options, :cursor_selectable_models, @adapter_selectable_models)
-
-  defp build_selectable_catalog(entries, :all), do: entries
-
-  defp build_selectable_catalog(entries, selectable) do
-    {kept, dropped} = Enum.split_with(entries, &(vendor_ref(&1) in selectable))
-
-    if dropped != [] do
-      Logger.info(
-        "cursor catalog: #{length(dropped)} model(s) from --list-models are not selectable by " <>
-          "cursor-agent #{@adapter_version} ACP and were withheld — re-probe " <>
-          "@adapter_selectable_models in harness/cursor.ex if this looks wrong"
-      )
-    end
-
-    kept
-  end
-
-  defp vendor_ref(entry),
-    do: Model.to_ref(Model.new(entry.family, context: entry.context))
 
   defp credential_refusal do
     {:error, %{code: "DIV-CURSOR-API-KEY-ONLY", message: "Cursor requires a banked API key"}}

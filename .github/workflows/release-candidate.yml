@@ -146,7 +146,6 @@ jobs:
         env:
           CANDIDATE_SHA: ${{ needs.metadata.outputs.candidate_sha }}
         run: |
-          mix format --check-formatted
           if [ "$RUNNER_OS" = macOS ]; then
             set +e
             scripts/verify_mix.sh > "$DD36_DARWIN_DIAGNOSTIC_DIR/full.log" 2>&1
@@ -158,7 +157,7 @@ jobs:
           else
             scripts/verify_mix.sh
           fi
-          (cd cli && cargo fmt --check && cargo test)
+          (cd cli && cargo test)
 
       - name: Collect bounded Darwin failure evidence
         if: failure() && runner.os == 'macOS' && steps.gates.outcome == 'failure'

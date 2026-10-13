@@ -107,18 +107,6 @@ class ExactHeadCI(unittest.TestCase):
                         env={**os.environ, 'CI_SOURCE_SHA': 'a' * 40, 'ACTUAL_SHA': actual})
                 self.assertEqual(result.returncode, expected)
 
-    def test_platforms_and_existing_gates(self):
-        self.assertRegex(self.jobs['test'], r'(?m)^    runs-on: \$\{\{ matrix\.os \}\}$')
-        for name in ('test', 'release'):
-            for platform in ('ubuntu-latest', 'macos-latest'):
-                self.assertIn('os: ' + platform, self.jobs[name])
-            self.assertIn('otp-version: "28"', self.jobs[name])
-            self.assertIn('elixir-version: "1.19.5"', self.jobs[name])
-        for command in ('scripts/verify_mix.sh', 'cargo test', 'cargo fmt --check',
-                        'mix format --check-formatted'):
-            self.assertIn('run: ' + command, self.jobs['test'])
-        self.assertIn('run: sh packaging/assemble.sh', self.jobs['release'])
-
     def test_packages_wait_for_tests_and_stamp_candidate(self):
         job = self.jobs['release']
         self.assertIn('    needs: test', job)

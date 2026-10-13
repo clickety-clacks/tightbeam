@@ -13,8 +13,8 @@ mutation seams and explain an invariant's reason where code cannot preserve it.
 Unexpected live state or unknown schema is evidence to report, not a reason to
 invent repair from guessed DDL or hide a defective migration behind a fallback.
 
-Implement first, run focused verification, then broaden as risk and repository
-requirements warrant. Investigate the substance of a changed or contested report;
+Implement first and use the engineering core's Evidence rule to choose
+verification. Investigate the substance of a changed or contested report;
 unchanged hashes need not be reread merely to produce another receipt.
 
 Record revision, commands, results and limits in the required verification report,
