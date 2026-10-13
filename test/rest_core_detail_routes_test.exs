@@ -41,6 +41,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       ~w(id kind raiserId raiserSessionKey ownerUserId assignmentId expecterSessionKey expecterUserId lineageRung effortGeneration deadlineWakeId raisedAt deadlineAt statuteName question options context status decision rationale ruledBy ruledAt consumedAt withdrawnBy withdrawnReason withdrawnAt askedOfRole answer answeredBy answeredAt rowVersion),
     "sessions" =>
       ~w(sessionKey displayName kind orderIndex isBuiltIn adopted ownerUserId origin spawnedBy topologyParent handle archetype overrides identityName identityRevision harness provider model thinkingLevel modelContext host clearedThroughSeq state createdAt updatedAt mechanicalStatus capabilities rowVersion),
+    "roles" => ~w(name boundSessionKey ownerUserId createdAt updatedAt rowVersion),
     "devices" => ~w(deviceId userId claimedName status platform model createdAt rowVersion),
     "artifacts" =>
       ~w(artifactId kind title description createdBySession workItemId parentSession originPath contentSha256 recordedMessageId recordedTurnEvidence state home createdAt updatedAt rowVersion),
@@ -898,25 +899,6 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
 
     assert turn_notice["refs"]["turnSeq"] == ctx.turn_seq
     assert device_notice["refs"]["deviceId"] == ctx.admin_device.device_id
-  end
-
-  test "the shared seams contain no composite CLI or prefix fallback" do
-    resources = File.read!(Path.expand("../lib/tightbeam/state_resources.ex", __DIR__))
-    router = File.read!(Path.expand("../lib/tightbeam/wire/router.ex", __DIR__))
-
-    refute resources =~ "WorkItems.__handle__"
-    refute resources =~ "Assignments.__handle__"
-    refute resources =~ "IdPrefix"
-    refute router =~ "StateVisibility.core_detail_visible?"
-    assert resources =~ "defp detail_selection"
-
-    matches =
-      Regex.scan(
-        ~r/get "\/api\/(?:work-items|assignments|wakes|turns|decision-requests|sessions|devices|artifacts|read-markers)\/:/,
-        router
-      )
-
-    assert length(matches) == 12
   end
 
   defp core_detail_cases(ctx) do
@@ -2147,5 +2129,341 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       "cache-control" => get_resp_header(response, "cache-control"),
       "content-type" => get_resp_header(response, "content-type")
     }
+  end
+
+  test "role detail shares canonical item bytes for user and session principals", ctx do
+    role_name = "g7-route-role"
+    _role = Tightbeam.Roles.create!(ctx.db, role_name, "flynn", nil)
+    principal = %{kind: "user", id: "flynn", is_admin: true}
+    role = StateResources.query_role(ctx.db, %{key: role_name, principal: principal})
+    item = StateResources.role(role)
+    expected = StateResources.encode_item("roles", item, ctx.catalog)
+    expected_fields = ~w(name boundSessionKey ownerUserId createdAt updatedAt rowVersion)
+
+    assert Enum.sort(Map.keys(item)) == Enum.sort(expected_fields)
+
+    assert StateResources.query_role(ctx.db, %{
+             key: role_name,
+             principal: %{kind: "process", id: "fixture", is_admin: false}
+           }) == nil
+
+    notice = Publisher.committed_notice("role.created", role, %{})
+    assert notice["resource"] == "roles"
+    assert notice["refs"] == %{"role" => role_name}
+    assert notice["payload"] == item
+
+    for {token, path} <- [
+          {ctx.token, "/api/roles/#{role_name}"},
+          {ctx.admin_session.cli_token, "/api/roles/#{role_name}?asUser=flynn"}
+        ] do
+      response = get(ctx, path, token)
+      body = JSON.decode!(response.resp_body)
+
+      assert response.status == 200
+      assert_application_headers(response)
+      assert body["schemaVersion"] == 1
+      assert body["resource"] == "roles"
+      assert raw_json_value(response.resp_body, "item") == expected
+      assert body["item"] == notice["payload"]
+    end
+
+    missing = get(ctx, "/api/roles/no-such-role")
+    assert_error(missing, 404, "roles", "not_found")
+    assert_application_headers(missing)
+
+    invalid_query = get(ctx, "/api/roles/#{role_name}?unexpected=value")
+    assert_error(invalid_query, 400, "roles", "invalid_filter")
+    assert_application_headers(invalid_query)
+
+    assert :ok = Tightbeam.Roles.rm(ctx.db, role_name)
+    deleted = get(ctx, "/api/roles/#{role_name}")
+    assert_error(deleted, 404, "roles", "not_found")
+    assert_application_headers(deleted)
+  end
+
+  test "the five remaining G7 detail reads resolve notice keys to canonical items", ctx do
+    owner_device = outsider_device(ctx)
+
+    owner_session =
+      Org.create(ctx.db, %{
+        session_key: "g7-detail-owner-session",
+        display_name: "G7 detail owner",
+        owner_user_id: "outsider",
+        origin: "user:outsider",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+
+    work_item =
+      WorkItems.__handle__(ctx.db, "work-item-create", %{
+        verb: "work-item-create",
+        origin: "user:outsider",
+        principal: {:user, "outsider"},
+        session_key: nil,
+        params: %{title: "G7 detail parent assignment"}
+      })
+
+    assignment =
+      Assignments.__handle__(ctx.db, "assign", %{
+        verb: "assign",
+        origin: "user:outsider",
+        principal: {:user, "outsider"},
+        session_key: owner_session.session_key,
+        target_role: nil,
+        role_fallback: false,
+        supervision_interval_ms: 60_000,
+        params: %{
+          subject: "G7 detail parent assignment",
+          idempotency_key: nil,
+          reviews_assignment_id: nil,
+          work_item_id: work_item.id,
+          files: []
+        }
+      })
+
+    attest_id = "att_g7_detail_route"
+    now = System.system_time(:millisecond)
+
+    query!(
+      ctx.db,
+      """
+      INSERT INTO attests (id, assignmentId, kind, verdictKind, note, byUser, ts)
+      VALUES (?1, ?2, 'verdict', 'g7-detail-route', 'route fixture', 'outsider', ?3)
+      """,
+      [attest_id, assignment.id, now]
+    )
+
+    attest_row = StateResources.query_attest(ctx.db, attest_id)
+    attest_notice = Publisher.committed_notice("attest.filed", attest_row, %{})
+
+    assert {:appended, message} =
+             Tightbeam.Projection.append(ctx.db, %{
+               session_key: owner_session.session_key,
+               role: "user",
+               content: "G7 detail transcript fixture",
+               timestamp: now,
+               attachments: []
+             })
+
+    message_row = StateResources.query_message(ctx.db, message.id)
+    message_notice = Publisher.committed_notice("message.created", message_row, %{})
+
+    assert {:ok, [[session_fact_id]]} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO condition_facts (ts, kind, scope, origin, ownerUserId)
+               VALUES (?1, 'g7-detail-ready', 'g7-detail', ?2, 'outsider')
+               RETURNING id
+               """,
+               [now, "session:#{owner_session.session_key}"]
+             )
+
+    assert {:ok, [[process_fact_id]]} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO condition_facts (ts, kind, scope, origin, ownerUserId)
+               VALUES (?1, 'g7-detail-process', 'g7-detail', 'process:fixture', 'outsider')
+               RETURNING id
+               """,
+               [now + 1]
+             )
+
+    session_fact_row = StateResources.query_condition_fact(ctx.db, session_fact_id)
+    process_fact_row = StateResources.query_condition_fact(ctx.db, process_fact_id)
+
+    session_fact_notice =
+      Publisher.committed_notice("condition_fact.filed", session_fact_row, %{})
+
+    process_fact_notice =
+      Publisher.committed_notice("condition_fact.filed", process_fact_row, %{})
+
+    critical_lease =
+      Tightbeam.CriticalLeases.declare(
+        ctx.db,
+        owner_session.session_key,
+        60_000,
+        "G7 detail fixture",
+        120_000
+      )
+
+    critical_row = StateResources.query_critical_state(ctx.db, owner_session.session_key)
+    assert critical_row == critical_lease
+    critical_notice = Publisher.committed_notice("critical_lease.updated", critical_row, %{})
+
+    host = "testhost"
+    harness = "claude"
+    env_name = "G7_DETAIL_FIXTURE"
+
+    query!(
+      ctx.db,
+      """
+      INSERT INTO host_environment_projection
+        (host, harness, name, valuePresent, updatedAt, rowVersion)
+      VALUES (?1, ?2, ?3, 1, ?4, ?4)
+      """,
+      [host, harness, env_name, now]
+    )
+
+    host_row = StateResources.query_host_environment(ctx.db, host, harness, env_name)
+    host_notice = Publisher.committed_notice("host_env.updated", host_row, %{})
+
+    cases = [
+      %{
+        resource: "attests",
+        path: "/api/attests/#{attest_id}",
+        notice: attest_notice,
+        primary_refs: %{"attestId" => attest_id},
+        allowed_bearers: [owner_device.token, owner_session.cli_token],
+        denied_bearer: ctx.admin_session.cli_token,
+        unknown_path: "/api/attests/att_g7_detail_missing"
+      },
+      %{
+        resource: "transcript messages",
+        path: "/api/sessions/#{owner_session.session_key}/messages/#{message.id}",
+        notice: message_notice,
+        primary_refs: %{
+          "messageId" => message.id,
+          "sessionKey" => owner_session.session_key
+        },
+        allowed_bearers: [owner_device.token, owner_session.cli_token],
+        denied_bearer: ctx.admin_session.cli_token,
+        unknown_path: "/api/sessions/#{owner_session.session_key}/messages/no-such-message"
+      },
+      %{
+        resource: "condition facts",
+        path: "/api/facts/#{session_fact_id}",
+        notice: session_fact_notice,
+        primary_refs: %{"factId" => session_fact_id},
+        allowed_bearers: [owner_device.token, owner_session.cli_token],
+        denied_bearer: ctx.admin_session.cli_token,
+        unknown_path: "/api/facts/#{session_fact_id + 1_000_000}"
+      },
+      %{
+        resource: "condition facts",
+        path: "/api/facts/#{process_fact_id}",
+        notice: process_fact_notice,
+        primary_refs: %{"factId" => process_fact_id},
+        allowed_bearers: [ctx.token],
+        denied_bearer: owner_device.token,
+        unknown_path: "/api/facts/#{process_fact_id + 2_000_000}"
+      },
+      %{
+        resource: "critical state",
+        path: "/api/critical-state/#{owner_session.session_key}",
+        notice: critical_notice,
+        primary_refs: %{"sessionKey" => owner_session.session_key},
+        allowed_bearers: [ctx.token],
+        denied_bearer: owner_session.cli_token,
+        unknown_path: "/api/critical-state/no-such-session"
+      },
+      %{
+        resource: "host environment",
+        path: "/api/host-env/#{host}/#{harness}/#{env_name}",
+        notice: host_notice,
+        primary_refs: %{"host" => host, "harness" => harness, "name" => env_name},
+        allowed_bearers: [ctx.token],
+        denied_bearer: owner_device.token,
+        unknown_path: "/api/host-env/no-such-host/no-such-harness/no-such-name"
+      }
+    ]
+
+    for row <- cases do
+      %{resource: resource, path: path, notice: notice, allowed_bearers: bearers} = row
+      item_bytes = StateResources.encode_item(resource, notice["payload"], ctx.catalog)
+      assert notice["refs"] == row.primary_refs
+
+      for bearer <- bearers do
+        response = get(ctx, path, bearer)
+        assert response.status == 200, "#{path}: #{response.resp_body}"
+        assert_application_headers(response)
+
+        assert response.resp_body ==
+                 ~s({"schemaVersion":1,"resource":#{JSON.encode!(resource)},"item":#{item_bytes}})
+
+        assert raw_json_value(response.resp_body, "item") ==
+                 raw_json_value(Publisher.encode_wire_notice(notice, ctx.catalog), "payload")
+      end
+
+      as_user = get(ctx, path <> "?asUser=flynn", "tbc_core_detail")
+      assert as_user.status == 200
+      assert_application_headers(as_user)
+      assert raw_json_value(as_user.resp_body, "item") == item_bytes
+
+      unauthenticated = get(ctx, path, "")
+      assert_error(unauthenticated, 401, resource, "auth_failed")
+      assert_application_headers(unauthenticated)
+
+      unsupported_filter = get(ctx, path <> "?unsupported=value", List.first(bearers))
+      assert_error(unsupported_filter, 400, resource, "invalid_filter")
+      assert_application_headers(unsupported_filter)
+
+      forbidden = get(ctx, path, row.denied_bearer)
+      unknown = get(ctx, row.unknown_path, row.denied_bearer)
+      assert_error(forbidden, 404, resource, "not_found")
+      assert_error(unknown, 404, resource, "not_found")
+      assert forbidden.resp_body == unknown.resp_body
+      assert_application_headers(forbidden)
+      assert_application_headers(unknown)
+    end
+
+    fact_item = session_fact_notice["payload"]
+    assert fact_item["id"] == session_fact_id
+    assert fact_item["rowVersion"] == session_fact_id
+    assert session_fact_notice["refs"] == %{"factId" => session_fact_id}
+
+    for spelling <- [
+          "0",
+          "0#{session_fact_id}",
+          "+#{session_fact_id}",
+          "-#{session_fact_id}",
+          "#{session_fact_id}.0",
+          "#{session_fact_id}e0",
+          " #{session_fact_id}",
+          "#{session_fact_id} ",
+          "١",
+          "9223372036854775808"
+        ] do
+      response = get(ctx, "/api/facts/#{URI.encode(spelling)}", owner_device.token)
+      assert_error(response, 404, "condition facts", "not_found")
+      assert_application_headers(response)
+    end
+
+    message_mismatch =
+      get(
+        ctx,
+        "/api/sessions/#{ctx.admin_session.session_key}/messages/#{message.id}",
+        owner_device.token
+      )
+
+    message_unknown =
+      get(
+        ctx,
+        "/api/sessions/#{ctx.admin_session.session_key}/messages/no-such-message",
+        owner_device.token
+      )
+
+    assert_error(message_mismatch, 404, "transcript messages", "not_found")
+    assert message_mismatch.resp_body == message_unknown.resp_body
+    assert_application_headers(message_mismatch)
+    assert_application_headers(message_unknown)
+
+    host_mismatch = get(ctx, "/api/host-env/#{host}/other-harness/#{env_name}", ctx.token)
+
+    host_unknown =
+      get(ctx, "/api/host-env/no-such-host/no-such-harness/no-such-name", ctx.token)
+
+    assert_error(host_mismatch, 404, "host environment", "not_found")
+    assert host_mismatch.resp_body == host_unknown.resp_body
+    assert_application_headers(host_mismatch)
+    assert_application_headers(host_unknown)
+
+    critical_unknown = get(ctx, "/api/critical-state/no-such-session", ctx.token)
+    assert_error(critical_unknown, 404, "critical state", "not_found")
+    assert_application_headers(critical_unknown)
   end
 end

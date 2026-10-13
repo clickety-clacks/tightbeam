@@ -587,6 +587,10 @@ defmodule Tightbeam.FirehoseInventoryAcceptance do
       |> Enum.map_reduce(random, fn {_class, notice}, random ->
         {choice, random} = :rand.uniform_s(2, random)
         order = if choice == 1, do: [:duplicate, :older], else: [:older, :duplicate]
+        # rowVersion is a positive integer on the wire. A row at version 1 has
+        # no older version, and rowVersion 0 is a malformed frame that the
+        # socket correctly refuses with 1008, so only its duplicate is replayed.
+        order = if notice["payload"]["rowVersion"] > 1, do: order, else: [:duplicate]
         {{notice, order}, random}
       end)
 

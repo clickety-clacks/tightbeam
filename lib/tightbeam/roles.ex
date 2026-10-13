@@ -155,6 +155,7 @@ defmodule Tightbeam.Roles do
     transaction!(db, fn txn ->
       with :ok <- role_present(txn, name) do
         snapshot = firehose_role_in_txn(txn, name)
+        snapshot = Map.put(snapshot, :row_version, max(now(), snapshot.updated_at + 1))
         Txn.q(txn, "DELETE FROM roles WHERE name = ?1", [name])
         Publisher.maybe_accepted_in_txn(txn, call, %{role: snapshot, removed: name})
         :ok
