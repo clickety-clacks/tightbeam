@@ -805,6 +805,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert after_single_message["items"] == []
     assert after_single_message["page"]["hasMoreBefore"] == false
     assert after_single_message["page"]["hasMoreAfter"] == false
+
     wakes =
       for index <- 1..3 do
         Wakes.schedule(ctx.db, %{
