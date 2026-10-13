@@ -1759,7 +1759,19 @@ defmodule Tightbeam.Acp.Adapter do
             end) do
       case model_ref_from_config(effort_result, effort_config) do
         {:ok, applied_model} ->
-          {:ok, applied_model}
+          # Claude reports the canonical Opus 5.5 selection as `opus[1m]`.
+          # Accept that alias only when its public option still names 5.5;
+          # an Opus 5 readback must remain a mismatch.
+          case {model_ref, applied_model} do
+            {%Model{family: "claude-opus-5-5", context: nil},
+             %Model{family: "opus", context: "1m"}} ->
+              if readback_confirms_model?(effort_result, state.preset, model_ref),
+                do: {:ok, %{model_ref | effort: applied_model.effort}},
+                else: {:ok, applied_model}
+
+            _ ->
+              {:ok, applied_model}
+          end
 
         :error ->
           unconfirmed = readback_node(effort_result, "model", Model.to_ref(model_ref), "readback")

@@ -2374,6 +2374,29 @@ defmodule Tightbeam.Acp.AdapterTest do
     refute Adapter.knows_session?(adapter, "sess-1")
   end
 
+  test "a Claude Opus 5.5 high candidate verifies the client's Opus 5.5 alias" do
+    {adapter, capture_path} =
+      start_adapter(harness: :claude, fail_mode: "canonical-opus55-alias")
+
+    requested = Model.new("claude-opus-5-5", effort: "high")
+
+    assert {:ok, "sess-1"} =
+             Adapter.new_candidate_session(adapter, requested, "/tmp", [], "guidance")
+
+    assert {:ok, ^requested} = Adapter.current_model(adapter, "sess-1")
+
+    writes =
+      captured_requests(capture_path)
+      |> Enum.filter(&(&1["method"] == "session/set_config_option"))
+
+    assert Enum.map(writes, &{&1["configId"], &1["value"]}) ==
+             [{"model", "claude-opus-5-5"}, {"effort", "high"}]
+
+    refute Enum.any?(captured_requests(capture_path), fn request ->
+             request["method"] == "session/close" and request["sessionId"] == "sess-1"
+           end)
+  end
+
   test "a candidate accepts the client's concrete effort when the request omitted effort" do
     {adapter, capture_path} =
       start_adapter(harness: :claude, fail_mode: "candidate-concrete-default-effort")
