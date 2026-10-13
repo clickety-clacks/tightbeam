@@ -4,7 +4,9 @@ This is the one migration procedure for 0.1.8 to 0.1.9. It replaces the separate
 `release-019-database-migration-rehearsal.md` procedure in the specs repository.
 It runs the 0.1.9 packaged gateway against a verified copy of a real 0.1.8
 database, checks build admission, preserves the migrated output and hands that
-output to every feature runbook. Nothing here runs until Mike calls the run.
+output to every feature runbook. Use the existing
+[execution scope](README.md#execution-contract); no fresh Mike call is required
+for already-authorized migration work.
 
 Everything below runs inside an environment that has passed all six
 [containment](README.md#containment) conditions, from a
