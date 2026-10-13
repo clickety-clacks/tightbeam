@@ -178,7 +178,10 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
       END
       """)
 
-    assert {:error, _reason} = Assignments.__handle__(db, "attest", call)
+    assert_raise DB.Error, ~r/fixture rollback after decision creation/, fn ->
+      Assignments.__handle__(db, "attest", call)
+    end
+
     assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM decision_requests")
 
     _ = Hub.connection_stats(hub, self())
