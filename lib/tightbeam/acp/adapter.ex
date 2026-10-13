@@ -795,6 +795,7 @@ defmodule Tightbeam.Acp.Adapter do
                   Model.to_ref(model)
                 )
             end
+
           {:error, {:runtime_config_mismatch, %Model{}}} = mismatch ->
             mismatch
 
