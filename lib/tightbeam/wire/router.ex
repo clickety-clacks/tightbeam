@@ -1231,6 +1231,7 @@ defmodule Tightbeam.Wire.Router do
 
   defp d1_row_tuple(resource, item), do: D1Read.tuple(resource, item)
   defp d1_encode(:work_items, item), do: StateResources.encode_item("work items", item, %{})
+
   defp d1_encode(:decision_requests, item),
     do: StateResources.encode_item("decision requests", item, %{})
 
