@@ -73,12 +73,13 @@ These are different conclusions, not interchangeable closure tokens.
 
 ## Evidence establishes only what it exercised
 
-Keep, add or require a test or gate only when it specifically tests business logic
-or an applicable specification; remove existing ones that do not. A repository
-workflow, implementation detail or paperwork convention does not become a
-specification merely because a check enforces it. Preserve specified product,
-security and safety behavior and substantive independent review; do not invent a
-requirement to justify a check.
+Apply one criterion to every existing or proposed test or gate: it must directly
+test product business logic or an applicable specification. Remove those that do
+not, without adding a replacement process gate. Independent review, security,
+safety, formatting and other categories confer no exemption. A check of specified
+product, security or safety behavior must meet the same criterion. Repository
+workflows, implementation details and paperwork do not become specifications
+merely because a check enforces them; do not invent a requirement to justify one.
 
 Use the narrowest evidence that exercises the change and broaden it only for
 required behavior or affected interactions. Record what ran, what happened and

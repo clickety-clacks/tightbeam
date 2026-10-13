@@ -54,11 +54,12 @@ intentional.
 
 ## Verification
 
-- Choose checks under the Evidence section of
+- Apply the Evidence section to every existing or proposed test and gate:
   `priv/kungfu/agentic-engineering/guidance/engineering-core.md`. Existing CI
   configuration does not by itself justify a test or gate; route a conflicting
   enforced check to its owner for removal through the authorized source path.
-- Use the applicable repository commands for qualifying checks:
+- Select repository commands only for checks that qualify under that rule;
+  command names and categories do not establish qualification:
   - Elixir: `mix format --check-formatted` and `scripts/verify_mix.sh`.
   - Rust, from `cli/`: `cargo fmt --check` and `cargo test`.
 - The canonical gate handles environment hygiene. For ad-hoc Mix runs outside the
