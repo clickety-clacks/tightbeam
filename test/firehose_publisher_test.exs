@@ -1171,6 +1171,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert notice["op"] == "delete"
     assert notice["refs"]["role"] == "worker"
     assert notice["payload"] == expected_item
+    assert notice["payload"]["name"] == "worker"
     assert notice["payload"]["rowVersion"] > notice["payload"]["updatedAt"]
     refute Map.has_key?(notice["payload"], "role")
   end
