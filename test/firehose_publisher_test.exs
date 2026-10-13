@@ -1208,6 +1208,17 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert older_fact["id"] == 4
     refute Map.has_key?(older_fact, "factId")
 
+    filed_fact =
+      Tightbeam.StateResources.condition_fact(%{
+        fact_id: 4,
+        ts: 100,
+        kind: "ready",
+        scope: "synthetic",
+        origin: "process:fixture"
+      })
+
+    assert filed_fact == older_fact
+
     assert_raise ArgumentError, ~r/extra or missing field/, fn ->
       Tightbeam.StateResources.condition_fact(Map.delete(fact, :scope))
     end

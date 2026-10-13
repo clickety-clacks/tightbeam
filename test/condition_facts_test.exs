@@ -119,8 +119,17 @@ defmodule Tightbeam.ConditionFactsTest do
     assert fact.scope == "synthetic"
     assert_receive {:firehose_notice, %{"class" => "verb.accepted"}}
     Hub.delivered(hub, self())
-    assert_receive {:firehose_notice, %{"class" => "condition_fact.filed", "payload" => payload}}
-    assert payload["factId"] == fact.fact_id
+
+    assert_receive {:firehose_notice,
+                    %{
+                      "class" => "condition_fact.filed",
+                      "refs" => %{"factId" => fact_id},
+                      "payload" => payload
+                    }}
+
+    assert fact_id == fact.fact_id
+    assert payload["id"] == fact.fact_id
+    refute Map.has_key?(payload, "factId")
     assert payload["rowVersion"] == fact.fact_id
     Hub.delivered(hub, self())
     assert {:ok, ^fact} = Dispatch.dispatch(ctx.db, handlers, call)

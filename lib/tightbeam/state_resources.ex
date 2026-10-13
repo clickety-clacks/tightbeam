@@ -1397,13 +1397,15 @@ defmodule Tightbeam.StateResources do
       exact_item_keys!("condition-facts notice", row, fields)
     end
 
-    row = public(row)
-    id = row["id"]
+    id = value(row, :id) || value(row, :fact_id)
 
     unless is_integer(id), do: raise(ArgumentError, "id must be an integer")
 
     item =
       row
+      |> public()
+      |> Map.delete("factId")
+      |> Map.put("id", id)
       |> Map.put("rowVersion", id)
       |> Map.take(fields)
 
