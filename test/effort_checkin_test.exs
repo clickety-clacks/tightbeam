@@ -703,7 +703,10 @@ defmodule Tightbeam.EffortCheckinTest do
     item = dispatch(ctx, {:session, "parent"}, "holder", "updated effort")
     request = escalate(ctx, item.id)
     start_supervised!({Hub})
-    :ok = Hub.register(Hub, self(), %{mode: :filtered, db: ctx.db, user_id: "admin", is_admin: true})
+
+    :ok =
+      Hub.register(Hub, self(), %{mode: :filtered, db: ctx.db, user_id: "admin", is_admin: true})
+
     :ok = Hub.subscribe(Hub, self(), "g6-decision", %{"classes" => ["decision_request."]})
 
     old_deadline = request.deadline_wake_id
@@ -735,7 +738,10 @@ defmodule Tightbeam.EffortCheckinTest do
     item = dispatch(ctx, {:session, "parent"}, "holder", "replacement effort")
     old = escalate(ctx, item.id)
     start_supervised!({Hub})
-    :ok = Hub.register(Hub, self(), %{mode: :filtered, db: ctx.db, user_id: "admin", is_admin: true})
+
+    :ok =
+      Hub.register(Hub, self(), %{mode: :filtered, db: ctx.db, user_id: "admin", is_admin: true})
+
     :ok = Hub.subscribe(Hub, self(), "g6-decision", %{"classes" => ["decision_request."]})
 
     assert {:ok, _generation} =
@@ -751,6 +757,7 @@ defmodule Tightbeam.EffortCheckinTest do
     assert_receive {:firehose_notice,
                     %{"class" => "decision_request.superseded", "payload" => old_payload} =
                       old_notice}
+
     assert old_notice["schemaVersion"] == 2
     assert old_notice["resource"] == "decision requests"
     assert old_notice["refs"] == %{"decisionRequestId" => old.id}
@@ -760,6 +767,7 @@ defmodule Tightbeam.EffortCheckinTest do
     assert_receive {:firehose_notice,
                     %{"class" => "decision_request.opened", "payload" => new_payload} =
                       new_notice}
+
     assert new_notice["schemaVersion"] == 2
     assert new_notice["resource"] == "decision requests"
     assert new_notice["refs"] == %{"decisionRequestId" => replacement.id}

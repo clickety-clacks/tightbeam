@@ -581,6 +581,7 @@ defmodule Tightbeam.EffortCheckin do
                    if before.status == "open" do
                      snapshot = Escalation.raw_by_id_in_txn(txn, result.id)
                      Tightbeam.Firehose.Publisher.maybe_accepted_in_txn(txn, call, snapshot)
+
                      _snapshot =
                        Escalation.publish_decision_transition_in_txn(
                          txn,
@@ -984,24 +985,24 @@ defmodule Tightbeam.EffortCheckin do
         assignment_id: generation.assignment_id
       })
 
-        context = Map.put(evidence, :actions, menu)
+    context = Map.put(evidence, :actions, menu)
 
-        supersede_command = %{
-          requester: %{kind: "process", id: "tightbeam:effort-checkin"},
-          reason_kind: "superseded",
-          causal_source: %{
-            kind: "monitor_generation",
-            id: "#{generation.assignment_id}##{generation.generation}"
-          },
-          outcome: %{kind: "replacement", replacement_wake_id: deadline.wake_id}
-        }
+    supersede_command = %{
+      requester: %{kind: "process", id: "tightbeam:effort-checkin"},
+      reason_kind: "superseded",
+      causal_source: %{
+        kind: "monitor_generation",
+        id: "#{generation.assignment_id}##{generation.generation}"
+      },
+      outcome: %{kind: "replacement", replacement_wake_id: deadline.wake_id}
+    }
 
-        supersede_requests_in_txn(
-          txn,
-          generation.assignment_id,
-          supersede_command,
-          generation.generation
-        )
+    supersede_requests_in_txn(
+      txn,
+      generation.assignment_id,
+      supersede_command,
+      generation.generation
+    )
 
     Txn.q(
       txn,

@@ -100,7 +100,10 @@ defmodule Tightbeam.EscalationTest do
     alias Tightbeam.Firehose.Hub
 
     start_supervised!({Hub})
-    :ok = Hub.register(Hub, self(), %{mode: :filtered, db: ctx.db, user_id: "flynn", is_admin: true})
+
+    :ok =
+      Hub.register(Hub, self(), %{mode: :filtered, db: ctx.db, user_id: "flynn", is_admin: true})
+
     :ok = Hub.subscribe(Hub, self(), "g6-decision", %{"classes" => ["decision_request."]})
 
     call = call(ctx.raiser, %{assignment_id: "a1", kind: "completion"})

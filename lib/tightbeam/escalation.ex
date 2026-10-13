@@ -465,13 +465,19 @@ defmodule Tightbeam.Escalation do
 
   defp ensure_decision_row_schema_revision_in_txn(txn) do
     revision_column =
-      Enum.find(Txn.q(txn, "PRAGMA table_info(decision_requests)"), &(Enum.at(&1, 1) == "rowSchemaRevision"))
+      Enum.find(
+        Txn.q(txn, "PRAGMA table_info(decision_requests)"),
+        &(Enum.at(&1, 1) == "rowSchemaRevision")
+      )
 
     case revision_column do
-      nil -> adopt_decision_row_schema_revision_in_txn(txn)
+      nil ->
+        adopt_decision_row_schema_revision_in_txn(txn)
+
       [_cid, "rowSchemaRevision", "INTEGER", 1, default, 0] when default in ["1", "2"] ->
         validate_decision_revision_column_sql!(txn, default)
         validate_decision_row_revisions_in_txn(txn)
+
       _ ->
         raise DB.Error, message: "incompatible decision request rowSchemaRevision column"
     end
@@ -482,6 +488,7 @@ defmodule Tightbeam.Escalation do
       Txn.q(txn, "SELECT sql FROM sqlite_master WHERE type='table' AND name='decision_requests'")
 
     normalized = String.replace(String.downcase(sql), ~r/\s+/u, "")
+
     expected =
       "rowschemarevisionintegernotnulldefault#{default}check(typeof(rowschemarevision)='integer'androwschemarevisionin(1,2))"
 
@@ -496,7 +503,8 @@ defmodule Tightbeam.Escalation do
     statuses = Txn.q(txn, "SELECT DISTINCT status FROM decision_requests") |> List.flatten()
 
     unless Enum.all?(statuses, &(&1 in @decision_revision_2_statuses)) do
-      raise DB.Error, message: "incompatible decision request status at rowSchemaRevision adoption"
+      raise DB.Error,
+        message: "incompatible decision request status at rowSchemaRevision adoption"
     end
 
     :ok =
@@ -1200,6 +1208,7 @@ defmodule Tightbeam.Escalation do
            case file_agent_request_in_txn(txn, input) do
              %{request: request} = filed ->
                Publisher.maybe_accepted_in_txn(txn, input.firehose_call, request)
+
                request =
                  publish_decision_transition_in_txn(
                    txn,
@@ -1207,6 +1216,7 @@ defmodule Tightbeam.Escalation do
                    request,
                    Map.get(input.firehose_call || %{}, :firehose_hub, Hub)
                  )
+
                %{filed | request: request}
 
              error ->
@@ -1378,13 +1388,15 @@ defmodule Tightbeam.Escalation do
 
           answered = request_in_txn(txn, request.id)
           Publisher.maybe_accepted_in_txn(txn, call, answered)
-               answered =
-                 publish_decision_transition_in_txn(
-                   txn,
-                   before,
-                   answered,
-                   Map.get(call, :firehose_hub, Hub)
-                 )
+
+          answered =
+            publish_decision_transition_in_txn(
+              txn,
+              before,
+              answered,
+              Map.get(call, :firehose_hub, Hub)
+            )
+
           answered
         else
           current = request_in_txn(txn, request.id)
@@ -1437,13 +1449,15 @@ defmodule Tightbeam.Escalation do
 
           returned = request_in_txn(txn, request.id)
           Publisher.maybe_accepted_in_txn(txn, call, returned)
-               returned =
-                 publish_decision_transition_in_txn(
-                   txn,
-                   before,
-                   returned,
-                   Map.get(call, :firehose_hub, Hub)
-                 )
+
+          returned =
+            publish_decision_transition_in_txn(
+              txn,
+              before,
+              returned,
+              Map.get(call, :firehose_hub, Hub)
+            )
+
           returned
         else
           current = request_in_txn(txn, request.id)
@@ -2236,11 +2250,13 @@ defmodule Tightbeam.Escalation do
     :ok
   end
 
-  defp public_transition_candidate?(nil, %{kind: kind, status: "open"}) when kind in ~w(statute effort agent),
-    do: true
+  defp public_transition_candidate?(nil, %{kind: kind, status: "open"})
+       when kind in ~w(statute effort agent),
+       do: true
 
-  defp public_transition_candidate?(%{id: id}, %{id: id, kind: kind}) when kind in ~w(statute effort agent),
-    do: true
+  defp public_transition_candidate?(%{id: id}, %{id: id, kind: kind})
+       when kind in ~w(statute effort agent),
+       do: true
 
   defp public_transition_candidate?(_before, _after), do: false
 
@@ -2248,10 +2264,13 @@ defmodule Tightbeam.Escalation do
        when kind in ~w(statute effort agent),
        do: "decision_request.opened"
 
-  defp public_transition_class(%{"kind" => "effort", "status" => "open"} = before, %{
-         "kind" => "effort",
-         "status" => "open"
-       } = after_item) do
+  defp public_transition_class(
+         %{"kind" => "effort", "status" => "open"} = before,
+         %{
+           "kind" => "effort",
+           "status" => "open"
+         } = after_item
+       ) do
     if before != after_item, do: "decision_request.updated"
   end
 
@@ -3166,6 +3185,7 @@ defmodule Tightbeam.Escalation do
 
             ruled = request_in_txn(txn, request.id)
             Publisher.maybe_accepted_in_txn(txn, opts[:firehose_call], ruled)
+
             ruled =
               publish_decision_transition_in_txn(
                 txn,
@@ -3328,6 +3348,7 @@ defmodule Tightbeam.Escalation do
 
             withdrawn = request_in_txn(txn, request.id)
             Publisher.maybe_accepted_in_txn(txn, request.firehose_call, withdrawn)
+
             withdrawn =
               publish_decision_transition_in_txn(
                 txn,
@@ -3335,6 +3356,7 @@ defmodule Tightbeam.Escalation do
                 withdrawn,
                 Map.get(request.firehose_call || %{}, :firehose_hub, Hub)
               )
+
             {withdrawn, decision_transition(request, "open", "withdrawn", by, "withdraw")}
           else
             {error("not_open", "decision request is not open"), nil}

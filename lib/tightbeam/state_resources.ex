@@ -1162,7 +1162,11 @@ defmodule Tightbeam.StateResources do
 
   def query_decision_request(db, %{key: id, principal: principal}) do
     db
-    |> detail_selection("decision requests", principal, &Tightbeam.Escalation.raw_by_id_in_txn(&1, id))
+    |> detail_selection(
+      "decision requests",
+      principal,
+      &Tightbeam.Escalation.raw_by_id_in_txn(&1, id)
+    )
     |> decision_request_query_row()
   end
 
@@ -1450,7 +1454,8 @@ defmodule Tightbeam.StateResources do
     public(row) |> Map.drop(["rowSchemaRevision"])
   end
 
-  def decision_request(row), do: decision_request_projection(row, value(row, :row_schema_revision))
+  def decision_request(row),
+    do: decision_request_projection(row, value(row, :row_schema_revision))
 
   def session(row) do
     reject_public_shape_drift!(row, "sessions")
