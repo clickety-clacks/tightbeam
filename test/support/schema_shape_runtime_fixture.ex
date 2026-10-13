@@ -689,7 +689,12 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
                    "DROP INDEX notice_source_client_identity; ALTER TABLE wakes DROP COLUMN sourceClientIdentity; ALTER TABLE wakes DROP COLUMN sourceAttachments; ALTER TABLE wakes DROP COLUMN sourceVisibilityScope; ALTER TABLE wakes DROP COLUMN sourceAddress"
                  )
 
-        assert :ok = DB.execute(db, "ALTER TABLE decision_requests DROP COLUMN rowSchemaRevision")
+        assert :ok =
+                 DB.execute(db, """
+                 DROP TRIGGER decision_requests_row_schema_revision_insert_guard;
+                 DROP TRIGGER decision_requests_row_schema_revision_update_guard;
+                 ALTER TABLE decision_requests DROP COLUMN rowSchemaRevision;
+                 """)
 
         assert {:ok, ^source_before} =
                  DB.query(

@@ -103,6 +103,43 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
     refute StateVisibility.visible?(db, agent_notice, "unrelated-user", false)
   end
 
+  test "operator decision notices retain their established owner and raiser grants", %{db: db} do
+    alias Tightbeam.StateVisibility
+
+    raiser =
+      Org.create(db, %{
+        session_key: "operator-raiser",
+        display_name: "operator raiser",
+        owner_user_id: "raiser-owner",
+        origin: "user:raiser-owner",
+        archetype: "default",
+        host: "synthetic-host",
+        harness: "fixture",
+        provider: "fixture_provider",
+        model: Model.new("fixture-model")
+      })
+
+    notice = %{
+      "class" => "decision_request.opened",
+      "payload" => %{
+        "kind" => "operator",
+        "ownerUserId" => "operator-owner",
+        "raiserSessionKey" => raiser.session_key
+      }
+    }
+
+    for class <- ~w(opened ruled withdrawn) do
+      event = put_in(notice, ["class"], "decision_request.#{class}")
+
+      assert StateVisibility.visible?(db, event, "operator-owner", false)
+      assert StateVisibility.visible?(db, event, "raiser-owner", false)
+      refute StateVisibility.visible?(db, event, "unrelated-user", false)
+      assert StateVisibility.visible?(db, event, %{kind: "session", id: raiser.session_key})
+      refute StateVisibility.visible?(db, event, %{kind: "session", id: "unrelated-session"})
+      assert StateVisibility.visible?(db, event, "admin", true)
+    end
+  end
+
   test "cannot-proceed publishes one rollback-safe opened snapshot through the agent seam", %{
     db: db,
     session: session

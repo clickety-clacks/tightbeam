@@ -16,6 +16,19 @@ defmodule Tightbeam.TerminalCredentialCoreFixture do
     TerminalCredentialFailure
   }
 
+  def proof!("current-stamped-readonly", db, base) do
+    assert {:opened, incident} = open(db, "current-stamped-readonly")
+
+    assert {:ok, [["decision-request-row-schema-v2-019"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert [view] = TerminalCredentialFailure.views(db)
+    assert [readonly] = TerminalCredentialFailure.readonly_views(base)
+    assert readonly == view
+
+    assert readonly.canonical_statement == TerminalCredentialFailure.statement(db, incident.id)
+  end
+
   def proof!("statement-delivery", db, base) do
     Devices.add_user(db, "mike", true)
 

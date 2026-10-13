@@ -458,17 +458,7 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
     assert function_exported?(Tightbeam.Artifacts, :archive_session, 4)
     assert function_exported?(Tightbeam.Artifacts, :release, 2)
 
-    committed_decision_classes =
-      ~w(decision_request.opened decision_request.updated decision_request.answered
-         decision_request.returned decision_request.ruled decision_request.consumed
-         decision_request.withdrawn decision_request.superseded)
-
-    declared =
-      handler_effects
-      |> Gateway.emitted_state_classes()
-      |> Kernel.++(committed_decision_classes)
-      |> Enum.uniq()
-      |> Enum.sort()
+    declared = Enum.sort(Gateway.emitted_state_classes(handler_effects))
 
     registered = rows |> Map.keys() |> Enum.sort()
     extra = declared -- registered

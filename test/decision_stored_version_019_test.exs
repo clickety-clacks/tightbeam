@@ -374,7 +374,13 @@ defmodule Tightbeam.DecisionStoredVersion019Test do
       WHERE id='dr_agent_r7'
       """)
 
-    :ok = DB.execute(db, "ALTER TABLE decision_requests DROP COLUMN rowSchemaRevision")
+    :ok =
+      DB.execute(db, """
+      DROP TRIGGER decision_requests_row_schema_revision_insert_guard;
+      DROP TRIGGER decision_requests_row_schema_revision_update_guard;
+      ALTER TABLE decision_requests DROP COLUMN rowSchemaRevision;
+      """)
+
     :ok = DB.execute(db, "UPDATE schema_stamp SET shape='notice-source-storage-v1-019'")
 
     :ok =
@@ -415,12 +421,40 @@ defmodule Tightbeam.DecisionStoredVersion019Test do
   end
 
   test "current decision row revision stamp refuses a missing revision column", %{db: db} do
-    :ok = DB.execute(db, "ALTER TABLE decision_requests DROP COLUMN rowSchemaRevision")
+    :ok =
+      DB.execute(db, """
+      DROP TRIGGER decision_requests_row_schema_revision_insert_guard;
+      DROP TRIGGER decision_requests_row_schema_revision_update_guard;
+      ALTER TABLE decision_requests DROP COLUMN rowSchemaRevision;
+      """)
+
     before = decision_schema_snapshot(db)
 
     assert_raise Schema.ShapeError, ~r/incompatible decision request row schema stamp/, fn ->
       Schema.ensure_all(db)
     end
+
+    assert decision_schema_snapshot(db) == before
+  end
+
+  test "decision row revision guards reject values outside the stored enum", %{db: db} do
+    insert_decision_rows(db)
+    before = decision_schema_snapshot(db)
+
+    assert {:error, _} =
+             DB.query(
+               db,
+               "UPDATE decision_requests SET rowSchemaRevision=3 WHERE id='dr_statute_r7'"
+             )
+
+    assert {:error, _} =
+             DB.query(db, """
+             INSERT INTO decision_requests
+               (id,kind,raiserId,ownerUserId,raisedAt,deadlineAt,statuteName,actionKey,
+                question,context,status,rowSchemaRevision)
+             VALUES ('dr_invalid_revision','statute','user:mike','mike',1,2,'law',
+                     'invalid','invalid revision?','{}','open',3)
+             """)
 
     assert decision_schema_snapshot(db) == before
   end
