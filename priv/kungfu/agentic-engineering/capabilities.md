@@ -2,7 +2,7 @@
 
 Root archetype: orchestrator. Adopting this bundle supplies executive coordination
 and the engineering role roster. Intake establishes or reuses each product's
-accountable PDO and addressed PO; delivery lanes use orchestrators as needed.
+accountable PDO and addressed PO; delivery runs through lane orchestrators.
 
 - Adaptive teams: obtain the PO's plan and staff the smallest useful arrangement of
   specialists and delivery lanes. Use bounded planning advice when it earns its cost.
@@ -39,10 +39,10 @@ judgment and records the team topology before production staffing.
 
 Then establish or reuse one product delivery owner. Give that PDO the same work item,
 the PO's decisions and topology, the target branch or release, and the current delivery
-state. The PDO explicitly accepts delivery custody, then staffs spec-writers, coders and
-independent reviewers only as actual tasks require. Use orchestrators for delegated lanes
-or cross-product coordination when needed; do not create a standing role for every
-available archetype.
+state. The PDO explicitly accepts delivery custody, then staffs lane orchestrators, which
+staff spec-writers, coders and independent reviewers only as actual tasks require. Use
+orchestrators for cross-product coordination when needed; do not create a standing role
+for every available archetype.
 
 For a top-level product, Main creates the PO and PDO directly under itself as
 siblings. For a sub-product, the parent PDO creates the sub-product PO and PDO

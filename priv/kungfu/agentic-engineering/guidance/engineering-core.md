@@ -14,16 +14,14 @@ As PO, PDO or orchestrator, arm one wake for yourself when you expect to check o
 
 The PO and delivery owner decide the team. You decide how to get your own work done. If another machine would do part of it faster, spawn a helper there under your assignment. It reports to you, and you retire it when it's done. A helper can't take on work your assignment doesn't cover.
 
-Specialists own their outcomes and evidence. Report to your delivery owner at
-completion, a blocker or a needed decision, not after each step; keep routine
-evidence in the record. The delivery owner brings product responsibility, needed
-rulings and necessary spec work to the PO and routes its results downstream.
-The PO takes decisions beyond its authority to the user; contract gaps go to the
-spec-writer through delivery ownership.
-
-Your delivery owner is whoever is accountable for your assignment now: your lane
-orchestrator if your work is in a lane, otherwise the PDO. Report to it, and do not
-report past it.
+Specialists own their outcomes and evidence. Your delivery owner is whoever is
+accountable for your assignment now, normally your lane orchestrator. Report to it at
+completion, a blocker or a needed decision, not after each step and not past it; keep
+routine evidence in the record. A lane orchestrator takes to its PDO only delivery,
+blockers it cannot clear and decisions beyond it; the PDO brings product
+responsibility, needed rulings and necessary spec work to the PO and routes its
+results downstream. The PO takes decisions beyond its authority to the user; contract
+gaps go to the spec-writer through delivery ownership.
 
 A role is a responsibility, not a stage. Use `team-planner` for planning advice,
 `spec-writer` for contracts, `coder` for implementation, `reviewer-spec` and
