@@ -2353,7 +2353,9 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert ["horizon-8", "horizon-8[fast=true]"] ==
              capture
              |> captured_requests()
-             |> Enum.filter(&(&1["method"] == "session/set_config_option" and &1["configId"] == "model"))
+             |> Enum.filter(
+               &(&1["method"] == "session/set_config_option" and &1["configId"] == "model")
+             )
              |> Enum.map(& &1["value"])
   end
 

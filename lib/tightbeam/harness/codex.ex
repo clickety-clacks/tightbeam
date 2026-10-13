@@ -1269,7 +1269,7 @@ defmodule Tightbeam.Harness.Codex do
     with {:ok, models, version} <- probe_engine_models(state) do
       selected =
         models
-        |> Enum.filter(&(is_map(&1) and is_binary(&1["id"]) and &1["hidden"] == false))
+        |> Enum.filter(&(is_map(&1) and is_binary(&1["id"]) and &1["hidden"] != true))
         |> Map.new(&{&1["id"], &1})
 
       matched = Enum.filter(entries, &Map.has_key?(selected, &1.family))
@@ -1312,7 +1312,11 @@ defmodule Tightbeam.Harness.Codex do
     end
   end
 
-  defp selected_efforts(_model), do: {:error, :malformed_selected_engine_model_list}
+  defp selected_efforts(%{} = model) do
+    if Map.has_key?(model, "supportedReasoningEfforts"),
+      do: {:error, :malformed_selected_engine_model_list},
+      else: {:ok, []}
+  end
 
   defp adapter_binary(target) do
     # One path for both localities, as fixture.ex already does: the adapter lives
