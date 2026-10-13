@@ -18,7 +18,10 @@ Tightbeam.GuardGatewayFixture.run!(fn %{base: base, db: db, config: config} ->
   }
 
   children = Gateway.children(config)
-  {Bandit, bandit_opts} = List.last(children)
+
+  %{start: {Tightbeam.ListenerLifecycle, :start_listener, [bandit_opts, _owner]}} =
+    List.last(children)
+
   {Tightbeam.Wire.Router, socket_deps} = Keyword.fetch!(bandit_opts, :plug)
 
   {:pending, pending} =

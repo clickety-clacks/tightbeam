@@ -65,6 +65,10 @@ defmodule Tightbeam.Dispatch do
 
   @type handlers :: %{optional(String.t()) => handler()}
 
+  @db_transaction_diagnostic_fields ~w(
+    kind operation origin phase cause reasonCause exception cleanup
+  )
+
   @doc """
   Dispatch a call through the handler table. Unknown verb → `{:error,
   %{code: "unknown_verb"}}` + a "denied" event. Handler returning `%{code: _}`
@@ -79,6 +83,14 @@ defmodule Tightbeam.Dispatch do
     origin = Map.fetch!(call, :origin)
     principal = Map.get(call, :principal)
     session_key = Map.get(call, :session_key)
+
+    case principal do
+      {kind, subject} when kind in [:session, :user, :process] and is_binary(subject) ->
+        Tightbeam.RequestContext.resolve_principal(Atom.to_string(kind), subject)
+
+      _ ->
+        :ok
+    end
 
     case bracket_precheck(db, call, verb) do
       :proceed ->
@@ -356,8 +368,7 @@ defmodule Tightbeam.Dispatch do
             # the firehose keep their existing shape: a stack is caller evidence for
             # this call, not an org-wide observation, and elided verbs must not grow
             # a second copy of what they deliberately keep out of the log.
-            diagnostic =
-              ErrorDiagnostic.exception(exception, stacktrace, operation: verb, origin: "handler")
+            diagnostic = handler_exception_diagnostic(exception, stacktrace, verb)
 
             {:error, ErrorDiagnostic.put(error, diagnostic)}
         end
@@ -579,6 +590,9 @@ defmodule Tightbeam.Dispatch do
   defp invoke(handler, call) do
     {:returned, handler.(call)}
   rescue
+    exception in DB.Timeout ->
+      reraise exception, __STACKTRACE__
+
     exception in Placement.Refusal ->
       diagnostic =
         ErrorDiagnostic.new("denial",
@@ -593,6 +607,25 @@ defmodule Tightbeam.Dispatch do
 
     exception ->
       {:raised, exception, __STACKTRACE__}
+  end
+
+  defp handler_exception_diagnostic(exception, stacktrace, verb) do
+    case Map.get(exception, :diagnostic) || Map.get(exception, "diagnostic") do
+      %{
+        "kind" => "exception",
+        "operation" => "db.transaction",
+        "origin" => "db_owner"
+      } = diagnostic ->
+        # DB.transaction has already captured the original phase/stack and any
+        # failed rollback as a bounded, redacted node. Preserve that caller
+        # evidence instead of replacing it with this outer handler rescue frame.
+        diagnostic
+        |> Map.take(@db_transaction_diagnostic_fields)
+        |> ErrorDiagnostic.encode_term()
+
+      _other ->
+        ErrorDiagnostic.exception(exception, stacktrace, operation: verb, origin: "handler")
+    end
   end
 
   defp gated_ref(call) do

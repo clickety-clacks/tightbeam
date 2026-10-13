@@ -146,7 +146,12 @@ defmodule Tightbeam.WorkStateTest do
     assert_receive {:trace_delivered, ^db, ^delivered}
 
     requests = received_db_requests(db, [])
-    assert [{:transaction, transaction}] = requests
+
+    assert [
+             {:db_call, %{operation: "db.transaction", effect_kind: "write"},
+              {:transaction, transaction}}
+           ] = requests
+
     assert is_function(transaction, 1)
   end
 

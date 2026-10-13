@@ -21,6 +21,7 @@ defmodule Tightbeam.Wire.RouterTest do
   }
 
   alias Tightbeam.Wire.Router
+  alias Tightbeam.TestSupport.DBFailureReportingFixture
 
   @nonterminal_operator_detail_keys ~w(
     actionKey assignmentId consumedAt context deadlineAt deadlineWakeId decision
@@ -3616,6 +3617,59 @@ defmodule Tightbeam.Wire.RouterTest do
     assert [[payload]] = payloads
     assert payload =~ "[REDACTED:secret_field]"
     refute payload =~ "SENTINEL"
+  end
+
+  test "REST dispatch preserves the primary DB failure and failed rollback diagnostic", ctx do
+    sentinel = "router-db-failure-sentinel"
+
+    opts =
+      with_handler(
+        ctx.opts,
+        "work-item-create",
+        DBFailureReportingFixture.handler(ctx.db, self(), sentinel)
+      )
+
+    response =
+      conn(
+        :post,
+        "/agent/dispatch",
+        JSON.encode!(%{
+          verb: "work-item-create",
+          asUser: "flynn",
+          params: %{title: "db-failure"}
+        })
+      )
+      |> put_req_header("authorization", "Bearer tbc_test")
+      |> put_req_header("x-tightbeam-cli-version", Tightbeam.CliCompatibility.required_version())
+      |> Router.call(Router.init(opts))
+
+    assert response.status == 500
+    refute response.resp_body =~ sentinel
+
+    assert %{
+             "code" => "server_error",
+             "message" => "primary DB failure password=[REDACTED:secret_field]",
+             "diagnostic" => %{
+               "kind" => "exception",
+               "operation" => "db.transaction",
+               "origin" => "db_owner",
+               "phase" => "callback",
+               "exception" => %{"stacktrace" => stacktrace},
+               "cleanup" => %{
+                 "kind" => "cleanup",
+                 "status" => "unverified",
+                 "operation" => "db.rollback",
+                 "phase" => "rollback",
+                 "resultClass" => "sqlite_error"
+               }
+             }
+           } = JSON.decode!(response.resp_body)["error"]
+
+    assert Enum.any?(stacktrace, &String.contains?(&1, "db_failure_reporting_fixture.ex"))
+    assert_receive {:db_failure_reporting_handler_called, handler_pid} when is_pid(handler_pid)
+    refute_receive {:db_failure_reporting_handler_called, _handler_pid}, 0
+    assert_receive {:db_failure_reporting_callback_called, db_pid} when is_pid(db_pid)
+    refute_receive {:db_failure_reporting_callback_called, _db_pid}, 0
   end
 
   # THE THIRD DESTRUCTION SITE. JSON can say `null`, and the router dropped it —

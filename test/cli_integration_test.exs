@@ -29,6 +29,7 @@ defmodule Tightbeam.CliIntegrationTest do
     WorkState
   }
 
+  alias Tightbeam.TestSupport.DBFailureReportingFixture
   alias Tightbeam.Wire.Router
 
   setup_all do
@@ -938,6 +939,76 @@ defmodule Tightbeam.CliIntegrationTest do
 
     assert payload =~ "[REDACTED:secret_field]"
     refute payload =~ "SENTINEL"
+  end
+
+  test "real CLI preserves a DB failure and failed rollback through the gateway", ctx do
+    sentinel = "cli-db-failure-sentinel"
+    handler = DBFailureReportingFixture.handler(ctx.db, self(), sentinel)
+
+    router_opts =
+      Router.init(
+        db: ctx.db,
+        base_dir: ctx.base_dir,
+        handlers: Map.put(ctx.handlers, "work-item-create", handler),
+        cli_token: "tbc_cli_integration",
+        session_status: fn _ -> nil end
+      )
+
+    bandit =
+      start_supervised!(
+        {Bandit, plug: {Router, router_opts}, port: 0, ip: {127, 0, 0, 1}, startup_log: false},
+        id: :db_failure_router
+      )
+
+    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
+
+    File.write!(
+      Path.join(ctx.base_dir, "work/session/.tightbeam-session"),
+      JSON.encode!(%{
+        url: "http://127.0.0.1:#{port}",
+        token: ctx.session.cli_token,
+        sessionKey: ctx.session.session_key
+      })
+    )
+
+    {output, status} =
+      System.cmd(
+        ctx.binary,
+        ["work-item-create", "--title", "db-failure", "--as-user", "flynn"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert status != 0, output
+    refute output =~ sentinel
+
+    machine = machine_line!(output)
+    assert machine["httpStatus"] == 500
+    assert machine["error"]["code"] == "server_error"
+
+    assert machine["error"]["message"] ==
+             "primary DB failure password=[REDACTED:secret_field]"
+
+    assert %{
+             "kind" => "exception",
+             "operation" => "db.transaction",
+             "origin" => "db_owner",
+             "phase" => "callback",
+             "exception" => %{"stacktrace" => stacktrace},
+             "cleanup" => %{
+               "kind" => "cleanup",
+               "status" => "unverified",
+               "operation" => "db.rollback",
+               "phase" => "rollback",
+               "resultClass" => "sqlite_error"
+             }
+           } = machine["error"]["diagnostic"]
+
+    assert Enum.any?(stacktrace, &String.contains?(&1, "db_failure_reporting_fixture.ex"))
+    assert_receive {:db_failure_reporting_handler_called, handler_pid} when is_pid(handler_pid)
+    refute_receive {:db_failure_reporting_handler_called, _handler_pid}, 0
+    assert_receive {:db_failure_reporting_callback_called, db_pid} when is_pid(db_pid)
+    refute_receive {:db_failure_reporting_callback_called, _db_pid}, 0
   end
 
   defp serve_one(listener, {status, content_type, body}) do
