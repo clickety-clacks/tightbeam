@@ -702,7 +702,7 @@ defmodule Tightbeam.EffortCheckinTest do
 
     item = dispatch(ctx, {:session, "parent"}, "holder", "updated effort")
     request = escalate(ctx, item.id)
-    start_supervised!({Hub})
+    start_supervised!({Hub, name: Hub})
 
     :ok =
       Hub.register(Hub, self(), %{mode: :filtered, db: ctx.db, user_id: "admin", is_admin: true})
@@ -737,7 +737,7 @@ defmodule Tightbeam.EffortCheckinTest do
 
     item = dispatch(ctx, {:session, "parent"}, "holder", "replacement effort")
     old = escalate(ctx, item.id)
-    start_supervised!({Hub})
+    start_supervised!({Hub, name: Hub})
 
     :ok =
       Hub.register(Hub, self(), %{mode: :filtered, db: ctx.db, user_id: "admin", is_admin: true})
