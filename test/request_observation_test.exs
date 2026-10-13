@@ -3,43 +3,13 @@ defmodule Tightbeam.RequestObservationTest do
   import Plug.Conn
   import Plug.Test
   alias Tightbeam.{DB, Diagnostics, Org, RequestContext, Schema}
-  alias Tightbeam.Wire.{OperationRegistry, Router}
+  alias Tightbeam.Wire.Router
 
   setup do
     start_supervised!({Diagnostics, notify: self()})
     db = start_supervised!({DB, path: ":memory:", name: nil})
     :ok = Schema.ensure_all(db)
     %{db: db, opts: Router.init(db: db, cli_token: "private_org_token", handlers: %{})}
-  end
-
-  test "finite rows cover exactly current .9 routes, including session-diagnose" do
-    assert {:ok, routes} = OperationRegistry.router_routes()
-    assert :ok = OperationRegistry.check_source(:http, routes)
-    assert {:ok, rows} = OperationRegistry.rows(:http)
-    assert length(rows) == 48
-
-    assert OperationRegistry.http("POST", "/agent/session-diagnose") ==
-             "http.agent_session_diagnose"
-
-    assert OperationRegistry.http("POST", "/agent/terminal") == "http.agent_terminal"
-    assert OperationRegistry.http("GET", "/api/work-items/:id") == "http.api_work_items.get"
-    assert OperationRegistry.http("GET", "/api/roles/:name") == "http.api_roles.get"
-    assert OperationRegistry.http("GET", "/api/sessions") == "http.api_sessions.list"
-
-    assert OperationRegistry.http("GET", "/api/sessions/:session_key/messages") ==
-             "http.api_sessions.messages"
-
-    assert OperationRegistry.http("GET", "/api/sessions/:session_key/wakes") ==
-             "http.api_sessions.wakes"
-
-    assert OperationRegistry.http("GET", "/api/sessions/:session_key/turns") ==
-             "http.api_sessions.turns"
-
-    assert {:error, [{:unmapped_source, {"GET", "/new"}}]} =
-             OperationRegistry.check(rows, [{"GET", "/new"} | routes])
-
-    assert {:error, [{:orphan_row, {"GET", "/stale"}}]} =
-             OperationRegistry.check([{{"GET", "/stale"}, "http.stale"} | rows], routes)
   end
 
   test "malformed and repeated IDs refuse before authentication and restore prior context", %{

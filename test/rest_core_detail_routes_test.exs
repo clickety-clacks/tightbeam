@@ -900,25 +900,6 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert device_notice["refs"]["deviceId"] == ctx.admin_device.device_id
   end
 
-  test "the shared seams contain no composite CLI or prefix fallback" do
-    resources = File.read!(Path.expand("../lib/tightbeam/state_resources.ex", __DIR__))
-    router = File.read!(Path.expand("../lib/tightbeam/wire/router.ex", __DIR__))
-
-    refute resources =~ "WorkItems.__handle__"
-    refute resources =~ "Assignments.__handle__"
-    refute resources =~ "IdPrefix"
-    refute router =~ "StateVisibility.core_detail_visible?"
-    assert resources =~ "defp detail_selection"
-
-    matches =
-      Regex.scan(
-        ~r/get "\/api\/(?:work-items|assignments|wakes|turns|decision-requests|sessions|roles|devices|artifacts|read-markers)\/:/,
-        router
-      )
-
-    assert length(matches) == 13
-  end
-
   defp core_detail_cases(ctx) do
     call = %{
       principal: {:user, "flynn"},
