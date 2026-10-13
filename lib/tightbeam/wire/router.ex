@@ -81,9 +81,11 @@ defmodule Tightbeam.Wire.Router do
   @max_upload_bytes 32 * 1024 * 1024
   @state_not_found_floor_us 3_000
   @state_malformed_percent_escape ~r/%(?![0-9A-Fa-f]{2})/
+  @core_detail_fact_id ~r/\A[1-9][0-9]*\z/
   @core_detail_specs %{
     work_items: %{resource: "work items", query: :query_work_item, serializer: :work_item},
     assignments: %{resource: "assignments", query: :query_assignment, serializer: :assignment},
+    attests: %{resource: "attests", query: :query_attest, serializer: :attest},
     wakes: %{resource: "wakes", query: :query_wake, serializer: :wake},
     turns: %{resource: "turns", query: :query_turn_by_seq, serializer: :turn},
     decision_requests: %{
@@ -92,7 +94,27 @@ defmodule Tightbeam.Wire.Router do
       serializer: :decision_request
     },
     sessions: %{resource: "sessions", query: :query_session, serializer: :session},
+    messages: %{
+      resource: "transcript messages",
+      query: :query_message,
+      serializer: :message
+    },
     roles: %{resource: "roles", query: :query_role, serializer: :role},
+    facts: %{
+      resource: "condition facts",
+      query: :query_condition_fact,
+      serializer: :condition_fact
+    },
+    critical_state: %{
+      resource: "critical state",
+      query: :query_critical_state,
+      serializer: :critical_state
+    },
+    host_environment: %{
+      resource: "host environment",
+      query: :query_host_environment,
+      serializer: :host_environment
+    },
     devices: %{resource: "devices", query: :query_device, serializer: :device},
     artifacts: %{resource: "artifacts", query: :query_artifact, serializer: :artifact},
     read_markers: %{resource: "read markers", query: :query_read_marker, serializer: :read_marker}
@@ -392,6 +414,10 @@ defmodule Tightbeam.Wire.Router do
     core_detail(conn, Map.fetch!(@core_detail_specs, :assignments), assignment_id)
   end
 
+  get "/api/attests/:attest_id" do
+    core_detail(conn, Map.fetch!(@core_detail_specs, :attests), attest_id)
+  end
+
   get "/api/wakes/:wake_id" do
     core_detail(conn, Map.fetch!(@core_detail_specs, :wakes), wake_id)
   end
@@ -416,8 +442,32 @@ defmodule Tightbeam.Wire.Router do
     core_detail(conn, Map.fetch!(@core_detail_specs, :sessions), session_key)
   end
 
+  get "/api/sessions/:session_key/messages/:message_id" do
+    core_detail(
+      conn,
+      Map.fetch!(@core_detail_specs, :messages),
+      {session_key, message_id}
+    )
+  end
+
   get "/api/roles/:name" do
     core_detail(conn, Map.fetch!(@core_detail_specs, :roles), name)
+  end
+
+  get "/api/facts/:fact_id" do
+    core_detail(conn, Map.fetch!(@core_detail_specs, :facts), fact_id)
+  end
+
+  get "/api/critical-state/:session_key" do
+    core_detail(conn, Map.fetch!(@core_detail_specs, :critical_state), session_key)
+  end
+
+  get "/api/host-env/:host/:harness/:name" do
+    core_detail(
+      conn,
+      Map.fetch!(@core_detail_specs, :host_environment),
+      {host, harness, name}
+    )
   end
 
   get "/api/sessions/:session_key/messages" do
@@ -976,7 +1026,27 @@ defmodule Tightbeam.Wire.Router do
     end
   end
 
+  defp core_detail_key("condition facts", raw_key) when is_binary(raw_key) do
+    if Regex.match?(@core_detail_fact_id, raw_key) do
+      case Integer.parse(raw_key) do
+        {id, ""} when id <= 9_223_372_036_854_775_807 -> {:ok, id}
+        _ -> {:error, :not_found}
+      end
+    else
+      {:error, :not_found}
+    end
+  end
+
+  defp core_detail_key("transcript messages", {session_key, message_id})
+       when is_binary(session_key) and is_binary(message_id),
+       do: {:ok, {session_key, message_id}}
+
+  defp core_detail_key("host environment", {host, harness, name})
+       when is_binary(host) and is_binary(harness) and is_binary(name),
+       do: {:ok, {host, harness, name}}
+
   defp core_detail_key(_resource, raw_key) when is_binary(raw_key), do: {:ok, raw_key}
+  defp core_detail_key(_resource, _raw_key), do: {:error, :not_found}
 
   defp state_bearer_auth(conn) do
     token = bearer_token(conn)

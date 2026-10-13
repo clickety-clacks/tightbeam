@@ -668,6 +668,10 @@ defmodule Tightbeam.StateResources do
     end
   end
 
+  def query_attest(db, %{key: id, principal: principal}) do
+    detail_selection(db, "attests", principal, fn txn -> query_attest(txn, id) end)
+  end
+
   def query_attest(db, id) do
     {:ok, rows} =
       DB.query(
@@ -719,6 +723,12 @@ defmodule Tightbeam.StateResources do
     end
   end
 
+  def query_condition_fact(db, %{key: id, principal: principal}) do
+    detail_selection(db, "condition facts", principal, fn txn ->
+      query_condition_fact(txn, id)
+    end)
+  end
+
   def query_condition_fact(db, id) do
     {:ok, rows} =
       DB.query(db, "SELECT id, ts, kind, scope, origin FROM condition_facts WHERE id = ?1", [id])
@@ -737,6 +747,15 @@ defmodule Tightbeam.StateResources do
   # production enqueue path is the sole turn-bearing writer, so one message
   # resolves to zero or one turn. Refuse duplicate dirt instead of selecting a
   # row by timing or count.
+  def query_message(source, %{key: {session_key, id}, principal: principal}) do
+    detail_selection(source, "transcript messages", principal, fn txn ->
+      case query_message(txn, id) do
+        %{session_key: ^session_key} = row -> row
+        _ -> nil
+      end
+    end)
+  end
+
   def query_message(source, id) do
     case query(source, @message_select <> " WHERE m.id = ?1", [id]) do
       [row] -> message_row(row)
@@ -783,6 +802,12 @@ defmodule Tightbeam.StateResources do
   end
 
   @doc "Canonical host-environment detail query. It never selects the secret value table."
+  def query_host_environment(source, %{key: {host, harness, name}, principal: principal}) do
+    detail_selection(source, "host environment", principal, fn txn ->
+      query_host_environment(txn, host, harness, name)
+    end)
+  end
+
   def query_host_environment(source, filters) when is_map(filters) do
     host = filters[:host] || filters["host"]
     harness = filters[:harness] || filters["harness"]
@@ -950,6 +975,13 @@ defmodule Tightbeam.StateResources do
   end
 
   def query_read_marker(db, user_id, scope_key), do: ReadMarkers.get(db, user_id, scope_key)
+
+  def query_critical_state(db, %{key: session_key, principal: principal}) do
+    detail_selection(db, "critical state", principal, fn txn ->
+      query_critical_state(txn, session_key)
+    end)
+  end
+
   def query_critical_state(db, session_key), do: Tightbeam.CriticalLeases.get(db, session_key)
 
   def query_production(db, seq) do

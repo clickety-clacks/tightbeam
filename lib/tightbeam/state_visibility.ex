@@ -107,6 +107,36 @@ defmodule Tightbeam.StateVisibility do
 
   defp do_core_detail_visible?(_db, _resource, _row, %{is_admin: true}), do: true
 
+  defp do_core_detail_visible?(db, "attests", row, principal) do
+    assignment_id = value(row, :assignment_id)
+
+    not is_nil(
+      Tightbeam.StateResources.query_assignment(db, assignment_id, %{rest_principal: principal})
+    )
+  end
+
+  defp do_core_detail_visible?(db, "transcript messages", row, principal) do
+    session_key = value(row, :session_key)
+
+    is_binary(session_key) and
+      not is_nil(
+        Tightbeam.StateResources.query_session(db, %{key: session_key, principal: principal})
+      )
+  end
+
+  defp do_core_detail_visible?(_db, "condition facts", row, %{kind: "session", id: session_key})
+       when is_binary(session_key) do
+    value(row, :origin) == ("session:" <> session_key)
+  end
+
+  defp do_core_detail_visible?(db, "condition facts", row, %{kind: "user", id: user_id})
+       when is_binary(user_id) do
+    case value(row, :origin) do
+      "session:" <> session_key -> session_owner?(db, session_key, %{kind: "user", id: user_id})
+      _ -> false
+    end
+  end
+
   defp do_core_detail_visible?(_db, "devices", _row, _principal), do: false
 
   defp do_core_detail_visible?(_db, "read markers", row, %{kind: "user", id: user_id}),
