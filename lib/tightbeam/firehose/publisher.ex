@@ -475,6 +475,12 @@ defmodule Tightbeam.Firehose.Publisher do
     StateResources.query_assignment(db, id, call) || result
   end
 
+  defp canonical_result(db, %{verb: verb} = call, result)
+       when verb in ~w(operator-ask operator-rule operator-withdraw) do
+    id = result[:id] || result["id"] || call.params[:request] || call.params[:request_id]
+    StateResources.query_decision_request(db, id) || result
+  end
+
   defp canonical_result(db, %{verb: "wake"} = call, result) do
     id = result[:wake_id] || result["wakeId"] || call.params[:wake_id]
     StateResources.query_wake(db, id) || result

@@ -2337,6 +2337,10 @@ defmodule Tightbeam.StateResources do
       %{"label" => label} = option when map_size(option) == 1 and is_binary(label) ->
         option
 
+      %{"label" => label, "effect" => effect} = option
+      when map_size(option) == 2 and is_binary(label) and effect in ["allow", "deny"] ->
+        %{"label" => label}
+
       _invalid ->
         raise ArgumentError, "decision request options are projection_invalid"
     end)

@@ -1315,7 +1315,9 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
           update_in(row.overrides["skills_add"], &Enum.shuffle/1)
 
         "decision requests" ->
-          Map.update!(row, :context, &shuffle_json_maps/1)
+          Map.update!(row, "item", fn item ->
+            Map.update!(item, :context, &shuffle_json_maps/1)
+          end)
 
         _ ->
           row
@@ -1636,7 +1638,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
 
   defp route_key(%{resource: "wakes", row: row}), do: row.wake_id
   defp route_key(%{resource: "turns", row: row}), do: row.seq
-  defp route_key(%{resource: "decision requests", row: row}), do: row.id
+  defp route_key(%{resource: "decision requests", row: %{"item" => item}}), do: item.id
   defp route_key(%{resource: "sessions", row: row}), do: row.session_key
   defp route_key(%{resource: "devices", row: row}), do: row.device_id || row["deviceId"]
   defp route_key(%{resource: "artifacts", row: row}), do: row.artifact_id
@@ -1688,7 +1690,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
           :agent -> [admin, owner, session]
         end
 
-      {Atom.to_string(kind), row, allowed, denied}
+      {Atom.to_string(kind), row.row["item"], allowed, denied}
     end
   end
 

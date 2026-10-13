@@ -142,8 +142,15 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
       |> Gateway.emitted_state_classes()
       |> Map.new(&{&1, &1})
 
+    committed_decision_classes =
+      ~w(decision_request.opened decision_request.updated decision_request.answered
+         decision_request.returned decision_request.ruled decision_request.consumed
+         decision_request.withdrawn decision_request.superseded)
+      |> Map.new(&{&1, &1})
+
+    production_classes = Map.merge(gateway_classes, committed_decision_classes)
     registry_classes = Map.new(Map.keys(Registry.rows()), &{&1, &1})
-    assert :ok = assert_closed_map!("R8 production classes", registry_classes, gateway_classes)
+    assert :ok = assert_closed_map!("R8 production classes", registry_classes, production_classes)
 
     production_sources =
       Enum.concat([

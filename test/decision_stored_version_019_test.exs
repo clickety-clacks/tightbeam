@@ -100,15 +100,20 @@ defmodule Tightbeam.DecisionStoredVersion019Test do
   end
 
   @tag rest_r7_closure: true
-  test "decision option projection preserves ruled exact objects and refuses malformed values", %{
+  test "decision option projection hides stored effects and refuses malformed values", %{
     db: db
   } do
     insert_decision_rows(db)
     statute = Escalation.raw_by_id(db, "dr_statute_r7")
 
+    assert StateResources.decision_request(statute)["options"] == []
+
     assert StateResources.decision_request(%{
              statute
-             | options: [%{"label" => "allow"}, %{"label" => "deny"}]
+             | options: [
+                 %{"label" => "allow", "effect" => "allow"},
+                 %{"label" => "deny", "effect" => "deny"}
+               ]
            })["options"] == [%{"label" => "allow"}, %{"label" => "deny"}]
 
     for malformed <- [
@@ -116,7 +121,8 @@ defmodule Tightbeam.DecisionStoredVersion019Test do
           "allow",
           [1],
           [%{"label" => 1}],
-          [%{"label" => "allow", "effect" => "allow"}]
+          [%{"label" => "allow", "effect" => "defer"}],
+          [%{"label" => "allow", "unexpected" => "field"}]
         ] do
       assert_raise ArgumentError, ~r/projection_invalid/, fn ->
         StateResources.decision_request(%{statute | options: malformed})
@@ -619,11 +625,12 @@ defmodule Tightbeam.DecisionStoredVersion019Test do
                """
                INSERT INTO decision_requests
                  (id,kind,raiserId,raiserSessionKey,ownerUserId,assignmentId,
-                  raisedAt,deadlineAt,statuteName,actionKey,question,options,context,status)
+                  raisedAt,deadlineAt,statuteName,actionKey,question,options,context,status,
+                  rowSchemaRevision)
                VALUES
                  ('dr_statute_r7','statute','session:raiser','agent:raiser','mike','asg_r7',
                   10,20,'ship-law','ship-action','May this ship?',
-                  NULL,'{"verb":"ship"}','open')
+                  NULL,'{"verb":"ship"}','open',2)
                """
              )
 
@@ -633,10 +640,11 @@ defmodule Tightbeam.DecisionStoredVersion019Test do
                """
                INSERT INTO decision_requests
                  (id,kind,raiserId,raiserSessionKey,ownerUserId,assignmentId,
-                  expecterSessionKey,expecterUserId,raisedAt,question,context,status,askedOfRole)
+                  expecterSessionKey,expecterUserId,raisedAt,question,context,status,askedOfRole,
+                  rowSchemaRevision)
                VALUES
                  ('dr_agent_r7','agent','session:agent:raiser','agent:raiser','mike','asg_r7',
-                  'agent:asked','mike',11,'Which path?','{"verb":"ask"}','open','reviewer:r7')
+                  'agent:asked','mike',11,'Which path?','{"verb":"ask"}','open','reviewer:r7',2)
                """
              )
 
@@ -647,11 +655,11 @@ defmodule Tightbeam.DecisionStoredVersion019Test do
                INSERT INTO decision_requests
                  (id,kind,raiserId,ownerUserId,assignmentId,expecterSessionKey,
                   lineageRung,effortGeneration,deadlineWakeId,raisedAt,deadlineAt,
-                  question,options,context,status)
+                  question,options,context,status,rowSchemaRevision)
                VALUES
                  ('dr_effort_r7','effort','process:tightbeam','mike','asg_r7','agent:expecter',
                   4,7,'w_effort_r7',12,22,'Continue or dismiss?',
-                  '["wake","continue","dismiss"]','{"actions":["wake","continue","dismiss"]}','open')
+                  '["wake","continue","dismiss"]','{"actions":["wake","continue","dismiss"]}','open',2)
                """
              )
   end

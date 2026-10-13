@@ -199,6 +199,7 @@ defmodule Tightbeam.DecisionRowVersionR1MigrationTest do
     seed(db)
     :ok = DB.execute(db, "UPDATE decision_requests SET decision='allow' WHERE id='statute-ruled'")
     assert {:ok, :ok} = upgrade(db)
+    :ok = Escalation.ensure_schema(db)
     pid = GenServer.whereis(db)
     :erlang.trace_pattern({Wakes, :row_commit_in_txn, 2}, true, [:local])
     :erlang.trace(pid, true, [:call, {:tracer, self()}])
