@@ -276,23 +276,23 @@ defmodule Tightbeam.Escalation do
   """
 
   @decision_requests_pre_revision_ddl
-    case Regex.run(~r/CREATE TABLE IF NOT EXISTS decision_requests \([\s\S]*?\n  \);/u, @ddl) do
-      [ddl] ->
-        ddl
-        |> String.trim_trailing(";")
-        |> String.replace_prefix("CREATE TABLE IF NOT EXISTS", "CREATE TABLE")
+  case Regex.run(~r/CREATE TABLE IF NOT EXISTS decision_requests \([\s\S]*?\n  \);/u, @ddl) do
+    [ddl] ->
+      ddl
+      |> String.trim_trailing(";")
+      |> String.replace_prefix("CREATE TABLE IF NOT EXISTS", "CREATE TABLE")
 
-      _ ->
-        raise "decision_requests DDL not found"
-    end
+    _ ->
+      raise "decision_requests DDL not found"
+  end
 
   @decision_request_revision_ddl
-    "rowSchemaRevision INTEGER NOT NULL DEFAULT 1 " <>
-      "CHECK (typeof(rowSchemaRevision) = 'integer' AND rowSchemaRevision IN (1,2))"
+  "rowSchemaRevision INTEGER NOT NULL DEFAULT 1 " <>
+    "CHECK (typeof(rowSchemaRevision) = 'integer' AND rowSchemaRevision IN (1,2))"
 
   @decision_requests_current_ddl
-    String.trim_trailing(@decision_requests_pre_revision_ddl, ")") <>
-      ", " <> @decision_request_revision_ddl <> ")"
+  String.trim_trailing(@decision_requests_pre_revision_ddl, ")") <>
+    ", " <> @decision_request_revision_ddl <> ")"
 
   @terminal_request_columns """
   id, kind, raiserId, raiserSessionKey, ownerUserId, assignmentId,
@@ -1216,7 +1216,8 @@ defmodule Tightbeam.Escalation do
   defp file_agent_request(db, input) do
     case DB.transaction(db, fn txn ->
            case file_agent_request_in_txn(txn, input) do
-             %{request: _request} = filed -> filed
+             %{request: _request} = filed ->
+               filed
 
              error ->
                error

@@ -1764,8 +1764,8 @@ defmodule Tightbeam.Schema do
                [[@notice_source_payload_shape]] ->
                  validate_notice_source_payload_in_txn!(txn)
 
-             [[@decision_request_row_schema_shape]] ->
-               validate_notice_source_payload_in_txn!(txn)
+               [[@decision_request_row_schema_shape]] ->
+                 validate_notice_source_payload_in_txn!(txn)
 
                [[@assignment_source_replacement_shape]] ->
                  unless Txn.q(
@@ -2502,8 +2502,8 @@ defmodule Tightbeam.Schema do
                  @notice_source_payload_shape,
                  @decision_request_row_schema_shape
                ],
-              do: @assignment_source_replacement_liveness_objects,
-              else: @supervision_receipt_cancellation_liveness_objects
+               do: @assignment_source_replacement_liveness_objects,
+               else: @supervision_receipt_cancellation_liveness_objects
 
           Enum.reject(liveness_objects, &(&1.name == "supervision_receipt_cancellation_epoch"))
 
@@ -3189,8 +3189,7 @@ defmodule Tightbeam.Schema do
 
              rows ->
                raise ShapeError,
-                 message:
-                   "incompatible decision request row schema predecessor: #{inspect(rows)}"
+                 message: "incompatible decision request row schema predecessor: #{inspect(rows)}"
            end
          end) do
       {:ok, :ok} ->
@@ -3883,8 +3882,7 @@ defmodule Tightbeam.Schema do
 
       {:error, error} ->
         raise ShapeError,
-          message:
-            "incompatible decision request row schema stamp: #{Exception.message(error)}"
+          message: "incompatible decision request row schema stamp: #{Exception.message(error)}"
     end
   end
 
