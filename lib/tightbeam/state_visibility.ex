@@ -129,6 +129,10 @@ defmodule Tightbeam.StateVisibility do
           session_principal?(principal, value(row, :expecter_session_key)) or
           user_principal?(principal, value(row, :owner_user_id))
 
+      "operator" ->
+        admin or user_principal?(principal, value(row, :owner_user_id)) or
+          session_principal?(principal, value(row, :raiser_session_key))
+
       _ ->
         false
     end

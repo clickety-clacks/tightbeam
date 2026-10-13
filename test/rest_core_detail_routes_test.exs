@@ -2317,16 +2317,28 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     session = %{kind: "session", id: ctx.admin_session.session_key, is_admin: false}
     denied = %{kind: "user", id: "outsider", is_admin: false}
 
-    for %{kind: kind, row: row} <- decision_route_cases(ctx) do
-      allowed =
-        case kind do
-          :statute -> [admin, owner]
-          :effort -> [admin, session]
-          :agent -> [admin, owner, session]
-        end
+    decision_rows =
+      for %{kind: kind, row: row} <- decision_route_cases(ctx) do
+        allowed =
+          case kind do
+            :statute -> [admin, owner]
+            :effort -> [admin, session]
+            :agent -> [admin, owner, session]
+          end
 
-      {Atom.to_string(kind), row["item"], allowed, denied}
-    end
+        {Atom.to_string(kind), row["item"], allowed, denied}
+      end
+
+    decision_rows =
+      decision_rows ++
+        [
+          {"operator",
+           %{
+             kind: "operator",
+             owner_user_id: "flynn",
+             raiser_session_key: ctx.admin_session.session_key
+           }, [admin, owner, session], denied}
+        ]
   end
 
   defp decision_route_cases(ctx) do
