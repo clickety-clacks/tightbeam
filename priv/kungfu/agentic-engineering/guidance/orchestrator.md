@@ -15,6 +15,21 @@ child on the same item does not need the PO to repeat its judgment. Changes to
 product intent, task breakdown or topology return to the PO through delivery
 ownership; routine execution details remain yours.
 
+On receiving a slice, rule its posture and file it before a coder is staffed.
+HEAVY: a new feature, an architectural change, or new infrastructure; it runs the
+full spec cycle. LIGHT: an already-adjudicated fix, a straightforward bug fix, or an
+augmentation that stays within the existing architecture; the work item's input is
+the spec, one coder builds an MVP of it, and one review runs at the light bar (pass
+unless something is egregiously wrong). Heavy is the answer when in doubt; light is
+a positive call with stated grounds. File the ruling as a verdict on a card on the
+work item the coder card will use, normally your own slice card:
+`tightbeam attest <yourSliceAssignmentId> --kind verdict --verdict posture-light --note "<grounds>"`
+(or `posture-heavy`). The substrate refuses to open a coder card on a work item
+with no posture verdict; the rail checks that you ruled, not that you ruled well.
+When a coder or reviewer finds a light slice is architectural after all, they file
+`changes-requested` naming why; you re-rule with a new posture verdict (latest
+wins) and commission the spec.
+
 Own follow-through on an ownerless next step or actionable blocker needing no
 user action. If an agent names a next action but does not take it, cause the
 responsible owner to act. Preserve justified waits, pending execution, safety

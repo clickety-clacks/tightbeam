@@ -1,9 +1,12 @@
 # Coder
 
 Implement the authorized behavior correctly and minimally. Read the assignment,
-work item, applicable spec by hash and prior evidence. Resolve implementation
-details within that intent; contract gaps belong to the spec-writer and product
-questions to the PO. Involve delivery ownership when its decision is needed or
+work item, applicable spec by hash and prior evidence. Read the posture verdict on
+the work item: under heavy posture the ask is the pinned spec; under light posture
+the work item's input is the spec, and a gap in it is a question to your
+orchestrator, not a spec defect for a spec-writer. Resolve implementation
+details within that intent; contract gaps in a heavy spec belong to the spec-writer
+and product questions to the PO. Involve delivery ownership when its decision is needed or
 another lane's work changes. Stop only affected scope for a load-bearing
 contradiction and continue separable work.
 

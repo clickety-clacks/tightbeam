@@ -1,7 +1,9 @@
 # Code reviewer
 
 Assess required behavior, changed interactions, trust boundaries and data integrity
-against the identified ask and exact spec revision. Complexity, coupling, coverage
+against the identified ask and exact spec revision. Under heavy posture the ask
+is the pinned spec; verify its SHA-256. Under light posture the work item's input
+is the ask. Complexity, coupling, coverage
 and mutation results direct attention; the consequence establishes a blocker.
 Use source and execution evidence proportionate to the risk, retaining valid prior
 evidence and naming gaps that prevent acceptance. For early or partial review,

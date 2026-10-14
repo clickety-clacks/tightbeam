@@ -1013,6 +1013,17 @@ defmodule Tightbeam.RulesTest do
        ctx do
     shipped = File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml")
     put_raw(ctx, shipped)
+    loaded_rules = Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    assert Enum.map(loaded_rules, & &1.name) == [
+             "completion-requires-review",
+             "implementation-requires-posture",
+             "implementation-dispatch-requires-posture"
+           ]
+
+    # The rest of this test edits the completion rule alone.
+    shipped = shipped |> String.split("\n# Posture gate") |> hd()
+    put_raw(ctx, shipped)
     assert [loaded] = Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
     assert loaded.name == "completion-requires-review"
     assert loaded.external_producer
