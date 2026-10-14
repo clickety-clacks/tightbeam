@@ -57,7 +57,6 @@ defmodule Tightbeam.StateResources do
     Devices,
     Identity,
     Harness,
-    ModelCatalog,
     Org,
     ReadMarkers,
     StateVisibility,
@@ -303,33 +302,6 @@ defmodule Tightbeam.StateResources do
     {"transcript messages", "effort"} => :effort,
     {"transcript messages", "context"} => :context,
     {"host environment", "harness"} => :harness
-  }
-
-  @item_catalog_selections %{
-    "assignments" => %{harness: "holderHarness", provider: "holderProvider"},
-    "attests" => %{harness: "byHarness", provider: "byProvider"},
-    "turns" => %{
-      harness: "harness",
-      model: "model",
-      effort: "thinkingLevel",
-      context: "modelContext"
-    },
-    "sessions" => %{
-      host: "host",
-      harness: "harness",
-      provider: "provider",
-      model: "model",
-      effort: "thinkingLevel",
-      context: "modelContext"
-    },
-    "transcript messages" => %{
-      harness: "harness",
-      provider: "provider",
-      model: "model",
-      effort: "effort",
-      context: "context"
-    },
-    "host environment" => %{host: "host", harness: "harness"}
   }
 
   @item_enums %{
@@ -1807,17 +1779,23 @@ defmodule Tightbeam.StateResources do
 
   @doc "Encode one rebuildable R7/R7a item in its ruled order with compact UTF-8 JSON."
   def encode_item(resource, item) when is_binary(resource) and is_map(item) do
-    encode_item(resource, item, served_catalog(resource, item))
+    encode_item(resource, item, %{})
   end
 
-  @doc "Encode one item against an already-served model-catalog snapshot."
+  @doc """
+  Encode one item. A projection serializes a stored record as recorded: its
+  harness, provider, model, effort, and context are history, so they are not
+  checked against the live model catalog. Selections are validated against the
+  catalog where they are made (spawn, tune, set_harness). The catalog argument
+  is accepted for existing callers and not consulted.
+  """
   def encode_item(resource, item, catalog)
       when is_binary(resource) and is_map(item) and is_map(catalog) do
     resource = Map.get(@item_resource_aliases, resource, resource)
     fields = Map.fetch!(@item_field_order, resource)
     fields = conditional_fields!(resource, fields, item)
     exact_item_keys!(resource, item, fields)
-    validate_item_values!(resource, item, fields, catalog)
+    validate_item_values!(resource, item, fields)
 
     encoded =
       Enum.map_join(fields, ",", fn field ->
@@ -1895,7 +1873,7 @@ defmodule Tightbeam.StateResources do
     end
   end
 
-  defp validate_item_values!(resource, item, fields, catalog) do
+  defp validate_item_values!(resource, item, fields) do
     Enum.each(fields, fn field ->
       validate_wire_value!(
         Map.fetch!(item, field),
@@ -1904,7 +1882,7 @@ defmodule Tightbeam.StateResources do
       )
     end)
 
-    validate_item_relationships!(resource, item, catalog)
+    validate_item_invariants!(resource, item)
   end
 
   defp item_field_type!(resource, field) do
@@ -2094,14 +2072,6 @@ defmodule Tightbeam.StateResources do
   defp validate_json_value!(_value, label),
     do: raise(ArgumentError, "#{label} must be a JSON value")
 
-  defp validate_item_relationships!(resource, item, catalog) do
-    if Map.has_key?(@item_catalog_selections, resource) do
-      validate_catalog_selection!(resource, item, catalog)
-    end
-
-    validate_item_invariants!(resource, item)
-  end
-
   defp validate_item_invariants!("work items", item) do
     unless is_integer(item["priority"]) and item["priority"] in 0..8 do
       raise ArgumentError, "work items priority must be an integer from 0 through 8"
@@ -2155,81 +2125,6 @@ defmodule Tightbeam.StateResources do
   end
 
   defp validate_item_invariants!(_resource, _item), do: :ok
-
-  defp served_catalog(resource, item) do
-    resource = Map.get(@item_resource_aliases, resource, resource)
-
-    if catalog_selection_present?(resource, item) do
-      ModelCatalog.get()
-    else
-      %{}
-    end
-  end
-
-  defp catalog_selection_present?(resource, item) do
-    case Map.get(@item_catalog_selections, resource) do
-      nil -> false
-      fields -> Enum.any?(Map.values(fields), &is_binary(item[&1]))
-    end
-  end
-
-  defp validate_catalog_selection!(resource, item, catalog) do
-    fields = Map.fetch!(@item_catalog_selections, resource)
-
-    selection =
-      fields
-      |> Map.take([:harness, :provider, :model, :effort, :context])
-      |> Map.new(fn {kind, field} -> {kind, binary_or_nil(item[field])} end)
-
-    host = fields[:host] && binary_or_nil(item[fields.host])
-    harness = selection[:harness]
-
-    if is_binary(harness) do
-      try do
-        Harness.parse!(harness)
-      rescue
-        ArgumentError ->
-          raise ArgumentError, "#{resource}.harness is absent from the served harness catalog"
-      end
-
-      unless Enum.any?(Map.keys(catalog), fn {_host, catalog_harness} ->
-               harness == catalog_harness
-             end) do
-        raise ArgumentError, "#{resource}.harness is absent from the served harness catalog"
-      end
-    end
-
-    keys =
-      Enum.filter(Map.keys(catalog), fn {catalog_host, catalog_harness} ->
-        (is_nil(host) or host == catalog_host) and
-          (is_nil(harness) or harness == catalog_harness)
-      end)
-
-    dynamic = Map.drop(selection, [:harness])
-
-    if Enum.any?(Map.values(dynamic), &is_binary/1) do
-      entries = Enum.flat_map(keys, &Map.fetch!(catalog, &1))
-
-      unless Enum.any?(entries, &catalog_entry_matches?(&1, dynamic)) do
-        raise ArgumentError,
-              "#{resource} harness, provider, model, effort, and context must match one served catalog entry"
-      end
-    end
-
-    :ok
-  end
-
-  defp binary_or_nil(value) when is_binary(value), do: value
-  defp binary_or_nil(_value), do: nil
-
-  defp catalog_entry_matches?(entry, selection) do
-    provider = entry.provider |> Atom.to_string()
-
-    (is_nil(selection[:provider]) or selection.provider == provider) and
-      (is_nil(selection[:model]) or selection.model == entry.family) and
-      (is_nil(selection[:effort]) or selection.effort in entry.efforts) and
-      (is_nil(selection[:context]) or selection.context == entry.context)
-  end
 
   defp encode_item_field("sessions", "overrides", nil), do: "null"
 

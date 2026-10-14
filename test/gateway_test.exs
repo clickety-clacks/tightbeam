@@ -2808,6 +2808,17 @@ defmodule Tightbeam.GatewayTest do
     )
   end
 
+  @tag cold_gateway: true, gateway_fresh_auth: true, tmp_dir: true
+  test "an admin reads a freshly admitted Main while the model catalog is empty", %{
+    tmp_dir: tmp
+  } do
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "live_base_gateway_fresh_main_detail.exs",
+      "guarded-gateway-fresh-main-detail: ok"
+    )
+  end
+
   # Both spellings of the routability question reach the running catalog: the
   # fleet one that the catalog asks, and the per-harness one that validation and
   # boot ask. Written against the DEFAULT server, because that is the whole
