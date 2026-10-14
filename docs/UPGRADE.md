@@ -103,44 +103,55 @@ new yes before acting; read-only inventory can proceed while waiting.
    [old-install cleanup](#remove-the-old-npm-installation). Remove only the
    verified obsolete npm package and links, then check that the service,
    operator shell, and satellites cannot load the stale CLI or gateway.
-9. Complete the upgrade with guided relearn, or record the user's explicit
-   deferral. As soon as the gateway and satellites pass, tell the user the
-   upgrade is not complete until relearn and offer to start it; do not wait to
-   be asked, and do not report the upgrade as done before it. Have Main explain the installed guidance changes, run
-   `tightbeam identity relearn` when the user chooses, and guide each conflict
-   choice as described below; never silently select either version. Restarting
-   the gateway is not upgrade completion: without relearn, 0.1.9 code can run
-   with 0.1.8 guidance, and no staleness notice appears until a new identity is
-   published.
-   **Relearn does not update every file. Bring this to the user's attention
-   on every upgrade and offer a fix.** In 0.1.9, relearn keeps the org's copy
-   of these files without comparing it with the new release, and reports
-   nothing:
-   - The two starter files Tightbeam seeded when the org was created,
-     `archetypes/default.toml` and `guidance/operating-model.md`. The
-     release's changes to them never arrive.
-   - Any org file at a path the release itself ships, such as an org copy of
-     `guidance/operating-manual.md`. The org's copy keeps overriding the new
-     release's file, even when it is only an old snapshot.
+9. Complete the upgrade by bringing in the new guidance. Installing a release
+   changes Tightbeam's code; it does not change the guidance agents follow.
+   As soon as the gateway and satellites pass, tell the user that the upgrade
+   is not complete yet, explain the steps below in plain words before starting
+   any of them, and offer to begin. Do not wait to be asked, and do not report
+   the upgrade as done before the last step. Have Main lead the user through it.
 
-   After relearn, list those files by comparing the identity repository's
-   paths with the selected package's `priv/seed`, `priv/guidance` and the
-   learned bundles' paths. For each one, show the user the difference between
-   the org's copy and the release's version and say which org lines look
-   deliberate. Offer to apply the release's version while keeping the org's
-   deliberate lines, or to delete an override that is only an old copy, and
-   publish only what the user chooses through `tightbeam identity edit`.
-   Relearn itself is expected to merge these files in 0.1.10.
-   Before refreshing sessions, explain that `tightbeam identity apply --all`
-   updates their Tightbeam-owned skill files and asks them to re-read without
-   reloading their current model context, and obtain the user's confirmation.
-   After relearn (or `relearn --resolve`) publishes the merged identity, run
-   `tightbeam identity apply --all` at a boundary that does not interrupt running
-   turns, then require `tightbeam identity status` to show no conflicts and no
-   stale sessions. The upgrade is complete only after guided relearn, apply to
-   all sessions, and that clean status, or a recorded user deferral that names
-   the remaining guidance/session mismatch; do not report deferred refresh as
-   completed relearn.
+   1. **Relearn.** `tightbeam identity relearn` imports the release's version
+      of every learned kungfu bundle and merges it with the org's identity.
+      Before running it, explain what the release changes in the guidance.
+   2. **Resolve conflicts with the user.** Where the org changed a file the
+      release also changed, relearn stops. For each conflict, explain the
+      release's intent and the org's current text, and let the user choose:
+      keep one side, combine them, or abort. Never pick a side silently.
+   3. **Publish.** Once every conflict is resolved, `tightbeam identity
+      relearn --resolve` commits the merged identity; a relearn with no
+      conflicts publishes on its own. From then on, newly started agents
+      receive the new guidance.
+   4. **Check what relearn skipped.** In 0.1.9, relearn keeps the org's copy
+      of some files without comparing it with the release, and reports
+      nothing:
+      - the two starter files Tightbeam seeded when the org was created,
+        `archetypes/default.toml` and `guidance/operating-model.md`;
+      - any org file at a path the release itself ships, such as an org copy
+        of `guidance/operating-manual.md`, which keeps overriding the
+        release's file even when it is only an old snapshot.
+
+      Bring this to the user's attention on every upgrade and offer a fix.
+      List those files by comparing the identity repository's paths with the
+      selected package's `priv/seed`, `priv/guidance` and the learned bundles'
+      paths. For each one, show the difference between the org's copy and the
+      release's version, say which org lines look deliberate, and offer to
+      apply the release's version while keeping them, or to delete an
+      override that is only an old copy. Publish only what the user chooses,
+      through `tightbeam identity edit`. Relearn itself is expected to merge
+      these files in 0.1.10.
+   5. **Roll out to existing agents.** Publishing does not reach agents that
+      are already running. `tightbeam identity apply --all` rewrites their
+      Tightbeam-owned skill files and asks each to re-read them; it does not
+      reload a running model's context. Explain this, get the user's yes,
+      and run it at a moment that does not interrupt running turns.
+   6. **Confirm.** `tightbeam identity status` must show no conflicts and no
+      stale sessions.
+
+   Restarting the gateway is not upgrade completion: without these steps the
+   release's code runs with the previous release's guidance, and nothing warns
+   about it until a new identity is published. If the user defers any step,
+   record the deferral and name what remains out of date; do not report a
+   deferred step as done.
 
 ## 0.1.8 to 0.1.9 database rehearsal
 
@@ -375,14 +386,11 @@ new code to prove that every such incident recovered. If older code will run whi
 any incident remains open, explicitly acknowledge that it cannot honor the durable
 suppression and the automatic provider credential probe loop will return.
 
-After the upgraded gateway is running, recommend refreshing each learned
-kungfu when the user chooses. Ask Main to load the
-`tightbeam-operating-manual` skill and walk through the relearn; the single
-`tightbeam identity relearn` command imports the 0.1.9 version of every learned
-bundle and merges it with the user's identity. If a conflict appears, Main
-should explain the 0.1.9 version's intent and the user's current version, then
-let the user choose how to resolve it or abort. Do not run a separate trial
-relearn or resolve conflicts without the user's choice.
+After the upgraded gateway is running, bring in the new guidance as step 9 of
+[the 0.1.8 to 0.1.9 order](#018-to-019-follow-this-order) describes: relearn,
+resolve conflicts with the user, publish, check what relearn skipped, roll out
+to existing agents, confirm. Main loads the `tightbeam-operating-manual` skill
+to lead it.
 
 The 0.1.8 package carries its own exact migration chain: `model-identity-v1`
 (0.1.7) to `operator-decision-requests-v1`, then to `pi-harness-v1`. A database
