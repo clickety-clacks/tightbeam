@@ -384,10 +384,10 @@ defmodule Tightbeam.RailRemedy do
         case DB.transaction(db, fn txn ->
                case Txn.q(
                       txn,
-                      "SELECT noticeState FROM rail_remedy_episodes WHERE statute=?1 AND subject=?2 AND status='live' AND occurrence=?3",
-                      [statute, subject, occurrence]
+                      "SELECT status,occurrence,noticeState FROM rail_remedy_episodes WHERE statute=?1 AND subject=?2",
+                      [statute, subject]
                     ) do
-                 [[encoded]] ->
+                 [["live", ^occurrence, encoded]] ->
                    state = decode_notice_state(encoded)
 
                    if get_in(state, ["reassessment", "wakeId"]) == wake.wake_id and
@@ -482,6 +482,19 @@ defmodule Tightbeam.RailRemedy do
                      raise ArgumentError, "stale review remedy reassessment"
                    end
 
+                 [] ->
+                   settle_stale_reassessment_in_txn(txn, wake)
+                   :ok
+
+                 [["closed", current_occurrence, _encoded]]
+                 when current_occurrence >= occurrence ->
+                   settle_stale_reassessment_in_txn(txn, wake)
+                   :ok
+
+                 [["live", current_occurrence, _encoded]] when current_occurrence > occurrence ->
+                   settle_stale_reassessment_in_txn(txn, wake)
+                   :ok
+
                  _ ->
                    raise ArgumentError, "review remedy episode is not live"
                end
@@ -494,6 +507,28 @@ defmodule Tightbeam.RailRemedy do
         raise ArgumentError, "invalid review remedy reassessment payload"
     end
   end
+
+  defp settle_stale_reassessment_in_txn(
+         %Txn{} = txn,
+         %{consumer: "review_remedy_reconcile", prompt: prompt, wake_id: wake_id}
+       ) do
+    case Txn.q(txn, "SELECT consumer,prompt,state FROM wakes WHERE wakeId=?1", [wake_id]) do
+      [["review_remedy_reconcile", ^prompt, "pending"]] ->
+        Wakes.consume_internal_in_txn(txn, wake_id)
+
+      [["review_remedy_reconcile", ^prompt, state]] when state in ["fired", "canceled"] ->
+        :ok
+
+      [] ->
+        :ok
+
+      _ ->
+        raise ArgumentError, "stale review remedy reassessment identity changed"
+    end
+  end
+
+  defp settle_stale_reassessment_in_txn(_txn, _wake),
+    do: raise(ArgumentError, "stale review remedy reassessment identity changed")
 
   @doc "Return the occurrence when one statute/subject episode is live."
   @spec live?(DB.server(), String.t(), String.t()) :: pos_integer() | nil
