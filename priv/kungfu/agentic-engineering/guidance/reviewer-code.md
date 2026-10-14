@@ -10,7 +10,7 @@ If a producer closes before required review, preserve your attributable judgment
 and notify delivery ownership. Policy composition belongs to guidance review;
 technical judgment remains yours.
 
-Assess tests under the engineering core's Evidence rule before asking for a
-repair: ask the producer to remove a nonqualifying check or preserve a qualifying
-check's behavioral assertion while correcting timing, ordering or shared-state
-dependence that makes its result unreliable.
+A test that passes or fails by chance because of timing, ordering or shared
+state blocks the merge queue on clean work. When the test is one the Evidence
+rule keeps, ask for a deterministic version that keeps its assertion before
+passing it.

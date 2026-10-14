@@ -54,12 +54,12 @@ intentional.
 
 ## Verification
 
-- Apply the Evidence section to every existing or proposed test and gate:
-  `priv/kungfu/agentic-engineering/guidance/engineering-core.md`. Existing CI
-  configuration does not by itself justify a test or gate; route a conflicting
-  enforced check to its owner for removal through the authorized source path.
-- Select repository commands only for checks that qualify under that rule;
-  command names and categories do not establish qualification:
+- The Evidence section of
+  `priv/kungfu/agentic-engineering/guidance/engineering-core.md` decides which
+  tests and gates to keep, add or require, including those in CI configuration.
+  Take an enforced check that it would remove to its owner for removal through
+  the authorized source path.
+- Repository commands. Run those whose checks that rule keeps:
   - Elixir: `mix format --check-formatted` and `scripts/verify_mix.sh`.
   - Rust, from `cli/`: `cargo fmt --check` and `cargo test`.
 - The canonical gate handles environment hygiene. For ad-hoc Mix runs outside the
@@ -68,10 +68,9 @@ intentional.
   After `wi_8f90c5b3` merges, the suite is immune to the
   known `TIGHTBEAM_*` config leaks. Keep stripping both prefixes: that proof covers
   only config, while `RELEASE_ROOT` is read directly from the environment in `lib/`.
-- Make the requested change first, then select focused verification under the
-  engineering core's Evidence rule and broaden it for affected required behavior. Do not run a full-suite
-  baseline before writing code; an untouched-tree replay delays the change without
-  proving its result.
+- Make the requested change first, then run the focused checks that exercise it.
+  Do not run a full-suite baseline before writing code; an untouched-tree replay
+  delays the change without proving its result.
 - For a change to shipped documentation, use `sh packaging/assemble.sh` when
   package inclusion or assembly is the behavior under examination; documentation
   alone does not require a build or full suite.
@@ -82,17 +81,15 @@ intentional.
 worse than a red one: it reports safety it does not have, and it hides the regression from
 everyone downstream.
 
-- Preserve tests of required behavior; removing their assertions to hide a defect
-  is not a passing result. Apply the engineering core's Evidence rule to checks
-  that do not qualify for retention.
+- Preserve tests of required behavior; removing or weakening their assertions to
+  hide a defect is not a passing result. Remove a test or gate only because the
+  Evidence rule says to, through its source owner. Removing a feature or module
+  still needs authority for that behavior change.
 - **Never stub a test out** — no `assert true`, no emptied body, no permanent skip/tag, no
   assertion weakened until it stops failing. A test that asserts nothing is a lie.
 - **Reconcile instead.** When a test fails, first decide which side is wrong. If the code is
   wrong, fix the code. If the test encodes behavior the spec has since changed, rewrite it to
   assert the NEW correct behavior — the test keeps its subject and its teeth.
-- Remove nonqualifying tests and gates through their existing source ownership;
-  preserve product behavior and explicit constraints. A feature or module removal
-  still needs authority for that behavior change.
 - **Make sure the test is real.** It must be able to fail: it exercises the actual subject, it
   asserts a specific observable outcome, and breaking the code it covers turns it red. If you
   cannot state what regression it would catch, it is not a test yet.
@@ -103,9 +100,9 @@ everyone downstream.
   depends on what the OTHER side actually does is circular through a mock: it verifies our
   handling of a reply we authored. Every boundary assumption a mock encodes (which methods
   exist, what replies carry, which config options a harness declares) must be backed by
-  recorded real responses or applicable live evidence. Choose `feature_smoke` cases for
-  the affected required adapter behavior under the engineering core's Evidence rule;
-  touching the adapter seam alone does not require the full matrix.
+  recorded real responses or applicable live evidence. Choose the `feature_smoke` cases
+  that exercise the affected adapter behavior; touching the adapter seam alone does not
+  require the full matrix.
 
 ## Report dirt, never accommodate it
 
