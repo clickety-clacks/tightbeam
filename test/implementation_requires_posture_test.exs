@@ -78,16 +78,23 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
     }
   end
 
-  test "the shipped bundle omits posture-token admission rails", ctx do
+  # The posture gate (org ruling, 2026-08-31): implementation runs under a posture
+  # the orchestrator rules on receiving the slice, heavy or light, filed as a verdict
+  # on a card on the work item. The two rails refuse to open a coder card without
+  # that verdict, on assign and on dispatch alike; the verdict releases both, and a
+  # non-coder card on the same item is never gated.
+  test "both posture rails load from the shipped bundle", ctx do
     names = Enum.map(ctx.rules, & &1.name)
-    refute "implementation-requires-posture" in names
-    refute "implementation-dispatch-requires-posture" in names
+    assert "implementation-requires-posture" in names
+    assert "implementation-dispatch-requires-posture" in names
   end
 
-  test "coder assignment and dispatch proceed without a posture receipt", ctx do
+  test "a coder card on an unpostured work item is refused on assign and on dispatch",
+       ctx do
     item = work_item(ctx)
 
-    assert {:ok, assigned} =
+    assert {:error,
+            %{code: "rule_denied", rule: "implementation-requires-posture", message: message}} =
              Dispatch.dispatch(
                ctx.db,
                ctx.handlers,
@@ -99,11 +106,17 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
                )
              )
 
-    assert assigned.subject == "implement the bounded repair"
+    assert message =~ "posture"
 
-    assert {:ok, dispatched} =
-             dispatch_after_rumination(
-               ctx,
+    assert {:error,
+            %{
+              code: "rule_denied",
+              rule: "implementation-dispatch-requires-posture",
+              message: dispatch_message
+            }} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
                dispatch_call(
                  ctx.orchestrator.session_key,
                  ctx.coder.session_key,
@@ -112,10 +125,11 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
                )
              )
 
-    assert dispatched.subject == "implement the follow-up"
+    assert dispatch_message =~ "posture"
   end
 
-  test "a legacy posture-light verdict remains ordinary evidence, not an admission token", ctx do
+  test "a posture-light verdict on the orchestrator's card releases assign and dispatch",
+       ctx do
     item = work_item(ctx)
 
     assert {:ok, slice} =
@@ -147,9 +161,22 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
              )
 
     assert implementation.subject == "implement after judgment"
+
+    assert {:ok, dispatched} =
+             dispatch_after_rumination(
+               ctx,
+               dispatch_call(
+                 ctx.orchestrator.session_key,
+                 ctx.coder.session_key,
+                 item.id,
+                 "implement the follow-up"
+               )
+             )
+
+    assert dispatched.subject == "implement the follow-up"
   end
 
-  test "a legacy posture-heavy verdict does not select a mechanical workflow", ctx do
+  test "a posture-heavy verdict releases the coder card too", ctx do
     item = work_item(ctx)
 
     assert {:ok, slice} =
@@ -185,34 +212,22 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
     assert implementation.subject == "implement the authorized slice"
   end
 
-  test "a non-coder assignment remains admitted without a posture receipt", ctx do
+  test "a non-coder card on an unpostured work item is not gated", ctx do
     item = work_item(ctx)
-
-    assert {:ok, producer} =
-             Dispatch.dispatch(
-               ctx.db,
-               ctx.handlers,
-               session_assign_call(
-                 ctx.orchestrator.session_key,
-                 ctx.coder.session_key,
-                 item.id,
-                 "produce the specification"
-               )
-             )
 
     assert {:ok, review} =
              Dispatch.dispatch(
                ctx.db,
                ctx.handlers,
                user_assign_call(ctx.reviewer.session_key, item.id, "review the specification",
-                 reviews_assignment_id: producer.id
+                 effect_kind: "review"
                )
              )
 
     assert review.subject == "review the specification"
   end
 
-  test "posture evidence on another item has no admission effect", ctx do
+  test "a posture verdict on another work item does not release this one", ctx do
     item = work_item(ctx)
     other = work_item(ctx)
 
@@ -232,7 +247,7 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
                verdict_call(ctx.orchestrator.session_key, slice.id, "posture-light")
              )
 
-    assert {:ok, implementation} =
+    assert {:error, %{code: "rule_denied", rule: "implementation-requires-posture"}} =
              Dispatch.dispatch(
                ctx.db,
                ctx.handlers,
@@ -243,8 +258,6 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
                  "implement independently"
                )
              )
-
-    assert implementation.subject == "implement independently"
   end
 
   defp work_item(ctx) do

@@ -235,6 +235,20 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
                }
              })
 
+    # The posture gate refuses a coder card on an unpostured work item; these
+    # tests are about other edges, so the owner rules posture up front.
+    assert %{attest: %{verdictKind: "posture-light"}} =
+             Assignments.__handle__(ctx.db, "attest", %{
+               verb: "attest",
+               origin: "agent:#{ctx.pdo.session_key}",
+               principal: {:session, ctx.pdo.session_key},
+               params: %{
+                 assignment_id: topology.id,
+                 kind: "verdict",
+                 verdict_kind: "posture-light"
+               }
+             })
+
     assert %{assignment: %{state: "closed"}} =
              Assignments.__handle__(ctx.db, "attest", %{
                verb: "attest",

@@ -522,10 +522,18 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
         installed = File.read!(Path.join(ctx.base, "identity/rules/engineering.toml"))
         [_completion, rest] = String.split(installed, "# Re-entry twin", parts: 2)
 
+        # The fixture's rest already carries the posture gate the shipped file
+        # ends with; take only the shipped completion rule.
+        [shipped_completion | _] =
+          String.split(
+            File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"),
+            "\n# Posture gate",
+            parts: 2
+          )
+
         File.write!(
           Path.join(ctx.base, "identity/rules/engineering.toml"),
-          File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml") <>
-            "\n# Re-entry twin" <> rest
+          shipped_completion <> "\n# Re-entry twin" <> rest
         )
 
         Rules.load!(ctx.base, Map.keys(ctx.handlers))

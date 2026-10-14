@@ -1552,6 +1552,27 @@ defmodule Tightbeam.CliIntegrationTest do
     assert topology_delivery.source.prompt =~ topology_id
     finish_cli_delivery!(ctx.db, "cli-holder", topology_delivery.seq)
 
+    # The posture gate refuses a coder card on an unpostured work item, so the
+    # slice is ruled first, through the same real CLI.
+    {_postured, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "attest",
+          topology_id,
+          "--kind",
+          "verdict",
+          "--verdict",
+          "posture-light",
+          "--note",
+          "e2e: the input is the spec",
+          "--as-user",
+          "flynn"
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
     {assigned, 0} =
       System.cmd(
         ctx.binary,
