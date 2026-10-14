@@ -1114,6 +1114,40 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
              rest_session["capabilities"]["setHarness"]
   end
 
+  test "a session whose recorded model left the served catalog reads as recorded", ctx do
+    # The served catalog is not empty: it lists fable on testhost/claude. The
+    # session's stored selection is history and is reported as recorded.
+    assert ctx.catalog[{"testhost", "claude"}] != []
+
+    session =
+      Org.create(ctx.db, %{
+        session_key: "recorded-model-session",
+        display_name: "Recorded model",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("retired-sonnet", effort: "xhigh", context: "1m")
+      })
+
+    detail = get(ctx, "/api/sessions/#{session.session_key}")
+    assert detail.status == 200, detail.resp_body
+    item = JSON.decode!(detail.resp_body)["item"]
+    assert item["sessionKey"] == session.session_key
+    assert item["harness"] == "claude"
+    assert item["provider"] == "anthropic"
+    assert item["model"] == "retired-sonnet"
+    assert item["thinkingLevel"] == "xhigh"
+    assert item["modelContext"] == "1m"
+
+    collection = get(ctx, "/api/sessions")
+    assert collection.status == 200, collection.resp_body
+
+    assert item in JSON.decode!(collection.resp_body)["items"]
+  end
+
   test "artifact archive and release notices equal the current ordered REST detail", ctx do
     workspace =
       Path.join(System.tmp_dir!(), "artifact-rest-#{System.unique_integer([:positive])}")
