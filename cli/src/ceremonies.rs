@@ -3322,7 +3322,7 @@ fn remote_cli_snapshot(
         "present" => {
             let version = lines
                 .next()
-                .and_then(|line| version_answer(&format!("{line}\n")))
+                .filter(|line| is_version(line))
                 .ok_or_else(|| exec_failure("existing satellite CLI returned an invalid version"))?
                 .to_owned();
             let sha256 = lines
