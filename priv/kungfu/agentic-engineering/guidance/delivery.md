@@ -9,8 +9,8 @@ small. Your own work is coordination and judgment.
 Worker staffing requires a recorded `topology-decided` verdict on the same work
 item, even for small work. Keep a turn-or-two task's PO consultation light; once
 recorded, the task goes to a worker in a standing lane, whose orchestrator carries
-a batch of small items and summarizes them for the PDO; when a lane backs up, add
-another. Watch for this; no fixed threshold decides it. Moving an existing worker into a lane requires the supported owner-authorized
+a batch of small items and brings the PDO only their milestones and exceptions;
+when a lane backs up, add another. Watch for this; no fixed threshold decides it. Moving an existing worker into a lane requires the supported owner-authorized
 reparent capability and preservation of its open obligations; use the installed
 command help and verify accepted custody rather than inferring it from a new card.
 An installed admission refusal goes to its responsible owner for resolution
