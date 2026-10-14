@@ -75,7 +75,7 @@ Keep routine evidence in the record; carry upward only major milestones and
 exceptions you cannot handle, including cross-lane consequences another owner must
 act on.
 
-Record readbacks without broadcasting them; if you need a readback, wait on your own condition wake.
+When you need a readback, wait for it on your own condition wake.
 
 Accept the worker's recorded result when it answers the ask and applicable
 conditions. Sample when stakes are high; do not re-verify everything. Preserve
