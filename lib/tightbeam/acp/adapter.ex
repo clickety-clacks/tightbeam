@@ -28,9 +28,10 @@ defmodule Tightbeam.Acp.Adapter do
   # deadline starts. Residency calls queue behind handle_continue, so their
   # caller budget must clear the full boot boundary.
   @boot_boundary_timeout 185_000
-  # A common absolute budget preserves long turns while making a hung prompt
-  # finite. Only the owning connection may escalate after cancellation fails.
-  @prompt_timeout 30 * 60_000
+  # A prompt waits until the harness finishes it. Only a caller that passes an
+  # explicit `:timeout` gets an absolute deadline; only the owning connection
+  # may escalate after that cancellation fails.
+  @prompt_timeout :infinity
   @prompt_cancel_grace 5_000
   @prompt_reply_margin 2_000
   @gate_marker "[gate: tightbeam-probe]"
@@ -301,9 +302,9 @@ defmodule Tightbeam.Acp.Adapter do
   this GenServer keeps routing updates, and preserves the public ACP messageId
   boundary between distinct assistant messages before the harness finishes.
 
-  The model-neutral default budget is 30 minutes, absolute from the call.
-  `:timeout` overrides the budget; `:cancel_grace` defaults to five
-  seconds and cannot exceed it. The original response confirms cancellation.
+  By default a prompt has no time limit and runs until the harness finishes
+  it. An explicit integer `:timeout` sets an absolute budget from the call;
+  `:cancel_grace` defaults to five seconds and cannot exceed it. The original response confirms cancellation.
   If it never arrives, the owning local connection and workers are released;
   healthy prompts sharing it report interruption, and nothing is replayed.
   Local teardown does not establish remote provider completion.
@@ -332,14 +333,21 @@ defmodule Tightbeam.Acp.Adapter do
     timeout = Keyword.get(opts, :timeout, @prompt_timeout)
     grace = Keyword.get(opts, :cancel_grace, @prompt_cancel_grace)
 
-    if is_integer(timeout) and timeout > 0 and is_integer(grace) and
+    if (timeout == :infinity or (is_integer(timeout) and timeout > 0)) and is_integer(grace) and
          grace >= 0 and grace <= @prompt_cancel_grace do
+      {deadline, call_timeout} =
+        if timeout == :infinity,
+          do: {:infinity, :infinity},
+          else:
+            {System.monotonic_time(:millisecond) + timeout,
+             timeout + grace + @prompt_reply_margin}
+
       opts =
         opts
-        |> Keyword.put(:prompt_deadline, System.monotonic_time(:millisecond) + timeout)
+        |> Keyword.put(:prompt_deadline, deadline)
         |> Keyword.put(:cancel_grace, grace)
 
-      call(adapter, {:prompt, session_id, text, opts}, timeout + grace + @prompt_reply_margin)
+      call(adapter, {:prompt, session_id, text, opts}, call_timeout)
     else
       {:error, :invalid_prompt_timeout}
     end
@@ -739,7 +747,12 @@ defmodule Tightbeam.Acp.Adapter do
     if Map.has_key?(state.prompts, sid) do
       # A recovered lane can reach its next prompt before cancel acknowledges
       # the old one. Keep that call undispatched until the old operation ends.
-      timer = Process.send_after(self(), {:queued_prompt_expired, from}, prompt_remaining(opts))
+      timer =
+        case prompt_remaining(opts) do
+          :infinity -> nil
+          remaining -> Process.send_after(self(), {:queued_prompt_expired, from}, remaining)
+        end
+
       queued = %{sid: sid, text: text, opts: opts, from: from, timer: timer}
       {:noreply, %{state | queued_prompts: state.queued_prompts ++ [queued]}}
     else
@@ -1194,8 +1207,12 @@ defmodule Tightbeam.Acp.Adapter do
     end
   end
 
-  defp prompt_remaining(opts),
-    do: max(Keyword.fetch!(opts, :prompt_deadline) - System.monotonic_time(:millisecond), 0)
+  defp prompt_remaining(opts) do
+    case Keyword.fetch!(opts, :prompt_deadline) do
+      :infinity -> :infinity
+      deadline -> max(deadline - System.monotonic_time(:millisecond), 0)
+    end
+  end
 
   defp dispatch_prompt(state, sid, text, opts, from) do
     state = put_in(state.chunks[sid], [])
@@ -1448,7 +1465,7 @@ defmodule Tightbeam.Acp.Adapter do
 
       index ->
         {queued, rest} = List.pop_at(state.queued_prompts, index)
-        Process.cancel_timer(queued.timer)
+        if queued.timer, do: Process.cancel_timer(queued.timer)
         start_prompt(%{state | queued_prompts: rest}, sid, queued.text, queued.opts, queued.from)
     end
   end
@@ -1492,7 +1509,7 @@ defmodule Tightbeam.Acp.Adapter do
     end
 
     for queued <- state.queued_prompts do
-      Process.cancel_timer(queued.timer)
+      if queued.timer, do: Process.cancel_timer(queued.timer)
       GenServer.reply(queued.from, {:error, {:acp_request_not_dispatched, collateral}})
     end
 

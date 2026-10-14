@@ -11,9 +11,10 @@ defmodule Tightbeam.Acp.Conn do
   - Finite per-request timeout via Process.send_after; on timeout the caller gets
     {:error, :timeout} and the pending entry is KEPT (awaiting the adapter's
     eventual answer) until resolution, for quiescence accounting.
-    Owned prompts instead carry an absolute deadline: expiry sends cancel,
-    waits for the original response, then closes this exact connection if the
-    bounded cancellation grace expires. A timeout is never proof of quiescence.
+    Owned prompts get no request timer. By default their deadline is
+    `:infinity` and they wait for the harness. Only an explicit integer
+    deadline expires: expiry sends cancel, waits for the original response,
+    then closes this exact connection if the bounded cancellation grace expires. A timeout is never proof of quiescence.
   - Requester death: each pending request monitors its caller; on :DOWN a
     session/cancel notification is sent for that request's session. The
     pending entry is retained until the adapter's terminal response arrives —
@@ -222,15 +223,22 @@ defmodule Tightbeam.Acp.Conn do
               token = make_ref()
 
               timer =
-                if is_integer(deadline) do
-                  Process.send_after(
-                    self(),
-                    {:prompt_deadline, id, token},
-                    max(deadline - System.monotonic_time(:millisecond), 0)
-                  )
-                else
-                  if timeout != :infinity,
-                    do: Process.send_after(self(), {:req_timeout, id}, timeout)
+                cond do
+                  is_integer(deadline) ->
+                    Process.send_after(
+                      self(),
+                      {:prompt_deadline, id, token},
+                      max(deadline - System.monotonic_time(:millisecond), 0)
+                    )
+
+                  deadline == :infinity ->
+                    nil
+
+                  timeout != :infinity ->
+                    Process.send_after(self(), {:req_timeout, id}, timeout)
+
+                  true ->
+                    nil
                 end
 
               entry = %{
@@ -379,7 +387,7 @@ defmodule Tightbeam.Acp.Conn do
 
   def handle_info({:DOWN, ref, :process, _pid, reason}, state) do
     case Enum.find(state.pending, fn {_id, e} -> e.monitor == ref or e.owner_monitor == ref end) do
-      {id, %{deadline: deadline} = entry} when is_integer(deadline) ->
+      {id, %{deadline: deadline} = entry} when not is_nil(deadline) ->
         state =
           if entry.monitor == ref do
             put_in(state.pending[id], %{entry | orphaned: true, replied: true})
@@ -497,7 +505,7 @@ defmodule Tightbeam.Acp.Conn do
       end
 
     cond do
-      entry.orphaned and is_integer(entry.deadline) ->
+      entry.orphaned and not is_nil(entry.deadline) ->
         emit(state, {:acp_prompt_orphan_resolved, self(), id, entry.session_id})
 
       entry.orphaned ->
@@ -528,7 +536,7 @@ defmodule Tightbeam.Acp.Conn do
       # On exceptional teardown the adapter alone settles owned prompt calls.
       # A worker reply racing that signal could otherwise start a successor
       # before the generation's workers have been released.
-      unless entry.replied or (owned_teardown? and is_integer(entry.deadline)) do
+      unless entry.replied or (owned_teardown? and not is_nil(entry.deadline)) do
         failure =
           case reply do
             :transport_closed ->
