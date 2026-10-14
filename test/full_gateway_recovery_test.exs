@@ -109,16 +109,24 @@ defmodule Tightbeam.FullGatewayRecoveryTest do
         turn_columns = after_state["columns"]["turns"]
         after_turns = Enum.map(after_state["turns"], &Map.new(Enum.zip(turn_columns, &1)))
         a_turns = Enum.filter(after_turns, &(&1["sessionKey"] == prior["holderKey"]))
-        assert length(a_turns) == 4
 
         assert [successor_carrier_id] =
                  Map.fetch!(after_state["notice_source_refs"], "w_recovery_successor_a")
 
-        assert successor_carrier_id != carrier_wake_id
+        # Boot recovery raises the notice while the scheduler releases A's
+        # queued successor. Whichever is recorded first decides the batch: a
+        # notice pending when the successor's batch seals rides the same
+        # carrier; a later one gets its own carrier turn. Both deliver every
+        # source exactly once.
+        shared_carrier? = successor_carrier_id == carrier_wake_id
+        assert length(a_turns) == if(shared_carrier?, do: 3, else: 4)
 
         # The three recovery turns remain exact: the interrupted direct turn,
         # the queued successor's actual carrier, and the direct health replay.
-        recovery_turns = Enum.reject(a_turns, &(&1["wakeId"] == carrier_wake_id))
+        recovery_turns =
+          if shared_carrier?,
+            do: a_turns,
+            else: Enum.reject(a_turns, &(&1["wakeId"] == carrier_wake_id))
 
         assert Enum.map(recovery_turns, &{&1["wakeId"], &1["status"]}) ==
                  [
@@ -159,13 +167,21 @@ defmodule Tightbeam.FullGatewayRecoveryTest do
 
         assert notice_turn["origin"] == notice["origin"]
 
-        if carrier_wake_id == notice_id do
-          assert notice_turn["prompt"] ==
-                   "[from #{notice["origin"]}]\n\n#{notice["prompt"]}"
-        else
-          assert notice_turn["prompt"] =~ "[batched notices: 1]"
-          assert notice_turn["prompt"] =~ notice_id
-          assert notice_turn["prompt"] =~ notice["prompt"]
+        cond do
+          carrier_wake_id == notice_id ->
+            assert notice_turn["prompt"] ==
+                     "[from #{notice["origin"]}]\n\n#{notice["prompt"]}"
+
+          shared_carrier? ->
+            assert notice_turn["prompt"] =~ "[batched notices: 2]"
+            assert notice_turn["prompt"] =~ "w_recovery_successor_a"
+            assert notice_turn["prompt"] =~ notice_id
+            assert notice_turn["prompt"] =~ notice["prompt"]
+
+          true ->
+            assert notice_turn["prompt"] =~ "[batched notices: 1]"
+            assert notice_turn["prompt"] =~ notice_id
+            assert notice_turn["prompt"] =~ notice["prompt"]
         end
 
         # Every committed pre-crash message remains byte-identical exactly once.
