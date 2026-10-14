@@ -3404,8 +3404,14 @@ fn promotion_script(
             shell_quote(sha256)
         ),
     };
+    // The destination is Darwin. A persistent lock inode plus the kernel-managed
+    // advisory lock avoids stale PID publication and prevents a waiter from
+    // unlinking/replacing the inode another promotion is using. Keep the snapshot
+    // check and atomic move inside the locked child command.
+    let locked_promotion = format!("{state_check}; mv -f {staged} {destination}");
     format!(
-        "set -eu; lock={lock}; if ! mkdir \"$lock\" 2>/dev/null; then if [ ! -d \"$lock\" ] || [ -L \"$lock\" ] || [ ! -f \"$lock/pid\" ] || [ -L \"$lock/pid\" ]; then echo 'satellite CLI refresh lock is occupied' >&2; exit 73; fi; owner=$(cat \"$lock/pid\"); case \"$owner\" in ''|*[!0-9]*) echo 'satellite CLI refresh lock is invalid' >&2; exit 73;; esac; if kill -0 \"$owner\" 2>/dev/null; then echo 'another satellite CLI refresh is active' >&2; exit 73; fi; rm -f \"$lock/pid\" && rmdir \"$lock\" && mkdir \"$lock\" || {{ echo 'cannot recover stale satellite CLI refresh lock' >&2; exit 73; }}; fi; printf '%s\\n' \"$$\" > \"$lock/pid\"; trap 'rm -f \"$lock/pid\"; rmdir \"$lock\" 2>/dev/null || true' EXIT HUP INT TERM; {state_check}; mv -f {staged} {destination}"
+        "set -eu; lock={lock}; if [ -L \"$lock\" ] || {{ [ -e \"$lock\" ] && [ ! -f \"$lock\" ]; }}; then echo 'satellite CLI refresh lock is not a regular file' >&2; exit 73; fi; /usr/bin/lockf -k -t 0 \"$lock\" /bin/sh -c {}",
+        shell_quote(&locked_promotion)
     )
 }
 
@@ -5694,6 +5700,207 @@ mod tests {
             )
             .unwrap_err()
             .contains("different build digest")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    fn promotion_test_sha256(path: &Path) -> String {
+        let output = ProcessCommand::new("shasum")
+            .args(["-a", "256"])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .to_owned()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn make_executable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn present_snapshot(path: &Path, version: &str) -> RemoteCliSnapshot {
+        RemoteCliSnapshot::Present {
+            version: version.to_owned(),
+            sha256: promotion_test_sha256(path),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn wait_for_test_file(path: &Path, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if path.exists() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        path.exists()
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn promotion_lock_serializes_competing_retries_through_the_destination_check() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::process::CommandExt;
+
+        let directory = TestDirectory::new("satellite-promotion-race");
+        let cli_bin = directory.0.join("bin");
+        fs::create_dir_all(&cli_bin).unwrap();
+        let destination = cli_bin.join("tightbeam");
+        let stage_a = cli_bin.join(".tightbeam.update-newer");
+        let stage_b = cli_bin.join(".tightbeam.update-older");
+        let lock = cli_bin.join(".tightbeam-refresh.lock");
+        fs::write(&destination, b"prior CLI").unwrap();
+        fs::write(&stage_a, b"candidate A").unwrap();
+        fs::write(&stage_b, b"candidate B").unwrap();
+        fs::write(&lock, b"").unwrap();
+        make_executable(&destination);
+        make_executable(&stage_a);
+        make_executable(&stage_b);
+        let snapshot = present_snapshot(&destination, "0.1.8");
+
+        let shims = directory.0.join("shims");
+        fs::create_dir_all(&shims).unwrap();
+        let entered_move = directory.0.join("entered-move");
+        let continue_move = directory.0.join("continue-move");
+        let mv_shim = format!(
+            "#!/bin/sh\nif [ \"$2\" = {} ]; then : > {}; while [ ! -e {} ]; do sleep 0.01; done; fi\nexec /bin/mv \"$@\"\n",
+            shell_quote(stage_a.to_str().unwrap()),
+            shell_quote(entered_move.to_str().unwrap()),
+            shell_quote(continue_move.to_str().unwrap())
+        );
+        let mv_path = shims.join("mv");
+        fs::write(&mv_path, mv_shim).unwrap();
+        let mut permissions = fs::metadata(&mv_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&mv_path, permissions).unwrap();
+        let path = format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", shims.display());
+
+        let first = ProcessCommand::new("/bin/sh")
+            .arg("-c")
+            .arg(promotion_script(
+                cli_bin.to_str().unwrap(),
+                destination.to_str().unwrap(),
+                stage_a.to_str().unwrap(),
+                &snapshot,
+            ))
+            .env("PATH", &path)
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        if !wait_for_test_file(&entered_move, Duration::from_secs(5)) {
+            unsafe {
+                libc::kill(-(first.id() as i32), libc::SIGKILL);
+            }
+            let stalled = first.wait_with_output().unwrap();
+            panic!(
+                "first promotion did not reach its guarded move: {}",
+                String::from_utf8_lossy(&stalled.stderr)
+            );
+        }
+
+        let second = ProcessCommand::new("/bin/sh")
+            .arg("-c")
+            .arg(promotion_script(
+                cli_bin.to_str().unwrap(),
+                destination.to_str().unwrap(),
+                stage_b.to_str().unwrap(),
+                &snapshot,
+            ))
+            .env("PATH", &path)
+            .output()
+            .unwrap();
+        fs::write(&continue_move, b"continue").unwrap();
+        let first = first.wait_with_output().unwrap();
+
+        assert!(
+            !second.status.success(),
+            "competing promotion unexpectedly succeeded: {}",
+            String::from_utf8_lossy(&second.stderr)
+        );
+        assert!(
+            first.status.success(),
+            "first promotion failed: {}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+        assert_eq!(fs::read(&destination).unwrap(), b"candidate A");
+        assert!(
+            stage_b.exists(),
+            "refused retry must retain its staged input"
+        );
+        assert!(
+            lock.is_file(),
+            "the lock inode must persist between retries"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_empty_persistent_lock_file_allows_safe_retry_after_creation_interruption() {
+        let directory = TestDirectory::new("satellite-promotion-retry");
+        let cli_bin = directory.0.join("bin");
+        fs::create_dir_all(&cli_bin).unwrap();
+        let destination = cli_bin.join("tightbeam");
+        let lock = cli_bin.join(".tightbeam-refresh.lock");
+        let failed_stage = cli_bin.join(".tightbeam.update-failed");
+        let retry_stage = cli_bin.join(".tightbeam.update-retry");
+        fs::write(&destination, b"prior CLI").unwrap();
+        fs::write(&lock, b"").unwrap();
+        fs::write(&failed_stage, b"failed candidate").unwrap();
+        make_executable(&destination);
+        make_executable(&failed_stage);
+
+        let snapshot = present_snapshot(&destination, "0.1.8");
+        let changed_snapshot = RemoteCliSnapshot::Present {
+            version: "0.1.8".to_owned(),
+            sha256: promotion_test_sha256(&failed_stage),
+        };
+        let failed = ProcessCommand::new("/bin/sh")
+            .arg("-c")
+            .arg(promotion_script(
+                cli_bin.to_str().unwrap(),
+                destination.to_str().unwrap(),
+                failed_stage.to_str().unwrap(),
+                &changed_snapshot,
+            ))
+            .output()
+            .unwrap();
+        assert!(!failed.status.success());
+        assert_eq!(fs::read(&destination).unwrap(), b"prior CLI");
+        assert!(lock.is_file(), "empty lock inode should remain reusable");
+
+        fs::write(&retry_stage, b"retry candidate").unwrap();
+        make_executable(&retry_stage);
+        let retry = ProcessCommand::new("/bin/sh")
+            .arg("-c")
+            .arg(promotion_script(
+                cli_bin.to_str().unwrap(),
+                destination.to_str().unwrap(),
+                retry_stage.to_str().unwrap(),
+                &snapshot,
+            ))
+            .output()
+            .unwrap();
+        assert!(
+            retry.status.success(),
+            "retry failed after partial lock creation: {}",
+            String::from_utf8_lossy(&retry.stderr)
+        );
+        assert_eq!(fs::read(&destination).unwrap(), b"retry candidate");
+        assert!(
+            lock.is_file(),
+            "successful use must not unlink the lock inode"
         );
     }
 
