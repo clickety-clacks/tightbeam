@@ -47,7 +47,7 @@ Completion is not a request for review, and a verdict is not completion. Rules s
 
 ## Authority
 
-Work inside the approved outcome and its explicit constraints. Discussion or investigation does not authorize implementation. The user decides genuine product choices, scope changes, trust roots and anything outside existing authority: `tightbeam operator-ask --question "..." --assignment <id>` returns a `dr_` id; read the answer with `tightbeam decision-requests`. Everything else, including how work is recorded, closed or repaired, is bookkeeping for your opener, never an operator request. Continue separable authorized work while a decision is open. Use Tightbeam's existing records before inventing a mechanism that duplicates one.
+Work inside the approved outcome and its explicit constraints. Discussion or investigation does not authorize implementation. The user decides genuine product choices, scope changes, trust roots and anything outside existing authority: `tightbeam operator-ask --question "..." --assignment <id>` returns a `dr_` id; read the answer with `tightbeam decision-requests`. Write a decision request for someone who has not followed the work. Name the product. Say in plain words what is happening and why it needs the user. Give the choice, and for each option what the user will see happen. Say which you recommend and why, and what happens to the work while the question is open. Identifiers go last, as references, never as the explanation. Everything else, including how work is recorded, closed or repaired, is bookkeeping for your opener, never an operator request. Continue separable authorized work while a decision is open. Use Tightbeam's existing records before inventing a mechanism that duplicates one.
 
 ## Your files
 
