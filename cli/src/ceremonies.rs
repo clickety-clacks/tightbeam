@@ -3404,14 +3404,13 @@ fn promotion_script(
             shell_quote(sha256)
         ),
     };
-    // The destination is Darwin. A persistent lock inode plus the kernel-managed
-    // advisory lock avoids stale PID publication and prevents a waiter from
-    // unlinking/replacing the inode another promotion is using. Keep the snapshot
-    // check and atomic move inside the locked child command.
+    // The destination is Darwin. Keep a persistent lock inode and acquire its
+    // kernel lock through a descriptor opened by this shell. The descriptor is
+    // inherited by child commands, so an interrupted shell cannot release the
+    // lock while a surviving promotion child can still mutate the destination.
     let locked_promotion = format!("{state_check}; mv -f {staged} {destination}");
     format!(
-        "set -eu; lock={lock}; if [ -L \"$lock\" ] || {{ [ -e \"$lock\" ] && [ ! -f \"$lock\" ]; }}; then echo 'satellite CLI refresh lock is not a regular file' >&2; exit 73; fi; /usr/bin/lockf -k -t 0 \"$lock\" /bin/sh -c {}",
-        shell_quote(&locked_promotion)
+        "set -eu; lock={lock}; if [ -L \"$lock\" ] || {{ [ -e \"$lock\" ] && [ ! -f \"$lock\" ]; }}; then echo 'satellite CLI refresh lock is not a regular file' >&2; exit 73; fi; exec 9>>\"$lock\"; /usr/bin/lockf -s -t 0 9; {locked_promotion}"
     )
 }
 
@@ -5838,6 +5837,134 @@ mod tests {
         assert!(
             stage_b.exists(),
             "refused retry must retain its staged input"
+        );
+        assert!(
+            lock.is_file(),
+            "the lock inode must persist between retries"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn interrupted_promotion_parent_keeps_retry_excluded_until_child_finishes() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let directory = TestDirectory::new("satellite-promotion-interrupted-parent");
+        let cli_bin = directory.0.join("bin");
+        fs::create_dir_all(&cli_bin).unwrap();
+        let destination = cli_bin.join("tightbeam");
+        let stage_a = cli_bin.join(".tightbeam.update-first");
+        let stage_b = cli_bin.join(".tightbeam.update-retry");
+        let lock = cli_bin.join(".tightbeam-refresh.lock");
+        fs::write(&destination, b"prior CLI").unwrap();
+        fs::write(&stage_a, b"first candidate").unwrap();
+        fs::write(&stage_b, b"retry candidate").unwrap();
+        fs::write(&lock, b"").unwrap();
+        make_executable(&destination);
+        make_executable(&stage_a);
+        make_executable(&stage_b);
+
+        let original_snapshot = present_snapshot(&destination, "0.1.8");
+        let first_snapshot = present_snapshot(&stage_a, "0.1.8");
+        let shims = directory.0.join("shims");
+        fs::create_dir_all(&shims).unwrap();
+        let entered_move = directory.0.join("entered-move");
+        let continue_move = directory.0.join("continue-move");
+        let mv_shim = format!(
+            "#!/bin/sh\nif [ \"$2\" = {} ]; then : > {}; while [ ! -e {} ]; do /bin/sleep 0.01; done; fi\n/bin/mv \"$@\"\n",
+            shell_quote(stage_a.to_str().unwrap()),
+            shell_quote(entered_move.to_str().unwrap()),
+            shell_quote(continue_move.to_str().unwrap())
+        );
+        let mv_path = shims.join("mv");
+        fs::write(&mv_path, mv_shim).unwrap();
+        make_executable(&mv_path);
+        let path = format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", shims.display());
+
+        let mut first = ProcessCommand::new("/bin/sh")
+            .arg("-c")
+            .arg(promotion_script(
+                cli_bin.to_str().unwrap(),
+                destination.to_str().unwrap(),
+                stage_a.to_str().unwrap(),
+                &original_snapshot,
+            ))
+            .env("PATH", &path)
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        if !wait_for_test_file(&entered_move, Duration::from_secs(5)) {
+            unsafe {
+                libc::kill(-(first.id() as i32), libc::SIGKILL);
+            }
+            let _ = first.wait_with_output().unwrap();
+            panic!("first promotion did not reach its guarded move");
+        }
+
+        let interrupted = unsafe { libc::kill(first.id() as i32, libc::SIGKILL) };
+        let first_status = first.wait().unwrap();
+        let blocked_retry = ProcessCommand::new("/bin/sh")
+            .arg("-c")
+            .arg(promotion_script(
+                cli_bin.to_str().unwrap(),
+                destination.to_str().unwrap(),
+                stage_b.to_str().unwrap(),
+                &original_snapshot,
+            ))
+            .env("PATH", &path)
+            .output()
+            .unwrap();
+
+        // Let the already-checked child finish even when an assertion above
+        // would fail; the test must not leave a background mutator behind.
+        fs::write(&continue_move, b"continue").unwrap();
+
+        let mut retry_completed = false;
+        if !blocked_retry.status.success() {
+            for _ in 0..500 {
+                let retry = ProcessCommand::new("/bin/sh")
+                    .arg("-c")
+                    .arg(promotion_script(
+                        cli_bin.to_str().unwrap(),
+                        destination.to_str().unwrap(),
+                        stage_b.to_str().unwrap(),
+                        &first_snapshot,
+                    ))
+                    .env("PATH", &path)
+                    .output()
+                    .unwrap();
+                if retry.status.success() {
+                    retry_completed = true;
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        if !retry_completed {
+            unsafe {
+                libc::kill(-(first.id() as i32), libc::SIGKILL);
+            }
+        }
+        assert_eq!(interrupted, 0, "could not interrupt promotion parent");
+        assert_eq!(
+            first_status.signal(),
+            Some(libc::SIGKILL),
+            "promotion parent did not terminate while its child was blocked"
+        );
+        assert!(
+            !blocked_retry.status.success(),
+            "retry acquired the lock while a surviving child could still promote: {}",
+            String::from_utf8_lossy(&blocked_retry.stderr)
+        );
+        assert!(
+            retry_completed,
+            "retry did not succeed after the child finished"
+        );
+        assert_eq!(fs::read(&destination).unwrap(), b"retry candidate");
+        assert!(
+            !stage_b.exists(),
+            "successful retry should consume its stage"
         );
         assert!(
             lock.is_file(),
