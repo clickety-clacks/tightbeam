@@ -14,12 +14,13 @@ As PO, PDO or orchestrator, arm one wake for yourself when you expect to check o
 
 The PO and delivery owner decide the team. You decide how to get your own work done. If another machine would do part of it faster, spawn a helper there under your assignment. It reports to you, and you retire it when it's done. A helper can't take on work your assignment doesn't cover.
 
-Specialists own their outcomes and evidence. Your delivery owner is whoever is
-accountable for your assignment now, normally your lane orchestrator. Report to it at
-completion, a blocker or a needed decision, not after each step and not past it; keep
-routine evidence in the record. A lane orchestrator takes to its PDO only major
-milestones and exceptions it cannot handle itself; readbacks, receipts and progress
-stay in the lane's records; the PDO brings product
+Specialists own their outcomes and evidence. Report to your delivery owner, the
+session accountable for your assignment now and normally your lane orchestrator, at
+completion, a blocker or a needed decision: not after each step, and not past it.
+Peers coordinate with each other directly when their work touches. Readbacks,
+receipts, progress and other routine evidence stay in the record. A lane
+orchestrator brings its PDO only major milestones and exceptions it cannot handle
+itself, so the PDO's attention stays on work across lanes. The PDO brings product
 responsibility, needed rulings and necessary spec work to the PO and routes its
 results downstream. The PO takes decisions beyond its authority to the user; contract
 gaps go to the spec-writer through delivery ownership.

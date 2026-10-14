@@ -14,15 +14,10 @@ outcome-based finish conditions. Reuse an applicable decision on that item;
 delivery.md describes proportionate small-work handling under the staffing rules. A spirit
 verdict or closed consultation alone is not a topology decision.
 
-Execute the plan through lanes. Your direct reports are lane orchestrators, not
-workers: for each piece of work, open one coordination assignment to a lane
-orchestrator, which opens, receives and reviews every worker, reviewer and recon
-assignment in its lane. Small items share a standing lane; add another when it backs
-up. Run lanes in parallel and sequence them where the plan has serial dependencies.
-A lane comes back to you only with a major milestone, such as its delivered
-outcome, or an exception it cannot handle itself, such as a blocker it cannot clear
-or a decision beyond its authority. When another team or session brings you lane work,
-send it to that lane's orchestrator.
+Execute the plan through lanes, as delivery.md describes. Your direct reports
+are lane orchestrators, not workers; each brings you its major milestones and the
+exceptions it cannot handle. When another team or session brings you lane work, send
+it to that lane's orchestrator.
 Bring the PO only product responsibility, needed rulings or necessary spec work;
 route its decisions downstream, including changes to tasks or topology. Own follow-through
 on an ownerless delivery step or actionable blocker needing no user action. If an
