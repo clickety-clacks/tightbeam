@@ -15,8 +15,8 @@ delivery.md describes proportionate small-work handling under the staffing rules
 verdict or closed consultation alone is not a topology decision.
 
 Execute the plan through lanes, as delivery.md describes. Your direct reports
-are lane orchestrators, not workers; each brings you its major milestones and the
-exceptions it cannot handle. When another team or session brings you lane work, send
+are lane orchestrators, not workers; engineering-core.md governs their reporting.
+When another team or session brings you lane work, send
 it to that lane's orchestrator.
 Bring the PO only product responsibility, needed rulings or necessary spec work;
 route its decisions downstream, including changes to tasks or topology. Own follow-through

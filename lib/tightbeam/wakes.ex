@@ -32,6 +32,7 @@ defmodule Tightbeam.Wakes do
     Escalation,
     EventLog,
     Gateway,
+    Keyset,
     Ledger,
     NoticeBatcher,
     RuleRuntime,
@@ -5564,6 +5565,30 @@ defmodule Tightbeam.Wakes do
       )
 
     Enum.map(rows, &to_wake/1)
+  end
+
+  @doc "Return one bounded page of wakes targeting a session in stable creation order."
+  def list_for_session_page(db, session_key, boundary, limit) do
+    select_from = select_wake_sql()
+
+    case DB.transaction(db, fn txn ->
+           query = fn sql, params -> Txn.q(txn, sql, params) end
+
+           Keyset.page(
+             query,
+             select_from,
+             "wakes",
+             "sessionKey = ?",
+             [session_key],
+             ["createdAt", "wakeId"],
+             boundary,
+             limit,
+             fn row -> [Enum.at(row, 8), hd(row)] end
+           )
+         end) do
+      {:ok, page} -> %{rows: Enum.map(page.rows, &to_wake/1), flags: page}
+      {:error, error} -> raise error
+    end
   end
 
   @doc "Count pending wakes resolved to a session key."

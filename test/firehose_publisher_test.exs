@@ -734,6 +734,41 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert notice["payload"] == canonical
     assert JSON.decode!(Publisher.encode_wire_notice(notice))["payload"] == canonical
 
+    assert {:appended, marker} =
+             Tightbeam.Projection.append_marker(db, message.session_key, %{
+               kind: "harness-switch",
+               from: "claude",
+               to: "codex"
+             })
+
+    assert {:ok, :ok} =
+             DB.transaction(db, fn txn ->
+               Publisher.message_in_txn(txn, marker.session_key, marker, "flynn")
+             end)
+
+    marker_notice = receive_notice()
+
+    marker_canonical =
+      db
+      |> Tightbeam.StateResources.query_message(marker.id)
+      |> Tightbeam.StateResources.message()
+
+    assert marker_notice["class"] == "message.created"
+    assert marker_notice["payload"] == marker_canonical
+
+    assert marker_notice["payload"]["marker"] == %{
+             "kind" => "harness-switch",
+             "from" => "claude",
+             "to" => "codex"
+           }
+
+    assert JSON.decode!(Publisher.encode_wire_notice(marker_notice))["payload"] ==
+             marker_canonical
+
+    assert JSON.decode!(
+             Tightbeam.StateResources.encode_item("transcript messages", marker_canonical, %{})
+           ) == marker_canonical
+
     for key <- ["messageId", "sessionKey"] do
       assert_raise ExUnit.AssertionError, fn ->
         equality.(update_in(notice, ["refs"], &Map.delete(&1, key)))

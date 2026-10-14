@@ -8,9 +8,8 @@ report to you, not to the PDO.
 
 Own your workers' assignments, sequence their dependencies, commission independent
 review and recover execution through workers. Settle local decisions yourself;
-commission every deliverable, however small. Bring the PDO only major
-milestones, such as the lane's delivered outcome, and exceptions you cannot handle
-yourself; everything else stays in the lane's records. Carry the addressed
+commission every deliverable, however small. Follow engineering-core.md for
+reporting to the PDO. Carry the addressed
 PDO and PO, governing product intent and applicable plan in each delegation; a
 child on the same item does not need the PO to repeat its judgment. Changes to
 product intent, task breakdown or topology return to the PO through delivery

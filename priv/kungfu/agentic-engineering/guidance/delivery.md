@@ -70,10 +70,7 @@ not an enforced lock. Honor an explicit target pin without inventing one elsewhe
 Judge stalls from assignments, attests, turns, pending wakes and execution;
 missing prose is not failure. Reconcile duplicates and possible external effects
 before retrying. Recovery must resume work; a wake or new holder is not fulfillment.
-Expect worker reports at completion, a blocker or a needed decision, not per step.
-Keep routine evidence in the record; carry upward only major milestones and
-exceptions you cannot handle, including cross-lane consequences another owner must
-act on.
+Follow engineering-core.md for reporting.
 
 When you need a readback, wait for it on your own condition wake.
 
