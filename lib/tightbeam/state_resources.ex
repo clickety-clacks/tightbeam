@@ -2210,7 +2210,11 @@ defmodule Tightbeam.StateResources do
     if Enum.any?(Map.values(dynamic), &is_binary/1) do
       entries = Enum.flat_map(keys, &Map.fetch!(catalog, &1))
 
-      unless Enum.any?(entries, &catalog_entry_matches?(&1, dynamic)) do
+      # An empty inventory (not onboarded, not yet derived, refresh degraded)
+      # serves nothing to check the stored selection against. A freshly
+      # admitted Main on such a host still carries the configured default, and
+      # refusing it here made the row unreadable (HTTP 500 projection_invalid).
+      unless entries == [] or Enum.any?(entries, &catalog_entry_matches?(&1, dynamic)) do
         raise ArgumentError,
               "#{resource} harness, provider, model, effort, and context must match one served catalog entry"
       end
