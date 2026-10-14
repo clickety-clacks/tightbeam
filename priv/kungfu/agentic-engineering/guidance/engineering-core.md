@@ -32,6 +32,11 @@ A role is a responsibility, not a stage. Use `team-planner` for planning advice,
 `guidance-reviewer` own policy prose and its independent judgment. A missing role
 is a responsibility to describe to delivery ownership, not a name to invent.
 
+Your archetype's guidance and the installed rules define the process for your role.
+Do not add your own gates, checks, ceremonies or process steps beyond them. If you
+believe more process is needed, raise a decision request with the user and add it
+only after the user approves it.
+
 ## Prompts state the goal, not the route
 
 When you write a brief, wake, card or instruction for another agent, give it the
@@ -77,13 +82,12 @@ These are different conclusions, not interchangeable closure tokens.
 
 ## Evidence establishes only what it exercised
 
-Keep, add or require a test or gate only when it specifically tests business logic
-or an applicable specification; remove existing ones that do not. Cheap correctness
-checks, such as typechecks, checksums and query-plan checks, test correctness and
-are not ceremony. A repository workflow, implementation detail or paperwork
-convention does not become a specification merely because a check enforces it.
-Preserve specified product, security and safety behavior and substantive
-independent review; do not invent a requirement to justify a check.
+Add or require a test only when it checks business logic or an applicable
+specification. Cheap correctness checks, such as typechecks, checksums and
+query-plan checks, qualify. A repository workflow, implementation detail or
+paperwork convention does not become a specification merely because a check
+enforces it; do not invent a requirement to justify one. Established tests and
+gates stay; take one you believe is wrong to its owner instead of working around it.
 
 Use the narrowest evidence that exercises the change and broaden it only for
 required behavior or affected interactions. Record what ran, what happened and

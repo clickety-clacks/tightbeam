@@ -89,9 +89,8 @@ queued change, dequeue it; turning off auto-merge does not remove a change that
 is already queued. Read the pull request afterwards, and report a change that
 merged before the hold took effect. A red tip is yours to resolve; where the
 landing watcher runs, it wakes the branch's owner role when a required check
-fails on the tip. Get the tip green before more work builds on it. A failing
-check that the engineering core's Evidence rule would remove goes to its owner
-for removal instead, without holding unrelated work on it. A queue that stops
+fails on the tip. Get the tip green before more work builds on it. A failing check you
+believe should not exist goes to its owner, without holding unrelated work on it. A queue that stops
 moving shows up in your own reads, not as a signal. Commission an integrator
 when reconciling changes from different sources is a job in itself.
 

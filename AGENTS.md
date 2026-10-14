@@ -56,9 +56,10 @@ intentional.
 
 - The Evidence section of
   `priv/kungfu/agentic-engineering/guidance/engineering-core.md` decides which
-  tests and gates to keep, add or require, including those in CI configuration.
-  Take an enforced check that it would remove to its owner for removal through
-  the authorized source path.
+  tests to add or require. Established tests and gates, including CI
+  configuration, stay; take one you believe is wrong to its owner through the
+  authorized source path. Adding a gate, check or process step needs the user's
+  approval through a decision request.
 - Repository commands. Run those whose checks that rule keeps:
   - Elixir: `mix format --check-formatted` and `scripts/verify_mix.sh`.
   - Rust, from `cli/`: `cargo fmt --check` and `cargo test`.
@@ -82,8 +83,8 @@ worse than a red one: it reports safety it does not have, and it hides the regre
 everyone downstream.
 
 - Preserve tests of required behavior; removing or weakening their assertions to
-  hide a defect is not a passing result. Remove a test or gate only because the
-  Evidence rule says to, through its source owner. Removing a feature or module
+  hide a defect is not a passing result. Remove a test or gate only through its
+  owner. Removing a feature or module
   still needs authority for that behavior change.
 - **Never stub a test out** — no `assert true`, no emptied body, no permanent skip/tag, no
   assertion weakened until it stops failing. A test that asserts nothing is a lie.
