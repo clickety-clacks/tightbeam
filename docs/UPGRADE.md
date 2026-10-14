@@ -112,6 +112,25 @@ new yes before acting; read-only inventory can proceed while waiting.
    the gateway is not upgrade completion: without relearn, 0.1.9 code can run
    with 0.1.8 guidance, and no staleness notice appears until a new identity is
    published.
+   **Relearn does not update every file. Bring this to the user's attention
+   on every upgrade and offer a fix.** In 0.1.9, relearn keeps the org's copy
+   of these files without comparing it with the new release, and reports
+   nothing:
+   - The two starter files Tightbeam seeded when the org was created,
+     `archetypes/default.toml` and `guidance/operating-model.md`. The
+     release's changes to them never arrive.
+   - Any org file at a path the release itself ships, such as an org copy of
+     `guidance/operating-manual.md`. The org's copy keeps overriding the new
+     release's file, even when it is only an old snapshot.
+
+   After relearn, list those files by comparing the identity repository's
+   paths with the selected package's `priv/seed`, `priv/guidance` and the
+   learned bundles' paths. For each one, show the user the difference between
+   the org's copy and the release's version and say which org lines look
+   deliberate. Offer to apply the release's version while keeping the org's
+   deliberate lines, or to delete an override that is only an old copy, and
+   publish only what the user chooses through `tightbeam identity edit`.
+   Relearn itself is expected to merge these files in 0.1.10.
    Before refreshing sessions, explain that `tightbeam identity apply --all`
    updates their Tightbeam-owned skill files and asks them to re-read without
    reloading their current model context, and obtain the user's confirmation.
