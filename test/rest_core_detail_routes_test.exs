@@ -2038,6 +2038,83 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert JSON.decode!(empty.resp_body)["items"] == []
   end
 
+  test "B2 missing priority sidecar preserves configured and fallback defaults across reads and notices",
+       ctx do
+    for {configured_default, expected_priority} <- [{"7", 7}, {"0", 0}, {nil, 4}] do
+      created =
+        WorkItems.__handle__(ctx.db, "work-item-create", %{
+          verb: "work-item-create",
+          origin: "user:flynn",
+          principal: {:user, "flynn"},
+          session_key: nil,
+          params: %{title: "B2 sidecar fallback #{inspect(configured_default)}", priority: 8}
+        })
+
+      assert created.priority === 8
+
+      case configured_default do
+        nil ->
+          assert {:ok, _rows} =
+                   DB.query(ctx.db, "DELETE FROM org_settings WHERE key='default-priority'")
+
+        value ->
+          assert {:ok, _rows} =
+                   DB.query(
+                     ctx.db,
+                     "INSERT OR REPLACE INTO org_settings (key, value, updatedAt) VALUES ('default-priority', ?1, ?2)",
+                     [value, System.system_time(:millisecond)]
+                   )
+      end
+
+      assert {:ok, [[8]]} =
+               DB.query(ctx.db, "SELECT priority FROM work_item_priorities WHERE workItemId=?1", [
+                 created.id
+               ])
+
+      assert {:ok, _rows} =
+               DB.query(ctx.db, "DELETE FROM work_item_priorities WHERE workItemId=?1", [
+                 created.id
+               ])
+
+      assert {:ok, []} =
+               DB.query(ctx.db, "SELECT priority FROM work_item_priorities WHERE workItemId=?1", [
+                 created.id
+               ])
+
+      call = %{
+        verb: "work-item-update",
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        session_key: nil,
+        params: %{work_item_id: created.id, title: created.title <> " updated"}
+      }
+
+      updated = WorkItems.__handle__(ctx.db, "work-item-update", call)
+      assert updated.priority === expected_priority
+
+      assert {:ok, []} =
+               DB.query(ctx.db, "SELECT priority FROM work_item_priorities WHERE workItemId=?1", [
+                 created.id
+               ])
+
+      collection = get(ctx, "/api/work-items?state=open")
+      assert collection.status == 200
+      assert %{"resource" => "work items", "items" => items} = JSON.decode!(collection.resp_body)
+
+      assert %{"id" => id, "priority" => ^expected_priority} =
+               item = Enum.find(items, &(&1["id"] == created.id))
+
+      detail = get(ctx, "/api/work-items/" <> id)
+      assert detail.status == 200
+      assert JSON.decode!(detail.resp_body)["item"] == item
+
+      notice = Publisher.state_notice(ctx.db, call, updated)
+      assert notice["class"] == "work_item.updated"
+      assert notice["payload"] == item
+      assert notice["payload"]["priority"] === expected_priority
+    end
+  end
+
   @tag rest_r7_boundary: true
   test "B2 collection enforces principal resolution and rejects cross-principal cursors", ctx do
     outsider = outsider_device(ctx)
