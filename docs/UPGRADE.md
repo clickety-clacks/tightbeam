@@ -32,25 +32,81 @@ new yes before acting; read-only inventory can proceed while waiting.
    before restart.
 3. Review [runtime overrides](#runtime-overrides-during-an-upgrade). At the
    authorized idle boundary, select the staged build, update the npm-based
-   systemd unit or LaunchDaemon to the selector path, and restart the service
-   through its service manager as described in the selector move.
-   The gateway performs the supported database migration on first boot; do not
-   issue manual schema changes.
-4. Require `/version` to match the selected receipt's version and source SHA,
+   systemd unit or LaunchDaemon to the selector path, and stop the 0.1.8
+   service through its service manager. Do not start 0.1.9 yet.
+4. With the 0.1.8 gateway stopped, prepare every registered host before the
+   first 0.1.9 start. Each item below is a gap between what 0.1.8 left on
+   disk and what 0.1.9 accepts; skipping one stops agents from running.
+   - **Satellite CLIs.** 0.1.9 signals old harness processes through each
+     host's own `<base_dir>/bin/tightbeam`, and a 0.1.8 satellite CLI does not
+     understand that command. Replace each satellite's
+     `<base_dir>/bin/tightbeam` with `tightbeam/bin/tightbeam` from the same
+     release, using the package for that satellite's platform
+     (`darwin-aarch64` or `linux-x86_64`), verified against `SHA256SUMS`. Keep
+     the old file beside it until the upgrade passes. A Linux gateway's
+     `assimilate` cannot ship a macOS CLI, so copy it for a macOS satellite.
+     Require `<base_dir>/bin/tightbeam --version` to report 0.1.9 on every host.
+   - **Credential links.** 0.1.8 placed harness credentials in each
+     `<base_dir>/homes/<host>/<harness>/` as symbolic links into
+     `<base_dir>/auth/`, for example `homes/<host>/codex/auth.json` and
+     `homes/<host>/claude/.credentials.json`. 0.1.9 accepts only a regular
+     file there and reports a linked credential as missing. On every host,
+     check each of those two paths with `ls -l` without reading the file. For
+     each one that is a link, remove the link and move the file it points to
+     into its place, keeping its mode. Move it; do not copy it. A Codex
+     subscription credential refreshes itself, and two copies diverge. Where a
+     host has no usable credential, `tightbeam onboard openai|anthropic` on
+     that host after the start is the supported alternative; it needs the
+     user at each sign-in.
+   - **Old harness process records.** A 0.1.8 harness process record lacks the
+     identity file 0.1.9 requires before it signals a process, so at first
+     start 0.1.9 fails to settle each record it finds and parks that harness
+     on that host until the record resolves. No turn starts on a parked
+     harness. Stopping 0.1.8 already ended those processes. Until a release
+     settles these records itself, settle them before the first start. List
+     them with
+     `sqlite3 -readonly <base_dir>/state.db "SELECT launchId, adapterKey, host, processGroupId FROM harness_processes WHERE resolvedAt IS NULL;"`.
+     On each named host, confirm with `ps -A -o pid=,pgid= | awk '$2==<processGroupId>'` that
+     the group has no live process. Only when every one is gone, and with the
+     gateway still stopped, describe this exact change to the user, get their
+     yes, and run:
+
+     ```sh
+     sqlite3 <base_dir>/state.db "BEGIN IMMEDIATE;
+       UPDATE harness_processes SET state='exited',
+         resolvedAt=CAST(strftime('%s','now') AS INTEGER)*1000,
+         lastError='0.1.8 to 0.1.9 upgrade: process confirmed gone before first 0.1.9 start'
+       WHERE resolvedAt IS NULL;
+       DELETE FROM harness_park_fences;
+       COMMIT;"
+     ```
+
+     If a process is still alive, stop it on its host first. Do not settle a
+     record whose process is running.
+5. Start the 0.1.9 service through its service manager. The gateway performs
+   the supported database migration on first boot; do not issue manual schema
+   changes. On a large database the first process can exit once after the
+   migration finishes, when the wake scheduler runs before the lane manager is
+   up. The service manager restarts it and the second start serves normally.
+   Expect one such restart; investigate a second.
+6. Require `/version` to match the selected receipt's version and source SHA,
    verify the migrated database and important existing records, and complete
-   the runtime checks below. If the gateway fails to boot or verification
-   fails, stop and use the retained package and backup only after checking
-   schema compatibility; an executable rollback does not undo migration.
-5. For each registered satellite whose CLI came from assimilation, refresh it
-   with the selected 0.1.9 CLI by [re-assimilating that host](#refreshing-satellite-clis)
-   with its recorded destination and settings. Verify the remote CLI version;
-   upgrading the gateway does not replace a satellite CLI.
-6. After the service and satellites pass, follow
+   the runtime checks below. Require `SELECT count(*) FROM harness_park_fences;`
+   to return 0 and turns to move from `queued` to `running`. If the gateway
+   fails to boot or verification fails, stop and use the retained package and
+   backup only after checking schema compatibility; an executable rollback
+   does not undo migration.
+7. For each registered satellite, [re-assimilate that host](#refreshing-satellite-clis)
+   with its recorded destination and settings so its adapters and registration
+   match 0.1.9. The CLI was already replaced in step 4; re-check its version.
+8. After the service and satellites pass, follow
    [old-install cleanup](#remove-the-old-npm-installation). Remove only the
    verified obsolete npm package and links, then check that the service,
    operator shell, and satellites cannot load the stale CLI or gateway.
-7. Complete the upgrade with guided relearn, or record the user's explicit
-   deferral. Have Main explain the installed guidance changes, run
+9. Complete the upgrade with guided relearn, or record the user's explicit
+   deferral. As soon as the gateway and satellites pass, tell the user the
+   upgrade is not complete until relearn and offer to start it; do not wait to
+   be asked, and do not report the upgrade as done before it. Have Main explain the installed guidance changes, run
    `tightbeam identity relearn` when the user chooses, and guide each conflict
    choice as described below; never silently select either version. Restarting
    the gateway is not upgrade completion: without relearn, 0.1.9 code can run
