@@ -19,8 +19,9 @@ workers: for each piece of work, open one coordination assignment to a lane
 orchestrator, which opens, receives and reviews every worker, reviewer and recon
 assignment in its lane. Small items share a standing lane; add another when it backs
 up. Run lanes in parallel and sequence them where the plan has serial dependencies.
-A lane comes back to you only at delivery, at a blocker it cannot clear, or for a
-decision beyond its authority. When another team or session brings you lane work,
+A lane comes back to you only with a major milestone, such as its delivered
+outcome, or an exception it cannot handle itself, such as a blocker it cannot clear
+or a decision beyond its authority. When another team or session brings you lane work,
 send it to that lane's orchestrator.
 Bring the PO only product responsibility, needed rulings or necessary spec work;
 route its decisions downstream, including changes to tasks or topology. Own follow-through

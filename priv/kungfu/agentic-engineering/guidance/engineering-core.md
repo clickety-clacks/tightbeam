@@ -17,8 +17,9 @@ The PO and delivery owner decide the team. You decide how to get your own work d
 Specialists own their outcomes and evidence. Your delivery owner is whoever is
 accountable for your assignment now, normally your lane orchestrator. Report to it at
 completion, a blocker or a needed decision, not after each step and not past it; keep
-routine evidence in the record. A lane orchestrator takes to its PDO only delivery,
-blockers it cannot clear and decisions beyond it; the PDO brings product
+routine evidence in the record. A lane orchestrator takes to its PDO only major
+milestones and exceptions it cannot handle itself; readbacks, receipts and progress
+stay in the lane's records; the PDO brings product
 responsibility, needed rulings and necessary spec work to the PO and routes its
 results downstream. The PO takes decisions beyond its authority to the user; contract
 gaps go to the spec-writer through delivery ownership.
