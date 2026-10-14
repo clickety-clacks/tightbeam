@@ -686,7 +686,7 @@ defmodule Tightbeam.RailRemedyTest do
     end
   end
 
-  test "stale effects reassessment occurrence cannot replace a pending notice", ctx do
+  test "stale effects reassessment occurrence consumes only its superseded wake", ctx do
     assignment = notice_assignment(ctx, "stale effects occurrence")
     %{producer_id: root} = fire_review_notice(ctx, assignment)
     mark_notice_turn(ctx.db, assignment.id, root, "failed_unknown")
@@ -710,17 +710,164 @@ defmodule Tightbeam.RailRemedyTest do
         [assignment.id]
       )
 
-    {:ok, before_wakes} = DB.query(ctx.db, "SELECT wakeId,state FROM wakes ORDER BY wakeId", [])
+    unrelated =
+      Wakes.schedule(ctx.db, %{
+        session_key: ctx.holder.session_key,
+        origin: "test:unrelated",
+        prompt: "unrelated pending wake",
+        due_at: 0
+      })
 
-    assert_raise ArgumentError, "review remedy episode is not live", fn ->
-      RailRemedy.reconcile_notice(ctx.db, %{supervision_interval_ms: 1_000}, stale)
-    end
+    assert :ok =
+             RailRemedy.reconcile_notice(ctx.db, %{supervision_interval_ms: 1_000}, stale)
 
-    assert {:ok, ^before_wakes} =
-             DB.query(ctx.db, "SELECT wakeId,state FROM wakes ORDER BY wakeId", [])
+    assert %{state: "fired", consumer: "review_remedy_reconcile"} =
+             Wakes.get(ctx.db, stale.wake_id)
+
+    assert :ok = RailRemedy.reconcile_notice(ctx.db, %{supervision_interval_ms: 1_000}, stale)
+
+    assert %{state: "pending"} = Wakes.get(ctx.db, unrelated.wake_id)
 
     assert RailRemedy.episode(ctx.db, "completion-requires-review", assignment.id).notice_state ==
              current.notice_state
+  end
+
+  test "closed review-remedy episode consumes its reassessment without rewriting history", ctx do
+    assignment = notice_assignment(ctx, "closed reassessment")
+    fire_review_notice(ctx, assignment)
+    episode = RailRemedy.episode(ctx.db, "completion-requires-review", assignment.id)
+    reassessment = Wakes.get(ctx.db, episode.notice_state["reassessment"]["wakeId"])
+
+    assert true =
+             RailRemedy.close(
+               ctx.db,
+               "completion-requires-review",
+               assignment.id,
+               episode.occurrence
+             )
+
+    closed = RailRemedy.episode(ctx.db, "completion-requires-review", assignment.id)
+    assert closed.status == "closed"
+
+    assert :ok =
+             RailRemedy.reconcile_notice(ctx.db, %{supervision_interval_ms: 1_000}, reassessment)
+
+    assert %{state: "fired", consumer: "review_remedy_reconcile"} =
+             Wakes.get(ctx.db, reassessment.wake_id)
+
+    assert RailRemedy.episode(ctx.db, "completion-requires-review", assignment.id) == closed
+  end
+
+  test "missing review-remedy episode settles once across scheduler restart", ctx do
+    assignment = notice_assignment(ctx, "missing reassessment episode")
+    %{producer_id: root_id} = fire_review_notice(ctx, assignment)
+    episode = RailRemedy.episode(ctx.db, "completion-requires-review", assignment.id)
+    reassessment_id = episode.notice_state["reassessment"]["wakeId"]
+
+    {:ok, _} =
+      DB.query(ctx.db, "DELETE FROM rail_remedy_episodes WHERE statute=?1 AND subject=?2", [
+        "completion-requires-review",
+        assignment.id
+      ])
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE wakes SET dueAt=?2 WHERE wakeId=?1", [
+        root_id,
+        System.system_time(:millisecond) + 60_000
+      ])
+
+    {:ok, _} = DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [reassessment_id])
+
+    test_pid = self()
+    scheduler = String.to_atom("missing_episode_scheduler_#{System.unique_integer([:positive])}")
+
+    opts = [
+      name: scheduler,
+      db: ctx.db,
+      tick_ms: 60_000,
+      deliver: fn _wake -> flunk("an internal reassessment must not use prompt delivery") end,
+      internal_consumers: %{
+        "review_remedy_reconcile" => fn wake ->
+          send(test_pid, {:review_reconcile_delivered, wake.wake_id})
+          RailRemedy.reconcile_notice(ctx.db, %{supervision_interval_ms: 1_000}, wake)
+        end
+      }
+    ]
+
+    start_supervised!(Supervisor.child_spec({Wakes, opts}, id: scheduler))
+    assert :ok = Wakes.fire_due(scheduler)
+    assert_received {:review_reconcile_delivered, ^reassessment_id}
+
+    assert %{state: "fired", consumer: "review_remedy_reconcile"} =
+             Wakes.get(ctx.db, reassessment_id)
+
+    stop_supervised!(scheduler)
+
+    start_supervised!(Supervisor.child_spec({Wakes, opts}, id: scheduler))
+    assert :ok = Wakes.fire_due(scheduler)
+    refute_received {:review_reconcile_delivered, ^reassessment_id}
+
+    assert %{state: "fired", consumer: "review_remedy_reconcile"} =
+             Wakes.get(ctx.db, reassessment_id)
+
+    stop_supervised!(scheduler)
+  end
+
+  test "uncertain live episode state leaves reassessment pending", ctx do
+    assignment = notice_assignment(ctx, "uncertain reassessment episode")
+    fire_review_notice(ctx, assignment)
+    episode = RailRemedy.episode(ctx.db, "completion-requires-review", assignment.id)
+    reassessment = Wakes.get(ctx.db, episode.notice_state["reassessment"]["wakeId"])
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE rail_remedy_episodes SET noticeState='not-json' WHERE statute=?1 AND subject=?2",
+        ["completion-requires-review", assignment.id]
+      )
+
+    assert_raise ArgumentError, "unsupported or invalid rail remedy noticeState", fn ->
+      RailRemedy.reconcile_notice(ctx.db, %{supervision_interval_ms: 1_000}, reassessment)
+    end
+
+    assert %{state: "pending", consumer: "review_remedy_reconcile"} =
+             Wakes.get(ctx.db, reassessment.wake_id)
+  end
+
+  test "old reassessment cannot consume work for a newer live occurrence", ctx do
+    assignment = notice_assignment(ctx, "newer live reassessment")
+    fire_review_notice(ctx, assignment)
+    first = RailRemedy.episode(ctx.db, "completion-requires-review", assignment.id)
+    old_reassessment = Wakes.get(ctx.db, first.notice_state["reassessment"]["wakeId"])
+
+    assert true =
+             RailRemedy.close(
+               ctx.db,
+               "completion-requires-review",
+               assignment.id,
+               first.occurrence
+             )
+
+    assert %{outcome: "claimed-dispatched"} = fire_review_notice(ctx, assignment)
+    newer = RailRemedy.episode(ctx.db, "completion-requires-review", assignment.id)
+    assert newer.status == "live"
+    assert newer.occurrence == first.occurrence + 1
+    newer_reassessment_id = newer.notice_state["reassessment"]["wakeId"]
+
+    assert :ok =
+             RailRemedy.reconcile_notice(
+               ctx.db,
+               %{supervision_interval_ms: 1_000},
+               old_reassessment
+             )
+
+    assert %{state: "fired", consumer: "review_remedy_reconcile"} =
+             Wakes.get(ctx.db, old_reassessment.wake_id)
+
+    assert %{state: "pending", consumer: "review_remedy_reconcile"} =
+             Wakes.get(ctx.db, newer_reassessment_id)
+
+    assert RailRemedy.episode(ctx.db, "completion-requires-review", assignment.id) == newer
   end
 
   test "live bounded retry prevents a competing O2 recovery", ctx do
