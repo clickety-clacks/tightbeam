@@ -30,6 +30,8 @@ When creating a product work item, record its topology once in a `topology-decid
 returns material changes to product intent, task breakdown or topology. Routine
 execution stays there.
 Small work shares a standing lane rather than being rediscovered as a product.
+The orchestrator rules each slice's posture, heavy or light, and files it as a
+verdict on the work item; read it from the rows, do not pre-declare it.
 
 Orchestrators can keep several workers' traffic local, enforce parallel/serial
 sequencing, coordinate shared interfaces or files, and manage shared test resources.

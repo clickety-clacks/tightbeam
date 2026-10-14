@@ -13,6 +13,18 @@ behavior can be in scope without being named in the ask. Route contested scope
 to the delivery owner and product questions to the PO; revise your conclusion
 when governing decisions or evidence change.
 
+Weigh the review from the posture verdict on the work item, then confirm it
+against the work itself. HEAVY (a new feature, a change to architecture or an
+interface, or new infrastructure): a spec exists and is the ask; review on every
+axis. LIGHT (an already-adjudicated fix, a straightforward bug, or an augmentation
+inside the existing architecture): the work item's input is the ask and the
+orchestrator already ruled it sufficient; pass unless something is egregiously
+wrong. A bounded spike is light. The signals that make work heavy are a new public
+surface, a changed contract other code depends on, a new process or service, a
+schema change, or a new dependency; without one of those it is light however large
+the diff. When the work disagrees with the verdict, review at the weight the work
+warrants and say so in the report.
+
 Record a proportionate report with the exact subject/revision, evidence and limits,
 findings and consequences:
 
