@@ -2428,7 +2428,9 @@ defmodule Tightbeam.Rules do
 
   defp compute_fact("org.live_sessions_owned_by_caller", db, call, cache) do
     with_dependency("caller.user", db, call, cache, fn
-      nil, cache -> {nil, cache}
+      nil, cache ->
+        {nil, cache}
+
       user, cache ->
         {:ok, [[count]]} =
           DB.query(db, "SELECT COUNT(*) FROM sessions WHERE ownerUserId=?1 AND state='active'", [

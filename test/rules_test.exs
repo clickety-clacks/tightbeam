@@ -527,6 +527,7 @@ defmodule Tightbeam.RulesTest do
 
     assert {:deny, %{code: "rule_denied", rule: "needs-remedy"}} =
              Rules.evaluate(ctx.db, dispatch_call)
+
     verdict(ctx, holder.session_key, assigned.id, "tests-passed")
     assert :ok = Rules.evaluate(ctx.db, dispatch_call)
   end
@@ -779,7 +780,9 @@ defmodule Tightbeam.RulesTest do
 
       put_rule(ctx, rule("bad-list-value", "attest", fact, "not_in", []))
 
-      assert_unavailable(ctx, ~r/non-empty flat list/, fn -> Rules.load!(ctx.base_dir, ["attest"]) end)
+      assert_unavailable(ctx, ~r/non-empty flat list/, fn ->
+        Rules.load!(ctx.base_dir, ["attest"])
+      end)
     end
 
     for removed <- [
@@ -810,7 +813,9 @@ defmodule Tightbeam.RulesTest do
       rule("bad-overlap", "assign", "assign.declared_files_overlap_open", "eq", "true")
     )
 
-    assert_unavailable(ctx, ~r/does not match bool/, fn -> Rules.load!(ctx.base_dir, ["assign"]) end)
+    assert_unavailable(ctx, ~r/does not match bool/, fn ->
+      Rules.load!(ctx.base_dir, ["assign"])
+    end)
 
     put_rule(
       ctx,
@@ -824,7 +829,9 @@ defmodule Tightbeam.RulesTest do
       rule("bad-producing", "attest", "assignment.is_producing_card", "eq", "true")
     )
 
-    assert_unavailable(ctx, ~r/does not match bool/, fn -> Rules.load!(ctx.base_dir, ["attest"]) end)
+    assert_unavailable(ctx, ~r/does not match bool/, fn ->
+      Rules.load!(ctx.base_dir, ["attest"])
+    end)
 
     put_rule(ctx, rule("removed", "attest", "assignment.verdict_kinds_any", "in", ["x"]))
 
@@ -857,7 +864,9 @@ defmodule Tightbeam.RulesTest do
       )
     )
 
-    assert_unavailable(ctx, ~r/non-empty flat list/, fn -> Rules.load!(ctx.base_dir, ["attest"]) end)
+    assert_unavailable(ctx, ~r/non-empty flat list/, fn ->
+      Rules.load!(ctx.base_dir, ["attest"])
+    end)
   end
 
   test "P3 fact nil, empty-list, and overlap presence matrix", ctx do

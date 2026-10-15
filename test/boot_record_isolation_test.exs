@@ -94,7 +94,11 @@ defmodule Tightbeam.BootRecordIsolationTest do
       })
 
     {:ok, _} =
-      DB.query(db, "UPDATE wakes SET firedBy='condition',firedAt=1,recognitionEvidence=NULL WHERE wakeId=?1", [bad.wake_id])
+      DB.query(
+        db,
+        "UPDATE wakes SET firedBy='condition',firedAt=1,recognitionEvidence=NULL WHERE wakeId=?1",
+        [bad.wake_id]
+      )
 
     assert capture_log(fn -> assert :ok = Schema.ensure_all(db) end) =~ bad.wake_id
 
@@ -109,7 +113,12 @@ defmodule Tightbeam.BootRecordIsolationTest do
     assert %{state: "pending", recognition_evidence: nil} = Wakes.get(db, bad.wake_id)
     assert NoticeBatcher.source_refs(db, bad.wake_id) == []
     assert %{state: "fired"} = Wakes.get(db, good.wake_id)
-    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM turns WHERE sessionKey='healthy' AND status='queued'")
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               db,
+               "SELECT COUNT(*) FROM turns WHERE sessionKey='healthy' AND status='queued'"
+             )
   end
 
   test "identity snapshot reads revisions without decoding unused overrides", %{

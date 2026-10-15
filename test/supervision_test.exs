@@ -3508,7 +3508,11 @@ defmodule Tightbeam.SupervisionTest do
       })
 
     {:ok, _} =
-      DB.query(ctx.db, "UPDATE wakes SET state='fired',firedAt=1,deliveredTurnSeq=?1,reresolve='lineage',reresolveSeed='missing-holder',reresolveRung=1 WHERE wakeId=?2", [turn_seq, wake.wake_id])
+      DB.query(
+        ctx.db,
+        "UPDATE wakes SET state='fired',firedAt=1,deliveredTurnSeq=?1,reresolve='lineage',reresolveSeed='missing-holder',reresolveRung=1 WHERE wakeId=?2",
+        [turn_seq, wake.wake_id]
+      )
 
     assert {:ok, [[^turn_seq | _]]} =
              DB.query(ctx.db, Supervision.transfer_candidate_sql(), [wake.assignment_id, nil])
@@ -3528,7 +3532,10 @@ defmodule Tightbeam.SupervisionTest do
     assert result.retired_session_keys == [retiring.session_key]
     assert Org.get(ctx.db, retiring.session_key).state == "retired"
     assert Org.get(ctx.db, other.session_key).state == "active"
-    assert {:ok, [["open"]]} = DB.query(ctx.db, "SELECT state FROM assignments WHERE id=?1", [wake.assignment_id])
+
+    assert {:ok, [["open"]]} =
+             DB.query(ctx.db, "SELECT state FROM assignments WHERE id=?1", [wake.assignment_id])
+
     assert Wakes.get(ctx.db, wake.wake_id).reresolve_seed == "missing-holder"
   end
 
