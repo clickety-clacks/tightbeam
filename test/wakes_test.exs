@@ -711,8 +711,7 @@ defmodule Tightbeam.WakesTest do
     scheduler = :"busy_scheduler_#{System.unique_integer([:positive])}"
     test_pid = self()
 
-    # Accepts the post-commit nudge and never answers, like a scheduler stuck
-    # in a long tick.
+    # The scheduler never services its mailbox during this request.
     busy =
       spawn_link(fn ->
         Process.register(self(), scheduler)
@@ -728,19 +727,19 @@ defmodule Tightbeam.WakesTest do
 
     handler = Tightbeam.Gateway.handlers(%{db: db, wake_scheduler: scheduler})["wake"]
 
-    {response, log} =
-      with_log(fn ->
-        handler.(%{
-          origin: "user:flynn",
-          principal: {:user, "flynn"},
-          session_key: "k1",
-          params: %{prompt: "committed before the nudge", after_ms: 0}
-        })
-      end)
+    task = Task.async(fn ->
+      handler.(%{
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        session_key: "k1",
+        params: %{prompt: "committed before the nudge", after_ms: 0}
+      })
+    end)
+    response = Task.await(task, 2_000)
 
     assert %{wake_id: wake_id} = response
     assert %{state: "pending", prompt: "committed before the nudge"} = Wakes.get(db, wake_id)
-    assert log =~ "wake scheduler nudge after a committed write did not complete"
+    assert Process.alive?(busy)
   end
 
   defp active_sessions!(db, keys) do
