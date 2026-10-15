@@ -2444,7 +2444,7 @@ defmodule Tightbeam.EscalationTest do
   test "joined terminal traces distinguish known legacy condition and fallback paths", ctx do
     # Build the pre-delivery legacy fixture before a scheduler can create batch
     # members referencing its wake. The delivery scheduler starts below.
-    assert :ok = stop_supervised(ctx.scheduler)
+    assert :ok = stop_supervised(Wakes)
 
     legacy =
       Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "legacy trace?"}))
