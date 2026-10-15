@@ -3850,6 +3850,7 @@ defmodule Tightbeam.Wakes do
     )
 
     publish_change_in_txn(txn, "wake.scheduled", retry_wake_id)
+    schedule_changed_in_txn(txn, {:schedule_changed, due_at})
   end
 
   defp settle_retry_attempt_in_txn(txn, wake_id, turn_seq, outcome, observed_at) do

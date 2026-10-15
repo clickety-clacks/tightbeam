@@ -127,6 +127,52 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
     assert Process.alive?(pid)
   end
 
+  test "a restored prewrite successor fires on time without the miss detector", ctx do
+    source = wake(ctx.db, System.system_time(:millisecond) - 100)
+
+    [_carrier] =
+      NoticeBatcher.recover(ctx.db, System.system_time(:millisecond), ctx.delivery_opts)
+
+    assert {:ok, turn} = Ledger.claim_next(ctx.db, "recipient", "testhost")
+    pid = scheduler(ctx)
+    # Let startup recovery and the one-time backfill finish before inserting.
+    Process.sleep(300)
+    assert :sys.get_state(pid).timer == nil
+
+    evidence =
+      Tightbeam.NoticeSubmission.prewrite_evidence(
+        :prompt,
+        {:acp_request_not_dispatched, {:transport_capacity_exceeded, 201, 200}}
+      )
+
+    assert {:ok, [successor]} =
+             DB.transaction(ctx.db, fn txn ->
+               assert Ledger.finish_in_txn(txn, turn.seq, "failed", "prewrite refusal",
+                        owner_lease: turn.owner_lease,
+                        prewrite_evidence: evidence
+                      )
+
+               Tightbeam.NoticeSubmission.restore_in_txn(txn, turn, evidence)
+             end)
+
+    due = Wakes.get(ctx.db, successor).due_at
+    assert :sys.get_state(pid).deadline == due
+    Process.sleep(1_500)
+
+    assert [%{delivery_wake_id: carrier, batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(ctx.db, successor)
+
+    assert {:ok, [[delivered_at]]} =
+             DB.query(ctx.db, "SELECT createdAt FROM turns WHERE wakeId=?1", [
+               carrier
+             ])
+
+    assert delivered_at >= due and delivered_at - due < 1_000
+    assert Wakes.get(ctx.db, successor).state == "fired"
+    assert Wakes.get(ctx.db, source.wake_id).state == "fired"
+    assert Tightbeam.SchedulerMisses.count() == ctx.misses_before
+  end
+
   test "distant deadlines keep one timer without overflowing a relative timeout", ctx do
     pid = scheduler(ctx)
 

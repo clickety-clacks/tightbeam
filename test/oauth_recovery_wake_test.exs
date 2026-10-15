@@ -86,6 +86,7 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
     assert %{provider: :anthropic, credential_kind: "subscription", status: "onboarded"} =
              finish(onboard, "anthropic", lease_id, "subscription")
 
+    assert_receive {:lane_started, @main}
     assert {:ok, [[wake_id]]} = DB.query(ctx.db, "SELECT wakeId FROM wakes WHERE digest=0")
     carrier_id = assert_main_wake!(ctx, wake_id, "anthropic")
 
@@ -102,8 +103,6 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
              )
 
     assert carrier_content =~ recovery_prompt("anthropic")
-
-    assert_received {:lane_started, @main}
 
     assert {:ok, [[0]]} =
              DB.query(
@@ -136,9 +135,9 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
     assert %{provider: :openai, credential_kind: "subscription", status: "onboarded"} =
              onboard.(call)
 
+    assert_receive {:lane_started, @main}
     assert {:ok, [[wake_id]]} = DB.query(ctx.db, "SELECT wakeId FROM wakes WHERE digest=0")
     _carrier_id = assert_main_wake!(ctx, wake_id, "openai", operator_session)
-    assert_received {:lane_started, @main}
     refute_received {:lane_started, ^other_main}
   end
 
@@ -305,7 +304,7 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
   end
 
   defp start_real_scheduler!(ctx) do
-    name = String.to_atom("oauth_real_scheduler_#{System.unique_integer([:positive])}")
+    name = Tightbeam.WakeScheduler
 
     deliver = fn wake ->
       Gateway.deliver_prompt(wake.session_key, wake.origin, wake.prompt,

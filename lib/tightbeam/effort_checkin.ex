@@ -132,6 +132,8 @@ defmodule Tightbeam.EffortCheckin do
             elapsed
           ])
 
+          if Txn.changes(txn) == 1, do: Wakes.schedule_changed_in_txn(txn, :wake_ready)
+
         true ->
           :ok
       end
