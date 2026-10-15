@@ -88,7 +88,12 @@ defmodule Tightbeam.SourceDeliveriesTest do
         )
     end
 
-    :ok = DB.execute(db, "UPDATE wake_delivery_backfill SET afterRowid=0,throughRowid=(SELECT MAX(rowid) FROM wakes),completedAt=NULL")
+    :ok =
+      DB.execute(
+        db,
+        "UPDATE wake_delivery_backfill SET afterRowid=0,throughRowid=(SELECT MAX(rowid) FROM wakes),completedAt=NULL"
+      )
+
     %{db: db}
   end
 
@@ -99,14 +104,36 @@ defmodule Tightbeam.SourceDeliveriesTest do
 
   test "backfill records direct and carried turns, excluding canceled and unsent members", ctx do
     assert :done = Tightbeam.Schema.backfill_wake_delivery(ctx.db)
-    assert rows!(ctx.db, "SELECT wakeId,deliveredTurnSeq FROM wakes WHERE deliveredTurnSeq IS NOT NULL", []) ==
-      [["w_carrier",2],["w_direct",1],["w_src_a",2],["w_src_b",2]]
-    assert {:ok, [[2,"delivered","asg_a"]]} = DB.transaction(ctx.db, &NoticeBatcher.source_delivery_turns_in_txn(&1,"w_src_a"))
+
+    assert rows!(
+             ctx.db,
+             "SELECT wakeId,deliveredTurnSeq FROM wakes WHERE deliveredTurnSeq IS NOT NULL",
+             []
+           ) ==
+             [["w_carrier", 2], ["w_direct", 1], ["w_src_a", 2], ["w_src_b", 2]]
+
+    assert {:ok, [[2, "delivered", "asg_a"]]} =
+             DB.transaction(ctx.db, &NoticeBatcher.source_delivery_turns_in_txn(&1, "w_src_a"))
+
     # Membership is metadata, not delivery authority after the stamp.
     :ok = DB.execute(ctx.db, "DELETE FROM notice_batch_members")
-    assert {:ok, [[2,"delivered","asg_a"]]} = DB.transaction(ctx.db, &NoticeBatcher.source_delivery_turns_in_txn(&1,"w_src_a"))
-    assert {:ok, []} = DB.transaction(ctx.db, &NoticeBatcher.source_delivery_turns_in_txn(&1,"w_src_unsent"))
-    assert {:ok, plan} = DB.query(ctx.db, "EXPLAIN QUERY PLAN SELECT wakeId FROM wakes WHERE deliveredTurnSeq=?1", [2])
+
+    assert {:ok, [[2, "delivered", "asg_a"]]} =
+             DB.transaction(ctx.db, &NoticeBatcher.source_delivery_turns_in_txn(&1, "w_src_a"))
+
+    assert {:ok, []} =
+             DB.transaction(
+               ctx.db,
+               &NoticeBatcher.source_delivery_turns_in_txn(&1, "w_src_unsent")
+             )
+
+    assert {:ok, plan} =
+             DB.query(
+               ctx.db,
+               "EXPLAIN QUERY PLAN SELECT wakeId FROM wakes WHERE deliveredTurnSeq=?1",
+               [2]
+             )
+
     assert Enum.any?(plan, &(List.last(&1) =~ "wakes_delivered_turn"))
   end
 
@@ -117,24 +144,41 @@ defmodule Tightbeam.SourceDeliveriesTest do
     assert :ok = Tightbeam.Schema.ensure_all(ctx.db)
     assert :done = Tightbeam.Schema.backfill_wake_delivery(ctx.db)
     assert rows!(ctx.db, "SELECT * FROM wake_delivery_backfill", []) == before
-    assert {:ok, []} = DB.transaction(ctx.db, &NoticeBatcher.source_delivery_turns_in_txn(&1,"w_direct"))
+
+    assert {:ok, []} =
+             DB.transaction(ctx.db, &NoticeBatcher.source_delivery_turns_in_txn(&1, "w_direct"))
   end
 
   test "an existing database stamps pending and recent wakes before historical batches", ctx do
     # Reconstruct the additive predecessor. No application writes run during
     # this fixture-only downgrade.
-    :ok = DB.execute(ctx.db, """
-    DROP TRIGGER supervision_liveness_sidecar_insert_coherent;
-    DROP INDEX wakes_delivered_turn;
-    ALTER TABLE wakes DROP COLUMN deliveredTurnSeq;
-    DROP TABLE wake_delivery_backfill;
-    UPDATE wakes SET state='pending' WHERE wakeId='w_direct';
-    """)
+    :ok =
+      DB.execute(ctx.db, """
+      DROP TRIGGER supervision_liveness_sidecar_insert_coherent;
+      DROP INDEX wakes_delivered_turn;
+      ALTER TABLE wakes DROP COLUMN deliveredTurnSeq;
+      DROP TABLE wake_delivery_backfill;
+      UPDATE wakes SET state='pending' WHERE wakeId='w_direct';
+      """)
+
     at = System.system_time(:millisecond)
-    assert {:ok, _} = DB.query(ctx.db, "UPDATE wakes SET firedAt=?1 WHERE wakeId IN ('w_src_a','w_carrier')", [at])
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE wakes SET firedAt=?1 WHERE wakeId IN ('w_src_a','w_carrier')",
+               [at]
+             )
+
     assert :ok = Tightbeam.Schema.migrate_wake_delivery(ctx.db)
-    assert rows!(ctx.db, "SELECT wakeId,deliveredTurnSeq FROM wakes WHERE deliveredTurnSeq IS NOT NULL", []) ==
-      [["w_carrier",2],["w_direct",1],["w_src_a",2]]
+
+    assert rows!(
+             ctx.db,
+             "SELECT wakeId,deliveredTurnSeq FROM wakes WHERE deliveredTurnSeq IS NOT NULL",
+             []
+           ) ==
+             [["w_carrier", 2], ["w_direct", 1], ["w_src_a", 2]]
+
     assert :done = Tightbeam.Schema.backfill_wake_delivery(ctx.db)
     assert rows!(ctx.db, "SELECT deliveredTurnSeq FROM wakes WHERE wakeId='w_src_b'", []) == [[2]]
     assert :ok = Tightbeam.Schema.migrate_wake_delivery(ctx.db)

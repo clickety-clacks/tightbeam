@@ -6389,6 +6389,7 @@ defmodule Tightbeam.Wakes do
     if Tightbeam.Schema.backfill_wake_delivery(state.db) == :more do
       Process.send_after(self(), :backfill_wake_delivery, 100)
     end
+
     {:noreply, state}
   end
 

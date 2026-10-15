@@ -1730,31 +1730,45 @@ defmodule Tightbeam.Schema do
   # deliveries write the column in their own delivery transaction.
   def migrate_wake_delivery(db) do
     case DB.transaction(db, fn txn ->
-           :ok = Txn.exec(txn, """
-           CREATE TABLE IF NOT EXISTS wake_delivery_backfill (
-             id INTEGER PRIMARY KEY CHECK(id=0),
-             afterRowid INTEGER NOT NULL,
-             throughRowid INTEGER NOT NULL,
-             startedAt INTEGER NOT NULL,
-             completedAt INTEGER
-           )
-           """)
+           :ok =
+             Txn.exec(txn, """
+             CREATE TABLE IF NOT EXISTS wake_delivery_backfill (
+               id INTEGER PRIMARY KEY CHECK(id=0),
+               afterRowid INTEGER NOT NULL,
+               throughRowid INTEGER NOT NULL,
+               startedAt INTEGER NOT NULL,
+               completedAt INTEGER
+             )
+             """)
 
            if Txn.q(txn, "SELECT 1 FROM wake_delivery_backfill WHERE id=0") == [] do
              :ok = Txn.exec(txn, "ALTER TABLE wakes ADD COLUMN deliveredTurnSeq INTEGER")
-             :ok = Txn.exec(txn, "CREATE INDEX wakes_delivered_turn ON wakes(deliveredTurnSeq,firedAt)")
+
+             :ok =
+               Txn.exec(
+                 txn,
+                 "CREATE INDEX wakes_delivered_turn ON wakes(deliveredTurnSeq,firedAt)"
+               )
+
              at = System.system_time(:millisecond)
              [[last]] = Txn.q(txn, "SELECT COALESCE(MAX(rowid),0) FROM wakes")
              Txn.q(txn, "INSERT INTO wake_delivery_backfill VALUES(0,0,?1,?2,NULL)", [last, at])
 
-             rows = Txn.q(txn, """
-             SELECT rowid FROM wakes WHERE state='pending'
-             UNION
-             SELECT rowid FROM wakes INDEXED BY wakes_delivered_turn
-             WHERE deliveredTurnSeq IS NULL AND firedAt>=?1
-             """, [at - 7 * 24 * 60 * 60 * 1_000])
+             rows =
+               Txn.q(
+                 txn,
+                 """
+                 SELECT rowid FROM wakes WHERE state='pending'
+                 UNION
+                 SELECT rowid FROM wakes INDEXED BY wakes_delivered_turn
+                 WHERE deliveredTurnSeq IS NULL AND firedAt>=?1
+                 """,
+                 [at - 7 * 24 * 60 * 60 * 1_000]
+               )
+
              stamp_wake_delivery_rows_in_txn(txn, rows)
            end
+
            :ok
          end) do
       {:ok, :ok} -> :ok
@@ -1765,21 +1779,43 @@ defmodule Tightbeam.Schema do
   @doc false
   def backfill_wake_delivery(db) do
     case DB.transaction(db, fn txn ->
-           case Txn.q(txn, "SELECT afterRowid,throughRowid FROM wake_delivery_backfill WHERE id=0 AND completedAt IS NULL") do
+           case Txn.q(
+                  txn,
+                  "SELECT afterRowid,throughRowid FROM wake_delivery_backfill WHERE id=0 AND completedAt IS NULL"
+                ) do
              [[after_row, through_row]] ->
-               rows = Txn.q(txn, "SELECT rowid FROM wakes WHERE rowid>?1 AND rowid<=?2 ORDER BY rowid LIMIT 2000", [after_row, through_row])
+               rows =
+                 Txn.q(
+                   txn,
+                   "SELECT rowid FROM wakes WHERE rowid>?1 AND rowid<=?2 ORDER BY rowid LIMIT 2000",
+                   [after_row, through_row]
+                 )
+
                stamp_wake_delivery_rows_in_txn(txn, rows)
+
                if length(rows) < 2000 do
-                 Txn.q(txn, "UPDATE wake_delivery_backfill SET afterRowid=?1,completedAt=?2 WHERE id=0", [through_row, System.system_time(:millisecond)])
+                 Txn.q(
+                   txn,
+                   "UPDATE wake_delivery_backfill SET afterRowid=?1,completedAt=?2 WHERE id=0",
+                   [through_row, System.system_time(:millisecond)]
+                 )
+
                  :done
                else
-                 Txn.q(txn, "UPDATE wake_delivery_backfill SET afterRowid=?1 WHERE id=0", [rows |> List.last() |> hd()])
+                 Txn.q(txn, "UPDATE wake_delivery_backfill SET afterRowid=?1 WHERE id=0", [
+                   rows |> List.last() |> hd()
+                 ])
+
                  :more
                end
-             [] -> :done
+
+             [] ->
+               :done
            end
          end) do
-      {:ok, result} -> result
+      {:ok, result} ->
+        result
+
       {:error, error} ->
         Logger.error("wake delivery backfill deferred: #{inspect(error)}")
         :more
@@ -1788,15 +1824,19 @@ defmodule Tightbeam.Schema do
 
   defp stamp_wake_delivery_rows_in_txn(txn, rows) do
     Enum.each(rows, fn [rowid] ->
-      Txn.q(txn, """
-      UPDATE wakes SET deliveredTurnSeq=COALESCE(
-        (SELECT t.seq FROM turns t WHERE t.wakeId=wakes.wakeId ORDER BY t.seq LIMIT 1),
-        (SELECT t.seq FROM notice_batch_members m
-          JOIN notice_batches b ON b.batchId=m.batchId
-          JOIN turns t ON t.wakeId=b.deliveryWakeId
-          WHERE m.sourceWakeId=wakes.wakeId AND m.state='included' ORDER BY t.seq LIMIT 1))
-      WHERE rowid=?1 AND deliveredTurnSeq IS NULL
-      """, [rowid])
+      Txn.q(
+        txn,
+        """
+        UPDATE wakes SET deliveredTurnSeq=COALESCE(
+          (SELECT t.seq FROM turns t WHERE t.wakeId=wakes.wakeId ORDER BY t.seq LIMIT 1),
+          (SELECT t.seq FROM notice_batch_members m
+            JOIN notice_batches b ON b.batchId=m.batchId
+            JOIN turns t ON t.wakeId=b.deliveryWakeId
+            WHERE m.sourceWakeId=wakes.wakeId AND m.state='included' ORDER BY t.seq LIMIT 1))
+        WHERE rowid=?1 AND deliveredTurnSeq IS NULL
+        """,
+        [rowid]
+      )
     end)
   end
 
@@ -3292,7 +3332,7 @@ defmodule Tightbeam.Schema do
     JOIN wakes w ON w.wakeId=m.sourceWakeId
     JOIN turns t ON t.wakeId=b.deliveryWakeId
     WHERE m.state='included'
-) delivery
+    ) delivery
           WHERE delivery.sourceWakeId=old.wakeId AND delivery.turnSeq=failed.seq
             AND delivery.assignmentId=w.assignmentId)
         AND json_extract(terminal.detail,'$.prewrite.disposition')='not_dispatched'
@@ -3346,8 +3386,16 @@ defmodule Tightbeam.Schema do
 
   defp recorded_continuation_retry_guard(previous) do
     historical = continuation_retry_guard(previous)
-    %{historical | sql: Regex.replace(~r/AND EXISTS \(SELECT 1 FROM \(SELECT t.seq AS turnSeq.*?delivery.assignmentId=w.assignmentId\)/s,
-      historical.sql, "AND old.deliveredTurnSeq=failed.seq")}
+
+    %{
+      historical
+      | sql:
+          Regex.replace(
+            ~r/AND EXISTS \(SELECT 1 FROM \(SELECT t.seq AS turnSeq.*?delivery.assignmentId=w.assignmentId\)/s,
+            historical.sql,
+            "AND old.deliveredTurnSeq=failed.seq"
+          )
+    }
   end
 
   defp migrate_continuation_retry_guard(db) do
@@ -3358,10 +3406,19 @@ defmodule Tightbeam.Schema do
       )
 
     case DB.transaction(db, fn txn ->
-           [[actual]] = Txn.q(txn, "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1", [previous.name])
+           [[actual]] =
+             Txn.q(txn, "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1", [
+               previous.name
+             ])
+
            if normalize_schema_sql(actual) == normalize_schema_sql(previous.sql) do
-             migrate_owned_liveness_trigger_in_txn(txn, continuation_retry_guard(previous), previous.sql)
+             migrate_owned_liveness_trigger_in_txn(
+               txn,
+               continuation_retry_guard(previous),
+               previous.sql
+             )
            end
+
            migrate_owned_liveness_trigger_in_txn(
              txn,
              recorded_continuation_retry_guard(previous),

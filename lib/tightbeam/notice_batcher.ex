@@ -419,7 +419,9 @@ defmodule Tightbeam.NoticeBatcher do
       [[batch_id, state, carrier]] ->
         committed? =
           is_binary(carrier) and
-            Txn.q(txn, "SELECT 1 FROM wakes WHERE wakeId=?1 AND deliveredTurnSeq IS NOT NULL", [carrier]) != []
+            Txn.q(txn, "SELECT 1 FROM wakes WHERE wakeId=?1 AND deliveredTurnSeq IS NOT NULL", [
+              carrier
+            ]) != []
 
         cond do
           committed? or state in ["delivered", "delivery_failed"] ->
@@ -1034,7 +1036,11 @@ defmodule Tightbeam.NoticeBatcher do
   end
 
   defp prepare_due_source_after_suppression_in_txn(txn, wake_id) do
-    case Txn.q(txn, "SELECT t.sessionKey FROM wakes w JOIN turns t ON t.seq=w.deliveredTurnSeq WHERE w.wakeId=?1", [wake_id]) do
+    case Txn.q(
+           txn,
+           "SELECT t.sessionKey FROM wakes w JOIN turns t ON t.seq=w.deliveredTurnSeq WHERE w.wakeId=?1",
+           [wake_id]
+         ) do
       [[delivered_to]] ->
         # A pre-batching delivery may have committed its turn before the wake
         # row was marked fired. On recovery, acknowledge that exact source

@@ -1103,7 +1103,12 @@ defmodule Tightbeam.SchemaShapeTest do
     assert {:ok, [["m_one"]]} = DB.query(db, "SELECT recordedMessageId FROM artifacts")
     assert {:ok, [[1]]} = DB.query(db, "PRAGMA foreign_keys")
 
-    assert {:ok, [[1]]} = DB.query(db, "SELECT count(*) FROM pragma_table_info('wakes') WHERE name='deliveredTurnSeq' AND type='INTEGER'")
+    assert {:ok, [[1]]} =
+             DB.query(
+               db,
+               "SELECT count(*) FROM pragma_table_info('wakes') WHERE name='deliveredTurnSeq' AND type='INTEGER'"
+             )
+
     assert {:ok, [[1]]} = DB.query(db, "SELECT count(*) FROM wake_delivery_backfill WHERE id=0")
 
     # The rebuilt table is the same target shape a fresh 0.1.8 database gets.

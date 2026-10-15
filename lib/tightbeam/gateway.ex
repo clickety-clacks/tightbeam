@@ -2394,7 +2394,10 @@ defmodule Tightbeam.Gateway do
             if is_binary(opts[:wake_id]) do
               NoticeBatcher.carrier_source_ids_in_txn(txn, opts[:wake_id])
               |> Enum.each(fn source_id ->
-                DB.Txn.q(txn, "UPDATE wakes SET deliveredTurnSeq=?2 WHERE wakeId=?1", [source_id, seq])
+                DB.Txn.q(txn, "UPDATE wakes SET deliveredTurnSeq=?2 WHERE wakeId=?1", [
+                  source_id,
+                  seq
+                ])
               end)
             end
 

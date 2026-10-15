@@ -188,9 +188,11 @@ defmodule Tightbeam.Ledger do
       )
 
       [[seq]] = Txn.q(txn, "SELECT last_insert_rowid()")
+
       if wake_id = Map.get(attrs, :wake_id) do
         Txn.q(txn, "UPDATE wakes SET deliveredTurnSeq=?2 WHERE wakeId=?1", [wake_id, seq])
       end
+
       :ok = QueuedMessageSuppression.record_in_txn(txn, seq, attrs)
       QueuedMessageSuppression.replace_own_queued_in_txn(txn, seq, attrs)
 
