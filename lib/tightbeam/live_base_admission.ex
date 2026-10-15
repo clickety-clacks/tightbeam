@@ -128,9 +128,17 @@ defmodule Tightbeam.LiveBaseAdmission do
 
     transition =
       case Keyword.get(options, :transition) do
-        nil -> nil
-        bytes when is_binary(bytes) -> checked!(LiveBaseGuard.decode_transition(bytes))
-        _ -> refuse!("transition must be exact serialized input")
+        nil ->
+          nil
+
+        bytes when is_binary(bytes) ->
+          bytes
+          |> LiveBaseGuard.decode_transition()
+          |> checked!()
+          |> Map.update!("base", &canonical!/1)
+
+        _ ->
+          refuse!("transition must be exact serialized input")
       end
 
     source_marker =
