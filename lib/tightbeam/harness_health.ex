@@ -617,7 +617,10 @@ defmodule Tightbeam.HarnessHealth do
 
   defp copy_predecessor_in_txn(txn, predecessor_stamp) do
     previous_fk_violations =
-      Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(harness_health_observations harness_health_incidents harness_health_members harness_health_assignments))
+      Tightbeam.Schema.migration_foreign_keys_in_txn(
+        txn,
+        ~w(harness_health_observations harness_health_incidents harness_health_members harness_health_assignments)
+      )
 
     layout = validate_predecessor_objects!(txn)
 
@@ -713,7 +716,10 @@ defmodule Tightbeam.HarnessHealth do
           "copy migration row-count proof failed: before=#{inspect(predecessor_counts)} after=#{inspect(copied_counts)}"
         )
 
-    unless Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(harness_health_observations harness_health_incidents harness_health_members harness_health_assignments)) -- previous_fk_violations == [],
+    unless Tightbeam.Schema.migration_foreign_keys_in_txn(
+             txn,
+             ~w(harness_health_observations harness_health_incidents harness_health_members harness_health_assignments)
+           ) -- previous_fk_violations == [],
            do: raise(ArgumentError, "harness health copy migration left invalid foreign keys")
 
     EventLog.lifecycle_in_txn(

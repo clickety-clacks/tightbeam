@@ -190,9 +190,18 @@ defmodule Tightbeam.BootRecordIsolationTest do
   end
 
   test "unsupported credential incidents do not block healthy recipient reconciliation", %{db: db} do
-    Org.create(db, %{session_key: Org.personal_session_key("owner"), display_name: "Personal", owner_user_id: "owner",
-      origin: "user:owner", archetype: "default", harness: "claude", provider: "anthropic",
-        host: Placement.local_host_name(), model: Model.new("test-model")})
+    Org.create(db, %{
+      session_key: Org.personal_session_key("owner"),
+      display_name: "Personal",
+      owner_user_id: "owner",
+      origin: "user:owner",
+      archetype: "default",
+      harness: "claude",
+      provider: "anthropic",
+      host: Placement.local_host_name(),
+      model: Model.new("test-model")
+    })
+
     for {id, provider} <- [{"bad-incident", "obsolete"}, {"good-incident", "anthropic"}] do
       {:ok, _} =
         DB.query(
@@ -221,15 +230,35 @@ defmodule Tightbeam.BootRecordIsolationTest do
 
   test "fractional wake deadlines leave the scheduler and healthy timer available", %{db: db} do
     due = System.system_time(:millisecond) + 60_000
-    bad = Wakes.schedule(db, %{session_key: "healthy", origin: "user:owner", prompt: "bad deadline", due_at: due})
-    good = Wakes.schedule(db, %{session_key: "healthy", origin: "user:owner", prompt: "healthy deadline", due_at: due + 1_000})
+
+    bad =
+      Wakes.schedule(db, %{
+        session_key: "healthy",
+        origin: "user:owner",
+        prompt: "bad deadline",
+        due_at: due
+      })
+
+    good =
+      Wakes.schedule(db, %{
+        session_key: "healthy",
+        origin: "user:owner",
+        prompt: "healthy deadline",
+        due_at: due + 1_000
+      })
+
     {:ok, _} = DB.query(db, "UPDATE wakes SET dueAt=?2 WHERE wakeId=?1", [bad.wake_id, due + 0.5])
+
     assert capture_log(fn ->
-      pid = start_supervised!({Wakes, db: db, name: :fractional_deadline_scheduler, deliver: fn _ -> :ok end})
-      assert Process.alive?(pid)
-      state = :sys.get_state(pid)
-      assert state.deadline == good.due_at
-    end) =~ bad.wake_id
+             pid =
+               start_supervised!(
+                 {Wakes, db: db, name: :fractional_deadline_scheduler, deliver: fn _ -> :ok end}
+               )
+
+             assert Process.alive?(pid)
+             state = :sys.get_state(pid)
+             assert state.deadline == good.due_at
+           end) =~ bad.wake_id
   end
 
   test "invalid archetypes and fragment dependencies leave a healthy identity loaded", %{

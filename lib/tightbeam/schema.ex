@@ -4813,7 +4813,8 @@ defmodule Tightbeam.Schema do
                  do: raise(ShapeError, message: "session reparent stamp race")
 
                [] =
-                 Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(session_reparent_events)) -- previous_fk_violations
+                 Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(session_reparent_events)) --
+                   previous_fk_violations
 
                :ok
 
@@ -4898,10 +4899,12 @@ defmodule Tightbeam.Schema do
                # Scoped: the argument-less form walks the WHOLE database, a real stall
                # inside this transaction on a live 15G state.db for no added coverage.
                [] =
-                 Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(artifact_contents)) -- previous_fk_violations
+                 Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(artifact_contents)) --
+                   previous_fk_violations
 
                [] =
-                 Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(artifact_contents)) -- previous_fk_violations
+                 Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(artifact_contents)) --
+                   previous_fk_violations
 
                :ok
 
@@ -6602,45 +6605,51 @@ defmodule Tightbeam.Schema do
   end
 
   defp upgrade_agent_reparent(db) do
-    case DB.migration_transaction(db, :agent_reparent, ["PRAGMA foreign_keys=OFF"], ["PRAGMA foreign_keys=ON"], fn txn ->
-           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
-             [[shape]]
-             when shape in [
-                    @work_item_owner_link_shape,
-                    @notice_source_payload_shape,
-                    @decision_request_row_schema_shape,
-                    @assignment_source_replacement_shape,
-                    @identity_publication_denial_diagnostic_shape
-                  ] ->
-               :ok
+    case DB.migration_transaction(
+           db,
+           :agent_reparent,
+           ["PRAGMA foreign_keys=OFF"],
+           ["PRAGMA foreign_keys=ON"],
+           fn txn ->
+             case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+               [[shape]]
+               when shape in [
+                      @work_item_owner_link_shape,
+                      @notice_source_payload_shape,
+                      @decision_request_row_schema_shape,
+                      @assignment_source_replacement_shape,
+                      @identity_publication_denial_diagnostic_shape
+                    ] ->
+                 :ok
 
-             [[@agent_reparent_shape]] ->
-               :ok
+               [[@agent_reparent_shape]] ->
+                 :ok
 
-             [[@artifact_origin_shape]] ->
-               :ok
+               [[@artifact_origin_shape]] ->
+                 :ok
 
-             [[@terminal_credential_shape]] ->
-               :ok = Tightbeam.SessionReparent.upgrade_agent_principals_in_txn(txn)
+               [[@terminal_credential_shape]] ->
+                 :ok = Tightbeam.SessionReparent.upgrade_agent_principals_in_txn(txn)
 
-               Txn.q(txn, "UPDATE schema_stamp SET shape=?1, stampedAt=?2 WHERE shape=?3", [
-                 @agent_reparent_shape,
-                 System.system_time(:millisecond),
-                 @terminal_credential_shape
-               ])
+                 Txn.q(txn, "UPDATE schema_stamp SET shape=?1, stampedAt=?2 WHERE shape=?3", [
+                   @agent_reparent_shape,
+                   System.system_time(:millisecond),
+                   @terminal_credential_shape
+                 ])
 
-               if Txn.changes(txn) != 1 do
+                 if Txn.changes(txn) != 1 do
+                   raise ShapeError,
+                     message: "agent reparent migration lost its exact stamp transition"
+                 end
+
+                 :ok
+
+               other ->
                  raise ShapeError,
-                   message: "agent reparent migration lost its exact stamp transition"
-               end
-
-               :ok
-
-             other ->
-               raise ShapeError,
-                 message: "incompatible agent reparent predecessor: #{inspect(other)}"
+                   message: "incompatible agent reparent predecessor: #{inspect(other)}"
+             end
            end
-         end) do
+         ) do
       {:ok, :ok} -> :ok
       {:error, error} -> raise error
     end
