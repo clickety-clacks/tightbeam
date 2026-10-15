@@ -6396,17 +6396,20 @@ defmodule Tightbeam.Wakes do
   end
 
   def handle_info(:fire_matching, state) do
-    if evaluate_conditions(state, :tick) == :saturated, do: send(self(), :fire_matching)
+    DB.background_pass(fn ->
+      if evaluate_conditions(state, :tick) == :saturated, do: send(self(), :fire_matching)
+    end)
+
     {:noreply, state}
   end
 
   def handle_info({:fire_matching, fact_id}, state) do
-    eager_step(state, fact_id)
+    DB.background_pass(fn -> eager_step(state, fact_id) end)
     {:noreply, state}
   end
 
   def handle_info({:fire_matching_seq, fact_ids}, state) do
-    drain_seq(state, fact_ids)
+    DB.background_pass(fn -> drain_seq(state, fact_ids) end)
     {:noreply, state}
   end
 
@@ -6439,7 +6442,7 @@ defmodule Tightbeam.Wakes do
     # scan. The bind restores even when delivery raises; the next scan gets a
     # fresh ID. No context is implicitly inherited by a spawned process.
     Tightbeam.RequestContext.bind_internal("wake_scheduler", fn ->
-      deliver_due_in_context(state)
+      DB.background_pass(fn -> deliver_due_in_context(state) end)
     end)
   end
 

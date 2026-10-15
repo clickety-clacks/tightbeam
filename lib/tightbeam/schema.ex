@@ -1719,6 +1719,8 @@ defmodule Tightbeam.Schema do
     :ok = migrate_continuation_retry_guard(db)
     :ok = upgrade_decision_request_row_schema_revision(db)
 
+    :ok = Tightbeam.Recognition.ensure_schema(db)
+
     # Built last: the notice source payload migration above rebuilds
     # notice_batch_members, which drops any index created on the old table.
     # Building it here keeps a refused migration's schema untouched and makes
@@ -1726,7 +1728,7 @@ defmodule Tightbeam.Schema do
     :ok = ensure_notice_delivery_runtime_indexes(db)
 
     case DB.finish_schema(db) do
-      :ok -> :ok
+      :ok -> Tightbeam.Recognition.activate(db)
       {:error, error} -> raise error
     end
   end

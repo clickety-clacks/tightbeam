@@ -2845,19 +2845,26 @@ defmodule Tightbeam.CliIntegrationTest do
                       params: %{target_kind: "session", target_id: "cli-holder"}
                     }}
 
-    assert {:ok, [[payload]]} =
-             DB.query(
-               ctx.db,
-               "SELECT payload FROM events WHERE kind='verb' AND verb='breathing' ORDER BY id DESC LIMIT 1"
-             )
+    sql =
+      "SELECT payload FROM events WHERE kind='verb' AND verb='breathing' ORDER BY id DESC LIMIT 1"
 
-    {audit, []} = Code.eval_string(payload)
+    deadline = System.monotonic_time(:millisecond) + 2_000
 
-    assert %{
-             elided: true,
-             count: 0,
-             params: %{target_kind: "session", target_id: "cli-holder"}
-           } = audit
+    wait = fn wait ->
+      case DB.query(ctx.db, sql) do
+        {:ok, [[payload]]} ->
+          payload
+
+        other ->
+          assert System.monotonic_time(:millisecond) < deadline, inspect(other)
+          Process.sleep(10)
+          wait.(wait)
+      end
+    end
+
+    payload = wait.(wait)
+
+    assert payload == "null"
 
     refute payload =~ "running_turn"
     refute payload =~ ~s("breathing":true)

@@ -103,10 +103,16 @@ defmodule Tightbeam.ConditionFacts do
 
   @spec file(DB.server(), GenServer.server(), map()) :: map() | {:error, map()}
   def file(db, scheduler, input) do
-    case DB.transaction_then(db, &file_in_txn(&1, input), fn txn, result ->
-           Tightbeam.Wakes.row_commit_in_txn(txn, [])
-           recognize_after_commit(txn, result)
-         end) do
+    case DB.transaction_then(
+           db,
+           &file_in_txn(&1, input),
+           fn txn, result ->
+             Tightbeam.Wakes.row_commit_in_txn(txn, [])
+             recognize_after_commit(txn, result)
+           end,
+           fallback: fn result -> {result, []} end,
+           retry_deliveries: true
+         ) do
       {:ok, {result, deliveries}} ->
         complete_deliveries(db, scheduler, deliveries)
         notify_scheduler(scheduler, result)
@@ -379,7 +385,9 @@ defmodule Tightbeam.ConditionFacts do
              else
                {result, [], false}
              end
-           end
+           end,
+           fallback: fn {result, filed?} -> {result, [], filed?} end,
+           retry_deliveries: true
          ) do
       {:ok, {result, deliveries, filed?}} ->
         complete_deliveries(db, scheduler, deliveries)
