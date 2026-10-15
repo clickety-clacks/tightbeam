@@ -3,21 +3,6 @@ defmodule Tightbeam.DispatchTest do
 
   alias Tightbeam.{DB, Dispatch, Escalation, EventLog, Rules}
 
-  defmodule DenialHandoffCapture do
-    use GenServer
-
-    def start_link(owner), do: GenServer.start_link(__MODULE__, owner)
-
-    @impl true
-    def init(owner), do: {:ok, owner}
-
-    @impl true
-    def handle_cast({:denied, call, error}, owner) do
-      send(owner, {:denial_handoff, call, error})
-      {:noreply, owner}
-    end
-  end
-
   setup do
     :persistent_term.erase(Rules)
     name = :"db_#{System.unique_integer([:positive])}"
@@ -71,6 +56,7 @@ defmodule Tightbeam.DispatchTest do
 
   test "publication survives audit overload and precedes the response", %{db: db} do
     parent = self()
+    hub = start_hub(db)
 
     handler = fn _ ->
       :sys.suspend(db)
@@ -87,7 +73,7 @@ defmodule Tightbeam.DispatchTest do
       origin: "user:flynn",
       session_key: nil,
       params: %{},
-      firehose_hub: self()
+      firehose_hub: hub
     }
 
     task = Task.async(fn -> Dispatch.dispatch(db, %{"transcript" => handler}, call) end)
@@ -100,7 +86,9 @@ defmodule Tightbeam.DispatchTest do
     end
 
     assert {:ok, %{entries: []}} = Task.await(task)
-    assert_receive {:"$gen_cast", {:accepted, nil, ^call, %{entries: []}}}
+
+    assert_receive {:firehose_notice,
+                    %{"class" => "verb.accepted", "payload" => %{"verb" => "transcript"}}}
   end
 
   test "write then denial or crash retains the outcome audit", %{db: db} do
@@ -281,7 +269,7 @@ defmodule Tightbeam.DispatchTest do
   end
 
   test "body reads and body updates elide raised denial messages", %{db: db} do
-    hub = start_supervised!({DenialHandoffCapture, self()})
+    hub = start_hub(db)
     sentinel = "dispatch-body-secret-#{System.unique_integer([:positive])}"
 
     for {verb, params} <- [
@@ -299,11 +287,14 @@ defmodule Tightbeam.DispatchTest do
       assert {:error, %{code: "server_error", message: ^sentinel}} =
                Dispatch.dispatch(db, %{verb => fn _ -> raise sentinel end}, call)
 
-      assert_receive {:denial_handoff, handed_call, denial_error}
-      assert handed_call.verb == verb
-      assert denial_error == %{code: "server_error", bodyElided: true}
-      notices = Tightbeam.Firehose.Publisher.denied_notices(handed_call, denial_error)
-      refute inspect(notices) =~ sentinel
+      assert_receive {:firehose_notice,
+                      %{"class" => "verb.denied", "payload" => payload} = notice}
+
+      assert payload["verb"] == verb
+      assert payload["code"] == "server_error"
+      assert payload["bodyElided"] == true
+      refute inspect(notice) =~ sentinel
+      Tightbeam.Firehose.Hub.delivered(hub, self())
 
       assert [%{kind: "verb", verb: ^verb}] = EventLog.events_after(db, 0, 10) |> Enum.take(-1)
       {:ok, [[payload]]} = DB.query(db, "SELECT payload FROM events ORDER BY id DESC LIMIT 1")
@@ -496,6 +487,13 @@ defmodule Tightbeam.DispatchTest do
              }
            ] =
              EventLog.rail_denials(db, 0, 10)
+  end
+
+  defp start_hub(db) do
+    alias Tightbeam.Firehose.Hub
+    hub = start_supervised!({Hub, name: :dispatch_test_hub})
+    :ok = Hub.register(hub, self(), %{mode: :all, db: db, user_id: "flynn", is_admin: true})
+    hub
   end
 
   defp wait_for_audit(db, sql, expected, attempts \\ 100)
