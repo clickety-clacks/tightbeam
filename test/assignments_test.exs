@@ -6770,7 +6770,11 @@ defmodule Tightbeam.AssignmentsTest do
              Dispatch.dispatch(
                ctx.db,
                ctx.handlers,
-               Map.put(assign_call({:session, "holder"}, "committed"), :supervision_interval_ms, 1_000)
+               Map.put(
+                 assign_call({:session, "holder"}, "committed"),
+                 :supervision_interval_ms,
+                 1_000
+               )
              )
 
     assert message =~ "events"
