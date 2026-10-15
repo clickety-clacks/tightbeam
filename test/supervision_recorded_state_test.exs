@@ -39,7 +39,7 @@ defmodule Tightbeam.SupervisionRecordedStateTest do
     on_exit(fn -> File.rm_rf!(Path.dirname(path)) end)
     Tightbeam.SchemaShapeRuntimeFixture.seed_operator_predecessor!(path, payload)
     name = :"recorded_predecessor_#{System.unique_integer([:positive])}"
-    db = start_supervised!({DB, name: name, path: path, guard_inputs: [], payload_root: payload})
+    db = start_supervised!(Supervisor.child_spec({DB, name: name, path: path, guard_inputs: [], payload_root: payload}, id: name))
 
     assert {:ok, [["operator-decision-requests-v1"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
@@ -52,8 +52,7 @@ defmodule Tightbeam.SupervisionRecordedStateTest do
 
   test "terminal sweeps bound their work and resume after a database restart", %{
     db: db,
-    path: path,
-    name: name
+    db_opts: db_opts
   } do
     :ok = Schema.ensure_all(db)
     seed_session(db)
