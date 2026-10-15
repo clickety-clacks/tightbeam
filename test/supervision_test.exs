@@ -2921,9 +2921,13 @@ defmodule Tightbeam.SupervisionTest do
     assert :ok = Supervision.recover_liveness!(ctx.db, 60_000)
 
     assert {:ok, [["pending"]]} =
-             DB.query(ctx.db, "SELECT controllerState FROM supervision_liveness_sidecar WHERE wakeId=?1", [
-               controller.wake_id
-             ])
+             DB.query(
+               ctx.db,
+               "SELECT controllerState FROM supervision_liveness_sidecar WHERE wakeId=?1",
+               [
+                 controller.wake_id
+               ]
+             )
 
     assert {:ok, _} =
              DB.query(ctx.db, "UPDATE wakes SET state='canceled' WHERE wakeId=?1", [
@@ -2932,6 +2936,7 @@ defmodule Tightbeam.SupervisionTest do
 
     assert {:ok, [[_, "asg_1", "canceled"]]} =
              DB.query(ctx.db, Supervision.ended_controllers_sql())
+
     assert :ok = Supervision.recover_liveness!(ctx.db, 60_000)
     assert {:ok, []} = DB.query(ctx.db, Supervision.ended_controllers_sql())
   end

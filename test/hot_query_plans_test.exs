@@ -43,7 +43,12 @@ defmodule Tightbeam.HotQueryPlansTest do
   test "ended scheduled controllers are read from their recorded-state index", %{db: db} do
     plan = plan!(db, Supervision.ended_controllers_sql(), [])
     assert hd(plan) =~ "supervision_liveness_ended_controller"
-    assert Enum.any?(plan, &String.contains?(&1, "SEARCH w USING INDEX sqlite_autoindex_wakes_1 (wakeId=?)"))
+
+    assert Enum.any?(
+             plan,
+             &String.contains?(&1, "SEARCH w USING INDEX sqlite_autoindex_wakes_1 (wakeId=?)")
+           )
+
     refute Enum.any?(plan, &Regex.match?(~r/^SCAN w/, &1))
   end
 

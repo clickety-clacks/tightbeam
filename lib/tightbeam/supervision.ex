@@ -5056,6 +5056,7 @@ defmodule Tightbeam.Supervision do
         {:ok, metadata} ->
           group = idle_cleanup_digest("idle-cleanup-group-v1\0" <> metadata["group"])
           Txn.q(txn, "UPDATE wakes SET idleCleanupGroup=?2 WHERE wakeId=?1", [wake_id, group])
+
           record_idle_cleanup_delivery_in_txn(txn, wake_id, """
           EXISTS(SELECT 1 FROM turns WHERE wakeId=w.wakeId) OR
           EXISTS(SELECT 1 FROM notice_batch_members m
