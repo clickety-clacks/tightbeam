@@ -106,7 +106,7 @@ try do
 
   {_, listener, _, _} =
     Enum.find(
-      Supervisor.which_children(Tightbeam.Supervisor),
+      Supervisor.which_children(Tightbeam.RuntimeSupervisor),
       fn {id, _, _, _} -> match?({Bandit, _}, id) end
     )
 

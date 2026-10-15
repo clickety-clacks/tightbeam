@@ -17,8 +17,10 @@ defmodule Tightbeam.Gateway do
   Children appended to Tightbeam.Application's tree, in order:
   ConnRegistry → WakeScheduler → AdapterSupervisor (DynamicSupervisor) →
   AdapterCoordinator → LaneManager (with the runner built here) → Bandit
-  (Wire.Router; port + WS upgrade). All under the SAME rest_for_one root —
-  a DB restart still restarts everything that could hold stale state.
+  (Wire.Router; port + WS upgrade). Runtime children use one_for_one under
+  Tightbeam.RuntimeSupervisor, so a service failure preserves its siblings.
+  The rest_for_one application root still restarts runtime services after
+  a DB restart, discarding any state derived from the old database owner.
 
   The turn pipeline (runner passed to lanes; gateway.ts `runTurn` +
   fifo wiring, adapted to the Ledger):
@@ -526,7 +528,7 @@ defmodule Tightbeam.Gateway do
   end
 
   defp start_remote_credential_child(config, db, machine, previous_host, host) do
-    supervisor = Map.get(config, :credential_supervisor, Tightbeam.Supervisor)
+    supervisor = Map.get(config, :credential_supervisor, Tightbeam.RuntimeSupervisor)
     child = credential_child(config, db, machine, host)
 
     case Supervisor.start_child(supervisor, child) do

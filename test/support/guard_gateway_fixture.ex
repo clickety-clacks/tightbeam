@@ -1,5 +1,31 @@
 defmodule Tightbeam.GuardGatewayFixture do
   @moduledoc false
+  # Seed synthetic inventories only after asynchronous startup has settled.
+  def seed_catalog!(catalog, update) do
+    await_catalog_idle!(catalog, 2_000)
+
+    :sys.replace_state(catalog, fn state ->
+      updated = update.(state)
+
+      Enum.reduce(updated.entries, updated, fn {key, cache}, acc ->
+        if cache == state.entries[key],
+          do: acc,
+          else: update_in(acc.versions[key], &((&1 || 0) + 1))
+      end)
+    end)
+  end
+
+  defp await_catalog_idle!(_catalog, 0), do: raise("catalog startup did not settle")
+
+  defp await_catalog_idle!(catalog, attempts) do
+    if :sys.get_state(catalog).background == nil do
+      :ok
+    else
+      Process.sleep(5)
+      await_catalog_idle!(catalog, attempts - 1)
+    end
+  end
+
   def run!(proof) do
     [payload, base] = System.argv()
     true = Path.expand(Application.app_dir(:tightbeam)) == Path.expand(payload)

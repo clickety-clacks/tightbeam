@@ -81,6 +81,34 @@ defmodule Tightbeam.Wire.SocketTest do
     %{db: db, registry: registry, deps: deps}
   end
 
+  test "registry restart closes an authenticated socket", ctx do
+    {:paired, device} =
+      Devices.pair(ctx.db, %{
+        device_id: "restart",
+        claimed_name: "Client",
+        platform: nil,
+        model: nil
+      })
+
+    {:ok, initial} = Socket.init(ctx.deps)
+
+    {:push, _frames, state} =
+      Socket.handle_in(
+        {JSON.encode!(%{
+           "type" => "auth",
+           "token" => device.token,
+           "subscriptions" => ["work_state"]
+         }), opcode: :text},
+        initial
+      )
+
+    old = Process.whereis(ctx.registry)
+    Process.exit(old, :kill)
+    ref = state.registry_monitor
+    assert_receive {:DOWN, ^ref, :process, ^old, :killed} = down
+    assert {:stop, :normal, 1012, ^state} = Socket.handle_info(down, state)
+  end
+
   test "chat ingress uses real Gateway handlers for ack, dedupe, conflict, and validation", ctx do
     start_supervised!(%{
       id: :socket_e2e_conn_registry,
@@ -422,6 +450,170 @@ defmodule Tightbeam.Wire.SocketTest do
     {:push, [{:text, sync}], live} = Socket.handle_info(:finish_replay, replaying)
     assert JSON.decode!(sync) == %{"type" => "sync_complete"}
     assert live.phase == :live
+  end
+
+  test "replay shares one message budget across hundreds of sessions and resumes", ctx do
+    {:paired, device} =
+      Devices.pair(ctx.db, %{
+        device_id: "paged",
+        claimed_name: "Reader",
+        platform: nil,
+        model: nil
+      })
+
+    for n <- 1..260 do
+      key = "paged-#{n}"
+
+      Org.create(ctx.db, %{
+        session_key: key,
+        display_name: key,
+        kind: "custom",
+        owner_user_id: device.user_id,
+        origin: "user:#{device.user_id}",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+
+      for m <- 1..3,
+          do:
+            Projection.append(ctx.db, %{session_key: key, role: "assistant", content: "#{n}-#{m}"})
+    end
+
+    {:ok, state} = Socket.init(ctx.deps)
+    auth = %{"type" => "auth", "token" => device.token, "deviceId" => device.device_id}
+    {:push, frames, replaying} = Socket.handle_in({JSON.encode!(auth), opcode: :text}, state)
+
+    [result, _snapshot | messages] =
+      Enum.map(frames, fn {:text, frame} -> JSON.decode!(frame) end)
+
+    assert result["replayTruncated"]
+    assert length(messages) == 500
+    cursors = Map.new(messages, &{&1["sessionKey"], &1["id"]})
+    {:push, _, live} = Socket.handle_info(:finish_replay, replaying)
+
+    {:push, next, _} =
+      Socket.handle_in(
+        {JSON.encode!(Map.put(auth, "replayCursorsBySessionKey", cursors)), opcode: :text},
+        live
+      )
+
+    [result, _snapshot | remainder] = Enum.map(next, fn {:text, frame} -> JSON.decode!(frame) end)
+    refute result["replayTruncated"]
+    assert length(remainder) == 280
+    assert MapSet.size(MapSet.new(messages ++ remainder, & &1["id"])) == 780
+  end
+
+  test "replay byte budget leaves the next message available through its cursor", ctx do
+    {:paired, device} =
+      Devices.pair(ctx.db, %{
+        device_id: "byte-page",
+        claimed_name: "Reader",
+        platform: nil,
+        model: nil
+      })
+
+    key = Org.personal_session_key(device.user_id)
+
+    Org.create(ctx.db, %{
+      session_key: key,
+      display_name: "Main",
+      kind: "main",
+      is_built_in: true,
+      owner_user_id: device.user_id,
+      origin: "user:#{device.user_id}",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("fable")
+    })
+
+    for _ <- 1..80,
+        do:
+          Projection.append(ctx.db, %{
+            session_key: key,
+            role: "assistant",
+            content: String.duplicate("x", 65_536)
+          })
+
+    {:ok, state} = Socket.init(ctx.deps)
+    auth = %{"type" => "auth", "token" => device.token, "deviceId" => device.device_id}
+    {:push, frames, replaying} = Socket.handle_in({JSON.encode!(auth), opcode: :text}, state)
+    [_, _ | messages] = frames
+
+    assert Enum.sum(Enum.map(messages, fn {:text, frame} -> byte_size(frame) end)) <=
+             4 * 1024 * 1024
+
+    assert length(messages) < 80
+    {:text, last} = List.last(messages)
+    cursor = JSON.decode!(last)["id"]
+    held = %{"type" => "message", "id" => "live-after-backlog"}
+    {:ok, replaying} = Socket.handle_info({:push_message, key, 81, held}, replaying)
+    {:push, drained, live} = Socket.handle_info(:finish_replay, replaying)
+    refute Enum.any?(drained, fn {:text, frame} -> JSON.decode!(frame) == held end)
+    assert {:ok, ^live} = Socket.handle_info({:push_message, key, 81, held}, live)
+    assert {:push, _, _} = Socket.handle_info({:push_message, "caught-up", 1, held}, live)
+
+    {:push, next, caught_up} =
+      Socket.handle_in(
+        {JSON.encode!(Map.put(auth, "replayCursorsBySessionKey", %{key => cursor})),
+         opcode: :text},
+        live
+      )
+
+    assert length(messages) + length(next) - 2 == 80
+    assert MapSet.size(caught_up.replay_pending) == 0
+  end
+
+  test "one oversized replay row advances the cursor", ctx do
+    {:paired, device} =
+      Devices.pair(ctx.db, %{
+        device_id: "oversized-page",
+        claimed_name: "Reader",
+        platform: nil,
+        model: nil
+      })
+
+    key = Org.personal_session_key(device.user_id)
+
+    Org.create(ctx.db, %{
+      session_key: key,
+      display_name: "Main",
+      kind: "main",
+      is_built_in: true,
+      owner_user_id: device.user_id,
+      origin: "user:#{device.user_id}",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("fable")
+    })
+
+    {:appended, first} =
+      Projection.append(ctx.db, %{
+        session_key: key,
+        role: "assistant",
+        content: String.duplicate("x", 4 * 1024 * 1024)
+      })
+
+    Projection.append(ctx.db, %{session_key: key, role: "assistant", content: "next"})
+    {:ok, state} = Socket.init(ctx.deps)
+    auth = %{"type" => "auth", "token" => device.token, "deviceId" => device.device_id}
+    {:push, frames, replaying} = Socket.handle_in({JSON.encode!(auth), opcode: :text}, state)
+    [result, _, message] = Enum.map(frames, fn {:text, frame} -> JSON.decode!(frame) end)
+    assert result["replayTruncated"]
+    assert message["id"] == first.id
+    {:push, _, live} = Socket.handle_info(:finish_replay, replaying)
+    auth = Map.put(auth, "replayCursorsBySessionKey", %{key => first.id})
+    {:push, frames, next_state} = Socket.handle_in({JSON.encode!(auth), opcode: :text}, live)
+    [result, _, message] = Enum.map(frames, fn {:text, frame} -> JSON.decode!(frame) end)
+    refute result["replayTruncated"]
+    assert message["content"] == "next"
+    assert MapSet.size(next_state.replay_pending) == 0
   end
 
   test "concurrent first auths converge on one personal main stream", ctx do
