@@ -323,7 +323,11 @@ defmodule Tightbeam.SentinelsTest do
                    }
                  })
 
-        assert Enum.map(shipped_setup.pending, & &1.state) == ["setting-missing", "setting-missing", "disabled"]
+        assert Enum.map(shipped_setup.pending, & &1.state) == [
+                 "setting-missing",
+                 "setting-missing",
+                 "disabled"
+               ]
 
         configured =
           handlers["kungfu-setup"].(%{
