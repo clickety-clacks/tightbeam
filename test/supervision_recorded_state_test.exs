@@ -42,13 +42,22 @@ defmodule Tightbeam.SupervisionRecordedStateTest do
     Tightbeam.SchemaShapeRuntimeFixture.seed_operator_predecessor!(path, payload)
     name = :"recorded_predecessor_#{System.unique_integer([:positive])}"
     manifest = File.read!(Path.join(payload, "build-manifest.json")) |> JSON.decode!()
-    transition = JSON.encode!(%{"base" => Path.dirname(path), "source" => "unmarked",
-      "target" => manifest["buildIdentity"], "expectedSchema" => "operator-decision-requests-v1"})
+
+    transition =
+      JSON.encode!(%{
+        "base" => Path.dirname(path),
+        "source" => "unmarked",
+        "target" => manifest["buildIdentity"],
+        "expectedSchema" => "operator-decision-requests-v1"
+      })
 
     db =
       start_supervised!(
         Supervisor.child_spec(
-          {DB, name: name, path: path, guard_inputs: [transition: transition], payload_root: payload}, id: name)
+          {DB,
+           name: name, path: path, guard_inputs: [transition: transition], payload_root: payload},
+          id: name
+        )
       )
 
     assert {:ok, [["operator-decision-requests-v1"]]} =
@@ -117,16 +126,25 @@ defmodule Tightbeam.SupervisionRecordedStateTest do
   test "one inconsistent terminal is flagged without blocking the rest of a batch", %{db: db} do
     :ok = Schema.ensure_all(db)
     seed_session(db)
-    :ok = DB.execute(db, """
-    INSERT INTO patrol_failure_boundary(id,firstTurnSeq,activatedAt,principal)
-      VALUES(0,1,1,'process:tightbeam');
-    INSERT INTO turns(sessionKey,messageId,origin,prompt,status,createdAt,endedAt)
-      VALUES('s','inconsistent','test','prompt','queued',1,1),
-            ('s','valid','test','prompt','delivered',2,2);
-    """)
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO patrol_failure_boundary(id,firstTurnSeq,activatedAt,principal)
+        VALUES(0,1,1,'process:tightbeam');
+      INSERT INTO turns(sessionKey,messageId,origin,prompt,status,createdAt,endedAt)
+        VALUES('s','inconsistent','test','prompt','queued',1,1),
+              ('s','valid','test','prompt','delivered',2,2);
+      """)
+
     assert :ok = Supervision.sweep_unclassified_terminals(db)
     assert {:ok, [[2]]} = DB.query(db, "SELECT turnSeq FROM patrol_terminal_classifications")
-    assert {:ok, [["1"]]} = DB.query(db, "SELECT subject FROM lifecycle_events WHERE kind='supervision_terminal_refused'")
+
+    assert {:ok, [["1"]]} =
+             DB.query(
+               db,
+               "SELECT subject FROM lifecycle_events WHERE kind='supervision_terminal_refused'"
+             )
+
     assert {:ok, [[2]]} = DB.query(db, "SELECT lastTurnSeq FROM patrol_failure_boundary")
   end
 
