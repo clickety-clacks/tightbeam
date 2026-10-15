@@ -2822,14 +2822,21 @@ defmodule Tightbeam.SupervisionTest do
              Supervision.prod_state(ctx.db, "asg_1")
   end
 
-  test "scheduled controller records its wake ending when delivered", ctx do
+  test "delivery settles its controller before the wake ending is recorded", ctx do
     terminal_seq = terminal!(ctx.db, "holder")
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0, interval: 60_000)
     assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", terminal_seq)
     assert [controller] = Wakes.list_pending(ctx.db)
     assert :appended = admit_supervision_wake!(ctx.db, controller)
 
-    assert {:ok, [["fired"]]} =
+    assert {:ok, [["settled"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT controllerState FROM supervision_liveness_sidecar WHERE wakeId=?1",
+               [controller.wake_id]
+             )
+
+    assert {:ok, []} =
              DB.query(
                ctx.db,
                "SELECT endedWakeState FROM supervision_ended_controllers WHERE wakeId=?1",

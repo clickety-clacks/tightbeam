@@ -3369,11 +3369,9 @@ defmodule Tightbeam.Supervision do
   @doc false
   def ended_controllers_sql do
     """
-    SELECT e.wakeId, e.assignmentId, e.endedWakeState
-    FROM supervision_ended_controllers e INDEXED BY supervision_liveness_ended_controller
-    CROSS JOIN supervision_liveness_sidecar s ON s.wakeId=e.wakeId
-    WHERE s.controllerOrigin='scheduled' AND s.controllerState='pending'
-    ORDER BY e.assignmentId, e.wakeId
+    SELECT wakeId, assignmentId, endedWakeState
+    FROM supervision_ended_controllers INDEXED BY supervision_liveness_ended_controller
+    ORDER BY assignmentId, wakeId
     """
   end
 
