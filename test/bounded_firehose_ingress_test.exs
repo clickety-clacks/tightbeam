@@ -68,7 +68,8 @@ defmodule Tightbeam.BoundedFirehoseIngressTest do
     :ok = Hub.register(hub, self(), %{mode: :subscribed})
     :ok = Hub.subscribe(hub, self(), "one", %{})
     :ok = Hub.subscribe(hub, self(), "two", %{})
-    :erlang.trace_pattern({Tightbeam.StateVisibility, :visible?, 4}, true, [])
+    Code.ensure_loaded!(Tightbeam.StateVisibility)
+    assert :erlang.trace_pattern({Tightbeam.StateVisibility, :visible?, 4}, true, []) == 1
     :erlang.trace(hub, true, [:call])
 
     try do
