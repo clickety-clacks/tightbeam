@@ -928,6 +928,11 @@ defmodule Tightbeam.Productions.BubbleTest do
 
     missed = fail_turn!(ctx.db, "holder")
 
+    DB.query(ctx.db, "UPDATE turns SET endedAt=?1 WHERE seq=?2", [
+      System.system_time(:millisecond) - 61_000,
+      missed
+    ])
+
     log =
       ExUnit.CaptureLog.capture_log(fn ->
         send(sweeper, :tick)
@@ -940,13 +945,10 @@ defmodule Tightbeam.Productions.BubbleTest do
     assert {:ok, [[cursor]]} =
              DB.query(ctx.db, "SELECT seq FROM production_cursors WHERE name='bubble'")
 
-    assert cursor >= missed or
-             match?(
-               {:ok, [[^missed]]},
-               DB.query(ctx.db, "SELECT seq FROM production_cursors WHERE name=?1", [
-                 "bubble:#{missed}"
-               ])
-             )
+    assert cursor >= missed or MapSet.member?(:sys.get_state(sweeper).recognized, missed)
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "SELECT name FROM production_cursors WHERE name LIKE 'bubble:%'")
 
     before_restart = Tightbeam.SchedulerMisses.count()
     stop_supervised!(Tightbeam.Productions.BubbleSweeper)
@@ -958,6 +960,38 @@ defmodule Tightbeam.Productions.BubbleTest do
 
     :sys.get_state(replacement)
     assert Tightbeam.SchedulerMisses.count() == before_restart
+  end
+
+  test "bubble misses skip boot and recent terminals and count a failed turn once", ctx do
+    old = fail_turn!(ctx.db, "holder")
+
+    DB.query(ctx.db, "UPDATE turns SET endedAt=?1 WHERE seq=?2", [
+      System.system_time(:millisecond) - 61_000,
+      old
+    ])
+
+    proxy = start_supervised!({RecognitionRefusal, ctx.db})
+
+    boot_log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        sweeper =
+          start_supervised!(
+            {Tightbeam.Productions.BubbleSweeper, db: proxy, name: :miss_bubble_sweeper}
+          )
+
+        :sys.get_state(sweeper)
+      end)
+
+    refute boot_log =~ "loop=bubble"
+    recent = fail_turn!(ctx.db, "holder")
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        for _ <- 1..3, do: Tightbeam.Productions.BubbleSweeper.sweep_now(:miss_bubble_sweeper)
+      end)
+
+    assert length(Regex.scan(~r/loop=bubble record=#{old}\b/, log)) == 1
+    refute log =~ "loop=bubble record=#{recent}"
   end
 
   # Review B1/B3b: the sweeper's cursor makes recognition sweep-reachable —

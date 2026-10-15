@@ -9,6 +9,7 @@ defmodule Tightbeam.LaneManager do
 
   defstruct [
     :db,
+    :name,
     :lane_sup,
     :task_sup,
     :runner,
@@ -61,6 +62,7 @@ defmodule Tightbeam.LaneManager do
   @impl true
   def init(opts) do
     state = %__MODULE__{
+      name: Keyword.get(opts, :name, __MODULE__),
       db: Keyword.get(opts, :db, Tightbeam.DB),
       lane_sup: Keyword.fetch!(opts, :lane_sup),
       task_sup: Keyword.fetch!(opts, :task_sup),
@@ -137,8 +139,9 @@ defmodule Tightbeam.LaneManager do
     {:noreply, do_reconcile(state, true)}
   end
 
-  def handle_info({ref, _result}, state) when is_map_key(state.reaping, ref) do
+  def handle_info({ref, result}, state) when is_map_key(state.reaping, ref) do
     Process.demonitor(ref, [:flush])
+    if match?({:ok, [_ | _]}, result), do: republish_terminals(state, false)
     {:noreply, %{state | reaping: Map.delete(state.reaping, ref)}}
   end
 
@@ -158,15 +161,7 @@ defmodule Tightbeam.LaneManager do
   end
 
   defp reconcile_pass(state, detect) do
-    # Re-publish terminals whose publication may have been lost to a crash —
-    # to the WIRE, not just the ledger: without frames, a client whose turn
-    # died with the gateway keeps a stuck typing indicator forever.
-    for %{seq: seq} = row <- Ledger.unpublished_terminals(state.db) do
-      if detect, do: Tightbeam.SchedulerMisses.record(:lane_terminal, seq)
-      state.terminal_publisher.(row)
-      Ledger.mark_published(state.db, seq)
-      state.on_terminal.(row.session_key, seq)
-    end
+    republish_terminals(state, detect)
 
     Enum.reduce(Ledger.pending_sessions(state.db), state, fn session_key, acc ->
       active? =
@@ -186,6 +181,20 @@ defmodule Tightbeam.LaneManager do
     end)
   end
 
+  defp republish_terminals(state, detect) do
+    DB.background_pass(fn ->
+      # Re-publish terminals whose publication may have been lost to a crash —
+      # to the WIRE, not just the ledger: without frames, a client whose turn
+      # died with the gateway keeps a stuck typing indicator forever.
+      for %{seq: seq} = row <- Ledger.unpublished_terminals(state.db) do
+        if detect, do: Tightbeam.SchedulerMisses.record(:lane_terminal, seq)
+        state.terminal_publisher.(row)
+        Ledger.mark_published(state.db, seq)
+        state.on_terminal.(row.session_key, seq)
+      end
+    end)
+  end
+
   defp repair_lane(state, session_key, detect \\ false) do
     ensure(state, session_key)
 
@@ -194,48 +203,17 @@ defmodule Tightbeam.LaneManager do
     else
       task =
         Task.Supervisor.async_nolink(state.task_sup, fn ->
-          outcome = SessionLane.reap_abandoned(session_key)
-
-          if detect and outcome != :active and not parked?(state.db, session_key),
-            do: Tightbeam.SchedulerMisses.record(:lane, session_key)
-
-          SessionLane.nudge(session_key)
-
-          DB.background_pass(fn ->
-            for row <- Ledger.unpublished_terminals(state.db), row.session_key == session_key do
-              state.terminal_publisher.(row)
-              Ledger.mark_published(state.db, row.seq)
-              state.on_terminal.(session_key, row.seq)
-            end
-          end)
+          SessionLane.repair(session_key, detect)
         end)
 
       %{state | reaping: Map.put(state.reaping, task.ref, session_key)}
     end
   end
 
-  defp parked?(db, session_key) do
-    case DB.query(db, "SELECT harness,host FROM sessions WHERE sessionKey=?1", [session_key]) do
-      {:ok, [[harness, host]]} ->
-        Tightbeam.HarnessProcess.parked?(
-          db,
-          {Tightbeam.Harness.parse!(harness).id(), "shared", host}
-        )
-
-      {:ok, []} ->
-        false
-
-      {:error, error} ->
-        raise error
-    end
-  end
-
   defp ensure(state, session_key) do
     case Registry.lookup(Tightbeam.LaneRegistry, session_key) do
       [{pid, _}] ->
-        if Process.alive?(pid),
-          do: GenServer.cast(pid, {:lane_manager, self()}),
-          else: start_lane(state, session_key)
+        if not Process.alive?(pid), do: start_lane(state, session_key)
 
       [] ->
         start_lane(state, session_key)
@@ -249,7 +227,7 @@ defmodule Tightbeam.LaneManager do
   defp lane_opts(state, session_key, extra \\ []) do
     [
       session_key: session_key,
-      lane_manager: self(),
+      lane_manager: state.name,
       db: state.db,
       task_sup: state.task_sup,
       runner: state.runner,

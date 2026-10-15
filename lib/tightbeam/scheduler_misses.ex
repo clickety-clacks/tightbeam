@@ -10,23 +10,10 @@ defmodule Tightbeam.SchedulerMisses do
 
   def count, do: :counters.get(counter(), 1)
 
-  defp counter do
-    case :persistent_term.get(__MODULE__, nil) do
-      nil ->
-        :global.trans({__MODULE__, self()}, fn ->
-          case :persistent_term.get(__MODULE__, nil) do
-            nil ->
-              counter = :counters.new(1, [:write_concurrency])
-              :persistent_term.put(__MODULE__, counter)
-              counter
-
-            counter ->
-              counter
-          end
-        end)
-
-      counter ->
-        counter
-    end
+  def init do
+    :persistent_term.put(__MODULE__, :counters.new(1, [:write_concurrency]))
+    :ok
   end
+
+  defp counter, do: :persistent_term.get(__MODULE__)
 end

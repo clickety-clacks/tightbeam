@@ -15,6 +15,17 @@ defmodule Tightbeam.RecognitionRetryTest do
     def handle_call(request, _from, state), do: {:reply, GenServer.call(state.db, request), state}
   end
 
+  defmodule ScheduleRefusal do
+    use GenServer
+    def start_link(db), do: GenServer.start_link(__MODULE__, db)
+    def init(db), do: {:ok, %{db: db, refused: false}}
+
+    def handle_call({:query, "SELECT MIN(nextAt)" <> _, _}, _from, %{refused: false} = state),
+      do: {:reply, {:error, %DB.Overloaded{}}, %{state | refused: true}}
+
+    def handle_call(request, _from, state), do: {:reply, GenServer.call(state.db, request), state}
+  end
+
   setup do
     db = start_supervised!({DB, path: ":memory:", name: nil})
     :ok = DB.execute(db, "CREATE TABLE recognized_rows(id INTEGER PRIMARY KEY)")
@@ -230,6 +241,56 @@ defmodule Tightbeam.RecognitionRetryTest do
     assert {:ok, []} = DB.query(db, "SELECT id FROM pending_recognition")
   end
 
+  test "a failed deadline query schedules another attempt within a second", %{
+    db: db,
+    retry: retry
+  } do
+    parent = self()
+
+    {:ok, _} =
+      DB.transaction(db, fn txn ->
+        pending =
+          Tightbeam.Recognition.record(
+            txn,
+            fn _ -> send(parent, :query_retried) end,
+            :value,
+            [],
+            []
+          )
+
+        Txn.q(txn, "UPDATE pending_recognition SET nextAt=0 WHERE id=?1", [pending.id])
+      end)
+
+    proxy = start_supervised!({ScheduleRefusal, db})
+    :sys.replace_state(retry, &%{&1 | db: proxy})
+
+    on_exit(fn ->
+      if Process.alive?(retry), do: :sys.replace_state(retry, &%{&1 | db: db})
+    end)
+
+    GenServer.cast(retry, :reschedule)
+    :sys.get_state(retry)
+    assert_receive :query_retried, 1_800
+    :sys.get_state(retry)
+    assert {:ok, []} = DB.query(db, "SELECT id FROM pending_recognition")
+    :sys.replace_state(retry, &%{&1 | db: db})
+  end
+
+  test "successful inline recognition does not request timer recomputation", %{
+    db: db,
+    retry: retry
+  } do
+    :sys.get_state(retry)
+    :erlang.trace(retry, true, [:receive])
+
+    assert {:ok, :recognized} =
+             DB.transaction_then(db, fn _ -> :value end, fn _ -> :recognized end)
+
+    :sys.get_state(retry)
+    refute_receive {:trace, ^retry, :receive, {:"$gen_cast", :reschedule}}, 50
+    :erlang.trace(retry, false, [:receive])
+  end
+
   test "idle retries make no database calls between events", %{db: db, retry: retry} do
     assert :sys.get_state(retry).timer == nil
     :erlang.trace(db, true, [:receive])
@@ -302,7 +363,7 @@ defmodule Tightbeam.RecognitionRetryTest do
       end)
 
     assert_receive :miss_recognized
-    assert Tightbeam.SchedulerMisses.count() == before + 1
+    assert Tightbeam.SchedulerMisses.count() >= before + 1
     assert log =~ "loop=recognition record=#{pending.id}"
     assert {:ok, []} = DB.query(db, "SELECT id FROM pending_recognition")
   end

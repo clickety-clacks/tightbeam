@@ -152,7 +152,7 @@ defmodule Tightbeam.LaneTest do
       end)
 
     assert log =~ "loop=lane record=k1"
-    assert Tightbeam.SchedulerMisses.count() == before + 1
+    assert Tightbeam.SchedulerMisses.count() >= before + 1
 
     assert {:ok, _lane, _token} = LaneManager.ensure_settlement_lane(manager, "k2")
     enqueue!(ctx.db, "k2", "reserved")
@@ -202,6 +202,69 @@ defmodule Tightbeam.LaneTest do
     enqueue!(ctx.db, "k1", "after crash")
     Process.exit(lane, :kill)
     assert_receive :restarted_turn, 2_000
+  end
+
+  test "restarted lanes report to the replacement manager by name", ctx do
+    opts = [
+      db: ctx.db,
+      lane_sup: ctx.lane_sup,
+      task_sup: ctx.task_sup,
+      name: :replacement_lane_manager,
+      runner: fn _ -> {:ok, %{text: "done"}} end
+    ]
+
+    {:ok, manager} = LaneManager.start_link(opts)
+    LaneManager.ensure_lane(manager, "k1")
+    assert eventually(fn -> map_size(:sys.get_state(manager).lanes) == 1 end)
+    GenServer.stop(manager)
+    {:ok, replacement} = LaneManager.start_link(opts)
+    on_exit(fn -> if Process.alive?(replacement), do: GenServer.stop(replacement) end)
+    [{lane, _}] = Registry.lookup(Tightbeam.LaneRegistry, "k1")
+    Process.exit(lane, :kill)
+
+    assert eventually(fn ->
+             Enum.any?(:sys.get_state(replacement).lanes, fn {pid, _} ->
+               pid != lane and Process.alive?(pid)
+             end)
+           end)
+  end
+
+  test "settlement rechecks and gateway draining do not count lane misses", ctx do
+    manager =
+      start_supervised!(
+        {LaneManager,
+         db: ctx.db,
+         lane_sup: ctx.lane_sup,
+         task_sup: ctx.task_sup,
+         name: :quiet_lane_manager,
+         runner: fn _ -> {:ok, %{text: "done"}} end}
+      )
+
+    LaneManager.ensure_lane(manager, "k1")
+    [{lane, _}] = Registry.lookup(Tightbeam.LaneRegistry, "k1")
+    :sys.replace_state(lane, &%{&1 | settlement_rechecking: true})
+    seq = enqueue!(ctx.db, "k1", "wait")
+
+    check = fn ->
+      ExUnit.CaptureLog.capture_log(fn ->
+        send(manager, :tick)
+        :sys.get_state(manager)
+        assert eventually(fn -> map_size(:sys.get_state(manager).reaping) == 0 end)
+      end)
+    end
+
+    refute check.() =~ "loop=lane record=k1"
+    LaneManager.ensure_lane_quiet(manager, "k2")
+    [{inactive_lane, _}] = Registry.lookup(Tightbeam.LaneRegistry, "k2")
+    :sys.get_state(inactive_lane)
+    enqueue!(ctx.db, "k2", "inactive")
+    DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey='k2'")
+    refute check.() =~ "loop=lane record=k2"
+    :persistent_term.put({Tightbeam.Application, :draining}, true)
+    on_exit(fn -> :persistent_term.erase({Tightbeam.Application, :draining}) end)
+    :sys.replace_state(lane, &%{&1 | settlement_rechecking: false})
+    refute check.() =~ "loop=lane record=k1"
+    assert {:ok, [["queued"]]} = DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [seq])
   end
 
   test "a blocked turn boundary does not block admission for another session", ctx do

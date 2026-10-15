@@ -89,6 +89,14 @@ defmodule Tightbeam.SessionLane do
     end
   end
 
+  @doc false
+  def repair(session_key, detect) do
+    case Registry.lookup(Tightbeam.LaneRegistry, session_key) do
+      [{pid, _}] -> GenServer.call(pid, {:repair, detect}, :infinity)
+      [] -> :no_lane
+    end
+  end
+
   @doc "Clear one stranded running turn without invoking its provider."
   @spec clear_stranded(String.t(), integer(), String.t(), String.t(), String.t()) ::
           {:ok, map()} | {:error, map()} | :no_lane
@@ -356,6 +364,18 @@ defmodule Tightbeam.SessionLane do
     end
   end
 
+  def handle_call({:repair, detect}, from, state) do
+    {:reply, outcome, repaired} = handle_call(:reap_abandoned, from, state)
+
+    recovered? = match?({:ok, [_ | _]}, outcome)
+    claimed? = is_nil(state.task_ref) and not is_nil(repaired.task_ref)
+
+    if detect and (recovered? or claimed?),
+      do: Tightbeam.SchedulerMisses.record(:lane, state.session_key)
+
+    {:reply, outcome, repaired}
+  end
+
   def handle_call(:reap_abandoned, _from, %{reservation_token: token} = state)
       when not is_nil(token),
       do: {:reply, :active, state}
@@ -521,12 +541,6 @@ defmodule Tightbeam.SessionLane do
   end
 
   @impl true
-  def handle_cast({:lane_manager, manager}, state) do
-    state = %{state | lane_manager: manager}
-    report_state(state, if(state.task_ref, do: state.current_seq))
-    {:noreply, state}
-  end
-
   def handle_cast({:release_recovered, seq}, %{current_seq: seq, task_ref: ref} = state)
       when not is_nil(ref) do
     {:noreply, release_recovered_task(state)}

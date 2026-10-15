@@ -2,8 +2,8 @@ defmodule Tightbeam.Productions.BubbleSweeper do
   @moduledoc """
   Recognizes committed terminals from turn-end signals. A slow consistency
   check repairs missed signals using the durable terminal-prefix cursor.
-  Acknowledgements ahead of that cursor prevent repeated recognition when
-  turns finish out of order, including across a restart.
+  An in-memory set prevents repeated recognition of out-of-order terminals
+  until restart. Recognition is idempotent across restarts.
   """
 
   use GenServer
@@ -41,7 +41,11 @@ defmodule Tightbeam.Productions.BubbleSweeper do
   def init(opts) do
     state = %{
       db: Keyword.get(opts, :db, Tightbeam.DB),
-      interval: Keyword.get(opts, :interval, 180_000)
+      interval: Keyword.get(opts, :interval, 180_000),
+      recognized: MapSet.new(),
+      missed: MapSet.new(),
+      failures: %{},
+      first_pass: true
     }
 
     # Boot IS a sweep: whatever terminalized while no sweeper was alive —
@@ -53,132 +57,128 @@ defmodule Tightbeam.Productions.BubbleSweeper do
 
   @impl true
   def handle_cast({:recognize, seq}, state) do
-    DB.background_pass(fn ->
-      if seq > read_cursor(state.db) and not acknowledged?(state.db, seq) do
-        if recognize_one(state.db, seq) == :ok do
-          acknowledge(state.db, seq)
-          advance_cursor(state.db)
-        end
-      end
-    end)
+    state =
+      DB.background_pass(
+        fn ->
+          if seq > read_cursor(state.db) and not MapSet.member?(state.recognized, seq) and
+               recognize_one(state.db, seq) == :ok do
+            advance_cursor(%{state | recognized: MapSet.put(state.recognized, seq)})
+          else
+            state
+          end
+        end,
+        state
+      )
 
     {:noreply, state}
   end
 
   @impl true
-  def handle_call(:sweep, _from, state), do: {:reply, sweep(state.db), state}
+  def handle_call(:sweep, _from, state) do
+    {count, state} = sweep(state)
+    {:reply, count, state}
+  end
 
   @impl true
   def handle_info(:tick, state) do
-    sweep(state.db)
+    {_count, state} = sweep(state)
     Process.send_after(self(), :tick, state.interval)
     {:noreply, state}
   end
 
-  # Keep out-of-order acknowledgements until the terminal prefix reaches them.
-  defp sweep(db), do: DB.background_pass(fn -> sweep_pass(db) end, 0)
+  defp sweep(state), do: DB.background_pass(fn -> sweep_pass(state) end, {0, state})
 
-  defp sweep_pass(db) do
-    cursor = read_cursor(db)
+  defp sweep_pass(state) do
+    cursor = read_cursor(state.db)
 
     {:ok, rows} =
       DB.query(
-        db,
+        state.db,
         """
-        SELECT seq, endedAt IS NOT NULL FROM turns AS t
+        SELECT seq, endedAt FROM turns
         WHERE seq > ?1 AND endedAt IS NOT NULL
-          AND NOT EXISTS (
-            SELECT 1 FROM production_cursors WHERE name = 'bubble:' || t.seq
-          )
+          AND seq NOT IN (SELECT value FROM json_each(?3))
         ORDER BY seq LIMIT ?2
         """,
-        [cursor, @batch]
+        [cursor, @batch, JSON.encode!(MapSet.to_list(state.recognized))]
       )
 
-    recognized =
-      rows
-      |> Enum.filter(fn [_seq, ended] -> ended == 1 end)
-      |> Enum.reduce(0, fn [seq, _], count ->
-        if acknowledged?(db, seq) do
-          count
-        else
-          Tightbeam.SchedulerMisses.record(:bubble, seq)
+    cutoff = System.system_time(:millisecond) - 60_000
 
-          case recognize_one(db, seq) do
-            :ok ->
-              Process.delete({__MODULE__, seq})
-              acknowledge(db, seq)
-              count + 1
-
-            {:error, %DB.Overloaded{}} ->
-              count
-
-            _ ->
-              failures = Process.get({__MODULE__, seq}, 0) + 1
-
-              if failures >= 5 do
-                Logger.error("bubble recognition skipping turn #{seq} after #{failures} failures")
-                Process.delete({__MODULE__, seq})
-                acknowledge(db, seq)
-              else
-                Process.put({__MODULE__, seq}, failures)
-              end
-
-              count
+    {count, state} =
+      Enum.reduce(rows, {0, state}, fn [seq, ended_at], {count, state} ->
+        state =
+          if not state.first_pass and ended_at < cutoff and not MapSet.member?(state.missed, seq) do
+            Tightbeam.SchedulerMisses.record(:bubble, seq)
+            %{state | missed: MapSet.put(state.missed, seq)}
+          else
+            state
           end
+
+        case recognize_one(state.db, seq) do
+          :ok ->
+            {count + 1,
+             %{
+               state
+               | recognized: MapSet.put(state.recognized, seq),
+                 failures: Map.delete(state.failures, seq)
+             }}
+
+          {:error, %DB.Overloaded{}} ->
+            {count, state}
+
+          _ ->
+            failures = Map.get(state.failures, seq, 0) + 1
+
+            if failures >= 5 do
+              Logger.error("bubble recognition skipping turn #{seq} after #{failures} failures")
+
+              {count,
+               %{
+                 state
+                 | recognized: MapSet.put(state.recognized, seq),
+                   failures: Map.delete(state.failures, seq)
+               }}
+            else
+              {count, %{state | failures: Map.put(state.failures, seq, failures)}}
+            end
         end
       end)
 
-    advance_cursor(db)
-    recognized
+    {count, advance_cursor(%{state | first_pass: false})}
   end
 
-  defp acknowledged?(db, seq) do
-    {:ok, rows} =
-      DB.query(db, "SELECT seq FROM production_cursors WHERE name=?1", ["bubble:#{seq}"])
-
-    rows != []
-  end
-
-  defp acknowledge(db, seq) do
-    {:ok, _} =
-      DB.query(
-        db,
-        "INSERT INTO production_cursors(name,seq) VALUES(?1,?2) ON CONFLICT(name) DO NOTHING",
-        ["bubble:#{seq}", seq]
-      )
-  end
-
-  defp advance_cursor(db) do
-    cursor = read_cursor(db)
+  defp advance_cursor(state) do
+    cursor = read_cursor(state.db)
 
     {:ok, rows} =
       DB.query(
-        db,
-        "SELECT seq, endedAt IS NOT NULL, EXISTS(SELECT 1 FROM production_cursors WHERE name='bubble:' || t.seq) FROM turns AS t WHERE seq>?1 ORDER BY seq LIMIT ?2",
+        state.db,
+        "SELECT seq, endedAt IS NOT NULL FROM turns WHERE seq>?1 ORDER BY seq LIMIT ?2",
         [cursor, @batch]
       )
 
     prefix =
-      Enum.take_while(rows, fn [_seq, ended, acknowledged] -> ended == 1 and acknowledged == 1 end)
+      Enum.take_while(rows, fn [seq, ended] ->
+        ended == 1 and MapSet.member?(state.recognized, seq)
+      end)
 
-    if prefix != [] do
-      last = prefix |> List.last() |> hd()
+    last = if prefix == [], do: cursor, else: prefix |> List.last() |> hd()
 
+    if last > cursor do
       {:ok, _} =
         DB.query(
-          db,
+          state.db,
           "INSERT INTO production_cursors(name,seq) VALUES('bubble',?1) ON CONFLICT(name) DO UPDATE SET seq=excluded.seq",
           [last]
         )
-
-      clear_acknowledgements(db, last)
     end
-  end
 
-  defp clear_acknowledgements(db, last) do
-    {:ok, _} =
-      DB.query(db, "DELETE FROM production_cursors WHERE name LIKE 'bubble:%' AND seq<=?1", [last])
+    %{
+      state
+      | recognized: MapSet.reject(state.recognized, &(&1 <= last)),
+        missed: MapSet.reject(state.missed, &(&1 <= last))
+    }
   end
 
   defp read_cursor(db) do

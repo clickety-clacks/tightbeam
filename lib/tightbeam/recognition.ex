@@ -98,14 +98,13 @@ defmodule Tightbeam.Recognition do
   end
 
   def inline(db, pending, callback, opts, deadline) do
-    if pid = worker(db), do: GenServer.cast(pid, :reschedule)
-
     case invoke(db, pending, callback, true, deadline) do
       {:ok, result} ->
         if is_function(callback, 1), do: finish(db, pending.id)
         {:ok, result}
 
       {:error, _} ->
+        if pid = worker(db), do: GenServer.cast(pid, :reschedule)
         Logger.error("post-commit recognition failed; returning committed result")
         # No failure bookkeeping is needed here: the primary commit already
         # contains the retry row, including a bounded first retry time.
@@ -251,6 +250,7 @@ defmodule Tightbeam.Recognition do
         %{state | timer: timer, due_at: due_at}
 
       {:error, _} ->
+        Process.send_after(self(), :reschedule, 1_000)
         state
     end
   end
