@@ -1258,6 +1258,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
         {AdapterCoordinator,
          adapter_sup: ctx.sup,
          db: ctx.db,
+         adapter_context: fn _ -> [] end,
          adapter_opts: fn _key, _context -> [] end,
          name: :shared_shutdown_deadline_coordinator}
       )
