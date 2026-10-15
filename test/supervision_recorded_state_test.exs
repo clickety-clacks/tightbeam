@@ -41,11 +41,14 @@ defmodule Tightbeam.SupervisionRecordedStateTest do
     on_exit(fn -> File.rm_rf!(Path.dirname(path)) end)
     Tightbeam.SchemaShapeRuntimeFixture.seed_operator_predecessor!(path, payload)
     name = :"recorded_predecessor_#{System.unique_integer([:positive])}"
+    manifest = File.read!(Path.join(payload, "build-manifest.json")) |> JSON.decode!()
+    transition = JSON.encode!(%{"base" => Path.dirname(path), "source" => "unmarked",
+      "target" => manifest["buildIdentity"], "expectedSchema" => "operator-decision-requests-v1"})
 
     db =
       start_supervised!(
         Supervisor.child_spec(
-          {DB, name: name, path: path, guard_inputs: [], payload_root: payload}, id: name)
+          {DB, name: name, path: path, guard_inputs: [transition: transition], payload_root: payload}, id: name)
       )
 
     assert {:ok, [["operator-decision-requests-v1"]]} =
@@ -109,6 +112,22 @@ defmodule Tightbeam.SupervisionRecordedStateTest do
     assert {:ok, [[0]]} = DB.query(db, "SELECT lastTurnSeq FROM patrol_failure_boundary")
     assert :ok = Supervision.sweep_unclassified_terminals(db)
     assert {:ok, [[2]]} = DB.query(db, "SELECT COUNT(*) FROM patrol_terminal_classifications")
+  end
+
+  test "one inconsistent terminal is flagged without blocking the rest of a batch", %{db: db} do
+    :ok = Schema.ensure_all(db)
+    seed_session(db)
+    :ok = DB.execute(db, """
+    INSERT INTO patrol_failure_boundary(id,firstTurnSeq,activatedAt,principal)
+      VALUES(0,1,1,'process:tightbeam');
+    INSERT INTO turns(sessionKey,messageId,origin,prompt,status,createdAt,endedAt)
+      VALUES('s','inconsistent','test','prompt','queued',1,1),
+            ('s','valid','test','prompt','delivered',2,2);
+    """)
+    assert :ok = Supervision.sweep_unclassified_terminals(db)
+    assert {:ok, [[2]]} = DB.query(db, "SELECT turnSeq FROM patrol_terminal_classifications")
+    assert {:ok, [["1"]]} = DB.query(db, "SELECT subject FROM lifecycle_events WHERE kind='supervision_terminal_refused'")
+    assert {:ok, [[2]]} = DB.query(db, "SELECT lastTurnSeq FROM patrol_failure_boundary")
   end
 
   test "historical observations copy in bounded batches, skip bad records, and resume", %{db: db} do
@@ -239,7 +258,7 @@ defmodule Tightbeam.SupervisionRecordedStateTest do
     :ok =
       DB.execute(db, """
       INSERT INTO sessions(sessionKey,displayName,ownerUserId,origin,archetype,harness,provider,model,createdAt,updatedAt)
-      VALUES('s','session','owner','user:owner','coder','fixture','fixture','fixture',1,1)
+      VALUES('s','session','owner','user:owner','coder','fixture','fixture_provider','fixture',1,1)
       """)
   end
 end

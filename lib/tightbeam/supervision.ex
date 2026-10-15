@@ -4549,6 +4549,10 @@ defmodule Tightbeam.Supervision do
       [session_key, wake_id]
     )
 
+    if Txn.changes(txn) == 0 and Txn.q(txn, "SELECT 1 FROM sessions WHERE sessionKey=?1", [session_key]) == [] do
+      Logger.warning("idle cleanup observation for wake #{wake_id} names missing session #{session_key}")
+      idle_cleanup_refusal_in_txn(txn, wake_id, :observation_session_missing)
+    end
     Txn.q(txn, "UPDATE wakes SET idleCleanupObserved=1 WHERE wakeId=?1", [wake_id])
   end
 
