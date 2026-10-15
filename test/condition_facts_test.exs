@@ -492,6 +492,8 @@ defmodule Tightbeam.ConditionFactsTest do
 
     assert older_fact.fact_id < newer_fact.fact_id
     assert :ok = Wakes.fire_matching(ctx.scheduler, older_fact.fact_id)
+    # Wait for the delivery pass the condition nudge queued.
+    :sys.get_state(ctx.scheduler)
     assert %{state: "fired", fired_by: "condition"} = Wakes.get(ctx.db, older_wake.wake_id)
 
     assert %{state: "fired", fired_by: "condition"} =
@@ -508,6 +510,8 @@ defmodule Tightbeam.ConditionFactsTest do
              [older_wake.wake_id, newer_wake.wake_id]
 
     assert :ok = Wakes.fire_matching(ctx.scheduler, newer_fact.fact_id)
+    # Wait for the delivery pass the condition nudge queued.
+    :sys.get_state(ctx.scheduler)
     assert %{state: "fired", fired_by: "condition"} = Wakes.get(ctx.db, newer_wake.wake_id)
   end
 
@@ -696,6 +700,9 @@ defmodule Tightbeam.ConditionFactsTest do
       origin: "user:flynn"
     })
 
+    # Wait for the delivery pass the condition nudge queued.
+    :sys.get_state(ctx.scheduler)
+
     assert %{state: "fired", fired_by: "condition"} = Wakes.get(ctx.db, wake.wake_id)
     assert delivery_turn_count(ctx.db, wake.wake_id) == 1
   end
@@ -711,6 +718,9 @@ defmodule Tightbeam.ConditionFactsTest do
       scope: "prod",
       origin: "user:flynn"
     })
+
+    # Wait for the delivery pass the condition nudge queued.
+    :sys.get_state(ctx.scheduler)
 
     assert Wakes.get(ctx.db, first.wake_id).state == "fired"
     assert Wakes.get(ctx.db, second.wake_id).state == "fired"
@@ -788,6 +798,8 @@ defmodule Tightbeam.ConditionFactsTest do
       end)
 
     :ok = Wakes.fire_matching(ctx.scheduler, [fact_a.fact_id, fact_b.fact_id])
+    # Wait for the delivery pass the condition nudge queued.
+    :sys.get_state(ctx.scheduler)
 
     all = MapSet.new([b_wake | a_wakes])
 
@@ -836,6 +848,9 @@ defmodule Tightbeam.ConditionFactsTest do
       origin: "process:ci",
       owner_user_id: "flynn"
     })
+
+    # Wait for the delivery pass the condition nudge queued.
+    :sys.get_state(ctx.scheduler)
 
     assert %{state: "fired", fired_by: "condition"} = Wakes.get(ctx.db, matching)
     assert Enum.all?(nonmatches, &(Wakes.get(ctx.db, &1).state == "pending"))
