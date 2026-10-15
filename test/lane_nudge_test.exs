@@ -55,6 +55,35 @@ defmodule Tightbeam.LaneNudgeTest do
     %{db: db, manager_opts: manager_opts}
   end
 
+  test "a lane manager that has just crashed does not fail a committed delivery", ctx do
+    registry = :"lane_nudge_registry_#{System.unique_integer([:positive])}"
+    start_supervised!({ConnRegistry, name: registry})
+
+    dead = spawn(fn -> :ok end)
+    ref = Process.monitor(dead)
+    assert_receive {:DOWN, ^ref, :process, ^dead, _}
+
+    {:appended, message} =
+      Projection.append(ctx.db, %{
+        session_key: "k1",
+        role: "user",
+        content: "committed before the manager restarts",
+        sender: "test:lane-nudge"
+      })
+
+    {result, log} =
+      ExUnit.CaptureLog.with_log(fn ->
+        Gateway.complete_delivery(
+          ctx.db,
+          {:appended, "k1", message, [conn_registry: registry, lane_manager: dead]}
+        )
+      end)
+
+    assert result == :appended
+    assert log =~ "lane nudge after a committed delivery to k1 did not complete"
+    assert log =~ "noproc"
+  end
+
   test "a busy lane manager does not fail a committed delivery", ctx do
     registry = :"lane_nudge_registry_#{System.unique_integer([:positive])}"
     start_supervised!({ConnRegistry, name: registry})

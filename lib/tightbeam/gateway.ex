@@ -2663,14 +2663,12 @@ defmodule Tightbeam.Gateway do
 
   def complete_delivery(_db, {:terminal_notice_undeliverable, _} = incomplete), do: incomplete
 
-  # The message is already committed and published. A busy lane manager only
-  # delays the turn: the manager's periodic reconcile starts the lane.
+  # The message is already committed and published. A busy, restarting or
+  # absent lane manager only delays the turn: the manager's first reconcile
+  # after it is up again starts the lane.
   defp nudge_lane(lane_manager, session_key) do
     LaneManager.ensure_lane(lane_manager, session_key)
   catch
-    :exit, {:noproc, _call} = reason ->
-      exit(reason)
-
     :exit, reason ->
       Logger.warning(
         "lane nudge after a committed delivery to #{session_key} did not complete; " <>
