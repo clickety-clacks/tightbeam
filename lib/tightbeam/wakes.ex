@@ -6567,9 +6567,7 @@ defmodule Tightbeam.Wakes do
     end)
   end
 
-  defp deliver_due_in_context(
-         %{db: db, deliver: deliver, internal_consumers: consumers} = state
-       ) do
+  defp deliver_due_in_context(%{db: db, deliver: deliver, internal_consumers: consumers} = state) do
     if Map.has_key?(consumers, "review_remedy_reconcile") do
       {:ok, :ok} =
         Tightbeam.RailRemedy.reconcile_pending_episodes(db, state.review_remedy_interval_ms)
@@ -7839,26 +7837,27 @@ defmodule Tightbeam.Wakes do
       transaction!(state.db, fn txn ->
         Txn.q(
           txn,
-          select_wake_sql() <> """
-           INDEXED BY wakes_due
-          WHERE state='pending' AND dueAt<?1 AND consumer='prompt'
-            AND deliveredTurnSeq IS NULL
-            AND NOT EXISTS (
-              SELECT 1 FROM turns t
-              WHERE t.sessionKey=CASE
-                WHEN wakes.targetRole IS NOT NULL THEN (
-                  SELECT r.boundSessionKey FROM roles r
-                  JOIN sessions s ON s.sessionKey=r.boundSessionKey AND s.state='active'
-                  WHERE r.name=wakes.targetRole
-                )
-                WHEN wakes.reresolve='lineage' AND NOT EXISTS (
-                  SELECT 1 FROM sessions s WHERE s.sessionKey=wakes.sessionKey AND s.state='active'
-                ) THEN NULL
-                ELSE wakes.sessionKey END
-                AND t.status IN ('running','queued')
-            )
-          ORDER BY dueAt
-          """,
+          select_wake_sql() <>
+            """
+             INDEXED BY wakes_due
+            WHERE state='pending' AND dueAt<?1 AND consumer='prompt'
+              AND deliveredTurnSeq IS NULL
+              AND NOT EXISTS (
+                SELECT 1 FROM turns t
+                WHERE t.sessionKey=CASE
+                  WHEN wakes.targetRole IS NOT NULL THEN (
+                    SELECT r.boundSessionKey FROM roles r
+                    JOIN sessions s ON s.sessionKey=r.boundSessionKey AND s.state='active'
+                    WHERE r.name=wakes.targetRole
+                  )
+                  WHEN wakes.reresolve='lineage' AND NOT EXISTS (
+                    SELECT 1 FROM sessions s WHERE s.sessionKey=wakes.sessionKey AND s.state='active'
+                  ) THEN NULL
+                  ELSE wakes.sessionKey END
+                  AND t.status IN ('running','queued')
+              )
+            ORDER BY dueAt
+            """,
           [at - @miss_lateness_ms]
         )
         |> Enum.flat_map(fn row ->

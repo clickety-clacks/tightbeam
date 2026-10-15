@@ -106,10 +106,14 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
     pid = scheduler(ctx)
     scheduled = wake(ctx.db, System.system_time(:millisecond) + 60_000, %{consumer: "test"})
     due = System.system_time(:millisecond) + 250
-    assert {:ok, :ok} = DB.transaction(ctx.db, fn txn ->
-      DB.Txn.q(txn, "UPDATE wakes SET dueAt=?2 WHERE wakeId=?1", [scheduled.wake_id, due])
-      Wakes.schedule_changed_in_txn(txn)
-    end)
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               DB.Txn.q(txn, "UPDATE wakes SET dueAt=?2 WHERE wakeId=?1", [scheduled.wake_id, due])
+
+               Wakes.schedule_changed_in_txn(txn)
+             end)
+
     assert_receive {:delivered, id, fired_at}, 1_250
     assert id == scheduled.wake_id
     assert fired_at >= due and fired_at - due < 1_000
@@ -181,8 +185,13 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
 
     assert log =~ "wake scheduler miss wake=#{source.wake_id} kind=prompt late_ms="
     assert Wakes.health(pid) == %{misses: 1}
-    response = Tightbeam.Wire.Router.call(Plug.Test.conn(:get, "/version"),
-      Tightbeam.Wire.Router.init(db: ctx.db, wake_scheduler: pid))
+
+    response =
+      Tightbeam.Wire.Router.call(
+        Plug.Test.conn(:get, "/version"),
+        Tightbeam.Wire.Router.init(db: ctx.db, wake_scheduler: pid)
+      )
+
     assert JSON.decode!(response.resp_body)["wakeScheduler"] == %{"misses" => 1}
 
     assert {:ok, [[seq]]} =
