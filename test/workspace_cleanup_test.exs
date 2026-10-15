@@ -35,7 +35,12 @@ defmodule Tightbeam.WorkspaceCleanupTest do
         model: Model.new("example")
       })
 
-    config = %{db: db, base_dir: base, wake_tick_ms: 1_000}
+    config = %{
+      db: db,
+      base_dir: base,
+      wake_tick_ms: 1_000,
+      workspace_cleanup_runner: &WorkspaceCleanup.system_runner/3
+    }
     workspace = Placement.workdir_path(config, session)
     File.mkdir_p!(workspace)
     %{db: db, base: base, config: config, session: session, workspace: workspace}
@@ -124,7 +129,8 @@ defmodule Tightbeam.WorkspaceCleanupTest do
 
   test "configured archive crosses filesystems and resumes after the move before repointing",
        ctx do
-    archive = Path.join("/dev/shm", "cleanup-archive-#{System.unique_integer([:positive])}")
+    archive_parent = if File.dir?("/dev/shm"), do: "/dev/shm", else: ctx.base
+    archive = Path.join(archive_parent, "cleanup-archive-#{System.unique_integer([:positive])}")
     on_exit(fn -> File.rm_rf!(archive) end)
     Application.put_env(:tightbeam, :archive_dir, archive)
     on_exit(fn -> Application.delete_env(:tightbeam, :archive_dir) end)
@@ -152,7 +158,9 @@ defmodule Tightbeam.WorkspaceCleanupTest do
     home = Artifacts.get(ctx.db, artifact.artifact_id).home
     assert String.starts_with?(home, archive <> "/")
     assert File.read!(home) == "preserve across devices"
-    assert File.stat!(ctx.base).major_device != File.stat!(archive).major_device
+    if archive_parent == "/dev/shm" do
+      assert File.stat!(ctx.base).major_device != File.stat!(archive).major_device
+    end
   end
 
   test "the recorded backlog migration runs once and includes retirements with no attempt", ctx do
@@ -203,7 +211,9 @@ defmodule Tightbeam.WorkspaceCleanupTest do
            name: name,
            path: path,
            guard_inputs: [transition: transition],
-           payload_root: prepared.payload}, id: name)
+           payload_root: prepared.payload},
+          id: name
+        )
       )
 
     assert :ok = Schema.ensure_all(db)
