@@ -2688,6 +2688,16 @@ defmodule Tightbeam.Wakes do
     end
   end
 
+  defp log_wake_deferral(wake_id, operation, error) do
+    key = {__MODULE__, :deferred_wake_ids}
+    logged = Process.get(key, MapSet.new())
+
+    unless MapSet.member?(logged, wake_id) do
+      Process.put(key, MapSet.put(logged, wake_id))
+      Logger.warning("wake #{wake_id} #{operation} deferred: #{Exception.message(error)}")
+    end
+  end
+
   defp recognize_wake_in_savepoint(txn, wake_id, recognize) do
     :ok = Txn.exec(txn, "SAVEPOINT wake_recognition")
 
@@ -2699,7 +2709,7 @@ defmodule Tightbeam.Wakes do
       error ->
         :ok = Txn.exec(txn, "ROLLBACK TO wake_recognition")
         :ok = Txn.exec(txn, "RELEASE wake_recognition")
-        Logger.warning("wake #{wake_id} recognition deferred: #{Exception.message(error)}")
+        log_wake_deferral(wake_id, "recognition", error)
         []
     end
   end
@@ -4248,8 +4258,14 @@ defmodule Tightbeam.Wakes do
           _ -> :ok
         end
       rescue
+        error in DB.Overloaded ->
+          reraise error, __STACKTRACE__
+
         error ->
-          Logger.warning("wake #{wake_id} remedy cleanup deferred: #{Exception.message(error)}")
+          if match?(%MatchError{term: {:error, %DB.Overloaded{}}}, error),
+            do: reraise(error, __STACKTRACE__)
+
+          log_wake_deferral(wake_id, "remedy cleanup", error)
       end
     end)
 
@@ -6665,7 +6681,7 @@ defmodule Tightbeam.Wakes do
           [{to_wake(wake_row), Enum.reject(carriers, &is_nil/1)}]
         rescue
           error ->
-            Logger.warning("wake #{hd(row)} due delivery deferred: #{Exception.message(error)}")
+            log_wake_deferral(hd(row), "due delivery", error)
             []
         end
       end)
@@ -6769,10 +6785,11 @@ defmodule Tightbeam.Wakes do
         {:ok, _} ->
           :ok
 
+        {:error, %DB.Overloaded{} = error} ->
+          raise error
+
         {:error, error} ->
-          Logger.warning(
-            "wake #{wake_id} dependency recognition deferred: #{Exception.message(error)}"
-          )
+          log_wake_deferral(wake_id, "dependency recognition", error)
       end
     end)
 
@@ -6847,8 +6864,11 @@ defmodule Tightbeam.Wakes do
         {:ok, _} ->
           []
 
+        {:error, %DB.Overloaded{} = error} ->
+          raise error
+
         {:error, error} ->
-          Logger.warning("wake #{wake_id} wait delivery deferred: #{Exception.message(error)}")
+          log_wake_deferral(wake_id, "wait delivery", error)
           []
       end
     end)
@@ -7481,8 +7501,11 @@ defmodule Tightbeam.Wakes do
       {:ok, _} ->
         :ok
 
+      {:error, %DB.Overloaded{} = error} ->
+        raise error
+
       {:error, error} ->
-        Logger.warning("wake #{wake_id} condition delivery deferred: #{Exception.message(error)}")
+        log_wake_deferral(wake_id, "condition delivery", error)
     end
   end
 

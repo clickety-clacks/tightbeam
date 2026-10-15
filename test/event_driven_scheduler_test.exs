@@ -3,6 +3,22 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
   import ExUnit.CaptureLog
   alias Tightbeam.{DB, Ledger, NoticeBatcher, Wakes}
 
+  defmodule OverloadedDeliveryDB do
+    use GenServer
+
+    def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
+    def init(opts), do: {:ok, opts}
+
+    def handle_call({:transaction_then, _prepare, _commit}, _from, {_db, parent} = state) do
+      send(parent, :delivery_overloaded)
+      {:reply, {:error, %DB.Overloaded{}}, state}
+    end
+
+    def handle_call(request, _from, {db, _parent} = state) do
+      {:reply, GenServer.call(db, request), state}
+    end
+  end
+
   setup do
     db = start_supervised!({DB, path: ":memory:", name: nil})
     :ok = ensure_all_schemas(db)
@@ -79,6 +95,44 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
     turn
   end
 
+  test "condition delivery overload defers the pass without advancing either cursor", ctx do
+    pending = wake(ctx.db, 1, %{condition_kind: "ready", condition_after_id: 0})
+
+    assert {:ok, [[fact_id]]} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO condition_facts(ts,kind,origin) VALUES (1,'ready','system') RETURNING id"
+             )
+
+    assert {:ok, [[before_fact]]} = DB.query(ctx.db, "SELECT afterFact FROM scheduler_state")
+    assert fact_id > before_fact
+    proxy = start_supervised!({OverloadedDeliveryDB, {ctx.db, self()}})
+    timer = make_ref()
+
+    state = %{
+      db: proxy,
+      timer: timer,
+      deadline: nil,
+      retries: %{},
+      retry_attempts: %{},
+      scanned_through: -1,
+      internal_consumers: %{},
+      deliver: fn _ -> flunk("delivery must not run") end,
+      delivery_opts: ctx.delivery_opts,
+      batch: 100
+    }
+
+    assert {:noreply, next} = Wakes.handle_info({:timeout, timer, :due}, state)
+    assert_received :delivery_overloaded
+    assert next.scanned_through == state.scanned_through
+    assert next.retries[:pass] > System.system_time(:millisecond)
+    assert :erlang.read_timer(next.timer) >= 900
+    :erlang.cancel_timer(next.timer)
+    assert {:ok, [[^before_fact]]} = DB.query(ctx.db, "SELECT afterFact FROM scheduler_state")
+    assert Wakes.get(ctx.db, pending.wake_id).state == "pending"
+    assert Wakes.get(ctx.db, pending.wake_id).fired_at == nil
+  end
+
   for column <- ~w(predicate recognitionEvidence recognitionTransition) do
     test "malformed #{column} defers one internal wake while other wakes deliver", ctx do
       bad = wake(ctx.db, 1, %{consumer: "test"})
@@ -95,9 +149,10 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
           assert_receive {:delivered, id, _}, 1_000
           assert id == good.wake_id
           assert Process.alive?(pid)
+          assert :ok = Wakes.fire_due(pid)
         end)
 
-      assert log =~ bad.wake_id
+      assert length(Regex.scan(~r/#{bad.wake_id}/, log)) == 1
       assert log =~ "deferred"
 
       assert {:ok, [["pending", "{"]]} =
