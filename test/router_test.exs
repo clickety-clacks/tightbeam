@@ -50,7 +50,10 @@ defmodule Tightbeam.Wire.RouterTest do
            }) == %{:prompt => "hello", key => true, "artifactId" => "a"}
 
     assert_raise ArgumentError, fn -> String.to_existing_atom(key) end
-    assert Router.atomize_params_for_test("unknown-verb", %{"prompt" => "hello"}) == %{"prompt" => "hello"}
+
+    assert Router.atomize_params_for_test("unknown-verb", %{"prompt" => "hello"}) == %{
+             "prompt" => "hello"
+           }
 
     assert Router.atomize_params_for_test("tune", %{
              "fastMode" => "on",
