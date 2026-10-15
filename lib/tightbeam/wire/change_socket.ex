@@ -16,13 +16,16 @@ defmodule Tightbeam.Wire.ChangeSocket do
             is_admin: false,
             subscriptions: %{},
             heartbeat_timer: nil,
+            hub_monitor: nil,
             deps: %{}
 
   @impl true
   def init(deps) do
     state = %__MODULE__{deps: Map.new(deps)}
-    :ok = Hub.register(hub(state), self(), %{mode: :pending})
-    {:ok, state}
+    pid = GenServer.whereis(hub(state))
+    ref = Process.monitor(pid)
+    :ok = Hub.register(pid, self(), %{mode: :pending})
+    {:ok, %{state | hub_monitor: ref}}
   end
 
   @impl true
@@ -37,6 +40,9 @@ defmodule Tightbeam.Wire.ChangeSocket do
     do: invalid("binary frames are unsupported", state)
 
   @impl true
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{hub_monitor: ref} = state),
+    do: {:stop, :normal, 1012, state}
+
   def handle_info({:firehose_notice, notice}, %{phase: :live} = state) do
     await_delivery_release(state, notice)
     Hub.delivered(hub(state), self())

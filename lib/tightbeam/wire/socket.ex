@@ -75,6 +75,7 @@ defmodule Tightbeam.Wire.Socket do
         }
 
   defstruct conn_ref: nil,
+            registry_monitor: nil,
             user_id: nil,
             device_id: nil,
             is_admin: false,
@@ -112,6 +113,9 @@ defmodule Tightbeam.Wire.Socket do
   @impl true
   def handle_info(msg, state) do
     case msg do
+      {:DOWN, ref, :process, _pid, _reason} when ref == state.registry_monitor ->
+        {:stop, :normal, 1012, state}
+
       {:push, payload} when state.phase == :replaying ->
         {:ok, %{state | buffer: [{:frame, payload} | state.buffer]}}
 
@@ -301,8 +305,11 @@ defmodule Tightbeam.Wire.Socket do
       {:ok, subscriptions} ->
         if MapSet.member?(subscriptions, "chat"), do: seed_main_stream(device.user_id, state)
 
+        registry = GenServer.whereis(conn_registry(state))
+        monitor = Process.monitor(registry)
+
         {:ok, conn_ref, _replaced} =
-          ConnRegistry.register(conn_registry(state), %{
+          ConnRegistry.register(registry, %{
             pid: self(),
             user_id: device.user_id,
             device_id: device.device_id,
@@ -310,7 +317,7 @@ defmodule Tightbeam.Wire.Socket do
             subscriptions: subscriptions
           })
 
-        auth_replay(msg, device, conn_ref, subscriptions, state)
+        auth_replay(msg, device, conn_ref, subscriptions, %{state | registry_monitor: monitor})
 
       :error ->
         stop_with(Payloads.wire_error("invalid_message"), state)

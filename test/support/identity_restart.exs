@@ -92,7 +92,7 @@ before = if phase in ["abort", "resolve"], do: File.read!(Path.join(root, "pendi
 {:ok, _} = Application.ensure_all_started(:tightbeam)
 
 {_, listener, _, _} =
-  Enum.find(Supervisor.which_children(Tightbeam.Supervisor), fn {id, _, _, modules} ->
+  Enum.find(Supervisor.which_children(Tightbeam.RuntimeSupervisor), fn {id, _, _, modules} ->
     id == Bandit or (is_list(modules) and Bandit in modules)
   end)
 

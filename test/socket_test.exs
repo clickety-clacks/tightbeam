@@ -81,6 +81,34 @@ defmodule Tightbeam.Wire.SocketTest do
     %{db: db, registry: registry, deps: deps}
   end
 
+  test "registry restart closes an authenticated socket", ctx do
+    {:paired, device} =
+      Devices.pair(ctx.db, %{
+        device_id: "restart",
+        claimed_name: "Client",
+        platform: nil,
+        model: nil
+      })
+
+    {:ok, initial} = Socket.init(ctx.deps)
+
+    {:push, _frames, state} =
+      Socket.handle_in(
+        {JSON.encode!(%{
+           "type" => "auth",
+           "token" => device.token,
+           "subscriptions" => ["work_state"]
+         }), opcode: :text},
+        initial
+      )
+
+    old = Process.whereis(ctx.registry)
+    Process.exit(old, :kill)
+    ref = state.registry_monitor
+    assert_receive {:DOWN, ^ref, :process, ^old, :killed} = down
+    assert {:stop, :normal, 1012, ^state} = Socket.handle_info(down, state)
+  end
+
   test "chat ingress uses real Gateway handlers for ack, dedupe, conflict, and validation", ctx do
     start_supervised!(%{
       id: :socket_e2e_conn_registry,
