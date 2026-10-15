@@ -3,6 +3,8 @@ defmodule Tightbeam.WorkspaceCleanupTest do
   alias Tightbeam.{Artifacts, DB, Gateway, Model, Org, Placement, Schema, WorkspaceCleanup}
 
   setup do
+    start_supervised!({Task.Supervisor, name: Tightbeam.TurnTaskSupervisor})
+    start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
     db = start_supervised!({DB, path: ":memory:", name: :"cleanup_#{System.unique_integer([:positive])}"})
     :ok = Schema.ensure_all(db)
     base = Path.join(System.tmp_dir!(), "workspace-cleanup-#{System.unique_integer([:positive])}")
@@ -18,17 +20,22 @@ defmodule Tightbeam.WorkspaceCleanupTest do
 
   test "retirement records pending cleanup without waiting for filesystem work", ctx do
     parent = self()
-    config = Map.put(ctx.config, :workspace_cleanup_runner, fn _, _, _ ->
-      send(parent, :runner_started)
+    config = ctx.config |> Map.put(:workspace_cleanup_timeout_ms, 60_000) |> Map.put(:workspace_cleanup_runner, fn _, _, _ ->
+      send(parent, {:runner_started, self()})
       receive do :release -> {"DONE\t0\n", 0} end
     end)
     worker = start_supervised!({WorkspaceCleanup, config: config})
-    result = Gateway.handlers(config)["retire"].(%{origin: "user:owner", principal: {:user, "owner"}, session_key: ctx.session.session_key, params: %{}})
-    assert result.retired_session_keys == [ctx.session.session_key]
-    assert_receive :runner_started, 5_000
-    assert Org.get(ctx.db, ctx.session.session_key).state == "retired"
-    assert WorkspaceCleanup.health(ctx.db).count == 1
-    Process.exit(worker, :kill)
+    request = Task.async(fn ->
+      Gateway.handlers(config)["retire"].(%{origin: "user:owner", principal: {:user, "owner"}, session_key: ctx.session.session_key, params: %{}})
+    end)
+    assert_receive {:runner_started, runner}, 5_000
+    result = Task.yield(request, 1_000)
+    if is_nil(result), do: Task.shutdown(request, :brutal_kill)
+    send(runner, :release)
+    assert {:ok, %{retired_session_keys: [key]}} = result
+    assert key == ctx.session.session_key
+    assert Org.get(ctx.db, key).state == "retired"
+    :sys.get_state(worker)
   end
 
   test "a workspace with no artifacts disappears and completed work is not queued again", ctx do
@@ -92,6 +99,84 @@ defmodule Tightbeam.WorkspaceCleanupTest do
     assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM retired_workspace_cleanup_migration")
     assert :ok = Schema.ensure_all(ctx.db)
     assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM retired_workspace_cleanup")
+  end
+
+  test "a 0.1.8 predecessor receives the cleanup migration once", ctx do
+    prepared = Tightbeam.GuardRuntimeFixture.prepare!(Path.join(ctx.base, "predecessor"), "schema_shape_runtime.exs")
+    path = Path.join(prepared.base, "state.db")
+    Tightbeam.SchemaShapeRuntimeFixture.seed_operator_predecessor!(path, prepared.payload)
+    manifest = File.read!(Path.join(prepared.payload, "build-manifest.json")) |> JSON.decode!()
+    transition = JSON.encode!(%{"base" => Path.dirname(path), "source" => "unmarked", "target" => manifest["buildIdentity"], "expectedSchema" => "operator-decision-requests-v1"})
+    name = :"cleanup_predecessor_#{System.unique_integer([:positive])}"
+    db = start_supervised!(Supervisor.child_spec({DB, name: name, path: path, guard_inputs: [transition: transition], payload_root: prepared.payload}, id: name))
+    assert :ok = Schema.ensure_all(db)
+    assert :ok = Schema.ensure_all(db)
+    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM retired_workspace_cleanup_migration")
+    assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
+  end
+
+  test "existing archives move once to the configured directory and their records follow", ctx do
+    kept = Path.join(ctx.workspace, "kept")
+    File.write!(kept, "older archive")
+    artifact = artifact(ctx, kept)
+    retire(ctx)
+    assert %{status: "completed"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, ctx.session.session_key)
+    old_home = Artifacts.get(ctx.db, artifact.artifact_id).home
+    archive = Path.join(ctx.base, "configured-archive")
+    Application.put_env(:tightbeam, :archive_dir, archive)
+    on_exit(fn -> Application.delete_env(:tightbeam, :archive_dir) end)
+    worker = start_supervised!({WorkspaceCleanup, config: ctx.config})
+    send(worker, :drain)
+    :sys.get_state(worker)
+    moved = Artifacts.get(ctx.db, artifact.artifact_id)
+    assert String.starts_with?(moved.home, archive <> "/")
+    assert File.read!(moved.home) == "older archive"
+    refute File.exists?(old_home)
+    send(worker, :drain)
+    :sys.get_state(worker)
+    assert Artifacts.get(ctx.db, artifact.artifact_id).home == moved.home
+  end
+
+  test "one failed workspace does not prevent the next cleanup and retries when due", ctx do
+    other = Org.create(ctx.db, %{session_key: "other-example", display_name: "Other", owner_user_id: "owner", origin: "user:owner", archetype: "default", host: Placement.local_host_name(), harness: "claude", provider: "anthropic", model: Model.new("example")})
+    other_workspace = Placement.workdir_path(ctx.config, other)
+    File.mkdir_p!(other_workspace)
+    File.write!(Path.join(other_workspace, "scratch"), "discard")
+    retire(ctx)
+    {:ok, _} = DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [other.session_key])
+    attempts = :atomics.new(1, [])
+    config = Map.put(ctx.config, :workspace_cleanup_runner, fn invocation, script, input ->
+      if :atomics.add_get(attempts, 1, 1) == 1, do: {"offline", 255}, else: WorkspaceCleanup.system_runner(invocation, script, input)
+    end)
+    worker = start_supervised!({WorkspaceCleanup, config: config})
+    send(worker, :drain)
+    :sys.get_state(worker)
+    assert WorkspaceCleanup.health(ctx.db).count == 2
+    send(worker, :drain)
+    :sys.get_state(worker)
+    refute File.exists?(other_workspace)
+    assert %{count: 1, unfinished: [%{reason: reason}]} = WorkspaceCleanup.health(ctx.db)
+    assert reason =~ "cleanup_command_failed"
+    assert WorkspaceCleanup.health(ctx.db, "another-owner").count == 0
+    {:ok, _} = DB.query(ctx.db, "UPDATE retired_workspace_cleanup SET nextAt=0 WHERE completed=0")
+    send(worker, :drain)
+    :sys.get_state(worker)
+    refute File.exists?(ctx.workspace)
+    assert WorkspaceCleanup.health(ctx.db).count == 0
+  end
+
+  test "a missing artifact does not stop deletion of unrelated files", ctx do
+    missing = Path.join(ctx.workspace, "missing")
+    artifact(ctx, missing)
+    scratch = Path.join(ctx.workspace, "scratch")
+    File.write!(scratch, "discard")
+    retire(ctx)
+    assert %{status: "incomplete", blockers: blockers} = WorkspaceCleanup.process_session(ctx.config, ctx.db, ctx.session.session_key)
+    assert Enum.any?(blockers, &(&1.reason == "artifact_missing"))
+    refute File.exists?(scratch)
+    File.write!(missing, "recovered")
+    assert %{status: "completed"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, ctx.session.session_key)
+    assert WorkspaceCleanup.health(ctx.db).count == 0
   end
 
   defp retire(ctx) do

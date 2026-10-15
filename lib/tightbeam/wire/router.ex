@@ -221,8 +221,7 @@ defmodule Tightbeam.Wire.Router do
       "adapters" => health,
       "diagnostics" => diagnostic_health(),
       "schedulerMisses" => Tightbeam.SchedulerMisses.count(),
-      "eventPaths" => Tightbeam.SchedulerMisses.health(),
-      "workspaceCleanup" => Tightbeam.WorkspaceCleanup.health(db(conn))
+      "eventPaths" => Tightbeam.SchedulerMisses.health()
     })
   end
 

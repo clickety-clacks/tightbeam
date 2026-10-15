@@ -1068,7 +1068,7 @@ defmodule Tightbeam.Gateway do
         end),
       # Readable by any caller, like kungfu-list: names, states and shipped setup
       # text only, never a setting value, so doctor can report it from a session.
-      {"sentinel-list", []} => fn _call ->
+      {"sentinel-list", []} => fn call ->
         host = Placement.local_host_name()
         states = Sentinels.states(db, host)
 
@@ -1091,6 +1091,7 @@ defmodule Tightbeam.Gateway do
                 reason: row[:reason]
               }
             end),
+          workspace_cleanup: WorkspaceCleanup.health(db, if(admin_caller?(db, call), do: nil, else: principal_caller(db, call)[:owner_user_id] || "")),
           setup: Sentinels.setup_all(config.base_dir, db, host)
         }
       end,

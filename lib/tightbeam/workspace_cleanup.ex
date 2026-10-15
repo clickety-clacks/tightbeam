@@ -101,6 +101,8 @@ defmodule Tightbeam.WorkspaceCleanup do
   end
 
   defp relocate_archive(db, name, host, source, destination, config) do
+    if relative_inside(destination, source) != nil or relative_inside(source, destination) != nil,
+      do: raise(ArgumentError, "archive relocation directories overlap")
     target = Path.join(destination, "previous-" <> Base.url_encode64(name, padding: false))
     script = """
     set -e
@@ -119,10 +121,11 @@ defmodule Tightbeam.WorkspaceCleanup do
       {:ok, :ok} = DB.transaction(db, fn txn ->
         Txn.q(txn, "SELECT artifactId,home,originHost FROM artifacts WHERE state='archived' AND substr(home,1,length(?1)+1)=?1 || '/'", [source])
         |> Enum.each(fn [id,home,origin_host] ->
-          if origin_host == name do
+          if origin_host == name or (is_nil(origin_host) and is_nil(host.ssh)) do
             Tightbeam.Artifacts.repoint_archive_in_txn(txn, id, target <> String.replace_prefix(home, source, ""))
           end
         end)
+        Txn.q(txn, "UPDATE retired_workspace_cleanup SET archivePath=?2 || substr(archivePath,length(?1)+1) WHERE substr(archivePath,1,length(?1)+1)=?1 || '/' AND sessionKey IN (SELECT sessionKey FROM sessions WHERE host=?3)", [source,target,name])
         Txn.q(txn, "UPDATE retired_archive_relocation SET completed=1,report=NULL WHERE host=?1 AND destination=?2", [name,destination])
         :ok
       end)
@@ -170,10 +173,10 @@ defmodule Tightbeam.WorkspaceCleanup do
     report
   end
 
-  def health(db \\ DB) do
-    case DB.query(db, "SELECT sessionKey,report FROM retired_workspace_cleanup WHERE completed=0 ORDER BY sessionKey") do
+  def health(db \\ DB, owner \\ nil) do
+    case DB.query(db, "SELECT c.sessionKey,c.report FROM retired_workspace_cleanup c JOIN sessions s ON s.sessionKey=c.sessionKey WHERE c.completed=0 AND (?1 IS NULL OR s.ownerUserId=?1) ORDER BY c.sessionKey", [owner]) do
       {:ok, rows} ->
-        {:ok, relocation} = DB.query(db, "SELECT host,report FROM retired_archive_relocation WHERE completed=0")
+        {:ok, relocation} = DB.query(db, "SELECT host,report FROM retired_archive_relocation WHERE completed=0 AND ?1 IS NULL", [owner])
         unfinished = Enum.map(rows, fn [key, report] -> %{workspace: key, reason: report || "cleanup pending"} end) ++
           Enum.map(relocation, fn [host, report] -> %{workspace: "archive on " <> host, reason: report || "archive relocation pending"} end)
         %{count: length(unfinished), unfinished: unfinished}
@@ -412,7 +415,7 @@ defmodule Tightbeam.WorkspaceCleanup do
           FROM artifacts WHERE state='in-workspace'
             AND (originWorkspace=?1 OR originPath=?1
                  OR substr(originPath,1,length(?1)+1)=?1 || '/'
-                 OR instr(originPath,':' || ?1 || '/')>0)
+                 OR instr(originPath,':' || ?1)>0)
           ORDER BY artifactId
           """,
           [root]
@@ -908,8 +911,7 @@ defmodule Tightbeam.WorkspaceCleanup do
         emit_error archive_destination_exists "$archive"
         had_error=1
       elif mkdir -p "$(dirname "$archive")" &&
-           (mv "$root" "$archive" 2>/dev/null ||
-            (cp -a "$root" "$archive" && rm -rf "$root")); then
+           mv "$root" "$archive"; then
         :
       else
         emit_error archive_move_failed "$archive"

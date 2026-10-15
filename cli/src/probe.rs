@@ -1507,12 +1507,12 @@ fn pretty_json(value: &Value) -> String {
 fn report_json(report: &Report, sentinels: Option<Value>, event_paths: Option<Value>) -> String {
     let mut value = report_value(report);
     if let (Some(sentinels), Some(fields)) = (sentinels, value.as_object_mut()) {
+        if let Some(cleanup) = sentinels.get("workspace_cleanup") {
+            fields.insert("workspace_cleanup".to_owned(), cleanup.clone());
+        }
         fields.insert("sentinels".to_owned(), sentinels);
     }
     if let (Some(event_paths), Some(fields)) = (event_paths, value.as_object_mut()) {
-        if let Some(cleanup) = event_paths.get("workspaceCleanup") {
-            fields.insert("workspace_cleanup".to_owned(), cleanup.clone());
-        }
         fields.insert("event_paths".to_owned(), event_paths);
     }
     pretty_json(&value)
@@ -1581,6 +1581,7 @@ pub fn run(
     } else {
         println!("{}", human(&report));
         println!("{}", sentinel_lines(&sentinels).join("\n"));
+        println!("{}", workspace_cleanup_lines(&sentinel_value(&sentinels)["workspace_cleanup"]).join("\n"));
         println!("{}", event_paths_lines(&event_paths).join("\n"));
     }
     require_runnable_harness_cli(harness_catalog.as_ref())?;
@@ -1606,7 +1607,6 @@ fn doctor_event_paths(base_dir: &Path, explicit_base_dir: bool) -> Result<Value,
     let deadline = Instant::now() + std::time::Duration::from_secs(5);
     let version = crate::dispatch::send_to_with_deadline(&endpoint, &request, Some(deadline))?
         .ok_or("the gateway returned no health facts")?;
-    let cleanup = version.get("workspaceCleanup").cloned();
     version
         .get("eventPaths")
         .filter(|health| {
@@ -1615,12 +1615,6 @@ fn doctor_event_paths(base_dir: &Path, explicit_base_dir: bool) -> Result<Value,
                 && health["recent"].is_array()
         })
         .cloned()
-        .map(|mut health| {
-            if let Some(cleanup) = cleanup {
-                health["workspaceCleanup"] = cleanup;
-            }
-            health
-        })
         .ok_or_else(|| "the gateway did not report event path health".to_owned())
 }
 
@@ -1644,11 +1638,8 @@ fn event_paths_lines(status: &Result<Value, String>) -> Vec<String> {
         Ok(health) => health,
         Err(reason) => return vec![format!("[WARN] event paths: health unavailable ({reason})")],
     };
-    let cleanup = workspace_cleanup_lines(&health["workspaceCleanup"]);
     if health["count"] == 0 {
-        let mut lines = vec!["[PASS] event paths: no missed events since start".to_owned()];
-        lines.extend(cleanup);
-        return lines;
+        return vec!["[PASS] event paths: no missed events since start".to_owned()];
     }
     let counts = [
         ("wake", "wake scheduler"),
@@ -1678,7 +1669,6 @@ fn event_paths_lines(status: &Result<Value, String>) -> Vec<String> {
             ));
         }
     }
-    lines.extend(cleanup);
     lines
 }
 
