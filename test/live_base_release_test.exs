@@ -81,6 +81,7 @@ defmodule Tightbeam.LiveBaseReleaseTest do
     identity = manifest["buildIdentity"]
 
     {:ok, predecessor} = Sqlite3.open(Path.join(base, "state.db"))
+
     {:ok, index_stmt} =
       Sqlite3.prepare(
         predecessor,
@@ -105,6 +106,7 @@ defmodule Tightbeam.LiveBaseReleaseTest do
     :ok = Schema.ensure_all(db)
     target = hd(Schema.guard_compatible_stamps())
     assert {:ok, [[^target]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+
     assert {:ok, [[_applied_at]]} =
              DB.query(db, "SELECT appliedAt FROM hot_query_indexes_migration WHERE id=0")
 
@@ -137,8 +139,10 @@ defmodule Tightbeam.LiveBaseReleaseTest do
 
     assert :ok = Schema.ensure_all(restarted)
     assert {:ok, [[^target]]} = DB.query(restarted, "SELECT shape FROM schema_stamp")
+
     assert {:ok, [[^applied_at_before_restart]]} =
              DB.query(restarted, "SELECT appliedAt FROM hot_query_indexes_migration WHERE id=0")
+
     assert File.exists?(Path.join(base, "build-owner.json"))
     :ok = GenServer.stop(restarted)
   end

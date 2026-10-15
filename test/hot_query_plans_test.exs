@@ -73,7 +73,8 @@ defmodule Tightbeam.HotQueryPlansTest do
   end
 
   test "review verdict counts find review assignments through their subject index", %{db: db} do
-    direct_plan = plan!(db, "SELECT id FROM assignments WHERE reviewsAssignmentId=?1", ["subject"])
+    direct_plan =
+      plan!(db, "SELECT id FROM assignments WHERE reviewsAssignmentId=?1", ["subject"])
 
     assert Enum.any?(direct_plan, &String.contains?(&1, "assignments_reviews_assignment"))
 
@@ -217,6 +218,7 @@ defmodule Tightbeam.HotQueryPlansTest do
              DB.query(db, "SELECT appliedAt FROM hot_query_indexes_migration WHERE id=0")
 
     assert {:ok, [[^before_version]]} = DB.query(db, "PRAGMA schema_version")
+
     assert {:ok, [[index_sql]]} =
              DB.query(
                db,
