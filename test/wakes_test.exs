@@ -727,14 +727,16 @@ defmodule Tightbeam.WakesTest do
 
     handler = Tightbeam.Gateway.handlers(%{db: db, wake_scheduler: scheduler})["wake"]
 
-    task = Task.async(fn ->
-      handler.(%{
-        origin: "user:flynn",
-        principal: {:user, "flynn"},
-        session_key: "k1",
-        params: %{prompt: "committed before the nudge", after_ms: 0}
-      })
-    end)
+    task =
+      Task.async(fn ->
+        handler.(%{
+          origin: "user:flynn",
+          principal: {:user, "flynn"},
+          session_key: "k1",
+          params: %{prompt: "committed before the nudge", after_ms: 0}
+        })
+      end)
+
     response = Task.await(task, 2_000)
 
     assert %{wake_id: wake_id} = response
