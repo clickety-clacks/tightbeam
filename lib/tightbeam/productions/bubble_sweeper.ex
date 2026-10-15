@@ -125,9 +125,7 @@ defmodule Tightbeam.Productions.BubbleSweeper do
             failures = Process.get({__MODULE__, seq}, 0) + 1
 
             if failures >= 5 do
-              Logger.error(
-                "bubble recognition skipping turn #{seq} after #{failures} failures; pending recognition retains retry intent"
-              )
+              Logger.error("bubble recognition skipping turn #{seq} after #{failures} failures")
 
               Process.delete({__MODULE__, seq})
               {:cont, [seq | recognized]}

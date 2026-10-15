@@ -3911,6 +3911,9 @@ defmodule Tightbeam.Gateway do
         # truth rides in the diagnostic.
         ErrorDiagnostic.put(%{ok: true}, cancel_leg(leg))
 
+      {:error, %DB.Overloaded{}} ->
+        %{ok: false, code: "busy", message: "database overloaded; retry later"}
+
       _ ->
         %{ok: false, code: "not_running", message: "no turn in flight"}
     end

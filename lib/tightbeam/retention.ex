@@ -164,7 +164,7 @@ defmodule Tightbeam.Retention do
 
       {:error, %DB.Overloaded{}} ->
         Logger.debug("database overloaded; background pass deferred")
-        Process.send_after(self(), :trim, @interval)
+        Process.send_after(self(), :trim, 5_000)
         {:noreply, state}
 
       {:error, error} ->

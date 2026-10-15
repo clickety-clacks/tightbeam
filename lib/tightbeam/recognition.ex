@@ -116,6 +116,7 @@ defmodule Tightbeam.Recognition do
   defp invoke(db, pending, callback, clear, deadline) when is_function(callback, 2) do
     safely(fn ->
       transaction = fn txn ->
+        [[1]] = Txn.q(txn, "SELECT 1 FROM pending_recognition WHERE id=?1", [pending.id])
         Enum.each(pending.transitions, &DB.record_row_commit(txn, &1))
         result = recognized_result!(call_callback!(callback, txn, pending.result), pending.result)
         # Clear the durable intent atomically with recognition's changes.
