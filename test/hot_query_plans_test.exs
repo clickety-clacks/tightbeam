@@ -121,9 +121,10 @@ defmodule Tightbeam.HotQueryPlansTest do
         """
         SELECT COUNT(*)
         FROM assignments producer
-        JOIN assignments review ON review.reviewsAssignmentId=producer.id
+        CROSS JOIN assignments review
         JOIN attests verdict ON verdict.assignmentId=review.id
         WHERE producer.workItemId=?1
+          AND review.reviewsAssignmentId=producer.id
           AND review.workItemId IS NULL
           AND verdict.kind='verdict'
           AND verdict.verdictKind='changes-requested'
@@ -142,9 +143,10 @@ defmodule Tightbeam.HotQueryPlansTest do
         """
         SELECT COUNT(*)
         FROM assignments producer
-        JOIN assignments review ON review.reviewsAssignmentId=producer.id
+        CROSS JOIN assignments review
         JOIN attests verdict ON verdict.assignmentId=review.id
         WHERE producer.workItemId=?1
+          AND review.reviewsAssignmentId=producer.id
           AND review.workItemId IS NULL
           AND review.reviewsAssignmentId IS NOT NULL
           AND verdict.kind='verdict'
