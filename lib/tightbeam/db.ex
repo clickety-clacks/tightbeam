@@ -925,25 +925,10 @@ defmodule Tightbeam.DB do
   end
 
   @impl true
-  def handle_cast({:dispatch_audit, audit}, %{conn: conn} = state) do
-    case commit_phase(
-           conn,
-           fn txn ->
-             Tightbeam.EventLog.append_event_in_txn(
-               txn,
-               audit.kind,
-               audit.verb,
-               audit.origin,
-               audit.session_key,
-               audit.payload,
-               audit.principal,
-               System.system_time(:millisecond)
-             )
-           end,
-           fenced_archetypes(state)
-         ) do
+  def handle_cast({:dispatch_audit, record, deadline}, %{conn: conn} = state) do
+    case commit_phase(conn, record, fenced_archetypes(state), deadline) do
+      {:ok, _} -> :ok
       {:error, _} -> Logger.warning("dispatch audit could not be recorded")
-      _ -> :ok
     end
 
     {:noreply, state}

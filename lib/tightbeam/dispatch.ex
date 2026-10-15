@@ -15,10 +15,12 @@ defmodule Tightbeam.Dispatch do
   anything long-running goes through the Ledger/lane pipeline, never inline.
 
   Rules evaluate each call before its handler runs. Handler database writes
-  record an identity audit in their transaction. Dispatch queues remaining
+  record an identity audit in their transaction. Dispatch records remaining
   audits and commits publication before returning the response.
   Read audits contain identity and verb rather than the returned content.
   """
+
+  require Logger
 
   alias Tightbeam.{
     Assignments,
@@ -389,7 +391,7 @@ defmodule Tightbeam.Dispatch do
   end
 
   defp audit_payload(verb, call, outcome) do
-    if Process.get(:tightbeam_dispatch_audited) == true or verb == "onboard" or
+    if is_integer(Process.get(:tightbeam_dispatch_audited)) or verb in ~w(onboard settle-turn) or
          Publisher.transactional_verb?(verb),
        do: outcome_payload(verb, call, outcome),
        else: nil
@@ -416,40 +418,57 @@ defmodule Tightbeam.Dispatch do
   defp append_event(db, kind, verb, origin, session_key, payload, principal),
     do: append_event_with_handoff(db, kind, verb, origin, session_key, payload, principal, nil)
 
+  # A handler that wrote already has its audit row, written in its own
+  # transaction (`DBObservation.audit_in_txn/2`); the outcome completes that
+  # row. Any other outcome gets its own row. A read's "verb" row carries no
+  # content. Denials audit in the publication transaction. Outcomes known only
+  # after the handler returns complete asynchronously, so an audit never delays
+  # a committed result.
   defp append_event_with_handoff(db, kind, verb, origin, session_key, payload, principal, handoff) do
-    audited? = Process.delete(:tightbeam_dispatch_audited) == true
+    audited = Process.delete(:tightbeam_dispatch_audited)
 
-    audit = %{
-      kind: kind,
-      verb: verb,
-      origin: origin,
-      session_key: session_key,
-      payload:
-        cond do
-          kind == "verb" and verb in ~w(transcript breathing work-item-get) and
-              not match?(%{crash: true}, payload) ->
-            nil
+    # Successful reads audit identity and verb only, including body reads.
+    payload =
+      if kind == "verb" and verb in ~w(transcript breathing work-item-get) and
+           not match?(%{crash: true}, payload),
+         do: nil,
+         else: payload
 
-          kind == "denied" or verb == "onboard" or match?(%{code: _}, payload) or
-              Publisher.transactional_verb?(verb) ->
-            payload
+    record = fn txn ->
+      try do
+        if is_integer(audited) do
+          EventLog.complete_event_in_txn(txn, audited, kind, payload)
+        else
+          EventLog.append_event_in_txn(
+            txn,
+            kind,
+            verb,
+            origin,
+            session_key,
+            payload,
+            principal,
+            System.system_time(:millisecond)
+          )
+        end
+      rescue
+        _ -> Logger.warning("dispatch audit for #{verb} could not be recorded")
+      end
 
-          true ->
-            nil
-        end,
-      principal: principal
-    }
-
-    # Publication keeps its synchronous commit and handoff order, even when
-    # audit admission is overloaded. Only the audit may be deferred.
-    if handoff do
-      {:ok, _} = DB.publish_transaction(db, handoff)
+      :ok
     end
 
-    skip? = audited? and kind == "verb" and not match?(%{crash: true}, payload)
-
-    unless skip? or DB.overloaded?(db) do
-      GenServer.cast(db, {:dispatch_audit, audit})
+    if handoff do
+      {:ok, _} =
+        DB.publish_transaction(db, fn txn ->
+          record.(txn)
+          handoff.(txn)
+        end)
+    else
+      if DB.overloaded?(db) do
+        Logger.warning("dispatch audit for #{verb} skipped: database overloaded")
+      else
+        GenServer.cast(db, {:dispatch_audit, record, System.monotonic_time(:millisecond) + 2_000})
+      end
     end
 
     :ok

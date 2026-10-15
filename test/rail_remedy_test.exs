@@ -2792,6 +2792,11 @@ defmodule Tightbeam.RailRemedyTest do
       )
 
     {:ok, [[seq]]} = DB.query(db, "SELECT seq FROM turns WHERE messageId=?1", [message_id])
+
+    # Delivery reads the recorded turn on the wake instead of inferring history.
+    {:ok, []} =
+      DB.query(db, "UPDATE wakes SET deliveredTurnSeq=?2 WHERE wakeId=?1", [wake_id, seq])
+
     seq
   end
 
