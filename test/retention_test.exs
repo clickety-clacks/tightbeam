@@ -68,6 +68,25 @@ defmodule Tightbeam.RetentionTest do
     assert {:ok, [[1]]} = DB.query(db, "SELECT 1")
   end
 
+  test "invalid retention configuration logs an error and keeps the default", %{db: db} do
+    previous = Application.get_env(:tightbeam, :retention_days)
+    Application.put_env(:tightbeam, :retention_days, "invalid")
+
+    on_exit(fn ->
+      if previous == nil,
+        do: Application.delete_env(:tightbeam, :retention_days),
+        else: Application.put_env(:tightbeam, :retention_days, previous)
+    end)
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        pid = start_supervised!({Retention, db: db, name: nil})
+        assert %{days: 60} = :sys.get_state(pid)
+      end)
+
+    assert log =~ "invalid retention_days"
+  end
+
   defp insert_rows(db, count, ts) do
     assert {:ok, _} =
              DB.transaction(db, fn txn ->
