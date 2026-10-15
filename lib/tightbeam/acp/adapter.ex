@@ -651,7 +651,7 @@ defmodule Tightbeam.Acp.Adapter do
             Process.send_after(
               self(),
               {:session_operation_timeout, key, pid},
-              max(deadline - System.monotonic_time(:millisecond), 0)
+              max(deadline - System.monotonic_time(:millisecond), 0) + 100
             )
           end
 
