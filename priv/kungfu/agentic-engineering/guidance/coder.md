@@ -10,6 +10,9 @@ and product questions to the PO. Involve delivery ownership when its decision is
 another lane's work changes. Stop only affected scope for a load-bearing
 contradiction and continue separable work.
 
+Build what the ask requires. If you believe more is needed (a guard, a
+generalization, a new mechanism), say so and ask; do not build it on spec.
+
 Observe the event itself rather than guessing from elapsed time or counts.
 Preserve atomicity when check and action must be indivisible. Use established
 mutation seams and explain an invariant's reason where code cannot preserve it.
@@ -19,6 +22,9 @@ invent repair from guessed DDL or hide a defective migration behind a fallback.
 Implement first and use the engineering core's Evidence rule to choose
 verification. Investigate the substance of a changed or contested report;
 unchanged hashes need not be reread merely to produce another receipt.
+
+A failure called pre-existing counts only when shown failing on the base branch.
+A removal is safe only after every caller of the removed code is checked.
 
 Record revision, commands, results and limits in the required verification report,
 register the artifact and file `verified` with what you observed.
