@@ -117,10 +117,12 @@ defmodule Tightbeam.RecognitionRetryTest do
                db,
                fn txn ->
                  Txn.q(txn, "INSERT INTO recognized_rows VALUES(1)")
+                 send(parent, {:primary_deadline, txn.deadline})
                  Process.sleep(60)
                  :committed
                end,
                fn txn, _ ->
+                 send(parent, {:recognition_deadline, txn.deadline})
                  Process.sleep(120)
                  Txn.q(txn, "INSERT INTO recognized_rows VALUES(2)")
                end
