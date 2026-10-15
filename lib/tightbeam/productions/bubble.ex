@@ -688,7 +688,9 @@ defmodule Tightbeam.Productions.Bubble do
             if is_integer(fact_id), do: ConditionFacts.recognize_in_txn(txn, fact_id), else: []
 
           {published, deliveries}
-        end
+        end,
+        fallback: fn {published, _fact_id} -> {published, []} end,
+        retry_deliveries: true
       )
 
     ConditionFacts.complete_deliveries(db, deliveries)
@@ -796,7 +798,9 @@ defmodule Tightbeam.Productions.Bubble do
           fn txn, {published, facts} ->
             Tightbeam.Wakes.row_commit_in_txn(txn, [])
             {published, Enum.flat_map(facts, &ConditionFacts.recognize_in_txn(txn, &1))}
-          end
+          end,
+          fallback: fn {published, _facts} -> {published, []} end,
+          retry_deliveries: true
         )
 
       ConditionFacts.complete_deliveries(db, deliveries)
@@ -1137,7 +1141,9 @@ defmodule Tightbeam.Productions.Bubble do
            fn txn, fact ->
              Tightbeam.Wakes.row_commit_in_txn(txn, [])
              {fact, ConditionFacts.recognize_in_txn(txn, fact.fact_id)}
-           end
+           end,
+           fallback: fn fact -> {fact, []} end,
+           retry_deliveries: true
          ) do
       {:ok, {%{fact_id: _}, deliveries}} ->
         ConditionFacts.complete_deliveries(db, deliveries)

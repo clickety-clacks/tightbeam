@@ -203,6 +203,7 @@ defmodule Tightbeam.EventLog do
         [ts, kind, verb, origin, serialize_principal(principal), session_key, encode(payload)]
       )
 
+    Tightbeam.DBObservation.audit_recorded(verb)
     event_id
   end
 

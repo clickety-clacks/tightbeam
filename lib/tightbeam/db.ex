@@ -1,23 +1,13 @@
 defmodule Tightbeam.DB do
   @moduledoc """
-  The single-writer database owner — THE serialization seam (spec: SQLite
-  ownership). One connection, owned by one process; every write goes through
-  `transaction/1` here, so single-writer is a property of the topology, not a
-  convention. Calls are short and bounded (prepared statements, microseconds);
-  this GenServer deliberately serializes them.
-
-  PRAGMAs are pinned on open: WAL, foreign_keys=ON, synchronous=NORMAL,
-  busy_timeout=5000 (deliberate addition over the TS reference — recorded in
-  the port spec). Reads share the same serialized connection in E1; a read
-  pool is a later, additive concern.
-
-  A function running inside a caller's transaction must never re-enter the DB
-  owner by opening another connection or transaction. By convention,
-  `*_in_txn(txn, ...)` helpers write only through the supplied transaction and
-  never open their own; the five CAS tables remain separate modules by design.
+  Single-writer database owner. Transactions and statements that write are
+  serialized here. File-backed databases also open four read-only connections
+  for plain queries, so WAL readers do not wait behind a writer. Private
+  in-memory databases retain their single connection.
   """
 
   use GenServer
+  require Logger
   alias Exqlite.Sqlite3
   alias Tightbeam.{DBObservation, ErrorDiagnostic}
 
@@ -77,6 +67,73 @@ defmodule Tightbeam.DB do
   defmodule DeadlineExceeded do
     @moduledoc false
     defexception message: "database transaction deadline exceeded"
+  end
+
+  defmodule Overloaded do
+    @moduledoc "The database owner has reached its fixed queue limit; retry later."
+    defexception message: "database owner overloaded"
+  end
+
+  @queue_limit 128
+  @deadline_key {__MODULE__, :deadline}
+
+  @doc false
+  def overloaded?(server) do
+    case GenServer.whereis(server) do
+      pid when is_pid(pid) ->
+        case Process.info(pid, :message_queue_len) do
+          {:message_queue_len, length} -> length >= @queue_limit
+          _ -> false
+        end
+
+      _ ->
+        false
+    end
+  end
+
+  @doc false
+  def background_pass(fun, deferred \\ :ok) do
+    case fun.() do
+      {:error, %Overloaded{}} ->
+        Logger.debug("database overloaded; background pass deferred")
+        deferred
+
+      result ->
+        result
+    end
+  rescue
+    _error in Overloaded ->
+      Logger.debug("database overloaded; background pass deferred")
+      deferred
+
+    error in MatchError ->
+      if match?({:error, %Overloaded{}}, error.term) do
+        Logger.debug("database overloaded; background pass deferred")
+        deferred
+      else
+        reraise error, __STACKTRACE__
+      end
+  end
+
+  @doc false
+  def reader(server, sql) do
+    if Regex.match?(~r/\A(?:\s|--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)*(SELECT|WITH|EXPLAIN)\b/i, sql) do
+      with pid when is_pid(pid) <- GenServer.whereis(server),
+           [_ | _] = readers <- :persistent_term.get({__MODULE__, pid}, []) do
+        Enum.at(readers, :erlang.phash2(self(), length(readers)))
+      else
+        _ -> nil
+      end
+    else
+      nil
+    end
+  end
+
+  @doc false
+  def read_query(conn, sql, params) do
+    {:ok, run_query(conn, sql, params)}
+  rescue
+    error -> {:error, error}
   end
 
   ## Client
@@ -239,20 +296,40 @@ defmodule Tightbeam.DB do
   def transaction_then(server \\ __MODULE__, prepare, after_commit)
 
   def transaction_then(server, prepare, after_commit)
-      when is_function(prepare, 1) and is_function(after_commit, 1) do
-    case DBObservation.call(server, {:transaction, prepare}, "db.transaction", call_timeout()) do
-      {:ok, result} -> run_after_commit(after_commit, result, MapSet.new())
-      {:error, error} -> {:error, error}
+      when is_function(prepare, 1) and is_function(after_commit) do
+    transaction_then(server, prepare, after_commit, [])
+  end
+
+  @doc false
+  def transaction_then(server, prepare, after_commit, opts)
+      when is_function(prepare, 1) and is_function(after_commit) do
+    deadline = System.monotonic_time(:millisecond) + call_timeout()
+
+    case DBObservation.call(
+           server,
+           if(opts == [],
+             do: {:transaction_then, prepare, after_commit},
+             else: {:transaction_then, prepare, after_commit, opts}
+           ),
+           "db.transaction",
+           call_timeout()
+         ) do
+      {:ok, %Tightbeam.Recognition.Pending{} = pending} ->
+        Tightbeam.Recognition.inline(server, pending, after_commit, opts, deadline)
+
+      other ->
+        other
     end
   end
 
-  def transaction_then(server, prepare, after_commit)
-      when is_function(prepare, 1) and is_function(after_commit, 2) do
+  @doc false
+  def publish_transaction(server, callback) do
     DBObservation.call(
       server,
-      {:transaction_then, prepare, after_commit},
+      {:transaction, callback},
       "db.transaction",
-      call_timeout()
+      call_timeout(),
+      :publication
     )
   end
 
@@ -360,7 +437,8 @@ defmodule Tightbeam.DB do
 
     @doc "Run one SQL statement inside the transaction; returns rows (positional lists)."
     @spec q(t(), String.t(), [term()]) :: [Tightbeam.DB.row()]
-    def q(%__MODULE__{conn: conn, query_trace: trace}, sql, params \\ []) do
+    def q(%__MODULE__{conn: conn, query_trace: trace} = txn, sql, params \\ []) do
+      ensure_before_deadline(txn)
       trace_query(trace, sql, params)
       Tightbeam.DB.run_query(conn, sql, params)
     end
@@ -379,11 +457,15 @@ defmodule Tightbeam.DB do
 
     @doc "Execute a statement without results inside the transaction."
     @spec exec(t(), String.t()) :: :ok
-    def exec(%__MODULE__{conn: conn}, sql), do: Tightbeam.DB.execute_sql!(conn, sql)
+    def exec(%__MODULE__{conn: conn} = txn, sql) do
+      ensure_before_deadline(txn)
+      Tightbeam.DB.execute_sql!(conn, sql)
+    end
 
     @doc "Rows changed by the last statement — the CAS check for guarded UPDATEs."
     @spec changes(t()) :: non_neg_integer()
-    def changes(%__MODULE__{conn: conn}) do
+    def changes(%__MODULE__{conn: conn} = txn) do
+      ensure_before_deadline(txn)
       {:ok, n} = Sqlite3.changes(conn)
       n
     end
@@ -506,12 +588,27 @@ defmodule Tightbeam.DB do
       end
 
       :ok = load_topline_unicode(conn)
-      {:ok, %{conn: conn, admission: admission, reference_fences: %{}}}
+      if path == ":memory:", do: :ok = Tightbeam.Recognition.ensure_sqlite_schema(conn)
+      {:ok, retry} = Tightbeam.Recognition.start_link(self(), path == ":memory:")
+      readers = open_readers(path)
+      :persistent_term.put({__MODULE__, self()}, readers)
+
+      {:ok,
+       %{conn: conn, readers: readers, retry: retry, admission: admission, reference_fences: %{}}}
     rescue
       error ->
         :ok = Sqlite3.close(conn)
         reraise error, __STACKTRACE__
     end
+  end
+
+  defp open_readers(":memory:"), do: []
+
+  defp open_readers(path) do
+    Enum.map(1..4, fn _ ->
+      {:ok, reader} = Tightbeam.DB.Reader.start_link(path)
+      reader
+    end)
   end
 
   defp prepare_persistent_admission!(":memory:", _opts), do: {":memory:", nil}
@@ -539,7 +636,12 @@ defmodule Tightbeam.DB do
   end
 
   @impl true
-  def terminate(_reason, %{conn: conn}) do
+  def terminate(_reason, %{conn: conn, readers: readers, retry: retry}) do
+    Process.unlink(retry)
+    Process.exit(retry, :shutdown)
+    :persistent_term.erase({Tightbeam.Recognition, self()})
+    :persistent_term.erase({__MODULE__, self()})
+    Enum.each(readers, &GenServer.stop/1)
     # close_v2 may defer destruction until remaining statements finalize.
     # Abnormal process death uses the same Exqlite resource destructor.
     Sqlite3.close(conn)
@@ -550,16 +652,40 @@ defmodule Tightbeam.DB do
   def handle_call({:db_call, envelope, payload}, from, state) do
     # Delegate to the existing handler so admission, fences, deadlines and all
     # state transitions retain their current owner and ordering (R2/R3).
-    DBObservation.server(envelope, 5_000, fn -> handle_call(payload, from, state) end)
+    DBObservation.server(envelope, 5_000, fn ->
+      with_deadline(
+        envelope.deadline,
+        fn ->
+          handle_call(payload, from, state)
+        end,
+        state
+      )
+    end)
   end
 
-  defp observed_transaction(callback, run) do
+  defp observed_transaction(callback, state, run) do
     case DBObservation.transaction_metadata(callback) do
       {:ok, envelope, original_callback} ->
-        DBObservation.server(envelope, 5_000, fn -> run.(original_callback) end)
+        DBObservation.server(envelope, 5_000, fn ->
+          with_deadline(envelope.deadline, fn -> run.(original_callback) end, state)
+        end)
 
       :none ->
         run.(callback)
+    end
+  end
+
+  defp with_deadline(deadline, fun, state) do
+    if System.monotonic_time(:millisecond) >= deadline do
+      {:reply, {:error, %DeadlineExceeded{}}, state}
+    else
+      previous = Process.put(@deadline_key, deadline)
+
+      try do
+        fun.()
+      after
+        if previous, do: Process.put(@deadline_key, previous), else: Process.delete(@deadline_key)
+      end
     end
   end
 
@@ -657,17 +783,34 @@ defmodule Tightbeam.DB do
   end
 
   def handle_call({:query, sql, params}, _from, %{conn: conn} = state) do
-    {:reply, {:ok, run_query(conn, sql, params)}, state}
+    reply =
+      if DBObservation.audit_active?() do
+        commit_phase(conn, fn txn -> Txn.q(txn, sql, params) end, fenced_archetypes(state))
+      else
+        {:ok, run_query(conn, sql, params)}
+      end
+
+    {:reply, reply, state}
   rescue
     e -> {:reply, {:error, e}, state}
   end
 
   def handle_call({:execute, sql}, _from, %{conn: conn} = state) do
-    {:reply, execute_sql(conn, sql), state}
+    reply =
+      if DBObservation.audit_active?() do
+        case commit_phase(conn, fn _ -> execute_sql!(conn, sql) end, fenced_archetypes(state)) do
+          {:ok, :ok} -> :ok
+          error -> error
+        end
+      else
+        execute_sql(conn, sql)
+      end
+
+    {:reply, reply, state}
   end
 
   def handle_call({:transaction, fun}, _from, %{conn: conn} = state) do
-    observed_transaction(fun, fn callback ->
+    observed_transaction(fun, state, fn callback ->
       Process.put(row_commit_key(conn), [])
 
       try do
@@ -679,7 +822,7 @@ defmodule Tightbeam.DB do
   end
 
   def handle_call({:transaction_until, fun, deadline}, _from, %{conn: conn} = state) do
-    observed_transaction(fun, fn callback ->
+    observed_transaction(fun, state, fn callback ->
       remaining = deadline - System.monotonic_time(:millisecond)
 
       if remaining <= 0 do
@@ -703,22 +846,32 @@ defmodule Tightbeam.DB do
 
   def handle_call(
         {:transaction_then, prepare, after_commit},
+        from,
+        state
+      ) do
+    handle_call({:transaction_then, prepare, after_commit, []}, from, state)
+  end
+
+  def handle_call(
+        {:transaction_then, prepare, after_commit, opts},
         _from,
         %{conn: conn} = state
       )
-      when is_function(after_commit, 2) do
-    observed_transaction(prepare, fn callback ->
+      when is_function(after_commit) do
+    observed_transaction(prepare, state, fn callback ->
       Process.put(row_commit_key(conn), [])
 
       try do
         reply =
-          case commit_phase(conn, callback, fenced_archetypes(state)) do
-            {:ok, result} ->
-              run_after_commit(conn, after_commit, result, fenced_archetypes(state))
-
-            {:error, error} ->
-              {:error, error}
-          end
+          commit_phase(
+            conn,
+            fn txn ->
+              result = callback.(txn)
+              transitions = take_row_commits(txn)
+              Tightbeam.Recognition.record(txn, after_commit, result, transitions, opts)
+            end,
+            fenced_archetypes(state)
+          )
 
         {:reply, reply, state}
       after
@@ -772,6 +925,31 @@ defmodule Tightbeam.DB do
   end
 
   @impl true
+  def handle_cast({:dispatch_audit, audit}, %{conn: conn} = state) do
+    case commit_phase(
+           conn,
+           fn txn ->
+             Tightbeam.EventLog.append_event_in_txn(
+               txn,
+               audit.kind,
+               audit.verb,
+               audit.origin,
+               audit.session_key,
+               audit.payload,
+               audit.principal,
+               System.system_time(:millisecond)
+             )
+           end,
+           fenced_archetypes(state)
+         ) do
+      {:error, _} -> Logger.warning("dispatch audit could not be recorded")
+      _ -> :ok
+    end
+
+    {:noreply, state}
+  end
+
+  @impl true
   def handle_info({:DOWN, monitor, :process, owner, _reason}, %{reference_fences: fences} = state) do
     fences =
       Enum.reduce(fences, fences, fn {token, fence}, acc ->
@@ -803,13 +981,16 @@ defmodule Tightbeam.DB do
 
   # Each real transaction owns a distinct queue. Invalidate it before sending
   # casts; later recognition failure cannot undo the first committed phase.
-  # `deadline` is a fourth parameter with a default rather than a generalised
-  # one, so every caller that has no deadline keeps its existing three-argument
-  # call unchanged and :infinity makes the two deadline checks no-ops. The two
-  # guards stay independent: the fence is enforced inside `fun` via
-  # `assert_archetype_available!`, the deadline around it via
-  # `ensure_before_deadline`, and neither consults the other.
-  defp commit_phase(conn, fun, fenced_archetypes, deadline \\ :infinity) do
+  # Runtime calls inherit their caller's absolute deadline. Explicit deadlines
+  # can shorten it; migration callbacks retain an unbounded transaction handle.
+  defp commit_phase(conn, fun, fenced_archetypes, deadline \\ nil) do
+    deadline =
+      case {deadline, Process.get(@deadline_key, :infinity)} do
+        {nil, inherited} -> inherited
+        {explicit, :infinity} -> explicit
+        {explicit, inherited} -> min(explicit, inherited)
+      end
+
     token = make_ref()
     key = {Txn, :outbox, token}
     Process.put(key, [])
@@ -836,7 +1017,17 @@ defmodule Tightbeam.DB do
 
         try do
           Process.put(@commit_phase_key, :callback)
+
+          changes_before =
+            if DBObservation.audit_active?(), do: Txn.q(txn, "SELECT total_changes()")
+
           result = DBObservation.callback(fn -> fun.(txn) end)
+
+          if changes_before do
+            changes_after = Txn.q(txn, "SELECT total_changes()")
+            DBObservation.audit_in_txn(txn, changes_after != changes_before)
+          end
+
           Process.put(@commit_phase_key, :before_commit)
           Txn.ensure_before_deadline(txn)
           Process.put(@commit_phase_key, :commit)
@@ -925,20 +1116,6 @@ defmodule Tightbeam.DB do
       :ok
   end
 
-  defp run_after_commit(after_commit, result, _fenced_archetypes)
-       when is_function(after_commit, 1) do
-    try do
-      {:ok, after_commit.(result)}
-    rescue
-      error -> {:error, error}
-    end
-  end
-
-  defp run_after_commit(conn, after_commit, result, fenced_archetypes)
-       when is_function(after_commit, 2) do
-    commit_phase(conn, fn txn -> after_commit.(txn, result) end, fenced_archetypes)
-  end
-
   defp fenced_archetypes(%{reference_fences: fences}) do
     Enum.reduce(fences, MapSet.new(), fn {_token, fence}, acc ->
       MapSet.union(acc, fence.archetypes)
@@ -962,7 +1139,11 @@ defmodule Tightbeam.DB do
     try do
       result =
         DBObservation.callback(fn ->
-          check.(%Txn{conn: conn, fenced_archetypes: fenced_archetypes})
+          check.(%Txn{
+            conn: conn,
+            fenced_archetypes: fenced_archetypes,
+            deadline: Process.get(@deadline_key, :infinity)
+          })
         end)
 
       case result do
@@ -1028,7 +1209,8 @@ defmodule Tightbeam.DB do
     end)
   end
 
-  defp load_topline_unicode(conn) do
+  @doc false
+  def load_topline_unicode(conn) do
     extension = if match?({:unix, :darwin}, :os.type()), do: ".dylib", else: ".so"
     path = Application.app_dir(:tightbeam, "priv/topline_unicode#{extension}")
     :ok = Sqlite3.enable_load_extension(conn, true)

@@ -896,7 +896,8 @@ defmodule Tightbeam.Escalation do
               fn txn, {result, transitions} ->
                 Tightbeam.Wakes.row_commit_in_txn(txn, transitions)
                 result
-              end
+              end,
+              fallback: fn {result, _transitions} -> result end
             )
 
           result
@@ -937,7 +938,9 @@ defmodule Tightbeam.Escalation do
                    else: []
 
                {result, deliveries}
-             end
+             end,
+             fallback: fn {result, _fact_id, _transitions} -> {result, []} end,
+             retry_deliveries: true
            ) do
         {:ok, {result, deliveries}} ->
           ConditionFacts.complete_deliveries(
@@ -1045,7 +1048,8 @@ defmodule Tightbeam.Escalation do
           fn txn, {result, transitions} ->
             Tightbeam.Wakes.row_commit_in_txn(txn, transitions)
             result
-          end
+          end,
+          fallback: fn {result, _transitions} -> result end
         )
 
       result
@@ -1695,7 +1699,8 @@ defmodule Tightbeam.Escalation do
         fn txn, {consumed?, transitions} ->
           Tightbeam.Wakes.row_commit_in_txn(txn, transitions)
           consumed?
-        end
+        end,
+        fallback: fn {consumed?, _transitions} -> consumed? end
       )
 
     consumed?
@@ -1950,7 +1955,8 @@ defmodule Tightbeam.Escalation do
         fn txn, transitions ->
           Tightbeam.Wakes.row_commit_in_txn(txn, transitions)
           :ok
-        end
+        end,
+        fallback: fn _transitions -> :ok end
       )
 
     :ok
@@ -2034,7 +2040,8 @@ defmodule Tightbeam.Escalation do
         fn txn, transitions ->
           Tightbeam.Wakes.row_commit_in_txn(txn, transitions)
           :ok
-        end
+        end,
+        fallback: fn _transitions -> :ok end
       )
 
     :ok
@@ -3272,7 +3279,9 @@ defmodule Tightbeam.Escalation do
             if is_integer(fact_id), do: ConditionFacts.recognize_in_txn(txn, fact_id), else: []
 
           {result, deliveries}
-        end
+        end,
+        fallback: fn {result, _fact_id, _transition} -> {result, []} end,
+        retry_deliveries: true
       )
 
     ConditionFacts.complete_deliveries(
@@ -3369,7 +3378,9 @@ defmodule Tightbeam.Escalation do
             end)
 
           {waiver, deliveries, Enum.map(recognized, &elem(&1, 0))}
-        end
+        end,
+        fallback: fn {waiver, recognized} -> {waiver, [], Enum.map(recognized, &elem(&1, 0))} end,
+        retry_deliveries: true
       )
 
     ConditionFacts.complete_deliveries(
@@ -3422,7 +3433,8 @@ defmodule Tightbeam.Escalation do
         fn txn, {result, transition} ->
           Tightbeam.Wakes.row_commit_in_txn(txn, List.wrap(transition))
           result
-        end
+        end,
+        fallback: fn {result, _transition} -> result end
       )
 
     result

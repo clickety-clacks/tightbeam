@@ -162,6 +162,11 @@ defmodule Tightbeam.Retention do
         Process.send_after(self(), :trim, @yield_ms)
         {:noreply, %{state | cursor: cursor, cutoff: cutoff}}
 
+      {:error, %DB.Overloaded{}} ->
+        Logger.debug("database overloaded; background pass deferred")
+        Process.send_after(self(), :trim, 5_000)
+        {:noreply, state}
+
       {:error, error} ->
         Logger.error("lifecycle retention failed: #{inspect(error)}")
         Process.send_after(self(), :trim, @interval)
