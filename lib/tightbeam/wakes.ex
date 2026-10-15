@@ -7818,7 +7818,9 @@ defmodule Tightbeam.Wakes do
             [[due_at]] ->
               deadline = System.monotonic_time(:millisecond) + max(0, due_at - now())
               :erlang.start_timer(deadline, self(), :due, abs: true)
-            [] -> nil
+
+            [] ->
+              nil
           end
         end,
         nil
@@ -7865,22 +7867,25 @@ defmodule Tightbeam.Wakes do
         )
         |> Enum.flat_map(fn row ->
           try do
-          wake = to_wake(row)
+            wake = to_wake(row)
 
-          case resolved_recipient(txn, wake) do
-            {recipient, _, _} ->
-              if Txn.q(
-                   txn,
-                   "SELECT 1 FROM turns WHERE sessionKey=?1 AND status IN ('running','queued') LIMIT 1",
-                   [recipient]
-                 ) == [], do: [{wake, recipient}], else: []
+            case resolved_recipient(txn, wake) do
+              {recipient, _, _} ->
+                if Txn.q(
+                     txn,
+                     "SELECT 1 FROM turns WHERE sessionKey=?1 AND status IN ('running','queued') LIMIT 1",
+                     [recipient]
+                   ) == [], do: [{wake, recipient}], else: []
 
-            nil ->
-              []
-          end
+              nil ->
+                []
+            end
           rescue
             error ->
-              Logger.error("wake scheduler miss candidate #{hd(row)} refused: #{Exception.message(error)}")
+              Logger.error(
+                "wake scheduler miss candidate #{hd(row)} refused: #{Exception.message(error)}"
+              )
+
               []
           end
         end)
@@ -7892,11 +7897,15 @@ defmodule Tightbeam.Wakes do
       )
 
       Process.put(:wake_scheduler_misses, Process.get(:wake_scheduler_misses, 0) + 1)
+
       try do
         deliver_eligible_waits(state.db, state.delivery_opts, recipient)
         NoticeBatcher.recover(state.db, at, state.delivery_opts, recipient)
       rescue
-        error -> Logger.error("wake scheduler miss recovery #{wake.wake_id} failed: #{Exception.message(error)}")
+        error ->
+          Logger.error(
+            "wake scheduler miss recovery #{wake.wake_id} failed: #{Exception.message(error)}"
+          )
       end
     end
 

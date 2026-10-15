@@ -122,8 +122,10 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
 
   test "distant deadlines keep one timer without overflowing a relative timeout", ctx do
     pid = scheduler(ctx)
-    scheduled = wake(ctx.db, System.system_time(:millisecond) + 60 * 86_400_000,
-      %{consumer: "test"})
+
+    scheduled =
+      wake(ctx.db, System.system_time(:millisecond) + 60 * 86_400_000, %{consumer: "test"})
+
     assert is_reference(:sys.get_state(pid).timer)
     assert Wakes.get(ctx.db, scheduled.wake_id).state == "pending"
     refute_receive {:delivered, _, _}, 100

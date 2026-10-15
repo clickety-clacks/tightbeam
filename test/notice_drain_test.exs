@@ -94,12 +94,15 @@ defmodule Tightbeam.NoticeDrainTest do
     :sys.get_state(scheduler)
     assert Wakes.get(ctx.db, due.wake_id).state == "pending"
 
-    assert {:ok, :ok} = DB.transaction(ctx.db, fn txn ->
-      DB.Txn.q(txn, "UPDATE wakes SET dueAt=?2 WHERE wakeId=?1", [
-        due.wake_id, System.system_time(:millisecond) - 1
-      ])
-      Wakes.schedule_changed_in_txn(txn)
-    end)
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               DB.Txn.q(txn, "UPDATE wakes SET dueAt=?2 WHERE wakeId=?1", [
+                 due.wake_id,
+                 System.system_time(:millisecond) - 1
+               ])
+
+               Wakes.schedule_changed_in_txn(txn)
+             end)
 
     await_delivery(ctx.db, due.wake_id)
     assert Wakes.get(ctx.db, due.wake_id).state == "fired"
@@ -211,9 +214,15 @@ defmodule Tightbeam.NoticeDrainTest do
   end
 
   test "a busy backlog adds no idle database calls or preparation", ctx do
-    scheduler = start_supervised!({Wakes, db: ctx.db, name: nil,
-      deliver: fn _ -> flunk("unexpected delivery") end,
-      delivery_opts: ctx.delivery_opts})
+    scheduler =
+      start_supervised!(
+        {Wakes,
+         db: ctx.db,
+         name: nil,
+         deliver: fn _ -> flunk("unexpected delivery") end,
+         delivery_opts: ctx.delivery_opts}
+      )
+
     Process.sleep(300)
     :ok = Wakes.fire_due(scheduler)
     empty = idle_requests(ctx.db)
@@ -325,12 +334,21 @@ defmodule Tightbeam.NoticeDrainTest do
 
     :sys.get_state(scheduler)
     # Insert after boot with its event deliberately omitted, simulating a miss.
-    assert {:ok, due} = DB.transaction(ctx.db, fn txn ->
-      source = Wakes.schedule_in_txn(txn, %{session_key: "recipient", origin: "process:test",
-        prompt: "notice", due_at: System.system_time(:millisecond) - 61_000, target_gate: 0})
-      Process.put({DB.Txn, :outbox, txn.outbox}, [])
-      source
-    end)
+    assert {:ok, due} =
+             DB.transaction(ctx.db, fn txn ->
+               source =
+                 Wakes.schedule_in_txn(txn, %{
+                   session_key: "recipient",
+                   origin: "process:test",
+                   prompt: "notice",
+                   due_at: System.system_time(:millisecond) - 61_000,
+                   target_gate: 0
+                 })
+
+               Process.put({DB.Txn, :outbox, txn.outbox}, [])
+               source
+             end)
+
     send(scheduler, :detect_misses)
     :sys.get_state(scheduler)
     assert Wakes.health(scheduler) == %{misses: 1}
@@ -359,9 +377,12 @@ defmodule Tightbeam.NoticeDrainTest do
 
   defp await_delivery(db, wake_id, attempts \\ 100)
   defp await_delivery(_db, _wake_id, 0), do: flunk("deadline event did not deliver the notice")
+
   defp await_delivery(db, wake_id, attempts) do
     case DB.query(db, "SELECT deliveredTurnSeq FROM wakes WHERE wakeId=?1", [wake_id]) do
-      {:ok, [[seq]]} when is_integer(seq) -> seq
+      {:ok, [[seq]]} when is_integer(seq) ->
+        seq
+
       _ ->
         Process.sleep(10)
         await_delivery(db, wake_id, attempts - 1)

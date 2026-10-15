@@ -858,8 +858,12 @@ defmodule Tightbeam.RowDrivenWaitsTest do
       register_wait(ctx.db, System.system_time(:millisecond) - 1, predicate("R", nil, "V2"))
 
     assert fallback.recognition_path == nil
-    assert :ok = Ledger.finish(ctx.db, originating.seq, "delivered", nil,
-      owner_lease: originating.owner_lease)
+
+    assert :ok =
+             Ledger.finish(ctx.db, originating.seq, "delivered", nil,
+               owner_lease: originating.owner_lease
+             )
+
     assert :ok = Wakes.fire_due(ctx.scheduler)
 
     fired = Wakes.get(ctx.db, fallback.wake_id)
