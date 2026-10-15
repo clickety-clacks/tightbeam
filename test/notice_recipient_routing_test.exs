@@ -64,28 +64,6 @@ defmodule Tightbeam.NoticeRecipientRoutingTest do
       assert before.session_key == "previous-recipient"
       at = System.system_time(:millisecond)
 
-      # Resolving a recipient cannot update the source, expire an incident or
-      # publish even a diagnostic event, including when routing is stale.
-      assert {:ok, :ok} =
-               DB.transaction(ctx.db, fn txn ->
-                 [[changes]] = Txn.q(txn, "SELECT total_changes()")
-
-                 case kind do
-                   :terminal ->
-                     assert {:ok, target} = Wakes.terminal_notice_target_in_txn(txn, before)
-                     assert target == ctx.current
-
-                   :idle_cleanup ->
-                     assert {:idle_cleanup, target} =
-                              Supervision.idle_cleanup_target_in_txn(txn, before, at)
-
-                     assert target == ctx.current
-                 end
-
-                 assert [[changes]] == Txn.q(txn, "SELECT total_changes()")
-                 :ok
-               end)
-
       {carriers, prepared} = recover_traced(ctx, ctx.db, at)
 
       if current_busy do
@@ -109,6 +87,36 @@ defmodule Tightbeam.NoticeRecipientRoutingTest do
                  ctx.db,
                  "SELECT COUNT(*) FROM notice_batches WHERE sessionKey='previous-recipient'"
                )
+    end
+  end
+
+  for kind <- [:terminal, :idle_cleanup] do
+    @tag new_read_only_api: true
+    test "resolving the current #{kind} recipient writes no rows", ctx do
+      kind = unquote(kind)
+      before = source!(ctx, kind)
+      at = System.system_time(:millisecond)
+      # Resolving a recipient cannot update the source, expire an incident or
+      # publish even a diagnostic event, including when routing is stale.
+      assert {:ok, :ok} =
+               DB.transaction(ctx.db, fn txn ->
+                 [[changes]] = Txn.q(txn, "SELECT total_changes()")
+
+                 case kind do
+                   :terminal ->
+                     assert {:ok, target} = Wakes.terminal_notice_target_in_txn(txn, before)
+                     assert target == ctx.current
+
+                   :idle_cleanup ->
+                     assert {:idle_cleanup, target} =
+                              Supervision.idle_cleanup_target_in_txn(txn, before, at)
+
+                     assert target == ctx.current
+                 end
+
+                 assert [[changes]] == Txn.q(txn, "SELECT total_changes()")
+                 :ok
+               end)
     end
   end
 
