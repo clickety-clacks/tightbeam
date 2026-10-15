@@ -106,6 +106,7 @@ defmodule Tightbeam.SupervisionRecordedStateTest do
 
   test "historical observations copy in bounded batches, skip bad records, and resume", %{db: db} do
     :ok = Schema.ensure_all(db)
+    seed_session(db)
 
     :ok =
       DB.execute(db, """
@@ -118,10 +119,10 @@ defmodule Tightbeam.SupervisionRecordedStateTest do
       """)
 
     assert {:ok, false} = DB.transaction(db, &Supervision.backfill_idle_cleanup_in_txn/1)
-    assert {:ok, [[1000]]} = DB.query(db, "SELECT COUNT(*) FROM idle_cleanup_observations")
+    assert {:ok, [["wake-1000","wake-999"]]} = DB.query(db, "SELECT idleCleanupObservedWake,idleCleanupPreviousWake FROM sessions WHERE sessionKey='s'")
     assert :ok = Schema.ensure_all(db)
     assert {:ok, true} = DB.transaction(db, &Supervision.backfill_idle_cleanup_in_txn/1)
-    assert {:ok, [[1001]]} = DB.query(db, "SELECT COUNT(*) FROM idle_cleanup_observations")
+    assert {:ok, [["wake-1001","wake-1000"]]} = DB.query(db, "SELECT idleCleanupObservedWake,idleCleanupPreviousWake FROM sessions WHERE sessionKey='s'")
 
     assert {:ok, [[1]]} =
              DB.query(
@@ -135,42 +136,76 @@ defmodule Tightbeam.SupervisionRecordedStateTest do
   test "batched cleanup delivery records its members once in the delivery transaction", %{db: db} do
     :ok = Schema.ensure_all(db)
     seed_session(db)
-    metadata = %{"group" => "parent", "owner" => "owner", "n" => 2,
-                 "depth" => 3, "main" => true, "members" => %{"s" => "token"}}
+
+    metadata = %{
+      "group" => "parent",
+      "owner" => "owner",
+      "n" => 2,
+      "depth" => 3,
+      "main" => true,
+      "members" => %{"s" => "token"}
+    }
+
     group = :crypto.hash(:sha256, "idle-cleanup-group-v1\0parent") |> Base.encode16(case: :lower)
     ref = "idle-cleanup-v1:" <> group <> "|token|\n" <> JSON.encode!(metadata)
-    {:ok, _} = DB.query(db, """
-    INSERT INTO wakes(wakeId,sessionKey,origin,prompt,dueAt,createdAt,obligationRef)
-      VALUES('cleanup','s','process:tightbeam','cleanup',1,1,?1)
-    """, [ref])
-    :ok = DB.execute(db, """
-    INSERT INTO wakes(wakeId,sessionKey,origin,prompt,dueAt,createdAt)
-      VALUES('carrier','s','process:tightbeam','batch',1,1);
-    INSERT INTO notice_batches(batchId,recipientAddress,sessionKey,visibilityScope,policyRevision,
-      state,dueAt,openedAt,sealedAt,deliveryToken,envelope,deliveryWakeId)
-      VALUES('batch','session:s','s','owner','fixture','delivery_pending',1,1,1,'token','batch','carrier');
-    INSERT INTO notice_batch_members(memberId,batchId,sourceWakeId,policyRef,recipientAddress,
-      visibilityScope,publicationSeq,policyRevision,senderPrincipal,cause,class,payload,renderedBytes,state,addedAt)
-      VALUES('member','batch','cleanup','policy','session:s','owner',1,'fixture','process:tightbeam',
-             'idle_cleanup','fyi','cleanup',7,'included',1);
-    INSERT INTO turns(sessionKey,messageId,origin,prompt,status,createdAt,wakeId)
-      VALUES('s','batch-message','process:tightbeam','batch','queued',1,'carrier');
-    """)
-    assert {:ok, :ok} = DB.transaction(db, fn txn ->
-      Tightbeam.NoticeBatcher.enqueue_or_recover_in_txn(txn, {:delivered, "carrier", 42})
-    end)
-    assert {:ok, [[1,42,3,1]]} = DB.query(db, Supervision.idle_cleanup_delivery_history_sql(), [group,"token"])
-    assert {:ok, :ok} = DB.transaction(db, fn txn ->
-      Supervision.record_idle_cleanup_delivery_in_txn(txn, "cleanup")
-    end)
-    assert {:ok, [[1,42,3,1]]} = DB.query(db, Supervision.idle_cleanup_delivery_history_sql(), [group,"token"])
-    :ok = DB.execute(db, "DELETE FROM idle_cleanup_state; UPDATE wakes SET idleCleanupRecorded=0 WHERE wakeId='cleanup'")
-    assert {:error, _} = DB.transaction(db, fn txn ->
-      Supervision.record_idle_cleanup_delivery_in_txn(txn, "cleanup")
-      raise "rollback delivery"
-    end)
+
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT INTO wakes(wakeId,sessionKey,origin,prompt,dueAt,createdAt,obligationRef)
+          VALUES('cleanup','s','process:tightbeam','cleanup',1,1,?1)
+        """,
+        [ref]
+      )
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO wakes(wakeId,sessionKey,origin,prompt,dueAt,createdAt)
+        VALUES('carrier','s','process:tightbeam','batch',1,1);
+      INSERT INTO notice_batches(batchId,recipientAddress,sessionKey,visibilityScope,policyRevision,
+        state,dueAt,openedAt,sealedAt,deliveryToken,envelope,deliveryWakeId)
+        VALUES('batch','session:s','s','owner','fixture','delivery_pending',1,1,1,'token','batch','carrier');
+      INSERT INTO notice_batch_members(memberId,batchId,sourceWakeId,policyRef,recipientAddress,
+        visibilityScope,publicationSeq,policyRevision,senderPrincipal,cause,class,payload,renderedBytes,state,addedAt)
+        VALUES('member','batch','cleanup','policy','session:s','owner',1,'fixture','process:tightbeam',
+               'idle_cleanup','fyi','cleanup',7,'included',1);
+      INSERT INTO turns(sessionKey,messageId,origin,prompt,status,createdAt,wakeId)
+        VALUES('s','batch-message','process:tightbeam','batch','queued',1,'carrier');
+      """)
+
+    assert {:ok, :ok} =
+             DB.transaction(db, fn txn ->
+               Tightbeam.NoticeBatcher.enqueue_or_recover_in_txn(txn, {:delivered, "carrier", 42})
+             end)
+
+    assert {:ok, [[1, 42, 3, 1]]} =
+             DB.query(db, Supervision.idle_cleanup_delivery_history_sql(), [group, "token"])
+
+    assert {:ok, :ok} =
+             DB.transaction(db, fn txn ->
+               Supervision.record_idle_cleanup_delivery_in_txn(txn, "cleanup")
+             end)
+
+    assert {:ok, [[1, 42, 3, 1]]} =
+             DB.query(db, Supervision.idle_cleanup_delivery_history_sql(), [group, "token"])
+
+    :ok =
+      DB.execute(
+        db,
+        "DELETE FROM idle_cleanup_state; UPDATE wakes SET idleCleanupRecorded=0 WHERE wakeId='cleanup'"
+      )
+
+    assert {:error, _} =
+             DB.transaction(db, fn txn ->
+               Supervision.record_idle_cleanup_delivery_in_txn(txn, "cleanup")
+               raise "rollback delivery"
+             end)
+
     assert {:ok, []} = DB.query(db, "SELECT * FROM idle_cleanup_state")
-    assert {:ok, [[0]]} = DB.query(db, "SELECT idleCleanupRecorded FROM wakes WHERE wakeId='cleanup'")
+
+    assert {:ok, [[0]]} =
+             DB.query(db, "SELECT idleCleanupRecorded FROM wakes WHERE wakeId='cleanup'")
   end
 
   defp seed_session(db) do

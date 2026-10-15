@@ -1747,11 +1747,9 @@ defmodule Tightbeam.Schema do
               deliveredDepth INTEGER NOT NULL, deliveredMain INTEGER NOT NULL,
               PRIMARY KEY(groupDigest,memberToken)
             );
-            CREATE TABLE idle_cleanup_observations (
-              observedOrder INTEGER PRIMARY KEY AUTOINCREMENT, wakeId TEXT NOT NULL UNIQUE, sessionKey TEXT NOT NULL
-            );
-            CREATE INDEX idle_cleanup_observations_session
-              ON idle_cleanup_observations(sessionKey,observedOrder DESC);
+            ALTER TABLE sessions ADD COLUMN idleCleanupObservedWake TEXT;
+            ALTER TABLE sessions ADD COLUMN idleCleanupPreviousWake TEXT;
+            ALTER TABLE wakes ADD COLUMN idleCleanupObserved INTEGER NOT NULL DEFAULT 0;
             ALTER TABLE wakes ADD COLUMN idleCleanupGroup TEXT;
             ALTER TABLE wakes ADD COLUMN idleCleanupRecorded INTEGER NOT NULL DEFAULT 0;
             CREATE INDEX idle_cleanup_pending_group ON wakes(idleCleanupGroup)

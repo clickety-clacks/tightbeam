@@ -4507,9 +4507,7 @@ defmodule Tightbeam.Supervision do
       JOIN sessions s ON s.sessionKey=w.sessionKey
       WHERE w.state='pending' AND w.consumer='prompt'
         AND s.state='active' AND s.isBuiltIn=0
-        AND NOT EXISTS (
-          SELECT 1 FROM idle_cleanup_observations o WHERE o.wakeId=w.wakeId
-        )
+        AND w.idleCleanupObserved=0
       ORDER BY w.rowid
       """
     )
@@ -4525,29 +4523,30 @@ defmodule Tightbeam.Supervision do
         })
       )
 
-      Txn.q(
-        txn,
-        """
-        INSERT INTO idle_cleanup_observations(wakeId,sessionKey) VALUES(?1,?2)
-        """,
-        [wake_id, session_key]
-      )
+      record_idle_cleanup_observation_in_txn(txn, wake_id, session_key)
     end)
   end
 
   defp idle_cleanup_occurrences_in_txn(_txn, ignored_wake), do: ignored_wake
 
   defp idle_cleanup_occurrence(txn, ignored_wake, session_key) do
-    Txn.q(
-      txn,
-      """
-      SELECT wakeId FROM idle_cleanup_observations
-      WHERE sessionKey=?1 AND (?2 IS NULL OR wakeId<>?2)
-      ORDER BY observedOrder DESC LIMIT 1
-      """,
-      [session_key, ignored_wake]
-    )
-    |> JSON.encode!()
+    case Txn.q(txn, """
+         SELECT CASE WHEN idleCleanupObservedWake=?2 THEN idleCleanupPreviousWake
+                     ELSE idleCleanupObservedWake END
+         FROM sessions WHERE sessionKey=?1
+         """, [session_key, ignored_wake]) do
+      [[wake_id]] when is_binary(wake_id) -> JSON.encode!([[wake_id]])
+      _ -> JSON.encode!([])
+    end
+  end
+
+  defp record_idle_cleanup_observation_in_txn(txn, wake_id, session_key) do
+    Txn.q(txn, """
+    UPDATE sessions SET idleCleanupPreviousWake=idleCleanupObservedWake,
+      idleCleanupObservedWake=?2
+    WHERE sessionKey=?1 AND idleCleanupObservedWake IS NOT ?2
+    """, [session_key, wake_id])
+    Txn.q(txn, "UPDATE wakes SET idleCleanupObserved=1 WHERE wakeId=?1", [wake_id])
   end
 
   defp idle_cleanup_refusal_in_txn(txn, subject, reason) do
@@ -5075,11 +5074,7 @@ defmodule Tightbeam.Supervision do
         Enum.each(observations, fn [id, wake_id, detail] ->
           case JSON.decode(detail || "") do
             {:ok, %{"session" => session}} when is_binary(session) ->
-              Txn.q(
-                txn,
-                "INSERT OR IGNORE INTO idle_cleanup_observations(wakeId,sessionKey,observedOrder) VALUES(?1,?2,?3)",
-                [wake_id, session, id]
-              )
+              record_idle_cleanup_observation_in_txn(txn, wake_id, session)
 
             _ ->
               Logger.warning("invalid idle cleanup observation #{id}")
