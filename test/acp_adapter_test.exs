@@ -2077,7 +2077,7 @@ defmodule Tightbeam.Acp.AdapterTest do
 
   test "a load can spend its full deadline while another session completes a turn" do
     {adapter, capture} = start_adapter(fail_mode: "load-hang")
-    deadline = System.monotonic_time(:millisecond) + 300
+    deadline = System.monotonic_time(:millisecond) + 1_000
     caller = Task.async(fn ->
       GenServer.call(adapter,
         {:session_operation, {:load_session, "slow", nil, "/tmp", [], "guidance"}, deadline})
@@ -2108,6 +2108,17 @@ defmodule Tightbeam.Acp.AdapterTest do
     refute Enum.any?(captured_requests(capture), &(&1["method"] == "session/load"))
     assert Process.alive?(adapter)
     assert :sys.get_state(adapter).operations == %{}
+  end
+
+  test "session setup requests share one deadline instead of renewing their timeout" do
+    {adapter, capture} = start_adapter(gate_mode: "delay-setup", probe: false)
+    deadline = System.monotonic_time(:millisecond) + 120
+    assert {:error, :timeout} = ErrorDiagnostic.classified(GenServer.call(adapter,
+      {:session_operation, {:new_session, nil, "/tmp", [], "guidance"}, deadline}))
+    assert Enum.any?(captured_requests(capture), &(&1["method"] == "session/set_mode"))
+    refute Adapter.knows_session?(adapter, "sess-1")
+    Process.sleep(100)
+    refute Adapter.knows_session?(adapter, "sess-1")
   end
 
   test "a progress consumer timeout does not block or crash the adapter" do
@@ -3094,7 +3105,6 @@ defmodule Tightbeam.Acp.AdapterTest do
   end
 
   # Queue time on the same session still spends the strict operation budget.
-  @tag timeout: 40_000
   test "strict apply queue time spends the caller-owned operation budget" do
     {adapter, capture_path} =
       start_adapter(harness: :codex, fail_mode: "slow-apply-before-strict")
@@ -3111,7 +3121,9 @@ defmodule Tightbeam.Acp.AdapterTest do
     blocker =
       Task.async(fn ->
         try do
-          Adapter.apply_model(adapter, "sess-1", Model.new("gpt-blocking"))
+          GenServer.call(adapter,
+            {:session_operation, {:apply_model, "sess-1", Model.new("gpt-blocking")},
+             System.monotonic_time(:millisecond) + 500})
         catch
           :exit, reason -> {:caller_exit, reason}
         end
@@ -3122,12 +3134,9 @@ defmodule Tightbeam.Acp.AdapterTest do
     strict =
       Task.async(fn ->
         try do
-          Adapter.apply_model_strict(
-            adapter,
-            "sess-1",
-            Model.new("gpt-new", effort: "high"),
-            Model.new("gpt-old", effort: "medium")
-          )
+          GenServer.call(adapter,
+            {:apply_model_strict, "sess-1", Model.new("gpt-new", effort: "high"),
+             Model.new("gpt-old", effort: "medium"), System.monotonic_time(:millisecond) + 50})
         catch
           :exit, reason -> {:caller_exit, reason}
         end

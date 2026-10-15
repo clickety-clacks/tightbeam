@@ -601,27 +601,30 @@ defmodule Tightbeam.Acp.Adapter do
         {:noreply, state}
 
       Map.has_key?(state.operations, key) ->
+        Process.send_after(self(), {:queued_operation_expired, from},
+          max(deadline - System.monotonic_time(:millisecond), 0))
         {:noreply, %{state | operation_queue: state.operation_queue ++ [{message, from, deadline}]}}
 
       true ->
       parent = self()
+      snapshot = %{state | operations: %{}, operation_queue: []}
       {pid, monitor} = spawn_monitor(fn ->
         # A link releases the operation if its owning adapter exits.
         Process.link(parent)
         Process.put(:acp_operation_deadline, deadline)
         result = try do
-          session_call(message, from, state)
+          session_call(message, from, snapshot)
         rescue
-          error -> {:reply, {:error, {:session_operation_failed, error}}, state}
+          error -> {:reply, {:error, {:session_operation_failed, error}}, snapshot}
         catch
-          kind, reason -> {:reply, {:error, {:session_operation_failed, {kind, reason}}}, state}
+          kind, reason -> {:reply, {:error, {:session_operation_failed, {kind, reason}}}, snapshot}
         end
         send(parent, {:session_operation_done, key, self(), result})
         Process.unlink(parent)
       end)
       timer = Process.send_after(self(), {:session_operation_timeout, key, pid},
         max(deadline - System.monotonic_time(:millisecond), 0) + 100)
-      operation = %{pid: pid, monitor: monitor, timer: timer, from: from, before: state}
+      operation = %{pid: pid, monitor: monitor, timer: timer, from: from, before: snapshot}
       {:noreply, %{state | operations: Map.put(state.operations, key, operation)}}
     end
   end
@@ -1457,6 +1460,16 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   @impl true
+  def handle_info({:queued_operation_expired, from}, state) do
+    {expired, waiting} = Enum.split_with(state.operation_queue, fn {_, caller, _} -> caller == from end)
+    for {message, caller, _} <- expired do
+      reason = if elem(message, 0) == :apply_model_strict,
+        do: :model_transport_failure, else: :timeout
+      GenServer.reply(caller, {:error, reason})
+    end
+    {:noreply, %{state | operation_queue: waiting}}
+  end
+
   def handle_info({:session_operation_done, key, pid, {:reply, reply, after_state}}, state) do
     case state.operations[key] do
       %{pid: ^pid} = operation -> finish_operation(state, key, operation, reply, after_state)
