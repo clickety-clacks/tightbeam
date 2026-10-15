@@ -1207,8 +1207,13 @@ defmodule Tightbeam.NoticeBatcherFixture do
       assert {:ok, [^raw]} =
                DB.query(db, "SELECT #{projection} FROM wakes WHERE wakeId=?1", [retry])
 
-      assert {:ok, [[seq], [nil]]} = DB.query(db,
-        "SELECT deliveredTurnSeq FROM wakes WHERE wakeId IN (?1,?2) ORDER BY wakeId=?1 DESC", [original,retry])
+      assert {:ok, [[seq], [nil]]} =
+               DB.query(
+                 db,
+                 "SELECT deliveredTurnSeq FROM wakes WHERE wakeId IN (?1,?2) ORDER BY wakeId=?1 DESC",
+                 [original, retry]
+               )
+
       assert seq == turn.seq
     end
 

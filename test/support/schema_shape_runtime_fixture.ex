@@ -650,7 +650,12 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
 
         assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM notice_batch_members")
         downgrade_continuation_retry_guard!(db)
-        :ok = DB.execute(db, "DROP INDEX wakes_delivered_turn; ALTER TABLE wakes DROP COLUMN deliveredTurnSeq; DROP TABLE wake_delivery_backfill")
+
+        :ok =
+          DB.execute(
+            db,
+            "DROP INDEX wakes_delivered_turn; ALTER TABLE wakes DROP COLUMN deliveredTurnSeq; DROP TABLE wake_delivery_backfill"
+          )
 
         assert {:ok, source_before} =
                  DB.query(
@@ -739,7 +744,11 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
                "SELECT sql FROM sqlite_master WHERE name='supervision_liveness_sidecar_insert_coherent'"
              )
 
-    assert normalize_guard(sql) in [normalize_guard(previous), normalize_guard(current), normalize_guard(historical_continuation_guard!())]
+    assert normalize_guard(sql) in [
+             normalize_guard(previous),
+             normalize_guard(current),
+             normalize_guard(historical_continuation_guard!())
+           ]
 
     assert {:ok, [[0]]} =
              DB.query(db, """
@@ -785,8 +794,11 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
       )
 
   defp current_continuation_guard!() do
-    Regex.replace(~r/AND EXISTS \(SELECT 1 FROM \(SELECT t.seq AS turnSeq.*?delivery.assignmentId=w.assignmentId\)/s,
-      historical_continuation_guard!(), "AND old.deliveredTurnSeq=failed.seq")
+    Regex.replace(
+      ~r/AND EXISTS \(SELECT 1 FROM \(SELECT t.seq AS turnSeq.*?delivery.assignmentId=w.assignmentId\)/s,
+      historical_continuation_guard!(),
+      "AND old.deliveredTurnSeq=failed.seq"
+    )
   end
 
   defp historical_continuation_guard!(),
