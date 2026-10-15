@@ -60,7 +60,9 @@ defmodule Tightbeam.DBBackgroundOverloadTest do
   test "recipient drain skips overload without losing scheduler state", %{db: db} do
     state = %{db: db, delivery_opts: []}
     assert Tightbeam.NoticeBatcher.recover(db, 1, [], "recipient") == []
-    assert {:noreply, ^state} = Tightbeam.Wakes.handle_cast({:recipient_ready, "recipient"}, state)
+
+    assert {:noreply, ^state} =
+             Tightbeam.Wakes.handle_cast({:recipient_ready, "recipient"}, state)
   end
 
   test "fallback skips overload and schedules its next pass", %{db: db} do
@@ -79,9 +81,10 @@ defmodule Tightbeam.DBBackgroundOverloadTest do
   test "backfill skips overload and retries without reporting a persistence failure", %{db: db} do
     state = %{db: db}
 
-    log = capture_log([level: :debug], fn ->
-      assert {:noreply, ^state} = Tightbeam.Wakes.handle_info(:backfill_wake_delivery, state)
-    end)
+    log =
+      capture_log([level: :debug], fn ->
+        assert {:noreply, ^state} = Tightbeam.Wakes.handle_info(:backfill_wake_delivery, state)
+      end)
 
     assert log =~ "background pass deferred"
     refute log =~ "wake delivery backfill deferred for 5 seconds"
