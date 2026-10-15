@@ -1,16 +1,7 @@
 defmodule Tightbeam.LaneManager do
   @moduledoc """
-  The Reconciler — the liveness guarantee. The doorbell (SessionLane.nudge)
-  is an optimization; THIS scan is the guarantee. At boot and every
-  `interval` ms it:
-  1. recovers running turns → failed_unknown (survives a crash that left a lane
-     mid-turn),
-  2. re-publishes any unpublished terminal rows (at-least-once publication),
-  3. ensures a SessionLane exists for every session with pending work and
-     nudges it.
-
-  Lanes are named in Tightbeam.LaneRegistry (unique per session), so "start a
-  lane if absent" is atomic and there is never more than one lane per session.
+  Maintains lanes from admission, lane state reports and process monitors.
+  Boot recovery and a slow consistency check repair work whose signal was lost.
   """
 
   use GenServer
@@ -24,6 +15,7 @@ defmodule Tightbeam.LaneManager do
     :interval,
     :terminal_publisher,
     :on_terminal,
+    lanes: %{},
     reaping: %{}
   ]
 
@@ -75,7 +67,7 @@ defmodule Tightbeam.LaneManager do
       runner: Keyword.fetch!(opts, :runner),
       terminal_publisher: Keyword.get(opts, :terminal_publisher, fn _ -> :ok end),
       on_terminal: Keyword.get(opts, :on_terminal, fn _, _ -> :ok end),
-      interval: Keyword.get(opts, :interval, 5_000)
+      interval: Keyword.get(opts, :interval, 180_000)
     }
 
     # Boot recovery happens before the first scan starts nudging lanes.
@@ -132,9 +124,15 @@ defmodule Tightbeam.LaneManager do
   end
 
   @impl true
+  def handle_cast({:lane_state, pid, session_key, seq}, state) do
+    {ref, _, _} = Map.get_lazy(state.lanes, pid, fn -> {Process.monitor(pid), session_key, seq} end)
+    {:noreply, %{state | lanes: Map.put(state.lanes, pid, {ref, session_key, seq})}}
+  end
+
+  @impl true
   def handle_info(:tick, state) do
     schedule(state.interval)
-    {:noreply, do_reconcile(state)}
+    {:noreply, do_reconcile(state, true)}
   end
 
   def handle_info({ref, _result}, state) when is_map_key(state.reaping, ref) do
@@ -142,45 +140,67 @@ defmodule Tightbeam.LaneManager do
     {:noreply, %{state | reaping: Map.delete(state.reaping, ref)}}
   end
 
-  def handle_info({:DOWN, ref, :process, _pid, _reason}, state) do
-    {:noreply, %{state | reaping: Map.delete(state.reaping, ref)}}
+  def handle_info({:DOWN, ref, :process, pid, _reason}, state) do
+    case Map.pop(state.lanes, pid) do
+      {{^ref, key, _seq}, lanes} ->
+        state = %{state | lanes: lanes}
+        {:noreply, repair_lane(state, key)}
+      _ ->
+        {:noreply, %{state | reaping: Map.delete(state.reaping, ref)}}
+    end
   end
 
-  defp do_reconcile(state) do
-    DB.background_pass(fn -> reconcile_pass(state) end, state)
+  defp do_reconcile(state, detect \\ false) do
+    DB.background_pass(fn -> reconcile_pass(state, detect) end, state)
   end
 
-  defp reconcile_pass(state) do
+  defp reconcile_pass(state, detect) do
     # Re-publish terminals whose publication may have been lost to a crash —
     # to the WIRE, not just the ledger: without frames, a client whose turn
     # died with the gateway keeps a stuck typing indicator forever.
     for %{seq: seq} = row <- Ledger.unpublished_terminals(state.db) do
+      if detect, do: Tightbeam.SchedulerMisses.record(:lane_terminal, seq)
       state.terminal_publisher.(row)
       Ledger.mark_published(state.db, seq)
       state.on_terminal.(row.session_key, seq)
     end
 
     Enum.reduce(Ledger.pending_sessions(state.db), state, fn session_key, acc ->
-      ensure(acc, session_key)
-
-      if Enum.any?(acc.reaping, fn {_ref, key} -> key == session_key end) do
+      active? = Enum.any?(acc.lanes, fn {_pid, {_ref, key, seq}} -> key == session_key and not is_nil(seq) end)
+      if detect and active? do
         acc
       else
-        task =
-          Task.Supervisor.async_nolink(state.task_sup, fn ->
-            SessionLane.reap_abandoned(session_key)
-            SessionLane.nudge(session_key)
-          end)
-
-        %{acc | reaping: Map.put(acc.reaping, task.ref, session_key)}
+        if detect, do: Tightbeam.SchedulerMisses.record(:lane, session_key)
+        repair_lane(acc, session_key)
       end
     end)
   end
 
+  defp repair_lane(state, session_key) do
+    ensure(state, session_key)
+
+    if Enum.any?(state.reaping, fn {_ref, key} -> key == session_key end) do
+      state
+    else
+      task = Task.Supervisor.async_nolink(state.task_sup, fn ->
+        SessionLane.reap_abandoned(session_key)
+        SessionLane.nudge(session_key)
+        DB.background_pass(fn ->
+          for row <- Ledger.unpublished_terminals(state.db), row.session_key == session_key do
+            state.terminal_publisher.(row)
+            Ledger.mark_published(state.db, row.seq)
+            state.on_terminal.(session_key, row.seq)
+          end
+        end)
+      end)
+      %{state | reaping: Map.put(state.reaping, task.ref, session_key)}
+    end
+  end
+
   defp ensure(state, session_key) do
     case Registry.lookup(Tightbeam.LaneRegistry, session_key) do
-      [{_pid, _}] ->
-        :ok
+      [{pid, _}] ->
+        GenServer.cast(pid, {:lane_manager, self()})
 
       [] ->
         DynamicSupervisor.start_child(
@@ -193,6 +213,7 @@ defmodule Tightbeam.LaneManager do
   defp lane_opts(state, session_key, extra \\ []) do
     [
       session_key: session_key,
+      lane_manager: self(),
       db: state.db,
       task_sup: state.task_sup,
       runner: state.runner,

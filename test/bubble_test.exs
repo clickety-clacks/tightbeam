@@ -909,6 +909,31 @@ defmodule Tightbeam.Productions.BubbleTest do
     refute Bubble.bubble_production_matches?(ctx.db, "failed", cause)
   end
 
+  test "turn signals recognize once and missed signals are repaired and counted", ctx do
+    sweeper = start_supervised!({Tightbeam.Productions.BubbleSweeper,
+      db: ctx.db, name: :event_bubble_sweeper})
+    :sys.get_state(sweeper)
+    assert :sys.get_state(sweeper).interval >= 180_000
+    before = Tightbeam.SchedulerMisses.count()
+    seq = fail_turn!(ctx.db, "holder")
+    Tightbeam.Productions.BubbleSweeper.recognize(sweeper, seq)
+    :sys.get_state(sweeper)
+    assert [[_, ref, _, _, _]] = notice_turn(ctx.db, "supervisor")
+    assert ref == "bubble:#{seq}"
+    Tightbeam.Productions.BubbleSweeper.sweep_now(sweeper)
+    assert Tightbeam.SchedulerMisses.count() == before
+
+    missed = fail_turn!(ctx.db, "holder")
+    log = ExUnit.CaptureLog.capture_log(fn ->
+      send(sweeper, :tick)
+      :sys.get_state(sweeper)
+    end)
+    assert log =~ "loop=bubble record=#{missed}"
+    assert Tightbeam.SchedulerMisses.count() > before
+    assert {:ok, [[cursor]]} = DB.query(ctx.db, "SELECT seq FROM production_cursors WHERE name='bubble'")
+    assert cursor >= missed
+  end
+
   # Review B1/B3b: the sweeper's cursor makes recognition sweep-reachable —
   # a terminal whose cast was lost is picked up from the cursor, and the
   # cursor never advances past a still-pending row (out-of-order terminals).

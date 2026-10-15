@@ -1,24 +1,9 @@
 defmodule Tightbeam.Productions.BubbleSweeper do
   @moduledoc """
-  The bubble production's own recognition process (spec production-machine-v1
-  §The cycle). Two feeds, one consumer:
-
-  - THE WIRED EDGE: terminal commits cast `{:recognize, seq}` here — the fast
-    path, fired from the lane hook. A cast, deliberately: recognition enqueues
-    turns, and enqueueing rings the LaneManager, so recognition run INSIDE the
-    LaneManager (as a synchronous hook would) is a call to self — the review
-    that forced this module found exactly that deadlock on the boot path.
-  - THE SWEEP: a durable cursor over the turns table, advanced in batches each
-    tick and at boot. This is what makes recognition "provably reachable by a
-    sweep": a crash between a terminal committing and its cast being served
-    loses nothing, because the cursor has not passed it. Recognition is
-    idempotent (the LHS is a pure function of committed state; the enqueue
-    dedupes on wakeId), so the fast path and the sweep overlapping is free.
-
-  Every recognition is crash-isolated: one turn's failure to recognize is
-  logged and never takes the sweeper, the lanes, or the turn-end shift with
-  it — the bubble must stay deletable without touching the failing turn's own
-  three obligations.
+  Recognizes committed terminals from turn-end signals. A slow consistency
+  check repairs missed signals using the durable terminal-prefix cursor.
+  Acknowledgements ahead of that cursor prevent repeated recognition when
+  turns finish out of order, including across a restart.
   """
 
   use GenServer
@@ -56,7 +41,7 @@ defmodule Tightbeam.Productions.BubbleSweeper do
   def init(opts) do
     state = %{
       db: Keyword.get(opts, :db, Tightbeam.DB),
-      interval: Keyword.get(opts, :interval, 5_000)
+      interval: Keyword.get(opts, :interval, 180_000)
     }
 
     # Boot IS a sweep: whatever terminalized while no sweeper was alive —
@@ -68,7 +53,14 @@ defmodule Tightbeam.Productions.BubbleSweeper do
 
   @impl true
   def handle_cast({:recognize, seq}, state) do
-    recognize_one(state.db, seq)
+    DB.background_pass(fn ->
+      if seq > read_cursor(state.db) and not acknowledged?(state.db, seq) do
+        if recognize_one(state.db, seq) == :ok do
+          acknowledge(state.db, seq)
+          advance_cursor(state.db)
+        end
+      end
+    end)
     {:noreply, state}
   end
 
@@ -82,14 +74,7 @@ defmodule Tightbeam.Productions.BubbleSweeper do
     {:noreply, state}
   end
 
-  # Advance the cursor over the CONTIGUOUS TERMINAL PREFIX, recognizing each
-  # row. Contiguous, because seqs terminalize out of order: seq 5 can still be
-  # running when seq 6 finishes, and a cursor that skipped past 5 would never
-  # revisit it — the exact lost-recognition this sweep exists to prevent. A
-  # still-pending row therefore blocks the cursor (bounded by one turn's
-  # duration; the cast edge keeps serving everything ahead of it). The cursor
-  # commits AFTER the prefix is recognized: a crash mid-batch re-runs from the
-  # old cursor into idempotent recognitions, never past an unrecognized row.
+  # Keep out-of-order acknowledgements until the terminal prefix reaches them.
   defp sweep(db), do: DB.background_pass(fn -> sweep_pass(db) end, 0)
 
   defp sweep_pass(db) do
@@ -106,52 +91,64 @@ defmodule Tightbeam.Productions.BubbleSweeper do
         [cursor, @batch]
       )
 
-    prefix =
+    recognized =
       rows
-      |> Enum.take_while(fn [_seq, ended] -> ended == 1 end)
-      |> Enum.map(&hd/1)
+      |> Enum.filter(fn [_seq, ended] -> ended == 1 end)
+      |> Enum.reduce(0, fn [seq, _], count ->
+        if acknowledged?(db, seq) do
+          count
+        else
+          Tightbeam.SchedulerMisses.record(:bubble, seq)
 
-    prefix =
-      Enum.reduce_while(prefix, [], fn seq, recognized ->
-        case recognize_one(db, seq) do
-          :ok ->
-            Process.delete({__MODULE__, seq})
-            {:cont, [seq | recognized]}
-
-          {:error, %DB.Overloaded{}} ->
-            {:halt, recognized}
-
-          _ ->
-            failures = Process.get({__MODULE__, seq}, 0) + 1
-
-            if failures >= 5 do
-              Logger.error("bubble recognition skipping turn #{seq} after #{failures} failures")
-
+          case recognize_one(db, seq) do
+            :ok ->
               Process.delete({__MODULE__, seq})
-              {:cont, [seq | recognized]}
-            else
-              Process.put({__MODULE__, seq}, failures)
-              {:halt, recognized}
-            end
+              acknowledge(db, seq)
+              count + 1
+
+            {:error, %DB.Overloaded{}} -> count
+
+            _ ->
+              failures = Process.get({__MODULE__, seq}, 0) + 1
+              if failures >= 5 do
+                Logger.error("bubble recognition skipping turn #{seq} after #{failures} failures")
+                Process.delete({__MODULE__, seq})
+                acknowledge(db, seq)
+              else
+                Process.put({__MODULE__, seq}, failures)
+              end
+              count
+          end
         end
       end)
-      |> Enum.reverse()
 
-    case List.last(prefix) do
-      nil ->
-        0
+    advance_cursor(db)
+    recognized
+  end
 
-      last ->
-        {:ok, _} =
-          DB.query(
-            db,
-            "INSERT INTO production_cursors (name, seq) VALUES (?1, ?2) " <>
-              "ON CONFLICT(name) DO UPDATE SET seq = excluded.seq",
-            [@cursor_name, last]
-          )
+  defp acknowledged?(db, seq) do
+    {:ok, rows} = DB.query(db, "SELECT seq FROM production_cursors WHERE name=?1", ["bubble:#{seq}"])
+    rows != []
+  end
 
-        length(prefix)
+  defp acknowledge(db, seq) do
+    {:ok, _} = DB.query(db, "INSERT INTO production_cursors(name,seq) VALUES(?1,?2) ON CONFLICT(name) DO NOTHING", ["bubble:#{seq}", seq])
+  end
+
+  defp advance_cursor(db) do
+    cursor = read_cursor(db)
+    {:ok, rows} = DB.query(db, "SELECT seq, endedAt IS NOT NULL FROM turns WHERE seq>?1 ORDER BY seq LIMIT ?2", [cursor, @batch])
+    prefix = Enum.take_while(rows, fn [seq, ended] -> ended == 1 and acknowledged?(db, seq) end)
+
+    if prefix != [] do
+      last = prefix |> List.last() |> hd()
+      {:ok, _} = DB.query(db, "INSERT INTO production_cursors(name,seq) VALUES('bubble',?1) ON CONFLICT(name) DO UPDATE SET seq=excluded.seq", [last])
+      clear_acknowledgements(db, last)
     end
+  end
+
+  defp clear_acknowledgements(db, last) do
+    {:ok, _} = DB.query(db, "DELETE FROM production_cursors WHERE name LIKE 'bubble:%' AND seq<=?1", [last])
   end
 
   defp read_cursor(db) do

@@ -195,6 +195,46 @@ defmodule Tightbeam.RecognitionRetryTest do
     assert {:ok, []} = DB.query(db, "SELECT id FROM pending_recognition")
   end
 
+  test "idle retries make no database calls between events", %{db: db, retry: retry} do
+    assert :sys.get_state(retry).timer == nil
+    :erlang.trace(db, true, [:receive])
+    refute_receive {:trace, ^db, :receive, {:"$gen_call", _, _}}, 1_200
+    :erlang.trace(db, false, [:receive])
+  end
+
+  test "a committed retry moves the deadline timer earlier and fires without polling", %{db: db, retry: retry} do
+    parent = self()
+    assert {:ok, pending} = DB.transaction(db, fn txn ->
+      pending = Tightbeam.Recognition.record(txn, fn _ -> send(parent, :timer_recognized) end, :value, [], [])
+      Txn.q(txn, "UPDATE pending_recognition SET nextAt=?1 WHERE id=?2", [System.system_time(:millisecond) + 200, pending.id])
+      pending
+    end)
+    GenServer.cast(retry, :reschedule)
+    assert :sys.get_state(retry).due_at != nil
+    assert_receive :timer_recognized, 1_000
+    assert :sys.get_state(retry).timer == nil
+    assert {:ok, []} = DB.query(db, "SELECT id FROM pending_recognition WHERE id=?1", [pending.id])
+  end
+
+  test "the consistency check repairs and counts a suppressed retry signal", %{db: db, retry: retry} do
+    parent = self()
+    assert :sys.get_state(retry).timer == nil
+    {:ok, pending} = DB.transaction(db, fn txn ->
+      pending = Tightbeam.Recognition.record(txn, fn _ -> send(parent, :miss_recognized) end, :value, [], [])
+      Txn.q(txn, "UPDATE pending_recognition SET nextAt=0 WHERE id=?1", [pending.id])
+      pending
+    end)
+    before = Tightbeam.SchedulerMisses.count()
+    log = capture_log(fn ->
+      send(retry, :check_misses)
+      :sys.get_state(retry)
+    end)
+    assert_receive :miss_recognized
+    assert Tightbeam.SchedulerMisses.count() == before + 1
+    assert log =~ "loop=recognition record=#{pending.id}"
+    assert {:ok, []} = DB.query(db, "SELECT id FROM pending_recognition")
+  end
+
   defp retry_now(db, retry) do
     :ok = DB.execute(db, "UPDATE pending_recognition SET nextAt=0 WHERE flagged=0")
     send(retry, :retry)

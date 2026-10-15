@@ -27,6 +27,7 @@ defmodule Tightbeam.SessionLane do
     :runner,
     :task_sup,
     :lane_owner,
+    :lane_manager,
     terminal_publisher: nil,
     on_terminal: nil,
     wake_scheduler: Tightbeam.WakeScheduler,
@@ -210,10 +211,12 @@ defmodule Tightbeam.SessionLane do
       # indicator stuck forever. No-op default keeps unit tests standalone.
       terminal_publisher: Keyword.get(opts, :terminal_publisher, fn _ -> :ok end),
       on_terminal: Keyword.get(opts, :on_terminal, fn _, _ -> :ok end),
+      lane_manager: Keyword.get(opts, :lane_manager),
       wake_scheduler: Keyword.get(opts, :wake_scheduler, Tightbeam.WakeScheduler),
       lane_owner: "lane:#{inspect(self())}:#{System.unique_integer([:positive])}"
     }
 
+    report_state(state, nil)
     token = Keyword.get(opts, :settlement_reservation)
     if is_nil(token), do: send(self(), :nudge)
     owner = Keyword.get(opts, :settlement_owner)
@@ -518,6 +521,12 @@ defmodule Tightbeam.SessionLane do
   end
 
   @impl true
+  def handle_cast({:lane_manager, manager}, state) do
+    state = %{state | lane_manager: manager}
+    report_state(state, if(state.task_ref, do: state.current_seq))
+    {:noreply, state}
+  end
+
   def handle_cast({:release_recovered, seq}, %{current_seq: seq, task_ref: ref} = state)
       when not is_nil(ref) do
     {:noreply, release_recovered_task(state)}
@@ -540,6 +549,7 @@ defmodule Tightbeam.SessionLane do
   def handle_info({ref, {seq, outcome}}, %{task_ref: ref} = state) do
     Process.demonitor(ref, [:flush])
     finalize(state, seq, outcome)
+    report_state(state, nil)
     {:noreply, maybe_start(%{state | task_ref: nil})}
   end
 
@@ -551,6 +561,7 @@ defmodule Tightbeam.SessionLane do
       when not is_nil(reason) do
     EventLog.lifecycle(state.db, "turn_task_crash", state.session_key, inspect(reason))
     finalize(state, seq, crash_outcome(reason, seq))
+    report_state(state, nil)
     {:noreply, maybe_start(%{state | task_ref: nil})}
   end
 
@@ -667,6 +678,7 @@ defmodule Tightbeam.SessionLane do
             {turn.seq, runner.(Map.put(turn, :session_key, state.session_key))}
           end)
 
+        report_state(state, turn.seq)
         state
         |> Map.put(:task_ref, task.ref)
         |> Map.put(:task_pid, task.pid)
@@ -856,7 +868,12 @@ defmodule Tightbeam.SessionLane do
     end
   end
 
+  defp report_state(%{lane_manager: nil}, _seq), do: :ok
+  defp report_state(state, seq),
+    do: GenServer.cast(state.lane_manager, {:lane_state, self(), state.session_key, seq})
+
   defp notify_terminal(state, seq) do
+    report_state(state, nil)
     Tightbeam.Wakes.recipient_ready(state.wake_scheduler, state.session_key)
     state.on_terminal.(state.session_key, seq)
   end
