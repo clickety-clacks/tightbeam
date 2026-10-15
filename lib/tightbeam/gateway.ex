@@ -525,7 +525,7 @@ defmodule Tightbeam.Gateway do
   end
 
   defp start_remote_credential_child(config, db, machine, previous_host, host) do
-    supervisor = Map.get(config, :credential_supervisor, Tightbeam.Supervisor)
+    supervisor = Map.get(config, :credential_supervisor, Tightbeam.RuntimeSupervisor)
     child = credential_child(config, db, machine, host)
 
     case Supervisor.start_child(supervisor, child) do
