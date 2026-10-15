@@ -2645,10 +2645,7 @@ defmodule Tightbeam.Gateway do
       registry
     )
 
-    LaneManager.ensure_lane(
-      Keyword.get(opts, :lane_manager, Tightbeam.LaneManager),
-      actual_session_key
-    )
+    nudge_lane(Keyword.get(opts, :lane_manager, Tightbeam.LaneManager), actual_session_key)
 
     :appended
   end
@@ -2665,6 +2662,23 @@ defmodule Tightbeam.Gateway do
   def complete_delivery(_db, {:conflict, _message}), do: :conflict
 
   def complete_delivery(_db, {:terminal_notice_undeliverable, _} = incomplete), do: incomplete
+
+  # The message is already committed and published. A busy lane manager only
+  # delays the turn: the manager's periodic reconcile starts the lane.
+  defp nudge_lane(lane_manager, session_key) do
+    LaneManager.ensure_lane(lane_manager, session_key)
+  catch
+    :exit, {:noproc, _call} = reason ->
+      exit(reason)
+
+    :exit, reason ->
+      Logger.warning(
+        "lane nudge after a committed delivery to #{session_key} did not complete; " <>
+          "the lane manager's next reconcile starts it: #{inspect(reason)}"
+      )
+
+      :ok
+  end
 
   @doc false
   def delivery_target(_txn, session_key, nil), do: {session_key, nil, false}
