@@ -227,6 +227,16 @@ defmodule Tightbeam.SentinelsTest do
       assert %{sentinel: "alpha-bundle/watch", name: "CODEX_HOME", changed: true} =
                reserved_name_set
 
+      assert %{code: "invalid_env_name"} =
+               handlers["host-env-set"].(%{
+                 origin: "user:flynn",
+                 params: %{
+                   sentinel: "alpha-bundle/watch",
+                   name: "CODEX-HOME",
+                   value: "synthetic-codex-home"
+                 }
+               })
+
       listed =
         handlers["host-env-list"].(%{
           origin: "user:flynn",
