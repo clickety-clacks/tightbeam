@@ -96,24 +96,55 @@ defmodule Tightbeam.ConditionFactsTest do
     %{db: db, scheduler: scheduler, session: session}
   end
 
-  test "one malformed wake does not roll back recognition of another wake for the same fact", ctx do
-    attrs = %{session_key: ctx.session.session_key, origin: "user:flynn", prompt: "ready",
-      due_at: System.system_time(:millisecond) + 60_000, condition_kind: "isolation-ready",
-      condition_after_id: 0}
+  test "one malformed wake does not roll back recognition of another wake for the same fact",
+       ctx do
+    attrs = %{
+      session_key: ctx.session.session_key,
+      origin: "user:flynn",
+      prompt: "ready",
+      due_at: System.system_time(:millisecond) + 60_000,
+      condition_kind: "isolation-ready",
+      condition_after_id: 0
+    }
+
     bad = Wakes.schedule(ctx.db, attrs)
     good = Wakes.schedule(ctx.db, attrs)
-    assert {:ok, _} = DB.query(ctx.db, "UPDATE wakes SET recognitionTransition='{' WHERE wakeId=?1", [bad.wake_id])
-    log = ExUnit.CaptureLog.capture_log(fn ->
-      assert {:ok, _} = DB.transaction(ctx.db, fn txn ->
-        [[id]] = DB.Txn.q(txn, "INSERT INTO condition_facts(ts,kind,origin) VALUES (1,'isolation-ready','user:flynn') RETURNING id")
-        Wakes.recognize_condition_fact_in_txn(txn, id)
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE wakes SET recognitionTransition='{' WHERE wakeId=?1", [
+               bad.wake_id
+             ])
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:ok, _} =
+                 DB.transaction(ctx.db, fn txn ->
+                   [[id]] =
+                     DB.Txn.q(
+                       txn,
+                       "INSERT INTO condition_facts(ts,kind,origin) VALUES (1,'isolation-ready','user:flynn') RETURNING id"
+                     )
+
+                   Wakes.recognize_condition_fact_in_txn(txn, id)
+                 end)
       end)
-    end)
+
     assert log =~ bad.wake_id
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert Wakes.get(ctx.db, good.wake_id).fired_at != nil
-    assert {:ok, [["pending", nil, "{"]]} = DB.query(ctx.db, "SELECT state,firedAt,recognitionTransition FROM wakes WHERE wakeId=?1", [bad.wake_id])
-    assert {:ok, [[count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey=?1", [ctx.session.session_key])
+
+    assert {:ok, [["pending", nil, "{"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,firedAt,recognitionTransition FROM wakes WHERE wakeId=?1",
+               [bad.wake_id]
+             )
+
+    assert {:ok, [[count]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey=?1", [
+               ctx.session.session_key
+             ])
+
     assert count > 0
   end
 

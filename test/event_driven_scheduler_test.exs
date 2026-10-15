@@ -84,35 +84,57 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
       bad = wake(ctx.db, 1, %{consumer: "test"})
       good = wake(ctx.db, 2, %{consumer: "test"})
       column = unquote(column)
-      assert {:ok, _} = DB.query(ctx.db, "UPDATE wakes SET #{column}='{' WHERE wakeId=?1", [bad.wake_id])
-      log = capture_log(fn ->
-        pid = scheduler(ctx)
-        assert :ok = Wakes.fire_due(pid)
-        assert_receive {:delivered, id, _}, 1_000
-        assert id == good.wake_id
-        assert Process.alive?(pid)
-      end)
+
+      assert {:ok, _} =
+               DB.query(ctx.db, "UPDATE wakes SET #{column}='{' WHERE wakeId=?1", [bad.wake_id])
+
+      log =
+        capture_log(fn ->
+          pid = scheduler(ctx)
+          assert :ok = Wakes.fire_due(pid)
+          assert_receive {:delivered, id, _}, 1_000
+          assert id == good.wake_id
+          assert Process.alive?(pid)
+        end)
+
       assert log =~ bad.wake_id
       assert log =~ "deferred"
-      assert {:ok, [["pending", "{"]]} = DB.query(ctx.db, "SELECT state,#{column} FROM wakes WHERE wakeId=?1", [bad.wake_id])
+
+      assert {:ok, [["pending", "{"]]} =
+               DB.query(ctx.db, "SELECT state,#{column} FROM wakes WHERE wakeId=?1", [bad.wake_id])
     end
   end
 
-  for {column, value} <- [{"conditionKind", ""}, {"conditionAfterId", nil}, {"recognitionEvidence", "{"}] do
+  for {column, value} <- [
+        {"conditionKind", ""},
+        {"conditionAfterId", nil},
+        {"recognitionEvidence", "{"}
+      ] do
     test "bad condition #{column} does not stop fallback candidates or ordinary delivery", ctx do
       bad = wake(ctx.db, 1, %{condition_kind: "ready", condition_after_id: 0})
       good = wake(ctx.db, 2, %{consumer: "test"})
       column = unquote(column)
-      assert {:ok, _} = DB.query(ctx.db, "UPDATE wakes SET #{column}=?2 WHERE wakeId=?1", [bad.wake_id, unquote(value)])
-      log = capture_log(fn ->
-        pid = scheduler(ctx)
-        assert :ok = Wakes.fire_due(pid)
-        assert_receive {:delivered, id, _}, 1_000
-        assert id == good.wake_id
-        assert Process.alive?(pid)
-      end)
+
+      assert {:ok, _} =
+               DB.query(ctx.db, "UPDATE wakes SET #{column}=?2 WHERE wakeId=?1", [
+                 bad.wake_id,
+                 unquote(value)
+               ])
+
+      log =
+        capture_log(fn ->
+          pid = scheduler(ctx)
+          assert :ok = Wakes.fire_due(pid)
+          assert_receive {:delivered, id, _}, 1_000
+          assert id == good.wake_id
+          assert Process.alive?(pid)
+        end)
+
       assert log =~ bad.wake_id
-      assert {:ok, [["pending", nil]]} = DB.query(ctx.db, "SELECT state,firedAt FROM wakes WHERE wakeId=?1", [bad.wake_id])
+
+      assert {:ok, [["pending", nil]]} =
+               DB.query(ctx.db, "SELECT state,firedAt FROM wakes WHERE wakeId=?1", [bad.wake_id])
+
       assert {:ok, [[after_fact]]} = DB.query(ctx.db, "SELECT afterFact FROM scheduler_state")
       assert is_integer(after_fact)
     end
@@ -121,15 +143,22 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
   test "malformed remedy source does not stop later source cleanup or wake delivery", ctx do
     bad = wake(ctx.db, 1, %{origin: "remedy:broken"})
     good = wake(ctx.db, 2, %{consumer: "test"})
-    assert {:ok, _} = DB.query(ctx.db, "UPDATE wakes SET recognitionTransition='{' WHERE wakeId=?1", [bad.wake_id])
-    log = capture_log(fn ->
-      assert :ok = Wakes.dispose_closed_remedy_sources(ctx.db)
-      pid = scheduler(ctx)
-      assert :ok = Wakes.fire_due(pid)
-      assert_receive {:delivered, id, _}, 1_000
-      assert id == good.wake_id
-      assert Process.alive?(pid)
-    end)
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE wakes SET recognitionTransition='{' WHERE wakeId=?1", [
+               bad.wake_id
+             ])
+
+    log =
+      capture_log(fn ->
+        assert :ok = Wakes.dispose_closed_remedy_sources(ctx.db)
+        pid = scheduler(ctx)
+        assert :ok = Wakes.fire_due(pid)
+        assert_receive {:delivered, id, _}, 1_000
+        assert id == good.wake_id
+        assert Process.alive?(pid)
+      end)
+
     assert log =~ bad.wake_id
     assert log =~ "cleanup deferred"
   end

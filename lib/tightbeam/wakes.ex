@@ -2742,75 +2742,87 @@ defmodule Tightbeam.Wakes do
       )
       |> Enum.each(fn [wake_id] ->
         recognize_wake_in_savepoint(txn, wake_id, fn ->
-        [[predicate, resolver_kind, resolver_id, verifier, verification_state]] =
-          Txn.q(txn, "SELECT predicate,resolverKind,resolverId,verificationAssignmentId,verificationState FROM wakes WHERE wakeId=?1", [wake_id])
-        candidate = %{wake_id: wake_id, owner_user_id: owner_user_id,
-          predicate: decode_optional(predicate), resolver_kind: resolver_kind, resolver_id: resolver_id,
-          verification_assignment_id: verifier, verification_state: verification_state}
-        case candidate do
-          nil ->
-            :ok
+          [[predicate, resolver_kind, resolver_id, verifier, verification_state]] =
+            Txn.q(
+              txn,
+              "SELECT predicate,resolverKind,resolverId,verificationAssignmentId,verificationState FROM wakes WHERE wakeId=?1",
+              [wake_id]
+            )
 
-          wake ->
-            owner_transitions =
-              Enum.filter(transitions, &(&1.owner_user_id == wake.owner_user_id))
+          candidate = %{
+            wake_id: wake_id,
+            owner_user_id: owner_user_id,
+            predicate: decode_optional(predicate),
+            resolver_kind: resolver_kind,
+            resolver_id: resolver_id,
+            verification_assignment_id: verifier,
+            verification_state: verification_state
+          }
 
-            predicate_transition =
-              Enum.find(transitions, fn transition ->
-                (transition.owner_user_id == wake.owner_user_id or unowned_fact?.(transition)) and
-                  predicate_transition_relevant?(txn, wake, transition)
-              end)
+          case candidate do
+            nil ->
+              :ok
 
-            resolver_transition =
-              Enum.find(owner_transitions, &resolver_transition_relevant?(wake, &1))
+            wake ->
+              owner_transitions =
+                Enum.filter(transitions, &(&1.owner_user_id == wake.owner_user_id))
 
-            verification_transition =
-              Enum.find(owner_transitions, &verification_terminal_transition?(wake, &1))
+              predicate_transition =
+                Enum.find(transitions, fn transition ->
+                  (transition.owner_user_id == wake.owner_user_id or unowned_fact?.(transition)) and
+                    predicate_transition_relevant?(txn, wake, transition)
+                end)
 
-            if predicate_transition || resolver_transition || verification_transition do
-              wake = wait_in_txn(txn, wake_id)
-              evaluation = evaluate_wait_predicate_in_txn(txn, wake)
-              resolver = resolver_for_wake_in_txn(txn, wake)
+              resolver_transition =
+                Enum.find(owner_transitions, &resolver_transition_relevant?(wake, &1))
 
-              cond do
-                evaluation.matched and predicate_transition ->
-                  recognize_wait_in_txn(
-                    txn,
-                    wake,
-                    "success",
-                    nil,
-                    evaluation,
-                    resolver,
-                    predicate_transition
-                  )
+              verification_transition =
+                Enum.find(owner_transitions, &verification_terminal_transition?(wake, &1))
 
-                resolver.terminal and resolver_transition ->
-                  recognize_wait_in_txn(
-                    txn,
-                    wake,
-                    "reconsideration",
-                    "resolver-terminal",
-                    evaluation,
-                    resolver,
-                    resolver_transition
-                  )
+              if predicate_transition || resolver_transition || verification_transition do
+                wake = wait_in_txn(txn, wake_id)
+                evaluation = evaluate_wait_predicate_in_txn(txn, wake)
+                resolver = resolver_for_wake_in_txn(txn, wake)
 
-                verification_transition ->
-                  recognize_wait_in_txn(
-                    txn,
-                    wake,
-                    "reconsideration",
-                    "verification-terminal",
-                    evaluation,
-                    resolver,
-                    verification_transition
-                  )
+                cond do
+                  evaluation.matched and predicate_transition ->
+                    recognize_wait_in_txn(
+                      txn,
+                      wake,
+                      "success",
+                      nil,
+                      evaluation,
+                      resolver,
+                      predicate_transition
+                    )
 
-                true ->
-                  wake
+                  resolver.terminal and resolver_transition ->
+                    recognize_wait_in_txn(
+                      txn,
+                      wake,
+                      "reconsideration",
+                      "resolver-terminal",
+                      evaluation,
+                      resolver,
+                      resolver_transition
+                    )
+
+                  verification_transition ->
+                    recognize_wait_in_txn(
+                      txn,
+                      wake,
+                      "reconsideration",
+                      "verification-terminal",
+                      evaluation,
+                      resolver,
+                      verification_transition
+                    )
+
+                  true ->
+                    wake
+                end
               end
-            end
-        end
+          end
         end)
       end)
     end)
@@ -4242,7 +4254,8 @@ defmodule Tightbeam.Wakes do
           _ -> :ok
         end
       rescue
-        error -> Logger.warning("wake #{wake_id} remedy cleanup deferred: #{Exception.message(error)}")
+        error ->
+          Logger.warning("wake #{wake_id} remedy cleanup deferred: #{Exception.message(error)}")
       end
     end)
 
@@ -6354,17 +6367,17 @@ defmodule Tightbeam.Wakes do
     )
     |> Enum.flat_map(fn [wake_id] ->
       recognize_wake_in_savepoint(txn, wake_id, fn ->
-      case Txn.q(txn, select_wake_sql() <> " WHERE wakeId=?1", [wake_id]) do
-        [row] ->
-          case fire_in_txn(txn, to_wake(row), fact_id) do
-            {:fired, :staged} -> [{:condition_batch_ready, wake_id}]
-            {:fired, delivery} -> [delivery]
-            :noop -> []
-          end
+        case Txn.q(txn, select_wake_sql() <> " WHERE wakeId=?1", [wake_id]) do
+          [row] ->
+            case fire_in_txn(txn, to_wake(row), fact_id) do
+              {:fired, :staged} -> [{:condition_batch_ready, wake_id}]
+              {:fired, delivery} -> [delivery]
+              :noop -> []
+            end
 
-        [] ->
-          []
-      end
+          [] ->
+            []
+        end
       end)
     end)
   end
@@ -6759,9 +6772,13 @@ defmodule Tightbeam.Wakes do
 
     Enum.each(rows, fn [wake_id] ->
       case DB.transaction(db, fn txn -> recognize_due_dependency_in_txn(txn, wake_id) end) do
-        {:ok, _} -> :ok
+        {:ok, _} ->
+          :ok
+
         {:error, error} ->
-          Logger.warning("wake #{wake_id} dependency recognition deferred: #{Exception.message(error)}")
+          Logger.warning(
+            "wake #{wake_id} dependency recognition deferred: #{Exception.message(error)}"
+          )
       end
     end)
 
@@ -7461,9 +7478,15 @@ defmodule Tightbeam.Wakes do
       )
 
     case result do
-      {:ok, {:fired, :staged}} -> GenServer.cast(self(), :wake_ready)
-      {:ok, {:fired, delivery}} -> Gateway.complete_delivery(db, delivery)
-      {:ok, _} -> :ok
+      {:ok, {:fired, :staged}} ->
+        GenServer.cast(self(), :wake_ready)
+
+      {:ok, {:fired, delivery}} ->
+        Gateway.complete_delivery(db, delivery)
+
+      {:ok, _} ->
+        :ok
+
       {:error, error} ->
         Logger.warning("wake #{wake_id} condition delivery deferred: #{Exception.message(error)}")
     end
