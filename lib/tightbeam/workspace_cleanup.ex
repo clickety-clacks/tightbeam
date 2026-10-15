@@ -109,13 +109,27 @@ defmodule Tightbeam.WorkspaceCleanup do
           error ->
             detail = Exception.message(error)
             Logger.warning("archive relocation deferred #{name}: #{detail}")
-            _ = DB.query(db, "UPDATE retired_archive_relocation SET report=?3 WHERE host=?1 AND destination=?2", [name, destination, detail])
+
+            _ =
+              DB.query(
+                db,
+                "UPDATE retired_archive_relocation SET report=?3 WHERE host=?1 AND destination=?2",
+                [name, destination, detail]
+              )
+
             false
         catch
           kind, error ->
             detail = "#{kind}: #{inspect(error)}"
             Logger.warning("archive relocation deferred #{name}: #{detail}")
-            _ = DB.query(db, "UPDATE retired_archive_relocation SET report=?3 WHERE host=?1 AND destination=?2", [name, destination, detail])
+
+            _ =
+              DB.query(
+                db,
+                "UPDATE retired_archive_relocation SET report=?3 WHERE host=?1 AND destination=?2",
+                [name, destination, detail]
+              )
+
             false
         end
       end
@@ -133,8 +147,15 @@ defmodule Tightbeam.WorkspaceCleanup do
     if relative_inside(destination, source) != nil or relative_inside(source, destination) != nil,
       do: raise(ArgumentError, "archive relocation directories overlap")
 
-    {:ok, [[target]]} = DB.query(db, "SELECT archivePath FROM retired_archive_relocation WHERE host=?1 AND destination=?2", [name, destination])
-    script = move_script() <> "\nmove_workspace " <> shell_quote(source) <> " " <> shell_quote(target)
+    {:ok, [[target]]} =
+      DB.query(
+        db,
+        "SELECT archivePath FROM retired_archive_relocation WHERE host=?1 AND destination=?2",
+        [name, destination]
+      )
+
+    script =
+      move_script() <> "\nmove_workspace " <> shell_quote(source) <> " " <> shell_quote(target)
 
     invocation = invocation(host, script)
     runner = Map.get(config, :workspace_cleanup_runner) || (&system_runner/3)
@@ -189,7 +210,9 @@ defmodule Tightbeam.WorkspaceCleanup do
   end
 
   defp archive_name(key),
-    do: Base.url_encode64(key, padding: false) <> "-" <> Base.encode16(:crypto.strong_rand_bytes(6), case: :lower)
+    do:
+      Base.url_encode64(key, padding: false) <>
+        "-" <> Base.encode16(:crypto.strong_rand_bytes(6), case: :lower)
 
   defp move_script do
     """
@@ -296,7 +319,7 @@ defmodule Tightbeam.WorkspaceCleanup do
   def health(db \\ DB, owner \\ nil) do
     case DB.query(
            db,
-           "SELECT c.sessionKey,c.report FROM retired_workspace_cleanup c JOIN sessions s ON s.sessionKey=c.sessionKey WHERE c.completed=0 AND (?1 IS NULL OR s.ownerUserId=?1) ORDER BY c.sessionKey",
+           "SELECT c.sessionKey,c.report FROM retired_workspace_cleanup c LEFT JOIN sessions s ON s.sessionKey=c.sessionKey WHERE c.completed=0 AND (?1 IS NULL OR s.ownerUserId=?1) ORDER BY c.sessionKey",
            [owner]
          ) do
       {:ok, rows} ->
@@ -309,7 +332,7 @@ defmodule Tightbeam.WorkspaceCleanup do
 
         unfinished =
           Enum.map(rows, fn [key, report] ->
-            %{workspace: key, reason: report || "cleanup pending"}
+            %{workspace: key, reason: cleanup_reason(report)}
           end) ++
             Enum.map(relocation, fn [host, report] ->
               %{workspace: "archive on " <> host, reason: report || "archive relocation pending"}
@@ -324,6 +347,26 @@ defmodule Tightbeam.WorkspaceCleanup do
     error -> %{unavailable: Exception.message(error)}
   catch
     kind, error -> %{unavailable: "#{kind}: #{inspect(error)}"}
+  end
+
+  defp cleanup_reason(nil), do: "cleanup pending"
+
+  defp cleanup_reason(report) do
+    case JSON.decode(report) do
+      {:ok, %{"blockers" => blockers}} when is_list(blockers) ->
+        Enum.map_join(blockers, "; ", fn
+          %{"reason" => reason} = blocker when is_binary(reason) ->
+            [reason, blocker["detail"], blocker["path"]]
+            |> Enum.filter(&is_binary/1)
+            |> Enum.join(": ")
+
+          _ ->
+            "invalid cleanup blocker"
+        end)
+
+      _ ->
+        "invalid cleanup report"
+    end
   end
 
   @doc false
