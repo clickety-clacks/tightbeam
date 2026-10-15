@@ -210,13 +210,20 @@ defmodule Tightbeam.ModelCatalogTest do
       {worker, _, _, _, _} = :sys.get_state(pid).background
       ref = Process.monitor(worker)
 
-      log = capture_log(fn ->
-        Process.exit(worker, :kill)
-        assert_receive {:DOWN, ^ref, :process, ^worker, :killed}
-        await(fn -> :sys.get_state(pid).background == nil end)
-      end)
+      log =
+        capture_log(fn ->
+          Process.exit(worker, :kill)
+          assert_receive {:DOWN, ^ref, :process, ^worker, :killed}
+          await(fn ->
+            case :sys.get_state(pid).background do
+              {^worker, _, _, _, _} -> false
+              _ -> true
+            end
+          end)
+        end)
 
       assert log =~ "model catalog background work failed: :killed"
+
       assert :sys.get_state(pid).entries[{@host, "claude"}].reason ==
                :credential_transition_pending
     after
@@ -232,23 +239,28 @@ defmodule Tightbeam.ModelCatalogTest do
   test "refresh tick kills overdue work and resumes queued refreshes", ctx do
     {:ok, clock} = Agent.start_link(fn -> 0 end)
     {:ok, mode} = Agent.start_link(fn -> :normal end)
+
     on_exit(fn ->
       for agent <- [clock, mode], Process.alive?(agent), do: Agent.stop(agent)
     end)
 
     parent = self()
+
     hosts = fn ->
       if Agent.get(mode, & &1) == :block do
         send(parent, {:refresh_blocked, self()})
+
         receive do
           :release -> :ok
         end
       end
+
       Placement.hosts(ctx.base_dir, ctx.db)
     end
 
-    catalog = start_catalog(ctx, hosts: hosts, ttl_ms: 60_000,
-      now: fn -> Agent.get(clock, & &1) end)
+    catalog =
+      start_catalog(ctx, hosts: hosts, ttl_ms: 60_000, now: fn -> Agent.get(clock, & &1) end)
+
     await_fresh(catalog, "claude")
     pid = Process.whereis(catalog)
     {cached, :fresh} = ModelCatalog.get(@host, "claude", catalog)
@@ -264,12 +276,13 @@ defmodule Tightbeam.ModelCatalogTest do
     :sys.get_state(pid)
     assert Process.alive?(worker)
 
-    log = capture_log(fn ->
-      Agent.update(clock, fn _ -> 60_001 end)
-      send(pid, :refresh_tick)
-      assert_receive {:DOWN, ^ref, :process, ^worker, :killed}, 2_000
-      await_fresh(catalog, "claude")
-    end)
+    log =
+      capture_log(fn ->
+        Agent.update(clock, fn _ -> 60_001 end)
+        send(pid, :refresh_tick)
+        assert_receive {:DOWN, ^ref, :process, ^worker, :killed}, 2_000
+        await_fresh(catalog, "claude")
+      end)
 
     assert log =~ "model catalog background work failed: :killed"
     assert ModelCatalog.get(@host, "claude", catalog) == {cached, :fresh}
@@ -280,17 +293,21 @@ defmodule Tightbeam.ModelCatalogTest do
     catalog = start_catalog(ctx)
     await_fresh(catalog, "claude")
     pid = Process.whereis(catalog)
+
     await(fn ->
       state = :sys.get_state(pid)
+
       state.background == nil and
         Enum.all?(state.entries, fn {_, cache} -> not cache.refreshing end)
     end)
+
     before = :sys.get_state(pid)
 
-    log = capture_log(fn ->
-      send(pid, {:stray, :message})
-      assert :sys.get_state(pid) == before
-    end)
+    log =
+      capture_log(fn ->
+        send(pid, {:stray, :message})
+        assert :sys.get_state(pid) == before
+      end)
 
     assert log =~ "model catalog ignored unexpected message: {:stray, :message}"
     assert length(String.split(String.trim(log), "\n")) == 1

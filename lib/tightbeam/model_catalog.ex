@@ -385,7 +385,10 @@ defmodule Tightbeam.ModelCatalog do
     {:noreply, enqueue_background({:info, :refresh_due}, state)}
   end
 
-  def handle_info({pid, {:noreply, updated}}, %{background: {pid, ref, _event, versions, _started_at}} = state) do
+  def handle_info(
+        {pid, {:noreply, updated}},
+        %{background: {pid, ref, _event, versions, _started_at}} = state
+      ) do
     Process.demonitor(ref, [:flush])
 
     entries =
