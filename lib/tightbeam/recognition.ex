@@ -104,6 +104,7 @@ defmodule Tightbeam.Recognition do
         {:ok, result}
 
       {:error, _} ->
+        if pid = worker(db), do: GenServer.cast(pid, :reschedule)
         Logger.error("post-commit recognition failed; returning committed result")
         # No failure bookkeeping is needed here: the primary commit already
         # contains the retry row, including a bounded first retry time.
@@ -174,30 +175,84 @@ defmodule Tightbeam.Recognition do
   def init({owner, ready}) do
     Process.monitor(owner)
     :persistent_term.put({__MODULE__, owner}, self())
-    if ready, do: Process.send_after(self(), :retry, 1_000)
-    {:ok, %{db: owner, ready: ready}}
+    if ready, do: send(self(), :reschedule)
+    Process.send_after(self(), :check_misses, 180_000)
+    {:ok, %{db: owner, ready: ready, timer: nil, due_at: nil}}
   end
 
   @impl true
   def handle_cast(:activate, %{ready: false} = state) do
-    Process.send_after(self(), :retry, 1_000)
-    {:noreply, %{state | ready: true}}
+    {:noreply, schedule_retry(%{state | ready: true})}
   end
 
   def handle_cast(:activate, state), do: {:noreply, state}
 
+  def handle_cast(:reschedule, state), do: {:noreply, schedule_retry(state)}
+
   @impl true
+  def handle_info(:reschedule, state), do: {:noreply, schedule_retry(state)}
+
+  def handle_info({:retry, due_at}, %{due_at: due_at} = state),
+    do: handle_info(:retry, state)
+
+  def handle_info({:retry, _}, state), do: {:noreply, state}
+
+  def handle_info(:check_misses, state) do
+    if state.ready do
+      safely(fn ->
+        DB.background_pass(fn ->
+          case DB.query(
+                 state.db,
+                 "SELECT id FROM pending_recognition WHERE flagged=0 AND nextAt<?1",
+                 [now() - 60_000]
+               ) do
+            {:ok, rows} ->
+              for [id] <- rows, do: Tightbeam.SchedulerMisses.record(:recognition, id)
+              retry_pass(state)
+
+            {:error, error} ->
+              raise error
+          end
+        end)
+      end)
+    end
+
+    Process.send_after(self(), :check_misses, 180_000)
+    {:noreply, schedule_retry(state)}
+  end
+
   def handle_info({:DOWN, _, :process, owner, _}, %{db: owner} = state),
     do: {:stop, :normal, state}
 
   def handle_info(:retry, state) do
-    case safely(fn -> DB.background_pass(fn -> retry_pass(state) end) end) do
-      {:error, _} -> Logger.error("pending recognition scan failed; retrying next tick")
-      _ -> :ok
-    end
+    result = safely(fn -> DB.background_pass(fn -> retry_pass(state) end, :deferred) end)
+    delay = if result in [:ok, nil], do: 0, else: 1_000
 
-    Process.send_after(self(), :retry, 1_000)
-    {:noreply, state}
+    if match?({:error, _}, result),
+      do: Logger.error("pending recognition scan failed; retry deferred")
+
+    {:noreply, schedule_retry(state, delay)}
+  end
+
+  defp schedule_retry(state, delay \\ 0)
+  defp schedule_retry(%{ready: false} = state, _delay), do: state
+
+  defp schedule_retry(state, delay) do
+    case safely(fn ->
+           DB.query(state.db, "SELECT MIN(nextAt) FROM pending_recognition WHERE flagged=0")
+         end) do
+      {:ok, [[due_at]]} ->
+        if state.timer, do: Process.cancel_timer(state.timer)
+
+        timer =
+          if due_at, do: Process.send_after(self(), {:retry, due_at}, max(delay, due_at - now()))
+
+        %{state | timer: timer, due_at: due_at}
+
+      {:error, _} ->
+        Process.send_after(self(), :reschedule, 1_000)
+        state
+    end
   end
 
   @impl true
