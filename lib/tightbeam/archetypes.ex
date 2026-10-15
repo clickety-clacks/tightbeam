@@ -95,7 +95,7 @@ defmodule Tightbeam.Archetypes do
           unknown = Enum.reject(archetype.skills, &MapSet.member?(library, &1))
 
           if unknown != [],
-            do: raise(ArgumentError, "unknown skills: #{Enum.join(unknown, ", ")}")
+            do: raise(ArgumentError, "elects unknown skills: #{Enum.join(unknown, ", ")}")
 
           Map.put(loaded, name, archetype)
         rescue
@@ -114,8 +114,7 @@ defmodule Tightbeam.Archetypes do
       path = Path.join([skills_dir(base_dir), name, "SKILL.md"])
 
       if File.regular?(path) do
-        raise ArgumentError,
-              "#{path}: rename or remove the org copy; substrate names are reserved"
+        Logger.warning("archetype skill #{path} unavailable: rename or remove the org copy; substrate names are reserved")
       end
     end
   end

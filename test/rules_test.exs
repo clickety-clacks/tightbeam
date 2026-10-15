@@ -157,7 +157,7 @@ defmodule Tightbeam.RulesTest do
       path = put_raw(ctx, contents)
 
       error =
-        assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end
+        assert_unavailable(fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end)
 
       assert error.message =~ path
       assert error.message =~ "verifier"
@@ -175,7 +175,7 @@ defmodule Tightbeam.RulesTest do
 
     for {contents, reason} <- cases do
       path = put_raw(ctx, contents)
-      error = assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, ["post"]) end
+      error = assert_unavailable(fn -> Rules.load!(ctx.base_dir, ["post"]) end)
       assert error.message =~ path
       assert error.message =~ reason
       refute error.message =~ "rule #"
@@ -240,7 +240,7 @@ defmodule Tightbeam.RulesTest do
 
     for {contents, reason} <- cases do
       path = put_raw(ctx, contents)
-      error = assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, ["post"]) end
+      error = assert_unavailable(fn -> Rules.load!(ctx.base_dir, ["post"]) end)
       assert error.message =~ path
       assert error.message =~ reason
       assert error.message =~ "rule"
@@ -250,7 +250,7 @@ defmodule Tightbeam.RulesTest do
   test "subagent facts are refused by the observability-only registration boundary", ctx do
     path = put_raw(ctx, rule("no-child-obligation", "post", "subagent_stop", "eq", "child"))
 
-    error = assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, ["post"]) end
+    error = assert_unavailable(fn -> Rules.load!(ctx.base_dir, ["post"]) end)
 
     assert error.message =~ path
     assert error.message =~ "observability-only"
@@ -261,7 +261,7 @@ defmodule Tightbeam.RulesTest do
     put_raw(ctx, rule("same", "post", "caller.origin_class", "eq", "user"), "a.toml")
     path = put_raw(ctx, rule("same", "post", "caller.origin_class", "eq", "agent"), "b.toml")
 
-    error = assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, ["post"]) end
+    error = assert_unavailable(fn -> Rules.load!(ctx.base_dir, ["post"]) end)
     assert error.message =~ "same"
     assert error.message =~ "rule"
     assert error.message =~ Path.dirname(path)
@@ -275,7 +275,7 @@ defmodule Tightbeam.RulesTest do
           "\n" <> rule("same-table", "post", "caller.origin_class", "eq", "agent")
       )
 
-    error = assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, ["post"]) end
+    error = assert_unavailable(fn -> Rules.load!(ctx.base_dir, ["post"]) end)
     assert error.message =~ same_file
     assert error.message =~ "same-table"
   end
@@ -705,15 +705,11 @@ defmodule Tightbeam.RulesTest do
 
       put_rule(ctx, rule("bad-list-op", "attest", fact, "eq", ["reviewed-clean"]))
 
-      assert_raise ArgumentError, ~r/invalid for a list fact/, fn ->
-        Rules.load!(ctx.base_dir, ["attest"])
-      end
+      assert_unavailable(~r/invalid for a list fact/, fn -> Rules.load!(ctx.base_dir, ["attest"]) end)
 
       put_rule(ctx, rule("bad-list-value", "attest", fact, "not_in", []))
 
-      assert_raise ArgumentError, ~r/non-empty flat list/, fn ->
-        Rules.load!(ctx.base_dir, ["attest"])
-      end
+      assert_unavailable(~r/non-empty flat list/, fn -> Rules.load!(ctx.base_dir, ["attest"]) end)
     end
 
     for removed <- [
@@ -722,9 +718,7 @@ defmodule Tightbeam.RulesTest do
         ] do
       put_rule(ctx, rule("removed-review-fact", "attest", removed, "in", ["reviewed-clean"]))
 
-      assert_raise ArgumentError, ~r/unknown fact/, fn ->
-        Rules.load!(ctx.base_dir, ["attest"])
-      end
+      assert_unavailable(~r/unknown fact/, fn -> Rules.load!(ctx.base_dir, ["attest"]) end)
     end
 
     put_rule(
@@ -746,9 +740,7 @@ defmodule Tightbeam.RulesTest do
       rule("bad-overlap", "assign", "assign.declared_files_overlap_open", "eq", "true")
     )
 
-    assert_raise ArgumentError, ~r/does not match bool/, fn ->
-      Rules.load!(ctx.base_dir, ["assign"])
-    end
+    assert_unavailable(~r/does not match bool/, fn -> Rules.load!(ctx.base_dir, ["assign"]) end)
 
     put_rule(
       ctx,
@@ -762,15 +754,11 @@ defmodule Tightbeam.RulesTest do
       rule("bad-producing", "attest", "assignment.is_producing_card", "eq", "true")
     )
 
-    assert_raise ArgumentError, ~r/does not match bool/, fn ->
-      Rules.load!(ctx.base_dir, ["attest"])
-    end
+    assert_unavailable(~r/does not match bool/, fn -> Rules.load!(ctx.base_dir, ["attest"]) end)
 
     put_rule(ctx, rule("removed", "attest", "assignment.verdict_kinds_any", "in", ["x"]))
 
-    assert_raise ArgumentError, ~r/unknown fact/, fn ->
-      Rules.load!(ctx.base_dir, ["attest"])
-    end
+    assert_unavailable(~r/unknown fact/, fn -> Rules.load!(ctx.base_dir, ["attest"]) end)
 
     # Migration proof (verification-papertrail-v1): an org rule still gating the
     # deleted producer fact fails loud at boot, naming file and rule.
@@ -782,7 +770,7 @@ defmodule Tightbeam.RulesTest do
     )
 
     error =
-      assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, ["attest"]) end
+      assert_unavailable(fn -> Rules.load!(ctx.base_dir, ["attest"]) end)
 
     assert error.message =~ "unknown fact"
     assert error.message =~ "dead-produced"
@@ -799,9 +787,7 @@ defmodule Tightbeam.RulesTest do
       )
     )
 
-    assert_raise ArgumentError, ~r/non-empty flat list/, fn ->
-      Rules.load!(ctx.base_dir, ["attest"])
-    end
+    assert_unavailable(~r/non-empty flat list/, fn -> Rules.load!(ctx.base_dir, ["attest"]) end)
   end
 
   test "P3 fact nil, empty-list, and overlap presence matrix", ctx do
@@ -1033,23 +1019,17 @@ defmodule Tightbeam.RulesTest do
 
     put_raw(ctx, String.replace(shipped, "completion-requires-review", "unrelated-review-rule"))
 
-    assert_raise ArgumentError, ~r/linked-review-fact remedy requires reviews/, fn ->
-      Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
-    end
+    assert_unavailable(~r/linked-review-fact remedy requires reviews/, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end)
 
     for extra <- [~s(reviews = "{assignment_id}"), ~s(arbitrary = "value")] do
       put_raw(ctx, shipped <> "\n" <> extra <> "\n")
 
-      assert_raise ArgumentError, ~r/remedy wake has invalid params/, fn ->
-        Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
-      end
+      assert_unavailable(~r/remedy wake has invalid params/, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end)
     end
 
     put_raw(ctx, String.replace(shipped, "external_producer = true", "external_producer = false"))
 
-    assert_raise ArgumentError, ~r/F1 unsatisfied verdict gate/, fn ->
-      Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
-    end
+    assert_unavailable(~r/F1 unsatisfied verdict gate/, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end)
 
     assigned =
       shipped
@@ -1059,15 +1039,11 @@ defmodule Tightbeam.RulesTest do
 
     put_raw(ctx, assigned)
 
-    assert_raise ArgumentError, ~r/linked-review-fact remedy requires reviews/, fn ->
-      Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
-    end
+    assert_unavailable(~r/linked-review-fact remedy requires reviews/, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end)
 
     put_raw(ctx, assigned <> ~s(\nreviews = "{holder_key}"\n))
 
-    assert_raise ArgumentError, ~r/linked-review-fact remedy requires reviews/, fn ->
-      Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
-    end
+    assert_unavailable(~r/linked-review-fact remedy requires reviews/, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end)
 
     put_raw(ctx, assigned <> ~s(\nreviews = "{assignment_id}"\n))
     assert [linked] = Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
@@ -2243,9 +2219,7 @@ defmodule Tightbeam.RulesTest do
     deny_when = [{ fact = "assignment.state", op = "eq", value = "open" }]
     """)
 
-    assert_raise ArgumentError, ~r/edge "row-commit" requires effect = "notice"/, fn ->
-      Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
-    end
+    assert_unavailable(~r/edge "row-commit" requires effect = "notice"/, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end)
   end
 
   test "AC6a backlog crosses at 20, preserves protected traffic, and replays without a notice loop",
@@ -4240,4 +4214,15 @@ defmodule Tightbeam.RulesTest do
       model: Model.new("fable")
     })
   end
+  defp assert_unavailable(expected \\ nil, load) do
+    log = ExUnit.CaptureLog.capture_log(fn ->
+      result = load.()
+      assert is_list(result)
+    end) |> String.trim()
+    assert log =~ "unavailable"
+    if is_struct(expected, Regex), do: assert(log =~ expected)
+    if is_binary(expected), do: assert(log =~ expected)
+    %{message: log}
+  end
+
 end

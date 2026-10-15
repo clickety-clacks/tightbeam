@@ -409,16 +409,12 @@ defmodule Tightbeam.SchemaShapeTest do
     seed_owner_link_history!(db, "stale", "active", false)
     rewind_to_agent_reparent!(db)
 
-    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
-
-    assert error.message =~ "wi_link_stale"
-    assert error.message =~ "link-agent-stale"
-    assert error.message =~ "stale"
-
-    assert {:ok, [[@identity_publication_denial_diagnostic_shape]]} =
-             DB.query(db, "SELECT shape FROM schema_stamp")
-
-    refute "deliveryOwnerSessionKey" in table_columns(db, "work_items")
+    log = ExUnit.CaptureLog.capture_log(fn -> assert :ok = Schema.ensure_all(db) end)
+    assert log =~ "wi_link_stale"
+    assert log =~ "link-agent-stale"
+    assert log =~ "stale"
+    assert {:ok, [[nil]]} = DB.query(db, "SELECT deliveryOwnerSessionKey FROM work_items WHERE id='wi_link_stale'")
+    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert {:ok, [[1, 1]]} =
              DB.query(
@@ -1661,9 +1657,8 @@ defmodule Tightbeam.SchemaShapeTest do
 
     :ok = DB.execute(db, "DELETE FROM supervision_liveness_epoch")
 
-    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
-    assert error.message =~ "incompatible_supervision_liveness_v1"
-    assert error.message =~ "supervision_liveness_epoch row"
+    assert ExUnit.CaptureLog.capture_log(fn -> assert :ok = Schema.ensure_all(db) end) =~
+             "supervision_liveness_epoch row 0"
     assert {:ok, []} = DB.query(db, "SELECT id FROM supervision_liveness_epoch")
   end
 

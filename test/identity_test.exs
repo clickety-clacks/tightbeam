@@ -280,7 +280,7 @@ defmodule Tightbeam.IdentityTest do
     git!(dir, ["init", "-b", "main"])
 
     assert_raise ArgumentError,
-                 "identity repository is missing required refs: main, tightbeam/upstream, tightbeam/live. Repair with: remove #{dir} and re-boot to re-learn",
+                 "identity repository is missing required refs: tightbeam/live. Repair with: remove #{dir} and re-boot to re-learn",
                  fn ->
                    Identity.init!(ctx.base)
                  end

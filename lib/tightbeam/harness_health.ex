@@ -622,14 +622,6 @@ defmodule Tightbeam.HarnessHealth do
         fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end
       )
 
-    Enum.each(previous_fk_violations, fn violation ->
-      require Logger
-
-      Logger.warning(
-        "migration copy_predecessor_in_txn retains unresolved foreign key #{inspect(violation)}"
-      )
-    end)
-
     layout = validate_predecessor_objects!(txn)
 
     predecessor_counts =

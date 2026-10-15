@@ -365,7 +365,7 @@ defmodule Tightbeam.Rules do
                     {:ok, manifest} ->
                       case Map.get(manifest, "rule") do
                         rules when is_list(rules) ->
-                          declared = Enum.map(rules, &Map.get(&1, "verb"))
+                          declared = Enum.map(rules, fn rule -> if is_map(rule), do: Map.get(rule, "verb"), else: nil end)
 
                           if declared != [] and Enum.all?(declared, &MapSet.member?(verbs, &1)),
                             do: declared,
@@ -1887,12 +1887,6 @@ defmodule Tightbeam.Rules do
     |> MapSet.difference(allowed)
     |> MapSet.to_list()
     |> Enum.sort()
-  end
-
-  defp validate_satisfiability!(rules, valid_verbs) do
-    Enum.each(rules, &validate_producer_existence!/1)
-    Enum.each(rules, &validate_remedy_reachability!(&1, rules, valid_verbs))
-    validate_producer_cycles!(rules)
   end
 
   defp validate_producer_existence!(%{check: check}) when not is_nil(check), do: :ok
