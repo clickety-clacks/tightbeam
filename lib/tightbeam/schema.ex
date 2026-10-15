@@ -1595,11 +1595,25 @@ defmodule Tightbeam.Schema do
   @doc false
   def migration_foreign_keys_in_txn(txn, tables) do
     Enum.flat_map(tables, fn table ->
-      rows = Txn.q(txn, "PRAGMA foreign_key_check(#{table})")
-      Enum.each(rows, fn row ->
-        Logger.warning("migration unresolved foreign key #{inspect(row)}")
+      key = case table do
+        name when name in ~w(wakes wake_retry_attempts wake_cancellations) -> "wakeId"
+        "notice_batch_members" -> "memberId"
+        "sessions" -> "sessionKey"
+        "turns" -> "seq"
+        "session_reparent_events" -> "eventSeq"
+        name when name in ~w(artifacts artifact_contents artifact_version_floors) -> "artifactId"
+        "supervision_liveness_receipts" -> "receiptId"
+        "assignment_revocation_generations" -> "assignmentId,reopeningId"
+        "harness_health_members" -> "incidentId,sessionKey"
+        "harness_health_assignments" -> "incidentId,assignmentId"
+        _ -> "id"
+      end
+      Txn.q(txn, "PRAGMA foreign_key_check(#{table})")
+      |> Enum.map(fn [^table, rowid, parent, fk] ->
+        [id] = Txn.q(txn, "SELECT #{key} FROM #{table} WHERE rowid=?1", [rowid])
+        Logger.warning("migration unresolved foreign key table=#{table} id=#{inspect(id)} parent=#{parent}")
+        [table, id, parent, fk]
       end)
-      rows
     end)
   end
 
@@ -4918,7 +4932,7 @@ defmodule Tightbeam.Schema do
         try do
           case DB.transaction(db, fn txn ->
                  previous_fk_violations =
-                   Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(assignments wakes decision_requests))
+                   Tightbeam.Schema.migration_foreign_keys_in_txn(txn, if(predecessor == @shape, do: ~w(wake_cancellations), else: []))
 
                  [[^predecessor]] = Txn.q(txn, "SELECT shape FROM schema_stamp")
                  # Bootstrap the exact legacy episode shape before any O2 module DDL.
@@ -4988,7 +5002,7 @@ defmodule Tightbeam.Schema do
                  if Txn.changes(txn) != 1, do: raise(ShapeError, message: "O2 stamp race")
 
                  [] =
-                   Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(assignments wakes decision_requests)) -- previous_fk_violations
+                   Tightbeam.Schema.migration_foreign_keys_in_txn(txn, if(predecessor == @shape, do: ~w(wake_cancellations), else: [])) -- previous_fk_violations
 
                  :ok
                end) do

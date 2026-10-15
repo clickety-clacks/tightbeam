@@ -241,7 +241,7 @@ defmodule Tightbeam.NoticeSourcePayloadTest do
 
   for requested_scope <- ["actual-recipient", nil] do
     @legacy_requested_scope requested_scope
-    test "recognized predecessor condition with scope #{inspect(@legacy_requested_scope)} refuses atomically without rewriting authored markers",
+    test "recognized predecessor condition with scope #{inspect(@legacy_requested_scope)} upgrades without rewriting authored markers",
          %{db: db, db_opts: db_opts} do
       authored = "[woke: fact authored/marker-looking-prefix]\n\nkeep this authored text"
 
@@ -273,21 +273,14 @@ defmodule Tightbeam.NoticeSourcePayloadTest do
                  [condition.wake_id, stamped]
                )
 
-      assert {:ok, sources_before} = DB.query(db, "SELECT rowid,* FROM wakes ORDER BY rowid")
-      objects_before = payload_snapshot(db)
+      {:ok, columns} = DB.query(db, "PRAGMA table_info(wakes)")
+      old_columns = Enum.map_join(columns, ",", &Enum.at(&1, 1))
+      assert {:ok, sources_before} = DB.query(db, "SELECT #{old_columns} FROM wakes ORDER BY rowid")
 
-      assert {:ok, ddl_before} =
-               DB.query(db, "SELECT type,name,sql FROM sqlite_master ORDER BY type,name")
+      assert ExUnit.CaptureLog.capture_log(fn -> assert :ok = Schema.ensure_all(db) end) =~ condition.wake_id
 
-      assert_raise Schema.ShapeError,
-                   ~r/incompatible_notice_source_payload: unsupported_pending_condition_recognition/,
-                   fn -> Schema.ensure_all(db) end
+      assert {:ok, ^sources_before} = DB.query(db, "SELECT #{old_columns} FROM wakes ORDER BY rowid")
 
-      assert {:ok, ^sources_before} = DB.query(db, "SELECT rowid,* FROM wakes ORDER BY rowid")
-      assert payload_snapshot(db) == objects_before
-
-      assert {:ok, ^ddl_before} =
-               DB.query(db, "SELECT type,name,sql FROM sqlite_master ORDER BY type,name")
 
       assert %{
                state: "pending",
@@ -299,7 +292,7 @@ defmodule Tightbeam.NoticeSourcePayloadTest do
 
       assert Wakes.get(db, ordinary.wake_id).state == "pending"
 
-      assert {:ok, [["assignment-source-replacement-v1-019"]]} =
+      assert {:ok, [["decision-request-row-schema-v2-019"]]} =
                DB.query(db, "SELECT shape FROM schema_stamp")
 
       assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM turns")
@@ -307,15 +300,10 @@ defmodule Tightbeam.NoticeSourcePayloadTest do
       stop_supervised!(db)
       start_supervised!(Supervisor.child_spec({DB, db_opts}, id: db))
 
-      assert_raise Schema.ShapeError, ~r/unsupported_pending_condition_recognition/, fn ->
-        Schema.ensure_all(db)
-      end
+      assert ExUnit.CaptureLog.capture_log(fn -> assert :ok = Schema.ensure_all(db) end) =~ condition.wake_id
 
-      assert {:ok, ^sources_before} = DB.query(db, "SELECT rowid,* FROM wakes ORDER BY rowid")
-      assert payload_snapshot(db) == objects_before
+      assert {:ok, ^sources_before} = DB.query(db, "SELECT #{old_columns} FROM wakes ORDER BY rowid")
 
-      assert {:ok, ^ddl_before} =
-               DB.query(db, "SELECT type,name,sql FROM sqlite_master ORDER BY type,name")
     end
   end
 
@@ -371,17 +359,13 @@ defmodule Tightbeam.NoticeSourcePayloadTest do
 
       before = current_storage_snapshot(db)
 
-      assert_raise Schema.ShapeError, ~r/unsupported_pending_condition_recognition/, fn ->
-        Schema.ensure_all(db)
-      end
+      assert ExUnit.CaptureLog.capture_log(fn -> assert :ok = Schema.ensure_all(db) end) =~ condition.wake_id
 
       assert current_storage_snapshot(db) == before
       stop_supervised!(db)
       start_supervised!(Supervisor.child_spec({DB, db_opts}, id: db))
 
-      assert_raise Schema.ShapeError, ~r/unsupported_pending_condition_recognition/, fn ->
-        Schema.ensure_all(db)
-      end
+      assert ExUnit.CaptureLog.capture_log(fn -> assert :ok = Schema.ensure_all(db) end) =~ condition.wake_id
 
       assert current_storage_snapshot(db) == before
 
@@ -543,25 +527,25 @@ defmodule Tightbeam.NoticeSourcePayloadTest do
                "CREATE TRIGGER refuse_payload_copy BEFORE UPDATE ON wakes BEGIN SELECT RAISE(ABORT,'forced source payload copy failure'); END"
              )
 
-    before = payload_snapshot(db)
+    assert ExUnit.CaptureLog.capture_log(fn -> assert :ok = Schema.ensure_all(db) end) =~ source.wake_id
+    assert {:ok, [["[]"]]} = DB.query(db, "SELECT attachments FROM notice_batch_source_attachments_unresolved WHERE sourceWakeId=?1", [source.wake_id])
+    assert {:ok, [[nil]]} = DB.query(db, "SELECT sourceAttachments FROM wakes WHERE wakeId=?1", [source.wake_id])
+    assert {:ok, [["decision-request-row-schema-v2-019"]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+    assert :ok = Schema.ensure_all(db)
 
-    assert_raise Schema.ShapeError, ~r/notice source payload migration rolled back/, fn ->
-      Schema.ensure_all(db)
-    end
+  end
 
-    assert payload_snapshot(db) == before
-
-    assert {:ok, []} =
-             DB.query(
-               db,
-               "SELECT name FROM sqlite_master WHERE name='notice_source_client_identity'"
-             )
-
-    assert {:ok, []} =
-             DB.query(
-               db,
-               "SELECT name FROM pragma_table_info('wakes') WHERE name IN ('sourceAttachments','sourceClientIdentity')"
-             )
+  test "orphan attachment sidecar is retained while a healthy source upgrades", %{db: db, db_opts: db_opts} do
+    source = Wakes.schedule(db, %{session_key: "payload-recipient", origin: "user:owner", prompt: "healthy", due_at: 0})
+    predecessor!(db, db_opts)
+    :ok = DB.execute(db, "PRAGMA foreign_keys=OFF")
+    {:ok, _} = DB.query(db, "INSERT INTO notice_batch_source_attachments VALUES ('missing-source','[]')")
+    {:ok, _} = DB.query(db, "INSERT INTO notice_batch_source_attachments VALUES (?1,'[]')", [source.wake_id])
+    :ok = DB.execute(db, "PRAGMA foreign_keys=ON")
+    assert ExUnit.CaptureLog.capture_log(fn -> assert :ok = Schema.ensure_all(db) end) =~ "missing-source"
+    assert {:ok, [["missing-source","[]"]]} = DB.query(db, "SELECT * FROM notice_batch_source_attachments_unresolved")
+    assert {:ok, [["[]"]]} = DB.query(db, "SELECT sourceAttachments FROM wakes WHERE wakeId=?1", [source.wake_id])
+    assert :ok = Schema.ensure_all(db)
   end
 
   defp predecessor!(db, db_opts) do

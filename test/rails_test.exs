@@ -61,7 +61,9 @@ defmodule Tightbeam.RailsTest do
   test "the invariant refusal: remind is not law", ctx do
     write_statute(ctx, %{"mode" => ~s("remind")})
 
-    assert_unavailable(~r/rails never add guidance; put prose in guidance or a skill/, fn -> Rails.load!(ctx.base_dir) end)
+    assert_unavailable(~r/rails never add guidance; put prose in guidance or a skill/, fn ->
+      Rails.load!(ctx.base_dir)
+    end)
   end
 
   test "reserved and malformed statutes fail the boot with named errors", ctx do
@@ -122,7 +124,9 @@ defmodule Tightbeam.RailsTest do
 
     write_statute(ctx, %{}, "b.toml")
 
-    assert_unavailable(~r/duplicate statute name: no-history-rewrites/, fn -> Rails.load!(ctx.base_dir) end)
+    assert_unavailable(~r/duplicate statute name: no-history-rewrites/, fn ->
+      Rails.load!(ctx.base_dir)
+    end)
   end
 
   test "hook_settings compiles the byte-pinned PreToolUse entry", ctx do
@@ -211,16 +215,19 @@ defmodule Tightbeam.RailsTest do
     assert moduledoc =~ "DISTINCT from permission bypass"
     assert moduledoc =~ ~s(CODEX_CONFIG={"bypass_hook_trust":true})
   end
+
   defp assert_unavailable(expected \\ nil, load) do
-    log = ExUnit.CaptureLog.capture_log(fn ->
-      result = load.()
-      assert is_list(result)
-      assert Enum.all?(result, &(&1.pattern == ".*" and &1.action == nil))
-    end) |> String.trim()
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        result = load.()
+        assert is_list(result)
+        assert Enum.all?(result, &(&1.pattern == ".*" and &1.action == nil))
+      end)
+      |> String.trim()
+
     assert log =~ "unavailable"
     if is_struct(expected, Regex), do: assert(log =~ expected)
     if is_binary(expected), do: assert(log =~ expected)
     %{message: log}
   end
-
 end

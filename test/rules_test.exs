@@ -705,7 +705,9 @@ defmodule Tightbeam.RulesTest do
 
       put_rule(ctx, rule("bad-list-op", "attest", fact, "eq", ["reviewed-clean"]))
 
-      assert_unavailable(~r/invalid for a list fact/, fn -> Rules.load!(ctx.base_dir, ["attest"]) end)
+      assert_unavailable(~r/invalid for a list fact/, fn ->
+        Rules.load!(ctx.base_dir, ["attest"])
+      end)
 
       put_rule(ctx, rule("bad-list-value", "attest", fact, "not_in", []))
 
@@ -1019,17 +1021,23 @@ defmodule Tightbeam.RulesTest do
 
     put_raw(ctx, String.replace(shipped, "completion-requires-review", "unrelated-review-rule"))
 
-    assert_unavailable(~r/linked-review-fact remedy requires reviews/, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end)
+    assert_unavailable(~r/linked-review-fact remedy requires reviews/, fn ->
+      Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    end)
 
     for extra <- [~s(reviews = "{assignment_id}"), ~s(arbitrary = "value")] do
       put_raw(ctx, shipped <> "\n" <> extra <> "\n")
 
-      assert_unavailable(~r/remedy wake has invalid params/, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end)
+      assert_unavailable(~r/remedy wake has invalid params/, fn ->
+        Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+      end)
     end
 
     put_raw(ctx, String.replace(shipped, "external_producer = true", "external_producer = false"))
 
-    assert_unavailable(~r/F1 unsatisfied verdict gate/, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end)
+    assert_unavailable(~r/F1 unsatisfied verdict gate/, fn ->
+      Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    end)
 
     assigned =
       shipped
@@ -1039,11 +1047,15 @@ defmodule Tightbeam.RulesTest do
 
     put_raw(ctx, assigned)
 
-    assert_unavailable(~r/linked-review-fact remedy requires reviews/, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end)
+    assert_unavailable(~r/linked-review-fact remedy requires reviews/, fn ->
+      Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    end)
 
     put_raw(ctx, assigned <> ~s(\nreviews = "{holder_key}"\n))
 
-    assert_unavailable(~r/linked-review-fact remedy requires reviews/, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end)
+    assert_unavailable(~r/linked-review-fact remedy requires reviews/, fn ->
+      Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    end)
 
     put_raw(ctx, assigned <> ~s(\nreviews = "{assignment_id}"\n))
     assert [linked] = Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
@@ -2219,7 +2231,9 @@ defmodule Tightbeam.RulesTest do
     deny_when = [{ fact = "assignment.state", op = "eq", value = "open" }]
     """)
 
-    assert_unavailable(~r/edge "row-commit" requires effect = "notice"/, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end)
+    assert_unavailable(~r/edge "row-commit" requires effect = "notice"/, fn ->
+      Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    end)
   end
 
   test "AC6a backlog crosses at 20, preserves protected traffic, and replays without a notice loop",
@@ -4214,15 +4228,18 @@ defmodule Tightbeam.RulesTest do
       model: Model.new("fable")
     })
   end
+
   defp assert_unavailable(expected \\ nil, load) do
-    log = ExUnit.CaptureLog.capture_log(fn ->
-      result = load.()
-      assert is_list(result)
-    end) |> String.trim()
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        result = load.()
+        assert is_list(result)
+      end)
+      |> String.trim()
+
     assert log =~ "unavailable"
     if is_struct(expected, Regex), do: assert(log =~ expected)
     if is_binary(expected), do: assert(log =~ expected)
     %{message: log}
   end
-
 end

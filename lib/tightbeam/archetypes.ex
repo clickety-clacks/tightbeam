@@ -40,10 +40,8 @@ defmodule Tightbeam.Archetypes do
   @doc """
   Load every manifest under `<base_dir>/identity/archetypes/*.toml`, validate,
   merge over the built-in default, and store the set in :persistent_term.
-  Raises (failing boot) on: unparseable TOML, unknown top-level keys, `where`
-  not a non-empty list of strings, defaults.harness outside claude|codex, a
-  reference missing `location`, or an org skill using a reserved substrate
-  name. Returns the loaded map (name => t()).
+  Invalid manifests or fragment dependencies are logged and leave only their
+  dependent archetypes unavailable. Returns the loaded map (name => t()).
   """
   @spec load!(String.t()) :: %{optional(String.t()) => t()}
   def load!(base_dir) do
@@ -114,7 +112,9 @@ defmodule Tightbeam.Archetypes do
       path = Path.join([skills_dir(base_dir), name, "SKILL.md"])
 
       if File.regular?(path) do
-        Logger.warning("archetype skill #{path} unavailable: rename or remove the org copy; substrate names are reserved")
+        Logger.warning(
+          "archetype skill #{path} unavailable: rename or remove the org copy; substrate names are reserved"
+        )
       end
     end
   end

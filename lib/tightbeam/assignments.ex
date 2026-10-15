@@ -157,7 +157,8 @@ defmodule Tightbeam.Assignments do
     Txn.exec(txn, "DROP TABLE assignments_before_process_actor")
     Enum.each(objects, fn [sql] -> :ok = Txn.exec(txn, sql) end)
 
-    unless Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(assignments)) -- previous_fk_violations == [],
+    unless Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(assignments)) --
+             previous_fk_violations == [],
            do: raise(ArgumentError, "R1 rebuild foreign key violation")
 
     :ok

@@ -236,9 +236,15 @@ defmodule Tightbeam.ToplinesSchemaTest do
     :ok = DB.execute(db, "PRAGMA ignore_check_constraints=OFF")
     {:ok, before} = DB.query(db, "SELECT id,title FROM toplines ORDER BY id")
     [[id]] = elem(DB.query(db, "SELECT id FROM toplines WHERE title=' Cafe '"), 1)
-    assert ExUnit.CaptureLog.capture_log(fn -> assert :ok = ToplinesSchema.activate(db, 124) end) =~ id
+
+    assert ExUnit.CaptureLog.capture_log(fn -> assert :ok = ToplinesSchema.activate(db, 124) end) =~
+             id
+
     assert {:ok, ^before} = DB.query(db, "SELECT id,title FROM toplines ORDER BY id")
-    assert {:ok, [["standalone-toplines-v6"]]} = DB.query(db, "SELECT shape FROM topline_schema_stamp")
+
+    assert {:ok, [["standalone-toplines-v6"]]} =
+             DB.query(db, "SELECT shape FROM topline_schema_stamp")
+
     assert {:error, _} = insert_topline(db, " Another invalid ")
     assert :ok = ToplinesSchema.activate(db, 125)
   end
@@ -273,9 +279,16 @@ defmodule Tightbeam.ToplinesSchemaTest do
       """)
 
     :ok = DB.execute(db, "PRAGMA foreign_keys=ON")
-    assert ExUnit.CaptureLog.capture_log(fn -> assert :ok = ToplinesSchema.activate(db, 124) end) =~ "topline_concerns"
-    assert {:ok, [["tlc_orphan","tl_missing"]]} = DB.query(db, "SELECT id,toplineId FROM topline_concerns")
-    assert {:ok, [["standalone-toplines-v6"]]} = DB.query(db, "SELECT shape FROM topline_schema_stamp")
+
+    assert ExUnit.CaptureLog.capture_log(fn -> assert :ok = ToplinesSchema.activate(db, 124) end) =~
+             "topline_concerns"
+
+    assert {:ok, [["tlc_orphan", "tl_missing"]]} =
+             DB.query(db, "SELECT id,toplineId FROM topline_concerns")
+
+    assert {:ok, [["standalone-toplines-v6"]]} =
+             DB.query(db, "SELECT shape FROM topline_schema_stamp")
+
     assert {:ok, [[1]]} = DB.query(db, "PRAGMA foreign_keys")
     assert {:ok, [[0]]} = DB.query(db, "PRAGMA defer_foreign_keys")
   end

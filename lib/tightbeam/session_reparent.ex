@@ -52,8 +52,6 @@ defmodule Tightbeam.SessionReparent do
 
   @doc false
   def upgrade_agent_principals_in_txn(txn) do
-
-
     [[table_sql]] =
       Txn.q(
         txn,
@@ -68,8 +66,9 @@ defmodule Tightbeam.SessionReparent do
       String.contains?(table_sql, "cause='owner_topology_correction'") and
         String.contains?(table_sql, "principalKind='user'") and
           String.contains?(table_sql, "principalRef='user:' || ownerUserId") ->
-    previous_fk_violations =
-      Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(session_reparent_events))
+        previous_fk_violations =
+          Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(session_reparent_events))
+
         [[count]] = Txn.q(txn, "SELECT COUNT(*) FROM session_reparent_events")
 
         replacement_ddl =
@@ -108,7 +107,8 @@ defmodule Tightbeam.SessionReparent do
         :ok = Txn.exec(txn, @indexes_and_triggers_ddl)
 
         [] =
-          Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(session_reparent_events)) -- previous_fk_violations
+          Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(session_reparent_events)) --
+            previous_fk_violations
 
         :ok
 

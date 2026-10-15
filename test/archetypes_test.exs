@@ -810,7 +810,9 @@ defmodule Tightbeam.ArchetypesTest do
     model_preferences = ["claude-fable-5[1m]"]
     """)
 
-    assert_unavailable(~r/is a packed string; a preference is fields/, fn -> Archetypes.load!(ctx.base_dir) end)
+    assert_unavailable(~r/is a packed string; a preference is fields/, fn ->
+      Archetypes.load!(ctx.base_dir)
+    end)
 
     File.write!(path, """
     name = "prefs"
@@ -819,7 +821,9 @@ defmodule Tightbeam.ArchetypesTest do
     effort = "high"
     """)
 
-    assert_unavailable(~r/model_preferences entry is missing model/, fn -> Archetypes.load!(ctx.base_dir) end)
+    assert_unavailable(~r/model_preferences entry is missing model/, fn ->
+      Archetypes.load!(ctx.base_dir)
+    end)
   end
 
   test "the engineering bundle resolves current defaults", ctx do
@@ -954,7 +958,10 @@ defmodule Tightbeam.ArchetypesTest do
     File.mkdir_p!(Path.dirname(path))
     File.write!(path, "# org shadow")
 
-    assert_unavailable("#{path}: rename or remove the org copy; substrate names are reserved", fn -> Archetypes.load!(ctx.base_dir) end)
+    assert_unavailable(
+      "#{path}: rename or remove the org copy; substrate names are reserved",
+      fn -> Archetypes.load!(ctx.base_dir) end
+    )
   end
 
   test "mcp declarations compile to the byte-pinned ACP shape and sort deterministically", ctx do
@@ -1015,7 +1022,9 @@ defmodule Tightbeam.ArchetypesTest do
     text = '#include "nope.md"'
     """)
 
-    assert_unavailable(~r/cause=missing_fragment.*nope.md/, fn -> Archetypes.load!(ctx.base_dir) end)
+    assert_unavailable(~r/cause=missing_fragment.*nope.md/, fn ->
+      Archetypes.load!(ctx.base_dir)
+    end)
 
     File.write!(Path.join(identity_dir, "guidance/a.md"), ~s(#include "b.md"))
     File.write!(Path.join(identity_dir, "guidance/b.md"), ~s(#include "a.md"))
@@ -1026,7 +1035,9 @@ defmodule Tightbeam.ArchetypesTest do
     text = '#include "a.md"'
     """)
 
-    assert_unavailable(~r/cause=cycle.*a.md -> b.md -> a.md/, fn -> Archetypes.load!(ctx.base_dir) end)
+    assert_unavailable(~r/cause=cycle.*a.md -> b.md -> a.md/, fn ->
+      Archetypes.load!(ctx.base_dir)
+    end)
   end
 
   defp manifests_dir!(base_dir), do: Path.join(identity_dir!(base_dir), "archetypes")
@@ -1096,15 +1107,18 @@ defmodule Tightbeam.ArchetypesTest do
       git!(identity_dir, ["rev-parse", "main"])
     ])
   end
+
   defp assert_unavailable(expected \\ nil, load) do
-    log = ExUnit.CaptureLog.capture_log(fn ->
-      result = load.()
-      assert is_map(result)
-    end) |> String.trim()
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        result = load.()
+        assert is_map(result)
+      end)
+      |> String.trim()
+
     assert log =~ "unavailable"
     if is_struct(expected, Regex), do: assert(log =~ expected)
     if is_binary(expected), do: assert(log =~ expected)
     %{message: log}
   end
-
 end

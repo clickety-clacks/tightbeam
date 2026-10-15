@@ -365,7 +365,10 @@ defmodule Tightbeam.Rules do
                     {:ok, manifest} ->
                       case Map.get(manifest, "rule") do
                         rules when is_list(rules) ->
-                          declared = Enum.map(rules, fn rule -> if is_map(rule), do: Map.get(rule, "verb"), else: nil end)
+                          declared =
+                            Enum.map(rules, fn rule ->
+                              if is_map(rule), do: Map.get(rule, "verb"), else: nil
+                            end)
 
                           if declared != [] and Enum.all?(declared, &MapSet.member?(verbs, &1)),
                             do: declared,
@@ -442,8 +445,11 @@ defmodule Tightbeam.Rules do
       Enum.filter(rules, fn rule ->
         try do
           validate_producer_existence!(rule)
-        validate_remedy_reachability!(rule, rules, verbs)
-        if rule.remedy && not escaping_static_producer?(rule), do: walk_producer_chain!(rule, rule, rules, [rule.name])
+          validate_remedy_reachability!(rule, rules, verbs)
+
+          if rule.remedy && not escaping_static_producer?(rule),
+            do: walk_producer_chain!(rule, rule, rules, [rule.name])
+
           true
         rescue
           error ->

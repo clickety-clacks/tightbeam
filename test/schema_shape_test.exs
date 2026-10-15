@@ -413,7 +413,13 @@ defmodule Tightbeam.SchemaShapeTest do
     assert log =~ "wi_link_stale"
     assert log =~ "link-agent-stale"
     assert log =~ "stale"
-    assert {:ok, [[nil]]} = DB.query(db, "SELECT deliveryOwnerSessionKey FROM work_items WHERE id='wi_link_stale'")
+
+    assert {:ok, [[nil]]} =
+             DB.query(
+               db,
+               "SELECT deliveryOwnerSessionKey FROM work_items WHERE id='wi_link_stale'"
+             )
+
     assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert {:ok, [[1, 1]]} =
@@ -1659,6 +1665,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
     assert ExUnit.CaptureLog.capture_log(fn -> assert :ok = Schema.ensure_all(db) end) =~
              "supervision_liveness_epoch row 0"
+
     assert {:ok, []} = DB.query(db, "SELECT id FROM supervision_liveness_epoch")
   end
 

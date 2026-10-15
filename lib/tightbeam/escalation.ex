@@ -616,7 +616,9 @@ defmodule Tightbeam.Escalation do
 
   # Older stamped migrations call arity two before rowVersion exists.
   def ensure_terminal_parity_in_txn(%Txn{} = txn, activated_at, versioned?) do
-    current_schema? = Txn.q(txn, "SELECT shape FROM schema_stamp") == [["decision-request-row-schema-v2-019"]]
+    current_schema? =
+      Txn.q(txn, "SELECT shape FROM schema_stamp") == [["decision-request-row-schema-v2-019"]]
+
     invalid_version =
       if versioned?, do: "typeof(NEW.rowVersion) <> 'integer' OR NEW.rowVersion < 1 OR ", else: ""
 
