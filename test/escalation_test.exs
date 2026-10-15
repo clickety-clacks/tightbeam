@@ -2442,6 +2442,10 @@ defmodule Tightbeam.EscalationTest do
   end
 
   test "joined terminal traces distinguish known legacy condition and fallback paths", ctx do
+    # Build the pre-delivery legacy fixture before a scheduler can create batch
+    # members referencing its wake. The delivery scheduler starts below.
+    assert :ok = stop_supervised(Wakes)
+
     legacy =
       Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "legacy trace?"}))
 
@@ -2471,6 +2475,15 @@ defmodule Tightbeam.EscalationTest do
                "SELECT COUNT(*) FROM wakes WHERE conditionKind='escalation-ruled' AND conditionScope=?1",
                [legacy.id]
              )
+
+    assert {:ok, [[legacy_wake_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId FROM wakes WHERE conditionKind='escalation-ruled' AND conditionScope=?1",
+               [legacy.id]
+             )
+
+    assert NoticeBatcher.source_refs(ctx.db, legacy_wake_id) == []
 
     assert {:ok, _} =
              DB.query(
