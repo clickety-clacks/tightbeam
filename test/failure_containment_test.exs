@@ -96,7 +96,8 @@ defmodule Tightbeam.FailureContainmentTest do
         }
 
         Firehose.Hub.publish(__MODULE__.Hub, notice)
-        assert {:ok, frame, _} = WS.recv(resumed, 2_000)
+        assert {:ok, {:text, bytes}, _} = WS.recv(resumed, 2_000)
+        frame = JSON.decode!(bytes)
         assert frame["class"] == "work_item.updated"
         assert frame["payload"]["id"] == "wi_restart"
         WS.close(resumed)
@@ -122,9 +123,11 @@ defmodule Tightbeam.FailureContainmentTest do
   defp subscribe(port, token) do
     {:ok, ws} = WS.connect("127.0.0.1", port, "/changes")
     :ok = WS.send_text(ws, JSON.encode!(%{"type" => "auth", "token" => token}))
-    assert {:ok, %{"success" => true}, ws} = WS.recv(ws, 2_000)
+    assert {:ok, {:text, bytes}, ws} = WS.recv(ws, 2_000)
+    assert %{"success" => true} = JSON.decode!(bytes)
     :ok = WS.send_text(ws, JSON.encode!(%{"type" => "subscribe", "subscriptionId" => "all"}))
-    assert {:ok, %{"type" => "subscription_ready"}, ws} = WS.recv(ws, 2_000)
+    assert {:ok, {:text, bytes}, ws} = WS.recv(ws, 2_000)
+    assert %{"type" => "subscription_ready"} = JSON.decode!(bytes)
     ws
   end
 
