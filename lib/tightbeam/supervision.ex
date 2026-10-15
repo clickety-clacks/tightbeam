@@ -1913,18 +1913,40 @@ defmodule Tightbeam.Supervision do
   def handle_info(:detect_misses, state) do
     DB.background_pass(fn ->
       safe_evaluate(state, "miss_check", fn ->
-        pending = query(state.db, "SELECT sessionKey,pendingBranch FROM supervision_watermarks WHERE pendingBranch IS NOT NULL", [])
-        escalations = query(state.db, "SELECT id,sessionKey,state FROM patrol_failure_escalations WHERE state IN ('pending','admitted')", [])
+        pending =
+          query(
+            state.db,
+            "SELECT sessionKey,pendingBranch FROM supervision_watermarks WHERE pendingBranch IS NOT NULL",
+            []
+          )
+
+        escalations =
+          query(
+            state.db,
+            "SELECT id,sessionKey,state FROM patrol_failure_escalations WHERE state IN ('pending','admitted')",
+            []
+          )
+
         detect_misses(state)
         sweep(state)
+
         Enum.each(pending, fn [session, branch] ->
-          if query(state.db, "SELECT 1 FROM supervision_watermarks WHERE sessionKey=?1 AND pendingBranch=?2", [session, branch]) == [] do
+          if query(
+               state.db,
+               "SELECT 1 FROM supervision_watermarks WHERE sessionKey=?1 AND pendingBranch=?2",
+               [session, branch]
+             ) == [] do
             Tightbeam.SchedulerMisses.record(:supervision, "pending_branch session=#{session}")
           end
         end)
+
         Enum.each(escalations, fn [id, session, prior] ->
-          if query(state.db, "SELECT state FROM patrol_failure_escalations WHERE id=?1", [id]) != [[prior]] do
-            Tightbeam.SchedulerMisses.record(:supervision, "failure_escalation session=#{session}")
+          if query(state.db, "SELECT state FROM patrol_failure_escalations WHERE id=?1", [id]) !=
+               [[prior]] do
+            Tightbeam.SchedulerMisses.record(
+              :supervision,
+              "failure_escalation session=#{session}"
+            )
           end
         end)
       end)
@@ -5656,10 +5678,6 @@ defmodule Tightbeam.Supervision do
         |> Map.values()
         |> Enum.map(&idle_cleanup_candidate_in_txn(txn, &1, now(), sessions, nil, true))
         |> Enum.reject(&is_nil/1)
-        |> Enum.filter(fn candidate ->
-          candidate.harness_available and
-            not idle_cleanup_pending_group_in_txn(txn, candidate.group_digest)
-        end)
 
       dormant =
         candidates
@@ -5669,6 +5687,10 @@ defmodule Tightbeam.Supervision do
 
       idle =
         candidates
+        |> Enum.filter(fn candidate ->
+          candidate.harness_available and
+            not idle_cleanup_pending_group_in_txn(txn, candidate.group_digest)
+        end)
         |> Enum.group_by(& &1.parent_group)
         |> Enum.flat_map(fn {group, members} ->
           {owner, route_group, depth} = idle_cleanup_route(members, group, state.n)
