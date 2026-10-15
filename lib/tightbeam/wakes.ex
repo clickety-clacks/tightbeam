@@ -3144,7 +3144,6 @@ defmodule Tightbeam.Wakes do
   @spec row_commit_in_txn(Txn.t(), [map()] | map()) :: :ok
   def row_commit_in_txn(%Txn{} = txn, transitions) do
     transitions = List.wrap(transitions) ++ DB.take_row_commits(txn)
-    if transitions != [], do: Supervision.deadlines_changed_in_txn(txn)
 
     if wait_recognition_ready?(txn) do
       txn
@@ -5346,7 +5345,6 @@ defmodule Tightbeam.Wakes do
         )
       end
 
-      Supervision.deadlines_changed_in_txn(txn)
       publish_change_in_txn(txn, "wake.canceled", wake.wake_id)
       cancellation_result(cancellation)
     else
@@ -6303,7 +6301,6 @@ defmodule Tightbeam.Wakes do
   @doc false
   # The existing outbox sends to the registered scheduler only after commit.
   def schedule_changed_in_txn(%Txn{} = txn, message) do
-    Supervision.deadlines_changed_in_txn(txn)
     Txn.handoff(txn, Tightbeam.WakeScheduler, message)
   end
 

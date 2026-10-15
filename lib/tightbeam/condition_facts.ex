@@ -241,7 +241,6 @@ defmodule Tightbeam.ConditionFacts do
   defp consequence_replay(_txn, _input), do: :new
 
   defp file_admitted_in_txn(txn, kind, origin, input) do
-    Tightbeam.Supervision.deadlines_changed_in_txn(txn)
     ts = System.system_time(:millisecond)
     scope = Map.get(input, :scope)
     owner_user_id = Map.get(input, :owner_user_id) || owner_for_origin_in_txn(txn, origin)

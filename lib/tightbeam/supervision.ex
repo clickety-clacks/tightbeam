@@ -1851,7 +1851,7 @@ defmodule Tightbeam.Supervision do
       delivery_opts: Keyword.take(opts, [:conn_registry, :lane_manager]),
       deadline_timer: nil,
       deadline: nil,
-      rearm_pending: false
+      idle_cleanup_due: nil
     }
 
     :ok = activate_failure_patrol(state.db)
@@ -1863,7 +1863,7 @@ defmodule Tightbeam.Supervision do
   @impl true
   def handle_continue(:initial_sweep, state) do
     DB.background_pass(fn -> sweep(state) end)
-    {:noreply, arm_deadline(state)}
+    {:noreply, state |> refresh_idle_cleanup_deadline() |> arm_deadline()}
   end
 
   @impl true
@@ -1887,18 +1887,9 @@ defmodule Tightbeam.Supervision do
     {:noreply, arm_deadline(state)}
   end
 
-  def handle_cast(:deadlines_changed, %{rearm_pending: true} = state), do: {:noreply, state}
-
-  def handle_cast(:deadlines_changed, state) do
-    send(self(), :rearm_deadline)
-    {:noreply, %{state | rearm_pending: true}}
-  end
+  def handle_cast(:deadlines_changed, state), do: {:noreply, arm_deadline(state)}
 
   @impl true
-  def handle_info(:rearm_deadline, state) do
-    {:noreply, arm_deadline(%{state | rearm_pending: false})}
-  end
-
   def handle_info({:timeout, ref, :supervision_due}, %{deadline_timer: ref} = state) do
     safe_evaluate(state, "liveness_deadline", fn ->
       due_holders =
@@ -1917,7 +1908,13 @@ defmodule Tightbeam.Supervision do
       liveness_cycle(state, terminal_rebases)
     end)
 
-    DB.background_pass(fn -> idle_cleanup_sweep(state) end)
+    state =
+      if state.idle_cleanup_due && state.idle_cleanup_due <= now() do
+        DB.background_pass(fn -> idle_cleanup_sweep(state) end)
+        refresh_idle_cleanup_deadline(state)
+      else
+        state
+      end
 
     {:noreply, arm_deadline(%{state | deadline_timer: nil, deadline: nil})}
   end
@@ -1927,47 +1924,13 @@ defmodule Tightbeam.Supervision do
   def handle_info(:detect_misses, state) do
     DB.background_pass(fn ->
       safe_evaluate(state, "miss_check", fn ->
-        pending =
-          query(
-            state.db,
-            "SELECT sessionKey,pendingBranch FROM supervision_watermarks WHERE pendingBranch IS NOT NULL",
-            []
-          )
-
-        escalations =
-          query(
-            state.db,
-            "SELECT id,sessionKey,state FROM patrol_failure_escalations WHERE state IN ('pending','admitted')",
-            []
-          )
-
         detect_misses(state)
         sweep(state)
-
-        Enum.each(pending, fn [session, branch] ->
-          if query(
-               state.db,
-               "SELECT 1 FROM supervision_watermarks WHERE sessionKey=?1 AND pendingBranch=?2",
-               [session, branch]
-             ) == [] do
-            Tightbeam.SchedulerMisses.record(:supervision, "pending_branch session=#{session}")
-          end
-        end)
-
-        Enum.each(escalations, fn [id, session, prior] ->
-          if query(state.db, "SELECT state FROM patrol_failure_escalations WHERE id=?1", [id]) !=
-               [[prior]] do
-            Tightbeam.SchedulerMisses.record(
-              :supervision,
-              "failure_escalation session=#{session}"
-            )
-          end
-        end)
       end)
     end)
 
     Process.send_after(self(), :detect_misses, 180_000)
-    {:noreply, arm_deadline(state)}
+    {:noreply, state |> refresh_idle_cleanup_deadline() |> arm_deadline()}
   end
 
   defp evaluate_ended_session(state, session_key, terminal_seq) do
@@ -4597,7 +4560,7 @@ defmodule Tightbeam.Supervision do
         nil
     end
   rescue
-    error in DB.Overloaded ->
+    error in [DB.Overloaded, DB.DeadlineExceeded] ->
       reraise error, __STACKTRACE__
 
     error ->
@@ -5669,8 +5632,7 @@ defmodule Tightbeam.Supervision do
       )
   end
 
-  # Temporary deadline calculation uses the same eligibility and gate decisions
-  # as the old sweep. Gated, overdue work waits for a fact change or turn end.
+  # The slow check diagnoses overdue work with the same gates as the sweep.
   defp deadline_rows(state) do
     transaction!(state.db, fn txn ->
       liveness =
@@ -5686,54 +5648,92 @@ defmodule Tightbeam.Supervision do
         end)
         |> Enum.map(fn [_id, holder, due] -> {:liveness, holder, due} end)
 
-      sessions = idle_cleanup_sessions_in_txn(txn)
-
-      candidates =
-        sessions
-        |> Map.values()
-        |> Enum.map(&idle_cleanup_candidate_in_txn(txn, &1, now(), sessions, nil, true))
-        |> Enum.reject(&is_nil/1)
-
-      dormant =
-        candidates
-        |> Enum.filter(&(&1.age_ms >= &1.threshold))
-        |> Enum.map(& &1.session_key)
-        |> MapSet.new()
-
-      idle =
-        candidates
-        |> Enum.filter(fn candidate ->
-          candidate.harness_available and
-            not idle_cleanup_pending_group_in_txn(txn, candidate.group_digest)
-        end)
-        |> Enum.group_by(& &1.parent_group)
-        |> Enum.flat_map(fn {group, members} ->
-          {owner, route_group, depth} = idle_cleanup_route(members, group, state.n)
-
-          case idle_cleanup_target(sessions, dormant, owner, route_group, depth) do
-            {target, _} ->
-              if HarnessHealth.prod_shape_gate_in_txn(txn, target.harness, target.host, now()) ==
-                   :available do
-                Enum.map(members, &{:idle_cleanup, &1.session_key, &1.due_at})
-              else
-                []
-              end
-
-            nil ->
-              []
-          end
-        end)
-
-      liveness ++ idle
+      liveness ++ idle_cleanup_deadline_rows_in_txn(txn, state)
     end)
   end
+
+  defp idle_cleanup_deadline_rows_in_txn(txn, state) do
+    snapshot_at = now()
+    sessions = idle_cleanup_sessions_in_txn(txn)
+
+    candidates =
+      sessions
+      |> Map.values()
+      |> Enum.map(&idle_cleanup_candidate_in_txn(txn, &1, snapshot_at, sessions, nil, true))
+      |> Enum.reject(&is_nil/1)
+
+    dormant =
+      candidates
+      |> Enum.filter(&(&1.age_ms >= &1.threshold))
+      |> Enum.map(& &1.session_key)
+      |> MapSet.new()
+
+    candidates
+    |> Enum.filter(fn candidate ->
+      candidate.harness_available and
+        not idle_cleanup_pending_group_in_txn(txn, candidate.group_digest)
+    end)
+    |> Enum.group_by(& &1.parent_group)
+    |> Enum.flat_map(fn {group, members} ->
+      # Route the batch that will actually be claimed at the next deadline.
+      next_due = members |> Enum.map(& &1.due_at) |> Enum.min()
+      due_members = Enum.filter(members, &(&1.due_at <= max(snapshot_at, next_due)))
+      {owner, route_group, depth} = idle_cleanup_route(due_members, group, state.n)
+
+      case idle_cleanup_target(sessions, dormant, owner, route_group, depth) do
+        {target, _} ->
+          if HarnessHealth.prod_shape_gate_in_txn(txn, target.harness, target.host, now()) ==
+               :available do
+            Enum.map(due_members, &{:idle_cleanup, &1.session_key, &1.due_at})
+          else
+            []
+          end
+
+        nil ->
+          []
+      end
+    end)
+  end
+
+  defp refresh_idle_cleanup_deadline(%{sweep_ms: interval} = state)
+       when is_integer(interval) and interval > 0 do
+    DB.background_pass(fn ->
+      due = transaction!(state.db, fn txn ->
+        idle_cleanup_deadline_rows_in_txn(txn, state)
+        |> Enum.map(&elem(&1, 2))
+        |> Enum.min(fn -> nil end)
+      end)
+      %{state | idle_cleanup_due: due}
+    end, state)
+  end
+
+  defp refresh_idle_cleanup_deadline(state), do: state
 
   defp arm_deadline(%{sweep_ms: interval} = state) when is_integer(interval) and interval > 0 do
     DB.background_pass(
       fn ->
-        due = deadline_rows(state) |> Enum.map(&elem(&1, 2)) |> Enum.min(fn -> nil end)
+        [[liveness_due]] =
+          query(
+            state.db,
+            """
+            SELECT MIN(e.dueAt) FROM supervision_entitlements e INDEXED BY supervision_entitlements_due
+            JOIN assignments a ON a.id=e.assignmentId
+            JOIN sessions s ON s.sessionKey=a.holderKey
+            WHERE e.state='armed' AND e.dueAt>?1 AND a.state='open' AND s.state='active'
+            """,
+            [now()]
+          )
+
+        due =
+          [liveness_due, state.idle_cleanup_due]
+          |> Enum.reject(&is_nil/1)
+          |> Enum.min(fn -> nil end)
+
         if state.deadline_timer, do: Process.cancel_timer(state.deadline_timer)
-        ref = if due, do: :erlang.start_timer(max(0, due - now()), self(), :supervision_due)
+
+        ref =
+          if due, do: :erlang.start_timer(max(interval, due - now()), self(), :supervision_due)
+
         %{state | deadline_timer: ref, deadline: due}
       end,
       state

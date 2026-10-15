@@ -139,8 +139,6 @@ defmodule Tightbeam.SupervisionTest do
   test "supervision sleeps without database calls between deadlines", ctx do
     {:ok, _} = DB.query(ctx.db, "DELETE FROM assignments WHERE id='asg_1'")
     name = start_liveness!(ctx, sweep_ms: 1_000, name: Supervision)
-    # Flush the coalesced rearm message before tracing a quiet server.
-    :sys.get_state(name)
     pid = Process.whereis(name)
     assert :sys.get_state(name).deadline > System.system_time(:millisecond) + 2_000
     :erlang.trace(pid, true, [:send, {:tracer, self()}])
@@ -168,7 +166,7 @@ defmodule Tightbeam.SupervisionTest do
   end
 
   test "a new liveness deadline moves the timer and fires within one second", ctx do
-    name = start_liveness!(ctx, sweep_ms: 60_000, name: Supervision)
+    name = start_liveness!(ctx, sweep_ms: 100, name: Supervision)
     assignment(ctx.db, "asg_deadline", "holder", "deadline", System.system_time(:millisecond))
     due = System.system_time(:millisecond) + 500
 
@@ -203,7 +201,7 @@ defmodule Tightbeam.SupervisionTest do
 
   test "idle cleanup runs at its deadline without a periodic sweep", ctx do
     idle_cleanup_fixture!(ctx, ["deadline-child"])
-    future = System.system_time(:millisecond) + 500
+    future = System.system_time(:millisecond) + 50
 
     {:ok, _} =
       DB.query(
@@ -212,14 +210,15 @@ defmodule Tightbeam.SupervisionTest do
         [future - 60_000]
       )
 
-    name = start_liveness!(ctx, sweep_ms: 60_000, name: Supervision)
+    name = start_liveness!(ctx, sweep_ms: 100, name: Supervision)
     assert idle_cleanup_wakes(ctx.db) == []
+    assert :erlang.read_timer(:sys.get_state(name).deadline_timer) > 50
     assert eventually(fn -> idle_cleanup_wakes(ctx.db) != [] end, 140)
     assert System.system_time(:millisecond) - future < 1_000
     assert Process.alive?(Process.whereis(name))
   end
 
-  test "canceling a blocking wake arms the newly eligible cleanup deadline", ctx do
+  test "the slow check finds cleanup after a blocking wake is canceled", ctx do
     idle_cleanup_fixture!(ctx, ["waiting-cleanup"])
 
     wake =
@@ -230,9 +229,12 @@ defmodule Tightbeam.SupervisionTest do
         due_at: System.system_time(:millisecond) + 3_600_000
       })
 
-    start_liveness!(ctx, sweep_ms: 60_000, name: Supervision)
+    name = start_liveness!(ctx, sweep_ms: 100, name: Supervision)
     assert idle_cleanup_wakes(ctx.db) == []
     cancel_wake!(ctx.db, wake)
+    :sys.get_state(name)
+    assert idle_cleanup_wakes(ctx.db) == []
+    send(name, :detect_misses)
     assert eventually(fn -> idle_cleanup_wakes(ctx.db) != [] end, 140)
   end
 
