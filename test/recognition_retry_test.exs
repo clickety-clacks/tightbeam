@@ -129,7 +129,10 @@ defmodule Tightbeam.RecognitionRetryTest do
     assert Process.alive?(db)
   end
 
-  test "recognition deadline failure cannot replace a primary commit near its deadline", %{db: db, retry: retry} do
+  test "recognition deadline failure cannot replace a primary commit near its deadline", %{
+    db: db,
+    retry: retry
+  } do
     # This case isolates the inline deadline. Automatic retry has its own cases.
     GenServer.stop(retry)
     parent = self()
