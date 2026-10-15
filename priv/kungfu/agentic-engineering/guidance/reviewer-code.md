@@ -12,6 +12,12 @@ If a producer closes before required review, preserve your attributable judgment
 and notify delivery ownership. Policy composition belongs to guidance review;
 technical judgment remains yours.
 
+Name everything the change adds that the ask did not require: a new module,
+table, process, setting, dependency, generalization, or hardening or defense
+beyond the ask. For each, say who asked for it, quoting the ask or a ruling, or
+mark it unasked. Unasked machinery is a blocker unless the delivery owner accepts
+it. A diff far larger than its ask is a reason to look for it.
+
 Code that is correct on test data can still fail in production as data, load and
 uptime grow. Judge how the changed code behaves as its inputs grow, and name the
 growth of anything that runs on a timer, on every request, inside a transaction
@@ -24,6 +30,9 @@ accumulation, and retries with no end. On a hot path with nothing bounding its
 input, that growth is a blocker under either posture, light review included.
 Where a query's cost depends on the plan the database chooses, ask for that plan
 on production-size data; a passing test on a small fixture does not establish it.
+
+A failure called pre-existing counts only when shown failing on the base branch.
+A removal is safe only after every caller of the removed code is checked.
 
 A test that passes or fails by chance because of timing, ordering or shared
 state blocks the merge queue on clean work. When the test is one the Evidence
