@@ -11,6 +11,51 @@ defmodule Tightbeam.ConnRegistryTest do
     %{reg: reg, deliver: deliver, test_pid: test_pid}
   end
 
+  test "socket death removes its registration without unregister", %{reg: reg} do
+    pid =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    {:ok, ref, _} =
+      ConnRegistry.register(reg, %{
+        pid: pid,
+        user_id: "owner",
+        device_id: "dead-socket",
+        is_admin: false,
+        subscriptions: MapSet.new(["chat"])
+      })
+
+    registry_monitor = :sys.get_state(reg).conns[ref].monitor
+    assert is_reference(registry_monitor)
+    :erlang.trace(reg, true, [:receive])
+    Process.exit(pid, :kill)
+    assert_receive {:trace, ^reg, :receive, {:DOWN, ^registry_monitor, :process, ^pid, :killed}}
+    :erlang.trace(reg, false, [:receive])
+    state = :sys.get_state(reg)
+
+    refute Map.has_key?(state.conns, ref)
+    refute Map.has_key?(state.devices, "dead-socket")
+  end
+
+  test "stray messages do not crash the registry", %{reg: reg} do
+    send(reg, :unexpected)
+    assert :sys.get_state(reg).conns == %{}
+  end
+
+  test "inactive rate windows expire without another request", %{reg: reg} do
+    assert ConnRegistry.within_rate_limit(reg, "inactive", :chat, 1, 1)
+    Process.sleep(2)
+    send(reg, :expire_rate_windows)
+    assert :sys.get_state(reg).rate_windows == %{}
+    assert ConnRegistry.within_rate_limit(reg, "active", :chat, 1, 60_000)
+    send(reg, :expire_rate_windows)
+    assert map_size(:sys.get_state(reg).rate_windows) == 1
+    refute ConnRegistry.within_rate_limit(reg, "active", :chat, 1, 60_000)
+  end
+
   test "owner-scoped broadcast: owner only — admin is powers, not a merged feed", %{
     reg: reg,
     deliver: d

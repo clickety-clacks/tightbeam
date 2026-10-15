@@ -124,7 +124,10 @@ defmodule Tightbeam.ConnRegistry do
   ## Server
 
   @impl true
-  def init(:ok), do: {:ok, %__MODULE__{}}
+  def init(:ok) do
+    Process.send_after(self(), :expire_rate_windows, 60_000)
+    {:ok, %__MODULE__{}}
+  end
 
   @impl true
   def handle_call({:register, conn}, _from, state) do
@@ -135,6 +138,7 @@ defmodule Tightbeam.ConnRegistry do
 
     entry = %{
       pid: conn.pid,
+      monitor: if(is_pid(conn.pid), do: Process.monitor(conn.pid)),
       user_id: conn.user_id,
       device_id: device_id,
       is_admin: conn.is_admin,
@@ -150,6 +154,8 @@ defmodule Tightbeam.ConnRegistry do
     if prior && state.conns[prior.ref] && is_pid(state.conns[prior.ref].pid) do
       send(state.conns[prior.ref].pid, {:takeover_close})
     end
+
+    if replaced, do: demonitor(state.conns[replaced])
 
     state = %{
       state
@@ -217,9 +223,17 @@ defmodule Tightbeam.ConnRegistry do
   def handle_call({:within_rate_limit, device_id, kind, limit, window_ms}, _from, state) do
     now = System.monotonic_time(:millisecond)
     key = {device_id, kind}
-    recent = state.rate_windows |> Map.get(key, []) |> Enum.filter(&(&1 > now - window_ms))
+    {timestamps, _expires} = Map.get(state.rate_windows, key, {[], now})
+    recent = Enum.filter(timestamps, &(&1 > now - window_ms))
     allowed = length(recent) < limit
-    windows = Map.put(state.rate_windows, key, if(allowed, do: [now | recent], else: recent))
+
+    windows =
+      Map.put(
+        state.rate_windows,
+        key,
+        {if(allowed, do: [now | recent], else: recent), now + window_ms}
+      )
+
     {:reply, allowed, %{state | rate_windows: windows}}
   end
 
@@ -230,6 +244,7 @@ defmodule Tightbeam.ConnRegistry do
         {:noreply, state}
 
       e ->
+        demonitor(e)
         # Generation guard: only clear the device slot if THIS ref still owns it.
         devices =
           case state.devices[e.device_id] do
@@ -240,6 +255,31 @@ defmodule Tightbeam.ConnRegistry do
         {:noreply, %{state | conns: Map.delete(state.conns, ref), devices: devices}}
     end
   end
+
+  @impl true
+  def handle_info({:DOWN, monitor, :process, _pid, _reason}, state) do
+    case Enum.find(state.conns, fn {_ref, entry} -> entry.monitor == monitor end) do
+      {ref, _entry} -> handle_cast({:unregister, ref}, state)
+      nil -> {:noreply, state}
+    end
+  end
+
+  def handle_info(:expire_rate_windows, state) do
+    now = System.monotonic_time(:millisecond)
+
+    windows =
+      Map.reject(state.rate_windows, fn {_key, {_timestamps, expires}} -> expires <= now end)
+
+    Process.send_after(self(), :expire_rate_windows, 60_000)
+    {:noreply, %{state | rate_windows: windows}}
+  end
+
+  def handle_info(_message, state), do: {:noreply, state}
+
+  defp demonitor(%{monitor: monitor}) when is_reference(monitor),
+    do: Process.demonitor(monitor, [:flush])
+
+  defp demonitor(_), do: :ok
 
   defp maybe_drop(conns, nil), do: conns
   defp maybe_drop(conns, ref), do: Map.delete(conns, ref)

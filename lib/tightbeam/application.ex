@@ -22,6 +22,8 @@ defmodule Tightbeam.Application do
 
   @impl true
   def start(_type, _args) do
+    :persistent_term.erase({__MODULE__, :shutdown_deadline})
+
     if Application.get_env(:tightbeam, :autostart, true) do
       config = production_config()
 
@@ -60,9 +62,11 @@ defmodule Tightbeam.Application do
 
   defp start_tree(config) do
     with {:ok, supervisor} <- Supervisor.start_link(children(config), root_opts()) do
-      Enum.each(Tightbeam.Gateway.children_after_preflight(config), fn child ->
-        {:ok, _pid} = Supervisor.start_child(supervisor, child)
-      end)
+      {:ok, _pid} =
+        Supervisor.start_child(
+          supervisor,
+          runtime_child(Tightbeam.Gateway.children_after_preflight(config))
+        )
 
       # LAST, deliberately: Bandit's "Running ... (http)" has already been
       # logged by now, and that line reads as a verdict. On an org that cannot
@@ -185,6 +189,25 @@ defmodule Tightbeam.Application do
     ]
   end
 
+  @doc false
+  def runtime_child(children) do
+    %{
+      id: Tightbeam.RuntimeSupervisor,
+      start:
+        {Supervisor, :start_link,
+         [
+           children,
+           [
+             strategy: :one_for_one,
+             name: Tightbeam.RuntimeSupervisor,
+             max_restarts: 50,
+             max_seconds: 30
+           ]
+         ]},
+      type: :supervisor
+    }
+  end
+
   @doc "Root supervisor options — rest_for_one with a tight restart budget."
   @spec root_opts() :: keyword()
   def root_opts,
@@ -299,49 +322,47 @@ defmodule Tightbeam.Application do
     # queued turns are durable and simply run after the restart.
     :persistent_term.put({__MODULE__, :draining}, true)
 
-    deadline =
-      System.monotonic_time(:millisecond) +
-        Application.get_env(:tightbeam, :drain_timeout_ms, 90_000)
+    budget = Application.get_env(:tightbeam, :drain_timeout_ms, 90_000)
+    deadline = System.monotonic_time(:millisecond) + budget
 
-    drain_until(deadline)
+    :persistent_term.put({__MODULE__, :shutdown_deadline}, deadline)
 
-    try do
-      Tightbeam.Firehose.Hub.shutdown()
-    catch
-      _, _ -> :ok
-    end
+    # Keep the stamp inside the budget even when draining or acknowledgements
+    # use their whole allowance. Short stop budgets reserve the whole budget.
+    work_deadline = deadline - min(5_000, budget)
+    drain_until(work_deadline)
+    Tightbeam.Firehose.Hub.shutdown(Tightbeam.Firehose.Hub, work_deadline)
 
-    # Clean-shutdown stamp MUST happen in prep_stop: stop/1 runs after the
-    # supervision tree (and the DB) is already down, so stamping there would
-    # silently fail and every shutdown would be inferred dirty at next boot.
+    # stop/1 runs after the database has stopped, so stamp here.
     with epoch when is_integer(epoch) <- Application.get_env(:tightbeam, :boot_epoch) do
       try do
-        Tightbeam.EventLog.clean_shutdown(Tightbeam.DB, epoch, stamp_deadline(deadline))
+        Tightbeam.EventLog.clean_shutdown(Tightbeam.DB, epoch, deadline)
+      rescue
+        error -> Logger.error("clean shutdown stamp failed: #{Exception.message(error)}")
       catch
-        _, _ -> :ok
+        kind, reason -> Logger.error("clean shutdown stamp failed: #{inspect({kind, reason})}")
       end
     end
 
     state
   end
 
-  # What the drain left over, and never the global default — but never nothing
-  # either. The stamp is one short UPDATE that HAS to happen: without it the next
-  # boot infers a dirty exit, so a drain that spent its whole budget (turns still
-  # running, DB healthy) must not report every busy restart as a crash. The floor
-  # is the 5s this call inherited from `GenServer` before there was a knob, which
-  # makes the worst case here no longer than it is today; a call timeout
-  # configured below the floor is the smaller bound and wins.
-  @stamp_floor_ms 5_000
-
-  defp stamp_deadline(drain_deadline) do
-    now = System.monotonic_time(:millisecond)
-    allowance = max(drain_deadline - now, @stamp_floor_ms)
-
-    now + min(Tightbeam.DB.call_timeout(), allowance)
+  @doc false
+  def shutdown_deadline(fallback) do
+    if draining?(),
+      do: min(fallback, :persistent_term.get({__MODULE__, :shutdown_deadline}, fallback)),
+      else: fallback
   end
 
   defp drain_until(deadline) do
+    if System.monotonic_time(:millisecond) >= deadline do
+      Logger.warning("shutdown drain deadline reached")
+    else
+      poll_drain(deadline)
+    end
+  end
+
+  defp poll_drain(deadline) do
     running =
       try do
         # Deadline-bounded: a poll that outlived the drain must not extend it.
@@ -357,7 +378,9 @@ defmodule Tightbeam.Application do
 
         n
       catch
-        _, _ -> 0
+        kind, reason ->
+          Logger.warning("shutdown drain poll failed: #{inspect({kind, reason})}")
+          0
       end
 
     cond do
@@ -365,10 +388,10 @@ defmodule Tightbeam.Application do
         :ok
 
       System.monotonic_time(:millisecond) >= deadline ->
-        :ok
+        Logger.warning("shutdown drain deadline reached with #{running} running turns")
 
       true ->
-        Process.sleep(250)
+        Process.sleep(min(250, max(deadline - System.monotonic_time(:millisecond), 0)))
         drain_until(deadline)
     end
   end

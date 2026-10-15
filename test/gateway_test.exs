@@ -4748,13 +4748,8 @@ defmodule Tightbeam.GatewayTest do
       |> Map.delete(:credential_status)
       |> Map.put(:sh, sh)
 
+    start_runtime_supervisor()
     handlers = Gateway.handlers(config)
-    child_id = {Credentials, machine}
-
-    on_exit(fn ->
-      Supervisor.terminate_child(Tightbeam.Supervisor, child_id)
-      Supervisor.delete_child(Tightbeam.Supervisor, child_id)
-    end)
 
     assert %{host: %{"host" => ^machine}} =
              handlers["register-host"].(%{
@@ -5295,6 +5290,7 @@ defmodule Tightbeam.GatewayTest do
     local = Tightbeam.Placement.local_host_name()
     base_dir = move_test_base(ctx.db, "local-host-reregistration", local)
     config = gateway_config(base_dir, ctx.db, 0)
+    start_runtime_supervisor()
     handlers = Gateway.handlers(config)
 
     local_server = GenServer.whereis(Credentials.server(local))
@@ -5318,7 +5314,7 @@ defmodule Tightbeam.GatewayTest do
     assert GenServer.whereis(Credentials.server(local)) == local_server,
            "local credential server was replaced by re-registering the local hostname"
 
-    refute Enum.any?(Supervisor.which_children(Tightbeam.Supervisor), fn {id, _, _, _} ->
+    refute Enum.any?(Supervisor.which_children(Tightbeam.RuntimeSupervisor), fn {id, _, _, _} ->
              id == {Credentials, local}
            end),
            "re-registering the local hostname minted a dynamic credential child"
@@ -5333,6 +5329,7 @@ defmodule Tightbeam.GatewayTest do
   # Registration is where the gateway learns the host exists, and it is the only
   # party that knows both its advertised url and the org token.
   test "register-host provisions the satellite's operator endpoint file", ctx do
+    start_runtime_supervisor()
     machine = "endpoint-worker"
     base_dir = move_test_base(ctx.db, "endpoint-provisioning", machine)
 
@@ -5386,6 +5383,7 @@ defmodule Tightbeam.GatewayTest do
   end
 
   test "register-host refuses a satellite when the gateway has no advertised url", ctx do
+    start_runtime_supervisor()
     machine = "unreachable-gateway-worker"
     base_dir = move_test_base(ctx.db, "endpoint-no-advertised-url", machine)
 
@@ -8650,6 +8648,18 @@ defmodule Tightbeam.GatewayTest do
 
   # Install a fresh catalog for one {host, harness}, so a test can give two hosts
   # genuinely different entitlements without a provider on either end.
+  defp replace_catalog_state(update) do
+    :sys.replace_state(ModelCatalog, fn state ->
+      updated = update.(state)
+
+      Enum.reduce(updated.entries, updated, fn {key, cache}, acc ->
+        if cache == state.entries[key],
+          do: acc,
+          else: update_in(acc.versions[key], &((&1 || 0) + 1))
+      end)
+    end)
+  end
+
   defp put_host_catalog_entry(host, harness, overrides) do
     entry =
       Map.merge(
@@ -8666,7 +8676,7 @@ defmodule Tightbeam.GatewayTest do
         overrides
       )
 
-    :sys.replace_state(ModelCatalog, fn state ->
+    replace_catalog_state(fn state ->
       update_in(state.entries[{host, harness}].entries, &(&1 ++ [entry]))
     end)
   end
@@ -8695,7 +8705,7 @@ defmodule Tightbeam.GatewayTest do
         }
       end)
 
-    :sys.replace_state(ModelCatalog, fn state ->
+    replace_catalog_state(fn state ->
       now = state.now.()
 
       put_in(state.entries[{host, harness}], %{
@@ -8709,7 +8719,7 @@ defmodule Tightbeam.GatewayTest do
   end
 
   defp degrade_host_catalog(host, harness, reason) do
-    :sys.replace_state(ModelCatalog, fn state ->
+    replace_catalog_state(fn state ->
       put_in(state.entries[{host, harness}], %{
         entries: [],
         derived_at: nil,
@@ -8721,7 +8731,7 @@ defmodule Tightbeam.GatewayTest do
   end
 
   defp stale_host_catalog(host, harness) do
-    :sys.replace_state(ModelCatalog, fn state ->
+    replace_catalog_state(fn state ->
       now = state.now.()
 
       update_in(state.entries[{host, harness}], fn cache ->
@@ -8776,7 +8786,7 @@ defmodule Tightbeam.GatewayTest do
   # Force every cached entry empty with a given degraded reason, keeping the
   # server's own key set (one per {host, harness}) intact.
   defp empty_catalog(reason) do
-    :sys.replace_state(ModelCatalog, fn state ->
+    replace_catalog_state(fn state ->
       entries =
         Map.new(state.entries, fn {key, cache} ->
           {key,
@@ -11350,5 +11360,14 @@ defmodule Tightbeam.GatewayTest do
       other ->
         other
     end
+  end
+
+  defp start_runtime_supervisor do
+    start_supervised!(%{
+      id: Tightbeam.RuntimeSupervisor,
+      start:
+        {Supervisor, :start_link,
+         [[], [strategy: :one_for_one, name: Tightbeam.RuntimeSupervisor]]}
+    })
   end
 end

@@ -74,6 +74,8 @@ defmodule Tightbeam.Acp.Adapter do
     unprompted: MapSet.new(),
     switchable_models: %{},
     config_options: %{},
+    operations: %{},
+    operation_queue: [],
     context_usage: %{}
   ]
 
@@ -211,7 +213,7 @@ defmodule Tightbeam.Acp.Adapter do
   """
   @spec close_session(adapter(), String.t(), keyword()) :: :ok | {:error, term()}
   def close_session(adapter, session_id, opts \\ []) do
-    GenServer.call(adapter, {:close_session, session_id, opts}, 65_000)
+    call(adapter, {:close_session, session_id, opts}, 65_000)
   rescue
     reason -> {:error, {:adapter_unavailable, reason}}
   catch
@@ -292,7 +294,7 @@ defmodule Tightbeam.Acp.Adapter do
   @doc "Apply a model selection and surface any explicit harness refusal."
   @spec apply_model(adapter(), String.t(), model_ref()) :: :ok | {:error, term()}
   def apply_model(adapter, session_id, model),
-    do: GenServer.call(adapter, {:apply_model, session_id, model}, 30_000)
+    do: call(adapter, {:apply_model, session_id, model}, 30_000)
 
   def apply_model_for_turn(adapter, session_id, model),
     do: call(adapter, {:apply_model, session_id, model, :infinity}, :infinity)
@@ -551,40 +553,225 @@ defmodule Tightbeam.Acp.Adapter do
     end
   end
 
+  defp session_operation?(message) when is_tuple(message),
+    do:
+      elem(message, 0) in [
+        :new_session,
+        :new_candidate_session,
+        :load_session,
+        :switch_model_session,
+        :close_session,
+        :apply_model,
+        :apply_model_strict,
+        :apply_fast
+      ]
+
+  defp session_operation?(_message), do: false
+
+  defp operation_key(message) when elem(message, 0) in [:new_session, :new_candidate_session],
+    do: make_ref()
+
+  defp operation_key(message), do: elem(message, 1)
+
   @impl true
-  def handle_call({:new_session, model, cwd, mcp_servers, guidance}, _from, state) do
+  def handle_call(message, from, state) do
+    cond do
+      session_operation?(message) ->
+        enqueue_operation(state, message, from)
+
+      is_tuple(message) and elem(message, 0) in [:prompt, :forget_model_residency] and
+          pending_session_operation?(state, elem(message, 1)) ->
+        {:noreply, %{state | operation_queue: state.operation_queue ++ [{message, from}]}}
+
+      true ->
+        session_call(message, from, state)
+    end
+  end
+
+  defp enqueue_operation(state, message, from) do
+    key = operation_key(message)
+
+    if map_size(state.operations) > 0 do
+      {:noreply, %{state | operation_queue: state.operation_queue ++ [{message, from}]}}
+    else
+      parent = self()
+      snapshot = %{state | operations: %{}, operation_queue: []}
+
+      {:ok, pid} =
+        Task.start_link(fn ->
+          {:reply, reply, after_state} = session_call(message, from, snapshot)
+          updates = operation_updates(message, reply, after_state)
+          send(parent, {:session_operation_done, key, self(), reply, updates})
+        end)
+
+      monitor = Process.monitor(pid)
+
+      operation = %{pid: pid, monitor: monitor, from: from, notified_fields: MapSet.new()}
+      {:noreply, %{state | operations: Map.put(state.operations, key, operation)}}
+    end
+  end
+
+  defp pending_session_operation?(state, sid) do
+    Map.has_key?(state.operations, sid) or
+      Enum.any?(state.operation_queue, fn {message, _} -> operation_key(message) == sid end)
+  end
+
+  defp operation_updates(message, reply, state) do
+    kind = elem(message, 0)
+
+    sid =
+      case {kind, reply} do
+        {kind, {:ok, sid}}
+        when kind in [:new_session, :new_candidate_session, :switch_model_session] and
+               is_binary(sid) ->
+          sid
+
+        {kind, _} when kind in [:new_session, :new_candidate_session] ->
+          nil
+
+        _ ->
+          elem(message, 1)
+      end
+
+    residency = [
+      :known,
+      :models,
+      :context_usage,
+      :unprompted,
+      :switchable_models,
+      :config_options
+    ]
+
+    fields =
+      case {kind, reply} do
+        {:close_session, :ok} ->
+          residency ++ [:chunks, :progress]
+
+        {:close_session, _} ->
+          []
+
+        {:apply_fast, _} ->
+          [:config_options]
+
+        {kind, {:error, _}}
+        when kind in [:apply_model, :apply_model_strict, :switch_model_session] ->
+          residency
+
+        {kind, _} when kind in [:apply_model, :apply_model_strict] ->
+          [:models, :known]
+
+        _ ->
+          residency ++ [:chunks]
+      end
+
+    entries =
+      for field <- fields, not is_nil(sid), into: %{} do
+        value = Map.fetch!(state, field)
+
+        {field,
+         if(match?(%MapSet{}, value), do: MapSet.member?(value, sid), else: Map.fetch(value, sid))}
+      end
+
+    {sid, entries, kind == :close_session and reply == :ok}
+  end
+
+  defp merge_operation(state, {sid, entries, closed?}, notified_fields) do
+    entries =
+      Map.reject(entries, fn {field, _} -> MapSet.member?(notified_fields, {sid, field}) end)
+
+    state =
+      Enum.reduce(entries, state, fn {field, entry}, acc ->
+        current = Map.fetch!(acc, field)
+
+        value =
+          case entry do
+            true -> MapSet.put(current, sid)
+            false -> MapSet.delete(current, sid)
+            {:ok, value} -> Map.put(current, sid, value)
+            :error -> Map.delete(current, sid)
+          end
+
+        Map.put(acc, field, value)
+      end)
+
+    if closed?,
+      do: %{state | subagent_roots: drop_subagent_root(state.subagent_roots, sid)},
+      else: state
+  end
+
+  defp record_notification_fields(state, sid, fields) do
+    operations =
+      Map.new(state.operations, fn {key, operation} ->
+        notified = Enum.reduce(fields, operation.notified_fields, &MapSet.put(&2, {sid, &1}))
+        {key, %{operation | notified_fields: notified}}
+      end)
+
+    %{state | operations: operations}
+  end
+
+  defp finish_operation(state, key, operation, reply, updates) do
+    Process.demonitor(operation.monitor, [:flush])
+    GenServer.reply(operation.from, reply)
+    state = merge_operation(state, updates, operation.notified_fields)
+    drain_operations(%{state | operations: Map.delete(state.operations, key)})
+  end
+
+  defp drain_operations(%{operations: operations} = state) when map_size(operations) > 0,
+    do: {:noreply, state}
+
+  defp drain_operations(%{operation_queue: []} = state), do: {:noreply, state}
+
+  defp drain_operations(%{operation_queue: [{message, from} | rest]} = state) do
+    state = %{state | operation_queue: rest}
+
+    result =
+      if session_operation?(message),
+        do: enqueue_operation(state, message, from),
+        else: session_call(message, from, state)
+
+    case result do
+      {:reply, reply, next} ->
+        GenServer.reply(from, reply)
+        drain_operations(next)
+
+      {:noreply, next} ->
+        drain_operations(next)
+    end
+  end
+
+  defp session_call({:new_session, model, cwd, mcp_servers, guidance}, _from, state) do
     new_session_reply(state, model, cwd, mcp_servers, guidance, 60_000, false)
   end
 
-  def handle_call({:new_candidate_session, model, cwd, mcp_servers, guidance}, _from, state) do
+  defp session_call({:new_candidate_session, model, cwd, mcp_servers, guidance}, _from, state) do
     new_session_reply(state, model, cwd, mcp_servers, guidance, 60_000, true)
   end
 
-  def handle_call(
-        {:new_session, model, cwd, mcp_servers, guidance, request_timeout},
-        _from,
-        state
-      ) do
+  defp session_call(
+         {:new_session, model, cwd, mcp_servers, guidance, request_timeout},
+         _from,
+         state
+       ) do
     new_session_reply(state, model, cwd, mcp_servers, guidance, request_timeout, false)
   end
 
-  def handle_call({:load_session, sid, model, cwd, mcp_servers, guidance}, _from, state) do
+  defp session_call({:load_session, sid, model, cwd, mcp_servers, guidance}, _from, state) do
     load_session_reply(state, sid, model, cwd, mcp_servers, guidance, 60_000)
   end
 
-  def handle_call(
-        {:load_session, sid, model, cwd, mcp_servers, guidance, request_timeout},
-        _from,
-        state
-      ) do
+  defp session_call(
+         {:load_session, sid, model, cwd, mcp_servers, guidance, request_timeout},
+         _from,
+         state
+       ) do
     load_session_reply(state, sid, model, cwd, mcp_servers, guidance, request_timeout)
   end
 
-  def handle_call(
-        {:switch_model_session, sid, model, cwd, mcp_servers, guidance},
-        _from,
-        state
-      ) do
+  defp session_call(
+         {:switch_model_session, sid, model, cwd, mcp_servers, guidance},
+         _from,
+         state
+       ) do
     case state.preset.resident_model_switch do
       :fork ->
         if MapSet.member?(state.unprompted, sid) do
@@ -598,10 +785,10 @@ defmodule Tightbeam.Acp.Adapter do
     end
   end
 
-  def handle_call({:close_session, sid}, from, state),
-    do: handle_call({:close_session, sid, []}, from, state)
+  defp session_call({:close_session, sid}, from, state),
+    do: session_call({:close_session, sid, []}, from, state)
 
-  def handle_call({:close_session, sid, opts}, _from, state) do
+  defp session_call({:close_session, sid, opts}, _from, state) do
     diagnostic? = Keyword.get(opts, :diagnostic, false)
 
     case Conn.request(state.conn, "session/close", %{sessionId: sid}, diagnostic: diagnostic?) do
@@ -626,7 +813,7 @@ defmodule Tightbeam.Acp.Adapter do
     end
   end
 
-  def handle_call({:apply_model_strict, sid, model, prior_model, caller_deadline}, _from, state) do
+  defp session_call({:apply_model_strict, sid, model, prior_model, caller_deadline}, _from, state) do
     cond do
       caller_deadline - System.monotonic_time(:millisecond) <= 0 ->
         {:reply, {:error, :model_transport_failure}, state}
@@ -650,31 +837,31 @@ defmodule Tightbeam.Acp.Adapter do
     end
   end
 
-  def handle_call({:apply_model, sid, model}, _from, state) do
+  defp session_call({:apply_model, sid, model}, _from, state) do
     case apply_model_to_session(state, sid, model) do
       {:ok, applied_model} -> {:reply, :ok, remember_model(state, sid, applied_model)}
       error -> {:reply, error, drop_model_residency(state, sid)}
     end
   end
 
-  def handle_call({:apply_model, sid, model, request_timeout}, _from, state) do
+  defp session_call({:apply_model, sid, model, request_timeout}, _from, state) do
     case apply_model_to_session(state, sid, model, request_timeout) do
       {:ok, applied_model} -> {:reply, :ok, remember_model(state, sid, applied_model)}
       error -> {:reply, error, drop_model_residency(state, sid)}
     end
   end
 
-  def handle_call({:knows_session?, sid}, _from, state),
+  defp session_call({:knows_session?, sid}, _from, state),
     do: {:reply, MapSet.member?(state.known, sid), state}
 
-  def handle_call({:current_model, sid}, _from, state) do
+  defp session_call({:current_model, sid}, _from, state) do
     case Map.fetch(state.models, sid) do
       {:ok, model} -> {:reply, {:ok, model}, state}
       :error -> {:reply, {:error, :model_readback_unavailable}, state}
     end
   end
 
-  def handle_call({:context_usage, sid, max_age_ms}, _from, state) do
+  defp session_call({:context_usage, sid, max_age_ms}, _from, state) do
     result =
       if Map.has_key?(state.prompts, sid) do
         {:error, :context_usage_in_flight}
@@ -690,18 +877,18 @@ defmodule Tightbeam.Acp.Adapter do
     {:reply, result, state}
   end
 
-  def handle_call({:switchable_models, sid}, _from, state) do
+  defp session_call({:switchable_models, sid}, _from, state) do
     case Map.fetch(state.switchable_models, sid) do
       {:ok, models} -> {:reply, {:ok, models}, state}
       :error -> {:reply, {:error, :model_capability_unavailable}, state}
     end
   end
 
-  def handle_call({:fast_status, sid}, _from, state) do
+  defp session_call({:fast_status, sid}, _from, state) do
     {:reply, canonical_fast_status(state, sid), state}
   end
 
-  def handle_call({:apply_fast, sid, requested}, _from, state) do
+  defp session_call({:apply_fast, sid, requested}, _from, state) do
     with {:ok, option} <- advertised_fast_option(state, sid),
          {:ok, wire_value} <- fast_wire_value(option, requested) do
       case Conn.request(
@@ -740,10 +927,10 @@ defmodule Tightbeam.Acp.Adapter do
     end
   end
 
-  def handle_call({:forget_model_residency, sid}, _from, state),
+  defp session_call({:forget_model_residency, sid}, _from, state),
     do: {:reply, :ok, drop_model_residency(state, sid)}
 
-  def handle_call({:prompt, sid, text, opts}, from, state) do
+  defp session_call({:prompt, sid, text, opts}, from, state) do
     if Map.has_key?(state.prompts, sid) do
       # A recovered lane can reach its next prompt before cancel acknowledges
       # the old one. Keep that call undispatched until the old operation ends.
@@ -760,7 +947,7 @@ defmodule Tightbeam.Acp.Adapter do
     end
   end
 
-  def handle_call(:conn, _from, state), do: {:reply, state.conn, state}
+  defp session_call(:conn, _from, state), do: {:reply, state.conn, state}
 
   defp switch_model_in_place_reply(state, sid, model, request_timeout) do
     case apply_verified_in_place_model(state, sid, model, request_timeout) do
@@ -1334,6 +1521,13 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   @impl true
+  def handle_info({:session_operation_done, key, pid, reply, updates}, state) do
+    case state.operations[key] do
+      %{pid: ^pid} = operation -> finish_operation(state, key, operation, reply, updates)
+      _ -> {:noreply, state}
+    end
+  end
+
   def handle_info({:acp_notification, "account/updated", params}, state) do
     emit_auth_classification(state, params)
     {:noreply, state}
@@ -1359,7 +1553,12 @@ defmodule Tightbeam.Acp.Adapter do
 
       if is_binary(text) and Map.has_key?(state.chunks, sid) do
         {:noreply,
-         update_in(state.chunks[sid], &accumulate_assistant_chunk(&1, message_id, text))}
+         state
+         |> update_in(
+           [Access.key(:chunks), sid],
+           &accumulate_assistant_chunk(&1, message_id, text)
+         )
+         |> record_notification_fields(sid, [:chunks])}
       else
         {:noreply, state}
       end
@@ -1726,14 +1925,23 @@ defmodule Tightbeam.Acp.Adapter do
     end
   end
 
-  # Invoke the per-turn progress fun on status CHANGE only. The fun is fast
-  # by contract (an in-memory registry broadcast) — see PATTERNS on shared
-  # serializers; anything slower belongs to the turn, not here.
+  # A slow or unavailable progress consumer must not hold the adapter loop.
   defp emit_progress(state, sid, update) do
     with {fun, last, seq} <- Map.get(state.progress, sid),
          {:ok, text} when text != last <- progress_status(update) do
-      fun.(text, seq + 1)
-      put_in(state.progress[sid], {fun, text, seq + 1})
+      Task.start(fn ->
+        try do
+          fun.(text, seq + 1)
+        rescue
+          error -> Logger.warning("adapter progress callback failed: #{inspect(error)}")
+        catch
+          :exit, reason -> Logger.warning("adapter progress callback exited: #{inspect(reason)}")
+        end
+      end)
+
+      state
+      |> put_in([Access.key(:progress), sid], {fun, text, seq + 1})
+      |> record_notification_fields(sid, [:progress])
     else
       _ -> state
     end
@@ -1777,7 +1985,9 @@ defmodule Tightbeam.Acp.Adapter do
         System.monotonic_time(:millisecond)
       )
 
-    put_in(state.context_usage[sid], observation)
+    state
+    |> put_in([Access.key(:context_usage), sid], observation)
+    |> record_notification_fields(sid, [:context_usage])
   end
 
   defp remember_context_usage(state, _sid, _update), do: state
@@ -2045,6 +2255,12 @@ defmodule Tightbeam.Acp.Adapter do
       state
       |> remember_switchable_models(sid, %{"configOptions" => options})
       |> remember_config_options(sid, %{"configOptions" => options})
+      |> record_notification_fields(sid, [:config_options])
+
+    state =
+      if canonical_offered_models(state.preset, %{"configOptions" => options}) == [],
+        do: state,
+        else: record_notification_fields(state, sid, [:switchable_models])
 
     case Map.fetch(state.models, sid) do
       {:ok, %Model{} = cached} ->
@@ -2360,9 +2576,17 @@ defmodule Tightbeam.Acp.Adapter do
 
   defp remember_reported_config_model(state, sid, options) do
     case model_ref_from_config(%{"configOptions" => options}, state.preset.effort_config) do
-      {:ok, model} -> remember_model(state, sid, model)
+      {:ok, model} -> remember_notification_model(state, sid, model)
       :error -> state
     end
+  end
+
+  defp remember_notification_model(state, sid, model) do
+    fields = if state.models[sid] == model, do: [:models], else: [:models, :context_usage]
+
+    state
+    |> remember_model(sid, model)
+    |> record_notification_fields(sid, fields)
   end
 
   defp remember_confirmed_config_model(state, sid, cached, options) do
@@ -2373,7 +2597,7 @@ defmodule Tightbeam.Acp.Adapter do
         effort -> %{cached | effort: effort}
       end
 
-    remember_model(state, sid, model)
+    remember_notification_model(state, sid, model)
   end
 
   defp model_ref_from_config(%{"configOptions" => options}, effort_id)

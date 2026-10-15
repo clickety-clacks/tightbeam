@@ -1,4 +1,6 @@
 defmodule Tightbeam.Escalation do
+  require Logger
+
   @moduledoc """
   Durable decision requests and raiser-scoped escalation waivers.
 
@@ -571,20 +573,21 @@ defmodule Tightbeam.Escalation do
     |> String.trim_trailing(";")
   end
 
+  # One invalid historical row must not refuse service. Report every such row
+  # and leave it as it is; the schema and guard checks above stay strict.
   defp validate_decision_row_revisions_in_txn(txn) do
-    invalid =
-      Txn.q(
-        txn,
-        "SELECT id FROM decision_requests WHERE " <>
-          "typeof(rowSchemaRevision) <> 'integer' OR rowSchemaRevision NOT IN (1,2) OR " <>
-          "(rowSchemaRevision=1 AND status NOT IN ('open','answered','ruled','consumed','withdrawn','superseded')) OR " <>
-          "(rowSchemaRevision=2 AND status NOT IN ('open','answered','returned','ruled','consumed','withdrawn','superseded')) LIMIT 1"
-      )
+    Txn.q(
+      txn,
+      "SELECT id FROM decision_requests WHERE " <>
+        "typeof(rowSchemaRevision) <> 'integer' OR rowSchemaRevision NOT IN (1,2) OR " <>
+        "(rowSchemaRevision=1 AND status NOT IN ('open','answered','ruled','consumed','withdrawn','superseded')) OR " <>
+        "(rowSchemaRevision=2 AND status NOT IN ('open','answered','returned','ruled','consumed','withdrawn','superseded'))"
+    )
+    |> Enum.each(fn [id] ->
+      Logger.warning("incompatible decision request row revision for #{id}; row left unchanged")
+    end)
 
-    case invalid do
-      [] -> :ok
-      [[id]] -> raise DB.Error, message: "incompatible decision request row revision for #{id}"
-    end
+    :ok
   end
 
   @doc false

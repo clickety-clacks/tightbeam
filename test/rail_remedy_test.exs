@@ -710,17 +710,35 @@ defmodule Tightbeam.RailRemedyTest do
         [assignment.id]
       )
 
-    {:ok, before_wakes} = DB.query(ctx.db, "SELECT wakeId,state FROM wakes ORDER BY wakeId", [])
+    {:ok, before_wakes} =
+      DB.query(ctx.db, "SELECT wakeId,state FROM wakes WHERE wakeId<>?1 ORDER BY wakeId", [
+        stale.wake_id
+      ])
 
-    assert_raise ArgumentError, "review remedy episode is not live", fn ->
-      RailRemedy.reconcile_notice(ctx.db, %{supervision_interval_ms: 1_000}, stale)
-    end
+    # The reassessment can never apply to the new occurrence. It settles once
+    # instead of failing on every tick, and changes nothing else.
+    assert :ok = RailRemedy.reconcile_notice(ctx.db, %{supervision_interval_ms: 1_000}, stale)
+    assert %{state: "fired"} = Wakes.get(ctx.db, stale.wake_id)
 
     assert {:ok, ^before_wakes} =
-             DB.query(ctx.db, "SELECT wakeId,state FROM wakes ORDER BY wakeId", [])
+             DB.query(ctx.db, "SELECT wakeId,state FROM wakes WHERE wakeId<>?1 ORDER BY wakeId", [
+               stale.wake_id
+             ])
 
     assert RailRemedy.episode(ctx.db, "completion-requires-review", assignment.id).notice_state ==
              current.notice_state
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM lifecycle_events WHERE kind='rail_remedy_reassessment_retired' AND subject=?1",
+               [assignment.id]
+             )
+
+    # A repeated delivery of the settled wake is refused, not re-applied.
+    assert_raise ArgumentError, fn ->
+      RailRemedy.reconcile_notice(ctx.db, %{supervision_interval_ms: 1_000}, stale)
+    end
   end
 
   test "live bounded retry prevents a competing O2 recovery", ctx do

@@ -459,6 +459,38 @@ defmodule Tightbeam.DecisionStoredVersion019Test do
     assert decision_schema_snapshot(db) == before
   end
 
+  test "an invalid historical decision row is reported and does not stop startup", %{db: db} do
+    insert_decision_rows(db)
+
+    {:ok, guards} =
+      DB.query(
+        db,
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name LIKE 'decision_requests_row_schema_revision_%' ORDER BY name"
+      )
+
+    assert length(guards) == 2
+
+    # Write the invalid value the guards would refuse, as an old writer could
+    # have, then restore the exact guards.
+    :ok =
+      DB.execute(db, """
+      DROP TRIGGER decision_requests_row_schema_revision_insert_guard;
+      DROP TRIGGER decision_requests_row_schema_revision_update_guard;
+      UPDATE decision_requests SET rowSchemaRevision=7 WHERE id='dr_statute_r7';
+      """)
+
+    for [sql] <- guards, do: :ok = DB.execute(db, sql)
+    before = DB.query(db, "SELECT * FROM decision_requests ORDER BY id")
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert :ok = Schema.ensure_all(db)
+      end)
+
+    assert log =~ "incompatible decision request row revision for dr_statute_r7"
+    assert DB.query(db, "SELECT * FROM decision_requests ORDER BY id") == before
+  end
+
   test "decision projections require an explicit compatible row schema revision", %{db: db} do
     insert_decision_rows(db)
     agent = Escalation.raw_by_id(db, "dr_agent_r7")

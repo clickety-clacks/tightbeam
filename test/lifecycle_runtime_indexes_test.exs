@@ -74,10 +74,10 @@ defmodule Tightbeam.LifecycleRuntimeIndexesTest do
     query =
       Enum.find(
         LifecycleRuntimeFixture.cases(),
-        &String.starts_with?(String.trim(&1.sql), "SELECT e.subject")
+        &String.starts_with?(String.trim(&1.sql), "SELECT session, subject")
       )
 
-    assert {:error, %DB.Error{message: message}} = DB.query(db, query.sql, ["index-session", nil])
+    assert {:error, %DB.Error{message: message}} = DB.query(db, query.sql, [nil])
     assert message =~ "malformed JSON"
     :ok = Schema.ensure_all(db)
   end

@@ -16,7 +16,16 @@ defmodule Tightbeam.LaneManager do
   use GenServer
   alias Tightbeam.{DB, HarnessHealth, Ledger, SessionLane}
 
-  defstruct [:db, :lane_sup, :task_sup, :runner, :interval, :terminal_publisher, :on_terminal]
+  defstruct [
+    :db,
+    :lane_sup,
+    :task_sup,
+    :runner,
+    :interval,
+    :terminal_publisher,
+    :on_terminal,
+    reaping: %{}
+  ]
 
   @doc """
   Start the reconciler. Required opts: `:lane_sup` (the lane
@@ -128,6 +137,15 @@ defmodule Tightbeam.LaneManager do
     {:noreply, do_reconcile(state)}
   end
 
+  def handle_info({ref, _result}, state) when is_map_key(state.reaping, ref) do
+    Process.demonitor(ref, [:flush])
+    {:noreply, %{state | reaping: Map.delete(state.reaping, ref)}}
+  end
+
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, state) do
+    {:noreply, %{state | reaping: Map.delete(state.reaping, ref)}}
+  end
+
   defp do_reconcile(state) do
     DB.background_pass(fn -> reconcile_pass(state) end, state)
   end
@@ -142,13 +160,21 @@ defmodule Tightbeam.LaneManager do
       state.on_terminal.(row.session_key, seq)
     end
 
-    for session_key <- Ledger.pending_sessions(state.db) do
-      ensure(state, session_key)
-      SessionLane.reap_abandoned(session_key)
-      SessionLane.nudge(session_key)
-    end
+    Enum.reduce(Ledger.pending_sessions(state.db), state, fn session_key, acc ->
+      ensure(acc, session_key)
 
-    state
+      if Enum.any?(acc.reaping, fn {_ref, key} -> key == session_key end) do
+        acc
+      else
+        task =
+          Task.Supervisor.async_nolink(state.task_sup, fn ->
+            SessionLane.reap_abandoned(session_key)
+            SessionLane.nudge(session_key)
+          end)
+
+        %{acc | reaping: Map.put(acc.reaping, task.ref, session_key)}
+      end
+    end)
   end
 
   defp ensure(state, session_key) do

@@ -1070,6 +1070,60 @@ defmodule Tightbeam.WakesTest do
              2
   end
 
+  test "fire_matching replies after the eager step and runs the delivery pass afterwards", %{
+    db: db,
+    scheduler: scheduler
+  } do
+    test_pid = self()
+
+    start_supervised!({Wakes,
+     db: db,
+     name: scheduler,
+     tick_ms: 60_000,
+     deliver: fn _wake -> :ok end,
+     internal_consumers: %{
+       "blocking" => fn wake ->
+         # Runs in the scheduler process; block only the first pass.
+         unless Process.get(:blocked_once) do
+           Process.put(:blocked_once, true)
+           send(test_pid, {:consuming, wake.wake_id})
+
+           receive do
+             :release -> :ok
+           after
+             10_000 -> :ok
+           end
+         end
+
+         :ok
+       end
+     }})
+
+    wake =
+      Wakes.schedule(db, %{
+        session_key: "k1",
+        origin: "process:tightbeam",
+        consumer: "blocking",
+        due_at: System.system_time(:millisecond)
+      })
+
+    {:ok, [[fact_id]]} =
+      DB.query(
+        db,
+        "INSERT INTO condition_facts (ts, kind, scope, origin) VALUES (1, 'unmatched', NULL, 'process:ci') RETURNING id"
+      )
+
+    # The due wake's consumer blocks until released. A fact filer must get its
+    # reply without waiting for that pass.
+    assert :ok = Wakes.fire_matching(scheduler, fact_id)
+    assert_receive {:consuming, consumed}, 5_000
+    assert consumed == wake.wake_id
+
+    send(Process.whereis(scheduler), :release)
+    assert :ok = Wakes.fire_matching(scheduler, [fact_id, fact_id])
+    assert :ok = Wakes.fire_due(scheduler)
+  end
+
   test "fire_due called inside the scheduler queues another pass without self-calling", %{
     db: db,
     scheduler: scheduler

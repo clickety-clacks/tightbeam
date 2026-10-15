@@ -1349,14 +1349,21 @@ defmodule Tightbeam.Ledger do
     end
   end
 
+  @doc false
+  # `+seq` keeps ORDER BY from steering the planner off turns_unpublished and
+  # onto a full scan of turns in rowid order; the sort is over the few
+  # unpublished rows.
+  def unpublished_terminals_sql do
+    """
+    SELECT seq, sessionKey, messageId, status, error FROM turns
+    WHERE endedAt IS NOT NULL AND publishedAt IS NULL ORDER BY +seq
+    """
+  end
+
   @doc "Terminal rows not yet published (at-least-once publication feed)."
   @spec unpublished_terminals(db()) :: [map()]
   def unpublished_terminals(db \\ Tightbeam.DB) do
-    {:ok, rows} =
-      DB.query(db, """
-        SELECT seq, sessionKey, messageId, status, error FROM turns
-        WHERE endedAt IS NOT NULL AND publishedAt IS NULL ORDER BY seq
-      """)
+    {:ok, rows} = DB.query(db, unpublished_terminals_sql())
 
     Enum.map(rows, fn [seq, sk, mid, status, error] ->
       %{seq: seq, session_key: sk, message_id: mid, status: status, error: error}
