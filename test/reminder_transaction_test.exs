@@ -333,7 +333,12 @@ defmodule Tightbeam.ReminderTransactionTest do
     :ok =
       DB.execute(
         db,
-        "INSERT INTO turns(seq,sessionKey,messageId,wakeId,origin,prompt,assignmentId,status,createdAt,endedAt) VALUES (1,'r1-holder','m1','r1-failed','process:tightbeam','notice','r1-assignment','failed_unknown',1,2)"
+        """
+        INSERT INTO wakes(wakeId,sessionKey,origin,prompt,dueAt,createdAt,state,assignmentId,deliveredTurnSeq)
+        VALUES('r1-failed','r1-holder','process:tightbeam','notice',1,1,'fired','r1-assignment',1);
+        INSERT INTO turns(seq,sessionKey,messageId,wakeId,origin,prompt,assignmentId,status,createdAt,endedAt)
+        VALUES (1,'r1-holder','m1','r1-failed','process:tightbeam','notice','r1-assignment','failed_unknown',1,2);
+        """
       )
 
     assert {:ok, :no_claim} = DB.transaction(db, &ReminderDelivery.delivered_in_txn(&1, 1))

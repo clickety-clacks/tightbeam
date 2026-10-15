@@ -2130,10 +2130,21 @@ defmodule Tightbeam.Gateway do
   defp existing_wake_turn_in_txn(_txn, wake_id) when not is_binary(wake_id), do: nil
 
   defp existing_wake_turn_in_txn(txn, wake_id) do
-    case NoticeBatcher.source_delivery_turns_in_txn(txn, wake_id) do
-      [[seq, _status, _assignment] | _] -> {:duplicate, %{wake_id: wake_id, turn_seq: seq}}
-      [] -> nil
-    end
+    seq =
+      case DB.Txn.q(txn, "SELECT deliveredTurnSeq FROM wakes WHERE wakeId=?1", [wake_id]) do
+        [[seq]] when is_integer(seq) ->
+          seq
+
+        _ ->
+          # Direct callers may use a transport dedupe token without scheduling
+          # a wake. Its unique turn key remains the idempotency authority.
+          case DB.Txn.q(txn, "SELECT seq FROM turns WHERE wakeId=?1", [wake_id]) do
+            [[seq]] -> seq
+            [] -> nil
+          end
+      end
+
+    if is_integer(seq), do: {:duplicate, %{wake_id: wake_id, turn_seq: seq}}, else: nil
   end
 
   @doc false
@@ -2395,6 +2406,16 @@ defmodule Tightbeam.Gateway do
 
         case enqueued do
           {:ok, seq} ->
+            if is_binary(opts[:wake_id]) do
+              NoticeBatcher.carrier_source_ids_in_txn(txn, opts[:wake_id])
+              |> Enum.each(fn source_id ->
+                DB.Txn.q(txn, "UPDATE wakes SET deliveredTurnSeq=?2 WHERE wakeId=?1", [
+                  source_id,
+                  seq
+                ])
+              end)
+            end
+
             settle_supervision_controller_in_txn(txn, opts, target, seq)
 
             opts[:wake_id]

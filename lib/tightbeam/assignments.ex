@@ -782,7 +782,7 @@ defmodule Tightbeam.Assignments do
     Txn.q(
       txn,
       """
-      SELECT d.sourceWakeId FROM (#{Tightbeam.NoticeBatcher.source_deliveries_sql()}) d
+      SELECT d.sourceWakeId FROM (#{Tightbeam.NoticeBatcher.recorded_deliveries_sql()}) d
       JOIN wakes w ON w.wakeId=d.sourceWakeId JOIN turns t ON t.seq=d.turnSeq
       WHERE d.turnSeq=?1 AND w.sessionKey=t.sessionKey
       """,

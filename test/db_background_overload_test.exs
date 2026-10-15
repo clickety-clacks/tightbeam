@@ -57,6 +57,41 @@ defmodule Tightbeam.DBBackgroundOverloadTest do
     assert {:noreply, ^state} = Tightbeam.Wakes.handle_info(:tick, state)
   end
 
+  test "recipient drain skips overload without losing scheduler state", %{db: db} do
+    state = %{db: db, delivery_opts: []}
+    assert Tightbeam.NoticeBatcher.recover(db, 1, [], "recipient") == []
+
+    assert {:noreply, ^state} =
+             Tightbeam.Wakes.handle_cast({:recipient_ready, "recipient"}, state)
+  end
+
+  test "fallback skips overload and schedules its next pass", %{db: db} do
+    state = %{
+      db: db,
+      internal_consumers: %{},
+      delivery_opts: [],
+      deliver: fn _ -> flunk("delivery must not run") end
+    }
+
+    assert {:noreply, ^state} = Tightbeam.Wakes.handle_info(:notice_fallback, state)
+    refute_receive :notice_fallback, 100
+    assert_receive :notice_fallback, 30_500
+  end
+
+  test "backfill skips overload and retries without reporting a persistence failure", %{db: db} do
+    state = %{db: db}
+
+    log =
+      capture_log([level: :debug], fn ->
+        assert {:noreply, ^state} = Tightbeam.Wakes.handle_info(:backfill_wake_delivery, state)
+      end)
+
+    assert log =~ "background pass deferred"
+    refute log =~ "wake delivery backfill deferred for 5 seconds"
+    refute_receive :backfill_wake_delivery, 200
+    assert_receive :backfill_wake_delivery, 5_500
+  end
+
   test "supervision sweep skips overload and retains its next tick", %{db: db} do
     state = %{db: db, sweep_ms: 3_600_000}
     assert {:noreply, ^state} = Tightbeam.Supervision.handle_info(:scheduled_sweep, state)

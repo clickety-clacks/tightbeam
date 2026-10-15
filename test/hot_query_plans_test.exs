@@ -21,6 +21,14 @@ defmodule Tightbeam.HotQueryPlansTest do
     plan
   end
 
+  test "transfer candidates use the wake assignment index", %{db: db} do
+    plan = plan!(db, Supervision.transfer_candidate_sql(), ["assignment", nil])
+    assert Enum.any?(plan, &String.contains?(&1, "USING INDEX wakes_assignment (assignmentId=?)"))
+    refute Enum.any?(plan, &Regex.match?(~r/^SCAN (wakes|w|d)\b/, &1))
+    assert {:ok, []} = DB.query(db, Supervision.transfer_candidate_sql(), ["assignment", nil])
+    assert :ok = Tightbeam.Schema.ensure_all(db)
+  end
+
   test "idle-cleanup delivery history is driven by its partial index", %{db: db} do
     params = Supervision.idle_cleanup_delivery_history_params(String.duplicate("a", 64), "tok")
     plan = plan!(db, Supervision.idle_cleanup_delivery_history_sql(), params)

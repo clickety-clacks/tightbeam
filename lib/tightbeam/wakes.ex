@@ -42,6 +42,8 @@ defmodule Tightbeam.Wakes do
 
   alias Tightbeam.DB.Txn
 
+  @notice_fallback_ms 30_000
+
   @type db :: GenServer.server()
 
   @type wake :: %{
@@ -993,17 +995,8 @@ defmodule Tightbeam.Wakes do
     Txn.q(
       txn,
       """
-      SELECT 1 FROM turns t
-      WHERE t.sessionKey=?2 AND (
-        t.wakeId=?1 OR EXISTS (
-          SELECT 1
-          FROM notice_batch_members m
-          JOIN notice_batches b ON b.batchId=m.batchId
-          WHERE m.sourceWakeId=?1 AND m.state='included'
-            AND b.deliveryWakeId=t.wakeId
-        )
-      )
-      LIMIT 1
+      SELECT 1 FROM wakes w JOIN turns t ON t.seq=w.deliveredTurnSeq
+      WHERE w.wakeId=?1 AND t.sessionKey=?2
       """,
       [source_wake_id, session_key]
     ) == [[1]]
@@ -2238,7 +2231,7 @@ defmodule Tightbeam.Wakes do
       case Txn.q(
              txn,
              """
-             WITH deliveries AS (#{NoticeBatcher.source_deliveries_sql()})
+             WITH deliveries AS (#{Tightbeam.NoticeBatcher.recorded_deliveries_sql()})
              SELECT t.status FROM deliveries d JOIN turns t ON t.seq=d.turnSeq
              WHERE d.sourceWakeId=?1 AND d.assignmentId=?2 AND t.sessionKey=?3
              ORDER BY t.seq DESC
@@ -2342,7 +2335,7 @@ defmodule Tightbeam.Wakes do
         Txn.q(
           txn,
           """
-          WITH deliveries AS (#{NoticeBatcher.source_deliveries_sql()})
+          WITH deliveries AS (#{Tightbeam.NoticeBatcher.recorded_deliveries_sql()})
           SELECT 1 FROM deliveries d JOIN turns t ON t.seq=d.turnSeq
           JOIN sessions holder ON holder.sessionKey=t.sessionKey
           JOIN supervision_liveness_sidecar sidecar ON sidecar.wakeId=d.sourceWakeId
@@ -6317,6 +6310,11 @@ defmodule Tightbeam.Wakes do
   end
 
   @doc false
+  def recipient_ready(server \\ Tightbeam.WakeScheduler, session_key) do
+    GenServer.cast(server, {:recipient_ready, session_key})
+  end
+
+  @doc false
   @spec recognize_condition_fact_in_txn(Txn.t(), pos_integer()) :: [term()]
   def recognize_condition_fact_in_txn(%Txn{} = txn, fact_id) do
     Txn.q(
@@ -6360,6 +6358,8 @@ defmodule Tightbeam.Wakes do
     }
 
     schedule_tick(state.tick_ms)
+    Process.send_after(self(), :notice_fallback, @notice_fallback_ms)
+    Process.send_after(self(), :backfill_wake_delivery, 100)
     {:ok, state}
   end
 
@@ -6384,13 +6384,43 @@ defmodule Tightbeam.Wakes do
   end
 
   @impl true
+  def handle_cast({:recipient_ready, session_key}, state) do
+    DB.background_pass(fn ->
+      deliver_eligible_waits(state.db, state.delivery_opts, session_key)
+      NoticeBatcher.recover(state.db, now(), state.delivery_opts, session_key)
+    end)
+
+    {:noreply, state}
+  end
+
+  @impl true
+  def handle_info(:backfill_wake_delivery, state) do
+    result =
+      DB.background_pass(fn -> Tightbeam.Schema.backfill_wake_delivery(state.db) end, :overloaded)
+
+    case result do
+      :overloaded -> Process.send_after(self(), :backfill_wake_delivery, 5_000)
+      :more -> Process.send_after(self(), :backfill_wake_delivery, 100)
+      {:error, _error} -> Process.send_after(self(), :backfill_wake_delivery, 5_000)
+      :done -> :ok
+    end
+
+    {:noreply, state}
+  end
+
   def handle_info(:fire_due, state) do
     deliver_due(state)
     {:noreply, state}
   end
 
-  def handle_info(:tick, state) do
+  def handle_info(:notice_fallback, state) do
     deliver_due(state)
+    Process.send_after(self(), :notice_fallback, @notice_fallback_ms)
+    {:noreply, state}
+  end
+
+  def handle_info(:tick, state) do
+    deliver_due(state, false)
     schedule_tick(state.tick_ms)
     {:noreply, state}
   end
@@ -6437,30 +6467,84 @@ defmodule Tightbeam.Wakes do
   # Deliver-then-mark (see moduledoc — never reorder): a raising deliver
   # leaves its wake pending for the next tick; a crash between deliver and
   # mark redelivers, deduped by turns.wakeId.
-  defp deliver_due(state) do
+  defp deliver_due(state, drain_notices \\ true) do
     # R1/B1: one real scheduler entry owns the context of all DB calls in this
     # scan. The bind restores even when delivery raises; the next scan gets a
     # fresh ID. No context is implicitly inherited by a spawned process.
     Tightbeam.RequestContext.bind_internal("wake_scheduler", fn ->
-      DB.background_pass(fn -> deliver_due_in_context(state) end)
+      DB.background_pass(fn -> deliver_due_in_context(state, drain_notices) end)
     end)
   end
 
-  defp deliver_due_in_context(%{db: db, deliver: deliver, internal_consumers: consumers} = state) do
+  # Group only due routing destinations before resolving them. Busy recipients
+  # wait for their lane's readiness signal without preparing their sources.
+  defp due_prompt_recipients(db) do
+    transaction!(db, fn txn ->
+      Txn.q(
+        txn,
+        """
+        SELECT DISTINCT sessionKey,targetRole,targetGate,reresolve,reresolveSeed,reresolveRung
+        FROM wakes INDEXED BY wakes_due
+        WHERE state='pending' AND dueAt<=?1 AND consumer='prompt' AND digest=0
+          AND COALESCE(deliveryRule,'')<>'turn-boundary-digest r1'
+          AND (conditionKind IS NULL OR firedAt IS NOT NULL)
+          AND (waitMode IS NULL OR recognitionAt IS NOT NULL)
+        """,
+        [now()]
+      )
+      |> Enum.flat_map(fn [key, role, gate, resolve, seed, rung] ->
+        target_gate =
+          cond do
+            is_binary(role) -> %{target_role: role}
+            gate == 0 -> nil
+            true -> %{reresolve: resolve, reresolve_seed: seed, reresolve_rung: rung}
+          end
+
+        case Gateway.delivery_target(txn, key, target_gate) do
+          {recipient, _, _} -> [recipient]
+          nil -> []
+        end
+      end)
+      |> Enum.uniq()
+      |> Enum.reject(fn recipient ->
+        Txn.q(
+          txn,
+          "SELECT 1 FROM turns WHERE sessionKey=?1 AND status IN ('running','queued') LIMIT 1",
+          [recipient]
+        ) != []
+      end)
+    end)
+  end
+
+  defp deliver_due_in_context(
+         %{db: db, deliver: deliver, internal_consumers: consumers} = state,
+         drain_notices
+       ) do
     if Map.has_key?(consumers, "review_remedy_reconcile") do
       {:ok, :ok} =
         Tightbeam.RailRemedy.reconcile_pending_episodes(db, state.review_remedy_interval_ms)
     end
 
-    recognize_due_dependency_waits(db)
-    deliver_eligible_waits(db, state.delivery_opts)
+    newly_due = recognize_due_dependency_waits(db)
+
+    if drain_notices do
+      deliver_eligible_waits(db, state.delivery_opts)
+    else
+      (deliver_wait_ids(db, newly_due, state.delivery_opts) ++ due_prompt_recipients(db))
+      |> Enum.uniq()
+      |> Enum.each(&NoticeBatcher.recover(db, now(), state.delivery_opts, &1))
+    end
+
     evaluate_conditions(state, :tick)
 
     # Materialize after condition recognition so a fallback or matching fact
     # that becomes due in this pass joins the same recipient-ready batch.
     # Held members remain individual source rows and never reach the delivery
     # loop below.
-    NoticeBatcher.recover(db, now(), state.delivery_opts)
+    if drain_notices do
+      NoticeBatcher.recover(db, now(), state.delivery_opts)
+    end
+
     legacy_materialize_digests(db, now())
 
     {:ok, rows} =
@@ -6470,7 +6554,7 @@ defmodule Tightbeam.Wakes do
         select_wake_sql(
           ", (SELECT routingWakeId FROM work_items WHERE id=wakes.work_item_id), (SELECT slateWakeId FROM work_items WHERE id=wakes.work_item_id)"
         ) <>
-          " WHERE state = 'pending' AND dueAt <= ?1 AND conditionKind IS NULL AND waitMode IS NULL" <>
+          " INDEXED BY wakes_due WHERE state = 'pending' AND dueAt <= ?1 AND conditionKind IS NULL AND waitMode IS NULL" <>
           " AND NOT (consumer='prompt' AND digest=0 AND COALESCE(deliveryRule,'')<>'turn-boundary-digest r1')" <>
           " ORDER BY dueAt ASC",
         [now()]
@@ -6562,7 +6646,7 @@ defmodule Tightbeam.Wakes do
       DB.query(
         db,
         """
-        SELECT wakeId FROM wakes
+        SELECT wakeId FROM wakes INDEXED BY wakes_due
         WHERE state='pending' AND waitMode='dependency' AND recognitionAt IS NULL AND dueAt<=?1
         ORDER BY dueAt,wakeId
         """,
@@ -6575,6 +6659,8 @@ defmodule Tightbeam.Wakes do
         {:error, error} -> raise error
       end
     end)
+
+    rows
   end
 
   defp recognize_due_dependency_in_txn(txn, wake_id) do
@@ -6603,19 +6689,24 @@ defmodule Tightbeam.Wakes do
     end
   end
 
-  defp deliver_eligible_waits(db, delivery_opts) do
+  defp deliver_eligible_waits(db, delivery_opts, recipient \\ nil) do
     {:ok, rows} =
       DB.query(
         db,
         """
         SELECT wakeId FROM wakes
         WHERE state='pending' AND waitMode IS NOT NULL AND recognitionAt IS NOT NULL
-          AND firedAt IS NULL
+          AND firedAt IS NULL AND (?1 IS NULL OR sessionKey=?1)
         ORDER BY recognitionAt,wakeId
-        """
+        """,
+        [recipient]
       )
 
-    Enum.each(rows, fn [wake_id] ->
+    deliver_wait_ids(db, rows, delivery_opts)
+  end
+
+  defp deliver_wait_ids(db, rows, delivery_opts) do
+    Enum.flat_map(rows, fn [wake_id] ->
       case DB.transaction_then(
              db,
              fn txn -> deliver_wait_in_txn(txn, wake_id, delivery_opts) end,
@@ -6624,10 +6715,18 @@ defmodule Tightbeam.Wakes do
                result
              end
            ) do
-        {:ok, {:delivery, delivery}} -> Gateway.complete_delivery(db, delivery)
-        {:ok, :staged} -> :ok
-        {:ok, _} -> :ok
-        {:error, error} -> raise error
+        {:ok, {:delivery, delivery}} ->
+          Gateway.complete_delivery(db, delivery)
+          []
+
+        {:ok, {:staged, target}} ->
+          [target]
+
+        {:ok, _} ->
+          []
+
+        {:error, error} ->
+          raise error
       end
     end)
   end
@@ -6684,7 +6783,14 @@ defmodule Tightbeam.Wakes do
             end
 
             publish_change_in_txn(txn, "wake.fired", wake.wake_id)
-            if delivery == :staged, do: :staged, else: {:delivery, delivery}
+
+            if delivery == :staged do
+              target_gate = if wake.target_gate == 0, do: nil, else: wake
+              {recipient, _, _} = Gateway.delivery_target(txn, wake.session_key, target_gate)
+              {:staged, recipient}
+            else
+              {:delivery, delivery}
+            end
           else
             :noop
           end
