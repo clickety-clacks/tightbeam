@@ -1,6 +1,7 @@
 defmodule Tightbeam.Firehose.Hub do
   @moduledoc "Live-only Firehose queue with per-delivery authorization; startup is owned by Gateway."
   use GenServer
+  require Logger
   alias Tightbeam.Firehose.Publisher
   alias Tightbeam.StateVisibility
 
@@ -44,7 +45,25 @@ defmodule Tightbeam.Firehose.Hub do
     do: GenServer.cast(server, {:unregister, pid})
 
   def shutdown_delivered(server, pid), do: GenServer.call(server, {:shutdown_delivered, pid})
-  def shutdown(server \\ __MODULE__), do: GenServer.call(server, :shutdown, :infinity)
+
+  def shutdown(server \\ __MODULE__, deadline \\ System.monotonic_time(:millisecond) + 5_000) do
+    remaining = deadline - System.monotonic_time(:millisecond)
+
+    result =
+      if remaining <= 0 do
+        {:error, :deadline_exceeded}
+      else
+        try do
+          GenServer.call(server, {:shutdown, deadline}, remaining)
+        catch
+          :exit, reason -> {:error, reason}
+        end
+      end
+
+    if result != :ok, do: Logger.warning("firehose shutdown incomplete: #{inspect(result)}")
+    result
+  end
+
   def publish(server \\ __MODULE__, notice), do: GenServer.cast(server, {:publish, notice})
 
   def committed(server \\ __MODULE__, class, payload, refs),
@@ -99,7 +118,13 @@ defmodule Tightbeam.Firehose.Hub do
     {:reply, socket && Map.take(socket, [:queued, :in_flight, :overflowed, :seq]), state}
   end
 
-  def handle_call(:shutdown, from, state) do
+  def handle_call({:shutdown, deadline}, from, state) do
+    Process.send_after(
+      self(),
+      {:shutdown_timeout, from},
+      max(deadline - System.monotonic_time(:millisecond), 0)
+    )
+
     Enum.each(Map.keys(state.sockets), &send(&1, :firehose_shutdown))
 
     if map_size(state.sockets) == 0,
@@ -342,6 +367,13 @@ defmodule Tightbeam.Firehose.Hub do
   end
 
   @impl true
+  def handle_info({:shutdown_timeout, from}, %{shutdown_waiter: from} = state) do
+    GenServer.reply(from, {:error, :deadline_exceeded})
+    {:noreply, %{state | shutdown_waiter: nil}}
+  end
+
+  def handle_info({:shutdown_timeout, _from}, state), do: {:noreply, state}
+
   def handle_info({:DOWN, monitor, :process, pid, _}, state) do
     case state.sockets[pid] do
       %{monitor: ^monitor} -> {:noreply, drop(state, pid)}
