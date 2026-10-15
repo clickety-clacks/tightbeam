@@ -1136,7 +1136,7 @@ defmodule Tightbeam.Supervision do
           Txn.q(
             txn,
             """
-            WITH deliveries AS (#{NoticeBatcher.source_deliveries_sql()})
+            WITH deliveries AS (#{NoticeBatcher.source_deliveries_sql(source_wake: "?2", turn_seq: "?5")})
             SELECT 1 FROM supervision_entitlements e
             JOIN assignments a ON a.id=e.assignmentId
             JOIN wakes old ON old.wakeId=?2 AND old.assignmentId=a.id
@@ -4731,20 +4731,24 @@ defmodule Tightbeam.Supervision do
   defp idle_cleanup_digest(value),
     do: :crypto.hash(:sha256, value) |> Base.encode16(case: :lower)
 
+  @doc false
+  # Driven by the idle_cleanup_wakes_delivery_history partial index; delivery
+  # history is two keyed lookups per candidate wake, never a relation scan.
+  def idle_cleanup_delivery_history_sql do
+    """
+    SELECT w.firedAt,w.obligationRef
+    FROM wakes w
+    WHERE w.origin='process:tightbeam' AND w.state='fired'
+      AND w.obligationRef LIKE ?1
+      AND w.obligationRef LIKE ?2
+      AND #{NoticeBatcher.source_delivered_sql("w.wakeId")}
+    """
+  end
+
   defp idle_cleanup_delivery_history_in_txn(txn, group_digest, member_token) do
     Txn.q(
       txn,
-      """
-      SELECT w.firedAt,w.obligationRef
-      FROM wakes w
-      WHERE w.origin='process:tightbeam' AND w.state='fired'
-        AND w.obligationRef LIKE ?1
-        AND w.obligationRef LIKE ?2
-        AND EXISTS (
-          SELECT 1 FROM (#{NoticeBatcher.source_deliveries_sql()}) d
-          WHERE d.sourceWakeId=w.wakeId
-        )
-      """,
+      idle_cleanup_delivery_history_sql(),
       [@idle_cleanup_prefix <> group_digest <> "|%", "%|" <> member_token <> "|%"]
     )
     |> Enum.reduce({0, nil, 0, false}, fn [at, ref], {count, last, depth, main} ->
@@ -5777,7 +5781,7 @@ defmodule Tightbeam.Supervision do
     query(
       db_or_txn,
       """
-      WITH source_deliveries AS (#{NoticeBatcher.source_deliveries_sql()})
+      WITH source_deliveries AS (#{NoticeBatcher.source_deliveries_sql(assignment: "?1")})
       SELECT t.seq,t.sessionKey,d.assignmentId,
              w.wakeId,w.state,w.assignmentId,w.origin,w.createdAt,w.firedAt,
              w.reresolve,w.reresolveSeed,w.reresolveRung,
@@ -6071,7 +6075,7 @@ defmodule Tightbeam.Supervision do
     query(
       db_or_txn,
       """
-      WITH source_deliveries AS (#{NoticeBatcher.source_deliveries_sql()})
+      WITH source_deliveries AS (#{NoticeBatcher.source_deliveries_sql(turn_seq: "?1", source_wake: "?2")})
       SELECT 1 FROM source_deliveries d
       WHERE d.turnSeq=?1 AND d.sourceWakeId=?2 AND d.carrier=1 LIMIT 1
       """,

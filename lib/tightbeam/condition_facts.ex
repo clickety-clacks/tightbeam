@@ -465,7 +465,7 @@ defmodule Tightbeam.ConditionFacts do
   end
 
   defp notify_scheduler(scheduler, %{fact_id: fact_id}),
-    do: Wakes.fire_matching(scheduler, fact_id)
+    do: Wakes.nudge_matching(scheduler, fact_id)
 
   defp notify_scheduler(_scheduler, _result), do: :ok
 

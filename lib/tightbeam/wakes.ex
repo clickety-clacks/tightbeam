@@ -406,6 +406,11 @@ defmodule Tightbeam.Wakes do
 
   @terminal_notice_purpose "terminal-child-owner-notification"
   @terminal_notice_marker @terminal_notice_purpose <> ":"
+
+  @doc false
+  # A terminal notice re-resolves its recipient when it is prepared.
+  def terminal_notice?(%{obligation_ref: @terminal_notice_marker <> _}), do: true
+  def terminal_notice?(_wake), do: false
   @terminal_action_purpose "terminal-child-owner-action-reminder"
   @terminal_action_marker @terminal_action_purpose <> ":"
   @terminal_action_condition_kind "terminal-child-owner-action"
@@ -6287,6 +6292,28 @@ defmodule Tightbeam.Wakes do
 
   def fire_matching(server, fact_id) do
     GenServer.call(server, {:fire_matching, fact_id})
+  end
+
+  @doc """
+  Post-commit `fire_matching/2` for request paths. The fact has already
+  committed: an absent scheduler is ignored, and a timeout or crash only logs,
+  so the caller still gets its success response. Matching condition wakes are
+  evaluated again on the scheduler's next tick.
+  """
+  @spec nudge_matching(GenServer.server(), pos_integer() | [pos_integer()]) :: :ok
+  def nudge_matching(server, fact_ids) do
+    fire_matching(server, fact_ids)
+  catch
+    :exit, {:noproc, _call} ->
+      :ok
+
+    :exit, reason ->
+      Logger.warning(
+        "wake scheduler condition nudge after a committed fact did not complete; " <>
+          "matching wakes are evaluated on the next tick: #{inspect(reason)}"
+      )
+
+      :ok
   end
 
   @doc false

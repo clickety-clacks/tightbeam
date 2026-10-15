@@ -268,14 +268,7 @@ defmodule Tightbeam.SupervisionTest do
     {:ok, delivery_rows} =
       DB.query(
         ctx.db,
-        """
-        EXPLAIN QUERY PLAN
-        SELECT w.firedAt,w.obligationRef
-        FROM wakes w
-        WHERE w.origin='process:tightbeam' AND w.state='fired'
-          AND w.obligationRef LIKE ?1 AND w.obligationRef LIKE ?2
-          AND EXISTS (SELECT 1 FROM turns t WHERE t.wakeId=w.wakeId)
-        """,
+        "EXPLAIN QUERY PLAN " <> Supervision.idle_cleanup_delivery_history_sql(),
         [group_prefix <> "|%", "%|" <> member_token <> "|%"]
       )
 
@@ -283,6 +276,8 @@ defmodule Tightbeam.SupervisionTest do
     IO.puts("idle-cleanup delivery-history plan: " <> Enum.join(delivery_plan, " | "))
 
     assert Enum.any?(delivery_plan, &String.contains?(&1, "idle_cleanup_wakes_delivery_history"))
+    refute Enum.any?(delivery_plan, &Regex.match?(~r/^SCAN /, &1))
+    refute Enum.any?(delivery_plan, &String.contains?(&1, "CO-ROUTINE"))
 
     {:ok, pending_group_rows} =
       DB.query(
