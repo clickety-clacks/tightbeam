@@ -358,6 +358,7 @@ defmodule Tightbeam.Acp.AdapterTest do
         if (failMode === "slow-apply-before-strict" &&
             m.params.configId === "model" &&
             m.params.value === "gpt-blocking") {
+          models[m.params.sessionId] = m.params.value;
           return setTimeout(() => send({ id: m.id, result: configOptions(m.params.sessionId) }), 30600);
         }
         if (failMode === "slow-apply-before-strict" &&
@@ -4220,6 +4221,23 @@ defmodule Tightbeam.Acp.AdapterTest do
       |> Map.put(:harness, :missing_harness)
     end)
 
+    status = inspect(:sys.get_status(adapter))
+    refute status =~ chunk_marker
+    assert status =~ "harness: :missing_harness"
+
+    assert status =~
+             "redacted: [:chunks, :preset, :config_options, :switchable_models, :callbacks]"
+
+    formatted =
+      Adapter.format_status(%{
+        state: :sys.get_state(adapter),
+        message: {:new_session, Model.new("haiku"), "/tmp", [], guidance_marker}
+      })
+
+    assert formatted.message == :redacted
+    refute inspect(formatted) =~ guidance_marker
+    refute inspect(formatted) =~ chunk_marker
+
     monitor = Process.monitor(adapter)
 
     log =
@@ -4233,10 +4251,7 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     refute log =~ chunk_marker
     refute log =~ guidance_marker
-    # The nonsecret state stays readable; only the text-bearing fields are withheld.
-    assert log =~ "harness: :missing_harness"
-    assert log =~ "redacted: [:chunks, :preset, :config_options, :switchable_models, :callbacks]"
-    assert log =~ ~r/Last message(?: \(from .+?\))?: :redacted/
+    assert log =~ "unknown harness: :missing_harness"
   end
 
   test "gate wiring-check has no elapsed-time failure" do
