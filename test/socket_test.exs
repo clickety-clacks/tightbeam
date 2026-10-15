@@ -94,7 +94,7 @@ defmodule Tightbeam.Wire.SocketTest do
 
     {:push, _frames, state} =
       Socket.handle_in(
-        {JSON.encode!(%{"type" => "auth", "token" => device.token, "subscriptions" => []}),
+        {JSON.encode!(%{"type" => "auth", "token" => device.token, "subscriptions" => ["work_state"]}),
          opcode: :text},
         initial
       )

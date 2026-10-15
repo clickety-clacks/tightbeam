@@ -75,7 +75,10 @@ defmodule Tightbeam.ModelCatalogTest do
     await_fresh(catalog, "claude")
     {cached, :fresh} = ModelCatalog.get(@host, "claude", catalog)
     assert cached != []
-    await(fn -> :sys.get_state(catalog).background == nil end)
+    await(fn ->
+      state = :sys.get_state(catalog)
+      state.background == nil and Enum.all?(state.entries, fn {_key, cache} -> not cache.refreshing end)
+    end)
 
     blocker =
       Task.async(fn ->
