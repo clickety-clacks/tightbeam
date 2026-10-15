@@ -373,9 +373,10 @@ defmodule Tightbeam.Dispatch do
   end
 
   defp audit_payload(verb, call, outcome) do
-    if Process.get(:tightbeam_dispatch_audited) == true or Publisher.transactional_verb?(verb),
-      do: outcome_payload(verb, call, outcome),
-      else: nil
+    if Process.get(:tightbeam_dispatch_audited) == true or verb == "onboard" or
+         Publisher.transactional_verb?(verb),
+       do: outcome_payload(verb, call, outcome),
+       else: nil
   end
 
   defp invoke_with_audit(handler, call) do
@@ -408,7 +409,17 @@ defmodule Tightbeam.Dispatch do
       origin: origin,
       session_key: session_key,
       payload:
-        if(kind == "denied" or Publisher.transactional_verb?(verb), do: payload, else: nil),
+        cond do
+          kind == "verb" and verb in ~w(transcript breathing work-item-get) ->
+            nil
+
+          kind == "denied" or verb == "onboard" or match?(%{code: _}, payload) or
+              Publisher.transactional_verb?(verb) ->
+            payload
+
+          true ->
+            nil
+        end,
       principal: principal
     }
 

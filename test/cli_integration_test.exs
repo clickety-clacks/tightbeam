@@ -2851,13 +2851,7 @@ defmodule Tightbeam.CliIntegrationTest do
                "SELECT payload FROM events WHERE kind='verb' AND verb='breathing' ORDER BY id DESC LIMIT 1"
              )
 
-    {audit, []} = Code.eval_string(payload)
-
-    assert %{
-             elided: true,
-             count: 0,
-             params: %{target_kind: "session", target_id: "cli-holder"}
-           } = audit
+    assert payload == "null"
 
     refute payload =~ "running_turn"
     refute payload =~ ~s("breathing":true)

@@ -7,6 +7,7 @@ defmodule Tightbeam.DB do
   """
 
   use GenServer
+  require Logger
   alias Exqlite.Sqlite3
   alias Tightbeam.{DBObservation, ErrorDiagnostic}
 

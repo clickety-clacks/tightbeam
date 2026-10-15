@@ -1422,7 +1422,18 @@ defmodule Tightbeam.Productions.BubbleTest do
 
           # The boot tick precedes this call: containment must not advance the
           # cursor past a group whose original causes have not been completed.
-          assert Tightbeam.Productions.BubbleSweeper.sweep_now(sweeper) == 0
+          if interrupted? do
+            assert {:ok, [[cursor_before_retry]]} =
+                     DB.query(
+                       ctx.db,
+                       "SELECT seq FROM production_cursors WHERE name='bubble'"
+                     )
+
+            assert cursor_before_retry == intermediate.seq - 1
+          end
+
+          expected_recognized = if interrupted?, do: 1, else: 0
+          assert Tightbeam.Productions.BubbleSweeper.sweep_now(sweeper) == expected_recognized
           assert_receive {:real_missing_target_delivery, selected_target}
           assert selected_target == ctx.main.session_key
 

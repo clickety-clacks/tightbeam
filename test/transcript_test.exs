@@ -545,7 +545,7 @@ defmodule Tightbeam.TranscriptTest do
 
   ## Proof 10 — elision
 
-  test "proof 10: a successful read is audited by params and count, never by content", ctx do
+  test "proof 10: a successful read is audited by identity and verb, never by content", ctx do
     body = "a distinctive body string only this row holds"
     message!(ctx.db, "owned", "user", body)
 
@@ -553,11 +553,7 @@ defmodule Tightbeam.TranscriptTest do
     assert {:ok, result} = dispatch_verb(ctx, params)
     assert Enum.any?(result.messages, &(&1.content == body))
 
-    assert verb_payload(ctx.db) == %{
-             elided: true,
-             params: %{session_key: "owned", limit: 10},
-             count: 1
-           }
+    assert raw_payload(ctx.db, "verb") == "null"
 
     # The content that WAS returned appears nowhere in the audit row.
     refute raw_payload(ctx.db, "verb") =~ body
@@ -612,14 +608,7 @@ defmodule Tightbeam.TranscriptTest do
     # a guarantee that the returned error is content-free, which is not true.
     assert is_binary(returned.message)
 
-    # EXACTLY these four keys — in particular no `message`, which is where
-    # `Exception.message/1` would have put the row the handler was holding.
-    assert verb_payload(ctx.db) == %{
-             elided: true,
-             params: %{session_key: "owned"},
-             crash: true,
-             code: "server_error"
-           }
+    assert raw_payload(ctx.db, "verb") == "null"
 
     raw = raw_payload(ctx.db, "verb")
     refute raw =~ "message:"
@@ -783,11 +772,6 @@ defmodule Tightbeam.TranscriptTest do
       DB.query(db, "SELECT payload FROM events WHERE kind = ?1 AND verb = 'transcript'", [kind])
 
     payload
-  end
-
-  defp verb_payload(db) do
-    {term, _bindings} = Code.eval_string(raw_payload(db, "verb"))
-    term
   end
 
   defp verb_event_count(db) do

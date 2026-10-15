@@ -237,7 +237,10 @@ defmodule Tightbeam.DispatchTest do
       assert [%{kind: "verb", verb: ^verb}] = EventLog.events_after(db, 0, 10) |> Enum.take(-1)
       {:ok, [[payload]]} = DB.query(db, "SELECT payload FROM events ORDER BY id DESC LIMIT 1")
       refute payload =~ sentinel
-      assert payload =~ "bodyElided"
+
+      if verb == "work-item-get",
+        do: assert(payload == "null"),
+        else: assert(payload =~ "bodyElided")
     end
   end
 
@@ -280,7 +283,7 @@ defmodule Tightbeam.DispatchTest do
     assert payload =~ "bodyUpdate"
   end
 
-  test "successful body get returns detail but audits only its descriptor", %{db: db} do
+  test "successful body get returns detail but audits only identity and verb", %{db: db} do
     sentinel = "accepted-body-read-secret-#{System.unique_integer([:positive])}"
 
     detail = %{
@@ -303,15 +306,12 @@ defmodule Tightbeam.DispatchTest do
     assert {:ok, ^result} = Dispatch.dispatch(db, %{"work-item-get" => fn _ -> result end}, call)
 
     {:ok, [[payload]]} = DB.query(db, "SELECT payload FROM events ORDER BY id DESC LIMIT 1")
-    digest = :crypto.hash(:sha256, sentinel) |> Base.encode16(case: :lower)
     refute payload =~ sentinel
     refute payload =~ "bodyUpdatedByUser"
     refute payload =~ "bodyUpdatedBySession"
     refute payload =~ "bodyUpdatedAt"
-    assert payload =~ "bodyRead"
-    assert payload =~ "present"
-    assert payload =~ Integer.to_string(byte_size(sentinel))
-    assert payload =~ digest
+    assert payload == "null"
+    assert [%{verb: "work-item-get", origin: "user:flynn"}] = EventLog.events_after(db, 0, 10)
   end
 
   test "a raised message keeps its text but not its secrets in the reply and audit row",
