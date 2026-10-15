@@ -337,6 +337,7 @@ defmodule Tightbeam.Gateway do
     credential_children(config, db) ++
       [
         {ModelCatalog, base_dir: config.base_dir, db: db},
+        {Tightbeam.Retention, db: db},
         {Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry},
         {Task, fn -> HarnessHealth.resume_other_routes(db) end},
         {Tightbeam.Firehose.Hub, name: Tightbeam.Firehose.Hub},
