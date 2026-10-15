@@ -4343,9 +4343,7 @@ defmodule Tightbeam.Supervision do
 
     eligible =
       Map.values(sessions)
-      |> Enum.map(
-        &idle_cleanup_candidate_in_txn(txn, &1, snapshot_at, sessions, nil)
-      )
+      |> Enum.map(&idle_cleanup_candidate_in_txn(txn, &1, snapshot_at, sessions, nil))
       |> Enum.reject(&is_nil/1)
 
     dormant =
@@ -5111,10 +5109,14 @@ defmodule Tightbeam.Supervision do
     case Wakes.get_in_txn(txn, wake_id) do
       %{origin: "process:tightbeam", obligation_ref: @idle_cleanup_prefix <> _} = wake ->
         cond do
-          wake.state != "pending" -> :stale
+          wake.state != "pending" ->
+            :stale
+
           Txn.q(txn, "SELECT 1 FROM supervision_state_migration WHERE id=0 AND complete=0") != [] ->
             {:idle_cleanup_deferred, :state_backfill}
-          true -> idle_cleanup_resolve_delivery_in_txn(txn, wake, snapshot_at)
+
+          true ->
+            idle_cleanup_resolve_delivery_in_txn(txn, wake, snapshot_at)
         end
 
       _ ->

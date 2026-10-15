@@ -2850,11 +2850,16 @@ defmodule Tightbeam.Schema do
   defp validate_owned_object!(txn, %{type: type, name: name, sql: expected_sql}) do
     expected_sql =
       if name == "supervision_liveness_sidecar" and
-           Txn.q(txn, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='supervision_state_migration'") == [[1]] and
+           Txn.q(
+             txn,
+             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='supervision_state_migration'"
+           ) == [[1]] and
            Txn.q(txn, "SELECT 1 FROM supervision_state_migration WHERE id=0") == [[1]] do
-        String.replace(expected_sql,
+        String.replace(
+          expected_sql,
           "retirementActionNeeded INTEGER CHECK (retirementActionNeeded IN (0,1)),",
-          "retirementActionNeeded INTEGER CHECK (retirementActionNeeded IN (0,1)), endedWakeState TEXT,")
+          "retirementActionNeeded INTEGER CHECK (retirementActionNeeded IN (0,1)), endedWakeState TEXT,"
+        )
       else
         expected_sql
       end

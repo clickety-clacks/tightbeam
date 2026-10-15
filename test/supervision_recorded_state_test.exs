@@ -171,9 +171,12 @@ defmodule Tightbeam.SupervisionRecordedStateTest do
       )
 
     :ok = DB.execute(db, "UPDATE supervision_state_migration SET complete=0")
-    assert {:ok, {:idle_cleanup_deferred, :state_backfill}} = DB.transaction(db, fn txn ->
-      Supervision.idle_cleanup_delivery_in_txn(txn, "cleanup", 42)
-    end)
+
+    assert {:ok, {:idle_cleanup_deferred, :state_backfill}} =
+             DB.transaction(db, fn txn ->
+               Supervision.idle_cleanup_delivery_in_txn(txn, "cleanup", 42)
+             end)
+
     :ok = DB.execute(db, "UPDATE supervision_state_migration SET complete=1")
 
     :ok =
