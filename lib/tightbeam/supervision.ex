@@ -4452,7 +4452,7 @@ defmodule Tightbeam.Supervision do
       gate = HarnessHealth.prod_shape_gate_in_txn(txn, session.harness, session.host, snapshot_at)
       group_digest = idle_cleanup_digest("idle-cleanup-group-v1\0" <> parent_group)
       activity_fingerprint = idle_cleanup_activity_fingerprint(session.session_key, activity)
-      occurrence = idle_cleanup_occurrence(occurrences, session.session_key)
+      occurrence = idle_cleanup_occurrence(txn, occurrences, session.session_key)
 
       member_token =
         idle_cleanup_member_token(session.session_key, activity_fingerprint <> occurrence)
@@ -4536,32 +4536,64 @@ defmodule Tightbeam.Supervision do
 
   # The latest pending observation per session (excluding `ignored_wake`), read
   # once for a whole sweep or delivery check instead of once per candidate.
-  # SQLite returns the bare subject from the row holding MAX(id).
+  # SQLite returns the bare subject from the row holding MAX(id). The detail
+  # column is free-form: one malformed row fails this grouped read. The sweep
+  # then reports it and falls back to the per-candidate lookup, which skips
+  # malformed rows, so one bad historical row cannot stop every sweep.
   defp idle_cleanup_occurrences_in_txn(txn, ignored_wake) do
-    Txn.q(
-      txn,
-      """
-      SELECT session, subject FROM (
-        SELECT json_extract(e.detail,'$.session') AS session, e.subject AS subject, MAX(e.id)
-        FROM lifecycle_events e
-        WHERE e.kind='idle_cleanup_pending_observed' AND (?1 IS NULL OR e.subject<>?1)
-        GROUP BY session
+    rows =
+      Txn.q(
+        txn,
+        """
+        SELECT session, subject FROM (
+          SELECT json_extract(e.detail,'$.session') AS session, e.subject AS subject, MAX(e.id)
+          FROM lifecycle_events e
+          WHERE e.kind='idle_cleanup_pending_observed' AND (?1 IS NULL OR e.subject<>?1)
+          GROUP BY session
+        )
+        ORDER BY session
+        """,
+        [ignored_wake]
       )
-      ORDER BY session
-      """,
-      [ignored_wake]
-    )
-    |> Enum.reduce(%{}, fn
-      [session, subject], acc when is_binary(session) -> Map.put(acc, session, subject)
-      _row, acc -> acc
-    end)
+
+    {:grouped,
+     Enum.reduce(rows, %{}, fn
+       [session, subject], acc when is_binary(session) -> Map.put(acc, session, subject)
+       _row, acc -> acc
+     end)}
+  rescue
+    error in DB.Error ->
+      if String.contains?(Exception.message(error), "malformed JSON") do
+        Logger.warning(
+          "idle cleanup observation history holds malformed detail; " <>
+            "reading observations per candidate for this sweep"
+        )
+
+        {:per_candidate, ignored_wake}
+      else
+        reraise error, __STACKTRACE__
+      end
   end
 
-  defp idle_cleanup_occurrence(occurrences, session_key) do
+  defp idle_cleanup_occurrence(_txn, {:grouped, occurrences}, session_key) do
     case Map.fetch(occurrences, session_key) do
       {:ok, subject} -> JSON.encode!([[subject]])
       :error -> JSON.encode!([])
     end
+  end
+
+  defp idle_cleanup_occurrence(txn, {:per_candidate, ignored_wake}, session_key) do
+    Txn.q(
+      txn,
+      """
+      SELECT e.subject FROM lifecycle_events e
+      WHERE e.kind='idle_cleanup_pending_observed' AND json_valid(e.detail)
+        AND json_extract(e.detail,'$.session')=?1 AND (?2 IS NULL OR e.subject<>?2)
+      ORDER BY e.id DESC LIMIT 1
+      """,
+      [session_key, ignored_wake]
+    )
+    |> JSON.encode!()
   end
 
   defp idle_cleanup_refusal_in_txn(txn, subject, reason) do

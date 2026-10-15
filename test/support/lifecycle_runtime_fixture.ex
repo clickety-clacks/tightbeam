@@ -18,6 +18,8 @@ defmodule Tightbeam.LifecycleRuntimeFixture do
        [["index-unobserved", "index-session"]]},
       {"supervision.ex", "SELECT session, subject FROM (", [nil],
        [["index-session", "index-observed-new"], ["other-session", "other-wake"]]},
+      {"supervision.ex", "SELECT e.subject FROM lifecycle_events e", ["index-session", nil],
+       [["index-observed-new"]]},
       {"gateway.ex", "SELECT seq, role, sender, content, attachments", ["index-session", 3, 100],
        [[1, "user", nil, "visible", "[]"]]},
       {"gateway.ex", "SELECT kind FROM lifecycle_events", ["index-session"],
@@ -70,6 +72,13 @@ defmodule Tightbeam.LifecycleRuntimeFixture do
 
     assert DB.query(db, occurrence.sql, ["other-wake"]) ==
              {:ok, [["index-session", "index-observed-new"]]}
+
+    fallback = Enum.find(cases(), &String.starts_with?(String.trim(&1.sql), "SELECT e.subject"))
+
+    assert DB.query(db, fallback.sql, ["index-session", "index-observed-new"]) ==
+             {:ok, [["index-observed"]]}
+
+    assert DB.query(db, fallback.sql, ["absent-session", nil]) == {:ok, []}
 
     assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
     :ok

@@ -449,6 +449,45 @@ defmodule Tightbeam.SupervisionTest do
              Enum.filter(EventLog.lifecycle_events(ctx.db), &(&1.subject == wake.wake_id))
   end
 
+  test "idle cleanup sweeps past a malformed pending observation row", ctx do
+    previous = Application.get_env(:tightbeam, :effort_checkin_horizon_ms)
+    Application.put_env(:tightbeam, :effort_checkin_horizon_ms, 1_000)
+
+    on_exit(fn ->
+      if is_nil(previous),
+        do: Application.delete_env(:tightbeam, :effort_checkin_horizon_ms),
+        else: Application.put_env(:tightbeam, :effort_checkin_horizon_ms, previous)
+    end)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE sessions SET createdAt=1,updatedAt=1 WHERE sessionKey='supervisor'"
+      )
+
+    :ok =
+      DB.execute(ctx.db, """
+      INSERT INTO lifecycle_events(ts,kind,subject,detail)
+      VALUES (0,'idle_cleanup_pending_observed','old-wake','not json');
+      """)
+
+    main_key = ctx.main.session_key
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        start_liveness!(ctx, sweep_ms: 60_000, name: :idle_cleanup_malformed_supervision)
+      end)
+
+    assert log =~ "malformed detail"
+    assert [%{session_key: ^main_key} = wake] = idle_cleanup_wakes(ctx.db)
+    assert wake.prompt =~ "child=supervisor"
+
+    refute Enum.any?(
+             EventLog.lifecycle_events(ctx.db),
+             &(&1.kind == "supervision_evaluate_failed")
+           )
+  end
+
   test "idle cleanup honors each session's archetype opt-out and the true default", ctx do
     manifests = Path.join([ctx.base, "identity", "archetypes"])
     File.mkdir_p!(manifests)
