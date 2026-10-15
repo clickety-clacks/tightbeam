@@ -2412,7 +2412,10 @@ defmodule Tightbeam.Schema do
 
   # Delivery-history lookups by source wake (NoticeBatcher.source_delivered_sql/1
   # and source_deliveries_sql/1). An explicit index, so these lookups do not
-  # depend on the table carrying a composite UNIQUE that leads with it.
+  # depend on the table carrying a composite UNIQUE that leads with it. It is
+  # an access path only: if building it fails, the gateway logs that and still
+  # runs (the lookups then use the table's composite UNIQUE index). Only a
+  # migration transaction that cannot run at all refuses the boot.
   defp ensure_notice_delivery_runtime_indexes(db) do
     sql =
       "CREATE INDEX IF NOT EXISTS notice_batch_members_source " <>
@@ -2425,17 +2428,27 @@ defmodule Tightbeam.Schema do
              "database migration notice delivery index notice_batch_members_source: begin"
            )
 
-           :ok = Txn.exec(txn, sql)
-           elapsed = System.monotonic_time(:millisecond) - started
+           try do
+             :ok = Txn.exec(txn, sql)
+             elapsed = System.monotonic_time(:millisecond) - started
 
-           Logger.info(
-             "database migration notice delivery index notice_batch_members_source: " <>
-               "finished elapsed_ms=#{elapsed}"
-           )
+             Logger.info(
+               "database migration notice delivery index notice_batch_members_source: " <>
+                 "finished elapsed_ms=#{elapsed}"
+             )
 
-           :ok
+             :ok
+           rescue
+             error ->
+               Logger.warning(
+                 "notice delivery index notice_batch_members_source was not built; " <>
+                   "continuing without it: #{Exception.message(error)}"
+               )
+
+               :skipped
+           end
          end) do
-      {:ok, :ok} ->
+      {:ok, _outcome} ->
         :ok
 
       {:error, error} ->
