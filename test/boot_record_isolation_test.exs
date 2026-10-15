@@ -35,6 +35,7 @@ defmodule Tightbeam.BootRecordIsolationTest do
         archetype: "default",
         harness: "claude",
         provider: "anthropic",
+        host: Placement.local_host_name(),
         model: Model.new("test-model")
       })
 
@@ -189,6 +190,9 @@ defmodule Tightbeam.BootRecordIsolationTest do
   end
 
   test "unsupported credential incidents do not block healthy recipient reconciliation", %{db: db} do
+    Org.create(db, %{session_key: Org.personal_session_key("owner"), display_name: "Personal", owner_user_id: "owner",
+      origin: "user:owner", archetype: "default", harness: "claude", provider: "anthropic",
+        host: Placement.local_host_name(), model: Model.new("test-model")})
     for {id, provider} <- [{"bad-incident", "obsolete"}, {"good-incident", "anthropic"}] do
       {:ok, _} =
         DB.query(

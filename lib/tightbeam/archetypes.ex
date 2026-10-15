@@ -113,7 +113,7 @@ defmodule Tightbeam.Archetypes do
 
       if File.regular?(path) do
         Logger.warning(
-          "archetype skill #{path} unavailable: rename or remove the org copy; substrate names are reserved"
+          "#{path}: rename or remove the org copy; substrate names are reserved; org copy unavailable"
         )
       end
     end

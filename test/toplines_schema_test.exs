@@ -245,7 +245,8 @@ defmodule Tightbeam.ToplinesSchemaTest do
     assert {:ok, [["standalone-toplines-v6"]]} =
              DB.query(db, "SELECT shape FROM topline_schema_stamp")
 
-    assert {:error, _} = insert_topline(db, " Another invalid ")
+    assert {:ok, [[0]]} = DB.query(db, "PRAGMA ignore_check_constraints")
+    assert {:error, _} = DB.query(db, "UPDATE toplines SET state='invalid'")
     assert :ok = ToplinesSchema.activate(db, 125)
   end
 

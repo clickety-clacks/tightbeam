@@ -6602,7 +6602,7 @@ defmodule Tightbeam.Schema do
   end
 
   defp upgrade_agent_reparent(db) do
-    case DB.transaction(db, fn txn ->
+    case DB.migration_transaction(db, :agent_reparent, ["PRAGMA foreign_keys=OFF"], ["PRAGMA foreign_keys=ON"], fn txn ->
            case Txn.q(txn, "SELECT shape FROM schema_stamp") do
              [[shape]]
              when shape in [
