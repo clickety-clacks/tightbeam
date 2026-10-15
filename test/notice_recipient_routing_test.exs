@@ -254,7 +254,11 @@ defmodule Tightbeam.NoticeRecipientRoutingTest do
     process =
       start_supervised!(
         {Supervision,
-         db: ctx.db, handlers: Gateway.handlers(%{db: ctx.db}), sweep_ms: 60_000, name: nil}
+         db: ctx.db,
+         handlers: Gateway.handlers(%{db: ctx.db}),
+         prod_limit: 2,
+         sweep_ms: 60_000,
+         name: nil}
       )
 
     :sys.get_state(process)
