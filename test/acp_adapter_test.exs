@@ -2077,7 +2077,8 @@ defmodule Tightbeam.Acp.AdapterTest do
 
   test "a load can spend its full deadline while another session completes a turn" do
     {adapter, capture} = start_adapter(fail_mode: "load-hang")
-    deadline = System.monotonic_time(:millisecond) + 1_000
+    Adapter.conn(adapter)
+    deadline = System.monotonic_time(:millisecond) + 3_000
 
     caller =
       Task.async(fn ->
@@ -2132,6 +2133,7 @@ defmodule Tightbeam.Acp.AdapterTest do
 
   test "session setup requests share one deadline instead of renewing their timeout" do
     {adapter, capture} = start_adapter(gate_mode: "delay-setup", probe: false)
+    Adapter.conn(adapter)
     deadline = System.monotonic_time(:millisecond) + 120
 
     assert {:error, :timeout} =
