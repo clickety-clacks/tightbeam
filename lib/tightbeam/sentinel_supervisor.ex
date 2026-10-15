@@ -132,7 +132,16 @@ defmodule Tightbeam.SentinelSupervisor do
       cond do
         Map.has_key?(acc.children, qualified) -> acc
         waiting and qualified not in restart -> acc
-        true -> start_child(acc, qualified, learned)
+        true ->
+          try do
+            start_child(acc, qualified, learned)
+          rescue
+            error ->
+              reason = Exception.message(error)
+              Logger.error("sentinel #{qualified} startup failed: #{reason}")
+              Sentinels.mark_stopped(acc.db, acc.host, qualified, reason)
+              acc
+          end
       end
     end)
   end

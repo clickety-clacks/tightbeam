@@ -244,6 +244,10 @@ defmodule Tightbeam.Identity do
 
   defp verify_required_refs!(identity_dir) do
     missing = Enum.reject(@required_refs, &required_ref_exists?(identity_dir, &1))
+    Enum.each(missing -- [@live], fn ref ->
+      Logger.warning("identity synchronization unavailable: missing ref #{ref}")
+    end)
+    missing = Enum.filter(missing, &(&1 == @live))
 
     if missing != [] do
       repair =
@@ -884,17 +888,23 @@ defmodule Tightbeam.Identity do
     dir = identity_dir(base_dir)
     revision = git_output!(dir, ["rev-parse", @live])
 
-    sentinels =
-      for bundle <- learned_bundle_names(dir, revision),
-          sentinel <- live_bundle_sentinels(dir, revision, bundle) do
-        %{
-          bundle: bundle,
-          name: sentinel.name,
-          qualified: "#{bundle}/#{sentinel.name}",
-          command_path: Path.join(["kungfu", bundle, sentinel.command]),
-          requires: sentinel.requires
-        }
+    sentinels = Enum.flat_map(learned_bundle_names(dir, revision), fn bundle ->
+      try do
+        for sentinel <- live_bundle_sentinels(dir, revision, bundle) do
+          %{
+            bundle: bundle,
+            name: sentinel.name,
+            qualified: "#{bundle}/#{sentinel.name}",
+            command_path: Path.join(["kungfu", bundle, sentinel.command]),
+            requires: sentinel.requires
+          }
+        end
+      rescue
+        error ->
+          Logger.warning("sentinel bundle #{bundle} unavailable: #{Exception.message(error)}")
+          []
       end
+    end)
 
     %{revision: revision, sentinels: sentinels}
   end

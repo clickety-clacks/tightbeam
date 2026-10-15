@@ -10,6 +10,7 @@ defmodule Tightbeam.Archetypes do
   instructions. No archetype identity is projected into a harness home.
   """
 
+  require Logger
   @persist_key __MODULE__
   alias Tightbeam.Identity.Renderer
 
@@ -65,6 +66,7 @@ defmodule Tightbeam.Archetypes do
       |> Path.wildcard()
       |> Enum.sort()
       |> Enum.reduce(%{"default" => builtin_default()}, fn path, loaded ->
+        try do
         bytes = File.read!(path)
         manifest = Toml.decode!(bytes)
 
@@ -77,25 +79,27 @@ defmodule Tightbeam.Archetypes do
           })
 
         Map.put(loaded, archetype.name, archetype)
+        rescue
+          error ->
+            Logger.warning("archetype #{path} unavailable: #{Exception.message(error)}")
+            Map.delete(loaded, Path.basename(path, ".toml"))
+        end
       end)
 
     fragments = load_fragments!(base_dir)
 
-    # Validate ALL law at load: every archetype's guidance must compose
-    # (missing fragments and include cycles fail the boot, not a turn), and
-    # every elected skill must exist in the library.
-    for {_name, archetype} <- archetypes do
-      guidance_with(archetype, fragments)
-
-      case Enum.reject(archetype.skills, &MapSet.member?(library, &1)) do
-        [] ->
-          :ok
-
-        unknown ->
-          raise ArgumentError,
-                "archetype #{archetype.name} elects unknown skills: #{Enum.join(unknown, ", ")}"
+    archetypes = Enum.reduce(archetypes, %{}, fn {name, archetype}, loaded ->
+      try do
+        guidance_with(archetype, fragments)
+        unknown = Enum.reject(archetype.skills, &MapSet.member?(library, &1))
+        if unknown != [], do: raise(ArgumentError, "unknown skills: #{Enum.join(unknown, ", ")}")
+        Map.put(loaded, name, archetype)
+      rescue
+        error ->
+          Logger.warning("archetype #{name} unavailable: #{Exception.message(error)}")
+          loaded
       end
-    end
+    end)
 
     :persistent_term.put(@persist_key, {archetypes, fragments})
     archetypes
@@ -476,22 +480,20 @@ defmodule Tightbeam.Archetypes do
   end
 
   defp load_fragments!(base_dir) do
-    entries =
-      base_dir
-      |> Path.join("identity/guidance/**/*.md")
-      |> Path.wildcard()
-      |> Enum.sort()
-      |> Enum.map(&{Path.relative_to(&1, Path.join(base_dir, "identity")), File.read!(&1)})
-
-    catalog = Renderer.catalog!(entries)
-
-    catalog =
-      Map.put_new(catalog, "operating-manual.md", %{
-        path: "substrate:priv/guidance/operating-manual.md",
-        bytes: builtin_fragments()["operating-manual.md"]
-      })
-
-    Map.new(catalog, fn {name, entry} -> {name, entry.bytes} end)
+    paths = Path.wildcard(Path.join(base_dir, "identity/guidance/**/*.md")) |> Enum.sort()
+    duplicates = paths |> Enum.frequencies_by(&Path.basename/1)
+    fragments = Enum.reduce(paths, %{}, fn path, acc ->
+      name = Path.basename(path)
+      try do
+        if duplicates[name] > 1, do: raise(ArgumentError, "duplicate fragment #{name}")
+        Map.put(acc, name, File.read!(path))
+      rescue
+        error ->
+          Logger.warning("guidance fragment #{path} unavailable: #{Exception.message(error)}")
+          acc
+      end
+    end)
+    Map.put_new(fragments, "operating-manual.md", builtin_fragments()["operating-manual.md"])
   end
 
   @kungfu_template_paths [

@@ -1007,6 +1007,19 @@ defmodule Tightbeam.Ledger do
   end
 
   defp recover_running_where(db, predicate, predicate_params) do
+    {:ok, rows} = DB.query(db, recover_running_rows_sql(predicate), predicate_params)
+    Enum.flat_map(rows, fn [seq, _session] ->
+      try do
+        recover_running_turn(db, "seq = ?1", [seq])
+      rescue
+        error ->
+          Logger.warning("turn #{seq} recovery unresolved: #{Exception.message(error)}")
+          []
+      end
+    end)
+  end
+
+  defp recover_running_turn(db, predicate, predicate_params) do
     now = System.system_time(:millisecond)
 
     {:ok, {seqs, publications}} =

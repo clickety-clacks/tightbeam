@@ -591,6 +591,7 @@ defmodule Tightbeam.AdminProjection do
       base_dir
       |> Tightbeam.StateResources.kungfu_names()
       |> Enum.flat_map(fn name ->
+        try do
         case Tightbeam.StateResources.kungfu_snapshot(base_dir, name) do
           nil ->
             []
@@ -605,6 +606,13 @@ defmodule Tightbeam.AdminProjection do
                 item: canonical_without_version(snapshot, "kungfu")
               }
             ]
+        end
+        rescue
+          error ->
+            require Logger
+            Logger.warning("kungfu #{name} projection unavailable: #{Exception.message(error)}")
+            record_fault(db, "kungfu", name, error)
+            []
         end
       end)
 
