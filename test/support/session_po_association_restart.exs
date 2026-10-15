@@ -98,7 +98,9 @@ committed =
         deliver: fn _ -> flunk("normal association used legacy callback") end
       )
 
-    assert catch_exit(Wakes.fire_due(:session_po_restart_wakes))
+    # The delivery committed before the doorbell; a crashed lane doorbell is
+    # logged and the committed delivery still completes.
+    assert :ok = Wakes.fire_due(:session_po_restart_wakes)
     assert_receive {:postcommit_doorbell, "orchestrator"}
 
     assert [%{delivery_wake_id: carrier_id, member_state: "included", batch_state: "delivered"}] =
