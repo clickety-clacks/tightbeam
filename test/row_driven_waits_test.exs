@@ -843,7 +843,6 @@ defmodule Tightbeam.RowDrivenWaitsTest do
 
   test "terminal verifier and fallback end provisional waiting without inventing confirmation",
        ctx do
-    originating = running_turn(ctx.db, "holder")
     verifier_terminal = register_wait(ctx.db, due_after(), predicate("R"))
     assert %{outcome: "revoked"} = revoke(ctx.db, "V")
 
@@ -851,6 +850,8 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assert terminal.recognition_path == "reconsideration"
     assert terminal.recognition_reason == "verification-terminal"
     assert terminal.verification_state == "provisional"
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    drain_queued_turns(ctx.db, "holder")
 
     assignment(ctx.db, "V2", "verifier")
 
@@ -858,12 +859,6 @@ defmodule Tightbeam.RowDrivenWaitsTest do
       register_wait(ctx.db, System.system_time(:millisecond) - 1, predicate("R", nil, "V2"))
 
     assert fallback.recognition_path == nil
-
-    assert :ok =
-             Ledger.finish(ctx.db, originating.seq, "delivered", nil,
-               owner_lease: originating.owner_lease
-             )
-
     assert :ok = Wakes.fire_due(ctx.scheduler)
 
     fired = Wakes.get(ctx.db, fallback.wake_id)
