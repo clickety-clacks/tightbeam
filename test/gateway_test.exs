@@ -4750,6 +4750,7 @@ defmodule Tightbeam.GatewayTest do
 
     start_runtime_supervisor()
     handlers = Gateway.handlers(config)
+
     assert %{host: %{"host" => ^machine}} =
              handlers["register-host"].(%{
                origin: "user:flynn",

@@ -89,6 +89,7 @@ defmodule Tightbeam.ModelCatalogTest do
       end)
 
     assert_receive {:database_held, database_owner}
+
     try do
       # Discard host reads from initial derivation before starting the stalled pass.
       drain_host_reads()
