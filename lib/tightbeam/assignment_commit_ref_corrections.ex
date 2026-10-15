@@ -41,7 +41,10 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
   def __handle__(db, "assignment-commitref-correct", call), do: correct(db, call)
 
   @doc "List immutable corrections for one assignment in deterministic order."
-  def list(db, assignment_id) do
+  def list(db, assignment_id), do: Map.get(list_many(db, [assignment_id]), assignment_id, [])
+
+  @doc false
+  def list_many(db, assignment_ids) do
     {:ok, rows} =
       DB.query(
         db,
@@ -49,13 +52,13 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
         SELECT id, assignmentId, commitRefs, reason, evidenceArtifactId,
                actorKind, actorRef, cause, idempotencyKey, verifiedAt, createdAt
         FROM assignment_commit_ref_corrections
-        WHERE assignmentId = ?1
+        WHERE assignmentId IN (SELECT value FROM json_each(?1))
         ORDER BY createdAt, id
         """,
-        [assignment_id]
+        [JSON.encode!(assignment_ids)]
       )
 
-    Enum.map(rows, &correction/1)
+    rows |> Enum.map(&correction/1) |> Enum.group_by(& &1.assignmentId)
   end
 
   defp correct(db, call) do
