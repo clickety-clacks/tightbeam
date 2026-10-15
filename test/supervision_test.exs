@@ -262,8 +262,6 @@ defmodule Tightbeam.SupervisionTest do
 
     identity = first_wake.obligation_ref |> String.split("\n", parts: 2) |> hd()
     identity_parts = String.split(identity, "|")
-    group_prefix = Enum.take(identity_parts, 2) |> Enum.join("|")
-    member_token = Enum.at(identity_parts, 2)
 
     group_digest = identity_parts |> hd() |> String.replace_prefix("idle-cleanup-v1:", "")
 
@@ -282,33 +280,11 @@ defmodule Tightbeam.SupervisionTest do
 
       assert Enum.any?(
                delivery_plan,
-               &String.contains?(
-                 &1,
-                 "idle_cleanup_wakes_delivery_history (obligationRef>? AND obligationRef<?)"
-               )
+               &String.contains?(&1, "sqlite_autoindex_idle_cleanup_state")
              )
 
       refute Enum.any?(delivery_plan, &Regex.match?(~r/^SCAN /, &1))
-      refute Enum.any?(delivery_plan, &String.contains?(&1, "CO-ROUTINE"))
-
-      # Same rows as the plain LIKE form the range terms and named index replace.
-      {:ok, expected} =
-        DB.query(
-          ctx.db,
-          """
-          SELECT w.firedAt,w.obligationRef FROM wakes w
-          WHERE w.origin='process:tightbeam' AND w.state='fired'
-            AND w.obligationRef LIKE ?1 AND w.obligationRef LIKE ?2
-            AND EXISTS (SELECT 1 FROM (SELECT wakeId AS sourceWakeId,deliveredTurnSeq AS turnSeq,assignmentId FROM wakes WHERE deliveredTurnSeq IS NOT NULL) d
-              WHERE d.sourceWakeId=w.wakeId)
-          """,
-          Enum.take(params, 2)
-        )
-
-      assert {:ok, actual} =
-               DB.query(ctx.db, Supervision.idle_cleanup_delivery_history_sql(), params)
-
-      assert Enum.sort(actual) == Enum.sort(expected)
+      assert {:ok, []} = DB.query(ctx.db, Supervision.idle_cleanup_delivery_history_sql(), params)
     end
 
     {:ok, pending_group_rows} =
@@ -318,10 +294,10 @@ defmodule Tightbeam.SupervisionTest do
         EXPLAIN QUERY PLAN
         SELECT 1 FROM wakes
         WHERE origin='process:tightbeam' AND consumer='prompt' AND state='pending'
-          AND obligationRef LIKE ?1
+          AND idleCleanupGroup=?1
         LIMIT 1
         """,
-        [group_prefix <> "|%"]
+        [group_digest]
       )
 
     pending_group_plan = Enum.map(pending_group_rows, &List.last/1)
@@ -329,7 +305,7 @@ defmodule Tightbeam.SupervisionTest do
 
     assert Enum.any?(
              pending_group_plan,
-             &String.contains?(&1, "idle_cleanup_wakes_pending_group")
+             &String.contains?(&1, "idle_cleanup_pending_group")
            )
 
     repeated_sweep_us =
@@ -478,7 +454,7 @@ defmodule Tightbeam.SupervisionTest do
         start_liveness!(ctx, sweep_ms: 60_000, name: :idle_cleanup_malformed_supervision)
       end)
 
-    assert log =~ "malformed detail"
+    assert log == ""
     assert [%{session_key: ^main_key} = wake] = idle_cleanup_wakes(ctx.db)
     assert wake.prompt =~ "child=supervisor"
 
@@ -643,6 +619,11 @@ defmodule Tightbeam.SupervisionTest do
         "UPDATE wakes SET state='fired',firedAt=?2 WHERE wakeId=?1",
         [first.wake_id, System.system_time(:millisecond) - 2_000]
       )
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               Supervision.record_idle_cleanup_delivery_in_txn(txn, first.wake_id)
+             end)
 
     {:ok, _} =
       DB.query(
@@ -1111,6 +1092,12 @@ defmodule Tightbeam.SupervisionTest do
     [batch] = idle_cleanup_wakes(ctx.db)
     assert :appended = admit_supervision_wake!(ctx.db, batch)
 
+    assert {:ok, [[1, 0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT deliveredCount,deliveredDepth FROM idle_cleanup_state WHERE sessionKey='observed-child'"
+             )
+
     _delivery_wake_id =
       assert_direct_supervision_source!(ctx.db, batch, complete_turn: true)
 
@@ -1424,6 +1411,18 @@ defmodule Tightbeam.SupervisionTest do
         wake.wake_id,
         System.system_time(:millisecond) - 61_000
       ])
+
+    [identity, json] = String.split(wake.obligation_ref, "\n", parts: 2)
+    group = identity |> String.split("|") |> hd() |> String.replace_prefix("idle-cleanup-v1:", "")
+
+    for token <- JSON.decode!(json)["members"] |> Map.values() do
+      {:ok, _} =
+        DB.query(
+          db,
+          "UPDATE idle_cleanup_state SET lastDeliveredAt=?1 WHERE groupDigest=?2 AND memberToken=?3",
+          [System.system_time(:millisecond) - 61_000, group, token]
+        )
+    end
   end
 
   defp idle_cleanup_scheduler!(ctx) do
@@ -2821,6 +2820,143 @@ defmodule Tightbeam.SupervisionTest do
 
     assert %{supervisionGeneration: 13, supervisionBasisKind: "liveness_receipt"} =
              Supervision.prod_state(ctx.db, "asg_1")
+  end
+
+  test "delivery settles its controller before the wake ending is recorded", ctx do
+    terminal_seq = terminal!(ctx.db, "holder")
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0, interval: 60_000)
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", terminal_seq)
+    assert [controller] = Wakes.list_pending(ctx.db)
+    assert :appended = admit_supervision_wake!(ctx.db, controller)
+
+    assert {:ok, [["settled"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT controllerState FROM supervision_liveness_sidecar WHERE wakeId=?1",
+               [controller.wake_id]
+             )
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "SELECT endedWakeState FROM supervision_ended_controllers WHERE wakeId=?1",
+               [controller.wake_id]
+             )
+  end
+
+  test "an already settled controller does not record a later wake ending", ctx do
+    terminal_seq = terminal!(ctx.db, "holder")
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0, interval: 60_000)
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", terminal_seq)
+    assert [controller] = Wakes.list_pending(ctx.db)
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE supervision_liveness_sidecar SET controllerState='settled' WHERE wakeId=?1",
+               [controller.wake_id]
+             )
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE wakes SET state='fired',firedAt=1 WHERE wakeId=?1", [
+               controller.wake_id
+             ])
+
+    assert {:ok, []} = DB.query(ctx.db, "SELECT * FROM supervision_ended_controllers")
+  end
+
+  test "a pending controller records its wake ending until settlement", ctx do
+    terminal_seq = terminal!(ctx.db, "holder")
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0, interval: 60_000)
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", terminal_seq)
+    assert [controller] = Wakes.list_pending(ctx.db)
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE wakes SET state='fired',firedAt=1 WHERE wakeId=?1", [
+               controller.wake_id
+             ])
+
+    assert {:ok, [["fired"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT endedWakeState FROM supervision_ended_controllers WHERE wakeId=?1",
+               [controller.wake_id]
+             )
+
+    assert {:ok, [[wake_id, "asg_1", "fired"]]} =
+             DB.query(ctx.db, Supervision.ended_controllers_sql())
+
+    assert wake_id == controller.wake_id
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE supervision_liveness_sidecar SET controllerState='settled' WHERE wakeId=?1",
+               [controller.wake_id]
+             )
+
+    assert {:ok, []} = DB.query(ctx.db, Supervision.ended_controllers_sql())
+  end
+
+  test "a fired controller returning to pending is excluded from settlement", ctx do
+    terminal_seq = terminal!(ctx.db, "holder")
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0, interval: 60_000)
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", terminal_seq)
+    assert [controller] = Wakes.list_pending(ctx.db)
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE wakes SET state='fired',firedAt=1 WHERE wakeId=?1", [
+               controller.wake_id
+             ])
+
+    assert {:ok, [[_, "asg_1", "fired"]]} =
+             DB.query(ctx.db, Supervision.ended_controllers_sql())
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE wakes SET state='pending' WHERE wakeId=?1", [
+               controller.wake_id
+             ])
+
+    assert {:ok, []} = DB.query(ctx.db, Supervision.ended_controllers_sql())
+    assert :ok = Supervision.recover_liveness!(ctx.db, 60_000)
+
+    assert {:ok, [["pending"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT controllerState FROM supervision_liveness_sidecar WHERE wakeId=?1",
+               [
+                 controller.wake_id
+               ]
+             )
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE wakes SET state='fired' WHERE wakeId=?1", [
+               controller.wake_id
+             ])
+
+    assert {:ok, [[_, "asg_1", "fired"]]} =
+             DB.query(ctx.db, Supervision.ended_controllers_sql())
+
+    assert :ok = Supervision.recover_liveness!(ctx.db, 60_000)
+    assert {:ok, []} = DB.query(ctx.db, Supervision.ended_controllers_sql())
+  end
+
+  test "cancellation settles its controller and removes its ending record", ctx do
+    terminal_seq = terminal!(ctx.db, "holder")
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0, interval: 60_000)
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", terminal_seq)
+    assert [controller] = Wakes.list_pending(ctx.db)
+    cancel_wake!(ctx.db, controller)
+    assert Wakes.get(ctx.db, controller.wake_id).state == "canceled"
+
+    assert {:ok, [["settled"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT controllerState FROM supervision_liveness_sidecar WHERE wakeId=?1",
+               [controller.wake_id]
+             )
+
+    assert {:ok, []} = DB.query(ctx.db, "SELECT * FROM supervision_ended_controllers")
   end
 
   test "missing entitlement recovery preserves a coherent generation-12 controller lineage",

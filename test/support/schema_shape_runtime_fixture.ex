@@ -637,7 +637,35 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
     end
   end
 
+  def downgrade_supervision_recorded_state!(db) do
+    if DB.query(db, "SELECT 1 FROM sqlite_master WHERE name='supervision_state_migration'") ==
+         {:ok, [[1]]} do
+      :ok =
+        DB.execute(db, """
+        DROP TRIGGER supervision_record_controller_end;
+        DROP TRIGGER supervision_forget_settled_controller;
+        DROP TRIGGER patrol_terminal_checkpoint_rewind;
+        DROP TRIGGER patrol_terminal_checkpoint_insert;
+        DROP INDEX supervision_liveness_ended_controller;
+        DROP INDEX idle_cleanup_pending_group;
+        DROP TABLE supervision_ended_controllers;
+        ALTER TABLE patrol_failure_boundary DROP COLUMN lastTurnSeq;
+        ALTER TABLE sessions DROP COLUMN idleCleanupObservedWake;
+        ALTER TABLE sessions DROP COLUMN idleCleanupPreviousWake;
+        ALTER TABLE wakes DROP COLUMN idleCleanupObserved;
+        ALTER TABLE wakes DROP COLUMN idleCleanupGroup;
+        ALTER TABLE wakes DROP COLUMN idleCleanupRecorded;
+        DROP TABLE idle_cleanup_state;
+        DROP TABLE supervision_state_migration;
+        """)
+    end
+
+    :ok
+  end
+
   def downgrade_notice_source_storage!(db) do
+    downgrade_supervision_recorded_state!(db)
+
     case DB.query(db, "SELECT shape FROM schema_stamp") do
       {:ok, [[@shape]]} ->
         # Reconstruct the known predecessor representation, including source
@@ -978,6 +1006,8 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
   end
 
   defp drop_liveness_activation(db) do
+    downgrade_supervision_recorded_state!(db)
+
     :ok =
       DB.execute(db, """
       DROP TRIGGER IF EXISTS supervision_liveness_retirement_immutable_delete;

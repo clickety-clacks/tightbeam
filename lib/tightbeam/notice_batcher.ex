@@ -1657,6 +1657,7 @@ defmodule Tightbeam.NoticeBatcher do
       source_updated? = Txn.changes(txn) == 1
       Wakes.settle_batched_wait_in_txn(txn, source_id, "delivered")
       if source_updated?, do: Wakes.publish_change_in_txn(txn, "wake.fired", source_id)
+      Tightbeam.Supervision.record_idle_cleanup_delivery_in_txn(txn, source_id)
     end)
 
     :ok

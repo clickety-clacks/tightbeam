@@ -1720,6 +1720,7 @@ defmodule Tightbeam.Schema do
     :ok = migrate_wake_delivery(db)
     :ok = migrate_continuation_retry_guard(db)
     :ok = upgrade_decision_request_row_schema_revision(db)
+    :ok = migrate_supervision_recorded_state(db)
 
     :ok = Tightbeam.Recognition.ensure_schema(db)
 
@@ -1859,6 +1860,80 @@ defmodule Tightbeam.Schema do
         [rowid]
       )
     end)
+  end
+
+  # This additive marker is independent of the predecessor shape migrations.
+  # Historical cleanup state is copied in the same transaction as the marker.
+  defp migrate_supervision_recorded_state(db) do
+    {:ok, :ok} =
+      DB.transaction(db, fn txn ->
+        Txn.exec(txn, """
+        CREATE TABLE IF NOT EXISTS supervision_state_migration (
+          id INTEGER PRIMARY KEY CHECK(id=0)
+        )
+        """)
+
+        if Txn.q(txn, "SELECT 1 FROM supervision_state_migration WHERE id=0") == [] do
+          :ok =
+            Txn.exec(txn, """
+            CREATE TABLE idle_cleanup_state (
+              sessionKey TEXT NOT NULL, groupDigest TEXT NOT NULL, memberToken TEXT NOT NULL,
+              deliveredCount INTEGER NOT NULL, lastDeliveredAt INTEGER NOT NULL,
+              deliveredDepth INTEGER NOT NULL, deliveredMain INTEGER NOT NULL,
+              PRIMARY KEY(groupDigest,memberToken)
+            );
+            ALTER TABLE sessions ADD COLUMN idleCleanupObservedWake TEXT;
+            ALTER TABLE sessions ADD COLUMN idleCleanupPreviousWake TEXT;
+            ALTER TABLE wakes ADD COLUMN idleCleanupObserved INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE wakes ADD COLUMN idleCleanupGroup TEXT;
+            ALTER TABLE wakes ADD COLUMN idleCleanupRecorded INTEGER NOT NULL DEFAULT 0;
+            CREATE INDEX idle_cleanup_pending_group ON wakes(idleCleanupGroup)
+              WHERE state='pending' AND consumer='prompt';
+            CREATE TABLE supervision_ended_controllers (
+              wakeId TEXT PRIMARY KEY REFERENCES supervision_liveness_sidecar(wakeId) ON DELETE CASCADE,
+              assignmentId TEXT NOT NULL,
+              endedWakeState TEXT NOT NULL CHECK(endedWakeState IN ('fired','canceled'))
+            );
+            CREATE INDEX supervision_liveness_ended_controller
+              ON supervision_ended_controllers(assignmentId,wakeId);
+            INSERT INTO supervision_ended_controllers(wakeId,assignmentId,endedWakeState)
+            SELECT s.wakeId,s.assignmentId,w.state FROM supervision_liveness_sidecar s
+            JOIN wakes w ON w.wakeId=s.wakeId
+            WHERE s.controllerOrigin='scheduled' AND s.controllerState='pending'
+              AND w.state IN ('fired','canceled');
+            CREATE TRIGGER supervision_record_controller_end AFTER UPDATE OF state ON wakes
+            WHEN NEW.state IN ('fired','canceled') AND OLD.state<>NEW.state
+            BEGIN
+              INSERT OR REPLACE INTO supervision_ended_controllers(wakeId,assignmentId,endedWakeState)
+              SELECT wakeId,assignmentId,NEW.state FROM supervision_liveness_sidecar
+              WHERE wakeId=NEW.wakeId AND controllerOrigin='scheduled' AND controllerState = 'pending';
+            END;
+            CREATE TRIGGER supervision_forget_settled_controller AFTER UPDATE OF controllerState ON supervision_liveness_sidecar
+            WHEN NEW.controllerState='settled'
+            BEGIN
+              DELETE FROM supervision_ended_controllers WHERE wakeId=NEW.wakeId;
+            END;
+            ALTER TABLE patrol_failure_boundary ADD COLUMN lastTurnSeq INTEGER NOT NULL DEFAULT 0;
+            CREATE TRIGGER patrol_terminal_checkpoint_rewind AFTER UPDATE OF endedAt ON turns
+            WHEN NEW.endedAt IS NOT NULL AND OLD.endedAt IS NULL
+            BEGIN
+              UPDATE patrol_failure_boundary SET lastTurnSeq=MIN(lastTurnSeq,NEW.seq-1) WHERE id=0;
+            END;
+            CREATE TRIGGER patrol_terminal_checkpoint_insert AFTER INSERT ON turns
+            WHEN NEW.endedAt IS NOT NULL
+            BEGIN
+              UPDATE patrol_failure_boundary SET lastTurnSeq=MIN(lastTurnSeq,NEW.seq-1) WHERE id=0;
+            END;
+            """)
+
+          :ok = Tightbeam.Supervision.copy_idle_cleanup_history_in_txn(txn)
+          :ok = Txn.exec(txn, "INSERT INTO supervision_state_migration(id) VALUES(0)")
+        end
+
+        :ok
+      end)
+
+    :ok
   end
 
   @source_client_column """
@@ -2504,15 +2579,7 @@ defmodule Tightbeam.Schema do
          "ON wakes(sessionKey, firedAt DESC, wakeId DESC) WHERE firedAt IS NOT NULL"},
       {"idle_cleanup_wakes_pending_session",
        "CREATE INDEX IF NOT EXISTS idle_cleanup_wakes_pending_session " <>
-         "ON wakes(sessionKey, wakeId) WHERE state='pending' AND consumer='prompt'"},
-      {"idle_cleanup_wakes_delivery_history",
-       "CREATE INDEX IF NOT EXISTS idle_cleanup_wakes_delivery_history " <>
-         "ON wakes(obligationRef COLLATE NOCASE) " <>
-         "WHERE origin='process:tightbeam' AND state='fired' AND obligationRef IS NOT NULL"},
-      {"idle_cleanup_wakes_pending_group",
-       "CREATE INDEX IF NOT EXISTS idle_cleanup_wakes_pending_group " <>
-         "ON wakes(obligationRef COLLATE NOCASE) " <>
-         "WHERE origin='process:tightbeam' AND state='pending' AND consumer='prompt' AND obligationRef IS NOT NULL"}
+         "ON wakes(sessionKey, wakeId) WHERE state='pending' AND consumer='prompt'"}
     ]
 
     case DB.migration_transaction(db, :idle_cleanup_runtime_indexes, [], [], fn txn ->

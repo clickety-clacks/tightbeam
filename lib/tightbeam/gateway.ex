@@ -2514,6 +2514,8 @@ defmodule Tightbeam.Gateway do
 
       if DB.Txn.changes(txn) == 1,
         do: Wakes.publish_change_in_txn(txn, "wake.fired", opts[:wake_id])
+
+      Supervision.record_idle_cleanup_delivery_in_txn(txn, opts[:wake_id])
     end
   end
 
