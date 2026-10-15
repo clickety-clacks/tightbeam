@@ -1508,10 +1508,10 @@ defmodule Tightbeam.Wire.RouterTest do
     health = body["eventPaths"]
     assert body["schedulerMisses"] - before.count == 25
     assert health["count"] == body["schedulerMisses"]
-    assert health["by_loop"]["wake"] - before.by_loop.wake == 25
+    assert health["byLoop"]["wake"] - before.by_loop.wake == 25
     assert length(health["recent"]) == 20
-    assert hd(health["recent"])["record_id"] == "doctor-miss-25"
-    assert hd(health["recent"])["late_ms"] == 25_000
+    assert hd(health["recent"])["recordId"] == "doctor-miss-25"
+    assert hd(health["recent"])["lateMs"] == 25_000
     assert hd(health["recent"])["loop"] == "wake"
     assert is_integer(hd(health["recent"])["at"])
   end

@@ -1607,7 +1607,7 @@ fn doctor_event_paths(base_dir: &Path, explicit_base_dir: bool) -> Result<Value,
         .get("eventPaths")
         .filter(|health| {
             health["count"].as_u64().is_some()
-                && health["by_loop"].is_object()
+                && health["byLoop"].is_object()
                 && health["recent"].is_array()
         })
         .cloned()
@@ -1644,7 +1644,7 @@ fn event_paths_lines(status: &Result<Value, String>) -> Vec<String> {
         ("lanes", "lanes"),
     ]
     .iter()
-    .map(|(key, label)| format!("{label}={}", health["by_loop"][key]))
+    .map(|(key, label)| format!("{label}={}", health["byLoop"][key]))
     .collect::<Vec<_>>()
     .join(", ");
     let mut lines = vec![format!(
@@ -1653,14 +1653,14 @@ fn event_paths_lines(status: &Result<Value, String>) -> Vec<String> {
     )];
     if let Some(recent) = health["recent"].as_array() {
         for miss in recent {
-            let late = miss["late_ms"]
+            let late = miss["lateMs"]
                 .as_u64()
                 .map(|ms| format!("{ms} ms late"))
                 .unwrap_or_else(|| "lateness unknown".to_owned());
             lines.push(format!(
                 "  {} record={} {late} at={} ms since epoch",
                 miss["loop"].as_str().unwrap_or("unknown"),
-                miss["record_id"],
+                miss["recordId"],
                 miss["at"]
             ));
         }
@@ -1896,7 +1896,7 @@ mod tests {
     fn event_paths_pass_at_clean_start_and_warn_with_recorded_misses() {
         let clean = Ok(serde_json::json!({
             "count": 0,
-            "by_loop": {"wake": 0, "recognition": 0, "bubble": 0, "lanes": 0},
+            "byLoop": {"wake": 0, "recognition": 0, "bubble": 0, "lanes": 0},
             "recent": []
         }));
         assert_eq!(
@@ -1906,8 +1906,8 @@ mod tests {
         assert_eq!(event_paths_value(&clean)["level"], "pass");
         let missed = Ok(serde_json::json!({
             "count": 1,
-            "by_loop": {"wake": 1, "recognition": 0, "bubble": 0, "lanes": 0},
-            "recent": [{"loop": "wake", "record_id": "wake-missed", "late_ms": 65000, "at": 1700000000000_u64}]
+            "byLoop": {"wake": 1, "recognition": 0, "bubble": 0, "lanes": 0},
+            "recent": [{"loop": "wake", "recordId": "wake-missed", "lateMs": 65000, "at": 1700000000000_u64}]
         }));
         let lines = event_paths_lines(&missed);
         assert!(lines[0].contains("[WARN] event paths: 1 missed events since start"));

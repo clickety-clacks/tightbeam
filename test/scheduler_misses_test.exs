@@ -40,8 +40,15 @@ defmodule Tightbeam.SchedulerMissesTest do
     health = JSON.decode!(doctor.(true))["event_paths"]
     assert health["level"] == "warning"
     assert health["count"] == 1
-    assert [%{"record_id" => "missed-wake", "late_ms" => 65_000, "at" => at}] = health["recent"]
+    assert [%{"recordId" => "missed-wake", "lateMs" => 65_000, "at" => at}] = health["recent"]
     assert is_integer(at)
+    Tightbeam.SchedulerMisses.record(:recognition, "retry", 70_000)
+    Tightbeam.SchedulerMisses.record(:bubble, 42, 80_000)
+    Tightbeam.SchedulerMisses.record(:lane_terminal, 43, 90_000)
+    Tightbeam.SchedulerMisses.record(:lane, "lane")
+    health = JSON.decode!(doctor.(true))["event_paths"]
+    assert health["byLoop"] == %{"wake" => 1, "recognition" => 1, "bubble" => 1, "lanes" => 2}
+    assert health["count"] == 5
     IO.puts("event-path-doctor: ok")
     '''
 
