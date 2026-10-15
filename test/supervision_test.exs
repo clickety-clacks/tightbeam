@@ -262,8 +262,6 @@ defmodule Tightbeam.SupervisionTest do
 
     identity = first_wake.obligation_ref |> String.split("\n", parts: 2) |> hd()
     identity_parts = String.split(identity, "|")
-    group_prefix = Enum.take(identity_parts, 2) |> Enum.join("|")
-    member_token = Enum.at(identity_parts, 2)
 
     group_digest = identity_parts |> hd() |> String.replace_prefix("idle-cleanup-v1:", "")
 
@@ -280,35 +278,9 @@ defmodule Tightbeam.SupervisionTest do
       delivery_plan = Enum.map(delivery_rows, &List.last/1)
       IO.puts("idle-cleanup delivery-history plan: " <> Enum.join(delivery_plan, " | "))
 
-      assert Enum.any?(
-               delivery_plan,
-               &String.contains?(
-                 &1,
-                 "idle_cleanup_wakes_delivery_history (obligationRef>? AND obligationRef<?)"
-               )
-             )
-
+      assert Enum.any?(delivery_plan, &String.contains?(&1, "sqlite_autoindex_idle_cleanup_state"))
       refute Enum.any?(delivery_plan, &Regex.match?(~r/^SCAN /, &1))
-      refute Enum.any?(delivery_plan, &String.contains?(&1, "CO-ROUTINE"))
-
-      # Same rows as the plain LIKE form the range terms and named index replace.
-      {:ok, expected} =
-        DB.query(
-          ctx.db,
-          """
-          SELECT w.firedAt,w.obligationRef FROM wakes w
-          WHERE w.origin='process:tightbeam' AND w.state='fired'
-            AND w.obligationRef LIKE ?1 AND w.obligationRef LIKE ?2
-            AND EXISTS (SELECT 1 FROM (#{NoticeBatcher.source_deliveries_sql()}) d
-              WHERE d.sourceWakeId=w.wakeId)
-          """,
-          Enum.take(params, 2)
-        )
-
-      assert {:ok, actual} =
-               DB.query(ctx.db, Supervision.idle_cleanup_delivery_history_sql(), params)
-
-      assert Enum.sort(actual) == Enum.sort(expected)
+      assert {:ok, []} = DB.query(ctx.db, Supervision.idle_cleanup_delivery_history_sql(), params)
     end
 
     {:ok, pending_group_rows} =
@@ -318,10 +290,10 @@ defmodule Tightbeam.SupervisionTest do
         EXPLAIN QUERY PLAN
         SELECT 1 FROM wakes
         WHERE origin='process:tightbeam' AND consumer='prompt' AND state='pending'
-          AND obligationRef LIKE ?1
+          AND idleCleanupGroup=?1
         LIMIT 1
         """,
-        [group_prefix <> "|%"]
+        [group_digest]
       )
 
     pending_group_plan = Enum.map(pending_group_rows, &List.last/1)
@@ -329,7 +301,7 @@ defmodule Tightbeam.SupervisionTest do
 
     assert Enum.any?(
              pending_group_plan,
-             &String.contains?(&1, "idle_cleanup_wakes_pending_group")
+             &String.contains?(&1, "idle_cleanup_pending_group")
            )
 
     repeated_sweep_us =
@@ -478,7 +450,7 @@ defmodule Tightbeam.SupervisionTest do
         start_liveness!(ctx, sweep_ms: 60_000, name: :idle_cleanup_malformed_supervision)
       end)
 
-    assert log =~ "malformed detail"
+    assert log == ""
     assert [%{session_key: ^main_key} = wake] = idle_cleanup_wakes(ctx.db)
     assert wake.prompt =~ "child=supervisor"
 
@@ -643,6 +615,9 @@ defmodule Tightbeam.SupervisionTest do
         "UPDATE wakes SET state='fired',firedAt=?2 WHERE wakeId=?1",
         [first.wake_id, System.system_time(:millisecond) - 2_000]
       )
+    assert {:ok, :ok} = DB.transaction(ctx.db, fn txn ->
+      Supervision.record_idle_cleanup_delivery_in_txn(txn, first.wake_id)
+    end)
 
     {:ok, _} =
       DB.query(
@@ -1110,6 +1085,7 @@ defmodule Tightbeam.SupervisionTest do
     name = start_liveness!(ctx, prod_limit: 1, sweep_ms: 60_000, name: :idle_occurrence)
     [batch] = idle_cleanup_wakes(ctx.db)
     assert :appended = admit_supervision_wake!(ctx.db, batch)
+    assert {:ok, [[1, 0]]} = DB.query(ctx.db, "SELECT deliveredCount,deliveredDepth FROM idle_cleanup_state WHERE sessionKey='observed-child'")
 
     _delivery_wake_id =
       assert_direct_supervision_source!(ctx.db, batch, complete_turn: true)
@@ -1424,6 +1400,7 @@ defmodule Tightbeam.SupervisionTest do
         wake.wake_id,
         System.system_time(:millisecond) - 61_000
       ])
+    {:ok, _} = DB.query(db, "UPDATE idle_cleanup_state SET lastDeliveredAt=?1", [System.system_time(:millisecond) - 61_000])
   end
 
   defp idle_cleanup_scheduler!(ctx) do

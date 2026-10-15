@@ -21,21 +21,21 @@ defmodule Tightbeam.HotQueryPlansTest do
     plan
   end
 
-  test "idle-cleanup delivery history is driven by its partial index", %{db: db} do
+  test "idle-cleanup delivery state uses its primary key", %{db: db} do
     params = Supervision.idle_cleanup_delivery_history_params(String.duplicate("a", 64), "tok")
     plan = plan!(db, Supervision.idle_cleanup_delivery_history_sql(), params)
 
     assert hd(plan) =~
-             "SEARCH w USING INDEX idle_cleanup_wakes_delivery_history (obligationRef>? AND obligationRef<?)"
+             "SEARCH idle_cleanup_state USING INDEX sqlite_autoindex_idle_cleanup_state"
 
     refute Enum.any?(plan, &Regex.match?(~r/^SCAN /, &1))
     assert {:ok, []} = DB.query(db, Supervision.idle_cleanup_delivery_history_sql(), params)
   end
 
-  test "ended scheduled controllers are read from the pending-controller index", %{db: db} do
+  test "ended scheduled controllers are read from the sidecar index", %{db: db} do
     plan = plan!(db, Supervision.ended_controllers_sql(), [])
-    assert hd(plan) =~ "supervision_liveness_pending_controller"
-    assert Enum.any?(plan, &(&1 =~ ~r/^SEARCH w USING .*\(wakeId=\?/))
+    assert hd(plan) =~ "supervision_liveness_ended_controller"
+    refute Enum.any?(plan, &String.contains?(&1, "wakes"))
     refute Enum.any?(plan, &Regex.match?(~r/^SCAN w/, &1))
   end
 
