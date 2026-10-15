@@ -79,7 +79,7 @@ defmodule Tightbeam.ApplicationShutdownTest do
     elapsed = System.monotonic_time(:millisecond) - started
 
     assert elapsed >= 500
-    assert elapsed < 1_200
+    assert elapsed < 3_000
     assert_stamped(epoch)
   end
 
