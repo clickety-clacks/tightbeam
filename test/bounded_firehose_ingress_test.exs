@@ -53,6 +53,14 @@ defmodule Tightbeam.BoundedFirehoseIngressTest do
     assert_receive :firehose_overflow, 5_000
   end
 
+  test "shutdown delivers its signal with bounded publication transport", %{hub: hub} do
+    parent = self()
+    task = Task.async(fn -> Hub.shutdown(hub, System.monotonic_time(:millisecond) + 1_000) end)
+    assert_receive :firehose_shutdown
+    assert :ok = Hub.shutdown_delivered(hub, parent)
+    assert Task.await(task) == :ok
+  end
+
   test "nonmatching subscriptions never query visibility", %{hub: hub} do
     :ok =
       Hub.register(hub, self(), %{mode: :subscribed, db: :unavailable_database, is_admin: false})

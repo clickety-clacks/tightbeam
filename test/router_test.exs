@@ -61,6 +61,14 @@ defmodule Tightbeam.Wire.RouterTest do
            }) == %{fastMode: "on", reasoningLevel: "high"}
   end
 
+  test "effort and health parameters preserve accepted aliases" do
+    assert Router.atomize_params_for_test("effort-rule", %{"requestId" => "request"}) ==
+             %{request_id: "request"}
+    assert Router.atomize_params_for_test("harness-health-observe-other", %{
+             "acceptedAt" => 123, "sessionKey" => "source"
+           }) == %{accepted_at: 123, session_key: "source"}
+  end
+
   test "changes route refuses missing upgrade or unsupported protocol before authentication" do
     hub = :"router_refused_changes_hub_#{System.unique_integer([:positive])}"
     start_supervised!({Tightbeam.Firehose.Hub, name: hub})

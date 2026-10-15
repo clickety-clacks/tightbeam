@@ -6369,15 +6369,17 @@ defmodule Tightbeam.Wakes do
     {:reply, :ok, state}
   end
 
+  # Evaluate the committed fact(s) eagerly, then reply. The delivery pass runs
+  # as the next message, so a fact filer never waits on a full scheduler pass.
   def handle_call({:fire_matching, fact_id}, _from, state) do
     eager_step(state, fact_id)
-    deliver_due(state)
+    send(self(), :fire_due)
     {:reply, :ok, state}
   end
 
   def handle_call({:fire_matching_seq, fact_ids}, _from, state) do
     drain_seq(state, fact_ids)
-    deliver_due(state)
+    send(self(), :fire_due)
     {:reply, :ok, state}
   end
 

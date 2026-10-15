@@ -82,6 +82,7 @@ defmodule Tightbeam.Wire.Socket do
             subscriptions: nil,
             buffer: [],
             replayed_seqs: MapSet.new(),
+            replay_pending: MapSet.new(),
             deps: %{}
 
   @impl true
@@ -123,8 +124,8 @@ defmodule Tightbeam.Wire.Socket do
       {:push_message, key, seq, payload} when state.phase == :replaying ->
         {:ok, %{state | buffer: [{:msg, key, seq, payload} | state.buffer]}}
 
-      {:push_message, _key, _seq, payload} when state.phase == :live ->
-        push(payload, state)
+      {:push_message, key, _seq, payload} when state.phase == :live ->
+        if MapSet.member?(state.replay_pending, key), do: {:ok, state}, else: push(payload, state)
 
       {:push_message, _key, _seq, _payload} ->
         {:ok, state}
@@ -139,7 +140,10 @@ defmodule Tightbeam.Wire.Socket do
           |> Enum.reverse()
           |> Enum.flat_map(fn
             {:msg, key, seq, payload} ->
-              if MapSet.member?(state.replayed_seqs, {key, seq}), do: [], else: [payload]
+              if MapSet.member?(state.replay_pending, key) or
+                   MapSet.member?(state.replayed_seqs, {key, seq}),
+                do: [],
+                else: [payload]
 
             {:frame, payload} ->
               [payload]
@@ -330,9 +334,9 @@ defmodule Tightbeam.Wire.Socket do
     keys = Enum.map(sessions, & &1.session_key)
     cursors = replay_cursors(msg, device.user_id, state)
 
-    {reversed, truncated?, replayed_seqs, _bytes, _count} =
-      Enum.reduce_while(sessions, {[], false, MapSet.new(), 0, 0}, fn session,
-                                                                      {messages, _, sent, bytes,
+    {reversed, pending, replayed_seqs, _bytes, _count} =
+      Enum.reduce(sessions, {[], MapSet.new(), MapSet.new(), 0, 0}, fn session,
+                                                                      {messages, pending, sent, bytes,
                                                                        count} ->
         key = session.session_key
 
@@ -351,7 +355,7 @@ defmodule Tightbeam.Wire.Socket do
                                                                              n} ->
             row_bytes = byte_size(JSON.encode!(Payloads.server_message(row)))
 
-            if n == 500 or size + row_bytes > 4 * 1024 * 1024 do
+            if n == 500 or (n > 0 and size + row_bytes > 4 * 1024 * 1024) do
               {:halt, {acc, true, seen, size, n}}
             else
               {:cont,
@@ -359,7 +363,9 @@ defmodule Tightbeam.Wire.Socket do
             end
           end)
 
-        if elem(page, 1), do: {:halt, page}, else: {:cont, page}
+        {messages, truncated?, sent, bytes, count} = page
+        pending = if truncated?, do: MapSet.put(pending, key), else: pending
+        {messages, pending, sent, bytes, count}
       end)
 
     replay = Enum.reverse(reversed)
@@ -384,7 +390,7 @@ defmodule Tightbeam.Wire.Socket do
         session_id: "conn_#{device.device_id}",
         is_admin: device.is_admin,
         replay_count: length(replay),
-        replay_truncated: truncated?,
+        replay_truncated: MapSet.size(pending) > 0,
         history_reset: false,
         session_keys: keys,
         stream_read_states: read_states,
@@ -404,7 +410,8 @@ defmodule Tightbeam.Wire.Socket do
         is_admin: device.is_admin,
         subscriptions: subscriptions,
         phase: :replaying,
-        replayed_seqs: replayed_seqs
+        replayed_seqs: replayed_seqs,
+        replay_pending: pending
     }
 
     state = state |> schedule_ping() |> arm_pong_deadline()

@@ -1,7 +1,7 @@
 defmodule Tightbeam.Firehose.Hub do
   @moduledoc "Live-only Firehose queue with per-delivery authorization; startup is owned by Gateway."
   use GenServer
-  import Kernel, except: [send: 2]
+  require Logger
   alias Tightbeam.Firehose.Publisher
   alias Tightbeam.StateVisibility
 
@@ -32,45 +32,39 @@ defmodule Tightbeam.Firehose.Hub do
   @ingress_count 1_000
   @ingress_bytes 8 * 1024 * 1024
 
-  # Transaction outboxes use this via destination too, so every publication
-  # reserves space before sending anything to the hub's mailbox.
-  def destination(server), do: {:via, __MODULE__, server}
+  defmodule Transport do
+    @moduledoc false
 
-  def send(server, {:"$gen_cast", message}) do
-    ingress(server, message)
+    def send(server, {:"$gen_cast", message}),
+      do: Tightbeam.Firehose.Hub.ingress(server, message)
   end
 
-  defp ingress(server, message) do
+  # Committed outboxes use the same admission path as direct publications.
+  def destination(server), do: {:via, Transport, server}
+
+  @doc false
+  def ingress(server, message) do
     pid = GenServer.whereis(server)
-    table = if is_pid(pid), do: Process.info(pid, :dictionary)
 
-    case table do
-      {:dictionary, dictionary} ->
-        case Keyword.fetch(dictionary, :firehose_ingress) do
-          {:ok, table} ->
-            bytes = :erlang.external_size(message)
-            [count, total] = :ets.update_counter(table, :ingress, [{2, 1}, {3, bytes}])
-
-            if count <= @ingress_count and total <= @ingress_bytes do
-              GenServer.cast(pid, {:ingress, bytes, message})
-            else
-              :ets.update_counter(table, :ingress, [{2, -1}, {3, -bytes}])
-
-              if :ets.insert_new(table, {:overflow, true}),
-                do: GenServer.cast(pid, :ingress_overflow)
-            end
-
-          :error ->
-            GenServer.cast(pid, message)
-        end
-
-      _ ->
+    case :persistent_term.get({__MODULE__, pid}, nil) do
+      nil ->
         :ok
+
+      table ->
+        bytes = :erlang.external_size(message)
+        [count, total] = :ets.update_counter(table, :ingress, [{2, 1}, {3, bytes}])
+
+        if count <= @ingress_count and total <= @ingress_bytes do
+          GenServer.cast(pid, {:ingress, bytes, message})
+        else
+          :ets.update_counter(table, :ingress, [{2, -1}, {3, -bytes}])
+
+          if :ets.insert_new(table, {:overflow, true}),
+            do: GenServer.cast(pid, :ingress_overflow)
+        end
     end
 
     :ok
-  rescue
-    ArgumentError -> :ok
   end
 
   def start_link(opts \\ []),
@@ -91,7 +85,25 @@ defmodule Tightbeam.Firehose.Hub do
     do: GenServer.cast(server, {:unregister, pid})
 
   def shutdown_delivered(server, pid), do: GenServer.call(server, {:shutdown_delivered, pid})
-  def shutdown(server \\ __MODULE__), do: GenServer.call(server, :shutdown, :infinity)
+
+  def shutdown(server \\ __MODULE__, deadline \\ System.monotonic_time(:millisecond) + 5_000) do
+    remaining = deadline - System.monotonic_time(:millisecond)
+
+    result =
+      if remaining <= 0 do
+        {:error, :deadline_exceeded}
+      else
+        try do
+          GenServer.call(server, {:shutdown, deadline}, remaining)
+        catch
+          :exit, reason -> {:error, reason}
+        end
+      end
+
+    if result != :ok, do: Logger.warning("firehose shutdown incomplete: #{inspect(result)}")
+    result
+  end
+
   def publish(server \\ __MODULE__, notice), do: ingress(server, {:publish, notice})
 
   def committed(server \\ __MODULE__, class, payload, refs),
@@ -107,14 +119,20 @@ defmodule Tightbeam.Firehose.Hub do
   def init(opts) do
     table = :ets.new(__MODULE__, [:public, :set, write_concurrency: true])
     :ets.insert(table, {:ingress, 0, 0})
-    Process.put(:firehose_ingress, table)
+    :persistent_term.put({__MODULE__, self()}, table)
     {:ok, %__MODULE__{ingress: table, queue_limit: Keyword.get(opts, :queue_limit, 1_000)}}
+  end
+
+  @impl true
+  def terminate(_reason, _state) do
+    :persistent_term.erase({__MODULE__, self()})
+    :ok
   end
 
   @impl true
   def handle_call({:register, pid, opts}, _from, state) do
     if state.shutting_down do
-      Kernel.send(pid, :firehose_shutdown)
+      send(pid, :firehose_shutdown)
       {:reply, :ok, state}
     else
       socket = state.sockets[pid] || %Socket{monitor: Process.monitor(pid)}
@@ -152,8 +170,14 @@ defmodule Tightbeam.Firehose.Hub do
     {:reply, socket && Map.take(socket, [:queued, :in_flight, :overflowed, :seq]), state}
   end
 
-  def handle_call(:shutdown, from, state) do
-    Enum.each(Map.keys(state.sockets), &Kernel.send(&1, :firehose_shutdown))
+  def handle_call({:shutdown, deadline}, from, state) do
+    Process.send_after(
+      self(),
+      {:shutdown_timeout, from},
+      max(deadline - System.monotonic_time(:millisecond), 0)
+    )
+
+    Enum.each(Map.keys(state.sockets), &send(&1, :firehose_shutdown))
 
     if map_size(state.sockets) == 0,
       do: {:reply, :ok, %{state | shutting_down: true}},
@@ -181,7 +205,7 @@ defmodule Tightbeam.Firehose.Hub do
 
     sockets =
       Map.new(state.sockets, fn {pid, socket} ->
-        if not socket.overflowed, do: Kernel.send(pid, :firehose_overflow)
+        if not socket.overflowed, do: send(pid, :firehose_overflow)
         {pid, %{socket | queue: :queue.new(), queued: 0, overflowed: true}}
       end)
 
@@ -209,7 +233,7 @@ defmodule Tightbeam.Firehose.Hub do
             false
 
           revoked?(probe, socket) ->
-            Kernel.send(pid, :firehose_revoked)
+            send(pid, :firehose_revoked)
             false
 
           true ->
@@ -269,7 +293,7 @@ defmodule Tightbeam.Firehose.Hub do
 
   defp deliver_notice(socket, pid, notice, limit) do
     if revoked?(notice, socket) do
-      Kernel.send(pid, :firehose_revoked)
+      send(pid, :firehose_revoked)
       socket
     else
       deliver_visible_notice(socket, pid, notice, limit)
@@ -302,7 +326,7 @@ defmodule Tightbeam.Firehose.Hub do
     occupied = socket.queued + if(socket.in_flight, do: 1, else: 0)
 
     if occupied + length(frames) > limit do
-      Kernel.send(pid, :firehose_overflow)
+      send(pid, :firehose_overflow)
       %{socket | queue: :queue.new(), queued: 0, overflowed: true}
     else
       queue = Enum.reduce(frames, socket.queue, &:queue.in(&1, &2))
@@ -318,7 +342,7 @@ defmodule Tightbeam.Firehose.Hub do
       {{:value, frame}, queue} ->
         socket = %{socket | queue: queue, queued: socket.queued - 1}
 
-        Kernel.send(pid, {:firehose_notice, frame})
+        send(pid, {:firehose_notice, frame})
         %{socket | in_flight: true}
 
       {:empty, _} ->
@@ -421,6 +445,13 @@ defmodule Tightbeam.Firehose.Hub do
   end
 
   @impl true
+  def handle_info({:shutdown_timeout, from}, %{shutdown_waiter: from} = state) do
+    GenServer.reply(from, {:error, :deadline_exceeded})
+    {:noreply, %{state | shutdown_waiter: nil}}
+  end
+
+  def handle_info({:shutdown_timeout, _from}, state), do: {:noreply, state}
+
   def handle_info({:DOWN, monitor, :process, pid, _}, state) do
     case state.sockets[pid] do
       %{monitor: ^monitor} -> {:noreply, drop(state, pid)}

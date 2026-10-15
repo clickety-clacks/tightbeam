@@ -380,6 +380,8 @@ defmodule Tightbeam.Firehose.PublisherTest do
     }
 
     assert {:ok, %{kind: "effect-ready"}} = Dispatch.dispatch(db, handlers, condition)
+    # Wait for the delivery pass the condition nudge queued.
+    :sys.get_state(scheduler)
     assert_per_verb_effects!(config, "condition", observed_state_classes())
 
     {:ok, condition_turn} = Ledger.claim_next(db, "effect-target", "lane:effects")

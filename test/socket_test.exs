@@ -522,9 +522,14 @@ defmodule Tightbeam.Wire.SocketTest do
     assert length(messages) < 80
     {:text, last} = List.last(messages)
     cursor = JSON.decode!(last)["id"]
-    {:push, _, live} = Socket.handle_info(:finish_replay, replaying)
+    held = %{"type" => "message", "id" => "live-after-backlog"}
+    {:ok, replaying} = Socket.handle_info({:push_message, key, 81, held}, replaying)
+    {:push, drained, live} = Socket.handle_info(:finish_replay, replaying)
+    refute Enum.any?(drained, fn {:text, frame} -> JSON.decode!(frame) == held end)
+    assert {:ok, ^live} = Socket.handle_info({:push_message, key, 81, held}, live)
+    assert {:push, _, _} = Socket.handle_info({:push_message, "caught-up", 1, held}, live)
 
-    {:push, next, _} =
+    {:push, next, caught_up} =
       Socket.handle_in(
         {JSON.encode!(Map.put(auth, "replayCursorsBySessionKey", %{key => cursor})),
          opcode: :text},
@@ -532,6 +537,51 @@ defmodule Tightbeam.Wire.SocketTest do
       )
 
     assert length(messages) + length(next) - 2 == 80
+    assert MapSet.size(caught_up.replay_pending) == 0
+  end
+
+  test "one oversized replay row advances the cursor", ctx do
+    {:paired, device} =
+      Devices.pair(ctx.db, %{
+        device_id: "oversized-page",
+        claimed_name: "Reader",
+        platform: nil,
+        model: nil
+      })
+
+    key = Org.personal_session_key(device.user_id)
+
+    Org.create(ctx.db, %{
+      session_key: key,
+      display_name: "Main",
+      kind: "main",
+      is_built_in: true,
+      owner_user_id: device.user_id,
+      origin: "user:#{device.user_id}",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("fable")
+    })
+
+    first = Projection.append(ctx.db, %{
+      session_key: key, role: "assistant", content: String.duplicate("x", 4 * 1024 * 1024)
+    })
+    Projection.append(ctx.db, %{session_key: key, role: "assistant", content: "next"})
+    {:ok, state} = Socket.init(ctx.deps)
+    auth = %{"type" => "auth", "token" => device.token, "deviceId" => device.device_id}
+    {:push, frames, replaying} = Socket.handle_in({JSON.encode!(auth), opcode: :text}, state)
+    [result, _, message] = Enum.map(frames, fn {:text, frame} -> JSON.decode!(frame) end)
+    assert result["replayTruncated"]
+    assert message["id"] == first.id
+    {:push, _, live} = Socket.handle_info(:finish_replay, replaying)
+    auth = Map.put(auth, "replayCursorsBySessionKey", %{key => first.id})
+    {:push, frames, next_state} = Socket.handle_in({JSON.encode!(auth), opcode: :text}, live)
+    [result, _, message] = Enum.map(frames, fn {:text, frame} -> JSON.decode!(frame) end)
+    refute result["replayTruncated"]
+    assert message["content"] == "next"
+    assert MapSet.size(next_state.replay_pending) == 0
   end
 
   test "concurrent first auths converge on one personal main stream", ctx do

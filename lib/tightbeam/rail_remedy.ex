@@ -483,7 +483,19 @@ defmodule Tightbeam.RailRemedy do
                    end
 
                  _ ->
-                   raise ArgumentError, "review remedy episode is not live"
+                   # The episode closed or moved to another occurrence, so this
+                   # reassessment can never apply. Consume it once instead of
+                   # failing on every scheduler tick.
+                   Tightbeam.Wakes.consume_internal_in_txn(txn, wake.wake_id)
+
+                   EventLog.lifecycle_in_txn(
+                     txn,
+                     "rail_remedy_reassessment_retired",
+                     subject,
+                     "wakeId=#{wake.wake_id} cause=episode_not_live occurrence=#{occurrence} principal=process:tightbeam"
+                   )
+
+                   :ok
                end
              end) do
           {:ok, :ok} -> :ok

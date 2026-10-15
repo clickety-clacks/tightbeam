@@ -1855,7 +1855,7 @@ defmodule Tightbeam.Wire.Router do
          true <-
            payload["principalKind"] == principal.kind and payload["principalId"] == principal.id,
          true <- d1_tuple?(payload["tuple"], d1_resource(spec)) do
-      {:ok, {Map.fetch!(%{"after" => :after, "before" => :before}, direction), payload["tuple"]}}
+      {:ok, {String.to_atom(direction), payload["tuple"]}}
     else
       _ -> {:error, 400, "invalid_cursor", nil}
     end
@@ -2814,7 +2814,7 @@ defmodule Tightbeam.Wire.Router do
     "decision-requests" => ~w(status)a,
     "dispatch" =>
       ~w(brief effect_kind holder_key idempotency_key prompt session_key subject succeeds_assignment_id work_item_id workdir_root)a,
-    "effort-rule" => ~w(action request)a,
+    "effort-rule" => ~w(action request request_id)a,
     "execution-map" => ~w(tree origin owner state spec spec_sha session quiet_over)a,
     "execution-map-select" =>
       ~w(assignments under origin owner state spec spec_sha session quiet_over)a,
@@ -2823,7 +2823,7 @@ defmodule Tightbeam.Wire.Router do
       ~w(candidate_commit idempotency_key named_class promotion_id review_artifact_id review_assignment_id review_attest_id spec_artifact_id spec_ref spec_sha256)a,
     "harness-health-evidence-other" => ~w(incident_id)a,
     "harness-health-observe-other" =>
-      ~w(correlation_id description evidence_mode exact_observed_error exact_probe harness host idempotency_key not_known_class_reason observed_at observed_state output_digest recovery_condition redaction_confirmed source_session_key valid_until world_status)a,
+      ~w(accepted_at session_key correlation_id description evidence_mode exact_observed_error exact_probe harness host idempotency_key not_known_class_reason observed_at observed_state output_digest recovery_condition redaction_confirmed source_session_key valid_until world_status)a,
     "harness-health-resolve-other" =>
       ~w(accepted_at cause correlation_id exact_probe harness host idempotency_key incident_id observed_at observed_state output_digest recovery_condition_digest recovery_satisfied redaction_confirmed session_key world_status)a,
     "harness-health-review-other" => ~w(cause idempotency_key incident_id named_class outcome)a,

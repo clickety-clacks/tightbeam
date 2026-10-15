@@ -28,23 +28,23 @@ defmodule Tightbeam.ConnRegistryTest do
         subscriptions: MapSet.new(["chat"])
       })
 
-    assert is_reference(:sys.get_state(reg).conns[ref].monitor)
+    registry_monitor = :sys.get_state(reg).conns[ref].monitor
+    assert is_reference(registry_monitor)
+    monitor = Process.monitor(pid)
     Process.exit(pid, :kill)
-
-    state =
-      Enum.reduce_while(1..100, nil, fn _, _ ->
-        state = :sys.get_state(reg)
-
-        if Map.has_key?(state.conns, ref) do
-          Process.sleep(1)
-          {:cont, state}
-        else
-          {:halt, state}
-        end
-      end)
+    assert_receive {:DOWN, ^monitor, :process, ^pid, :killed}
+    # Deliver the registry's monitor event before the state query from this sender.
+    send(reg, {:DOWN, registry_monitor,
+               :process, pid, :killed})
+    state = :sys.get_state(reg)
 
     refute Map.has_key?(state.conns, ref)
     refute Map.has_key?(state.devices, "dead-socket")
+  end
+
+  test "stray messages do not crash the registry", %{reg: reg} do
+    send(reg, :unexpected)
+    assert :sys.get_state(reg).conns == %{}
   end
 
   test "inactive rate windows expire without another request", %{reg: reg} do

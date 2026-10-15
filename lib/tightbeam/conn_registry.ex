@@ -274,6 +274,8 @@ defmodule Tightbeam.ConnRegistry do
     {:noreply, %{state | rate_windows: windows}}
   end
 
+  def handle_info(_message, state), do: {:noreply, state}
+
   defp demonitor(%{monitor: monitor}) when is_reference(monitor),
     do: Process.demonitor(monitor, [:flush])
 

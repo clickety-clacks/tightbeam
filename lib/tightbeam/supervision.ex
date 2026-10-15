@@ -3366,19 +3366,23 @@ defmodule Tightbeam.Supervision do
 
   defp recover_liveness(_state), do: :ok
 
+  @doc false
+  # CROSS JOIN fixes the join order: walk the few pending scheduled controllers
+  # through supervision_liveness_pending_controller and look each wake up by
+  # key, instead of walking every fired or canceled wake.
+  def ended_controllers_sql do
+    """
+    SELECT s.wakeId, s.assignmentId, w.state
+    FROM supervision_liveness_sidecar s
+    CROSS JOIN wakes w ON w.wakeId=s.wakeId
+    WHERE s.controllerOrigin='scheduled' AND s.controllerState='pending'
+      AND w.state IN ('fired','canceled')
+    ORDER BY s.assignmentId, s.wakeId
+    """
+  end
+
   defp settle_ended_controllers_in_txn(txn) do
-    ended =
-      Txn.q(
-        txn,
-        """
-        SELECT s.wakeId, s.assignmentId, w.state
-        FROM supervision_liveness_sidecar s
-        JOIN wakes w ON w.wakeId=s.wakeId
-        WHERE s.controllerOrigin='scheduled' AND s.controllerState='pending'
-          AND w.state IN ('fired','canceled')
-        ORDER BY s.assignmentId, s.wakeId
-        """
-      )
+    ended = Txn.q(txn, ended_controllers_sql())
 
     Enum.each(ended, fn [wake_id, assignment_id, wake_state] ->
       Txn.q(
@@ -4342,10 +4346,13 @@ defmodule Tightbeam.Supervision do
   defp idle_cleanup_sweep_in_txn(txn, n, snapshot_at) do
     idle_cleanup_observe_pending_in_txn(txn)
     sessions = idle_cleanup_sessions_in_txn(txn)
+    occurrences = idle_cleanup_occurrences_in_txn(txn, nil)
 
     eligible =
       Map.values(sessions)
-      |> Enum.map(&idle_cleanup_candidate_in_txn(txn, &1, snapshot_at, sessions))
+      |> Enum.map(
+        &idle_cleanup_candidate_in_txn(txn, &1, snapshot_at, sessions, nil, occurrences)
+      )
       |> Enum.reject(&is_nil/1)
 
     dormant =
@@ -4412,7 +4419,14 @@ defmodule Tightbeam.Supervision do
     |> Map.new(&{&1.session_key, &1})
   end
 
-  defp idle_cleanup_candidate_in_txn(txn, session, snapshot_at, sessions, ignored_wake \\ nil) do
+  defp idle_cleanup_candidate_in_txn(
+         txn,
+         session,
+         snapshot_at,
+         sessions,
+         ignored_wake,
+         occurrences
+       ) do
     with true <- session.state == "active" and not session.built_in,
          true <- idle_cleanup_enabled?(session.archetype),
          [] <-
@@ -4438,7 +4452,7 @@ defmodule Tightbeam.Supervision do
       gate = HarnessHealth.prod_shape_gate_in_txn(txn, session.harness, session.host, snapshot_at)
       group_digest = idle_cleanup_digest("idle-cleanup-group-v1\0" <> parent_group)
       activity_fingerprint = idle_cleanup_activity_fingerprint(session.session_key, activity)
-      occurrence = idle_cleanup_occurrence_in_txn(txn, session.session_key, ignored_wake)
+      occurrence = idle_cleanup_occurrence(txn, occurrences, session.session_key)
 
       member_token =
         idle_cleanup_member_token(session.session_key, activity_fingerprint <> occurrence)
@@ -4520,12 +4534,60 @@ defmodule Tightbeam.Supervision do
     end)
   end
 
-  defp idle_cleanup_occurrence_in_txn(txn, session_key, ignored_wake) do
+  # The latest pending observation per session (excluding `ignored_wake`), read
+  # once for a whole sweep or delivery check instead of once per candidate.
+  # SQLite returns the bare subject from the row holding MAX(id). The detail
+  # column is free-form: one malformed row fails this grouped read. The sweep
+  # then reports it and falls back to the per-candidate lookup, which skips
+  # malformed rows, so one bad historical row cannot stop every sweep.
+  defp idle_cleanup_occurrences_in_txn(txn, ignored_wake) do
+    rows =
+      Txn.q(
+        txn,
+        """
+        SELECT session, subject FROM (
+          SELECT json_extract(e.detail,'$.session') AS session, e.subject AS subject, MAX(e.id)
+          FROM lifecycle_events e
+          WHERE e.kind='idle_cleanup_pending_observed' AND (?1 IS NULL OR e.subject<>?1)
+          GROUP BY session
+        )
+        ORDER BY session
+        """,
+        [ignored_wake]
+      )
+
+    {:grouped,
+     Enum.reduce(rows, %{}, fn
+       [session, subject], acc when is_binary(session) -> Map.put(acc, session, subject)
+       _row, acc -> acc
+     end)}
+  rescue
+    error in DB.Error ->
+      if String.contains?(Exception.message(error), "malformed JSON") do
+        Logger.warning(
+          "idle cleanup observation history holds malformed detail; " <>
+            "reading observations per candidate for this sweep"
+        )
+
+        {:per_candidate, ignored_wake}
+      else
+        reraise error, __STACKTRACE__
+      end
+  end
+
+  defp idle_cleanup_occurrence(_txn, {:grouped, occurrences}, session_key) do
+    case Map.fetch(occurrences, session_key) do
+      {:ok, subject} -> JSON.encode!([[subject]])
+      :error -> JSON.encode!([])
+    end
+  end
+
+  defp idle_cleanup_occurrence(txn, {:per_candidate, ignored_wake}, session_key) do
     Txn.q(
       txn,
       """
       SELECT e.subject FROM lifecycle_events e
-      WHERE e.kind='idle_cleanup_pending_observed'
+      WHERE e.kind='idle_cleanup_pending_observed' AND json_valid(e.detail)
         AND json_extract(e.detail,'$.session')=?1 AND (?2 IS NULL OR e.subject<>?2)
       ORDER BY e.id DESC LIMIT 1
       """,
@@ -4734,22 +4796,37 @@ defmodule Tightbeam.Supervision do
   @doc false
   # Driven by the idle_cleanup_wakes_delivery_history partial index; delivery
   # history is two keyed lookups per candidate wake, never a relation scan.
+  # Without statistics the planner prefers a state index and walks every fired
+  # wake, so the index is named. ?3/?4 bound the group prefix in the index's
+  # NOCASE collation: [prefix "|", prefix "}") holds exactly the references that
+  # start with prefix "|" ("}" follows "|"), which LIKE ?1 already requires, so
+  # the rows are unchanged. A bound LIKE alone cannot drive a named index.
   def idle_cleanup_delivery_history_sql do
     """
     SELECT w.firedAt,w.obligationRef
-    FROM wakes w
+    FROM wakes w INDEXED BY idle_cleanup_wakes_delivery_history
     WHERE w.origin='process:tightbeam' AND w.state='fired'
+      AND w.obligationRef IS NOT NULL
+      AND w.obligationRef COLLATE NOCASE >= ?3
+      AND w.obligationRef COLLATE NOCASE < ?4
       AND w.obligationRef LIKE ?1
       AND w.obligationRef LIKE ?2
       AND #{NoticeBatcher.source_delivered_sql("w.wakeId")}
     """
   end
 
+  @doc false
+  def idle_cleanup_delivery_history_params(group_digest, member_token) do
+    group = @idle_cleanup_prefix <> group_digest
+
+    [group <> "|%", "%|" <> member_token <> "|%", group <> "|", group <> "}"]
+  end
+
   defp idle_cleanup_delivery_history_in_txn(txn, group_digest, member_token) do
     Txn.q(
       txn,
       idle_cleanup_delivery_history_sql(),
-      [@idle_cleanup_prefix <> group_digest <> "|%", "%|" <> member_token <> "|%"]
+      idle_cleanup_delivery_history_params(group_digest, member_token)
     )
     |> Enum.reduce({0, nil, 0, false}, fn [at, ref], {count, last, depth, main} ->
       case idle_cleanup_metadata(ref) do
@@ -4979,11 +5056,21 @@ defmodule Tightbeam.Supervision do
          true <- is_integer(claimed_at) and claimed_at >= 0 and claimed_at <= snapshot_at,
          true <- is_binary(evidence) do
       sessions = idle_cleanup_sessions_in_txn(txn)
+      occurrences = idle_cleanup_occurrences_in_txn(txn, wake.wake_id)
 
       eligible =
         sessions
         |> Map.values()
-        |> Enum.map(&idle_cleanup_candidate_in_txn(txn, &1, snapshot_at, sessions, wake.wake_id))
+        |> Enum.map(
+          &idle_cleanup_candidate_in_txn(
+            txn,
+            &1,
+            snapshot_at,
+            sessions,
+            wake.wake_id,
+            occurrences
+          )
+        )
         |> Enum.reject(&is_nil/1)
 
       dormant = MapSet.new(eligible, & &1.session_key)

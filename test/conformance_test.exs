@@ -1923,6 +1923,8 @@ defmodule Tightbeam.ConformanceSupport do
                          scheduler: scheduler
                        )
 
+              # Wait for the delivery pass the condition nudge queued.
+              :sys.get_state(scheduler)
               assert %{state: "fired", fired_by: "condition"} = Wakes.get(db, park_wake_id)
 
               if kase["kind"] == "legibility" do
