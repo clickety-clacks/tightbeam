@@ -12,13 +12,23 @@ defmodule Tightbeam.DBBackgroundOverloadTest do
   end
 
   test "background passes defer overload from a result, a raise, or a match", %{db: db} do
-    log = capture_log([level: :debug], fn ->
-      assert :deferred = DB.background_pass(fn -> DB.transaction(db, fn _ -> flunk("ran") end) end, :deferred)
-      assert :ok = DB.background_pass(fn -> raise DB.Overloaded end)
-      assert :ok = DB.background_pass(fn -> {:ok, _} = DB.query(db, "SELECT 1") end)
-    end)
+    log =
+      capture_log([level: :debug], fn ->
+        assert :deferred =
+                 DB.background_pass(
+                   fn -> DB.transaction(db, fn _ -> flunk("ran") end) end,
+                   :deferred
+                 )
+
+        assert :ok = DB.background_pass(fn -> raise DB.Overloaded end)
+        assert :ok = DB.background_pass(fn -> {:ok, _} = DB.query(db, "SELECT 1") end)
+      end)
+
     assert length(Regex.scan(~r/background pass deferred/, log)) == 3
-    assert_raise RuntimeError, "unrelated", fn -> DB.background_pass(fn -> raise "unrelated" end) end
+
+    assert_raise RuntimeError, "unrelated", fn ->
+      DB.background_pass(fn -> raise "unrelated" end)
+    end
   end
 
   test "notice drain skips its pass under overload", %{db: db} do

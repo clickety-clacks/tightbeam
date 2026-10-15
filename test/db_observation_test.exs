@@ -178,6 +178,7 @@ defmodule Tightbeam.DBObservationTest do
 
       assert {:ok, []} =
                DB.query(db, "SELECT name FROM sqlite_master WHERE name='secret_sentinel'")
+
       refute inspect(Diagnostics.records()) =~ "secret_sentinel"
     after
       if Process.alive?(db), do: :sys.resume(db)

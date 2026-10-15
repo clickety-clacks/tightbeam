@@ -111,12 +111,14 @@ defmodule Tightbeam.Productions.BubbleSweeper do
       |> Enum.take_while(fn [_seq, ended] -> ended == 1 end)
       |> Enum.map(&hd/1)
 
-    prefix = Enum.reduce_while(prefix, [], fn seq, recognized ->
-      case recognize_one(db, seq) do
-        :ok -> {:cont, [seq | recognized]}
-        _ -> {:halt, recognized}
-      end
-    end) |> Enum.reverse()
+    prefix =
+      Enum.reduce_while(prefix, [], fn seq, recognized ->
+        case recognize_one(db, seq) do
+          :ok -> {:cont, [seq | recognized]}
+          _ -> {:halt, recognized}
+        end
+      end)
+      |> Enum.reverse()
 
     case List.last(prefix) do
       nil ->

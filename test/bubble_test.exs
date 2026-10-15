@@ -27,14 +27,19 @@ defmodule Tightbeam.Productions.BubbleTest do
     def start_link(db), do: GenServer.start_link(__MODULE__, db)
     def init(db), do: {:ok, %{db: db, refuse: true}}
     def handle_call(:allow, _from, state), do: {:reply, :ok, %{state | refuse: false}}
+
     def handle_call({:query, sql, _params} = request, _from, state) do
-      sweep_query? = String.contains?(sql, "production_cursors") or String.contains?(sql, "SELECT seq, endedAt")
+      sweep_query? =
+        String.contains?(sql, "production_cursors") or
+          String.contains?(sql, "SELECT seq, endedAt")
+
       if state.refuse and not sweep_query? do
         {:reply, {:error, %DB.Error{message: "recognition temporarily refused"}}, state}
       else
         {:reply, GenServer.call(state.db, request), state}
       end
     end
+
     def handle_call(request, _from, state), do: {:reply, GenServer.call(state.db, request), state}
   end
 
@@ -939,13 +944,21 @@ defmodule Tightbeam.Productions.BubbleTest do
   test "a failed recognition holds the cursor and succeeds on a later sweep", ctx do
     seq = fail_turn!(ctx.db, "holder")
     proxy = start_supervised!({RecognitionRefusal, ctx.db})
-    sweeper = start_supervised!({Tightbeam.Productions.BubbleSweeper,
-      db: proxy, interval: 3_600_000, name: :"refused_bubble_sweeper_#{ctx.db}"})
+
+    sweeper =
+      start_supervised!(
+        {Tightbeam.Productions.BubbleSweeper,
+         db: proxy, interval: 3_600_000, name: :"refused_bubble_sweeper_#{ctx.db}"}
+      )
+
     assert Tightbeam.Productions.BubbleSweeper.sweep_now(sweeper) == 0
     assert {:ok, []} = DB.query(ctx.db, "SELECT seq FROM production_cursors WHERE name='bubble'")
     assert :ok = GenServer.call(proxy, :allow)
     assert Tightbeam.Productions.BubbleSweeper.sweep_now(sweeper) >= 1
-    assert {:ok, [[cursor]]} = DB.query(ctx.db, "SELECT seq FROM production_cursors WHERE name='bubble'")
+
+    assert {:ok, [[cursor]]} =
+             DB.query(ctx.db, "SELECT seq FROM production_cursors WHERE name='bubble'")
+
     assert cursor >= seq
     assert [[_, _, _, _, _]] = notice_turn(ctx.db, "supervisor")
   end

@@ -97,7 +97,8 @@ defmodule Tightbeam.DB do
         Logger.debug("database overloaded; background pass deferred")
         deferred
 
-      result -> result
+      result ->
+        result
     end
   rescue
     _error in Overloaded ->
@@ -770,25 +771,29 @@ defmodule Tightbeam.DB do
   end
 
   def handle_call({:query, sql, params}, _from, %{conn: conn} = state) do
-    reply = if DBObservation.audit_active?() do
-      commit_phase(conn, fn txn -> Txn.q(txn, sql, params) end, fenced_archetypes(state))
-    else
-      {:ok, run_query(conn, sql, params)}
-    end
+    reply =
+      if DBObservation.audit_active?() do
+        commit_phase(conn, fn txn -> Txn.q(txn, sql, params) end, fenced_archetypes(state))
+      else
+        {:ok, run_query(conn, sql, params)}
+      end
+
     {:reply, reply, state}
   rescue
     e -> {:reply, {:error, e}, state}
   end
 
   def handle_call({:execute, sql}, _from, %{conn: conn} = state) do
-    reply = if DBObservation.audit_active?() do
-      case commit_phase(conn, fn _ -> execute_sql!(conn, sql) end, fenced_archetypes(state)) do
-        {:ok, :ok} -> :ok
-        error -> error
+    reply =
+      if DBObservation.audit_active?() do
+        case commit_phase(conn, fn _ -> execute_sql!(conn, sql) end, fenced_archetypes(state)) do
+          {:ok, :ok} -> :ok
+          error -> error
+        end
+      else
+        execute_sql(conn, sql)
       end
-    else
-      execute_sql(conn, sql)
-    end
+
     {:reply, reply, state}
   end
 
@@ -899,16 +904,30 @@ defmodule Tightbeam.DB do
 
   @impl true
   def handle_cast({:dispatch_audit, audit, handoff, skip?}, %{conn: conn} = state) do
-    case commit_phase(conn, fn txn ->
-      unless skip? do
-        Tightbeam.EventLog.append_event_in_txn(txn, audit.kind, audit.verb, audit.origin,
-          audit.session_key, audit.payload, audit.principal, System.system_time(:millisecond))
-      end
-      if handoff, do: handoff.(txn)
-    end, fenced_archetypes(state)) do
+    case commit_phase(
+           conn,
+           fn txn ->
+             unless skip? do
+               Tightbeam.EventLog.append_event_in_txn(
+                 txn,
+                 audit.kind,
+                 audit.verb,
+                 audit.origin,
+                 audit.session_key,
+                 audit.payload,
+                 audit.principal,
+                 System.system_time(:millisecond)
+               )
+             end
+
+             if handoff, do: handoff.(txn)
+           end,
+           fenced_archetypes(state)
+         ) do
       {:error, _} -> Logger.warning("dispatch audit could not be recorded")
       _ -> :ok
     end
+
     {:noreply, state}
   end
 
@@ -953,6 +972,7 @@ defmodule Tightbeam.DB do
         {explicit, :infinity} -> explicit
         {explicit, inherited} -> min(explicit, inherited)
       end
+
     token = make_ref()
     key = {Txn, :outbox, token}
     Process.put(key, [])
@@ -979,12 +999,17 @@ defmodule Tightbeam.DB do
 
         try do
           Process.put(@commit_phase_key, :callback)
-          changes_before = if DBObservation.audit_active?(), do: Txn.q(txn, "SELECT total_changes()")
+
+          changes_before =
+            if DBObservation.audit_active?(), do: Txn.q(txn, "SELECT total_changes()")
+
           result = DBObservation.callback(fn -> fun.(txn) end)
+
           if changes_before do
             changes_after = Txn.q(txn, "SELECT total_changes()")
             DBObservation.audit_in_txn(txn, changes_after != changes_before)
           end
+
           Process.put(@commit_phase_key, :before_commit)
           Txn.ensure_before_deadline(txn)
           Process.put(@commit_phase_key, :commit)

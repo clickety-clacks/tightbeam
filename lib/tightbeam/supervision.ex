@@ -4293,9 +4293,14 @@ defmodule Tightbeam.Supervision do
 
     idle_cleanup_sweep(state)
   rescue
-    error in DB.Overloaded -> reraise error, __STACKTRACE__
+    error in DB.Overloaded ->
+      reraise error, __STACKTRACE__
+
     error in MatchError ->
-      if match?({:error, %DB.Overloaded{}}, error.term), do: raise(DB.Overloaded), else: reraise(error, __STACKTRACE__)
+      if match?({:error, %DB.Overloaded{}}, error.term),
+        do: raise(DB.Overloaded),
+        else: reraise(error, __STACKTRACE__)
+
     error ->
       best_effort_lifecycle(
         state.db,
@@ -4325,9 +4330,14 @@ defmodule Tightbeam.Supervision do
       {:error, error} -> raise error
     end
   rescue
-    error in DB.Overloaded -> reraise error, __STACKTRACE__
+    error in DB.Overloaded ->
+      reraise error, __STACKTRACE__
+
     error in MatchError ->
-      if match?({:error, %DB.Overloaded{}}, error.term), do: raise(DB.Overloaded), else: reraise(error, __STACKTRACE__)
+      if match?({:error, %DB.Overloaded{}}, error.term),
+        do: raise(DB.Overloaded),
+        else: reraise(error, __STACKTRACE__)
+
     error ->
       best_effort_lifecycle(
         db,
@@ -5367,9 +5377,14 @@ defmodule Tightbeam.Supervision do
   defp evaluate_pass(state, session_key, fun) do
     fun.()
   rescue
-    error in DB.Overloaded -> reraise error, __STACKTRACE__
+    error in DB.Overloaded ->
+      reraise error, __STACKTRACE__
+
     error in MatchError ->
-      if match?({:error, %DB.Overloaded{}}, error.term), do: raise(DB.Overloaded), else: reraise(error, __STACKTRACE__)
+      if match?({:error, %DB.Overloaded{}}, error.term),
+        do: raise(DB.Overloaded),
+        else: reraise(error, __STACKTRACE__)
+
     error ->
       best_effort_lifecycle(
         state.db,

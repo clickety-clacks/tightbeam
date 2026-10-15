@@ -377,12 +377,20 @@ defmodule Tightbeam.Dispatch do
   end
 
   defp invoke_with_audit(handler, call) do
-    previous = Process.put(:tightbeam_dispatch_audit, Map.take(call, [:verb, :origin, :session_key, :principal]))
+    previous =
+      Process.put(
+        :tightbeam_dispatch_audit,
+        Map.take(call, [:verb, :origin, :session_key, :principal])
+      )
+
     Process.delete(:tightbeam_dispatch_audited)
+
     try do
       invoke(handler, call)
     after
-      if previous, do: Process.put(:tightbeam_dispatch_audit, previous), else: Process.delete(:tightbeam_dispatch_audit)
+      if previous,
+        do: Process.put(:tightbeam_dispatch_audit, previous),
+        else: Process.delete(:tightbeam_dispatch_audit)
     end
   end
 
@@ -391,11 +399,21 @@ defmodule Tightbeam.Dispatch do
 
   defp append_event_with_handoff(db, kind, verb, origin, session_key, payload, principal, handoff) do
     audited? = Process.delete(:tightbeam_dispatch_audited) == true
-    audit = %{kind: kind, verb: verb, origin: origin, session_key: session_key,
-      payload: if(kind == "denied" or Publisher.transactional_verb?(verb), do: payload, else: nil), principal: principal}
+
+    audit = %{
+      kind: kind,
+      verb: verb,
+      origin: origin,
+      session_key: session_key,
+      payload:
+        if(kind == "denied" or Publisher.transactional_verb?(verb), do: payload, else: nil),
+      principal: principal
+    }
+
     unless DB.overloaded?(db) do
       GenServer.cast(db, {:dispatch_audit, audit, handoff, audited?})
     end
+
     :ok
   end
 

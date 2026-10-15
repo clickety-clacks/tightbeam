@@ -25,7 +25,15 @@ try do
     end)
 
   assert_receive :writer_holds_owner
-  reader = Task.async(fn -> DB.query(db, "-- read committed rows\n/* independent reader */ SELECT id FROM reader_rows ORDER BY id") end)
+
+  reader =
+    Task.async(fn ->
+      DB.query(
+        db,
+        "-- read committed rows\n/* independent reader */ SELECT id FROM reader_rows ORDER BY id"
+      )
+    end)
+
   assert {:ok, {:ok, [[1]]}} = Task.yield(reader, 1_000)
   send(db, :release_writer)
   assert {:ok, :written} = Task.await(writer)

@@ -488,7 +488,8 @@ defmodule Tightbeam.NoticeBatcher do
           {:ok, target} ->
             {[{target, wake_id} | targets], deferred}
 
-          {:error, %DB.Overloaded{} = error} -> raise error
+          {:error, %DB.Overloaded{} = error} ->
+            raise error
 
           {:error, error} ->
             reason =
@@ -528,7 +529,8 @@ defmodule Tightbeam.NoticeBatcher do
           {:ok, _} ->
             []
 
-          {:error, %DB.Overloaded{} = error} -> raise error
+          {:error, %DB.Overloaded{} = error} ->
+            raise error
 
           {:error, error} ->
             Logger.error(
