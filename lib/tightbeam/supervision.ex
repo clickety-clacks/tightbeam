@@ -4524,22 +4524,29 @@ defmodule Tightbeam.Supervision do
           "principal" => "process:tightbeam"
         })
       )
-      Txn.q(txn, """
-      INSERT INTO idle_cleanup_observations(wakeId,sessionKey,observedOrder)
-      SELECT ?1,?2,MAX(id) FROM lifecycle_events
-      WHERE kind='idle_cleanup_pending_observed' AND subject=?1
-      """, [wake_id, session_key])
+
+      Txn.q(
+        txn,
+        """
+        INSERT INTO idle_cleanup_observations(wakeId,sessionKey) VALUES(?1,?2)
+        """,
+        [wake_id, session_key]
+      )
     end)
   end
 
   defp idle_cleanup_occurrences_in_txn(_txn, ignored_wake), do: ignored_wake
 
   defp idle_cleanup_occurrence(txn, ignored_wake, session_key) do
-    Txn.q(txn, """
-    SELECT wakeId FROM idle_cleanup_observations
-    WHERE sessionKey=?1 AND (?2 IS NULL OR wakeId<>?2)
-    ORDER BY observedOrder DESC LIMIT 1
-    """, [session_key, ignored_wake])
+    Txn.q(
+      txn,
+      """
+      SELECT wakeId FROM idle_cleanup_observations
+      WHERE sessionKey=?1 AND (?2 IS NULL OR wakeId<>?2)
+      ORDER BY observedOrder DESC LIMIT 1
+      """,
+      [session_key, ignored_wake]
+    )
     |> JSON.encode!()
   end
 
@@ -4760,10 +4767,14 @@ defmodule Tightbeam.Supervision do
   end
 
   defp idle_cleanup_pending_group_in_txn(txn, group_digest) do
-    Txn.q(txn, """
-    SELECT 1 FROM wakes WHERE state='pending' AND consumer='prompt'
-      AND idleCleanupGroup=?1 LIMIT 1
-    """, [group_digest]) != []
+    Txn.q(
+      txn,
+      """
+      SELECT 1 FROM wakes WHERE state='pending' AND consumer='prompt'
+        AND idleCleanupGroup=?1 LIMIT 1
+      """,
+      [group_digest]
+    ) != []
   end
 
   defp idle_cleanup_claim_group_in_txn(
@@ -4862,7 +4873,10 @@ defmodule Tightbeam.Supervision do
                   {:suppressed, gate}
               end
 
-            Txn.q(txn, "UPDATE wakes SET idleCleanupGroup=?2 WHERE wakeId=?1", [wake_id, group_digest])
+            Txn.q(txn, "UPDATE wakes SET idleCleanupGroup=?2 WHERE wakeId=?1", [
+              wake_id,
+              group_digest
+            ])
 
             case result do
               {:suppressed, gate} ->
@@ -4952,80 +4966,142 @@ defmodule Tightbeam.Supervision do
   # The wake marker makes retries and the historical copy idempotent.
   @doc false
   def record_idle_cleanup_delivery_in_txn(txn, wake_id) do
-    case Txn.q(txn, """
-         SELECT firedAt,obligationRef FROM wakes w
-         WHERE wakeId=?1 AND origin='process:tightbeam' AND state='fired'
-           AND idleCleanupRecorded=0 AND (
-             EXISTS(SELECT 1 FROM turns WHERE wakeId=w.wakeId) OR
-             EXISTS(SELECT 1 FROM notice_batch_members m
-                    JOIN notice_batches b ON b.batchId=m.batchId
-                    JOIN turns t ON t.wakeId=b.deliveryWakeId
-                    WHERE m.sourceWakeId=w.wakeId AND m.state='included'))
-         """, [wake_id]) do
+    case Txn.q(
+           txn,
+           """
+           SELECT firedAt,obligationRef FROM wakes w
+           WHERE wakeId=?1 AND origin='process:tightbeam' AND state='fired'
+             AND idleCleanupRecorded=0 AND (
+               EXISTS(SELECT 1 FROM turns WHERE wakeId=w.wakeId) OR
+               EXISTS(SELECT 1 FROM notice_batch_members m
+                      JOIN notice_batches b ON b.batchId=m.batchId
+                      JOIN turns t ON t.wakeId=b.deliveryWakeId
+                      WHERE m.sourceWakeId=w.wakeId AND m.state='included'))
+           """,
+           [wake_id]
+         ) do
       [[at, @idle_cleanup_prefix <> _ = ref]] when is_integer(at) ->
         case idle_cleanup_metadata(ref) do
           {:ok, metadata} ->
             group = idle_cleanup_digest("idle-cleanup-group-v1\0" <> metadata["group"])
+
             Enum.each(metadata["members"], fn {session, token} ->
-              Txn.q(txn, """
-              INSERT INTO idle_cleanup_state
-                (sessionKey,groupDigest,memberToken,deliveredCount,lastDeliveredAt,deliveredDepth,deliveredMain)
-              VALUES(?1,?2,?3,1,?4,?5,?6)
-              ON CONFLICT(groupDigest,memberToken) DO UPDATE SET
-                deliveredCount=deliveredCount+1,
-                lastDeliveredAt=MAX(lastDeliveredAt,excluded.lastDeliveredAt),
-                deliveredDepth=MAX(deliveredDepth,excluded.deliveredDepth),
-                deliveredMain=MAX(deliveredMain,excluded.deliveredMain)
-              """, [session, group, token, at, metadata["depth"], if(metadata["main"], do: 1, else: 0)])
+              Txn.q(
+                txn,
+                """
+                INSERT INTO idle_cleanup_state
+                  (sessionKey,groupDigest,memberToken,deliveredCount,lastDeliveredAt,deliveredDepth,deliveredMain)
+                VALUES(?1,?2,?3,1,?4,?5,?6)
+                ON CONFLICT(groupDigest,memberToken) DO UPDATE SET
+                  deliveredCount=deliveredCount+1,
+                  lastDeliveredAt=MAX(lastDeliveredAt,excluded.lastDeliveredAt),
+                  deliveredDepth=MAX(deliveredDepth,excluded.deliveredDepth),
+                  deliveredMain=MAX(deliveredMain,excluded.deliveredMain)
+                """,
+                [
+                  session,
+                  group,
+                  token,
+                  at,
+                  metadata["depth"],
+                  if(metadata["main"], do: 1, else: 0)
+                ]
+              )
             end)
+
             Txn.q(txn, "UPDATE wakes SET idleCleanupRecorded=1 WHERE wakeId=?1", [wake_id])
+
           :error ->
             Logger.warning("invalid idle cleanup delivery metadata for wake #{wake_id}")
             idle_cleanup_refusal_in_txn(txn, wake_id, :invalid_delivery_metadata)
         end
-      _ -> :ok
+
+      _ ->
+        :ok
     end
+
     :ok
   end
 
   @doc false
   def backfill_idle_cleanup_in_txn(txn) do
-    case Txn.q(txn, "SELECT wakeCursor,observationCursor FROM supervision_state_migration WHERE id=0 AND complete=0") do
-      [] -> true
+    case Txn.q(
+           txn,
+           "SELECT wakeCursor,observationCursor FROM supervision_state_migration WHERE id=0 AND complete=0"
+         ) do
+      [] ->
+        true
+
       [[wake_cursor, observation_cursor]] ->
-        wakes = Txn.q(txn, "SELECT rowid,wakeId,obligationRef FROM wakes WHERE rowid>?1 ORDER BY rowid LIMIT 1000", [wake_cursor])
+        wakes =
+          Txn.q(
+            txn,
+            "SELECT rowid,wakeId,obligationRef FROM wakes WHERE rowid>?1 ORDER BY rowid LIMIT 1000",
+            [wake_cursor]
+          )
+
         Enum.each(wakes, fn
           [_rowid, wake_id, @idle_cleanup_prefix <> _ = ref] ->
             case idle_cleanup_metadata(ref) do
               {:ok, metadata} ->
                 group = idle_cleanup_digest("idle-cleanup-group-v1\0" <> metadata["group"])
-                Txn.q(txn, "UPDATE wakes SET idleCleanupGroup=?2 WHERE wakeId=?1", [wake_id, group])
+
+                Txn.q(txn, "UPDATE wakes SET idleCleanupGroup=?2 WHERE wakeId=?1", [
+                  wake_id,
+                  group
+                ])
+
                 record_idle_cleanup_delivery_in_txn(txn, wake_id)
+
               :error ->
                 Logger.warning("invalid idle cleanup metadata for wake #{wake_id}")
                 idle_cleanup_refusal_in_txn(txn, wake_id, :invalid_delivery_metadata)
             end
-          _ -> :ok
+
+          _ ->
+            :ok
         end)
-        observations = Txn.q(txn, """
-        SELECT id,subject,detail FROM lifecycle_events
-        WHERE kind='idle_cleanup_pending_observed' AND id>?1 ORDER BY id LIMIT 1000
-        """, [observation_cursor])
+
+        observations =
+          Txn.q(
+            txn,
+            """
+            SELECT id,subject,detail FROM lifecycle_events
+            WHERE kind='idle_cleanup_pending_observed' AND id>?1 ORDER BY id LIMIT 1000
+            """,
+            [observation_cursor]
+          )
+
         Enum.each(observations, fn [id, wake_id, detail] ->
           case JSON.decode(detail || "") do
             {:ok, %{"session" => session}} when is_binary(session) ->
-              Txn.q(txn, "INSERT OR IGNORE INTO idle_cleanup_observations(wakeId,sessionKey,observedOrder) VALUES(?1,?2,?3)", [wake_id, session, id])
+              Txn.q(
+                txn,
+                "INSERT OR IGNORE INTO idle_cleanup_observations(wakeId,sessionKey,observedOrder) VALUES(?1,?2,?3)",
+                [wake_id, session, id]
+              )
+
             _ ->
               Logger.warning("invalid idle cleanup observation #{id}")
               idle_cleanup_refusal_in_txn(txn, wake_id, :invalid_observation_metadata)
           end
         end)
-        complete = length(wakes)<1000 and length(observations)<1000
-        Txn.q(txn, "UPDATE supervision_state_migration SET wakeCursor=?1,observationCursor=?2,complete=?3 WHERE id=0", [
-          if(wakes==[], do: wake_cursor, else: wakes |> List.last() |> hd()),
-          if(observations==[], do: observation_cursor, else: observations |> List.last() |> hd()),
-          if(complete, do: 1, else: 0)
-        ])
+
+        complete = length(wakes) < 1000 and length(observations) < 1000
+
+        Txn.q(
+          txn,
+          "UPDATE supervision_state_migration SET wakeCursor=?1,observationCursor=?2,complete=?3 WHERE id=0",
+          [
+            if(wakes == [], do: wake_cursor, else: wakes |> List.last() |> hd()),
+            if(observations == [],
+              do: observation_cursor,
+              else: observations |> List.last() |> hd()
+            ),
+            if(complete, do: 1, else: 0)
+          ]
+        )
+
         complete
     end
   end
@@ -5254,31 +5330,47 @@ defmodule Tightbeam.Supervision do
 
   @doc false
   def sweep_unclassified_terminals(db) do
-    {:ok, :ok} = DB.transaction(db, fn txn ->
-      rows = Txn.q(txn, """
-      SELECT t.seq,t.endedAt FROM turns t
-      WHERE t.seq > COALESCE((SELECT MAX(lastTurnSeq,firstTurnSeq-1)
-                             FROM patrol_failure_boundary WHERE id=0),9223372036854775807)
-      ORDER BY t.seq LIMIT 256
-      """)
-      Enum.each(rows, fn [seq, ended_at] ->
-        if ended_at do
-          :ok = Txn.exec(txn, "SAVEPOINT classify_terminal")
-          try do
-            classify_terminal_in_txn(txn, seq)
-            :ok = Txn.exec(txn, "RELEASE classify_terminal")
-          rescue
-            error ->
-              :ok = Txn.exec(txn, "ROLLBACK TO classify_terminal")
+    {:ok, :ok} =
+      DB.transaction(db, fn txn ->
+        rows =
+          Txn.q(txn, """
+          SELECT t.seq,t.endedAt FROM turns t
+          WHERE t.seq > COALESCE((SELECT MAX(lastTurnSeq,firstTurnSeq-1)
+                                 FROM patrol_failure_boundary WHERE id=0),9223372036854775807)
+          ORDER BY t.seq LIMIT 256
+          """)
+
+        Enum.each(rows, fn [seq, ended_at] ->
+          if ended_at do
+            :ok = Txn.exec(txn, "SAVEPOINT classify_terminal")
+
+            try do
+              classify_terminal_in_txn(txn, seq)
               :ok = Txn.exec(txn, "RELEASE classify_terminal")
-              Logger.warning("terminal classification refused for turn #{seq}: #{Exception.message(error)}")
-              EventLog.lifecycle_in_txn(txn, "supervision_terminal_refused", Integer.to_string(seq), Exception.message(error))
+            rescue
+              error ->
+                :ok = Txn.exec(txn, "ROLLBACK TO classify_terminal")
+                :ok = Txn.exec(txn, "RELEASE classify_terminal")
+
+                Logger.warning(
+                  "terminal classification refused for turn #{seq}: #{Exception.message(error)}"
+                )
+
+                EventLog.lifecycle_in_txn(
+                  txn,
+                  "supervision_terminal_refused",
+                  Integer.to_string(seq),
+                  Exception.message(error)
+                )
+            end
           end
-        end
-        Txn.q(txn, "UPDATE patrol_failure_boundary SET lastTurnSeq=?1 WHERE id=0", [seq])
+
+          Txn.q(txn, "UPDATE patrol_failure_boundary SET lastTurnSeq=?1 WHERE id=0", [seq])
+        end)
+
+        :ok
       end)
-      :ok
-    end)
+
     :ok
   end
 

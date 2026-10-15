@@ -278,7 +278,11 @@ defmodule Tightbeam.SupervisionTest do
       delivery_plan = Enum.map(delivery_rows, &List.last/1)
       IO.puts("idle-cleanup delivery-history plan: " <> Enum.join(delivery_plan, " | "))
 
-      assert Enum.any?(delivery_plan, &String.contains?(&1, "sqlite_autoindex_idle_cleanup_state"))
+      assert Enum.any?(
+               delivery_plan,
+               &String.contains?(&1, "sqlite_autoindex_idle_cleanup_state")
+             )
+
       refute Enum.any?(delivery_plan, &Regex.match?(~r/^SCAN /, &1))
       assert {:ok, []} = DB.query(ctx.db, Supervision.idle_cleanup_delivery_history_sql(), params)
     end
@@ -615,9 +619,11 @@ defmodule Tightbeam.SupervisionTest do
         "UPDATE wakes SET state='fired',firedAt=?2 WHERE wakeId=?1",
         [first.wake_id, System.system_time(:millisecond) - 2_000]
       )
-    assert {:ok, :ok} = DB.transaction(ctx.db, fn txn ->
-      Supervision.record_idle_cleanup_delivery_in_txn(txn, first.wake_id)
-    end)
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               Supervision.record_idle_cleanup_delivery_in_txn(txn, first.wake_id)
+             end)
 
     {:ok, _} =
       DB.query(
@@ -1085,7 +1091,12 @@ defmodule Tightbeam.SupervisionTest do
     name = start_liveness!(ctx, prod_limit: 1, sweep_ms: 60_000, name: :idle_occurrence)
     [batch] = idle_cleanup_wakes(ctx.db)
     assert :appended = admit_supervision_wake!(ctx.db, batch)
-    assert {:ok, [[1, 0]]} = DB.query(ctx.db, "SELECT deliveredCount,deliveredDepth FROM idle_cleanup_state WHERE sessionKey='observed-child'")
+
+    assert {:ok, [[1, 0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT deliveredCount,deliveredDepth FROM idle_cleanup_state WHERE sessionKey='observed-child'"
+             )
 
     _delivery_wake_id =
       assert_direct_supervision_source!(ctx.db, batch, complete_turn: true)
@@ -1400,7 +1411,11 @@ defmodule Tightbeam.SupervisionTest do
         wake.wake_id,
         System.system_time(:millisecond) - 61_000
       ])
-    {:ok, _} = DB.query(db, "UPDATE idle_cleanup_state SET lastDeliveredAt=?1", [System.system_time(:millisecond) - 61_000])
+
+    {:ok, _} =
+      DB.query(db, "UPDATE idle_cleanup_state SET lastDeliveredAt=?1", [
+        System.system_time(:millisecond) - 61_000
+      ])
   end
 
   defp idle_cleanup_scheduler!(ctx) do
@@ -2798,6 +2813,24 @@ defmodule Tightbeam.SupervisionTest do
 
     assert %{supervisionGeneration: 13, supervisionBasisKind: "liveness_receipt"} =
              Supervision.prod_state(ctx.db, "asg_1")
+  end
+
+  test "scheduled controller records its wake ending when delivered", ctx do
+    terminal_seq = terminal!(ctx.db, "holder")
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0, interval: 60_000)
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", terminal_seq)
+    assert [controller] = Wakes.list_pending(ctx.db)
+    assert :appended = admit_supervision_wake!(ctx.db, controller)
+    assert {:ok, [["fired"]]} = DB.query(ctx.db, "SELECT endedWakeState FROM supervision_liveness_sidecar WHERE wakeId=?1", [controller.wake_id])
+  end
+
+  test "scheduled controller records its wake ending when canceled", ctx do
+    terminal_seq = terminal!(ctx.db, "holder")
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0, interval: 60_000)
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", terminal_seq)
+    assert [controller] = Wakes.list_pending(ctx.db)
+    cancel_wake!(ctx.db, controller)
+    assert {:ok, [["canceled"]]} = DB.query(ctx.db, "SELECT endedWakeState FROM supervision_liveness_sidecar WHERE wakeId=?1", [controller.wake_id])
   end
 
   test "missing entitlement recovery preserves a coherent generation-12 controller lineage",

@@ -1729,63 +1729,67 @@ defmodule Tightbeam.Schema do
   # This additive marker is independent of the predecessor shape migrations.
   # Historical data is copied in bounded batches by the existing sweep.
   defp migrate_supervision_recorded_state(db) do
-    {:ok, :ok} = DB.transaction(db, fn txn ->
-      Txn.exec(txn, """
-      CREATE TABLE IF NOT EXISTS supervision_state_migration (
-        id INTEGER PRIMARY KEY CHECK(id=0), wakeCursor INTEGER NOT NULL DEFAULT 0,
-        observationCursor INTEGER NOT NULL DEFAULT 0, complete INTEGER NOT NULL DEFAULT 0
-      )
-      """)
-
-      if Txn.q(txn, "SELECT 1 FROM supervision_state_migration WHERE id=0") == [] do
-        :ok = Txn.exec(txn, """
-        CREATE TABLE idle_cleanup_state (
-          sessionKey TEXT NOT NULL, groupDigest TEXT NOT NULL, memberToken TEXT NOT NULL,
-          deliveredCount INTEGER NOT NULL, lastDeliveredAt INTEGER NOT NULL,
-          deliveredDepth INTEGER NOT NULL, deliveredMain INTEGER NOT NULL,
-          PRIMARY KEY(groupDigest,memberToken)
-        );
-        CREATE TABLE idle_cleanup_observations (
-          wakeId TEXT PRIMARY KEY, sessionKey TEXT NOT NULL, observedOrder INTEGER NOT NULL
-        );
-        CREATE INDEX idle_cleanup_observations_session
-          ON idle_cleanup_observations(sessionKey,observedOrder DESC);
-        ALTER TABLE wakes ADD COLUMN idleCleanupGroup TEXT;
-        ALTER TABLE wakes ADD COLUMN idleCleanupRecorded INTEGER NOT NULL DEFAULT 0;
-        CREATE INDEX idle_cleanup_pending_group ON wakes(idleCleanupGroup)
-          WHERE state='pending' AND consumer='prompt';
-        ALTER TABLE supervision_liveness_sidecar ADD COLUMN endedWakeState TEXT;
-        CREATE INDEX supervision_liveness_ended_controller
-          ON supervision_liveness_sidecar(assignmentId,wakeId)
-          WHERE controllerOrigin='scheduled' AND controllerState='pending'
-            AND endedWakeState IS NOT NULL;
-        UPDATE supervision_liveness_sidecar SET endedWakeState=(
-          SELECT state FROM wakes WHERE wakeId=supervision_liveness_sidecar.wakeId
-            AND state IN ('fired','canceled'))
-          WHERE controllerOrigin='scheduled' AND controllerState='pending';
-        CREATE TRIGGER supervision_record_controller_end AFTER UPDATE OF state ON wakes
-        WHEN NEW.state IN ('fired','canceled') AND OLD.state<>NEW.state
-        BEGIN
-          UPDATE supervision_liveness_sidecar SET endedWakeState=NEW.state
-          WHERE wakeId=NEW.wakeId AND controllerOrigin='scheduled';
-        END;
-        ALTER TABLE patrol_failure_boundary ADD COLUMN lastTurnSeq INTEGER NOT NULL DEFAULT 0;
-        CREATE TRIGGER patrol_terminal_checkpoint_rewind AFTER UPDATE OF endedAt ON turns
-        WHEN NEW.endedAt IS NOT NULL AND OLD.endedAt IS NULL
-        BEGIN
-          UPDATE patrol_failure_boundary SET lastTurnSeq=MIN(lastTurnSeq,NEW.seq-1) WHERE id=0;
-        END;
-        CREATE TRIGGER patrol_terminal_checkpoint_insert AFTER INSERT ON turns
-        WHEN NEW.endedAt IS NOT NULL
-        BEGIN
-          UPDATE patrol_failure_boundary SET lastTurnSeq=MIN(lastTurnSeq,NEW.seq-1) WHERE id=0;
-        END;
-        INSERT INTO supervision_state_migration(id,complete)
-        SELECT 0,NOT EXISTS(SELECT 1 FROM wakes);
+    {:ok, :ok} =
+      DB.transaction(db, fn txn ->
+        Txn.exec(txn, """
+        CREATE TABLE IF NOT EXISTS supervision_state_migration (
+          id INTEGER PRIMARY KEY CHECK(id=0), wakeCursor INTEGER NOT NULL DEFAULT 0,
+          observationCursor INTEGER NOT NULL DEFAULT 0, complete INTEGER NOT NULL DEFAULT 0
+        )
         """)
-      end
-      :ok
-    end)
+
+        if Txn.q(txn, "SELECT 1 FROM supervision_state_migration WHERE id=0") == [] do
+          :ok =
+            Txn.exec(txn, """
+            CREATE TABLE idle_cleanup_state (
+              sessionKey TEXT NOT NULL, groupDigest TEXT NOT NULL, memberToken TEXT NOT NULL,
+              deliveredCount INTEGER NOT NULL, lastDeliveredAt INTEGER NOT NULL,
+              deliveredDepth INTEGER NOT NULL, deliveredMain INTEGER NOT NULL,
+              PRIMARY KEY(groupDigest,memberToken)
+            );
+            CREATE TABLE idle_cleanup_observations (
+              observedOrder INTEGER PRIMARY KEY AUTOINCREMENT, wakeId TEXT NOT NULL UNIQUE, sessionKey TEXT NOT NULL
+            );
+            CREATE INDEX idle_cleanup_observations_session
+              ON idle_cleanup_observations(sessionKey,observedOrder DESC);
+            ALTER TABLE wakes ADD COLUMN idleCleanupGroup TEXT;
+            ALTER TABLE wakes ADD COLUMN idleCleanupRecorded INTEGER NOT NULL DEFAULT 0;
+            CREATE INDEX idle_cleanup_pending_group ON wakes(idleCleanupGroup)
+              WHERE state='pending' AND consumer='prompt';
+            ALTER TABLE supervision_liveness_sidecar ADD COLUMN endedWakeState TEXT;
+            CREATE INDEX supervision_liveness_ended_controller
+              ON supervision_liveness_sidecar(assignmentId,wakeId)
+              WHERE controllerOrigin='scheduled' AND controllerState='pending'
+                AND endedWakeState IS NOT NULL;
+            UPDATE supervision_liveness_sidecar SET endedWakeState=(
+              SELECT state FROM wakes WHERE wakeId=supervision_liveness_sidecar.wakeId
+                AND state IN ('fired','canceled'))
+              WHERE controllerOrigin='scheduled' AND controllerState='pending';
+            CREATE TRIGGER supervision_record_controller_end AFTER UPDATE OF state ON wakes
+            WHEN NEW.state IN ('fired','canceled') AND OLD.state<>NEW.state
+            BEGIN
+              UPDATE supervision_liveness_sidecar SET endedWakeState=NEW.state
+              WHERE wakeId=NEW.wakeId AND controllerOrigin='scheduled';
+            END;
+            ALTER TABLE patrol_failure_boundary ADD COLUMN lastTurnSeq INTEGER NOT NULL DEFAULT 0;
+            CREATE TRIGGER patrol_terminal_checkpoint_rewind AFTER UPDATE OF endedAt ON turns
+            WHEN NEW.endedAt IS NOT NULL AND OLD.endedAt IS NULL
+            BEGIN
+              UPDATE patrol_failure_boundary SET lastTurnSeq=MIN(lastTurnSeq,NEW.seq-1) WHERE id=0;
+            END;
+            CREATE TRIGGER patrol_terminal_checkpoint_insert AFTER INSERT ON turns
+            WHEN NEW.endedAt IS NOT NULL
+            BEGIN
+              UPDATE patrol_failure_boundary SET lastTurnSeq=MIN(lastTurnSeq,NEW.seq-1) WHERE id=0;
+            END;
+            INSERT INTO supervision_state_migration(id,complete)
+            SELECT 0,NOT EXISTS(SELECT 1 FROM wakes);
+            """)
+        end
+
+        :ok
+      end)
+
     :ok
   end
 
