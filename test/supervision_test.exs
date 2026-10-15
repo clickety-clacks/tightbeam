@@ -221,10 +221,15 @@ defmodule Tightbeam.SupervisionTest do
 
   test "canceling a blocking wake arms the newly eligible cleanup deadline", ctx do
     idle_cleanup_fixture!(ctx, ["waiting-cleanup"])
-    wake = Wakes.schedule(ctx.db, %{
-      session_key: "waiting-cleanup", origin: "system", prompt: "later",
-      due_at: System.system_time(:millisecond) + 3_600_000
-    })
+
+    wake =
+      Wakes.schedule(ctx.db, %{
+        session_key: "waiting-cleanup",
+        origin: "system",
+        prompt: "later",
+        due_at: System.system_time(:millisecond) + 3_600_000
+      })
+
     start_liveness!(ctx, sweep_ms: 60_000, name: Supervision)
     assert idle_cleanup_wakes(ctx.db) == []
     cancel_wake!(ctx.db, wake)
