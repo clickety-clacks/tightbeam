@@ -202,7 +202,8 @@ defmodule Tightbeam.RecognitionRetryTest do
 
   test "a failed inline callback arms its retry from the committed row", %{db: db, retry: retry} do
     parent = self()
-    calls = :atomics.new(1, [])
+    gate = Path.join(System.tmp_dir!(), "automatic-recognition-" <> Tightbeam.Id.uuid4())
+    on_exit(fn -> File.rm(gate) end)
     old = Application.get_env(:tightbeam, :db_call_timeout_ms)
     Application.put_env(:tightbeam, :db_call_timeout_ms, 500)
 
@@ -214,7 +215,7 @@ defmodule Tightbeam.RecognitionRetryTest do
 
     assert {:ok, :committed} =
              DB.transaction_then(db, fn _ -> :committed end, fn _ ->
-               if :atomics.add_get(calls, 1, 1) == 1, do: raise("first attempt")
+               if not File.exists?(gate), do: raise("first attempt")
                send(parent, :automatic_retry)
                :recognized
              end)
@@ -223,6 +224,7 @@ defmodule Tightbeam.RecognitionRetryTest do
     assert state.timer != nil
     assert {:ok, [[next_at]]} = DB.query(db, "SELECT nextAt FROM pending_recognition")
     assert next_at <= System.system_time(:millisecond) + 500
+    File.write!(gate, "ready")
     assert_receive :automatic_retry, 1_500
     assert :sys.get_state(retry).timer == nil
     assert {:ok, []} = DB.query(db, "SELECT id FROM pending_recognition")
