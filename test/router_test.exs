@@ -1500,6 +1500,22 @@ defmodule Tightbeam.Wire.RouterTest do
     assert body["schedulerMisses"] - before == 0
   end
 
+  test "/version reports recorded event misses with bounded recent details", ctx do
+    before = Tightbeam.SchedulerMisses.health()
+    for n <- 1..25, do: Tightbeam.SchedulerMisses.record(:wake, "doctor-miss-#{n}", n * 1_000)
+    response = Router.call(conn(:get, "/version"), Router.init(ctx.opts))
+    body = JSON.decode!(response.resp_body)
+    health = body["eventPaths"]
+    assert body["schedulerMisses"] - before.count == 25
+    assert health["count"] == body["schedulerMisses"]
+    assert health["by_loop"]["wake"] - before.by_loop.wake == 25
+    assert length(health["recent"]) == 20
+    assert hd(health["recent"])["record_id"] == "doctor-miss-25"
+    assert hd(health["recent"])["late_ms"] == 25_000
+    assert hd(health["recent"])["loop"] == "wake"
+    assert is_integer(hd(health["recent"])["at"])
+  end
+
   test "CLI exact-version refusal is loud after bearer authentication", ctx do
     body = JSON.encode!(%{verb: "inspect", asUser: "flynn", params: %{}})
 

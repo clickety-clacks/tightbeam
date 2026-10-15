@@ -203,11 +203,12 @@ defmodule Tightbeam.Recognition do
         DB.background_pass(fn ->
           case DB.query(
                  state.db,
-                 "SELECT id FROM pending_recognition WHERE flagged=0 AND nextAt<?1",
+                 "SELECT id, nextAt FROM pending_recognition WHERE flagged=0 AND nextAt<?1",
                  [now() - 60_000]
                ) do
             {:ok, rows} ->
-              for [id] <- rows, do: Tightbeam.SchedulerMisses.record(:recognition, id)
+              for [id, next_at] <- rows,
+                do: Tightbeam.SchedulerMisses.record(:recognition, id, max(0, now() - next_at))
               retry_pass(state)
 
             {:error, error} ->

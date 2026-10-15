@@ -8009,7 +8009,7 @@ defmodule Tightbeam.Wakes do
         "wake scheduler miss wake=#{wake.wake_id} kind=#{wake.condition_kind || wake.wait_mode || wake.consumer} late_ms=#{at - wake.due_at}"
       )
 
-      Tightbeam.SchedulerMisses.record(:wake, wake.wake_id)
+      Tightbeam.SchedulerMisses.record(:wake, wake.wake_id, max(0, at - wake.due_at))
 
       try do
         deliver_eligible_waits(state.db, state.delivery_opts, recipient)
