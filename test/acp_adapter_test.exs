@@ -2154,7 +2154,8 @@ defmodule Tightbeam.Acp.AdapterTest do
       :sys.replace_state(adapter, fn state ->
         %{
           state
-          | on_guidance: fn _, _ ->
+          | config_options: %{"sess-1" => [%{"id" => "model", "currentValue" => "haiku"}]},
+            on_guidance: fn _, _ ->
               send(owner, {:guidance_started, self()})
 
               receive do
@@ -2195,8 +2196,60 @@ defmodule Tightbeam.Acp.AdapterTest do
       after_setup = :sys.get_state(adapter)
       assert after_setup.context_usage["sess-1"] == during.context_usage["sess-1"]
       assert after_setup.config_options["sess-1"] == during.config_options["sess-1"]
-      assert after_setup.switchable_models["sess-1"] == during.switchable_models["sess-1"]
+      assert is_nil(during.switchable_models["sess-1"])
+      assert [_ | _] = after_setup.switchable_models["sess-1"]
       assert Adapter.knows_session?(adapter, "sess-1")
+    end
+  end
+
+  for operation <- [:new, :load] do
+    @operation operation
+    test "#{operation} retains response capabilities when only usage is notified" do
+      {adapter, _} = start_adapter(fail_mode: "fast-live")
+      owner = self()
+
+      :sys.replace_state(adapter, fn state ->
+        %{
+          state
+          | on_guidance: fn _, _ ->
+              send(owner, {:guidance_started, self()})
+
+              receive do
+                :continue -> :ok
+              end
+            end
+        }
+      end)
+
+      caller =
+        Task.async(fn ->
+          case @operation do
+            :new -> Adapter.new_session(adapter, nil, "/tmp", [], "guidance")
+            :load -> Adapter.load_session(adapter, "sess-1", nil, "/tmp", [], "guidance")
+          end
+        end)
+
+      assert_receive {:guidance_started, worker}, 2_000
+
+      for {sid, update} <- [
+            {"sess-1", %{"sessionUpdate" => "usage_update", "used" => 3000, "size" => 10000}},
+            {"other", %{"sessionUpdate" => "config_option_update", "configOptions" => []}}
+          ] do
+        send(
+          adapter,
+          {:acp_notification, "session/update", %{"sessionId" => sid, "update" => update}}
+        )
+      end
+
+      during = :sys.get_state(adapter)
+      send(worker, :continue)
+      assert {:ok, "sess-1"} = Task.await(caller, 5_000)
+      after_setup = :sys.get_state(adapter)
+      assert after_setup.context_usage["sess-1"] == during.context_usage["sess-1"]
+      assert {:ok, %{used: 3000, size: 10000}} = after_setup.context_usage["sess-1"]
+      assert {:ok, %{fast: "off"}} = Adapter.fast_status(adapter, "sess-1")
+      assert {:ok, [_ | _]} = Adapter.switchable_models(adapter, "sess-1")
+      assert after_setup.config_options["other"] == []
     end
   end
 

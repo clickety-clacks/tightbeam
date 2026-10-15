@@ -606,7 +606,7 @@ defmodule Tightbeam.Acp.Adapter do
 
       monitor = Process.monitor(pid)
 
-      operation = %{pid: pid, monitor: monitor, from: from}
+      operation = %{pid: pid, monitor: monitor, from: from, notified_fields: MapSet.new()}
       {:noreply, %{state | operations: Map.put(state.operations, key, operation)}}
     end
   end
@@ -644,9 +644,6 @@ defmodule Tightbeam.Acp.Adapter do
 
     fields =
       case {kind, reply} do
-        {kind, {:ok, _}} when kind in [:new_session, :load_session] ->
-          [:known, :models, :unprompted, :chunks]
-
         {:close_session, :ok} ->
           residency ++ [:chunks, :progress]
 
@@ -678,7 +675,10 @@ defmodule Tightbeam.Acp.Adapter do
     {sid, entries, kind == :close_session and reply == :ok}
   end
 
-  defp merge_operation(state, {sid, entries, closed?}) do
+  defp merge_operation(state, {sid, entries, closed?}, notified_fields) do
+    entries =
+      Map.reject(entries, fn {field, _} -> MapSet.member?(notified_fields, {sid, field}) end)
+
     state =
       Enum.reduce(entries, state, fn {field, entry}, acc ->
         current = Map.fetch!(acc, field)
@@ -699,10 +699,20 @@ defmodule Tightbeam.Acp.Adapter do
       else: state
   end
 
+  defp record_notification_fields(state, sid, fields) do
+    operations =
+      Map.new(state.operations, fn {key, operation} ->
+        notified = Enum.reduce(fields, operation.notified_fields, &MapSet.put(&2, {sid, &1}))
+        {key, %{operation | notified_fields: notified}}
+      end)
+
+    %{state | operations: operations}
+  end
+
   defp finish_operation(state, key, operation, reply, updates) do
     Process.demonitor(operation.monitor, [:flush])
     GenServer.reply(operation.from, reply)
-    state = merge_operation(state, updates)
+    state = merge_operation(state, updates, operation.notified_fields)
     drain_operations(%{state | operations: Map.delete(state.operations, key)})
   end
 
@@ -1543,7 +1553,12 @@ defmodule Tightbeam.Acp.Adapter do
 
       if is_binary(text) and Map.has_key?(state.chunks, sid) do
         {:noreply,
-         update_in(state.chunks[sid], &accumulate_assistant_chunk(&1, message_id, text))}
+         state
+         |> update_in(
+           [Access.key(:chunks), sid],
+           &accumulate_assistant_chunk(&1, message_id, text)
+         )
+         |> record_notification_fields(sid, [:chunks])}
       else
         {:noreply, state}
       end
@@ -1924,7 +1939,9 @@ defmodule Tightbeam.Acp.Adapter do
         end
       end)
 
-      put_in(state.progress[sid], {fun, text, seq + 1})
+      state
+      |> put_in([Access.key(:progress), sid], {fun, text, seq + 1})
+      |> record_notification_fields(sid, [:progress])
     else
       _ -> state
     end
@@ -1968,7 +1985,9 @@ defmodule Tightbeam.Acp.Adapter do
         System.monotonic_time(:millisecond)
       )
 
-    put_in(state.context_usage[sid], observation)
+    state
+    |> put_in([Access.key(:context_usage), sid], observation)
+    |> record_notification_fields(sid, [:context_usage])
   end
 
   defp remember_context_usage(state, _sid, _update), do: state
@@ -2236,6 +2255,12 @@ defmodule Tightbeam.Acp.Adapter do
       state
       |> remember_switchable_models(sid, %{"configOptions" => options})
       |> remember_config_options(sid, %{"configOptions" => options})
+      |> record_notification_fields(sid, [:config_options])
+
+    state =
+      if canonical_offered_models(state.preset, %{"configOptions" => options}) == [],
+        do: state,
+        else: record_notification_fields(state, sid, [:switchable_models])
 
     case Map.fetch(state.models, sid) do
       {:ok, %Model{} = cached} ->
@@ -2551,9 +2576,17 @@ defmodule Tightbeam.Acp.Adapter do
 
   defp remember_reported_config_model(state, sid, options) do
     case model_ref_from_config(%{"configOptions" => options}, state.preset.effort_config) do
-      {:ok, model} -> remember_model(state, sid, model)
+      {:ok, model} -> remember_notification_model(state, sid, model)
       :error -> state
     end
+  end
+
+  defp remember_notification_model(state, sid, model) do
+    fields = if state.models[sid] == model, do: [:models], else: [:models, :context_usage]
+
+    state
+    |> remember_model(sid, model)
+    |> record_notification_fields(sid, fields)
   end
 
   defp remember_confirmed_config_model(state, sid, cached, options) do
@@ -2564,7 +2597,7 @@ defmodule Tightbeam.Acp.Adapter do
         effort -> %{cached | effort: effort}
       end
 
-    remember_model(state, sid, model)
+    remember_notification_model(state, sid, model)
   end
 
   defp model_ref_from_config(%{"configOptions" => options}, effort_id)
