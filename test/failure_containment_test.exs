@@ -81,10 +81,15 @@ defmodule Tightbeam.FailureContainmentTest do
         WS.close(ws)
         resumed = subscribe(port, device.token)
 
-        {:ok, _} = DB.query(db, """
-        INSERT INTO work_items(id,title,ownerUserId,state,createdByUser,createdAt)
-        VALUES ('wi_restart','Restart delivery',?1,'open',?1,1)
-        """, [device.user_id])
+        {:ok, _} =
+          DB.query(
+            db,
+            """
+            INSERT INTO work_items(id,title,ownerUserId,state,createdByUser,createdAt)
+            VALUES ('wi_restart','Restart delivery',?1,'open',?1,1)
+            """,
+            [device.user_id]
+          )
 
         notice = %{
           "class" => "work_item.updated",

@@ -378,6 +378,7 @@ defmodule Tightbeam.ModelCatalog do
 
   def handle_info({pid, {:noreply, updated}}, %{background: {pid, ref, _event, versions}} = state) do
     Process.demonitor(ref, [:flush])
+
     entries =
       Enum.reduce(state.versions, updated.entries, fn {key, version}, entries ->
         if version == Map.get(versions, key, 0),
@@ -385,11 +386,21 @@ defmodule Tightbeam.ModelCatalog do
           else: Map.put(entries, key, Map.fetch!(state.entries, key))
       end)
 
-    updated = %{updated | entries: entries, versions: state.versions, background: nil, pending: state.pending}
+    updated = %{
+      updated
+      | entries: entries,
+        versions: state.versions,
+        background: nil,
+        pending: state.pending
+    }
+
     {:noreply, next_background(updated)}
   end
 
-  def handle_info({:DOWN, ref, :process, pid, reason}, %{background: {pid, ref, event, _}} = state) do
+  def handle_info(
+        {:DOWN, ref, :process, pid, reason},
+        %{background: {pid, ref, event, _}} = state
+      ) do
     Logger.warning("model catalog background work failed: #{inspect(reason)}")
     state = %{state | background: nil}
 
@@ -402,7 +413,8 @@ defmodule Tightbeam.ModelCatalog do
 
   def handle_info({:catalog_result, key, version, message}, state) do
     if Map.get(state.versions, key, 0) == version,
-      do: {:noreply, enqueue_background({:info, {:catalog_result, key, version, message}}, state)},
+      do:
+        {:noreply, enqueue_background({:info, {:catalog_result, key, version, message}}, state)},
       else: {:noreply, state}
   end
 
@@ -702,8 +714,11 @@ defmodule Tightbeam.ModelCatalog do
 
       {:ok, _pid} =
         Task.start(fn ->
-          send(owner, {:catalog_result, key, Map.get(snapshot.versions, key, 0),
-            {:catalog_refresh, key, safely_derive(key, probe, snapshot)}})
+          send(
+            owner,
+            {:catalog_result, key, Map.get(snapshot.versions, key, 0),
+             {:catalog_refresh, key, safely_derive(key, probe, snapshot)}}
+          )
         end)
 
       state

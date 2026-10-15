@@ -111,6 +111,7 @@ defmodule Tightbeam.ModelCatalogTest do
         send(parent, :refresh_failed)
         exit(:host_discovery_failed)
       end
+
       Placement.hosts(ctx.base_dir, ctx.db)
     end
 
@@ -135,10 +136,12 @@ defmodule Tightbeam.ModelCatalogTest do
     hosts = fn ->
       if Agent.get(mode, & &1) == :block do
         send(parent, {:refresh_blocked, self()})
+
         receive do
           :release -> :ok
         end
       end
+
       Placement.hosts(ctx.base_dir, ctx.db)
     end
 
@@ -149,8 +152,10 @@ defmodule Tightbeam.ModelCatalogTest do
     send(pid, :refresh_due)
     assert_receive {:refresh_blocked, worker}, 2_000
     ModelCatalog.credential_transition(@host, :anthropic, 1, catalog)
+
     assert {[], {:unavailable, :credential_transition_pending}} =
-      ModelCatalog.get(@host, "claude", catalog)
+             ModelCatalog.get(@host, "claude", catalog)
+
     send(worker, :release)
 
     # A second background job has started, so the old snapshot has completed.

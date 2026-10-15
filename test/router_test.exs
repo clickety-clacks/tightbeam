@@ -3267,7 +3267,9 @@ defmodule Tightbeam.Wire.RouterTest do
 
     start_supervised!(%{
       id: Tightbeam.RuntimeSupervisor,
-      start: {Supervisor, :start_link, [[], [strategy: :one_for_one, name: Tightbeam.RuntimeSupervisor]]}
+      start:
+        {Supervisor, :start_link,
+         [[], [strategy: :one_for_one, name: Tightbeam.RuntimeSupervisor]]}
     })
 
     credential_supervisor =

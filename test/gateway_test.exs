@@ -11353,11 +11353,13 @@ defmodule Tightbeam.GatewayTest do
         other
     end
   end
+
   defp start_runtime_supervisor do
     start_supervised!(%{
       id: Tightbeam.RuntimeSupervisor,
-      start: {Supervisor, :start_link, [[], [strategy: :one_for_one, name: Tightbeam.RuntimeSupervisor]]}
+      start:
+        {Supervisor, :start_link,
+         [[], [strategy: :one_for_one, name: Tightbeam.RuntimeSupervisor]]}
     })
   end
-
 end
