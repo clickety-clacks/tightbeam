@@ -3341,7 +3341,8 @@ defmodule Tightbeam.SupervisionTest do
     assert {:ok, [[^migration_id, 1, "release_upgrade", "process:tightbeam"]]} =
              DB.query(
                ctx.db,
-               "SELECT migrationId,affectedRows,cause,principal FROM supervision_liveness_migrations"
+               "SELECT migrationId,affectedRows,cause,principal FROM supervision_liveness_migrations WHERE migrationId=?1",
+               [migration_id]
              )
 
     # The earlier legacy notice intentionally left the supervisor busy. Finish
@@ -3398,9 +3399,15 @@ defmodule Tightbeam.SupervisionTest do
         [post_receipt.wake_id]
       )
 
-    assert_raise RuntimeError, ~r/invalid_parent_transfer/, fn ->
-      Supervision.recover_liveness!(ctx.db, 60_000)
-    end
+    # Recovery reports the malformed transfer and leaves it untouched instead
+    # of refusing to start.
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        Supervision.recover_liveness!(ctx.db, 60_000)
+      end)
+
+    assert log =~ "supervision recovery skipped assignment asg_post_receipt"
+    assert log =~ "invalid_parent_transfer"
 
     assert {:ok, [["lineage", "holder", 1]]} =
              DB.query(
@@ -3617,6 +3624,105 @@ defmodule Tightbeam.SupervisionTest do
              DB.query(
                ctx.db,
                "SELECT COUNT(*), COUNT(DISTINCT wakeId) FROM turns WHERE assignmentId='asg_1'"
+             )
+  end
+
+  test "startup survives an escalation whose holder was reparented and runs the legacy migration once",
+       ctx do
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO work_items
+          (id, title, ownerUserId, state, createdByUser, createdAt)
+        VALUES ('wi_reparented_holder', 'reparented holder', 'flynn', 'open', 'flynn', 1)
+        """
+      )
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE assignments SET workItemId='wi_reparented_holder' WHERE id='asg_1'"
+      )
+
+    terminal_seq = terminal!(ctx.db, "holder")
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
+
+    assert {:escalated, 1, "supervisor"} =
+             Supervision.evaluate(ctx.db, ctx.handlers, 0, "holder", terminal_seq)
+
+    assert [source_wake] = Wakes.list_pending(ctx.db)
+    assert :appended = admit_supervision_wake!(ctx.db, source_wake)
+
+    # A supported reparent moves the holder under a new, still-active parent.
+    # The escalation's original parent stays active, so the legacy migration
+    # cannot treat it as a retired target.
+    new_parent = session(ctx.db, "new-parent", ctx.main.session_key)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO session_reparent_events
+          (eventId, ownerUserId, childSessionKey, assignmentId, workItemId,
+           originParentSessionKey, previousCurrentParentSessionKey,
+           newCurrentParentSessionKey, originAssignmentOpenerKind,
+           originAssignmentOpenerRef, previousCurrentCoordinationParentSessionKey,
+           newCurrentCoordinationParentSessionKey, cause, principalKind, principalRef,
+           idempotencyKey, requestFingerprint, createdAt)
+        VALUES ('reparent-holder', 'flynn', 'holder', 'asg_1', 'wi_reparented_holder',
+                'supervisor', 'supervisor', ?1, 'user', 'user:flynn', 'supervisor', ?1,
+                'owner_topology_correction', 'user', 'user:flynn', 'reparent-holder',
+                'fingerprint', 2)
+        """,
+        [new_parent.session_key]
+      )
+
+    assert {:ok, [["active"]]} =
+             DB.query(ctx.db, "SELECT state FROM sessions WHERE sessionKey='supervisor'")
+
+    assert {:ok, before_sidecar} =
+             DB.query(
+               ctx.db,
+               "SELECT * FROM supervision_liveness_sidecar WHERE assignmentId='asg_1' ORDER BY wakeId"
+             )
+
+    assert {:ok, before_turns} =
+             DB.query(ctx.db, "SELECT * FROM turns WHERE assignmentId='asg_1' ORDER BY seq")
+
+    log = ExUnit.CaptureLog.capture_log(fn -> start_liveness!(ctx, sweep_ms: 60_000) end)
+    assert log =~ "legacy parent retirement migration skipped assignment asg_1"
+    assert log =~ "legacy_parent_target_not_retired"
+    assert log =~ "supervision recovery skipped assignment asg_1"
+
+    # The assignment is left exactly as it was.
+    assert {:ok, ^before_sidecar} =
+             DB.query(
+               ctx.db,
+               "SELECT * FROM supervision_liveness_sidecar WHERE assignmentId='asg_1' ORDER BY wakeId"
+             )
+
+    assert {:ok, ^before_turns} =
+             DB.query(ctx.db, "SELECT * FROM turns WHERE assignmentId='asg_1' ORDER BY seq")
+
+    assert {:ok, [[0, "release_upgrade", "process:tightbeam"]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT affectedRows, cause, principal FROM supervision_liveness_migrations
+               WHERE migrationId='0.1.9/legacy-parent-retirements-v1'
+               """
+             )
+
+    # A later boot skips the recorded migration and does not re-examine the row.
+    assert :ok = stop_supervised(Supervision)
+    log = ExUnit.CaptureLog.capture_log(fn -> start_liveness!(ctx, sweep_ms: 60_000) end)
+    refute log =~ "legacy parent retirement migration"
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM supervision_liveness_migrations WHERE migrationId='0.1.9/legacy-parent-retirements-v1'"
              )
   end
 
