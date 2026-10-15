@@ -75,7 +75,23 @@ defmodule Tightbeam.Dispatch do
   @spec dispatch(GenServer.server(), handlers(), call()) ::
           {:ok, map()} | {:error, map()} | {:decision_pending, String.t()}
   def dispatch(db \\ Tightbeam.DB, handlers, call) do
-    Process.delete(:tightbeam_dispatch_audited)
+    previous_audit = Process.delete(:tightbeam_dispatch_audit)
+    previous_audited = Process.delete(:tightbeam_dispatch_audited)
+
+    try do
+      dispatch_call(db, handlers, call)
+    after
+      if previous_audit,
+        do: Process.put(:tightbeam_dispatch_audit, previous_audit),
+        else: Process.delete(:tightbeam_dispatch_audit)
+
+      if previous_audited,
+        do: Process.put(:tightbeam_dispatch_audited, previous_audited),
+        else: Process.delete(:tightbeam_dispatch_audited)
+    end
+  end
+
+  defp dispatch_call(db, handlers, call) do
     verb = Map.fetch!(call, :verb)
     origin = Map.fetch!(call, :origin)
     principal = Map.get(call, :principal)
