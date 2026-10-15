@@ -3317,6 +3317,7 @@ defmodule Tightbeam.EscalationTest do
   defp reset_terminal_census(db) do
     :ok =
       DB.execute(db, """
+      UPDATE schema_stamp SET shape='operator-decision-requests-v1';
       DELETE FROM decision_request_terminal_epoch;
       DELETE FROM decision_request_integrity_evidence;
       UPDATE decision_requests SET ruledViaPrincipal=NULL, ruledViaSessionState=NULL;

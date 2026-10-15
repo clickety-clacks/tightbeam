@@ -122,6 +122,9 @@ defmodule Tightbeam.Assignments do
 
   @doc false
   def rebuild_r1_process_close_in_txn(%Txn{} = txn) do
+    previous_fk_violations =
+      Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(assignments))
+
     # The caller owns the exact predecessor and transaction. These settings
     # prevent SQLite from rewriting incoming references during the rename.
     unless Txn.q(txn, "PRAGMA foreign_keys") == [[0]] and
@@ -154,8 +157,9 @@ defmodule Tightbeam.Assignments do
     Txn.exec(txn, "DROP TABLE assignments_before_process_actor")
     Enum.each(objects, fn [sql] -> :ok = Txn.exec(txn, sql) end)
 
-    unless Txn.q(txn, "PRAGMA foreign_key_check") == [],
-      do: raise(ArgumentError, "R1 rebuild foreign key violation")
+    unless Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(assignments)) --
+             previous_fk_violations == [],
+           do: raise(ArgumentError, "R1 rebuild foreign key violation")
 
     :ok
   end

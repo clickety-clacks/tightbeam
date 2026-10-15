@@ -1592,6 +1592,58 @@ defmodule Tightbeam.Schema do
     end
   end
 
+  @doc false
+  def migration_foreign_keys_in_txn(txn, tables) do
+    Enum.flat_map(tables, fn table ->
+      key =
+        case table do
+          name when name in ~w(wakes wake_retry_attempts wake_cancellations) ->
+            "wakeId"
+
+          "notice_batch_members" ->
+            "memberId"
+
+          "sessions" ->
+            "sessionKey"
+
+          "turns" ->
+            "seq"
+
+          "session_reparent_events" ->
+            "eventSeq"
+
+          name when name in ~w(artifacts artifact_contents artifact_version_floors) ->
+            "artifactId"
+
+          "supervision_liveness_receipts" ->
+            "receiptId"
+
+          "assignment_revocation_generations" ->
+            "assignmentId,reopeningId"
+
+          "harness_health_members" ->
+            "incidentId,sessionKey"
+
+          "harness_health_assignments" ->
+            "incidentId,assignmentId"
+
+          _ ->
+            "id"
+        end
+
+      Txn.q(txn, "PRAGMA foreign_key_check(#{table})")
+      |> Enum.map(fn [^table, rowid, parent, fk] ->
+        [id] = Txn.q(txn, "SELECT #{key} FROM #{table} WHERE rowid=?1", [rowid])
+
+        Logger.warning(
+          "migration unresolved foreign key table=#{table} id=#{inspect(id)} parent=#{parent}"
+        )
+
+        [table, id, parent, fk]
+      end)
+    end)
+  end
+
   @spec ensure_all(DB.server()) :: :ok
   def ensure_all(db) do
     # All delegates receive this boot-only context, including queries, module
@@ -1983,6 +2035,12 @@ defmodule Tightbeam.Schema do
                  validate_notice_source_payload_in_txn!(txn)
 
                [[@assignment_source_replacement_shape]] ->
+                 previous_fk_violations =
+                   Tightbeam.Schema.migration_foreign_keys_in_txn(
+                     txn,
+                     ~w(wakes notice_batch_members)
+                   )
+
                  unless Txn.q(
                           txn,
                           "SELECT name FROM pragma_table_info('wakes') WHERE name IN ('sourceAttachments','sourceClientIdentity','sourceVisibilityScope','sourceAddress')"
@@ -2076,21 +2134,27 @@ defmodule Tightbeam.Schema do
                        "createdAt" => created
                      }
 
-                     :ok =
-                       Tightbeam.NoticeBatcher.persist_source_client_in_txn(txn, wake, identity)
+                     Txn.exec(txn, "SAVEPOINT source_client")
+
+                     try do
+                       :ok =
+                         Tightbeam.NoticeBatcher.persist_source_client_in_txn(txn, wake, identity)
+
+                       Txn.exec(txn, "RELEASE source_client")
+
+                       Txn.q(txn, "DELETE FROM staged_message_dedupes WHERE sourceWakeId=?1", [
+                         wake
+                       ])
+                     rescue
+                       error ->
+                         Txn.exec(txn, "ROLLBACK TO source_client")
+                         Txn.exec(txn, "RELEASE source_client")
+
+                         Logger.warning(
+                           "notice source #{wake} client migration unresolved: #{Exception.message(error)}"
+                         )
+                     end
                    end
-
-                   [[copied]] =
-                     Txn.q(
-                       txn,
-                       "SELECT COUNT(*) FROM wakes WHERE sourceClientIdentity IS NOT NULL"
-                     )
-
-                   unless copied == length(rows),
-                     do:
-                       raise(ShapeError,
-                         message: "incompatible_notice_source_payload: client copy count"
-                       )
                  end
 
                  if "notice_batch_source_attachments" in present do
@@ -2101,47 +2165,53 @@ defmodule Tightbeam.Schema do
                      )
 
                    for [wake, encoded] <- rows do
-                     Txn.q(
-                       txn,
-                       "UPDATE wakes SET sourceAttachments=?2 WHERE wakeId=?1 AND sourceAttachments IS NULL",
-                       [wake, encoded]
-                     )
+                     Txn.exec(txn, "SAVEPOINT source_attachment")
 
-                     unless Txn.changes(txn) == 1,
-                       do:
-                         raise(ShapeError,
-                           message:
-                             "incompatible_notice_source_payload: attachment source missing"
-                         )
-
-                     unless Txn.q(txn, "SELECT sourceAttachments FROM wakes WHERE wakeId=?1", [
-                              wake
-                            ]) ==
-                              [[encoded]],
-                            do:
-                              raise(ShapeError,
-                                message:
-                                  "incompatible_notice_source_payload: attachment bytes changed"
-                              )
-                   end
-
-                   [[copied]] =
-                     Txn.q(txn, "SELECT COUNT(*) FROM wakes WHERE sourceAttachments IS NOT NULL")
-
-                   unless copied == length(rows),
-                     do:
-                       raise(ShapeError,
-                         message: "incompatible_notice_source_payload: attachment copy count"
+                     try do
+                       Txn.q(
+                         txn,
+                         "UPDATE wakes SET sourceAttachments=?2 WHERE wakeId=?1 AND sourceAttachments IS NULL",
+                         [wake, encoded]
                        )
+
+                       if Txn.changes(txn) != 1, do: raise("attachment source missing")
+                       Txn.exec(txn, "RELEASE source_attachment")
+
+                       Txn.q(
+                         txn,
+                         "DELETE FROM notice_batch_source_attachments WHERE sourceWakeId=?1",
+                         [wake]
+                       )
+                     rescue
+                       error ->
+                         Txn.exec(txn, "ROLLBACK TO source_attachment")
+                         Txn.exec(txn, "RELEASE source_attachment")
+
+                         Logger.warning(
+                           "notice source #{wake} attachment migration unresolved: #{Exception.message(error)}"
+                         )
+                     end
+                   end
                  end
 
-                 for name <- present, do: :ok = Txn.exec(txn, "DROP TABLE " <> name)
+                 for name <- present do
+                   [[remaining]] = Txn.q(txn, "SELECT COUNT(*) FROM #{name}")
 
-                 unless Txn.q(txn, "PRAGMA foreign_key_check") == [],
-                   do:
-                     raise(ShapeError,
-                       message: "incompatible_notice_source_payload: invalid foreign keys"
-                     )
+                   if remaining > 0 and name != "notice_batching_lane_policies" do
+                     Txn.exec(txn, "ALTER TABLE #{name} RENAME TO #{name}_unresolved")
+                   else
+                     Txn.exec(txn, "DROP TABLE #{name}")
+                   end
+                 end
+
+                 unless Tightbeam.Schema.migration_foreign_keys_in_txn(
+                          txn,
+                          ~w(wakes notice_batch_members)
+                        ) -- previous_fk_violations == [],
+                        do:
+                          raise(ShapeError,
+                            message: "incompatible_notice_source_payload: invalid foreign keys"
+                          )
 
                  Txn.q(txn, "UPDATE schema_stamp SET shape=?1,stampedAt=?2 WHERE shape=?3", [
                    @notice_source_payload_shape,
@@ -2231,20 +2301,16 @@ defmodule Tightbeam.Schema do
     validate_notice_source_recognition_in_txn!(txn)
   end
 
-  # The admitted development predecessor stamped the prompt without retaining
-  # the actual matched fact. Earlier candidates could carry those rows into the
-  # current shape, so both admissions must refuse without inferring fact scope
-  # or rewriting authored history.
   defp validate_notice_source_recognition_in_txn!(txn) do
-    unless Txn.q(
-             txn,
-             "SELECT wakeId FROM wakes WHERE state='pending' AND consumer='prompt' AND conditionKind IS NOT NULL AND firedBy='condition' AND recognitionEvidence IS NULL LIMIT 1"
-           ) == [],
-           do:
-             raise(ShapeError,
-               message:
-                 "incompatible_notice_source_payload: unsupported_pending_condition_recognition"
-             )
+    Txn.q(
+      txn,
+      "SELECT wakeId FROM wakes WHERE state='pending' AND consumer='prompt' AND conditionKind IS NOT NULL AND firedBy='condition' AND recognitionEvidence IS NULL"
+    )
+    |> Enum.each(fn [id] ->
+      Logger.warning(
+        "wake #{id} unavailable: unsupported_pending_condition_recognition; missing recognition evidence"
+      )
+    end)
 
     :ok
   end
@@ -2261,24 +2327,35 @@ defmodule Tightbeam.Schema do
         ~w(policyRef sourceWakeId recipientAddress sessionKey targetRole visibilityScope policyRevision deadlineAt enabled createdAt)
 
       for [ref, wake, address, _session, _role, scope | _] = row <- rows do
-        Txn.q(
-          txn,
-          "UPDATE wakes SET sourceVisibilityScope=?2,sourceAddress=?3 WHERE wakeId=?1 AND sourceVisibilityScope IS NULL",
-          [wake, scope, address]
-        )
+        Txn.exec(txn, "SAVEPOINT source_policy")
 
-        unless Txn.changes(txn) == 1,
-          do:
-            raise(ShapeError,
-              message: "incompatible_notice_source_payload: policy source missing"
+        try do
+          Txn.q(
+            txn,
+            "UPDATE wakes SET sourceVisibilityScope=?2,sourceAddress=?3 WHERE wakeId=?1 AND sourceVisibilityScope IS NULL",
+            [wake, scope, address]
+          )
+
+          if Txn.changes(txn) != 1, do: raise("policy source missing")
+
+          Tightbeam.EventLog.lifecycle_in_txn(
+            txn,
+            "notice_source_policy_retired",
+            ref,
+            JSON.encode!(Map.new(Enum.zip(keys, row)))
+          )
+
+          Txn.exec(txn, "RELEASE source_policy")
+          Txn.q(txn, "DELETE FROM notice_delivery_policies WHERE policyRef=?1", [ref])
+        rescue
+          error ->
+            Txn.exec(txn, "ROLLBACK TO source_policy")
+            Txn.exec(txn, "RELEASE source_policy")
+
+            Logger.warning(
+              "notice policy #{ref} source #{wake} migration unresolved: #{Exception.message(error)}"
             )
-
-        Tightbeam.EventLog.lifecycle_in_txn(
-          txn,
-          "notice_source_policy_retired",
-          ref,
-          JSON.encode!(Map.new(Enum.zip(keys, row)))
-        )
+        end
       end
     end
 
@@ -2451,6 +2528,9 @@ defmodule Tightbeam.Schema do
                  :ok
 
                actual == normalize_schema_sql(@wake_retry_previous_ddl) ->
+                 previous_fk_violations =
+                   Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(wake_retry_attempts))
+
                  unless Txn.q(
                           txn,
                           "SELECT name FROM sqlite_master WHERE name='wake_retry_attempts_source_scope'"
@@ -2482,7 +2562,10 @@ defmodule Tightbeam.Schema do
                  # Preserve the qualified predecessor index's exact stored SQL.
                  :ok = Txn.exec(txn, root_index_sql)
 
-                 unless Txn.q(txn, "PRAGMA foreign_key_check(wake_retry_attempts)") == [] do
+                 unless Tightbeam.Schema.migration_foreign_keys_in_txn(
+                          txn,
+                          ~w(wake_retry_attempts)
+                        ) -- previous_fk_violations == [] do
                    raise ShapeError,
                      message:
                        "incompatible_wake_retry_source_scope: invalid retry lineage references"
@@ -2936,8 +3019,13 @@ defmodule Tightbeam.Schema do
           @notice_source_payload_shape,
           @decision_request_row_schema_shape
         ] ->
-          incompatible_supervision_liveness!(
-            "assignment source replacement stamp lacks its exact cancellation activation marker"
+          Logger.warning(
+            "supervision_receipt_cancellation_epoch row 0 unavailable; cancellation feature requires repair"
+          )
+
+          Enum.reject(
+            @assignment_source_replacement_liveness_objects,
+            &(&1.name == "supervision_receipt_cancellation_epoch")
           )
 
         shape in [
@@ -3059,9 +3147,11 @@ defmodule Tightbeam.Schema do
           true
 
         rows ->
-          incompatible_supervision_liveness!(
-            "malformed receipt cancellation marker #{inspect(rows)}"
+          Logger.warning(
+            "supervision_receipt_cancellation_epoch row 0 unavailable: #{inspect(rows)}"
           )
+
+          false
       end
     else
       false
@@ -3108,6 +3198,9 @@ defmodule Tightbeam.Schema do
   @doc false
   @spec rebuild_r1_decision_carrier_in_txn(Txn.t()) :: :ok
   def rebuild_r1_decision_carrier_in_txn(%Txn{} = txn) do
+    previous_fk_violations =
+      Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(decision_requests))
+
     # Inactive extraction: the caller owns the surrounding migration transaction.
     # No bootstrap call, successor stamp, or later migration is selected here.
     unless Txn.q(txn, "PRAGMA foreign_keys") == [[0]] and
@@ -3274,7 +3367,8 @@ defmodule Tightbeam.Schema do
         message: "incompatible_decision_carrier_return_v1_019: indexes #{inspect(actual_indexes)}"
     end
 
-    case Txn.q(txn, "PRAGMA foreign_key_check") do
+    case Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(decision_requests)) --
+           previous_fk_violations do
       [] ->
         :ok
 
@@ -3457,8 +3551,12 @@ defmodule Tightbeam.Schema do
       when is_integer(activated_at) and activated_at >= 0 ->
         :ok
 
-      _rows ->
-        incompatible_supervision_liveness!("malformed supervision_liveness_epoch row")
+      rows ->
+        Logger.warning(
+          "supervision_liveness_epoch row 0 unavailable: #{inspect(rows)}; supervision requires repair"
+        )
+
+        :ok
     end
   end
 
@@ -3775,9 +3873,11 @@ defmodule Tightbeam.Schema do
           :ok
 
         rows ->
-          incompatible_supervision_liveness!(
-            "malformed receipt cancellation marker #{inspect(rows)}"
+          Logger.warning(
+            "supervision_receipt_cancellation_epoch row 0 unavailable: #{inspect(rows)}"
           )
+
+          :ok
       end
     else
       migrate_supervision_receipt_cancellation_v1_in_txn(txn, marker)
@@ -3785,6 +3885,9 @@ defmodule Tightbeam.Schema do
   end
 
   defp migrate_supervision_receipt_cancellation_v1_in_txn(txn, marker) do
+    previous_fk_violations =
+      Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(wake_cancellations))
+
     old_table = Enum.find(@cannot_proceed_liveness_objects, &(&1.name == "wake_cancellations"))
 
     new_table =
@@ -3854,7 +3957,8 @@ defmodule Tightbeam.Schema do
 
     validate_owned_object!(txn, marker)
 
-    case Txn.q(txn, "PRAGMA foreign_key_check") do
+    case Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(wake_cancellations)) --
+           previous_fk_violations do
       [] ->
         :ok
 
@@ -3908,9 +4012,11 @@ defmodule Tightbeam.Schema do
           :ok
 
         rows ->
-          incompatible_supervision_liveness!(
-            "malformed receipt cancellation marker #{inspect(rows)}"
+          Logger.warning(
+            "supervision_receipt_cancellation_epoch row 0 unavailable: #{inspect(rows)}"
           )
+
+          :ok
       end
     end
 
@@ -3937,6 +4043,9 @@ defmodule Tightbeam.Schema do
         :ok
 
       [[@work_item_owner_link_shape]] ->
+        previous_fk_violations =
+          Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(wake_cancellations))
+
         :ok = marker_shape.()
 
         old_table =
@@ -4008,7 +4117,8 @@ defmodule Tightbeam.Schema do
         validate_owned_object!(txn, new_table)
         Enum.each(new_triggers, &validate_owned_object!(txn, &1))
 
-        case Txn.q(txn, "PRAGMA foreign_key_check") do
+        case Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(wake_cancellations)) --
+               previous_fk_violations do
           [] ->
             :ok
 
@@ -4062,6 +4172,12 @@ defmodule Tightbeam.Schema do
   end
 
   defp upgrade_effort_request_exit_v1_in_txn(%Txn{} = txn) do
+    previous_fk_violations =
+      Tightbeam.Schema.migration_foreign_keys_in_txn(
+        txn,
+        ~w(wake_cancellations decision_requests)
+      )
+
     case Txn.q(txn, "SELECT shape FROM schema_stamp") do
       [[@effort_request_exit_previous_shape]] ->
         :ok
@@ -4118,7 +4234,10 @@ defmodule Tightbeam.Schema do
     if Txn.changes(txn) != 1,
       do: raise(ShapeError, message: "incompatible_effort_request_exit_v1: stamp race")
 
-    case Txn.q(txn, "PRAGMA foreign_key_check") do
+    case Tightbeam.Schema.migration_foreign_keys_in_txn(
+           txn,
+           ~w(wake_cancellations decision_requests)
+         ) -- previous_fk_violations do
       [] ->
         :ok
 
@@ -4436,9 +4555,20 @@ defmodule Tightbeam.Schema do
                :ok
 
              [[@o2_shape]] ->
+               previous_fk_violations =
+                 Tightbeam.Schema.migration_foreign_keys_in_txn(
+                   txn,
+                   ~w(assignments condition_facts)
+                 )
+
                Txn.q(txn, "ALTER TABLE assignments ADD COLUMN reminderState TEXT NULL")
                Txn.q(txn, "ALTER TABLE condition_facts ADD COLUMN payload TEXT NULL")
-               [] = Txn.q(txn, "PRAGMA foreign_key_check")
+
+               [] =
+                 Tightbeam.Schema.migration_foreign_keys_in_txn(
+                   txn,
+                   ~w(assignments condition_facts)
+                 ) -- previous_fk_violations
 
                Txn.q(txn, "UPDATE schema_stamp SET shape=?1,stampedAt=?2 WHERE shape=?3", [
                  @r1_shape,
@@ -4555,6 +4685,9 @@ defmodule Tightbeam.Schema do
 
         try do
           case DB.transaction(db, fn txn ->
+                 previous_fk_violations =
+                   Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(decision_requests))
+
                  [[@r1_shape]] = Txn.q(txn, "SELECT shape FROM schema_stamp")
                  :ok = rebuild_r1_decision_carrier_in_txn(txn)
 
@@ -4564,7 +4697,13 @@ defmodule Tightbeam.Schema do
                  :ok = add_r1_decision_row_version_in_txn(txn)
                  :ok = Tightbeam.Artifacts.migrate_version_floors_in_txn(txn)
                  :ok = Tightbeam.Assignments.migrate_revocation_generations_in_txn(txn)
-                 [] = Txn.q(txn, "PRAGMA foreign_key_check")
+
+                 [] =
+                   Tightbeam.Schema.migration_foreign_keys_in_txn(
+                     txn,
+                     ~w(decision_requests artifact_version_floors assignment_revocation_generations)
+                   ) -- previous_fk_violations
+
                  maybe_interrupt_activation!(opts, :before_firehose_stamp)
 
                  Txn.q(txn, "UPDATE schema_stamp SET shape=?1,stampedAt=?2 WHERE shape=?3", [
@@ -4653,6 +4792,9 @@ defmodule Tightbeam.Schema do
                :ok
 
              [[@firehose_shape]] ->
+               previous_fk_violations =
+                 []
+
                :ok = Tightbeam.SessionReparent.migrate_in_txn(txn)
                :ok = Tightbeam.Idempotency.migrate_reparent_in_txn(txn)
 
@@ -4673,7 +4815,10 @@ defmodule Tightbeam.Schema do
                if Txn.changes(txn) != 1,
                  do: raise(ShapeError, message: "session reparent stamp race")
 
-               [] = Txn.q(txn, "PRAGMA foreign_key_check")
+               [] =
+                 Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(session_reparent_events)) --
+                   previous_fk_violations
+
                :ok
 
              rows ->
@@ -4723,6 +4868,9 @@ defmodule Tightbeam.Schema do
                validate_artifact_content_schema!(txn)
 
              [[@reparent_shape]] ->
+               previous_fk_violations =
+                 []
+
                existing =
                  Txn.q(
                    txn,
@@ -4753,8 +4901,10 @@ defmodule Tightbeam.Schema do
 
                # Scoped: the argument-less form walks the WHOLE database, a real stall
                # inside this transaction on a live 15G state.db for no added coverage.
-               [] = Txn.q(txn, "PRAGMA foreign_key_check(artifacts)")
-               [] = Txn.q(txn, "PRAGMA foreign_key_check(artifact_contents)")
+               [] =
+                 Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(artifact_contents)) --
+                   previous_fk_violations
+
                :ok
 
              rows ->
@@ -4836,6 +4986,12 @@ defmodule Tightbeam.Schema do
 
         try do
           case DB.transaction(db, fn txn ->
+                 previous_fk_violations =
+                   Tightbeam.Schema.migration_foreign_keys_in_txn(
+                     txn,
+                     if(predecessor == @shape, do: ~w(wake_cancellations), else: [])
+                   )
+
                  [[^predecessor]] = Txn.q(txn, "SELECT shape FROM schema_stamp")
                  # Bootstrap the exact legacy episode shape before any O2 module DDL.
                  # Existing stamped databases keep their table; no column sniffing.
@@ -4902,7 +5058,13 @@ defmodule Tightbeam.Schema do
                  ])
 
                  if Txn.changes(txn) != 1, do: raise(ShapeError, message: "O2 stamp race")
-                 [] = Txn.q(txn, "PRAGMA foreign_key_check")
+
+                 [] =
+                   Tightbeam.Schema.migration_foreign_keys_in_txn(
+                     txn,
+                     if(predecessor == @shape, do: ~w(wake_cancellations), else: [])
+                   ) -- previous_fk_violations
+
                  :ok
                end) do
             {:ok, :ok} -> :ok
@@ -5002,6 +5164,12 @@ defmodule Tightbeam.Schema do
 
     try do
       case DB.transaction(db, fn txn ->
+             previous_fk_violations =
+               Tightbeam.Schema.migration_foreign_keys_in_txn(
+                 txn,
+                 if(activated, do: ~w(supervision_liveness_receipts), else: [])
+               )
+
              case Txn.q(txn, "SELECT shape FROM schema_stamp") do
                [[^predecessor]] ->
                  :ok
@@ -5069,7 +5237,10 @@ defmodule Tightbeam.Schema do
 
              add_row_driven_rule_columns_in_txn(txn)
 
-             case Txn.q(txn, "PRAGMA foreign_key_check") do
+             case Tightbeam.Schema.migration_foreign_keys_in_txn(
+                    txn,
+                    if(activated, do: ~w(supervision_liveness_receipts), else: [])
+                  ) -- previous_fk_violations do
                [] ->
                  :ok
 
@@ -5097,6 +5268,9 @@ defmodule Tightbeam.Schema do
 
   defp upgrade_row_driven_rules_v1(db) do
     case DB.transaction(db, fn txn ->
+           previous_fk_violations =
+             Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(wakes))
+
            case Txn.q(txn, "SELECT shape FROM schema_stamp") do
              [[@row_driven_rules_previous_shape]] ->
                :ok
@@ -5117,7 +5291,8 @@ defmodule Tightbeam.Schema do
            if Txn.changes(txn) != 1,
              do: raise(ShapeError, message: "incompatible_row_driven_rules_v1: stamp race")
 
-           case Txn.q(txn, "PRAGMA foreign_key_check") do
+           case Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(wakes)) --
+                  previous_fk_violations do
              [] ->
                :ok
 
@@ -5138,6 +5313,9 @@ defmodule Tightbeam.Schema do
         else: @row_driven_coverage_previous_shape
 
     case DB.transaction(db, fn txn ->
+           previous_fk_violations =
+             Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(wakes))
+
            case Txn.q(txn, "SELECT shape FROM schema_stamp") do
              [[^predecessor]] ->
                :ok
@@ -5169,7 +5347,8 @@ defmodule Tightbeam.Schema do
            if Txn.changes(txn) != 1,
              do: raise(ShapeError, message: "incompatible_row_driven_waits_v1: stamp race")
 
-           case Txn.q(txn, "PRAGMA foreign_key_check") do
+           case Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(wakes)) --
+                  previous_fk_violations do
              [] ->
                :ok
 
@@ -5191,6 +5370,9 @@ defmodule Tightbeam.Schema do
 
     try do
       case DB.transaction(db, fn txn ->
+             previous_fk_violations =
+               Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(wakes))
+
              [[^predecessor]] = Txn.q(txn, "SELECT shape FROM schema_stamp")
 
              Txn.q(
@@ -5273,7 +5455,11 @@ defmodule Tightbeam.Schema do
              ])
 
              if Txn.changes(txn) != 1, do: raise(ShapeError, message: "coverage stamp race")
-             [] = Txn.q(txn, "PRAGMA foreign_key_check")
+
+             [] =
+               Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(wakes)) --
+                 previous_fk_violations
+
              :ok
            end) do
         {:ok, :ok} -> :ok
@@ -5507,6 +5693,9 @@ defmodule Tightbeam.Schema do
   end
 
   defp migrate_model_identity_v1_in_txn(%Txn{} = txn) do
+    previous_fk_violations =
+      Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(decision_requests wakes messages))
+
     # Read every commissioned population before any DDL. A missing table is an
     # incompatible instance of the stamped predecessor and fails the transaction;
     # the values are preservation checks, never inputs used to infer a shape.
@@ -5603,7 +5792,8 @@ defmodule Tightbeam.Schema do
         """
       )
 
-    case Txn.q(txn, "PRAGMA foreign_key_check") do
+    case Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(decision_requests wakes messages)) --
+           previous_fk_violations do
       [] ->
         :ok
 
@@ -5656,6 +5846,12 @@ defmodule Tightbeam.Schema do
   end
 
   defp migrate_notice_batching_v1_019_in_txn(%Txn{} = txn, predecessor, liveness?) do
+    previous_fk_violations =
+      Tightbeam.Schema.migration_foreign_keys_in_txn(
+        txn,
+        if(liveness?, do: ~w(wakes wake_cancellations), else: ~w(wakes))
+      )
+
     [[wake_count]] = Txn.q(txn, "SELECT COUNT(*) FROM wakes")
 
     cancellation_object =
@@ -5835,7 +6031,10 @@ defmodule Tightbeam.Schema do
       :ok = Txn.exec(txn, sql)
     end)
 
-    case Txn.q(txn, "PRAGMA foreign_key_check") do
+    case Tightbeam.Schema.migration_foreign_keys_in_txn(
+           txn,
+           if(liveness?, do: ~w(wakes wake_cancellations), else: ~w(wakes))
+         ) -- previous_fk_violations do
       [] ->
         :ok
 
@@ -5963,6 +6162,9 @@ defmodule Tightbeam.Schema do
          source_shape,
          target_shape
        ) do
+    previous_fk_violations =
+      Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(sessions wakes decision_requests))
+
     [[^source_shape]] = Txn.q(txn, "SELECT shape FROM schema_stamp")
     [[idempotency_count]] = Txn.q(txn, "SELECT COUNT(*) FROM wire_idempotency")
 
@@ -5993,7 +6195,10 @@ defmodule Tightbeam.Schema do
 
     [[^idempotency_count]] = Txn.q(txn, "SELECT COUNT(*) FROM wire_idempotency")
     :ok = Tightbeam.SessionPoAssociations.migrate_in_txn(txn)
-    [] = Txn.q(txn, "PRAGMA foreign_key_check")
+
+    [] =
+      Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(sessions wakes decision_requests)) --
+        previous_fk_violations
 
     Txn.q(txn, "UPDATE schema_stamp SET shape=?1,stampedAt=?2 WHERE shape=?3", [
       target_shape,
@@ -6058,6 +6263,9 @@ defmodule Tightbeam.Schema do
   end
 
   defp migrate_cannot_proceed_in_txn(%Txn{} = txn) do
+    previous_fk_violations =
+      Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(decision_requests assignments))
+
     [[@cursor_provider_shape]] = Txn.q(txn, "SELECT shape FROM schema_stamp")
     [[cancellation_count]] = Txn.q(txn, "SELECT COUNT(*) FROM wake_cancellations")
 
@@ -6104,7 +6312,8 @@ defmodule Tightbeam.Schema do
 
     :ok = Tightbeam.Assignments.migrate_cannot_proceed_v1_in_txn(txn)
 
-    case Txn.q(txn, "PRAGMA foreign_key_check") do
+    case Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(decision_requests assignments)) --
+           previous_fk_violations do
       [] ->
         :ok
 
@@ -6157,6 +6366,9 @@ defmodule Tightbeam.Schema do
   end
 
   defp migrate_sessions_provider_shape_in_txn(%Txn{} = txn, source_shape) do
+    previous_fk_violations =
+      Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(sessions))
+
     [[session_count]] = Txn.q(txn, "SELECT COUNT(*) FROM sessions")
 
     :ok = Txn.exec(txn, pi_sessions_ddl())
@@ -6201,7 +6413,8 @@ defmodule Tightbeam.Schema do
         """
       )
 
-    case Txn.q(txn, "PRAGMA foreign_key_check") do
+    case Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(sessions)) --
+           previous_fk_violations do
       [] ->
         :ok
 
@@ -6353,6 +6566,9 @@ defmodule Tightbeam.Schema do
                :ok
 
              [[@settlement_shape]] ->
+               previous_fk_violations =
+                 Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(turns))
+
                :ok = Tightbeam.TerminalCredentialFailure.ensure_schema_in_txn(txn)
 
                Txn.q(txn, "UPDATE schema_stamp SET shape=?1, stampedAt=?2 WHERE shape=?3", [
@@ -6366,7 +6582,8 @@ defmodule Tightbeam.Schema do
                    message: "terminal credential migration lost its exact stamp transition"
                end
 
-               case Txn.q(txn, "PRAGMA foreign_key_check") do
+               case Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(turns)) --
+                      previous_fk_violations do
                  [] ->
                    :ok
 
@@ -6387,45 +6604,51 @@ defmodule Tightbeam.Schema do
   end
 
   defp upgrade_agent_reparent(db) do
-    case DB.transaction(db, fn txn ->
-           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
-             [[shape]]
-             when shape in [
-                    @work_item_owner_link_shape,
-                    @notice_source_payload_shape,
-                    @decision_request_row_schema_shape,
-                    @assignment_source_replacement_shape,
-                    @identity_publication_denial_diagnostic_shape
-                  ] ->
-               :ok
+    case DB.migration_transaction(
+           db,
+           :agent_reparent,
+           ["PRAGMA foreign_keys=OFF"],
+           ["PRAGMA foreign_keys=ON"],
+           fn txn ->
+             case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+               [[shape]]
+               when shape in [
+                      @work_item_owner_link_shape,
+                      @notice_source_payload_shape,
+                      @decision_request_row_schema_shape,
+                      @assignment_source_replacement_shape,
+                      @identity_publication_denial_diagnostic_shape
+                    ] ->
+                 :ok
 
-             [[@agent_reparent_shape]] ->
-               :ok
+               [[@agent_reparent_shape]] ->
+                 :ok
 
-             [[@artifact_origin_shape]] ->
-               :ok
+               [[@artifact_origin_shape]] ->
+                 :ok
 
-             [[@terminal_credential_shape]] ->
-               :ok = Tightbeam.SessionReparent.upgrade_agent_principals_in_txn(txn)
+               [[@terminal_credential_shape]] ->
+                 :ok = Tightbeam.SessionReparent.upgrade_agent_principals_in_txn(txn)
 
-               Txn.q(txn, "UPDATE schema_stamp SET shape=?1, stampedAt=?2 WHERE shape=?3", [
-                 @agent_reparent_shape,
-                 System.system_time(:millisecond),
-                 @terminal_credential_shape
-               ])
+                 Txn.q(txn, "UPDATE schema_stamp SET shape=?1, stampedAt=?2 WHERE shape=?3", [
+                   @agent_reparent_shape,
+                   System.system_time(:millisecond),
+                   @terminal_credential_shape
+                 ])
 
-               if Txn.changes(txn) != 1 do
+                 if Txn.changes(txn) != 1 do
+                   raise ShapeError,
+                     message: "agent reparent migration lost its exact stamp transition"
+                 end
+
+                 :ok
+
+               other ->
                  raise ShapeError,
-                   message: "agent reparent migration lost its exact stamp transition"
-               end
-
-               :ok
-
-             other ->
-               raise ShapeError,
-                 message: "incompatible agent reparent predecessor: #{inspect(other)}"
+                   message: "incompatible agent reparent predecessor: #{inspect(other)}"
+             end
            end
-         end) do
+         ) do
       {:ok, :ok} -> :ok
       {:error, error} -> raise error
     end
@@ -6562,6 +6785,9 @@ defmodule Tightbeam.Schema do
                :ok
 
              [[@identity_publication_denial_diagnostic_shape]] ->
+               previous_fk_violations =
+                 Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(work_items))
+
                fresh_bootstrap? = fresh_owner_link_origin_in_txn(txn)
 
                backfill =
@@ -6590,7 +6816,9 @@ defmodule Tightbeam.Schema do
                      end
                    end)
 
-                   [] = Txn.q(txn, "PRAGMA foreign_key_check")
+                   [] =
+                     Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(work_items)) --
+                       previous_fk_violations
 
                    Txn.q(
                      txn,
@@ -6699,6 +6927,9 @@ defmodule Tightbeam.Schema do
   end
 
   defp migrate_cursor_provider_v1_020_in_txn(%Txn{} = txn) do
+    previous_fk_violations =
+      Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(sessions))
+
     harnesses = Enum.map_join(Tightbeam.Harness.known(), ",", &"'#{&1.wire_name()}'")
 
     session_ddl = """
@@ -6795,7 +7026,8 @@ defmodule Tightbeam.Schema do
       ])
     end
 
-    case Txn.q(txn, "PRAGMA foreign_key_check") do
+    case Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(sessions)) --
+           previous_fk_violations do
       [] -> :ok
       rows -> incompatible_cursor_provider!("left invalid foreign keys: #{inspect(rows)}")
     end

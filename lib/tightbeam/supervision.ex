@@ -6642,18 +6642,30 @@ defmodule Tightbeam.Supervision do
       []
     )
     |> Enum.reduce([], fn [assignment_id], acc ->
-      case accepted_transfer(txn, assignment_id, nil) do
-        {:ok, %{session_key: ^target_session_key} = transfer} ->
-          [{assignment_id, transfer} | acc]
+      relevant? =
+        transfer_candidate_rows(txn, assignment_id, nil)
+        |> Enum.any?(fn [_seq, session_key | _] -> session_key == target_session_key end)
 
-        {:ok, _other_target} ->
-          acc
+      if relevant? do
+        case accepted_transfer(txn, assignment_id, nil) do
+          {:ok, %{session_key: ^target_session_key} = transfer} ->
+            [{assignment_id, transfer} | acc]
 
-        :none ->
-          acc
+          {:ok, _other_target} ->
+            acc
 
-        {:error, reason} ->
-          raise "incompatible_supervision_liveness_v1: #{reason}"
+          :none ->
+            acc
+
+          {:error, reason} ->
+            Logger.warning(
+              "assignment #{assignment_id} transfer skipped during retirement of #{target_session_key}: #{inspect(reason)}"
+            )
+
+            acc
+        end
+      else
+        acc
       end
     end)
     |> Enum.reverse()

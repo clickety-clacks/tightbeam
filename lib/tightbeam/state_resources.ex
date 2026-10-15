@@ -1056,15 +1056,13 @@ defmodule Tightbeam.StateResources do
     status = Identity.status(base_dir)
     live = status.live_revision
 
-    session_revisions =
-      db
-      |> Org.list_for_user("", true)
-      |> Enum.flat_map(fn session ->
-        if is_binary(session.identity_revision),
-          do: [{session.session_key, session.identity_revision}],
-          else: []
-      end)
-      |> Map.new()
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT sessionKey, identityRevision FROM sessions WHERE state='active' AND identityRevision IS NOT NULL"
+      )
+
+    session_revisions = Map.new(rows, fn [key, revision] -> {key, revision} end)
 
     %{
       "name" => "served",

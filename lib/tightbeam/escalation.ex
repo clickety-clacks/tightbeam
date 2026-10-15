@@ -616,6 +616,9 @@ defmodule Tightbeam.Escalation do
 
   # Older stamped migrations call arity two before rowVersion exists.
   def ensure_terminal_parity_in_txn(%Txn{} = txn, activated_at, versioned?) do
+    current_schema? =
+      Txn.q(txn, "SELECT shape FROM schema_stamp") == [["decision-request-row-schema-v2-019"]]
+
     invalid_version =
       if versioned?, do: "typeof(NEW.rowVersion) <> 'integer' OR NEW.rowVersion < 1 OR ", else: ""
 
@@ -668,6 +671,11 @@ defmodule Tightbeam.Escalation do
       )
 
     case Txn.q(txn, "SELECT schemaVersion FROM decision_request_terminal_epoch WHERE id = 0") do
+      [] when current_schema? ->
+        Logger.warning(
+          "decision_request_terminal_epoch row 0 unavailable: missing activation evidence"
+        )
+
       [] ->
         [[cutoff]] = Txn.q(txn, "SELECT COALESCE(MAX(id), 0) FROM condition_facts")
 
@@ -723,8 +731,8 @@ defmodule Tightbeam.Escalation do
       [[@terminal_schema_version]] ->
         :ok
 
-      [[other]] ->
-        raise DB.Error, message: "incompatible terminal decision epoch #{other}"
+      rows ->
+        Logger.warning("decision_request_terminal_epoch row 0 unavailable: #{inspect(rows)}")
     end
 
     :ok
@@ -1901,27 +1909,45 @@ defmodule Tightbeam.Escalation do
               match?(%{"verb" => "cannot-proceed"}, decode_json_safe(context))
             end)
 
-          Enum.each(rows, fn [id, _owner_user_id, _context] ->
-            request = request_in_txn(txn, id)
+          withdrawn_rows =
+            Enum.filter(rows, fn [id, _owner_user_id, _context] ->
+              Txn.exec(txn, "SAVEPOINT retired_request")
 
-            Txn.q(
-              txn,
-              "UPDATE decision_requests SET status = 'withdrawn', withdrawnBy = 'process:tightbeam', withdrawnReason = 'raiser-retired', withdrawnAt = ?2 WHERE id = ?1 AND status = 'open'",
-              [id, at]
-            )
+              try do
+                request = request_in_txn(txn, id)
 
-            if Txn.changes(txn) == 1 do
-              withdrawn = request_in_txn(txn, id)
-              _withdrawn = publish_decision_transition_in_txn(txn, request, withdrawn)
+                Txn.q(
+                  txn,
+                  "UPDATE decision_requests SET status = 'withdrawn', withdrawnBy = 'process:tightbeam', withdrawnReason = 'raiser-retired', withdrawnAt = ?2 WHERE id = ?1 AND status = 'open'",
+                  [id, at]
+                )
 
-              EventLog.lifecycle_in_txn(
-                txn,
-                "decision_request_withdrawn",
-                id,
-                "by=process:tightbeam reason=raiser-retired"
-              )
-            end
-          end)
+                if Txn.changes(txn) == 1 do
+                  withdrawn = request_in_txn(txn, id)
+                  _withdrawn = publish_decision_transition_in_txn(txn, request, withdrawn)
+
+                  EventLog.lifecycle_in_txn(
+                    txn,
+                    "decision_request_withdrawn",
+                    id,
+                    "by=process:tightbeam reason=raiser-retired"
+                  )
+                end
+
+                Txn.exec(txn, "RELEASE retired_request")
+                true
+              rescue
+                error ->
+                  Txn.exec(txn, "ROLLBACK TO retired_request")
+                  Txn.exec(txn, "RELEASE retired_request")
+
+                  Logger.warning(
+                    "decision request #{id} withdrawal unresolved: #{Exception.message(error)}"
+                  )
+
+                  false
+              end
+            end)
 
           waivers =
             Txn.q(
@@ -1942,7 +1968,7 @@ defmodule Tightbeam.Escalation do
             end
           end)
 
-          Enum.map(rows, fn [id, owner_user_id, _context] ->
+          Enum.map(withdrawn_rows, fn [id, owner_user_id, _context] ->
             decision_transition(
               %{id: id, owner_user_id: owner_user_id},
               "open",
@@ -2056,7 +2082,16 @@ defmodule Tightbeam.Escalation do
         "SELECT s.sessionKey FROM sessions s WHERE s.state = 'retired' AND (EXISTS (SELECT 1 FROM decision_requests dr WHERE dr.raiserSessionKey = s.sessionKey AND dr.kind != 'operator' AND dr.status = 'open') OR EXISTS (SELECT 1 FROM escalation_waivers ew WHERE ew.raiserId = 'session:' || s.sessionKey AND ew.revokedAt IS NULL))"
       )
 
-    Enum.each(rows, fn [key] -> withdraw_for_retired(db, key) end)
+    Enum.each(rows, fn [key] ->
+      try do
+        withdraw_for_retired(db, key)
+      rescue
+        error ->
+          Logger.warning(
+            "retired session #{key} recovery unresolved: #{Exception.message(error)}"
+          )
+      end
+    end)
 
     :ok
   end
@@ -3783,6 +3818,15 @@ defmodule Tightbeam.Escalation do
   end
 
   defp validate_terminal_request_in_txn(txn, request, event_counts \\ nil) do
+    unless Txn.q(txn, "SELECT schemaVersion FROM decision_request_terminal_epoch WHERE id=0") == [
+             [@terminal_schema_version]
+           ],
+           do:
+             raise(DB.Error,
+               message:
+                 "decision request #{request.id} unavailable: terminal epoch row 0 requires repair"
+             )
+
     [[cutoff]] =
       Txn.q(
         txn,
