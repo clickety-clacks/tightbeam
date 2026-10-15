@@ -321,6 +321,10 @@ defmodule Tightbeam.Acp.AdapterTest do
         return send({ id: m.id, result: { sessionId: sid, ...configOptions(sid) } });
       }
       case "session/load": {
+        if (failMode === "load-hang" && m.params.sessionId === "slow") {
+          capture(m);
+          return;
+        }
         capture(m);
         models[m.params.sessionId] = failMode === "load-owner" ? "owner-model" : (models[m.params.sessionId] || "haiku");
         offeredModels[m.params.sessionId] = [...defaultOfferedModels];
@@ -2047,6 +2051,63 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert_receive {:DOWN, ^conn_monitor, :process, ^conn, :killed}
   end
 
+  test "a load can spend its full deadline while another session completes a turn" do
+    {adapter, capture} = start_adapter(fail_mode: "load-hang")
+    deadline = System.monotonic_time(:millisecond) + 300
+    caller = Task.async(fn ->
+      GenServer.call(adapter,
+        {:session_operation, {:load_session, "slow", nil, "/tmp", [], "guidance"}, deadline})
+    end)
+    assert eventually(fn ->
+      Enum.any?(captured_requests(capture), &(&1["method"] == "session/load"))
+    end)
+    assert {:ok, "sess-1"} = Adapter.new_session(adapter, nil, "/tmp", [], "guidance")
+    assert {:ok, %{stop_reason: "end_turn"}} = Adapter.prompt(adapter, "sess-1", "hello")
+    assert Task.yield(caller, 0) == nil
+    assert {:error, :timeout} = ErrorDiagnostic.classified(Task.await(caller))
+    assert Adapter.knows_session?(adapter, "sess-1")
+  end
+
+  test "one deadline bounds guidance and all subsequent setup requests" do
+    {adapter, capture} = start_adapter()
+    owner = self()
+    :sys.replace_state(adapter, fn state ->
+      %{state | on_guidance: fn _, _ ->
+        send(owner, :guidance_started)
+        receive do :continue -> :ok end
+      end}
+    end)
+    deadline = System.monotonic_time(:millisecond) + 50
+    assert {:error, :timeout} = GenServer.call(adapter,
+      {:session_operation, {:load_session, "slow", nil, "/tmp", [], "guidance"}, deadline})
+    assert_received :guidance_started
+    refute Enum.any?(captured_requests(capture), &(&1["method"] == "session/load"))
+    assert Process.alive?(adapter)
+    assert :sys.get_state(adapter).operations == %{}
+  end
+
+  test "a progress consumer timeout does not block or crash the adapter" do
+    {adapter, _} = start_adapter(gate_mode: "progress-turn", probe: false)
+    owner = self()
+    consumer = spawn(fn -> receive do :stop -> :ok end end)
+    caller = Task.async(fn ->
+      Adapter.prompt(adapter, "progress", "hello", progress: fn _, _ ->
+        send(owner, :progress_started)
+        try do
+          GenServer.call(consumer, :unanswered, 50)
+        after
+          send(owner, :progress_finished)
+        end
+      end)
+    end)
+    assert_receive :progress_started
+    assert {:ok, %{text: "progressed"}} = Task.await(caller)
+    assert_receive :progress_finished
+    send(consumer, :stop)
+    assert Process.alive?(adapter)
+    assert {:ok, "sess-1"} = Adapter.new_session(adapter, nil, "/tmp", [], "guidance")
+  end
+
   test "thought and tool progress stay routed within the prompt budget" do
     {adapter, _capture_path} = start_adapter(gate_mode: "progress-turn", probe: false)
     assert {:ok, sid} = Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
@@ -3008,13 +3069,7 @@ defmodule Tightbeam.Acp.AdapterTest do
              Adapter.current_model(adapter, "sess-1")
   end
 
-  # FAIL-BEFORE: strict_apply/4 used to start its deadline only after the
-  # preceding blocked request released the shared Adapter, so queue time was
-  # free and its fresh request outlived the caller's 30s GenServer.call budget.
-  # The 30.6s blocker exceeds the 30s operation deadline, so a correctly
-  # caller-stamped budget is exhausted at dequeue: nothing may be dispatched,
-  # and the structured error must still beat the caller's exit, which waits
-  # the reply margin past the operation deadline.
+  # Queue time on the same session still spends the strict operation budget.
   @tag timeout: 40_000
   test "strict apply queue time spends the caller-owned operation budget" do
     {adapter, capture_path} =
@@ -3029,10 +3084,6 @@ defmodule Tightbeam.Acp.AdapterTest do
                "guidance"
              )
 
-    # The blocker exists to OCCUPY the shared Adapter past the strict
-    # operation deadline; the handler holds the server until Conn answers at
-    # 30.6s whether or not the blocker's own 30s caller is still listening,
-    # so its caller exit is expected and irrelevant to what is under test.
     blocker =
       Task.async(fn ->
         try do
@@ -3059,7 +3110,7 @@ defmodule Tightbeam.Acp.AdapterTest do
       end)
 
     assert {:error, :model_transport_failure} = Task.await(strict, 33_000)
-    assert {:caller_exit, _} = Task.await(blocker, 33_000)
+    assert {:error, :timeout} = ErrorDiagnostic.classified(Task.await(blocker, 33_000))
 
     refute Enum.any?(captured_requests(capture_path), fn request ->
              request["method"] == "session/set_config_option" and
