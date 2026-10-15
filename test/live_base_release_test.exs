@@ -80,6 +80,18 @@ defmodule Tightbeam.LiveBaseReleaseTest do
     seed_real_predecessor!(base, app)
     identity = manifest["buildIdentity"]
 
+    {:ok, predecessor} = Sqlite3.open(Path.join(base, "state.db"))
+    {:ok, index_stmt} =
+      Sqlite3.prepare(
+        predecessor,
+        "SELECT name FROM sqlite_master WHERE type='index' " <>
+          "AND name='assignments_reviews_assignment'"
+      )
+
+    assert {:ok, []} = Sqlite3.fetch_all(predecessor, index_stmt)
+    :ok = Sqlite3.release(predecessor, index_stmt)
+    :ok = Sqlite3.close(predecessor)
+
     refute File.exists?(Path.join(base, "build-owner.json"))
 
     {:ok, db} =
@@ -93,6 +105,17 @@ defmodule Tightbeam.LiveBaseReleaseTest do
     :ok = Schema.ensure_all(db)
     target = hd(Schema.guard_compatible_stamps())
     assert {:ok, [[^target]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+    assert {:ok, [[_applied_at]]} =
+             DB.query(db, "SELECT appliedAt FROM hot_query_indexes_migration WHERE id=0")
+
+    assert {:ok, [[index_sql]]} =
+             DB.query(
+               db,
+               "SELECT sql FROM sqlite_master WHERE type='index' " <>
+                 "AND name='assignment_revocation_generation_reopened'"
+             )
+
+    refute index_sql =~ "WHERE"
 
     assert %{
              "format" => "tightbeam-build-owner/v1",
@@ -109,8 +132,13 @@ defmodule Tightbeam.LiveBaseReleaseTest do
         payload_root: app
       )
 
+    {:ok, [[applied_at_before_restart]]} =
+      DB.query(restarted, "SELECT appliedAt FROM hot_query_indexes_migration WHERE id=0")
+
     assert :ok = Schema.ensure_all(restarted)
     assert {:ok, [[^target]]} = DB.query(restarted, "SELECT shape FROM schema_stamp")
+    assert {:ok, [[^applied_at_before_restart]]} =
+             DB.query(restarted, "SELECT appliedAt FROM hot_query_indexes_migration WHERE id=0")
     assert File.exists?(Path.join(base, "build-owner.json"))
     :ok = GenServer.stop(restarted)
   end

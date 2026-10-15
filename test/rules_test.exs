@@ -2850,6 +2850,19 @@ defmodule Tightbeam.RulesTest do
       target_session = "{assignment_opener_session}"
       prompt = "preserved work-item review count observed"
       idempotency_key = "compat-review-count:{work_item_id}:3"
+
+      [[rule]]
+      name = "changes-requested-review-count"
+      verb = "attest"
+      edges = ["row-commit"]
+      effect = "notice"
+      text = "observe changes-requested review count"
+      deny_when = [{ fact = "work_item.changes_requested_count", op = "eq", value = 2 }]
+
+      [rule.notice]
+      target_session = "{assignment_opener_session}"
+      prompt = "changes-requested review count observed"
+      idempotency_key = "changes-requested-count:{work_item_id}:2"
       """,
       "compat-review-count.toml"
     )
@@ -2895,6 +2908,7 @@ defmodule Tightbeam.RulesTest do
     )
 
     assert notice_count(ctx.db, "remedy:compat-work-item-review-verdict-count") == 0
+    assert notice_count(ctx.db, "remedy:changes-requested-review-count") == 0
 
     for {reviewer, index} <- Enum.with_index(Enum.take(reviewers, 3), 1) do
       {producer_opener, producer_holder} = Enum.at(producer_rounds, index - 1)
@@ -2918,6 +2932,9 @@ defmodule Tightbeam.RulesTest do
       )
 
       assert notice_count(ctx.db, "remedy:compat-work-item-review-verdict-count") ==
+               if(index >= 2, do: 1, else: 0)
+
+      assert notice_count(ctx.db, "remedy:changes-requested-review-count") ==
                if(index >= 2, do: 1, else: 0)
 
       {producer_assignment, review_assignment}
@@ -2954,6 +2971,7 @@ defmodule Tightbeam.RulesTest do
     )
 
     assert notice_count(ctx.db, "remedy:compat-work-item-review-verdict-count") == 1
+    assert notice_count(ctx.db, "remedy:changes-requested-review-count") == 1
   end
 
   test "AC6a third review rejection spans fresh reviewers and fires once at equality", ctx do

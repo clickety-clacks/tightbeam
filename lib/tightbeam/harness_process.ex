@@ -106,7 +106,6 @@ defmodule Tightbeam.HarnessProcess do
   @doc "Insert the durable launch event and wrap the target command to record its identity."
   @spec prepare_launch(keyword(), DB.server(), tuple()) :: keyword()
   def prepare_launch(opts, db, {harness, preset, host} = key) do
-    :ok = ensure_schema(db)
     launch_id = Id.ulid()
     ssh = Keyword.get(opts, :process_ssh)
     helper_path = Keyword.fetch!(opts, :process_helper)
@@ -223,7 +222,6 @@ defmodule Tightbeam.HarnessProcess do
   @doc "Atomically establish the durable park fence and return the launch it protects."
   @spec begin_park(DB.server(), tuple()) :: {:ok, row() | :no_launch}
   def begin_park(db, key) do
-    :ok = ensure_schema(db)
     DB.transaction(db, &begin_park_in_txn(&1, key))
   end
 
@@ -231,8 +229,6 @@ defmodule Tightbeam.HarnessProcess do
   @spec begin_park_many(DB.server(), [tuple()]) ::
           {:ok, [{tuple(), row() | :no_launch}]} | {:error, term()}
   def begin_park_many(db, keys) do
-    :ok = ensure_schema(db)
-
     DB.transaction(db, fn txn ->
       Enum.map(keys, fn key -> {key, begin_park_in_txn(txn, key)} end)
     end)
@@ -245,8 +241,6 @@ defmodule Tightbeam.HarnessProcess do
     DB.transaction_until(
       db,
       fn txn ->
-        ensure_schema_in_txn(txn)
-
         Enum.map(keys, fn key ->
           DB.Txn.ensure_before_deadline(txn)
           {key, begin_park_in_txn(txn, key)}
@@ -290,8 +284,6 @@ defmodule Tightbeam.HarnessProcess do
   @doc "True only while an explicit durable park request stands for the key."
   @spec parked?(DB.server(), tuple()) :: boolean()
   def parked?(db, key) do
-    :ok = ensure_schema(db)
-
     {:ok, [[count]]} =
       DB.query(db, "SELECT COUNT(*) FROM harness_park_fences WHERE adapterKey = ?1", [
         key_name(key)
@@ -314,8 +306,6 @@ defmodule Tightbeam.HarnessProcess do
   @doc "True while any unresolved durable launch or park request fences the key."
   @spec fenced?(DB.server(), tuple()) :: boolean()
   def fenced?(db, key) do
-    :ok = ensure_schema(db)
-
     {:ok, [[count]]} =
       DB.query(
         db,
@@ -428,8 +418,6 @@ defmodule Tightbeam.HarnessProcess do
   @doc "Reconcile every unresolved launch left by an earlier coordinator."
   @spec reconcile(DB.server()) :: :ok
   def reconcile(db) do
-    :ok = ensure_schema(db)
-
     Enum.each(unresolved(db), fn row ->
       :ok = ensure_fence(db, row.adapter_key)
 
@@ -466,7 +454,6 @@ defmodule Tightbeam.HarnessProcess do
   @doc "Settle cleanup after the coordinator observes its current adapter instance die."
   @spec settle_proven_dead(DB.server(), tuple()) :: :ok | :already_resolved
   def settle_proven_dead(db, key) do
-    :ok = ensure_schema(db)
     :ok = ensure_fence(db, key_name(key))
 
     result =
@@ -482,8 +469,6 @@ defmodule Tightbeam.HarnessProcess do
   @doc "Operator-facing launch ledger, newest first."
   @spec list(DB.server()) :: [row()]
   def list(db \\ DB) do
-    :ok = ensure_schema(db)
-
     {:ok, rows} =
       DB.query(
         db,

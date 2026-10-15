@@ -372,7 +372,8 @@ defmodule Tightbeam.SubagentMarkers do
   defp running_turn_assignment_in_txn(txn, principal) do
     case Txn.q(
            txn,
-           "SELECT assignmentId FROM turns WHERE sessionKey = ?1 AND status = 'running' LIMIT 1",
+           "SELECT assignmentId FROM turns WHERE sessionKey = ?1 AND status = 'running' " <>
+             "AND status IN ('queued','running') LIMIT 1",
            [principal]
          ) do
       [[assignment_id]] -> assignment_id

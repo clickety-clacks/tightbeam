@@ -2733,13 +2733,13 @@ defmodule Tightbeam.Rules do
           DB.query(
             db,
             """
-            SELECT COUNT(*) FROM attests
-             WHERE kind = 'verdict'
-               AND assignmentId IN
-                   (SELECT id FROM assignments
-                     WHERE reviewsAssignmentId =
-                           (SELECT COALESCE(reviewsAssignmentId, id)
-                              FROM assignments WHERE id = ?1))
+            SELECT COUNT(*)
+            FROM assignments review
+            JOIN attests verdict ON verdict.assignmentId=review.id
+            WHERE review.reviewsAssignmentId =
+                  (SELECT COALESCE(reviewsAssignmentId, id)
+                     FROM assignments WHERE id = ?1)
+              AND verdict.kind = 'verdict'
             """,
             [assignment.id]
           )
@@ -2866,13 +2866,26 @@ defmodule Tightbeam.Rules do
               DB.query(
                 db,
                 """
-                SELECT COUNT(*)
-                FROM attests verdict
-                JOIN assignments review ON review.id=verdict.assignmentId
-                JOIN assignments producer ON producer.id=review.reviewsAssignmentId
-                WHERE COALESCE(review.workItemId,producer.workItemId)=?1
-                  AND verdict.kind='verdict'
-                  AND verdict.verdictKind='changes-requested'
+                  SELECT SUM(count) FROM (
+                    SELECT COUNT(*) AS count
+                    FROM assignments review
+                    JOIN attests verdict ON verdict.assignmentId=review.id
+                    WHERE review.workItemId=?1
+                      AND review.reviewsAssignmentId IS NOT NULL
+                      AND verdict.kind='verdict'
+                      AND verdict.verdictKind='changes-requested'
+
+                    UNION ALL
+
+                    SELECT COUNT(*) AS count
+                    FROM assignments producer
+                    JOIN assignments review ON review.reviewsAssignmentId=producer.id
+                    JOIN attests verdict ON verdict.assignmentId=review.id
+                    WHERE producer.workItemId=?1
+                      AND review.workItemId IS NULL
+                      AND verdict.kind='verdict'
+                      AND verdict.verdictKind='changes-requested'
+                  )
                 """,
                 [work_item_id]
               )
@@ -2905,16 +2918,30 @@ defmodule Tightbeam.Rules do
           DB.query(
             db,
             """
-            SELECT COUNT(*)
-            FROM attests verdict
-            JOIN assignments review ON review.id=verdict.assignmentId
-            LEFT JOIN assignments subject ON subject.id=review.reviewsAssignmentId
-            WHERE COALESCE(review.workItemId,subject.workItemId)=?1
-              AND review.reviewsAssignmentId IS NOT NULL
-              AND verdict.kind='verdict'
-              AND verdict.rowid <= (
-                SELECT event_attest.rowid FROM attests event_attest WHERE event_attest.id=?2
-              )
+            SELECT SUM(count) FROM (
+              SELECT COUNT(*) AS count
+              FROM assignments review
+              JOIN attests verdict ON verdict.assignmentId=review.id
+              WHERE review.workItemId=?1
+                AND review.reviewsAssignmentId IS NOT NULL
+                AND verdict.kind='verdict'
+                AND verdict.rowid <= (
+                  SELECT event_attest.rowid FROM attests event_attest WHERE event_attest.id=?2
+                )
+
+              UNION ALL
+
+              SELECT COUNT(*) AS count
+              FROM assignments producer
+              JOIN assignments review ON review.reviewsAssignmentId=producer.id
+              JOIN attests verdict ON verdict.assignmentId=review.id
+              WHERE producer.workItemId=?1
+                AND review.workItemId IS NULL
+                AND verdict.kind='verdict'
+                AND verdict.rowid <= (
+                  SELECT event_attest.rowid FROM attests event_attest WHERE event_attest.id=?2
+                )
+            )
             """,
             [work_item_id, attest_id]
           )

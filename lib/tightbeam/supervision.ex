@@ -5411,11 +5411,18 @@ defmodule Tightbeam.Supervision do
     end)
   end
 
+  @doc false
+  def open_assignment_holder_keys(db) do
+    {:ok, rows} =
+      DB.query(db, "SELECT DISTINCT holderKey FROM assignments WHERE state='open'")
+
+    Enum.map(rows, &hd/1)
+  end
+
   defp sweep_new_terminals(state) do
     open_holders =
       state.db
-      |> Assignments.list(%{state: "open"})
-      |> Enum.map(& &1.holderKey)
+      |> open_assignment_holder_keys()
       |> Enum.reject(&ConditionFacts.standing?(state.db, "work-blocked", &1))
 
     {:ok, pending_rows} =

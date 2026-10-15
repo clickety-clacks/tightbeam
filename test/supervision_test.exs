@@ -154,6 +154,17 @@ defmodule Tightbeam.SupervisionTest do
     refute "pendingTarget" in names
   end
 
+  test "the terminal sweep reads each open holder key once", ctx do
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO assignments (id,subject,holderKey,openedByUser,openedAt) " <>
+          "VALUES ('asg_2','second assignment','holder','flynn',2)"
+      )
+
+    assert Supervision.open_assignment_holder_keys(ctx.db) == ["holder"]
+  end
+
   test "idle cleanup activity sources use keyed query-plan paths", ctx do
     # Give SQLite enough representative cardinality and statistics to choose the
     # selective creator-session index instead of scanning a nearly empty test DB.

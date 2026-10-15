@@ -1681,6 +1681,7 @@ defmodule Tightbeam.Schema do
       Tightbeam.Ledger -> :ok
       Tightbeam.Toplines -> :ok = Tightbeam.Toplines.ensure_historical_schema(db)
       Tightbeam.NoticeBatcher -> :ok
+      Tightbeam.HarnessProcess -> :ok
       module -> :ok = module.ensure_schema(db)
     end)
 
@@ -1721,6 +1722,7 @@ defmodule Tightbeam.Schema do
     :ok = migrate_continuation_retry_guard(db)
     :ok = upgrade_decision_request_row_schema_revision(db)
     :ok = migrate_supervision_recorded_state(db)
+    :ok = ensure_hot_query_indexes(db)
 
     :ok = Tightbeam.Recognition.ensure_schema(db)
 
@@ -2756,6 +2758,60 @@ defmodule Tightbeam.Schema do
         raise ShapeError,
           message:
             "REST decision-request collection index migration failed: #{Exception.message(error)}"
+    end
+  end
+
+  # These two access paths are one run-once migration. The existing partial
+  # reopened-generation index cannot answer lookups where reopeningId is NULL.
+  defp ensure_hot_query_indexes(db) do
+    case DB.migration_transaction(db, :hot_query_indexes, [], [], fn txn ->
+           :ok =
+             Txn.exec(txn, """
+             CREATE TABLE IF NOT EXISTS hot_query_indexes_migration (
+               id INTEGER PRIMARY KEY CHECK(id=0),
+               appliedAt INTEGER NOT NULL CHECK(appliedAt >= 0)
+             )
+             """)
+
+           case Txn.q(txn, "SELECT id,appliedAt FROM hot_query_indexes_migration") do
+             [] ->
+               :ok =
+                 Txn.exec(
+                   txn,
+                   "CREATE INDEX assignments_reviews_assignment ON assignments(reviewsAssignmentId)"
+                 )
+
+               :ok = Txn.exec(txn, "DROP INDEX assignment_revocation_generation_reopened")
+
+               :ok =
+                 Txn.exec(
+                   txn,
+                   "CREATE UNIQUE INDEX assignment_revocation_generation_reopened " <>
+                     "ON assignment_revocation_generations(assignmentId,reopeningId)"
+                 )
+
+               Txn.q(
+                 txn,
+                 "INSERT INTO hot_query_indexes_migration(id,appliedAt) VALUES(0,?1)",
+                 [System.system_time(:millisecond)]
+               )
+
+             [[0, applied_at]] when is_integer(applied_at) and applied_at >= 0 ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message: "incompatible_hot_query_indexes_migration: #{inspect(rows)}"
+           end
+
+           :ok
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, error} ->
+        raise ShapeError,
+          message: "hot query index migration failed: #{Exception.message(error)}"
     end
   end
 

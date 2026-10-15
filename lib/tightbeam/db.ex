@@ -76,6 +76,9 @@ defmodule Tightbeam.DB do
 
   @queue_limit 128
   @deadline_key {__MODULE__, :deadline}
+  @statement_cache_key {__MODULE__, :statement_cache}
+  # Keep the first 64 distinct SQL strings on each connection; later ones run uncached.
+  @statement_cache_limit 64
 
   @doc false
   def overloaded?(server) do
@@ -134,6 +137,34 @@ defmodule Tightbeam.DB do
     {:ok, run_query(conn, sql, params)}
   rescue
     error -> {:error, error}
+  end
+
+  @doc false
+  def enable_statement_cache(conn) do
+    key = {@statement_cache_key, conn}
+    if is_nil(Process.get(key)), do: Process.put(key, %{})
+    :ok
+  end
+
+  @doc false
+  def clear_statement_cache(conn) do
+    case Process.delete({@statement_cache_key, conn}) do
+      cache when is_map(cache) ->
+        Enum.each(Map.values(cache), &Sqlite3.release(conn, &1))
+
+      _ ->
+        :ok
+    end
+
+    :ok
+  end
+
+  @doc false
+  def statement_cache_size(conn) do
+    case Process.get({@statement_cache_key, conn}) do
+      cache when is_map(cache) -> map_size(cache)
+      _ -> 0
+    end
   end
 
   ## Client
@@ -642,6 +673,7 @@ defmodule Tightbeam.DB do
     :persistent_term.erase({Tightbeam.Recognition, self()})
     :persistent_term.erase({__MODULE__, self()})
     Enum.each(readers, &GenServer.stop/1)
+    :ok = clear_statement_cache(conn)
     # close_v2 may defer destruction until remaining statements finalize.
     # Abnormal process death uses the same Exqlite resource destructor.
     Sqlite3.close(conn)
@@ -699,12 +731,15 @@ defmodule Tightbeam.DB do
     error -> {:reply, {:error, error}, state}
   end
 
-  def handle_call(:finish_schema, _from, %{admission: nil} = state),
-    do: {:reply, :ok, state}
+  def handle_call(:finish_schema, _from, %{admission: nil, conn: conn} = state) do
+    :ok = enable_statement_cache(conn)
+    {:reply, :ok, state}
+  end
 
   def handle_call(:finish_schema, _from, %{conn: conn, admission: admission} = state) do
     rows = run_query(conn, "SELECT shape FROM schema_stamp", [])
     current = Tightbeam.LiveBaseAdmission.publish_marker!(admission, rows)
+    :ok = enable_statement_cache(conn)
     {:reply, :ok, %{state | admission: current}}
   rescue
     error -> {:reply, {:error, error}, state}
@@ -1164,7 +1199,7 @@ defmodule Tightbeam.DB do
     do: DBObservation.sqlite(fn -> :ok = Sqlite3.execute(conn, sql) end)
 
   defp run_query_measured(conn, sql, params) do
-    {:ok, stmt} = Sqlite3.prepare(conn, sql)
+    {stmt, cached?} = prepare_statement(conn, sql)
 
     try do
       bound = Sqlite3.bind(stmt, params)
@@ -1178,7 +1213,32 @@ defmodule Tightbeam.DB do
 
       collect(conn, stmt, [])
     after
-      Sqlite3.release(conn, stmt)
+      unless cached?, do: Sqlite3.release(conn, stmt)
+    end
+  end
+
+  defp prepare_statement(conn, sql) do
+    key = {@statement_cache_key, conn}
+
+    case Process.get(key) do
+      cache when is_map(cache) ->
+        case Map.fetch(cache, sql) do
+          {:ok, stmt} ->
+            {stmt, true}
+
+          :error when map_size(cache) < @statement_cache_limit ->
+            {:ok, stmt} = Sqlite3.prepare(conn, sql)
+            Process.put(key, Map.put(cache, sql, stmt))
+            {stmt, true}
+
+          :error ->
+            {:ok, stmt} = Sqlite3.prepare(conn, sql)
+            {stmt, false}
+        end
+
+      _ ->
+        {:ok, stmt} = Sqlite3.prepare(conn, sql)
+        {stmt, false}
     end
   end
 

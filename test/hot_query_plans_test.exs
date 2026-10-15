@@ -71,4 +71,159 @@ defmodule Tightbeam.HotQueryPlansTest do
 
     assert Enum.map(Ledger.unpublished_terminals(db), & &1.seq) == [1, 2, 3]
   end
+
+  test "review verdict counts find review assignments through their subject index", %{db: db} do
+    direct_plan = plan!(db, "SELECT id FROM assignments WHERE reviewsAssignmentId=?1", ["subject"])
+
+    assert Enum.any?(direct_plan, &String.contains?(&1, "assignments_reviews_assignment"))
+
+    assignment_verdict_plan =
+      plan!(
+        db,
+        """
+        SELECT v.verdictKind, v.byHarness, v.byProvider
+        FROM attests AS v
+        JOIN assignments AS r ON r.id = v.assignmentId
+        WHERE r.reviewsAssignmentId = ?1
+          AND v.kind = 'verdict'
+          AND v.bySession = r.holderKey
+          AND v.bySession != ?2
+        ORDER BY v.ts ASC, v.id ASC
+        """,
+        ["subject", "session"]
+      )
+
+    assert Enum.any?(
+             assignment_verdict_plan,
+             &String.contains?(&1, "assignments_reviews_assignment")
+           )
+
+    count_plan =
+      plan!(
+        db,
+        """
+        SELECT COUNT(*)
+        FROM assignments review
+        JOIN attests verdict ON verdict.assignmentId=review.id
+        WHERE review.reviewsAssignmentId =
+              (SELECT COALESCE(reviewsAssignmentId, id) FROM assignments WHERE id = ?1)
+          AND verdict.kind = 'verdict'
+        """,
+        ["subject"]
+      )
+
+    assert Enum.any?(count_plan, &String.contains?(&1, "assignments_reviews_assignment"))
+
+    work_item_count_plan =
+      plan!(
+        db,
+        """
+        SELECT COUNT(*)
+        FROM assignments producer
+        JOIN assignments review ON review.reviewsAssignmentId=producer.id
+        JOIN attests verdict ON verdict.assignmentId=review.id
+        WHERE producer.workItemId=?1
+          AND review.workItemId IS NULL
+          AND verdict.kind='verdict'
+          AND verdict.verdictKind='changes-requested'
+        """,
+        ["work-item"]
+      )
+
+    assert Enum.any?(
+             work_item_count_plan,
+             &String.contains?(&1, "assignments_reviews_assignment")
+           )
+
+    compatibility_count_plan =
+      plan!(
+        db,
+        """
+        SELECT COUNT(*)
+        FROM assignments producer
+        JOIN assignments review ON review.reviewsAssignmentId=producer.id
+        JOIN attests verdict ON verdict.assignmentId=review.id
+        WHERE producer.workItemId=?1
+          AND review.workItemId IS NULL
+          AND review.reviewsAssignmentId IS NOT NULL
+          AND verdict.kind='verdict'
+          AND verdict.rowid <= (SELECT rowid FROM attests WHERE id=?2)
+        """,
+        ["work-item", "attest"]
+      )
+
+    assert Enum.any?(
+             compatibility_count_plan,
+             &String.contains?(&1, "assignments_reviews_assignment")
+           )
+  end
+
+  test "revocation generation reads use both indexed keys", %{db: db} do
+    plan =
+      plan!(
+        db,
+        """
+        SELECT a.id,
+               (SELECT r.reason FROM assignment_revocation_generations g
+                JOIN assignment_revocations r ON r.id=g.revocationId
+                WHERE g.assignmentId=a.id AND g.reopeningId IS
+                  (SELECT reopening.id FROM assignment_reopenings reopening
+                   WHERE reopening.assignmentId=a.id ORDER BY reopening.id DESC LIMIT 1))
+        FROM assignments a
+        """,
+        []
+      )
+
+    assert Enum.any?(
+             plan,
+             &String.contains?(&1, "assignment_revocation_generation_reopened")
+           )
+
+    refute Enum.any?(plan, &Regex.match?(~r/^SCAN g\b/, &1))
+  end
+
+  test "running turn lookups use the pending-turn partial index", %{db: db} do
+    plan =
+      plan!(
+        db,
+        "SELECT messageId FROM turns WHERE sessionKey=?1 AND status='running' " <>
+          "AND status IN ('queued','running') LIMIT 1",
+        ["session"]
+      )
+
+    assert Enum.any?(plan, &String.contains?(&1, "turns_pending"))
+    refute Enum.any?(plan, &Regex.match?(~r/^SCAN turns\b/, &1))
+
+    recovery_plan =
+      plan!(
+        db,
+        "SELECT seq,sessionKey FROM turns WHERE status='running' " <>
+          "AND status IN ('queued','running') AND sessionKey=?1",
+        ["session"]
+      )
+
+    assert Enum.any?(recovery_plan, &String.contains?(&1, "turns_pending"))
+    refute Enum.any?(recovery_plan, &Regex.match?(~r/^SCAN turns\b/, &1))
+  end
+
+  test "hot query indexes are recorded and skipped on a second boot", %{db: db} do
+    {:ok, [[applied_at]]} =
+      DB.query(db, "SELECT appliedAt FROM hot_query_indexes_migration WHERE id=0")
+
+    {:ok, [[before_version]]} = DB.query(db, "PRAGMA schema_version")
+    assert :ok = Tightbeam.Schema.ensure_all(db)
+
+    assert {:ok, [[^applied_at]]} =
+             DB.query(db, "SELECT appliedAt FROM hot_query_indexes_migration WHERE id=0")
+
+    assert {:ok, [[^before_version]]} = DB.query(db, "PRAGMA schema_version")
+    assert {:ok, [[index_sql]]} =
+             DB.query(
+               db,
+               "SELECT sql FROM sqlite_master WHERE type='index' " <>
+                 "AND name='assignment_revocation_generation_reopened'"
+             )
+
+    refute index_sql =~ "WHERE"
+  end
 end
