@@ -428,6 +428,10 @@ defmodule Tightbeam.SupervisionConsumerFixture do
 
     refute newer_id == fact_id
 
+    # The condition reply no longer waits for the scheduler's delivery pass,
+    # which runs as its next message; wait for that pass before reading it.
+    assert :ok = Wakes.fire_due(:r1_api_scheduler)
+
     assert {:ok, [[pending_json]]} =
              DB.query(ctx.db, "SELECT reminderState FROM assignments WHERE id='asg_1'")
 
