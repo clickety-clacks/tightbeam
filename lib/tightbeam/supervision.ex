@@ -1912,8 +1912,22 @@ defmodule Tightbeam.Supervision do
 
   def handle_info(:detect_misses, state) do
     DB.background_pass(fn ->
-      safe_evaluate(state, "miss_check", fn -> detect_misses(state) end)
-      sweep(state)
+      safe_evaluate(state, "miss_check", fn ->
+        pending = query(state.db, "SELECT sessionKey,pendingBranch FROM supervision_watermarks WHERE pendingBranch IS NOT NULL")
+        escalations = query(state.db, "SELECT id,sessionKey,state FROM patrol_failure_escalations WHERE state IN ('pending','admitted')")
+        detect_misses(state)
+        sweep(state)
+        Enum.each(pending, fn [session, branch] ->
+          if query(state.db, "SELECT 1 FROM supervision_watermarks WHERE sessionKey=?1 AND pendingBranch=?2", [session, branch]) == [] do
+            Tightbeam.SchedulerMisses.record(:supervision, "pending_branch session=#{session}")
+          end
+        end)
+        Enum.each(escalations, fn [id, session, prior] ->
+          if query(state.db, "SELECT state FROM patrol_failure_escalations WHERE id=?1", [id]) != [[prior]] do
+            Tightbeam.SchedulerMisses.record(:supervision, "failure_escalation session=#{session}")
+          end
+        end)
+      end)
     end)
 
     Process.send_after(self(), :detect_misses, 180_000)
@@ -4552,7 +4566,10 @@ defmodule Tightbeam.Supervision do
       reraise error, __STACKTRACE__
 
     error ->
-      Logger.warning("idle cleanup refused session=#{session.session_key}: #{Exception.message(error)}")
+      Logger.warning(
+        "idle cleanup refused session=#{session.session_key}: #{Exception.message(error)}"
+      )
+
       idle_cleanup_refusal_in_txn(txn, session.session_key, Exception.message(error))
       nil
   end
@@ -5714,7 +5731,8 @@ defmodule Tightbeam.Supervision do
 
     Enum.each(rows, fn [session, seq, ended_at, unclassified] ->
       if ended_at < now() - 60_000 and
-           (unclassified == 1 or match?({:match, _}, prod_production_matches?(state.db, session, seq))) do
+           (unclassified == 1 or
+              match?({:match, _}, prod_production_matches?(state.db, session, seq))) do
         Tightbeam.SchedulerMisses.record(
           :supervision,
           "terminal session=#{session} turn=#{seq}",

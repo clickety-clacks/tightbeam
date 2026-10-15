@@ -252,6 +252,16 @@ defmodule Tightbeam.SupervisionTest do
     assert Tightbeam.SchedulerMisses.count() == before + 1
   end
 
+  test "a bad cleanup record does not stop other sessions or deadline scheduling", ctx do
+    idle_cleanup_fixture!(ctx, ["bad-cleanup", "healthy-cleanup"])
+    {:ok, _} = DB.query(ctx.db, "UPDATE sessions SET archetype='unknown-cleanup' WHERE sessionKey='bad-cleanup'")
+    ExUnit.CaptureLog.capture_log(fn ->
+      name = start_liveness!(ctx, sweep_ms: 60_000, name: Supervision)
+      assert Process.alive?(Process.whereis(name))
+      assert Enum.any?(idle_cleanup_wakes(ctx.db), &String.contains?(&1.prompt, "child=healthy-cleanup;"))
+    end)
+  end
+
   test "schema and neutral row APIs expose the exact durable state", ctx do
     assert Assignments.oldest_open(ctx.db, "holder").id == "asg_1"
     assert Assignments.attest_count(ctx.db, "asg_1") == 0
