@@ -176,6 +176,21 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
     assert Wakes.health(pid) == %{misses: 0}
   end
 
+  test "recipient readiness cancels a deadline satisfied by an early recognized notice", ctx do
+    pid = scheduler(ctx)
+    source = wake(ctx.db, System.system_time(:millisecond) + 60_000)
+    assert is_reference(:sys.get_state(pid).timer)
+    assert {:ok, {:ok, _}} = DB.transaction(ctx.db, fn txn ->
+      Wakes.prepare_prompt_source_for_batch_in_txn(txn, source.wake_id,
+        "recipient", source.prompt)
+    end)
+    Wakes.recipient_ready(pid, "recipient")
+    assert :sys.get_state(pid).timer == nil
+    assert {:ok, [[seq]]} = DB.query(ctx.db,
+      "SELECT deliveredTurnSeq FROM wakes WHERE wakeId=?1", [source.wake_id])
+    assert is_integer(seq)
+  end
+
   test "the detector ignores busy recipients then delivers and logs a suppressed readiness signal",
        ctx do
     turn = busy(ctx.db)

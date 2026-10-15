@@ -6435,7 +6435,7 @@ defmodule Tightbeam.Wakes do
       NoticeBatcher.recover(state.db, now(), state.delivery_opts, session_key)
     end)
 
-    {:noreply, state}
+    {:noreply, arm_due_timer(state)}
   end
 
   @impl true
