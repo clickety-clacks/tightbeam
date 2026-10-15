@@ -255,39 +255,53 @@ defmodule Tightbeam.Spinup do
                 {{:error, denial}, "reached; directories ensured; DENIED: #{denial.message}"}
 
               {:ok, adapter_detail} ->
-                if credential_ready?(
-                     target,
-                     module,
-                     home,
-                     credential_provider,
-                     credential_names
-                   ) do
-                  {:ok, "reached; directories ensured; #{adapter_detail}; credentials present"}
-                else
-                  credential_location =
-                    cond do
-                      module == Tightbeam.Harness.Cursor ->
-                        store = Credentials.store_dir(host.base_dir, :cursor)
-                        "Tightbeam keeps its own credential under #{store}."
+                case Harness.materialize_legacy_credential_link(module, target, home) do
+                  :ok ->
+                    if credential_ready?(
+                         target,
+                         module,
+                         home,
+                         credential_provider,
+                         credential_names
+                       ) do
+                      {:ok,
+                       "reached; directories ensured; #{adapter_detail}; credentials present"}
+                    else
+                      credential_location =
+                        cond do
+                          module == Tightbeam.Harness.Cursor ->
+                            store = Credentials.store_dir(host.base_dir, :cursor)
+                            "Tightbeam keeps its own credential under #{store}."
 
-                      credential_provider == :local_openai ->
-                        auth_dir = Providers.providers_dir(host.base_dir)
-                        "The credential belongs only in #{auth_dir}."
+                          credential_provider == :local_openai ->
+                            auth_dir = Providers.providers_dir(host.base_dir)
+                            "The credential belongs only in #{auth_dir}."
 
-                      true ->
-                        "The credential belongs only in #{home}."
+                          true ->
+                            "The credential belongs only in #{home}."
+                        end
+
+                      message =
+                        "host #{target.host_name} is not ready for #{module.wire_name()}: " <>
+                          "Tightbeam has no credential for #{credential_provider} on " <>
+                          "#{target.host_name}. It does not use or import your normal " <>
+                          "#{module.wire_name()} CLI login. #{credential_location} " <>
+                          "Run on #{target.host_name}: " <>
+                          Credentials.onboard_command(credential_provider)
+
+                      {{:error, host_unready(message)},
+                       "reached; directories ensured; #{adapter_detail}; DENIED: #{message}"}
                     end
 
-                  message =
-                    "host #{target.host_name} is not ready for #{module.wire_name()}: " <>
-                      "Tightbeam has no credential for #{credential_provider} on " <>
-                      "#{target.host_name}. It does not use or import your normal " <>
-                      "#{module.wire_name()} CLI login. #{credential_location} " <>
-                      "Run on #{target.host_name}: " <>
-                      Credentials.onboard_command(credential_provider)
+                  {:error, %{path: path, source: source, reason: reason}} ->
+                    message =
+                      "host #{target.host_name} is not ready for #{module.wire_name()}: " <>
+                        "Tightbeam could not safely materialize the linked credential at " <>
+                        "#{path} from #{source} (#{migration_reason(reason)}). The auth store " <>
+                        "was left intact; repair the link or filesystem condition and retry."
 
-                  {{:error, host_unready(message)},
-                   "reached; directories ensured; #{adapter_detail}; DENIED: #{message}"}
+                    {{:error, host_unready(message)},
+                     "reached; directories ensured; #{adapter_detail}; DENIED: #{message}"}
                 end
             end
         end
@@ -312,6 +326,26 @@ defmodule Tightbeam.Spinup do
 
   defp credential_ready?(target, module, home, _provider, _names),
     do: module.credential_ready?(target, home)
+
+  defp migration_reason(:source_missing), do: "the expected auth file is missing"
+  defp migration_reason(:source_not_regular), do: "the expected auth entry is not a regular file"
+  defp migration_reason(:source_unreadable), do: "the expected auth file is unreadable"
+
+  defp migration_reason(:unsafe_access_mode),
+    do: "the expected auth file does not grant owner read access"
+
+  defp migration_reason(:source_changed), do: "the auth file changed during migration"
+  defp migration_reason(:destination_changed), do: "the home link changed during migration"
+
+  defp migration_reason(:unsupported_destination),
+    do: "the home entry is not a regular file or link"
+
+  defp migration_reason(:unsafe_or_unreadable_link),
+    do: "the link is unreadable or leaves the installation boundary"
+
+  defp migration_reason(:staging_failed), do: "a private migration stage could not be created"
+  defp migration_reason(:promotion_failed), do: "the staged regular file could not be installed"
+  defp migration_reason(_reason), do: "the remote migration could not be completed safely"
 
   defp remote_command(destination, script) do
     ["ssh" | Support.ssh_opts()] ++ [destination, "sh", "-c", shell_quote(script)]

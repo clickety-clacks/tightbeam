@@ -404,6 +404,16 @@ defmodule Tightbeam.Credentials do
   end
 
   @doc false
+  def legacy_credential_path(base_dir, provider) when provider in [:openai, :anthropic] do
+    Path.join([
+      base_dir,
+      "auth",
+      Atom.to_string(harness_id(provider)),
+      credential_filename(provider)
+    ])
+  end
+
+  @doc false
   def credential_secret_paths(base_dir) do
     base_dir = Path.expand(base_dir)
     active = active_credential_secret_paths(base_dir)
