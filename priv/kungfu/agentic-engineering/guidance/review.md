@@ -21,10 +21,11 @@ inside the existing architecture): the work item's input is the ask and the
 orchestrator already ruled it sufficient; pass unless something is egregiously
 wrong. A bounded spike is light. The signals that make work heavy are a new public
 surface, a changed contract other code depends on, a new process or service, a
-schema change, or a new dependency; without one of those it is light. Check a
-change an order of magnitude larger than its ask for unasked additions before it
-passes. When the work disagrees with the verdict, review at the weight the work
-warrants and say so in the report.
+schema change, or a new dependency; without one of those it is light unless it
+adds unasked machinery. Every review, light or heavy and whatever the size, checks
+the work for additions the ask did not require. Unasked machinery is never light.
+When the work disagrees with the verdict, review at the weight the work warrants
+and say so in the report.
 
 Record a proportionate report with the exact subject/revision, evidence and limits,
 findings and consequences:

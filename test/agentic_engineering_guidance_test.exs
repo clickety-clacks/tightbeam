@@ -15,17 +15,41 @@ defmodule Tightbeam.AgenticEngineeringGuidanceTest do
            """
   end
 
-  test "light review checks disproportionate changes for unasked additions" do
+  test "every review checks unasked additions and unasked machinery is never light" do
     text = File.read!(Path.join(@guidance, "review.md"))
 
     assert text =~ """
-           schema change, or a new dependency; without one of those it is light. Check a
-           change an order of magnitude larger than its ask for unasked additions before it
-           passes. When the work disagrees with the verdict, review at the weight the work
-           warrants and say so in the report.
+           schema change, or a new dependency; without one of those it is light unless it
+           adds unasked machinery. Every review, light or heavy and whatever the size, checks
+           the work for additions the ask did not require. Unasked machinery is never light.
+           When the work disagrees with the verdict, review at the weight the work warrants
+           and say so in the report.
            """
 
     refute text =~ "light however large"
+    refute text =~ "an order of magnitude larger"
+  end
+
+  test "spec writers cite the ask or a ruling for every addition" do
+    text = File.read!(Path.join(@guidance, "spec-writer.md"))
+
+    assert text =~ """
+           - Every requirement, mechanism, component, table, process and setting cites what it
+             serves: a quote from the ask or a ruling. Anything that cannot cite one is cut,
+             or raised to the PO as a question; never write it in on spec.
+           """
+  end
+
+  test "spec review blocks uncited requirements unless the PO accepts them" do
+    text = File.read!(Path.join(@guidance, "reviewer-spec.md"))
+
+    assert text =~ """
+           simpler adequate alternative when useful. Check every requirement and mechanism
+           against the ask: each must cite the ask or a ruling it serves. An uncited one is a
+           blocker unless the PO accepts it. Do not cut what the ask needs to save lines.
+           """
+
+    refute text =~ "Future flexibility or a smaller line"
   end
 
   test "coders ask before building beyond the ask" do
