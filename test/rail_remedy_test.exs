@@ -2404,7 +2404,7 @@ defmodule Tightbeam.RailRemedyTest do
     )
 
     error =
-      assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end
+      assert_unavailable(ctx, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end)
 
     assert error.message =~ "completion-needs-review"
     assert error.message =~ "does not require"
@@ -2426,7 +2426,7 @@ defmodule Tightbeam.RailRemedyTest do
     )
 
     error =
-      assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end
+      assert_unavailable(ctx, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end)
 
     assert error.message =~ "valid only on a verdict-fact gate"
 
@@ -2437,20 +2437,20 @@ defmodule Tightbeam.RailRemedyTest do
     )
 
     error =
-      assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end
+      assert_unavailable(ctx, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end)
 
     assert error.message =~ "must be a verdictKind required by the gate"
 
     put_rules(ctx, external_missing_gate())
 
     error =
-      assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end
+      assert_unavailable(ctx, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end)
 
     assert error.message =~ "F1"
     assert error.message =~ "missing-producer"
 
     put_rules(ctx, review_gate())
-    error = assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, ["attest"]) end
+    error = assert_unavailable(ctx, fn -> Rules.load!(ctx.base_dir, ["attest"]) end)
     assert error.message =~ "F2"
     assert error.message =~ "completion-needs-review"
     assert error.message =~ "assign"
@@ -2458,7 +2458,7 @@ defmodule Tightbeam.RailRemedyTest do
     put_rules(ctx, review_gate() <> pure_blocker())
 
     error =
-      assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end
+      assert_unavailable(ctx, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end)
 
     assert error.message =~ "completion-needs-review"
     assert error.message =~ "block-remedy-assign"
@@ -2466,7 +2466,7 @@ defmodule Tightbeam.RailRemedyTest do
     put_rules(ctx, cycle_rules())
 
     error =
-      assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end
+      assert_unavailable(ctx, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end)
 
     assert error.message =~ "F2 producer cycle"
     assert error.message =~ "cycle-assign"
@@ -2518,9 +2518,7 @@ defmodule Tightbeam.RailRemedyTest do
       put_rules(ctx, law)
 
       error =
-        assert_raise ArgumentError, fn ->
-          Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
-        end
+        assert_unavailable(ctx, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end)
 
       assert error.message =~ message
     end)
@@ -3280,4 +3278,23 @@ defmodule Tightbeam.RailRemedyTest do
       model: Model.new("test")
     })
   end
+
+  defp assert_unavailable(ctx, load) do
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert is_list(load.())
+      end)
+
+    assert log =~ "unavailable"
+    unavailable = :persistent_term.get({Rules, :unavailable_verbs})
+    assert map_size(unavailable) > 0
+
+    for {verb, _source} <- unavailable do
+      assert {:deny, %{code: "rule_unavailable"}} =
+               Rules.evaluate(ctx.db, %{verb: verb, origin: "user:flynn", params: %{}})
+    end
+
+    %{message: log}
+  end
+
 end

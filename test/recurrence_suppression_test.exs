@@ -498,7 +498,7 @@ defmodule Tightbeam.RecurrenceSuppressionTest do
   end
 
   test "loader requires the complete deterministic declaration and keeps legacy rules valid",
-       _ctx do
+       ctx do
     base = Path.join(System.tmp_dir!(), "recurrence-loader-#{System.unique_integer([:positive])}")
     File.mkdir_p!(Path.join(base, "identity/rules"))
     on_exit(fn -> File.rm_rf!(base) end)
@@ -563,7 +563,16 @@ defmodule Tightbeam.RecurrenceSuppressionTest do
 
     for {contents, message} <- malformed do
       File.write!(Path.join([base, "identity/rules/rule.toml"]), contents)
-      assert_raise ArgumentError, ~r/#{message}/, fn -> Rules.load!(base, ["post", "wake"]) end
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert [] = Rules.load!(base, ["post", "wake"])
+        end)
+
+      assert log =~ "unavailable"
+      assert log =~ message
+
+      assert {:deny, %{code: "rule_unavailable"}} =
+               Rules.evaluate(ctx.db, %{verb: "post", origin: "user:mike", params: %{}})
     end
   end
 
