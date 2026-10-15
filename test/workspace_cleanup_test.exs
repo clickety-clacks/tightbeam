@@ -250,6 +250,17 @@ defmodule Tightbeam.WorkspaceCleanupTest do
     # The moved entry remains discoverable through its old database prefix.
     assert Artifacts.get(ctx.db, artifact.artifact_id).home == old_home
     :ok = DB.execute(ctx.db, "DROP TRIGGER refuse_archive_repoint")
+
+    :sys.replace_state(worker, fn state ->
+      %{
+        state
+        | relocation_failures:
+            Map.new(state.relocation_failures, fn {entry, _} ->
+              {entry, System.monotonic_time(:millisecond) - 1}
+            end)
+      }
+    end)
+
     send(worker, :drain)
     :sys.get_state(worker)
     moved = Artifacts.get(ctx.db, artifact.artifact_id)
@@ -499,6 +510,72 @@ defmodule Tightbeam.WorkspaceCleanupTest do
     :sys.get_state(worker)
     assert File.ls!(source) == []
     assert File.read!(Path.join([destination, "second", "kept"])) == "second"
+  end
+
+  test "failed archive entries wait while later entries relocate, then retry when due", ctx do
+    source = Path.join(ctx.base, "archive")
+    destination = Path.join(ctx.base, "destination")
+    File.mkdir_p!(source)
+    # A file cannot be relocated as an archive directory.
+    File.write!(Path.join(source, "first"), "blocked")
+    File.mkdir_p!(Path.join(source, "second"))
+    File.write!(Path.join([source, "second", "kept"]), "preserve")
+    Application.put_env(:tightbeam, :archive_dir, destination)
+    on_exit(fn -> Application.delete_env(:tightbeam, :archive_dir) end)
+    worker = start_supervised!({WorkspaceCleanup, config: ctx.config})
+
+    send(worker, :drain)
+    state = :sys.get_state(worker)
+    retry_at = Map.fetch!(state.relocation_failures, "first")
+    assert retry_at > System.monotonic_time(:millisecond) + 290_000
+
+    send(worker, :drain)
+    :sys.get_state(worker)
+    assert File.read!(Path.join([destination, "second", "kept"])) == "preserve"
+    File.rm!(Path.join(source, "first"))
+    File.mkdir_p!(Path.join(source, "first"))
+    send(worker, :drain)
+    state = :sys.get_state(worker)
+    assert state.relocation_failures == %{"first" => retry_at}
+    assert Process.read_timer(state.timer) > 290_000
+    assert File.dir?(Path.join(source, "first"))
+
+    :sys.replace_state(worker, fn state ->
+      %{state | relocation_failures: %{"first" => System.monotonic_time(:millisecond) - 1}}
+    end)
+
+    send(worker, :drain)
+    assert :sys.get_state(worker).relocation_failures == %{}
+    refute File.exists?(Path.join(source, "first"))
+    assert File.dir?(Path.join(destination, "first"))
+  end
+
+  test "a database exit during relocation leaves the worker alive", ctx do
+    Application.put_env(:tightbeam, :archive_dir, Path.join(ctx.base, "destination"))
+    on_exit(fn -> Application.delete_env(:tightbeam, :archive_dir) end)
+    dead = spawn(fn -> :ok end)
+    monitor = Process.monitor(dead)
+    assert_receive {:DOWN, ^monitor, :process, ^dead, _}
+    worker = start_supervised!({WorkspaceCleanup, config: ctx.config})
+    :sys.replace_state(worker, &%{&1 | db: dead})
+    send(worker, :drain)
+    state = :sys.get_state(worker)
+    assert Process.alive?(worker)
+    assert Process.read_timer(state.timer) > 0
+  end
+
+  test "all missing artifacts leave no workspace or empty archive", ctx do
+    artifact = artifact(ctx, Path.join(ctx.workspace, "nested/lost"))
+    File.mkdir_p!(Path.join(ctx.workspace, "nested"))
+    File.write!(Path.join(ctx.workspace, "scratch"), "discard")
+    retire(ctx)
+
+    assert %{status: "completed", blockers: [%{reason: "artifact_missing"}]} =
+             WorkspaceCleanup.process_session(ctx.config, ctx.db, ctx.session.session_key)
+
+    refute File.exists?(ctx.workspace)
+    refute File.exists?(Path.join(ctx.base, "archive"))
+    assert Artifacts.get(ctx.db, artifact.artifact_id).state == "in-workspace"
   end
 
   test "an absent workspace finishes with missing artifact reasons", ctx do

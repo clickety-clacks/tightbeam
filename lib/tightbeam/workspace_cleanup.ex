@@ -28,7 +28,7 @@ defmodule Tightbeam.WorkspaceCleanup do
   def init(opts) do
     config = Keyword.fetch!(opts, :config)
     timer = Process.send_after(self(), :drain, 30_000)
-    {:ok, %{config: config, db: Map.get(config, :db, DB), timer: timer}}
+    {:ok, %{config: config, db: Map.get(config, :db, DB), timer: timer, relocation_failures: %{}}}
   end
 
   def handle_info(:drain, state) do
@@ -65,17 +65,12 @@ defmodule Tightbeam.WorkspaceCleanup do
           60_000
       end
 
-    relocated = relocate_archive(state.config, state.db)
+    {relocation_delay, relocation_failures} =
+      relocate_archive(state.config, state.db, state.relocation_failures)
 
-    delay =
-      case relocated do
-        true -> min(delay || 1_000, 1_000)
-        :retry -> min(delay || 300_000, 300_000)
-        false -> delay
-      end
-
+    delay = if relocation_delay, do: min(delay || relocation_delay, relocation_delay), else: delay
     timer = if delay, do: Process.send_after(self(), :drain, delay)
-    {:noreply, %{state | timer: timer}}
+    {:noreply, %{state | timer: timer, relocation_failures: relocation_failures}}
   end
 
   def archive_root(%{ssh: nil} = host),
@@ -83,7 +78,7 @@ defmodule Tightbeam.WorkspaceCleanup do
 
   def archive_root(host), do: Path.join(host.base_dir, "archive")
 
-  defp relocate_archive(config, db) do
+  defp relocate_archive(config, db, failures) do
     source = Path.join(config.base_dir, "archive")
     destination = archive_root(%{ssh: nil, base_dir: config.base_dir})
 
@@ -96,7 +91,7 @@ defmodule Tightbeam.WorkspaceCleanup do
       {:ok, rows} =
         DB.query(
           db,
-          "SELECT home FROM artifacts WHERE state='archived' AND (originHost=?2 OR originHost IS NULL) AND substr(home,1,length(?1)+1)=?1 || '/' UNION SELECT archivePath FROM retired_workspace_cleanup WHERE substr(archivePath,1,length(?1)+1)=?1 || '/' AND sessionKey IN (SELECT sessionKey FROM sessions WHERE host=?2) LIMIT 1",
+          "SELECT home FROM artifacts WHERE state='archived' AND (originHost=?2 OR originHost IS NULL) AND substr(home,1,length(?1)+1)=?1 || '/' UNION SELECT archivePath FROM retired_workspace_cleanup WHERE substr(archivePath,1,length(?1)+1)=?1 || '/' AND sessionKey IN (SELECT sessionKey FROM sessions WHERE host=?2)",
           [source, Tightbeam.Placement.local_host_name()]
         )
 
@@ -115,61 +110,87 @@ defmodule Tightbeam.WorkspaceCleanup do
             raise File.Error, reason: reason, action: "list archive", path: source
         end
 
-      case Enum.sort(Enum.uniq(entries ++ recorded)) do
-        [] ->
-          false
+      entries = Enum.sort(Enum.uniq(entries ++ recorded))
+      failures = Map.take(failures, entries)
+      now = System.monotonic_time(:millisecond)
 
-        [entry | _] ->
-          old = Path.join(source, entry)
-          target = Path.join(destination, entry)
+      entry =
+        Enum.find(entries, &(not Map.has_key?(failures, &1))) ||
+          Enum.find(entries, &(Map.fetch!(failures, &1) <= now))
 
-          script =
-            move_script() <> "\nmove_workspace " <> shell_quote(old) <> " " <> shell_quote(target)
+      if entry do
+        case relocate_entry(config, db, source, destination, entry) do
+          :ok ->
+            {1_000, Map.delete(failures, entry)}
 
-          runner = Map.get(config, :workspace_cleanup_runner) || (&system_runner/3)
-
-          {_output, 0} =
-            run_bounded(runner, ["sh", "-c", script], script, "", @default_runner_timeout_ms)
-
-          {:ok, :ok} =
-            DB.transaction(db, fn txn ->
-              Txn.q(
-                txn,
-                "SELECT artifactId,home FROM artifacts WHERE state='archived' AND (originHost=?2 OR originHost IS NULL) AND (home=?1 OR substr(home,1,length(?1)+1)=?1 || '/')",
-                [old, Tightbeam.Placement.local_host_name()]
-              )
-              |> Enum.each(fn [id, home] ->
-                Tightbeam.Artifacts.repoint_archive_in_txn(
-                  txn,
-                  id,
-                  target <> String.replace_prefix(home, old, "")
-                )
-              end)
-
-              Txn.q(
-                txn,
-                "UPDATE retired_workspace_cleanup SET archivePath=?2 WHERE archivePath=?1 AND sessionKey IN (SELECT sessionKey FROM sessions WHERE host=?3)",
-                [old, target, Tightbeam.Placement.local_host_name()]
-              )
-
-              :ok
-            end)
-
-          true
+          :retry ->
+            {1_000, Map.put(failures, entry, System.monotonic_time(:millisecond) + 300_000)}
+        end
+      else
+        delay = failures |> Map.values() |> Enum.min(fn -> nil end)
+        {if(delay, do: max(delay - now, 1_000)), failures}
       end
     else
-      false
+      {nil, failures}
     end
   rescue
     error ->
       Logger.warning("archive relocation deferred: #{Exception.message(error)}")
+      {300_000, failures}
+  catch
+    kind, error ->
+      Logger.warning("archive relocation deferred: #{kind}: #{inspect(error)}")
+      {300_000, failures}
+  end
+
+  defp relocate_entry(config, db, source, destination, entry) do
+    old = Path.join(source, entry)
+    target = Path.join(destination, entry)
+
+    script =
+      move_script() <> "\nmove_workspace " <> shell_quote(old) <> " " <> shell_quote(target)
+
+    runner = Map.get(config, :workspace_cleanup_runner) || (&system_runner/3)
+
+    {_output, 0} =
+      run_bounded(runner, ["sh", "-c", script], script, "", @default_runner_timeout_ms)
+
+    {:ok, :ok} =
+      DB.transaction(db, fn txn ->
+        Txn.q(
+          txn,
+          "SELECT artifactId,home FROM artifacts WHERE state='archived' AND (originHost=?2 OR originHost IS NULL) AND (home=?1 OR substr(home,1,length(?1)+1)=?1 || '/')",
+          [old, Tightbeam.Placement.local_host_name()]
+        )
+        |> Enum.each(fn [id, home] ->
+          Tightbeam.Artifacts.repoint_archive_in_txn(
+            txn,
+            id,
+            target <> String.replace_prefix(home, old, "")
+          )
+        end)
+
+        Txn.q(
+          txn,
+          "UPDATE retired_workspace_cleanup SET archivePath=?2 WHERE archivePath=?1 AND sessionKey IN (SELECT sessionKey FROM sessions WHERE host=?3)",
+          [old, target, Tightbeam.Placement.local_host_name()]
+        )
+
+        :ok
+      end)
+
+    :ok
+  rescue
+    error ->
+      Logger.warning("archive relocation deferred for #{entry}: #{Exception.message(error)}")
+      :retry
+  catch
+    kind, error ->
+      Logger.warning("archive relocation deferred for #{entry}: #{kind}: #{inspect(error)}")
       :retry
   end
 
-  defp archive_name(key),
-    do:
-      Base.url_encode64(key, padding: false) <>
-        "-" <> Base.encode16(:crypto.strong_rand_bytes(6), case: :lower)
+  defp archive_name(key), do: Base.url_encode64(key, padding: false)
 
   defp move_script(timeout_ms \\ @default_runner_timeout_ms) do
     """
@@ -333,9 +354,6 @@ defmodule Tightbeam.WorkspaceCleanup do
 
     record_report(db, report)
   end
-
-  @doc false
-  def default_runner_timeout_ms, do: @default_runner_timeout_ms
 
   @doc false
   def system_runner(invocation, _script, input) do
@@ -792,6 +810,7 @@ defmodule Tightbeam.WorkspaceCleanup do
     keep_list=$(cat)
     had_error=0
     unsafe_route=0
+    present_keep_list=
 
     emit_path() {
       printf '%s' "$1" | od -An -v -tx1 | tr -d ' \n'
@@ -979,6 +998,7 @@ defmodule Tightbeam.WorkspaceCleanup do
           if [ ! -e "$root/$keep" ] && [ ! -L "$root/$keep" ]; then
             emit_error artifact_missing "$keep"
           else
+            present_keep_list="${present_keep_list:+$present_keep_list$newline}$keep"
             exact_keep_path "$keep"
             keep_status=$?
             case "$keep_status" in
@@ -990,6 +1010,7 @@ defmodule Tightbeam.WorkspaceCleanup do
         done
         set +f
         IFS=$saved_ifs
+        keep_list=$present_keep_list
 
         if [ "$unsafe_route" -eq 0 ] && ! is_protected .; then
           if cleanup_dir ""; then :; else had_error=1; fi

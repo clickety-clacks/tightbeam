@@ -9896,8 +9896,6 @@ defmodule Tightbeam.Gateway do
                   end
                 )
 
-              WorkspaceCleanup.kick()
-
               Enum.each(result.retired, fn retired ->
                 try do
                   broadcast(db, owner, Payloads.stream_deleted(retired.session_key))
