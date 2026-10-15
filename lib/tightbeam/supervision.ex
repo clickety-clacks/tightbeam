@@ -3351,8 +3351,14 @@ defmodule Tightbeam.Supervision do
               interval
             )
 
+          # Startup must not fail on one assignment whose escalation history no
+          # longer validates (for example, after its holder was reparented).
+          # The check is read-only; leave the assignment as it is.
           {:error, reason} ->
-            raise "incompatible_supervision_liveness_v1: #{reason}"
+            Logger.warning(
+              "supervision recovery skipped assignment #{assignment_id} and left it " <>
+                "unchanged: incompatible_supervision_liveness_v1: #{reason}"
+            )
         end
       end)
     end)
@@ -5629,36 +5635,95 @@ defmodule Tightbeam.Supervision do
     end
   end
 
+  # One-time upgrade step, recorded in supervision_liveness_migrations so later
+  # boots skip it. An assignment it cannot reconcile is logged and left as it
+  # is: a record this step does not understand must never stop the gateway
+  # from starting. For example, an old escalation whose holder was reparented
+  # afterwards no longer resolves to the parent it was sent to.
+  @legacy_parent_retirements_migration "0.1.9/legacy-parent-retirements-v1"
+
   defp migrate_legacy_parent_retirements_in_txn(txn) do
-    activation_epoch = liveness_epoch!(txn)
+    case Txn.q(
+           txn,
+           "SELECT 1 FROM supervision_liveness_migrations WHERE migrationId=?1",
+           [@legacy_parent_retirements_migration]
+         ) do
+      [[1]] ->
+        :ok
 
-    assignments =
-      Txn.q(
-        txn,
-        """
-        SELECT a.id
-        FROM assignments a
-        LEFT JOIN supervision_entitlements e ON e.assignmentId=a.id
-        WHERE a.state='open' AND e.assignmentId IS NULL
-        ORDER BY a.openedAt, a.id
-        """
-      )
+      [] ->
+        activation_epoch = liveness_epoch!(txn)
 
-    Enum.each(assignments, fn [assignment_id] ->
-      case legacy_outcomes_in_txn(txn, assignment_id) do
-        [] ->
-          migrate_legacy_candidate_in_txn(txn, assignment_id, activation_epoch)
+        assignments =
+          Txn.q(
+            txn,
+            """
+            SELECT a.id
+            FROM assignments a
+            LEFT JOIN supervision_entitlements e ON e.assignmentId=a.id
+            WHERE a.state='open' AND e.assignmentId IS NULL
+            ORDER BY a.openedAt, a.id
+            """
+          )
 
-        [_outcome] ->
-          case accepted_transfer(txn, assignment_id, nil) do
-            {:ok, %{cause: "legacy_parent_target_retired"}} -> :ok
-            _ -> legacy_refusal!(assignment_id, "legacy_parent_successor_conflict")
-          end
+        skipped =
+          Enum.count(assignments, fn [assignment_id] ->
+            migrate_legacy_parent_retirement_isolated_in_txn(
+              txn,
+              assignment_id,
+              activation_epoch
+            ) == :skipped
+          end)
 
-        _many ->
-          legacy_refusal!(assignment_id, "legacy_parent_successor_conflict")
-      end
-    end)
+        Txn.q(
+          txn,
+          """
+          INSERT INTO supervision_liveness_migrations
+            (migrationId, appliedAt, affectedRows, cause, principal)
+          VALUES (?1, ?2, ?3, 'release_upgrade', 'process:tightbeam')
+          """,
+          [@legacy_parent_retirements_migration, now(), length(assignments) - skipped]
+        )
+
+        :ok
+    end
+  end
+
+  defp migrate_legacy_parent_retirement_isolated_in_txn(txn, assignment_id, activation_epoch) do
+    :ok = Txn.exec(txn, "SAVEPOINT legacy_parent_retirement")
+
+    try do
+      migrate_legacy_parent_retirement_in_txn(txn, assignment_id, activation_epoch)
+      :ok = Txn.exec(txn, "RELEASE legacy_parent_retirement")
+      :ok
+    rescue
+      error ->
+        :ok = Txn.exec(txn, "ROLLBACK TO legacy_parent_retirement")
+        :ok = Txn.exec(txn, "RELEASE legacy_parent_retirement")
+
+        Logger.warning(
+          "legacy parent retirement migration skipped assignment #{assignment_id} " <>
+            "and left it unchanged: #{Exception.message(error)}"
+        )
+
+        :skipped
+    end
+  end
+
+  defp migrate_legacy_parent_retirement_in_txn(txn, assignment_id, activation_epoch) do
+    case legacy_outcomes_in_txn(txn, assignment_id) do
+      [] ->
+        migrate_legacy_candidate_in_txn(txn, assignment_id, activation_epoch)
+
+      [_outcome] ->
+        case accepted_transfer(txn, assignment_id, nil) do
+          {:ok, %{cause: "legacy_parent_target_retired"}} -> :ok
+          _ -> legacy_refusal!(assignment_id, "legacy_parent_successor_conflict")
+        end
+
+      _many ->
+        legacy_refusal!(assignment_id, "legacy_parent_successor_conflict")
+    end
   end
 
   defp legacy_outcomes_in_txn(txn, assignment_id) do
