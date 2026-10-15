@@ -5346,6 +5346,7 @@ defmodule Tightbeam.Wakes do
         )
       end
 
+      Supervision.deadlines_changed_in_txn(txn)
       publish_change_in_txn(txn, "wake.canceled", wake.wake_id)
       cancellation_result(cancellation)
     else
