@@ -225,7 +225,7 @@ defmodule Tightbeam.SupervisionTest do
     wake =
       Wakes.schedule(ctx.db, %{
         session_key: "waiting-cleanup",
-        origin: "system",
+        origin: "user:flynn",
         prompt: "later",
         due_at: System.system_time(:millisecond) + 3_600_000
       })
