@@ -15,7 +15,7 @@ defmodule Tightbeam.Dispatch do
   anything long-running goes through the Ledger/lane pipeline, never inline.
 
   Rules evaluate each call before its handler runs. Handler database writes
-  record an identity audit in their transaction. Dispatch queues remaining
+  record an identity audit in their transaction. Dispatch records remaining
   audits and commits publication before returning the response.
   Read audits contain identity and verb rather than the returned content.
   """

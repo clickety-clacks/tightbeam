@@ -925,7 +925,6 @@ defmodule Tightbeam.DB do
   end
 
   @impl true
-  @impl true
   def handle_info({:DOWN, monitor, :process, owner, _reason}, %{reference_fences: fences} = state) do
     fences =
       Enum.reduce(fences, fences, fn {token, fence}, acc ->
