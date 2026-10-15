@@ -214,6 +214,7 @@ defmodule Tightbeam.ModelCatalogTest do
         capture_log(fn ->
           Process.exit(worker, :kill)
           assert_receive {:DOWN, ^ref, :process, ^worker, :killed}
+
           await(fn ->
             case :sys.get_state(pid).background do
               {^worker, _, _, _, _} -> false
