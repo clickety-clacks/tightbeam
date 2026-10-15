@@ -67,12 +67,22 @@ defmodule Tightbeam.DBBackgroundOverloadTest do
   end
 
   test "recipient drain skips overload without losing scheduler state", %{db: db} do
-    state = %{db: db, delivery_opts: [], timer: nil, deadline: nil, scanned_through: -1,
-      retries: %{}, retry_attempts: %{}, internal_consumers: %{}}
+    state = %{
+      db: db,
+      delivery_opts: [],
+      timer: nil,
+      deadline: nil,
+      scanned_through: -1,
+      retries: %{},
+      retry_attempts: %{},
+      internal_consumers: %{}
+    }
+
     assert Tightbeam.NoticeBatcher.recover(db, 1, [], "recipient") == []
 
     assert {:noreply, next} =
              Tightbeam.Wakes.handle_cast({:recipient_ready, "recipient"}, state)
+
     assert is_reference(next.timer)
     assert next.scanned_through == -1
   end

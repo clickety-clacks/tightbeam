@@ -966,7 +966,8 @@ defmodule Tightbeam.WakesTest do
     refute_receive {:delivered, _}
 
     assert :ok = Wakes.fire_due(scheduler)
-    assert_receive {:delivered, %{wake_id: probe_id, prompt: "callback retry control"}}
+    assert_receive {:delivered, %{wake_id: probe_id, prompt: "callback retry control"}}, 1_600
+    :sys.get_state(scheduler)
     assert probe_id == probe.wake_id
     assert Wakes.get(db, probe.wake_id).state == "fired"
     assert :ok = Wakes.fire_due(scheduler)
@@ -1062,8 +1063,9 @@ defmodule Tightbeam.WakesTest do
     assert subject == wake.wake_id
     assert detail =~ "consumer_boom"
 
-    # One row per attempt, so the repetition is itself visible.
-    assert :ok = Wakes.fire_due(scheduler)
+    # The retry deadline starts the next attempt without another write.
+    Process.sleep(1_100)
+    :sys.get_state(scheduler)
 
     assert length(
              Enum.filter(EventLog.lifecycle_events(db), &(&1.kind == "wake_delivery_failed"))

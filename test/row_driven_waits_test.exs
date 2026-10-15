@@ -201,6 +201,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
 
   test "unresolved registration is coherent, terminal recognition latches, and T gates one delivery",
        ctx do
+    scheduler_pid = suspend_scheduler(ctx)
     turn = running_turn(ctx.db, "holder")
     wake = register_wait(ctx.db, due_after(), predicate("R"))
 
@@ -251,6 +252,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
 
     :ok = Hub.subscribe(hub, self(), "wait-fired", %{"classes" => ["wake.fired"]})
     exact_wake_id = wake.wake_id
+    :ok = :sys.resume(scheduler_pid)
 
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert turn_count(ctx.db, wake.wake_id) == 0
@@ -288,6 +290,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
   end
 
   test "registration evaluates success and terminal resolver paths before returning", ctx do
+    scheduler_pid = suspend_scheduler(ctx)
     assert %{outcome: "revoked"} = revoke(ctx.db, "R")
 
     terminal = register_wait(ctx.db, due_after(), predicate("R"))
@@ -304,6 +307,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assert success.recognition_path == "success"
     assert success.recognition_disposition == "completed"
     assert success.verification_notice_wake_id == nil
+    :ok = :sys.resume(scheduler_pid)
 
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert turn_count(ctx.db, terminal.wake_id) == 0

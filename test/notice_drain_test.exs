@@ -101,7 +101,10 @@ defmodule Tightbeam.NoticeDrainTest do
                  System.system_time(:millisecond) - 1
                ])
 
-               Wakes.schedule_changed_in_txn(txn, {:schedule_changed, System.system_time(:millisecond) - 1})
+               Wakes.schedule_changed_in_txn(
+                 txn,
+                 {:schedule_changed, System.system_time(:millisecond) - 1}
+               )
              end)
 
     await_delivery(ctx.db, due.wake_id)

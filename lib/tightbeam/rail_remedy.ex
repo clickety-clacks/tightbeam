@@ -16,7 +16,7 @@ defmodule Tightbeam.RailRemedy do
 
   alias Tightbeam.DB.Txn
 
-  @reassessment_wait 253402300799000
+  @reassessment_wait 253_402_300_799_000
   @ttl_ms 60_000
   @token_re ~r/\{([^{}]+)\}/
 
@@ -106,6 +106,7 @@ defmodule Tightbeam.RailRemedy do
     result =
       case DB.transaction(db, fn txn ->
              Wakes.schedule_changed_in_txn(txn, :review_remedy_changed)
+
              row =
                Txn.q(
                  txn,

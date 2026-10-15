@@ -19,7 +19,11 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
         'anthropic','fable','testhost','active',1,1);
       """)
 
-    %{misses_before: Tightbeam.SchedulerMisses.count(), db: db, delivery_opts: [conn_registry: registry, lane_manager: lane_name]}
+    %{
+      misses_before: Tightbeam.SchedulerMisses.count(),
+      db: db,
+      delivery_opts: [conn_registry: registry, lane_manager: lane_name]
+    }
   end
 
   defp scheduler(ctx, extra \\ []) do
@@ -27,19 +31,22 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
 
     start_supervised!(
       {Wakes,
-       Keyword.merge([
-         db: ctx.db,
-         name: nil,
-         deliver: fn wake ->
-           send(parent, {:delivered, wake.wake_id, System.system_time(:millisecond)})
-         end,
-         internal_consumers: %{
-           "test" => fn wake ->
+       Keyword.merge(
+         [
+           db: ctx.db,
+           name: nil,
+           deliver: fn wake ->
              send(parent, {:delivered, wake.wake_id, System.system_time(:millisecond)})
-           end
-         },
-         delivery_opts: ctx.delivery_opts
-       ], extra)}
+           end,
+           internal_consumers: %{
+             "test" => fn wake ->
+               send(parent, {:delivered, wake.wake_id, System.system_time(:millisecond)})
+             end
+           },
+           delivery_opts: ctx.delivery_opts
+         ],
+         extra
+       )}
     )
   end
 
@@ -246,12 +253,14 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
     parent = self()
     attempts = :ets.new(:retry_attempts, [:public])
     :ets.insert(attempts, {:count, 0})
+
     consumer = fn wake ->
       n = :ets.update_counter(attempts, :count, 1)
       send(parent, {:attempt, n, System.system_time(:millisecond)})
       if n < 3, do: raise("transient failure")
       {:ok, _} = DB.transaction(ctx.db, &Wakes.consume_internal_in_txn(&1, wake.wake_id))
     end
+
     pid = scheduler(ctx, internal_consumers: %{"effort_probe" => consumer})
     scheduled = wake(ctx.db, System.system_time(:millisecond), %{consumer: "effort_probe"})
     assert_receive {:attempt, 1, first}, 1_000
@@ -259,6 +268,7 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
     assert second - first >= 1_000
     assert_receive {:attempt, 3, third}, 2_600
     assert third - second >= 2_000
+    :sys.get_state(pid)
     assert Wakes.get(ctx.db, scheduled.wake_id).state == "fired"
     assert :sys.get_state(pid).retries == %{}
   end
@@ -273,12 +283,10 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
     assert state.timer == original.timer
     assert state.scanned_through == original.scanned_through
 
-    :sys.suspend(pid)
-    for _ <- 1..200, do: GenServer.cast(pid, :wake_ready)
-    :sys.resume(pid)
-    state = :sys.get_state(pid)
-    assert state.fire_pending
-    :sys.get_state(pid)
-    refute :sys.get_state(pid).fire_pending
+    state = %{fire_pending: false}
+    {:noreply, queued} = Wakes.handle_cast(:wake_ready, state)
+    for _ <- 1..200, do: assert({:noreply, queued} == Wakes.handle_cast(:wake_ready, queued))
+    assert_receive :fire_due
+    refute_receive :fire_due
   end
 end
