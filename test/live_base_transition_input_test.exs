@@ -58,6 +58,48 @@ defmodule Tightbeam.LiveBaseTransitionInputTest do
     assert admission.decision.expected_schema == ctx.expected_schema
   end
 
+  test "transition and observed base admit either spelling of a symlink", ctx do
+    alias_base = ctx.base <> "-alias"
+    File.ln_s!(ctx.base, alias_base)
+    canonical_base = LiveBaseAdmission.canonical!(ctx.base)
+
+    for {observed, requested} <- [{alias_base, ctx.base}, {ctx.base, alias_base}] do
+      transition = transition_json(%{ctx | base: requested}, false)
+      options = [payload_root: ctx.payload, transition: transition]
+      admission = LiveBaseAdmission.prepare!(observed, options)
+
+      assert admission.base == canonical_base
+      assert admission.decision.base == canonical_base
+      assert admission.transition == transition
+      assert LiveBaseAdmission.revalidate!(admission) == admission
+    end
+  end
+
+  test "a transition for a different directory still refuses", ctx do
+    other_base = ctx.base <> "-other"
+    File.mkdir_p!(other_base)
+    transition = transition_json(%{ctx | base: other_base})
+
+    assert_raise LiveBaseAdmission.Refusal, ~r/build_transition_mismatch/, fn ->
+      LiveBaseAdmission.prepare!(ctx.base, payload_root: ctx.payload, transition: transition)
+    end
+  end
+
+  test "revalidation refuses a transition alias retargeted to a different directory", ctx do
+    alias_base = ctx.base <> "-alias"
+    other_base = ctx.base <> "-other"
+    File.ln_s!(ctx.base, alias_base)
+    transition = transition_json(%{ctx | base: alias_base}, false)
+    admission = LiveBaseAdmission.prepare!(ctx.base, payload_root: ctx.payload, transition: transition)
+    File.mkdir_p!(other_base)
+    File.rm!(alias_base)
+    File.ln_s!(other_base, alias_base)
+
+    assert_raise LiveBaseAdmission.Refusal, ~r/build_transition_mismatch/, fn ->
+      LiveBaseAdmission.revalidate!(admission)
+    end
+  end
+
   test "absent, malformed, and mismatched packaged input still refuses", ctx do
     assert_raise LiveBaseAdmission.Refusal, ~r/build_transition_required/, fn ->
       LiveBaseAdmission.prepare!(ctx.base, [payload_root: ctx.payload] ++ runtime_guard_inputs())
@@ -100,9 +142,9 @@ defmodule Tightbeam.LiveBaseTransitionInputTest do
     end
   end
 
-  defp transition_json(ctx) do
+  defp transition_json(ctx, canonical \\ true) do
     JSON.encode!(%{
-      "base" => LiveBaseAdmission.canonical!(ctx.base),
+      "base" => if(canonical, do: LiveBaseAdmission.canonical!(ctx.base), else: ctx.base),
       "expectedSchema" => ctx.expected_schema,
       "source" => "unmarked",
       "target" => ctx.identity

@@ -333,8 +333,7 @@ defmodule Tightbeam.Application do
     # short for that still gives draining and feed acknowledgements half of
     # itself, up to 500 ms, so a short bounded stop still closes feeds in
     # order instead of skipping straight to the stamp.
-    work_allowance = max(budget - 5_000, min(500, div(budget, 2)))
-    work_deadline = deadline - budget + work_allowance
+    work_deadline = shutdown_work_deadline(deadline, budget)
     drain_until(work_deadline)
     Tightbeam.Firehose.Hub.shutdown(Tightbeam.Firehose.Hub, work_deadline)
 
@@ -350,6 +349,12 @@ defmodule Tightbeam.Application do
     end
 
     state
+  end
+
+  @doc false
+  def shutdown_work_deadline(deadline, budget) do
+    work_allowance = max(budget - 5_000, min(500, div(budget, 2)))
+    deadline - budget + work_allowance
   end
 
   @doc false

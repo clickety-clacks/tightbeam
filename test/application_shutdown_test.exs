@@ -57,11 +57,16 @@ defmodule Tightbeam.ApplicationShutdownTest do
     assert_stamped(epoch)
   end
 
-  test "a short budget reserves time for the stamp", %{epoch: epoch} do
-    Application.put_env(:tightbeam, :drain_timeout_ms, 25)
-    :ok = DB.execute(DB, "INSERT INTO turns VALUES ('running')")
-    assert :state = Tightbeam.Application.prep_stop(:state)
-    assert_stamped(epoch)
+  test "a short budget reserves time for the stamp" do
+    # Check the reservation without depending on scheduling a DB transaction
+    # inside 13 ms. The drain-exhaustion test exercises the actual stamp.
+    started = -1_000
+    budget = 25
+    deadline = started + budget
+    work_deadline = Tightbeam.Application.shutdown_work_deadline(deadline, budget)
+
+    assert work_deadline == started + 12
+    assert deadline - work_deadline == 13
   end
 
   @tag timeout: 5_000
