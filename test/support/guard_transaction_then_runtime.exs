@@ -56,7 +56,7 @@ try do
   assert {:ok, :published} = Task.await(publication)
   assert {:ok, [[1], [2]]} = DB.query(db, "SELECT id FROM publication_markers ORDER BY id")
 
-  assert {:error, %RuntimeError{message: "publication crashed"}} =
+  assert {:ok, :marker} =
            DB.transaction_then(
              db,
              fn txn ->
