@@ -237,7 +237,13 @@ defmodule Tightbeam.WorkspaceCleanupTest do
     archive = Path.join(ctx.base, "configured-archive")
     Application.put_env(:tightbeam, :archive_dir, archive)
     on_exit(fn -> Application.delete_env(:tightbeam, :archive_dir) end)
-    :ok = DB.execute(ctx.db, "CREATE TRIGGER refuse_archive_repoint BEFORE UPDATE OF home ON artifacts BEGIN SELECT RAISE(ABORT,'archive repoint unavailable'); END")
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        "CREATE TRIGGER refuse_archive_repoint BEFORE UPDATE OF home ON artifacts BEGIN SELECT RAISE(ABORT,'archive repoint unavailable'); END"
+      )
+
     worker = start_supervised!({WorkspaceCleanup, config: ctx.config})
     send(worker, :drain)
     :sys.get_state(worker)
@@ -367,32 +373,57 @@ defmodule Tightbeam.WorkspaceCleanupTest do
     artifact = artifact(ctx, kept)
     retire(ctx)
     attempts = :atomics.new(1, [])
+
     runner = fn _invocation, script, input ->
-      copy_script = String.replace(script,
-        ~S|if [ "$(device_id "$source")" = "$(device_id "$(dirname "$target")")" ]; then|,
-        "if false; then")
-      prefix = if :atomics.add_get(attempts, 1, 1) == 1 do
-        """
-        cp() {
-          command cp "$@" || return $?
-          return 1
-        }
-        """
-      else
-        ""
-      end
+      copy_script =
+        String.replace(
+          script,
+          ~S|if [ "$(device_id "$source")" = "$(device_id "$(dirname "$target")")" ]; then|,
+          "if false; then"
+        )
+
+      prefix =
+        if :atomics.add_get(attempts, 1, 1) == 1 do
+          """
+          cp() {
+            command cp "$@" || return $?
+            return 1
+          }
+          """
+        else
+          ""
+        end
+
       WorkspaceCleanup.system_runner(["sh", "-c", prefix <> copy_script], copy_script, input)
     end
+
     config = Map.put(ctx.config, :workspace_cleanup_runner, runner)
-    assert %{status: "incomplete"} = WorkspaceCleanup.process_session(config, ctx.db, ctx.session.session_key)
+
+    assert %{status: "incomplete"} =
+             WorkspaceCleanup.process_session(config, ctx.db, ctx.session.session_key)
+
     assert File.read!(kept) == "preserve through a failed copy"
-    assert {:ok, [[destination]]} = DB.query(ctx.db, "SELECT archivePath FROM retired_workspace_cleanup WHERE sessionKey=?1", [ctx.session.session_key])
+
+    assert {:ok, [[destination]]} =
+             DB.query(
+               ctx.db,
+               "SELECT archivePath FROM retired_workspace_cleanup WHERE sessionKey=?1",
+               [ctx.session.session_key]
+             )
+
     refute File.exists?(destination)
-    assert File.read!(Path.join(destination <> ".partial", "kept")) == "preserve through a failed copy"
-    assert %{status: "completed"} = WorkspaceCleanup.process_session(config, ctx.db, ctx.session.session_key)
+
+    assert File.read!(Path.join(destination <> ".partial", "kept")) ==
+             "preserve through a failed copy"
+
+    assert %{status: "completed"} =
+             WorkspaceCleanup.process_session(config, ctx.db, ctx.session.session_key)
+
     refute File.exists?(ctx.workspace)
     refute File.exists?(destination <> ".partial")
-    assert File.read!(Artifacts.get(ctx.db, artifact.artifact_id).home) == "preserve through a failed copy"
+
+    assert File.read!(Artifacts.get(ctx.db, artifact.artifact_id).home) ==
+             "preserve through a failed copy"
   end
 
   defp retire(ctx) do
