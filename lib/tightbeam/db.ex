@@ -92,9 +92,12 @@ defmodule Tightbeam.DB do
   @doc false
   def reader(server, sql) do
     if Regex.match?(~r/\A\s*(SELECT|WITH|EXPLAIN)\b/i, sql) do
-      case :persistent_term.get({__MODULE__, :readers, GenServer.whereis(server)}, []) do
-        [] -> nil
-        readers -> Enum.at(readers, :erlang.phash2(self(), length(readers)))
+      with pid when is_pid(pid) <- GenServer.whereis(server),
+           {:dictionary, dictionary} <- Process.info(pid, :dictionary),
+           [_ | _] = readers <- Keyword.get(dictionary, :tightbeam_db_readers, []) do
+        Enum.at(readers, :erlang.phash2(self(), length(readers)))
+      else
+        _ -> nil
       end
     else
       nil
@@ -416,7 +419,8 @@ defmodule Tightbeam.DB do
 
     @doc "Rows changed by the last statement — the CAS check for guarded UPDATEs."
     @spec changes(t()) :: non_neg_integer()
-    def changes(%__MODULE__{conn: conn}) do
+    def changes(%__MODULE__{conn: conn} = txn) do
+      ensure_before_deadline(txn)
       {:ok, n} = Sqlite3.changes(conn)
       n
     end
@@ -540,7 +544,7 @@ defmodule Tightbeam.DB do
 
       :ok = load_topline_unicode(conn)
       readers = open_readers(path)
-      :persistent_term.put({__MODULE__, :readers, self()}, readers)
+      Process.put(:tightbeam_db_readers, readers)
       {:ok, %{conn: conn, readers: readers, admission: admission, reference_fences: %{}}}
     rescue
       error ->
@@ -600,7 +604,6 @@ defmodule Tightbeam.DB do
 
   @impl true
   def terminate(_reason, %{conn: conn, readers: readers}) do
-    :persistent_term.erase({__MODULE__, :readers, self()})
     Enum.each(readers, &Sqlite3.close/1)
     # close_v2 may defer destruction until remaining statements finalize.
     # Abnormal process death uses the same Exqlite resource destructor.
