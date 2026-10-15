@@ -279,6 +279,7 @@ defmodule Tightbeam.SentinelsTest do
         {:ok, _revision} = Identity.publish_live!(ctx.base, candidate)
 
         qualified = "agentic-engineering/landing-watch"
+        host = ctx.host
         shipped_setup = Sentinels.setup(ctx.base, ctx.db, ctx.host, "agentic-engineering")
 
         for instruction <- [
@@ -295,7 +296,7 @@ defmodule Tightbeam.SentinelsTest do
 
         assert %{
                  sentinel: ^qualified,
-                 host: ctx.host,
+                 host: ^host,
                  name: "GH_CONFIG_DIR",
                  changed: true
                } =
@@ -310,7 +311,7 @@ defmodule Tightbeam.SentinelsTest do
 
         assert %{
                  sentinel: ^qualified,
-                 host: ctx.host,
+                 host: ^host,
                  name: "LANDING_REPOS",
                  changed: true
                } =
@@ -341,7 +342,7 @@ defmodule Tightbeam.SentinelsTest do
         # making GitHub/Tightbeam provider calls in this isolated fixture.
         refute Process.whereis(SentinelSupervisor)
 
-        assert %{sentinel: ^qualified, host: ctx.host, state: "enabled"} =
+        assert %{sentinel: ^qualified, host: ^host, state: "enabled"} =
                  handlers["sentinel-enable"].(%{
                    origin: "user:flynn",
                    params: %{name: qualified}
