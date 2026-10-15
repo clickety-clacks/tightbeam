@@ -211,8 +211,9 @@ defmodule Tightbeam.SupervisionTest do
       )
 
     name = start_liveness!(ctx, sweep_ms: 100, name: Supervision)
-    state = :sys.get_state(name)
-    {:noreply, armed} = Supervision.handle_cast(:deadlines_changed, %{state | idle_cleanup_due: 0, deadline_timer: nil})
+    state = Map.merge(:sys.get_state(name), %{idle_cleanup_due: 0, deadline_timer: nil})
+    {:noreply, armed} = Supervision.handle_cast(:deadlines_changed, state)
+
     assert :erlang.read_timer(armed.deadline_timer) > 50
     Process.cancel_timer(armed.deadline_timer)
     assert idle_cleanup_wakes(ctx.db) == []

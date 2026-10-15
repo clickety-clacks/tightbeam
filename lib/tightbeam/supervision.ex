@@ -5692,16 +5692,19 @@ defmodule Tightbeam.Supervision do
        when is_integer(interval) and interval > 0 do
     DB.background_pass(
       fn ->
-        state = if refresh_idle do
-          due = transaction!(state.db, fn txn ->
-            idle_cleanup_deadline_rows_in_txn(txn, state)
-            |> Enum.map(&elem(&1, 2))
-            |> Enum.min(fn -> nil end)
-          end)
-          %{state | idle_cleanup_due: due}
-        else
-          state
-        end
+        state =
+          if refresh_idle do
+            due =
+              transaction!(state.db, fn txn ->
+                idle_cleanup_deadline_rows_in_txn(txn, state)
+                |> Enum.map(&elem(&1, 2))
+                |> Enum.min(fn -> nil end)
+              end)
+
+            %{state | idle_cleanup_due: due}
+          else
+            state
+          end
 
         [[liveness_due]] =
           query(
