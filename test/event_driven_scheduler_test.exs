@@ -114,7 +114,13 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
       bad = wake(ctx.db, 1, %{condition_kind: "ready", condition_after_id: 0})
       sibling = wake(ctx.db, 2, %{condition_kind: "other-ready", condition_after_id: 0})
       good = wake(ctx.db, 3, %{consumer: "test"})
-      assert {:ok, [[fact_id]]} = DB.query(ctx.db, "INSERT INTO condition_facts(ts,kind,origin) VALUES (1,'unrelated','system') RETURNING id")
+
+      assert {:ok, [[fact_id]]} =
+               DB.query(
+                 ctx.db,
+                 "INSERT INTO condition_facts(ts,kind,origin) VALUES (1,'unrelated','system') RETURNING id"
+               )
+
       column = unquote(column)
 
       assert {:ok, _} =
