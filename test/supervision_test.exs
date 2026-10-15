@@ -265,19 +265,51 @@ defmodule Tightbeam.SupervisionTest do
     group_prefix = Enum.take(identity_parts, 2) |> Enum.join("|")
     member_token = Enum.at(identity_parts, 2)
 
-    {:ok, delivery_rows} =
-      DB.query(
-        ctx.db,
-        "EXPLAIN QUERY PLAN " <> Supervision.idle_cleanup_delivery_history_sql(),
-        [group_prefix <> "|%", "%|" <> member_token <> "|%"]
-      )
+    group_digest = identity_parts |> hd() |> String.replace_prefix("idle-cleanup-v1:", "")
 
-    delivery_plan = Enum.map(delivery_rows, &List.last/1)
-    IO.puts("idle-cleanup delivery-history plan: " <> Enum.join(delivery_plan, " | "))
+    for token <- Enum.drop(identity_parts, 1) |> Enum.reject(&(&1 == "")) |> Enum.take(5) do
+      params = Supervision.idle_cleanup_delivery_history_params(group_digest, token)
 
-    assert Enum.any?(delivery_plan, &String.contains?(&1, "idle_cleanup_wakes_delivery_history"))
-    refute Enum.any?(delivery_plan, &Regex.match?(~r/^SCAN /, &1))
-    refute Enum.any?(delivery_plan, &String.contains?(&1, "CO-ROUTINE"))
+      {:ok, delivery_rows} =
+        DB.query(
+          ctx.db,
+          "EXPLAIN QUERY PLAN " <> Supervision.idle_cleanup_delivery_history_sql(),
+          params
+        )
+
+      delivery_plan = Enum.map(delivery_rows, &List.last/1)
+      IO.puts("idle-cleanup delivery-history plan: " <> Enum.join(delivery_plan, " | "))
+
+      assert Enum.any?(
+               delivery_plan,
+               &String.contains?(
+                 &1,
+                 "idle_cleanup_wakes_delivery_history (obligationRef>? AND obligationRef<?)"
+               )
+             )
+
+      refute Enum.any?(delivery_plan, &Regex.match?(~r/^SCAN /, &1))
+      refute Enum.any?(delivery_plan, &String.contains?(&1, "CO-ROUTINE"))
+
+      # Same rows as the plain LIKE form the range terms and named index replace.
+      {:ok, expected} =
+        DB.query(
+          ctx.db,
+          """
+          SELECT w.firedAt,w.obligationRef FROM wakes w
+          WHERE w.origin='process:tightbeam' AND w.state='fired'
+            AND w.obligationRef LIKE ?1 AND w.obligationRef LIKE ?2
+            AND EXISTS (SELECT 1 FROM (#{NoticeBatcher.source_deliveries_sql()}) d
+              WHERE d.sourceWakeId=w.wakeId)
+          """,
+          Enum.take(params, 2)
+        )
+
+      assert {:ok, actual} =
+               DB.query(ctx.db, Supervision.idle_cleanup_delivery_history_sql(), params)
+
+      assert Enum.sort(actual) == Enum.sort(expected)
+    end
 
     {:ok, pending_group_rows} =
       DB.query(

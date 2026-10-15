@@ -16,8 +16,8 @@ defmodule Tightbeam.LifecycleRuntimeFixture do
        ["index-assignment", "refusal"], [[1]]},
       {"supervision.ex", "SELECT w.wakeId,w.sessionKey FROM wakes w", [],
        [["index-unobserved", "index-session"]]},
-      {"supervision.ex", "SELECT e.subject FROM lifecycle_events e", ["index-session", nil],
-       [["index-observed-new"]]},
+      {"supervision.ex", "SELECT session, subject FROM (", [nil],
+       [["index-session", "index-observed-new"], ["other-session", "other-wake"]]},
       {"gateway.ex", "SELECT seq, role, sender, content, attachments", ["index-session", 3, 100],
        [[1, "user", nil, "visible", "[]"]]},
       {"gateway.ex", "SELECT kind FROM lifecycle_events", ["index-session"],
@@ -62,12 +62,15 @@ defmodule Tightbeam.LifecycleRuntimeFixture do
       IO.puts("lifecycle plan #{file}: #{inspect(details)}")
     end
 
-    occurrence = Enum.find(cases(), &String.starts_with?(String.trim(&1.sql), "SELECT e.subject"))
+    occurrence =
+      Enum.find(cases(), &String.starts_with?(String.trim(&1.sql), "SELECT session, subject"))
 
-    assert DB.query(db, occurrence.sql, ["index-session", "index-observed-new"]) ==
-             {:ok, [["index-observed"]]}
+    assert DB.query(db, occurrence.sql, ["index-observed-new"]) ==
+             {:ok, [["index-session", "index-observed"], ["other-session", "other-wake"]]}
 
-    assert DB.query(db, occurrence.sql, ["absent-session", nil]) == {:ok, []}
+    assert DB.query(db, occurrence.sql, ["other-wake"]) ==
+             {:ok, [["index-session", "index-observed-new"]]}
+
     assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
     :ok
   end
