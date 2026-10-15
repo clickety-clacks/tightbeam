@@ -71,9 +71,14 @@ defmodule Tightbeam.RailRemedyTest do
       :persistent_term.erase(Rules)
     end)
 
-    registry = start_supervised!(Supervisor.child_spec({ConnRegistry, name: nil}, id: :scheduler_registry))
+    registry =
+      start_supervised!(Supervisor.child_spec({ConnRegistry, name: nil}, id: :scheduler_registry))
+
     lane = :"remedy_lane_#{System.unique_integer([:positive])}"
-    start_supervised!(Supervisor.child_spec({Tightbeam.NoticeBatcherFixture.LaneStub, lane}, id: :scheduler_lane))
+
+    start_supervised!(
+      Supervisor.child_spec({Tightbeam.NoticeBatcherFixture.LaneStub, lane}, id: :scheduler_lane)
+    )
 
     %{
       db: db,

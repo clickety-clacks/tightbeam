@@ -527,15 +527,22 @@ defmodule Tightbeam.RailRemedy do
   @spec close(DB.server(), String.t(), String.t(), pos_integer()) :: boolean()
   def close(db, statute, subject, occurrence) do
     case DB.transaction(db, fn txn ->
-      Txn.q(txn, """
-      UPDATE rail_remedy_episodes SET status = 'closed', closedAt = ?4
-      WHERE statute = ?1 AND subject = ?2 AND occurrence = ?3 AND status = 'live'
-      """, [statute, subject, occurrence, now()])
-      won? = Txn.changes(txn) == 1
-      if won? and statute == "completion-requires-review",
-        do: Wakes.schedule_changed_in_txn(txn, :review_remedy_changed)
-      won?
-    end) do
+           Txn.q(
+             txn,
+             """
+             UPDATE rail_remedy_episodes SET status = 'closed', closedAt = ?4
+             WHERE statute = ?1 AND subject = ?2 AND occurrence = ?3 AND status = 'live'
+             """,
+             [statute, subject, occurrence, now()]
+           )
+
+           won? = Txn.changes(txn) == 1
+
+           if won? and statute == "completion-requires-review",
+             do: Wakes.schedule_changed_in_txn(txn, :review_remedy_changed)
+
+           won?
+         end) do
       {:ok, won?} -> won?
       {:error, error} -> raise error
     end
