@@ -29,11 +29,13 @@ new yes before acting; read-only inventory can proceed while waiting.
    README's release-package heading; `stage` leaves the running build selected.
    If the service still starts an npm-installed executable, follow
    [the selector move](#moving-an-npm-installed-gateway-to-the-selector)
-   before restart.
+   for inventory and staging only at this step; its stop/configuration and
+   start phases belong to steps 3 and 5 respectively.
 3. Review [runtime overrides](#runtime-overrides-during-an-upgrade). At the
-   authorized idle boundary, select the staged build, update the npm-based
-   systemd unit or LaunchDaemon to the selector path, and stop the 0.1.8
-   service through its service manager. Do not start 0.1.9 yet.
+   authorized idle boundary, stop the 0.1.8 service through its service
+   manager, then select the staged build and update the npm-based systemd
+   unit or LaunchDaemon to the selector path. Keep the service stopped
+   throughout step 4; do not restart or bootstrap it yet.
 4. With the 0.1.8 gateway stopped, prepare every registered host before the
    first 0.1.9 start. Each item below is a gap between what 0.1.8 left on
    disk and what 0.1.9 accepts; skipping one stops agents from running.
@@ -61,38 +63,59 @@ new yes before acting; read-only inventory can proceed while waiting.
    - **Old harness process records.** A 0.1.8 harness process record lacks the
      identity file 0.1.9 requires before it signals a process, so at first
      start 0.1.9 fails to settle each record it finds and parks that harness
-     on that host until the record resolves. No turn starts on a parked
-     harness. Stopping 0.1.8 already ended those processes. Until a release
-     settles these records itself, settle them before the first start. List
-     them with
-     `sqlite3 -readonly <base_dir>/state.db "SELECT launchId, adapterKey, host, processGroupId FROM harness_processes WHERE resolvedAt IS NULL;"`.
-     On each named host, confirm with `ps -A -o pid=,pgid= | awk '$2==<processGroupId>'` that
-     the group has no live process. Only when every one is gone, and with the
-     gateway still stopped, describe this exact change to the user, get their
-     yes, and run:
+     on that host until the record resolves. Until a release settles these
+     records itself, review them before the first start:
+
+     ```sh
+     sqlite3 -readonly <base_dir>/state.db "SELECT launchId, adapterKey, host, processGroupId FROM harness_processes WHERE resolvedAt IS NULL;"
+     sqlite3 -readonly <base_dir>/state.db "SELECT adapterKey, requestedAt FROM harness_park_fences;"
+     sqlite3 -readonly <base_dir>/state.db "SELECT id, harness, host, failureClass FROM harness_health_incidents WHERE state='open';"
+     ```
+
+     Retain this inventory. On each named host, confirm with
+     `ps -A -o pid=,pgid= | awk '$2==<processGroupId>'` that each reviewed
+     launch's group has no live process. A failed host check or missing or
+     invalid group identity is not proof of absence. If a process is alive,
+     stop it on that host first; do not settle its record while it is running.
+     With the gateway still stopped, describe the exact launch IDs to settle
+     to the user and get their yes. Replace the example IDs below with only
+     those reviewed, confirmed-absent launches, quoting each as a SQL string:
 
      ```sh
      sqlite3 <base_dir>/state.db "BEGIN IMMEDIATE;
        UPDATE harness_processes SET state='exited',
          resolvedAt=CAST(strftime('%s','now') AS INTEGER)*1000,
          lastError='0.1.8 to 0.1.9 upgrade: process confirmed gone before first 0.1.9 start'
-       WHERE resolvedAt IS NULL;
-       DELETE FROM harness_park_fences;
+       WHERE launchId IN ('<reviewed-launch-id-1>', '<reviewed-launch-id-2>')
+         AND resolvedAt IS NULL;
        COMMIT;"
      ```
 
-     If a process is still alive, stop it on its host first. Do not settle a
-     record whose process is running.
-5. Start the 0.1.9 service through its service manager. The gateway performs
-   the supported database migration on first boot; do not issue manual schema
+     Read back those launch IDs and require them to be resolved as `exited`.
+     Leave `harness_park_fences` untouched by this transaction. A fence can
+     represent an independent open incident, including `rate-limit-dead`;
+     process absence does not clear that incident or authorize unpark.
+     At startup, 0.1.9 reconciles launch-only fences and deliberately retains
+     fences for open rate-limit incidents. Preserve those parks; any incident
+     resolution needs its own supported, owner-authorized action after its
+     cause is resolved, not an upgrade-time fence deletion.
+5. Only after every step 4 preparation is complete, start the 0.1.9 service
+   through its service manager, using the selector procedure's separate
+   [start phase](#start-after-pre-start-preparation) if the service was moved.
+   The gateway performs the supported database migration on first boot; do
+   not issue manual schema
    changes. On a large database the first process can exit once after the
    migration finishes, when the wake scheduler runs before the lane manager is
    up. The service manager restarts it and the second start serves normally.
    Expect one such restart; investigate a second.
 6. Require `/version` to match the selected receipt's version and source SHA,
    verify the migrated database and important existing records, and complete
-   the runtime checks below. Require `SELECT count(*) FROM harness_park_fences;`
-   to return 0 and turns to move from `queued` to `running`. If the gateway
+   the runtime checks below. Compare the retained process/fence/incident
+   inventory with the current rows: reviewed obsolete launches are resolved,
+   and valid incident parks remain in force. Do not require a global zero
+   fence count or delete a fence to pass verification. Require turns on
+   unparked, ready harnesses to move from `queued` to `running`; diagnose any
+   remaining park by its launch or incident cause. If the gateway
    fails to boot or verification fails, stop and use the retained package and
    backup only after checking schema compatibility; an executable rollback
    does not undo migration.
@@ -223,27 +246,50 @@ Use the service-manager branch that applies, within this same upgrade order:
   the [README plist](../README.md#macos--launchd), not a per-login LaunchAgent.
 
 Stage the verified 0.1.9 target using the README's release-package commands.
-At the authorized idle boundary, select that target and move the service to
+For the 0.1.8 upgrade, this is the end of step 2: staging does not authorize
+starting the selected build. The following phases keep service configuration
+separate from the first 0.1.9 start.
+
+#### Stop and configure; leave the service stopped
+
+At step 3's authorized idle boundary, stop the old service through its service
+manager before selecting the target or changing its executable path. Select
+the staged target, then move the service to
 `/opt/tightbeam/current/tightbeam/bin/tightbeam-gateway`, with
 `/opt/tightbeam/current/tightbeam/bin` first in its `PATH`. Preserve its existing
 service user, working directory, base directory, port, advertised URL,
 credentials, remaining environment and logging settings.
 
-- **Linux — systemd:** change only the unit's executable path and `PATH`,
-  preserving `User` and `WorkingDirectory`. For an `ExecStart` drop-in, clear
-  the old value with an empty `ExecStart=` before setting the selector path.
-  Run `sudo systemctl daemon-reload`, inspect the effective unit again, then
-  `sudo systemctl restart tightbeam.service` once.
-- **macOS — LaunchDaemon:** in the installed plist, change the gateway
-  executable in `ProgramArguments` to the selector path and put the selected
-  bin directory first in `EnvironmentVariables.PATH`. Preserve `UserName`,
-  `WorkingDirectory`, other arguments, `RunAtLoad`, `KeepAlive` and other
-  settings; retain the README's `root:wheel` ownership and mode `644`.
-  Validate the edited plist with `plutil -lint`, then reload it at the authorized
-  restart boundary so launchd reads the changed paths:
+- **Linux — systemd:** run `sudo systemctl stop tightbeam.service`. Change
+  only the unit's executable path and `PATH`, preserving `User` and
+  `WorkingDirectory`. For an `ExecStart` drop-in, clear the old value with an
+  empty `ExecStart=` before setting the selector path. Run
+  `sudo systemctl daemon-reload` and inspect the effective unit again. Leave
+  the service stopped; do not run `start` or `restart` during preparation.
+- **macOS — LaunchDaemon:** run
+  `sudo launchctl bootout system/com.tightbeam.gateway` to unload and stop
+  the old job. In the installed plist, change the gateway executable in
+  `ProgramArguments` to the selector path and put the selected bin directory
+  first in `EnvironmentVariables.PATH`. Preserve `UserName`, `WorkingDirectory`,
+  other arguments, `RunAtLoad`, `KeepAlive` and other settings; retain the
+  README's `root:wheel` ownership and mode `644`. Validate the edited plist
+  with `plutil -lint`. Leave the job unloaded; do not bootstrap it yet.
+
+Complete every pre-start item in step 4 of
+[the 0.1.8 upgrade order](#018-to-019-follow-this-order), including satellite
+CLIs, credential links and reviewed obsolete launch settlement, while the
+gateway remains stopped. Selecting a build or reloading configuration is not
+permission to skip this preparation.
+
+#### Start after pre-start preparation
+
+At step 5, after the preceding preparation and the user's authorization for
+the start/migration, start only the applicable service:
+
+- **Linux — systemd:** `sudo systemctl start tightbeam.service`.
+- **macOS — LaunchDaemon:** load the configured job, then inspect it:
 
   ```sh
-  sudo launchctl bootout system/com.tightbeam.gateway
   sudo launchctl bootstrap system /Library/LaunchDaemons/com.tightbeam.gateway.plist
   sudo launchctl print system/com.tightbeam.gateway
   ```
@@ -254,9 +300,10 @@ running artifact's origin is unknown, its source stamp alone is insufficient.
 
 After selection, `readlink /opt/tightbeam/current` identifies the selected
 build. The running process may still report the previous version until its
-service is restarted. Restart only after the applicable idle and authorization
-boundary, then compare `GET /version`'s `version` with the selected receipt's
-`version` and its short `sha` with the prefix of `sourceCommit` in
+service is started in the separate phase above. Start only after pre-start
+preparation and the applicable idle and authorization boundary, then compare
+`GET /version`'s `version` with the selected receipt's `version` and its short
+`sha` with the prefix of `sourceCommit` in
 `/opt/tightbeam/builds/<selected-build-id>/.tightbeam-stage.json`. Run
 `/opt/tightbeam/current/tightbeam/bin/tightbeam-select select --root
 /opt/tightbeam --build <previous-build-id>` to switch back to a retained build
