@@ -1604,7 +1604,12 @@ defmodule Tightbeam.Acp.AdapterTest do
   test "late success during cancellation is timeout once, without killing a healthy peer" do
     {adapter, _capture} = start_adapter(gate_mode: "late-success-turn", probe: false)
     conn = Adapter.conn(adapter)
-    expired = Task.async(fn -> Adapter.prompt(adapter, "expired", "stall", timeout: @explicit_prompt_timeout) end)
+
+    expired =
+      Task.async(fn ->
+        Adapter.prompt(adapter, "expired", "stall", timeout: @explicit_prompt_timeout)
+      end)
+
     peer = Task.async(fn -> Adapter.prompt(adapter, "peer", "healthy") end)
     assert pending_count?(conn, 2)
     {id, entry} = prompt_entry(conn, "expired")
@@ -1624,7 +1629,12 @@ defmodule Tightbeam.Acp.AdapterTest do
     {other, _} = start_adapter(gate_mode: "stall-turn", probe: false)
     conn = Adapter.conn(adapter)
     other_conn = Adapter.conn(other)
-    expired = Task.async(fn -> Adapter.prompt(adapter, "expired", "stall", timeout: @explicit_prompt_timeout) end)
+
+    expired =
+      Task.async(fn ->
+        Adapter.prompt(adapter, "expired", "stall", timeout: @explicit_prompt_timeout)
+      end)
+
     peer = Task.async(fn -> Adapter.prompt(adapter, "peer", "healthy") end)
     independent = Task.async(fn -> Adapter.prompt(other, "other", "healthy") end)
     assert pending_count?(conn, 2)
@@ -1690,7 +1700,12 @@ defmodule Tightbeam.Acp.AdapterTest do
   test "worker death racing timeout acknowledgment preserves the timeout cause" do
     {adapter, _} = start_adapter(gate_mode: "ignore-cancel-turn", probe: false)
     conn = Adapter.conn(adapter)
-    caller = Task.async(fn -> Adapter.prompt(adapter, "timed", "stall", timeout: @explicit_prompt_timeout) end)
+
+    caller =
+      Task.async(fn ->
+        Adapter.prompt(adapter, "timed", "stall", timeout: @explicit_prompt_timeout)
+      end)
+
     assert pending_count?(conn, 1)
     {id, entry} = prompt_entry(conn, "timed")
     send(conn, {:prompt_deadline, id, entry.token})
@@ -1707,8 +1722,17 @@ defmodule Tightbeam.Acp.AdapterTest do
   test "concurrent expired prompts keep timeout causes and converge on one teardown" do
     {adapter, _} = start_adapter(gate_mode: "ignore-cancel-turn", probe: false)
     conn = Adapter.conn(adapter)
-    first = Task.async(fn -> Adapter.prompt(adapter, "first", "stall", timeout: @explicit_prompt_timeout) end)
-    second = Task.async(fn -> Adapter.prompt(adapter, "second", "stall", timeout: @explicit_prompt_timeout) end)
+
+    first =
+      Task.async(fn ->
+        Adapter.prompt(adapter, "first", "stall", timeout: @explicit_prompt_timeout)
+      end)
+
+    second =
+      Task.async(fn ->
+        Adapter.prompt(adapter, "second", "stall", timeout: @explicit_prompt_timeout)
+      end)
+
     assert pending_count?(conn, 2)
     {id1, entry1} = prompt_entry(conn, "first")
     {id2, entry2} = prompt_entry(conn, "second")
