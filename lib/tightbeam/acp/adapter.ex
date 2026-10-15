@@ -637,10 +637,8 @@ defmodule Tightbeam.Acp.Adapter do
         parent = self()
         snapshot = %{state | operations: %{}, operation_queue: []}
 
-        {pid, monitor} =
-          spawn_monitor(fn ->
-            # A link releases the operation if its owning adapter exits.
-            Process.link(parent)
+        {:ok, pid} =
+          Task.start_link(fn ->
             Process.put(:acp_operation_deadline, deadline)
 
             result =
@@ -654,8 +652,9 @@ defmodule Tightbeam.Acp.Adapter do
               end
 
             send(parent, {:session_operation_done, key, self(), result})
-            Process.unlink(parent)
           end)
+
+        monitor = Process.monitor(pid)
 
         timer =
           Process.send_after(
