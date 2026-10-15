@@ -3494,7 +3494,10 @@ defmodule Tightbeam.SupervisionTest do
         origin: "process:tightbeam",
         prompt: "invalid transfer",
         due_at: 0,
-        assignment_id: "asg_unrelated_transfer"
+        assignment_id: "asg_unrelated_transfer",
+        reresolve: "lineage",
+        reresolve_seed: "missing-holder",
+        reresolve_rung: 1
       })
 
     {:ok, turn_seq} =
@@ -3521,7 +3524,7 @@ defmodule Tightbeam.SupervisionTest do
     {:ok, _} =
       DB.query(
         ctx.db,
-        "UPDATE wakes SET state='fired',firedAt=1,deliveredTurnSeq=?1,reresolve='lineage',reresolveSeed='missing-holder',reresolveRung=1 WHERE wakeId=?2",
+        "UPDATE wakes SET state='fired',firedAt=1,deliveredTurnSeq=?1 WHERE wakeId=?2",
         [turn_seq, wake.wake_id]
       )
 
