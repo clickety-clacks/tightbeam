@@ -6188,7 +6188,7 @@ defmodule Tightbeam.Supervision do
       """
       WITH source_deliveries AS (#{Tightbeam.NoticeBatcher.recorded_deliveries_sql()})
       SELECT 1 FROM source_deliveries d
-      WHERE d.turnSeq=?1 AND d.sourceWakeId=?2 AND (SELECT wakeId FROM turns WHERE seq=d.turnSeq)<>d.sourceWakeId LIMIT 1
+      WHERE d.turnSeq=?1 AND d.sourceWakeId=?2 AND #{Tightbeam.NoticeBatcher.carrier_delivery_sql("d")} LIMIT 1
       """,
       [turn_seq, source_wake_id]
     ) != []

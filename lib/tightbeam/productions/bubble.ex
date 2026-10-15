@@ -1003,7 +1003,7 @@ defmodule Tightbeam.Productions.Bubble do
            SELECT source.sessionKey,source.wakeId
            FROM source_deliveries d JOIN wakes source ON source.wakeId=d.sourceWakeId
            JOIN turns turn ON turn.seq=d.turnSeq
-           WHERE turn.wakeId=?1 AND (SELECT wakeId FROM turns WHERE seq=d.turnSeq)<>d.sourceWakeId ORDER BY (SELECT m.publicationSeq FROM notice_batch_members m WHERE m.sourceWakeId=d.sourceWakeId AND m.state='included' LIMIT 1)
+           WHERE turn.wakeId=?1 AND #{Tightbeam.NoticeBatcher.carrier_delivery_sql("d")} ORDER BY (SELECT m.publicationSeq FROM notice_batch_members m WHERE m.sourceWakeId=d.sourceWakeId AND m.state='included' LIMIT 1)
            """,
            [wake_id]
          ) do
@@ -1031,7 +1031,7 @@ defmodule Tightbeam.Productions.Bubble do
            WITH source_deliveries AS (#{Tightbeam.NoticeBatcher.recorded_deliveries_sql()})
            SELECT d.sourceWakeId
            FROM source_deliveries d JOIN turns turn ON turn.seq=d.turnSeq
-           WHERE turn.wakeId=?1 AND (SELECT wakeId FROM turns WHERE seq=d.turnSeq)<>d.sourceWakeId ORDER BY (SELECT m.publicationSeq FROM notice_batch_members m WHERE m.sourceWakeId=d.sourceWakeId AND m.state='included' LIMIT 1)
+           WHERE turn.wakeId=?1 AND #{Tightbeam.NoticeBatcher.carrier_delivery_sql("d")} ORDER BY (SELECT m.publicationSeq FROM notice_batch_members m WHERE m.sourceWakeId=d.sourceWakeId AND m.state='included' LIMIT 1)
            """,
            [wake_id]
          ) do

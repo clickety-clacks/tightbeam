@@ -20,6 +20,11 @@ defmodule Tightbeam.NoticeBatcher do
       "FROM wakes WHERE deliveredTurnSeq IS NOT NULL"
   end
 
+  @doc false
+  def carrier_delivery_sql(source_alias) do
+    "(SELECT wakeId FROM turns WHERE seq=#{source_alias}.turnSeq)<>#{source_alias}.sourceWakeId"
+  end
+
   @rule "notice-batching-v1 r2"
   @policy_revision "notice-batching-v1 r2"
 
