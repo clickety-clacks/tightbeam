@@ -600,6 +600,18 @@ defmodule Tightbeam.Wakes do
   def terminal_notice_delivery_in_txn(%Txn{}, _wake_id), do: :ordinary
 
   @doc false
+  def terminal_notice_target_in_txn(
+        %Txn{} = txn,
+        %{obligation_ref: @terminal_notice_marker <> _} = wake
+      ) do
+    if wake.state == "pending",
+      do: terminal_notice_resolution_in_txn(txn, wake),
+      else: {:error, :not_pending}
+  end
+
+  def terminal_notice_target_in_txn(%Txn{}, _wake), do: :ordinary
+
+  @doc false
   def terminal_notice_delivered_in_txn(%Txn{} = txn, wake_id, delivered_to)
       when is_binary(wake_id) and is_binary(delivered_to) do
     case get_in_txn(txn, wake_id) do

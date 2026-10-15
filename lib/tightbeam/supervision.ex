@@ -4412,7 +4412,14 @@ defmodule Tightbeam.Supervision do
     |> Map.new(&{&1.session_key, &1})
   end
 
-  defp idle_cleanup_candidate_in_txn(txn, session, snapshot_at, sessions, ignored_wake \\ nil) do
+  defp idle_cleanup_candidate_in_txn(
+         txn,
+         session,
+         snapshot_at,
+         sessions,
+         ignored_wake \\ nil,
+         mode \\ :deliver
+       ) do
     with true <- session.state == "active" and not session.built_in,
          true <- idle_cleanup_enabled?(session.archetype),
          [] <-
@@ -4435,7 +4442,14 @@ defmodule Tightbeam.Supervision do
          true <- snapshot_at - activity.at >= threshold do
       {parent_group, parent_invalid} = idle_cleanup_parent_group(session, sessions)
 
-      gate = HarnessHealth.prod_shape_gate_in_txn(txn, session.harness, session.host, snapshot_at)
+      # Recipient selection must not expire health incidents or write refusal
+      # events. Availability is still revalidated by delivery preparation.
+      gate =
+        if mode == :select,
+          do: :available,
+          else:
+            HarnessHealth.prod_shape_gate_in_txn(txn, session.harness, session.host, snapshot_at)
+
       group_digest = idle_cleanup_digest("idle-cleanup-group-v1\0" <> parent_group)
       activity_fingerprint = idle_cleanup_activity_fingerprint(session.session_key, activity)
       occurrence = idle_cleanup_occurrence_in_txn(txn, session.session_key, ignored_wake)
@@ -4472,7 +4486,7 @@ defmodule Tightbeam.Supervision do
       }
     else
       {:error, reason} ->
-        idle_cleanup_refusal_in_txn(txn, session.session_key, reason)
+        if mode == :deliver, do: idle_cleanup_refusal_in_txn(txn, session.session_key, reason)
         nil
 
       _ ->
@@ -4973,7 +4987,22 @@ defmodule Tightbeam.Supervision do
 
   def idle_cleanup_delivery_in_txn(_txn, _wake_id, _snapshot_at), do: :ordinary
 
-  defp idle_cleanup_resolve_delivery_in_txn(txn, wake, snapshot_at) do
+  @doc false
+  def idle_cleanup_target_in_txn(
+        txn,
+        %{
+          origin: "process:tightbeam",
+          obligation_ref: @idle_cleanup_prefix <> _,
+          state: "pending"
+        } = wake,
+        snapshot_at
+      ) do
+    idle_cleanup_resolve_delivery_in_txn(txn, wake, snapshot_at, :select)
+  end
+
+  def idle_cleanup_target_in_txn(_txn, _wake, _snapshot_at), do: :ordinary
+
+  defp idle_cleanup_resolve_delivery_in_txn(txn, wake, snapshot_at, mode \\ :deliver) do
     with {:ok, %{"snapshot" => claimed_at, "evidence" => evidence} = metadata} <-
            idle_cleanup_metadata(wake.obligation_ref),
          true <- is_integer(claimed_at) and claimed_at >= 0 and claimed_at <= snapshot_at,
@@ -4983,7 +5012,9 @@ defmodule Tightbeam.Supervision do
       eligible =
         sessions
         |> Map.values()
-        |> Enum.map(&idle_cleanup_candidate_in_txn(txn, &1, snapshot_at, sessions, wake.wake_id))
+        |> Enum.map(
+          &idle_cleanup_candidate_in_txn(txn, &1, snapshot_at, sessions, wake.wake_id, mode)
+        )
         |> Enum.reject(&is_nil/1)
 
       dormant = MapSet.new(eligible, & &1.session_key)
@@ -5002,12 +5033,14 @@ defmodule Tightbeam.Supervision do
         length(members) != map_size(metadata["members"]) or
             idle_cleanup_evidence_digest(metadata["group"], claimed_at, members, metadata["n"]) !=
               evidence ->
-          EventLog.lifecycle_in_txn(
-            txn,
-            "idle_cleanup_stale",
-            wake.wake_id,
-            "cause=member_changed principal=process:tightbeam remedy=recompute_due_batch"
-          )
+          if mode == :deliver,
+            do:
+              EventLog.lifecycle_in_txn(
+                txn,
+                "idle_cleanup_stale",
+                wake.wake_id,
+                "cause=member_changed principal=process:tightbeam remedy=recompute_due_batch"
+              )
 
           :stale
 
@@ -5021,8 +5054,13 @@ defmodule Tightbeam.Supervision do
 
           case idle_cleanup_target(sessions, dormant, metadata["owner"], group, depth) do
             nil ->
-              idle_cleanup_refusal_in_txn(txn, wake.wake_id, :target_unresolvable)
+              if mode == :deliver,
+                do: idle_cleanup_refusal_in_txn(txn, wake.wake_id, :target_unresolvable)
+
               {:idle_cleanup_deferred, :target_unresolvable}
+
+            {target, _actual_depth} when mode == :select ->
+              {:idle_cleanup, target.session_key}
 
             {target, actual_depth} ->
               case HarnessHealth.prod_shape_gate_in_txn(
@@ -5068,7 +5106,9 @@ defmodule Tightbeam.Supervision do
       end
     else
       _ ->
-        idle_cleanup_refusal_in_txn(txn, wake.wake_id, :invalid_delivery_metadata)
+        if mode == :deliver,
+          do: idle_cleanup_refusal_in_txn(txn, wake.wake_id, :invalid_delivery_metadata)
+
         :stale
     end
   end

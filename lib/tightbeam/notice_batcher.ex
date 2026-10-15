@@ -716,18 +716,12 @@ defmodule Tightbeam.NoticeBatcher do
     end
   end
 
-  # Resolve a ready source's recipient from its stored routing, without
-  # preparing it. Only a terminal notice or a source with no resolvable
-  # recipient is prepared here.
+  # Resolve current routing without preparing or changing the source. Terminal
+  # and cleanup notices may have moved away from their stored recipient.
   defp source_recipient_in_txn(txn, wake_id, at) do
     case Wakes.get_in_txn(txn, wake_id) do
       %{state: "pending"} = wake ->
-        # A terminal notice can change recipient when prepared, so it is
-        # grouped by its prepared recipient, not by stored routing.
-        stored_target =
-          if Wakes.terminal_notice?(wake), do: nil, else: source_delivery_target(txn, wake)
-
-        case stored_target do
+        case current_source_target_in_txn(txn, wake, at) do
           {target, _, _} ->
             target
 
@@ -753,6 +747,23 @@ defmodule Tightbeam.NoticeBatcher do
     end
   end
 
+  defp current_source_target_in_txn(txn, wake, at) do
+    case Wakes.terminal_notice_target_in_txn(txn, wake) do
+      {:ok, target} ->
+        source_delivery_target(txn, %{wake | session_key: target})
+
+      :ordinary ->
+        case Supervision.idle_cleanup_target_in_txn(txn, wake, at) do
+          {:idle_cleanup, target} -> source_delivery_target(txn, %{wake | session_key: target})
+          :ordinary -> source_delivery_target(txn, wake)
+          _ -> nil
+        end
+
+      _ ->
+        nil
+    end
+  end
+
   # A busy recipient's sources are left untouched until it can receive. For a
   # free recipient, re-check readiness and prepare only its own sources, each
   # once, in this transaction. A source that fails preparation rolls back to
@@ -766,15 +777,15 @@ defmodule Tightbeam.NoticeBatcher do
         |> Enum.filter(&MapSet.member?(own_ids, &1))
         |> Enum.reject(&MapSet.member?(deferred_ids, &1))
         |> Enum.flat_map(fn wake_id ->
-          case prepared_own_source_in_txn(txn, wake_id) do
-            nil ->
-              []
-
-            source ->
-              case source_delivery_target(txn, source) do
-                {^target, _, _} -> [source]
-                _ -> []
-              end
+          # A source may have changed after selection. Do not prepare it for
+          # a different (possibly busy) recipient; the next tick regroups it.
+          with %{state: "pending"} = current <- Wakes.get_in_txn(txn, wake_id),
+               {^target, _, _} <- current_source_target_in_txn(txn, current, at),
+               source when not is_nil(source) <- prepared_own_source_in_txn(txn, wake_id),
+               {^target, _, _} <- source_delivery_target(txn, source) do
+            [source]
+          else
+            _ -> []
           end
         end)
 
