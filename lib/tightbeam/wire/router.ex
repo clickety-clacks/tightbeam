@@ -2814,8 +2814,8 @@ defmodule Tightbeam.Wire.Router do
     "dispatch" =>
       ~w(brief effect_kind holder_key idempotency_key prompt session_key subject succeeds_assignment_id work_item_id workdir_root)a,
     "effort-rule" => ~w(action request)a,
-    "execution-map" => ~w(tree)a,
-    "execution-map-select" => ~w(assignments under)a,
+    "execution-map" => ~w(tree origin owner state spec spec_sha session quiet_over)a,
+    "execution-map-select" => ~w(assignments under origin owner state spec spec_sha session quiet_over)a,
     "facts-read" => ~w(after kind limit scope)a,
     "harness-health-close-promotion" =>
       ~w(candidate_commit idempotency_key named_class promotion_id review_artifact_id review_assignment_id review_attest_id spec_artifact_id spec_ref spec_sha256)a,
@@ -2886,7 +2886,7 @@ defmodule Tightbeam.Wire.Router do
   }
 
   @param_keys Map.new(@param_keys, fn {verb, keys} ->
-                {verb, Map.new(keys, &{Atom.to_string(&1), &1})}
+                {verb, Map.new(keys ++ Map.get(@substrate_only_params, verb, []), &{Atom.to_string(&1), &1})}
               end)
 
   @doc false
@@ -2901,7 +2901,7 @@ defmodule Tightbeam.Wire.Router do
     params
     |> Enum.reduce(%{}, fn {key, value}, acc ->
       case keys[Macro.underscore(key)] do
-        nil -> acc
+        nil -> Map.put(acc, key, value)
         atom -> Map.put(acc, Map.get(aliases, atom, atom), value)
       end
     end)

@@ -47,10 +47,10 @@ defmodule Tightbeam.Wire.RouterTest do
              key => true,
              "prompt" => "hello",
              "artifactId" => "a"
-           }) == %{prompt: "hello"}
+           }) == %{:prompt => "hello", key => true, "artifactId" => "a"}
 
     assert_raise ArgumentError, fn -> String.to_existing_atom(key) end
-    assert Router.atomize_params_for_test("unknown-verb", %{"prompt" => "hello"}) == %{}
+    assert Router.atomize_params_for_test("unknown-verb", %{"prompt" => "hello"}) == %{"prompt" => "hello"}
 
     assert Router.atomize_params_for_test("tune", %{
              "fastMode" => "on",
@@ -118,11 +118,11 @@ defmodule Tightbeam.Wire.RouterTest do
       end,
       "attest" => fn call ->
         send(parent, {:call, call})
-        %{code: call.params[:return_code] || "not_holder"}
+        %{code: call.params["returnCode"] || "not_holder"}
       end,
       "revoke-assignment" => fn call ->
         send(parent, {:call, call})
-        %{code: call.params[:return_code] || "not_authorized"}
+        %{code: call.params["returnCode"] || "not_authorized"}
       end,
       "assignments" => fn call ->
         send(parent, {:call, call})
@@ -135,8 +135,8 @@ defmodule Tightbeam.Wire.RouterTest do
       "work-item-get" => fn call ->
         send(parent, {:call, call})
 
-        if call.params[:return_code],
-          do: %{code: call.params.return_code},
+        if call.params["returnCode"],
+          do: %{code: call.params["returnCode"]},
           else: %{workItem: %{id: call.params.work_item_id}, assignments: []}
       end,
       "work-item-trace" => fn call ->
@@ -161,8 +161,8 @@ defmodule Tightbeam.Wire.RouterTest do
       "artifact-get" => fn call ->
         send(parent, {:call, call})
 
-        if call.params[:return_code],
-          do: %{code: call.params.return_code},
+        if call.params["returnCode"],
+          do: %{code: call.params["returnCode"]},
           else: %{artifact_id: call.params.artifact_id}
       end,
       "artifact-content-fetch" => fn call ->

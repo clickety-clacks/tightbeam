@@ -188,6 +188,37 @@ defmodule Tightbeam.Firehose.Hub do
     {:noreply, %{state | sockets: sockets}}
   end
 
+  def handle_cast({:committed, class, payload, refs}, state)
+      when class in ~w(session.spawned session.updated session.harness_changed session.retired) do
+    session_key = refs["sessionKey"] || payload[:session_key] || payload["sessionKey"]
+    owner = refs["ownerUserId"] || payload[:owner_user_id] || payload["ownerUserId"]
+    probe = %{"class" => class,
+      "refs" => Map.merge(refs, %{"sessionKey" => session_key, "ownerUserId" => owner}),
+      "payload" => %{"sessionKey" => session_key, "ownerUserId" => owner}}
+
+    eligible = Enum.filter(state.sockets, fn {pid, socket} ->
+      cond do
+        socket.mode == :pending or socket.overflowed -> false
+        revoked?(probe, socket) ->
+          Kernel.send(pid, :firehose_revoked)
+          false
+        true -> interested?(socket, probe) and visible?(socket, probe)
+      end
+    end)
+
+    # Deriving session capabilities can query the database. Only do it after
+    # subscriptions and visibility admit a recipient, then reuse that decision.
+    sockets = if eligible == [] do
+      state.sockets
+    else
+      notice = Publisher.committed_notice(class, payload, refs)
+      Enum.reduce(eligible, state.sockets, fn {pid, socket}, sockets ->
+        Map.put(sockets, pid, deliver_visible_notice(socket, pid, notice, state.queue_limit, true))
+      end)
+    end
+    {:noreply, %{state | sockets: sockets}}
+  end
+
   def handle_cast({:committed, class, payload, refs}, state),
     do: {:noreply, fanout(state, Publisher.committed_notice(class, payload, refs))}
 
@@ -227,13 +258,18 @@ defmodule Tightbeam.Firehose.Hub do
     end
   end
 
-  defp deliver_visible_notice(socket, pid, notice, limit) do
+  defp interested?(%{mode: :all}, _notice), do: true
+  defp interested?(socket, notice),
+    do: Enum.any?(socket.subscriptions, fn {_id, filters} -> matches?(notice, filters) end)
+
+  defp deliver_visible_notice(socket, pid, notice, limit, authorized? \\ false) do
     frames =
       if socket.mode == :all,
         do: [notice],
         else: matching_frames(notice, socket.subscriptions, socket.seq)
 
-    if frames != [] and not secret_payload?(notice["payload"]) and visible?(socket, notice) do
+    if frames != [] and not secret_payload?(notice["payload"]) and
+         (authorized? or visible?(socket, notice)) do
       seq = if socket.mode == :all, do: socket.seq, else: List.last(frames)["seq"]
       enqueue(%{socket | seq: seq}, pid, Enum.map(frames, &Publisher.wire_notice/1), limit)
     else
