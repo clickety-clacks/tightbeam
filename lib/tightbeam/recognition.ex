@@ -99,6 +99,7 @@ defmodule Tightbeam.Recognition do
 
   def inline(db, pending, callback, opts, deadline) do
     if pid = worker(db), do: GenServer.cast(pid, :reschedule)
+
     case invoke(db, pending, callback, true, deadline) do
       {:ok, result} ->
         if is_function(callback, 1), do: finish(db, pending.id)
@@ -199,14 +200,20 @@ defmodule Tightbeam.Recognition do
 
   def handle_info(:check_misses, state) do
     if state.ready do
-      DB.background_pass(fn ->
-        case DB.query(state.db, "SELECT id FROM pending_recognition WHERE flagged=0 AND nextAt<?1", [now() - 60_000]) do
+      safely(fn -> DB.background_pass(fn ->
+        case DB.query(
+               state.db,
+               "SELECT id FROM pending_recognition WHERE flagged=0 AND nextAt<?1",
+               [now() - 60_000]
+             ) do
           {:ok, rows} ->
             for [id] <- rows, do: Tightbeam.SchedulerMisses.record(:recognition, id)
             retry_pass(state)
-          {:error, error} -> raise error
+
+          {:error, error} ->
+            raise error
         end
-      end)
+      end) end)
     end
 
     Process.send_after(self(), :check_misses, 180_000)
@@ -219,7 +226,10 @@ defmodule Tightbeam.Recognition do
   def handle_info(:retry, state) do
     result = safely(fn -> DB.background_pass(fn -> retry_pass(state) end, :deferred) end)
     delay = if result in [:ok, nil], do: 0, else: 1_000
-    if match?({:error, _}, result), do: Logger.error("pending recognition scan failed; retry deferred")
+
+    if match?({:error, _}, result),
+      do: Logger.error("pending recognition scan failed; retry deferred")
+
     {:noreply, schedule_retry(state, delay)}
   end
 
@@ -227,13 +237,17 @@ defmodule Tightbeam.Recognition do
   defp schedule_retry(%{ready: false} = state, _delay), do: state
 
   defp schedule_retry(state, delay) do
-    case DB.query(state.db, "SELECT MIN(nextAt) FROM pending_recognition WHERE flagged=0") do
+    case safely(fn -> DB.query(state.db, "SELECT MIN(nextAt) FROM pending_recognition WHERE flagged=0") end) do
       {:ok, [[due_at]]} ->
         if state.timer, do: Process.cancel_timer(state.timer)
-        timer = if due_at, do: Process.send_after(self(), {:retry, due_at}, max(delay, due_at - now()))
+
+        timer =
+          if due_at, do: Process.send_after(self(), {:retry, due_at}, max(delay, due_at - now()))
+
         %{state | timer: timer, due_at: due_at}
 
-      {:error, _} -> state
+      {:error, _} ->
+        state
     end
   end
 

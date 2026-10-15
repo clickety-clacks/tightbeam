@@ -125,7 +125,9 @@ defmodule Tightbeam.LaneManager do
 
   @impl true
   def handle_cast({:lane_state, pid, session_key, seq}, state) do
-    {ref, _, _} = Map.get_lazy(state.lanes, pid, fn -> {Process.monitor(pid), session_key, seq} end)
+    {ref, _, _} =
+      Map.get_lazy(state.lanes, pid, fn -> {Process.monitor(pid), session_key, seq} end)
+
     {:noreply, %{state | lanes: Map.put(state.lanes, pid, {ref, session_key, seq})}}
   end
 
@@ -145,6 +147,7 @@ defmodule Tightbeam.LaneManager do
       {{^ref, key, _seq}, lanes} ->
         state = %{state | lanes: lanes}
         {:noreply, repair_lane(state, key)}
+
       _ ->
         {:noreply, %{state | reaping: Map.delete(state.reaping, ref)}}
     end
@@ -166,7 +169,12 @@ defmodule Tightbeam.LaneManager do
     end
 
     Enum.reduce(Ledger.pending_sessions(state.db), state, fn session_key, acc ->
-      active? = Enum.any?(acc.lanes, fn {_pid, {_ref, key, seq}} -> key == session_key and not is_nil(seq) end)
+      active? =
+        Enum.any?(acc.lanes, fn {_pid, {_ref, key, seq}} ->
+          key == session_key and not is_nil(seq) and
+            match?({:ok, [["running"]]}, DB.query(state.db, "SELECT status FROM turns WHERE seq=?1", [seq]))
+        end)
+
       if detect and active? do
         acc
       else
@@ -182,17 +190,20 @@ defmodule Tightbeam.LaneManager do
     if Enum.any?(state.reaping, fn {_ref, key} -> key == session_key end) do
       state
     else
-      task = Task.Supervisor.async_nolink(state.task_sup, fn ->
-        SessionLane.reap_abandoned(session_key)
-        SessionLane.nudge(session_key)
-        DB.background_pass(fn ->
-          for row <- Ledger.unpublished_terminals(state.db), row.session_key == session_key do
-            state.terminal_publisher.(row)
-            Ledger.mark_published(state.db, row.seq)
-            state.on_terminal.(session_key, row.seq)
-          end
+      task =
+        Task.Supervisor.async_nolink(state.task_sup, fn ->
+          SessionLane.reap_abandoned(session_key)
+          SessionLane.nudge(session_key)
+
+          DB.background_pass(fn ->
+            for row <- Ledger.unpublished_terminals(state.db), row.session_key == session_key do
+              state.terminal_publisher.(row)
+              Ledger.mark_published(state.db, row.seq)
+              state.on_terminal.(session_key, row.seq)
+            end
+          end)
         end)
-      end)
+
       %{state | reaping: Map.put(state.reaping, task.ref, session_key)}
     end
   end

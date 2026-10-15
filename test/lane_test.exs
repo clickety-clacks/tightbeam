@@ -74,30 +74,67 @@ defmodule Tightbeam.LaneTest do
     end
   end
 
+  test "idle recovery workers do no database work on a short interval", ctx do
+    manager = start_supervised!({LaneManager, db: ctx.db, lane_sup: ctx.lane_sup,
+      task_sup: ctx.task_sup, name: :idle_lane_manager,
+      runner: fn _ -> {:ok, %{text: "done"}} end})
+    sweeper = start_supervised!({Tightbeam.Productions.BubbleSweeper,
+      db: ctx.db, name: :idle_bubble_sweeper})
+    :sys.get_state(manager)
+    :sys.get_state(sweeper)
+    db_pid = GenServer.whereis(ctx.db)
+    :sys.get_state(:sys.get_state(ctx.db).retry)
+    :erlang.trace(db_pid, true, [:receive])
+    refute_receive {:trace, ^db_pid, :receive, {:"$gen_call", _, _}}, 5_200
+    :erlang.trace(db_pid, false, [:receive])
+  end
+
   test "lanes report turn changes and the slow check repairs a lost doorbell", ctx do
     parent = self()
-    manager = start_supervised!({LaneManager, db: ctx.db, lane_sup: ctx.lane_sup,
-      task_sup: ctx.task_sup, name: :event_lane_manager,
-      runner: fn turn ->
-        send(parent, {:event_turn, turn.seq, self()})
-        receive do: (:finish -> {:ok, %{text: "done"}})
-      end})
+
+    manager =
+      start_supervised!(
+        {LaneManager,
+         db: ctx.db,
+         lane_sup: ctx.lane_sup,
+         task_sup: ctx.task_sup,
+         name: :event_lane_manager,
+         runner: fn turn ->
+           send(parent, {:event_turn, turn.seq, self()})
+           receive do: (:finish -> {:ok, %{text: "done"}})
+         end}
+      )
+
     assert :sys.get_state(manager).interval >= 180_000
     :ok = LaneManager.ensure_lane(manager, "k1")
     assert eventually(fn -> map_size(:sys.get_state(manager).lanes) == 1 end)
     seq = enqueue!(ctx.db, "k1", "event")
     SessionLane.nudge("k1")
     assert_receive {:event_turn, ^seq, task}, 2_000
-    assert eventually(fn -> Enum.any?(:sys.get_state(manager).lanes, fn {_, {_, _, current}} -> current == seq end) end)
+
+    assert eventually(fn ->
+             Enum.any?(:sys.get_state(manager).lanes, fn {_, {_, _, current}} ->
+               current == seq
+             end)
+           end)
+
     send(task, :finish)
-    assert eventually(fn -> Enum.all?(:sys.get_state(manager).lanes, fn {_, {_, _, current}} -> current == nil end) end)
+
+    assert eventually(fn ->
+             Enum.all?(:sys.get_state(manager).lanes, fn {_, {_, _, current}} ->
+               current == nil
+             end)
+           end)
 
     missed = enqueue!(ctx.db, "k1", "missed")
     before = Tightbeam.SchedulerMisses.count()
-    log = ExUnit.CaptureLog.capture_log(fn ->
-      send(manager, :tick)
-      :sys.get_state(manager)
-    end)
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        send(manager, :tick)
+        :sys.get_state(manager)
+      end)
+
     assert log =~ "loop=lane record=k1"
     assert Tightbeam.SchedulerMisses.count() == before + 1
     assert_receive {:event_turn, ^missed, task}, 2_000
@@ -106,9 +143,20 @@ defmodule Tightbeam.LaneTest do
 
   test "a lane crash is repaired by its monitor without waiting for a scan", ctx do
     parent = self()
-    manager = start_supervised!({LaneManager, db: ctx.db, lane_sup: ctx.lane_sup,
-      task_sup: ctx.task_sup, name: :monitored_lane_manager,
-      runner: fn _ -> send(parent, :restarted_turn); {:ok, %{text: "done"}} end})
+
+    manager =
+      start_supervised!(
+        {LaneManager,
+         db: ctx.db,
+         lane_sup: ctx.lane_sup,
+         task_sup: ctx.task_sup,
+         name: :monitored_lane_manager,
+         runner: fn _ ->
+           send(parent, :restarted_turn)
+           {:ok, %{text: "done"}}
+         end}
+      )
+
     :ok = LaneManager.ensure_lane(manager, "k1")
     assert eventually(fn -> map_size(:sys.get_state(manager).lanes) == 1 end)
     [{lane, _}] = Registry.lookup(Tightbeam.LaneRegistry, "k1")

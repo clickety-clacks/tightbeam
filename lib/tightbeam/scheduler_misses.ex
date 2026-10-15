@@ -19,10 +19,14 @@ defmodule Tightbeam.SchedulerMisses do
               counter = :counters.new(1, [:write_concurrency])
               :persistent_term.put(__MODULE__, counter)
               counter
-            counter -> counter
+
+            counter ->
+              counter
           end
         end)
-      counter -> counter
+
+      counter ->
+        counter
     end
   end
 end

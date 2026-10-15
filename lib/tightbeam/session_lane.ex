@@ -679,6 +679,7 @@ defmodule Tightbeam.SessionLane do
           end)
 
         report_state(state, turn.seq)
+
         state
         |> Map.put(:task_ref, task.ref)
         |> Map.put(:task_pid, task.pid)
@@ -869,6 +870,7 @@ defmodule Tightbeam.SessionLane do
   end
 
   defp report_state(%{lane_manager: nil}, _seq), do: :ok
+
   defp report_state(state, seq),
     do: GenServer.cast(state.lane_manager, {:lane_state, self(), state.session_key, seq})
 

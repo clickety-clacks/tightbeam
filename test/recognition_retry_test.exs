@@ -195,6 +195,25 @@ defmodule Tightbeam.RecognitionRetryTest do
     assert {:ok, []} = DB.query(db, "SELECT id FROM pending_recognition")
   end
 
+  test "a failed inline callback arms its retry from the committed row", %{db: db, retry: retry} do
+    parent = self()
+    calls = :atomics.new(1, [])
+    old = Application.get_env(:tightbeam, :db_call_timeout_ms)
+    Application.put_env(:tightbeam, :db_call_timeout_ms, 500)
+    on_exit(fn ->
+      if old, do: Application.put_env(:tightbeam, :db_call_timeout_ms, old),
+        else: Application.delete_env(:tightbeam, :db_call_timeout_ms)
+    end)
+    assert {:ok, :committed} = DB.transaction_then(db, fn _ -> :committed end, fn _ ->
+      if :atomics.add_get(calls, 1, 1) == 1, do: raise("first attempt")
+      send(parent, :automatic_retry)
+      :recognized
+    end)
+    assert_receive :automatic_retry, 1_500
+    assert :sys.get_state(retry).timer == nil
+    assert {:ok, []} = DB.query(db, "SELECT id FROM pending_recognition")
+  end
+
   test "idle retries make no database calls between events", %{db: db, retry: retry} do
     assert :sys.get_state(retry).timer == nil
     :erlang.trace(db, true, [:receive])
@@ -202,33 +221,70 @@ defmodule Tightbeam.RecognitionRetryTest do
     :erlang.trace(db, false, [:receive])
   end
 
-  test "a committed retry moves the deadline timer earlier and fires without polling", %{db: db, retry: retry} do
+  test "a committed retry moves the deadline timer earlier and fires without polling", %{
+    db: db,
+    retry: retry
+  } do
     parent = self()
-    assert {:ok, pending} = DB.transaction(db, fn txn ->
-      pending = Tightbeam.Recognition.record(txn, fn _ -> send(parent, :timer_recognized) end, :value, [], [])
-      Txn.q(txn, "UPDATE pending_recognition SET nextAt=?1 WHERE id=?2", [System.system_time(:millisecond) + 200, pending.id])
-      pending
-    end)
+
+    assert {:ok, pending} =
+             DB.transaction(db, fn txn ->
+               pending =
+                 Tightbeam.Recognition.record(
+                   txn,
+                   fn _ -> send(parent, :timer_recognized) end,
+                   :value,
+                   [],
+                   []
+                 )
+
+               Txn.q(txn, "UPDATE pending_recognition SET nextAt=?1 WHERE id=?2", [
+                 System.system_time(:millisecond) + 200,
+                 pending.id
+               ])
+
+               pending
+             end)
+
     GenServer.cast(retry, :reschedule)
     assert :sys.get_state(retry).due_at != nil
     assert_receive :timer_recognized, 1_000
     assert :sys.get_state(retry).timer == nil
-    assert {:ok, []} = DB.query(db, "SELECT id FROM pending_recognition WHERE id=?1", [pending.id])
+
+    assert {:ok, []} =
+             DB.query(db, "SELECT id FROM pending_recognition WHERE id=?1", [pending.id])
   end
 
-  test "the consistency check repairs and counts a suppressed retry signal", %{db: db, retry: retry} do
+  test "the consistency check repairs and counts a suppressed retry signal", %{
+    db: db,
+    retry: retry
+  } do
     parent = self()
     assert :sys.get_state(retry).timer == nil
-    {:ok, pending} = DB.transaction(db, fn txn ->
-      pending = Tightbeam.Recognition.record(txn, fn _ -> send(parent, :miss_recognized) end, :value, [], [])
-      Txn.q(txn, "UPDATE pending_recognition SET nextAt=0 WHERE id=?1", [pending.id])
-      pending
-    end)
+
+    {:ok, pending} =
+      DB.transaction(db, fn txn ->
+        pending =
+          Tightbeam.Recognition.record(
+            txn,
+            fn _ -> send(parent, :miss_recognized) end,
+            :value,
+            [],
+            []
+          )
+
+        Txn.q(txn, "UPDATE pending_recognition SET nextAt=0 WHERE id=?1", [pending.id])
+        pending
+      end)
+
     before = Tightbeam.SchedulerMisses.count()
-    log = capture_log(fn ->
-      send(retry, :check_misses)
-      :sys.get_state(retry)
-    end)
+
+    log =
+      capture_log(fn ->
+        send(retry, :check_misses)
+        :sys.get_state(retry)
+      end)
+
     assert_receive :miss_recognized
     assert Tightbeam.SchedulerMisses.count() == before + 1
     assert log =~ "loop=recognition record=#{pending.id}"

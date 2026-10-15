@@ -61,6 +61,7 @@ defmodule Tightbeam.Productions.BubbleSweeper do
         end
       end
     end)
+
     {:noreply, state}
   end
 
@@ -84,8 +85,11 @@ defmodule Tightbeam.Productions.BubbleSweeper do
       DB.query(
         db,
         """
-        SELECT seq, endedAt IS NOT NULL FROM turns
-        WHERE seq > ?1
+        SELECT seq, endedAt IS NOT NULL FROM turns AS t
+        WHERE seq > ?1 AND endedAt IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM production_cursors WHERE name = 'bubble:' || t.seq
+          )
         ORDER BY seq LIMIT ?2
         """,
         [cursor, @batch]
@@ -106,10 +110,12 @@ defmodule Tightbeam.Productions.BubbleSweeper do
               acknowledge(db, seq)
               count + 1
 
-            {:error, %DB.Overloaded{}} -> count
+            {:error, %DB.Overloaded{}} ->
+              count
 
             _ ->
               failures = Process.get({__MODULE__, seq}, 0) + 1
+
               if failures >= 5 do
                 Logger.error("bubble recognition skipping turn #{seq} after #{failures} failures")
                 Process.delete({__MODULE__, seq})
@@ -117,6 +123,7 @@ defmodule Tightbeam.Productions.BubbleSweeper do
               else
                 Process.put({__MODULE__, seq}, failures)
               end
+
               count
           end
         end
@@ -127,28 +134,50 @@ defmodule Tightbeam.Productions.BubbleSweeper do
   end
 
   defp acknowledged?(db, seq) do
-    {:ok, rows} = DB.query(db, "SELECT seq FROM production_cursors WHERE name=?1", ["bubble:#{seq}"])
+    {:ok, rows} =
+      DB.query(db, "SELECT seq FROM production_cursors WHERE name=?1", ["bubble:#{seq}"])
+
     rows != []
   end
 
   defp acknowledge(db, seq) do
-    {:ok, _} = DB.query(db, "INSERT INTO production_cursors(name,seq) VALUES(?1,?2) ON CONFLICT(name) DO NOTHING", ["bubble:#{seq}", seq])
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO production_cursors(name,seq) VALUES(?1,?2) ON CONFLICT(name) DO NOTHING",
+        ["bubble:#{seq}", seq]
+      )
   end
 
   defp advance_cursor(db) do
     cursor = read_cursor(db)
-    {:ok, rows} = DB.query(db, "SELECT seq, endedAt IS NOT NULL FROM turns WHERE seq>?1 ORDER BY seq LIMIT ?2", [cursor, @batch])
-    prefix = Enum.take_while(rows, fn [seq, ended] -> ended == 1 and acknowledged?(db, seq) end)
+
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT seq, endedAt IS NOT NULL, EXISTS(SELECT 1 FROM production_cursors WHERE name='bubble:' || t.seq) FROM turns AS t WHERE seq>?1 ORDER BY seq LIMIT ?2",
+        [cursor, @batch]
+      )
+
+    prefix = Enum.take_while(rows, fn [_seq, ended, acknowledged] -> ended == 1 and acknowledged == 1 end)
 
     if prefix != [] do
       last = prefix |> List.last() |> hd()
-      {:ok, _} = DB.query(db, "INSERT INTO production_cursors(name,seq) VALUES('bubble',?1) ON CONFLICT(name) DO UPDATE SET seq=excluded.seq", [last])
+
+      {:ok, _} =
+        DB.query(
+          db,
+          "INSERT INTO production_cursors(name,seq) VALUES('bubble',?1) ON CONFLICT(name) DO UPDATE SET seq=excluded.seq",
+          [last]
+        )
+
       clear_acknowledgements(db, last)
     end
   end
 
   defp clear_acknowledgements(db, last) do
-    {:ok, _} = DB.query(db, "DELETE FROM production_cursors WHERE name LIKE 'bubble:%' AND seq<=?1", [last])
+    {:ok, _} =
+      DB.query(db, "DELETE FROM production_cursors WHERE name LIKE 'bubble:%' AND seq<=?1", [last])
   end
 
   defp read_cursor(db) do

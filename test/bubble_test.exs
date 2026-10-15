@@ -910,8 +910,11 @@ defmodule Tightbeam.Productions.BubbleTest do
   end
 
   test "turn signals recognize once and missed signals are repaired and counted", ctx do
-    sweeper = start_supervised!({Tightbeam.Productions.BubbleSweeper,
-      db: ctx.db, name: :event_bubble_sweeper})
+    sweeper =
+      start_supervised!(
+        {Tightbeam.Productions.BubbleSweeper, db: ctx.db, name: :event_bubble_sweeper}
+      )
+
     :sys.get_state(sweeper)
     assert :sys.get_state(sweeper).interval >= 180_000
     before = Tightbeam.SchedulerMisses.count()
@@ -924,14 +927,21 @@ defmodule Tightbeam.Productions.BubbleTest do
     assert Tightbeam.SchedulerMisses.count() == before
 
     missed = fail_turn!(ctx.db, "holder")
-    log = ExUnit.CaptureLog.capture_log(fn ->
-      send(sweeper, :tick)
-      :sys.get_state(sweeper)
-    end)
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        send(sweeper, :tick)
+        :sys.get_state(sweeper)
+      end)
+
     assert log =~ "loop=bubble record=#{missed}"
     assert Tightbeam.SchedulerMisses.count() > before
-    assert {:ok, [[cursor]]} = DB.query(ctx.db, "SELECT seq FROM production_cursors WHERE name='bubble'")
-    assert cursor >= missed
+
+    assert {:ok, [[cursor]]} =
+             DB.query(ctx.db, "SELECT seq FROM production_cursors WHERE name='bubble'")
+
+    assert cursor >= missed or match?({:ok, [[^missed]]}, DB.query(ctx.db,
+      "SELECT seq FROM production_cursors WHERE name=?1", ["bubble:#{missed}"]))
   end
 
   # Review B1/B3b: the sweeper's cursor makes recognition sweep-reachable —
