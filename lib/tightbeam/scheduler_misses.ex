@@ -8,7 +8,14 @@ defmodule Tightbeam.SchedulerMisses do
   def record(loop, record, late_ms \\ nil) do
     index = loop_index(loop)
     [sequence, _] = :ets.update_counter(__MODULE__, :counts, [{2, 1}, {index, 1}])
-    miss = %{loop: loop_name(loop), record_id: record, late_ms: late_ms, at: System.system_time(:millisecond)}
+
+    miss = %{
+      loop: loop_name(loop),
+      record_id: record,
+      late_ms: late_ms,
+      at: System.system_time(:millisecond)
+    }
+
     :ets.insert(__MODULE__, {rem(sequence, @limit), sequence, miss})
     Logger.warning("event miss loop=#{loop} record=#{record} late_ms=#{late_ms || "unknown"}")
     :ok
@@ -18,15 +25,21 @@ defmodule Tightbeam.SchedulerMisses do
 
   def health do
     [counts] = :ets.lookup(__MODULE__, :counts)
+
     recent =
       :ets.tab2list(__MODULE__)
       |> Enum.filter(&(tuple_size(&1) == 3))
       |> Enum.sort_by(&elem(&1, 1), :desc)
       |> Enum.map(&elem(&1, 2))
 
-    %{count: elem(counts, 1), by_loop: Map.new(Enum.with_index(@loops, 2), fn {loop, index} ->
-      {loop, elem(counts, index)}
-    end), recent: recent}
+    %{
+      count: elem(counts, 1),
+      by_loop:
+        Map.new(Enum.with_index(@loops, 2), fn {loop, index} ->
+          {loop, elem(counts, index)}
+        end),
+      recent: recent
+    }
   end
 
   def init do

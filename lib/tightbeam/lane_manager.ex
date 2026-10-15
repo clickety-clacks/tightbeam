@@ -188,7 +188,13 @@ defmodule Tightbeam.LaneManager do
       # died with the gateway keeps a stuck typing indicator forever.
       for %{seq: seq} = row <- Ledger.unpublished_terminals(state.db) do
         if detect,
-          do: Tightbeam.SchedulerMisses.record(:lane_terminal, seq, max(0, System.system_time(:millisecond) - row.ended_at))
+          do:
+            Tightbeam.SchedulerMisses.record(
+              :lane_terminal,
+              seq,
+              max(0, System.system_time(:millisecond) - row.ended_at)
+            )
+
         state.terminal_publisher.(row)
         Ledger.mark_published(state.db, seq)
         state.on_terminal.(row.session_key, seq)

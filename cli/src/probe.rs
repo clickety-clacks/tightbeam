@@ -1567,7 +1567,14 @@ pub fn run(
     let sentinels = doctor_sentinels(&resolved_base_dir, explicit_base_dir, identity);
     let event_paths = doctor_event_paths(&resolved_base_dir, explicit_base_dir);
     if json {
-        println!("{}", report_json(&report, Some(sentinel_value(&sentinels)), Some(event_paths_value(&event_paths))));
+        println!(
+            "{}",
+            report_json(
+                &report,
+                Some(sentinel_value(&sentinels)),
+                Some(event_paths_value(&event_paths))
+            )
+        );
     } else {
         println!("{}", human(&report));
         println!("{}", sentinel_lines(&sentinels).join("\n"));
@@ -1596,9 +1603,13 @@ fn doctor_event_paths(base_dir: &Path, explicit_base_dir: bool) -> Result<Value,
     let deadline = Instant::now() + std::time::Duration::from_secs(5);
     let version = crate::dispatch::send_to_with_deadline(&endpoint, &request, Some(deadline))?
         .ok_or("the gateway returned no health facts")?;
-    version.get("eventPaths")
-        .filter(|health| health["count"].as_u64().is_some()
-            && health["by_loop"].is_object() && health["recent"].is_array())
+    version
+        .get("eventPaths")
+        .filter(|health| {
+            health["count"].as_u64().is_some()
+                && health["by_loop"].is_object()
+                && health["recent"].is_array()
+        })
         .cloned()
         .ok_or_else(|| "the gateway did not report event path health".to_owned())
 }
@@ -1607,7 +1618,11 @@ fn event_paths_value(status: &Result<Value, String>) -> Value {
     match status {
         Ok(health) => {
             let mut health = health.clone();
-            health["level"] = Value::from(if health["count"] == 0 { "pass" } else { "warning" });
+            health["level"] = Value::from(if health["count"] == 0 {
+                "pass"
+            } else {
+                "warning"
+            });
             health
         }
         Err(reason) => object([("unavailable", Value::from(reason.clone()))]),
@@ -1622,17 +1637,32 @@ fn event_paths_lines(status: &Result<Value, String>) -> Vec<String> {
     if health["count"] == 0 {
         return vec!["[PASS] event paths: no missed events since start".to_owned()];
     }
-    let counts = [("wake", "wake scheduler"), ("recognition", "recognition retry"),
-        ("bubble", "bubble"), ("lanes", "lanes")]
-        .iter().map(|(key, label)| format!("{label}={}", health["by_loop"][key]))
-        .collect::<Vec<_>>().join(", ");
-    let mut lines = vec![format!("[WARN] event paths: {} missed events since start; {counts}", health["count"])];
+    let counts = [
+        ("wake", "wake scheduler"),
+        ("recognition", "recognition retry"),
+        ("bubble", "bubble"),
+        ("lanes", "lanes"),
+    ]
+    .iter()
+    .map(|(key, label)| format!("{label}={}", health["by_loop"][key]))
+    .collect::<Vec<_>>()
+    .join(", ");
+    let mut lines = vec![format!(
+        "[WARN] event paths: {} missed events since start; {counts}",
+        health["count"]
+    )];
     if let Some(recent) = health["recent"].as_array() {
         for miss in recent {
-            let late = miss["late_ms"].as_u64().map(|ms| format!("{ms} ms late"))
+            let late = miss["late_ms"]
+                .as_u64()
+                .map(|ms| format!("{ms} ms late"))
                 .unwrap_or_else(|| "lateness unknown".to_owned());
-            lines.push(format!("  {} record={} {late} at={} ms since epoch",
-                miss["loop"].as_str().unwrap_or("unknown"), miss["record_id"], miss["at"]));
+            lines.push(format!(
+                "  {} record={} {late} at={} ms since epoch",
+                miss["loop"].as_str().unwrap_or("unknown"),
+                miss["record_id"],
+                miss["at"]
+            ));
         }
     }
     lines
@@ -1869,7 +1899,10 @@ mod tests {
             "by_loop": {"wake": 0, "recognition": 0, "bubble": 0, "lanes": 0},
             "recent": []
         }));
-        assert_eq!(event_paths_lines(&clean), vec!["[PASS] event paths: no missed events since start"]);
+        assert_eq!(
+            event_paths_lines(&clean),
+            vec!["[PASS] event paths: no missed events since start"]
+        );
         assert_eq!(event_paths_value(&clean)["level"], "pass");
         let missed = Ok(serde_json::json!({
             "count": 1,

@@ -208,7 +208,8 @@ defmodule Tightbeam.Recognition do
                ) do
             {:ok, rows} ->
               for [id, next_at] <- rows,
-                do: Tightbeam.SchedulerMisses.record(:recognition, id, max(0, now() - next_at))
+                  do: Tightbeam.SchedulerMisses.record(:recognition, id, max(0, now() - next_at))
+
               retry_pass(state)
 
             {:error, error} ->

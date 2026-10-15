@@ -1371,7 +1371,14 @@ defmodule Tightbeam.Ledger do
     {:ok, rows} = DB.query(db, unpublished_terminals_sql())
 
     Enum.map(rows, fn [seq, sk, mid, status, error, ended_at] ->
-      %{seq: seq, session_key: sk, message_id: mid, status: status, error: error, ended_at: ended_at}
+      %{
+        seq: seq,
+        session_key: sk,
+        message_id: mid,
+        status: status,
+        error: error,
+        ended_at: ended_at
+      }
     end)
   end
 

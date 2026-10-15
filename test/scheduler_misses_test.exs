@@ -4,7 +4,10 @@ defmodule Tightbeam.SchedulerMissesTest do
   @tag timeout: 180_000
   test "doctor passes at clean gateway start and warns after an actual recorded miss" do
     cli_dir = Path.expand("../cli", __DIR__)
-    {output, status} = System.cmd("cargo", ["build", "--release"], cd: cli_dir, stderr_to_stdout: true)
+
+    {output, status} =
+      System.cmd("cargo", ["build", "--release"], cd: cli_dir, stderr_to_stdout: true)
+
     assert status == 0, output
     binary = Path.join(cli_dir, "target/release/tightbeam")
     base = Path.join(System.tmp_dir!(), "event-path-doctor-#{System.unique_integer([:positive])}")
@@ -43,7 +46,12 @@ defmodule Tightbeam.SchedulerMissesTest do
     '''
 
     paths = Enum.flat_map(:code.get_path(), fn path -> ["-pa", to_string(path)] end)
-    {output, status} = System.cmd(System.find_executable("elixir"), paths ++ ["-e", script, binary, base], stderr_to_stdout: true)
+
+    {output, status} =
+      System.cmd(System.find_executable("elixir"), paths ++ ["-e", script, binary, base],
+        stderr_to_stdout: true
+      )
+
     assert status == 0, output
     assert output =~ "event-path-doctor: ok"
   end
