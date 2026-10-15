@@ -1913,8 +1913,8 @@ defmodule Tightbeam.Supervision do
   def handle_info(:detect_misses, state) do
     DB.background_pass(fn ->
       safe_evaluate(state, "miss_check", fn ->
-        pending = query(state.db, "SELECT sessionKey,pendingBranch FROM supervision_watermarks WHERE pendingBranch IS NOT NULL")
-        escalations = query(state.db, "SELECT id,sessionKey,state FROM patrol_failure_escalations WHERE state IN ('pending','admitted')")
+        pending = query(state.db, "SELECT sessionKey,pendingBranch FROM supervision_watermarks WHERE pendingBranch IS NOT NULL", [])
+        escalations = query(state.db, "SELECT id,sessionKey,state FROM patrol_failure_escalations WHERE state IN ('pending','admitted')", [])
         detect_misses(state)
         sweep(state)
         Enum.each(pending, fn [session, branch] ->
