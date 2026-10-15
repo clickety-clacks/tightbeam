@@ -74,6 +74,39 @@ defmodule Tightbeam.LaneTest do
     end
   end
 
+  test "a blocked turn boundary does not block admission for another session", ctx do
+    parent = self()
+    seq = enqueue!(ctx.db, "k1", "complete")
+    manager = start_supervised!({LaneManager,
+      db: ctx.db, lane_sup: ctx.lane_sup, task_sup: ctx.task_sup,
+      runner: fn _ -> {:ok, %{text: "done"}} end,
+      on_terminal: fn key, terminal_seq ->
+        if key == "k1" and terminal_seq == seq do
+          send(parent, {:boundary, self()})
+          receive do
+            :release_boundary -> :ok
+          end
+        end
+      end,
+      interval: 60_000, name: :blocked_boundary_manager
+    })
+    assert_receive {:boundary, lane}, 5_000
+    # Keep work pending so reconciliation must visit this lane.
+    enqueue!(ctx.db, "k1", "waiting")
+    assert :ok = LaneManager.reconcile(manager)
+    assert :ok = LaneManager.reconcile(manager)
+    {elapsed, result} = :timer.tc(fn -> LaneManager.ensure_lane(manager, "k2") end)
+    assert result == :ok
+    assert elapsed < 250_000
+    assert [{other_lane, _}] = Registry.lookup(Tightbeam.LaneRegistry, "k2")
+    assert Process.alive?(other_lane)
+    assert Enum.count(:sys.get_state(manager).reaping, fn {_, key} -> key == "k1" end) == 1
+    send(lane, :release_boundary)
+    assert eventually(fn ->
+      match?({:ok, [["delivered"]]}, DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [seq]))
+    end)
+  end
+
   test "lane drains queued turns in seq order, one at a time, marking terminals", ctx do
     {:ok, agent} = Agent.start_link(fn -> [] end)
     enqueue!(ctx.db, "k1", "first")

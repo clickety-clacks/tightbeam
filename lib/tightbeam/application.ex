@@ -60,9 +60,11 @@ defmodule Tightbeam.Application do
 
   defp start_tree(config) do
     with {:ok, supervisor} <- Supervisor.start_link(children(config), root_opts()) do
-      Enum.each(Tightbeam.Gateway.children_after_preflight(config), fn child ->
-        {:ok, _pid} = Supervisor.start_child(supervisor, child)
-      end)
+      {:ok, _pid} =
+        Supervisor.start_child(
+          supervisor,
+          runtime_child(Tightbeam.Gateway.children_after_preflight(config))
+        )
 
       # LAST, deliberately: Bandit's "Running ... (http)" has already been
       # logged by now, and that line reads as a verdict. On an org that cannot
@@ -183,6 +185,19 @@ defmodule Tightbeam.Application do
       # LaneManager (reconciler) is started once a runner is composed by the
       # gateway composition root; see Tightbeam.Gateway (E2).
     ]
+  end
+
+  @doc false
+  def runtime_child(children) do
+    %{
+      id: Tightbeam.RuntimeSupervisor,
+      start:
+        {Supervisor, :start_link,
+         [children,
+          [strategy: :one_for_one, name: Tightbeam.RuntimeSupervisor,
+           max_restarts: 50, max_seconds: 30]]},
+      type: :supervisor
+    }
   end
 
   @doc "Root supervisor options — rest_for_one with a tight restart budget."
