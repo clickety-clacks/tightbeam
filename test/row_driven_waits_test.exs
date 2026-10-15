@@ -159,6 +159,21 @@ defmodule Tightbeam.RowDrivenWaitsTest do
              )
   end
 
+  test "unrelated transition candidates are scoped before decoding optional evidence", ctx do
+    assignment(ctx.db, "R2", "resolver")
+    bad = register_wait(ctx.db, due_after(), predicate("R2"))
+    good = register_wait(ctx.db, due_after(), predicate("R"))
+    assert {:ok, _} = DB.query(ctx.db, "UPDATE wakes SET recognitionEvidence='{' WHERE wakeId=?1", [bad.wake_id])
+    log = ExUnit.CaptureLog.capture_log(fn ->
+      assert %{outcome: "revoked"} = revoke(ctx.db, "R")
+    end)
+    refute log =~ bad.wake_id
+    assert Wakes.get(ctx.db, good.wake_id).recognition_path == "reconsideration"
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    assert turn_count(ctx.db, good.wake_id) == 1
+    assert {:ok, [["pending", nil, "{"]]} = DB.query(ctx.db, "SELECT state,recognitionAt,recognitionEvidence FROM wakes WHERE wakeId=?1", [bad.wake_id])
+  end
+
   for invalid <- ["{", "{}"] do
     test "invalid dependency #{inspect(invalid)} does not roll back another wait's transition recognition",
          ctx do

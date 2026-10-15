@@ -2733,23 +2733,16 @@ defmodule Tightbeam.Wakes do
       Txn.q(
         txn,
         """
-        SELECT wakeId FROM wakes
+        SELECT wakeId,predicate,resolverKind,resolverId,verificationAssignmentId,verificationState FROM wakes
         WHERE state='pending' AND waitMode='dependency' AND recognitionAt IS NULL
           AND ownerUserId=?1
         ORDER BY rowid
         """,
         [owner_user_id]
       )
-      |> Enum.each(fn [wake_id] ->
+      |> Enum.each(fn [wake_id, predicate, resolver_kind, resolver_id, verifier, verification_state] ->
         recognize_wake_in_savepoint(txn, wake_id, fn ->
-          [[predicate, resolver_kind, resolver_id, verifier, verification_state]] =
-            Txn.q(
-              txn,
-              "SELECT predicate,resolverKind,resolverId,verificationAssignmentId,verificationState FROM wakes WHERE wakeId=?1",
-              [wake_id]
-            )
-
-          candidate = %{
+          wake = %{
             wake_id: wake_id,
             owner_user_id: owner_user_id,
             predicate: decode_optional(predicate),
@@ -2759,69 +2752,63 @@ defmodule Tightbeam.Wakes do
             verification_state: verification_state
           }
 
-          case candidate do
-            nil ->
-              :ok
+          owner_transitions =
+            Enum.filter(transitions, &(&1.owner_user_id == wake.owner_user_id))
 
-            wake ->
-              owner_transitions =
-                Enum.filter(transitions, &(&1.owner_user_id == wake.owner_user_id))
+          predicate_transition =
+            Enum.find(transitions, fn transition ->
+              (transition.owner_user_id == wake.owner_user_id or unowned_fact?.(transition)) and
+                predicate_transition_relevant?(txn, wake, transition)
+            end)
 
-              predicate_transition =
-                Enum.find(transitions, fn transition ->
-                  (transition.owner_user_id == wake.owner_user_id or unowned_fact?.(transition)) and
-                    predicate_transition_relevant?(txn, wake, transition)
-                end)
+          resolver_transition =
+            Enum.find(owner_transitions, &resolver_transition_relevant?(wake, &1))
 
-              resolver_transition =
-                Enum.find(owner_transitions, &resolver_transition_relevant?(wake, &1))
+          verification_transition =
+            Enum.find(owner_transitions, &verification_terminal_transition?(wake, &1))
 
-              verification_transition =
-                Enum.find(owner_transitions, &verification_terminal_transition?(wake, &1))
+          if predicate_transition || resolver_transition || verification_transition do
+            wake = wait_in_txn(txn, wake_id)
+            evaluation = evaluate_wait_predicate_in_txn(txn, wake)
+            resolver = resolver_for_wake_in_txn(txn, wake)
 
-              if predicate_transition || resolver_transition || verification_transition do
-                wake = wait_in_txn(txn, wake_id)
-                evaluation = evaluate_wait_predicate_in_txn(txn, wake)
-                resolver = resolver_for_wake_in_txn(txn, wake)
+            cond do
+              evaluation.matched and predicate_transition ->
+                recognize_wait_in_txn(
+                  txn,
+                  wake,
+                  "success",
+                  nil,
+                  evaluation,
+                  resolver,
+                  predicate_transition
+                )
 
-                cond do
-                  evaluation.matched and predicate_transition ->
-                    recognize_wait_in_txn(
-                      txn,
-                      wake,
-                      "success",
-                      nil,
-                      evaluation,
-                      resolver,
-                      predicate_transition
-                    )
+              resolver.terminal and resolver_transition ->
+                recognize_wait_in_txn(
+                  txn,
+                  wake,
+                  "reconsideration",
+                  "resolver-terminal",
+                  evaluation,
+                  resolver,
+                  resolver_transition
+                )
 
-                  resolver.terminal and resolver_transition ->
-                    recognize_wait_in_txn(
-                      txn,
-                      wake,
-                      "reconsideration",
-                      "resolver-terminal",
-                      evaluation,
-                      resolver,
-                      resolver_transition
-                    )
+              verification_transition ->
+                recognize_wait_in_txn(
+                  txn,
+                  wake,
+                  "reconsideration",
+                  "verification-terminal",
+                  evaluation,
+                  resolver,
+                  verification_transition
+                )
 
-                  verification_transition ->
-                    recognize_wait_in_txn(
-                      txn,
-                      wake,
-                      "reconsideration",
-                      "verification-terminal",
-                      evaluation,
-                      resolver,
-                      verification_transition
-                    )
-
-                  true ->
-                    wake
-                end
-              end
+              true ->
+                wake
+            end
           end
         end)
       end)
