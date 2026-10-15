@@ -275,12 +275,15 @@ defmodule Tightbeam.NoticeSourcePayloadTest do
 
       {:ok, columns} = DB.query(db, "PRAGMA table_info(wakes)")
       old_columns = Enum.map_join(columns, ",", &Enum.at(&1, 1))
-      assert {:ok, sources_before} = DB.query(db, "SELECT #{old_columns} FROM wakes ORDER BY rowid")
 
-      assert ExUnit.CaptureLog.capture_log(fn -> assert :ok = Schema.ensure_all(db) end) =~ condition.wake_id
+      assert {:ok, sources_before} =
+               DB.query(db, "SELECT #{old_columns} FROM wakes ORDER BY rowid")
 
-      assert {:ok, ^sources_before} = DB.query(db, "SELECT #{old_columns} FROM wakes ORDER BY rowid")
+      assert ExUnit.CaptureLog.capture_log(fn -> assert :ok = Schema.ensure_all(db) end) =~
+               condition.wake_id
 
+      assert {:ok, ^sources_before} =
+               DB.query(db, "SELECT #{old_columns} FROM wakes ORDER BY rowid")
 
       assert %{
                state: "pending",
@@ -300,10 +303,11 @@ defmodule Tightbeam.NoticeSourcePayloadTest do
       stop_supervised!(db)
       start_supervised!(Supervisor.child_spec({DB, db_opts}, id: db))
 
-      assert ExUnit.CaptureLog.capture_log(fn -> assert :ok = Schema.ensure_all(db) end) =~ condition.wake_id
+      assert ExUnit.CaptureLog.capture_log(fn -> assert :ok = Schema.ensure_all(db) end) =~
+               condition.wake_id
 
-      assert {:ok, ^sources_before} = DB.query(db, "SELECT #{old_columns} FROM wakes ORDER BY rowid")
-
+      assert {:ok, ^sources_before} =
+               DB.query(db, "SELECT #{old_columns} FROM wakes ORDER BY rowid")
     end
   end
 
@@ -359,13 +363,15 @@ defmodule Tightbeam.NoticeSourcePayloadTest do
 
       before = current_storage_snapshot(db)
 
-      assert ExUnit.CaptureLog.capture_log(fn -> assert :ok = Schema.ensure_all(db) end) =~ condition.wake_id
+      assert ExUnit.CaptureLog.capture_log(fn -> assert :ok = Schema.ensure_all(db) end) =~
+               condition.wake_id
 
       assert current_storage_snapshot(db) == before
       stop_supervised!(db)
       start_supervised!(Supervisor.child_spec({DB, db_opts}, id: db))
 
-      assert ExUnit.CaptureLog.capture_log(fn -> assert :ok = Schema.ensure_all(db) end) =~ condition.wake_id
+      assert ExUnit.CaptureLog.capture_log(fn -> assert :ok = Schema.ensure_all(db) end) =~
+               condition.wake_id
 
       assert current_storage_snapshot(db) == before
 
@@ -527,24 +533,59 @@ defmodule Tightbeam.NoticeSourcePayloadTest do
                "CREATE TRIGGER refuse_payload_copy BEFORE UPDATE ON wakes BEGIN SELECT RAISE(ABORT,'forced source payload copy failure'); END"
              )
 
-    assert ExUnit.CaptureLog.capture_log(fn -> assert :ok = Schema.ensure_all(db) end) =~ source.wake_id
-    assert {:ok, [["[]"]]} = DB.query(db, "SELECT attachments FROM notice_batch_source_attachments_unresolved WHERE sourceWakeId=?1", [source.wake_id])
-    assert {:ok, [[nil]]} = DB.query(db, "SELECT sourceAttachments FROM wakes WHERE wakeId=?1", [source.wake_id])
-    assert {:ok, [["decision-request-row-schema-v2-019"]]} = DB.query(db, "SELECT shape FROM schema_stamp")
-    assert :ok = Schema.ensure_all(db)
+    assert ExUnit.CaptureLog.capture_log(fn -> assert :ok = Schema.ensure_all(db) end) =~
+             source.wake_id
 
+    assert {:ok, [["[]"]]} =
+             DB.query(
+               db,
+               "SELECT attachments FROM notice_batch_source_attachments_unresolved WHERE sourceWakeId=?1",
+               [source.wake_id]
+             )
+
+    assert {:ok, [[nil]]} =
+             DB.query(db, "SELECT sourceAttachments FROM wakes WHERE wakeId=?1", [source.wake_id])
+
+    assert {:ok, [["decision-request-row-schema-v2-019"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert :ok = Schema.ensure_all(db)
   end
 
-  test "orphan attachment sidecar is retained while a healthy source upgrades", %{db: db, db_opts: db_opts} do
-    source = Wakes.schedule(db, %{session_key: "payload-recipient", origin: "user:owner", prompt: "healthy", due_at: 0})
+  test "orphan attachment sidecar is retained while a healthy source upgrades", %{
+    db: db,
+    db_opts: db_opts
+  } do
+    source =
+      Wakes.schedule(db, %{
+        session_key: "payload-recipient",
+        origin: "user:owner",
+        prompt: "healthy",
+        due_at: 0
+      })
+
     predecessor!(db, db_opts)
     :ok = DB.execute(db, "PRAGMA foreign_keys=OFF")
-    {:ok, _} = DB.query(db, "INSERT INTO notice_batch_source_attachments VALUES ('missing-source','[]')")
-    {:ok, _} = DB.query(db, "INSERT INTO notice_batch_source_attachments VALUES (?1,'[]')", [source.wake_id])
+
+    {:ok, _} =
+      DB.query(db, "INSERT INTO notice_batch_source_attachments VALUES ('missing-source','[]')")
+
+    {:ok, _} =
+      DB.query(db, "INSERT INTO notice_batch_source_attachments VALUES (?1,'[]')", [
+        source.wake_id
+      ])
+
     :ok = DB.execute(db, "PRAGMA foreign_keys=ON")
-    assert ExUnit.CaptureLog.capture_log(fn -> assert :ok = Schema.ensure_all(db) end) =~ "missing-source"
-    assert {:ok, [["missing-source","[]"]]} = DB.query(db, "SELECT * FROM notice_batch_source_attachments_unresolved")
-    assert {:ok, [["[]"]]} = DB.query(db, "SELECT sourceAttachments FROM wakes WHERE wakeId=?1", [source.wake_id])
+
+    assert ExUnit.CaptureLog.capture_log(fn -> assert :ok = Schema.ensure_all(db) end) =~
+             "missing-source"
+
+    assert {:ok, [["missing-source", "[]"]]} =
+             DB.query(db, "SELECT * FROM notice_batch_source_attachments_unresolved")
+
+    assert {:ok, [["[]"]]} =
+             DB.query(db, "SELECT sourceAttachments FROM wakes WHERE wakeId=?1", [source.wake_id])
+
     assert :ok = Schema.ensure_all(db)
   end
 

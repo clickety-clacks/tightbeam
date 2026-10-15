@@ -3937,15 +3937,30 @@ defmodule Tightbeam.SupervisionTest do
                ctx.db,
                "SELECT COUNT(*) FROM supervision_liveness_migrations WHERE migrationId='0.1.9/legacy-parent-retirements-v1'"
              )
+
     start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
-    log = ExUnit.CaptureLog.capture_log(fn ->
-      result = ctx.handlers["retire"].(%{origin: "user:flynn", principal: {:user, "flynn"}, session_key: "supervisor", params: %{}})
-      assert result.retired_session_keys == ["supervisor"]
-    end)
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        result =
+          ctx.handlers["retire"].(%{
+            origin: "user:flynn",
+            principal: {:user, "flynn"},
+            session_key: "supervisor",
+            params: %{}
+          })
+
+        assert result.retired_session_keys == ["supervisor"]
+      end)
+
     assert log =~ "asg_1"
     assert Org.get(ctx.db, "holder").state == "active"
-    assert {:ok, ^before_sidecar} = DB.query(ctx.db, "SELECT * FROM supervision_liveness_sidecar WHERE assignmentId='asg_1' ORDER BY wakeId")
 
+    assert {:ok, ^before_sidecar} =
+             DB.query(
+               ctx.db,
+               "SELECT * FROM supervision_liveness_sidecar WHERE assignmentId='asg_1' ORDER BY wakeId"
+             )
   end
 
   test "a staged retirement elevation keeps immutable source evidence and validates through its carrier",

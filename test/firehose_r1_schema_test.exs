@@ -154,24 +154,45 @@ defmodule Tightbeam.FirehoseR1SchemaTest do
   test "invalid artifact seeds remain unresolved while healthy floors upgrade", %{db: db} do
     load_r1(db)
     :ok = DB.execute(db, "UPDATE artifacts SET createdAt=0 WHERE artifactId='artifact'")
-    :ok = DB.execute(db, """
-    INSERT INTO artifacts(artifactId,kind,title,createdBySession,workItemId,originPath,createdAt,updatedAt)
-      VALUES ('valid-artifact','other','valid','fixture-session','work','valid',5,5)
-    """)
-    assert ExUnit.CaptureLog.capture_log(fn -> assert :ok = Schema.upgrade_firehose_r1(db) end) =~ "artifact"
-    assert rows(db, "SELECT artifactId,rowVersion FROM artifact_version_floors") == [["valid-artifact",6]]
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO artifacts(artifactId,kind,title,createdBySession,workItemId,originPath,createdAt,updatedAt)
+        VALUES ('valid-artifact','other','valid','fixture-session','work','valid',5,5)
+      """)
+
+    assert ExUnit.CaptureLog.capture_log(fn -> assert :ok = Schema.upgrade_firehose_r1(db) end) =~
+             "artifact"
+
+    assert rows(db, "SELECT artifactId,rowVersion FROM artifact_version_floors") == [
+             ["valid-artifact", 6]
+           ]
+
     assert rows(db, "SELECT createdAt FROM artifacts WHERE artifactId='artifact'") == [[0]]
     assert :ok = Schema.upgrade_firehose_r1(db)
-    assert rows(db, "SELECT artifactId,rowVersion FROM artifact_version_floors") == [["valid-artifact",6]]
+
+    assert rows(db, "SELECT artifactId,rowVersion FROM artifact_version_floors") == [
+             ["valid-artifact", 6]
+           ]
   end
 
   test "unrelated artifact orphan does not veto decision and assignment upgrades", %{db: db} do
     load_r1(db)
     :ok = DB.execute(db, "PRAGMA foreign_keys=OFF")
-    :ok = DB.execute(db, "UPDATE artifacts SET createdBySession='missing-creator' WHERE artifactId='artifact'")
+
+    :ok =
+      DB.execute(
+        db,
+        "UPDATE artifacts SET createdBySession='missing-creator' WHERE artifactId='artifact'"
+      )
+
     :ok = DB.execute(db, "PRAGMA foreign_keys=ON")
     assert :ok = Schema.upgrade_firehose_r1(db)
-    assert rows(db, "SELECT createdBySession FROM artifacts WHERE artifactId='artifact'") == [["missing-creator"]]
+
+    assert rows(db, "SELECT createdBySession FROM artifacts WHERE artifactId='artifact'") == [
+             ["missing-creator"]
+           ]
+
     assert rows(db, "SELECT shape FROM schema_stamp") == [["firehose-r1-v1-019"]]
     assert :ok = Schema.upgrade_firehose_r1(db)
   end

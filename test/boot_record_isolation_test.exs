@@ -170,27 +170,62 @@ defmodule Tightbeam.BootRecordIsolationTest do
 
   test "one malformed request leaves other retired-session withdrawals committed", %{db: db} do
     for {id, context} <- [{"bad-request", "{"}, {"good-request", "{}"}] do
-      {:ok, _} = DB.query(db, """
-      INSERT INTO decision_requests(id,kind,raiserId,raiserSessionKey,ownerUserId,raisedAt,deadlineAt,statuteName,actionKey,question,options,context,status)
-      VALUES (?1,'statute','session:healthy','healthy','owner',1,2,'law',?1,'Proceed?','[]',?2,'open')
-      """, [id, context])
+      {:ok, _} =
+        DB.query(
+          db,
+          """
+          INSERT INTO decision_requests(id,kind,raiserId,raiserSessionKey,ownerUserId,raisedAt,deadlineAt,statuteName,actionKey,question,options,context,status)
+          VALUES (?1,'statute','session:healthy','healthy','owner',1,2,'law',?1,'Proceed?','[]',?2,'open')
+          """,
+          [id, context]
+        )
     end
+
     :ok = DB.execute(db, "UPDATE sessions SET state='retired' WHERE sessionKey='healthy'")
     assert capture_log(fn -> assert :ok = Escalation.recover_retired(db) end) =~ "bad-request"
+
     assert {:ok, [["bad-request", "open"], ["good-request", "withdrawn"]]} =
-      DB.query(db, "SELECT id,status FROM decision_requests ORDER BY id")
+             DB.query(db, "SELECT id,status FROM decision_requests ORDER BY id")
   end
 
   test "unsupported credential incidents do not block healthy recipient reconciliation", %{db: db} do
     for {id, provider} <- [{"bad-incident", "obsolete"}, {"good-incident", "anthropic"}] do
-      {:ok, _} = DB.query(db, """
-      INSERT INTO terminal_credential_incidents(id,class,state,host,harness,provider,openedAt,openingWatermark,openingObservationId,assertionFactId,statementId,recoveryState)
-      VALUES (?1,'terminal_credential_failure','open',?1,'claude',?2,1,0,?1,1,?1,'idle')
-      """, [id, provider])
+      {:ok, _} =
+        DB.query(
+          db,
+          """
+          INSERT INTO terminal_credential_incidents(id,class,state,host,harness,provider,openedAt,openingWatermark,openingObservationId,assertionFactId,statementId,recoveryState)
+          VALUES (?1,'terminal_credential_failure','open',?1,'claude',?2,1,0,?1,1,?1,'idle')
+          """,
+          [id, provider]
+        )
     end
-    assert capture_log(fn -> assert :ok = Tightbeam.TerminalCredentialFailure.reconcile_all(db) end) =~ "bad-incident"
-    assert {:ok, [["good-incident"]]} = DB.query(db, "SELECT incidentId FROM terminal_credential_deliveries")
-    assert {:ok, [["obsolete"]]} = DB.query(db, "SELECT provider FROM terminal_credential_incidents WHERE id='bad-incident'")
+
+    assert capture_log(fn ->
+             assert :ok = Tightbeam.TerminalCredentialFailure.reconcile_all(db)
+           end) =~ "bad-incident"
+
+    assert {:ok, [["good-incident"]]} =
+             DB.query(db, "SELECT incidentId FROM terminal_credential_deliveries")
+
+    assert {:ok, [["obsolete"]]} =
+             DB.query(
+               db,
+               "SELECT provider FROM terminal_credential_incidents WHERE id='bad-incident'"
+             )
+  end
+
+  test "fractional wake deadlines leave the scheduler and healthy timer available", %{db: db} do
+    due = System.system_time(:millisecond) + 60_000
+    bad = Wakes.schedule(db, %{session_key: "healthy", origin: "user:owner", prompt: "bad deadline", due_at: due})
+    good = Wakes.schedule(db, %{session_key: "healthy", origin: "user:owner", prompt: "healthy deadline", due_at: due + 1_000})
+    {:ok, _} = DB.query(db, "UPDATE wakes SET dueAt=?2 WHERE wakeId=?1", [bad.wake_id, due + 0.5])
+    assert capture_log(fn ->
+      pid = start_supervised!({Wakes, db: db, name: :fractional_deadline_scheduler, deliver: fn _ -> :ok end})
+      assert Process.alive?(pid)
+      state = :sys.get_state(pid)
+      assert state.deadline == good.due_at
+    end) =~ bad.wake_id
   end
 
   test "invalid archetypes and fragment dependencies leave a healthy identity loaded", %{

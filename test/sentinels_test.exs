@@ -446,19 +446,25 @@ defmodule Tightbeam.SentinelsTest do
 
     test "an unwritable sentinel directory leaves a healthy child running", ctx do
       learn_both!(ctx)
+
       for bundle <- @bundles do
         set_settings!(ctx, "#{bundle}/watch", %{"WATCH_TARGET" => "test", "WATCH_EXTRA" => "test"})
+
         enable!(ctx, "#{bundle}/watch")
       end
+
       File.mkdir_p!(Path.join(ctx.base, "sentinels"))
       File.write!(Path.join(ctx.base, "sentinels/alpha-bundle"), "occupied")
-      log = ExUnit.CaptureLog.capture_log(fn ->
-        pid = start_supervisor!(ctx)
-        state = :sys.get_state(pid)
-        assert Map.has_key?(state.children, "beta-bundle/watch")
-        refute Map.has_key?(state.children, "alpha-bundle/watch")
-        assert Process.alive?(pid)
-      end)
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          pid = start_supervisor!(ctx)
+          state = :sys.get_state(pid)
+          assert Map.has_key?(state.children, "beta-bundle/watch")
+          refute Map.has_key?(state.children, "alpha-bundle/watch")
+          assert Process.alive?(pid)
+        end)
+
       assert log =~ "alpha-bundle/watch"
       assert Sentinels.states(ctx.db, ctx.host)["alpha-bundle/watch"].state == "stopped"
     end

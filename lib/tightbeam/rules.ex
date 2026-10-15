@@ -420,6 +420,13 @@ defmodule Tightbeam.Rules do
     named = rules ++ policies
 
     duplicates = named |> Enum.frequencies_by(& &1.name)
+    Enum.each(named, fn entry ->
+      if duplicates[entry.name] > 1 do
+        require Logger
+        Logger.warning("rule or policy #{entry.name} unavailable: duplicate name in #{entry.source}")
+      end
+    end)
+
 
     rules =
       Enum.reject(rules, fn rule ->

@@ -397,7 +397,7 @@ defmodule Tightbeam.Toplines.Schema do
 
   def activate(db, stamped_at, opts)
       when is_integer(stamped_at) and stamped_at >= 0 and is_list(opts) do
-    case DB.transaction(db, fn txn -> activate_in_txn(txn, stamped_at, opts) end) do
+    case DB.migration_transaction(db, :toplines_titles, ["PRAGMA foreign_keys=OFF"], ["PRAGMA foreign_keys=ON"], fn txn -> activate_in_txn(txn, stamped_at, opts) end) do
       {:ok, :ok} -> :ok
       {:ok, {:error, _} = refusal} -> refusal
       {:error, error} -> raise error
