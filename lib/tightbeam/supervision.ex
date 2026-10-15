@@ -1901,7 +1901,13 @@ defmodule Tightbeam.Supervision do
 
   def handle_info({:timeout, ref, :supervision_due}, %{deadline_timer: ref} = state) do
     DB.background_pass(fn ->
-      liveness_cycle(state, MapSet.new())
+      due_holders = query(state.db, """
+      SELECT DISTINCT a.holderKey FROM supervision_entitlements e
+      JOIN assignments a ON a.id=e.assignmentId
+      WHERE e.state='armed' AND e.dueAt<=?1 AND a.state='open'
+      """, [now()]) |> Enum.map(&hd/1)
+      terminal_rebases = sweep_new_terminals(state, due_holders)
+      liveness_cycle(state, terminal_rebases)
       idle_cleanup_sweep(state)
     end)
 
@@ -5524,10 +5530,9 @@ defmodule Tightbeam.Supervision do
     Enum.map(rows, &hd/1)
   end
 
-  defp sweep_new_terminals(state) do
+  defp sweep_new_terminals(state, holders \\ nil) do
     open_holders =
-      state.db
-      |> open_assignment_holder_keys()
+      (holders || open_assignment_holder_keys(state.db))
       |> Enum.reject(&ConditionFacts.standing?(state.db, "work-blocked", &1))
 
     {:ok, pending_rows} =
@@ -5536,7 +5541,10 @@ defmodule Tightbeam.Supervision do
         "SELECT sessionKey FROM supervision_watermarks WHERE pendingBranch IS NOT NULL"
       )
 
-    pending_sessions = Enum.map(pending_rows, fn [session_key] -> session_key end)
+    pending_sessions =
+      pending_rows
+      |> Enum.map(fn [session_key] -> session_key end)
+      |> Enum.filter(&(is_nil(holders) or &1 in holders))
 
     open_holders
     |> Kernel.++(pending_sessions)
