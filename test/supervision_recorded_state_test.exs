@@ -5,13 +5,14 @@ defmodule Tightbeam.SupervisionRecordedStateTest do
   setup do
     name = :"recorded_state_#{System.unique_integer([:positive])}"
 
-    path =
-      Path.join(System.tmp_dir!(), "recorded-db-#{System.unique_integer([:positive])}/state.db")
-
+    tmp = Path.join(System.tmp_dir!(), "recorded-db-#{System.unique_integer([:positive])}")
+    prepared = Tightbeam.GuardRuntimeFixture.prepare!(tmp, "schema_shape_runtime.exs")
+    path = Path.join(prepared.base, "state.db")
     File.mkdir_p!(Path.dirname(path))
-    on_exit(fn -> File.rm_rf!(Path.dirname(path)) end)
-    db = start_supervised!({DB, name: name, path: path, guard_inputs: []})
-    %{db: db, path: path, name: name}
+    on_exit(fn -> File.rm_rf!(tmp) end)
+    db_opts = [name: name, path: path, guard_inputs: [], payload_root: prepared.payload]
+    db = start_supervised!({DB, db_opts})
+    %{db: db, db_opts: db_opts, payload: prepared.payload}
   end
 
   test "0.1.9 upgrade records its migration once and preserves its checkpoint", %{db: db} do
@@ -28,7 +29,7 @@ defmodule Tightbeam.SupervisionRecordedStateTest do
              DB.query(db, "SELECT wakeCursor,observationCursor FROM supervision_state_migration")
   end
 
-  test "0.1.8 operator-decision predecessor upgrades through the existing migrations" do
+  test "0.1.8 operator-decision predecessor upgrades through the existing migrations", %{payload: payload} do
     path =
       Path.join(
         System.tmp_dir!(),
@@ -36,9 +37,9 @@ defmodule Tightbeam.SupervisionRecordedStateTest do
       )
 
     on_exit(fn -> File.rm_rf!(Path.dirname(path)) end)
-    Tightbeam.SchemaShapeRuntimeFixture.seed_operator_predecessor!(path)
+    Tightbeam.SchemaShapeRuntimeFixture.seed_operator_predecessor!(path, payload)
     name = :"recorded_predecessor_#{System.unique_integer([:positive])}"
-    db = start_supervised!({DB, name: name, path: path, guard_inputs: []})
+    db = start_supervised!({DB, name: name, path: path, guard_inputs: [], payload_root: payload})
 
     assert {:ok, [["operator-decision-requests-v1"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
@@ -72,7 +73,7 @@ defmodule Tightbeam.SupervisionRecordedStateTest do
              DB.query(db, "SELECT COUNT(*),MAX(turnSeq) FROM patrol_terminal_classifications")
 
     :ok = stop_supervised(DB)
-    db = start_supervised!({DB, name: name, path: path, guard_inputs: []})
+    db = start_supervised!({DB, db_opts})
     assert :ok = Schema.ensure_all(db)
     assert :ok = Supervision.sweep_unclassified_terminals(db)
 
