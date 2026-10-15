@@ -130,8 +130,12 @@ defmodule Tightbeam.SentinelSupervisor do
       waiting = Map.has_key?(acc.failures, qualified) and qualified not in due
 
       cond do
-        Map.has_key?(acc.children, qualified) -> acc
-        waiting and qualified not in restart -> acc
+        Map.has_key?(acc.children, qualified) ->
+          acc
+
+        waiting and qualified not in restart ->
+          acc
+
         true ->
           try do
             start_child(acc, qualified, learned)

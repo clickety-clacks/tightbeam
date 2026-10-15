@@ -506,27 +506,34 @@ defmodule Tightbeam.Toplines.Schema do
   end
 
   defp migrate_v5!(txn, stamped_at, opts) do
-    previous_fk_violations = Enum.flat_map(@objects, fn
-      %{type: "table", name: name} -> Txn.q(txn, "PRAGMA foreign_key_check(#{name})")
-      _ -> []
-    end)
+    previous_fk_violations =
+      Enum.flat_map(@objects, fn
+        %{type: "table", name: name} -> Txn.q(txn, "PRAGMA foreign_key_check(#{name})")
+        _ -> []
+      end)
+
     Enum.each(previous_fk_violations, fn row ->
       require Logger
       Logger.warning("Toplines migration retains unresolved foreign key #{inspect(row)}")
     end)
-    invalid_titles = Map.new(@title_tables, fn name ->
-      rows = Txn.q(txn, """
-      SELECT rowid, id FROM #{name}
-      WHERE typeof(title) != 'text' OR tightbeam_canonical_title(title) IS NULL
-         OR title != tightbeam_canonical_title(title)
-         OR tightbeam_unicode_scalar_length(title) NOT BETWEEN 1 AND 2000
-      """)
-      Enum.each(rows, fn [_rowid, id] ->
-        require Logger
-        Logger.warning("Toplines #{name} row #{id} unresolved: invalid title preserved")
+
+    invalid_titles =
+      Map.new(@title_tables, fn name ->
+        rows =
+          Txn.q(txn, """
+          SELECT rowid, id FROM #{name}
+          WHERE typeof(title) != 'text' OR tightbeam_canonical_title(title) IS NULL
+             OR title != tightbeam_canonical_title(title)
+             OR tightbeam_unicode_scalar_length(title) NOT BETWEEN 1 AND 2000
+          """)
+
+        Enum.each(rows, fn [_rowid, id] ->
+          require Logger
+          Logger.warning("Toplines #{name} row #{id} unresolved: invalid title preserved")
+        end)
+
+        {name, Enum.map(rows, &hd/1)}
       end)
-      {name, Enum.map(rows, &hd/1)}
-    end)
 
     :ok = Txn.exec(txn, "PRAGMA defer_foreign_keys=ON")
 
@@ -544,24 +551,37 @@ defmodule Tightbeam.Toplines.Schema do
       :ok = Txn.exec(txn, Enum.find(@objects, &(&1.name == index)).sql)
       rejected = invalid_titles[name]
       rejected_sql = if rejected == [], do: "0", else: "rowid IN (#{Enum.join(rejected, ",")})"
-      :ok = Txn.exec(txn, "INSERT INTO #{name} (#{columns}) SELECT #{columns} FROM #{copy} WHERE NOT (#{rejected_sql})")
+
+      :ok =
+        Txn.exec(
+          txn,
+          "INSERT INTO #{name} (#{columns}) SELECT #{columns} FROM #{copy} WHERE NOT (#{rejected_sql})"
+        )
+
       if rejected != [] do
         # Preserve invalid historical title bytes without authorizing a new invalid title.
         :ok = Txn.exec(txn, "PRAGMA ignore_check_constraints=ON")
+
         try do
-          :ok = Txn.exec(txn, "INSERT INTO #{name} (#{columns}) SELECT #{columns} FROM #{copy} WHERE #{rejected_sql}")
+          :ok =
+            Txn.exec(
+              txn,
+              "INSERT INTO #{name} (#{columns}) SELECT #{columns} FROM #{copy} WHERE #{rejected_sql}"
+            )
         after
           :ok = Txn.exec(txn, "PRAGMA ignore_check_constraints=OFF")
         end
       end
+
       :ok = Txn.exec(txn, "DROP TABLE #{copy}")
       maybe_interrupt!(opts, {:copied, name})
     end)
 
     # Only a new violation belongs to this migration.
     for object <- @objects, object.type == "table" do
-      unless (Txn.q(txn, "PRAGMA foreign_key_check(#{object.name})") -- previous_fk_violations) == [],
-        do: raise("Toplines migration found invalid foreign keys in #{object.name}")
+      unless Txn.q(txn, "PRAGMA foreign_key_check(#{object.name})") -- previous_fk_violations ==
+               [],
+             do: raise("Toplines migration found invalid foreign keys in #{object.name}")
     end
 
     verify_manifest!(txn)

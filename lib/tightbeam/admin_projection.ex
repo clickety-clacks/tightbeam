@@ -592,21 +592,21 @@ defmodule Tightbeam.AdminProjection do
       |> Tightbeam.StateResources.kungfu_names()
       |> Enum.flat_map(fn name ->
         try do
-        case Tightbeam.StateResources.kungfu_snapshot(base_dir, name) do
-          nil ->
-            []
+          case Tightbeam.StateResources.kungfu_snapshot(base_dir, name) do
+            nil ->
+              []
 
-          snapshot ->
-            [
-              %{
-                resource: "kungfu",
-                key: name,
-                class: "kungfu.updated",
-                refs: %{"name" => name},
-                item: canonical_without_version(snapshot, "kungfu")
-              }
-            ]
-        end
+            snapshot ->
+              [
+                %{
+                  resource: "kungfu",
+                  key: name,
+                  class: "kungfu.updated",
+                  refs: %{"name" => name},
+                  item: canonical_without_version(snapshot, "kungfu")
+                }
+              ]
+          end
         rescue
           error ->
             require Logger

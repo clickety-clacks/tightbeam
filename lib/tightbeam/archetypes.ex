@@ -67,18 +67,18 @@ defmodule Tightbeam.Archetypes do
       |> Enum.sort()
       |> Enum.reduce(%{"default" => builtin_default()}, fn path, loaded ->
         try do
-        bytes = File.read!(path)
-        manifest = Toml.decode!(bytes)
+          bytes = File.read!(path)
+          manifest = Toml.decode!(bytes)
 
-        archetype =
-          manifest
-          |> validate!(path)
-          |> Map.put(:source, %{
-            file: Path.relative_to(path, base_dir),
-            sha256: bytes |> then(&:crypto.hash(:sha256, &1)) |> Base.encode16(case: :lower)
-          })
+          archetype =
+            manifest
+            |> validate!(path)
+            |> Map.put(:source, %{
+              file: Path.relative_to(path, base_dir),
+              sha256: bytes |> then(&:crypto.hash(:sha256, &1)) |> Base.encode16(case: :lower)
+            })
 
-        Map.put(loaded, archetype.name, archetype)
+          Map.put(loaded, archetype.name, archetype)
         rescue
           error ->
             Logger.warning("archetype #{path} unavailable: #{Exception.message(error)}")
@@ -88,18 +88,22 @@ defmodule Tightbeam.Archetypes do
 
     fragments = load_fragments!(base_dir)
 
-    archetypes = Enum.reduce(archetypes, %{}, fn {name, archetype}, loaded ->
-      try do
-        guidance_with(archetype, fragments)
-        unknown = Enum.reject(archetype.skills, &MapSet.member?(library, &1))
-        if unknown != [], do: raise(ArgumentError, "unknown skills: #{Enum.join(unknown, ", ")}")
-        Map.put(loaded, name, archetype)
-      rescue
-        error ->
-          Logger.warning("archetype #{name} unavailable: #{Exception.message(error)}")
-          loaded
-      end
-    end)
+    archetypes =
+      Enum.reduce(archetypes, %{}, fn {name, archetype}, loaded ->
+        try do
+          guidance_with(archetype, fragments)
+          unknown = Enum.reject(archetype.skills, &MapSet.member?(library, &1))
+
+          if unknown != [],
+            do: raise(ArgumentError, "unknown skills: #{Enum.join(unknown, ", ")}")
+
+          Map.put(loaded, name, archetype)
+        rescue
+          error ->
+            Logger.warning("archetype #{name} unavailable: #{Exception.message(error)}")
+            loaded
+        end
+      end)
 
     :persistent_term.put(@persist_key, {archetypes, fragments})
     archetypes
@@ -482,17 +486,21 @@ defmodule Tightbeam.Archetypes do
   defp load_fragments!(base_dir) do
     paths = Path.wildcard(Path.join(base_dir, "identity/guidance/**/*.md")) |> Enum.sort()
     duplicates = paths |> Enum.frequencies_by(&Path.basename/1)
-    fragments = Enum.reduce(paths, %{}, fn path, acc ->
-      name = Path.basename(path)
-      try do
-        if duplicates[name] > 1, do: raise(ArgumentError, "duplicate fragment #{name}")
-        Map.put(acc, name, File.read!(path))
-      rescue
-        error ->
-          Logger.warning("guidance fragment #{path} unavailable: #{Exception.message(error)}")
-          acc
-      end
-    end)
+
+    fragments =
+      Enum.reduce(paths, %{}, fn path, acc ->
+        name = Path.basename(path)
+
+        try do
+          if duplicates[name] > 1, do: raise(ArgumentError, "duplicate fragment #{name}")
+          Map.put(acc, name, File.read!(path))
+        rescue
+          error ->
+            Logger.warning("guidance fragment #{path} unavailable: #{Exception.message(error)}")
+            acc
+        end
+      end)
+
     Map.put_new(fragments, "operating-manual.md", builtin_fragments()["operating-manual.md"])
   end
 

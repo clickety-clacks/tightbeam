@@ -1008,6 +1008,7 @@ defmodule Tightbeam.Ledger do
 
   defp recover_running_where(db, predicate, predicate_params) do
     {:ok, rows} = DB.query(db, recover_running_rows_sql(predicate), predicate_params)
+
     Enum.flat_map(rows, fn [seq, _session] ->
       try do
         recover_running_turn(db, "seq = ?1", [seq])

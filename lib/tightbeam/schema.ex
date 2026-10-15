@@ -1983,11 +1983,18 @@ defmodule Tightbeam.Schema do
                  validate_notice_source_payload_in_txn!(txn)
 
                [[@assignment_source_replacement_shape]] ->
-    previous_fk_violations = Enum.flat_map(~w(wakes notice_batch_members), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end)
-    Enum.each(previous_fk_violations, fn violation ->
-      require Logger
-      Logger.warning("migration upgrade_notice_source_payload retains unresolved foreign key #{inspect(violation)}")
-    end)
+                 previous_fk_violations =
+                   Enum.flat_map(~w(wakes notice_batch_members), fn table ->
+                     Txn.q(txn, "PRAGMA foreign_key_check(#{table})")
+                   end)
+
+                 Enum.each(previous_fk_violations, fn violation ->
+                   require Logger
+
+                   Logger.warning(
+                     "migration upgrade_notice_source_payload retains unresolved foreign key #{inspect(violation)}"
+                   )
+                 end)
 
                  unless Txn.q(
                           txn,
@@ -2073,19 +2080,34 @@ defmodule Tightbeam.Schema do
                      )
 
                    for [target, device, client, wake, hash, created] <- rows do
-                     identity = %{"targetSessionKey" => target, "deviceId" => device,
-                       "clientMessageId" => client, "sourceWakeId" => wake,
-                       "payloadSha256" => hash, "createdAt" => created}
+                     identity = %{
+                       "targetSessionKey" => target,
+                       "deviceId" => device,
+                       "clientMessageId" => client,
+                       "sourceWakeId" => wake,
+                       "payloadSha256" => hash,
+                       "createdAt" => created
+                     }
+
                      Txn.exec(txn, "SAVEPOINT source_client")
+
                      try do
-                       :ok = Tightbeam.NoticeBatcher.persist_source_client_in_txn(txn, wake, identity)
+                       :ok =
+                         Tightbeam.NoticeBatcher.persist_source_client_in_txn(txn, wake, identity)
+
                        Txn.exec(txn, "RELEASE source_client")
-                       Txn.q(txn, "DELETE FROM staged_message_dedupes WHERE sourceWakeId=?1", [wake])
+
+                       Txn.q(txn, "DELETE FROM staged_message_dedupes WHERE sourceWakeId=?1", [
+                         wake
+                       ])
                      rescue
                        error ->
                          Txn.exec(txn, "ROLLBACK TO source_client")
                          Txn.exec(txn, "RELEASE source_client")
-                         Logger.warning("notice source #{wake} client migration unresolved: #{Exception.message(error)}")
+
+                         Logger.warning(
+                           "notice source #{wake} client migration unresolved: #{Exception.message(error)}"
+                         )
                      end
                    end
                  end
@@ -2099,22 +2121,37 @@ defmodule Tightbeam.Schema do
 
                    for [wake, encoded] <- rows do
                      Txn.exec(txn, "SAVEPOINT source_attachment")
+
                      try do
-                       Txn.q(txn, "UPDATE wakes SET sourceAttachments=?2 WHERE wakeId=?1 AND sourceAttachments IS NULL", [wake, encoded])
+                       Txn.q(
+                         txn,
+                         "UPDATE wakes SET sourceAttachments=?2 WHERE wakeId=?1 AND sourceAttachments IS NULL",
+                         [wake, encoded]
+                       )
+
                        if Txn.changes(txn) != 1, do: raise("attachment source missing")
                        Txn.exec(txn, "RELEASE source_attachment")
-                       Txn.q(txn, "DELETE FROM notice_batch_source_attachments WHERE sourceWakeId=?1", [wake])
+
+                       Txn.q(
+                         txn,
+                         "DELETE FROM notice_batch_source_attachments WHERE sourceWakeId=?1",
+                         [wake]
+                       )
                      rescue
                        error ->
                          Txn.exec(txn, "ROLLBACK TO source_attachment")
                          Txn.exec(txn, "RELEASE source_attachment")
-                         Logger.warning("notice source #{wake} attachment migration unresolved: #{Exception.message(error)}")
+
+                         Logger.warning(
+                           "notice source #{wake} attachment migration unresolved: #{Exception.message(error)}"
+                         )
                      end
                    end
                  end
 
                  for name <- present do
                    [[remaining]] = Txn.q(txn, "SELECT COUNT(*) FROM #{name}")
+
                    if remaining > 0 and name != "notice_batching_lane_policies" do
                      Txn.exec(txn, "ALTER TABLE #{name} RENAME TO #{name}_unresolved")
                    else
@@ -2122,11 +2159,13 @@ defmodule Tightbeam.Schema do
                    end
                  end
 
-                 unless (Enum.flat_map(~w(wakes notice_batch_members), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end) -- previous_fk_violations) == [],
-                   do:
-                     raise(ShapeError,
-                       message: "incompatible_notice_source_payload: invalid foreign keys"
-                     )
+                 unless Enum.flat_map(~w(wakes notice_batch_members), fn table ->
+                          Txn.q(txn, "PRAGMA foreign_key_check(#{table})")
+                        end) -- previous_fk_violations == [],
+                        do:
+                          raise(ShapeError,
+                            message: "incompatible_notice_source_payload: invalid foreign keys"
+                          )
 
                  Txn.q(txn, "UPDATE schema_stamp SET shape=?1,stampedAt=?2 WHERE shape=?3", [
                    @notice_source_payload_shape,
@@ -2217,10 +2256,16 @@ defmodule Tightbeam.Schema do
   end
 
   defp validate_notice_source_recognition_in_txn!(txn) do
-    Txn.q(txn, "SELECT wakeId FROM wakes WHERE state='pending' AND consumer='prompt' AND conditionKind IS NOT NULL AND firedBy='condition' AND recognitionEvidence IS NULL")
+    Txn.q(
+      txn,
+      "SELECT wakeId FROM wakes WHERE state='pending' AND consumer='prompt' AND conditionKind IS NOT NULL AND firedBy='condition' AND recognitionEvidence IS NULL"
+    )
     |> Enum.each(fn [id] ->
-      Logger.warning("wake #{id} unavailable: unsupported_pending_condition_recognition; missing recognition evidence")
+      Logger.warning(
+        "wake #{id} unavailable: unsupported_pending_condition_recognition; missing recognition evidence"
+      )
     end)
+
     :ok
   end
 
@@ -2237,17 +2282,33 @@ defmodule Tightbeam.Schema do
 
       for [ref, wake, address, _session, _role, scope | _] = row <- rows do
         Txn.exec(txn, "SAVEPOINT source_policy")
+
         try do
-          Txn.q(txn, "UPDATE wakes SET sourceVisibilityScope=?2,sourceAddress=?3 WHERE wakeId=?1 AND sourceVisibilityScope IS NULL", [wake, scope, address])
+          Txn.q(
+            txn,
+            "UPDATE wakes SET sourceVisibilityScope=?2,sourceAddress=?3 WHERE wakeId=?1 AND sourceVisibilityScope IS NULL",
+            [wake, scope, address]
+          )
+
           if Txn.changes(txn) != 1, do: raise("policy source missing")
-          Tightbeam.EventLog.lifecycle_in_txn(txn, "notice_source_policy_retired", ref, JSON.encode!(Map.new(Enum.zip(keys, row))))
+
+          Tightbeam.EventLog.lifecycle_in_txn(
+            txn,
+            "notice_source_policy_retired",
+            ref,
+            JSON.encode!(Map.new(Enum.zip(keys, row)))
+          )
+
           Txn.exec(txn, "RELEASE source_policy")
           Txn.q(txn, "DELETE FROM notice_delivery_policies WHERE policyRef=?1", [ref])
         rescue
           error ->
             Txn.exec(txn, "ROLLBACK TO source_policy")
             Txn.exec(txn, "RELEASE source_policy")
-            Logger.warning("notice policy #{ref} source #{wake} migration unresolved: #{Exception.message(error)}")
+
+            Logger.warning(
+              "notice policy #{ref} source #{wake} migration unresolved: #{Exception.message(error)}"
+            )
         end
       end
     end
@@ -2421,11 +2482,18 @@ defmodule Tightbeam.Schema do
                  :ok
 
                actual == normalize_schema_sql(@wake_retry_previous_ddl) ->
-    previous_fk_violations = Enum.flat_map(~w(wake_retry_attempts), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end)
-    Enum.each(previous_fk_violations, fn violation ->
-      require Logger
-      Logger.warning("migration migrate_wake_retry_source_scope retains unresolved foreign key #{inspect(violation)}")
-    end)
+                 previous_fk_violations =
+                   Enum.flat_map(~w(wake_retry_attempts), fn table ->
+                     Txn.q(txn, "PRAGMA foreign_key_check(#{table})")
+                   end)
+
+                 Enum.each(previous_fk_violations, fn violation ->
+                   require Logger
+
+                   Logger.warning(
+                     "migration migrate_wake_retry_source_scope retains unresolved foreign key #{inspect(violation)}"
+                   )
+                 end)
 
                  unless Txn.q(
                           txn,
@@ -2458,7 +2526,9 @@ defmodule Tightbeam.Schema do
                  # Preserve the qualified predecessor index's exact stored SQL.
                  :ok = Txn.exec(txn, root_index_sql)
 
-                 unless (Enum.flat_map(~w(wake_retry_attempts), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end) -- previous_fk_violations) == [] do
+                 unless Enum.flat_map(~w(wake_retry_attempts), fn table ->
+                          Txn.q(txn, "PRAGMA foreign_key_check(#{table})")
+                        end) -- previous_fk_violations == [] do
                    raise ShapeError,
                      message:
                        "incompatible_wake_retry_source_scope: invalid retry lineage references"
@@ -2909,8 +2979,14 @@ defmodule Tightbeam.Schema do
           @notice_source_payload_shape,
           @decision_request_row_schema_shape
         ] ->
-          Logger.warning("supervision_receipt_cancellation_epoch row 0 unavailable; cancellation feature requires repair")
-          Enum.reject(@assignment_source_replacement_liveness_objects, &(&1.name == "supervision_receipt_cancellation_epoch"))
+          Logger.warning(
+            "supervision_receipt_cancellation_epoch row 0 unavailable; cancellation feature requires repair"
+          )
+
+          Enum.reject(
+            @assignment_source_replacement_liveness_objects,
+            &(&1.name == "supervision_receipt_cancellation_epoch")
+          )
 
         shape in [
           @cannot_proceed_shape,
@@ -3031,7 +3107,10 @@ defmodule Tightbeam.Schema do
           true
 
         rows ->
-          Logger.warning("supervision_receipt_cancellation_epoch row 0 unavailable: #{inspect(rows)}")
+          Logger.warning(
+            "supervision_receipt_cancellation_epoch row 0 unavailable: #{inspect(rows)}"
+          )
+
           false
       end
     else
@@ -3079,10 +3158,17 @@ defmodule Tightbeam.Schema do
   @doc false
   @spec rebuild_r1_decision_carrier_in_txn(Txn.t()) :: :ok
   def rebuild_r1_decision_carrier_in_txn(%Txn{} = txn) do
-    previous_fk_violations = Enum.flat_map(~w(decision_requests), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end)
+    previous_fk_violations =
+      Enum.flat_map(~w(decision_requests), fn table ->
+        Txn.q(txn, "PRAGMA foreign_key_check(#{table})")
+      end)
+
     Enum.each(previous_fk_violations, fn violation ->
       require Logger
-      Logger.warning("migration rebuild_r1_decision_carrier_in_txn retains unresolved foreign key #{inspect(violation)}")
+
+      Logger.warning(
+        "migration rebuild_r1_decision_carrier_in_txn retains unresolved foreign key #{inspect(violation)}"
+      )
     end)
 
     # Inactive extraction: the caller owns the surrounding migration transaction.
@@ -3251,7 +3337,9 @@ defmodule Tightbeam.Schema do
         message: "incompatible_decision_carrier_return_v1_019: indexes #{inspect(actual_indexes)}"
     end
 
-    case (Enum.flat_map(~w(decision_requests), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end) -- previous_fk_violations) do
+    case Enum.flat_map(~w(decision_requests), fn table ->
+           Txn.q(txn, "PRAGMA foreign_key_check(#{table})")
+         end) -- previous_fk_violations do
       [] ->
         :ok
 
@@ -3435,7 +3523,10 @@ defmodule Tightbeam.Schema do
         :ok
 
       rows ->
-        Logger.warning("supervision_liveness_epoch row 0 unavailable: #{inspect(rows)}; supervision requires repair")
+        Logger.warning(
+          "supervision_liveness_epoch row 0 unavailable: #{inspect(rows)}; supervision requires repair"
+        )
+
         :ok
     end
   end
@@ -3753,7 +3844,10 @@ defmodule Tightbeam.Schema do
           :ok
 
         rows ->
-          Logger.warning("supervision_receipt_cancellation_epoch row 0 unavailable: #{inspect(rows)}")
+          Logger.warning(
+            "supervision_receipt_cancellation_epoch row 0 unavailable: #{inspect(rows)}"
+          )
+
           :ok
       end
     else
@@ -3762,10 +3856,17 @@ defmodule Tightbeam.Schema do
   end
 
   defp migrate_supervision_receipt_cancellation_v1_in_txn(txn, marker) do
-    previous_fk_violations = Enum.flat_map(~w(wake_cancellations), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end)
+    previous_fk_violations =
+      Enum.flat_map(~w(wake_cancellations), fn table ->
+        Txn.q(txn, "PRAGMA foreign_key_check(#{table})")
+      end)
+
     Enum.each(previous_fk_violations, fn violation ->
       require Logger
-      Logger.warning("migration migrate_supervision_receipt_cancellation_v1_in_txn retains unresolved foreign key #{inspect(violation)}")
+
+      Logger.warning(
+        "migration migrate_supervision_receipt_cancellation_v1_in_txn retains unresolved foreign key #{inspect(violation)}"
+      )
     end)
 
     old_table = Enum.find(@cannot_proceed_liveness_objects, &(&1.name == "wake_cancellations"))
@@ -3837,7 +3938,9 @@ defmodule Tightbeam.Schema do
 
     validate_owned_object!(txn, marker)
 
-    case (Enum.flat_map(~w(wake_cancellations), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end) -- previous_fk_violations) do
+    case Enum.flat_map(~w(wake_cancellations), fn table ->
+           Txn.q(txn, "PRAGMA foreign_key_check(#{table})")
+         end) -- previous_fk_violations do
       [] ->
         :ok
 
@@ -3875,10 +3978,17 @@ defmodule Tightbeam.Schema do
   end
 
   defp upgrade_assignment_source_replacement_v1_in_txn(%Txn{} = txn) do
-    previous_fk_violations = Enum.flat_map(~w(wake_cancellations), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end)
+    previous_fk_violations =
+      Enum.flat_map(~w(wake_cancellations), fn table ->
+        Txn.q(txn, "PRAGMA foreign_key_check(#{table})")
+      end)
+
     Enum.each(previous_fk_violations, fn violation ->
       require Logger
-      Logger.warning("migration upgrade_assignment_source_replacement_v1_in_txn retains unresolved foreign key #{inspect(violation)}")
+
+      Logger.warning(
+        "migration upgrade_assignment_source_replacement_v1_in_txn retains unresolved foreign key #{inspect(violation)}"
+      )
     end)
 
     marker =
@@ -3897,7 +4007,10 @@ defmodule Tightbeam.Schema do
           :ok
 
         rows ->
-          Logger.warning("supervision_receipt_cancellation_epoch row 0 unavailable: #{inspect(rows)}")
+          Logger.warning(
+            "supervision_receipt_cancellation_epoch row 0 unavailable: #{inspect(rows)}"
+          )
+
           :ok
       end
     end
@@ -3996,7 +4109,9 @@ defmodule Tightbeam.Schema do
         validate_owned_object!(txn, new_table)
         Enum.each(new_triggers, &validate_owned_object!(txn, &1))
 
-        case (Enum.flat_map(~w(wake_cancellations), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end) -- previous_fk_violations) do
+        case Enum.flat_map(~w(wake_cancellations), fn table ->
+               Txn.q(txn, "PRAGMA foreign_key_check(#{table})")
+             end) -- previous_fk_violations do
           [] ->
             :ok
 
@@ -4050,10 +4165,17 @@ defmodule Tightbeam.Schema do
   end
 
   defp upgrade_effort_request_exit_v1_in_txn(%Txn{} = txn) do
-    previous_fk_violations = Enum.flat_map(~w(effort_requests), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end)
+    previous_fk_violations =
+      Enum.flat_map(~w(effort_requests), fn table ->
+        Txn.q(txn, "PRAGMA foreign_key_check(#{table})")
+      end)
+
     Enum.each(previous_fk_violations, fn violation ->
       require Logger
-      Logger.warning("migration upgrade_effort_request_exit_v1_in_txn retains unresolved foreign key #{inspect(violation)}")
+
+      Logger.warning(
+        "migration upgrade_effort_request_exit_v1_in_txn retains unresolved foreign key #{inspect(violation)}"
+      )
     end)
 
     case Txn.q(txn, "SELECT shape FROM schema_stamp") do
@@ -4112,7 +4234,9 @@ defmodule Tightbeam.Schema do
     if Txn.changes(txn) != 1,
       do: raise(ShapeError, message: "incompatible_effort_request_exit_v1: stamp race")
 
-    case (Enum.flat_map(~w(effort_requests), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end) -- previous_fk_violations) do
+    case Enum.flat_map(~w(effort_requests), fn table ->
+           Txn.q(txn, "PRAGMA foreign_key_check(#{table})")
+         end) -- previous_fk_violations do
       [] ->
         :ok
 
@@ -4430,15 +4554,26 @@ defmodule Tightbeam.Schema do
                :ok
 
              [[@o2_shape]] ->
-    previous_fk_violations = Enum.flat_map(~w(assignments condition_facts), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end)
-    Enum.each(previous_fk_violations, fn violation ->
-      require Logger
-      Logger.warning("migration upgrade_r1 retains unresolved foreign key #{inspect(violation)}")
-    end)
+               previous_fk_violations =
+                 Enum.flat_map(~w(assignments condition_facts), fn table ->
+                   Txn.q(txn, "PRAGMA foreign_key_check(#{table})")
+                 end)
+
+               Enum.each(previous_fk_violations, fn violation ->
+                 require Logger
+
+                 Logger.warning(
+                   "migration upgrade_r1 retains unresolved foreign key #{inspect(violation)}"
+                 )
+               end)
 
                Txn.q(txn, "ALTER TABLE assignments ADD COLUMN reminderState TEXT NULL")
                Txn.q(txn, "ALTER TABLE condition_facts ADD COLUMN payload TEXT NULL")
-               [] = (Enum.flat_map(~w(assignments condition_facts), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end) -- previous_fk_violations)
+
+               [] =
+                 Enum.flat_map(~w(assignments condition_facts), fn table ->
+                   Txn.q(txn, "PRAGMA foreign_key_check(#{table})")
+                 end) -- previous_fk_violations
 
                Txn.q(txn, "UPDATE schema_stamp SET shape=?1,stampedAt=?2 WHERE shape=?3", [
                  @r1_shape,
@@ -4555,11 +4690,19 @@ defmodule Tightbeam.Schema do
 
         try do
           case DB.transaction(db, fn txn ->
-    previous_fk_violations = Enum.flat_map(~w(decision_requests artifact_version_floors assignment_revocation_generations), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end)
-    Enum.each(previous_fk_violations, fn violation ->
-      require Logger
-      Logger.warning("migration upgrade_firehose_r1 retains unresolved foreign key #{inspect(violation)}")
-    end)
+                 previous_fk_violations =
+                   Enum.flat_map(
+                     ~w(decision_requests artifact_version_floors assignment_revocation_generations),
+                     fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end
+                   )
+
+                 Enum.each(previous_fk_violations, fn violation ->
+                   require Logger
+
+                   Logger.warning(
+                     "migration upgrade_firehose_r1 retains unresolved foreign key #{inspect(violation)}"
+                   )
+                 end)
 
                  [[@r1_shape]] = Txn.q(txn, "SELECT shape FROM schema_stamp")
                  :ok = rebuild_r1_decision_carrier_in_txn(txn)
@@ -4570,7 +4713,13 @@ defmodule Tightbeam.Schema do
                  :ok = add_r1_decision_row_version_in_txn(txn)
                  :ok = Tightbeam.Artifacts.migrate_version_floors_in_txn(txn)
                  :ok = Tightbeam.Assignments.migrate_revocation_generations_in_txn(txn)
-                 [] = (Enum.flat_map(~w(decision_requests artifact_version_floors assignment_revocation_generations), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end) -- previous_fk_violations)
+
+                 [] =
+                   Enum.flat_map(
+                     ~w(decision_requests artifact_version_floors assignment_revocation_generations),
+                     fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end
+                   ) -- previous_fk_violations
+
                  maybe_interrupt_activation!(opts, :before_firehose_stamp)
 
                  Txn.q(txn, "UPDATE schema_stamp SET shape=?1,stampedAt=?2 WHERE shape=?3", [
@@ -4659,11 +4808,18 @@ defmodule Tightbeam.Schema do
                :ok
 
              [[@firehose_shape]] ->
-    previous_fk_violations = Enum.flat_map(~w(sessions session_reparent_events), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end)
-    Enum.each(previous_fk_violations, fn violation ->
-      require Logger
-      Logger.warning("migration upgrade_session_reparent retains unresolved foreign key #{inspect(violation)}")
-    end)
+               previous_fk_violations =
+                 Enum.flat_map(~w(sessions session_reparent_events), fn table ->
+                   Txn.q(txn, "PRAGMA foreign_key_check(#{table})")
+                 end)
+
+               Enum.each(previous_fk_violations, fn violation ->
+                 require Logger
+
+                 Logger.warning(
+                   "migration upgrade_session_reparent retains unresolved foreign key #{inspect(violation)}"
+                 )
+               end)
 
                :ok = Tightbeam.SessionReparent.migrate_in_txn(txn)
                :ok = Tightbeam.Idempotency.migrate_reparent_in_txn(txn)
@@ -4685,7 +4841,11 @@ defmodule Tightbeam.Schema do
                if Txn.changes(txn) != 1,
                  do: raise(ShapeError, message: "session reparent stamp race")
 
-               [] = (Enum.flat_map(~w(sessions session_reparent_events), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end) -- previous_fk_violations)
+               [] =
+                 Enum.flat_map(~w(sessions session_reparent_events), fn table ->
+                   Txn.q(txn, "PRAGMA foreign_key_check(#{table})")
+                 end) -- previous_fk_violations
+
                :ok
 
              rows ->
@@ -4735,11 +4895,18 @@ defmodule Tightbeam.Schema do
                validate_artifact_content_schema!(txn)
 
              [[@reparent_shape]] ->
-    previous_fk_violations = Enum.flat_map(~w(artifacts artifact_contents), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end)
-    Enum.each(previous_fk_violations, fn violation ->
-      require Logger
-      Logger.warning("migration upgrade_artifact_durability retains unresolved foreign key #{inspect(violation)}")
-    end)
+               previous_fk_violations =
+                 Enum.flat_map(~w(artifacts artifact_contents), fn table ->
+                   Txn.q(txn, "PRAGMA foreign_key_check(#{table})")
+                 end)
+
+               Enum.each(previous_fk_violations, fn violation ->
+                 require Logger
+
+                 Logger.warning(
+                   "migration upgrade_artifact_durability retains unresolved foreign key #{inspect(violation)}"
+                 )
+               end)
 
                existing =
                  Txn.q(
@@ -4771,8 +4938,16 @@ defmodule Tightbeam.Schema do
 
                # Scoped: the argument-less form walks the WHOLE database, a real stall
                # inside this transaction on a live 15G state.db for no added coverage.
-               [] = (Enum.flat_map(~w(artifacts artifact_contents), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end) -- previous_fk_violations)
-               [] = (Enum.flat_map(~w(artifacts artifact_contents), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end) -- previous_fk_violations)
+               [] =
+                 Enum.flat_map(~w(artifacts artifact_contents), fn table ->
+                   Txn.q(txn, "PRAGMA foreign_key_check(#{table})")
+                 end) -- previous_fk_violations
+
+               [] =
+                 Enum.flat_map(~w(artifacts artifact_contents), fn table ->
+                   Txn.q(txn, "PRAGMA foreign_key_check(#{table})")
+                 end) -- previous_fk_violations
+
                :ok
 
              rows ->
@@ -4854,11 +5029,18 @@ defmodule Tightbeam.Schema do
 
         try do
           case DB.transaction(db, fn txn ->
-    previous_fk_violations = Enum.flat_map(~w(assignments wakes decision_requests), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end)
-    Enum.each(previous_fk_violations, fn violation ->
-      require Logger
-      Logger.warning("migration upgrade_o2 retains unresolved foreign key #{inspect(violation)}")
-    end)
+                 previous_fk_violations =
+                   Enum.flat_map(~w(assignments wakes decision_requests), fn table ->
+                     Txn.q(txn, "PRAGMA foreign_key_check(#{table})")
+                   end)
+
+                 Enum.each(previous_fk_violations, fn violation ->
+                   require Logger
+
+                   Logger.warning(
+                     "migration upgrade_o2 retains unresolved foreign key #{inspect(violation)}"
+                   )
+                 end)
 
                  [[^predecessor]] = Txn.q(txn, "SELECT shape FROM schema_stamp")
                  # Bootstrap the exact legacy episode shape before any O2 module DDL.
@@ -4926,7 +5108,12 @@ defmodule Tightbeam.Schema do
                  ])
 
                  if Txn.changes(txn) != 1, do: raise(ShapeError, message: "O2 stamp race")
-                 [] = (Enum.flat_map(~w(assignments wakes decision_requests), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end) -- previous_fk_violations)
+
+                 [] =
+                   Enum.flat_map(~w(assignments wakes decision_requests), fn table ->
+                     Txn.q(txn, "PRAGMA foreign_key_check(#{table})")
+                   end) -- previous_fk_violations
+
                  :ok
                end) do
             {:ok, :ok} -> :ok
@@ -5026,11 +5213,18 @@ defmodule Tightbeam.Schema do
 
     try do
       case DB.transaction(db, fn txn ->
-    previous_fk_violations = Enum.flat_map(~w(supervision_liveness_receipts), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end)
-    Enum.each(previous_fk_violations, fn violation ->
-      require Logger
-      Logger.warning("migration upgrade_liveness_progress_receipts_v1 retains unresolved foreign key #{inspect(violation)}")
-    end)
+             previous_fk_violations =
+               Enum.flat_map(~w(supervision_liveness_receipts), fn table ->
+                 Txn.q(txn, "PRAGMA foreign_key_check(#{table})")
+               end)
+
+             Enum.each(previous_fk_violations, fn violation ->
+               require Logger
+
+               Logger.warning(
+                 "migration upgrade_liveness_progress_receipts_v1 retains unresolved foreign key #{inspect(violation)}"
+               )
+             end)
 
              case Txn.q(txn, "SELECT shape FROM schema_stamp") do
                [[^predecessor]] ->
@@ -5099,7 +5293,9 @@ defmodule Tightbeam.Schema do
 
              add_row_driven_rule_columns_in_txn(txn)
 
-             case (Enum.flat_map(~w(supervision_liveness_receipts), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end) -- previous_fk_violations) do
+             case Enum.flat_map(~w(supervision_liveness_receipts), fn table ->
+                    Txn.q(txn, "PRAGMA foreign_key_check(#{table})")
+                  end) -- previous_fk_violations do
                [] ->
                  :ok
 
@@ -5127,11 +5323,18 @@ defmodule Tightbeam.Schema do
 
   defp upgrade_row_driven_rules_v1(db) do
     case DB.transaction(db, fn txn ->
-    previous_fk_violations = Enum.flat_map(~w(wakes), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end)
-    Enum.each(previous_fk_violations, fn violation ->
-      require Logger
-      Logger.warning("migration upgrade_row_driven_rules_v1 retains unresolved foreign key #{inspect(violation)}")
-    end)
+           previous_fk_violations =
+             Enum.flat_map(~w(wakes), fn table ->
+               Txn.q(txn, "PRAGMA foreign_key_check(#{table})")
+             end)
+
+           Enum.each(previous_fk_violations, fn violation ->
+             require Logger
+
+             Logger.warning(
+               "migration upgrade_row_driven_rules_v1 retains unresolved foreign key #{inspect(violation)}"
+             )
+           end)
 
            case Txn.q(txn, "SELECT shape FROM schema_stamp") do
              [[@row_driven_rules_previous_shape]] ->
@@ -5153,7 +5356,9 @@ defmodule Tightbeam.Schema do
            if Txn.changes(txn) != 1,
              do: raise(ShapeError, message: "incompatible_row_driven_rules_v1: stamp race")
 
-           case (Enum.flat_map(~w(wakes), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end) -- previous_fk_violations) do
+           case Enum.flat_map(~w(wakes), fn table ->
+                  Txn.q(txn, "PRAGMA foreign_key_check(#{table})")
+                end) -- previous_fk_violations do
              [] ->
                :ok
 
@@ -5174,11 +5379,18 @@ defmodule Tightbeam.Schema do
         else: @row_driven_coverage_previous_shape
 
     case DB.transaction(db, fn txn ->
-    previous_fk_violations = Enum.flat_map(~w(wakes), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end)
-    Enum.each(previous_fk_violations, fn violation ->
-      require Logger
-      Logger.warning("migration upgrade_row_driven_waits_v1 retains unresolved foreign key #{inspect(violation)}")
-    end)
+           previous_fk_violations =
+             Enum.flat_map(~w(wakes), fn table ->
+               Txn.q(txn, "PRAGMA foreign_key_check(#{table})")
+             end)
+
+           Enum.each(previous_fk_violations, fn violation ->
+             require Logger
+
+             Logger.warning(
+               "migration upgrade_row_driven_waits_v1 retains unresolved foreign key #{inspect(violation)}"
+             )
+           end)
 
            case Txn.q(txn, "SELECT shape FROM schema_stamp") do
              [[^predecessor]] ->
@@ -5211,7 +5423,9 @@ defmodule Tightbeam.Schema do
            if Txn.changes(txn) != 1,
              do: raise(ShapeError, message: "incompatible_row_driven_waits_v1: stamp race")
 
-           case (Enum.flat_map(~w(wakes), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end) -- previous_fk_violations) do
+           case Enum.flat_map(~w(wakes), fn table ->
+                  Txn.q(txn, "PRAGMA foreign_key_check(#{table})")
+                end) -- previous_fk_violations do
              [] ->
                :ok
 
@@ -5233,11 +5447,18 @@ defmodule Tightbeam.Schema do
 
     try do
       case DB.transaction(db, fn txn ->
-    previous_fk_violations = Enum.flat_map(~w(wakes), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end)
-    Enum.each(previous_fk_violations, fn violation ->
-      require Logger
-      Logger.warning("migration upgrade_row_driven_coverage_v1 retains unresolved foreign key #{inspect(violation)}")
-    end)
+             previous_fk_violations =
+               Enum.flat_map(~w(wakes), fn table ->
+                 Txn.q(txn, "PRAGMA foreign_key_check(#{table})")
+               end)
+
+             Enum.each(previous_fk_violations, fn violation ->
+               require Logger
+
+               Logger.warning(
+                 "migration upgrade_row_driven_coverage_v1 retains unresolved foreign key #{inspect(violation)}"
+               )
+             end)
 
              [[^predecessor]] = Txn.q(txn, "SELECT shape FROM schema_stamp")
 
@@ -5321,7 +5542,12 @@ defmodule Tightbeam.Schema do
              ])
 
              if Txn.changes(txn) != 1, do: raise(ShapeError, message: "coverage stamp race")
-             [] = (Enum.flat_map(~w(wakes), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end) -- previous_fk_violations)
+
+             [] =
+               Enum.flat_map(~w(wakes), fn table ->
+                 Txn.q(txn, "PRAGMA foreign_key_check(#{table})")
+               end) -- previous_fk_violations
+
              :ok
            end) do
         {:ok, :ok} -> :ok
@@ -5555,10 +5781,17 @@ defmodule Tightbeam.Schema do
   end
 
   defp migrate_model_identity_v1_in_txn(%Txn{} = txn) do
-    previous_fk_violations = Enum.flat_map(~w(decision_requests wakes messages), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end)
+    previous_fk_violations =
+      Enum.flat_map(~w(decision_requests wakes messages), fn table ->
+        Txn.q(txn, "PRAGMA foreign_key_check(#{table})")
+      end)
+
     Enum.each(previous_fk_violations, fn violation ->
       require Logger
-      Logger.warning("migration migrate_model_identity_v1_in_txn retains unresolved foreign key #{inspect(violation)}")
+
+      Logger.warning(
+        "migration migrate_model_identity_v1_in_txn retains unresolved foreign key #{inspect(violation)}"
+      )
     end)
 
     # Read every commissioned population before any DDL. A missing table is an
@@ -5657,7 +5890,9 @@ defmodule Tightbeam.Schema do
         """
       )
 
-    case (Enum.flat_map(~w(decision_requests wakes messages), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end) -- previous_fk_violations) do
+    case Enum.flat_map(~w(decision_requests wakes messages), fn table ->
+           Txn.q(txn, "PRAGMA foreign_key_check(#{table})")
+         end) -- previous_fk_violations do
       [] ->
         :ok
 
@@ -5710,10 +5945,17 @@ defmodule Tightbeam.Schema do
   end
 
   defp migrate_notice_batching_v1_019_in_txn(%Txn{} = txn, predecessor, liveness?) do
-    previous_fk_violations = Enum.flat_map(~w(wakes wake_cancellations notice_batch_members), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end)
+    previous_fk_violations =
+      Enum.flat_map(~w(wakes wake_cancellations notice_batch_members), fn table ->
+        Txn.q(txn, "PRAGMA foreign_key_check(#{table})")
+      end)
+
     Enum.each(previous_fk_violations, fn violation ->
       require Logger
-      Logger.warning("migration migrate_notice_batching_v1_019_in_txn retains unresolved foreign key #{inspect(violation)}")
+
+      Logger.warning(
+        "migration migrate_notice_batching_v1_019_in_txn retains unresolved foreign key #{inspect(violation)}"
+      )
     end)
 
     [[wake_count]] = Txn.q(txn, "SELECT COUNT(*) FROM wakes")
@@ -5895,7 +6137,9 @@ defmodule Tightbeam.Schema do
       :ok = Txn.exec(txn, sql)
     end)
 
-    case (Enum.flat_map(~w(wakes wake_cancellations notice_batch_members), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end) -- previous_fk_violations) do
+    case Enum.flat_map(~w(wakes wake_cancellations notice_batch_members), fn table ->
+           Txn.q(txn, "PRAGMA foreign_key_check(#{table})")
+         end) -- previous_fk_violations do
       [] ->
         :ok
 
@@ -6023,10 +6267,17 @@ defmodule Tightbeam.Schema do
          source_shape,
          target_shape
        ) do
-    previous_fk_violations = Enum.flat_map(~w(sessions wakes decision_requests), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end)
+    previous_fk_violations =
+      Enum.flat_map(~w(sessions wakes decision_requests), fn table ->
+        Txn.q(txn, "PRAGMA foreign_key_check(#{table})")
+      end)
+
     Enum.each(previous_fk_violations, fn violation ->
       require Logger
-      Logger.warning("migration migrate_addressed_po_consultation_in_txn retains unresolved foreign key #{inspect(violation)}")
+
+      Logger.warning(
+        "migration migrate_addressed_po_consultation_in_txn retains unresolved foreign key #{inspect(violation)}"
+      )
     end)
 
     [[^source_shape]] = Txn.q(txn, "SELECT shape FROM schema_stamp")
@@ -6059,7 +6310,11 @@ defmodule Tightbeam.Schema do
 
     [[^idempotency_count]] = Txn.q(txn, "SELECT COUNT(*) FROM wire_idempotency")
     :ok = Tightbeam.SessionPoAssociations.migrate_in_txn(txn)
-    [] = (Enum.flat_map(~w(sessions wakes decision_requests), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end) -- previous_fk_violations)
+
+    [] =
+      Enum.flat_map(~w(sessions wakes decision_requests), fn table ->
+        Txn.q(txn, "PRAGMA foreign_key_check(#{table})")
+      end) -- previous_fk_violations
 
     Txn.q(txn, "UPDATE schema_stamp SET shape=?1,stampedAt=?2 WHERE shape=?3", [
       target_shape,
@@ -6124,10 +6379,17 @@ defmodule Tightbeam.Schema do
   end
 
   defp migrate_cannot_proceed_in_txn(%Txn{} = txn) do
-    previous_fk_violations = Enum.flat_map(~w(decision_requests assignments), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end)
+    previous_fk_violations =
+      Enum.flat_map(~w(decision_requests assignments), fn table ->
+        Txn.q(txn, "PRAGMA foreign_key_check(#{table})")
+      end)
+
     Enum.each(previous_fk_violations, fn violation ->
       require Logger
-      Logger.warning("migration migrate_cannot_proceed_in_txn retains unresolved foreign key #{inspect(violation)}")
+
+      Logger.warning(
+        "migration migrate_cannot_proceed_in_txn retains unresolved foreign key #{inspect(violation)}"
+      )
     end)
 
     [[@cursor_provider_shape]] = Txn.q(txn, "SELECT shape FROM schema_stamp")
@@ -6176,7 +6438,9 @@ defmodule Tightbeam.Schema do
 
     :ok = Tightbeam.Assignments.migrate_cannot_proceed_v1_in_txn(txn)
 
-    case (Enum.flat_map(~w(decision_requests assignments), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end) -- previous_fk_violations) do
+    case Enum.flat_map(~w(decision_requests assignments), fn table ->
+           Txn.q(txn, "PRAGMA foreign_key_check(#{table})")
+         end) -- previous_fk_violations do
       [] ->
         :ok
 
@@ -6229,10 +6493,15 @@ defmodule Tightbeam.Schema do
   end
 
   defp migrate_sessions_provider_shape_in_txn(%Txn{} = txn, source_shape) do
-    previous_fk_violations = Enum.flat_map(~w(sessions), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end)
+    previous_fk_violations =
+      Enum.flat_map(~w(sessions), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end)
+
     Enum.each(previous_fk_violations, fn violation ->
       require Logger
-      Logger.warning("migration migrate_sessions_provider_shape_in_txn retains unresolved foreign key #{inspect(violation)}")
+
+      Logger.warning(
+        "migration migrate_sessions_provider_shape_in_txn retains unresolved foreign key #{inspect(violation)}"
+      )
     end)
 
     [[session_count]] = Txn.q(txn, "SELECT COUNT(*) FROM sessions")
@@ -6279,7 +6548,9 @@ defmodule Tightbeam.Schema do
         """
       )
 
-    case (Enum.flat_map(~w(sessions), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end) -- previous_fk_violations) do
+    case Enum.flat_map(~w(sessions), fn table ->
+           Txn.q(txn, "PRAGMA foreign_key_check(#{table})")
+         end) -- previous_fk_violations do
       [] ->
         :ok
 
@@ -6431,11 +6702,19 @@ defmodule Tightbeam.Schema do
                :ok
 
              [[@settlement_shape]] ->
-    previous_fk_violations = Enum.flat_map(~w(turns terminal_credential_incidents terminal_credential_notifications), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end)
-    Enum.each(previous_fk_violations, fn violation ->
-      require Logger
-      Logger.warning("migration upgrade_terminal_credential_failure retains unresolved foreign key #{inspect(violation)}")
-    end)
+               previous_fk_violations =
+                 Enum.flat_map(
+                   ~w(turns terminal_credential_incidents terminal_credential_notifications),
+                   fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end
+                 )
+
+               Enum.each(previous_fk_violations, fn violation ->
+                 require Logger
+
+                 Logger.warning(
+                   "migration upgrade_terminal_credential_failure retains unresolved foreign key #{inspect(violation)}"
+                 )
+               end)
 
                :ok = Tightbeam.TerminalCredentialFailure.ensure_schema_in_txn(txn)
 
@@ -6450,7 +6729,10 @@ defmodule Tightbeam.Schema do
                    message: "terminal credential migration lost its exact stamp transition"
                end
 
-               case (Enum.flat_map(~w(turns terminal_credential_incidents terminal_credential_notifications), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end) -- previous_fk_violations) do
+               case Enum.flat_map(
+                      ~w(turns terminal_credential_incidents terminal_credential_notifications),
+                      fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end
+                    ) -- previous_fk_violations do
                  [] ->
                    :ok
 
@@ -6646,11 +6928,18 @@ defmodule Tightbeam.Schema do
                :ok
 
              [[@identity_publication_denial_diagnostic_shape]] ->
-    previous_fk_violations = Enum.flat_map(~w(work_items), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end)
-    Enum.each(previous_fk_violations, fn violation ->
-      require Logger
-      Logger.warning("migration upgrade_work_item_delivery_owner_link retains unresolved foreign key #{inspect(violation)}")
-    end)
+               previous_fk_violations =
+                 Enum.flat_map(~w(work_items), fn table ->
+                   Txn.q(txn, "PRAGMA foreign_key_check(#{table})")
+                 end)
+
+               Enum.each(previous_fk_violations, fn violation ->
+                 require Logger
+
+                 Logger.warning(
+                   "migration upgrade_work_item_delivery_owner_link retains unresolved foreign key #{inspect(violation)}"
+                 )
+               end)
 
                fresh_bootstrap? = fresh_owner_link_origin_in_txn(txn)
 
@@ -6680,7 +6969,10 @@ defmodule Tightbeam.Schema do
                      end
                    end)
 
-                   [] = (Enum.flat_map(~w(work_items), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end) -- previous_fk_violations)
+                   [] =
+                     Enum.flat_map(~w(work_items), fn table ->
+                       Txn.q(txn, "PRAGMA foreign_key_check(#{table})")
+                     end) -- previous_fk_violations
 
                    Txn.q(
                      txn,
@@ -6789,10 +7081,15 @@ defmodule Tightbeam.Schema do
   end
 
   defp migrate_cursor_provider_v1_020_in_txn(%Txn{} = txn) do
-    previous_fk_violations = Enum.flat_map(~w(sessions), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end)
+    previous_fk_violations =
+      Enum.flat_map(~w(sessions), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end)
+
     Enum.each(previous_fk_violations, fn violation ->
       require Logger
-      Logger.warning("migration migrate_cursor_provider_v1_020_in_txn retains unresolved foreign key #{inspect(violation)}")
+
+      Logger.warning(
+        "migration migrate_cursor_provider_v1_020_in_txn retains unresolved foreign key #{inspect(violation)}"
+      )
     end)
 
     harnesses = Enum.map_join(Tightbeam.Harness.known(), ",", &"'#{&1.wire_name()}'")
@@ -6891,7 +7188,9 @@ defmodule Tightbeam.Schema do
       ])
     end
 
-    case (Enum.flat_map(~w(sessions), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end) -- previous_fk_violations) do
+    case Enum.flat_map(~w(sessions), fn table ->
+           Txn.q(txn, "PRAGMA foreign_key_check(#{table})")
+         end) -- previous_fk_violations do
       [] -> :ok
       rows -> incompatible_cursor_provider!("left invalid foreign keys: #{inspect(rows)}")
     end

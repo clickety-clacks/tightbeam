@@ -6362,8 +6362,17 @@ defmodule Tightbeam.Wakes do
     send(self(), :review_remedy_changed)
     send(self(), :recover_notices)
     Process.send_after(self(), :backfill_wake_delivery, 100)
-          {:ok, invalid} = DB.query(state.db, "SELECT wakeId, dueAt FROM wakes WHERE state='pending' AND dueAt IS NOT NULL AND typeof(dueAt)<>'integer'")
-          Enum.each(invalid, fn [id, due] -> Logger.warning("wake #{id} unavailable: invalid deadline #{inspect(due)}") end)
+
+    {:ok, invalid} =
+      DB.query(
+        state.db,
+        "SELECT wakeId, dueAt FROM wakes WHERE state='pending' AND dueAt IS NOT NULL AND typeof(dueAt)<>'integer'"
+      )
+
+    Enum.each(invalid, fn [id, due] ->
+      Logger.warning("wake #{id} unavailable: invalid deadline #{inspect(due)}")
+    end)
+
     {:ok, arm_due_timer(state)}
   end
 

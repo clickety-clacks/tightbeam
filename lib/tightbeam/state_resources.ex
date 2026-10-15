@@ -1056,7 +1056,12 @@ defmodule Tightbeam.StateResources do
     status = Identity.status(base_dir)
     live = status.live_revision
 
-    {:ok, rows} = DB.query(db, "SELECT sessionKey, identityRevision FROM sessions WHERE state='active' AND identityRevision IS NOT NULL")
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT sessionKey, identityRevision FROM sessions WHERE state='active' AND identityRevision IS NOT NULL"
+      )
+
     session_revisions = Map.new(rows, fn [key, revision] -> {key, revision} end)
 
     %{

@@ -52,10 +52,17 @@ defmodule Tightbeam.SessionReparent do
 
   @doc false
   def upgrade_agent_principals_in_txn(txn) do
-    previous_fk_violations = Enum.flat_map(~w(session_reparent_events), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end)
+    previous_fk_violations =
+      Enum.flat_map(~w(session_reparent_events), fn table ->
+        Txn.q(txn, "PRAGMA foreign_key_check(#{table})")
+      end)
+
     Enum.each(previous_fk_violations, fn violation ->
       require Logger
-      Logger.warning("migration upgrade_agent_principals_in_txn retains unresolved foreign key #{inspect(violation)}")
+
+      Logger.warning(
+        "migration upgrade_agent_principals_in_txn retains unresolved foreign key #{inspect(violation)}"
+      )
     end)
 
     [[table_sql]] =
@@ -108,7 +115,12 @@ defmodule Tightbeam.SessionReparent do
         :ok = Txn.exec(txn, "DROP TABLE session_reparent_events_agent_v1")
 
         :ok = Txn.exec(txn, @indexes_and_triggers_ddl)
-        [] = (Enum.flat_map(~w(session_reparent_events), fn table -> Txn.q(txn, "PRAGMA foreign_key_check(#{table})") end) -- previous_fk_violations)
+
+        [] =
+          Enum.flat_map(~w(session_reparent_events), fn table ->
+            Txn.q(txn, "PRAGMA foreign_key_check(#{table})")
+          end) -- previous_fk_violations
+
         :ok
 
       true ->
