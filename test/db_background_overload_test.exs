@@ -47,8 +47,11 @@ defmodule Tightbeam.DBBackgroundOverloadTest do
 
   test "a due event skips overload and leaves recovery to the detector", %{db: db} do
     timer = make_ref()
+
     state = %{
-      db: db, timer: timer, scanned_through: -1,
+      db: db,
+      timer: timer,
+      scanned_through: -1,
       internal_consumers: %{},
       deliver: fn _ -> flunk("delivery must not run") end,
       delivery_opts: []
@@ -69,7 +72,9 @@ defmodule Tightbeam.DBBackgroundOverloadTest do
 
   test "the miss detector skips overload and schedules its next check", %{db: db} do
     state = %{
-      db: db, timer: nil, scanned_through: -1,
+      db: db,
+      timer: nil,
+      scanned_through: -1,
       internal_consumers: %{},
       delivery_opts: [],
       deliver: fn _ -> flunk("delivery must not run") end

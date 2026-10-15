@@ -9,32 +9,65 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
     registry = start_supervised!({Tightbeam.ConnRegistry, name: nil})
     lane_name = :"event_lane_#{System.unique_integer([:positive])}"
     start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, lane_name})
-    :ok = DB.execute(db, """
-    INSERT INTO users(userId,isAdmin,createdAt) VALUES ('owner',1,1);
-    INSERT INTO sessions(sessionKey,displayName,ownerUserId,origin,archetype,harness,
-      provider,model,host,state,createdAt,updatedAt)
-    VALUES ('recipient','recipient','owner','user:owner','default','claude',
-      'anthropic','fable','testhost','active',1,1);
-    """)
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO users(userId,isAdmin,createdAt) VALUES ('owner',1,1);
+      INSERT INTO sessions(sessionKey,displayName,ownerUserId,origin,archetype,harness,
+        provider,model,host,state,createdAt,updatedAt)
+      VALUES ('recipient','recipient','owner','user:owner','default','claude',
+        'anthropic','fable','testhost','active',1,1);
+      """)
+
     %{db: db, delivery_opts: [conn_registry: registry, lane_manager: lane_name]}
   end
 
   defp scheduler(ctx, extra \\ []) do
     parent = self()
-    start_supervised!({Wakes, [db: ctx.db, name: nil,
-      deliver: fn wake -> send(parent, {:delivered, wake.wake_id, System.system_time(:millisecond)}) end,
-      internal_consumers: %{"test" => fn wake -> send(parent, {:delivered, wake.wake_id, System.system_time(:millisecond)}) end},
-      delivery_opts: ctx.delivery_opts] ++ extra})
+
+    start_supervised!(
+      {Wakes,
+       [
+         db: ctx.db,
+         name: nil,
+         deliver: fn wake ->
+           send(parent, {:delivered, wake.wake_id, System.system_time(:millisecond)})
+         end,
+         internal_consumers: %{
+           "test" => fn wake ->
+             send(parent, {:delivered, wake.wake_id, System.system_time(:millisecond)})
+           end
+         },
+         delivery_opts: ctx.delivery_opts
+       ] ++ extra}
+    )
   end
 
   defp wake(db, due_at, extra \\ %{}) do
-    Wakes.schedule(db, Map.merge(%{session_key: "recipient", origin: "system",
-      prompt: "scheduled notice", due_at: due_at, sender_scheduled: true}, extra))
+    Wakes.schedule(
+      db,
+      Map.merge(
+        %{
+          session_key: "recipient",
+          origin: "system",
+          prompt: "scheduled notice",
+          due_at: due_at,
+          sender_scheduled: true
+        },
+        extra
+      )
+    )
   end
 
   defp busy(db) do
-    {:ok, _} = Ledger.enqueue(db, %{session_key: "recipient", message_id: "busy",
-      origin: "user:owner", prompt: "working"})
+    {:ok, _} =
+      Ledger.enqueue(db, %{
+        session_key: "recipient",
+        message_id: "busy",
+        origin: "user:owner",
+        prompt: "working"
+      })
+
     {:ok, turn} = Ledger.claim_next(db, "recipient", "testhost")
     turn
   end
@@ -45,11 +78,15 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
     Process.sleep(300)
     :sys.get_state(pid)
     1 = :erlang.trace(pid, true, [:send, {:tracer, self()}])
+
     try do
-      refute_receive {:trace, ^pid, :send, {label, _, _}, _} when label in [:"$gen_call", :"$gen_cast"], 1_200
+      refute_receive {:trace, ^pid, :send, {label, _, _}, _}
+                     when label in [:"$gen_call", :"$gen_cast"],
+                     1_200
     after
       :erlang.trace(pid, false, [:send])
     end
+
     assert :sys.get_state(pid).timer == nil
   end
 
@@ -76,11 +113,19 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
 
   test "a rolled back schedule never arms the timer", ctx do
     pid = scheduler(ctx)
-    assert {:error, _} = DB.transaction(ctx.db, fn txn ->
-      Wakes.schedule_in_txn(txn, %{session_key: "recipient", origin: "system",
-        consumer: "test", due_at: System.system_time(:millisecond)})
-      raise "rollback"
-    end)
+
+    assert {:error, _} =
+             DB.transaction(ctx.db, fn txn ->
+               Wakes.schedule_in_txn(txn, %{
+                 session_key: "recipient",
+                 origin: "system",
+                 consumer: "test",
+                 due_at: System.system_time(:millisecond)
+               })
+
+               raise "rollback"
+             end)
+
     assert :sys.get_state(pid).timer == nil
     refute_receive {:delivered, _, _}, 100
   end
@@ -94,12 +139,18 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
     :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
     Wakes.recipient_ready(pid, "recipient")
     :sys.get_state(pid)
-    assert {:ok, [[seq]]} = DB.query(ctx.db, "SELECT deliveredTurnSeq FROM wakes WHERE wakeId=?1", [source.wake_id])
+
+    assert {:ok, [[seq]]} =
+             DB.query(ctx.db, "SELECT deliveredTurnSeq FROM wakes WHERE wakeId=?1", [
+               source.wake_id
+             ])
+
     assert is_integer(seq)
     assert Wakes.health(pid) == %{misses: 0}
   end
 
-  test "the detector ignores busy recipients then delivers and logs a suppressed readiness signal", ctx do
+  test "the detector ignores busy recipients then delivers and logs a suppressed readiness signal",
+       ctx do
     turn = busy(ctx.db)
     pid = scheduler(ctx)
     source = wake(ctx.db, System.system_time(:millisecond) - 61_000)
@@ -109,13 +160,21 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
     assert Wakes.health(pid) == %{misses: 0}
     assert NoticeBatcher.source_refs(ctx.db, source.wake_id) == []
     :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
-    log = capture_log(fn ->
-      send(pid, :detect_misses)
-      :sys.get_state(pid)
-    end)
+
+    log =
+      capture_log(fn ->
+        send(pid, :detect_misses)
+        :sys.get_state(pid)
+      end)
+
     assert log =~ "wake scheduler miss wake=#{source.wake_id} kind=prompt late_ms="
     assert Wakes.health(pid) == %{misses: 1}
-    assert {:ok, [[seq]]} = DB.query(ctx.db, "SELECT deliveredTurnSeq FROM wakes WHERE wakeId=?1", [source.wake_id])
+
+    assert {:ok, [[seq]]} =
+             DB.query(ctx.db, "SELECT deliveredTurnSeq FROM wakes WHERE wakeId=?1", [
+               source.wake_id
+             ])
+
     assert is_integer(seq)
     send(pid, :detect_misses)
     :sys.get_state(pid)

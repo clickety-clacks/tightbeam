@@ -6324,10 +6324,13 @@ defmodule Tightbeam.Wakes do
   def health(server \\ Tightbeam.WakeScheduler) do
     with pid when is_pid(pid) <- GenServer.whereis(server),
          {:dictionary, dictionary} <- Process.info(pid, :dictionary) do
-      %{misses: case List.keyfind(dictionary, :wake_scheduler_misses, 0) do
-        {_, count} -> count
-        nil -> 0
-      end}
+      %{
+        misses:
+          case List.keyfind(dictionary, :wake_scheduler_misses, 0) do
+            {_, count} -> count
+            nil -> 0
+          end
+      }
     else
       _ -> %{misses: 0}
     end
@@ -6383,9 +6386,12 @@ defmodule Tightbeam.Wakes do
     }
 
     scheduler = self()
-    {:ok, _} = DB.transaction(state.db, fn _txn ->
-      Process.put({__MODULE__, :scheduler}, scheduler)
-    end)
+
+    {:ok, _} =
+      DB.transaction(state.db, fn _txn ->
+        Process.put({__MODULE__, :scheduler}, scheduler)
+      end)
+
     Process.put(:wake_scheduler_misses, 0)
     Process.send_after(self(), :detect_misses, @miss_detector_ms)
     Process.send_after(self(), :backfill_wake_delivery, 100)
@@ -6746,8 +6752,10 @@ defmodule Tightbeam.Wakes do
              db,
              fn txn ->
                wake = get_in_txn(txn, wake_id)
+
                if is_nil(recipient) or match?({^recipient, _, _}, resolved_recipient(txn, wake)),
-                 do: deliver_wait_in_txn(txn, wake_id, delivery_opts), else: :noop
+                 do: deliver_wait_in_txn(txn, wake_id, delivery_opts),
+                 else: :noop
              end,
              fn txn, result ->
                row_commit_in_txn(txn, [])
@@ -7798,17 +7806,26 @@ defmodule Tightbeam.Wakes do
   defp arm_due_timer(state) do
     if state.timer, do: Process.cancel_timer(state.timer)
 
-    timer = DB.background_pass(fn ->
-      {:ok, rows} = DB.query(state.db, """
-      SELECT dueAt FROM wakes INDEXED BY wakes_due
-      WHERE state='pending' AND dueAt>?1 ORDER BY dueAt LIMIT 1
-      """, [state.scanned_through])
+    timer =
+      DB.background_pass(
+        fn ->
+          {:ok, rows} =
+            DB.query(
+              state.db,
+              """
+              SELECT dueAt FROM wakes INDEXED BY wakes_due
+              WHERE state='pending' AND dueAt>?1 ORDER BY dueAt LIMIT 1
+              """,
+              [state.scanned_through]
+            )
 
-      case rows do
-        [[due_at]] -> :erlang.start_timer(max(0, due_at - now()), self(), :due)
-        [] -> nil
-      end
-    end, nil)
+          case rows do
+            [[due_at]] -> :erlang.start_timer(max(0, due_at - now()), self(), :due)
+            [] -> nil
+          end
+        end,
+        nil
+      )
 
     %{state | timer: timer}
   end
@@ -7821,30 +7838,45 @@ defmodule Tightbeam.Wakes do
 
   defp detect_misses(state) do
     at = now()
-    candidates = transaction!(state.db, fn txn ->
-      Txn.q(txn, """
-      SELECT wakeId FROM wakes INDEXED BY wakes_due
-      WHERE state='pending' AND dueAt<?1 AND consumer='prompt'
-        AND deliveredTurnSeq IS NULL
-        AND (targetRole IS NOT NULL OR targetGate<>0 OR NOT EXISTS (
-          SELECT 1 FROM turns t WHERE t.sessionKey=wakes.sessionKey
-            AND t.status IN ('running','queued')
-        ))
-      ORDER BY dueAt
-      """, [at - @miss_lateness_ms])
-      |> Enum.flat_map(fn [id] ->
-        wake = get_in_txn(txn, id)
-        case resolved_recipient(txn, wake) do
-          {recipient, _, _} ->
-            if Txn.q(txn, "SELECT 1 FROM turns WHERE sessionKey=?1 AND status IN ('running','queued') LIMIT 1", [recipient]) == [],
-              do: [{wake, recipient}], else: []
-          nil -> []
-        end
+
+    candidates =
+      transaction!(state.db, fn txn ->
+        Txn.q(
+          txn,
+          """
+          SELECT wakeId FROM wakes INDEXED BY wakes_due
+          WHERE state='pending' AND dueAt<?1 AND consumer='prompt'
+            AND deliveredTurnSeq IS NULL
+            AND (targetRole IS NOT NULL OR targetGate<>0 OR NOT EXISTS (
+              SELECT 1 FROM turns t WHERE t.sessionKey=wakes.sessionKey
+                AND t.status IN ('running','queued')
+            ))
+          ORDER BY dueAt
+          """,
+          [at - @miss_lateness_ms]
+        )
+        |> Enum.flat_map(fn [id] ->
+          wake = get_in_txn(txn, id)
+
+          case resolved_recipient(txn, wake) do
+            {recipient, _, _} ->
+              if Txn.q(
+                   txn,
+                   "SELECT 1 FROM turns WHERE sessionKey=?1 AND status IN ('running','queued') LIMIT 1",
+                   [recipient]
+                 ) == [], do: [{wake, recipient}], else: []
+
+            nil ->
+              []
+          end
+        end)
       end)
-    end)
 
     for {wake, recipient} <- candidates do
-      Logger.warning("wake scheduler miss wake=#{wake.wake_id} kind=#{wake.condition_kind || wake.wait_mode || wake.consumer} late_ms=#{at - wake.due_at}")
+      Logger.warning(
+        "wake scheduler miss wake=#{wake.wake_id} kind=#{wake.condition_kind || wake.wait_mode || wake.consumer} late_ms=#{at - wake.due_at}"
+      )
+
       Process.put(:wake_scheduler_misses, Process.get(:wake_scheduler_misses, 0) + 1)
       deliver_eligible_waits(state.db, state.delivery_opts, recipient)
       NoticeBatcher.recover(state.db, at, state.delivery_opts, recipient)
@@ -7854,11 +7886,13 @@ defmodule Tightbeam.Wakes do
   end
 
   defp resolved_recipient(txn, wake) do
-    gate = cond do
-      is_binary(wake.target_role) -> %{target_role: wake.target_role}
-      wake.target_gate == 0 -> nil
-      true -> Map.take(wake, [:reresolve, :reresolve_seed, :reresolve_rung])
-    end
+    gate =
+      cond do
+        is_binary(wake.target_role) -> %{target_role: wake.target_role}
+        wake.target_gate == 0 -> nil
+        true -> Map.take(wake, [:reresolve, :reresolve_seed, :reresolve_rung])
+      end
+
     Gateway.delivery_target(txn, wake.session_key, gate)
   end
 

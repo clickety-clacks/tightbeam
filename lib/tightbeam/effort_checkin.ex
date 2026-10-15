@@ -131,6 +131,7 @@ defmodule Tightbeam.EffortCheckin do
             wake_id,
             elapsed
           ])
+
           Wakes.schedule_changed_in_txn(txn)
 
         true ->
