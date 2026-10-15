@@ -2790,9 +2790,10 @@ defmodule Tightbeam.Wire.Router do
     "add-user" => ~w(is_admin user_id)a,
     "answer" => ~w(answer idempotency_key reason request request_id)a,
     "artifact-content-fetch" => ~w(artifact_id)a,
+    "artifact-get" => ~w(artifact_id)a,
     "artifact-record" =>
       ~w(content_sha256 description kind origin_path produced_by_assignment_id title work_item_id)a,
-    "artifacts" => ~w(session_key work_item_id)a,
+    "artifacts" => ~w(session_key work_item_id kind)a,
     "ask" =>
       ~w(assignment_id context idempotency_key params question reason role session_key target user_id verb)a,
     "assign" =>
