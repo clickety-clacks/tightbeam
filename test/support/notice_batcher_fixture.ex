@@ -1191,12 +1191,12 @@ defmodule Tightbeam.NoticeBatcherFixture do
       assert Wakes.get(db, retry).prompt == Wakes.get(db, original).prompt
       assert Wakes.get(db, retry).state == "pending"
       # Compare every stored field, not just the rendered text. Only successor
-      # identity, retry timing, pending state and original-client dedupe differ.
+      # identity, retry timing, pending state, delivery and client dedupe differ.
       assert {:ok, columns} = DB.query(db, "PRAGMA table_info(wakes)")
 
       names =
         for [_, name | _] <- columns,
-            name not in ~w(wakeId state dueAt canceledAt sourceClientIdentity),
+            name not in ~w(wakeId state dueAt canceledAt sourceClientIdentity deliveredTurnSeq),
             do: name
 
       projection = Enum.join(names, ",")
@@ -1206,6 +1206,10 @@ defmodule Tightbeam.NoticeBatcherFixture do
 
       assert {:ok, [^raw]} =
                DB.query(db, "SELECT #{projection} FROM wakes WHERE wakeId=?1", [retry])
+
+      assert {:ok, [[seq], [nil]]} = DB.query(db,
+        "SELECT deliveredTurnSeq FROM wakes WHERE wakeId IN (?1,?2) ORDER BY wakeId=?1 DESC", [original,retry])
+      assert seq == turn.seq
     end
 
     assert {:ok, [[nil]]} =

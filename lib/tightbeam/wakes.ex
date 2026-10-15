@@ -6472,18 +6472,23 @@ defmodule Tightbeam.Wakes do
     end)
   end
 
-  defp deliver_due_in_context(%{db: db, deliver: deliver, internal_consumers: consumers} = state, drain_notices) do
+  defp deliver_due_in_context(
+         %{db: db, deliver: deliver, internal_consumers: consumers} = state,
+         drain_notices
+       ) do
     if drain_notices and Map.has_key?(consumers, "review_remedy_reconcile") do
       {:ok, :ok} =
         Tightbeam.RailRemedy.reconcile_pending_episodes(db, state.review_remedy_interval_ms)
     end
 
     newly_due = recognize_due_dependency_waits(db)
+
     if drain_notices do
       deliver_eligible_waits(db, state.delivery_opts)
     else
       deliver_wait_ids(db, newly_due, state.delivery_opts)
     end
+
     evaluate_conditions(state, :tick)
 
     # Materialize after condition recognition so a fallback or matching fact

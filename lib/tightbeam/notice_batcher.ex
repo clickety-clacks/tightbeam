@@ -496,7 +496,10 @@ defmodule Tightbeam.NoticeBatcher do
         end
       end)
 
-    recipients = Enum.reverse(recipients) |> Enum.filter(fn {target, _} -> is_nil(recipient) or target == recipient end)
+    recipients =
+      Enum.reverse(recipients)
+      |> Enum.filter(fn {target, _} -> is_nil(recipient) or target == recipient end)
+
     own_sources = Enum.group_by(recipients, &elem(&1, 0), &elem(&1, 1))
 
     deliveries =
