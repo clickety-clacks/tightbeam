@@ -107,11 +107,15 @@ defmodule Tightbeam.WorkspaceCleanup do
           end
         rescue
           error ->
-            Logger.warning("archive relocation deferred #{name}: #{Exception.message(error)}")
+            detail = Exception.message(error)
+            Logger.warning("archive relocation deferred #{name}: #{detail}")
+            _ = DB.query(db, "UPDATE retired_archive_relocation SET report=?3 WHERE host=?1 AND destination=?2", [name, destination, detail])
             false
         catch
           kind, error ->
-            Logger.warning("archive relocation deferred #{name}: #{kind}: #{inspect(error)}")
+            detail = "#{kind}: #{inspect(error)}"
+            Logger.warning("archive relocation deferred #{name}: #{detail}")
+            _ = DB.query(db, "UPDATE retired_archive_relocation SET report=?3 WHERE host=?1 AND destination=?2", [name, destination, detail])
             false
         end
       end

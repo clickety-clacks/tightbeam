@@ -237,7 +237,13 @@ defmodule Tightbeam.WorkspaceCleanupTest do
     archive = Path.join(ctx.base, "configured-archive")
     Application.put_env(:tightbeam, :archive_dir, archive)
     on_exit(fn -> Application.delete_env(:tightbeam, :archive_dir) end)
+    :ok = DB.execute(ctx.db, "CREATE TRIGGER refuse_archive_repoint BEFORE UPDATE OF home ON artifacts BEGIN SELECT RAISE(ABORT,'archive repoint unavailable'); END")
     worker = start_supervised!({WorkspaceCleanup, config: ctx.config})
+    send(worker, :drain)
+    :sys.get_state(worker)
+    assert %{count: 1, unfinished: [%{reason: reason}]} = WorkspaceCleanup.health(ctx.db)
+    assert reason =~ "archive repoint unavailable"
+    :ok = DB.execute(ctx.db, "DROP TRIGGER refuse_archive_repoint")
     send(worker, :drain)
     :sys.get_state(worker)
     moved = Artifacts.get(ctx.db, artifact.artifact_id)
