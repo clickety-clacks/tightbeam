@@ -129,7 +129,9 @@ defmodule Tightbeam.RecognitionRetryTest do
     assert Process.alive?(db)
   end
 
-  test "recognition deadline failure cannot replace a primary commit near its deadline", %{db: db} do
+  test "recognition deadline failure cannot replace a primary commit near its deadline", %{db: db, retry: retry} do
+    # This case isolates the inline deadline. Automatic retry has its own cases.
+    GenServer.stop(retry)
     parent = self()
     old = Application.get_env(:tightbeam, :db_call_timeout_ms)
     Application.put_env(:tightbeam, :db_call_timeout_ms, 500)
@@ -159,11 +161,8 @@ defmodule Tightbeam.RecognitionRetryTest do
     assert_receive {:primary_deadline, primary_deadline}
     assert_receive {:recognition_deadline, recognition_deadline}
     assert recognition_deadline <= primary_deadline
-    # The timer may already be retrying the deliberately slow callback. These
-    # reads verify durable outcomes after it releases the in-memory connection.
-    deadline = System.monotonic_time(:millisecond) + 2_000
-    assert {:ok, [[1]]} = DB.query_until(db, "SELECT id FROM recognized_rows", [], deadline)
-    assert {:ok, [[0]]} = DB.query_until(db, "SELECT flagged FROM pending_recognition", [], deadline)
+    assert {:ok, [[1]]} = DB.query(db, "SELECT id FROM recognized_rows")
+    assert {:ok, [[0]]} = DB.query(db, "SELECT flagged FROM pending_recognition")
   end
 
   test "recognition returning an error is rolled back and leaves pending work", %{db: db} do
@@ -217,6 +216,10 @@ defmodule Tightbeam.RecognitionRetryTest do
                :recognized
              end)
 
+    state = :sys.get_state(retry)
+    assert state.timer != nil
+    assert {:ok, [[next_at]]} = DB.query(db, "SELECT nextAt FROM pending_recognition")
+    assert next_at <= System.system_time(:millisecond) + 500
     assert_receive :automatic_retry, 1_500
     assert :sys.get_state(retry).timer == nil
     assert {:ok, []} = DB.query(db, "SELECT id FROM pending_recognition")

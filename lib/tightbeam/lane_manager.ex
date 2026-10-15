@@ -214,14 +214,17 @@ defmodule Tightbeam.LaneManager do
   defp ensure(state, session_key) do
     case Registry.lookup(Tightbeam.LaneRegistry, session_key) do
       [{pid, _}] ->
-        GenServer.cast(pid, {:lane_manager, self()})
+        if Process.alive?(pid),
+          do: GenServer.cast(pid, {:lane_manager, self()}),
+          else: start_lane(state, session_key)
 
       [] ->
-        DynamicSupervisor.start_child(
-          state.lane_sup,
-          {SessionLane, lane_opts(state, session_key)}
-        )
+        start_lane(state, session_key)
     end
+  end
+
+  defp start_lane(state, session_key) do
+    DynamicSupervisor.start_child(state.lane_sup, {SessionLane, lane_opts(state, session_key)})
   end
 
   defp lane_opts(state, session_key, extra \\ []) do
