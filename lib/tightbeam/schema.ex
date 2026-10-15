@@ -2852,7 +2852,9 @@ defmodule Tightbeam.Schema do
       if name == "supervision_liveness_sidecar" and
            Txn.q(txn, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='supervision_state_migration'") == [[1]] and
            Txn.q(txn, "SELECT 1 FROM supervision_state_migration WHERE id=0") == [[1]] do
-        String.replace(expected_sql, ~r/\)\s*$/, ", endedWakeState TEXT)")
+        String.replace(expected_sql,
+          "retirementActionNeeded INTEGER CHECK (retirementActionNeeded IN (0,1)),",
+          "retirementActionNeeded INTEGER CHECK (retirementActionNeeded IN (0,1)), endedWakeState TEXT,")
       else
         expected_sql
       end
