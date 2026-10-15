@@ -16,6 +16,7 @@ defmodule Tightbeam.RailRemedy do
 
   alias Tightbeam.DB.Txn
 
+  @reassessment_wait 253402300799000
   @ttl_ms 60_000
   @token_re ~r/\{([^{}]+)\}/
 
@@ -104,6 +105,7 @@ defmodule Tightbeam.RailRemedy do
 
     result =
       case DB.transaction(db, fn txn ->
+             Wakes.schedule_changed_in_txn(txn, :review_remedy_changed)
              row =
                Txn.q(
                  txn,
@@ -199,7 +201,7 @@ defmodule Tightbeam.RailRemedy do
           Tightbeam.Gateway.schedule_review_notice_in_txn(txn, recipient, %{
             wake_id: reassess_id,
             assignment_id: subject,
-            due_at: now + interval,
+            due_at: @reassessment_wait,
             consumer: "review_remedy_reconcile",
             prompt:
               JSON.encode!(%{
@@ -1324,7 +1326,7 @@ defmodule Tightbeam.RailRemedy do
       "observations" => [],
       "reassessment" =>
         if(is_binary(reassess_id),
-          do: %{"generation" => 1, "wakeId" => reassess_id, "dueAt" => now + interval},
+          do: %{"generation" => 1, "wakeId" => reassess_id, "dueAt" => @reassessment_wait},
           else: nil
         )
     }
@@ -1894,9 +1896,9 @@ defmodule Tightbeam.RailRemedy do
          subject,
          occurrence,
          generation,
-         interval,
+         _interval,
          state,
-         now
+         _now
        ) do
     if state["blocked"] == "accountable_owner_chain_exhausted" do
       persist_notice_state(txn, statute, subject, put_in(state, ["reassessment"], nil))
@@ -1908,7 +1910,7 @@ defmodule Tightbeam.RailRemedy do
           schedule_protocol_notice(txn, recipient, state, %{
             wake_id: next_id,
             assignment_id: subject,
-            due_at: now + interval,
+            due_at: @reassessment_wait,
             consumer: "review_remedy_reconcile",
             prompt:
               JSON.encode!(%{
@@ -1923,7 +1925,7 @@ defmodule Tightbeam.RailRemedy do
             put_in(state, ["reassessment"], %{
               "generation" => generation + 1,
               "wakeId" => next_id,
-              "dueAt" => now + interval
+              "dueAt" => @reassessment_wait
             })
 
           state = Map.put(state, "lastGeneration", generation + 1)

@@ -220,8 +220,7 @@ defmodule Tightbeam.Wire.Router do
       "features" => ["stale-turn-settlement-v1"],
       "adapters" => health,
       "diagnostics" => diagnostic_health(),
-      "wakeScheduler" =>
-        Tightbeam.Wakes.health(deps(conn)[:wake_scheduler] || Tightbeam.WakeScheduler)
+      "schedulerMisses" => Tightbeam.SchedulerMisses.count()
     })
   end
 

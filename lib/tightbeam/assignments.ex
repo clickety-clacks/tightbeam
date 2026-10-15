@@ -3676,6 +3676,10 @@ defmodule Tightbeam.Assignments do
 
     if Txn.changes(txn) != 1, do: raise(TransitionRace)
 
+    if attrs.kind == "verdict" do
+      Tightbeam.Wakes.schedule_changed_in_txn(txn, :review_remedy_changed)
+    end
+
     attest([
       id,
       attrs.assignment_id,

@@ -19,7 +19,7 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
         'anthropic','fable','testhost','active',1,1);
       """)
 
-    %{db: db, delivery_opts: [conn_registry: registry, lane_manager: lane_name]}
+    %{misses_before: Tightbeam.SchedulerMisses.count(), db: db, delivery_opts: [conn_registry: registry, lane_manager: lane_name]}
   end
 
   defp scheduler(ctx, extra \\ []) do
@@ -27,7 +27,7 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
 
     start_supervised!(
       {Wakes,
-       [
+       Keyword.merge([
          db: ctx.db,
          name: nil,
          deliver: fn wake ->
@@ -39,7 +39,7 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
            end
          },
          delivery_opts: ctx.delivery_opts
-       ] ++ extra}
+       ], extra)}
     )
   end
 
@@ -173,7 +173,7 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
              ])
 
     assert is_integer(seq)
-    assert Wakes.health(pid) == %{misses: 0}
+    assert Tightbeam.SchedulerMisses.count() - ctx.misses_before == 0
   end
 
   test "recipient readiness cancels a deadline satisfied by an early recognized notice", ctx do
@@ -210,7 +210,7 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
     :ok = Wakes.fire_due(pid)
     send(pid, :detect_misses)
     :sys.get_state(pid)
-    assert Wakes.health(pid) == %{misses: 0}
+    assert Tightbeam.SchedulerMisses.count() - ctx.misses_before == 0
     assert NoticeBatcher.source_refs(ctx.db, source.wake_id) == []
     :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
 
@@ -221,7 +221,7 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
       end)
 
     assert log =~ "wake scheduler miss wake=#{source.wake_id} kind=prompt late_ms="
-    assert Wakes.health(pid) == %{misses: 1}
+    assert Tightbeam.SchedulerMisses.count() - ctx.misses_before == 1
 
     response =
       Tightbeam.Wire.Router.call(
@@ -229,7 +229,7 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
         Tightbeam.Wire.Router.init(db: ctx.db, wake_scheduler: pid)
       )
 
-    assert JSON.decode!(response.resp_body)["wakeScheduler"] == %{"misses" => 1}
+    assert JSON.decode!(response.resp_body)["schedulerMisses"] - ctx.misses_before == 1
 
     assert {:ok, [[seq]]} =
              DB.query(ctx.db, "SELECT deliveredTurnSeq FROM wakes WHERE wakeId=?1", [
@@ -239,6 +239,46 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
     assert is_integer(seq)
     send(pid, :detect_misses)
     :sys.get_state(pid)
-    assert Wakes.health(pid) == %{misses: 1}
+    assert Tightbeam.SchedulerMisses.count() - ctx.misses_before == 1
+  end
+
+  test "failed internal deliveries back off and succeed without another write", ctx do
+    parent = self()
+    attempts = :ets.new(:retry_attempts, [:public])
+    :ets.insert(attempts, {:count, 0})
+    consumer = fn wake ->
+      n = :ets.update_counter(attempts, :count, 1)
+      send(parent, {:attempt, n, System.system_time(:millisecond)})
+      if n < 3, do: raise("transient failure")
+      {:ok, _} = DB.transaction(ctx.db, &Wakes.consume_internal_in_txn(&1, wake.wake_id))
+    end
+    pid = scheduler(ctx, internal_consumers: %{"effort_probe" => consumer})
+    scheduled = wake(ctx.db, System.system_time(:millisecond), %{consumer: "effort_probe"})
+    assert_receive {:attempt, 1, first}, 1_000
+    assert_receive {:attempt, 2, second}, 1_600
+    assert second - first >= 1_000
+    assert_receive {:attempt, 3, third}, 2_600
+    assert third - second >= 2_000
+    assert Wakes.get(ctx.db, scheduled.wake_id).state == "fired"
+    assert :sys.get_state(pid).retries == %{}
+  end
+
+  test "later schedule storms retain the deadline and coalesce delivery passes", ctx do
+    pid = scheduler(ctx)
+    first = System.system_time(:millisecond) + 60_000
+    wake(ctx.db, first, %{consumer: "test"})
+    original = :sys.get_state(pid)
+    for _ <- 1..200, do: GenServer.cast(pid, {:schedule_changed, first + 60_000})
+    state = :sys.get_state(pid)
+    assert state.timer == original.timer
+    assert state.scanned_through == original.scanned_through
+
+    :sys.suspend(pid)
+    for _ <- 1..200, do: GenServer.cast(pid, :wake_ready)
+    :sys.resume(pid)
+    state = :sys.get_state(pid)
+    assert state.fire_pending
+    :sys.get_state(pid)
+    refute :sys.get_state(pid).fire_pending
   end
 end
