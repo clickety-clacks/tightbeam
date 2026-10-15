@@ -4538,9 +4538,8 @@ defmodule Tightbeam.SupervisionTest do
     {:ok, _} =
       DB.query(ctx.db, "UPDATE decision_requests SET parkWakeId = NULL WHERE id = ?1", [stale_id])
 
-    # Finish the old park before starting supervision. Keep the production timer long enough
-    # to prove the terminal notification owns the permanent skip; the test timer below then
-    # delivers the real scheduled-sweep handler that must re-drive it.
+    # Finish the old park before starting supervision. The terminal notification
+    # owns the permanent skip; the slow consistency check must later re-drive it.
     name = :"park_sweep_supervision_#{System.unique_integer([:positive])}"
 
     start_supervised!(
@@ -4556,7 +4555,7 @@ defmodule Tightbeam.SupervisionTest do
     :sys.get_state(name)
     :sys.get_state(name)
     refute_receive {:request_rechecked, :withdraw, _}
-    Process.send_after(name, :scheduled_sweep, 0)
+    Process.send_after(name, :detect_misses, 0)
 
     try do
       assert_receive {:request_rechecked, :withdraw, 2}
