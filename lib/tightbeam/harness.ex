@@ -44,6 +44,9 @@ defmodule Tightbeam.Harness do
   @type preflight_result :: {:ok, keyword()} | {:error, launch_refusal()}
   @type launch_result :: {:ok, launch_plan()} | {:error, launch_refusal()}
   @type ensure_result :: {:ok, String.t()} | {:error, launch_refusal()}
+  @type credential_migration_result ::
+          :ok
+          | {:error, %{path: String.t(), source: String.t(), reason: atom()}}
   @type probe_result ::
           {:ok, %{bin: String.t(), version: String.t()}}
           | {:error, :not_found | {:exec_failed, String.t()} | launch_refusal()}
@@ -92,6 +95,9 @@ defmodule Tightbeam.Harness do
   @callback materialize_skills(target(), String.t(), map()) :: map()
   @callback credential_ready?(target(), String.t()) :: boolean()
   @callback credential_live?(target(), String.t(), keyword()) :: credential_liveness()
+  @doc "Materialize a supported legacy auth link before regular-file readiness is checked."
+  @callback materialize_legacy_credential_link(target(), String.t()) ::
+              credential_migration_result()
   @doc """
   Give the harness one real run against a freshly banked credential.
 
@@ -124,6 +130,7 @@ defmodule Tightbeam.Harness do
 
   @optional_callbacks preflight_launch: 3,
                       warm_home: 2,
+                      materialize_legacy_credential_link: 2,
                       local_client_model_authority?: 1,
                       submission_text_limit: 0,
                       project_session_identity: 3,
@@ -153,6 +160,14 @@ defmodule Tightbeam.Harness do
 
   @spec ensure_adapter(module(), target()) :: ensure_result()
   def ensure_adapter(module, target), do: module.ensure_adapter(target)
+
+  @spec materialize_legacy_credential_link(module(), target(), String.t()) ::
+          credential_migration_result()
+  def materialize_legacy_credential_link(module, target, home) do
+    if function_exported?(module, :materialize_legacy_credential_link, 2),
+      do: module.materialize_legacy_credential_link(target, home),
+      else: :ok
+  end
 
   @spec probe_cli(module(), target()) :: probe_result()
   def probe_cli(module, target), do: module.probe_cli(target)

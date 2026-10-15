@@ -512,6 +512,17 @@ defmodule Tightbeam.Harness.Codex do
   end
 
   @impl true
+  def materialize_legacy_credential_link(target, home) do
+    source =
+      Tightbeam.Credentials.legacy_credential_path(
+        target.host_config.base_dir,
+        credential_provider()
+      )
+
+    Tightbeam.Homes.materialize_legacy_auth_link(target, home, source)
+  end
+
+  @impl true
   def credential_ready?(target, home) do
     Tightbeam.Homes.credential_ready?(target, home, ["auth.json"])
   end
