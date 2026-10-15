@@ -391,7 +391,7 @@ defmodule Tightbeam.Dispatch do
   end
 
   defp audit_payload(verb, call, outcome) do
-    if is_integer(Process.get(:tightbeam_dispatch_audited)) or verb == "onboard" or
+    if is_integer(Process.get(:tightbeam_dispatch_audited)) or verb in ~w(onboard settle-turn) or
          Publisher.transactional_verb?(verb),
        do: outcome_payload(verb, call, outcome),
        else: nil
