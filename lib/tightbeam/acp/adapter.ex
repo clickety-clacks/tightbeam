@@ -74,6 +74,8 @@ defmodule Tightbeam.Acp.Adapter do
     unprompted: MapSet.new(),
     switchable_models: %{},
     config_options: %{},
+    operations: %{},
+    operation_queue: [],
     context_usage: %{}
   ]
 
@@ -211,7 +213,7 @@ defmodule Tightbeam.Acp.Adapter do
   """
   @spec close_session(adapter(), String.t(), keyword()) :: :ok | {:error, term()}
   def close_session(adapter, session_id, opts \\ []) do
-    GenServer.call(adapter, {:close_session, session_id, opts}, 65_000)
+    call(adapter, {:close_session, session_id, opts}, 65_000)
   rescue
     reason -> {:error, {:adapter_unavailable, reason}}
   catch
@@ -230,7 +232,13 @@ defmodule Tightbeam.Acp.Adapter do
   # has always produced — is what puts the reason on the turn row. Every
   # adapter-boundary call the turn path makes goes through this.
   defp call(adapter, message, timeout) do
-    GenServer.call(adapter, message, timeout)
+    if session_operation?(message) do
+      budget = if timeout == :infinity, do: 60_000, else: timeout
+      deadline = System.monotonic_time(:millisecond) + budget
+      GenServer.call(adapter, {:session_operation, message, deadline}, budget + 2_000)
+    else
+      GenServer.call(adapter, message, timeout)
+    end
   catch
     :exit, reason -> {:error, {:adapter_unavailable, unavailable_reason(reason)}}
   end
@@ -292,7 +300,7 @@ defmodule Tightbeam.Acp.Adapter do
   @doc "Apply a model selection and surface any explicit harness refusal."
   @spec apply_model(adapter(), String.t(), model_ref()) :: :ok | {:error, term()}
   def apply_model(adapter, session_id, model),
-    do: GenServer.call(adapter, {:apply_model, session_id, model}, 30_000)
+    do: call(adapter, {:apply_model, session_id, model}, 30_000)
 
   def apply_model_for_turn(adapter, session_id, model),
     do: call(adapter, {:apply_model, session_id, model, :infinity}, :infinity)
@@ -551,16 +559,131 @@ defmodule Tightbeam.Acp.Adapter do
     end
   end
 
+  defp session_operation?(message) when is_tuple(message),
+    do: elem(message, 0) in [:new_session, :new_candidate_session, :load_session,
+      :switch_model_session, :close_session, :apply_model, :apply_model_strict, :apply_fast]
+
+  defp session_operation?(_message), do: false
+
+  defp operation_key(message) when elem(message, 0) in [:new_session, :new_candidate_session],
+    do: make_ref()
+
+  defp operation_key(message), do: elem(message, 1)
+
   @impl true
-  def handle_call({:new_session, model, cwd, mcp_servers, guidance}, _from, state) do
+  def handle_call({:session_operation, message, deadline}, from, state),
+    do: enqueue_operation(state, message, from, deadline)
+
+  def handle_call(message, from, state) do
+    cond do
+      session_operation?(message) ->
+        deadline = case message do
+          {:apply_model_strict, _, _, _, deadline} -> deadline
+          _ -> System.monotonic_time(:millisecond) + 60_000
+        end
+        enqueue_operation(state, message, from, deadline)
+
+      is_tuple(message) and elem(message, 0) in [:prompt, :forget_model_residency] and
+          Map.has_key?(state.operations, elem(message, 1)) ->
+        {:noreply, %{state | operation_queue: state.operation_queue ++ [{message, from, nil}]}}
+
+      true -> session_call(message, from, state)
+    end
+  end
+
+  defp enqueue_operation(state, message, from, deadline) do
+    key = operation_key(message)
+    cond do
+      deadline <= System.monotonic_time(:millisecond) ->
+        reason = if elem(message, 0) == :apply_model_strict,
+          do: :model_transport_failure, else: :timeout
+        GenServer.reply(from, {:error, reason})
+        {:noreply, state}
+
+      Map.has_key?(state.operations, key) ->
+        {:noreply, %{state | operation_queue: state.operation_queue ++ [{message, from, deadline}]}}
+
+      true ->
+      parent = self()
+      {pid, monitor} = spawn_monitor(fn ->
+        # A link releases the operation if its owning adapter exits.
+        Process.link(parent)
+        Process.put(:acp_operation_deadline, deadline)
+        result = try do
+          session_call(message, from, state)
+        rescue
+          error -> {:reply, {:error, {:session_operation_failed, error}}, state}
+        catch
+          kind, reason -> {:reply, {:error, {:session_operation_failed, {kind, reason}}}, state}
+        end
+        send(parent, {:session_operation_done, key, self(), result})
+        Process.unlink(parent)
+      end)
+      timer = Process.send_after(self(), {:session_operation_timeout, key, pid},
+        max(deadline - System.monotonic_time(:millisecond), 0) + 100)
+      operation = %{pid: pid, monitor: monitor, timer: timer, from: from, before: state}
+      {:noreply, %{state | operations: Map.put(state.operations, key, operation)}}
+    end
+  end
+
+  # Only changed session entries are applied. Other sessions and incoming
+  # prompt updates may have advanced while the operation was waiting.
+  defp merge_operation(state, before, after_state) do
+    Enum.reduce([:known, :models, :unprompted, :switchable_models, :config_options,
+      :context_usage, :chunks, :progress, :subagent_roots], state, fn field, acc ->
+      old = Map.fetch!(before, field)
+      new = Map.fetch!(after_state, field)
+      current = Map.fetch!(acc, field)
+      merged = if match?(%MapSet{}, old) do
+        current |> MapSet.difference(MapSet.difference(old, new))
+        |> MapSet.union(MapSet.difference(new, old))
+      else
+        Enum.reduce(Enum.uniq(Map.keys(old) ++ Map.keys(new)), current, fn sid, entries ->
+          if Map.fetch(old, sid) == Map.fetch(new, sid) do
+            entries
+          else
+            case Map.fetch(new, sid) do
+              {:ok, value} -> Map.put(entries, sid, value)
+              :error -> Map.delete(entries, sid)
+            end
+          end
+        end)
+      end
+      Map.put(acc, field, merged)
+    end)
+  end
+
+  defp finish_operation(state, key, operation, reply, after_state) do
+    Process.cancel_timer(operation.timer)
+    Process.demonitor(operation.monitor, [:flush])
+    GenServer.reply(operation.from, reply)
+    state = merge_operation(state, operation.before, after_state)
+    state = %{state | operations: Map.delete(state.operations, key)}
+    {ready, waiting} = Enum.split_with(state.operation_queue, fn {message, _, _} ->
+      elem(message, 1) == key
+    end)
+    Enum.reduce(ready, {:noreply, %{state | operation_queue: waiting}},
+      fn {message, from, deadline}, {:noreply, acc} ->
+        result = if deadline, do: enqueue_operation(acc, message, from, deadline),
+          else: handle_call(message, from, acc)
+        case result do
+          {:reply, reply, next} ->
+            GenServer.reply(from, reply)
+            {:noreply, next}
+          other -> other
+        end
+      end)
+  end
+
+  defp session_call({:new_session, model, cwd, mcp_servers, guidance}, _from, state) do
     new_session_reply(state, model, cwd, mcp_servers, guidance, 60_000, false)
   end
 
-  def handle_call({:new_candidate_session, model, cwd, mcp_servers, guidance}, _from, state) do
+  defp session_call({:new_candidate_session, model, cwd, mcp_servers, guidance}, _from, state) do
     new_session_reply(state, model, cwd, mcp_servers, guidance, 60_000, true)
   end
 
-  def handle_call(
+  defp session_call(
         {:new_session, model, cwd, mcp_servers, guidance, request_timeout},
         _from,
         state
@@ -568,11 +691,11 @@ defmodule Tightbeam.Acp.Adapter do
     new_session_reply(state, model, cwd, mcp_servers, guidance, request_timeout, false)
   end
 
-  def handle_call({:load_session, sid, model, cwd, mcp_servers, guidance}, _from, state) do
+  defp session_call({:load_session, sid, model, cwd, mcp_servers, guidance}, _from, state) do
     load_session_reply(state, sid, model, cwd, mcp_servers, guidance, 60_000)
   end
 
-  def handle_call(
+  defp session_call(
         {:load_session, sid, model, cwd, mcp_servers, guidance, request_timeout},
         _from,
         state
@@ -580,7 +703,7 @@ defmodule Tightbeam.Acp.Adapter do
     load_session_reply(state, sid, model, cwd, mcp_servers, guidance, request_timeout)
   end
 
-  def handle_call(
+  defp session_call(
         {:switch_model_session, sid, model, cwd, mcp_servers, guidance},
         _from,
         state
@@ -598,10 +721,10 @@ defmodule Tightbeam.Acp.Adapter do
     end
   end
 
-  def handle_call({:close_session, sid}, from, state),
-    do: handle_call({:close_session, sid, []}, from, state)
+  defp session_call({:close_session, sid}, from, state),
+    do: session_call({:close_session, sid, []}, from, state)
 
-  def handle_call({:close_session, sid, opts}, _from, state) do
+  defp session_call({:close_session, sid, opts}, _from, state) do
     diagnostic? = Keyword.get(opts, :diagnostic, false)
 
     case Conn.request(state.conn, "session/close", %{sessionId: sid}, diagnostic: diagnostic?) do
@@ -626,7 +749,7 @@ defmodule Tightbeam.Acp.Adapter do
     end
   end
 
-  def handle_call({:apply_model_strict, sid, model, prior_model, caller_deadline}, _from, state) do
+  defp session_call({:apply_model_strict, sid, model, prior_model, caller_deadline}, _from, state) do
     cond do
       caller_deadline - System.monotonic_time(:millisecond) <= 0 ->
         {:reply, {:error, :model_transport_failure}, state}
@@ -650,31 +773,31 @@ defmodule Tightbeam.Acp.Adapter do
     end
   end
 
-  def handle_call({:apply_model, sid, model}, _from, state) do
+  defp session_call({:apply_model, sid, model}, _from, state) do
     case apply_model_to_session(state, sid, model) do
       {:ok, applied_model} -> {:reply, :ok, remember_model(state, sid, applied_model)}
       error -> {:reply, error, drop_model_residency(state, sid)}
     end
   end
 
-  def handle_call({:apply_model, sid, model, request_timeout}, _from, state) do
+  defp session_call({:apply_model, sid, model, request_timeout}, _from, state) do
     case apply_model_to_session(state, sid, model, request_timeout) do
       {:ok, applied_model} -> {:reply, :ok, remember_model(state, sid, applied_model)}
       error -> {:reply, error, drop_model_residency(state, sid)}
     end
   end
 
-  def handle_call({:knows_session?, sid}, _from, state),
+  defp session_call({:knows_session?, sid}, _from, state),
     do: {:reply, MapSet.member?(state.known, sid), state}
 
-  def handle_call({:current_model, sid}, _from, state) do
+  defp session_call({:current_model, sid}, _from, state) do
     case Map.fetch(state.models, sid) do
       {:ok, model} -> {:reply, {:ok, model}, state}
       :error -> {:reply, {:error, :model_readback_unavailable}, state}
     end
   end
 
-  def handle_call({:context_usage, sid, max_age_ms}, _from, state) do
+  defp session_call({:context_usage, sid, max_age_ms}, _from, state) do
     result =
       if Map.has_key?(state.prompts, sid) do
         {:error, :context_usage_in_flight}
@@ -690,18 +813,18 @@ defmodule Tightbeam.Acp.Adapter do
     {:reply, result, state}
   end
 
-  def handle_call({:switchable_models, sid}, _from, state) do
+  defp session_call({:switchable_models, sid}, _from, state) do
     case Map.fetch(state.switchable_models, sid) do
       {:ok, models} -> {:reply, {:ok, models}, state}
       :error -> {:reply, {:error, :model_capability_unavailable}, state}
     end
   end
 
-  def handle_call({:fast_status, sid}, _from, state) do
+  defp session_call({:fast_status, sid}, _from, state) do
     {:reply, canonical_fast_status(state, sid), state}
   end
 
-  def handle_call({:apply_fast, sid, requested}, _from, state) do
+  defp session_call({:apply_fast, sid, requested}, _from, state) do
     with {:ok, option} <- advertised_fast_option(state, sid),
          {:ok, wire_value} <- fast_wire_value(option, requested) do
       case Conn.request(
@@ -740,10 +863,10 @@ defmodule Tightbeam.Acp.Adapter do
     end
   end
 
-  def handle_call({:forget_model_residency, sid}, _from, state),
+  defp session_call({:forget_model_residency, sid}, _from, state),
     do: {:reply, :ok, drop_model_residency(state, sid)}
 
-  def handle_call({:prompt, sid, text, opts}, from, state) do
+  defp session_call({:prompt, sid, text, opts}, from, state) do
     if Map.has_key?(state.prompts, sid) do
       # A recovered lane can reach its next prompt before cancel acknowledges
       # the old one. Keep that call undispatched until the old operation ends.
@@ -760,7 +883,7 @@ defmodule Tightbeam.Acp.Adapter do
     end
   end
 
-  def handle_call(:conn, _from, state), do: {:reply, state.conn, state}
+  defp session_call(:conn, _from, state), do: {:reply, state.conn, state}
 
   defp switch_model_in_place_reply(state, sid, model, request_timeout) do
     case apply_verified_in_place_model(state, sid, model, request_timeout) do
@@ -1334,6 +1457,24 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   @impl true
+  def handle_info({:session_operation_done, key, pid, {:reply, reply, after_state}}, state) do
+    case state.operations[key] do
+      %{pid: ^pid} = operation -> finish_operation(state, key, operation, reply, after_state)
+      _ -> {:noreply, state}
+    end
+  end
+
+  def handle_info({:session_operation_timeout, key, pid}, state) do
+    case state.operations[key] do
+      %{pid: ^pid} = operation ->
+        Process.unlink(pid)
+        Process.exit(pid, :kill)
+        finish_operation(state, key, operation, {:error, :timeout},
+          drop_model_residency(operation.before, key))
+      _ -> {:noreply, state}
+    end
+  end
+
   def handle_info({:acp_notification, "account/updated", params}, state) do
     emit_auth_classification(state, params)
     {:noreply, state}
@@ -1726,13 +1867,19 @@ defmodule Tightbeam.Acp.Adapter do
     end
   end
 
-  # Invoke the per-turn progress fun on status CHANGE only. The fun is fast
-  # by contract (an in-memory registry broadcast) — see PATTERNS on shared
-  # serializers; anything slower belongs to the turn, not here.
+  # A slow or unavailable progress consumer must not hold the adapter loop.
   defp emit_progress(state, sid, update) do
     with {fun, last, seq} <- Map.get(state.progress, sid),
          {:ok, text} when text != last <- progress_status(update) do
-      fun.(text, seq + 1)
+      Task.start(fn ->
+        try do
+          fun.(text, seq + 1)
+        rescue
+          error -> Logger.warning("adapter progress callback failed: #{inspect(error)}")
+        catch
+          :exit, reason -> Logger.warning("adapter progress callback exited: #{inspect(reason)}")
+        end
+      end)
       put_in(state.progress[sid], {fun, text, seq + 1})
     else
       _ -> state
