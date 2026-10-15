@@ -459,7 +459,9 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
     end)
   end
 
-  test "A3 source visibility runs before matching and hidden rows emit no frame", ctx do
+  # Subscription matching runs first and visibility is checked only for a
+  # matching row, so a hidden row may be matched but never emits a frame.
+  test "A3 hidden rows are matched but emit no frame; visible rows emit one", ctx do
     %{valid: notices, unresolved_marker: unresolved_marker} = visibility_notices(ctx)
 
     Enum.each(notices, fn notice ->
@@ -502,7 +504,10 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
       Hub.publish(ctx.hub, notice)
       _sequence = Hub.sequence(ctx.hub, self())
       trace_barrier(hub_pid)
-      refute_received {:trace, ^hub_pid, :call, {Hub, :matches?, _}}
+
+      assert_received {:trace, ^hub_pid, :call,
+                       {Hub, :matches?, [^notice, %{"classes" => ^classes}]}}
+
       refute_received {:firehose_notice, _frame}
 
       :ok =
@@ -542,7 +547,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
     Hub.publish(ctx.hub, unresolved_marker)
     _sequence = Hub.sequence(ctx.hub, self())
     trace_barrier(hub_pid)
-    refute_received {:trace, ^hub_pid, :call, {Hub, :matches?, _}}
+    assert_received {:trace, ^hub_pid, :call, {Hub, :matches?, [^unresolved_marker, _]}}
     refute_received {:firehose_notice, _frame}
   end
 
