@@ -1860,7 +1860,7 @@ defmodule Tightbeam.Supervision do
   @impl true
   def handle_continue(:initial_sweep, state) do
     DB.background_pass(fn -> sweep(state) end)
-    {:noreply, state |> refresh_idle_cleanup_deadline() |> arm_deadline()}
+    {:noreply, arm_deadline(state, true)}
   end
 
   @impl true
@@ -1905,15 +1905,9 @@ defmodule Tightbeam.Supervision do
       liveness_cycle(state, terminal_rebases)
     end)
 
-    state =
-      if state.idle_cleanup_due && state.idle_cleanup_due <= now() do
-        DB.background_pass(fn -> idle_cleanup_sweep(state) end)
-        refresh_idle_cleanup_deadline(state)
-      else
-        state
-      end
-
-    {:noreply, arm_deadline(%{state | deadline_timer: nil, deadline: nil})}
+    idle_due = state.idle_cleanup_due && state.idle_cleanup_due <= now()
+    if idle_due, do: DB.background_pass(fn -> idle_cleanup_sweep(state) end)
+    {:noreply, arm_deadline(%{state | deadline_timer: nil, deadline: nil}, idle_due)}
   end
 
   def handle_info({:timeout, _ref, :supervision_due}, state), do: {:noreply, state}
@@ -1927,7 +1921,7 @@ defmodule Tightbeam.Supervision do
     end)
 
     Process.send_after(self(), :detect_misses, 180_000)
-    {:noreply, state |> refresh_idle_cleanup_deadline() |> arm_deadline()}
+    {:noreply, arm_deadline(state, true)}
   end
 
   defp evaluate_ended_session(state, session_key, terminal_seq) do
@@ -5692,28 +5686,23 @@ defmodule Tightbeam.Supervision do
     end)
   end
 
-  defp refresh_idle_cleanup_deadline(%{sweep_ms: interval} = state)
+  defp arm_deadline(state, refresh_idle \\ false)
+
+  defp arm_deadline(%{sweep_ms: interval} = state, refresh_idle)
        when is_integer(interval) and interval > 0 do
     DB.background_pass(
       fn ->
-        due =
-          transaction!(state.db, fn txn ->
+        state = if refresh_idle do
+          due = transaction!(state.db, fn txn ->
             idle_cleanup_deadline_rows_in_txn(txn, state)
             |> Enum.map(&elem(&1, 2))
             |> Enum.min(fn -> nil end)
           end)
+          %{state | idle_cleanup_due: due}
+        else
+          state
+        end
 
-        %{state | idle_cleanup_due: due}
-      end,
-      state
-    )
-  end
-
-  defp refresh_idle_cleanup_deadline(state), do: state
-
-  defp arm_deadline(%{sweep_ms: interval} = state) when is_integer(interval) and interval > 0 do
-    DB.background_pass(
-      fn ->
         [[liveness_due]] =
           query(
             state.db,
@@ -5746,7 +5735,7 @@ defmodule Tightbeam.Supervision do
       state
   end
 
-  defp arm_deadline(state), do: state
+  defp arm_deadline(state, _refresh_idle), do: state
 
   defp detect_misses(state) do
     # Both durable classification and obligation watermarks acknowledge the
