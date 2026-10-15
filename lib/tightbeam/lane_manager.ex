@@ -16,7 +16,16 @@ defmodule Tightbeam.LaneManager do
   use GenServer
   alias Tightbeam.{DB, HarnessHealth, Ledger, SessionLane}
 
-  defstruct [:db, :lane_sup, :task_sup, :runner, :interval, :terminal_publisher, :on_terminal, reaping: %{}]
+  defstruct [
+    :db,
+    :lane_sup,
+    :task_sup,
+    :runner,
+    :interval,
+    :terminal_publisher,
+    :on_terminal,
+    reaping: %{}
+  ]
 
   @doc """
   Start the reconciler. Required opts: `:lane_sup` (the lane
@@ -149,13 +158,16 @@ defmodule Tightbeam.LaneManager do
 
     Enum.reduce(Ledger.pending_sessions(state.db), state, fn session_key, acc ->
       ensure(acc, session_key)
+
       if Enum.any?(acc.reaping, fn {_ref, key} -> key == session_key end) do
         acc
       else
-        task = Task.Supervisor.async_nolink(state.task_sup, fn ->
-          SessionLane.reap_abandoned(session_key)
-          SessionLane.nudge(session_key)
-        end)
+        task =
+          Task.Supervisor.async_nolink(state.task_sup, fn ->
+            SessionLane.reap_abandoned(session_key)
+            SessionLane.nudge(session_key)
+          end)
+
         %{acc | reaping: Map.put(acc.reaping, task.ref, session_key)}
       end
     end)
