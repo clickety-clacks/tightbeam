@@ -3482,6 +3482,56 @@ defmodule Tightbeam.SupervisionTest do
     assert updated_at > prior_updated_at
   end
 
+  test "an unrelated invalid transfer does not block retirement", ctx do
+    start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
+    retiring = session(ctx.db, "retiring-unrelated", ctx.main.session_key)
+    other = session(ctx.db, "other-transfer-target", ctx.main.session_key)
+    assignment(ctx.db, "asg_unrelated_transfer", other.session_key, "unrelated work", 2)
+
+    wake =
+      Wakes.schedule(ctx.db, %{
+        session_key: other.session_key,
+        origin: "process:tightbeam",
+        prompt: "invalid transfer",
+        due_at: 0,
+        assignment_id: "asg_unrelated_transfer"
+      })
+
+    {:ok, turn_seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: other.session_key,
+        message_id: "unrelated-transfer-turn",
+        origin: wake.origin,
+        prompt: wake.prompt,
+        wake_id: wake.wake_id,
+        assignment_id: wake.assignment_id
+      })
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE wakes SET state='fired',firedAt=1,deliveredTurnSeq=?1,reresolve='lineage',reresolveSeed='missing-holder',reresolveRung=1 WHERE wakeId=?2", [turn_seq, wake.wake_id])
+
+    assert {:ok, [[^turn_seq | _]]} =
+             DB.query(ctx.db, Supervision.transfer_candidate_sql(), [wake.assignment_id, nil])
+
+    assert_raise RuntimeError, ~r/invalid_parent_transfer/, fn ->
+      Supervision.prod_state(ctx.db, wake.assignment_id)
+    end
+
+    result =
+      ctx.handlers["retire"].(%{
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        session_key: retiring.session_key,
+        params: %{}
+      })
+
+    assert result.retired_session_keys == [retiring.session_key]
+    assert Org.get(ctx.db, retiring.session_key).state == "retired"
+    assert Org.get(ctx.db, other.session_key).state == "active"
+    assert {:ok, [["open"]]} = DB.query(ctx.db, "SELECT state FROM assignments WHERE id=?1", [wake.assignment_id])
+    assert Wakes.get(ctx.db, wake.wake_id).reresolve_seed == "missing-holder"
+  end
+
   test "startup uses the newest valid parent transfer when history has earlier transfers", ctx do
     Tightbeam.SupervisionConsumerFixture.run!(4, nil)
   end

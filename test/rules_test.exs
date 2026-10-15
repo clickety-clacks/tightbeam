@@ -157,7 +157,7 @@ defmodule Tightbeam.RulesTest do
       path = put_raw(ctx, contents)
 
       error =
-        assert_unavailable(fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end)
+        assert_unavailable(ctx, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end)
 
       assert error.message =~ path
       assert error.message =~ "verifier"
@@ -192,7 +192,7 @@ defmodule Tightbeam.RulesTest do
 
     for {contents, reason} <- cases do
       path = put_raw(ctx, contents)
-      error = assert_unavailable(fn -> Rules.load!(ctx.base_dir, ["post"]) end)
+      error = assert_unavailable(ctx, fn -> Rules.load!(ctx.base_dir, ["post"]) end)
       assert error.message =~ path
       assert error.message =~ reason
       refute error.message =~ "rule #"
@@ -257,7 +257,7 @@ defmodule Tightbeam.RulesTest do
 
     for {contents, reason} <- cases do
       path = put_raw(ctx, contents)
-      error = assert_unavailable(fn -> Rules.load!(ctx.base_dir, ["post"]) end)
+      error = assert_unavailable(ctx, fn -> Rules.load!(ctx.base_dir, ["post"]) end)
       assert error.message =~ path
       assert error.message =~ reason
       assert error.message =~ "rule"
@@ -267,7 +267,7 @@ defmodule Tightbeam.RulesTest do
   test "subagent facts are refused by the observability-only registration boundary", ctx do
     path = put_raw(ctx, rule("no-child-obligation", "post", "subagent_stop", "eq", "child"))
 
-    error = assert_unavailable(fn -> Rules.load!(ctx.base_dir, ["post"]) end)
+    error = assert_unavailable(ctx, fn -> Rules.load!(ctx.base_dir, ["post"]) end)
 
     assert error.message =~ path
     assert error.message =~ "observability-only"
@@ -278,7 +278,7 @@ defmodule Tightbeam.RulesTest do
     put_raw(ctx, rule("same", "post", "caller.origin_class", "eq", "user"), "a.toml")
     path = put_raw(ctx, rule("same", "post", "caller.origin_class", "eq", "agent"), "b.toml")
 
-    error = assert_unavailable(fn -> Rules.load!(ctx.base_dir, ["post"]) end)
+    error = assert_unavailable(ctx, fn -> Rules.load!(ctx.base_dir, ["post"]) end)
     assert error.message =~ "same"
     assert error.message =~ "rule"
     assert error.message =~ Path.dirname(path)
@@ -292,7 +292,7 @@ defmodule Tightbeam.RulesTest do
           "\n" <> rule("same-table", "post", "caller.origin_class", "eq", "agent")
       )
 
-    error = assert_unavailable(fn -> Rules.load!(ctx.base_dir, ["post"]) end)
+    error = assert_unavailable(ctx, fn -> Rules.load!(ctx.base_dir, ["post"]) end)
     assert error.message =~ same_file
     assert error.message =~ "same-table"
   end
@@ -478,6 +478,57 @@ defmodule Tightbeam.RulesTest do
     assert {:deny, %{rule: "live-count"}} = Rules.evaluate(ctx.db, call("user:flynn"))
     assert :ok = Rules.evaluate(ctx.db, call("process:cron"))
     assert :ok = Rules.evaluate(ctx.db, call("broken"))
+  end
+
+  test "live session counts include rows with malformed overrides", ctx do
+    session(ctx.db, "malformed-overrides", "flynn")
+    session(ctx.db, "healthy-overrides", "flynn")
+    session(ctx.db, "other-owner", "mike")
+    retired = session(ctx.db, "retired-count", "flynn")
+    Org.retire(ctx.db, retired.session_key, "user:flynn", 1_000)
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE sessions SET overrides='{' WHERE sessionKey='malformed-overrides'")
+
+    put_rule(ctx, rule("session-limit", "post", "org.live_sessions_owned_by_caller", "gte", 2))
+    Rules.load!(ctx.base_dir, ["post"])
+    assert {:deny, %{rule: "session-limit"}} = Rules.evaluate(ctx.db, call("user:flynn"))
+    assert :ok = Rules.evaluate(ctx.db, call("user:mike"))
+  end
+
+  test "a remedy gated by a rule without a remedy remains available", ctx do
+    put_raw(ctx, """
+    [[rule]]
+    name = "needs-remedy"
+    verb = "post"
+    effect = "remedy"
+    deny_when = [{ fact = "assignment.verdicts", op = "not_in", value = ["tests-passed"] }]
+    text = "remedy required"
+    [rule.remedy]
+    action = "wake"
+    produces = "tests-passed"
+    target_session = "{holder_key}"
+    [rule.remedy.params]
+    prompt = "review"
+
+    [[rule]]
+    name = "conditional-wake-gate"
+    verb = "wake"
+    deny_when = [{ fact = "caller.is_admin", op = "eq", value = false }]
+    text = "admin required"
+    """)
+
+    assert [%{name: "needs-remedy"}, %{name: "conditional-wake-gate"}] =
+             Rules.load!(ctx.base_dir, ["post", "wake"])
+
+    holder = session(ctx.db, "remedy-gate-holder", "flynn")
+    assigned = assignment(ctx, holder.session_key, {:user, "flynn"})
+    dispatch_call = p3_call("post", {:session, holder.session_key}, %{assignment_id: assigned.id})
+
+    assert {:deny, %{code: "rule_denied", rule: "needs-remedy"}} =
+             Rules.evaluate(ctx.db, dispatch_call)
+    verdict(ctx, holder.session_key, assigned.id, "tests-passed")
+    assert :ok = Rules.evaluate(ctx.db, dispatch_call)
   end
 
   test "work_item.has_topline distinguishes unknown, invisible, inactive, and active membership",
@@ -722,13 +773,13 @@ defmodule Tightbeam.RulesTest do
 
       put_rule(ctx, rule("bad-list-op", "attest", fact, "eq", ["reviewed-clean"]))
 
-      assert_unavailable(~r/invalid for a list fact/, fn ->
+      assert_unavailable(ctx, ~r/invalid for a list fact/, fn ->
         Rules.load!(ctx.base_dir, ["attest"])
       end)
 
       put_rule(ctx, rule("bad-list-value", "attest", fact, "not_in", []))
 
-      assert_unavailable(~r/non-empty flat list/, fn -> Rules.load!(ctx.base_dir, ["attest"]) end)
+      assert_unavailable(ctx, ~r/non-empty flat list/, fn -> Rules.load!(ctx.base_dir, ["attest"]) end)
     end
 
     for removed <- [
@@ -737,7 +788,7 @@ defmodule Tightbeam.RulesTest do
         ] do
       put_rule(ctx, rule("removed-review-fact", "attest", removed, "in", ["reviewed-clean"]))
 
-      assert_unavailable(~r/unknown fact/, fn -> Rules.load!(ctx.base_dir, ["attest"]) end)
+      assert_unavailable(ctx, ~r/unknown fact/, fn -> Rules.load!(ctx.base_dir, ["attest"]) end)
     end
 
     put_rule(
@@ -759,7 +810,7 @@ defmodule Tightbeam.RulesTest do
       rule("bad-overlap", "assign", "assign.declared_files_overlap_open", "eq", "true")
     )
 
-    assert_unavailable(~r/does not match bool/, fn -> Rules.load!(ctx.base_dir, ["assign"]) end)
+    assert_unavailable(ctx, ~r/does not match bool/, fn -> Rules.load!(ctx.base_dir, ["assign"]) end)
 
     put_rule(
       ctx,
@@ -773,11 +824,11 @@ defmodule Tightbeam.RulesTest do
       rule("bad-producing", "attest", "assignment.is_producing_card", "eq", "true")
     )
 
-    assert_unavailable(~r/does not match bool/, fn -> Rules.load!(ctx.base_dir, ["attest"]) end)
+    assert_unavailable(ctx, ~r/does not match bool/, fn -> Rules.load!(ctx.base_dir, ["attest"]) end)
 
     put_rule(ctx, rule("removed", "attest", "assignment.verdict_kinds_any", "in", ["x"]))
 
-    assert_unavailable(~r/unknown fact/, fn -> Rules.load!(ctx.base_dir, ["attest"]) end)
+    assert_unavailable(ctx, ~r/unknown fact/, fn -> Rules.load!(ctx.base_dir, ["attest"]) end)
 
     # Migration proof (verification-papertrail-v1): an org rule still gating the
     # deleted producer fact fails loud at boot, naming file and rule.
@@ -789,7 +840,7 @@ defmodule Tightbeam.RulesTest do
     )
 
     error =
-      assert_unavailable(fn -> Rules.load!(ctx.base_dir, ["attest"]) end)
+      assert_unavailable(ctx, fn -> Rules.load!(ctx.base_dir, ["attest"]) end)
 
     assert error.message =~ "unknown fact"
     assert error.message =~ "dead-produced"
@@ -806,7 +857,7 @@ defmodule Tightbeam.RulesTest do
       )
     )
 
-    assert_unavailable(~r/non-empty flat list/, fn -> Rules.load!(ctx.base_dir, ["attest"]) end)
+    assert_unavailable(ctx, ~r/non-empty flat list/, fn -> Rules.load!(ctx.base_dir, ["attest"]) end)
   end
 
   test "P3 fact nil, empty-list, and overlap presence matrix", ctx do
@@ -1038,21 +1089,21 @@ defmodule Tightbeam.RulesTest do
 
     put_raw(ctx, String.replace(shipped, "completion-requires-review", "unrelated-review-rule"))
 
-    assert_unavailable(~r/linked-review-fact remedy requires reviews/, fn ->
+    assert_unavailable(ctx, ~r/linked-review-fact remedy requires reviews/, fn ->
       Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
     end)
 
     for extra <- [~s(reviews = "{assignment_id}"), ~s(arbitrary = "value")] do
       put_raw(ctx, shipped <> "\n" <> extra <> "\n")
 
-      assert_unavailable(~r/remedy wake has invalid params/, fn ->
+      assert_unavailable(ctx, ~r/remedy wake has invalid params/, fn ->
         Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
       end)
     end
 
     put_raw(ctx, String.replace(shipped, "external_producer = true", "external_producer = false"))
 
-    assert_unavailable(~r/F1 unsatisfied verdict gate/, fn ->
+    assert_unavailable(ctx, ~r/F1 unsatisfied verdict gate/, fn ->
       Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
     end)
 
@@ -1064,13 +1115,13 @@ defmodule Tightbeam.RulesTest do
 
     put_raw(ctx, assigned)
 
-    assert_unavailable(~r/linked-review-fact remedy requires reviews/, fn ->
+    assert_unavailable(ctx, ~r/linked-review-fact remedy requires reviews/, fn ->
       Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
     end)
 
     put_raw(ctx, assigned <> ~s(\nreviews = "{holder_key}"\n))
 
-    assert_unavailable(~r/linked-review-fact remedy requires reviews/, fn ->
+    assert_unavailable(ctx, ~r/linked-review-fact remedy requires reviews/, fn ->
       Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
     end)
 
@@ -2248,7 +2299,7 @@ defmodule Tightbeam.RulesTest do
     deny_when = [{ fact = "assignment.state", op = "eq", value = "open" }]
     """)
 
-    assert_unavailable(~r/edge "row-commit" requires effect = "notice"/, fn ->
+    assert_unavailable(ctx, ~r/edge "row-commit" requires effect = "notice"/, fn ->
       Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
     end)
   end
@@ -4246,7 +4297,7 @@ defmodule Tightbeam.RulesTest do
     })
   end
 
-  defp assert_unavailable(expected \\ nil, load) do
+  defp assert_unavailable(ctx, expected \\ nil, load) do
     log =
       ExUnit.CaptureLog.capture_log(fn ->
         result = load.()
@@ -4255,6 +4306,14 @@ defmodule Tightbeam.RulesTest do
       |> String.trim()
 
     assert log =~ "unavailable"
+    unavailable = :persistent_term.get({Rules, :unavailable_verbs})
+    assert map_size(unavailable) > 0
+
+    for {verb, _source} <- unavailable do
+      assert {:deny, %{code: "rule_unavailable"}} =
+               Rules.evaluate(ctx.db, %{call() | verb: verb})
+    end
+
     if is_struct(expected, Regex), do: assert(log =~ expected)
     if is_binary(expected), do: assert(log =~ expected)
     %{message: log}

@@ -11,6 +11,7 @@ defmodule Tightbeam.BootRecordIsolationTest do
     Identity,
     Ledger,
     Model,
+    NoticeBatcher,
     Org,
     Placement,
     Rails,
@@ -68,6 +69,47 @@ defmodule Tightbeam.BootRecordIsolationTest do
     assert capture_log(fn -> assert :ok = Schema.ensure_all(db) end) =~ wake.wake_id
     assert Wakes.get(db, wake.wake_id).recognition_evidence == nil
     assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM users WHERE userId='owner'")
+  end
+
+  test "missing recognition evidence defers only its wake during notice delivery", %{db: db} do
+    start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
+    start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, Tightbeam.LaneManager})
+
+    bad =
+      Wakes.schedule(db, %{
+        session_key: "healthy",
+        origin: "user:owner",
+        prompt: "missing recognition",
+        due_at: 0,
+        condition_kind: "ready",
+        condition_scope: "healthy"
+      })
+
+    good =
+      Wakes.schedule(db, %{
+        session_key: "healthy",
+        origin: "user:owner",
+        prompt: "healthy notice",
+        due_at: 0
+      })
+
+    {:ok, _} =
+      DB.query(db, "UPDATE wakes SET firedBy='condition',firedAt=1,recognitionEvidence=NULL WHERE wakeId=?1", [bad.wake_id])
+
+    assert capture_log(fn -> assert :ok = Schema.ensure_all(db) end) =~ bad.wake_id
+
+    assert capture_log(fn ->
+             assert [carrier] = NoticeBatcher.recover(db)
+             prompt = Wakes.get(db, carrier).prompt
+             assert prompt =~ "healthy notice"
+             refute prompt =~ "missing recognition"
+             refute prompt =~ "[woke: fact"
+           end) =~ "notice source #{bad.wake_id} preparation deferred"
+
+    assert %{state: "pending", recognition_evidence: nil} = Wakes.get(db, bad.wake_id)
+    assert NoticeBatcher.source_refs(db, bad.wake_id) == []
+    assert %{state: "fired"} = Wakes.get(db, good.wake_id)
+    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM turns WHERE sessionKey='healthy' AND status='queued'")
   end
 
   test "identity snapshot reads revisions without decoding unused overrides", %{

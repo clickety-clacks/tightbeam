@@ -1109,12 +1109,15 @@ defmodule Tightbeam.ArchetypesTest do
   end
 
   defp assert_unavailable(expected \\ nil, load) do
-    log =
-      ExUnit.CaptureLog.capture_log(fn ->
-        result = load.()
-        assert is_map(result)
-      end)
-      |> String.trim()
+    {result, log} = ExUnit.CaptureLog.with_log(load)
+    assert is_map(result)
+    log = String.trim(log)
+
+    for [_, source] <- Regex.scan(~r/archetype (\S+) unavailable:/, log) do
+      name = Path.basename(source, ".toml")
+      refute Map.has_key?(result, name)
+      assert Archetypes.get(name) == nil
+    end
 
     assert log =~ "unavailable"
     if is_struct(expected, Regex), do: assert(log =~ expected)

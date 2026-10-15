@@ -4902,10 +4902,6 @@ defmodule Tightbeam.Schema do
                  Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(artifact_contents)) --
                    previous_fk_violations
 
-               [] =
-                 Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(artifact_contents)) --
-                   previous_fk_violations
-
                :ok
 
              rows ->

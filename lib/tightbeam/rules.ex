@@ -472,7 +472,7 @@ defmodule Tightbeam.Rules do
           validate_remedy_reachability!(rule, rules, verbs)
 
           if rule.remedy && not escaping_static_producer?(rule),
-            do: walk_producer_chain!(rule, rule, rules, [rule.name])
+            do: validate_producer_cycles!(rule, rules)
 
           true
         rescue
@@ -1997,16 +1997,14 @@ defmodule Tightbeam.Rules do
 
   defp fixed_condition_true?(_condition, _remedy), do: false
 
-  defp validate_producer_cycles!(rules) do
+  defp validate_producer_cycles!(rule, rules) do
     remedy_rules =
       Enum.filter(
         rules,
         &(not is_nil(&1.remedy) and not escaping_static_producer?(&1))
       )
 
-    Enum.each(remedy_rules, fn rule ->
-      walk_producer_chain!(rule, rule, remedy_rules, [rule.name])
-    end)
+    walk_producer_chain!(rule, rule, remedy_rules, [rule.name])
   end
 
   defp escaping_static_producer?(%{external_producer: true}), do: true
@@ -2431,7 +2429,13 @@ defmodule Tightbeam.Rules do
   defp compute_fact("org.live_sessions_owned_by_caller", db, call, cache) do
     with_dependency("caller.user", db, call, cache, fn
       nil, cache -> {nil, cache}
-      user, cache -> {length(Org.list_for_user(db, user, false)), cache}
+      user, cache ->
+        {:ok, [[count]]} =
+          DB.query(db, "SELECT COUNT(*) FROM sessions WHERE ownerUserId=?1 AND state='active'", [
+            user
+          ])
+
+        {count, cache}
     end)
   end
 
