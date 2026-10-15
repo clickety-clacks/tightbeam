@@ -407,7 +407,9 @@ defmodule Tightbeam.WorkspaceCleanupTest do
         if :atomics.add_get(attempts, 1, 1) == 1 do
           """
           cp() {
-            command cp "$@" || return $?
+            # macOS sh can exec `command cp` here and skip the rest of this function.
+            /bin/cp "$@" || return $?
+            printf 'interrupting archive copy\\n'
             # Replace the background function with a process that really dies by signal.
             exec sh -c 'kill -TERM "$$"'
           }
@@ -425,10 +427,12 @@ defmodule Tightbeam.WorkspaceCleanupTest do
 
     config = Map.put(ctx.config, :workspace_cleanup_runner, runner)
 
-    assert %{status: "incomplete"} =
+    assert %{status: "incomplete", blockers: blockers} =
              WorkspaceCleanup.process_session(config, ctx.db, ctx.session.session_key)
 
-    assert_receive {:copy_result, {_output, status}}
+    assert Enum.any?(blockers, &(&1.reason == "archive_move_failed"))
+    assert_receive {:copy_result, {output, status}}
+    assert output =~ "interrupting archive copy"
     assert status != 0
     assert File.read!(kept) == "preserve through a failed copy"
     assert Artifacts.get(ctx.db, artifact.artifact_id).state == "in-workspace"
