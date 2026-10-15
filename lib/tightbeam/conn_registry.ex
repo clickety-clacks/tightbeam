@@ -226,7 +226,14 @@ defmodule Tightbeam.ConnRegistry do
     {timestamps, _expires} = Map.get(state.rate_windows, key, {[], now})
     recent = Enum.filter(timestamps, &(&1 > now - window_ms))
     allowed = length(recent) < limit
-    windows = Map.put(state.rate_windows, key, {if(allowed, do: [now | recent], else: recent), now + window_ms})
+
+    windows =
+      Map.put(
+        state.rate_windows,
+        key,
+        {if(allowed, do: [now | recent], else: recent), now + window_ms}
+      )
+
     {:reply, allowed, %{state | rate_windows: windows}}
   end
 
@@ -259,13 +266,17 @@ defmodule Tightbeam.ConnRegistry do
 
   def handle_info(:expire_rate_windows, state) do
     now = System.monotonic_time(:millisecond)
-    windows = Map.reject(state.rate_windows, fn {_key, {_timestamps, expires}} -> expires <= now end)
+
+    windows =
+      Map.reject(state.rate_windows, fn {_key, {_timestamps, expires}} -> expires <= now end)
+
     Process.send_after(self(), :expire_rate_windows, 60_000)
     {:noreply, %{state | rate_windows: windows}}
   end
 
   defp demonitor(%{monitor: monitor}) when is_reference(monitor),
     do: Process.demonitor(monitor, [:flush])
+
   defp demonitor(_), do: :ok
 
   defp maybe_drop(conns, nil), do: conns

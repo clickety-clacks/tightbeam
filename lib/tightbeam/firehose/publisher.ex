@@ -59,7 +59,11 @@ defmodule Tightbeam.Firehose.Publisher do
   @doc "Queue accepted notices on the transaction that committed their state."
   @spec accepted_in_txn(Txn.t(), map(), term()) :: :ok
   def accepted_in_txn(%Txn{} = txn, call, result) do
-    Txn.handoff(txn, Hub.destination(hub(call)), {:accepted, nil, call, canonical_in_txn(txn, call, result)})
+    Txn.handoff(
+      txn,
+      Hub.destination(hub(call)),
+      {:accepted, nil, call, canonical_in_txn(txn, call, result)}
+    )
   end
 
   defp canonical_in_txn(txn, %{verb: verb} = call, result)
@@ -90,7 +94,11 @@ defmodule Tightbeam.Firehose.Publisher do
 
   @spec observed_accepted_in_txn(Txn.t(), map()) :: :ok
   def observed_accepted_in_txn(%Txn{} = txn, call) do
-    Txn.handoff(txn, Hub.destination(hub(call)), {:publish, observation_notice("verb.accepted", call)})
+    Txn.handoff(
+      txn,
+      Hub.destination(hub(call)),
+      {:publish, observation_notice("verb.accepted", call)}
+    )
   end
 
   @spec maybe_observed_accepted_in_txn(Txn.t(), map()) :: :ok

@@ -23,7 +23,11 @@ defmodule Tightbeam.Firehose.Hub do
               overflowed: false
   end
 
-  defstruct sockets: %{}, ingress: nil, queue_limit: 1_000, shutting_down: false, shutdown_waiter: nil
+  defstruct sockets: %{},
+            ingress: nil,
+            queue_limit: 1_000,
+            shutting_down: false,
+            shutdown_waiter: nil
 
   @ingress_count 1_000
   @ingress_bytes 8 * 1024 * 1024
@@ -32,7 +36,7 @@ defmodule Tightbeam.Firehose.Hub do
   # reserves space before sending anything to the hub's mailbox.
   def destination(server), do: {:via, __MODULE__, server}
 
-  def send(server, {:'$gen_cast', message}) do
+  def send(server, {:"$gen_cast", message}) do
     ingress(server, message)
   end
 
@@ -46,17 +50,24 @@ defmodule Tightbeam.Firehose.Hub do
           {:ok, table} ->
             bytes = :erlang.external_size(message)
             [count, total] = :ets.update_counter(table, :ingress, [{2, 1}, {3, bytes}])
+
             if count <= @ingress_count and total <= @ingress_bytes do
               GenServer.cast(pid, {:ingress, bytes, message})
             else
               :ets.update_counter(table, :ingress, [{2, -1}, {3, -bytes}])
-              if :ets.insert_new(table, {:overflow, true}), do: GenServer.cast(pid, :ingress_overflow)
+
+              if :ets.insert_new(table, {:overflow, true}),
+                do: GenServer.cast(pid, :ingress_overflow)
             end
+
           :error ->
             GenServer.cast(pid, message)
         end
-      _ -> :ok
+
+      _ ->
+        :ok
     end
+
     :ok
   rescue
     ArgumentError -> :ok
@@ -99,6 +110,7 @@ defmodule Tightbeam.Firehose.Hub do
     Process.put(:firehose_ingress, table)
     {:ok, %__MODULE__{ingress: table, queue_limit: Keyword.get(opts, :queue_limit, 1_000)}}
   end
+
   @impl true
   def handle_call({:register, pid, opts}, _from, state) do
     if state.shutting_down do
@@ -166,10 +178,13 @@ defmodule Tightbeam.Firehose.Hub do
 
   def handle_cast(:ingress_overflow, state) do
     :ets.delete(state.ingress, :overflow)
-    sockets = Map.new(state.sockets, fn {pid, socket} ->
-      if not socket.overflowed, do: Kernel.send(pid, :firehose_overflow)
-      {pid, %{socket | queue: :queue.new(), queued: 0, overflowed: true}}
-    end)
+
+    sockets =
+      Map.new(state.sockets, fn {pid, socket} ->
+        if not socket.overflowed, do: Kernel.send(pid, :firehose_overflow)
+        {pid, %{socket | queue: :queue.new(), queued: 0, overflowed: true}}
+      end)
+
     {:noreply, %{state | sockets: sockets}}
   end
 
@@ -213,7 +228,10 @@ defmodule Tightbeam.Firehose.Hub do
   end
 
   defp deliver_visible_notice(socket, pid, notice, limit) do
-    frames = if socket.mode == :all, do: [notice], else: matching_frames(notice, socket.subscriptions, socket.seq)
+    frames =
+      if socket.mode == :all,
+        do: [notice],
+        else: matching_frames(notice, socket.subscriptions, socket.seq)
 
     if frames != [] and not secret_payload?(notice["payload"]) and visible?(socket, notice) do
       seq = if socket.mode == :all, do: socket.seq, else: List.last(frames)["seq"]
@@ -254,13 +272,23 @@ defmodule Tightbeam.Firehose.Hub do
   end
 
   defp matching_frames(notice, subscriptions, seq) do
-    {frames, _seq} = Enum.sort(subscriptions)
-    |> Enum.reduce({[], seq}, fn {id, filters}, {frames, n} ->
-      if matches?(notice, filters),
-        do: {[Map.merge(notice, %{"type" => "change", "schemaVersion" => 2,
-          "subscriptionId" => id, "seq" => n + 1}) | frames], n + 1},
-        else: {frames, n}
-    end)
+    {frames, _seq} =
+      Enum.sort(subscriptions)
+      |> Enum.reduce({[], seq}, fn {id, filters}, {frames, n} ->
+        if matches?(notice, filters),
+          do:
+            {[
+               Map.merge(notice, %{
+                 "type" => "change",
+                 "schemaVersion" => 2,
+                 "subscriptionId" => id,
+                 "seq" => n + 1
+               })
+               | frames
+             ], n + 1},
+          else: {frames, n}
+      end)
+
     Enum.reverse(frames)
   end
 

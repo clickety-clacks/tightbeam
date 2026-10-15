@@ -425,22 +425,53 @@ defmodule Tightbeam.Wire.SocketTest do
   end
 
   test "replay shares one message budget across hundreds of sessions and resumes", ctx do
-    {:paired, device} = Devices.pair(ctx.db, %{device_id: "paged", claimed_name: "Reader", platform: nil, model: nil})
+    {:paired, device} =
+      Devices.pair(ctx.db, %{
+        device_id: "paged",
+        claimed_name: "Reader",
+        platform: nil,
+        model: nil
+      })
+
     for n <- 1..260 do
       key = "paged-#{n}"
-      Org.create(ctx.db, %{session_key: key, display_name: key, kind: "custom", owner_user_id: device.user_id,
-        origin: "user:#{device.user_id}", archetype: "default", host: "testhost", harness: "claude", provider: "anthropic", model: Model.new("fable")})
-      for m <- 1..3, do: Projection.append(ctx.db, %{session_key: key, role: "assistant", content: "#{n}-#{m}"})
+
+      Org.create(ctx.db, %{
+        session_key: key,
+        display_name: key,
+        kind: "custom",
+        owner_user_id: device.user_id,
+        origin: "user:#{device.user_id}",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+
+      for m <- 1..3,
+          do:
+            Projection.append(ctx.db, %{session_key: key, role: "assistant", content: "#{n}-#{m}"})
     end
+
     {:ok, state} = Socket.init(ctx.deps)
     auth = %{"type" => "auth", "token" => device.token, "deviceId" => device.device_id}
     {:push, frames, replaying} = Socket.handle_in({JSON.encode!(auth), opcode: :text}, state)
-    [result, _snapshot | messages] = Enum.map(frames, fn {:text, frame} -> JSON.decode!(frame) end)
+
+    [result, _snapshot | messages] =
+      Enum.map(frames, fn {:text, frame} -> JSON.decode!(frame) end)
+
     assert result["replayTruncated"]
     assert length(messages) == 500
     cursors = Map.new(messages, &{&1["sessionKey"], &1["id"]})
     {:push, _, live} = Socket.handle_info(:finish_replay, replaying)
-    {:push, next, _} = Socket.handle_in({JSON.encode!(Map.put(auth, "replayCursorsBySessionKey", cursors)), opcode: :text}, live)
+
+    {:push, next, _} =
+      Socket.handle_in(
+        {JSON.encode!(Map.put(auth, "replayCursorsBySessionKey", cursors)), opcode: :text},
+        live
+      )
+
     [result, _snapshot | remainder] = Enum.map(next, fn {:text, frame} -> JSON.decode!(frame) end)
     refute result["replayTruncated"]
     assert length(remainder) == 280
@@ -448,21 +479,58 @@ defmodule Tightbeam.Wire.SocketTest do
   end
 
   test "replay byte budget leaves the next message available through its cursor", ctx do
-    {:paired, device} = Devices.pair(ctx.db, %{device_id: "byte-page", claimed_name: "Reader", platform: nil, model: nil})
+    {:paired, device} =
+      Devices.pair(ctx.db, %{
+        device_id: "byte-page",
+        claimed_name: "Reader",
+        platform: nil,
+        model: nil
+      })
+
     key = Org.personal_session_key(device.user_id)
-    Org.create(ctx.db, %{session_key: key, display_name: "Main", kind: "main", is_built_in: true,
-      owner_user_id: device.user_id, origin: "user:#{device.user_id}", archetype: "default", host: "testhost", harness: "claude", provider: "anthropic", model: Model.new("fable")})
-    for _ <- 1..80, do: Projection.append(ctx.db, %{session_key: key, role: "assistant", content: String.duplicate("x", 65_536)})
+
+    Org.create(ctx.db, %{
+      session_key: key,
+      display_name: "Main",
+      kind: "main",
+      is_built_in: true,
+      owner_user_id: device.user_id,
+      origin: "user:#{device.user_id}",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("fable")
+    })
+
+    for _ <- 1..80,
+        do:
+          Projection.append(ctx.db, %{
+            session_key: key,
+            role: "assistant",
+            content: String.duplicate("x", 65_536)
+          })
+
     {:ok, state} = Socket.init(ctx.deps)
     auth = %{"type" => "auth", "token" => device.token, "deviceId" => device.device_id}
     {:push, frames, replaying} = Socket.handle_in({JSON.encode!(auth), opcode: :text}, state)
     [_, _ | messages] = frames
-    assert Enum.sum(Enum.map(messages, fn {:text, frame} -> byte_size(frame) end)) <= 4 * 1024 * 1024
+
+    assert Enum.sum(Enum.map(messages, fn {:text, frame} -> byte_size(frame) end)) <=
+             4 * 1024 * 1024
+
     assert length(messages) < 80
     {:text, last} = List.last(messages)
     cursor = JSON.decode!(last)["id"]
     {:push, _, live} = Socket.handle_info(:finish_replay, replaying)
-    {:push, next, _} = Socket.handle_in({JSON.encode!(Map.put(auth, "replayCursorsBySessionKey", %{key => cursor})), opcode: :text}, live)
+
+    {:push, next, _} =
+      Socket.handle_in(
+        {JSON.encode!(Map.put(auth, "replayCursorsBySessionKey", %{key => cursor})),
+         opcode: :text},
+        live
+      )
+
     assert length(messages) + length(next) - 2 == 80
   end
 

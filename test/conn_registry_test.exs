@@ -12,20 +12,37 @@ defmodule Tightbeam.ConnRegistryTest do
   end
 
   test "socket death removes its registration without unregister", %{reg: reg} do
-    pid = spawn(fn -> receive do :stop -> :ok end end)
-    {:ok, ref, _} = ConnRegistry.register(reg, %{pid: pid, user_id: "owner",
-      device_id: "dead-socket", is_admin: false, subscriptions: MapSet.new(["chat"])})
+    pid =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    {:ok, ref, _} =
+      ConnRegistry.register(reg, %{
+        pid: pid,
+        user_id: "owner",
+        device_id: "dead-socket",
+        is_admin: false,
+        subscriptions: MapSet.new(["chat"])
+      })
+
     assert is_reference(:sys.get_state(reg).conns[ref].monitor)
     Process.exit(pid, :kill)
-    state = Enum.reduce_while(1..100, nil, fn _, _ ->
-      state = :sys.get_state(reg)
-      if Map.has_key?(state.conns, ref) do
-        Process.sleep(1)
-        {:cont, state}
-      else
-        {:halt, state}
-      end
-    end)
+
+    state =
+      Enum.reduce_while(1..100, nil, fn _, _ ->
+        state = :sys.get_state(reg)
+
+        if Map.has_key?(state.conns, ref) do
+          Process.sleep(1)
+          {:cont, state}
+        else
+          {:halt, state}
+        end
+      end)
+
     refute Map.has_key?(state.conns, ref)
     refute Map.has_key?(state.devices, "dead-socket")
   end

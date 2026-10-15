@@ -42,10 +42,20 @@ defmodule Tightbeam.Wire.RouterTest do
   test "unknown keys cannot create atoms or borrow another verb's parameters" do
     key = "unrecognized_wire_key_#{System.unique_integer([:positive])}"
     assert_raise ArgumentError, fn -> String.to_existing_atom(key) end
-    assert Router.atomize_params_for_test("wake", %{key => true, "prompt" => "hello", "artifactId" => "a"}) == %{prompt: "hello"}
+
+    assert Router.atomize_params_for_test("wake", %{
+             key => true,
+             "prompt" => "hello",
+             "artifactId" => "a"
+           }) == %{prompt: "hello"}
+
     assert_raise ArgumentError, fn -> String.to_existing_atom(key) end
     assert Router.atomize_params_for_test("unknown-verb", %{"prompt" => "hello"}) == %{}
-    assert Router.atomize_params_for_test("tune", %{"fastMode" => "on", "reasoningLevel" => "high"}) == %{fastMode: "on", reasoningLevel: "high"}
+
+    assert Router.atomize_params_for_test("tune", %{
+             "fastMode" => "on",
+             "reasoningLevel" => "high"
+           }) == %{fastMode: "on", reasoningLevel: "high"}
   end
 
   test "changes route refuses missing upgrade or unsupported protocol before authentication" do

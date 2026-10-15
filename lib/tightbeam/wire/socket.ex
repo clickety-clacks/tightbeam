@@ -332,21 +332,32 @@ defmodule Tightbeam.Wire.Socket do
 
     {reversed, truncated?, replayed_seqs, _bytes, _count} =
       Enum.reduce_while(sessions, {[], false, MapSet.new(), 0, 0}, fn session,
-                                                                                {messages, _, sent, bytes, count} ->
+                                                                      {messages, _, sent, bytes,
+                                                                       count} ->
         key = session.session_key
-        rows = Projection.list_after(db(state), key, cursors[key], 501 - count,
-          session.cleared_through_seq || 0)
 
-        page = Enum.reduce_while(rows, {messages, false, sent, bytes, count}, fn row,
-                                                                                 {acc, _, seen, size, n} ->
-          row_bytes = byte_size(JSON.encode!(Payloads.server_message(row)))
+        rows =
+          Projection.list_after(
+            db(state),
+            key,
+            cursors[key],
+            501 - count,
+            session.cleared_through_seq || 0
+          )
 
-          if n == 500 or size + row_bytes > 4 * 1024 * 1024 do
-            {:halt, {acc, true, seen, size, n}}
-          else
-            {:cont, {[row | acc], false, MapSet.put(seen, {key, row.seq}), size + row_bytes, n + 1}}
-          end
-        end)
+        page =
+          Enum.reduce_while(rows, {messages, false, sent, bytes, count}, fn row,
+                                                                            {acc, _, seen, size,
+                                                                             n} ->
+            row_bytes = byte_size(JSON.encode!(Payloads.server_message(row)))
+
+            if n == 500 or size + row_bytes > 4 * 1024 * 1024 do
+              {:halt, {acc, true, seen, size, n}}
+            else
+              {:cont,
+               {[row | acc], false, MapSet.put(seen, {key, row.seq}), size + row_bytes, n + 1}}
+            end
+          end)
 
         if elem(page, 1), do: {:halt, page}, else: {:cont, page}
       end)
