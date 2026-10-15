@@ -911,8 +911,8 @@ defmodule Tightbeam.WorkItemsTest do
     refute get_payload =~ "bodyUpdatedByUser"
     refute get_payload =~ "bodyUpdatedBySession"
     refute get_payload =~ "bodyUpdatedAt"
-    assert get_payload =~ "bodyRead"
-    assert get_payload =~ descriptor.sha256
+    # Read audits now retain only identity and verb, without result descriptors.
+    assert get_payload == "null"
   end
 
   test "body updates remain serialized under concurrent writers", ctx do

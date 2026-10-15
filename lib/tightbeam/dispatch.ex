@@ -390,7 +390,12 @@ defmodule Tightbeam.Dispatch do
     end
   end
 
-  defp audit_payload(verb, call, outcome), do: outcome_payload(verb, call, outcome)
+  defp audit_payload(verb, call, outcome) do
+    if is_integer(Process.get(:tightbeam_dispatch_audited)) or verb == "onboard" or
+         Publisher.transactional_verb?(verb),
+       do: outcome_payload(verb, call, outcome),
+       else: nil
+  end
 
   defp invoke_with_audit(handler, call) do
     previous =
@@ -422,10 +427,9 @@ defmodule Tightbeam.Dispatch do
   defp append_event_with_handoff(db, kind, verb, origin, session_key, payload, principal, handoff) do
     audited = Process.delete(:tightbeam_dispatch_audited)
 
-    # Read verbs audit identity and verb only. A body read keeps its own
-    # content-free descriptor (digest and size), which is its access trail.
+    # Successful reads audit identity and verb only, including body reads.
     payload =
-      if kind == "verb" and verb in ~w(transcript breathing) and
+      if kind == "verb" and verb in ~w(transcript breathing work-item-get) and
            not match?(%{crash: true}, payload),
          do: nil,
          else: payload

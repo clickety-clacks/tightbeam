@@ -192,6 +192,7 @@ defmodule Tightbeam.ResponseObservationAdapterTest do
     end
   end
 
+  # Expired owner requests must be dropped rather than applying a late mutation.
   test "a timeout response completes once and the expired mutation is dropped", %{
     port: port,
     db: db
@@ -401,6 +402,7 @@ defmodule Tightbeam.ResponseObservationAdapterTest do
 
   for order <- [:send_failure_first, :late_completion_first] do
     @order order
+    # Deadline expiry prevents the mutation in either response-failure ordering.
     test "timeout response failure and the expired mutation retain independent facts: #{@order}",
          %{
            port: port,
