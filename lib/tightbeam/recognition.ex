@@ -24,10 +24,35 @@ defmodule Tightbeam.Recognition do
   """
   @max_attempts 5
 
-  def ensure_schema(conn), do: Exqlite.Sqlite3.execute(conn, @ddl)
-  def start_link(owner), do: GenServer.start_link(__MODULE__, owner)
+  def ensure_sqlite_schema(conn), do: Exqlite.Sqlite3.execute(conn, @ddl)
 
-  def record(txn, callback, result, transitions, opts) do
+  def ensure_schema(db) do
+    :ok = DB.execute(db, @ddl)
+
+    case DB.query(db, "SELECT version FROM pending_recognition WHERE version<>1 LIMIT 1") do
+      {:ok, []} ->
+        :ok
+
+      {:ok, [[version]]} ->
+        raise DB.Error, message: "unknown pending recognition version #{inspect(version)}"
+
+      {:error, error} ->
+        raise error
+    end
+  end
+
+  def start_link(owner, ready \\ true), do: GenServer.start_link(__MODULE__, {owner, ready})
+
+  def activate(%DB.Migration{server: db}), do: activate(db)
+
+  def activate(db) do
+    GenServer.cast(worker(db), :activate)
+    :ok
+  end
+
+  defp worker(db), do: :persistent_term.get({__MODULE__, GenServer.whereis(db)}, nil)
+
+  def record(txn, callback, result, transitions, opts, caller) do
     id = Tightbeam.Id.uuid4()
     module = callback |> :erlang.fun_info(:module) |> elem(1)
 
@@ -40,23 +65,28 @@ defmodule Tightbeam.Recognition do
     Txn.q(txn, "INSERT INTO pending_recognition(id,version,payload,nextAt) VALUES(?1,1,?2,?3)", [
       id,
       {:blob, payload},
-      now() + DB.call_timeout() + 1_000
+      now() + 1_000
     ])
 
+    Txn.handoff(txn, worker(self()), {:active, id, caller})
     %Pending{id: id, result: result, transitions: transitions}
   end
 
   def inline(db, pending, callback, opts) do
-    case invoke(db, pending, callback) do
-      {:ok, result} ->
-        if is_function(callback, 1), do: finish(db, pending.id)
-        {:ok, result}
+    try do
+      case invoke(db, pending, callback) do
+        {:ok, result} ->
+          if is_function(callback, 1), do: finish(db, pending.id)
+          {:ok, result}
 
-      {:error, _} ->
-        Logger.error("post-commit recognition failed; returning committed result")
-        # No failure bookkeeping is needed here: the primary commit already
-        # contains the retry row, including a bounded first retry time.
-        {:ok, Keyword.get(opts, :fallback, &Function.identity/1).(pending.result)}
+        {:error, _} ->
+          Logger.error("post-commit recognition failed; returning committed result")
+          # No failure bookkeeping is needed here: the primary commit already
+          # contains the retry row, including a bounded first retry time.
+          {:ok, Keyword.get(opts, :fallback, &Function.identity/1).(pending.result)}
+      end
+    after
+      if retry = worker(db), do: GenServer.cast(retry, {:release, pending.id})
     end
   end
 
@@ -108,34 +138,74 @@ defmodule Tightbeam.Recognition do
   end
 
   @impl true
-  def init(owner) do
+  def init({owner, ready}) do
     Process.monitor(owner)
-    Process.send_after(self(), :retry, 1_000)
-    {:ok, owner}
+    :persistent_term.put({__MODULE__, owner}, self())
+    if ready, do: Process.send_after(self(), :retry, 1_000)
+    {:ok, %{db: owner, ready: ready, active: %{}}}
   end
 
   @impl true
-  def handle_info({:DOWN, _, :process, owner, _}, owner), do: {:stop, :normal, owner}
+  def handle_cast(:activate, %{ready: false} = state) do
+    Process.send_after(self(), :retry, 1_000)
+    {:noreply, %{state | ready: true}}
+  end
 
-  def handle_info(:retry, db) do
-    case safely(fn -> DB.background_pass(fn -> retry_pass(db) end) end) do
+  def handle_cast(:activate, state), do: {:noreply, state}
+
+  def handle_cast({:active, id, caller}, state) do
+    {:noreply, %{state | active: Map.put(state.active, id, Process.monitor(caller))}}
+  end
+
+  def handle_cast({:release, id}, state) do
+    if monitor = state.active[id], do: Process.demonitor(monitor, [:flush])
+    {:noreply, %{state | active: Map.delete(state.active, id)}}
+  end
+
+  @impl true
+  def handle_info({:DOWN, _, :process, owner, _}, %{db: owner} = state),
+    do: {:stop, :normal, state}
+
+  def handle_info({:DOWN, monitor, :process, _, _}, state),
+    do: {:noreply, %{state | active: Map.reject(state.active, fn {_, ref} -> ref == monitor end)}}
+
+  def handle_info(:retry, state) do
+    case safely(fn -> DB.background_pass(fn -> retry_pass(state) end) end) do
       {:error, _} -> Logger.error("pending recognition scan failed; retrying next tick")
       _ -> :ok
     end
 
     Process.send_after(self(), :retry, 1_000)
-    {:noreply, db}
+    {:noreply, state}
   end
 
-  defp retry_pass(db) do
+  @impl true
+  def terminate(_, %{db: db}) do
+    if :persistent_term.get({__MODULE__, db}, nil) == self(),
+      do: :persistent_term.erase({__MODULE__, db})
+  end
+
+  defp retry_pass(%{db: db, active: active}) do
     case DB.query(
            db,
            "SELECT id,payload,attempts FROM pending_recognition WHERE flagged=0 AND nextAt<=?1 ORDER BY nextAt LIMIT 1",
            [now()]
          ) do
-      {:ok, [[id, payload, attempts]]} -> retry_one(db, id, payload, attempts)
-      {:ok, []} -> :ok
-      {:error, error} -> raise error
+      {:ok, [[id, payload, attempts]]} ->
+        if Map.has_key?(active, id) do
+          DB.transaction(
+            db,
+            &Txn.q(&1, "UPDATE pending_recognition SET nextAt=?2 WHERE id=?1", [id, now() + 1_000])
+          )
+        else
+          retry_one(db, id, payload, attempts)
+        end
+
+      {:ok, []} ->
+        :ok
+
+      {:error, error} ->
+        raise error
     end
   end
 

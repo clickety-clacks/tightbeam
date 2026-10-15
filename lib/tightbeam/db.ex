@@ -575,8 +575,8 @@ defmodule Tightbeam.DB do
       end
 
       :ok = load_topline_unicode(conn)
-      :ok = Tightbeam.Recognition.ensure_schema(conn)
-      {:ok, retry} = Tightbeam.Recognition.start_link(self())
+      if path == ":memory:", do: :ok = Tightbeam.Recognition.ensure_sqlite_schema(conn)
+      {:ok, retry} = Tightbeam.Recognition.start_link(self(), path == ":memory:")
       readers = open_readers(path)
       :persistent_term.put({__MODULE__, self()}, readers)
 
@@ -840,7 +840,7 @@ defmodule Tightbeam.DB do
 
   def handle_call(
         {:transaction_then, prepare, after_commit, opts},
-        _from,
+        {caller, _},
         %{conn: conn} = state
       )
       when is_function(after_commit) do
@@ -854,7 +854,7 @@ defmodule Tightbeam.DB do
             fn txn ->
               result = callback.(txn)
               transitions = take_row_commits(txn)
-              Tightbeam.Recognition.record(txn, after_commit, result, transitions, opts)
+              Tightbeam.Recognition.record(txn, after_commit, result, transitions, opts, caller)
             end,
             fenced_archetypes(state)
           )

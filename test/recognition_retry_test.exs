@@ -129,6 +129,26 @@ defmodule Tightbeam.RecognitionRetryTest do
     assert {:ok, [[0]]} = DB.query(db, "SELECT flagged FROM pending_recognition")
   end
 
+  test "the retry worker never overlaps an active inline publication", %{db: db, retry: retry} do
+    parent = self()
+
+    caller =
+      Task.async(fn ->
+        DB.transaction_then(db, fn _ -> :committed end, fn _ ->
+          send(parent, {:publication, self()})
+          receive do: (:release -> :published)
+        end)
+      end)
+
+    assert_receive {:publication, pid}
+    assert pid == caller.pid
+    retry_now(db, retry)
+    refute_receive {:publication, _}, 30
+    send(caller.pid, :release)
+    assert {:ok, :published} = Task.await(caller)
+    assert {:ok, []} = DB.query(db, "SELECT id FROM pending_recognition")
+  end
+
   defp retry_now(db, retry) do
     :ok = DB.execute(db, "UPDATE pending_recognition SET nextAt=0 WHERE flagged=0")
     send(retry, :retry)

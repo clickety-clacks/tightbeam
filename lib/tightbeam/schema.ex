@@ -1719,8 +1719,10 @@ defmodule Tightbeam.Schema do
     :ok = migrate_continuation_retry_guard(db)
     :ok = upgrade_decision_request_row_schema_revision(db)
 
+    :ok = Tightbeam.Recognition.ensure_schema(db)
+
     case DB.finish_schema(db) do
-      :ok -> :ok
+      :ok -> Tightbeam.Recognition.activate(db)
       {:error, error} -> raise error
     end
   end
