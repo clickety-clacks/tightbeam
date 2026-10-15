@@ -88,6 +88,12 @@ defmodule Tightbeam.BootRecordIsolationTest do
              StateResources.identity_snapshot(db, base)
 
     assert :ok = AdminProjection.bootstrap_served(db, base)
+    Org.create(db, %{session_key: "other", display_name: "Other", owner_user_id: "owner",
+      origin: "user:owner", archetype: "default", harness: "claude", provider: "anthropic",
+      host: Placement.local_host_name(), model: Model.new("test-model")})
+    assert capture_log(fn ->
+      assert [%{session_key: "other"}] = Org.list_for_user(db, "owner", false)
+    end) =~ "healthy"
   end
 
   test "orphan toolchain rows leave healthy host placement available", %{db: db, base: base} do

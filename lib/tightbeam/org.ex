@@ -613,7 +613,16 @@ defmodule Tightbeam.Org do
     {:ok, rows} =
       DB.query(db, select_session_sql() <> " WHERE #{where} ORDER BY #{order}", params)
 
-    Enum.map(rows, &to_session/1)
+    Enum.flat_map(rows, fn row ->
+      try do
+        [to_session(row)]
+      rescue
+        error in JSON.DecodeError ->
+          require Logger
+          Logger.warning("session #{hd(row)} unavailable: invalid overrides: #{Exception.message(error)}")
+          []
+      end
+    end)
   end
 
   @doc "Return one bounded owner-only active-session page in the existing UI order."
