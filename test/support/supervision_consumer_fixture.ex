@@ -674,10 +674,12 @@ defmodule Tightbeam.SupervisionConsumerFixture do
     registry = start_supervised!({ConnRegistry, name: :atomic_fire_registry})
 
     lane =
-      start_supervised!(
-        {RaceLane,
-         {:atomic_fire_lane,
-          fn "holder" ->
+      start_supervised!({RaceLane,
+       {:atomic_fire_lane,
+        fn "holder" ->
+          # Immediate successor delivery is another nudge, not the first prod.
+          unless Process.get(:atomic_fire_consumed, false) do
+            Process.put(:atomic_fire_consumed, true)
             state_at_nudge = Wakes.get(ctx.db, originating.wake_id).state
             turn = consume.("holder")
 
@@ -694,8 +696,8 @@ defmodule Tightbeam.SupervisionConsumerFixture do
 
             result = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", turn.seq)
             send(parent, {:race_result, state_at_nudge, result})
-          end}}
-      )
+          end
+        end}})
 
     scheduler =
       start_supervised!(
@@ -711,9 +713,24 @@ defmodule Tightbeam.SupervisionConsumerFixture do
     assert_receive {:race_result, "fired", {:prodded, 2}}
     assert Wakes.get(ctx.db, originating.wake_id).state == "fired"
 
-    assert [%{prompt: next_prompt, digest: false}] =
-             Wakes.list_pending(ctx.db)
-             |> Enum.filter(&(&1.assignment_id == "asg_1" and not &1.digest))
+    # The next due prod now follows its commit notification immediately.
+    assert :ok = Wakes.fire_due(scheduler)
+
+    assert {:ok, [[next_id, next_prompt, "fired"]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT wakeId,prompt,state FROM wakes
+               WHERE assignmentId='asg_1' AND digest=0 AND wakeId<>?1
+               """,
+               [originating.wake_id]
+             )
+
+    assert [%{delivery_wake_id: next_carrier, batch_state: "delivered"}] =
+             NoticeBatcher.source_refs(ctx.db, next_id)
+
+    assert {:ok, [["queued"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns WHERE wakeId=?1", [next_carrier])
 
     assert next_prompt =~ "prod 2 of 2"
   end

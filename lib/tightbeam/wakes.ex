@@ -6427,6 +6427,9 @@ defmodule Tightbeam.Wakes do
   end
 
   def handle_info(:recover_notices, state) do
+    # Recognize overdue conditions before recovery forms a carrier. Otherwise
+    # a timed source can occupy the recipient ahead of its due condition peers.
+    DB.background_pass(fn -> evaluate_conditions(state, :tick) end)
     # Release pre-crash, unclaimed memberships once. Later drains are driven
     # only by recipient readiness and due events.
     NoticeBatcher.recover(state.db, now(), state.delivery_opts)
