@@ -4790,10 +4790,7 @@ defmodule Tightbeam.Schema do
 
              [[@firehose_shape]] ->
                previous_fk_violations =
-                 Tightbeam.Schema.migration_foreign_keys_in_txn(
-                   txn,
-                   ~w(sessions session_reparent_events)
-                 )
+                 []
 
                :ok = Tightbeam.SessionReparent.migrate_in_txn(txn)
                :ok = Tightbeam.Idempotency.migrate_reparent_in_txn(txn)
@@ -4816,10 +4813,7 @@ defmodule Tightbeam.Schema do
                  do: raise(ShapeError, message: "session reparent stamp race")
 
                [] =
-                 Tightbeam.Schema.migration_foreign_keys_in_txn(
-                   txn,
-                   ~w(sessions session_reparent_events)
-                 ) -- previous_fk_violations
+                 Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(session_reparent_events)) -- previous_fk_violations
 
                :ok
 
@@ -4871,10 +4865,7 @@ defmodule Tightbeam.Schema do
 
              [[@reparent_shape]] ->
                previous_fk_violations =
-                 Tightbeam.Schema.migration_foreign_keys_in_txn(
-                   txn,
-                   ~w(artifacts artifact_contents)
-                 )
+                 []
 
                existing =
                  Txn.q(
@@ -4907,16 +4898,10 @@ defmodule Tightbeam.Schema do
                # Scoped: the argument-less form walks the WHOLE database, a real stall
                # inside this transaction on a live 15G state.db for no added coverage.
                [] =
-                 Tightbeam.Schema.migration_foreign_keys_in_txn(
-                   txn,
-                   ~w(artifacts artifact_contents)
-                 ) -- previous_fk_violations
+                 Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(artifact_contents)) -- previous_fk_violations
 
                [] =
-                 Tightbeam.Schema.migration_foreign_keys_in_txn(
-                   txn,
-                   ~w(artifacts artifact_contents)
-                 ) -- previous_fk_violations
+                 Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(artifact_contents)) -- previous_fk_violations
 
                :ok
 
@@ -5180,7 +5165,7 @@ defmodule Tightbeam.Schema do
              previous_fk_violations =
                Tightbeam.Schema.migration_foreign_keys_in_txn(
                  txn,
-                 ~w(supervision_liveness_receipts)
+                 if(activated, do: ~w(supervision_liveness_receipts), else: [])
                )
 
              case Txn.q(txn, "SELECT shape FROM schema_stamp") do
@@ -5252,7 +5237,7 @@ defmodule Tightbeam.Schema do
 
              case Tightbeam.Schema.migration_foreign_keys_in_txn(
                     txn,
-                    ~w(supervision_liveness_receipts)
+                    if(activated, do: ~w(supervision_liveness_receipts), else: [])
                   ) -- previous_fk_violations do
                [] ->
                  :ok
@@ -5862,7 +5847,7 @@ defmodule Tightbeam.Schema do
     previous_fk_violations =
       Tightbeam.Schema.migration_foreign_keys_in_txn(
         txn,
-        ~w(wakes wake_cancellations notice_batch_members)
+        if(liveness?, do: ~w(wakes wake_cancellations), else: ~w(wakes))
       )
 
     [[wake_count]] = Txn.q(txn, "SELECT COUNT(*) FROM wakes")
@@ -6046,7 +6031,7 @@ defmodule Tightbeam.Schema do
 
     case Tightbeam.Schema.migration_foreign_keys_in_txn(
            txn,
-           ~w(wakes wake_cancellations notice_batch_members)
+           if(liveness?, do: ~w(wakes wake_cancellations), else: ~w(wakes))
          ) -- previous_fk_violations do
       [] ->
         :ok

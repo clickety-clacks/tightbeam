@@ -163,7 +163,7 @@ defmodule Tightbeam.Rails do
     statutes =
       if duplicate do
         require Logger
-        Logger.warning("duplicate statute #{duplicate} unavailable; affected tools remain closed")
+        Logger.warning("duplicate statute name: #{duplicate} unavailable; affected tools remain closed")
 
         Enum.map(statutes, fn statute ->
           if Enum.count(statutes, &(&1.name == statute.name)) > 1,
