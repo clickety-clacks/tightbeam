@@ -514,5 +514,4 @@ defmodule Tightbeam.CheckTierTest do
     assert {:deny, %{code: "rule_unavailable"}} =
              Rules.evaluate(ctx.db, call("attest", {:user, "flynn"}, %{}))
   end
-
 end

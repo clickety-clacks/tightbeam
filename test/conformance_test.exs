@@ -403,7 +403,9 @@ defmodule Tightbeam.ConformanceSupport do
       Map.new(Enum.filter(fixtures, &(&1["kind"] == "load-rejection")), &{&1["name"], &1})
 
     Enum.each(@load_twins, fn [unavailable_name, clean_name] ->
-      assert Map.has_key?(loadsets, unavailable_name), "missing load-unavailable twin #{unavailable_name}"
+      assert Map.has_key?(loadsets, unavailable_name),
+             "missing load-unavailable twin #{unavailable_name}"
+
       assert Map.has_key?(loadsets, clean_name), "missing load-clean twin #{clean_name}"
       assert loadsets[unavailable_name]["outcome"] == "load-unavailable"
       assert loadsets[clean_name]["outcome"] == "load-clean"

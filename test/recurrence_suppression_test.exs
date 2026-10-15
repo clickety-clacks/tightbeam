@@ -563,6 +563,7 @@ defmodule Tightbeam.RecurrenceSuppressionTest do
 
     for {contents, message} <- malformed do
       File.write!(Path.join([base, "identity/rules/rule.toml"]), contents)
+
       log =
         ExUnit.CaptureLog.capture_log(fn ->
           assert [] = Rules.load!(base, ["post", "wake"])

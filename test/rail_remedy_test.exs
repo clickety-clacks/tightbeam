@@ -3296,5 +3296,4 @@ defmodule Tightbeam.RailRemedyTest do
 
     %{message: log}
   end
-
 end
