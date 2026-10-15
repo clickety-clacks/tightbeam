@@ -401,30 +401,43 @@ defmodule Tightbeam.SchemaShapeTest do
              DB.query(db, "SELECT eventId FROM work_item_delivery_scope_events")
   end
 
-  test "the exact agent-reparent migration refuses stale owner history without changing it", %{
-    db: db
-  } do
+  test "the exact agent-reparent migration preserves a stale owner while migrating a healthy relation",
+       %{
+         db: db
+       } do
     assert :ok = Schema.ensure_all(db)
     assert :ok = DB.execute(db, @owner_link_history_ddl)
     seed_owner_link_history!(db, "stale", "active", false)
+    seed_owner_link_history!(db, "healthy", "active", true)
     rewind_to_agent_reparent!(db)
 
-    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
+    log = ExUnit.CaptureLog.capture_log(fn -> assert :ok = Schema.ensure_all(db) end)
+    assert log =~ "wi_link_stale"
+    assert log =~ "link-agent-stale"
+    assert log =~ "stale"
 
-    assert error.message =~ "wi_link_stale"
-    assert error.message =~ "link-agent-stale"
-    assert error.message =~ "stale"
+    assert {:ok, [[nil]]} =
+             DB.query(
+               db,
+               "SELECT deliveryOwnerSessionKey FROM work_items WHERE id='wi_link_stale'"
+             )
 
-    assert {:ok, [[@identity_publication_denial_diagnostic_shape]]} =
-             DB.query(db, "SELECT shape FROM schema_stamp")
+    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
 
-    refute "deliveryOwnerSessionKey" in table_columns(db, "work_items")
-
-    assert {:ok, [[1, 1]]} =
+    assert {:ok, [[2, 2]]} =
              DB.query(
                db,
                "SELECT (SELECT COUNT(*) FROM work_item_delivery_scope_events), (SELECT COUNT(*) FROM delivery_scope_owner_events)"
              )
+
+    assert {:ok, [["link-agent-healthy"]]} =
+             DB.query(
+               db,
+               "SELECT deliveryOwnerSessionKey FROM work_items WHERE id='wi_link_healthy'"
+             )
+
+    refute ExUnit.CaptureLog.capture_log(fn -> assert :ok = Schema.ensure_all(db) end) =~
+             "owner link-agent-stale unresolved"
   end
 
   test "an unknown predecessor refuses before the owner-link shape is accepted", %{db: db} do
@@ -1661,9 +1674,9 @@ defmodule Tightbeam.SchemaShapeTest do
 
     :ok = DB.execute(db, "DELETE FROM supervision_liveness_epoch")
 
-    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
-    assert error.message =~ "incompatible_supervision_liveness_v1"
-    assert error.message =~ "supervision_liveness_epoch row"
+    assert ExUnit.CaptureLog.capture_log(fn -> assert :ok = Schema.ensure_all(db) end) =~
+             "supervision_liveness_epoch row 0"
+
     assert {:ok, []} = DB.query(db, "SELECT id FROM supervision_liveness_epoch")
   end
 

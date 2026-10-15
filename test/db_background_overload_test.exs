@@ -121,9 +121,9 @@ defmodule Tightbeam.DBBackgroundOverloadTest do
     assert_receive :backfill_wake_delivery, 5_500
   end
 
-  test "supervision sweep skips overload and retains its next tick", %{db: db} do
+  test "supervision consistency check defers overload without losing its state", %{db: db} do
     state = %{db: db, sweep_ms: 3_600_000}
-    assert {:noreply, ^state} = Tightbeam.Supervision.handle_info(:scheduled_sweep, state)
+    assert {:noreply, ^state} = Tightbeam.Supervision.handle_info(:detect_misses, state)
   end
 
   test "terminal classification skips overload without reporting a refused terminal", %{db: db} do

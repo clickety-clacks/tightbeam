@@ -817,6 +817,11 @@ defmodule Tightbeam.NoticeBatcher do
 
     try do
       source = prepared_source_in_txn(txn, wake_id)
+
+      source =
+        if source,
+          do: Map.put(source, :delivery_prompt, Wakes.delivery_prompt_in_txn(txn, wake_id))
+
       :ok = Txn.exec(txn, "RELEASE notice_source_prepare")
       source
     rescue
@@ -852,7 +857,7 @@ defmodule Tightbeam.NoticeBatcher do
           wake.work_item_id || wake.assignment_id || "wake",
           wake.class,
           publication_seq,
-          Wakes.delivery_prompt_in_txn(txn, wake.wake_id)
+          wake.delivery_prompt
         ]
       end)
 

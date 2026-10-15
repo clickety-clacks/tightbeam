@@ -183,7 +183,8 @@ defmodule Tightbeam.Placement do
           Map.put(acc, host, Map.put(host_config, :toolchain_dirs, dirs))
 
         :error ->
-          raise "host toolchain registry contains rows for unknown host: #{host}"
+          Logger.warning("ignoring toolchain directories for unknown host #{host}")
+          acc
       end
     end)
   end

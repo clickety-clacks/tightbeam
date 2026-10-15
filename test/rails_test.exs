@@ -61,9 +61,9 @@ defmodule Tightbeam.RailsTest do
   test "the invariant refusal: remind is not law", ctx do
     write_statute(ctx, %{"mode" => ~s("remind")})
 
-    assert_raise ArgumentError,
-                 ~r/rails never add guidance; put prose in guidance or a skill/,
-                 fn -> Rails.load!(ctx.base_dir) end
+    assert_unavailable(~r/rails never add guidance; put prose in guidance or a skill/, fn ->
+      Rails.load!(ctx.base_dir)
+    end)
   end
 
   test "reserved and malformed statutes fail the boot with named errors", ctx do
@@ -89,8 +89,35 @@ defmodule Tightbeam.RailsTest do
 
     for {overrides, error} <- cases do
       write_statute(ctx, overrides)
-      assert_raise ArgumentError, error, fn -> Rails.load!(ctx.base_dir) end
+      assert_unavailable(error, fn -> Rails.load!(ctx.base_dir) end)
     end
+  end
+
+  test "a malformed statute keeps its tool closed and retains a healthy sibling", ctx do
+    write_statute(ctx, %{"pattern" => :omit})
+    path = Path.join(ctx.rails_dir, "statutes.toml")
+
+    File.write!(
+      path,
+      File.read!(path) <>
+        """
+        [[statute]]
+        name = "healthy-sibling"
+        on = "tool-call"
+        tool = "Read"
+        pattern = "protected"
+        text = "Do not read protected files"
+        """
+    )
+
+    assert ExUnit.CaptureLog.capture_log(fn ->
+             assert [bad, good] = Rails.load!(ctx.base_dir)
+             assert bad.tool == "Bash"
+             assert bad.pattern == ".*"
+             assert good.name == "healthy-sibling"
+             assert good.tool == "Read"
+             assert good.pattern == "protected"
+           end) =~ "no-history-rewrites"
   end
 
   test "an action statute compiles the closed argv classifier", ctx do
@@ -124,9 +151,9 @@ defmodule Tightbeam.RailsTest do
 
     write_statute(ctx, %{}, "b.toml")
 
-    assert_raise ArgumentError, ~r/duplicate statute name: no-history-rewrites/, fn ->
+    assert_unavailable(~r/duplicate statute name: no-history-rewrites/, fn ->
       Rails.load!(ctx.base_dir)
-    end
+    end)
   end
 
   test "hook_settings compiles the byte-pinned PreToolUse entry", ctx do
@@ -214,5 +241,20 @@ defmodule Tightbeam.RailsTest do
     assert moduledoc =~ "codex `agent-full-access` and claude `bypassPermissions`"
     assert moduledoc =~ "DISTINCT from permission bypass"
     assert moduledoc =~ ~s(CODEX_CONFIG={"bypass_hook_trust":true})
+  end
+
+  defp assert_unavailable(expected \\ nil, load) do
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        result = load.()
+        assert is_list(result)
+        assert Enum.all?(result, &(&1.pattern == ".*" and &1.action == nil))
+      end)
+      |> String.trim()
+
+    assert log =~ "unavailable"
+    if is_struct(expected, Regex), do: assert(log =~ expected)
+    if is_binary(expected), do: assert(log =~ expected)
+    %{message: log}
   end
 end

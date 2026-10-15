@@ -99,13 +99,17 @@ defmodule Tightbeam.Artifacts do
          OR createdAt >= #{@maximum_version}
       """)
 
-    if invalid != [], do: raise(ArgumentError, "artifact_version_seed_invalid")
+    Enum.each(invalid, fn [id] ->
+      require Logger
+      Logger.warning("artifact #{id} unresolved: artifact_version_seed_invalid")
+    end)
 
     Txn.q(txn, "CREATE TABLE artifact_version_floors (#{@floor_definition})")
 
     Txn.q(txn, """
     INSERT INTO artifact_version_floors (artifactId, rowVersion)
     SELECT artifactId, createdAt + 1 FROM artifacts
+    WHERE typeof(createdAt) = 'integer' AND createdAt > 0 AND createdAt < #{@maximum_version}
     """)
 
     :ok

@@ -249,7 +249,23 @@ defmodule Tightbeam.Gateway do
     # and before any runtime child can consume wakes or accept traffic. The
     # Supervision child skips its duplicate recovery below.
     :ok = Wakes.activate_wait_recognition(db)
-    :ok = Supervision.recover_liveness!(db, supervision_interval_ms(config))
+
+    {:ok, epoch_rows} =
+      DB.query(db, "SELECT id, activatedAt, cause, principal FROM supervision_liveness_epoch")
+
+    supervision_available? =
+      match?(
+        [[0, at, "schema_activation", "process:tightbeam"]] when is_integer(at) and at >= 0,
+        epoch_rows
+      )
+
+    if supervision_available? do
+      :ok = Supervision.recover_liveness!(db, supervision_interval_ms(config))
+    else
+      Logger.warning(
+        "supervision_liveness_epoch row 0 unavailable; supervision recovery disabled"
+      )
+    end
 
     adapter_config = config |> Map.put(:cli_bin, cli_bin) |> Map.put(:db, db)
     adapter_context = fn key -> Placement.adapter_context(adapter_config, key) end
@@ -336,73 +352,77 @@ defmodule Tightbeam.Gateway do
       end
     end
 
-    credential_children(config, db) ++
-      [
-        {ModelCatalog, base_dir: config.base_dir, db: db},
-        {Tightbeam.Retention, db: db},
-        {WorkspaceCleanup, config: Map.put(config, :db, db)},
-        {Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry},
-        {Task, fn -> HarnessHealth.resume_other_routes(db) end},
-        {Tightbeam.Firehose.Hub, name: Tightbeam.Firehose.Hub},
-        # Ahead of Supervision and Bandit deliberately: both can reach a check-tier
-        # statute, and the episode writer must already own the ordering before the first
-        # evaluation runs. Explicitly a child rather than lazily started — a lazy start
-        # would let a missing spec here go unnoticed in production forever.
-        {Tightbeam.RailEpisodes, name: Tightbeam.RailEpisodes},
-        # Ahead of Bandit for the same reason: the hook seam posts to the wire,
-        # so the window's writer must own the ordering before the first
-        # observation can arrive.
-        {Tightbeam.TurnObservations, name: Tightbeam.TurnObservations},
-        # R8: retain listener evidence across Wakes and Bandit restarts.
-        {Tightbeam.ListenerLifecycle, []},
-        {Tightbeam.Wakes,
-         db: db,
-         deliver: deliver,
-         delivery_opts: delivery_config,
-         internal_consumers: %{
-           "effort_probe" => &EffortCheckin.probe(db, config, &1),
-           "effort_deadline" => &EffortCheckin.deadline(db, config, &1),
-           "review_remedy_reconcile" =>
-             &Tightbeam.RailRemedy.reconcile_notice(
-               db,
-               Map.put(config, :supervision_interval_ms, supervision_interval_ms(config)),
-               &1
-             )
-         },
-         tick_ms: config.wake_tick_ms,
-         review_remedy_interval_ms: supervision_interval_ms(config),
-         name: Tightbeam.WakeScheduler},
-        {Tightbeam.Supervision,
-         db: db,
-         handlers: handler_table,
-         prod_limit: prod_limit,
-         recover: false,
-         sweep_ms: supervision_interval_ms(config),
-         name: Tightbeam.Supervision},
-        {Tightbeam.Spinup.Flight, name: Tightbeam.Spinup.Flight},
-        {DynamicSupervisor, strategy: :one_for_one, name: Tightbeam.AdapterSupervisor},
-        {Tightbeam.AdapterCoordinator,
-         adapter_sup: Tightbeam.AdapterSupervisor,
-         adapter_context: adapter_context,
-         adapter_opts: adapter_opts,
-         db: db,
-         name: Tightbeam.AdapterCoordinator},
-        {Tightbeam.Productions.BubbleSweeper, db: db},
-        {Tightbeam.LaneManager,
-         db: db,
-         lane_sup: Tightbeam.LaneSupervisor,
-         task_sup: Tightbeam.TurnTaskSupervisor,
-         runner: runner,
-         terminal_publisher: terminal_publisher(db),
-         on_terminal: on_terminal,
-         name: Tightbeam.LaneManager},
-        {Tightbeam.SentinelSupervisor,
-         db: db, base_dir: config.base_dir, cli_bin: Path.join(cli_bin, "tightbeam")},
-        Tightbeam.ListenerLifecycle.listener_spec(
-          plug: {Tightbeam.Wire.Router, router_deps},
-          port: config.port
-        )
-      ]
+    (credential_children(config, db) ++
+       [
+         {ModelCatalog, base_dir: config.base_dir, db: db},
+         {Tightbeam.Retention, db: db},
+         {WorkspaceCleanup, config: Map.put(config, :db, db)},
+         {Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry},
+         {Task, fn -> HarnessHealth.resume_other_routes(db) end},
+         {Tightbeam.Firehose.Hub, name: Tightbeam.Firehose.Hub},
+         # Ahead of Supervision and Bandit deliberately: both can reach a check-tier
+         # statute, and the episode writer must already own the ordering before the first
+         # evaluation runs. Explicitly a child rather than lazily started — a lazy start
+         # would let a missing spec here go unnoticed in production forever.
+         {Tightbeam.RailEpisodes, name: Tightbeam.RailEpisodes},
+         # Ahead of Bandit for the same reason: the hook seam posts to the wire,
+         # so the window's writer must own the ordering before the first
+         # observation can arrive.
+         {Tightbeam.TurnObservations, name: Tightbeam.TurnObservations},
+         # R8: retain listener evidence across Wakes and Bandit restarts.
+         {Tightbeam.ListenerLifecycle, []},
+         {Tightbeam.Wakes,
+          db: db,
+          deliver: deliver,
+          delivery_opts: delivery_config,
+          internal_consumers: %{
+            "effort_probe" => &EffortCheckin.probe(db, config, &1),
+            "effort_deadline" => &EffortCheckin.deadline(db, config, &1),
+            "review_remedy_reconcile" =>
+              &Tightbeam.RailRemedy.reconcile_notice(
+                db,
+                Map.put(config, :supervision_interval_ms, supervision_interval_ms(config)),
+                &1
+              )
+          },
+          tick_ms: config.wake_tick_ms,
+          review_remedy_interval_ms: supervision_interval_ms(config),
+          name: Tightbeam.WakeScheduler},
+         if(supervision_available?,
+           do:
+             {Tightbeam.Supervision,
+              db: db,
+              handlers: handler_table,
+              prod_limit: prod_limit,
+              recover: false,
+              sweep_ms: supervision_interval_ms(config),
+              name: Tightbeam.Supervision}
+         ),
+         {Tightbeam.Spinup.Flight, name: Tightbeam.Spinup.Flight},
+         {DynamicSupervisor, strategy: :one_for_one, name: Tightbeam.AdapterSupervisor},
+         {Tightbeam.AdapterCoordinator,
+          adapter_sup: Tightbeam.AdapterSupervisor,
+          adapter_context: adapter_context,
+          adapter_opts: adapter_opts,
+          db: db,
+          name: Tightbeam.AdapterCoordinator},
+         {Tightbeam.Productions.BubbleSweeper, db: db},
+         {Tightbeam.LaneManager,
+          db: db,
+          lane_sup: Tightbeam.LaneSupervisor,
+          task_sup: Tightbeam.TurnTaskSupervisor,
+          runner: runner,
+          terminal_publisher: terminal_publisher(db),
+          on_terminal: on_terminal,
+          name: Tightbeam.LaneManager},
+         {Tightbeam.SentinelSupervisor,
+          db: db, base_dir: config.base_dir, cli_bin: Path.join(cli_bin, "tightbeam")},
+         Tightbeam.ListenerLifecycle.listener_spec(
+           plug: {Tightbeam.Wire.Router, router_deps},
+           port: config.port
+         )
+       ])
+    |> Enum.reject(&is_nil/1)
   end
 
   @doc """

@@ -343,12 +343,59 @@ defmodule Tightbeam.Rules do
     revision = Keyword.get(opts, :revision)
     identity_manifest_sha = revision || identity_manifest_sha(base_dir)
 
+    :persistent_term.put({__MODULE__, :unavailable_verbs}, %{})
+
     entries =
       law_base
       |> Path.join("identity/rules/*.toml")
       |> Path.wildcard()
       |> Enum.sort()
-      |> Enum.flat_map(&load_file!(&1, verbs, law_base, identity_manifest_sha))
+      |> Enum.flat_map(fn path ->
+        try do
+          load_file!(path, verbs, law_base, identity_manifest_sha)
+        rescue
+          error ->
+            require Logger
+            Logger.warning("rule file #{path} unavailable: #{Exception.message(error)}")
+
+            affected =
+              case File.read(path) do
+                {:ok, bytes} ->
+                  case Toml.decode(bytes) do
+                    {:ok, manifest} ->
+                      case Map.get(manifest, "rule") do
+                        rules when is_list(rules) ->
+                          declared =
+                            Enum.map(rules, fn rule ->
+                              if is_map(rule), do: Map.get(rule, "verb"), else: nil
+                            end)
+
+                          if declared != [] and Enum.all?(declared, &MapSet.member?(verbs, &1)),
+                            do: declared,
+                            else: MapSet.to_list(verbs)
+
+                        _ ->
+                          MapSet.to_list(verbs)
+                      end
+
+                    _ ->
+                      MapSet.to_list(verbs)
+                  end
+
+                _ ->
+                  MapSet.to_list(verbs)
+              end
+
+            unavailable = :persistent_term.get({__MODULE__, :unavailable_verbs})
+
+            :persistent_term.put(
+              {__MODULE__, :unavailable_verbs},
+              Enum.reduce(affected, unavailable, &Map.put(&2, &1, path))
+            )
+
+            []
+        end
+      end)
       |> Enum.map(fn
         {:rule, rule} ->
           # Keep runtime effects in the real base. A recovery snapshot is removed
@@ -372,15 +419,77 @@ defmodule Tightbeam.Rules do
 
     named = rules ++ policies
 
-    case Enum.find(named, fn entry -> Enum.count(named, &(&1.name == entry.name)) > 1 end) do
-      %{name: name, source: source} ->
-        raise ArgumentError, "#{source}: rule #{inspect(name)}: duplicate name"
+    duplicates = named |> Enum.frequencies_by(& &1.name)
 
-      nil ->
-        :ok
-    end
+    Enum.each(named, fn entry ->
+      if duplicates[entry.name] > 1 do
+        require Logger
 
-    validate_satisfiability!(rules, verbs)
+        Logger.warning(
+          "rule or policy #{entry.name} unavailable: duplicate name in #{entry.source}"
+        )
+      end
+    end)
+
+    rules =
+      Enum.reject(rules, fn rule ->
+        if duplicates[rule.name] > 1 do
+          require Logger
+          Logger.warning("rule #{rule.name} unavailable: duplicate name in #{rule.source}")
+          unavailable = :persistent_term.get({__MODULE__, :unavailable_verbs})
+
+          :persistent_term.put(
+            {__MODULE__, :unavailable_verbs},
+            Map.put(unavailable, rule.verb, rule.source)
+          )
+
+          true
+        else
+          false
+        end
+      end)
+
+    policies =
+      Enum.reject(policies, fn policy ->
+        if duplicates[policy.name] > 1 do
+          unavailable = :persistent_term.get({__MODULE__, :unavailable_verbs})
+
+          :persistent_term.put(
+            {__MODULE__, :unavailable_verbs},
+            Enum.reduce(verbs, unavailable, &Map.put(&2, &1, policy.source))
+          )
+
+          true
+        else
+          false
+        end
+      end)
+
+    rules =
+      Enum.filter(rules, fn rule ->
+        try do
+          validate_producer_existence!(rule)
+          validate_remedy_reachability!(rule, rules, verbs)
+
+          if rule.remedy && not escaping_static_producer?(rule),
+            do: validate_producer_cycles!(rule, rules)
+
+          true
+        rescue
+          error ->
+            require Logger
+            Logger.warning("rule #{rule.name} unavailable: #{Exception.message(error)}")
+            unavailable = :persistent_term.get({__MODULE__, :unavailable_verbs})
+
+            :persistent_term.put(
+              {__MODULE__, :unavailable_verbs},
+              Map.put(unavailable, rule.verb, rule.source)
+            )
+
+            false
+        end
+      end)
+
     :persistent_term.put(@persist_key, rules)
     :persistent_term.put(@policy_key, policies)
 
@@ -438,9 +547,19 @@ defmodule Tightbeam.Rules do
     verb = Map.fetch!(call, :verb)
     edge = edge(call)
 
-    rules
-    |> Enum.filter(&(&1.verb == verb and edge in &1.edges))
-    |> decide_rules(db, call, %{}, [], [])
+    case Map.get(:persistent_term.get({__MODULE__, :unavailable_verbs}, %{}), verb) do
+      nil ->
+        rules
+        |> Enum.filter(&(&1.verb == verb and edge in &1.edges))
+        |> decide_rules(db, call, %{}, [], [])
+
+      source ->
+        {{:deny,
+          %{
+            code: "rule_unavailable",
+            message: "#{verb} unavailable until rule #{source} is repaired"
+          }}, [], []}
+    end
   end
 
   @doc false
@@ -1145,8 +1264,28 @@ defmodule Tightbeam.Rules do
           rules
           |> Enum.with_index(1)
           |> Enum.map(fn {rule, ordinal} ->
-            {:rule,
-             validate_rule!(path, ordinal, rule, valid_verbs, base_dir, identity_manifest_sha)}
+            try do
+              {:rule,
+               validate_rule!(path, ordinal, rule, valid_verbs, base_dir, identity_manifest_sha)}
+            rescue
+              error ->
+                require Logger
+
+                Logger.warning(
+                  "rule #{path} entry #{ordinal} unavailable: #{Exception.message(error)}"
+                )
+
+                verb = if is_map(rule), do: Map.get(rule, "verb"), else: nil
+                affected = if MapSet.member?(valid_verbs, verb), do: [verb], else: valid_verbs
+                unavailable = :persistent_term.get({__MODULE__, :unavailable_verbs})
+
+                :persistent_term.put(
+                  {__MODULE__, :unavailable_verbs},
+                  Enum.reduce(affected, unavailable, &Map.put(&2, &1, path))
+                )
+
+                {:unavailable, path}
+            end
           end)
 
         :error ->
@@ -1800,12 +1939,6 @@ defmodule Tightbeam.Rules do
     |> Enum.sort()
   end
 
-  defp validate_satisfiability!(rules, valid_verbs) do
-    Enum.each(rules, &validate_producer_existence!/1)
-    Enum.each(rules, &validate_remedy_reachability!(&1, rules, valid_verbs))
-    validate_producer_cycles!(rules)
-  end
-
   defp validate_producer_existence!(%{check: check}) when not is_nil(check), do: :ok
 
   defp validate_producer_existence!(rule) do
@@ -1864,16 +1997,14 @@ defmodule Tightbeam.Rules do
 
   defp fixed_condition_true?(_condition, _remedy), do: false
 
-  defp validate_producer_cycles!(rules) do
+  defp validate_producer_cycles!(rule, rules) do
     remedy_rules =
       Enum.filter(
         rules,
         &(not is_nil(&1.remedy) and not escaping_static_producer?(&1))
       )
 
-    Enum.each(remedy_rules, fn rule ->
-      walk_producer_chain!(rule, rule, remedy_rules, [rule.name])
-    end)
+    walk_producer_chain!(rule, rule, remedy_rules, [rule.name])
   end
 
   defp escaping_static_producer?(%{external_producer: true}), do: true
@@ -2297,8 +2428,16 @@ defmodule Tightbeam.Rules do
 
   defp compute_fact("org.live_sessions_owned_by_caller", db, call, cache) do
     with_dependency("caller.user", db, call, cache, fn
-      nil, cache -> {nil, cache}
-      user, cache -> {length(Org.list_for_user(db, user, false)), cache}
+      nil, cache ->
+        {nil, cache}
+
+      user, cache ->
+        {:ok, [[count]]} =
+          DB.query(db, "SELECT COUNT(*) FROM sessions WHERE ownerUserId=?1 AND state='active'", [
+            user
+          ])
+
+        {count, cache}
     end)
   end
 

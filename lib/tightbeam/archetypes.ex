@@ -10,6 +10,7 @@ defmodule Tightbeam.Archetypes do
   instructions. No archetype identity is projected into a harness home.
   """
 
+  require Logger
   @persist_key __MODULE__
   alias Tightbeam.Identity.Renderer
 
@@ -39,10 +40,8 @@ defmodule Tightbeam.Archetypes do
   @doc """
   Load every manifest under `<base_dir>/identity/archetypes/*.toml`, validate,
   merge over the built-in default, and store the set in :persistent_term.
-  Raises (failing boot) on: unparseable TOML, unknown top-level keys, `where`
-  not a non-empty list of strings, defaults.harness outside claude|codex, a
-  reference missing `location`, or an org skill using a reserved substrate
-  name. Returns the loaded map (name => t()).
+  Invalid manifests or fragment dependencies are logged and leave only their
+  dependent archetypes unavailable. Returns the loaded map (name => t()).
   """
   @spec load!(String.t()) :: %{optional(String.t()) => t()}
   def load!(base_dir) do
@@ -65,37 +64,44 @@ defmodule Tightbeam.Archetypes do
       |> Path.wildcard()
       |> Enum.sort()
       |> Enum.reduce(%{"default" => builtin_default()}, fn path, loaded ->
-        bytes = File.read!(path)
-        manifest = Toml.decode!(bytes)
+        try do
+          bytes = File.read!(path)
+          manifest = Toml.decode!(bytes)
 
-        archetype =
-          manifest
-          |> validate!(path)
-          |> Map.put(:source, %{
-            file: Path.relative_to(path, base_dir),
-            sha256: bytes |> then(&:crypto.hash(:sha256, &1)) |> Base.encode16(case: :lower)
-          })
+          archetype =
+            manifest
+            |> validate!(path)
+            |> Map.put(:source, %{
+              file: Path.relative_to(path, base_dir),
+              sha256: bytes |> then(&:crypto.hash(:sha256, &1)) |> Base.encode16(case: :lower)
+            })
 
-        Map.put(loaded, archetype.name, archetype)
+          Map.put(loaded, archetype.name, archetype)
+        rescue
+          error ->
+            Logger.warning("archetype #{path} unavailable: #{Exception.message(error)}")
+            Map.delete(loaded, Path.basename(path, ".toml"))
+        end
       end)
 
     fragments = load_fragments!(base_dir)
 
-    # Validate ALL law at load: every archetype's guidance must compose
-    # (missing fragments and include cycles fail the boot, not a turn), and
-    # every elected skill must exist in the library.
-    for {_name, archetype} <- archetypes do
-      guidance_with(archetype, fragments)
+    archetypes =
+      Enum.reduce(archetypes, %{}, fn {name, archetype}, loaded ->
+        try do
+          guidance_with(archetype, fragments)
+          unknown = Enum.reject(archetype.skills, &MapSet.member?(library, &1))
 
-      case Enum.reject(archetype.skills, &MapSet.member?(library, &1)) do
-        [] ->
-          :ok
+          if unknown != [],
+            do: raise(ArgumentError, "elects unknown skills: #{Enum.join(unknown, ", ")}")
 
-        unknown ->
-          raise ArgumentError,
-                "archetype #{archetype.name} elects unknown skills: #{Enum.join(unknown, ", ")}"
-      end
-    end
+          Map.put(loaded, name, archetype)
+        rescue
+          error ->
+            Logger.warning("archetype #{name} unavailable: #{Exception.message(error)}")
+            loaded
+        end
+      end)
 
     :persistent_term.put(@persist_key, {archetypes, fragments})
     archetypes
@@ -106,8 +112,9 @@ defmodule Tightbeam.Archetypes do
       path = Path.join([skills_dir(base_dir), name, "SKILL.md"])
 
       if File.regular?(path) do
-        raise ArgumentError,
-              "#{path}: rename or remove the org copy; substrate names are reserved"
+        Logger.warning(
+          "#{path}: rename or remove the org copy; substrate names are reserved; org copy unavailable"
+        )
       end
     end
   end
@@ -476,22 +483,24 @@ defmodule Tightbeam.Archetypes do
   end
 
   defp load_fragments!(base_dir) do
-    entries =
-      base_dir
-      |> Path.join("identity/guidance/**/*.md")
-      |> Path.wildcard()
-      |> Enum.sort()
-      |> Enum.map(&{Path.relative_to(&1, Path.join(base_dir, "identity")), File.read!(&1)})
+    paths = Path.wildcard(Path.join(base_dir, "identity/guidance/**/*.md")) |> Enum.sort()
+    duplicates = paths |> Enum.frequencies_by(&Path.basename/1)
 
-    catalog = Renderer.catalog!(entries)
+    fragments =
+      Enum.reduce(paths, %{}, fn path, acc ->
+        name = Path.basename(path)
 
-    catalog =
-      Map.put_new(catalog, "operating-manual.md", %{
-        path: "substrate:priv/guidance/operating-manual.md",
-        bytes: builtin_fragments()["operating-manual.md"]
-      })
+        try do
+          if duplicates[name] > 1, do: raise(ArgumentError, "duplicate fragment #{name}")
+          Map.put(acc, name, File.read!(path))
+        rescue
+          error ->
+            Logger.warning("guidance fragment #{path} unavailable: #{Exception.message(error)}")
+            acc
+        end
+      end)
 
-    Map.new(catalog, fn {name, entry} -> {name, entry.bytes} end)
+    Map.put_new(fragments, "operating-manual.md", builtin_fragments()["operating-manual.md"])
   end
 
   @kungfu_template_paths [

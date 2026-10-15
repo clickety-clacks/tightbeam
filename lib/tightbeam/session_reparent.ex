@@ -66,6 +66,9 @@ defmodule Tightbeam.SessionReparent do
       String.contains?(table_sql, "cause='owner_topology_correction'") and
         String.contains?(table_sql, "principalKind='user'") and
           String.contains?(table_sql, "principalRef='user:' || ownerUserId") ->
+        previous_fk_violations =
+          Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(session_reparent_events))
+
         [[count]] = Txn.q(txn, "SELECT COUNT(*) FROM session_reparent_events")
 
         replacement_ddl =
@@ -102,7 +105,11 @@ defmodule Tightbeam.SessionReparent do
         :ok = Txn.exec(txn, "DROP TABLE session_reparent_events_agent_v1")
 
         :ok = Txn.exec(txn, @indexes_and_triggers_ddl)
-        [] = Txn.q(txn, "PRAGMA foreign_key_check(session_reparent_events)")
+
+        [] =
+          Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(session_reparent_events)) --
+            previous_fk_violations
+
         :ok
 
       true ->
