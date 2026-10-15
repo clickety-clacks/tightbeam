@@ -1869,30 +1869,37 @@ defmodule Tightbeam.Schema do
   # Historical cleanup state is copied in the same transaction as the marker.
   defp migrate_retired_workspace_cleanup(db) do
     case DB.transaction(db, fn txn ->
-      Txn.exec(txn, "CREATE TABLE IF NOT EXISTS retired_workspace_cleanup_migration (id INTEGER PRIMARY KEY CHECK(id=0))")
-      if Txn.q(txn, "SELECT id FROM retired_workspace_cleanup_migration") == [] do
-        Txn.exec(txn, """
-        CREATE TABLE retired_workspace_cleanup (
-          sessionKey TEXT PRIMARY KEY, completed INTEGER NOT NULL DEFAULT 0,
-          nextAt INTEGER NOT NULL DEFAULT 0, archivePath TEXT, report TEXT
-        );
-        CREATE TABLE retired_archive_relocation (
-          host TEXT NOT NULL, destination TEXT NOT NULL, completed INTEGER NOT NULL DEFAULT 0,
-          report TEXT, PRIMARY KEY(host,destination)
-        );
-        CREATE INDEX retired_workspace_cleanup_due ON retired_workspace_cleanup(completed,nextAt);
-        CREATE TRIGGER retired_workspace_cleanup_enqueue AFTER UPDATE OF state ON sessions
-        WHEN NEW.state='retired' AND OLD.state<>'retired'
-        BEGIN
-          INSERT OR IGNORE INTO retired_workspace_cleanup(sessionKey) VALUES(NEW.sessionKey);
-        END;
-        INSERT INTO retired_workspace_cleanup(sessionKey) SELECT sessionKey FROM sessions WHERE state='retired';
-        INSERT INTO retired_workspace_cleanup_migration(id) VALUES(0);
-        """)
-      end
-      :ok
-    end) do
-      {:ok, :ok} -> :ok
+           Txn.exec(
+             txn,
+             "CREATE TABLE IF NOT EXISTS retired_workspace_cleanup_migration (id INTEGER PRIMARY KEY CHECK(id=0))"
+           )
+
+           if Txn.q(txn, "SELECT id FROM retired_workspace_cleanup_migration") == [] do
+             Txn.exec(txn, """
+             CREATE TABLE retired_workspace_cleanup (
+               sessionKey TEXT PRIMARY KEY, completed INTEGER NOT NULL DEFAULT 0,
+               nextAt INTEGER NOT NULL DEFAULT 0, archivePath TEXT, report TEXT
+             );
+             CREATE TABLE retired_archive_relocation (
+               host TEXT NOT NULL, destination TEXT NOT NULL, completed INTEGER NOT NULL DEFAULT 0,
+               report TEXT, PRIMARY KEY(host,destination)
+             );
+             CREATE INDEX retired_workspace_cleanup_due ON retired_workspace_cleanup(completed,nextAt);
+             CREATE TRIGGER retired_workspace_cleanup_enqueue AFTER UPDATE OF state ON sessions
+             WHEN NEW.state='retired' AND OLD.state<>'retired'
+             BEGIN
+               INSERT OR IGNORE INTO retired_workspace_cleanup(sessionKey) VALUES(NEW.sessionKey);
+             END;
+             INSERT INTO retired_workspace_cleanup(sessionKey) SELECT sessionKey FROM sessions WHERE state='retired';
+             INSERT INTO retired_workspace_cleanup_migration(id) VALUES(0);
+             """)
+           end
+
+           :ok
+         end) do
+      {:ok, :ok} ->
+        :ok
+
       {:error, error} ->
         Logger.error("retired workspace cleanup migration deferred: #{inspect(error)}")
         :ok

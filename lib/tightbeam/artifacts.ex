@@ -627,7 +627,13 @@ defmodule Tightbeam.Artifacts do
   @doc false
   def repoint_archive_in_txn(txn, artifact_id, home) do
     reserve_version_in_txn(txn, artifact_id)
-    Txn.q(txn, "UPDATE artifacts SET home=?2,updatedAt=?3 WHERE artifactId=?1 AND state='archived'", [artifact_id,home,now()])
+
+    Txn.q(
+      txn,
+      "UPDATE artifacts SET home=?2,updatedAt=?3 WHERE artifactId=?1 AND state='archived'",
+      [artifact_id, home, now()]
+    )
+
     publish_in_txn(txn, "artifact.archived", artifact_id)
   end
 

@@ -179,6 +179,23 @@ defmodule Tightbeam.WorkspaceCleanupTest do
     assert WorkspaceCleanup.health(ctx.db).count == 0
   end
 
+  test "notification failure after retirement cannot lose cleanup or change the result", ctx do
+    config = Map.put(ctx.config, :on_retired, fn _ -> raise "notification unavailable" end)
+    result = Gateway.handlers(config)["retire"].(%{origin: "user:owner", principal: {:user, "owner"}, session_key: ctx.session.session_key, params: %{}})
+    assert result.retired_session_keys == [ctx.session.session_key]
+    assert %{count: 1} = WorkspaceCleanup.health(ctx.db)
+    assert %{status: "completed"} = WorkspaceCleanup.process_session(config, ctx.db, ctx.session.session_key)
+    refute File.exists?(ctx.workspace)
+  end
+
+  test "an audit failure cannot turn a completed cleanup into a failure", ctx do
+    retire(ctx)
+    :ok = DB.execute(ctx.db, "CREATE TRIGGER refuse_cleanup_audit BEFORE INSERT ON lifecycle_events WHEN NEW.kind='retired_workspace_cleanup_completed' BEGIN SELECT RAISE(ABORT,'audit unavailable'); END")
+    assert %{status: "completed"} = WorkspaceCleanup.process_session(ctx.config, ctx.db, ctx.session.session_key)
+    refute File.exists?(ctx.workspace)
+    assert WorkspaceCleanup.health(ctx.db).count == 0
+  end
+
   defp retire(ctx) do
     {:ok, _} = DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [ctx.session.session_key])
   end

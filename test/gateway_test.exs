@@ -1700,8 +1700,18 @@ defmodule Tightbeam.GatewayTest do
     assert [%{status: "completed"} = cleanup] = result.workspace_cleanup
     refute File.exists?(workspace)
     assert File.read!(Artifacts.get(ctx.db, artifact.artifact_id).home) == "banana"
-    assert File.read!(Path.join(Artifacts.get(ctx.db, checkout_artifact.artifact_id).home, ".git/HEAD")) == "ref: refs/heads/main"
-    assert File.read!(Path.join(Artifacts.get(ctx.db, checkout_artifact.artifact_id).home, "target/build/output.bin")) == "generated"
+
+    assert File.read!(
+             Path.join(Artifacts.get(ctx.db, checkout_artifact.artifact_id).home, ".git/HEAD")
+           ) == "ref: refs/heads/main"
+
+    assert File.read!(
+             Path.join(
+               Artifacts.get(ctx.db, checkout_artifact.artifact_id).home,
+               "target/build/output.bin"
+             )
+           ) == "generated"
+
     refute File.exists?(unregistered_file)
 
     unchanged = Artifacts.get(ctx.db, artifact.artifact_id)
@@ -1771,8 +1781,14 @@ defmodule Tightbeam.GatewayTest do
     assert "ServerAliveInterval=5" in invocation
     assert "ServerAliveCountMax=2" in invocation
     assert File.read!(Artifacts.get(ctx.db, report.artifact_id).home) == "remote report"
-    assert File.read!(Path.join(Artifacts.get(ctx.db, checkout.artifact_id).home, ".git/HEAD")) == "ref: refs/heads/main"
-    assert File.read!(Path.join(Artifacts.get(ctx.db, checkout.artifact_id).home, "target/build.bin")) == "preserve the registered directory subtree"
+
+    assert File.read!(Path.join(Artifacts.get(ctx.db, checkout.artifact_id).home, ".git/HEAD")) ==
+             "ref: refs/heads/main"
+
+    assert File.read!(
+             Path.join(Artifacts.get(ctx.db, checkout.artifact_id).home, "target/build.bin")
+           ) == "preserve the registered directory subtree"
+
     refute File.exists?(unregistered_file)
     assert Artifacts.get(ctx.db, report.artifact_id).state == "archived"
     assert Artifacts.get(ctx.db, checkout.artifact_id).state == "archived"
@@ -10880,11 +10896,15 @@ defmodule Tightbeam.GatewayTest do
   # Exercise background cleanup explicitly after the retirement request returns.
   defp retirement_cleanup_handler(config) do
     handler = Gateway.handlers(config)["retire"]
+
     fn call ->
       result = handler.(call)
-      reports = Enum.map(Enum.uniq(result.retired_session_keys ++ [call.session_key]), fn key ->
-        Tightbeam.WorkspaceCleanup.process_session(config, config.db, key)
-      end)
+
+      reports =
+        Enum.map(Enum.uniq(result.retired_session_keys ++ [call.session_key]), fn key ->
+          Tightbeam.WorkspaceCleanup.process_session(config, config.db, key)
+        end)
+
       Map.put(result, :workspace_cleanup, reports)
     end
   end

@@ -9893,12 +9893,18 @@ defmodule Tightbeam.Gateway do
 
               WorkspaceCleanup.kick()
               Enum.each(result.retired, fn retired ->
-                broadcast(db, owner, Payloads.stream_deleted(retired.session_key))
+                try do
+                  broadcast(db, owner, Payloads.stream_deleted(retired.session_key))
                 Map.get(config, :on_retired, fn _ -> :ok end).(retired.session_key)
 
                 Enum.each(retired.assignments, fn assignment ->
                   emit_assignment_change(db, assignment.assignment_id, assignment.from_state)
                 end)
+                rescue
+                  error -> best_effort_failed("retire_notifications", :error, error, __STACKTRACE__)
+                catch
+                  kind, reason -> best_effort_failed("retire_notifications", kind, reason, __STACKTRACE__)
+                end
               end)
 
               cleanup_reports =
