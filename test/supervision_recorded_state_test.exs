@@ -10,7 +10,7 @@ defmodule Tightbeam.SupervisionRecordedStateTest do
 
     File.mkdir_p!(Path.dirname(path))
     on_exit(fn -> File.rm_rf!(Path.dirname(path)) end)
-    db = start_supervised!({DB, name: name, path: path})
+    db = start_supervised!({DB, name: name, path: path, guard_inputs: []})
     %{db: db, path: path, name: name}
   end
 
@@ -38,7 +38,7 @@ defmodule Tightbeam.SupervisionRecordedStateTest do
     on_exit(fn -> File.rm_rf!(Path.dirname(path)) end)
     Tightbeam.SchemaShapeRuntimeFixture.seed_operator_predecessor!(path)
     name = :"recorded_predecessor_#{System.unique_integer([:positive])}"
-    db = start_supervised!({DB, name: name, path: path})
+    db = start_supervised!({DB, name: name, path: path, guard_inputs: []})
 
     assert {:ok, [["operator-decision-requests-v1"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
@@ -72,7 +72,7 @@ defmodule Tightbeam.SupervisionRecordedStateTest do
              DB.query(db, "SELECT COUNT(*),MAX(turnSeq) FROM patrol_terminal_classifications")
 
     :ok = stop_supervised(DB)
-    db = start_supervised!({DB, name: name, path: path})
+    db = start_supervised!({DB, name: name, path: path, guard_inputs: []})
     assert :ok = Schema.ensure_all(db)
     assert :ok = Supervision.sweep_unclassified_terminals(db)
 

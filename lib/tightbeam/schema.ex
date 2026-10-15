@@ -1783,7 +1783,8 @@ defmodule Tightbeam.Schema do
               UPDATE patrol_failure_boundary SET lastTurnSeq=MIN(lastTurnSeq,NEW.seq-1) WHERE id=0;
             END;
             INSERT INTO supervision_state_migration(id,complete)
-            SELECT 0,NOT EXISTS(SELECT 1 FROM wakes);
+            SELECT 0,NOT EXISTS(SELECT 1 FROM wakes) AND
+              NOT EXISTS(SELECT 1 FROM lifecycle_events WHERE kind='idle_cleanup_pending_observed');
             """)
         end
 
@@ -2847,6 +2848,15 @@ defmodule Tightbeam.Schema do
   end
 
   defp validate_owned_object!(txn, %{type: type, name: name, sql: expected_sql}) do
+    expected_sql =
+      if name == "supervision_liveness_sidecar" and
+           Txn.q(txn, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='supervision_state_migration'") == [[1]] and
+           Txn.q(txn, "SELECT 1 FROM supervision_state_migration WHERE id=0") == [[1]] do
+        String.replace(expected_sql, ~r/\)\s*$/, ", endedWakeState TEXT)")
+      else
+        expected_sql
+      end
+
     case Txn.q(
            txn,
            "SELECT sql FROM sqlite_master WHERE type = ?1 AND name = ?2",
