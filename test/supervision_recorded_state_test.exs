@@ -86,7 +86,12 @@ defmodule Tightbeam.SupervisionRecordedStateTest do
     File.ln_s!(".", alias_parent)
     linked_base = Path.join(alias_parent, "base")
     on_exit(fn -> File.rm_rf!(tmp) end)
-    Tightbeam.SchemaShapeRuntimeFixture.seed_operator_predecessor!(Path.join(base, "state.db"), payload)
+
+    Tightbeam.SchemaShapeRuntimeFixture.seed_operator_predecessor!(
+      Path.join(base, "state.db"),
+      payload
+    )
+
     manifest = File.read!(Path.join(payload, "build-manifest.json")) |> JSON.decode!()
 
     transition =
@@ -103,8 +108,10 @@ defmodule Tightbeam.SupervisionRecordedStateTest do
       start_supervised!(
         Supervisor.child_spec(
           {DB,
-           name: name, path: Path.join(linked_base, "state.db"),
-           guard_inputs: [transition: transition], payload_root: payload},
+           name: name,
+           path: Path.join(linked_base, "state.db"),
+           guard_inputs: [transition: transition],
+           payload_root: payload},
           id: name
         )
       )

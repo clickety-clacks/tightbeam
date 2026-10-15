@@ -90,7 +90,9 @@ defmodule Tightbeam.LiveBaseTransitionInputTest do
     other_base = ctx.base <> "-other"
     File.ln_s!(ctx.base, alias_base)
     transition = transition_json(%{ctx | base: alias_base}, false)
-    admission = LiveBaseAdmission.prepare!(ctx.base, payload_root: ctx.payload, transition: transition)
+    admission =
+      LiveBaseAdmission.prepare!(ctx.base, payload_root: ctx.payload, transition: transition)
+
     File.mkdir_p!(other_base)
     File.rm!(alias_base)
     File.ln_s!(other_base, alias_base)
