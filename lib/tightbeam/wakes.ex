@@ -2688,6 +2688,22 @@ defmodule Tightbeam.Wakes do
     end
   end
 
+  defp recognize_wake_in_savepoint(txn, wake_id, recognize) do
+    :ok = Txn.exec(txn, "SAVEPOINT wake_recognition")
+
+    try do
+      result = recognize.()
+      :ok = Txn.exec(txn, "RELEASE wake_recognition")
+      result
+    rescue
+      error ->
+        :ok = Txn.exec(txn, "ROLLBACK TO wake_recognition")
+        :ok = Txn.exec(txn, "RELEASE wake_recognition")
+        Logger.warning("wake #{wake_id} recognition deferred: #{Exception.message(error)}")
+        []
+    end
+  end
+
   defp recognize_wait_transitions_in_txn(txn, transitions) do
     unowned_fact? = fn transition ->
       is_map(transition) and transition[:domain] == "condition_fact" and
@@ -2725,7 +2741,13 @@ defmodule Tightbeam.Wakes do
         [owner_user_id]
       )
       |> Enum.each(fn [wake_id] ->
-        case wait_in_txn(txn, wake_id) do
+        recognize_wake_in_savepoint(txn, wake_id, fn ->
+        [[predicate, resolver_kind, resolver_id, verifier, verification_state]] =
+          Txn.q(txn, "SELECT predicate,resolverKind,resolverId,verificationAssignmentId,verificationState FROM wakes WHERE wakeId=?1", [wake_id])
+        candidate = %{wake_id: wake_id, owner_user_id: owner_user_id,
+          predicate: decode_optional(predicate), resolver_kind: resolver_kind, resolver_id: resolver_id,
+          verification_assignment_id: verifier, verification_state: verification_state}
+        case candidate do
           nil ->
             :ok
 
@@ -2746,6 +2768,7 @@ defmodule Tightbeam.Wakes do
               Enum.find(owner_transitions, &verification_terminal_transition?(wake, &1))
 
             if predicate_transition || resolver_transition || verification_transition do
+              wake = wait_in_txn(txn, wake_id)
               evaluation = evaluate_wait_predicate_in_txn(txn, wake)
               resolver = resolver_for_wake_in_txn(txn, wake)
 
@@ -2788,6 +2811,7 @@ defmodule Tightbeam.Wakes do
               end
             end
         end
+        end)
       end)
     end)
 
@@ -4212,9 +4236,13 @@ defmodule Tightbeam.Wakes do
       )
 
     Enum.each(rows, fn [wake_id] ->
-      case get(db, wake_id) do
-        %{state: "pending"} = wake -> dispose_closed_remedy(db, wake)
-        _ -> :ok
+      try do
+        case get(db, wake_id) do
+          %{state: "pending"} = wake -> dispose_closed_remedy(db, wake)
+          _ -> :ok
+        end
+      rescue
+        error -> Logger.warning("wake #{wake_id} remedy cleanup deferred: #{Exception.message(error)}")
       end
     end)
 
@@ -6325,6 +6353,7 @@ defmodule Tightbeam.Wakes do
       [fact_id]
     )
     |> Enum.flat_map(fn [wake_id] ->
+      recognize_wake_in_savepoint(txn, wake_id, fn ->
       case Txn.q(txn, select_wake_sql() <> " WHERE wakeId=?1", [wake_id]) do
         [row] ->
           case fire_in_txn(txn, to_wake(row), fact_id) do
@@ -6336,6 +6365,7 @@ defmodule Tightbeam.Wakes do
         [] ->
           []
       end
+      end)
     end)
   end
 
@@ -6622,9 +6652,15 @@ defmodule Tightbeam.Wakes do
     # linked carriers for this pass, never the unrelated due batch. Consumed
     # carriers are not reset; absent liveness remains a visible pending notice.
     entries =
-      Enum.map(rows, fn row ->
-        {wake_row, carriers} = Enum.split(row, -2)
-        {to_wake(wake_row), Enum.reject(carriers, &is_nil/1)}
+      Enum.flat_map(rows, fn row ->
+        try do
+          {wake_row, carriers} = Enum.split(row, -2)
+          [{to_wake(wake_row), Enum.reject(carriers, &is_nil/1)}]
+        rescue
+          error ->
+            Logger.warning("wake #{hd(row)} due delivery deferred: #{Exception.message(error)}")
+            []
+        end
       end)
 
     deferred =
@@ -6724,7 +6760,8 @@ defmodule Tightbeam.Wakes do
     Enum.each(rows, fn [wake_id] ->
       case DB.transaction(db, fn txn -> recognize_due_dependency_in_txn(txn, wake_id) end) do
         {:ok, _} -> :ok
-        {:error, error} -> raise error
+        {:error, error} ->
+          Logger.warning("wake #{wake_id} dependency recognition deferred: #{Exception.message(error)}")
       end
     end)
 
@@ -6800,7 +6837,8 @@ defmodule Tightbeam.Wakes do
           []
 
         {:error, error} ->
-          raise error
+          Logger.warning("wake #{wake_id} wait delivery deferred: #{Exception.message(error)}")
+          []
       end
     end)
   end
@@ -7426,7 +7464,8 @@ defmodule Tightbeam.Wakes do
       {:ok, {:fired, :staged}} -> GenServer.cast(self(), :wake_ready)
       {:ok, {:fired, delivery}} -> Gateway.complete_delivery(db, delivery)
       {:ok, _} -> :ok
-      {:error, error} -> raise error
+      {:error, error} ->
+        Logger.warning("wake #{wake_id} condition delivery deferred: #{Exception.message(error)}")
     end
   end
 

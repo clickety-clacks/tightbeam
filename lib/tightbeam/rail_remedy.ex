@@ -14,6 +14,8 @@ defmodule Tightbeam.RailRemedy do
     Wakes
   }
 
+  require Logger
+
   alias Tightbeam.DB.Txn
 
   @reassessment_wait 253_402_300_799_000
@@ -252,12 +254,13 @@ defmodule Tightbeam.RailRemedy do
         SELECT subject,occurrence,producerKey,noticeState FROM rail_remedy_episodes
         WHERE statute='completion-requires-review' AND status='live'
           AND (?1 IS NULL OR subject=?1)
-          AND (noticeState IS NULL OR json_extract(noticeState,'$.reassessment') IS NULL)
         ORDER BY openedAt,subject
         """,
         [subject]
       )
       |> Enum.each(fn [subject, occurrence, producer, encoded] ->
+        :ok = Txn.exec(txn, "SAVEPOINT review_episode")
+        try do
         state =
           if encoded,
             do: decode_notice_state(encoded),
@@ -266,6 +269,9 @@ defmodule Tightbeam.RailRemedy do
               |> Map.put("legacyProducer", producer)
 
         cond do
+          not is_nil(state["reassessment"]) ->
+            :ok
+
           state["need"]["state"] == "withdrawn" ->
             :ok
 
@@ -370,6 +376,13 @@ defmodule Tightbeam.RailRemedy do
                   recipient_blocked(state, missing)
                 )
             end
+        end
+        :ok = Txn.exec(txn, "RELEASE review_episode")
+        rescue
+          error ->
+            :ok = Txn.exec(txn, "ROLLBACK TO review_episode")
+            :ok = Txn.exec(txn, "RELEASE review_episode")
+            Logger.warning("review remedy episode #{subject}/#{occurrence} deferred: #{Exception.message(error)}")
         end
       end)
 
