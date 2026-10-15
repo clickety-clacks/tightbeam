@@ -995,17 +995,8 @@ defmodule Tightbeam.Wakes do
     Txn.q(
       txn,
       """
-      SELECT 1 FROM turns t
-      WHERE t.sessionKey=?2 AND (
-        t.wakeId=?1 OR EXISTS (
-          SELECT 1
-          FROM notice_batch_members m
-          JOIN notice_batches b ON b.batchId=m.batchId
-          WHERE m.sourceWakeId=?1 AND m.state='included'
-            AND b.deliveryWakeId=t.wakeId
-        )
-      )
-      LIMIT 1
+      SELECT 1 FROM wakes w JOIN turns t ON t.seq=w.deliveredTurnSeq
+      WHERE w.wakeId=?1 AND t.sessionKey=?2
       """,
       [source_wake_id, session_key]
     ) == [[1]]
@@ -2240,7 +2231,7 @@ defmodule Tightbeam.Wakes do
       case Txn.q(
              txn,
              """
-             WITH deliveries AS (SELECT wakeId AS sourceWakeId,deliveredTurnSeq AS turnSeq,assignmentId FROM wakes WHERE deliveredTurnSeq IS NOT NULL)
+             WITH deliveries AS (#{Tightbeam.NoticeBatcher.recorded_deliveries_sql()})
              SELECT t.status FROM deliveries d JOIN turns t ON t.seq=d.turnSeq
              WHERE d.sourceWakeId=?1 AND d.assignmentId=?2 AND t.sessionKey=?3
              ORDER BY t.seq DESC
@@ -2344,7 +2335,7 @@ defmodule Tightbeam.Wakes do
         Txn.q(
           txn,
           """
-          WITH deliveries AS (SELECT wakeId AS sourceWakeId,deliveredTurnSeq AS turnSeq,assignmentId FROM wakes WHERE deliveredTurnSeq IS NOT NULL)
+          WITH deliveries AS (#{Tightbeam.NoticeBatcher.recorded_deliveries_sql()})
           SELECT 1 FROM deliveries d JOIN turns t ON t.seq=d.turnSeq
           JOIN sessions holder ON holder.sessionKey=t.sessionKey
           JOIN supervision_liveness_sidecar sidecar ON sidecar.wakeId=d.sourceWakeId
@@ -6401,8 +6392,10 @@ defmodule Tightbeam.Wakes do
 
   @impl true
   def handle_info(:backfill_wake_delivery, state) do
-    if Tightbeam.Schema.backfill_wake_delivery(state.db) == :more do
-      Process.send_after(self(), :backfill_wake_delivery, 100)
+    case Tightbeam.Schema.backfill_wake_delivery(state.db) do
+      :more -> Process.send_after(self(), :backfill_wake_delivery, 100)
+      {:error, _error} -> Process.send_after(self(), :backfill_wake_delivery, 5_000)
+      :done -> :ok
     end
 
     {:noreply, state}
@@ -6473,11 +6466,50 @@ defmodule Tightbeam.Wakes do
     end)
   end
 
+  # Group only due routing destinations before resolving them. Busy recipients
+  # wait for their lane's readiness signal without preparing their sources.
+  defp due_prompt_recipients(db) do
+    transaction!(db, fn txn ->
+      Txn.q(
+        txn,
+        """
+        SELECT DISTINCT sessionKey,targetRole,targetGate,reresolve,reresolveSeed,reresolveRung
+        FROM wakes INDEXED BY wakes_due
+        WHERE state='pending' AND dueAt<=?1 AND consumer='prompt' AND digest=0
+          AND COALESCE(deliveryRule,'')<>'turn-boundary-digest r1'
+          AND (conditionKind IS NULL OR firedAt IS NOT NULL)
+          AND (waitMode IS NULL OR recognitionAt IS NOT NULL)
+        """,
+        [now()]
+      )
+      |> Enum.flat_map(fn [key, role, gate, resolve, seed, rung] ->
+        target_gate =
+          cond do
+            is_binary(role) -> %{target_role: role}
+            gate == 0 -> nil
+            true -> %{reresolve: resolve, reresolve_seed: seed, reresolve_rung: rung}
+          end
+
+        case Gateway.delivery_target(txn, key, target_gate) do
+          {recipient, _, _} -> [recipient]
+          nil -> []
+        end
+      end)
+      |> Enum.uniq()
+      |> Enum.reject(fn recipient ->
+        Txn.q(txn,
+          "SELECT 1 FROM turns WHERE sessionKey=?1 AND status IN ('running','queued') LIMIT 1",
+          [recipient]
+        ) != []
+      end)
+    end)
+  end
+
   defp deliver_due_in_context(
          %{db: db, deliver: deliver, internal_consumers: consumers} = state,
          drain_notices
        ) do
-    if drain_notices and Map.has_key?(consumers, "review_remedy_reconcile") do
+    if Map.has_key?(consumers, "review_remedy_reconcile") do
       {:ok, :ok} =
         Tightbeam.RailRemedy.reconcile_pending_episodes(db, state.review_remedy_interval_ms)
     end
@@ -6487,7 +6519,7 @@ defmodule Tightbeam.Wakes do
     if drain_notices do
       deliver_eligible_waits(db, state.delivery_opts)
     else
-      deliver_wait_ids(db, newly_due, state.delivery_opts)
+      (deliver_wait_ids(db, newly_due, state.delivery_opts) ++ due_prompt_recipients(db))
       |> Enum.uniq()
       |> Enum.each(&NoticeBatcher.recover(db, now(), state.delivery_opts, &1))
     end
@@ -6500,8 +6532,9 @@ defmodule Tightbeam.Wakes do
     # loop below.
     if drain_notices do
       NoticeBatcher.recover(db, now(), state.delivery_opts)
-      legacy_materialize_digests(db, now())
     end
+
+    legacy_materialize_digests(db, now())
 
     {:ok, rows} =
       DB.query_for(

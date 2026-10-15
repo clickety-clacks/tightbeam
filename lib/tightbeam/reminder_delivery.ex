@@ -73,7 +73,7 @@ defmodule Tightbeam.ReminderDelivery do
       Txn.q(
         txn,
         """
-        WITH source_deliveries AS (SELECT wakeId AS sourceWakeId,deliveredTurnSeq AS turnSeq,assignmentId FROM wakes WHERE deliveredTurnSeq IS NOT NULL)
+        WITH source_deliveries AS (#{Tightbeam.NoticeBatcher.recorded_deliveries_sql()})
         SELECT 1 FROM wakes w JOIN wake_cancellations c ON c.wakeId=w.wakeId
         WHERE w.wakeId=?1 AND w.assignmentId=?2 AND w.state='canceled'
           AND c.outcomeKind='no_replacement'
@@ -124,7 +124,7 @@ defmodule Tightbeam.ReminderDelivery do
           Txn.q(
             txn,
             """
-            WITH source_deliveries AS (SELECT wakeId AS sourceWakeId,deliveredTurnSeq AS turnSeq,assignmentId FROM wakes WHERE deliveredTurnSeq IS NOT NULL)
+            WITH source_deliveries AS (#{Tightbeam.NoticeBatcher.recorded_deliveries_sql()})
             SELECT d.assignmentId,d.sourceWakeId
             FROM source_deliveries d
             WHERE d.turnSeq=?1 AND (SELECT wakeId FROM turns WHERE seq=d.turnSeq)<>d.sourceWakeId AND d.assignmentId IS NOT NULL
@@ -161,7 +161,7 @@ defmodule Tightbeam.ReminderDelivery do
           Txn.q(
             txn,
             """
-            WITH source_deliveries AS (SELECT wakeId AS sourceWakeId,deliveredTurnSeq AS turnSeq,assignmentId FROM wakes WHERE deliveredTurnSeq IS NOT NULL)
+            WITH source_deliveries AS (#{Tightbeam.NoticeBatcher.recorded_deliveries_sql()})
             SELECT d.sourceWakeId FROM source_deliveries d
             WHERE d.turnSeq=?1 AND d.assignmentId=?2 ORDER BY d.sourceWakeId
             """,

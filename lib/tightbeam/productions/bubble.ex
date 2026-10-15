@@ -425,7 +425,7 @@ defmodule Tightbeam.Productions.Bubble do
               DB.Txn.q(
                 txn,
                 """
-                WITH source_deliveries AS (SELECT wakeId AS sourceWakeId,deliveredTurnSeq AS turnSeq,assignmentId FROM wakes WHERE deliveredTurnSeq IS NOT NULL)
+                WITH source_deliveries AS (#{Tightbeam.NoticeBatcher.recorded_deliveries_sql()})
                 SELECT source.wakeId,source.assignmentId,source.sessionKey
                 FROM source_deliveries d JOIN wakes source ON source.wakeId=d.sourceWakeId
                 WHERE d.turnSeq=?1
@@ -580,7 +580,7 @@ defmodule Tightbeam.Productions.Bubble do
       DB.query(
         db,
         """
-        WITH source_deliveries AS (SELECT wakeId AS sourceWakeId,deliveredTurnSeq AS turnSeq,assignmentId FROM wakes WHERE deliveredTurnSeq IS NOT NULL)
+        WITH source_deliveries AS (#{Tightbeam.NoticeBatcher.recorded_deliveries_sql()})
         SELECT source.sessionKey,
                CASE
                  WHEN turn.status IS NOT NULL THEN turn.status
@@ -995,7 +995,7 @@ defmodule Tightbeam.Productions.Bubble do
     case DB.query(
            db,
            """
-           WITH source_deliveries AS (SELECT wakeId AS sourceWakeId,deliveredTurnSeq AS turnSeq,assignmentId FROM wakes WHERE deliveredTurnSeq IS NOT NULL)
+           WITH source_deliveries AS (#{Tightbeam.NoticeBatcher.recorded_deliveries_sql()})
            SELECT source.sessionKey,source.wakeId
            FROM source_deliveries d JOIN wakes source ON source.wakeId=d.sourceWakeId
            JOIN turns turn ON turn.seq=d.turnSeq
@@ -1024,7 +1024,7 @@ defmodule Tightbeam.Productions.Bubble do
     case DB.query(
            db,
            """
-           WITH source_deliveries AS (SELECT wakeId AS sourceWakeId,deliveredTurnSeq AS turnSeq,assignmentId FROM wakes WHERE deliveredTurnSeq IS NOT NULL)
+           WITH source_deliveries AS (#{Tightbeam.NoticeBatcher.recorded_deliveries_sql()})
            SELECT d.sourceWakeId
            FROM source_deliveries d JOIN turns turn ON turn.seq=d.turnSeq
            WHERE turn.wakeId=?1 AND (SELECT wakeId FROM turns WHERE seq=d.turnSeq)<>d.sourceWakeId ORDER BY (SELECT m.publicationSeq FROM notice_batch_members m WHERE m.sourceWakeId=d.sourceWakeId AND m.state='included' LIMIT 1)

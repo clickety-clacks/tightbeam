@@ -14,6 +14,12 @@ defmodule Tightbeam.NoticeBatcher do
   alias Tightbeam.{DB, EventLog, Gateway, Harness, Org, SubmissionSize, Supervision, Wakes}
   alias Tightbeam.DB.Txn
 
+  @doc false
+  def recorded_deliveries_sql do
+    "SELECT wakeId AS sourceWakeId,deliveredTurnSeq AS turnSeq,assignmentId " <>
+      "FROM wakes WHERE deliveredTurnSeq IS NOT NULL"
+  end
+
   @rule "notice-batching-v1 r2"
   @policy_revision "notice-batching-v1 r2"
 
@@ -1381,7 +1387,7 @@ defmodule Tightbeam.NoticeBatcher do
     Txn.q(
       txn,
       """
-      WITH source_deliveries AS (SELECT wakeId AS sourceWakeId,deliveredTurnSeq AS turnSeq,assignmentId FROM wakes WHERE deliveredTurnSeq IS NOT NULL)
+      WITH source_deliveries AS (#{Tightbeam.NoticeBatcher.recorded_deliveries_sql()})
       SELECT t.seq,t.status,d.assignmentId
       FROM source_deliveries d JOIN turns t ON t.seq=d.turnSeq
       WHERE d.sourceWakeId=?1 ORDER BY t.seq

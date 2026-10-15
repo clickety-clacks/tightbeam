@@ -1716,12 +1716,22 @@ defmodule Tightbeam.Schema do
     :ok = migrate_supervision_batch_delivery_guards(db)
     :ok = migrate_wake_retry_source_scope(db)
     :ok = upgrade_notice_source_payload(db)
+    :ok = ensure_wake_assignment_index(db)
     :ok = migrate_wake_delivery(db)
     :ok = migrate_continuation_retry_guard(db)
     :ok = upgrade_decision_request_row_schema_revision(db)
 
     case DB.finish_schema(db) do
       :ok -> :ok
+      {:error, error} -> raise error
+    end
+  end
+
+  defp ensure_wake_assignment_index(db) do
+    case DB.migration_transaction(db, :wake_assignment_index, [], [], fn txn ->
+           Txn.exec(txn, "CREATE INDEX IF NOT EXISTS wakes_assignment ON wakes(assignmentId)")
+         end) do
+      {:ok, :ok} -> :ok
       {:error, error} -> raise error
     end
   end
@@ -1817,8 +1827,8 @@ defmodule Tightbeam.Schema do
         result
 
       {:error, error} ->
-        Logger.error("wake delivery backfill deferred: #{inspect(error)}")
-        :more
+        Logger.error("wake delivery backfill deferred for 5 seconds: #{inspect(error)}")
+        {:error, error}
     end
   end
 
@@ -3286,7 +3296,28 @@ defmodule Tightbeam.Schema do
   # Registration still requires the creator's running turn. A restored leaf
   # retains that immutable originating turn after it ends, so only a proved
   # NOT-DISPATCHED retry may re-admit its existing continuation authority.
-  defp continuation_retry_guard(previous) do
+  defp continuation_retry_guard(previous, recorded \\ false) do
+    delivery_proof =
+      if recorded do
+        "AND old.deliveredTurnSeq=failed.seq"
+      else
+        """
+AND EXISTS (SELECT 1 FROM (SELECT t.seq AS turnSeq,t.wakeId AS sourceWakeId,t.assignmentId AS assignmentId,
+           0 AS carrier,NULL AS publicationSeq
+    FROM turns t WHERE t.wakeId IS NOT NULL
+    UNION ALL
+    SELECT t.seq,m.sourceWakeId,w.assignmentId,1,m.publicationSeq
+    FROM notice_batch_members m
+    JOIN notice_batches b ON b.batchId=m.batchId
+    JOIN wakes w ON w.wakeId=m.sourceWakeId
+    JOIN turns t ON t.wakeId=b.deliveryWakeId
+    WHERE m.state='included'
+    ) delivery
+          WHERE delivery.sourceWakeId=old.wakeId AND delivery.turnSeq=failed.seq
+            AND delivery.assignmentId=w.assignmentId)
+        """
+      end
+
     proof = """
     EXISTS (
       SELECT 1 FROM wake_retry_attempts retry
@@ -3322,19 +3353,7 @@ defmodule Tightbeam.Schema do
         AND terminal.ownerLease=claim.ownerLease
         AND NOT EXISTS (SELECT 1 FROM turn_lifecycle_events dispatched
           WHERE dispatched.turnSeq=failed.seq AND dispatched.kind='prompt_dispatched')
-        AND EXISTS (SELECT 1 FROM (SELECT t.seq AS turnSeq,t.wakeId AS sourceWakeId,t.assignmentId AS assignmentId,
-           0 AS carrier,NULL AS publicationSeq
-    FROM turns t WHERE t.wakeId IS NOT NULL
-    UNION ALL
-    SELECT t.seq,m.sourceWakeId,w.assignmentId,1,m.publicationSeq
-    FROM notice_batch_members m
-    JOIN notice_batches b ON b.batchId=m.batchId
-    JOIN wakes w ON w.wakeId=m.sourceWakeId
-    JOIN turns t ON t.wakeId=b.deliveryWakeId
-    WHERE m.state='included'
-    ) delivery
-          WHERE delivery.sourceWakeId=old.wakeId AND delivery.turnSeq=failed.seq
-            AND delivery.assignmentId=w.assignmentId)
+        #{delivery_proof}
         AND json_extract(terminal.detail,'$.prewrite.disposition')='not_dispatched'
         AND (SELECT count(*) FROM json_each(terminal.detail,'$.prewrite'))=4
         AND (
@@ -3385,17 +3404,7 @@ defmodule Tightbeam.Schema do
   end
 
   defp recorded_continuation_retry_guard(previous) do
-    historical = continuation_retry_guard(previous)
-
-    %{
-      historical
-      | sql:
-          Regex.replace(
-            ~r/AND EXISTS \(SELECT 1 FROM \(SELECT t.seq AS turnSeq.*?delivery.assignmentId=w.assignmentId\)/s,
-            historical.sql,
-            "AND old.deliveredTurnSeq=failed.seq"
-          )
-    }
+    continuation_retry_guard(previous, true)
   end
 
   defp migrate_continuation_retry_guard(db) do

@@ -1136,7 +1136,7 @@ defmodule Tightbeam.Supervision do
           Txn.q(
             txn,
             """
-            WITH deliveries AS (SELECT wakeId AS sourceWakeId,deliveredTurnSeq AS turnSeq,assignmentId FROM wakes WHERE deliveredTurnSeq IS NOT NULL)
+            WITH deliveries AS (#{Tightbeam.NoticeBatcher.recorded_deliveries_sql()})
             SELECT 1 FROM supervision_entitlements e
             JOIN assignments a ON a.id=e.assignmentId
             JOIN wakes old ON old.wakeId=?2 AND old.assignmentId=a.id
@@ -5867,8 +5867,15 @@ defmodule Tightbeam.Supervision do
   defp transfer_candidate_rows(db_or_txn, assignment_id, requested_turn_seq) do
     query(
       db_or_txn,
+      transfer_candidate_sql(),
+      [assignment_id, requested_turn_seq]
+    )
+  end
+
+  @doc false
+  def transfer_candidate_sql do
       """
-      WITH source_deliveries AS (SELECT wakeId AS sourceWakeId,deliveredTurnSeq AS turnSeq,assignmentId FROM wakes WHERE deliveredTurnSeq IS NOT NULL)
+      WITH source_deliveries AS (#{Tightbeam.NoticeBatcher.recorded_deliveries_sql()})
       SELECT t.seq,t.sessionKey,d.assignmentId,
              w.wakeId,w.state,w.assignmentId,w.origin,w.createdAt,w.firedAt,
              w.reresolve,w.reresolveSeed,w.reresolveRung,
@@ -5881,9 +5888,7 @@ defmodule Tightbeam.Supervision do
         AND (?2 IS NULL OR t.seq=?2)
         AND (w.reresolve='lineage' OR sidecar.wakeKind='escalation')
       ORDER BY t.seq
-      """,
-      [assignment_id, requested_turn_seq]
-    )
+      """
   end
 
   defp potential_legacy_candidate?(
@@ -6162,7 +6167,7 @@ defmodule Tightbeam.Supervision do
     query(
       db_or_txn,
       """
-      WITH source_deliveries AS (SELECT wakeId AS sourceWakeId,deliveredTurnSeq AS turnSeq,assignmentId FROM wakes WHERE deliveredTurnSeq IS NOT NULL)
+      WITH source_deliveries AS (#{Tightbeam.NoticeBatcher.recorded_deliveries_sql()})
       SELECT 1 FROM source_deliveries d
       WHERE d.turnSeq=?1 AND d.sourceWakeId=?2 AND (SELECT wakeId FROM turns WHERE seq=d.turnSeq)<>d.sourceWakeId LIMIT 1
       """,

@@ -2130,10 +2130,10 @@ defmodule Tightbeam.Gateway do
   defp existing_wake_turn_in_txn(txn, wake_id) do
     seq =
       case DB.Txn.q(txn, "SELECT deliveredTurnSeq FROM wakes WHERE wakeId=?1", [wake_id]) do
-        [[seq]] ->
+        [[seq]] when is_integer(seq) ->
           seq
 
-        [] ->
+        _ ->
           # Direct callers may use a transport dedupe token without scheduling
           # a wake. Its unique turn key remains the idempotency authority.
           case DB.Txn.q(txn, "SELECT seq FROM turns WHERE wakeId=?1", [wake_id]) do
