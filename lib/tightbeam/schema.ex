@@ -1721,6 +1721,12 @@ defmodule Tightbeam.Schema do
 
     :ok = Tightbeam.Recognition.ensure_schema(db)
 
+    # Built last: the notice source payload migration above rebuilds
+    # notice_batch_members, which drops any index created on the old table.
+    # Building it here keeps a refused migration's schema untouched and makes
+    # the first and every later boot leave the same objects.
+    :ok = ensure_notice_delivery_runtime_indexes(db)
+
     case DB.finish_schema(db) do
       :ok -> Tightbeam.Recognition.activate(db)
       {:error, error} -> raise error
@@ -2378,13 +2384,7 @@ defmodule Tightbeam.Schema do
       {"idle_cleanup_wakes_pending_group",
        "CREATE INDEX IF NOT EXISTS idle_cleanup_wakes_pending_group " <>
          "ON wakes(obligationRef COLLATE NOCASE) " <>
-         "WHERE origin='process:tightbeam' AND state='pending' AND consumer='prompt' AND obligationRef IS NOT NULL"},
-      # Delivery-history lookups by source wake (NoticeBatcher.source_delivered_sql/1
-      # and source_deliveries_sql/1). An explicit index, so these lookups do not
-      # depend on the table carrying a composite UNIQUE that leads with it.
-      {"notice_batch_members_source",
-       "CREATE INDEX IF NOT EXISTS notice_batch_members_source " <>
-         "ON notice_batch_members(sourceWakeId)"}
+         "WHERE origin='process:tightbeam' AND state='pending' AND consumer='prompt' AND obligationRef IS NOT NULL"}
     ]
 
     case DB.migration_transaction(db, :idle_cleanup_runtime_indexes, [], [], fn txn ->
@@ -2407,6 +2407,53 @@ defmodule Tightbeam.Schema do
       {:error, error} ->
         raise ShapeError,
           message: "idle-cleanup runtime index migration failed: #{Exception.message(error)}"
+    end
+  end
+
+  # Delivery-history lookups by source wake (NoticeBatcher.source_delivered_sql/1
+  # and source_deliveries_sql/1). An explicit index, so these lookups do not
+  # depend on the table carrying a composite UNIQUE that leads with it. It is
+  # an access path only: if building it fails, the gateway logs that and still
+  # runs (the lookups then use the table's composite UNIQUE index). Only a
+  # migration transaction that cannot run at all refuses the boot.
+  defp ensure_notice_delivery_runtime_indexes(db) do
+    sql =
+      "CREATE INDEX IF NOT EXISTS notice_batch_members_source " <>
+        "ON notice_batch_members(sourceWakeId)"
+
+    case DB.migration_transaction(db, :notice_delivery_runtime_indexes, [], [], fn txn ->
+           started = System.monotonic_time(:millisecond)
+
+           Logger.info(
+             "database migration notice delivery index notice_batch_members_source: begin"
+           )
+
+           try do
+             :ok = Txn.exec(txn, sql)
+             elapsed = System.monotonic_time(:millisecond) - started
+
+             Logger.info(
+               "database migration notice delivery index notice_batch_members_source: " <>
+                 "finished elapsed_ms=#{elapsed}"
+             )
+
+             :ok
+           rescue
+             error ->
+               Logger.warning(
+                 "notice delivery index notice_batch_members_source was not built; " <>
+                   "continuing without it: #{Exception.message(error)}"
+               )
+
+               :skipped
+           end
+         end) do
+      {:ok, _outcome} ->
+        :ok
+
+      {:error, error} ->
+        raise ShapeError,
+          message: "notice delivery runtime index migration failed: #{Exception.message(error)}"
     end
   end
 

@@ -328,8 +328,12 @@ defmodule Tightbeam.Application do
     :persistent_term.put({__MODULE__, :shutdown_deadline}, deadline)
 
     # Keep the stamp inside the budget even when draining or acknowledgements
-    # use their whole allowance. Short stop budgets reserve the whole budget.
-    work_deadline = deadline - min(5_000, budget)
+    # use their whole allowance: up to 5 s is reserved for it. A budget too
+    # short for that still gives draining and feed acknowledgements half of
+    # itself, up to 500 ms, so a short bounded stop still closes feeds in
+    # order instead of skipping straight to the stamp.
+    work_allowance = max(budget - 5_000, min(500, div(budget, 2)))
+    work_deadline = deadline - budget + work_allowance
     drain_until(work_deadline)
     Tightbeam.Firehose.Hub.shutdown(Tightbeam.Firehose.Hub, work_deadline)
 
