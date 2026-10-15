@@ -1496,6 +1496,7 @@ defmodule Tightbeam.Wire.RouterTest do
     assert is_integer(body["build"]) and body["build"] > 0
     assert body["build"] == Tightbeam.BuildStamp.build()
     assert body["sha"] == Tightbeam.BuildStamp.sha()
+    assert body["wakeScheduler"] == %{"misses" => 0}
   end
 
   test "CLI exact-version refusal is loud after bearer authentication", ctx do

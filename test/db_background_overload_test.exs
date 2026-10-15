@@ -45,16 +45,18 @@ defmodule Tightbeam.DBBackgroundOverloadTest do
     assert {:noreply, ^state} = Tightbeam.Productions.BubbleSweeper.handle_info(:tick, state)
   end
 
-  test "scheduler tick skips overload and retains its next tick", %{db: db} do
+  test "a due event skips overload and leaves recovery to the detector", %{db: db} do
+    timer = make_ref()
     state = %{
-      db: db,
+      db: db, timer: timer, scanned_through: -1,
       internal_consumers: %{},
-      tick_ms: 3_600_000,
       deliver: fn _ -> flunk("delivery must not run") end,
       delivery_opts: []
     }
 
-    assert {:noreply, ^state} = Tightbeam.Wakes.handle_info(:tick, state)
+    assert {:noreply, next} = Tightbeam.Wakes.handle_info({:timeout, timer, :due}, state)
+    assert next.timer == nil
+    assert is_integer(next.scanned_through)
   end
 
   test "recipient drain skips overload without losing scheduler state", %{db: db} do
@@ -65,17 +67,16 @@ defmodule Tightbeam.DBBackgroundOverloadTest do
              Tightbeam.Wakes.handle_cast({:recipient_ready, "recipient"}, state)
   end
 
-  test "fallback skips overload and schedules its next pass", %{db: db} do
+  test "the miss detector skips overload and schedules its next check", %{db: db} do
     state = %{
-      db: db,
+      db: db, timer: nil, scanned_through: -1,
       internal_consumers: %{},
       delivery_opts: [],
       deliver: fn _ -> flunk("delivery must not run") end
     }
 
-    assert {:noreply, ^state} = Tightbeam.Wakes.handle_info(:notice_fallback, state)
-    refute_receive :notice_fallback, 100
-    assert_receive :notice_fallback, 30_500
+    assert {:noreply, ^state} = Tightbeam.Wakes.handle_info(:detect_misses, state)
+    refute_receive :detect_misses, 100
   end
 
   test "backfill skips overload and retries without reporting a persistence failure", %{db: db} do

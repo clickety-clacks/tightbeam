@@ -131,6 +131,7 @@ defmodule Tightbeam.EffortCheckin do
             wake_id,
             elapsed
           ])
+          Wakes.schedule_changed_in_txn(txn)
 
         true ->
           :ok
@@ -1163,6 +1164,7 @@ defmodule Tightbeam.EffortCheckin do
     )
 
     horizon = horizon_for_priority(txn, config, priority)
+    Wakes.schedule_changed_in_txn(txn)
 
     Txn.q(
       txn,
