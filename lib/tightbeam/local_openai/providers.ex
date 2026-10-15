@@ -1,5 +1,6 @@
 defmodule Tightbeam.LocalOpenAi.Providers do
   @moduledoc false
+  require Logger
 
   alias Tightbeam.ErrorDiagnostic
   alias Tightbeam.Harness.Support
@@ -79,18 +80,21 @@ defmodule Tightbeam.LocalOpenAi.Providers do
 
   @doc false
   def read_all(base_dir) when is_binary(base_dir) do
-    base_dir
-    |> list()
-    |> Enum.reduce({:ok, []}, fn name, {:ok, acc} ->
-      case read(base_dir, name) do
-        {:ok, record} -> {:ok, [record | acc]}
-        {:error, _} = error -> error
-      end
-    end)
-    |> case do
-      {:ok, records} -> {:ok, Enum.sort_by(records, & &1.name)}
-      error -> error
-    end
+    records =
+      base_dir
+      |> list()
+      |> Enum.reduce([], fn name, acc ->
+        case read(base_dir, name) do
+          {:ok, record} ->
+            [record | acc]
+
+          {:error, reason} ->
+            log_unreadable_provider(name, reason)
+            acc
+        end
+      end)
+
+    {:ok, Enum.sort_by(records, & &1.name)}
   end
 
   @doc false
@@ -104,20 +108,31 @@ defmodule Tightbeam.LocalOpenAi.Providers do
 
     with {:ok, ssh} <- absolute_executable(target, "ssh"),
          {:ok, files} <- remote_provider_files(target, ssh, providers_dir(base_dir)) do
-      Enum.reduce_while(files, {:ok, []}, fn file, {:ok, acc} ->
-        name = Path.rootname(file)
-        path = Path.join(providers_dir(base_dir), file)
+      records =
+        Enum.reduce(files, [], fn file, acc ->
+          name = Path.rootname(file)
+          path = Path.join(providers_dir(base_dir), file)
 
-        case remote_read_redacted(target, ssh, name, path) do
-          {:ok, record} -> {:cont, {:ok, [record | acc]}}
-          {:error, _} = error -> {:halt, error}
-        end
-      end)
-      |> case do
-        {:ok, records} -> {:ok, Enum.sort_by(records, & &1.name)}
-        error -> error
-      end
+          case remote_read_redacted(target, ssh, name, path) do
+            {:ok, record} ->
+              [record | acc]
+
+            {:error, reason} ->
+              log_unreadable_provider(name, reason)
+              acc
+          end
+        end)
+
+      {:ok, Enum.sort_by(records, & &1.name)}
     end
+  end
+
+  defp log_unreadable_provider(name, reason) do
+    diagnostic = ErrorDiagnostic.from_reason(reason, operation: "read_local_provider")
+
+    Logger.warning(
+      "Skipping unreadable local-openai provider #{inspect(name)}: #{JSON.encode!(diagnostic)}"
+    )
   end
 
   @doc false

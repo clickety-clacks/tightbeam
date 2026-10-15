@@ -1,6 +1,7 @@
 defmodule Tightbeam.PiProvider.OpenCodeGo do
   @moduledoc false
   @behaviour Tightbeam.PiProvider
+  require Logger
 
   alias Tightbeam.Harness.Support
 
@@ -122,18 +123,32 @@ defmodule Tightbeam.PiProvider.OpenCodeGo do
   defp decode_catalog(_body), do: {:error, :malformed_catalog}
 
   defp derive_entries(models) do
-    models
-    |> Enum.reduce_while({:ok, []}, fn {_key, model}, {:ok, entries} ->
-      case catalog_entry(model) do
-        {:ok, entry} -> {:cont, {:ok, [entry | entries]}}
-        :error -> {:halt, {:error, :malformed_catalog}}
-      end
-    end)
-    |> case do
-      {:ok, entries} -> {:ok, Enum.sort_by(entries, & &1.family)}
-      error -> error
+    {entries, skipped} =
+      Enum.reduce(models, {[], 0}, fn {key, model}, {entries, skipped} ->
+        case catalog_entry(model) do
+          {:ok, entry} ->
+            {[entry | entries], skipped}
+
+          :error ->
+            Logger.warning(
+              "Skipping malformed OpenCode Go catalog model #{inspect(model_identity(model, key))}"
+            )
+
+            {entries, skipped + 1}
+        end
+      end)
+
+    case Enum.sort_by(entries, & &1.family) do
+      [] when skipped > 0 -> {:error, :malformed_catalog}
+      sorted -> {:ok, sorted}
     end
   end
+
+  defp model_identity(%{"id" => id}, _key) when is_binary(id) and id != "" do
+    String.slice(id, 0, 120)
+  end
+
+  defp model_identity(_model, key), do: "provider-key=#{String.slice(key, 0, 120)}"
 
   defp catalog_entry(
          %{

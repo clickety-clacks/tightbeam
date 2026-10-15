@@ -203,6 +203,46 @@ defmodule Tightbeam.HarnessPiTest do
              Pi.fetch_catalog(state)
   end
 
+  test "a malformed OpenCode Go model does not discard healthy catalog entries" do
+    state = %{
+      base_dir: "/vector/base",
+      find_executable: fn
+        "sh" -> "/bin/sh"
+        "curl" -> "/usr/bin/curl"
+      end,
+      options: %{
+        sh: fn _command ->
+          body =
+            JSON.encode!(%{
+              "good" => %{
+                "id" => "good",
+                "name" => "Good model",
+                "provider" => "opencode-go",
+                "contextWindow" => 1000,
+                "maxTokens" => 100,
+                "thinkingLevelMap" => %{"medium" => "medium"}
+              },
+              "broken" => %{"id" => "broken", "name" => "Broken model"}
+            })
+
+          {body <> "\n200", 0}
+        end
+      },
+      host_config: %{ssh: nil}
+    }
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:ok, [model]} =
+                 Tightbeam.PiProvider.OpenCodeGo.fetch_catalog(state)
+
+        assert model.family == "opencode-go/good"
+      end)
+
+    assert log =~ "Skipping malformed OpenCode Go catalog model"
+    assert log =~ "broken"
+  end
+
   test "liveness uses the live-proven Pi request without putting the key in argv" do
     owner = self()
 

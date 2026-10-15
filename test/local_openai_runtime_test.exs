@@ -1,7 +1,6 @@
 defmodule Tightbeam.LocalOpenAiRuntimeTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.ErrorDiagnostic
   alias Tightbeam.Harness.Support
   alias Tightbeam.LocalOpenAi.Providers
   alias Tightbeam.PiProvider
@@ -72,10 +71,41 @@ defmodule Tightbeam.LocalOpenAiRuntimeTest do
           assert PiProvider.named_local_providers(base) == []
         end)
 
-      assert log =~ "local-openai providers could not be read"
-      assert log =~ "read_local_providers"
+      assert log =~ "Skipping unreadable local-openai provider \"spark\""
       assert log =~ "not valid JSON"
       refute log =~ @sentinel
+    end
+
+    test "a malformed named provider is logged and skipped beside a healthy provider", %{
+      base: base
+    } do
+      {:ok, healthy} = Providers.encode_record("healthy", "https://healthy.example/v1")
+      File.write!(Providers.provider_path(base, "healthy"), healthy)
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert {:ok, [record]} = Providers.read_all(base)
+          assert record.name == "healthy"
+        end)
+
+      assert log =~ "Skipping unreadable local-openai provider \"spark\""
+      refute log =~ @sentinel
+    end
+
+    test "an unreadable named provider does not hide healthy providers", %{base: base} do
+      File.rm!(Providers.provider_path(base, "spark"))
+      File.mkdir!(Providers.provider_path(base, "broken"))
+      {:ok, healthy} = Providers.encode_record("healthy", "https://healthy.example/v1")
+      File.write!(Providers.provider_path(base, "healthy"), healthy)
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert {:ok, [record]} = Providers.read_all(base)
+          assert record.name == "healthy"
+        end)
+
+      assert log =~ "Skipping unreadable local-openai provider \"broken\""
+      assert log =~ "eisdir"
     end
   end
 
@@ -289,9 +319,13 @@ defmodule Tightbeam.LocalOpenAiRuntimeTest do
       host_config: %{ssh: "fixture@remote", base_dir: "/remote/tightbeam"}
     }
 
-    result = Providers.read_all_target(state)
-    assert {:error, {:remote_provider_read_failed, "spark", {:exit, 65}}} = result
-    refute inspect(result) =~ secret
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:ok, []} = Providers.read_all_target(state)
+      end)
+
+    assert log =~ "Skipping unreadable local-openai provider \"spark\""
+    refute log =~ secret
   end
 
   test "remote provider read refuses malformed redaction output without returning its bytes" do
@@ -333,13 +367,56 @@ defmodule Tightbeam.LocalOpenAiRuntimeTest do
       host_config: %{ssh: "fixture@remote", base_dir: "/remote/tightbeam"}
     }
 
-    result = Providers.read_all_target(state)
-    assert {:error, {:remote_provider_read_failed, "spark", _reason}} = result
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:ok, []} = Providers.read_all_target(state)
+      end)
+
     assert_receive {:redactor_output, output, command}
     refute output =~ secret
     refute inspect(command) =~ secret
     assert inspect(command) =~ "JSON.parse"
-    refute inspect(result) =~ secret
+    assert log =~ "Skipping unreadable local-openai provider \"spark\""
+    refute log =~ secret
+  end
+
+  test "a bad remote provider file does not remove healthy providers" do
+    state = %{
+      base_dir: "/remote/tightbeam",
+      options: %{
+        find_executable: fn "ssh" -> "/usr/bin/ssh" end,
+        sh: fn command ->
+          joined = Enum.join(command, " ")
+
+          cond do
+            String.contains?(joined, "/bin/ls -1") ->
+              {"broken.json\nspark.json\n", 0}
+
+            String.contains?(joined, "JSON.parse") and String.contains?(joined, "broken.json") ->
+              {"SyntaxError: malformed provider descriptor\n", 65}
+
+            String.contains?(joined, "JSON.parse") ->
+              {~s({"name":"spark","type":"local-openai","endpoint":"https://spark.example/v1"}) <>
+                 "\n__TIGHTBEAM_API_KEY_ABSENT__\n", 0}
+
+            String.contains?(joined, "/bin/test") ->
+              {"", 0}
+
+            true ->
+              flunk("unexpected remote command: #{inspect(command)}")
+          end
+        end
+      },
+      host_config: %{ssh: "fixture@remote", base_dir: "/remote/tightbeam"}
+    }
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:ok, [record]} = Providers.read_all_target(state)
+        assert record.name == "spark"
+      end)
+
+    assert log =~ "Skipping unreadable local-openai provider \"broken\""
   end
 
   test "remote provider refusals that are not stdout keep their reason" do
@@ -370,49 +447,35 @@ defmodule Tightbeam.LocalOpenAiRuntimeTest do
          "\n__TIGHTBEAM_API_KEY_ABSENT__\n", 0}
     end
 
-    assert {:error, {:remote_provider_read_failed, "spark", reason}} =
-             Providers.read_all_target(remote.(empty_endpoint))
+    empty_log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:ok, []} = Providers.read_all_target(remote.(empty_endpoint))
+      end)
 
-    assert reason ==
-             "the local-openai provider record at /remote/tightbeam/auth/pi-local/providers/spark.json is invalid: endpoint is empty"
+    assert empty_log =~ "Skipping unreadable local-openai provider \"spark\""
+    assert empty_log =~ "endpoint is empty"
 
     # A transport exception keeps its message instead of becoming a bare atom.
     raised = fn -> raise "ssh transport broke for sk-fixture-SENTINEL-0123456789abcdef" end
 
-    assert {:error,
-            {:remote_provider_read_failed, "spark", {:transport, {:transport_exception, message}}}} =
-             Providers.read_all_target(remote.(raised))
+    raised_log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:ok, []} = Providers.read_all_target(remote.(raised))
+      end)
 
-    assert message == "ssh transport broke for [REDACTED:token]"
+    assert raised_log =~ "ssh transport broke for [REDACTED:token]"
 
     # An unexpected runner result keeps its classification and typed safe detail.
     unexpected = fn -> {~s({"apiKey":"TB_REMOTE_UNEXPECTED_RESULT_SECRET"}), :killed} end
 
-    assert {:error, {:remote_provider_read_failed, "spark", reason}} =
-             Providers.read_all_target(remote.(unexpected))
+    unexpected_log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:ok, []} = Providers.read_all_target(remote.(unexpected))
+      end)
 
-    assert {:remote_command_failed, {:unexpected_result, {{:binary, bytes}, :killed}}} =
-             ErrorDiagnostic.classified(reason)
-
-    assert bytes == byte_size(~s({"apiKey":"TB_REMOTE_UNEXPECTED_RESULT_SECRET"}))
-
-    assert %{
-             "kind" => "unexpected_result",
-             "operation" => "remote_command",
-             "phase" => "bounded_run",
-             "origin" => "local_openai_provider",
-             "reason" => %{
-               "$type" => "tuple",
-               "items" => [
-                 ~s({"apiKey":"[REDACTED:secret_field]"}),
-                 %{"$type" => "atom", "value" => "killed"}
-               ]
-             }
-           } = ErrorDiagnostic.of(reason)
-
-    assert inspect(reason) =~ "unexpected_result"
-    assert inspect(reason) =~ "killed"
-    refute inspect(reason) =~ "TB_REMOTE_UNEXPECTED_RESULT_SECRET"
+    assert unexpected_log =~ "unexpected_result"
+    assert unexpected_log =~ "killed"
+    refute unexpected_log =~ "TB_REMOTE_UNEXPECTED_RESULT_SECRET"
   end
 
   test "unproven local models receive conservative capabilities" do

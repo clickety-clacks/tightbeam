@@ -438,6 +438,76 @@ defmodule Tightbeam.CredentialKindsTest do
       refute "authorization" in names
     end
 
+    test "missing and malformed model details skip only those Claude models", ctx do
+      stage!(ctx.base, "claude", ".credentials.json", "sk-ant-api03-catalog")
+
+      models =
+        JSON.encode!(%{
+          "data" => [
+            %{"id" => "claude-gone"},
+            %{"id" => "claude-bad-detail"},
+            %{"id" => "claude-good"}
+          ]
+        })
+
+      fetch = fn
+        "/v1/models?limit=100", _headers ->
+          {:ok, models}
+
+        "/v1/models/claude-gone", _headers ->
+          {:error, {:http_status, 404, "model missing"}}
+
+        "/v1/models/claude-bad-detail", _headers ->
+          {:ok, "{"}
+
+        "/v1/models/claude-good", _headers ->
+          {:ok,
+           JSON.encode!(%{
+             "display_name" => "Claude Good",
+             "max_input_tokens" => 200_000,
+             "capabilities" => %{"effort" => %{"low" => %{"supported" => true}}}
+           })}
+      end
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert {:ok, [entry]} =
+                   Claude.fetch_catalog(%{
+                     base_dir: ctx.base,
+                     credential_kind: :api_key,
+                     options: %{claude_fetch: fetch}
+                   })
+
+          assert entry.family == "claude-good"
+        end)
+
+      assert log =~ "claude-gone"
+      assert log =~ "claude-bad-detail"
+    end
+
+    test "Claude model-detail authentication and authorization errors remain provider failures",
+         ctx do
+      stage!(ctx.base, "claude", ".credentials.json", "sk-ant-api03-catalog")
+      models = JSON.encode!(%{"data" => [%{"id" => "claude-auth-check"}]})
+
+      for status <- [401, 403] do
+        fetch = fn
+          "/v1/models?limit=100", _headers ->
+            {:ok, models}
+
+          "/v1/models/claude-auth-check", _headers ->
+            {:error, {:http_status, status, "provider authorization response"}}
+        end
+
+        assert {:error, {:http_status, ^status, "provider authorization response"}} =
+                 Claude.fetch_catalog(%{
+                   base_dir: ctx.base,
+                   credential_kind: :api_key,
+                   options: %{claude_fetch: fetch}
+                 })
+      end
+    end
+
     test "a subscription claude host still sends a bearer token", ctx do
       stage!(
         ctx.base,
@@ -508,6 +578,31 @@ defmodule Tightbeam.CredentialKindsTest do
       assert entry.efforts == ~w(low medium high xhigh max ultra)
       assert entry.max_input_tokens == nil
       assert entry.provider == :openai
+    end
+
+    test "a malformed platform model does not hide a valid Codex model", ctx do
+      stage!(ctx.base, "codex", "auth.json", ~s({"OPENAI_API_KEY":"sk-proj-catalog"}))
+
+      sh = fn command ->
+        if String.contains?(Enum.join(command, " "), "model/list") do
+          {stock_codex_models_body(), 0}
+        else
+          {~s({"data":[{"id":"gpt-5.6-sol"},{"object":"model"}]}) <> "\n200", 0}
+        end
+      end
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert {:ok, [%{family: "gpt-5.6-sol"}]} =
+                   Codex.fetch_catalog(%{
+                     base_dir: ctx.base,
+                     credential_kind: :api_key,
+                     options: %{sh: sh}
+                   })
+        end)
+
+      assert log =~ "Codex platform catalog model"
+      assert log =~ "entry-index=2"
     end
 
     # Recorded reality, the #89/#99 api-key exercise (2026-07-28): the platform
@@ -714,6 +809,39 @@ defmodule Tightbeam.CredentialKindsTest do
                    options: %{sh: sh}
                  })
       end
+    end
+
+    test "malformed selected-engine efforts skip only their Codex model", ctx do
+      stage!(ctx.base, "codex", "auth.json", ~s({"OPENAI_API_KEY":"fixture-key"}))
+      engine = stock_codex_models_body() |> JSON.decode!()
+
+      models =
+        Enum.map(engine["models"], fn
+          %{"id" => "gpt-6-astra"} = model ->
+            Map.put(model, "supportedReasoningEfforts", [%{"reasoningEffort" => "high"}, "bad"])
+
+          model ->
+            model
+        end)
+
+      sh = fn command ->
+        if String.contains?(Enum.join(command, " "), "model/list"),
+          do: {JSON.encode!(%{engine | "models" => models}), 0},
+          else: {~s({"data":[{"id":"gpt-5.6-sol"},{"id":"gpt-6-astra"}]}) <> "\n200", 0}
+      end
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert {:ok, [%{family: "gpt-5.6-sol"}]} =
+                   Codex.fetch_catalog(%{
+                     base_dir: ctx.base,
+                     credential_kind: :api_key,
+                     options: %{sh: sh}
+                   })
+        end)
+
+      assert log =~ "Codex selected_engine catalog model"
+      assert log =~ "gpt-6-astra"
     end
 
     test "Astra native probe selects CODEX_PATH rather than an unrelated global binary", ctx do
