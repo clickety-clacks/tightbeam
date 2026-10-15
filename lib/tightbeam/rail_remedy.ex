@@ -244,14 +244,19 @@ defmodule Tightbeam.RailRemedy do
   end
 
   @doc false
-  def reconcile_pending_episodes(db, interval) do
+  def reconcile_pending_episodes(db, interval, subject \\ nil) do
     DB.transaction(db, fn txn ->
-      Txn.q(txn, """
-      SELECT subject,occurrence,producerKey,noticeState FROM rail_remedy_episodes
-      WHERE statute='completion-requires-review' AND status='live'
-        AND (noticeState IS NULL OR json_extract(noticeState,'$.reassessment') IS NULL)
-      ORDER BY openedAt,subject
-      """)
+      Txn.q(
+        txn,
+        """
+        SELECT subject,occurrence,producerKey,noticeState FROM rail_remedy_episodes
+        WHERE statute='completion-requires-review' AND status='live'
+          AND (?1 IS NULL OR subject=?1)
+          AND (noticeState IS NULL OR json_extract(noticeState,'$.reassessment') IS NULL)
+        ORDER BY openedAt,subject
+        """,
+        [subject]
+      )
       |> Enum.each(fn [subject, occurrence, producer, encoded] ->
         state =
           if encoded,

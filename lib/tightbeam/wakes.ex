@@ -1088,7 +1088,10 @@ defmodule Tightbeam.Wakes do
 
         # The DB has rolled back this notice. Do not invent cancellation or
         # lifecycle evidence after its failed transaction, or leak SQL/payloads.
-        Logger.warning("terminal notice #{wake_id} recognition deferred: #{reason}")
+        Logger.warning(
+          "terminal notice #{wake_id} recognition deferred: #{reason}; pending until a later scheduler pass"
+        )
+
         {:deferred, %{wake_id: wake_id, reason: reason}}
     end
   end
@@ -6294,10 +6297,9 @@ defmodule Tightbeam.Wakes do
   end
 
   @doc false
-  # The DB owner retains this runtime destination until it exits. A scheduler
-  # restart replaces it; the existing outbox sends only after a successful commit.
+  # The existing outbox sends to the registered scheduler only after commit.
   def schedule_changed_in_txn(%Txn{} = txn, message) do
-    Txn.handoff(txn, Process.get({__MODULE__, :scheduler}, Tightbeam.WakeScheduler), message)
+    Txn.handoff(txn, Tightbeam.WakeScheduler, message)
   end
 
   @doc false
@@ -6354,13 +6356,6 @@ defmodule Tightbeam.Wakes do
       internal_consumers: Keyword.get(opts, :internal_consumers, %{})
     }
 
-    scheduler = self()
-
-    {:ok, _} =
-      DB.transaction(state.db, fn _txn ->
-        Process.put({__MODULE__, :scheduler}, scheduler)
-      end)
-
     Process.send_after(self(), :detect_misses, @miss_detector_ms)
     send(self(), :review_remedy_changed)
     send(self(), :recover_notices)
@@ -6404,6 +6399,10 @@ defmodule Tightbeam.Wakes do
       true ->
         {:noreply, state}
     end
+  end
+
+  def handle_cast({:review_remedy_changed, subject}, state) do
+    {:noreply, review_remedy_changed(state, nil, subject)}
   end
 
   def handle_cast(:review_remedy_changed, state) do
@@ -7643,11 +7642,6 @@ defmodule Tightbeam.Wakes do
 
   @doc false
   def publish_change_in_txn(%Txn{} = txn, class, wake_id) do
-    if class == "wake.scheduled" do
-      [[due_at]] = Txn.q(txn, "SELECT dueAt FROM wakes WHERE wakeId=?1", [wake_id])
-      schedule_changed_in_txn(txn, {:schedule_changed, due_at})
-    end
-
     case delivery_projection_in_txn(txn, wake_id) do
       nil ->
         :ok
@@ -7908,7 +7902,7 @@ defmodule Tightbeam.Wakes do
     end
   end
 
-  defp review_remedy_changed(state, recipient \\ nil) do
+  defp review_remedy_changed(state, recipient \\ nil, subject \\ nil) do
     if Map.has_key?(state.internal_consumers, "review_remedy_reconcile") do
       result =
         DB.background_pass(
@@ -7917,7 +7911,8 @@ defmodule Tightbeam.Wakes do
               {:ok, :ok} =
                 Tightbeam.RailRemedy.reconcile_pending_episodes(
                   state.db,
-                  state.review_remedy_interval_ms
+                  state.review_remedy_interval_ms,
+                  subject
                 )
             end
 
@@ -7928,8 +7923,9 @@ defmodule Tightbeam.Wakes do
                   """
                   UPDATE wakes SET dueAt=?1 WHERE state='pending' AND consumer='review_remedy_reconcile'
                     AND (?2 IS NULL OR sessionKey=?2)
+                    AND (?3 IS NULL OR assignmentId=?3)
                   """,
-                  [now(), recipient]
+                  [now(), recipient, subject]
                 )
               end)
           end,
@@ -7959,20 +7955,6 @@ defmodule Tightbeam.Wakes do
             WHERE state='pending' AND dueAt<?1 AND consumer='prompt'
               AND #{prompt_eligibility_sql()}
               AND deliveredTurnSeq IS NULL
-              AND NOT EXISTS (
-                SELECT 1 FROM turns t
-                WHERE t.sessionKey=CASE
-                  WHEN wakes.targetRole IS NOT NULL THEN (
-                    SELECT r.boundSessionKey FROM roles r
-                    JOIN sessions s ON s.sessionKey=r.boundSessionKey AND s.state='active'
-                    WHERE r.name=wakes.targetRole
-                  )
-                  WHEN wakes.reresolve='lineage' AND NOT EXISTS (
-                    SELECT 1 FROM sessions s WHERE s.sessionKey=wakes.sessionKey AND s.state='active'
-                  ) THEN NULL
-                  ELSE wakes.sessionKey END
-                  AND t.status IN ('running','queued')
-              )
             ORDER BY dueAt
             """,
           [at - @miss_lateness_ms]
@@ -8023,7 +8005,7 @@ defmodule Tightbeam.Wakes do
     end
 
     detected =
-      Enum.reduce(candidates, state.detected_misses, fn {wake, _}, set ->
+      Enum.reduce(candidates, MapSet.new(), fn {wake, _}, set ->
         MapSet.put(set, wake.wake_id)
       end)
 

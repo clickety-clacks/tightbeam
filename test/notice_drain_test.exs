@@ -85,7 +85,7 @@ defmodule Tightbeam.NoticeDrainTest do
       start_supervised!(
         {Wakes,
          db: ctx.db,
-         name: :notice_due_scheduler,
+         name: Tightbeam.WakeScheduler,
          tick_ms: 60_000,
          delivery_opts: ctx.delivery_opts,
          deliver: fn _ -> :ok end}

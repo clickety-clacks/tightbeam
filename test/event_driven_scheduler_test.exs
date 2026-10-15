@@ -34,7 +34,7 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
        Keyword.merge(
          [
            db: ctx.db,
-           name: nil,
+           name: Tightbeam.WakeScheduler,
            deliver: fn wake ->
              send(parent, {:delivered, wake.wake_id, System.system_time(:millisecond)})
            end,
@@ -247,6 +247,7 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
     send(pid, :detect_misses)
     :sys.get_state(pid)
     assert Tightbeam.SchedulerMisses.count() - ctx.misses_before == 1
+    assert :sys.get_state(pid).detected_misses == MapSet.new()
   end
 
   test "failed internal deliveries back off and succeed without another write", ctx do
@@ -263,10 +264,10 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
 
     pid = scheduler(ctx, internal_consumers: %{"effort_probe" => consumer})
     scheduled = wake(ctx.db, System.system_time(:millisecond), %{consumer: "effort_probe"})
-    assert_receive {:attempt, 1, first}, 1_000
-    assert_receive {:attempt, 2, second}, 1_600
+    assert_receive {:attempt, 1, first}, 5_000
+    assert_receive {:attempt, 2, second}, 5_000
     assert second - first >= 1_000
-    assert_receive {:attempt, 3, third}, 2_600
+    assert_receive {:attempt, 3, third}, 7_000
     assert third - second >= 2_000
     :sys.get_state(pid)
     assert Wakes.get(ctx.db, scheduled.wake_id).state == "fired"

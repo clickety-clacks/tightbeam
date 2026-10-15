@@ -105,7 +105,7 @@ defmodule Tightbeam.RailRemedyTest do
       start_supervised!(
         {Wakes,
          db: ctx.db,
-         name: nil,
+         name: Tightbeam.WakeScheduler,
          delivery_opts: ctx.delivery_opts,
          deliver: fn _ -> :skipped end,
          internal_consumers: %{"review_remedy_reconcile" => consumer}}
@@ -137,12 +137,49 @@ defmodule Tightbeam.RailRemedyTest do
     episode = RailRemedy.episode(ctx.db, "completion-requires-review", assignment.id)
     next = episode.notice_state["reassessment"]["wakeId"]
 
-    assert {:ok, :ok} =
-             DB.transaction(ctx.db, fn txn ->
-               Wakes.schedule_changed_in_txn(txn, :review_remedy_changed)
-             end)
+    unrelated = notice_assignment(ctx, "unrelated reassessment")
+    due_at = 253_402_300_799_000
+
+    other =
+      Wakes.schedule(ctx.db, %{
+        session_key: ctx.holder.session_key,
+        origin: "system",
+        consumer: "review_remedy_reconcile",
+        assignment_id: unrelated.id,
+        due_at: due_at
+      })
+
+    review = linked_review(ctx, assignment.id, "event review")
+
+    assert %{attest: %{verdictKind: "changes-requested"}} =
+             verdict(ctx, review.id, "changes-requested")
 
     assert_receive {:reassessed, ^next}, 1_000
+    :sys.get_state(pid)
+    assert Wakes.get(ctx.db, other.wake_id).due_at == due_at
+    assert Wakes.get(ctx.db, other.wake_id).state == "pending"
+  end
+
+  test "episode recovery only reconstructs the requested review subject", ctx do
+    assignment = notice_assignment(ctx, "scoped recovery")
+    unrelated = notice_assignment(ctx, "unrelated recovery")
+    fire_review_notice(ctx, assignment)
+    fire_review_notice(ctx, unrelated)
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "UPDATE rail_remedy_episodes SET noticeState=NULL WHERE subject IN (?1,?2)",
+               [assignment.id, unrelated.id]
+             )
+
+    assert {:ok, :ok} = RailRemedy.reconcile_pending_episodes(ctx.db, 1_000, assignment.id)
+
+    assert RailRemedy.episode(ctx.db, "completion-requires-review", assignment.id).notice_state !=
+             nil
+
+    assert RailRemedy.episode(ctx.db, "completion-requires-review", unrelated.id).notice_state ==
+             nil
   end
 
   test "review notice retargets one pending unroutable attempt", ctx do
