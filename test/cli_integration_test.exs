@@ -1595,10 +1595,6 @@ defmodule Tightbeam.CliIntegrationTest do
 
     work_id = JSON.decode!(assigned)["id"]
 
-    register_hosts(ctx.db, %{
-      Tightbeam.Placement.local_host_name() => %{ssh: nil, base_dir: ctx.base_dir, cli_bin: nil}
-    })
-
     repo = Path.expand("..", __DIR__)
     {commit, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: repo)
 
