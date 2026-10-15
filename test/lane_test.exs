@@ -146,13 +146,21 @@ defmodule Tightbeam.LaneTest do
     log =
       ExUnit.CaptureLog.capture_log(fn ->
         send(manager, :tick)
-        :sys.get_state(manager)
+        assert_receive {:event_turn, ^missed, task}, 2_000
+        send(task, :finish)
+        assert eventually(fn -> map_size(:sys.get_state(manager).reaping) == 0 end)
       end)
 
     assert log =~ "loop=lane record=k1"
     assert Tightbeam.SchedulerMisses.count() == before + 1
-    assert_receive {:event_turn, ^missed, task}, 2_000
-    send(task, :finish)
+
+    assert {:ok, _lane, _token} = LaneManager.ensure_settlement_lane(manager, "k2")
+    enqueue!(ctx.db, "k2", "reserved")
+    before = Tightbeam.SchedulerMisses.count()
+    send(manager, :tick)
+    :sys.get_state(manager)
+    assert eventually(fn -> map_size(:sys.get_state(manager).reaping) == 0 end)
+    assert Tightbeam.SchedulerMisses.count() == before
   end
 
   test "a lane crash is repaired by its monitor without waiting for a scan", ctx do

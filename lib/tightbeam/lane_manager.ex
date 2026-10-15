@@ -181,13 +181,12 @@ defmodule Tightbeam.LaneManager do
       if detect and active? do
         acc
       else
-        if detect, do: Tightbeam.SchedulerMisses.record(:lane, session_key)
-        repair_lane(acc, session_key)
+        repair_lane(acc, session_key, detect)
       end
     end)
   end
 
-  defp repair_lane(state, session_key) do
+  defp repair_lane(state, session_key, detect \\ false) do
     ensure(state, session_key)
 
     if Enum.any?(state.reaping, fn {_ref, key} -> key == session_key end) do
@@ -195,7 +194,9 @@ defmodule Tightbeam.LaneManager do
     else
       task =
         Task.Supervisor.async_nolink(state.task_sup, fn ->
-          SessionLane.reap_abandoned(session_key)
+          outcome = SessionLane.reap_abandoned(session_key)
+          if detect and outcome != :active and not parked?(state.db, session_key),
+            do: Tightbeam.SchedulerMisses.record(:lane, session_key)
           SessionLane.nudge(session_key)
 
           DB.background_pass(fn ->
@@ -208,6 +209,15 @@ defmodule Tightbeam.LaneManager do
         end)
 
       %{state | reaping: Map.put(state.reaping, task.ref, session_key)}
+    end
+  end
+
+  defp parked?(db, session_key) do
+    case DB.query(db, "SELECT harness,host FROM sessions WHERE sessionKey=?1", [session_key]) do
+      {:ok, [[harness, host]]} ->
+        Tightbeam.HarnessProcess.parked?(db, {Tightbeam.Harness.parse!(harness).id(), "shared", host})
+      {:ok, []} -> false
+      {:error, error} -> raise error
     end
   end
 
