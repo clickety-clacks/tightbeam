@@ -30,11 +30,10 @@ defmodule Tightbeam.ConnRegistryTest do
 
     registry_monitor = :sys.get_state(reg).conns[ref].monitor
     assert is_reference(registry_monitor)
-    monitor = Process.monitor(pid)
+    :erlang.trace(reg, true, [:receive])
     Process.exit(pid, :kill)
-    assert_receive {:DOWN, ^monitor, :process, ^pid, :killed}
-    # Deliver the registry's monitor event before the state query from this sender.
-    send(reg, {:DOWN, registry_monitor, :process, pid, :killed})
+    assert_receive {:trace, ^reg, :receive, {:DOWN, ^registry_monitor, :process, ^pid, :killed}}
+    :erlang.trace(reg, false, [:receive])
     state = :sys.get_state(reg)
 
     refute Map.has_key?(state.conns, ref)
