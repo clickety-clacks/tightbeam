@@ -5110,10 +5110,11 @@ defmodule Tightbeam.Supervision do
   def idle_cleanup_delivery_in_txn(txn, wake_id, snapshot_at) when is_binary(wake_id) do
     case Wakes.get_in_txn(txn, wake_id) do
       %{origin: "process:tightbeam", obligation_ref: @idle_cleanup_prefix <> _} = wake ->
-        if wake.state == "pending" do
-          idle_cleanup_resolve_delivery_in_txn(txn, wake, snapshot_at)
-        else
-          :stale
+        cond do
+          wake.state != "pending" -> :stale
+          Txn.q(txn, "SELECT 1 FROM supervision_state_migration WHERE id=0 AND complete=0") != [] ->
+            {:idle_cleanup_deferred, :state_backfill}
+          true -> idle_cleanup_resolve_delivery_in_txn(txn, wake, snapshot_at)
         end
 
       _ ->
