@@ -355,6 +355,40 @@ defmodule Tightbeam.WorkspaceCleanupTest do
     assert WorkspaceCleanup.health(ctx.db).count == 0
   end
 
+  test "an interrupted archive copy preserves originals and resumes its staging directory", ctx do
+    kept = Path.join(ctx.workspace, "kept")
+    File.write!(kept, "preserve through a failed copy")
+    artifact = artifact(ctx, kept)
+    retire(ctx)
+    attempts = :atomics.new(1, [])
+    runner = fn _invocation, script, input ->
+      copy_script = String.replace(script,
+        ~s(if [ "$(device_id "$source")" = "$(device_id "$(dirname "$target")")" ]; then),
+        "if false; then")
+      prefix = if :atomics.add_get(attempts, 1, 1) == 1 do
+        """
+        cp() {
+          command cp "$@" || return $?
+          return 1
+        }
+        """
+      else
+        ""
+      end
+      WorkspaceCleanup.system_runner(["sh", "-c", prefix <> copy_script], copy_script, input)
+    end
+    config = Map.put(ctx.config, :workspace_cleanup_runner, runner)
+    assert %{status: "incomplete"} = WorkspaceCleanup.process_session(config, ctx.db, ctx.session.session_key)
+    assert File.read!(kept) == "preserve through a failed copy"
+    assert {:ok, [[destination]]} = DB.query(ctx.db, "SELECT archivePath FROM retired_workspace_cleanup WHERE sessionKey=?1", [ctx.session.session_key])
+    refute File.exists?(destination)
+    assert File.read!(Path.join(destination <> ".partial", "kept")) == "preserve through a failed copy"
+    assert %{status: "completed"} = WorkspaceCleanup.process_session(config, ctx.db, ctx.session.session_key)
+    refute File.exists?(ctx.workspace)
+    refute File.exists?(destination <> ".partial")
+    assert File.read!(Artifacts.get(ctx.db, artifact.artifact_id).home) == "preserve through a failed copy"
+  end
+
   defp retire(ctx) do
     {:ok, _} =
       DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [

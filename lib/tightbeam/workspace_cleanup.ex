@@ -93,8 +93,8 @@ defmodule Tightbeam.WorkspaceCleanup do
           {:ok, _} =
             DB.query(
               db,
-              "INSERT OR IGNORE INTO retired_archive_relocation(host,destination) VALUES(?1,?2)",
-              [name, destination]
+              "INSERT OR IGNORE INTO retired_archive_relocation(host,destination,archivePath) VALUES(?1,?2,?3)",
+              [name, destination, Path.join(destination, "previous-" <> archive_name(name))]
             )
 
           case DB.query(
@@ -129,18 +129,8 @@ defmodule Tightbeam.WorkspaceCleanup do
     if relative_inside(destination, source) != nil or relative_inside(source, destination) != nil,
       do: raise(ArgumentError, "archive relocation directories overlap")
 
-    target = Path.join(destination, "previous-" <> Base.url_encode64(name, padding: false))
-
-    script = """
-    set -e
-    source=#{shell_quote(source)}
-    target=#{shell_quote(target)}
-    if [ -d "$source" ]; then
-      [ ! -e "$target" ]
-      mkdir -p "$(dirname "$target")"
-      mv "$source" "$target"
-    fi
-    """
+    {:ok, [[target]]} = DB.query(db, "SELECT archivePath FROM retired_archive_relocation WHERE host=?1 AND destination=?2", [name, destination])
+    script = move_script() <> "\nmove_workspace " <> shell_quote(source) <> " " <> shell_quote(target)
 
     invocation = invocation(host, script)
     runner = Map.get(config, :workspace_cleanup_runner) || (&system_runner/3)
@@ -194,6 +184,39 @@ defmodule Tightbeam.WorkspaceCleanup do
     end
   end
 
+  defp archive_name(key),
+    do: Base.url_encode64(key, padding: false) <> "-" <> Base.encode16(:crypto.strong_rand_bytes(6), case: :lower)
+
+  defp move_script do
+    """
+    device_id() {
+      stat -c '%d' "$1" 2>/dev/null || stat -f '%d' "$1" 2>/dev/null
+    }
+
+    move_workspace() (
+      source=$1
+      target=$2
+      [ ! -L "$source" ] && [ ! -L "$target" ] || exit 1
+      if [ -d "$target" ]; then
+        # The reserved destination appears only after a complete copy or rename.
+        [ ! -e "$source" ] || rm -rf "$source"
+      elif [ -d "$source" ]; then
+        mkdir -p "$(dirname "$target")" || exit 1
+        if [ "$(device_id "$source")" = "$(device_id "$(dirname "$target")")" ]; then
+          mv "$source" "$target"
+        else
+          mkdir -p "$target.partial" &&
+            cp -a "$source/." "$target.partial/" &&
+            mv "$target.partial" "$target" &&
+            rm -rf "$source"
+        fi
+      elif [ -e "$source" ] || [ -L "$source" ] || [ -e "$target" ]; then
+        exit 1
+      fi
+    )
+    """
+  end
+
   defp invocation(host, script) do
     case host.ssh do
       nil ->
@@ -216,7 +239,7 @@ defmodule Tightbeam.WorkspaceCleanup do
         if relative_inside(root, workspace) != nil or relative_inside(workspace, root) != nil,
           do: raise(ArgumentError, "archive directory overlaps workspace")
 
-        destination = Path.join(root, Base.url_encode64(key, padding: false))
+        destination = Path.join(root, archive_name(key))
 
         {:ok, _} =
           DB.query(
@@ -796,8 +819,10 @@ defmodule Tightbeam.WorkspaceCleanup do
 
   defp cleanup_script(root, archive_path) do
     """
+    #{move_script()}
     umask 077
     root=#{shell_quote(root)}
+    workspace_root=$root
     archive=#{shell_quote(archive_path || "")}
     keep_list=$(cat)
     had_error=0
@@ -954,6 +979,10 @@ defmodule Tightbeam.WorkspaceCleanup do
       [ "$local_failed" -eq 0 ]
     )
 
+    if [ -n "$archive" ] && [ -d "$archive" ]; then
+      root=$archive
+    fi
+
     if [ ! -e "$root" ] && [ ! -L "$root" ]; then
       if [ -n "$keep_list" ]; then
         [ -n "$archive" ] && [ -d "$archive" ] || { emit_error workspace_unavailable .; printf 'DONE\t1\n'; exit 2; }
@@ -1013,12 +1042,8 @@ defmodule Tightbeam.WorkspaceCleanup do
       fi
     fi
 
-    if [ "$had_error" -eq 0 ] && [ -n "$keep_list" ] && [ -n "$archive" ] && [ "$root" != "$archive" ]; then
-      if [ -e "$archive" ] || [ -L "$archive" ]; then
-        emit_error archive_destination_exists "$archive"
-        had_error=1
-      elif mkdir -p "$(dirname "$archive")" &&
-           mv "$root" "$archive"; then
+    if [ "$had_error" -eq 0 ] && [ -n "$keep_list" ] && [ -n "$archive" ]; then
+      if move_workspace "$workspace_root" "$archive"; then
         :
       else
         emit_error archive_move_failed "$archive"

@@ -1882,7 +1882,7 @@ defmodule Tightbeam.Schema do
              );
              CREATE TABLE retired_archive_relocation (
                host TEXT NOT NULL, destination TEXT NOT NULL, completed INTEGER NOT NULL DEFAULT 0,
-               report TEXT, PRIMARY KEY(host,destination)
+               archivePath TEXT NOT NULL, report TEXT, PRIMARY KEY(host,destination)
              );
              CREATE INDEX retired_workspace_cleanup_due ON retired_workspace_cleanup(completed,nextAt);
              CREATE TRIGGER retired_workspace_cleanup_enqueue AFTER UPDATE OF state ON sessions
