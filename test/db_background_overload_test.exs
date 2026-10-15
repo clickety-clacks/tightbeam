@@ -61,4 +61,9 @@ defmodule Tightbeam.DBBackgroundOverloadTest do
     state = %{db: db, sweep_ms: 3_600_000}
     assert {:noreply, ^state} = Tightbeam.Supervision.handle_info(:scheduled_sweep, state)
   end
+
+  test "retention skips overload and preserves its cursor", %{db: db} do
+    state = %{db: db, days: 60, cursor: 42, cutoff: nil}
+    assert {:noreply, ^state} = Tightbeam.Retention.handle_info(:trim, state)
+  end
 end

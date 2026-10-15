@@ -151,7 +151,7 @@ defmodule Tightbeam.DBTransactionThenTest do
     db: db,
     sink: sink
   } do
-    assert {:error, %RuntimeError{message: "recognition"}} =
+    assert {:ok, :ok} =
              DB.transaction_then(
                db,
                fn txn ->

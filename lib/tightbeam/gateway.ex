@@ -499,7 +499,9 @@ defmodule Tightbeam.Gateway do
              fn txn, fact ->
                Tightbeam.Wakes.row_commit_in_txn(txn, [])
                {fact, ConditionFacts.recognize_in_txn(txn, fact.fact_id)}
-             end
+             end,
+             fallback: fn fact -> {fact, []} end,
+             retry_deliveries: true
            ) do
         {:ok, {%{fact_id: fact_id}, deliveries}} ->
           Enum.each(deliveries, &complete_delivery(db, &1))

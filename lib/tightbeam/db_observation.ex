@@ -42,6 +42,18 @@ defmodule Tightbeam.DBObservation do
     end)
   end
 
+  def call(
+        server,
+        {:transaction_then, prepare, after_commit, opts} = payload,
+        operation,
+        budget,
+        mode
+      ) do
+    transaction_call(server, payload, operation, budget, mode, fn envelope ->
+      {:transaction_then, transaction_callback(envelope, prepare), after_commit, opts}
+    end)
+  end
+
   def call(server, payload, operation, budget, mode) do
     # Existing composition proxies keep their established wire protocol. The
     # envelope is between our client and the actual owner, never a new API for
@@ -71,10 +83,8 @@ defmodule Tightbeam.DBObservation do
   def transaction_metadata(_callback), do: :none
 
   defp owner?(server) do
-    with pid when is_pid(pid) <- GenServer.whereis(server),
-         {:dictionary, dictionary} <- Process.info(pid, :dictionary) do
-      Keyword.get(dictionary, :"$initial_call") == {Tightbeam.DB, :init, 1}
-    else
+    case GenServer.whereis(server) do
+      pid when is_pid(pid) -> :persistent_term.get({Tightbeam.DB, pid}, :not_owner) != :not_owner
       _ -> false
     end
   end
@@ -173,16 +183,13 @@ defmodule Tightbeam.DBObservation do
       nil ->
         owner_request(server, request, envelope, budget)
 
-      conn ->
-        {:reply, response, _} =
-          server(envelope, 5_000, fn ->
-            {:reply, Tightbeam.DB.read_query(conn, sql, params), nil}
-          end)
+      reader ->
+        response = Tightbeam.DB.Reader.query(reader, sql, params, envelope)
 
         case response do
           {{:error, %{message: message}}, _} when is_binary(message) ->
             if String.contains?(message, "readonly"),
-              do: owner_request(server, request, envelope, budget),
+              do: owner_request(server, request, envelope, remaining(envelope)),
               else: response
 
           _ ->
@@ -194,7 +201,12 @@ defmodule Tightbeam.DBObservation do
   defp send_request(server, request, envelope, budget),
     do: owner_request(server, request, envelope, budget)
 
-  defp owner_request(server, request, envelope, budget) do
+  defp remaining(envelope),
+    do: max(0, envelope.deadline - System.monotonic_time(:millisecond))
+
+  defp owner_request(server, request, envelope, _budget) do
+    budget = remaining(envelope)
+
     if Tightbeam.DB.overloaded?(server) do
       {:reply, response, _} =
         server(envelope, nil, fn ->

@@ -119,8 +119,7 @@ defmodule Tightbeam.DB do
   def reader(server, sql) do
     if Regex.match?(~r/\A(?:\s|--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)*(SELECT|WITH|EXPLAIN)\b/i, sql) do
       with pid when is_pid(pid) <- GenServer.whereis(server),
-           {:dictionary, dictionary} <- Process.info(pid, :dictionary),
-           [_ | _] = readers <- Keyword.get(dictionary, :tightbeam_db_readers, []) do
+           [_ | _] = readers <- :persistent_term.get({__MODULE__, pid}, []) do
         Enum.at(readers, :erlang.phash2(self(), length(readers)))
       else
         _ -> nil
@@ -297,21 +296,28 @@ defmodule Tightbeam.DB do
   def transaction_then(server \\ __MODULE__, prepare, after_commit)
 
   def transaction_then(server, prepare, after_commit)
-      when is_function(prepare, 1) and is_function(after_commit, 1) do
-    case DBObservation.call(server, {:transaction, prepare}, "db.transaction", call_timeout()) do
-      {:ok, result} -> run_after_commit(after_commit, result, MapSet.new())
-      {:error, error} -> {:error, error}
-    end
+      when is_function(prepare, 1) and is_function(after_commit) do
+    transaction_then(server, prepare, after_commit, [])
   end
 
-  def transaction_then(server, prepare, after_commit)
-      when is_function(prepare, 1) and is_function(after_commit, 2) do
-    DBObservation.call(
-      server,
-      {:transaction_then, prepare, after_commit},
-      "db.transaction",
-      call_timeout()
-    )
+  @doc false
+  def transaction_then(server, prepare, after_commit, opts)
+      when is_function(prepare, 1) and is_function(after_commit) do
+    case DBObservation.call(
+           server,
+           if(opts == [],
+             do: {:transaction_then, prepare, after_commit},
+             else: {:transaction_then, prepare, after_commit, opts}
+           ),
+           "db.transaction",
+           call_timeout()
+         ) do
+      {:ok, %Tightbeam.Recognition.Pending{} = pending} ->
+        Tightbeam.Recognition.inline(server, pending, after_commit, opts)
+
+      other ->
+        other
+    end
   end
 
   @doc "Atomically check references and hold a monitored archetype-release fence."
@@ -569,9 +575,13 @@ defmodule Tightbeam.DB do
       end
 
       :ok = load_topline_unicode(conn)
+      :ok = Tightbeam.Recognition.ensure_schema(conn)
+      {:ok, retry} = Tightbeam.Recognition.start_link(self())
       readers = open_readers(path)
-      Process.put(:tightbeam_db_readers, readers)
-      {:ok, %{conn: conn, readers: readers, admission: admission, reference_fences: %{}}}
+      :persistent_term.put({__MODULE__, self()}, readers)
+
+      {:ok,
+       %{conn: conn, readers: readers, retry: retry, admission: admission, reference_fences: %{}}}
     rescue
       error ->
         :ok = Sqlite3.close(conn)
@@ -582,25 +592,9 @@ defmodule Tightbeam.DB do
   defp open_readers(":memory:"), do: []
 
   defp open_readers(path) do
-    Enum.reduce(1..4, [], fn _, readers ->
-      case Sqlite3.open(path, mode: :readonly) do
-        {:ok, conn} ->
-          try do
-            execute_sql!(conn, "PRAGMA foreign_keys=ON")
-            execute_sql!(conn, "PRAGMA busy_timeout=5000")
-            :ok = load_topline_unicode(conn)
-            [conn | readers]
-          rescue
-            error ->
-              Sqlite3.close(conn)
-              Logger.error("database reader could not open: #{Exception.message(error)}")
-              readers
-          end
-
-        {:error, reason} ->
-          Logger.error("database reader could not open: #{inspect(reason)}")
-          readers
-      end
+    Enum.map(1..4, fn _ ->
+      {:ok, reader} = Tightbeam.DB.Reader.start_link(path)
+      reader
     end)
   end
 
@@ -629,8 +623,11 @@ defmodule Tightbeam.DB do
   end
 
   @impl true
-  def terminate(_reason, %{conn: conn, readers: readers}) do
-    Enum.each(readers, &Sqlite3.close/1)
+  def terminate(_reason, %{conn: conn, readers: readers, retry: retry}) do
+    Process.unlink(retry)
+    Process.exit(retry, :shutdown)
+    :persistent_term.erase({__MODULE__, self()})
+    Enum.each(readers, &GenServer.stop/1)
     # close_v2 may defer destruction until remaining statements finalize.
     # Abnormal process death uses the same Exqlite resource destructor.
     Sqlite3.close(conn)
@@ -835,22 +832,32 @@ defmodule Tightbeam.DB do
 
   def handle_call(
         {:transaction_then, prepare, after_commit},
+        from,
+        state
+      ) do
+    handle_call({:transaction_then, prepare, after_commit, []}, from, state)
+  end
+
+  def handle_call(
+        {:transaction_then, prepare, after_commit, opts},
         _from,
         %{conn: conn} = state
       )
-      when is_function(after_commit, 2) do
+      when is_function(after_commit) do
     observed_transaction(prepare, state, fn callback ->
       Process.put(row_commit_key(conn), [])
 
       try do
         reply =
-          case commit_phase(conn, callback, fenced_archetypes(state)) do
-            {:ok, result} ->
-              run_after_commit(conn, after_commit, result, fenced_archetypes(state))
-
-            {:error, error} ->
-              {:error, error}
-          end
+          commit_phase(
+            conn,
+            fn txn ->
+              result = callback.(txn)
+              transitions = take_row_commits(txn)
+              Tightbeam.Recognition.record(txn, after_commit, result, transitions, opts)
+            end,
+            fenced_archetypes(state)
+          )
 
         {:reply, reply, state}
       after
@@ -1099,26 +1106,6 @@ defmodule Tightbeam.DB do
       :ok
   end
 
-  defp run_after_commit(after_commit, result, _fenced_archetypes)
-       when is_function(after_commit, 1) do
-    try do
-      {:ok, after_commit.(result)}
-    rescue
-      _error ->
-        Logger.error("post-commit publication failed; returning committed result")
-        {:ok, result}
-    catch
-      _kind, _reason ->
-        Logger.error("post-commit publication failed; returning committed result")
-        {:ok, result}
-    end
-  end
-
-  defp run_after_commit(conn, after_commit, result, fenced_archetypes)
-       when is_function(after_commit, 2) do
-    commit_phase(conn, fn txn -> after_commit.(txn, result) end, fenced_archetypes)
-  end
-
   defp fenced_archetypes(%{reference_fences: fences}) do
     Enum.reduce(fences, MapSet.new(), fn {_token, fence}, acc ->
       MapSet.union(acc, fence.archetypes)
@@ -1212,7 +1199,8 @@ defmodule Tightbeam.DB do
     end)
   end
 
-  defp load_topline_unicode(conn) do
+  @doc false
+  def load_topline_unicode(conn) do
     extension = if match?({:unix, :darwin}, :os.type()), do: ".dylib", else: ".so"
     path = Application.app_dir(:tightbeam, "priv/topline_unicode#{extension}")
     :ok = Sqlite3.enable_load_extension(conn, true)
