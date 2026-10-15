@@ -628,6 +628,84 @@ defmodule Tightbeam.WakesTest do
     assert replacement.delivery_rule == original.delivery_rule
   end
 
+  test "a delivery tick prepares each free recipient's source once and leaves a busy recipient's sources unprepared",
+       %{db: db} do
+    active_sessions!(db, ["free-a", "free-b", "busy-c"])
+    registry = :"registry_#{System.unique_integer([:positive])}"
+    lane = :"lane_#{System.unique_integer([:positive])}"
+    start_supervised!({Tightbeam.ConnRegistry, name: registry})
+    start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, lane})
+
+    {:ok, _seq} =
+      Tightbeam.Ledger.enqueue(db, %{
+        session_key: "busy-c",
+        message_id: "msg-#{System.unique_integer([:positive])}",
+        origin: "agent:fixture",
+        prompt: "work in progress"
+      })
+
+    {:ok, _turn} = Tightbeam.Ledger.claim_next(db, "busy-c", "fixture")
+    due_at = System.system_time(:millisecond)
+
+    sources =
+      for recipient <- ["free-a", "free-b", "busy-c"], n <- 1..3, into: %{} do
+        wake =
+          Wakes.schedule(db, %{
+            session_key: recipient,
+            origin: "system",
+            prompt: "notice #{n} for #{recipient}",
+            due_at: due_at,
+            sender_scheduled: true
+          })
+
+        {wake.wake_id, recipient}
+      end
+
+    # Count the batcher's own preparation path. Carrier admission keeps its
+    # separate, unchanged validation of each included source.
+    db_pid = Process.whereis(db)
+    traced = {NoticeBatcher, :prepared_source_in_txn, 2}
+    1 = :erlang.trace_pattern(traced, true, [:local])
+    1 = :erlang.trace(db_pid, true, [:call, {:tracer, self()}])
+
+    carriers =
+      try do
+        NoticeBatcher.recover(db, due_at + 1_000, conn_registry: registry, lane_manager: lane)
+      after
+        :erlang.trace(db_pid, false, [:call])
+        :erlang.trace_pattern(traced, false, [:local])
+      end
+
+    prepared = collect_prepared_sources(db_pid, [])
+    counts = Enum.frequencies(prepared)
+
+    assert length(carriers) == 2
+
+    for {wake_id, recipient} <- sources do
+      if recipient == "busy-c" do
+        assert Map.get(counts, wake_id, 0) == 0
+        assert NoticeBatcher.source_refs(db, wake_id) == []
+        assert Wakes.get(db, wake_id).state == "pending"
+      else
+        assert Map.get(counts, wake_id) == 1
+
+        assert [%{member_state: "included", delivery_wake_id: carrier}] =
+                 NoticeBatcher.source_refs(db, wake_id)
+
+        assert carrier in carriers
+      end
+    end
+  end
+
+  defp collect_prepared_sources(db_pid, acc) do
+    receive do
+      {:trace, ^db_pid, :call, {NoticeBatcher, :prepared_source_in_txn, [_txn, wake_id]}} ->
+        collect_prepared_sources(db_pid, [wake_id | acc])
+    after
+      200 -> acc
+    end
+  end
+
   defp active_sessions!(db, keys) do
     values =
       keys

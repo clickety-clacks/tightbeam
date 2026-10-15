@@ -463,28 +463,16 @@ defmodule Tightbeam.NoticeBatcher do
 
     {:ok, ready_ids} = DB.transaction(db, &ready_sources_in_txn(&1, at))
 
-    # Resolve semantic authority before selecting recipients. A failed source
-    # preparation rolls back only that source, never an unrelated recipient.
+    # Group ready sources by recipient without preparing them. Preparation
+    # happens once, inside the recipient's own drain transaction, and only when
+    # that recipient can receive. A source whose recipient does not resolve
+    # keeps the old path: prepare it here and dispose of it if still unresolved.
+    # A failed source rolls back only that source, never an unrelated recipient.
     {recipients, deferred_ids} =
       Enum.reduce(ready_ids, {[], MapSet.new()}, fn wake_id, {targets, deferred} ->
         case DB.transaction_then(
                db,
-               fn txn ->
-                 case prepared_source_in_txn(txn, wake_id) do
-                   nil ->
-                     nil
-
-                   source ->
-                     case source_delivery_target(txn, source) do
-                       {target, _, _} ->
-                         target
-
-                       nil ->
-                         dispose_unresolved_source_in_txn(txn, source, at)
-                         nil
-                     end
-                 end
-               end,
+               fn txn -> source_recipient_in_txn(txn, wake_id, at) end,
                fn txn, target ->
                  Wakes.row_commit_in_txn(txn, [])
                  target
@@ -494,7 +482,7 @@ defmodule Tightbeam.NoticeBatcher do
             {targets, deferred}
 
           {:ok, target} ->
-            {[target | targets], deferred}
+            {[{target, wake_id} | targets], deferred}
 
           {:error, error} ->
             reason =
@@ -505,13 +493,21 @@ defmodule Tightbeam.NoticeBatcher do
         end
       end)
 
-    recipients = recipients |> Enum.reverse() |> Enum.uniq()
+    recipients = Enum.reverse(recipients)
+    own_sources = Enum.group_by(recipients, &elem(&1, 0), &elem(&1, 1))
 
     deliveries =
-      Enum.flat_map(recipients, fn target ->
+      recipients
+      |> Enum.map(&elem(&1, 0))
+      |> Enum.uniq()
+      |> Enum.flat_map(fn target ->
+        own_ids = MapSet.new(Map.fetch!(own_sources, target))
+
         case DB.transaction_then(
                db,
-               fn txn -> drain_session_in_txn(txn, target, at, delivery_opts, deferred_ids) end,
+               fn txn ->
+                 drain_session_in_txn(txn, target, own_ids, at, delivery_opts, deferred_ids)
+               end,
                fn txn, result ->
                  Wakes.row_commit_in_txn(txn, [])
                  result
@@ -720,27 +716,87 @@ defmodule Tightbeam.NoticeBatcher do
     end
   end
 
-  defp drain_session_in_txn(txn, target, at, delivery_opts, deferred_ids) do
-    sources =
-      ready_sources_in_txn(txn, at)
-      |> Enum.reject(&MapSet.member?(deferred_ids, &1))
-      |> Enum.flat_map(fn wake_id ->
-        case prepared_source_in_txn(txn, wake_id) do
-          nil ->
-            []
+  # Resolve a ready source's recipient from its stored routing, without
+  # preparing it. Only a source with no resolvable recipient is prepared here.
+  defp source_recipient_in_txn(txn, wake_id, at) do
+    case Wakes.get_in_txn(txn, wake_id) do
+      %{state: "pending"} = wake ->
+        case source_delivery_target(txn, wake) do
+          {target, _, _} ->
+            target
 
-          source ->
-            case source_delivery_target(txn, source) do
-              {^target, _, _} -> [source]
-              _ -> []
+          nil ->
+            case prepared_source_in_txn(txn, wake_id) do
+              nil ->
+                nil
+
+              source ->
+                case source_delivery_target(txn, source) do
+                  {target, _, _} ->
+                    target
+
+                  nil ->
+                    dispose_unresolved_source_in_txn(txn, source, at)
+                    nil
+                end
             end
         end
-      end)
 
-    cond do
-      sources == [] -> :empty
-      recipient_running?(txn, target, nil) -> :busy
-      true -> admit_session_snapshot_in_txn(txn, target, sources, at, delivery_opts)
+      _ ->
+        nil
+    end
+  end
+
+  # A busy recipient's sources are left untouched until it can receive. For a
+  # free recipient, re-check readiness and prepare only its own sources, each
+  # once, in this transaction. A source that fails preparation rolls back to
+  # its savepoint and waits for a later tick; the recipient's others proceed.
+  defp drain_session_in_txn(txn, target, own_ids, at, delivery_opts, deferred_ids) do
+    if recipient_running?(txn, target, nil) do
+      :busy
+    else
+      sources =
+        ready_sources_in_txn(txn, at)
+        |> Enum.filter(&MapSet.member?(own_ids, &1))
+        |> Enum.reject(&MapSet.member?(deferred_ids, &1))
+        |> Enum.flat_map(fn wake_id ->
+          case prepared_own_source_in_txn(txn, wake_id) do
+            nil ->
+              []
+
+            source ->
+              case source_delivery_target(txn, source) do
+                {^target, _, _} -> [source]
+                _ -> []
+              end
+          end
+        end)
+
+      if sources == [] do
+        :empty
+      else
+        admit_session_snapshot_in_txn(txn, target, sources, at, delivery_opts)
+      end
+    end
+  end
+
+  defp prepared_own_source_in_txn(txn, wake_id) do
+    :ok = Txn.exec(txn, "SAVEPOINT notice_source_prepare")
+
+    try do
+      source = prepared_source_in_txn(txn, wake_id)
+      :ok = Txn.exec(txn, "RELEASE notice_source_prepare")
+      source
+    rescue
+      error ->
+        :ok = Txn.exec(txn, "ROLLBACK TO notice_source_prepare")
+        :ok = Txn.exec(txn, "RELEASE notice_source_prepare")
+
+        reason =
+          if match?(%DB.Error{}, error), do: :persistence_refused, else: :recognition_failed
+
+        Logger.warning("notice source #{wake_id} preparation deferred: #{reason}")
+        nil
     end
   end
 
