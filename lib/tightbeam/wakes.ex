@@ -6570,7 +6570,7 @@ defmodule Tightbeam.Wakes do
       Enum.reduce(Map.keys(state.retries), state, fn id, acc ->
         if is_binary(id) and
              transaction!(db, fn txn ->
-               Txn.q(txn, "SELECT 1 FROM wakes WHERE wakeId=?1 AND state='pending'", [id]) == []
+               Txn.q(txn, "SELECT 1 FROM wakes WHERE wakeId=?1 AND state='pending' AND dueAt<=?2", [id, now()]) == []
              end), do: clear_retry(acc, id), else: acc
       end)
 
@@ -7871,7 +7871,11 @@ defmodule Tightbeam.Wakes do
     next = if next == :overloaded, do: now() + 1_000, else: next
     pass_at = Map.get(state.retries, :pass)
     next = if next && pass_at, do: max(next, pass_at), else: next
-    retry_at = state.retries |> Map.values() |> Enum.min(fn -> nil end)
+    retry_at =
+      state.retries
+      |> Map.values()
+      |> Enum.map(&max(&1, pass_at || 0))
+      |> Enum.min(fn -> nil end)
     due_at = [next, retry_at] |> Enum.reject(&is_nil/1) |> Enum.min(fn -> nil end)
     set_due_timer(state, due_at)
   end

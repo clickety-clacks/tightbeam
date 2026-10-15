@@ -52,7 +52,7 @@ defmodule Tightbeam.DBBackgroundOverloadTest do
       db: db,
       timer: timer,
       deadline: nil,
-      retries: %{},
+      retries: %{"failed-wake" => 0},
       retry_attempts: %{},
       scanned_through: -1,
       internal_consumers: %{},
@@ -62,6 +62,7 @@ defmodule Tightbeam.DBBackgroundOverloadTest do
 
     assert {:noreply, next} = Tightbeam.Wakes.handle_info({:timeout, timer, :due}, state)
     assert is_reference(next.timer)
+    assert :erlang.read_timer(next.timer) >= 900
     assert next.scanned_through == -1
     assert next.retries[:pass] > System.system_time(:millisecond)
   end

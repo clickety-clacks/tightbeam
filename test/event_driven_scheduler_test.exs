@@ -273,7 +273,7 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
     assert :sys.get_state(pid).retries == %{}
   end
 
-  test "internal retry backoff stops growing at five minutes", ctx do
+  test "internal retries cap at five minutes and respect rescheduled deadlines", ctx do
     parent = self()
 
     pid =
@@ -301,17 +301,29 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
     assert next >= before + 300_000
     assert next <= System.system_time(:millisecond) + 300_000
     refute_receive :attempted, 100
+
+    later = System.system_time(:millisecond) + 60_000
+    {:ok, :ok} = DB.transaction(ctx.db, fn txn ->
+      DB.Txn.q(txn, "UPDATE wakes SET dueAt=?2 WHERE wakeId=?1", [scheduled.wake_id, later])
+      Wakes.schedule_changed_in_txn(txn, {:schedule_changed, later})
+    end)
+    Wakes.fire_due(pid)
+    state = :sys.get_state(pid)
+    assert state.retries == %{}
+    assert state.deadline == later
+    refute_receive :attempted, 100
   end
 
   test "the detector excludes digests and waits that cannot deliver", ctx do
     pid = scheduler(ctx)
     Process.sleep(150)
-    :sys.get_state(pid)
-    :sys.suspend(pid)
-    on_exit(fn -> if Process.alive?(pid), do: :sys.resume(pid) end)
+    state = :sys.get_state(pid)
+    stop_supervised!(Wakes)
     due = System.system_time(:millisecond) + 60_000
     digest = wake(ctx.db, due, %{digest: true})
     boundary = wake(ctx.db, due, %{delivery_rule: "turn-boundary-digest r1"})
+    {:ok, _} = DB.query(ctx.db, "UPDATE wakes SET deliveryRule=?2 WHERE wakeId=?1",
+      [boundary.wake_id, "turn-boundary-digest r1"])
     unrecognized = wake(ctx.db, due)
     after_turn = wake(ctx.db, due)
 
@@ -355,9 +367,8 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
         ])
     end
 
-    send(pid, :detect_misses)
-    :sys.resume(pid)
-    :sys.get_state(pid)
+    # Exercise the detector before any due pass recognizes dependency fallbacks.
+    assert {:noreply, _} = Wakes.handle_info(:detect_misses, state)
     assert Tightbeam.SchedulerMisses.count() - ctx.misses_before == 0
   end
 
