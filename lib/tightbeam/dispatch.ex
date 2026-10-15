@@ -431,7 +431,17 @@ defmodule Tightbeam.Dispatch do
   # content. Denials audit in the publication transaction. Outcomes known only
   # after the handler returns complete asynchronously, so an audit never delays
   # a committed result.
-  defp append_event_with_handoff(db, kind, verb, origin, session_key, payload, principal, handoff, async \\ false) do
+  defp append_event_with_handoff(
+         db,
+         kind,
+         verb,
+         origin,
+         session_key,
+         payload,
+         principal,
+         handoff,
+         async \\ false
+       ) do
     audited = Process.delete(:tightbeam_dispatch_audited)
 
     # Successful reads audit identity and verb only, including body reads.
@@ -479,7 +489,10 @@ defmodule Tightbeam.Dispatch do
           if handoff, do: handoff.(txn), else: :ok
         end
 
-        GenServer.cast(db, {:dispatch_audit, side_task, System.monotonic_time(:millisecond) + 2_000})
+        GenServer.cast(
+          db,
+          {:dispatch_audit, side_task, System.monotonic_time(:millisecond) + 2_000}
+        )
       end
     end
 

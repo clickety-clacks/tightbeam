@@ -16,7 +16,11 @@ defmodule Tightbeam.DispatchTest do
 
   @tag :tmp_dir
   test "a dispatched read returns while a write transaction holds the owner", %{tmp_dir: tmp} do
-    Tightbeam.GuardRuntimeFixture.run!(tmp, "guard_dispatch_read_runtime.exs", "dispatch-read: ok")
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "guard_dispatch_read_runtime.exs",
+      "dispatch-read: ok"
+    )
   end
 
   test "successful reads return before publication and audit failure preserves success", %{db: db} do
@@ -58,7 +62,9 @@ defmodule Tightbeam.DispatchTest do
     assert {:ok, [[1]]} = DB.query(db, "SELECT count(*) FROM events")
   end
 
-  test "successful reads skip overloaded audit and publication without delaying the response", %{db: db} do
+  test "successful reads skip overloaded audit and publication without delaying the response", %{
+    db: db
+  } do
     parent = self()
     hub = start_hub(db)
 
