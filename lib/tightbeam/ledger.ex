@@ -516,7 +516,8 @@ defmodule Tightbeam.Ledger do
           running =
             Txn.q(
               txn,
-              "SELECT seq FROM turns WHERE sessionKey = ?1 AND status = 'running' LIMIT 1",
+              "SELECT seq FROM turns WHERE sessionKey = ?1 AND status = 'running' " <>
+                "AND status IN ('queued','running') LIMIT 1",
               [session_key]
             )
 
@@ -573,6 +574,7 @@ defmodule Tightbeam.Ledger do
                     """
                       SELECT seq, messageId, origin, prompt, wakeId FROM turns
                       WHERE sessionKey = ?1 AND status = 'running'
+                        AND status IN ('queued','running')
                     """,
                     [session_key]
                   )
@@ -1016,7 +1018,7 @@ defmodule Tightbeam.Ledger do
           rows =
             Txn.q(
               txn,
-              "SELECT seq, sessionKey FROM turns WHERE status = 'running' AND " <> predicate,
+              recover_running_rows_sql(predicate),
               predicate_params
             )
 
@@ -1030,7 +1032,8 @@ defmodule Tightbeam.Ledger do
             """
               UPDATE turns SET status = 'failed_unknown', endedAt = ?1,
                                error = COALESCE(error, 'interrupted: outcome unknown')
-              WHERE status = 'running' AND #{update_predicate}
+              WHERE status = 'running' AND status IN ('queued','running')
+                AND #{update_predicate}
             """,
             [now | predicate_params]
           )
@@ -1085,6 +1088,12 @@ defmodule Tightbeam.Ledger do
     end)
 
     seqs
+  end
+
+  @doc false
+  def recover_running_rows_sql(predicate) do
+    "SELECT seq, sessionKey FROM turns WHERE status = 'running' " <>
+      "AND status IN ('queued','running') AND " <> predicate
   end
 
   defp shift_sql_params(sql) do
@@ -1308,7 +1317,8 @@ defmodule Tightbeam.Ledger do
     {:ok, [[count]]} =
       DB.query(
         db,
-        "SELECT count(*) FROM turns WHERE sessionKey = ?1 AND status = 'running'",
+        "SELECT count(*) FROM turns WHERE sessionKey = ?1 AND status = 'running' " <>
+          "AND status IN ('queued','running')",
         [session_key]
       )
 
@@ -1342,16 +1352,18 @@ defmodule Tightbeam.Ledger do
   @spec running_turn_message_id(db(), String.t()) :: String.t() | nil
   def running_turn_message_id(db \\ Tightbeam.DB, session_key) do
     {:ok, rows} =
-      DB.query(
-        db,
-        "SELECT messageId FROM turns WHERE sessionKey = ?1 AND status = 'running' LIMIT 1",
-        [session_key]
-      )
+      DB.query(db, running_turn_message_id_sql(), [session_key])
 
     case rows do
       [[message_id]] -> message_id
       [] -> nil
     end
+  end
+
+  @doc false
+  def running_turn_message_id_sql do
+    "SELECT messageId FROM turns WHERE sessionKey = ?1 AND status = 'running' " <>
+      "AND status IN ('queued','running') LIMIT 1"
   end
 
   @doc false

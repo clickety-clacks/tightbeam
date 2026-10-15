@@ -17,6 +17,7 @@ defmodule Tightbeam.DB.Reader do
     :ok = Sqlite3.execute(conn, "PRAGMA foreign_keys=ON")
     :ok = Sqlite3.execute(conn, "PRAGMA busy_timeout=5000")
     :ok = DB.load_topline_unicode(conn)
+    :ok = DB.enable_statement_cache(conn)
     {:ok, conn}
   end
 
@@ -58,6 +59,7 @@ defmodule Tightbeam.DB.Reader do
 
   @impl true
   def terminate(_, conn) do
+    :ok = DB.clear_statement_cache(conn)
     Sqlite3.close(conn)
   end
 end

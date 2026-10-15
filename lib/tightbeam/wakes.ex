@@ -2650,7 +2650,8 @@ defmodule Tightbeam.Wakes do
   defp running_turn_seq_in_txn(txn, session_key) do
     case Txn.q(
            txn,
-           "SELECT seq FROM turns WHERE sessionKey=?1 AND status='running' LIMIT 1",
+           "SELECT seq FROM turns WHERE sessionKey=?1 AND status='running' " <>
+             "AND status IN ('queued','running') LIMIT 1",
            [session_key]
          ) do
       [[seq]] -> seq
