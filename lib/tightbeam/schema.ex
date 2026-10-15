@@ -2111,6 +2111,9 @@ defmodule Tightbeam.Schema do
             txn,
             "SELECT type,name,sql FROM sqlite_master WHERE tbl_name='notice_batch_members' AND sql IS NOT NULL AND type IN ('index','trigger') ORDER BY type,name"
           )
+          # The additive runtime lookup index is rebuilt after every migration;
+          # the table rebuild below drops it with the old table.
+          |> Enum.reject(&match?(["index", "notice_batch_members_source", _], &1))
 
         expected_index =
           "CREATE INDEX IF NOT EXISTS notice_batch_members_batch ON notice_batch_members(batchId, publicationSeq)"
@@ -2373,7 +2376,13 @@ defmodule Tightbeam.Schema do
       {"idle_cleanup_wakes_pending_group",
        "CREATE INDEX IF NOT EXISTS idle_cleanup_wakes_pending_group " <>
          "ON wakes(obligationRef COLLATE NOCASE) " <>
-         "WHERE origin='process:tightbeam' AND state='pending' AND consumer='prompt' AND obligationRef IS NOT NULL"}
+         "WHERE origin='process:tightbeam' AND state='pending' AND consumer='prompt' AND obligationRef IS NOT NULL"},
+      # Delivery-history lookups by source wake (NoticeBatcher.source_delivered_sql/1
+      # and source_deliveries_sql/1). An explicit index, so these lookups do not
+      # depend on the table carrying a composite UNIQUE that leads with it.
+      {"notice_batch_members_source",
+       "CREATE INDEX IF NOT EXISTS notice_batch_members_source " <>
+         "ON notice_batch_members(sourceWakeId)"}
     ]
 
     case DB.migration_transaction(db, :idle_cleanup_runtime_indexes, [], [], fn txn ->

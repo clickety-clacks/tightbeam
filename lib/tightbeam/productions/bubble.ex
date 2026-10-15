@@ -995,7 +995,7 @@ defmodule Tightbeam.Productions.Bubble do
     case DB.query(
            db,
            """
-           WITH source_deliveries AS (#{NoticeBatcher.source_deliveries_sql()})
+           WITH source_deliveries AS (#{NoticeBatcher.source_deliveries_sql(turn_wake: "?1")})
            SELECT source.sessionKey,source.wakeId
            FROM source_deliveries d JOIN wakes source ON source.wakeId=d.sourceWakeId
            JOIN turns turn ON turn.seq=d.turnSeq
@@ -1024,7 +1024,7 @@ defmodule Tightbeam.Productions.Bubble do
     case DB.query(
            db,
            """
-           WITH source_deliveries AS (#{NoticeBatcher.source_deliveries_sql()})
+           WITH source_deliveries AS (#{NoticeBatcher.source_deliveries_sql(turn_wake: "?1")})
            SELECT d.sourceWakeId
            FROM source_deliveries d JOIN turns turn ON turn.seq=d.turnSeq
            WHERE turn.wakeId=?1 AND d.carrier=1 ORDER BY d.publicationSeq

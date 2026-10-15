@@ -1365,18 +1365,63 @@ defmodule Tightbeam.NoticeBatcher do
   # One read-only relation for actual delivery history. Transport membership
   # before a turn exists is deliberately not delivery evidence. Callers keep
   # their domain/assignment/authority predicates outside this relation.
-  def source_deliveries_sql do
+  #
+  # SQLite cannot push a caller's correlated predicate into this UNION ALL, so a
+  # caller that wants one source, turn or assignment passes the same predicate
+  # here and each arm applies it through its own index. The values are
+  # source-owned SQL expressions (a bound parameter such as "?1"), never caller
+  # input. Each option filters the relation's output column of the same name:
+  #   source_wake: sourceWakeId    turn_seq: turnSeq
+  #   assignment:  assignmentId    turn_wake: the delivery turn's wakeId
+  def source_deliveries_sql(filters \\ []) do
+    direct =
+      source_delivery_arm_filters(filters, %{
+        source_wake: "t.wakeId",
+        turn_seq: "t.seq",
+        turn_wake: "t.wakeId",
+        assignment: "t.assignmentId"
+      })
+
+    carried =
+      source_delivery_arm_filters(filters, %{
+        source_wake: "m.sourceWakeId",
+        turn_seq: "t.seq",
+        turn_wake: "t.wakeId",
+        assignment: "w.assignmentId"
+      })
+
     """
     SELECT t.seq AS turnSeq,t.wakeId AS sourceWakeId,t.assignmentId AS assignmentId,
            0 AS carrier,NULL AS publicationSeq
-    FROM turns t WHERE t.wakeId IS NOT NULL
+    FROM turns t WHERE t.wakeId IS NOT NULL#{direct}
     UNION ALL
     SELECT t.seq,m.sourceWakeId,w.assignmentId,1,m.publicationSeq
     FROM notice_batch_members m
     JOIN notice_batches b ON b.batchId=m.batchId
     JOIN wakes w ON w.wakeId=m.sourceWakeId
     JOIN turns t ON t.wakeId=b.deliveryWakeId
-    WHERE m.state='included'
+    WHERE m.state='included'#{carried}
+    """
+  end
+
+  defp source_delivery_arm_filters(filters, columns) do
+    Enum.map_join(filters, fn {key, expression} when is_binary(expression) ->
+      " AND #{Map.fetch!(columns, key)}=#{expression}"
+    end)
+  end
+
+  @doc false
+  # True when the source wake `expression` (a correlated column such as
+  # "w.wakeId", never caller input) has actual delivery history: the same rows as an EXISTS over
+  # `source_deliveries_sql/0` filtered by sourceWakeId, as two indexed lookups.
+  def source_delivered_sql(expression) when is_binary(expression) do
+    """
+    (EXISTS (SELECT 1 FROM turns sd_t WHERE sd_t.wakeId=#{expression})
+      OR EXISTS (SELECT 1 FROM notice_batch_members sd_m
+        JOIN notice_batches sd_b ON sd_b.batchId=sd_m.batchId
+        JOIN wakes sd_w ON sd_w.wakeId=sd_m.sourceWakeId
+        JOIN turns sd_t ON sd_t.wakeId=sd_b.deliveryWakeId
+        WHERE sd_m.sourceWakeId=#{expression} AND sd_m.state='included'))
     """
   end
 
@@ -1385,7 +1430,7 @@ defmodule Tightbeam.NoticeBatcher do
     Txn.q(
       txn,
       """
-      WITH source_deliveries AS (#{source_deliveries_sql()})
+      WITH source_deliveries AS (#{source_deliveries_sql(source_wake: "?1")})
       SELECT t.seq,t.status,d.assignmentId
       FROM source_deliveries d JOIN turns t ON t.seq=d.turnSeq
       WHERE d.sourceWakeId=?1 ORDER BY t.seq
