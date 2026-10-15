@@ -118,8 +118,16 @@ defmodule Tightbeam.RailRemedyTest do
     episode = RailRemedy.episode(ctx.db, "completion-requires-review", assignment.id)
     parked = episode.notice_state["reassessment"]["wakeId"]
     assert Wakes.get(ctx.db, parked).due_at == 253_402_300_799_000
-    refute_receive {:reassessed, _}, 1_200
-    assert :sys.get_state(pid).timer == nil
+    Process.sleep(150)
+    timer = :sys.get_state(pid).timer
+    :erlang.trace(pid, true, [:send, {:tracer, self()}])
+    try do
+      refute_receive {:trace, ^pid, :send, {:"$gen_call", _, _}, _}, 1_200
+    after
+      :erlang.trace(pid, false, [:send])
+    end
+    refute_receive {:reassessed, _}, 0
+    assert :sys.get_state(pid).timer == timer
 
     Wakes.recipient_ready(pid, ctx.holder.session_key)
     assert_receive {:reassessed, ^parked}, 1_000
@@ -2884,7 +2892,8 @@ defmodule Tightbeam.RailRemedyTest do
 
     {:ok, [[seq]]} = DB.query(db, "SELECT seq FROM turns WHERE messageId=?1", [message_id])
 
-    {:ok, _} =
+    # Delivery reads the recorded turn on the wake instead of inferring history.
+    {:ok, []} =
       DB.query(db, "UPDATE wakes SET deliveredTurnSeq=?2 WHERE wakeId=?1", [wake_id, seq])
 
     seq

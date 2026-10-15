@@ -135,7 +135,8 @@ defmodule Tightbeam.Firehose.Hub do
       send(pid, :firehose_shutdown)
       {:reply, :ok, state}
     else
-      socket = state.sockets[pid] || %Socket{monitor: Process.monitor(pid)}
+      existing = state.sockets[pid]
+      socket = existing || %Socket{monitor: Process.monitor(pid)}
 
       socket =
         struct(
@@ -150,6 +151,13 @@ defmodule Tightbeam.Firehose.Hub do
             :is_admin
           ])
         )
+
+      # Frames were admitted for the identity that queued them. A socket that
+      # comes back as someone else keeps only what that identity may see.
+      socket =
+        if existing && authorization(existing) != authorization(socket),
+          do: requeue_visible(socket),
+          else: socket
 
       {:reply, :ok, put_in(state.sockets[pid], socket)}
     end
@@ -423,6 +431,18 @@ defmodule Tightbeam.Firehose.Hub do
 
   defp secret_payload?(payload) when is_list(payload), do: Enum.any?(payload, &secret_payload?/1)
   defp secret_payload?(_payload), do: false
+
+  defp authorization(socket),
+    do: Map.take(socket, [:mode, :user_id, :principal_kind, :principal_id, :is_admin])
+
+  defp requeue_visible(socket) do
+    frames =
+      socket.queue
+      |> :queue.to_list()
+      |> Enum.filter(&(socket.mode != :pending and visible?(socket, &1)))
+
+    %{socket | queue: :queue.from_list(frames), queued: length(frames)}
+  end
 
   defp update(state, pid, fun) do
     case state.sockets[pid] do

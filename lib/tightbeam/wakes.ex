@@ -6551,7 +6551,7 @@ defmodule Tightbeam.Wakes do
 
         case Gateway.delivery_target(txn, key, target_gate) do
           {recipient, _, _} -> [recipient]
-          nil -> []
+          nil -> [key]
         end
       end)
       |> Enum.uniq()

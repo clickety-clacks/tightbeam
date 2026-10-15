@@ -133,8 +133,10 @@ defmodule Tightbeam.DBObservation do
       request = build_request.(envelope)
       {reply, timing} = send_request(server, request, envelope, budget)
 
-      if Map.get(timing, :dispatch_audited) and (reply == :ok or match?({:ok, _}, reply)),
-        do: Process.put(:tightbeam_dispatch_audited, true)
+      with event_id when is_integer(event_id) <- Map.get(timing, :dispatch_audited),
+           true <- reply == :ok or match?({:ok, _}, reply) do
+        Process.put(:tightbeam_dispatch_audited, event_id)
+      end
 
       emit(
         envelope,
@@ -229,10 +231,12 @@ defmodule Tightbeam.DBObservation do
   def audit_active?, do: is_map(get_in(Process.get(@key, %{}), [:dispatch_audit]))
 
   @doc false
-  def audit_recorded(verb) do
+  # Remembers the id of the audit row a handler wrote in its own transaction,
+  # so the dispatcher completes that row instead of writing a second one.
+  def audit_recorded(verb, event_id) do
     case Process.get(@key) do
-      %{dispatch_audit: %{verb: ^verb}} = observation ->
-        Process.put(@key, %{observation | dispatch_audited: true})
+      %{dispatch_audit: %{verb: ^verb}, dispatch_audited: false} = observation ->
+        Process.put(@key, %{observation | dispatch_audited: event_id})
 
       _ ->
         :ok
@@ -455,6 +459,7 @@ defmodule Tightbeam.DBObservation do
   defp result_class(:ok, _, _), do: "ok"
   defp result_class({:ok, _}, _, _), do: "ok"
   defp result_class({:ok, _, _}, _, _), do: "ok"
+  defp result_class({:error, %Tightbeam.DB.DeadlineExceeded{}}, _, _), do: "deadline_exceeded"
 
   defp result_class({:error, error}, %{raised: {raised, _stack, class}}, _) do
     if same_observed_error?(error, raised), do: class

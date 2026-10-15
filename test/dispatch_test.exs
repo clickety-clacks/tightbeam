@@ -123,6 +123,66 @@ defmodule Tightbeam.DispatchTest do
     assert {%{crash: true, code: "server_error"}, _} = Code.eval_string(payload)
   end
 
+  test "committed writes return while their outcome audit waits on the owner", %{db: db} do
+    :ok = DB.execute(db, "CREATE TABLE committed_result(id INTEGER)")
+    parent = self()
+
+    handler = fn _ ->
+      assert {:ok, _} =
+               DB.transaction(db, &DB.Txn.q(&1, "INSERT INTO committed_result VALUES(1)"))
+
+      :sys.suspend(db)
+      send(parent, :committed)
+      %{saved: true}
+    end
+
+    call = %{verb: "rule", origin: "user:flynn", session_key: nil, params: %{}}
+    task = Task.async(fn -> Dispatch.dispatch(db, %{"rule" => handler}, call) end)
+
+    try do
+      assert_receive :committed
+      assert {:ok, %{saved: true}} = Task.await(task, 1_000)
+    after
+      :sys.resume(db)
+    end
+
+    :sys.get_state(db)
+    assert {:ok, [[1]]} = DB.query(db, "SELECT count(*) FROM committed_result")
+    assert {:ok, [[payload]]} = DB.query(db, "SELECT payload FROM events WHERE verb='rule'")
+    assert {%{saved: true}, _} = Code.eval_string(payload)
+  end
+
+  test "skipping an overloaded outcome audit logs the omission", %{db: db} do
+    parent = self()
+
+    handler = fn _ ->
+      :sys.suspend(db)
+
+      for _ <- 1..128,
+          do: send(db, {:"$gen_call", {self(), make_ref()}, {:query, "SELECT 1", []}})
+
+      send(parent, :audit_overloaded)
+      %{saved: true}
+    end
+
+    call = %{verb: "rule", origin: "user:flynn", session_key: nil, params: %{}}
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        task = Task.async(fn -> Dispatch.dispatch(db, %{"rule" => handler}, call) end)
+
+        try do
+          assert_receive :audit_overloaded
+          assert {:ok, %{saved: true}} = Task.await(task, 1_000)
+        after
+          :sys.resume(db)
+        end
+      end)
+
+    assert log =~ "dispatch audit for rule skipped: database overloaded"
+    assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM events")
+  end
+
   test "a write and its audit commit together and are not appended twice", %{db: db} do
     :ok = DB.execute(db, "CREATE TABLE primary_result(id INTEGER)")
 
