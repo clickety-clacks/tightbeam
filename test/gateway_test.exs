@@ -4748,12 +4748,13 @@ defmodule Tightbeam.GatewayTest do
       |> Map.delete(:credential_status)
       |> Map.put(:sh, sh)
 
+    start_runtime_supervisor()
     handlers = Gateway.handlers(config)
     child_id = {Credentials, machine}
 
     on_exit(fn ->
-      Supervisor.terminate_child(Tightbeam.Supervisor, child_id)
-      Supervisor.delete_child(Tightbeam.Supervisor, child_id)
+      Supervisor.terminate_child(Tightbeam.RuntimeSupervisor, child_id)
+      Supervisor.delete_child(Tightbeam.RuntimeSupervisor, child_id)
     end)
 
     assert %{host: %{"host" => ^machine}} =
@@ -5295,6 +5296,7 @@ defmodule Tightbeam.GatewayTest do
     local = Tightbeam.Placement.local_host_name()
     base_dir = move_test_base(ctx.db, "local-host-reregistration", local)
     config = gateway_config(base_dir, ctx.db, 0)
+    start_runtime_supervisor()
     handlers = Gateway.handlers(config)
 
     local_server = GenServer.whereis(Credentials.server(local))
@@ -5318,7 +5320,7 @@ defmodule Tightbeam.GatewayTest do
     assert GenServer.whereis(Credentials.server(local)) == local_server,
            "local credential server was replaced by re-registering the local hostname"
 
-    refute Enum.any?(Supervisor.which_children(Tightbeam.Supervisor), fn {id, _, _, _} ->
+    refute Enum.any?(Supervisor.which_children(Tightbeam.RuntimeSupervisor), fn {id, _, _, _} ->
              id == {Credentials, local}
            end),
            "re-registering the local hostname minted a dynamic credential child"
@@ -11351,4 +11353,11 @@ defmodule Tightbeam.GatewayTest do
         other
     end
   end
+  defp start_runtime_supervisor do
+    start_supervised!(%{
+      id: Tightbeam.RuntimeSupervisor,
+      start: {Supervisor, :start_link, [[], [strategy: :one_for_one, name: Tightbeam.RuntimeSupervisor]]}
+    })
+  end
+
 end

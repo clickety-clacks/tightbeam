@@ -79,7 +79,7 @@ defmodule Tightbeam.ModelCatalogTest do
     blocker =
       Task.async(fn ->
         Tightbeam.DB.transaction(ctx.db, fn _txn ->
-          send(parent, :database_held)
+          send(parent, {:database_held, self()})
 
           receive do
             :release -> :ok
@@ -87,7 +87,7 @@ defmodule Tightbeam.ModelCatalogTest do
         end)
       end)
 
-    assert_receive :database_held
+    assert_receive {:database_held, database_owner}
     # Discard host reads from initial derivation before starting the stalled pass.
     drain_host_reads()
     send(Process.whereis(catalog), :refresh_due)
@@ -97,8 +97,67 @@ defmodule Tightbeam.ModelCatalogTest do
     assert result == {cached, :fresh}
     assert elapsed < 250_000
     assert ModelCatalog.get(catalog)[{@host, "claude"}] == cached
-    send(blocker.pid, :release)
+    send(database_owner, :release)
     assert {:ok, :ok} = Task.await(blocker)
+  end
+
+  test "background refresh failure preserves cached entries", ctx do
+    {:ok, mode} = Agent.start_link(fn -> :normal end)
+    on_exit(fn -> if Process.alive?(mode), do: Agent.stop(mode) end)
+    parent = self()
+
+    hosts = fn ->
+      if Agent.get(mode, & &1) == :fail do
+        send(parent, :refresh_failed)
+        exit(:host_discovery_failed)
+      end
+      Placement.hosts(ctx.base_dir, ctx.db)
+    end
+
+    catalog = start_catalog(ctx, hosts: hosts)
+    await_fresh(catalog, "claude")
+    {cached, :fresh} = ModelCatalog.get(@host, "claude", catalog)
+    pid = Process.whereis(catalog)
+    Agent.update(mode, fn _ -> :fail end)
+    send(pid, :refresh_due)
+    assert_receive :refresh_failed, 2_000
+    await(fn -> :sys.get_state(pid).background == nil end)
+    assert Process.whereis(catalog) == pid
+    assert ModelCatalog.get(@host, "claude", catalog) == {cached, :fresh}
+    Agent.update(mode, fn _ -> :normal end)
+  end
+
+  test "credential transition invalidates while background refresh is stalled", ctx do
+    parent = self()
+    {:ok, mode} = Agent.start_link(fn -> :normal end)
+    on_exit(fn -> if Process.alive?(mode), do: Agent.stop(mode) end)
+
+    hosts = fn ->
+      if Agent.get(mode, & &1) == :block do
+        send(parent, {:refresh_blocked, self()})
+        receive do
+          :release -> :ok
+        end
+      end
+      Placement.hosts(ctx.base_dir, ctx.db)
+    end
+
+    catalog = start_catalog(ctx, hosts: hosts)
+    await_fresh(catalog, "claude")
+    pid = Process.whereis(catalog)
+    Agent.update(mode, fn _ -> :block end)
+    send(pid, :refresh_due)
+    assert_receive {:refresh_blocked, worker}, 2_000
+    ModelCatalog.credential_transition(@host, :anthropic, 1, catalog)
+    assert {[], {:unavailable, :credential_transition_pending}} =
+      ModelCatalog.get(@host, "claude", catalog)
+    send(worker, :release)
+
+    # A second background job has started, so the old snapshot has completed.
+    assert_receive {:refresh_blocked, next_worker}, 2_000
+    assert :sys.get_state(pid).entries[{@host, "claude"}].entries == []
+    Agent.update(mode, fn _ -> :normal end)
+    send(next_worker, :release)
   end
 
   defp drain_host_reads do

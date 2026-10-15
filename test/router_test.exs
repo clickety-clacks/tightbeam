@@ -3265,6 +3265,11 @@ defmodule Tightbeam.Wire.RouterTest do
         else: Application.delete_env(:tightbeam, :advertised_url)
     end)
 
+    start_supervised!(%{
+      id: Tightbeam.RuntimeSupervisor,
+      start: {Supervisor, :start_link, [[], [strategy: :one_for_one, name: Tightbeam.RuntimeSupervisor]]}
+    })
+
     credential_supervisor =
       start_supervised!(%{
         id: :router_credential_supervisor,
@@ -3315,7 +3320,7 @@ defmodule Tightbeam.Wire.RouterTest do
              _child -> false
            end)
 
-    refute Enum.any?(Supervisor.which_children(Tightbeam.Supervisor), fn
+    refute Enum.any?(Supervisor.which_children(Tightbeam.RuntimeSupervisor), fn
              {{Credentials, "worker"}, _pid, :worker, [Credentials]} -> true
              _child -> false
            end)

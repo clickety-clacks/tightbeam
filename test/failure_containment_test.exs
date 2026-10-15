@@ -11,8 +11,17 @@ defmodule Tightbeam.FailureContainmentTest do
     Wakes
   }
 
+  alias Tightbeam.ClientE2E.WS
+
   defmodule HealthPlug do
     def init(opts), do: opts
+
+    def call(%{request_path: "/changes"} = conn, deps) do
+      conn
+      |> WebSockAdapter.upgrade(Tightbeam.Wire.ChangeSocket, deps, [])
+      |> Plug.Conn.halt()
+    end
+
     def call(conn, _opts), do: Plug.Conn.send_resp(conn, 200, "ok")
   end
 
@@ -28,7 +37,7 @@ defmodule Tightbeam.FailureContainmentTest do
       {DynamicSupervisor, strategy: :one_for_one, name: __MODULE__.Adapters},
       {SentinelSupervisor, db: db, base_dir: tmp, cli_bin: "unused", name: __MODULE__.Sentinels},
       ListenerLifecycle.listener_spec(
-        plug: HealthPlug,
+        plug: {HealthPlug, %{db: db, firehose_hub: __MODULE__.Hub, model_catalog: %{}}},
         port: 0,
         ip: {127, 0, 0, 1},
         startup_log: false
@@ -52,6 +61,11 @@ defmodule Tightbeam.FailureContainmentTest do
     adapters = Process.whereis(__MODULE__.Adapters)
     {:ok, {_, port}} = ThousandIsland.listener_info(listener)
 
+    {:paired, device} =
+      Tightbeam.Devices.pair(db, %{device_id: "containment", claimed_name: "Client"})
+
+    ws = subscribe(port, device.token)
+
     for id <- [Firehose.Hub, ModelCatalog, SentinelSupervisor] do
       before = Map.new(Supervisor.which_children(runtime), fn {id, pid, _, _} -> {id, pid} end)
       old = Map.fetch!(before, id)
@@ -61,6 +75,32 @@ defmodule Tightbeam.FailureContainmentTest do
                replacement = child(runtime, id)
                is_pid(replacement) and replacement != old and Process.alive?(replacement)
              end)
+
+      if id == Firehose.Hub do
+        assert {:ok, {:closed, 1012}, _} = WS.recv_event(ws, 2_000)
+        WS.close(ws)
+        resumed = subscribe(port, device.token)
+
+        {:ok, _} = DB.query(db, """
+        INSERT INTO work_items(id,title,ownerUserId,state,createdByUser,createdAt)
+        VALUES ('wi_restart','Restart delivery',?1,'open',?1,1)
+        """, [device.user_id])
+
+        notice = %{
+          "class" => "work_item.updated",
+          "resource" => "work-items",
+          "op" => "upsert",
+          "occurredAt" => 1,
+          "refs" => %{"workItemId" => "wi_restart", "ownerUserId" => device.user_id},
+          "payload" => %{"id" => "wi_restart"}
+        }
+
+        Firehose.Hub.publish(__MODULE__.Hub, notice)
+        assert {:ok, frame, _} = WS.recv(resumed, 2_000)
+        assert frame["class"] == "work_item.updated"
+        assert frame["payload"]["id"] == "wi_restart"
+        WS.close(resumed)
+      end
 
       assert child(runtime, Bandit) == listener
       assert Process.whereis(__MODULE__.Scheduler) == scheduler
@@ -77,6 +117,15 @@ defmodule Tightbeam.FailureContainmentTest do
       assert response =~ "200 OK"
       :gen_tcp.close(socket)
     end
+  end
+
+  defp subscribe(port, token) do
+    {:ok, ws} = WS.connect("127.0.0.1", port, "/changes")
+    :ok = WS.send_text(ws, JSON.encode!(%{"type" => "auth", "token" => token}))
+    assert {:ok, %{"success" => true}, ws} = WS.recv(ws, 2_000)
+    :ok = WS.send_text(ws, JSON.encode!(%{"type" => "subscribe", "subscriptionId" => "all"}))
+    assert {:ok, %{"type" => "subscription_ready"}, ws} = WS.recv(ws, 2_000)
+    ws
   end
 
   defp child(supervisor, id) do

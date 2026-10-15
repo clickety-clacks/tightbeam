@@ -329,6 +329,7 @@ defmodule Tightbeam.ModelCatalog do
       credential_status: Keyword.get(opts, :credential_status, &default_credential_status/2),
       credential_kind: Keyword.get(opts, :credential_kind, &default_credential_kind/2),
       entries: %{},
+      versions: %{},
       owner: self(),
       background: nil,
       pending: :queue.new()
@@ -341,7 +342,8 @@ defmodule Tightbeam.ModelCatalog do
 
   @impl true
   def handle_call(:get, _from, state) do
-    {:reply, Map.new(state.entries, fn {key, cache} -> {key, cache.entries} end), state}
+    {:reply, Map.new(state.entries, fn {key, cache} -> {key, cache.entries} end),
+     enqueue_background({:info, :refresh_due}, state)}
   end
 
   def handle_call({:get, key}, _from, state) do
@@ -351,33 +353,64 @@ defmodule Tightbeam.ModelCatalog do
         cache -> {cache.entries, health(cache, now_ms(state), state.ttl_ms)}
       end
 
-    {:reply, answer, state}
+    {:reply, answer, enqueue_background({:info, :refresh_due}, state)}
   end
 
   @impl true
+  def handle_cast({:credential_transition, host, provider, _fact_id} = message, state) do
+    state =
+      Enum.reduce(credential_keys(host, provider), state, fn key, acc ->
+        acc
+        |> put_in([:entries, key], Map.put(new_cache(), :reason, :credential_transition_pending))
+        |> update_in([:versions, key], &((&1 || 0) + 1))
+      end)
+
+    {:noreply, enqueue_background({:cast, message}, state)}
+  end
+
   def handle_cast(message, state), do: {:noreply, enqueue_background({:cast, message}, state)}
 
   @impl true
   def handle_info(:refresh_tick, state) do
-    Process.send_after(self(), :refresh_tick, 1_000)
+    Process.send_after(self(), :refresh_tick, state.ttl_ms)
     {:noreply, enqueue_background({:info, :refresh_due}, state)}
   end
 
-  def handle_info({pid, {:noreply, updated}}, %{background: {pid, ref}} = state) do
+  def handle_info({pid, {:noreply, updated}}, %{background: {pid, ref, _event, versions}} = state) do
     Process.demonitor(ref, [:flush])
-    updated = %{updated | background: nil, pending: state.pending}
+    entries =
+      Enum.reduce(state.versions, updated.entries, fn {key, version}, entries ->
+        if version == Map.get(versions, key, 0),
+          do: entries,
+          else: Map.put(entries, key, Map.fetch!(state.entries, key))
+      end)
+
+    updated = %{updated | entries: entries, versions: state.versions, background: nil, pending: state.pending}
     {:noreply, next_background(updated)}
   end
 
-  def handle_info({:DOWN, ref, :process, pid, reason}, %{background: {pid, ref}} = state) do
-    {:stop, {:background_refresh_failed, reason}, state}
+  def handle_info({:DOWN, ref, :process, pid, reason}, %{background: {pid, ref, event, _}} = state) do
+    Logger.warning("model catalog background work failed: #{inspect(reason)}")
+    state = %{state | background: nil}
+
+    if event == {:info, :resume_terminal_recoveries} do
+      Process.send_after(self(), :resume_terminal_recoveries, state.ttl_ms)
+    end
+
+    {:noreply, next_background(state)}
+  end
+
+  def handle_info({:catalog_result, key, version, message}, state) do
+    if Map.get(state.versions, key, 0) == version,
+      do: {:noreply, enqueue_background({:info, {:catalog_result, key, version, message}}, state)},
+      else: {:noreply, state}
   end
 
   def handle_info(message, state),
     do: {:noreply, enqueue_background({:info, message}, state)}
 
-  # Keep database and host work off the reader process. Serialize updates so a
-  # credential transition cannot be overwritten by an older refresh snapshot.
+  # Keep database and host work off the reader process. Entry versions prevent
+  # an older refresh snapshot from overwriting a credential invalidation.
   defp enqueue_background(event, state) do
     if event == {:info, :refresh_due} and
          :queue.member(event, state.pending) do
@@ -409,7 +442,7 @@ defmodule Tightbeam.ModelCatalog do
             send(owner, {self(), result})
           end)
 
-        %{state | background: {pid, ref}, pending: pending}
+        %{state | background: {pid, ref, event, state.versions}, pending: pending}
     end
   end
 
@@ -418,19 +451,13 @@ defmodule Tightbeam.ModelCatalog do
   # world-state. Pi also consumes named local providers; the other harnesses
   # retain their single-provider association.
   defp background_cast({:credential_present, host, provider}, state) do
-    keys =
-      for harness <- harness_names(),
-          catalog_uses_provider?(Harness.parse!(harness), provider),
-          do: {host, harness}
+    keys = credential_keys(host, provider)
 
     {:noreply, Enum.reduce(keys, state, &force_rederive(&2, &1))}
   end
 
   defp background_cast({:credential_transition, host, provider, fact_id}, state) do
-    keys =
-      for harness <- harness_names(),
-          catalog_uses_provider?(Harness.parse!(harness), provider),
-          do: {host, harness}
+    keys = credential_keys(host, provider)
 
     claims =
       if state.db do
@@ -452,8 +479,20 @@ defmodule Tightbeam.ModelCatalog do
     {:noreply, state}
   end
 
+  defp credential_keys(host, provider) do
+    for harness <- harness_names(),
+        catalog_uses_provider?(Harness.parse!(harness), provider),
+        do: {host, harness}
+  end
+
   defp catalog_uses_provider?(Tightbeam.Harness.Pi, :local_openai), do: true
   defp catalog_uses_provider?(module, provider), do: module.credential_provider() == provider
+
+  defp background_info({:catalog_result, key, version, message}, state) do
+    if Map.get(state.versions, key, 0) == version,
+      do: background_info(message, state),
+      else: {:noreply, state}
+  end
 
   defp background_info(:refresh_due, state), do: {:noreply, refresh_due(state)}
 
@@ -616,13 +655,18 @@ defmodule Tightbeam.ModelCatalog do
     cache = Map.get(state.entries, key) || new_cache()
     state = put_in(state, [:entries, key], cache)
 
-    if cache.reason == :terminal_credential_persistence_failed do
-      put_in(state, [:entries, key], persistence_failure_cache(cache))
-    else
-      case terminal_incident(state, key) do
-        nil -> refresh_unsuppressed(state, key, host_config, force?, now, cache)
-        incident -> put_in(state, [:entries, key], terminal_cache(cache, incident.id))
-      end
+    cond do
+      cache.reason == :credential_transition_pending and not force? ->
+        state
+
+      cache.reason == :terminal_credential_persistence_failed ->
+        put_in(state, [:entries, key], persistence_failure_cache(cache))
+
+      true ->
+        case terminal_incident(state, key) do
+          nil -> refresh_unsuppressed(state, key, host_config, force?, now, cache)
+          incident -> put_in(state, [:entries, key], terminal_cache(cache, incident.id))
+        end
     end
   end
 
@@ -658,7 +702,8 @@ defmodule Tightbeam.ModelCatalog do
 
       {:ok, _pid} =
         Task.start(fn ->
-          send(owner, {:catalog_refresh, key, safely_derive(key, probe, snapshot)})
+          send(owner, {:catalog_result, key, Map.get(snapshot.versions, key, 0),
+            {:catalog_refresh, key, safely_derive(key, probe, snapshot)}})
         end)
 
       state
@@ -688,7 +733,8 @@ defmodule Tightbeam.ModelCatalog do
           Task.start(fn ->
             send(
               owner,
-              {:catalog_recovery, key, incident_id, fact_id, safely_derive(key, probe, snapshot)}
+              {:catalog_result, key, Map.get(snapshot.versions, key, 0),
+               {:catalog_recovery, key, incident_id, fact_id, safely_derive(key, probe, snapshot)}}
             )
           end)
 
