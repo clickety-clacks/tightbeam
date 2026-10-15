@@ -3,7 +3,9 @@ defmodule Tightbeam.DBReadersDeadlinesTest do
   alias Tightbeam.DB
 
   @tag :tmp_dir
-  test "WAL queries read committed state while the owner holds a write transaction", %{tmp_dir: tmp} do
+  test "WAL queries read committed state while the owner holds a write transaction", %{
+    tmp_dir: tmp
+  } do
     Tightbeam.GuardRuntimeFixture.run!(tmp, "guard_db_readers_runtime.exs", "guarded-readers: ok")
   end
 
@@ -12,10 +14,14 @@ defmodule Tightbeam.DBReadersDeadlinesTest do
     parent = self()
     :sys.suspend(db)
 
-    caller = Task.async(fn ->
-      DB.transaction_until(db, fn _ -> send(parent, :expired_callback) end,
-        System.monotonic_time(:millisecond) + 30)
-    end)
+    caller =
+      Task.async(fn ->
+        DB.transaction_until(
+          db,
+          fn _ -> send(parent, :expired_callback) end,
+          System.monotonic_time(:millisecond) + 30
+        )
+      end)
 
     assert {:error, %DB.DeadlineExceeded{}} = Task.await(caller)
     :sys.resume(db)
@@ -29,12 +35,17 @@ defmodule Tightbeam.DBReadersDeadlinesTest do
     parent = self()
     deadline = System.monotonic_time(:millisecond) + 100
 
-    result = DB.transaction_until(db, fn txn ->
-      DB.Txn.q(txn, "INSERT INTO deadline_rows VALUES(1)")
-      Process.sleep(110)
-      DB.Txn.q(txn, "INSERT INTO deadline_rows VALUES(2)")
-      send(parent, :statement_ran)
-    end, deadline)
+    result =
+      DB.transaction_until(
+        db,
+        fn txn ->
+          DB.Txn.q(txn, "INSERT INTO deadline_rows VALUES(1)")
+          Process.sleep(110)
+          DB.Txn.q(txn, "INSERT INTO deadline_rows VALUES(2)")
+          send(parent, :statement_ran)
+        end,
+        deadline
+      )
 
     assert {:error, %DB.DeadlineExceeded{}} = result
     refute_receive :statement_ran

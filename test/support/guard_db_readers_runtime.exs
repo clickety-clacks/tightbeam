@@ -15,25 +15,29 @@ try do
   {:ok, []} = DB.query(db, "INSERT INTO reader_rows VALUES(1)")
   parent = self()
 
-  writer = Task.async(fn ->
-    DB.transaction(db, fn txn ->
-      DB.Txn.q(txn, "INSERT INTO reader_rows VALUES(2)")
-      send(parent, :writer_holds_owner)
-      receive do: (:release_writer -> :written)
+  writer =
+    Task.async(fn ->
+      DB.transaction(db, fn txn ->
+        DB.Txn.q(txn, "INSERT INTO reader_rows VALUES(2)")
+        send(parent, :writer_holds_owner)
+        receive do: (:release_writer -> :written)
+      end)
     end)
-  end)
 
   assert_receive :writer_holds_owner
-  reader = Task.async(fn -> DB.query(db, "SELECT id FROM reader_rows ORDER BY id") end)
+  reader = Task.async(fn -> DB.query(db, "-- read committed rows\n/* independent reader */ SELECT id FROM reader_rows ORDER BY id") end)
   assert {:ok, {:ok, [[1]]}} = Task.yield(reader, 1_000)
   send(db, :release_writer)
   assert {:ok, :written} = Task.await(writer)
   assert {:ok, [[1], [2]]} = DB.query(db, "SELECT id FROM reader_rows ORDER BY id")
 
   # A write CTE must still use the writer, never silently fail on a reader.
-  assert {:ok, []} = DB.query(db, "WITH n AS (SELECT 3 AS id) INSERT INTO reader_rows SELECT id FROM n")
+  assert {:ok, []} =
+           DB.query(db, "WITH n AS (SELECT 3 AS id) INSERT INTO reader_rows SELECT id FROM n")
+
   assert {:ok, [[3]]} = DB.query(db, "SELECT id FROM reader_rows WHERE id=3")
 after
   GenServer.stop(db)
 end
+
 IO.puts("guarded-readers: ok")

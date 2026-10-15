@@ -85,13 +85,14 @@ defmodule Tightbeam.DB do
           _ -> false
         end
 
-      _ -> false
+      _ ->
+        false
     end
   end
 
   @doc false
   def reader(server, sql) do
-    if Regex.match?(~r/\A\s*(SELECT|WITH|EXPLAIN)\b/i, sql) do
+    if Regex.match?(~r/\A(?:\s|--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)*(SELECT|WITH|EXPLAIN)\b/i, sql) do
       with pid when is_pid(pid) <- GenServer.whereis(server),
            {:dictionary, dictionary} <- Process.info(pid, :dictionary),
            [_ | _] = readers <- Keyword.get(dictionary, :tightbeam_db_readers, []) do
@@ -616,9 +617,13 @@ defmodule Tightbeam.DB do
     # Delegate to the existing handler so admission, fences, deadlines and all
     # state transitions retain their current owner and ordering (R2/R3).
     DBObservation.server(envelope, 5_000, fn ->
-      with_deadline(envelope.deadline, fn ->
-        handle_call(payload, from, state)
-      end, state)
+      with_deadline(
+        envelope.deadline,
+        fn ->
+          handle_call(payload, from, state)
+        end,
+        state
+      )
     end)
   end
 
@@ -888,14 +893,15 @@ defmodule Tightbeam.DB do
 
   # Each real transaction owns a distinct queue. Invalidate it before sending
   # casts; later recognition failure cannot undo the first committed phase.
-  # `deadline` is a fourth parameter with a default rather than a generalised
-  # one, so every caller that has no deadline keeps its existing three-argument
-  # call unchanged and :infinity makes the two deadline checks no-ops. The two
-  # guards stay independent: the fence is enforced inside `fun` via
-  # `assert_archetype_available!`, the deadline around it via
-  # `ensure_before_deadline`, and neither consults the other.
+  # Runtime calls inherit their caller's absolute deadline. Explicit deadlines
+  # can shorten it; migration callbacks retain an unbounded transaction handle.
   defp commit_phase(conn, fun, fenced_archetypes, deadline \\ nil) do
-    deadline = deadline || Process.get(@deadline_key, :infinity)
+    deadline =
+      case {deadline, Process.get(@deadline_key, :infinity)} do
+        {nil, inherited} -> inherited
+        {explicit, :infinity} -> explicit
+        {explicit, inherited} -> min(explicit, inherited)
+      end
     token = make_ref()
     key = {Txn, :outbox, token}
     Process.put(key, [])
@@ -1048,7 +1054,11 @@ defmodule Tightbeam.DB do
     try do
       result =
         DBObservation.callback(fn ->
-          check.(%Txn{conn: conn, fenced_archetypes: fenced_archetypes, deadline: Process.get(@deadline_key, :infinity)})
+          check.(%Txn{
+            conn: conn,
+            fenced_archetypes: fenced_archetypes,
+            deadline: Process.get(@deadline_key, :infinity)
+          })
         end)
 
       case result do

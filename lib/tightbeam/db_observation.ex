@@ -162,11 +162,14 @@ defmodule Tightbeam.DBObservation do
 
   defp send_request(server, {:db_call, envelope, {:query, sql, params}} = request, _, budget) do
     case Tightbeam.DB.reader(server, sql) do
-      nil -> owner_request(server, request, envelope, budget)
+      nil ->
+        owner_request(server, request, envelope, budget)
+
       conn ->
-        {:reply, response, _} = server(envelope, 5_000, fn ->
-          {:reply, Tightbeam.DB.read_query(conn, sql, params), nil}
-        end)
+        {:reply, response, _} =
+          server(envelope, 5_000, fn ->
+            {:reply, Tightbeam.DB.read_query(conn, sql, params), nil}
+          end)
 
         case response do
           {{:error, %{message: message}}, _} when is_binary(message) ->
@@ -174,7 +177,8 @@ defmodule Tightbeam.DBObservation do
               do: owner_request(server, request, envelope, budget),
               else: response
 
-          _ -> response
+          _ ->
+            response
         end
     end
   end
@@ -184,9 +188,11 @@ defmodule Tightbeam.DBObservation do
 
   defp owner_request(server, request, envelope, budget) do
     if Tightbeam.DB.overloaded?(server) do
-      {:reply, response, _} = server(envelope, nil, fn ->
-        {:reply, {:error, %Tightbeam.DB.Overloaded{}}, nil}
-      end)
+      {:reply, response, _} =
+        server(envelope, nil, fn ->
+          {:reply, {:error, %Tightbeam.DB.Overloaded{}}, nil}
+        end)
+
       response
     else
       GenServer.call(server, request, budget)
