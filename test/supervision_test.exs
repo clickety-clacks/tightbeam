@@ -2865,24 +2865,51 @@ defmodule Tightbeam.SupervisionTest do
     assert {:ok, []} = DB.query(ctx.db, "SELECT * FROM supervision_ended_controllers")
   end
 
-  test "scheduled controller records its wake ending when canceled", ctx do
+  test "a pending controller records its wake ending until settlement", ctx do
     terminal_seq = terminal!(ctx.db, "holder")
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0, interval: 60_000)
     assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", terminal_seq)
     assert [controller] = Wakes.list_pending(ctx.db)
-    cancel_wake!(ctx.db, controller)
 
-    assert {:ok, [["canceled"]]} =
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE wakes SET state='fired',firedAt=1 WHERE wakeId=?1", [
+               controller.wake_id
+             ])
+
+    assert {:ok, [["fired"]]} =
              DB.query(
                ctx.db,
                "SELECT endedWakeState FROM supervision_ended_controllers WHERE wakeId=?1",
                [controller.wake_id]
              )
 
+    assert {:ok, [[wake_id, "asg_1", "fired"]]} =
+             DB.query(ctx.db, Supervision.ended_controllers_sql())
+
+    assert wake_id == controller.wake_id
+
     assert {:ok, _} =
              DB.query(
                ctx.db,
                "UPDATE supervision_liveness_sidecar SET controllerState='settled' WHERE wakeId=?1",
+               [controller.wake_id]
+             )
+
+    assert {:ok, []} = DB.query(ctx.db, Supervision.ended_controllers_sql())
+  end
+
+  test "cancellation settles its controller and removes its ending record", ctx do
+    terminal_seq = terminal!(ctx.db, "holder")
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0, interval: 60_000)
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", terminal_seq)
+    assert [controller] = Wakes.list_pending(ctx.db)
+    cancel_wake!(ctx.db, controller)
+    assert Wakes.get(ctx.db, controller.wake_id).state == "canceled"
+
+    assert {:ok, [["settled"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT controllerState FROM supervision_liveness_sidecar WHERE wakeId=?1",
                [controller.wake_id]
              )
 
