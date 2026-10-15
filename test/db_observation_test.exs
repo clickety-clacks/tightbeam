@@ -211,7 +211,7 @@ defmodule Tightbeam.DBObservationTest do
       assert terminal.sqlite_busy_budget_ms == nil
       # Expired owner work now reports its distinct deadline refusal class.
       assert terminal.result_class == "deadline_exceeded"
-      assert terminal.cause == nil
+      assert terminal.cause == "deadline_exceeded"
       assert terminal.execute_ms == nil
       assert terminal.callback_sql_ms == nil
       assert terminal.callback_outside_sql_ms == nil

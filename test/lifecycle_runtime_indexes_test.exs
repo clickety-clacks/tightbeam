@@ -21,6 +21,7 @@ defmodule Tightbeam.LifecycleRuntimeIndexesTest do
       if String.contains?(sql, "lifecycle_events") do
         assert Enum.any?(plan, &Regex.match?(~r/\bSCAN (?:lifecycle_events|e)\b/, List.last(&1)))
       end
+
       assert DB.query(db, sql, params) == {:ok, expected}
     end
 
