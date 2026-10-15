@@ -250,7 +250,7 @@ defmodule Tightbeam.RailRemedy do
       SELECT subject,occurrence,producerKey,noticeState FROM rail_remedy_episodes
       WHERE statute='completion-requires-review' AND status='live'
         AND (noticeState IS NULL OR json_extract(noticeState,'$.reassessment') IS NULL)
-      ORDER BY openedAt,subject LIMIT 100
+      ORDER BY openedAt,subject
       """)
       |> Enum.each(fn [subject, occurrence, producer, encoded] ->
         state =
@@ -526,14 +526,19 @@ defmodule Tightbeam.RailRemedy do
   @doc "Actor-owned live-to-closed CAS for one passed statute occurrence."
   @spec close(DB.server(), String.t(), String.t(), pos_integer()) :: boolean()
   def close(db, statute, subject, occurrence) do
-    cas(
-      db,
-      """
+    case DB.transaction(db, fn txn ->
+      Txn.q(txn, """
       UPDATE rail_remedy_episodes SET status = 'closed', closedAt = ?4
       WHERE statute = ?1 AND subject = ?2 AND occurrence = ?3 AND status = 'live'
-      """,
-      [statute, subject, occurrence, now()]
-    )
+      """, [statute, subject, occurrence, now()])
+      won? = Txn.changes(txn) == 1
+      if won? and statute == "completion-requires-review",
+        do: Wakes.schedule_changed_in_txn(txn, :review_remedy_changed)
+      won?
+    end) do
+      {:ok, won?} -> won?
+      {:error, error} -> raise error
+    end
   end
 
   @doc false

@@ -1482,6 +1482,7 @@ defmodule Tightbeam.Wire.RouterTest do
   end
 
   test "/version states which bytes the gateway is: version + build stamp", ctx do
+    before = Tightbeam.SchedulerMisses.count()
     response = Router.call(conn(:get, "/version"), Router.init(ctx.opts))
 
     assert response.status == 200
@@ -1496,7 +1497,7 @@ defmodule Tightbeam.Wire.RouterTest do
     assert is_integer(body["build"]) and body["build"] > 0
     assert body["build"] == Tightbeam.BuildStamp.build()
     assert body["sha"] == Tightbeam.BuildStamp.sha()
-    assert body["schedulerMisses"] == Tightbeam.SchedulerMisses.count()
+    assert body["schedulerMisses"] - before == 0
   end
 
   test "CLI exact-version refusal is loud after bearer authentication", ctx do

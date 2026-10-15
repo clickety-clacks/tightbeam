@@ -71,9 +71,9 @@ defmodule Tightbeam.RailRemedyTest do
       :persistent_term.erase(Rules)
     end)
 
-    registry = start_supervised!({ConnRegistry, name: nil})
+    registry = start_supervised!(Supervisor.child_spec({ConnRegistry, name: nil}, id: :scheduler_registry))
     lane = :"remedy_lane_#{System.unique_integer([:positive])}"
-    start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, lane})
+    start_supervised!(Supervisor.child_spec({Tightbeam.NoticeBatcherFixture.LaneStub, lane}, id: :scheduler_lane))
 
     %{
       db: db,
@@ -87,7 +87,8 @@ defmodule Tightbeam.RailRemedyTest do
 
   test "an open review episode sleeps until readiness or a verdict", ctx do
     assignment = notice_assignment(ctx, "event reassessment")
-    fire_review_notice(ctx, assignment)
+    %{producer_id: root} = fire_review_notice(ctx, assignment)
+    mark_notice_turn(ctx.db, assignment.id, root, "delivered")
     parent = self()
 
     consumer = fn wake ->

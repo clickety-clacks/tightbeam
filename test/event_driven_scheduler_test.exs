@@ -273,6 +273,61 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
     assert :sys.get_state(pid).retries == %{}
   end
 
+  test "internal retry backoff stops growing at five minutes", ctx do
+    parent = self()
+    pid = scheduler(ctx, internal_consumers: %{"effort_deadline" => fn _ ->
+      send(parent, :attempted)
+      raise "temporary"
+    end})
+    scheduled = wake(ctx.db, System.system_time(:millisecond), %{consumer: "effort_deadline"})
+    assert_receive :attempted, 1_000
+    :sys.get_state(pid)
+    :sys.replace_state(pid, fn state ->
+      %{state | retries: %{scheduled.wake_id => 0}, retry_attempts: %{scheduled.wake_id => 20}}
+    end)
+    before = System.system_time(:millisecond)
+    Wakes.fire_due(pid)
+    assert_receive :attempted
+    next = :sys.get_state(pid).retries[scheduled.wake_id]
+    assert next >= before + 300_000
+    assert next <= System.system_time(:millisecond) + 300_000
+    refute_receive :attempted, 100
+  end
+
+  test "the detector excludes digests and waits that cannot deliver", ctx do
+    pid = scheduler(ctx)
+    Process.sleep(150)
+    :sys.get_state(pid)
+    :sys.suspend(pid)
+    on_exit(fn -> if Process.alive?(pid), do: :sys.resume(pid) end)
+    due = System.system_time(:millisecond) + 60_000
+    digest = wake(ctx.db, due, %{digest: true})
+    boundary = wake(ctx.db, due, %{delivery_rule: "turn-boundary-digest r1"})
+    unrecognized = wake(ctx.db, due)
+    after_turn = wake(ctx.db, due)
+    {:ok, _} = DB.query(ctx.db, """
+    INSERT INTO sessions(sessionKey,displayName,ownerUserId,origin,archetype,harness,
+      provider,model,host,state,createdAt,updatedAt)
+    VALUES ('originator','originator','owner','user:owner','default','claude',
+      'anthropic','fable','testhost','active',1,1)
+    """)
+    {:ok, _} = Ledger.enqueue(ctx.db, %{session_key: "originator", message_id: "origin-turn",
+      origin: "user:owner", prompt: "working"})
+    {:ok, origin} = Ledger.claim_next(ctx.db, "originator", "testhost")
+    {:ok, _} = DB.query(ctx.db, "UPDATE wakes SET waitMode='dependency' WHERE wakeId=?1", [unrecognized.wake_id])
+    {:ok, _} = DB.query(ctx.db, """
+    UPDATE wakes SET waitMode='after-turn',recognitionAt=1,originatingTurnSeq=?2 WHERE wakeId=?1
+    """, [after_turn.wake_id, origin.seq])
+    for wake <- [digest, boundary, unrecognized, after_turn] do
+      {:ok, _} = DB.query(ctx.db, "UPDATE wakes SET dueAt=?2 WHERE wakeId=?1",
+        [wake.wake_id, System.system_time(:millisecond) - 61_000])
+    end
+    send(pid, :detect_misses)
+    :sys.resume(pid)
+    :sys.get_state(pid)
+    assert Tightbeam.SchedulerMisses.count() - ctx.misses_before == 0
+  end
+
   test "later schedule storms retain the deadline and coalesce delivery passes", ctx do
     pid = scheduler(ctx)
     first = System.system_time(:millisecond) + 60_000
