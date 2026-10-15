@@ -393,6 +393,7 @@ defmodule Tightbeam.WorkspaceCleanupTest do
     artifact = artifact(ctx, kept)
     retire(ctx)
     attempts = :atomics.new(1, [])
+    parent = self()
 
     runner = fn _invocation, script, input ->
       copy_script =
@@ -407,14 +408,19 @@ defmodule Tightbeam.WorkspaceCleanupTest do
           """
           cp() {
             command cp "$@" || return $?
-            return 1
+            # Replace the background function with a process that really dies by signal.
+            exec sh -c 'kill -TERM "$$"'
           }
           """
         else
           ""
         end
 
-      WorkspaceCleanup.system_runner(["sh", "-c", prefix <> copy_script], copy_script, input)
+      result =
+        WorkspaceCleanup.system_runner(["sh", "-c", prefix <> copy_script], copy_script, input)
+
+      send(parent, {:copy_result, result})
+      result
     end
 
     config = Map.put(ctx.config, :workspace_cleanup_runner, runner)
@@ -422,7 +428,10 @@ defmodule Tightbeam.WorkspaceCleanupTest do
     assert %{status: "incomplete"} =
              WorkspaceCleanup.process_session(config, ctx.db, ctx.session.session_key)
 
+    assert_receive {:copy_result, {_output, status}}
+    assert status != 0
     assert File.read!(kept) == "preserve through a failed copy"
+    assert Artifacts.get(ctx.db, artifact.artifact_id).state == "in-workspace"
 
     assert {:ok, [[destination]]} =
              DB.query(
