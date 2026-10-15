@@ -214,15 +214,39 @@ defmodule Tightbeam.SentinelsTest do
 
       assert %{sentinel: "alpha-bundle/watch", name: "WATCH_TARGET", changed: true} = set
 
+      reserved_name_set =
+        handlers["host-env-set"].(%{
+          origin: "user:flynn",
+          params: %{
+            sentinel: "alpha-bundle/watch",
+            name: "CODEX_HOME",
+            value: "synthetic-codex-home"
+          }
+        })
+
+      assert %{sentinel: "alpha-bundle/watch", name: "CODEX_HOME", changed: true} =
+               reserved_name_set
+
+      assert %{code: "invalid_env_name"} =
+               handlers["host-env-set"].(%{
+                 origin: "user:flynn",
+                 params: %{
+                   sentinel: "alpha-bundle/watch",
+                   name: "CODEX-HOME",
+                   value: "synthetic-codex-home"
+                 }
+               })
+
       listed =
         handlers["host-env-list"].(%{
           origin: "user:flynn",
           params: %{sentinel: "alpha-bundle/watch"}
         })
 
-      assert [%{name: "WATCH_TARGET"}] = listed.settings
+      assert Enum.sort(Enum.map(listed.settings, & &1.name)) == ["CODEX_HOME", "WATCH_TARGET"]
       assert listed.missing == ["WATCH_EXTRA"]
-      refute inspect({set, listed}) =~ "synthetic-secret-value"
+      refute inspect({set, reserved_name_set, listed}) =~ "synthetic-secret-value"
+      refute inspect({set, reserved_name_set, listed}) =~ "synthetic-codex-home"
 
       assert %{overlays: []} = handlers["host-env-list"].(%{origin: "user:flynn", params: %{}})
 
@@ -237,6 +261,17 @@ defmodule Tightbeam.SentinelsTest do
                    harness: "claude",
                    name: "WATCH_TARGET",
                    value: "x"
+                 }
+               })
+
+      assert %{code: "reserved_env_name"} =
+               handlers["host-env-set"].(%{
+                 origin: "user:flynn",
+                 params: %{
+                   host: ctx.host,
+                   harness: "claude",
+                   name: "CODEX_HOME",
+                   value: "synthetic-codex-home"
                  }
                })
 
@@ -262,6 +297,113 @@ defmodule Tightbeam.SentinelsTest do
                  origin: "user:flynn",
                  params: %{sentinel: "alpha-bundle/watch", name: "WATCH_TARGET"}
                })
+    end
+
+    test "shipped landing watcher can be configured and enabled from setup.md", ctx do
+      bundle_root = Path.expand("../priv/kungfu", __DIR__)
+      shipped_bundle = Path.join(bundle_root, "agentic-engineering")
+      previous_bundle_root = Application.get_env(:tightbeam, :kungfu_bundle_root_dir)
+      previous_identity_source = Application.get_env(:tightbeam, :identity_source_dir)
+
+      Application.put_env(:tightbeam, :kungfu_bundle_root_dir, bundle_root)
+      Application.put_env(:tightbeam, :identity_source_dir, shipped_bundle)
+
+      try do
+        Identity.init!(ctx.base)
+        {:ok, candidate} = Identity.learn!(ctx.base, "agentic-engineering", "user:flynn")
+        {:ok, _revision} = Identity.publish_live!(ctx.base, candidate)
+
+        qualified = "agentic-engineering/landing-watch"
+        host = ctx.host
+        shipped_setup = Sentinels.setup(ctx.base, ctx.db, ctx.host, "agentic-engineering")
+
+        for instruction <- [
+              "tightbeam host-env-set --sentinel #{qualified} GH_CONFIG_DIR=<dir>",
+              "tightbeam host-env-set --sentinel #{qualified} LANDING_REPOS=",
+              "tightbeam sentinel enable #{qualified}"
+            ] do
+          assert shipped_setup.setup_text =~ instruction
+        end
+
+        gh_config_dir = Path.join(ctx.root, "synthetic-gh-config")
+        File.mkdir_p!(gh_config_dir)
+        handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base})
+
+        assert %{
+                 sentinel: ^qualified,
+                 host: ^host,
+                 name: "GH_CONFIG_DIR",
+                 changed: true
+               } =
+                 handlers["host-env-set"].(%{
+                   origin: "user:flynn",
+                   params: %{
+                     sentinel: qualified,
+                     name: "GH_CONFIG_DIR",
+                     value: gh_config_dir
+                   }
+                 })
+
+        assert %{
+                 sentinel: ^qualified,
+                 host: ^host,
+                 name: "LANDING_REPOS",
+                 changed: true
+               } =
+                 handlers["host-env-set"].(%{
+                   origin: "user:flynn",
+                   params: %{
+                     sentinel: qualified,
+                     name: "LANDING_REPOS",
+                     value: "example/repo@main=pdo:example"
+                   }
+                 })
+
+        assert Enum.map(shipped_setup.pending, & &1.state) == [
+                 "setting-missing",
+                 "setting-missing",
+                 "disabled"
+               ]
+
+        configured =
+          handlers["kungfu-setup"].(%{
+            origin: "user:flynn",
+            params: %{name: "agentic-engineering"}
+          })
+
+        assert Enum.map(configured.pending, & &1.state) == ["disabled"]
+
+        # Exercise the shipped enable handler without starting the watcher or
+        # making GitHub/Tightbeam provider calls in this isolated fixture.
+        refute Process.whereis(SentinelSupervisor)
+
+        assert %{sentinel: ^qualified, host: ^host, state: "enabled"} =
+                 handlers["sentinel-enable"].(%{
+                   origin: "user:flynn",
+                   params: %{name: qualified}
+                 })
+
+        assert Sentinels.setup(ctx.base, ctx.db, ctx.host, "agentic-engineering").pending == []
+
+        assert %{code: "reserved_env_name"} =
+                 handlers["host-env-set"].(%{
+                   origin: "user:flynn",
+                   params: %{
+                     host: ctx.host,
+                     harness: "claude",
+                     name: "GH_CONFIG_DIR",
+                     value: gh_config_dir
+                   }
+                 })
+      after
+        if is_nil(previous_bundle_root),
+          do: Application.delete_env(:tightbeam, :kungfu_bundle_root_dir),
+          else: Application.put_env(:tightbeam, :kungfu_bundle_root_dir, previous_bundle_root)
+
+        if is_nil(previous_identity_source),
+          do: Application.delete_env(:tightbeam, :identity_source_dir),
+          else: Application.put_env(:tightbeam, :identity_source_dir, previous_identity_source)
+      end
     end
 
     test "removing a bundle forgets its states and settings and leaves the other's", ctx do
@@ -307,7 +449,8 @@ defmodule Tightbeam.SentinelsTest do
 
       set_settings!(ctx, "alpha-bundle/watch", %{
         "WATCH_TARGET" => "alpha-value",
-        "WATCH_EXTRA" => "e"
+        "WATCH_EXTRA" => "e",
+        "CODEX_HOME" => "/synthetic/codex-home"
       })
 
       set_settings!(ctx, "beta-bundle/watch", %{
@@ -346,6 +489,7 @@ defmodule Tightbeam.SentinelsTest do
       assert env["TIGHTBEAM_AS_PROCESS"] == "sentinel:alpha-bundle/watch"
       assert env["TIGHTBEAM_BASE_DIR"] == ctx.base
       assert env["WATCH_TARGET"] == "alpha-value"
+      assert env["CODEX_HOME"] == "/synthetic/codex-home"
       assert String.starts_with?(env["PATH"], "/synthetic/cli/bin:")
       refute Map.has_key?(env, "TIGHTBEAM_TOKEN")
       refute Map.has_key?(env, "WATCH_EXTRA")

@@ -352,8 +352,9 @@ defmodule Tightbeam.Placement do
   def set_sentinel_env(db, host, scope, name, value, set_by, call) do
     "sentinel:" <> _qualified = scope
 
-    with :ok <- valid_env_name(name),
-         :ok <- unreserved_env_name(name) do
+    # Sentinel settings are operator-selected and passed through opaquely; the
+    # harness reservation policy applies only to harness environment overlays.
+    with :ok <- valid_env_name(name) do
       {:ok, changed} =
         DB.transaction(db, fn txn ->
           DB.Txn.q(
