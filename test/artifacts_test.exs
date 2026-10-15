@@ -275,7 +275,7 @@ defmodule Tightbeam.ArtifactsTest do
   end
 
   @tag artifact_delta: true
-  test "supported retained-row migration uses creation plus one and rejects exhausted seed",
+  test "supported retained-row migration uses creation plus one and isolates exhausted seeds",
        ctx do
     row =
       record(ctx.db, ctx.child.session_key, %{
@@ -300,14 +300,13 @@ defmodule Tightbeam.ArtifactsTest do
         row.artifact_id
       ])
 
-    assert {:error, %ArgumentError{message: "artifact_version_seed_invalid"}} =
-             DB.transaction(ctx.db, &Artifacts.migrate_version_floors_in_txn/1)
-
-    assert {:ok, []} =
-             DB.query(
-               ctx.db,
-               "SELECT name FROM sqlite_master WHERE name='artifact_version_floors'"
-             )
+    log = ExUnit.CaptureLog.capture_log(fn ->
+      assert {:ok, :ok} = DB.transaction(ctx.db, &Artifacts.migrate_version_floors_in_txn/1)
+    end)
+    assert log =~ row.artifact_id
+    assert log =~ "artifact_version_seed_invalid"
+    assert {:ok, []} = DB.query(ctx.db, "SELECT artifactId FROM artifact_version_floors")
+    assert {:ok, [[9223372036854775807]]} = DB.query(ctx.db, "SELECT createdAt FROM artifacts WHERE artifactId=?1", [row.artifact_id])
   end
 
   test "records pointer provenance and supports exact AND filters newest first", ctx do

@@ -192,6 +192,7 @@ defmodule Tightbeam.BootRecordIsolationTest do
   test "unsupported credential incidents do not block healthy recipient reconciliation", %{db: db} do
     Org.create(db, %{
       session_key: Org.personal_session_key("owner"),
+      kind: "main",
       display_name: "Personal",
       owner_user_id: "owner",
       origin: "user:owner",
