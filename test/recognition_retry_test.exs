@@ -166,6 +166,23 @@ defmodule Tightbeam.RecognitionRetryTest do
     assert {:ok, []} = DB.query(db, "SELECT id FROM pending_recognition")
   end
 
+  @tag :tmp_dir
+  test "both persisted callback arities recover in a new virtual machine", %{tmp_dir: tmp} do
+    fixture = Tightbeam.GuardRuntimeFixture.prepare!(tmp, "recognition_restart_runtime.exs")
+
+    for phase <- ["write", "retry"] do
+      {output, status} =
+        System.cmd(fixture.executable, fixture.args ++ [phase],
+          env: fixture.env,
+          stderr_to_stdout: true
+        )
+
+      File.write!(Path.join(tmp, phase <> ".log"), output)
+      assert status == 0, output
+      assert output =~ "recognition-restart-#{phase}: ok"
+    end
+  end
+
   defp retry_now(db, retry) do
     :ok = DB.execute(db, "UPDATE pending_recognition SET nextAt=0 WHERE flagged=0")
     send(retry, :retry)
