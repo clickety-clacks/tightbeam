@@ -707,13 +707,13 @@ defmodule Tightbeam.Supervision do
   end
 
   defp do_transition_in_txn(%Txn{} = txn, %{
-        kind: "assignment_open",
-        assignment_id: assignment_id,
-        opened_at: opened_at,
-        principal: principal,
-        supervision_interval_ms: interval
-      })
-      when is_integer(opened_at) and opened_at >= 0 and is_integer(interval) and interval > 0 do
+         kind: "assignment_open",
+         assignment_id: assignment_id,
+         opened_at: opened_at,
+         principal: principal,
+         supervision_interval_ms: interval
+       })
+       when is_integer(opened_at) and opened_at >= 0 and is_integer(interval) and interval > 0 do
     Txn.q(
       txn,
       """
@@ -733,22 +733,22 @@ defmodule Tightbeam.Supervision do
   end
 
   defp do_transition_in_txn(%Txn{} = txn, %{
-        kind: "terminal_disposition",
-        assignment_id: assignment_id,
-        cause: cause,
-        principal: principal,
-        requester_id: requester_id
-      }) do
+         kind: "terminal_disposition",
+         assignment_id: assignment_id,
+         cause: cause,
+         principal: principal,
+         requester_id: requester_id
+       }) do
     cancel_assignment_controllers_in_txn(txn, assignment_id, requester_id)
     clear_entitlement_in_txn(txn, assignment_id, cause, principal)
     :terminal_disposition
   end
 
   defp do_transition_in_txn(%Txn{} = txn, %{
-        kind: "checkpoint_scheduled",
-        wake_id: wake_id,
-        creator_session_key: creator_session_key
-      }) do
+         kind: "checkpoint_scheduled",
+         wake_id: wake_id,
+         creator_session_key: creator_session_key
+       }) do
     case Txn.q(
            txn,
            """
@@ -788,15 +788,15 @@ defmodule Tightbeam.Supervision do
   end
 
   defp do_transition_in_txn(%Txn{} = txn, %{
-        kind: "parent_target_retired",
-        session_key: session_key,
-        retirement_epoch: retirement_epoch,
-        supervision_interval_ms: supervision_interval_ms,
-        principal: principal
-      })
-      when is_integer(retirement_epoch) and retirement_epoch >= 0 and
-             is_integer(supervision_interval_ms) and supervision_interval_ms > 0 and
-             is_binary(principal) do
+         kind: "parent_target_retired",
+         session_key: session_key,
+         retirement_epoch: retirement_epoch,
+         supervision_interval_ms: supervision_interval_ms,
+         principal: principal
+       })
+       when is_integer(retirement_epoch) and retirement_epoch >= 0 and
+              is_integer(supervision_interval_ms) and supervision_interval_ms > 0 and
+              is_binary(principal) do
     outcomes =
       transferred_assignments_in_txn(txn, session_key)
       |> Enum.map(fn {assignment_id, transfer} ->
@@ -818,12 +818,12 @@ defmodule Tightbeam.Supervision do
   end
 
   defp do_transition_in_txn(%Txn{} = txn, %{
-        kind: "parent_elevated",
-        assignment_id: assignment_id,
-        wake_id: wake_id,
-        turn_seq: turn_seq,
-        target_session_key: target
-      }) do
+         kind: "parent_elevated",
+         assignment_id: assignment_id,
+         wake_id: wake_id,
+         turn_seq: turn_seq,
+         target_session_key: target
+       }) do
     Txn.q(
       txn,
       """
@@ -848,12 +848,12 @@ defmodule Tightbeam.Supervision do
   end
 
   defp do_transition_in_txn(%Txn{} = txn, %{
-        kind: "controller_scheduled",
-        wake_id: wake_id,
-        assignment_id: assignment_id,
-        wake_kind: wake_kind
-      })
-      when wake_kind in ["prod", "escalation"] do
+         kind: "controller_scheduled",
+         wake_id: wake_id,
+         assignment_id: assignment_id,
+         wake_kind: wake_kind
+       })
+       when wake_kind in ["prod", "escalation"] do
     case Txn.q(
            txn,
            """
@@ -929,13 +929,13 @@ defmodule Tightbeam.Supervision do
   end
 
   defp do_transition_in_txn(%Txn{} = txn, %{
-        kind: "policy_denied",
-        assignment_id: assignment_id,
-        event_id: event_id,
-        evaluation_clock: evaluation_clock
-      })
-      when is_integer(event_id) and event_id > 0 and is_integer(evaluation_clock) and
-             evaluation_clock >= 0 do
+         kind: "policy_denied",
+         assignment_id: assignment_id,
+         event_id: event_id,
+         evaluation_clock: evaluation_clock
+       })
+       when is_integer(event_id) and event_id > 0 and is_integer(evaluation_clock) and
+              evaluation_clock >= 0 do
     case Txn.q(
            txn,
            """
@@ -1026,14 +1026,14 @@ defmodule Tightbeam.Supervision do
   end
 
   defp do_transition_in_txn(
-        %Txn{} = txn,
-        %{
-          kind: "controller_fire",
-          wake_id: wake_id,
-          assignment_id: assignment_id,
-          target_session_key: target
-        } = observation
-      ) do
+         %Txn{} = txn,
+         %{
+           kind: "controller_fire",
+           wake_id: wake_id,
+           assignment_id: assignment_id,
+           target_session_key: target
+         } = observation
+       ) do
     turn_seq = Map.get(observation, :turn_seq)
 
     case Txn.q(
@@ -1912,7 +1912,7 @@ defmodule Tightbeam.Supervision do
 
   def handle_info(:detect_misses, state) do
     DB.background_pass(fn ->
-      detect_misses(state)
+      safe_evaluate(state, "miss_check", fn -> detect_misses(state) end)
       sweep(state)
     end)
 
@@ -1923,7 +1923,16 @@ defmodule Tightbeam.Supervision do
   defp evaluate_ended_session(state, session_key, terminal_seq) do
     safe_evaluate(state, session_key, fn ->
       :ok = classify_terminal(state.db, terminal_seq)
-      evaluate_with_interval(state.db, state.handlers, state.n, session_key, terminal_seq, state.sweep_ms)
+
+      evaluate_with_interval(
+        state.db,
+        state.handlers,
+        state.n,
+        session_key,
+        terminal_seq,
+        state.sweep_ms
+      )
+
       liveness_cycle(state, MapSet.new(), session_key)
       drain(state.db, state.handlers, session_key)
     end)
@@ -4538,6 +4547,14 @@ defmodule Tightbeam.Supervision do
       _ ->
         nil
     end
+  rescue
+    error in DB.Overloaded ->
+      reraise error, __STACKTRACE__
+
+    error ->
+      Logger.warning("idle cleanup refused session=#{session.session_key}: #{Exception.message(error)}")
+      idle_cleanup_refusal_in_txn(txn, session.session_key, Exception.message(error))
+      nil
   end
 
   defp idle_cleanup_enabled?(name) do
@@ -4961,24 +4978,22 @@ defmodule Tightbeam.Supervision do
   end
 
   defp idle_cleanup_route(due_members, parent_group, n) do
-        requested_depth =
-          due_members
-          |> Enum.map(
-            &max(idle_cleanup_requested_depth(&1.delivered_count, n), &1.delivered_depth)
-          )
-          |> Enum.max()
+    requested_depth =
+      due_members
+      |> Enum.map(&max(idle_cleanup_requested_depth(&1.delivered_count, n), &1.delivered_depth))
+      |> Enum.max()
 
-        owner = hd(due_members).owner_user_id
+    owner = hd(due_members).owner_user_id
 
-        route_group =
-          if Enum.any?(due_members, & &1.delivered_main),
-            do: "owner-main:" <> owner,
-            else: parent_group
+    route_group =
+      if Enum.any?(due_members, & &1.delivered_main),
+        do: "owner-main:" <> owner,
+        else: parent_group
 
-        route_depth =
-          if Enum.any?(due_members, & &1.delivered_main),
-            do: due_members |> Enum.map(& &1.delivered_depth) |> Enum.max(),
-            else: requested_depth
+    route_depth =
+      if Enum.any?(due_members, & &1.delivered_main),
+        do: due_members |> Enum.map(& &1.delivered_depth) |> Enum.max(),
+        else: requested_depth
 
     {owner, route_group, route_depth}
   end
@@ -5618,29 +5633,40 @@ defmodule Tightbeam.Supervision do
         |> Enum.map(fn [_id, holder, due] -> {:liveness, holder, due} end)
 
       sessions = idle_cleanup_sessions_in_txn(txn)
+
       candidates =
         sessions
         |> Map.values()
         |> Enum.map(&idle_cleanup_candidate_in_txn(txn, &1, now(), sessions, nil, true))
         |> Enum.reject(&is_nil/1)
         |> Enum.filter(fn candidate ->
-          candidate.harness_available and not idle_cleanup_pending_group_in_txn(txn, candidate.group_digest)
+          candidate.harness_available and
+            not idle_cleanup_pending_group_in_txn(txn, candidate.group_digest)
         end)
 
-      dormant = candidates |> Enum.filter(&(&1.age_ms >= &1.threshold)) |> Enum.map(& &1.session_key) |> MapSet.new()
+      dormant =
+        candidates
+        |> Enum.filter(&(&1.age_ms >= &1.threshold))
+        |> Enum.map(& &1.session_key)
+        |> MapSet.new()
+
       idle =
         candidates
         |> Enum.group_by(& &1.parent_group)
         |> Enum.flat_map(fn {group, members} ->
           {owner, route_group, depth} = idle_cleanup_route(members, group, state.n)
+
           case idle_cleanup_target(sessions, dormant, owner, route_group, depth) do
             {target, _} ->
-              if HarnessHealth.prod_shape_gate_in_txn(txn, target.harness, target.host, now()) == :available do
+              if HarnessHealth.prod_shape_gate_in_txn(txn, target.harness, target.host, now()) ==
+                   :available do
                 Enum.map(members, &{:idle_cleanup, &1.session_key, &1.due_at})
               else
                 []
               end
-            nil -> []
+
+            nil ->
+              []
           end
         end)
 
@@ -5649,12 +5675,19 @@ defmodule Tightbeam.Supervision do
   end
 
   defp arm_deadline(%{sweep_ms: interval} = state) when is_integer(interval) and interval > 0 do
-    DB.background_pass(fn ->
-      due = deadline_rows(state) |> Enum.map(&elem(&1, 2)) |> Enum.min(fn -> nil end)
-      if state.deadline_timer, do: Process.cancel_timer(state.deadline_timer)
-      ref = if due, do: :erlang.start_timer(max(0, due - now()), self(), :supervision_due)
-      %{state | deadline_timer: ref, deadline: due}
-    end, state)
+    DB.background_pass(
+      fn ->
+        due = deadline_rows(state) |> Enum.map(&elem(&1, 2)) |> Enum.min(fn -> nil end)
+        if state.deadline_timer, do: Process.cancel_timer(state.deadline_timer)
+        ref = if due, do: :erlang.start_timer(max(0, due - now()), self(), :supervision_due)
+        %{state | deadline_timer: ref, deadline: due}
+      end,
+      state
+    )
+  rescue
+    error ->
+      Logger.warning("supervision deadline calculation failed: #{Exception.message(error)}")
+      state
   end
 
   defp arm_deadline(state), do: state
@@ -5662,24 +5695,33 @@ defmodule Tightbeam.Supervision do
   defp detect_misses(state) do
     # Both durable classification and obligation watermarks acknowledge the
     # existing turn-end signal. No new cursor or acknowledgement table.
-    {:ok, rows} = DB.query(state.db, """
-    SELECT t.sessionKey,t.seq,t.endedAt FROM turns t
-    WHERE t.endedAt IS NOT NULL AND (
-      (t.seq >= (SELECT firstTurnSeq FROM patrol_failure_boundary WHERE id=0)
-       AND NOT EXISTS (SELECT 1 FROM patrol_terminal_classifications c WHERE c.turnSeq=t.seq))
-      OR (t.seq=(SELECT MAX(last.seq) FROM turns last
-                WHERE last.sessionKey=t.sessionKey AND last.endedAt IS NOT NULL)
-          AND EXISTS (SELECT 1 FROM assignments a
-                      LEFT JOIN supervision_watermarks p ON p.assignmentId=a.id AND p.sessionKey=a.holderKey
-                      WHERE a.holderKey=t.sessionKey AND a.state='open'
-                        AND (p.lastEvaluatedTerminal IS NULL OR p.lastEvaluatedTerminal<t.seq)))
-    ) ORDER BY t.seq LIMIT 256
-    """)
+    {:ok, rows} =
+      DB.query(state.db, """
+      SELECT t.sessionKey,t.seq,t.endedAt,
+             NOT EXISTS (SELECT 1 FROM patrol_terminal_classifications c WHERE c.turnSeq=t.seq)
+      FROM turns t
+      WHERE t.endedAt IS NOT NULL AND (
+        (t.seq >= (SELECT firstTurnSeq FROM patrol_failure_boundary WHERE id=0)
+         AND NOT EXISTS (SELECT 1 FROM patrol_terminal_classifications c WHERE c.turnSeq=t.seq))
+        OR (t.seq=(SELECT MAX(last.seq) FROM turns last
+                  WHERE last.sessionKey=t.sessionKey AND last.endedAt IS NOT NULL)
+            AND EXISTS (SELECT 1 FROM assignments a
+                        LEFT JOIN supervision_watermarks p ON p.assignmentId=a.id AND p.sessionKey=a.holderKey
+                        WHERE a.holderKey=t.sessionKey AND a.state='open'
+                          AND (p.lastEvaluatedTerminal IS NULL OR p.lastEvaluatedTerminal<t.seq)))
+      ) ORDER BY t.seq LIMIT 256
+      """)
 
-    Enum.each(rows, fn [session, seq, ended_at] ->
-      if ended_at < now() - 60_000 do
-        Tightbeam.SchedulerMisses.record(:supervision, "terminal session=#{session} turn=#{seq}", now() - ended_at)
+    Enum.each(rows, fn [session, seq, ended_at, unclassified] ->
+      if ended_at < now() - 60_000 and
+           (unclassified == 1 or match?({:match, _}, prod_production_matches?(state.db, session, seq))) do
+        Tightbeam.SchedulerMisses.record(
+          :supervision,
+          "terminal session=#{session} turn=#{seq}",
+          now() - ended_at
+        )
       end
+
       evaluate_ended_session(state, session, seq)
     end)
 

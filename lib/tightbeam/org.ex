@@ -1647,6 +1647,7 @@ defmodule Tightbeam.Org do
 
   defp publish_session_in_txn(txn, class, session) do
     Tightbeam.Supervision.deadlines_changed_in_txn(txn)
+
     Publisher.committed_in_txn(txn, class, session, %{
       "sessionKey" => session.session_key
     })
