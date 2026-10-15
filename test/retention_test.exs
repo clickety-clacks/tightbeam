@@ -111,6 +111,7 @@ defmodule Tightbeam.RetentionTest do
     @kind kind
     test "retention preserves expired #{@kind} state", %{db: db} do
       expired = System.system_time(:millisecond) - 61 * @day_ms
+
       assert {:ok, []} =
                DB.query(
                  db,
@@ -122,6 +123,7 @@ defmodule Tightbeam.RetentionTest do
       pid = start_supervised!({Retention, db: db, name: nil})
       send(pid, :trim)
       :sys.get_state(pid)
+
       assert {:ok, [[@kind, "state", "evidence"]]} =
                DB.query(db, "SELECT kind,subject,detail FROM lifecycle_events ORDER BY id")
     end
@@ -154,6 +156,7 @@ defmodule Tightbeam.RetentionTest do
     send(pid, :trim)
     assert %{cursor: 2_000} = :sys.get_state(pid)
     eventually(fn -> count(db) == 2_000 end)
+
     assert {:ok, [["decision_request_ruled", 2_000]]} =
              DB.query(db, "SELECT kind,COUNT(*) FROM lifecycle_events GROUP BY kind")
   end
