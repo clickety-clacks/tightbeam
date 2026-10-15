@@ -370,8 +370,7 @@ defmodule Tightbeam.ModelCatalog do
   end
 
   def handle_info({:DOWN, ref, :process, pid, reason}, %{background: {pid, ref}} = state) do
-    Logger.warning("model catalog background refresh failed: #{inspect(reason)}")
-    {:noreply, next_background(%{state | background: nil})}
+    {:stop, {:background_refresh_failed, reason}, state}
   end
 
   def handle_info(message, state),
