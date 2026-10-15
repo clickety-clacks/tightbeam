@@ -2450,6 +2450,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
   defp drop_liveness_activation(db) do
     Tightbeam.SchemaShapeRuntimeFixture.downgrade_supervision_recorded_state!(db)
+
     :ok =
       DB.execute(db, """
       DROP TRIGGER IF EXISTS supervision_liveness_retirement_immutable_delete;
