@@ -947,6 +947,13 @@ defmodule Tightbeam.Productions.BubbleTest do
                  "bubble:#{missed}"
                ])
              )
+    before_restart = Tightbeam.SchedulerMisses.count()
+    stop_supervised!(Tightbeam.Productions.BubbleSweeper)
+    replacement = start_supervised!({Tightbeam.Productions.BubbleSweeper,
+      db: ctx.db, name: :event_bubble_sweeper})
+    :sys.get_state(replacement)
+    assert Tightbeam.SchedulerMisses.count() == before_restart
+
   end
 
   # Review B1/B3b: the sweeper's cursor makes recognition sweep-reachable —
