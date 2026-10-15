@@ -1091,7 +1091,14 @@ defmodule Tightbeam.Gateway do
                 reason: row[:reason]
               }
             end),
-          workspace_cleanup: WorkspaceCleanup.health(db, if(admin_caller?(db, call), do: nil, else: principal_caller(db, call)[:owner_user_id] || "")),
+          workspace_cleanup:
+            WorkspaceCleanup.health(
+              db,
+              if(admin_caller?(db, call),
+                do: nil,
+                else: principal_caller(db, call)[:owner_user_id] || ""
+              )
+            ),
           setup: Sentinels.setup_all(config.base_dir, db, host)
         }
       end,
@@ -9892,18 +9899,21 @@ defmodule Tightbeam.Gateway do
                 )
 
               WorkspaceCleanup.kick()
+
               Enum.each(result.retired, fn retired ->
                 try do
                   broadcast(db, owner, Payloads.stream_deleted(retired.session_key))
-                Map.get(config, :on_retired, fn _ -> :ok end).(retired.session_key)
+                  Map.get(config, :on_retired, fn _ -> :ok end).(retired.session_key)
 
-                Enum.each(retired.assignments, fn assignment ->
-                  emit_assignment_change(db, assignment.assignment_id, assignment.from_state)
-                end)
+                  Enum.each(retired.assignments, fn assignment ->
+                    emit_assignment_change(db, assignment.assignment_id, assignment.from_state)
+                  end)
                 rescue
-                  error -> best_effort_failed("retire_notifications", :error, error, __STACKTRACE__)
+                  error ->
+                    best_effort_failed("retire_notifications", :error, error, __STACKTRACE__)
                 catch
-                  kind, reason -> best_effort_failed("retire_notifications", kind, reason, __STACKTRACE__)
+                  kind, reason ->
+                    best_effort_failed("retire_notifications", kind, reason, __STACKTRACE__)
                 end
               end)
 

@@ -1581,7 +1581,10 @@ pub fn run(
     } else {
         println!("{}", human(&report));
         println!("{}", sentinel_lines(&sentinels).join("\n"));
-        println!("{}", workspace_cleanup_lines(&sentinel_value(&sentinels)["workspace_cleanup"]).join("\n"));
+        println!(
+            "{}",
+            workspace_cleanup_lines(&sentinel_value(&sentinels)["workspace_cleanup"]).join("\n")
+        );
         println!("{}", event_paths_lines(&event_paths).join("\n"));
     }
     require_runnable_harness_cli(harness_catalog.as_ref())?;
@@ -1676,15 +1679,26 @@ fn workspace_cleanup_lines(health: &Value) -> Vec<String> {
     match health["count"].as_u64() {
         Some(0) => vec!["[PASS] retired workspaces: cleanup complete".to_owned()],
         Some(count) => {
-            let mut lines = vec![format!("[WARN] retired workspaces: {count} unfinished cleanups")];
+            let mut lines = vec![format!(
+                "[WARN] retired workspaces: {count} unfinished cleanups"
+            )];
             if let Some(rows) = health["unfinished"].as_array() {
                 for row in rows {
-                    lines.push(format!("  {}: {}", row["workspace"].as_str().unwrap_or("unknown"), row["reason"].as_str().unwrap_or("cleanup pending")));
+                    lines.push(format!(
+                        "  {}: {}",
+                        row["workspace"].as_str().unwrap_or("unknown"),
+                        row["reason"].as_str().unwrap_or("cleanup pending")
+                    ));
                 }
             }
             lines
         }
-        None => vec![format!("[WARN] retired workspaces: cleanup status unavailable ({})", health["unavailable"].as_str().unwrap_or("gateway did not report cleanup status"))],
+        None => vec![format!(
+            "[WARN] retired workspaces: cleanup status unavailable ({})",
+            health["unavailable"]
+                .as_str()
+                .unwrap_or("gateway did not report cleanup status")
+        )],
     }
 }
 
@@ -1914,11 +1928,16 @@ mod tests {
     use super::*;
     #[test]
     fn doctor_names_unfinished_workspace_cleanups() {
-        let lines = workspace_cleanup_lines(&serde_json::json!({"count": 1, "unfinished": [{"workspace": "example-workspace", "reason": "archive move failed"}]}));
+        let lines = workspace_cleanup_lines(
+            &serde_json::json!({"count": 1, "unfinished": [{"workspace": "example-workspace", "reason": "archive move failed"}]}),
+        );
         assert!(lines[0].contains("1 unfinished"));
         assert!(lines[1].contains("example-workspace: archive move failed"));
         assert!(workspace_cleanup_lines(&serde_json::json!({"count": 0}))[0].contains("[PASS]"));
-        assert!(workspace_cleanup_lines(&serde_json::json!({"unavailable": "offline"}))[0].contains("offline"));
+        assert!(
+            workspace_cleanup_lines(&serde_json::json!({"unavailable": "offline"}))[0]
+                .contains("offline")
+        );
     }
 
     #[test]
