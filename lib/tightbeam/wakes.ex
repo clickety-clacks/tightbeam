@@ -405,7 +405,13 @@ defmodule Tightbeam.Wakes do
   ## Store (pure DB ops — callable without the scheduler process, e.g. by inspect)
 
   @terminal_notice_purpose "terminal-child-owner-notification"
-  @terminal_notice_marker @terminal_notice_purpose <> ":"  @terminal_action_purpose "terminal-child-owner-action-reminder"
+  @terminal_notice_marker @terminal_notice_purpose <> ":"
+
+  @doc false
+  # A terminal notice re-resolves its recipient when it is prepared.
+  def terminal_notice?(%{obligation_ref: @terminal_notice_marker <> _}), do: true
+  def terminal_notice?(_wake), do: false
+  @terminal_action_purpose "terminal-child-owner-action-reminder"
   @terminal_action_marker @terminal_action_purpose <> ":"
   @terminal_action_condition_kind "terminal-child-owner-action"
   @terminal_action_fallback_ms 2 * 60 * 60 * 1_000

@@ -717,11 +717,17 @@ defmodule Tightbeam.NoticeBatcher do
   end
 
   # Resolve a ready source's recipient from its stored routing, without
-  # preparing it. Only a source with no resolvable recipient is prepared here.
+  # preparing it. Only a terminal notice or a source with no resolvable
+  # recipient is prepared here.
   defp source_recipient_in_txn(txn, wake_id, at) do
     case Wakes.get_in_txn(txn, wake_id) do
       %{state: "pending"} = wake ->
-        case source_delivery_target(txn, wake) do
+        # A terminal notice can change recipient when prepared, so it is
+        # grouped by its prepared recipient, not by stored routing.
+        stored_target =
+          if Wakes.terminal_notice?(wake), do: nil, else: source_delivery_target(txn, wake)
+
+        case stored_target do
           {target, _, _} ->
             target
 
