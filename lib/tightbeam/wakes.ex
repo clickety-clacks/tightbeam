@@ -6783,6 +6783,7 @@ defmodule Tightbeam.Wakes do
             end
 
             publish_change_in_txn(txn, "wake.fired", wake.wake_id)
+
             if delivery == :staged do
               target_gate = if wake.target_gate == 0, do: nil, else: wake
               {recipient, _, _} = Gateway.delivery_target(txn, wake.session_key, target_gate)

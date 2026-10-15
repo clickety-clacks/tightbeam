@@ -2513,7 +2513,6 @@ defmodule Tightbeam.Schema do
        "CREATE INDEX IF NOT EXISTS idle_cleanup_wakes_pending_group " <>
          "ON wakes(obligationRef COLLATE NOCASE) " <>
          "WHERE origin='process:tightbeam' AND state='pending' AND consumer='prompt' AND obligationRef IS NOT NULL"}
-
     ]
 
     case DB.migration_transaction(db, :idle_cleanup_runtime_indexes, [], [], fn txn ->

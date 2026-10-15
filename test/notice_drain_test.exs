@@ -168,9 +168,15 @@ defmodule Tightbeam.NoticeDrainTest do
                DB.query(ctx.db, "SELECT sessionKey,seq FROM turns WHERE wakeId=?1", [carrier])
 
       assert is_integer(seq)
-      assert Wakes.get(ctx.db, carrier).delivered_turn_seq == seq
+      assert {:ok, [[^seq]]} =
+               DB.query(ctx.db, "SELECT deliveredTurnSeq FROM wakes WHERE wakeId=?1", [carrier])
       assert Enum.map(Wakes.digest_members(ctx.db, carrier), & &1.wake_id) == [wake.wake_id]
-      assert Tightbeam.NoticeBatcher.recover(ctx.db, System.system_time(:millisecond), ctx.delivery_opts) == []
+
+      assert Tightbeam.NoticeBatcher.recover(
+               ctx.db,
+               System.system_time(:millisecond),
+               ctx.delivery_opts
+             ) == []
     end
   end
 
