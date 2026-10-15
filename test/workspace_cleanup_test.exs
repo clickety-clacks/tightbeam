@@ -369,7 +369,7 @@ defmodule Tightbeam.WorkspaceCleanupTest do
     attempts = :atomics.new(1, [])
     runner = fn _invocation, script, input ->
       copy_script = String.replace(script,
-        ~s(if [ "$(device_id "$source")" = "$(device_id "$(dirname "$target")")" ]; then),
+        ~S|if [ "$(device_id "$source")" = "$(device_id "$(dirname "$target")")" ]; then|,
         "if false; then")
       prefix = if :atomics.add_get(attempts, 1, 1) == 1 do
         """
