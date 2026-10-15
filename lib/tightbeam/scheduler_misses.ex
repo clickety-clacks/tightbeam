@@ -3,7 +3,7 @@ defmodule Tightbeam.SchedulerMisses do
   require Logger
 
   @limit 20
-  @loops [:wake, :recognition, :bubble, :lanes]
+  @loops [:wake, :recognition, :bubble, :lanes, :supervision]
 
   def record(loop, record, late_ms \\ nil) do
     index = loop_index(loop)
@@ -44,12 +44,13 @@ defmodule Tightbeam.SchedulerMisses do
 
   def init do
     :ets.new(__MODULE__, [:named_table, :public, :set])
-    :ets.insert(__MODULE__, {:counts, 0, 0, 0, 0, 0})
+    :ets.insert(__MODULE__, {:counts, 0, 0, 0, 0, 0, 0})
     :ok
   end
 
   defp loop_name(loop) when loop in [:lane, :lane_terminal], do: :lanes
   defp loop_name(loop), do: loop
+  defp loop_index(:supervision), do: 7
   defp loop_index(:wake), do: 3
   defp loop_index(:recognition), do: 4
   defp loop_index(:bubble), do: 5

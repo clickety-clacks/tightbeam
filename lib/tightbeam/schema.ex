@@ -2561,6 +2561,9 @@ defmodule Tightbeam.Schema do
   # the assignment work-item path also bounds the cleanup custody check.
   defp ensure_idle_cleanup_runtime_indexes(db) do
     indexes = [
+      {"supervision_entitlements_due",
+       "CREATE INDEX IF NOT EXISTS supervision_entitlements_due " <>
+         "ON supervision_entitlements(state, dueAt, assignmentId)"},
       {"idle_cleanup_assignments_activity",
        "CREATE INDEX IF NOT EXISTS idle_cleanup_assignments_activity " <>
          "ON assignments(holderKey, state, openedAt DESC, id DESC)"},
