@@ -2145,6 +2145,61 @@ defmodule Tightbeam.Acp.AdapterTest do
     refute Adapter.knows_session?(adapter, "slow")
   end
 
+  for operation <- [:new, :load] do
+    @operation operation
+    test "#{operation} preserves config and usage notifications received during setup" do
+      {adapter, _} = start_adapter()
+      owner = self()
+
+      :sys.replace_state(adapter, fn state ->
+        %{
+          state
+          | on_guidance: fn _, _ ->
+              send(owner, {:guidance_started, self()})
+
+              receive do
+                :continue -> :ok
+              end
+            end
+        }
+      end)
+
+      caller =
+        Task.async(fn ->
+          case @operation do
+            :new -> Adapter.new_session(adapter, nil, "/tmp", [], "guidance")
+            :load -> Adapter.load_session(adapter, "sess-1", nil, "/tmp", [], "guidance")
+          end
+        end)
+
+      assert_receive {:guidance_started, worker}, 2_000
+
+      for update <- [
+            %{
+              "sessionUpdate" => "config_option_update",
+              "configOptions" => [%{"id" => "model", "currentValue" => "haiku"}]
+            },
+            %{"sessionUpdate" => "usage_update", "used" => 3000, "size" => 10000}
+          ] do
+        send(
+          adapter,
+          {:acp_notification, "session/update", %{"sessionId" => "sess-1", "update" => update}}
+        )
+      end
+
+      during = :sys.get_state(adapter)
+      assert {:ok, %{used: 3000, size: 10000}} = during.context_usage["sess-1"]
+      assert [%{"id" => "model", "currentValue" => "haiku"}] = during.config_options["sess-1"]
+      send(worker, :continue)
+      assert {:ok, _} = Task.await(caller, 5_000)
+      after_setup = :sys.get_state(adapter)
+      assert after_setup.context_usage["sess-1"] == during.context_usage["sess-1"]
+      assert after_setup.config_options["sess-1"] == during.config_options["sess-1"]
+      assert after_setup.switchable_models["sess-1"] == during.switchable_models["sess-1"]
+      assert Adapter.knows_session?(adapter, "sess-1")
+    end
+  end
+
   test "turn setup retains its per-request timeout across setup requests" do
     {adapter, _} = start_adapter(gate_mode: "delay-setup", probe: false)
     assert {:ok, "sess-1"} = Adapter.new_session_for_turn(adapter, nil, "/tmp", [], "guidance")

@@ -123,7 +123,7 @@ defmodule Tightbeam.Acp.Adapter do
               %{status: String.t(), reason: term() | nil}}}
           | {:error, term()}
   def new_candidate_session(adapter, model, cwd, mcp_servers, guidance),
-    do: call(adapter, {:new_candidate_session, model, cwd, mcp_servers, guidance}, 60_000)
+    do: call(adapter, {:new_candidate_session, model, cwd, mcp_servers, guidance}, 30_000)
 
   # The turn path keeps each failure's diagnostic carrier. The gateway renders
   # `ErrorDiagnostic.classified/1` of it as the text the health and supervision
@@ -232,10 +232,7 @@ defmodule Tightbeam.Acp.Adapter do
   # has always produced — is what puts the reason on the turn row. Every
   # adapter-boundary call the turn path makes goes through this.
   defp call(adapter, message, timeout) do
-    reply_timeout =
-      if session_operation?(message) and is_integer(timeout), do: timeout + 2_000, else: timeout
-
-    GenServer.call(adapter, message, reply_timeout)
+    GenServer.call(adapter, message, timeout)
   catch
     :exit, reason -> {:error, {:adapter_unavailable, unavailable_reason(reason)}}
   end
@@ -571,19 +568,6 @@ defmodule Tightbeam.Acp.Adapter do
 
   defp session_operation?(_message), do: false
 
-  defp operation_budget(message) do
-    case message do
-      {:new_session, _, _, _, _, :infinity} -> :infinity
-      {:load_session, _, _, _, _, _, :infinity} -> :infinity
-      {:apply_model, _, _, :infinity} -> :infinity
-      {:new_candidate_session, _, _, _, _} -> :infinity
-      {:switch_model_session, _, _, _, _, _} -> @boot_boundary_timeout
-      {:close_session, _, _} -> 60_000
-      {:close_session, _} -> 60_000
-      _ -> 30_000
-    end
-  end
-
   defp operation_key(message) when elem(message, 0) in [:new_session, :new_candidate_session],
     do: make_ref()
 
@@ -593,79 +577,43 @@ defmodule Tightbeam.Acp.Adapter do
   def handle_call(message, from, state) do
     cond do
       session_operation?(message) ->
-        deadline =
-          case message do
-            {:apply_model_strict, _, _, _, deadline} -> deadline
-            _ -> operation_deadline(operation_budget(message))
-          end
-
-        enqueue_operation(state, message, from, deadline)
+        enqueue_operation(state, message, from)
 
       is_tuple(message) and elem(message, 0) in [:prompt, :forget_model_residency] and
           pending_session_operation?(state, elem(message, 1)) ->
-        {:noreply, %{state | operation_queue: state.operation_queue ++ [{message, from, nil}]}}
+        {:noreply, %{state | operation_queue: state.operation_queue ++ [{message, from}]}}
 
       true ->
         session_call(message, from, state)
     end
   end
 
-  defp enqueue_operation(state, message, from, deadline) do
+  defp enqueue_operation(state, message, from) do
     key = operation_key(message)
 
-    cond do
-      is_integer(deadline) and deadline <= System.monotonic_time(:millisecond) ->
-        reason =
-          if elem(message, 0) == :apply_model_strict, do: :model_transport_failure, else: :timeout
+    if map_size(state.operations) > 0 do
+      {:noreply, %{state | operation_queue: state.operation_queue ++ [{message, from}]}}
+    else
+      parent = self()
+      snapshot = %{state | operations: %{}, operation_queue: []}
 
-        GenServer.reply(from, {:error, reason})
-        {:noreply, state}
+      {:ok, pid} =
+        Task.start_link(fn ->
+          {:reply, reply, after_state} = session_call(message, from, snapshot)
+          updates = operation_updates(message, reply, after_state)
+          send(parent, {:session_operation_done, key, self(), reply, updates})
+        end)
 
-      map_size(state.operations) > 0 ->
-        if is_integer(deadline),
-          do:
-            Process.send_after(
-              self(),
-              {:queued_operation_expired, from},
-              max(deadline - System.monotonic_time(:millisecond), 0)
-            )
+      monitor = Process.monitor(pid)
 
-        {:noreply,
-         %{state | operation_queue: state.operation_queue ++ [{message, from, deadline}]}}
-
-      true ->
-        parent = self()
-        snapshot = %{state | operations: %{}, operation_queue: []}
-
-        {:ok, pid} =
-          Task.start_link(fn ->
-            {:reply, reply, after_state} = session_call(message, from, snapshot)
-            updates = operation_updates(message, reply, after_state)
-            send(parent, {:session_operation_done, key, self(), reply, updates})
-          end)
-
-        monitor = Process.monitor(pid)
-
-        timer =
-          if is_integer(deadline) do
-            Process.send_after(
-              self(),
-              {:session_operation_timeout, key, pid},
-              max(deadline - System.monotonic_time(:millisecond), 0) + 100
-            )
-          end
-
-        operation = %{pid: pid, monitor: monitor, timer: timer, from: from, message: message}
-        {:noreply, %{state | operations: Map.put(state.operations, key, operation)}}
+      operation = %{pid: pid, monitor: monitor, from: from}
+      {:noreply, %{state | operations: Map.put(state.operations, key, operation)}}
     end
   end
 
-  defp operation_deadline(:infinity), do: :infinity
-  defp operation_deadline(budget), do: System.monotonic_time(:millisecond) + budget
-
   defp pending_session_operation?(state, sid) do
     Map.has_key?(state.operations, sid) or
-      Enum.any?(state.operation_queue, fn {message, _, _} -> operation_key(message) == sid end)
+      Enum.any?(state.operation_queue, fn {message, _} -> operation_key(message) == sid end)
   end
 
   defp operation_updates(message, reply, state) do
@@ -696,6 +644,9 @@ defmodule Tightbeam.Acp.Adapter do
 
     fields =
       case {kind, reply} do
+        {kind, {:ok, _}} when kind in [:new_session, :new_candidate_session, :load_session] ->
+          [:known, :models, :unprompted, :chunks]
+
         {:close_session, :ok} ->
           residency ++ [:chunks, :progress]
 
@@ -749,7 +700,6 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   defp finish_operation(state, key, operation, reply, updates) do
-    if operation.timer, do: Process.cancel_timer(operation.timer)
     Process.demonitor(operation.monitor, [:flush])
     GenServer.reply(operation.from, reply)
     state = merge_operation(state, updates)
@@ -761,12 +711,12 @@ defmodule Tightbeam.Acp.Adapter do
 
   defp drain_operations(%{operation_queue: []} = state), do: {:noreply, state}
 
-  defp drain_operations(%{operation_queue: [{message, from, deadline} | rest]} = state) do
+  defp drain_operations(%{operation_queue: [{message, from} | rest]} = state) do
     state = %{state | operation_queue: rest}
 
     result =
-      if deadline,
-        do: enqueue_operation(state, message, from, deadline),
+      if session_operation?(message),
+        do: enqueue_operation(state, message, from),
         else: session_call(message, from, state)
 
     case result do
@@ -1561,51 +1511,10 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   @impl true
-  def handle_info({:queued_operation_expired, from}, state) do
-    {expired, waiting} =
-      Enum.split_with(state.operation_queue, fn {_, caller, _} -> caller == from end)
-
-    for {message, caller, _} <- expired do
-      reason =
-        if elem(message, 0) == :apply_model_strict, do: :model_transport_failure, else: :timeout
-
-      GenServer.reply(caller, {:error, reason})
-    end
-
-    {:noreply, %{state | operation_queue: waiting}}
-  end
-
   def handle_info({:session_operation_done, key, pid, reply, updates}, state) do
     case state.operations[key] do
       %{pid: ^pid} = operation -> finish_operation(state, key, operation, reply, updates)
       _ -> {:noreply, state}
-    end
-  end
-
-  def handle_info({:session_operation_timeout, key, pid}, state) do
-    case state.operations[key] do
-      %{pid: ^pid} = operation ->
-        Process.unlink(pid)
-        Process.exit(pid, :kill)
-
-        finish_operation(
-          state,
-          key,
-          operation,
-          {:error,
-           if(elem(operation.message, 0) == :apply_model_strict,
-             do: :model_transport_failure,
-             else: :timeout
-           )},
-          operation_updates(
-            operation.message,
-            {:error, :timeout},
-            drop_model_residency(state, key)
-          )
-        )
-
-      _ ->
-        {:noreply, state}
     end
   end
 
