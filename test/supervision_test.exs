@@ -3510,6 +3510,17 @@ defmodule Tightbeam.SupervisionTest do
     {:ok, _} =
       DB.query(
         ctx.db,
+        """
+        INSERT INTO supervision_liveness_sidecar
+          (wakeId,assignmentId,controllerOrigin,wakeKind,controllerState,chargedGeneration)
+        VALUES (?1,?2,'scheduled','escalation','settled',1)
+        """,
+        [wake.wake_id, wake.assignment_id]
+      )
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
         "UPDATE wakes SET state='fired',firedAt=1,deliveredTurnSeq=?1,reresolve='lineage',reresolveSeed='missing-holder',reresolveRung=1 WHERE wakeId=?2",
         [turn_seq, wake.wake_id]
       )
