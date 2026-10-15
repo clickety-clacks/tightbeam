@@ -464,7 +464,7 @@ defmodule Tightbeam.Dispatch do
       :ok
     end
 
-    if handoff and not async do
+    if not is_nil(handoff) and not async do
       {:ok, _} =
         DB.publish_transaction(db, fn txn ->
           record.(txn)
