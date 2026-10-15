@@ -200,20 +200,22 @@ defmodule Tightbeam.Recognition do
 
   def handle_info(:check_misses, state) do
     if state.ready do
-      safely(fn -> DB.background_pass(fn ->
-        case DB.query(
-               state.db,
-               "SELECT id FROM pending_recognition WHERE flagged=0 AND nextAt<?1",
-               [now() - 60_000]
-             ) do
-          {:ok, rows} ->
-            for [id] <- rows, do: Tightbeam.SchedulerMisses.record(:recognition, id)
-            retry_pass(state)
+      safely(fn ->
+        DB.background_pass(fn ->
+          case DB.query(
+                 state.db,
+                 "SELECT id FROM pending_recognition WHERE flagged=0 AND nextAt<?1",
+                 [now() - 60_000]
+               ) do
+            {:ok, rows} ->
+              for [id] <- rows, do: Tightbeam.SchedulerMisses.record(:recognition, id)
+              retry_pass(state)
 
-          {:error, error} ->
-            raise error
-        end
-      end) end)
+            {:error, error} ->
+              raise error
+          end
+        end)
+      end)
     end
 
     Process.send_after(self(), :check_misses, 180_000)
@@ -237,7 +239,9 @@ defmodule Tightbeam.Recognition do
   defp schedule_retry(%{ready: false} = state, _delay), do: state
 
   defp schedule_retry(state, delay) do
-    case safely(fn -> DB.query(state.db, "SELECT MIN(nextAt) FROM pending_recognition WHERE flagged=0") end) do
+    case safely(fn ->
+           DB.query(state.db, "SELECT MIN(nextAt) FROM pending_recognition WHERE flagged=0")
+         end) do
       {:ok, [[due_at]]} ->
         if state.timer, do: Process.cancel_timer(state.timer)
 

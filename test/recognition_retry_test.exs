@@ -200,15 +200,20 @@ defmodule Tightbeam.RecognitionRetryTest do
     calls = :atomics.new(1, [])
     old = Application.get_env(:tightbeam, :db_call_timeout_ms)
     Application.put_env(:tightbeam, :db_call_timeout_ms, 500)
+
     on_exit(fn ->
-      if old, do: Application.put_env(:tightbeam, :db_call_timeout_ms, old),
+      if old,
+        do: Application.put_env(:tightbeam, :db_call_timeout_ms, old),
         else: Application.delete_env(:tightbeam, :db_call_timeout_ms)
     end)
-    assert {:ok, :committed} = DB.transaction_then(db, fn _ -> :committed end, fn _ ->
-      if :atomics.add_get(calls, 1, 1) == 1, do: raise("first attempt")
-      send(parent, :automatic_retry)
-      :recognized
-    end)
+
+    assert {:ok, :committed} =
+             DB.transaction_then(db, fn _ -> :committed end, fn _ ->
+               if :atomics.add_get(calls, 1, 1) == 1, do: raise("first attempt")
+               send(parent, :automatic_retry)
+               :recognized
+             end)
+
     assert_receive :automatic_retry, 1_500
     assert :sys.get_state(retry).timer == nil
     assert {:ok, []} = DB.query(db, "SELECT id FROM pending_recognition")

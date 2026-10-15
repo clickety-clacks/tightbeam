@@ -940,8 +940,13 @@ defmodule Tightbeam.Productions.BubbleTest do
     assert {:ok, [[cursor]]} =
              DB.query(ctx.db, "SELECT seq FROM production_cursors WHERE name='bubble'")
 
-    assert cursor >= missed or match?({:ok, [[^missed]]}, DB.query(ctx.db,
-      "SELECT seq FROM production_cursors WHERE name=?1", ["bubble:#{missed}"]))
+    assert cursor >= missed or
+             match?(
+               {:ok, [[^missed]]},
+               DB.query(ctx.db, "SELECT seq FROM production_cursors WHERE name=?1", [
+                 "bubble:#{missed}"
+               ])
+             )
   end
 
   # Review B1/B3b: the sweeper's cursor makes recognition sweep-reachable —

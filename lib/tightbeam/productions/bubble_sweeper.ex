@@ -159,7 +159,8 @@ defmodule Tightbeam.Productions.BubbleSweeper do
         [cursor, @batch]
       )
 
-    prefix = Enum.take_while(rows, fn [_seq, ended, acknowledged] -> ended == 1 and acknowledged == 1 end)
+    prefix =
+      Enum.take_while(rows, fn [_seq, ended, acknowledged] -> ended == 1 and acknowledged == 1 end)
 
     if prefix != [] do
       last = prefix |> List.last() |> hd()

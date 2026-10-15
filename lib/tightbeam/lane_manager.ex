@@ -172,7 +172,10 @@ defmodule Tightbeam.LaneManager do
       active? =
         Enum.any?(acc.lanes, fn {_pid, {_ref, key, seq}} ->
           key == session_key and not is_nil(seq) and
-            match?({:ok, [["running"]]}, DB.query(state.db, "SELECT status FROM turns WHERE seq=?1", [seq]))
+            match?(
+              {:ok, [["running"]]},
+              DB.query(state.db, "SELECT status FROM turns WHERE seq=?1", [seq])
+            )
         end)
 
       if detect and active? do

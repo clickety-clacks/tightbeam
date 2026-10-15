@@ -75,11 +75,21 @@ defmodule Tightbeam.LaneTest do
   end
 
   test "idle recovery workers do no database work on a short interval", ctx do
-    manager = start_supervised!({LaneManager, db: ctx.db, lane_sup: ctx.lane_sup,
-      task_sup: ctx.task_sup, name: :idle_lane_manager,
-      runner: fn _ -> {:ok, %{text: "done"}} end})
-    sweeper = start_supervised!({Tightbeam.Productions.BubbleSweeper,
-      db: ctx.db, name: :idle_bubble_sweeper})
+    manager =
+      start_supervised!(
+        {LaneManager,
+         db: ctx.db,
+         lane_sup: ctx.lane_sup,
+         task_sup: ctx.task_sup,
+         name: :idle_lane_manager,
+         runner: fn _ -> {:ok, %{text: "done"}} end}
+      )
+
+    sweeper =
+      start_supervised!(
+        {Tightbeam.Productions.BubbleSweeper, db: ctx.db, name: :idle_bubble_sweeper}
+      )
+
     :sys.get_state(manager)
     :sys.get_state(sweeper)
     db_pid = GenServer.whereis(ctx.db)
