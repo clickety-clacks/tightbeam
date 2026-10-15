@@ -225,7 +225,7 @@ defmodule Tightbeam.NoticeDrainTest do
 
     Process.sleep(300)
     :ok = Wakes.fire_due(scheduler)
-    empty = idle_requests(ctx.db)
+    empty = idle_requests(scheduler)
     assert empty == []
 
     assert {:ok, _seq} =
@@ -244,7 +244,7 @@ defmodule Tightbeam.NoticeDrainTest do
       """)
 
     :ok = Wakes.fire_due(scheduler)
-    busy = idle_requests(ctx.db)
+    busy = idle_requests(scheduler)
     assert busy == []
     refute Enum.any?(busy, &match?({:transaction_then, _, _}, &1))
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM notice_batches")
@@ -366,13 +366,13 @@ defmodule Tightbeam.NoticeDrainTest do
     })
   end
 
-  defp idle_requests(db) do
-    :erlang.trace(db, true, [:receive])
+  defp idle_requests(scheduler) do
+    :erlang.trace(scheduler, true, [:send, {:tracer, self()}])
     Process.sleep(1_200)
-    ref = :erlang.trace_delivered(db)
-    assert_receive {:trace_delivered, ^db, ^ref}
-    :erlang.trace(db, false, [:receive])
-    collect_requests(db, [])
+    ref = :erlang.trace_delivered(scheduler)
+    assert_receive {:trace_delivered, ^scheduler, ^ref}
+    :erlang.trace(scheduler, false, [:send])
+    collect_requests(scheduler, [])
   end
 
   defp await_delivery(db, wake_id, attempts \\ 100)
@@ -389,13 +389,13 @@ defmodule Tightbeam.NoticeDrainTest do
     end
   end
 
-  defp collect_requests(db, requests) do
+  defp collect_requests(scheduler, requests) do
     receive do
-      {:trace, ^db, :receive, {:"$gen_call", _, request}} ->
-        collect_requests(db, [request | requests])
+      {:trace, ^scheduler, :send, {:"$gen_call", _, request}, _destination} ->
+        collect_requests(scheduler, [request | requests])
 
-      {:trace, ^db, :receive, _} ->
-        collect_requests(db, requests)
+      {:trace, ^scheduler, :send, _, _destination} ->
+        collect_requests(scheduler, requests)
     after
       0 -> requests
     end
