@@ -458,12 +458,10 @@ defmodule Tightbeam.NoticeBatcher do
     if is_nil(recipient) do
       :ok = Wakes.dispose_closed_remedy_sources(db, at)
       reconcile_committed_deliveries(db, at)
+      # A committed carrier never returns to the editable queue.
       restore_unclaimed_sources(db, at)
     end
 
-    # Only carriers with no actual turn can return to the editable queue.
-    # Their frozen bytes remain historical evidence; committed deliveries do
-    # not participate in a later recipient snapshot.
     {:ok, ready_ids} = DB.transaction(db, &ready_sources_in_txn(&1, at, recipient))
 
     # Group ready sources by recipient without preparing them. Preparation

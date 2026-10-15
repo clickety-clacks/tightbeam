@@ -6394,6 +6394,7 @@ defmodule Tightbeam.Wakes do
 
   @impl true
   def handle_cast({:recipient_ready, session_key}, state) do
+    deliver_eligible_waits(state.db, state.delivery_opts, session_key)
     NoticeBatcher.recover(state.db, now(), state.delivery_opts, session_key)
     {:noreply, state}
   end
@@ -6487,6 +6488,8 @@ defmodule Tightbeam.Wakes do
       deliver_eligible_waits(db, state.delivery_opts)
     else
       deliver_wait_ids(db, newly_due, state.delivery_opts)
+      |> Enum.uniq()
+      |> Enum.each(&NoticeBatcher.recover(db, now(), state.delivery_opts, &1))
     end
 
     evaluate_conditions(state, :tick)
@@ -6642,23 +6645,24 @@ defmodule Tightbeam.Wakes do
     end
   end
 
-  defp deliver_eligible_waits(db, delivery_opts) do
+  defp deliver_eligible_waits(db, delivery_opts, recipient \\ nil) do
     {:ok, rows} =
       DB.query(
         db,
         """
         SELECT wakeId FROM wakes
         WHERE state='pending' AND waitMode IS NOT NULL AND recognitionAt IS NOT NULL
-          AND firedAt IS NULL
+          AND firedAt IS NULL AND (?1 IS NULL OR sessionKey=?1)
         ORDER BY recognitionAt,wakeId
-        """
+        """,
+        [recipient]
       )
 
     deliver_wait_ids(db, rows, delivery_opts)
   end
 
   defp deliver_wait_ids(db, rows, delivery_opts) do
-    Enum.each(rows, fn [wake_id] ->
+    Enum.flat_map(rows, fn [wake_id] ->
       case DB.transaction_then(
              db,
              fn txn -> deliver_wait_in_txn(txn, wake_id, delivery_opts) end,
@@ -6667,9 +6671,11 @@ defmodule Tightbeam.Wakes do
                result
              end
            ) do
-        {:ok, {:delivery, delivery}} -> Gateway.complete_delivery(db, delivery)
-        {:ok, :staged} -> :ok
-        {:ok, _} -> :ok
+        {:ok, {:delivery, delivery}} ->
+          Gateway.complete_delivery(db, delivery)
+          []
+        {:ok, {:staged, target}} -> [target]
+        {:ok, _} -> []
         {:error, error} -> raise error
       end
     end)
@@ -6727,7 +6733,7 @@ defmodule Tightbeam.Wakes do
             end
 
             publish_change_in_txn(txn, "wake.fired", wake.wake_id)
-            if delivery == :staged, do: :staged, else: {:delivery, delivery}
+            if delivery == :staged, do: {:staged, wake.session_key}, else: {:delivery, delivery}
           else
             :noop
           end
