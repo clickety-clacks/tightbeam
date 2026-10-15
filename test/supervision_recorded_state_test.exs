@@ -352,12 +352,18 @@ defmodule Tightbeam.SupervisionRecordedStateTest do
     # Historical turn evidence alone must not bypass the runtime delivery column.
     assert {:ok, :ok} =
              DB.transaction(db, fn txn ->
-               Tightbeam.DB.Txn.q(txn, "UPDATE wakes SET state='fired',firedAt=42 WHERE wakeId='cleanup'")
+               Tightbeam.DB.Txn.q(
+                 txn,
+                 "UPDATE wakes SET state='fired',firedAt=42 WHERE wakeId='cleanup'"
+               )
+
                Supervision.record_idle_cleanup_delivery_in_txn(txn, "cleanup")
              end)
 
     assert {:ok, []} = DB.query(db, "SELECT * FROM idle_cleanup_state")
-    assert {:ok, _} = DB.query(db, "UPDATE wakes SET state='pending',firedAt=NULL WHERE wakeId='cleanup'")
+
+    assert {:ok, _} =
+             DB.query(db, "UPDATE wakes SET state='pending',firedAt=NULL WHERE wakeId='cleanup'")
 
     assert {:ok, :ok} =
              DB.transaction(db, fn txn ->
