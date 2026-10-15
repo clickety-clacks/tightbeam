@@ -45,37 +45,66 @@ defmodule Tightbeam.DBBackgroundOverloadTest do
     assert {:noreply, ^state} = Tightbeam.Productions.BubbleSweeper.handle_info(:tick, state)
   end
 
-  test "scheduler tick skips overload and retains its next tick", %{db: db} do
+  test "a due event retries overload without advancing its scan point", %{db: db} do
+    timer = make_ref()
+
     state = %{
       db: db,
+      timer: timer,
+      deadline: nil,
+      retries: %{"failed-wake" => 0},
+      retry_attempts: %{},
+      scanned_through: -1,
       internal_consumers: %{},
-      tick_ms: 3_600_000,
       deliver: fn _ -> flunk("delivery must not run") end,
       delivery_opts: []
     }
 
-    assert {:noreply, ^state} = Tightbeam.Wakes.handle_info(:tick, state)
+    assert {:noreply, next} = Tightbeam.Wakes.handle_info({:timeout, timer, :due}, state)
+    assert is_reference(next.timer)
+    assert :erlang.read_timer(next.timer) >= 900
+    assert next.scanned_through == -1
+    assert next.retries[:pass] > System.system_time(:millisecond)
   end
 
   test "recipient drain skips overload without losing scheduler state", %{db: db} do
-    state = %{db: db, delivery_opts: []}
-    assert Tightbeam.NoticeBatcher.recover(db, 1, [], "recipient") == []
-
-    assert {:noreply, ^state} =
-             Tightbeam.Wakes.handle_cast({:recipient_ready, "recipient"}, state)
-  end
-
-  test "fallback skips overload and schedules its next pass", %{db: db} do
     state = %{
       db: db,
+      delivery_opts: [],
+      timer: nil,
+      deadline: nil,
+      scanned_through: -1,
+      retries: %{},
+      retry_attempts: %{},
+      internal_consumers: %{}
+    }
+
+    assert Tightbeam.NoticeBatcher.recover(db, 1, [], "recipient") == []
+
+    assert {:noreply, next} =
+             Tightbeam.Wakes.handle_cast({:recipient_ready, "recipient"}, state)
+
+    assert is_reference(next.timer)
+    assert next.scanned_through == -1
+  end
+
+  test "the miss detector skips overload and schedules its next check", %{db: db} do
+    state = %{
+      db: db,
+      timer: nil,
+      deadline: nil,
+      retries: %{},
+      retry_attempts: %{},
+      scanned_through: -1,
       internal_consumers: %{},
       delivery_opts: [],
       deliver: fn _ -> flunk("delivery must not run") end
     }
 
-    assert {:noreply, ^state} = Tightbeam.Wakes.handle_info(:notice_fallback, state)
-    refute_receive :notice_fallback, 100
-    assert_receive :notice_fallback, 30_500
+    assert {:noreply, next} = Tightbeam.Wakes.handle_info(:detect_misses, state)
+    assert is_reference(next.timer)
+    assert next.scanned_through == -1
+    refute_receive :detect_misses, 100
   end
 
   test "backfill skips overload and retries without reporting a persistence failure", %{db: db} do

@@ -1372,7 +1372,7 @@ defmodule Tightbeam.Ledger do
   # unpublished rows.
   def unpublished_terminals_sql do
     """
-    SELECT seq, sessionKey, messageId, status, error FROM turns
+    SELECT seq, sessionKey, messageId, status, error, endedAt FROM turns
     WHERE endedAt IS NOT NULL AND publishedAt IS NULL ORDER BY +seq
     """
   end
@@ -1382,8 +1382,15 @@ defmodule Tightbeam.Ledger do
   def unpublished_terminals(db \\ Tightbeam.DB) do
     {:ok, rows} = DB.query(db, unpublished_terminals_sql())
 
-    Enum.map(rows, fn [seq, sk, mid, status, error] ->
-      %{seq: seq, session_key: sk, message_id: mid, status: status, error: error}
+    Enum.map(rows, fn [seq, sk, mid, status, error, ended_at] ->
+      %{
+        seq: seq,
+        session_key: sk,
+        message_id: mid,
+        status: status,
+        error: error,
+        ended_at: ended_at
+      }
     end)
   end
 

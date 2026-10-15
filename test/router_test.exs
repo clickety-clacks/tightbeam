@@ -1482,6 +1482,7 @@ defmodule Tightbeam.Wire.RouterTest do
   end
 
   test "/version states which bytes the gateway is: version + build stamp", ctx do
+    before = Tightbeam.SchedulerMisses.count()
     response = Router.call(conn(:get, "/version"), Router.init(ctx.opts))
 
     assert response.status == 200
@@ -1496,6 +1497,23 @@ defmodule Tightbeam.Wire.RouterTest do
     assert is_integer(body["build"]) and body["build"] > 0
     assert body["build"] == Tightbeam.BuildStamp.build()
     assert body["sha"] == Tightbeam.BuildStamp.sha()
+    assert body["schedulerMisses"] - before == 0
+  end
+
+  test "/version reports recorded event misses with bounded recent details", ctx do
+    before = Tightbeam.SchedulerMisses.health()
+    for n <- 1..25, do: Tightbeam.SchedulerMisses.record(:wake, "doctor-miss-#{n}", n * 1_000)
+    response = Router.call(conn(:get, "/version"), Router.init(ctx.opts))
+    body = JSON.decode!(response.resp_body)
+    health = body["eventPaths"]
+    assert body["schedulerMisses"] - before.count == 25
+    assert health["count"] == body["schedulerMisses"]
+    assert health["byLoop"]["wake"] - before.by_loop.wake == 25
+    assert length(health["recent"]) == 20
+    assert hd(health["recent"])["recordId"] == "doctor-miss-25"
+    assert hd(health["recent"])["lateMs"] == 25_000
+    assert hd(health["recent"])["loop"] == "wake"
+    assert is_integer(hd(health["recent"])["at"])
   end
 
   test "CLI exact-version refusal is loud after bearer authentication", ctx do

@@ -77,7 +77,7 @@ defmodule Tightbeam.NoticeDrainTest do
              DB.query(ctx.db, "SELECT count(*) FROM turns WHERE wakeId=?1", [wake.wake_id])
   end
 
-  test "the next tick drains a newly due prompt and leaves future prompts pending", ctx do
+  test "a rescheduled deadline drains its prompt and leaves future prompts pending", ctx do
     due = notice(ctx.db, System.system_time(:millisecond) + 60_000)
     future = notice(ctx.db, System.system_time(:millisecond) + 120_000)
 
@@ -85,24 +85,29 @@ defmodule Tightbeam.NoticeDrainTest do
       start_supervised!(
         {Wakes,
          db: ctx.db,
-         name: :notice_due_scheduler,
+         name: Tightbeam.WakeScheduler,
          tick_ms: 60_000,
          delivery_opts: ctx.delivery_opts,
          deliver: fn _ -> :ok end}
       )
 
-    send(scheduler, :tick)
     :sys.get_state(scheduler)
     assert Wakes.get(ctx.db, due.wake_id).state == "pending"
 
-    assert {:ok, _} =
-             DB.query(ctx.db, "UPDATE wakes SET dueAt=?2 WHERE wakeId=?1", [
-               due.wake_id,
-               System.system_time(:millisecond) - 1
-             ])
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               DB.Txn.q(txn, "UPDATE wakes SET dueAt=?2 WHERE wakeId=?1", [
+                 due.wake_id,
+                 System.system_time(:millisecond) - 1
+               ])
 
-    send(scheduler, :tick)
-    :sys.get_state(scheduler)
+               Wakes.schedule_changed_in_txn(
+                 txn,
+                 {:schedule_changed, System.system_time(:millisecond) - 1}
+               )
+             end)
+
+    await_delivery(ctx.db, due.wake_id)
     assert Wakes.get(ctx.db, due.wake_id).state == "fired"
     assert Wakes.get(ctx.db, future.wake_id).state == "pending"
 
@@ -211,18 +216,20 @@ defmodule Tightbeam.NoticeDrainTest do
              )
   end
 
-  test "a busy backlog does not add database calls or preparation to a tick", ctx do
-    state = %{
-      db: ctx.db,
-      deliver: fn _ -> flunk("unexpected delivery") end,
-      internal_consumers: %{},
-      delivery_opts: ctx.delivery_opts,
-      tick_ms: 60_000,
-      review_remedy_interval_ms: 60_000,
-      batch: 100
-    }
+  test "a busy backlog adds no idle database calls or preparation", ctx do
+    scheduler =
+      start_supervised!(
+        {Wakes,
+         db: ctx.db,
+         name: nil,
+         deliver: fn _ -> flunk("unexpected delivery") end,
+         delivery_opts: ctx.delivery_opts}
+      )
 
-    empty = tick_requests(ctx.db, state)
+    Process.sleep(300)
+    :ok = Wakes.fire_due(scheduler)
+    empty = idle_requests(scheduler)
+    assert empty == []
 
     assert {:ok, _seq} =
              Ledger.enqueue(ctx.db, %{
@@ -239,8 +246,9 @@ defmodule Tightbeam.NoticeDrainTest do
       SELECT 'notice-' || x,'recipient','process:test','waiting',1,1 FROM n;
       """)
 
-    busy = tick_requests(ctx.db, state)
-    assert length(busy) == length(empty)
+    :ok = Wakes.fire_due(scheduler)
+    busy = idle_requests(scheduler)
+    assert busy == []
     refute Enum.any?(busy, &match?({:transaction_then, _, _}, &1))
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM notice_batches")
     assert {:ok, [[1000]]} = DB.query(ctx.db, "SELECT count(*) FROM wakes WHERE state='pending'")
@@ -314,22 +322,40 @@ defmodule Tightbeam.NoticeDrainTest do
              )
   end
 
-  test "fallback drains due notices and leaves future notices alone", ctx do
-    due = notice(ctx.db)
+  test "the miss detector drains overdue notices and leaves future notices alone", ctx do
+    before = Tightbeam.SchedulerMisses.count()
     future = notice(ctx.db, System.system_time(:millisecond) + 60_000)
 
     scheduler =
       start_supervised!(
         {Wakes,
          db: ctx.db,
-         name: :notice_fallback_scheduler,
+         name: :notice_detector_scheduler,
          tick_ms: 60_000,
          delivery_opts: ctx.delivery_opts,
          deliver: fn _ -> :ok end}
       )
 
-    send(scheduler, :notice_fallback)
     :sys.get_state(scheduler)
+    # Insert after boot with its event deliberately omitted, simulating a miss.
+    assert {:ok, due} =
+             DB.transaction(ctx.db, fn txn ->
+               source =
+                 Wakes.schedule_in_txn(txn, %{
+                   session_key: "recipient",
+                   origin: "process:test",
+                   prompt: "notice",
+                   due_at: System.system_time(:millisecond) - 61_000,
+                   target_gate: 0
+                 })
+
+               Process.put({DB.Txn, :outbox, txn.outbox}, [])
+               source
+             end)
+
+    send(scheduler, :detect_misses)
+    :sys.get_state(scheduler)
+    assert Tightbeam.SchedulerMisses.count() - before == 1
     assert Wakes.get(ctx.db, due.wake_id).state == "fired"
     assert Wakes.get(ctx.db, future.wake_id).state == "pending"
   end
@@ -344,22 +370,36 @@ defmodule Tightbeam.NoticeDrainTest do
     })
   end
 
-  defp tick_requests(db, state) do
-    :erlang.trace(db, true, [:receive])
-    assert {:noreply, ^state} = Wakes.handle_info(:tick, state)
-    ref = :erlang.trace_delivered(db)
-    assert_receive {:trace_delivered, ^db, ^ref}
-    :erlang.trace(db, false, [:receive])
-    collect_requests(db, [])
+  defp idle_requests(scheduler) do
+    :erlang.trace(scheduler, true, [:send, {:tracer, self()}])
+    Process.sleep(1_200)
+    ref = :erlang.trace_delivered(scheduler)
+    assert_receive {:trace_delivered, ^scheduler, ^ref}
+    :erlang.trace(scheduler, false, [:send])
+    collect_requests(scheduler, [])
   end
 
-  defp collect_requests(db, requests) do
-    receive do
-      {:trace, ^db, :receive, {:"$gen_call", _, request}} ->
-        collect_requests(db, [request | requests])
+  defp await_delivery(db, wake_id, attempts \\ 100)
+  defp await_delivery(_db, _wake_id, 0), do: flunk("deadline event did not deliver the notice")
 
-      {:trace, ^db, :receive, _} ->
-        collect_requests(db, requests)
+  defp await_delivery(db, wake_id, attempts) do
+    case DB.query(db, "SELECT deliveredTurnSeq FROM wakes WHERE wakeId=?1", [wake_id]) do
+      {:ok, [[seq]]} when is_integer(seq) ->
+        seq
+
+      _ ->
+        Process.sleep(10)
+        await_delivery(db, wake_id, attempts - 1)
+    end
+  end
+
+  defp collect_requests(scheduler, requests) do
+    receive do
+      {:trace, ^scheduler, :send, {:"$gen_call", _, request}, _destination} ->
+        collect_requests(scheduler, [request | requests])
+
+      {:trace, ^scheduler, :send, _, _destination} ->
+        collect_requests(scheduler, requests)
     after
       0 -> requests
     end

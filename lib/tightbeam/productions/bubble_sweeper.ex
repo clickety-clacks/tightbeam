@@ -109,7 +109,12 @@ defmodule Tightbeam.Productions.BubbleSweeper do
       Enum.reduce(rows, {0, state}, fn [seq, ended_at], {count, state} ->
         state =
           if not state.first_pass and ended_at < cutoff and not MapSet.member?(state.missed, seq) do
-            Tightbeam.SchedulerMisses.record(:bubble, seq)
+            Tightbeam.SchedulerMisses.record(
+              :bubble,
+              seq,
+              max(0, System.system_time(:millisecond) - ended_at)
+            )
+
             %{state | missed: MapSet.put(state.missed, seq)}
           else
             state

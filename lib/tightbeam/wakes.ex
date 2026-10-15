@@ -6,10 +6,10 @@ defmodule Tightbeam.Wakes do
   the SAME turn pipeline as a user post (T8: coordination is fact-shaped).
 
   Process shape: ONE GenServer (`Tightbeam.WakeScheduler` in the tree) owning
-  a tick timer. Every tick (and on explicit `fire_due/1`) it reads due
+  one due-time timer. At that deadline (and on explicit `fire_due/1`) it reads due
   pending wakes. Legacy timed wakes DELIVER and then mark fired — wakes.ts
   order, load-bearing:
-  - deliver raises → wake stays pending, retried next tick (at-least-once;
+  - deliver raises → wake stays pending, retried with backoff (at-least-once;
     a poison wake retries visibly rather than vanishing).
   - crash between deliver and mark → redelivered after restart, deduped by
     the turns table's `wakeId` UNIQUE (enqueue is exactly-once).
@@ -42,7 +42,8 @@ defmodule Tightbeam.Wakes do
 
   alias Tightbeam.DB.Txn
 
-  @notice_fallback_ms 30_000
+  @miss_detector_ms 180_000
+  @miss_lateness_ms 60_000
 
   @type db :: GenServer.server()
 
@@ -751,6 +752,7 @@ defmodule Tightbeam.Wakes do
         if Txn.changes(txn) == 1 do
           source = %{wake | state: "pending", fired_at: fired_at}
           NoticeBatcher.record_policy_in_txn(txn, source)
+          if state == "fired", do: schedule_changed_in_txn(txn, :wake_ready)
 
           {:ok, source}
         else
@@ -1086,7 +1088,10 @@ defmodule Tightbeam.Wakes do
 
         # The DB has rolled back this notice. Do not invent cancellation or
         # lifecycle evidence after its failed transaction, or leak SQL/payloads.
-        Logger.warning("terminal notice #{wake_id} recognition deferred: #{reason}")
+        Logger.warning(
+          "terminal notice #{wake_id} recognition deferred: #{reason}; pending until a later scheduler pass"
+        )
+
         {:deferred, %{wake_id: wake_id, reason: reason}}
     end
   end
@@ -1832,6 +1837,7 @@ defmodule Tightbeam.Wakes do
       NoticeBatcher.record_policy_in_txn(txn, wake, policy_opts)
     end
 
+    schedule_changed_in_txn(txn, {:schedule_changed, wake.due_at})
     wake
   end
 
@@ -2955,6 +2961,7 @@ defmodule Tightbeam.Wakes do
 
     if Txn.changes(txn) == 1 do
       reconcile_wait_relief_in_txn(txn, wake.assignment_id, recognized_at)
+      schedule_changed_in_txn(txn, :wake_ready)
 
       EventLog.lifecycle_in_txn(
         txn,
@@ -3844,6 +3851,7 @@ defmodule Tightbeam.Wakes do
     )
 
     publish_change_in_txn(txn, "wake.scheduled", retry_wake_id)
+    schedule_changed_in_txn(txn, {:schedule_changed, due_at})
   end
 
   defp settle_retry_attempt_in_txn(txn, wake_id, turn_seq, outcome, observed_at) do
@@ -4153,7 +4161,9 @@ defmodule Tightbeam.Wakes do
         end
 
         [row] = Txn.q(txn, select_wake_sql() <> " WHERE wakeId=?1", [replacement_id])
-        to_wake(row)
+        wake = to_wake(row)
+        schedule_changed_in_txn(txn, {:schedule_changed, wake.due_at})
+        wake
       else
         :error
       end
@@ -6221,7 +6231,7 @@ defmodule Tightbeam.Wakes do
 
   @doc """
   Start the scheduler. Opts: `:deliver` (required — see `t:deliver/0`),
-  `:db`, `:tick_ms` (default 1000), `:name` (default `Tightbeam.WakeScheduler`
+  `:db`, `:name` (default `Tightbeam.WakeScheduler`
   — the registered name the wake verb handler calls).
   """
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -6238,33 +6248,11 @@ defmodule Tightbeam.Wakes do
   @spec fire_due(GenServer.server()) :: :ok
   def fire_due(server \\ Tightbeam.WakeScheduler) do
     if GenServer.whereis(server) == self() do
-      send(self(), :fire_due)
+      GenServer.cast(self(), :wake_ready)
       :ok
     else
       GenServer.call(server, :fire_due)
     end
-  end
-
-  @doc """
-  Post-commit nudge for request paths. Runs `fire_due/1`, but a scheduler that
-  is absent, busy past the call timeout, or crashing only logs: the write it
-  follows has already committed, and its caller must still get the success
-  response. Undelivered wakes stay pending for the scheduler's next tick.
-  """
-  @spec nudge_due(GenServer.server()) :: :ok
-  def nudge_due(server \\ Tightbeam.WakeScheduler) do
-    fire_due(server)
-  catch
-    :exit, {:noproc, _call} ->
-      :ok
-
-    :exit, reason ->
-      Logger.warning(
-        "wake scheduler nudge after a committed write did not complete; " <>
-          "due wakes stay pending for the next tick: #{inspect(reason)}"
-      )
-
-      :ok
   end
 
   @doc """
@@ -6292,7 +6280,7 @@ defmodule Tightbeam.Wakes do
   Post-commit `fire_matching/2` for request paths. The fact has already
   committed: an absent scheduler is ignored, and a timeout or crash only logs,
   so the caller still gets its success response. Matching condition wakes are
-  evaluated again on the scheduler's next tick.
+  evaluated again on the next scheduler event.
   """
   @spec nudge_matching(GenServer.server(), pos_integer() | [pos_integer()]) :: :ok
   def nudge_matching(server, fact_ids) do
@@ -6304,10 +6292,16 @@ defmodule Tightbeam.Wakes do
     :exit, reason ->
       Logger.warning(
         "wake scheduler condition nudge after a committed fact did not complete; " <>
-          "matching wakes are evaluated on the next tick: #{inspect(reason)}"
+          "matching wakes are evaluated on the next scheduler event: #{inspect(reason)}"
       )
 
       :ok
+  end
+
+  @doc false
+  # The existing outbox sends to the registered scheduler only after commit.
+  def schedule_changed_in_txn(%Txn{} = txn, message) do
+    Txn.handoff(txn, Tightbeam.WakeScheduler, message)
   end
 
   @doc false
@@ -6350,7 +6344,13 @@ defmodule Tightbeam.Wakes do
     state = %{
       deliver: Keyword.fetch!(opts, :deliver),
       db: Keyword.get(opts, :db, Tightbeam.DB),
-      tick_ms: Keyword.get(opts, :tick_ms, 1_000),
+      timer: nil,
+      deadline: nil,
+      fire_pending: false,
+      retries: %{},
+      retry_attempts: %{},
+      detected_misses: MapSet.new(),
+      scanned_through: -1,
       review_remedy_interval_ms:
         Keyword.get(opts, :review_remedy_interval_ms, Keyword.get(opts, :tick_ms, 1_000)),
       batch: Keyword.get(opts, :batch, 100),
@@ -6358,43 +6358,85 @@ defmodule Tightbeam.Wakes do
       internal_consumers: Keyword.get(opts, :internal_consumers, %{})
     }
 
-    schedule_tick(state.tick_ms)
-    Process.send_after(self(), :notice_fallback, @notice_fallback_ms)
+    Process.send_after(self(), :detect_misses, @miss_detector_ms)
+    send(self(), :review_remedy_changed)
+    send(self(), :recover_notices)
     Process.send_after(self(), :backfill_wake_delivery, 100)
-    {:ok, state}
+    {:ok, arm_due_timer(state)}
   end
 
   @impl true
   def handle_call(:fire_due, _from, state) do
-    deliver_due(state)
-    {:reply, :ok, state}
+    {:reply, :ok, run_due(state)}
   end
 
   # Evaluate the committed fact(s) eagerly, then reply. The delivery pass runs
   # as the next message, so a fact filer never waits on a full scheduler pass.
   def handle_call({:fire_matching, fact_id}, _from, state) do
     eager_step(state, fact_id)
-    send(self(), :fire_due)
-    {:reply, :ok, state}
+    {:reply, :ok, queue_due(state)}
   end
 
   def handle_call({:fire_matching_seq, fact_ids}, _from, state) do
     drain_seq(state, fact_ids)
-    send(self(), :fire_due)
-    {:reply, :ok, state}
+    {:reply, :ok, queue_due(state)}
   end
 
   @impl true
+  def handle_cast(:wake_ready, state) do
+    {:noreply, queue_due(state)}
+  end
+
+  def handle_cast({:schedule_changed, due_at}, state) do
+    cond do
+      is_nil(due_at) or due_at >= 253_402_300_799_000 ->
+        {:noreply, state}
+
+      due_at <= now() ->
+        {:noreply, queue_due(state)}
+
+      is_nil(state.deadline) or due_at < state.deadline ->
+        {:noreply, set_due_timer(state, due_at)}
+
+      true ->
+        {:noreply, state}
+    end
+  end
+
+  def handle_cast({:review_remedy_changed, subject}, state) do
+    {:noreply, review_remedy_changed(state, nil, subject)}
+  end
+
+  def handle_cast(:review_remedy_changed, state) do
+    {:noreply, review_remedy_changed(state)}
+  end
+
   def handle_cast({:recipient_ready, session_key}, state) do
+    state = review_remedy_changed(state, session_key)
+
     DB.background_pass(fn ->
       deliver_eligible_waits(state.db, state.delivery_opts, session_key)
       NoticeBatcher.recover(state.db, now(), state.delivery_opts, session_key)
     end)
 
-    {:noreply, state}
+    {:noreply, arm_due_timer(state)}
   end
 
   @impl true
+  def handle_info(:review_remedy_changed, state) do
+    {:noreply, review_remedy_changed(state)}
+  end
+
+  def handle_info(:recover_notices, state) do
+    # Recognize overdue conditions before recovery forms a carrier. Otherwise
+    # a timed source can occupy the recipient ahead of its due condition peers.
+    DB.background_pass(fn -> evaluate_conditions(state, :tick) end)
+    # Release pre-crash, unclaimed memberships once. Later drains are driven
+    # only by recipient readiness and due events.
+    NoticeBatcher.recover(state.db, now(), state.delivery_opts)
+    {:noreply, state}
+  end
+
   def handle_info(:backfill_wake_delivery, state) do
     result =
       DB.background_pass(fn -> Tightbeam.Schema.backfill_wake_delivery(state.db) end, :overloaded)
@@ -6410,20 +6452,19 @@ defmodule Tightbeam.Wakes do
   end
 
   def handle_info(:fire_due, state) do
-    deliver_due(state)
-    {:noreply, state}
+    {:noreply, run_due(%{state | fire_pending: false})}
   end
 
-  def handle_info(:notice_fallback, state) do
-    deliver_due(state)
-    Process.send_after(self(), :notice_fallback, @notice_fallback_ms)
-    {:noreply, state}
+  def handle_info({:timeout, timer, :due}, %{timer: timer} = state) do
+    {:noreply, run_due(%{state | timer: nil, deadline: nil})}
   end
 
-  def handle_info(:tick, state) do
-    deliver_due(state, false)
-    schedule_tick(state.tick_ms)
-    {:noreply, state}
+  def handle_info({:timeout, _stale_timer, :due}, state), do: {:noreply, state}
+
+  def handle_info(:detect_misses, state) do
+    state = DB.background_pass(fn -> detect_misses(state) end, state)
+    Process.send_after(self(), :detect_misses, @miss_detector_ms)
+    {:noreply, arm_due_timer(state)}
   end
 
   def handle_info(:fire_matching, state) do
@@ -6466,15 +6507,27 @@ defmodule Tightbeam.Wakes do
   end
 
   # Deliver-then-mark (see moduledoc — never reorder): a raising deliver
-  # leaves its wake pending for the next tick; a crash between deliver and
+  # leaves its wake pending for recovery; a crash between deliver and
   # mark redelivers, deduped by turns.wakeId.
-  defp deliver_due(state, drain_notices \\ true) do
+  defp deliver_due(state) do
     # R1/B1: one real scheduler entry owns the context of all DB calls in this
     # scan. The bind restores even when delivery raises; the next scan gets a
     # fresh ID. No context is implicitly inherited by a spawned process.
     Tightbeam.RequestContext.bind_internal("wake_scheduler", fn ->
-      DB.background_pass(fn -> deliver_due_in_context(state, drain_notices) end)
+      DB.background_pass(fn -> deliver_due_in_context(state) end, :overloaded)
     end)
+  end
+
+  defp prompt_eligibility_sql do
+    """
+    digest=0 AND COALESCE(deliveryRule,'')<>'turn-boundary-digest r1'
+    AND (conditionKind IS NULL OR firedAt IS NOT NULL)
+    AND (waitMode IS NULL OR recognitionAt IS NOT NULL)
+    AND (originatingTurnSeq IS NULL OR EXISTS (
+      SELECT 1 FROM turns origin_turn WHERE origin_turn.seq=wakes.originatingTurnSeq
+        AND origin_turn.status IN ('delivered','canceled','failed','failed_unknown')
+    ))
+    """
   end
 
   # Group only due routing destinations before resolving them. Busy recipients
@@ -6486,10 +6539,9 @@ defmodule Tightbeam.Wakes do
         """
         SELECT DISTINCT sessionKey,targetRole,targetGate,reresolve,reresolveSeed,reresolveRung
         FROM wakes INDEXED BY wakes_due
-        WHERE state='pending' AND dueAt<=?1 AND consumer='prompt' AND digest=0
-          AND COALESCE(deliveryRule,'')<>'turn-boundary-digest r1'
-          AND (conditionKind IS NULL OR firedAt IS NOT NULL)
-          AND (waitMode IS NULL OR recognitionAt IS NOT NULL)
+        WHERE state='pending' AND consumer='prompt'
+          AND (dueAt<=?1 OR firedAt IS NOT NULL OR recognitionAt IS NOT NULL)
+          AND #{prompt_eligibility_sql()}
         """,
         [now()]
       )
@@ -6503,7 +6555,7 @@ defmodule Tightbeam.Wakes do
 
         case Gateway.delivery_target(txn, key, target_gate) do
           {recipient, _, _} -> [recipient]
-          nil -> []
+          nil -> [key]
         end
       end)
       |> Enum.uniq()
@@ -6517,34 +6569,25 @@ defmodule Tightbeam.Wakes do
     end)
   end
 
-  defp deliver_due_in_context(
-         %{db: db, deliver: deliver, internal_consumers: consumers} = state,
-         drain_notices
-       ) do
-    if Map.has_key?(consumers, "review_remedy_reconcile") do
-      {:ok, :ok} =
-        Tightbeam.RailRemedy.reconcile_pending_episodes(db, state.review_remedy_interval_ms)
-    end
+  defp deliver_due_in_context(%{db: db, deliver: deliver, internal_consumers: consumers} = state) do
+    state =
+      Enum.reduce(Map.keys(state.retries), state, fn id, acc ->
+        if is_binary(id) and
+             transaction!(db, fn txn ->
+               Txn.q(
+                 txn,
+                 "SELECT 1 FROM wakes WHERE wakeId=?1 AND state='pending' AND dueAt<=?2",
+                 [id, now()]
+               ) == []
+             end), do: clear_retry(acc, id), else: acc
+      end)
 
-    newly_due = recognize_due_dependency_waits(db)
-
-    if drain_notices do
-      deliver_eligible_waits(db, state.delivery_opts)
-    else
-      (deliver_wait_ids(db, newly_due, state.delivery_opts) ++ due_prompt_recipients(db))
-      |> Enum.uniq()
-      |> Enum.each(&NoticeBatcher.recover(db, now(), state.delivery_opts, &1))
-    end
-
+    recognize_due_dependency_waits(db)
     evaluate_conditions(state, :tick)
 
-    # Materialize after condition recognition so a fallback or matching fact
-    # that becomes due in this pass joins the same recipient-ready batch.
-    # Held members remain individual source rows and never reach the delivery
-    # loop below.
-    if drain_notices do
-      NoticeBatcher.recover(db, now(), state.delivery_opts)
-    end
+    (deliver_eligible_waits(db, state.delivery_opts) ++ due_prompt_recipients(db))
+    |> Enum.uniq()
+    |> Enum.each(&NoticeBatcher.recover(db, now(), state.delivery_opts, &1))
 
     legacy_materialize_digests(db, now())
 
@@ -6585,61 +6628,72 @@ defmodule Tightbeam.Wakes do
         end
       end)
 
-    for {wake, _carriers} <- entries, not MapSet.member?(deferred, wake.wake_id) do
-      if wake.digest, do: NoticeBatcher.delivery_attempted(db, wake.wake_id)
+    Enum.reduce(entries, state, fn {wake, _carriers}, state ->
+      if MapSet.member?(deferred, wake.wake_id) or Map.get(state.retries, wake.wake_id, 0) > now() do
+        state
+      else
+        if wake.digest, do: NoticeBatcher.delivery_attempted(db, wake.wake_id)
 
-      delivery =
-        if dispose_closed_remedy(db, wake) do
-          :disposed
-        else
-          case wake.consumer do
-            "prompt" ->
-              if suppressed_by_recognition?(db, wake) do
-                :retry
-              else
-                attempt_delivery(fn -> deliver.(wake) end)
-              end
+        delivery =
+          if dispose_closed_remedy(db, wake) do
+            :disposed
+          else
+            case wake.consumer do
+              "prompt" ->
+                if suppressed_by_recognition?(db, wake) do
+                  :retry
+                else
+                  attempt_delivery(fn -> deliver.(wake) end)
+                end
 
-            consumer ->
-              case Map.fetch(consumers, consumer) do
-                {:ok, internal_consumer} ->
-                  attempt_internal_delivery(db, wake, internal_consumer)
+              consumer ->
+                case Map.fetch(consumers, consumer) do
+                  {:ok, internal_consumer} ->
+                    attempt_internal_delivery(db, wake, internal_consumer)
 
-                :error ->
-                  undeliverable(db, wake, "unknown internal consumer #{inspect(consumer)}")
-                  false
-              end
+                  :error ->
+                    undeliverable(db, wake, "unknown internal consumer #{inspect(consumer)}")
+                    false
+                end
+            end
           end
+
+        case {wake.consumer, delivery} do
+          {"prompt", {:ok, {:idle_cleanup_deferred, _reason}}} ->
+            :ok
+
+          {"prompt", {:ok, {:terminal_notice_undeliverable, _evidence}}} ->
+            :ok
+
+          # Gateway returns :queued only when it staged the same pending source
+          # into the recipient's editable next-turn queue. Leave that source
+          # pending for NoticeBatcher recovery; marking it fired here would erase
+          # the very row the carrier must preserve.
+          {"prompt", {:ok, :queued}} ->
+            :ok
+
+          {"prompt", {:ok, :retry}} ->
+            :ok
+
+          {"prompt", {:ok, :skipped}} when wake.digest ->
+            NoticeBatcher.delivery_terminal_failure(db, wake.wake_id, :skipped)
+
+          {"prompt", {:ok, _result}} ->
+            mark_fired(db, wake.wake_id)
+            if wake.digest, do: NoticeBatcher.delivery_delivered(db, wake.wake_id)
+
+          _ ->
+            if wake.digest,
+              do: NoticeBatcher.delivery_failed_attempt(db, wake.wake_id, :not_committed)
         end
 
-      case {wake.consumer, delivery} do
-        {"prompt", {:ok, {:idle_cleanup_deferred, _reason}}} ->
-          :ok
-
-        {"prompt", {:ok, {:terminal_notice_undeliverable, _evidence}}} ->
-          :ok
-
-        # Gateway returns :queued only when it staged the same pending source
-        # into the recipient's editable next-turn queue. Leave that source
-        # pending for NoticeBatcher recovery; marking it fired here would erase
-        # the very row the carrier must preserve.
-        {"prompt", {:ok, :queued}} ->
-          :ok
-
-        {"prompt", {:ok, :skipped}} when wake.digest ->
-          NoticeBatcher.delivery_terminal_failure(db, wake.wake_id, :skipped)
-
-        {"prompt", {:ok, _result}} ->
-          mark_fired(db, wake.wake_id)
-          if wake.digest, do: NoticeBatcher.delivery_delivered(db, wake.wake_id)
-
-        _ ->
-          if wake.digest,
-            do: NoticeBatcher.delivery_failed_attempt(db, wake.wake_id, :not_committed)
+        if delivery in [false, :retry] or delivery == {:ok, :retry} do
+          retry_later(state, wake.wake_id)
+        else
+          clear_retry(state, wake.wake_id)
+        end
       end
-    end
-
-    :ok
+    end)
   end
 
   defp recognize_due_dependency_waits(db) do
@@ -6697,20 +6751,26 @@ defmodule Tightbeam.Wakes do
         """
         SELECT wakeId FROM wakes
         WHERE state='pending' AND waitMode IS NOT NULL AND recognitionAt IS NOT NULL
-          AND firedAt IS NULL AND (?1 IS NULL OR sessionKey=?1)
+          AND firedAt IS NULL AND (?1 IS NULL OR sessionKey=?1 OR targetRole IS NOT NULL OR targetGate<>0)
         ORDER BY recognitionAt,wakeId
         """,
         [recipient]
       )
 
-    deliver_wait_ids(db, rows, delivery_opts)
+    deliver_wait_ids(db, rows, delivery_opts, recipient)
   end
 
-  defp deliver_wait_ids(db, rows, delivery_opts) do
+  defp deliver_wait_ids(db, rows, delivery_opts, recipient) do
     Enum.flat_map(rows, fn [wake_id] ->
       case DB.transaction_then(
              db,
-             fn txn -> deliver_wait_in_txn(txn, wake_id, delivery_opts) end,
+             fn txn ->
+               wake = get_in_txn(txn, wake_id)
+
+               if is_nil(recipient) or match?({^recipient, _, _}, resolved_recipient(txn, wake)),
+                 do: deliver_wait_in_txn(txn, wake_id, delivery_opts),
+                 else: :noop
+             end,
              fn txn, result ->
                row_commit_in_txn(txn, [])
                result
@@ -7163,15 +7223,14 @@ defmodule Tightbeam.Wakes do
     if canceled, do: best_effort_lifecycle(db, "wake_undeliverable", wake.wake_id, reason)
   end
 
-  # An internal consumer that RAISES keeps its wake pending, so the next tick
-  # retries it — correct, because a consumer can fail transiently and succeed
-  # later. What was wrong is that it retried in total silence: the `false` an
-  # internal delivery returns is discarded by the prompt-only `mark_fired` guard
-  # below, so a consumer raising on every tick was indistinguishable from an idle
-  # scheduler. One row per failed attempt, so the repetition is itself visible.
+  # Keep failed internal work pending and record each attempt. The scheduler
+  # retries it with an in-memory deadline rather than scanning it on a tick.
   defp attempt_internal_delivery(db, wake, internal_consumer) do
-    internal_consumer.(wake)
-    true
+    case internal_consumer.(wake) do
+      {:error, reason} -> internal_delivery_failed(db, wake, inspect(reason))
+      result when result in [false, :retry] -> internal_delivery_failed(db, wake, inspect(result))
+      _ -> true
+    end
   rescue
     error -> internal_delivery_failed(db, wake, Exception.message(error))
   catch
@@ -7351,7 +7410,7 @@ defmodule Tightbeam.Wakes do
       )
 
     case result do
-      {:ok, {:fired, :staged}} -> send(self(), :fire_due)
+      {:ok, {:fired, :staged}} -> GenServer.cast(self(), :wake_ready)
       {:ok, {:fired, delivery}} -> Gateway.complete_delivery(db, delivery)
       {:ok, _} -> :ok
       {:error, error} -> raise error
@@ -7465,6 +7524,7 @@ defmodule Tightbeam.Wakes do
             maybe_schedule_terminal_action_successor_in_txn(txn, wake, delivery)
             lifecycle_for_fire(txn, wake, cause, match, delivery)
             publish_change_in_txn(txn, "wake.fired", wake.wake_id)
+            if delivery == :staged, do: schedule_changed_in_txn(txn, :wake_ready)
             {:fired, delivery}
           else
             :noop
@@ -7751,7 +7811,223 @@ defmodule Tightbeam.Wakes do
   defp decode_optional(nil), do: nil
   defp decode_optional(value), do: JSON.decode!(value)
 
-  defp schedule_tick(tick_ms), do: Process.send_after(self(), :tick, tick_ms)
+  defp queue_due(%{fire_pending: true} = state), do: state
+
+  defp queue_due(state) do
+    send(self(), :fire_due)
+    %{state | fire_pending: true}
+  end
+
+  defp retry_later(state, wake_id) do
+    attempt = Map.get(state.retry_attempts, wake_id, 0)
+    delay = min(1_000 * Integer.pow(2, min(attempt, 9)), 300_000)
+
+    %{
+      state
+      | retries: Map.put(state.retries, wake_id, now() + delay),
+        retry_attempts: Map.put(state.retry_attempts, wake_id, attempt + 1)
+    }
+  end
+
+  defp clear_retry(state, wake_id) do
+    %{
+      state
+      | retries: Map.delete(state.retries, wake_id),
+        retry_attempts: Map.delete(state.retry_attempts, wake_id)
+    }
+  end
+
+  defp set_due_timer(state, due_at) do
+    if state.timer, do: Process.cancel_timer(state.timer)
+
+    if due_at do
+      deadline = System.monotonic_time(:millisecond) + max(0, due_at - now())
+      timer = :erlang.start_timer(deadline, self(), :due, abs: true)
+      %{state | timer: timer, deadline: due_at}
+    else
+      %{state | timer: nil, deadline: nil}
+    end
+  end
+
+  defp arm_due_timer(state) do
+    next =
+      DB.background_pass(
+        fn ->
+          {:ok, rows} =
+            DB.query(
+              state.db,
+              """
+              SELECT MIN(dueAt) FROM wakes INDEXED BY wakes_due
+              WHERE state='pending' AND dueAt>?1 AND dueAt<253402300799000
+              """,
+              [state.scanned_through]
+            )
+
+          case rows do
+            [[due_at]] -> due_at
+            [] -> nil
+          end
+        end,
+        :overloaded
+      )
+
+    next = if next == :overloaded, do: now() + 1_000, else: next
+    pass_at = Map.get(state.retries, :pass)
+    next = if next && pass_at, do: max(next, pass_at), else: next
+
+    retry_at =
+      state.retries
+      |> Map.values()
+      |> Enum.map(&max(&1, pass_at || 0))
+      |> Enum.min(fn -> nil end)
+
+    due_at = [next, retry_at] |> Enum.reject(&is_nil/1) |> Enum.min(fn -> nil end)
+    set_due_timer(state, due_at)
+  end
+
+  defp run_due(state) do
+    state =
+      if Map.get(state.retries, :review_remedy_changed, now() + 1) <= now(),
+        do: review_remedy_changed(state),
+        else: state
+
+    at = now()
+    result = if Map.get(state.retries, :pass, 0) > at, do: :waiting, else: deliver_due(state)
+
+    case result do
+      :waiting ->
+        arm_due_timer(state)
+
+      :overloaded ->
+        arm_due_timer(retry_later(state, :pass))
+
+      updated ->
+        updated = clear_retry(updated, :pass)
+        arm_due_timer(%{updated | scanned_through: max(state.scanned_through, at)})
+    end
+  end
+
+  defp review_remedy_changed(state, recipient \\ nil, subject \\ nil) do
+    if Map.has_key?(state.internal_consumers, "review_remedy_reconcile") do
+      result =
+        DB.background_pass(
+          fn ->
+            if is_nil(recipient) do
+              {:ok, :ok} =
+                Tightbeam.RailRemedy.reconcile_pending_episodes(
+                  state.db,
+                  state.review_remedy_interval_ms,
+                  subject
+                )
+            end
+
+            {:ok, _} =
+              DB.transaction(state.db, fn txn ->
+                DB.Txn.q(
+                  txn,
+                  """
+                  UPDATE wakes SET dueAt=?1 WHERE state='pending' AND consumer='review_remedy_reconcile'
+                    AND (?2 IS NULL OR sessionKey=?2)
+                    AND (?3 IS NULL OR assignmentId=?3)
+                  """,
+                  [now(), recipient, subject]
+                )
+              end)
+          end,
+          :overloaded
+        )
+
+      if result == :overloaded do
+        arm_due_timer(retry_later(state, :review_remedy_changed))
+      else
+        queue_due(clear_retry(state, :review_remedy_changed))
+      end
+    else
+      state
+    end
+  end
+
+  defp detect_misses(state) do
+    at = now()
+
+    candidates =
+      transaction!(state.db, fn txn ->
+        Txn.q(
+          txn,
+          select_wake_sql() <>
+            """
+             INDEXED BY wakes_due
+            WHERE state='pending' AND dueAt<?1 AND consumer='prompt'
+              AND #{prompt_eligibility_sql()}
+              AND deliveredTurnSeq IS NULL
+            ORDER BY dueAt
+            """,
+          [at - @miss_lateness_ms]
+        )
+        |> Enum.flat_map(fn row ->
+          try do
+            wake = to_wake(row)
+
+            case if(wait_eligible_in_txn?(txn, wake), do: resolved_recipient(txn, wake)) do
+              {recipient, _, _} ->
+                if Txn.q(
+                     txn,
+                     "SELECT 1 FROM turns WHERE sessionKey=?1 AND status IN ('running','queued') LIMIT 1",
+                     [recipient]
+                   ) == [], do: [{wake, recipient}], else: []
+
+              nil ->
+                []
+            end
+          rescue
+            error ->
+              Logger.error(
+                "wake scheduler miss candidate #{hd(row)} refused: #{Exception.message(error)}"
+              )
+
+              []
+          end
+        end)
+      end)
+
+    for {wake, recipient} <- candidates,
+        not MapSet.member?(state.detected_misses, wake.wake_id) do
+      Logger.warning(
+        "wake scheduler miss wake=#{wake.wake_id} kind=#{wake.condition_kind || wake.wait_mode || wake.consumer} late_ms=#{at - wake.due_at}"
+      )
+
+      Tightbeam.SchedulerMisses.record(:wake, wake.wake_id, max(0, at - wake.due_at))
+
+      try do
+        deliver_eligible_waits(state.db, state.delivery_opts, recipient)
+        NoticeBatcher.recover(state.db, at, state.delivery_opts, recipient)
+      rescue
+        error ->
+          Logger.error(
+            "wake scheduler miss recovery #{wake.wake_id} failed: #{Exception.message(error)}"
+          )
+      end
+    end
+
+    detected =
+      Enum.reduce(candidates, MapSet.new(), fn {wake, _}, set ->
+        MapSet.put(set, wake.wake_id)
+      end)
+
+    state = %{state | detected_misses: detected}
+    if candidates != [], do: run_due(state), else: state
+  end
+
+  defp resolved_recipient(txn, wake) do
+    gate =
+      cond do
+        is_binary(wake.target_role) -> %{target_role: wake.target_role}
+        wake.target_gate == 0 -> nil
+        true -> Map.take(wake, [:reresolve, :reresolve_seed, :reresolve_rung])
+      end
+
+    Gateway.delivery_target(txn, wake.session_key, gate)
+  end
 
   defp transaction!(db, fun) do
     case DB.transaction(db, fun) do

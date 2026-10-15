@@ -1974,8 +1974,6 @@ defmodule Tightbeam.Gateway do
 
     case result do
       {:ok, {:staged, _wake}} ->
-        Wakes.nudge_due(Keyword.get(opts, :wake_scheduler, Tightbeam.WakeScheduler))
-
         :queued
 
       {:ok, delivery} ->
@@ -2679,8 +2677,6 @@ defmodule Tightbeam.Gateway do
   end
 
   def complete_delivery(_db, {:staged, _wake}) do
-    Wakes.nudge_due()
-
     :queued
   end
 
@@ -5920,7 +5916,6 @@ defmodule Tightbeam.Gateway do
            })
          end) do
       {:ok, _wake} ->
-        Wakes.nudge_due(Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler))
         :ok
 
       {:error, reason} ->
@@ -6665,10 +6660,6 @@ defmodule Tightbeam.Gateway do
           end
 
         if is_map(wake) and is_binary(wake[:wake_id]) do
-          if (due_at <= System.system_time(:millisecond) or is_binary(wake[:wait_mode])) and
-               p[:nudge] != false,
-             do: Wakes.nudge_due(Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler))
-
           wake_response(wake)
           |> maybe_add_after_fact_hint(db, p)
         else

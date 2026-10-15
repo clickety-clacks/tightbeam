@@ -3677,6 +3677,15 @@ defmodule Tightbeam.Assignments do
 
     if Txn.changes(txn) != 1, do: raise(TransitionRace)
 
+    if attrs.kind == "verdict" do
+      [[subject]] =
+        Txn.q(txn, "SELECT COALESCE(reviewsAssignmentId,id) FROM assignments WHERE id=?1", [
+          attrs.assignment_id
+        ])
+
+      Tightbeam.Wakes.schedule_changed_in_txn(txn, {:review_remedy_changed, subject})
+    end
+
     attest([
       id,
       attrs.assignment_id,

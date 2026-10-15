@@ -320,6 +320,7 @@ defmodule Tightbeam.NoticeSubmission do
           )
 
         Wakes.publish_change_in_txn(txn, "wake.scheduled", successor_id)
+        Wakes.schedule_changed_in_txn(txn, {:schedule_changed, due_at})
 
         EventLog.lifecycle_in_txn(
           txn,

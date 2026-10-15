@@ -322,6 +322,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     }
 
     assert {:ok, %{wake_id: immediate_id}} = Dispatch.dispatch(db, handlers, immediate_wake)
+    assert :ok = Wakes.fire_due(scheduler)
     assert %{state: "fired"} = Wakes.get(db, immediate_id)
     wake_observed = observed_state_classes()
 
@@ -867,6 +868,8 @@ defmodule Tightbeam.Firehose.PublisherTest do
          delivery
        end}
     )
+
+    :sys.get_state(delivery_scheduler)
 
     ask = %{
       verb: "operator-ask",

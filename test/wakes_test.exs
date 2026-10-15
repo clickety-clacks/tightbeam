@@ -711,8 +711,7 @@ defmodule Tightbeam.WakesTest do
     scheduler = :"busy_scheduler_#{System.unique_integer([:positive])}"
     test_pid = self()
 
-    # Accepts the post-commit nudge and never answers, like a scheduler stuck
-    # in a long tick.
+    # The scheduler never services its mailbox during this request.
     busy =
       spawn_link(fn ->
         Process.register(self(), scheduler)
@@ -728,8 +727,8 @@ defmodule Tightbeam.WakesTest do
 
     handler = Tightbeam.Gateway.handlers(%{db: db, wake_scheduler: scheduler})["wake"]
 
-    {response, log} =
-      with_log(fn ->
+    task =
+      Task.async(fn ->
         handler.(%{
           origin: "user:flynn",
           principal: {:user, "flynn"},
@@ -738,9 +737,11 @@ defmodule Tightbeam.WakesTest do
         })
       end)
 
+    response = Task.await(task, 2_000)
+
     assert %{wake_id: wake_id} = response
     assert %{state: "pending", prompt: "committed before the nudge"} = Wakes.get(db, wake_id)
-    assert log =~ "wake scheduler nudge after a committed write did not complete"
+    assert Process.alive?(busy)
   end
 
   defp active_sessions!(db, keys) do
@@ -965,7 +966,8 @@ defmodule Tightbeam.WakesTest do
     refute_receive {:delivered, _}
 
     assert :ok = Wakes.fire_due(scheduler)
-    assert_receive {:delivered, %{wake_id: probe_id, prompt: "callback retry control"}}
+    assert_receive {:delivered, %{wake_id: probe_id, prompt: "callback retry control"}}, 1_600
+    :sys.get_state(scheduler)
     assert probe_id == probe.wake_id
     assert Wakes.get(db, probe.wake_id).state == "fired"
     assert :ok = Wakes.fire_due(scheduler)
@@ -1061,8 +1063,9 @@ defmodule Tightbeam.WakesTest do
     assert subject == wake.wake_id
     assert detail =~ "consumer_boom"
 
-    # One row per attempt, so the repetition is itself visible.
-    assert :ok = Wakes.fire_due(scheduler)
+    # The retry deadline starts the next attempt without another write.
+    Process.sleep(1_100)
+    :sys.get_state(scheduler)
 
     assert length(
              Enum.filter(EventLog.lifecycle_events(db), &(&1.kind == "wake_delivery_failed"))

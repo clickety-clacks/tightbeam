@@ -16,6 +16,7 @@ defmodule Tightbeam.RailRemedy do
 
   alias Tightbeam.DB.Txn
 
+  @reassessment_wait 253_402_300_799_000
   @ttl_ms 60_000
   @token_re ~r/\{([^{}]+)\}/
 
@@ -104,6 +105,8 @@ defmodule Tightbeam.RailRemedy do
 
     result =
       case DB.transaction(db, fn txn ->
+             Wakes.schedule_changed_in_txn(txn, :review_remedy_changed)
+
              row =
                Txn.q(
                  txn,
@@ -199,7 +202,7 @@ defmodule Tightbeam.RailRemedy do
           Tightbeam.Gateway.schedule_review_notice_in_txn(txn, recipient, %{
             wake_id: reassess_id,
             assignment_id: subject,
-            due_at: now + interval,
+            due_at: @reassessment_wait,
             consumer: "review_remedy_reconcile",
             prompt:
               JSON.encode!(%{
@@ -241,14 +244,19 @@ defmodule Tightbeam.RailRemedy do
   end
 
   @doc false
-  def reconcile_pending_episodes(db, interval) do
+  def reconcile_pending_episodes(db, interval, subject \\ nil) do
     DB.transaction(db, fn txn ->
-      Txn.q(txn, """
-      SELECT subject,occurrence,producerKey,noticeState FROM rail_remedy_episodes
-      WHERE statute='completion-requires-review' AND status='live'
-        AND (noticeState IS NULL OR json_extract(noticeState,'$.reassessment') IS NULL)
-      ORDER BY openedAt,subject LIMIT 100
-      """)
+      Txn.q(
+        txn,
+        """
+        SELECT subject,occurrence,producerKey,noticeState FROM rail_remedy_episodes
+        WHERE statute='completion-requires-review' AND status='live'
+          AND (?1 IS NULL OR subject=?1)
+          AND (noticeState IS NULL OR json_extract(noticeState,'$.reassessment') IS NULL)
+        ORDER BY openedAt,subject
+        """,
+        [subject]
+      )
       |> Enum.each(fn [subject, occurrence, producer, encoded] ->
         state =
           if encoded,
@@ -523,14 +531,26 @@ defmodule Tightbeam.RailRemedy do
   @doc "Actor-owned live-to-closed CAS for one passed statute occurrence."
   @spec close(DB.server(), String.t(), String.t(), pos_integer()) :: boolean()
   def close(db, statute, subject, occurrence) do
-    cas(
-      db,
-      """
-      UPDATE rail_remedy_episodes SET status = 'closed', closedAt = ?4
-      WHERE statute = ?1 AND subject = ?2 AND occurrence = ?3 AND status = 'live'
-      """,
-      [statute, subject, occurrence, now()]
-    )
+    case DB.transaction(db, fn txn ->
+           Txn.q(
+             txn,
+             """
+             UPDATE rail_remedy_episodes SET status = 'closed', closedAt = ?4
+             WHERE statute = ?1 AND subject = ?2 AND occurrence = ?3 AND status = 'live'
+             """,
+             [statute, subject, occurrence, now()]
+           )
+
+           won? = Txn.changes(txn) == 1
+
+           if won? and statute == "completion-requires-review",
+             do: Wakes.schedule_changed_in_txn(txn, :review_remedy_changed)
+
+           won?
+         end) do
+      {:ok, won?} -> won?
+      {:error, error} -> raise error
+    end
   end
 
   @doc false
@@ -1324,7 +1344,7 @@ defmodule Tightbeam.RailRemedy do
       "observations" => [],
       "reassessment" =>
         if(is_binary(reassess_id),
-          do: %{"generation" => 1, "wakeId" => reassess_id, "dueAt" => now + interval},
+          do: %{"generation" => 1, "wakeId" => reassess_id, "dueAt" => @reassessment_wait},
           else: nil
         )
     }
@@ -1894,9 +1914,9 @@ defmodule Tightbeam.RailRemedy do
          subject,
          occurrence,
          generation,
-         interval,
+         _interval,
          state,
-         now
+         _now
        ) do
     if state["blocked"] == "accountable_owner_chain_exhausted" do
       persist_notice_state(txn, statute, subject, put_in(state, ["reassessment"], nil))
@@ -1908,7 +1928,7 @@ defmodule Tightbeam.RailRemedy do
           schedule_protocol_notice(txn, recipient, state, %{
             wake_id: next_id,
             assignment_id: subject,
-            due_at: now + interval,
+            due_at: @reassessment_wait,
             consumer: "review_remedy_reconcile",
             prompt:
               JSON.encode!(%{
@@ -1923,7 +1943,7 @@ defmodule Tightbeam.RailRemedy do
             put_in(state, ["reassessment"], %{
               "generation" => generation + 1,
               "wakeId" => next_id,
-              "dueAt" => now + interval
+              "dueAt" => @reassessment_wait
             })
 
           state = Map.put(state, "lastGeneration", generation + 1)

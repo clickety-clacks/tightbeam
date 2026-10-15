@@ -201,6 +201,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
 
   test "unresolved registration is coherent, terminal recognition latches, and T gates one delivery",
        ctx do
+    scheduler_pid = suspend_scheduler(ctx)
     turn = running_turn(ctx.db, "holder")
     wake = register_wait(ctx.db, due_after(), predicate("R"))
 
@@ -251,6 +252,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
 
     :ok = Hub.subscribe(hub, self(), "wait-fired", %{"classes" => ["wake.fired"]})
     exact_wake_id = wake.wake_id
+    :ok = :sys.resume(scheduler_pid)
 
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert turn_count(ctx.db, wake.wake_id) == 0
@@ -288,6 +290,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
   end
 
   test "registration evaluates success and terminal resolver paths before returning", ctx do
+    scheduler_pid = suspend_scheduler(ctx)
     assert %{outcome: "revoked"} = revoke(ctx.db, "R")
 
     terminal = register_wait(ctx.db, due_after(), predicate("R"))
@@ -304,6 +307,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assert success.recognition_path == "success"
     assert success.recognition_disposition == "completed"
     assert success.verification_notice_wake_id == nil
+    :ok = :sys.resume(scheduler_pid)
 
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert turn_count(ctx.db, terminal.wake_id) == 0
@@ -850,6 +854,8 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assert terminal.recognition_path == "reconsideration"
     assert terminal.recognition_reason == "verification-terminal"
     assert terminal.verification_state == "provisional"
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    drain_queued_turns(ctx.db, "holder")
 
     assignment(ctx.db, "V2", "verifier")
 
@@ -1187,6 +1193,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
   @tag persistent: true
   test "current-stamped continuation guard admits only the exact qualified retry migration",
        ctx do
+    suspend_scheduler(ctx)
     originating = running_turn(ctx.db, "holder")
     original = after_turn_wait!(ctx.db, "A")
 
@@ -1265,6 +1272,8 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     @tag persistent: true
     test "#{mode} continuation restores with #{sibling} through the lane terminal callback and reopen",
          ctx do
+      # Assemble all competing sources before delivery seals the restoration batch.
+      scheduler_pid = suspend_scheduler(ctx)
       qualification_policy(ctx)
       assignment(ctx.db, "B", "holder")
       originating = running_turn(ctx.db, "holder")
@@ -1308,7 +1317,9 @@ defmodule Tightbeam.RowDrivenWaitsTest do
                  )
       end
 
+      :ok = :sys.resume(scheduler_pid)
       assert :ok = Wakes.fire_due(ctx.scheduler)
+      :ok = :sys.suspend(scheduler_pid)
 
       assert {:ok, [[carrier, seq]]} =
                DB.query(
@@ -1823,6 +1834,13 @@ defmodule Tightbeam.RowDrivenWaitsTest do
       assert {:ok, [["open", nil]]} =
                DB.query(ctx.db, "SELECT state,outcome FROM assignments WHERE id='A'")
     end
+  end
+
+  defp suspend_scheduler(ctx) do
+    pid = Process.whereis(ctx.scheduler)
+    :ok = :sys.suspend(pid)
+    on_exit(fn -> if Process.alive?(pid), do: :sys.resume(pid) end)
+    pid
   end
 
   defp after_turn_wait!(db, assignment_id) do
