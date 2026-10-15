@@ -6554,18 +6554,20 @@ defmodule Tightbeam.Wakes do
           end
 
         case Gateway.delivery_target(txn, key, target_gate) do
-          {recipient, _, _} -> [recipient]
-          nil -> [key]
+          {recipient, _, _} ->
+            if Txn.q(
+                 txn,
+                 "SELECT 1 FROM turns WHERE sessionKey=?1 AND status IN ('running','queued') LIMIT 1",
+                 [recipient]
+               ) == [], do: [recipient], else: []
+
+          # An unresolved role must be disposed visibly even when its former
+          # recipient is busy. There is no recipient whose readiness can unblock it.
+          nil ->
+            [key]
         end
       end)
       |> Enum.uniq()
-      |> Enum.reject(fn recipient ->
-        Txn.q(
-          txn,
-          "SELECT 1 FROM turns WHERE sessionKey=?1 AND status IN ('running','queued') LIMIT 1",
-          [recipient]
-        ) != []
-      end)
     end)
   end
 

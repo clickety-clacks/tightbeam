@@ -1,5 +1,5 @@
 defmodule Tightbeam.SchedulerMissesTest do
-  use ExUnit.Case, async: false
+  use Tightbeam.TestCase, async: false
 
   @tag timeout: 180_000
   test "doctor passes at clean gateway start and warns after an actual recorded miss" do

@@ -255,6 +255,40 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
     assert is_integer(seq)
   end
 
+  test "a deleted role is reported at its deadline while the former recipient is busy", ctx do
+    busy(ctx.db)
+    Tightbeam.Roles.create!(ctx.db, "reviewer", "owner", "recipient")
+    pid = scheduler(ctx)
+    source = wake(ctx.db, System.system_time(:millisecond) + 250, %{target_role: "reviewer"})
+    :ok = Tightbeam.Roles.rm(ctx.db, "reviewer")
+
+    deadline = System.monotonic_time(:millisecond) + 5_000
+    assert await_fired(ctx.db, source.wake_id, deadline)
+    assert NoticeBatcher.source_refs(ctx.db, source.wake_id) == []
+    assert :ok = Wakes.fire_due(pid)
+
+    assert Enum.count(Tightbeam.EventLog.lifecycle_events(ctx.db), fn event ->
+             event.kind == "wake_unresolved" and event.subject == source.wake_id and
+               event.detail == "role reviewer no longer exists"
+           end) == 1
+
+    assert Tightbeam.SchedulerMisses.count() == ctx.misses_before
+  end
+
+  defp await_fired(db, id, deadline) do
+    cond do
+      Wakes.get(db, id).state == "fired" ->
+        true
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        false
+
+      true ->
+        Process.sleep(10)
+        await_fired(db, id, deadline)
+    end
+  end
+
   test "the detector ignores busy recipients then delivers and logs a suppressed readiness signal",
        ctx do
     turn = busy(ctx.db)
