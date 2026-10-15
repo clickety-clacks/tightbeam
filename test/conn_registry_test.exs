@@ -11,6 +11,36 @@ defmodule Tightbeam.ConnRegistryTest do
     %{reg: reg, deliver: deliver, test_pid: test_pid}
   end
 
+  test "socket death removes its registration without unregister", %{reg: reg} do
+    pid = spawn(fn -> receive do :stop -> :ok end end)
+    {:ok, ref, _} = ConnRegistry.register(reg, %{pid: pid, user_id: "owner",
+      device_id: "dead-socket", is_admin: false, subscriptions: MapSet.new(["chat"])})
+    assert is_reference(:sys.get_state(reg).conns[ref].monitor)
+    Process.exit(pid, :kill)
+    state = Enum.reduce_while(1..100, nil, fn _, _ ->
+      state = :sys.get_state(reg)
+      if Map.has_key?(state.conns, ref) do
+        Process.sleep(1)
+        {:cont, state}
+      else
+        {:halt, state}
+      end
+    end)
+    refute Map.has_key?(state.conns, ref)
+    refute Map.has_key?(state.devices, "dead-socket")
+  end
+
+  test "inactive rate windows expire without another request", %{reg: reg} do
+    assert ConnRegistry.within_rate_limit(reg, "inactive", :chat, 1, 1)
+    Process.sleep(2)
+    send(reg, :expire_rate_windows)
+    assert :sys.get_state(reg).rate_windows == %{}
+    assert ConnRegistry.within_rate_limit(reg, "active", :chat, 1, 60_000)
+    send(reg, :expire_rate_windows)
+    assert map_size(:sys.get_state(reg).rate_windows) == 1
+    refute ConnRegistry.within_rate_limit(reg, "active", :chat, 1, 60_000)
+  end
+
   test "owner-scoped broadcast: owner only — admin is powers, not a merged feed", %{
     reg: reg,
     deliver: d

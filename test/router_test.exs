@@ -39,6 +39,15 @@ defmodule Tightbeam.Wire.RouterTest do
     def handle_call({:fire_matching, _fact_id}, _from, state), do: {:reply, :ok, state}
   end
 
+  test "unknown keys cannot create atoms or borrow another verb's parameters" do
+    key = "unrecognized_wire_key_#{System.unique_integer([:positive])}"
+    assert_raise ArgumentError, fn -> String.to_existing_atom(key) end
+    assert Router.atomize_params_for_test("wake", %{key => true, "prompt" => "hello", "artifactId" => "a"}) == %{prompt: "hello"}
+    assert_raise ArgumentError, fn -> String.to_existing_atom(key) end
+    assert Router.atomize_params_for_test("unknown-verb", %{"prompt" => "hello"}) == %{}
+    assert Router.atomize_params_for_test("tune", %{"fastMode" => "on", "reasoningLevel" => "high"}) == %{fastMode: "on", reasoningLevel: "high"}
+  end
+
   test "changes route refuses missing upgrade or unsupported protocol before authentication" do
     hub = :"router_refused_changes_hub_#{System.unique_integer([:positive])}"
     start_supervised!({Tightbeam.Firehose.Hub, name: hub})

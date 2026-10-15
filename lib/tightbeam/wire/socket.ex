@@ -330,20 +330,28 @@ defmodule Tightbeam.Wire.Socket do
     keys = Enum.map(sessions, & &1.session_key)
     cursors = replay_cursors(msg, device.user_id, state)
 
-    {replay, truncated?, replayed_seqs} =
-      Enum.reduce(keys, {[], false, MapSet.new()}, fn key, {messages, truncated, sent} ->
-        barrier = Enum.find_value(sessions, 0, &(&1.session_key == key && &1.cleared_through_seq))
-        rows = Projection.list_after(db(state), key, cursors[key], 501, barrier || 0)
-        selected = Enum.take(rows, 500)
+    {reversed, truncated?, replayed_seqs, _bytes, _count} =
+      Enum.reduce_while(sessions, {[], false, MapSet.new(), 0, 0}, fn session,
+                                                                                {messages, _, sent, bytes, count} ->
+        key = session.session_key
+        rows = Projection.list_after(db(state), key, cursors[key], 501 - count,
+          session.cleared_through_seq || 0)
 
-        # The SET of rows sent, not a high-water mark. A mark deletes: a stalled
-        # frame below the max but absent from the replay window (the client's
-        # cursor already passed it, so `seq >` excluded it) would drain as
-        # "≤ mark" and be lost for good — the registry's old bug, one layer down.
-        sent = Enum.reduce(selected, sent, fn m, acc -> MapSet.put(acc, {key, m.seq}) end)
+        page = Enum.reduce_while(rows, {messages, false, sent, bytes, count}, fn row,
+                                                                                 {acc, _, seen, size, n} ->
+          row_bytes = byte_size(JSON.encode!(Payloads.server_message(row)))
 
-        {messages ++ selected, truncated or length(rows) == 501, sent}
+          if n == 500 or size + row_bytes > 4 * 1024 * 1024 do
+            {:halt, {acc, true, seen, size, n}}
+          else
+            {:cont, {[row | acc], false, MapSet.put(seen, {key, row.seq}), size + row_bytes, n + 1}}
+          end
+        end)
+
+        if elem(page, 1), do: {:halt, page}, else: {:cont, page}
       end)
+
+    replay = Enum.reverse(reversed)
 
     read_states = if chat?, do: Projection.read_states(db(state), device.user_id), else: %{}
 
