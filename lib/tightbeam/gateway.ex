@@ -17,8 +17,10 @@ defmodule Tightbeam.Gateway do
   Children appended to Tightbeam.Application's tree, in order:
   ConnRegistry → WakeScheduler → AdapterSupervisor (DynamicSupervisor) →
   AdapterCoordinator → LaneManager (with the runner built here) → Bandit
-  (Wire.Router; port + WS upgrade). All under the SAME rest_for_one root —
-  a DB restart still restarts everything that could hold stale state.
+  (Wire.Router; port + WS upgrade). Runtime children use one_for_one under
+  Tightbeam.RuntimeSupervisor, so a service failure preserves its siblings.
+  The rest_for_one application root still restarts runtime services after
+  a DB restart, discarding any state derived from the old database owner.
 
   The turn pipeline (runner passed to lanes; gateway.ts `runTurn` +
   fifo wiring, adapted to the Ledger):
@@ -499,7 +501,9 @@ defmodule Tightbeam.Gateway do
              fn txn, fact ->
                Tightbeam.Wakes.row_commit_in_txn(txn, [])
                {fact, ConditionFacts.recognize_in_txn(txn, fact.fact_id)}
-             end
+             end,
+             fallback: fn fact -> {fact, []} end,
+             retry_deliveries: true
            ) do
         {:ok, {%{fact_id: fact_id}, deliveries}} ->
           Enum.each(deliveries, &complete_delivery(db, &1))
@@ -526,7 +530,7 @@ defmodule Tightbeam.Gateway do
   end
 
   defp start_remote_credential_child(config, db, machine, previous_host, host) do
-    supervisor = Map.get(config, :credential_supervisor, Tightbeam.Supervisor)
+    supervisor = Map.get(config, :credential_supervisor, Tightbeam.RuntimeSupervisor)
     child = credential_child(config, db, machine, host)
 
     case Supervisor.start_child(supervisor, child) do
@@ -2126,10 +2130,21 @@ defmodule Tightbeam.Gateway do
   defp existing_wake_turn_in_txn(_txn, wake_id) when not is_binary(wake_id), do: nil
 
   defp existing_wake_turn_in_txn(txn, wake_id) do
-    case NoticeBatcher.source_delivery_turns_in_txn(txn, wake_id) do
-      [[seq, _status, _assignment] | _] -> {:duplicate, %{wake_id: wake_id, turn_seq: seq}}
-      [] -> nil
-    end
+    seq =
+      case DB.Txn.q(txn, "SELECT deliveredTurnSeq FROM wakes WHERE wakeId=?1", [wake_id]) do
+        [[seq]] when is_integer(seq) ->
+          seq
+
+        _ ->
+          # Direct callers may use a transport dedupe token without scheduling
+          # a wake. Its unique turn key remains the idempotency authority.
+          case DB.Txn.q(txn, "SELECT seq FROM turns WHERE wakeId=?1", [wake_id]) do
+            [[seq]] -> seq
+            [] -> nil
+          end
+      end
+
+    if is_integer(seq), do: {:duplicate, %{wake_id: wake_id, turn_seq: seq}}, else: nil
   end
 
   @doc false
@@ -2391,6 +2406,16 @@ defmodule Tightbeam.Gateway do
 
         case enqueued do
           {:ok, seq} ->
+            if is_binary(opts[:wake_id]) do
+              NoticeBatcher.carrier_source_ids_in_txn(txn, opts[:wake_id])
+              |> Enum.each(fn source_id ->
+                DB.Txn.q(txn, "UPDATE wakes SET deliveredTurnSeq=?2 WHERE wakeId=?1", [
+                  source_id,
+                  seq
+                ])
+              end)
+            end
+
             settle_supervision_controller_in_txn(txn, opts, target, seq)
 
             opts[:wake_id]
@@ -3908,6 +3933,9 @@ defmodule Tightbeam.Gateway do
         # The lane cancel succeeded, so the result stays ok; the harness leg's
         # truth rides in the diagnostic.
         ErrorDiagnostic.put(%{ok: true}, cancel_leg(leg))
+
+      {:error, %DB.Overloaded{}} ->
+        %{ok: false, code: "busy", message: "database overloaded; retry later"}
 
       _ ->
         %{ok: false, code: "not_running", message: "no turn in flight"}

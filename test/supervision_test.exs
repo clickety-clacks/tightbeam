@@ -2898,6 +2898,44 @@ defmodule Tightbeam.SupervisionTest do
     assert {:ok, []} = DB.query(ctx.db, Supervision.ended_controllers_sql())
   end
 
+  test "a fired controller returning to pending is excluded from settlement", ctx do
+    terminal_seq = terminal!(ctx.db, "holder")
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0, interval: 60_000)
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", terminal_seq)
+    assert [controller] = Wakes.list_pending(ctx.db)
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE wakes SET state='fired',firedAt=1 WHERE wakeId=?1", [
+               controller.wake_id
+             ])
+
+    assert {:ok, [[_, "asg_1", "fired"]]} =
+             DB.query(ctx.db, Supervision.ended_controllers_sql())
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE wakes SET state='pending' WHERE wakeId=?1", [
+               controller.wake_id
+             ])
+
+    assert {:ok, []} = DB.query(ctx.db, Supervision.ended_controllers_sql())
+    assert :ok = Supervision.recover_liveness!(ctx.db, 60_000)
+
+    assert {:ok, [["pending"]]} =
+             DB.query(ctx.db, "SELECT controllerState FROM supervision_liveness_sidecar WHERE wakeId=?1", [
+               controller.wake_id
+             ])
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE wakes SET state='canceled' WHERE wakeId=?1", [
+               controller.wake_id
+             ])
+
+    assert {:ok, [[_, "asg_1", "canceled"]]} =
+             DB.query(ctx.db, Supervision.ended_controllers_sql())
+    assert :ok = Supervision.recover_liveness!(ctx.db, 60_000)
+    assert {:ok, []} = DB.query(ctx.db, Supervision.ended_controllers_sql())
+  end
+
   test "cancellation settles its controller and removes its ending record", ctx do
     terminal_seq = terminal!(ctx.db, "holder")
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0, interval: 60_000)

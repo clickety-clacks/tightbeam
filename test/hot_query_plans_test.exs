@@ -21,6 +21,14 @@ defmodule Tightbeam.HotQueryPlansTest do
     plan
   end
 
+  test "transfer candidates use the wake assignment index", %{db: db} do
+    plan = plan!(db, Supervision.transfer_candidate_sql(), ["assignment", nil])
+    assert Enum.any?(plan, &String.contains?(&1, "USING INDEX wakes_assignment (assignmentId=?)"))
+    refute Enum.any?(plan, &Regex.match?(~r/^SCAN (wakes|w|d)\b/, &1))
+    assert {:ok, []} = DB.query(db, Supervision.transfer_candidate_sql(), ["assignment", nil])
+    assert :ok = Tightbeam.Schema.ensure_all(db)
+  end
+
   test "idle-cleanup delivery state uses its primary key", %{db: db} do
     params = Supervision.idle_cleanup_delivery_history_params(String.duplicate("a", 64), "tok")
     plan = plan!(db, Supervision.idle_cleanup_delivery_history_sql(), params)
@@ -35,7 +43,7 @@ defmodule Tightbeam.HotQueryPlansTest do
   test "ended scheduled controllers are read from their recorded-state index", %{db: db} do
     plan = plan!(db, Supervision.ended_controllers_sql(), [])
     assert hd(plan) =~ "supervision_liveness_ended_controller"
-    refute Enum.any?(plan, &String.contains?(&1, "wakes"))
+    assert Enum.any?(plan, &String.contains?(&1, "SEARCH w USING INDEX sqlite_autoindex_wakes_1 (wakeId=?)"))
     refute Enum.any?(plan, &Regex.match?(~r/^SCAN w/, &1))
   end
 

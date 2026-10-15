@@ -262,6 +262,10 @@ defmodule Tightbeam.Artifacts do
                    error ->
                      error
                  end
+               end,
+               fallback: fn
+                 {:created, artifact} -> artifact
+                 error -> error
                end
              ) do
           # The row still lands on the weaker class; when that class came from

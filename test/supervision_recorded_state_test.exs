@@ -351,6 +351,12 @@ defmodule Tightbeam.SupervisionRecordedStateTest do
 
     assert {:ok, :ok} =
              DB.transaction(db, fn txn ->
+               # Gateway stamps included sources before the delivered callback.
+               Tightbeam.DB.Txn.q(txn, """
+               UPDATE wakes SET deliveredTurnSeq=(SELECT seq FROM turns WHERE wakeId='carrier')
+               WHERE wakeId='cleanup'
+               """)
+
                Tightbeam.NoticeBatcher.enqueue_or_recover_in_txn(txn, {:delivered, "carrier", 42})
              end)
 

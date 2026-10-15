@@ -425,7 +425,7 @@ defmodule Tightbeam.Productions.Bubble do
               DB.Txn.q(
                 txn,
                 """
-                WITH source_deliveries AS (#{NoticeBatcher.source_deliveries_sql()})
+                WITH source_deliveries AS (#{Tightbeam.NoticeBatcher.recorded_deliveries_sql()})
                 SELECT source.wakeId,source.assignmentId,source.sessionKey
                 FROM source_deliveries d JOIN wakes source ON source.wakeId=d.sourceWakeId
                 WHERE d.turnSeq=?1
@@ -580,7 +580,7 @@ defmodule Tightbeam.Productions.Bubble do
       DB.query(
         db,
         """
-        WITH source_deliveries AS (#{NoticeBatcher.source_deliveries_sql()})
+        WITH source_deliveries AS (#{Tightbeam.NoticeBatcher.recorded_deliveries_sql()})
         SELECT source.sessionKey,
                CASE
                  WHEN turn.status IS NOT NULL THEN turn.status
@@ -688,7 +688,9 @@ defmodule Tightbeam.Productions.Bubble do
             if is_integer(fact_id), do: ConditionFacts.recognize_in_txn(txn, fact_id), else: []
 
           {published, deliveries}
-        end
+        end,
+        fallback: fn {published, _fact_id} -> {published, []} end,
+        retry_deliveries: true
       )
 
     ConditionFacts.complete_deliveries(db, deliveries)
@@ -796,7 +798,9 @@ defmodule Tightbeam.Productions.Bubble do
           fn txn, {published, facts} ->
             Tightbeam.Wakes.row_commit_in_txn(txn, [])
             {published, Enum.flat_map(facts, &ConditionFacts.recognize_in_txn(txn, &1))}
-          end
+          end,
+          fallback: fn {published, _facts} -> {published, []} end,
+          retry_deliveries: true
         )
 
       ConditionFacts.complete_deliveries(db, deliveries)
@@ -995,11 +999,11 @@ defmodule Tightbeam.Productions.Bubble do
     case DB.query(
            db,
            """
-           WITH source_deliveries AS (#{NoticeBatcher.source_deliveries_sql(turn_wake: "?1")})
+           WITH source_deliveries AS (#{Tightbeam.NoticeBatcher.recorded_deliveries_sql()})
            SELECT source.sessionKey,source.wakeId
            FROM source_deliveries d JOIN wakes source ON source.wakeId=d.sourceWakeId
            JOIN turns turn ON turn.seq=d.turnSeq
-           WHERE turn.wakeId=?1 AND d.carrier=1 ORDER BY d.publicationSeq
+           WHERE turn.wakeId=?1 AND #{Tightbeam.NoticeBatcher.carrier_delivery_sql("d")} ORDER BY (SELECT m.publicationSeq FROM notice_batch_members m WHERE m.sourceWakeId=d.sourceWakeId AND m.state='included' LIMIT 1)
            """,
            [wake_id]
          ) do
@@ -1024,10 +1028,10 @@ defmodule Tightbeam.Productions.Bubble do
     case DB.query(
            db,
            """
-           WITH source_deliveries AS (#{NoticeBatcher.source_deliveries_sql(turn_wake: "?1")})
+           WITH source_deliveries AS (#{Tightbeam.NoticeBatcher.recorded_deliveries_sql()})
            SELECT d.sourceWakeId
            FROM source_deliveries d JOIN turns turn ON turn.seq=d.turnSeq
-           WHERE turn.wakeId=?1 AND d.carrier=1 ORDER BY d.publicationSeq
+           WHERE turn.wakeId=?1 AND #{Tightbeam.NoticeBatcher.carrier_delivery_sql("d")} ORDER BY (SELECT m.publicationSeq FROM notice_batch_members m WHERE m.sourceWakeId=d.sourceWakeId AND m.state='included' LIMIT 1)
            """,
            [wake_id]
          ) do
@@ -1137,7 +1141,9 @@ defmodule Tightbeam.Productions.Bubble do
            fn txn, fact ->
              Tightbeam.Wakes.row_commit_in_txn(txn, [])
              {fact, ConditionFacts.recognize_in_txn(txn, fact.fact_id)}
-           end
+           end,
+           fallback: fn fact -> {fact, []} end,
+           retry_deliveries: true
          ) do
       {:ok, {%{fact_id: _}, deliveries}} ->
         ConditionFacts.complete_deliveries(db, deliveries)

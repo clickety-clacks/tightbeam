@@ -200,7 +200,7 @@ defmodule Tightbeam.DBCallTimeoutTest do
     assert reason =~ "CHECK constraint failed"
   end
 
-  test "a bounded cleanup call can mask the original transaction timeout while the owner continues" do
+  test "an abandoned ordinary transaction rolls back before its next statement" do
     Application.put_env(:tightbeam, :db_call_timeout_ms, 25)
     db = start_supervised!({DB, path: ":memory:", name: nil})
     parent = self()
@@ -235,7 +235,7 @@ defmodule Tightbeam.DBCallTimeoutTest do
 
     send(db, :finish_old_migration)
 
-    assert {:ok, [["old_migration_committed"]]} =
+    assert {:ok, []} =
              DB.query(
                DB.migration_context(db),
                "SELECT name FROM sqlite_master WHERE name='old_migration_committed'"

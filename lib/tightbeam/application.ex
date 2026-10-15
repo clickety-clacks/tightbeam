@@ -62,9 +62,11 @@ defmodule Tightbeam.Application do
 
   defp start_tree(config) do
     with {:ok, supervisor} <- Supervisor.start_link(children(config), root_opts()) do
-      Enum.each(Tightbeam.Gateway.children_after_preflight(config), fn child ->
-        {:ok, _pid} = Supervisor.start_child(supervisor, child)
-      end)
+      {:ok, _pid} =
+        Supervisor.start_child(
+          supervisor,
+          runtime_child(Tightbeam.Gateway.children_after_preflight(config))
+        )
 
       # LAST, deliberately: Bandit's "Running ... (http)" has already been
       # logged by now, and that line reads as a verdict. On an org that cannot
@@ -187,6 +189,25 @@ defmodule Tightbeam.Application do
     ]
   end
 
+  @doc false
+  def runtime_child(children) do
+    %{
+      id: Tightbeam.RuntimeSupervisor,
+      start:
+        {Supervisor, :start_link,
+         [
+           children,
+           [
+             strategy: :one_for_one,
+             name: Tightbeam.RuntimeSupervisor,
+             max_restarts: 50,
+             max_seconds: 30
+           ]
+         ]},
+      type: :supervisor
+    }
+  end
+
   @doc "Root supervisor options — rest_for_one with a tight restart budget."
   @spec root_opts() :: keyword()
   def root_opts,
@@ -307,8 +328,12 @@ defmodule Tightbeam.Application do
     :persistent_term.put({__MODULE__, :shutdown_deadline}, deadline)
 
     # Keep the stamp inside the budget even when draining or acknowledgements
-    # use their whole allowance. Short stop budgets reserve the whole budget.
-    work_deadline = deadline - min(5_000, budget)
+    # use their whole allowance: up to 5 s is reserved for it. A budget too
+    # short for that still gives draining and feed acknowledgements half of
+    # itself, up to 500 ms, so a short bounded stop still closes feeds in
+    # order instead of skipping straight to the stamp.
+    work_allowance = max(budget - 5_000, min(500, div(budget, 2)))
+    work_deadline = deadline - budget + work_allowance
     drain_until(work_deadline)
     Tightbeam.Firehose.Hub.shutdown(Tightbeam.Firehose.Hub, work_deadline)
 

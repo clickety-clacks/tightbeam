@@ -2540,14 +2540,14 @@ defmodule Tightbeam.Wire.Router do
        when action in ~w(set_thinking set_reasoning set_fast_mode set_mode set_verbosity) do
     key =
       %{
-        "set_thinking" => "thinkingLevel",
-        "set_reasoning" => "reasoningLevel",
-        "set_fast_mode" => "fastMode",
-        "set_mode" => "mode",
-        "set_verbosity" => "verbosity"
+        "set_thinking" => :thinkingLevel,
+        "set_reasoning" => :reasoningLevel,
+        "set_fast_mode" => :fastMode,
+        "set_mode" => :mode,
+        "set_verbosity" => :verbosity
       }[action]
 
-    {:ok, "tune", Map.put(%{setting: action}, String.to_atom(key), body[key])}
+    {:ok, "tune", Map.put(%{setting: action}, key, body[Atom.to_string(key)])}
   end
 
   defp control_call(%{"action" => action}),
@@ -2763,6 +2763,138 @@ defmodule Tightbeam.Wire.Router do
     }
   }
 
+  @param_keys %{
+    "work-item-list" =>
+      ~w(state status owner_user_id created_by_session created_by_user is_bug spec_ref_name holder_key limit after)a,
+    "topline-placement-list" => ~w(state)a,
+    "topline-work-leave-unlinked" => ~w(idempotency_key reason work_item_id)a,
+    "topline-concern-unlink-work" => ~w(concern_id idempotency_key reason work_item_id)a,
+    "topline-concern-link-work" => ~w(concern_id idempotency_key reason work_item_id)a,
+    "topline-concern-create" => ~w(idempotency_key title topline_id)a,
+    "topline-unlink-work" => ~w(idempotency_key membership_id reason)a,
+    "topline-link-work" => ~w(idempotency_key reason topline_id work_item_id)a,
+    "topline-reopen" => ~w(idempotency_key reason topline_id)a,
+    "topline-close" => ~w(idempotency_key reason topline_id)a,
+    "topline-update" => ~w(idempotency_key reason title topline_id)a,
+    "topline-create" => ~w(idempotency_key title)a,
+    "withdraw" => ~w(request request_id reason)a,
+    "revoke-waiver" => ~w(waiver waiver_id reason)a,
+    "waive" =>
+      ~w(request request_id session session_key statute statute_name reason scope expires_at idempotency_key)a,
+    "kungfu-scaffold" => ~w(name purpose idempotency_key)a,
+    "promote-user" => ~w(user_id is_admin)a,
+    "revoke-device" => ~w(device_id)a,
+    "deny-device" => ~w(device_id)a,
+    "approve-device" => ~w(device_id user_id)a,
+    "assignment-get" => ~w(assignment_id)a,
+    "add-user" => ~w(is_admin user_id)a,
+    "answer" => ~w(answer idempotency_key reason request request_id)a,
+    "artifact-content-fetch" => ~w(artifact_id)a,
+    "artifact-get" => ~w(artifact_id)a,
+    "artifact-record" =>
+      ~w(content_sha256 description kind origin_path produced_by_assignment_id title work_item_id)a,
+    "artifacts" => ~w(session_key work_item_id kind)a,
+    "ask" =>
+      ~w(assignment_id context idempotency_key params question reason role session_key target user_id verb)a,
+    "assign" =>
+      ~w(effect_kind files holder_key idempotency_key prompt reviews reviews_assignment_id role session_key subject succeeds_assignment_id work_item_id)a,
+    "assignment-commitref-correct" =>
+      ~w(assignment_id commit_refs evidence_artifact_id idempotency_key reason)a,
+    "assignments" => ~w(role session_key state)a,
+    "attend" => ~w(high)a,
+    "attest" =>
+      ~w(artifact_id assignment_id commit_refs content_sha256 kind note release_fact_kind release_fact_principal_ref release_fact_scope verdict_kind wait_id)a,
+    "attests" => ~w(assignment_id)a,
+    "breathing" => ~w(target_id target_kind)a,
+    "cancel" => ~w(assignment_id reason)a,
+    "condition" => ~w(idempotency_key kind payload scope)a,
+    "config" => ~w(action key setting value)a,
+    "critical" => ~w(for_ms reason)a,
+    "decision-request" => ~w(request request_id)a,
+    "decision-requests" => ~w(status)a,
+    "dispatch" =>
+      ~w(brief effect_kind holder_key idempotency_key prompt session_key subject succeeds_assignment_id work_item_id workdir_root)a,
+    "effort-rule" => ~w(action request request_id)a,
+    "execution-map" => ~w(tree origin owner state spec spec_sha session quiet_over)a,
+    "execution-map-select" =>
+      ~w(assignments under origin owner state spec spec_sha session quiet_over)a,
+    "facts-read" => ~w(after kind limit scope)a,
+    "harness-health-close-promotion" =>
+      ~w(candidate_commit idempotency_key named_class promotion_id review_artifact_id review_assignment_id review_attest_id spec_artifact_id spec_ref spec_sha256)a,
+    "harness-health-evidence-other" => ~w(incident_id)a,
+    "harness-health-observe-other" =>
+      ~w(accepted_at session_key correlation_id description evidence_mode exact_observed_error exact_probe harness host idempotency_key not_known_class_reason observed_at observed_state output_digest recovery_condition redaction_confirmed source_session_key valid_until world_status)a,
+    "harness-health-resolve-other" =>
+      ~w(accepted_at cause correlation_id exact_probe harness host idempotency_key incident_id observed_at observed_state output_digest recovery_condition_digest recovery_satisfied redaction_confirmed session_key world_status)a,
+    "harness-health-review-other" => ~w(cause idempotency_key incident_id named_class outcome)a,
+    "harness-processes" => ~w()a,
+    "host-env-list" => ~w(harness host sentinel)a,
+    "host-env-set" => ~w(harness host key name sentinel value)a,
+    "host-env-unset" => ~w(harness host key name sentinel)a,
+    "host-toolchain-set" => ~w(dirs host)a,
+    "identity-apply" => ~w(all session_key)a,
+    "identity-edit" =>
+      ~w(archetype content expected_revision idempotency_key manifest name path remove skill)a,
+    "identity-relearn" => ~w(action idempotency_key)a,
+    "identity-repoint" => ~w(archetype name path session_key)a,
+    "identity-status" => ~w(archetype)a,
+    "inspect" => ~w(batch_id)a,
+    "kungfu-list" => ~w()a,
+    "kungfu-setup" => ~w(name)a,
+    "learn" => ~w(idempotency_key name)a,
+    "onboard" => ~w(provider phase kind machine lease_id reason source code callback_url)a,
+    "operator-ask" =>
+      ~w(assignment assignment_id choices context deadline idempotency_key note options owner_user_id question supersedes work_item_id)a,
+    "operator-rule" => ~w(decision idempotency_key rationale reason request request_id response)a,
+    "operator-withdraw" => ~w(idempotency_key reason request request_id)a,
+    "register-host" => ~w(adapter_bin_dir base_dir cli_bin name ssh)a,
+    "reopen-assignment" => ~w(assignment_id reason)a,
+    "repair-assignment" =>
+      ~w(action assignment_id context effort idempotency_key model outcome turn_seq)a,
+    "retire" => ~w(idempotency_key session_key)a,
+    "return" => ~w(idempotency_key reason request request_id)a,
+    "revoke-assignment" => ~w(assignment_id reason)a,
+    "role-bind" => ~w(name session_key)a,
+    "role-create" => ~w(name bind description session_key)a,
+    "role-list" => ~w()a,
+    "role-rm" => ~w(name)a,
+    "rule" => ~w(request request_id decision rationale reason scope expires_at idempotency_key)a,
+    "sentinel-disable" => ~w(name)a,
+    "sentinel-enable" => ~w(name)a,
+    "sentinel-list" => ~w()a,
+    "session-po-set" => ~w(idempotency_key po_role po_session_key session_key)a,
+    "session-reparent" => ~w(assignment_id idempotency_key parent_session_key session_key)a,
+    "settle-turn" => ~w(idempotency_key outcome reason session_key turn_seq)a,
+    "spawn" =>
+      ~w(archetype context display_name effort handle harness host idempotency_key model overrides work_item_id)a,
+    "topline" => ~w(history origin owner quiet_over session spec spec_sha state topline_id)a,
+    "toplines" => ~w(origin owner quiet_over session spec spec_sha state)a,
+    "transcript" => ~w(after before limit name session_key)a,
+    "tune" =>
+      ~w(adopted context display_name effort fast_mode harness host idempotency_key mode model reasoning_level session_key setting skill guidance thinking_level verbosity)a,
+    "unlearn" => ~w(idempotency_key name)a,
+    "wake" =>
+      ~w(prompt after_ms after_turn assignment_id at cancel_wake_id class condition_kind condition_scope idempotency_key predicate replace_queued reresolve reresolve_rung reresolve_seed nudge)a,
+    "work-item-close" => ~w(work_item_id)a,
+    "work-item-create" =>
+      ~w(title is_bug priority spec_ref_name spec_ref_sha256 idempotency_key body)a,
+    "work-item-fail" => ~w(reason work_item_id)a,
+    "work-item-get" => ~w(work_item_id)a,
+    "work-item-icebox" => ~w(work_item_id)a,
+    "work-item-reopen" => ~w(work_item_id)a,
+    "work-item-trace" => ~w(work_item_id)a,
+    "work-item-update" =>
+      ~w(work_item_id title is_bug priority spec_ref_name spec_ref_sha256 delivery_owner_session_key body clear_body)a
+  }
+
+  @param_keys Map.new(@param_keys, fn {verb, keys} ->
+                {verb,
+                 Map.new(
+                   keys ++ Map.get(@substrate_only_params, verb, []),
+                   &{Atom.to_string(&1), &1}
+                 )}
+              end)
+
   @doc false
   # Exposed so the Law-0 boundary strip is provable at its own seam.
   def atomize_params_for_test(verb, params), do: atomize_params(verb, params)
@@ -2770,10 +2902,14 @@ defmodule Tightbeam.Wire.Router do
   defp atomize_params(verb, params) when is_map(params) do
     aliases = Map.get(@param_aliases, verb, %{})
 
+    keys = Map.get(@param_keys, verb, %{})
+
     params
-    |> Map.new(fn {key, value} ->
-      atom = key |> Macro.underscore() |> String.to_atom()
-      {Map.get(aliases, atom, atom), value}
+    |> Enum.reduce(%{}, fn {key, value}, acc ->
+      case keys[Macro.underscore(key)] do
+        nil -> Map.put(acc, key, value)
+        atom -> Map.put(acc, Map.get(aliases, atom, atom), value)
+      end
     end)
     |> Map.drop(Map.get(@substrate_only_params, verb, []))
     |> strip_notification_assignment(verb)

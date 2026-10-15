@@ -22,6 +22,27 @@ defmodule Tightbeam.Productions.BubbleTest do
     def handle_call({:ensure_lane, _key}, _from, state), do: {:reply, :ok, state}
   end
 
+  defmodule RecognitionRefusal do
+    use GenServer
+    def start_link(db), do: GenServer.start_link(__MODULE__, db)
+    def init(db), do: {:ok, %{db: db, refuse: true}}
+    def handle_call(:allow, _from, state), do: {:reply, :ok, %{state | refuse: false}}
+
+    def handle_call({:query, sql, _params} = request, _from, state) do
+      sweep_query? =
+        String.contains?(sql, "production_cursors") or
+          String.contains?(sql, "SELECT seq, endedAt")
+
+      if state.refuse and not sweep_query? do
+        {:reply, {:error, %DB.Error{message: "recognition temporarily refused"}}, state}
+      else
+        {:reply, GenServer.call(state.db, request), state}
+      end
+    end
+
+    def handle_call(request, _from, state), do: {:reply, GenServer.call(state.db, request), state}
+  end
+
   # Exercise the real registry implementation until the first terminal-alert
   # transaction has committed, then disconnect that local publication handoff.
   defmodule OwnerAlertDisconnect do
@@ -920,6 +941,48 @@ defmodule Tightbeam.Productions.BubbleTest do
     assert Tightbeam.Productions.BubbleSweeper.sweep_now(sweeper) == 0
   end
 
+  test "a permanently failed turn cannot hold the sweep cursor forever", ctx do
+    seq = fail_turn!(ctx.db, "holder")
+    proxy = start_supervised!({RecognitionRefusal, ctx.db})
+
+    sweeper =
+      start_supervised!(
+        {Tightbeam.Productions.BubbleSweeper,
+         db: proxy, interval: 3_600_000, name: :"bounded_bubble_sweeper_#{ctx.db}"}
+      )
+
+    :sys.get_state(sweeper)
+    for _ <- 1..5, do: Tightbeam.Productions.BubbleSweeper.sweep_now(sweeper)
+
+    assert {:ok, [[cursor]]} =
+             DB.query(ctx.db, "SELECT seq FROM production_cursors WHERE name='bubble'")
+
+    assert cursor >= seq
+    assert Process.alive?(sweeper)
+  end
+
+  test "a failed recognition holds the cursor and succeeds on a later sweep", ctx do
+    seq = fail_turn!(ctx.db, "holder")
+    proxy = start_supervised!({RecognitionRefusal, ctx.db})
+
+    sweeper =
+      start_supervised!(
+        {Tightbeam.Productions.BubbleSweeper,
+         db: proxy, interval: 3_600_000, name: :"refused_bubble_sweeper_#{ctx.db}"}
+      )
+
+    assert Tightbeam.Productions.BubbleSweeper.sweep_now(sweeper) == 0
+    assert {:ok, []} = DB.query(ctx.db, "SELECT seq FROM production_cursors WHERE name='bubble'")
+    assert :ok = GenServer.call(proxy, :allow)
+    assert Tightbeam.Productions.BubbleSweeper.sweep_now(sweeper) >= 1
+
+    assert {:ok, [[cursor]]} =
+             DB.query(ctx.db, "SELECT seq FROM production_cursors WHERE name='bubble'")
+
+    assert cursor >= seq
+    assert [[_, _, _, _, _]] = notice_turn(ctx.db, "supervisor")
+  end
+
   test "the substrate may not assert work-blocked; agents may not file the alert kinds", ctx do
     {:ok, refused} =
       DB.transaction(ctx.db, fn txn ->
@@ -1128,7 +1191,7 @@ defmodule Tightbeam.Productions.BubbleTest do
     assert {:ok, [[1]]} =
              DB.query(
                ctx.db,
-               "SELECT count(*) FROM (#{NoticeBatcher.source_deliveries_sql()}) d WHERE d.sourceWakeId=?1",
+               "SELECT count(*) FROM (SELECT wakeId AS sourceWakeId,deliveredTurnSeq AS turnSeq,assignmentId FROM wakes WHERE deliveredTurnSeq IS NOT NULL) d WHERE d.sourceWakeId=?1",
                [retry]
              )
 
@@ -1379,7 +1442,18 @@ defmodule Tightbeam.Productions.BubbleTest do
 
           # The boot tick precedes this call: containment must not advance the
           # cursor past a group whose original causes have not been completed.
-          assert Tightbeam.Productions.BubbleSweeper.sweep_now(sweeper) == 0
+          if interrupted? do
+            assert {:ok, [[cursor_before_retry]]} =
+                     DB.query(
+                       ctx.db,
+                       "SELECT seq FROM production_cursors WHERE name='bubble'"
+                     )
+
+            assert cursor_before_retry == intermediate.seq - 1
+          end
+
+          expected_recognized = if interrupted?, do: 1, else: 0
+          assert Tightbeam.Productions.BubbleSweeper.sweep_now(sweeper) == expected_recognized
           assert_receive {:real_missing_target_delivery, selected_target}
           assert selected_target == ctx.main.session_key
 

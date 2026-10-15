@@ -23,9 +23,49 @@ defmodule Tightbeam.Firehose.Hub do
               overflowed: false
   end
 
-  defstruct sockets: %{}, queue_limit: 1_000, shutting_down: false, shutdown_waiter: nil
+  defstruct sockets: %{},
+            ingress: nil,
+            queue_limit: 1_000,
+            shutting_down: false,
+            shutdown_waiter: nil
 
-  @session_event_classes ~w(session.spawned session.updated session.harness_changed session.retired)
+  @ingress_count 1_000
+  @ingress_bytes 8 * 1024 * 1024
+
+  defmodule Transport do
+    @moduledoc false
+
+    def send(server, {:"$gen_cast", message}),
+      do: Tightbeam.Firehose.Hub.ingress(server, message)
+  end
+
+  # Committed outboxes use the same admission path as direct publications.
+  def destination(server), do: {:via, Transport, server}
+
+  @doc false
+  def ingress(server, message) do
+    pid = GenServer.whereis(server)
+
+    case :persistent_term.get({__MODULE__, pid}, nil) do
+      nil ->
+        :ok
+
+      table ->
+        bytes = :erlang.external_size(message)
+        [count, total] = :ets.update_counter(table, :ingress, [{2, 1}, {3, bytes}])
+
+        if count <= @ingress_count and total <= @ingress_bytes do
+          GenServer.cast(pid, {:ingress, bytes, message})
+        else
+          :ets.update_counter(table, :ingress, [{2, -1}, {3, -bytes}])
+
+          if :ets.insert_new(table, {:overflow, true}),
+            do: GenServer.cast(pid, :ingress_overflow)
+        end
+    end
+
+    :ok
+  end
 
   def start_link(opts \\ []),
     do: GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
@@ -64,19 +104,31 @@ defmodule Tightbeam.Firehose.Hub do
     result
   end
 
-  def publish(server \\ __MODULE__, notice), do: GenServer.cast(server, {:publish, notice})
+  def publish(server \\ __MODULE__, notice), do: ingress(server, {:publish, notice})
 
   def committed(server \\ __MODULE__, class, payload, refs),
-    do: GenServer.cast(server, {:committed, class, payload, refs})
+    do: ingress(server, {:committed, class, payload, refs})
 
   def accepted(server \\ __MODULE__, db, call, result),
-    do: GenServer.cast(server, {:accepted, db, call, result})
+    do: ingress(server, {:accepted, db, call, result})
 
   def denied(server \\ __MODULE__, call, error),
-    do: GenServer.cast(server, {:denied, call, error})
+    do: ingress(server, {:denied, call, error})
 
   @impl true
-  def init(opts), do: {:ok, %__MODULE__{queue_limit: Keyword.get(opts, :queue_limit, 1_000)}}
+  def init(opts) do
+    table = :ets.new(__MODULE__, [:public, :set, write_concurrency: true])
+    :ets.insert(table, {:ingress, 0, 0})
+    :persistent_term.put({__MODULE__, self()}, table)
+    {:ok, %__MODULE__{ingress: table, queue_limit: Keyword.get(opts, :queue_limit, 1_000)}}
+  end
+
+  @impl true
+  def terminate(_reason, _state) do
+    :persistent_term.erase({__MODULE__, self()})
+    :ok
+  end
+
   @impl true
   def handle_call({:register, pid, opts}, _from, state) do
     if state.shutting_down do
@@ -140,13 +192,73 @@ defmodule Tightbeam.Firehose.Hub do
   def handle_cast({:delivered, pid}, state),
     do: {:noreply, update(state, pid, &dispatch_next(%{&1 | in_flight: false}, pid))}
 
-  def handle_cast({:committed, class, payload, refs}, state)
-      when class in @session_event_classes do
-    if session_change_visible_to_sink?(state, class, payload, refs) do
-      {:noreply, fanout(state, Publisher.committed_notice(class, payload, refs))}
-    else
-      {:noreply, state}
+  def handle_cast({:ingress, bytes, message}, state) do
+    try do
+      handle_cast(message, state)
+    after
+      :ets.update_counter(state.ingress, :ingress, [{2, -1}, {3, -bytes}])
     end
+  end
+
+  def handle_cast(:ingress_overflow, state) do
+    :ets.delete(state.ingress, :overflow)
+
+    sockets =
+      Map.new(state.sockets, fn {pid, socket} ->
+        if not socket.overflowed, do: send(pid, :firehose_overflow)
+        {pid, %{socket | queue: :queue.new(), queued: 0, overflowed: true}}
+      end)
+
+    {:noreply, %{state | sockets: sockets}}
+  end
+
+  def handle_cast({:committed, _, _, _}, %{shutting_down: true} = state),
+    do: {:noreply, state}
+
+  def handle_cast({:committed, class, payload, refs}, state)
+      when class in ~w(session.spawned session.updated session.harness_changed session.retired) do
+    session_key = refs["sessionKey"] || payload[:session_key] || payload["sessionKey"]
+    owner = refs["ownerUserId"] || payload[:owner_user_id] || payload["ownerUserId"]
+
+    probe = %{
+      "class" => class,
+      "refs" => Map.merge(refs, %{"sessionKey" => session_key, "ownerUserId" => owner}),
+      "payload" => %{"sessionKey" => session_key, "ownerUserId" => owner}
+    }
+
+    eligible =
+      Enum.filter(state.sockets, fn {pid, socket} ->
+        cond do
+          socket.mode == :pending or socket.overflowed ->
+            false
+
+          revoked?(probe, socket) ->
+            send(pid, :firehose_revoked)
+            false
+
+          true ->
+            interested?(socket, probe) and visible?(socket, probe)
+        end
+      end)
+
+    # Deriving session capabilities can query the database. Only do it after
+    # subscriptions and visibility admit a recipient, then reuse that decision.
+    sockets =
+      if eligible == [] do
+        state.sockets
+      else
+        notice = Publisher.committed_notice(class, payload, refs)
+
+        Enum.reduce(eligible, state.sockets, fn {pid, socket}, sockets ->
+          Map.put(
+            sockets,
+            pid,
+            deliver_visible_notice(socket, pid, notice, state.queue_limit, true)
+          )
+        end)
+      end
+
+    {:noreply, %{state | sockets: sockets}}
   end
 
   def handle_cast({:committed, class, payload, refs}, state),
@@ -176,35 +288,6 @@ defmodule Tightbeam.Firehose.Hub do
     %{state | sockets: sockets}
   end
 
-  defp session_change_visible_to_sink?(state, class, payload, refs)
-       when is_map(payload) and is_map(refs) do
-    session_key =
-      Map.get(refs, "sessionKey") || Map.get(refs, :session_key) ||
-        Map.get(refs, "session_key") || Map.get(payload, "sessionKey") ||
-        Map.get(payload, :session_key) || Map.get(payload, "session_key")
-
-    if is_binary(session_key) and session_key != "" do
-      owner_user_id =
-        Map.get(refs, "ownerUserId") || Map.get(refs, :owner_user_id) ||
-          Map.get(payload, "ownerUserId") || Map.get(payload, :owner_user_id)
-
-      probe = %{
-        "class" => class,
-        "refs" => %{"sessionKey" => session_key, "ownerUserId" => owner_user_id},
-        "payload" => %{"sessionKey" => session_key, "ownerUserId" => owner_user_id}
-      }
-
-      Enum.any?(state.sockets, fn {_pid, socket} ->
-        not is_nil(socket.db) and socket.mode != :pending and not socket.overflowed and
-          visible?(socket, probe)
-      end)
-    else
-      true
-    end
-  end
-
-  defp session_change_visible_to_sink?(_state, _class, _payload, _refs), do: true
-
   defp deliver_notice(%{mode: :pending} = socket, _, _, _), do: socket
   defp deliver_notice(%{overflowed: true} = socket, _, _, _), do: socket
 
@@ -217,20 +300,21 @@ defmodule Tightbeam.Firehose.Hub do
     end
   end
 
-  defp deliver_visible_notice(socket, pid, notice, limit) do
-    if not secret_payload?(notice["payload"]) and visible?(socket, notice) do
-      {frames, seq} =
-        if socket.mode == :all,
-          do: {[notice], socket.seq},
-          else:
-            matching_frames(
-              notice,
-              socket.subscriptions,
-              socket.seq
-            )
+  defp interested?(%{mode: :all}, _notice), do: true
 
-      frames = Enum.map(frames, &Publisher.wire_notice/1)
-      enqueue(%{socket | seq: seq}, pid, frames, limit)
+  defp interested?(socket, notice),
+    do: Enum.any?(socket.subscriptions, fn {_id, filters} -> matches?(notice, filters) end)
+
+  defp deliver_visible_notice(socket, pid, notice, limit, authorized? \\ false) do
+    frames =
+      if socket.mode == :all,
+        do: [notice],
+        else: matching_frames(notice, socket.subscriptions, socket.seq)
+
+    if frames != [] and not secret_payload?(notice["payload"]) and
+         (authorized? or visible?(socket, notice)) do
+      seq = if socket.mode == :all, do: socket.seq, else: List.last(frames)["seq"]
+      enqueue(%{socket | seq: seq}, pid, Enum.map(frames, &Publisher.wire_notice/1), limit)
     else
       socket
     end
@@ -258,14 +342,8 @@ defmodule Tightbeam.Firehose.Hub do
       {{:value, frame}, queue} ->
         socket = %{socket | queue: queue, queued: socket.queued - 1}
 
-        cond do
-          socket.mode == :pending or not visible?(socket, frame) ->
-            dispatch_next(socket, pid)
-
-          true ->
-            send(pid, {:firehose_notice, Publisher.wire_notice(frame)})
-            %{socket | in_flight: true}
-        end
+        send(pid, {:firehose_notice, frame})
+        %{socket | in_flight: true}
 
       {:empty, _} ->
         socket
@@ -273,24 +351,24 @@ defmodule Tightbeam.Firehose.Hub do
   end
 
   defp matching_frames(notice, subscriptions, seq) do
-    Enum.sort(subscriptions)
-    |> Enum.reduce({[], seq}, fn {id, filters}, {frames, n} ->
-      if matches?(notice, filters),
-        do:
-          {frames ++
-             [
-               Map.merge(
-                 notice,
-                 %{
-                   "type" => "change",
-                   "schemaVersion" => 2,
-                   "subscriptionId" => id,
-                   "seq" => n + 1
-                 }
-               )
+    {frames, _seq} =
+      Enum.sort(subscriptions)
+      |> Enum.reduce({[], seq}, fn {id, filters}, {frames, n} ->
+        if matches?(notice, filters),
+          do:
+            {[
+               Map.merge(notice, %{
+                 "type" => "change",
+                 "schemaVersion" => 2,
+                 "subscriptionId" => id,
+                 "seq" => n + 1
+               })
+               | frames
              ], n + 1},
-        else: {frames, n}
-    end)
+          else: {frames, n}
+      end)
+
+    Enum.reverse(frames)
   end
 
   def matches?(notice, filters) do

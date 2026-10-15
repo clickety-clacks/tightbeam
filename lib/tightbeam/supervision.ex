@@ -1136,7 +1136,7 @@ defmodule Tightbeam.Supervision do
           Txn.q(
             txn,
             """
-            WITH deliveries AS (#{NoticeBatcher.source_deliveries_sql(source_wake: "?2", turn_seq: "?5")})
+            WITH deliveries AS (#{Tightbeam.NoticeBatcher.recorded_deliveries_sql()})
             SELECT 1 FROM supervision_entitlements e
             JOIN assignments a ON a.id=e.assignmentId
             JOIN wakes old ON old.wakeId=?2 AND old.assignmentId=a.id
@@ -1846,7 +1846,7 @@ defmodule Tightbeam.Supervision do
 
   @impl true
   def handle_continue(:initial_sweep, state) do
-    sweep(state)
+    DB.background_pass(fn -> sweep(state) end)
     {:noreply, state}
   end
 
@@ -1879,13 +1879,13 @@ defmodule Tightbeam.Supervision do
   end
 
   def handle_cast(:sweep, state) do
-    sweep(state)
+    DB.background_pass(fn -> sweep(state) end)
     {:noreply, state}
   end
 
   @impl true
   def handle_info(:scheduled_sweep, state) do
-    sweep(state)
+    DB.background_pass(fn -> sweep(state) end)
     schedule_sweep(state.sweep_ms)
     {:noreply, state}
   end
@@ -3369,9 +3369,11 @@ defmodule Tightbeam.Supervision do
   @doc false
   def ended_controllers_sql do
     """
-    SELECT wakeId, assignmentId, endedWakeState
-    FROM supervision_ended_controllers INDEXED BY supervision_liveness_ended_controller
-    ORDER BY assignmentId, wakeId
+    SELECT e.wakeId, e.assignmentId, w.state
+    FROM supervision_ended_controllers e INDEXED BY supervision_liveness_ended_controller
+    CROSS JOIN wakes w ON w.wakeId=e.wakeId
+    WHERE w.state IN ('fired','canceled')
+    ORDER BY e.assignmentId, e.wakeId
     """
   end
 
@@ -4291,7 +4293,12 @@ defmodule Tightbeam.Supervision do
 
     idle_cleanup_sweep(state)
   rescue
+    error in DB.Overloaded ->
+      reraise error, __STACKTRACE__
+
     error ->
+      if match?(%MatchError{term: {:error, %DB.Overloaded{}}}, error), do: raise(DB.Overloaded)
+
       best_effort_lifecycle(
         state.db,
         "supervision_evaluate_failed",
@@ -4318,7 +4325,12 @@ defmodule Tightbeam.Supervision do
       {:error, error} -> raise error
     end
   rescue
+    error in DB.Overloaded ->
+      reraise error, __STACKTRACE__
+
     error ->
+      if match?(%MatchError{term: {:error, %DB.Overloaded{}}}, error), do: raise(DB.Overloaded)
+
       best_effort_lifecycle(
         db,
         "supervision_evaluate_failed",
@@ -4975,17 +4987,16 @@ defmodule Tightbeam.Supervision do
   # The wake marker makes retries and the historical copy idempotent.
   @doc false
   def record_idle_cleanup_delivery_in_txn(txn, wake_id) do
+    record_idle_cleanup_delivery_in_txn(txn, wake_id, "w.deliveredTurnSeq IS NOT NULL")
+  end
+
+  defp record_idle_cleanup_delivery_in_txn(txn, wake_id, delivered_sql) do
     case Txn.q(
            txn,
            """
            SELECT firedAt,obligationRef FROM wakes w
            WHERE wakeId=?1 AND origin='process:tightbeam' AND state='fired'
-             AND idleCleanupRecorded=0 AND (
-               EXISTS(SELECT 1 FROM turns WHERE wakeId=w.wakeId) OR
-               EXISTS(SELECT 1 FROM notice_batch_members m
-                      JOIN notice_batches b ON b.batchId=m.batchId
-                      JOIN turns t ON t.wakeId=b.deliveryWakeId
-                      WHERE m.sourceWakeId=w.wakeId AND m.state='included'))
+             AND idleCleanupRecorded=0 AND (#{delivered_sql})
            """,
            [wake_id]
          ) do
@@ -5045,7 +5056,13 @@ defmodule Tightbeam.Supervision do
         {:ok, metadata} ->
           group = idle_cleanup_digest("idle-cleanup-group-v1\0" <> metadata["group"])
           Txn.q(txn, "UPDATE wakes SET idleCleanupGroup=?2 WHERE wakeId=?1", [wake_id, group])
-          record_idle_cleanup_delivery_in_txn(txn, wake_id)
+          record_idle_cleanup_delivery_in_txn(txn, wake_id, """
+          EXISTS(SELECT 1 FROM turns WHERE wakeId=w.wakeId) OR
+          EXISTS(SELECT 1 FROM notice_batch_members m
+                 JOIN notice_batches b ON b.batchId=m.batchId
+                 JOIN turns t ON t.wakeId=b.deliveryWakeId
+                 WHERE m.sourceWakeId=w.wakeId AND m.state='included')
+          """)
 
         :error ->
           Logger.warning("invalid idle cleanup metadata for wake #{wake_id}")
@@ -5295,6 +5312,10 @@ defmodule Tightbeam.Supervision do
 
   @doc false
   def sweep_unclassified_terminals(db) do
+    DB.background_pass(fn -> sweep_unclassified_terminals_pass(db) end)
+  end
+
+  defp sweep_unclassified_terminals_pass(db) do
     {:ok, :ok} =
       DB.transaction(db, fn txn ->
         rows =
@@ -5313,7 +5334,13 @@ defmodule Tightbeam.Supervision do
               classify_terminal_in_txn(txn, seq)
               :ok = Txn.exec(txn, "RELEASE classify_terminal")
             rescue
+              error in DB.Overloaded ->
+                reraise error, __STACKTRACE__
+
               error ->
+                if match?(%MatchError{term: {:error, %DB.Overloaded{}}}, error),
+                  do: raise(DB.Overloaded)
+
                 :ok = Txn.exec(txn, "ROLLBACK TO classify_terminal")
                 :ok = Txn.exec(txn, "RELEASE classify_terminal")
 
@@ -5491,7 +5518,12 @@ defmodule Tightbeam.Supervision do
       end)
     end)
   rescue
+    error in DB.Overloaded ->
+      reraise error, __STACKTRACE__
+
     error ->
+      if match?(%MatchError{term: {:error, %DB.Overloaded{}}}, error), do: raise(DB.Overloaded)
+
       best_effort_lifecycle(
         state.db,
         "supervision_evaluate_failed",
@@ -5514,9 +5546,18 @@ defmodule Tightbeam.Supervision do
   defp schedule_sweep(_sweep_ms), do: :ok
 
   defp safe_evaluate(state, session_key, fun) do
+    DB.background_pass(fn -> evaluate_pass(state, session_key, fun) end)
+  end
+
+  defp evaluate_pass(state, session_key, fun) do
     fun.()
   rescue
+    error in DB.Overloaded ->
+      reraise error, __STACKTRACE__
+
     error ->
+      if match?(%MatchError{term: {:error, %DB.Overloaded{}}}, error), do: raise(DB.Overloaded)
+
       best_effort_lifecycle(
         state.db,
         "supervision_evaluate_failed",
@@ -5939,23 +5980,28 @@ defmodule Tightbeam.Supervision do
   defp transfer_candidate_rows(db_or_txn, assignment_id, requested_turn_seq) do
     query(
       db_or_txn,
-      """
-      WITH source_deliveries AS (#{NoticeBatcher.source_deliveries_sql(assignment: "?1")})
-      SELECT t.seq,t.sessionKey,d.assignmentId,
-             w.wakeId,w.state,w.assignmentId,w.origin,w.createdAt,w.firedAt,
-             w.reresolve,w.reresolveSeed,w.reresolveRung,
-             sidecar.assignmentId,sidecar.controllerOrigin,sidecar.wakeKind,
-             sidecar.controllerState,sidecar.chargedGeneration,sidecar.transferEvidenceId
-      FROM source_deliveries d JOIN turns t ON t.seq=d.turnSeq
-      JOIN wakes w ON w.wakeId=d.sourceWakeId
-      LEFT JOIN supervision_liveness_sidecar sidecar ON sidecar.wakeId=w.wakeId
-      WHERE d.assignmentId=?1 AND w.assignmentId=?1
-        AND (?2 IS NULL OR t.seq=?2)
-        AND (w.reresolve='lineage' OR sidecar.wakeKind='escalation')
-      ORDER BY t.seq
-      """,
+      transfer_candidate_sql(),
       [assignment_id, requested_turn_seq]
     )
+  end
+
+  @doc false
+  def transfer_candidate_sql do
+    """
+    WITH source_deliveries AS (#{Tightbeam.NoticeBatcher.recorded_deliveries_sql()})
+    SELECT t.seq,t.sessionKey,d.assignmentId,
+           w.wakeId,w.state,w.assignmentId,w.origin,w.createdAt,w.firedAt,
+           w.reresolve,w.reresolveSeed,w.reresolveRung,
+           sidecar.assignmentId,sidecar.controllerOrigin,sidecar.wakeKind,
+           sidecar.controllerState,sidecar.chargedGeneration,sidecar.transferEvidenceId
+    FROM source_deliveries d JOIN turns t ON t.seq=d.turnSeq
+    JOIN wakes w ON w.wakeId=d.sourceWakeId
+    LEFT JOIN supervision_liveness_sidecar sidecar ON sidecar.wakeId=w.wakeId
+    WHERE d.assignmentId=?1 AND w.assignmentId=?1
+      AND (?2 IS NULL OR t.seq=?2)
+      AND (w.reresolve='lineage' OR sidecar.wakeKind='escalation')
+    ORDER BY t.seq
+    """
   end
 
   defp potential_legacy_candidate?(
@@ -6234,9 +6280,9 @@ defmodule Tightbeam.Supervision do
     query(
       db_or_txn,
       """
-      WITH source_deliveries AS (#{NoticeBatcher.source_deliveries_sql(turn_seq: "?1", source_wake: "?2")})
+      WITH source_deliveries AS (#{Tightbeam.NoticeBatcher.recorded_deliveries_sql()})
       SELECT 1 FROM source_deliveries d
-      WHERE d.turnSeq=?1 AND d.sourceWakeId=?2 AND d.carrier=1 LIMIT 1
+      WHERE d.turnSeq=?1 AND d.sourceWakeId=?2 AND #{Tightbeam.NoticeBatcher.carrier_delivery_sql("d")} LIMIT 1
       """,
       [turn_seq, source_wake_id]
     ) != []

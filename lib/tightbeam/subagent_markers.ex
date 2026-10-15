@@ -63,7 +63,9 @@ defmodule Tightbeam.SubagentMarkers do
               else: []
 
           {result, deliveries}
-        end
+        end,
+        fallback: fn result -> {result, []} end,
+        retry_deliveries: true
       )
 
     ConditionFacts.complete_deliveries(db, scheduler, deliveries)

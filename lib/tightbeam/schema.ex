@@ -1716,14 +1716,150 @@ defmodule Tightbeam.Schema do
     :ok = migrate_supervision_batch_delivery_guards(db)
     :ok = migrate_wake_retry_source_scope(db)
     :ok = upgrade_notice_source_payload(db)
+    :ok = ensure_wake_assignment_index(db)
+    :ok = migrate_wake_delivery(db)
     :ok = migrate_continuation_retry_guard(db)
     :ok = upgrade_decision_request_row_schema_revision(db)
     :ok = migrate_supervision_recorded_state(db)
 
+    :ok = Tightbeam.Recognition.ensure_schema(db)
+
+    # Built last: the notice source payload migration above rebuilds
+    # notice_batch_members, which drops any index created on the old table.
+    # Building it here keeps a refused migration's schema untouched and makes
+    # the first and every later boot leave the same objects.
+    :ok = ensure_notice_delivery_runtime_indexes(db)
+
     case DB.finish_schema(db) do
-      :ok -> :ok
+      :ok -> Tightbeam.Recognition.activate(db)
       {:error, error} -> raise error
     end
+  end
+
+  defp ensure_wake_assignment_index(db) do
+    case DB.migration_transaction(db, :wake_assignment_index, [], [], fn txn ->
+           Txn.exec(txn, "CREATE INDEX IF NOT EXISTS wakes_assignment ON wakes(assignmentId)")
+         end) do
+      {:ok, :ok} -> :ok
+      {:error, error} -> raise error
+    end
+  end
+
+  # The marker and row cursor belong only to this additive backfill. New
+  # deliveries write the column in their own delivery transaction.
+  def migrate_wake_delivery(db) do
+    case DB.transaction(db, fn txn ->
+           :ok =
+             Txn.exec(txn, """
+             CREATE TABLE IF NOT EXISTS wake_delivery_backfill (
+               id INTEGER PRIMARY KEY CHECK(id=0),
+               afterRowid INTEGER NOT NULL,
+               throughRowid INTEGER NOT NULL,
+               startedAt INTEGER NOT NULL,
+               completedAt INTEGER
+             )
+             """)
+
+           if Txn.q(txn, "SELECT 1 FROM wake_delivery_backfill WHERE id=0") == [] do
+             :ok = Txn.exec(txn, "ALTER TABLE wakes ADD COLUMN deliveredTurnSeq INTEGER")
+
+             :ok =
+               Txn.exec(
+                 txn,
+                 "CREATE INDEX wakes_delivered_turn ON wakes(deliveredTurnSeq,firedAt)"
+               )
+
+             at = System.system_time(:millisecond)
+             [[last]] = Txn.q(txn, "SELECT COALESCE(MAX(rowid),0) FROM wakes")
+             Txn.q(txn, "INSERT INTO wake_delivery_backfill VALUES(0,0,?1,?2,NULL)", [last, at])
+
+             rows =
+               Txn.q(
+                 txn,
+                 """
+                 SELECT rowid FROM wakes WHERE state='pending'
+                 UNION
+                 SELECT rowid FROM wakes INDEXED BY wakes_delivered_turn
+                 WHERE deliveredTurnSeq IS NULL AND firedAt>=?1
+                 """,
+                 [at - 7 * 24 * 60 * 60 * 1_000]
+               )
+
+             stamp_wake_delivery_rows_in_txn(txn, rows)
+           end
+
+           :ok
+         end) do
+      {:ok, :ok} -> :ok
+      {:error, error} -> raise error
+    end
+  end
+
+  @doc false
+  def backfill_wake_delivery(db) do
+    case DB.transaction(db, fn txn ->
+           case Txn.q(
+                  txn,
+                  "SELECT afterRowid,throughRowid FROM wake_delivery_backfill WHERE id=0 AND completedAt IS NULL"
+                ) do
+             [[after_row, through_row]] ->
+               rows =
+                 Txn.q(
+                   txn,
+                   "SELECT rowid FROM wakes WHERE rowid>?1 AND rowid<=?2 ORDER BY rowid LIMIT 2000",
+                   [after_row, through_row]
+                 )
+
+               stamp_wake_delivery_rows_in_txn(txn, rows)
+
+               if length(rows) < 2000 do
+                 Txn.q(
+                   txn,
+                   "UPDATE wake_delivery_backfill SET afterRowid=?1,completedAt=?2 WHERE id=0",
+                   [through_row, System.system_time(:millisecond)]
+                 )
+
+                 :done
+               else
+                 Txn.q(txn, "UPDATE wake_delivery_backfill SET afterRowid=?1 WHERE id=0", [
+                   rows |> List.last() |> hd()
+                 ])
+
+                 :more
+               end
+
+             [] ->
+               :done
+           end
+         end) do
+      {:ok, result} ->
+        result
+
+      {:error, %DB.Overloaded{}} = overloaded ->
+        overloaded
+
+      {:error, error} ->
+        Logger.error("wake delivery backfill deferred for 5 seconds: #{inspect(error)}")
+        {:error, error}
+    end
+  end
+
+  defp stamp_wake_delivery_rows_in_txn(txn, rows) do
+    Enum.each(rows, fn [rowid] ->
+      Txn.q(
+        txn,
+        """
+        UPDATE wakes SET deliveredTurnSeq=COALESCE(
+          (SELECT t.seq FROM turns t WHERE t.wakeId=wakes.wakeId ORDER BY t.seq LIMIT 1),
+          (SELECT t.seq FROM notice_batch_members m
+            JOIN notice_batches b ON b.batchId=m.batchId
+            JOIN turns t ON t.wakeId=b.deliveryWakeId
+            WHERE m.sourceWakeId=wakes.wakeId AND m.state='included' ORDER BY t.seq LIMIT 1))
+        WHERE rowid=?1 AND deliveredTurnSeq IS NULL
+        """,
+        [rowid]
+      )
+    end)
   end
 
   # This additive marker is independent of the predecessor shape migrations.
@@ -2443,13 +2579,7 @@ defmodule Tightbeam.Schema do
          "ON wakes(sessionKey, firedAt DESC, wakeId DESC) WHERE firedAt IS NOT NULL"},
       {"idle_cleanup_wakes_pending_session",
        "CREATE INDEX IF NOT EXISTS idle_cleanup_wakes_pending_session " <>
-         "ON wakes(sessionKey, wakeId) WHERE state='pending' AND consumer='prompt'"},
-      # Delivery-history lookups by source wake (NoticeBatcher.source_delivered_sql/1
-      # and source_deliveries_sql/1). An explicit index, so these lookups do not
-      # depend on the table carrying a composite UNIQUE that leads with it.
-      {"notice_batch_members_source",
-       "CREATE INDEX IF NOT EXISTS notice_batch_members_source " <>
-         "ON notice_batch_members(sourceWakeId)"}
+         "ON wakes(sessionKey, wakeId) WHERE state='pending' AND consumer='prompt'"}
     ]
 
     case DB.migration_transaction(db, :idle_cleanup_runtime_indexes, [], [], fn txn ->
@@ -2472,6 +2602,53 @@ defmodule Tightbeam.Schema do
       {:error, error} ->
         raise ShapeError,
           message: "idle-cleanup runtime index migration failed: #{Exception.message(error)}"
+    end
+  end
+
+  # Delivery-history lookups by source wake (NoticeBatcher.source_delivered_sql/1
+  # and source_deliveries_sql/1). An explicit index, so these lookups do not
+  # depend on the table carrying a composite UNIQUE that leads with it. It is
+  # an access path only: if building it fails, the gateway logs that and still
+  # runs (the lookups then use the table's composite UNIQUE index). Only a
+  # migration transaction that cannot run at all refuses the boot.
+  defp ensure_notice_delivery_runtime_indexes(db) do
+    sql =
+      "CREATE INDEX IF NOT EXISTS notice_batch_members_source " <>
+        "ON notice_batch_members(sourceWakeId)"
+
+    case DB.migration_transaction(db, :notice_delivery_runtime_indexes, [], [], fn txn ->
+           started = System.monotonic_time(:millisecond)
+
+           Logger.info(
+             "database migration notice delivery index notice_batch_members_source: begin"
+           )
+
+           try do
+             :ok = Txn.exec(txn, sql)
+             elapsed = System.monotonic_time(:millisecond) - started
+
+             Logger.info(
+               "database migration notice delivery index notice_batch_members_source: " <>
+                 "finished elapsed_ms=#{elapsed}"
+             )
+
+             :ok
+           rescue
+             error ->
+               Logger.warning(
+                 "notice delivery index notice_batch_members_source was not built; " <>
+                   "continuing without it: #{Exception.message(error)}"
+               )
+
+               :skipped
+           end
+         end) do
+      {:ok, _outcome} ->
+        :ok
+
+      {:error, error} ->
+        raise ShapeError,
+          message: "notice delivery runtime index migration failed: #{Exception.message(error)}"
     end
   end
 
@@ -3239,7 +3416,28 @@ defmodule Tightbeam.Schema do
   # Registration still requires the creator's running turn. A restored leaf
   # retains that immutable originating turn after it ends, so only a proved
   # NOT-DISPATCHED retry may re-admit its existing continuation authority.
-  defp continuation_retry_guard(previous) do
+  defp continuation_retry_guard(previous, recorded \\ false) do
+    delivery_proof =
+      if recorded do
+        "AND old.deliveredTurnSeq=failed.seq"
+      else
+        """
+        AND EXISTS (SELECT 1 FROM (SELECT t.seq AS turnSeq,t.wakeId AS sourceWakeId,t.assignmentId AS assignmentId,
+           0 AS carrier,NULL AS publicationSeq
+        FROM turns t WHERE t.wakeId IS NOT NULL
+        UNION ALL
+        SELECT t.seq,m.sourceWakeId,w.assignmentId,1,m.publicationSeq
+        FROM notice_batch_members m
+        JOIN notice_batches b ON b.batchId=m.batchId
+        JOIN wakes w ON w.wakeId=m.sourceWakeId
+        JOIN turns t ON t.wakeId=b.deliveryWakeId
+        WHERE m.state='included'
+        ) delivery
+          WHERE delivery.sourceWakeId=old.wakeId AND delivery.turnSeq=failed.seq
+            AND delivery.assignmentId=w.assignmentId)
+        """
+      end
+
     proof = """
     EXISTS (
       SELECT 1 FROM wake_retry_attempts retry
@@ -3275,9 +3473,7 @@ defmodule Tightbeam.Schema do
         AND terminal.ownerLease=claim.ownerLease
         AND NOT EXISTS (SELECT 1 FROM turn_lifecycle_events dispatched
           WHERE dispatched.turnSeq=failed.seq AND dispatched.kind='prompt_dispatched')
-        AND EXISTS (SELECT 1 FROM (#{Tightbeam.NoticeBatcher.source_deliveries_sql()}) delivery
-          WHERE delivery.sourceWakeId=old.wakeId AND delivery.turnSeq=failed.seq
-            AND delivery.assignmentId=w.assignmentId)
+        #{delivery_proof}
         AND json_extract(terminal.detail,'$.prewrite.disposition')='not_dispatched'
         AND (SELECT count(*) FROM json_each(terminal.detail,'$.prewrite'))=4
         AND (
@@ -3319,11 +3515,16 @@ defmodule Tightbeam.Schema do
 
     unless normalize_schema_sql(actual) in [
              normalize_schema_sql(previous.sql),
-             normalize_schema_sql(current.sql)
+             normalize_schema_sql(current.sql),
+             normalize_schema_sql(recorded_continuation_retry_guard(previous).sql)
            ],
            do: incompatible_supervision_liveness!("malformed owned object #{previous.name}")
 
     :ok
+  end
+
+  defp recorded_continuation_retry_guard(previous) do
+    continuation_retry_guard(previous, true)
   end
 
   defp migrate_continuation_retry_guard(db) do
@@ -3334,10 +3535,23 @@ defmodule Tightbeam.Schema do
       )
 
     case DB.transaction(db, fn txn ->
+           [[actual]] =
+             Txn.q(txn, "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1", [
+               previous.name
+             ])
+
+           if normalize_schema_sql(actual) == normalize_schema_sql(previous.sql) do
+             migrate_owned_liveness_trigger_in_txn(
+               txn,
+               continuation_retry_guard(previous),
+               previous.sql
+             )
+           end
+
            migrate_owned_liveness_trigger_in_txn(
              txn,
-             continuation_retry_guard(previous),
-             previous.sql
+             recorded_continuation_retry_guard(previous),
+             continuation_retry_guard(previous).sql
            )
          end) do
       {:ok, :ok} -> :ok
