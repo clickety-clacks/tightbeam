@@ -321,9 +321,9 @@ defmodule Tightbeam.Acp.AdapterTest do
         return send({ id: m.id, result: { sessionId: sid, ...configOptions(sid) } });
       }
       case "session/load": {
-        if (failMode === "load-hang" && m.params.sessionId === "slow") {
+        if (failMode === "load-slow" && m.params.sessionId === "slow") {
           capture(m);
-          return;
+          return setTimeout(() => send({ id: m.id, result: configOptions(m.params.sessionId) }), 1500);
         }
         capture(m);
         models[m.params.sessionId] = failMode === "load-owner" ? "owner-model" : (models[m.params.sessionId] || "haiku");
@@ -2075,31 +2075,32 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert_receive {:DOWN, ^conn_monitor, :process, ^conn, :killed}
   end
 
-  test "a load can spend its full deadline while another session completes a turn" do
-    {adapter, capture} = start_adapter(fail_mode: "load-hang")
-    Adapter.conn(adapter)
-    deadline = System.monotonic_time(:millisecond) + 3_000
+  test "setup requests stay serial while another session completes a turn" do
+    {adapter, capture} = start_adapter(fail_mode: "load-slow")
+    assert {:ok, sid} = Adapter.new_session(adapter, nil, "/tmp", [], "guidance")
 
     caller =
       Task.async(fn ->
-        GenServer.call(
-          adapter,
-          {:session_operation, {:load_session, "slow", nil, "/tmp", [], "guidance"}, deadline}
-        )
+        Adapter.load_session_for_turn(adapter, "slow", nil, "/tmp", [], "guidance")
       end)
 
     assert eventually(fn ->
              Enum.any?(captured_requests(capture), &(&1["method"] == "session/load"))
            end)
 
-    assert {:ok, "sess-1"} = Adapter.new_session(adapter, nil, "/tmp", [], "guidance")
-    assert {:ok, %{stop_reason: "end_turn"}} = Adapter.prompt(adapter, "sess-1", "hello")
+    queued =
+      Task.async(fn -> Adapter.new_session_for_turn(adapter, nil, "/tmp", [], "guidance") end)
+
+    assert eventually(fn -> length(:sys.get_state(adapter).operation_queue) == 1 end)
+    assert Enum.count(captured_requests(capture), &(&1["method"] == "session/new")) == 1
+    assert {:ok, %{stop_reason: "end_turn"}} = Adapter.prompt(adapter, sid, "hello")
     assert Task.yield(caller, 0) == nil
-    assert {:error, :timeout} = ErrorDiagnostic.classified(Task.await(caller))
-    assert Adapter.knows_session?(adapter, "sess-1")
+    assert {:ok, _} = Task.await(caller, 5_000)
+    assert {:ok, _} = Task.await(queued, 5_000)
+    assert Adapter.knows_session?(adapter, "slow")
   end
 
-  test "one deadline bounds guidance and all subsequent setup requests" do
+  test "stalled turn guidance leaves the loop free and preserves load prompt close order" do
     {adapter, capture} = start_adapter()
     owner = self()
 
@@ -2107,7 +2108,7 @@ defmodule Tightbeam.Acp.AdapterTest do
       %{
         state
         | on_guidance: fn _, _ ->
-            send(owner, :guidance_started)
+            send(owner, {:guidance_started, self()})
 
             receive do
               :continue -> :ok
@@ -2116,38 +2117,37 @@ defmodule Tightbeam.Acp.AdapterTest do
       }
     end)
 
-    deadline = System.monotonic_time(:millisecond) + 50
+    caller =
+      Task.async(fn ->
+        Adapter.load_session_for_turn(adapter, "slow", nil, "/tmp", [], "guidance")
+      end)
 
-    assert {:error, :timeout} =
-             GenServer.call(
-               adapter,
-               {:session_operation, {:load_session, "slow", nil, "/tmp", [], "guidance"},
-                deadline}
-             )
-
-    assert_received :guidance_started
-    refute Enum.any?(captured_requests(capture), &(&1["method"] == "session/load"))
+    assert_receive {:guidance_started, worker}, 2_000
+    prompt = Task.async(fn -> Adapter.prompt(adapter, "slow", "hello") end)
+    assert eventually(fn -> length(:sys.get_state(adapter).operation_queue) == 1 end)
+    close = Task.async(fn -> Adapter.close_session(adapter, "slow") end)
+    assert eventually(fn -> length(:sys.get_state(adapter).operation_queue) == 2 end)
     assert Process.alive?(adapter)
-    assert :sys.get_state(adapter).operations == %{}
+    refute Enum.any?(captured_requests(capture), &(&1["method"] == "session/load"))
+    send(worker, :continue)
+    assert {:ok, _} = Task.await(caller, 5_000)
+    assert {:ok, _} = Task.await(prompt, 5_000)
+    assert :ok = Task.await(close, 5_000)
+
+    methods =
+      for r <- captured_requests(capture),
+          r["sessionId"] == "slow",
+          r["method"] in ["session/load", "session/prompt", "session/close"],
+          do: r["method"]
+
+    assert methods == ["session/load", "session/prompt", "session/close"]
+    refute Adapter.knows_session?(adapter, "slow")
   end
 
-  test "session setup requests share one deadline instead of renewing their timeout" do
-    {adapter, capture} = start_adapter(gate_mode: "delay-setup", probe: false)
-    Adapter.conn(adapter)
-    deadline = System.monotonic_time(:millisecond) + 120
-
-    assert {:error, :timeout} =
-             ErrorDiagnostic.classified(
-               GenServer.call(
-                 adapter,
-                 {:session_operation, {:new_session, nil, "/tmp", [], "guidance"}, deadline}
-               )
-             )
-
-    assert Enum.any?(captured_requests(capture), &(&1["method"] == "session/set_mode"))
-    refute Adapter.knows_session?(adapter, "sess-1")
-    Process.sleep(100)
-    refute Adapter.knows_session?(adapter, "sess-1")
+  test "turn setup retains its per-request timeout across setup requests" do
+    {adapter, _} = start_adapter(gate_mode: "delay-setup", probe: false)
+    assert {:ok, "sess-1"} = Adapter.new_session_for_turn(adapter, nil, "/tmp", [], "guidance")
+    assert Adapter.knows_session?(adapter, "sess-1")
   end
 
   test "a progress consumer timeout does not block or crash the adapter" do
@@ -2176,12 +2176,12 @@ defmodule Tightbeam.Acp.AdapterTest do
         )
       end)
 
-    assert_receive :progress_started
+    assert_receive :progress_started, 2_000
     assert {:ok, %{text: "progressed"}} = Task.await(caller)
-    assert_receive :progress_finished
+    assert_receive :progress_finished, 2_000
     send(consumer, :stop)
     assert Process.alive?(adapter)
-    assert {:ok, "sess-1"} = Adapter.new_session(adapter, nil, "/tmp", [], "guidance")
+    assert {:ok, "probe-sess"} = Adapter.new_session(adapter, nil, "/tmp", [], "guidance")
   end
 
   test "thought and tool progress stay routed within the prompt budget" do
@@ -3161,34 +3161,23 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     blocker =
       Task.async(fn ->
-        try do
-          GenServer.call(
-            adapter,
-            {:session_operation, {:apply_model, "sess-1", Model.new("gpt-blocking")},
-             System.monotonic_time(:millisecond) + 500}
-          )
-        catch
-          :exit, reason -> {:caller_exit, reason}
-        end
+        Adapter.apply_model_for_turn(adapter, "sess-1", Model.new("gpt-blocking"))
       end)
 
     assert_request_captured(capture_path, "model", "gpt-blocking")
 
     strict =
       Task.async(fn ->
-        try do
-          GenServer.call(
-            adapter,
-            {:apply_model_strict, "sess-1", Model.new("gpt-new", effort: "high"),
-             Model.new("gpt-old", effort: "medium"), System.monotonic_time(:millisecond) + 50}
-          )
-        catch
-          :exit, reason -> {:caller_exit, reason}
-        end
+        Adapter.apply_model_strict(
+          adapter,
+          "sess-1",
+          Model.new("gpt-new", effort: "high"),
+          Model.new("gpt-old", effort: "medium")
+        )
       end)
 
     assert {:error, :model_transport_failure} = Task.await(strict, 33_000)
-    assert {:error, :timeout} = ErrorDiagnostic.classified(Task.await(blocker, 33_000))
+    assert :ok = Task.await(blocker, 33_000)
 
     refute Enum.any?(captured_requests(capture_path), fn request ->
              request["method"] == "session/set_config_option" and

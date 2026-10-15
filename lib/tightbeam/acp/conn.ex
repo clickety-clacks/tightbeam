@@ -74,12 +74,6 @@ defmodule Tightbeam.Acp.Conn do
   """
   @spec request(conn(), String.t(), map(), keyword()) :: {:ok, term()} | {:error, term()}
   def request(conn, method, params, opts \\ []) do
-    opts =
-      case Process.get(:acp_operation_deadline) do
-        deadline when is_integer(deadline) -> Keyword.put(opts, :operation_deadline, deadline)
-        _ -> opts
-      end
-
     reply = GenServer.call(conn, {:request, method, params, opts}, :infinity)
 
     if Keyword.get(opts, :diagnostic, false),
@@ -193,20 +187,6 @@ defmodule Tightbeam.Acp.Conn do
 
   @impl true
   def handle_call({:request, method, params, opts}, {pid, _} = from, state) do
-    remaining =
-      case opts[:operation_deadline] do
-        deadline when is_integer(deadline) ->
-          max(deadline - System.monotonic_time(:millisecond), 0)
-
-        _ ->
-          :infinity
-      end
-
-    opts =
-      if remaining == :infinity,
-        do: opts,
-        else: Keyword.put(opts, :timeout, min(Keyword.get(opts, :timeout, 60_000), remaining))
-
     expired? =
       is_integer(opts[:prompt_deadline]) and
         opts[:prompt_deadline] <= System.monotonic_time(:millisecond)
@@ -215,9 +195,6 @@ defmodule Tightbeam.Acp.Conn do
       state.closed ->
         notify_not_dispatched(opts, :closed)
         {:reply, {:error, transport_failure(state, :closed, method, nil)}, state}
-
-      remaining == 0 ->
-        {:reply, {:error, transport_failure(state, :timeout, method, 0)}, state}
 
       expired? ->
         notify_not_dispatched(opts, :prompt_timeout)

@@ -123,7 +123,7 @@ defmodule Tightbeam.Acp.Adapter do
               %{status: String.t(), reason: term() | nil}}}
           | {:error, term()}
   def new_candidate_session(adapter, model, cwd, mcp_servers, guidance),
-    do: call(adapter, {:new_candidate_session, model, cwd, mcp_servers, guidance}, 30_000)
+    do: call(adapter, {:new_candidate_session, model, cwd, mcp_servers, guidance}, 60_000)
 
   # The turn path keeps each failure's diagnostic carrier. The gateway renders
   # `ErrorDiagnostic.classified/1` of it as the text the health and supervision
@@ -573,9 +573,10 @@ defmodule Tightbeam.Acp.Adapter do
 
   defp operation_budget(message) do
     case message do
-      {:new_session, _, _, _, _, :infinity} -> 60_000
-      {:load_session, _, _, _, _, _, :infinity} -> 60_000
-      {:apply_model, _, _, :infinity} -> 60_000
+      {:new_session, _, _, _, _, :infinity} -> :infinity
+      {:load_session, _, _, _, _, _, :infinity} -> :infinity
+      {:apply_model, _, _, :infinity} -> :infinity
+      {:new_candidate_session, _, _, _, _} -> :infinity
       {:switch_model_session, _, _, _, _, _} -> @boot_boundary_timeout
       {:close_session, _, _} -> 60_000
       {:close_session, _} -> 60_000
@@ -589,22 +590,19 @@ defmodule Tightbeam.Acp.Adapter do
   defp operation_key(message), do: elem(message, 1)
 
   @impl true
-  def handle_call({:session_operation, message, deadline}, from, state),
-    do: enqueue_operation(state, message, from, deadline)
-
   def handle_call(message, from, state) do
     cond do
       session_operation?(message) ->
         deadline =
           case message do
             {:apply_model_strict, _, _, _, deadline} -> deadline
-            _ -> System.monotonic_time(:millisecond) + operation_budget(message)
+            _ -> operation_deadline(operation_budget(message))
           end
 
         enqueue_operation(state, message, from, deadline)
 
       is_tuple(message) and elem(message, 0) in [:prompt, :forget_model_residency] and
-          Map.has_key?(state.operations, elem(message, 1)) ->
+          pending_session_operation?(state, elem(message, 1)) ->
         {:noreply, %{state | operation_queue: state.operation_queue ++ [{message, from, nil}]}}
 
       true ->
@@ -616,19 +614,21 @@ defmodule Tightbeam.Acp.Adapter do
     key = operation_key(message)
 
     cond do
-      deadline <= System.monotonic_time(:millisecond) ->
+      is_integer(deadline) and deadline <= System.monotonic_time(:millisecond) ->
         reason =
           if elem(message, 0) == :apply_model_strict, do: :model_transport_failure, else: :timeout
 
         GenServer.reply(from, {:error, reason})
         {:noreply, state}
 
-      Map.has_key?(state.operations, key) ->
-        Process.send_after(
-          self(),
-          {:queued_operation_expired, from},
-          max(deadline - System.monotonic_time(:millisecond), 0)
-        )
+      map_size(state.operations) > 0 ->
+        if is_integer(deadline),
+          do:
+            Process.send_after(
+              self(),
+              {:queued_operation_expired, from},
+              max(deadline - System.monotonic_time(:millisecond), 0)
+            )
 
         {:noreply,
          %{state | operation_queue: state.operation_queue ++ [{message, from, deadline}]}}
@@ -639,108 +639,144 @@ defmodule Tightbeam.Acp.Adapter do
 
         {:ok, pid} =
           Task.start_link(fn ->
-            Process.put(:acp_operation_deadline, deadline)
-
-            result =
-              try do
-                session_call(message, from, snapshot)
-              rescue
-                error -> {:reply, {:error, {:session_operation_failed, error}}, snapshot}
-              catch
-                kind, reason ->
-                  {:reply, {:error, {:session_operation_failed, {kind, reason}}}, snapshot}
-              end
-
-            send(parent, {:session_operation_done, key, self(), result})
+            {:reply, reply, after_state} = session_call(message, from, snapshot)
+            updates = operation_updates(message, reply, after_state)
+            send(parent, {:session_operation_done, key, self(), reply, updates})
           end)
 
         monitor = Process.monitor(pid)
 
         timer =
-          Process.send_after(
-            self(),
-            {:session_operation_timeout, key, pid},
-            max(deadline - System.monotonic_time(:millisecond), 0) + 100
-          )
+          if is_integer(deadline) do
+            Process.send_after(
+              self(),
+              {:session_operation_timeout, key, pid},
+              max(deadline - System.monotonic_time(:millisecond), 0)
+            )
+          end
 
-        operation = %{pid: pid, monitor: monitor, timer: timer, from: from, before: snapshot}
+        operation = %{pid: pid, monitor: monitor, timer: timer, from: from, message: message}
         {:noreply, %{state | operations: Map.put(state.operations, key, operation)}}
     end
   end
 
-  # Only changed session entries are applied. Other sessions and incoming
-  # prompt updates may have advanced while the operation was waiting.
-  defp merge_operation(state, before, after_state) do
-    Enum.reduce(
-      [
-        :known,
-        :models,
-        :unprompted,
-        :switchable_models,
-        :config_options,
-        :context_usage,
-        :chunks,
-        :progress,
-        :subagent_roots
-      ],
-      state,
-      fn field, acc ->
-        old = Map.fetch!(before, field)
-        new = Map.fetch!(after_state, field)
-        current = Map.fetch!(acc, field)
+  defp operation_deadline(:infinity), do: :infinity
+  defp operation_deadline(budget), do: System.monotonic_time(:millisecond) + budget
 
-        merged =
-          if match?(%MapSet{}, old) do
-            current
-            |> MapSet.difference(MapSet.difference(old, new))
-            |> MapSet.union(MapSet.difference(new, old))
-          else
-            Enum.reduce(Enum.uniq(Map.keys(old) ++ Map.keys(new)), current, fn sid, entries ->
-              if Map.fetch(old, sid) == Map.fetch(new, sid) do
-                entries
-              else
-                case Map.fetch(new, sid) do
-                  {:ok, value} -> Map.put(entries, sid, value)
-                  :error -> Map.delete(entries, sid)
-                end
-              end
-            end)
-          end
-
-        Map.put(acc, field, merged)
-      end
-    )
+  defp pending_session_operation?(state, sid) do
+    Map.has_key?(state.operations, sid) or
+      Enum.any?(state.operation_queue, fn {message, _, _} -> operation_key(message) == sid end)
   end
 
-  defp finish_operation(state, key, operation, reply, after_state) do
-    Process.cancel_timer(operation.timer)
-    Process.demonitor(operation.monitor, [:flush])
-    GenServer.reply(operation.from, reply)
-    state = merge_operation(state, operation.before, after_state)
-    state = %{state | operations: Map.delete(state.operations, key)}
+  defp operation_updates(message, reply, state) do
+    kind = elem(message, 0)
 
-    {ready, waiting} =
-      Enum.split_with(state.operation_queue, fn {message, _, _} ->
-        elem(message, 1) == key
+    sid =
+      case {kind, reply} do
+        {kind, {:ok, sid}}
+        when kind in [:new_session, :new_candidate_session, :switch_model_session] and
+               is_binary(sid) ->
+          sid
+
+        {kind, _} when kind in [:new_session, :new_candidate_session] ->
+          nil
+
+        _ ->
+          elem(message, 1)
+      end
+
+    residency = [
+      :known,
+      :models,
+      :context_usage,
+      :unprompted,
+      :switchable_models,
+      :config_options
+    ]
+
+    fields =
+      case {kind, reply} do
+        {:close_session, :ok} ->
+          residency ++ [:chunks, :progress]
+
+        {:close_session, _} ->
+          []
+
+        {:apply_fast, _} ->
+          [:config_options]
+
+        {kind, {:error, _}}
+        when kind in [:apply_model, :apply_model_strict, :switch_model_session] ->
+          residency
+
+        {kind, _} when kind in [:apply_model, :apply_model_strict] ->
+          [:models, :known]
+
+        _ ->
+          residency ++ [:chunks]
+      end
+
+    entries =
+      for field <- fields, not is_nil(sid), into: %{} do
+        value = Map.fetch!(state, field)
+
+        {field,
+         if(match?(%MapSet{}, value), do: MapSet.member?(value, sid), else: Map.fetch(value, sid))}
+      end
+
+    {sid, entries, kind == :close_session and reply == :ok}
+  end
+
+  defp merge_operation(state, {sid, entries, closed?}) do
+    state =
+      Enum.reduce(entries, state, fn {field, entry}, acc ->
+        current = Map.fetch!(acc, field)
+
+        value =
+          case entry do
+            true -> MapSet.put(current, sid)
+            false -> MapSet.delete(current, sid)
+            {:ok, value} -> Map.put(current, sid, value)
+            :error -> Map.delete(current, sid)
+          end
+
+        Map.put(acc, field, value)
       end)
 
-    Enum.reduce(ready, {:noreply, %{state | operation_queue: waiting}}, fn {message, from,
-                                                                            deadline},
-                                                                           {:noreply, acc} ->
-      result =
-        if deadline,
-          do: enqueue_operation(acc, message, from, deadline),
-          else: handle_call(message, from, acc)
+    if closed?,
+      do: %{state | subagent_roots: drop_subagent_root(state.subagent_roots, sid)},
+      else: state
+  end
 
-      case result do
-        {:reply, reply, next} ->
-          GenServer.reply(from, reply)
-          {:noreply, next}
+  defp finish_operation(state, key, operation, reply, updates) do
+    if operation.timer, do: Process.cancel_timer(operation.timer)
+    Process.demonitor(operation.monitor, [:flush])
+    GenServer.reply(operation.from, reply)
+    state = merge_operation(state, updates)
+    drain_operations(%{state | operations: Map.delete(state.operations, key)})
+  end
 
-        other ->
-          other
-      end
-    end)
+  defp drain_operations(%{operations: operations} = state) when map_size(operations) > 0,
+    do: {:noreply, state}
+
+  defp drain_operations(%{operation_queue: []} = state), do: {:noreply, state}
+
+  defp drain_operations(%{operation_queue: [{message, from, deadline} | rest]} = state) do
+    state = %{state | operation_queue: rest}
+
+    result =
+      if deadline,
+        do: enqueue_operation(state, message, from, deadline),
+        else: session_call(message, from, state)
+
+    case result do
+      {:reply, reply, next} ->
+        GenServer.reply(from, reply)
+        drain_operations(next)
+
+      {:noreply, next} ->
+        drain_operations(next)
+    end
   end
 
   defp session_call({:new_session, model, cwd, mcp_servers, guidance}, _from, state) do
@@ -1539,9 +1575,9 @@ defmodule Tightbeam.Acp.Adapter do
     {:noreply, %{state | operation_queue: waiting}}
   end
 
-  def handle_info({:session_operation_done, key, pid, {:reply, reply, after_state}}, state) do
+  def handle_info({:session_operation_done, key, pid, reply, updates}, state) do
     case state.operations[key] do
-      %{pid: ^pid} = operation -> finish_operation(state, key, operation, reply, after_state)
+      %{pid: ^pid} = operation -> finish_operation(state, key, operation, reply, updates)
       _ -> {:noreply, state}
     end
   end
@@ -1556,8 +1592,16 @@ defmodule Tightbeam.Acp.Adapter do
           state,
           key,
           operation,
-          {:error, :timeout},
-          drop_model_residency(operation.before, key)
+          {:error,
+           if(elem(operation.message, 0) == :apply_model_strict,
+             do: :model_transport_failure,
+             else: :timeout
+           )},
+          operation_updates(
+            operation.message,
+            {:error, :timeout},
+            drop_model_residency(state, key)
+          )
         )
 
       _ ->
