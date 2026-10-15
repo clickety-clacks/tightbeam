@@ -136,6 +136,78 @@ defmodule Tightbeam.SupervisionTest do
     }
   end
 
+  test "supervision sleeps without database calls between deadlines", ctx do
+    name = start_liveness!(ctx, sweep_ms: 60_000, name: Supervision)
+    # Flush the coalesced rearm message before tracing a quiet server.
+    :sys.get_state(name)
+    pid = Process.whereis(name)
+    assert :sys.get_state(name).deadline > System.system_time(:millisecond) + 2_000
+    :erlang.trace(pid, true, [:send, {:tracer, self()}])
+    try do
+      refute_receive {:trace, ^pid, :send, {:"$gen_call", _, _}, _}, 1_200
+    after
+      :erlang.trace(pid, false, [:send])
+    end
+  end
+
+  test "a committed turn end evaluates its session without a sweep", ctx do
+    name = start_liveness!(ctx, sweep_ms: 60_000, name: Supervision)
+    seq = terminal!(ctx.db, "holder")
+    Supervision.notify_terminal(name, "holder", seq)
+    :sys.get_state(name)
+    assert {:ok, [[^seq]]} = DB.query(ctx.db,
+      "SELECT turnSeq FROM patrol_terminal_classifications WHERE sessionKey='holder'")
+    assert Supervision.watermark(ctx.db, "holder").lastEvaluatedTerminal == seq
+  end
+
+  test "a new liveness deadline moves the timer and fires within one second", ctx do
+    name = start_liveness!(ctx, sweep_ms: 60_000, name: Supervision)
+    assignment(ctx.db, "asg_deadline", "holder", "deadline", System.system_time(:millisecond))
+    due = System.system_time(:millisecond) + 500
+    assert {:ok, :armed} = DB.transaction(ctx.db, fn txn ->
+      Supervision.transition_in_txn(txn, %{kind: "assignment_open", assignment_id: "asg_deadline",
+        opened_at: due - 60_000, principal: "user:flynn", supervision_interval_ms: 60_000})
+    end)
+    :sys.get_state(name)
+    assert eventually(fn ->
+      case DB.query(ctx.db, "SELECT generation,dueAt FROM supervision_entitlements WHERE assignmentId='asg_deadline'") do
+        {:ok, [[generation, next_due]]} -> generation > 1 and next_due > due
+        _ -> false
+      end
+    end, 140)
+    assert System.system_time(:millisecond) - due < 1_000
+  end
+
+  test "idle cleanup runs at its deadline without a periodic sweep", ctx do
+    idle_cleanup_fixture!(ctx, ["deadline-child"])
+    future = System.system_time(:millisecond) + 500
+    {:ok, _} = DB.query(ctx.db, "UPDATE sessions SET createdAt=?1,updatedAt=?1 WHERE sessionKey='deadline-child'", [future - 60_000])
+    name = start_liveness!(ctx, sweep_ms: 60_000, name: Supervision)
+    assert idle_cleanup_wakes(ctx.db) == []
+    assert eventually(fn -> idle_cleanup_wakes(ctx.db) != [] end, 140)
+    assert System.system_time(:millisecond) - future < 1_000
+    assert Process.alive?(Process.whereis(name))
+  end
+
+  test "the slow check repairs and counts a suppressed turn-end signal", ctx do
+    name = start_liveness!(ctx, sweep_ms: 60_000, name: Supervision)
+    seq = terminal!(ctx.db, "holder")
+    {:ok, _} = DB.query(ctx.db, "UPDATE turns SET endedAt=?1 WHERE seq=?2", [System.system_time(:millisecond) - 70_000, seq])
+    before = Tightbeam.SchedulerMisses.count()
+    log = ExUnit.CaptureLog.capture_log(fn ->
+      send(name, :detect_misses)
+      :sys.get_state(name)
+    end)
+    assert Tightbeam.SchedulerMisses.count() == before + 1
+    assert log =~ "event miss loop=supervision record=terminal session=holder"
+    assert Supervision.watermark(ctx.db, "holder").lastEvaluatedTerminal == seq
+    assert {:ok, [[^seq]]} = DB.query(ctx.db,
+      "SELECT turnSeq FROM patrol_terminal_classifications WHERE sessionKey='holder'")
+    send(name, :detect_misses)
+    :sys.get_state(name)
+    assert Tightbeam.SchedulerMisses.count() == before + 1
+  end
+
   test "schema and neutral row APIs expose the exact durable state", ctx do
     assert Assignments.oldest_open(ctx.db, "holder").id == "asg_1"
     assert Assignments.attest_count(ctx.db, "asg_1") == 0

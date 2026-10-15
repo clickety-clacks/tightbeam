@@ -293,6 +293,7 @@ defmodule Tightbeam.Org do
 
   @doc false
   def put_setting_projected_in_txn(%Txn{} = txn, key, value) do
+    Tightbeam.Supervision.deadlines_changed_in_txn(txn)
     if key == "default-archetype", do: Txn.assert_archetype_available!(txn, value)
 
     updated_at = now()
@@ -413,6 +414,7 @@ defmodule Tightbeam.Org do
   @doc false
   @spec create_in_txn(Txn.t(), map()) :: session()
   def create_in_txn(%Txn{} = txn, input) do
+    Tightbeam.Supervision.deadlines_changed_in_txn(txn)
     Txn.assert_archetype_available!(txn, Map.fetch!(input, :archetype))
 
     session_key =
@@ -1644,6 +1646,7 @@ defmodule Tightbeam.Org do
   end
 
   defp publish_session_in_txn(txn, class, session) do
+    Tightbeam.Supervision.deadlines_changed_in_txn(txn)
     Publisher.committed_in_txn(txn, class, session, %{
       "sessionKey" => session.session_key
     })

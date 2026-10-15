@@ -12,6 +12,11 @@ defmodule Tightbeam.Supervision do
   honestly. The turn-end schedule (`@turn_end_schedule`) is the machine's
   CONFLICT-RESOLUTION STRATEGY: several productions could fire when a turn
   ends, so they hold a fixed priority order and the first act wins the cycle.
+
+  Temporary 0.1.9 scheduling replaces the one-second six-job sweep with the
+  existing turn-end hook, one earliest-deadline timer and a three-minute miss
+  check. The 0.1.10 supervision core redesign should remove this scheduling
+  machinery, retaining the turn-end hook only if its new deadlines need it.
   """
 
   use GenServer
@@ -204,6 +209,9 @@ defmodule Tightbeam.Supervision do
 
   @spec request_sweep(GenServer.server()) :: :ok
   def request_sweep(server \\ __MODULE__), do: GenServer.cast(server, :sweep)
+
+  @doc false
+  def deadlines_changed_in_txn(txn), do: Txn.handoff(txn, __MODULE__, :deadlines_changed)
 
   @spec ensure_schema(DB.server()) :: :ok
   def ensure_schema(db \\ DB) do
@@ -693,7 +701,12 @@ defmodule Tightbeam.Supervision do
           | {:armed, pos_integer()}
           | {:admit, String.t()}
           | {:error, term()}
-  def transition_in_txn(%Txn{} = txn, %{
+  def transition_in_txn(txn, observation) do
+    deadlines_changed_in_txn(txn)
+    do_transition_in_txn(txn, observation)
+  end
+
+  defp do_transition_in_txn(%Txn{} = txn, %{
         kind: "assignment_open",
         assignment_id: assignment_id,
         opened_at: opened_at,
@@ -719,7 +732,7 @@ defmodule Tightbeam.Supervision do
     result
   end
 
-  def transition_in_txn(%Txn{} = txn, %{
+  defp do_transition_in_txn(%Txn{} = txn, %{
         kind: "terminal_disposition",
         assignment_id: assignment_id,
         cause: cause,
@@ -731,7 +744,7 @@ defmodule Tightbeam.Supervision do
     :terminal_disposition
   end
 
-  def transition_in_txn(%Txn{} = txn, %{
+  defp do_transition_in_txn(%Txn{} = txn, %{
         kind: "checkpoint_scheduled",
         wake_id: wake_id,
         creator_session_key: creator_session_key
@@ -774,7 +787,7 @@ defmodule Tightbeam.Supervision do
     end
   end
 
-  def transition_in_txn(%Txn{} = txn, %{
+  defp do_transition_in_txn(%Txn{} = txn, %{
         kind: "parent_target_retired",
         session_key: session_key,
         retirement_epoch: retirement_epoch,
@@ -804,7 +817,7 @@ defmodule Tightbeam.Supervision do
     end
   end
 
-  def transition_in_txn(%Txn{} = txn, %{
+  defp do_transition_in_txn(%Txn{} = txn, %{
         kind: "parent_elevated",
         assignment_id: assignment_id,
         wake_id: wake_id,
@@ -834,7 +847,7 @@ defmodule Tightbeam.Supervision do
     :parent_elevated
   end
 
-  def transition_in_txn(%Txn{} = txn, %{
+  defp do_transition_in_txn(%Txn{} = txn, %{
         kind: "controller_scheduled",
         wake_id: wake_id,
         assignment_id: assignment_id,
@@ -915,7 +928,7 @@ defmodule Tightbeam.Supervision do
     end
   end
 
-  def transition_in_txn(%Txn{} = txn, %{
+  defp do_transition_in_txn(%Txn{} = txn, %{
         kind: "policy_denied",
         assignment_id: assignment_id,
         event_id: event_id,
@@ -1012,7 +1025,7 @@ defmodule Tightbeam.Supervision do
     end
   end
 
-  def transition_in_txn(
+  defp do_transition_in_txn(
         %Txn{} = txn,
         %{
           kind: "controller_fire",
@@ -1106,7 +1119,7 @@ defmodule Tightbeam.Supervision do
     end
   end
 
-  def transition_in_txn(%Txn{}, _observation), do: :duplicate
+  defp do_transition_in_txn(%Txn{}, _observation), do: :duplicate
 
   @doc false
   def rebind_not_dispatched_source_in_txn(%Txn{} = txn, source, successor, turn, evidence) do
@@ -1835,37 +1848,28 @@ defmodule Tightbeam.Supervision do
       handlers: Keyword.fetch!(opts, :handlers),
       n: Keyword.fetch!(opts, :prod_limit),
       sweep_ms: Keyword.get(opts, :sweep_ms),
-      delivery_opts: Keyword.take(opts, [:conn_registry, :lane_manager])
+      delivery_opts: Keyword.take(opts, [:conn_registry, :lane_manager]),
+      deadline_timer: nil,
+      deadline: nil,
+      rearm_pending: false
     }
 
     :ok = activate_failure_patrol(state.db)
     if Keyword.get(opts, :recover, true), do: recover_liveness(state)
-    schedule_sweep(state.sweep_ms)
+    Process.send_after(self(), :detect_misses, 180_000)
     {:ok, state, {:continue, :initial_sweep}}
   end
 
   @impl true
   def handle_continue(:initial_sweep, state) do
     DB.background_pass(fn -> sweep(state) end)
-    {:noreply, state}
+    {:noreply, arm_deadline(state)}
   end
 
   @impl true
   def handle_cast({:terminal, session_key, terminal_seq}, state) do
-    safe_evaluate(state, session_key, fn ->
-      :ok = classify_terminal(state.db, terminal_seq)
-
-      evaluate_with_interval(
-        state.db,
-        state.handlers,
-        state.n,
-        session_key,
-        terminal_seq,
-        state.sweep_ms
-      )
-    end)
-
-    {:noreply, state}
+    evaluate_ended_session(state, session_key, terminal_seq)
+    {:noreply, arm_deadline(state)}
   end
 
   def handle_cast({:retired, session_key}, state) do
@@ -1875,19 +1879,54 @@ defmodule Tightbeam.Supervision do
       notify_stranded_ancestor(state, session_key)
     end)
 
-    {:noreply, state}
+    {:noreply, arm_deadline(state)}
   end
 
   def handle_cast(:sweep, state) do
     DB.background_pass(fn -> sweep(state) end)
-    {:noreply, state}
+    {:noreply, arm_deadline(state)}
+  end
+
+  def handle_cast(:deadlines_changed, %{rearm_pending: true} = state), do: {:noreply, state}
+
+  def handle_cast(:deadlines_changed, state) do
+    send(self(), :rearm_deadline)
+    {:noreply, %{state | rearm_pending: true}}
   end
 
   @impl true
-  def handle_info(:scheduled_sweep, state) do
-    DB.background_pass(fn -> sweep(state) end)
-    schedule_sweep(state.sweep_ms)
-    {:noreply, state}
+  def handle_info(:rearm_deadline, state) do
+    {:noreply, arm_deadline(%{state | rearm_pending: false})}
+  end
+
+  def handle_info({:timeout, ref, :supervision_due}, %{deadline_timer: ref} = state) do
+    DB.background_pass(fn ->
+      liveness_cycle(state, MapSet.new())
+      idle_cleanup_sweep(state)
+    end)
+
+    {:noreply, arm_deadline(%{state | deadline_timer: nil, deadline: nil})}
+  end
+
+  def handle_info({:timeout, _ref, :supervision_due}, state), do: {:noreply, state}
+
+  def handle_info(:detect_misses, state) do
+    DB.background_pass(fn ->
+      detect_misses(state)
+      sweep(state)
+    end)
+
+    Process.send_after(self(), :detect_misses, 180_000)
+    {:noreply, arm_deadline(state)}
+  end
+
+  defp evaluate_ended_session(state, session_key, terminal_seq) do
+    safe_evaluate(state, session_key, fn ->
+      :ok = classify_terminal(state.db, terminal_seq)
+      evaluate_with_interval(state.db, state.handlers, state.n, session_key, terminal_seq, state.sweep_ms)
+      liveness_cycle(state, MapSet.new(), session_key)
+      drain(state.db, state.handlers, session_key)
+    end)
   end
 
   # Recognize, then act: the production's complete LHS is evaluated once, at
@@ -3716,7 +3755,9 @@ defmodule Tightbeam.Supervision do
     end
   end
 
-  defp liveness_cycle(%{sweep_ms: interval} = state, terminal_rebases)
+  defp liveness_cycle(state, terminal_rebases, session_key \\ nil)
+
+  defp liveness_cycle(%{sweep_ms: interval} = state, terminal_rebases, session_key)
        when is_integer(interval) and interval > 0 do
     evaluation_clock = now()
 
@@ -3733,8 +3774,10 @@ defmodule Tightbeam.Supervision do
             JOIN assignments a ON a.id=e.assignmentId
             JOIN sessions s ON s.sessionKey=a.holderKey
             WHERE e.state IN ('armed','claimed') AND a.state='open' AND s.state='active'
+              AND (?1 IS NULL OR a.holderKey=?1)
             ORDER BY a.openedAt, a.id
-            """
+            """,
+            [session_key]
           )
 
         rebased =
@@ -3749,7 +3792,7 @@ defmodule Tightbeam.Supervision do
             end
           end)
 
-        claim_due_in_txn(txn, evaluation_clock, rebased, state.n)
+        claim_due_in_txn(txn, evaluation_clock, rebased, state.n, session_key)
       end)
 
     case outcome do
@@ -3764,7 +3807,7 @@ defmodule Tightbeam.Supervision do
     end
   end
 
-  defp liveness_cycle(_state, _terminal_rebases), do: :ok
+  defp liveness_cycle(_state, _terminal_rebases, _session_key), do: :ok
 
   defp absorb_liveness_receipts_in_txn(
          txn,
@@ -4112,7 +4155,7 @@ defmodule Tightbeam.Supervision do
     max(accepted_at, latest_source) + interval
   end
 
-  defp claim_due_in_txn(txn, evaluation_clock, rebased, n) do
+  defp claim_due_in_txn(txn, evaluation_clock, rebased, n, session_key) do
     candidates =
       Txn.q(
         txn,
@@ -4124,10 +4167,11 @@ defmodule Tightbeam.Supervision do
         JOIN assignments a ON a.id=e.assignmentId
         JOIN sessions s ON s.sessionKey=a.holderKey
         WHERE e.state='armed' AND e.dueAt <= ?1
+          AND (?2 IS NULL OR a.holderKey=?2)
           AND a.state='open' AND s.state='active'
         ORDER BY e.dueAt, a.openedAt, a.id
         """,
-        [evaluation_clock]
+        [evaluation_clock, session_key]
       )
 
     Enum.reduce_while(candidates, :not_due, fn
@@ -4425,7 +4469,8 @@ defmodule Tightbeam.Supervision do
          session,
          snapshot_at,
          sessions,
-         ignored_wake
+         ignored_wake,
+         include_future \\ false
        ) do
     with true <- session.state == "active" and not session.built_in,
          true <- idle_cleanup_enabled?(session.archetype),
@@ -4446,7 +4491,7 @@ defmodule Tightbeam.Supervision do
          {:ok, custody} <- idle_cleanup_custody_in_txn(txn, last_assignment),
          {:ok, priority} <- idle_cleanup_priority_in_txn(txn, last_assignment),
          {:ok, threshold} <- idle_cleanup_horizon_in_txn(txn, priority),
-         true <- snapshot_at - activity.at >= threshold do
+         true <- include_future or snapshot_at - activity.at >= threshold do
       {parent_group, parent_invalid} = idle_cleanup_parent_group(session, sessions)
 
       gate = HarnessHealth.prod_shape_gate_in_txn(txn, session.harness, session.host, snapshot_at)
@@ -4481,6 +4526,7 @@ defmodule Tightbeam.Supervision do
         parent_group: parent_group,
         group_digest: group_digest,
         parent_invalid: parent_invalid,
+        due_at: max(activity.at + threshold, (last_delivered_at || 0) + threshold),
         due: is_nil(last_delivered_at) or snapshot_at - last_delivered_at >= threshold,
         harness_available: gate == :available
       }
@@ -4822,24 +4868,7 @@ defmodule Tightbeam.Supervision do
         :pending
 
       true ->
-        requested_depth =
-          due_members
-          |> Enum.map(
-            &max(idle_cleanup_requested_depth(&1.delivered_count, n), &1.delivered_depth)
-          )
-          |> Enum.max()
-
-        owner = hd(due_members).owner_user_id
-
-        route_group =
-          if Enum.any?(due_members, & &1.delivered_main),
-            do: "owner-main:" <> owner,
-            else: parent_group
-
-        route_depth =
-          if Enum.any?(due_members, & &1.delivered_main),
-            do: due_members |> Enum.map(& &1.delivered_depth) |> Enum.max(),
-            else: requested_depth
+        {owner, route_group, route_depth} = idle_cleanup_route(due_members, parent_group, n)
 
         case idle_cleanup_target(sessions, dormant, owner, route_group, route_depth) do
           nil ->
@@ -4929,6 +4958,29 @@ defmodule Tightbeam.Supervision do
             result
         end
     end
+  end
+
+  defp idle_cleanup_route(due_members, parent_group, n) do
+        requested_depth =
+          due_members
+          |> Enum.map(
+            &max(idle_cleanup_requested_depth(&1.delivered_count, n), &1.delivered_depth)
+          )
+          |> Enum.max()
+
+        owner = hd(due_members).owner_user_id
+
+        route_group =
+          if Enum.any?(due_members, & &1.delivered_main),
+            do: "owner-main:" <> owner,
+            else: parent_group
+
+        route_depth =
+          if Enum.any?(due_members, & &1.delivered_main),
+            do: due_members |> Enum.map(& &1.delivered_depth) |> Enum.max(),
+            else: requested_depth
+
+    {owner, route_group, route_depth}
   end
 
   defp idle_cleanup_requested_depth(delivered_count, n) when is_integer(n) and n > 0,
@@ -5548,10 +5600,97 @@ defmodule Tightbeam.Supervision do
       )
   end
 
-  defp schedule_sweep(sweep_ms) when is_integer(sweep_ms) and sweep_ms > 0,
-    do: Process.send_after(self(), :scheduled_sweep, sweep_ms)
+  # Temporary deadline calculation uses the same eligibility and gate decisions
+  # as the old sweep. Gated, overdue work waits for a fact change or turn end.
+  defp deadline_rows(state) do
+    transaction!(state.db, fn txn ->
+      liveness =
+        Txn.q(txn, """
+        SELECT e.assignmentId,a.holderKey,e.dueAt
+        FROM supervision_entitlements e JOIN assignments a ON a.id=e.assignmentId
+        JOIN sessions s ON s.sessionKey=a.holderKey
+        WHERE e.state='armed' AND a.state='open' AND s.state='active'
+        ORDER BY e.dueAt
+        """)
+        |> Enum.reject(fn [id, holder, _due] ->
+          owner_child_prod_active_in_txn?(txn, holder) or due_gate?(txn, id, holder)
+        end)
+        |> Enum.map(fn [_id, holder, due] -> {:liveness, holder, due} end)
 
-  defp schedule_sweep(_sweep_ms), do: :ok
+      sessions = idle_cleanup_sessions_in_txn(txn)
+      candidates =
+        sessions
+        |> Map.values()
+        |> Enum.map(&idle_cleanup_candidate_in_txn(txn, &1, now(), sessions, nil, true))
+        |> Enum.reject(&is_nil/1)
+        |> Enum.filter(fn candidate ->
+          candidate.harness_available and not idle_cleanup_pending_group_in_txn(txn, candidate.group_digest)
+        end)
+
+      dormant = candidates |> Enum.filter(&(&1.age_ms >= &1.threshold)) |> Enum.map(& &1.session_key) |> MapSet.new()
+      idle =
+        candidates
+        |> Enum.group_by(& &1.parent_group)
+        |> Enum.flat_map(fn {group, members} ->
+          {owner, route_group, depth} = idle_cleanup_route(members, group, state.n)
+          case idle_cleanup_target(sessions, dormant, owner, route_group, depth) do
+            {target, _} ->
+              if HarnessHealth.prod_shape_gate_in_txn(txn, target.harness, target.host, now()) == :available do
+                Enum.map(members, &{:idle_cleanup, &1.session_key, &1.due_at})
+              else
+                []
+              end
+            nil -> []
+          end
+        end)
+
+      liveness ++ idle
+    end)
+  end
+
+  defp arm_deadline(%{sweep_ms: interval} = state) when is_integer(interval) and interval > 0 do
+    DB.background_pass(fn ->
+      due = deadline_rows(state) |> Enum.map(&elem(&1, 2)) |> Enum.min(fn -> nil end)
+      if state.deadline_timer, do: Process.cancel_timer(state.deadline_timer)
+      ref = if due, do: :erlang.start_timer(max(0, due - now()), self(), :supervision_due)
+      %{state | deadline_timer: ref, deadline: due}
+    end, state)
+  end
+
+  defp arm_deadline(state), do: state
+
+  defp detect_misses(state) do
+    # Both durable classification and obligation watermarks acknowledge the
+    # existing turn-end signal. No new cursor or acknowledgement table.
+    {:ok, rows} = DB.query(state.db, """
+    SELECT t.sessionKey,t.seq,t.endedAt FROM turns t
+    WHERE t.endedAt IS NOT NULL AND (
+      (t.seq >= (SELECT firstTurnSeq FROM patrol_failure_boundary WHERE id=0)
+       AND NOT EXISTS (SELECT 1 FROM patrol_terminal_classifications c WHERE c.turnSeq=t.seq))
+      OR (t.seq=(SELECT MAX(last.seq) FROM turns last
+                WHERE last.sessionKey=t.sessionKey AND last.endedAt IS NOT NULL)
+          AND EXISTS (SELECT 1 FROM assignments a
+                      LEFT JOIN supervision_watermarks p ON p.assignmentId=a.id AND p.sessionKey=a.holderKey
+                      WHERE a.holderKey=t.sessionKey AND a.state='open'
+                        AND (p.lastEvaluatedTerminal IS NULL OR p.lastEvaluatedTerminal<t.seq)))
+    ) ORDER BY t.seq LIMIT 256
+    """)
+
+    Enum.each(rows, fn [session, seq, ended_at] ->
+      if ended_at < now() - 60_000 do
+        Tightbeam.SchedulerMisses.record(:supervision, "terminal session=#{session} turn=#{seq}", now() - ended_at)
+      end
+      evaluate_ended_session(state, session, seq)
+    end)
+
+    if is_integer(state.sweep_ms) and state.sweep_ms > 0 do
+      Enum.each(deadline_rows(state), fn {job, session, due} ->
+        if due < now() - 60_000 do
+          Tightbeam.SchedulerMisses.record(:supervision, "#{job} session=#{session}", now() - due)
+        end
+      end)
+    end
+  end
 
   defp safe_evaluate(state, session_key, fun) do
     DB.background_pass(fn -> evaluate_pass(state, session_key, fun) end)
