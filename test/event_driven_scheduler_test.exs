@@ -303,10 +303,13 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
     refute_receive :attempted, 100
 
     later = System.system_time(:millisecond) + 60_000
-    {:ok, :ok} = DB.transaction(ctx.db, fn txn ->
-      DB.Txn.q(txn, "UPDATE wakes SET dueAt=?2 WHERE wakeId=?1", [scheduled.wake_id, later])
-      Wakes.schedule_changed_in_txn(txn, {:schedule_changed, later})
-    end)
+
+    {:ok, :ok} =
+      DB.transaction(ctx.db, fn txn ->
+        DB.Txn.q(txn, "UPDATE wakes SET dueAt=?2 WHERE wakeId=?1", [scheduled.wake_id, later])
+        Wakes.schedule_changed_in_txn(txn, {:schedule_changed, later})
+      end)
+
     Wakes.fire_due(pid)
     state = :sys.get_state(pid)
     assert state.retries == %{}
@@ -322,8 +325,13 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
     due = System.system_time(:millisecond) + 60_000
     digest = wake(ctx.db, due, %{digest: true})
     boundary = wake(ctx.db, due, %{delivery_rule: "turn-boundary-digest r1"})
-    {:ok, _} = DB.query(ctx.db, "UPDATE wakes SET deliveryRule=?2 WHERE wakeId=?1",
-      [boundary.wake_id, "turn-boundary-digest r1"])
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE wakes SET deliveryRule=?2 WHERE wakeId=?1", [
+        boundary.wake_id,
+        "turn-boundary-digest r1"
+      ])
+
     unrecognized = wake(ctx.db, due)
     after_turn = wake(ctx.db, due)
 

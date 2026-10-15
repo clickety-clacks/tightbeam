@@ -121,11 +121,13 @@ defmodule Tightbeam.RailRemedyTest do
     Process.sleep(150)
     timer = :sys.get_state(pid).timer
     :erlang.trace(pid, true, [:send, {:tracer, self()}])
+
     try do
       refute_receive {:trace, ^pid, :send, {:"$gen_call", _, _}, _}, 1_200
     after
       :erlang.trace(pid, false, [:send])
     end
+
     refute_receive {:reassessed, _}, 0
     assert :sys.get_state(pid).timer == timer
 
