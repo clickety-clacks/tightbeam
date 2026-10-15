@@ -2211,7 +2211,8 @@ defmodule Tightbeam.Acp.AdapterTest do
       :sys.replace_state(adapter, fn state ->
         %{
           state
-          | on_guidance: fn _, _ ->
+          | models: %{"sess-1" => Model.new("haiku")},
+            on_guidance: fn _, _ ->
               send(owner, {:guidance_started, self()})
 
               receive do
@@ -2243,7 +2244,8 @@ defmodule Tightbeam.Acp.AdapterTest do
 
       during = :sys.get_state(adapter)
       send(worker, :continue)
-      assert {:ok, "sess-1"} = Task.await(caller, 5_000)
+      expected = if @operation == :new, do: "sess-1", else: :unknown
+      assert {:ok, ^expected} = Task.await(caller, 5_000)
       after_setup = :sys.get_state(adapter)
       assert after_setup.context_usage["sess-1"] == during.context_usage["sess-1"]
       assert {:ok, %{used: 3000, size: 10000}} = after_setup.context_usage["sess-1"]
