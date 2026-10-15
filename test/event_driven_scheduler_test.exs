@@ -111,7 +111,7 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
              DB.transaction(ctx.db, fn txn ->
                DB.Txn.q(txn, "UPDATE wakes SET dueAt=?2 WHERE wakeId=?1", [scheduled.wake_id, due])
 
-               Wakes.schedule_changed_in_txn(txn)
+               Wakes.schedule_changed_in_txn(txn, {:schedule_changed, due})
              end)
 
     assert_receive {:delivered, id, fired_at}, 1_250

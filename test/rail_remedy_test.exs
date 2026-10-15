@@ -74,6 +74,38 @@ defmodule Tightbeam.RailRemedyTest do
     %{db: db, base_dir: base_dir, handlers: handlers, holder: holder, reviewer: reviewer}
   end
 
+  test "an open review episode sleeps until readiness or a verdict", ctx do
+    assignment = notice_assignment(ctx, "event reassessment")
+    fire_review_notice(ctx, assignment)
+    parent = self()
+    consumer = fn wake ->
+      send(parent, {:reassessed, wake.wake_id})
+      RailRemedy.reconcile_notice(ctx.db, %{}, wake)
+    end
+    pid = start_supervised!({Wakes, db: ctx.db, name: nil,
+      deliver: fn _ -> :skipped end,
+      internal_consumers: %{"review_remedy_reconcile" => consumer}})
+    assert_receive {:reassessed, _}, 1_000
+    # Finish the pass and its committed scheduling hooks.
+    :sys.get_state(pid)
+    :sys.get_state(pid)
+    episode = RailRemedy.episode(ctx.db, "completion-requires-review", assignment.id)
+    parked = episode.notice_state["reassessment"]["wakeId"]
+    assert Wakes.get(ctx.db, parked).due_at == 253402300799000
+    refute_receive {:reassessed, _}, 1_200
+    assert :sys.get_state(pid).timer == nil
+
+    Wakes.recipient_ready(pid, ctx.holder.session_key)
+    assert_receive {:reassessed, ^parked}, 1_000
+    :sys.get_state(pid)
+    episode = RailRemedy.episode(ctx.db, "completion-requires-review", assignment.id)
+    next = episode.notice_state["reassessment"]["wakeId"]
+    assert {:ok, :ok} = DB.transaction(ctx.db, fn txn ->
+      Wakes.schedule_changed_in_txn(txn, :review_remedy_changed)
+    end)
+    assert_receive {:reassessed, ^next}, 1_000
+  end
+
   test "review notice retargets one pending unroutable attempt", ctx do
     assignment = notice_assignment(ctx, "retarget pending notice")
 

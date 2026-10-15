@@ -6296,17 +6296,7 @@ defmodule Tightbeam.Wakes do
   @doc false
   # The DB owner retains this runtime destination until it exits. A scheduler
   # restart replaces it; the existing outbox sends only after a successful commit.
-  def schedule_changed_in_txn(%Txn{} = txn, message \\ :schedule_changed) do
-    message =
-      if message == :schedule_changed do
-        case Txn.q(txn, "SELECT MIN(dueAt) FROM wakes WHERE state='pending' AND dueAt<253402300799000") do
-          [[due_at]] when is_integer(due_at) -> {:schedule_changed, due_at}
-          _ -> {:schedule_changed, nil}
-        end
-      else
-        message
-      end
-
+  def schedule_changed_in_txn(%Txn{} = txn, message) do
     Txn.handoff(txn, Process.get({__MODULE__, :scheduler}, Tightbeam.WakeScheduler), message)
   end
 
@@ -7216,15 +7206,14 @@ defmodule Tightbeam.Wakes do
     if canceled, do: best_effort_lifecycle(db, "wake_undeliverable", wake.wake_id, reason)
   end
 
-  # An internal consumer that RAISES keeps its wake pending, so the next tick
-  # retries it — correct, because a consumer can fail transiently and succeed
-  # later. What was wrong is that it retried in total silence: the `false` an
-  # internal delivery returns is discarded by the prompt-only `mark_fired` guard
-  # below, so a consumer raising on every tick was indistinguishable from an idle
-  # scheduler. One row per failed attempt, so the repetition is itself visible.
+  # Keep failed internal work pending and record each attempt. The scheduler
+  # retries it with an in-memory deadline rather than scanning it on a tick.
   defp attempt_internal_delivery(db, wake, internal_consumer) do
-    internal_consumer.(wake)
-    true
+    case internal_consumer.(wake) do
+      {:error, reason} -> internal_delivery_failed(db, wake, inspect(reason))
+      result when result in [false, :retry] -> internal_delivery_failed(db, wake, inspect(result))
+      _ -> true
+    end
   rescue
     error -> internal_delivery_failed(db, wake, Exception.message(error))
   catch

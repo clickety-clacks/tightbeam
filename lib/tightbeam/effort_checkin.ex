@@ -1204,7 +1204,13 @@ defmodule Tightbeam.EffortCheckin do
       [work_item_id, horizon]
     )
 
-    Wakes.schedule_changed_in_txn(txn)
+    [[due_at]] = Txn.q(txn, """
+    SELECT MIN(w.dueAt) FROM wakes w
+    JOIN effort_checkin_generations g ON g.wakeId=w.wakeId
+    JOIN assignments a ON a.id=g.assignmentId
+    WHERE a.workItemId=?1 AND a.state='open' AND g.state='armed' AND w.state='pending'
+    """, [work_item_id])
+    Wakes.schedule_changed_in_txn(txn, {:schedule_changed, due_at})
     :ok
   end
 

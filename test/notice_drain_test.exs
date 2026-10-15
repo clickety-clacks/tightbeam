@@ -101,7 +101,7 @@ defmodule Tightbeam.NoticeDrainTest do
                  System.system_time(:millisecond) - 1
                ])
 
-               Wakes.schedule_changed_in_txn(txn)
+               Wakes.schedule_changed_in_txn(txn, {:schedule_changed, System.system_time(:millisecond) - 1})
              end)
 
     await_delivery(ctx.db, due.wake_id)
@@ -320,6 +320,7 @@ defmodule Tightbeam.NoticeDrainTest do
   end
 
   test "the miss detector drains overdue notices and leaves future notices alone", ctx do
+    before = Tightbeam.SchedulerMisses.count()
     future = notice(ctx.db, System.system_time(:millisecond) + 60_000)
 
     scheduler =
@@ -351,7 +352,7 @@ defmodule Tightbeam.NoticeDrainTest do
 
     send(scheduler, :detect_misses)
     :sys.get_state(scheduler)
-    assert Wakes.health(scheduler) == %{misses: 1}
+    assert Tightbeam.SchedulerMisses.count() - before == 1
     assert Wakes.get(ctx.db, due.wake_id).state == "fired"
     assert Wakes.get(ctx.db, future.wake_id).state == "pending"
   end

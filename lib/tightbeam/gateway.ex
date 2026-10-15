@@ -1974,7 +1974,6 @@ defmodule Tightbeam.Gateway do
 
     case result do
       {:ok, {:staged, _wake}} ->
-
         :queued
 
       {:ok, delivery} ->
