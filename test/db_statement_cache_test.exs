@@ -22,14 +22,17 @@ defmodule Tightbeam.DBStatementCacheTest do
     assert DB.statement_cache_size(conn) == 1
   end
 
-  test "statements beyond the per-connection bound run uncached", %{conn: conn} do
-    for value <- 1..100 do
+  test "a full cache releases its statements and starts caching recent queries", %{conn: conn} do
+    for value <- 1..64 do
       assert [[expected]] = DB.run_query(conn, "SELECT #{value} + ?1", [1])
       assert expected == value + 1
     end
 
     assert DB.statement_cache_size(conn) == 64
-    assert [[2]] = DB.run_query(conn, "SELECT 1 + ?1", [1])
-    assert DB.statement_cache_size(conn) == 64
+    assert [[1_001]] = DB.run_query(conn, "SELECT 1000 + ?1", [1])
+    assert DB.statement_cache_size(conn) == 1
+
+    assert [[1_002]] = DB.run_query(conn, "SELECT 1000 + ?1", [2])
+    assert DB.statement_cache_size(conn) == 1
   end
 end

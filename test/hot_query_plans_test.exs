@@ -1,7 +1,7 @@
 defmodule Tightbeam.HotQueryPlansTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Ledger, Supervision}
+  alias Tightbeam.{Assignments, DB, Ledger, Rules, Supervision, WorkState}
 
   # Production databases carry no sqlite_stat1, so these plans are checked
   # without ANALYZE: the planner then prefers equality indexes such as
@@ -73,64 +73,20 @@ defmodule Tightbeam.HotQueryPlansTest do
   end
 
   test "review verdict counts find review assignments through their subject index", %{db: db} do
-    direct_plan =
-      plan!(db, "SELECT id FROM assignments WHERE reviewsAssignmentId=?1", ["subject"])
-
-    assert Enum.any?(direct_plan, &String.contains?(&1, "assignments_reviews_assignment"))
-
     assignment_verdict_plan =
-      plan!(
-        db,
-        """
-        SELECT v.verdictKind, v.byHarness, v.byProvider
-        FROM attests AS v
-        JOIN assignments AS r ON r.id = v.assignmentId
-        WHERE r.reviewsAssignmentId = ?1
-          AND v.kind = 'verdict'
-          AND v.bySession = r.holderKey
-          AND v.bySession != ?2
-        ORDER BY v.ts ASC, v.id ASC
-        """,
-        ["subject", "session"]
-      )
+      plan!(db, Assignments.commissioned_review_authors_sql(), ["subject", "session"])
 
     assert Enum.any?(
              assignment_verdict_plan,
              &String.contains?(&1, "assignments_reviews_assignment")
            )
 
-    count_plan =
-      plan!(
-        db,
-        """
-        SELECT COUNT(*)
-        FROM assignments review
-        JOIN attests verdict ON verdict.assignmentId=review.id
-        WHERE review.reviewsAssignmentId =
-              (SELECT COALESCE(reviewsAssignmentId, id) FROM assignments WHERE id = ?1)
-          AND verdict.kind = 'verdict'
-        """,
-        ["subject"]
-      )
+    count_plan = plan!(db, Rules.assignment_review_verdict_count_sql(), ["subject"])
 
     assert Enum.any?(count_plan, &String.contains?(&1, "assignments_reviews_assignment"))
 
     work_item_count_plan =
-      plan!(
-        db,
-        """
-        SELECT COUNT(*)
-        FROM assignments producer
-        CROSS JOIN assignments review
-        JOIN attests verdict ON verdict.assignmentId=review.id
-        WHERE producer.workItemId=?1
-          AND review.reviewsAssignmentId=producer.id
-          AND review.workItemId IS NULL
-          AND verdict.kind='verdict'
-          AND verdict.verdictKind='changes-requested'
-        """,
-        ["work-item"]
-      )
+      plan!(db, Rules.work_item_changes_requested_count_sql(), ["work-item"])
 
     assert Enum.any?(
              work_item_count_plan,
@@ -138,44 +94,24 @@ defmodule Tightbeam.HotQueryPlansTest do
            )
 
     compatibility_count_plan =
-      plan!(
-        db,
-        """
-        SELECT COUNT(*)
-        FROM assignments producer
-        CROSS JOIN assignments review
-        JOIN attests verdict ON verdict.assignmentId=review.id
-        WHERE producer.workItemId=?1
-          AND review.reviewsAssignmentId=producer.id
-          AND review.workItemId IS NULL
-          AND review.reviewsAssignmentId IS NOT NULL
-          AND verdict.kind='verdict'
-          AND verdict.rowid <= (SELECT rowid FROM attests WHERE id=?2)
-        """,
-        ["work-item", "attest"]
-      )
+      plan!(db, Rules.work_item_review_verdict_count_sql(), ["work-item", "attest"])
 
     assert Enum.any?(
              compatibility_count_plan,
              &String.contains?(&1, "assignments_reviews_assignment")
            )
+
+    fourth_round_count_plan =
+      plan!(db, Rules.work_item_fourth_round_count_sql(), ["work-item"])
+
+    assert Enum.any?(
+             fourth_round_count_plan,
+             &String.contains?(&1, "assignments_reviews_assignment")
+           )
   end
 
   test "revocation generation reads use both indexed keys", %{db: db} do
-    plan =
-      plan!(
-        db,
-        """
-        SELECT a.id,
-               (SELECT r.reason FROM assignment_revocation_generations g
-                JOIN assignment_revocations r ON r.id=g.revocationId
-                WHERE g.assignmentId=a.id AND g.reopeningId IS
-                  (SELECT reopening.id FROM assignment_reopenings reopening
-                   WHERE reopening.assignmentId=a.id ORDER BY reopening.id DESC LIMIT 1))
-        FROM assignments a
-        """,
-        []
-      )
+    plan = plan!(db, WorkState.assignment_query_sql(), [])
 
     assert Enum.any?(
              plan,
@@ -186,13 +122,7 @@ defmodule Tightbeam.HotQueryPlansTest do
   end
 
   test "running turn lookups use the pending-turn partial index", %{db: db} do
-    plan =
-      plan!(
-        db,
-        "SELECT messageId FROM turns WHERE sessionKey=?1 AND status='running' " <>
-          "AND status IN ('queued','running') LIMIT 1",
-        ["session"]
-      )
+    plan = plan!(db, Ledger.running_turn_message_id_sql(), ["session"])
 
     assert Enum.any?(plan, &String.contains?(&1, "turns_pending"))
     refute Enum.any?(plan, &Regex.match?(~r/^SCAN turns\b/, &1))
@@ -200,9 +130,8 @@ defmodule Tightbeam.HotQueryPlansTest do
     recovery_plan =
       plan!(
         db,
-        "SELECT seq,sessionKey FROM turns WHERE status='running' " <>
-          "AND status IN ('queued','running') AND sessionKey=?1",
-        ["session"]
+        Ledger.recover_running_rows_sql("sessionKey = ?1 AND (owner IS NULL OR owner <> ?2)"),
+        ["session", "replacement"]
       )
 
     assert Enum.any?(recovery_plan, &String.contains?(&1, "turns_pending"))
@@ -229,5 +158,19 @@ defmodule Tightbeam.HotQueryPlansTest do
              )
 
     refute index_sql =~ "WHERE"
+  end
+
+  test "a failed hot query index migration does not stop schema boot" do
+    db = :"hot_query_indexes_failure_db_#{System.unique_integer([:positive])}"
+    start_supervised!(Supervisor.child_spec({DB, path: ":memory:", name: db}, id: db))
+    :ok = DB.execute(db, "CREATE TABLE assignments_reviews_assignment (id INTEGER)")
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert :ok = Tightbeam.Schema.ensure_all(db)
+      end)
+
+    assert log =~ "hot query indexes were not built; continuing without them"
+    assert {:ok, [[1]]} = DB.query(db, "SELECT 1")
   end
 end

@@ -244,7 +244,7 @@ defmodule Tightbeam.WorkState do
   end
 
   defp assignment_rows(txn, filters) do
-    rows = Txn.q(txn, assignment_query("1 = 1"))
+    rows = Txn.q(txn, assignment_query_sql())
     state = Map.get(filters, :state, "all")
     statuses = Map.get(filters, :status)
     holder = Map.get(filters, :session_key)
@@ -379,6 +379,9 @@ defmodule Tightbeam.WorkState do
     "SELECT #{@assignment_columns} FROM assignments a JOIN sessions s ON s.sessionKey = a.holderKey " <>
       "WHERE #{where} ORDER BY a.openedAt DESC, a.id DESC"
   end
+
+  @doc false
+  def assignment_query_sql, do: assignment_query("1 = 1")
 
   defp assignment_page_filters(filters) do
     {where, params} = {"1 = 1", []}

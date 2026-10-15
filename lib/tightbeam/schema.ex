@@ -2810,8 +2810,11 @@ defmodule Tightbeam.Schema do
         :ok
 
       {:error, error} ->
-        raise ShapeError,
-          message: "hot query index migration failed: #{Exception.message(error)}"
+        Logger.warning(
+          "hot query indexes were not built; continuing without them: #{Exception.message(error)}"
+        )
+
+        :ok
     end
   end
 

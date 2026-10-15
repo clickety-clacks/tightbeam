@@ -77,7 +77,7 @@ defmodule Tightbeam.DB do
   @queue_limit 128
   @deadline_key {__MODULE__, :deadline}
   @statement_cache_key {__MODULE__, :statement_cache}
-  # Keep the first 64 distinct SQL strings on each connection; later ones run uncached.
+  # Bound per-connection statement memory while letting recent hot queries stay cached.
   @statement_cache_limit 64
 
   @doc false
@@ -1232,8 +1232,11 @@ defmodule Tightbeam.DB do
             {stmt, true}
 
           :error ->
+            Process.put(key, %{})
+            Enum.each(Map.values(cache), &Sqlite3.release(conn, &1))
             {:ok, stmt} = Sqlite3.prepare(conn, sql)
-            {stmt, false}
+            Process.put(key, %{sql => stmt})
+            {stmt, true}
         end
 
       _ ->

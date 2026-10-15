@@ -224,6 +224,102 @@ defmodule Tightbeam.Rules do
     workItemId assignmentId decisionRequestId artifact
     conditionKind conditionScope conditionAfterId conditionFactId
   )
+
+  @assignment_review_verdict_count_sql """
+  SELECT COUNT(*)
+  FROM assignments review
+  JOIN attests verdict ON verdict.assignmentId=review.id
+  WHERE review.reviewsAssignmentId =
+        (SELECT COALESCE(reviewsAssignmentId, id)
+           FROM assignments WHERE id = ?1)
+    AND verdict.kind = 'verdict'
+  """
+
+  @work_item_fourth_round_count_sql """
+  SELECT SUM(count) FROM (
+    SELECT COUNT(*) AS count
+    FROM assignments review
+    JOIN attests verdict ON verdict.assignmentId=review.id
+    WHERE review.workItemId=?1
+      AND review.reviewsAssignmentId IS NOT NULL
+      AND verdict.kind='verdict'
+
+    UNION ALL
+
+    SELECT COUNT(*) AS count
+    FROM assignments producer
+    CROSS JOIN assignments review
+    JOIN attests verdict ON verdict.assignmentId=review.id
+    WHERE producer.workItemId=?1
+      AND review.reviewsAssignmentId=producer.id
+      AND review.workItemId IS NULL
+      AND verdict.kind='verdict'
+  )
+  """
+
+  @work_item_changes_requested_count_sql """
+  SELECT SUM(count) FROM (
+    SELECT COUNT(*) AS count
+    FROM assignments review
+    JOIN attests verdict ON verdict.assignmentId=review.id
+    WHERE review.workItemId=?1
+      AND review.reviewsAssignmentId IS NOT NULL
+      AND verdict.kind='verdict'
+      AND verdict.verdictKind='changes-requested'
+
+    UNION ALL
+
+    SELECT COUNT(*) AS count
+    FROM assignments producer
+    CROSS JOIN assignments review
+    JOIN attests verdict ON verdict.assignmentId=review.id
+    WHERE producer.workItemId=?1
+      AND review.reviewsAssignmentId=producer.id
+      AND review.workItemId IS NULL
+      AND verdict.kind='verdict'
+      AND verdict.verdictKind='changes-requested'
+  )
+  """
+
+  @work_item_review_verdict_count_sql """
+  SELECT SUM(count) FROM (
+    SELECT COUNT(*) AS count
+    FROM assignments review
+    JOIN attests verdict ON verdict.assignmentId=review.id
+    WHERE review.workItemId=?1
+      AND review.reviewsAssignmentId IS NOT NULL
+      AND verdict.kind='verdict'
+      AND verdict.rowid <= (
+        SELECT event_attest.rowid FROM attests event_attest WHERE event_attest.id=?2
+      )
+
+    UNION ALL
+
+    SELECT COUNT(*) AS count
+    FROM assignments producer
+    CROSS JOIN assignments review
+    JOIN attests verdict ON verdict.assignmentId=review.id
+    WHERE producer.workItemId=?1
+      AND review.reviewsAssignmentId=producer.id
+      AND review.workItemId IS NULL
+      AND verdict.kind='verdict'
+      AND verdict.rowid <= (
+        SELECT event_attest.rowid FROM attests event_attest WHERE event_attest.id=?2
+      )
+  )
+  """
+
+  @doc false
+  def assignment_review_verdict_count_sql, do: @assignment_review_verdict_count_sql
+
+  @doc false
+  def work_item_fourth_round_count_sql, do: @work_item_fourth_round_count_sql
+
+  @doc false
+  def work_item_changes_requested_count_sql, do: @work_item_changes_requested_count_sql
+
+  @doc false
+  def work_item_review_verdict_count_sql, do: @work_item_review_verdict_count_sql
   @artifact_facts ~w(artifact.present artifact.content_sha256 review.qualifying_verdict_kinds)
   @type condition :: %{fact: String.t(), op: String.t(), value: term()}
   @type rule :: %{
@@ -2730,19 +2826,7 @@ defmodule Tightbeam.Rules do
 
       assignment, cache ->
         {:ok, [[count]]} =
-          DB.query(
-            db,
-            """
-            SELECT COUNT(*)
-            FROM assignments review
-            JOIN attests verdict ON verdict.assignmentId=review.id
-            WHERE review.reviewsAssignmentId =
-                  (SELECT COALESCE(reviewsAssignmentId, id)
-                     FROM assignments WHERE id = ?1)
-              AND verdict.kind = 'verdict'
-            """,
-            [assignment.id]
-          )
+          DB.query(db, assignment_review_verdict_count_sql(), [assignment.id])
 
         {count, cache}
     end)
@@ -2788,18 +2872,7 @@ defmodule Tightbeam.Rules do
             case row_commit_work_item_id(db, call, assignment) do
               work_item_id when is_binary(work_item_id) ->
                 {:ok, [[count]]} =
-                  DB.query(
-                    db,
-                    """
-                    SELECT COUNT(*)
-                    FROM attests verdict
-                    JOIN assignments review ON review.id=verdict.assignmentId
-                    JOIN assignments producer ON producer.id=review.reviewsAssignmentId
-                    WHERE COALESCE(review.workItemId,producer.workItemId)=?1
-                      AND verdict.kind='verdict'
-                    """,
-                    [work_item_id]
-                  )
+                  DB.query(db, work_item_fourth_round_count_sql(), [work_item_id])
 
                 if count == 4, do: {"review", cache}, else: {nil, cache}
 
@@ -2863,33 +2936,7 @@ defmodule Tightbeam.Rules do
         case row_commit_work_item_id(db, call, assignment) do
           work_item_id when is_binary(work_item_id) ->
             {:ok, [[count]]} =
-              DB.query(
-                db,
-                """
-                  SELECT SUM(count) FROM (
-                    SELECT COUNT(*) AS count
-                    FROM assignments review
-                    JOIN attests verdict ON verdict.assignmentId=review.id
-                    WHERE review.workItemId=?1
-                      AND review.reviewsAssignmentId IS NOT NULL
-                      AND verdict.kind='verdict'
-                      AND verdict.verdictKind='changes-requested'
-
-                    UNION ALL
-
-                    SELECT COUNT(*) AS count
-                    FROM assignments producer
-                    CROSS JOIN assignments review
-                    JOIN attests verdict ON verdict.assignmentId=review.id
-                    WHERE producer.workItemId=?1
-                      AND review.reviewsAssignmentId=producer.id
-                      AND review.workItemId IS NULL
-                      AND verdict.kind='verdict'
-                      AND verdict.verdictKind='changes-requested'
-                  )
-                """,
-                [work_item_id]
-              )
+              DB.query(db, work_item_changes_requested_count_sql(), [work_item_id])
 
             {count, cache}
 
@@ -2916,37 +2963,7 @@ defmodule Tightbeam.Rules do
     case {row_commit_work_item_id(db, call, assignment), attest_id} do
       {work_item_id, attest_id} when is_binary(work_item_id) and is_binary(attest_id) ->
         {:ok, [[count]]} =
-          DB.query(
-            db,
-            """
-            SELECT SUM(count) FROM (
-              SELECT COUNT(*) AS count
-              FROM assignments review
-              JOIN attests verdict ON verdict.assignmentId=review.id
-              WHERE review.workItemId=?1
-                AND review.reviewsAssignmentId IS NOT NULL
-                AND verdict.kind='verdict'
-                AND verdict.rowid <= (
-                  SELECT event_attest.rowid FROM attests event_attest WHERE event_attest.id=?2
-                )
-
-              UNION ALL
-
-              SELECT COUNT(*) AS count
-              FROM assignments producer
-              CROSS JOIN assignments review
-              JOIN attests verdict ON verdict.assignmentId=review.id
-              WHERE producer.workItemId=?1
-                AND review.reviewsAssignmentId=producer.id
-                AND review.workItemId IS NULL
-                AND verdict.kind='verdict'
-                AND verdict.rowid <= (
-                  SELECT event_attest.rowid FROM attests event_attest WHERE event_attest.id=?2
-                )
-            )
-            """,
-            [work_item_id, attest_id]
-          )
+          DB.query(db, work_item_review_verdict_count_sql(), [work_item_id, attest_id])
 
         {count, cache}
 

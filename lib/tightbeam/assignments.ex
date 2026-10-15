@@ -1055,24 +1055,25 @@ defmodule Tightbeam.Assignments do
   @spec commissioned_review_authors(DB.server(), String.t(), String.t()) :: [map()]
   def commissioned_review_authors(db, assignment_id, a_holder_key) do
     {:ok, rows} =
-      DB.query(
-        db,
-        """
-        SELECT v.verdictKind, v.byHarness, v.byProvider
-        FROM attests AS v
-        JOIN assignments AS r ON r.id = v.assignmentId
-        WHERE r.reviewsAssignmentId = ?1
-          AND v.kind = 'verdict'
-          AND v.bySession = r.holderKey
-          AND v.bySession != ?2
-        ORDER BY v.ts ASC, v.id ASC
-        """,
-        [assignment_id, a_holder_key]
-      )
+      DB.query(db, commissioned_review_authors_sql(), [assignment_id, a_holder_key])
 
     Enum.map(rows, fn [verdict_kind, by_harness, by_provider] ->
       %{verdict_kind: verdict_kind, by_harness: by_harness, by_provider: by_provider}
     end)
+  end
+
+  @doc false
+  def commissioned_review_authors_sql do
+    """
+    SELECT v.verdictKind, v.byHarness, v.byProvider
+    FROM attests AS v
+    JOIN assignments AS r ON r.id = v.assignmentId
+    WHERE r.reviewsAssignmentId = ?1
+      AND v.kind = 'verdict'
+      AND v.bySession = r.holderKey
+      AND v.bySession != ?2
+    ORDER BY v.ts ASC, v.id ASC
+    """
   end
 
   @doc """
