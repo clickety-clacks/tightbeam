@@ -30,34 +30,56 @@ defmodule Tightbeam.DispatchTest do
   end
 
   test "read audit cannot delay or fail a successful response", %{db: db} do
-    handlers = %{"transcript" => fn _ -> %{entries: ["large result"]} end}
     call = %{verb: "transcript", origin: "user:flynn", session_key: "s1", params: %{}}
-    :sys.suspend(db)
     # Rules and publication do their established reads before invoking the handler.
     # Suspend at the handler's completion, exactly where the audit used to block.
-    :sys.resume(db)
-    handlers = Map.put(handlers, "transcript", fn _ -> :sys.suspend(db); %{entries: ["large result"]} end)
+    handlers = %{
+      "transcript" => fn _ ->
+        :sys.suspend(db)
+        %{entries: ["large result"]}
+      end
+    }
+
     try do
       assert {:ok, %{entries: ["large result"]}} = Dispatch.dispatch(db, handlers, call)
     after
       :sys.resume(db)
     end
+
     assert {:ok, [["null"]]} = DB.query(db, "SELECT payload FROM events")
-    :ok = DB.execute(db, "CREATE TRIGGER refuse_audit BEFORE INSERT ON events BEGIN SELECT RAISE(FAIL, 'audit unavailable'); END")
-    assert {:ok, %{entries: ["large result"]}} = Dispatch.dispatch(db, %{"transcript" => fn _ -> %{entries: ["large result"]} end}, call)
+
+    :ok =
+      DB.execute(
+        db,
+        "CREATE TRIGGER refuse_audit BEFORE INSERT ON events BEGIN SELECT RAISE(FAIL, 'audit unavailable'); END"
+      )
+
+    assert {:ok, %{entries: ["large result"]}} =
+             Dispatch.dispatch(
+               db,
+               %{"transcript" => fn _ -> %{entries: ["large result"]} end},
+               call
+             )
+
     assert {:ok, [[1]]} = DB.query(db, "SELECT count(*) FROM events")
   end
 
   test "a write and its audit commit together and are not appended twice", %{db: db} do
     :ok = DB.execute(db, "CREATE TABLE primary_result(id INTEGER)")
-    handlers = %{"post" => fn _ ->
-      {:ok, result} = DB.transaction(db, fn txn ->
-        DB.Txn.q(txn, "INSERT INTO primary_result VALUES(1)")
-        %{saved: true}
-      end)
-      assert {:ok, [[1]]} = DB.query(db, "SELECT count(*) FROM events WHERE verb='post'")
-      result
-    end}
+
+    handlers = %{
+      "post" => fn _ ->
+        {:ok, result} =
+          DB.transaction(db, fn txn ->
+            DB.Txn.q(txn, "INSERT INTO primary_result VALUES(1)")
+            %{saved: true}
+          end)
+
+        assert {:ok, [[1]]} = DB.query(db, "SELECT count(*) FROM events WHERE verb='post'")
+        result
+      end
+    }
+
     call = %{verb: "post", origin: "user:flynn", session_key: nil, params: %{}}
     assert {:ok, %{saved: true}} = Dispatch.dispatch(db, handlers, call)
     assert {:ok, [[1]]} = DB.query(db, "SELECT count(*) FROM primary_result")

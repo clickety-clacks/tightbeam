@@ -187,7 +187,7 @@ defmodule Tightbeam.DBTransactionThenTest do
 
     assert_receive {:handoff, :one}
 
-    assert {:error, %RuntimeError{}} =
+    assert {:ok, %Txn{}} =
              DB.transaction_then(
                db,
                fn txn ->

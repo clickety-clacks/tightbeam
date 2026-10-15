@@ -14,14 +14,10 @@ defmodule Tightbeam.Dispatch do
   the CALLER's process (a socket, an HTTP request task, the scheduler), and
   anything long-running goes through the Ledger/lane pipeline, never inline.
 
-  Before a known handler runs, the `Tightbeam.Rules` tier evaluates
-  the raw call. A statute denial or fact error appends kind "denied" and
-  returns immediately; that audit append is best-effort so an unavailable
-  sink cannot fail open. All calls that pass statutes retain the existing
-  behavior: kind "verb" on acceptance, kind "denied" when the verb is unknown
-  or the handler returns a denial (`%{code: _}`). Handler outcome rows are
-  appended AFTER the handler so they can carry the result; a handler crash
-  still appends a "verb" row with the error.
+  Rules evaluate each call before its handler runs. Handler database writes
+  record an identity audit in their transaction. Dispatch queues remaining
+  audits and publication handoffs without waiting for the database owner.
+  Read audits contain identity and verb rather than the returned content.
   """
 
   alias Tightbeam.{
@@ -306,7 +302,7 @@ defmodule Tightbeam.Dispatch do
             {:ok, assignment}
 
           {:returned, {:firehose_effect, result, changed?}} when is_boolean(changed?) ->
-            payload = outcome_payload(verb, call, {:returned, result})
+            payload = audit_payload(verb, call, {:returned, result})
             :ok = append_event(db, "verb", verb, origin, session_key, payload, principal)
 
             :ok =
@@ -319,7 +315,7 @@ defmodule Tightbeam.Dispatch do
             {:ok, result}
 
           {:returned, result} ->
-            payload = outcome_payload(verb, call, {:returned, result})
+            payload = audit_payload(verb, call, {:returned, result})
 
             if Publisher.transactional_verb?(verb) do
               :ok =
@@ -374,6 +370,12 @@ defmodule Tightbeam.Dispatch do
             {:error, ErrorDiagnostic.put(error, diagnostic)}
         end
     end
+  end
+
+  defp audit_payload(verb, call, outcome) do
+    if Process.get(:tightbeam_dispatch_audited) == true or Publisher.transactional_verb?(verb),
+      do: outcome_payload(verb, call, outcome),
+      else: nil
   end
 
   defp invoke_with_audit(handler, call) do

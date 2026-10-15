@@ -1103,7 +1103,13 @@ defmodule Tightbeam.DB do
     try do
       {:ok, after_commit.(result)}
     rescue
-      error -> {:error, error}
+      _error ->
+        Logger.error("post-commit publication failed; returning committed result")
+        {:ok, result}
+    catch
+      _kind, _reason ->
+        Logger.error("post-commit publication failed; returning committed result")
+        {:ok, result}
     end
   end
 

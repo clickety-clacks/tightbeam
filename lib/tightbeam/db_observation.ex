@@ -118,7 +118,7 @@ defmodule Tightbeam.DBObservation do
       request = build_request.(envelope)
       {reply, timing} = send_request(server, request, envelope, budget)
 
-      if Map.get(timing, :dispatch_audited) and match?({:ok, _}, reply),
+      if Map.get(timing, :dispatch_audited) and (reply == :ok or match?({:ok, _}, reply)),
         do: Process.put(:tightbeam_dispatch_audited, true)
 
       emit(

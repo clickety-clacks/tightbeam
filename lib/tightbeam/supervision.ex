@@ -4296,12 +4296,9 @@ defmodule Tightbeam.Supervision do
     error in DB.Overloaded ->
       reraise error, __STACKTRACE__
 
-    error in MatchError ->
-      if match?({:error, %DB.Overloaded{}}, error.term),
-        do: raise(DB.Overloaded),
-        else: reraise(error, __STACKTRACE__)
-
     error ->
+      if match?(%MatchError{term: {:error, %DB.Overloaded{}}}, error), do: raise(DB.Overloaded)
+
       best_effort_lifecycle(
         state.db,
         "supervision_evaluate_failed",
@@ -4333,12 +4330,9 @@ defmodule Tightbeam.Supervision do
     error in DB.Overloaded ->
       reraise error, __STACKTRACE__
 
-    error in MatchError ->
-      if match?({:error, %DB.Overloaded{}}, error.term),
-        do: raise(DB.Overloaded),
-        else: reraise(error, __STACKTRACE__)
-
     error ->
+      if match?(%MatchError{term: {:error, %DB.Overloaded{}}}, error), do: raise(DB.Overloaded)
+
       best_effort_lifecycle(
         db,
         "supervision_evaluate_failed",
@@ -5380,12 +5374,9 @@ defmodule Tightbeam.Supervision do
     error in DB.Overloaded ->
       reraise error, __STACKTRACE__
 
-    error in MatchError ->
-      if match?({:error, %DB.Overloaded{}}, error.term),
-        do: raise(DB.Overloaded),
-        else: reraise(error, __STACKTRACE__)
-
     error ->
+      if match?(%MatchError{term: {:error, %DB.Overloaded{}}}, error), do: raise(DB.Overloaded)
+
       best_effort_lifecycle(
         state.db,
         "supervision_evaluate_failed",

@@ -44,4 +44,21 @@ defmodule Tightbeam.DBBackgroundOverloadTest do
     state = %{db: db, interval: 3_600_000}
     assert {:noreply, ^state} = Tightbeam.Productions.BubbleSweeper.handle_info(:tick, state)
   end
+
+  test "scheduler tick skips overload and retains its next tick", %{db: db} do
+    state = %{
+      db: db,
+      internal_consumers: %{},
+      tick_ms: 3_600_000,
+      deliver: fn _ -> flunk("delivery must not run") end,
+      delivery_opts: []
+    }
+
+    assert {:noreply, ^state} = Tightbeam.Wakes.handle_info(:tick, state)
+  end
+
+  test "supervision sweep skips overload and retains its next tick", %{db: db} do
+    state = %{db: db, sweep_ms: 3_600_000}
+    assert {:noreply, ^state} = Tightbeam.Supervision.handle_info(:scheduled_sweep, state)
+  end
 end
