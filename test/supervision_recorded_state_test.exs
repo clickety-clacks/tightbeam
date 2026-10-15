@@ -119,10 +119,21 @@ defmodule Tightbeam.SupervisionRecordedStateTest do
       """)
 
     assert {:ok, false} = DB.transaction(db, &Supervision.backfill_idle_cleanup_in_txn/1)
-    assert {:ok, [["wake-1000","wake-999"]]} = DB.query(db, "SELECT idleCleanupObservedWake,idleCleanupPreviousWake FROM sessions WHERE sessionKey='s'")
+
+    assert {:ok, [["wake-1000", "wake-999"]]} =
+             DB.query(
+               db,
+               "SELECT idleCleanupObservedWake,idleCleanupPreviousWake FROM sessions WHERE sessionKey='s'"
+             )
+
     assert :ok = Schema.ensure_all(db)
     assert {:ok, true} = DB.transaction(db, &Supervision.backfill_idle_cleanup_in_txn/1)
-    assert {:ok, [["wake-1001","wake-1000"]]} = DB.query(db, "SELECT idleCleanupObservedWake,idleCleanupPreviousWake FROM sessions WHERE sessionKey='s'")
+
+    assert {:ok, [["wake-1001", "wake-1000"]]} =
+             DB.query(
+               db,
+               "SELECT idleCleanupObservedWake,idleCleanupPreviousWake FROM sessions WHERE sessionKey='s'"
+             )
 
     assert {:ok, [[1]]} =
              DB.query(

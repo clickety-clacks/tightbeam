@@ -4340,12 +4340,11 @@ defmodule Tightbeam.Supervision do
   defp idle_cleanup_sweep_in_txn(txn, n, snapshot_at) do
     idle_cleanup_observe_pending_in_txn(txn)
     sessions = idle_cleanup_sessions_in_txn(txn)
-    occurrences = idle_cleanup_occurrences_in_txn(txn, nil)
 
     eligible =
       Map.values(sessions)
       |> Enum.map(
-        &idle_cleanup_candidate_in_txn(txn, &1, snapshot_at, sessions, nil, occurrences)
+        &idle_cleanup_candidate_in_txn(txn, &1, snapshot_at, sessions, nil)
       )
       |> Enum.reject(&is_nil/1)
 
@@ -4418,8 +4417,7 @@ defmodule Tightbeam.Supervision do
          session,
          snapshot_at,
          sessions,
-         ignored_wake,
-         occurrences
+         ignored_wake
        ) do
     with true <- session.state == "active" and not session.built_in,
          true <- idle_cleanup_enabled?(session.archetype),
@@ -4446,7 +4444,7 @@ defmodule Tightbeam.Supervision do
       gate = HarnessHealth.prod_shape_gate_in_txn(txn, session.harness, session.host, snapshot_at)
       group_digest = idle_cleanup_digest("idle-cleanup-group-v1\0" <> parent_group)
       activity_fingerprint = idle_cleanup_activity_fingerprint(session.session_key, activity)
-      occurrence = idle_cleanup_occurrence(txn, occurrences, session.session_key)
+      occurrence = idle_cleanup_occurrence(txn, ignored_wake, session.session_key)
 
       member_token =
         idle_cleanup_member_token(session.session_key, activity_fingerprint <> occurrence)
@@ -4527,25 +4525,32 @@ defmodule Tightbeam.Supervision do
     end)
   end
 
-  defp idle_cleanup_occurrences_in_txn(_txn, ignored_wake), do: ignored_wake
-
   defp idle_cleanup_occurrence(txn, ignored_wake, session_key) do
-    case Txn.q(txn, """
-         SELECT CASE WHEN idleCleanupObservedWake=?2 THEN idleCleanupPreviousWake
-                     ELSE idleCleanupObservedWake END
-         FROM sessions WHERE sessionKey=?1
-         """, [session_key, ignored_wake]) do
+    case Txn.q(
+           txn,
+           """
+           SELECT CASE WHEN idleCleanupObservedWake=?2 THEN idleCleanupPreviousWake
+                       ELSE idleCleanupObservedWake END
+           FROM sessions WHERE sessionKey=?1
+           """,
+           [session_key, ignored_wake]
+         ) do
       [[wake_id]] when is_binary(wake_id) -> JSON.encode!([[wake_id]])
       _ -> JSON.encode!([])
     end
   end
 
   defp record_idle_cleanup_observation_in_txn(txn, wake_id, session_key) do
-    Txn.q(txn, """
-    UPDATE sessions SET idleCleanupPreviousWake=idleCleanupObservedWake,
-      idleCleanupObservedWake=?2
-    WHERE sessionKey=?1 AND idleCleanupObservedWake IS NOT ?2
-    """, [session_key, wake_id])
+    Txn.q(
+      txn,
+      """
+      UPDATE sessions SET idleCleanupPreviousWake=idleCleanupObservedWake,
+        idleCleanupObservedWake=?2
+      WHERE sessionKey=?1 AND idleCleanupObservedWake IS NOT ?2
+      """,
+      [session_key, wake_id]
+    )
+
     Txn.q(txn, "UPDATE wakes SET idleCleanupObserved=1 WHERE wakeId=?1", [wake_id])
   end
 
@@ -5124,7 +5129,6 @@ defmodule Tightbeam.Supervision do
          true <- is_integer(claimed_at) and claimed_at >= 0 and claimed_at <= snapshot_at,
          true <- is_binary(evidence) do
       sessions = idle_cleanup_sessions_in_txn(txn)
-      occurrences = idle_cleanup_occurrences_in_txn(txn, wake.wake_id)
 
       eligible =
         sessions
@@ -5135,8 +5139,7 @@ defmodule Tightbeam.Supervision do
             &1,
             snapshot_at,
             sessions,
-            wake.wake_id,
-            occurrences
+            wake.wake_id
           )
         )
         |> Enum.reject(&is_nil/1)
