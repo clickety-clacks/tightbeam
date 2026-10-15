@@ -2837,6 +2837,27 @@ defmodule Tightbeam.SupervisionTest do
              )
   end
 
+  test "an already settled controller does not record a later wake ending", ctx do
+    terminal_seq = terminal!(ctx.db, "holder")
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0, interval: 60_000)
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", terminal_seq)
+    assert [controller] = Wakes.list_pending(ctx.db)
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE supervision_liveness_sidecar SET controllerState='settled' WHERE wakeId=?1",
+               [controller.wake_id]
+             )
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE wakes SET state='fired',firedAt=1 WHERE wakeId=?1", [
+               controller.wake_id
+             ])
+
+    assert {:ok, []} = DB.query(ctx.db, "SELECT * FROM supervision_ended_controllers")
+  end
+
   test "scheduled controller records its wake ending when canceled", ctx do
     terminal_seq = terminal!(ctx.db, "holder")
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0, interval: 60_000)
@@ -2850,6 +2871,15 @@ defmodule Tightbeam.SupervisionTest do
                "SELECT endedWakeState FROM supervision_ended_controllers WHERE wakeId=?1",
                [controller.wake_id]
              )
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE supervision_liveness_sidecar SET controllerState='settled' WHERE wakeId=?1",
+               [controller.wake_id]
+             )
+
+    assert {:ok, []} = DB.query(ctx.db, "SELECT * FROM supervision_ended_controllers")
   end
 
   test "missing entitlement recovery preserves a coherent generation-12 controller lineage",

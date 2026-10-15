@@ -1754,7 +1754,8 @@ defmodule Tightbeam.Schema do
             CREATE INDEX idle_cleanup_pending_group ON wakes(idleCleanupGroup)
               WHERE state='pending' AND consumer='prompt';
             CREATE TABLE supervision_ended_controllers (
-              wakeId TEXT PRIMARY KEY, assignmentId TEXT NOT NULL,
+              wakeId TEXT PRIMARY KEY REFERENCES supervision_liveness_sidecar(wakeId) ON DELETE CASCADE,
+              assignmentId TEXT NOT NULL,
               endedWakeState TEXT NOT NULL CHECK(endedWakeState IN ('fired','canceled'))
             );
             CREATE INDEX supervision_liveness_ended_controller
@@ -1770,6 +1771,11 @@ defmodule Tightbeam.Schema do
               INSERT OR REPLACE INTO supervision_ended_controllers(wakeId,assignmentId,endedWakeState)
               SELECT wakeId,assignmentId,NEW.state FROM supervision_liveness_sidecar
               WHERE wakeId=NEW.wakeId AND controllerOrigin='scheduled' AND controllerState = 'pending';
+            END;
+            CREATE TRIGGER supervision_forget_settled_controller AFTER UPDATE OF controllerState ON supervision_liveness_sidecar
+            WHEN NEW.controllerState='settled'
+            BEGIN
+              DELETE FROM supervision_ended_controllers WHERE wakeId=NEW.wakeId;
             END;
             ALTER TABLE patrol_failure_boundary ADD COLUMN lastTurnSeq INTEGER NOT NULL DEFAULT 0;
             CREATE TRIGGER patrol_terminal_checkpoint_rewind AFTER UPDATE OF endedAt ON turns

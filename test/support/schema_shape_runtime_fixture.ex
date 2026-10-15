@@ -643,6 +643,7 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
       :ok =
         DB.execute(db, """
         DROP TRIGGER supervision_record_controller_end;
+        DROP TRIGGER supervision_forget_settled_controller;
         DROP TRIGGER patrol_terminal_checkpoint_rewind;
         DROP TRIGGER patrol_terminal_checkpoint_insert;
         DROP INDEX supervision_liveness_ended_controller;
