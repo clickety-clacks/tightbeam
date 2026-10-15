@@ -13,7 +13,9 @@ defmodule Tightbeam.RetentionTest do
     %{db: db}
   end
 
-  test "startup leaves a large history untouched and batches yield to other database work", %{db: db} do
+  test "startup leaves a large history untouched and batches yield to other database work", %{
+    db: db
+  } do
     now = System.system_time(:millisecond)
     insert_rows(db, 6_001, now - 61 * @day_ms)
     pid = start_supervised!({Retention, db: db, name: nil})
@@ -27,7 +29,9 @@ defmodule Tightbeam.RetentionTest do
     eventually(fn -> count(db) == 0 end)
   end
 
-  test "configured days preserve the cutoff and younger rows with out-of-order timestamps", %{db: db} do
+  test "configured days preserve the cutoff and younger rows with out-of-order timestamps", %{
+    db: db
+  } do
     previous = Application.get_env(:tightbeam, :retention_days)
     Application.put_env(:tightbeam, :retention_days, 7)
 
@@ -48,7 +52,10 @@ defmodule Tightbeam.RetentionTest do
 
     send(pid, :trim)
     :sys.get_state(pid)
-    assert {:ok, [[^cutoff], [young]]} = DB.query(db, "SELECT ts FROM lifecycle_events ORDER BY id")
+
+    assert {:ok, [[^cutoff], [young]]} =
+             DB.query(db, "SELECT ts FROM lifecycle_events ORDER BY id")
+
     assert young == cutoff + @day_ms
   end
 
@@ -65,7 +72,11 @@ defmodule Tightbeam.RetentionTest do
     assert {:ok, _} =
              DB.transaction(db, fn txn ->
                for _ <- 1..count do
-                 Txn.q(txn, "INSERT INTO lifecycle_events (ts,kind,subject) VALUES (?1,'test','sample')", [ts])
+                 Txn.q(
+                   txn,
+                   "INSERT INTO lifecycle_events (ts,kind,subject) VALUES (?1,'test','sample')",
+                   [ts]
+                 )
                end
              end)
   end
