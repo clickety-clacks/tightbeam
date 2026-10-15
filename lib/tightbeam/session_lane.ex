@@ -27,6 +27,7 @@ defmodule Tightbeam.SessionLane do
     :runner,
     :task_sup,
     :lane_owner,
+    :lane_manager,
     terminal_publisher: nil,
     on_terminal: nil,
     wake_scheduler: Tightbeam.WakeScheduler,
@@ -84,6 +85,14 @@ defmodule Tightbeam.SessionLane do
   def reap_abandoned(session_key) do
     case Registry.lookup(Tightbeam.LaneRegistry, session_key) do
       [{pid, _}] -> GenServer.call(pid, :reap_abandoned, :infinity)
+      [] -> :no_lane
+    end
+  end
+
+  @doc false
+  def repair(session_key, detect) do
+    case Registry.lookup(Tightbeam.LaneRegistry, session_key) do
+      [{pid, _}] -> GenServer.call(pid, {:repair, detect}, :infinity)
       [] -> :no_lane
     end
   end
@@ -210,10 +219,12 @@ defmodule Tightbeam.SessionLane do
       # indicator stuck forever. No-op default keeps unit tests standalone.
       terminal_publisher: Keyword.get(opts, :terminal_publisher, fn _ -> :ok end),
       on_terminal: Keyword.get(opts, :on_terminal, fn _, _ -> :ok end),
+      lane_manager: Keyword.get(opts, :lane_manager),
       wake_scheduler: Keyword.get(opts, :wake_scheduler, Tightbeam.WakeScheduler),
       lane_owner: "lane:#{inspect(self())}:#{System.unique_integer([:positive])}"
     }
 
+    report_state(state, nil)
     token = Keyword.get(opts, :settlement_reservation)
     if is_nil(token), do: send(self(), :nudge)
     owner = Keyword.get(opts, :settlement_owner)
@@ -351,6 +362,18 @@ defmodule Tightbeam.SessionLane do
       {:error, refusal} ->
         {:reply, {:error, refusal}, state}
     end
+  end
+
+  def handle_call({:repair, detect}, from, state) do
+    {:reply, outcome, repaired} = handle_call(:reap_abandoned, from, state)
+
+    recovered? = match?({:ok, [_ | _]}, outcome)
+    claimed? = is_nil(state.task_ref) and not is_nil(repaired.task_ref)
+
+    if detect and (recovered? or claimed?),
+      do: Tightbeam.SchedulerMisses.record(:lane, state.session_key)
+
+    {:reply, outcome, repaired}
   end
 
   def handle_call(:reap_abandoned, _from, %{reservation_token: token} = state)
@@ -540,6 +563,7 @@ defmodule Tightbeam.SessionLane do
   def handle_info({ref, {seq, outcome}}, %{task_ref: ref} = state) do
     Process.demonitor(ref, [:flush])
     finalize(state, seq, outcome)
+    report_state(state, nil)
     {:noreply, maybe_start(%{state | task_ref: nil})}
   end
 
@@ -551,6 +575,7 @@ defmodule Tightbeam.SessionLane do
       when not is_nil(reason) do
     EventLog.lifecycle(state.db, "turn_task_crash", state.session_key, inspect(reason))
     finalize(state, seq, crash_outcome(reason, seq))
+    report_state(state, nil)
     {:noreply, maybe_start(%{state | task_ref: nil})}
   end
 
@@ -666,6 +691,8 @@ defmodule Tightbeam.SessionLane do
           Task.Supervisor.async_nolink(state.task_sup, fn ->
             {turn.seq, runner.(Map.put(turn, :session_key, state.session_key))}
           end)
+
+        report_state(state, turn.seq)
 
         state
         |> Map.put(:task_ref, task.ref)
@@ -856,7 +883,13 @@ defmodule Tightbeam.SessionLane do
     end
   end
 
+  defp report_state(%{lane_manager: nil}, _seq), do: :ok
+
+  defp report_state(state, seq),
+    do: GenServer.cast(state.lane_manager, {:lane_state, self(), state.session_key, seq})
+
   defp notify_terminal(state, seq) do
+    report_state(state, nil)
     Tightbeam.Wakes.recipient_ready(state.wake_scheduler, state.session_key)
     state.on_terminal.(state.session_key, seq)
   end
