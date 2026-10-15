@@ -619,7 +619,11 @@ defmodule Tightbeam.Org do
       rescue
         error in JSON.DecodeError ->
           require Logger
-          Logger.warning("session #{hd(row)} unavailable: invalid overrides: #{Exception.message(error)}")
+
+          Logger.warning(
+            "session #{hd(row)} unavailable: invalid overrides: #{Exception.message(error)}"
+          )
+
           []
       end
     end)

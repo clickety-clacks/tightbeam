@@ -300,13 +300,19 @@ defmodule Tightbeam.ArtifactsTest do
         row.artifact_id
       ])
 
-    log = ExUnit.CaptureLog.capture_log(fn ->
-      assert {:ok, :ok} = DB.transaction(ctx.db, &Artifacts.migrate_version_floors_in_txn/1)
-    end)
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:ok, :ok} = DB.transaction(ctx.db, &Artifacts.migrate_version_floors_in_txn/1)
+      end)
+
     assert log =~ row.artifact_id
     assert log =~ "artifact_version_seed_invalid"
     assert {:ok, []} = DB.query(ctx.db, "SELECT artifactId FROM artifact_version_floors")
-    assert {:ok, [[9223372036854775807]]} = DB.query(ctx.db, "SELECT createdAt FROM artifacts WHERE artifactId=?1", [row.artifact_id])
+
+    assert {:ok, [[9_223_372_036_854_775_807]]} =
+             DB.query(ctx.db, "SELECT createdAt FROM artifacts WHERE artifactId=?1", [
+               row.artifact_id
+             ])
   end
 
   test "records pointer provenance and supports exact AND filters newest first", ctx do

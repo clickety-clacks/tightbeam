@@ -449,15 +449,21 @@ defmodule Tightbeam.Rules do
         end
       end)
 
-    policies = Enum.reject(policies, fn policy ->
-      if duplicates[policy.name] > 1 do
-        unavailable = :persistent_term.get({__MODULE__, :unavailable_verbs})
-        :persistent_term.put({__MODULE__, :unavailable_verbs}, Enum.reduce(verbs, unavailable, &Map.put(&2, &1, policy.source)))
-        true
-      else
-        false
-      end
-    end)
+    policies =
+      Enum.reject(policies, fn policy ->
+        if duplicates[policy.name] > 1 do
+          unavailable = :persistent_term.get({__MODULE__, :unavailable_verbs})
+
+          :persistent_term.put(
+            {__MODULE__, :unavailable_verbs},
+            Enum.reduce(verbs, unavailable, &Map.put(&2, &1, policy.source))
+          )
+
+          true
+        else
+          false
+        end
+      end)
 
     rules =
       Enum.filter(rules, fn rule ->
@@ -1259,15 +1265,25 @@ defmodule Tightbeam.Rules do
           |> Enum.with_index(1)
           |> Enum.map(fn {rule, ordinal} ->
             try do
-              {:rule, validate_rule!(path, ordinal, rule, valid_verbs, base_dir, identity_manifest_sha)}
+              {:rule,
+               validate_rule!(path, ordinal, rule, valid_verbs, base_dir, identity_manifest_sha)}
             rescue
               error ->
                 require Logger
-                Logger.warning("rule #{path} entry #{ordinal} unavailable: #{Exception.message(error)}")
+
+                Logger.warning(
+                  "rule #{path} entry #{ordinal} unavailable: #{Exception.message(error)}"
+                )
+
                 verb = if is_map(rule), do: Map.get(rule, "verb"), else: nil
                 affected = if MapSet.member?(valid_verbs, verb), do: [verb], else: valid_verbs
                 unavailable = :persistent_term.get({__MODULE__, :unavailable_verbs})
-                :persistent_term.put({__MODULE__, :unavailable_verbs}, Enum.reduce(affected, unavailable, &Map.put(&2, &1, path)))
+
+                :persistent_term.put(
+                  {__MODULE__, :unavailable_verbs},
+                  Enum.reduce(affected, unavailable, &Map.put(&2, &1, path))
+                )
+
                 {:unavailable, path}
             end
           end)

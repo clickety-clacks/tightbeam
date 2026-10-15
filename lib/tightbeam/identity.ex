@@ -216,7 +216,10 @@ defmodule Tightbeam.Identity do
   defp init_identity!(identity_dir) do
     if File.dir?(Path.join(identity_dir, ".git")) do
       verify_required_refs!(identity_dir)
-      if required_ref_exists?(identity_dir, "main"), do: maybe_mint_grandfather_receipt!(identity_dir)
+
+      if required_ref_exists?(identity_dir, "main"),
+        do: maybe_mint_grandfather_receipt!(identity_dir)
+
       :noop
     else
       candidate =

@@ -200,13 +200,22 @@ defmodule Tightbeam.FirehoseR1SchemaTest do
   test "pre-existing assignment orphans retain their identity across a table rebuild", %{db: db} do
     load_r1(db)
     :ok = DB.execute(db, "PRAGMA foreign_keys=OFF")
-    :ok = DB.execute(db, """
-    INSERT INTO assignments(rowid,id,subject,holderKey,openedByUser,openedAt,reminderState)
-    VALUES (99,'orphan-assignment','unchanged','missing-holder','fixture',1,NULL)
-    """)
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO assignments(rowid,id,subject,holderKey,openedByUser,openedAt,reminderState)
+      VALUES (99,'orphan-assignment','unchanged','missing-holder','fixture',1,NULL)
+      """)
+
     :ok = DB.execute(db, "PRAGMA foreign_keys=ON")
-    assert ExUnit.CaptureLog.capture_log(fn -> assert :ok = Schema.upgrade_firehose_r1(db) end) =~ "orphan-assignment"
-    assert rows(db, "SELECT holderKey,subject FROM assignments WHERE id='orphan-assignment'") == [["missing-holder","unchanged"]]
+
+    assert ExUnit.CaptureLog.capture_log(fn -> assert :ok = Schema.upgrade_firehose_r1(db) end) =~
+             "orphan-assignment"
+
+    assert rows(db, "SELECT holderKey,subject FROM assignments WHERE id='orphan-assignment'") == [
+             ["missing-holder", "unchanged"]
+           ]
+
     assert rows(db, "SELECT shape FROM schema_stamp") == [["firehose-r1-v1-019"]]
   end
 
