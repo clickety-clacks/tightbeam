@@ -74,8 +74,15 @@ defmodule Tightbeam.RailRemedyTest do
     registry = start_supervised!({ConnRegistry, name: nil})
     lane = :"remedy_lane_#{System.unique_integer([:positive])}"
     start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, lane})
-    %{db: db, base_dir: base_dir, handlers: handlers, holder: holder, reviewer: reviewer,
-      delivery_opts: [conn_registry: registry, lane_manager: lane]}
+
+    %{
+      db: db,
+      base_dir: base_dir,
+      handlers: handlers,
+      holder: holder,
+      reviewer: reviewer,
+      delivery_opts: [conn_registry: registry, lane_manager: lane]
+    }
   end
 
   test "an open review episode sleeps until readiness or a verdict", ctx do
@@ -1071,9 +1078,11 @@ defmodule Tightbeam.RailRemedyTest do
          review_remedy_interval_ms: 4_321,
          delivery_opts: [conn_registry: registry, lane_manager: lane],
          deliver: fn _ -> flunk("normal notice delivery must use actual recipient admission") end,
-         internal_consumers: %{"review_remedy_reconcile" => fn wake ->
-           RailRemedy.reconcile_notice(ctx.db, %{supervision_interval_ms: 4_321}, wake)
-         end}
+         internal_consumers: %{
+           "review_remedy_reconcile" => fn wake ->
+             RailRemedy.reconcile_notice(ctx.db, %{supervision_interval_ms: 4_321}, wake)
+           end
+         }
        ]}
     )
 
@@ -1084,7 +1093,8 @@ defmodule Tightbeam.RailRemedyTest do
     refute_receive :fire_due, 100
   end
 
-  test "scheduler restart reassesses once and retains one pending check without duplicate notices", ctx do
+  test "scheduler restart reassesses once and retains one pending check without duplicate notices",
+       ctx do
     assignment = notice_assignment(ctx, "restart protocol")
     fire_review_notice(ctx, assignment)
 
@@ -1120,10 +1130,19 @@ defmodule Tightbeam.RailRemedyTest do
       stop_supervised!(Wakes)
     end
 
-    assert {:ok, [[1]]} = DB.query(ctx.db,
-      "SELECT count(*) FROM wakes WHERE assignmentId=?1 AND consumer='prompt'", [assignment.id])
-    assert {:ok, [[1]]} = DB.query(ctx.db,
-      "SELECT count(*) FROM wakes WHERE assignmentId=?1 AND consumer='review_remedy_reconcile' AND state='pending'", [assignment.id])
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM wakes WHERE assignmentId=?1 AND consumer='prompt'",
+               [assignment.id]
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM wakes WHERE assignmentId=?1 AND consumer='review_remedy_reconcile' AND state='pending'",
+               [assignment.id]
+             )
   end
 
   test "assignment terminal handlers retain protocol review custody", ctx do
@@ -1169,8 +1188,14 @@ defmodule Tightbeam.RailRemedyTest do
   end
 
   test "scheduler precheck delivers protocol reconciliation after terminal row", ctx do
-    {:ok, _} = Tightbeam.Ledger.enqueue(ctx.db, %{session_key: ctx.holder.session_key,
-      message_id: "hold-reconciliation", origin: "user:flynn", prompt: "working"})
+    {:ok, _} =
+      Tightbeam.Ledger.enqueue(ctx.db, %{
+        session_key: ctx.holder.session_key,
+        message_id: "hold-reconciliation",
+        origin: "user:flynn",
+        prompt: "working"
+      })
+
     {:ok, _} = Tightbeam.Ledger.claim_next(ctx.db, ctx.holder.session_key, "fixture")
     assignment = notice_assignment(ctx, "scheduler protocol custody")
     %{producer_id: root} = fire_review_notice(ctx, assignment)
@@ -2852,7 +2877,10 @@ defmodule Tightbeam.RailRemedyTest do
       )
 
     {:ok, [[seq]]} = DB.query(db, "SELECT seq FROM turns WHERE messageId=?1", [message_id])
-    {:ok, _} = DB.query(db, "UPDATE wakes SET deliveredTurnSeq=?2 WHERE wakeId=?1", [wake_id, seq])
+
+    {:ok, _} =
+      DB.query(db, "UPDATE wakes SET deliveredTurnSeq=?2 WHERE wakeId=?1", [wake_id, seq])
+
     seq
   end
 
