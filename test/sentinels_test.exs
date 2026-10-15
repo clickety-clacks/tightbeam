@@ -264,6 +264,108 @@ defmodule Tightbeam.SentinelsTest do
                })
     end
 
+    test "shipped landing watcher can be configured and enabled from setup.md", ctx do
+      bundle_root = Path.expand("../priv/kungfu", __DIR__)
+      shipped_bundle = Path.join(bundle_root, "agentic-engineering")
+      previous_bundle_root = Application.get_env(:tightbeam, :kungfu_bundle_root_dir)
+      previous_identity_source = Application.get_env(:tightbeam, :identity_source_dir)
+
+      Application.put_env(:tightbeam, :kungfu_bundle_root_dir, bundle_root)
+      Application.put_env(:tightbeam, :identity_source_dir, shipped_bundle)
+
+      try do
+        Identity.init!(ctx.base)
+        {:ok, candidate} = Identity.learn!(ctx.base, "agentic-engineering", "user:flynn")
+        {:ok, _revision} = Identity.publish_live!(ctx.base, candidate)
+
+        qualified = "agentic-engineering/landing-watch"
+        shipped_setup = Sentinels.setup(ctx.base, ctx.db, ctx.host, "agentic-engineering")
+
+        for instruction <- [
+              "tightbeam host-env-set --sentinel #{qualified} GH_CONFIG_DIR=<dir>",
+              "tightbeam host-env-set --sentinel #{qualified} LANDING_REPOS=",
+              "tightbeam sentinel enable #{qualified}"
+            ] do
+          assert shipped_setup.setup_text =~ instruction
+        end
+
+        gh_config_dir = Path.join(ctx.root, "synthetic-gh-config")
+        File.mkdir_p!(gh_config_dir)
+        handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base})
+
+        assert %{
+                 sentinel: ^qualified,
+                 host: ctx.host,
+                 name: "GH_CONFIG_DIR",
+                 changed: true
+               } =
+                 handlers["host-env-set"].(%{
+                   origin: "user:flynn",
+                   params: %{
+                     sentinel: qualified,
+                     name: "GH_CONFIG_DIR",
+                     value: gh_config_dir
+                   }
+                 })
+
+        assert %{
+                 sentinel: ^qualified,
+                 host: ctx.host,
+                 name: "LANDING_REPOS",
+                 changed: true
+               } =
+                 handlers["host-env-set"].(%{
+                   origin: "user:flynn",
+                   params: %{
+                     sentinel: qualified,
+                     name: "LANDING_REPOS",
+                     value: "example/repo@main=pdo:example"
+                   }
+                 })
+
+        assert Enum.map(shipped_setup.pending, & &1.state) == ["setting-missing", "setting-missing", "disabled"]
+
+        configured =
+          handlers["kungfu-setup"].(%{
+            origin: "user:flynn",
+            params: %{name: "agentic-engineering"}
+          })
+
+        assert Enum.map(configured.pending, & &1.state) == ["disabled"]
+
+        # Exercise the shipped enable handler without starting the watcher or
+        # making GitHub/Tightbeam provider calls in this isolated fixture.
+        refute Process.whereis(SentinelSupervisor)
+
+        assert %{sentinel: ^qualified, host: ctx.host, state: "enabled"} =
+                 handlers["sentinel-enable"].(%{
+                   origin: "user:flynn",
+                   params: %{name: qualified}
+                 })
+
+        assert Sentinels.setup(ctx.base, ctx.db, ctx.host, "agentic-engineering").pending == []
+
+        assert %{code: "reserved_env_name"} =
+                 handlers["host-env-set"].(%{
+                   origin: "user:flynn",
+                   params: %{
+                     host: ctx.host,
+                     harness: "claude",
+                     name: "GH_CONFIG_DIR",
+                     value: gh_config_dir
+                   }
+                 })
+      after
+        if is_nil(previous_bundle_root),
+          do: Application.delete_env(:tightbeam, :kungfu_bundle_root_dir),
+          else: Application.put_env(:tightbeam, :kungfu_bundle_root_dir, previous_bundle_root)
+
+        if is_nil(previous_identity_source),
+          do: Application.delete_env(:tightbeam, :identity_source_dir),
+          else: Application.put_env(:tightbeam, :identity_source_dir, previous_identity_source)
+      end
+    end
+
     test "removing a bundle forgets its states and settings and leaves the other's", ctx do
       learn_both!(ctx)
       set_settings!(ctx, "alpha-bundle/watch", %{"WATCH_TARGET" => "a", "WATCH_EXTRA" => "b"})
