@@ -70,6 +70,20 @@ defmodule Tightbeam.ApplicationShutdownTest do
   end
 
   @tag timeout: 5_000
+  test "a short budget still stamps after exhausting the drain", %{epoch: epoch} do
+    Application.put_env(:tightbeam, :drain_timeout_ms, 1_000)
+    :ok = DB.execute(DB, "INSERT INTO turns VALUES ('running')")
+    started = System.monotonic_time(:millisecond)
+
+    assert :state = Tightbeam.Application.prep_stop(:state)
+    elapsed = System.monotonic_time(:millisecond) - started
+
+    assert elapsed >= 500
+    assert elapsed < 1_200
+    assert_stamped(epoch)
+  end
+
+  @tag timeout: 5_000
   test "a stalled database cannot add a fresh stamp timeout" do
     :ok = :sys.suspend(DB)
     started = System.monotonic_time(:millisecond)
