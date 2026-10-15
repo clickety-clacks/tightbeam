@@ -65,23 +65,28 @@ defmodule Tightbeam.ModelCatalogTest do
 
   test "cached reads return while host refresh waits for the database", ctx do
     parent = self()
+
     hosts = fn ->
       send(parent, {:reading_hosts, self()})
       Placement.hosts(ctx.base_dir, ctx.db)
     end
+
     catalog = start_catalog(ctx, hosts: hosts)
     await_fresh(catalog, "claude")
     {cached, :fresh} = ModelCatalog.get(@host, "claude", catalog)
     assert cached != []
 
-    blocker = Task.async(fn ->
-      Tightbeam.DB.transaction(ctx.db, fn _txn ->
-        send(parent, :database_held)
-        receive do
-          :release -> :ok
-        end
+    blocker =
+      Task.async(fn ->
+        Tightbeam.DB.transaction(ctx.db, fn _txn ->
+          send(parent, :database_held)
+
+          receive do
+            :release -> :ok
+          end
+        end)
       end)
-    end)
+
     assert_receive :database_held
     # Discard host reads from initial derivation before starting the stalled pass.
     drain_host_reads()

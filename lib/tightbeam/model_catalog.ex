@@ -398,13 +398,18 @@ defmodule Tightbeam.ModelCatalog do
       {{:value, event}, pending} ->
         snapshot = %{state | pending: :queue.new()}
         owner = self()
-        {pid, ref} = spawn_monitor(fn ->
-          result = case event do
-            {:cast, message} -> background_cast(message, snapshot)
-            {:info, message} -> background_info(message, snapshot)
-          end
-          send(owner, {self(), result})
-        end)
+
+        {pid, ref} =
+          spawn_monitor(fn ->
+            result =
+              case event do
+                {:cast, message} -> background_cast(message, snapshot)
+                {:info, message} -> background_info(message, snapshot)
+              end
+
+            send(owner, {self(), result})
+          end)
+
         %{state | background: {pid, ref}, pending: pending}
     end
   end

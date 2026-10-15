@@ -193,9 +193,15 @@ defmodule Tightbeam.Application do
       id: Tightbeam.RuntimeSupervisor,
       start:
         {Supervisor, :start_link,
-         [children,
-          [strategy: :one_for_one, name: Tightbeam.RuntimeSupervisor,
-           max_restarts: 50, max_seconds: 30]]},
+         [
+           children,
+           [
+             strategy: :one_for_one,
+             name: Tightbeam.RuntimeSupervisor,
+             max_restarts: 50,
+             max_seconds: 30
+           ]
+         ]},
       type: :supervisor
     }
   end
