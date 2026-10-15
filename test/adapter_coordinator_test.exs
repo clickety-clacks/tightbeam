@@ -1251,6 +1251,38 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     assert [] = ctx.db |> EventLog.lifecycle_events() |> Enum.filter(&(&1.kind == "adapter_down"))
   end
 
+  @tag timeout: 5_000
+  test "adapter shutdown uses the application's remaining deadline", ctx do
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         db: ctx.db,
+         adapter_opts: fn _key, _context -> [] end,
+         name: :shared_shutdown_deadline_coordinator}
+      )
+
+    :persistent_term.put({Tightbeam.Application, :draining}, true)
+    deadline = System.monotonic_time(:millisecond) + 200
+    :persistent_term.put({Tightbeam.Application, :shutdown_deadline}, deadline)
+    on_exit(fn -> :persistent_term.erase({Tightbeam.Application, :shutdown_deadline}) end)
+    :ok = :sys.suspend(ctx.db)
+    started = System.monotonic_time(:millisecond)
+
+    try do
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert :ok = GenServer.stop(coordinator, :shutdown, 2_000)
+        end)
+
+      assert System.monotonic_time(:millisecond) - started < 600
+      assert log =~ "adapter shutdown"
+      assert log =~ "deadline"
+    after
+      :sys.resume(ctx.db)
+    end
+  end
+
   test "supervisor allowance exceeds the configured shutdown budget" do
     # The child_spec must read the configured option, not the module attribute:
     # a caller raising shutdown_budget_ms above the default would otherwise be
