@@ -507,6 +507,9 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
         assert System.monotonic_time(:millisecond) < deadline,
                "actual effort rumination carrier was not admitted"
 
+        # This fixture has no lanes to announce recipient readiness.
+        assert {:ok, ready} = DB.query(db, "SELECT DISTINCT sessionKey FROM wakes WHERE state='pending' AND rumination=1 AND dueAt<=?1", [System.system_time(:millisecond)])
+        Enum.each(ready, fn [recipient] -> Tightbeam.Wakes.recipient_ready(recipient) end)
         Process.sleep(10)
         drain_effort_rumination!(db, deadline)
     end
