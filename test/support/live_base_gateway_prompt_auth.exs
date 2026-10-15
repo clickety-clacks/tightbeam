@@ -58,7 +58,7 @@ defmodule GuardPromptAuth do
 
       try do
         # Synthetic catalog truth only; no credentials or provider are consulted.
-        :sys.replace_state(catalog, fn state ->
+        Tightbeam.GuardGatewayFixture.seed_catalog!(catalog, fn state ->
           now = state.now.()
 
           cache = %{

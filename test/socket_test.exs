@@ -82,7 +82,7 @@ defmodule Tightbeam.Wire.SocketTest do
   end
 
   test "registry restart closes an authenticated socket", ctx do
-    {:paired, device} = Devices.pair(ctx.db, %{device_id: "restart", claimed_name: "Client"})
+    {:paired, device} = Devices.pair(ctx.db, %{device_id: "restart", claimed_name: "Client", platform: nil, model: nil})
     {:ok, initial} = Socket.init(ctx.deps)
 
     {:push, _frames, state} =

@@ -75,6 +75,7 @@ defmodule Tightbeam.ModelCatalogTest do
     await_fresh(catalog, "claude")
     {cached, :fresh} = ModelCatalog.get(@host, "claude", catalog)
     assert cached != []
+    await(fn -> :sys.get_state(catalog).background == nil end)
 
     blocker =
       Task.async(fn ->
@@ -88,16 +89,20 @@ defmodule Tightbeam.ModelCatalogTest do
       end)
 
     assert_receive {:database_held, database_owner}
-    # Discard host reads from initial derivation before starting the stalled pass.
-    drain_host_reads()
-    send(Process.whereis(catalog), :refresh_due)
-    assert_receive {:reading_hosts, _worker}, 2_000
+    try do
+      # Discard host reads from initial derivation before starting the stalled pass.
+      drain_host_reads()
+      send(Process.whereis(catalog), :refresh_due)
+      assert_receive {:reading_hosts, _worker}, 2_000
 
-    {elapsed, result} = :timer.tc(fn -> ModelCatalog.get(@host, "claude", catalog) end)
-    assert result == {cached, :fresh}
-    assert elapsed < 250_000
-    assert ModelCatalog.get(catalog)[{@host, "claude"}] == cached
-    send(database_owner, :release)
+      {elapsed, result} = :timer.tc(fn -> ModelCatalog.get(@host, "claude", catalog) end)
+      assert result == {cached, :fresh}
+      assert elapsed < 250_000
+      assert ModelCatalog.get(catalog)[{@host, "claude"}] == cached
+    after
+      send(database_owner, :release)
+    end
+
     assert {:ok, :ok} = Task.await(blocker)
   end
 
