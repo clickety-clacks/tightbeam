@@ -277,8 +277,12 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
 
   defp await_fired(db, id, deadline) do
     cond do
-      Wakes.get(db, id).state == "fired" -> true
-      System.monotonic_time(:millisecond) >= deadline -> false
+      Wakes.get(db, id).state == "fired" ->
+        true
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        false
+
       true ->
         Process.sleep(10)
         await_fired(db, id, deadline)
