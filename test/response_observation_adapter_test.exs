@@ -2,6 +2,10 @@ defmodule Tightbeam.ResponseObservationAdapterTest do
   use Tightbeam.TestCase, async: false
   alias Tightbeam.{DB, Diagnostics, ListenerLifecycle, RequestContext}
 
+  @max_diagnostic_elapsed_us 60_000_000
+  @max_diagnostic_queue 1_000_000
+  @max_diagnostic_schedulers 4_096
+
   defmodule ClosingAdapter do
     # A test-only gate at the real adapter call. It closes the actual bound TCP
     # socket, then lets Bandit's real send observe the error; no idealized reply
@@ -471,7 +475,7 @@ defmodule Tightbeam.ResponseObservationAdapterTest do
   end
 
   defp assert_late_effect(db, id, call_id) do
-    assert {:ok, [[1]]} = DB.query(db, "SELECT count(*) FROM effects")
+    assert {:ok, [[1]]} = confirmation_query(db, "SELECT count(*) FROM effects")
 
     assert_receive {:diagnostic,
                     %{
@@ -482,6 +486,115 @@ defmodule Tightbeam.ResponseObservationAdapterTest do
                     }},
                    2_000
   end
+
+  test "a timed-out confirmation query emits bounded scheduler context and still fails", %{
+    db: db
+  } do
+    output =
+      ExUnit.CaptureIO.capture_io(:stderr, fn ->
+        with_suspended_db(db, fn ->
+          assert_raise DB.Timeout, fn ->
+            confirmation_query(db, "SELECT count(*) FROM effects")
+          end
+        end)
+      end)
+
+    assert [line] = String.split(output, "\n", trim: true)
+    assert String.starts_with?(line, "response_observation_confirmation_db_timeout ")
+
+    fields =
+      line
+      |> String.split()
+      |> Enum.drop(1)
+      |> Map.new(fn field ->
+        [name, value] = String.split(field, "=", parts: 2)
+        {name, value}
+      end)
+
+    assert Map.keys(fields) |> Enum.sort() ==
+             [
+               "db_mailbox",
+               "db_mailbox_capped",
+               "elapsed_capped",
+               "elapsed_us",
+               "run_queue",
+               "run_queue_capped",
+               "schedulers_capped",
+               "schedulers_online"
+             ]
+
+    assert fields["elapsed_capped"] in ["true", "false"]
+    assert fields["run_queue_capped"] in ["true", "false"]
+    assert fields["db_mailbox_capped"] in ["true", "false"]
+    assert fields["schedulers_capped"] in ["true", "false"]
+
+    for {name, maximum} <- [
+          {"elapsed_us", @max_diagnostic_elapsed_us},
+          {"schedulers_online", @max_diagnostic_schedulers},
+          {"run_queue", @max_diagnostic_queue},
+          {"db_mailbox", @max_diagnostic_queue}
+        ] do
+      {value, ""} = Integer.parse(fields[name])
+      assert value <= maximum
+    end
+
+    refute output =~ "SELECT"
+    refute output =~ "req_"
+  end
+
+  defp confirmation_query(db, sql) do
+    started_at = System.monotonic_time(:microsecond)
+
+    try do
+      DB.query(db, sql)
+    rescue
+      error in DB.Timeout ->
+        emit_confirmation_query_timeout(db, started_at)
+        reraise error, __STACKTRACE__
+    end
+  end
+
+  defp emit_confirmation_query_timeout(db, started_at) do
+    elapsed_us = max(System.monotonic_time(:microsecond) - started_at, 0)
+    {elapsed_us, elapsed_capped} = bounded_metric(elapsed_us, @max_diagnostic_elapsed_us)
+
+    {schedulers_online, schedulers_capped} =
+      safe_bounded_metric(
+        fn -> :erlang.system_info(:schedulers_online) end,
+        @max_diagnostic_schedulers
+      )
+
+    {run_queue, run_queue_capped} =
+      safe_bounded_metric(fn -> :erlang.statistics(:run_queue) end, @max_diagnostic_queue)
+
+    {db_mailbox, db_mailbox_capped} =
+      safe_bounded_metric(
+        fn -> Process.info(db, :message_queue_len) |> elem(1) end,
+        @max_diagnostic_queue
+      )
+
+    IO.puts(
+      :stderr,
+      "response_observation_confirmation_db_timeout elapsed_us=#{elapsed_us} elapsed_capped=#{elapsed_capped} " <>
+        "schedulers_online=#{schedulers_online} schedulers_capped=#{schedulers_capped} " <>
+        "run_queue=#{run_queue} run_queue_capped=#{run_queue_capped} " <>
+        "db_mailbox=#{db_mailbox} db_mailbox_capped=#{db_mailbox_capped}"
+    )
+  end
+
+  defp safe_bounded_metric(read, maximum) do
+    read.() |> bounded_metric(maximum)
+  rescue
+    _error -> {0, false}
+  catch
+    _kind, _reason -> {0, false}
+  end
+
+  defp bounded_metric(value, maximum) when is_integer(value) and value >= 0 do
+    {min(value, maximum), value > maximum}
+  end
+
+  defp bounded_metric(_value, _maximum), do: {0, false}
 
   defp assert_one_terminal(id) do
     assert length(
