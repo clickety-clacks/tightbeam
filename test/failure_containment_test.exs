@@ -137,7 +137,11 @@ defmodule Tightbeam.FailureContainmentTest do
   end
 
   defp child(supervisor, id) do
-    {^id, pid, _, _} = List.keyfind(Supervisor.which_children(supervisor), id, 0)
+    {_id, pid, _, _} =
+      Enum.find(Supervisor.which_children(supervisor), fn {child_id, _, _, modules} ->
+        child_id == id or (is_list(modules) and id in modules)
+      end)
+
     pid
   end
 

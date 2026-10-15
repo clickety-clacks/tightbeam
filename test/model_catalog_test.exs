@@ -1560,8 +1560,8 @@ defmodule Tightbeam.ModelCatalogTest do
 
       await(fn ->
         match?(
-          {:error, %Unroutable{cause: :no_catalog}},
-          ModelCatalog.route(@host, "claude", Model.new("claude-opus-5"), catalog)
+          {[], {:unavailable, {:needs_onboarding, :no_credential}}},
+          ModelCatalog.get(@host, "claude", catalog)
         )
       end)
 
