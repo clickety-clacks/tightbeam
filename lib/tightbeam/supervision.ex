@@ -1970,7 +1970,6 @@ defmodule Tightbeam.Supervision do
       )
 
       liveness_cycle(state, MapSet.new(), session_key)
-      drain(state.db, state.handlers, session_key)
     end)
   end
 
