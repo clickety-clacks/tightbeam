@@ -644,7 +644,7 @@ defmodule Tightbeam.Acp.Adapter do
 
     fields =
       case {kind, reply} do
-        {kind, {:ok, _}} when kind in [:new_session, :new_candidate_session, :load_session] ->
+        {kind, {:ok, _}} when kind in [:new_session, :load_session] ->
           [:known, :models, :unprompted, :chunks]
 
         {:close_session, :ok} ->
