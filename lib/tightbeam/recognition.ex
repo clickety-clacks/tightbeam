@@ -13,7 +13,7 @@ defmodule Tightbeam.Recognition do
   # Callback terms are Erlang external terms, valid for the exact module build
   # that wrote them. An incompatible upgrade is flagged, never guessed at.
   @ddl """
-  CREATE TABLE IF NOT EXISTS pending_recognition (
+  CREATE TABLE pending_recognition (
     id TEXT PRIMARY KEY,
     version INTEGER NOT NULL CHECK(version = 1),
     payload BLOB NOT NULL,
@@ -27,17 +27,39 @@ defmodule Tightbeam.Recognition do
   def ensure_sqlite_schema(conn), do: Exqlite.Sqlite3.execute(conn, @ddl)
 
   def ensure_schema(db) do
-    :ok = DB.execute(db, @ddl)
+    owner =
+      case db do
+        %DB.Migration{server: server} -> server
+        server -> server
+      end
 
-    case DB.query(db, "SELECT version FROM pending_recognition WHERE version<>1 LIMIT 1") do
-      {:ok, []} ->
-        :ok
+    # The owner stamps its reader list at initialization. An empty list means
+    # its private in-memory table was already created with the connection.
+    in_memory? = :persistent_term.get({DB, GenServer.whereis(owner)}) == []
 
-      {:ok, [[version]]} ->
-        raise DB.Error, message: "unknown pending recognition version #{inspect(version)}"
+    case DB.transaction(db, fn txn ->
+           id = "0.1.9/pending-recognition-v1"
 
-      {:error, error} ->
-        raise error
+           case Txn.q(txn, "SELECT 1 FROM supervision_liveness_migrations WHERE migrationId=?1", [
+                  id
+                ]) do
+             [[1]] ->
+               :ok
+
+             [] ->
+               unless in_memory?, do: Txn.exec(txn, @ddl)
+
+               Txn.q(
+                 txn,
+                 "INSERT INTO supervision_liveness_migrations(migrationId,appliedAt,affectedRows,cause,principal) VALUES(?1,?2,0,'release_upgrade','process:tightbeam')",
+                 [id, now()]
+               )
+
+               :ok
+           end
+         end) do
+      {:ok, :ok} -> :ok
+      {:error, error} -> raise error
     end
   end
 
@@ -52,7 +74,7 @@ defmodule Tightbeam.Recognition do
 
   defp worker(db), do: :persistent_term.get({__MODULE__, GenServer.whereis(db)}, nil)
 
-  def record(txn, callback, result, transitions, opts, caller) do
+  def record(txn, callback, result, transitions, opts) do
     id = Tightbeam.Id.uuid4()
     module = callback |> :erlang.fun_info(:module) |> elem(1)
 
@@ -65,28 +87,27 @@ defmodule Tightbeam.Recognition do
     Txn.q(txn, "INSERT INTO pending_recognition(id,version,payload,nextAt) VALUES(?1,1,?2,?3)", [
       id,
       {:blob, payload},
-      now() + 1_000
+      now() +
+        case txn.deadline do
+          :infinity -> DB.call_timeout()
+          deadline -> max(0, deadline - System.monotonic_time(:millisecond))
+        end
     ])
 
-    Txn.handoff(txn, worker(self()), {:active, id, caller})
     %Pending{id: id, result: result, transitions: transitions}
   end
 
   def inline(db, pending, callback, opts, deadline) do
-    try do
-      case invoke(db, pending, callback, true, deadline) do
-        {:ok, result} ->
-          if is_function(callback, 1), do: finish(db, pending.id)
-          {:ok, result}
+    case invoke(db, pending, callback, true, deadline) do
+      {:ok, result} ->
+        if is_function(callback, 1), do: finish(db, pending.id)
+        {:ok, result}
 
-        {:error, _} ->
-          Logger.error("post-commit recognition failed; returning committed result")
-          # No failure bookkeeping is needed here: the primary commit already
-          # contains the retry row, including a bounded first retry time.
-          {:ok, Keyword.get(opts, :fallback, &Function.identity/1).(pending.result)}
-      end
-    after
-      if retry = worker(db), do: GenServer.cast(retry, {:release, pending.id})
+      {:error, _} ->
+        Logger.error("post-commit recognition failed; returning committed result")
+        # No failure bookkeeping is needed here: the primary commit already
+        # contains the retry row, including a bounded first retry time.
+        {:ok, Keyword.get(opts, :fallback, &Function.identity/1).(pending.result)}
     end
   end
 
@@ -134,11 +155,18 @@ defmodule Tightbeam.Recognition do
   defp finish(db, id) do
     # Arity-two deletes in its own commit. Arity-one is at-least-once across a
     # process crash between publication and deletion, as any external outbox is.
-    safely(fn ->
-      DB.transaction(db, &Txn.q(&1, "DELETE FROM pending_recognition WHERE id=?1", [id]))
-    end)
+    delete = fn ->
+      safely(fn ->
+        DB.transaction(db, &Txn.q(&1, "DELETE FROM pending_recognition WHERE id=?1", [id]))
+      end)
+    end
 
-    :ok
+    # Retry deletion once without publishing again. If both deletes fail, later
+    # replay is at least once, just as after a crash following publication.
+    case delete.() do
+      {:ok, _} -> :ok
+      {:error, _} -> delete.()
+    end
   end
 
   @impl true
@@ -146,7 +174,7 @@ defmodule Tightbeam.Recognition do
     Process.monitor(owner)
     :persistent_term.put({__MODULE__, owner}, self())
     if ready, do: Process.send_after(self(), :retry, 1_000)
-    {:ok, %{db: owner, ready: ready, active: %{}}}
+    {:ok, %{db: owner, ready: ready}}
   end
 
   @impl true
@@ -157,21 +185,9 @@ defmodule Tightbeam.Recognition do
 
   def handle_cast(:activate, state), do: {:noreply, state}
 
-  def handle_cast({:active, id, caller}, state) do
-    {:noreply, %{state | active: Map.put(state.active, id, Process.monitor(caller))}}
-  end
-
-  def handle_cast({:release, id}, state) do
-    if monitor = state.active[id], do: Process.demonitor(monitor, [:flush])
-    {:noreply, %{state | active: Map.delete(state.active, id)}}
-  end
-
   @impl true
   def handle_info({:DOWN, _, :process, owner, _}, %{db: owner} = state),
     do: {:stop, :normal, state}
-
-  def handle_info({:DOWN, monitor, :process, _, _}, state),
-    do: {:noreply, %{state | active: Map.reject(state.active, fn {_, ref} -> ref == monitor end)}}
 
   def handle_info(:retry, state) do
     case safely(fn -> DB.background_pass(fn -> retry_pass(state) end) end) do
@@ -189,20 +205,22 @@ defmodule Tightbeam.Recognition do
       do: :persistent_term.erase({__MODULE__, db})
   end
 
-  defp retry_pass(%{db: db, active: active}) do
+  defp retry_pass(%{db: db}), do: retry_due(db, System.monotonic_time(:millisecond) + 900)
+
+  defp retry_due(db, deadline) do
+    if System.monotonic_time(:millisecond) < deadline, do: retry_due_one(db, deadline)
+  end
+
+  defp retry_due_one(db, deadline) do
     case DB.query(
            db,
            "SELECT id,payload,attempts FROM pending_recognition WHERE flagged=0 AND nextAt<=?1 ORDER BY nextAt LIMIT 1",
            [now()]
          ) do
       {:ok, [[id, payload, attempts]]} ->
-        if Map.has_key?(active, id) do
-          DB.transaction(
-            db,
-            &Txn.q(&1, "UPDATE pending_recognition SET nextAt=?2 WHERE id=?1", [id, now() + 1_000])
-          )
-        else
-          retry_one(db, id, payload, attempts)
+        case retry_one(db, id, payload, attempts) do
+          {:error, error} -> raise error
+          _ -> retry_due(db, deadline)
         end
 
       {:ok, []} ->

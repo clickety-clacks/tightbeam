@@ -608,9 +608,8 @@ defmodule Tightbeam.TranscriptTest do
     # a guarantee that the returned error is content-free, which is not true.
     assert is_binary(returned.message)
 
-    assert raw_payload(ctx.db, "verb") == "null"
-
     raw = raw_payload(ctx.db, "verb")
+    assert {%{code: "server_error", crash: true, elided: true}, _} = Code.eval_string(raw)
     refute raw =~ "message:"
     refute raw =~ body
   end

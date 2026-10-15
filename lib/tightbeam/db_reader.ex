@@ -7,24 +7,8 @@ defmodule Tightbeam.DB.Reader do
   def start_link(path), do: GenServer.start_link(__MODULE__, path)
 
   def query(reader, sql, params, envelope) do
-    token = make_ref()
     budget = max(0, envelope.deadline - System.monotonic_time(:millisecond))
-
-    try do
-      GenServer.call(reader, {:query, token, sql, params, envelope}, budget)
-    catch
-      :exit, {:timeout, _} ->
-        # The reader waits for acknowledgement before starting another query.
-        # Interrupt only this request, never an earlier or subsequent caller.
-        case :persistent_term.get({__MODULE__, reader}, nil) do
-          {^token, conn} -> Sqlite3.interrupt(conn)
-          _ -> :ok
-        end
-
-        exit({:timeout, {GenServer, :call, [:redacted, budget]}})
-    after
-      send(reader, {:ack, token})
-    end
+    GenServer.call(reader, {:query, sql, params, envelope}, budget)
   end
 
   @impl true
@@ -37,9 +21,7 @@ defmodule Tightbeam.DB.Reader do
   end
 
   @impl true
-  def handle_call({:query, token, sql, params, envelope}, {caller, _} = from, conn) do
-    monitor = Process.monitor(caller)
-    :persistent_term.put({__MODULE__, self()}, {token, conn})
+  def handle_call({:query, sql, params, envelope}, _from, conn) do
     remaining = envelope.deadline - System.monotonic_time(:millisecond)
 
     # The timer covers the race where the caller times out just before this
@@ -71,24 +53,11 @@ defmodule Tightbeam.DB.Reader do
     send(timer, :done)
     receive do: ({:DOWN, ^timer_ref, :process, ^timer, _} -> :ok)
     {:reply, response, nil} = reply
-    GenServer.reply(from, response)
-
-    receive do
-      {:ack, ^token} -> :ok
-      {:DOWN, ^monitor, :process, ^caller, _} -> :ok
-    end
-
-    Process.demonitor(monitor, [:flush])
-    :persistent_term.erase({__MODULE__, self()})
-    {:noreply, conn}
+    {:reply, response, conn}
   end
 
   @impl true
-  def handle_info({:ack, _}, conn), do: {:noreply, conn}
-
-  @impl true
   def terminate(_, conn) do
-    :persistent_term.erase({__MODULE__, self()})
     Sqlite3.close(conn)
   end
 end

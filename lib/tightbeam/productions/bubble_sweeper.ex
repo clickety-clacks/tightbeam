@@ -114,8 +114,27 @@ defmodule Tightbeam.Productions.BubbleSweeper do
     prefix =
       Enum.reduce_while(prefix, [], fn seq, recognized ->
         case recognize_one(db, seq) do
-          :ok -> {:cont, [seq | recognized]}
-          _ -> {:halt, recognized}
+          :ok ->
+            Process.delete({__MODULE__, seq})
+            {:cont, [seq | recognized]}
+
+          {:error, %DB.Overloaded{}} ->
+            {:halt, recognized}
+
+          _ ->
+            failures = Process.get({__MODULE__, seq}, 0) + 1
+
+            if failures >= 5 do
+              Logger.error(
+                "bubble recognition skipping turn #{seq} after #{failures} failures; pending recognition retains retry intent"
+              )
+
+              Process.delete({__MODULE__, seq})
+              {:cont, [seq | recognized]}
+            else
+              Process.put({__MODULE__, seq}, failures)
+              {:halt, recognized}
+            end
         end
       end)
       |> Enum.reverse()

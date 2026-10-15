@@ -111,6 +111,7 @@ defmodule Tightbeam.DBObservation do
     started = System.monotonic_time()
 
     envelope = %{
+      publication: mode == :publication,
       dispatch_audit:
         if(Process.get(:tightbeam_dispatch_audited),
           do: nil,
@@ -207,7 +208,7 @@ defmodule Tightbeam.DBObservation do
   defp owner_request(server, request, envelope, _budget) do
     budget = remaining(envelope)
 
-    if Tightbeam.DB.overloaded?(server) do
+    if not envelope.publication and Tightbeam.DB.overloaded?(server) do
       {:reply, response, _} =
         server(envelope, nil, fn ->
           {:reply, {:error, %Tightbeam.DB.Overloaded{}}, nil}

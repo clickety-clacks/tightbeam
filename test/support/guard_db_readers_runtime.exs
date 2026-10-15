@@ -83,20 +83,10 @@ try do
       )
     end)
 
+  :erlang.trace(reader, true, [:receive])
   send(slow_pid, :run)
-  # Wait until the selected connection is executing the long statement.
-  wait_active = fn wait ->
-    case :persistent_term.get({Tightbeam.DB.Reader, reader}, nil) do
-      {_, _} ->
-        :ok
-
-      nil ->
-        Process.sleep(1)
-        wait.(wait)
-    end
-  end
-
-  wait_active.(wait_active)
+  assert_receive {:trace, ^reader, :receive, {:"$gen_call", _, {:query, _, _, _}}}
+  :erlang.trace(reader, false, [:receive])
   Process.sleep(20)
 
   assert {:ok, :written} =

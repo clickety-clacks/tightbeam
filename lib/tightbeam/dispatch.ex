@@ -16,7 +16,7 @@ defmodule Tightbeam.Dispatch do
 
   Rules evaluate each call before its handler runs. Handler database writes
   record an identity audit in their transaction. Dispatch queues remaining
-  audits and publication handoffs without waiting for the database owner.
+  audits and commits publication before returning the response.
   Read audits contain identity and verb rather than the returned content.
   """
 
@@ -426,7 +426,8 @@ defmodule Tightbeam.Dispatch do
       session_key: session_key,
       payload:
         cond do
-          kind == "verb" and verb in ~w(transcript breathing work-item-get) ->
+          kind == "verb" and verb in ~w(transcript breathing work-item-get) and
+              not match?(%{crash: true}, payload) ->
             nil
 
           kind == "denied" or verb == "onboard" or match?(%{code: _}, payload) or
@@ -439,8 +440,16 @@ defmodule Tightbeam.Dispatch do
       principal: principal
     }
 
-    unless DB.overloaded?(db) do
-      GenServer.cast(db, {:dispatch_audit, audit, handoff, audited?})
+    # Publication keeps its synchronous commit and handoff order, even when
+    # audit admission is overloaded. Only the audit may be deferred.
+    if handoff do
+      {:ok, _} = DB.publish_transaction(db, handoff)
+    end
+
+    skip? = audited? and kind == "verb" and not match?(%{crash: true}, payload)
+
+    unless skip? or DB.overloaded?(db) do
+      GenServer.cast(db, {:dispatch_audit, audit})
     end
 
     :ok

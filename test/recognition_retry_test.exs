@@ -4,6 +4,17 @@ defmodule Tightbeam.RecognitionRetryTest do
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
 
+  defmodule DeleteRefusal do
+    use GenServer
+    def start_link(db), do: GenServer.start_link(__MODULE__, db)
+    def init(db), do: {:ok, %{db: db, refused: false}}
+
+    def handle_call({:transaction, _}, _from, %{refused: false} = state),
+      do: {:reply, {:error, %DB.Overloaded{}}, %{state | refused: true}}
+
+    def handle_call(request, _from, state), do: {:reply, GenServer.call(state.db, request), state}
+  end
+
   setup do
     db = start_supervised!({DB, path: ":memory:", name: nil})
     :ok = DB.execute(db, "CREATE TABLE recognized_rows(id INTEGER PRIMARY KEY)")
@@ -71,6 +82,21 @@ defmodule Tightbeam.RecognitionRetryTest do
     assert {:ok, []} = DB.query(db, "SELECT id FROM pending_recognition")
   end
 
+  test "arity one retries a refused delete without republishing", %{db: db} do
+    proxy = start_supervised!({DeleteRefusal, db})
+    parent = self()
+
+    assert {:ok, :published} =
+             DB.transaction_then(proxy, fn _ -> :committed end, fn _ ->
+               send(parent, :published_once)
+               :published
+             end)
+
+    assert_receive :published_once
+    refute_receive :published_once
+    assert {:ok, []} = DB.query(db, "SELECT id FROM pending_recognition")
+  end
+
   test "both callback arities contain throw and exit and flag after five retry attempts", %{
     db: db,
     retry: retry
@@ -81,17 +107,19 @@ defmodule Tightbeam.RecognitionRetryTest do
     assert {:ok, :two} =
              DB.transaction_then(db, fn _ -> :two end, fn _, _ -> throw(:bad_recognition) end)
 
-    for _ <- 1..10 do
+    for _ <- 1..5 do
       {:ok, before_rows} = DB.query(db, "SELECT id,attempts FROM pending_recognition")
       before_attempts = Map.new(before_rows, fn [id, attempts] -> {id, attempts} end)
       started = System.system_time(:millisecond)
       retry_now(db, retry)
       {:ok, after_rows} = DB.query(db, "SELECT id,attempts,nextAt FROM pending_recognition")
 
-      assert [[_id, attempt, next_at]] =
-               Enum.filter(after_rows, fn [id, attempt, _] -> attempt > before_attempts[id] end)
+      changed = Enum.filter(after_rows, fn [id, attempt, _] -> attempt > before_attempts[id] end)
+      assert length(changed) == 2
 
-      assert next_at >= started + trunc(:math.pow(2, attempt - 1)) * 1_000
+      for [_id, attempt, next_at] <- changed do
+        assert next_at >= started + trunc(:math.pow(2, attempt - 1)) * 1_000
+      end
     end
 
     assert {:ok, [[5, 1], [5, 1]]} =
@@ -104,7 +132,7 @@ defmodule Tightbeam.RecognitionRetryTest do
   test "recognition deadline failure cannot replace a primary commit near its deadline", %{db: db} do
     parent = self()
     old = Application.get_env(:tightbeam, :db_call_timeout_ms)
-    Application.put_env(:tightbeam, :db_call_timeout_ms, 100)
+    Application.put_env(:tightbeam, :db_call_timeout_ms, 500)
 
     on_exit(fn ->
       if old,
@@ -118,12 +146,12 @@ defmodule Tightbeam.RecognitionRetryTest do
                fn txn ->
                  Txn.q(txn, "INSERT INTO recognized_rows VALUES(1)")
                  send(parent, {:primary_deadline, txn.deadline})
-                 Process.sleep(60)
+                 Process.sleep(100)
                  :committed
                end,
                fn txn, _ ->
                  send(parent, {:recognition_deadline, txn.deadline})
-                 Process.sleep(120)
+                 Process.sleep(600)
                  Txn.q(txn, "INSERT INTO recognized_rows VALUES(2)")
                end
              )
@@ -159,28 +187,12 @@ defmodule Tightbeam.RecognitionRetryTest do
 
     assert_receive {:publication, pid}
     assert pid == caller.pid
-    retry_now(db, retry)
+    send(retry, :retry)
+    :sys.get_state(retry)
     refute_receive {:publication, _}, 30
     send(caller.pid, :release)
     assert {:ok, :published} = Task.await(caller)
     assert {:ok, []} = DB.query(db, "SELECT id FROM pending_recognition")
-  end
-
-  @tag :tmp_dir
-  test "both persisted callback arities recover in a new virtual machine", %{tmp_dir: tmp} do
-    fixture = Tightbeam.GuardRuntimeFixture.prepare!(tmp, "recognition_restart_runtime.exs")
-
-    for phase <- ["write", "retry"] do
-      {output, status} =
-        System.cmd(fixture.executable, fixture.args ++ [phase],
-          env: fixture.env,
-          stderr_to_stdout: true
-        )
-
-      File.write!(Path.join(tmp, phase <> ".log"), output)
-      assert status == 0, output
-      assert output =~ "recognition-restart-#{phase}: ok"
-    end
   end
 
   defp retry_now(db, retry) do

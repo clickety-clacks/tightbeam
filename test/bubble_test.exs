@@ -941,6 +941,26 @@ defmodule Tightbeam.Productions.BubbleTest do
     assert Tightbeam.Productions.BubbleSweeper.sweep_now(sweeper) == 0
   end
 
+  test "a permanently failed turn cannot hold the sweep cursor forever", ctx do
+    seq = fail_turn!(ctx.db, "holder")
+    proxy = start_supervised!({RecognitionRefusal, ctx.db})
+
+    sweeper =
+      start_supervised!(
+        {Tightbeam.Productions.BubbleSweeper,
+         db: proxy, interval: 3_600_000, name: :"bounded_bubble_sweeper_#{ctx.db}"}
+      )
+
+    :sys.get_state(sweeper)
+    for _ <- 1..5, do: Tightbeam.Productions.BubbleSweeper.sweep_now(sweeper)
+
+    assert {:ok, [[cursor]]} =
+             DB.query(ctx.db, "SELECT seq FROM production_cursors WHERE name='bubble'")
+
+    assert cursor >= seq
+    assert Process.alive?(sweeper)
+  end
+
   test "a failed recognition holds the cursor and succeeds on a later sweep", ctx do
     seq = fail_turn!(ctx.db, "holder")
     proxy = start_supervised!({RecognitionRefusal, ctx.db})

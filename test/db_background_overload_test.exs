@@ -62,6 +62,27 @@ defmodule Tightbeam.DBBackgroundOverloadTest do
     assert {:noreply, ^state} = Tightbeam.Supervision.handle_info(:scheduled_sweep, state)
   end
 
+  test "sentinel stop notification skips overload", %{db: db} do
+    # An absent declaration takes the stop path during reconciliation.
+    state = %{db: db, host: "test-host", children: %{}, failures: %{}}
+
+    assert {:noreply, ^state} =
+             Tightbeam.SentinelSupervisor.handle_info({:restart, "missing"}, state)
+  end
+
+  test "turn cancellation skips overload without losing lane state", %{db: db} do
+    state = %{
+      db: db,
+      task_ref: make_ref(),
+      current_seq: 1,
+      current_message_id: "message",
+      current_owner_lease: nil
+    }
+
+    assert {:reply, {:error, %DB.Overloaded{}}, ^state} =
+             Tightbeam.SessionLane.handle_call(:cancel_current, {self(), make_ref()}, state)
+  end
+
   test "retention skips overload and preserves its cursor", %{db: db} do
     state = %{db: db, days: 60, cursor: 42, cutoff: nil}
     assert {:noreply, ^state} = Tightbeam.Retention.handle_info(:trim, state)

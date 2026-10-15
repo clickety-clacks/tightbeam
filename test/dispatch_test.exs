@@ -29,24 +29,29 @@ defmodule Tightbeam.DispatchTest do
     %{db: name}
   end
 
-  test "read audit cannot delay or fail a successful response", %{db: db} do
+  test "publication commits before response and audit failure preserves success", %{db: db} do
     call = %{verb: "transcript", origin: "user:flynn", session_key: "s1", params: %{}}
-    # Rules and publication do their established reads before invoking the handler.
-    # Suspend at the handler's completion, exactly where the audit used to block.
+    parent = self()
+
     handlers = %{
       "transcript" => fn _ ->
         :sys.suspend(db)
+        send(parent, :handler_completed)
         %{entries: ["large result"]}
       end
     }
 
+    task = Task.async(fn -> Dispatch.dispatch(db, handlers, call) end)
+
     try do
-      assert {:ok, %{entries: ["large result"]}} = Dispatch.dispatch(db, handlers, call)
+      assert_receive :handler_completed
+      assert Task.yield(task, 30) == nil
     after
       :sys.resume(db)
     end
 
-    assert {:ok, [["null"]]} = DB.query(db, "SELECT payload FROM events")
+    assert {:ok, %{entries: ["large result"]}} = Task.await(task)
+    wait_for_audit(db, "SELECT payload FROM events", [["null"]])
 
     :ok =
       DB.execute(
@@ -62,6 +67,72 @@ defmodule Tightbeam.DispatchTest do
              )
 
     assert {:ok, [[1]]} = DB.query(db, "SELECT count(*) FROM events")
+  end
+
+  test "publication survives audit overload and precedes the response", %{db: db} do
+    parent = self()
+
+    handler = fn _ ->
+      :sys.suspend(db)
+
+      for _ <- 1..128,
+          do: send(db, {:"$gen_call", {self(), make_ref()}, {:query, "SELECT 1", []}})
+
+      send(parent, :overloaded)
+      %{entries: []}
+    end
+
+    call = %{
+      verb: "transcript",
+      origin: "user:flynn",
+      session_key: nil,
+      params: %{},
+      firehose_hub: self()
+    }
+
+    task = Task.async(fn -> Dispatch.dispatch(db, %{"transcript" => handler}, call) end)
+
+    try do
+      assert_receive :overloaded
+      assert Task.yield(task, 30) == nil
+    after
+      :sys.resume(db)
+    end
+
+    assert {:ok, %{entries: []}} = Task.await(task)
+    assert_receive {:"$gen_cast", {:accepted, nil, ^call, %{entries: []}}}
+  end
+
+  test "write then denial or crash retains the outcome audit", %{db: db} do
+    :ok = DB.execute(db, "CREATE TABLE written_before_outcome(id INTEGER)")
+
+    for outcome <- [:denial, :crash] do
+      handler = fn _ ->
+        {:ok, _} =
+          DB.transaction(db, &DB.Txn.q(&1, "INSERT INTO written_before_outcome VALUES(1)"))
+
+        case outcome do
+          :denial -> %{code: "forbidden"}
+          :crash -> raise "handler failed"
+        end
+      end
+
+      verb = if outcome == :denial, do: "post", else: "transcript"
+      call = %{verb: verb, origin: "user:flynn", session_key: nil, params: %{}}
+      assert {:error, _} = Dispatch.dispatch(db, %{verb => handler}, call)
+    end
+
+    :sys.get_state(db)
+    events = EventLog.events_after(db, 0, 10)
+    assert Enum.count(events, &(&1.kind == "denied")) == 1
+
+    assert {:ok, [[payload]]} =
+             DB.query(
+               db,
+               "SELECT payload FROM events WHERE verb='transcript' AND payload<>'null'"
+             )
+
+    assert {%{crash: true, code: "server_error"}, _} = Code.eval_string(payload)
   end
 
   test "a write and its audit commit together and are not appended twice", %{db: db} do
@@ -238,9 +309,8 @@ defmodule Tightbeam.DispatchTest do
       {:ok, [[payload]]} = DB.query(db, "SELECT payload FROM events ORDER BY id DESC LIMIT 1")
       refute payload =~ sentinel
 
-      if verb == "work-item-get",
-        do: assert(payload == "null"),
-        else: assert(payload =~ "bodyElided")
+      assert {%{code: "server_error", crash: true, bodyElided: true}, _} =
+               Code.eval_string(payload)
     end
   end
 
@@ -426,5 +496,19 @@ defmodule Tightbeam.DispatchTest do
              }
            ] =
              EventLog.rail_denials(db, 0, 10)
+  end
+
+  defp wait_for_audit(db, sql, expected, attempts \\ 100)
+  defp wait_for_audit(db, sql, expected, 0), do: assert(DB.query(db, sql) == {:ok, expected})
+
+  defp wait_for_audit(db, sql, expected, attempts) do
+    case DB.query(db, sql) do
+      {:ok, ^expected} ->
+        :ok
+
+      _ ->
+        Process.sleep(10)
+        wait_for_audit(db, sql, expected, attempts - 1)
+    end
   end
 end

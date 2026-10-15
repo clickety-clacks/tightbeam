@@ -322,6 +322,17 @@ defmodule Tightbeam.DB do
     end
   end
 
+  @doc false
+  def publish_transaction(server, callback) do
+    DBObservation.call(
+      server,
+      {:transaction, callback},
+      "db.transaction",
+      call_timeout(),
+      :publication
+    )
+  end
+
   @doc "Atomically check references and hold a monitored archetype-release fence."
   @spec begin_reference_fence(
           server(),
@@ -843,7 +854,7 @@ defmodule Tightbeam.DB do
 
   def handle_call(
         {:transaction_then, prepare, after_commit, opts},
-        {caller, _},
+        _from,
         %{conn: conn} = state
       )
       when is_function(after_commit) do
@@ -857,7 +868,7 @@ defmodule Tightbeam.DB do
             fn txn ->
               result = callback.(txn)
               transitions = take_row_commits(txn)
-              Tightbeam.Recognition.record(txn, after_commit, result, transitions, opts, caller)
+              Tightbeam.Recognition.record(txn, after_commit, result, transitions, opts)
             end,
             fenced_archetypes(state)
           )
@@ -914,24 +925,20 @@ defmodule Tightbeam.DB do
   end
 
   @impl true
-  def handle_cast({:dispatch_audit, audit, handoff, skip?}, %{conn: conn} = state) do
+  def handle_cast({:dispatch_audit, audit}, %{conn: conn} = state) do
     case commit_phase(
            conn,
            fn txn ->
-             unless skip? do
-               Tightbeam.EventLog.append_event_in_txn(
-                 txn,
-                 audit.kind,
-                 audit.verb,
-                 audit.origin,
-                 audit.session_key,
-                 audit.payload,
-                 audit.principal,
-                 System.system_time(:millisecond)
-               )
-             end
-
-             if handoff, do: handoff.(txn)
+             Tightbeam.EventLog.append_event_in_txn(
+               txn,
+               audit.kind,
+               audit.verb,
+               audit.origin,
+               audit.session_key,
+               audit.payload,
+               audit.principal,
+               System.system_time(:millisecond)
+             )
            end,
            fenced_archetypes(state)
          ) do
