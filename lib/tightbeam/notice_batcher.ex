@@ -708,7 +708,7 @@ defmodule Tightbeam.NoticeBatcher do
       """
       SELECT w.wakeId FROM wakes w
       WHERE w.state='pending' AND w.consumer='prompt' AND w.digest=0
-        AND (?2 IS NULL OR w.sessionKey=?2 OR w.targetRole IS NOT NULL)
+        AND (?2 IS NULL OR w.sessionKey=?2 OR w.targetRole IS NOT NULL OR w.targetGate<>0)
         AND COALESCE(w.deliveryRule,'')<>'turn-boundary-digest r1'
         AND (w.conditionKind IS NULL OR w.firedAt IS NOT NULL)
         AND (w.waitMode IS NULL OR w.recognitionAt IS NOT NULL)
@@ -783,7 +783,7 @@ defmodule Tightbeam.NoticeBatcher do
       :busy
     else
       sources =
-        ready_sources_in_txn(txn, at, target)
+        ready_sources_in_txn(txn, at)
         |> Enum.filter(&MapSet.member?(own_ids, &1))
         |> Enum.reject(&MapSet.member?(deferred_ids, &1))
         |> Enum.flat_map(fn wake_id ->

@@ -112,6 +112,68 @@ defmodule Tightbeam.NoticeDrainTest do
     assert is_integer(seq)
   end
 
+  for scope <- [:all, :recipient] do
+    @scope scope
+    test "#{scope} drain delivers a lineage notice to the successor after a respawn", ctx do
+      :ok =
+        DB.execute(ctx.db, """
+        INSERT INTO sessions(sessionKey,displayName,ownerUserId,origin,archetype,harness,provider,model,host,spawnedBy,createdAt,updatedAt)
+        VALUES('child','child','owner','user:owner','default','claude','anthropic','claude-sonnet-5','local','recipient',1,1),
+          ('successor','successor','owner','user:owner','default','claude','anthropic','claude-sonnet-5','local',NULL,2,2);
+        INSERT INTO work_items(id,title,ownerUserId,state,createdByUser,createdAt)
+        VALUES('lineage-work','Lineage work','owner','open','owner',1);
+        INSERT INTO assignments(id,subject,holderKey,openedByUser,openedAt,workItemId)
+        VALUES('lineage-assignment','Lineage assignment','child','owner',1,'lineage-work');
+        """)
+
+      wake =
+        Wakes.schedule(ctx.db, %{
+          session_key: "recipient",
+          origin: "process:test",
+          prompt: "notice for the current parent",
+          due_at: System.system_time(:millisecond),
+          reresolve: "lineage",
+          reresolve_seed: "child",
+          reresolve_rung: 1
+        })
+
+      # Preserve the child's creation parent while recording its current parent
+      # after the original recipient retires and its successor takes over.
+      :ok =
+        DB.execute(ctx.db, """
+        UPDATE sessions SET state='retired' WHERE sessionKey='recipient';
+        INSERT INTO session_reparent_events(eventId,ownerUserId,childSessionKey,assignmentId,workItemId,
+          originParentSessionKey,previousCurrentParentSessionKey,newCurrentParentSessionKey,
+          originAssignmentOpenerKind,originAssignmentOpenerRef,newCurrentCoordinationParentSessionKey,
+          cause,principalKind,principalRef,idempotencyKey,requestFingerprint,createdAt)
+        VALUES('lineage-reparent','owner','child','lineage-assignment','lineage-work',
+          'recipient','recipient','successor','user','owner','successor',
+          'owner_topology_correction','user','user:owner','lineage-reparent','lineage-reparent',2);
+        """)
+
+      recipient = if @scope == :recipient, do: "successor", else: nil
+
+      assert [carrier] =
+               Tightbeam.NoticeBatcher.recover(
+                 ctx.db,
+                 System.system_time(:millisecond),
+                 ctx.delivery_opts,
+                 recipient
+               )
+
+      assert Wakes.get(ctx.db, wake.wake_id).session_key == "recipient"
+      assert Wakes.get(ctx.db, wake.wake_id).state == "fired"
+
+      assert {:ok, [["successor", seq]]} =
+               DB.query(ctx.db, "SELECT sessionKey,seq FROM turns WHERE wakeId=?1", [carrier])
+
+      assert is_integer(seq)
+      assert Wakes.get(ctx.db, carrier).delivered_turn_seq == seq
+      assert Enum.map(Wakes.digest_members(ctx.db, carrier), & &1.wake_id) == [wake.wake_id]
+      assert Tightbeam.NoticeBatcher.recover(ctx.db, System.system_time(:millisecond), ctx.delivery_opts) == []
+    end
+  end
+
   test "a failed backfill logs and waits five seconds before retrying", ctx do
     :ok =
       DB.execute(ctx.db, """
