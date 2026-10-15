@@ -2688,6 +2688,32 @@ defmodule Tightbeam.Wakes do
     end
   end
 
+  defp log_wake_deferral(wake_id, operation, error) do
+    key = {__MODULE__, :deferred_wake_ids}
+    logged = Process.get(key, MapSet.new())
+
+    unless MapSet.member?(logged, wake_id) do
+      Process.put(key, MapSet.put(logged, wake_id))
+      Logger.warning("wake #{wake_id} #{operation} deferred: #{Exception.message(error)}")
+    end
+  end
+
+  defp recognize_wake_in_savepoint(txn, wake_id, recognize) do
+    :ok = Txn.exec(txn, "SAVEPOINT wake_recognition")
+
+    try do
+      result = recognize.()
+      :ok = Txn.exec(txn, "RELEASE wake_recognition")
+      result
+    rescue
+      error ->
+        :ok = Txn.exec(txn, "ROLLBACK TO wake_recognition")
+        :ok = Txn.exec(txn, "RELEASE wake_recognition")
+        log_wake_deferral(wake_id, "recognition", error)
+        []
+    end
+  end
+
   defp recognize_wait_transitions_in_txn(txn, transitions) do
     unowned_fact? = fn transition ->
       is_map(transition) and transition[:domain] == "condition_fact" and
@@ -2717,77 +2743,91 @@ defmodule Tightbeam.Wakes do
       Txn.q(
         txn,
         """
-        SELECT wakeId FROM wakes
+        SELECT wakeId,predicate,resolverKind,resolverId,verificationAssignmentId,verificationState FROM wakes
         WHERE state='pending' AND waitMode='dependency' AND recognitionAt IS NULL
           AND ownerUserId=?1
         ORDER BY rowid
         """,
         [owner_user_id]
       )
-      |> Enum.each(fn [wake_id] ->
-        case wait_in_txn(txn, wake_id) do
-          nil ->
-            :ok
+      |> Enum.each(fn [
+                        wake_id,
+                        predicate,
+                        resolver_kind,
+                        resolver_id,
+                        verifier,
+                        verification_state
+                      ] ->
+        recognize_wake_in_savepoint(txn, wake_id, fn ->
+          wake = %{
+            wake_id: wake_id,
+            owner_user_id: owner_user_id,
+            predicate: decode_optional(predicate),
+            resolver_kind: resolver_kind,
+            resolver_id: resolver_id,
+            verification_assignment_id: verifier,
+            verification_state: verification_state
+          }
 
-          wake ->
-            owner_transitions =
-              Enum.filter(transitions, &(&1.owner_user_id == wake.owner_user_id))
+          owner_transitions =
+            Enum.filter(transitions, &(&1.owner_user_id == wake.owner_user_id))
 
-            predicate_transition =
-              Enum.find(transitions, fn transition ->
-                (transition.owner_user_id == wake.owner_user_id or unowned_fact?.(transition)) and
-                  predicate_transition_relevant?(txn, wake, transition)
-              end)
+          predicate_transition =
+            Enum.find(transitions, fn transition ->
+              (transition.owner_user_id == wake.owner_user_id or unowned_fact?.(transition)) and
+                predicate_transition_relevant?(txn, wake, transition)
+            end)
 
-            resolver_transition =
-              Enum.find(owner_transitions, &resolver_transition_relevant?(wake, &1))
+          resolver_transition =
+            Enum.find(owner_transitions, &resolver_transition_relevant?(wake, &1))
 
-            verification_transition =
-              Enum.find(owner_transitions, &verification_terminal_transition?(wake, &1))
+          verification_transition =
+            Enum.find(owner_transitions, &verification_terminal_transition?(wake, &1))
 
-            if predicate_transition || resolver_transition || verification_transition do
-              evaluation = evaluate_wait_predicate_in_txn(txn, wake)
-              resolver = resolver_for_wake_in_txn(txn, wake)
+          if predicate_transition || resolver_transition || verification_transition do
+            wake = wait_in_txn(txn, wake_id)
+            evaluation = evaluate_wait_predicate_in_txn(txn, wake)
+            resolver = resolver_for_wake_in_txn(txn, wake)
 
-              cond do
-                evaluation.matched and predicate_transition ->
-                  recognize_wait_in_txn(
-                    txn,
-                    wake,
-                    "success",
-                    nil,
-                    evaluation,
-                    resolver,
-                    predicate_transition
-                  )
+            cond do
+              evaluation.matched and predicate_transition ->
+                recognize_wait_in_txn(
+                  txn,
+                  wake,
+                  "success",
+                  nil,
+                  evaluation,
+                  resolver,
+                  predicate_transition
+                )
 
-                resolver.terminal and resolver_transition ->
-                  recognize_wait_in_txn(
-                    txn,
-                    wake,
-                    "reconsideration",
-                    "resolver-terminal",
-                    evaluation,
-                    resolver,
-                    resolver_transition
-                  )
+              resolver.terminal and resolver_transition ->
+                recognize_wait_in_txn(
+                  txn,
+                  wake,
+                  "reconsideration",
+                  "resolver-terminal",
+                  evaluation,
+                  resolver,
+                  resolver_transition
+                )
 
-                verification_transition ->
-                  recognize_wait_in_txn(
-                    txn,
-                    wake,
-                    "reconsideration",
-                    "verification-terminal",
-                    evaluation,
-                    resolver,
-                    verification_transition
-                  )
+              verification_transition ->
+                recognize_wait_in_txn(
+                  txn,
+                  wake,
+                  "reconsideration",
+                  "verification-terminal",
+                  evaluation,
+                  resolver,
+                  verification_transition
+                )
 
-                true ->
-                  wake
-              end
+              true ->
+                wake
             end
-        end
+          end
+        end)
       end)
     end)
 
@@ -4212,9 +4252,20 @@ defmodule Tightbeam.Wakes do
       )
 
     Enum.each(rows, fn [wake_id] ->
-      case get(db, wake_id) do
-        %{state: "pending"} = wake -> dispose_closed_remedy(db, wake)
-        _ -> :ok
+      try do
+        case get(db, wake_id) do
+          %{state: "pending"} = wake -> dispose_closed_remedy(db, wake)
+          _ -> :ok
+        end
+      rescue
+        error in DB.Overloaded ->
+          reraise error, __STACKTRACE__
+
+        error ->
+          if match?(%MatchError{term: {:error, %DB.Overloaded{}}}, error),
+            do: reraise(error, __STACKTRACE__)
+
+          log_wake_deferral(wake_id, "remedy cleanup", error)
       end
     end)
 
@@ -6325,17 +6376,19 @@ defmodule Tightbeam.Wakes do
       [fact_id]
     )
     |> Enum.flat_map(fn [wake_id] ->
-      case Txn.q(txn, select_wake_sql() <> " WHERE wakeId=?1", [wake_id]) do
-        [row] ->
-          case fire_in_txn(txn, to_wake(row), fact_id) do
-            {:fired, :staged} -> [{:condition_batch_ready, wake_id}]
-            {:fired, delivery} -> [delivery]
-            :noop -> []
-          end
+      recognize_wake_in_savepoint(txn, wake_id, fn ->
+        case Txn.q(txn, select_wake_sql() <> " WHERE wakeId=?1", [wake_id]) do
+          [row] ->
+            case fire_in_txn(txn, to_wake(row), fact_id) do
+              {:fired, :staged} -> [{:condition_batch_ready, wake_id}]
+              {:fired, delivery} -> [delivery]
+              :noop -> []
+            end
 
-        [] ->
-          []
-      end
+          [] ->
+            []
+        end
+      end)
     end)
   end
 
@@ -6622,9 +6675,15 @@ defmodule Tightbeam.Wakes do
     # linked carriers for this pass, never the unrelated due batch. Consumed
     # carriers are not reset; absent liveness remains a visible pending notice.
     entries =
-      Enum.map(rows, fn row ->
-        {wake_row, carriers} = Enum.split(row, -2)
-        {to_wake(wake_row), Enum.reject(carriers, &is_nil/1)}
+      Enum.flat_map(rows, fn row ->
+        try do
+          {wake_row, carriers} = Enum.split(row, -2)
+          [{to_wake(wake_row), Enum.reject(carriers, &is_nil/1)}]
+        rescue
+          error ->
+            log_wake_deferral(hd(row), "due delivery", error)
+            []
+        end
       end)
 
     deferred =
@@ -6723,8 +6782,14 @@ defmodule Tightbeam.Wakes do
 
     Enum.each(rows, fn [wake_id] ->
       case DB.transaction(db, fn txn -> recognize_due_dependency_in_txn(txn, wake_id) end) do
-        {:ok, _} -> :ok
-        {:error, error} -> raise error
+        {:ok, _} ->
+          :ok
+
+        {:error, %DB.Overloaded{} = error} ->
+          raise error
+
+        {:error, error} ->
+          log_wake_deferral(wake_id, "dependency recognition", error)
       end
     end)
 
@@ -6799,8 +6864,12 @@ defmodule Tightbeam.Wakes do
         {:ok, _} ->
           []
 
-        {:error, error} ->
+        {:error, %DB.Overloaded{} = error} ->
           raise error
+
+        {:error, error} ->
+          log_wake_deferral(wake_id, "wait delivery", error)
+          []
       end
     end)
   end
@@ -7423,10 +7492,20 @@ defmodule Tightbeam.Wakes do
       )
 
     case result do
-      {:ok, {:fired, :staged}} -> GenServer.cast(self(), :wake_ready)
-      {:ok, {:fired, delivery}} -> Gateway.complete_delivery(db, delivery)
-      {:ok, _} -> :ok
-      {:error, error} -> raise error
+      {:ok, {:fired, :staged}} ->
+        GenServer.cast(self(), :wake_ready)
+
+      {:ok, {:fired, delivery}} ->
+        Gateway.complete_delivery(db, delivery)
+
+      {:ok, _} ->
+        :ok
+
+      {:error, %DB.Overloaded{} = error} ->
+        raise error
+
+      {:error, error} ->
+        log_wake_deferral(wake_id, "condition delivery", error)
     end
   end
 

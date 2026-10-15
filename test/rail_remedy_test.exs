@@ -90,6 +90,73 @@ defmodule Tightbeam.RailRemedyTest do
     }
   end
 
+  for invalid <- ["{", "{}"] do
+    test "bad episode #{inspect(invalid)} leaves other review recovery and wake delivery running",
+         ctx do
+      bad = notice_assignment(ctx, "bad recovery")
+      good = notice_assignment(ctx, "healthy recovery")
+      fire_review_notice(ctx, bad)
+      fire_review_notice(ctx, good)
+
+      assert {:ok, _} =
+               DB.query(
+                 ctx.db,
+                 "UPDATE rail_remedy_episodes SET noticeState=?2 WHERE subject=?1",
+                 [bad.id, unquote(invalid)]
+               )
+
+      assert {:ok, _} =
+               DB.query(
+                 ctx.db,
+                 "UPDATE rail_remedy_episodes SET noticeState=NULL WHERE subject=?1",
+                 [good.id]
+               )
+
+      parent = self()
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          pid =
+            start_supervised!(
+              {Wakes,
+               db: ctx.db,
+               name: Tightbeam.WakeScheduler,
+               delivery_opts: ctx.delivery_opts,
+               deliver: fn _ -> :skipped end,
+               internal_consumers: %{
+                 "test" => fn wake -> send(parent, {:healthy_delivery, wake.wake_id}) end,
+                 "review_remedy_reconcile" => fn _ -> :ok end
+               }}
+            )
+
+          ordinary =
+            Wakes.schedule(ctx.db, %{
+              session_key: ctx.holder.session_key,
+              origin: "system",
+              prompt: "ordinary",
+              due_at: 1,
+              consumer: "test"
+            })
+
+          assert :ok = Wakes.fire_due(pid)
+          assert_receive {:healthy_delivery, id}, 1_000
+          assert id == ordinary.wake_id
+          assert Process.alive?(pid)
+        end)
+
+      assert log =~ bad.id
+      assert log =~ "episode"
+      assert RailRemedy.episode(ctx.db, "completion-requires-review", good.id).notice_state != nil
+
+      assert {:ok, [[encoded]]} =
+               DB.query(ctx.db, "SELECT noticeState FROM rail_remedy_episodes WHERE subject=?1", [
+                 bad.id
+               ])
+
+      assert encoded == unquote(invalid)
+    end
+  end
+
   test "an open review episode sleeps until readiness or a verdict", ctx do
     assignment = notice_assignment(ctx, "event reassessment")
     %{producer_id: root} = fire_review_notice(ctx, assignment)
