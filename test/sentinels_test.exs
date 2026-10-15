@@ -214,15 +214,29 @@ defmodule Tightbeam.SentinelsTest do
 
       assert %{sentinel: "alpha-bundle/watch", name: "WATCH_TARGET", changed: true} = set
 
+      reserved_name_set =
+        handlers["host-env-set"].(%{
+          origin: "user:flynn",
+          params: %{
+            sentinel: "alpha-bundle/watch",
+            name: "CODEX_HOME",
+            value: "synthetic-codex-home"
+          }
+        })
+
+      assert %{sentinel: "alpha-bundle/watch", name: "CODEX_HOME", changed: true} =
+               reserved_name_set
+
       listed =
         handlers["host-env-list"].(%{
           origin: "user:flynn",
           params: %{sentinel: "alpha-bundle/watch"}
         })
 
-      assert [%{name: "WATCH_TARGET"}] = listed.settings
+      assert Enum.sort(Enum.map(listed.settings, & &1.name)) == ["CODEX_HOME", "WATCH_TARGET"]
       assert listed.missing == ["WATCH_EXTRA"]
-      refute inspect({set, listed}) =~ "synthetic-secret-value"
+      refute inspect({set, reserved_name_set, listed}) =~ "synthetic-secret-value"
+      refute inspect({set, reserved_name_set, listed}) =~ "synthetic-codex-home"
 
       assert %{overlays: []} = handlers["host-env-list"].(%{origin: "user:flynn", params: %{}})
 
@@ -237,6 +251,17 @@ defmodule Tightbeam.SentinelsTest do
                    harness: "claude",
                    name: "WATCH_TARGET",
                    value: "x"
+                 }
+               })
+
+      assert %{code: "reserved_env_name"} =
+               handlers["host-env-set"].(%{
+                 origin: "user:flynn",
+                 params: %{
+                   host: ctx.host,
+                   harness: "claude",
+                   name: "CODEX_HOME",
+                   value: "synthetic-codex-home"
                  }
                })
 
@@ -414,7 +439,8 @@ defmodule Tightbeam.SentinelsTest do
 
       set_settings!(ctx, "alpha-bundle/watch", %{
         "WATCH_TARGET" => "alpha-value",
-        "WATCH_EXTRA" => "e"
+        "WATCH_EXTRA" => "e",
+        "CODEX_HOME" => "/synthetic/codex-home"
       })
 
       set_settings!(ctx, "beta-bundle/watch", %{
@@ -453,6 +479,7 @@ defmodule Tightbeam.SentinelsTest do
       assert env["TIGHTBEAM_AS_PROCESS"] == "sentinel:alpha-bundle/watch"
       assert env["TIGHTBEAM_BASE_DIR"] == ctx.base
       assert env["WATCH_TARGET"] == "alpha-value"
+      assert env["CODEX_HOME"] == "/synthetic/codex-home"
       assert String.starts_with?(env["PATH"], "/synthetic/cli/bin:")
       refute Map.has_key?(env, "TIGHTBEAM_TOKEN")
       refute Map.has_key?(env, "WATCH_EXTRA")

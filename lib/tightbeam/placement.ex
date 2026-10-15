@@ -352,8 +352,9 @@ defmodule Tightbeam.Placement do
   def set_sentinel_env(db, host, scope, name, value, set_by, call) do
     "sentinel:" <> _qualified = scope
 
-    with :ok <- valid_env_name(name),
-         :ok <- unreserved_sentinel_env_name(name) do
+    # Sentinel settings are operator-selected and passed through opaquely; the
+    # harness reservation policy applies only to harness environment overlays.
+    with :ok <- valid_env_name(name) do
       {:ok, changed} =
         DB.transaction(db, fn txn ->
           DB.Txn.q(
@@ -1126,12 +1127,6 @@ defmodule Tightbeam.Placement do
         :ok
     end
   end
-
-  # GH_CONFIG_DIR is reserved for harness overlays because Tightbeam pins the
-  # GitHub bank for agent sessions. A sentinel has its own isolated environment
-  # and owns its explicitly configured settings, so it may use that name.
-  defp unreserved_sentinel_env_name("GH_CONFIG_DIR"), do: :ok
-  defp unreserved_sentinel_env_name(name), do: unreserved_env_name(name)
 
   defp known_host_in_txn?(txn, host) do
     host == local_host_name() or
