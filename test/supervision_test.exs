@@ -2832,7 +2832,7 @@ defmodule Tightbeam.SupervisionTest do
     assert {:ok, [["fired"]]} =
              DB.query(
                ctx.db,
-               "SELECT endedWakeState FROM supervision_liveness_sidecar WHERE wakeId=?1",
+               "SELECT endedWakeState FROM supervision_ended_controllers WHERE wakeId=?1",
                [controller.wake_id]
              )
   end
@@ -2847,7 +2847,7 @@ defmodule Tightbeam.SupervisionTest do
     assert {:ok, [["canceled"]]} =
              DB.query(
                ctx.db,
-               "SELECT endedWakeState FROM supervision_liveness_sidecar WHERE wakeId=?1",
+               "SELECT endedWakeState FROM supervision_ended_controllers WHERE wakeId=?1",
                [controller.wake_id]
              )
   end

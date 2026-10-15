@@ -1727,14 +1727,13 @@ defmodule Tightbeam.Schema do
   end
 
   # This additive marker is independent of the predecessor shape migrations.
-  # Historical data is copied in bounded batches by the existing sweep.
+  # Historical cleanup state is copied in the same transaction as the marker.
   defp migrate_supervision_recorded_state(db) do
     {:ok, :ok} =
       DB.transaction(db, fn txn ->
         Txn.exec(txn, """
         CREATE TABLE IF NOT EXISTS supervision_state_migration (
-          id INTEGER PRIMARY KEY CHECK(id=0), wakeCursor INTEGER NOT NULL DEFAULT 0,
-          observationCursor INTEGER NOT NULL DEFAULT 0, complete INTEGER NOT NULL DEFAULT 0
+          id INTEGER PRIMARY KEY CHECK(id=0)
         )
         """)
 
@@ -1754,22 +1753,23 @@ defmodule Tightbeam.Schema do
             ALTER TABLE wakes ADD COLUMN idleCleanupRecorded INTEGER NOT NULL DEFAULT 0;
             CREATE INDEX idle_cleanup_pending_group ON wakes(idleCleanupGroup)
               WHERE state='pending' AND consumer='prompt';
-            ALTER TABLE supervision_liveness_sidecar ADD COLUMN endedWakeState TEXT;
+            CREATE TABLE supervision_ended_controllers (
+              wakeId TEXT PRIMARY KEY, assignmentId TEXT NOT NULL,
+              endedWakeState TEXT NOT NULL CHECK(endedWakeState IN ('fired','canceled'))
+            );
             CREATE INDEX supervision_liveness_ended_controller
-              ON supervision_liveness_sidecar(assignmentId,wakeId)
-              WHERE controllerOrigin='scheduled' AND controllerState='pending'
-                AND endedWakeState IS NOT NULL;
-            UPDATE supervision_liveness_sidecar SET endedWakeState=(
-              SELECT state FROM wakes WHERE wakeId=supervision_liveness_sidecar.wakeId
-                AND state IN ('fired','canceled'))
-              WHERE controllerOrigin='scheduled' AND controllerState='pending'
-                AND EXISTS(SELECT 1 FROM wakes WHERE wakeId=supervision_liveness_sidecar.wakeId
-                           AND state IN ('fired','canceled'));
+              ON supervision_ended_controllers(assignmentId,wakeId);
+            INSERT INTO supervision_ended_controllers(wakeId,assignmentId,endedWakeState)
+            SELECT s.wakeId,s.assignmentId,w.state FROM supervision_liveness_sidecar s
+            JOIN wakes w ON w.wakeId=s.wakeId
+            WHERE s.controllerOrigin='scheduled' AND s.controllerState='pending'
+              AND w.state IN ('fired','canceled');
             CREATE TRIGGER supervision_record_controller_end AFTER UPDATE OF state ON wakes
             WHEN NEW.state IN ('fired','canceled') AND OLD.state<>NEW.state
             BEGIN
-              UPDATE supervision_liveness_sidecar SET endedWakeState=NEW.state
-              WHERE wakeId=NEW.wakeId AND controllerOrigin='scheduled';
+              INSERT OR REPLACE INTO supervision_ended_controllers(wakeId,assignmentId,endedWakeState)
+              SELECT wakeId,assignmentId,NEW.state FROM supervision_liveness_sidecar
+              WHERE wakeId=NEW.wakeId AND controllerOrigin='scheduled' AND controllerState = 'pending';
             END;
             ALTER TABLE patrol_failure_boundary ADD COLUMN lastTurnSeq INTEGER NOT NULL DEFAULT 0;
             CREATE TRIGGER patrol_terminal_checkpoint_rewind AFTER UPDATE OF endedAt ON turns
@@ -1782,10 +1782,10 @@ defmodule Tightbeam.Schema do
             BEGIN
               UPDATE patrol_failure_boundary SET lastTurnSeq=MIN(lastTurnSeq,NEW.seq-1) WHERE id=0;
             END;
-            INSERT INTO supervision_state_migration(id,complete)
-            SELECT 0,NOT EXISTS(SELECT 1 FROM wakes) AND
-              NOT EXISTS(SELECT 1 FROM lifecycle_events WHERE kind='idle_cleanup_pending_observed');
             """)
+
+          :ok = Tightbeam.Supervision.copy_idle_cleanup_history_in_txn(txn)
+          :ok = Txn.exec(txn, "INSERT INTO supervision_state_migration(id) VALUES(0)")
         end
 
         :ok
@@ -2438,14 +2438,6 @@ defmodule Tightbeam.Schema do
       {"idle_cleanup_wakes_pending_session",
        "CREATE INDEX IF NOT EXISTS idle_cleanup_wakes_pending_session " <>
          "ON wakes(sessionKey, wakeId) WHERE state='pending' AND consumer='prompt'"},
-      {"idle_cleanup_wakes_delivery_history",
-       "CREATE INDEX IF NOT EXISTS idle_cleanup_wakes_delivery_history " <>
-         "ON wakes(obligationRef COLLATE NOCASE) " <>
-         "WHERE origin='process:tightbeam' AND state='fired' AND obligationRef IS NOT NULL"},
-      {"idle_cleanup_wakes_pending_group",
-       "CREATE INDEX IF NOT EXISTS idle_cleanup_wakes_pending_group " <>
-         "ON wakes(obligationRef COLLATE NOCASE) " <>
-         "WHERE origin='process:tightbeam' AND state='pending' AND consumer='prompt' AND obligationRef IS NOT NULL"},
       # Delivery-history lookups by source wake (NoticeBatcher.source_delivered_sql/1
       # and source_deliveries_sql/1). An explicit index, so these lookups do not
       # depend on the table carrying a composite UNIQUE that leads with it.
@@ -2848,22 +2840,6 @@ defmodule Tightbeam.Schema do
   end
 
   defp validate_owned_object!(txn, %{type: type, name: name, sql: expected_sql}) do
-    expected_sql =
-      if name == "supervision_liveness_sidecar" and
-           Txn.q(
-             txn,
-             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='supervision_state_migration'"
-           ) == [[1]] and
-           Txn.q(txn, "SELECT 1 FROM supervision_state_migration WHERE id=0") == [[1]] do
-        String.replace(
-          expected_sql,
-          "retirementActionNeeded INTEGER CHECK (retirementActionNeeded IN (0,1)),",
-          "retirementActionNeeded INTEGER CHECK (retirementActionNeeded IN (0,1)), endedWakeState TEXT,"
-        )
-      else
-        expected_sql
-      end
-
     case Txn.q(
            txn,
            "SELECT sql FROM sqlite_master WHERE type = ?1 AND name = ?2",

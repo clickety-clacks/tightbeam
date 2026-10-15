@@ -32,7 +32,7 @@ defmodule Tightbeam.HotQueryPlansTest do
     assert {:ok, []} = DB.query(db, Supervision.idle_cleanup_delivery_history_sql(), params)
   end
 
-  test "ended scheduled controllers are read from the sidecar index", %{db: db} do
+  test "ended scheduled controllers are read from their recorded-state index", %{db: db} do
     plan = plan!(db, Supervision.ended_controllers_sql(), [])
     assert hd(plan) =~ "supervision_liveness_ended_controller"
     refute Enum.any?(plan, &String.contains?(&1, "wakes"))

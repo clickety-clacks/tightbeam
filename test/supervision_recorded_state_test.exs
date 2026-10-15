@@ -1,6 +1,7 @@
 defmodule Tightbeam.SupervisionRecordedStateTest do
   use Tightbeam.TestCase, async: false
   alias Tightbeam.{DB, Schema, Supervision}
+  import ExUnit.CaptureLog
 
   setup do
     name = :"recorded_state_#{System.unique_integer([:positive])}"
@@ -15,18 +16,15 @@ defmodule Tightbeam.SupervisionRecordedStateTest do
     %{db: db, db_opts: db_opts, payload: prepared.payload}
   end
 
-  test "0.1.9 upgrade records its migration once and preserves its checkpoint", %{db: db} do
+  test "0.1.9 upgrade records its migration once without changing the sidecar DDL", %{db: db} do
     :ok = DB.execute(db, File.read!(Path.join(__DIR__, "fixtures/r1_o2_v1.sql")))
     assert :ok = Schema.ensure_all(db)
-    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM supervision_state_migration")
-
-    :ok =
-      DB.execute(db, "UPDATE supervision_state_migration SET wakeCursor=77,observationCursor=88")
-
+    Tightbeam.SchemaShapeRuntimeFixture.downgrade_supervision_recorded_state!(db)
+    assert {:ok, [[ddl]]} = DB.query(db, "SELECT sql FROM sqlite_master WHERE name='supervision_liveness_sidecar'")
     assert :ok = Schema.ensure_all(db)
-
-    assert {:ok, [[77, 88]]} =
-             DB.query(db, "SELECT wakeCursor,observationCursor FROM supervision_state_migration")
+    assert :ok = Schema.ensure_all(db)
+    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM supervision_state_migration")
+    assert {:ok, [[^ddl]]} = DB.query(db, "SELECT sql FROM sqlite_master WHERE name='supervision_liveness_sidecar'")
   end
 
   test "0.1.8 operator-decision predecessor upgrades through the existing migrations", %{
@@ -136,7 +134,14 @@ defmodule Tightbeam.SupervisionRecordedStateTest do
               ('s','valid','test','prompt','delivered',2,2);
       """)
 
-    assert :ok = Supervision.sweep_unclassified_terminals(db)
+    log = capture_log(fn -> assert :ok = Supervision.sweep_unclassified_terminals(db) end)
+    assert log =~ "terminal classification refused for turn 1:"
+    assert {:ok, [[reason]]} = DB.query(db, "SELECT detail FROM lifecycle_events WHERE kind='supervision_terminal_refused' AND subject='1'")
+    assert reason != ""
+    assert log =~ reason
+    :ok = DB.execute(db, "UPDATE patrol_failure_boundary SET lastTurnSeq=0")
+    repeated = capture_log(fn -> assert :ok = Supervision.sweep_unclassified_terminals(db) end)
+    refute repeated =~ "terminal classification refused for turn 1:"
     assert {:ok, [[2]]} = DB.query(db, "SELECT turnSeq FROM patrol_terminal_classifications")
 
     assert {:ok, [["1"]]} =
@@ -148,13 +153,13 @@ defmodule Tightbeam.SupervisionRecordedStateTest do
     assert {:ok, [[2]]} = DB.query(db, "SELECT lastTurnSeq FROM patrol_failure_boundary")
   end
 
-  test "historical observations copy in bounded batches, skip bad records, and resume", %{db: db} do
+  test "migration copies all historical observations once and skips bad records", %{db: db} do
     :ok = Schema.ensure_all(db)
     seed_session(db)
+    Tightbeam.SchemaShapeRuntimeFixture.downgrade_supervision_recorded_state!(db)
 
     :ok =
       DB.execute(db, """
-      UPDATE supervision_state_migration SET complete=0;
       WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<1001)
       INSERT INTO lifecycle_events(ts,kind,subject,detail)
         SELECT i,'idle_cleanup_pending_observed','wake-'||i,'{"session":"s"}' FROM n;
@@ -162,30 +167,80 @@ defmodule Tightbeam.SupervisionRecordedStateTest do
         VALUES(1002,'idle_cleanup_pending_observed','bad','invalid json');
       """)
 
-    assert {:ok, false} = DB.transaction(db, &Supervision.backfill_idle_cleanup_in_txn/1)
-
-    assert {:ok, [["wake-1000", "wake-999"]]} =
-             DB.query(
-               db,
-               "SELECT idleCleanupObservedWake,idleCleanupPreviousWake FROM sessions WHERE sessionKey='s'"
-             )
-
     assert :ok = Schema.ensure_all(db)
-    assert {:ok, true} = DB.transaction(db, &Supervision.backfill_idle_cleanup_in_txn/1)
-
     assert {:ok, [["wake-1001", "wake-1000"]]} =
-             DB.query(
-               db,
-               "SELECT idleCleanupObservedWake,idleCleanupPreviousWake FROM sessions WHERE sessionKey='s'"
-             )
+             DB.query(db, "SELECT idleCleanupObservedWake,idleCleanupPreviousWake FROM sessions WHERE sessionKey='s'")
+    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM lifecycle_events WHERE kind='idle_cleanup_refused' AND subject='bad'")
+    # A second boot must not replay observations over newer recorded state.
+    :ok = DB.execute(db, "UPDATE sessions SET idleCleanupObservedWake='newer' WHERE sessionKey='s'")
+    assert :ok = Schema.ensure_all(db)
+    assert {:ok, [["newer"]]} = DB.query(db, "SELECT idleCleanupObservedWake FROM sessions WHERE sessionKey='s'")
+  end
 
-    assert {:ok, [[1]]} =
-             DB.query(
-               db,
-               "SELECT COUNT(*) FROM lifecycle_events WHERE kind='idle_cleanup_refused' AND subject='bad'"
-             )
+  test "migration delivery copy equals the old history derivation", %{db: db} do
+    :ok = Schema.ensure_all(db)
+    seed_session(db)
+    Tightbeam.SchemaShapeRuntimeFixture.downgrade_supervision_recorded_state!(db)
+    group = :crypto.hash(:sha256, "idle-cleanup-group-v1\0parent") |> Base.encode16(case: :lower)
 
-    assert {:ok, true} = DB.transaction(db, &Supervision.backfill_idle_cleanup_in_txn/1)
+    for {id, state, at, depth, main, token} <- [
+      {"direct", "fired", 12, 1, false, "token"},
+      {"batched", "fired", 42, 3, true, "token"},
+      {"not-delivered", "fired", 80, 9, true, "token"},
+      {"canceled", "canceled", 90, 9, true, "token"},
+      {"pending", "pending", nil, 9, true, "token"},
+      {"other-occurrence", "fired", 100, 8, false, "other-token"}
+    ] do
+      metadata = %{"group" => "parent", "owner" => "owner", "n" => 2,
+                   "depth" => depth, "main" => main, "members" => %{"s" => token}}
+      ref = "idle-cleanup-v1:" <> group <> "|" <> token <> "|\n" <> JSON.encode!(metadata)
+      {:ok, _} = DB.query(db, """
+      INSERT INTO wakes(wakeId,sessionKey,origin,prompt,dueAt,createdAt,state,firedAt,obligationRef)
+      VALUES(?1,'s','process:tightbeam','cleanup',1,1,?2,?3,?4)
+      """, [id,state,at,ref])
+    end
+
+    :ok = DB.execute(db, """
+    INSERT INTO wakes(wakeId,sessionKey,origin,prompt,dueAt,createdAt)
+      VALUES('carrier','s','process:tightbeam','batch',1,1);
+    INSERT INTO notice_batches(batchId,recipientAddress,sessionKey,visibilityScope,policyRevision,
+      state,dueAt,openedAt,sealedAt,deliveryToken,envelope,deliveryWakeId)
+      VALUES('batch','session:s','s','owner','fixture','delivery_pending',1,1,1,'token','batch','carrier');
+    INSERT INTO notice_batch_members(memberId,batchId,sourceWakeId,policyRef,recipientAddress,
+      visibilityScope,publicationSeq,policyRevision,senderPrincipal,cause,class,payload,renderedBytes,state,addedAt)
+      VALUES('member','batch','batched','policy','session:s','owner',1,'fixture','process:tightbeam',
+             'idle_cleanup','fyi','cleanup',7,'included',1);
+    INSERT INTO turns(sessionKey,messageId,origin,prompt,status,createdAt,wakeId)
+      VALUES('s','direct-message','process:tightbeam','cleanup','queued',1,'direct'),
+            ('s','batch-message','process:tightbeam','batch','queued',1,'carrier'),
+            ('s','other-message','process:tightbeam','cleanup','queued',1,'other-occurrence'),
+            ('s','canceled-message','process:tightbeam','cleanup','queued',1,'canceled');
+    """)
+
+    # Preserve the old packed-reference selection and metadata reduction as
+    # an independent oracle, including both direct and carried delivery.
+    assert {:ok, history} = DB.query(db, """
+    SELECT w.firedAt,w.obligationRef FROM wakes w
+    WHERE w.origin='process:tightbeam' AND w.state='fired'
+      AND w.obligationRef LIKE ?1 AND w.obligationRef LIKE ?2
+      AND (EXISTS(SELECT 1 FROM turns t WHERE t.wakeId=w.wakeId)
+        OR EXISTS(SELECT 1 FROM notice_batch_members m
+          JOIN notice_batches b ON b.batchId=m.batchId
+          JOIN turns t ON t.wakeId=b.deliveryWakeId
+          WHERE m.sourceWakeId=w.wakeId AND m.state='included'))
+    """, ["idle-cleanup-v1:" <> group <> "|%", "%|token|%"])
+
+    expected = Enum.reduce(history, [0, 0, 0, 0], fn [at, ref], [count, last, depth, main] ->
+      [_, json] = String.split(ref, "\n", parts: 2)
+      metadata = JSON.decode!(json)
+      [count+1, max(last,at), max(depth,metadata["depth"]), max(main,if(metadata["main"], do: 1, else: 0))]
+    end)
+    assert expected == [2,42,3,1]
+    assert :ok = Schema.ensure_all(db)
+    assert {:ok, [^expected]} = DB.query(db, Supervision.idle_cleanup_delivery_history_sql(), [group,"token"])
+    assert :ok = Schema.ensure_all(db)
+    assert {:ok, [^expected]} = DB.query(db, Supervision.idle_cleanup_delivery_history_sql(), [group,"token"])
+    assert {:ok, [[1,100,8,0]]} = DB.query(db, Supervision.idle_cleanup_delivery_history_sql(), [group,"other-token"])
   end
 
   test "batched cleanup delivery records its members once in the delivery transaction", %{db: db} do
@@ -213,15 +268,6 @@ defmodule Tightbeam.SupervisionRecordedStateTest do
         """,
         [ref]
       )
-
-    :ok = DB.execute(db, "UPDATE supervision_state_migration SET complete=0")
-
-    assert {:ok, {:idle_cleanup_deferred, :state_backfill}} =
-             DB.transaction(db, fn txn ->
-               Supervision.idle_cleanup_delivery_in_txn(txn, "cleanup", 42)
-             end)
-
-    :ok = DB.execute(db, "UPDATE supervision_state_migration SET complete=1")
 
     :ok =
       DB.execute(db, """

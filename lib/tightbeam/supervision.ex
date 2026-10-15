@@ -3369,11 +3369,11 @@ defmodule Tightbeam.Supervision do
   @doc false
   def ended_controllers_sql do
     """
-    SELECT wakeId, assignmentId, endedWakeState
-    FROM supervision_liveness_sidecar INDEXED BY supervision_liveness_ended_controller
-    WHERE controllerOrigin='scheduled' AND controllerState='pending'
-      AND endedWakeState IS NOT NULL
-    ORDER BY assignmentId, wakeId
+    SELECT e.wakeId, e.assignmentId, e.endedWakeState
+    FROM supervision_ended_controllers e INDEXED BY supervision_liveness_ended_controller
+    CROSS JOIN supervision_liveness_sidecar s ON s.wakeId=e.wakeId
+    WHERE s.controllerOrigin='scheduled' AND s.controllerState='pending'
+    ORDER BY e.assignmentId, e.wakeId
     """
   end
 
@@ -4314,7 +4314,7 @@ defmodule Tightbeam.Supervision do
 
   defp idle_cleanup_sweep(%{db: db, n: n}) do
     case DB.transaction(db, fn txn ->
-           if backfill_idle_cleanup_in_txn(txn), do: idle_cleanup_sweep_in_txn(txn, n, now())
+           idle_cleanup_sweep_in_txn(txn, n, now())
          end) do
       {:ok, _} -> :ok
       {:error, error} -> raise error
@@ -5034,83 +5034,40 @@ defmodule Tightbeam.Supervision do
     :ok
   end
 
+  # Used only by the run-once migration. Delivery is derived directly from
+  # turns and batch members, independently of any delivery-column backfill.
   @doc false
-  def backfill_idle_cleanup_in_txn(txn) do
-    case Txn.q(
-           txn,
-           "SELECT wakeCursor,observationCursor FROM supervision_state_migration WHERE id=0 AND complete=0"
-         ) do
-      [] ->
-        true
+  def copy_idle_cleanup_history_in_txn(txn) do
+    Txn.q(txn, "SELECT wakeId,obligationRef FROM wakes WHERE obligationRef LIKE 'idle-cleanup-v1:%' ORDER BY rowid")
+    |> Enum.each(fn [wake_id, ref] ->
+      case idle_cleanup_metadata(ref) do
+        {:ok, metadata} ->
+          group = idle_cleanup_digest("idle-cleanup-group-v1\0" <> metadata["group"])
+          Txn.q(txn, "UPDATE wakes SET idleCleanupGroup=?2 WHERE wakeId=?1", [wake_id, group])
+          record_idle_cleanup_delivery_in_txn(txn, wake_id)
 
-      [[wake_cursor, observation_cursor]] ->
-        wakes =
-          Txn.q(
-            txn,
-            "SELECT rowid,wakeId,obligationRef FROM wakes WHERE rowid>?1 ORDER BY rowid LIMIT 1000",
-            [wake_cursor]
-          )
+        :error ->
+          Logger.warning("invalid idle cleanup metadata for wake #{wake_id}")
+          idle_cleanup_refusal_in_txn(txn, wake_id, :invalid_delivery_metadata)
+      end
+    end)
 
-        Enum.each(wakes, fn
-          [_rowid, wake_id, @idle_cleanup_prefix <> _ = ref] ->
-            case idle_cleanup_metadata(ref) do
-              {:ok, metadata} ->
-                group = idle_cleanup_digest("idle-cleanup-group-v1\0" <> metadata["group"])
+    Txn.q(txn, """
+    SELECT id,subject,detail FROM lifecycle_events
+    WHERE kind='idle_cleanup_pending_observed' ORDER BY id
+    """)
+    |> Enum.each(fn [id, wake_id, detail] ->
+      case JSON.decode(detail || "") do
+        {:ok, %{"session" => session}} when is_binary(session) ->
+          record_idle_cleanup_observation_in_txn(txn, wake_id, session)
 
-                Txn.q(txn, "UPDATE wakes SET idleCleanupGroup=?2 WHERE wakeId=?1", [
-                  wake_id,
-                  group
-                ])
+        _ ->
+          Logger.warning("invalid idle cleanup observation #{id}")
+          idle_cleanup_refusal_in_txn(txn, wake_id, :invalid_observation_metadata)
+      end
+    end)
 
-                record_idle_cleanup_delivery_in_txn(txn, wake_id)
-
-              :error ->
-                Logger.warning("invalid idle cleanup metadata for wake #{wake_id}")
-                idle_cleanup_refusal_in_txn(txn, wake_id, :invalid_delivery_metadata)
-            end
-
-          _ ->
-            :ok
-        end)
-
-        observations =
-          Txn.q(
-            txn,
-            """
-            SELECT id,subject,detail FROM lifecycle_events
-            WHERE kind='idle_cleanup_pending_observed' AND id>?1 ORDER BY id LIMIT 1000
-            """,
-            [observation_cursor]
-          )
-
-        Enum.each(observations, fn [id, wake_id, detail] ->
-          case JSON.decode(detail || "") do
-            {:ok, %{"session" => session}} when is_binary(session) ->
-              record_idle_cleanup_observation_in_txn(txn, wake_id, session)
-
-            _ ->
-              Logger.warning("invalid idle cleanup observation #{id}")
-              idle_cleanup_refusal_in_txn(txn, wake_id, :invalid_observation_metadata)
-          end
-        end)
-
-        complete = length(wakes) < 1000 and length(observations) < 1000
-
-        Txn.q(
-          txn,
-          "UPDATE supervision_state_migration SET wakeCursor=?1,observationCursor=?2,complete=?3 WHERE id=0",
-          [
-            if(wakes == [], do: wake_cursor, else: wakes |> List.last() |> hd()),
-            if(observations == [],
-              do: observation_cursor,
-              else: observations |> List.last() |> hd()
-            ),
-            if(complete, do: 1, else: 0)
-          ]
-        )
-
-        complete
-    end
+    :ok
   end
 
   @doc false
@@ -5120,9 +5077,6 @@ defmodule Tightbeam.Supervision do
         cond do
           wake.state != "pending" ->
             :stale
-
-          Txn.q(txn, "SELECT 1 FROM supervision_state_migration WHERE id=0 AND complete=0") != [] ->
-            {:idle_cleanup_deferred, :state_backfill}
 
           true ->
             idle_cleanup_resolve_delivery_in_txn(txn, wake, snapshot_at)
@@ -5362,16 +5316,18 @@ defmodule Tightbeam.Supervision do
                 :ok = Txn.exec(txn, "ROLLBACK TO classify_terminal")
                 :ok = Txn.exec(txn, "RELEASE classify_terminal")
 
-                Logger.warning(
-                  "terminal classification refused for turn #{seq}: #{Exception.message(error)}"
-                )
+                if Txn.q(txn, "SELECT 1 FROM lifecycle_events WHERE kind='supervision_terminal_refused' AND subject=?1 LIMIT 1", [Integer.to_string(seq)]) == [] do
+                  Logger.warning(
+                    "terminal classification refused for turn #{seq}: #{Exception.message(error)}"
+                  )
 
-                EventLog.lifecycle_in_txn(
-                  txn,
-                  "supervision_terminal_refused",
-                  Integer.to_string(seq),
-                  Exception.message(error)
-                )
+                  EventLog.lifecycle_in_txn(
+                    txn,
+                    "supervision_terminal_refused",
+                    Integer.to_string(seq),
+                    Exception.message(error)
+                  )
+                end
             end
           end
 

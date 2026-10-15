@@ -647,7 +647,7 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
         DROP TRIGGER patrol_terminal_checkpoint_insert;
         DROP INDEX supervision_liveness_ended_controller;
         DROP INDEX idle_cleanup_pending_group;
-        ALTER TABLE supervision_liveness_sidecar DROP COLUMN endedWakeState;
+        DROP TABLE supervision_ended_controllers;
         ALTER TABLE patrol_failure_boundary DROP COLUMN lastTurnSeq;
         ALTER TABLE sessions DROP COLUMN idleCleanupObservedWake;
         ALTER TABLE sessions DROP COLUMN idleCleanupPreviousWake;
