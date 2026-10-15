@@ -29,6 +29,7 @@ defmodule Tightbeam.SessionLane do
     :lane_owner,
     terminal_publisher: nil,
     on_terminal: nil,
+    wake_scheduler: Tightbeam.WakeScheduler,
     task_ref: nil,
     task_pid: nil,
     current_seq: nil,
@@ -209,6 +210,7 @@ defmodule Tightbeam.SessionLane do
       # indicator stuck forever. No-op default keeps unit tests standalone.
       terminal_publisher: Keyword.get(opts, :terminal_publisher, fn _ -> :ok end),
       on_terminal: Keyword.get(opts, :on_terminal, fn _, _ -> :ok end),
+      wake_scheduler: Keyword.get(opts, :wake_scheduler, Tightbeam.WakeScheduler),
       lane_owner: "lane:#{inspect(self())}:#{System.unique_integer([:positive])}"
     }
 
@@ -327,7 +329,7 @@ defmodule Tightbeam.SessionLane do
     case result do
       {:ok, message_id} ->
         publish_route_publication(route_publication)
-        state.on_terminal.(state.session_key, state.current_seq)
+        notify_terminal(state, state.current_seq)
         reply = {:ok, %{seq: state.current_seq, message_id: message_id}}
         # Assignment stops rely on the ACP session/cancel notification sent by
         # the gateway. Keep the turn task alive until that cancellation returns
@@ -427,7 +429,7 @@ defmodule Tightbeam.SessionLane do
         })
 
         Ledger.mark_published(state.db, clear_seq)
-        state.on_terminal.(state.session_key, clear_seq)
+        notify_terminal(state, clear_seq)
         {:reply, {:ok, result}, maybe_start(state)}
 
       {:error, :not_found} ->
@@ -847,6 +849,11 @@ defmodule Tightbeam.SessionLane do
     end
   end
 
+  defp notify_terminal(state, seq) do
+    Tightbeam.Wakes.recipient_ready(state.wake_scheduler, state.session_key)
+    state.on_terminal.(state.session_key, seq)
+  end
+
   defp finish_result(state, seq, terminal, error, publish, after_commit, won, recorded) do
     {finish_result, recorded} = {if(won, do: :ok, else: :already_terminal), recorded}
 
@@ -869,7 +876,7 @@ defmodule Tightbeam.SessionLane do
         end
 
         publish_terminal(state, seq)
-        state.on_terminal.(state.session_key, seq)
+        notify_terminal(state, seq)
 
       :already_terminal ->
         :ok
@@ -891,7 +898,7 @@ defmodule Tightbeam.SessionLane do
     })
 
     publish_terminal(state, result.turn_seq)
-    state.on_terminal.(state.session_key, result.turn_seq)
+    notify_terminal(state, result.turn_seq)
     state
   end
 

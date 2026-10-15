@@ -454,16 +454,17 @@ defmodule Tightbeam.NoticeBatcher do
 
   @doc "Resolve and admit one ready snapshot per concrete session atomically."
   @spec recover(GenServer.server(), integer(), keyword()) :: [String.t()]
-  def recover(db \\ Tightbeam.DB, at \\ now(), delivery_opts \\ []) do
-    :ok = Wakes.dispose_closed_remedy_sources(db, at)
-    reconcile_committed_deliveries(db, at)
+  def recover(db \\ Tightbeam.DB, at \\ now(), delivery_opts \\ [], recipient \\ nil) do
+    if is_nil(recipient) do
+      :ok = Wakes.dispose_closed_remedy_sources(db, at)
+      reconcile_committed_deliveries(db, at)
+      restore_unclaimed_sources(db, at)
+    end
 
     # Only carriers with no actual turn can return to the editable queue.
     # Their frozen bytes remain historical evidence; committed deliveries do
     # not participate in a later recipient snapshot.
-    restore_unclaimed_sources(db, at)
-
-    {:ok, ready_ids} = DB.transaction(db, &ready_sources_in_txn(&1, at))
+    {:ok, ready_ids} = DB.transaction(db, &ready_sources_in_txn(&1, at, recipient))
 
     # Group ready sources by recipient without preparing them. Preparation
     # happens once, inside the recipient's own drain transaction, and only when
@@ -495,7 +496,7 @@ defmodule Tightbeam.NoticeBatcher do
         end
       end)
 
-    recipients = Enum.reverse(recipients)
+    recipients = Enum.reverse(recipients) |> Enum.filter(fn {target, _} -> is_nil(recipient) or target == recipient end)
     own_sources = Enum.group_by(recipients, &elem(&1, 0), &elem(&1, 1))
 
     deliveries =
@@ -684,12 +685,13 @@ defmodule Tightbeam.NoticeBatcher do
 
   defp dispose_missing_role_in_txn(_txn, _wake, _at), do: :ok
 
-  defp ready_sources_in_txn(txn, at) do
+  defp ready_sources_in_txn(txn, at, recipient \\ nil) do
     Txn.q(
       txn,
       """
       SELECT w.wakeId FROM wakes w
       WHERE w.state='pending' AND w.consumer='prompt' AND w.digest=0
+        AND (?2 IS NULL OR w.sessionKey=?2 OR w.targetRole IS NOT NULL)
         AND COALESCE(w.deliveryRule,'')<>'turn-boundary-digest r1'
         AND (w.conditionKind IS NULL OR w.firedAt IS NOT NULL)
         AND (w.waitMode IS NULL OR w.recognitionAt IS NOT NULL)
@@ -704,7 +706,7 @@ defmodule Tightbeam.NoticeBatcher do
         w.createdAt,COALESCE((SELECT root.rowid FROM wake_retry_attempts r
           JOIN wakes root ON root.wakeId=r.rootWakeId WHERE r.wakeId=w.wakeId),w.rowid)
       """,
-      [at]
+      [at, recipient]
     )
     |> Enum.map(&hd/1)
   end
@@ -764,7 +766,7 @@ defmodule Tightbeam.NoticeBatcher do
       :busy
     else
       sources =
-        ready_sources_in_txn(txn, at)
+        ready_sources_in_txn(txn, at, target)
         |> Enum.filter(&MapSet.member?(own_ids, &1))
         |> Enum.reject(&MapSet.member?(deferred_ids, &1))
         |> Enum.flat_map(fn wake_id ->

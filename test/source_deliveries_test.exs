@@ -149,6 +149,20 @@ defmodule Tightbeam.SourceDeliveriesTest do
              DB.transaction(ctx.db, &NoticeBatcher.source_delivery_turns_in_txn(&1, "w_direct"))
   end
 
+  test "historical batches yield and resume from their recorded cursor", ctx do
+    :ok = DB.execute(ctx.db, """
+    WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<2100)
+    INSERT INTO wakes(wakeId,sessionKey,origin,prompt,dueAt,createdAt,state)
+    SELECT 'old-' || x,'recipient','process:test','old',1,1,'fired' FROM n;
+    UPDATE wake_delivery_backfill SET throughRowid=(SELECT MAX(rowid) FROM wakes);
+    """)
+    assert :more = Tightbeam.Schema.backfill_wake_delivery(ctx.db)
+    assert {:ok, [[2000,nil]]} = DB.query(ctx.db, "SELECT afterRowid,completedAt FROM wake_delivery_backfill")
+    assert :ok = Tightbeam.Schema.ensure_all(ctx.db)
+    assert {:ok, [[2000,nil]]} = DB.query(ctx.db, "SELECT afterRowid,completedAt FROM wake_delivery_backfill")
+    assert :done = Tightbeam.Schema.backfill_wake_delivery(ctx.db)
+  end
+
   test "an existing database stamps pending and recent wakes before historical batches", ctx do
     # Reconstruct the additive predecessor. No application writes run during
     # this fixture-only downgrade.

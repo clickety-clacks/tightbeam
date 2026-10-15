@@ -42,6 +42,8 @@ defmodule Tightbeam.Wakes do
 
   alias Tightbeam.DB.Txn
 
+  @notice_fallback_ms 30_000
+
   @type db :: GenServer.server()
 
   @type wake :: %{
@@ -6317,6 +6319,11 @@ defmodule Tightbeam.Wakes do
   end
 
   @doc false
+  def recipient_ready(server \\ Tightbeam.WakeScheduler, session_key) do
+    GenServer.cast(server, {:recipient_ready, session_key})
+  end
+
+  @doc false
   @spec recognize_condition_fact_in_txn(Txn.t(), pos_integer()) :: [term()]
   def recognize_condition_fact_in_txn(%Txn{} = txn, fact_id) do
     Txn.q(
@@ -6360,6 +6367,7 @@ defmodule Tightbeam.Wakes do
     }
 
     schedule_tick(state.tick_ms)
+    Process.send_after(self(), :notice_fallback, @notice_fallback_ms)
     Process.send_after(self(), :backfill_wake_delivery, 100)
     {:ok, state}
   end
@@ -6385,6 +6393,12 @@ defmodule Tightbeam.Wakes do
   end
 
   @impl true
+  def handle_cast({:recipient_ready, session_key}, state) do
+    NoticeBatcher.recover(state.db, now(), state.delivery_opts, session_key)
+    {:noreply, state}
+  end
+
+  @impl true
   def handle_info(:backfill_wake_delivery, state) do
     if Tightbeam.Schema.backfill_wake_delivery(state.db) == :more do
       Process.send_after(self(), :backfill_wake_delivery, 100)
@@ -6398,8 +6412,14 @@ defmodule Tightbeam.Wakes do
     {:noreply, state}
   end
 
-  def handle_info(:tick, state) do
+  def handle_info(:notice_fallback, state) do
     deliver_due(state)
+    Process.send_after(self(), :notice_fallback, @notice_fallback_ms)
+    {:noreply, state}
+  end
+
+  def handle_info(:tick, state) do
+    deliver_due(state, false)
     schedule_tick(state.tick_ms)
     {:noreply, state}
   end
@@ -6443,31 +6463,37 @@ defmodule Tightbeam.Wakes do
   # Deliver-then-mark (see moduledoc — never reorder): a raising deliver
   # leaves its wake pending for the next tick; a crash between deliver and
   # mark redelivers, deduped by turns.wakeId.
-  defp deliver_due(state) do
+  defp deliver_due(state, drain_notices \\ true) do
     # R1/B1: one real scheduler entry owns the context of all DB calls in this
     # scan. The bind restores even when delivery raises; the next scan gets a
     # fresh ID. No context is implicitly inherited by a spawned process.
     Tightbeam.RequestContext.bind_internal("wake_scheduler", fn ->
-      deliver_due_in_context(state)
+      deliver_due_in_context(state, drain_notices)
     end)
   end
 
-  defp deliver_due_in_context(%{db: db, deliver: deliver, internal_consumers: consumers} = state) do
-    if Map.has_key?(consumers, "review_remedy_reconcile") do
+  defp deliver_due_in_context(%{db: db, deliver: deliver, internal_consumers: consumers} = state, drain_notices) do
+    if drain_notices and Map.has_key?(consumers, "review_remedy_reconcile") do
       {:ok, :ok} =
         Tightbeam.RailRemedy.reconcile_pending_episodes(db, state.review_remedy_interval_ms)
     end
 
-    recognize_due_dependency_waits(db)
-    deliver_eligible_waits(db, state.delivery_opts)
+    newly_due = recognize_due_dependency_waits(db)
+    if drain_notices do
+      deliver_eligible_waits(db, state.delivery_opts)
+    else
+      deliver_wait_ids(db, newly_due, state.delivery_opts)
+    end
     evaluate_conditions(state, :tick)
 
     # Materialize after condition recognition so a fallback or matching fact
     # that becomes due in this pass joins the same recipient-ready batch.
     # Held members remain individual source rows and never reach the delivery
     # loop below.
-    NoticeBatcher.recover(db, now(), state.delivery_opts)
-    legacy_materialize_digests(db, now())
+    if drain_notices do
+      NoticeBatcher.recover(db, now(), state.delivery_opts)
+      legacy_materialize_digests(db, now())
+    end
 
     {:ok, rows} =
       DB.query_for(
@@ -6581,6 +6607,8 @@ defmodule Tightbeam.Wakes do
         {:error, error} -> raise error
       end
     end)
+
+    rows
   end
 
   defp recognize_due_dependency_in_txn(txn, wake_id) do
@@ -6621,6 +6649,10 @@ defmodule Tightbeam.Wakes do
         """
       )
 
+    deliver_wait_ids(db, rows, delivery_opts)
+  end
+
+  defp deliver_wait_ids(db, rows, delivery_opts) do
     Enum.each(rows, fn [wake_id] ->
       case DB.transaction_then(
              db,
