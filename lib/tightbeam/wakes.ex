@@ -752,6 +752,7 @@ defmodule Tightbeam.Wakes do
         if Txn.changes(txn) == 1 do
           source = %{wake | state: "pending", fired_at: fired_at}
           NoticeBatcher.record_policy_in_txn(txn, source)
+          if state == "fired", do: schedule_changed_in_txn(txn, :wake_ready)
 
           {:ok, source}
         else
@@ -7814,7 +7815,9 @@ defmodule Tightbeam.Wakes do
             )
 
           case rows do
-            [[due_at]] -> :erlang.start_timer(max(0, due_at - now()), self(), :due)
+            [[due_at]] ->
+              deadline = System.monotonic_time(:millisecond) + max(0, due_at - now())
+              :erlang.start_timer(deadline, self(), :due, abs: true)
             [] -> nil
           end
         end,
@@ -7861,6 +7864,7 @@ defmodule Tightbeam.Wakes do
           [at - @miss_lateness_ms]
         )
         |> Enum.flat_map(fn row ->
+          try do
           wake = to_wake(row)
 
           case resolved_recipient(txn, wake) do
@@ -7874,6 +7878,11 @@ defmodule Tightbeam.Wakes do
             nil ->
               []
           end
+          rescue
+            error ->
+              Logger.error("wake scheduler miss candidate #{hd(row)} refused: #{Exception.message(error)}")
+              []
+          end
         end)
       end)
 
@@ -7883,8 +7892,12 @@ defmodule Tightbeam.Wakes do
       )
 
       Process.put(:wake_scheduler_misses, Process.get(:wake_scheduler_misses, 0) + 1)
-      deliver_eligible_waits(state.db, state.delivery_opts, recipient)
-      NoticeBatcher.recover(state.db, at, state.delivery_opts, recipient)
+      try do
+        deliver_eligible_waits(state.db, state.delivery_opts, recipient)
+        NoticeBatcher.recover(state.db, at, state.delivery_opts, recipient)
+      rescue
+        error -> Logger.error("wake scheduler miss recovery #{wake.wake_id} failed: #{Exception.message(error)}")
+      end
     end
 
     if candidates != [], do: deliver_due(state)

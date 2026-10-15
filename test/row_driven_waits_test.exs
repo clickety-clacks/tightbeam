@@ -843,6 +843,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
 
   test "terminal verifier and fallback end provisional waiting without inventing confirmation",
        ctx do
+    originating = running_turn(ctx.db, "holder")
     verifier_terminal = register_wait(ctx.db, due_after(), predicate("R"))
     assert %{outcome: "revoked"} = revoke(ctx.db, "V")
 
@@ -857,6 +858,8 @@ defmodule Tightbeam.RowDrivenWaitsTest do
       register_wait(ctx.db, System.system_time(:millisecond) - 1, predicate("R", nil, "V2"))
 
     assert fallback.recognition_path == nil
+    assert :ok = Ledger.finish(ctx.db, originating.seq, "delivered", nil,
+      owner_lease: originating.owner_lease)
     assert :ok = Wakes.fire_due(ctx.scheduler)
 
     fired = Wakes.get(ctx.db, fallback.wake_id)
@@ -1187,6 +1190,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
   @tag persistent: true
   test "current-stamped continuation guard admits only the exact qualified retry migration",
        ctx do
+    suspend_scheduler(ctx)
     originating = running_turn(ctx.db, "holder")
     original = after_turn_wait!(ctx.db, "A")
 
@@ -1265,6 +1269,8 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     @tag persistent: true
     test "#{mode} continuation restores with #{sibling} through the lane terminal callback and reopen",
          ctx do
+      # Assemble all competing sources before delivery seals the restoration batch.
+      scheduler_pid = suspend_scheduler(ctx)
       qualification_policy(ctx)
       assignment(ctx.db, "B", "holder")
       originating = running_turn(ctx.db, "holder")
@@ -1308,7 +1314,9 @@ defmodule Tightbeam.RowDrivenWaitsTest do
                  )
       end
 
+      :ok = :sys.resume(scheduler_pid)
       assert :ok = Wakes.fire_due(ctx.scheduler)
+      :ok = :sys.suspend(scheduler_pid)
 
       assert {:ok, [[carrier, seq]]} =
                DB.query(
@@ -1823,6 +1831,13 @@ defmodule Tightbeam.RowDrivenWaitsTest do
       assert {:ok, [["open", nil]]} =
                DB.query(ctx.db, "SELECT state,outcome FROM assignments WHERE id='A'")
     end
+  end
+
+  defp suspend_scheduler(ctx) do
+    pid = Process.whereis(ctx.scheduler)
+    :ok = :sys.suspend(pid)
+    on_exit(fn -> if Process.alive?(pid), do: :sys.resume(pid) end)
+    pid
   end
 
   defp after_turn_wait!(db, assignment_id) do
