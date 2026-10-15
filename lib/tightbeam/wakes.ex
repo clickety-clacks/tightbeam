@@ -6510,7 +6510,7 @@ defmodule Tightbeam.Wakes do
         select_wake_sql(
           ", (SELECT routingWakeId FROM work_items WHERE id=wakes.work_item_id), (SELECT slateWakeId FROM work_items WHERE id=wakes.work_item_id)"
         ) <>
-          " WHERE state = 'pending' AND dueAt <= ?1 AND conditionKind IS NULL AND waitMode IS NULL" <>
+          " INDEXED BY wakes_due WHERE state = 'pending' AND dueAt <= ?1 AND conditionKind IS NULL AND waitMode IS NULL" <>
           " AND NOT (consumer='prompt' AND digest=0 AND COALESCE(deliveryRule,'')<>'turn-boundary-digest r1')" <>
           " ORDER BY dueAt ASC",
         [now()]
@@ -6602,7 +6602,7 @@ defmodule Tightbeam.Wakes do
       DB.query(
         db,
         """
-        SELECT wakeId FROM wakes
+        SELECT wakeId FROM wakes INDEXED BY wakes_due
         WHERE state='pending' AND waitMode='dependency' AND recognitionAt IS NULL AND dueAt<=?1
         ORDER BY dueAt,wakeId
         """,
