@@ -691,7 +691,7 @@ defmodule Tightbeam.IdentityTest do
     assert Path.wildcard(Path.join(ctx.base, "rails/scratch/*")) == []
   end
 
-  test "recovery refuses invalid published law and a missing published ref without touching the merge",
+  test "recovery keeps invalid published law closed and preserves the merge",
        ctx do
     alias Tightbeam.Gateway
     learn_test_bundle!(ctx)
@@ -702,9 +702,12 @@ defmodule Tightbeam.IdentityTest do
     git!(dir, ["commit", "-m", "synthetic invalid published law"], "test")
     git!(dir, ["branch", "-f", "tightbeam/live", "HEAD"])
 
-    assert_raise ArgumentError, ~r/missing or blank verb/, fn ->
-      Gateway.load_law!(%{base_dir: ctx.base}, ["post"])
-    end
+    log = ExUnit.CaptureLog.capture_log(fn ->
+      assert [] = Gateway.load_law!(%{base_dir: ctx.base}, ["post"])
+    end)
+    assert log =~ "invalid.toml"
+    assert log =~ "missing or blank verb"
+    assert {:deny, %{code: "rule_unavailable"}} = Tightbeam.Rules.evaluate(nil, %{verb: "post", origin: "user:test", params: %{}})
 
     edit!(ctx.base, "coder", :guidance, "local customization", "test")
     File.write!(Path.join(ctx.source, "guidance/coder.md"), "incoming guidance")
@@ -712,9 +715,12 @@ defmodule Tightbeam.IdentityTest do
     index = File.read!(Path.join(dir, ".git/index"))
     merge = File.read!(Path.join(dir, ".git/MERGE_HEAD"))
 
-    assert_raise ArgumentError, ~r/missing or blank verb/, fn ->
-      Gateway.load_law!(%{base_dir: ctx.base}, ["post"])
-    end
+    log = ExUnit.CaptureLog.capture_log(fn ->
+      assert [] = Gateway.load_law!(%{base_dir: ctx.base}, ["post"])
+    end)
+    assert log =~ "invalid.toml"
+    assert log =~ "missing or blank verb"
+    assert {:deny, %{code: "rule_unavailable"}} = Tightbeam.Rules.evaluate(nil, %{verb: "post", origin: "user:test", params: %{}})
 
     assert Path.wildcard(Path.join(ctx.base, ".identity-law-*")) == []
     git!(dir, ["branch", "-D", "tightbeam/live"])

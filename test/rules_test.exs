@@ -164,6 +164,17 @@ defmodule Tightbeam.RulesTest do
     end
   end
 
+  test "a malformed rule leaves a healthy sibling rule active", ctx do
+    put_raw(ctx, "[[rule]]\nname='broken'\nverb='post'\n" <>
+      rule("healthy-sibling", "wake", "caller.origin_class", "eq", "user"))
+    assert ExUnit.CaptureLog.capture_log(fn ->
+      assert [%{name: "healthy-sibling"}] = Rules.load!(ctx.base_dir, ["post", "wake", "status"])
+    end) =~ "broken"
+    assert {:deny, %{code: "rule_unavailable"}} = Rules.evaluate(ctx.db, call())
+    assert {:deny, %{code: "rule_denied"}} = Rules.evaluate(ctx.db, %{call() | verb: "wake"})
+    assert :ok = Rules.evaluate(ctx.db, %{call() | verb: "status"})
+  end
+
   test "file-level validation names only the file", ctx do
     cases = [
       {"", "empty TOML"},

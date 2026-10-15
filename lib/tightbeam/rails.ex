@@ -131,7 +131,19 @@ defmodule Tightbeam.Rails do
 
           case Map.get(manifest, "statute") do
             statutes when is_list(statutes) and statutes != [] ->
-              Enum.map(statutes, &validate!/1)
+              statutes |> Enum.with_index(1) |> Enum.map(fn {raw, ordinal} ->
+                try do
+                  validate!(raw)
+                rescue
+                  error ->
+                    require Logger
+                    Logger.warning("rail #{path} entry #{ordinal} unavailable: #{Exception.message(error)}")
+                    tool = if is_map(raw), do: Map.get(raw, "tool"), else: nil
+                    %{name: "unavailable-#{Path.basename(path, ".toml")}-#{ordinal}", on: :tool_call, mode: :gate,
+                      tool: if(is_binary(tool) and String.trim(tool) != "", do: tool, else: ".*"),
+                      pattern: ".*", action: nil, text: "Rail #{Path.basename(path)} entry #{ordinal} requires repair"}
+                end
+              end)
 
             _ ->
               raise ArgumentError, "#{path} must contain one or more [[statute]] tables"
@@ -155,32 +167,18 @@ defmodule Tightbeam.Rails do
         end
       end)
 
-    duplicate =
-      statutes
-      |> Enum.frequencies_by(& &1.name)
-      |> Enum.find_value(fn {name, count} -> if count > 1, do: name end)
-
-    statutes =
-      if duplicate do
+    duplicates = Enum.frequencies_by(statutes, & &1.name)
+    Enum.each(duplicates, fn {name, count} ->
+      if count > 1 do
         require Logger
-
-        Logger.warning(
-          "duplicate statute name: #{duplicate} unavailable; affected tools remain closed"
-        )
-
-        Enum.map(statutes, fn statute ->
-          if Enum.count(statutes, &(&1.name == statute.name)) > 1,
-            do: %{
-              statute
-              | pattern: ".*",
-                action: nil,
-                text: "Duplicate statute #{statute.name} requires repair"
-            },
-            else: statute
-        end)
-      else
-        statutes
+        Logger.warning("duplicate statute name: #{name} unavailable; affected tools remain closed")
       end
+    end)
+    statutes = Enum.map(statutes, fn statute ->
+      if duplicates[statute.name] > 1,
+        do: %{statute | pattern: ".*", action: nil, text: "Duplicate statute #{statute.name} requires repair"},
+        else: statute
+    end)
 
     :persistent_term.put(@persist_key, statutes)
     statutes

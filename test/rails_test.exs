@@ -93,6 +93,27 @@ defmodule Tightbeam.RailsTest do
     end
   end
 
+  test "a malformed statute keeps its tool closed and retains a healthy sibling", ctx do
+    write_statute(ctx, %{"pattern" => :omit})
+    path = Path.join(ctx.rails_dir, "statutes.toml")
+    File.write!(path, File.read!(path) <> """
+    [[statute]]
+    name = "healthy-sibling"
+    on = "tool-call"
+    tool = "Read"
+    pattern = "protected"
+    text = "Do not read protected files"
+    """)
+    assert ExUnit.CaptureLog.capture_log(fn ->
+      assert [bad, good] = Rails.load!(ctx.base_dir)
+      assert bad.tool == "Bash"
+      assert bad.pattern == ".*"
+      assert good.name == "healthy-sibling"
+      assert good.tool == "Read"
+      assert good.pattern == "protected"
+    end) =~ "no-history-rewrites"
+  end
+
   test "an action statute compiles the closed argv classifier", ctx do
     write_statute(ctx, %{"pattern" => :omit, "action" => ~s("git-stash")})
     assert [statute] = Rails.load!(ctx.base_dir)
