@@ -624,6 +624,18 @@ defmodule Tightbeam.Artifacts do
     end
   end
 
+  @doc false
+  def repoint_archive_in_txn(txn, artifact_id, home) do
+    reserve_version_in_txn(txn, artifact_id)
+    Txn.q(txn, "UPDATE artifacts SET home=?2,updatedAt=?3 WHERE artifactId=?1 AND state='archived'", [artifact_id,home,now()])
+    publish_in_txn(txn, "artifact.archived", artifact_id)
+  end
+
+  @doc false
+  def archive_cleaned_in_txn(txn, artifact_id, home) do
+    transition_in_txn(txn, artifact_id, "in-workspace", "archived", home, now())
+  end
+
   defp transition_in_txn(txn, id, prior, state, home, updated_at, custody \\ nil) do
     case get_in_txn(txn, id) do
       %{state: ^prior} ->

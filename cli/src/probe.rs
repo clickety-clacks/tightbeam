@@ -1510,6 +1510,9 @@ fn report_json(report: &Report, sentinels: Option<Value>, event_paths: Option<Va
         fields.insert("sentinels".to_owned(), sentinels);
     }
     if let (Some(event_paths), Some(fields)) = (event_paths, value.as_object_mut()) {
+        if let Some(cleanup) = event_paths.get("workspaceCleanup") {
+            fields.insert("workspace_cleanup".to_owned(), cleanup.clone());
+        }
         fields.insert("event_paths".to_owned(), event_paths);
     }
     pretty_json(&value)
@@ -1603,6 +1606,7 @@ fn doctor_event_paths(base_dir: &Path, explicit_base_dir: bool) -> Result<Value,
     let deadline = Instant::now() + std::time::Duration::from_secs(5);
     let version = crate::dispatch::send_to_with_deadline(&endpoint, &request, Some(deadline))?
         .ok_or("the gateway returned no health facts")?;
+    let cleanup = version.get("workspaceCleanup").cloned();
     version
         .get("eventPaths")
         .filter(|health| {
@@ -1611,6 +1615,12 @@ fn doctor_event_paths(base_dir: &Path, explicit_base_dir: bool) -> Result<Value,
                 && health["recent"].is_array()
         })
         .cloned()
+        .map(|mut health| {
+            if let Some(cleanup) = cleanup {
+                health["workspaceCleanup"] = cleanup;
+            }
+            health
+        })
         .ok_or_else(|| "the gateway did not report event path health".to_owned())
 }
 
@@ -1634,8 +1644,11 @@ fn event_paths_lines(status: &Result<Value, String>) -> Vec<String> {
         Ok(health) => health,
         Err(reason) => return vec![format!("[WARN] event paths: health unavailable ({reason})")],
     };
+    let cleanup = workspace_cleanup_lines(&health["workspaceCleanup"]);
     if health["count"] == 0 {
-        return vec!["[PASS] event paths: no missed events since start".to_owned()];
+        let mut lines = vec!["[PASS] event paths: no missed events since start".to_owned()];
+        lines.extend(cleanup);
+        return lines;
     }
     let counts = [
         ("wake", "wake scheduler"),
@@ -1665,7 +1678,24 @@ fn event_paths_lines(status: &Result<Value, String>) -> Vec<String> {
             ));
         }
     }
+    lines.extend(cleanup);
     lines
+}
+
+fn workspace_cleanup_lines(health: &Value) -> Vec<String> {
+    match health["count"].as_u64() {
+        Some(0) => vec!["[PASS] retired workspaces: cleanup complete".to_owned()],
+        Some(count) => {
+            let mut lines = vec![format!("[WARN] retired workspaces: {count} unfinished cleanups")];
+            if let Some(rows) = health["unfinished"].as_array() {
+                for row in rows {
+                    lines.push(format!("  {}: {}", row["workspace"].as_str().unwrap_or("unknown"), row["reason"].as_str().unwrap_or("cleanup pending")));
+                }
+            }
+            lines
+        }
+        None => vec![format!("[WARN] retired workspaces: cleanup status unavailable ({})", health["unavailable"].as_str().unwrap_or("gateway did not report cleanup status"))],
+    }
 }
 
 /// What the gateway reports about this host's sentinels, or why it could not.
@@ -1892,6 +1922,15 @@ fn offline_harness_notes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn doctor_names_unfinished_workspace_cleanups() {
+        let lines = workspace_cleanup_lines(&serde_json::json!({"count": 1, "unfinished": [{"workspace": "example-workspace", "reason": "archive move failed"}]}));
+        assert!(lines[0].contains("1 unfinished"));
+        assert!(lines[1].contains("example-workspace: archive move failed"));
+        assert!(workspace_cleanup_lines(&serde_json::json!({"count": 0}))[0].contains("[PASS]"));
+        assert!(workspace_cleanup_lines(&serde_json::json!({"unavailable": "offline"}))[0].contains("offline"));
+    }
+
     #[test]
     fn event_paths_pass_at_clean_start_and_warn_with_recorded_misses() {
         let clean = Ok(serde_json::json!({

@@ -79,6 +79,10 @@ if config_env() != :test do
     config :tightbeam, :drain_timeout_ms, String.to_integer(value)
   end
 
+  if value = System.get_env("TIGHTBEAM_ARCHIVE_DIR") do
+    config :tightbeam, :archive_dir, value
+  end
+
   if value = System.get_env("TIGHTBEAM_RETENTION_DAYS") do
     days =
       case Integer.parse(value) do
