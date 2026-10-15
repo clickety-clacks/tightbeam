@@ -1507,6 +1507,9 @@ fn pretty_json(value: &Value) -> String {
 fn report_json(report: &Report, sentinels: Option<Value>, event_paths: Option<Value>) -> String {
     let mut value = report_value(report);
     if let (Some(sentinels), Some(fields)) = (sentinels, value.as_object_mut()) {
+        if let Some(cleanup) = sentinels.get("workspace_cleanup") {
+            fields.insert("workspace_cleanup".to_owned(), cleanup.clone());
+        }
         fields.insert("sentinels".to_owned(), sentinels);
     }
     if let (Some(event_paths), Some(fields)) = (event_paths, value.as_object_mut()) {
@@ -1578,6 +1581,10 @@ pub fn run(
     } else {
         println!("{}", human(&report));
         println!("{}", sentinel_lines(&sentinels).join("\n"));
+        println!(
+            "{}",
+            workspace_cleanup_lines(&sentinel_value(&sentinels)["workspace_cleanup"]).join("\n")
+        );
         println!("{}", event_paths_lines(&event_paths).join("\n"));
     }
     require_runnable_harness_cli(harness_catalog.as_ref())?;
@@ -1666,6 +1673,44 @@ fn event_paths_lines(status: &Result<Value, String>) -> Vec<String> {
         }
     }
     lines
+}
+
+fn workspace_cleanup_lines(health: &Value) -> Vec<String> {
+    match health["count"].as_u64() {
+        Some(0)
+            if health["reasons"]
+                .as_array()
+                .is_none_or(|rows| rows.is_empty()) =>
+        {
+            vec!["[PASS] retired workspaces: cleanup complete".to_owned()]
+        }
+        Some(count) => {
+            let mut lines = vec![format!(
+                "[WARN] retired workspaces: {count} unfinished cleanups"
+            )];
+            if let Some(rows) = health["reasons"].as_array() {
+                for row in rows {
+                    lines.push(format!(
+                        "  {}: {} ({})",
+                        row["count"].as_u64().unwrap_or(0),
+                        row["reason"].as_str().unwrap_or("cleanup pending"),
+                        if row["completed"].as_bool().unwrap_or(false) {
+                            "finished"
+                        } else {
+                            "pending"
+                        }
+                    ));
+                }
+            }
+            lines
+        }
+        None => vec![format!(
+            "[WARN] retired workspaces: cleanup status unavailable ({})",
+            health["unavailable"]
+                .as_str()
+                .unwrap_or("gateway did not report cleanup status")
+        )],
+    }
 }
 
 /// What the gateway reports about this host's sentinels, or why it could not.
@@ -1892,6 +1937,25 @@ fn offline_harness_notes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn doctor_names_unfinished_workspace_cleanups() {
+        let lines = workspace_cleanup_lines(
+            &serde_json::json!({"count": 1, "reasons": [{"count": 1, "reason": "archive move failed", "completed": false}]}),
+        );
+        assert!(lines[0].contains("1 unfinished"));
+        assert!(lines[1].contains("1: archive move failed"));
+        let finished = workspace_cleanup_lines(
+            &serde_json::json!({"count": 0, "reasons": [{"count": 3, "reason": "artifact_missing", "completed": true}]}),
+        );
+        assert!(finished[0].contains("[WARN]"));
+        assert!(finished[1].contains("3: artifact_missing (finished)"));
+        assert!(workspace_cleanup_lines(&serde_json::json!({"count": 0}))[0].contains("[PASS]"));
+        assert!(
+            workspace_cleanup_lines(&serde_json::json!({"unavailable": "offline"}))[0]
+                .contains("offline")
+        );
+    }
+
     #[test]
     fn event_paths_pass_at_clean_start_and_warn_with_recorded_misses() {
         let clean = Ok(serde_json::json!({

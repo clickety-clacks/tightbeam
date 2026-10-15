@@ -21,8 +21,8 @@ defmodule Tightbeam.LifecycleRuntimeFixture do
        [["index-observed-new"]]},
       {"gateway.ex", "SELECT seq, role, sender, content, attachments", ["index-session", 3, 100],
        [[1, "user", nil, "visible", "[]"]]},
-      {"gateway.ex", "SELECT kind FROM lifecycle_events", ["index-session"],
-       [["retired_workspace_cleanup_incomplete"]]},
+      {"workspace_cleanup.ex", "SELECT sessionKey,nextAt FROM retired_workspace_cleanup", [],
+       [["index-session", 0]]},
       {"wakes.ex", "SELECT detail FROM lifecycle_events", ["index-observed"], [["wake-detail"]]},
       {"escalation.ex", "SELECT COUNT(*) FROM lifecycle_events WHERE kind", ["index-decision"],
        [[2]]}
@@ -37,7 +37,8 @@ defmodule Tightbeam.LifecycleRuntimeFixture do
                  (String.contains?(sql, "lifecycle_events") or
                     prefix in [
                       "SELECT w.wakeId,w.sessionKey FROM wakes w",
-                      "SELECT CASE WHEN idleCleanupObservedWake"
+                      "SELECT CASE WHEN idleCleanupObservedWake",
+                      "SELECT sessionKey,nextAt FROM retired_workspace_cleanup"
                     ]),
                do: {sql, [sql | acc]},
                else: {sql, acc}
@@ -64,7 +65,7 @@ defmodule Tightbeam.LifecycleRuntimeFixture do
       else
         assert Enum.any?(details, &String.contains?(&1, "SEARCH")), inspect(plan)
 
-        assert Enum.any?(details, &String.contains?(&1, "USING INDEX")),
+        assert Enum.any?(details, &Regex.match?(~r/USING (?:COVERING )?INDEX/, &1)),
                "#{file}: recorded cleanup lookup missing index: #{inspect(plan)}"
 
         refute Enum.any?(details, &Regex.match?(~r/\bSCAN (?:wakes|w)\b/, &1)),
@@ -104,6 +105,7 @@ defmodule Tightbeam.LifecycleRuntimeFixture do
       INSERT INTO sessions(sessionKey,displayName,ownerUserId,origin,archetype,harness,provider,model,createdAt,updatedAt,idleCleanupObservedWake,idleCleanupPreviousWake)
       VALUES ('index-session','Synthetic','index-owner','process:synthetic','default','claude','anthropic','fable',0,0,'index-observed-new','index-observed'),
              ('other-session','Other','index-owner','process:synthetic','default','claude','anthropic','fable',0,0,'other-wake',NULL);
+      INSERT INTO retired_workspace_cleanup(sessionKey,nextAt) VALUES ('index-session',0);
       INSERT INTO wakes(wakeId,sessionKey,origin,prompt,dueAt,createdAt,idleCleanupObserved)
       VALUES ('index-unobserved','index-session','process:synthetic','fixture',0,0,0),
              ('index-observed','index-session','process:synthetic','fixture',0,0,1);
