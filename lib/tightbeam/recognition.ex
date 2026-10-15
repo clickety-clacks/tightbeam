@@ -66,7 +66,7 @@ defmodule Tightbeam.Recognition do
     safely(fn ->
       DB.transaction(db, fn txn ->
         Enum.each(pending.transitions, &DB.record_row_commit(txn, &1))
-        result = recognized_result!(callback.(txn, pending.result), pending.result)
+        result = recognized_result!(call_callback!(callback, txn, pending.result), pending.result)
         # Clear the durable intent atomically with recognition's changes.
         if clear, do: Txn.q(txn, "DELETE FROM pending_recognition WHERE id=?1", [pending.id])
         result
@@ -76,6 +76,13 @@ defmodule Tightbeam.Recognition do
 
   defp invoke(_db, pending, callback, _clear) when is_function(callback, 1),
     do: safely(fn -> {:ok, recognized_result!(callback.(pending.result), pending.result)} end)
+
+  defp call_callback!(callback, txn, result) do
+    callback.(txn, result)
+  catch
+    kind, _reason when kind in [:throw, :exit] ->
+      raise DB.Error, message: "recognition callback #{kind}"
+  end
 
   defp recognized_result!({:error, _} = error, original) when error != original,
     do: raise(DB.Error, message: "recognition returned an error")
