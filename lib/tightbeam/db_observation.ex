@@ -101,7 +101,11 @@ defmodule Tightbeam.DBObservation do
     started = System.monotonic_time()
 
     envelope = %{
-      dispatch_audit: Process.get(:tightbeam_dispatch_audit),
+      dispatch_audit:
+        if(Process.get(:tightbeam_dispatch_audited),
+          do: nil,
+          else: Process.get(:tightbeam_dispatch_audit)
+        ),
       request_id: context.request_id,
       db_call_id: RequestContext.id("dbc_"),
       operation: operation,
