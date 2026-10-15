@@ -318,7 +318,7 @@ defmodule Tightbeam.BootRecordIsolationTest do
     assert :ok = Rules.evaluate(db, %{verb: "status", params: %{}, origin: "user:owner"})
   end
 
-  test "missing upstream ref leaves the published identity readable", %{base: base} do
+  test "missing synchronization refs leave the published identity readable", %{base: base} do
     Identity.init!(base)
     revision = Identity.live_revision!(base)
 
@@ -327,6 +327,11 @@ defmodule Tightbeam.BootRecordIsolationTest do
 
     assert capture_log(fn -> assert :noop = Identity.init!(base) end) =~ "tightbeam/upstream"
     assert Identity.live_revision!(base) == revision
+    {_, 0} = System.cmd("git", ["checkout", "--detach", "tightbeam/live"], cd: Path.join(base, "identity"), stderr_to_stdout: true)
+    {_, 0} = System.cmd("git", ["branch", "-D", "main"], cd: Path.join(base, "identity"))
+    assert capture_log(fn -> assert :noop = Identity.init!(base) end) =~ "main"
+    assert Identity.live_revision!(base) == revision
+
   end
 
   test "broken installed bundle metadata records its own projection fault", %{db: db, base: base} do
