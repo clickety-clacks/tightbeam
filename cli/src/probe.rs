@@ -1677,17 +1677,28 @@ fn event_paths_lines(status: &Result<Value, String>) -> Vec<String> {
 
 fn workspace_cleanup_lines(health: &Value) -> Vec<String> {
     match health["count"].as_u64() {
-        Some(0) => vec!["[PASS] retired workspaces: cleanup complete".to_owned()],
+        Some(0)
+            if health["reasons"]
+                .as_array()
+                .is_none_or(|rows| rows.is_empty()) =>
+        {
+            vec!["[PASS] retired workspaces: cleanup complete".to_owned()]
+        }
         Some(count) => {
             let mut lines = vec![format!(
                 "[WARN] retired workspaces: {count} unfinished cleanups"
             )];
-            if let Some(rows) = health["unfinished"].as_array() {
+            if let Some(rows) = health["reasons"].as_array() {
                 for row in rows {
                     lines.push(format!(
-                        "  {}: {}",
-                        row["workspace"].as_str().unwrap_or("unknown"),
-                        row["reason"].as_str().unwrap_or("cleanup pending")
+                        "  {}: {} ({})",
+                        row["count"].as_u64().unwrap_or(0),
+                        row["reason"].as_str().unwrap_or("cleanup pending"),
+                        if row["completed"].as_bool().unwrap_or(false) {
+                            "finished"
+                        } else {
+                            "pending"
+                        }
                     ));
                 }
             }
@@ -1929,10 +1940,15 @@ mod tests {
     #[test]
     fn doctor_names_unfinished_workspace_cleanups() {
         let lines = workspace_cleanup_lines(
-            &serde_json::json!({"count": 1, "unfinished": [{"workspace": "example-workspace", "reason": "archive move failed"}]}),
+            &serde_json::json!({"count": 1, "reasons": [{"count": 1, "reason": "archive move failed", "completed": false}]}),
         );
         assert!(lines[0].contains("1 unfinished"));
-        assert!(lines[1].contains("example-workspace: archive move failed"));
+        assert!(lines[1].contains("1: archive move failed"));
+        let finished = workspace_cleanup_lines(
+            &serde_json::json!({"count": 0, "reasons": [{"count": 3, "reason": "artifact_missing", "completed": true}]}),
+        );
+        assert!(finished[0].contains("[WARN]"));
+        assert!(finished[1].contains("3: artifact_missing (finished)"));
         assert!(workspace_cleanup_lines(&serde_json::json!({"count": 0}))[0].contains("[PASS]"));
         assert!(
             workspace_cleanup_lines(&serde_json::json!({"unavailable": "offline"}))[0]

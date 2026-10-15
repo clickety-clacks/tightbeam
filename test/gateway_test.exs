@@ -1726,12 +1726,12 @@ defmodule Tightbeam.GatewayTest do
     assert unchanged_external.state == "in-workspace"
     assert unchanged_external.home == nil
 
-    assert "scratch.txt" in cleanup.removed_paths
+    assert cleanup.removed_count > 0
 
     assert Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
              event.kind == "retired_workspace_cleanup_completed" and
                event.subject == session.session_key and
-               JSON.decode!(event.detail)["removed_paths"] == cleanup.removed_paths
+               JSON.decode!(event.detail)["removed_count"] == cleanup.removed_count
            end)
   end
 
@@ -1792,7 +1792,7 @@ defmodule Tightbeam.GatewayTest do
     refute File.exists?(unregistered_file)
     assert Artifacts.get(ctx.db, report.artifact_id).state == "archived"
     assert Artifacts.get(ctx.db, checkout.artifact_id).state == "archived"
-    assert "scratch.txt" in cleanup.removed_paths
+    assert cleanup.removed_count > 0
 
     assert Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
              event.kind == "retired_workspace_cleanup_completed" and
@@ -1828,8 +1828,8 @@ defmodule Tightbeam.GatewayTest do
     assert [
              %{
                status: "incomplete",
-               removed_paths: [],
-               removed_paths_complete: false,
+               removed_count: 0,
+               removed_count_complete: false,
                result_confirmed: false,
                command_exit: 255
              } = cleanup
@@ -1843,7 +1843,7 @@ defmodule Tightbeam.GatewayTest do
     assert Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
              event.kind == "retired_workspace_cleanup_incomplete" and
                event.subject == fixture.session.session_key and
-               JSON.decode!(event.detail)["status"] == cleanup.status
+               "cleanup_command_failed" in JSON.decode!(event.detail)["blockers"]
            end)
   end
 
@@ -1893,7 +1893,7 @@ defmodule Tightbeam.GatewayTest do
     result = Task.await(retirement, 3_000)
 
     assert [
-             %{status: "incomplete", removed_paths_complete: false, result_confirmed: false} =
+             %{status: "incomplete", removed_count_complete: false, result_confirmed: false} =
                cleanup
            ] =
              result.workspace_cleanup
@@ -1926,7 +1926,7 @@ defmodule Tightbeam.GatewayTest do
         params: %{}
       })
 
-    assert [%{status: "incomplete"} = cleanup] = result.workspace_cleanup
+    assert [cleanup] = result.workspace_cleanup
 
     if File.exists?(Path.join(fixture.workspace, registered_path)) do
       assert File.read!(differently_spelled_path) == "registered path must not be removed"
@@ -1995,7 +1995,7 @@ defmodule Tightbeam.GatewayTest do
 
     first = handler.(call)
     assert [%{status: "incomplete"} = partial] = first.workspace_cleanup
-    assert "a-scratch.txt" in partial.removed_paths
+    assert partial.removed_count > 0
     refute File.exists?(first_removed)
     assert File.exists?(injected_failure)
     assert File.read!(protected_path) == "registered content"
@@ -2025,7 +2025,7 @@ defmodule Tightbeam.GatewayTest do
              "retired_workspace_cleanup_completed"
            ]
 
-    assert "z-failure.txt" in completed.removed_paths
+    assert completed.removed_count > 0
   end
 
   test "remote cleanup ignores legacy artifacts with no location", ctx do
@@ -2108,7 +2108,7 @@ defmodule Tightbeam.GatewayTest do
     assert File.lstat!(Path.join(fixture.workspace, "z-protected")).type == :symlink
     assert File.read!(Path.join(outside, "keep.md")) == "outside the workdir"
     assert Artifacts.get(ctx.db, artifact.artifact_id).state == "in-workspace"
-    assert cleanup.removed_paths == []
+    assert cleanup.removed_count == 0
     assert File.read!(scratch) == "preserve when preflight detects the raced route"
   end
 

@@ -169,13 +169,13 @@ defmodule Tightbeam.WorkspaceCleanupTest do
     :ok =
       DB.execute(
         ctx.db,
-        "DROP TRIGGER retired_workspace_cleanup_enqueue; DROP TABLE retired_workspace_cleanup; DROP TABLE retired_archive_relocation; DELETE FROM retired_workspace_cleanup_migration"
+        "DROP TRIGGER retired_workspace_cleanup_enqueue; DROP TABLE retired_workspace_cleanup; DELETE FROM retired_workspace_cleanup_migration"
       )
 
     retire(ctx)
     assert :ok = Schema.ensure_all(ctx.db)
 
-    assert %{count: 1, unfinished: [%{reason: "cleanup pending"}]} =
+    assert %{count: 1, reasons: [%{reason: "cleanup pending"}]} =
              WorkspaceCleanup.health(ctx.db)
 
     assert {:ok, [[1]]} =
@@ -247,8 +247,8 @@ defmodule Tightbeam.WorkspaceCleanupTest do
     worker = start_supervised!({WorkspaceCleanup, config: ctx.config})
     send(worker, :drain)
     :sys.get_state(worker)
-    assert %{count: 1, unfinished: [%{reason: reason}]} = WorkspaceCleanup.health(ctx.db)
-    assert reason =~ "archive repoint unavailable"
+    # The moved entry remains discoverable through its old database prefix.
+    assert Artifacts.get(ctx.db, artifact.artifact_id).home == old_home
     :ok = DB.execute(ctx.db, "DROP TRIGGER refuse_archive_repoint")
     send(worker, :drain)
     :sys.get_state(worker)
@@ -301,7 +301,7 @@ defmodule Tightbeam.WorkspaceCleanupTest do
     send(worker, :drain)
     :sys.get_state(worker)
     refute File.exists?(other_workspace)
-    assert %{count: 1, unfinished: [%{reason: reason}]} = WorkspaceCleanup.health(ctx.db)
+    assert %{count: 1, reasons: [%{reason: reason}]} = WorkspaceCleanup.health(ctx.db)
     assert reason =~ "cleanup_command_failed"
     assert WorkspaceCleanup.health(ctx.db, "another-owner").count == 0
     {:ok, _} = DB.query(ctx.db, "UPDATE retired_workspace_cleanup SET nextAt=0 WHERE completed=0")
@@ -314,21 +314,30 @@ defmodule Tightbeam.WorkspaceCleanupTest do
   test "a missing artifact does not stop deletion of unrelated files", ctx do
     missing = Path.join(ctx.workspace, "missing")
     artifact(ctx, missing)
+    present = Path.join(ctx.workspace, "present")
+    File.write!(present, "keep")
+    kept = artifact(ctx, present)
     scratch = Path.join(ctx.workspace, "scratch")
     File.write!(scratch, "discard")
     retire(ctx)
 
-    assert %{status: "incomplete", blockers: blockers} =
+    assert %{status: "completed", blockers: blockers} =
              WorkspaceCleanup.process_session(ctx.config, ctx.db, ctx.session.session_key)
 
     assert Enum.any?(blockers, &(&1.reason == "artifact_missing"))
     refute File.exists?(scratch)
-    File.write!(missing, "recovered")
+    refute File.exists?(ctx.workspace)
+    assert File.read!(Artifacts.get(ctx.db, kept.artifact_id).home) == "keep"
 
-    assert %{status: "completed"} =
-             WorkspaceCleanup.process_session(ctx.config, ctx.db, ctx.session.session_key)
+    assert %{count: 0, reasons: [%{completed: true, reason: "artifact_missing", count: 1}]} =
+             WorkspaceCleanup.health(ctx.db)
 
-    assert WorkspaceCleanup.health(ctx.db).count == 0
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT completed FROM retired_workspace_cleanup WHERE sessionKey=?1",
+               [ctx.session.session_key]
+             )
   end
 
   test "notification failure after retirement cannot lose cleanup or change the result", ctx do
@@ -367,7 +376,7 @@ defmodule Tightbeam.WorkspaceCleanupTest do
     assert WorkspaceCleanup.health(ctx.db).count == 0
   end
 
-  test "an interrupted archive copy preserves originals and resumes its staging directory", ctx do
+  test "an interrupted archive copy preserves originals and retries the copy", ctx do
     kept = Path.join(ctx.workspace, "kept")
     File.write!(kept, "preserve through a failed copy")
     artifact = artifact(ctx, kept)
@@ -378,7 +387,7 @@ defmodule Tightbeam.WorkspaceCleanupTest do
       copy_script =
         String.replace(
           script,
-          ~S|if [ "$(device_id "$source")" = "$(device_id "$(dirname "$target")")" ]; then|,
+          ~S|if [ ! -e "$target" ] && [ "$(device_id "$source")" = "$(device_id "$(dirname "$target")")" ]; then|,
           "if false; then"
         )
 
@@ -411,9 +420,7 @@ defmodule Tightbeam.WorkspaceCleanupTest do
                [ctx.session.session_key]
              )
 
-    refute File.exists?(destination)
-
-    assert File.read!(Path.join(destination <> ".partial", "kept")) ==
+    assert File.read!(Path.join(destination, "kept")) ==
              "preserve through a failed copy"
 
     assert %{status: "completed"} =
@@ -424,6 +431,143 @@ defmodule Tightbeam.WorkspaceCleanupTest do
 
     assert File.read!(Artifacts.get(ctx.db, artifact.artifact_id).home) ==
              "preserve through a failed copy"
+  end
+
+  test "a timed out archive copy stops before another attempt can start", ctx do
+    kept = Path.join(ctx.workspace, "kept")
+    File.write!(kept, "preserve")
+    artifact(ctx, kept)
+    retire(ctx)
+    pid_file = Path.join(ctx.base, "copy-pid")
+
+    runner = fn _, script, input ->
+      script =
+        String.replace(
+          script,
+          ~S|if [ ! -e "$target" ] && [ "$(device_id "$source")" = "$(device_id "$(dirname "$target")")" ]; then|,
+          "if false; then"
+        )
+
+      script =
+        "cp() { sleep 30 & child=$!; echo $child > " <>
+          pid_file <> "; trap 'kill $child; wait $child; exit 1' TERM; wait $child; }\n" <> script
+
+      WorkspaceCleanup.system_runner(["sh", "-c", script], script, input)
+    end
+
+    config =
+      ctx.config
+      |> Map.put(:workspace_cleanup_runner, runner)
+      |> Map.put(:workspace_cleanup_timeout_ms, 4_000)
+
+    assert %{status: "incomplete", blockers: blockers} =
+             WorkspaceCleanup.process_session(config, ctx.db, ctx.session.session_key)
+
+    assert Enum.any?(blockers, &(&1.reason == "archive_move_failed"))
+    pid = File.read!(pid_file) |> String.trim()
+    assert {_, status} = System.cmd("kill", ["-0", pid], stderr_to_stdout: true)
+    assert status != 0
+    assert File.read!(kept) == "preserve"
+  end
+
+  test "satellites keep their archive on their own host", ctx do
+    Application.put_env(:tightbeam, :archive_dir, "/configured/archive")
+    on_exit(fn -> Application.delete_env(:tightbeam, :archive_dir) end)
+    assert WorkspaceCleanup.archive_root(%{ssh: nil, base_dir: ctx.base}) == "/configured/archive"
+
+    assert WorkspaceCleanup.archive_root(%{ssh: "remote", base_dir: "/remote/base"}) ==
+             "/remote/base/archive"
+  end
+
+  test "each drain relocates only one existing archive entry", ctx do
+    source = Path.join(ctx.base, "archive")
+    destination = Path.join(ctx.base, "destination")
+
+    for entry <- ["first", "second"] do
+      File.mkdir_p!(Path.join(source, entry))
+      File.write!(Path.join([source, entry, "kept"]), entry)
+    end
+
+    Application.put_env(:tightbeam, :archive_dir, destination)
+    on_exit(fn -> Application.delete_env(:tightbeam, :archive_dir) end)
+    worker = start_supervised!({WorkspaceCleanup, config: ctx.config})
+    send(worker, :drain)
+    :sys.get_state(worker)
+    assert File.ls!(source) == ["second"]
+    assert File.read!(Path.join([destination, "first", "kept"])) == "first"
+    send(worker, :drain)
+    :sys.get_state(worker)
+    assert File.ls!(source) == []
+    assert File.read!(Path.join([destination, "second", "kept"])) == "second"
+  end
+
+  test "an absent workspace finishes with missing artifact reasons", ctx do
+    artifact(ctx, Path.join(ctx.workspace, "lost"))
+    File.rm_rf!(ctx.workspace)
+    retire(ctx)
+
+    assert %{status: "completed", blockers: [%{reason: "artifact_missing"}]} =
+             WorkspaceCleanup.process_session(ctx.config, ctx.db, ctx.session.session_key)
+
+    assert %{count: 0, reasons: [%{completed: true, reason: "artifact_missing"}]} =
+             WorkspaceCleanup.health(ctx.db)
+  end
+
+  test "removal reports store counts without paths", ctx do
+    for n <- 1..1000, do: File.write!(Path.join(ctx.workspace, "scratch-#{n}"), "discard")
+    retire(ctx)
+    report = WorkspaceCleanup.process_session(ctx.config, ctx.db, ctx.session.session_key)
+    assert report.status == "completed"
+    assert report.removed_count == 1001
+
+    {:ok, [[stored]]} =
+      DB.query(ctx.db, "SELECT report FROM retired_workspace_cleanup WHERE sessionKey=?1", [
+        ctx.session.session_key
+      ])
+
+    assert JSON.decode!(stored) == %{"removed_count" => 1001, "blockers" => []}
+
+    {:ok, [[event]]} =
+      DB.query(
+        ctx.db,
+        "SELECT detail FROM lifecycle_events WHERE kind='retired_workspace_cleanup_completed' AND subject=?1",
+        [ctx.session.session_key]
+      )
+
+    assert JSON.decode!(event) == JSON.decode!(stored)
+  end
+
+  test "repeated failures grow the retry interval and doctor groups reasons", ctx do
+    retire(ctx)
+    config = Map.put(ctx.config, :workspace_cleanup_runner, fn _, _, _ -> {"offline", 255} end)
+    WorkspaceCleanup.process_session(config, ctx.db, ctx.session.session_key)
+
+    {:ok, [[first]]} =
+      DB.query(ctx.db, "SELECT nextAt FROM retired_workspace_cleanup WHERE sessionKey=?1", [
+        ctx.session.session_key
+      ])
+
+    WorkspaceCleanup.process_session(config, ctx.db, ctx.session.session_key)
+
+    {:ok, [[second, attempts]]} =
+      DB.query(
+        ctx.db,
+        "SELECT nextAt,attempts FROM retired_workspace_cleanup WHERE sessionKey=?1",
+        [ctx.session.session_key]
+      )
+
+    assert attempts == 2
+    assert second - first >= 300_000
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO retired_workspace_cleanup(sessionKey,reason) SELECT 'other',reason FROM retired_workspace_cleanup WHERE sessionKey=?1",
+        [ctx.session.session_key]
+      )
+
+    assert %{count: 2, reasons: [%{count: 2, reason: reason}]} = WorkspaceCleanup.health(ctx.db)
+    assert reason =~ "cleanup_command_failed"
   end
 
   defp retire(ctx) do

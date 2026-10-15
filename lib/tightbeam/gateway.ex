@@ -9836,16 +9836,14 @@ defmodule Tightbeam.Gateway do
       prior && prior.session_key == call.session_key ->
         retired_keys = retired_subtree_keys(db, call.session_key)
 
-        retire_replay_with_cleanup(
-          config,
+        retire_replay_observation(
           db,
           call,
           %{
             deleted_session_key: call.session_key,
             retired_session_keys: retired_keys,
             deferred: []
-          },
-          retired_keys
+          }
         )
 
       true ->
@@ -9917,26 +9915,22 @@ defmodule Tightbeam.Gateway do
                 end
               end)
 
-              cleanup_reports =
-                reap_retired_sessions(config, db, Enum.map(result.retired, & &1.session_key))
+              reap_retired_sessions(config, db, Enum.map(result.retired, & &1.session_key))
 
               %{
                 deleted_session_key: session.session_key,
                 retired_session_keys: Enum.map(result.retired, & &1.session_key),
-                deferred: result.deferred,
-                workspace_cleanup: cleanup_reports
+                deferred: result.deferred
               }
             else
-              retire_replay_with_cleanup(
-                config,
+              retire_replay_observation(
                 db,
                 call,
                 %{
                   deleted_session_key: session.session_key,
                   retired_session_keys: [],
                   deferred: []
-                },
-                retired_subtree_keys(db, session.session_key)
+                }
               )
             end
 
@@ -9953,18 +9947,6 @@ defmodule Tightbeam.Gateway do
       end)
 
     result
-  end
-
-  defp retire_replay_with_cleanup(config, db, call, result, session_keys) do
-    result = retire_replay_observation(db, call, result)
-    reports = retry_incomplete_retired_workspaces(config, db, session_keys)
-
-    if reports == [], do: result, else: Map.put(result, :workspace_cleanup, reports)
-  end
-
-  defp retry_incomplete_retired_workspaces(_config, _db, _session_keys) do
-    WorkspaceCleanup.kick()
-    []
   end
 
   defp critical_result(config, db, call) do
@@ -10148,7 +10130,6 @@ defmodule Tightbeam.Gateway do
     coordinator = Map.get(config, :adapter_coordinator, Tightbeam.AdapterCoordinator)
 
     WorkspaceCleanup.kick()
-    cleanup_reports = []
 
     try do
       session_keys
@@ -10174,7 +10155,7 @@ defmodule Tightbeam.Gateway do
       :exit, reason -> best_effort_failed("reap_retired_sessions", :exit, reason, __STACKTRACE__)
     end
 
-    cleanup_reports
+    :ok
   end
 
   defp reap_adapter_sessions(db, coordinator, key, retired) do
