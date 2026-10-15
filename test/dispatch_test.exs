@@ -14,7 +14,16 @@ defmodule Tightbeam.DispatchTest do
     %{db: name}
   end
 
-  test "publication commits before response and audit failure preserves success", %{db: db} do
+  @tag :tmp_dir
+  test "a dispatched read returns while a write transaction holds the owner", %{tmp_dir: tmp} do
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "guard_dispatch_read_runtime.exs",
+      "dispatch-read: ok"
+    )
+  end
+
+  test "successful reads return before publication and audit failure preserves success", %{db: db} do
     call = %{verb: "transcript", origin: "user:flynn", session_key: "s1", params: %{}}
     parent = self()
 
@@ -30,12 +39,11 @@ defmodule Tightbeam.DispatchTest do
 
     try do
       assert_receive :handler_completed
-      assert Task.yield(task, 30) == nil
+      assert {:ok, %{entries: ["large result"]}} = Task.await(task, 1_000)
     after
       :sys.resume(db)
     end
 
-    assert {:ok, %{entries: ["large result"]}} = Task.await(task)
     wait_for_audit(db, "SELECT payload FROM events", [["null"]])
 
     :ok =
@@ -54,7 +62,9 @@ defmodule Tightbeam.DispatchTest do
     assert {:ok, [[1]]} = DB.query(db, "SELECT count(*) FROM events")
   end
 
-  test "publication survives audit overload and precedes the response", %{db: db} do
+  test "successful reads skip overloaded audit and publication without delaying the response", %{
+    db: db
+  } do
     parent = self()
     hub = start_hub(db)
 
@@ -80,15 +90,15 @@ defmodule Tightbeam.DispatchTest do
 
     try do
       assert_receive :overloaded
-      assert Task.yield(task, 30) == nil
+      assert {:ok, %{entries: []}} = Task.await(task, 1_000)
     after
       :sys.resume(db)
     end
 
-    assert {:ok, %{entries: []}} = Task.await(task)
-
-    assert_receive {:firehose_notice,
-                    %{"class" => "verb.accepted", "payload" => %{"verb" => "transcript"}}}
+    :sys.get_state(db)
+    :sys.get_state(hub)
+    assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM events")
+    refute_received {:firehose_notice, _}
   end
 
   test "write then denial or crash retains the outcome audit", %{db: db} do

@@ -1030,15 +1030,23 @@ defmodule Tightbeam.Assignments do
         params
       )
 
-    Enum.map(rows, fn row ->
-      assignment = assignment(row)
+    assignments = Enum.map(rows, &assignment/1)
+    ids = Enum.map(assignments, & &1.id)
 
-      assignment
-      |> Map.put(:files, declared_files(db, assignment.id))
-      |> Map.put(
-        :commitRefCorrections,
-        Tightbeam.AssignmentCommitRefCorrections.list(db, assignment.id)
+    {:ok, file_rows} =
+      DB.query(
+        db,
+        "SELECT assignmentId, path FROM assignment_files WHERE assignmentId IN (SELECT value FROM json_each(?1)) ORDER BY path",
+        [JSON.encode!(ids)]
       )
+
+    files = Enum.group_by(file_rows, &hd/1, &List.last/1)
+    corrections = Tightbeam.AssignmentCommitRefCorrections.list_many(db, ids)
+
+    Enum.map(assignments, fn assignment ->
+      assignment
+      |> Map.put(:files, Map.get(files, assignment.id, []))
+      |> Map.put(:commitRefCorrections, Map.get(corrections, assignment.id, []))
     end)
   end
 

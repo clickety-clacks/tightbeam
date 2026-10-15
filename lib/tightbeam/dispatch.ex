@@ -16,7 +16,7 @@ defmodule Tightbeam.Dispatch do
 
   Rules evaluate each call before its handler runs. Handler database writes
   record an identity audit in their transaction. Dispatch records remaining
-  audits and commits publication before returning the response.
+  audits and publication asynchronously for successful reads.
   Read audits contain identity and verb rather than the returned content.
   """
 
@@ -62,6 +62,12 @@ defmodule Tightbeam.Dispatch do
   @type handler :: (call() -> map() | accepted_in_txn())
 
   @type handlers :: %{optional(String.t()) => handler()}
+
+  @read_verbs ~w(facts-read artifact-content-fetch artifact-get artifacts decision-requests
+    decision-request host-env-list sentinel-list identity-status kungfu-list harness-processes
+    role-list breathing work-item-get work-item-trace transcript execution-map execution-map-select
+    toplines topline topline-placement-list work-item-list attests assignment-get assignments inspect
+    harness-health-evidence-other)
 
   @db_transaction_diagnostic_fields ~w(
     kind operation origin phase cause reasonCause exception cleanup
@@ -356,7 +362,8 @@ defmodule Tightbeam.Dispatch do
                   session_key,
                   payload,
                   principal,
-                  &Publisher.accepted_in_txn(&1, publisher_call, caller_only_stripped(result))
+                  &Publisher.accepted_in_txn(&1, publisher_call, caller_only_stripped(result)),
+                  verb in @read_verbs
                 )
             end
 
@@ -424,7 +431,17 @@ defmodule Tightbeam.Dispatch do
   # content. Denials audit in the publication transaction. Outcomes known only
   # after the handler returns complete asynchronously, so an audit never delays
   # a committed result.
-  defp append_event_with_handoff(db, kind, verb, origin, session_key, payload, principal, handoff) do
+  defp append_event_with_handoff(
+         db,
+         kind,
+         verb,
+         origin,
+         session_key,
+         payload,
+         principal,
+         handoff,
+         async \\ false
+       ) do
     audited = Process.delete(:tightbeam_dispatch_audited)
 
     # Successful reads audit identity and verb only, including body reads.
@@ -457,7 +474,7 @@ defmodule Tightbeam.Dispatch do
       :ok
     end
 
-    if handoff do
+    if not is_nil(handoff) and not async do
       {:ok, _} =
         DB.publish_transaction(db, fn txn ->
           record.(txn)
@@ -467,7 +484,15 @@ defmodule Tightbeam.Dispatch do
       if DB.overloaded?(db) do
         Logger.warning("dispatch audit for #{verb} skipped: database overloaded")
       else
-        GenServer.cast(db, {:dispatch_audit, record, System.monotonic_time(:millisecond) + 2_000})
+        side_task = fn txn ->
+          record.(txn)
+          if handoff, do: handoff.(txn), else: :ok
+        end
+
+        GenServer.cast(
+          db,
+          {:dispatch_audit, side_task, System.monotonic_time(:millisecond) + 2_000}
+        )
       end
     end
 
