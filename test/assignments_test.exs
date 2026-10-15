@@ -6766,13 +6766,14 @@ defmodule Tightbeam.AssignmentsTest do
   test "accepted handler rolls back when its event append fails", ctx do
     {:ok, _} = DB.query(ctx.db, "DROP TABLE events")
 
-    assert_raise MatchError, fn ->
-      Dispatch.dispatch(
-        ctx.db,
-        ctx.handlers,
-        Map.put(assign_call({:session, "holder"}, "committed"), :supervision_interval_ms, 1_000)
-      )
-    end
+    assert {:error, %{code: "server_error", message: message}} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               Map.put(assign_call({:session, "holder"}, "committed"), :supervision_interval_ms, 1_000)
+             )
+
+    assert message =~ "events"
 
     assert {:ok, [[0]]} =
              DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE subject = 'committed'")
