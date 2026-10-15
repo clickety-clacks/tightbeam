@@ -2730,10 +2730,9 @@ defmodule Tightbeam.Wire.Router do
   # spec's "stripped from any agent/dispatch param map" is read as scoped to the
   # carrier it is written about, not to the parameter name everywhere.
   @substrate_only_params %{
-    "wake" =>
-      ~w(prompt after_ms after_turn assignment_id at cancel_wake_id class condition_kind condition_scope idempotency_key predicate replace_queued reresolve reresolve_rung reresolve_seed nudge)a,
+    "wake" => ~w(request_ref replacement_assignment_id)a,
     "operator-rule" => ~w(ruled_via_session_key)a,
-    "work-item-create" => ~w(title is_bug priority spec_ref_name spec_ref_sha256 idempotency_key body)a,
+    "work-item-create" => ~w(created_in_turn_seq created_context_known)a,
     # The artifact's turn edge and the class of evidence behind it are the
     # substrate's own observation, resolved in `Artifacts.record/2` from the hook
     # window and the ledger. A caller-filled edge would be forgeable, which is
@@ -2780,7 +2779,8 @@ defmodule Tightbeam.Wire.Router do
     "topline-create" => ~w(idempotency_key title)a,
     "withdraw" => ~w(request request_id reason)a,
     "revoke-waiver" => ~w(waiver waiver_id reason)a,
-    "waive" => ~w(request request_id session session_key statute statute_name reason scope expires_at idempotency_key)a,
+    "waive" =>
+      ~w(request request_id session session_key statute statute_name reason scope expires_at idempotency_key)a,
     "kungfu-scaffold" => ~w(name purpose idempotency_key)a,
     "promote-user" => ~w(user_id is_admin)a,
     "revoke-device" => ~w(device_id)a,
@@ -2874,13 +2874,15 @@ defmodule Tightbeam.Wire.Router do
     "wake" =>
       ~w(prompt after_ms after_turn assignment_id at cancel_wake_id class condition_kind condition_scope idempotency_key predicate replace_queued reresolve reresolve_rung reresolve_seed nudge)a,
     "work-item-close" => ~w(work_item_id)a,
-    "work-item-create" => ~w(title is_bug priority spec_ref_name spec_ref_sha256 idempotency_key body)a,
+    "work-item-create" =>
+      ~w(title is_bug priority spec_ref_name spec_ref_sha256 idempotency_key body)a,
     "work-item-fail" => ~w(reason work_item_id)a,
     "work-item-get" => ~w(work_item_id)a,
     "work-item-icebox" => ~w(work_item_id)a,
     "work-item-reopen" => ~w(work_item_id)a,
     "work-item-trace" => ~w(work_item_id)a,
-    "work-item-update" => ~w(work_item_id title is_bug priority spec_ref_name spec_ref_sha256 delivery_owner_session_key body clear_body)a
+    "work-item-update" =>
+      ~w(work_item_id title is_bug priority spec_ref_name spec_ref_sha256 delivery_owner_session_key body clear_body)a
   }
 
   @param_keys Map.new(@param_keys, fn {verb, keys} ->
