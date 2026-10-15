@@ -64,8 +64,10 @@ defmodule Tightbeam.Wire.RouterTest do
   test "effort and health parameters preserve accepted aliases" do
     assert Router.atomize_params_for_test("effort-rule", %{"requestId" => "request"}) ==
              %{request_id: "request"}
+
     assert Router.atomize_params_for_test("harness-health-observe-other", %{
-             "acceptedAt" => 123, "sessionKey" => "source"
+             "acceptedAt" => 123,
+             "sessionKey" => "source"
            }) == %{accepted_at: 123, session_key: "source"}
   end
 

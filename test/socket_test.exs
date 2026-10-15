@@ -565,9 +565,13 @@ defmodule Tightbeam.Wire.SocketTest do
       model: Model.new("fable")
     })
 
-    first = Projection.append(ctx.db, %{
-      session_key: key, role: "assistant", content: String.duplicate("x", 4 * 1024 * 1024)
-    })
+    {:appended, first} =
+      Projection.append(ctx.db, %{
+        session_key: key,
+        role: "assistant",
+        content: String.duplicate("x", 4 * 1024 * 1024)
+      })
+
     Projection.append(ctx.db, %{session_key: key, role: "assistant", content: "next"})
     {:ok, state} = Socket.init(ctx.deps)
     auth = %{"type" => "auth", "token" => device.token, "deviceId" => device.device_id}

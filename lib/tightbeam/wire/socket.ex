@@ -142,8 +142,8 @@ defmodule Tightbeam.Wire.Socket do
             {:msg, key, seq, payload} ->
               if MapSet.member?(state.replay_pending, key) or
                    MapSet.member?(state.replayed_seqs, {key, seq}),
-                do: [],
-                else: [payload]
+                 do: [],
+                 else: [payload]
 
             {:frame, payload} ->
               [payload]
@@ -336,8 +336,8 @@ defmodule Tightbeam.Wire.Socket do
 
     {reversed, pending, replayed_seqs, _bytes, _count} =
       Enum.reduce(sessions, {[], MapSet.new(), MapSet.new(), 0, 0}, fn session,
-                                                                      {messages, pending, sent, bytes,
-                                                                       count} ->
+                                                                       {messages, pending, sent,
+                                                                        bytes, count} ->
         key = session.session_key
 
         rows =

@@ -34,8 +34,7 @@ defmodule Tightbeam.ConnRegistryTest do
     Process.exit(pid, :kill)
     assert_receive {:DOWN, ^monitor, :process, ^pid, :killed}
     # Deliver the registry's monitor event before the state query from this sender.
-    send(reg, {:DOWN, registry_monitor,
-               :process, pid, :killed})
+    send(reg, {:DOWN, registry_monitor, :process, pid, :killed})
     state = :sys.get_state(reg)
 
     refute Map.has_key?(state.conns, ref)
