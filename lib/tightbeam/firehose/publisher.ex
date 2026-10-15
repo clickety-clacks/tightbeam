@@ -59,7 +59,11 @@ defmodule Tightbeam.Firehose.Publisher do
   @doc "Queue accepted notices on the transaction that committed their state."
   @spec accepted_in_txn(Txn.t(), map(), term()) :: :ok
   def accepted_in_txn(%Txn{} = txn, call, result) do
-    Txn.handoff(txn, hub(call), {:accepted, nil, call, canonical_in_txn(txn, call, result)})
+    Txn.handoff(
+      txn,
+      Hub.destination(hub(call)),
+      {:accepted, nil, call, canonical_in_txn(txn, call, result)}
+    )
   end
 
   defp canonical_in_txn(txn, %{verb: verb} = call, result)
@@ -90,7 +94,11 @@ defmodule Tightbeam.Firehose.Publisher do
 
   @spec observed_accepted_in_txn(Txn.t(), map()) :: :ok
   def observed_accepted_in_txn(%Txn{} = txn, call) do
-    Txn.handoff(txn, hub(call), {:publish, observation_notice("verb.accepted", call)})
+    Txn.handoff(
+      txn,
+      Hub.destination(hub(call)),
+      {:publish, observation_notice("verb.accepted", call)}
+    )
   end
 
   @spec maybe_observed_accepted_in_txn(Txn.t(), map()) :: :ok
@@ -122,7 +130,7 @@ defmodule Tightbeam.Firehose.Publisher do
 
   @spec denied_in_txn(Txn.t(), map(), map()) :: :ok
   def denied_in_txn(%Txn{} = txn, call, error) do
-    Txn.handoff(txn, hub(call), {:denied, call, error})
+    Txn.handoff(txn, Hub.destination(hub(call)), {:denied, call, error})
   end
 
   @spec observed_accepted(map()) :: :ok
@@ -170,9 +178,9 @@ defmodule Tightbeam.Firehose.Publisher do
   @doc false
   def committed_in_txn(%Txn{} = txn, class, payload, refs, hub) do
     if class == "kungfu.updated" do
-      Txn.handoff(txn, hub, {:publish, committed_notice(class, payload, refs)})
+      Txn.handoff(txn, Hub.destination(hub), {:publish, committed_notice(class, payload, refs)})
     else
-      Txn.handoff(txn, hub, {:committed, class, payload, refs})
+      Txn.handoff(txn, Hub.destination(hub), {:committed, class, payload, refs})
     end
   end
 
@@ -184,7 +192,7 @@ defmodule Tightbeam.Firehose.Publisher do
       "workItemId" => snapshot.work_item_id
     }
 
-    Txn.handoff(txn, hub(call), {:committed, class, snapshot, refs})
+    Txn.handoff(txn, Hub.destination(hub(call)), {:committed, class, snapshot, refs})
   end
 
   @doc "Queue one exact source-invalidation notice on its committing transaction."
@@ -206,7 +214,7 @@ defmodule Tightbeam.Firehose.Publisher do
       ) do
     Txn.handoff(
       txn,
-      hub,
+      Hub.destination(hub),
       {:publish, source_invalidation_notice(class, source_version, occurred_at, refs)}
     )
   end
@@ -313,7 +321,7 @@ defmodule Tightbeam.Firehose.Publisher do
       "payload" => StateResources.observation(payload)
     }
 
-    Txn.handoff(txn, Hub, {:publish, notice})
+    Txn.handoff(txn, Hub.destination(Hub), {:publish, notice})
   end
 
   @doc "Queue one observational notice with the mutation's durable occurrence time."
@@ -328,7 +336,7 @@ defmodule Tightbeam.Firehose.Publisher do
       "payload" => StateResources.observation(payload)
     }
 
-    Txn.handoff(txn, Hub, {:publish, notice})
+    Txn.handoff(txn, Hub.destination(Hub), {:publish, notice})
   end
 
   @doc false
