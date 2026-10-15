@@ -79,6 +79,10 @@ if config_env() != :test do
     config :tightbeam, :drain_timeout_ms, String.to_integer(value)
   end
 
+  if value = System.get_env("TIGHTBEAM_RETENTION_DAYS") do
+    config :tightbeam, :retention_days, String.to_integer(value)
+  end
+
   if value = System.get_env("TIGHTBEAM_DB_CALL_TIMEOUT_MS") do
     config :tightbeam, :db_call_timeout_ms, String.to_integer(value)
   end
