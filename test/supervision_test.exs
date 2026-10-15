@@ -3496,7 +3496,7 @@ defmodule Tightbeam.SupervisionTest do
         due_at: 0,
         assignment_id: "asg_unrelated_transfer",
         reresolve: "lineage",
-        reresolve_seed: "missing-holder",
+        reresolve_seed: "holder",
         reresolve_rung: 1
       })
 
@@ -3550,7 +3550,7 @@ defmodule Tightbeam.SupervisionTest do
     assert {:ok, [["open"]]} =
              DB.query(ctx.db, "SELECT state FROM assignments WHERE id=?1", [wake.assignment_id])
 
-    assert Wakes.get(ctx.db, wake.wake_id).reresolve_seed == "missing-holder"
+    assert Wakes.get(ctx.db, wake.wake_id).reresolve_seed == "holder"
   end
 
   test "startup uses the newest valid parent transfer when history has earlier transfers", ctx do
