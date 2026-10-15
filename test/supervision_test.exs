@@ -2930,11 +2930,11 @@ defmodule Tightbeam.SupervisionTest do
              )
 
     assert {:ok, _} =
-             DB.query(ctx.db, "UPDATE wakes SET state='canceled' WHERE wakeId=?1", [
+             DB.query(ctx.db, "UPDATE wakes SET state='fired' WHERE wakeId=?1", [
                controller.wake_id
              ])
 
-    assert {:ok, [[_, "asg_1", "canceled"]]} =
+    assert {:ok, [[_, "asg_1", "fired"]]} =
              DB.query(ctx.db, Supervision.ended_controllers_sql())
 
     assert :ok = Supervision.recover_liveness!(ctx.db, 60_000)

@@ -46,7 +46,7 @@ defmodule Tightbeam.HotQueryPlansTest do
 
     assert Enum.any?(
              plan,
-             &String.contains?(&1, "SEARCH w USING INDEX sqlite_autoindex_wakes_1 (wakeId=?)")
+             &Regex.match?(~r/^SEARCH w USING (?:COVERING )?INDEX .* \(wakeId=\?/, &1)
            )
 
     refute Enum.any?(plan, &Regex.match?(~r/^SCAN w/, &1))
