@@ -210,9 +210,6 @@ defmodule Tightbeam.Supervision do
   @spec request_sweep(GenServer.server()) :: :ok
   def request_sweep(server \\ __MODULE__), do: GenServer.cast(server, :sweep)
 
-  @doc false
-  def deadlines_changed_in_txn(txn), do: Txn.handoff(txn, __MODULE__, :deadlines_changed)
-
   @spec ensure_schema(DB.server()) :: :ok
   def ensure_schema(db \\ DB) do
     :ok = DB.execute(db, @prods_ddl)
@@ -702,7 +699,7 @@ defmodule Tightbeam.Supervision do
           | {:admit, String.t()}
           | {:error, term()}
   def transition_in_txn(txn, observation) do
-    deadlines_changed_in_txn(txn)
+    Txn.handoff(txn, __MODULE__, :deadlines_changed)
     do_transition_in_txn(txn, observation)
   end
 
@@ -5697,14 +5694,19 @@ defmodule Tightbeam.Supervision do
 
   defp refresh_idle_cleanup_deadline(%{sweep_ms: interval} = state)
        when is_integer(interval) and interval > 0 do
-    DB.background_pass(fn ->
-      due = transaction!(state.db, fn txn ->
-        idle_cleanup_deadline_rows_in_txn(txn, state)
-        |> Enum.map(&elem(&1, 2))
-        |> Enum.min(fn -> nil end)
-      end)
-      %{state | idle_cleanup_due: due}
-    end, state)
+    DB.background_pass(
+      fn ->
+        due =
+          transaction!(state.db, fn txn ->
+            idle_cleanup_deadline_rows_in_txn(txn, state)
+            |> Enum.map(&elem(&1, 2))
+            |> Enum.min(fn -> nil end)
+          end)
+
+        %{state | idle_cleanup_due: due}
+      end,
+      state
+    )
   end
 
   defp refresh_idle_cleanup_deadline(state), do: state
