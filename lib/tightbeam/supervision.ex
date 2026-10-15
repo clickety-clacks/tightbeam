@@ -5038,7 +5038,10 @@ defmodule Tightbeam.Supervision do
   # turns and batch members, independently of any delivery-column backfill.
   @doc false
   def copy_idle_cleanup_history_in_txn(txn) do
-    Txn.q(txn, "SELECT wakeId,obligationRef FROM wakes WHERE obligationRef LIKE 'idle-cleanup-v1:%' ORDER BY rowid")
+    Txn.q(
+      txn,
+      "SELECT wakeId,obligationRef FROM wakes WHERE obligationRef LIKE 'idle-cleanup-v1:%' ORDER BY rowid"
+    )
     |> Enum.each(fn [wake_id, ref] ->
       case idle_cleanup_metadata(ref) do
         {:ok, metadata} ->
@@ -5316,7 +5319,11 @@ defmodule Tightbeam.Supervision do
                 :ok = Txn.exec(txn, "ROLLBACK TO classify_terminal")
                 :ok = Txn.exec(txn, "RELEASE classify_terminal")
 
-                if Txn.q(txn, "SELECT 1 FROM lifecycle_events WHERE kind='supervision_terminal_refused' AND subject=?1 LIMIT 1", [Integer.to_string(seq)]) == [] do
+                if Txn.q(
+                     txn,
+                     "SELECT 1 FROM lifecycle_events WHERE kind='supervision_terminal_refused' AND subject=?1 LIMIT 1",
+                     [Integer.to_string(seq)]
+                   ) == [] do
                   Logger.warning(
                     "terminal classification refused for turn #{seq}: #{Exception.message(error)}"
                   )
