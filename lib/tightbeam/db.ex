@@ -303,6 +303,8 @@ defmodule Tightbeam.DB do
   @doc false
   def transaction_then(server, prepare, after_commit, opts)
       when is_function(prepare, 1) and is_function(after_commit) do
+    deadline = System.monotonic_time(:millisecond) + call_timeout()
+
     case DBObservation.call(
            server,
            if(opts == [],
@@ -313,7 +315,7 @@ defmodule Tightbeam.DB do
            call_timeout()
          ) do
       {:ok, %Tightbeam.Recognition.Pending{} = pending} ->
-        Tightbeam.Recognition.inline(server, pending, after_commit, opts)
+        Tightbeam.Recognition.inline(server, pending, after_commit, opts, deadline)
 
       other ->
         other
@@ -626,6 +628,7 @@ defmodule Tightbeam.DB do
   def terminate(_reason, %{conn: conn, readers: readers, retry: retry}) do
     Process.unlink(retry)
     Process.exit(retry, :shutdown)
+    :persistent_term.erase({Tightbeam.Recognition, self()})
     :persistent_term.erase({__MODULE__, self()})
     Enum.each(readers, &GenServer.stop/1)
     # close_v2 may defer destruction until remaining statements finalize.

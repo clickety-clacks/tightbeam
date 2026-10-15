@@ -72,9 +72,9 @@ defmodule Tightbeam.Recognition do
     %Pending{id: id, result: result, transitions: transitions}
   end
 
-  def inline(db, pending, callback, opts) do
+  def inline(db, pending, callback, opts, deadline) do
     try do
-      case invoke(db, pending, callback) do
+      case invoke(db, pending, callback, true, deadline) do
         {:ok, result} ->
           if is_function(callback, 1), do: finish(db, pending.id)
           {:ok, result}
@@ -90,21 +90,25 @@ defmodule Tightbeam.Recognition do
     end
   end
 
-  defp invoke(db, pending, callback, clear \\ true)
+  defp invoke(db, pending, callback, clear \\ true, deadline \\ nil)
 
-  defp invoke(db, pending, callback, clear) when is_function(callback, 2) do
+  defp invoke(db, pending, callback, clear, deadline) when is_function(callback, 2) do
     safely(fn ->
-      DB.transaction(db, fn txn ->
+      transaction = fn txn ->
         Enum.each(pending.transitions, &DB.record_row_commit(txn, &1))
         result = recognized_result!(call_callback!(callback, txn, pending.result), pending.result)
         # Clear the durable intent atomically with recognition's changes.
         if clear, do: Txn.q(txn, "DELETE FROM pending_recognition WHERE id=?1", [pending.id])
         result
-      end)
+      end
+
+      if deadline,
+        do: DB.transaction_until(db, transaction, deadline),
+        else: DB.transaction(db, transaction)
     end)
   end
 
-  defp invoke(_db, pending, callback, _clear) when is_function(callback, 1),
+  defp invoke(_db, pending, callback, _clear, _deadline) when is_function(callback, 1),
     do: safely(fn -> {:ok, recognized_result!(callback.(pending.result), pending.result)} end)
 
   defp call_callback!(callback, txn, result) do

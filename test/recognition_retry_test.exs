@@ -81,7 +81,18 @@ defmodule Tightbeam.RecognitionRetryTest do
     assert {:ok, :two} =
              DB.transaction_then(db, fn _ -> :two end, fn _, _ -> throw(:bad_recognition) end)
 
-    for _ <- 1..10, do: retry_now(db, retry)
+    for _ <- 1..10 do
+      {:ok, before_rows} = DB.query(db, "SELECT id,attempts FROM pending_recognition")
+      before_attempts = Map.new(before_rows, fn [id, attempts] -> {id, attempts} end)
+      started = System.system_time(:millisecond)
+      retry_now(db, retry)
+      {:ok, after_rows} = DB.query(db, "SELECT id,attempts,nextAt FROM pending_recognition")
+
+      assert [[_id, attempt, next_at]] =
+               Enum.filter(after_rows, fn [id, attempt, _] -> attempt > before_attempts[id] end)
+
+      assert next_at >= started + trunc(:math.pow(2, attempt - 1)) * 1_000
+    end
 
     assert {:ok, [[5, 1], [5, 1]]} =
              DB.query(db, "SELECT attempts,flagged FROM pending_recognition ORDER BY id")
@@ -91,6 +102,7 @@ defmodule Tightbeam.RecognitionRetryTest do
   end
 
   test "recognition deadline failure cannot replace a primary commit near its deadline", %{db: db} do
+    parent = self()
     old = Application.get_env(:tightbeam, :db_call_timeout_ms)
     Application.put_env(:tightbeam, :db_call_timeout_ms, 100)
 
@@ -114,6 +126,9 @@ defmodule Tightbeam.RecognitionRetryTest do
                end
              )
 
+    assert_receive {:primary_deadline, primary_deadline}
+    assert_receive {:recognition_deadline, recognition_deadline}
+    assert recognition_deadline <= primary_deadline
     assert {:ok, [[1]]} = DB.query(db, "SELECT id FROM recognized_rows")
     assert {:ok, [[0]]} = DB.query(db, "SELECT flagged FROM pending_recognition")
   end
