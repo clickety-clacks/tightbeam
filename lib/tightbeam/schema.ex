@@ -1764,7 +1764,9 @@ defmodule Tightbeam.Schema do
             UPDATE supervision_liveness_sidecar SET endedWakeState=(
               SELECT state FROM wakes WHERE wakeId=supervision_liveness_sidecar.wakeId
                 AND state IN ('fired','canceled'))
-              WHERE controllerOrigin='scheduled' AND controllerState='pending';
+              WHERE controllerOrigin='scheduled' AND controllerState='pending'
+                AND EXISTS(SELECT 1 FROM wakes WHERE wakeId=supervision_liveness_sidecar.wakeId
+                           AND state IN ('fired','canceled'));
             CREATE TRIGGER supervision_record_controller_end AFTER UPDATE OF state ON wakes
             WHEN NEW.state IN ('fired','canceled') AND OLD.state<>NEW.state
             BEGIN

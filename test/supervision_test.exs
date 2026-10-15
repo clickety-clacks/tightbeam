@@ -2821,7 +2821,13 @@ defmodule Tightbeam.SupervisionTest do
     assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", terminal_seq)
     assert [controller] = Wakes.list_pending(ctx.db)
     assert :appended = admit_supervision_wake!(ctx.db, controller)
-    assert {:ok, [["fired"]]} = DB.query(ctx.db, "SELECT endedWakeState FROM supervision_liveness_sidecar WHERE wakeId=?1", [controller.wake_id])
+
+    assert {:ok, [["fired"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT endedWakeState FROM supervision_liveness_sidecar WHERE wakeId=?1",
+               [controller.wake_id]
+             )
   end
 
   test "scheduled controller records its wake ending when canceled", ctx do
@@ -2830,7 +2836,13 @@ defmodule Tightbeam.SupervisionTest do
     assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", terminal_seq)
     assert [controller] = Wakes.list_pending(ctx.db)
     cancel_wake!(ctx.db, controller)
-    assert {:ok, [["canceled"]]} = DB.query(ctx.db, "SELECT endedWakeState FROM supervision_liveness_sidecar WHERE wakeId=?1", [controller.wake_id])
+
+    assert {:ok, [["canceled"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT endedWakeState FROM supervision_liveness_sidecar WHERE wakeId=?1",
+               [controller.wake_id]
+             )
   end
 
   test "missing entitlement recovery preserves a coherent generation-12 controller lineage",

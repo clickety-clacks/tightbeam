@@ -4,7 +4,10 @@ defmodule Tightbeam.SupervisionRecordedStateTest do
 
   setup do
     name = :"recorded_state_#{System.unique_integer([:positive])}"
-    path = Path.join(System.tmp_dir!(), "recorded-db-#{System.unique_integer([:positive])}/state.db")
+
+    path =
+      Path.join(System.tmp_dir!(), "recorded-db-#{System.unique_integer([:positive])}/state.db")
+
     File.mkdir_p!(Path.dirname(path))
     on_exit(fn -> File.rm_rf!(Path.dirname(path)) end)
     db = start_supervised!({DB, name: name, path: path})
@@ -46,7 +49,11 @@ defmodule Tightbeam.SupervisionRecordedStateTest do
     assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
   end
 
-  test "terminal sweeps bound their work and resume after a database restart", %{db: db, path: path, name: name} do
+  test "terminal sweeps bound their work and resume after a database restart", %{
+    db: db,
+    path: path,
+    name: name
+  } do
     :ok = Schema.ensure_all(db)
     seed_session(db)
 
@@ -64,6 +71,8 @@ defmodule Tightbeam.SupervisionRecordedStateTest do
     assert {:ok, [[256, 256]]} =
              DB.query(db, "SELECT COUNT(*),MAX(turnSeq) FROM patrol_terminal_classifications")
 
+    :ok = stop_supervised(DB)
+    db = start_supervised!({DB, name: name, path: path})
     assert :ok = Schema.ensure_all(db)
     assert :ok = Supervision.sweep_unclassified_terminals(db)
 
