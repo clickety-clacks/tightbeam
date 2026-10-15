@@ -283,8 +283,16 @@ defmodule Tightbeam.AdapterCoordinator do
     # One monotonic clock covers preparation, park attempts, durable settlement,
     # and nonblocking retirement. Reserve the final slice for settlement; if
     # either DB phase cannot finish, keep the outcome explicitly unresolved.
-    deadline = System.monotonic_time(:millisecond) + state.shutdown_budget_ms
-    settle_start = deadline - state.shutdown_settlement_budget_ms
+    local_deadline = System.monotonic_time(:millisecond) + state.shutdown_budget_ms
+    deadline = Tightbeam.Application.shutdown_deadline(local_deadline)
+    remaining = max(deadline - System.monotonic_time(:millisecond), 0)
+
+    settlement_budget =
+      if deadline < local_deadline,
+        do: min(state.shutdown_settlement_budget_ms, div(remaining, 5)),
+        else: state.shutdown_settlement_budget_ms
+
+    settle_start = deadline - settlement_budget
 
     # A park phase that times out still owes every cancelled task the cancel
     # grace, so parking must surrender the clock one grace before the reserve
@@ -323,7 +331,7 @@ defmodule Tightbeam.AdapterCoordinator do
     # the configured deadline no matter how many adapters were retained; the
     # cleanup those late entries still need is handed to its own owner after.
     settle_shutdown_results(results, state, deadline)
-    dispatch_late_cleanup(late_targets, state)
+    dispatch_late_cleanup(late_targets, state, deadline)
 
     :ok
   end
@@ -576,7 +584,7 @@ defmodule Tightbeam.AdapterCoordinator do
 
     state =
       Enum.reduce(keys, state, fn key, state ->
-        cancel_pending_starts(key, state)
+        cancel_pending_starts(key, state, true)
       end)
 
     case Tightbeam.HarnessProcess.begin_park_many_until(state.db, keys, deadline) do
@@ -777,9 +785,9 @@ defmodule Tightbeam.AdapterCoordinator do
   #
   # No demonitor here: a monitor may only be cleared by the process that set it,
   # and the coordinator's monitors die with the coordinator anyway.
-  defp dispatch_late_cleanup([], _state), do: :ok
+  defp dispatch_late_cleanup([], _state, _deadline), do: :ok
 
-  defp dispatch_late_cleanup(targets, state) do
+  defp dispatch_late_cleanup(targets, state, deadline) do
     cleanup = fn ->
       Enum.each(targets, fn {_key, pid} ->
         if is_pid(pid) do
@@ -798,11 +806,32 @@ defmodule Tightbeam.AdapterCoordinator do
     # than returning an error tuple. Catching it matters: terminate/2 must not
     # die here, or the cleanup this function exists to guarantee is lost along
     # with the callback.
+    owner = self()
+
+    {worker, monitor} = spawn_monitor(fn ->
+      result =
+        try do
+          Task.Supervisor.start_child(state.shutdown_cleanup_supervisor, cleanup)
+        catch
+          :exit, reason -> {:error, {:cleanup_owner_unavailable, reason}}
+        end
+
+      send(owner, {self(), result})
+    end)
+
     handoff =
-      try do
-        Task.Supervisor.start_child(state.shutdown_cleanup_supervisor, cleanup)
-      catch
-        :exit, reason -> {:error, {:cleanup_owner_unavailable, reason}}
+      receive do
+        {^worker, result} ->
+          Process.demonitor(monitor, [:flush])
+          result
+
+        {:DOWN, ^monitor, :process, ^worker, reason} ->
+          {:error, reason}
+      after
+        max(deadline - System.monotonic_time(:millisecond), 0) ->
+          Process.exit(worker, :kill)
+          Process.demonitor(monitor, [:flush])
+          {:error, :shutdown_budget_exhausted}
       end
 
     case handoff do
@@ -868,14 +897,14 @@ defmodule Tightbeam.AdapterCoordinator do
     end
   end
 
-  defp cancel_pending_starts(key, state) do
+  defp cancel_pending_starts(key, state, shutdown? \\ false) do
     case state.adapters[key] do
       %{timer: timer} = entry ->
         if is_reference(timer), do: Process.cancel_timer(timer)
 
         state =
           if readiness_pending?(entry),
-            do: terminate_readiness_generation(key, entry, state, true),
+            do: terminate_readiness_generation(key, entry, state, not shutdown?, shutdown?),
             else: state
 
         Enum.each(entry.waiters, fn {monitor, from} ->
@@ -1306,7 +1335,7 @@ defmodule Tightbeam.AdapterCoordinator do
     begin_readiness(key, replacement, state, context, from)
   end
 
-  defp terminate_readiness_generation(key, entry, state, settle?) do
+  defp terminate_readiness_generation(key, entry, state, settle?, shutdown? \\ false) do
     cancel_timer_flush(
       entry.readiness_timer,
       {:adapter_readiness_timeout, key, entry.generation, entry.readiness_token}
@@ -1321,7 +1350,9 @@ defmodule Tightbeam.AdapterCoordinator do
     state =
       if is_pid(entry.pid) do
         if is_reference(entry.monitor), do: Process.demonitor(entry.monitor, [:flush])
-        _ = DynamicSupervisor.terminate_child(state.adapter_sup, entry.pid)
+        if shutdown?,
+          do: Process.exit(entry.pid, :kill),
+          else: DynamicSupervisor.terminate_child(state.adapter_sup, entry.pid)
 
         %{
           state
