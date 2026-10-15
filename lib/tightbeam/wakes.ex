@@ -2740,7 +2740,14 @@ defmodule Tightbeam.Wakes do
         """,
         [owner_user_id]
       )
-      |> Enum.each(fn [wake_id, predicate, resolver_kind, resolver_id, verifier, verification_state] ->
+      |> Enum.each(fn [
+                        wake_id,
+                        predicate,
+                        resolver_kind,
+                        resolver_id,
+                        verifier,
+                        verification_state
+                      ] ->
         recognize_wake_in_savepoint(txn, wake_id, fn ->
           wake = %{
             wake_id: wake_id,

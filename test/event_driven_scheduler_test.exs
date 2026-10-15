@@ -112,7 +112,9 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
       ] do
     test "bad condition #{column} does not stop fallback candidates or ordinary delivery", ctx do
       bad = wake(ctx.db, 1, %{condition_kind: "ready", condition_after_id: 0})
-      good = wake(ctx.db, 2, %{consumer: "test"})
+      sibling = wake(ctx.db, 2, %{condition_kind: "other-ready", condition_after_id: 0})
+      good = wake(ctx.db, 3, %{consumer: "test"})
+      assert {:ok, [[fact_id]]} = DB.query(ctx.db, "INSERT INTO condition_facts(ts,kind,origin) VALUES (1,'unrelated','system') RETURNING id")
       column = unquote(column)
 
       assert {:ok, _} =
@@ -136,11 +138,12 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
                DB.query(ctx.db, "SELECT state,firedAt FROM wakes WHERE wakeId=?1", [bad.wake_id])
 
       assert {:ok, [[after_fact]]} = DB.query(ctx.db, "SELECT afterFact FROM scheduler_state")
-      assert is_integer(after_fact)
+      assert after_fact == fact_id
+      assert Wakes.get(ctx.db, sibling.wake_id).fired_at != nil
     end
   end
 
-  test "malformed remedy source does not stop later source cleanup or wake delivery", ctx do
+  test "malformed remedy source does not stop wake delivery", ctx do
     bad = wake(ctx.db, 1, %{origin: "remedy:broken"})
     good = wake(ctx.db, 2, %{consumer: "test"})
 
