@@ -102,6 +102,20 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
     assert Process.alive?(pid)
   end
 
+  test "a committed deadline change moves the timer earlier", ctx do
+    pid = scheduler(ctx)
+    scheduled = wake(ctx.db, System.system_time(:millisecond) + 60_000, %{consumer: "test"})
+    due = System.system_time(:millisecond) + 250
+    assert {:ok, :ok} = DB.transaction(ctx.db, fn txn ->
+      DB.Txn.q(txn, "UPDATE wakes SET dueAt=?2 WHERE wakeId=?1", [scheduled.wake_id, due])
+      Wakes.schedule_changed_in_txn(txn)
+    end)
+    assert_receive {:delivered, id, fired_at}, 1_250
+    assert id == scheduled.wake_id
+    assert fired_at >= due and fired_at - due < 1_000
+    assert Process.alive?(pid)
+  end
+
   test "boot reconstructs the earliest timer from pending wakes", ctx do
     scheduled = wake(ctx.db, System.system_time(:millisecond) + 300, %{consumer: "test"})
     scheduler(ctx)
@@ -134,7 +148,7 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
     source = wake(ctx.db, System.system_time(:millisecond) - 100)
     :ok = Wakes.fire_due(pid)
     assert NoticeBatcher.source_refs(ctx.db, source.wake_id) == []
-    :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
+    :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
     Wakes.recipient_ready(pid, "recipient")
     :sys.get_state(pid)
 
@@ -157,7 +171,7 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
     :sys.get_state(pid)
     assert Wakes.health(pid) == %{misses: 0}
     assert NoticeBatcher.source_refs(ctx.db, source.wake_id) == []
-    :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
+    :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
 
     log =
       capture_log(fn ->
@@ -167,6 +181,9 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
 
     assert log =~ "wake scheduler miss wake=#{source.wake_id} kind=prompt late_ms="
     assert Wakes.health(pid) == %{misses: 1}
+    response = Tightbeam.Wire.Router.call(Plug.Test.conn(:get, "/version"),
+      Tightbeam.Wire.Router.init(db: ctx.db, wake_scheduler: pid))
+    assert JSON.decode!(response.resp_body)["wakeScheduler"] == %{"misses" => 1}
 
     assert {:ok, [[seq]]} =
              DB.query(ctx.db, "SELECT deliveredTurnSeq FROM wakes WHERE wakeId=?1", [

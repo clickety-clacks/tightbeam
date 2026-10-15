@@ -6224,7 +6224,7 @@ defmodule Tightbeam.Wakes do
 
   @doc """
   Start the scheduler. Opts: `:deliver` (required — see `t:deliver/0`),
-  `:db`, `:tick_ms` (default 1000), `:name` (default `Tightbeam.WakeScheduler`
+  `:db`, `:name` (default `Tightbeam.WakeScheduler`
   — the registered name the wake verb handler calls).
   """
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -6252,7 +6252,7 @@ defmodule Tightbeam.Wakes do
   Post-commit nudge for request paths. Runs `fire_due/1`, but a scheduler that
   is absent, busy past the call timeout, or crashing only logs: the write it
   follows has already committed, and its caller must still get the success
-  response. Undelivered wakes stay pending for the scheduler's next tick.
+  response. Undelivered prompt wakes remain visible to the miss detector.
   """
   @spec nudge_due(GenServer.server()) :: :ok
   def nudge_due(server \\ Tightbeam.WakeScheduler) do
@@ -6264,7 +6264,7 @@ defmodule Tightbeam.Wakes do
     :exit, reason ->
       Logger.warning(
         "wake scheduler nudge after a committed write did not complete; " <>
-          "due wakes stay pending for the next tick: #{inspect(reason)}"
+          "due wakes stay pending for recovery: #{inspect(reason)}"
       )
 
       :ok
@@ -6295,7 +6295,7 @@ defmodule Tightbeam.Wakes do
   Post-commit `fire_matching/2` for request paths. The fact has already
   committed: an absent scheduler is ignored, and a timeout or crash only logs,
   so the caller still gets its success response. Matching condition wakes are
-  evaluated again on the scheduler's next tick.
+  evaluated again on the next scheduler event.
   """
   @spec nudge_matching(GenServer.server(), pos_integer() | [pos_integer()]) :: :ok
   def nudge_matching(server, fact_ids) do
@@ -6307,7 +6307,7 @@ defmodule Tightbeam.Wakes do
     :exit, reason ->
       Logger.warning(
         "wake scheduler condition nudge after a committed fact did not complete; " <>
-          "matching wakes are evaluated on the next tick: #{inspect(reason)}"
+          "matching wakes are evaluated on the next scheduler event: #{inspect(reason)}"
       )
 
       :ok
@@ -6394,6 +6394,7 @@ defmodule Tightbeam.Wakes do
 
     Process.put(:wake_scheduler_misses, 0)
     Process.send_after(self(), :detect_misses, @miss_detector_ms)
+    send(self(), :recover_notices)
     Process.send_after(self(), :backfill_wake_delivery, 100)
     {:ok, arm_due_timer(state)}
   end
@@ -6437,6 +6438,13 @@ defmodule Tightbeam.Wakes do
   end
 
   @impl true
+  def handle_info(:recover_notices, state) do
+    # Release pre-crash, unclaimed memberships once. Later drains are driven
+    # only by recipient readiness and due events.
+    NoticeBatcher.recover(state.db, now(), state.delivery_opts)
+    {:noreply, state}
+  end
+
   def handle_info(:backfill_wake_delivery, state) do
     result =
       DB.background_pass(fn -> Tightbeam.Schema.backfill_wake_delivery(state.db) end, :overloaded)
@@ -6507,14 +6515,14 @@ defmodule Tightbeam.Wakes do
   end
 
   # Deliver-then-mark (see moduledoc — never reorder): a raising deliver
-  # leaves its wake pending for the next tick; a crash between deliver and
+  # leaves its wake pending for recovery; a crash between deliver and
   # mark redelivers, deduped by turns.wakeId.
-  defp deliver_due(state, drain_notices \\ true) do
+  defp deliver_due(state) do
     # R1/B1: one real scheduler entry owns the context of all DB calls in this
     # scan. The bind restores even when delivery raises; the next scan gets a
     # fresh ID. No context is implicitly inherited by a spawned process.
     Tightbeam.RequestContext.bind_internal("wake_scheduler", fn ->
-      DB.background_pass(fn -> deliver_due_in_context(state, drain_notices) end)
+      DB.background_pass(fn -> deliver_due_in_context(state) end)
     end)
   end
 
@@ -6527,7 +6535,8 @@ defmodule Tightbeam.Wakes do
         """
         SELECT DISTINCT sessionKey,targetRole,targetGate,reresolve,reresolveSeed,reresolveRung
         FROM wakes INDEXED BY wakes_due
-        WHERE state='pending' AND dueAt<=?1 AND consumer='prompt' AND digest=0
+        WHERE state='pending' AND consumer='prompt' AND digest=0
+          AND (dueAt<=?1 OR firedAt IS NOT NULL OR recognitionAt IS NOT NULL)
           AND COALESCE(deliveryRule,'')<>'turn-boundary-digest r1'
           AND (conditionKind IS NULL OR firedAt IS NOT NULL)
           AND (waitMode IS NULL OR recognitionAt IS NOT NULL)
@@ -6559,8 +6568,7 @@ defmodule Tightbeam.Wakes do
   end
 
   defp deliver_due_in_context(
-         %{db: db, deliver: deliver, internal_consumers: consumers} = state,
-         drain_notices
+         %{db: db, deliver: deliver, internal_consumers: consumers} = state
        ) do
     if Map.has_key?(consumers, "review_remedy_reconcile") do
       {:ok, :ok} =
@@ -6570,21 +6578,9 @@ defmodule Tightbeam.Wakes do
     recognize_due_dependency_waits(db)
     evaluate_conditions(state, :tick)
 
-    if drain_notices do
-      deliver_eligible_waits(db, state.delivery_opts)
-    else
-      (deliver_eligible_waits(db, state.delivery_opts) ++ due_prompt_recipients(db))
-      |> Enum.uniq()
-      |> Enum.each(&NoticeBatcher.recover(db, now(), state.delivery_opts, &1))
-    end
-
-    # Materialize after condition recognition so a fallback or matching fact
-    # that becomes due in this pass joins the same recipient-ready batch.
-    # Held members remain individual source rows and never reach the delivery
-    # loop below.
-    if drain_notices do
-      NoticeBatcher.recover(db, now(), state.delivery_opts)
-    end
+    (deliver_eligible_waits(db, state.delivery_opts) ++ due_prompt_recipients(db))
+    |> Enum.uniq()
+    |> Enum.each(&NoticeBatcher.recover(db, now(), state.delivery_opts, &1))
 
     legacy_materialize_digests(db, now())
 
@@ -7634,7 +7630,7 @@ defmodule Tightbeam.Wakes do
 
   @doc false
   def publish_change_in_txn(%Txn{} = txn, class, wake_id) do
-    if class == "wake.scheduled", do: schedule_changed_in_txn(txn)
+    if class in ["wake.scheduled", "wake.canceled"], do: schedule_changed_in_txn(txn)
 
     case delivery_projection_in_txn(txn, wake_id) do
       nil ->
@@ -7832,7 +7828,7 @@ defmodule Tightbeam.Wakes do
 
   defp run_due(state) do
     at = now()
-    deliver_due(state, false)
+    deliver_due(state)
     arm_due_timer(%{state | scanned_through: at})
   end
 
@@ -7843,20 +7839,30 @@ defmodule Tightbeam.Wakes do
       transaction!(state.db, fn txn ->
         Txn.q(
           txn,
-          """
-          SELECT wakeId FROM wakes INDEXED BY wakes_due
+          select_wake_sql() <> """
+           INDEXED BY wakes_due
           WHERE state='pending' AND dueAt<?1 AND consumer='prompt'
             AND deliveredTurnSeq IS NULL
-            AND (targetRole IS NOT NULL OR targetGate<>0 OR NOT EXISTS (
-              SELECT 1 FROM turns t WHERE t.sessionKey=wakes.sessionKey
+            AND NOT EXISTS (
+              SELECT 1 FROM turns t
+              WHERE t.sessionKey=CASE
+                WHEN wakes.targetRole IS NOT NULL THEN (
+                  SELECT r.boundSessionKey FROM roles r
+                  JOIN sessions s ON s.sessionKey=r.boundSessionKey AND s.state='active'
+                  WHERE r.name=wakes.targetRole
+                )
+                WHEN wakes.reresolve='lineage' AND NOT EXISTS (
+                  SELECT 1 FROM sessions s WHERE s.sessionKey=wakes.sessionKey AND s.state='active'
+                ) THEN NULL
+                ELSE wakes.sessionKey END
                 AND t.status IN ('running','queued')
-            ))
+            )
           ORDER BY dueAt
           """,
           [at - @miss_lateness_ms]
         )
-        |> Enum.flat_map(fn [id] ->
-          wake = get_in_txn(txn, id)
+        |> Enum.flat_map(fn row ->
+          wake = to_wake(row)
 
           case resolved_recipient(txn, wake) do
             {recipient, _, _} ->
@@ -7882,7 +7888,7 @@ defmodule Tightbeam.Wakes do
       NoticeBatcher.recover(state.db, at, state.delivery_opts, recipient)
     end
 
-    if candidates != [], do: deliver_due(state, false)
+    if candidates != [], do: deliver_due(state)
   end
 
   defp resolved_recipient(txn, wake) do
