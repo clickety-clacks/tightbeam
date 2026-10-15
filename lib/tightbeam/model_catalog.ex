@@ -373,10 +373,19 @@ defmodule Tightbeam.ModelCatalog do
   @impl true
   def handle_info(:refresh_tick, state) do
     Process.send_after(self(), :refresh_tick, state.ttl_ms)
+
+    case state.background do
+      {pid, _ref, _event, _versions, started_at} ->
+        if now_ms(state) - started_at > state.ttl_ms, do: Process.exit(pid, :kill)
+
+      nil ->
+        :ok
+    end
+
     {:noreply, enqueue_background({:info, :refresh_due}, state)}
   end
 
-  def handle_info({pid, {:noreply, updated}}, %{background: {pid, ref, _event, versions}} = state) do
+  def handle_info({pid, {:noreply, updated}}, %{background: {pid, ref, _event, versions, _started_at}} = state) do
     Process.demonitor(ref, [:flush])
 
     entries =
@@ -399,13 +408,20 @@ defmodule Tightbeam.ModelCatalog do
 
   def handle_info(
         {:DOWN, ref, :process, pid, reason},
-        %{background: {pid, ref, event, _}} = state
+        %{background: {pid, ref, event, _, _started_at}} = state
       ) do
     Logger.warning("model catalog background work failed: #{inspect(reason)}")
     state = %{state | background: nil}
 
-    if event == {:info, :resume_terminal_recoveries} do
-      Process.send_after(self(), :resume_terminal_recoveries, state.ttl_ms)
+    case event do
+      {:info, :resume_terminal_recoveries} ->
+        Process.send_after(self(), :resume_terminal_recoveries, state.ttl_ms)
+
+      {:cast, {:credential_transition, _, _, _} = message} ->
+        Process.send_after(self(), {:"$gen_cast", message}, state.ttl_ms)
+
+      _ ->
+        :ok
     end
 
     {:noreply, next_background(state)}
@@ -418,8 +434,13 @@ defmodule Tightbeam.ModelCatalog do
       else: {:noreply, state}
   end
 
-  def handle_info(message, state),
+  def handle_info(message, state) when message in [:refresh_due, :resume_terminal_recoveries],
     do: {:noreply, enqueue_background({:info, message}, state)}
+
+  def handle_info(message, state) do
+    Logger.warning("model catalog ignored unexpected message: #{inspect(message)}")
+    {:noreply, state}
+  end
 
   # Keep database and host work off the reader process. Entry versions prevent
   # an older refresh snapshot from overwriting a credential invalidation.
@@ -454,7 +475,7 @@ defmodule Tightbeam.ModelCatalog do
             send(owner, {self(), result})
           end)
 
-        %{state | background: {pid, ref, event, state.versions}, pending: pending}
+        %{state | background: {pid, ref, event, state.versions, now_ms(state)}, pending: pending}
     end
   end
 

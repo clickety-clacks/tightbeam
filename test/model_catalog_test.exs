@@ -177,6 +177,125 @@ defmodule Tightbeam.ModelCatalogTest do
     send(next_worker, :release)
   end
 
+  test "failed credential transition retries after the TTL without restarting", ctx do
+    catalog = start_catalog(ctx, ttl_ms: 200)
+    await_fresh(catalog, "claude")
+    pid = Process.whereis(catalog)
+    fact_id = credential_fact(ctx.db, @host, :anthropic)
+    parent = self()
+
+    blocker =
+      Task.async(fn ->
+        Tightbeam.DB.transaction(ctx.db, fn _txn ->
+          send(parent, {:database_held, self()})
+
+          receive do
+            :release -> :ok
+          end
+        end)
+      end)
+
+    assert_receive {:database_held, database_owner}
+
+    try do
+      ModelCatalog.credential_transition(@host, :anthropic, fact_id, catalog)
+
+      await(fn ->
+        case :sys.get_state(pid).background do
+          {_, _, {:cast, {:credential_transition, _, _, ^fact_id}}, _, _} -> true
+          _ -> false
+        end
+      end)
+
+      {worker, _, _, _, _} = :sys.get_state(pid).background
+      ref = Process.monitor(worker)
+
+      log = capture_log(fn ->
+        Process.exit(worker, :kill)
+        assert_receive {:DOWN, ^ref, :process, ^worker, :killed}
+        await(fn -> :sys.get_state(pid).background == nil end)
+      end)
+
+      assert log =~ "model catalog background work failed: :killed"
+      assert :sys.get_state(pid).entries[{@host, "claude"}].reason ==
+               :credential_transition_pending
+    after
+      send(database_owner, :release)
+    end
+
+    assert {:ok, :ok} = Task.await(blocker)
+    await_fresh(catalog, "claude")
+    assert Process.whereis(catalog) == pid
+    assert :sys.get_state(pid).versions[{@host, "claude"}] >= 2
+  end
+
+  test "refresh tick kills overdue work and resumes queued refreshes", ctx do
+    {:ok, clock} = Agent.start_link(fn -> 0 end)
+    {:ok, mode} = Agent.start_link(fn -> :normal end)
+    on_exit(fn ->
+      for agent <- [clock, mode], Process.alive?(agent), do: Agent.stop(agent)
+    end)
+
+    parent = self()
+    hosts = fn ->
+      if Agent.get(mode, & &1) == :block do
+        send(parent, {:refresh_blocked, self()})
+        receive do
+          :release -> :ok
+        end
+      end
+      Placement.hosts(ctx.base_dir, ctx.db)
+    end
+
+    catalog = start_catalog(ctx, hosts: hosts, ttl_ms: 60_000,
+      now: fn -> Agent.get(clock, & &1) end)
+    await_fresh(catalog, "claude")
+    pid = Process.whereis(catalog)
+    {cached, :fresh} = ModelCatalog.get(@host, "claude", catalog)
+    Agent.update(mode, fn _ -> :block end)
+    send(pid, :refresh_due)
+    assert_receive {:refresh_blocked, worker}, 2_000
+    ref = Process.monitor(worker)
+    Agent.update(mode, fn _ -> :normal end)
+
+    # A tick at the TTL boundary must leave the job running.
+    Agent.update(clock, fn _ -> 60_000 end)
+    send(pid, :refresh_tick)
+    :sys.get_state(pid)
+    assert Process.alive?(worker)
+
+    log = capture_log(fn ->
+      Agent.update(clock, fn _ -> 60_001 end)
+      send(pid, :refresh_tick)
+      assert_receive {:DOWN, ^ref, :process, ^worker, :killed}, 2_000
+      await_fresh(catalog, "claude")
+    end)
+
+    assert log =~ "model catalog background work failed: :killed"
+    assert ModelCatalog.get(@host, "claude", catalog) == {cached, :fresh}
+    assert Process.whereis(catalog) == pid
+  end
+
+  test "stray messages log once without starting background work", ctx do
+    catalog = start_catalog(ctx)
+    await_fresh(catalog, "claude")
+    pid = Process.whereis(catalog)
+    await(fn ->
+      state = :sys.get_state(pid)
+      state.background == nil and
+        Enum.all?(state.entries, fn {_, cache} -> not cache.refreshing end)
+    end)
+    before = :sys.get_state(pid)
+
+    log = capture_log(fn ->
+      send(pid, {:stray, :message})
+      assert :sys.get_state(pid) == before
+    end)
+
+    assert log =~ "model catalog ignored unexpected message: {:stray, :message}"
+    assert length(String.split(String.trim(log), "\n")) == 1
+  end
+
   defp drain_host_reads do
     receive do
       {:reading_hosts, _} -> drain_host_reads()
