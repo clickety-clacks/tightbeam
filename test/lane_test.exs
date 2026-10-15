@@ -171,11 +171,23 @@ defmodule Tightbeam.LaneTest do
          end}
       )
 
-    {:ok, _} = DynamicSupervisor.start_child(ctx.lane_sup,
-      Supervisor.child_spec({SessionLane, session_key: "k1", db: ctx.db,
-        task_sup: ctx.task_sup, lane_manager: manager,
-        runner: fn _ -> send(parent, :restarted_turn); {:ok, %{text: "done"}} end},
-        restart: :temporary))
+    {:ok, _} =
+      DynamicSupervisor.start_child(
+        ctx.lane_sup,
+        Supervisor.child_spec(
+          {SessionLane,
+           session_key: "k1",
+           db: ctx.db,
+           task_sup: ctx.task_sup,
+           lane_manager: manager,
+           runner: fn _ ->
+             send(parent, :restarted_turn)
+             {:ok, %{text: "done"}}
+           end},
+          restart: :temporary
+        )
+      )
+
     assert eventually(fn -> map_size(:sys.get_state(manager).lanes) == 1 end)
     [{lane, _}] = Registry.lookup(Tightbeam.LaneRegistry, "k1")
     :sys.suspend(lane)

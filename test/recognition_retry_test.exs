@@ -159,8 +159,11 @@ defmodule Tightbeam.RecognitionRetryTest do
     assert_receive {:primary_deadline, primary_deadline}
     assert_receive {:recognition_deadline, recognition_deadline}
     assert recognition_deadline <= primary_deadline
-    assert {:ok, [[1]]} = DB.query(db, "SELECT id FROM recognized_rows")
-    assert {:ok, [[0]]} = DB.query(db, "SELECT flagged FROM pending_recognition")
+    # The timer may already be retrying the deliberately slow callback. These
+    # reads verify durable outcomes after it releases the in-memory connection.
+    deadline = System.monotonic_time(:millisecond) + 2_000
+    assert {:ok, [[1]]} = DB.query_until(db, "SELECT id FROM recognized_rows", [], deadline)
+    assert {:ok, [[0]]} = DB.query_until(db, "SELECT flagged FROM pending_recognition", [], deadline)
   end
 
   test "recognition returning an error is rolled back and leaves pending work", %{db: db} do
