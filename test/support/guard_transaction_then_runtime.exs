@@ -56,7 +56,7 @@ try do
   assert {:ok, :published} = Task.await(publication)
   assert {:ok, [[1], [2]]} = DB.query(db, "SELECT id FROM publication_markers ORDER BY id")
 
-  assert {:error, %RuntimeError{message: "publication crashed"}} =
+  assert {:ok, :marker} =
            DB.transaction_then(
              db,
              fn txn ->
@@ -71,6 +71,50 @@ try do
 
   assert File.read!(Path.join(base, "build-owner.json")) == marker
   :ok = DB.assert_base_admitted!(db, base)
+
+  gate = Path.join(base, "recognition-ready")
+
+  assert {:ok, :durable} =
+           DB.transaction_then(
+             db,
+             fn txn ->
+               Txn.q(txn, "INSERT INTO publication_markers VALUES(4)")
+               :durable
+             end,
+             fn txn, :durable ->
+               unless File.exists?(gate), do: raise("wait for recovery")
+               Txn.q(txn, "INSERT INTO publication_markers VALUES(5)")
+               :recognized
+             end
+           )
+
+  assert {:ok, [[0]]} =
+           DB.query(
+             db,
+             "SELECT flagged FROM pending_recognition WHERE attempts=0 ORDER BY id LIMIT 1"
+           )
+
+  GenServer.stop(db)
+  File.write!(gate, "ready")
+  {:ok, reopened} = DB.start_link(path: path, name: nil, guard_inputs: [])
+
+  try do
+    :ok = Schema.ensure_all(reopened)
+    :ok = DB.execute(reopened, "UPDATE pending_recognition SET nextAt=0")
+    retry = :sys.get_state(reopened).retry
+    # The permanently failing earlier publication may be selected first.
+    for _ <- 1..2 do
+      send(retry, :retry)
+      :sys.get_state(retry)
+    end
+
+    assert {:ok, [[1], [2], [3], [4], [5]]} =
+             DB.query(reopened, "SELECT id FROM publication_markers ORDER BY id")
+
+    assert File.read!(Path.join(base, "build-owner.json")) == marker
+  after
+    GenServer.stop(reopened)
+  end
 after
   if Process.alive?(db), do: GenServer.stop(db)
 end

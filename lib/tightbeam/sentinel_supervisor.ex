@@ -108,6 +108,10 @@ defmodule Tightbeam.SentinelSupervisor do
   # stop every running child whose row is no longer enabled. A sentinel waiting on
   # a backoff timer starts only when `due` names it.
   defp do_reconcile(state, restart, due \\ []) do
+    DB.background_pass(fn -> reconcile_pass(state, restart, due) end, state)
+  end
+
+  defp reconcile_pass(state, restart, due) do
     states = Sentinels.states(state.db, state.host)
     enabled = for {qualified, %{state: "enabled"}} <- states, into: MapSet.new(), do: qualified
 
@@ -233,6 +237,10 @@ defmodule Tightbeam.SentinelSupervisor do
   end
 
   defp stop_after_failures(state, qualified, reason) do
+    DB.background_pass(fn -> record_stopped(state, qualified, reason) end)
+  end
+
+  defp record_stopped(state, qualified, reason) do
     enabled_by = Sentinels.states(state.db, state.host)[qualified][:enabled_by]
     :ok = Sentinels.mark_stopped(state.db, state.host, qualified, reason)
     Logger.error("sentinel #{qualified} stopped on #{state.host}: #{reason}")

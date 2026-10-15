@@ -1721,8 +1721,10 @@ defmodule Tightbeam.Schema do
     :ok = migrate_continuation_retry_guard(db)
     :ok = upgrade_decision_request_row_schema_revision(db)
 
+    :ok = Tightbeam.Recognition.ensure_schema(db)
+
     case DB.finish_schema(db) do
-      :ok -> :ok
+      :ok -> Tightbeam.Recognition.activate(db)
       {:error, error} -> raise error
     end
   end
@@ -1825,6 +1827,9 @@ defmodule Tightbeam.Schema do
          end) do
       {:ok, result} ->
         result
+
+      {:error, %DB.Overloaded{}} = overloaded ->
+        overloaded
 
       {:error, error} ->
         Logger.error("wake delivery backfill deferred for 5 seconds: #{inspect(error)}")

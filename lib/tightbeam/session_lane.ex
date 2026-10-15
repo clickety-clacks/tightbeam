@@ -257,6 +257,13 @@ defmodule Tightbeam.SessionLane do
   end
 
   defp cancel_running_turn(state, audit) do
+    DB.background_pass(
+      fn -> cancel_turn(state, audit) end,
+      {:reply, {:error, %DB.Overloaded{}}, state}
+    )
+  end
+
+  defp cancel_turn(state, audit) do
     audit =
       if is_map(audit),
         do: Map.put(audit, :principal_ref, assignment_stop_principal_ref(audit.principal)),

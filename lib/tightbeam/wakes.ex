@@ -6385,14 +6385,21 @@ defmodule Tightbeam.Wakes do
 
   @impl true
   def handle_cast({:recipient_ready, session_key}, state) do
-    deliver_eligible_waits(state.db, state.delivery_opts, session_key)
-    NoticeBatcher.recover(state.db, now(), state.delivery_opts, session_key)
+    DB.background_pass(fn ->
+      deliver_eligible_waits(state.db, state.delivery_opts, session_key)
+      NoticeBatcher.recover(state.db, now(), state.delivery_opts, session_key)
+    end)
+
     {:noreply, state}
   end
 
   @impl true
   def handle_info(:backfill_wake_delivery, state) do
-    case Tightbeam.Schema.backfill_wake_delivery(state.db) do
+    result =
+      DB.background_pass(fn -> Tightbeam.Schema.backfill_wake_delivery(state.db) end, :overloaded)
+
+    case result do
+      :overloaded -> Process.send_after(self(), :backfill_wake_delivery, 5_000)
       :more -> Process.send_after(self(), :backfill_wake_delivery, 100)
       {:error, _error} -> Process.send_after(self(), :backfill_wake_delivery, 5_000)
       :done -> :ok
@@ -6419,17 +6426,20 @@ defmodule Tightbeam.Wakes do
   end
 
   def handle_info(:fire_matching, state) do
-    if evaluate_conditions(state, :tick) == :saturated, do: send(self(), :fire_matching)
+    DB.background_pass(fn ->
+      if evaluate_conditions(state, :tick) == :saturated, do: send(self(), :fire_matching)
+    end)
+
     {:noreply, state}
   end
 
   def handle_info({:fire_matching, fact_id}, state) do
-    eager_step(state, fact_id)
+    DB.background_pass(fn -> eager_step(state, fact_id) end)
     {:noreply, state}
   end
 
   def handle_info({:fire_matching_seq, fact_ids}, state) do
-    drain_seq(state, fact_ids)
+    DB.background_pass(fn -> drain_seq(state, fact_ids) end)
     {:noreply, state}
   end
 
@@ -6462,7 +6472,7 @@ defmodule Tightbeam.Wakes do
     # scan. The bind restores even when delivery raises; the next scan gets a
     # fresh ID. No context is implicitly inherited by a spawned process.
     Tightbeam.RequestContext.bind_internal("wake_scheduler", fn ->
-      deliver_due_in_context(state, drain_notices)
+      DB.background_pass(fn -> deliver_due_in_context(state, drain_notices) end)
     end)
   end
 
