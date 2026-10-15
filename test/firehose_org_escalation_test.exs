@@ -348,8 +348,10 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
              DB.transaction(db, fn txn -> SubagentMarkers.append_in_txn(txn, input) end)
 
     assert_receive {:trace, ^hub, :receive,
-                    {:"$gen_cast", {:ingress, _bytes,
-                      {:publish, %{"class" => "subagent_marker.appended", "refs" => refs} = notice}}}}
+                    {:"$gen_cast",
+                     {:ingress, _bytes,
+                      {:publish,
+                       %{"class" => "subagent_marker.appended", "refs" => refs} = notice}}}}
 
     assert refs["sessionKey"] == "firehose-owner"
     refute Map.has_key?(refs, "assignmentId")
@@ -361,7 +363,9 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
              DB.transaction(db, fn txn -> SubagentMarkers.append_in_txn(txn, input) end)
 
     refute_receive {:trace, ^hub, :receive,
-                    {:"$gen_cast", {:ingress, _, {:publish, %{"class" => "subagent_marker.appended"}}}}}
+                    {:"$gen_cast",
+                     {:ingress, _, {:publish, %{"class" => "subagent_marker.appended"}}}}}
+
     before = SubagentMarkers.list(db)
 
     assert {:error, %RuntimeError{message: "marker rollback"}} =
@@ -376,8 +380,11 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
              end)
 
     assert SubagentMarkers.list(db) == before
+
     refute_receive {:trace, ^hub, :receive,
-                    {:"$gen_cast", {:ingress, _, {:publish, %{"class" => "subagent_marker.appended"}}}}}
+                    {:"$gen_cast",
+                     {:ingress, _, {:publish, %{"class" => "subagent_marker.appended"}}}}}
+
     :erlang.trace(hub, false, [:receive])
   end
 
