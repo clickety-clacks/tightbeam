@@ -1846,7 +1846,7 @@ defmodule Tightbeam.Supervision do
 
   @impl true
   def handle_continue(:initial_sweep, state) do
-    sweep(state)
+    DB.background_pass(fn -> sweep(state) end)
     {:noreply, state}
   end
 
@@ -1879,13 +1879,13 @@ defmodule Tightbeam.Supervision do
   end
 
   def handle_cast(:sweep, state) do
-    sweep(state)
+    DB.background_pass(fn -> sweep(state) end)
     {:noreply, state}
   end
 
   @impl true
   def handle_info(:scheduled_sweep, state) do
-    sweep(state)
+    DB.background_pass(fn -> sweep(state) end)
     schedule_sweep(state.sweep_ms)
     {:noreply, state}
   end
@@ -4293,6 +4293,9 @@ defmodule Tightbeam.Supervision do
 
     idle_cleanup_sweep(state)
   rescue
+    error in DB.Overloaded -> reraise error, __STACKTRACE__
+    error in MatchError ->
+      if match?({:error, %DB.Overloaded{}}, error.term), do: raise(DB.Overloaded), else: reraise(error, __STACKTRACE__)
     error ->
       best_effort_lifecycle(
         state.db,
@@ -4322,6 +4325,9 @@ defmodule Tightbeam.Supervision do
       {:error, error} -> raise error
     end
   rescue
+    error in DB.Overloaded -> reraise error, __STACKTRACE__
+    error in MatchError ->
+      if match?({:error, %DB.Overloaded{}}, error.term), do: raise(DB.Overloaded), else: reraise(error, __STACKTRACE__)
     error ->
       best_effort_lifecycle(
         db,
@@ -5355,8 +5361,15 @@ defmodule Tightbeam.Supervision do
   defp schedule_sweep(_sweep_ms), do: :ok
 
   defp safe_evaluate(state, session_key, fun) do
+    DB.background_pass(fn -> evaluate_pass(state, session_key, fun) end)
+  end
+
+  defp evaluate_pass(state, session_key, fun) do
     fun.()
   rescue
+    error in DB.Overloaded -> reraise error, __STACKTRACE__
+    error in MatchError ->
+      if match?({:error, %DB.Overloaded{}}, error.term), do: raise(DB.Overloaded), else: reraise(error, __STACKTRACE__)
     error ->
       best_effort_lifecycle(
         state.db,

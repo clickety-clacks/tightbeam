@@ -453,6 +453,10 @@ defmodule Tightbeam.NoticeBatcher do
   @doc "Resolve and admit one ready snapshot per concrete session atomically."
   @spec recover(GenServer.server(), integer(), keyword()) :: [String.t()]
   def recover(db \\ Tightbeam.DB, at \\ now(), delivery_opts \\ []) do
+    DB.background_pass(fn -> recover_pass(db, at, delivery_opts) end, [])
+  end
+
+  defp recover_pass(db, at, delivery_opts) do
     :ok = Wakes.dispose_closed_remedy_sources(db, at)
     reconcile_committed_deliveries(db, at)
 
@@ -483,6 +487,8 @@ defmodule Tightbeam.NoticeBatcher do
 
           {:ok, target} ->
             {[{target, wake_id} | targets], deferred}
+
+          {:error, %DB.Overloaded{} = error} -> raise error
 
           {:error, error} ->
             reason =
@@ -521,6 +527,8 @@ defmodule Tightbeam.NoticeBatcher do
 
           {:ok, _} ->
             []
+
+          {:error, %DB.Overloaded{} = error} -> raise error
 
           {:error, error} ->
             Logger.error(

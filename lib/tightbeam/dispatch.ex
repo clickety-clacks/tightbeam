@@ -79,6 +79,7 @@ defmodule Tightbeam.Dispatch do
   @spec dispatch(GenServer.server(), handlers(), call()) ::
           {:ok, map()} | {:error, map()} | {:decision_pending, String.t()}
   def dispatch(db \\ Tightbeam.DB, handlers, call) do
+    Process.delete(:tightbeam_dispatch_audited)
     verb = Map.fetch!(call, :verb)
     origin = Map.fetch!(call, :origin)
     principal = Map.get(call, :principal)
@@ -100,7 +101,7 @@ defmodule Tightbeam.Dispatch do
         # A keyed replay bypasses the rail entirely (statute inertness): the
         # original assignment is returned, no rumination, no terminal guard.
         :ok =
-          EventLog.append_event_with_handoff(
+          append_event_with_handoff(
             db,
             "verb",
             verb,
@@ -115,7 +116,7 @@ defmodule Tightbeam.Dispatch do
 
       {:terminal_replay, result} ->
         :ok =
-          EventLog.append_event_with_handoff(
+          append_event_with_handoff(
             db,
             "verb",
             verb,
@@ -237,7 +238,7 @@ defmodule Tightbeam.Dispatch do
         error = %{code: "unknown_verb"}
 
         :ok =
-          EventLog.append_event_with_handoff(
+          append_event_with_handoff(
             db,
             "denied",
             verb,
@@ -268,7 +269,7 @@ defmodule Tightbeam.Dispatch do
               publisher_call
           end
 
-        case invoke(handler, handler_call) do
+        case invoke_with_audit(handler, handler_call) do
           {:returned, %{code: _} = error} ->
             # A denial's diagnostic is caller evidence, like a crash's stack below:
             # the audit row and the firehose keep the denial's existing shape.
@@ -280,7 +281,7 @@ defmodule Tightbeam.Dispatch do
                 else: recorded
 
             :ok =
-              EventLog.append_event_with_handoff(
+              append_event_with_handoff(
                 db,
                 "denied",
                 verb,
@@ -306,7 +307,7 @@ defmodule Tightbeam.Dispatch do
 
           {:returned, {:firehose_effect, result, changed?}} when is_boolean(changed?) ->
             payload = outcome_payload(verb, call, {:returned, result})
-            :ok = EventLog.append_event(db, "verb", verb, origin, session_key, payload, principal)
+            :ok = append_event(db, "verb", verb, origin, session_key, payload, principal)
 
             :ok =
               Publisher.accepted_after_handler(
@@ -322,7 +323,7 @@ defmodule Tightbeam.Dispatch do
 
             if Publisher.transactional_verb?(verb) do
               :ok =
-                EventLog.append_event(
+                append_event(
                   db,
                   "verb",
                   verb,
@@ -333,7 +334,7 @@ defmodule Tightbeam.Dispatch do
                 )
             else
               :ok =
-                EventLog.append_event_with_handoff(
+                append_event_with_handoff(
                   db,
                   "verb",
                   verb,
@@ -353,7 +354,7 @@ defmodule Tightbeam.Dispatch do
             payload = outcome_payload(verb, call, {:raised, exception})
 
             :ok =
-              EventLog.append_event_with_handoff(
+              append_event_with_handoff(
                 db,
                 "verb",
                 verb,
@@ -373,6 +374,29 @@ defmodule Tightbeam.Dispatch do
             {:error, ErrorDiagnostic.put(error, diagnostic)}
         end
     end
+  end
+
+  defp invoke_with_audit(handler, call) do
+    previous = Process.put(:tightbeam_dispatch_audit, Map.take(call, [:verb, :origin, :session_key, :principal]))
+    Process.delete(:tightbeam_dispatch_audited)
+    try do
+      invoke(handler, call)
+    after
+      if previous, do: Process.put(:tightbeam_dispatch_audit, previous), else: Process.delete(:tightbeam_dispatch_audit)
+    end
+  end
+
+  defp append_event(db, kind, verb, origin, session_key, payload, principal),
+    do: append_event_with_handoff(db, kind, verb, origin, session_key, payload, principal, nil)
+
+  defp append_event_with_handoff(db, kind, verb, origin, session_key, payload, principal, handoff) do
+    audited? = Process.delete(:tightbeam_dispatch_audited) == true
+    audit = %{kind: kind, verb: verb, origin: origin, session_key: session_key,
+      payload: if(kind == "denied" or Publisher.transactional_verb?(verb), do: payload, else: nil), principal: principal}
+    unless DB.overloaded?(db) do
+      GenServer.cast(db, {:dispatch_audit, audit, handoff, audited?})
+    end
+    :ok
   end
 
   defp identity_invocation_id(call, verb, origin) do
@@ -560,7 +584,7 @@ defmodule Tightbeam.Dispatch do
   defp best_effort_denial(db, verb, origin, principal, session_key, error) do
     try do
       :ok =
-        EventLog.append_event_with_handoff(
+        append_event_with_handoff(
           db,
           "denied",
           verb,

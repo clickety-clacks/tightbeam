@@ -101,6 +101,7 @@ defmodule Tightbeam.DBObservation do
     started = System.monotonic_time()
 
     envelope = %{
+      dispatch_audit: Process.get(:tightbeam_dispatch_audit),
       request_id: context.request_id,
       db_call_id: RequestContext.id("dbc_"),
       operation: operation,
@@ -116,6 +117,7 @@ defmodule Tightbeam.DBObservation do
     try do
       request = build_request.(envelope)
       {reply, timing} = send_request(server, request, envelope, budget)
+      if Map.get(timing, :dispatch_audited) and match?({:ok, _}, reply), do: Process.put(:tightbeam_dispatch_audited, true)
 
       emit(
         envelope,
@@ -204,11 +206,37 @@ defmodule Tightbeam.DBObservation do
     fn transaction -> apply(elem(capture, 2), [transaction]) end
   end
 
+  @doc false
+  def audit_active?, do: is_map(get_in(Process.get(@key, %{}), [:dispatch_audit]))
+
+  @doc false
+  def audit_recorded(verb) do
+    case Process.get(@key) do
+      %{dispatch_audit: %{verb: ^verb}} = observation ->
+        Process.put(@key, %{observation | dispatch_audited: true})
+      _ -> :ok
+    end
+  end
+
+  @doc false
+  def audit_in_txn(txn, changed?) do
+    case Process.get(@key) do
+      %{dispatch_audit: audit, dispatch_audited: false} when is_map(audit) and changed? ->
+        Tightbeam.EventLog.append_event_in_txn(txn, "verb", audit.verb, audit.origin,
+          audit.session_key, nil, Map.get(audit, :principal), System.system_time(:millisecond))
+      _ -> :ok
+    end
+  rescue
+    _ -> Logger.warning("dispatch audit could not be recorded in primary transaction")
+  end
+
   def server(envelope, sqlite_budget, fun) do
     started = System.monotonic_time()
     previous = Process.get(@key)
 
     Process.put(@key, %{
+      dispatch_audit: Map.get(envelope, :dispatch_audit),
+      dispatch_audited: false,
       sql: 0,
       sql_observed: false,
       callback: 0,
@@ -224,7 +252,7 @@ defmodule Tightbeam.DBObservation do
     try do
       case fun.() do
         {:reply, reply, state} ->
-          timing = terminal(envelope, started, reply)
+          timing = terminal(envelope, started, reply) |> Map.put(:dispatch_audited, Process.get(@key).dispatch_audited)
           {:reply, {reply, timing}, state}
       end
     catch

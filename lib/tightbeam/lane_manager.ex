@@ -129,6 +129,10 @@ defmodule Tightbeam.LaneManager do
   end
 
   defp do_reconcile(state) do
+    DB.background_pass(fn -> reconcile_pass(state) end, state)
+  end
+
+  defp reconcile_pass(state) do
     # Re-publish terminals whose publication may have been lost to a crash —
     # to the WIRE, not just the ledger: without frames, a client whose turn
     # died with the gateway keeps a stuck typing indicator forever.

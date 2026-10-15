@@ -90,7 +90,9 @@ defmodule Tightbeam.Productions.BubbleSweeper do
   # duration; the cast edge keeps serving everything ahead of it). The cursor
   # commits AFTER the prefix is recognized: a crash mid-batch re-runs from the
   # old cursor into idempotent recognitions, never past an unrecognized row.
-  defp sweep(db) do
+  defp sweep(db), do: DB.background_pass(fn -> sweep_pass(db) end, 0)
+
+  defp sweep_pass(db) do
     cursor = read_cursor(db)
 
     {:ok, rows} =
@@ -109,7 +111,12 @@ defmodule Tightbeam.Productions.BubbleSweeper do
       |> Enum.take_while(fn [_seq, ended] -> ended == 1 end)
       |> Enum.map(&hd/1)
 
-    Enum.each(prefix, &recognize_one(db, &1))
+    prefix = Enum.reduce_while(prefix, [], fn seq, recognized ->
+      case recognize_one(db, seq) do
+        :ok -> {:cont, [seq | recognized]}
+        _ -> {:halt, recognized}
+      end
+    end) |> Enum.reverse()
 
     case List.last(prefix) do
       nil ->
@@ -131,26 +138,34 @@ defmodule Tightbeam.Productions.BubbleSweeper do
   defp read_cursor(db) do
     case DB.query(db, "SELECT seq FROM production_cursors WHERE name = ?1", [@cursor_name]) do
       {:ok, [[seq]]} -> seq
-      _ -> 0
+      {:ok, []} -> 0
+      {:error, error} -> raise error
     end
   end
 
   defp recognize_one(db, seq) do
-    Bubble.recognize_terminal(db, seq)
+    case Bubble.recognize_terminal(db, seq) do
+      {:error, error} -> {:error, error}
+      _ -> :ok
+    end
   rescue
+    error in DB.Overloaded ->
+      Logger.debug("database overloaded; background pass deferred")
+      {:error, error}
+
     error ->
       Logger.error(
         "bubble recognition of turn #{seq} crashed and was contained: " <>
           Exception.format(:error, error, __STACKTRACE__)
       )
 
-      :ok
+      {:error, error}
   catch
     kind, reason ->
       Logger.error(
         "bubble recognition of turn #{seq} crashed and was contained: #{inspect({kind, reason})}"
       )
 
-      :ok
+      {:error, {kind, reason}}
   end
 end

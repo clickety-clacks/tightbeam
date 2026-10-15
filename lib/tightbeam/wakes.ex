@@ -6437,7 +6437,7 @@ defmodule Tightbeam.Wakes do
     # scan. The bind restores even when delivery raises; the next scan gets a
     # fresh ID. No context is implicitly inherited by a spawned process.
     Tightbeam.RequestContext.bind_internal("wake_scheduler", fn ->
-      deliver_due_in_context(state)
+      DB.background_pass(fn -> deliver_due_in_context(state) end)
     end)
   end
 
