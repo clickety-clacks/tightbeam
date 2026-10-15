@@ -1901,14 +1901,22 @@ defmodule Tightbeam.Supervision do
 
   def handle_info({:timeout, ref, :supervision_due}, %{deadline_timer: ref} = state) do
     safe_evaluate(state, "liveness_deadline", fn ->
-      due_holders = query(state.db, """
-      SELECT DISTINCT a.holderKey FROM supervision_entitlements e
-      JOIN assignments a ON a.id=e.assignmentId
-      WHERE e.state='armed' AND e.dueAt<=?1 AND a.state='open'
-      """, [now()]) |> Enum.map(&hd/1)
+      due_holders =
+        query(
+          state.db,
+          """
+          SELECT DISTINCT a.holderKey FROM supervision_entitlements e
+          JOIN assignments a ON a.id=e.assignmentId
+          WHERE e.state='armed' AND e.dueAt<=?1 AND a.state='open'
+          """,
+          [now()]
+        )
+        |> Enum.map(&hd/1)
+
       terminal_rebases = sweep_new_terminals(state, due_holders)
       liveness_cycle(state, terminal_rebases)
     end)
+
     DB.background_pass(fn -> idle_cleanup_sweep(state) end)
 
     {:noreply, arm_deadline(%{state | deadline_timer: nil, deadline: nil})}
