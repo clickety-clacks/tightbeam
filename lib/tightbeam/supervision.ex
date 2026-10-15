@@ -1136,7 +1136,7 @@ defmodule Tightbeam.Supervision do
           Txn.q(
             txn,
             """
-            WITH deliveries AS (#{NoticeBatcher.source_deliveries_sql(source_wake: "?2", turn_seq: "?5")})
+            WITH deliveries AS (SELECT wakeId AS sourceWakeId,deliveredTurnSeq AS turnSeq,assignmentId FROM wakes WHERE deliveredTurnSeq IS NOT NULL)
             SELECT 1 FROM supervision_entitlements e
             JOIN assignments a ON a.id=e.assignmentId
             JOIN wakes old ON old.wakeId=?2 AND old.assignmentId=a.id
@@ -4811,7 +4811,7 @@ defmodule Tightbeam.Supervision do
       AND w.obligationRef COLLATE NOCASE < ?4
       AND w.obligationRef LIKE ?1
       AND w.obligationRef LIKE ?2
-      AND #{NoticeBatcher.source_delivered_sql("w.wakeId")}
+      AND w.deliveredTurnSeq IS NOT NULL
     """
   end
 
@@ -5868,7 +5868,7 @@ defmodule Tightbeam.Supervision do
     query(
       db_or_txn,
       """
-      WITH source_deliveries AS (#{NoticeBatcher.source_deliveries_sql(assignment: "?1")})
+      WITH source_deliveries AS (SELECT wakeId AS sourceWakeId,deliveredTurnSeq AS turnSeq,assignmentId FROM wakes WHERE deliveredTurnSeq IS NOT NULL)
       SELECT t.seq,t.sessionKey,d.assignmentId,
              w.wakeId,w.state,w.assignmentId,w.origin,w.createdAt,w.firedAt,
              w.reresolve,w.reresolveSeed,w.reresolveRung,
@@ -6162,9 +6162,9 @@ defmodule Tightbeam.Supervision do
     query(
       db_or_txn,
       """
-      WITH source_deliveries AS (#{NoticeBatcher.source_deliveries_sql(turn_seq: "?1", source_wake: "?2")})
+      WITH source_deliveries AS (SELECT wakeId AS sourceWakeId,deliveredTurnSeq AS turnSeq,assignmentId FROM wakes WHERE deliveredTurnSeq IS NOT NULL)
       SELECT 1 FROM source_deliveries d
-      WHERE d.turnSeq=?1 AND d.sourceWakeId=?2 AND d.carrier=1 LIMIT 1
+      WHERE d.turnSeq=?1 AND d.sourceWakeId=?2 AND (SELECT wakeId FROM turns WHERE seq=d.turnSeq)<>d.sourceWakeId LIMIT 1
       """,
       [turn_seq, source_wake_id]
     ) != []

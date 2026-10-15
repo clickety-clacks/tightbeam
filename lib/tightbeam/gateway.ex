@@ -2391,6 +2391,13 @@ defmodule Tightbeam.Gateway do
 
         case enqueued do
           {:ok, seq} ->
+            if is_binary(opts[:wake_id]) do
+              NoticeBatcher.carrier_source_ids_in_txn(txn, opts[:wake_id])
+              |> Enum.each(fn source_id ->
+                DB.Txn.q(txn, "UPDATE wakes SET deliveredTurnSeq=?2 WHERE wakeId=?1", [source_id, seq])
+              end)
+            end
+
             settle_supervision_controller_in_txn(txn, opts, target, seq)
 
             opts[:wake_id]

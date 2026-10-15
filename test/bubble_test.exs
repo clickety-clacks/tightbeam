@@ -1128,7 +1128,7 @@ defmodule Tightbeam.Productions.BubbleTest do
     assert {:ok, [[1]]} =
              DB.query(
                ctx.db,
-               "SELECT count(*) FROM (#{NoticeBatcher.source_deliveries_sql()}) d WHERE d.sourceWakeId=?1",
+               "SELECT count(*) FROM (SELECT wakeId AS sourceWakeId,deliveredTurnSeq AS turnSeq,assignmentId FROM wakes WHERE deliveredTurnSeq IS NOT NULL) d WHERE d.sourceWakeId=?1",
                [retry]
              )
 

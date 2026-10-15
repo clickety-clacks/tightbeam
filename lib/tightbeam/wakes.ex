@@ -2238,7 +2238,7 @@ defmodule Tightbeam.Wakes do
       case Txn.q(
              txn,
              """
-             WITH deliveries AS (#{NoticeBatcher.source_deliveries_sql()})
+             WITH deliveries AS (SELECT wakeId AS sourceWakeId,deliveredTurnSeq AS turnSeq,assignmentId FROM wakes WHERE deliveredTurnSeq IS NOT NULL)
              SELECT t.status FROM deliveries d JOIN turns t ON t.seq=d.turnSeq
              WHERE d.sourceWakeId=?1 AND d.assignmentId=?2 AND t.sessionKey=?3
              ORDER BY t.seq DESC
@@ -2342,7 +2342,7 @@ defmodule Tightbeam.Wakes do
         Txn.q(
           txn,
           """
-          WITH deliveries AS (#{NoticeBatcher.source_deliveries_sql()})
+          WITH deliveries AS (SELECT wakeId AS sourceWakeId,deliveredTurnSeq AS turnSeq,assignmentId FROM wakes WHERE deliveredTurnSeq IS NOT NULL)
           SELECT 1 FROM deliveries d JOIN turns t ON t.seq=d.turnSeq
           JOIN sessions holder ON holder.sessionKey=t.sessionKey
           JOIN supervision_liveness_sidecar sidecar ON sidecar.wakeId=d.sourceWakeId
@@ -6360,6 +6360,7 @@ defmodule Tightbeam.Wakes do
     }
 
     schedule_tick(state.tick_ms)
+    Process.send_after(self(), :backfill_wake_delivery, 100)
     {:ok, state}
   end
 
@@ -6384,6 +6385,13 @@ defmodule Tightbeam.Wakes do
   end
 
   @impl true
+  def handle_info(:backfill_wake_delivery, state) do
+    if Tightbeam.Schema.backfill_wake_delivery(state.db) == :more do
+      Process.send_after(self(), :backfill_wake_delivery, 100)
+    end
+    {:noreply, state}
+  end
+
   def handle_info(:fire_due, state) do
     deliver_due(state)
     {:noreply, state}

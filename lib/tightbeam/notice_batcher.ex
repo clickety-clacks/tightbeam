@@ -419,7 +419,7 @@ defmodule Tightbeam.NoticeBatcher do
       [[batch_id, state, carrier]] ->
         committed? =
           is_binary(carrier) and
-            Txn.q(txn, "SELECT 1 FROM turns WHERE wakeId=?1 LIMIT 1", [carrier]) != []
+            Txn.q(txn, "SELECT 1 FROM wakes WHERE wakeId=?1 AND deliveredTurnSeq IS NOT NULL", [carrier]) != []
 
         cond do
           committed? or state in ["delivered", "delivery_failed"] ->
@@ -556,7 +556,7 @@ defmodule Tightbeam.NoticeBatcher do
            WHERE b.batchId=?1 AND b.state IN ('open','sealed','delivery_pending')
              AND (b.deliveryWakeId IS NULL OR EXISTS (
                SELECT 1 FROM wakes w WHERE w.wakeId=b.deliveryWakeId AND w.state='pending' AND w.digest=1))
-             AND NOT EXISTS (SELECT 1 FROM turns t WHERE t.wakeId=b.deliveryWakeId)
+             AND NOT EXISTS (SELECT 1 FROM wakes w WHERE w.wakeId=b.deliveryWakeId AND w.deliveredTurnSeq IS NOT NULL)
            """,
            [batch_id]
          ) do
@@ -1034,7 +1034,7 @@ defmodule Tightbeam.NoticeBatcher do
   end
 
   defp prepare_due_source_after_suppression_in_txn(txn, wake_id) do
-    case Txn.q(txn, "SELECT sessionKey FROM turns WHERE wakeId=?1 ORDER BY seq LIMIT 1", [wake_id]) do
+    case Txn.q(txn, "SELECT t.sessionKey FROM wakes w JOIN turns t ON t.seq=w.deliveredTurnSeq WHERE w.wakeId=?1", [wake_id]) do
       [[delivered_to]] ->
         # A pre-batching delivery may have committed its turn before the wake
         # row was marked fired. On recovery, acknowledge that exact source
@@ -1368,75 +1368,11 @@ defmodule Tightbeam.NoticeBatcher do
   end
 
   @doc false
-  # One read-only relation for actual delivery history. Transport membership
-  # before a turn exists is deliberately not delivery evidence. Callers keep
-  # their domain/assignment/authority predicates outside this relation.
-  #
-  # SQLite cannot push a caller's correlated predicate into this UNION ALL, so a
-  # caller that wants one source, turn or assignment passes the same predicate
-  # here and each arm applies it through its own index. The values are
-  # source-owned SQL expressions (a bound parameter such as "?1"), never caller
-  # input. Each option filters the relation's output column of the same name:
-  #   source_wake: sourceWakeId    turn_seq: turnSeq
-  #   assignment:  assignmentId    turn_wake: the delivery turn's wakeId
-  def source_deliveries_sql(filters \\ []) do
-    direct =
-      source_delivery_arm_filters(filters, %{
-        source_wake: "t.wakeId",
-        turn_seq: "t.seq",
-        turn_wake: "t.wakeId",
-        assignment: "t.assignmentId"
-      })
-
-    carried =
-      source_delivery_arm_filters(filters, %{
-        source_wake: "m.sourceWakeId",
-        turn_seq: "t.seq",
-        turn_wake: "t.wakeId",
-        assignment: "w.assignmentId"
-      })
-
-    """
-    SELECT t.seq AS turnSeq,t.wakeId AS sourceWakeId,t.assignmentId AS assignmentId,
-           0 AS carrier,NULL AS publicationSeq
-    FROM turns t WHERE t.wakeId IS NOT NULL#{direct}
-    UNION ALL
-    SELECT t.seq,m.sourceWakeId,w.assignmentId,1,m.publicationSeq
-    FROM notice_batch_members m
-    JOIN notice_batches b ON b.batchId=m.batchId
-    JOIN wakes w ON w.wakeId=m.sourceWakeId
-    JOIN turns t ON t.wakeId=b.deliveryWakeId
-    WHERE m.state='included'#{carried}
-    """
-  end
-
-  defp source_delivery_arm_filters(filters, columns) do
-    Enum.map_join(filters, fn {key, expression} when is_binary(expression) ->
-      " AND #{Map.fetch!(columns, key)}=#{expression}"
-    end)
-  end
-
-  @doc false
-  # True when the source wake `expression` (a correlated column such as
-  # "w.wakeId", never caller input) has actual delivery history: the same rows as an EXISTS over
-  # `source_deliveries_sql/0` filtered by sourceWakeId, as two indexed lookups.
-  def source_delivered_sql(expression) when is_binary(expression) do
-    """
-    (EXISTS (SELECT 1 FROM turns sd_t WHERE sd_t.wakeId=#{expression})
-      OR EXISTS (SELECT 1 FROM notice_batch_members sd_m
-        JOIN notice_batches sd_b ON sd_b.batchId=sd_m.batchId
-        JOIN wakes sd_w ON sd_w.wakeId=sd_m.sourceWakeId
-        JOIN turns sd_t ON sd_t.wakeId=sd_b.deliveryWakeId
-        WHERE sd_m.sourceWakeId=#{expression} AND sd_m.state='included'))
-    """
-  end
-
-  @doc false
   def source_delivery_turns_in_txn(%Txn{} = txn, source_wake_id) do
     Txn.q(
       txn,
       """
-      WITH source_deliveries AS (#{source_deliveries_sql(source_wake: "?1")})
+      WITH source_deliveries AS (SELECT wakeId AS sourceWakeId,deliveredTurnSeq AS turnSeq,assignmentId FROM wakes WHERE deliveredTurnSeq IS NOT NULL)
       SELECT t.seq,t.status,d.assignmentId
       FROM source_deliveries d JOIN turns t ON t.seq=d.turnSeq
       WHERE d.sourceWakeId=?1 ORDER BY t.seq
@@ -1726,11 +1662,11 @@ defmodule Tightbeam.NoticeBatcher do
         db,
         """
         SELECT b.deliveryWakeId,
-               EXISTS (SELECT 1 FROM turns t WHERE t.wakeId=b.deliveryWakeId)
+               w.deliveredTurnSeq IS NOT NULL
         FROM notice_batches b
         LEFT JOIN wakes w ON w.wakeId=b.deliveryWakeId
         WHERE b.state='delivery_pending'
-          AND (w.state='fired' OR EXISTS (SELECT 1 FROM turns t WHERE t.wakeId=b.deliveryWakeId))
+          AND (w.state='fired' OR w.deliveredTurnSeq IS NOT NULL)
         """
       )
 

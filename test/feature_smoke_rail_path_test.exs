@@ -289,12 +289,12 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
                    """
                    SELECT turn.wakeId,turn.sessionKey,turn.prompt,
                      batch.envelope,batch.envelopeSha256
-                   FROM (#{NoticeBatcher.source_deliveries_sql()}) delivery
+                   FROM (SELECT wakeId AS sourceWakeId,deliveredTurnSeq AS turnSeq,assignmentId FROM wakes WHERE deliveredTurnSeq IS NOT NULL) delivery
                    JOIN turns turn ON turn.seq=delivery.turnSeq AND turn.origin='process:tightbeam'
                    JOIN messages message ON message.id=turn.messageId
                      AND message.sender=turn.origin AND message.content=turn.prompt
                    JOIN notice_batches batch ON batch.deliveryWakeId=turn.wakeId AND batch.state='delivered'
-                   WHERE delivery.sourceWakeId=?1 AND delivery.assignmentId=?2 AND delivery.carrier=1
+                   WHERE delivery.sourceWakeId=?1 AND delivery.assignmentId=?2 AND (SELECT wakeId FROM turns WHERE seq=delivery.turnSeq)<>delivery.sourceWakeId
                    """,
                    [terminal_source, dispatch_id]
                  )
@@ -359,7 +359,7 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
         assert {:ok, [[0]]} =
                  DB.query(
                    ctx.db,
-                   "SELECT count(*) FROM (#{NoticeBatcher.source_deliveries_sql()}) WHERE sourceWakeId=?1",
+                   "SELECT count(*) FROM (SELECT wakeId AS sourceWakeId,deliveredTurnSeq AS turnSeq,assignmentId FROM wakes WHERE deliveredTurnSeq IS NOT NULL) WHERE sourceWakeId=?1",
                    [terminal_source]
                  )
 
@@ -483,9 +483,9 @@ defmodule Tightbeam.FeatureSmokeRailPathTest do
              DB.query(db, """
              SELECT source.wakeId,source.sessionKey,t.seq,t.wakeId
              FROM wakes source JOIN sessions s ON s.sessionKey=source.sessionKey
-             JOIN (#{NoticeBatcher.source_deliveries_sql()}) d ON d.sourceWakeId=source.wakeId
+             JOIN (SELECT wakeId AS sourceWakeId,deliveredTurnSeq AS turnSeq,assignmentId FROM wakes WHERE deliveredTurnSeq IS NOT NULL) d ON d.sourceWakeId=source.wakeId
              JOIN turns t ON t.seq=d.turnSeq
-             WHERE source.rumination=1 AND source.state='fired' AND d.carrier=1
+             WHERE source.rumination=1 AND source.state='fired' AND (SELECT wakeId FROM turns WHERE seq=d.turnSeq)<>d.sourceWakeId
                AND s.displayName LIKE 'smoke-effort-parent-%' AND t.status='queued'
              """)
 

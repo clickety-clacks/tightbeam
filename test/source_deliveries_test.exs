@@ -88,7 +88,8 @@ defmodule Tightbeam.SourceDeliveriesTest do
         )
     end
 
-    %{db: db, wake_ids: Enum.map(wakes, &elem(&1, 0))}
+    :ok = DB.execute(db, "UPDATE wake_delivery_backfill SET afterRowid=0,throughRowid=(SELECT MAX(rowid) FROM wakes),completedAt=NULL")
+    %{db: db}
   end
 
   defp rows!(db, sql, params) do
@@ -96,77 +97,46 @@ defmodule Tightbeam.SourceDeliveriesTest do
     Enum.sort(rows)
   end
 
-  defp plan!(db, sql, params) do
-    {:ok, rows} = DB.query(db, "EXPLAIN QUERY PLAN " <> sql, params)
-    Enum.map(rows, &List.last/1)
+  test "backfill records direct and carried turns, excluding canceled and unsent members", ctx do
+    assert :done = Tightbeam.Schema.backfill_wake_delivery(ctx.db)
+    assert rows!(ctx.db, "SELECT wakeId,deliveredTurnSeq FROM wakes WHERE deliveredTurnSeq IS NOT NULL", []) ==
+      [["w_carrier",2],["w_direct",1],["w_src_a",2],["w_src_b",2]]
+    assert {:ok, [[2,"delivered","asg_a"]]} = DB.transaction(ctx.db, &NoticeBatcher.source_delivery_turns_in_txn(&1,"w_src_a"))
+    # Membership is metadata, not delivery authority after the stamp.
+    :ok = DB.execute(ctx.db, "DELETE FROM notice_batch_members")
+    assert {:ok, [[2,"delivered","asg_a"]]} = DB.transaction(ctx.db, &NoticeBatcher.source_delivery_turns_in_txn(&1,"w_src_a"))
+    assert {:ok, []} = DB.transaction(ctx.db, &NoticeBatcher.source_delivery_turns_in_txn(&1,"w_src_unsent"))
+    assert {:ok, plan} = DB.query(ctx.db, "EXPLAIN QUERY PLAN SELECT wakeId FROM wakes WHERE deliveredTurnSeq=?1", [2])
+    assert Enum.any?(plan, &(List.last(&1) =~ "wakes_delivered_turn"))
   end
 
-  test "filtered source deliveries return exactly the rows of the filtered relation", ctx do
-    all = NoticeBatcher.source_deliveries_sql()
-    assert length(rows!(ctx.db, "SELECT * FROM (#{all})", [])) == 4
-
-    cases = [
-      {:source_wake, "d.sourceWakeId=?1", ctx.wake_ids},
-      {:turn_seq, "d.turnSeq=?1", [1, 2, 3]},
-      {:assignment, "d.assignmentId=?1", ["asg_a", "asg_b", "asg_none"]},
-      {:turn_wake, "turn.wakeId=?1", ctx.wake_ids}
-    ]
-
-    for {key, predicate, values} <- cases do
-      filtered = NoticeBatcher.source_deliveries_sql([{key, "?1"}])
-
-      matched =
-        Enum.map(values, fn value ->
-          expected =
-            rows!(
-              ctx.db,
-              "SELECT d.* FROM (#{all}) d JOIN turns turn ON turn.seq=d.turnSeq WHERE #{predicate}",
-              [value]
-            )
-
-          assert rows!(
-                   ctx.db,
-                   "SELECT d.* FROM (#{filtered}) d JOIN turns turn ON turn.seq=d.turnSeq WHERE #{predicate}",
-                   [value]
-                 ) == expected,
-                 "#{key}=#{inspect(value)}"
-
-          assert rows!(ctx.db, "SELECT d.* FROM (#{filtered}) d", [value]) == expected,
-                 "#{key}=#{inspect(value)} without the outer predicate"
-
-          length(expected)
-        end)
-
-      assert Enum.sum(matched) > 0, "#{key} matched nothing"
-
-      plan = plan!(ctx.db, "SELECT * FROM (#{filtered}) d", [hd(values)])
-      refute Enum.any?(plan, &Regex.match?(~r/^SCAN t$/, &1)), "#{key}: #{inspect(plan)}"
-
-      if key != :assignment do
-        refute Enum.any?(plan, &Regex.match?(~r/^SCAN m$/, &1)), "#{key}: #{inspect(plan)}"
-      end
-    end
+  test "a completed backfill skips historical rows on a second boot", ctx do
+    assert :done = Tightbeam.Schema.backfill_wake_delivery(ctx.db)
+    before = rows!(ctx.db, "SELECT * FROM wake_delivery_backfill", [])
+    :ok = DB.execute(ctx.db, "UPDATE wakes SET deliveredTurnSeq=NULL WHERE wakeId='w_direct'")
+    assert :ok = Tightbeam.Schema.ensure_all(ctx.db)
+    assert :done = Tightbeam.Schema.backfill_wake_delivery(ctx.db)
+    assert rows!(ctx.db, "SELECT * FROM wake_delivery_backfill", []) == before
+    assert {:ok, []} = DB.transaction(ctx.db, &NoticeBatcher.source_delivery_turns_in_txn(&1,"w_direct"))
   end
 
-  test "source_delivered_sql matches an EXISTS over the relation by indexed lookups", ctx do
-    all = NoticeBatcher.source_deliveries_sql()
-
-    expected =
-      rows!(
-        ctx.db,
-        "SELECT w.wakeId FROM wakes w WHERE EXISTS (SELECT 1 FROM (#{all}) d WHERE d.sourceWakeId=w.wakeId)",
-        []
-      )
-
-    assert expected == [["w_carrier"], ["w_direct"], ["w_src_a"], ["w_src_b"]]
-
-    sql =
-      "SELECT w.wakeId FROM wakes w WHERE #{NoticeBatcher.source_delivered_sql("w.wakeId")}"
-
-    assert rows!(ctx.db, sql, []) == expected
-
-    plan = plan!(ctx.db, sql, [])
-    refute Enum.any?(plan, &Regex.match?(~r/^SCAN sd_(t|m)$/, &1)), inspect(plan)
-    assert Enum.any?(plan, &(&1 =~ ~r/^SEARCH sd_m USING .*\(sourceWakeId=\?\)/)), inspect(plan)
+  test "an existing database stamps pending and recent wakes before historical batches", ctx do
+    # Reconstruct the additive predecessor. No application writes run during
+    # this fixture-only downgrade.
+    :ok = DB.execute(ctx.db, """
+    DROP TRIGGER supervision_liveness_sidecar_insert_coherent;
+    DROP INDEX wakes_delivered_turn;
+    ALTER TABLE wakes DROP COLUMN deliveredTurnSeq;
+    DROP TABLE wake_delivery_backfill;
+    UPDATE wakes SET state='pending' WHERE wakeId='w_direct';
+    """)
+    at = System.system_time(:millisecond)
+    assert {:ok, _} = DB.query(ctx.db, "UPDATE wakes SET firedAt=?1 WHERE wakeId IN ('w_src_a','w_carrier')", [at])
+    assert :ok = Tightbeam.Schema.migrate_wake_delivery(ctx.db)
+    assert rows!(ctx.db, "SELECT wakeId,deliveredTurnSeq FROM wakes WHERE deliveredTurnSeq IS NOT NULL", []) ==
+      [["w_carrier",2],["w_direct",1],["w_src_a",2]]
+    assert :done = Tightbeam.Schema.backfill_wake_delivery(ctx.db)
+    assert rows!(ctx.db, "SELECT deliveredTurnSeq FROM wakes WHERE wakeId='w_src_b'", []) == [[2]]
+    assert :ok = Tightbeam.Schema.migrate_wake_delivery(ctx.db)
   end
 end

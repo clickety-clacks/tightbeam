@@ -1,6 +1,6 @@
 defmodule Tightbeam.NoticeAuthority do
   @moduledoc false
-  alias Tightbeam.{DB, NoticeBatcher, NoticeSubmission}
+  alias Tightbeam.{DB, NoticeSubmission}
   alias Tightbeam.DB.Txn
 
   # Discovery only, never authority: callers use this to find a domain row
@@ -89,7 +89,7 @@ defmodule Tightbeam.NoticeAuthority do
               AND c.ownerLease IS NOT NULL AND length(c.ownerLease)>0
               AND NOT EXISTS (SELECT 1 FROM turn_lifecycle_events d
                 WHERE d.turnSeq=t.seq AND d.kind='prompt_dispatched')
-              AND EXISTS (SELECT 1 FROM (#{NoticeBatcher.source_deliveries_sql()}) delivery
+              AND EXISTS (SELECT 1 FROM (SELECT wakeId AS sourceWakeId,deliveredTurnSeq AS turnSeq,assignmentId FROM wakes WHERE deliveredTurnSeq IS NOT NULL) delivery
                 WHERE delivery.sourceWakeId=p.wakeId AND delivery.turnSeq=t.seq)
             """,
             [predecessor, root, attempt - 1, wake_id]
@@ -183,7 +183,7 @@ defmodule Tightbeam.NoticeAuthority do
         db,
         """
         SELECT source.wakeId,r.retryWakeId,r.sourceTurnSeq
-        FROM (#{NoticeBatcher.source_deliveries_sql()}) d
+        FROM (SELECT wakeId AS sourceWakeId,deliveredTurnSeq AS turnSeq,assignmentId FROM wakes WHERE deliveredTurnSeq IS NOT NULL) d
         JOIN wakes source ON source.wakeId=d.sourceWakeId AND source.consumer='prompt' AND source.digest=0
         LEFT JOIN wake_retry_attempts r ON r.wakeId=source.wakeId
         WHERE d.turnSeq=?1

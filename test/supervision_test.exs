@@ -299,7 +299,7 @@ defmodule Tightbeam.SupervisionTest do
           SELECT w.firedAt,w.obligationRef FROM wakes w
           WHERE w.origin='process:tightbeam' AND w.state='fired'
             AND w.obligationRef LIKE ?1 AND w.obligationRef LIKE ?2
-            AND EXISTS (SELECT 1 FROM (#{NoticeBatcher.source_deliveries_sql()}) d
+            AND EXISTS (SELECT 1 FROM (SELECT wakeId AS sourceWakeId,deliveredTurnSeq AS turnSeq,assignmentId FROM wakes WHERE deliveredTurnSeq IS NOT NULL) d
               WHERE d.sourceWakeId=w.wakeId)
           """,
           Enum.take(params, 2)
