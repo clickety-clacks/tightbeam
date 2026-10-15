@@ -6674,9 +6674,15 @@ defmodule Tightbeam.Wakes do
         {:ok, {:delivery, delivery}} ->
           Gateway.complete_delivery(db, delivery)
           []
-        {:ok, {:staged, target}} -> [target]
-        {:ok, _} -> []
-        {:error, error} -> raise error
+
+        {:ok, {:staged, target}} ->
+          [target]
+
+        {:ok, _} ->
+          []
+
+        {:error, error} ->
+          raise error
       end
     end)
   end
