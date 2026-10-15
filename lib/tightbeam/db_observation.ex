@@ -109,11 +109,13 @@ defmodule Tightbeam.DBObservation do
       principal_ref: context.principal_ref,
       timeout_source: "otp_db_call",
       budget_ms: budget,
+      deadline: System.monotonic_time(:millisecond) + budget,
       enqueued_monotonic: started
     }
 
     try do
-      {reply, timing} = GenServer.call(server, build_request.(envelope), budget)
+      request = build_request.(envelope)
+      {reply, timing} = send_request(server, request, envelope, budget)
 
       emit(
         envelope,
@@ -155,6 +157,39 @@ defmodule Tightbeam.DBObservation do
             budget_ms: budget,
             effect_state: if(envelope.effect_kind == "read", do: "none", else: "unknown")
         end
+    end
+  end
+
+  defp send_request(server, {:db_call, envelope, {:query, sql, params}} = request, _, budget) do
+    case Tightbeam.DB.reader(server, sql) do
+      nil -> owner_request(server, request, envelope, budget)
+      conn ->
+        {:reply, response, _} = server(envelope, 5_000, fn ->
+          {:reply, Tightbeam.DB.read_query(conn, sql, params), nil}
+        end)
+
+        case response do
+          {{:error, %{message: message}}, _} when is_binary(message) ->
+            if String.contains?(message, "readonly"),
+              do: owner_request(server, request, envelope, budget),
+              else: response
+
+          _ -> response
+        end
+    end
+  end
+
+  defp send_request(server, request, envelope, budget),
+    do: owner_request(server, request, envelope, budget)
+
+  defp owner_request(server, request, envelope, budget) do
+    if Tightbeam.DB.overloaded?(server) do
+      {:reply, response, _} = server(envelope, nil, fn ->
+        {:reply, {:error, %Tightbeam.DB.Overloaded{}}, nil}
+      end)
+      response
+    else
+      GenServer.call(server, request, budget)
     end
   end
 
