@@ -45,6 +45,7 @@ defmodule Tightbeam.Firehose.Hub do
     do: GenServer.cast(server, {:unregister, pid})
 
   def shutdown_delivered(server, pid), do: GenServer.call(server, {:shutdown_delivered, pid})
+
   def shutdown(server \\ __MODULE__, deadline \\ System.monotonic_time(:millisecond) + 5_000) do
     remaining = deadline - System.monotonic_time(:millisecond)
 
@@ -118,7 +119,12 @@ defmodule Tightbeam.Firehose.Hub do
   end
 
   def handle_call({:shutdown, deadline}, from, state) do
-    Process.send_after(self(), {:shutdown_timeout, from}, max(deadline - System.monotonic_time(:millisecond), 0))
+    Process.send_after(
+      self(),
+      {:shutdown_timeout, from},
+      max(deadline - System.monotonic_time(:millisecond), 0)
+    )
+
     Enum.each(Map.keys(state.sockets), &send(&1, :firehose_shutdown))
 
     if map_size(state.sockets) == 0,

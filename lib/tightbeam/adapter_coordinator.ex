@@ -808,16 +808,17 @@ defmodule Tightbeam.AdapterCoordinator do
     # with the callback.
     owner = self()
 
-    {worker, monitor} = spawn_monitor(fn ->
-      result =
-        try do
-          Task.Supervisor.start_child(state.shutdown_cleanup_supervisor, cleanup)
-        catch
-          :exit, reason -> {:error, {:cleanup_owner_unavailable, reason}}
-        end
+    {worker, monitor} =
+      spawn_monitor(fn ->
+        result =
+          try do
+            Task.Supervisor.start_child(state.shutdown_cleanup_supervisor, cleanup)
+          catch
+            :exit, reason -> {:error, {:cleanup_owner_unavailable, reason}}
+          end
 
-      send(owner, {self(), result})
-    end)
+        send(owner, {self(), result})
+      end)
 
     handoff =
       receive do
@@ -1350,6 +1351,7 @@ defmodule Tightbeam.AdapterCoordinator do
     state =
       if is_pid(entry.pid) do
         if is_reference(entry.monitor), do: Process.demonitor(entry.monitor, [:flush])
+
         if shutdown?,
           do: Process.exit(entry.pid, :kill),
           else: DynamicSupervisor.terminate_child(state.adapter_sup, entry.pid)

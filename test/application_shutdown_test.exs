@@ -30,7 +30,9 @@ defmodule Tightbeam.ApplicationShutdownTest do
   test "a normal stop stamps the epoch inside the shutdown budget", %{epoch: epoch} do
     assert :state = Tightbeam.Application.prep_stop(:state)
     assert_stamped(epoch)
-    assert System.monotonic_time(:millisecond) < Tightbeam.Application.shutdown_deadline(0x7FFFFFFFFFFFFFFF)
+
+    assert System.monotonic_time(:millisecond) <
+             Tightbeam.Application.shutdown_deadline(0x7FFFFFFFFFFFFFFF)
   end
 
   @tag timeout: 5_000
@@ -58,9 +60,10 @@ defmodule Tightbeam.ApplicationShutdownTest do
     started = System.monotonic_time(:millisecond)
 
     try do
-      log = ExUnit.CaptureLog.capture_log(fn ->
-        assert :state = Tightbeam.Application.prep_stop(:state)
-      end)
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert :state = Tightbeam.Application.prep_stop(:state)
+        end)
 
       assert System.monotonic_time(:millisecond) - started < 900
       assert log =~ "clean shutdown stamp failed"
@@ -70,7 +73,9 @@ defmodule Tightbeam.ApplicationShutdownTest do
   end
 
   defp assert_stamped(epoch) do
-    assert {:ok, [[stamp]]} = DB.query(DB, "SELECT cleanShutdownAt FROM boot_epochs WHERE epoch = ?1", [epoch])
+    assert {:ok, [[stamp]]} =
+             DB.query(DB, "SELECT cleanShutdownAt FROM boot_epochs WHERE epoch = ?1", [epoch])
+
     assert is_integer(stamp)
   end
 end

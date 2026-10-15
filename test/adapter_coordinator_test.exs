@@ -1253,12 +1253,14 @@ defmodule Tightbeam.AdapterCoordinatorTest do
 
   @tag timeout: 5_000
   test "adapter shutdown uses the application's remaining deadline", ctx do
-    coordinator = start_supervised!({AdapterCoordinator,
-      adapter_sup: ctx.sup,
-      db: ctx.db,
-      adapter_opts: fn _key, _context -> [] end,
-      name: :shared_shutdown_deadline_coordinator
-    })
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         db: ctx.db,
+         adapter_opts: fn _key, _context -> [] end,
+         name: :shared_shutdown_deadline_coordinator}
+      )
 
     :persistent_term.put({Tightbeam.Application, :draining}, true)
     deadline = System.monotonic_time(:millisecond) + 200
@@ -1268,9 +1270,10 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     started = System.monotonic_time(:millisecond)
 
     try do
-      log = ExUnit.CaptureLog.capture_log(fn ->
-        assert :ok = GenServer.stop(coordinator, :shutdown, 2_000)
-      end)
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert :ok = GenServer.stop(coordinator, :shutdown, 2_000)
+        end)
 
       assert System.monotonic_time(:millisecond) - started < 600
       assert log =~ "adapter shutdown"
