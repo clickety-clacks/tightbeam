@@ -232,13 +232,9 @@ defmodule Tightbeam.Acp.Adapter do
   # has always produced — is what puts the reason on the turn row. Every
   # adapter-boundary call the turn path makes goes through this.
   defp call(adapter, message, timeout) do
-    if session_operation?(message) do
-      budget = if timeout == :infinity, do: 60_000, else: timeout
-      deadline = System.monotonic_time(:millisecond) + budget
-      GenServer.call(adapter, {:session_operation, message, deadline}, budget + 2_000)
-    else
-      GenServer.call(adapter, message, timeout)
-    end
+    reply_timeout =
+      if session_operation?(message) and is_integer(timeout), do: timeout + 2_000, else: timeout
+    GenServer.call(adapter, message, reply_timeout)
   catch
     :exit, reason -> {:error, {:adapter_unavailable, unavailable_reason(reason)}}
   end
@@ -565,6 +561,18 @@ defmodule Tightbeam.Acp.Adapter do
 
   defp session_operation?(_message), do: false
 
+  defp operation_budget(message) do
+    case message do
+      {:new_session, _, _, _, _, :infinity} -> 60_000
+      {:load_session, _, _, _, _, _, :infinity} -> 60_000
+      {:apply_model, _, _, :infinity} -> 60_000
+      {:switch_model_session, _, _, _, _, _} -> @boot_boundary_timeout
+      {:close_session, _, _} -> 60_000
+      {:close_session, _} -> 60_000
+      _ -> 30_000
+    end
+  end
+
   defp operation_key(message) when elem(message, 0) in [:new_session, :new_candidate_session],
     do: make_ref()
 
@@ -579,7 +587,7 @@ defmodule Tightbeam.Acp.Adapter do
       session_operation?(message) ->
         deadline = case message do
           {:apply_model_strict, _, _, _, deadline} -> deadline
-          _ -> System.monotonic_time(:millisecond) + 60_000
+          _ -> System.monotonic_time(:millisecond) + operation_budget(message)
         end
         enqueue_operation(state, message, from, deadline)
 
