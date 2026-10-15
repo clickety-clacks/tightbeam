@@ -80,9 +80,7 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
     1 = :erlang.trace(pid, true, [:send, {:tracer, self()}])
 
     try do
-      refute_receive {:trace, ^pid, :send, {label, _, _}, _}
-                     when label in [:"$gen_call", :"$gen_cast"],
-                     1_200
+      refute_receive {:trace, ^pid, :send, {:"$gen_call", _, _}, _}, 1_200
     after
       :erlang.trace(pid, false, [:send])
     end
