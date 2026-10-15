@@ -52,60 +52,93 @@ defmodule Tightbeam.NoticeDrainTest do
   test "a NULL wake delivery stamp still deduplicates its committed turn", ctx do
     wake = notice(ctx.db)
 
-    assert {:ok, :ok} = DB.transaction(ctx.db, fn txn ->
-      assert {:appended, "recipient", _, _} =
-        Gateway.deliver_prompt_in_txn(txn, "recipient", wake.origin, wake.prompt,
-          wake_id: wake.wake_id, fire_wake_in_txn: true)
-      DB.Txn.q(txn, "UPDATE wakes SET deliveredTurnSeq=NULL WHERE wakeId=?1", [wake.wake_id])
-      assert {:duplicate, _} =
-        Gateway.deliver_prompt_in_txn(txn, "recipient", wake.origin, wake.prompt,
-          wake_id: wake.wake_id, fire_wake_in_txn: true)
-      :ok
-    end)
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               assert {:appended, "recipient", _, _} =
+                        Gateway.deliver_prompt_in_txn(txn, "recipient", wake.origin, wake.prompt,
+                          wake_id: wake.wake_id,
+                          fire_wake_in_txn: true
+                        )
 
-    assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT count(*) FROM turns WHERE wakeId=?1", [wake.wake_id])
+               DB.Txn.q(txn, "UPDATE wakes SET deliveredTurnSeq=NULL WHERE wakeId=?1", [
+                 wake.wake_id
+               ])
+
+               assert {:duplicate, _} =
+                        Gateway.deliver_prompt_in_txn(txn, "recipient", wake.origin, wake.prompt,
+                          wake_id: wake.wake_id,
+                          fire_wake_in_txn: true
+                        )
+
+               :ok
+             end)
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT count(*) FROM turns WHERE wakeId=?1", [wake.wake_id])
   end
 
   test "the next tick drains a newly due prompt and leaves future prompts pending", ctx do
     due = notice(ctx.db, System.system_time(:millisecond) + 60_000)
     future = notice(ctx.db, System.system_time(:millisecond) + 120_000)
-    scheduler = start_supervised!({Wakes,
-      db: ctx.db, name: :notice_due_scheduler, tick_ms: 60_000,
-      delivery_opts: ctx.delivery_opts, deliver: fn _ -> :ok end})
+
+    scheduler =
+      start_supervised!(
+        {Wakes,
+         db: ctx.db,
+         name: :notice_due_scheduler,
+         tick_ms: 60_000,
+         delivery_opts: ctx.delivery_opts,
+         deliver: fn _ -> :ok end}
+      )
 
     send(scheduler, :tick)
     :sys.get_state(scheduler)
     assert Wakes.get(ctx.db, due.wake_id).state == "pending"
-    assert {:ok, _} = DB.query(ctx.db, "UPDATE wakes SET dueAt=?2 WHERE wakeId=?1",
-      [due.wake_id, System.system_time(:millisecond) - 1])
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE wakes SET dueAt=?2 WHERE wakeId=?1", [
+               due.wake_id,
+               System.system_time(:millisecond) - 1
+             ])
+
     send(scheduler, :tick)
     :sys.get_state(scheduler)
     assert Wakes.get(ctx.db, due.wake_id).state == "fired"
     assert Wakes.get(ctx.db, future.wake_id).state == "pending"
-    assert {:ok, [[seq]]} = DB.query(ctx.db,
-      "SELECT deliveredTurnSeq FROM wakes WHERE wakeId=?1", [due.wake_id])
+
+    assert {:ok, [[seq]]} =
+             DB.query(ctx.db, "SELECT deliveredTurnSeq FROM wakes WHERE wakeId=?1", [due.wake_id])
+
     assert is_integer(seq)
   end
 
   test "a failed backfill logs and waits five seconds before retrying", ctx do
-    :ok = DB.execute(ctx.db, """
-    INSERT INTO wakes(wakeId,sessionKey,origin,prompt,dueAt,createdAt,state)
-    VALUES('backfill-error','recipient','process:test','old',1,1,'fired');
-    UPDATE wake_delivery_backfill SET afterRowid=0,
-      throughRowid=(SELECT MAX(rowid) FROM wakes),completedAt=NULL;
-    CREATE TRIGGER reject_backfill BEFORE UPDATE OF deliveredTurnSeq ON wakes
-    BEGIN SELECT RAISE(ABORT,'backfill test refusal'); END;
-    """)
+    :ok =
+      DB.execute(ctx.db, """
+      INSERT INTO wakes(wakeId,sessionKey,origin,prompt,dueAt,createdAt,state)
+      VALUES('backfill-error','recipient','process:test','old',1,1,'fired');
+      UPDATE wake_delivery_backfill SET afterRowid=0,
+        throughRowid=(SELECT MAX(rowid) FROM wakes),completedAt=NULL;
+      CREATE TRIGGER reject_backfill BEFORE UPDATE OF deliveredTurnSeq ON wakes
+      BEGIN SELECT RAISE(ABORT,'backfill test refusal'); END;
+      """)
 
     state = %{db: ctx.db}
-    log = ExUnit.CaptureLog.capture_log(fn ->
-      assert {:noreply, ^state} = Wakes.handle_info(:backfill_wake_delivery, state)
-    end)
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:noreply, ^state} = Wakes.handle_info(:backfill_wake_delivery, state)
+      end)
+
     assert log =~ "wake delivery backfill deferred for 5 seconds"
     refute_receive :backfill_wake_delivery, 200
     assert_receive :backfill_wake_delivery, 5_500
-    assert {:ok, [[0, nil]]} = DB.query(ctx.db,
-      "SELECT afterRowid,completedAt FROM wake_delivery_backfill")
+
+    assert {:ok, [[0, nil]]} =
+             DB.query(
+               ctx.db,
+               "SELECT afterRowid,completedAt FROM wake_delivery_backfill"
+             )
   end
 
   test "a busy backlog does not add database calls or preparation to a tick", ctx do

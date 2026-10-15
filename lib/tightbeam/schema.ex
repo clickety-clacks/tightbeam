@@ -3302,17 +3302,17 @@ defmodule Tightbeam.Schema do
         "AND old.deliveredTurnSeq=failed.seq"
       else
         """
-AND EXISTS (SELECT 1 FROM (SELECT t.seq AS turnSeq,t.wakeId AS sourceWakeId,t.assignmentId AS assignmentId,
+        AND EXISTS (SELECT 1 FROM (SELECT t.seq AS turnSeq,t.wakeId AS sourceWakeId,t.assignmentId AS assignmentId,
            0 AS carrier,NULL AS publicationSeq
-    FROM turns t WHERE t.wakeId IS NOT NULL
-    UNION ALL
-    SELECT t.seq,m.sourceWakeId,w.assignmentId,1,m.publicationSeq
-    FROM notice_batch_members m
-    JOIN notice_batches b ON b.batchId=m.batchId
-    JOIN wakes w ON w.wakeId=m.sourceWakeId
-    JOIN turns t ON t.wakeId=b.deliveryWakeId
-    WHERE m.state='included'
-    ) delivery
+        FROM turns t WHERE t.wakeId IS NOT NULL
+        UNION ALL
+        SELECT t.seq,m.sourceWakeId,w.assignmentId,1,m.publicationSeq
+        FROM notice_batch_members m
+        JOIN notice_batches b ON b.batchId=m.batchId
+        JOIN wakes w ON w.wakeId=m.sourceWakeId
+        JOIN turns t ON t.wakeId=b.deliveryWakeId
+        WHERE m.state='included'
+        ) delivery
           WHERE delivery.sourceWakeId=old.wakeId AND delivery.turnSeq=failed.seq
             AND delivery.assignmentId=w.assignmentId)
         """

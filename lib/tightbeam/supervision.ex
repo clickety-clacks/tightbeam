@@ -5874,21 +5874,21 @@ defmodule Tightbeam.Supervision do
 
   @doc false
   def transfer_candidate_sql do
-      """
-      WITH source_deliveries AS (#{Tightbeam.NoticeBatcher.recorded_deliveries_sql()})
-      SELECT t.seq,t.sessionKey,d.assignmentId,
-             w.wakeId,w.state,w.assignmentId,w.origin,w.createdAt,w.firedAt,
-             w.reresolve,w.reresolveSeed,w.reresolveRung,
-             sidecar.assignmentId,sidecar.controllerOrigin,sidecar.wakeKind,
-             sidecar.controllerState,sidecar.chargedGeneration,sidecar.transferEvidenceId
-      FROM source_deliveries d JOIN turns t ON t.seq=d.turnSeq
-      JOIN wakes w ON w.wakeId=d.sourceWakeId
-      LEFT JOIN supervision_liveness_sidecar sidecar ON sidecar.wakeId=w.wakeId
-      WHERE d.assignmentId=?1 AND w.assignmentId=?1
-        AND (?2 IS NULL OR t.seq=?2)
-        AND (w.reresolve='lineage' OR sidecar.wakeKind='escalation')
-      ORDER BY t.seq
-      """
+    """
+    WITH source_deliveries AS (#{Tightbeam.NoticeBatcher.recorded_deliveries_sql()})
+    SELECT t.seq,t.sessionKey,d.assignmentId,
+           w.wakeId,w.state,w.assignmentId,w.origin,w.createdAt,w.firedAt,
+           w.reresolve,w.reresolveSeed,w.reresolveRung,
+           sidecar.assignmentId,sidecar.controllerOrigin,sidecar.wakeKind,
+           sidecar.controllerState,sidecar.chargedGeneration,sidecar.transferEvidenceId
+    FROM source_deliveries d JOIN turns t ON t.seq=d.turnSeq
+    JOIN wakes w ON w.wakeId=d.sourceWakeId
+    LEFT JOIN supervision_liveness_sidecar sidecar ON sidecar.wakeId=w.wakeId
+    WHERE d.assignmentId=?1 AND w.assignmentId=?1
+      AND (?2 IS NULL OR t.seq=?2)
+      AND (w.reresolve='lineage' OR sidecar.wakeKind='escalation')
+    ORDER BY t.seq
+    """
   end
 
   defp potential_legacy_candidate?(

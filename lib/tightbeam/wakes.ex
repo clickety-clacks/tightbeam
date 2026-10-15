@@ -6497,7 +6497,8 @@ defmodule Tightbeam.Wakes do
       end)
       |> Enum.uniq()
       |> Enum.reject(fn recipient ->
-        Txn.q(txn,
+        Txn.q(
+          txn,
           "SELECT 1 FROM turns WHERE sessionKey=?1 AND status IN ('running','queued') LIMIT 1",
           [recipient]
         ) != []
