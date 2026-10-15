@@ -925,6 +925,16 @@ defmodule Tightbeam.DB do
   end
 
   @impl true
+  def handle_cast({:dispatch_audit, record, deadline}, %{conn: conn} = state) do
+    case commit_phase(conn, record, fenced_archetypes(state), deadline) do
+      {:ok, _} -> :ok
+      {:error, _} -> Logger.warning("dispatch audit could not be recorded")
+    end
+
+    {:noreply, state}
+  end
+
+  @impl true
   def handle_info({:DOWN, monitor, :process, owner, _reason}, %{reference_fences: fences} = state) do
     fences =
       Enum.reduce(fences, fences, fn {token, fence}, acc ->

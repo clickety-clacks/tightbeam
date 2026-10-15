@@ -62,6 +62,14 @@ defmodule Tightbeam.LifecycleRuntimeFixture do
         assert Enum.any?(details, &String.contains?(&1, "lifecycle_events_")),
                "#{file}: missing lifecycle index: #{inspect(plan)}"
       else
+        assert Enum.any?(details, &String.contains?(&1, "SEARCH")), inspect(plan)
+
+        assert Enum.any?(details, &String.contains?(&1, "USING INDEX")),
+               "#{file}: recorded cleanup lookup missing index: #{inspect(plan)}"
+
+        refute Enum.any?(details, &Regex.match?(~r/\bSCAN (?:wakes|w)\b/, &1)),
+               "#{file}: recorded cleanup lookup scans wakes: #{inspect(plan)}"
+
         refute Enum.any?(details, &String.contains?(&1, "lifecycle_events")),
                "#{file}: recorded cleanup lookup reads history: #{inspect(plan)}"
       end

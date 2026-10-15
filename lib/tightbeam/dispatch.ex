@@ -421,9 +421,9 @@ defmodule Tightbeam.Dispatch do
   # A handler that wrote already has its audit row, written in its own
   # transaction (`DBObservation.audit_in_txn/2`); the outcome completes that
   # row. Any other outcome gets its own row. A read's "verb" row carries no
-  # content. The audit rides in the publication transaction, which already
-  # commits before the response, or in one short bounded transaction; it is
-  # a side task and never fails the committed result.
+  # content. Denials audit in the publication transaction. Outcomes known only
+  # after the handler returns complete asynchronously, so an audit never delays
+  # a committed result.
   defp append_event_with_handoff(db, kind, verb, origin, session_key, payload, principal, handoff) do
     audited = Process.delete(:tightbeam_dispatch_audited)
 
@@ -464,11 +464,10 @@ defmodule Tightbeam.Dispatch do
           handoff.(txn)
         end)
     else
-      unless DB.overloaded?(db) do
-        case DB.transaction_until(db, record, System.monotonic_time(:millisecond) + 2_000) do
-          {:ok, _} -> :ok
-          {:error, _} -> Logger.warning("dispatch audit for #{verb} could not be recorded")
-        end
+      if DB.overloaded?(db) do
+        Logger.warning("dispatch audit for #{verb} skipped: database overloaded")
+      else
+        GenServer.cast(db, {:dispatch_audit, record, System.monotonic_time(:millisecond) + 2_000})
       end
     end
 
