@@ -1414,8 +1414,14 @@ defmodule Tightbeam.SupervisionTest do
 
     [identity, json] = String.split(wake.obligation_ref, "\n", parts: 2)
     group = identity |> String.split("|") |> hd() |> String.replace_prefix("idle-cleanup-v1:", "")
+
     for token <- JSON.decode!(json)["members"] |> Map.values() do
-      {:ok, _} = DB.query(db, "UPDATE idle_cleanup_state SET lastDeliveredAt=?1 WHERE groupDigest=?2 AND memberToken=?3", [System.system_time(:millisecond) - 61_000, group, token])
+      {:ok, _} =
+        DB.query(
+          db,
+          "UPDATE idle_cleanup_state SET lastDeliveredAt=?1 WHERE groupDigest=?2 AND memberToken=?3",
+          [System.system_time(:millisecond) - 61_000, group, token]
+        )
     end
   end
 
