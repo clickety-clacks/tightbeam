@@ -41,6 +41,7 @@ defmodule Tightbeam.WorkspaceCleanupTest do
       wake_tick_ms: 1_000,
       workspace_cleanup_runner: &WorkspaceCleanup.system_runner/3
     }
+
     workspace = Placement.workdir_path(config, session)
     File.mkdir_p!(workspace)
     %{db: db, base: base, config: config, session: session, workspace: workspace}
@@ -158,6 +159,7 @@ defmodule Tightbeam.WorkspaceCleanupTest do
     home = Artifacts.get(ctx.db, artifact.artifact_id).home
     assert String.starts_with?(home, archive <> "/")
     assert File.read!(home) == "preserve across devices"
+
     if archive_parent == "/dev/shm" do
       assert File.stat!(ctx.base).major_device != File.stat!(archive).major_device
     end
