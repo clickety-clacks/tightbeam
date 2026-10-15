@@ -706,6 +706,43 @@ defmodule Tightbeam.WakesTest do
     end
   end
 
+  test "a busy wake scheduler does not turn a committed wake into an error response", %{db: db} do
+    active_sessions!(db, ["k1"])
+    scheduler = :"busy_scheduler_#{System.unique_integer([:positive])}"
+    test_pid = self()
+
+    # Accepts the post-commit nudge and never answers, like a scheduler stuck
+    # in a long tick.
+    busy =
+      spawn_link(fn ->
+        Process.register(self(), scheduler)
+        send(test_pid, :busy_ready)
+
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    assert_receive :busy_ready
+    on_exit(fn -> send(busy, :stop) end)
+
+    handler = Tightbeam.Gateway.handlers(%{db: db, wake_scheduler: scheduler})["wake"]
+
+    {response, log} =
+      with_log(fn ->
+        handler.(%{
+          origin: "user:flynn",
+          principal: {:user, "flynn"},
+          session_key: "k1",
+          params: %{prompt: "committed before the nudge", after_ms: 0}
+        })
+      end)
+
+    assert %{wake_id: wake_id} = response
+    assert %{state: "pending", prompt: "committed before the nudge"} = Wakes.get(db, wake_id)
+    assert log =~ "wake scheduler nudge after a committed write did not complete"
+  end
+
   defp active_sessions!(db, keys) do
     values =
       keys

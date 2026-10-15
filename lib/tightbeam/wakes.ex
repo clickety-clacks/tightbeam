@@ -6247,6 +6247,28 @@ defmodule Tightbeam.Wakes do
   end
 
   @doc """
+  Post-commit nudge for request paths. Runs `fire_due/1`, but a scheduler that
+  is absent, busy past the call timeout, or crashing only logs: the write it
+  follows has already committed, and its caller must still get the success
+  response. Undelivered wakes stay pending for the scheduler's next tick.
+  """
+  @spec nudge_due(GenServer.server()) :: :ok
+  def nudge_due(server \\ Tightbeam.WakeScheduler) do
+    fire_due(server)
+  catch
+    :exit, {:noproc, _call} ->
+      :ok
+
+    :exit, reason ->
+      Logger.warning(
+        "wake scheduler nudge after a committed write did not complete; " <>
+          "due wakes stay pending for the next tick: #{inspect(reason)}"
+      )
+
+      :ok
+  end
+
+  @doc """
   Eagerly evaluate condition wakes for the fact(s) that just committed.
 
   A caller that filed SEVERAL facts in one transaction passes them as one
