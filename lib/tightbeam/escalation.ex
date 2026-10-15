@@ -4481,7 +4481,7 @@ defmodule Tightbeam.Escalation do
 
   defp nudge(opts, fact_ids) do
     if Keyword.has_key?(opts, :scheduler) do
-      Wakes.fire_matching(Keyword.fetch!(opts, :scheduler), fact_ids)
+      Wakes.nudge_matching(Keyword.fetch!(opts, :scheduler), fact_ids)
     else
       :ok
     end

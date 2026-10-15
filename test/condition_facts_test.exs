@@ -430,6 +430,41 @@ defmodule Tightbeam.ConditionFactsTest do
     refute_receive {:fire_matching, _}
   end
 
+  test "a busy scheduler does not turn a committed fact into an error", ctx do
+    test_pid = self()
+
+    # Accepts the post-commit nudge and never answers, like a scheduler stuck
+    # in a long tick.
+    busy =
+      spawn_link(fn ->
+        send(test_pid, :busy_ready)
+
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    assert_receive :busy_ready
+    on_exit(fn -> send(busy, :stop) end)
+
+    {filed, log} =
+      ExUnit.CaptureLog.with_log(fn ->
+        ConditionFacts.file(ctx.db, busy, %{
+          kind: "busy-kind",
+          scope: "prod",
+          origin: "process:ci"
+        })
+      end)
+
+    assert %{fact_id: fact_id} = filed
+    assert is_integer(fact_id)
+
+    assert {:ok, [["busy-kind", "prod"]]} =
+             DB.query(ctx.db, "SELECT kind, scope FROM condition_facts WHERE id=?1", [fact_id])
+
+    assert log =~ "condition nudge after a committed fact did not complete"
+  end
+
   test "eager evaluation cannot skip an older committed fact when a newer fact exists", ctx do
     older_wake = condition_wake(ctx, "older-kind", "prod")
     newer_wake = condition_wake(ctx, "newer-kind", "prod")

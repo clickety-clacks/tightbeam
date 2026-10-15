@@ -1803,13 +1803,13 @@ defmodule Tightbeam.EscalationTest do
     request =
       Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "nudge loss?"}))
 
-    assert catch_exit(
-             Escalation.operator_rule(
-               ctx.db,
-               owner_operator_rule(request.id, %{decision: "accept"}),
-               scheduler: :missing_terminal_scheduler
-             )
-           )
+    # The ruling has committed; a missing scheduler loses only the nudge and
+    # never turns the committed ruling into an exit.
+    Escalation.operator_rule(
+      ctx.db,
+      owner_operator_rule(request.id, %{decision: "accept"}),
+      scheduler: :missing_terminal_scheduler
+    )
 
     assert {:ok, [["ruled", fact_id, wake_id, "pending", "condition", fired_at]]} =
              DB.query(
