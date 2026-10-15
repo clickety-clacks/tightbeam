@@ -12,9 +12,8 @@ recorded, the task goes to a worker in a standing lane, whose orchestrator carri
 a batch of small items; when a lane backs up, add another. Watch for this; no fixed threshold decides it. Moving an existing worker into a lane requires the supported owner-authorized
 reparent capability and preservation of its open obligations; use the installed
 command help and verify accepted custody rather than inferring it from a new card.
-An installed admission refusal goes to its responsible owner for resolution
-under the engineering core's Evidence rule, not around the supported seam; do
-not make a preferred workflow an acceptance condition.
+Installed admission rules still apply; take a refusal you believe is defective
+to its responsible owner, not around the supported seam.
 
 Staff the PO's same-item plan through lanes: a PDO opens one coordination assignment
 per lane, and each lane orchestrator opens, receives and reviews its workers',
