@@ -80,7 +80,13 @@ if config_env() != :test do
   end
 
   if value = System.get_env("TIGHTBEAM_RETENTION_DAYS") do
-    config :tightbeam, :retention_days, String.to_integer(value)
+    days =
+      case Integer.parse(value) do
+        {days, ""} -> days
+        _ -> value
+      end
+
+    config :tightbeam, :retention_days, days
   end
 
   if value = System.get_env("TIGHTBEAM_DB_CALL_TIMEOUT_MS") do
