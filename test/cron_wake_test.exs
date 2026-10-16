@@ -196,12 +196,10 @@ defmodule Tightbeam.CronWakeTest do
          delivery_opts: ctx.delivery_opts}
       )
 
-    monitor = Process.monitor(scheduler)
-
     # Move only the stored deadline forward to exercise the actual single timer.
     due = System.system_time(:millisecond) + 200
     {:ok, []} = DB.query(ctx.db, "UPDATE wakes SET dueAt=?2 WHERE wakeId=?1", [wake.wake_id, due])
-    send(scheduler, {:schedule_changed, due})
+    GenServer.cast(scheduler, {:schedule_changed, due})
 
     assert_eventually(fn ->
       {:ok, [[count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
@@ -214,11 +212,6 @@ defmodule Tightbeam.CronWakeTest do
     assert content =~ "check progress"
     assert content =~ "status-query"
     assert Wakes.get(ctx.db, wake.wake_id).state == "pending"
-    assert Process.alive?(scheduler), inspect(receive do
-      {:DOWN, ^monitor, :process, ^scheduler, reason} -> reason
-    after
-      0 -> :no_down_message
-    end)
     assert :sys.get_state(scheduler).deadline == Wakes.get(ctx.db, wake.wake_id).due_at
   end
 
