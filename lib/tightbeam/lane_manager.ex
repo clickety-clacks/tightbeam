@@ -133,6 +133,12 @@ defmodule Tightbeam.LaneManager do
     {:noreply, %{state | lanes: Map.put(state.lanes, pid, {ref, session_key, seq})}}
   end
 
+  def handle_cast({:ensure_lane, session_key}, state) do
+    ensure(state, session_key)
+    SessionLane.nudge(session_key)
+    {:noreply, state}
+  end
+
   @impl true
   def handle_info(:tick, state) do
     schedule(state.interval)
@@ -186,7 +192,12 @@ defmodule Tightbeam.LaneManager do
       # Re-publish terminals whose publication may have been lost to a crash —
       # to the WIRE, not just the ledger: without frames, a client whose turn
       # died with the gateway keeps a stuck typing indicator forever.
-      for %{seq: seq} = row <- Ledger.unpublished_terminals(state.db) do
+      for %{seq: seq} = row <- Ledger.unpublished_terminals(state.db),
+          not detect or System.system_time(:millisecond) - row.ended_at >= 10_000 do
+        state.terminal_publisher.(row)
+        Ledger.mark_published(state.db, seq)
+        state.on_terminal.(row.session_key, seq)
+
         if detect,
           do:
             Tightbeam.SchedulerMisses.record(
@@ -194,10 +205,6 @@ defmodule Tightbeam.LaneManager do
               seq,
               max(0, System.system_time(:millisecond) - row.ended_at)
             )
-
-        state.terminal_publisher.(row)
-        Ledger.mark_published(state.db, seq)
-        state.on_terminal.(row.session_key, seq)
       end
     end)
   end

@@ -926,6 +926,7 @@ defmodule Tightbeam.Productions.BubbleTest do
     Tightbeam.Productions.BubbleSweeper.sweep_now(sweeper)
     assert Tightbeam.SchedulerMisses.count() == before
 
+    :sys.replace_state(sweeper, &%{&1 | boot_at: System.system_time(:millisecond) - 120_000})
     missed = fail_turn!(ctx.db, "holder")
 
     DB.query(ctx.db, "UPDATE turns SET endedAt=?1 WHERE seq=?2", [
@@ -962,7 +963,27 @@ defmodule Tightbeam.Productions.BubbleTest do
     assert Tightbeam.SchedulerMisses.count() == before_restart
   end
 
-  test "bubble misses skip boot and recent terminals and count a failed turn once", ctx do
+  test "startup recovery beyond one batch never counts as a runtime miss", ctx do
+    for _ <- 1..205 do
+      seq = fail_turn!(ctx.db, "holder")
+      DB.query(ctx.db, "UPDATE turns SET endedAt=?1 WHERE seq=?2", [
+        System.system_time(:millisecond) - 120_000, seq
+      ])
+    end
+
+    before = Tightbeam.SchedulerMisses.count()
+    sweeper = start_supervised!({Tightbeam.Productions.BubbleSweeper,
+      db: ctx.db, name: :startup_bubble_sweeper})
+    :sys.get_state(sweeper)
+    for _ <- 1..4, do: Tightbeam.Productions.BubbleSweeper.sweep_now(sweeper)
+    assert {:ok, [[0]]} = DB.query(ctx.db, """
+      SELECT COUNT(*) FROM turns t WHERE t.endedAt IS NOT NULL
+        AND t.seq > COALESCE((SELECT seq FROM production_cursors WHERE name='bubble'),0)
+    """)
+    assert Tightbeam.SchedulerMisses.count() == before
+  end
+
+  test "bubble misses skip boot, recent terminals and failed repairs", ctx do
     old = fail_turn!(ctx.db, "holder")
 
     DB.query(ctx.db, "UPDATE turns SET endedAt=?1 WHERE seq=?2", [
@@ -990,7 +1011,7 @@ defmodule Tightbeam.Productions.BubbleTest do
         for _ <- 1..3, do: Tightbeam.Productions.BubbleSweeper.sweep_now(:miss_bubble_sweeper)
       end)
 
-    assert length(Regex.scan(~r/loop=bubble record=#{old}\b/, log)) == 1
+    refute log =~ "loop=bubble record=#{old}"
     refute log =~ "loop=bubble record=#{recent}"
   end
 

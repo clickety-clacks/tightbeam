@@ -449,6 +449,15 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
     assert NoticeBatcher.source_refs(ctx.db, source.wake_id) == []
     :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
 
+    # A due wake that just became receivable is normal event-path work.
+    send(pid, :detect_misses)
+    :sys.get_state(pid)
+    assert Tightbeam.SchedulerMisses.count() == ctx.misses_before
+    assert NoticeBatcher.source_refs(ctx.db, source.wake_id) == []
+    {:ok, _} = DB.query(ctx.db, "UPDATE turns SET endedAt=?1 WHERE seq=?2", [
+      System.system_time(:millisecond) - 61_000, turn.seq
+    ])
+
     log =
       capture_log(fn ->
         send(pid, :detect_misses)

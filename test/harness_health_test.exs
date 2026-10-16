@@ -32,6 +32,17 @@ defmodule Tightbeam.HarnessHealthTest do
     "message" => "Internal error: You've hit your weekly limit · resets Aug 15, 12am (UTC)"
   }
 
+  defmodule RecoveryLane do
+    use GenServer
+    def start_link(args), do: GenServer.start_link(__MODULE__, args, name: Tightbeam.LaneManager)
+    def init(args), do: {:ok, args}
+    def handle_cast({:ensure_lane, key}, {db, parent} = state) do
+      {:ok, rows} = DB.query(db, "SELECT seq FROM turns WHERE sessionKey=?1 AND status='queued'", [key])
+      send(parent, {:recovery_lane, key, rows})
+      {:noreply, state}
+    end
+  end
+
   setup do
     db = :"harness_health_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
@@ -2149,7 +2160,12 @@ defmodule Tightbeam.HarnessHealthTest do
                  "WHERE sourceMessageId='single-session-source'"
              )
 
+    start_supervised!({RecoveryLane, {ctx.db, self()}})
     restoration = restore_health_turn!(ctx.db, healthy.session, "single-session-restoration")
+    assert_receive {:recovery_lane, key, [[redelivery_seq]]}
+    assert key == failed.session
+    assert is_integer(redelivery_seq)
+
 
     assert {:ok,
             [
