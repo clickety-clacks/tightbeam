@@ -3704,6 +3704,7 @@ defmodule Tightbeam.Wakes do
           if Txn.changes(txn) != 1,
             do: raise("health redelivery attempt lost its enqueue")
 
+          Txn.handoff(txn, Tightbeam.LaneManager, {:ensure_lane, session_key})
           1
 
         {:error, :no_session} ->
@@ -8066,7 +8067,25 @@ defmodule Tightbeam.Wakes do
                      txn,
                      "SELECT 1 FROM turns WHERE sessionKey=?1 AND status IN ('running','queued') LIMIT 1",
                      [recipient]
-                   ) == [], do: [{wake, recipient}], else: []
+                   ) == [] do
+                  last_ended =
+                    case Txn.q(
+                           txn,
+                           "SELECT endedAt FROM turns WHERE sessionKey=?1 AND endedAt IS NOT NULL ORDER BY seq DESC LIMIT 1",
+                           [recipient]
+                         ) do
+                      [[ended_at]] -> ended_at
+                      [] -> wake.due_at
+                    end
+
+                  eligible_at = max(wake.due_at, last_ended)
+
+                  if eligible_at < at - @miss_lateness_ms,
+                    do: [{wake, recipient, eligible_at}],
+                    else: []
+                else
+                  []
+                end
 
               nil ->
                 []
@@ -8082,17 +8101,39 @@ defmodule Tightbeam.Wakes do
         end)
       end)
 
-    for {wake, recipient} <- candidates,
-        not MapSet.member?(state.detected_misses, wake.wake_id) do
-      Logger.warning(
-        "wake scheduler miss wake=#{wake.wake_id} kind=#{wake.condition_kind || wake.wait_mode || wake.consumer} late_ms=#{at - wake.due_at}"
-      )
-
-      Tightbeam.SchedulerMisses.record(:wake, wake.wake_id, max(0, at - wake.due_at))
-
+    for {wake, recipient, eligible_at} <- candidates do
       try do
-        deliver_eligible_waits(state.db, state.delivery_opts, recipient)
-        NoticeBatcher.recover(state.db, at, state.delivery_opts, recipient)
+        # The event path may have delivered or occupied the recipient since sampling.
+        ready =
+          transaction!(state.db, fn txn ->
+            Txn.q(
+              txn,
+              """
+              SELECT 1 FROM wakes WHERE wakeId=?1 AND state='pending' AND deliveredTurnSeq IS NULL
+                AND NOT EXISTS (SELECT 1 FROM turns WHERE sessionKey=?2 AND status IN ('running','queued'))
+                AND NOT EXISTS (SELECT 1 FROM turns WHERE sessionKey=?2 AND endedAt>?3)
+              """,
+              [wake.wake_id, recipient, at - @miss_lateness_ms]
+            ) != []
+          end)
+
+        if ready do
+          deliver_eligible_waits(state.db, state.delivery_opts, recipient)
+          NoticeBatcher.recover(state.db, at, state.delivery_opts, recipient)
+
+          if match?(
+               {:ok, [[seq]]} when is_integer(seq),
+               DB.query(state.db, "SELECT deliveredTurnSeq FROM wakes WHERE wakeId=?1", [
+                 wake.wake_id
+               ])
+             ) do
+            Logger.warning(
+              "wake scheduler miss wake=#{wake.wake_id} kind=#{wake.condition_kind || wake.wait_mode || wake.consumer} late_ms=#{at - eligible_at}"
+            )
+
+            Tightbeam.SchedulerMisses.record(:wake, wake.wake_id, max(0, at - eligible_at))
+          end
+        end
       rescue
         error ->
           Logger.error(
@@ -8101,12 +8142,7 @@ defmodule Tightbeam.Wakes do
       end
     end
 
-    detected =
-      Enum.reduce(candidates, MapSet.new(), fn {wake, _}, set ->
-        MapSet.put(set, wake.wake_id)
-      end)
-
-    state = %{state | detected_misses: detected}
+    state = %{state | detected_misses: MapSet.new()}
     if candidates != [], do: run_due(state), else: state
   end
 

@@ -45,7 +45,7 @@ defmodule Tightbeam.Productions.BubbleSweeper do
       recognized: MapSet.new(),
       missed: MapSet.new(),
       failures: %{},
-      first_pass: true
+      boot_at: System.system_time(:millisecond)
     }
 
     # Boot IS a sweep: whatever terminalized while no sweeper was alive —
@@ -107,21 +107,22 @@ defmodule Tightbeam.Productions.BubbleSweeper do
 
     {count, state} =
       Enum.reduce(rows, {0, state}, fn [seq, ended_at], {count, state} ->
-        state =
-          if not state.first_pass and ended_at < cutoff and not MapSet.member?(state.missed, seq) do
-            Tightbeam.SchedulerMisses.record(
-              :bubble,
-              seq,
-              max(0, System.system_time(:millisecond) - ended_at)
-            )
-
-            %{state | missed: MapSet.put(state.missed, seq)}
-          else
-            state
-          end
-
         case recognize_one(state.db, seq) do
           :ok ->
+            state =
+              if ended_at >= state.boot_at and ended_at < cutoff and
+                   not MapSet.member?(state.missed, seq) do
+                Tightbeam.SchedulerMisses.record(
+                  :bubble,
+                  seq,
+                  max(0, System.system_time(:millisecond) - ended_at)
+                )
+
+                %{state | missed: MapSet.put(state.missed, seq)}
+              else
+                state
+              end
+
             {count + 1,
              %{
                state
@@ -150,7 +151,7 @@ defmodule Tightbeam.Productions.BubbleSweeper do
         end
       end)
 
-    {count, advance_cursor(%{state | first_pass: false})}
+    {count, advance_cursor(state)}
   end
 
   defp advance_cursor(state) do
