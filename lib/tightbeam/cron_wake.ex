@@ -157,6 +157,11 @@ defmodule Tightbeam.CronWake do
             :ok
           end)
       rescue
+        error in DB.Overloaded -> reraise error, __STACKTRACE__
+        error in MatchError ->
+          if match?({:error, %DB.Overloaded{}}, error.term),
+            do: reraise(error, __STACKTRACE__),
+            else: Logger.warning("cron wake #{id} deferred: #{Exception.message(error)}")
         error -> Logger.warning("cron wake #{id} deferred: #{Exception.message(error)}")
       end
     end)

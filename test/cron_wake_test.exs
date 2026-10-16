@@ -2,6 +2,15 @@ defmodule Tightbeam.CronWakeTest do
   use Tightbeam.TestCase, async: false
   alias Tightbeam.{CronWake, DB, Gateway, Schema, Wakes}
 
+  defmodule OverloadedDB do
+    use GenServer
+    def start_link(db), do: GenServer.start_link(__MODULE__, db)
+    def init(db), do: {:ok, db}
+    def handle_call({:transaction, _fun}, _from, db),
+      do: {:reply, {:error, %DB.Overloaded{}}, db}
+    def handle_call(request, _from, db), do: {:reply, GenServer.call(db, request), db}
+  end
+
   setup do
     db = start_supervised!({DB, path: ":memory:", name: nil})
     :ok = ensure_all_schemas(db)
@@ -145,6 +154,18 @@ defmodule Tightbeam.CronWakeTest do
              DB.query(db, "SELECT COUNT(*) FROM wakes WHERE consumer='prompt' AND digest=0")
 
     assert Wakes.get(db, wake.wake_id).due_at == CronWake.next_at("*/30 * * * *", at)
+  end
+
+  test "R1.2 overload defers the scheduler pass and preserves the armed wake", %{db: db} do
+    wake = schedule(db)
+    :ok = DB.execute(db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [wake.wake_id])
+    proxy = start_supervised!({OverloadedDB, db})
+    at = System.system_time(:millisecond)
+    assert :deferred == DB.background_pass(fn -> CronWake.fire_due(proxy, at) end, :deferred)
+    assert Wakes.get(db, wake.wake_id).due_at == 0
+    CronWake.fire_due(db, at)
+    assert Wakes.get(db, wake.wake_id).due_at > at
+    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM wakes WHERE consumer='prompt' AND digest=0")
   end
 
   test "R1.3 existing scheduler timer delivers the firing with recipient prompt and class", ctx do

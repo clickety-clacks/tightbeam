@@ -4108,11 +4108,48 @@ mod tests {
     #[test]
     fn cron_wake_preserves_schedule_and_rejects_other_triggers() {
         assert_eq!(
-            body(&["wake", "--session", "recipient", "--prompt", "check", "--cron", "*/30 * * * *", "--class", "status-query"]),
+            body(&[
+                "wake",
+                "--session",
+                "recipient",
+                "--prompt",
+                "check",
+                "--cron",
+                "*/30 * * * *",
+                "--class",
+                "status-query"
+            ]),
             r#"{"verb":"wake","sessionKey":"recipient","params":{"prompt":"check","cron":"*/30 * * * *","class":"status-query"}}"#
         );
-        for flag in ["--after", "--at", "--when-fact", "--predicate", "--after-turn", "--assignment", "--replace-queued", "--fallback-after"] {
-            assert!(crate::args::parse(["wake", "--session", "recipient", "--prompt", "check", "--cron", "0 * * * *", flag, "1"].iter().map(|s| s.to_string()).collect()).is_err());
+        for flag in [
+            "--after",
+            "--at",
+            "--when-fact",
+            "--predicate",
+            "--after-turn",
+            "--assignment",
+            "--replace-queued",
+            "--fallback-after",
+        ] {
+            assert!(
+                crate::args::parse(
+                    [
+                        "wake",
+                        "--session",
+                        "recipient",
+                        "--prompt",
+                        "check",
+                        "--cron",
+                        "0 * * * *",
+                        flag,
+                        "1"
+                    ]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect()
+                )
+                .is_err()
+            );
         }
     }
 

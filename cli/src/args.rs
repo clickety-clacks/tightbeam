@@ -1784,8 +1784,21 @@ fn parse_with_optional_catalog(
             if flags.get("cron").is_some_and(String::is_empty) {
                 return Err("--cron requires a five-field schedule".to_owned());
             }
-            if cron.is_some() && ["after", "at", "fallback-after", "when-fact", "when-scope", "predicate", "after-turn", "assignment", "replace-queued"]
-                .iter().any(|flag| flags.contains_key(*flag)) {
+            if cron.is_some()
+                && [
+                    "after",
+                    "at",
+                    "fallback-after",
+                    "when-fact",
+                    "when-scope",
+                    "predicate",
+                    "after-turn",
+                    "assignment",
+                    "replace-queued",
+                ]
+                .iter()
+                .any(|flag| flags.contains_key(*flag))
+            {
                 return Err("--cron cannot be combined with another trigger".to_owned());
             }
             let at = nonempty(flags, "at").map(|value| js_number_json(number_coercion(&value)));
@@ -6284,7 +6297,7 @@ mod tests {
                     prompt: "go".to_owned(),
                     after_ms: Some("30000".to_owned()),
                     at: Some("123".to_owned()),
-                cron: None,
+                    cron: None,
                     condition_kind: None,
                     condition_scope: None,
                     predicate: None,
