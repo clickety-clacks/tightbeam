@@ -302,6 +302,7 @@ defmodule Tightbeam.SupervisionTest do
     assignment(ctx.db, "asg_peer", other.session_key, "peer", 2)
     peer_seq = terminal!(ctx.db, other.session_key)
     Supervision.classify_terminal(ctx.db, peer_seq)
+    Supervision.evaluate(ctx.db, ctx.handlers, 2, other.session_key, peer_seq)
 
     DB.query(
       ctx.db,
@@ -316,11 +317,10 @@ defmodule Tightbeam.SupervisionTest do
     Process.cancel_timer(armed.deadline_timer)
     Supervision.handle_info({:timeout, armed.deadline_timer, :supervision_due}, armed)
 
-    assert {:ok, [[2]]} =
-             DB.query(ctx.db, """
-               SELECT COUNT(*) FROM supervision_entitlements
-               WHERE assignmentId IN ('asg_1','asg_peer') AND lastAttemptGeneration=1
-             """)
+    for id <- ["asg_1", "asg_peer"] do
+      assert %{attemptCount: 1, prodCount: 1} = Supervision.prod_state(ctx.db, id)
+      assert Enum.any?(Wakes.list_pending(ctx.db), &(&1.assignment_id == id))
+    end
   end
 
   test "deadline passes bound their work and keep the remaining overdue work armed", ctx do
