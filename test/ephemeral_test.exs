@@ -60,8 +60,8 @@ defmodule Tightbeam.EphemeralTest do
       assert {:ok, _} = DB.transaction(db, &Ephemeral.stamp_in_txn(&1, key, "caller"))
       assert {:ok, seq} = enqueue(db, key)
       assert {:error, :ephemeral_turn_used} = enqueue(db, key)
-      assert {:ok, _} = Ledger.claim_next(db, key, "test")
-      assert :ok = Ledger.finish(db, seq, terminal)
+      assert {:ok, turn} = Ledger.claim_next(db, key, "test")
+      assert :ok = Ledger.finish(db, seq, terminal, nil, owner_lease: turn.owner_lease)
       assert Org.get(db, key).state == "retired"
       assert :already_terminal = Ledger.finish(db, seq, terminal)
       assert {:error, :ephemeral_turn_used} = enqueue(db, key)

@@ -580,34 +580,30 @@ defmodule Tightbeam.Placement do
     if config[:db] && Tightbeam.Ephemeral.session?(config.db, holder_session.session_key) do
       "/"
     else
-      ensure_holder_workdir(config, holder_session)
+      host = fetch_session_host!(config, holder_session)
+      path = workdir_path(config, holder_session)
+
+      url =
+        if host.ssh == nil,
+          do: "http://127.0.0.1:#{config.port}",
+          else: Application.fetch_env!(:tightbeam, :advertised_url)
+
+      content =
+        JSON.encode!(%{
+          url: url,
+          token: holder_session.cli_token,
+          sessionKey: holder_session.session_key
+        })
+
+      ensure_opts = [base_dir: config.base_dir]
+      ensure_opts = if config[:sh], do: Keyword.put(ensure_opts, :sh, config.sh), else: ensure_opts
+
+      ensure_opts =
+        if config[:sh_out], do: Keyword.put(ensure_opts, :sh_out, config.sh_out), else: ensure_opts
+
+      ensure_workdir(host, path, content, ensure_opts)
+      path
     end
-  end
-
-  defp ensure_holder_workdir(config, holder_session) do
-    host = fetch_session_host!(config, holder_session)
-    path = workdir_path(config, holder_session)
-
-    url =
-      if host.ssh == nil,
-        do: "http://127.0.0.1:#{config.port}",
-        else: Application.fetch_env!(:tightbeam, :advertised_url)
-
-    content =
-      JSON.encode!(%{
-        url: url,
-        token: holder_session.cli_token,
-        sessionKey: holder_session.session_key
-      })
-
-    ensure_opts = [base_dir: config.base_dir]
-    ensure_opts = if config[:sh], do: Keyword.put(ensure_opts, :sh, config.sh), else: ensure_opts
-
-    ensure_opts =
-      if config[:sh_out], do: Keyword.put(ensure_opts, :sh_out, config.sh_out), else: ensure_opts
-
-    ensure_workdir(host, path, content, ensure_opts)
-    path
   end
 
   @doc "Materialize one already-resolved identity snapshot at the session's exact cwd."
