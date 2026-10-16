@@ -188,6 +188,16 @@ defmodule Tightbeam.EphemeralTest do
     assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
   end
 
+  test "R2.1-R2.5 additive migration preserves existing 0.1.9 sessions", %{db: db} do
+    Tightbeam.SchemaShapeRuntimeFixture.downgrade_ephemeral!(db)
+    assert {:ok, before_rows} = DB.query(db, "SELECT * FROM sessions ORDER BY sessionKey")
+    assert :ok = Schema.ensure_all(db)
+    assert :ok = Schema.ensure_all(db)
+    assert {:ok, ^before_rows} = DB.query(db, "SELECT * FROM sessions ORDER BY sessionKey")
+    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM ephemeral_sessions")
+    assert {:ok, [[0]]} = DB.query(db, "SELECT id FROM ephemeral_migration")
+  end
+
   @tag :tmp_dir
   test "R2.1-R2.5 additive migration follows the 0.1.8 predecessor upgrade", %{tmp_dir: tmp} do
     prepared = Tightbeam.GuardRuntimeFixture.prepare!(Path.join(tmp, "payload"), "schema_shape_runtime.exs")
