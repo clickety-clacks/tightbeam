@@ -179,7 +179,10 @@ defmodule Tightbeam.Dispatch do
 
   defp dispatch_through_rail(db, handlers, call, verb, origin, principal, session_key) do
     {decision, to_close, to_consume} =
-      if Tightbeam.Ephemeral.read_only?(db, call), do: {:allow, [], []}, else: Rules.decide(db, call)
+      if Tightbeam.Ephemeral.read_only?(db, call),
+        do: {:allow, [], []},
+        else: Rules.decide(db, call)
+
     Enum.each(to_close, &close(db, &1))
 
     case decision do

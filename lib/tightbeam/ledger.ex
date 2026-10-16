@@ -211,7 +211,8 @@ defmodule Tightbeam.Ledger do
       Org.sync_mechanical_status_in_txn(txn, session_key)
       {:ok, seq}
     else
-      {:error, if(session_exists_in_txn?(txn, session_key), do: :ephemeral_turn_used, else: :no_session)}
+      {:error,
+       if(session_exists_in_txn?(txn, session_key), do: :ephemeral_turn_used, else: :no_session)}
     end
   end
 

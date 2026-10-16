@@ -3451,10 +3451,24 @@ defmodule Tightbeam.GatewayTest do
     assert %{session_key: key} = spawn.(call)
     assert Tightbeam.Ephemeral.caller(ctx.db, key) == "k1"
     assert Org.get(ctx.db, key).handle == nil
-    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM assignments WHERE holderKey=?1", [key])
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM assignments WHERE holderKey=?1", [key])
+
     assert %{session_key: ^key} = spawn.(call)
-    assert %{code: "ephemeral_requires_caller"} = spawn.(%{call | origin: "user:flynn", params: %{params | idempotency_key: "no-caller"}})
-    assert %{code: "ephemeral_obligation"} = spawn.(%{call | params: Map.merge(params, %{idempotency_key: "bound", handle: "bound"})})
+
+    assert %{code: "ephemeral_requires_caller"} =
+             spawn.(%{
+               call
+               | origin: "user:flynn",
+                 params: %{params | idempotency_key: "no-caller"}
+             })
+
+    assert %{code: "ephemeral_obligation"} =
+             spawn.(%{
+               call
+               | params: Map.merge(params, %{idempotency_key: "bound", handle: "bound"})
+             })
   end
 
   test "spawn --name creates a bound role and role_exists rolls back the session", ctx do

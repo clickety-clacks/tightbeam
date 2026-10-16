@@ -87,12 +87,17 @@ defmodule Tightbeam.Ephemeral do
   # R2.2: the terminal CAS owns retirement, including failed and canceled turns.
   def retire_in_txn(txn, key) do
     if session?(txn, key) do
-      Txn.q(txn, """
-      UPDATE sessions SET state='retired', mechanicalStatus='idle', updatedAt=MAX(updatedAt+1,?2)
-      WHERE sessionKey=?1 AND state='active'
-      """, [key, System.system_time(:millisecond)])
+      Txn.q(
+        txn,
+        """
+        UPDATE sessions SET state='retired', mechanicalStatus='idle', updatedAt=MAX(updatedAt+1,?2)
+        WHERE sessionKey=?1 AND state='active'
+        """,
+        [key, System.system_time(:millisecond)]
+      )
 
       session = Org.get_in_txn(txn, key)
+
       Tightbeam.Firehose.Publisher.committed_in_txn(txn, "session.retired", session, %{
         "sessionKey" => key
       })

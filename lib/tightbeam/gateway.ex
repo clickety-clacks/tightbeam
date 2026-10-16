@@ -3504,9 +3504,13 @@ defmodule Tightbeam.Gateway do
           # losing runner must not append assistant messages before that CAS.
           record_in_txn = fn txn ->
             replies = append_assistant_messages_in_txn(txn, turn, echo, result, attention_tier)
+
             Tightbeam.Ephemeral.return_in_txn(
-              txn, turn.session_key, List.last(assistant_message_texts(result))
+              txn,
+              turn.session_key,
+              List.last(assistant_message_texts(result))
             )
+
             Tightbeam.ReminderDelivery.delivered_in_txn(txn, turn.seq)
 
             health_publication =
@@ -4741,7 +4745,8 @@ defmodule Tightbeam.Gateway do
 
     guidance =
       if session[:ephemeral] do
-        guidance <> "\n\nYou are an ephemeral inspection helper. Read and inspect only. " <>
+        guidance <>
+          "\n\nYou are an ephemeral inspection helper. Read and inspect only. " <>
           "Do not edit files, change state, write artifacts or records, or spawn helpers. " <>
           "Return your report as your final message. You retire after this turn. " <>
           "For CLI reads set TIGHTBEAM_URL=#{inspect(Application.get_env(:tightbeam, :advertised_url) || "http://127.0.0.1:#{config.port}")} " <>
@@ -7334,7 +7339,10 @@ defmodule Tightbeam.Gateway do
         %{code: "ephemeral_requires_caller", message: "ephemeral spawns require a calling agent"}
 
       %{ephemeral: true} when is_map_key(p, :handle) or is_map_key(p, :work_item_id) ->
-        %{code: "ephemeral_obligation", message: "ephemeral spawns cannot bind roles or work items"}
+        %{
+          code: "ephemeral_obligation",
+          message: "ephemeral spawns cannot bind roles or work items"
+        }
 
       archetype ->
         override_result =
@@ -7713,7 +7721,9 @@ defmodule Tightbeam.Gateway do
 
                       if archetype.ephemeral do
                         Tightbeam.Ephemeral.stamp_in_txn(
-                          txn, session.session_key, caller.caller_session.session_key
+                          txn,
+                          session.session_key,
+                          caller.caller_session.session_key
                         )
                       end
 
