@@ -577,6 +577,14 @@ defmodule Tightbeam.Placement do
   def holder_workdir(_config, %{ephemeral: true}), do: "/"
 
   def holder_workdir(config, holder_session) do
+    if config[:db] && Tightbeam.Ephemeral.session?(config.db, holder_session.session_key) do
+      "/"
+    else
+      ensure_holder_workdir(config, holder_session)
+    end
+  end
+
+  defp ensure_holder_workdir(config, holder_session) do
     host = fetch_session_host!(config, holder_session)
     path = workdir_path(config, holder_session)
 

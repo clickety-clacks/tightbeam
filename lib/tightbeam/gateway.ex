@@ -4483,7 +4483,6 @@ defmodule Tightbeam.Gateway do
   end
 
   defp harness_session(config, db, adapter, generation, session, turn_seq) do
-    session = Map.put(session, :ephemeral, Tightbeam.Ephemeral.session?(db, session.session_key))
     cwd = Placement.holder_workdir(config, session)
     mcp_servers = mcp_servers_for_archetype(session.archetype)
     harness = Harness.parse!(session.harness).id()
@@ -4730,6 +4729,8 @@ defmodule Tightbeam.Gateway do
   end
 
   defp served_snapshot(config, session, harness, revision) do
+    session = Map.put(session, :ephemeral, Tightbeam.Ephemeral.session?(config.db, session.session_key))
+
     config
     |> complete_session_snapshot(session, harness, revision)
     |> then(fn snapshot ->

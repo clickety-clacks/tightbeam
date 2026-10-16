@@ -53,8 +53,8 @@ defmodule Tightbeam.EphemeralTest do
 
       :ok =
         DB.execute(db, """
-        INSERT INTO sessions(sessionKey,displayName,ownerUserId,origin,archetype,harness,provider,createdAt,updatedAt)
-        VALUES('#{key}','helper','owner','user:owner','default','claude','anthropic',1,1)
+        INSERT INTO sessions(sessionKey,displayName,ownerUserId,origin,archetype,harness,provider,model,createdAt,updatedAt)
+        VALUES('#{key}','helper','owner','user:owner','default','claude','anthropic','fable',1,1)
         """)
 
       assert {:ok, _} = DB.transaction(db, &Ephemeral.stamp_in_txn(&1, key, "caller"))
@@ -69,6 +69,14 @@ defmodule Tightbeam.EphemeralTest do
 
     assert {:ok, _} = enqueue(db, "ordinary")
     assert {:ok, _} = enqueue(db, "ordinary")
+  end
+
+  test "R2.2 recovery retires an interrupted helper instead of rerunning it", %{db: db} do
+    assert {:ok, seq} = enqueue(db, "helper")
+    assert {:ok, _turn} = Ledger.claim_next(db, "helper", "interrupted")
+    assert [^seq] = Ledger.recover_running(db)
+    assert Org.get(db, "helper").state == "retired"
+    assert {:error, :ephemeral_turn_used} = enqueue(db, "helper")
   end
 
   test "R2.3 rejects assignment and card ownership through insert and update", %{db: db} do
@@ -140,8 +148,8 @@ defmodule Tightbeam.EphemeralTest do
   end
 
   test "R2.4 no owned workdir is created", %{db: db} do
-    helper = Org.get(db, "helper") |> Map.put(:ephemeral, true)
-    assert Placement.holder_workdir(%{}, helper) == "/"
+    helper = Org.get(db, "helper")
+    assert Placement.holder_workdir(%{db: db}, helper) == "/"
   end
 
   test "R2.5 final result targets the exact spawning agent", %{db: db} do

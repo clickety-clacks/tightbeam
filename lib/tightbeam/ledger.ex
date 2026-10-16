@@ -878,7 +878,6 @@ defmodule Tightbeam.Ledger do
       Publisher.turn_in_txn(txn, "turn.ended", seq)
       [[session_key]] = Txn.q(txn, "SELECT sessionKey FROM turns WHERE seq = ?1", [seq])
       Org.sync_mechanical_status_in_txn(txn, session_key)
-      Tightbeam.Ephemeral.retire_in_txn(txn, session_key)
     end
 
     won
@@ -1443,6 +1442,8 @@ defmodule Tightbeam.Ledger do
         nil -> detail
         evidence -> Map.put(detail, :prewrite, evidence)
       end
+
+    Tightbeam.Ephemeral.retire_turn_in_txn(txn, seq)
 
     TurnLifecycle.append_in_txn(txn, seq, %{
       event_key: "terminal:committed",
