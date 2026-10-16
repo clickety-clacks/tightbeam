@@ -232,7 +232,9 @@ defmodule Tightbeam.Ledger do
   end
 
   defp ephemeral_turn_available?(txn, session_key) do
-    Txn.q(txn, "SELECT 1 FROM ephemeral_sessions WHERE sessionKey=?1 AND turnUsed=1", [session_key]) == []
+    Txn.q(txn, "SELECT 1 FROM ephemeral_sessions WHERE sessionKey=?1 AND turnUsed=1", [
+      session_key
+    ]) == []
   end
 
   @doc "Convenience: enqueue outside an existing transaction."

@@ -596,10 +596,14 @@ defmodule Tightbeam.Placement do
         })
 
       ensure_opts = [base_dir: config.base_dir]
-      ensure_opts = if config[:sh], do: Keyword.put(ensure_opts, :sh, config.sh), else: ensure_opts
 
       ensure_opts =
-        if config[:sh_out], do: Keyword.put(ensure_opts, :sh_out, config.sh_out), else: ensure_opts
+        if config[:sh], do: Keyword.put(ensure_opts, :sh, config.sh), else: ensure_opts
+
+      ensure_opts =
+        if config[:sh_out],
+          do: Keyword.put(ensure_opts, :sh_out, config.sh_out),
+          else: ensure_opts
 
       ensure_workdir(host, path, content, ensure_opts)
       path

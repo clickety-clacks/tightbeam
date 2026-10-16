@@ -49,11 +49,15 @@ defmodule Tightbeam.Ephemeral do
   end
 
   def stamp_in_txn(txn, key, caller) do
-    Txn.q(txn, "INSERT INTO ephemeral_sessions(sessionKey,callerSessionKey,createdAt) VALUES(?1,?2,?3)", [
-      key,
-      caller,
-      System.system_time(:millisecond)
-    ])
+    Txn.q(
+      txn,
+      "INSERT INTO ephemeral_sessions(sessionKey,callerSessionKey,createdAt) VALUES(?1,?2,?3)",
+      [
+        key,
+        caller,
+        System.system_time(:millisecond)
+      ]
+    )
   end
 
   def caller(db, key) do
