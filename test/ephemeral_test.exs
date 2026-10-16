@@ -69,12 +69,15 @@ defmodule Tightbeam.EphemeralTest do
       assert wake.session_key == "caller"
       assert is_binary(wake.prompt)
 
-      assert wake.prompt =~ case(terminal) do
-        "delivered" -> "completed"
-        "canceled" -> "canceled"
-        "failed_unknown" -> "recovered"
-        "failed" -> "failed"
-      end
+      summary =
+        case terminal do
+          "delivered" -> "completed"
+          "canceled" -> "canceled"
+          "failed_unknown" -> "recovered"
+          "failed" -> "failed"
+        end
+
+      assert wake.prompt =~ summary
 
       assert :already_terminal = Ledger.finish(db, seq, terminal)
       assert Wakes.get(db, "ephemeral-result:" <> key) == wake
