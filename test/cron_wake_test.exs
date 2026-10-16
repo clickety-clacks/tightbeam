@@ -262,4 +262,34 @@ defmodule Tightbeam.CronWakeTest do
     assert :ok = Schema.ensure_all(db)
     assert {:ok, [[0, ^at]]} = DB.query(db, "SELECT * FROM cron_wake_migration")
   end
+
+  test "failed cron migration logs the error and lets boot finish without committing", %{db: db} do
+    :ok =
+      DB.execute(db, """
+      DROP TABLE cron_wake_schedules;
+      DELETE FROM cron_wake_migration;
+      CREATE TRIGGER fail_cron_migration BEFORE INSERT ON cron_wake_migration
+      BEGIN
+        SELECT RAISE(ABORT, 'cron migration rejected');
+      END;
+      """)
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert :ok = Schema.ensure_all(db)
+      end)
+
+    assert log =~ "cron unavailable: schema migration failed:"
+    assert log =~ "cron migration rejected"
+    assert {:ok, []} = DB.query(db, "SELECT * FROM cron_wake_migration")
+
+    assert {:ok, []} =
+             DB.query(db, "SELECT name FROM sqlite_master WHERE name='cron_wake_schedules'")
+
+    :ok = DB.execute(db, "DROP TRIGGER fail_cron_migration")
+    assert :ok = Schema.ensure_all(db)
+    assert {:ok, [[0, at]]} = DB.query(db, "SELECT * FROM cron_wake_migration")
+    assert :ok = Schema.ensure_all(db)
+    assert {:ok, [[0, ^at]]} = DB.query(db, "SELECT * FROM cron_wake_migration")
+  end
 end

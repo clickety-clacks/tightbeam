@@ -5,7 +5,7 @@ defmodule Tightbeam.CronWake do
   require Logger
 
   def ensure_schema(db) do
-    {:ok, :ok} =
+    result =
       DB.transaction(db, fn txn ->
         Txn.exec(txn, """
         CREATE TABLE IF NOT EXISTS cron_wake_migration (
@@ -30,7 +30,10 @@ defmodule Tightbeam.CronWake do
         :ok
       end)
 
-    :ok
+    case result do
+      {:ok, :ok} -> :ok
+      {:error, error} -> {:error, error}
+    end
   end
 
   def valid?(schedule) do
