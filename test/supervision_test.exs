@@ -327,7 +327,7 @@ defmodule Tightbeam.SupervisionTest do
     name = start_liveness!(ctx, sweep_ms: 60_000, name: Supervision)
     state = :sys.get_state(name)
 
-    for index <- 1..258 do
+    for index <- 1..34 do
       id = "bounded_deadline_#{index}"
       assignment(ctx.db, id, "holder", "bounded deadline", index)
       insert_entitlement!(ctx.db, id, generation: 1, due_at: 0)
@@ -341,7 +341,7 @@ defmodule Tightbeam.SupervisionTest do
         %{state | deadline_timer: ref}
       )
 
-    assert {:ok, [[256]]} =
+    assert {:ok, [[32]]} =
              DB.query(ctx.db, """
                SELECT COUNT(*) FROM supervision_entitlements
                WHERE assignmentId LIKE 'bounded_deadline_%' AND generation=2
@@ -354,7 +354,7 @@ defmodule Tightbeam.SupervisionTest do
     {:noreply, next} =
       Supervision.handle_info({:timeout, armed.deadline_timer, :supervision_due}, armed)
 
-    assert {:ok, [[258]]} =
+    assert {:ok, [[34]]} =
              DB.query(ctx.db, """
                SELECT COUNT(*) FROM supervision_entitlements
                WHERE assignmentId LIKE 'bounded_deadline_%' AND generation=2

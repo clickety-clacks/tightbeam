@@ -4182,7 +4182,7 @@ defmodule Tightbeam.Supervision do
       MapSet.member?(rebased, id) or owner_child_prod_active_in_txn?(txn, holder) or
         due_gate?(txn, id, holder)
     end)
-    |> Enum.take(256)
+    |> Enum.take(32)
     |> Enum.reduce([], fn
       [
         assignment_id,
