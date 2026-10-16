@@ -2103,6 +2103,13 @@ defmodule Tightbeam.Assignments do
         # optional probe seam drives a concurrent disposition between the checks.
         assert_work_item_open!(txn, call, work_item_id)
 
+        if Tightbeam.Ephemeral.session?(txn, call.session_key) do
+          throw(
+            {:delivery_owner_error,
+             error("ephemeral_obligation", "ephemeral sessions cannot hold assignments")}
+          )
+        end
+
         id = id("asg_")
         now = now()
         {opened_user, opened_session} = opener(call.principal)

@@ -663,7 +663,16 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
     :ok
   end
 
+  def downgrade_ephemeral!(db) do
+    assert :ok =
+             DB.execute(db, """
+             DROP TABLE IF EXISTS ephemeral_sessions;
+             DROP TABLE IF EXISTS ephemeral_migration;
+             """)
+  end
+
   def downgrade_notice_source_storage!(db) do
+    downgrade_ephemeral!(db)
     downgrade_supervision_recorded_state!(db)
 
     case DB.query(db, "SELECT shape FROM schema_stamp") do

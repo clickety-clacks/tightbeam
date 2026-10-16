@@ -1683,6 +1683,12 @@ defmodule Tightbeam.Supervision do
   end
 
   defp evaluate_with_interval(db, handlers, n, session_key, terminal_seq, interval) do
+    if Tightbeam.Ephemeral.session?(db, session_key),
+      do: :idle,
+      else: evaluate_ordinary(db, handlers, n, session_key, terminal_seq, interval)
+  end
+
+  defp evaluate_ordinary(db, handlers, n, session_key, terminal_seq, interval) do
     case drain(db, handlers, session_key) do
       {:pending, result} ->
         result
@@ -4467,6 +4473,7 @@ defmodule Tightbeam.Supervision do
          include_future \\ false
        ) do
     with true <- session.state == "active" and not session.built_in,
+         false <- Tightbeam.Ephemeral.session?(txn, session.session_key),
          true <- idle_cleanup_enabled?(session.archetype),
          [] <-
            Txn.q(

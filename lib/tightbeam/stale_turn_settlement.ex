@@ -333,6 +333,7 @@ defmodule Tightbeam.StaleTurnSettlement do
           at: now
         })
 
+        Tightbeam.Ephemeral.retire_turn_in_txn(txn, request.turn_seq)
         Publisher.turn_in_txn(txn, "turn.ended", request.turn_seq)
         Org.sync_mechanical_status_in_txn(txn, request.session_key)
 
