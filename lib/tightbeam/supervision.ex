@@ -3805,7 +3805,7 @@ defmodule Tightbeam.Supervision do
         claim_due_in_txn(txn, evaluation_clock, rebased, state.n, session_key)
       end)
 
-    Enum.each(outcome, fn holder ->
+    Enum.each(Enum.reverse(outcome), fn holder ->
       drain(state.db, state.handlers, holder)
     end)
   end

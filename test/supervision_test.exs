@@ -323,6 +323,45 @@ defmodule Tightbeam.SupervisionTest do
              """)
   end
 
+  test "deadline passes bound their work and keep the remaining overdue work armed", ctx do
+    name = start_liveness!(ctx, sweep_ms: 60_000, name: Supervision)
+    state = :sys.get_state(name)
+
+    for index <- 1..258 do
+      id = "bounded_deadline_#{index}"
+      assignment(ctx.db, id, "holder", "bounded deadline", index)
+      insert_entitlement!(ctx.db, id, generation: 1, due_at: 0)
+    end
+
+    ref = make_ref()
+    {:noreply, armed} =
+      Supervision.handle_info(
+        {:timeout, ref, :supervision_due},
+        %{state | deadline_timer: ref}
+      )
+
+    assert {:ok, [[256]]} =
+             DB.query(ctx.db, """
+               SELECT COUNT(*) FROM supervision_entitlements
+               WHERE assignmentId LIKE 'bounded_deadline_%' AND generation=2
+             """)
+
+    assert armed.deadline == 0
+    assert is_reference(armed.deadline_timer)
+    Process.cancel_timer(armed.deadline_timer)
+
+    {:noreply, next} =
+      Supervision.handle_info({:timeout, armed.deadline_timer, :supervision_due}, armed)
+
+    assert {:ok, [[258]]} =
+             DB.query(ctx.db, """
+               SELECT COUNT(*) FROM supervision_entitlements
+               WHERE assignmentId LIKE 'bounded_deadline_%' AND generation=2
+             """)
+
+    Process.cancel_timer(next.deadline_timer)
+  end
+
   test "a bad cleanup record does not stop other sessions or deadline scheduling", ctx do
     idle_cleanup_fixture!(ctx, ["bad-cleanup", "healthy-cleanup"])
 
