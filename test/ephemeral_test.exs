@@ -213,7 +213,15 @@ defmodule Tightbeam.EphemeralTest do
     tmp_dir: tmp
   } do
     assert {:ok, _} = Placement.register_host(db, "testhost", %{ssh: nil, base_dir: tmp})
-    config = %{db: db, base_dir: tmp}
+    owner = self()
+
+    sh = fn [command | args] ->
+      result = System.cmd(command, args, stderr_to_stdout: true)
+      if command == "rm", do: send(owner, {:directory_removed, List.last(args)})
+      result
+    end
+
+    config = %{db: db, base_dir: tmp, sh: sh}
     helper = Org.get(db, "helper")
 
     path =
@@ -225,13 +233,96 @@ defmodule Tightbeam.EphemeralTest do
         path
       end)
 
+    assert_receive {:directory_removed, ^path}, 1_000
     refute File.exists?(path)
 
-    Placement.with_turn_directory(config, helper, fn ->
-      next = Placement.holder_workdir(config, helper)
-      refute next == path
-      assert File.ls!(next) == []
-    end)
+    next =
+      Placement.with_turn_directory(config, helper, fn ->
+        next = Placement.holder_workdir(config, helper)
+        refute next == path
+        assert File.ls!(next) == []
+        next
+      end)
+
+    assert_receive {:directory_removed, ^next}, 1_000
+    refute File.exists?(next)
+  end
+
+  @tag :tmp_dir
+  test "cleanup failure preserves the runner result and exception", %{db: db, tmp_dir: tmp} do
+    assert {:ok, _} = Placement.register_host(db, "testhost", %{ssh: nil, base_dir: tmp})
+    helper = Org.get(db, "helper")
+    owner = self()
+
+    sh = fn
+      ["mktemp" | _] ->
+        {"/tmp/helper-cleanup-fixture\n", 0}
+
+      ["rm", "-rf", "--", "/tmp/helper-cleanup-fixture"] ->
+        send(owner, {:cleanup_attempted, self()})
+        {"removal failed", 1}
+    end
+
+    config = %{db: db, base_dir: tmp, sh: sh}
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:ok, :runner_result} ==
+                 Placement.with_turn_directory(config, helper, fn -> {:ok, :runner_result} end)
+
+        assert_receive {:cleanup_attempted, cleaner}, 1_000
+        ref = Process.monitor(cleaner)
+        assert_receive {:DOWN, ^ref, :process, ^cleaner, reason}, 1_000
+        assert reason in [:normal, :noproc]
+
+        assert_raise RuntimeError, "runner failure", fn ->
+          Placement.with_turn_directory(config, helper, fn -> raise "runner failure" end)
+        end
+
+        assert_receive {:cleanup_attempted, failed_cleaner}, 1_000
+        failed_ref = Process.monitor(failed_cleaner)
+        assert_receive {:DOWN, ^failed_ref, :process, ^failed_cleaner, failed_reason}, 1_000
+        assert failed_reason in [:normal, :noproc]
+      end)
+
+    assert log =~ "Ephemeral temporary directory cleanup failed for helper"
+    assert log =~ "/tmp/helper-cleanup-fixture"
+    assert log =~ "removal failed"
+  end
+
+  @tag :tmp_dir
+  test "the cleaner retains ownership when the runner process dies", %{db: db, tmp_dir: tmp} do
+    assert {:ok, _} = Placement.register_host(db, "testhost", %{ssh: nil, base_dir: tmp})
+    helper = Org.get(db, "helper")
+    owner = self()
+
+    sh = fn
+      ["mktemp" | _] ->
+        {"/tmp/helper-owner-death-fixture\n", 0}
+
+      ["rm", "-rf", "--", "/tmp/helper-owner-death-fixture"] ->
+        send(owner, :owner_death_cleanup)
+        {"", 0}
+    end
+
+    config = %{db: db, base_dir: tmp, sh: sh}
+
+    runner =
+      spawn(fn ->
+        Placement.with_turn_directory(config, helper, fn ->
+          send(owner, :runner_started)
+
+          receive do
+            :finish -> :ok
+          end
+        end)
+      end)
+
+    ref = Process.monitor(runner)
+    assert_receive :runner_started, 1_000
+    Process.exit(runner, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^runner, :killed}, 1_000
+    assert_receive :owner_death_cleanup, 1_000
   end
 
   test "R2.5 final result targets the exact spawning agent", %{db: db} do

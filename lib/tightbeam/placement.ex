@@ -644,7 +644,21 @@ defmodule Tightbeam.Placement do
             {:DOWN, ^monitor, :process, ^owner, _} -> :ok
           end
 
-          run.(["rm", "-rf", "--", path])
+          Process.demonitor(monitor, [:flush])
+
+          try do
+            run.(["rm", "-rf", "--", path])
+          rescue
+            error ->
+              Logger.warning(
+                "Ephemeral temporary directory cleanup failed for #{session.session_key} at #{path}: #{Exception.message(error)}"
+              )
+          catch
+            kind, reason ->
+              Logger.warning(
+                "Ephemeral temporary directory cleanup failed for #{session.session_key} at #{path}: #{kind} #{inspect(reason)}"
+              )
+          end
         end)
 
       path =
@@ -659,15 +673,11 @@ defmodule Tightbeam.Placement do
         fun.()
       after
         Process.delete({__MODULE__, :turn_directory})
+
+        # Teardown must not replace or delay the runner's terminal result.
+        # The unlinked cleaner retains ownership, including after owner death.
+        Process.demonitor(ref, [:flush])
         send(cleaner, :cleanup)
-
-        receive do
-          {:DOWN, ^ref, :process, ^cleaner, :normal} ->
-            :ok
-
-          {:DOWN, ^ref, :process, ^cleaner, reason} ->
-            exit({:temporary_directory_cleanup_failed, reason})
-        end
       end
     else
       fun.()

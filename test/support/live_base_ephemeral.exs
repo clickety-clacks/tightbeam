@@ -47,6 +47,27 @@ defmodule EphemeralRuntime do
       {:ok, adapter} = AdapterStub.start_link(self())
       {:ok, coordinator} = CoordinatorStub.start_link({adapter, self()})
 
+      owner = self()
+
+      sh = fn [command | args] ->
+        if command == "rm" do
+          send(owner, {:cleanup_started, self()})
+
+          receive do
+            :finish_cleanup -> :ok
+          after
+            10_000 -> :ok
+          end
+
+          System.cmd(command, args, stderr_to_stdout: true)
+          {"cleanup transport failed", 1}
+        else
+          System.cmd(command, args, stderr_to_stdout: true)
+        end
+      end
+
+      config = Map.put(config, :sh, sh)
+
       try do
         {Tightbeam.LaneManager, opts} =
           Gateway.children(config) |> Enum.find(&match?({Tightbeam.LaneManager, _}, &1))
@@ -73,6 +94,9 @@ defmodule EphemeralRuntime do
         assert_receive {:prompt_started, ^adapter}, 60_000
         send(adapter, :continue_prompt)
         assert {:ok, %{record_in_txn: record}} = Task.await(task)
+        assert_receive {:cleanup_started, cleaner}, 1_000
+        assert Process.alive?(cleaner)
+        cleanup_ref = Process.monitor(cleaner)
         assert :ok = Tightbeam.GatewayTurnFixture.commit_success!(db, turn, record)
 
         assert Org.get(db, "helper").state == "retired"
@@ -97,6 +121,18 @@ defmodule EphemeralRuntime do
 
         assert {:ok, returned} = Ledger.claim_next(db, "caller", "test")
         assert returned.prompt =~ "SECOND"
+
+        # The actual final text and terminal retirement commit before teardown finishes.
+        assert {:ok, [[1]]} =
+                 DB.query(db, "SELECT COUNT(*) FROM wakes WHERE wakeId='ephemeral-result:helper'")
+
+        send(cleaner, :finish_cleanup)
+        assert_receive {:DOWN, ^cleanup_ref, :process, ^cleaner, :normal}, 1_000
+        assert Org.get(db, "helper").state == "retired"
+        assert Wakes.get(db, "ephemeral-result:helper").prompt == result.prompt
+
+        assert {:ok, [[1]]} =
+                 DB.query(db, "SELECT COUNT(*) FROM wakes WHERE wakeId='ephemeral-result:helper'")
       after
         GenServer.stop(coordinator)
         GenServer.stop(adapter)
