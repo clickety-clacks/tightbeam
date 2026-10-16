@@ -163,7 +163,7 @@ defmodule Tightbeam.Ledger do
     now = System.system_time(:millisecond)
     session_key = Map.fetch!(attrs, :session_key)
 
-    if session_exists_in_txn?(txn, session_key) do
+    if session_exists_in_txn?(txn, session_key) and ephemeral_turn_available?(txn, session_key) do
       Txn.q(
         txn,
         """
@@ -211,7 +211,7 @@ defmodule Tightbeam.Ledger do
       Org.sync_mechanical_status_in_txn(txn, session_key)
       {:ok, seq}
     else
-      {:error, :no_session}
+      {:error, if(session_exists_in_txn?(txn, session_key), do: :ephemeral_turn_used, else: :no_session)}
     end
   end
 
@@ -223,10 +223,15 @@ defmodule Tightbeam.Ledger do
   """
   @spec enqueueable_in_txn?(Txn.t(), String.t()) :: boolean()
   def enqueueable_in_txn?(%Txn{} = txn, session_key),
-    do: session_exists_in_txn?(txn, session_key)
+    do: session_exists_in_txn?(txn, session_key) and ephemeral_turn_available?(txn, session_key)
 
   defp session_exists_in_txn?(%Txn{} = txn, session_key) do
     Txn.q(txn, "SELECT 1 FROM sessions WHERE sessionKey = ?1", [session_key]) != []
+  end
+
+  defp ephemeral_turn_available?(txn, session_key) do
+    not Tightbeam.Ephemeral.session?(txn, session_key) or
+      Txn.q(txn, "SELECT 1 FROM turns WHERE sessionKey=?1 LIMIT 1", [session_key]) == []
   end
 
   @doc "Convenience: enqueue outside an existing transaction."
@@ -872,6 +877,7 @@ defmodule Tightbeam.Ledger do
       Publisher.turn_in_txn(txn, "turn.ended", seq)
       [[session_key]] = Txn.q(txn, "SELECT sessionKey FROM turns WHERE seq = ?1", [seq])
       Org.sync_mechanical_status_in_txn(txn, session_key)
+      Tightbeam.Ephemeral.retire_in_txn(txn, session_key)
     end
 
     won

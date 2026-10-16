@@ -3437,6 +3437,26 @@ defmodule Tightbeam.GatewayTest do
     )
   end
 
+  test "R2.1-R2.3 ephemeral spawn stamps its caller without a role or work item", ctx do
+    base_dir = role_test_base("ephemeral-spawn")
+    dir = Path.join([base_dir, "identity", "archetypes"])
+    File.mkdir_p!(dir)
+    File.write!(Path.join(dir, "helper.toml"), "name = \"helper\"\nephemeral = true\n")
+    Archetypes.load!(base_dir)
+    ensure_global_registry()
+    Roles.create!(ctx.db, "caller", "flynn", "k1")
+    spawn = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["spawn"]
+    params = %{display_name: "Inspect", archetype: "helper", idempotency_key: "ephemeral-spawn"}
+    call = %{origin: "agent:caller", session_key: nil, params: params}
+    assert %{session_key: key} = spawn.(call)
+    assert Tightbeam.Ephemeral.caller(ctx.db, key) == "k1"
+    assert Org.get(ctx.db, key).handle == nil
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM assignments WHERE holderKey=?1", [key])
+    assert %{session_key: ^key} = spawn.(call)
+    assert %{code: "ephemeral_requires_caller"} = spawn.(%{call | origin: "user:flynn", params: %{params | idempotency_key: "no-caller"}})
+    assert %{code: "ephemeral_obligation"} = spawn.(%{call | params: Map.merge(params, %{idempotency_key: "bound", handle: "bound"})})
+  end
+
   test "spawn --name creates a bound role and role_exists rolls back the session", ctx do
     base_dir = role_test_base("spawn")
     Archetypes.load!(base_dir)

@@ -1776,6 +1776,7 @@ defmodule Tightbeam.Schema do
     :ok = migrate_supervision_recorded_state(db)
     :ok = ensure_hot_query_indexes(db)
     :ok = migrate_retired_workspace_cleanup(db)
+    :ok = Tightbeam.Ephemeral.migrate(db)
 
     :ok = Tightbeam.Recognition.ensure_schema(db)
 

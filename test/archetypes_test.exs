@@ -14,6 +14,16 @@ defmodule Tightbeam.ArchetypesTest do
     %{base_dir: base_dir}
   end
 
+  test "R2.1 ephemeral is optional and must be boolean" do
+    refute Archetypes.builtin_default().ephemeral
+    refute Archetypes.parse_manifest!("name = \"helper\"", "helper.toml").ephemeral
+    assert Archetypes.parse_manifest!("name = \"helper\"\nephemeral = true", "helper.toml").ephemeral
+
+    assert_raise ArgumentError, ~r/ephemeral must be a boolean/, fn ->
+      Archetypes.parse_manifest!("name = \"helper\"\nephemeral = \"true\"", "helper.toml")
+    end
+  end
+
   test "initialization seeds only the neutral served identity tree once", ctx do
     assert Archetypes.init_identity!(ctx.base_dir) == :initialized
     identity_dir = Path.join(ctx.base_dir, "identity")

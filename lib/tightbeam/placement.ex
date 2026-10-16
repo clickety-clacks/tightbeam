@@ -574,6 +574,8 @@ defmodule Tightbeam.Placement do
   durable scratch across engine swaps.
   """
   @spec holder_workdir(map(), map()) :: String.t()
+  def holder_workdir(_config, %{ephemeral: true}), do: "/"
+
   def holder_workdir(config, holder_session) do
     host = fetch_session_host!(config, holder_session)
     path = workdir_path(config, holder_session)

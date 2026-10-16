@@ -3504,6 +3504,9 @@ defmodule Tightbeam.Gateway do
           # losing runner must not append assistant messages before that CAS.
           record_in_txn = fn txn ->
             replies = append_assistant_messages_in_txn(txn, turn, echo, result, attention_tier)
+            Tightbeam.Ephemeral.return_in_txn(
+              txn, turn.session_key, List.last(assistant_message_texts(result))
+            )
             Tightbeam.ReminderDelivery.delivered_in_txn(txn, turn.seq)
 
             health_publication =
@@ -4476,6 +4479,7 @@ defmodule Tightbeam.Gateway do
   end
 
   defp harness_session(config, db, adapter, generation, session, turn_seq) do
+    session = Map.put(session, :ephemeral, Tightbeam.Ephemeral.session?(db, session.session_key))
     cwd = Placement.holder_workdir(config, session)
     mcp_servers = mcp_servers_for_archetype(session.archetype)
     harness = Harness.parse!(session.harness).id()
@@ -4724,12 +4728,27 @@ defmodule Tightbeam.Gateway do
   defp served_snapshot(config, session, harness, revision) do
     config
     |> complete_session_snapshot(session, harness, revision)
-    |> then(&Placement.materialize_identity(config, session, &1))
+    |> then(fn snapshot ->
+      if session[:ephemeral],
+        do: snapshot,
+        else: Placement.materialize_identity(config, session, snapshot)
+    end)
   end
 
   defp complete_session_snapshot(config, session, harness, revision) do
     snapshot = Identity.snapshot_at!(config.base_dir, revision, session.archetype, harness)
     guidance = append_transcript_self_inspection(snapshot.guidance, session.session_key)
+
+    guidance =
+      if session[:ephemeral] do
+        guidance <> "\n\nYou are an ephemeral inspection helper. Read and inspect only. " <>
+          "Do not edit files, change state, write artifacts or records, or spawn helpers. " <>
+          "Return your report as your final message. You retire after this turn. " <>
+          "For CLI reads set TIGHTBEAM_URL=#{inspect(Application.get_env(:tightbeam, :advertised_url) || "http://127.0.0.1:#{config.port}")} " <>
+          "and TIGHTBEAM_TOKEN=#{inspect(session.cli_token)} in the command environment."
+      else
+        guidance
+      end
 
     %{
       snapshot
@@ -7311,6 +7330,12 @@ defmodule Tightbeam.Gateway do
       nil ->
         %{code: "unknown_archetype", message: "no such archetype: #{archetype_name}"}
 
+      %{ephemeral: true} when is_nil(caller.caller_session) ->
+        %{code: "ephemeral_requires_caller", message: "ephemeral spawns require a calling agent"}
+
+      %{ephemeral: true} when is_map_key(p, :handle) or is_map_key(p, :work_item_id) ->
+        %{code: "ephemeral_obligation", message: "ephemeral spawns cannot bind roles or work items"}
+
       archetype ->
         override_result =
           if Map.has_key?(p, :overrides) do
@@ -7670,14 +7695,27 @@ defmodule Tightbeam.Gateway do
                    ) do
                   {:cap_exceeded, max_live_sessions}
                 else
-                  case DeliveryResponsibilities.check_staffing_owner_in_txn(
-                         txn,
-                         Map.put(call, :verb, "spawn"),
-                         owner_user_id: caller.owner_user_id,
-                         target_archetype: archetype.name
-                       ) do
+                  staffing =
+                    if archetype.ephemeral do
+                      :ok
+                    else
+                      DeliveryResponsibilities.check_staffing_owner_in_txn(
+                        txn,
+                        Map.put(call, :verb, "spawn"),
+                        owner_user_id: caller.owner_user_id,
+                        target_archetype: archetype.name
+                      )
+                    end
+
+                  case staffing do
                     :ok ->
                       session = Org.create_in_txn(txn, input)
+
+                      if archetype.ephemeral do
+                        Tightbeam.Ephemeral.stamp_in_txn(
+                          txn, session.session_key, caller.caller_session.session_key
+                        )
+                      end
 
                       if p[:handle] do
                         Roles.create_in_txn!(

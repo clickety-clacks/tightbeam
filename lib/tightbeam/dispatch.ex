@@ -113,7 +113,7 @@ defmodule Tightbeam.Dispatch do
         :ok
     end
 
-    case bracket_precheck(db, call, verb) do
+    case ephemeral_precheck(db, call, verb) do
       :proceed ->
         dispatch_through_rail(db, handlers, call, verb, origin, principal, session_key)
 
@@ -157,6 +157,18 @@ defmodule Tightbeam.Dispatch do
     end
   end
 
+  defp ephemeral_precheck(db, call, verb) do
+    if Tightbeam.Ephemeral.read_only?(db, call) do
+      if verb in @read_verbs do
+        :proceed
+      else
+        {:refuse, %{code: "ephemeral_read_only", message: "ephemeral helpers may only read"}}
+      end
+    else
+      bracket_precheck(db, call, verb)
+    end
+  end
+
   # Assignment idempotency is resolved before the rail so both the guard and
   # Rules.decide see the replay outcome.
   defp bracket_precheck(db, call, verb) when verb in ["assign", "dispatch"] do
@@ -166,7 +178,8 @@ defmodule Tightbeam.Dispatch do
   defp bracket_precheck(_db, _call, _verb), do: :proceed
 
   defp dispatch_through_rail(db, handlers, call, verb, origin, principal, session_key) do
-    {decision, to_close, to_consume} = Rules.decide(db, call)
+    {decision, to_close, to_consume} =
+      if Tightbeam.Ephemeral.read_only?(db, call), do: {:allow, [], []}, else: Rules.decide(db, call)
     Enum.each(to_close, &close(db, &1))
 
     case decision do
