@@ -144,7 +144,7 @@ defmodule Tightbeam.CronWakeTest do
   end
 
   test "R1.2 recovery fires once without catching up missed slots", %{db: db} do
-    wake = schedule(db)
+    wake = schedule(db, %{class: nil})
     {:ok, []} = DB.query(db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [wake.wake_id])
     at = System.system_time(:millisecond)
     CronWake.fire_due(db, at)
@@ -153,6 +153,8 @@ defmodule Tightbeam.CronWakeTest do
     assert {:ok, [[1]]} =
              DB.query(db, "SELECT COUNT(*) FROM wakes WHERE consumer='prompt' AND digest=0")
 
+    assert {:ok, [["fyi", "classifier"]]} = DB.query(db,
+      "SELECT class,classElection FROM wakes WHERE consumer='prompt' AND digest=0")
     assert Wakes.get(db, wake.wake_id).due_at == CronWake.next_at("*/30 * * * *", at)
   end
 

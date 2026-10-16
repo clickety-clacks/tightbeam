@@ -141,7 +141,9 @@ defmodule Tightbeam.CronWake do
 
                 next = next_at(schedule, at)
 
-                wake
+                input = if wake.class_election == "classifier", do: Map.delete(wake, :class), else: wake
+
+                input
                 |> Map.delete(:wake_id)
                 |> Map.merge(%{consumer: "prompt", due_at: at})
                 |> then(&Wakes.schedule_in_txn(txn, &1))
