@@ -2,6 +2,8 @@ defmodule Tightbeam.EphemeralTest do
   use Tightbeam.TestCase, async: false
 
   alias Tightbeam.{
+    Assignments,
+    WorkItems,
     DB,
     Dispatch,
     Ephemeral,
@@ -63,7 +65,23 @@ defmodule Tightbeam.EphemeralTest do
       assert {:ok, turn} = Ledger.claim_next(db, key, "test")
       assert :ok = Ledger.finish(db, seq, terminal, nil, owner_lease: turn.owner_lease)
       assert Org.get(db, key).state == "retired"
+      wake = Wakes.get(db, "ephemeral-result:" <> key)
+      assert wake.session_key == "caller"
+      assert is_binary(wake.prompt)
+
+      assert wake.prompt =~ case(terminal) do
+        "delivered" -> "completed"
+        "canceled" -> "canceled"
+        "failed_unknown" -> "recovered"
+        "failed" -> "failed"
+      end
+
       assert :already_terminal = Ledger.finish(db, seq, terminal)
+      assert Wakes.get(db, "ephemeral-result:" <> key) == wake
+
+      assert {:ok, [[1]]} =
+               DB.query(db, "SELECT COUNT(*) FROM wakes WHERE wakeId=?1", [wake.wake_id])
+
       assert {:error, :ephemeral_turn_used} = enqueue(db, key)
     end
 
@@ -76,34 +94,43 @@ defmodule Tightbeam.EphemeralTest do
     assert {:ok, _turn} = Ledger.claim_next(db, "helper", "interrupted")
     assert [^seq] = Ledger.recover_running(db)
     assert Org.get(db, "helper").state == "retired"
+    assert Wakes.get(db, "ephemeral-result:helper").prompt =~ "recovered"
+    assert [] = Ledger.recover_running(db)
+
+    assert {:ok, [[1]]} =
+             DB.query(db, "SELECT COUNT(*) FROM wakes WHERE wakeId='ephemeral-result:helper'")
+
     assert {:error, :ephemeral_turn_used} = enqueue(db, "helper")
   end
 
-  test "R2.3 rejects assignment and card ownership through insert and update", %{db: db} do
-    assignment = """
-    INSERT INTO assignments(id,subject,holderKey,openedBySession,openedAt,state,holderHarness,holderProvider)
-    VALUES('assignment','inspect',?1,'caller',1,'open','claude','anthropic')
-    """
+  test "R2.3 rejects assignment and card ownership at their write paths", %{db: db} do
+    call = %{
+      verb: "assign",
+      principal: {:user, "owner"},
+      origin: "user:owner",
+      session_key: "helper",
+      target_role: nil,
+      role_fallback: false,
+      params: %{subject: "inspect"}
+    }
 
-    assert {:error, error} = DB.query(db, assignment, ["helper"])
-    assert error.message =~ "ephemeral sessions cannot hold assignments"
-    assert {:ok, []} = DB.query(db, assignment, ["ordinary"])
-    assert {:error, error} = DB.query(db, "UPDATE assignments SET holderKey='helper'")
-    assert error.message =~ "ephemeral sessions cannot hold assignments"
+    assert %{code: "ephemeral_obligation"} = Assignments.__handle__(db, "assign", call)
+    card = WorkItems.__handle__(db, "work-item-create", %{call | params: %{title: "inspect"}})
 
-    card = """
-    INSERT INTO work_items(id,title,ownerUserId,deliveryOwnerSessionKey,state,createdByUser,createdAt)
-    VALUES('card','inspect','owner',?1,'open','owner',1)
-    """
+    assert %{code: "ephemeral_obligation"} =
+             WorkItems.__handle__(db, "work-item-update", %{
+               call
+               | params: %{work_item_id: card.id, delivery_owner_session_key: "helper"}
+             })
 
-    assert {:error, error} = DB.query(db, card, ["helper"])
-    assert error.message =~ "ephemeral sessions cannot own work items"
-    assert {:ok, []} = DB.query(db, card, ["ordinary"])
+    assert {:ok, [[0]]} =
+             DB.query(db, "SELECT COUNT(*) FROM assignments WHERE holderKey='helper'")
 
-    assert {:error, error} =
-             DB.query(db, "UPDATE work_items SET deliveryOwnerSessionKey='helper'")
-
-    assert error.message =~ "ephemeral sessions cannot own work items"
+    assert {:ok, [[0]]} =
+             DB.query(
+               db,
+               "SELECT COUNT(*) FROM work_items WHERE deliveryOwnerSessionKey='helper'"
+             )
   end
 
   test "R2.3 never runs supervision for an ephemeral helper", %{db: db} do
@@ -176,9 +203,31 @@ defmodule Tightbeam.EphemeralTest do
     assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM decision_requests")
   end
 
-  test "R2.4 no owned workdir is created", %{db: db} do
+  @tag :tmp_dir
+  test "R2.4 tools use a fresh empty temporary directory removed after the turn", %{
+    db: db,
+    tmp_dir: tmp
+  } do
+    assert {:ok, _} = Placement.register_host(db, "testhost", %{ssh: nil, base_dir: tmp})
+    config = %{db: db, base_dir: tmp}
     helper = Org.get(db, "helper")
-    assert Placement.holder_workdir(%{db: db}, helper) == "/"
+
+    path =
+      Placement.with_turn_directory(config, helper, fn ->
+        path = Placement.holder_workdir(config, helper)
+        assert path != "/"
+        assert File.ls!(path) == []
+        File.write!(Path.join(path, "scratch"), "discard")
+        path
+      end)
+
+    refute File.exists?(path)
+
+    Placement.with_turn_directory(config, helper, fn ->
+      next = Placement.holder_workdir(config, helper)
+      refute next == path
+      assert File.ls!(next) == []
+    end)
   end
 
   test "R2.5 final result targets the exact spawning agent", %{db: db} do
@@ -193,6 +242,69 @@ defmodule Tightbeam.EphemeralTest do
              DB.transaction(db, &Ephemeral.return_in_txn(&1, "ordinary", "ordinary reply"))
 
     assert Wakes.get(db, "ephemeral-result:ordinary") == nil
+  end
+
+  test "R2.5 retired callers return to their parent, with no further routing", %{db: db} do
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "UPDATE sessions SET spawnedBy='ordinary',state='retired' WHERE sessionKey='caller'"
+             )
+
+    assert {:ok, :ok} = DB.transaction(db, &Ephemeral.return_in_txn(&1, "helper", "result"))
+    assert Wakes.get(db, "ephemeral-result:helper").session_key == "ordinary"
+    assert {:ok, :ok} = DB.transaction(db, &Ephemeral.return_in_txn(&1, "helper", "duplicate"))
+    assert Wakes.get(db, "ephemeral-result:helper").prompt =~ "result"
+  end
+
+  test "R2.5 drops and logs a result if the caller and parent are retired", %{db: db} do
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "UPDATE sessions SET spawnedBy='ordinary',state='retired' WHERE sessionKey='caller'"
+             )
+
+    assert {:ok, _} =
+             DB.query(db, "UPDATE sessions SET state='retired' WHERE sessionKey='ordinary'")
+
+    assert ExUnit.CaptureLog.capture_log(fn ->
+             assert {:ok, :ok} =
+                      DB.transaction(db, &Ephemeral.return_in_txn(&1, "helper", "result"))
+           end) =~ "Dropping ephemeral result"
+
+    assert Wakes.get(db, "ephemeral-result:helper") == nil
+  end
+
+  test "R2.5 drops a result when its retired caller has no parent", %{db: db} do
+    assert {:ok, _} =
+             DB.query(db, "UPDATE sessions SET state='retired' WHERE sessionKey='caller'")
+
+    ExUnit.CaptureLog.capture_log(fn ->
+      assert {:ok, :ok} = DB.transaction(db, &Ephemeral.return_in_txn(&1, "helper", "result"))
+    end)
+
+    assert Wakes.get(db, "ephemeral-result:helper") == nil
+  end
+
+  test "migration failure keeps boot available, rolls back the marker and disables helpers", %{
+    db: db
+  } do
+    Tightbeam.SchemaShapeRuntimeFixture.downgrade_ephemeral!(db)
+    assert :ok = DB.execute(db, "CREATE TABLE ephemeral_sessions(conflict TEXT)")
+    log = ExUnit.CaptureLog.capture_log(fn -> assert :ok = Schema.ensure_all(db) end)
+    assert log =~ "Ephemeral migration failed; feature unavailable"
+    refute Ephemeral.available?(db)
+    refute Ephemeral.session?(db, "ordinary")
+
+    assert {:ok, [[0]]} =
+             DB.query(db, "SELECT COUNT(*) FROM sqlite_schema WHERE name='ephemeral_migration'")
+
+    assert {:ok, _} = enqueue(db, "ordinary")
+    assert {:error, _} = DB.transaction(db, &Ephemeral.stamp_in_txn(&1, "ordinary", "caller"))
+    assert :ok = DB.execute(db, "DROP TABLE ephemeral_sessions")
+    assert :ok = Schema.ensure_all(db)
+    assert Ephemeral.available?(db)
+    assert {:ok, [[0]]} = DB.query(db, "SELECT id FROM ephemeral_migration")
   end
 
   test "R2.1-R2.5 migration and stamped elections survive restart", %{db: db} do

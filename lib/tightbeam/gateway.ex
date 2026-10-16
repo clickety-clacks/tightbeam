@@ -3406,7 +3406,7 @@ defmodule Tightbeam.Gateway do
   defp turn_runner(config) do
     db = Map.get(config, :db, Tightbeam.DB)
 
-    fn turn ->
+    runner = fn turn ->
       session = Org.get(db, turn.session_key)
       echo = Projection.get(db, turn.message_id)
       correlation = (echo && echo.client_message_id) || turn.message_id
@@ -3505,7 +3505,7 @@ defmodule Tightbeam.Gateway do
           record_in_txn = fn txn ->
             replies = append_assistant_messages_in_txn(txn, turn, echo, result, attention_tier)
 
-            Tightbeam.Ephemeral.return_in_txn(
+            Tightbeam.Ephemeral.final_message_in_txn(
               txn,
               turn.session_key,
               List.last(assistant_message_texts(result))
@@ -3655,6 +3655,11 @@ defmodule Tightbeam.Gateway do
         end
 
       outcome
+    end
+
+    fn turn ->
+      session = Org.get(db, turn.session_key)
+      Placement.with_turn_directory(config, session, fn -> runner.(turn) end)
     end
   end
 
@@ -7346,34 +7351,48 @@ defmodule Tightbeam.Gateway do
           message: "ephemeral spawns cannot bind work items"
         }
 
+      %{ephemeral: true} = archetype ->
+        if Tightbeam.Ephemeral.available?(db) do
+          create_available_spawn(config, db, call, caller, archetype)
+        else
+          %{code: "ephemeral_unavailable", message: "ephemeral migration failed"}
+        end
+
       archetype ->
-        override_result =
-          if Map.has_key?(p, :overrides) do
-            Archetypes.normalize_overrides(config.base_dir, archetype, p.overrides)
-          else
-            {:ok, nil}
-          end
+        create_available_spawn(config, db, call, caller, archetype)
+    end
+  end
 
-        case override_result do
-          {:ok, overrides} ->
-            harness = p[:harness] || archetype.defaults[:harness] || defaults.harness
+  defp create_available_spawn(config, db, call, caller, archetype) do
+    p = call.params
+    defaults = defaults(config, db)
 
-            module =
-              if is_atom(harness), do: Harness.module!(harness), else: Harness.parse!(harness)
+    override_result =
+      if Map.has_key?(p, :overrides) do
+        Archetypes.normalize_overrides(config.base_dir, archetype, p.overrides)
+      else
+        {:ok, nil}
+      end
 
-            default_model = archetype.defaults[:model] || defaults.model
+    case override_result do
+      {:ok, overrides} ->
+        harness = p[:harness] || archetype.defaults[:harness] || defaults.harness
 
-            with {:ok, placement} <-
-                   resolve_spawn_host(config, db, archetype, p, module, default_model) do
-              create_spawn(config, db, call, caller, archetype, placement, overrides)
-            else
-              {:error, denial} ->
-                classified_spawn_denial(denial, "config_denied", "placement_denied")
-            end
+        module =
+          if is_atom(harness), do: Harness.module!(harness), else: Harness.parse!(harness)
 
+        default_model = archetype.defaults[:model] || defaults.model
+
+        with {:ok, placement} <-
+               resolve_spawn_host(config, db, archetype, p, module, default_model) do
+          create_spawn(config, db, call, caller, archetype, placement, overrides)
+        else
           {:error, denial} ->
             classified_spawn_denial(denial, "config_denied", "placement_denied")
         end
+
+      {:error, denial} ->
+        classified_spawn_denial(denial, "config_denied", "placement_denied")
     end
   end
 
@@ -7706,16 +7725,12 @@ defmodule Tightbeam.Gateway do
                   {:cap_exceeded, max_live_sessions}
                 else
                   staffing =
-                    if archetype.ephemeral do
-                      :ok
-                    else
-                      DeliveryResponsibilities.check_staffing_owner_in_txn(
-                        txn,
-                        Map.put(call, :verb, "spawn"),
-                        owner_user_id: caller.owner_user_id,
-                        target_archetype: archetype.name
-                      )
-                    end
+                    DeliveryResponsibilities.check_staffing_owner_in_txn(
+                      txn,
+                      Map.put(call, :verb, "spawn"),
+                      owner_user_id: caller.owner_user_id,
+                      target_archetype: archetype.name
+                    )
 
                   case staffing do
                     :ok ->

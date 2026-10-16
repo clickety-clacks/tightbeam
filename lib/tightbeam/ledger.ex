@@ -163,7 +163,9 @@ defmodule Tightbeam.Ledger do
     now = System.system_time(:millisecond)
     session_key = Map.fetch!(attrs, :session_key)
 
-    if session_exists_in_txn?(txn, session_key) and ephemeral_turn_available?(txn, session_key) do
+    eligibility = enqueue_eligibility_in_txn(txn, session_key)
+
+    if eligibility == :ok do
       Txn.q(
         txn,
         """
@@ -188,7 +190,10 @@ defmodule Tightbeam.Ledger do
       )
 
       [[seq]] = Txn.q(txn, "SELECT last_insert_rowid()")
-      Txn.q(txn, "UPDATE ephemeral_sessions SET turnUsed=1 WHERE sessionKey=?1", [session_key])
+
+      if Tightbeam.Ephemeral.available?(txn),
+        do:
+          Txn.q(txn, "UPDATE ephemeral_sessions SET turnUsed=1 WHERE sessionKey=?1", [session_key])
 
       if wake_id = Map.get(attrs, :wake_id) do
         Txn.q(txn, "UPDATE wakes SET deliveredTurnSeq=?2 WHERE wakeId=?1", [wake_id, seq])
@@ -212,8 +217,7 @@ defmodule Tightbeam.Ledger do
       Org.sync_mechanical_status_in_txn(txn, session_key)
       {:ok, seq}
     else
-      {:error,
-       if(session_exists_in_txn?(txn, session_key), do: :ephemeral_turn_used, else: :no_session)}
+      {:error, eligibility}
     end
   end
 
@@ -225,16 +229,21 @@ defmodule Tightbeam.Ledger do
   """
   @spec enqueueable_in_txn?(Txn.t(), String.t()) :: boolean()
   def enqueueable_in_txn?(%Txn{} = txn, session_key),
-    do: session_exists_in_txn?(txn, session_key) and ephemeral_turn_available?(txn, session_key)
+    do: enqueue_eligibility_in_txn(txn, session_key) == :ok
 
-  defp session_exists_in_txn?(%Txn{} = txn, session_key) do
-    Txn.q(txn, "SELECT 1 FROM sessions WHERE sessionKey = ?1", [session_key]) != []
-  end
+  defp enqueue_eligibility_in_txn(txn, session_key) do
+    sql =
+      if Tightbeam.Ephemeral.available?(txn) do
+        "SELECT COALESCE(e.turnUsed,0) FROM sessions s LEFT JOIN ephemeral_sessions e ON e.sessionKey=s.sessionKey WHERE s.sessionKey=?1"
+      else
+        "SELECT 0 FROM sessions WHERE sessionKey=?1"
+      end
 
-  defp ephemeral_turn_available?(txn, session_key) do
-    Txn.q(txn, "SELECT 1 FROM ephemeral_sessions WHERE sessionKey=?1 AND turnUsed=1", [
-      session_key
-    ]) == []
+    case Txn.q(txn, sql, [session_key]) do
+      [[0]] -> :ok
+      [[1]] -> :ephemeral_turn_used
+      [] -> :no_session
+    end
   end
 
   @doc "Convenience: enqueue outside an existing transaction."

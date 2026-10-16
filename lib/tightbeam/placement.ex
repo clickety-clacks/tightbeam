@@ -574,11 +574,15 @@ defmodule Tightbeam.Placement do
   durable scratch across engine swaps.
   """
   @spec holder_workdir(map(), map()) :: String.t()
-  def holder_workdir(_config, %{ephemeral: true}), do: "/"
+  def holder_workdir(_config, %{ephemeral: true}),
+    do:
+      Process.get({__MODULE__, :turn_directory}) ||
+        raise("ephemeral tools require a turn directory")
 
   def holder_workdir(config, holder_session) do
     if config[:db] && Tightbeam.Ephemeral.session?(config.db, holder_session.session_key) do
-      "/"
+      Process.get({__MODULE__, :turn_directory}) ||
+        raise("ephemeral tools require a turn directory")
     else
       host = fetch_session_host!(config, holder_session)
       path = workdir_path(config, holder_session)
@@ -607,6 +611,66 @@ defmodule Tightbeam.Placement do
 
       ensure_workdir(host, path, content, ensure_opts)
       path
+    end
+  end
+
+  def with_turn_directory(config, session, fun) do
+    if Tightbeam.Ephemeral.session?(config.db, session.session_key) do
+      host = fetch_session_host!(config, session)
+      sh = Map.get(config, :sh, &system_cmd/1)
+
+      run = fn args ->
+        invocation = if host.ssh == nil, do: args, else: ["ssh" | @ssh_opts] ++ [host.ssh | args]
+
+        case sh.(invocation) do
+          {output, 0} ->
+            String.trim(output)
+
+          {output, code} ->
+            raise "ephemeral temporary directory command failed (#{code}): #{output}"
+        end
+      end
+
+      owner = self()
+
+      {cleaner, ref} =
+        spawn_monitor(fn ->
+          monitor = Process.monitor(owner)
+          path = run.(["mktemp", "-d", "/tmp/tightbeam-helper.XXXXXXXXXX"])
+          send(owner, {self(), :directory, path})
+
+          receive do
+            :cleanup -> :ok
+            {:DOWN, ^monitor, :process, ^owner, _} -> :ok
+          end
+
+          run.(["rm", "-rf", "--", path])
+        end)
+
+      path =
+        receive do
+          {^cleaner, :directory, path} -> path
+          {:DOWN, ^ref, :process, ^cleaner, reason} -> exit({:temporary_directory_failed, reason})
+        end
+
+      Process.put({__MODULE__, :turn_directory}, path)
+
+      try do
+        fun.()
+      after
+        Process.delete({__MODULE__, :turn_directory})
+        send(cleaner, :cleanup)
+
+        receive do
+          {:DOWN, ^ref, :process, ^cleaner, :normal} ->
+            :ok
+
+          {:DOWN, ^ref, :process, ^cleaner, reason} ->
+            exit({:temporary_directory_cleanup_failed, reason})
+        end
+      end
+    else
+      fun.()
     end
   end
 

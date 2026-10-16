@@ -1,6 +1,8 @@
 defmodule Tightbeam.Ephemeral do
   @moduledoc "One-turn archetype lifecycle and return delivery."
 
+  require Logger
+
   alias Tightbeam.{DB, Org, Wakes}
   alias Tightbeam.DB.Txn
 
@@ -18,46 +20,52 @@ defmodule Tightbeam.Ephemeral do
              CREATE TABLE ephemeral_sessions (
                sessionKey TEXT PRIMARY KEY REFERENCES sessions(sessionKey),
                callerSessionKey TEXT NOT NULL REFERENCES sessions(sessionKey),
-               createdAt INTEGER NOT NULL,
                turnUsed INTEGER NOT NULL DEFAULT 0 CHECK(turnUsed IN (0,1))
              );
-             CREATE TRIGGER ephemeral_assignment_insert BEFORE INSERT ON assignments
-             WHEN EXISTS(SELECT 1 FROM ephemeral_sessions WHERE sessionKey=NEW.holderKey)
-             BEGIN SELECT RAISE(ABORT,'ephemeral sessions cannot hold assignments'); END;
-             CREATE TRIGGER ephemeral_assignment_update BEFORE UPDATE OF holderKey ON assignments
-             WHEN EXISTS(SELECT 1 FROM ephemeral_sessions WHERE sessionKey=NEW.holderKey)
-             BEGIN SELECT RAISE(ABORT,'ephemeral sessions cannot hold assignments'); END;
-             CREATE TRIGGER ephemeral_card_insert BEFORE INSERT ON work_items
-             WHEN EXISTS(SELECT 1 FROM ephemeral_sessions WHERE sessionKey=NEW.deliveryOwnerSessionKey)
-             BEGIN SELECT RAISE(ABORT,'ephemeral sessions cannot own work items'); END;
-             CREATE TRIGGER ephemeral_card_update BEFORE UPDATE OF deliveryOwnerSessionKey ON work_items
-             WHEN EXISTS(SELECT 1 FROM ephemeral_sessions WHERE sessionKey=NEW.deliveryOwnerSessionKey)
-             BEGIN SELECT RAISE(ABORT,'ephemeral sessions cannot own work items'); END;
              INSERT INTO ephemeral_migration VALUES(0);
              """)
            end
 
            :ok
          end) do
-      {:ok, :ok} -> :ok
-      {:error, error} -> raise error
+      {:ok, :ok} ->
+        set_available(db, true)
+
+      {:error, error} ->
+        Logger.error("Ephemeral migration failed; feature unavailable: #{inspect(error)}")
+        set_available(db, false)
     end
   end
 
+  defp set_available(db, available) do
+    {:ok, _} = DB.transaction(db, fn _ -> Process.put({__MODULE__, :available}, available) end)
+    :ok
+  end
+
+  def available?(%Txn{}), do: Process.get({__MODULE__, :available}, true)
+
+  def available?(db) do
+    {:ok, available} = DB.transaction(db, &available?/1)
+    available
+  end
+
+  def session?(%Txn{} = txn, key) do
+    available?(txn) and
+      Txn.q(txn, "SELECT 1 FROM ephemeral_sessions WHERE sessionKey=?1", [key]) != []
+  end
+
   def session?(db, key) do
-    query(db, "SELECT 1 FROM ephemeral_sessions WHERE sessionKey=?1", [key]) != []
+    {:ok, result} = DB.transaction(db, &session?(&1, key))
+    result
   end
 
   def stamp_in_txn(txn, key, caller) do
-    Txn.q(
-      txn,
-      "INSERT INTO ephemeral_sessions(sessionKey,callerSessionKey,createdAt) VALUES(?1,?2,?3)",
-      [
-        key,
-        caller,
-        System.system_time(:millisecond)
-      ]
-    )
+    unless available?(txn), do: raise("ephemeral feature unavailable")
+
+    Txn.q(txn, "INSERT INTO ephemeral_sessions(sessionKey,callerSessionKey) VALUES(?1,?2)", [
+      key,
+      caller
+    ])
   end
 
   def caller(db, key) do
@@ -90,14 +98,22 @@ defmodule Tightbeam.Ephemeral do
   defp origin_session(_db, _origin), do: nil
 
   def retire_turn_in_txn(txn, seq) do
-    case Txn.q(
-           txn,
-           "SELECT e.sessionKey FROM turns t JOIN ephemeral_sessions e ON e.sessionKey=t.sessionKey WHERE t.seq=?1",
-           [seq]
-         ) do
-      [[key]] -> retire_in_txn(txn, key)
-      [] -> :ok
+    if available?(txn) do
+      case Txn.q(
+             txn,
+             "SELECT e.sessionKey,t.status FROM turns t JOIN ephemeral_sessions e ON e.sessionKey=t.sessionKey WHERE t.seq=?1",
+             [seq]
+           ) do
+        [[key, status]] ->
+          return_in_txn(txn, key, terminal_summary(status))
+          retire_in_txn(txn, key)
+
+        [] ->
+          :ok
+      end
     end
+
+    :ok
   end
 
   # R2.2: the terminal CAS owns retirement, including failed and canceled turns.
@@ -122,16 +138,63 @@ defmodule Tightbeam.Ephemeral do
     :ok
   end
 
+  defp terminal_summary("delivered"), do: "Helper completed without a final message."
+  defp terminal_summary("canceled"), do: "Helper turn was canceled."
+
+  defp terminal_summary("failed_unknown"),
+    do: "Helper turn was interrupted and recovered as failed."
+
+  defp terminal_summary(_), do: "Helper turn failed."
+
+  def final_message_in_txn(txn, key, text) when is_binary(text) do
+    Txn.q(txn, "UPDATE wakes SET prompt=?2 WHERE wakeId=?1 AND state='pending'", [
+      "ephemeral-result:" <> key,
+      "Ephemeral spawn result from #{key}:\n\n" <> text
+    ])
+
+    :ok
+  end
+
+  def final_message_in_txn(_txn, _key, _text), do: :ok
+
+  defp recipient(txn, caller) do
+    case Txn.q(txn, "SELECT state,spawnedBy FROM sessions WHERE sessionKey=?1", [caller]) do
+      [["retired", parent]] ->
+        case Txn.q(
+               txn,
+               "SELECT sessionKey FROM sessions WHERE sessionKey=?1 AND state!='retired'",
+               [parent]
+             ) do
+          [[key]] -> key
+          [] -> nil
+        end
+
+      [[_, _]] ->
+        caller
+
+      [] ->
+        nil
+    end
+  end
+
   # R2.5: the existing scheduler delivers the final response to the spawning agent.
   def return_in_txn(txn, key, text) do
-    if caller = caller(txn, key) do
-      Wakes.schedule_in_txn(txn, %{
-        wake_id: "ephemeral-result:" <> key,
-        session_key: caller,
-        origin: "session:" <> key,
-        prompt: "Ephemeral spawn result from #{key}:\n\n" <> text,
-        due_at: System.system_time(:millisecond)
-      })
+    if session?(txn, key) and Wakes.get_in_txn(txn, "ephemeral-result:" <> key) == nil do
+      caller = caller(txn, key)
+
+      if target = recipient(txn, caller) do
+        Wakes.schedule_in_txn(txn, %{
+          wake_id: "ephemeral-result:" <> key,
+          session_key: target,
+          origin: "session:" <> key,
+          prompt: "Ephemeral spawn result from #{key}:\n\n" <> text,
+          due_at: System.system_time(:millisecond)
+        })
+      else
+        Logger.warning(
+          "Dropping ephemeral result from #{key}: caller #{caller} and its parent are unavailable"
+        )
+      end
     end
 
     :ok

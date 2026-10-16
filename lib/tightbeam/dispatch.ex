@@ -113,9 +113,11 @@ defmodule Tightbeam.Dispatch do
         :ok
     end
 
-    case ephemeral_precheck(db, call, verb) do
+    helper? = Tightbeam.Ephemeral.read_only?(db, call)
+
+    case ephemeral_precheck(db, call, verb, helper?) do
       :proceed ->
-        dispatch_through_rail(db, handlers, call, verb, origin, principal, session_key)
+        dispatch_through_rail(db, handlers, call, verb, origin, principal, session_key, helper?)
 
       {:replay, assignment} ->
         # A keyed replay bypasses the rail entirely (statute inertness): the
@@ -157,8 +159,8 @@ defmodule Tightbeam.Dispatch do
     end
   end
 
-  defp ephemeral_precheck(db, call, verb) do
-    if Tightbeam.Ephemeral.read_only?(db, call) do
+  defp ephemeral_precheck(db, call, verb, helper?) do
+    if helper? do
       if verb in @read_verbs do
         :proceed
       else
@@ -177,11 +179,11 @@ defmodule Tightbeam.Dispatch do
 
   defp bracket_precheck(_db, _call, _verb), do: :proceed
 
-  defp dispatch_through_rail(db, handlers, call, verb, origin, principal, session_key) do
+  defp dispatch_through_rail(db, handlers, call, verb, origin, principal, session_key, helper?) do
     {decision, to_close, to_consume} = Rules.decide(db, call)
 
     decision =
-      if Tightbeam.Ephemeral.read_only?(db, call) do
+      if helper? do
         case decision do
           :allow -> :allow
           {:deny, error} -> {:deny, error}

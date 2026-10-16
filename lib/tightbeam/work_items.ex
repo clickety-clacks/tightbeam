@@ -408,28 +408,33 @@ defmodule Tightbeam.WorkItems do
 
   defp valid_delivery_owner(txn, %{delivery_owner_session_key: session_key})
        when is_binary(session_key) do
-    if String.trim(session_key) == "" do
-      error(
-        "invalid_delivery_owner",
-        "deliveryOwnerSessionKey must be an active session or null"
-      )
-    else
-      case Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey=?1", [session_key]) do
-        [["active"]] ->
-          :ok
+    cond do
+      Tightbeam.Ephemeral.session?(txn, session_key) ->
+        error("ephemeral_obligation", "ephemeral sessions cannot own work items")
 
-        [[_state]] ->
-          error(
-            "delivery_owner_unavailable",
-            "delivery owner session #{session_key} is not active"
-          )
+      String.trim(session_key) == "" ->
+        error(
+          "invalid_delivery_owner",
+          "deliveryOwnerSessionKey must be an active session or null"
+        )
 
-        [] ->
-          error(
-            "unknown_delivery_owner",
-            "delivery owner session #{session_key} does not exist"
-          )
-      end
+      true ->
+        case Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey=?1", [session_key]) do
+          [["active"]] ->
+            :ok
+
+          [[_state]] ->
+            error(
+              "delivery_owner_unavailable",
+              "delivery owner session #{session_key} is not active"
+            )
+
+          [] ->
+            error(
+              "unknown_delivery_owner",
+              "delivery owner session #{session_key} does not exist"
+            )
+        end
     end
   end
 
