@@ -170,7 +170,7 @@ defmodule Tightbeam.EphemeralTest do
       params: %{}
     }
 
-    assert {:error, %{code: "rule_denied"}} =
+    assert {:error, %{code: "rule_denied", reason: "rule_denied"}} =
              Dispatch.dispatch(db, %{"inspect" => fn _ -> flunk("must deny") end}, call)
 
     assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM decision_requests")

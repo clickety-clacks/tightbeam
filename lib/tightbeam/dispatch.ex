@@ -185,8 +185,8 @@ defmodule Tightbeam.Dispatch do
         case decision do
           :allow -> :allow
           {:deny, error} -> {:deny, error}
-          {:remedy, _statute, _ref, error} -> {:deny, error}
-          {:escalate, _statute, ctx, _id} -> {:deny, ctx.error}
+          {:remedy, _statute, _ref, error} -> {:deny, Map.put(error, :reason, "rule_denied")}
+          {:escalate, _statute, ctx, _id} -> {:deny, Map.put(ctx.error, :reason, "rule_denied")}
           {:deny_escalate, _statute, ctx} -> {:deny, ctx.error}
         end
       else
