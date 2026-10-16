@@ -18,7 +18,8 @@ defmodule Tightbeam.Ephemeral do
              CREATE TABLE ephemeral_sessions (
                sessionKey TEXT PRIMARY KEY REFERENCES sessions(sessionKey),
                callerSessionKey TEXT NOT NULL REFERENCES sessions(sessionKey),
-               createdAt INTEGER NOT NULL
+               createdAt INTEGER NOT NULL,
+               turnUsed INTEGER NOT NULL DEFAULT 0 CHECK(turnUsed IN (0,1))
              );
              CREATE TRIGGER ephemeral_assignment_insert BEFORE INSERT ON assignments
              WHEN EXISTS(SELECT 1 FROM ephemeral_sessions WHERE sessionKey=NEW.holderKey)
@@ -48,7 +49,7 @@ defmodule Tightbeam.Ephemeral do
   end
 
   def stamp_in_txn(txn, key, caller) do
-    Txn.q(txn, "INSERT INTO ephemeral_sessions VALUES(?1,?2,?3)", [
+    Txn.q(txn, "INSERT INTO ephemeral_sessions(sessionKey,callerSessionKey,createdAt) VALUES(?1,?2,?3)", [
       key,
       caller,
       System.system_time(:millisecond)

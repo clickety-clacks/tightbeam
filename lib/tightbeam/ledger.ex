@@ -188,6 +188,7 @@ defmodule Tightbeam.Ledger do
       )
 
       [[seq]] = Txn.q(txn, "SELECT last_insert_rowid()")
+      Txn.q(txn, "UPDATE ephemeral_sessions SET turnUsed=1 WHERE sessionKey=?1", [session_key])
 
       if wake_id = Map.get(attrs, :wake_id) do
         Txn.q(txn, "UPDATE wakes SET deliveredTurnSeq=?2 WHERE wakeId=?1", [wake_id, seq])
@@ -231,8 +232,7 @@ defmodule Tightbeam.Ledger do
   end
 
   defp ephemeral_turn_available?(txn, session_key) do
-    not Tightbeam.Ephemeral.session?(txn, session_key) or
-      Txn.q(txn, "SELECT 1 FROM turns WHERE sessionKey=?1 LIMIT 1", [session_key]) == []
+    Txn.q(txn, "SELECT 1 FROM ephemeral_sessions WHERE sessionKey=?1 AND turnUsed=1", [session_key]) == []
   end
 
   @doc "Convenience: enqueue outside an existing transaction."
