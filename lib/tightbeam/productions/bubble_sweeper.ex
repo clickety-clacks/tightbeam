@@ -112,7 +112,12 @@ defmodule Tightbeam.Productions.BubbleSweeper do
             state =
               if ended_at >= state.boot_at and ended_at < cutoff and
                    not MapSet.member?(state.missed, seq) do
-                Tightbeam.SchedulerMisses.record(:bubble, seq, max(0, System.system_time(:millisecond) - ended_at))
+                Tightbeam.SchedulerMisses.record(
+                  :bubble,
+                  seq,
+                  max(0, System.system_time(:millisecond) - ended_at)
+                )
+
                 %{state | missed: MapSet.put(state.missed, seq)}
               else
                 state

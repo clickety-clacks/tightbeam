@@ -165,11 +165,18 @@ defmodule Tightbeam.LaneTest do
 
   test "publication detector gives normal terminal publication time to finish", ctx do
     parent = self()
-    manager = start_supervised!({LaneManager,
-      db: ctx.db, lane_sup: ctx.lane_sup, task_sup: ctx.task_sup,
-      name: :publication_grace_manager,
-      runner: fn _ -> {:ok, %{text: "done"}} end,
-      terminal_publisher: fn row -> send(parent, {:published_terminal, row.seq}) end})
+
+    manager =
+      start_supervised!(
+        {LaneManager,
+         db: ctx.db,
+         lane_sup: ctx.lane_sup,
+         task_sup: ctx.task_sup,
+         name: :publication_grace_manager,
+         runner: fn _ -> {:ok, %{text: "done"}} end,
+         terminal_publisher: fn row -> send(parent, {:published_terminal, row.seq}) end}
+      )
+
     :sys.get_state(manager)
     seq = enqueue!(ctx.db, "k1", "terminal")
     {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "testhost")
@@ -179,8 +186,12 @@ defmodule Tightbeam.LaneTest do
     :sys.get_state(manager)
     refute_receive {:published_terminal, ^seq}, 50
     assert Tightbeam.SchedulerMisses.count() == before
+
     DB.query(ctx.db, "UPDATE turns SET endedAt=?1 WHERE seq=?2", [
-      System.system_time(:millisecond) - 11_000, seq])
+      System.system_time(:millisecond) - 11_000,
+      seq
+    ])
+
     send(manager, :tick)
     :sys.get_state(manager)
     assert_receive {:published_terminal, ^seq}
@@ -192,10 +203,20 @@ defmodule Tightbeam.LaneTest do
 
   test "a committed enqueue handoff starts a recipient lane without reconciliation", ctx do
     parent = self()
-    manager = start_supervised!({LaneManager,
-      db: ctx.db, lane_sup: ctx.lane_sup, task_sup: ctx.task_sup,
-      name: :handoff_lane_manager,
-      runner: fn turn -> send(parent, {:handoff_turn, turn.seq}); {:ok, %{text: "done"}} end})
+
+    manager =
+      start_supervised!(
+        {LaneManager,
+         db: ctx.db,
+         lane_sup: ctx.lane_sup,
+         task_sup: ctx.task_sup,
+         name: :handoff_lane_manager,
+         runner: fn turn ->
+           send(parent, {:handoff_turn, turn.seq})
+           {:ok, %{text: "done"}}
+         end}
+      )
+
     :sys.get_state(manager)
     seq = enqueue!(ctx.db, "k1", "handed off")
     GenServer.cast(manager, {:ensure_lane, "k1"})

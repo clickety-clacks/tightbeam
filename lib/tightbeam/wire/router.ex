@@ -262,47 +262,47 @@ defmodule Tightbeam.Wire.Router do
   post "/agent/dispatch" do
     with {:ok, auth} <- cli_auth(conn) do
       with_json(conn, fn body, conn ->
-      with {:ok, verb} <- required_string(body["verb"]),
-         :ok <- allowed_agent_verb(verb),
-         {:ok, origin, principal} <- agent_identity(body, auth, conn),
-         {:ok, session_key, target_meta} <- typed_target(verb, body, conn) do
-      call = %{
-        verb: verb,
-        origin: origin,
-        principal: principal,
-        # Identity resolution can turn a session-authenticated call into a user
-        # principal. Keep the authenticated transport beside that principal so a
-        # handler can stamp the hop without trusting a caller param.
-        transport_session_key: authenticated_session_key(auth),
-        session_key: artifact_caller_session(verb, session_key, principal),
-        target_role: target_meta.role,
-        role_fallback: target_meta.fallback,
-        params: atomize_params(verb, body["params"] || %{})
-      }
+        with {:ok, verb} <- required_string(body["verb"]),
+             :ok <- allowed_agent_verb(verb),
+             {:ok, origin, principal} <- agent_identity(body, auth, conn),
+             {:ok, session_key, target_meta} <- typed_target(verb, body, conn) do
+          call = %{
+            verb: verb,
+            origin: origin,
+            principal: principal,
+            # Identity resolution can turn a session-authenticated call into a user
+            # principal. Keep the authenticated transport beside that principal so a
+            # handler can stamp the hop without trusting a caller param.
+            transport_session_key: authenticated_session_key(auth),
+            session_key: artifact_caller_session(verb, session_key, principal),
+            target_role: target_meta.role,
+            role_fallback: target_meta.fallback,
+            params: atomize_params(verb, body["params"] || %{})
+          }
 
-      call =
-        case Map.get(target_meta, :user_id) do
-          user_id when is_binary(user_id) -> Map.put(call, :target_user_id, user_id)
-          _ -> call
+          call =
+            case Map.get(target_meta, :user_id) do
+              user_id when is_binary(user_id) -> Map.put(call, :target_user_id, user_id)
+              _ -> call
+            end
+
+          call =
+            case {verb, principal} do
+              {"artifact-content-fetch", {kind, _}} when kind in [:user, :session] ->
+                Map.put(call, :rest_principal, state_principal_view(principal, conn))
+
+              _ ->
+                call
+            end
+
+          dispatch_response(conn, call, 200, &%{"result" => &1})
+        else
+          {:error, status, code, message} ->
+            error(conn, status, code, message)
+
+          {:error, status, code, message, diagnostic} ->
+            error(conn, status, code, message, diagnostic)
         end
-
-      call =
-        case {verb, principal} do
-          {"artifact-content-fetch", {kind, _}} when kind in [:user, :session] ->
-            Map.put(call, :rest_principal, state_principal_view(principal, conn))
-
-          _ ->
-            call
-        end
-
-      dispatch_response(conn, call, 200, &%{"result" => &1})
-    else
-      {:error, status, code, message} ->
-        error(conn, status, code, message)
-
-      {:error, status, code, message, diagnostic} ->
-        error(conn, status, code, message, diagnostic)
-    end
       end)
     else
       {:error, status, code, message} ->
@@ -551,36 +551,37 @@ defmodule Tightbeam.Wire.Router do
   post "/api/streams" do
     with {:ok, device} <- device_auth(conn) do
       with_json(conn, fn body, conn ->
-      with :ok <- streams_overrides_unsupported(body),
-         {:ok, display_name} <- required_string(body["displayName"]),
-         {:ok, idempotency_key} <- required_string(body["idempotencyKey"]) do
-      picker =
-        for {k, atom} <- [
-              {"harness", :harness},
-              {"host", :host},
-              {"archetype", :archetype}
-            ],
-            is_binary(body[k]) and body[k] != "",
-            into: %{},
-            do: {atom, body[k]}
+        with :ok <- streams_overrides_unsupported(body),
+             {:ok, display_name} <- required_string(body["displayName"]),
+             {:ok, idempotency_key} <- required_string(body["idempotencyKey"]) do
+          picker =
+            for {k, atom} <- [
+                  {"harness", :harness},
+                  {"host", :host},
+                  {"archetype", :archetype}
+                ],
+                is_binary(body[k]) and body[k] != "",
+                into: %{},
+                do: {atom, body[k]}
 
-      picker = Map.merge(picker, model_params(body))
+          picker = Map.merge(picker, model_params(body))
 
-      call = %{
-        verb: "spawn",
-        origin: "user:#{device.user_id}",
-        session_key: nil,
-        params: Map.merge(%{display_name: display_name, idempotency_key: idempotency_key}, picker)
-      }
+          call = %{
+            verb: "spawn",
+            origin: "user:#{device.user_id}",
+            session_key: nil,
+            params:
+              Map.merge(%{display_name: display_name, idempotency_key: idempotency_key}, picker)
+          }
 
-      dispatch_response(conn, call, 201, & &1)
-    else
-      {:error, status, code, message} ->
-        error(conn, status, code, message)
+          dispatch_response(conn, call, 201, & &1)
+        else
+          {:error, status, code, message} ->
+            error(conn, status, code, message)
 
-      {:error, status, code, message, diagnostic} ->
-        error(conn, status, code, message, diagnostic)
-    end
+          {:error, status, code, message, diagnostic} ->
+            error(conn, status, code, message, diagnostic)
+        end
       end)
     else
       {:error, status, code, message} ->
@@ -596,22 +597,22 @@ defmodule Tightbeam.Wire.Router do
          {:ok, decoded_key} <- decode_session_key_param(key),
          {:ok, session} <- owned_session(decoded_key, device, conn) do
       with_json(conn, fn body, conn ->
-      with {:ok, display_name} <- required_string(body["displayName"]) do
-      call = %{
-        verb: "tune",
-        origin: "user:#{device.user_id}",
-        session_key: session.session_key,
-        params: %{setting: "rename", display_name: display_name}
-      }
+        with {:ok, display_name} <- required_string(body["displayName"]) do
+          call = %{
+            verb: "tune",
+            origin: "user:#{device.user_id}",
+            session_key: session.session_key,
+            params: %{setting: "rename", display_name: display_name}
+          }
 
-      dispatch_response(conn, call, 200, & &1)
-    else
-      {:error, status, code, message} ->
-        error(conn, status, code, message)
+          dispatch_response(conn, call, 200, & &1)
+        else
+          {:error, status, code, message} ->
+            error(conn, status, code, message)
 
-      {:error, status, code, message, diagnostic} ->
-        error(conn, status, code, message, diagnostic)
-    end
+          {:error, status, code, message, diagnostic} ->
+            error(conn, status, code, message, diagnostic)
+        end
       end)
     else
       {:error, status, code, message} ->
@@ -625,28 +626,28 @@ defmodule Tightbeam.Wire.Router do
   delete "/api/streams/:key" do
     with {:ok, device} <- device_auth(conn) do
       with_json(conn, fn body, conn ->
-      with {:ok, decoded_key} <- decode_session_key_param(key),
-         {:ok, session_key} <- retire_target(decoded_key, body, device, conn) do
-      params =
-        if is_binary(body["idempotencyKey"]),
-          do: %{idempotency_key: body["idempotencyKey"]},
-          else: %{}
+        with {:ok, decoded_key} <- decode_session_key_param(key),
+             {:ok, session_key} <- retire_target(decoded_key, body, device, conn) do
+          params =
+            if is_binary(body["idempotencyKey"]),
+              do: %{idempotency_key: body["idempotencyKey"]},
+              else: %{}
 
-      call = %{
-        verb: "retire",
-        origin: "user:#{device.user_id}",
-        session_key: session_key,
-        params: params
-      }
+          call = %{
+            verb: "retire",
+            origin: "user:#{device.user_id}",
+            session_key: session_key,
+            params: params
+          }
 
-      dispatch_response(conn, call, 200, & &1)
-    else
-      {:error, status, code, message} ->
-        error(conn, status, code, message)
+          dispatch_response(conn, call, 200, & &1)
+        else
+          {:error, status, code, message} ->
+            error(conn, status, code, message)
 
-      {:error, status, code, message, diagnostic} ->
-        error(conn, status, code, message, diagnostic)
-    end
+          {:error, status, code, message, diagnostic} ->
+            error(conn, status, code, message, diagnostic)
+        end
       end)
     else
       {:error, status, code, message} ->
@@ -748,27 +749,27 @@ defmodule Tightbeam.Wire.Router do
   post "/api/session-control" do
     with {:ok, device} <- device_auth(conn) do
       with_json(conn, fn body, conn ->
-      with key = to_string(body["sessionKey"] || ""),
-         {:ok, _session} <- visible_session(key, device, conn),
-         {:ok, verb, params} <- control_call(body) do
-      action = body["action"]
+        with key = to_string(body["sessionKey"] || ""),
+             {:ok, _session} <- visible_session(key, device, conn),
+             {:ok, verb, params} <- control_call(body) do
+          action = body["action"]
 
-      call = %{
-        verb: verb,
-        origin: "user:#{device.user_id}",
-        principal: {:user, device.user_id},
-        session_key: key,
-        params: params
-      }
+          call = %{
+            verb: verb,
+            origin: "user:#{device.user_id}",
+            principal: {:user, device.user_id},
+            session_key: key,
+            params: params
+          }
 
-      control_response(conn, call, key, action)
-    else
-      {:error, status, code, message} ->
-        error(conn, status, code, message)
+          control_response(conn, call, key, action)
+        else
+          {:error, status, code, message} ->
+            error(conn, status, code, message)
 
-      {:error, status, code, message, diagnostic} ->
-        error(conn, status, code, message, diagnostic)
-    end
+          {:error, status, code, message, diagnostic} ->
+            error(conn, status, code, message, diagnostic)
+        end
       end)
     else
       {:error, status, code, message} ->
@@ -2717,7 +2718,9 @@ defmodule Tightbeam.Wire.Router do
   # the second where the parser stopped. Both keep the invalid_message code.
   defp with_json(conn, fun) do
     case read_json(conn) do
-      {:ok, body, conn} -> fun.(body, conn)
+      {:ok, body, conn} ->
+        fun.(body, conn)
+
       {:error, conn, status, code, message, diagnostic} ->
         error(conn, status, code, message, diagnostic)
     end

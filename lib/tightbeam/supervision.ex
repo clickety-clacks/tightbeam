@@ -3808,7 +3808,6 @@ defmodule Tightbeam.Supervision do
     Enum.each(outcome, fn holder ->
       drain(state.db, state.handlers, holder)
     end)
-
   end
 
   defp liveness_cycle(_state, _terminal_rebases, _session_key), do: :ok
@@ -4197,57 +4196,57 @@ defmodule Tightbeam.Supervision do
         holder
       ],
       acc ->
-            case last_terminal_in_txn(txn, holder) do
-              nil ->
-                next_generation = generation + 1
+        case last_terminal_in_txn(txn, holder) do
+          nil ->
+            next_generation = generation + 1
 
-                Txn.q(
-                  txn,
-                  """
-                  UPDATE supervision_entitlements
-                  SET generation=?2, dueAt=?3, state='armed', lastAttemptGeneration=NULL,
-                      claimClock=NULL, basisKind='no_terminal', basisId=?4,
-                      cause='no_terminal', principal='process:tightbeam'
-                  WHERE assignmentId=?1 AND generation=?5 AND state='armed'
-                  """,
-                  [
-                    assignment_id,
-                    next_generation,
-                    evaluation_clock + interval,
-                    "#{assignment_id}##{generation}",
-                    generation
-                  ]
-                )
+            Txn.q(
+              txn,
+              """
+              UPDATE supervision_entitlements
+              SET generation=?2, dueAt=?3, state='armed', lastAttemptGeneration=NULL,
+                  claimClock=NULL, basisKind='no_terminal', basisId=?4,
+                  cause='no_terminal', principal='process:tightbeam'
+              WHERE assignmentId=?1 AND generation=?5 AND state='armed'
+              """,
+              [
+                assignment_id,
+                next_generation,
+                evaluation_clock + interval,
+                "#{assignment_id}##{generation}",
+                generation
+              ]
+            )
 
-                EventLog.lifecycle_in_txn(
-                  txn,
-                  "supervision_entitlement_rearmed",
-                  assignment_id,
-                  "generation=#{next_generation} basis=no_terminal:#{assignment_id}##{generation} cause=no_terminal principal=process:tightbeam"
-                )
+            EventLog.lifecycle_in_txn(
+              txn,
+              "supervision_entitlement_rearmed",
+              assignment_id,
+              "generation=#{next_generation} basis=no_terminal:#{assignment_id}##{generation} cause=no_terminal principal=process:tightbeam"
+            )
 
-                acc
+            acc
 
-              terminal_seq ->
-                assignment = %{id: assignment_id, subject: subject, holderKey: holder}
+          terminal_seq ->
+            assignment = %{id: assignment_id, subject: subject, holderKey: holder}
 
-                case claim_entitlement_in_txn(
-                       txn,
-                       assignment,
-                       generation,
-                       due_at,
-                       last_attempt_generation,
-                       basis_kind,
-                       basis_id,
-                       evaluation_clock,
-                       n,
-                       terminal_seq,
-                       "deadline"
-                     ) do
-                  :ok -> [holder | acc]
-                  :stale -> acc
-                end
+            case claim_entitlement_in_txn(
+                   txn,
+                   assignment,
+                   generation,
+                   due_at,
+                   last_attempt_generation,
+                   basis_kind,
+                   basis_id,
+                   evaluation_clock,
+                   n,
+                   terminal_seq,
+                   "deadline"
+                 ) do
+              :ok -> [holder | acc]
+              :stale -> acc
             end
+        end
     end)
   end
 
@@ -5630,7 +5629,8 @@ defmodule Tightbeam.Supervision do
        when is_integer(interval) and interval > 0 do
     DB.background_pass(
       fn ->
-        due = deadline_rows(state)
+        due =
+          deadline_rows(state)
           |> Enum.map(&elem(&1, 2))
           |> Enum.min(fn -> nil end)
 
@@ -5672,10 +5672,25 @@ defmodule Tightbeam.Supervision do
       """)
 
     Enum.each(rows, fn [session, seq, ended_at, unclassified] ->
-      before = query(state.db, "SELECT assignmentId,lastEvaluatedTerminal FROM supervision_watermarks WHERE sessionKey=?1 ORDER BY assignmentId", [session])
+      before =
+        query(
+          state.db,
+          "SELECT assignmentId,lastEvaluatedTerminal FROM supervision_watermarks WHERE sessionKey=?1 ORDER BY assignmentId",
+          [session]
+        )
+
       evaluate_ended_session(state, session, seq)
-      after_watermark = query(state.db, "SELECT assignmentId,lastEvaluatedTerminal FROM supervision_watermarks WHERE sessionKey=?1 ORDER BY assignmentId", [session])
-      classified = query(state.db, "SELECT 1 FROM patrol_terminal_classifications WHERE turnSeq=?1", [seq]) != []
+
+      after_watermark =
+        query(
+          state.db,
+          "SELECT assignmentId,lastEvaluatedTerminal FROM supervision_watermarks WHERE sessionKey=?1 ORDER BY assignmentId",
+          [session]
+        )
+
+      classified =
+        query(state.db, "SELECT 1 FROM patrol_terminal_classifications WHERE turnSeq=?1", [seq]) !=
+          []
 
       if ended_at < now() - 60_000 and
            ((unclassified == 1 and classified) or before != after_watermark) do
@@ -5688,11 +5703,19 @@ defmodule Tightbeam.Supervision do
     end)
 
     if is_integer(state.sweep_ms) and state.sweep_ms > 0 do
-      overdue = Enum.filter(deadline_rows(state), fn {_, session, due} ->
-        due < now() - 60_000 and query(state.db, "SELECT 1 FROM turns WHERE sessionKey=?1 AND endedAt IS NOT NULL LIMIT 1", [session]) != []
-      end)
+      overdue =
+        Enum.filter(deadline_rows(state), fn {_, session, due} ->
+          due < now() - 60_000 and
+            query(
+              state.db,
+              "SELECT 1 FROM turns WHERE sessionKey=?1 AND endedAt IS NOT NULL LIMIT 1",
+              [session]
+            ) != []
+        end)
+
       liveness_cycle(state, MapSet.new())
       remaining = MapSet.new(deadline_rows(state))
+
       Enum.each(overdue, fn {job, session, due} = row ->
         unless MapSet.member?(remaining, row) do
           Tightbeam.SchedulerMisses.record(:supervision, "#{job} session=#{session}", now() - due)

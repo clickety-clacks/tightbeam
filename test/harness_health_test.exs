@@ -36,8 +36,11 @@ defmodule Tightbeam.HarnessHealthTest do
     use GenServer
     def start_link(args), do: GenServer.start_link(__MODULE__, args, name: Tightbeam.LaneManager)
     def init(args), do: {:ok, args}
+
     def handle_cast({:ensure_lane, key}, {db, parent} = state) do
-      {:ok, rows} = DB.query(db, "SELECT seq FROM turns WHERE sessionKey=?1 AND status='queued'", [key])
+      {:ok, rows} =
+        DB.query(db, "SELECT seq FROM turns WHERE sessionKey=?1 AND status='queued'", [key])
+
       send(parent, {:recovery_lane, key, rows})
       {:noreply, state}
     end
@@ -2165,7 +2168,6 @@ defmodule Tightbeam.HarnessHealthTest do
     assert_receive {:recovery_lane, key, [[redelivery_seq]]}
     assert key == failed.session
     assert is_integer(redelivery_seq)
-
 
     assert {:ok,
             [

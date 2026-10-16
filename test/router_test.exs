@@ -100,25 +100,32 @@ defmodule Tightbeam.Wire.RouterTest do
       {status, body, next} = adapter.read_req_body(payload, opts)
       {status, body, {adapter, next, true}}
     end
+
     def send_resp({adapter, payload, true}, status, headers, body),
       do: adapter.send_resp(payload, status, headers, body)
   end
 
   test "JSON and validation errors respond with the connection returned by the body read", ctx do
     create_session(ctx.db, "body-conn-session", ctx.device.user_id)
+
     for {method, path, token, body} <- [
-      {:post, "/agent/dispatch", "tbc_test", "{"},
-      {:post, "/agent/dispatch", "tbc_test", "[]"},
-      {:post, "/agent/dispatch", "tbc_test", ~s({"verb":"unsupported"})},
-      {:post, "/api/streams", ctx.device.token, "{}"},
-      {:patch, "/api/streams/body-conn-session", ctx.device.token, "{}"},
-      {:delete, "/api/streams/missing", ctx.device.token, "{"},
-      {:post, "/api/session-control", ctx.device.token, "{}"}
-    ] do
-      request = conn(method, path, body)
+          {:post, "/agent/dispatch", "tbc_test", "{"},
+          {:post, "/agent/dispatch", "tbc_test", "[]"},
+          {:post, "/agent/dispatch", "tbc_test", ~s({"verb":"unsupported"})},
+          {:post, "/api/streams", ctx.device.token, "{}"},
+          {:patch, "/api/streams/body-conn-session", ctx.device.token, "{}"},
+          {:delete, "/api/streams/missing", ctx.device.token, "{"},
+          {:post, "/api/session-control", ctx.device.token, "{}"}
+        ] do
+      request =
+        conn(method, path, body)
         |> put_req_header("authorization", "Bearer " <> token)
         |> put_req_header("content-type", "application/json")
-        |> put_req_header("x-tightbeam-cli-version", Tightbeam.CliCompatibility.required_version())
+        |> put_req_header(
+          "x-tightbeam-cli-version",
+          Tightbeam.CliCompatibility.required_version()
+        )
+
       {adapter, payload} = request.adapter
       request = %{request | adapter: {ReadConnAdapter, {adapter, payload, false}}}
       response = Router.call(request, Router.init(ctx.opts))

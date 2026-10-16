@@ -202,7 +202,13 @@ defmodule Tightbeam.SupervisionTest do
   test "idle cleanup uses a lazy poll after a session becomes eligible", ctx do
     idle_cleanup_fixture!(ctx, ["poll-child"])
     future = System.system_time(:millisecond) + 60_000
-    DB.query(ctx.db, "UPDATE sessions SET createdAt=?1,updatedAt=?1 WHERE sessionKey='poll-child'", [future])
+
+    DB.query(
+      ctx.db,
+      "UPDATE sessions SET createdAt=?1,updatedAt=?1 WHERE sessionKey='poll-child'",
+      [future]
+    )
+
     name = start_liveness!(ctx, sweep_ms: 100, name: Supervision)
     refute Map.has_key?(:sys.get_state(name), :idle_cleanup_due)
     assert idle_cleanup_wakes(ctx.db) == []
@@ -270,14 +276,19 @@ defmodule Tightbeam.SupervisionTest do
     {wake, seq} = schedule_checkpoint_via_gateway!(ctx, "waiting intentionally", 3_600_000)
     Supervision.notify_terminal(name, "holder", seq)
     :sys.get_state(name)
+
     DB.query(ctx.db, "UPDATE turns SET endedAt=?1 WHERE seq=?2", [
-      System.system_time(:millisecond) - 120_000, seq
+      System.system_time(:millisecond) - 120_000,
+      seq
     ])
+
     before = Tightbeam.SchedulerMisses.count()
+
     for _ <- 1..2 do
       send(name, :detect_misses)
       :sys.get_state(name)
     end
+
     assert Wakes.get(ctx.db, wake.wake_id).state == "pending"
     assert Tightbeam.SchedulerMisses.count() == before
   end
@@ -291,7 +302,12 @@ defmodule Tightbeam.SupervisionTest do
     assignment(ctx.db, "asg_peer", other.session_key, "peer", 2)
     peer_seq = terminal!(ctx.db, other.session_key)
     Supervision.classify_terminal(ctx.db, peer_seq)
-    DB.query(ctx.db, "DELETE FROM supervision_entitlements WHERE assignmentId IN ('asg_1','asg_peer')")
+
+    DB.query(
+      ctx.db,
+      "DELETE FROM supervision_entitlements WHERE assignmentId IN ('asg_1','asg_peer')"
+    )
+
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
     insert_entitlement!(ctx.db, "asg_peer", generation: 1, due_at: 0)
     {:noreply, armed} = Supervision.handle_cast(:deadlines_changed, :sys.get_state(name))
@@ -299,10 +315,12 @@ defmodule Tightbeam.SupervisionTest do
     assert :erlang.read_timer(armed.deadline_timer) <= 100
     Process.cancel_timer(armed.deadline_timer)
     Supervision.handle_info({:timeout, armed.deadline_timer, :supervision_due}, armed)
-    assert {:ok, [[2]]} = DB.query(ctx.db, """
-      SELECT COUNT(*) FROM supervision_entitlements
-      WHERE assignmentId IN ('asg_1','asg_peer') AND lastAttemptGeneration=1
-    """)
+
+    assert {:ok, [[2]]} =
+             DB.query(ctx.db, """
+               SELECT COUNT(*) FROM supervision_entitlements
+               WHERE assignmentId IN ('asg_1','asg_peer') AND lastAttemptGeneration=1
+             """)
   end
 
   test "a bad cleanup record does not stop other sessions or deadline scheduling", ctx do

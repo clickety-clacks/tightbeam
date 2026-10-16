@@ -23,13 +23,18 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
     use GenServer
     def start_link(args), do: GenServer.start_link(__MODULE__, args)
     def init(args), do: {:ok, args}
+
     def handle_call(request, _from, {db, opts} = state) do
       result = GenServer.call(db, request)
+
       case result do
         {:ok, [{%{wake_id: _}, recipient, _} | _]} ->
           NoticeBatcher.recover(db, System.system_time(:millisecond), opts, recipient)
-        _ -> :ok
+
+        _ ->
+          :ok
       end
+
       {:reply, result, state}
     end
   end
@@ -469,9 +474,12 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
     :sys.get_state(pid)
     assert Tightbeam.SchedulerMisses.count() == ctx.misses_before
     assert NoticeBatcher.source_refs(ctx.db, source.wake_id) == []
-    {:ok, _} = DB.query(ctx.db, "UPDATE turns SET endedAt=?1 WHERE seq=?2", [
-      System.system_time(:millisecond) - 61_000, turn.seq
-    ])
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE turns SET endedAt=?1 WHERE seq=?2", [
+        System.system_time(:millisecond) - 61_000,
+        turn.seq
+      ])
 
     log =
       capture_log(fn ->
@@ -508,11 +516,20 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
     state = :sys.get_state(pid)
     stop_supervised!(Wakes)
     source = wake(ctx.db, System.system_time(:millisecond) + 60_000)
+
     DB.query(ctx.db, "UPDATE wakes SET dueAt=?1 WHERE wakeId=?2", [
-      System.system_time(:millisecond) - 61_000, source.wake_id])
+      System.system_time(:millisecond) - 61_000,
+      source.wake_id
+    ])
+
     proxy = start_supervised!({MissRaceDB, {ctx.db, ctx.delivery_opts}})
     assert {:noreply, _} = Wakes.handle_info(:detect_misses, %{state | db: proxy})
-    assert {:ok, [[seq]]} = DB.query(ctx.db, "SELECT deliveredTurnSeq FROM wakes WHERE wakeId=?1", [source.wake_id])
+
+    assert {:ok, [[seq]]} =
+             DB.query(ctx.db, "SELECT deliveredTurnSeq FROM wakes WHERE wakeId=?1", [
+               source.wake_id
+             ])
+
     assert is_integer(seq)
     assert Tightbeam.SchedulerMisses.count() == ctx.misses_before
   end
