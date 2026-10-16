@@ -7339,10 +7339,10 @@ defmodule Tightbeam.Gateway do
       %{ephemeral: true} when is_nil(caller.caller_session) ->
         %{code: "ephemeral_requires_caller", message: "ephemeral spawns require a calling agent"}
 
-      %{ephemeral: true} when is_map_key(p, :handle) or is_map_key(p, :work_item_id) ->
+      %{ephemeral: true} when is_map_key(p, :work_item_id) ->
         %{
           code: "ephemeral_obligation",
-          message: "ephemeral spawns cannot bind roles or work items"
+          message: "ephemeral spawns cannot bind work items"
         }
 
       archetype ->

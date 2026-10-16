@@ -3467,7 +3467,7 @@ defmodule Tightbeam.GatewayTest do
     assert %{code: "ephemeral_obligation"} =
              spawn.(%{
                call
-               | params: Map.merge(params, %{idempotency_key: "bound", handle: "bound"})
+               | params: Map.merge(params, %{idempotency_key: "bound", work_item_id: "card"})
              })
   end
 
