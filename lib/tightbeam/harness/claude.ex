@@ -1,6 +1,7 @@
 defmodule Tightbeam.Harness.Claude do
   @moduledoc false
   @behaviour Tightbeam.Harness
+  require Logger
 
   @credential_file ".credentials.json"
 
@@ -732,26 +733,47 @@ defmodule Tightbeam.Harness.Claude do
   end
 
   defp fill_capabilities(models, get) do
-    Enum.reduce_while(models, {:ok, []}, fn model, {:ok, acc} ->
-      if is_map(get_in(model, ["capabilities", "effort"])) do
-        {:cont, {:ok, [model | acc]}}
-      else
-        case model["id"] do
-          id when is_binary(id) ->
-            path = "/v1/models/" <> URI.encode(id, &URI.char_unreserved?/1)
+    models
+    |> Enum.with_index(1)
+    |> Enum.reduce_while({:ok, []}, fn {model, index}, {:ok, acc} ->
+      cond do
+        match?(%{"capabilities" => %{"effort" => effort}} when is_map(effort), model) ->
+          {:cont, {:ok, [model | acc]}}
 
-            with {:ok, body} <- get.(path),
-                 {:ok, detail} <- JSON.decode(body),
-                 true <- is_map(detail) do
-              {:cont, {:ok, [Map.merge(model, detail) | acc]}}
-            else
-              {:error, reason} -> {:halt, {:error, reason}}
-              _ -> {:halt, {:error, :malformed_catalog}}
-            end
+        not is_map(model) ->
+          log_skipped_catalog_model(model_identity(model, index), :malformed_entry)
+          {:cont, {:ok, acc}}
 
-          _ ->
-            {:halt, {:error, :malformed_catalog}}
-        end
+        not is_binary(model["id"]) or model["id"] == "" ->
+          log_skipped_catalog_model(model_identity(model, index), :missing_model_id)
+          {:cont, {:ok, acc}}
+
+        true ->
+          id = model["id"]
+          path = "/v1/models/" <> URI.encode(id, &URI.char_unreserved?/1)
+
+          case get.(path) do
+            {:ok, body} when is_binary(body) ->
+              case JSON.decode(body) do
+                {:ok, detail} when is_map(detail) ->
+                  {:cont, {:ok, [Map.merge(model, detail) | acc]}}
+
+                _ ->
+                  log_skipped_catalog_model(id, :malformed_detail)
+                  {:cont, {:ok, acc}}
+              end
+
+            {:error, {:http_status, 404, _body}} ->
+              log_skipped_catalog_model(id, :detail_not_found)
+              {:cont, {:ok, acc}}
+
+            {:error, reason} ->
+              {:halt, {:error, reason}}
+
+            _ ->
+              log_skipped_catalog_model(id, :malformed_detail)
+              {:cont, {:ok, acc}}
+          end
       end
     end)
     |> case do
@@ -760,29 +782,64 @@ defmodule Tightbeam.Harness.Claude do
     end
   end
 
+  defp model_identity(model, index) when is_map(model) do
+    case Map.get(model, "id") do
+      id when is_binary(id) and id != "" -> String.slice(id, 0, 120)
+      _ -> "entry-index=#{index}"
+    end
+  end
+
+  defp model_identity(_model, index), do: "entry-index=#{index}"
+
+  defp log_skipped_catalog_model(identity, reason) do
+    Logger.warning(
+      "Skipping malformed Claude catalog model #{inspect(identity)} reason=#{reason}"
+    )
+  end
+
   defp derive_catalog_entries(models) do
-    Enum.reduce_while(models, {:ok, []}, fn
-      %{
-        "id" => id,
-        "display_name" => display_name,
-        "max_input_tokens" => max_input_tokens,
-        "capabilities" => capabilities
-      } = model,
-      {:ok, entries}
-      when is_binary(id) and is_binary(display_name) and is_integer(max_input_tokens) and
-             max_input_tokens >= 0 and is_map(capabilities) ->
-        case efforts(capabilities) do
-          {:ok, effort_names} ->
-            {:cont, {:ok, entries ++ [entry_for(model, id, effort_names, capabilities)]}}
+    entries =
+      models
+      |> Enum.with_index(1)
+      |> Enum.reduce([], fn {model, index}, entries ->
+        case catalog_entry(model) do
+          {:ok, entry} ->
+            [entry | entries]
 
           :error ->
-            {:halt, {:error, :malformed_catalog}}
+            log_skipped_catalog_model(model_identity(model, index), :malformed_entry)
+            entries
         end
+      end)
+      |> Enum.reverse()
 
-      _, _ ->
-        {:halt, {:error, :malformed_catalog}}
-    end)
+    if entries == [] and models != [] do
+      {:error, :malformed_catalog}
+    else
+      {:ok, entries}
+    end
   end
+
+  defp catalog_entry(
+         %{
+           "id" => id,
+           "display_name" => display_name,
+           "max_input_tokens" => max_input_tokens,
+           "capabilities" => capabilities
+         } = model
+       )
+       when is_binary(id) and is_binary(display_name) and is_integer(max_input_tokens) and
+              max_input_tokens >= 0 and is_map(capabilities) do
+    case efforts(capabilities) do
+      {:ok, effort_names} ->
+        {:ok, entry_for(model, id, effort_names, capabilities)}
+
+      :error ->
+        :error
+    end
+  end
+
+  defp catalog_entry(_model), do: :error
 
   defp efforts(capabilities) do
     values = Map.get(capabilities, "effort", %{})

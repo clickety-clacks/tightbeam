@@ -104,10 +104,8 @@ defmodule Tightbeam.PiProvider do
   # Materialization still proceeds without the named providers when they cannot
   # be read, but the record says why instead of reading as "none configured".
   def named_local_providers(base_dir) when is_binary(base_dir) do
-    case Providers.read_all(base_dir) do
-      {:ok, records} -> records
-      {:error, reason} -> unreadable_providers(reason)
-    end
+    {:ok, records} = Providers.read_all(base_dir)
+    records
   end
 
   def named_local_providers(%{host_config: _} = target) do

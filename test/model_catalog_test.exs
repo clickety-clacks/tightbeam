@@ -713,7 +713,7 @@ defmodule Tightbeam.ModelCatalogTest do
            ]
   end
 
-  test "mixed valid and unexpectedly shaped rows degrade atomically", ctx do
+  test "mixed valid and malformed rows retain each provider's usable models", ctx do
     claude_valid = %{
       id: "claude-valid",
       display_name: "Claude Valid",
@@ -792,14 +792,21 @@ defmodule Tightbeam.ModelCatalogTest do
                })
            ]}
         ] do
-      catalog = start_catalog(ctx, Keyword.put(overrides, :name, unique_name(label)))
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          catalog = start_catalog(ctx, Keyword.put(overrides, :name, unique_name(label)))
 
-      await(fn ->
-        ModelCatalog.get(@host, harness, catalog) == {[], {:unavailable, :malformed_catalog}}
-      end)
+          await(fn ->
+            match?({[_ | _], :fresh}, ModelCatalog.get(@host, harness, catalog))
+          end)
 
-      assert ModelCatalog.get(@host, harness, catalog) ==
-               {[], {:unavailable, :malformed_catalog}}
+          {entries, :fresh} = ModelCatalog.get(@host, harness, catalog)
+          expected_family = if harness == "claude", do: "claude-valid", else: "gpt-valid"
+          assert Enum.map(entries, & &1.family) == [expected_family]
+        end)
+
+      assert log =~ "Skipping malformed #{String.capitalize(harness)}"
+      assert log =~ "entry-index=2" or log =~ "claude-" or log =~ "gpt-"
     end
   end
 

@@ -1,6 +1,7 @@
 defmodule Tightbeam.Harness.Codex do
   @moduledoc false
   @behaviour Tightbeam.Harness
+  require Logger
 
   alias Tightbeam.Harness.Support
   alias Tightbeam.{ErrorDiagnostic, Model, Placement}
@@ -1194,32 +1195,104 @@ defmodule Tightbeam.Harness.Codex do
   defp derive_catalog_entries(:api_key, models), do: derive_platform_entries(models)
 
   defp derive_account_entries(models) do
-    Enum.reduce_while(models, {:ok, []}, fn
-      %{
-        "slug" => slug,
-        "display_name" => display_name,
-        "supported_reasoning_levels" => levels
-      } = model,
-      {:ok, entries}
-      when is_binary(slug) and is_binary(display_name) and is_list(levels) ->
-        capabilities = model["capabilities"] || %{}
-        max_input_tokens = model["max_input_tokens"] || model["context_window"]
+    entries =
+      models
+      |> Enum.with_index(1)
+      |> Enum.reduce([], fn {model, index}, entries ->
+        case account_entry(model) do
+          {:ok, entry} ->
+            [entry | entries]
 
-        if is_map(capabilities) and
-             (is_nil(max_input_tokens) or
-                (is_integer(max_input_tokens) and max_input_tokens >= 0)) and
-             Enum.all?(levels, &match?(%{"effort" => effort} when is_binary(effort), &1)) do
-          efforts = Enum.map(levels, & &1["effort"])
-          capabilities = Map.put(capabilities, "supported_reasoning_levels", levels)
-          {:cont, {:ok, entries ++ [entry_for(model, slug, efforts, capabilities)]}}
-        else
-          {:halt, {:error, :malformed_catalog}}
+          :error ->
+            log_skipped_catalog_model(:subscription, model_identity(model, "slug", index))
+            entries
         end
+      end)
+      |> Enum.reverse()
 
-      _, _ ->
-        {:halt, {:error, :malformed_catalog}}
-    end)
+    if entries == [] and models != [] do
+      {:error, :malformed_catalog}
+    else
+      {:ok, entries}
+    end
   end
+
+  defp account_entry(
+         %{
+           "slug" => slug,
+           "display_name" => display_name,
+           "supported_reasoning_levels" => levels
+         } = model
+       )
+       when is_binary(slug) and is_binary(display_name) and is_list(levels) do
+    capabilities = model["capabilities"] || %{}
+    max_input_tokens = model["max_input_tokens"] || model["context_window"]
+
+    if is_map(capabilities) and
+         (is_nil(max_input_tokens) or
+            (is_integer(max_input_tokens) and max_input_tokens >= 0)) and
+         Enum.all?(levels, &match?(%{"effort" => effort} when is_binary(effort), &1)) do
+      efforts = Enum.map(levels, & &1["effort"])
+      capabilities = Map.put(capabilities, "supported_reasoning_levels", levels)
+      {:ok, entry_for(model, slug, efforts, capabilities)}
+    else
+      :error
+    end
+  end
+
+  defp account_entry(_model), do: :error
+
+  defp model_identity(model, field, index) when is_map(model) do
+    case Map.get(model, field) do
+      id when is_binary(id) and id != "" -> String.slice(id, 0, 120)
+      _ -> "entry-index=#{index}"
+    end
+  end
+
+  defp model_identity(_model, _field, index), do: "entry-index=#{index}"
+
+  defp log_skipped_catalog_model(source, identity) do
+    Logger.warning("Skipping malformed Codex #{source} catalog model #{inspect(identity)}")
+  end
+
+  defp derive_platform_entries(models) do
+    entries =
+      models
+      |> Enum.with_index(1)
+      |> Enum.reduce([], fn {model, index}, entries ->
+        case platform_entry(model) do
+          {:ok, entry} ->
+            [entry | entries]
+
+          :error ->
+            log_skipped_catalog_model(:platform, model_identity(model, "id", index))
+            entries
+        end
+      end)
+      |> Enum.reverse()
+
+    if entries == [] and models != [] do
+      {:error, :malformed_catalog}
+    else
+      {:ok, entries}
+    end
+  end
+
+  defp platform_entry(%{"id" => id}) when is_binary(id) and id != "" do
+    {:ok,
+     %{
+       family: id,
+       context: nil,
+       display_name: id,
+       name: id,
+       efforts: [],
+       max_input_tokens: nil,
+       capabilities: %{},
+       provider: :openai
+     }}
+  end
+
+  defp platform_entry(_model), do: :error
 
   # ONE entry per vendor model, carrying the efforts it offers.
   defp entry_for(model, id, efforts, capabilities) do
@@ -1249,30 +1322,6 @@ defmodule Tightbeam.Harness.Codex do
   #
   # OBSERVED LIVE 2026-07-28 (the #89 api-key exercise): 125 entries in exactly
   # this shape, bare ids under "data".
-  defp derive_platform_entries(models) do
-    Enum.reduce_while(models, {:ok, []}, fn
-      %{"id" => id}, {:ok, entries} when is_binary(id) and id != "" ->
-        {:cont,
-         {:ok,
-          entries ++
-            [
-              %{
-                family: id,
-                context: nil,
-                display_name: id,
-                name: id,
-                efforts: [],
-                max_input_tokens: nil,
-                capabilities: %{},
-                provider: :openai
-              }
-            ]}}
-
-      _model, _entries ->
-        {:halt, {:error, :malformed_catalog}}
-    end)
-  end
-
   defp qualify_selected_engine(_state, :subscription, entries), do: {:ok, entries}
   defp qualify_selected_engine(_state, :api_key, []), do: {:ok, []}
 
@@ -1288,43 +1337,54 @@ defmodule Tightbeam.Harness.Codex do
       if matched == [] do
         {:error, {:no_provider_model_selectable_on_selected_engine, version}}
       else
-        Enum.reduce_while(matched, {:ok, []}, fn entry, {:ok, qualified} ->
-          case selected_efforts(selected[entry.family]) do
-            {:ok, levels} ->
-              capabilities =
-                if levels == [] do
-                  entry.capabilities
-                else
-                  %{"supported_reasoning_levels" => levels}
-                end
+        {qualified, errors} =
+          Enum.reduce(matched, {[], []}, fn entry, {qualified, errors} ->
+            case selected_efforts(selected[entry.family]) do
+              {:ok, levels} ->
+                capabilities =
+                  if levels == [] do
+                    entry.capabilities
+                  else
+                    %{"supported_reasoning_levels" => levels}
+                  end
 
-              enriched =
-                %{
-                  entry
-                  | efforts: Enum.map(levels, & &1["reasoningEffort"]),
-                    capabilities: capabilities
-                }
+                enriched =
+                  %{
+                    entry
+                    | efforts: Enum.map(levels, & &1["reasoningEffort"]),
+                      capabilities: capabilities
+                  }
 
-              {:cont, {:ok, [enriched | qualified]}}
+                {[enriched | qualified], errors}
 
-            error ->
-              {:halt, error}
-          end
-        end)
-        |> case do
-          {:ok, qualified} -> {:ok, Enum.reverse(qualified)}
-          error -> error
+              {:error, reason} ->
+                log_skipped_catalog_model(:selected_engine, entry.family)
+                {qualified, [reason | errors]}
+            end
+          end)
+
+        case {qualified, errors} do
+          {[_ | _], _} -> {:ok, Enum.reverse(qualified)}
+          {[], [reason | _]} -> {:error, reason}
+          {[], []} -> {:ok, []}
         end
       end
     end
   end
 
   defp selected_efforts(%{"supportedReasoningEfforts" => levels}) when is_list(levels) do
-    efforts = Enum.map(levels, & &1["reasoningEffort"])
+    valid_efforts? =
+      Enum.all?(levels, fn
+        %{"reasoningEffort" => effort} when is_binary(effort) and effort != "" -> true
+        _ -> false
+      end)
 
-    if Enum.all?(efforts, &(is_binary(&1) and &1 != "")) and
-         length(efforts) == length(Enum.uniq(efforts)) do
-      {:ok, levels}
+    if valid_efforts? do
+      efforts = Enum.map(levels, & &1["reasoningEffort"])
+
+      if length(efforts) == length(Enum.uniq(efforts)),
+        do: {:ok, levels},
+        else: {:error, :malformed_selected_engine_model_list}
     else
       {:error, :malformed_selected_engine_model_list}
     end
