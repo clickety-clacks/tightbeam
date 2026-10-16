@@ -6,8 +6,10 @@ defmodule Tightbeam.CronWakeTest do
     use GenServer
     def start_link(db), do: GenServer.start_link(__MODULE__, db)
     def init(db), do: {:ok, db}
+
     def handle_call({:transaction, _fun}, _from, db),
       do: {:reply, {:error, %DB.Overloaded{}}, db}
+
     def handle_call(request, _from, db), do: {:reply, GenServer.call(db, request), db}
   end
 
@@ -131,7 +133,11 @@ defmodule Tightbeam.CronWakeTest do
       assert next > System.system_time(:millisecond)
       Tightbeam.NoticeBatcher.recover(ctx.db, System.system_time(:millisecond), ctx.delivery_opts)
       assert {:ok, turn} = Tightbeam.Ledger.claim_next(ctx.db, "recipient", "testhost")
-      assert :ok = Tightbeam.Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+
+      assert :ok =
+               Tightbeam.Ledger.finish(ctx.db, turn.seq, "delivered", nil,
+                 owner_lease: turn.owner_lease
+               )
     end
 
     assert {:ok, [[2]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
@@ -155,8 +161,12 @@ defmodule Tightbeam.CronWakeTest do
     assert {:ok, [[1]]} =
              DB.query(db, "SELECT COUNT(*) FROM wakes WHERE consumer='prompt' AND digest=0")
 
-    assert {:ok, [["fyi", "classifier"]]} = DB.query(db,
-      "SELECT class,classElection FROM wakes WHERE consumer='prompt' AND digest=0")
+    assert {:ok, [["fyi", "classifier"]]} =
+             DB.query(
+               db,
+               "SELECT class,classElection FROM wakes WHERE consumer='prompt' AND digest=0"
+             )
+
     assert Wakes.get(db, wake.wake_id).due_at == CronWake.next_at("*/30 * * * *", at)
   end
 
@@ -169,7 +179,9 @@ defmodule Tightbeam.CronWakeTest do
     assert Wakes.get(db, wake.wake_id).due_at == 0
     CronWake.fire_due(db, at)
     assert Wakes.get(db, wake.wake_id).due_at > at
-    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM wakes WHERE consumer='prompt' AND digest=0")
+
+    assert {:ok, [[1]]} =
+             DB.query(db, "SELECT COUNT(*) FROM wakes WHERE consumer='prompt' AND digest=0")
   end
 
   test "R1.3 existing scheduler timer delivers the firing with recipient prompt and class", ctx do

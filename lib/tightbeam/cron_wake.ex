@@ -141,7 +141,8 @@ defmodule Tightbeam.CronWake do
 
                 next = next_at(schedule, at)
 
-                input = if wake.class_election == "classifier", do: Map.delete(wake, :class), else: wake
+                input =
+                  if wake.class_election == "classifier", do: Map.delete(wake, :class), else: wake
 
                 input
                 |> Map.delete(:wake_id)
@@ -159,12 +160,16 @@ defmodule Tightbeam.CronWake do
             :ok
           end)
       rescue
-        error in DB.Overloaded -> reraise error, __STACKTRACE__
+        error in DB.Overloaded ->
+          reraise error, __STACKTRACE__
+
         error in MatchError ->
           if match?({:error, %DB.Overloaded{}}, error.term),
             do: reraise(error, __STACKTRACE__),
             else: Logger.warning("cron wake #{id} deferred: #{Exception.message(error)}")
-        error -> Logger.warning("cron wake #{id} deferred: #{Exception.message(error)}")
+
+        error ->
+          Logger.warning("cron wake #{id} deferred: #{Exception.message(error)}")
       end
     end)
   end
