@@ -118,6 +118,7 @@ defmodule Tightbeam.Wire.RouterTest do
       request = conn(method, path, body)
         |> put_req_header("authorization", "Bearer " <> token)
         |> put_req_header("content-type", "application/json")
+        |> put_req_header("x-tightbeam-cli-version", Tightbeam.CliCompatibility.required_version())
       {adapter, payload} = request.adapter
       request = %{request | adapter: {ReadConnAdapter, {adapter, payload, false}}}
       response = Router.call(request, Router.init(ctx.opts))
