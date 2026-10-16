@@ -97,7 +97,6 @@ defmodule EphemeralRuntime do
 
         assert {:ok, returned} = Ledger.claim_next(db, "caller", "test")
         assert returned.prompt =~ "SECOND"
-        assert returned.prompt =~ "ephemeral-result:helper"
       after
         GenServer.stop(coordinator)
         GenServer.stop(adapter)

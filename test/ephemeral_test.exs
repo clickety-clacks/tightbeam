@@ -147,6 +147,18 @@ defmodule Tightbeam.EphemeralTest do
     assert_received :handler_ran
   end
 
+  test "R2.3 read rules still deny without escalating the helper", %{db: db} do
+    rule = %{
+      name: "read-approval", verb: "inspect", verbs: ["inspect"],
+      text: "approval required", conditions: [], edges: ["verb"],
+      effect: "escalate", check: nil, identity_manifest_sha: "test-identity"
+    }
+    :persistent_term.put(Tightbeam.Rules, [rule])
+    call = %{verb: "inspect", origin: "session:helper", principal: {:session, "helper"}, session_key: nil, params: %{}}
+    assert {:error, %{code: "rule_denied"}} = Dispatch.dispatch(db, %{"inspect" => fn _ -> flunk("must deny") end}, call)
+    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM decision_requests")
+  end
+
   test "R2.4 no owned workdir is created", %{db: db} do
     helper = Org.get(db, "helper")
     assert Placement.holder_workdir(%{db: db}, helper) == "/"
