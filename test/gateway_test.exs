@@ -3457,7 +3457,7 @@ defmodule Tightbeam.GatewayTest do
 
     assert %{session_key: ^key} = spawn.(call)
 
-    assert %{code: "work_item_required"} =
+    assert %{code: "unknown_caller"} =
              spawn.(%{
                call
                | origin: "session:k1",
