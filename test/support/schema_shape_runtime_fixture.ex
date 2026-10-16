@@ -664,14 +664,15 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
   end
 
   def downgrade_ephemeral!(db) do
-    assert :ok = DB.execute(db, """
-    DROP TRIGGER IF EXISTS ephemeral_assignment_insert;
-    DROP TRIGGER IF EXISTS ephemeral_assignment_update;
-    DROP TRIGGER IF EXISTS ephemeral_card_insert;
-    DROP TRIGGER IF EXISTS ephemeral_card_update;
-    DROP TABLE IF EXISTS ephemeral_sessions;
-    DROP TABLE IF EXISTS ephemeral_migration;
-    """)
+    assert :ok =
+             DB.execute(db, """
+             DROP TRIGGER IF EXISTS ephemeral_assignment_insert;
+             DROP TRIGGER IF EXISTS ephemeral_assignment_update;
+             DROP TRIGGER IF EXISTS ephemeral_card_insert;
+             DROP TRIGGER IF EXISTS ephemeral_card_update;
+             DROP TABLE IF EXISTS ephemeral_sessions;
+             DROP TABLE IF EXISTS ephemeral_migration;
+             """)
   end
 
   def downgrade_notice_source_storage!(db) do

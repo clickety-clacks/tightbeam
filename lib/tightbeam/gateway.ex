@@ -4729,7 +4729,8 @@ defmodule Tightbeam.Gateway do
   end
 
   defp served_snapshot(config, session, harness, revision) do
-    session = Map.put(session, :ephemeral, Tightbeam.Ephemeral.session?(config.db, session.session_key))
+    session =
+      Map.put(session, :ephemeral, Tightbeam.Ephemeral.session?(config.db, session.session_key))
 
     config
     |> complete_session_snapshot(session, harness, revision)

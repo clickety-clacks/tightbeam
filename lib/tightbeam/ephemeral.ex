@@ -85,7 +85,11 @@ defmodule Tightbeam.Ephemeral do
   defp origin_session(_db, _origin), do: nil
 
   def retire_turn_in_txn(txn, seq) do
-    case Txn.q(txn, "SELECT e.sessionKey FROM turns t JOIN ephemeral_sessions e ON e.sessionKey=t.sessionKey WHERE t.seq=?1", [seq]) do
+    case Txn.q(
+           txn,
+           "SELECT e.sessionKey FROM turns t JOIN ephemeral_sessions e ON e.sessionKey=t.sessionKey WHERE t.seq=?1",
+           [seq]
+         ) do
       [[key]] -> retire_in_txn(txn, key)
       [] -> :ok
     end

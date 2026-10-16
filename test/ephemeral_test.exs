@@ -149,13 +149,30 @@ defmodule Tightbeam.EphemeralTest do
 
   test "R2.3 read rules still deny without escalating the helper", %{db: db} do
     rule = %{
-      name: "read-approval", verb: "inspect", verbs: ["inspect"],
-      text: "approval required", conditions: [], edges: ["verb"],
-      effect: "escalate", check: nil, identity_manifest_sha: "test-identity"
+      name: "read-approval",
+      verb: "inspect",
+      verbs: ["inspect"],
+      text: "approval required",
+      conditions: [],
+      edges: ["verb"],
+      effect: "escalate",
+      check: nil,
+      identity_manifest_sha: "test-identity"
     }
+
     :persistent_term.put(Tightbeam.Rules, [rule])
-    call = %{verb: "inspect", origin: "session:helper", principal: {:session, "helper"}, session_key: nil, params: %{}}
-    assert {:error, %{code: "rule_denied"}} = Dispatch.dispatch(db, %{"inspect" => fn _ -> flunk("must deny") end}, call)
+
+    call = %{
+      verb: "inspect",
+      origin: "session:helper",
+      principal: {:session, "helper"},
+      session_key: nil,
+      params: %{}
+    }
+
+    assert {:error, %{code: "rule_denied"}} =
+             Dispatch.dispatch(db, %{"inspect" => fn _ -> flunk("must deny") end}, call)
+
     assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM decision_requests")
   end
 
@@ -200,19 +217,37 @@ defmodule Tightbeam.EphemeralTest do
 
   @tag :tmp_dir
   test "R2.1-R2.5 additive migration follows the 0.1.8 predecessor upgrade", %{tmp_dir: tmp} do
-    prepared = Tightbeam.GuardRuntimeFixture.prepare!(Path.join(tmp, "payload"), "schema_shape_runtime.exs")
+    prepared =
+      Tightbeam.GuardRuntimeFixture.prepare!(
+        Path.join(tmp, "payload"),
+        "schema_shape_runtime.exs"
+      )
+
     path = Path.join(tmp, "predecessor/state.db")
     Tightbeam.SchemaShapeRuntimeFixture.seed_operator_predecessor!(path, prepared.payload)
     manifest = File.read!(Path.join(prepared.payload, "build-manifest.json")) |> JSON.decode!()
-    transition = JSON.encode!(%{
-      "base" => Path.dirname(path), "source" => "unmarked",
-      "target" => manifest["buildIdentity"], "expectedSchema" => "operator-decision-requests-v1"
-    })
+
+    transition =
+      JSON.encode!(%{
+        "base" => Path.dirname(path),
+        "source" => "unmarked",
+        "target" => manifest["buildIdentity"],
+        "expectedSchema" => "operator-decision-requests-v1"
+      })
+
     name = :"ephemeral_upgrade_#{System.unique_integer([:positive])}"
-    db = start_supervised!(Supervisor.child_spec(
-      {DB, path: path, name: name, payload_root: prepared.payload, guard_inputs: [transition: transition]},
-      id: name
-    ))
+
+    db =
+      start_supervised!(
+        Supervisor.child_spec(
+          {DB,
+           path: path,
+           name: name,
+           payload_root: prepared.payload,
+           guard_inputs: [transition: transition]},
+          id: name
+        )
+      )
 
     assert {:ok, [["operator-decision-requests-v1"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
