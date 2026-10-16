@@ -145,7 +145,9 @@ defmodule Tightbeam.ResponseObservationAdapterTest do
            ) == 1
   end
 
-  test "a real DB timeout after successful send preserves complete and one late effect", %{
+  # The owner drops work whose caller's deadline has passed, so no late effect
+  # lands; the response that was already sent stays complete.
+  test "a real DB timeout after successful send stays complete and drops the expired effect", %{
     port: port,
     db: db
   } do
@@ -181,16 +183,7 @@ defmodule Tightbeam.ResponseObservationAdapterTest do
                      2_000
 
       :sys.resume(db)
-      assert {:ok, [[1]]} = DB.query(db, "SELECT count(*) FROM effects")
-
-      assert_receive {:diagnostic,
-                      %{
-                        event: "db_server_completed",
-                        request_id: ^id,
-                        db_call_id: ^call_id,
-                        result_class: "ok"
-                      }},
-                     2_000
+      assert_expired_effect(db, id, call_id)
 
       assert length(
                Enum.filter(
@@ -203,7 +196,8 @@ defmodule Tightbeam.ResponseObservationAdapterTest do
     end
   end
 
-  test "a timeout response completes once before the queued mutation finishes", %{
+  # Expired owner requests must be dropped rather than applying a late mutation.
+  test "a timeout response completes once and the expired mutation is dropped", %{
     port: port,
     db: db
   } do
@@ -229,7 +223,7 @@ defmodule Tightbeam.ResponseObservationAdapterTest do
                      2_000
 
       :sys.resume(db)
-      assert_late_effect(db, id, call_id)
+      assert_expired_effect(db, id, call_id)
       assert_one_terminal(id)
     end)
   end
@@ -412,10 +406,12 @@ defmodule Tightbeam.ResponseObservationAdapterTest do
 
   for order <- [:send_failure_first, :late_completion_first] do
     @order order
-    test "timeout response failure and late completion retain independent facts: #{@order}", %{
-      port: port,
-      db: db
-    } do
+    # Deadline expiry prevents the mutation in either response-failure ordering.
+    test "timeout response failure and the expired mutation retain independent facts: #{@order}",
+         %{
+           port: port,
+           db: db
+         } do
       with_suspended_db(db, fn ->
         id = RequestContext.id("req_")
         task = Task.async(fn -> request(port, "/timeout-close", id) end)
@@ -428,7 +424,7 @@ defmodule Tightbeam.ResponseObservationAdapterTest do
 
         if @order == :late_completion_first do
           :sys.resume(db)
-          assert_late_effect(db, id, call_id)
+          assert_expired_effect(db, id, call_id)
         end
 
         send(sender, :close_socket)
@@ -449,7 +445,7 @@ defmodule Tightbeam.ResponseObservationAdapterTest do
 
         if @order == :send_failure_first do
           :sys.resume(db)
-          assert_late_effect(db, id, call_id)
+          assert_expired_effect(db, id, call_id)
         end
 
         assert_one_terminal(id)
@@ -474,17 +470,19 @@ defmodule Tightbeam.ResponseObservationAdapterTest do
     end
   end
 
-  defp assert_late_effect(db, id, call_id) do
-    assert {:ok, [[1]]} = confirmation_query(db, "SELECT count(*) FROM effects")
-
+  # The abandoned request reaches the owner after its deadline: it is dropped
+  # with a distinct result class and its effect never lands.
+  defp assert_expired_effect(db, id, call_id) do
     assert_receive {:diagnostic,
                     %{
                       event: "db_server_completed",
                       request_id: ^id,
                       db_call_id: ^call_id,
-                      result_class: "ok"
+                      result_class: "deadline_exceeded"
                     }},
                    2_000
+
+    assert {:ok, [[0]]} = confirmation_query(db, "SELECT count(*) FROM effects")
   end
 
   test "a timed-out confirmation query emits bounded scheduler context and still fails", %{

@@ -901,8 +901,10 @@ defmodule Tightbeam.NoticeBatcherFixture do
     at = Enum.max(Enum.map([user, session, role, other], &Wakes.get(db, &1).due_at))
     finish_running_turn(db, owner_busy, at)
     finish_running_turn(db, other_busy, at)
-    carriers = NoticeBatcher.recover(db, at)
-    assert length(carriers) == 2
+    NoticeBatcher.recover(db, at)
+    # The event-driven scheduler may create a batch before this explicit pass.
+    # Both recipients must still have exactly one durable batch.
+    assert count(db, "notice_batches") == 2
     batch_ids = Enum.map([user, session, role], &batch_id(db, Wakes.get(db, &1)))
     assert length(Enum.uniq(batch_ids)) == 1
     owner_batch = hd(batch_ids)
@@ -1191,12 +1193,12 @@ defmodule Tightbeam.NoticeBatcherFixture do
       assert Wakes.get(db, retry).prompt == Wakes.get(db, original).prompt
       assert Wakes.get(db, retry).state == "pending"
       # Compare every stored field, not just the rendered text. Only successor
-      # identity, retry timing, pending state and original-client dedupe differ.
+      # identity, retry timing, pending state, delivery and client dedupe differ.
       assert {:ok, columns} = DB.query(db, "PRAGMA table_info(wakes)")
 
       names =
         for [_, name | _] <- columns,
-            name not in ~w(wakeId state dueAt canceledAt sourceClientIdentity),
+            name not in ~w(wakeId state dueAt canceledAt sourceClientIdentity deliveredTurnSeq),
             do: name
 
       projection = Enum.join(names, ",")
@@ -1206,6 +1208,15 @@ defmodule Tightbeam.NoticeBatcherFixture do
 
       assert {:ok, [^raw]} =
                DB.query(db, "SELECT #{projection} FROM wakes WHERE wakeId=?1", [retry])
+
+      assert {:ok, [[seq], [nil]]} =
+               DB.query(
+                 db,
+                 "SELECT deliveredTurnSeq FROM wakes WHERE wakeId IN (?1,?2) ORDER BY wakeId=?1 DESC",
+                 [original, retry]
+               )
+
+      assert seq == turn.seq
     end
 
     assert {:ok, [[nil]]} =

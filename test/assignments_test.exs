@@ -5878,6 +5878,28 @@ defmodule Tightbeam.AssignmentsTest do
     refute Enum.any?(markers, &String.contains?(&1, "path denied"))
   end
 
+  test "listing batches declared files without mixing assignments or changing filters", ctx do
+    a =
+      assign_call({:user, "flynn"}, "files a")
+      |> put_in([:params, :files], ["z.ex", "a.ex"])
+      |> then(&handle(ctx, "assign", &1))
+
+    b =
+      assign_call({:user, "flynn"}, "files b")
+      |> put_in([:params, :files], ["b.ex"])
+      |> then(&handle(ctx, "assign", &1))
+
+    c = handle(ctx, "assign", assign_call({:user, "flynn"}, "no files"))
+    assignments = Assignments.list(ctx.db, %{state: "open", holder_key: "holder"})
+    by_id = Map.new(assignments, &{&1.id, &1})
+    assert map_size(by_id) == 3
+    assert by_id[a.id].files == ["a.ex", "z.ex"]
+    assert by_id[b.id].files == ["b.ex"]
+    assert by_id[c.id].files == []
+    assert Enum.all?(assignments, &(&1.commitRefCorrections == []))
+    assert Assignments.list(ctx.db, %{state: "closed"}) == []
+  end
+
   test "assignment readback and work-item trace project the same ordered declared files", ctx do
     paths = [
       "test/job_trace_test.exs",
@@ -6766,13 +6788,18 @@ defmodule Tightbeam.AssignmentsTest do
   test "accepted handler rolls back when its event append fails", ctx do
     {:ok, _} = DB.query(ctx.db, "DROP TABLE events")
 
-    assert_raise MatchError, fn ->
-      Dispatch.dispatch(
-        ctx.db,
-        ctx.handlers,
-        Map.put(assign_call({:session, "holder"}, "committed"), :supervision_interval_ms, 1_000)
-      )
-    end
+    assert {:error, %{code: "server_error", message: message}} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               Map.put(
+                 assign_call({:session, "holder"}, "committed"),
+                 :supervision_interval_ms,
+                 1_000
+               )
+             )
+
+    assert message =~ "events"
 
     assert {:ok, [[0]]} =
              DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE subject = 'committed'")

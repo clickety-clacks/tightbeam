@@ -515,7 +515,7 @@ readiness = %{
 
 {_id, bandit, _type, _modules} =
   Enum.find(
-    Supervisor.which_children(Tightbeam.Supervisor),
+    Supervisor.which_children(Tightbeam.RuntimeSupervisor),
     fn {id, _pid, _type, modules} -> id == Bandit or (is_list(modules) and Bandit in modules) end
   )
 

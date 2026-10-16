@@ -178,7 +178,8 @@ defmodule Tightbeam.VerificationPapertrailTest do
   end
 
   defp admitted_remedy!(ctx, source_id) do
-    source = Wakes.get(ctx.db, source_id)
+    # Dispatch returns after commit; the scheduler admits the notice asynchronously.
+    source = await_remedy(ctx.db, source_id, System.monotonic_time(:millisecond) + 5_000)
     assert source.state == "fired"
 
     assert [%{delivery_wake_id: carrier_id, member_state: "included", batch_state: "delivered"}] =
@@ -202,6 +203,17 @@ defmodule Tightbeam.VerificationPapertrailTest do
              DB.query(ctx.db, "SELECT count(*) FROM turns WHERE wakeId=?1", [source_id])
 
     source
+  end
+
+  defp await_remedy(db, source_id, deadline) do
+    source = Wakes.get(db, source_id)
+
+    if source.state == "fired" or System.monotonic_time(:millisecond) >= deadline do
+      source
+    else
+      Process.sleep(10)
+      await_remedy(db, source_id, deadline)
+    end
   end
 
   test "A2: the complete papertrail passes and the episodes close", ctx do

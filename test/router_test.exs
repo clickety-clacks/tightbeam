@@ -39,6 +39,38 @@ defmodule Tightbeam.Wire.RouterTest do
     def handle_call({:fire_matching, _fact_id}, _from, state), do: {:reply, :ok, state}
   end
 
+  test "unknown keys cannot create atoms or borrow another verb's parameters" do
+    key = "unrecognized_wire_key_#{System.unique_integer([:positive])}"
+    assert_raise ArgumentError, fn -> String.to_existing_atom(key) end
+
+    assert Router.atomize_params_for_test("wake", %{
+             key => true,
+             "prompt" => "hello",
+             "artifactId" => "a"
+           }) == %{:prompt => "hello", key => true, "artifactId" => "a"}
+
+    assert_raise ArgumentError, fn -> String.to_existing_atom(key) end
+
+    assert Router.atomize_params_for_test("unknown-verb", %{"prompt" => "hello"}) == %{
+             "prompt" => "hello"
+           }
+
+    assert Router.atomize_params_for_test("tune", %{
+             "fastMode" => "on",
+             "reasoningLevel" => "high"
+           }) == %{fastMode: "on", reasoningLevel: "high"}
+  end
+
+  test "effort and health parameters preserve accepted aliases" do
+    assert Router.atomize_params_for_test("effort-rule", %{"requestId" => "request"}) ==
+             %{request_id: "request"}
+
+    assert Router.atomize_params_for_test("harness-health-observe-other", %{
+             "acceptedAt" => 123,
+             "sessionKey" => "source"
+           }) == %{accepted_at: 123, session_key: "source"}
+  end
+
   test "changes route refuses missing upgrade or unsupported protocol before authentication" do
     hub = :"router_refused_changes_hub_#{System.unique_integer([:positive])}"
     start_supervised!({Tightbeam.Firehose.Hub, name: hub})
@@ -60,6 +92,46 @@ defmodule Tightbeam.Wire.RouterTest do
     end
 
     assert :sys.get_state(hub) == hub_before
+  end
+
+  defmodule ReadConnAdapter do
+    # A body read consumes the adapter state, just as a real HTTP connection does.
+    def read_req_body({adapter, payload, false}, opts) do
+      {status, body, next} = adapter.read_req_body(payload, opts)
+      {status, body, {adapter, next, true}}
+    end
+
+    def send_resp({adapter, payload, true}, status, headers, body),
+      do: adapter.send_resp(payload, status, headers, body)
+  end
+
+  test "JSON and validation errors respond with the connection returned by the body read", ctx do
+    create_session(ctx.db, "body-conn-session", ctx.device.user_id)
+
+    for {method, path, token, body} <- [
+          {:post, "/agent/dispatch", "tbc_test", "{"},
+          {:post, "/agent/dispatch", "tbc_test", "[]"},
+          {:post, "/agent/dispatch", "tbc_test", ~s({"verb":"unsupported"})},
+          {:post, "/api/streams", ctx.device.token, "{}"},
+          {:patch, "/api/streams/body-conn-session", ctx.device.token, "{}"},
+          {:delete, "/api/streams/missing", ctx.device.token, "{"},
+          {:post, "/api/session-control", ctx.device.token, "{}"}
+        ] do
+      request =
+        conn(method, path, body)
+        |> put_req_header("authorization", "Bearer " <> token)
+        |> put_req_header("content-type", "application/json")
+        |> put_req_header(
+          "x-tightbeam-cli-version",
+          Tightbeam.CliCompatibility.required_version()
+        )
+
+      {adapter, payload} = request.adapter
+      request = %{request | adapter: {ReadConnAdapter, {adapter, payload, false}}}
+      response = Router.call(request, Router.init(ctx.opts))
+      assert response.status in [400, 404]
+      assert is_map(JSON.decode!(response.resp_body)["error"])
+    end
   end
 
   setup do
@@ -99,11 +171,11 @@ defmodule Tightbeam.Wire.RouterTest do
       end,
       "attest" => fn call ->
         send(parent, {:call, call})
-        %{code: call.params[:return_code] || "not_holder"}
+        %{code: call.params["returnCode"] || "not_holder"}
       end,
       "revoke-assignment" => fn call ->
         send(parent, {:call, call})
-        %{code: call.params[:return_code] || "not_authorized"}
+        %{code: call.params["returnCode"] || "not_authorized"}
       end,
       "assignments" => fn call ->
         send(parent, {:call, call})
@@ -116,8 +188,8 @@ defmodule Tightbeam.Wire.RouterTest do
       "work-item-get" => fn call ->
         send(parent, {:call, call})
 
-        if call.params[:return_code],
-          do: %{code: call.params.return_code},
+        if call.params["returnCode"],
+          do: %{code: call.params["returnCode"]},
           else: %{workItem: %{id: call.params.work_item_id}, assignments: []}
       end,
       "work-item-trace" => fn call ->
@@ -142,8 +214,8 @@ defmodule Tightbeam.Wire.RouterTest do
       "artifact-get" => fn call ->
         send(parent, {:call, call})
 
-        if call.params[:return_code],
-          do: %{code: call.params.return_code},
+        if call.params["returnCode"],
+          do: %{code: call.params["returnCode"]},
           else: %{artifact_id: call.params.artifact_id}
       end,
       "artifact-content-fetch" => fn call ->
@@ -1450,6 +1522,7 @@ defmodule Tightbeam.Wire.RouterTest do
   end
 
   test "/version states which bytes the gateway is: version + build stamp", ctx do
+    before = Tightbeam.SchedulerMisses.count()
     response = Router.call(conn(:get, "/version"), Router.init(ctx.opts))
 
     assert response.status == 200
@@ -1464,6 +1537,23 @@ defmodule Tightbeam.Wire.RouterTest do
     assert is_integer(body["build"]) and body["build"] > 0
     assert body["build"] == Tightbeam.BuildStamp.build()
     assert body["sha"] == Tightbeam.BuildStamp.sha()
+    assert body["schedulerMisses"] - before == 0
+  end
+
+  test "/version reports recorded event misses with bounded recent details", ctx do
+    before = Tightbeam.SchedulerMisses.health()
+    for n <- 1..25, do: Tightbeam.SchedulerMisses.record(:wake, "doctor-miss-#{n}", n * 1_000)
+    response = Router.call(conn(:get, "/version"), Router.init(ctx.opts))
+    body = JSON.decode!(response.resp_body)
+    health = body["eventPaths"]
+    assert body["schedulerMisses"] - before.count == 25
+    assert health["count"] == body["schedulerMisses"]
+    assert health["byLoop"]["wake"] - before.by_loop.wake == 25
+    assert length(health["recent"]) == 20
+    assert hd(health["recent"])["recordId"] == "doctor-miss-25"
+    assert hd(health["recent"])["lateMs"] == 25_000
+    assert hd(health["recent"])["loop"] == "wake"
+    assert is_integer(hd(health["recent"])["at"])
   end
 
   test "CLI exact-version refusal is loud after bearer authentication", ctx do
@@ -3265,6 +3355,13 @@ defmodule Tightbeam.Wire.RouterTest do
         else: Application.delete_env(:tightbeam, :advertised_url)
     end)
 
+    start_supervised!(%{
+      id: Tightbeam.RuntimeSupervisor,
+      start:
+        {Supervisor, :start_link,
+         [[], [strategy: :one_for_one, name: Tightbeam.RuntimeSupervisor]]}
+    })
+
     credential_supervisor =
       start_supervised!(%{
         id: :router_credential_supervisor,
@@ -3315,7 +3412,7 @@ defmodule Tightbeam.Wire.RouterTest do
              _child -> false
            end)
 
-    refute Enum.any?(Supervisor.which_children(Tightbeam.Supervisor), fn
+    refute Enum.any?(Supervisor.which_children(Tightbeam.RuntimeSupervisor), fn
              {{Credentials, "worker"}, _pid, :worker, [Credentials]} -> true
              _child -> false
            end)

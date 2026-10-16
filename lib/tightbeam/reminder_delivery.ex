@@ -5,7 +5,6 @@ defmodule Tightbeam.ReminderDelivery do
   # terminal transaction. Enqueue, running, and unknown outcomes are not success.
   @gaps [300_000, 900_000, 1_800_000, 1_800_000]
 
-  alias Tightbeam.NoticeBatcher
   alias Tightbeam.DB.Txn
 
   # The caller has already established ordinary supervision eligibility. This
@@ -74,7 +73,7 @@ defmodule Tightbeam.ReminderDelivery do
       Txn.q(
         txn,
         """
-        WITH source_deliveries AS (#{NoticeBatcher.source_deliveries_sql()})
+        WITH source_deliveries AS (#{Tightbeam.NoticeBatcher.recorded_deliveries_sql()})
         SELECT 1 FROM wakes w JOIN wake_cancellations c ON c.wakeId=w.wakeId
         WHERE w.wakeId=?1 AND w.assignmentId=?2 AND w.state='canceled'
           AND c.outcomeKind='no_replacement'
@@ -125,10 +124,10 @@ defmodule Tightbeam.ReminderDelivery do
           Txn.q(
             txn,
             """
-            WITH source_deliveries AS (#{NoticeBatcher.source_deliveries_sql()})
+            WITH source_deliveries AS (#{Tightbeam.NoticeBatcher.recorded_deliveries_sql()})
             SELECT d.assignmentId,d.sourceWakeId
             FROM source_deliveries d
-            WHERE d.turnSeq=?1 AND d.carrier=1 AND d.assignmentId IS NOT NULL
+            WHERE d.turnSeq=?1 AND #{Tightbeam.NoticeBatcher.carrier_delivery_sql("d")} AND d.assignmentId IS NOT NULL
             """,
             [turn_seq]
           )
@@ -162,7 +161,7 @@ defmodule Tightbeam.ReminderDelivery do
           Txn.q(
             txn,
             """
-            WITH source_deliveries AS (#{NoticeBatcher.source_deliveries_sql()})
+            WITH source_deliveries AS (#{Tightbeam.NoticeBatcher.recorded_deliveries_sql()})
             SELECT d.sourceWakeId FROM source_deliveries d
             WHERE d.turnSeq=?1 AND d.assignmentId=?2 ORDER BY d.sourceWakeId
             """,

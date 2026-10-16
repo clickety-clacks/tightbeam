@@ -23,6 +23,8 @@ defmodule Tightbeam.LateRulingHandoffTest do
              )
 
     assert :ok = Tightbeam.Wakes.fire_matching(ctx.scheduler, fact_id)
+    # Wait for the delivery pass the condition nudge queued.
+    :sys.get_state(ctx.scheduler)
     assert Tightbeam.Wakes.get(ctx.db, same.wake_id).state == "fired"
     assert Tightbeam.Wakes.get(ctx.db, other.wake_id).state == "pending"
 

@@ -44,7 +44,7 @@ defmodule Tightbeam.ConformanceSupport do
                ~w(case kind expect reason emits input script_return world call phase2 phase)
              )
   @expects MapSet.new(
-             ~w(deny pass refuse run-remedy re-obligate escalate-park none escalate-halt escalate-open escalate-continue load-raise load-clean)
+             ~w(deny pass refuse run-remedy re-obligate escalate-park none escalate-halt escalate-open escalate-continue load-unavailable load-clean)
            )
   @case_expects %{
     "harness-gate" => ~w(deny pass),
@@ -227,14 +227,14 @@ defmodule Tightbeam.ConformanceSupport do
 
     assert loadset["phase"] in ~w(green pending pending-unhomed pending-runtime pending-escalation-review)
 
-    assert loadset["outcome"] in ~w(load-raise load-clean)
+    assert loadset["outcome"] in ~w(load-unavailable load-clean)
 
-    if loadset["outcome"] == "load-raise" do
+    if loadset["outcome"] == "load-unavailable" do
       assert is_list(loadset["must_name"]) and loadset["must_name"] != [],
-             "#{path}: load-raise needs must_name"
+             "#{path}: load-unavailable needs must_name"
 
       assert is_binary(loadset["error_match"]) and loadset["error_match"] != "",
-             "#{path}: load-raise needs error_match"
+             "#{path}: load-unavailable needs error_match"
     end
 
     loadset_dir = String.replace_suffix(path, ".load.toml", ".loadset")
@@ -402,10 +402,12 @@ defmodule Tightbeam.ConformanceSupport do
     loadsets =
       Map.new(Enum.filter(fixtures, &(&1["kind"] == "load-rejection")), &{&1["name"], &1})
 
-    Enum.each(@load_twins, fn [raise_name, clean_name] ->
-      assert Map.has_key?(loadsets, raise_name), "missing load-raise twin #{raise_name}"
+    Enum.each(@load_twins, fn [unavailable_name, clean_name] ->
+      assert Map.has_key?(loadsets, unavailable_name),
+             "missing load-unavailable twin #{unavailable_name}"
+
       assert Map.has_key?(loadsets, clean_name), "missing load-clean twin #{clean_name}"
-      assert loadsets[raise_name]["outcome"] == "load-raise"
+      assert loadsets[unavailable_name]["outcome"] == "load-unavailable"
       assert loadsets[clean_name]["outcome"] == "load-clean"
     end)
   end
@@ -951,24 +953,27 @@ defmodule Tightbeam.ConformanceSupport do
     |> Enum.each(&File.cp!(&1, Path.join(scripts_dir, Path.basename(&1))))
 
     try do
-      outcome =
-        try do
+      {_rules, log} =
+        ExUnit.CaptureLog.with_log(fn ->
           Rules.load!(base, Map.keys(Gateway.handlers(%{})))
-          :clean
-        rescue
-          error in ArgumentError -> {:raise, Exception.message(error)}
-        end
+        end)
 
-      case {loadset["outcome"], outcome} do
-        {"load-clean", :clean} ->
-          :ok
+      unavailable = :persistent_term.get({Rules, :unavailable_verbs})
 
-        {"load-raise", {:raise, message}} ->
-          assert message =~ loadset["error_match"]
-          Enum.each(loadset["must_name"], &assert(message =~ &1))
+      case loadset["outcome"] do
+        "load-clean" ->
+          assert unavailable == %{}
 
-        expected ->
-          flunk("load assertion mismatch: #{inspect(expected)}")
+        "load-unavailable" ->
+          assert map_size(unavailable) > 0
+          assert log =~ "unavailable"
+          assert log =~ loadset["error_match"]
+          Enum.each(loadset["must_name"], &assert(log =~ &1))
+
+          for {verb, _source} <- unavailable do
+            assert {:deny, %{code: "rule_unavailable"}} =
+                     Rules.evaluate(nil, %{verb: verb, origin: "user:test", params: %{}})
+          end
       end
     after
       File.rm_rf!(base)
@@ -1923,6 +1928,8 @@ defmodule Tightbeam.ConformanceSupport do
                          scheduler: scheduler
                        )
 
+              # Wait for the delivery pass the condition nudge queued.
+              :sys.get_state(scheduler)
               assert %{state: "fired", fired_by: "condition"} = Wakes.get(db, park_wake_id)
 
               if kase["kind"] == "legibility" do

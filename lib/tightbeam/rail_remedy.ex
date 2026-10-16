@@ -14,8 +14,11 @@ defmodule Tightbeam.RailRemedy do
     Wakes
   }
 
+  require Logger
+
   alias Tightbeam.DB.Txn
 
+  @reassessment_wait 253_402_300_799_000
   @ttl_ms 60_000
   @token_re ~r/\{([^{}]+)\}/
 
@@ -104,6 +107,8 @@ defmodule Tightbeam.RailRemedy do
 
     result =
       case DB.transaction(db, fn txn ->
+             Wakes.schedule_changed_in_txn(txn, :review_remedy_changed)
+
              row =
                Txn.q(
                  txn,
@@ -199,7 +204,7 @@ defmodule Tightbeam.RailRemedy do
           Tightbeam.Gateway.schedule_review_notice_in_txn(txn, recipient, %{
             wake_id: reassess_id,
             assignment_id: subject,
-            due_at: now + interval,
+            due_at: @reassessment_wait,
             consumer: "review_remedy_reconcile",
             prompt:
               JSON.encode!(%{
@@ -241,127 +246,149 @@ defmodule Tightbeam.RailRemedy do
   end
 
   @doc false
-  def reconcile_pending_episodes(db, interval) do
+  def reconcile_pending_episodes(db, interval, subject \\ nil) do
     DB.transaction(db, fn txn ->
-      Txn.q(txn, """
-      SELECT subject,occurrence,producerKey,noticeState FROM rail_remedy_episodes
-      WHERE statute='completion-requires-review' AND status='live'
-        AND (noticeState IS NULL OR json_extract(noticeState,'$.reassessment') IS NULL)
-      ORDER BY openedAt,subject LIMIT 100
-      """)
+      Txn.q(
+        txn,
+        """
+        SELECT subject,occurrence,producerKey,noticeState FROM rail_remedy_episodes
+        WHERE statute='completion-requires-review' AND status='live'
+          AND (?1 IS NULL OR subject=?1)
+        ORDER BY openedAt,subject
+        """,
+        [subject]
+      )
       |> Enum.each(fn [subject, occurrence, producer, encoded] ->
-        state =
-          if encoded,
-            do: decode_notice_state(encoded),
-            else:
-              notice_state(nil, nil, nil, nil, now(), interval)
-              |> Map.put("legacyProducer", producer)
+        :ok = Txn.exec(txn, "SAVEPOINT review_episode")
 
-        cond do
-          state["need"]["state"] == "withdrawn" ->
-            :ok
+        try do
+          state =
+            if encoded,
+              do: decode_notice_state(encoded),
+              else:
+                notice_state(nil, nil, nil, nil, now(), interval)
+                |> Map.put("legacyProducer", producer)
 
-          state["blocked"] == "accountable_owner_chain_exhausted" ->
-            :ok
+          cond do
+            not is_nil(state["reassessment"]) ->
+              :ok
 
-          true ->
-            case Tightbeam.Gateway.review_notice_recipient_in_txn(txn, subject) do
-              {:ok, recipient} ->
-                state =
-                  if is_nil(state["root"]) do
-                    legacy? = Map.has_key?(state, "legacyProducer")
+            state["need"]["state"] == "withdrawn" ->
+              :ok
 
-                    root_id =
-                      if legacy?,
-                        do:
-                          notice_recovery_wake_id(
-                            "completion-requires-review",
-                            subject,
-                            occurrence,
-                            1,
-                            "legacy-reconcile"
-                          ),
-                        else: notice_wake_id("completion-requires-review", subject, occurrence, 0)
+            state["blocked"] == "accountable_owner_chain_exhausted" ->
+              :ok
 
-                    prompt =
-                      if legacy?,
-                        do:
-                          "Reconcile preserved legacy review producer #{inspect(producer)} for #{subject}; retain existing review custody and do not assume delivery or restaff.",
-                        else:
-                          "Independent review remains required for assignment #{subject}; resolve its recorded need."
+            true ->
+              case Tightbeam.Gateway.review_notice_recipient_in_txn(txn, subject) do
+                {:ok, recipient} ->
+                  state =
+                    if is_nil(state["root"]) do
+                      legacy? = Map.has_key?(state, "legacyProducer")
 
-                    root =
-                      schedule_protocol_notice(txn, recipient, state, %{
-                        wake_id: root_id,
-                        assignment_id: subject,
-                        due_at: now(),
-                        prompt: prompt
-                      })
+                      root_id =
+                        if legacy?,
+                          do:
+                            notice_recovery_wake_id(
+                              "completion-requires-review",
+                              subject,
+                              occurrence,
+                              1,
+                              "legacy-reconcile"
+                            ),
+                          else:
+                            notice_wake_id("completion-requires-review", subject, occurrence, 0)
 
-                    next =
-                      put_in(state, ["root"], %{
-                        "wakeId" => root.wake_id,
-                        "recipient" => recipient.session_key,
-                        "purpose" => if(legacy?, do: "legacy-reconcile", else: "review-needed")
-                      })
+                      prompt =
+                        if legacy?,
+                          do:
+                            "Reconcile preserved legacy review producer #{inspect(producer)} for #{subject}; retain existing review custody and do not assume delivery or restaff.",
+                          else:
+                            "Independent review remains required for assignment #{subject}; resolve its recorded need."
 
+                      root =
+                        schedule_protocol_notice(txn, recipient, state, %{
+                          wake_id: root_id,
+                          assignment_id: subject,
+                          due_at: now(),
+                          prompt: prompt
+                        })
+
+                      next =
+                        put_in(state, ["root"], %{
+                          "wakeId" => root.wake_id,
+                          "recipient" => recipient.session_key,
+                          "purpose" => if(legacy?, do: "legacy-reconcile", else: "review-needed")
+                        })
+
+                      Txn.q(
+                        txn,
+                        "UPDATE rail_remedy_episodes SET producerKey=?3 WHERE statute=?1 AND subject=?2",
+                        ["completion-requires-review", subject, root.wake_id]
+                      )
+
+                      next
+                    else
+                      state
+                    end
+
+                  old_generations =
                     Txn.q(
                       txn,
-                      "UPDATE rail_remedy_episodes SET producerKey=?3 WHERE statute=?1 AND subject=?2",
-                      ["completion-requires-review", subject, root.wake_id]
+                      """
+                      SELECT wakeId,json_extract(prompt,'$.generation') FROM wakes
+                      WHERE consumer='review_remedy_reconcile' AND json_valid(prompt)
+                        AND json_extract(prompt,'$.statute')='completion-requires-review'
+                        AND json_extract(prompt,'$.subject')=?1 AND json_extract(prompt,'$.occurrence')=?2
+                      """,
+                      [subject, occurrence]
                     )
 
-                    next
-                  else
-                    state
+                  if is_nil(encoded) do
+                    Enum.each(old_generations, fn [id, _] ->
+                      Txn.q(
+                        txn,
+                        "UPDATE wakes SET state='fired',firedAt=?2 WHERE wakeId=?1 AND state='pending' AND consumer='review_remedy_reconcile'",
+                        [id, now()]
+                      )
+                    end)
                   end
 
-                old_generations =
-                  Txn.q(
+                  generation =
+                    Enum.max([
+                      state["lastGeneration"] || 0 | Enum.map(old_generations, &Enum.at(&1, 1))
+                    ])
+
+                  schedule_next_reassessment(
                     txn,
-                    """
-                    SELECT wakeId,json_extract(prompt,'$.generation') FROM wakes
-                    WHERE consumer='review_remedy_reconcile' AND json_valid(prompt)
-                      AND json_extract(prompt,'$.statute')='completion-requires-review'
-                      AND json_extract(prompt,'$.subject')=?1 AND json_extract(prompt,'$.occurrence')=?2
-                    """,
-                    [subject, occurrence]
+                    "completion-requires-review",
+                    subject,
+                    occurrence,
+                    generation,
+                    interval,
+                    Map.put(state, "intervalMs", interval),
+                    now()
                   )
 
-                if is_nil(encoded) do
-                  Enum.each(old_generations, fn [id, _] ->
-                    Txn.q(
-                      txn,
-                      "UPDATE wakes SET state='fired',firedAt=?2 WHERE wakeId=?1 AND state='pending' AND consumer='review_remedy_reconcile'",
-                      [id, now()]
-                    )
-                  end)
-                end
+                {:error, missing} ->
+                  persist_notice_state(
+                    txn,
+                    "completion-requires-review",
+                    subject,
+                    recipient_blocked(state, missing)
+                  )
+              end
+          end
 
-                generation =
-                  Enum.max([
-                    state["lastGeneration"] || 0 | Enum.map(old_generations, &Enum.at(&1, 1))
-                  ])
+          :ok = Txn.exec(txn, "RELEASE review_episode")
+        rescue
+          error ->
+            :ok = Txn.exec(txn, "ROLLBACK TO review_episode")
+            :ok = Txn.exec(txn, "RELEASE review_episode")
 
-                schedule_next_reassessment(
-                  txn,
-                  "completion-requires-review",
-                  subject,
-                  occurrence,
-                  generation,
-                  interval,
-                  Map.put(state, "intervalMs", interval),
-                  now()
-                )
-
-              {:error, missing} ->
-                persist_notice_state(
-                  txn,
-                  "completion-requires-review",
-                  subject,
-                  recipient_blocked(state, missing)
-                )
-            end
+            Logger.warning(
+              "review remedy episode #{subject}/#{occurrence} deferred: #{Exception.message(error)}"
+            )
         end
       end)
 
@@ -483,7 +510,19 @@ defmodule Tightbeam.RailRemedy do
                    end
 
                  _ ->
-                   raise ArgumentError, "review remedy episode is not live"
+                   # The episode closed or moved to another occurrence, so this
+                   # reassessment can never apply. Consume it once instead of
+                   # failing on every scheduler tick.
+                   Tightbeam.Wakes.consume_internal_in_txn(txn, wake.wake_id)
+
+                   EventLog.lifecycle_in_txn(
+                     txn,
+                     "rail_remedy_reassessment_retired",
+                     subject,
+                     "wakeId=#{wake.wake_id} cause=episode_not_live occurrence=#{occurrence} principal=process:tightbeam"
+                   )
+
+                   :ok
                end
              end) do
           {:ok, :ok} -> :ok
@@ -511,14 +550,26 @@ defmodule Tightbeam.RailRemedy do
   @doc "Actor-owned live-to-closed CAS for one passed statute occurrence."
   @spec close(DB.server(), String.t(), String.t(), pos_integer()) :: boolean()
   def close(db, statute, subject, occurrence) do
-    cas(
-      db,
-      """
-      UPDATE rail_remedy_episodes SET status = 'closed', closedAt = ?4
-      WHERE statute = ?1 AND subject = ?2 AND occurrence = ?3 AND status = 'live'
-      """,
-      [statute, subject, occurrence, now()]
-    )
+    case DB.transaction(db, fn txn ->
+           Txn.q(
+             txn,
+             """
+             UPDATE rail_remedy_episodes SET status = 'closed', closedAt = ?4
+             WHERE statute = ?1 AND subject = ?2 AND occurrence = ?3 AND status = 'live'
+             """,
+             [statute, subject, occurrence, now()]
+           )
+
+           won? = Txn.changes(txn) == 1
+
+           if won? and statute == "completion-requires-review",
+             do: Wakes.schedule_changed_in_txn(txn, :review_remedy_changed)
+
+           won?
+         end) do
+      {:ok, won?} -> won?
+      {:error, error} -> raise error
+    end
   end
 
   @doc false
@@ -1312,7 +1363,7 @@ defmodule Tightbeam.RailRemedy do
       "observations" => [],
       "reassessment" =>
         if(is_binary(reassess_id),
-          do: %{"generation" => 1, "wakeId" => reassess_id, "dueAt" => now + interval},
+          do: %{"generation" => 1, "wakeId" => reassess_id, "dueAt" => @reassessment_wait},
           else: nil
         )
     }
@@ -1882,9 +1933,9 @@ defmodule Tightbeam.RailRemedy do
          subject,
          occurrence,
          generation,
-         interval,
+         _interval,
          state,
-         now
+         _now
        ) do
     if state["blocked"] == "accountable_owner_chain_exhausted" do
       persist_notice_state(txn, statute, subject, put_in(state, ["reassessment"], nil))
@@ -1896,7 +1947,7 @@ defmodule Tightbeam.RailRemedy do
           schedule_protocol_notice(txn, recipient, state, %{
             wake_id: next_id,
             assignment_id: subject,
-            due_at: now + interval,
+            due_at: @reassessment_wait,
             consumer: "review_remedy_reconcile",
             prompt:
               JSON.encode!(%{
@@ -1911,7 +1962,7 @@ defmodule Tightbeam.RailRemedy do
             put_in(state, ["reassessment"], %{
               "generation" => generation + 1,
               "wakeId" => next_id,
-              "dueAt" => now + interval
+              "dueAt" => @reassessment_wait
             })
 
           state = Map.put(state, "lastGeneration", generation + 1)

@@ -38,6 +38,12 @@ defmodule Tightbeam.AssignmentCommitRefCorrectionsTest do
     assert [%{"verifiedRefCommit" => verified}] = correction.commitRefs
     assert verified == ctx.commit
 
+    listed = Map.new(Assignments.list(ctx.db, %{state: "all"}), &{&1.id, &1})
+    assert listed["asg_closed"].commitRefCorrections == [correction]
+    assert listed["asg_open"].commitRefCorrections == []
+    assert AssignmentCommitRefCorrections.list_many(ctx.db, []) == %{}
+    assert AssignmentCommitRefCorrections.list(ctx.db, "absent") == []
+
     assert lifecycle(ctx.db, "asg_closed") == before
 
     assert {:ok, [[0]]} =

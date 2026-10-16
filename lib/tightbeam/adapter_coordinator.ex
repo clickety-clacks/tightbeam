@@ -283,8 +283,16 @@ defmodule Tightbeam.AdapterCoordinator do
     # One monotonic clock covers preparation, park attempts, durable settlement,
     # and nonblocking retirement. Reserve the final slice for settlement; if
     # either DB phase cannot finish, keep the outcome explicitly unresolved.
-    deadline = System.monotonic_time(:millisecond) + state.shutdown_budget_ms
-    settle_start = deadline - state.shutdown_settlement_budget_ms
+    local_deadline = System.monotonic_time(:millisecond) + state.shutdown_budget_ms
+    deadline = Tightbeam.Application.shutdown_deadline(local_deadline)
+    remaining = max(deadline - System.monotonic_time(:millisecond), 0)
+
+    settlement_budget =
+      if deadline < local_deadline,
+        do: min(state.shutdown_settlement_budget_ms, div(remaining, 5)),
+        else: state.shutdown_settlement_budget_ms
+
+    settle_start = deadline - settlement_budget
 
     # A park phase that times out still owes every cancelled task the cancel
     # grace, so parking must surrender the clock one grace before the reserve
@@ -576,7 +584,7 @@ defmodule Tightbeam.AdapterCoordinator do
 
     state =
       Enum.reduce(keys, state, fn key, state ->
-        cancel_pending_starts(key, state)
+        cancel_pending_starts(key, state, deadline)
       end)
 
     case Tightbeam.HarnessProcess.begin_park_many_until(state.db, keys, deadline) do
@@ -868,14 +876,14 @@ defmodule Tightbeam.AdapterCoordinator do
     end
   end
 
-  defp cancel_pending_starts(key, state) do
+  defp cancel_pending_starts(key, state, deadline \\ :infinity) do
     case state.adapters[key] do
       %{timer: timer} = entry ->
         if is_reference(timer), do: Process.cancel_timer(timer)
 
         state =
           if readiness_pending?(entry),
-            do: terminate_readiness_generation(key, entry, state, true),
+            do: terminate_readiness_generation(key, entry, state, true, deadline),
             else: state
 
         Enum.each(entry.waiters, fn {monitor, from} ->
@@ -1306,7 +1314,7 @@ defmodule Tightbeam.AdapterCoordinator do
     begin_readiness(key, replacement, state, context, from)
   end
 
-  defp terminate_readiness_generation(key, entry, state, settle?) do
+  defp terminate_readiness_generation(key, entry, state, settle?, deadline \\ :infinity) do
     cancel_timer_flush(
       entry.readiness_timer,
       {:adapter_readiness_timeout, key, entry.generation, entry.readiness_token}
@@ -1321,7 +1329,10 @@ defmodule Tightbeam.AdapterCoordinator do
     state =
       if is_pid(entry.pid) do
         if is_reference(entry.monitor), do: Process.demonitor(entry.monitor, [:flush])
-        _ = DynamicSupervisor.terminate_child(state.adapter_sup, entry.pid)
+
+        if deadline != :infinity,
+          do: Process.exit(entry.pid, :kill),
+          else: DynamicSupervisor.terminate_child(state.adapter_sup, entry.pid)
 
         %{
           state
@@ -1332,12 +1343,30 @@ defmodule Tightbeam.AdapterCoordinator do
         state
       end
 
-    if settle?, do: reconcile_launch_generation(state.db, key)
+    if settle?, do: reconcile_launch_generation(state.db, key, deadline)
     state
   end
 
   defp live_waiters(waiters) do
     Enum.filter(waiters, fn {_monitor, {pid, _tag}} -> Process.alive?(pid) end)
+  end
+
+  defp reconcile_launch_generation(db, key, :infinity),
+    do: reconcile_launch_generation(db, key)
+
+  defp reconcile_launch_generation(db, key, deadline) do
+    task = Task.async(fn -> reconcile_launch_generation(db, key) end)
+
+    case Task.yield(task, max(deadline - System.monotonic_time(:millisecond), 0)) ||
+           Task.shutdown(task, :brutal_kill) do
+      {:ok, result} ->
+        result
+
+      _ ->
+        Logger.error(
+          "adapter readiness generation cleanup unresolved before deadline for #{key_name(key)}"
+        )
+    end
   end
 
   defp reconcile_launch_generation(db, key) do

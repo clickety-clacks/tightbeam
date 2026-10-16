@@ -71,7 +71,182 @@ defmodule Tightbeam.RailRemedyTest do
       :persistent_term.erase(Rules)
     end)
 
-    %{db: db, base_dir: base_dir, handlers: handlers, holder: holder, reviewer: reviewer}
+    registry =
+      start_supervised!(Supervisor.child_spec({ConnRegistry, name: nil}, id: :scheduler_registry))
+
+    lane = :"remedy_lane_#{System.unique_integer([:positive])}"
+
+    start_supervised!(
+      Supervisor.child_spec({Tightbeam.NoticeBatcherFixture.LaneStub, lane}, id: :scheduler_lane)
+    )
+
+    %{
+      db: db,
+      base_dir: base_dir,
+      handlers: handlers,
+      holder: holder,
+      reviewer: reviewer,
+      delivery_opts: [conn_registry: registry, lane_manager: lane]
+    }
+  end
+
+  for invalid <- ["{", "{}"] do
+    test "bad episode #{inspect(invalid)} leaves other review recovery and wake delivery running",
+         ctx do
+      bad = notice_assignment(ctx, "bad recovery")
+      good = notice_assignment(ctx, "healthy recovery")
+      fire_review_notice(ctx, bad)
+      fire_review_notice(ctx, good)
+
+      assert {:ok, _} =
+               DB.query(
+                 ctx.db,
+                 "UPDATE rail_remedy_episodes SET noticeState=?2 WHERE subject=?1",
+                 [bad.id, unquote(invalid)]
+               )
+
+      assert {:ok, _} =
+               DB.query(
+                 ctx.db,
+                 "UPDATE rail_remedy_episodes SET noticeState=NULL WHERE subject=?1",
+                 [good.id]
+               )
+
+      parent = self()
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          pid =
+            start_supervised!(
+              {Wakes,
+               db: ctx.db,
+               name: Tightbeam.WakeScheduler,
+               delivery_opts: ctx.delivery_opts,
+               deliver: fn _ -> :skipped end,
+               internal_consumers: %{
+                 "test" => fn wake -> send(parent, {:healthy_delivery, wake.wake_id}) end,
+                 "review_remedy_reconcile" => fn _ -> :ok end
+               }}
+            )
+
+          ordinary =
+            Wakes.schedule(ctx.db, %{
+              session_key: ctx.holder.session_key,
+              origin: "system",
+              prompt: "ordinary",
+              due_at: 1,
+              consumer: "test"
+            })
+
+          assert :ok = Wakes.fire_due(pid)
+          assert_receive {:healthy_delivery, id}, 1_000
+          assert id == ordinary.wake_id
+          assert Process.alive?(pid)
+        end)
+
+      assert log =~ bad.id
+      assert log =~ "episode"
+      assert RailRemedy.episode(ctx.db, "completion-requires-review", good.id).notice_state != nil
+
+      assert {:ok, [[encoded]]} =
+               DB.query(ctx.db, "SELECT noticeState FROM rail_remedy_episodes WHERE subject=?1", [
+                 bad.id
+               ])
+
+      assert encoded == unquote(invalid)
+    end
+  end
+
+  test "an open review episode sleeps until readiness or a verdict", ctx do
+    assignment = notice_assignment(ctx, "event reassessment")
+    %{producer_id: root} = fire_review_notice(ctx, assignment)
+    mark_notice_turn(ctx.db, assignment.id, root, "delivered")
+    parent = self()
+
+    consumer = fn wake ->
+      send(parent, {:reassessed, wake.wake_id})
+      RailRemedy.reconcile_notice(ctx.db, %{}, wake)
+    end
+
+    pid =
+      start_supervised!(
+        {Wakes,
+         db: ctx.db,
+         name: Tightbeam.WakeScheduler,
+         delivery_opts: ctx.delivery_opts,
+         deliver: fn _ -> :skipped end,
+         internal_consumers: %{"review_remedy_reconcile" => consumer}}
+      )
+
+    assert_receive {:reassessed, _}, 1_000
+    # Finish the pass and its committed scheduling hooks.
+    :sys.get_state(pid)
+    :sys.get_state(pid)
+    episode = RailRemedy.episode(ctx.db, "completion-requires-review", assignment.id)
+    parked = episode.notice_state["reassessment"]["wakeId"]
+    assert Wakes.get(ctx.db, parked).due_at == 253_402_300_799_000
+    Process.sleep(150)
+    timer = :sys.get_state(pid).timer
+    :erlang.trace(pid, true, [:send, {:tracer, self()}])
+
+    try do
+      refute_receive {:trace, ^pid, :send, {:"$gen_call", _, _}, _}, 1_200
+    after
+      :erlang.trace(pid, false, [:send])
+    end
+
+    refute_receive {:reassessed, _}, 0
+    assert :sys.get_state(pid).timer == timer
+
+    Wakes.recipient_ready(pid, ctx.holder.session_key)
+    assert_receive {:reassessed, ^parked}, 1_000
+    :sys.get_state(pid)
+    episode = RailRemedy.episode(ctx.db, "completion-requires-review", assignment.id)
+    next = episode.notice_state["reassessment"]["wakeId"]
+
+    unrelated = notice_assignment(ctx, "unrelated reassessment")
+    due_at = 253_402_300_799_000
+
+    other =
+      Wakes.schedule(ctx.db, %{
+        session_key: ctx.holder.session_key,
+        origin: "system",
+        consumer: "review_remedy_reconcile",
+        assignment_id: unrelated.id,
+        due_at: due_at
+      })
+
+    review = linked_review(ctx, assignment.id, "event review")
+
+    assert %{attest: %{verdictKind: "changes-requested"}} =
+             verdict(ctx, review.id, "changes-requested")
+
+    assert_receive {:reassessed, ^next}, 1_000
+    :sys.get_state(pid)
+    assert Wakes.get(ctx.db, other.wake_id).due_at == due_at
+    assert Wakes.get(ctx.db, other.wake_id).state == "pending"
+  end
+
+  test "episode recovery only reconstructs the requested review subject", ctx do
+    assignment = notice_assignment(ctx, "scoped recovery")
+    unrelated = notice_assignment(ctx, "unrelated recovery")
+    fire_review_notice(ctx, assignment)
+    fire_review_notice(ctx, unrelated)
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "UPDATE rail_remedy_episodes SET noticeState=NULL WHERE subject IN (?1,?2)",
+               [assignment.id, unrelated.id]
+             )
+
+    assert {:ok, :ok} = RailRemedy.reconcile_pending_episodes(ctx.db, 1_000, assignment.id)
+
+    assert RailRemedy.episode(ctx.db, "completion-requires-review", assignment.id).notice_state !=
+             nil
+
+    assert RailRemedy.episode(ctx.db, "completion-requires-review", unrelated.id).notice_state ==
+             nil
   end
 
   test "review notice retargets one pending unroutable attempt", ctx do
@@ -710,17 +885,35 @@ defmodule Tightbeam.RailRemedyTest do
         [assignment.id]
       )
 
-    {:ok, before_wakes} = DB.query(ctx.db, "SELECT wakeId,state FROM wakes ORDER BY wakeId", [])
+    {:ok, before_wakes} =
+      DB.query(ctx.db, "SELECT wakeId,state FROM wakes WHERE wakeId<>?1 ORDER BY wakeId", [
+        stale.wake_id
+      ])
 
-    assert_raise ArgumentError, "review remedy episode is not live", fn ->
-      RailRemedy.reconcile_notice(ctx.db, %{supervision_interval_ms: 1_000}, stale)
-    end
+    # The reassessment can never apply to the new occurrence. It settles once
+    # instead of failing on every tick, and changes nothing else.
+    assert :ok = RailRemedy.reconcile_notice(ctx.db, %{supervision_interval_ms: 1_000}, stale)
+    assert %{state: "fired"} = Wakes.get(ctx.db, stale.wake_id)
 
     assert {:ok, ^before_wakes} =
-             DB.query(ctx.db, "SELECT wakeId,state FROM wakes ORDER BY wakeId", [])
+             DB.query(ctx.db, "SELECT wakeId,state FROM wakes WHERE wakeId<>?1 ORDER BY wakeId", [
+               stale.wake_id
+             ])
 
     assert RailRemedy.episode(ctx.db, "completion-requires-review", assignment.id).notice_state ==
              current.notice_state
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM lifecycle_events WHERE kind='rail_remedy_reassessment_retired' AND subject=?1",
+               [assignment.id]
+             )
+
+    # A repeated delivery of the settled wake is refused, not re-applied.
+    assert_raise ArgumentError, fn ->
+      RailRemedy.reconcile_notice(ctx.db, %{supervision_interval_ms: 1_000}, stale)
+    end
   end
 
   test "live bounded retry prevents a competing O2 recovery", ctx do
@@ -975,7 +1168,7 @@ defmodule Tightbeam.RailRemedyTest do
     assert Enum.any?(final.notice_state["observations"], &("failed_unknown" in &1["states"]))
   end
 
-  test "bootstrap uses the configured supervision interval rather than scheduler tick", ctx do
+  test "bootstrap parks reassessment until an event regardless of the configured interval", ctx do
     registry = :"o2_interval_registry_#{System.unique_integer([:positive])}"
     lane = :"o2_interval_lane_#{System.unique_integer([:positive])}"
     start_supervised!({ConnRegistry, name: registry})
@@ -1005,19 +1198,23 @@ defmodule Tightbeam.RailRemedyTest do
          review_remedy_interval_ms: 4_321,
          delivery_opts: [conn_registry: registry, lane_manager: lane],
          deliver: fn _ -> flunk("normal notice delivery must use actual recipient admission") end,
-         internal_consumers: %{"review_remedy_reconcile" => fn _ -> flunk("not due") end}
+         internal_consumers: %{
+           "review_remedy_reconcile" => fn wake ->
+             RailRemedy.reconcile_notice(ctx.db, %{supervision_interval_ms: 4_321}, wake)
+           end
+         }
        ]}
     )
 
-    before = System.system_time(:millisecond)
     assert :ok = Wakes.fire_due(name)
     state = RailRemedy.episode(ctx.db, "completion-requires-review", assignment.id).notice_state
     assert state["intervalMs"] == 4_321
-    assert state["reassessment"]["dueAt"] >= before + 4_321
-    assert state["reassessment"]["dueAt"] <= System.system_time(:millisecond) + 4_321
+    assert state["reassessment"]["dueAt"] == 253_402_300_799_000
+    refute_receive :fire_due, 100
   end
 
-  test "scheduler restart retains one exact pending reassessment and no duplicate notice", ctx do
+  test "scheduler restart reassesses once and retains one pending check without duplicate notices",
+       ctx do
     assignment = notice_assignment(ctx, "restart protocol")
     fire_review_notice(ctx, assignment)
 
@@ -1032,6 +1229,7 @@ defmodule Tightbeam.RailRemedyTest do
       name: name,
       db: ctx.db,
       tick_ms: 60_000,
+      delivery_opts: ctx.delivery_opts,
       deliver: fn _ -> flunk("no prompt is due") end,
       internal_consumers: %{
         "review_remedy_reconcile" => fn wake ->
@@ -1043,13 +1241,28 @@ defmodule Tightbeam.RailRemedyTest do
     for _ <- 1..2 do
       start_supervised!({Wakes, opts})
       assert :ok = Wakes.fire_due(name)
-      assert Wakes.get(ctx.db, before.wake_id) == before
-      assert RailRemedy.episode(ctx.db, "completion-requires-review", assignment.id) == episode
+      assert Wakes.get(ctx.db, before.wake_id).state == "fired"
+      current = RailRemedy.episode(ctx.db, "completion-requires-review", assignment.id)
+      assert current.notice_state["root"] == episode.notice_state["root"]
+      pending = Wakes.get(ctx.db, current.notice_state["reassessment"]["wakeId"])
+      assert pending.state == "pending"
+      assert pending.due_at == 253_402_300_799_000
       stop_supervised!(Wakes)
     end
 
-    assert {:ok, [[2]]} =
-             DB.query(ctx.db, "SELECT count(*) FROM wakes WHERE assignmentId=?1", [assignment.id])
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM wakes WHERE assignmentId=?1 AND consumer='prompt'",
+               [assignment.id]
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM wakes WHERE assignmentId=?1 AND consumer='review_remedy_reconcile' AND state='pending'",
+               [assignment.id]
+             )
   end
 
   test "assignment terminal handlers retain protocol review custody", ctx do
@@ -1095,6 +1308,15 @@ defmodule Tightbeam.RailRemedyTest do
   end
 
   test "scheduler precheck delivers protocol reconciliation after terminal row", ctx do
+    {:ok, _} =
+      Tightbeam.Ledger.enqueue(ctx.db, %{
+        session_key: ctx.holder.session_key,
+        message_id: "hold-reconciliation",
+        origin: "user:flynn",
+        prompt: "working"
+      })
+
+    {:ok, _} = Tightbeam.Ledger.claim_next(ctx.db, ctx.holder.session_key, "fixture")
     assignment = notice_assignment(ctx, "scheduler protocol custody")
     %{producer_id: root} = fire_review_notice(ctx, assignment)
     mark_notice_turn(ctx.db, assignment.id, root, "failed_unknown")
@@ -1116,6 +1338,7 @@ defmodule Tightbeam.RailRemedyTest do
          name: scheduler,
          db: ctx.db,
          tick_ms: 60_000,
+         delivery_opts: ctx.delivery_opts,
          deliver: fn _wake -> flunk("protocol wake was diverted to prompt delivery") end,
          internal_consumers: %{
            "review_remedy_reconcile" => fn wake ->
@@ -2248,7 +2471,7 @@ defmodule Tightbeam.RailRemedyTest do
     )
 
     error =
-      assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end
+      assert_unavailable(ctx, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end)
 
     assert error.message =~ "completion-needs-review"
     assert error.message =~ "does not require"
@@ -2270,7 +2493,7 @@ defmodule Tightbeam.RailRemedyTest do
     )
 
     error =
-      assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end
+      assert_unavailable(ctx, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end)
 
     assert error.message =~ "valid only on a verdict-fact gate"
 
@@ -2281,20 +2504,20 @@ defmodule Tightbeam.RailRemedyTest do
     )
 
     error =
-      assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end
+      assert_unavailable(ctx, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end)
 
     assert error.message =~ "must be a verdictKind required by the gate"
 
     put_rules(ctx, external_missing_gate())
 
     error =
-      assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end
+      assert_unavailable(ctx, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end)
 
     assert error.message =~ "F1"
     assert error.message =~ "missing-producer"
 
     put_rules(ctx, review_gate())
-    error = assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, ["attest"]) end
+    error = assert_unavailable(ctx, fn -> Rules.load!(ctx.base_dir, ["attest"]) end)
     assert error.message =~ "F2"
     assert error.message =~ "completion-needs-review"
     assert error.message =~ "assign"
@@ -2302,7 +2525,7 @@ defmodule Tightbeam.RailRemedyTest do
     put_rules(ctx, review_gate() <> pure_blocker())
 
     error =
-      assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end
+      assert_unavailable(ctx, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end)
 
     assert error.message =~ "completion-needs-review"
     assert error.message =~ "block-remedy-assign"
@@ -2310,7 +2533,7 @@ defmodule Tightbeam.RailRemedyTest do
     put_rules(ctx, cycle_rules())
 
     error =
-      assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end
+      assert_unavailable(ctx, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end)
 
     assert error.message =~ "F2 producer cycle"
     assert error.message =~ "cycle-assign"
@@ -2362,9 +2585,7 @@ defmodule Tightbeam.RailRemedyTest do
       put_rules(ctx, law)
 
       error =
-        assert_raise ArgumentError, fn ->
-          Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
-        end
+        assert_unavailable(ctx, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end)
 
       assert error.message =~ message
     end)
@@ -2774,6 +2995,11 @@ defmodule Tightbeam.RailRemedyTest do
       )
 
     {:ok, [[seq]]} = DB.query(db, "SELECT seq FROM turns WHERE messageId=?1", [message_id])
+
+    # Delivery reads the recorded turn on the wake instead of inferring history.
+    {:ok, []} =
+      DB.query(db, "UPDATE wakes SET deliveredTurnSeq=?2 WHERE wakeId=?1", [wake_id, seq])
+
     seq
   end
 
@@ -3118,5 +3344,23 @@ defmodule Tightbeam.RailRemedyTest do
       provider: if(harness == "codex", do: "openai", else: "anthropic"),
       model: Model.new("test")
     })
+  end
+
+  defp assert_unavailable(ctx, load) do
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert is_list(load.())
+      end)
+
+    assert log =~ "unavailable"
+    unavailable = :persistent_term.get({Rules, :unavailable_verbs})
+    assert map_size(unavailable) > 0
+
+    for {verb, _source} <- unavailable do
+      assert {:deny, %{code: "rule_unavailable"}} =
+               Rules.evaluate(ctx.db, %{verb: verb, origin: "user:flynn", params: %{}})
+    end
+
+    %{message: log}
   end
 end
