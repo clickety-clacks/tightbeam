@@ -130,6 +130,8 @@ defmodule Tightbeam.CronWakeTest do
       assert %{state: "pending", due_at: next} = Wakes.get(ctx.db, wake.wake_id)
       assert next > System.system_time(:millisecond)
       Tightbeam.NoticeBatcher.recover(ctx.db, System.system_time(:millisecond), ctx.delivery_opts)
+      assert {:ok, turn} = Tightbeam.Ledger.claim_next(ctx.db, "recipient", "testhost")
+      assert :ok = Tightbeam.Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
     end
 
     assert {:ok, [[2]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
