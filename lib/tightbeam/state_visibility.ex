@@ -185,7 +185,7 @@ defmodule Tightbeam.StateVisibility do
 
   defp do_core_detail_visible?(_db, "condition facts", row, %{kind: "session", id: session_key})
        when is_binary(session_key) do
-    value(row, :origin) == ("session:" <> session_key)
+    value(row, :origin) == "session:" <> session_key
   end
 
   defp do_core_detail_visible?(db, "condition facts", row, %{kind: "user", id: user_id})

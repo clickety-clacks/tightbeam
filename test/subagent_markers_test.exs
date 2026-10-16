@@ -116,6 +116,8 @@ defmodule Tightbeam.SubagentMarkersTest do
     assert Wakes.get(ctx.db, condition_wake.wake_id).condition_scope == start.subagent_ref
 
     consume(ctx, :codex, "sid-codex", ctx.codex_fixture["patched_termination"])
+    # Wait for the delivery pass the condition nudge queued.
+    :sys.get_state(ctx.scheduler)
 
     assert %{state: "fired", fired_by: "condition"} =
              Wakes.get(ctx.db, condition_wake.wake_id)

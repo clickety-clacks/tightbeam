@@ -98,7 +98,7 @@ defmodule GuardCheckoutRefusal do
 
       try do
         # Synthetic catalog truth only; no credentials or provider are consulted.
-        :sys.replace_state(catalog, fn state ->
+        Tightbeam.GuardGatewayFixture.seed_catalog!(catalog, fn state ->
           now = state.now.()
 
           cache = %{
@@ -422,7 +422,7 @@ defmodule GuardCheckoutRefusal do
   end
 
   defp degrade_host_catalog(host, harness, reason) do
-    :sys.replace_state(ModelCatalog, fn state ->
+    Tightbeam.GuardGatewayFixture.seed_catalog!(ModelCatalog, fn state ->
       put_in(state.entries[{host, harness}], %{
         entries: [],
         derived_at: nil,

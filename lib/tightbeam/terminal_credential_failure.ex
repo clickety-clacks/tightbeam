@@ -662,7 +662,9 @@ defmodule Tightbeam.TerminalCredentialFailure do
 
     Txn.q(txn, "SELECT id FROM terminal_credential_incidents WHERE state='open' ORDER BY id")
     |> List.flatten()
-    |> Enum.each(fn incident_id -> reconcile_delivery_in_txn(txn, incident_id, user_id, now) end)
+    |> Enum.each(fn incident_id ->
+      reconcile_delivery_isolated_in_txn(txn, incident_id, user_id, now)
+    end)
 
     :ok
   end
@@ -741,7 +743,27 @@ defmodule Tightbeam.TerminalCredentialFailure do
   defp seed_admin_deliveries_in_txn(txn, incident_id, now) do
     Txn.q(txn, "SELECT userId FROM users WHERE isAdmin=1 ORDER BY userId")
     |> List.flatten()
-    |> Enum.each(&reconcile_delivery_in_txn(txn, incident_id, &1, now))
+    |> Enum.each(&reconcile_delivery_isolated_in_txn(txn, incident_id, &1, now))
+  end
+
+  defp reconcile_delivery_isolated_in_txn(txn, incident_id, user_id, now) do
+    Txn.exec(txn, "SAVEPOINT credential_recipient")
+
+    try do
+      reconcile_delivery_in_txn(txn, incident_id, user_id, now)
+      Txn.exec(txn, "RELEASE credential_recipient")
+    rescue
+      error ->
+        Txn.exec(txn, "ROLLBACK TO credential_recipient")
+        Txn.exec(txn, "RELEASE credential_recipient")
+        require Logger
+
+        Logger.warning(
+          "credential incident #{incident_id} recipient #{user_id} unresolved: #{Exception.message(error)}"
+        )
+    end
+
+    :ok
   end
 
   defp reconcile_incident_in_txn(txn, incident_id, now) do

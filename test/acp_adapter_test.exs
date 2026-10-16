@@ -321,6 +321,10 @@ defmodule Tightbeam.Acp.AdapterTest do
         return send({ id: m.id, result: { sessionId: sid, ...configOptions(sid) } });
       }
       case "session/load": {
+        if (failMode === "load-slow" && m.params.sessionId === "slow") {
+          capture(m);
+          return setTimeout(() => send({ id: m.id, result: configOptions(m.params.sessionId) }), 1500);
+        }
         capture(m);
         models[m.params.sessionId] = failMode === "load-owner" ? "owner-model" : (models[m.params.sessionId] || "haiku");
         offeredModels[m.params.sessionId] = [...defaultOfferedModels];
@@ -354,6 +358,7 @@ defmodule Tightbeam.Acp.AdapterTest do
         if (failMode === "slow-apply-before-strict" &&
             m.params.configId === "model" &&
             m.params.value === "gpt-blocking") {
+          models[m.params.sessionId] = m.params.value;
           return setTimeout(() => send({ id: m.id, result: configOptions(m.params.sessionId) }), 30600);
         }
         if (failMode === "slow-apply-before-strict" &&
@@ -1604,7 +1609,12 @@ defmodule Tightbeam.Acp.AdapterTest do
   test "late success during cancellation is timeout once, without killing a healthy peer" do
     {adapter, _capture} = start_adapter(gate_mode: "late-success-turn", probe: false)
     conn = Adapter.conn(adapter)
-    expired = Task.async(fn -> Adapter.prompt(adapter, "expired", "stall", timeout: @explicit_prompt_timeout) end)
+
+    expired =
+      Task.async(fn ->
+        Adapter.prompt(adapter, "expired", "stall", timeout: @explicit_prompt_timeout)
+      end)
+
     peer = Task.async(fn -> Adapter.prompt(adapter, "peer", "healthy") end)
     assert pending_count?(conn, 2)
     {id, entry} = prompt_entry(conn, "expired")
@@ -1624,7 +1634,12 @@ defmodule Tightbeam.Acp.AdapterTest do
     {other, _} = start_adapter(gate_mode: "stall-turn", probe: false)
     conn = Adapter.conn(adapter)
     other_conn = Adapter.conn(other)
-    expired = Task.async(fn -> Adapter.prompt(adapter, "expired", "stall", timeout: @explicit_prompt_timeout) end)
+
+    expired =
+      Task.async(fn ->
+        Adapter.prompt(adapter, "expired", "stall", timeout: @explicit_prompt_timeout)
+      end)
+
     peer = Task.async(fn -> Adapter.prompt(adapter, "peer", "healthy") end)
     independent = Task.async(fn -> Adapter.prompt(other, "other", "healthy") end)
     assert pending_count?(conn, 2)
@@ -1690,7 +1705,12 @@ defmodule Tightbeam.Acp.AdapterTest do
   test "worker death racing timeout acknowledgment preserves the timeout cause" do
     {adapter, _} = start_adapter(gate_mode: "ignore-cancel-turn", probe: false)
     conn = Adapter.conn(adapter)
-    caller = Task.async(fn -> Adapter.prompt(adapter, "timed", "stall", timeout: @explicit_prompt_timeout) end)
+
+    caller =
+      Task.async(fn ->
+        Adapter.prompt(adapter, "timed", "stall", timeout: @explicit_prompt_timeout)
+      end)
+
     assert pending_count?(conn, 1)
     {id, entry} = prompt_entry(conn, "timed")
     send(conn, {:prompt_deadline, id, entry.token})
@@ -1707,8 +1727,17 @@ defmodule Tightbeam.Acp.AdapterTest do
   test "concurrent expired prompts keep timeout causes and converge on one teardown" do
     {adapter, _} = start_adapter(gate_mode: "ignore-cancel-turn", probe: false)
     conn = Adapter.conn(adapter)
-    first = Task.async(fn -> Adapter.prompt(adapter, "first", "stall", timeout: @explicit_prompt_timeout) end)
-    second = Task.async(fn -> Adapter.prompt(adapter, "second", "stall", timeout: @explicit_prompt_timeout) end)
+
+    first =
+      Task.async(fn ->
+        Adapter.prompt(adapter, "first", "stall", timeout: @explicit_prompt_timeout)
+      end)
+
+    second =
+      Task.async(fn ->
+        Adapter.prompt(adapter, "second", "stall", timeout: @explicit_prompt_timeout)
+      end)
+
     assert pending_count?(conn, 2)
     {id1, entry1} = prompt_entry(conn, "first")
     {id2, entry2} = prompt_entry(conn, "second")
@@ -2045,6 +2074,225 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert {:error, {:adapter_unavailable, _reason}} = Task.await(caller)
     assert_receive {:DOWN, ^worker_monitor, :process, ^worker, _reason}
     assert_receive {:DOWN, ^conn_monitor, :process, ^conn, :killed}
+  end
+
+  test "setup requests stay serial while another session completes a turn" do
+    {adapter, capture} = start_adapter(fail_mode: "load-slow")
+    assert {:ok, sid} = Adapter.new_session(adapter, nil, "/tmp", [], "guidance")
+
+    caller =
+      Task.async(fn ->
+        Adapter.load_session_for_turn(adapter, "slow", nil, "/tmp", [], "guidance")
+      end)
+
+    assert eventually(fn ->
+             Enum.any?(captured_requests(capture), &(&1["method"] == "session/load"))
+           end)
+
+    queued =
+      Task.async(fn -> Adapter.new_session_for_turn(adapter, nil, "/tmp", [], "guidance") end)
+
+    assert eventually(fn -> length(:sys.get_state(adapter).operation_queue) == 1 end)
+    assert Enum.count(captured_requests(capture), &(&1["method"] == "session/new")) == 1
+    assert {:ok, %{stop_reason: "end_turn"}} = Adapter.prompt(adapter, sid, "hello")
+    assert Task.yield(caller, 0) == nil
+    assert {:ok, _} = Task.await(caller, 5_000)
+    assert {:ok, _} = Task.await(queued, 5_000)
+    assert Adapter.knows_session?(adapter, "slow")
+  end
+
+  test "stalled turn guidance leaves the loop free and preserves load prompt close order" do
+    {adapter, capture} = start_adapter()
+    owner = self()
+
+    :sys.replace_state(adapter, fn state ->
+      %{
+        state
+        | on_guidance: fn _, _ ->
+            send(owner, {:guidance_started, self()})
+
+            receive do
+              :continue -> :ok
+            end
+          end
+      }
+    end)
+
+    caller =
+      Task.async(fn ->
+        Adapter.load_session_for_turn(adapter, "slow", nil, "/tmp", [], "guidance")
+      end)
+
+    assert_receive {:guidance_started, worker}, 2_000
+    prompt = Task.async(fn -> Adapter.prompt(adapter, "slow", "hello") end)
+    assert eventually(fn -> length(:sys.get_state(adapter).operation_queue) == 1 end)
+    close = Task.async(fn -> Adapter.close_session(adapter, "slow") end)
+    assert eventually(fn -> length(:sys.get_state(adapter).operation_queue) == 2 end)
+    assert Process.alive?(adapter)
+    refute Enum.any?(captured_requests(capture), &(&1["method"] == "session/load"))
+    send(worker, :continue)
+    assert {:ok, _} = Task.await(caller, 5_000)
+    assert {:ok, _} = Task.await(prompt, 5_000)
+    assert :ok = Task.await(close, 5_000)
+
+    methods =
+      for r <- captured_requests(capture),
+          r["sessionId"] == "slow",
+          r["method"] in ["session/load", "session/prompt", "session/close"],
+          do: r["method"]
+
+    assert methods == ["session/load", "session/prompt", "session/close"]
+    refute Adapter.knows_session?(adapter, "slow")
+  end
+
+  for operation <- [:new, :load] do
+    @operation operation
+    test "#{operation} preserves config and usage notifications received during setup" do
+      {adapter, _} = start_adapter()
+      owner = self()
+
+      :sys.replace_state(adapter, fn state ->
+        %{
+          state
+          | config_options: %{"sess-1" => [%{"id" => "model", "currentValue" => "haiku"}]},
+            on_guidance: fn _, _ ->
+              send(owner, {:guidance_started, self()})
+
+              receive do
+                :continue -> :ok
+              end
+            end
+        }
+      end)
+
+      caller =
+        Task.async(fn ->
+          case @operation do
+            :new -> Adapter.new_session(adapter, nil, "/tmp", [], "guidance")
+            :load -> Adapter.load_session(adapter, "sess-1", nil, "/tmp", [], "guidance")
+          end
+        end)
+
+      assert_receive {:guidance_started, worker}, 2_000
+
+      for update <- [
+            %{
+              "sessionUpdate" => "config_option_update",
+              "configOptions" => [%{"id" => "model", "currentValue" => "haiku"}]
+            },
+            %{"sessionUpdate" => "usage_update", "used" => 3000, "size" => 10000}
+          ] do
+        send(
+          adapter,
+          {:acp_notification, "session/update", %{"sessionId" => "sess-1", "update" => update}}
+        )
+      end
+
+      during = :sys.get_state(adapter)
+      assert {:ok, %{used: 3000, size: 10000}} = during.context_usage["sess-1"]
+      assert [%{"id" => "model", "currentValue" => "haiku"}] = during.config_options["sess-1"]
+      send(worker, :continue)
+      assert {:ok, _} = Task.await(caller, 5_000)
+      after_setup = :sys.get_state(adapter)
+      assert after_setup.context_usage["sess-1"] == during.context_usage["sess-1"]
+      assert after_setup.config_options["sess-1"] == during.config_options["sess-1"]
+      assert is_nil(during.switchable_models["sess-1"])
+      assert [_ | _] = after_setup.switchable_models["sess-1"]
+      assert Adapter.knows_session?(adapter, "sess-1")
+    end
+  end
+
+  for operation <- [:new, :load] do
+    @operation operation
+    test "#{operation} retains response capabilities when only usage is notified" do
+      {adapter, _} = start_adapter(fail_mode: "fast-live")
+      owner = self()
+
+      :sys.replace_state(adapter, fn state ->
+        %{
+          state
+          | models: %{"sess-1" => Model.new("haiku")},
+            on_guidance: fn _, _ ->
+              send(owner, {:guidance_started, self()})
+
+              receive do
+                :continue -> :ok
+              end
+            end
+        }
+      end)
+
+      caller =
+        Task.async(fn ->
+          case @operation do
+            :new -> Adapter.new_session(adapter, nil, "/tmp", [], "guidance")
+            :load -> Adapter.load_session(adapter, "sess-1", nil, "/tmp", [], "guidance")
+          end
+        end)
+
+      assert_receive {:guidance_started, worker}, 2_000
+
+      for {sid, update} <- [
+            {"sess-1", %{"sessionUpdate" => "usage_update", "used" => 3000, "size" => 10000}},
+            {"other", %{"sessionUpdate" => "config_option_update", "configOptions" => []}}
+          ] do
+        send(
+          adapter,
+          {:acp_notification, "session/update", %{"sessionId" => sid, "update" => update}}
+        )
+      end
+
+      during = :sys.get_state(adapter)
+      send(worker, :continue)
+      expected = if @operation == :new, do: "sess-1", else: :unknown
+      assert {:ok, ^expected} = Task.await(caller, 5_000)
+      after_setup = :sys.get_state(adapter)
+      assert after_setup.context_usage["sess-1"] == during.context_usage["sess-1"]
+      assert {:ok, %{used: 3000, size: 10000}} = after_setup.context_usage["sess-1"]
+      assert {:ok, %{fast: "off"}} = Adapter.fast_status(adapter, "sess-1")
+      assert {:ok, [_ | _]} = Adapter.switchable_models(adapter, "sess-1")
+      assert after_setup.config_options["other"] == []
+    end
+  end
+
+  test "turn setup retains its per-request timeout across setup requests" do
+    {adapter, _} = start_adapter(gate_mode: "delay-setup", probe: false)
+    assert {:ok, "sess-1"} = Adapter.new_session_for_turn(adapter, nil, "/tmp", [], "guidance")
+    assert Adapter.knows_session?(adapter, "sess-1")
+  end
+
+  test "a progress consumer timeout does not block or crash the adapter" do
+    {adapter, _} = start_adapter(gate_mode: "progress-turn", probe: false)
+    owner = self()
+
+    consumer =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    caller =
+      Task.async(fn ->
+        Adapter.prompt(adapter, "progress", "hello",
+          progress: fn _, _ ->
+            send(owner, :progress_started)
+
+            try do
+              GenServer.call(consumer, :unanswered, 50)
+            after
+              send(owner, :progress_finished)
+            end
+          end
+        )
+      end)
+
+    assert_receive :progress_started, 2_000
+    assert {:ok, %{text: "progressed"}} = Task.await(caller)
+    assert_receive :progress_finished, 2_000
+    send(consumer, :stop)
+    assert Process.alive?(adapter)
+    assert {:ok, "probe-sess"} = Adapter.new_session(adapter, nil, "/tmp", [], "guidance")
   end
 
   test "thought and tool progress stay routed within the prompt budget" do
@@ -3008,14 +3256,7 @@ defmodule Tightbeam.Acp.AdapterTest do
              Adapter.current_model(adapter, "sess-1")
   end
 
-  # FAIL-BEFORE: strict_apply/4 used to start its deadline only after the
-  # preceding blocked request released the shared Adapter, so queue time was
-  # free and its fresh request outlived the caller's 30s GenServer.call budget.
-  # The 30.6s blocker exceeds the 30s operation deadline, so a correctly
-  # caller-stamped budget is exhausted at dequeue: nothing may be dispatched,
-  # and the structured error must still beat the caller's exit, which waits
-  # the reply margin past the operation deadline.
-  @tag timeout: 40_000
+  # Queue time on the same session still spends the strict operation budget.
   test "strict apply queue time spends the caller-owned operation budget" do
     {adapter, capture_path} =
       start_adapter(harness: :codex, fail_mode: "slow-apply-before-strict")
@@ -3029,37 +3270,25 @@ defmodule Tightbeam.Acp.AdapterTest do
                "guidance"
              )
 
-    # The blocker exists to OCCUPY the shared Adapter past the strict
-    # operation deadline; the handler holds the server until Conn answers at
-    # 30.6s whether or not the blocker's own 30s caller is still listening,
-    # so its caller exit is expected and irrelevant to what is under test.
     blocker =
       Task.async(fn ->
-        try do
-          Adapter.apply_model(adapter, "sess-1", Model.new("gpt-blocking"))
-        catch
-          :exit, reason -> {:caller_exit, reason}
-        end
+        Adapter.apply_model_for_turn(adapter, "sess-1", Model.new("gpt-blocking"))
       end)
 
     assert_request_captured(capture_path, "model", "gpt-blocking")
 
     strict =
       Task.async(fn ->
-        try do
-          Adapter.apply_model_strict(
-            adapter,
-            "sess-1",
-            Model.new("gpt-new", effort: "high"),
-            Model.new("gpt-old", effort: "medium")
-          )
-        catch
-          :exit, reason -> {:caller_exit, reason}
-        end
+        Adapter.apply_model_strict(
+          adapter,
+          "sess-1",
+          Model.new("gpt-new", effort: "high"),
+          Model.new("gpt-old", effort: "medium")
+        )
       end)
 
     assert {:error, :model_transport_failure} = Task.await(strict, 33_000)
-    assert {:caller_exit, _} = Task.await(blocker, 33_000)
+    assert :ok = Task.await(blocker, 33_000)
 
     refute Enum.any?(captured_requests(capture_path), fn request ->
              request["method"] == "session/set_config_option" and
@@ -4102,6 +4331,23 @@ defmodule Tightbeam.Acp.AdapterTest do
       |> Map.put(:harness, :missing_harness)
     end)
 
+    status = inspect(:sys.get_status(adapter))
+    refute status =~ chunk_marker
+    assert status =~ "harness: :missing_harness"
+
+    assert status =~
+             "redacted: [:chunks, :preset, :config_options, :switchable_models, :callbacks]"
+
+    formatted =
+      Adapter.format_status(%{
+        state: :sys.get_state(adapter),
+        message: {:new_session, Model.new("haiku"), "/tmp", [], guidance_marker}
+      })
+
+    assert formatted.message == :redacted
+    refute inspect(formatted) =~ guidance_marker
+    refute inspect(formatted) =~ chunk_marker
+
     monitor = Process.monitor(adapter)
 
     log =
@@ -4115,10 +4361,7 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     refute log =~ chunk_marker
     refute log =~ guidance_marker
-    # The nonsecret state stays readable; only the text-bearing fields are withheld.
-    assert log =~ "harness: :missing_harness"
-    assert log =~ "redacted: [:chunks, :preset, :config_options, :switchable_models, :callbacks]"
-    assert log =~ ~r/Last message(?: \(from .+?\))?: :redacted/
+    assert log =~ "unknown harness: :missing_harness"
   end
 
   test "gate wiring-check has no elapsed-time failure" do

@@ -224,6 +224,102 @@ defmodule Tightbeam.Rules do
     workItemId assignmentId decisionRequestId artifact
     conditionKind conditionScope conditionAfterId conditionFactId
   )
+
+  @assignment_review_verdict_count_sql """
+  SELECT COUNT(*)
+  FROM assignments review
+  JOIN attests verdict ON verdict.assignmentId=review.id
+  WHERE review.reviewsAssignmentId =
+        (SELECT COALESCE(reviewsAssignmentId, id)
+           FROM assignments WHERE id = ?1)
+    AND verdict.kind = 'verdict'
+  """
+
+  @work_item_fourth_round_count_sql """
+  SELECT SUM(count) FROM (
+    SELECT COUNT(*) AS count
+    FROM assignments review
+    JOIN attests verdict ON verdict.assignmentId=review.id
+    WHERE review.workItemId=?1
+      AND review.reviewsAssignmentId IS NOT NULL
+      AND verdict.kind='verdict'
+
+    UNION ALL
+
+    SELECT COUNT(*) AS count
+    FROM assignments producer
+    CROSS JOIN assignments review
+    JOIN attests verdict ON verdict.assignmentId=review.id
+    WHERE producer.workItemId=?1
+      AND review.reviewsAssignmentId=producer.id
+      AND review.workItemId IS NULL
+      AND verdict.kind='verdict'
+  )
+  """
+
+  @work_item_changes_requested_count_sql """
+  SELECT SUM(count) FROM (
+    SELECT COUNT(*) AS count
+    FROM assignments review
+    JOIN attests verdict ON verdict.assignmentId=review.id
+    WHERE review.workItemId=?1
+      AND review.reviewsAssignmentId IS NOT NULL
+      AND verdict.kind='verdict'
+      AND verdict.verdictKind='changes-requested'
+
+    UNION ALL
+
+    SELECT COUNT(*) AS count
+    FROM assignments producer
+    CROSS JOIN assignments review
+    JOIN attests verdict ON verdict.assignmentId=review.id
+    WHERE producer.workItemId=?1
+      AND review.reviewsAssignmentId=producer.id
+      AND review.workItemId IS NULL
+      AND verdict.kind='verdict'
+      AND verdict.verdictKind='changes-requested'
+  )
+  """
+
+  @work_item_review_verdict_count_sql """
+  SELECT SUM(count) FROM (
+    SELECT COUNT(*) AS count
+    FROM assignments review
+    JOIN attests verdict ON verdict.assignmentId=review.id
+    WHERE review.workItemId=?1
+      AND review.reviewsAssignmentId IS NOT NULL
+      AND verdict.kind='verdict'
+      AND verdict.rowid <= (
+        SELECT event_attest.rowid FROM attests event_attest WHERE event_attest.id=?2
+      )
+
+    UNION ALL
+
+    SELECT COUNT(*) AS count
+    FROM assignments producer
+    CROSS JOIN assignments review
+    JOIN attests verdict ON verdict.assignmentId=review.id
+    WHERE producer.workItemId=?1
+      AND review.reviewsAssignmentId=producer.id
+      AND review.workItemId IS NULL
+      AND verdict.kind='verdict'
+      AND verdict.rowid <= (
+        SELECT event_attest.rowid FROM attests event_attest WHERE event_attest.id=?2
+      )
+  )
+  """
+
+  @doc false
+  def assignment_review_verdict_count_sql, do: @assignment_review_verdict_count_sql
+
+  @doc false
+  def work_item_fourth_round_count_sql, do: @work_item_fourth_round_count_sql
+
+  @doc false
+  def work_item_changes_requested_count_sql, do: @work_item_changes_requested_count_sql
+
+  @doc false
+  def work_item_review_verdict_count_sql, do: @work_item_review_verdict_count_sql
   @artifact_facts ~w(artifact.present artifact.content_sha256 review.qualifying_verdict_kinds)
   @type condition :: %{fact: String.t(), op: String.t(), value: term()}
   @type rule :: %{
@@ -247,12 +343,59 @@ defmodule Tightbeam.Rules do
     revision = Keyword.get(opts, :revision)
     identity_manifest_sha = revision || identity_manifest_sha(base_dir)
 
+    :persistent_term.put({__MODULE__, :unavailable_verbs}, %{})
+
     entries =
       law_base
       |> Path.join("identity/rules/*.toml")
       |> Path.wildcard()
       |> Enum.sort()
-      |> Enum.flat_map(&load_file!(&1, verbs, law_base, identity_manifest_sha))
+      |> Enum.flat_map(fn path ->
+        try do
+          load_file!(path, verbs, law_base, identity_manifest_sha)
+        rescue
+          error ->
+            require Logger
+            Logger.warning("rule file #{path} unavailable: #{Exception.message(error)}")
+
+            affected =
+              case File.read(path) do
+                {:ok, bytes} ->
+                  case Toml.decode(bytes) do
+                    {:ok, manifest} ->
+                      case Map.get(manifest, "rule") do
+                        rules when is_list(rules) ->
+                          declared =
+                            Enum.map(rules, fn rule ->
+                              if is_map(rule), do: Map.get(rule, "verb"), else: nil
+                            end)
+
+                          if declared != [] and Enum.all?(declared, &MapSet.member?(verbs, &1)),
+                            do: declared,
+                            else: MapSet.to_list(verbs)
+
+                        _ ->
+                          MapSet.to_list(verbs)
+                      end
+
+                    _ ->
+                      MapSet.to_list(verbs)
+                  end
+
+                _ ->
+                  MapSet.to_list(verbs)
+              end
+
+            unavailable = :persistent_term.get({__MODULE__, :unavailable_verbs})
+
+            :persistent_term.put(
+              {__MODULE__, :unavailable_verbs},
+              Enum.reduce(affected, unavailable, &Map.put(&2, &1, path))
+            )
+
+            []
+        end
+      end)
       |> Enum.map(fn
         {:rule, rule} ->
           # Keep runtime effects in the real base. A recovery snapshot is removed
@@ -276,15 +419,77 @@ defmodule Tightbeam.Rules do
 
     named = rules ++ policies
 
-    case Enum.find(named, fn entry -> Enum.count(named, &(&1.name == entry.name)) > 1 end) do
-      %{name: name, source: source} ->
-        raise ArgumentError, "#{source}: rule #{inspect(name)}: duplicate name"
+    duplicates = named |> Enum.frequencies_by(& &1.name)
 
-      nil ->
-        :ok
-    end
+    Enum.each(named, fn entry ->
+      if duplicates[entry.name] > 1 do
+        require Logger
 
-    validate_satisfiability!(rules, verbs)
+        Logger.warning(
+          "rule or policy #{entry.name} unavailable: duplicate name in #{entry.source}"
+        )
+      end
+    end)
+
+    rules =
+      Enum.reject(rules, fn rule ->
+        if duplicates[rule.name] > 1 do
+          require Logger
+          Logger.warning("rule #{rule.name} unavailable: duplicate name in #{rule.source}")
+          unavailable = :persistent_term.get({__MODULE__, :unavailable_verbs})
+
+          :persistent_term.put(
+            {__MODULE__, :unavailable_verbs},
+            Map.put(unavailable, rule.verb, rule.source)
+          )
+
+          true
+        else
+          false
+        end
+      end)
+
+    policies =
+      Enum.reject(policies, fn policy ->
+        if duplicates[policy.name] > 1 do
+          unavailable = :persistent_term.get({__MODULE__, :unavailable_verbs})
+
+          :persistent_term.put(
+            {__MODULE__, :unavailable_verbs},
+            Enum.reduce(verbs, unavailable, &Map.put(&2, &1, policy.source))
+          )
+
+          true
+        else
+          false
+        end
+      end)
+
+    rules =
+      Enum.filter(rules, fn rule ->
+        try do
+          validate_producer_existence!(rule)
+          validate_remedy_reachability!(rule, rules, verbs)
+
+          if rule.remedy && not escaping_static_producer?(rule),
+            do: validate_producer_cycles!(rule, rules)
+
+          true
+        rescue
+          error ->
+            require Logger
+            Logger.warning("rule #{rule.name} unavailable: #{Exception.message(error)}")
+            unavailable = :persistent_term.get({__MODULE__, :unavailable_verbs})
+
+            :persistent_term.put(
+              {__MODULE__, :unavailable_verbs},
+              Map.put(unavailable, rule.verb, rule.source)
+            )
+
+            false
+        end
+      end)
+
     :persistent_term.put(@persist_key, rules)
     :persistent_term.put(@policy_key, policies)
 
@@ -342,9 +547,19 @@ defmodule Tightbeam.Rules do
     verb = Map.fetch!(call, :verb)
     edge = edge(call)
 
-    rules
-    |> Enum.filter(&(&1.verb == verb and edge in &1.edges))
-    |> decide_rules(db, call, %{}, [], [])
+    case Map.get(:persistent_term.get({__MODULE__, :unavailable_verbs}, %{}), verb) do
+      nil ->
+        rules
+        |> Enum.filter(&(&1.verb == verb and edge in &1.edges))
+        |> decide_rules(db, call, %{}, [], [])
+
+      source ->
+        {{:deny,
+          %{
+            code: "rule_unavailable",
+            message: "#{verb} unavailable until rule #{source} is repaired"
+          }}, [], []}
+    end
   end
 
   @doc false
@@ -1049,8 +1264,28 @@ defmodule Tightbeam.Rules do
           rules
           |> Enum.with_index(1)
           |> Enum.map(fn {rule, ordinal} ->
-            {:rule,
-             validate_rule!(path, ordinal, rule, valid_verbs, base_dir, identity_manifest_sha)}
+            try do
+              {:rule,
+               validate_rule!(path, ordinal, rule, valid_verbs, base_dir, identity_manifest_sha)}
+            rescue
+              error ->
+                require Logger
+
+                Logger.warning(
+                  "rule #{path} entry #{ordinal} unavailable: #{Exception.message(error)}"
+                )
+
+                verb = if is_map(rule), do: Map.get(rule, "verb"), else: nil
+                affected = if MapSet.member?(valid_verbs, verb), do: [verb], else: valid_verbs
+                unavailable = :persistent_term.get({__MODULE__, :unavailable_verbs})
+
+                :persistent_term.put(
+                  {__MODULE__, :unavailable_verbs},
+                  Enum.reduce(affected, unavailable, &Map.put(&2, &1, path))
+                )
+
+                {:unavailable, path}
+            end
           end)
 
         :error ->
@@ -1704,12 +1939,6 @@ defmodule Tightbeam.Rules do
     |> Enum.sort()
   end
 
-  defp validate_satisfiability!(rules, valid_verbs) do
-    Enum.each(rules, &validate_producer_existence!/1)
-    Enum.each(rules, &validate_remedy_reachability!(&1, rules, valid_verbs))
-    validate_producer_cycles!(rules)
-  end
-
   defp validate_producer_existence!(%{check: check}) when not is_nil(check), do: :ok
 
   defp validate_producer_existence!(rule) do
@@ -1768,16 +1997,14 @@ defmodule Tightbeam.Rules do
 
   defp fixed_condition_true?(_condition, _remedy), do: false
 
-  defp validate_producer_cycles!(rules) do
+  defp validate_producer_cycles!(rule, rules) do
     remedy_rules =
       Enum.filter(
         rules,
         &(not is_nil(&1.remedy) and not escaping_static_producer?(&1))
       )
 
-    Enum.each(remedy_rules, fn rule ->
-      walk_producer_chain!(rule, rule, remedy_rules, [rule.name])
-    end)
+    walk_producer_chain!(rule, rule, remedy_rules, [rule.name])
   end
 
   defp escaping_static_producer?(%{external_producer: true}), do: true
@@ -2201,8 +2428,16 @@ defmodule Tightbeam.Rules do
 
   defp compute_fact("org.live_sessions_owned_by_caller", db, call, cache) do
     with_dependency("caller.user", db, call, cache, fn
-      nil, cache -> {nil, cache}
-      user, cache -> {length(Org.list_for_user(db, user, false)), cache}
+      nil, cache ->
+        {nil, cache}
+
+      user, cache ->
+        {:ok, [[count]]} =
+          DB.query(db, "SELECT COUNT(*) FROM sessions WHERE ownerUserId=?1 AND state='active'", [
+            user
+          ])
+
+        {count, cache}
     end)
   end
 
@@ -2730,19 +2965,7 @@ defmodule Tightbeam.Rules do
 
       assignment, cache ->
         {:ok, [[count]]} =
-          DB.query(
-            db,
-            """
-            SELECT COUNT(*) FROM attests
-             WHERE kind = 'verdict'
-               AND assignmentId IN
-                   (SELECT id FROM assignments
-                     WHERE reviewsAssignmentId =
-                           (SELECT COALESCE(reviewsAssignmentId, id)
-                              FROM assignments WHERE id = ?1))
-            """,
-            [assignment.id]
-          )
+          DB.query(db, assignment_review_verdict_count_sql(), [assignment.id])
 
         {count, cache}
     end)
@@ -2788,18 +3011,7 @@ defmodule Tightbeam.Rules do
             case row_commit_work_item_id(db, call, assignment) do
               work_item_id when is_binary(work_item_id) ->
                 {:ok, [[count]]} =
-                  DB.query(
-                    db,
-                    """
-                    SELECT COUNT(*)
-                    FROM attests verdict
-                    JOIN assignments review ON review.id=verdict.assignmentId
-                    JOIN assignments producer ON producer.id=review.reviewsAssignmentId
-                    WHERE COALESCE(review.workItemId,producer.workItemId)=?1
-                      AND verdict.kind='verdict'
-                    """,
-                    [work_item_id]
-                  )
+                  DB.query(db, work_item_fourth_round_count_sql(), [work_item_id])
 
                 if count == 4, do: {"review", cache}, else: {nil, cache}
 
@@ -2863,19 +3075,7 @@ defmodule Tightbeam.Rules do
         case row_commit_work_item_id(db, call, assignment) do
           work_item_id when is_binary(work_item_id) ->
             {:ok, [[count]]} =
-              DB.query(
-                db,
-                """
-                SELECT COUNT(*)
-                FROM attests verdict
-                JOIN assignments review ON review.id=verdict.assignmentId
-                JOIN assignments producer ON producer.id=review.reviewsAssignmentId
-                WHERE COALESCE(review.workItemId,producer.workItemId)=?1
-                  AND verdict.kind='verdict'
-                  AND verdict.verdictKind='changes-requested'
-                """,
-                [work_item_id]
-              )
+              DB.query(db, work_item_changes_requested_count_sql(), [work_item_id])
 
             {count, cache}
 
@@ -2902,22 +3102,7 @@ defmodule Tightbeam.Rules do
     case {row_commit_work_item_id(db, call, assignment), attest_id} do
       {work_item_id, attest_id} when is_binary(work_item_id) and is_binary(attest_id) ->
         {:ok, [[count]]} =
-          DB.query(
-            db,
-            """
-            SELECT COUNT(*)
-            FROM attests verdict
-            JOIN assignments review ON review.id=verdict.assignmentId
-            LEFT JOIN assignments subject ON subject.id=review.reviewsAssignmentId
-            WHERE COALESCE(review.workItemId,subject.workItemId)=?1
-              AND review.reviewsAssignmentId IS NOT NULL
-              AND verdict.kind='verdict'
-              AND verdict.rowid <= (
-                SELECT event_attest.rowid FROM attests event_attest WHERE event_attest.id=?2
-              )
-            """,
-            [work_item_id, attest_id]
-          )
+          DB.query(db, work_item_review_verdict_count_sql(), [work_item_id, attest_id])
 
         {count, cache}
 

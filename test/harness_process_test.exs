@@ -3,7 +3,7 @@ defmodule Tightbeam.HarnessProcessTest do
   @moduletag tmp_dir: true
   @moduletag timeout: 120_000
 
-  alias Tightbeam.{DB, HarnessProcess}
+  alias Tightbeam.{DB, Diagnostics, HarnessProcess}
   @helper Path.expand("../cli/target/release/tightbeam", __DIR__)
 
   test "a bare executable name is resolved to a path rather than handed over unresolved", %{
@@ -51,6 +51,7 @@ defmodule Tightbeam.HarnessProcessTest do
   } do
     db = String.to_atom("cursor_harness_process_#{System.unique_integer([:positive])}")
     start_supervised!(Supervisor.child_spec({DB, path: ":memory:", name: db}, id: db))
+    :ok = HarnessProcess.ensure_schema(db)
 
     opts =
       HarnessProcess.prepare_launch(
@@ -102,6 +103,7 @@ defmodule Tightbeam.HarnessProcessTest do
   test "Cursor execution identity refuses an SSH launch before wrapping it" do
     db = String.to_atom("remote_cursor_harness_process_#{System.unique_integer([:positive])}")
     start_supervised!(Supervisor.child_spec({DB, path: ":memory:", name: db}, id: db))
+    :ok = HarnessProcess.ensure_schema(db)
 
     assert_raise ArgumentError, ~r/local-only; SSH hosts are unsupported/, fn ->
       HarnessProcess.prepare_launch(
@@ -117,6 +119,30 @@ defmodule Tightbeam.HarnessProcessTest do
         {:cursor, "shared", "worker"}
       )
     end
+  end
+
+  test "launch checks use the schema prepared at startup", %{tmp_dir: tmp} do
+    start_supervised!({Diagnostics, notify: self()})
+    db = String.to_atom("harness_process_schema_#{System.unique_integer([:positive])}")
+    start_supervised!(Supervisor.child_spec({DB, path: ":memory:", name: db}, id: db))
+    :ok = HarnessProcess.ensure_schema(db)
+    before = length(Diagnostics.records())
+
+    refute HarnessProcess.parked?(db, {:claude, "shared", "testhost"})
+    refute HarnessProcess.fenced?(db, {:claude, "shared", "testhost"})
+
+    HarnessProcess.prepare_launch(
+      [cmd: ["/bin/true"], process_helper: @helper, process_identity_dir: tmp],
+      db,
+      {:claude, "shared", "testhost"}
+    )
+
+    transactions =
+      Diagnostics.records()
+      |> Enum.drop(before)
+      |> Enum.filter(&(&1.event == "db_server_completed" and &1.operation == "db.transaction"))
+
+    assert length(transactions) == 1
   end
 
   test "identity capture accepts an unbounded wait", %{tmp_dir: tmp} do

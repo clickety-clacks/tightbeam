@@ -183,7 +183,8 @@ defmodule Tightbeam.Placement do
           Map.put(acc, host, Map.put(host_config, :toolchain_dirs, dirs))
 
         :error ->
-          raise "host toolchain registry contains rows for unknown host: #{host}"
+          Logger.warning("ignoring toolchain directories for unknown host #{host}")
+          acc
       end
     end)
   end
@@ -352,8 +353,9 @@ defmodule Tightbeam.Placement do
   def set_sentinel_env(db, host, scope, name, value, set_by, call) do
     "sentinel:" <> _qualified = scope
 
-    with :ok <- valid_env_name(name),
-         :ok <- unreserved_env_name(name) do
+    # Sentinel settings are operator-selected and passed through opaquely; the
+    # harness reservation policy applies only to harness environment overlays.
+    with :ok <- valid_env_name(name) do
       {:ok, changed} =
         DB.transaction(db, fn txn ->
           DB.Txn.q(

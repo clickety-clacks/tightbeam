@@ -122,7 +122,7 @@ end
 
 {_id, bandit, _type, _modules} =
   Enum.find(
-    Supervisor.which_children(Tightbeam.Supervisor),
+    Supervisor.which_children(Tightbeam.RuntimeSupervisor),
     fn {id, _pid, _type, modules} -> id == Bandit or (is_list(modules) and Bandit in modules) end
   )
 
@@ -150,12 +150,12 @@ try do
     # Use the real catalog server with its existing synthetic dependency options.
     # Only Fixture can derive; its fetch_catalog returns a static entry and does no I/O.
     db_owner = Process.whereis(DB)
-    :ok = Supervisor.terminate_child(Tightbeam.Supervisor, Tightbeam.ModelCatalog)
-    :ok = Supervisor.delete_child(Tightbeam.Supervisor, Tightbeam.ModelCatalog)
+    :ok = Supervisor.terminate_child(Tightbeam.RuntimeSupervisor, Tightbeam.ModelCatalog)
+    :ok = Supervisor.delete_child(Tightbeam.RuntimeSupervisor, Tightbeam.ModelCatalog)
 
     {:ok, _} =
       Supervisor.start_child(
-        Tightbeam.Supervisor,
+        Tightbeam.RuntimeSupervisor,
         {Tightbeam.ModelCatalog,
          base_dir: base,
          db: DB,

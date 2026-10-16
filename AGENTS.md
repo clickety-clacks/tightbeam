@@ -52,6 +52,23 @@ a clause you're implementing demands one, STOP and report it as a finding for
 adjudication. Parity refactors owe byte-parity except changes the spec names as
 intentional.
 
+## React to events; don't poll your own data
+
+Work the gateway does on its own state should run when the state changes, not
+on a timer that re-checks it. A loop that wakes every second to ask "did
+anything change?" costs the same whether or not anything did, grows with the
+data it scans, and shares the one database owner with every request, so a slow
+pass stalls the whole gateway. Fire on the event that causes the work (a write,
+a turn ending, a lane changing state), and when work is due at a time, set one
+timer for the earliest due time instead of ticking.
+
+Poll only where the event-driven version is too complex for the value it gives,
+or where the state lives outside the gateway with no way to be told (an external
+service with no webhook). When you add a safety net for missed events, make it
+slow (minutes), have it repair what it finds, and count each repair as a miss in
+the gateway's miss counter with a log line naming what was missed, so production
+data shows whether the event path ever drops anything.
+
 ## Verification
 
 - The Evidence section of

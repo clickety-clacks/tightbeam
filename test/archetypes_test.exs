@@ -619,9 +619,7 @@ defmodule Tightbeam.ArchetypesTest do
     where = ["testhost"]
     """)
 
-    assert_raise ArgumentError, ~r/elects unknown skills/, fn ->
-      Archetypes.load!(ctx.base_dir)
-    end
+    assert_unavailable(~r/elects unknown skills/, fn -> Archetypes.load!(ctx.base_dir) end)
   end
 
   test "kungfu scaffold rejects every invalid name class before identity mutation", ctx do
@@ -713,7 +711,7 @@ defmodule Tightbeam.ArchetypesTest do
 
     for {body, message} <- cases do
       File.write!(path, body)
-      assert_raise ArgumentError, message, fn -> Archetypes.load!(ctx.base_dir) end
+      assert_unavailable(message, fn -> Archetypes.load!(ctx.base_dir) end)
     end
   end
 
@@ -812,9 +810,9 @@ defmodule Tightbeam.ArchetypesTest do
     model_preferences = ["claude-fable-5[1m]"]
     """)
 
-    assert_raise ArgumentError, ~r/is a packed string; a preference is fields/, fn ->
+    assert_unavailable(~r/is a packed string; a preference is fields/, fn ->
       Archetypes.load!(ctx.base_dir)
-    end
+    end)
 
     File.write!(path, """
     name = "prefs"
@@ -823,9 +821,9 @@ defmodule Tightbeam.ArchetypesTest do
     effort = "high"
     """)
 
-    assert_raise ArgumentError, ~r/model_preferences entry is missing model/, fn ->
+    assert_unavailable(~r/model_preferences entry is missing model/, fn ->
       Archetypes.load!(ctx.base_dir)
-    end
+    end)
   end
 
   test "the engineering bundle resolves current defaults", ctx do
@@ -852,12 +850,10 @@ defmodule Tightbeam.ArchetypesTest do
 
     File.write!(path, "name = \"bad\"\nwhere = [\"*\", \"eezo\"]\n")
 
-    assert_raise ArgumentError, ~r/must be the only element/, fn ->
-      Archetypes.load!(ctx.base_dir)
-    end
+    assert_unavailable(~r/must be the only element/, fn -> Archetypes.load!(ctx.base_dir) end)
 
     File.write!(path, "name = \"bad\"\nwhere = []\n")
-    assert_raise ArgumentError, ~r/non-empty list/, fn -> Archetypes.load!(ctx.base_dir) end
+    assert_unavailable(~r/non-empty list/, fn -> Archetypes.load!(ctx.base_dir) end)
 
     File.write!(path, "name = \"roamer\"\nwhere = [\"*\"]\n")
     assert Archetypes.load!(ctx.base_dir)["roamer"].where == ["*"]
@@ -885,7 +881,7 @@ defmodule Tightbeam.ArchetypesTest do
           "[containment]\nnetwork = \"loopback\"\n"
         ] do
       File.write!(path, "name = \"contained\"\n" <> body)
-      assert_raise ArgumentError, fn -> Archetypes.load!(ctx.base_dir) end
+      assert_unavailable(fn -> Archetypes.load!(ctx.base_dir) end)
     end
   end
 
@@ -953,9 +949,7 @@ defmodule Tightbeam.ArchetypesTest do
     path = Path.join(manifests_dir!(ctx.base_dir), "bad.toml")
     File.write!(path, "name = \"bad--name\"\n")
 
-    assert_raise ArgumentError, ~r/may not contain --/, fn ->
-      Archetypes.load!(ctx.base_dir)
-    end
+    assert_unavailable(~r/may not contain --/, fn -> Archetypes.load!(ctx.base_dir) end)
   end
 
   test "load refuses an org copy of a reserved substrate skill and names its path", ctx do
@@ -964,9 +958,10 @@ defmodule Tightbeam.ArchetypesTest do
     File.mkdir_p!(Path.dirname(path))
     File.write!(path, "# org shadow")
 
-    assert_raise ArgumentError,
-                 "#{path}: rename or remove the org copy; substrate names are reserved",
-                 fn -> Archetypes.load!(ctx.base_dir) end
+    assert_unavailable(
+      "#{path}: rename or remove the org copy; substrate names are reserved",
+      fn -> Archetypes.load!(ctx.base_dir) end
+    )
   end
 
   test "mcp declarations compile to the byte-pinned ACP shape and sort deterministically", ctx do
@@ -1013,7 +1008,7 @@ defmodule Tightbeam.ArchetypesTest do
            ~r/unknown mcp server keys.*url/}
         ] do
       File.write!(path, manifest)
-      assert_raise ArgumentError, message, fn -> Archetypes.load!(ctx.base_dir) end
+      assert_unavailable(message, fn -> Archetypes.load!(ctx.base_dir) end)
     end
   end
 
@@ -1027,9 +1022,9 @@ defmodule Tightbeam.ArchetypesTest do
     text = '#include "nope.md"'
     """)
 
-    assert_raise Tightbeam.Identity.IncludeError, ~r/cause=missing_fragment.*nope.md/, fn ->
+    assert_unavailable(~r/cause=missing_fragment.*nope.md/, fn ->
       Archetypes.load!(ctx.base_dir)
-    end
+    end)
 
     File.write!(Path.join(identity_dir, "guidance/a.md"), ~s(#include "b.md"))
     File.write!(Path.join(identity_dir, "guidance/b.md"), ~s(#include "a.md"))
@@ -1040,9 +1035,9 @@ defmodule Tightbeam.ArchetypesTest do
     text = '#include "a.md"'
     """)
 
-    assert_raise Tightbeam.Identity.IncludeError, ~r/cause=cycle.*a.md -> b.md -> a.md/, fn ->
+    assert_unavailable(~r/cause=cycle.*a.md -> b.md -> a.md/, fn ->
       Archetypes.load!(ctx.base_dir)
-    end
+    end)
   end
 
   defp manifests_dir!(base_dir), do: Path.join(identity_dir!(base_dir), "archetypes")
@@ -1111,5 +1106,22 @@ defmodule Tightbeam.ArchetypesTest do
       "refs/heads/tightbeam/live",
       git!(identity_dir, ["rev-parse", "main"])
     ])
+  end
+
+  defp assert_unavailable(expected \\ nil, load) do
+    {result, log} = ExUnit.CaptureLog.with_log(load)
+    assert is_map(result)
+    log = String.trim(log)
+
+    for [_, source] <- Regex.scan(~r/archetype (\S+) unavailable:/, log) do
+      name = Path.basename(source, ".toml")
+      refute Map.has_key?(result, name)
+      assert Archetypes.get(name) == nil
+    end
+
+    assert log =~ "unavailable"
+    if is_struct(expected, Regex), do: assert(log =~ expected)
+    if is_binary(expected), do: assert(log =~ expected)
+    %{message: log}
   end
 end

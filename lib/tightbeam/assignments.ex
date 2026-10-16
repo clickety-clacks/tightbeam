@@ -122,6 +122,9 @@ defmodule Tightbeam.Assignments do
 
   @doc false
   def rebuild_r1_process_close_in_txn(%Txn{} = txn) do
+    previous_fk_violations =
+      Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(assignments))
+
     # The caller owns the exact predecessor and transaction. These settings
     # prevent SQLite from rewriting incoming references during the rename.
     unless Txn.q(txn, "PRAGMA foreign_keys") == [[0]] and
@@ -154,8 +157,9 @@ defmodule Tightbeam.Assignments do
     Txn.exec(txn, "DROP TABLE assignments_before_process_actor")
     Enum.each(objects, fn [sql] -> :ok = Txn.exec(txn, sql) end)
 
-    unless Txn.q(txn, "PRAGMA foreign_key_check") == [],
-      do: raise(ArgumentError, "R1 rebuild foreign key violation")
+    unless Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(assignments)) --
+             previous_fk_violations == [],
+           do: raise(ArgumentError, "R1 rebuild foreign key violation")
 
     :ok
   end
@@ -782,7 +786,7 @@ defmodule Tightbeam.Assignments do
     Txn.q(
       txn,
       """
-      SELECT d.sourceWakeId FROM (#{Tightbeam.NoticeBatcher.source_deliveries_sql()}) d
+      SELECT d.sourceWakeId FROM (#{Tightbeam.NoticeBatcher.recorded_deliveries_sql()}) d
       JOIN wakes w ON w.wakeId=d.sourceWakeId JOIN turns t ON t.seq=d.turnSeq
       WHERE d.turnSeq=?1 AND w.sessionKey=t.sessionKey
       """,
@@ -1026,15 +1030,23 @@ defmodule Tightbeam.Assignments do
         params
       )
 
-    Enum.map(rows, fn row ->
-      assignment = assignment(row)
+    assignments = Enum.map(rows, &assignment/1)
+    ids = Enum.map(assignments, & &1.id)
 
-      assignment
-      |> Map.put(:files, declared_files(db, assignment.id))
-      |> Map.put(
-        :commitRefCorrections,
-        Tightbeam.AssignmentCommitRefCorrections.list(db, assignment.id)
+    {:ok, file_rows} =
+      DB.query(
+        db,
+        "SELECT assignmentId, path FROM assignment_files WHERE assignmentId IN (SELECT value FROM json_each(?1)) ORDER BY path",
+        [JSON.encode!(ids)]
       )
+
+    files = Enum.group_by(file_rows, &hd/1, &List.last/1)
+    corrections = Tightbeam.AssignmentCommitRefCorrections.list_many(db, ids)
+
+    Enum.map(assignments, fn assignment ->
+      assignment
+      |> Map.put(:files, Map.get(files, assignment.id, []))
+      |> Map.put(:commitRefCorrections, Map.get(corrections, assignment.id, []))
     end)
   end
 
@@ -1055,24 +1067,25 @@ defmodule Tightbeam.Assignments do
   @spec commissioned_review_authors(DB.server(), String.t(), String.t()) :: [map()]
   def commissioned_review_authors(db, assignment_id, a_holder_key) do
     {:ok, rows} =
-      DB.query(
-        db,
-        """
-        SELECT v.verdictKind, v.byHarness, v.byProvider
-        FROM attests AS v
-        JOIN assignments AS r ON r.id = v.assignmentId
-        WHERE r.reviewsAssignmentId = ?1
-          AND v.kind = 'verdict'
-          AND v.bySession = r.holderKey
-          AND v.bySession != ?2
-        ORDER BY v.ts ASC, v.id ASC
-        """,
-        [assignment_id, a_holder_key]
-      )
+      DB.query(db, commissioned_review_authors_sql(), [assignment_id, a_holder_key])
 
     Enum.map(rows, fn [verdict_kind, by_harness, by_provider] ->
       %{verdict_kind: verdict_kind, by_harness: by_harness, by_provider: by_provider}
     end)
+  end
+
+  @doc false
+  def commissioned_review_authors_sql do
+    """
+    SELECT v.verdictKind, v.byHarness, v.byProvider
+    FROM attests AS v
+    JOIN assignments AS r ON r.id = v.assignmentId
+    WHERE r.reviewsAssignmentId = ?1
+      AND v.kind = 'verdict'
+      AND v.bySession = r.holderKey
+      AND v.bySession != ?2
+    ORDER BY v.ts ASC, v.id ASC
+    """
   end
 
   @doc """
@@ -3675,6 +3688,15 @@ defmodule Tightbeam.Assignments do
     )
 
     if Txn.changes(txn) != 1, do: raise(TransitionRace)
+
+    if attrs.kind == "verdict" do
+      [[subject]] =
+        Txn.q(txn, "SELECT COALESCE(reviewsAssignmentId,id) FROM assignments WHERE id=?1", [
+          attrs.assignment_id
+        ])
+
+      Tightbeam.Wakes.schedule_changed_in_txn(txn, {:review_remedy_changed, subject})
+    end
 
     attest([
       id,

@@ -14,6 +14,17 @@ defmodule Tightbeam.NoticeBatcher do
   alias Tightbeam.{DB, EventLog, Gateway, Harness, Org, SubmissionSize, Supervision, Wakes}
   alias Tightbeam.DB.Txn
 
+  @doc false
+  def recorded_deliveries_sql do
+    "SELECT wakeId AS sourceWakeId,deliveredTurnSeq AS turnSeq,assignmentId " <>
+      "FROM wakes WHERE deliveredTurnSeq IS NOT NULL"
+  end
+
+  @doc false
+  def carrier_delivery_sql(source_alias) do
+    "(SELECT wakeId FROM turns WHERE seq=#{source_alias}.turnSeq)<>#{source_alias}.sourceWakeId"
+  end
+
   @rule "notice-batching-v1 r2"
   @policy_revision "notice-batching-v1 r2"
 
@@ -419,7 +430,9 @@ defmodule Tightbeam.NoticeBatcher do
       [[batch_id, state, carrier]] ->
         committed? =
           is_binary(carrier) and
-            Txn.q(txn, "SELECT 1 FROM turns WHERE wakeId=?1 LIMIT 1", [carrier]) != []
+            Txn.q(txn, "SELECT 1 FROM wakes WHERE wakeId=?1 AND deliveredTurnSeq IS NOT NULL", [
+              carrier
+            ]) != []
 
         cond do
           committed? or state in ["delivered", "delivery_failed"] ->
@@ -452,39 +465,30 @@ defmodule Tightbeam.NoticeBatcher do
 
   @doc "Resolve and admit one ready snapshot per concrete session atomically."
   @spec recover(GenServer.server(), integer(), keyword()) :: [String.t()]
-  def recover(db \\ Tightbeam.DB, at \\ now(), delivery_opts \\ []) do
-    :ok = Wakes.dispose_closed_remedy_sources(db, at)
-    reconcile_committed_deliveries(db, at)
+  def recover(db \\ Tightbeam.DB, at \\ now(), delivery_opts \\ [], recipient \\ nil) do
+    DB.background_pass(fn -> recover_pass(db, at, delivery_opts, recipient) end, [])
+  end
 
-    # Only carriers with no actual turn can return to the editable queue.
-    # Their frozen bytes remain historical evidence; committed deliveries do
-    # not participate in a later recipient snapshot.
-    restore_unclaimed_sources(db, at)
+  defp recover_pass(db, at, delivery_opts, recipient) do
+    if is_nil(recipient) do
+      :ok = Wakes.dispose_closed_remedy_sources(db, at)
+      reconcile_committed_deliveries(db, at)
+      # A committed carrier never returns to the editable queue.
+      restore_unclaimed_sources(db, at)
+    end
 
-    {:ok, ready_ids} = DB.transaction(db, &ready_sources_in_txn(&1, at))
+    {:ok, ready_ids} = DB.transaction(db, &ready_sources_in_txn(&1, at, recipient))
 
-    # Resolve semantic authority before selecting recipients. A failed source
-    # preparation rolls back only that source, never an unrelated recipient.
+    # Group ready sources by recipient without preparing them. Preparation
+    # happens once, inside the recipient's own drain transaction, and only when
+    # that recipient can receive. A source whose recipient does not resolve
+    # keeps the old path: prepare it here and dispose of it if still unresolved.
+    # A failed source rolls back only that source, never an unrelated recipient.
     {recipients, deferred_ids} =
       Enum.reduce(ready_ids, {[], MapSet.new()}, fn wake_id, {targets, deferred} ->
         case DB.transaction_then(
                db,
-               fn txn ->
-                 case prepared_source_in_txn(txn, wake_id) do
-                   nil ->
-                     nil
-
-                   source ->
-                     case source_delivery_target(txn, source) do
-                       {target, _, _} ->
-                         target
-
-                       nil ->
-                         dispose_unresolved_source_in_txn(txn, source, at)
-                         nil
-                     end
-                 end
-               end,
+               fn txn -> source_recipient_in_txn(txn, wake_id, at) end,
                fn txn, target ->
                  Wakes.row_commit_in_txn(txn, [])
                  target
@@ -494,7 +498,10 @@ defmodule Tightbeam.NoticeBatcher do
             {targets, deferred}
 
           {:ok, target} ->
-            {[target | targets], deferred}
+            {[{target, wake_id} | targets], deferred}
+
+          {:error, %DB.Overloaded{} = error} ->
+            raise error
 
           {:error, error} ->
             reason =
@@ -505,13 +512,24 @@ defmodule Tightbeam.NoticeBatcher do
         end
       end)
 
-    recipients = recipients |> Enum.reverse() |> Enum.uniq()
+    recipients =
+      Enum.reverse(recipients)
+      |> Enum.filter(fn {target, _} -> is_nil(recipient) or target == recipient end)
+
+    own_sources = Enum.group_by(recipients, &elem(&1, 0), &elem(&1, 1))
 
     deliveries =
-      Enum.flat_map(recipients, fn target ->
+      recipients
+      |> Enum.map(&elem(&1, 0))
+      |> Enum.uniq()
+      |> Enum.flat_map(fn target ->
+        own_ids = MapSet.new(Map.fetch!(own_sources, target))
+
         case DB.transaction_then(
                db,
-               fn txn -> drain_session_in_txn(txn, target, at, delivery_opts, deferred_ids) end,
+               fn txn ->
+                 drain_session_in_txn(txn, target, own_ids, at, delivery_opts, deferred_ids)
+               end,
                fn txn, result ->
                  Wakes.row_commit_in_txn(txn, [])
                  result
@@ -525,6 +543,9 @@ defmodule Tightbeam.NoticeBatcher do
 
           {:ok, _} ->
             []
+
+          {:error, %DB.Overloaded{} = error} ->
+            raise error
 
           {:error, error} ->
             Logger.error(
@@ -560,7 +581,7 @@ defmodule Tightbeam.NoticeBatcher do
            WHERE b.batchId=?1 AND b.state IN ('open','sealed','delivery_pending')
              AND (b.deliveryWakeId IS NULL OR EXISTS (
                SELECT 1 FROM wakes w WHERE w.wakeId=b.deliveryWakeId AND w.state='pending' AND w.digest=1))
-             AND NOT EXISTS (SELECT 1 FROM turns t WHERE t.wakeId=b.deliveryWakeId)
+             AND NOT EXISTS (SELECT 1 FROM wakes w WHERE w.wakeId=b.deliveryWakeId AND w.deliveredTurnSeq IS NOT NULL)
            """,
            [batch_id]
          ) do
@@ -686,12 +707,13 @@ defmodule Tightbeam.NoticeBatcher do
 
   defp dispose_missing_role_in_txn(_txn, _wake, _at), do: :ok
 
-  defp ready_sources_in_txn(txn, at) do
+  defp ready_sources_in_txn(txn, at, recipient \\ nil) do
     Txn.q(
       txn,
       """
       SELECT w.wakeId FROM wakes w
       WHERE w.state='pending' AND w.consumer='prompt' AND w.digest=0
+        AND (?2 IS NULL OR w.sessionKey=?2 OR w.targetRole IS NOT NULL OR w.targetGate<>0)
         AND COALESCE(w.deliveryRule,'')<>'turn-boundary-digest r1'
         AND (w.conditionKind IS NULL OR w.firedAt IS NOT NULL)
         AND (w.waitMode IS NULL OR w.recognitionAt IS NOT NULL)
@@ -706,7 +728,7 @@ defmodule Tightbeam.NoticeBatcher do
         w.createdAt,COALESCE((SELECT root.rowid FROM wake_retry_attempts r
           JOIN wakes root ON root.wakeId=r.rootWakeId WHERE r.wakeId=w.wakeId),w.rowid)
       """,
-      [at]
+      [at, recipient]
     )
     |> Enum.map(&hd/1)
   end
@@ -720,27 +742,98 @@ defmodule Tightbeam.NoticeBatcher do
     end
   end
 
-  defp drain_session_in_txn(txn, target, at, delivery_opts, deferred_ids) do
-    sources =
-      ready_sources_in_txn(txn, at)
-      |> Enum.reject(&MapSet.member?(deferred_ids, &1))
-      |> Enum.flat_map(fn wake_id ->
-        case prepared_source_in_txn(txn, wake_id) do
-          nil ->
-            []
+  # Resolve a ready source's recipient from its stored routing, without
+  # preparing it. Only a terminal notice or a source with no resolvable
+  # recipient is prepared here.
+  defp source_recipient_in_txn(txn, wake_id, at) do
+    case Wakes.get_in_txn(txn, wake_id) do
+      %{state: "pending"} = wake ->
+        # A terminal notice can change recipient when prepared, so it is
+        # grouped by its prepared recipient, not by stored routing.
+        stored_target =
+          if Wakes.terminal_notice?(wake), do: nil, else: source_delivery_target(txn, wake)
 
-          source ->
-            case source_delivery_target(txn, source) do
-              {^target, _, _} -> [source]
-              _ -> []
+        case stored_target do
+          {target, _, _} ->
+            target
+
+          nil ->
+            case prepared_source_in_txn(txn, wake_id) do
+              nil ->
+                nil
+
+              source ->
+                case source_delivery_target(txn, source) do
+                  {target, _, _} ->
+                    target
+
+                  nil ->
+                    dispose_unresolved_source_in_txn(txn, source, at)
+                    nil
+                end
             end
         end
-      end)
 
-    cond do
-      sources == [] -> :empty
-      recipient_running?(txn, target, nil) -> :busy
-      true -> admit_session_snapshot_in_txn(txn, target, sources, at, delivery_opts)
+      _ ->
+        nil
+    end
+  end
+
+  # A busy recipient's sources are left untouched until it can receive. For a
+  # free recipient, re-check readiness and prepare only its own sources, each
+  # once, in this transaction. A source that fails preparation rolls back to
+  # its savepoint and waits for a later tick; the recipient's others proceed.
+  defp drain_session_in_txn(txn, target, own_ids, at, delivery_opts, deferred_ids) do
+    if recipient_running?(txn, target, nil) do
+      :busy
+    else
+      sources =
+        ready_sources_in_txn(txn, at)
+        |> Enum.filter(&MapSet.member?(own_ids, &1))
+        |> Enum.reject(&MapSet.member?(deferred_ids, &1))
+        |> Enum.flat_map(fn wake_id ->
+          case prepared_own_source_in_txn(txn, wake_id) do
+            nil ->
+              []
+
+            source ->
+              case source_delivery_target(txn, source) do
+                {^target, _, _} -> [source]
+                _ -> []
+              end
+          end
+        end)
+
+      if sources == [] do
+        :empty
+      else
+        admit_session_snapshot_in_txn(txn, target, sources, at, delivery_opts)
+      end
+    end
+  end
+
+  defp prepared_own_source_in_txn(txn, wake_id) do
+    :ok = Txn.exec(txn, "SAVEPOINT notice_source_prepare")
+
+    try do
+      source = prepared_source_in_txn(txn, wake_id)
+
+      source =
+        if source,
+          do: Map.put(source, :delivery_prompt, Wakes.delivery_prompt_in_txn(txn, wake_id))
+
+      :ok = Txn.exec(txn, "RELEASE notice_source_prepare")
+      source
+    rescue
+      error ->
+        :ok = Txn.exec(txn, "ROLLBACK TO notice_source_prepare")
+        :ok = Txn.exec(txn, "RELEASE notice_source_prepare")
+
+        reason =
+          if match?(%DB.Error{}, error), do: :persistence_refused, else: :recognition_failed
+
+        Logger.warning("notice source #{wake_id} preparation deferred: #{reason}")
+        nil
     end
   end
 
@@ -764,7 +857,7 @@ defmodule Tightbeam.NoticeBatcher do
           wake.work_item_id || wake.assignment_id || "wake",
           wake.class,
           publication_seq,
-          Wakes.delivery_prompt_in_txn(txn, wake.wake_id)
+          wake.delivery_prompt
         ]
       end)
 
@@ -972,7 +1065,11 @@ defmodule Tightbeam.NoticeBatcher do
   end
 
   defp prepare_due_source_after_suppression_in_txn(txn, wake_id) do
-    case Txn.q(txn, "SELECT sessionKey FROM turns WHERE wakeId=?1 ORDER BY seq LIMIT 1", [wake_id]) do
+    case Txn.q(
+           txn,
+           "SELECT t.sessionKey FROM wakes w JOIN turns t ON t.seq=w.deliveredTurnSeq WHERE w.wakeId=?1",
+           [wake_id]
+         ) do
       [[delivered_to]] ->
         # A pre-batching delivery may have committed its turn before the wake
         # row was marked fired. On recovery, acknowledge that exact source
@@ -1306,30 +1403,11 @@ defmodule Tightbeam.NoticeBatcher do
   end
 
   @doc false
-  # One read-only relation for actual delivery history. Transport membership
-  # before a turn exists is deliberately not delivery evidence. Callers keep
-  # their domain/assignment/authority predicates outside this relation.
-  def source_deliveries_sql do
-    """
-    SELECT t.seq AS turnSeq,t.wakeId AS sourceWakeId,t.assignmentId AS assignmentId,
-           0 AS carrier,NULL AS publicationSeq
-    FROM turns t WHERE t.wakeId IS NOT NULL
-    UNION ALL
-    SELECT t.seq,m.sourceWakeId,w.assignmentId,1,m.publicationSeq
-    FROM notice_batch_members m
-    JOIN notice_batches b ON b.batchId=m.batchId
-    JOIN wakes w ON w.wakeId=m.sourceWakeId
-    JOIN turns t ON t.wakeId=b.deliveryWakeId
-    WHERE m.state='included'
-    """
-  end
-
-  @doc false
   def source_delivery_turns_in_txn(%Txn{} = txn, source_wake_id) do
     Txn.q(
       txn,
       """
-      WITH source_deliveries AS (#{source_deliveries_sql()})
+      WITH source_deliveries AS (#{Tightbeam.NoticeBatcher.recorded_deliveries_sql()})
       SELECT t.seq,t.status,d.assignmentId
       FROM source_deliveries d JOIN turns t ON t.seq=d.turnSeq
       WHERE d.sourceWakeId=?1 ORDER BY t.seq
@@ -1584,6 +1662,7 @@ defmodule Tightbeam.NoticeBatcher do
       source_updated? = Txn.changes(txn) == 1
       Wakes.settle_batched_wait_in_txn(txn, source_id, "delivered")
       if source_updated?, do: Wakes.publish_change_in_txn(txn, "wake.fired", source_id)
+      Tightbeam.Supervision.record_idle_cleanup_delivery_in_txn(txn, source_id)
     end)
 
     :ok
@@ -1619,11 +1698,11 @@ defmodule Tightbeam.NoticeBatcher do
         db,
         """
         SELECT b.deliveryWakeId,
-               EXISTS (SELECT 1 FROM turns t WHERE t.wakeId=b.deliveryWakeId)
+               w.deliveredTurnSeq IS NOT NULL
         FROM notice_batches b
         LEFT JOIN wakes w ON w.wakeId=b.deliveryWakeId
         WHERE b.state='delivery_pending'
-          AND (w.state='fired' OR EXISTS (SELECT 1 FROM turns t WHERE t.wakeId=b.deliveryWakeId))
+          AND (w.state='fired' OR w.deliveredTurnSeq IS NOT NULL)
         """
       )
 

@@ -331,6 +331,8 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
     :ok =
       Hub.register(hub, self(), %{mode: :all, db: db, user_id: "synthetic-owner", is_admin: true})
 
+    :erlang.trace(hub, true, [:receive])
+
     input = %{
       kind: "subagent_start",
       principal: "firehose-owner",
@@ -339,14 +341,17 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
       harness: "fixture",
       at: 100,
       assignment_id: nil,
-      firehose_hub: self()
+      firehose_hub: hub
     }
 
     assert {:ok, %{appended: true, assignment_id: nil}} =
              DB.transaction(db, fn txn -> SubagentMarkers.append_in_txn(txn, input) end)
 
-    assert_receive {:"$gen_cast",
-                    {:publish, %{"class" => "subagent_marker.appended", "refs" => refs} = notice}}
+    assert_receive {:trace, ^hub, :receive,
+                    {:"$gen_cast",
+                     {:ingress, _bytes,
+                      {:publish,
+                       %{"class" => "subagent_marker.appended", "refs" => refs} = notice}}}}
 
     assert refs["sessionKey"] == "firehose-owner"
     refute Map.has_key?(refs, "assignmentId")
@@ -357,7 +362,10 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
     assert {:ok, %{appended: false, assignment_id: nil}} =
              DB.transaction(db, fn txn -> SubagentMarkers.append_in_txn(txn, input) end)
 
-    refute_receive {:"$gen_cast", {:publish, %{"class" => "subagent_marker.appended"}}}
+    refute_receive {:trace, ^hub, :receive,
+                    {:"$gen_cast",
+                     {:ingress, _, {:publish, %{"class" => "subagent_marker.appended"}}}}}
+
     before = SubagentMarkers.list(db)
 
     assert {:error, %RuntimeError{message: "marker rollback"}} =
@@ -372,7 +380,12 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
              end)
 
     assert SubagentMarkers.list(db) == before
-    refute_receive {:"$gen_cast", {:publish, %{"class" => "subagent_marker.appended"}}}
+
+    refute_receive {:trace, ^hub, :receive,
+                    {:"$gen_cast",
+                     {:ingress, _, {:publish, %{"class" => "subagent_marker.appended"}}}}}
+
+    :erlang.trace(hub, false, [:receive])
   end
 
   test "connection takeover publishes once and preserves winning generation", %{db: db} do
