@@ -125,7 +125,7 @@ defmodule Tightbeam.CronWakeTest do
     wake = schedule(ctx.db)
 
     for _ <- 1..2 do
-      :ok = DB.execute(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [wake.wake_id])
+      {:ok, []} = DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [wake.wake_id])
       CronWake.fire_due(ctx.db, System.system_time(:millisecond))
       assert %{state: "pending", due_at: next} = Wakes.get(ctx.db, wake.wake_id)
       assert next > System.system_time(:millisecond)
@@ -145,7 +145,7 @@ defmodule Tightbeam.CronWakeTest do
 
   test "R1.2 recovery fires once without catching up missed slots", %{db: db} do
     wake = schedule(db)
-    :ok = DB.execute(db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [wake.wake_id])
+    {:ok, []} = DB.query(db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [wake.wake_id])
     at = System.system_time(:millisecond)
     CronWake.fire_due(db, at)
     CronWake.fire_due(db, at)
@@ -158,7 +158,7 @@ defmodule Tightbeam.CronWakeTest do
 
   test "R1.2 overload defers the scheduler pass and preserves the armed wake", %{db: db} do
     wake = schedule(db)
-    :ok = DB.execute(db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [wake.wake_id])
+    {:ok, []} = DB.query(db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [wake.wake_id])
     proxy = start_supervised!({OverloadedDB, db})
     at = System.system_time(:millisecond)
     assert :deferred == DB.background_pass(fn -> CronWake.fire_due(proxy, at) end, :deferred)
@@ -182,7 +182,7 @@ defmodule Tightbeam.CronWakeTest do
 
     # Move only the stored deadline forward to exercise the actual single timer.
     due = System.system_time(:millisecond) + 200
-    :ok = DB.execute(ctx.db, "UPDATE wakes SET dueAt=?2 WHERE wakeId=?1", [wake.wake_id, due])
+    {:ok, []} = DB.query(ctx.db, "UPDATE wakes SET dueAt=?2 WHERE wakeId=?1", [wake.wake_id, due])
     send(scheduler, {:schedule_changed, due})
 
     assert_eventually(fn ->
@@ -204,7 +204,7 @@ defmodule Tightbeam.CronWakeTest do
 
     for fired? <- [false, true] do
       wake = schedule(db)
-      :ok = DB.execute(db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [wake.wake_id])
+      {:ok, []} = DB.query(db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [wake.wake_id])
       if fired?, do: CronWake.fire_due(db, System.system_time(:millisecond))
 
       result =
