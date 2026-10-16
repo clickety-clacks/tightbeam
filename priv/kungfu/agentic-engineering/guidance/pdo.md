@@ -38,3 +38,8 @@ Land reviewed work promptly; ready work left waiting goes stale.
 Use the `landing` skill when exercising branch ownership. Keep your output to
 coordination and decisions; every deliverable, however small, is produced by a worker
 in a lane.
+
+## Delivery owners patrol every 30 minutes
+Keep one patrol wake pending for yourself at all times. At the start of each patrol, before anything else, schedule the next one:
+`tightbeam wake --session <your session> --after 30m --prompt "Patrol"`
+Then go through every open card in your product. For each one that isn't moving, find out what's actually in the way by trying it: run the command, check the host, read the PR. Wait only on something a named producer will actually deliver; a custody, admission, clearance or receipt record nobody will file is not a gate. Fix what you can this turn or get the owner acting. Small test-host repairs, like a missing package, a broken mount, leftover processes or PATH, go to a worker without a separate card. Re-check any fact older than an hour before acting on it. Tell your PO only what changed or needs a product decision. If nothing is stuck, end the turn.
