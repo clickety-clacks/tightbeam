@@ -1645,11 +1645,18 @@ defmodule Tightbeam.Wakes do
   def schedule_in_txn(%Txn{} = txn, input) do
     input =
       case Map.get(input, :cron) do
-        nil -> input
+        nil ->
+          input
+
         schedule ->
           if Enum.any?([:condition_kind, :wait_mode], &Map.get(input, &1)),
             do: raise(ArgumentError, "cron cannot be combined with another trigger")
-          Map.merge(input, %{consumer: "cron", classify: true, due_at: Tightbeam.CronWake.next_at(schedule, now())})
+
+          Map.merge(input, %{
+            consumer: "cron",
+            classify: true,
+            due_at: Tightbeam.CronWake.next_at(schedule, now())
+          })
       end
 
     condition_kind = Map.get(input, :condition_kind)
@@ -1809,7 +1816,10 @@ defmodule Tightbeam.Wakes do
     )
 
     if schedule = Map.get(input, :cron) do
-      Txn.q(txn, "INSERT INTO cron_wake_schedules(wakeId,schedule) VALUES(?1,?2)", [wake.wake_id, schedule])
+      Txn.q(txn, "INSERT INTO cron_wake_schedules(wakeId,schedule) VALUES(?1,?2)", [
+        wake.wake_id,
+        schedule
+      ])
     end
 
     if is_binary(Map.get(input, :replacement_assignment_id)) do

@@ -834,7 +834,11 @@ defmodule Tightbeam.Gateway do
               %{code: "invalid", message: "--class requires a class name"}
 
             not valid_cron_request?(p) ->
-              %{code: "invalid", message: "cron requires a five-field schedule and cannot be combined with another trigger"}
+              %{
+                code: "invalid",
+                message:
+                  "cron requires a five-field schedule and cannot be combined with another trigger"
+              }
 
             not valid_reresolve?(p) ->
               %{code: "invalid", message: "reresolve lineage requires seed and rung"}
@@ -6941,8 +6945,18 @@ defmodule Tightbeam.Gateway do
   defp valid_cron_request?(p) do
     not Map.has_key?(p, :cron) or
       (Tightbeam.CronWake.valid?(p.cron) and
-         Enum.all?([:at, :after_ms, :condition_kind, :predicate, :after_turn, :assignment_id, :replace_queued],
-           &is_nil(p[&1])))
+         Enum.all?(
+           [
+             :at,
+             :after_ms,
+             :condition_kind,
+             :predicate,
+             :after_turn,
+             :assignment_id,
+             :replace_queued
+           ],
+           &is_nil(p[&1])
+         ))
   end
 
   defp valid_wait_request_shape?(p) do

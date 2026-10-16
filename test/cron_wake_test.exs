@@ -5,13 +5,16 @@ defmodule Tightbeam.CronWakeTest do
   setup do
     db = start_supervised!({DB, path: ":memory:", name: nil})
     :ok = ensure_all_schemas(db)
-    :ok = DB.execute(db, """
-    INSERT INTO users(userId,isAdmin,createdAt) VALUES('owner',1,1);
-    INSERT INTO sessions(sessionKey,displayName,ownerUserId,origin,archetype,harness,
-      provider,model,host,state,createdAt,updatedAt)
-    VALUES('recipient','recipient','owner','user:owner','default','claude',
-      'anthropic','fable','testhost','active',1,1);
-    """)
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO users(userId,isAdmin,createdAt) VALUES('owner',1,1);
+      INSERT INTO sessions(sessionKey,displayName,ownerUserId,origin,archetype,harness,
+        provider,model,host,state,createdAt,updatedAt)
+      VALUES('recipient','recipient','owner','user:owner','default','claude',
+        'anthropic','fable','testhost','active',1,1);
+      """)
+
     registry = start_supervised!({Tightbeam.ConnRegistry, name: nil})
     lane = :"cron_lane_#{System.unique_integer([:positive])}"
     start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, lane})
@@ -19,14 +22,24 @@ defmodule Tightbeam.CronWakeTest do
   end
 
   defp schedule(db, extra \\ %{}) do
-    Wakes.schedule(db, Map.merge(%{
-      session_key: "recipient", origin: "process:clock", prompt: "check progress",
-      cron: "*/30 * * * *", class: "status-query"
-    }, extra))
+    Wakes.schedule(
+      db,
+      Map.merge(
+        %{
+          session_key: "recipient",
+          origin: "process:clock",
+          prompt: "check progress",
+          cron: "*/30 * * * *",
+          class: "status-query"
+        },
+        extra
+      )
+    )
   end
 
   defp assert_eventually(fun, attempts \\ 200)
   defp assert_eventually(fun, 0), do: assert(fun.())
+
   defp assert_eventually(fun, attempts) do
     unless fun.() do
       Process.sleep(10)
@@ -44,36 +57,64 @@ defmodule Tightbeam.CronWakeTest do
     assert CronWake.next_at("*/30 * * * *", at) == at + 30 * 60_000
     assert CronWake.next_at("0 * * * *", at) == at + 60 * 60_000
     assert CronWake.next_at("5,20-40/10 10-12 * * *", at) == at + 5 * 60_000
+
     assert CronWake.next_at("0 0 29 2 *", local_ms({2025, 3, 1}, {0, 0, 0})) ==
-      local_ms({2028, 2, 29}, {0, 0, 0})
+             local_ms({2028, 2, 29}, {0, 0, 0})
+
     assert CronWake.next_at("0 0 * * 0,7", local_ms({2026, 10, 16}, {0, 0, 0})) ==
-      local_ms({2026, 10, 18}, {0, 0, 0})
+             local_ms({2026, 10, 18}, {0, 0, 0})
+
     assert CronWake.next_at("0 0 17 * 0", local_ms({2026, 10, 16}, {0, 0, 0})) ==
-      local_ms({2026, 10, 17}, {0, 0, 0})
+             local_ms({2026, 10, 17}, {0, 0, 0})
   end
 
   test "R1.1 invalid and impossible schedules are rejected" do
-    for invalid <- [nil, "", "* * * *", "60 * * * *", "*/0 * * * *", "9-1 * * * *", "x * * * *", "0 0 30 2 *"] do
+    for invalid <- [
+          nil,
+          "",
+          "* * * *",
+          "60 * * * *",
+          "*/0 * * * *",
+          "9-1 * * * *",
+          "x * * * *",
+          "0 0 30 2 *"
+        ] do
       refute CronWake.valid?(invalid)
     end
   end
 
   test "R1.1 wire and public wake handler accept cron and reject mixed triggers", %{db: db} do
-    assert Tightbeam.Wire.Router.atomize_params_for_test("wake", %{"cron" => "0 * * * *"}) == %{cron: "0 * * * *"}
+    assert Tightbeam.Wire.Router.atomize_params_for_test("wake", %{"cron" => "0 * * * *"}) == %{
+             cron: "0 * * * *"
+           }
+
     handler = Gateway.handlers(%{db: db})["wake"]
-    call = %{origin: "process:clock", principal: {:process, "clock"}, session_key: "recipient",
-      params: %{prompt: "check progress", cron: "0 * * * *"}}
+
+    call = %{
+      origin: "process:clock",
+      principal: {:process, "clock"},
+      session_key: "recipient",
+      params: %{prompt: "check progress", cron: "0 * * * *"}
+    }
+
     assert %{wake_id: id, state: "pending", class: "fyi"} = handler.(call)
     assert Wakes.get(db, id).due_at > System.system_time(:millisecond)
-    for params <- [%{cron: "bad"}, %{cron: "0 * * * *", at: 1},
-        %{cron: "0 * * * *", after_ms: 1}, %{cron: "0 * * * *", condition_kind: "done"},
-        %{cron: "0 * * * *", after_turn: true}, %{cron: "0 * * * *", predicate: %{}}] do
+
+    for params <- [
+          %{cron: "bad"},
+          %{cron: "0 * * * *", at: 1},
+          %{cron: "0 * * * *", after_ms: 1},
+          %{cron: "0 * * * *", condition_kind: "done"},
+          %{cron: "0 * * * *", after_turn: true},
+          %{cron: "0 * * * *", predicate: %{}}
+        ] do
       assert %{code: "invalid"} = handler.(%{call | params: Map.merge(call.params, params)})
     end
   end
 
   test "R1.2 repeated firings stay armed and enqueue distinct ordinary deliveries", ctx do
     wake = schedule(ctx.db)
+
     for _ <- 1..2 do
       :ok = DB.execute(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [wake.wake_id])
       CronWake.fire_due(ctx.db, System.system_time(:millisecond))
@@ -81,8 +122,15 @@ defmodule Tightbeam.CronWakeTest do
       assert next > System.system_time(:millisecond)
       Tightbeam.NoticeBatcher.recover(ctx.db, System.system_time(:millisecond), ctx.delivery_opts)
     end
+
     assert {:ok, [[2]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
-    assert {:ok, rows} = DB.query(ctx.db, "SELECT sessionKey,prompt,class FROM wakes WHERE consumer='prompt' AND digest=0")
+
+    assert {:ok, rows} =
+             DB.query(
+               ctx.db,
+               "SELECT sessionKey,prompt,class FROM wakes WHERE consumer='prompt' AND digest=0"
+             )
+
     assert rows == List.duplicate(["recipient", "check progress", "status-query"], 2)
   end
 
@@ -92,24 +140,38 @@ defmodule Tightbeam.CronWakeTest do
     at = System.system_time(:millisecond)
     CronWake.fire_due(db, at)
     CronWake.fire_due(db, at)
-    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM wakes WHERE consumer='prompt' AND digest=0")
+
+    assert {:ok, [[1]]} =
+             DB.query(db, "SELECT COUNT(*) FROM wakes WHERE consumer='prompt' AND digest=0")
+
     assert Wakes.get(db, wake.wake_id).due_at == CronWake.next_at("*/30 * * * *", at)
   end
 
   test "R1.3 existing scheduler timer delivers the firing with recipient prompt and class", ctx do
     wake = schedule(ctx.db)
-    scheduler = start_supervised!({Wakes, db: ctx.db, name: Tightbeam.WakeScheduler,
-      deliver: fn _ -> flunk("ordinary sources must use normal delivery") end,
-      delivery_opts: ctx.delivery_opts})
+
+    scheduler =
+      start_supervised!(
+        {Wakes,
+         db: ctx.db,
+         name: Tightbeam.WakeScheduler,
+         deliver: fn _ -> flunk("ordinary sources must use normal delivery") end,
+         delivery_opts: ctx.delivery_opts}
+      )
+
     # Move only the stored deadline forward to exercise the actual single timer.
     due = System.system_time(:millisecond) + 200
     :ok = DB.execute(ctx.db, "UPDATE wakes SET dueAt=?2 WHERE wakeId=?1", [wake.wake_id, due])
     send(scheduler, {:schedule_changed, due})
+
     assert_eventually(fn ->
       {:ok, [[count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
       count == 1
     end)
-    assert {:ok, [["recipient", content]]} = DB.query(ctx.db, "SELECT sessionKey,prompt FROM turns")
+
+    assert {:ok, [["recipient", content]]} =
+             DB.query(ctx.db, "SELECT sessionKey,prompt FROM turns")
+
     assert content =~ "check progress"
     assert content =~ "status-query"
     assert Wakes.get(ctx.db, wake.wake_id).state == "pending"
@@ -118,13 +180,23 @@ defmodule Tightbeam.CronWakeTest do
 
   test "R1.4 existing cancel stops future firings before and after first firing", %{db: db} do
     handler = Gateway.handlers(%{db: db})["wake"]
+
     for fired? <- [false, true] do
       wake = schedule(db)
       :ok = DB.execute(db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [wake.wake_id])
       if fired?, do: CronWake.fire_due(db, System.system_time(:millisecond))
-      result = handler.(%{origin: "process:clock", principal: {:process, "clock"}, session_key: "recipient",
-        params: %{cancel_wake_id: wake.wake_id}})
-      assert result == %{canceled: true} or match?({:accepted_in_txn, _, %{canceled: true}}, result)
+
+      result =
+        handler.(%{
+          origin: "process:clock",
+          principal: {:process, "clock"},
+          session_key: "recipient",
+          params: %{cancel_wake_id: wake.wake_id}
+        })
+
+      assert result == %{canceled: true} or
+               match?({:accepted_in_txn, _, %{canceled: true}}, result)
+
       assert Wakes.get(db, wake.wake_id).state == "canceled"
       {:ok, before} = DB.query(db, "SELECT * FROM wakes")
       CronWake.fire_due(db, System.system_time(:millisecond) + 86_400_000)
@@ -137,7 +209,11 @@ defmodule Tightbeam.CronWakeTest do
     assert {:ok, marker} = DB.query(db, "SELECT * FROM cron_wake_migration")
     assert :ok = Schema.ensure_all(db)
     assert {:ok, ^marker} = DB.query(db, "SELECT * FROM cron_wake_migration")
-    assert {:ok, [["*/30 * * * *"]]} = DB.query(db, "SELECT schedule FROM cron_wake_schedules WHERE wakeId=?1", [wake.wake_id])
+
+    assert {:ok, [["*/30 * * * *"]]} =
+             DB.query(db, "SELECT schedule FROM cron_wake_schedules WHERE wakeId=?1", [
+               wake.wake_id
+             ])
   end
 
   test "R1.1 additive migration follows a captured predecessor upgrade" do
