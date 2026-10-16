@@ -19,6 +19,21 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
     end
   end
 
+  defmodule MissRaceDB do
+    use GenServer
+    def start_link(args), do: GenServer.start_link(__MODULE__, args)
+    def init(args), do: {:ok, args}
+    def handle_call(request, _from, {db, opts} = state) do
+      result = GenServer.call(db, request)
+      case result do
+        {:ok, [{%{wake_id: _}, recipient, _} | _]} ->
+          NoticeBatcher.recover(db, System.system_time(:millisecond), opts, recipient)
+        _ -> :ok
+      end
+      {:reply, result, state}
+    end
+  end
+
   setup do
     db = start_supervised!({DB, path: ":memory:", name: nil})
     :ok = ensure_all_schemas(db)
@@ -485,6 +500,21 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
     :sys.get_state(pid)
     assert Tightbeam.SchedulerMisses.count() - ctx.misses_before == 1
     assert :sys.get_state(pid).detected_misses == MapSet.new()
+  end
+
+  test "the detector rechecks a candidate delivered by the event path before repair", ctx do
+    pid = scheduler(ctx)
+    Process.sleep(150)
+    state = :sys.get_state(pid)
+    stop_supervised!(Wakes)
+    source = wake(ctx.db, System.system_time(:millisecond) + 60_000)
+    DB.query(ctx.db, "UPDATE wakes SET dueAt=?1 WHERE wakeId=?2", [
+      System.system_time(:millisecond) - 61_000, source.wake_id])
+    proxy = start_supervised!({MissRaceDB, {ctx.db, ctx.delivery_opts}})
+    assert {:noreply, _} = Wakes.handle_info(:detect_misses, %{state | db: proxy})
+    assert {:ok, [[seq]]} = DB.query(ctx.db, "SELECT deliveredTurnSeq FROM wakes WHERE wakeId=?1", [source.wake_id])
+    assert is_integer(seq)
+    assert Tightbeam.SchedulerMisses.count() == ctx.misses_before
   end
 
   test "failed internal deliveries back off and succeed without another write", ctx do

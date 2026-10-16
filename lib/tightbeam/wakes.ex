@@ -8068,8 +8068,11 @@ defmodule Tightbeam.Wakes do
                      "SELECT 1 FROM turns WHERE sessionKey=?1 AND status IN ('running','queued') LIMIT 1",
                      [recipient]
                    ) == [] do
-                  [[last_ended]] = Txn.q(txn, "SELECT MAX(endedAt) FROM turns WHERE sessionKey=?1", [recipient])
-                  eligible_at = max(wake.due_at, last_ended || wake.due_at)
+                  last_ended = case Txn.q(txn, "SELECT endedAt FROM turns WHERE sessionKey=?1 AND endedAt IS NOT NULL ORDER BY seq DESC LIMIT 1", [recipient]) do
+                    [[ended_at]] -> ended_at
+                    [] -> wake.due_at
+                  end
+                  eligible_at = max(wake.due_at, last_ended)
                   if eligible_at < at - @miss_lateness_ms,
                     do: [{wake, recipient, eligible_at}], else: []
                 else
@@ -8090,8 +8093,7 @@ defmodule Tightbeam.Wakes do
         end)
       end)
 
-    for {wake, recipient, eligible_at} <- candidates,
-        not MapSet.member?(state.detected_misses, wake.wake_id) do
+    for {wake, recipient, eligible_at} <- candidates do
       try do
         # The event path may have delivered or occupied the recipient since sampling.
         ready = transaction!(state.db, fn txn ->
@@ -8122,12 +8124,7 @@ defmodule Tightbeam.Wakes do
       end
     end
 
-    detected =
-      Enum.reduce(candidates, MapSet.new(), fn {wake, _, _}, set ->
-        MapSet.put(set, wake.wake_id)
-      end)
-
-    state = %{state | detected_misses: detected}
+    state = %{state | detected_misses: MapSet.new()}
     if candidates != [], do: run_due(state), else: state
   end
 

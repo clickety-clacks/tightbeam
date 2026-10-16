@@ -105,11 +105,13 @@ defmodule Tightbeam.Wire.RouterTest do
   end
 
   test "JSON and validation errors respond with the connection returned by the body read", ctx do
+    create_session(ctx.db, "body-conn-session", ctx.device.user_id)
     for {method, path, token, body} <- [
       {:post, "/agent/dispatch", "tbc_test", "{"},
       {:post, "/agent/dispatch", "tbc_test", "[]"},
       {:post, "/agent/dispatch", "tbc_test", ~s({"verb":"unsupported"})},
       {:post, "/api/streams", ctx.device.token, "{}"},
+      {:patch, "/api/streams/body-conn-session", ctx.device.token, "{}"},
       {:delete, "/api/streams/missing", ctx.device.token, "{"},
       {:post, "/api/session-control", ctx.device.token, "{}"}
     ] do

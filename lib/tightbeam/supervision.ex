@@ -15,7 +15,8 @@ defmodule Tightbeam.Supervision do
 
   Temporary 0.1.9 scheduling replaces the one-second six-job sweep with the
   existing turn-end hook, one earliest-deadline timer and a three-minute miss
-  check. The 0.1.10 supervision core redesign should remove this scheduling
+  check. Idle cleanup deliberately uses that slow pass rather than caching a
+  deadline as eligibility changes. The 0.1.10 supervision core redesign should remove this scheduling
   machinery, retaining the turn-end hook only if its new deadlines need it.
   """
 

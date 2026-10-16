@@ -291,6 +291,7 @@ defmodule Tightbeam.SupervisionTest do
     assignment(ctx.db, "asg_peer", other.session_key, "peer", 2)
     peer_seq = terminal!(ctx.db, other.session_key)
     Supervision.classify_terminal(ctx.db, peer_seq)
+    DB.query(ctx.db, "DELETE FROM supervision_entitlements WHERE assignmentId IN ('asg_1','asg_peer')")
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
     insert_entitlement!(ctx.db, "asg_peer", generation: 1, due_at: 0)
     {:noreply, armed} = Supervision.handle_cast(:deadlines_changed, :sys.get_state(name))
