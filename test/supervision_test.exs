@@ -334,6 +334,7 @@ defmodule Tightbeam.SupervisionTest do
     end
 
     ref = make_ref()
+
     {:noreply, armed} =
       Supervision.handle_info(
         {:timeout, ref, :supervision_due},
