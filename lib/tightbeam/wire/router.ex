@@ -2927,7 +2927,7 @@ defmodule Tightbeam.Wire.Router do
       ~w(adopted context display_name effort fast_mode harness host idempotency_key mode model reasoning_level session_key setting skill guidance thinking_level verbosity)a,
     "unlearn" => ~w(idempotency_key name)a,
     "wake" =>
-      ~w(prompt after_ms after_turn assignment_id at cancel_wake_id class condition_kind condition_scope idempotency_key predicate replace_queued reresolve reresolve_rung reresolve_seed nudge)a,
+      ~w(prompt after_ms after_turn assignment_id at cancel_wake_id class cron condition_kind condition_scope idempotency_key predicate replace_queued reresolve reresolve_rung reresolve_seed nudge)a,
     "work-item-close" => ~w(work_item_id)a,
     "work-item-create" =>
       ~w(title is_bug priority spec_ref_name spec_ref_sha256 idempotency_key body)a,

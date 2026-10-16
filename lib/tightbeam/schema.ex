@@ -1778,6 +1778,14 @@ defmodule Tightbeam.Schema do
     :ok = migrate_retired_workspace_cleanup(db)
     :ok = Tightbeam.Ephemeral.migrate(db)
 
+    case Tightbeam.CronWake.ensure_schema(db) do
+      :ok ->
+        :ok
+
+      {:error, error} ->
+        Logger.error("cron unavailable: schema migration failed: #{inspect(error)}")
+    end
+
     :ok = Tightbeam.Recognition.ensure_schema(db)
 
     # Built last: the notice source payload migration above rebuilds
