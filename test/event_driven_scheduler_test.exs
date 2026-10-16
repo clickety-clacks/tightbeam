@@ -461,7 +461,7 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
        ctx do
     turn = busy(ctx.db)
     pid = scheduler(ctx)
-    source = wake(ctx.db, System.system_time(:millisecond) - 61_000)
+    source = wake(ctx.db, System.system_time(:millisecond) - 600_000)
     :ok = Wakes.fire_due(pid)
     send(pid, :detect_misses)
     :sys.get_state(pid)
@@ -488,6 +488,8 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
       end)
 
     assert log =~ "wake scheduler miss wake=#{source.wake_id} kind=prompt late_ms="
+    assert [_, lateness] = Regex.run(~r/late_ms=(\d+)/, log)
+    assert String.to_integer(lateness) in 60_000..119_999
     assert Tightbeam.SchedulerMisses.count() - ctx.misses_before == 1
 
     response =
