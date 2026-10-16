@@ -114,6 +114,7 @@ defmodule Tightbeam.EphemeralTest do
       session_key: "helper",
       target_role: nil,
       role_fallback: false,
+      supervision_interval_ms: 1_000,
       params: %{subject: "inspect"}
     }
 
