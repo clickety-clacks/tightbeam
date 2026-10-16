@@ -1831,6 +1831,8 @@ defmodule Tightbeam.SchemaShapeTest do
                "SELECT originHost, originWorkspace FROM artifacts WHERE artifactId='art_legacy_origin'"
              )
 
+    Tightbeam.SchemaShapeRuntimeFixture.downgrade_ephemeral!(db)
+
     assert :ok =
              DB.execute(
                db,
@@ -1899,6 +1901,8 @@ defmodule Tightbeam.SchemaShapeTest do
 
   test "identity denial diagnostic migration rolls back DDL with a refused stamp", %{db: db} do
     assert :ok = Schema.ensure_all(db)
+
+    Tightbeam.SchemaShapeRuntimeFixture.downgrade_ephemeral!(db)
 
     assert :ok =
              DB.execute(

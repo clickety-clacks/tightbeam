@@ -190,13 +190,19 @@ defmodule Tightbeam.EphemeralTest do
 
   @tag :tmp_dir
   test "R2.1-R2.5 additive migration follows the 0.1.8 predecessor upgrade", %{tmp_dir: tmp} do
+    prepared = Tightbeam.GuardRuntimeFixture.prepare!(Path.join(tmp, "payload"), "schema_shape_runtime.exs")
     path = Path.join(tmp, "predecessor/state.db")
-    Tightbeam.SchemaShapeRuntimeFixture.seed_operator_predecessor!(path)
-
-    db =
-      start_supervised!(
-        {DB, path: path, name: :"ephemeral_upgrade_#{System.unique_integer([:positive])}"}
-      )
+    Tightbeam.SchemaShapeRuntimeFixture.seed_operator_predecessor!(path, prepared.payload)
+    manifest = File.read!(Path.join(prepared.payload, "build-manifest.json")) |> JSON.decode!()
+    transition = JSON.encode!(%{
+      "base" => Path.dirname(path), "source" => "unmarked",
+      "target" => manifest["buildIdentity"], "expectedSchema" => "operator-decision-requests-v1"
+    })
+    name = :"ephemeral_upgrade_#{System.unique_integer([:positive])}"
+    db = start_supervised!(Supervisor.child_spec(
+      {DB, path: path, name: name, payload_root: prepared.payload, guard_inputs: [transition: transition]},
+      id: name
+    ))
 
     assert {:ok, [["operator-decision-requests-v1"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
