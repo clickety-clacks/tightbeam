@@ -1081,6 +1081,12 @@ defmodule Tightbeam.SchemaShapeTest do
     assert :ok = DB.execute(db, @owner_link_history_ddl)
     assert :ok = Schema.ensure_all(db)
 
+    # R1.1: the cron schema follows the legacy upgrade and records activation once.
+    assert {:ok, [[0, cron_at]]} = DB.query(db, "SELECT * FROM cron_wake_migration")
+    assert :ok = Schema.ensure_all(db)
+    assert {:ok, [[0, ^cron_at]]} = DB.query(db, "SELECT * FROM cron_wake_migration")
+    assert {:ok, []} = DB.query(db, "SELECT * FROM cron_wake_schedules")
+
     assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert {:ok, ^decision_requests_before} =

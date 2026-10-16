@@ -64,6 +64,7 @@ pub enum Command {
         prompt: String,
         after_ms: Option<String>,
         at: Option<String>,
+        cron: Option<String>,
         condition_kind: Option<String>,
         condition_scope: Option<String>,
         predicate: Option<serde_json::Value>,
@@ -652,7 +653,7 @@ TARGET (for commands that take one — pass exactly one):
 
 COMMANDS:
   wake (--session <key> | --role <name> | --user <id>) --prompt "<text>"
-       [--after 30s|5m|2h] [--at <epochMs>] [--assignment <id> --replace-queued]
+       [--after 30s|5m|2h] [--at <epochMs>] [--cron "<schedule>"] [--assignment <id> --replace-queued]
        [--class fyi|status-query|input-needed|blocker|algedonic]
       Condition wake:
         tightbeam wake (--session <key> | --role <name> | --user <id>)
@@ -666,6 +667,8 @@ COMMANDS:
       Ready-now continuation:
         tightbeam wake --session <holderSession> --assignment <assignmentId>
           --after-turn --prompt "<continuation>"
+      --cron uses five numeric fields in gateway local time, such as "*/30 * * * *".
+      It repeats until cancel-wake. Lists, ranges and steps are supported.
       Send a prompt to the selected target. Immediate = a direct message; with --after or
       --at = a scheduled wake that fires later. A wake ALWAYS carries a prompt —
       there is no content-free ping. This is how you DM or nudge another
@@ -1777,6 +1780,14 @@ fn parse_with_optional_catalog(
             let fallback_after_ms = nonempty(flags, "fallback-after")
                 .map(|value| parse_duration("fallback-after", &value))
                 .transpose()?;
+            let cron = nonempty(flags, "cron");
+            if flags.get("cron").is_some_and(String::is_empty) {
+                return Err("--cron requires a five-field schedule".to_owned());
+            }
+            if cron.is_some() && ["after", "at", "fallback-after", "when-fact", "when-scope", "predicate", "after-turn", "assignment", "replace-queued"]
+                .iter().any(|flag| flags.contains_key(*flag)) {
+                return Err("--cron cannot be combined with another trigger".to_owned());
+            }
             let at = nonempty(flags, "at").map(|value| js_number_json(number_coercion(&value)));
             let condition_kind = nonempty(flags, "when-fact");
             let condition_scope = nonempty(flags, "when-scope");
@@ -1863,6 +1874,7 @@ fn parse_with_optional_catalog(
                 prompt,
                 after_ms: fallback_after_ms.or(after_ms),
                 at,
+                cron,
                 condition_kind,
                 condition_scope,
                 predicate,
@@ -5266,6 +5278,7 @@ mod tests {
                 prompt: "re-read durable state".to_owned(),
                 after_ms: Some("7200000".to_owned()),
                 at: None,
+                cron: None,
                 condition_kind: Some("build-finished".to_owned()),
                 condition_scope: Some("app".to_owned()),
                 predicate: None,
@@ -5296,6 +5309,7 @@ mod tests {
                 prompt: "decide what follows".to_owned(),
                 after_ms: None,
                 at: Some("123".to_owned()),
+                cron: None,
                 condition_kind: Some("review-landed".to_owned()),
                 condition_scope: None,
                 predicate: None,
@@ -5398,6 +5412,7 @@ mod tests {
                 prompt: "continue".to_owned(),
                 after_ms: Some("7200000".to_owned()),
                 at: None,
+                cron: None,
                 condition_kind: None,
                 condition_scope: None,
                 predicate: Some(serde_json::from_str(predicate).unwrap()),
@@ -5428,6 +5443,7 @@ mod tests {
                 prompt: "continue".to_owned(),
                 after_ms: None,
                 at: None,
+                cron: None,
                 condition_kind: None,
                 condition_scope: None,
                 predicate: None,
@@ -6268,6 +6284,7 @@ mod tests {
                     prompt: "go".to_owned(),
                     after_ms: Some("30000".to_owned()),
                     at: Some("123".to_owned()),
+                cron: None,
                     condition_kind: None,
                     condition_scope: None,
                     predicate: None,

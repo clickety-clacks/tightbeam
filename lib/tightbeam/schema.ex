@@ -1777,6 +1777,7 @@ defmodule Tightbeam.Schema do
     :ok = ensure_hot_query_indexes(db)
     :ok = migrate_retired_workspace_cleanup(db)
 
+    :ok = Tightbeam.CronWake.ensure_schema(db)
     :ok = Tightbeam.Recognition.ensure_schema(db)
 
     # Built last: the notice source payload migration above rebuilds

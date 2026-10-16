@@ -1643,6 +1643,15 @@ defmodule Tightbeam.Wakes do
   """
   @spec schedule_in_txn(Txn.t(), map()) :: wake()
   def schedule_in_txn(%Txn{} = txn, input) do
+    input =
+      case Map.get(input, :cron) do
+        nil -> input
+        schedule ->
+          if Enum.any?([:condition_kind, :wait_mode], &Map.get(input, &1)),
+            do: raise(ArgumentError, "cron cannot be combined with another trigger")
+          Map.merge(input, %{consumer: "cron", classify: true, due_at: Tightbeam.CronWake.next_at(schedule, now())})
+      end
+
     condition_kind = Map.get(input, :condition_kind)
 
     input =
@@ -1798,6 +1807,10 @@ defmodule Tightbeam.Wakes do
         encode_optional(wake.recognition_transition)
       ]
     )
+
+    if schedule = Map.get(input, :cron) do
+      Txn.q(txn, "INSERT INTO cron_wake_schedules(wakeId,schedule) VALUES(?1,?2)", [wake.wake_id, schedule])
+    end
 
     if is_binary(Map.get(input, :replacement_assignment_id)) do
       Tightbeam.QueuedMessageSuppression.record_replacement_request_in_txn(
@@ -6649,6 +6662,7 @@ defmodule Tightbeam.Wakes do
              end), do: clear_retry(acc, id), else: acc
       end)
 
+    Tightbeam.CronWake.fire_due(db, now())
     recognize_due_dependency_waits(db)
     evaluate_conditions(state, :tick)
 
@@ -6665,7 +6679,7 @@ defmodule Tightbeam.Wakes do
         select_wake_sql(
           ", (SELECT routingWakeId FROM work_items WHERE id=wakes.work_item_id), (SELECT slateWakeId FROM work_items WHERE id=wakes.work_item_id)"
         ) <>
-          " INDEXED BY wakes_due WHERE state = 'pending' AND dueAt <= ?1 AND conditionKind IS NULL AND waitMode IS NULL" <>
+          " INDEXED BY wakes_due WHERE state = 'pending' AND dueAt <= ?1 AND conditionKind IS NULL AND waitMode IS NULL AND consumer<>'cron'" <>
           " AND NOT (consumer='prompt' AND digest=0 AND COALESCE(deliveryRule,'')<>'turn-boundary-digest r1')" <>
           " ORDER BY dueAt ASC",
         [now()]

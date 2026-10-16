@@ -833,6 +833,9 @@ defmodule Tightbeam.Gateway do
             Map.has_key?(p, :class) and not (is_binary(p[:class]) and p[:class] != "") ->
               %{code: "invalid", message: "--class requires a class name"}
 
+            not valid_cron_request?(p) ->
+              %{code: "invalid", message: "cron requires a five-field schedule and cannot be combined with another trigger"}
+
             not valid_reresolve?(p) ->
               %{code: "invalid", message: "reresolve lineage requires seed and rung"}
 
@@ -6935,6 +6938,13 @@ defmodule Tightbeam.Gateway do
     end
   end
 
+  defp valid_cron_request?(p) do
+    not Map.has_key?(p, :cron) or
+      (Tightbeam.CronWake.valid?(p.cron) and
+         Enum.all?([:at, :after_ms, :condition_kind, :predicate, :after_turn, :assignment_id, :replace_queued],
+           &is_nil(p[&1])))
+  end
+
   defp valid_wait_request_shape?(p) do
     predicate_present? = Map.has_key?(p, :predicate)
     predicate? = is_map(p[:predicate])
@@ -7062,6 +7072,7 @@ defmodule Tightbeam.Gateway do
         target_user_id: Map.get(call, :target_user_id),
         origin: call.origin,
         prompt: p.prompt,
+        cron: p[:cron],
         due_at: due_at,
         condition_kind: condition_kind,
         condition_scope: condition_scope,
