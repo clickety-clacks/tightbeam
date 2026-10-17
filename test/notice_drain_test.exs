@@ -192,7 +192,9 @@ defmodule Tightbeam.NoticeDrainTest do
       assert {:ok, [[^seq]]} =
                DB.query(ctx.db, "SELECT deliveredTurnSeq FROM wakes WHERE wakeId=?1", [carrier])
 
-      assert Enum.map(Wakes.digest_members(ctx.db, carrier), & &1.wake_id) == [replacement_wake_id]
+      assert Enum.map(Wakes.digest_members(ctx.db, carrier), & &1.wake_id) == [
+               replacement_wake_id
+             ]
 
       assert Tightbeam.NoticeBatcher.recover(
                ctx.db,

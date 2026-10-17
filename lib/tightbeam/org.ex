@@ -1133,7 +1133,6 @@ defmodule Tightbeam.Org do
     end
   end
 
-
   @doc "Repoint a retired session to another archetype and its base identity."
   @spec repoint_retired_archetype(db(), String.t(), String.t()) ::
           {:ok, session()} | {:error, :not_found | :not_retired}

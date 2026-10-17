@@ -4514,8 +4514,8 @@ defmodule Tightbeam.Wakes do
       nil ->
         if retirement_no_replacement_without_liveness?(command, outcome) or
              exact_terminal_effort_request?(txn, command, outcome, wake, primary),
-          do: {:ok, %{liveness_kind: nil, liveness_id: nil, action_needed: 0}},
-          else: :error
+           do: {:ok, %{liveness_kind: nil, liveness_id: nil, action_needed: 0}},
+           else: :error
 
       _ ->
         :error
