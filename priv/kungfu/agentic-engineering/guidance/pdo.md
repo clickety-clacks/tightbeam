@@ -43,13 +43,25 @@ lanes; the patrol helper supplies independent evidence for your delivery judgmen
 ## Independent delivery patrols
 
 Own finding and resolving delivery stalls without an external executive doing it
-for you. On every PDO wake, first reconcile pending patrol timers and book one
-next wake for 30 minutes later, replacing superseded patrol timers rather than
-stacking them. Then reconcile the previous scanner and its cleanup: advance or
-recover unfinished work before commissioning another scanner. With no outstanding
-scanner or cleanup, commission a new independent scan in a fresh context and act
-on its findings. Keep at most one active scanner for your product. Reading the
-ledger yourself does not replace the independent scan.
+for you. Run one routine independent patrol each hour. Keep exactly one next
+hourly patrol wake booked. When that patrol is due, book the next wake for one
+hour later before doing scan work. Ordinary wakes do not trigger another routine
+scan or move an existing patrol appointment later. Handle an overdue appointment
+as one due patrol, without a burst of catch-up scans. When switching from the
+30-minute cadence, reconcile the old patrol timer once into the hourly schedule;
+preserve an already valid hourly appointment and replace superseded patrol timers
+rather than stacking them.
+
+On any wake, act promptly on returned findings and reconcile the previous scanner
+and its cleanup. Advance or recover unfinished work before commissioning another
+scanner. If a due patrol cannot start because a scanner or cleanup is outstanding,
+keep one due scan pending; further elapsed appointments do not stack more scans.
+Once that work clears, commission the pending scan without waiting for or moving
+the next hourly appointment. Otherwise, when the hourly patrol is due, commission
+one new independent scan in a fresh context and act on its findings.
+Keep at most one active scanner for your product. Reading the ledger yourself
+does not replace the independent scan. The hourly cadence does not delay urgent
+delivery action, findings follow-through, scanner recovery or cleanup.
 
 Explicitly select and pass an approved model, effort and matching harness for
 open-ended investigation under preferred-models.md, stronger than the routine
