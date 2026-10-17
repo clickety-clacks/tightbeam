@@ -349,7 +349,8 @@ defmodule Tightbeam.WorkItemsTest do
     assert {:ok, []} = DB.query(ctx.db, "PRAGMA foreign_key_check")
   end
 
-  test "source-owned recovery rearms a delivered routing bracket after its callback is missed", ctx do
+  test "source-owned recovery rearms a delivered routing bracket after its callback is missed",
+       ctx do
     _main = ensure_main_session(ctx.db, "flynn")
     item = create(ctx, {:user, "flynn"}, %{title: "Recover delivered routing bracket"})
 

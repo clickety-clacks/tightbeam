@@ -887,7 +887,10 @@ defmodule Tightbeam.WorkItems do
                  end
 
                malformed, failures ->
-                 Logger.warning("malformed delivered work-item bracket ignored: #{inspect(malformed)}")
+                 Logger.warning(
+                   "malformed delivered work-item bracket ignored: #{inspect(malformed)}"
+                 )
+
                  failures
              end)
 
@@ -914,7 +917,8 @@ defmodule Tightbeam.WorkItems do
           all_failures -> {:error, {:source_action_failed, all_failures}}
         end
 
-      {:error, error} -> {:error, error}
+      {:error, error} ->
+        {:error, error}
     end
   end
 

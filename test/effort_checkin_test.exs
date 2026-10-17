@@ -1280,7 +1280,10 @@ defmodule Tightbeam.EffortCheckinTest do
         assignment_id: assigned.id
       })
 
-    assert rows(ctx.db, "SELECT state FROM assignments WHERE id=?1", [assigned.id]) == [["closed"]]
+    assert rows(ctx.db, "SELECT state FROM assignments WHERE id=?1", [assigned.id]) == [
+             ["closed"]
+           ]
+
     assert Wakes.get(ctx.db, prod.wake_id).state == "canceled"
   end
 

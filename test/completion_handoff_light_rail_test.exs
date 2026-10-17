@@ -315,7 +315,10 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     delivered_root = Wakes.get(ctx.db, root.wake_id)
 
     assert {:ok, _} =
-             DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey='notice-parent'")
+             DB.query(
+               ctx.db,
+               "UPDATE sessions SET state='retired' WHERE sessionKey='notice-parent'"
+             )
 
     assert %{deliveryOwnerSessionKey: "other-parent"} =
              handle(

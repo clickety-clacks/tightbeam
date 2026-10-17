@@ -608,8 +608,11 @@ defmodule Tightbeam.Wakes do
                failures
            end)
          end) do
-      {:ok, []} -> :ok
-      {:ok, failures} -> {:error, {:source_actions_unavailable, Enum.reverse(failures)}}
+      {:ok, []} ->
+        :ok
+
+      {:ok, failures} ->
+        {:error, {:source_actions_unavailable, Enum.reverse(failures)}}
 
       {:error, error} ->
         Logger.warning("delivered source actions unavailable: #{Exception.message(error)}")
@@ -3889,11 +3892,13 @@ defmodule Tightbeam.Wakes do
       else
         {:error, refusal} ->
           raise DB.Error,
-            message: "terminal action reminder readdress refused for #{wake_id}: #{inspect(refusal)}"
+            message:
+              "terminal action reminder readdress refused for #{wake_id}: #{inspect(refusal)}"
 
         other ->
           raise DB.Error,
-            message: "terminal action reminder readdress could not resolve #{wake_id}: #{inspect(other)}"
+            message:
+              "terminal action reminder readdress could not resolve #{wake_id}: #{inspect(other)}"
       end
     end)
 
@@ -6200,8 +6205,11 @@ defmodule Tightbeam.Wakes do
     work_item_result = WorkItems.reconcile_delivered_brackets(db, recipient_session_key, wake_id)
 
     case {wake_result, work_item_result} do
-      {:ok, :ok} -> :ok
-      failures -> Logger.warning("source-owned delivered-record action failed: #{inspect(failures)}")
+      {:ok, :ok} ->
+        :ok
+
+      failures ->
+        Logger.warning("source-owned delivered-record action failed: #{inspect(failures)}")
     end
   end
 
