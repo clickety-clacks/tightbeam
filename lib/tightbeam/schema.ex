@@ -1556,7 +1556,7 @@ defmodule Tightbeam.Schema do
             "(outcomeKind = 'no_replacement' AND replacementWakeId IS NULL AND"
 
           no_replacement_arms =
-            ~r/\(\(workImpactKind = 'linked_work_open' AND livenessTriggerKind IS NOT NULL AND livenessTriggerId IS NOT NULL AND actionNeeded = 1\)\s+OR\s+\(workImpactKind != 'linked_work_open' AND livenessTriggerKind IS NULL AND livenessTriggerId IS NULL AND actionNeeded = 0\)\)/
+            ~r/\(\(\s*workImpactKind\s*=\s*'linked_work_open'\s+AND\s+livenessTriggerKind\s+IS\s+NOT\s+NULL\s+AND\s+livenessTriggerId\s+IS\s+NOT\s+NULL\s+AND\s+actionNeeded\s*=\s*1\s*\)\s+OR\s+\(\s*workImpactKind\s*!=\s*'linked_work_open'\s+AND\s+livenessTriggerKind\s+IS\s+NULL\s+AND\s+livenessTriggerId\s+IS\s+NULL\s+AND\s+actionNeeded\s*=\s*0\s*\)\)/
 
           holder_activity_arm =
             "((workImpactKind = 'linked_work_open' AND livenessTriggerKind IS NOT NULL AND " <>
