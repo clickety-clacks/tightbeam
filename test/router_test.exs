@@ -275,7 +275,7 @@ defmodule Tightbeam.Wire.RouterTest do
     assert JSON.decode!(missing_parent.resp_body)["error"]["code"] == "not_found"
   end
 
-  test "selected session REST routes use only the credential-derived read principal", ctx do
+  test "selected session REST routes require explicit operator identity only for history", ctx do
     session = create_session(ctx.db, "selected-session", ctx.device.user_id)
 
     catalog = %{
@@ -298,7 +298,7 @@ defmodule Tightbeam.Wire.RouterTest do
       attributed = request.(path <> "?asUser=#{ctx.device.user_id}", "tbc_test")
 
       assert denied.status == 403
-      assert attributed.status == 403
+      assert attributed.status == if(suffix == "/messages", do: 200, else: 403)
       assert JSON.decode!(denied.resp_body)["error"]["code"] == "org_token_read_forbidden"
       refute denied.resp_body =~ session.session_key
     end
