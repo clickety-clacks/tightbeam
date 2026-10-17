@@ -4267,7 +4267,10 @@ defmodule Tightbeam.Schema do
       Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(wake_cancellations))
 
     old_table =
-      Enum.find(@assignment_source_replacement_liveness_objects, &(&1.name == "wake_cancellations"))
+      Enum.find(
+        @assignment_source_replacement_liveness_objects,
+        &(&1.name == "wake_cancellations")
+      )
 
     new_table =
       Enum.find(@effort_holder_activity_cancellation_objects, &(&1.name == "wake_cancellations"))

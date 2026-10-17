@@ -6,9 +6,9 @@ defmodule Tightbeam.EffortHolderActivityCancellationMigrationTest do
   @activity_route ~r/\n\s+OR\n\s+\(workImpactKind = 'linked_work_open' AND livenessTriggerKind IS NULL AND livenessTriggerId IS NULL AND actionNeeded = 0 AND\s+requesterKind = 'process' AND requesterId = 'tightbeam:effort-checkin' AND\s+reasonKind = 'superseded' AND causalSourceKind = 'progress_attest'\)/
   @activity_requester_route ~r/\(requesterId = 'tightbeam:effort-checkin' AND reasonKind = 'superseded' AND\s+causalSourceKind = 'progress_attest' AND outcomeKind = 'no_replacement'\)\n\s+OR\n\s+/
   @columns "wakeId,wakeState,canceledAt,requesterKind,requesterId,reasonKind," <>
-            "causalSourceKind,causalSourceId,outcomeKind,replacementWakeId," <>
-            "dispositionKind,dispositionId,primaryWorkKind,primaryWorkId,workImpactKind," <>
-            "livenessTriggerKind,livenessTriggerId,actionNeeded"
+             "causalSourceKind,causalSourceId,outcomeKind,replacementWakeId," <>
+             "dispositionKind,dispositionId,primaryWorkKind,primaryWorkId,workImpactKind," <>
+             "livenessTriggerKind,livenessTriggerId,actionNeeded"
 
   setup do
     db = :"effort_activity_migration_#{System.unique_integer([:positive])}"
@@ -80,6 +80,7 @@ defmodule Tightbeam.EffortHolderActivityCancellationMigrationTest do
 
     assert Regex.match?(@activity_route, table_sql)
     assert Regex.match?(@activity_requester_route, table_sql)
+
     assert rows(ctx.db, "SELECT shape FROM effort_holder_activity_cancellation_epoch WHERE id=0") ==
              [["effort-holder-activity-cancellation-v1-019"]]
 
