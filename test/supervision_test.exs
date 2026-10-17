@@ -82,7 +82,7 @@ defmodule Tightbeam.SupervisionTest do
                [episode_ref]
              )
 
-    assert {:ok, :canceled} =
+    assert {:ok, {:canceled, {^notice_id, nil}}} =
              DB.transaction(ctx.db, fn txn ->
                Wakes.undeliverable_delivery_in_txn(
                  txn,
@@ -122,6 +122,51 @@ defmodule Tightbeam.SupervisionTest do
     assert successor_prompt == prompt
     assert main == ctx.main.session_key
     assert Wakes.get(ctx.db, notice_id).state == "canceled"
+  end
+
+  test "legacy controller cleanup survives a real migration transaction and stamps once", ctx do
+    legacy =
+      Wakes.schedule(ctx.db, %{
+        session_key: ctx.holder.session_key,
+        assignment_id: "asg_inactive",
+        origin: "process:tightbeam",
+        creator_session_key: nil,
+        prompt: "legacy scheduled controller",
+        due_at: System.system_time(:millisecond) + 60_000
+      })
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO supervision_liveness_sidecar (
+                 wakeId,assignmentId,controllerOrigin,wakeKind,controllerState,chargedGeneration
+               ) VALUES (?1,'asg_inactive','scheduled','prod','pending',1)
+               """,
+               [legacy.wake_id]
+             )
+
+    assert :ok = Supervision.migrate_open_assignments(ctx.db, 60_000)
+
+    migrated = pending_deadline!(ctx.db, "asg_inactive")
+    assert migrated.wake_id != legacy.wake_id
+    assert Wakes.get(ctx.db, legacy.wake_id).state == "canceled"
+
+    assert {:ok, [["settled"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT controllerState FROM supervision_liveness_sidecar WHERE wakeId=?1",
+               [legacy.wake_id]
+             )
+
+    assert :ok = Supervision.migrate_open_assignments(ctx.db, 1)
+    assert pending_deadline!(ctx.db, "asg_inactive").wake_id == migrated.wake_id
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId='asg_inactive' AND consumer='assignment_inactivity_deadline' AND state='pending'"
+             )
   end
 
   test "holder wake registration moves its deadline from registration time, not future due time",
@@ -167,6 +212,98 @@ defmodule Tightbeam.SupervisionTest do
              end)
 
     assert pending_deadline!(ctx.db, "asg_inactive").wake_id == deadline.wake_id
+  end
+
+  test "deadline and reopen lookups keep indexed plans with long assignment history", ctx do
+    history_size = 20_000
+
+    assert {:ok, []} =
+             DB.query(ctx.db, """
+             WITH RECURSIVE seq(value) AS (
+               VALUES (1)
+               UNION ALL
+               SELECT value + 1 FROM seq WHERE value < #{history_size}
+             )
+             INSERT INTO wakes (wakeId,sessionKey,origin,consumer,dueAt,state,createdAt,assignmentId)
+             SELECT 'historical-deadline-' || printf('%08d',value),
+                    ?1,'process:tightbeam','assignment_inactivity_deadline',value,'fired',value,?2
+             FROM seq
+             """, [ctx.holder.session_key, "asg_inactive"])
+
+    assert {:ok, []} =
+             DB.query(ctx.db, """
+             WITH RECURSIVE seq(value) AS (
+               VALUES (1)
+               UNION ALL
+               SELECT value + 1 FROM seq WHERE value < #{history_size}
+             )
+             INSERT INTO assignment_reopenings (
+               assignmentId,ts,reopenedByUser,reason,priorOutcome,priorClosedAt
+             )
+             SELECT ?1,value,'flynn','synthetic historical close','completed',value
+             FROM seq
+             """, ["asg_inactive"])
+
+    assert {:ok, [[^history_size]]} =
+             DB.query(ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline'",
+               ["asg_inactive"]
+             )
+
+    assert {:ok, [[^history_size]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM assignment_reopenings WHERE assignmentId=?1", [
+               "asg_inactive"
+             ])
+
+    assert {:ok, deadline_plan} =
+             DB.query(
+               ctx.db,
+               "EXPLAIN QUERY PLAN SELECT prompt FROM wakes WHERE assignmentId=?1 AND consumer=?2 ORDER BY createdAt DESC,wakeId DESC LIMIT 1",
+               ["asg_inactive", "assignment_inactivity_deadline"]
+             )
+
+    assert Enum.any?(deadline_plan, fn [_, _, _, detail] ->
+             String.contains?(detail, "wakes_assignment_consumer_created_order")
+           end)
+
+    assert {:ok, reopen_plan} =
+             DB.query(
+               ctx.db,
+               "EXPLAIN QUERY PLAN SELECT MAX(ts) FROM assignment_reopenings WHERE assignmentId=?1",
+               ["asg_inactive"]
+             )
+
+    assert Enum.any?(reopen_plan, fn [_, _, _, detail] ->
+             String.contains?(detail, "assignment_reopenings_activity_source_order")
+           end)
+
+    assert {:ok, reconciliation_plan} =
+             DB.query(
+               ctx.db,
+               "EXPLAIN QUERY PLAN SELECT wakeId,recipientSessionKey FROM wake_source_reconciliation " <>
+                 "WHERE outcome IN ('delivered','delivery-failed') AND availableAt<=?1 " <>
+                 "ORDER BY availableAt,id LIMIT ?2",
+               [System.system_time(:millisecond), 100]
+             )
+
+    assert Enum.any?(reconciliation_plan, fn [_, _, _, detail] ->
+             String.contains?(detail, "wake_source_reconciliation_due")
+           end)
+
+    assert {:ok, terminal_action_plan} =
+             DB.query(
+               ctx.db,
+               "EXPLAIN QUERY PLAN SELECT id FROM attests WHERE bySession=?1 AND kind='progress' AND note LIKE ?2 ESCAPE ?3 LIMIT 1",
+               [
+                 ctx.main.session_key,
+                 "completion-handoff-action asg_inactive attest w_history %",
+                 "\\"
+               ]
+             )
+
+    assert Enum.any?(terminal_action_plan, fn [_, _, _, detail] ->
+             String.contains?(detail, "attests_terminal_action_note")
+           end)
   end
 
   test "an unanswered climb preserves a delivered rung and creates a fresh parent notice", ctx do

@@ -612,6 +612,10 @@ defmodule Tightbeam.NoticeBatcher do
           {:ok, nil} ->
             {targets, deferred}
 
+          {:ok, {:undeliverable, wake_id, source_recipient, notice}} ->
+            publish_undeliverable_outcome(db, wake_id, source_recipient, notice)
+            {targets, deferred}
+
           {:ok, target} ->
             {[{target, wake_id} | targets], deferred}
 
@@ -650,7 +654,11 @@ defmodule Tightbeam.NoticeBatcher do
                  result
                end
              ) do
-          {:ok, {:deliveries, chunks}} ->
+          {:ok, {:deliveries, chunks, undeliverable_notices}} ->
+            Enum.each(undeliverable_notices, fn {wake_id, source_recipient, notice} ->
+              publish_undeliverable_outcome(db, wake_id, source_recipient, notice)
+            end)
+
             Enum.map(chunks, fn {:delivered, wake_id, delivery} ->
               Gateway.complete_delivery(db, delivery)
               wake_id
@@ -751,13 +759,22 @@ defmodule Tightbeam.NoticeBatcher do
 
   def carrier_admission_in_txn(%Txn{}, _wake_id), do: :ready
 
+  defp publish_undeliverable_outcome(db, wake_id, recipient, notice) do
+    Wakes.publish_undeliverable_notice(notice)
+    Wakes.delivery_outcome_committed(db, recipient, wake_id)
+  end
+
   defp dispose_unresolved_source_in_txn(txn, source, at) do
-    Wakes.undeliverable_delivery_in_txn(
-      txn,
-      source.wake_id,
-      "recipient is not currently resolvable",
-      at
-    )
+    case Wakes.undeliverable_delivery_in_txn(
+           txn,
+           source.wake_id,
+           "recipient is not currently resolvable",
+           at
+         ) do
+      {:canceled, {wake_id, notice}} ->
+        {:undeliverable, wake_id, source.session_key, notice}
+      _ -> nil
+    end
   end
 
   defp ready_sources_in_txn(txn, at, recipient \\ nil) do
@@ -805,7 +822,6 @@ defmodule Tightbeam.NoticeBatcher do
 
           nil ->
             dispose_unresolved_source_in_txn(txn, wake, at)
-            nil
         end
 
       _ ->
@@ -925,7 +941,7 @@ defmodule Tightbeam.NoticeBatcher do
             admit_session_chunk_in_txn(txn, target, chunk_sources, chunk_rows, at, delivery_opts)
           end)
 
-        {:deliveries, deliveries}
+        {:deliveries, deliveries, []}
 
       {:error, {:source_submission_too_large, {source, _}, chars, limit}} ->
         EventLog.lifecycle_in_txn(
@@ -935,9 +951,35 @@ defmodule Tightbeam.NoticeBatcher do
           "receiver=#{receiver} textChars=#{chars} limitChars=#{limit} recipient=#{target}"
         )
 
-        {:submission_size_refused, target}
+        notice =
+          case Wakes.undeliverable_delivery_in_txn(
+                 txn,
+                 source.wake_id,
+                 "notice text exceeds the recipient submission limit",
+                 at,
+                 "consumer_unavailable"
+               ) do
+            {:canceled, {wake_id, sender_notice}} -> {wake_id, sender_notice}
+            _ -> nil
+          end
+
+        remaining = Enum.reject(sources, &(&1.wake_id == source.wake_id))
+
+        case admit_session_snapshot_in_txn(txn, target, remaining, at, delivery_opts) do
+          {:deliveries, deliveries, notices} ->
+            source_notice =
+              case notice do
+                {wake_id, sender_notice} -> [{wake_id, target, sender_notice}]
+                nil -> []
+              end
+
+            {:deliveries, deliveries, source_notice ++ notices}
+        end
     end
   end
+
+  defp admit_session_snapshot_in_txn(_txn, _target, [], _at, _delivery_opts),
+    do: {:deliveries, [], []}
 
   defp release_cause(boundary, first) do
     if is_integer(boundary) and boundary > first.created_at, do: "turn-boundary", else: "idle"

@@ -1775,6 +1775,7 @@ defmodule Tightbeam.Schema do
     :ok = migrate_continuation_retry_guard(db)
     :ok = upgrade_decision_request_row_schema_revision(db)
     :ok = ensure_hot_query_indexes(db)
+    :ok = ensure_supervision_source_indexes(db)
     :ok = migrate_retired_workspace_cleanup(db)
     :ok = Tightbeam.Ephemeral.migrate(db)
 
@@ -2809,6 +2810,43 @@ defmodule Tightbeam.Schema do
         )
 
         :ok
+    end
+  end
+
+  defp ensure_supervision_source_indexes(db) do
+    indexes = [
+      "CREATE INDEX IF NOT EXISTS wakes_assignment_consumer_created_order " <>
+        "ON wakes(assignmentId,consumer,createdAt DESC,wakeId DESC)",
+      "CREATE INDEX IF NOT EXISTS wakes_assignment_consumer_pending_created " <>
+        "ON wakes(assignmentId,consumer,createdAt DESC,wakeId DESC) WHERE state='pending'",
+      "CREATE INDEX IF NOT EXISTS wakes_assignment_pending_created_order " <>
+        "ON wakes(assignmentId,createdAt DESC,wakeId DESC) WHERE state='pending'",
+      "CREATE INDEX IF NOT EXISTS wakes_activity_source_order " <>
+        "ON wakes(assignmentId,creatorSessionKey,createdAt DESC)",
+      "CREATE INDEX IF NOT EXISTS attests_activity_source_order " <>
+        "ON attests(assignmentId,bySession,ts DESC)",
+      "CREATE INDEX IF NOT EXISTS attests_terminal_action_note " <>
+        "ON attests(bySession,kind,note COLLATE NOCASE)",
+      "CREATE INDEX IF NOT EXISTS artifacts_activity_source_order " <>
+        "ON artifacts(producedByAssignmentId,createdBySession,createdAt DESC)",
+      "CREATE INDEX IF NOT EXISTS decision_requests_activity_source_order " <>
+        "ON decision_requests(assignmentId,raiserSessionKey,raisedAt DESC)",
+      "CREATE INDEX IF NOT EXISTS assignment_reopenings_activity_source_order " <>
+        "ON assignment_reopenings(assignmentId,ts DESC)",
+      "CREATE INDEX IF NOT EXISTS wakes_pending_session_obligation " <>
+        "ON wakes(sessionKey,obligationRef) WHERE state='pending'"
+    ]
+
+    case DB.migration_transaction(db, :supervision_source_indexes_v1, [], [], fn txn ->
+           Enum.each(indexes, &Txn.exec(txn, &1))
+           :ok
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, error} ->
+        raise ShapeError,
+          message: "supervision source indexes could not be built: #{Exception.message(error)}"
     end
   end
 

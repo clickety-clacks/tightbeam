@@ -140,11 +140,12 @@ defmodule Tightbeam.WakesTest do
     %{db: name, scheduler: scheduler}
   end
 
-  test "schedule persists a pending wake and typed public cancel requires its origin", %{db: db} do
+  test "schedule persists a pending wake and public cancel follows its recorded sender", %{db: db} do
     wake =
       Wakes.schedule(db, %{
         session_key: "k1",
         origin: "agent:a",
+        creator_session_key: "test-session",
         prompt: "check the build",
         due_at: System.system_time(:millisecond)
       })
@@ -177,7 +178,12 @@ defmodule Tightbeam.WakesTest do
     assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM events")
     assert Wakes.get(db, wake.wake_id).state == "pending"
 
-    refute public_cancel(db, wake.wake_id, "agent:b")
+    refute public_cancel(
+             db,
+             wake.wake_id,
+             "agent:a",
+             %{kind: "session", id: "new-role-holder"}
+           )
     assert cancellation_event_count(db, wake.wake_id) == 0
 
     :ok =
@@ -192,7 +198,7 @@ defmodule Tightbeam.WakesTest do
       )
 
     assert {:accepted_in_txn, event_id, %{canceled: true}} =
-             public_cancel(db, wake.wake_id, "agent:a")
+             public_cancel(db, wake.wake_id, "agent:b")
 
     assert {:ok, [[^event_id, causal_source_id]]} =
              DB.query(
@@ -216,7 +222,7 @@ defmodule Tightbeam.WakesTest do
 
     assert cancellation_event_count(db, wake.wake_id) == 1
     assert Wakes.get(db, wake.wake_id).state == "canceled"
-    refute public_cancel(db, wake.wake_id, "agent:a")
+    refute public_cancel(db, wake.wake_id, "agent:b")
     assert cancellation_event_count(db, wake.wake_id) == 1
   end
 
@@ -225,6 +231,7 @@ defmodule Tightbeam.WakesTest do
       Wakes.schedule(db, %{
         session_key: "rollback-session",
         origin: "agent:rollback",
+        creator_session_key: "rollback-session",
         prompt: "roll every cancellation row back",
         due_at: 1
       })

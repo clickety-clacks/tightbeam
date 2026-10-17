@@ -162,7 +162,53 @@ defmodule Tightbeam.NoticeBatcherTest do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 30)
   end
 
+  test "prewrite retry restores every admitted source without changing its stored bytes", %{
+    tmp_dir: tmp
+  } do
+    Tightbeam.NoticeBatcherFixture.run!(tmp, 31)
+  end
+
+  test "uncertain or dispatched turns refuse prewrite restoration atomically", %{tmp_dir: tmp} do
+    Tightbeam.NoticeBatcherFixture.run!(tmp, 32)
+  end
+
+  test "unavailable retry provenance rolls back the whole sibling restoration", %{tmp_dir: tmp} do
+    Tightbeam.NoticeBatcherFixture.run!(tmp, 35)
+  end
+
+  test "a provider rejection cannot be mistaken for prewrite restoration evidence", %{
+    tmp_dir: tmp
+  } do
+    Tightbeam.NoticeBatcherFixture.run!(tmp, 38)
+  end
+
+  test "forged retry identity or carrier metadata cannot be restored", %{tmp_dir: tmp} do
+    Tightbeam.NoticeBatcherFixture.run!(tmp, 42)
+  end
+
+  test "ordinary sources retain retry authority across repeated prewrite failures", %{tmp_dir: tmp} do
+    Tightbeam.NoticeBatcherFixture.run!(tmp, 47)
+  end
+
   test "one malformed attachment source does not block its sibling notice", %{tmp_dir: tmp} do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 43)
+  end
+
+  test "an oversized source is ended with a sender notice without blocking its sibling", %{
+    tmp_dir: tmp
+  } do
+    Tightbeam.NoticeBatcherFixture.run!(tmp, 44)
+  end
+
+  test "an unresolvable linked target is ended without blocking or reading its missing source", %{
+    tmp_dir: tmp
+  } do
+    Tightbeam.NoticeBatcherFixture.run!(tmp, 46)
+  end
+
+  test "a malformed source-reconciliation record does not block a healthy delivered notice", %{
+    tmp_dir: tmp
+  } do
+    Tightbeam.NoticeBatcherFixture.run!(tmp, 48)
   end
 end

@@ -590,6 +590,84 @@ defmodule Tightbeam.EscalationTest do
              ])
   end
 
+  test "terminal requests retract only their pending notice and keep event reports", ctx do
+    owner_session = Org.personal_session_key("flynn")
+
+    Org.create(ctx.db, %{
+      session_key: owner_session,
+      display_name: "Owner Main",
+      kind: "main",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("fable")
+    })
+
+    busy_turn = start_busy_turn(ctx.db, owner_session)
+    call = call(ctx.raiser, %{assignment_id: "a-notice-clear", kind: "completion"})
+    {:decision_pending, withdrawn_id} = open(ctx, call, statute())
+    withdrawn_ref = Wakes.decision_request_notice_ref(withdrawn_id)
+
+    assert {:ok, [[withdrawn_wake, "pending"]]} =
+             DB.query(ctx.db, "SELECT wakeId,state FROM wakes WHERE obligationRef=?1", [withdrawn_ref])
+
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    assert Wakes.get(ctx.db, withdrawn_wake).state == "pending"
+
+    assert %{status: "withdrawn"} =
+             Escalation.withdraw(ctx.db, %{
+               origin: "agent:raiser",
+               principal: {:session, ctx.raiser.session_key},
+               params: %{request_id: withdrawn_id, reason: "changed course"}
+             })
+
+    assert {:ok, [["canceled"]]} =
+             DB.query(ctx.db, "SELECT state FROM wakes WHERE wakeId=?1", [withdrawn_wake])
+
+    {:decision_pending, ruled_id} = open(ctx, call, statute())
+    ruled_ref = Wakes.decision_request_notice_ref(ruled_id)
+
+    assert {:ok, [[ruled_wake, "pending"]]} =
+             DB.query(ctx.db, "SELECT wakeId,state FROM wakes WHERE obligationRef=?1", [ruled_ref])
+
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    assert Wakes.get(ctx.db, ruled_wake).state == "pending"
+    _report = ruling_wake(ctx, ruled_id)
+
+    assert %{status: "ruled"} =
+             Escalation.rule(ctx.db, rule_call(ruled_id, "allow"),
+               authorized: true,
+               scheduler: ctx.scheduler
+             )
+
+    assert {:ok, [["canceled"]]} =
+             DB.query(ctx.db, "SELECT state FROM wakes WHERE wakeId=?1", [ruled_wake])
+
+    assert {:ok, [[event_state, "escalation-ruled"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,conditionKind FROM wakes WHERE conditionScope=?1 AND conditionKind='escalation-ruled'",
+               [ruled_id]
+             )
+
+    assert event_state in ["pending", "fired"]
+
+    finish_busy_turn(ctx.db, busy_turn)
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+
+    assert {:ok, [["fired"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state FROM wakes WHERE conditionScope=?1 AND conditionKind='escalation-ruled'",
+               [ruled_id]
+             )
+
+    assert Wakes.get(ctx.db, ruled_wake).state == "canceled"
+  end
+
   test "boot recovery catches a retired session and read surfaces enforce owner or raiser", ctx do
     call = call(ctx.raiser, %{assignment_id: "a6", kind: "completion"})
     {:decision_pending, id} = open(ctx, call, statute())
@@ -3377,6 +3455,31 @@ defmodule Tightbeam.EscalationTest do
 
   defp open(ctx, call, statute) do
     Escalation.escalate(ctx.db, call, statute, escalation_ctx())
+  end
+
+  defp start_busy_turn(db, session_key) do
+    {:appended, message} =
+      Projection.append(db, %{
+        session_key: session_key,
+        role: "user",
+        content: "[from test:escalation]\n\nHold the decision notice recipient.",
+        sender: "test:escalation"
+      })
+
+    {:ok, _seq} =
+      Ledger.enqueue(db, %{
+        session_key: session_key,
+        message_id: message.id,
+        origin: "test:escalation",
+        prompt: "Hold the decision notice recipient."
+      })
+
+    assert {:ok, turn} = Ledger.claim_next(db, session_key, "escalation-notice-clear-test")
+    turn
+  end
+
+  defp finish_busy_turn(db, turn) do
+    assert :ok = Ledger.finish(db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
   end
 
   defp rule_call(id, decision) do

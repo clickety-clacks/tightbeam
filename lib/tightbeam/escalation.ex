@@ -857,7 +857,8 @@ defmodule Tightbeam.Escalation do
                 origin: "process:tightbeam",
                 prompt: owner_notification(request),
                 due_at: now,
-                target_gate: 0
+                target_gate: 0,
+                obligation_ref: Wakes.decision_request_notice_ref(request.id)
               })
             end
 
@@ -1357,7 +1358,8 @@ defmodule Tightbeam.Escalation do
             prompt: ask_notification(request_id, resolved_input),
             due_at: raised_at,
             target_gate: 0,
-            class: "input-needed"
+            class: "input-needed",
+            obligation_ref: Wakes.decision_request_notice_ref(request_id)
           })
         else
           Wakes.schedule_in_txn(txn, %{
@@ -1366,6 +1368,7 @@ defmodule Tightbeam.Escalation do
             prompt: ask_notification(request_id, resolved_input),
             due_at: raised_at,
             target_gate: 0,
+            obligation_ref: Wakes.decision_request_notice_ref(request_id),
             class: "input-needed"
           })
         end
@@ -2219,6 +2222,10 @@ defmodule Tightbeam.Escalation do
   def publish_decision_transition_in_txn(%Txn{} = txn, before, after_row, hub \\ Hub) do
     after_row = request_in_txn(txn, after_row.id)
 
+    if before && before.status == "open" && after_row.status != "open" do
+      Wakes.clear_decision_request_notice_in_txn(txn, after_row.id)
+    end
+
     if public_transition_candidate?(before, after_row) do
       Txn.q(
         txn,
@@ -2595,6 +2602,8 @@ defmodule Tightbeam.Escalation do
 
       if Txn.changes(txn) != 1,
         do: raise(DB.Error, message: "operator supersede lost its open-row CAS")
+
+      Wakes.clear_decision_request_notice_in_txn(txn, ask.supersedes)
     end
 
     Txn.q(
@@ -2645,15 +2654,16 @@ defmodule Tightbeam.Escalation do
       )
     end
 
-    # The existing outbox provides only the filing-time opportunity in this
-    # bounded core. requestRef, reminder consumption, and terminal wake
-    # cancellation land with their separately owned Wakes/Gateway integration.
+    # The opening notice is an ordinary stored wake associated with this open
+    # request. Terminal transitions retract it while preserving any delivered
+    # transport history and the separate ruling event report.
     Wakes.schedule_in_txn(txn, %{
       session_key: Org.personal_session_key(owner_user_id),
       origin: "process:tightbeam",
       prompt: operator_notification(request),
       due_at: raised_at,
-      target_gate: 0
+      target_gate: 0,
+      obligation_ref: Wakes.decision_request_notice_ref(request.id)
     })
 
     request

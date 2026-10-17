@@ -908,6 +908,7 @@ defmodule Tightbeam.EffortCheckin do
 
         if Txn.changes(txn) == 1 do
           ruled = Escalation.raw_by_id_in_txn(txn, current.id)
+          Wakes.clear_decision_request_notice_in_txn(txn, current.id)
 
           DB.record_row_commit(
             txn,
@@ -1717,7 +1718,8 @@ defmodule Tightbeam.EffortCheckin do
       prompt: prompt,
       due_at: now(),
       assignment_id: request.assignment_id,
-      target_gate: 0
+      target_gate: 0,
+      obligation_ref: Wakes.decision_request_notice_ref(request.id)
     })
   end
 

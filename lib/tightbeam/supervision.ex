@@ -101,11 +101,9 @@ defmodule Tightbeam.Supervision do
            ) do
         [[^actor_session_key, work_item_id, opened_at, "open"]]
         when is_integer(opened_at) ->
-          interval_ms = current_interval_in_txn(txn, assignment_id)
           activity_start = activity_start_in_txn(txn, assignment_id, opened_at)
-
-          last_activity =
-            current_activity_time_in_txn(txn, assignment_id, actor_session_key, activity_start)
+          {interval_ms, last_activity} =
+            latest_deadline_state_in_txn(txn, assignment_id, activity_start)
 
           effective_at = max(activity_start, max(last_activity, at))
 
@@ -862,7 +860,7 @@ defmodule Tightbeam.Supervision do
     end
   end
 
-  defp current_interval_in_txn(txn, assignment_id) do
+  defp latest_deadline_state_in_txn(txn, assignment_id, activity_start) do
     rows =
       Txn.q(
         txn,
@@ -870,11 +868,14 @@ defmodule Tightbeam.Supervision do
         [assignment_id, @deadline_consumer]
       )
 
-    interval =
+    state =
       case rows do
         [[prompt]] when is_binary(prompt) ->
           case JSON.decode(prompt) do
-            {:ok, %{"intervalMs" => value}} when is_integer(value) and value > 0 -> value
+            {:ok, %{"intervalMs" => interval_ms, "activityAt" => activity_at}}
+            when is_integer(interval_ms) and interval_ms > 0 and is_integer(activity_at) ->
+              {interval_ms, activity_at}
+
             _ -> nil
           end
 
@@ -882,14 +883,16 @@ defmodule Tightbeam.Supervision do
           nil
       end
 
-    if is_integer(interval) do
-      interval
-    else
-      Logger.warning(
-        "assignment inactivity interval unavailable for #{assignment_id}; using default"
-      )
+    case state do
+      {interval_ms, activity_at} ->
+        {interval_ms, max(activity_start, activity_at)}
 
-      @default_interval_ms
+      _ ->
+        Logger.warning(
+          "assignment inactivity interval unavailable for #{assignment_id}; using default"
+        )
+
+        {@default_interval_ms, activity_start}
     end
   end
 
@@ -996,7 +999,7 @@ defmodule Tightbeam.Supervision do
     Enum.each(rows, fn
       [wake_id, assignment_id, assignment_state]
       when is_binary(wake_id) and is_binary(assignment_id) ->
-        isolated_side_task(txn, assignment_id, "legacy-controller", fn ->
+        isolated_side_task(txn, assignment_id, "legacy_controller", fn ->
           result =
             case {assignment_state, pending_deadline_wake_id(txn, assignment_id)} do
               {"open", replacement_id} when is_binary(replacement_id) ->

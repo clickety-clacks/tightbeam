@@ -1,8 +1,9 @@
 defmodule Tightbeam.SentinelsTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Gateway, Identity, Model, Org, Placement, Schema}
+  alias Tightbeam.{DB, Gateway, Identity, Ledger, Model, Org, Placement, Projection, Schema}
   alias Tightbeam.{SentinelSupervisor, Sentinels}
+  alias Tightbeam.Wakes
 
   # Two synthetic bundles that each declare a sentinel named "watch", so a bare
   # name is ambiguous and each qualified name is distinct.
@@ -548,6 +549,9 @@ defmodule Tightbeam.SentinelsTest do
         model: Model.new("fable")
       })
 
+      owner_session = Org.personal_session_key("flynn")
+      busy_turn = start_busy_turn(ctx.db, owner_session)
+
       File.write!(Path.join(ctx.bundles, "alpha-bundle/sentinels/watch"), "#!/bin/sh\nexit 3\n")
       learn_both!(ctx)
       set_settings!(ctx, "alpha-bundle/watch", %{"WATCH_TARGET" => "a", "WATCH_EXTRA" => "b"})
@@ -571,15 +575,45 @@ defmodule Tightbeam.SentinelsTest do
 
       assert length(Regex.scan(~r/ exit alpha-bundle\/watch status=3/, log)) == 5
 
-      {:ok, wakes} = DB.query(ctx.db, "SELECT sessionKey, origin, prompt FROM wakes")
+      {:ok, wakes} =
+        DB.query(ctx.db, "SELECT sessionKey,origin,prompt,obligationRef,state FROM wakes")
 
-      assert [[session_key, "process:tightbeam", prompt]] = wakes
+      assert [[session_key, "process:tightbeam", prompt, obligation_ref, "pending"]] = wakes
       assert session_key == Org.personal_session_key("flynn")
       assert prompt =~ "Sentinel alpha-bundle/watch on #{ctx.host} is stopped"
       assert prompt =~ "tightbeam sentinel enable alpha-bundle/watch"
+      assert obligation_ref == Wakes.sentinel_stop_notice_ref(ctx.host, "alpha-bundle/watch")
 
       assert [%{state: "stopped", action: "run: tightbeam sentinel enable alpha-bundle/watch"}] =
                Sentinels.setup(ctx.base, ctx.db, ctx.host, "alpha-bundle").pending
+
+      scheduler =
+        start_supervised!(
+          {Wakes,
+           db: ctx.db,
+           name: :sentinel_condition_notice_scheduler,
+           tick_ms: 60_000,
+           deliver: fn _wake -> :ok end}
+        )
+
+      assert :ok = Wakes.fire_due(scheduler)
+      assert {:ok, [["pending"]]} =
+               DB.query(ctx.db, "SELECT state FROM wakes WHERE obligationRef=?1", [obligation_ref])
+
+      enable!(ctx, "alpha-bundle/watch")
+      :ok = Sentinels.mark_started(ctx.db, ctx.host, "alpha-bundle/watch", String.duplicate("a", 64), 2)
+
+      assert {:ok, [["canceled"]]} =
+               DB.query(ctx.db, "SELECT state FROM wakes WHERE obligationRef=?1", [obligation_ref])
+
+      assert :ok = Ledger.finish(ctx.db, busy_turn.seq, "delivered", nil, owner_lease: busy_turn.owner_lease)
+      assert :ok = Wakes.fire_due(scheduler)
+      assert {:ok, [[0]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM turns WHERE wakeId=(SELECT wakeId FROM wakes WHERE obligationRef=?1)",
+                 [obligation_ref]
+               )
 
       # Children that exit at once never take the supervisor down with them.
       assert Process.alive?(supervisor)
@@ -669,6 +703,27 @@ defmodule Tightbeam.SentinelsTest do
   defp enable!(ctx, qualified) do
     {:ok, sentinel} = Sentinels.resolve(ctx.base, qualified)
     {:ok, %{state: "enabled"}} = Sentinels.enable(ctx.db, ctx.host, sentinel, "user:flynn")
+  end
+
+  defp start_busy_turn(db, session_key) do
+    {:appended, message} =
+      Projection.append(db, %{
+        session_key: session_key,
+        role: "user",
+        content: "[from test:sentinels]\n\nKeep the condition notice recipient busy.",
+        sender: "test:sentinels"
+      })
+
+    {:ok, _seq} =
+      Ledger.enqueue(db, %{
+        session_key: session_key,
+        message_id: message.id,
+        origin: "test:sentinels",
+        prompt: "Keep the condition notice recipient busy."
+      })
+
+    assert {:ok, turn} = Ledger.claim_next(db, session_key, "sentinel-condition-clear-test")
+    turn
   end
 
   defp start_supervisor!(ctx, opts \\ []) do

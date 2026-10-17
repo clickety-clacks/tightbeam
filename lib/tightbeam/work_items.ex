@@ -295,6 +295,10 @@ defmodule Tightbeam.WorkItems do
       updated = fetch_in_txn(txn, item.id)
       changed? = metadata(item) != metadata(updated)
 
+      if item.deliveryOwnerSessionKey != updated.deliveryOwnerSessionKey do
+        Wakes.readdress_accountability_notices_in_txn(txn, item.id)
+      end
+
       if changed?, do: stamp_version_in_txn(txn, item.id, now())
       {:updated, fetch_in_txn(txn, item.id), changed?}
     end
@@ -829,40 +833,38 @@ defmodule Tightbeam.WorkItems do
         delivered_wake_id \\ nil
       ) do
     case DB.transaction(db, fn txn ->
-           delivered_turn_seq =
-             if is_binary(delivered_wake_id) do
-               case Txn.q(txn, "SELECT deliveredTurnSeq FROM wakes WHERE wakeId=?1", [
-                      delivered_wake_id
-                    ]) do
-                 [[seq]] when is_integer(seq) -> seq
-                 _ -> nil
-               end
-             end
-
            rows =
              Txn.q(
                txn,
                """
                SELECT w.wakeId,w.work_item_id
-               FROM wakes w
-               JOIN turns t ON t.seq=w.deliveredTurnSeq
+               FROM wake_source_reconciliation q
+               JOIN wakes w ON w.wakeId=q.wakeId
                JOIN work_items wi ON wi.id=w.work_item_id
-               WHERE (?1 IS NULL OR t.sessionKey=?1)
-                 AND (?2 IS NULL OR w.deliveredTurnSeq=?2)
+               WHERE q.outcome='delivered'
+                 AND typeof(q.wakeId)='text' AND length(q.wakeId)>0
+                 AND typeof(q.recipientSessionKey)='text' AND length(q.recipientSessionKey)>0
+                 AND typeof(q.availableAt)='integer'
+                 AND (?1 IS NULL OR q.recipientSessionKey=?1)
+                 AND (?2 IS NULL OR q.wakeId=?2)
+                 AND q.availableAt<=?3
                  AND wi.state='open'
                  AND (wi.routingWakeId=w.wakeId OR wi.slateWakeId=w.wakeId)
-               ORDER BY w.deliveredTurnSeq,w.wakeId
+               ORDER BY q.availableAt,q.id
+               LIMIT 100
                """,
-               [recipient_session_key, delivered_turn_seq]
+               [recipient_session_key, delivered_wake_id, System.system_time(:millisecond)]
              )
 
-           Enum.each(rows, fn
-             [wake_id, work_item_id] when is_binary(wake_id) and is_binary(work_item_id) ->
+           Enum.reduce(rows, [], fn
+             [wake_id, work_item_id], failures
+             when is_binary(wake_id) and is_binary(work_item_id) ->
                :ok = Txn.exec(txn, "SAVEPOINT reconcile_work_item_bracket")
 
                try do
                  :ok = rearm_on_fire_in_txn(txn, wake_id, %{work_item_id: work_item_id})
                  :ok = Txn.exec(txn, "RELEASE reconcile_work_item_bracket")
+                 failures
                rescue
                  error ->
                    :ok = Txn.exec(txn, "ROLLBACK TO reconcile_work_item_bracket")
@@ -871,15 +873,17 @@ defmodule Tightbeam.WorkItems do
                    Logger.warning(
                      "work-item bracket delivery reconciliation deferred for #{wake_id}: #{Exception.message(error)}"
                    )
+
+                   [wake_id | failures]
                end
 
-             _malformed ->
+             _malformed, failures ->
                Logger.warning("skipping malformed delivered work-item bracket")
+               failures
            end)
-
-           :ok
          end) do
-      {:ok, :ok} -> :ok
+      {:ok, []} -> :ok
+      {:ok, pending} -> {:error, {:source_reconciliation_pending, pending}}
       {:error, error} -> {:error, error}
     end
   end

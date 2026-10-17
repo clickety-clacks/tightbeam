@@ -313,12 +313,7 @@ defmodule Tightbeam.Gateway do
          {Tightbeam.Retention, db: db},
          {WorkspaceCleanup, config: Map.put(config, :db, db)},
          {Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry},
-         {Task,
-          fn ->
-            Wakes.reconcile_delivered_sources(db)
-            WorkItems.reconcile_delivered_brackets(db)
-            HarnessHealth.resume_other_routes(db)
-          end},
+         {Task, fn -> HarnessHealth.resume_other_routes(db) end},
          {Tightbeam.Firehose.Hub, name: Tightbeam.Firehose.Hub},
          # Ahead of Supervision and Bandit deliberately: both can reach a check-tier
          # statute, and the episode writer must already own the ordering before the first
@@ -2248,12 +2243,21 @@ defmodule Tightbeam.Gateway do
         case enqueued do
           {:ok, seq} ->
             if is_binary(opts[:wake_id]) do
-              NoticeBatcher.carrier_source_ids_in_txn(txn, opts[:wake_id])
-              |> Enum.each(fn source_id ->
+              source_ids = NoticeBatcher.carrier_source_ids_in_txn(txn, opts[:wake_id])
+              source_ids = if source_ids == [], do: [opts[:wake_id]], else: source_ids
+
+              Enum.each(source_ids, fn source_id ->
                 DB.Txn.q(txn, "UPDATE wakes SET deliveredTurnSeq=?2 WHERE wakeId=?1", [
                   source_id,
                   seq
                 ])
+
+                Wakes.enqueue_source_reconciliation_in_txn(
+                  txn,
+                  source_id,
+                  target,
+                  "delivered"
+                )
               end)
             end
 
@@ -2379,28 +2383,10 @@ defmodule Tightbeam.Gateway do
     )
 
     # The delivery transaction has already committed its immutable turn and
-    # deliveredTurnSeq. Let each source owner reconcile that durable outcome
-    # in its own transaction; none of these source reads can veto the notice.
+    # deliveredTurnSeq. Wake the existing source-owning scheduler to reconcile
+    # after delivery without making source reads part of this recipient's path.
     if is_binary(opts[:wake_id]) do
-      case Wakes.reconcile_delivered_sources(db, actual_session_key, opts[:wake_id]) do
-        :ok ->
-          :ok
-
-        {:error, error} ->
-          Logger.warning(
-            "wake source delivery reconciliation deferred: #{Exception.message(error)}"
-          )
-      end
-
-      case WorkItems.reconcile_delivered_brackets(db, actual_session_key, opts[:wake_id]) do
-        :ok ->
-          :ok
-
-        {:error, error} ->
-          Logger.warning(
-            "work-item bracket delivery reconciliation deferred: #{Exception.message(error)}"
-          )
-      end
+      Wakes.delivery_outcome_committed(db, actual_session_key, opts[:wake_id])
     end
 
     nudge_lane(Keyword.get(opts, :lane_manager, Tightbeam.LaneManager), actual_session_key)
