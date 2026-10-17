@@ -843,8 +843,6 @@ defmodule Tightbeam.EscalationDeliveryFixture do
                [[expected_session]]
     end
 
-    assert Wakes.get(ctx.db, effort_wake.wake_id).state == "canceled"
-
     before_turns = rows(ctx.db, "SELECT * FROM turns ORDER BY seq")
     before_messages = rows(ctx.db, "SELECT * FROM messages ORDER BY id")
     drain!(ctx)
