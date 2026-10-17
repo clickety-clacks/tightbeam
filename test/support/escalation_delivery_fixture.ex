@@ -810,7 +810,13 @@ defmodule Tightbeam.EscalationDeliveryFixture do
 
     replacement = Wakes.get(ctx.db, replacement_id)
 
-    assert %{state: "pending", session_key: "top", target_gate: 1, target_role: nil, reresolve: nil} =
+    assert %{
+             state: "pending",
+             session_key: "top",
+             target_gate: 1,
+             target_role: nil,
+             reresolve: nil
+           } =
              replacement
 
     assert replacement.prompt == effort_wake.prompt
