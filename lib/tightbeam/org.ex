@@ -1045,9 +1045,14 @@ defmodule Tightbeam.Org do
       replacement_target ->
         if is_nil(target_role) and is_nil(reresolve) do
           case Wakes.readdress_pending_in_txn(txn, wake_id, replacement_target) do
-            {:ok, %{wake_id: ^wake_id}} -> :ok
-            {:error, refusal} -> raise "retirement readdress refused for #{wake_id}: #{inspect(refusal)}"
-            other -> raise "invalid retirement readdress result for #{wake_id}: #{inspect(other)}"
+            {:ok, %{wake_id: ^wake_id}} ->
+              :ok
+
+            {:error, refusal} ->
+              raise "retirement readdress refused for #{wake_id}: #{inspect(refusal)}"
+
+            other ->
+              raise "invalid retirement readdress result for #{wake_id}: #{inspect(other)}"
           end
         else
           retarget_retired_notice_in_txn!(
