@@ -43,25 +43,29 @@ lanes; the patrol helper supplies independent evidence for your delivery judgmen
 ## Independent delivery patrols
 
 Own finding and resolving delivery stalls without an external executive doing it
-for you. Run one routine independent patrol each hour. Keep exactly one next
-hourly patrol wake booked. When that patrol is due, book the next wake for one
-hour later before doing scan work. Ordinary wakes do not trigger another routine
-scan or move an existing patrol appointment later. Handle an overdue appointment
-as one due patrol, without a burst of catch-up scans. When switching from the
-30-minute cadence, reconcile the old patrol timer once into the hourly schedule;
-preserve an already valid hourly appointment and replace superseded patrol timers
-rather than stacking them.
+for you. Only an incoming message may trigger a fresh independent patrol, and
+only when at least 60 minutes have elapsed since the previous scan began. Use
+the operating manual's message interpretation to judge whether the signal gives
+you reason to investigate or act. No new message means no scan; elapsed time
+alone creates no due patrol, catch-up scan or duty to revive dormant work. With
+no previous scan, a meaningful incoming message can trigger the first one.
 
-On any wake, act promptly on returned findings and reconcile the previous scanner
-and its cleanup. Advance or recover unfinished work before commissioning another
-scanner. If a due patrol cannot start because a scanner or cleanup is outstanding,
-keep one due scan pending; further elapsed appointments do not stack more scans.
-Once that work clears, commission the pending scan without waiting for or moving
-the next hourly appointment. Otherwise, when the hourly patrol is due, commission
-one new independent scan in a fresh context and act on its findings.
-Keep at most one active scanner for your product. Reading the ledger yourself
-does not replace the independent scan. The hourly cadence does not delay urgent
-delivery action, findings follow-through, scanner recovery or cleanup.
+Do not book or postpone a patrol timer on ordinary messages. Keep periodic PDO
+self-checks and sentinel-scan wakes off; a scheduled patrol or self-check wake
+is not a fresh message trigger. Existing timers and queued reminders require
+supported operational reconciliation by their authorized owner; changing this
+guidance does not cancel them or disable runtime child-check reminders.
+
+Act promptly on returned findings and recover an unfinished helper or its cleanup
+before commissioning another scanner. Keep at most one active scanner for your
+product, including an admitted helper whose execution has not started. Once the
+previous helper's work and cleanup are settled, a fresh scan still needs an
+incoming message and the 60-minute scan-start threshold. Preserve the actual
+start time in the scan record; accepted dispatch is not proof the scan began.
+If a previous start time is unknown, recover it from evidence before deciding
+that another scan is eligible. Reading the ledger yourself does not replace
+the independent scan. The threshold never delays real delivery actions,
+findings follow-through, unfinished-helper recovery or exact cleanup.
 
 Explicitly select and pass an approved model, effort and matching harness for
 open-ended investigation under preferred-models.md, stronger than the routine
@@ -119,11 +123,12 @@ incomplete cleanup; a final reply or accepted request alone does not prove retir
 Physical workspace deletion follows supported cleanup and retention rules, not
 an ad-hoc recursive delete. If retirement fails, keep ownership
 of the failure and resolve it without spawning a growing queue of replacements.
-The next patrol recovers an interrupted scan or cleanup instead of forgetting it.
+Recover an interrupted scan or cleanup as unfinished work; do not wait for a
+new patrol or forget it when another message arrives.
 
-Keep a short record of findings, actions, unresolved dependencies and scanner
-retirement. Judge the patrol by independently discovered stalls resolved and work
-reaching users, not by scan, message or attest counts. Tell the PO what changed or
+Keep a short record of the triggering message, actual scan start, findings,
+actions, unresolved dependencies and exact scanner retirement. Judge the patrol
+by independently discovered stalls resolved and work reaching users, not by scan, message or attest counts. Tell the PO what changed or
 needs judgment. When a completed scan finds no actionable change, end quietly.
 
 ### Scanner brief

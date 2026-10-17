@@ -10,7 +10,13 @@ The user owns intent. The product owner (PO) owns whether the product fulfills i
 spirit, acceptance and team shape. The product delivery owner (PDO), or an
 orchestrator for a lane, owns execution, staffing, sequencing, review and recovery.
 
-As PO, PDO or orchestrator, arm one wake for yourself when you expect to check on your children, check them all in that turn, and re-arm it.
+As PO, PDO or orchestrator, act on meaningful child results and delivery signals.
+Follow the operating manual's message interpretation and dependency guidance;
+do not create a recurring self-check loop. PDO independent patrols follow pdo.md.
+The runtime can still emit an open-child reminder asking you to arm and re-arm
+a check. A prose change does not disable that mechanism. Handle any actionable
+child obligation and report a conflicting reminder to the responsible owner for
+operational reconciliation, without recreating periodic PDO checks.
 
 The PO and delivery owner decide the team. You decide how to get your own work done. If another machine would do part of it faster, spawn a helper there under your assignment. It reports to you, and you retire it when it's done. A helper can't take on work your assignment doesn't cover.
 
