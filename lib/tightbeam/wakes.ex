@@ -3765,7 +3765,7 @@ defmodule Tightbeam.Wakes do
                :ok <- Tightbeam.NoticeBatcher.readdress_source_in_txn(txn, wake_id) do
             Txn.q(
               txn,
-              "UPDATE wakes SET sessionKey=?2 WHERE wakeId=?1 AND state='pending' AND deliveredTurnSeq IS NULL",
+              "UPDATE wakes SET sessionKey=?2,targetGate=1 WHERE wakeId=?1 AND state='pending' AND deliveredTurnSeq IS NULL",
               [wake_id, replacement_target]
             )
 
@@ -3860,7 +3860,7 @@ defmodule Tightbeam.Wakes do
           if(source.rumination, do: 1, else: 0),
           source.work_item_id,
           source.assignment_id,
-          source.target_gate,
+          if(ordinary_address?, do: 1, else: source.target_gate),
           source.class,
           source.class_election,
           delivery_rule,

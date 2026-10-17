@@ -242,6 +242,63 @@ defmodule Tightbeam.SupervisionTest do
     assert successor_holder == ctx.parent.session_key
   end
 
+  test "retiring a pending notice recipient readdresses the same episode wake", ctx do
+    opened_at = System.system_time(:millisecond) - 5_000
+    interval_ms = 1_000
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE assignments SET openedAt=?2 WHERE id=?1", [
+               "asg_inactive",
+               opened_at
+             ])
+
+    open_deadline!(ctx.db, "asg_inactive", opened_at, interval_ms)
+    deadline = pending_deadline!(ctx.db, "asg_inactive")
+    assert {:ok, :ok} = Supervision.deadline(ctx.db, deadline)
+
+    notice =
+      Enum.find(Wakes.list_pending(ctx.db), fn wake ->
+        wake.consumer == "prompt" and wake.assignment_id == "asg_inactive"
+      end)
+
+    assert is_map(notice)
+    climb = pending_climb!(ctx.db, "asg_inactive")
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1 AND state='pending'", [
+               climb.wake_id
+             ])
+
+    assert {:ok, :ok} = Supervision.climb(ctx.db, Wakes.get(ctx.db, climb.wake_id))
+    assert Wakes.get(ctx.db, notice.wake_id).session_key == ctx.parent.session_key
+
+    assert %{state: "retired"} = Org.retire(ctx.db, ctx.parent.session_key, "user:flynn")
+
+    readdressed = Wakes.get(ctx.db, notice.wake_id)
+    assert readdressed.state == "pending"
+    assert readdressed.session_key == ctx.main.session_key
+    assert readdressed.target_gate == 1
+    assert readdressed.prompt == notice.prompt
+    assert readdressed.obligation_ref == notice.obligation_ref
+
+    next_climb = pending_climb!(ctx.db, "asg_inactive")
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1 AND state='pending'", [
+               next_climb.wake_id
+             ])
+
+    assert {:ok, :ok} = Supervision.climb(ctx.db, Wakes.get(ctx.db, next_climb.wake_id))
+    assert Wakes.get(ctx.db, notice.wake_id).session_key == ctx.main.session_key
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId='asg_inactive' AND consumer='prompt' AND obligationRef=?1 AND state='pending'",
+               [notice.obligation_ref]
+             )
+  end
+
   test "activity from an authenticated holder moves a pending deadline once at its event time",
        ctx do
     opened_at = System.system_time(:millisecond)

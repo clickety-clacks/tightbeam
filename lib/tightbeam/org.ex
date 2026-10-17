@@ -1011,7 +1011,8 @@ defmodule Tightbeam.Org do
     Txn.q(
       txn,
       """
-      SELECT w.wakeId,w.targetRole,w.reresolve,w.reresolveSeed,w.reresolveRung
+      SELECT w.wakeId,w.targetRole,w.reresolve,w.reresolveSeed,w.reresolveRung,
+             w.assignmentId,w.obligationRef
       FROM wakes w
       LEFT JOIN roles r ON r.name=w.targetRole
       WHERE w.state='pending' AND w.consumer='prompt'
@@ -1026,46 +1027,81 @@ defmodule Tightbeam.Org do
   defp readdress_retired_notice_in_txn!(
          txn,
          session_key,
-         [wake_id, target_role, reresolve, seed, rung]
+         [wake_id, target_role, reresolve, seed, rung, assignment_id, obligation_ref]
        ) do
-    case retirement_replacement_target(txn, session_key, target_role, reresolve, seed, rung) do
+    case retirement_replacement_target(
+           txn,
+           session_key,
+           target_role,
+           reresolve,
+           seed,
+           rung,
+           assignment_id,
+           obligation_ref
+         ) do
       nil ->
         cancel_retired_notice!(txn, session_key, wake_id, %{kind: "no_replacement"}, nil)
 
       replacement_target ->
-        case Wakes.retarget_in_txn(txn, wake_id, replacement_target, ordinary_address: true) do
-          %{wake_id: replacement_wake_id} ->
-            after_cancellation =
-              case NoticeBatcher.preserve_retargeted_source_in_txn(
-                     txn,
-                     wake_id,
-                     replacement_wake_id
-                   ) do
-                :not_batched ->
-                  nil
-
-                {:immutable_delivery, %{delivery_wake_id: delivery_wake_id}} ->
-                  {:supersede_by_carrier, replacement_wake_id, delivery_wake_id}
-
-                {:error, refusal} ->
-                  raise "retirement replacement batching refused: #{inspect(refusal)}"
-              end
-
-            cancel_retired_notice!(
-              txn,
-              session_key,
-              wake_id,
-              %{kind: "replacement", replacement_wake_id: replacement_wake_id},
-              after_cancellation
-            )
-
-          :error ->
-            raise "retirement replacement refused for #{wake_id}"
+        if is_nil(target_role) and is_nil(reresolve) do
+          case Wakes.readdress_pending_in_txn(txn, wake_id, replacement_target) do
+            {:ok, %{wake_id: ^wake_id}} -> :ok
+            {:error, refusal} -> raise "retirement readdress refused for #{wake_id}: #{inspect(refusal)}"
+            other -> raise "invalid retirement readdress result for #{wake_id}: #{inspect(other)}"
+          end
+        else
+          retarget_retired_notice_in_txn!(
+            txn,
+            session_key,
+            wake_id,
+            replacement_target
+          )
         end
     end
   end
 
-  defp retirement_replacement_target(txn, _session_key, target_role, _reresolve, _seed, _rung)
+  defp retarget_retired_notice_in_txn!(txn, session_key, wake_id, replacement_target) do
+    case Wakes.retarget_in_txn(txn, wake_id, replacement_target, ordinary_address: true) do
+      %{wake_id: replacement_wake_id} ->
+        after_cancellation =
+          case NoticeBatcher.preserve_retargeted_source_in_txn(
+                 txn,
+                 wake_id,
+                 replacement_wake_id
+               ) do
+            :not_batched ->
+              nil
+
+            {:immutable_delivery, %{delivery_wake_id: delivery_wake_id}} ->
+              {:supersede_by_carrier, replacement_wake_id, delivery_wake_id}
+
+            {:error, refusal} ->
+              raise "retirement replacement batching refused: #{inspect(refusal)}"
+          end
+
+        cancel_retired_notice!(
+          txn,
+          session_key,
+          wake_id,
+          %{kind: "replacement", replacement_wake_id: replacement_wake_id},
+          after_cancellation
+        )
+
+      :error ->
+        raise "retirement replacement refused for #{wake_id}"
+    end
+  end
+
+  defp retirement_replacement_target(
+         txn,
+         _session_key,
+         target_role,
+         _reresolve,
+         _seed,
+         _rung,
+         _assignment_id,
+         _obligation_ref
+       )
        when is_binary(target_role) do
     case Txn.q(
            txn,
@@ -1077,13 +1113,49 @@ defmodule Tightbeam.Org do
     end
   end
 
-  defp retirement_replacement_target(txn, _session_key, nil, "lineage", seed, rung)
+  defp retirement_replacement_target(
+         txn,
+         _session_key,
+         nil,
+         "lineage",
+         seed,
+         rung,
+         _assignment_id,
+         _obligation_ref
+       )
        when is_binary(seed) and is_integer(rung) and rung > 0 do
     Tightbeam.Supervision.ladder_target(txn, seed, rung)
   end
 
-  defp retirement_replacement_target(_txn, _session_key, _role, _reresolve, _seed, _rung),
-    do: nil
+  defp retirement_replacement_target(
+         txn,
+         session_key,
+         nil,
+         nil,
+         _seed,
+         _rung,
+         assignment_id,
+         obligation_ref
+       ) do
+    Tightbeam.Supervision.retirement_target_in_txn(
+      txn,
+      session_key,
+      assignment_id,
+      obligation_ref
+    )
+  end
+
+  defp retirement_replacement_target(
+         _txn,
+         _session_key,
+         _role,
+         _reresolve,
+         _seed,
+         _rung,
+         _assignment_id,
+         _obligation_ref
+       ),
+       do: nil
 
   defp active_personal_key(txn, owner_user_id) do
     main_key = personal_session_key(owner_user_id)
