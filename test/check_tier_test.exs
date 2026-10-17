@@ -277,21 +277,15 @@ defmodule Tightbeam.CheckTierTest do
   test "new fact types validate at load and demanded database failures deny", ctx do
     put_rules(ctx, rule("bad-list-op", "assignment.verdicts", "eq", ["reviewed"]))
 
-    assert_raise ArgumentError, ~r/invalid for a list fact/, fn ->
-      Rules.load!(ctx.base_dir, ["attest"])
-    end
+    assert_unavailable(ctx, ~r/invalid for a list fact/)
 
     put_rules(ctx, rule("bad-list-value", "assignment.verdicts", "in", [1]))
 
-    assert_raise ArgumentError, ~r/non-empty flat list/, fn ->
-      Rules.load!(ctx.base_dir, ["attest"])
-    end
+    assert_unavailable(ctx, ~r/non-empty flat list/)
 
     put_rules(ctx, rule("bad-bool", "assignment.caller_is_holder", "eq", "true"))
 
-    assert_raise ArgumentError, ~r/does not match bool/, fn ->
-      Rules.load!(ctx.base_dir, ["attest"])
-    end
+    assert_unavailable(ctx, ~r/does not match bool/)
 
     assignment = assign(ctx)
     put_rules(ctx, rule("fact-error", "assignment.verdicts", "not_in", ["reviewed"]))
@@ -506,5 +500,18 @@ defmodule Tightbeam.CheckTierTest do
     #{external}
     deny_when = [{ fact = "#{fact}", op = "#{op}", value = #{value} }]
     """
+  end
+
+  defp assert_unavailable(ctx, expected) do
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert [] = Rules.load!(ctx.base_dir, ["attest"])
+      end)
+
+    assert log =~ expected
+    assert log =~ "unavailable"
+
+    assert {:deny, %{code: "rule_unavailable"}} =
+             Rules.evaluate(ctx.db, call("attest", {:user, "flynn"}, %{}))
   end
 end

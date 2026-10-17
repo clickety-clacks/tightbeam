@@ -183,7 +183,8 @@ defmodule Tightbeam.Placement do
           Map.put(acc, host, Map.put(host_config, :toolchain_dirs, dirs))
 
         :error ->
-          raise "host toolchain registry contains rows for unknown host: #{host}"
+          Logger.warning("ignoring toolchain directories for unknown host #{host}")
+          acc
       end
     end)
   end
@@ -352,8 +353,9 @@ defmodule Tightbeam.Placement do
   def set_sentinel_env(db, host, scope, name, value, set_by, call) do
     "sentinel:" <> _qualified = scope
 
-    with :ok <- valid_env_name(name),
-         :ok <- unreserved_env_name(name) do
+    # Sentinel settings are operator-selected and passed through opaquely; the
+    # harness reservation policy applies only to harness environment overlays.
+    with :ok <- valid_env_name(name) do
       {:ok, changed} =
         DB.transaction(db, fn txn ->
           DB.Txn.q(
@@ -572,30 +574,114 @@ defmodule Tightbeam.Placement do
   durable scratch across engine swaps.
   """
   @spec holder_workdir(map(), map()) :: String.t()
+  def holder_workdir(_config, %{ephemeral: true}),
+    do:
+      Process.get({__MODULE__, :turn_directory}) ||
+        raise("ephemeral tools require a turn directory")
+
   def holder_workdir(config, holder_session) do
-    host = fetch_session_host!(config, holder_session)
-    path = workdir_path(config, holder_session)
+    if config[:db] && Tightbeam.Ephemeral.session?(config.db, holder_session.session_key) do
+      Process.get({__MODULE__, :turn_directory}) ||
+        raise("ephemeral tools require a turn directory")
+    else
+      host = fetch_session_host!(config, holder_session)
+      path = workdir_path(config, holder_session)
 
-    url =
-      if host.ssh == nil,
-        do: "http://127.0.0.1:#{config.port}",
-        else: Application.fetch_env!(:tightbeam, :advertised_url)
+      url =
+        if host.ssh == nil,
+          do: "http://127.0.0.1:#{config.port}",
+          else: Application.fetch_env!(:tightbeam, :advertised_url)
 
-    content =
-      JSON.encode!(%{
-        url: url,
-        token: holder_session.cli_token,
-        sessionKey: holder_session.session_key
-      })
+      content =
+        JSON.encode!(%{
+          url: url,
+          token: holder_session.cli_token,
+          sessionKey: holder_session.session_key
+        })
 
-    ensure_opts = [base_dir: config.base_dir]
-    ensure_opts = if config[:sh], do: Keyword.put(ensure_opts, :sh, config.sh), else: ensure_opts
+      ensure_opts = [base_dir: config.base_dir]
 
-    ensure_opts =
-      if config[:sh_out], do: Keyword.put(ensure_opts, :sh_out, config.sh_out), else: ensure_opts
+      ensure_opts =
+        if config[:sh], do: Keyword.put(ensure_opts, :sh, config.sh), else: ensure_opts
 
-    ensure_workdir(host, path, content, ensure_opts)
-    path
+      ensure_opts =
+        if config[:sh_out],
+          do: Keyword.put(ensure_opts, :sh_out, config.sh_out),
+          else: ensure_opts
+
+      ensure_workdir(host, path, content, ensure_opts)
+      path
+    end
+  end
+
+  def with_turn_directory(config, session, fun) do
+    if Tightbeam.Ephemeral.session?(config.db, session.session_key) do
+      host = fetch_session_host!(config, session)
+      sh = Map.get(config, :sh, &system_cmd/1)
+
+      run = fn args ->
+        invocation = if host.ssh == nil, do: args, else: ["ssh" | @ssh_opts] ++ [host.ssh | args]
+
+        case sh.(invocation) do
+          {output, 0} ->
+            String.trim(output)
+
+          {output, code} ->
+            raise "ephemeral temporary directory command failed (#{code}): #{output}"
+        end
+      end
+
+      owner = self()
+
+      {cleaner, ref} =
+        spawn_monitor(fn ->
+          monitor = Process.monitor(owner)
+          path = run.(["mktemp", "-d", "/tmp/tightbeam-helper.XXXXXXXXXX"])
+          send(owner, {self(), :directory, path})
+
+          receive do
+            :cleanup -> :ok
+            {:DOWN, ^monitor, :process, ^owner, _} -> :ok
+          end
+
+          Process.demonitor(monitor, [:flush])
+
+          try do
+            run.(["rm", "-rf", "--", path])
+          rescue
+            error ->
+              Logger.warning(
+                "Ephemeral temporary directory cleanup failed for #{session.session_key} at #{path}: #{Exception.message(error)}"
+              )
+          catch
+            kind, reason ->
+              Logger.warning(
+                "Ephemeral temporary directory cleanup failed for #{session.session_key} at #{path}: #{kind} #{inspect(reason)}"
+              )
+          end
+        end)
+
+      path =
+        receive do
+          {^cleaner, :directory, path} -> path
+          {:DOWN, ^ref, :process, ^cleaner, reason} -> exit({:temporary_directory_failed, reason})
+        end
+
+      Process.put({__MODULE__, :turn_directory}, path)
+
+      try do
+        fun.()
+      after
+        Process.delete({__MODULE__, :turn_directory})
+
+        # Teardown must not replace or delay the runner's terminal result.
+        # The unlinked cleaner retains ownership, including after owner death.
+        Process.demonitor(ref, [:flush])
+        send(cleaner, :cleanup)
+      end
+    else
+      fun.()
+    end
   end
 
   @doc "Materialize one already-resolved identity snapshot at the session's exact cwd."

@@ -19,7 +19,7 @@ Tightbeam.GuardGatewayFixture.run!(fn %{db: db, config: config} ->
   config =
     config
     |> Map.put(:lane_manager, lane)
-    |> Map.put(:effort_checkin_horizon_ms, 1)
+    |> Map.put(:effort_checkin_horizon_ms, 60_000)
     |> Map.put(:sh, fn _ -> {"B\tobserved\t0\n/w\n", 0} end)
 
   {Wakes, opts} = Gateway.children(config) |> Enum.find(&match?({Wakes, _}, &1))
@@ -88,18 +88,19 @@ Tightbeam.GuardGatewayFixture.run!(fn %{db: db, config: config} ->
     assert is_binary(request_id)
     assert Wakes.get(db, wake_id).state == "fired"
 
-    # The expecter notification is a durable ungated wake armed with the request,
-    # still pending until the following scheduler pass forms its ready carrier.
+    # The expecter notification is a durable ungated source armed with the request.
+    # Its deadline may already have delivered it before this observer reads it.
     assert {:ok, [[notify_id]]} =
              DB.query(
                db,
-               "SELECT wakeId FROM wakes WHERE targetGate = 0 AND state = 'pending'"
+               "SELECT wakeId FROM wakes WHERE targetGate=0 AND digest=0 AND assignmentId=?1 AND prompt LIKE ?2",
+               [assignment.id, "Effort check-in #{request_id}%"]
              )
 
     assert %{consumer: "prompt", session_key: expecter} = Wakes.get(db, notify_id)
 
-    # The next ordinary tick delivers it through the gateway's own configured
-    # prompt closure — real ConnRegistry, real lane nudge, one turn.
+    # A repeated delivery pass still leaves exactly one carrier and one turn,
+    # using the gateway's configured registry and lane nudge.
     assert :ok = Wakes.fire_due(scheduler)
     assert Wakes.get(db, notify_id).state == "fired"
 

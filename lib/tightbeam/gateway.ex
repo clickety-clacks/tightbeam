@@ -17,8 +17,10 @@ defmodule Tightbeam.Gateway do
   Children appended to Tightbeam.Application's tree, in order:
   ConnRegistry → WakeScheduler → AdapterSupervisor (DynamicSupervisor) →
   AdapterCoordinator → LaneManager (with the runner built here) → Bandit
-  (Wire.Router; port + WS upgrade). All under the SAME rest_for_one root —
-  a DB restart still restarts everything that could hold stale state.
+  (Wire.Router; port + WS upgrade). Runtime children use one_for_one under
+  Tightbeam.RuntimeSupervisor, so a service failure preserves its siblings.
+  The rest_for_one application root still restarts runtime services after
+  a DB restart, discarding any state derived from the old database owner.
 
   The turn pipeline (runner passed to lanes; gateway.ts `runTurn` +
   fifo wiring, adapted to the Ledger):
@@ -247,7 +249,23 @@ defmodule Tightbeam.Gateway do
     # and before any runtime child can consume wakes or accept traffic. The
     # Supervision child skips its duplicate recovery below.
     :ok = Wakes.activate_wait_recognition(db)
-    :ok = Supervision.recover_liveness!(db, supervision_interval_ms(config))
+
+    {:ok, epoch_rows} =
+      DB.query(db, "SELECT id, activatedAt, cause, principal FROM supervision_liveness_epoch")
+
+    supervision_available? =
+      match?(
+        [[0, at, "schema_activation", "process:tightbeam"]] when is_integer(at) and at >= 0,
+        epoch_rows
+      )
+
+    if supervision_available? do
+      :ok = Supervision.recover_liveness!(db, supervision_interval_ms(config))
+    else
+      Logger.warning(
+        "supervision_liveness_epoch row 0 unavailable; supervision recovery disabled"
+      )
+    end
 
     adapter_config = config |> Map.put(:cli_bin, cli_bin) |> Map.put(:db, db)
     adapter_context = fn key -> Placement.adapter_context(adapter_config, key) end
@@ -334,71 +352,77 @@ defmodule Tightbeam.Gateway do
       end
     end
 
-    credential_children(config, db) ++
-      [
-        {ModelCatalog, base_dir: config.base_dir, db: db},
-        {Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry},
-        {Task, fn -> HarnessHealth.resume_other_routes(db) end},
-        {Tightbeam.Firehose.Hub, name: Tightbeam.Firehose.Hub},
-        # Ahead of Supervision and Bandit deliberately: both can reach a check-tier
-        # statute, and the episode writer must already own the ordering before the first
-        # evaluation runs. Explicitly a child rather than lazily started — a lazy start
-        # would let a missing spec here go unnoticed in production forever.
-        {Tightbeam.RailEpisodes, name: Tightbeam.RailEpisodes},
-        # Ahead of Bandit for the same reason: the hook seam posts to the wire,
-        # so the window's writer must own the ordering before the first
-        # observation can arrive.
-        {Tightbeam.TurnObservations, name: Tightbeam.TurnObservations},
-        # R8: retain listener evidence across Wakes and Bandit restarts.
-        {Tightbeam.ListenerLifecycle, []},
-        {Tightbeam.Wakes,
-         db: db,
-         deliver: deliver,
-         delivery_opts: delivery_config,
-         internal_consumers: %{
-           "effort_probe" => &EffortCheckin.probe(db, config, &1),
-           "effort_deadline" => &EffortCheckin.deadline(db, config, &1),
-           "review_remedy_reconcile" =>
-             &Tightbeam.RailRemedy.reconcile_notice(
-               db,
-               Map.put(config, :supervision_interval_ms, supervision_interval_ms(config)),
-               &1
-             )
-         },
-         tick_ms: config.wake_tick_ms,
-         review_remedy_interval_ms: supervision_interval_ms(config),
-         name: Tightbeam.WakeScheduler},
-        {Tightbeam.Supervision,
-         db: db,
-         handlers: handler_table,
-         prod_limit: prod_limit,
-         recover: false,
-         sweep_ms: supervision_interval_ms(config),
-         name: Tightbeam.Supervision},
-        {Tightbeam.Spinup.Flight, name: Tightbeam.Spinup.Flight},
-        {DynamicSupervisor, strategy: :one_for_one, name: Tightbeam.AdapterSupervisor},
-        {Tightbeam.AdapterCoordinator,
-         adapter_sup: Tightbeam.AdapterSupervisor,
-         adapter_context: adapter_context,
-         adapter_opts: adapter_opts,
-         db: db,
-         name: Tightbeam.AdapterCoordinator},
-        {Tightbeam.Productions.BubbleSweeper, db: db},
-        {Tightbeam.LaneManager,
-         db: db,
-         lane_sup: Tightbeam.LaneSupervisor,
-         task_sup: Tightbeam.TurnTaskSupervisor,
-         runner: runner,
-         terminal_publisher: terminal_publisher(db),
-         on_terminal: on_terminal,
-         name: Tightbeam.LaneManager},
-        {Tightbeam.SentinelSupervisor,
-         db: db, base_dir: config.base_dir, cli_bin: Path.join(cli_bin, "tightbeam")},
-        Tightbeam.ListenerLifecycle.listener_spec(
-          plug: {Tightbeam.Wire.Router, router_deps},
-          port: config.port
-        )
-      ]
+    (credential_children(config, db) ++
+       [
+         {ModelCatalog, base_dir: config.base_dir, db: db},
+         {Tightbeam.Retention, db: db},
+         {WorkspaceCleanup, config: Map.put(config, :db, db)},
+         {Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry},
+         {Task, fn -> HarnessHealth.resume_other_routes(db) end},
+         {Tightbeam.Firehose.Hub, name: Tightbeam.Firehose.Hub},
+         # Ahead of Supervision and Bandit deliberately: both can reach a check-tier
+         # statute, and the episode writer must already own the ordering before the first
+         # evaluation runs. Explicitly a child rather than lazily started — a lazy start
+         # would let a missing spec here go unnoticed in production forever.
+         {Tightbeam.RailEpisodes, name: Tightbeam.RailEpisodes},
+         # Ahead of Bandit for the same reason: the hook seam posts to the wire,
+         # so the window's writer must own the ordering before the first
+         # observation can arrive.
+         {Tightbeam.TurnObservations, name: Tightbeam.TurnObservations},
+         # R8: retain listener evidence across Wakes and Bandit restarts.
+         {Tightbeam.ListenerLifecycle, []},
+         {Tightbeam.Wakes,
+          db: db,
+          deliver: deliver,
+          delivery_opts: delivery_config,
+          internal_consumers: %{
+            "effort_probe" => &EffortCheckin.probe(db, config, &1),
+            "effort_deadline" => &EffortCheckin.deadline(db, config, &1),
+            "review_remedy_reconcile" =>
+              &Tightbeam.RailRemedy.reconcile_notice(
+                db,
+                Map.put(config, :supervision_interval_ms, supervision_interval_ms(config)),
+                &1
+              )
+          },
+          tick_ms: config.wake_tick_ms,
+          review_remedy_interval_ms: supervision_interval_ms(config),
+          name: Tightbeam.WakeScheduler},
+         if(supervision_available?,
+           do:
+             {Tightbeam.Supervision,
+              db: db,
+              handlers: handler_table,
+              prod_limit: prod_limit,
+              recover: false,
+              sweep_ms: supervision_interval_ms(config),
+              name: Tightbeam.Supervision}
+         ),
+         {Tightbeam.Spinup.Flight, name: Tightbeam.Spinup.Flight},
+         {DynamicSupervisor, strategy: :one_for_one, name: Tightbeam.AdapterSupervisor},
+         {Tightbeam.AdapterCoordinator,
+          adapter_sup: Tightbeam.AdapterSupervisor,
+          adapter_context: adapter_context,
+          adapter_opts: adapter_opts,
+          db: db,
+          name: Tightbeam.AdapterCoordinator},
+         {Tightbeam.Productions.BubbleSweeper, db: db},
+         {Tightbeam.LaneManager,
+          db: db,
+          lane_sup: Tightbeam.LaneSupervisor,
+          task_sup: Tightbeam.TurnTaskSupervisor,
+          runner: runner,
+          terminal_publisher: terminal_publisher(db),
+          on_terminal: on_terminal,
+          name: Tightbeam.LaneManager},
+         {Tightbeam.SentinelSupervisor,
+          db: db, base_dir: config.base_dir, cli_bin: Path.join(cli_bin, "tightbeam")},
+         Tightbeam.ListenerLifecycle.listener_spec(
+           plug: {Tightbeam.Wire.Router, router_deps},
+           port: config.port
+         )
+       ])
+    |> Enum.reject(&is_nil/1)
   end
 
   @doc """
@@ -498,7 +522,9 @@ defmodule Tightbeam.Gateway do
              fn txn, fact ->
                Tightbeam.Wakes.row_commit_in_txn(txn, [])
                {fact, ConditionFacts.recognize_in_txn(txn, fact.fact_id)}
-             end
+             end,
+             fallback: fn fact -> {fact, []} end,
+             retry_deliveries: true
            ) do
         {:ok, {%{fact_id: fact_id}, deliveries}} ->
           Enum.each(deliveries, &complete_delivery(db, &1))
@@ -525,7 +551,7 @@ defmodule Tightbeam.Gateway do
   end
 
   defp start_remote_credential_child(config, db, machine, previous_host, host) do
-    supervisor = Map.get(config, :credential_supervisor, Tightbeam.Supervisor)
+    supervisor = Map.get(config, :credential_supervisor, Tightbeam.RuntimeSupervisor)
     child = credential_child(config, db, machine, host)
 
     case Supervisor.start_child(supervisor, child) do
@@ -807,6 +833,13 @@ defmodule Tightbeam.Gateway do
             Map.has_key?(p, :class) and not (is_binary(p[:class]) and p[:class] != "") ->
               %{code: "invalid", message: "--class requires a class name"}
 
+            not valid_cron_request?(p) ->
+              %{
+                code: "invalid",
+                message:
+                  "cron requires a five-field schedule and cannot be combined with another trigger"
+              }
+
             not valid_reresolve?(p) ->
               %{code: "invalid", message: "reresolve lineage requires seed and rung"}
 
@@ -1062,7 +1095,7 @@ defmodule Tightbeam.Gateway do
         end),
       # Readable by any caller, like kungfu-list: names, states and shipped setup
       # text only, never a setting value, so doctor can report it from a session.
-      {"sentinel-list", []} => fn _call ->
+      {"sentinel-list", []} => fn call ->
         host = Placement.local_host_name()
         states = Sentinels.states(db, host)
 
@@ -1085,6 +1118,14 @@ defmodule Tightbeam.Gateway do
                 reason: row[:reason]
               }
             end),
+          workspace_cleanup:
+            WorkspaceCleanup.health(
+              db,
+              if(admin_caller?(db, call),
+                do: nil,
+                else: principal_caller(db, call)[:owner_user_id] || ""
+              )
+            ),
           setup: Sentinels.setup_all(config.base_dir, db, host)
         }
       end,
@@ -1969,12 +2010,6 @@ defmodule Tightbeam.Gateway do
 
     case result do
       {:ok, {:staged, _wake}} ->
-        try do
-          Wakes.fire_due(Keyword.get(opts, :wake_scheduler, Tightbeam.WakeScheduler))
-        catch
-          :exit, {:noproc, _call} -> :ok
-        end
-
         :queued
 
       {:ok, delivery} ->
@@ -2129,10 +2164,21 @@ defmodule Tightbeam.Gateway do
   defp existing_wake_turn_in_txn(_txn, wake_id) when not is_binary(wake_id), do: nil
 
   defp existing_wake_turn_in_txn(txn, wake_id) do
-    case NoticeBatcher.source_delivery_turns_in_txn(txn, wake_id) do
-      [[seq, _status, _assignment] | _] -> {:duplicate, %{wake_id: wake_id, turn_seq: seq}}
-      [] -> nil
-    end
+    seq =
+      case DB.Txn.q(txn, "SELECT deliveredTurnSeq FROM wakes WHERE wakeId=?1", [wake_id]) do
+        [[seq]] when is_integer(seq) ->
+          seq
+
+        _ ->
+          # Direct callers may use a transport dedupe token without scheduling
+          # a wake. Its unique turn key remains the idempotency authority.
+          case DB.Txn.q(txn, "SELECT seq FROM turns WHERE wakeId=?1", [wake_id]) do
+            [[seq]] -> seq
+            [] -> nil
+          end
+      end
+
+    if is_integer(seq), do: {:duplicate, %{wake_id: wake_id, turn_seq: seq}}, else: nil
   end
 
   @doc false
@@ -2394,6 +2440,16 @@ defmodule Tightbeam.Gateway do
 
         case enqueued do
           {:ok, seq} ->
+            if is_binary(opts[:wake_id]) do
+              NoticeBatcher.carrier_source_ids_in_txn(txn, opts[:wake_id])
+              |> Enum.each(fn source_id ->
+                DB.Txn.q(txn, "UPDATE wakes SET deliveredTurnSeq=?2 WHERE wakeId=?1", [
+                  source_id,
+                  seq
+                ])
+              end)
+            end
+
             settle_supervision_controller_in_txn(txn, opts, target, seq)
 
             opts[:wake_id]
@@ -2492,6 +2548,8 @@ defmodule Tightbeam.Gateway do
 
       if DB.Txn.changes(txn) == 1,
         do: Wakes.publish_change_in_txn(txn, "wake.fired", opts[:wake_id])
+
+      Supervision.record_idle_cleanup_delivery_in_txn(txn, opts[:wake_id])
     end
   end
 
@@ -2649,21 +2707,12 @@ defmodule Tightbeam.Gateway do
       registry
     )
 
-    LaneManager.ensure_lane(
-      Keyword.get(opts, :lane_manager, Tightbeam.LaneManager),
-      actual_session_key
-    )
+    nudge_lane(Keyword.get(opts, :lane_manager, Tightbeam.LaneManager), actual_session_key)
 
     :appended
   end
 
   def complete_delivery(_db, {:staged, _wake}) do
-    try do
-      Wakes.fire_due()
-    catch
-      :exit, {:noproc, _call} -> :ok
-    end
-
     :queued
   end
 
@@ -2673,6 +2722,21 @@ defmodule Tightbeam.Gateway do
   def complete_delivery(_db, {:conflict, _message}), do: :conflict
 
   def complete_delivery(_db, {:terminal_notice_undeliverable, _} = incomplete), do: incomplete
+
+  # The message is already committed and published. A busy, restarting or
+  # absent lane manager only delays the turn: the manager's first reconcile
+  # after it is up again starts the lane.
+  defp nudge_lane(lane_manager, session_key) do
+    LaneManager.ensure_lane(lane_manager, session_key)
+  catch
+    :exit, reason ->
+      Logger.warning(
+        "lane nudge after a committed delivery to #{session_key} did not complete; " <>
+          "the lane manager's next reconcile starts it: #{inspect(reason)}"
+      )
+
+      :ok
+  end
 
   @doc false
   def delivery_target(_txn, session_key, nil), do: {session_key, nil, false}
@@ -3349,7 +3413,7 @@ defmodule Tightbeam.Gateway do
   defp turn_runner(config) do
     db = Map.get(config, :db, Tightbeam.DB)
 
-    fn turn ->
+    runner = fn turn ->
       session = Org.get(db, turn.session_key)
       echo = Projection.get(db, turn.message_id)
       correlation = (echo && echo.client_message_id) || turn.message_id
@@ -3447,6 +3511,13 @@ defmodule Tightbeam.Gateway do
           # losing runner must not append assistant messages before that CAS.
           record_in_txn = fn txn ->
             replies = append_assistant_messages_in_txn(txn, turn, echo, result, attention_tier)
+
+            Tightbeam.Ephemeral.final_message_in_txn(
+              txn,
+              turn.session_key,
+              List.last(assistant_message_texts(result))
+            )
+
             Tightbeam.ReminderDelivery.delivered_in_txn(txn, turn.seq)
 
             health_publication =
@@ -3591,6 +3662,11 @@ defmodule Tightbeam.Gateway do
         end
 
       outcome
+    end
+
+    fn turn ->
+      session = Org.get(db, turn.session_key)
+      Placement.with_turn_directory(config, session, fn -> runner.(turn) end)
     end
   end
 
@@ -3901,6 +3977,9 @@ defmodule Tightbeam.Gateway do
         # The lane cancel succeeded, so the result stays ok; the harness leg's
         # truth rides in the diagnostic.
         ErrorDiagnostic.put(%{ok: true}, cancel_leg(leg))
+
+      {:error, %DB.Overloaded{}} ->
+        %{ok: false, code: "busy", message: "database overloaded; retry later"}
 
       _ ->
         %{ok: false, code: "not_running", message: "no turn in flight"}
@@ -4662,14 +4741,33 @@ defmodule Tightbeam.Gateway do
   end
 
   defp served_snapshot(config, session, harness, revision) do
+    session =
+      Map.put(session, :ephemeral, Tightbeam.Ephemeral.session?(config.db, session.session_key))
+
     config
     |> complete_session_snapshot(session, harness, revision)
-    |> then(&Placement.materialize_identity(config, session, &1))
+    |> then(fn snapshot ->
+      if session[:ephemeral],
+        do: snapshot,
+        else: Placement.materialize_identity(config, session, snapshot)
+    end)
   end
 
   defp complete_session_snapshot(config, session, harness, revision) do
     snapshot = Identity.snapshot_at!(config.base_dir, revision, session.archetype, harness)
     guidance = append_transcript_self_inspection(snapshot.guidance, session.session_key)
+
+    guidance =
+      if session[:ephemeral] do
+        guidance <>
+          "\n\nYou are an ephemeral inspection helper. Read and inspect only. " <>
+          "Do not edit files, change state, write artifacts or records, or spawn helpers. " <>
+          "Return your report as your final message. You retire after this turn. " <>
+          "For CLI reads set TIGHTBEAM_URL=#{inspect(Application.get_env(:tightbeam, :advertised_url) || "http://127.0.0.1:#{config.port}")} " <>
+          "and TIGHTBEAM_TOKEN=#{inspect(session.cli_token)} in the command environment."
+      else
+        guidance
+      end
 
     %{
       snapshot
@@ -5885,7 +5983,6 @@ defmodule Tightbeam.Gateway do
            })
          end) do
       {:ok, _wake} ->
-        Wakes.fire_due(Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler))
         :ok
 
       {:error, reason} ->
@@ -6630,10 +6727,6 @@ defmodule Tightbeam.Gateway do
           end
 
         if is_map(wake) and is_binary(wake[:wake_id]) do
-          if (due_at <= System.system_time(:millisecond) or is_binary(wake[:wait_mode])) and
-               p[:nudge] != false,
-             do: Wakes.fire_due(Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler))
-
           wake_response(wake)
           |> maybe_add_after_fact_hint(db, p)
         else
@@ -6880,6 +6973,23 @@ defmodule Tightbeam.Gateway do
     end
   end
 
+  defp valid_cron_request?(p) do
+    not Map.has_key?(p, :cron) or
+      (Tightbeam.CronWake.valid?(p.cron) and
+         Enum.all?(
+           [
+             :at,
+             :after_ms,
+             :condition_kind,
+             :predicate,
+             :after_turn,
+             :assignment_id,
+             :replace_queued
+           ],
+           &is_nil(p[&1])
+         ))
+  end
+
   defp valid_wait_request_shape?(p) do
     predicate_present? = Map.has_key?(p, :predicate)
     predicate? = is_map(p[:predicate])
@@ -7007,6 +7117,7 @@ defmodule Tightbeam.Gateway do
         target_user_id: Map.get(call, :target_user_id),
         origin: call.origin,
         prompt: p.prompt,
+        cron: p[:cron],
         due_at: due_at,
         condition_kind: condition_kind,
         condition_scope: condition_scope,
@@ -7256,34 +7367,57 @@ defmodule Tightbeam.Gateway do
       nil ->
         %{code: "unknown_archetype", message: "no such archetype: #{archetype_name}"}
 
+      %{ephemeral: true} when is_nil(caller.caller_session) ->
+        %{code: "ephemeral_requires_caller", message: "ephemeral spawns require a calling agent"}
+
+      %{ephemeral: true} when is_map_key(p, :work_item_id) ->
+        %{
+          code: "ephemeral_obligation",
+          message: "ephemeral spawns cannot bind work items"
+        }
+
+      %{ephemeral: true} = archetype ->
+        if Tightbeam.Ephemeral.available?(db) do
+          create_available_spawn(config, db, call, caller, archetype)
+        else
+          %{code: "ephemeral_unavailable", message: "ephemeral migration failed"}
+        end
+
       archetype ->
-        override_result =
-          if Map.has_key?(p, :overrides) do
-            Archetypes.normalize_overrides(config.base_dir, archetype, p.overrides)
-          else
-            {:ok, nil}
-          end
+        create_available_spawn(config, db, call, caller, archetype)
+    end
+  end
 
-        case override_result do
-          {:ok, overrides} ->
-            harness = p[:harness] || archetype.defaults[:harness] || defaults.harness
+  defp create_available_spawn(config, db, call, caller, archetype) do
+    p = call.params
+    defaults = defaults(config, db)
 
-            module =
-              if is_atom(harness), do: Harness.module!(harness), else: Harness.parse!(harness)
+    override_result =
+      if Map.has_key?(p, :overrides) do
+        Archetypes.normalize_overrides(config.base_dir, archetype, p.overrides)
+      else
+        {:ok, nil}
+      end
 
-            default_model = archetype.defaults[:model] || defaults.model
+    case override_result do
+      {:ok, overrides} ->
+        harness = p[:harness] || archetype.defaults[:harness] || defaults.harness
 
-            with {:ok, placement} <-
-                   resolve_spawn_host(config, db, archetype, p, module, default_model) do
-              create_spawn(config, db, call, caller, archetype, placement, overrides)
-            else
-              {:error, denial} ->
-                classified_spawn_denial(denial, "config_denied", "placement_denied")
-            end
+        module =
+          if is_atom(harness), do: Harness.module!(harness), else: Harness.parse!(harness)
 
+        default_model = archetype.defaults[:model] || defaults.model
+
+        with {:ok, placement} <-
+               resolve_spawn_host(config, db, archetype, p, module, default_model) do
+          create_spawn(config, db, call, caller, archetype, placement, overrides)
+        else
           {:error, denial} ->
             classified_spawn_denial(denial, "config_denied", "placement_denied")
         end
+
+      {:error, denial} ->
+        classified_spawn_denial(denial, "config_denied", "placement_denied")
     end
   end
 
@@ -7615,14 +7749,25 @@ defmodule Tightbeam.Gateway do
                    ) do
                   {:cap_exceeded, max_live_sessions}
                 else
-                  case DeliveryResponsibilities.check_staffing_owner_in_txn(
-                         txn,
-                         Map.put(call, :verb, "spawn"),
-                         owner_user_id: caller.owner_user_id,
-                         target_archetype: archetype.name
-                       ) do
+                  staffing =
+                    DeliveryResponsibilities.check_staffing_owner_in_txn(
+                      txn,
+                      Map.put(call, :verb, "spawn"),
+                      owner_user_id: caller.owner_user_id,
+                      target_archetype: archetype.name
+                    )
+
+                  case staffing do
                     :ok ->
                       session = Org.create_in_txn(txn, input)
+
+                      if archetype.ephemeral do
+                        Tightbeam.Ephemeral.stamp_in_txn(
+                          txn,
+                          session.session_key,
+                          caller.caller_session.session_key
+                        )
+                      end
 
                       if p[:handle] do
                         Roles.create_in_txn!(
@@ -9770,7 +9915,8 @@ defmodule Tightbeam.Gateway do
   defp running_turn_seq_in_txn(txn, session_key) do
     case DB.Txn.q(
            txn,
-           "SELECT seq FROM turns WHERE sessionKey = ?1 AND status = 'running' LIMIT 1",
+           "SELECT seq FROM turns WHERE sessionKey = ?1 AND status = 'running' " <>
+             "AND status IN ('queued','running') LIMIT 1",
            [session_key]
          ) do
       [[seq]] -> seq
@@ -9800,16 +9946,14 @@ defmodule Tightbeam.Gateway do
       prior && prior.session_key == call.session_key ->
         retired_keys = retired_subtree_keys(db, call.session_key)
 
-        retire_replay_with_cleanup(
-          config,
+        retire_replay_observation(
           db,
           call,
           %{
             deleted_session_key: call.session_key,
             retired_session_keys: retired_keys,
             deferred: []
-          },
-          retired_keys
+          }
         )
 
       true ->
@@ -9863,34 +10007,38 @@ defmodule Tightbeam.Gateway do
                 )
 
               Enum.each(result.retired, fn retired ->
-                broadcast(db, owner, Payloads.stream_deleted(retired.session_key))
-                Map.get(config, :on_retired, fn _ -> :ok end).(retired.session_key)
+                try do
+                  broadcast(db, owner, Payloads.stream_deleted(retired.session_key))
+                  Map.get(config, :on_retired, fn _ -> :ok end).(retired.session_key)
 
-                Enum.each(retired.assignments, fn assignment ->
-                  emit_assignment_change(db, assignment.assignment_id, assignment.from_state)
-                end)
+                  Enum.each(retired.assignments, fn assignment ->
+                    emit_assignment_change(db, assignment.assignment_id, assignment.from_state)
+                  end)
+                rescue
+                  error ->
+                    best_effort_failed("retire_notifications", :error, error, __STACKTRACE__)
+                catch
+                  kind, reason ->
+                    best_effort_failed("retire_notifications", kind, reason, __STACKTRACE__)
+                end
               end)
 
-              cleanup_reports =
-                reap_retired_sessions(config, db, Enum.map(result.retired, & &1.session_key))
+              reap_retired_sessions(config, db, Enum.map(result.retired, & &1.session_key))
 
               %{
                 deleted_session_key: session.session_key,
                 retired_session_keys: Enum.map(result.retired, & &1.session_key),
-                deferred: result.deferred,
-                workspace_cleanup: cleanup_reports
+                deferred: result.deferred
               }
             else
-              retire_replay_with_cleanup(
-                config,
+              retire_replay_observation(
                 db,
                 call,
                 %{
                   deleted_session_key: session.session_key,
                   retired_session_keys: [],
                   deferred: []
-                },
-                retired_subtree_keys(db, session.session_key)
+                }
               )
             end
 
@@ -9907,46 +10055,6 @@ defmodule Tightbeam.Gateway do
       end)
 
     result
-  end
-
-  defp retire_replay_with_cleanup(config, db, call, result, session_keys) do
-    result = retire_replay_observation(db, call, result)
-    reports = retry_incomplete_retired_workspaces(config, db, session_keys)
-
-    if reports == [], do: result, else: Map.put(result, :workspace_cleanup, reports)
-  end
-
-  defp retry_incomplete_retired_workspaces(config, db, session_keys) do
-    Enum.flat_map(session_keys, fn session_key ->
-      case Org.get(db, session_key) do
-        %{state: "retired"} ->
-          if last_workspace_cleanup_incomplete?(db, session_key) do
-            [cleanup_retired_workspace(config, db, session_key)]
-          else
-            []
-          end
-
-        _ ->
-          []
-      end
-    end)
-  end
-
-  defp last_workspace_cleanup_incomplete?(db, session_key) do
-    case DB.query(
-           db,
-           """
-           SELECT kind FROM lifecycle_events
-           WHERE subject=?1
-             AND kind IN ('retired_workspace_cleanup_completed',
-                          'retired_workspace_cleanup_incomplete')
-           ORDER BY id DESC LIMIT 1
-           """,
-           [session_key]
-         ) do
-      {:ok, [["retired_workspace_cleanup_incomplete"]]} -> true
-      _ -> false
-    end
   end
 
   defp critical_result(config, db, call) do
@@ -10129,7 +10237,7 @@ defmodule Tightbeam.Gateway do
   defp reap_retired_sessions(config, db, session_keys) do
     coordinator = Map.get(config, :adapter_coordinator, Tightbeam.AdapterCoordinator)
 
-    cleanup_reports = Enum.map(session_keys, &cleanup_retired_workspace(config, db, &1))
+    WorkspaceCleanup.kick()
 
     try do
       session_keys
@@ -10155,76 +10263,7 @@ defmodule Tightbeam.Gateway do
       :exit, reason -> best_effort_failed("reap_retired_sessions", :exit, reason, __STACKTRACE__)
     end
 
-    cleanup_reports
-  end
-
-  defp cleanup_retired_workspace(config, db, session_key) do
-    case Org.get(db, session_key) do
-      nil ->
-        retirement_cleanup_failure(db, session_key, :retired_session_missing)
-
-      session ->
-        hosts = Placement.hosts(config.base_dir, db)
-
-        case hosts[session.host] do
-          %{ssh: ssh} = host when is_nil(ssh) or (is_binary(ssh) and ssh != "") ->
-            WorkspaceCleanup.reap(db,
-              session_key: session_key,
-              host_name: session.host,
-              host: host,
-              hosts: hosts,
-              workspace: Placement.workdir_path(config, session),
-              runner: Map.get(config, :workspace_cleanup_runner),
-              runner_timeout_ms:
-                Map.get(
-                  config,
-                  :workspace_cleanup_timeout_ms,
-                  WorkspaceCleanup.default_runner_timeout_ms()
-                )
-            )
-
-          nil ->
-            retirement_cleanup_failure(db, session_key, {:retirement_host_unknown, session.host})
-        end
-    end
-  rescue
-    error ->
-      retirement_cleanup_failure(db, session_key, {:retired_workspace_cleanup_failed, error})
-  catch
-    kind, reason ->
-      retirement_cleanup_failure(
-        db,
-        session_key,
-        {:retired_workspace_cleanup_failed, kind, reason}
-      )
-  end
-
-  defp retirement_cleanup_failure(db, session_key, reason) do
-    report = %{
-      status: "incomplete",
-      session_key: session_key,
-      removed_paths: [],
-      removed_paths_complete: false,
-      result_confirmed: false,
-      blockers: [%{reason: "retired_workspace_cleanup_failed", detail: inspect(reason)}]
-    }
-
-    record_retirement_cleanup_failure(db, session_key, reason)
-    report
-  end
-
-  defp record_retirement_cleanup_failure(db, session_key, reason) do
-    EventLog.lifecycle(
-      db,
-      "retired_workspace_cleanup_incomplete",
-      session_key,
-      describe_error(reason)
-    )
-  rescue
-    exception ->
-      best_effort_failed("archive_retired_workspace", :error, exception, __STACKTRACE__)
-  catch
-    kind, reason -> best_effort_failed("archive_retired_workspace", kind, reason, __STACKTRACE__)
+    :ok
   end
 
   defp reap_adapter_sessions(db, coordinator, key, retired) do

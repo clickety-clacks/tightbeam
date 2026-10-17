@@ -505,9 +505,14 @@ defmodule Tightbeam.RailScriptTest do
     for {contents, message} <- cases do
       put_statute(ctx, contents)
 
-      assert_raise ArgumentError, ~r/#{Regex.escape(message)}/, fn ->
-        Rules.load!(ctx.base_dir, ["post"])
-      end
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert [] = Rules.load!(ctx.base_dir, ["post"])
+        end)
+
+      assert log =~ "unavailable"
+      assert log =~ message
+      assert {:deny, %{code: "rule_unavailable"}} = Rules.evaluate(ctx.db, call())
     end
   end
 

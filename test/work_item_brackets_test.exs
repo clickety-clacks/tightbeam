@@ -260,12 +260,11 @@ defmodule Tightbeam.WorkItemBracketsTest do
           """
         )
 
-      error =
-        assert_raise MatchError, fn ->
-          dispatch_fun.(ctx, subject, item.id)
-        end
+      # The event append is part of the handler's own transaction now, so its
+      # failure rolls the bundle back and comes back as the handler's error.
+      assert {:error, %{code: "server_error", message: message}} =
+               dispatch_fun.(ctx, subject, item.id)
 
-      assert {:error, %DB.Error{message: message}} = error.term
       assert message =~ "forced #{verb} event rollback"
       assert routing_wake_id(ctx.db, item.id) == routing
       assert Wakes.get(ctx.db, routing).state == "pending"

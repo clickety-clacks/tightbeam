@@ -175,7 +175,7 @@ defmodule Tightbeam.ArtifactLifecycleFirehoseTest do
     refute_receive {:firehose_notice, _}
   end
 
-  test "AL13 denied visibility never invokes matcher", ctx do
+  test "AL13 matching subscriptions still require visibility", ctx do
     :ok =
       Hub.register(Hub, self(), %{
         mode: :subscribed,
@@ -197,7 +197,7 @@ defmodule Tightbeam.ArtifactLifecycleFirehoseTest do
     try do
       record(ctx.db, "eezo:/tmp/hidden")
       assert Hub.sequence(Hub, self()) == 0
-      refute_receive {:trace, ^hub, :call, {Hub, :matches?, _}}
+      assert_receive {:trace, ^hub, :call, {Hub, :matches?, _}}
       refute_receive {:firehose_notice, _}
       :ok = Hub.register(Hub, self(), %{user_id: "flynn"})
       :ok = Artifacts.archive_session(ctx.db, "al_owner", ctx.work, ctx.archive)

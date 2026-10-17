@@ -96,6 +96,58 @@ defmodule Tightbeam.ConditionFactsTest do
     %{db: db, scheduler: scheduler, session: session}
   end
 
+  test "one malformed wake does not roll back recognition of another wake for the same fact",
+       ctx do
+    attrs = %{
+      session_key: ctx.session.session_key,
+      origin: "user:flynn",
+      prompt: "ready",
+      due_at: System.system_time(:millisecond) + 60_000,
+      condition_kind: "isolation-ready",
+      condition_after_id: 0
+    }
+
+    bad = Wakes.schedule(ctx.db, attrs)
+    good = Wakes.schedule(ctx.db, attrs)
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE wakes SET recognitionTransition='{' WHERE wakeId=?1", [
+               bad.wake_id
+             ])
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:ok, _} =
+                 DB.transaction(ctx.db, fn txn ->
+                   [[id]] =
+                     DB.Txn.q(
+                       txn,
+                       "INSERT INTO condition_facts(ts,kind,origin) VALUES (1,'isolation-ready','user:flynn') RETURNING id"
+                     )
+
+                   Wakes.recognize_condition_fact_in_txn(txn, id)
+                 end)
+      end)
+
+    assert log =~ bad.wake_id
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    assert Wakes.get(ctx.db, good.wake_id).fired_at != nil
+
+    assert {:ok, [["pending", nil, "{"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,firedAt,recognitionTransition FROM wakes WHERE wakeId=?1",
+               [bad.wake_id]
+             )
+
+    assert {:ok, [[count]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey=?1", [
+               ctx.session.session_key
+             ])
+
+    assert count > 0
+  end
+
   test "Firehose condition Dispatch files once and replays observation only", ctx do
     alias Tightbeam.{Dispatch, Firehose.Hub}
     hub = start_supervised!({Hub, name: Hub})
@@ -430,6 +482,41 @@ defmodule Tightbeam.ConditionFactsTest do
     refute_receive {:fire_matching, _}
   end
 
+  test "a busy scheduler does not turn a committed fact into an error", ctx do
+    test_pid = self()
+
+    # Accepts the post-commit nudge and never answers, like a scheduler stuck
+    # in a long tick.
+    busy =
+      spawn_link(fn ->
+        send(test_pid, :busy_ready)
+
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    assert_receive :busy_ready
+    on_exit(fn -> send(busy, :stop) end)
+
+    {filed, log} =
+      ExUnit.CaptureLog.with_log(fn ->
+        ConditionFacts.file(ctx.db, busy, %{
+          kind: "busy-kind",
+          scope: "prod",
+          origin: "process:ci"
+        })
+      end)
+
+    assert %{fact_id: fact_id} = filed
+    assert is_integer(fact_id)
+
+    assert {:ok, [["busy-kind", "prod"]]} =
+             DB.query(ctx.db, "SELECT kind, scope FROM condition_facts WHERE id=?1", [fact_id])
+
+    assert log =~ "condition nudge after a committed fact did not complete"
+  end
+
   test "eager evaluation cannot skip an older committed fact when a newer fact exists", ctx do
     older_wake = condition_wake(ctx, "older-kind", "prod")
     newer_wake = condition_wake(ctx, "newer-kind", "prod")
@@ -457,6 +544,8 @@ defmodule Tightbeam.ConditionFactsTest do
 
     assert older_fact.fact_id < newer_fact.fact_id
     assert :ok = Wakes.fire_matching(ctx.scheduler, older_fact.fact_id)
+    # Wait for the delivery pass the condition nudge queued.
+    :sys.get_state(ctx.scheduler)
     assert %{state: "fired", fired_by: "condition"} = Wakes.get(ctx.db, older_wake.wake_id)
 
     assert %{state: "fired", fired_by: "condition"} =
@@ -473,6 +562,8 @@ defmodule Tightbeam.ConditionFactsTest do
              [older_wake.wake_id, newer_wake.wake_id]
 
     assert :ok = Wakes.fire_matching(ctx.scheduler, newer_fact.fact_id)
+    # Wait for the delivery pass the condition nudge queued.
+    :sys.get_state(ctx.scheduler)
     assert %{state: "fired", fired_by: "condition"} = Wakes.get(ctx.db, newer_wake.wake_id)
   end
 
@@ -661,6 +752,9 @@ defmodule Tightbeam.ConditionFactsTest do
       origin: "user:flynn"
     })
 
+    # Wait for the delivery pass the condition nudge queued.
+    :sys.get_state(ctx.scheduler)
+
     assert %{state: "fired", fired_by: "condition"} = Wakes.get(ctx.db, wake.wake_id)
     assert delivery_turn_count(ctx.db, wake.wake_id) == 1
   end
@@ -676,6 +770,9 @@ defmodule Tightbeam.ConditionFactsTest do
       scope: "prod",
       origin: "user:flynn"
     })
+
+    # Wait for the delivery pass the condition nudge queued.
+    :sys.get_state(ctx.scheduler)
 
     assert Wakes.get(ctx.db, first.wake_id).state == "fired"
     assert Wakes.get(ctx.db, second.wake_id).state == "fired"
@@ -753,6 +850,8 @@ defmodule Tightbeam.ConditionFactsTest do
       end)
 
     :ok = Wakes.fire_matching(ctx.scheduler, [fact_a.fact_id, fact_b.fact_id])
+    # Wait for the delivery pass the condition nudge queued.
+    :sys.get_state(ctx.scheduler)
 
     all = MapSet.new([b_wake | a_wakes])
 
@@ -801,6 +900,9 @@ defmodule Tightbeam.ConditionFactsTest do
       origin: "process:ci",
       owner_user_id: "flynn"
     })
+
+    # Wait for the delivery pass the condition nudge queued.
+    :sys.get_state(ctx.scheduler)
 
     assert %{state: "fired", fired_by: "condition"} = Wakes.get(ctx.db, matching)
     assert Enum.all?(nonmatches, &(Wakes.get(ctx.db, &1).state == "pending"))

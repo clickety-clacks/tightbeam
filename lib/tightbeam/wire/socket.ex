@@ -75,6 +75,7 @@ defmodule Tightbeam.Wire.Socket do
         }
 
   defstruct conn_ref: nil,
+            registry_monitor: nil,
             user_id: nil,
             device_id: nil,
             is_admin: false,
@@ -82,6 +83,7 @@ defmodule Tightbeam.Wire.Socket do
             subscriptions: nil,
             buffer: [],
             replayed_seqs: MapSet.new(),
+            replay_pending: MapSet.new(),
             deps: %{}
 
   @impl true
@@ -111,6 +113,9 @@ defmodule Tightbeam.Wire.Socket do
   @impl true
   def handle_info(msg, state) do
     case msg do
+      {:DOWN, ref, :process, _pid, _reason} when ref == state.registry_monitor ->
+        {:stop, :normal, 1012, state}
+
       {:push, payload} when state.phase == :replaying ->
         {:ok, %{state | buffer: [{:frame, payload} | state.buffer]}}
 
@@ -123,8 +128,8 @@ defmodule Tightbeam.Wire.Socket do
       {:push_message, key, seq, payload} when state.phase == :replaying ->
         {:ok, %{state | buffer: [{:msg, key, seq, payload} | state.buffer]}}
 
-      {:push_message, _key, _seq, payload} when state.phase == :live ->
-        push(payload, state)
+      {:push_message, key, _seq, payload} when state.phase == :live ->
+        if MapSet.member?(state.replay_pending, key), do: {:ok, state}, else: push(payload, state)
 
       {:push_message, _key, _seq, _payload} ->
         {:ok, state}
@@ -139,7 +144,10 @@ defmodule Tightbeam.Wire.Socket do
           |> Enum.reverse()
           |> Enum.flat_map(fn
             {:msg, key, seq, payload} ->
-              if MapSet.member?(state.replayed_seqs, {key, seq}), do: [], else: [payload]
+              if MapSet.member?(state.replay_pending, key) or
+                   MapSet.member?(state.replayed_seqs, {key, seq}),
+                 do: [],
+                 else: [payload]
 
             {:frame, payload} ->
               [payload]
@@ -297,8 +305,11 @@ defmodule Tightbeam.Wire.Socket do
       {:ok, subscriptions} ->
         if MapSet.member?(subscriptions, "chat"), do: seed_main_stream(device.user_id, state)
 
+        registry = GenServer.whereis(conn_registry(state))
+        monitor = Process.monitor(registry)
+
         {:ok, conn_ref, _replaced} =
-          ConnRegistry.register(conn_registry(state), %{
+          ConnRegistry.register(registry, %{
             pid: self(),
             user_id: device.user_id,
             device_id: device.device_id,
@@ -306,7 +317,7 @@ defmodule Tightbeam.Wire.Socket do
             subscriptions: subscriptions
           })
 
-        auth_replay(msg, device, conn_ref, subscriptions, state)
+        auth_replay(msg, device, conn_ref, subscriptions, %{state | registry_monitor: monitor})
 
       :error ->
         stop_with(Payloads.wire_error("invalid_message"), state)
@@ -330,20 +341,41 @@ defmodule Tightbeam.Wire.Socket do
     keys = Enum.map(sessions, & &1.session_key)
     cursors = replay_cursors(msg, device.user_id, state)
 
-    {replay, truncated?, replayed_seqs} =
-      Enum.reduce(keys, {[], false, MapSet.new()}, fn key, {messages, truncated, sent} ->
-        barrier = Enum.find_value(sessions, 0, &(&1.session_key == key && &1.cleared_through_seq))
-        rows = Projection.list_after(db(state), key, cursors[key], 501, barrier || 0)
-        selected = Enum.take(rows, 500)
+    {reversed, pending, replayed_seqs, _bytes, _count} =
+      Enum.reduce(sessions, {[], MapSet.new(), MapSet.new(), 0, 0}, fn session,
+                                                                       {messages, pending, sent,
+                                                                        bytes, count} ->
+        key = session.session_key
 
-        # The SET of rows sent, not a high-water mark. A mark deletes: a stalled
-        # frame below the max but absent from the replay window (the client's
-        # cursor already passed it, so `seq >` excluded it) would drain as
-        # "≤ mark" and be lost for good — the registry's old bug, one layer down.
-        sent = Enum.reduce(selected, sent, fn m, acc -> MapSet.put(acc, {key, m.seq}) end)
+        rows =
+          Projection.list_after(
+            db(state),
+            key,
+            cursors[key],
+            501 - count,
+            session.cleared_through_seq || 0
+          )
 
-        {messages ++ selected, truncated or length(rows) == 501, sent}
+        page =
+          Enum.reduce_while(rows, {messages, false, sent, bytes, count}, fn row,
+                                                                            {acc, _, seen, size,
+                                                                             n} ->
+            row_bytes = byte_size(JSON.encode!(Payloads.server_message(row)))
+
+            if n == 500 or (n > 0 and size + row_bytes > 4 * 1024 * 1024) do
+              {:halt, {acc, true, seen, size, n}}
+            else
+              {:cont,
+               {[row | acc], false, MapSet.put(seen, {key, row.seq}), size + row_bytes, n + 1}}
+            end
+          end)
+
+        {messages, truncated?, sent, bytes, count} = page
+        pending = if truncated?, do: MapSet.put(pending, key), else: pending
+        {messages, pending, sent, bytes, count}
       end)
+
+    replay = Enum.reverse(reversed)
 
     read_states = if chat?, do: Projection.read_states(db(state), device.user_id), else: %{}
 
@@ -365,7 +397,7 @@ defmodule Tightbeam.Wire.Socket do
         session_id: "conn_#{device.device_id}",
         is_admin: device.is_admin,
         replay_count: length(replay),
-        replay_truncated: truncated?,
+        replay_truncated: MapSet.size(pending) > 0,
         history_reset: false,
         session_keys: keys,
         stream_read_states: read_states,
@@ -385,7 +417,8 @@ defmodule Tightbeam.Wire.Socket do
         is_admin: device.is_admin,
         subscriptions: subscriptions,
         phase: :replaying,
-        replayed_seqs: replayed_seqs
+        replayed_seqs: replayed_seqs,
+        replay_pending: pending
     }
 
     state = state |> schedule_ping() |> arm_pong_deadline()

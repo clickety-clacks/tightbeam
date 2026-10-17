@@ -448,6 +448,8 @@ defmodule Tightbeam.EscalationTest do
              })
 
     ruled = handlers["rule"].(rule_call(id, "allow"))
+    # Wait for the delivery pass the condition nudge queued.
+    :sys.get_state(scheduler)
     assert ruled.status == "ruled"
     assert Wakes.get(ctx.db, wake.wake_id).state == "fired"
 
@@ -488,6 +490,9 @@ defmodule Tightbeam.EscalationTest do
         authorized: true,
         scheduler: ctx.scheduler
       )
+
+    # Wait for the delivery pass the condition nudge queued.
+    :sys.get_state(ctx.scheduler)
 
     assert request(ctx, first).decision == "waived"
     assert request(ctx, second).decision == "waived"
@@ -940,6 +945,9 @@ defmodule Tightbeam.EscalationTest do
         owner_operator_rule(direct.id, %{decision: "accept"}),
         scheduler: scheduler
       )
+
+    # Wait for the delivery pass the condition nudge queued.
+    :sys.get_state(scheduler)
 
     assert ruled.status == "ruled"
     assert ruled.decision == "accept"
@@ -1803,13 +1811,13 @@ defmodule Tightbeam.EscalationTest do
     request =
       Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "nudge loss?"}))
 
-    assert catch_exit(
-             Escalation.operator_rule(
-               ctx.db,
-               owner_operator_rule(request.id, %{decision: "accept"}),
-               scheduler: :missing_terminal_scheduler
-             )
-           )
+    # The ruling has committed; a missing scheduler loses only the nudge and
+    # never turns the committed ruling into an exit.
+    Escalation.operator_rule(
+      ctx.db,
+      owner_operator_rule(request.id, %{decision: "accept"}),
+      scheduler: :missing_terminal_scheduler
+    )
 
     assert {:ok, [["ruled", fact_id, wake_id, "pending", "condition", fired_at]]} =
              DB.query(
@@ -1825,6 +1833,8 @@ defmodule Tightbeam.EscalationTest do
     start_gateway_scheduler(ctx, restarted)
 
     assert :ok = Wakes.fire_matching(restarted, fact_id)
+    # Wait for the delivery pass the condition nudge queued.
+    :sys.get_state(restarted)
     assert %{state: "fired", fired_by: "condition"} = Wakes.get(ctx.db, wake_id)
 
     assert [%{delivery_wake_id: carrier_id, batch_state: "delivered"}] =
@@ -2079,6 +2089,9 @@ defmodule Tightbeam.EscalationTest do
         scheduler: scheduler
       )
 
+    # Wait for the delivery pass the condition nudge queued.
+    :sys.get_state(scheduler)
+
     assert {:ok, [[wake_id, "fired", "condition"]]} =
              DB.query(
                ctx.db,
@@ -2148,6 +2161,9 @@ defmodule Tightbeam.EscalationTest do
         owner_operator_rule(request.id, %{decision: "accept"}),
         scheduler: ctx.scheduler
       )
+
+    # Wait for the delivery pass the condition nudge queued.
+    :sys.get_state(ctx.scheduler)
 
     assert {:ok, [[1]]} =
              DB.query(
@@ -2426,6 +2442,10 @@ defmodule Tightbeam.EscalationTest do
   end
 
   test "joined terminal traces distinguish known legacy condition and fallback paths", ctx do
+    # Build the pre-delivery legacy fixture before a scheduler can create batch
+    # members referencing its wake. The delivery scheduler starts below.
+    assert :ok = stop_supervised(Wakes)
+
     legacy =
       Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "legacy trace?"}))
 
@@ -2456,6 +2476,15 @@ defmodule Tightbeam.EscalationTest do
                [legacy.id]
              )
 
+    assert {:ok, [[legacy_wake_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId FROM wakes WHERE conditionKind='escalation-ruled' AND conditionScope=?1",
+               [legacy.id]
+             )
+
+    assert NoticeBatcher.source_refs(ctx.db, legacy_wake_id) == []
+
     assert {:ok, _} =
              DB.query(
                ctx.db,
@@ -2480,6 +2509,8 @@ defmodule Tightbeam.EscalationTest do
     scheduler = start_gateway_scheduler(ctx)
     known_ruled = Escalation.operator_rule(ctx.db, known_call)
     assert :ok = Wakes.fire_matching(scheduler, known_ruled.ruling_fact_id)
+    # Wait for the delivery pass the condition nudge queued.
+    :sys.get_state(scheduler)
 
     wrong_name =
       Wakes.schedule(ctx.db, %{
@@ -3286,6 +3317,7 @@ defmodule Tightbeam.EscalationTest do
   defp reset_terminal_census(db) do
     :ok =
       DB.execute(db, """
+      UPDATE schema_stamp SET shape='operator-decision-requests-v1';
       DELETE FROM decision_request_terminal_epoch;
       DELETE FROM decision_request_integrity_evidence;
       UPDATE decision_requests SET ruledViaPrincipal=NULL, ruledViaSessionState=NULL;

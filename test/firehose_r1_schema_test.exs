@@ -151,6 +151,74 @@ defmodule Tightbeam.FirehoseR1SchemaTest do
     assert rows(db, "PRAGMA ignore_check_constraints") == [[0]]
   end
 
+  test "invalid artifact seeds remain unresolved while healthy floors upgrade", %{db: db} do
+    load_r1(db)
+    :ok = DB.execute(db, "UPDATE artifacts SET createdAt=0 WHERE artifactId='artifact'")
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO artifacts(artifactId,kind,title,createdBySession,workItemId,originPath,createdAt,updatedAt)
+        VALUES ('valid-artifact','other','valid','fixture-session','work','valid',5,5)
+      """)
+
+    assert ExUnit.CaptureLog.capture_log(fn -> assert :ok = Schema.upgrade_firehose_r1(db) end) =~
+             "artifact"
+
+    assert rows(db, "SELECT artifactId,rowVersion FROM artifact_version_floors") == [
+             ["valid-artifact", 6]
+           ]
+
+    assert rows(db, "SELECT createdAt FROM artifacts WHERE artifactId='artifact'") == [[0]]
+    assert :ok = Schema.upgrade_firehose_r1(db)
+
+    assert rows(db, "SELECT artifactId,rowVersion FROM artifact_version_floors") == [
+             ["valid-artifact", 6]
+           ]
+  end
+
+  test "unrelated artifact orphan does not veto decision and assignment upgrades", %{db: db} do
+    load_r1(db)
+    :ok = DB.execute(db, "PRAGMA foreign_keys=OFF")
+
+    :ok =
+      DB.execute(
+        db,
+        "UPDATE artifacts SET createdBySession='missing-creator' WHERE artifactId='artifact'"
+      )
+
+    :ok = DB.execute(db, "PRAGMA foreign_keys=ON")
+    assert :ok = Schema.upgrade_firehose_r1(db)
+
+    assert rows(db, "SELECT createdBySession FROM artifacts WHERE artifactId='artifact'") == [
+             ["missing-creator"]
+           ]
+
+    assert rows(db, "SELECT shape FROM schema_stamp") == [["firehose-r1-v1-019"]]
+    assert :ok = Schema.upgrade_firehose_r1(db)
+  end
+
+  test "pre-existing assignment orphans retain their identity across a table rebuild", %{db: db} do
+    load_r1(db)
+    :ok = DB.execute(db, "PRAGMA foreign_keys=OFF")
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO assignments(rowid,id,subject,holderKey,openedByUser,openedAt,reminderState)
+      VALUES (99,'orphan-assignment','unchanged','missing-holder','fixture',1,NULL)
+      """)
+
+    :ok = DB.execute(db, "PRAGMA foreign_keys=ON")
+
+    assert ExUnit.CaptureLog.capture_log(fn -> assert :ok = Schema.upgrade_firehose_r1(db) end) =~
+             "orphan-assignment"
+
+    assert rows(db, "SELECT holderKey,subject FROM assignments WHERE id='orphan-assignment'") == [
+             ["missing-holder", "unchanged"]
+           ]
+
+    assert rows(db, "SELECT shape FROM schema_stamp") == [["firehose-r1-v1-019"]]
+  end
+
   defp load_r1(db) do
     sql = File.read!(@fixture)
     assert Base.encode16(:crypto.hash(:sha256, sql), case: :lower) == @fixture_sha

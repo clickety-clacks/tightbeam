@@ -321,7 +321,11 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
 
     :ok = Hub.subscribe(ctx.hub, self(), "work", %{})
 
-    Enum.each(1..1_500, fn index -> Hub.publish(ctx.hub, notice(ctx, "wi_#{index}")) end)
+    Enum.each(1..1_500, fn index ->
+      Hub.publish(ctx.hub, notice(ctx, "wi_#{index}"))
+      # Drain ingress so this test isolates the per-connection delivery queue.
+      Hub.sequence(ctx.hub, self())
+    end)
 
     assert %{in_flight: true, overflowed: true, queued: 0, seq: 1_001} =
              Hub.connection_stats(ctx.hub, self())

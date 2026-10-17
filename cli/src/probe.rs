@@ -1504,10 +1504,16 @@ fn pretty_json(value: &Value) -> String {
 }
 
 /// The doctor report, with the gateway's sentinel section when doctor asked for it.
-fn report_json(report: &Report, sentinels: Option<Value>) -> String {
+fn report_json(report: &Report, sentinels: Option<Value>, event_paths: Option<Value>) -> String {
     let mut value = report_value(report);
     if let (Some(sentinels), Some(fields)) = (sentinels, value.as_object_mut()) {
+        if let Some(cleanup) = sentinels.get("workspace_cleanup") {
+            fields.insert("workspace_cleanup".to_owned(), cleanup.clone());
+        }
         fields.insert("sentinels".to_owned(), sentinels);
+    }
+    if let (Some(event_paths), Some(fields)) = (event_paths, value.as_object_mut()) {
+        fields.insert("event_paths".to_owned(), event_paths);
     }
     pretty_json(&value)
 }
@@ -1562,17 +1568,148 @@ pub fn run(
     report.credential_health = inspect_credential_health(&resolved_base_dir);
     report.collection_ms = u64::try_from(monotonic.elapsed().as_millis()).unwrap_or(u64::MAX);
     let sentinels = doctor_sentinels(&resolved_base_dir, explicit_base_dir, identity);
+    let event_paths = doctor_event_paths(&resolved_base_dir, explicit_base_dir);
     if json {
-        println!("{}", report_json(&report, Some(sentinel_value(&sentinels))));
+        println!(
+            "{}",
+            report_json(
+                &report,
+                Some(sentinel_value(&sentinels)),
+                Some(event_paths_value(&event_paths))
+            )
+        );
     } else {
         println!("{}", human(&report));
         println!("{}", sentinel_lines(&sentinels).join("\n"));
+        println!(
+            "{}",
+            workspace_cleanup_lines(&sentinel_value(&sentinels)["workspace_cleanup"]).join("\n")
+        );
+        println!("{}", event_paths_lines(&event_paths).join("\n"));
     }
     require_runnable_harness_cli(harness_catalog.as_ref())?;
     require_credential_integrity(&report.credential_health)?;
     match collection_failure {
         Some(failure) => Err(failure),
         None => Ok(()),
+    }
+}
+
+fn doctor_event_paths(base_dir: &Path, explicit_base_dir: bool) -> Result<Value, String> {
+    let endpoint = if explicit_base_dir {
+        crate::dispatch::discover_from(base_dir)
+    } else {
+        crate::dispatch::discover()
+    }?;
+    let request = crate::dispatch::RequestSpec {
+        path: "/version",
+        body_json: String::new(),
+        attempt_context: None,
+        receipt_base_override: Some(base_dir.to_path_buf()),
+    };
+    let deadline = Instant::now() + std::time::Duration::from_secs(5);
+    let version = crate::dispatch::send_to_with_deadline(&endpoint, &request, Some(deadline))?
+        .ok_or("the gateway returned no health facts")?;
+    version
+        .get("eventPaths")
+        .filter(|health| {
+            health["count"].as_u64().is_some()
+                && health["byLoop"].is_object()
+                && health["recent"].is_array()
+        })
+        .cloned()
+        .ok_or_else(|| "the gateway did not report event path health".to_owned())
+}
+
+fn event_paths_value(status: &Result<Value, String>) -> Value {
+    match status {
+        Ok(health) => {
+            let mut health = health.clone();
+            health["level"] = Value::from(if health["count"] == 0 {
+                "pass"
+            } else {
+                "warning"
+            });
+            health
+        }
+        Err(reason) => object([("unavailable", Value::from(reason.clone()))]),
+    }
+}
+
+fn event_paths_lines(status: &Result<Value, String>) -> Vec<String> {
+    let health = match status {
+        Ok(health) => health,
+        Err(reason) => return vec![format!("[WARN] event paths: health unavailable ({reason})")],
+    };
+    if health["count"] == 0 {
+        return vec!["[PASS] event paths: no missed events since start".to_owned()];
+    }
+    let counts = [
+        ("wake", "wake scheduler"),
+        ("recognition", "recognition retry"),
+        ("bubble", "bubble"),
+        ("lanes", "lanes"),
+    ]
+    .iter()
+    .map(|(key, label)| format!("{label}={}", health["byLoop"][key]))
+    .collect::<Vec<_>>()
+    .join(", ");
+    let mut lines = vec![format!(
+        "[WARN] event paths: {} missed events since start; {counts}",
+        health["count"]
+    )];
+    if let Some(recent) = health["recent"].as_array() {
+        for miss in recent {
+            let late = miss["lateMs"]
+                .as_u64()
+                .map(|ms| format!("{ms} ms late"))
+                .unwrap_or_else(|| "lateness unknown".to_owned());
+            lines.push(format!(
+                "  {} record={} {late} at={} ms since epoch",
+                miss["loop"].as_str().unwrap_or("unknown"),
+                miss["recordId"],
+                miss["at"]
+            ));
+        }
+    }
+    lines
+}
+
+fn workspace_cleanup_lines(health: &Value) -> Vec<String> {
+    match health["count"].as_u64() {
+        Some(0)
+            if health["reasons"]
+                .as_array()
+                .is_none_or(|rows| rows.is_empty()) =>
+        {
+            vec!["[PASS] retired workspaces: cleanup complete".to_owned()]
+        }
+        Some(count) => {
+            let mut lines = vec![format!(
+                "[WARN] retired workspaces: {count} unfinished cleanups"
+            )];
+            if let Some(rows) = health["reasons"].as_array() {
+                for row in rows {
+                    lines.push(format!(
+                        "  {}: {} ({})",
+                        row["count"].as_u64().unwrap_or(0),
+                        row["reason"].as_str().unwrap_or("cleanup pending"),
+                        if row["completed"].as_bool().unwrap_or(false) {
+                            "finished"
+                        } else {
+                            "pending"
+                        }
+                    ));
+                }
+            }
+            lines
+        }
+        None => vec![format!(
+            "[WARN] retired workspaces: cleanup status unavailable ({})",
+            health["unavailable"]
+                .as_str()
+                .unwrap_or("gateway did not report cleanup status")
+        )],
     }
 }
 
@@ -1800,6 +1937,58 @@ fn offline_harness_notes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn doctor_names_unfinished_workspace_cleanups() {
+        let lines = workspace_cleanup_lines(
+            &serde_json::json!({"count": 1, "reasons": [{"count": 1, "reason": "archive move failed", "completed": false}]}),
+        );
+        assert!(lines[0].contains("1 unfinished"));
+        assert!(lines[1].contains("1: archive move failed"));
+        let finished = workspace_cleanup_lines(
+            &serde_json::json!({"count": 0, "reasons": [{"count": 3, "reason": "artifact_missing", "completed": true}]}),
+        );
+        assert!(finished[0].contains("[WARN]"));
+        assert!(finished[1].contains("3: artifact_missing (finished)"));
+        assert!(workspace_cleanup_lines(&serde_json::json!({"count": 0}))[0].contains("[PASS]"));
+        assert!(
+            workspace_cleanup_lines(&serde_json::json!({"unavailable": "offline"}))[0]
+                .contains("offline")
+        );
+    }
+
+    #[test]
+    fn event_paths_pass_at_clean_start_and_warn_with_recorded_misses() {
+        let clean = Ok(serde_json::json!({
+            "count": 0,
+            "byLoop": {"wake": 0, "recognition": 0, "bubble": 0, "lanes": 0},
+            "recent": []
+        }));
+        assert_eq!(
+            event_paths_lines(&clean),
+            vec!["[PASS] event paths: no missed events since start"]
+        );
+        assert_eq!(event_paths_value(&clean)["level"], "pass");
+        let missed = Ok(serde_json::json!({
+            "count": 1,
+            "byLoop": {"wake": 1, "recognition": 0, "bubble": 0, "lanes": 0},
+            "recent": [{"loop": "wake", "recordId": "wake-missed", "lateMs": 65000, "at": 1700000000000_u64}]
+        }));
+        let lines = event_paths_lines(&missed);
+        assert!(lines[0].contains("[WARN] event paths: 1 missed events since start"));
+        assert!(lines[0].contains("wake scheduler=1, recognition retry=0, bubble=0, lanes=0"));
+        assert!(lines[1].contains("wake-missed"));
+        assert!(lines[1].contains("65000 ms late"));
+        assert!(lines[1].contains("1700000000000"));
+        assert_eq!(event_paths_value(&missed)["level"], "warning");
+    }
+
+    #[test]
+    fn unavailable_event_health_never_claims_a_clean_start() {
+        let unavailable = Err("gateway unavailable".to_owned());
+        assert!(event_paths_lines(&unavailable)[0].contains("health unavailable"));
+        assert!(event_paths_value(&unavailable).get("level").is_none());
+    }
+
     use std::os::unix::fs::PermissionsExt;
 
     fn doctor_credential_root() -> PathBuf {
@@ -2673,7 +2862,7 @@ mod tests {
                 adapter_stderr_log_count: None,
             },
         );
-        let encoded: Value = serde_json::from_str(&report_json(&report, None)).unwrap();
+        let encoded: Value = serde_json::from_str(&report_json(&report, None, None)).unwrap();
         assert_eq!(
             encoded,
             serde_json::from_str::<Value>(
@@ -2775,7 +2964,7 @@ mod tests {
                 adapter_stderr_log_count: Some(2),
             },
         );
-        let encoded: Value = serde_json::from_str(&report_json(&report, None)).unwrap();
+        let encoded: Value = serde_json::from_str(&report_json(&report, None, None)).unwrap();
         assert_eq!(
             encoded,
             serde_json::from_str::<Value>(

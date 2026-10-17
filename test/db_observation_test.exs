@@ -147,7 +147,7 @@ defmodule Tightbeam.DBObservationTest do
     assert Enum.all?(events, &(&1.result_class == "ok"))
   end
 
-  test "queued ordinary timeout preserves late effect and null unobserved spans", %{db: db} do
+  test "queued ordinary timeout rejects the late effect with null unobserved spans", %{db: db} do
     Application.put_env(:tightbeam, :db_call_timeout_ms, 50)
     :sys.suspend(db)
 
@@ -169,12 +169,17 @@ defmodule Tightbeam.DBObservationTest do
                      1_000
 
       assert terminal.queue_ms >= 50
-      assert terminal.result_class == "ok"
+      # Expired owner work now reports its distinct deadline refusal class.
+      assert terminal.result_class == "deadline_exceeded"
+      assert terminal.execute_ms == nil
+      assert terminal.callback_ms == nil
 
       assert Diagnostics.classify_db_timeout(Diagnostics.records(), id) ==
                "db_mailbox_queue_overrun"
 
-      assert {:ok, []} = DB.query(db, "SELECT * FROM secret_sentinel")
+      assert {:ok, []} =
+               DB.query(db, "SELECT name FROM sqlite_master WHERE name='secret_sentinel'")
+
       refute inspect(Diagnostics.records()) =~ "secret_sentinel"
     after
       if Process.alive?(db), do: :sys.resume(db)
@@ -204,8 +209,9 @@ defmodule Tightbeam.DBObservationTest do
 
       assert terminal.callback_ms == nil
       assert terminal.sqlite_busy_budget_ms == nil
-      assert terminal.result_class == nil
-      assert terminal.cause == nil
+      # Expired owner work now reports its distinct deadline refusal class.
+      assert terminal.result_class == "deadline_exceeded"
+      assert terminal.cause == "deadline_exceeded"
       assert terminal.execute_ms == nil
       assert terminal.callback_sql_ms == nil
       assert terminal.callback_outside_sql_ms == nil
