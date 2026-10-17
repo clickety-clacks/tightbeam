@@ -398,6 +398,7 @@ defmodule Tightbeam.Schema do
   @fresh_owner_link_origin_table "schema_bootstrap_origin"
   @work_item_owner_link_shape "work-item-delivery-owner-v1-019"
   @assignment_source_replacement_shape "assignment-source-replacement-v1-019"
+  @effort_holder_activity_cancellation_shape "effort-holder-activity-cancellation-v1-019"
   @notice_source_payload_shape "notice-source-storage-v1-019"
   @decision_request_row_schema_shape "decision-request-row-schema-v2-019"
   @identity_publication_denial_diagnostic_previous_shape @artifact_origin_shape
@@ -1532,6 +1533,76 @@ defmodule Tightbeam.Schema do
                                                     end
                                                   )
 
+  # A current holder's progress attest clears its pending effort prod directly;
+  # no later liveness action is owed for that exact source event. Keep the
+  # earlier stamped cancellation DDL byte-exact and migrate this narrow route
+  # behind its own activation marker.
+  @effort_holder_activity_cancellation_objects [
+    %{
+      type: "table",
+      name: "effort_holder_activity_cancellation_epoch",
+      sql: """
+      CREATE TABLE IF NOT EXISTS effort_holder_activity_cancellation_epoch (
+        id INTEGER PRIMARY KEY CHECK(id = 0),
+        shape TEXT NOT NULL CHECK(shape = 'effort-holder-activity-cancellation-v1-019'),
+        activatedAt INTEGER NOT NULL CHECK(activatedAt >= 0),
+        principal TEXT NOT NULL CHECK(principal = 'process:tightbeam')
+      )
+      """
+    }
+    | Enum.map(@assignment_source_replacement_liveness_objects, fn
+        %{name: "wake_cancellations", sql: sql} = object ->
+          old_no_replacement = """
+               ((workImpactKind = 'linked_work_open' AND livenessTriggerKind IS NOT NULL AND
+                 livenessTriggerId IS NOT NULL AND actionNeeded = 1)
+                OR
+                (workImpactKind != 'linked_work_open' AND livenessTriggerKind IS NULL AND
+                 livenessTriggerId IS NULL AND actionNeeded = 0))
+          """
+
+          new_no_replacement = """
+               ((workImpactKind = 'linked_work_open' AND livenessTriggerKind IS NOT NULL AND
+                 livenessTriggerId IS NOT NULL AND actionNeeded = 1)
+                OR
+                (workImpactKind = 'linked_work_open' AND livenessTriggerKind IS NULL AND
+                 livenessTriggerId IS NULL AND actionNeeded = 0 AND
+                 requesterKind = 'process' AND requesterId = 'tightbeam:effort-checkin' AND
+                 reasonKind = 'superseded' AND causalSourceKind = 'progress_attest')
+                OR
+                (workImpactKind != 'linked_work_open' AND livenessTriggerKind IS NULL AND
+                 livenessTriggerId IS NULL AND actionNeeded = 0))
+          """
+
+          true = String.contains?(sql, old_no_replacement)
+
+          sql = String.replace(sql, old_no_replacement, new_no_replacement, global: false)
+
+          requester_anchor =
+            "(requesterId = 'tightbeam:supervision' AND reasonKind = 'superseded' AND"
+
+          holder_activity_requester_route =
+            "(requesterId = 'tightbeam:effort-checkin' AND reasonKind = 'superseded' AND\n" <>
+              "     causalSourceKind = 'progress_attest' AND outcomeKind = 'no_replacement')\n" <>
+              "    OR\n    "
+
+          true = String.contains?(sql, requester_anchor)
+
+          %{
+            object
+            | sql:
+                String.replace(
+                  sql,
+                  requester_anchor,
+                  holder_activity_requester_route <> requester_anchor,
+                  global: false
+                )
+          }
+
+        object ->
+          object
+      end)
+  ]
+
   @doc false
   def live_base_upgrade_predecessor, do: @operator_decision_shape
 
@@ -1794,6 +1865,7 @@ defmodule Tightbeam.Schema do
     # Building it here keeps a refused migration's schema untouched and makes
     # the first and every later boot leave the same objects.
     :ok = ensure_notice_delivery_runtime_indexes(db)
+    :ok = upgrade_effort_holder_activity_cancellation_v1(db)
 
     case DB.finish_schema(db) do
       :ok -> Tightbeam.Recognition.activate(db)
@@ -2955,7 +3027,7 @@ defmodule Tightbeam.Schema do
                  @notice_source_payload_shape,
                  @decision_request_row_schema_shape
                ],
-               do: @assignment_source_replacement_liveness_objects,
+               do: assignment_source_replacement_liveness_objects(txn),
                else: @supervision_receipt_cancellation_liveness_objects
 
           Enum.reject(liveness_objects, &(&1.name == "supervision_receipt_cancellation_epoch"))
@@ -2970,7 +3042,7 @@ defmodule Tightbeam.Schema do
           )
 
           Enum.reject(
-            @assignment_source_replacement_liveness_objects,
+            assignment_source_replacement_liveness_objects(txn),
             &(&1.name == "supervision_receipt_cancellation_epoch")
           )
 
@@ -3095,6 +3167,40 @@ defmodule Tightbeam.Schema do
         rows ->
           Logger.warning(
             "supervision_receipt_cancellation_epoch row 0 unavailable: #{inspect(rows)}"
+          )
+
+          false
+      end
+    else
+      false
+    end
+  end
+
+  defp assignment_source_replacement_liveness_objects(txn) do
+    if effort_holder_activity_cancellation_active?(txn),
+      do: @effort_holder_activity_cancellation_objects,
+      else: @assignment_source_replacement_liveness_objects
+  end
+
+  defp effort_holder_activity_cancellation_active?(txn) do
+    marker =
+      Enum.find(@effort_holder_activity_cancellation_objects, fn object ->
+        object.name == "effort_holder_activity_cancellation_epoch"
+      end)
+
+    if owned_object_present?(txn, marker) do
+      validate_owned_object!(txn, marker)
+
+      case Txn.q(
+             txn,
+             "SELECT shape FROM effort_holder_activity_cancellation_epoch WHERE id=0"
+           ) do
+        [[@effort_holder_activity_cancellation_shape]] ->
+          true
+
+        rows ->
+          Logger.warning(
+            "effort_holder_activity_cancellation_epoch row 0 unavailable: #{inspect(rows)}"
           )
 
           false
@@ -3975,8 +4081,10 @@ defmodule Tightbeam.Schema do
            ] ->
         :ok = marker_shape.()
 
+        current_liveness_objects = assignment_source_replacement_liveness_objects(txn)
+
         Enum.each(
-          Enum.filter(@assignment_source_replacement_liveness_objects, fn object ->
+          Enum.filter(current_liveness_objects, fn object ->
             object.name in [
               "wake_cancellations",
               "wake_cancellations_pending_insert",
@@ -4091,6 +4199,151 @@ defmodule Tightbeam.Schema do
       rows ->
         raise ShapeError,
           message: "incompatible assignment source replacement predecessor: #{inspect(rows)}"
+    end
+  end
+
+  @doc false
+  @spec upgrade_effort_holder_activity_cancellation_v1(DB.server()) :: :ok
+  def upgrade_effort_holder_activity_cancellation_v1(db) do
+    {:ok, [[foreign_keys]]} = DB.query(db, "PRAGMA foreign_keys")
+    {:ok, [[legacy_alter_table]]} = DB.query(db, "PRAGMA legacy_alter_table")
+    :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
+    :ok = DB.execute(db, "PRAGMA legacy_alter_table = ON")
+
+    try do
+      case DB.transaction(db, &upgrade_effort_holder_activity_cancellation_v1_in_txn/1) do
+        {:ok, :ok} ->
+          :ok
+
+        {:error, %ShapeError{} = error} ->
+          raise error
+
+        {:error, error} ->
+          raise ShapeError,
+            message:
+              "incompatible_effort_holder_activity_cancellation_v1: migration failed: #{Exception.message(error)}"
+      end
+    after
+      :ok = DB.execute(db, "PRAGMA legacy_alter_table = #{legacy_alter_table}")
+      :ok = DB.execute(db, "PRAGMA foreign_keys = #{foreign_keys}")
+    end
+  end
+
+  defp upgrade_effort_holder_activity_cancellation_v1_in_txn(%Txn{} = txn) do
+    case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+      [[shape]]
+      when shape in [
+             @assignment_source_replacement_shape,
+             @notice_source_payload_shape,
+             @decision_request_row_schema_shape
+           ] ->
+        if effort_holder_activity_cancellation_active?(txn) do
+          Enum.each(
+            Enum.filter(@effort_holder_activity_cancellation_objects, fn object ->
+              object.name in [
+                "effort_holder_activity_cancellation_epoch",
+                "wake_cancellations",
+                "wake_cancellations_pending_insert",
+                "wakes_typed_cancellation_required"
+              ]
+            end),
+            &validate_owned_object!(txn, &1)
+          )
+
+          :ok
+        else
+          migrate_effort_holder_activity_cancellation_v1_in_txn(txn)
+        end
+
+      rows ->
+        raise ShapeError,
+          message:
+            "incompatible_effort_holder_activity_cancellation_v1 predecessor: #{inspect(rows)}"
+    end
+  end
+
+  defp migrate_effort_holder_activity_cancellation_v1_in_txn(txn) do
+    previous_fk_violations =
+      Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(wake_cancellations))
+
+    old_table =
+      Enum.find(@assignment_source_replacement_liveness_objects, &(&1.name == "wake_cancellations"))
+
+    new_table =
+      Enum.find(@effort_holder_activity_cancellation_objects, &(&1.name == "wake_cancellations"))
+
+    marker =
+      Enum.find(@effort_holder_activity_cancellation_objects, fn object ->
+        object.name == "effort_holder_activity_cancellation_epoch"
+      end)
+
+    trigger_names = ~w(wake_cancellations_pending_insert wakes_typed_cancellation_required)
+
+    old_triggers =
+      Enum.filter(@assignment_source_replacement_liveness_objects, fn object ->
+        object.type == "trigger" and object.name in trigger_names
+      end)
+
+    new_triggers =
+      Enum.filter(@effort_holder_activity_cancellation_objects, fn object ->
+        object.type == "trigger" and object.name in trigger_names
+      end)
+
+    validate_owned_object!(txn, old_table)
+    Enum.each(old_triggers, &validate_owned_object!(txn, &1))
+    Enum.each(old_triggers, &Txn.exec(txn, "DROP TRIGGER #{&1.name}"))
+
+    [[cancellation_count]] = Txn.q(txn, "SELECT COUNT(*) FROM wake_cancellations")
+
+    :ok =
+      Txn.exec(
+        txn,
+        "ALTER TABLE wake_cancellations RENAME TO wake_cancellations_effort_activity_previous_v1"
+      )
+
+    :ok = Txn.exec(txn, new_table.sql)
+
+    columns =
+      "wakeId,wakeState,canceledAt,requesterKind,requesterId,reasonKind," <>
+        "causalSourceKind,causalSourceId,outcomeKind,replacementWakeId," <>
+        "dispositionKind,dispositionId,primaryWorkKind,primaryWorkId,workImpactKind," <>
+        "livenessTriggerKind,livenessTriggerId,actionNeeded"
+
+    Txn.q(
+      txn,
+      "INSERT INTO wake_cancellations (#{columns}) SELECT #{columns} FROM wake_cancellations_effort_activity_previous_v1"
+    )
+
+    if Txn.changes(txn) != cancellation_count do
+      raise ShapeError,
+        message:
+          "effort holder activity cancellation migration copied #{Txn.changes(txn)} of #{cancellation_count} rows"
+    end
+
+    [[^cancellation_count]] = Txn.q(txn, "SELECT COUNT(*) FROM wake_cancellations")
+    :ok = Txn.exec(txn, "DROP TABLE wake_cancellations_effort_activity_previous_v1")
+    Enum.each(new_triggers, &Txn.exec(txn, &1.sql))
+    :ok = Txn.exec(txn, marker.sql)
+
+    Txn.q(
+      txn,
+      "INSERT INTO effort_holder_activity_cancellation_epoch (id,shape,activatedAt,principal) VALUES (0,?1,?2,'process:tightbeam')",
+      [@effort_holder_activity_cancellation_shape, System.system_time(:millisecond)]
+    )
+
+    validate_owned_object!(txn, new_table)
+    Enum.each(new_triggers, &validate_owned_object!(txn, &1))
+    validate_owned_object!(txn, marker)
+
+    case Tightbeam.Schema.migration_foreign_keys_in_txn(txn, ~w(wake_cancellations)) --
+           previous_fk_violations do
+      [] ->
+        :ok
+
+      rows ->
+        raise ShapeError,
+          message:
+            "effort holder activity cancellation migration left invalid foreign keys: #{inspect(rows)}"
     end
   end
 

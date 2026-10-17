@@ -317,6 +317,7 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     assert :ok = Wakes.fire_due(ctx.scheduler)
     [reminder] = pending_reminders(ctx.db, root.wake_id)
     delivered_root = Wakes.get(ctx.db, root.wake_id)
+    assert is_integer(delivered_root.delivered_turn_seq)
 
     assert {:ok, _} =
              DB.query(

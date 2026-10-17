@@ -1241,7 +1241,7 @@ defmodule Tightbeam.EffortCheckinTest do
     assert prod.prompt =~ "Only a qualifying unresolved dependency wait pauses the effort horizon"
     refute prod.prompt =~ "or say what is happening"
 
-    assert %{attest: %{kind: "progress"}} =
+    assert %{attest: %{id: activity_attest_id, kind: "progress"}} =
              assignment(ctx, "attest", {:session, "holder"}, "holder", %{
                assignment_id: silent.id,
                kind: "progress",
@@ -1249,6 +1249,17 @@ defmodule Tightbeam.EffortCheckinTest do
              })
 
     assert Wakes.get(ctx.db, prod.wake_id).state == "canceled"
+
+    assert %{
+             requester: "tightbeam:effort-checkin",
+             reason: "superseded",
+             source_kind: "progress_attest",
+             source_id: ^activity_attest_id,
+             outcome: "no_replacement",
+             liveness_kind: nil,
+             liveness_id: nil,
+             action_needed: 0
+           } = cancellation(ctx.db, prod.wake_id)
 
     assert rows(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE assignmentId=?1", [
              silent.id

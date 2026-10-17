@@ -7365,7 +7365,7 @@ defmodule Tightbeam.Wakes do
   end
 
   defp select_wake_sql(extra_columns \\ "") do
-    "SELECT wakeId, sessionKey, targetRole, origin, prompt, consumer, dueAt, state, createdAt, firedAt, reresolve, reresolveSeed, reresolveRung, conditionKind, conditionScope, conditionAfterId, firedBy, creatorSessionKey, rumination, work_item_id, assignmentId, canceledAt, targetGate, class, classElection, deliveryRule, digest, summon, ownerUserId, obligationRef, waitMode, predicate, resolverKind, resolverId, resolverHolder, resolverAddressee, necessity, verificationAssignmentId, verificationHolderKey, selectedPolicyName, verificationState, verificationAttestId, verificationNoticeWakeId, originatingTurnSeq, recognitionAt, recognitionPath, recognitionReason, recognitionEvidence, recognitionDisposition, recognitionTransition#{extra_columns} FROM wakes"
+    "SELECT wakeId, sessionKey, targetRole, origin, prompt, consumer, dueAt, state, createdAt, firedAt, reresolve, reresolveSeed, reresolveRung, conditionKind, conditionScope, conditionAfterId, firedBy, creatorSessionKey, rumination, work_item_id, assignmentId, canceledAt, targetGate, class, classElection, deliveryRule, digest, summon, ownerUserId, obligationRef, waitMode, predicate, resolverKind, resolverId, resolverHolder, resolverAddressee, necessity, verificationAssignmentId, verificationHolderKey, selectedPolicyName, verificationState, verificationAttestId, verificationNoticeWakeId, originatingTurnSeq, recognitionAt, recognitionPath, recognitionReason, recognitionEvidence, recognitionDisposition, recognitionTransition, deliveredTurnSeq#{extra_columns} FROM wakes"
   end
 
   defp to_wake([
@@ -7418,7 +7418,8 @@ defmodule Tightbeam.Wakes do
          recognition_reason,
          recognition_evidence,
          recognition_disposition,
-         recognition_transition
+         recognition_transition,
+         delivered_turn_seq
        ]) do
     %{
       wake_id: wake_id,
@@ -7470,7 +7471,8 @@ defmodule Tightbeam.Wakes do
       recognition_reason: recognition_reason,
       recognition_evidence: decode_optional(recognition_evidence),
       recognition_disposition: recognition_disposition,
-      recognition_transition: decode_optional(recognition_transition)
+      recognition_transition: decode_optional(recognition_transition),
+      delivered_turn_seq: delivered_turn_seq
     }
   end
 
