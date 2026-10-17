@@ -213,6 +213,7 @@ defmodule Tightbeam.AssignmentsTest do
         |> put_in([:params, :effect_kind], "coordination")
 
       assignment = handle(ctx, "assign", assignment_call)
+      assert ConditionFacts.latest(ctx.db, "assignment-landed", assignment.id) == nil
 
       wake =
         Wakes.schedule(ctx.db, %{
@@ -511,9 +512,20 @@ defmodule Tightbeam.AssignmentsTest do
     assert hint.kind == "assignment-landed"
     assert hint.scope == assignment.id
     assert hint.fallback_after == "2h"
+
+    assert hint.record_dependency.conditions == [
+             %{fact: "assignment.state", op: "eq", value: "closed"}
+           ]
+
+    assert hint.record_dependency.bindings == %{"assignmentId" => assignment.id}
+    assert hint.record_dependency.message =~ "not a complete --predicate"
+    assert hint.record_dependency.message =~ "caller-selected resolverRef"
+    assert hint.record_dependency.message =~ "nonblank necessity"
+    assert hint.record_dependency.message =~ "same-owner open assignment"
     assert hint.message =~ "--when-fact assignment-landed"
-    assert hint.message =~ "--when-scope #{assignment.id}"
-    assert hint.message =~ "--fallback-after 2h"
+    assert hint.message =~ "assignmentId=#{assignment.id}"
+    assert hint.message =~ "assignment.state"
+    assert hint.message =~ "completion attestation only"
 
     assert %{condition_wake_hint: replay_hint} = dispatch!(ctx, dispatch)
     assert replay_hint.scope == assignment.id
@@ -531,6 +543,9 @@ defmodule Tightbeam.AssignmentsTest do
     assert result.fact_hint.kind == "assignment-landed"
     assert result.fact_hint.scope == assignment.id
     assert result.fact_hint.message =~ "Advisory:"
+    assert result.fact_hint.record_dependency == hint.record_dependency
+    assert result.fact_hint.message =~ "assignment.state"
+    assert result.fact_hint.message =~ "completion-attestation producer"
 
     no_hint =
       ctx.handlers["wake"].(
