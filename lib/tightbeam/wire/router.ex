@@ -2871,7 +2871,7 @@ defmodule Tightbeam.Wire.Router do
     "revoke-device" => ~w(device_id)a,
     "deny-device" => ~w(device_id)a,
     "approve-device" => ~w(device_id user_id)a,
-    "assignment-get" => ~w(assignment_id)a,
+    "assignment-get" => ~w(assignment_id fact_id)a,
     "add-user" => ~w(is_admin user_id)a,
     "answer" => ~w(answer idempotency_key reason request request_id)a,
     "artifact-content-fetch" => ~w(artifact_id)a,

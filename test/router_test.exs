@@ -3131,6 +3131,29 @@ defmodule Tightbeam.Wire.RouterTest do
 
     assert JSON.decode!(facts.resp_body)["result"] == %{"exists" => false, "fact" => nil}
 
+    assignment_opts =
+      with_handler(ctx.opts, "assignment-get", fn call ->
+        send(parent, {:assignment_call, call})
+        %{accepted: true}
+      end)
+
+    assignment =
+      dispatch_cli(%{ctx | opts: assignment_opts}, "tbc_test", %{
+        verb: "assignment-get",
+        asUser: "flynn",
+        params: %{assignmentId: "assignment-example", factId: 42}
+      })
+
+    assert assignment.status == 200
+
+    assert_receive {:assignment_call,
+                    %{
+                      verb: "assignment-get",
+                      params: %{assignment_id: "assignment-example", fact_id: 42}
+                    }}
+
+    assert JSON.decode!(assignment.resp_body)["result"] == %{"accepted" => true}
+
     list_opts =
       with_handler(ctx.opts, "inspect", fn _call ->
         %{sessions: [%{session_key: "agent:tour:app", created_at: 123}]}

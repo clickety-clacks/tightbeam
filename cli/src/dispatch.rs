@@ -1232,6 +1232,17 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
             vec![],
             vec![string_field("assignmentId", assignment_id)],
         )),
+        Command::AssignmentGet {
+            identity,
+            assignment_id,
+            fact_id,
+        } => {
+            let mut params = vec![string_field("assignmentId", assignment_id)];
+            if let Some(fact_id) = fact_id {
+                params.push(format!("\"factId\":{fact_id}"));
+            }
+            Ok(request(identity, "assignment-get", vec![], params))
+        }
         Command::Assignments {
             identity,
             target,
@@ -3557,6 +3568,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::WorkItemFail { identity, .. }
         | Command::Attest { identity, .. }
         | Command::Attests { identity, .. }
+        | Command::AssignmentGet { identity, .. }
         | Command::Assignments { identity, .. }
         | Command::CancelWake { identity, .. }
         | Command::SettleTurn { identity, .. }
@@ -4669,6 +4681,25 @@ mod tests {
                 "flynn",
             ]),
             r#"{"asUser":"flynn","verb":"assignments","sessionKey":"s1","params":{"state":"all"}}"#
+        );
+    }
+
+    #[test]
+    fn builds_byte_exact_assignment_get_bodies() {
+        assert_eq!(
+            body(&[
+                "assignment-get",
+                "assignment-example",
+                "--fact-id",
+                "42",
+                "--as-user",
+                "flynn",
+            ]),
+            r#"{"asUser":"flynn","verb":"assignment-get","params":{"assignmentId":"assignment-example","factId":42}}"#
+        );
+        assert_eq!(
+            body(&["assignment-get", "assignment-example"]),
+            r#"{"verb":"assignment-get","params":{"assignmentId":"assignment-example"}}"#
         );
     }
 

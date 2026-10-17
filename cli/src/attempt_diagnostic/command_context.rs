@@ -114,6 +114,7 @@ impl CommandContext {
             WorkItemFail { .. } => ("cli.work_item_fail", DispatchPath),
             Attest { .. } => ("cli.attest", DispatchPath),
             Attests { .. } => ("cli.attests", DispatchPath),
+            AssignmentGet { .. } => ("cli.assignment_get", DispatchPath),
             Assignments { .. } => ("cli.assignments", DispatchPath),
             CancelWake { .. } => ("cli.cancel_wake", DispatchPath),
             SettleTurn { .. } => ("cli.settle_turn", Requests::VersionAndDispatch),
@@ -310,6 +311,7 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | DurableToplines { .. }
         | DurableTopline { .. }
         | Attests { .. }
+        | AssignmentGet { .. }
         | Assignments { .. }
         | IdentityStatus { .. }
         | KungfuList { .. }
