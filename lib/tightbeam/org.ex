@@ -10,7 +10,8 @@ defmodule Tightbeam.Org do
     EventLog,
     Keyset,
     NoticeBatcher,
-    TerminalCredentialFailure
+    TerminalCredentialFailure,
+    Wakes
   }
 
   alias Tightbeam.DB.Txn
@@ -999,10 +1000,139 @@ defmodule Tightbeam.Org do
 
     if Txn.changes(txn) != 1, do: raise("retirement state changed before commit")
 
+    readdress_retirement_notices_in_txn!(txn, session_key)
+
     session = stamp_session_change_in_txn(txn, session_key, retirement_epoch)
     publish_session_in_txn(txn, "session.retired", session)
     session
   end
+
+  defp readdress_retirement_notices_in_txn!(txn, session_key) do
+    Txn.q(
+      txn,
+      """
+      SELECT w.wakeId,w.targetRole,w.reresolve,w.reresolveSeed,w.reresolveRung
+      FROM wakes w
+      LEFT JOIN roles r ON r.name=w.targetRole
+      WHERE w.state='pending' AND w.consumer='prompt'
+        AND ((w.targetRole IS NULL AND w.sessionKey=?1) OR r.boundSessionKey=?1)
+      ORDER BY w.createdAt,w.wakeId
+      """,
+      [session_key]
+    )
+    |> Enum.each(fn row -> readdress_retired_notice_in_txn!(txn, session_key, row) end)
+  end
+
+  defp readdress_retired_notice_in_txn!(
+         txn,
+         session_key,
+         [wake_id, target_role, reresolve, seed, rung]
+       ) do
+    case retirement_replacement_target(txn, session_key, target_role, reresolve, seed, rung) do
+      nil ->
+        cancel_retired_notice!(txn, session_key, wake_id, %{kind: "no_replacement"}, nil)
+
+      replacement_target ->
+        case Wakes.retarget_in_txn(txn, wake_id, replacement_target, ordinary_address: true) do
+          %{wake_id: replacement_wake_id} ->
+            after_cancellation =
+              case NoticeBatcher.preserve_retargeted_source_in_txn(
+                     txn,
+                     wake_id,
+                     replacement_wake_id
+                   ) do
+                :not_batched ->
+                  nil
+
+                {:immutable_delivery, %{delivery_wake_id: delivery_wake_id}} ->
+                  {:supersede_by_carrier, replacement_wake_id, delivery_wake_id}
+
+                {:error, refusal} ->
+                  raise "retirement replacement batching refused: #{inspect(refusal)}"
+              end
+
+            cancel_retired_notice!(
+              txn,
+              session_key,
+              wake_id,
+              %{kind: "replacement", replacement_wake_id: replacement_wake_id},
+              after_cancellation
+            )
+
+          :error ->
+            raise "retirement replacement refused for #{wake_id}"
+        end
+    end
+  end
+
+  defp retirement_replacement_target(txn, _session_key, target_role, _reresolve, _seed, _rung)
+       when is_binary(target_role) do
+    case Txn.q(
+           txn,
+           "SELECT ownerUserId FROM roles WHERE name=?1",
+           [target_role]
+         ) do
+      [[owner_user_id]] -> active_personal_key(txn, owner_user_id)
+      [] -> nil
+    end
+  end
+
+  defp retirement_replacement_target(txn, _session_key, nil, "lineage", seed, rung)
+       when is_binary(seed) and is_integer(rung) and rung > 0 do
+    Tightbeam.Supervision.ladder_target(txn, seed, rung)
+  end
+
+  defp retirement_replacement_target(_txn, _session_key, _role, _reresolve, _seed, _rung),
+    do: nil
+
+  defp active_personal_key(txn, owner_user_id) do
+    main_key = personal_session_key(owner_user_id)
+
+    case Txn.q(
+           txn,
+           "SELECT 1 FROM sessions WHERE sessionKey=?1 AND state='active'",
+           [main_key]
+         ) do
+      [[1]] -> main_key
+      [] -> nil
+    end
+  end
+
+  defp cancel_retired_notice!(txn, session_key, wake_id, outcome, after_cancellation) do
+    command = %{
+      wake_id: wake_id,
+      requester: %{kind: "process", id: "tightbeam:retirement"},
+      reason_kind: "target_retired",
+      causal_source: %{kind: "session_transition", id: session_key},
+      outcome: outcome
+    }
+
+    unless Wakes.cancel_in_txn(txn, command) do
+      raise "typed retirement cancellation refused for #{wake_id}"
+    end
+
+    finalize_retirement_replacement_in_txn!(txn, after_cancellation)
+  end
+
+  defp finalize_retirement_replacement_in_txn!(_txn, nil), do: :ok
+
+  defp finalize_retirement_replacement_in_txn!(
+         txn,
+         {:supersede_by_carrier, replacement_wake_id, delivery_wake_id}
+       ) do
+    command = %{
+      wake_id: replacement_wake_id,
+      requester: %{kind: "process", id: "tightbeam:batcher"},
+      reason_kind: "superseded",
+      causal_source: %{kind: "wake", id: delivery_wake_id},
+      outcome: %{kind: "replacement", replacement_wake_id: delivery_wake_id}
+    }
+
+    unless Wakes.cancel_in_txn(txn, command) do
+      raise "retirement replacement carrier supersession refused for #{replacement_wake_id}"
+    end
+  end
+
 
   @doc "Repoint a retired session to another archetype and its base identity."
   @spec repoint_retired_archetype(db(), String.t(), String.t()) ::

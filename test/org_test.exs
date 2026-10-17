@@ -154,7 +154,7 @@ defmodule Tightbeam.OrgTest do
     {:ok, [["retired"]]} = DB.query(db, "SELECT state FROM sessions WHERE sessionKey = 'k1'")
   end
 
-  test "retirement cancels gated direct and role targets, replaces the role, and preserves ungated delivery",
+  test "retirement ends unrouteable notices and stores role replacements as ordinary addresses",
        %{db: db} do
     main_key = Org.personal_session_key("flynn")
     Org.create(db, base(%{session_key: main_key, kind: "main", is_built_in: true}))
@@ -238,7 +238,8 @@ defmodule Tightbeam.OrgTest do
     assert %{
              state: "pending",
              session_key: ^main_key,
-             target_role: "reviewer",
+             target_role: nil,
+             reresolve: nil,
              prompt: "role",
              due_at: 9_001
            } = Wakes.get(db, replacement_wake_id)
@@ -275,8 +276,13 @@ defmodule Tightbeam.OrgTest do
 
     assert retained == JSON.decode!(encoded_attachments)
 
-    assert %{state: "pending"} = Wakes.get(db, ungated.wake_id)
-    assert cancellation(db, ungated.wake_id) == nil
+    assert %{state: "canceled"} = Wakes.get(db, ungated.wake_id)
+
+    assert %{
+             requester: "tightbeam:retirement",
+             reason: "target_retired",
+             outcome: "no_replacement"
+           } = cancellation(db, ungated.wake_id)
 
     {:ok, [[wake_count]]} = DB.query(db, "SELECT count(*) FROM wakes")
     {:ok, [[cancellation_count]]} = DB.query(db, "SELECT count(*) FROM wake_cancellations")
@@ -343,7 +349,8 @@ defmodule Tightbeam.OrgTest do
     replacement = Wakes.get(db, replacement_wake_id)
     assert replacement.state == "pending"
     assert replacement.session_key == main_key
-    assert replacement.target_role == "reviewer"
+    assert replacement.target_role == nil
+    assert replacement.reresolve == nil
     assert replacement.prompt == original.prompt
     assert replacement.origin == original.origin
     assert replacement.creator_session_key == original.creator_session_key
@@ -486,7 +493,8 @@ defmodule Tightbeam.OrgTest do
     replacement = Wakes.get(db, replacement_id)
     assert replacement.state == "pending"
     assert replacement.session_key == main_key
-    assert replacement.target_role == original.target_role
+    assert replacement.target_role == nil
+    assert replacement.reresolve == nil
     assert replacement.prompt == original.prompt
     assert replacement.origin == original.origin
     assert replacement.creator_session_key == original.creator_session_key
@@ -631,7 +639,6 @@ defmodule Tightbeam.OrgTest do
               :prompt,
               :origin,
               :creator_session_key,
-              :target_role,
               :class,
               :class_election,
               :delivery_rule,
@@ -947,7 +954,7 @@ defmodule Tightbeam.OrgTest do
              DB.query(db, "SELECT COUNT(*) FROM sessions WHERE sessionKey='retiring'")
   end
 
-  test "retirement refuses and rolls back when linked open work has no surviving liveness", %{
+  test "retirement ends a linked notice without requiring a liveness trigger", %{
     db: db
   } do
     Org.create(db, base(%{session_key: "retiring"}))
@@ -967,13 +974,18 @@ defmodule Tightbeam.OrgTest do
         work_item_id: "orphan"
       })
 
-    assert_raise RuntimeError, ~r/no liveness trigger/, fn ->
-      Org.retire(db, "retiring", "user:flynn", 1_000)
-    end
+    assert %{state: "retired"} = Org.retire(db, "retiring", "user:flynn", 1_000)
+    assert Wakes.get(db, wake.wake_id).state == "canceled"
 
-    assert Org.get(db, "retiring").state == "active"
-    assert Wakes.get(db, wake.wake_id).state == "pending"
-    assert cancellation(db, wake.wake_id) == nil
+    assert %{
+             requester: "tightbeam:retirement",
+             reason: "target_retired",
+             source_kind: "session_transition",
+             source_id: "retiring",
+             outcome: "no_replacement",
+             work_impact: "linked_work_open",
+             action_needed: 0
+           } = cancellation(db, wake.wake_id)
   end
 
   test "spawned-by provenance is retained", %{db: db} do

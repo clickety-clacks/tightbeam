@@ -1,7 +1,7 @@
 defmodule Tightbeam.NoticeDrainTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Gateway, Ledger, Schema, SessionLane, Wakes}
+  alias Tightbeam.{DB, Gateway, Ledger, Org, Schema, SessionLane, Wakes}
 
   setup do
     db = start_supervised!({DB, path: ":memory:", name: nil})
@@ -119,7 +119,7 @@ defmodule Tightbeam.NoticeDrainTest do
 
   for scope <- [:all, :recipient] do
     @scope scope
-    test "#{scope} drain delivers a lineage notice to the successor after a respawn", ctx do
+    test "#{scope} drain uses the retirement-stored lineage address", ctx do
       :ok =
         DB.execute(ctx.db, """
         INSERT INTO sessions(sessionKey,displayName,ownerUserId,origin,archetype,harness,provider,model,host,spawnedBy,createdAt,updatedAt)
@@ -143,10 +143,9 @@ defmodule Tightbeam.NoticeDrainTest do
         })
 
       # Preserve the child's creation parent while recording its current parent
-      # after the original recipient retires and its successor takes over.
+      # before the recipient retirement transaction readdresses its notice.
       :ok =
         DB.execute(ctx.db, """
-        UPDATE sessions SET state='retired' WHERE sessionKey='recipient';
         INSERT INTO session_reparent_events(eventId,ownerUserId,childSessionKey,assignmentId,workItemId,
           originParentSessionKey,previousCurrentParentSessionKey,newCurrentParentSessionKey,
           originAssignmentOpenerKind,originAssignmentOpenerRef,newCurrentCoordinationParentSessionKey,
@@ -155,6 +154,23 @@ defmodule Tightbeam.NoticeDrainTest do
           'recipient','recipient','successor','user','owner','successor',
           'owner_topology_correction','user','user:owner','lineage-reparent','lineage-reparent',2);
         """)
+
+      assert %{state: "retired"} = Org.retire(ctx.db, "recipient", "user:owner")
+
+      assert %{state: "canceled"} = Wakes.get(ctx.db, wake.wake_id)
+
+      assert {:ok, [[replacement_wake_id]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT replacementWakeId FROM wake_cancellations WHERE wakeId=?1 AND requesterId='tightbeam:retirement'",
+                 [wake.wake_id]
+               )
+
+      assert is_binary(replacement_wake_id)
+      replacement = Wakes.get(ctx.db, replacement_wake_id)
+      assert replacement.session_key == "successor"
+      assert replacement.target_role == nil
+      assert replacement.reresolve == nil
 
       recipient = if @scope == :recipient, do: "successor", else: nil
 
@@ -166,8 +182,7 @@ defmodule Tightbeam.NoticeDrainTest do
                  recipient
                )
 
-      assert Wakes.get(ctx.db, wake.wake_id).session_key == "recipient"
-      assert Wakes.get(ctx.db, wake.wake_id).state == "fired"
+      assert Wakes.get(ctx.db, replacement_wake_id).state == "fired"
 
       assert {:ok, [["successor", seq]]} =
                DB.query(ctx.db, "SELECT sessionKey,seq FROM turns WHERE wakeId=?1", [carrier])
@@ -177,7 +192,7 @@ defmodule Tightbeam.NoticeDrainTest do
       assert {:ok, [[^seq]]} =
                DB.query(ctx.db, "SELECT deliveredTurnSeq FROM wakes WHERE wakeId=?1", [carrier])
 
-      assert Enum.map(Wakes.digest_members(ctx.db, carrier), & &1.wake_id) == [wake.wake_id]
+      assert Enum.map(Wakes.digest_members(ctx.db, carrier), & &1.wake_id) == [replacement_wake_id]
 
       assert Tightbeam.NoticeBatcher.recover(
                ctx.db,

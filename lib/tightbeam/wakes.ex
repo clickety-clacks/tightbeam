@@ -3807,8 +3807,16 @@ defmodule Tightbeam.Wakes do
   @spec retarget_in_txn(Txn.t(), String.t(), String.t()) :: wake() | :error
   def retarget_in_txn(%Txn{} = txn, wake_id, replacement_target)
       when is_binary(wake_id) and is_binary(replacement_target) do
+    retarget_in_txn(txn, wake_id, replacement_target, [])
+  end
+
+  @doc false
+  @spec retarget_in_txn(Txn.t(), String.t(), String.t(), keyword()) :: wake() | :error
+  def retarget_in_txn(%Txn{} = txn, wake_id, replacement_target, options)
+      when is_binary(wake_id) and is_binary(replacement_target) and is_list(options) do
     replacement_id = "w_" <> Tightbeam.Id.uuid4()
     created_at = now()
+    ordinary_address? = Keyword.get(options, :ordinary_address, false)
 
     with [[1]] <-
            Txn.q(
@@ -3836,15 +3844,15 @@ defmodule Tightbeam.Wakes do
         [
           replacement_id,
           replacement_target,
-          source.target_role,
+          if(ordinary_address?, do: nil, else: source.target_role),
           source.origin,
           source.prompt,
           source.consumer,
           due_at,
           created_at,
-          source.reresolve,
-          source.reresolve_seed,
-          source.reresolve_rung,
+          if(ordinary_address?, do: nil, else: source.reresolve),
+          if(ordinary_address?, do: nil, else: source.reresolve_seed),
+          if(ordinary_address?, do: nil, else: source.reresolve_rung),
           source.condition_kind,
           source.condition_scope,
           source.condition_after_id,
@@ -3895,6 +3903,8 @@ defmodule Tightbeam.Wakes do
       _ -> :error
     end
   end
+
+  def retarget_in_txn(%Txn{}, _wake_id, _replacement_target, _options), do: :error
 
   def retarget_in_txn(%Txn{}, _wake_id, _replacement_target), do: :error
 
@@ -4502,7 +4512,8 @@ defmodule Tightbeam.Wakes do
         end
 
       nil ->
-        if exact_terminal_effort_request?(txn, command, outcome, wake, primary),
+        if retirement_no_replacement_without_liveness?(command, outcome) or
+             exact_terminal_effort_request?(txn, command, outcome, wake, primary),
           do: {:ok, %{liveness_kind: nil, liveness_id: nil, action_needed: 0}},
           else: :error
 
@@ -4510,6 +4521,20 @@ defmodule Tightbeam.Wakes do
         :error
     end
   end
+
+  defp retirement_no_replacement_without_liveness?(
+         %{
+           requester: %{kind: "process", id: "tightbeam:retirement"},
+           reason_kind: "target_retired",
+           causal_source: %{kind: "session_transition", id: session_key},
+           outcome: %{kind: "no_replacement"} = outcome
+         },
+         %{kind: "no_replacement"} = outcome
+       )
+       when is_binary(session_key),
+       do: true
+
+  defp retirement_no_replacement_without_liveness?(_command, _outcome), do: false
 
   # An open effort request is itself the agent's exit. Once the current
   # expecter transitions that exact request, the transition is sufficient
