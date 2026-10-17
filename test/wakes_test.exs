@@ -227,6 +227,59 @@ defmodule Tightbeam.WakesTest do
     assert cancellation_event_count(db, wake.wake_id) == 1
   end
 
+  test "sender can retract its linked pending notice after the inactivity ladder is exhausted", %{
+    db: db
+  } do
+    parent_relation_fixture(db, false)
+
+    wake =
+      Wakes.schedule(db, %{
+        session_key: "accountable-parent",
+        origin: "agent:parent",
+        creator_session_key: "accountable-parent",
+        assignment_id: "asg_parent_relation",
+        work_item_id: "wi_parent_relation",
+        prompt: "retract this authored notice",
+        due_at: 1
+      })
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND state='pending' AND consumer IN ('assignment_inactivity_deadline','assignment_inactivity_climb')",
+               ["asg_parent_relation"]
+             )
+
+    command =
+      public_cancel_command(
+        wake.wake_id,
+        "agent:parent",
+        %{kind: "session", id: "accountable-parent"}
+      )
+
+    assert {:ok, {:ok, %{kind: "no_replacement"}}} =
+             DB.transaction(db, fn txn ->
+               Wakes.public_cancellation_outcome_in_txn(txn, command)
+             end)
+
+    assert {:accepted_in_txn, _event_id, %{canceled: true}} =
+             public_cancel(
+               db,
+               wake.wake_id,
+               "agent:parent",
+               %{kind: "session", id: "accountable-parent"}
+             )
+
+    assert %{state: "canceled"} = Wakes.get(db, wake.wake_id)
+
+    assert {:ok, [["no_linked_work", 0]]} =
+             DB.query(
+               db,
+               "SELECT workImpactKind,actionNeeded FROM wake_cancellations WHERE wakeId=?1",
+               [wake.wake_id]
+             )
+  end
+
   test "public cancellation event, carrier, and CAS share one rollback boundary", %{db: db} do
     wake =
       Wakes.schedule(db, %{
@@ -896,6 +949,9 @@ defmodule Tightbeam.WakesTest do
     db: db,
     scheduler: scheduler
   } do
+    main = ensure_main_session(db, "wake-owner")
+    sender = session(db, "wake-sender", main.session_key)
+
     start_supervised!(
       {Wakes,
        db: db,
@@ -908,7 +964,8 @@ defmodule Tightbeam.WakesTest do
     wake =
       Wakes.schedule(db, %{
         session_key: "k1",
-        origin: "process:tightbeam",
+        origin: "session:#{sender.session_key}",
+        creator_session_key: sender.session_key,
         consumer: "missing_consumer",
         due_at: System.system_time(:millisecond)
       })
@@ -940,6 +997,53 @@ defmodule Tightbeam.WakesTest do
 
     assert subject == wake.wake_id
     assert detail =~ "missing_consumer"
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               db,
+               "SELECT COUNT(*) FROM messages WHERE sessionKey=?1 AND clientMessageId=?2",
+               [sender.session_key, "wake-undeliverable:#{wake.wake_id}"]
+             )
+  end
+
+  test "undeliverable sender failure is stored before its cancellation transaction commits", %{
+    db: db
+  } do
+    main = ensure_main_session(db, "wake-owner")
+    sender = session(db, "wake-sender", main.session_key)
+
+    wake =
+      Wakes.schedule(db, %{
+        session_key: "missing-recipient",
+        origin: "session:#{sender.session_key}",
+        creator_session_key: sender.session_key,
+        consumer: "missing_consumer",
+        due_at: 0
+      })
+
+    assert {:ok, {:canceled, {wake_id, sender_notice}}} =
+             DB.transaction(db, fn txn ->
+               result =
+                 Wakes.undeliverable_delivery_in_txn(
+                   txn,
+                   wake.wake_id,
+                   "unknown internal consumer",
+                   System.system_time(:millisecond),
+                   "consumer_unavailable"
+                 )
+
+               assert Txn.q(
+                        txn,
+                        "SELECT COUNT(*) FROM messages WHERE sessionKey=?1 AND clientMessageId=?2",
+                        [sender.session_key, "wake-undeliverable:#{wake.wake_id}"]
+                      ) == [[1]]
+
+               result
+             end)
+
+    assert wake_id == wake.wake_id
+    assert elem(sender_notice, 0) == wake.wake_id
+    assert Wakes.get(db, wake.wake_id).state == "canceled"
   end
 
   test "exiting internal consumer leaves its wake pending and does not crash the scheduler", %{

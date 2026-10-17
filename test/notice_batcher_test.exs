@@ -208,9 +208,4 @@ defmodule Tightbeam.NoticeBatcherTest do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 46)
   end
 
-  test "a malformed source-reconciliation record does not block a healthy delivered notice", %{
-    tmp_dir: tmp
-  } do
-    Tightbeam.NoticeBatcherFixture.run!(tmp, 48)
-  end
 end

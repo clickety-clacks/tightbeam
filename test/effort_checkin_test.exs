@@ -1241,6 +1241,15 @@ defmodule Tightbeam.EffortCheckinTest do
     assert prod.prompt =~ "Only a qualifying unresolved dependency wait pauses the effort horizon"
     refute prod.prompt =~ "or say what is happening"
 
+    assert %{attest: %{kind: "progress"}} =
+             assignment(ctx, "attest", {:session, "holder"}, "holder", %{
+               assignment_id: silent.id,
+               kind: "progress",
+               note: "material work recorded"
+             })
+
+    assert Wakes.get(ctx.db, prod.wake_id).state == "canceled"
+
     assert rows(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE assignmentId=?1", [
              silent.id
            ]) == [[0]]
@@ -1256,6 +1265,23 @@ defmodule Tightbeam.EffortCheckinTest do
     assert nil == fire_probe(ctx, recorded.id)
     assert silent_rearm(ctx.db, recorded.id)
     assert Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == recorded.id)) == []
+  end
+
+  test "assignment disposal retracts its pending effort holder prod", ctx do
+    item = work_item!(ctx.db, "effort prod disposal")
+    assigned = dispatch_for_item(ctx, {:session, "parent"}, "holder", "silent", item.id)
+
+    assert nil == fire_probe(ctx, assigned.id)
+    assert [prod] = Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == assigned.id))
+    assert prod.state == "pending"
+
+    _ =
+      assignment(ctx, "revoke-assignment", {:session, "parent"}, nil, %{
+        assignment_id: assigned.id
+      })
+
+    assert rows(ctx.db, "SELECT state FROM assignments WHERE id=?1", [assigned.id]) == [["closed"]]
+    assert Wakes.get(ctx.db, prod.wake_id).state == "canceled"
   end
 
   test "artifacts count only for the card's work item and unthreaded cards have none", ctx do

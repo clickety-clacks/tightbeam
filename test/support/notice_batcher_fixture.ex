@@ -1467,22 +1467,12 @@ defmodule Tightbeam.NoticeBatcherFixture do
                [oversized.wake_id]
              )
 
-    assert {:ok, [[0]]} =
+    assert {:ok, [[1]]} =
              DB.query(
                db,
                "SELECT COUNT(*) FROM messages WHERE sessionKey='agent:sender' AND clientMessageId=?1",
                ["wake-undeliverable:#{oversized.wake_id}"]
              )
-
-    assert count(db, "wake_source_reconciliation", "wakeId=?1", [oversized.wake_id]) == 1
-    start_scheduler(db, fn wake -> deliver(db, wake) end)
-
-    assert eventually(fn ->
-             count(db, "wake_source_reconciliation", "wakeId=?1", [oversized.wake_id]) == 0 and
-               count(db, "messages", "sessionKey='agent:sender' AND clientMessageId=?1", [
-                 "wake-undeliverable:#{oversized.wake_id}"
-               ]) == 1
-           end)
 
     assert Enum.any?(EventLog.lifecycle_events(db), fn event ->
              event.kind == "wake_undeliverable" and event.subject == oversized.wake_id
@@ -1527,22 +1517,12 @@ defmodule Tightbeam.NoticeBatcherFixture do
                [missing.wake_id]
              )
 
-    assert {:ok, [[0]]} =
+    assert {:ok, [[1]]} =
              DB.query(
                db,
                "SELECT COUNT(*) FROM messages WHERE sessionKey='agent:sender' AND clientMessageId=?1",
                ["wake-undeliverable:#{missing.wake_id}"]
              )
-
-    assert count(db, "wake_source_reconciliation", "wakeId=?1", [missing.wake_id]) == 1
-    start_scheduler(db, fn wake -> deliver(db, wake) end)
-
-    assert eventually(fn ->
-             count(db, "wake_source_reconciliation", "wakeId=?1", [missing.wake_id]) == 0 and
-               count(db, "messages", "sessionKey='agent:sender' AND clientMessageId=?1", [
-                 "wake-undeliverable:#{missing.wake_id}"
-               ]) == 1
-           end)
   end
 
   defp scenario(47, db) do
@@ -1602,59 +1582,6 @@ defmodule Tightbeam.NoticeBatcherFixture do
              first.wake_id,
              second.wake_id
            ]) == 4
-  end
-
-  defp scenario(48, db) do
-    seed_session(db, "agent:sender", "sender-owner")
-    seed_session(db, "agent:recipient", "recipient-owner")
-
-    [healthy, malformed] =
-      for prompt <- ["healthy source reconciliation", "malformed sibling reconciliation"] do
-        Wakes.schedule(db, %{
-          session_key: "agent:recipient",
-          origin: "session:agent:sender",
-          creator_session_key: "agent:sender",
-          prompt: prompt,
-          due_at: 0,
-          class: "fyi"
-        })
-      end
-
-    for wake <- [healthy, malformed] do
-      assert {:ok, {:appended, _, _, _}} =
-               DB.transaction(db, fn txn ->
-                 Gateway.deliver_prompt_in_txn(
-                   txn,
-                   wake.session_key,
-                   wake.origin,
-                   wake.prompt,
-                   wake_id: wake.wake_id,
-                   sender: wake.origin,
-                   fire_wake_in_txn: true
-                 )
-               end)
-    end
-
-    assert count(db, "wake_source_reconciliation", "wakeId=?1", [healthy.wake_id]) == 1
-    assert count(db, "wake_source_reconciliation", "wakeId=?1", [malformed.wake_id]) == 1
-
-    assert {:ok, []} =
-             DB.query(
-               db,
-               "UPDATE wake_source_reconciliation SET availableAt='invalid-deadline' WHERE wakeId=?1",
-               [malformed.wake_id]
-             )
-
-    scheduler = start_scheduler(db, fn wake -> deliver(db, wake) end)
-
-    assert eventually(fn ->
-             count(db, "wake_source_reconciliation", "wakeId=?1", [healthy.wake_id]) == 0
-           end)
-
-    assert count(db, "wake_source_reconciliation", "wakeId=?1", [malformed.wake_id]) == 1
-    assert Wakes.get(db, healthy.wake_id).delivered_turn_seq != nil
-    assert Wakes.get(db, malformed.wake_id).delivered_turn_seq != nil
-    :ok = GenServer.stop(scheduler)
   end
 
   defp scenario(35, db) do

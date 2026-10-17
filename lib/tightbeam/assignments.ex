@@ -2580,6 +2580,7 @@ defmodule Tightbeam.Assignments do
 
   defp insert_and_apply_lifecycle_attest(txn, call, assignment, holder) do
     attest = insert_attest(txn, call, assignment.id)
+    EffortCheckin.holder_activity_in_txn(txn, assignment.id, holder, attest)
     Wakes.record_terminal_handoff_action_in_txn(txn, holder, attest)
     result = apply_lifecycle_attest(txn, call, assignment, attest, holder)
     file_attest_condition_fact(txn, assignment, attest, result)

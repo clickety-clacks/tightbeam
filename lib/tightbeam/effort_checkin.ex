@@ -32,6 +32,7 @@ defmodule Tightbeam.EffortCheckin do
   alias Tightbeam.DB.Txn
 
   @origin "process:tightbeam"
+  @holder_prod_marker "effort-holder-prod:"
   @default_horizon_ms 14_400_000
   @default_priority 4
   @default_deadline_ms 86_400_000
@@ -371,9 +372,34 @@ defmodule Tightbeam.EffortCheckin do
         :ok
     end
 
+    clear_holder_prods_in_txn(txn, assignment_id, command)
     dispose_requests_in_txn(txn, assignment_id, command, row_context)
     :ok
   end
+
+  @doc false
+  def holder_activity_in_txn(%Txn{} = txn, assignment_id, holder, attest)
+      when is_binary(assignment_id) and is_binary(holder) and is_map(attest) do
+    if attest.bySession == holder and attest.assignmentId == assignment_id do
+      txn
+      |> pending_holder_prods(assignment_id, holder)
+      |> Enum.each(fn wake_id ->
+        unless Wakes.cancel_in_txn(txn, %{
+                 wake_id: wake_id,
+                 requester: %{kind: "process", id: "tightbeam:effort-checkin"},
+                 reason_kind: "superseded",
+                 causal_source: %{kind: "progress_attest", id: attest.id},
+                 outcome: %{kind: "no_replacement"}
+               }) do
+          raise DB.Error, message: "holder activity could not clear effort prod #{wake_id}"
+        end
+      end)
+    end
+
+    :ok
+  end
+
+  def holder_activity_in_txn(%Txn{}, _assignment_id, _holder, _attest), do: :ok
 
   @spec apply_prepared_rearms_in_txn(Txn.t(), map(), String.t(), [map()]) :: :ok
   def apply_prepared_rearms_in_txn(%Txn{} = txn, config, holder_key, prepared) do
@@ -1631,8 +1657,38 @@ defmodule Tightbeam.EffortCheckin do
           "An ordinary notification does not cover this assignment or pause effort. " <>
           "Only a qualifying unresolved dependency wait pauses the effort horizon.",
       due_at: now(),
-      assignment_id: generation.assignment_id
+      assignment_id: generation.assignment_id,
+      obligation_ref: holder_prod_ref(generation.assignment_id)
     })
+  end
+
+  def holder_prod_ref(assignment_id) when is_binary(assignment_id),
+    do: @holder_prod_marker <> assignment_id
+
+  defp pending_holder_prods(txn, assignment_id, holder) do
+    Txn.q(
+      txn,
+      "SELECT wakeId FROM wakes WHERE state='pending' AND consumer='prompt' " <>
+        "AND assignmentId=?1 AND sessionKey=?2 AND obligationRef=?3 ORDER BY createdAt,wakeId",
+      [assignment_id, holder, holder_prod_ref(assignment_id)]
+    )
+    |> Enum.map(fn [wake_id] -> wake_id end)
+  end
+
+  defp clear_holder_prods_in_txn(txn, assignment_id, command) do
+    txn
+    |> Txn.q(
+      "SELECT wakeId FROM wakes WHERE state='pending' AND consumer='prompt' " <>
+        "AND assignmentId=?1 AND obligationRef=?2 ORDER BY createdAt,wakeId",
+      [assignment_id, holder_prod_ref(assignment_id)]
+    )
+    |> Enum.each(fn [wake_id] ->
+      unless Wakes.cancel_in_txn(txn, Map.put(command, :wake_id, wake_id)) do
+        raise DB.Error, message: "assignment disposal could not clear effort prod #{wake_id}"
+      end
+    end)
+
+    :ok
   end
 
   defp channel_sentence(evidence) do

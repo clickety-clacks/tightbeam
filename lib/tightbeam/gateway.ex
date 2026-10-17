@@ -2251,13 +2251,6 @@ defmodule Tightbeam.Gateway do
                   source_id,
                   seq
                 ])
-
-                Wakes.enqueue_source_reconciliation_in_txn(
-                  txn,
-                  source_id,
-                  target,
-                  "delivered"
-                )
               end)
             end
 

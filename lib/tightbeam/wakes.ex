@@ -46,7 +46,6 @@ defmodule Tightbeam.Wakes do
   @miss_lateness_ms 60_000
   @decision_request_notice_marker "decision-request-notice:"
   @sentinel_stop_notice_marker "sentinel-stop-notice:"
-  @source_reconciliation_batch_size 100
 
   @type db :: GenServer.server()
 
@@ -211,17 +210,6 @@ defmodule Tightbeam.Wakes do
   );
   CREATE INDEX IF NOT EXISTS wake_retry_root
     ON wake_retry_attempts (rootWakeId, attempt);
-  CREATE TABLE IF NOT EXISTS wake_source_reconciliation (
-    id INTEGER PRIMARY KEY,
-    wakeId TEXT NOT NULL UNIQUE REFERENCES wakes(wakeId),
-    recipientSessionKey TEXT NOT NULL,
-    outcome TEXT NOT NULL CHECK (outcome IN ('delivered','delivery-failed')),
-    queuedAt INTEGER NOT NULL,
-    availableAt INTEGER NOT NULL,
-    attempt INTEGER NOT NULL DEFAULT 0 CHECK (attempt >= 0)
-  );
-  CREATE INDEX IF NOT EXISTS wake_source_reconciliation_due
-    ON wake_source_reconciliation (availableAt,id);
   """
 
   # AC4's retry guard is current-build storage. Do not install it during the
@@ -605,152 +593,63 @@ defmodule Tightbeam.Wakes do
         delivered_wake_id \\ nil
       ) do
     case DB.transaction(db, fn txn ->
-           rows =
-             Txn.q(
-               txn,
-               """
-               SELECT wakeId,outcome FROM wake_source_reconciliation
-               WHERE (?1 IS NULL OR recipientSessionKey=?1)
-                 AND (?2 IS NULL OR wakeId=?2)
-                 AND typeof(wakeId)='text' AND length(wakeId)>0
-                 AND typeof(recipientSessionKey)='text' AND length(recipientSessionKey)>0
-                 AND outcome IN ('delivered','delivery-failed')
-                 AND typeof(availableAt)='integer'
-                 AND availableAt<=?3
-               ORDER BY availableAt,id
-               LIMIT ?4
-               """,
-               [
-                 recipient_session_key,
-                 delivered_wake_id,
-                 now(),
-                 if(is_binary(delivered_wake_id), do: 1, else: @source_reconciliation_batch_size)
-               ]
-             )
+           rows = reconcilable_source_records(txn, recipient_session_key, delivered_wake_id)
 
-           Enum.reduce(rows, {[], []}, fn
-             [wake_id, outcome], {pending, effects}
+           Enum.reduce(rows, [], fn
+             [wake_id, outcome], failures
              when is_binary(wake_id) and outcome in ["delivered", "delivery-failed"] ->
                case reconcile_source_delivery_in_savepoint(txn, wake_id, outcome) do
-                 {:ok, new_effects} -> {pending, Enum.reverse(new_effects) ++ effects}
-                 {:error, _reason} -> {[wake_id | pending], effects}
+                 {:ok, _effects} -> failures
+                 {:error, _reason} -> [wake_id | failures]
                end
 
-             _malformed, acc ->
-               acc
+             malformed, failures ->
+               Logger.warning("malformed delivered source record ignored: #{inspect(malformed)}")
+               failures
            end)
          end) do
-      {:ok, {[], effects}} ->
-        Enum.each(Enum.reverse(effects), &publish_undeliverable_notice_safely/1)
-        :ok
-
-      {:ok, {pending, effects}} ->
-        Enum.each(Enum.reverse(effects), &publish_undeliverable_notice_safely/1)
-        {:error, {:source_reconciliation_pending, pending}}
+      {:ok, []} -> :ok
+      {:ok, failures} -> {:error, {:source_actions_unavailable, Enum.reverse(failures)}}
 
       {:error, error} ->
-        Logger.warning(
-          "delivered notice source reconciliation deferred: #{Exception.message(error)}"
-        )
+        Logger.warning("delivered source actions unavailable: #{Exception.message(error)}")
 
         {:error, error}
     end
   end
 
-  @doc false
-  def enqueue_source_reconciliation_in_txn(%Txn{} = txn, wake_id, recipient, outcome)
-      when is_binary(wake_id) and is_binary(recipient) and
-             outcome in ["delivered", "delivery-failed"] do
-    at = now()
+  defp reconcilable_source_records(txn, recipient_session_key, delivered_wake_id) do
+    filters = [recipient_session_key, delivered_wake_id]
 
     Txn.q(
       txn,
       """
-      INSERT INTO wake_source_reconciliation
-        (wakeId,recipientSessionKey,outcome,queuedAt,availableAt,attempt)
-      VALUES (?1,?2,?3,?4,?4,0)
-      ON CONFLICT(wakeId) DO NOTHING
+      SELECT wakeId,
+        CASE WHEN deliveredTurnSeq IS NOT NULL THEN 'delivered' ELSE 'delivery-failed' END
+      FROM wakes
+      WHERE (?1 IS NULL OR sessionKey=?1) AND (?2 IS NULL OR wakeId=?2)
+        AND (
+          (waitMode IS NOT NULL AND EXISTS (
+            SELECT 1 FROM supervision_liveness_sidecar s
+            WHERE s.wakeId=wakes.wakeId AND s.controllerOrigin='holder_continuation'
+              AND s.controllerState='pending'
+          ))
+          OR (deliveredTurnSeq IS NOT NULL AND substr(obligationRef,1,length(?3))=?3)
+          OR (deliveredTurnSeq IS NOT NULL AND substr(obligationRef,1,length(?4))=?4)
+        )
+        AND (
+          deliveredTurnSeq IS NOT NULL
+          OR EXISTS (
+            SELECT 1 FROM wake_cancellations c
+            WHERE c.wakeId=wakes.wakeId AND c.causalSourceKind='scheduler_delivery'
+              AND c.reasonKind IN ('target_unresolvable','consumer_unavailable')
+          )
+        )
+      ORDER BY COALESCE(deliveredTurnSeq, firedAt),wakeId
       """,
-      [wake_id, recipient, outcome, at]
-    )
-
-    :ok
-  end
-
-  def enqueue_source_reconciliation_in_txn(%Txn{}, _wake_id, _recipient, _outcome), do: :ok
-
-  @doc false
-  def pending_source_reconciliation_batch(db \\ DB, limit \\ @source_reconciliation_batch_size)
-      when is_integer(limit) and limit > 0 do
-    DB.query(
-      db,
-      "SELECT wakeId,recipientSessionKey FROM wake_source_reconciliation " <>
-        "WHERE typeof(wakeId)='text' AND length(wakeId)>0 " <>
-        "AND typeof(recipientSessionKey)='text' AND length(recipientSessionKey)>0 " <>
-        "AND outcome IN ('delivered','delivery-failed') " <>
-        "AND typeof(availableAt)='integer' AND availableAt<=?1 " <>
-        "ORDER BY availableAt,id LIMIT ?2",
-      [now(), limit]
+      filters ++ [@terminal_notice_marker, @terminal_action_marker]
     )
   end
-
-  @doc false
-  def acknowledge_source_reconciliation(db \\ DB, wake_id) when is_binary(wake_id) do
-    case DB.transaction(db, fn txn ->
-           Txn.q(txn, "DELETE FROM wake_source_reconciliation WHERE wakeId=?1", [wake_id])
-           :ok
-         end) do
-      {:ok, :ok} -> :ok
-      {:error, error} -> {:error, error}
-    end
-  end
-
-  def acknowledge_source_reconciliation(_db, _wake_id), do: :ok
-
-  @doc false
-  def next_source_reconciliation_delay(db \\ DB) do
-    case DB.query(
-           db,
-           "SELECT MIN(availableAt) FROM wake_source_reconciliation " <>
-             "WHERE typeof(wakeId)='text' AND length(wakeId)>0 " <>
-             "AND typeof(recipientSessionKey)='text' AND length(recipientSessionKey)>0 " <>
-             "AND outcome IN ('delivered','delivery-failed') " <>
-             "AND typeof(availableAt)='integer'",
-           []
-         ) do
-      {:ok, [[at]]} when is_integer(at) -> max(at - now(), 0)
-      _ -> nil
-    end
-  end
-
-  @doc false
-  def defer_source_reconciliation(db \\ DB, wake_id) when is_binary(wake_id) do
-    case DB.transaction(db, fn txn ->
-           case Txn.q(txn, "SELECT attempt FROM wake_source_reconciliation WHERE wakeId=?1", [
-                  wake_id
-                ]) do
-             [[attempt]] when is_integer(attempt) ->
-               next_attempt = attempt + 1
-               delay = min(1_000 * Integer.pow(2, min(next_attempt, 6)), 60_000)
-
-               Txn.q(
-                 txn,
-                 "UPDATE wake_source_reconciliation SET attempt=?2,availableAt=?3 WHERE wakeId=?1",
-                 [wake_id, next_attempt, now() + delay]
-               )
-
-               delay
-
-             _ ->
-               1_000
-           end
-         end) do
-      {:ok, delay} when is_integer(delay) -> delay
-      {:error, _error} -> 1_000
-    end
-  end
-
-  def defer_source_reconciliation(_db, _wake_id), do: 1_000
 
   defp reconcile_source_delivery_in_savepoint(txn, wake_id, wait_outcome) do
     :ok = Txn.exec(txn, "SAVEPOINT reconcile_notice_source")
@@ -787,14 +686,7 @@ defmodule Tightbeam.Wakes do
                 :ok
             end
 
-            if wait_outcome == "delivery-failed" do
-              case undeliverable_sender_notice_in_txn(txn, wake) do
-                nil -> []
-                effect -> [effect]
-              end
-            else
-              []
-            end
+            []
         end
 
       :ok = Txn.exec(txn, "RELEASE reconcile_notice_source")
@@ -851,14 +743,20 @@ defmodule Tightbeam.Wakes do
                   Txn.q(txn, "SELECT firedAt FROM wakes WHERE wakeId=?1", [wake_id])
 
                 if is_integer(delivered_at) do
-                  schedule_terminal_action_reminder_in_txn(
-                    txn,
-                    wake,
-                    event,
-                    delivered_to,
-                    nil,
-                    delivered_at
-                  )
+                  case terminal_notice_recipient_in_txn(txn, event) do
+                    {:ok, recipient} ->
+                      schedule_terminal_action_reminder_in_txn(
+                        txn,
+                        wake,
+                        event,
+                        recipient,
+                        nil,
+                        delivered_at
+                      )
+
+                    {:error, _reason} ->
+                      :ok
+                  end
                 end
 
               {:ok, _event} ->
@@ -1056,15 +954,19 @@ defmodule Tightbeam.Wakes do
 
     pattern = escape_like_prefix(prefix) <> "%"
 
-    case Txn.q(
-           txn,
-           "SELECT id FROM attests WHERE bySession=?1 AND kind='progress' " <>
-             "AND note LIKE ?2 ESCAPE ?3 LIMIT 1",
-           [parent, pattern, "\\"]
-         ) do
-      [[attest_id]] when is_binary(attest_id) -> attest_id
-      _ -> nil
-    end
+    txn
+    |> Txn.q(
+      "SELECT id,note FROM attests INDEXED BY attests_terminal_action_note " <>
+        "WHERE bySession=?1 AND kind='progress' AND note LIKE ?2 ESCAPE ?3 ORDER BY rowid",
+      [parent, pattern, "\\"]
+    )
+    |> Enum.find_value(fn
+      [attest_id, note] when is_binary(attest_id) and is_binary(note) ->
+        if terminal_action_note_matches?(note, event), do: attest_id
+
+      _ ->
+        nil
+    end)
   end
 
   defp escape_like_prefix(value) do
@@ -1110,7 +1012,6 @@ defmodule Tightbeam.Wakes do
          true <- root.prompt == root_prompt,
          relation = terminal_notice_relation(event),
          true <- Map.take(root, Map.keys(relation)) == relation,
-         true <- root.session_key == wake.session_key,
          true <- root.owner_user_id == wake.owner_user_id,
          true <- wake.condition_scope == root.wake_id,
          true <- wake.condition_kind == terminal_action_condition_kind(root.wake_id),
@@ -1122,7 +1023,7 @@ defmodule Tightbeam.Wakes do
          true <-
            Txn.q(
              txn,
-             "SELECT sessionKey FROM sessions WHERE sessionKey=?1 AND ownerUserId=?2 AND state='active'",
+             "SELECT sessionKey FROM sessions WHERE sessionKey=?1 AND ownerUserId=?2",
              [wake.session_key, event.owner_user_id]
            ) == [[wake.session_key]],
          true <- terminal_notice_has_delivery_turn_in_txn?(txn, root.wake_id, root.session_key) do
@@ -3953,10 +3854,51 @@ defmodule Tightbeam.Wakes do
       end
     end)
 
+    readdress_pending_terminal_action_reminders_in_txn(txn, work_item_id)
+
     :ok
   end
 
   def readdress_accountability_notices_in_txn(%Txn{}, _work_item_id), do: :ok
+
+  defp readdress_pending_terminal_action_reminders_in_txn(txn, work_item_id) do
+    reminder_ids =
+      Txn.q(
+        txn,
+        """
+        SELECT reminder.wakeId
+        FROM wakes reminder
+        JOIN wakes root ON root.wakeId=substr(reminder.obligationRef,length(?1)+1)
+        WHERE reminder.state='pending' AND reminder.consumer='prompt'
+          AND substr(reminder.obligationRef,1,length(?1))=?1
+          AND root.work_item_id=?2
+          AND substr(root.obligationRef,1,length(?3))=?3
+        ORDER BY reminder.createdAt,reminder.wakeId
+        """,
+        [@terminal_action_marker, work_item_id, @terminal_notice_marker]
+      )
+      |> Enum.map(fn [wake_id] -> wake_id end)
+
+    Enum.each(reminder_ids, fn wake_id ->
+      wake = get_in_txn(txn, wake_id)
+
+      with {:ok, _root, event} <- terminal_action_root_event_in_txn(txn, wake),
+           {:ok, replacement_target} <- terminal_notice_recipient_in_txn(txn, event),
+           {:ok, _readdressed} <- readdress_pending_in_txn(txn, wake_id, replacement_target) do
+        :ok
+      else
+        {:error, refusal} ->
+          raise DB.Error,
+            message: "terminal action reminder readdress refused for #{wake_id}: #{inspect(refusal)}"
+
+        other ->
+          raise DB.Error,
+            message: "terminal action reminder readdress could not resolve #{wake_id}: #{inspect(other)}"
+      end
+    end)
+
+    :ok
+  end
 
   @doc false
   def decision_request_notice_ref(request_id) when is_binary(request_id),
@@ -4221,7 +4163,7 @@ defmodule Tightbeam.Wakes do
   def public_cancellation_outcome_in_txn(%Txn{} = txn, command) when is_map(command) do
     with {:ok, wake} <- pending_wake(txn, command),
          :ok <- authorize_cancel(command, wake),
-         {:ok, primary} <- primary_work(txn, wake) do
+         {:ok, primary} <- cancellation_primary_work(txn, command, wake) do
       {:ok, public_cancellation_outcome(txn, primary)}
     else
       _ -> :error
@@ -4268,6 +4210,9 @@ defmodule Tightbeam.Wakes do
 
   defp cancellation_primary_work(txn, command, wake) do
     cond do
+      sender_withdrew_own_notice?(command) ->
+        {:ok, %{kind: nil, id: nil, impact: "no_linked_work"}}
+
       scheduler_delivery_without_source?(command, wake) ->
         {:ok, %{kind: nil, id: nil, impact: "no_linked_work"}}
 
@@ -4278,6 +4223,15 @@ defmodule Tightbeam.Wakes do
         primary_work(txn, wake)
     end
   end
+
+  defp sender_withdrew_own_notice?(%{
+         requester: %{kind: kind},
+         reason_kind: "requester_withdrew"
+       })
+       when kind in ["session", "user"],
+       do: true
+
+  defp sender_withdrew_own_notice?(_command), do: false
 
   defp decision_request_notice_clear?(
          txn,
@@ -4572,6 +4526,23 @@ defmodule Tightbeam.Wakes do
     end
   end
 
+  defp durable_source(
+         txn,
+         %{
+           requester: %{kind: "process", id: "tightbeam:effort-checkin"},
+           reason_kind: "superseded"
+         },
+         "progress_attest",
+         source_id,
+         wake,
+         _canceled_at
+       )
+       when is_binary(source_id) and source_id != "" do
+    if effort_holder_prod_attest?(txn, source_id, wake),
+      do: {:ok, source_id, nil},
+      else: :error
+  end
+
   defp durable_source(txn, _command, source_kind, source_id, wake, _canceled_at)
        when source_kind != "verb_call" and is_binary(source_id) and source_id != "" do
     case validate_source(txn, source_kind, source_id, wake) do
@@ -4824,6 +4795,7 @@ defmodule Tightbeam.Wakes do
       nil ->
         if retirement_no_replacement_without_liveness?(command, outcome) or
              exact_terminal_effort_request?(txn, command, outcome, wake, primary) or
+             cleared_effort_holder_prod_without_liveness?(txn, command, outcome, wake, primary) or
              completed_assignment_without_liveness?(txn, command, outcome, wake, primary) or
              cleared_decision_notice_without_liveness?(txn, command, outcome, wake, primary),
            do: {:ok, %{liveness_kind: nil, liveness_id: nil, action_needed: 0}},
@@ -4934,6 +4906,42 @@ defmodule Tightbeam.Wakes do
   end
 
   defp exact_terminal_effort_request?(_txn, _command, _outcome, _wake, _primary), do: false
+
+  defp cleared_effort_holder_prod_without_liveness?(
+         txn,
+         %{
+           requester: %{kind: "process", id: "tightbeam:effort-checkin"},
+           reason_kind: "superseded",
+           causal_source: %{kind: "progress_attest", id: attest_id},
+           outcome: %{kind: "no_replacement"} = outcome
+         },
+         %{kind: "no_replacement"} = outcome,
+         wake,
+         %{kind: "assignment", id: assignment_id, impact: "linked_work_open"}
+       )
+       when wake.assignment_id == assignment_id and is_binary(attest_id) do
+    effort_holder_prod_attest?(txn, attest_id, wake)
+  end
+
+  defp cleared_effort_holder_prod_without_liveness?(_txn, _command, _outcome, _wake, _primary),
+    do: false
+
+  defp effort_holder_prod_attest?(txn, attest_id, wake) do
+    assignment_id = wake.assignment_id
+    holder = wake.session_key
+
+    is_binary(assignment_id) and is_binary(holder) and
+      wake.obligation_ref == Tightbeam.EffortCheckin.holder_prod_ref(assignment_id) and
+      Txn.q(
+        txn,
+        """
+        SELECT 1 FROM attests t JOIN assignments a ON a.id=t.assignmentId
+        WHERE t.id=?1 AND t.assignmentId=?2 AND t.bySession=?3
+          AND a.holderKey=?3 AND a.state='open'
+        """,
+        [attest_id, assignment_id, holder]
+      ) == [[1]]
+  end
 
   # The plain 3-arity form is every OTHER caller of this check (today, only
   # `validate_liveness/5`'s `pending_wake` clause, which is not a batcher
@@ -6175,10 +6183,10 @@ defmodule Tightbeam.Wakes do
       when is_binary(recipient_session_key) and is_binary(wake_id) do
     case GenServer.whereis(Tightbeam.WakeScheduler) do
       pid when is_pid(pid) ->
-        GenServer.cast(pid, :source_reconciliation_ready)
+        GenServer.cast(pid, {:source_records_changed, recipient_session_key, wake_id})
 
       nil ->
-        # The durable outbox row remains for the scheduler's startup recovery.
+        # Delivered records remain the source owners' durable recovery input.
         :ok
     end
   catch
@@ -6187,51 +6195,13 @@ defmodule Tightbeam.Wakes do
 
   def delivery_outcome_committed(_db, _recipient_session_key, _wake_id), do: :ok
 
-  defp reconcile_delivery_outcome(db, recipient_session_key, wake_id) do
+  defp reconcile_delivery_source_records(db, recipient_session_key, wake_id) do
     wake_result = reconcile_delivered_sources(db, recipient_session_key, wake_id)
-
-    work_item_result =
-      WorkItems.reconcile_delivered_brackets(db, recipient_session_key, wake_id)
+    work_item_result = WorkItems.reconcile_delivered_brackets(db, recipient_session_key, wake_id)
 
     case {wake_result, work_item_result} do
-      {:ok, :ok} ->
-        case acknowledge_source_reconciliation(db, wake_id) do
-          :ok ->
-            :ok
-
-          {:error, reason} ->
-            delay = defer_source_reconciliation(db, wake_id)
-
-            Logger.warning(
-              "wake source reconciliation acknowledgement deferred: #{inspect(reason)}"
-            )
-
-            {:deferred, delay}
-        end
-
-      failures ->
-        delay = defer_source_reconciliation(db, wake_id)
-        Logger.warning("wake source reconciliation deferred: #{inspect(failures)}")
-        {:deferred, delay}
-    end
-  end
-
-  defp reconcile_pending_source_batch(db) do
-    case pending_source_reconciliation_batch(db) do
-      {:ok, rows} ->
-        results =
-          Enum.map(rows, fn
-            [wake_id, recipient] when is_binary(wake_id) and is_binary(recipient) ->
-              {wake_id, recipient, reconcile_delivery_outcome(db, recipient, wake_id)}
-
-            _malformed ->
-              {nil, nil, {:error, :malformed_source_reconciliation_row}}
-          end)
-
-        {:ok, results, length(rows) == @source_reconciliation_batch_size}
-
-      {:error, error} ->
-        {:error, error}
+      {:ok, :ok} -> :ok
+      failures -> Logger.warning("source-owned delivered-record action failed: #{inspect(failures)}")
     end
   end
 
@@ -6278,7 +6248,6 @@ defmodule Tightbeam.Wakes do
       retries: %{},
       retry_attempts: %{},
       detected_misses: MapSet.new(),
-      source_batch_running: false,
       scanned_through: -1,
       batch: Keyword.get(opts, :batch, 100),
       delivery_opts: Keyword.get(opts, :delivery_opts, []),
@@ -6287,7 +6256,6 @@ defmodule Tightbeam.Wakes do
 
     Process.send_after(self(), :detect_misses, @miss_detector_ms)
     send(self(), :recover_notices)
-    send(self(), :recover_source_reconciliations)
     Process.send_after(self(), :backfill_wake_delivery, 100)
 
     {:ok, invalid} =
@@ -6342,6 +6310,8 @@ defmodule Tightbeam.Wakes do
   end
 
   def handle_cast({:recipient_ready, session_key}, state) do
+    reconcile_delivery_source_records(state.db, session_key, nil)
+
     DB.background_pass(fn ->
       deliver_eligible_waits(state.db, state.delivery_opts, session_key)
       NoticeBatcher.recover(state.db, now(), state.delivery_opts, session_key)
@@ -6350,13 +6320,14 @@ defmodule Tightbeam.Wakes do
     {:noreply, arm_due_timer(state)}
   end
 
-  def handle_cast(:source_reconciliation_ready, state) do
-    send(self(), :recover_source_reconciliations)
+  def handle_cast({:source_records_changed, recipient_session_key, wake_id}, state) do
+    reconcile_delivery_source_records(state.db, recipient_session_key, wake_id)
     {:noreply, state}
   end
 
   @impl true
   def handle_info(:recover_notices, state) do
+    reconcile_delivery_source_records(state.db, nil, nil)
     # Recognize overdue conditions before recovery forms a carrier. Otherwise
     # a timed source can occupy the recipient ahead of its due condition peers.
     DB.background_pass(fn -> evaluate_conditions(state, :tick) end)
@@ -6364,71 +6335,6 @@ defmodule Tightbeam.Wakes do
     # only by recipient readiness and due events.
     NoticeBatcher.recover(state.db, now(), state.delivery_opts)
     {:noreply, state}
-  end
-
-  def handle_info(:recover_source_reconciliations, %{source_batch_running: true} = state),
-    do: {:noreply, state}
-
-  def handle_info(:recover_source_reconciliations, state) do
-    scheduler = self()
-
-    case Task.start(fn ->
-           result =
-             try do
-               reconcile_pending_source_batch(state.db)
-             rescue
-               error -> {:error, {:exception, error}}
-             catch
-               kind, reason -> {:error, {kind, reason}}
-             end
-
-           send(scheduler, {:source_reconciliation_batch, result})
-         end) do
-      {:ok, _pid} ->
-        {:noreply, %{state | source_batch_running: true}}
-
-      {:error, reason} ->
-        Logger.warning("could not start pending wake source reconciliation: #{inspect(reason)}")
-        Process.send_after(self(), :recover_source_reconciliations, 1_000)
-        {:noreply, state}
-    end
-  end
-
-  def handle_info({:source_reconciliation_batch, {:ok, results, more}}, state) do
-    Enum.each(results, fn
-      {_wake_id, _recipient, :ok} ->
-        :ok
-
-      {wake_id, recipient, {:deferred, delay}} when is_binary(wake_id) and is_binary(recipient) ->
-        Logger.warning("wake source reconciliation deferred for #{wake_id} by #{delay}ms")
-
-      {wake_id, recipient, {:error, _reason}}
-      when is_binary(wake_id) and is_binary(recipient) ->
-        Logger.warning("wake source reconciliation remains pending for #{wake_id}")
-
-      _ ->
-        :ok
-    end)
-
-    if more, do: Process.send_after(self(), :recover_source_reconciliations, 100)
-
-    if not more do
-      case next_source_reconciliation_delay(state.db) do
-        delay when is_integer(delay) ->
-          Process.send_after(self(), :recover_source_reconciliations, max(delay, 1))
-
-        _ ->
-          :ok
-      end
-    end
-
-    {:noreply, %{state | source_batch_running: false}}
-  end
-
-  def handle_info({:source_reconciliation_batch, {:error, error}}, state) do
-    Logger.warning("pending wake source reconciliation batch deferred: #{inspect(error)}")
-    Process.send_after(self(), :recover_source_reconciliations, 1_000)
-    {:noreply, %{state | source_batch_running: false}}
   end
 
   def handle_info(:backfill_wake_delivery, state) do
@@ -6939,15 +6845,8 @@ defmodule Tightbeam.Wakes do
 
         if cancel_in_txn(txn, command, fn -> at end) do
           EventLog.lifecycle_in_txn(txn, "wake_undeliverable", wake_id, reason)
-
-          enqueue_source_reconciliation_in_txn(
-            txn,
-            wake_id,
-            wake.session_key,
-            "delivery-failed"
-          )
-
-          {:canceled, {wake.wake_id, nil}}
+          sender_notice = undeliverable_sender_notice_in_txn(txn, wake)
+          {:canceled, {wake.wake_id, sender_notice}}
         else
           :unresolved
         end
@@ -7027,23 +6926,27 @@ defmodule Tightbeam.Wakes do
   # silently eat a decision request while the record showed it delivered.
   #
   # No new state value: `canceled` already means "will not be delivered", and the
-  # named lifecycle row carries WHY. Recording is best-effort so an unavailable
-  # sink cannot fail this notice's delivery pass.
+  # named lifecycle row carries WHY. The sender notice is stored with that outcome;
+  # only publishing it to a connected client happens after commit.
   defp undeliverable(db, wake, reason) do
     Logger.error("wake #{wake.wake_id} undeliverable: #{reason}")
 
-    canceled =
-      transaction!(db, fn txn ->
-        cancel_in_txn(txn, %{
-          wake_id: wake.wake_id,
-          requester: %{kind: "process", id: "tightbeam:wake-scheduler"},
-          reason_kind: "consumer_unavailable",
-          causal_source: %{kind: "scheduler_delivery", id: wake.wake_id},
-          outcome: %{kind: "no_replacement"}
-        })
-      end)
+    case transaction!(db, fn txn ->
+           undeliverable_delivery_in_txn(
+             txn,
+             wake.wake_id,
+             reason,
+             now(),
+             "consumer_unavailable"
+           )
+         end) do
+      {:canceled, {wake_id, sender_notice}} ->
+        publish_undeliverable_notice_safely(sender_notice)
+        delivery_outcome_committed(db, wake.session_key, wake_id)
 
-    if canceled, do: best_effort_lifecycle(db, "wake_undeliverable", wake.wake_id, reason)
+      _ ->
+        :ok
+    end
   end
 
   # Keep failed internal work pending and record each attempt. The scheduler

@@ -349,6 +349,41 @@ defmodule Tightbeam.WorkItemsTest do
     assert {:ok, []} = DB.query(ctx.db, "PRAGMA foreign_key_check")
   end
 
+  test "source-owned recovery rearms a delivered routing bracket after its callback is missed", ctx do
+    _main = ensure_main_session(ctx.db, "flynn")
+    item = create(ctx, {:user, "flynn"}, %{title: "Recover delivered routing bracket"})
+
+    assert {:ok, [[wake_id]]} =
+             DB.query(ctx.db, "SELECT routingWakeId FROM work_items WHERE id=?1", [item.id])
+
+    wake = Tightbeam.Wakes.get(ctx.db, wake_id)
+
+    assert {:ok, {:appended, _target, _message, _opts}} =
+             DB.transaction(ctx.db, fn txn ->
+               Gateway.deliver_prompt_in_txn(
+                 txn,
+                 wake.session_key,
+                 wake.origin,
+                 wake.prompt,
+                 wake_id: wake.wake_id
+               )
+             end)
+
+    assert {:ok, [[delivered_turn_seq]]} =
+             DB.query(ctx.db, "SELECT deliveredTurnSeq FROM wakes WHERE wakeId=?1", [wake_id])
+
+    assert is_integer(delivered_turn_seq)
+    assert :ok = WorkItems.reconcile_delivered_brackets(ctx.db)
+
+    assert {:ok, [[replacement_id]]} =
+             DB.query(ctx.db, "SELECT routingWakeId FROM work_items WHERE id=?1", [item.id])
+
+    refute replacement_id == wake_id
+
+    assert %{state: "pending", session_key: wake.session_key} =
+             Tightbeam.Wakes.get(ctx.db, replacement_id)
+  end
+
   test "Firehose work-item routing callback failure rolls back rows and notices", ctx do
     alias Tightbeam.Firehose.Hub
     hub = start_supervised!({Hub, name: nil})

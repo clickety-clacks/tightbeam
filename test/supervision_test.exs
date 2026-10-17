@@ -293,14 +293,17 @@ defmodule Tightbeam.SupervisionTest do
     assert {:ok, reconciliation_plan} =
              DB.query(
                ctx.db,
-               "EXPLAIN QUERY PLAN SELECT wakeId,recipientSessionKey FROM wake_source_reconciliation " <>
-                 "WHERE outcome IN ('delivered','delivery-failed') AND availableAt<=?1 " <>
-                 "ORDER BY availableAt,id LIMIT ?2",
-               [System.system_time(:millisecond), 100]
+               "EXPLAIN QUERY PLAN SELECT wakeId FROM wakes INDEXED BY wakes_delivered_turn " <>
+                 "WHERE deliveredTurnSeq IS NOT NULL AND " <>
+                 "(substr(obligationRef,1,length(?1))=?1 OR substr(obligationRef,1,length(?2))=?2)",
+               [
+                 "terminal-child-owner-notification:",
+                 "terminal-child-owner-action-reminder:"
+               ]
              )
 
     assert Enum.any?(reconciliation_plan, fn [_, _, _, detail] ->
-             String.contains?(detail, "wake_source_reconciliation_due")
+             String.contains?(detail, "wakes_delivered_turn")
            end)
 
     assert {:ok, terminal_action_plan} =

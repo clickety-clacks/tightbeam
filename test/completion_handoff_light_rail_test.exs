@@ -127,6 +127,35 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     refute third.wake_id in [first.wake_id, second.wake_id]
   end
 
+  test "startup recovers a terminal reminder when the gateway stops after root delivery", ctx do
+    {_parent_assignment, _child_assignment, root} = completed_child(ctx)
+    set_due_now(ctx.db, root.wake_id)
+
+    assert {:ok, {:appended, _recipient, _message, _opts}} =
+             DB.transaction(ctx.db, fn txn ->
+               Gateway.deliver_prompt_in_txn(
+                 txn,
+                 root.session_key,
+                 root.origin,
+                 root.prompt,
+                 wake_id: root.wake_id,
+                 sender: root.origin,
+                 target_gate: root,
+                 fire_wake_in_txn: true
+               )
+             end)
+
+    assert Wakes.get(ctx.db, root.wake_id).delivered_turn_seq != nil
+    assert reminders(ctx.db, root.wake_id) == []
+
+    stop_supervised!(ctx.scheduler)
+    restarted = start_scheduler(ctx.db)
+    assert :ok = Wakes.fire_due(restarted)
+
+    assert [reminder] = pending_reminders(ctx.db, root.wake_id)
+    assert reminder.session_key == "notice-parent"
+  end
+
   test "a retired opener is routed to Main when the finish notice is stored", ctx do
     item = create_work_item(ctx, "completion with retired opener")
     personal = Org.personal_session_key("flynn")
@@ -273,6 +302,41 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     assert turn_count(ctx.db, successor.wake_id) == 0
     assert pending_reminders(ctx.db, root.wake_id) == []
     assert length(reminders(ctx.db, root.wake_id)) == 2
+  end
+
+  test "accountability changes move a pending terminal-action reminder and retain root delivery history",
+       ctx do
+    {_parent_assignment, _child_assignment, root} = completed_child(ctx)
+
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    root_carrier_id = assert_delivered_carrier(ctx.db, root.wake_id)
+    finish_carrier_turn!(ctx.db, root_carrier_id)
+    [reminder] = pending_reminders(ctx.db, root.wake_id)
+    delivered_root = Wakes.get(ctx.db, root.wake_id)
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey='notice-parent'")
+
+    assert %{deliveryOwnerSessionKey: "other-parent"} =
+             handle(
+               ctx,
+               "work-item-update",
+               call("work-item-update", {:user, "flynn"}, nil, %{
+                 work_item_id: delivered_root.work_item_id,
+                 delivery_owner_session_key: "other-parent"
+               })
+             )
+
+    assert %{state: "pending", session_key: "other-parent", prompt: prompt, due_at: due_at} =
+             Wakes.get(ctx.db, reminder.wake_id)
+
+    assert prompt == reminder.prompt
+    assert due_at == reminder.due_at
+
+    assert %{state: "fired", session_key: "notice-parent", delivered_turn_seq: delivered_seq} =
+             Wakes.get(ctx.db, root.wake_id)
+
+    assert delivered_seq == delivered_root.delivered_turn_seq
   end
 
   test "a valid action receipt remains stopping evidence after its assignment closes", ctx do
@@ -450,6 +514,29 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     before = turn_count(ctx.db, pending.wake_id)
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert turn_count(ctx.db, pending.wake_id) == before
+  end
+
+  test "a malformed action note does not suppress the first terminal reminder", ctx do
+    {parent_assignment, child_assignment, root} = completed_child(ctx)
+    [source_kind, source_token] = terminal_source(root.prompt)
+
+    malformed =
+      "completion-handoff-action #{child_assignment.id} #{source_kind} #{source_token} " <>
+        "kept without the required colon and detail"
+
+    assert %{attest: %{kind: "progress"}} =
+             handle(
+               ctx,
+               "attest",
+               progress_call({:session, "notice-parent"}, parent_assignment.id, malformed)
+             )
+
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    root_carrier_id = assert_delivered_carrier(ctx.db, root.wake_id)
+    finish_carrier_turn!(ctx.db, root_carrier_id)
+
+    assert [reminder] = pending_reminders(ctx.db, root.wake_id)
+    assert reminder.session_key == "notice-parent"
   end
 
   test "an action at the fallback boundary either stops the pending wake or cancels its successor",
