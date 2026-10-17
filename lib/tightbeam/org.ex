@@ -979,7 +979,7 @@ defmodule Tightbeam.Org do
           "retirement requires a non-empty principal"
   end
 
-  defp retire_active_in_txn(txn, session_key, principal) do
+  defp retire_active_in_txn(txn, session_key, _principal) do
     retirement_epoch = now()
 
     Txn.q(

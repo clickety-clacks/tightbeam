@@ -1022,7 +1022,7 @@ defmodule Tightbeam.AssignmentsTest do
 
     for old_state <- [:queued, :running] do
       @old_recipient_state old_state
-      test "accountability changes do not readdress a stored notice",
+      test "accountability changes do not readdress a stored notice while the old recipient is #{@old_recipient_state}",
            ctx do
         {assignment, wake, personal} = terminal_delivery_fixture(ctx, "completion")
 
