@@ -143,11 +143,18 @@ defmodule Tightbeam.SupervisionTest do
       })
 
     assert wake.created_at < wake.due_at
-    assert Wakes.get(ctx.db, old_deadline.wake_id).state == "canceled"
 
     deadline = pending_deadline!(ctx.db, "asg_inactive")
     assert deadline.due_at == wake.created_at + interval_ms
     assert deadline.due_at < wake.due_at
+
+    if deadline.wake_id == old_deadline.wake_id do
+      # Opening and registration can share one millisecond, making the old
+      # row already the exact deadline derived from the registration time.
+      assert old_deadline.due_at == wake.created_at + interval_ms
+    else
+      assert Wakes.get(ctx.db, old_deadline.wake_id).state == "canceled"
+    end
 
     assert {:ok, :ignored} =
              DB.transaction(ctx.db, fn txn ->
