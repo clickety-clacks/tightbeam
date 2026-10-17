@@ -497,12 +497,14 @@ defmodule Tightbeam.NoticeBatcherFixture do
     assert Wakes.get(db, old_carrier).state == "fired"
     assert deliver(db, Wakes.get(db, unresolved.wake_id)) == :skipped
     assert Wakes.get(db, unresolved.wake_id).state == "canceled"
+
     assert {:ok, [["target_unresolvable", "scheduler_delivery", "no_replacement"]]} =
              DB.query(
                db,
                "SELECT reasonKind,causalSourceKind,outcomeKind FROM wake_cancellations WHERE wakeId=?1",
                [unresolved.wake_id]
              )
+
     assert count(db, "turns", "sessionKey=?1", [unresolved.session_key]) == 0
     assert NoticeBatcher.recover(db, unresolved.due_at) == []
     assert NoticeBatcher.batch(db, old_batch) == failed
