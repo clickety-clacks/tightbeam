@@ -1007,7 +1007,7 @@ defmodule Tightbeam.Supervision do
               {"open", replacement_id} when is_binary(replacement_id) ->
                 Wakes.cancel_in_txn(txn, %{
                   wake_id: wake_id,
-                  requester: %{kind: "process", id: "tightbeam:supervision"},
+                  requester: %{kind: "process", id: "tightbeam:assignments"},
                   reason_kind: "superseded",
                   causal_source: %{kind: "wake", id: replacement_id},
                   outcome: %{kind: "replacement", replacement_wake_id: replacement_id}

@@ -722,6 +722,7 @@ defmodule Tightbeam.NoticeBatcherFixture do
   defp scenario(23, db) do
     lane = [session: "agent:payload-floor"]
     seed_session(db, "agent:payload-floor", "payload-floor-owner")
+    seed_session(db, "agent:sender", "sender-owner")
     codex_recipient!(db, "agent:payload-floor")
     set_lane_policy(db, lane, false)
 
@@ -739,13 +740,24 @@ defmodule Tightbeam.NoticeBatcherFixture do
     assert byte_size(source.prompt) == 4 * 1_048_576
     assert source.delivery_rule == NoticeBatcher.rule()
     assert_retired_tables_absent!(db)
-    assert_capacity_hold!(db, [source], source.due_at)
+    assert NoticeBatcher.recover(db, source.due_at) == []
+    assert Wakes.get(db, source.wake_id).state == "canceled"
+    assert {:ok, [["consumer_unavailable", "scheduler_delivery", "no_replacement"]]} =
+             DB.query(
+               db,
+               "SELECT reasonKind,causalSourceKind,outcomeKind FROM wake_cancellations WHERE wakeId=?1",
+               [source.wake_id]
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               db,
+               "SELECT COUNT(*) FROM messages WHERE sessionKey='agent:sender' AND clientMessageId=?1",
+               ["wake-undeliverable:#{source.wake_id}"]
+             )
+
     later = fyi(db, Keyword.put(lane, :prompt, "fits after withdrawal"))
-    assert_capacity_hold!(db, [source, later], later.due_at)
-    assert Wakes.get(db, source.wake_id).prompt == source.prompt
-    assert Wakes.get(db, source.wake_id).delivery_rule == NoticeBatcher.rule()
-    withdraw!(db, source)
-    [carrier] = Wakes.materialize_digests(db, later.due_at)
+    [carrier] = NoticeBatcher.recover(db, later.due_at)
     assert_actual_carrier!(db, carrier, [later.wake_id])
     assert Wakes.get(db, source.wake_id).state == "canceled"
     assert NoticeBatcher.source_refs(db, source.wake_id) == []
@@ -767,6 +779,8 @@ defmodule Tightbeam.NoticeBatcherFixture do
       seed_session(db, session, owner)
       codex_recipient!(db, session)
     end
+
+    seed_session(db, "agent:sender", "sender-owner")
 
     # Measure the complete real turn prompt, including Gateway's sender stamp
     # and the immutable carrier envelope. Each fresh recipient starts at seq 1;
@@ -821,9 +835,21 @@ defmodule Tightbeam.NoticeBatcherFixture do
     assert overflow.delivery_rule == NoticeBatcher.rule()
     assert Wakes.get(db, overflow.wake_id).state == "pending"
     assert NoticeBatcher.source_refs(db, overflow.wake_id) == []
-    assert_capacity_hold!(db, [overflow], overflow.due_at)
-    assert Wakes.get(db, overflow.wake_id).delivery_rule == NoticeBatcher.rule()
-    assert Wakes.get(db, overflow.wake_id).prompt == overflow.prompt
+    assert NoticeBatcher.recover(db, overflow.due_at) == []
+    assert Wakes.get(db, overflow.wake_id).state == "canceled"
+    assert {:ok, [["consumer_unavailable", "scheduler_delivery", "no_replacement"]]} =
+             DB.query(
+               db,
+               "SELECT reasonKind,causalSourceKind,outcomeKind FROM wake_cancellations WHERE wakeId=?1",
+               [overflow.wake_id]
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               db,
+               "SELECT COUNT(*) FROM messages WHERE sessionKey='agent:sender' AND clientMessageId=?1",
+               ["wake-undeliverable:#{overflow.wake_id}"]
+             )
 
     assert Enum.any?(EventLog.lifecycle_events(db), fn event ->
              event.kind == "notice_source_submission_too_large" and
@@ -831,9 +857,9 @@ defmodule Tightbeam.NoticeBatcherFixture do
            end)
 
     assert_actual_carrier!(db, fitting_carrier, [fitting.wake_id])
-    assert count(db, "notice_batches") == 2
-    assert count(db, "notice_batch_members") == 2
-    assert count(db, "turns") == 2
+    assert count(db, "notice_batches") == 1
+    assert count(db, "notice_batch_members") == 1
+    assert count(db, "turns") == 1
   end
 
   defp scenario(25, db) do
@@ -1929,38 +1955,6 @@ defmodule Tightbeam.NoticeBatcherFixture do
     assert prompt == "[from process:tightbeam]\n\n" <> Wakes.get(db, carrier).prompt
     assert scalar_count(prompt) <= 1_048_576
     prompt
-  end
-
-  defp assert_capacity_hold!(db, sources, at) do
-    assert NoticeBatcher.recover(db, at) == []
-
-    for source <- sources do
-      current = Wakes.get(db, source.wake_id)
-      assert current.state == "pending"
-      assert current.prompt == source.prompt
-      assert current.delivery_rule == NoticeBatcher.rule()
-      assert NoticeBatcher.source_refs(db, source.wake_id) == []
-      assert count(db, "turns", "wakeId=?1", [source.wake_id]) == 0
-    end
-
-    assert count(db, "notice_batches", "sessionKey=?1", [hd(sources).session_key]) == 0
-
-    assert count(db, "turns", "sessionKey=?1 AND wakeId IS NOT NULL", [hd(sources).session_key]) ==
-             0
-
-    assert Enum.any?(EventLog.lifecycle_events(db), fn event ->
-             if event.kind == "notice_source_submission_too_large" and
-                  event.subject == hd(sources).wake_id and
-                  event.detail =~ "receiver=codex " and
-                  event.detail =~ "limitChars=1048576 recipient=#{hd(sources).session_key}" do
-               case Regex.run(~r/textChars=(\d+) /, event.detail) do
-                 [_, chars] -> String.to_integer(chars) > 1_048_576
-                 _ -> false
-               end
-             else
-               false
-             end
-           end)
   end
 
   defp assert_retired_tables_absent!(db) do

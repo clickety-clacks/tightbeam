@@ -114,13 +114,13 @@ defmodule Tightbeam.NoticeBatcherTest do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 22)
   end
 
-  test "a Codex source exceeding the wrapped scalar limit stays editable without a bypass", %{
+  test "an oversized Codex source is disposed and does not block a later sibling", %{
     tmp_dir: tmp
   } do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 23)
   end
 
-  test "the complete Codex submission admits 1048576 scalars and holds the next scalar", %{
+  test "the complete Codex submission admits 1048576 scalars and disposes the next scalar", %{
     tmp_dir: tmp
   } do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 24)

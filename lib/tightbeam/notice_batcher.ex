@@ -1471,8 +1471,8 @@ defmodule Tightbeam.NoticeBatcher do
   defp source_delivery_target(txn, %{target_role: role}) when is_binary(role),
     do: Gateway.delivery_target(txn, nil, %{target_role: role})
 
-  defp source_delivery_target(txn, %{session_key: session_key}),
-    do: Gateway.delivery_target(txn, session_key, nil)
+  defp source_delivery_target(txn, %{session_key: session_key} = wake),
+    do: Gateway.delivery_target(txn, session_key, wake)
 
   defp recipient_lane(recipient) do
     target_role = recipient[:target_role]
