@@ -1552,30 +1552,34 @@ defmodule Tightbeam.Schema do
     }
     | Enum.map(@assignment_source_replacement_liveness_objects, fn
         %{name: "wake_cancellations", sql: sql} = object ->
-          old_no_replacement = """
-               ((workImpactKind = 'linked_work_open' AND livenessTriggerKind IS NOT NULL AND
-                 livenessTriggerId IS NOT NULL AND actionNeeded = 1)
-                OR
-                (workImpactKind != 'linked_work_open' AND livenessTriggerKind IS NULL AND
-                 livenessTriggerId IS NULL AND actionNeeded = 0))
-          """
+          no_replacement_anchor =
+            "(outcomeKind = 'no_replacement' AND replacementWakeId IS NULL AND"
 
-          new_no_replacement = """
-               ((workImpactKind = 'linked_work_open' AND livenessTriggerKind IS NOT NULL AND
-                 livenessTriggerId IS NOT NULL AND actionNeeded = 1)
-                OR
-                (workImpactKind = 'linked_work_open' AND livenessTriggerKind IS NULL AND
-                 livenessTriggerId IS NULL AND actionNeeded = 0 AND
-                 requesterKind = 'process' AND requesterId = 'tightbeam:effort-checkin' AND
-                 reasonKind = 'superseded' AND causalSourceKind = 'progress_attest')
-                OR
-                (workImpactKind != 'linked_work_open' AND livenessTriggerKind IS NULL AND
-                 livenessTriggerId IS NULL AND actionNeeded = 0))
-          """
+          no_replacement_arms =
+            ~r/\(\(workImpactKind = 'linked_work_open' AND livenessTriggerKind IS NOT NULL AND livenessTriggerId IS NOT NULL AND actionNeeded = 1\)\s+OR\s+\(workImpactKind != 'linked_work_open' AND livenessTriggerKind IS NULL AND livenessTriggerId IS NULL AND actionNeeded = 0\)\)/
 
-          true = String.contains?(sql, old_no_replacement)
+          holder_activity_arm =
+            "((workImpactKind = 'linked_work_open' AND livenessTriggerKind IS NOT NULL AND " <>
+              "livenessTriggerId IS NOT NULL AND actionNeeded = 1) OR " <>
+              "(workImpactKind = 'linked_work_open' AND livenessTriggerKind IS NULL AND " <>
+              "livenessTriggerId IS NULL AND actionNeeded = 0 AND requesterKind = 'process' AND " <>
+              "requesterId = 'tightbeam:effort-checkin' AND reasonKind = 'superseded' AND " <>
+              "causalSourceKind = 'progress_attest') OR " <>
+              "(workImpactKind != 'linked_work_open' AND livenessTriggerKind IS NULL AND " <>
+              "livenessTriggerId IS NULL AND actionNeeded = 0))"
 
-          sql = String.replace(sql, old_no_replacement, new_no_replacement, global: false)
+          true = String.contains?(sql, no_replacement_anchor)
+          [before_no_replacement, after_no_replacement] =
+            String.split(sql, no_replacement_anchor, parts: 2)
+
+          true = length(Regex.scan(no_replacement_arms, after_no_replacement)) == 1
+
+          sql =
+            before_no_replacement <>
+              no_replacement_anchor <>
+              Regex.replace(no_replacement_arms, after_no_replacement, holder_activity_arm,
+                global: false
+              )
 
           requester_anchor =
             "(requesterId = 'tightbeam:supervision' AND reasonKind = 'superseded' AND"
