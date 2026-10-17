@@ -2160,18 +2160,18 @@ defmodule Tightbeam.Assignments do
           call.supervision_interval_ms
         )
 
-        entitlement_trigger = liveness_trigger!(txn, {:assignment, id})
-
         # This assign/dispatch routed the item: cancel bracket 1 (and bracket 2
         # if a prior last-close armed a slate wake — the slate is no longer clear).
         if work_item_id do
+          bracket_trigger = liveness_trigger!(txn, {:work_item, work_item_id})
+
           Tightbeam.WorkItems.cancel_brackets_in_txn(txn, work_item_id, %{
             causal_source: %{kind: "assignment_transition", id: id},
             outcome: %{
               kind: "disposition",
               disposition_kind: "assignment_transition",
               disposition_id: id,
-              liveness_trigger: entitlement_trigger
+              liveness_trigger: bracket_trigger
             }
           })
         end
@@ -3366,16 +3366,16 @@ defmodule Tightbeam.Assignments do
       call.supervision_interval_ms
     )
 
-    liveness_trigger = liveness_trigger!(txn, {:assignment, assignment_id})
-
     if reopened.workItemId do
+      bracket_trigger = liveness_trigger!(txn, {:work_item, reopened.workItemId})
+
       Tightbeam.WorkItems.cancel_brackets_in_txn(txn, reopened.workItemId, %{
         causal_source: %{kind: "assignment_transition", id: assignment_id},
         outcome: %{
           kind: "disposition",
           disposition_kind: "assignment_transition",
           disposition_id: assignment_id,
-          liveness_trigger: liveness_trigger
+          liveness_trigger: bracket_trigger
         }
       })
     end
