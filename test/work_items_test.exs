@@ -380,8 +380,10 @@ defmodule Tightbeam.WorkItemsTest do
 
     refute replacement_id == wake_id
 
-    assert %{state: "pending", session_key: wake.session_key} =
+    assert %{state: "pending", session_key: session_key} =
              Tightbeam.Wakes.get(ctx.db, replacement_id)
+
+    assert session_key == wake.session_key
   end
 
   test "Firehose work-item routing callback failure rolls back rows and notices", ctx do
