@@ -336,20 +336,6 @@ defmodule Tightbeam.Supervision do
 
   def ladder_target(_db_or_txn, _holder_key, _rung), do: nil
 
-  @doc false
-  def retirement_target_in_txn(%Txn{} = txn, session_key, assignment_id, obligation_ref)
-      when is_binary(session_key) and is_binary(assignment_id) and is_binary(obligation_ref) do
-    if String.starts_with?(obligation_ref, @episode_ref) and
-         Txn.q(txn, "SELECT 1 FROM assignments WHERE id=?1 AND state='open'", [assignment_id]) !=
-           [] do
-      ladder_target(txn, session_key, 1)
-    else
-      nil
-    end
-  end
-
-  def retirement_target_in_txn(_txn, _session_key, _assignment_id, _obligation_ref), do: nil
-
   defp consume_deadline_in_txn(txn, wake, assignment_id, interval_ms, activity_at) do
     now = now()
 

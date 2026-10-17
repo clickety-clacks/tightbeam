@@ -55,7 +55,7 @@ defmodule Tightbeam.EscalationDeliveryTest do
     Tightbeam.EscalationDeliveryFixture.run!(tmp, 10)
   end
 
-  test "proof 11: targetGate 0 delivers to a retired target; the default gate still gates", %{
+  test "proof 11: retirement readdresses notices before ordinary delivery", %{
     tmp_dir: tmp
   } do
     Tightbeam.EscalationDeliveryFixture.run!(tmp, 11)

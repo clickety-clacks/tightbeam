@@ -1011,8 +1011,7 @@ defmodule Tightbeam.Org do
     Txn.q(
       txn,
       """
-      SELECT w.wakeId,w.targetRole,w.reresolve,w.reresolveSeed,w.reresolveRung,
-             w.assignmentId,w.obligationRef
+      SELECT w.wakeId,w.targetRole,w.reresolve,w.reresolveSeed,w.reresolveRung
       FROM wakes w
       LEFT JOIN roles r ON r.name=w.targetRole
       WHERE w.state='pending' AND w.consumer='prompt'
@@ -1027,7 +1026,7 @@ defmodule Tightbeam.Org do
   defp readdress_retired_notice_in_txn!(
          txn,
          session_key,
-         [wake_id, target_role, reresolve, seed, rung, assignment_id, obligation_ref]
+         [wake_id, target_role, reresolve, seed, rung]
        ) do
     case retirement_replacement_target(
            txn,
@@ -1035,9 +1034,7 @@ defmodule Tightbeam.Org do
            target_role,
            reresolve,
            seed,
-           rung,
-           assignment_id,
-           obligation_ref
+           rung
          ) do
       nil ->
         cancel_retired_notice!(txn, session_key, wake_id, %{kind: "no_replacement"}, nil)
@@ -1103,9 +1100,7 @@ defmodule Tightbeam.Org do
          target_role,
          _reresolve,
          _seed,
-         _rung,
-         _assignment_id,
-         _obligation_ref
+         _rung
        )
        when is_binary(target_role) do
     case Txn.q(
@@ -1124,9 +1119,7 @@ defmodule Tightbeam.Org do
          nil,
          "lineage",
          seed,
-         rung,
-         _assignment_id,
-         _obligation_ref
+         rung
        )
        when is_binary(seed) and is_integer(rung) and rung > 0 do
     Tightbeam.Supervision.ladder_target(txn, seed, rung)
@@ -1138,16 +1131,9 @@ defmodule Tightbeam.Org do
          nil,
          nil,
          _seed,
-         _rung,
-         assignment_id,
-         obligation_ref
+         _rung
        ) do
-    Tightbeam.Supervision.retirement_target_in_txn(
-      txn,
-      session_key,
-      assignment_id,
-      obligation_ref
-    )
+    Tightbeam.Supervision.ladder_target(txn, session_key, 1)
   end
 
   defp retirement_replacement_target(
@@ -1156,9 +1142,7 @@ defmodule Tightbeam.Org do
          _role,
          _reresolve,
          _seed,
-         _rung,
-         _assignment_id,
-         _obligation_ref
+         _rung
        ),
        do: nil
 

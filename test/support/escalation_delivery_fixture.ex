@@ -669,7 +669,7 @@ defmodule Tightbeam.EscalationDeliveryFixture do
     # exact call count: a new site changes the map and fails.
     assert sink_sites() == %{
              {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt/4",
-              "children_after_preflight/1"} => 2,
+              "children_after_preflight/1"} => 1,
              {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt/4", "handler_specs/1"} => 1,
              {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt/4",
               "execute_assignment_repair/6"} => 1,
@@ -680,14 +680,6 @@ defmodule Tightbeam.EscalationDeliveryFixture do
              # the current cannot-proceed disposer.
              {"lib/tightbeam/productions/bubble.ex", "Gateway.deliver_prompt_in_txn/5",
               "deliver_bubble_notice_in_txn/4"} => 1,
-             {"lib/tightbeam/productions/bubble.ex", "Gateway.deliver_prompt_in_txn/5",
-              "route_patrol_escalation/2"} => 1,
-             {"lib/tightbeam/supervision.ex", "Gateway.deliver_prompt/4",
-              "notify_stranded_ancestor/2"} => 1,
-             {"lib/tightbeam/supervision.ex", "Gateway.deliver_prompt_in_txn/5",
-              "migrate_one_legacy_transfer_in_txn/4"} => 1,
-             {"lib/tightbeam/supervision.ex", "Gateway.deliver_prompt_in_txn/5",
-              "recover_retired_target_in_txn/6"} => 1,
              {"lib/tightbeam/gateway.ex", "Gateway.notify_session/4", "remove_override_result/3"} =>
                1,
              # Identity apply asks a started session to re-read the Tightbeam
@@ -775,7 +767,7 @@ defmodule Tightbeam.EscalationDeliveryFixture do
     end
   end
 
-  ## Proof 11 — a retired target is still delivered
+  ## Proof 11 — retirement readdresses before ordinary delivery
 
   defp scenario(11, ctx) do
     assignment = dispatch!(ctx)
@@ -785,12 +777,15 @@ defmodule Tightbeam.EscalationDeliveryFixture do
              Escalation.escalate(ctx.db, statute_call(), statute(), escalation_ctx())
 
     assert [effort_wake, statute_wake] = Enum.sort_by(notification_wakes(ctx.db), & &1.created_at)
+    main_key = Org.personal_session_key("flynn")
+    assert effort_wake.session_key == "mid"
+    assert statute_wake.session_key == main_key
 
-    # A CONTROL prompt wake on the same target, carrying the schema default
-    # targetGate = 1 — the gate every pre-existing wake producer relies on.
+    # A control prompt wake on the retiring target carries the schema default
+    # targetGate = 1. Retirement must preserve it as an ordinary address too.
     control =
       Wakes.schedule(ctx.db, %{
-        session_key: statute_wake.session_key,
+        session_key: effort_wake.session_key,
         origin: @origin,
         prompt: "control gated wake",
         due_at: System.system_time(:millisecond)
@@ -798,42 +793,52 @@ defmodule Tightbeam.EscalationDeliveryFixture do
 
     assert control.target_gate == 1
 
-    # Retire both recorded targets AFTER the requests committed.
-    for key <- [effort_wake.session_key, statute_wake.session_key] do
-      :ok = DB.execute(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey='#{key}'")
-    end
+    # Retire the actual active recipient through Org. The gate-zero effort
+    # notice moves up the lineage in that transaction; the active Main
+    # decision notice stays gate zero and is delivered through the ordinary path.
+    assert %{state: "retired"} =
+             Org.retire(ctx.db, effort_wake.session_key, "user:flynn", 1_000)
+
+    assert %{state: "canceled"} = Wakes.get(ctx.db, effort_wake.wake_id)
+
+    assert {:ok, [[replacement_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT replacementWakeId FROM wake_cancellations WHERE wakeId=?1",
+               [effort_wake.wake_id]
+             )
+
+    replacement = Wakes.get(ctx.db, replacement_id)
+
+    assert %{state: "pending", session_key: "top", target_gate: 1, target_role: nil, reresolve: nil} =
+             replacement
+
+    assert replacement.prompt == effort_wake.prompt
+    assert replacement.assignment_id == effort_wake.assignment_id
+    assert replacement.obligation_ref == effort_wake.obligation_ref
+
+    assert %{state: "pending", session_key: "top", target_gate: 1} =
+             Wakes.get(ctx.db, control.wake_id)
+
+    assert %{state: "pending", session_key: ^main_key, target_gate: 0} =
+             Wakes.get(ctx.db, statute_wake.wake_id)
 
     drain!(ctx)
 
-    for wake <- [effort_wake, statute_wake] do
-      assert wake.target_gate == 0
+    for {wake, expected_session} <- [
+          {replacement, "top"},
+          {statute_wake, main_key},
+          {Wakes.get(ctx.db, control.wake_id), "top"}
+        ] do
       carrier = delivery_wake(ctx.db, wake)
-      assert carrier.wake_id != wake.wake_id
-      assert carrier.target_gate == 0
-      assert carrier.session_key == wake.session_key
       assert carrier.state == "fired"
-      assert Wakes.get(ctx.db, wake.wake_id).state == "fired"
-      assert Wakes.get(ctx.db, wake.wake_id).prompt == wake.prompt
-
-      assert [%{delivery_wake_id: carrier_id, member_state: "included", batch_state: "delivered"}] =
-               NoticeBatcher.source_refs(ctx.db, wake.wake_id)
-
-      assert carrier_id == carrier.wake_id
-      assert count(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId = ?1", [wake.wake_id]) == 0
+      assert carrier.session_key == expected_session
 
       assert rows(ctx.db, "SELECT sessionKey FROM turns WHERE wakeId = ?1", [carrier.wake_id]) ==
-               [
-                 [carrier.session_key]
-               ]
-
-      assert count(ctx.db, "SELECT COUNT(*) FROM messages WHERE sessionKey = ?1", [
-               carrier.session_key
-             ]) >= 1
+               [[expected_session]]
     end
 
-    # The control wake keeps the active-session gate: nothing was committed for it.
-    assert count(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId = ?1", [control.wake_id]) == 0
-    assert NoticeBatcher.source_refs(ctx.db, control.wake_id) == []
+    assert Wakes.get(ctx.db, effort_wake.wake_id).state == "canceled"
 
     before_turns = rows(ctx.db, "SELECT * FROM turns ORDER BY seq")
     before_messages = rows(ctx.db, "SELECT * FROM messages ORDER BY id")

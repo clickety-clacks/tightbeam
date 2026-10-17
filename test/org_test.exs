@@ -154,7 +154,7 @@ defmodule Tightbeam.OrgTest do
     {:ok, [["retired"]]} = DB.query(db, "SELECT state FROM sessions WHERE sessionKey = 'k1'")
   end
 
-  test "retirement ends unrouteable notices and stores role replacements as ordinary addresses",
+  test "retirement readdresses direct notices and stores role replacements as ordinary addresses",
        %{db: db} do
     main_key = Org.personal_session_key("flynn")
     Org.create(db, base(%{session_key: main_key, kind: "main", is_built_in: true}))
@@ -213,18 +213,21 @@ defmodule Tightbeam.OrgTest do
              )
 
     assert %{state: "retired"} = Org.retire(db, "retiring", "user:flynn", 1_000)
-    assert %{state: "canceled"} = Wakes.get(db, direct.wake_id)
 
-    assert %{
-             requester: "tightbeam:retirement",
-             reason: "target_retired",
-             source_kind: "session_transition",
-             source_id: "retiring",
-             outcome: "no_replacement",
-             replacement_wake_id: nil,
-             work_impact: "no_linked_work",
-             action_needed: 0
-           } = cancellation(db, direct.wake_id)
+    for wake <- [direct, ungated] do
+      assert %{
+               state: "pending",
+               session_key: ^main_key,
+               target_gate: 1,
+               target_role: nil,
+               reresolve: nil
+             } = Wakes.get(db, wake.wake_id)
+
+      assert {:ok, [[0]]} =
+               DB.query(db, "SELECT count(*) FROM wake_cancellations WHERE wakeId=?1", [
+                 wake.wake_id
+               ])
+    end
 
     assert %{state: "canceled"} = Wakes.get(db, role.wake_id)
 
@@ -275,14 +278,6 @@ defmodule Tightbeam.OrgTest do
              )
 
     assert retained == JSON.decode!(encoded_attachments)
-
-    assert %{state: "canceled"} = Wakes.get(db, ungated.wake_id)
-
-    assert %{
-             requester: "tightbeam:retirement",
-             reason: "target_retired",
-             outcome: "no_replacement"
-           } = cancellation(db, ungated.wake_id)
 
     {:ok, [[wake_count]]} = DB.query(db, "SELECT count(*) FROM wakes")
     {:ok, [[cancellation_count]]} = DB.query(db, "SELECT count(*) FROM wake_cancellations")
@@ -954,9 +949,11 @@ defmodule Tightbeam.OrgTest do
              DB.query(db, "SELECT COUNT(*) FROM sessions WHERE sessionKey='retiring'")
   end
 
-  test "retirement ends a linked notice without requiring a liveness trigger", %{
+  test "retirement readdresses a linked notice to Main without a liveness trigger", %{
     db: db
   } do
+    ensure_legacy_main(db)
+    main_key = Org.personal_session_key("flynn")
     Org.create(db, base(%{session_key: "retiring"}))
 
     :ok =
@@ -975,17 +972,10 @@ defmodule Tightbeam.OrgTest do
       })
 
     assert %{state: "retired"} = Org.retire(db, "retiring", "user:flynn", 1_000)
-    assert Wakes.get(db, wake.wake_id).state == "canceled"
+    assert %{state: "pending", session_key: main_key, target_gate: 1, work_item_id: "orphan"} =
+             Wakes.get(db, wake.wake_id)
 
-    assert %{
-             requester: "tightbeam:retirement",
-             reason: "target_retired",
-             source_kind: "session_transition",
-             source_id: "retiring",
-             outcome: "no_replacement",
-             work_impact: "linked_work_open",
-             action_needed: 0
-           } = cancellation(db, wake.wake_id)
+    assert cancellation(db, wake.wake_id) == nil
   end
 
   test "spawned-by provenance is retained", %{db: db} do
