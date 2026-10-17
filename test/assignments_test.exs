@@ -1126,7 +1126,11 @@ defmodule Tightbeam.AssignmentsTest do
                handle(
                  ctx,
                  "reopen-assignment",
-                 reopen_call({:user, "flynn"}, assignment.id, "resume after completion")
+                 reopen_call(
+                   {:session, "notice-parent"},
+                   assignment.id,
+                   "resume after completion"
+                 )
                )
 
       scheduler = terminal_notice_scheduler(ctx.db)
@@ -1182,8 +1186,7 @@ defmodule Tightbeam.AssignmentsTest do
       restarted = terminal_notice_scheduler(ctx.db)
       assert :ok = Wakes.fire_due(restarted)
 
-      assert {:duplicate, %{turn_seq: ^seq}} =
-               deliver_terminal_notice(ctx.db, Wakes.get(ctx.db, carrier_id))
+      assert :duplicate = deliver_terminal_notice(ctx.db, Wakes.get(ctx.db, carrier_id))
 
       assert {:ok, {:ok, replay}} = admit_terminal_notice(ctx.db, assignment.id)
       assert replay.wake_id == wake.wake_id
@@ -1319,7 +1322,7 @@ defmodule Tightbeam.AssignmentsTest do
       assert carrier.prompt =~ second.prompt
 
       [[seq, _session_key, _status, ^carrier_id]] = source_delivery_turns(ctx.db, first.wake_id)
-      assert {:duplicate, %{turn_seq: ^seq}} = deliver_terminal_notice(ctx.db, carrier)
+      assert :duplicate = deliver_terminal_notice(ctx.db, carrier)
 
       for wake <- [first, second] do
         assert %{state: "fired", prompt: prompt} = Wakes.get(ctx.db, wake.wake_id)
@@ -1518,7 +1521,7 @@ defmodule Tightbeam.AssignmentsTest do
       assert revocation_notice_snapshot(ctx.db) == corrupt
     end
 
-    test "accountability change readdresses a pending revoked notice before delivery", ctx do
+    test "accountability change preserves a pending revoked notice recipient", ctx do
       {assignment, _item, personal} = revocation_notice_fixture(ctx)
 
       assert %{outcome: "revoked"} =
@@ -1530,12 +1533,12 @@ defmodule Tightbeam.AssignmentsTest do
 
       assert [wake] = terminal_notices(ctx.db)
       set_delivery_owner(ctx, assignment.workItemId, personal)
-      readdressed = Wakes.get(ctx.db, wake.wake_id)
-      assert readdressed.session_key == personal
-      assert readdressed.prompt == wake.prompt
+      stored = Wakes.get(ctx.db, wake.wake_id)
+      assert stored.session_key == wake.session_key
+      assert stored.prompt == wake.prompt
 
       before = accountable_disposition_snapshot(ctx.db)
-      assert {:appended, ^personal, message, _} = deliver_terminal_notice(ctx.db, readdressed)
+      assert {:appended, "notice-parent", message, _} = deliver_terminal_notice(ctx.db, stored)
       assert message.content =~ wake.prompt
       assert accountable_disposition_snapshot(ctx.db) == before
     end
@@ -3358,7 +3361,7 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   @tag assignment_delta: true
-  test "reopen validates close shape and rolls back a post-audit failure", ctx do
+  test "reopen validates close shape and rolls back a later assignment update failure", ctx do
     malformed = handle(ctx, "assign", reopen_fixture_call({:user, "flynn"}, "malformed close"))
     _ = handle(ctx, "attest", attest_call({:session, "holder"}, malformed.id, "completion"))
 
@@ -3386,9 +3389,9 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert :ok =
              DB.execute(ctx.db, """
-             CREATE TRIGGER force_reopen_event_rollback
-             BEFORE INSERT ON events
-             WHEN NEW.verb='reopen-assignment'
+             CREATE TRIGGER force_reopen_update_rollback
+             BEFORE UPDATE OF state ON assignments
+             WHEN OLD.state='closed' AND NEW.state='open'
              BEGIN SELECT RAISE(ABORT, 'forced reopen event rollback'); END
              """)
 

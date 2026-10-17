@@ -4651,6 +4651,34 @@ defmodule Tightbeam.Wakes do
   defp validate_disposition(txn, "monitor_generation_transition", id),
     do: generation_exists(txn, id)
 
+  # A work item can remain live through an open child assignment after the
+  # assignment whose effort wake is being disposed has closed. In that case
+  # the child's pending inactivity deadline is the canonical liveness proof
+  # selected by Supervision.inactivity_deadline_trigger_in_txn/2; its primary
+  # row is the assignment, while the disposed wake's primary has resolved to
+  # the shared work item.
+  defp validate_liveness(
+         txn,
+         "pending_wake",
+         id,
+         wake,
+         %{kind: "work_item", id: work_item_id}
+       ) do
+    with true <- id != wake.wake_id,
+         {:ok, %{kind: "pending_wake", id: ^id}} <-
+           Supervision.inactivity_deadline_trigger_in_txn(txn, {:work_item, work_item_id}),
+         [] <-
+           Txn.q(
+             txn,
+             "SELECT 1 FROM work_items WHERE id=?1 AND (routingWakeId=?2 OR slateWakeId=?2)",
+             [work_item_id, id]
+           ) do
+      :ok
+    else
+      _ -> :error
+    end
+  end
+
   defp validate_liveness(txn, "pending_wake", id, wake, primary) do
     with true <- id != wake.wake_id,
          :ok <- replacement_matches(txn, id, primary),
