@@ -2648,6 +2648,9 @@ defmodule Tightbeam.Escalation do
         %{kind: "effort"} ->
           {error("invalid", "effort requests use effort-rule"), nil}
 
+        %{kind: "agent"} ->
+          {error("invalid", "agent requests use answer or return"), nil}
+
         request ->
           with :ok <- operator_owner_authorized(call, request) do
             case request.status do
