@@ -1538,8 +1538,9 @@ defmodule Tightbeam.AssignmentsTest do
       assert stored.prompt == wake.prompt
 
       before = accountable_disposition_snapshot(ctx.db)
-      assert {:appended, "notice-parent", message, _} = deliver_terminal_notice(ctx.db, stored)
-      assert message.content =~ wake.prompt
+      assert :appended = deliver_terminal_notice(ctx.db, stored)
+      assert [[_seq, "notice-parent", "queued", _carrier_id]] =
+               source_delivery_turns(ctx.db, wake.wake_id)
       assert accountable_disposition_snapshot(ctx.db) == before
     end
   end
@@ -3395,14 +3396,13 @@ defmodule Tightbeam.AssignmentsTest do
              BEGIN SELECT RAISE(ABORT, 'forced reopen event rollback'); END
              """)
 
-    assert %{code: "server_error", message: message} =
-             handle(
-               ctx,
-               "reopen-assignment",
-               reopen_call({:user, "flynn"}, rollback.id, "force a later transactional failure")
-             )
-
-    assert message =~ "forced reopen event rollback"
+    assert_raise Tightbeam.DB.Error, "forced reopen event rollback", fn ->
+      handle(
+        ctx,
+        "reopen-assignment",
+        reopen_call({:user, "flynn"}, rollback.id, "force a later transactional failure")
+      )
+    end
 
     assert reopen_mutation_snapshot(ctx.db, rollback.id) == before
   end
