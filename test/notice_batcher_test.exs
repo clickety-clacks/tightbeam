@@ -186,7 +186,9 @@ defmodule Tightbeam.NoticeBatcherTest do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 42)
   end
 
-  test "ordinary sources retain retry authority across repeated prewrite failures", %{tmp_dir: tmp} do
+  test "ordinary sources retain retry authority across repeated prewrite failures", %{
+    tmp_dir: tmp
+  } do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 47)
   end
 

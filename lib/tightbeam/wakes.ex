@@ -758,44 +758,44 @@ defmodule Tightbeam.Wakes do
     try do
       effects =
         case get_in_txn(txn, wake_id) do
-        nil ->
-          []
-
-        wake ->
-          if wake.wait_mode do
-            settle_wait_continuation_in_txn(
-              txn,
-              wake.wake_id,
-              wake.recognition_path,
-              wake.assignment_id,
-              wait_outcome
-            )
-          end
-
-          case wake.obligation_ref do
-            @terminal_notice_marker <> _ ->
-              if wait_outcome == "delivered" do
-                terminal_notice_delivered_in_txn(txn, wake.wake_id, wake.session_key)
-              end
-
-            @terminal_action_marker <> _ ->
-              if wait_outcome == "delivered" do
-                reconcile_terminal_action_delivery_in_txn(txn, wake)
-              end
-
-            _ ->
-              :ok
-          end
-
-          if wait_outcome == "delivery-failed" do
-            case undeliverable_sender_notice_in_txn(txn, wake) do
-              nil -> []
-              effect -> [effect]
-            end
-          else
+          nil ->
             []
-          end
-      end
+
+          wake ->
+            if wake.wait_mode do
+              settle_wait_continuation_in_txn(
+                txn,
+                wake.wake_id,
+                wake.recognition_path,
+                wake.assignment_id,
+                wait_outcome
+              )
+            end
+
+            case wake.obligation_ref do
+              @terminal_notice_marker <> _ ->
+                if wait_outcome == "delivered" do
+                  terminal_notice_delivered_in_txn(txn, wake.wake_id, wake.session_key)
+                end
+
+              @terminal_action_marker <> _ ->
+                if wait_outcome == "delivered" do
+                  reconcile_terminal_action_delivery_in_txn(txn, wake)
+                end
+
+              _ ->
+                :ok
+            end
+
+            if wait_outcome == "delivery-failed" do
+              case undeliverable_sender_notice_in_txn(txn, wake) do
+                nil -> []
+                effect -> [effect]
+              end
+            else
+              []
+            end
+        end
 
       :ok = Txn.exec(txn, "RELEASE reconcile_notice_source")
       {:ok, effects}
@@ -807,6 +807,7 @@ defmodule Tightbeam.Wakes do
         Logger.warning(
           "notice source action deferred for #{wake_id}: #{Exception.message(error)}"
         )
+
         {:error, error}
     catch
       kind, reason ->
@@ -3943,8 +3944,7 @@ defmodule Tightbeam.Wakes do
       else
         {:error, refusal} ->
           raise DB.Error,
-            message:
-              "accountability notice readdress refused for #{wake_id}: #{inspect(refusal)}"
+            message: "accountability notice readdress refused for #{wake_id}: #{inspect(refusal)}"
 
         other ->
           raise DB.Error,
@@ -3990,7 +3990,8 @@ defmodule Tightbeam.Wakes do
       }
 
       unless cancel_in_txn(txn, command),
-        do: raise(DB.Error, message: "decision request notice cancellation refused for #{wake_id}")
+        do:
+          raise(DB.Error, message: "decision request notice cancellation refused for #{wake_id}")
     end)
 
     :ok
@@ -6200,7 +6201,11 @@ defmodule Tightbeam.Wakes do
 
           {:error, reason} ->
             delay = defer_source_reconciliation(db, wake_id)
-            Logger.warning("wake source reconciliation acknowledgement deferred: #{inspect(reason)}")
+
+            Logger.warning(
+              "wake source reconciliation acknowledgement deferred: #{inspect(reason)}"
+            )
+
             {:deferred, delay}
         end
 
@@ -6391,17 +6396,18 @@ defmodule Tightbeam.Wakes do
 
   def handle_info({:source_reconciliation_batch, {:ok, results, more}}, state) do
     Enum.each(results, fn
-      {_wake_id, _recipient, :ok} -> :ok
+      {_wake_id, _recipient, :ok} ->
+        :ok
+
       {wake_id, recipient, {:deferred, delay}} when is_binary(wake_id) and is_binary(recipient) ->
-        Logger.warning(
-          "wake source reconciliation deferred for #{wake_id} by #{delay}ms"
-        )
+        Logger.warning("wake source reconciliation deferred for #{wake_id} by #{delay}ms")
 
       {wake_id, recipient, {:error, _reason}}
       when is_binary(wake_id) and is_binary(recipient) ->
         Logger.warning("wake source reconciliation remains pending for #{wake_id}")
 
-      _ -> :ok
+      _ ->
+        :ok
     end)
 
     if more, do: Process.send_after(self(), :recover_source_reconciliations, 100)
@@ -6933,6 +6939,7 @@ defmodule Tightbeam.Wakes do
 
         if cancel_in_txn(txn, command, fn -> at end) do
           EventLog.lifecycle_in_txn(txn, "wake_undeliverable", wake_id, reason)
+
           enqueue_source_reconciliation_in_txn(
             txn,
             wake_id,
@@ -6957,7 +6964,8 @@ defmodule Tightbeam.Wakes do
     recipient = sender_failure_recipient(wake.creator_session_key, wake.origin)
 
     with recipient when is_binary(recipient) <- recipient,
-         [[owner]] <- Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [recipient]),
+         [[owner]] <-
+           Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [recipient]),
          owner when is_binary(owner) <- owner do
       {disposition, marker} =
         Tightbeam.Projection.append_in_txn(txn, %{
@@ -6992,14 +7000,19 @@ defmodule Tightbeam.Wakes do
       )
     rescue
       error ->
-        Logger.warning("could not publish undeliverable notice for #{wake_id}: #{Exception.message(error)}")
+        Logger.warning(
+          "could not publish undeliverable notice for #{wake_id}: #{Exception.message(error)}"
+        )
+
         :ok
     catch
       kind, reason ->
-        Logger.warning("could not publish undeliverable notice for #{wake_id}: #{inspect({kind, reason})}")
+        Logger.warning(
+          "could not publish undeliverable notice for #{wake_id}: #{inspect({kind, reason})}"
+        )
+
         :ok
     end
-
   end
 
   defp publish_undeliverable_notice_safely(effect), do: publish_undeliverable_notice(effect)

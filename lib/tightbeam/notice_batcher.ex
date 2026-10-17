@@ -773,7 +773,9 @@ defmodule Tightbeam.NoticeBatcher do
          ) do
       {:canceled, {wake_id, notice}} ->
         {:undeliverable, wake_id, source.session_key, notice}
-      _ -> nil
+
+      _ ->
+        nil
     end
   end
 

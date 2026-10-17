@@ -1511,8 +1511,16 @@ defmodule Tightbeam.NoticeBatcherFixture do
     assert Wakes.get(db, carrier_id).state == "fired"
     assert source_ids(db, carrier_id) == [sibling.wake_id]
 
-    assert {:ok, [["target_unresolvable", "scheduler_delivery", "no_replacement", nil,
-                   "no_linked_work"]]} =
+    assert {:ok,
+            [
+              [
+                "target_unresolvable",
+                "scheduler_delivery",
+                "no_replacement",
+                nil,
+                "no_linked_work"
+              ]
+            ]} =
              DB.query(
                db,
                "SELECT reasonKind,causalSourceKind,outcomeKind,primaryWorkKind,workImpactKind FROM wake_cancellations WHERE wakeId=?1",
@@ -1589,6 +1597,7 @@ defmodule Tightbeam.NoticeBatcherFixture do
     third_at = max(Wakes.get(db, first_successor).due_at, Wakes.get(db, second_successor).due_at)
     [third_carrier] = NoticeBatcher.recover(db, third_at)
     assert source_ids(db, third_carrier) == [first_successor, second_successor]
+
     assert count(db, "wake_retry_attempts", "rootWakeId IN (?1,?2)", [
              first.wake_id,
              second.wake_id

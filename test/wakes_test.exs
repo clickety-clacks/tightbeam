@@ -184,6 +184,7 @@ defmodule Tightbeam.WakesTest do
              "agent:a",
              %{kind: "session", id: "new-role-holder"}
            )
+
     assert cancellation_event_count(db, wake.wake_id) == 0
 
     :ok =
@@ -1331,9 +1332,10 @@ defmodule Tightbeam.WakesTest do
       assert parent_relation_snapshot(db) == before
     end
 
-    test "notice address is stored at admission and retirement readdresses it without source lookup", %{
-      db: db
-    } do
+    test "notice address is stored at admission and retirement readdresses it without source lookup",
+         %{
+           db: db
+         } do
       personal = parent_relation_fixture(db)
 
       :ok =

@@ -612,7 +612,9 @@ defmodule Tightbeam.EscalationTest do
     withdrawn_ref = Wakes.decision_request_notice_ref(withdrawn_id)
 
     assert {:ok, [[withdrawn_wake, "pending"]]} =
-             DB.query(ctx.db, "SELECT wakeId,state FROM wakes WHERE obligationRef=?1", [withdrawn_ref])
+             DB.query(ctx.db, "SELECT wakeId,state FROM wakes WHERE obligationRef=?1", [
+               withdrawn_ref
+             ])
 
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert Wakes.get(ctx.db, withdrawn_wake).state == "pending"

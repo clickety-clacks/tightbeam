@@ -597,17 +597,31 @@ defmodule Tightbeam.SentinelsTest do
         )
 
       assert :ok = Wakes.fire_due(scheduler)
+
       assert {:ok, [["pending"]]} =
                DB.query(ctx.db, "SELECT state FROM wakes WHERE obligationRef=?1", [obligation_ref])
 
       enable!(ctx, "alpha-bundle/watch")
-      :ok = Sentinels.mark_started(ctx.db, ctx.host, "alpha-bundle/watch", String.duplicate("a", 64), 2)
+
+      :ok =
+        Sentinels.mark_started(
+          ctx.db,
+          ctx.host,
+          "alpha-bundle/watch",
+          String.duplicate("a", 64),
+          2
+        )
 
       assert {:ok, [["canceled"]]} =
                DB.query(ctx.db, "SELECT state FROM wakes WHERE obligationRef=?1", [obligation_ref])
 
-      assert :ok = Ledger.finish(ctx.db, busy_turn.seq, "delivered", nil, owner_lease: busy_turn.owner_lease)
+      assert :ok =
+               Ledger.finish(ctx.db, busy_turn.seq, "delivered", nil,
+                 owner_lease: busy_turn.owner_lease
+               )
+
       assert :ok = Wakes.fire_due(scheduler)
+
       assert {:ok, [[0]]} =
                DB.query(
                  ctx.db,

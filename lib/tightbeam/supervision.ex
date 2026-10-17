@@ -102,6 +102,7 @@ defmodule Tightbeam.Supervision do
         [[^actor_session_key, work_item_id, opened_at, "open"]]
         when is_integer(opened_at) ->
           activity_start = activity_start_in_txn(txn, assignment_id, opened_at)
+
           {interval_ms, last_activity} =
             latest_deadline_state_in_txn(txn, assignment_id, activity_start)
 
@@ -876,7 +877,8 @@ defmodule Tightbeam.Supervision do
             when is_integer(interval_ms) and interval_ms > 0 and is_integer(activity_at) ->
               {interval_ms, activity_at}
 
-            _ -> nil
+            _ ->
+              nil
           end
 
         _ ->

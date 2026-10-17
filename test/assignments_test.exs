@@ -744,7 +744,8 @@ defmodule Tightbeam.AssignmentsTest do
       refute Map.has_key?(notices, sibling.id)
     end
 
-    test "changing a work item's accountable session readdresses its pending terminal notice", ctx do
+    test "changing a work item's accountable session readdresses its pending terminal notice",
+         ctx do
       old_owner = session(ctx.db, "terminal-owner-old", "flynn")
       new_owner = session(ctx.db, "terminal-owner-new", "flynn")
       item = create_work_item(ctx, "terminal notice follows accountability")
@@ -786,7 +787,11 @@ defmodule Tightbeam.AssignmentsTest do
         handle(
           ctx,
           "assign",
-          terminal_notice_assign_call({:user, "flynn"}, "close without a pending deadline", item.id)
+          terminal_notice_assign_call(
+            {:user, "flynn"},
+            "close without a pending deadline",
+            item.id
+          )
         )
 
       sibling =
@@ -1093,6 +1098,7 @@ defmodule Tightbeam.AssignmentsTest do
       {_assignment, wake, personal} = terminal_delivery_fixture(ctx, "completion")
 
       assert %{state: "retired"} = Org.retire(ctx.db, "notice-parent", "user:flynn", 1_000)
+
       assert %{state: "pending", session_key: ^personal, prompt: prompt} =
                Wakes.get(ctx.db, wake.wake_id)
 
@@ -1138,6 +1144,7 @@ defmodule Tightbeam.AssignmentsTest do
           end
 
         set_delivery_owner(ctx, assignment.workItemId, personal)
+
         assert %{state: "pending", session_key: ^personal, prompt: prompt} =
                  Wakes.get(ctx.db, wake.wake_id)
 
@@ -1188,6 +1195,7 @@ defmodule Tightbeam.AssignmentsTest do
       assert log =~ "notice session drain refused recipient=" <> personal
       assert Wakes.get(ctx.db, notice.wake_id).state == "canceled"
       assert source_delivery_turns(ctx.db, notice.wake_id) == []
+
       assert {:ok, [["target_unresolvable", "no_replacement"]]} =
                DB.query(
                  ctx.db,
@@ -1239,7 +1247,8 @@ defmodule Tightbeam.AssignmentsTest do
                DB.query(ctx.db, "SELECT state FROM assignments WHERE id=?1", [assignment.id])
     end
 
-    test "a terminal notice with no resolvable target is disposed rather than left pending", ctx do
+    test "a terminal notice with no resolvable target is disposed rather than left pending",
+         ctx do
       {_assignment, wake, personal} = terminal_delivery_fixture(ctx, "completion")
 
       {:ok, _} =
@@ -1302,6 +1311,7 @@ defmodule Tightbeam.AssignmentsTest do
       scheduler = terminal_notice_scheduler(ctx.db)
       assert :ok = Wakes.fire_due(scheduler)
       assert %{state: "fired", session_key: ^personal} = Wakes.get(ctx.db, ordinary.wake_id)
+
       assert [[_seq, ^personal, "queued", _carrier_id]] =
                source_delivery_turns(ctx.db, ordinary.wake_id)
     end

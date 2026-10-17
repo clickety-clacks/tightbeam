@@ -218,42 +218,55 @@ defmodule Tightbeam.SupervisionTest do
     history_size = 20_000
 
     assert {:ok, []} =
-             DB.query(ctx.db, """
-             WITH RECURSIVE seq(value) AS (
-               VALUES (1)
-               UNION ALL
-               SELECT value + 1 FROM seq WHERE value < #{history_size}
+             DB.query(
+               ctx.db,
+               """
+               WITH RECURSIVE seq(value) AS (
+                 VALUES (1)
+                 UNION ALL
+                 SELECT value + 1 FROM seq WHERE value < #{history_size}
+               )
+               INSERT INTO wakes (wakeId,sessionKey,origin,consumer,dueAt,state,createdAt,assignmentId)
+               SELECT 'historical-deadline-' || printf('%08d',value),
+                      ?1,'process:tightbeam','assignment_inactivity_deadline',value,'fired',value,?2
+               FROM seq
+               """,
+               [ctx.holder.session_key, "asg_inactive"]
              )
-             INSERT INTO wakes (wakeId,sessionKey,origin,consumer,dueAt,state,createdAt,assignmentId)
-             SELECT 'historical-deadline-' || printf('%08d',value),
-                    ?1,'process:tightbeam','assignment_inactivity_deadline',value,'fired',value,?2
-             FROM seq
-             """, [ctx.holder.session_key, "asg_inactive"])
 
     assert {:ok, []} =
-             DB.query(ctx.db, """
-             WITH RECURSIVE seq(value) AS (
-               VALUES (1)
-               UNION ALL
-               SELECT value + 1 FROM seq WHERE value < #{history_size}
+             DB.query(
+               ctx.db,
+               """
+               WITH RECURSIVE seq(value) AS (
+                 VALUES (1)
+                 UNION ALL
+                 SELECT value + 1 FROM seq WHERE value < #{history_size}
+               )
+               INSERT INTO assignment_reopenings (
+                 assignmentId,ts,reopenedByUser,reason,priorOutcome,priorClosedAt
+               )
+               SELECT ?1,value,'flynn','synthetic historical close','completed',value
+               FROM seq
+               """,
+               ["asg_inactive"]
              )
-             INSERT INTO assignment_reopenings (
-               assignmentId,ts,reopenedByUser,reason,priorOutcome,priorClosedAt
-             )
-             SELECT ?1,value,'flynn','synthetic historical close','completed',value
-             FROM seq
-             """, ["asg_inactive"])
 
     assert {:ok, [[^history_size]]} =
-             DB.query(ctx.db,
+             DB.query(
+               ctx.db,
                "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline'",
                ["asg_inactive"]
              )
 
     assert {:ok, [[^history_size]]} =
-             DB.query(ctx.db, "SELECT COUNT(*) FROM assignment_reopenings WHERE assignmentId=?1", [
-               "asg_inactive"
-             ])
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM assignment_reopenings WHERE assignmentId=?1",
+               [
+                 "asg_inactive"
+               ]
+             )
 
     assert {:ok, deadline_plan} =
              DB.query(
