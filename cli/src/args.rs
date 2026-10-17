@@ -429,6 +429,11 @@ pub enum Command {
         identity: Identity,
         assignment_id: String,
     },
+    AssignmentGet {
+        identity: Identity,
+        assignment_id: String,
+        fact_id: Option<i64>,
+    },
     Assignments {
         identity: Identity,
         target: Option<Target>,
@@ -907,6 +912,10 @@ COMMANDS:
       and accepts the three release-fact flags only as one complete tuple.
   attests <assignmentId>
       List every attest filed against an assignment.
+  assignment-get <assignmentId> [--fact-id <id>]
+      Read the assignment's current cannot-proceed release tuple and state. When
+      --fact-id is supplied, also read that existing fact and report the stored
+      tuple predicate, current eligibility, and any recorded settlement.
   assignments [--session <key> | --role <name>] [--state open|closed|all]
       List assignments (open by default).
 
@@ -3047,6 +3056,30 @@ fn parse_with_optional_catalog(
                 assignment_id: parsed.positional[1].clone(),
             })
         }
+        "assignment-get" => {
+            if parsed.positional.len() != 2 {
+                return Err(
+                    "usage: tightbeam assignment-get <assignmentId> [--fact-id <id>]".to_owned(),
+                );
+            }
+            let fact_id = match flags.get("fact-id") {
+                None => None,
+                Some(value) => {
+                    let id = value
+                        .parse::<i64>()
+                        .map_err(|_| "--fact-id must be a positive integer".to_owned())?;
+                    if id <= 0 {
+                        return Err("--fact-id must be a positive integer".to_owned());
+                    }
+                    Some(id)
+                }
+            };
+            Ok(Command::AssignmentGet {
+                identity: identity(flags)?,
+                assignment_id: parsed.positional[1].clone(),
+                fact_id,
+            })
+        }
         "assignments" => {
             let targets = [
                 nonempty(flags, "session").map(Target::Session),
@@ -3204,7 +3237,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, cancel-wake, attest, attests, breathing, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, cancel-wake, attest, attests, breathing, assign, assignment-get, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -4861,6 +4894,7 @@ mod tests {
                 "return",
                 "assimilate",
                 "assign",
+                "assignment-get",
                 "assignments",
                 "artifact-record",
                 "artifact-content-fetch",
@@ -5818,7 +5852,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, cancel-wake, attest, attests, breathing, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process".to_owned()),
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, cancel-wake, attest, attests, breathing, assign, assignment-get, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, config, host-env-set, host-env-list, host-env-unset, sentinel, doctor, assimilate, harness-process".to_owned()),
         );
     }
 
@@ -5968,7 +6002,6 @@ mod tests {
             "operator-supersede",
             "critical",
             "work-item-list",
-            "assignment-get",
             "init",
             "setup",
             "role",
@@ -5984,6 +6017,50 @@ mod tests {
                     .starts_with(&format!("unknown command: {command} —"))
             );
         }
+    }
+
+    #[test]
+    fn assignment_get_reads_optional_fact_by_positive_id() {
+        assert_eq!(
+            parse(strings(&[
+                "assignment-get",
+                "assignment-example",
+                "--fact-id",
+                "42",
+                "--as-user",
+                "flynn",
+            ])),
+            Ok(Command::AssignmentGet {
+                identity: Identity::User("flynn".to_owned()),
+                assignment_id: "assignment-example".to_owned(),
+                fact_id: Some(42),
+            })
+        );
+
+        assert_eq!(
+            parse(strings(&["assignment-get", "assignment-example"])),
+            Ok(Command::AssignmentGet {
+                identity: Identity::Session,
+                assignment_id: "assignment-example".to_owned(),
+                fact_id: None,
+            })
+        );
+
+        for value in ["0", "-1", "unknown"] {
+            assert_eq!(
+                parse(strings(&[
+                    "assignment-get",
+                    "assignment-example",
+                    "--fact-id",
+                    value,
+                ])),
+                Err("--fact-id must be a positive integer".to_owned())
+            );
+        }
+
+        let entry = render_command_help(None, "assignment-get").unwrap();
+        assert!(entry.starts_with("  assignment-get <assignmentId>"));
+        assert!(entry.contains("--fact-id <id>"), "{entry}");
     }
 
     #[test]
