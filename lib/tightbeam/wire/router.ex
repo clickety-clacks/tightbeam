@@ -1203,7 +1203,8 @@ defmodule Tightbeam.Wire.Router do
   defp session_collection(conn, session_key, resource, query_fun, serializer) do
     with {:ok, auth} <- selected_session_auth(conn),
          {:ok, request} <- decode_state_query(conn),
-         {:ok, principal} <- selected_session_principal(auth, request),
+         {:ok, principal, request} <-
+           session_collection_principal(auth, request, conn, session_key, resource),
          :ok <- session_collection_request(request, session_key),
          {:ok, limit, boundary} <-
            state_page_request(
@@ -1248,6 +1249,37 @@ defmodule Tightbeam.Wire.Router do
   rescue
     _error in [ArgumentError, KeyError, MatchError] ->
       state_error(conn, resource, 500, "projection_invalid", nil)
+  end
+
+  # The operator transport supplies an explicit user for this exact history
+  # selection, using the same owner/admin resolution as its socket operations.
+  defp session_collection_principal(:org, query, conn, session_key, "transcript messages") do
+    case Map.get(query, "asUser", []) do
+      [user_id] when user_id != "" ->
+        case Tightbeam.Wire.OperatorSession.resolve(db(conn), %{
+               "asUser" => user_id,
+               "sessionKey" => session_key
+             }) do
+          {:ok, user, _session} ->
+            Tightbeam.RequestContext.resolve_principal("user", user.user_id)
+            principal = %{kind: "user", id: user.user_id, is_admin: user.is_admin}
+            {:ok, principal, Map.delete(query, "asUser")}
+
+          {:error, _} ->
+            {:error, 404, "not_found", nil}
+        end
+
+      [] ->
+        {:error, 403, "org_token_read_forbidden", nil}
+
+      _ ->
+        {:error, 400, "invalid_as_user", nil}
+    end
+  end
+
+  defp session_collection_principal(auth, query, _conn, _session_key, _resource) do
+    with {:ok, principal} <- selected_session_principal(auth, query),
+         do: {:ok, principal, query}
   end
 
   defp session_collection_request(query, session_key) do
