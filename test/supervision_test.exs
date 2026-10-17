@@ -39,8 +39,7 @@ defmodule Tightbeam.SupervisionTest do
 
     open_deadline!(ctx.db, "asg_inactive", opened_at, interval_ms)
 
-    deadline =
-      Enum.find(Wakes.list_pending(ctx.db), &(&1.consumer == "assignment_inactivity_deadline"))
+    deadline = pending_deadline!(ctx.db, "asg_inactive")
 
     assert is_map(deadline)
     assert deadline.due_at <= System.system_time(:millisecond)
@@ -59,8 +58,7 @@ defmodule Tightbeam.SupervisionTest do
     assert holder == ctx.holder.session_key
     assert String.starts_with?(episode_ref, "assignment-inactivity-episode-v1:")
 
-    climb =
-      Enum.find(Wakes.list_pending(ctx.db), &(&1.consumer == "assignment_inactivity_climb"))
+    climb = pending_climb!(ctx.db, "asg_inactive")
 
     assert is_map(climb)
 
@@ -97,8 +95,7 @@ defmodule Tightbeam.SupervisionTest do
     assert Wakes.get(ctx.db, notice_id).state == "canceled"
     assert Wakes.get(ctx.db, notice_id).delivered_turn_seq == nil
 
-    next_climb =
-      Enum.find(Wakes.list_pending(ctx.db), &(&1.consumer == "assignment_inactivity_climb"))
+    next_climb = pending_climb!(ctx.db, "asg_inactive")
 
     assert is_map(next_climb)
 
@@ -203,8 +200,7 @@ defmodule Tightbeam.SupervisionTest do
 
     assert is_integer(delivered_turn_seq)
 
-    climb =
-      Enum.find(Wakes.list_pending(ctx.db), &(&1.consumer == "assignment_inactivity_climb"))
+    climb = pending_climb!(ctx.db, "asg_inactive")
 
     assert is_map(climb)
 
@@ -280,10 +276,22 @@ defmodule Tightbeam.SupervisionTest do
   end
 
   defp pending_deadline!(db, assignment_id) do
-    Enum.find(Wakes.list_pending(db), fn wake ->
-      wake.consumer == "assignment_inactivity_deadline" and
-        wake.assignment_id == assignment_id
-    end) || flunk("no pending inactivity deadline for #{assignment_id}")
+    pending_internal_wake!(db, "assignment_inactivity_deadline", assignment_id)
+  end
+
+  defp pending_climb!(db, assignment_id) do
+    pending_internal_wake!(db, "assignment_inactivity_climb", assignment_id)
+  end
+
+  defp pending_internal_wake!(db, consumer, assignment_id) do
+    assert {:ok, [[wake_id]]} =
+             DB.query(
+               db,
+               "SELECT wakeId FROM wakes WHERE consumer=?1 AND assignmentId=?2 AND state='pending' ORDER BY dueAt,wakeId LIMIT 1",
+               [consumer, assignment_id]
+             )
+
+    Wakes.get(db, wake_id)
   end
 
   defp session(db, key, spawned_by) do

@@ -151,15 +151,15 @@ defmodule Tightbeam.WorkItemBracketsTest do
              "work_item",
              assignment_work_item,
              "linked_work_open",
-             "supervision_entitlement",
-             entitlement_id,
+             "routing_bracket",
+             bracket_id,
              1
            ] = cancellation(ctx.db, a_routing)
 
     assert source_assignment_id == assignment.id
     assert disposition_assignment_id == assignment.id
     assert assignment_work_item == a_item.id
-    assert entitlement_id == "#{assignment.id}#1"
+    assert bracket_id == a_item.id
 
     d_item = create(ctx, {:user, "flynn"}, %{title: "Dispatch path"})
     d_routing = routing_wake_id(ctx.db, d_item.id)
@@ -954,9 +954,13 @@ defmodule Tightbeam.WorkItemBracketsTest do
         assert Wakes.get(db, source_wake_id).state == "fired"
         assert Wakes.get(db, carrier_wake_id).state == "fired"
         finish_delivery_queue(db, carrier.session_key)
+        :ok = Wakes.reconcile_delivered_sources(db, carrier.session_key, carrier_wake_id)
+        :ok = WorkItems.reconcile_delivered_brackets(db, carrier.session_key, carrier_wake_id)
 
       {:appended, _, _, _} ->
         finish_delivery_queue(db, wake.session_key)
+        :ok = Wakes.reconcile_delivered_sources(db, wake.session_key, wake.wake_id)
+        :ok = WorkItems.reconcile_delivered_brackets(db, wake.session_key, wake.wake_id)
 
       other ->
         flunk("expected bracket wake delivery, got: #{inspect(other)}")

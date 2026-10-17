@@ -804,7 +804,7 @@ defmodule Tightbeam.Supervision do
             {:replacement, replacement_id} ->
               %{
                 wake_id: wake_id,
-                requester: %{kind: "process", id: "tightbeam:supervision"},
+                requester: %{kind: "process", id: "tightbeam:assignments"},
                 reason_kind: "superseded",
                 causal_source: %{kind: "wake", id: replacement_id},
                 outcome: %{kind: "replacement", replacement_wake_id: replacement_id}
