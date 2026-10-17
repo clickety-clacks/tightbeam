@@ -302,7 +302,7 @@ defmodule Tightbeam.LiveBaseReleaseTest do
 
     :ok =
       Sqlite3.execute(conn, """
-      CREATE TABLE lifecycle_events_idle_cleanup_kind_id(x);
+      CREATE TABLE lifecycle_events_subject_kind(x);
       INSERT INTO lifecycle_events(ts,kind,subject,detail) VALUES(0,'synthetic','preserved','raw history');
       """)
 
@@ -384,7 +384,6 @@ defmodule Tightbeam.LiveBaseReleaseTest do
     assert log =~ "runtime checks restored"
     assert log =~ "database migration lifecycle_runtime_indexes: committed"
     assert log =~ "lifecycle index lifecycle_events_subject_kind: finished elapsed_ms="
-    assert log =~ "lifecycle index lifecycle_events_idle_cleanup_kind_id: finished elapsed_ms="
     IO.puts(log)
 
     target = hd(Schema.guard_compatible_stamps())

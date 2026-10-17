@@ -10,7 +10,6 @@ defmodule Tightbeam.LifecycleRuntimeIndexesTest do
     :ok =
       DB.execute(db, """
       DROP INDEX lifecycle_events_subject_kind;
-      DROP INDEX lifecycle_events_idle_cleanup_kind_id;
       """)
 
     :ok = LifecycleRuntimeFixture.seed!(db)
@@ -36,8 +35,7 @@ defmodule Tightbeam.LifecycleRuntimeIndexesTest do
     :ok =
       DB.execute(db, """
       DROP INDEX lifecycle_events_subject_kind;
-      DROP INDEX lifecycle_events_idle_cleanup_kind_id;
-      CREATE TABLE lifecycle_events_idle_cleanup_kind_id(x);
+      CREATE TABLE lifecycle_events_subject_kind(x);
       INSERT INTO lifecycle_events(ts,kind,subject,detail) VALUES(0,'synthetic','preserved','not json');
       """)
 
@@ -64,11 +62,10 @@ defmodule Tightbeam.LifecycleRuntimeIndexesTest do
     assert {:ok, [[5000]]} = DB.query(db, "PRAGMA busy_timeout")
   end
 
-  test "recorded cleanup migration preserves malformed detail and flags it without blocking" do
+  test "boot preserves legacy cleanup history without rewriting malformed detail" do
     db = start_supervised!({DB, path: ":memory:", name: nil})
     :ok = Schema.ensure_all(db)
     :ok = LifecycleRuntimeFixture.seed!(db)
-    Tightbeam.SchemaShapeRuntimeFixture.downgrade_supervision_recorded_state!(db)
 
     :ok =
       DB.execute(db, """
@@ -77,9 +74,9 @@ defmodule Tightbeam.LifecycleRuntimeIndexesTest do
              (0,'idle_cleanup_pending_observed','bad','not json');
       """)
 
-    # Historical JSON is decoded once during migration; bad records are flagged.
-    log = capture_log(fn -> assert :ok = Schema.ensure_all(db) end)
-    assert log =~ "invalid idle cleanup observation"
+    # Retired source machinery no longer interprets its historical rows during
+    # boot. The data remains available for audit and does not block startup.
+    _log = capture_log(fn -> assert :ok = Schema.ensure_all(db) end)
 
     assert {:ok, [[2]]} =
              DB.query(db, "SELECT count(*) FROM lifecycle_events WHERE detail='not json'")
@@ -87,7 +84,7 @@ defmodule Tightbeam.LifecycleRuntimeIndexesTest do
     assert {:ok, [[1]]} =
              DB.query(
                db,
-               "SELECT count(*) FROM lifecycle_events WHERE kind='idle_cleanup_refused' AND subject='bad'"
+               "SELECT count(*) FROM lifecycle_events WHERE kind='idle_cleanup_pending_observed' AND subject='bad' AND detail='not json'"
              )
 
     :ok = LifecycleRuntimeFixture.assert_plans_and_results!(db)

@@ -163,6 +163,7 @@ class PackageSoakChecks(unittest.TestCase):
                     "source_sha": "a" * 40, "archive_sha256": soak.digest(archive),
                     "build_identity": identity, "payload_manifest_sha256": soak.digest(manifest)}))
                 def pin(p):
+                    p = p.resolve()
                     return {"path": str(p), "sha256": soak.digest(p)}
                 package = {"root": str(root), "archive": pin(archive), "manifest": pin(manifest),
                            "build_identity": identity, "source_sha": "a" * 40, "version_sha": "a" * 8,

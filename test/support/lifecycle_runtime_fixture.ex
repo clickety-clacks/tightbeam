@@ -16,9 +16,6 @@ defmodule Tightbeam.LifecycleRuntimeFixture do
        ["index-assignment", "refusal"], [[1]]},
       {"supervision.ex", "SELECT w.wakeId,w.sessionKey FROM wakes w", [],
        [["index-unobserved", "index-session"]]},
-      # Cleanup observations now read recorded session state instead of history.
-      {"supervision.ex", "SELECT CASE WHEN idleCleanupObservedWake", ["index-session", nil],
-       [["index-observed-new"]]},
       {"gateway.ex", "SELECT seq, role, sender, content, attachments", ["index-session", 3, 100],
        [[1, "user", nil, "visible", "[]"]]},
       {"workspace_cleanup.ex", "SELECT sessionKey,nextAt FROM retired_workspace_cleanup", [],
@@ -37,7 +34,6 @@ defmodule Tightbeam.LifecycleRuntimeFixture do
                  (String.contains?(sql, "lifecycle_events") or
                     prefix in [
                       "SELECT w.wakeId,w.sessionKey FROM wakes w",
-                      "SELECT CASE WHEN idleCleanupObservedWake",
                       "SELECT sessionKey,nextAt FROM retired_workspace_cleanup"
                     ]),
                do: {sql, [sql | acc]},
@@ -82,19 +78,6 @@ defmodule Tightbeam.LifecycleRuntimeFixture do
       IO.puts("lifecycle plan #{file}: #{inspect(details)}")
     end
 
-    occurrence =
-      Enum.find(cases(), &String.starts_with?(String.trim(&1.sql), "SELECT CASE WHEN"))
-
-    assert DB.query(db, occurrence.sql, ["index-session", "index-observed-new"]) ==
-             {:ok, [["index-observed"]]}
-
-    assert DB.query(db, occurrence.sql, ["index-session", "other-wake"]) ==
-             {:ok, [["index-observed-new"]]}
-
-    assert DB.query(db, occurrence.sql, ["other-session", nil]) == {:ok, [["other-wake"]]}
-    assert DB.query(db, occurrence.sql, ["other-session", "other-wake"]) == {:ok, [[nil]]}
-    assert DB.query(db, occurrence.sql, ["absent-session", nil]) == {:ok, []}
-
     assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
     :ok
   end
@@ -102,13 +85,13 @@ defmodule Tightbeam.LifecycleRuntimeFixture do
   def seed!(db) do
     :ok =
       DB.execute(db, """
-      INSERT INTO sessions(sessionKey,displayName,ownerUserId,origin,archetype,harness,provider,model,createdAt,updatedAt,idleCleanupObservedWake,idleCleanupPreviousWake)
-      VALUES ('index-session','Synthetic','index-owner','process:synthetic','default','claude','anthropic','fable',0,0,'index-observed-new','index-observed'),
-             ('other-session','Other','index-owner','process:synthetic','default','claude','anthropic','fable',0,0,'other-wake',NULL);
+      INSERT INTO sessions(sessionKey,displayName,ownerUserId,origin,archetype,harness,provider,model,createdAt,updatedAt)
+      VALUES ('index-session','Synthetic','index-owner','process:synthetic','default','claude','anthropic','fable',0,0),
+             ('other-session','Other','index-owner','process:synthetic','default','claude','anthropic','fable',0,0);
       INSERT INTO retired_workspace_cleanup(sessionKey,nextAt) VALUES ('index-session',0);
-      INSERT INTO wakes(wakeId,sessionKey,origin,prompt,dueAt,createdAt,idleCleanupObserved)
-      VALUES ('index-unobserved','index-session','process:synthetic','fixture',0,0,0),
-             ('index-observed','index-session','process:synthetic','fixture',0,0,1);
+      INSERT INTO wakes(wakeId,sessionKey,origin,prompt,dueAt,createdAt)
+      VALUES ('index-unobserved','index-session','process:synthetic','fixture',0,0),
+             ('index-observed','index-session','process:synthetic','fixture',0,0);
       INSERT INTO lifecycle_events(ts,kind,subject,detail) VALUES
         (0,'supervision_entitlement_old','index-assignment','old'),
         (0,'supervision_entitlement_recovery_refused','index-assignment','refusal'),
