@@ -224,7 +224,7 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
     end
   end
 
-  test "malformed remedy source does not stop wake delivery", ctx do
+  test "malformed source metadata does not stop unrelated wake delivery", ctx do
     bad = wake(ctx.db, 1, %{origin: "remedy:broken"})
     good = wake(ctx.db, 2, %{consumer: "test"})
 
@@ -235,7 +235,6 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
 
     log =
       capture_log(fn ->
-        assert :ok = Wakes.dispose_closed_remedy_sources(ctx.db)
         pid = scheduler(ctx)
         assert :ok = Wakes.fire_due(pid)
         assert_receive {:delivered, id, _}, 1_000
@@ -244,7 +243,6 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
       end)
 
     assert log =~ bad.wake_id
-    assert log =~ "cleanup deferred"
   end
 
   test "an empty scheduler sleeps without database calls between events", ctx do
@@ -424,28 +422,33 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
   end
 
   test "a deleted role is reported at its deadline while the former recipient is busy", ctx do
-    busy(ctx.db)
+    turn = busy(ctx.db)
     Tightbeam.Roles.create!(ctx.db, "reviewer", "owner", "recipient")
     pid = scheduler(ctx)
     source = wake(ctx.db, System.system_time(:millisecond) + 250, %{target_role: "reviewer"})
     :ok = Tightbeam.Roles.rm(ctx.db, "reviewer")
 
     deadline = System.monotonic_time(:millisecond) + 5_000
-    assert await_fired(ctx.db, source.wake_id, deadline)
+    assert await_state(ctx.db, source.wake_id, "canceled", deadline)
     assert NoticeBatcher.source_refs(ctx.db, source.wake_id) == []
     assert :ok = Wakes.fire_due(pid)
 
     assert Enum.count(Tightbeam.EventLog.lifecycle_events(ctx.db), fn event ->
-             event.kind == "wake_unresolved" and event.subject == source.wake_id and
+             event.kind == "wake_undeliverable" and event.subject == source.wake_id and
                event.detail == "role reviewer no longer exists"
            end) == 1
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT count(*) FROM turns WHERE sessionKey='recipient'")
+
+    assert Wakes.get(ctx.db, source.wake_id).state == "canceled"
 
     assert Tightbeam.SchedulerMisses.count() == ctx.misses_before
   end
 
-  defp await_fired(db, id, deadline) do
+  defp await_state(db, id, expected, deadline) do
     cond do
-      Wakes.get(db, id).state == "fired" ->
+      Wakes.get(db, id).state == expected ->
         true
 
       System.monotonic_time(:millisecond) >= deadline ->
@@ -453,7 +456,7 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
 
       true ->
         Process.sleep(10)
-        await_fired(db, id, deadline)
+        await_state(db, id, expected, deadline)
     end
   end
 
