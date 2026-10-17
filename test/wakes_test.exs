@@ -363,9 +363,7 @@ defmodule Tightbeam.WakesTest do
     assert carrier_canceled_at == canceled_at
   end
 
-  test "retarget preserves the wake and typed cancellation atomically carries the controller", %{
-    db: db
-  } do
+  test "a pending ordinary notice is readdressed in place without controller state", %{db: db} do
     :ok =
       DB.execute(
         db,
@@ -379,128 +377,39 @@ defmodule Tightbeam.WakesTest do
            'anthropic', 'fable', 'eezo', 'active', 1, 1),
           ('replacement', 'replacement', 'flynn', 'user:flynn', 'default',
            'claude', 'anthropic', 'fable', 'eezo', 'active', 1, 1);
-        INSERT INTO work_items
-          (id, title, ownerUserId, state, createdByUser, createdAt)
-        VALUES ('wi_retarget', 'Retarget work', 'flynn', 'open', 'flynn', 1);
-        INSERT INTO assignments
-          (id, subject, holderKey, openedByUser, openedAt, workItemId)
-        VALUES
-          ('asg_retarget', 'retarget me', 'retiring', 'flynn', 1,
-           'wi_retarget');
-        INSERT INTO supervision_entitlements
-          (assignmentId, generation, dueAt, state, lastAttemptGeneration,
-           claimClock, basisKind, basisId, terminusAt, cause, principal,
-           supervisionIntervalMs)
-        VALUES
-          ('asg_retarget', 2, 5000, 'armed', NULL, NULL, 'prod_scheduled',
-           'pending-seed', NULL, 'prod_scheduled', 'process:tightbeam', 1000);
         """
       )
 
     original =
       Wakes.schedule(db, %{
         session_key: "retiring",
-        target_role: "reviewer",
         origin: "process:tightbeam",
         prompt: "continue",
         consumer: "prompt",
         due_at: 4_000,
-        condition_kind: "retirement",
-        condition_scope: "retiring",
-        creator_session_key: "retiring",
-        rumination: true,
-        work_item_id: "wi_retarget",
-        assignment_id: "asg_retarget",
-        target_gate: 0,
-        reresolve: "lineage",
-        reresolve_seed: "retiring",
-        reresolve_rung: 1
+        creator_session_key: "retiring"
       })
 
     {:ok, _} = DB.query(db, "UPDATE wakes SET createdAt=100 WHERE wakeId=?1", [original.wake_id])
     original = Wakes.get(db, original.wake_id)
 
-    {:ok, _} =
-      DB.query(
-        db,
-        "UPDATE supervision_entitlements SET basisId=?2 WHERE assignmentId=?1",
-        ["asg_retarget", original.wake_id]
-      )
-
-    {:ok, _} =
-      DB.query(
-        db,
-        """
-        INSERT INTO supervision_liveness_sidecar
-          (wakeId, assignmentId, controllerOrigin, wakeKind, controllerState,
-           chargedGeneration)
-        VALUES (?1, 'asg_retarget', 'scheduled', 'escalation', 'pending', 2)
-        """,
-        [original.wake_id]
-      )
-
-    assert {:ok, replacement} =
+    assert {:ok, readdressed} =
              DB.transaction(db, fn txn ->
-               replacement = Wakes.retarget_in_txn(txn, original.wake_id, "replacement")
+               {:ok, readdressed} =
+                 Wakes.readdress_pending_in_txn(txn, original.wake_id, "replacement")
 
-               assert Wakes.cancel_in_txn(
-                        txn,
-                        %{
-                          wake_id: original.wake_id,
-                          requester: %{kind: "process", id: "tightbeam:retirement"},
-                          reason_kind: "target_retired",
-                          causal_source: %{kind: "session_transition", id: "retiring"},
-                          outcome: %{
-                            kind: "replacement",
-                            replacement_wake_id: replacement.wake_id
-                          }
-                        },
-                        fn -> 6_000 end
-                      )
-
-               replacement
+               readdressed
              end)
 
-    assert %{state: "canceled", canceled_at: 6_000} = Wakes.get(db, original.wake_id)
-
-    assert %{
-             state: "pending",
-             session_key: "replacement",
-             target_role: "reviewer",
-             origin: "process:tightbeam",
-             prompt: "continue",
-             consumer: "prompt",
-             due_at: 4_000,
-             fired_at: nil,
-             canceled_at: nil,
-             condition_kind: "retirement",
-             condition_scope: "retiring",
-             condition_after_id: 0,
-             fired_by: nil,
-             creator_session_key: "retiring",
-             rumination: true,
-             work_item_id: "wi_retarget",
-             assignment_id: "asg_retarget",
-             target_gate: 0,
-             reresolve: "lineage",
-             reresolve_seed: "retiring",
-             reresolve_rung: 1
-           } = Wakes.get(db, replacement.wake_id)
-
-    assert replacement.wake_id != original.wake_id
-    assert replacement.created_at > original.created_at
-
-    assert {:ok, sidecars} =
-             DB.query(
-               db,
-               "SELECT wakeId, controllerState, chargedGeneration FROM supervision_liveness_sidecar"
-             )
-
-    states =
-      Map.new(sidecars, fn [wake_id, state, generation] -> {wake_id, {state, generation}} end)
-
-    assert states[original.wake_id] == {"settled", 2}
-    assert states[replacement.wake_id] == {"pending", 2}
+    assert readdressed.wake_id == original.wake_id
+    assert readdressed.created_at == original.created_at
+    assert readdressed.session_key == "replacement"
+    assert readdressed.prompt == original.prompt
+    assert readdressed.due_at == original.due_at
+    assert readdressed.target_gate == 1
+    assert readdressed.state == "pending"
+    assert is_nil(readdressed.delivered_turn_seq)
+    assert {:ok, []} = DB.query(db, "SELECT wakeId FROM wake_cancellations")
   end
 
   test "O1: retarget carries the sender's class election AND the original ceiling verbatim — never restarts it",
@@ -1415,7 +1324,7 @@ defmodule Tightbeam.WakesTest do
       assert parent_relation_snapshot(db) == before
     end
 
-    test "session opener is preferred and fallback stays with parent owner, never child", %{
+    test "notice address is stored at admission and retirement readdresses it without source lookup", %{
       db: db
     } do
       personal = parent_relation_fixture(db)
@@ -1435,23 +1344,26 @@ defmodule Tightbeam.WakesTest do
       assert wake.session_key == "accountable-parent"
       assert wake.owner_user_id == "parent-owner"
 
-      assert {:ok, {:terminal_notice, preferred}} =
-               DB.transaction(db, &Wakes.terminal_notice_delivery_in_txn(&1, wake.wake_id))
-
-      assert preferred.session_key == "accountable-parent"
-
+      # Once stored, a notice keeps its source-selected address and payload.
+      # Changing the assignment cannot make delivery re-resolve its owner.
       :ok =
         DB.execute(
           db,
-          "UPDATE sessions SET state='retired' WHERE sessionKey='accountable-parent'"
+          "UPDATE assignments SET openedByUser=NULL,openedBySession='independent-child' WHERE id='asg_parent_relation'"
         )
 
-      assert {:ok, {:terminal_notice, fallback}} =
-               DB.transaction(db, &Wakes.terminal_notice_delivery_in_txn(&1, wake.wake_id))
+      assert %{session_key: "accountable-parent", prompt: prompt, state: "pending"} =
+               Wakes.get(db, wake.wake_id)
 
-      assert fallback.session_key == personal
-      assert fallback.prompt == wake.prompt
-      assert fallback.wake_id == wake.wake_id
+      assert prompt == wake.prompt
+
+      assert %{state: "retired"} =
+               Tightbeam.Org.retire(db, "accountable-parent", "user:parent-owner", 1_000)
+
+      assert %{wake_id: wake_id, session_key: ^personal, prompt: ^prompt, state: "pending"} =
+               Wakes.get(db, wake.wake_id)
+
+      assert wake_id == wake.wake_id
 
       assert {:ok, [["active"]]} =
                DB.query(db, "SELECT state FROM sessions WHERE sessionKey='independent-child'")

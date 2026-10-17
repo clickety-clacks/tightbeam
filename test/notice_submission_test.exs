@@ -37,29 +37,8 @@ defmodule Tightbeam.NoticeSubmissionTest do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 42)
   end
 
-  test "a changed controller entitlement rolls back terminal and sibling restoration atomically",
-       %{tmp_dir: tmp} do
-    Tightbeam.NoticeBatcherFixture.run!(tmp, 33)
-  end
-
-  test "a restored prod reuses its charged generation and settles once across reopen", %{
-    tmp_dir: tmp
-  } do
-    Tightbeam.NoticeBatcherFixture.run!(tmp, 34)
-  end
-
   test "a missing bubble cause cannot partially restore siblings", %{tmp_dir: tmp} do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 35)
-  end
-
-  test "a scheduled escalation delegates original transfer through repeated prewrite successors",
-       %{tmp_dir: tmp} do
-    Tightbeam.NoticeBatcherFixture.run!(tmp, 36)
-  end
-
-  test "a retirement successor retains the original predecessor outcome across retry and reopen",
-       %{tmp_dir: tmp} do
-    Tightbeam.NoticeBatcherFixture.run!(tmp, 37)
   end
 
   test "a deterministic retry name without prewrite evidence cannot delegate or suppress failure",

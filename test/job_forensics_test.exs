@@ -697,6 +697,24 @@ defmodule Tightbeam.JobForensicsTest do
     session(db, "open-holder")
     assignment(db, "asg_open_cancel", "wi_open_cancel", "open-holder")
 
+    opened_at = System.system_time(:millisecond)
+
+    assert {:ok, _} =
+             DB.query(db, "UPDATE assignments SET openedAt=?2 WHERE id=?1", [
+               "asg_open_cancel",
+               opened_at
+             ])
+
+    assert {:ok, :ok} =
+             DB.transaction(db, fn txn ->
+               Tightbeam.Supervision.assignment_opened_in_txn(
+                 txn,
+                 "asg_open_cancel",
+                 opened_at,
+                 60_000
+               )
+             end)
+
     wake =
       Wakes.schedule(db, %{
         session_key: "open-holder",
@@ -731,27 +749,27 @@ defmodule Tightbeam.JobForensicsTest do
     assert Wakes.get(db, wake.wake_id).state == "pending"
     refute Enum.any?(trace(db, "wi_open_cancel").timeline, &(&1.type == "wake_canceled"))
 
-    {:ok, _} =
-      DB.query(
-        db,
-        """
-        INSERT INTO supervision_entitlements
-          (assignmentId, generation, dueAt, state, lastAttemptGeneration, claimClock,
-           basisKind, basisId, terminusAt, cause, principal, supervisionIntervalMs)
-        VALUES ('asg_open_cancel', 1, 1000, 'armed', NULL, NULL,
-                'assignment_open', 'asg_open_cancel', NULL, 'assignment_open',
-                'process:tightbeam', 1000)
-        """
-      )
+    assert {:ok, [[trigger_id]]} =
+             DB.query(
+               db,
+               "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline' AND state='pending'",
+               ["asg_open_cancel"]
+             )
 
-    valid_command =
-      put_in(command, [:outcome, :liveness_trigger], %{
-        kind: "supervision_entitlement",
-        id: "asg_open_cancel#1"
-      })
+    assert {:ok, true} =
+             DB.transaction(db, fn txn ->
+               {:ok, trigger} =
+                 Tightbeam.Supervision.inactivity_deadline_trigger_in_txn(
+                   txn,
+                   {:assignment, "asg_open_cancel"}
+                 )
 
-    {:ok, true} =
-      DB.transaction(db, fn txn -> typed_cancel_in_txn(txn, wake.wake_id, valid_command) end)
+               typed_cancel_in_txn(
+                 txn,
+                 wake.wake_id,
+                 put_in(command, [:outcome, :liveness_trigger], trigger)
+               )
+             end)
 
     entry = canceled_entry(db, "wi_open_cancel", wake.wake_id)
 
@@ -768,8 +786,8 @@ defmodule Tightbeam.JobForensicsTest do
       primaryWorkKind: "assignment",
       primaryWorkId: "asg_open_cancel",
       workImpactKind: "linked_work_open",
-      livenessTriggerKind: "supervision_entitlement",
-      livenessTriggerId: "asg_open_cancel#1",
+      livenessTriggerKind: "pending_wake",
+      livenessTriggerId: trigger_id,
       actionNeeded: true
     })
 
@@ -900,7 +918,17 @@ defmodule Tightbeam.JobForensicsTest do
 
     :ok = DB.execute(legacy_db, wakes_ddl <> ";")
 
-    # A predecessor fixture must exclude later delivery and cleanup columns too.
+    # Model an older schema that already had the retired supervision history
+    # columns. The 0.1.10 source migration must preserve these when restoring
+    # the newer notice columns below; it need not create them on a fresh store.
+    :ok =
+      DB.execute(legacy_db, """
+      ALTER TABLE wakes ADD COLUMN idleCleanupObserved INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE wakes ADD COLUMN idleCleanupGroup TEXT;
+      ALTER TABLE wakes ADD COLUMN idleCleanupRecorded INTEGER NOT NULL DEFAULT 0;
+      """)
+
+    # A predecessor fixture must exclude later delivery and source columns.
     :ok =
       DB.execute(legacy_db, """
       ALTER TABLE wakes DROP COLUMN sourceClientIdentity;
@@ -908,16 +936,13 @@ defmodule Tightbeam.JobForensicsTest do
       ALTER TABLE wakes DROP COLUMN sourceVisibilityScope;
       ALTER TABLE wakes DROP COLUMN sourceAddress;
       ALTER TABLE wakes DROP COLUMN deliveredTurnSeq;
-      ALTER TABLE wakes DROP COLUMN idleCleanupObserved;
-      ALTER TABLE wakes DROP COLUMN idleCleanupGroup;
-      ALTER TABLE wakes DROP COLUMN idleCleanupRecorded;
       """)
 
     assert {:ok, []} =
              DB.query(legacy_db, """
              SELECT name FROM pragma_table_info('wakes')
              WHERE name IN ('sourceClientIdentity','sourceAttachments','sourceVisibilityScope','sourceAddress',
-                            'deliveredTurnSeq','idleCleanupObserved','idleCleanupGroup','idleCleanupRecorded')
+                            'deliveredTurnSeq')
              """)
 
     :ok =
@@ -1059,7 +1084,8 @@ defmodule Tightbeam.JobForensicsTest do
     assert Enum.map(v1_types, & &1.type) == ["turn_start", "turn_end"]
 
     causal = Enum.filter(timeline, &(&1.type == "causal_event"))
-    assert length(causal) == 2
+    assert length(causal) == 1
+    assert hd(causal).kind == "disposition_transition"
     assert Enum.map(causal, & &1.seqTiebreak) == Enum.sort(Enum.map(causal, & &1.seqTiebreak))
     assert Enum.all?(causal, &String.starts_with?(&1.id, "ce:"))
 
