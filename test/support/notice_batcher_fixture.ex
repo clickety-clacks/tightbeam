@@ -496,7 +496,13 @@ defmodule Tightbeam.NoticeBatcherFixture do
     assert failed.retry_count == 0
     assert Wakes.get(db, old_carrier).state == "fired"
     assert deliver(db, Wakes.get(db, unresolved.wake_id)) == :skipped
-    assert Wakes.get(db, unresolved.wake_id).state == "pending"
+    assert Wakes.get(db, unresolved.wake_id).state == "canceled"
+    assert {:ok, [["target_unresolvable", "scheduler_delivery", "no_replacement"]]} =
+             DB.query(
+               db,
+               "SELECT reasonKind,causalSourceKind,outcomeKind FROM wake_cancellations WHERE wakeId=?1",
+               [unresolved.wake_id]
+             )
     assert count(db, "turns", "sessionKey=?1", [unresolved.session_key]) == 0
     assert NoticeBatcher.recover(db, unresolved.due_at) == []
     assert NoticeBatcher.batch(db, old_batch) == failed
@@ -1606,10 +1612,15 @@ defmodule Tightbeam.NoticeBatcherFixture do
     [third_carrier] = NoticeBatcher.recover(db, third_at)
     assert source_ids(db, third_carrier) == [first_successor, second_successor]
 
-    assert count(db, "wake_retry_attempts", "rootWakeId IN (?1,?2)", [
+    assert count(db, "wake_retry_attempts", "rootWakeId IN (?1,?2) AND outcome='failed'", [
              first.wake_id,
              second.wake_id
            ]) == 4
+
+    assert count(db, "wake_retry_attempts", "rootWakeId IN (?1,?2) AND outcome='pending'", [
+             first.wake_id,
+             second.wake_id
+           ]) == 2
   end
 
   defp scenario(35, db) do

@@ -29,7 +29,7 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
 
   setup do
     db = :"completion_handoff_#{System.unique_integer([:positive])}"
-    scheduler = :"completion_handoff_scheduler_#{System.unique_integer([:positive])}"
+    scheduler = Tightbeam.WakeScheduler
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Tightbeam.Schema.ensure_all(db)
 
@@ -311,6 +311,10 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     assert :ok = Wakes.fire_due(ctx.scheduler)
     root_carrier_id = assert_delivered_carrier(ctx.db, root.wake_id)
     finish_carrier_turn!(ctx.db, root_carrier_id)
+    # The source-owning scheduler handles the post-commit delivery record in
+    # its mailbox after the carrier transaction returns. A synchronous pass is
+    # the barrier before reading the reminder it records.
+    assert :ok = Wakes.fire_due(ctx.scheduler)
     [reminder] = pending_reminders(ctx.db, root.wake_id)
     delivered_root = Wakes.get(ctx.db, root.wake_id)
 
@@ -756,7 +760,7 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
   end
 
   defp start_scheduler(db) do
-    name = :"completion_handoff_scheduler_restart_#{System.unique_integer([:positive])}"
+    name = Tightbeam.WakeScheduler
 
     start_supervised!(
       Supervisor.child_spec(

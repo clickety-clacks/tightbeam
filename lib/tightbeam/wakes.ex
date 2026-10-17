@@ -630,7 +630,15 @@ defmodule Tightbeam.Wakes do
       SELECT wakeId,
         CASE WHEN deliveredTurnSeq IS NOT NULL THEN 'delivered' ELSE 'delivery-failed' END
       FROM wakes
-      WHERE (?1 IS NULL OR sessionKey=?1) AND (?2 IS NULL OR wakeId=?2)
+      WHERE (?1 IS NULL OR sessionKey=?1)
+        AND (
+          ?2 IS NULL OR wakeId=?2 OR EXISTS (
+            SELECT 1 FROM notice_batches b
+            JOIN notice_batch_members m ON m.batchId=b.batchId
+            WHERE b.deliveryWakeId=?2 AND b.state='delivered'
+              AND m.state='included' AND m.sourceWakeId=wakes.wakeId
+          )
+        )
         AND (
           (waitMode IS NOT NULL AND EXISTS (
             SELECT 1 FROM supervision_liveness_sidecar s
@@ -4290,7 +4298,7 @@ defmodule Tightbeam.Wakes do
     rows =
       Txn.q(
         txn,
-        "SELECT wakeId, origin, state, conditionKind, work_item_id, assignmentId, consumer, obligationRef, creatorSessionKey FROM wakes WHERE wakeId=?1",
+        "SELECT wakeId, origin, state, conditionKind, work_item_id, assignmentId, consumer, obligationRef, creatorSessionKey, sessionKey FROM wakes WHERE wakeId=?1",
         [wake_id]
       )
 
@@ -4306,7 +4314,8 @@ defmodule Tightbeam.Wakes do
             _assignment,
             _consumer,
             _obligation,
-            _creator
+            _creator,
+            _session_key
           ]
         ] ->
           rows
@@ -4316,7 +4325,8 @@ defmodule Tightbeam.Wakes do
             txn,
             """
             SELECT w.wakeId, w.origin, w.state, w.conditionKind, w.work_item_id,
-                   w.assignmentId, w.consumer, w.obligationRef, w.creatorSessionKey
+                   w.assignmentId, w.consumer, w.obligationRef, w.creatorSessionKey,
+                   w.sessionKey
             FROM wake_retry_attempts r
             JOIN wakes w ON w.wakeId=r.wakeId
             WHERE r.rootWakeId=?1 AND r.outcome='pending' AND w.state='pending'
@@ -4337,7 +4347,8 @@ defmodule Tightbeam.Wakes do
           assignment_id,
           consumer,
           obligation_ref,
-          creator_session_key
+          creator_session_key,
+          session_key
         ]
       ] ->
         {:ok,
@@ -4349,7 +4360,8 @@ defmodule Tightbeam.Wakes do
            assignment_id: assignment_id,
            consumer: consumer,
            obligation_ref: obligation_ref,
-           creator_session_key: creator_session_key
+           creator_session_key: creator_session_key,
+           session_key: session_key
          }}
 
       _ ->
