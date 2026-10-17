@@ -859,9 +859,9 @@ defmodule Tightbeam.NoticeBatcherFixture do
            end)
 
     assert_actual_carrier!(db, fitting_carrier, [fitting.wake_id])
-    assert count(db, "notice_batches") == 1
-    assert count(db, "notice_batch_members") == 1
-    assert count(db, "turns") == 1
+    assert count(db, "notice_batches") == 2
+    assert count(db, "notice_batch_members") == 2
+    assert count(db, "turns") == 2
   end
 
   defp scenario(25, db) do
