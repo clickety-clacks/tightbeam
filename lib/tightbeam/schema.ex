@@ -1569,6 +1569,7 @@ defmodule Tightbeam.Schema do
               "livenessTriggerId IS NULL AND actionNeeded = 0))"
 
           true = String.contains?(sql, no_replacement_anchor)
+
           [before_no_replacement, after_no_replacement] =
             String.split(sql, no_replacement_anchor, parts: 2)
 
