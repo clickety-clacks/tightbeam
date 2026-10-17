@@ -1011,7 +1011,10 @@ defmodule Tightbeam.AssignmentsTest do
       assert personal != "notice-parent"
 
       assert {:ok, _} =
-               DB.query(ctx.db, "UPDATE sessions SET state='active' WHERE sessionKey='notice-parent'")
+               DB.query(
+                 ctx.db,
+                 "UPDATE sessions SET state='active' WHERE sessionKey='notice-parent'"
+               )
 
       assert :ok = Wakes.fire_due(scheduler)
       assert %{state: "fired", session_key: "notice-parent"} = Wakes.get(ctx.db, wake.wake_id)
@@ -1364,8 +1367,10 @@ defmodule Tightbeam.AssignmentsTest do
 
         before = accountable_disposition_snapshot(ctx.db)
         assert :appended = deliver_terminal_notice(ctx.db, wake)
+
         assert {:ok, [[message_id]]} =
                  DB.query(ctx.db, "SELECT messageId FROM turns WHERE wakeId=?1", [wake.wake_id])
+
         message = Projection.get(ctx.db, message_id)
         assert message.content =~ token
         assert message.content =~ "outcome=\"revoked\""
@@ -1633,8 +1638,10 @@ defmodule Tightbeam.AssignmentsTest do
     assert session_key == wake.session_key
     assert prompt == wake.prompt
     assert source_delivery_turns(db, wake.wake_id) == []
+
     assert {:ok, []} =
              DB.query(db, "SELECT wakeId FROM wake_cancellations WHERE wakeId=?1", [wake.wake_id])
+
     assert {:ok, []} =
              DB.query(
                db,
@@ -6117,5 +6124,4 @@ defmodule Tightbeam.AssignmentsTest do
       MapSet.member?(wake_ids, wake_id)
     end)
   end
-
 end
