@@ -799,16 +799,7 @@ defmodule Tightbeam.EscalationDeliveryFixture do
     assert %{state: "retired"} =
              Org.retire(ctx.db, effort_wake.session_key, "user:flynn", 1_000)
 
-    assert %{state: "canceled"} = Wakes.get(ctx.db, effort_wake.wake_id)
-
-    assert {:ok, [[replacement_id]]} =
-             DB.query(
-               ctx.db,
-               "SELECT replacementWakeId FROM wake_cancellations WHERE wakeId=?1",
-               [effort_wake.wake_id]
-             )
-
-    replacement = Wakes.get(ctx.db, replacement_id)
+    readdressed_effort_wake = Wakes.get(ctx.db, effort_wake.wake_id)
 
     assert %{
              state: "pending",
@@ -817,11 +808,19 @@ defmodule Tightbeam.EscalationDeliveryFixture do
              target_role: nil,
              reresolve: nil
            } =
-             replacement
+             readdressed_effort_wake
 
-    assert replacement.prompt == effort_wake.prompt
-    assert replacement.assignment_id == effort_wake.assignment_id
-    assert replacement.obligation_ref == effort_wake.obligation_ref
+    assert readdressed_effort_wake.wake_id == effort_wake.wake_id
+    assert readdressed_effort_wake.prompt == effort_wake.prompt
+    assert readdressed_effort_wake.assignment_id == effort_wake.assignment_id
+    assert readdressed_effort_wake.obligation_ref == effort_wake.obligation_ref
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM wake_cancellations WHERE wakeId=?1",
+               [effort_wake.wake_id]
+             )
 
     assert %{state: "pending", session_key: "top", target_gate: 1} =
              Wakes.get(ctx.db, control.wake_id)
@@ -832,7 +831,7 @@ defmodule Tightbeam.EscalationDeliveryFixture do
     drain!(ctx)
 
     for {wake, expected_session} <- [
-          {replacement, "top"},
+          {readdressed_effort_wake, "top"},
           {statute_wake, main_key},
           {Wakes.get(ctx.db, control.wake_id), "top"}
         ] do

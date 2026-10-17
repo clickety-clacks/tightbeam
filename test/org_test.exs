@@ -973,7 +973,7 @@ defmodule Tightbeam.OrgTest do
 
     assert %{state: "retired"} = Org.retire(db, "retiring", "user:flynn", 1_000)
 
-    assert %{state: "pending", session_key: main_key, target_gate: 1, work_item_id: "orphan"} =
+    assert %{state: "pending", session_key: ^main_key, target_gate: 1, work_item_id: "orphan"} =
              Wakes.get(db, wake.wake_id)
 
     assert cancellation(db, wake.wake_id) == nil
