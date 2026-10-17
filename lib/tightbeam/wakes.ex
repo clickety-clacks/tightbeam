@@ -561,49 +561,6 @@ defmodule Tightbeam.Wakes do
     end
   end
 
-  @doc false
-  def readdress_terminal_notices_for_work_item_in_txn(%Txn{} = txn, work_item_id)
-      when is_binary(work_item_id) do
-    wake_ids =
-      Txn.q(
-        txn,
-        """
-        SELECT wakeId FROM wakes
-        WHERE work_item_id=?1 AND state='pending' AND deliveredTurnSeq IS NULL
-          AND substr(obligationRef,1,length(?2))=?2
-        ORDER BY createdAt,wakeId
-        """,
-        [work_item_id, @terminal_notice_marker]
-      )
-      |> Enum.map(&hd/1)
-
-    Enum.each(wake_ids, fn wake_id ->
-      case get_in_txn(txn, wake_id) do
-        %{obligation_ref: @terminal_notice_marker <> _} = wake ->
-          with {:ok, identity_wake} <- terminal_notice_identity_in_txn(txn, wake),
-               {:ok, event} <- terminal_event_for_wake_in_txn(txn, identity_wake),
-               true <- event.work_item_id == work_item_id,
-               {:ok, recipient} <- terminal_notice_recipient_in_txn(txn, event),
-               {:ok, _updated} <- readdress_pending_in_txn(txn, wake_id, recipient) do
-            :ok
-          else
-            _ ->
-              # The source remains durable and pending. A later owner update or
-              # explicit source recovery can reconcile it without making
-              # ordinary delivery inspect the terminal event.
-              :ok
-          end
-
-        _ ->
-          :ok
-      end
-    end)
-
-    :ok
-  end
-
-  def readdress_terminal_notices_for_work_item_in_txn(%Txn{}, _work_item_id), do: :ok
-
   defp schedule_terminal_notice_in_txn(txn, event, notice, relation, address) do
     schedule_in_txn(
       txn,

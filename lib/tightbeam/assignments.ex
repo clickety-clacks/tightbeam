@@ -643,8 +643,6 @@ defmodule Tightbeam.Assignments do
 
       liveness_trigger = disposition_liveness_trigger!(txn, work_item_id)
 
-      Supervision.assignment_closed_in_txn(txn, assignment_id)
-
       disposition =
         assignment_disposition_command(
           assignment_id,
@@ -660,6 +658,8 @@ defmodule Tightbeam.Assignments do
         disposition,
         %{verb: "retire", principal: principal}
       )
+
+      Supervision.assignment_closed_in_txn(txn, assignment_id)
 
       DB.record_row_commit(txn, %{
         verb: "retire",
@@ -2632,8 +2632,6 @@ defmodule Tightbeam.Assignments do
 
     liveness_trigger = disposition_liveness_trigger!(txn, closed_assignment.workItemId)
 
-    Supervision.assignment_closed_in_txn(txn, assignment.id)
-
     disposition =
       assignment_disposition_command(
         assignment.id,
@@ -2649,6 +2647,8 @@ defmodule Tightbeam.Assignments do
       disposition,
       %{verb: "attest", principal: principal_id(call.principal)}
     )
+
+    Supervision.assignment_closed_in_txn(txn, assignment.id)
 
     append_attest_marker(txn, attest)
     append_assignment_marker(txn, closed_assignment, :closed)
@@ -3194,8 +3194,6 @@ defmodule Tightbeam.Assignments do
       liveness_trigger
     )
 
-    Supervision.assignment_closed_in_txn(txn, assignment_id)
-
     disposition =
       assignment_disposition_command(
         assignment_id,
@@ -3211,6 +3209,8 @@ defmodule Tightbeam.Assignments do
       disposition,
       %{verb: "revoke-assignment", principal: principal_id(call.principal)}
     )
+
+    Supervision.assignment_closed_in_txn(txn, assignment_id)
 
     append_assignment_marker(txn, revoked_assignment, :revoked)
     revoked_assignment

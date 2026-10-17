@@ -93,7 +93,8 @@ defmodule Tightbeam.SupervisionTest do
              end)
 
     assert Wakes.get(ctx.db, notice_id).state == "canceled"
-    assert Wakes.get(ctx.db, notice_id).delivered_turn_seq == nil
+    assert {:ok, [[nil]]} =
+             DB.query(ctx.db, "SELECT deliveredTurnSeq FROM wakes WHERE wakeId=?1", [notice_id])
 
     next_climb = pending_climb!(ctx.db, "asg_inactive")
 

@@ -224,8 +224,8 @@ defmodule Tightbeam.WorkItemBracketsTest do
                  """
                  SELECT
                    (SELECT count(*) FROM assignments WHERE subject=?1),
-                   (SELECT count(*) FROM supervision_entitlements e
-                      JOIN assignments a ON a.id=e.assignmentId WHERE a.subject=?1),
+                   (SELECT count(*) FROM wakes w JOIN assignments a ON a.id=w.assignmentId
+                      WHERE a.subject=?1 AND w.consumer='assignment_inactivity_deadline'),
                    (SELECT count(*) FROM effort_checkin_generations g
                       JOIN assignments a ON a.id=g.assignmentId WHERE a.subject=?1),
                    (SELECT count(*) FROM wake_cancellations WHERE wakeId=?2),
@@ -275,8 +275,8 @@ defmodule Tightbeam.WorkItemBracketsTest do
                  """
                  SELECT
                    (SELECT count(*) FROM assignments WHERE subject=?1),
-                   (SELECT count(*) FROM supervision_entitlements e
-                      JOIN assignments a ON a.id=e.assignmentId WHERE a.subject=?1),
+                   (SELECT count(*) FROM wakes w JOIN assignments a ON a.id=w.assignmentId
+                      WHERE a.subject=?1 AND w.consumer='assignment_inactivity_deadline'),
                    (SELECT count(*) FROM effort_checkin_generations g
                       JOIN assignments a ON a.id=g.assignmentId WHERE a.subject=?1),
                    (SELECT count(*) FROM wake_cancellations WHERE wakeId=?2),

@@ -456,10 +456,6 @@ defmodule Tightbeam.WorkItems do
     Txn.q(txn, "UPDATE work_items SET #{assignments} WHERE id = ?1", values)
     updated = fetch_in_txn(txn, item.id)
 
-    if item.deliveryOwnerSessionKey != updated.deliveryOwnerSessionKey do
-      Wakes.readdress_terminal_notices_for_work_item_in_txn(txn, item.id)
-    end
-
     updated
   end
 
