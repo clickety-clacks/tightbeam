@@ -22,7 +22,6 @@ defmodule Tightbeam.Archetypes do
           defaults: %{optional(:harness) => atom(), optional(:model) => Tightbeam.Model.t()},
           references: [%{name: String.t(), location: String.t(), access: String.t() | nil}],
           model_preferences: [Tightbeam.Model.t()],
-          idle_cleanup: boolean(),
           ephemeral: boolean(),
           owner_open_child_prod: boolean(),
           containment: %{fs: :off, network: :open},
@@ -603,7 +602,6 @@ defmodule Tightbeam.Archetypes do
       defaults: %{},
       references: [],
       model_preferences: [],
-      idle_cleanup: true,
       ephemeral: false,
       owner_open_child_prod: false,
       containment: %{fs: :off, network: :open},
@@ -622,7 +620,6 @@ defmodule Tightbeam.Archetypes do
         "defaults",
         "references",
         "model_preferences",
-        "idle_cleanup",
         "ephemeral",
         "owner_open_child_prod",
         "guidance",
@@ -652,12 +649,7 @@ defmodule Tightbeam.Archetypes do
       raise ArgumentError, "archetype ephemeral must be a boolean: #{path}"
     end
 
-    idle_cleanup = Map.get(manifest, "idle_cleanup", true)
     owner_open_child_prod = Map.get(manifest, "owner_open_child_prod", false)
-
-    unless is_boolean(idle_cleanup) do
-      raise ArgumentError, "archetype idle_cleanup must be a boolean: #{path}"
-    end
 
     unless is_boolean(owner_open_child_prod) do
       raise ArgumentError,
@@ -720,7 +712,6 @@ defmodule Tightbeam.Archetypes do
       skills: skills,
       where: where,
       model_preferences: model_preferences,
-      idle_cleanup: idle_cleanup,
       ephemeral: ephemeral,
       owner_open_child_prod: owner_open_child_prod,
       containment: containment,

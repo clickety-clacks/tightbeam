@@ -930,11 +930,37 @@ defmodule Tightbeam.Org do
   Retire a session — soft state flip, never a delete: history, provenance, and
   the pointer chain remain queryable. Returns the updated session.
   """
-  @spec retire(db(), String.t(), String.t(), pos_integer()) :: session()
-  def retire(db \\ Tightbeam.DB, session_key, principal, supervision_interval_ms) do
+  @spec retire(db(), String.t(), String.t()) :: session()
+  def retire(db \\ Tightbeam.DB, session_key, principal) do
     transaction!(db, fn txn ->
-      retire_in_txn(txn, session_key, principal, supervision_interval_ms)
+      retire_in_txn(txn, session_key, principal)
     end)
+  end
+
+  @doc false
+  @spec retire(db(), String.t(), String.t(), pos_integer()) :: session()
+  def retire(db, session_key, principal, supervision_interval_ms)
+      when is_binary(principal) and principal != "" and is_integer(supervision_interval_ms) and
+             supervision_interval_ms > 0 do
+    retire(db, session_key, principal)
+  end
+
+  def retire(_db, _session_key, _principal, _supervision_interval_ms) do
+    raise ArgumentError,
+          "retirement requires a non-empty principal and positive supervision interval"
+  end
+
+  @doc false
+  @spec retire_in_txn(Txn.t(), String.t(), String.t()) :: session()
+  def retire_in_txn(%Txn{} = txn, session_key, principal)
+      when is_binary(principal) and principal != "" do
+    case must_get(txn, session_key) do
+      %{state: "retired"} = session ->
+        session
+
+      %{state: "active"} ->
+        retire_active_in_txn(txn, session_key, principal)
+    end
   end
 
   @doc false
@@ -942,18 +968,7 @@ defmodule Tightbeam.Org do
   def retire_in_txn(%Txn{} = txn, session_key, principal, supervision_interval_ms)
       when is_binary(principal) and principal != "" and is_integer(supervision_interval_ms) and
              supervision_interval_ms > 0 do
-    case must_get(txn, session_key) do
-      %{state: "retired"} = session ->
-        session
-
-      %{state: "active"} ->
-        retire_active_in_txn(
-          txn,
-          session_key,
-          principal,
-          supervision_interval_ms
-        )
-    end
+    retire_in_txn(txn, session_key, principal)
   end
 
   def retire_in_txn(%Txn{}, _session_key, _principal, _supervision_interval_ms) do
@@ -961,20 +976,13 @@ defmodule Tightbeam.Org do
           "retirement requires a non-empty principal and positive supervision interval"
   end
 
-  defp retire_active_in_txn(txn, session_key, principal, supervision_interval_ms) do
-    retirement_epoch = now()
+  def retire_in_txn(%Txn{}, _session_key, _principal) do
+    raise ArgumentError,
+          "retirement requires a non-empty principal"
+  end
 
-    case Supervision.transition_in_txn(txn, %{
-           kind: "parent_target_retired",
-           session_key: session_key,
-           retirement_epoch: retirement_epoch,
-           principal: principal,
-           supervision_interval_ms: supervision_interval_ms
-         }) do
-      outcome when outcome in [:armed, :parent_elevated, :duplicate] -> :ok
-      {:error, reason} -> raise "parent-target retirement refused: #{inspect(reason)}"
-      other -> raise "invalid parent-target retirement result: #{inspect(other)}"
-    end
+  defp retire_active_in_txn(txn, session_key, principal) do
+    retirement_epoch = now()
 
     Txn.q(
       txn,
@@ -1103,7 +1111,7 @@ defmodule Tightbeam.Org do
       outcome:
         put_liveness_trigger(
           outcome,
-          liveness_trigger_in_txn!(txn, direct_work_item_id, assignment_id)
+          inactivity_deadline_trigger_in_txn!(txn, direct_work_item_id, assignment_id)
         )
     }
   end
@@ -1131,7 +1139,7 @@ defmodule Tightbeam.Org do
         nil ->
           put_liveness_trigger(
             %{kind: "no_replacement"},
-            liveness_trigger_in_txn!(txn, work_item_id, assignment_id)
+            inactivity_deadline_trigger_in_txn!(txn, work_item_id, assignment_id)
           )
 
         replacement_target ->
@@ -1240,13 +1248,13 @@ defmodule Tightbeam.Org do
       ]
   end
 
-  defp liveness_trigger_in_txn!(txn, direct_work_item_id, assignment_id) do
+  defp inactivity_deadline_trigger_in_txn!(txn, direct_work_item_id, assignment_id) do
     case primary_liveness_ref(txn, direct_work_item_id, assignment_id) do
       nil ->
         nil
 
       primary ->
-        case Supervision.liveness_trigger_in_txn(txn, primary) do
+        case Supervision.inactivity_deadline_trigger_in_txn(txn, primary) do
           {:ok, trigger} when is_map(trigger) -> trigger
           :none -> raise "#{inspect(primary)} has no liveness trigger"
           {:error, reason} -> raise "invalid liveness trigger: #{inspect(reason)}"

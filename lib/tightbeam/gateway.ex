@@ -218,25 +218,16 @@ defmodule Tightbeam.Gateway do
     provision_host_endpoints(db, config, cli_token)
     cli_bin = install_cli_bin(config.base_dir)
     defaults = defaults(config, db)
-    # Post-commit recognition: both consumers of a committed terminal are
-    # FIRE-AND-FORGET casts into their own processes — the bubble sweeper and
-    # the supervision shift. Neither may run inside the lane or the
-    # LaneManager: recognition enqueues turns, enqueueing rings the
-    # LaneManager, and a synchronous hook is then a call to self (review B1
-    # found exactly that deadlock on the boot path).
-    on_terminal = fn session_key, seq ->
+    # Bubble recognition stays outside the lane transaction; it can enqueue
+    # turns and therefore must not run synchronously inside LaneManager.
+    on_terminal = fn _session_key, seq ->
+      Tightbeam.HarnessHealth.reconcile_delivered_turn(db, seq)
       Tightbeam.Productions.BubbleSweeper.recognize(seq)
-      Supervision.notify_terminal(session_key, seq)
-    end
-
-    on_retired = fn session_key ->
-      Supervision.notify_retired(session_key)
     end
 
     handler_table =
       config
       |> Map.put(:db, db)
-      |> Map.put(:on_retired, on_retired)
       |> handlers()
 
     runner = turn_runner(Map.put(config, :db, db))
@@ -245,26 +236,14 @@ defmodule Tightbeam.Gateway do
     # boot (bad law stops the boot). Placement owns every host mechanic.
     load_law!(config, Map.keys(handler_table))
 
-    # Recover durable liveness only after row-commit recognition is installed,
-    # and before any runtime child can consume wakes or accept traffic. The
-    # Supervision child skips its duplicate recovery below.
+    # The one-time migration creates ordinary deadline wakes before the event
+    # scheduler can consume them. Later changes are written by assignment and
+    # holder-activity transactions.
     :ok = Wakes.activate_wait_recognition(db)
 
-    {:ok, epoch_rows} =
-      DB.query(db, "SELECT id, activatedAt, cause, principal FROM supervision_liveness_epoch")
-
-    supervision_available? =
-      match?(
-        [[0, at, "schema_activation", "process:tightbeam"]] when is_integer(at) and at >= 0,
-        epoch_rows
-      )
-
-    if supervision_available? do
-      :ok = Supervision.recover_liveness!(db, supervision_interval_ms(config))
-    else
-      Logger.warning(
-        "supervision_liveness_epoch row 0 unavailable; supervision recovery disabled"
-      )
+    case Supervision.migrate_open_assignments(db, supervision_interval_ms(config)) do
+      :ok -> :ok
+      {:error, error} -> Logger.error("assignment inactivity recovery deferred: #{Exception.message(error)}")
     end
 
     adapter_config = config |> Map.put(:cli_bin, cli_bin) |> Map.put(:db, db)
@@ -305,51 +284,24 @@ defmodule Tightbeam.Gateway do
     ]
 
     deliver = fn wake ->
-      case wake.target_role do
-        role when is_binary(role) ->
-          case Roles.resolve(db, role) do
-            {:ok, session_key, fallback} ->
-              deliver_prompt(
-                session_key,
-                wake.origin,
-                wake.prompt,
-                [
-                  db: db,
-                  wake_id: wake.wake_id,
-                  sender: wake.origin,
-                  role_ref: role,
-                  role_fallback: fallback
-                ] ++ delivery_config
-              )
+      target_gate =
+        if is_binary(wake.target_role),
+          do: %{target_role: wake.target_role},
+          else: nil
 
-            {:error, %{code: "unknown_role"}} ->
-              :ok =
-                EventLog.lifecycle(
-                  db,
-                  "wake_unresolved",
-                  wake.wake_id,
-                  "role #{role} no longer exists"
-                )
-
-              :skipped
-          end
-
-        nil ->
-          deliver_prompt(
-            wake.session_key,
-            wake.origin,
-            wake.prompt,
-            [
-              db: db,
-              wake_id: wake.wake_id,
-              sender: wake.origin,
-              # targetGate = 0 (decision notifications) delivers to the recorded
-              # sessionKey unconditionally; every other wake keeps its gate.
-              target_gate: if(wake.target_gate == 0, do: nil, else: wake),
-              fire_wake_in_txn: wake.origin == "process:tightbeam"
-            ] ++ delivery_config
-          )
-      end
+      deliver_prompt(
+        wake.session_key,
+        wake.origin,
+        wake.prompt,
+        [
+          db: db,
+          wake_id: wake.wake_id,
+          sender: wake.origin,
+          target_gate: target_gate,
+          role_ref: wake.target_role,
+          fire_wake_in_txn: wake.origin == "process:tightbeam"
+        ] ++ delivery_config
+      )
     end
 
     (credential_children(config, db) ++
@@ -358,7 +310,12 @@ defmodule Tightbeam.Gateway do
          {Tightbeam.Retention, db: db},
          {WorkspaceCleanup, config: Map.put(config, :db, db)},
          {Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry},
-         {Task, fn -> HarnessHealth.resume_other_routes(db) end},
+         {Task,
+          fn ->
+            Wakes.reconcile_delivered_sources(db)
+            WorkItems.reconcile_delivered_brackets(db)
+            HarnessHealth.resume_other_routes(db)
+          end},
          {Tightbeam.Firehose.Hub, name: Tightbeam.Firehose.Hub},
          # Ahead of Supervision and Bandit deliberately: both can reach a check-tier
          # statute, and the episode writer must already own the ordering before the first
@@ -378,26 +335,11 @@ defmodule Tightbeam.Gateway do
           internal_consumers: %{
             "effort_probe" => &EffortCheckin.probe(db, config, &1),
             "effort_deadline" => &EffortCheckin.deadline(db, config, &1),
-            "review_remedy_reconcile" =>
-              &Tightbeam.RailRemedy.reconcile_notice(
-                db,
-                Map.put(config, :supervision_interval_ms, supervision_interval_ms(config)),
-                &1
-              )
+            "assignment_inactivity_deadline" => &Supervision.deadline(db, &1),
+            "assignment_inactivity_climb" => &Supervision.climb(db, &1)
           },
           tick_ms: config.wake_tick_ms,
-          review_remedy_interval_ms: supervision_interval_ms(config),
           name: Tightbeam.WakeScheduler},
-         if(supervision_available?,
-           do:
-             {Tightbeam.Supervision,
-              db: db,
-              handlers: handler_table,
-              prod_limit: prod_limit,
-              recover: false,
-              sweep_ms: supervision_interval_ms(config),
-              name: Tightbeam.Supervision}
-         ),
          {Tightbeam.Spinup.Flight, name: Tightbeam.Spinup.Flight},
          {DynamicSupervisor, strategy: :one_for_one, name: Tightbeam.AdapterSupervisor},
          {Tightbeam.AdapterCoordinator,
@@ -1400,7 +1342,6 @@ defmodule Tightbeam.Gateway do
           db,
           "attest",
           call
-          |> maybe_put_progress_interval(config)
           |> Map.put(:supervision_interval_ms, supervision_interval_ms(config))
           |> Map.put(:on_assignment_change, assignment_change)
           |> Map.put(:wake_scheduler, Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler))
@@ -1994,7 +1935,6 @@ defmodule Tightbeam.Gateway do
           | :duplicate
           | :conflict
           | :skipped
-          | {:terminal_notice_undeliverable, map()}
   def deliver_prompt(session_key, origin, prompt, opts \\ []) do
     db = Keyword.get(opts, :db, Tightbeam.DB)
 
@@ -2032,133 +1972,21 @@ defmodule Tightbeam.Gateway do
           | {:duplicate, map()}
           | {:conflict, map()}
           | :skipped
-          | {:terminal_notice_undeliverable, map()}
   def deliver_prompt_in_txn(%DB.Txn{} = txn, session_key, origin, prompt, opts \\ []) do
-    case remedy_wake_delivery_admission_in_txn(txn, opts[:wake_id]) do
-      :skip ->
-        :skipped
-
-      :continue ->
-        case existing_wake_turn_in_txn(txn, opts[:wake_id]) do
-          nil ->
-            case NoticeBatcher.carrier_admission_in_txn(txn, opts[:wake_id]) do
-              :ready -> deliver_resolved_prompt_in_txn(txn, session_key, origin, prompt, opts)
-              :skipped -> :skipped
-            end
-
-          duplicate ->
-            duplicate
+    case existing_wake_turn_in_txn(txn, opts[:wake_id]) do
+      nil ->
+        case NoticeBatcher.carrier_admission_in_txn(txn, opts[:wake_id]) do
+          :ready -> deliver_resolved_prompt_in_txn(txn, session_key, origin, prompt, opts)
+          :skipped -> :skipped
         end
+
+      duplicate ->
+        duplicate
     end
   end
 
   defp deliver_resolved_prompt_in_txn(txn, session_key, origin, prompt, opts) do
-    case Wakes.terminal_notice_delivery_in_txn(txn, opts[:wake_id]) do
-      :ordinary ->
-        case Supervision.idle_cleanup_delivery_in_txn(
-               txn,
-               opts[:wake_id],
-               System.system_time(:millisecond)
-             ) do
-          :ordinary ->
-            deliver_prompt_once_in_txn(txn, session_key, origin, prompt, opts)
-
-          :stale ->
-            fire_wake_in_txn(txn, Keyword.put(opts, :fire_wake_in_txn, true))
-            :skipped
-
-          {:idle_cleanup_deferred, _} = deferred ->
-            deferred
-
-          {:deliver, wake} ->
-            opts =
-              opts
-              |> Keyword.put(:target_gate, nil)
-              |> Keyword.put(:sender, wake.origin)
-              |> Keyword.put(:fire_wake_in_txn, true)
-
-            deliver_prompt_once_in_txn(txn, wake.session_key, wake.origin, wake.prompt, opts)
-        end
-
-      {:terminal_notice, wake} ->
-        # Resolution and enqueue share this transaction. Only the persisted
-        # terminal event and its freshly authorized recipient may supply content
-        # and routing; the caller's stale gate/lineage/prompt cannot override them.
-        opts =
-          opts
-          |> Keyword.put(:target_gate, nil)
-          |> Keyword.put(:sender, wake.origin)
-          |> Keyword.put(:assignment_id, wake.assignment_id)
-          |> Keyword.put(:job_ref, wake.work_item_id)
-          |> Keyword.put(:role_ref, nil)
-          |> Keyword.put(:role_fallback, false)
-          |> Keyword.put(:fire_wake_in_txn, true)
-
-        case deliver_prompt_once_in_txn(txn, wake.session_key, wake.origin, wake.prompt, opts) do
-          {:appended, actual_session_key, _message, _delivery_opts} = delivered ->
-            Wakes.terminal_notice_delivered_in_txn(txn, wake.wake_id, actual_session_key)
-            delivered
-
-          other ->
-            other
-        end
-
-      {:terminal_notice_undeliverable, _} = incomplete ->
-        incomplete
-    end
-  end
-
-  defp remedy_wake_delivery_admission_in_txn(_txn, wake_id) when not is_binary(wake_id),
-    do: :continue
-
-  defp remedy_wake_delivery_admission_in_txn(txn, wake_id) do
-    case DB.Txn.q(txn, "SELECT origin, assignmentId FROM wakes WHERE wakeId = ?1", [wake_id]) do
-      [["remedy:" <> _ = origin, assignment_id]] ->
-        case assignment_id || legacy_remedy_assignment_id_in_txn(txn, wake_id, origin) do
-          nil ->
-            :continue
-
-          assignment_id ->
-            case DB.Txn.q(txn, "SELECT state FROM assignments WHERE id = ?1", [assignment_id]) do
-              [["open"]] -> :continue
-              _ -> :skip
-            end
-        end
-
-      _ ->
-        :continue
-    end
-  end
-
-  defp legacy_remedy_assignment_id_in_txn(txn, wake_id, origin) do
-    case DB.Txn.q(
-           txn,
-           """
-           SELECT episode.subject
-           FROM rail_remedy_episodes episode
-           JOIN assignments assignment ON assignment.id = episode.subject
-           JOIN wire_idempotency idem
-             ON idem.ownerUserId = ?2
-            AND idem.operation = 'wake'
-            AND idem.sessionKey = ?1
-            AND (
-              substr(idem.idempotencyKey, 1,
-                length('rail-dispatch:' || episode.statute || ':' || episode.subject || ':')) =
-                'rail-dispatch:' || episode.statute || ':' || episode.subject || ':'
-              OR
-              substr(idem.idempotencyKey, 1,
-                length('rail-rewake:' || episode.statute || ':' || episode.subject || ':')) =
-                'rail-rewake:' || episode.statute || ':' || episode.subject || ':'
-            )
-           WHERE ?2 = 'remedy:' || episode.statute
-           ORDER BY episode.openedAt DESC, episode.subject
-           LIMIT 1
-           """,
-           [wake_id, origin]
-         ) do
-      [[assignment_id]] -> assignment_id
-      [] -> nil
-    end
+    deliver_prompt_once_in_txn(txn, session_key, origin, prompt, opts)
   end
 
   defp existing_wake_turn_in_txn(_txn, wake_id) when not is_binary(wake_id), do: nil
@@ -2193,14 +2021,7 @@ defmodule Tightbeam.Gateway do
 
     case delivery_target(txn, session_key, opts[:target_gate]) do
       nil ->
-        case cancel_unavailable_supervision_controller_in_txn(txn, opts, session_key) do
-          :canceled ->
-            :ok
-
-          :ordinary ->
-            record_undeliverable_in_txn(txn, session_key, origin, opts, "no_delivery_target")
-        end
-
+        record_undeliverable_in_txn(txn, session_key, origin, opts, "no_delivery_target")
         :skipped
 
       {target, role_ref, role_fallback} when not is_nil(target) ->
@@ -2224,39 +2045,23 @@ defmodule Tightbeam.Gateway do
                   role_ref || opts[:role_ref]
                 )
               else
-                case admit_supervision_controller_in_txn(txn, opts, target) do
-                  :canceled ->
-                    :skipped
-
-                  controller ->
-                    append_and_enqueue_in_txn(
-                      txn,
-                      target,
-                      role_ref,
-                      role_fallback,
-                      origin,
-                      stamped,
-                      Keyword.put(opts, :supervision_controller, controller)
-                    )
-                end
+                append_and_enqueue_in_txn(
+                  txn,
+                  target,
+                  role_ref,
+                  role_fallback,
+                  origin,
+                  stamped,
+                  opts
+                )
               end
 
             duplicate_or_conflict ->
               duplicate_or_conflict
           end
         else
-          case cancel_unavailable_supervision_controller_in_txn(txn, opts, target) do
-            :canceled ->
-              :skipped
-
-            :ordinary ->
-              # Asked BEFORE the echo, because the echo commits in this same
-              # transaction and a raise is not available to take it back (it would
-              # roll the caller's wake `fired` mark back with it). The ledger still
-              # refuses independently — it is the single writer — but a message with
-              # no turn is history nobody can answer, so nothing is written at all.
-              refuse_undeliverable_turn(txn, target, origin, opts)
-          end
+          # Ask before the echo: a message with no turn is history nobody can answer.
+          refuse_undeliverable_turn(txn, target, origin, opts)
         end
     end
   end
@@ -2434,8 +2239,7 @@ defmodule Tightbeam.Gateway do
             role_fallback: role_fallback || opts[:role_fallback] || false,
             assignment_id: assignment_id,
             job_ref: job_ref,
-            request_ref: opts[:request_ref],
-            queue_message_kind: opts[:queue_message_kind]
+            request_ref: opts[:request_ref]
           })
 
         case enqueued do
@@ -2450,50 +2254,7 @@ defmodule Tightbeam.Gateway do
               end)
             end
 
-            settle_supervision_controller_in_txn(txn, opts, target, seq)
-
-            opts[:wake_id]
-            |> case do
-              wake_id when is_binary(wake_id) ->
-                NoticeBatcher.carrier_source_ids_in_txn(txn, wake_id)
-                |> Enum.each(fn source_wake_id ->
-                  :ok =
-                    Tightbeam.Assignments.assert_retry_decision_in_txn!(
-                      txn,
-                      source_wake_id,
-                      target
-                    )
-
-                  Supervision.batch_source_delivered_in_txn(
-                    txn,
-                    source_wake_id,
-                    target,
-                    seq
-                  )
-
-                  Tightbeam.Productions.Bubble.batch_source_delivered_in_txn(
-                    txn,
-                    source_wake_id,
-                    target,
-                    seq
-                  )
-
-                  Wakes.batch_source_delivered_in_txn(txn, source_wake_id, target)
-                  HarnessHealth.batch_source_delivered_in_txn(txn, source_wake_id, seq)
-                end)
-
-              _ ->
-                :ok
-            end
-
             fire_wake_in_txn(txn, opts)
-
-            # Nag-by-re-arm: a bracket wake that just fired re-arms its
-            # replacement IN this transaction if the item is still holderless
-            # and non-terminal (the lattice does not watch holderless work).
-            # No-ops for every non-bracket wake (the discriminator is the item's
-            # routing/slate wake-id matching this wake).
-            WorkItems.rearm_on_fire_in_txn(txn, opts[:wake_id], opts[:target_gate])
             Tightbeam.Firehose.Publisher.message_in_txn(txn, target, message)
 
             {:appended, target, message, opts}
@@ -2548,98 +2309,6 @@ defmodule Tightbeam.Gateway do
 
       if DB.Txn.changes(txn) == 1,
         do: Wakes.publish_change_in_txn(txn, "wake.fired", opts[:wake_id])
-
-      Supervision.record_idle_cleanup_delivery_in_txn(txn, opts[:wake_id])
-    end
-  end
-
-  defp admit_supervision_controller_in_txn(txn, opts, target) do
-    case opts[:wake_id] do
-      wake_id when is_binary(wake_id) ->
-        case DB.Txn.q(
-               txn,
-               "SELECT assignmentId FROM supervision_liveness_sidecar WHERE wakeId=?1 AND controllerOrigin='scheduled' AND controllerState='pending'",
-               [wake_id]
-             ) do
-          [[assignment_id]] ->
-            case Supervision.transition_in_txn(txn, %{
-                   kind: "controller_fire",
-                   wake_id: wake_id,
-                   assignment_id: assignment_id,
-                   target_session_key: target
-                 }) do
-              {:admit, wake_kind} -> {assignment_id, wake_kind}
-              :canceled -> :canceled
-            end
-
-          [] ->
-            :ordinary
-        end
-
-      _ ->
-        :ordinary
-    end
-  end
-
-  defp settle_supervision_controller_in_txn(txn, opts, target, turn_seq) do
-    case opts[:supervision_controller] do
-      {assignment_id, wake_kind} ->
-        case Supervision.transition_in_txn(txn, %{
-               kind: "controller_fire",
-               wake_id: opts[:wake_id],
-               assignment_id: assignment_id,
-               target_session_key: target,
-               turn_seq: turn_seq
-             }) do
-          {:admit, ^wake_kind} ->
-            :ok
-
-          other ->
-            raise "incompatible_supervision_liveness_v1: controller settlement #{inspect(other)}"
-        end
-
-      _ ->
-        :ok
-    end
-  end
-
-  @doc false
-  def cancel_unavailable_supervision_controller_in_txn(txn, opts, target) do
-    case opts[:wake_id] do
-      wake_id when is_binary(wake_id) ->
-        case DB.Txn.q(
-               txn,
-               "SELECT assignmentId,wakeKind FROM supervision_liveness_sidecar WHERE wakeId=?1 AND controllerOrigin='scheduled' AND controllerState='pending'",
-               [wake_id]
-             ) do
-          [[assignment_id, wake_kind]] ->
-            {:ok, liveness_trigger} =
-              Supervision.liveness_trigger_in_txn(txn, {:assignment, assignment_id})
-
-            true =
-              Wakes.cancel_in_txn(txn, %{
-                wake_id: wake_id,
-                requester: %{kind: "process", id: "tightbeam:wake-scheduler"},
-                reason_kind: "target_unresolvable",
-                causal_source: %{kind: "scheduler_delivery", id: wake_id},
-                outcome: %{kind: "no_replacement", liveness_trigger: liveness_trigger}
-              })
-
-            EventLog.lifecycle_in_txn(
-              txn,
-              "supervision_controller_unavailable",
-              assignment_id,
-              "wakeId=#{wake_id} kind=#{wake_kind} target=#{target}"
-            )
-
-            :canceled
-
-          [] ->
-            :ordinary
-        end
-
-      _ ->
-        :ordinary
     end
   end
 
@@ -2693,7 +2362,6 @@ defmodule Tightbeam.Gateway do
           | :duplicate
           | :conflict
           | :skipped
-          | {:terminal_notice_undeliverable, map()}
   def complete_delivery(db, {:appended, actual_session_key, message, opts}) do
     registry = Keyword.get(opts, :conn_registry, Tightbeam.ConnRegistry)
     publish_message(db, actual_session_key, message, registry)
@@ -2707,6 +2375,23 @@ defmodule Tightbeam.Gateway do
       registry
     )
 
+    # The delivery transaction has already committed its immutable turn and
+    # deliveredTurnSeq. Let each source owner reconcile that durable outcome
+    # in its own transaction; none of these source reads can veto the notice.
+    if is_binary(opts[:wake_id]) do
+      case Wakes.reconcile_delivered_sources(db, actual_session_key, opts[:wake_id]) do
+        :ok -> :ok
+        {:error, error} ->
+          Logger.warning("wake source delivery reconciliation deferred: #{Exception.message(error)}")
+      end
+
+      case WorkItems.reconcile_delivered_brackets(db, actual_session_key, opts[:wake_id]) do
+        :ok -> :ok
+        {:error, error} ->
+          Logger.warning("work-item bracket delivery reconciliation deferred: #{Exception.message(error)}")
+      end
+    end
+
     nudge_lane(Keyword.get(opts, :lane_manager, Tightbeam.LaneManager), actual_session_key)
 
     :appended
@@ -2717,11 +2402,8 @@ defmodule Tightbeam.Gateway do
   end
 
   def complete_delivery(_db, :skipped), do: :skipped
-  def complete_delivery(_db, {:idle_cleanup_deferred, _} = deferred), do: deferred
   def complete_delivery(_db, {:duplicate, _message}), do: :duplicate
   def complete_delivery(_db, {:conflict, _message}), do: :conflict
-
-  def complete_delivery(_db, {:terminal_notice_undeliverable, _} = incomplete), do: incomplete
 
   # The message is already committed and published. A busy, restarting or
   # absent lane manager only delays the turn: the manager's first reconcile
@@ -2743,11 +2425,11 @@ defmodule Tightbeam.Gateway do
 
   def delivery_target(txn, _session_key, %{target_role: role}) when is_binary(role) do
     case DB.Txn.q(txn, "SELECT boundSessionKey, ownerUserId FROM roles WHERE name = ?1", [role]) do
-      [[bound, owner]] ->
-        case active_session?(txn, bound) do
-          true -> {bound, role, false}
-          false -> active_personal_target(txn, owner, role)
-        end
+      [[bound, _owner]] when is_binary(bound) ->
+        if active_session?(txn, bound), do: {bound, role, false}, else: nil
+
+      [[nil, _owner]] ->
+        nil
 
       [] ->
         nil
@@ -2758,25 +2440,6 @@ defmodule Tightbeam.Gateway do
     case DB.Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey = ?1", [session_key]) do
       [["active"]] ->
         {session_key, nil, false}
-
-      _ when gate.reresolve == "lineage" ->
-        # Re-resolution answers "who owns this now", and NOBODY is one of the
-        # answers. Until the ladder could say so, a notice whose recorded target
-        # had gone was re-addressed to a composed personal key that named no
-        # session, and the substrate queued it there forever.
-        case Supervision.ladder_target(txn, gate.reresolve_seed, gate.reresolve_rung) do
-          nil ->
-            Logger.error(
-              "substrate notice for #{session_key} is undeliverable: re-resolving the lineage " <>
-                "from #{gate.reresolve_seed} rung #{gate.reresolve_rung} found no active " <>
-                "session to own it"
-            )
-
-            nil
-
-          target ->
-            {target, nil, false}
-        end
 
       _ ->
         nil
@@ -2789,11 +2452,6 @@ defmodule Tightbeam.Gateway do
     DB.Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey = ?1", [session_key]) == [
       ["active"]
     ]
-  end
-
-  defp active_personal_target(txn, owner, role) do
-    target = Org.personal_session_key(owner)
-    if active_session?(txn, target), do: {target, role, true}, else: nil
   end
 
   @doc """
@@ -3637,6 +3295,8 @@ defmodule Tightbeam.Gateway do
               if prewrite_evidence do
                 Tightbeam.NoticeSubmission.restore_in_txn(txn, turn, prewrite_evidence)
               end
+
+              Tightbeam.Wakes.preserve_failed_intent_for_terminal_in_txn(txn, turn.seq)
 
               HarnessHealth.observe_turn_failure_in_txn(
                 txn,
@@ -6645,12 +6305,6 @@ defmodule Tightbeam.Gateway do
     Map.get(config, :supervision_interval_ms, Map.get(config, :wake_tick_ms, 1_000))
   end
 
-  defp maybe_put_progress_interval(%{params: %{kind: "progress"}} = call, config) do
-    Map.put(call, :supervision_interval_ms, supervision_interval_ms(config))
-  end
-
-  defp maybe_put_progress_interval(call, _config), do: call
-
   defp cancel_wake_result(db, call, wake_id) do
     with {:ok, requester} <- cancellation_requester(call[:principal]) do
       command = %{
@@ -6791,26 +6445,6 @@ defmodule Tightbeam.Gateway do
     p = call.params
 
     cond do
-      Map.get(call, :principal) == {:process, "tightbeam"} and
-          p[:supervision_wake_kind] in ["prod", "escalation"] ->
-        Tightbeam.ReminderDelivery.schedule_in_txn(
-          txn,
-          p[:assignment_id],
-          p[:supervision_wake_kind],
-          session_key,
-          fn ->
-            schedule_wake_row_in_txn(
-              txn,
-              call,
-              session_key,
-              due_at,
-              nil,
-              nil,
-              replacement_assignment_id
-            )
-          end
-        )
-
       is_map(p[:predicate]) or p[:after_turn] == true ->
         Wakes.register_wait_in_txn(txn, %{
           session_key: session_key,
@@ -6865,111 +6499,6 @@ defmodule Tightbeam.Gateway do
           p[:condition_scope],
           replacement_assignment_id
         )
-    end
-  end
-
-  @doc false
-  def review_notice_recipient_in_txn(txn, assignment_id) do
-    case DB.Txn.q(
-           txn,
-           """
-           SELECT a.openedByUser,a.openedBySession,a.workItemId,w.ownerUserId
-           FROM assignments a JOIN work_items w ON w.id=a.workItemId
-           WHERE a.id=?1
-           """,
-           [assignment_id]
-         ) do
-      [[opened_by_user, opened_by_session, work_item_id, owner]] ->
-        current =
-          DeliveryResponsibilities.current_accountable_recipient_in_txn(
-            txn,
-            work_item_id,
-            owner
-          )
-
-        opener =
-          cond do
-            is_binary(opened_by_user) and opened_by_user == owner ->
-              Org.personal_session_key(owner)
-
-            is_binary(opened_by_session) ->
-              case DB.Txn.q(
-                     txn,
-                     "SELECT 1 FROM sessions WHERE sessionKey=?1 AND ownerUserId=?2 AND state='active'",
-                     [opened_by_session, owner]
-                   ) do
-                [[1]] -> opened_by_session
-                _ -> nil
-              end
-
-            true ->
-              nil
-          end
-
-        delegated_opener =
-          if is_binary(opener) and is_binary(opened_by_session) and
-               DeliveryResponsibilities.responsibility_in_txn(
-                 txn,
-                 opened_by_session,
-                 work_item_id
-               ) == "delegated",
-             do: opener,
-             else: nil
-
-        recipient =
-          [delegated_opener, current, opener, Org.personal_session_key(owner)]
-          |> Enum.reject(&is_nil/1)
-          |> Enum.uniq()
-          |> Enum.find(fn candidate ->
-            DB.Txn.q(
-              txn,
-              "SELECT 1 FROM sessions WHERE sessionKey=?1 AND ownerUserId=?2 AND state='active'",
-              [candidate, owner]
-            ) == [[1]]
-          end)
-
-        case recipient do
-          recipient when is_binary(recipient) ->
-            {:ok, %{session_key: recipient, owner_user_id: owner, work_item_id: work_item_id}}
-
-          nil ->
-            {:error,
-             %{
-               reason: :missing_accountable_owner,
-               owner_user_id: owner,
-               work_item_id: work_item_id
-             }}
-        end
-
-      _ ->
-        {:error, %{reason: :missing_assignment}}
-    end
-  end
-
-  @doc false
-  def schedule_review_notice_in_txn(txn, recipient, attrs) do
-    case DB.Txn.q(
-           txn,
-           "SELECT 1 FROM sessions WHERE sessionKey=?1 AND ownerUserId=?2 AND state='active'",
-           [recipient.session_key, recipient.owner_user_id]
-         ) do
-      [[1]] ->
-        Wakes.schedule_in_txn(txn, %{
-          wake_id: attrs.wake_id,
-          session_key: recipient.session_key,
-          origin: "remedy:completion-requires-review",
-          prompt: attrs.prompt,
-          consumer: Map.get(attrs, :consumer, "prompt"),
-          due_at: attrs.due_at,
-          owner_user_id: recipient.owner_user_id,
-          work_item_id: recipient.work_item_id,
-          assignment_id: attrs.assignment_id,
-          target_gate: if(Map.get(attrs, :consumer, "prompt") == "prompt", do: 0, else: 1),
-          sender_scheduled: true
-        })
-
-      _ ->
-        raise ArgumentError, "review remedy recipient no longer belongs to the accountable owner"
     end
   end
 
@@ -7142,52 +6671,7 @@ defmodule Tightbeam.Gateway do
         assignment_id: wake_assignment_id_in_txn(txn, call)
       })
 
-    bind_liveness_checkpoint_in_txn(txn, call, wake)
-    schedule_supervision_controller_in_txn(txn, call, wake)
     wake
-  end
-
-  defp bind_liveness_checkpoint_in_txn(
-         txn,
-         %{principal: {:session, creator_session_key}},
-         %{session_key: creator_session_key, wake_id: wake_id}
-       ) do
-    Supervision.transition_in_txn(txn, %{
-      kind: "checkpoint_scheduled",
-      wake_id: wake_id,
-      creator_session_key: creator_session_key
-    })
-  end
-
-  defp bind_liveness_checkpoint_in_txn(_txn, _call, _wake), do: :duplicate
-
-  # The controller row is part of the supervision wake, not follow-up
-  # bookkeeping. Keeping both writes under the wake handler's transaction means
-  # a crash can commit both rows or neither, never a lineage wake that boot later
-  # has to guess about. The kind is trusted only from Tightbeam's reserved process
-  # principal, just like the assignment carrier above.
-  defp schedule_supervision_controller_in_txn(
-         txn,
-         %{principal: {:process, "tightbeam"}, params: %{supervision_wake_kind: wake_kind}},
-         wake
-       )
-       when wake_kind in ["prod", "escalation"] do
-    case Supervision.transition_in_txn(txn, %{
-           kind: "controller_scheduled",
-           wake_id: wake.wake_id,
-           assignment_id: wake.assignment_id,
-           wake_kind: wake_kind
-         }) do
-      {:armed, _generation} ->
-        :ok
-
-      :duplicate ->
-        # An internal supervision marker is a claim that this wake is a typed
-        # controller. If no entitlement can arm its sidecar, committing the wake
-        # would strand an unfireable controller. Roll the handler transaction
-        # back so wake and sidecar remain all-or-nothing.
-        raise "incompatible_supervision_liveness_v1: controller schedule :duplicate"
-    end
   end
 
   defp replacement_assignment_id_in_txn(txn, call, session_key) do
@@ -7231,16 +6715,6 @@ defmodule Tightbeam.Gateway do
   end
 
   defp replacement_origin_matches_sender?(_txn, _origin, _sender), do: false
-
-  defp schedule_supervision_controller_in_txn(
-         _txn,
-         %{principal: {:process, "tightbeam"}, params: %{supervision_wake_kind: wake_kind}},
-         _wake
-       ) do
-    raise "incompatible_supervision_liveness_v1: unknown controller kind #{inspect(wake_kind)}"
-  end
-
-  defp schedule_supervision_controller_in_txn(_txn, _call, _wake), do: :ok
 
   defp wake_assignment_id_in_txn(_txn, %{principal: {:process, "tightbeam"}} = call),
     do: call.params[:assignment_id]
@@ -9985,7 +9459,6 @@ defmodule Tightbeam.Gateway do
                           {:user, id} -> "user:" <> id
                           {:session, key} -> "session:" <> key
                         end,
-                        supervision_interval_ms(config),
                         "retired: session retired before execution"
                       )
 
@@ -10130,7 +9603,6 @@ defmodule Tightbeam.Gateway do
          root_key,
          owner,
          principal,
-         supervision_interval_ms,
          drain_reason
        ) do
     # Invariant: this spawnedBy walk visits each active member of the target's
@@ -10156,7 +9628,6 @@ defmodule Tightbeam.Gateway do
               member.session_key,
               owner,
               principal,
-              supervision_interval_ms,
               drain_reason
             )
 
@@ -10218,11 +9689,10 @@ defmodule Tightbeam.Gateway do
          session_key,
          owner,
          principal,
-         supervision_interval_ms,
          drain_reason
        ) do
     assignments = Assignments.interrupt_for_retire_in_txn(txn, session_key, owner, principal)
-    Org.retire_in_txn(txn, session_key, principal, supervision_interval_ms)
+    Org.retire_in_txn(txn, session_key, principal)
     Ledger.drain_queued_for_retire_in_txn(txn, session_key, drain_reason)
     assignments
   end

@@ -41,7 +41,6 @@ defmodule Tightbeam.Productions.Bubble do
     NoticeBatcher,
     Org,
     Projection,
-    Supervision,
     Wakes
   }
 
@@ -53,14 +52,7 @@ defmodule Tightbeam.Productions.Bubble do
   @climbing_notice_terminals ~w(failed canceled failed_unknown)
   @lineage_hop_limit 32
 
-  @doc """
-  Post-commit recognition site for every terminal transition, wired through
-  the lane's existing `on_terminal` hook — which also fires from the
-  republish sweep, so boot-recovered `failed_unknown` rows and retire-drained
-  `canceled` rows are recognized without their own sites. The row is already
-  committed truth; this only recognizes it. Safe to call for every terminal
-  and safe to call twice: the LHS decides, and the enqueue dedupes.
-  """
+  @doc "Recognize a terminal turn and carry an ordinary failure to an active parent."
   @spec recognize_terminal(DB.server(), integer()) :: :ok
   def recognize_terminal(db, seq) do
     Tightbeam.Wakes.report_failed_delivery(db, seq)
@@ -74,9 +66,7 @@ defmodule Tightbeam.Productions.Bubble do
       admitted =
         turn_contexts(db, seq)
         |> Enum.filter(fn turn ->
-          turn.status == "delivered" or
-            (is_binary(turn[:patrol_escalation_id]) and turn.status in @climbing_notice_terminals) or
-            bubble_production_matches?(db, turn.status, turn)
+          turn.status == "delivered" or bubble_production_matches?(db, turn.status, turn)
         end)
 
       ordinary = Enum.filter(admitted, &ordinary_cause?/1)
@@ -95,42 +85,10 @@ defmodule Tightbeam.Productions.Bubble do
     end
   end
 
-  defp ordinary_cause?(turn),
-    do: turn.status != "delivered" and is_nil(turn[:patrol_escalation_id])
-
-  @doc "Route one durable patrol threshold through the capable-ancestor climb."
-  @spec recognize_patrol_escalation(DB.server(), String.t()) :: :ok
-  def recognize_patrol_escalation(db, escalation_id) when is_binary(escalation_id) do
-    case Supervision.failure_escalation(db, escalation_id) do
-      %{state: state} = escalation when state in ["pending", "admitted"] ->
-        if ConditionFacts.standing?(db, "user-alerted", escalation.owner_user_id) do
-          {:ok, _} =
-            DB.transaction(db, fn txn ->
-              Supervision.update_failure_escalation_route_in_txn(txn, escalation_id, "resolved")
-            end)
-
-          :ok
-        else
-          route_patrol_escalation(db, escalation)
-        end
-
-      _ ->
-        :ok
-    end
-  end
+  defp ordinary_cause?(turn), do: turn.status != "delivered"
 
   defp recognize(db, seq, "delivered", turn) do
-    if is_binary(turn[:patrol_escalation_id]) do
-      {:ok, _} =
-        DB.transaction(db, fn txn ->
-          Supervision.update_failure_escalation_route_in_txn(
-            txn,
-            turn.patrol_escalation_id,
-            "resolved",
-            turn.session_key
-          )
-        end)
-    end
+    reconcile_delivered_notice_disposers(db, seq, turn.session_key)
 
     # Retraction is observed, not declared: a delivered turn is proof the
     # owner has capacity. Guarded by the cheap any?/2 read because almost
@@ -151,9 +109,59 @@ defmodule Tightbeam.Productions.Bubble do
     :ok
   end
 
-  defp recognize(db, _seq, terminal, %{patrol_escalation_id: escalation_id})
-       when terminal in @climbing_notice_terminals do
-    recognize_patrol_escalation(db, escalation_id)
+  defp reconcile_delivered_notice_disposers(db, turn_seq, recipient) do
+    case DB.transaction(db, fn txn ->
+           sources =
+             DB.Txn.q(
+               txn,
+               """
+               WITH source_deliveries AS (#{NoticeBatcher.recorded_deliveries_sql()})
+               SELECT source.wakeId
+               FROM source_deliveries d
+               JOIN wakes source ON source.wakeId=d.sourceWakeId
+               WHERE d.turnSeq=?1 AND source.sessionKey=?2
+                 AND source.origin='process:tightbeam'
+               ORDER BY source.wakeId
+               """,
+               [turn_seq, recipient]
+             )
+
+           Enum.each(sources, fn
+             [source_wake_id] when is_binary(source_wake_id) ->
+               DB.Txn.exec(txn, "SAVEPOINT reconcile_bubble_delivery")
+
+               try do
+                 case resolved_bubble_source(txn, source_wake_id, recipient) do
+                   {:ok, cause_seq, ^recipient} ->
+                     assert_retry_disposer_in_txn!(txn, source_wake_id, recipient)
+                     transfer_cannot_proceed_disposers_for_cause_in_txn(txn, cause_seq, recipient)
+
+                   _ ->
+                     :ok
+                 end
+
+                 DB.Txn.exec(txn, "RELEASE reconcile_bubble_delivery")
+               rescue
+                 error ->
+                   DB.Txn.exec(txn, "ROLLBACK TO reconcile_bubble_delivery")
+                   DB.Txn.exec(txn, "RELEASE reconcile_bubble_delivery")
+
+                   Logger.warning(
+                     "bubble source reconciliation deferred for #{source_wake_id}: #{Exception.message(error)}"
+                   )
+               end
+
+             _malformed ->
+               Logger.warning("skipping malformed delivered bubble source")
+           end)
+
+           :ok
+         end) do
+      {:ok, :ok} -> :ok
+      {:error, error} ->
+        Logger.warning("delivered bubble source reconciliation deferred: #{Exception.message(error)}")
+        :ok
+    end
   end
 
   @doc """
@@ -275,15 +283,6 @@ defmodule Tightbeam.Productions.Bubble do
           assignment_id: cause.assignment_id
         )
 
-      if match?({:appended, ^recipient, _, _}, delivery) or
-           match?({:staged, _source}, delivery) do
-        transfer_cannot_proceed_disposers_for_cause_in_txn(
-          txn,
-          turn.cause_seq,
-          recipient
-        )
-      end
-
       DB.Txn.exec(txn, "RELEASE bubble_notice_member")
       delivery
     rescue
@@ -302,22 +301,6 @@ defmodule Tightbeam.Productions.Bubble do
         end
     end
   end
-
-  @doc false
-  def batch_source_delivered_in_txn(%DB.Txn{} = txn, source_wake_id, recipient, _turn_seq)
-      when is_binary(source_wake_id) and is_binary(recipient) do
-    with %{origin: "process:tightbeam", session_key: ^recipient} <-
-           Wakes.get_in_txn(txn, source_wake_id),
-         {:ok, cause_seq, ^recipient} <- resolved_bubble_source(txn, source_wake_id, recipient) do
-      assert_retry_disposer_in_txn!(txn, source_wake_id, recipient)
-      transfer_cannot_proceed_disposers_for_cause_in_txn(txn, cause_seq, recipient)
-    else
-      _ -> :ok
-    end
-  end
-
-  def batch_source_delivered_in_txn(%DB.Txn{}, _source_wake_id, _recipient, _turn_seq),
-    do: :ok
 
   @doc false
   def assert_retry_disposer_in_txn!(%DB.Txn{} = txn, source, target \\ nil) do
@@ -499,220 +482,6 @@ defmodule Tightbeam.Productions.Bubble do
     end
   end
 
-  defp route_patrol_escalation(db, escalation) do
-    request_ref = "bubble:patrol:#{escalation.id}"
-    {coverage, excluded} = patrol_coverage(db, request_ref)
-
-    case coverage do
-      :resolved ->
-        {:ok, _} =
-          DB.transaction(db, fn txn ->
-            Supervision.update_failure_escalation_route_in_txn(txn, escalation.id, "resolved")
-          end)
-
-        :ok
-
-      :pending ->
-        :ok
-
-      :continue ->
-        prompt =
-          "Six consecutive turns in #{escalation.session_key} could not complete. " <>
-            "The latest classified failure is #{escalation.failure_class}. " <>
-            "You are the nearest ancestor shown able to run a turn. What to do " <>
-            "about it is your judgment."
-
-        {:ok, result} =
-          DB.transaction(db, fn txn ->
-            case next_active_ancestor_in_txn(txn, escalation.session_key, excluded) do
-              {:ok, recipient} ->
-                delivery =
-                  Gateway.deliver_prompt_in_txn(
-                    txn,
-                    recipient,
-                    "process:tightbeam",
-                    prompt,
-                    sender: "process:tightbeam",
-                    device_id: "process:tightbeam",
-                    client_message_id: "bubble:patrol:#{escalation.id}:#{recipient}",
-                    wake_id: "bubble:patrol:#{escalation.id}:#{recipient}",
-                    request_ref: request_ref
-                  )
-
-                Supervision.update_failure_escalation_route_in_txn(
-                  txn,
-                  escalation.id,
-                  "admitted",
-                  recipient
-                )
-
-                {:delivery, recipient, delivery}
-
-              _absence ->
-                :exhausted
-            end
-          end)
-
-        case result do
-          {:delivery, recipient, delivery} ->
-            handle_patrol_delivery(
-              db,
-              escalation,
-              recipient,
-              ConditionFacts.complete_deliveries(db, [delivery])
-            )
-
-          :exhausted ->
-            patrol_terminal_alert(db, escalation)
-        end
-    end
-  end
-
-  defp patrol_coverage(db, request_ref) do
-    {:ok, turn_rows} =
-      DB.query(
-        db,
-        "SELECT sessionKey, status FROM turns WHERE requestRef=?1 ORDER BY seq",
-        [request_ref]
-      )
-
-    {:ok, source_rows} =
-      DB.query(
-        db,
-        """
-        WITH source_deliveries AS (#{Tightbeam.NoticeBatcher.recorded_deliveries_sql()})
-        SELECT source.sessionKey,
-               CASE
-                 WHEN turn.status IS NOT NULL THEN turn.status
-                 WHEN source.state='pending' THEN 'queued'
-                 ELSE source.state
-               END
-        FROM wakes source
-        LEFT JOIN source_deliveries d ON d.sourceWakeId=source.wakeId
-        LEFT JOIN turns turn ON turn.seq=d.turnSeq
-        WHERE substr(source.wakeId,1,length(?1)+1)=?1 || ':'
-          AND source.state IN ('pending','fired')
-        ORDER BY source.createdAt,source.wakeId
-        """,
-        [request_ref]
-      )
-
-    rows = turn_rows ++ source_rows
-
-    cond do
-      Enum.any?(rows, fn [_session, status] -> status == "delivered" end) ->
-        {:resolved, MapSet.new()}
-
-      Enum.any?(rows, fn [_session, status] -> status in ["queued", "running"] end) ->
-        {:pending, MapSet.new()}
-
-      true ->
-        {:continue, MapSet.new(rows, &hd/1)}
-    end
-  end
-
-  defp handle_patrol_delivery(db, escalation, recipient, result) do
-    case result do
-      delivery when delivery in [:appended, :duplicate] ->
-        :ok
-
-      :skipped ->
-        route_patrol_escalation(db, %{escalation | first_recipient: recipient})
-
-      _ ->
-        :ok
-    end
-  end
-
-  defp patrol_terminal_alert(db, escalation) do
-    message =
-      "[no agent can act]\n\nSix consecutive turns in " <>
-        "#{escalation.session_key} could not complete, and no active agent in " <>
-        "its lineage could be told. The latest classified failure is " <>
-        "#{escalation.failure_class}. Tightbeam will not repeat this alert " <>
-        "until a turn is observed to run."
-
-    main_key = Org.personal_session_key(escalation.owner_user_id)
-
-    {:ok, {published, deliveries}} =
-      DB.transaction_then(
-        db,
-        fn txn ->
-          {route_state, stream?} =
-            case DB.Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey = ?1", [main_key]) do
-              [["active"]] -> {"owner_alerted", true}
-              _ -> {"record_only", false}
-            end
-
-          DB.Txn.q(
-            txn,
-            """
-            UPDATE patrol_failure_escalations SET state=?2, updatedAt=?3
-            WHERE id=?1 AND state IN ('pending','admitted')
-            """,
-            [escalation.id, route_state, System.system_time(:millisecond)]
-          )
-
-          if DB.Txn.changes(txn) == 1 do
-            EventLog.lifecycle_in_txn(
-              txn,
-              "patrol_failure_lineage_exhausted",
-              escalation.owner_user_id,
-              "escalationId=#{escalation.id} session=#{escalation.session_key} thresholdTurnSeq=#{escalation.threshold_turn_seq} principal=process:tightbeam"
-            )
-
-            fact =
-              ConditionFacts.file_in_txn(txn, %{
-                kind: "user-alerted",
-                scope: escalation.owner_user_id,
-                origin: "process:tightbeam",
-                owner_user_id: escalation.owner_user_id
-              })
-
-            if stream? do
-              {:appended, marker} =
-                Projection.append_substrate_in_txn(txn, main_key, message, :high)
-
-              {{:ok, marker}, fact.fact_id}
-            else
-              {:no_stream, fact.fact_id}
-            end
-          else
-            {:already_terminal, nil}
-          end
-        end,
-        fn txn, {published, fact_id} ->
-          Tightbeam.Wakes.row_commit_in_txn(txn, [])
-
-          deliveries =
-            if is_integer(fact_id), do: ConditionFacts.recognize_in_txn(txn, fact_id), else: []
-
-          {published, deliveries}
-        end,
-        fallback: fn {published, _fact_id} -> {published, []} end,
-        retry_deliveries: true
-      )
-
-    ConditionFacts.complete_deliveries(db, deliveries)
-
-    case published do
-      {:ok, marker} ->
-        ConnRegistry.publish_message(
-          Tightbeam.ConnRegistry,
-          main_key,
-          escalation.owner_user_id,
-          marker.seq,
-          Payloads.server_message(marker),
-          fn pid, payload -> send(pid, {:push_message, main_key, marker.seq, payload}) end
-        )
-
-      result when result in [:no_stream, :already_terminal] ->
-        :ok
-    end
-
-    :ok
-  end
-
   # One terminal carrier can represent several independent causes. Store all
   # their dispositions and transcript markers in the same transaction as the
   # common suppression fact. Publication is only a post-commit projection.
@@ -887,31 +656,6 @@ defmodule Tightbeam.Productions.Bubble do
               EventLog.lifecycle(db, "bubble_marker_malformed", session_key, "seq=#{seq}")
               nil
 
-            {:patrol_notice, escalation_id} ->
-              case Supervision.failure_escalation(db, escalation_id) do
-                nil ->
-                  EventLog.lifecycle(
-                    db,
-                    "bubble_cause_missing",
-                    session_key,
-                    "patrolEscalationId=#{escalation_id} seq=#{seq}"
-                  )
-
-                  nil
-
-                escalation ->
-                  %{
-                    session_key: session_key,
-                    owner: escalation.owner_user_id,
-                    status: status,
-                    cause_seq: escalation.threshold_turn_seq,
-                    notice?: true,
-                    patrol_escalation_id: escalation_id,
-                    harness: current_harness,
-                    host: current_host
-                  }
-              end
-
             {kind, cause_seq} ->
               {harness, host} =
                 if kind == :notice do
@@ -942,19 +686,13 @@ defmodule Tightbeam.Productions.Bubble do
   end
 
   defp parse_cause_seq("bubble:" <> cause, _seq) do
-    case cause do
-      "patrol:" <> escalation_id when escalation_id != "" ->
-        {:patrol_notice, escalation_id}
-
-      _ ->
-        case Integer.parse(cause) do
-          {cause_seq, ""} -> {:notice, cause_seq}
-          # A malformed marker is DIRT (review M5): a turn that claims to be a
-          # rung of a climb but names no cause must not be promoted to the start
-          # of a new bubble — notices about notices do not exist — and must not
-          # be silently indulged. Report it; recognition declines.
-          _ -> :malformed
-        end
+    case Integer.parse(cause) do
+      {cause_seq, ""} -> {:notice, cause_seq}
+      # A malformed marker is DIRT (review M5): a turn that claims to be a
+      # rung of a climb but names no cause must not be promoted to the start
+      # of a new bubble — notices about notices do not exist — and must not
+      # be silently indulged. Report it; recognition declines.
+      _ -> :malformed
     end
   end
 

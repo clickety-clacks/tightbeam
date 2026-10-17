@@ -121,33 +121,6 @@ defmodule Tightbeam.DBBackgroundOverloadTest do
     assert_receive :backfill_wake_delivery, 5_500
   end
 
-  test "supervision consistency check defers overload without losing its state", %{db: db} do
-    state = %{db: db, sweep_ms: 3_600_000}
-    assert {:noreply, ^state} = Tightbeam.Supervision.handle_info(:detect_misses, state)
-  end
-
-  test "terminal classification skips overload without reporting a refused terminal", %{db: db} do
-    log =
-      capture_log([level: :debug], fn ->
-        assert :ok = Tightbeam.Supervision.sweep_unclassified_terminals(db)
-      end)
-
-    assert log =~ "background pass deferred"
-    refute log =~ "terminal classification refused"
-  end
-
-  test "legacy supervision skips overload without reporting an evaluation failure", %{db: db} do
-    state = %{db: db, sweep_ms: nil}
-
-    log =
-      capture_log([level: :debug], fn ->
-        assert {:noreply, ^state} = Tightbeam.Supervision.handle_cast(:sweep, state)
-      end)
-
-    assert log =~ "background pass deferred"
-    refute log =~ "supervision_evaluate_failed"
-  end
-
   test "sentinel stop notification skips overload", %{db: db} do
     # An absent declaration takes the stop path during reconciliation.
     state = %{db: db, host: "test-host", children: %{}, failures: %{}}

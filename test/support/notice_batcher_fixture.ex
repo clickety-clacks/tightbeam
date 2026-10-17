@@ -1399,154 +1399,46 @@ defmodule Tightbeam.NoticeBatcherFixture do
     assert source_ids(db, carrier) == [first.wake_id, second.wake_id]
   end
 
-  defp scenario(33, db) do
-    first = eligible(db, prompt: "sibling cannot be partially restored", class: "blocker")
-    second = charged_prod!(db)
-    [carrier] = NoticeBatcher.recover(db, second.due_at)
-    assert {:ok, turn} = Ledger.claim_next(db, "agent:recipient", "prewrite-test")
-    # The original sidecar was created on its pending source and settled by
-    # real carrier admission. Model a changed live entitlement afterwards;
-    # inserting a sidecar on an already-fired source is not a valid fixture.
-    {:ok, _} =
-      DB.query(db, """
-      UPDATE supervision_entitlements SET generation=generation+1,
-        basisKind='progress',basisId='new-authority',cause='progress'
-      WHERE assignmentId='prewrite-controller'
-      """)
+  defp scenario(43, db) do
+    malformed = eligible(db, prompt: "malformed attachment source")
+    healthy = eligible(db, prompt: "healthy sibling notice")
+    attachment = %{"name" => "kept.txt", "url" => "attachment://kept"}
 
-    snapshot = delivery_snapshot(db)
-    evidence = prewrite_evidence()
-
-    assert {:error, _} =
-             DB.transaction(db, fn txn ->
-               assert Ledger.finish_in_txn(txn, turn.seq, "failed", "not dispatched",
-                        owner_lease: turn.owner_lease,
-                        prewrite_evidence: evidence
-                      )
-
-               Tightbeam.NoticeSubmission.restore_in_txn(txn, turn, evidence)
-             end)
-
-    assert delivery_snapshot(db) == snapshot
-    assert count(db, "wake_retry_attempts") == 0
-    assert count(db, "turns", "wakeId=?1 AND status='running'", [carrier]) == 1
-    assert Wakes.get(db, first.wake_id).state == "fired"
-
-    assert count(db, "turn_lifecycle_events", "turnSeq=?1 AND kind='terminal_committed'", [
-             turn.seq
-           ]) == 0
-  end
-
-  defp scenario(34, db) do
-    sibling = eligible(db, prompt: "ordinary sibling", class: "blocker")
-    prod = charged_prod!(db)
-    [carrier] = NoticeBatcher.recover(db, prod.due_at)
-    assert {:ok, turn} = Ledger.claim_next(db, "agent:recipient", "prewrite-test")
-    assert turn.wake_id == carrier
-
-    assert {:ok, [["settled", 2]]} =
-             DB.query(
-               db,
-               "SELECT controllerState,chargedGeneration FROM supervision_liveness_sidecar WHERE wakeId=?1",
-               [prod.wake_id]
-             )
-
-    {:ok, [old_entitlement]} =
-      DB.query(
-        db,
-        "SELECT * FROM supervision_entitlements WHERE assignmentId='prewrite-controller'"
-      )
-
-    {:ok, counters} =
-      DB.query(db, "SELECT * FROM assignment_prods WHERE assignmentId='prewrite-controller'")
-
-    {:ok, old_sidecar} =
-      DB.query(db, "SELECT * FROM supervision_liveness_sidecar WHERE wakeId=?1", [prod.wake_id])
-
-    evidence = prewrite_evidence()
-
-    assert {:ok, [sibling_retry, prod_retry] = successors} =
-             DB.transaction(db, fn txn ->
-               assert Ledger.finish_in_txn(txn, turn.seq, "failed", "not dispatched",
-                        owner_lease: turn.owner_lease,
-                        prewrite_evidence: evidence
-                      )
-
-               Tightbeam.NoticeSubmission.restore_in_txn(txn, turn, evidence)
-             end)
-
-    assert {:ok, columns} = DB.query(db, "PRAGMA table_info(supervision_entitlements)")
-    basis_index = Enum.find_index(columns, fn [_, name | _] -> name == "basisId" end)
-
-    assert {:ok, [updated]} =
-             DB.query(
-               db,
-               "SELECT * FROM supervision_entitlements WHERE assignmentId='prewrite-controller'"
-             )
-
-    assert updated == List.replace_at(old_entitlement, basis_index, prod_retry)
-
-    assert {:ok, ^counters} =
-             DB.query(
-               db,
-               "SELECT * FROM assignment_prods WHERE assignmentId='prewrite-controller'"
-             )
-
-    assert {:ok, ^old_sidecar} =
-             DB.query(db, "SELECT * FROM supervision_liveness_sidecar WHERE wakeId=?1", [
-               prod.wake_id
+    assert {:ok, _} =
+             DB.query(db, "UPDATE wakes SET sourceAttachments='false' WHERE wakeId=?1", [
+               malformed.wake_id
              ])
 
-    assert {:ok, [["pending", 2]]} =
+    assert {:ok, _} =
              DB.query(
                db,
-               "SELECT controllerState,chargedGeneration FROM supervision_liveness_sidecar WHERE wakeId=?1",
-               [prod_retry]
+               "UPDATE wakes SET sourceAttachments=?2 WHERE wakeId=?1",
+               [healthy.wake_id, JSON.encode!([attachment])]
              )
 
-    assert Wakes.get(db, prod_retry).prompt == prod.prompt
-    assert Wakes.get(db, sibling_retry).prompt == sibling.prompt
+    [carrier_id] = Wakes.materialize_digests(db, healthy.due_at)
+    carrier = Wakes.get(db, carrier_id)
+    assert source_ids(db, carrier_id) == [malformed.wake_id, healthy.wake_id]
 
-    {:ok, [[path]]} = DB.query(db, "SELECT file FROM pragma_database_list WHERE name='main'")
-    :ok = GenServer.stop(db)
-    {:ok, reopened} = DB.start_link(path: path, name: nil, guard_inputs: [])
-    Process.put({__MODULE__, :db}, reopened)
-    :ok = Schema.ensure_all(reopened)
-    snapshot = delivery_snapshot(reopened)
+    {:ok, _} = DB.query(db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [carrier_id])
+    scheduler = start_scheduler(db, fn wake -> deliver(db, wake) end)
+    assert :ok = Wakes.fire_due(scheduler)
 
-    assert {:ok, ^successors} =
-             DB.transaction(
-               reopened,
-               &Tightbeam.NoticeSubmission.restore_in_txn(&1, turn, evidence)
-             )
+    assert Wakes.get(db, malformed.wake_id).state == "fired"
+    assert Wakes.get(db, healthy.wake_id).state == "fired"
+    assert Wakes.get(db, carrier_id).state == "fired"
 
-    assert delivery_snapshot(reopened) == snapshot
-    at = Wakes.get(reopened, prod_retry).due_at
-    [next_carrier] = NoticeBatcher.recover(reopened, at)
-    assert source_ids(reopened, next_carrier) == successors
-
-    assert {:ok, [["settled", 2]]} =
+    assert {:ok, [[encoded_attachments]]} =
              DB.query(
-               reopened,
-               "SELECT controllerState,chargedGeneration FROM supervision_liveness_sidecar WHERE wakeId=?1",
-               [prod_retry]
+               db,
+               "SELECT attachments FROM messages WHERE id=(SELECT messageId FROM turns WHERE wakeId=?1)",
+               [carrier_id]
              )
 
-    assert {:ok, [^updated]} =
-             DB.query(
-               reopened,
-               "SELECT * FROM supervision_entitlements WHERE assignmentId='prewrite-controller'"
-             )
-
-    assert {:ok, ^counters} =
-             DB.query(
-               reopened,
-               "SELECT * FROM assignment_prods WHERE assignmentId='prewrite-controller'"
-             )
-
-    assert NoticeBatcher.recover(reopened, at) == []
-    assert count(reopened, "turns") == 2
-    assert {:ok, []} = DB.query(reopened, "PRAGMA foreign_key_check")
+    assert JSON.decode!(encoded_attachments) == [attachment]
+    assert [%{batch_state: "delivered"}] = NoticeBatcher.source_refs(db, healthy.wake_id)
+    assert [%{batch_state: "delivered"}] = NoticeBatcher.source_refs(db, malformed.wake_id)
+    :ok = GenServer.stop(scheduler)
   end
 
   defp scenario(35, db) do
@@ -1577,245 +1469,6 @@ defmodule Tightbeam.NoticeBatcherFixture do
     assert count(db, "turn_lifecycle_events", "turnSeq=?1 AND kind='terminal_committed'", [
              turn.seq
            ]) == 0
-  end
-
-  defp scenario(36, db) do
-    escalation = charged_controller!(db, "escalation")
-    [carrier] = NoticeBatcher.recover(db, escalation.due_at)
-    assert {:ok, turn} = Ledger.claim_next(db, "agent:recipient", "prewrite-escalation")
-    assert turn.wake_id == carrier
-    assert count(db, "supervision_entitlements") == 0
-    {:ok, counters} = DB.query(db, "SELECT * FROM assignment_prods")
-
-    {:ok, original} =
-      DB.query(db, "SELECT * FROM supervision_liveness_sidecar WHERE wakeId=?1", [
-        escalation.wake_id
-      ])
-
-    evidence = prewrite_evidence()
-
-    assert {:ok, [retry]} =
-             DB.transaction(db, fn txn ->
-               assert Ledger.finish_in_txn(txn, turn.seq, "failed", "not dispatched",
-                        owner_lease: turn.owner_lease,
-                        prewrite_evidence: evidence
-                      )
-
-               Tightbeam.NoticeSubmission.restore_in_txn(txn, turn, evidence)
-             end)
-
-    assert {:ok, ^original} =
-             DB.query(db, "SELECT * FROM supervision_liveness_sidecar WHERE wakeId=?1", [
-               escalation.wake_id
-             ])
-
-    assert {:ok, [["scheduled", "settled", 2]]} =
-             DB.query(
-               db,
-               "SELECT controllerOrigin,controllerState,chargedGeneration FROM supervision_liveness_sidecar WHERE wakeId=?1",
-               [retry]
-             )
-
-    [next_carrier] = NoticeBatcher.recover(db, Wakes.get(db, retry).due_at)
-    assert source_ids(db, next_carrier) == [retry]
-
-    assert {:ok, next_turn} =
-             Ledger.claim_next(db, "agent:recipient", "prewrite-escalation-again")
-
-    assert {:ok, [second_retry]} =
-             DB.transaction(db, fn txn ->
-               assert Ledger.finish_in_txn(txn, next_turn.seq, "failed", "still not dispatched",
-                        owner_lease: next_turn.owner_lease,
-                        prewrite_evidence: evidence
-                      )
-
-               Tightbeam.NoticeSubmission.restore_in_txn(txn, next_turn, evidence)
-             end)
-
-    assert Tightbeam.NoticeAuthority.resolve!(db, second_retry) ==
-             %{root_wake_id: escalation.wake_id, root_turn_seq: turn.seq}
-
-    assert Tightbeam.NoticeAuthority.current!(db, escalation.wake_id) == second_retry
-    assert count(db, "supervision_entitlements") == 0
-    assert {:ok, ^counters} = DB.query(db, "SELECT * FROM assignment_prods")
-    snapshot = delivery_snapshot(db)
-
-    assert {:ok, [^second_retry]} =
-             DB.transaction(
-               db,
-               &Tightbeam.NoticeSubmission.restore_in_txn(&1, next_turn, evidence)
-             )
-
-    assert delivery_snapshot(db) == snapshot
-    # A changed target cannot inherit original transfer authority. This local
-    # mutation and failed resolution are in one transaction and must roll back.
-    assert {:error, error} =
-             DB.transaction(db, fn txn ->
-               DB.Txn.q(txn, "UPDATE wakes SET sourceAddress='session:forged' WHERE wakeId=?1", [
-                 second_retry
-               ])
-
-               Tightbeam.NoticeAuthority.resolve!(txn, second_retry)
-             end)
-
-    assert Exception.message(error) =~ "changed_retry_authority"
-    assert delivery_snapshot(db) == snapshot
-    # Real user revocation commits BEFORE this restored sidecar is ready.
-    # Its settled charge is history, so terminal disposition cannot pretend
-    # the successor is an uncharged pending controller.
-    assert %{state: "closed", outcome: "revoked"} =
-             Tightbeam.Assignments.__handle__(db, "revoke-assignment", %{
-               verb: "revoke-assignment",
-               principal: {:user, "recipient-owner"},
-               origin: "user:recipient-owner",
-               params: %{
-                 assignment_id: "prewrite-controller",
-                 reason: "fixture parent disposition changed"
-               }
-             })
-
-    closed = delivery_snapshot(db)
-
-    assert {:ok, retries_before} =
-             DB.query(db, "SELECT * FROM wake_retry_attempts ORDER BY wakeId")
-
-    assert {:error, error} =
-             DB.transaction(db, fn txn ->
-               Tightbeam.Supervision.prepare_batch_source_in_txn(txn, second_retry)
-             end)
-
-    assert Exception.message(error) =~ "parent disposition changed"
-    assert delivery_snapshot(db) == closed
-
-    assert {:ok, [["closed", "revoked"]]} =
-             DB.query(db, "SELECT state,outcome FROM assignments WHERE id='prewrite-controller'")
-
-    unrelated = eligible(db, prompt: "unrelated work proceeds", class: "blocker")
-    at = max(Wakes.get(db, second_retry).due_at, unrelated.due_at)
-    carriers = NoticeBatcher.recover(db, at)
-    assert [%{delivery_wake_id: survivor}] = NoticeBatcher.source_refs(db, unrelated.wake_id)
-    assert survivor in carriers
-    assert_actual_carrier!(db, survivor, [unrelated.wake_id])
-    assert NoticeBatcher.source_refs(db, second_retry) == []
-    assert Wakes.get(db, second_retry).state == "pending"
-    assert count(db, "turns", "wakeId=?1", [second_retry]) == 0
-
-    assert {:ok, ^retries_before} =
-             DB.query(db, "SELECT * FROM wake_retry_attempts ORDER BY wakeId")
-
-    assert {:ok, ^counters} = DB.query(db, "SELECT * FROM assignment_prods")
-
-    assert {:ok, [["closed", "revoked"]]} =
-             DB.query(db, "SELECT state,outcome FROM assignments WHERE id='prewrite-controller'")
-
-    frozen = delivery_snapshot(db)
-    assert NoticeBatcher.recover(db, at) == []
-    assert delivery_snapshot(db) == frozen
-  end
-
-  defp scenario(37, db) do
-    escalation = charged_controller!(db, "escalation")
-    [old_carrier] = NoticeBatcher.recover(db, escalation.due_at)
-
-    {:ok, _} =
-      DB.query(db, """
-      INSERT INTO work_items(id,title,ownerUserId,state,createdByUser,createdAt)
-      VALUES ('wi_prewrite_retirement','retirement proof','recipient-owner','open','recipient-owner',1)
-      """)
-
-    {:ok, _} =
-      DB.query(
-        db,
-        "UPDATE assignments SET workItemId='wi_prewrite_retirement' WHERE id='prewrite-controller'"
-      )
-
-    # Drive the same pre-retirement transition that Org uses. With the child
-    # already retired, it must preserve a parent-elevation predecessor rather
-    # than rearm a live child. The old admitted turn has not been claimed.
-    {:ok, _} = DB.query(db, "UPDATE sessions SET state='retired' WHERE sessionKey='agent:child'")
-
-    assert {:ok, :parent_elevated} =
-             DB.transaction(db, fn txn ->
-               Tightbeam.Supervision.transition_in_txn(txn, %{
-                 kind: "parent_target_retired",
-                 session_key: "agent:recipient",
-                 retirement_epoch: System.system_time(:millisecond),
-                 supervision_interval_ms: 60000,
-                 principal: "user:recipient-owner"
-               })
-             end)
-
-    {:ok, _} =
-      DB.query(db, "UPDATE sessions SET state='retired' WHERE sessionKey='agent:recipient'")
-
-    assert {:ok, [["canceled"]]} =
-             DB.query(db, "SELECT status FROM turns WHERE wakeId=?1", [old_carrier])
-
-    {:ok, [[root, target]]} =
-      DB.query(db, """
-      SELECT w.wakeId,w.sessionKey FROM wakes w JOIN supervision_liveness_sidecar s ON s.wakeId=w.wakeId
-      WHERE s.controllerOrigin='retirement_elevation' AND s.assignmentId='prewrite-controller'
-      """)
-
-    _ = NoticeBatcher.recover(db, System.system_time(:millisecond) + 1000)
-    assert {:ok, turn} = Ledger.claim_next(db, target, "prewrite-retirement")
-
-    {:ok, predecessors} =
-      DB.query(
-        db,
-        "SELECT * FROM supervision_liveness_sidecar WHERE transferEvidenceId IS NOT NULL"
-      )
-
-    assert length(predecessors) == 1
-    evidence = prewrite_evidence()
-
-    assert {:ok, [retry]} =
-             DB.transaction(db, fn txn ->
-               assert Ledger.finish_in_txn(txn, turn.seq, "failed", "not dispatched",
-                        owner_lease: turn.owner_lease,
-                        prewrite_evidence: evidence
-                      )
-
-               Tightbeam.NoticeSubmission.restore_in_txn(txn, turn, evidence)
-             end)
-
-    assert Tightbeam.NoticeAuthority.resolve!(db, retry) == %{
-             root_wake_id: root,
-             root_turn_seq: turn.seq
-           }
-
-    {:ok, [[path]]} = DB.query(db, "SELECT file FROM pragma_database_list WHERE name='main'")
-    :ok = GenServer.stop(db)
-    {:ok, reopened} = DB.start_link(path: path, name: nil, guard_inputs: [])
-    Process.put({__MODULE__, :db}, reopened)
-    :ok = Schema.ensure_all(reopened)
-
-    assert {:ok, ^predecessors} =
-             DB.query(
-               reopened,
-               "SELECT * FROM supervision_liveness_sidecar WHERE transferEvidenceId IS NOT NULL"
-             )
-
-    snapshot = delivery_snapshot(reopened)
-
-    assert {:ok, [^retry]} =
-             DB.transaction(
-               reopened,
-               &Tightbeam.NoticeSubmission.restore_in_txn(&1, turn, evidence)
-             )
-
-    assert delivery_snapshot(reopened) == snapshot
-    [next_carrier] = NoticeBatcher.recover(reopened, Wakes.get(reopened, retry).due_at)
-    assert source_ids(reopened, next_carrier) == [retry]
-
-    assert {:ok, ^predecessors} =
-             DB.query(
-               reopened,
-               "SELECT * FROM supervision_liveness_sidecar WHERE transferEvidenceId IS NOT NULL"
-             )
-
-    assert count(reopened, "supervision_entitlements") == 0
-    assert {:ok, []} = DB.query(reopened, "PRAGMA foreign_key_check")
   end
 
   defp scenario(38, db) do
@@ -1863,85 +1516,6 @@ defmodule Tightbeam.NoticeBatcherFixture do
     assert Tightbeam.NoticeAuthority.current!(db, source.wake_id) == source.wake_id
   end
 
-  defp charged_prod!(db), do: charged_controller!(db, "prod")
-
-  defp charged_controller!(db, kind) do
-    holder =
-      if kind == "escalation" do
-        seed_session(db, "agent:child", "recipient-owner")
-
-        {:ok, _} =
-          DB.query(
-            db,
-            "UPDATE sessions SET spawnedBy='agent:recipient' WHERE sessionKey='agent:child'"
-          )
-
-        "agent:child"
-      else
-        "agent:recipient"
-      end
-
-    prod = eligible(db, prompt: "already charged controller")
-
-    {:ok, _} =
-      DB.query(
-        db,
-        """
-        INSERT INTO assignments(id,subject,holderKey,openedByUser,openedAt)
-        VALUES ('prewrite-controller','prewrite controller',?1,'recipient-owner',1)
-        """,
-        [holder]
-      )
-
-    {:ok, _} =
-      DB.query(db, "UPDATE wakes SET assignmentId='prewrite-controller' WHERE wakeId=?1", [
-        prod.wake_id
-      ])
-
-    if kind == "escalation" do
-      {:ok, _} =
-        DB.query(
-          db,
-          """
-          UPDATE wakes SET reresolve='lineage',reresolveSeed=?2,reresolveRung=1 WHERE wakeId=?1
-          """,
-          [prod.wake_id, holder]
-        )
-    end
-
-    clock = System.system_time(:millisecond)
-
-    {:ok, _} =
-      DB.query(
-        db,
-        """
-        INSERT INTO supervision_entitlements
-          (assignmentId,generation,dueAt,state,claimClock,basisKind,basisId,cause,principal,supervisionIntervalMs)
-        VALUES ('prewrite-controller',1,?1,'claimed',?1,'assignment_open',
-          'prewrite-controller','assignment_open','process:tightbeam',60000)
-        """,
-        [clock]
-      )
-
-    {:ok, _} =
-      DB.query(db, """
-      INSERT INTO assignment_prods(assignmentId,attemptCount,prodCount,deniedStreak,attestCount)
-      VALUES ('prewrite-controller',17,3,2,0)
-      """)
-
-    assert {:ok, {:armed, 2}} =
-             DB.transaction(db, fn txn ->
-               Tightbeam.Supervision.transition_in_txn(txn, %{
-                 kind: "controller_scheduled",
-                 wake_id: prod.wake_id,
-                 assignment_id: "prewrite-controller",
-                 wake_kind: kind
-               })
-             end)
-
-    Wakes.get(db, prod.wake_id)
-  end
-
   defp prewrite_evidence do
     Tightbeam.NoticeSubmission.prewrite_evidence(
       :prompt,
@@ -1958,10 +1532,7 @@ defmodule Tightbeam.NoticeBatcherFixture do
         {"wakes", "wakeId"},
         {"notice_batches", "batchId"},
         {"notice_batch_members", "memberId"},
-        {"supervision_entitlements", "assignmentId"},
-        {"supervision_liveness_sidecar", "wakeId"},
-        {"wake_retry_attempts", "wakeId"},
-        {"assignment_prods", "assignmentId"}
+        {"wake_retry_attempts", "wakeId"}
       ],
       fn {table, key} ->
         assert {:ok, rows} = DB.query(db, "SELECT * FROM #{table} ORDER BY #{key}")

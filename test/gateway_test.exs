@@ -8157,7 +8157,7 @@ defmodule Tightbeam.GatewayTest do
            end)
   end
 
-  test "queued set_harness handoff excludes exact replacement QMS sources and keeps other durable order",
+  test "queued set_harness handoff preserves plain notices and excludes sender-retracted sources",
        ctx do
     ensure_global_registry()
     candidate = start_supervised!({BlockingCandidateAdapterStub, self()})
@@ -8224,22 +8224,6 @@ defmodule Tightbeam.GatewayTest do
 
     assert suppressed_message.seq != suppressed_seq
 
-    assert {:ok, _} =
-             DB.query(
-               ctx.db,
-               """
-               INSERT INTO supervision_liveness_receipts
-                 (assignmentId,sourceKind,sourceId,sourceAt,acceptedAt,generation,expiresAt)
-               VALUES ('asg_handoff','progress','progress-1',?1,?2,2,NULL)
-               """,
-               [wake.created_at, wake.created_at + 1]
-             )
-
-    assert {:ok, [^suppressed_seq]} =
-             DB.transaction(ctx.db, fn txn ->
-               Tightbeam.QueuedMessageSuppression.suppress_before_claim_in_txn(txn, "k1")
-             end)
-
     {other_suppressed_seq, other_suppressed_message} =
       enqueue_gateway_prompt!(
         ctx.db,
@@ -8256,14 +8240,6 @@ defmodule Tightbeam.GatewayTest do
                  "queued-message-suppressed: another_reason"
                )
              end)
-
-    :ok =
-      EventLog.lifecycle(
-        ctx.db,
-        "queued_message_suppressed",
-        Integer.to_string(other_suppressed_seq),
-        JSON.encode!(%{messageKind: "liveness"})
-      )
 
     {replacement_source_seq, replacement_source_message} =
       enqueue_gateway_prompt!(
@@ -8363,7 +8339,7 @@ defmodule Tightbeam.GatewayTest do
 
     assert %{ok: true, harness: "codex", engine_context: "reset"} = Task.await(task, 60_000)
     assert Org.get(ctx.db, "k1").cleared_through_seq == unattributed_canceled_message.seq
-    assert Ledger.pending_count(ctx.db, "k1") == 3
+    assert Ledger.pending_count(ctx.db, "k1") == 4
 
     assert {:ok, queued_rows} =
              DB.query(
@@ -8372,7 +8348,7 @@ defmodule Tightbeam.GatewayTest do
              )
 
     assert queued_rows == [
-             [suppressed_seq, "canceled", suppressed_message.id],
+             [suppressed_seq, "queued", suppressed_message.id],
              [other_suppressed_seq, "canceled", other_suppressed_message.id],
              [replacement_source_seq, "canceled", replacement_source_message.id],
              [unattributed_canceled_seq, "canceled", unattributed_canceled_message.id],
@@ -8381,16 +8357,8 @@ defmodule Tightbeam.GatewayTest do
              [late_seq, "queued", late_message.id]
            ]
 
-    assert {:ok, [[error]]} =
-             DB.query(ctx.db, "SELECT error FROM turns WHERE seq=?1", [suppressed_seq])
-
-    assert error == "queued-message-suppressed: verified_liveness_recovery"
-
-    assert Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
-             event.kind == "queued_message_suppressed" and
-               event.subject == Integer.to_string(suppressed_seq) and
-               JSON.decode!(event.detail)["messageKind"] == "liveness"
-           end)
+    assert {:ok, [["queued"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [suppressed_seq])
 
     visible_after_switch = Projection.list_after(ctx.db, "k1", nil, 100, history_agent.seq)
 

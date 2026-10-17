@@ -63,7 +63,7 @@ defmodule Tightbeam.RulesTest do
              Dispatch.dispatch(ctx.db, %{"post" => fn _ -> %{ok: true} end}, call())
   end
 
-  test "shipped wait qualification matrix follows TOML reload with a fresh query snapshot", ctx do
+  test "shipped wait effort-relief policy follows TOML reload with a fresh query snapshot", ctx do
     shipped =
       File.read!(
         Path.expand("../priv/kungfu/agentic-engineering/rules/verification.toml", __DIR__)
@@ -75,8 +75,6 @@ defmodule Tightbeam.RulesTest do
     facts = %{
       "wait.obligation_matches" => true,
       "wait.admitted" => true,
-      "wait.after_turn_eligible" => true,
-      "wait.coverage_valid" => true,
       "wait.continuation_state" => "pending",
       "wait.recognized" => false,
       "resolver.open" => true,
@@ -86,39 +84,24 @@ defmodule Tightbeam.RulesTest do
       "wait.verification_state" => "provisional"
     }
 
-    query = fn purpose, snapshot ->
-      DB.transaction(ctx.db, &Rules.select_policy_in_txn(&1, purpose, %{wait_facts: snapshot}))
+    query = fn snapshot ->
+      DB.transaction(ctx.db, &Rules.select_policy_in_txn(&1, "wait-effort-relief", %{wait_facts: snapshot}))
     end
 
-    assert {:ok, {:ok, %{name: "holder-continuation-coverage"}}} =
-             query.("wait-prod-coverage", facts)
-
-    assert {:ok, {:ok, %{name: "justified-unresolved-dependency"}}} =
-             query.("wait-effort-relief", facts)
+    assert {:ok, {:ok, %{name: "justified-unresolved-dependency"}}} = query.(facts)
 
     for field <-
-          ~w(wait.obligation_matches wait.admitted wait.after_turn_eligible wait.coverage_valid) do
-      assert {:ok, :none} = query.("wait-prod-coverage", Map.put(facts, field, false))
+          ~w(wait.obligation_matches wait.admitted resolver.open resolver.owed_by_other wait.declaration_complete wait.verification_accountable) do
+      assert {:ok, :none} = query.(Map.put(facts, field, false))
     end
 
     for state <- ~w(queued running) do
-      snapshot = Map.put(facts, "wait.continuation_state", state)
-      assert {:ok, {:ok, _}} = query.("wait-prod-coverage", snapshot)
-      assert {:ok, :none} = query.("wait-effort-relief", snapshot)
+      assert {:ok, :none} = query.(Map.put(facts, "wait.continuation_state", state))
     end
 
-    for field <-
-          ~w(resolver.open resolver.owed_by_other wait.declaration_complete wait.verification_accountable) do
-      assert {:ok, :none} = query.("wait-effort-relief", Map.put(facts, field, false))
-    end
-
-    assert {:ok, :none} = query.("wait-effort-relief", Map.put(facts, "wait.recognized", true))
-
-    assert {:ok, :none} =
-             query.("wait-effort-relief", Map.put(facts, "wait.verification_state", "challenged"))
-
-    assert {:ok, {:ok, _}} =
-             query.("wait-effort-relief", Map.put(facts, "wait.verification_state", "confirmed"))
+    assert {:ok, :none} = query.(Map.put(facts, "wait.recognized", true))
+    assert {:ok, :none} = query.(Map.put(facts, "wait.verification_state", "challenged"))
+    assert {:ok, {:ok, _}} = query.(Map.put(facts, "wait.verification_state", "confirmed"))
 
     put_raw(
       ctx,
@@ -130,10 +113,8 @@ defmodule Tightbeam.RulesTest do
     )
 
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
-    assert {:ok, :none} = query.("wait-effort-relief", facts)
-
-    assert {:ok, {:ok, _}} =
-             query.("wait-effort-relief", Map.put(facts, "resolver.owed_by_other", false))
+    assert {:ok, :none} = query.(facts)
+    assert {:ok, {:ok, _}} = query.(Map.put(facts, "resolver.owed_by_other", false))
   end
 
   test "predicate policy loading refuses incomplete verification and invalid conditions", ctx do
@@ -1074,7 +1055,7 @@ defmodule Tightbeam.RulesTest do
     assert {:deny, %{rule: "needs-review"}} = Rules.evaluate(ctx.db, completion)
   end
 
-  test "completion notice loader exception preserves unrelated wake and review-link validation",
+  test "completion gate loader exception preserves unrelated remedy-link validation",
        ctx do
     shipped = File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml")
     put_raw(ctx, shipped)
@@ -1474,17 +1455,9 @@ defmodule Tightbeam.RulesTest do
     end
   end
 
-  test "shipped completion notifies its owner without forced review staffing", ctx do
+  test "shipped completion gate blocks and stores one ordinary holder notice", ctx do
     holder = session(ctx.db, "receipt-remedy-holder", "flynn", archetype: "coder")
-    reviewer = session(ctx.db, "receipt-remedy-reviewer", "flynn", archetype: "reviewer-code")
-    owner = session(ctx.db, Org.personal_session_key("flynn"), "flynn", archetype: "orchestrator")
-
-    {:ok, _} =
-      DB.query(ctx.db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1)")
-
-    Roles.create!(ctx.db, "reviewer-code", "flynn", reviewer.session_key)
-    producer = assignment(ctx, holder.session_key, {:user, "flynn"})
-    attach_work_item(ctx, producer.id, "wi-accountable-review-notice")
+    producer = assignment(ctx, holder.session_key, {:user, "flynn"}, effect_kind: "code")
 
     put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
@@ -1498,126 +1471,41 @@ defmodule Tightbeam.RulesTest do
     assert {:error,
             %{
               reason: "remedy_fired",
-              producer: notice_id,
+              producer: wake_id,
               rule: "completion-requires-review",
               ref: producer_id
             }} = Dispatch.dispatch(ctx.db, ctx.handlers, completion)
 
     assert producer_id == producer.id
     assert review_count(ctx.db, producer.id) == 0
-    notice = Wakes.get(ctx.db, notice_id)
-    assert notice.session_key == owner.session_key
-    assert notice.owner_user_id == "flynn"
-    assert notice.assignment_id == producer.id
-    assert notice.prompt =~ producer.id
 
-    verdict(
-      ctx,
-      holder.session_key,
-      producer.id,
-      "tests-passed",
-      "gibson:/repo 378807eabb39cecc25ea801494053f8aa20feafa; " <>
-        "mix test test/rules_test.exs; passed: 1 test"
-    )
-
-    previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
-
-    on_exit(fn ->
-      if previous_runner,
-        do: Application.put_env(:tightbeam, :commit_ref_command, previous_runner),
-        else: Application.delete_env(:tightbeam, :commit_ref_command)
-    end)
-
-    Application.put_env(:tightbeam, :commit_ref_command, fn _executable, _args, _opts ->
-      {"", 0}
-    end)
-
-    refs = [
-      %{
-        "repo" => "#{Tightbeam.Placement.local_host_name()}:/tmp/o2-result",
-        "commit" => String.duplicate("a", 40)
-      }
-    ]
-
-    assert %{attest: %{verdictKind: "verified"}} =
-             Assignments.__handle__(
+    assert {:ok, [[session_key, prompt, consumer, origin, creator_session_key, summon]]} =
+             DB.query(
                ctx.db,
-               "attest",
-               p3_call("attest", {:session, holder.session_key}, %{
-                 assignment_id: producer.id,
-                 kind: "verdict",
-                 verdict_kind: "verified",
-                 commit_refs: refs
-               })
+               "SELECT sessionKey,prompt,consumer,origin,creatorSessionKey,summon FROM wakes WHERE wakeId=?1 AND assignmentId=?2",
+               [wake_id, producer.id]
              )
 
-    completion = put_in(completion, [:params, :commit_refs], refs)
+    assert session_key == holder.session_key
+    assert prompt ==
+             "Coordinate independent review of assignment #{producer.id}; preserve current evidence and direct staffing through its accountable owner."
 
-    assert {:error,
-            %{
-              reason: "remedy_fired",
-              producer: review_id,
-              rule: "completion-requires-review"
-            }} = Dispatch.dispatch(ctx.db, ctx.handlers, completion)
-
-    assert review_id == notice_id
-    assert review_count(ctx.db, producer.id) == 0
-
-    assert {:error, %{reason: "remedy_fired", producer: ^review_id}} =
-             Dispatch.dispatch(ctx.db, ctx.handlers, completion)
-
-    assert review_count(ctx.db, producer.id) == 0
-    assert Wakes.get(ctx.db, review_id) != nil
+    assert consumer == "prompt"
+    assert origin == "remedy:completion-requires-review"
+    assert creator_session_key == nil
+    assert summon == 1
 
     assert {:ok, [[1]]} =
              DB.query(
                ctx.db,
-               "SELECT count(*) FROM wakes WHERE assignmentId=?1 AND consumer='prompt' AND origin='remedy:completion-requires-review'",
+               "SELECT count(*) FROM wakes WHERE assignmentId=?1 AND origin='remedy:completion-requires-review'",
                [producer.id]
              )
 
-    assert {:ok, [[1]]} =
+    assert {:ok, [[0]]} =
              DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE workItemId=?1", [
-               "wi-accountable-review-notice"
+               producer.workItemId
              ])
-
-    assert {:ok, [["open"]]} =
-             DB.query(ctx.db, "SELECT state FROM assignments WHERE id=?1", [producer.id])
-
-    assert {:ok, review} =
-             Dispatch.dispatch(
-               ctx.db,
-               ctx.handlers,
-               p3_call("assign", {:user, "flynn"}, %{
-                 subject: "owner-directed independent review",
-                 reviews_assignment_id: producer.id,
-                 idempotency_key: nil,
-                 files: nil
-               })
-               |> Map.put(:session_key, reviewer.session_key)
-             )
-
-    review_id = review.id
-    assert review.holderKey != holder.session_key
-
-    assert %{attest: %{verdictKind: "reviewed-clean"}} =
-             Assignments.__handle__(
-               ctx.db,
-               "attest",
-               p3_call("attest", {:session, reviewer.session_key}, %{
-                 assignment_id: review_id,
-                 kind: "verdict",
-                 verdict_kind: "reviewed-clean",
-                 note: "reviewed exact receipt tip",
-                 commit_refs: refs
-               })
-             )
-
-    assert {:ok, %{assignment: %{id: completed_id, state: "closed"}}} =
-             Dispatch.dispatch(ctx.db, ctx.handlers, completion)
-
-    assert completed_id == producer.id
-    assert review_count(ctx.db, producer.id) == 1
   end
 
   test "typed completion keeps code reviewed while receipt exemptions stay narrow", ctx do

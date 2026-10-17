@@ -281,12 +281,6 @@ defmodule Tightbeam.BreathingTest do
       prompt: "private-body-gamma"
     )
 
-    :ok =
-      DB.execute(
-        db,
-        "INSERT INTO queued_message_scopes (turnSeq,assignmentId,turnCreatedAt,wakeId,wakeCreatedAt) VALUES (52,'asg_session_opened',#{now_ms - 90_000},'w_queue_gamma',#{now_ms - 90_000})"
-      )
-
     insert_turn!(db, 53, "active", "queued",
       assignment_id: "asg_other",
       created_at: now_ms - 5_000_000,

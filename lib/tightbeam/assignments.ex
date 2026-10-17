@@ -643,13 +643,7 @@ defmodule Tightbeam.Assignments do
 
       liveness_trigger = disposition_liveness_trigger!(txn, work_item_id)
 
-      supervision_transition!(txn, :terminal_disposition, %{
-        kind: "terminal_disposition",
-        assignment_id: assignment_id,
-        cause: "holder_retired",
-        principal: principal,
-        requester_id: "tightbeam:retirement"
-      })
+      Supervision.assignment_closed_in_txn(txn, assignment_id)
 
       disposition =
         assignment_disposition_command(
@@ -2159,13 +2153,12 @@ defmodule Tightbeam.Assignments do
           )
         end)
 
-        supervision_transition!(txn, :armed, %{
-          kind: "assignment_open",
-          assignment_id: id,
-          opened_at: now,
-          supervision_interval_ms: call.supervision_interval_ms,
-          principal: principal_id(call.principal)
-        })
+        Supervision.assignment_opened_in_txn(
+          txn,
+          id,
+          now,
+          call.supervision_interval_ms
+        )
 
         entitlement_trigger = liveness_trigger!(txn, {:assignment, id})
 
@@ -2639,13 +2632,7 @@ defmodule Tightbeam.Assignments do
 
     liveness_trigger = disposition_liveness_trigger!(txn, closed_assignment.workItemId)
 
-    supervision_transition!(txn, :terminal_disposition, %{
-      kind: "terminal_disposition",
-      assignment_id: assignment.id,
-      cause: "terminal_disposition",
-      principal: principal_id(call.principal),
-      requester_id: "tightbeam:assignments"
-    })
+    Supervision.assignment_closed_in_txn(txn, assignment.id)
 
     disposition =
       assignment_disposition_command(
@@ -3207,13 +3194,7 @@ defmodule Tightbeam.Assignments do
       liveness_trigger
     )
 
-    supervision_transition!(txn, :terminal_disposition, %{
-      kind: "terminal_disposition",
-      assignment_id: assignment_id,
-      cause: "terminal_disposition",
-      principal: principal_id(call.principal),
-      requester_id: "tightbeam:assignments"
-    })
+    Supervision.assignment_closed_in_txn(txn, assignment_id)
 
     disposition =
       assignment_disposition_command(
@@ -3378,13 +3359,12 @@ defmodule Tightbeam.Assignments do
       call.prepared_effort_arm
     )
 
-    supervision_transition!(txn, :armed, %{
-      kind: "assignment_open",
-      assignment_id: assignment_id,
-      opened_at: reopened_at,
-      supervision_interval_ms: call.supervision_interval_ms,
-      principal: principal_id(call.principal)
-    })
+    Supervision.assignment_opened_in_txn(
+      txn,
+      assignment_id,
+      reopened_at,
+      call.supervision_interval_ms
+    )
 
     liveness_trigger = liveness_trigger!(txn, {:assignment, assignment_id})
 
@@ -3696,13 +3676,8 @@ defmodule Tightbeam.Assignments do
 
     if Txn.changes(txn) != 1, do: raise(TransitionRace)
 
-    if attrs.kind == "verdict" do
-      [[subject]] =
-        Txn.q(txn, "SELECT COALESCE(reviewsAssignmentId,id) FROM assignments WHERE id=?1", [
-          attrs.assignment_id
-        ])
-
-      Tightbeam.Wakes.schedule_changed_in_txn(txn, {:review_remedy_changed, subject})
+    if is_binary(attrs.by_session) do
+      Supervision.activity_in_txn(txn, attrs.assignment_id, attrs.by_session, ts)
     end
 
     attest([
@@ -4321,18 +4296,10 @@ defmodule Tightbeam.Assignments do
   defp row_commit_principal_id({:remedy, %{statute: statute}}), do: "remedy:" <> statute
   defp row_commit_principal_id(principal), do: principal_id(principal)
 
-  defp supervision_transition!(txn, expected, observation) do
-    case Supervision.transition_in_txn(txn, observation) do
-      ^expected -> expected
-      {:error, reason} -> raise "supervision transition refused: #{inspect(reason)}"
-      other -> raise "invalid supervision transition result: #{inspect(other)}"
-    end
-  end
-
   defp disposition_liveness_trigger!(_txn, nil), do: nil
 
   defp disposition_liveness_trigger!(txn, work_item_id) do
-    case Supervision.liveness_trigger_in_txn(txn, {:work_item, work_item_id}) do
+    case Supervision.inactivity_deadline_trigger_in_txn(txn, {:work_item, work_item_id}) do
       {:ok, trigger} when is_map(trigger) -> trigger
       :none -> raise "open work item #{work_item_id} has no liveness trigger"
       {:error, reason} -> raise "invalid liveness trigger: #{inspect(reason)}"
@@ -4340,7 +4307,7 @@ defmodule Tightbeam.Assignments do
   end
 
   defp liveness_trigger!(txn, primary) do
-    case Supervision.liveness_trigger_in_txn(txn, primary) do
+    case Supervision.inactivity_deadline_trigger_in_txn(txn, primary) do
       {:ok, trigger} when is_map(trigger) -> trigger
       :none -> raise "#{inspect(primary)} has no liveness trigger"
       {:error, reason} -> raise "invalid liveness trigger: #{inspect(reason)}"

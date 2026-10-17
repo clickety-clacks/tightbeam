@@ -12,7 +12,6 @@ defmodule Tightbeam.EphemeralTest do
     Org,
     Placement,
     Schema,
-    Supervision,
     Wakes
   }
 
@@ -135,12 +134,6 @@ defmodule Tightbeam.EphemeralTest do
                db,
                "SELECT COUNT(*) FROM work_items WHERE deliveryOwnerSessionKey='helper'"
              )
-  end
-
-  test "R2.3 never runs supervision for an ephemeral helper", %{db: db} do
-    assert Supervision.evaluate(db, %{}, 1, "helper", nil) == :idle
-    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM decision_requests")
-    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM wakes")
   end
 
   test "R2.3 inspection-only helpers cannot write records or spawn helpers", %{db: db} do

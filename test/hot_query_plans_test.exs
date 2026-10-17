@@ -1,7 +1,7 @@
 defmodule Tightbeam.HotQueryPlansTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{Assignments, DB, Ledger, Rules, Supervision, WorkState}
+  alias Tightbeam.{Assignments, DB, Ledger, Rules, WorkState}
 
   # Production databases carry no sqlite_stat1, so these plans are checked
   # without ANALYZE: the planner then prefers equality indexes such as
@@ -19,37 +19,6 @@ defmodule Tightbeam.HotQueryPlansTest do
     plan = Enum.map(rows, &List.last/1)
     IO.puts("plan: " <> Enum.join(plan, " | "))
     plan
-  end
-
-  test "transfer candidates use the wake assignment index", %{db: db} do
-    plan = plan!(db, Supervision.transfer_candidate_sql(), ["assignment", nil])
-    assert Enum.any?(plan, &String.contains?(&1, "USING INDEX wakes_assignment (assignmentId=?)"))
-    refute Enum.any?(plan, &Regex.match?(~r/^SCAN (wakes|w|d)\b/, &1))
-    assert {:ok, []} = DB.query(db, Supervision.transfer_candidate_sql(), ["assignment", nil])
-    assert :ok = Tightbeam.Schema.ensure_all(db)
-  end
-
-  test "idle-cleanup delivery state uses its primary key", %{db: db} do
-    params = Supervision.idle_cleanup_delivery_history_params(String.duplicate("a", 64), "tok")
-    plan = plan!(db, Supervision.idle_cleanup_delivery_history_sql(), params)
-
-    assert hd(plan) =~
-             "SEARCH idle_cleanup_state USING INDEX sqlite_autoindex_idle_cleanup_state"
-
-    refute Enum.any?(plan, &Regex.match?(~r/^SCAN /, &1))
-    assert {:ok, []} = DB.query(db, Supervision.idle_cleanup_delivery_history_sql(), params)
-  end
-
-  test "ended scheduled controllers are read from their recorded-state index", %{db: db} do
-    plan = plan!(db, Supervision.ended_controllers_sql(), [])
-    assert hd(plan) =~ "supervision_liveness_ended_controller"
-
-    assert Enum.any?(
-             plan,
-             &Regex.match?(~r/^SEARCH w USING (?:COVERING )?INDEX .* \(wakeId=\?/, &1)
-           )
-
-    refute Enum.any?(plan, &Regex.match?(~r/^SCAN w/, &1))
   end
 
   test "unpublished terminals are read from the unpublished partial index", %{db: db} do

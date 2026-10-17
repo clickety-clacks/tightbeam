@@ -13,13 +13,20 @@ defmodule Tightbeam.O2SchemaMigrationTest do
     %{db: db}
   end
 
-  test "fresh O2 bootstrap and restart preserve nullable notice state", %{db: db} do
+  test "fresh minimal bootstrap omits retired review-notice state", %{db: db} do
     assert :ok = Schema.ensure_all(db)
     assert stamp(db) == "decision-request-row-schema-v2-019"
     seed_episode(db)
-    assert rows(db, "SELECT noticeState FROM rail_remedy_episodes") == [[nil]]
+    columns =
+      rows(db, "PRAGMA table_info(rail_remedy_episodes)")
+      |> Enum.map(&Enum.at(&1, 1))
+
+    refute "noticeState" in columns
     assert :ok = Schema.ensure_all(db)
-    assert rows(db, "SELECT noticeState FROM rail_remedy_episodes") == [[nil]]
+
+    assert rows(db, "SELECT * FROM rail_remedy_episodes") == [
+             ["fixture", "subject", "closed", nil, 1, 0, "claim", 1, nil]
+           ]
     assert rows(db, "PRAGMA foreign_key_check") == []
     assert rows(db, "PRAGMA foreign_keys") == [[1]]
     assert_two_shapes(db)
@@ -73,8 +80,7 @@ defmodule Tightbeam.O2SchemaMigrationTest do
            ) ==
              [["assignment_cannot_proceed"]]
 
-    assert rows(db, "SELECT * FROM rail_remedy_episodes") ==
-             Enum.map(before_episode, &(&1 ++ [nil]))
+    assert rows(db, "SELECT * FROM rail_remedy_episodes") == before_episode
 
     # Only the explicit rowVersion, lineage and qualified retry guard upgrades change old SQL.
     before_names =
@@ -265,12 +271,20 @@ defmodule Tightbeam.O2SchemaMigrationTest do
 
     assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
     assert stamp(db) == "row-driven-o2-pre-liveness-v1-019"
-    assert rows(db, "SELECT noticeState FROM rail_remedy_episodes") == [[nil]]
+    columns =
+      rows(db, "PRAGMA table_info(rail_remedy_episodes)")
+      |> Enum.map(&Enum.at(&1, 1))
+
+    refute "noticeState" in columns
     assert rows(db, "SELECT name FROM sqlite_master WHERE name='wake_cancellations'") == []
     :ok = DB.execute(db, "DROP TRIGGER o2_test_refuse_activation")
     assert :ok = Schema.ensure_all(db)
     assert stamp(db) == "decision-request-row-schema-v2-019"
-    assert rows(db, "SELECT noticeState FROM rail_remedy_episodes") == [[nil]]
+    columns =
+      rows(db, "PRAGMA table_info(rail_remedy_episodes)")
+      |> Enum.map(&Enum.at(&1, 1))
+
+    refute "noticeState" in columns
     assert_two_shapes(db)
   end
 

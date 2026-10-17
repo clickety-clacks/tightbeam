@@ -199,7 +199,6 @@ defmodule Tightbeam.Ledger do
         Txn.q(txn, "UPDATE wakes SET deliveredTurnSeq=?2 WHERE wakeId=?1", [wake_id, seq])
       end
 
-      :ok = QueuedMessageSuppression.record_in_txn(txn, seq, attrs)
       QueuedMessageSuppression.replace_own_queued_in_txn(txn, seq, attrs)
 
       if transition =
@@ -543,8 +542,6 @@ defmodule Tightbeam.Ledger do
               :busy
 
             [] ->
-              QueuedMessageSuppression.suppress_before_claim_in_txn(txn, session_key)
-
               selected_mind =
                 case Txn.q(
                        txn,

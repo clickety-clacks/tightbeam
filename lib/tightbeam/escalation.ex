@@ -817,6 +817,15 @@ defmodule Tightbeam.Escalation do
 
             inserted? = Txn.changes(txn) == 1
 
+            if inserted? and is_binary(raiser_session_key) do
+              Tightbeam.Supervision.activity_in_txn(
+                txn,
+                assignment_id,
+                raiser_session_key,
+                now
+              )
+            end
+
             [row] =
               Txn.q(
                 txn,
@@ -1322,6 +1331,13 @@ defmodule Tightbeam.Escalation do
           context,
           resolved_input.asked_of_role
         ]
+      )
+
+      Tightbeam.Supervision.activity_in_txn(
+        txn,
+        resolved_input.assignment_id,
+        resolved_input.asker_session_key,
+        raised_at
       )
 
       EventLog.lifecycle_in_txn(
@@ -2602,6 +2618,13 @@ defmodule Tightbeam.Escalation do
         JSON.encode!(ask.options),
         JSON.encode!(%{"note" => ask.note, "supersedes" => ask.supersedes})
       ]
+    )
+
+    Tightbeam.Supervision.activity_in_txn(
+      txn,
+      ask.assignment_id,
+      session_key,
+      raised_at
     )
 
     request = request_in_txn(txn, request_id)

@@ -305,20 +305,6 @@ defmodule Tightbeam.NoticeSubmission do
         NoticeAuthority.resolve!(txn, successor_id)
         :ok = Assignments.assert_retry_decision_in_txn!(txn, successor_id)
         :ok = Tightbeam.Productions.Bubble.assert_retry_disposer_in_txn!(txn, successor_id)
-        # Bind only after the existing deterministic root lineage is present,
-        # inside the same lease-fenced terminal transaction. A prod reuses its
-        # charged generation; an escalation delegates its original transfer
-        # through the same proved lineage. Stale authority refuses the entire
-        # transaction rather than partially restoring siblings.
-        :ok =
-          Supervision.rebind_not_dispatched_source_in_txn(
-            txn,
-            source_id,
-            successor_id,
-            turn,
-            evidence
-          )
-
         Wakes.publish_change_in_txn(txn, "wake.scheduled", successor_id)
         Wakes.schedule_changed_in_txn(txn, {:schedule_changed, due_at})
 

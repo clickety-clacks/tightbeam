@@ -179,7 +179,7 @@ defmodule Tightbeam.RowWaitReliefFixture do
     assert %{attest: _} =
              attest(ctx.db, "V", "verifier", "verdict", "wait-challenged", first.wake_id)
 
-    assert covered?(ctx.db, "A")
+    assert effort_relief_active?(ctx.db, "A")
 
     assert {:ok, [[^interval_start, 0]]} =
              DB.query(
@@ -190,7 +190,7 @@ defmodule Tightbeam.RowWaitReliefFixture do
     assert %{attest: _} =
              attest(ctx.db, "V", "verifier", "verdict", "wait-challenged", second.wake_id)
 
-    refute covered?(ctx.db, "A")
+    refute effort_relief_active?(ctx.db, "A")
 
     assert {:ok, [[nil, excluded]]} =
              DB.query(
@@ -206,15 +206,11 @@ defmodule Tightbeam.RowWaitReliefFixture do
                generation.base_horizon_ms * generation.multiplier + excluded
 
     assert :ok = Wakes.fire_due(ctx.scheduler)
-    refute covered?(ctx.db, "A")
+    refute effort_relief_active?(ctx.db, "A")
   end
 
   defp qualification_policy(ctx, other \\ true) do
     File.write!(Path.join(ctx.base, "identity/rules/qualification.toml"), """
-    [[policy]]
-    name = "fixture-coverage"
-    purpose = "wait-prod-coverage"
-    when = [{fact="wait.coverage_valid",op="eq",value=true}]
     [[policy]]
     name = "fixture-relief"
     purpose = "wait-effort-relief"
@@ -224,9 +220,9 @@ defmodule Tightbeam.RowWaitReliefFixture do
     Rules.load!(ctx.base, ~w(wake attest))
   end
 
-  defp covered?(db, id) do
-    assert {:ok, covered} = DB.transaction(db, &Wakes.covering_continuation_in_txn?(&1, id))
-    covered
+  defp effort_relief_active?(db, id) do
+    assert {:ok, active} = DB.transaction(db, &Wakes.effort_relief_in_txn?(&1, id))
+    active
   end
 
   defp effort_snapshot(db) do

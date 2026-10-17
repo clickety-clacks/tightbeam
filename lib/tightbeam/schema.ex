@@ -1361,7 +1361,9 @@ defmodule Tightbeam.Schema do
   never to deduce a shape and accommodate it. Each migration is selected by an
   exact predecessor stamp; none sniffs stored DDL or infers from a column name.
   """
-  # Keep historical DDL immutable. Only O2 activation uses these two additions.
+  # Historical O2 databases may contain typed cancellation rows from the
+  # retired review-notice reconciler. Preserve those rows during migration;
+  # active code no longer creates or validates new review-remedy cancellations.
   @o2_liveness_objects Enum.map(@supervision_liveness_objects, fn
                          %{name: "wake_cancellations", sql: sql} = object ->
                            outcome = """
@@ -1759,7 +1761,6 @@ defmodule Tightbeam.Schema do
     # Build these additive access paths only after the existing migrations and
     # qualifications succeed, but before publishing a successful boot marker.
     :ok = ensure_lifecycle_runtime_indexes(db)
-    :ok = ensure_idle_cleanup_runtime_indexes(db)
     :ok = ensure_rest_collection_indexes(db)
     :ok = ensure_decision_request_collection_indexes(db)
 
@@ -1773,7 +1774,6 @@ defmodule Tightbeam.Schema do
     :ok = migrate_wake_delivery(db)
     :ok = migrate_continuation_retry_guard(db)
     :ok = upgrade_decision_request_row_schema_revision(db)
-    :ok = migrate_supervision_recorded_state(db)
     :ok = ensure_hot_query_indexes(db)
     :ok = migrate_retired_workspace_cleanup(db)
     :ok = Tightbeam.Ephemeral.migrate(db)
@@ -1961,80 +1961,6 @@ defmodule Tightbeam.Schema do
         Logger.error("retired workspace cleanup migration deferred: #{inspect(error)}")
         :ok
     end
-  end
-
-  # This additive marker is independent of the predecessor shape migrations.
-  # Historical cleanup state is copied in the same transaction as the marker.
-  defp migrate_supervision_recorded_state(db) do
-    {:ok, :ok} =
-      DB.transaction(db, fn txn ->
-        Txn.exec(txn, """
-        CREATE TABLE IF NOT EXISTS supervision_state_migration (
-          id INTEGER PRIMARY KEY CHECK(id=0)
-        )
-        """)
-
-        if Txn.q(txn, "SELECT 1 FROM supervision_state_migration WHERE id=0") == [] do
-          :ok =
-            Txn.exec(txn, """
-            CREATE TABLE idle_cleanup_state (
-              sessionKey TEXT NOT NULL, groupDigest TEXT NOT NULL, memberToken TEXT NOT NULL,
-              deliveredCount INTEGER NOT NULL, lastDeliveredAt INTEGER NOT NULL,
-              deliveredDepth INTEGER NOT NULL, deliveredMain INTEGER NOT NULL,
-              PRIMARY KEY(groupDigest,memberToken)
-            );
-            ALTER TABLE sessions ADD COLUMN idleCleanupObservedWake TEXT;
-            ALTER TABLE sessions ADD COLUMN idleCleanupPreviousWake TEXT;
-            ALTER TABLE wakes ADD COLUMN idleCleanupObserved INTEGER NOT NULL DEFAULT 0;
-            ALTER TABLE wakes ADD COLUMN idleCleanupGroup TEXT;
-            ALTER TABLE wakes ADD COLUMN idleCleanupRecorded INTEGER NOT NULL DEFAULT 0;
-            CREATE INDEX idle_cleanup_pending_group ON wakes(idleCleanupGroup)
-              WHERE state='pending' AND consumer='prompt';
-            CREATE TABLE supervision_ended_controllers (
-              wakeId TEXT PRIMARY KEY REFERENCES supervision_liveness_sidecar(wakeId) ON DELETE CASCADE,
-              assignmentId TEXT NOT NULL,
-              endedWakeState TEXT NOT NULL CHECK(endedWakeState IN ('fired','canceled'))
-            );
-            CREATE INDEX supervision_liveness_ended_controller
-              ON supervision_ended_controllers(assignmentId,wakeId);
-            INSERT INTO supervision_ended_controllers(wakeId,assignmentId,endedWakeState)
-            SELECT s.wakeId,s.assignmentId,w.state FROM supervision_liveness_sidecar s
-            JOIN wakes w ON w.wakeId=s.wakeId
-            WHERE s.controllerOrigin='scheduled' AND s.controllerState='pending'
-              AND w.state IN ('fired','canceled');
-            CREATE TRIGGER supervision_record_controller_end AFTER UPDATE OF state ON wakes
-            WHEN NEW.state IN ('fired','canceled') AND OLD.state<>NEW.state
-            BEGIN
-              INSERT OR REPLACE INTO supervision_ended_controllers(wakeId,assignmentId,endedWakeState)
-              SELECT wakeId,assignmentId,NEW.state FROM supervision_liveness_sidecar
-              WHERE wakeId=NEW.wakeId AND controllerOrigin='scheduled' AND controllerState = 'pending';
-            END;
-            CREATE TRIGGER supervision_forget_settled_controller AFTER UPDATE OF controllerState ON supervision_liveness_sidecar
-            WHEN NEW.controllerState='settled'
-            BEGIN
-              DELETE FROM supervision_ended_controllers WHERE wakeId=NEW.wakeId;
-            END;
-            ALTER TABLE patrol_failure_boundary ADD COLUMN lastTurnSeq INTEGER NOT NULL DEFAULT 0;
-            CREATE TRIGGER patrol_terminal_checkpoint_rewind AFTER UPDATE OF endedAt ON turns
-            WHEN NEW.endedAt IS NOT NULL AND OLD.endedAt IS NULL
-            BEGIN
-              UPDATE patrol_failure_boundary SET lastTurnSeq=MIN(lastTurnSeq,NEW.seq-1) WHERE id=0;
-            END;
-            CREATE TRIGGER patrol_terminal_checkpoint_insert AFTER INSERT ON turns
-            WHEN NEW.endedAt IS NOT NULL
-            BEGIN
-              UPDATE patrol_failure_boundary SET lastTurnSeq=MIN(lastTurnSeq,NEW.seq-1) WHERE id=0;
-            END;
-            """)
-
-          :ok = Tightbeam.Supervision.copy_idle_cleanup_history_in_txn(txn)
-          :ok = Txn.exec(txn, "INSERT INTO supervision_state_migration(id) VALUES(0)")
-        end
-
-        :ok
-      end)
-
-    :ok
   end
 
   @source_client_column """
@@ -2649,20 +2575,8 @@ defmodule Tightbeam.Schema do
        """
        CREATE INDEX IF NOT EXISTS lifecycle_events_subject_kind
        ON lifecycle_events(subject, kind)
-       """},
-      {"lifecycle_events_idle_cleanup_kind_id",
-       """
-       CREATE INDEX IF NOT EXISTS lifecycle_events_idle_cleanup_kind_id
-       ON lifecycle_events(kind, id)
-       WHERE kind='idle_cleanup_pending_observed'
        """}
     ]
-
-    # The idle-cleanup occurrence read filters JSON after selecting its kind.
-    # Keep that evaluation in the read: an expression index would impose a new
-    # JSON-validity constraint on this otherwise free-form lifecycle relation.
-    # This small partial index excludes unrelated history and preserves latest
-    # id ordering without indexing every event a second time.
     case DB.migration_transaction(db, :lifecycle_runtime_indexes, [], [], fn txn ->
            Enum.each(indexes, fn {name, sql} ->
              started = System.monotonic_time(:millisecond)
@@ -2683,60 +2597,6 @@ defmodule Tightbeam.Schema do
       {:error, error} ->
         raise ShapeError,
           message: "lifecycle runtime index migration failed: #{Exception.message(error)}"
-    end
-  end
-
-  # Idle cleanup examines per-session activity inside each sweep transaction.
-  # These paths make each activity source a keyed lookup instead of a table scan;
-  # the assignment work-item path also bounds the cleanup custody check.
-  defp ensure_idle_cleanup_runtime_indexes(db) do
-    indexes = [
-      {"supervision_entitlements_due",
-       "CREATE INDEX IF NOT EXISTS supervision_entitlements_due " <>
-         "ON supervision_entitlements(state, dueAt, assignmentId)"},
-      {"idle_cleanup_assignments_activity",
-       "CREATE INDEX IF NOT EXISTS idle_cleanup_assignments_activity " <>
-         "ON assignments(holderKey, state, openedAt DESC, id DESC)"},
-      {"idle_cleanup_assignments_closed_activity",
-       "CREATE INDEX IF NOT EXISTS idle_cleanup_assignments_closed_activity " <>
-         "ON assignments(holderKey, state, closedAt DESC, id DESC)"},
-      {"idle_cleanup_assignments_work_item",
-       "CREATE INDEX IF NOT EXISTS idle_cleanup_assignments_work_item " <>
-         "ON assignments(workItemId, state, holderKey)"},
-      {"idle_cleanup_attests_activity",
-       "CREATE INDEX IF NOT EXISTS idle_cleanup_attests_activity " <>
-         "ON attests(bySession, ts DESC, id DESC)"},
-      {"idle_cleanup_wakes_created_activity",
-       "CREATE INDEX IF NOT EXISTS idle_cleanup_wakes_created_activity " <>
-         "ON wakes(creatorSessionKey, createdAt DESC, wakeId DESC)"},
-      {"idle_cleanup_wakes_fired_activity",
-       "CREATE INDEX IF NOT EXISTS idle_cleanup_wakes_fired_activity " <>
-         "ON wakes(sessionKey, firedAt DESC, wakeId DESC) WHERE firedAt IS NOT NULL"},
-      {"idle_cleanup_wakes_pending_session",
-       "CREATE INDEX IF NOT EXISTS idle_cleanup_wakes_pending_session " <>
-         "ON wakes(sessionKey, wakeId) WHERE state='pending' AND consumer='prompt'"}
-    ]
-
-    case DB.migration_transaction(db, :idle_cleanup_runtime_indexes, [], [], fn txn ->
-           Enum.each(indexes, fn {name, sql} ->
-             started = System.monotonic_time(:millisecond)
-             Logger.info("database migration idle-cleanup index #{name}: begin")
-             :ok = Txn.exec(txn, sql)
-             elapsed = System.monotonic_time(:millisecond) - started
-
-             Logger.info(
-               "database migration idle-cleanup index #{name}: finished elapsed_ms=#{elapsed}"
-             )
-           end)
-
-           :ok
-         end) do
-      {:ok, :ok} ->
-        :ok
-
-      {:error, error} ->
-        raise ShapeError,
-          message: "idle-cleanup runtime index migration failed: #{Exception.message(error)}"
     end
   end
 
@@ -5057,8 +4917,6 @@ defmodule Tightbeam.Schema do
                      PRIMARY KEY (statute, subject)
                    )
                    """)
-
-                 Txn.q(txn, "ALTER TABLE rail_remedy_episodes ADD COLUMN noticeState TEXT NULL")
 
                  if predecessor == @shape do
                    for name <-

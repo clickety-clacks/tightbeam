@@ -726,24 +726,6 @@ defmodule Tightbeam.ArchetypesTest do
     end
   end
 
-  test "idle cleanup is an optional boolean with a true default" do
-    assert Archetypes.builtin_default().idle_cleanup == true
-
-    for {body, expected} <- [
-          {"name = \"quiet\"\n", true},
-          {"name = \"quiet\"\nidle_cleanup = true\n", true},
-          {"name = \"quiet\"\nidle_cleanup = false\n", false}
-        ] do
-      assert Archetypes.parse_manifest!(body, "quiet.toml").idle_cleanup == expected
-    end
-
-    for value <- ["\"false\"", "0", "[]"] do
-      assert_raise ArgumentError, ~r/archetype idle_cleanup must be a boolean/, fn ->
-        Archetypes.parse_manifest!("name = \"quiet\"\nidle_cleanup = #{value}\n", "quiet.toml")
-      end
-    end
-  end
-
   test "owner child prod marker is a default-off optional boolean" do
     assert Archetypes.builtin_default().owner_open_child_prod == false
 
@@ -779,7 +761,6 @@ defmodule Tightbeam.ArchetypesTest do
       archetype = Archetypes.parse_manifest!(File.read!(path), path)
 
       assert archetype.owner_open_child_prod == true
-      if name in ["product-owner", "pdo"], do: assert(archetype.idle_cleanup == false)
     end
   end
 

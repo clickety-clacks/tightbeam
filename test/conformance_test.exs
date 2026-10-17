@@ -32,7 +32,6 @@ defmodule Tightbeam.ConformanceSupport do
     Rails,
     Roles,
     Rules,
-    Supervision,
     Wakes,
     WorkItems
   }
@@ -44,7 +43,7 @@ defmodule Tightbeam.ConformanceSupport do
                ~w(case kind expect reason emits input script_return world call phase2 phase)
              )
   @expects MapSet.new(
-             ~w(deny pass refuse run-remedy re-obligate escalate-park none escalate-halt escalate-open escalate-continue load-unavailable load-clean)
+             ~w(deny pass refuse run-remedy re-obligate none escalate-halt escalate-open escalate-continue load-unavailable load-clean)
            )
   @case_expects %{
     "harness-gate" => ~w(deny pass),
@@ -52,8 +51,6 @@ defmodule Tightbeam.ConformanceSupport do
     "script-guard" => ~w(deny pass),
     "handler-refusal" => ~w(refuse pass),
     "remedy" => ~w(run-remedy none escalate-halt escalate-open escalate-continue),
-    "sweep" => ~w(run-remedy re-obligate escalate-park none escalate-continue),
-    "capstone" => ~w(deny pass run-remedy re-obligate none)
   }
   @load_twins [
     ~w(remedy-target-missing remedy-target-present),
@@ -99,26 +96,7 @@ defmodule Tightbeam.ConformanceSupport do
       ~w(owner-main-fallback-refuses-loudly unknown-role-refuses-loudly bound-reviewer-dispatches unbound-is-legible),
     {"C6", "note-digest-exclusion"} =>
       ~w(note-change-dedupes-same-action idempotency-key-change-dedupes material-change-gets-distinct-digest digest-dedupe-legible),
-    {"C7", "scheduled-wake-suppression"} =>
-      ~w(rail-enforcement-precedes-self-pending-wake rail-enforcement-precedes-process-pending-wake allow-falls-through-to-pending-wake-gate schedule-order-legible),
-    {"C7", "watermark-nil-duplicate"} =>
-      ~w(nil-fallthrough-no-null-write fresh-larger-terminal-acts duplicate-does-not-react),
-    {"C7", "retired-holder-no-remedy"} =>
-      ~w(retired-with-pending-wake-is-stranded live-holder-runs-rail-step stranded-legible),
-    {"C7", "escalation-return-sweep"} =>
-      ~w(resolve-deny-reobligates resolve-allow-continues-without-consuming needs-request-nil-opens-and-parks needs-request-id-rereturns-and-reuses-wake no-applicable-escalate-records-none park-legible),
-    {"C7", "sweep-never-consumes"} =>
-      ~w(sweep-allow-leaves-ruling-ruled verb-edge-consumes-exactly-once no-consume-legible),
-    {"Cap", "capstone-reviewer-loop"} =>
-      ~w(missing-review-dispatch-remedy changes-requested-iterates-author commissioned-clean-review-releases idle-pre-review-sweep-runs-remedy unbound-reviewer-refuses-loudly loop-legible-no-teardown-claim),
-    {"Cap", "capstone-tests-before-success"} =>
-      ~w(behind-main-script-denies reconciled-missing-tests-denies produced-tests-release idle-sweep-reobligates tests-loop-legible),
-    {"Cap", "capstone-real-run-before-ship"} =>
-      ~w(missing-real-run-denies produced-real-run-releases idle-sweep-reobligates real-run-loop-legible),
-    {"Cap", "capstone-yagni-judge"} =>
-      ~w(missing-yagni-judge-fires-remedy wrong-work-item-verdict-stays-denied commissioned-yagni-clean-passes yagni-loop-legible),
-    {"Cap", "capstone-spec-review"} =>
-      ~w(missing-spec-review-fires-remedy wrong-work-item-verdict-stays-denied commissioned-spec-reviewed-passes spec-review-loop-legible)
+
   }
 
   def corpus_root do
@@ -172,7 +150,7 @@ defmodule Tightbeam.ConformanceSupport do
     assert fixture["phase"] in ~w(green pending pending-unhomed pending-runtime pending-escalation-review),
            "#{path}: invalid phase"
 
-    if fixture["kind"] in ~w(dispatch-rule script-guard remedy sweep capstone) do
+    if fixture["kind"] in ~w(dispatch-rule script-guard remedy) do
       assert is_list(fixture["rule"]) and fixture["rule"] != [],
              "#{path}: #{fixture["kind"]} fixture needs fixture.rule"
     end
@@ -201,12 +179,6 @@ defmodule Tightbeam.ConformanceSupport do
     do: Enum.filter(runners, &(&1 == "handler_refusal"))
 
   defp applicable_runners("remedy", runners),
-    do: Enum.filter(runners, &(&1 in ~w(rules_decide acting_layer)))
-
-  defp applicable_runners("sweep", runners),
-    do: Enum.filter(runners, &(&1 in ~w(rules_decide acting_layer)))
-
-  defp applicable_runners("capstone", runners),
     do: Enum.filter(runners, &(&1 in ~w(rules_decide acting_layer)))
 
   defp applicable_runners("script-guard", runners),
@@ -349,7 +321,7 @@ defmodule Tightbeam.ConformanceSupport do
   defp validate_behavior_world!(kind, world, call, path) do
     assert world != %{}, "#{path}: non-harness case needs an observable world"
 
-    if kind in ~w(remedy sweep capstone) do
+    if kind in ~w(remedy) do
       for key <- ~w(users sessions assignments) do
         assert Map.get(world, key, []) != [], "#{path}: #{kind} case needs world.#{key}"
       end
@@ -358,9 +330,6 @@ defmodule Tightbeam.ConformanceSupport do
              "#{path}: #{kind} case needs call.params.assignment_id"
     end
 
-    if kind in ~w(sweep capstone) do
-      assert Map.has_key?(world, "turn"), "#{path}: #{kind} case needs world.turn"
-    end
   end
 
   defp validate_world_row!("sessions", row, path) do
@@ -532,55 +501,7 @@ defmodule Tightbeam.ConformanceSupport do
       {"C6", _, "remedy-episode-idempotent"} ->
         run_remedy_episode_contract(fixture)
 
-      {"C7", _, name}
-      when name in ~w(idle-open-obligation busy-or-queued-no-sweep satisfied-obligation-no-sweep) ->
-        run_rules_decide(fixture)
-        run_acting_layer(fixture)
 
-      {"C7", _, "turn-end-script-gate"} ->
-        run_rules_decide(fixture)
-        run_acting_layer(fixture)
-
-      {"C7", _, name}
-      when name in ~w(retired-holder-no-remedy watermark-nil-duplicate) ->
-        run_supervision_state_contract(
-          find.("C7", "retired-holder-no-remedy"),
-          find.("C7", "watermark-nil-duplicate"),
-          find.("C7", "escalation-return-sweep")
-        )
-
-      {"C7", _, "escalation-return-sweep"} ->
-        run_escalation_return_sweep_contract(fixture)
-
-      {"C7", _, "parkwakeid-reuse"} ->
-        run_park_wake_reuse_contract(fixture)
-
-      {"C7", _, "schedule-then-check"} ->
-        run_schedule_then_check_contract(fixture)
-
-      {"C7", _, "reobligate-pure-deny"} ->
-        run_rules_decide(fixture)
-        run_acting_layer(fixture)
-
-      {"C7", _, "scheduled-wake-suppression"} ->
-        run_scheduled_wake_contract(fixture)
-
-      {"C7", _, "sweep-never-consumes"} ->
-        run_sweep_ruling_contract(fixture)
-
-      # Aggregates all five capstone fixtures, so every one of them IS executed —
-      # but it names them, so a SIXTH capstone fixture fails to match loudly
-      # instead of silently inheriting a contract that never covers it.
-      {"Cap", _, name}
-      when name in ~w(capstone-reviewer-loop capstone-yagni-judge capstone-spec-review
-                      capstone-tests-before-success capstone-real-run-before-ship) ->
-        run_capstone_contracts(
-          find.("Cap", "capstone-reviewer-loop"),
-          find.("Cap", "capstone-yagni-judge"),
-          find.("Cap", "capstone-spec-review"),
-          find.("Cap", "capstone-tests-before-success"),
-          find.("Cap", "capstone-real-run-before-ship")
-        )
     end
   end
 
@@ -995,25 +916,21 @@ defmodule Tightbeam.ConformanceSupport do
           ids = materialize_world(db, Map.get(kase, "world", %{}))
           seed_script_checkout!(base, fixture, kase, db)
           call = build_call(kase["call"], ids)
-          {decision, _to_close, _to_consume} = Rules.decide(db, sweep_call(fixture, call))
+          {decision, _to_close, _to_consume} = Rules.decide(db, call)
 
-          case {kase["expect"], self_wake?(db, call), suppressed_before_decision?(fixture, kase)} do
-            {"run-remedy", _, _} ->
+          case {kase["expect"], self_wake?(db, call)} do
+            {"run-remedy", _} ->
               assert {:remedy, %{name: name}, _, _} = decision
               assert name == kase["reason"]
 
-            {"re-obligate", _, _} ->
+            {"re-obligate", _} ->
               assert {:deny, %{rule: name}} = decision
               assert name == (kase["reason"] || fixture_rule_name(fixture))
 
-            {"none", true, _} ->
+            {"none", true} ->
               assert match?({:remedy, _, _, _}, decision)
 
-            {"none", false, true} ->
-              assert {:deny, %{rule: name, reason: "rule_denied"}} = decision
-              assert name == (kase["reason"] || fixture_rule_name(fixture))
-
-            {"none", false, false} ->
+            {"none", false} ->
               assert decision == :allow
           end
         after
@@ -1027,8 +944,6 @@ defmodule Tightbeam.ConformanceSupport do
   end
 
   def run_acting_layer(%{"class" => "C6"} = fixture), do: run_dispatch_actor(fixture)
-  def run_acting_layer(%{"class" => "C7"} = fixture), do: run_supervision_actor(fixture)
-  def run_acting_layer(%{"class" => "Cap"} = fixture), do: run_capstone_actor(fixture)
 
   def run_remedy_episode_contract(%{"name" => "remedy-episode-idempotent"} = fixture) do
     base = temp_dir!("conformance-remedy-episode-matrix")
@@ -1468,902 +1383,6 @@ defmodule Tightbeam.ConformanceSupport do
     end
   end
 
-  def run_supervision_state_contract(retired_fixture, watermark_fixture, escalation_fixture) do
-    run_retired_holder_contract(retired_fixture)
-    run_watermark_contract(watermark_fixture)
-    run_sweep_escalation_contract(escalation_fixture)
-  end
-
-  def run_escalation_return_sweep_contract(fixture) do
-    base = temp_dir!("conformance-escalation-sweep-matrix")
-    prepare_rule_base!(base, fixture)
-    Rules.load!(base, Map.keys(Gateway.handlers(%{})))
-    service_pids = start_wake_delivery_services()
-
-    try do
-      Enum.each(fixture["cases"], fn kase ->
-        {db, pid} = memory_db!()
-        scheduler = :"conformance_escalation_scheduler_#{System.unique_integer([:positive])}"
-
-        {:ok, scheduler_pid} =
-          Wakes.start_link(
-            db: db,
-            name: scheduler,
-            tick_ms: 60_000,
-            deliver: fn _wake -> :ok end
-          )
-
-        try do
-          ids = materialize_world(db, kase["world"])
-          call = build_call(kase["call"], ids)
-          turn_call = sweep_call(fixture, call)
-          handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
-          session_key = elem(call.principal, 1)
-          statute = fixture_rule_name(fixture)
-
-          open_and_park = fn ->
-            assert {:acted, :rail_escalate} =
-                     Supervision.evaluate(
-                       db,
-                       handlers,
-                       3,
-                       session_key,
-                       ids.turns[session_key]
-                     )
-
-            assert {:ok, [[request_id, "open", park_wake_id]]} =
-                     DB.query(db, "SELECT id, status, parkWakeId FROM decision_requests")
-
-            assert %{state: "pending", condition_scope: ^request_id} =
-                     Wakes.get(db, park_wake_id)
-
-            {request_id, park_wake_id}
-          end
-
-          case kase["case"] do
-            "no-applicable-escalate-records-none" ->
-              assert {:allow, [], []} = Rules.decide(db, turn_call)
-
-              assert :rebased =
-                       Supervision.evaluate(
-                         db,
-                         handlers,
-                         3,
-                         session_key,
-                         ids.turns[session_key]
-                       )
-
-              assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM decision_requests")
-              assert sweep_decision?(db, session_key, nil, "none")
-
-            "needs-request-nil-opens-and-parks" ->
-              assert {{:escalate, %{name: ^statute}, _, nil}, [], []} =
-                       Rules.decide(db, turn_call)
-
-              {request_id, park_wake_id} = open_and_park.()
-              assert is_binary(request_id)
-              assert is_binary(park_wake_id)
-
-            "needs-request-id-rereturns-and-reuses-wake" ->
-              {request_id, park_wake_id} = open_and_park.()
-              assert kase["phase2"]["expect"] == "escalate-park"
-
-              assert {{:escalate, %{name: ^statute}, _, ^request_id}, [], []} =
-                       Rules.decide(db, turn_call)
-
-              phase2_ids = materialize_world(db, kase["phase2"]["world"], ids)
-
-              assert {:acted, :rail_escalate} =
-                       Supervision.evaluate(
-                         db,
-                         handlers,
-                         3,
-                         session_key,
-                         phase2_ids.turns[session_key]
-                       )
-
-              assert {:ok, [[^request_id, ^park_wake_id]]} =
-                       DB.query(db, "SELECT id, parkWakeId FROM decision_requests")
-
-              assert_one_park_and_one_notification!(db)
-
-            "resolve-deny-reobligates" ->
-              {request_id, park_wake_id} = open_and_park.()
-              assert kase["phase2"]["call"]["params"]["decision"] == "deny"
-
-              assert %{status: "ruled"} =
-                       Escalation.rule(
-                         db,
-                         escalation_rule_call(request_id, "deny"),
-                         authorized: true,
-                         scheduler: scheduler
-                       )
-
-              deliver_condition_source!(db, park_wake_id)
-
-              assert {{:deny, %{code: "escalation_denied", rule: ^statute}}, [], []} =
-                       Rules.decide(db, turn_call)
-
-              assert {:ok, %{seq: wake_seq, owner_lease: wake_seq_lease}} =
-                       Ledger.claim_next(db, session_key, "conformance-ruling-wake")
-
-              assert :ok =
-                       Ledger.finish(db, wake_seq, "delivered", nil, owner_lease: wake_seq_lease)
-
-              assert {:prodded, 1} =
-                       Supervision.evaluate(
-                         db,
-                         handlers,
-                         3,
-                         session_key,
-                         wake_seq
-                       )
-
-              assert sweep_decision?(db, session_key, statute, "re-obligate")
-              assert Supervision.prod_state(db, call.params.assignment_id).prodCount == 1
-
-            "resolve-allow-continues-without-consuming" ->
-              {request_id, park_wake_id} = open_and_park.()
-              assert kase["phase2"]["call"]["params"]["decision"] == "allow"
-
-              assert %{status: "ruled"} =
-                       Escalation.rule(
-                         db,
-                         escalation_rule_call(request_id, "allow"),
-                         authorized: true,
-                         scheduler: scheduler
-                       )
-
-              deliver_condition_source!(db, park_wake_id)
-
-              assert {{:deny, %{rule: "later-sweep-statute"}}, [], [^request_id]} =
-                       Rules.decide(db, turn_call)
-
-              assert {:ok, %{seq: wake_seq, owner_lease: wake_seq_lease}} =
-                       Ledger.claim_next(db, session_key, "conformance-ruling-wake")
-
-              assert :ok =
-                       Ledger.finish(db, wake_seq, "delivered", nil, owner_lease: wake_seq_lease)
-
-              assert {:prodded, 1} =
-                       Supervision.evaluate(
-                         db,
-                         handlers,
-                         3,
-                         session_key,
-                         wake_seq
-                       )
-
-              assert {:ok, [["ruled"]]} =
-                       DB.query(db, "SELECT status FROM decision_requests WHERE id=?1", [
-                         request_id
-                       ])
-
-              assert sweep_decision?(
-                       db,
-                       session_key,
-                       "later-sweep-statute",
-                       "re-obligate"
-                     )
-
-            "park-legible" ->
-              {_request_id, _park_wake_id} = open_and_park.()
-              assert_declared_records!(kase["emits"], latest_denied_payload(db), db)
-          end
-        after
-          GenServer.stop(scheduler_pid)
-          GenServer.stop(pid)
-        end
-      end)
-    after
-      Enum.each(service_pids, &GenServer.stop/1)
-      File.rm_rf!(base)
-      :persistent_term.erase(Rules)
-    end
-  end
-
-  # The park wake must not duplicate across re-returns, and the request's owner
-  # notification is exactly one durable ungated wake armed by the winning insert
-  # (escalation-delivery-v1): a replay arms none, so both counts stay at one.
-  defp assert_one_park_and_one_notification!(db) do
-    assert {:ok, [[1]]} =
-             DB.query(db, "SELECT COUNT(*) FROM wakes WHERE conditionKind IS NOT NULL")
-
-    assert {:ok, [[1]]} =
-             DB.query(
-               db,
-               "SELECT COUNT(*) FROM wakes WHERE consumer = 'prompt' AND conditionKind IS NULL AND targetGate = 0"
-             )
-
-    assert {:ok, [[2]]} =
-             DB.query(db, "SELECT COUNT(*) FROM wakes WHERE consumer <> 'effort_probe'")
-  end
-
-  def run_park_wake_reuse_contract(fixture) do
-    base = temp_dir!("conformance-park-wake-reuse")
-    prepare_rule_base!(base, fixture)
-    Rules.load!(base, Map.keys(Gateway.handlers(%{})))
-
-    try do
-      Enum.each(fixture["cases"], fn kase ->
-        {db, pid} = memory_db!()
-
-        try do
-          ids = materialize_world(db, kase["world"])
-          call = build_call(kase["call"], ids)
-          handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
-          session_key = elem(call.principal, 1)
-
-          assert {:acted, :rail_escalate} =
-                   Supervision.evaluate(db, handlers, 3, session_key, ids.turns[session_key])
-
-          assert {:ok, [[request_id, first_wake_id]]} =
-                   DB.query(db, "SELECT id, parkWakeId FROM decision_requests")
-
-          assert %{state: "pending", condition_scope: ^request_id} =
-                   Wakes.get(db, first_wake_id)
-
-          assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM decision_requests")
-          assert_one_park_and_one_notification!(db)
-
-          if kase["phase2"] do
-            phase2_ids = materialize_world(db, kase["phase2"]["world"], ids)
-
-            assert {:acted, :rail_escalate} =
-                     Supervision.evaluate(
-                       db,
-                       handlers,
-                       3,
-                       session_key,
-                       phase2_ids.turns[session_key]
-                     )
-
-            assert {:ok, [[^request_id, ^first_wake_id]]} =
-                     DB.query(db, "SELECT id, parkWakeId FROM decision_requests")
-
-            assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM decision_requests")
-            assert_one_park_and_one_notification!(db)
-          end
-
-          if kase["kind"] == "legibility" do
-            assert_declared_records!(kase["emits"], latest_denied_payload(db), db)
-          end
-        after
-          GenServer.stop(pid)
-        end
-      end)
-    after
-      File.rm_rf!(base)
-      :persistent_term.erase(Rules)
-    end
-  end
-
-  def run_scheduled_wake_contract(fixture) do
-    assert Supervision.turn_end_schedule() == [
-             :rail_enforcement,
-             :prod_ladder
-           ]
-
-    base = temp_dir!("conformance-r21-pending-wake")
-    prepare_rule_base!(base, fixture)
-    Rules.load!(base, Map.keys(Gateway.handlers(%{})))
-
-    try do
-      Enum.each(fixture["cases"], fn kase ->
-        {db, pid} = memory_db!()
-
-        try do
-          ids = materialize_world(db, kase["world"])
-          call = build_call(kase["call"], ids)
-          turn_call = sweep_call(fixture, call)
-          handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
-          session_key = elem(call.principal, 1)
-          assignment_id = call.params.assignment_id
-          statute = fixture_rule_name(fixture)
-
-          case kase["case"] do
-            "rail-enforcement-precedes-self-pending-wake" ->
-              assert {{:remedy, %{name: ^statute}, ^assignment_id, _}, [], []} =
-                       Rules.decide(db, turn_call)
-
-              # The self wake still suppresses the rail remedy, but it does not
-              # suppress the independent prod ladder unless it is an exact
-              # assignment checkpoint.
-              assert {:prodded, 1} =
-                       Supervision.evaluate(
-                         db,
-                         handlers,
-                         3,
-                         session_key,
-                         ids.turns[session_key]
-                       )
-
-              assert RailRemedy.episode(db, statute, assignment_id) == nil
-              assert review_effect_count(db, assignment_id) == 0
-
-            "rail-enforcement-precedes-process-pending-wake" ->
-              assert {{:remedy, %{name: ^statute}, ^assignment_id, _}, [], []} =
-                       Rules.decide(db, turn_call)
-
-              assert {:acted, :rail_remedy} =
-                       Supervision.evaluate(
-                         db,
-                         handlers,
-                         3,
-                         session_key,
-                         ids.turns[session_key]
-                       )
-
-              assert %{status: "live"} = RailRemedy.episode(db, statute, assignment_id)
-              assert review_effect_count(db, assignment_id) == 1
-              assert sweep_decision?(db, session_key, statute, "run-remedy")
-
-            "allow-falls-through-to-pending-wake-gate" ->
-              assert {:allow, [], []} = Rules.decide(db, turn_call)
-
-              assert :rebased =
-                       Supervision.evaluate(
-                         db,
-                         handlers,
-                         3,
-                         session_key,
-                         ids.turns[session_key]
-                       )
-
-              assert RailRemedy.episode(db, statute, assignment_id) == nil
-              assert review_effect_count(db, assignment_id) == 0
-              assert %{supervisionState: "armed"} = Supervision.prod_state(db, assignment_id)
-
-            "schedule-order-legible" ->
-              assert {:acted, :rail_remedy} =
-                       Supervision.evaluate(
-                         db,
-                         handlers,
-                         3,
-                         session_key,
-                         ids.turns[session_key]
-                       )
-
-              assert_declared_records!(kase["emits"], latest_denied_payload(db), db)
-          end
-        after
-          GenServer.stop(pid)
-        end
-      end)
-    after
-      File.rm_rf!(base)
-      :persistent_term.erase(Rules)
-    end
-  end
-
-  def run_schedule_then_check_contract(fixture) do
-    base = temp_dir!("conformance-schedule-then-check")
-    prepare_rule_base!(base, fixture)
-    Rules.load!(base, Map.keys(Gateway.handlers(%{})))
-    service_pids = start_wake_delivery_services()
-
-    try do
-      Enum.each(fixture["cases"], fn kase ->
-        {db, pid} = memory_db!()
-        scheduler = :"conformance_schedule_check_#{System.unique_integer([:positive])}"
-
-        {:ok, scheduler_pid} =
-          Wakes.start_link(
-            db: db,
-            name: scheduler,
-            tick_ms: 60_000,
-            deliver: fn _wake -> :ok end
-          )
-
-        try do
-          ids = materialize_world(db, kase["world"])
-          call = build_call(kase["call"], ids)
-          turn_call = sweep_call(fixture, call)
-          handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
-          session_key = elem(call.principal, 1)
-          statute_name = fixture_rule_name(fixture)
-
-          assert {{:escalate, statute, ctx, nil}, [], []} = Rules.decide(db, turn_call)
-          assert statute.name == statute_name
-
-          case kase["case"] do
-            "already-ruled-cancels-new-park" ->
-              # Public seams can prove a ruling visible before the sweep creates
-              # no park. The narrower schedule→recovered-check interleaving has
-              # no injection seam and is recorded in HANDOFF.md.
-              assert {:decision_pending, request_id} =
-                       Escalation.escalate(db, turn_call, statute, Map.put(ctx, :dr_id, nil))
-
-              assert %{status: "ruled"} =
-                       Escalation.rule(
-                         db,
-                         escalation_rule_call(request_id, "allow"),
-                         authorized: true,
-                         scheduler: scheduler
-                       )
-
-              assert {:prodded, 1} =
-                       Supervision.evaluate(
-                         db,
-                         handlers,
-                         3,
-                         session_key,
-                         ids.turns[session_key]
-                       )
-
-              assert {:ok, [[0]]} =
-                       DB.query(
-                         db,
-                         "SELECT COUNT(*) FROM wakes WHERE conditionKind='escalation-ruled'"
-                       )
-
-              assert {:ok, [["ruled", nil]]} =
-                       DB.query(
-                         db,
-                         "SELECT status, parkWakeId FROM decision_requests WHERE id=?1",
-                         [request_id]
-                       )
-
-            case_id when case_id in ~w(later-ruling-uses-ordinary-wake ordering-legible) ->
-              assert {:acted, :rail_escalate} =
-                       Supervision.evaluate(
-                         db,
-                         handlers,
-                         3,
-                         session_key,
-                         ids.turns[session_key]
-                       )
-
-              assert {:ok, [[request_id, park_wake_id]]} =
-                       DB.query(db, "SELECT id, parkWakeId FROM decision_requests")
-
-              assert %{state: "pending", condition_scope: ^request_id} =
-                       Wakes.get(db, park_wake_id)
-
-              assert %{status: "ruled"} =
-                       Escalation.rule(
-                         db,
-                         escalation_rule_call(request_id, "allow"),
-                         authorized: true,
-                         scheduler: scheduler
-                       )
-
-              # Wait for the delivery pass the condition nudge queued.
-              :sys.get_state(scheduler)
-              assert %{state: "fired", fired_by: "condition"} = Wakes.get(db, park_wake_id)
-
-              if kase["kind"] == "legibility" do
-                assert_declared_records!(kase["emits"], latest_denied_payload(db), db)
-              end
-          end
-        after
-          GenServer.stop(scheduler_pid)
-          GenServer.stop(pid)
-        end
-      end)
-    after
-      Enum.each(service_pids, &GenServer.stop/1)
-      File.rm_rf!(base)
-      :persistent_term.erase(Rules)
-    end
-  end
-
-  def run_sweep_ruling_contract(fixture) do
-    base = temp_dir!("conformance-sweep-ruling")
-    prepare_rule_base!(base, fixture)
-    Rules.load!(base, Map.keys(Gateway.handlers(%{})))
-    {db, pid} = memory_db!()
-    service_pids = start_wake_delivery_services()
-
-    try do
-      sample = Enum.find(fixture["cases"], &(&1["case"] == "sweep-allow-leaves-ruling-ruled"))
-      ids = materialize_world(db, sample["world"])
-      call = build_call(sample["call"], ids)
-      session_key = elem(call.principal, 1)
-      terminal_seq = Map.fetch!(ids.turns, session_key)
-      handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
-
-      assert {:acted, :rail_escalate} =
-               Supervision.evaluate(db, handlers, 3, session_key, terminal_seq)
-
-      assert {:ok, [[request_id, "open"]]} =
-               DB.query(db, "SELECT id, status FROM decision_requests")
-
-      assert {:ok, [[park_wake_id]]} =
-               DB.query(db, "SELECT parkWakeId FROM decision_requests WHERE id=?1", [request_id])
-
-      assert %{status: "ruled"} =
-               Escalation.rule(db, escalation_rule_call(request_id, "allow"), authorized: true)
-
-      deliver_condition_source!(db, park_wake_id)
-
-      park_wake = Wakes.get(db, park_wake_id)
-      assert %{state: "fired", fired_by: "condition"} = park_wake
-
-      assert [%{delivery_wake_id: carrier_id, member_state: "included", batch_state: "delivered"}] =
-               NoticeBatcher.source_refs(db, park_wake_id)
-
-      refute carrier_id == park_wake_id
-      assert Wakes.get(db, carrier_id).state == "fired"
-
-      assert {:ok, [[0]]} =
-               DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [park_wake_id])
-
-      assert {:ok, %{seq: continuation_seq, owner_lease: continuation_seq_lease}} =
-               Ledger.claim_next(db, session_key, "conformance-ruling-wake")
-
-      assert {:ok, [[^continuation_seq, ^carrier_id, content]]} =
-               DB.query(
-                 db,
-                 "SELECT t.seq,t.wakeId,m.content FROM turns t JOIN messages m ON m.id=t.messageId WHERE t.seq=?1",
-                 [continuation_seq]
-               )
-
-      assert content =~ park_wake.prompt
-
-      assert {:ok, [[1]]} =
-               DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [carrier_id])
-
-      assert :ok =
-               Ledger.finish(db, continuation_seq, "delivered", nil,
-                 owner_lease: continuation_seq_lease
-               )
-
-      assert {:prodded, 1} =
-               Supervision.evaluate(db, handlers, 3, session_key, continuation_seq)
-
-      assert {:ok, [["ruled"]]} =
-               DB.query(db, "SELECT status FROM decision_requests WHERE id=?1", [request_id])
-
-      assert {:ok, %{accepted: true}} =
-               Dispatch.dispatch(db, %{"attest" => fn _ -> %{accepted: true} end}, call)
-
-      assert {:ok, [["consumed"]]} =
-               DB.query(db, "SELECT status FROM decision_requests WHERE id=?1", [request_id])
-
-      assert {:decision_pending, new_request_id} =
-               Dispatch.dispatch(db, %{"attest" => fn _ -> %{accepted: true} end}, call)
-
-      refute new_request_id == request_id
-    after
-      Enum.each(service_pids, &GenServer.stop/1)
-      GenServer.stop(pid)
-      File.rm_rf!(base)
-      :persistent_term.erase(Rules)
-    end
-  end
-
-  def run_capstone_contracts(
-        reviewer_fixture,
-        yagni_fixture,
-        spec_fixture,
-        tests_fixture,
-        real_fixture
-      ) do
-    run_judge_capstone(reviewer_fixture, "reviewed-clean", true)
-    run_judge_capstone(yagni_fixture, "yagni-clean", false)
-    run_judge_capstone(spec_fixture, "spec-reviewed", false)
-    run_produced_capstone(tests_fixture, "produced-tests-release")
-    run_produced_capstone(real_fixture, "produced-real-run-releases")
-  end
-
-  defp run_judge_capstone(fixture, verdict_kind, iterate?) do
-    base = temp_dir!("conformance-capstone-judge")
-    prepare_rule_base!(base, fixture)
-    Rules.load!(base, Map.keys(Gateway.handlers(%{})))
-
-    try do
-      missing =
-        Enum.find(fixture["cases"], fn kase ->
-          String.starts_with?(kase["case"], "missing-") or
-            kase["case"] == "missing-review-dispatch-remedy"
-        end)
-
-      {db, pid} = memory_db!()
-
-      try do
-        ids = materialize_world(db, missing["world"])
-        handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
-        call = build_call(missing["call"], ids)
-        assignment_id = ids.assignments["work"]
-
-        assert {:error, %{reason: "remedy_fired", producer: review_id}} =
-                 Dispatch.dispatch(db, handlers, call)
-
-        assert is_binary(review_id)
-        assert review_effect_count(db, assignment_id) == 1
-
-        if iterate? do
-          attest_verdict!(db, review_id, "reviewer-session", "changes-requested")
-
-          assert {:error, %{reason: "remedy_fired", producer: ^review_id}} =
-                   Dispatch.dispatch(db, handlers, call)
-
-          assert Enum.any?(Wakes.list_pending(db), &(&1.session_key == "holder"))
-        end
-
-        attest_verdict!(db, review_id, "reviewer-session", verdict_kind)
-        assert {:ok, _} = Dispatch.dispatch(db, handlers, call)
-
-        assert %{status: "closed"} =
-                 RailRemedy.episode(db, fixture_rule_name(fixture), assignment_id)
-      after
-        GenServer.stop(pid)
-      end
-
-      unless iterate? do
-        wrong_item =
-          Enum.find(fixture["cases"], &String.contains?(&1["case"], "wrong-work-item"))
-
-        {db, pid} = memory_db!()
-
-        try do
-          ids = materialize_world(db, wrong_item["world"])
-          call = build_call(wrong_item["call"], ids)
-
-          assert {:error, %{reason: "remedy_fired"}} =
-                   Dispatch.dispatch(db, Gateway.handlers(%{db: db, wake_tick_ms: 1_000}), call)
-        after
-          GenServer.stop(pid)
-        end
-      end
-
-      if iterate? do
-        {db, pid} = memory_db!()
-
-        try do
-          ids = materialize_world(db, missing["world"])
-
-          assert {:acted, :rail_remedy} =
-                   Supervision.evaluate(
-                     db,
-                     Gateway.handlers(%{db: db, wake_tick_ms: 1_000}),
-                     3,
-                     "holder",
-                     ids.turns["holder"]
-                   )
-
-          assert review_effect_count(db, ids.assignments["work"]) == 1
-        after
-          GenServer.stop(pid)
-        end
-
-        {db, pid} = memory_db!()
-
-        try do
-          unbound_world =
-            missing["world"]
-            |> Map.put("roles", [])
-            |> Map.put(
-              "sessions",
-              Enum.reject(missing["world"]["sessions"], &(&1["key"] == "reviewer-session"))
-            )
-
-          ids = materialize_world(db, unbound_world)
-          call = build_call(missing["call"], ids)
-
-          assert {:error, %{reason: "remedy_fired", producer: nil}} =
-                   Dispatch.dispatch(db, Gateway.handlers(%{db: db, wake_tick_ms: 1_000}), call)
-
-          assert review_effect_count(db, ids.assignments["work"]) == 0
-
-          assert RailRemedy.episode(db, fixture_rule_name(fixture), ids.assignments["work"]) ==
-                   nil
-
-          assert lifecycle_outcome?(db, "rail_remedy", fixture_rule_name(fixture), "unbound")
-        after
-          GenServer.stop(pid)
-        end
-      end
-    after
-      File.rm_rf!(base)
-      :persistent_term.erase(Rules)
-    end
-  end
-
-  defp run_produced_capstone(fixture, release_case) do
-    base = temp_dir!("conformance-capstone-produced")
-    prepare_rule_base!(base, fixture)
-    Rules.load!(base, Map.keys(Gateway.handlers(%{})))
-
-    try do
-      missing =
-        Enum.find(fixture["cases"], fn kase ->
-          String.starts_with?(kase["case"], "missing-") and
-            not String.contains?(kase["case"], "legible")
-        end)
-
-      {db, pid} = memory_db!()
-
-      try do
-        ids = materialize_world(db, missing["world"])
-        seed_script_checkout!(base, fixture, missing, db)
-        call = build_call(missing["call"], ids)
-
-        assert {:error, %{code: "rule_denied"}} =
-                 Dispatch.dispatch(db, Gateway.handlers(%{db: db, wake_tick_ms: 1_000}), call)
-
-        assert {:prodded, 1} =
-                 Supervision.evaluate(
-                   db,
-                   Gateway.handlers(%{db: db, wake_tick_ms: 1_000}),
-                   3,
-                   "holder",
-                   ids.turns["holder"]
-                 )
-      after
-        GenServer.stop(pid)
-      end
-
-      release = Enum.find(fixture["cases"], &(&1["case"] == release_case))
-      {db, pid} = memory_db!()
-
-      try do
-        ids = materialize_world(db, release["world"])
-        seed_script_checkout!(base, fixture, release, db)
-        call = build_call(release["call"], ids)
-
-        assert {:ok, _} =
-                 Dispatch.dispatch(db, Gateway.handlers(%{db: db, wake_tick_ms: 1_000}), call)
-      after
-        GenServer.stop(pid)
-      end
-    after
-      File.rm_rf!(base)
-      :persistent_term.erase(Rules)
-    end
-  end
-
-  defp run_retired_holder_contract(fixture) do
-    base = temp_dir!("conformance-retired-holder")
-    prepare_rule_base!(base, fixture)
-    Rules.load!(base, Map.keys(Gateway.handlers(%{})))
-
-    try do
-      sample =
-        Enum.find(fixture["cases"], &(&1["case"] == "retired-with-pending-wake-is-stranded"))
-
-      {db, pid} = memory_db!()
-
-      try do
-        ids = materialize_world(db, sample["world"])
-        Org.retire(db, "holder", "process:tightbeam", 1_000)
-        terminal_seq = ids.turns["holder"]
-
-        assert :stranded =
-                 Supervision.evaluate(
-                   db,
-                   Gateway.handlers(%{db: db, wake_tick_ms: 1_000}),
-                   3,
-                   "holder",
-                   terminal_seq
-                 )
-
-        assert %{lastEvaluatedTerminal: ^terminal_seq} = Supervision.watermark(db, "holder")
-        assert Wakes.pending_count(db, "holder") == 0
-        assert RailRemedy.episode(db, fixture_rule_name(fixture), ids.assignments["work"]) == nil
-        refute lifecycle_kind?(db, "rail_sweep")
-      after
-        GenServer.stop(pid)
-      end
-
-      {db, pid} = memory_db!()
-
-      try do
-        live = Enum.find(fixture["cases"], &(&1["case"] == "live-holder-runs-rail-step"))
-        ids = materialize_world(db, live["world"])
-
-        assert {:acted, :rail_remedy} =
-                 Supervision.evaluate(
-                   db,
-                   Gateway.handlers(%{db: db, wake_tick_ms: 1_000}),
-                   3,
-                   "holder",
-                   ids.turns["holder"]
-                 )
-
-        assert %{status: "live"} =
-                 RailRemedy.episode(db, fixture_rule_name(fixture), ids.assignments["work"])
-      after
-        GenServer.stop(pid)
-      end
-    after
-      File.rm_rf!(base)
-      :persistent_term.erase(Rules)
-    end
-  end
-
-  defp run_watermark_contract(fixture) do
-    base = temp_dir!("conformance-watermark")
-    prepare_rule_base!(base, fixture)
-    Rules.load!(base, Map.keys(Gateway.handlers(%{})))
-
-    try do
-      nil_case = Enum.find(fixture["cases"], &(&1["case"] == "nil-fallthrough-no-null-write"))
-      {db, pid} = memory_db!()
-
-      try do
-        materialize_world(db, nil_case["world"])
-
-        assert :idle =
-                 Supervision.evaluate(
-                   db,
-                   Gateway.handlers(%{db: db, wake_tick_ms: 1_000}),
-                   3,
-                   "holder",
-                   nil
-                 )
-
-        assert Supervision.watermark(db, "holder") == nil
-        refute lifecycle_kind?(db, "rail_sweep")
-      after
-        GenServer.stop(pid)
-      end
-
-      fresh = Enum.find(fixture["cases"], &(&1["case"] == "fresh-larger-terminal-acts"))
-      {db, pid} = memory_db!()
-
-      try do
-        ids = materialize_world(db, fresh["world"])
-        terminal_seq = ids.turns["holder"]
-        handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
-        assert {:prodded, 1} = Supervision.evaluate(db, handlers, 3, "holder", terminal_seq)
-        lifecycle_count = length(EventLog.lifecycle_events(db))
-        assert :duplicate = Supervision.evaluate(db, handlers, 3, "holder", terminal_seq)
-        assert length(EventLog.lifecycle_events(db)) == lifecycle_count
-        assert %{lastEvaluatedTerminal: ^terminal_seq} = Supervision.watermark(db, "holder")
-      after
-        GenServer.stop(pid)
-      end
-    after
-      File.rm_rf!(base)
-      :persistent_term.erase(Rules)
-    end
-  end
-
-  defp run_sweep_escalation_contract(fixture) do
-    base = temp_dir!("conformance-sweep-escalation")
-    prepare_rule_base!(base, fixture)
-    Rules.load!(base, Map.keys(Gateway.handlers(%{})))
-    {db, pid} = memory_db!()
-
-    try do
-      sample =
-        Enum.find(fixture["cases"], &(&1["case"] == "needs-request-nil-opens-and-parks"))
-
-      ids = materialize_world(db, sample["world"])
-      handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
-
-      assert {:acted, :rail_escalate} =
-               Supervision.evaluate(db, handlers, 3, "holder", ids.turns["holder"])
-
-      assert {:ok, [[request_id, "open", park_wake_id]]} =
-               DB.query(db, "SELECT id, status, parkWakeId FROM decision_requests")
-
-      assert %{condition_kind: "escalation-ruled", condition_scope: ^request_id} =
-               Wakes.get(db, park_wake_id)
-
-      ids =
-        materialize_world(
-          db,
-          %{"turn" => %{"session" => "holder", "seq" => 2, "window_start" => 1}},
-          ids
-        )
-
-      assert {:acted, :rail_escalate} =
-               Supervision.evaluate(db, handlers, 3, "holder", ids.turns["holder"])
-
-      assert {:ok, [[^request_id, ^park_wake_id]]} =
-               DB.query(db, "SELECT id, parkWakeId FROM decision_requests")
-
-      assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM decision_requests")
-    after
-      GenServer.stop(pid)
-      File.rm_rf!(base)
-      :persistent_term.erase(Rules)
-    end
-  end
-
   def run_remedy_action_contract(fixture) do
     base = temp_dir!("conformance-remedy-actions")
     prepare_rule_base!(base, fixture)
@@ -2713,88 +1732,6 @@ defmodule Tightbeam.ConformanceSupport do
     end
   end
 
-  defp run_supervision_actor(fixture) do
-    base = temp_dir!("conformance-supervision-actor")
-    prepare_rule_base!(base, fixture)
-    Rules.load!(base, Map.keys(Gateway.handlers(%{})))
-
-    try do
-      Enum.each(fixture["cases"], fn kase ->
-        {db, pid} = memory_db!()
-
-        try do
-          ids = materialize_world(db, Map.get(kase, "world", %{}))
-          seed_script_checkout!(base, fixture, kase, db)
-          call = build_call(kase["call"], ids)
-          handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
-          session_key = call.principal |> elem(1)
-          assignment_id = call.params.assignment_id
-          terminal_seq = Map.fetch!(ids.turns, session_key)
-          result = Supervision.evaluate(db, handlers, 3, session_key, terminal_seq)
-          rule = fixture_rule_name(fixture)
-
-          case kase["expect"] do
-            "run-remedy" ->
-              assert result == {:acted, :rail_remedy}
-              assert %{status: "live"} = RailRemedy.episode(db, rule, assignment_id)
-              assert review_effect_count(db, assignment_id) == 1
-              assert %{supervisionState: "armed"} = Supervision.prod_state(db, assignment_id)
-              assert sweep_decision?(db, session_key, rule, "run-remedy")
-
-            "re-obligate" ->
-              assert result == {:prodded, 1}
-              assert RailRemedy.episode(db, rule, assignment_id) == nil
-              assert Supervision.prod_state(db, assignment_id).prodCount == 1
-              assert sweep_decision?(db, session_key, rule, "re-obligate")
-
-            "none" ->
-              assert RailRemedy.episode(db, rule, assignment_id) == nil
-
-              cond do
-                fixture["name"] == "busy-or-queued-no-sweep" ->
-                  # C-R1: this fixture's unscoped queued turn does not cover
-                  # the open obligation. Normal sweep evaluation re-obligates it.
-                  assert result == {:prodded, 1}
-                  assert %{prodCount: 1} = Supervision.prod_state(db, assignment_id)
-                  assert sweep_decision?(db, session_key, rule, "re-obligate")
-
-                self_wake?(db, call) ->
-                  assert result == :continuation
-                  assert %{supervisionState: "armed"} = Supervision.prod_state(db, assignment_id)
-                  refute lifecycle_kind?(db, "rail_sweep")
-
-                true ->
-                  assert sweep_decision?(db, session_key, nil, "none")
-              end
-          end
-
-          if fixture["name"] == "idle-open-obligation" and kase["kind"] == "positive" do
-            effect_count = review_effect_count(db, assignment_id)
-            lifecycle_count = length(EventLog.lifecycle_events(db))
-
-            assert Supervision.evaluate(db, handlers, 3, session_key, terminal_seq) == :duplicate
-            assert review_effect_count(db, assignment_id) == effect_count
-            assert length(EventLog.lifecycle_events(db)) == lifecycle_count
-          end
-
-          if kase["kind"] == "legibility" do
-            assert lifecycle_kind?(db, "rail_sweep")
-            assert_declared_records!(kase["emits"], latest_denied_payload(db), db)
-          end
-        after
-          GenServer.stop(pid)
-        end
-      end)
-    after
-      File.rm_rf!(base)
-      :persistent_term.erase(Rules)
-    end
-  end
-
-  defp run_capstone_actor(fixture) do
-    run_dispatch_actor(Map.put(fixture, "class", "C6"))
-  end
-
   defp memory_db! do
     name = :"conformance_db_#{System.unique_integer([:positive])}"
     {:ok, pid} = DB.start_link(path: ":memory:", name: name)
@@ -3139,7 +2076,7 @@ defmodule Tightbeam.ConformanceSupport do
 
     case fixture["name"] do
       name
-      when name in ~w(reconcile-with-main script-result-remedy turn-end-script-gate capstone-tests-before-success) ->
+      when name in ~w(reconcile-with-main script-result-remedy) ->
         git!(workdir, ["switch", "-c", "feature"])
 
         if kase["script_return"] == "behind" do
@@ -3174,23 +2111,10 @@ defmodule Tightbeam.ConformanceSupport do
     assert status == 0, "git #{Enum.join(args, " ")} failed: #{output}"
   end
 
-  defp sweep_call(%{"class" => "C7"}, call), do: Map.put(call, :edge, :turn_end)
-  defp sweep_call(_fixture, call), do: call
-
   defp self_wake?(db, %{principal: {:session, session_key}}),
     do: Wakes.self_pending_count(db, session_key) > 0
 
   defp self_wake?(_db, _call), do: false
-
-  defp suppressed_before_decision?(%{"class" => "C7"}, kase) do
-    world = Map.get(kase, "world", %{})
-
-    List.wrap(Map.get(world, "ledger", []))
-    |> Enum.any?(&(Map.get(&1, "pending", 0) > 0)) or
-      get_in(world, ["turn", "seq"]) == nil
-  end
-
-  defp suppressed_before_decision?(_fixture, _kase), do: false
 
   defp fixture_rule_name(fixture), do: fixture["rule"] |> List.first() |> Map.fetch!("name")
 
@@ -3317,19 +2241,6 @@ defmodule Tightbeam.ConformanceSupport do
     Enum.any?(EventLog.lifecycle_events(db), fn event ->
       event.kind == kind and event.subject == subject and
         JSON.decode!(event.detail)["outcome"] == outcome
-    end)
-  end
-
-  defp sweep_decision?(db, session_key, statute, decision) do
-    Enum.any?(EventLog.lifecycle_events(db), fn event ->
-      if event.kind == "rail_sweep" do
-        detail = JSON.decode!(event.detail)
-
-        event.subject == session_key and detail["statute"] == statute and
-          detail["decision"] == decision
-      else
-        false
-      end
     end)
   end
 
@@ -3558,19 +2469,14 @@ defmodule Tightbeam.ConformanceTest do
     # loadset twin; producer-backed-gate was replaced 1:1 by
     # artifact-backed-gate. The ten exact-mechanism skips are untouched.
     #
-    # Deleting adjudication (2026-08-05) removed one more: C7's
-    # adjudication-hold-order, whose whole subject was a hold freezing the
-    # turn-end shift. The shift itself is unchanged minus that first slot.
-    #
-    # Fabric §13 Phase 0 adds C4/holder-verdict-wins. It has its own cases and
-    # runner, so it increases the active and activated counts, not the exact
-    # mechanism skips.
-    assert length(@fixtures) == 65
-    assert active_fixtures == 55
+    # Legacy edge-controller fixtures are not part of the active contract set.
+    assert length(@fixtures) == 38
+    assert active_fixtures == 28
     assert exact_skips == 10
-    assert activated_fixture_tests == 42
-    assert activated_class_tests == 5
-    assert activated_tests == 47
+    assert activated_fixture_tests == 15
+    assert activated_class_tests == 3
+    assert activated_tests == 18
+    assert structured == 7
   end
 
   # The structural guard for the defect this file used to carry: a catch-all clause
@@ -3617,8 +2523,8 @@ defmodule Tightbeam.ConformanceTest do
       )
     end)
 
-    # C4/holder-verdict-wins is the 52nd pending fixture annotation.
-    assert Enum.count(entries, &(&1.scope == "fixture")) == 52
+    # C4/holder-verdict-wins remains one of the pending fixture annotations.
+    assert Enum.count(entries, &(&1.scope == "fixture")) == 25
 
     assert %{
              scope: "case",
@@ -3629,8 +2535,7 @@ defmodule Tightbeam.ConformanceTest do
 
     for id <- [
           "C6/escalation-return-dispatch",
-          "C6/escalation-continue-the-fold",
-          "C7/escalation-return-sweep"
+          "C6/escalation-continue-the-fold"
         ] do
       assert Enum.any?(entries, fn entry ->
                entry == %{
@@ -3776,53 +2681,12 @@ defmodule Tightbeam.ConformanceTest do
   # 180s is ~2.9x the projected worst; it is not the neighbour's 300s, because this
   # site did not measure the neighbour's number.
   @tag timeout: 180_000
-  test "C5 script tokens drive C6 dispatch remedies and C7 turn-end remedies" do
-    for {class, name} <- [
-          {"C6", "script-result-remedy"},
-          {"C7", "turn-end-script-gate"}
-        ] do
+  test "C5 script tokens drive C6 dispatch remedies" do
+    for {class, name} <- [{"C6", "script-result-remedy"}] do
       fixture = fixture!(class, name)
       Corpus.run_rules_decide(fixture)
       Corpus.run_acting_layer(fixture)
     end
-  end
-
-  test "C7 idle obligation acts at most once for the same terminal watermark" do
-    fixture = fixture!("C7", "idle-open-obligation")
-    Corpus.run_rules_decide(fixture)
-    Corpus.run_acting_layer(fixture)
-  end
-
-  test "C7 busy ledger state suppresses action and idle state re-obligates" do
-    Corpus.run_acting_layer(fixture!("C7", "busy-or-queued-no-sweep"))
-  end
-
-  test "C7 satisfied obligation performs no rail action and unsatisfied state re-obligates" do
-    fixture = fixture!("C7", "satisfied-obligation-no-sweep")
-    Corpus.run_rules_decide(fixture)
-    Corpus.run_acting_layer(fixture)
-  end
-
-  test "C7 prechecks retired holders, preserves watermark semantics, and reuses escalation park" do
-    Corpus.run_supervision_state_contract(
-      fixture!("C7", "retired-holder-no-remedy"),
-      fixture!("C7", "watermark-nil-duplicate"),
-      fixture!("C7", "escalation-return-sweep")
-    )
-  end
-
-  test "C7 sweep leaves rulings unconsumed and the verb edge consumes exactly once" do
-    Corpus.run_sweep_ruling_contract(fixture!("C7", "sweep-never-consumes"))
-  end
-
-  test "Cap reviewer, judge, tests, and real-run loops compose dispatch, producer, and sweep actors" do
-    Corpus.run_capstone_contracts(
-      fixture!("Cap", "capstone-reviewer-loop"),
-      fixture!("Cap", "capstone-yagni-judge"),
-      fixture!("Cap", "capstone-spec-review"),
-      fixture!("Cap", "capstone-tests-before-success"),
-      fixture!("Cap", "capstone-real-run-before-ship")
-    )
   end
 
   test "loader rejects a case fixture with no negative direction" do
@@ -3865,7 +2729,7 @@ defmodule Tightbeam.ConformanceTest do
 
   test "loader rejects empty complex worlds" do
     with_corpus_copy(fn root ->
-      path = Path.join(root, "capstone/capstone-reviewer-loop.cases.jsonl")
+      path = Path.join(root, "c6_remedies/remedy-episode-idempotent.cases.jsonl")
 
       [first | rest] =
         path

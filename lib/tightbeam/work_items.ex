@@ -18,6 +18,8 @@ defmodule Tightbeam.WorkItems do
 
   alias Tightbeam.{CausalEvents, DB, EffortCheckin, Org, Wakes}
   alias Tightbeam.DB.Txn
+
+  require Logger
   alias Tightbeam.Firehose.Publisher
 
   @origin "process:tightbeam"
@@ -452,7 +454,13 @@ defmodule Tightbeam.WorkItems do
 
     values = [item.id | Enum.map(updates, &elem(&1, 1))]
     Txn.q(txn, "UPDATE work_items SET #{assignments} WHERE id = ?1", values)
-    fetch_in_txn(txn, item.id)
+    updated = fetch_in_txn(txn, item.id)
+
+    if item.deliveryOwnerSessionKey != updated.deliveryOwnerSessionKey do
+      Wakes.readdress_terminal_notices_for_work_item_in_txn(txn, item.id)
+    end
+
+    updated
   end
 
   defp patch_spec_ref(item, params) do
@@ -770,11 +778,9 @@ defmodule Tightbeam.WorkItems do
   def arm_slate_in_txn(%Txn{} = _txn, nil), do: :ok
 
   @doc """
-  Re-arm the bracket wake being delivered, IN the delivery transaction, when
-  the item is still unrouted/un-iceboxed (bracket 1) or the slate is still
-  clear (bracket 2). The match on `routingWakeId`/`slateWakeId` is the sole
-  discriminator: a rumination or ordinary wake never matches, so it no-ops.
-  Nag-by-re-arm: the supervision lattice does not watch holderless work.
+  Re-arm a still-current routing or slate bracket after its durable delivery
+  record commits. The pointer match is the discriminator, so a replay or an
+  unrelated notice cannot advance the bracket twice.
   """
   @spec rearm_on_fire_in_txn(Txn.t(), String.t() | nil, map() | nil) :: :ok
   def rearm_on_fire_in_txn(%Txn{} = txn, wake_id, %{work_item_id: item_id})
@@ -817,6 +823,68 @@ defmodule Tightbeam.WorkItems do
   end
 
   def rearm_on_fire_in_txn(%Txn{} = _txn, _wake_id, _gate), do: :ok
+
+  @doc false
+  @spec reconcile_delivered_brackets(DB.server(), String.t() | nil, String.t() | nil) ::
+          :ok | {:error, term()}
+  def reconcile_delivered_brackets(
+        db \\ DB,
+        recipient_session_key \\ nil,
+        delivered_wake_id \\ nil
+      ) do
+    case DB.transaction(db, fn txn ->
+           delivered_turn_seq =
+             if is_binary(delivered_wake_id) do
+               case Txn.q(txn, "SELECT deliveredTurnSeq FROM wakes WHERE wakeId=?1", [delivered_wake_id]) do
+                 [[seq]] when is_integer(seq) -> seq
+                 _ -> nil
+               end
+             end
+
+           rows =
+             Txn.q(
+               txn,
+               """
+               SELECT w.wakeId,w.work_item_id
+               FROM wakes w
+               JOIN turns t ON t.seq=w.deliveredTurnSeq
+               JOIN work_items wi ON wi.id=w.work_item_id
+               WHERE (?1 IS NULL OR t.sessionKey=?1)
+                 AND (?2 IS NULL OR w.deliveredTurnSeq=?2)
+                 AND wi.state='open'
+                 AND (wi.routingWakeId=w.wakeId OR wi.slateWakeId=w.wakeId)
+               ORDER BY w.deliveredTurnSeq,w.wakeId
+               """,
+               [recipient_session_key, delivered_turn_seq]
+             )
+
+           Enum.each(rows, fn
+             [wake_id, work_item_id] when is_binary(wake_id) and is_binary(work_item_id) ->
+               :ok = Txn.exec(txn, "SAVEPOINT reconcile_work_item_bracket")
+
+               try do
+                 :ok = rearm_on_fire_in_txn(txn, wake_id, %{work_item_id: work_item_id})
+                 :ok = Txn.exec(txn, "RELEASE reconcile_work_item_bracket")
+               rescue
+                 error ->
+                   :ok = Txn.exec(txn, "ROLLBACK TO reconcile_work_item_bracket")
+                   :ok = Txn.exec(txn, "RELEASE reconcile_work_item_bracket")
+
+                   Logger.warning(
+                     "work-item bracket delivery reconciliation deferred for #{wake_id}: #{Exception.message(error)}"
+                   )
+               end
+
+             _malformed ->
+               Logger.warning("skipping malformed delivered work-item bracket")
+           end)
+
+           :ok
+         end) do
+      {:ok, :ok} -> :ok
+      {:error, error} -> {:error, error}
+    end
+  end
 
   defp arm_routing_in_txn(txn, id, owner, title) do
     wake =

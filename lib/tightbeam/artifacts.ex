@@ -233,6 +233,15 @@ defmodule Tightbeam.Artifacts do
                      ]
                    )
 
+                   if is_binary(producer_id) do
+                     Tightbeam.Supervision.activity_in_txn(
+                       txn,
+                       producer_id,
+                       session_key,
+                       now
+                     )
+                   end
+
                    Publisher.maybe_observed_accepted_in_txn(txn, call)
                    publish_in_txn(txn, "artifact.recorded", artifact_id, call)
                    {:created, artifact_in_txn(txn, artifact_id)}

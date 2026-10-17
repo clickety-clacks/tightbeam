@@ -127,8 +127,10 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     refute third.wake_id in [first.wake_id, second.wake_id]
   end
 
-  test "a recovered finish notice without an action destination remains notice-only", ctx do
-    item = create_work_item(ctx, "recovered completion")
+  test "a retired opener is routed to Main when the finish notice is stored", ctx do
+    item = create_work_item(ctx, "completion with retired opener")
+    personal = Org.personal_session_key("flynn")
+    session(ctx.db, personal, "flynn")
 
     child_assignment =
       handle(
@@ -150,26 +152,14 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
              )
 
     [root] = terminal_notices(ctx.db)
-    assert root.state == "canceled"
+    assert root.state == "pending"
+    assert root.session_key == personal
     assert reminders(ctx.db, root.wake_id) == []
 
-    {:ok, _} =
-      DB.query(ctx.db, "UPDATE sessions SET state='active' WHERE sessionKey='notice-parent'")
-
-    assert {:ok, {:ok, %{wake: recovered, replay: false}}} =
-             DB.transaction(ctx.db, fn txn ->
-               Wakes.recover_terminal_notification_in_txn(
-                 txn,
-                 root.wake_id,
-                 "session:notice-parent"
-               )
-             end)
-
-    refute recovered.wake_id == root.wake_id
     assert :ok = Wakes.fire_due(ctx.scheduler)
-    assert Wakes.get(ctx.db, recovered.wake_id).state == "fired"
-    assert_delivered_carrier(ctx.db, recovered.wake_id)
-    assert reminders(ctx.db, recovered.wake_id) == []
+    assert Wakes.get(ctx.db, root.wake_id).state == "fired"
+    assert_delivered_carrier(ctx.db, root.wake_id)
+    assert reminders(ctx.db, root.wake_id) == []
   end
 
   test "a parent with no open assignment gets the initial notice but no reminder rail", ctx do
@@ -673,8 +663,8 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
       end)
 
     case result do
-      {:terminal_notice_undeliverable, _} -> Gateway.complete_delivery(db, result)
-      other -> other
+      {:staged, _} -> result
+      other -> Gateway.complete_delivery(db, other)
     end
   end
 

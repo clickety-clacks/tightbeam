@@ -161,4 +161,8 @@ defmodule Tightbeam.NoticeBatcherTest do
        } do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 30)
   end
+
+  test "one malformed attachment source does not block its sibling notice", %{tmp_dir: tmp} do
+    Tightbeam.NoticeBatcherFixture.run!(tmp, 43)
+  end
 end

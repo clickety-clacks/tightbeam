@@ -1,7 +1,7 @@
 defmodule Tightbeam.FailedTurnIntentTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{ConnRegistry, DB, Ledger, Model, Org, Supervision, Wakes}
+  alias Tightbeam.{ConnRegistry, DB, Ledger, Model, Org, Wakes}
 
   defmodule LaneDoorbell do
     use GenServer
@@ -35,15 +35,6 @@ defmodule Tightbeam.FailedTurnIntentTest do
     parent = session(db, "parent", main.session_key)
     child = session(db, "child", parent.session_key)
 
-    supervision = :"failed_intent_supervision_#{System.unique_integer([:positive])}"
-
-    start_supervised!(
-      {Supervision,
-       db: db, handlers: %{}, prod_limit: 3, sweep_ms: 60_000, recover: false, name: supervision}
-    )
-
-    _ = :sys.get_state(supervision)
-
     %{db: db, parent: parent, child: child}
   end
 
@@ -63,10 +54,10 @@ defmodule Tightbeam.FailedTurnIntentTest do
 
     seq = terminal!(ctx.db, ctx.child.session_key, "failed", "provider rate limit", wake.wake_id)
 
-    assert :ok = Supervision.classify_terminal(ctx.db, seq)
-    assert :ok = Supervision.classify_terminal(ctx.db, seq)
+    assert {:retry, retry_id} = preserve_failed_intent!(ctx.db, seq)
+    assert {:retry, ^retry_id} = preserve_failed_intent!(ctx.db, seq)
 
-    assert {:ok, [[root, 0, ^seq, "failed", retry_id]]} =
+    assert {:ok, [[root, 0, ^seq, "failed", ^retry_id]]} =
              DB.query(
                ctx.db,
                "SELECT rootWakeId, attempt, sourceTurnSeq, outcome, retryWakeId FROM wake_retry_attempts WHERE wakeId=?1",
@@ -117,7 +108,7 @@ defmodule Tightbeam.FailedTurnIntentTest do
         wake.wake_id
       )
 
-    assert :ok = Supervision.classify_terminal(ctx.db, seq)
+    assert :not_retryable = preserve_failed_intent!(ctx.db, seq)
 
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wake_retry_attempts")
   end
@@ -135,7 +126,7 @@ defmodule Tightbeam.FailedTurnIntentTest do
 
     seq = terminal!(ctx.db, ctx.child.session_key, "failed", "provider rate limit", wake.wake_id)
 
-    assert :ok = Supervision.classify_terminal(ctx.db, seq)
+    assert {:retry, _retry_id} = preserve_failed_intent!(ctx.db, seq)
 
     assert {:ok, [["wi_repro", "asg_repro"]]} =
              DB.query(
@@ -150,168 +141,12 @@ defmodule Tightbeam.FailedTurnIntentTest do
              )
   end
 
-  test "two boot sweeps leave predecessor terminal history unclassified" do
-    db = :"legacy_failed_intent_db_#{System.unique_integer([:positive])}"
-
-    start_supervised!(%{
-      id: db,
-      start: {DB, :start_link, [[path: ":memory:", name: db]]}
-    })
-
-    :ok = Tightbeam.Schema.ensure_all(db)
-
-    {:ok, _} =
-      DB.query(
-        db,
-        "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('legacy-owner', 1, 1)"
-      )
-
-    legacy = session(db, Org.personal_session_key("legacy-owner"), nil, true, "legacy-owner")
-    legacy_seq = terminal!(db, legacy.session_key, "failed", "provider rate limit")
-
-    assert {:ok, []} = DB.query(db, "SELECT firstTurnSeq FROM patrol_failure_boundary")
-
-    supervision = :"legacy_failed_intent_supervision_#{System.unique_integer([:positive])}"
-
-    start_supervised!(%{
-      id: supervision,
-      start:
-        {Supervision, :start_link,
-         [
-           [
-             db: db,
-             handlers: %{},
-             prod_limit: 3,
-             sweep_ms: 60_000,
-             recover: false,
-             name: supervision
-           ]
-         ]}
-    })
-
-    _ = :sys.get_state(supervision)
-    Supervision.request_sweep(supervision)
-    _ = :sys.get_state(supervision)
-
-    assert {:ok, [[first_turn_seq]]} =
-             DB.query(db, "SELECT firstTurnSeq FROM patrol_failure_boundary WHERE id=0")
-
-    assert first_turn_seq == legacy_seq + 1
-    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM patrol_terminal_classifications")
-    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM patrol_failure_streaks")
-    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM patrol_failure_escalations")
-  end
-
-  test "six consecutive ordinary failures route one patrol cause to the parent", ctx do
-    seqs =
-      for n <- 1..6 do
-        seq = terminal!(ctx.db, ctx.child.session_key, "failed", "provider failure #{n}")
-        assert :ok = Supervision.classify_terminal(ctx.db, seq)
-        seq
-      end
-
-    assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM patrol_failure_escalations")
-
-    assert {:ok, [[escalation_id, 6, first_seq, threshold_seq, "admitted", "parent"]]} =
-             DB.query(
-               ctx.db,
-               """
-               SELECT e.id, s.failureCount, e.firstTurnSeq,
-                      e.thresholdTurnSeq, e.state, e.firstRecipient
-               FROM patrol_failure_escalations e
-               JOIN patrol_failure_streaks s ON s.escalationId=e.id
-               """
-             )
-
-    assert first_seq == hd(seqs)
-    assert threshold_seq == List.last(seqs)
-
-    assert {:ok, [["parent", "queued", request_ref, wake_id]]} =
-             DB.query(
-               ctx.db,
-               """
-               SELECT sessionKey, status, requestRef, wakeId FROM turns
-               WHERE requestRef LIKE 'bubble:patrol:%'
-               """
-             )
-
-    assert request_ref == "bubble:patrol:#{escalation_id}"
-    assert wake_id == "bubble:patrol:#{escalation_id}:parent"
-
-    {:ok, notice} = Ledger.claim_next(ctx.db, ctx.parent.session_key, "notice-test")
-
-    assert :ok =
-             Ledger.finish(ctx.db, notice.seq, "failed", "parent could not run",
-               owner_lease: notice.owner_lease
-             )
-
-    assert :ok = Supervision.classify_terminal(ctx.db, notice.seq)
-    assert :ok = Tightbeam.Productions.Bubble.recognize_terminal(ctx.db, notice.seq)
-
-    assert {:ok, [[main_key]]} =
-             DB.query(
-               ctx.db,
-               "SELECT sessionKey FROM turns WHERE requestRef=?1 AND sessionKey != 'parent'",
-               [request_ref]
-             )
-
-    assert main_key == Org.personal_session_key("flynn")
-
-    assert {:ok, []} =
-             DB.query(ctx.db, "SELECT 1 FROM patrol_failure_streaks WHERE sessionKey='parent'")
-
-    Enum.each(seqs, &Supervision.classify_terminal(ctx.db, &1))
-    seventh = terminal!(ctx.db, ctx.child.session_key, "failed", "another failure")
-    assert :ok = Supervision.classify_terminal(ctx.db, seventh)
-
-    assert {:ok, [[1, 2]]} =
-             DB.query(
-               ctx.db,
-               """
-               SELECT (SELECT COUNT(*) FROM patrol_failure_escalations),
-                      (SELECT COUNT(*) FROM turns WHERE requestRef LIKE 'bubble:patrol:%')
-               """
-             )
-  end
-
-  test "delivered turns reset the streak and failed Bubble notices never join it", ctx do
-    for n <- 1..5 do
-      seq = terminal!(ctx.db, ctx.child.session_key, "failed", "first incident #{n}")
-      assert :ok = Supervision.classify_terminal(ctx.db, seq)
+  defp preserve_failed_intent!(db, seq) do
+    DB.transaction(db, &Wakes.preserve_failed_intent_for_terminal_in_txn(&1, seq))
+    |> case do
+      {:ok, result} -> result
+      {:error, error} -> raise error
     end
-
-    delivered = terminal!(ctx.db, ctx.child.session_key, "delivered", nil)
-    assert :ok = Supervision.classify_terminal(ctx.db, delivered)
-
-    for n <- 1..5 do
-      seq = terminal!(ctx.db, ctx.child.session_key, "failed", "second incident #{n}")
-      assert :ok = Supervision.classify_terminal(ctx.db, seq)
-    end
-
-    for n <- 1..6 do
-      seq =
-        terminal!(
-          ctx.db,
-          ctx.parent.session_key,
-          "failed",
-          "notice failure #{n}",
-          nil,
-          "bubble:#{n}"
-        )
-
-      assert :ok = Supervision.classify_terminal(ctx.db, seq)
-    end
-
-    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM patrol_failure_escalations")
-
-    assert {:ok, [[5]]} =
-             DB.query(
-               ctx.db,
-               "SELECT failureCount FROM patrol_failure_streaks WHERE sessionKey='child'"
-             )
-
-    assert {:ok, []} =
-             DB.query(ctx.db, "SELECT 1 FROM patrol_failure_streaks WHERE sessionKey='parent'")
   end
 
   defp session(db, key, parent, built_in? \\ false, owner \\ "flynn") do

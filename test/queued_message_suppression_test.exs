@@ -10,7 +10,6 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
     Projection,
     QueuedMessageSuppression,
     Roles,
-    Rules,
     Wakes
   }
 
@@ -45,20 +44,10 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
     %{db: db}
   end
 
-  test "suppresses an exact liveness wake after a newer typed receipt", %{db: db} do
+  test "legacy liveness evidence does not suppress a stored notice", %{db: db} do
     assignment!(db, "asg_liveness")
     wake = liveness_wake!(db, "asg_liveness", "old liveness notice")
     seq = deliver_wake!(db, wake)
-
-    assert {:ok, [["asg_liveness", wake_id, wake_created_at]]} =
-             DB.query(
-               db,
-               "SELECT assignmentId,wakeId,wakeCreatedAt FROM queued_message_scopes WHERE turnSeq=?1",
-               [seq]
-             )
-
-    assert wake_id == wake.wake_id
-    assert wake_created_at == wake.created_at
 
     {:ok, _} =
       DB.query(
@@ -71,12 +60,8 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
         [wake.created_at, wake.created_at + 1]
       )
 
-    assert :none = Ledger.claim_next(db, "k1", "lane")
-
-    assert {:ok, [["canceled", error]]} =
-             DB.query(db, "SELECT status,error FROM turns WHERE seq=?1", [seq])
-
-    assert error =~ "verified_liveness_recovery"
+    assert {:ok, %{seq: ^seq, prompt: prompt}} = Ledger.claim_next(db, "k1", "lane")
+    assert prompt =~ "old liveness notice"
   end
 
   test "sender replacement is isolated by sender, holder, assignment and protected traffic", %{
@@ -163,8 +148,7 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
         message_id: "replace-process-failure",
         origin: "process:tightbeam",
         prompt: "system failure notice",
-        assignment_id: "asg_replace",
-        queue_message_kind: "failure"
+        assignment_id: "asg_replace"
       })
 
     decision_wake =
@@ -881,7 +865,7 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
              )
   end
 
-  test "suppresses an exact liveness wake after a newer assignment disposition", %{db: db} do
+  test "assignment disposition does not retract a queued notice", %{db: db} do
     :ok = DB.execute(db, "INSERT INTO users (userId,createdAt) VALUES ('flynn',1)")
     assignment!(db, "asg_closed")
     wake = liveness_wake!(db, "asg_closed", "old effort check")
@@ -900,18 +884,13 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
                }
              })
 
-    assert :none = Ledger.claim_next(db, "k1", "lane")
-
-    assert {:ok, [["canceled", error]]} =
-             DB.query(db, "SELECT status,error FROM turns WHERE seq=?1", [seq])
-
-    assert error =~ "newer_assignment_disposition"
+    assert {:ok, %{seq: ^seq, prompt: prompt}} = Ledger.claim_next(db, "k1", "lane")
+    assert prompt =~ "old effort check"
   end
 
-  test "suppresses stale liveness after admitted continuation and preserves the continuation", %{
+  test "an admitted continuation remains claimable beside ordinary notices", %{
     db: db
   } do
-    coverage_policy!()
     assignment!(db, "asg_continuation")
 
     {:ok, running_turn} =
@@ -944,18 +923,20 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
     assert :ok =
              Ledger.finish(db, running_turn, "delivered", nil, owner_lease: running_turn_lease)
 
-    assert {:ok, true} =
-             DB.transaction(db, &Wakes.covering_continuation_in_txn?(&1, "asg_continuation"))
+    ordinary_wake =
+      Wakes.schedule(db, %{
+        session_key: "k1",
+        origin: "user:flynn",
+        prompt: "an ordinary notice beside the continuation",
+        due_at: System.system_time(:millisecond)
+      })
 
-    stale_wake = liveness_wake!(db, "asg_continuation", "stale liveness notice")
-    stale_seq = deliver_wake!(db, stale_wake)
+    stale_seq = deliver_wake!(db, ordinary_wake)
 
-    assert :none = Ledger.claim_next(db, "k1", "lane")
+    assert {:ok, %{seq: ^stale_seq, owner_lease: stale_lease}} =
+             Ledger.claim_next(db, "k1", "lane")
 
-    assert {:ok, [["canceled", error]]} =
-             DB.query(db, "SELECT status,error FROM turns WHERE seq=?1", [stale_seq])
-
-    assert error =~ "admitted_continuation_coverage"
+    assert :ok = Ledger.finish(db, stale_seq, "delivered", nil, owner_lease: stale_lease)
 
     {:ok, continuation_seq} =
       Ledger.enqueue(db, %{
@@ -964,14 +945,8 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
         wake_id: continuation_wake.wake_id,
         origin: "agent:holder",
         prompt: "the admitted continuation itself",
-        assignment_id: "asg_continuation",
-        queue_message_kind: "liveness"
+        assignment_id: "asg_continuation"
       })
-
-    assert {:ok, []} =
-             DB.query(db, "SELECT 1 FROM queued_message_scopes WHERE turnSeq=?1", [
-               continuation_seq
-             ])
 
     assert {:ok, %{seq: ^continuation_seq}} = Ledger.claim_next(db, "k1", "lane")
   end
@@ -985,21 +960,17 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
 
     seq = deliver_wake!(db, wake)
 
-    assert {:ok, []} =
-             DB.query(db, "SELECT 1 FROM queued_message_scopes WHERE turnSeq=?1", [seq])
-
     assert {:ok, %{seq: ^seq, prompt: prompt}} = Ledger.claim_next(db, "k1", "lane")
     assert prompt =~ "unique material result"
   end
 
-  test "explicit report and failure classifications are deferred and remain claimable", %{db: db} do
+  test "report and failure messages remain claimable", %{db: db} do
     {:ok, report_seq} =
       Ledger.enqueue(db, %{
         session_key: "k1",
         message_id: "explicit-report",
         origin: "agent:reporter",
-        prompt: "deferred report",
-        queue_message_kind: "report"
+        prompt: "deferred report"
       })
 
     {:ok, failure_seq} =
@@ -1007,11 +978,8 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
         session_key: "k1",
         message_id: "explicit-failure",
         origin: "process:tightbeam",
-        prompt: "deferred failure",
-        queue_message_kind: "failure"
+        prompt: "deferred failure"
       })
-
-    assert {:ok, []} = DB.query(db, "SELECT 1 FROM queued_message_scopes", [])
 
     assert {:ok, %{seq: ^report_seq, owner_lease: report_seq_lease}} =
              Ledger.claim_next(db, "k1", "lane")
@@ -1020,7 +988,7 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
     assert {:ok, %{seq: ^failure_seq}} = Ledger.claim_next(db, "k1", "lane")
   end
 
-  test "human, decision and unscoped liveness-shaped traffic fails open", %{db: db} do
+  test "human, decision and unscoped notices remain claimable", %{db: db} do
     assignment!(db, "asg_preserve")
 
     human_wake = liveness_wake!(db, "asg_preserve", "human request")
@@ -1032,8 +1000,7 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
         wake_id: human_wake.wake_id,
         origin: "user:flynn",
         prompt: "keep this request",
-        assignment_id: "asg_preserve",
-        queue_message_kind: "liveness"
+        assignment_id: "asg_preserve"
       })
 
     decision_wake =
@@ -1054,8 +1021,7 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
         wake_id: decision_wake.wake_id,
         origin: "process:tightbeam",
         prompt: "keep this decision notification",
-        assignment_id: "asg_preserve",
-        queue_message_kind: "liveness"
+        assignment_id: "asg_preserve"
       })
 
     unscoped_wake =
@@ -1073,16 +1039,13 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
         message_id: "unscoped-notice",
         wake_id: unscoped_wake.wake_id,
         origin: "process:tightbeam",
-        prompt: "keep this unscoped notice",
-        queue_message_kind: "liveness"
+        prompt: "keep this unscoped notice"
       })
 
-    assert {:ok, []} =
-             DB.query(
-               db,
-               "SELECT 1 FROM queued_message_scopes WHERE turnSeq IN (?1,?2,?3)",
-               [human_seq, decision_seq, unscoped_seq]
-             )
+    for seq <- [human_seq, decision_seq, unscoped_seq] do
+      assert {:ok, %{seq: ^seq, owner_lease: lease}} = Ledger.claim_next(db, "k1", "lane")
+      assert :ok = Ledger.finish(db, seq, "delivered", nil, owner_lease: lease)
+    end
   end
 
   defp work_item!(db, id) do
@@ -1174,23 +1137,4 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
     seq
   end
 
-  defp coverage_policy! do
-    base =
-      Path.join(
-        System.tmp_dir!(),
-        "queued-message-coverage-#{System.unique_integer([:positive])}"
-      )
-
-    rules_dir = Path.join(base, "identity/rules")
-    File.mkdir_p!(rules_dir)
-
-    File.write!(Path.join(rules_dir, "coverage.toml"), """
-    [[policy]]
-    name = "queued-message-coverage"
-    purpose = "wait-prod-coverage"
-    when = [{fact="wait.coverage_valid",op="eq",value=true}]
-    """)
-
-    Rules.load!(base, ~w(wake attest))
-  end
 end

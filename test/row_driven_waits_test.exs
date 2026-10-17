@@ -1153,473 +1153,6 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assert wake_count(ctx.db) == before
   end
 
-  test "C1-C4: coverage follows only the admitted obligation through pending, queued and running",
-       ctx do
-    qualification_policy(ctx)
-    assignment(ctx.db, "B", "holder")
-    turn = running_turn(ctx.db, "holder")
-    wake = register_wait(ctx.db, due_after(), predicate("R"))
-    refute covered?(ctx.db, "A")
-    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
-    assert covered?(ctx.db, "A")
-    refute covered?(ctx.db, "B")
-    assert {:match, %{id: "B"}} = Supervision.prod_production_matches?(ctx.db, "holder", turn.seq)
-
-    assert {:ok, [["holder_continuation", nil, nil, "pending"]]} =
-             DB.query(
-               ctx.db,
-               "SELECT controllerOrigin,wakeKind,chargedGeneration,controllerState FROM supervision_liveness_sidecar WHERE wakeId=?1",
-               [wake.wake_id]
-             )
-
-    assert %{assignment: %{outcome: "completed"}} = attest(ctx.db, "R", "resolver", "completion")
-    assert :ok = Wakes.fire_due(ctx.scheduler)
-    assert covered?(ctx.db, "A")
-    assert {:ok, continuation} = Ledger.claim_next(ctx.db, "holder", "fixture")
-    assert covered?(ctx.db, "A")
-    refute covered?(ctx.db, "B")
-
-    assert :ok =
-             Ledger.finish(ctx.db, continuation.seq, "delivered", nil,
-               owner_lease: continuation.owner_lease
-             )
-
-    refute covered?(ctx.db, "A")
-
-    assert {:match, %{id: "A"}} =
-             Supervision.prod_production_matches?(ctx.db, "holder", continuation.seq)
-
-    # The executive specimen named its assignments only in prose: no typed join.
-    Wakes.schedule(ctx.db, %{
-      session_key: "holder",
-      origin: "agent:holder",
-      prompt: "Continue A and B",
-      due_at: due_after()
-    })
-
-    refute covered?(ctx.db, "A")
-    refute covered?(ctx.db, "B")
-  end
-
-  for sibling <- [:continuation, :ordinary], terminal <- ~w(delivered failed canceled) do
-    test "mixed #{sibling} carrier retains source wait coverage until #{terminal}", ctx do
-      qualification_policy(ctx)
-      assignment(ctx.db, "B", "holder")
-      assignment(ctx.db, "C", "holder")
-
-      assert {:ok, :armed} =
-               DB.transaction(ctx.db, fn txn ->
-                 Supervision.transition_in_txn(txn, %{
-                   kind: "assignment_open",
-                   assignment_id: "C",
-                   opened_at: 0,
-                   principal: "user:owner-a",
-                   supervision_interval_ms: 1
-                 })
-               end)
-
-      originating = running_turn(ctx.db, "holder")
-      first = after_turn_wait!(ctx.db, "A")
-      canceled = after_turn_wait!(ctx.db, "C")
-
-      second =
-        if unquote(sibling) == :continuation,
-          do: after_turn_wait!(ctx.db, "B"),
-          else: ordinary_wait_sibling!(ctx.db)
-
-      assert {:ok, {:accepted_in_txn, _, %{canceled: true}}} =
-               DB.transaction(ctx.db, fn txn ->
-                 {:ok, trigger} = Supervision.liveness_trigger_in_txn(txn, {:assignment, "C"})
-
-                 Wakes.cancel_in_txn(txn, %{
-                   wake_id: canceled.wake_id,
-                   expected_origin: canceled.origin,
-                   requester: %{kind: "session", id: "holder"},
-                   reason_kind: "requester_withdrew",
-                   causal_source: %{
-                     kind: "verb_call",
-                     accepted_event: %{
-                       origin: canceled.origin,
-                       session_key: "holder",
-                       principal: {:session, "holder"}
-                     }
-                   },
-                   outcome: %{kind: "no_replacement", liveness_trigger: trigger}
-                 })
-               end)
-
-      assert :ok =
-               Ledger.finish(ctx.db, originating.seq, "delivered", nil,
-                 owner_lease: originating.owner_lease
-               )
-
-      assert :ok = Wakes.fire_due(ctx.scheduler)
-
-      assert {:ok, [[carrier, nil, "queued"]]} =
-               DB.query(
-                 ctx.db,
-                 "SELECT wakeId,assignmentId,status FROM turns WHERE sessionKey='holder' AND status='queued'"
-               )
-
-      assert Enum.map(Tightbeam.Wakes.digest_members(ctx.db, carrier), & &1.wake_id) == [
-               first.wake_id,
-               second.wake_id
-             ]
-
-      assert covered?(ctx.db, "A")
-      assert covered?(ctx.db, "B") == (unquote(sibling) == :continuation)
-      refute covered?(ctx.db, "C")
-      uncovered = if unquote(sibling) == :continuation, do: "C", else: "B"
-
-      assert {:match, %{id: ^uncovered}} =
-               Supervision.prod_production_matches?(ctx.db, "holder", originating.seq)
-
-      assert turn_count(ctx.db, canceled.wake_id) == 0
-      assert {:ok, turn} = Ledger.claim_next(ctx.db, "holder", "mixed-wait")
-      assert covered?(ctx.db, "A")
-      assert covered?(ctx.db, "B") == (unquote(sibling) == :continuation)
-
-      assert {:match, %{id: ^uncovered}} =
-               Supervision.prod_production_matches?(ctx.db, "holder", originating.seq)
-
-      assert :ok =
-               Ledger.finish(ctx.db, turn.seq, unquote(terminal), nil,
-                 owner_lease: turn.owner_lease
-               )
-
-      refute covered?(ctx.db, "A")
-      refute covered?(ctx.db, "B")
-      refute covered?(ctx.db, "C")
-    end
-  end
-
-  @tag persistent: true
-  test "current-stamped continuation guard admits only the exact qualified retry migration",
-       ctx do
-    suspend_scheduler(ctx)
-    originating = running_turn(ctx.db, "holder")
-    original = after_turn_wait!(ctx.db, "A")
-
-    previous =
-      File.read!(Path.join(__DIR__, "fixtures/row_wakes/prewrite-continuation-21a4cb0e.sql"))
-
-    assert {:ok, :ok} =
-             DB.transaction(ctx.db, fn txn ->
-               :ok = DB.Txn.exec(txn, "DROP TRIGGER supervision_liveness_sidecar_insert_coherent")
-               DB.Txn.exec(txn, previous)
-             end)
-
-    before = restoration_snapshot(ctx.db)
-    assert {:ok, stamp} = DB.query(ctx.db, "SELECT * FROM schema_stamp")
-    assert :ok = stop_supervised(DB)
-    start_supervised!({DB, ctx.db_opts})
-    assert :ok = Tightbeam.Schema.ensure_all(ctx.db)
-    assert restoration_snapshot(ctx.db) == before
-    assert {:ok, ^stamp} = DB.query(ctx.db, "SELECT * FROM schema_stamp")
-    assert {:ok, []} = DB.query(ctx.db, "PRAGMA foreign_key_check")
-
-    assert {:ok, [[current]]} =
-             DB.query(
-               ctx.db,
-               "SELECT sql FROM sqlite_master WHERE name='supervision_liveness_sidecar_insert_coherent'"
-             )
-
-    assert current =~ "terminal.ownerLease=claim.ownerLease"
-    assert current =~ "t.status='running'"
-
-    assert :ok =
-             Ledger.finish(ctx.db, originating.seq, "delivered", nil,
-               owner_lease: originating.owner_lease
-             )
-
-    unbound = Wakes.schedule(ctx.db, Map.put(original, :wake_id, "unbound-continuation"))
-    before = restoration_snapshot(ctx.db)
-
-    assert {:error, %DB.Error{message: refusal}} =
-             DB.query(
-               ctx.db,
-               "INSERT INTO supervision_liveness_sidecar(wakeId,assignmentId,controllerOrigin,controllerState) VALUES (?1,'A','holder_continuation','pending')",
-               [unbound.wake_id]
-             )
-
-    assert refusal =~ "supervision sidecar requires coherent pending wake"
-    assert restoration_snapshot(ctx.db) == before
-
-    malformed = String.replace(previous, "t.status='running'", "t.status='delivered'")
-
-    assert {:ok, :ok} =
-             DB.transaction(ctx.db, fn txn ->
-               :ok = DB.Txn.exec(txn, "DROP TRIGGER supervision_liveness_sidecar_insert_coherent")
-               DB.Txn.exec(txn, malformed)
-             end)
-
-    before = restoration_snapshot(ctx.db)
-
-    assert {:ok, ddl} =
-             DB.query(ctx.db, "SELECT type,name,sql FROM sqlite_master ORDER BY type,name")
-
-    assert_raise Tightbeam.Schema.ShapeError, ~r/malformed owned object/, fn ->
-      Tightbeam.Schema.ensure_all(ctx.db)
-    end
-
-    assert restoration_snapshot(ctx.db) == before
-
-    assert {:ok, ^ddl} =
-             DB.query(ctx.db, "SELECT type,name,sql FROM sqlite_master ORDER BY type,name")
-
-    assert {:ok, ^stamp} = DB.query(ctx.db, "SELECT * FROM schema_stamp")
-    assert {:ok, []} = DB.query(ctx.db, "PRAGMA foreign_key_check")
-  end
-
-  for mode <- [:after_turn, :dependency], sibling <- [:none, :ordinary, :controller] do
-    @tag persistent: true
-    test "#{mode} continuation restores with #{sibling} through the lane terminal callback and reopen",
-         ctx do
-      # Assemble all competing sources before delivery seals the restoration batch.
-      scheduler_pid = suspend_scheduler(ctx)
-      qualification_policy(ctx)
-      assignment(ctx.db, "B", "holder")
-      originating = running_turn(ctx.db, "holder")
-
-      source =
-        if unquote(mode) == :after_turn,
-          do: after_turn_wait!(ctx.db, "A"),
-          else: register_wait(ctx.db, due_after(), predicate("R"))
-
-      if unquote(mode) == :dependency,
-        do: assert(%{assignment: _} = attest(ctx.db, "R", "resolver", "completion"))
-
-      ordinary = if unquote(sibling) == :ordinary, do: ordinary_wait_sibling!(ctx.db)
-
-      assert :ok =
-               Ledger.finish(ctx.db, originating.seq, "delivered", nil,
-                 owner_lease: originating.owner_lease
-               )
-
-      if unquote(sibling) == :controller do
-        assert {:ok, :armed} =
-                 DB.transaction(ctx.db, fn txn ->
-                   Supervision.transition_in_txn(txn, %{
-                     kind: "assignment_open",
-                     assignment_id: "B",
-                     opened_at: 0,
-                     principal: "user:owner-a",
-                     supervision_interval_ms: 1
-                   })
-                 end)
-
-        handlers = Gateway.handlers(%{db: ctx.db, wake_tick_ms: 60_000})
-
-        assert {:prodded, 1} =
-                 Supervision.evaluate(
-                   ctx.db,
-                   handlers,
-                   System.system_time(:millisecond),
-                   "holder",
-                   originating.seq
-                 )
-      end
-
-      :ok = :sys.resume(scheduler_pid)
-      assert :ok = Wakes.fire_due(ctx.scheduler)
-      :ok = :sys.suspend(scheduler_pid)
-
-      assert {:ok, [[carrier, seq]]} =
-               DB.query(
-                 ctx.db,
-                 "SELECT wakeId,seq FROM turns WHERE sessionKey='holder' AND status='queued'"
-               )
-
-      expected = if unquote(sibling) == :none, do: 1, else: 2
-      members = Tightbeam.Wakes.digest_members(ctx.db, carrier)
-      assert length(members) == expected
-      assert source.wake_id in Enum.map(members, & &1.wake_id)
-      if ordinary, do: assert(ordinary.wake_id in Enum.map(members, & &1.wake_id))
-      history = wait_history(ctx.db)
-      charges = controller_charges(ctx.db)
-      start_supervised!({Registry, keys: :unique, name: Tightbeam.LaneRegistry})
-      tasks = start_supervised!(Task.Supervisor)
-      {turn, successors} = lane_prewrite_refusal!(ctx, tasks, seq)
-      assert length(successors) == expected
-      assert_wait_history!(ctx.db, history)
-      assert controller_charges(ctx.db) == charges
-      assert covered?(ctx.db, "A")
-      retry = Tightbeam.NoticeAuthority.current!(ctx.db, source.wake_id)
-      assert retry in successors
-
-      assert Map.drop(Wakes.get(ctx.db, source.wake_id), [:wake_id, :state, :due_at, :canceled_at]) ==
-               Map.drop(Wakes.get(ctx.db, retry), [:wake_id, :state, :due_at, :canceled_at])
-
-      assert {:ok, [["holder_continuation", nil, nil, "pending"]]} =
-               DB.query(
-                 ctx.db,
-                 "SELECT controllerOrigin,wakeKind,chargedGeneration,controllerState FROM supervision_liveness_sidecar WHERE wakeId=?1",
-                 [retry]
-               )
-
-      assert :ok = stop_supervised(DB)
-      start_supervised!({DB, ctx.db_opts})
-      assert :ok = Tightbeam.Schema.ensure_all(ctx.db)
-      before = restoration_snapshot(ctx.db)
-      evidence = wait_prewrite_evidence()
-
-      assert {:ok, ^successors} =
-               DB.transaction(
-                 ctx.db,
-                 &Tightbeam.NoticeSubmission.restore_in_txn(&1, turn, evidence)
-               )
-
-      assert restoration_snapshot(ctx.db) == before
-      assert covered?(ctx.db, "A")
-      at = successors |> Enum.map(&Wakes.get(ctx.db, &1).due_at) |> Enum.max()
-
-      [next_carrier] =
-        Tightbeam.NoticeBatcher.recover(ctx.db, at,
-          conn_registry: ctx.registry,
-          lane_manager: ctx.lane
-        )
-
-      assert {:ok, [[next_seq]]} =
-               DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [next_carrier])
-
-      {next_turn, next_successors} = lane_prewrite_refusal!(ctx, tasks, next_seq)
-      assert length(next_successors) == expected
-      assert controller_charges(ctx.db) == charges
-      assert Tightbeam.NoticeAuthority.current!(ctx.db, source.wake_id) in next_successors
-      assert Tightbeam.NoticeAuthority.restored_turn?(ctx.db, next_turn.seq)
-      at = next_successors |> Enum.map(&Wakes.get(ctx.db, &1).due_at) |> Enum.max()
-
-      [final_carrier] =
-        Tightbeam.NoticeBatcher.recover(ctx.db, at,
-          conn_registry: ctx.registry,
-          lane_manager: ctx.lane
-        )
-
-      assert {:ok, final_turn} =
-               Ledger.claim_next(ctx.db, "holder", "restored-continuation-delivery")
-
-      assert final_turn.wake_id == final_carrier
-      assert covered?(ctx.db, "A")
-
-      assert :ok =
-               Ledger.finish(ctx.db, final_turn.seq, "delivered", nil,
-                 owner_lease: final_turn.owner_lease
-               )
-
-      refute covered?(ctx.db, "A")
-      assert controller_charges(ctx.db) == charges
-
-      assert Tightbeam.NoticeBatcher.recover(ctx.db, at,
-               conn_registry: ctx.registry,
-               lane_manager: ctx.lane
-             ) == []
-
-      assert_wait_history!(ctx.db, history)
-      assert {:ok, []} = DB.query(ctx.db, "PRAGMA foreign_key_check")
-    end
-  end
-
-  for change <- [:obligation, :verification, :lease, :write] do
-    test "continuation #{change} change refuses prewrite restoration atomically", ctx do
-      qualification_policy(ctx)
-      originating = running_turn(ctx.db, "holder")
-      source = register_wait(ctx.db, due_after(), predicate("R"))
-      assert %{assignment: _} = attest(ctx.db, "R", "resolver", "completion")
-      assignment(ctx.db, "B", "holder")
-      ordinary_wait_sibling!(ctx.db)
-
-      assert :ok =
-               Ledger.finish(ctx.db, originating.seq, "delivered", nil,
-                 owner_lease: originating.owner_lease
-               )
-
-      assert :ok = Wakes.fire_due(ctx.scheduler)
-      assert {:ok, turn} = Ledger.claim_next(ctx.db, "holder", "refusal-control")
-
-      case unquote(change) do
-        :obligation ->
-          revoke(ctx.db, "A")
-
-        :verification ->
-          revoke(ctx.db, "V")
-
-        :lease ->
-          :ok
-
-        :write ->
-          assert :ok = Ledger.stamp_adapter(ctx.db, turn.seq, 1)
-
-          assert :ok =
-                   Tightbeam.TurnLifecycle.append(ctx.db, turn.seq, %{
-                     event_key: "prompt:dispatched",
-                     producer_event_id: "wait:port-write",
-                     kind: "prompt_dispatched",
-                     stage: "prompt",
-                     outcome: "dispatched",
-                     cause: "acp:port-write",
-                     principal: "process:tightbeam",
-                     owner_lease: turn.owner_lease,
-                     adapter_gen: 1,
-                     acp_request_id: 1,
-                     detail: %{v: 1}
-                   })
-      end
-
-      before = restoration_snapshot(ctx.db)
-      evidence = wait_prewrite_evidence()
-      lease = if unquote(change) == :lease, do: "stale-lease", else: turn.owner_lease
-
-      assert {:error, _} =
-               DB.transaction(ctx.db, fn txn ->
-                 Ledger.finish_in_txn(txn, turn.seq, "failed", "prewrite refusal",
-                   owner_lease: lease,
-                   prewrite_evidence: evidence
-                 )
-
-                 Tightbeam.NoticeSubmission.restore_in_txn(txn, turn, evidence)
-               end)
-
-      assert restoration_snapshot(ctx.db) == before
-      assert Tightbeam.NoticeAuthority.current!(ctx.db, source.wake_id) == source.wake_id
-    end
-  end
-
-  test "C2-C3: one covered card cannot suppress another card's actual prod or watermark", ctx do
-    qualification_policy(ctx)
-    assignment(ctx.db, "B", "holder")
-    assignment(ctx.db, "C", "holder")
-
-    for id <- ~w(A B C) do
-      assert {:ok, :armed} =
-               DB.transaction(ctx.db, fn txn ->
-                 Supervision.transition_in_txn(txn, %{
-                   kind: "assignment_open",
-                   assignment_id: id,
-                   opened_at: 0,
-                   principal: "user:owner-a",
-                   supervision_interval_ms: 1
-                 })
-               end)
-    end
-
-    turn = running_turn(ctx.db, "holder")
-    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
-    register_wait(ctx.db, due_after(), predicate("R"))
-    handlers = Gateway.handlers(%{db: ctx.db, wake_tick_ms: 60_000})
-    assert {:prodded, 1} = Supervision.evaluate(ctx.db, handlers, 3, "holder", turn.seq)
-    assert %{prodCount: 1} = Supervision.prod_state(ctx.db, "B")
-    assert {:prodded, 1} = Supervision.evaluate(ctx.db, handlers, 3, "holder", turn.seq)
-    assert %{prodCount: 1} = Supervision.prod_state(ctx.db, "C")
-    assert {:ok, []} = DB.query(ctx.db, "SELECT 1 FROM assignment_prods WHERE assignmentId='A'")
-
-    assert {:ok, [["B"], ["C"]]} =
-             DB.query(
-               ctx.db,
-               "SELECT assignmentId FROM supervision_watermarks WHERE lastEvaluatedTerminal=?1 ORDER BY assignmentId",
-               [turn.seq]
-             )
-  end
-
   test "ancestor admission preserves the true creator and rechecks revoked lineage", ctx do
     session(ctx.db, "supervisor", "owner-a")
 
@@ -1654,9 +1187,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assert wake.session_key == "holder"
     assert wake.obligation_ref == "A"
     assert wake.originating_turn_seq == turn.seq
-    refute covered?(ctx.db, "A")
     assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
-    assert covered?(ctx.db, "A")
 
     # A rule installed after an earlier allowed decision must still be checked
     # inside registration. Evaluation must not execute notice/remedy effects.
@@ -1756,7 +1287,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
   end
 
   @tag tmp_dir: true
-  test "C5-C7,V1-V2: overlapping provisional waits pause one generation and challenge resumes its remainder",
+  test "overlapping provisional waits pause one generation and challenge resumes its remainder",
        %{tmp_dir: tmp} do
     Tightbeam.GuardRuntimeFixture.run!(tmp, "row_wait_relief_runtime.exs", "row-wait-relief: ok")
   end
@@ -1773,7 +1304,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
              end)
 
     register_wait(ctx.db, due_after(), predicate("R", "open"))
-    assert covered?(ctx.db, "A")
+    assert effort_relief_active?(ctx.db, "A")
 
     assert {:ok, [[nil, 0]]} =
              DB.query(
@@ -1802,20 +1333,12 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assert started == elected.created_at
   end
 
-  test "C6-C7: success, resolver termination, fallback and cancellation each end relief once",
+  test "success, resolver termination, fallback and cancellation each end relief once",
        ctx do
     qualification_policy(ctx)
 
     assert {:ok, _} =
              DB.transaction(ctx.db, fn txn ->
-               Supervision.transition_in_txn(txn, %{
-                 kind: "assignment_open",
-                 assignment_id: "A",
-                 opened_at: 0,
-                 principal: "user:owner-a",
-                 supervision_interval_ms: 60_000
-               })
-
                EffortCheckin.arm_in_txn(txn, %{base_dir: ctx.base}, %{
                  id: "A",
                  holderKey: "holder"
@@ -1856,9 +1379,20 @@ defmodule Tightbeam.RowDrivenWaitsTest do
           assert :ok = Wakes.fire_due(ctx.scheduler)
 
         "cancel" ->
+          opened_at = System.system_time(:millisecond)
+
+          assert {:ok, _} =
+                   DB.query(ctx.db, "UPDATE assignments SET openedAt=?2 WHERE id='A'", [opened_at])
+
+          assert {:ok, :ok} =
+                   DB.transaction(ctx.db, fn txn ->
+                     Supervision.assignment_opened_in_txn(txn, "A", opened_at, 60_000)
+                   end)
+
           assert {:ok, {:accepted_in_txn, _, %{canceled: true}}} =
                    DB.transaction(ctx.db, fn txn ->
-                     {:ok, trigger} = Supervision.liveness_trigger_in_txn(txn, {:assignment, "A"})
+                     {:ok, trigger} =
+                       Supervision.inactivity_deadline_trigger_in_txn(txn, {:assignment, "A"})
 
                      Wakes.cancel_in_txn(txn, %{
                        wake_id: wake.wake_id,
@@ -1904,14 +1438,14 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     end
   end
 
-  test "C8: failed and unknown continuation outcomes end coverage without answering work", ctx do
+  test "failed and unknown continuation outcomes end relief without answering work", ctx do
     qualification_policy(ctx)
 
     for status <- ~w(failed failed_unknown) do
       wake = register_wait(ctx.db, due_after(), predicate("R", "open"))
       assert :ok = Wakes.fire_due(ctx.scheduler)
       assert {:ok, turn} = Ledger.claim_next(ctx.db, "holder", "fixture")
-      assert covered?(ctx.db, "A")
+      assert effort_relief_active?(ctx.db, "A")
 
       assert [
                %{delivery_wake_id: carrier_id}
@@ -1931,7 +1465,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
                  owner_lease: turn.owner_lease
                )
 
-      refute covered?(ctx.db, "A")
+      refute effort_relief_active?(ctx.db, "A")
       assert {attest_count(ctx.db, "A"), supervision_counts(ctx.db, "A")} == before
 
       assert {:ok, [["open", nil]]} =
@@ -2049,39 +1583,8 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     end
   end
 
-  defp controller_charges(db) do
-    {:ok, rows} =
-      DB.query(
-        db,
-        "SELECT assignmentId,generation,prodCount FROM supervision_entitlements LEFT JOIN assignment_prods USING(assignmentId) ORDER BY assignmentId"
-      )
-
-    rows
-  end
-
-  defp restoration_snapshot(db) do
-    Map.new(
-      [
-        "turns",
-        "turn_lifecycle_events",
-        "wakes",
-        "wake_retry_attempts",
-        "supervision_liveness_sidecar",
-        "supervision_entitlements"
-      ],
-      fn table ->
-        {:ok, rows} = DB.query(db, "SELECT rowid,* FROM #{table} ORDER BY rowid")
-        {table, rows}
-      end
-    )
-  end
-
   defp qualification_policy(ctx, other \\ true) do
     File.write!(Path.join(ctx.base, "identity/rules/qualification.toml"), """
-    [[policy]]
-    name = "fixture-coverage"
-    purpose = "wait-prod-coverage"
-    when = [{fact="wait.coverage_valid",op="eq",value=true}]
     [[policy]]
     name = "fixture-relief"
     purpose = "wait-effort-relief"
@@ -2091,9 +1594,9 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     Rules.load!(ctx.base, ~w(wake attest))
   end
 
-  defp covered?(db, id) do
-    assert {:ok, covered} = DB.transaction(db, &Wakes.covering_continuation_in_txn?(&1, id))
-    covered
+  defp effort_relief_active?(db, id) do
+    assert {:ok, active} = DB.transaction(db, &Wakes.effort_relief_in_txn?(&1, id))
+    active
   end
 
   defp effort_snapshot(db) do
@@ -2143,17 +1646,6 @@ defmodule Tightbeam.RowDrivenWaitsTest do
   end
 
   defp cannot_proceed(db, release?) do
-    assert {:ok, :armed} =
-             DB.transaction(db, fn txn ->
-               Supervision.transition_in_txn(txn, %{
-                 kind: "assignment_open",
-                 assignment_id: "A",
-                 opened_at: 1,
-                 principal: "user:owner-a",
-                 supervision_interval_ms: 1_000
-               })
-             end)
-
     params = %{
       assignment_id: "A",
       kind: "cannot-proceed",
@@ -2259,19 +1751,18 @@ defmodule Tightbeam.RowDrivenWaitsTest do
   end
 
   defp supervision_counts(db, assignment_id) do
-    {:ok, [[prods, entitlements, sidecars]]} =
+    {:ok, [[entitlements, sidecars]]} =
       DB.query(
         db,
         """
         SELECT
-          (SELECT COUNT(*) FROM assignment_prods WHERE assignmentId=?1),
           (SELECT COUNT(*) FROM supervision_entitlements WHERE assignmentId=?1),
           (SELECT COUNT(*) FROM supervision_liveness_sidecar WHERE assignmentId=?1)
         """,
         [assignment_id]
       )
 
-    {prods, entitlements, sidecars}
+    {entitlements, sidecars}
   end
 
   defp session(db, key, owner) do

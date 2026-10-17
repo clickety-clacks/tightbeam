@@ -864,7 +864,7 @@ defmodule Tightbeam.EffortCheckin do
               decision_disposition_command(
                 txn,
                 winner,
-                liveness_trigger_in_txn!(txn, winner.assignment_id)
+                inactivity_deadline_trigger_in_txn!(txn, winner.assignment_id)
               )
             end
 
@@ -920,7 +920,7 @@ defmodule Tightbeam.EffortCheckin do
             decision_disposition_command(
               txn,
               ruled,
-              decision_liveness_trigger_in_txn(txn, ruled.assignment_id)
+              decision_inactivity_deadline_trigger_in_txn(txn, ruled.assignment_id)
             )
           )
 
@@ -1071,7 +1071,7 @@ defmodule Tightbeam.EffortCheckin do
               decision_disposition_command(
                 txn,
                 winner,
-                liveness_trigger_in_txn!(txn, winner.assignment_id)
+                inactivity_deadline_trigger_in_txn!(txn, winner.assignment_id)
               )
             end
 
@@ -1335,10 +1335,10 @@ defmodule Tightbeam.EffortCheckin do
 
   defp put_liveness_trigger(outcome, nil), do: outcome
 
-  defp decision_liveness_trigger_in_txn(txn, assignment_id) do
+  defp decision_inactivity_deadline_trigger_in_txn(txn, assignment_id) do
     primary = decision_liveness_primary_in_txn(txn, assignment_id)
 
-    case primary && Supervision.liveness_trigger_in_txn(txn, primary) do
+    case primary && Supervision.inactivity_deadline_trigger_in_txn(txn, primary) do
       nil -> nil
       {:ok, trigger} when is_map(trigger) -> trigger
       :none -> nil
@@ -1346,7 +1346,7 @@ defmodule Tightbeam.EffortCheckin do
     end
   end
 
-  defp liveness_trigger_in_txn!(txn, assignment_id) do
+  defp inactivity_deadline_trigger_in_txn!(txn, assignment_id) do
     primary = decision_liveness_primary_in_txn(txn, assignment_id)
 
     case primary do
@@ -1354,7 +1354,7 @@ defmodule Tightbeam.EffortCheckin do
         nil
 
       primary ->
-        fetch_liveness_trigger_in_txn!(txn, primary)
+        fetch_inactivity_deadline_trigger_in_txn!(txn, primary)
     end
   end
 
@@ -1382,8 +1382,8 @@ defmodule Tightbeam.EffortCheckin do
     end
   end
 
-  defp fetch_liveness_trigger_in_txn!(txn, primary) do
-    case Supervision.liveness_trigger_in_txn(txn, primary) do
+  defp fetch_inactivity_deadline_trigger_in_txn!(txn, primary) do
+    case Supervision.inactivity_deadline_trigger_in_txn(txn, primary) do
       {:ok, trigger} when is_map(trigger) -> trigger
       :none -> raise "#{inspect(primary)} has no liveness trigger"
       {:error, reason} -> raise "invalid liveness trigger: #{inspect(reason)}"

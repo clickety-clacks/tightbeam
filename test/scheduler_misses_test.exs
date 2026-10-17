@@ -20,7 +20,11 @@ defmodule Tightbeam.SchedulerMissesTest do
     import ExUnit.Assertions
     {:ok, _} = Application.ensure_all_started(:bandit)
     :ok = Tightbeam.SchedulerMisses.init()
-    assert Tightbeam.SchedulerMisses.health() == %{count: 0, by_loop: %{wake: 0, recognition: 0, bubble: 0, lanes: 0, supervision: 0}, recent: []}
+    assert Tightbeam.SchedulerMisses.health() == %{
+             count: 0,
+             by_loop: %{wake: 0, recognition: 0, bubble: 0, lanes: 0},
+             recent: []
+           }
     {:ok, server} = Bandit.start_link(plug: {Tightbeam.Wire.Router, [cli_token: "test"]}, port: 0, ip: {127, 0, 0, 1}, startup_log: false)
     {:ok, {_, port}} = ThousandIsland.listener_info(server)
     File.write!(Path.join(base, "gateway.json"), JSON.encode!(%{port: port, cliToken: "test"}))
@@ -46,7 +50,6 @@ defmodule Tightbeam.SchedulerMissesTest do
     Tightbeam.SchedulerMisses.record(:bubble, 42, 80_000)
     Tightbeam.SchedulerMisses.record(:lane_terminal, 43, 90_000)
     Tightbeam.SchedulerMisses.record(:lane, "lane")
-    Tightbeam.SchedulerMisses.record(:supervision, "terminal session=recipient", 70_000)
     health = JSON.decode!(doctor.(true))["event_paths"]
     assert health["byLoop"] == %{"wake" => 1, "recognition" => 1, "bubble" => 1, "lanes" => 2, "supervision" => 1}
     assert health["count"] == 6
