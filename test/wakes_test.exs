@@ -949,8 +949,8 @@ defmodule Tightbeam.WakesTest do
     db: db,
     scheduler: scheduler
   } do
-    main = ensure_main_session(db, "wake-owner")
-    sender = session(db, "wake-sender", main.session_key)
+    sender_session_key = "wake-sender"
+    active_sessions!(db, [sender_session_key])
 
     start_supervised!(
       {Wakes,
@@ -964,8 +964,8 @@ defmodule Tightbeam.WakesTest do
     wake =
       Wakes.schedule(db, %{
         session_key: "k1",
-        origin: "session:#{sender.session_key}",
-        creator_session_key: sender.session_key,
+        origin: "session:#{sender_session_key}",
+        creator_session_key: sender_session_key,
         consumer: "missing_consumer",
         due_at: System.system_time(:millisecond)
       })
@@ -1002,21 +1002,21 @@ defmodule Tightbeam.WakesTest do
              DB.query(
                db,
                "SELECT COUNT(*) FROM messages WHERE sessionKey=?1 AND clientMessageId=?2",
-               [sender.session_key, "wake-undeliverable:#{wake.wake_id}"]
+               [sender_session_key, "wake-undeliverable:#{wake.wake_id}"]
              )
   end
 
   test "undeliverable sender failure is stored before its cancellation transaction commits", %{
     db: db
   } do
-    main = ensure_main_session(db, "wake-owner")
-    sender = session(db, "wake-sender", main.session_key)
+    sender_session_key = "wake-sender"
+    active_sessions!(db, [sender_session_key])
 
     wake =
       Wakes.schedule(db, %{
         session_key: "missing-recipient",
-        origin: "session:#{sender.session_key}",
-        creator_session_key: sender.session_key,
+        origin: "session:#{sender_session_key}",
+        creator_session_key: sender_session_key,
         consumer: "missing_consumer",
         due_at: 0
       })
@@ -1035,7 +1035,7 @@ defmodule Tightbeam.WakesTest do
                assert Txn.q(
                         txn,
                         "SELECT COUNT(*) FROM messages WHERE sessionKey=?1 AND clientMessageId=?2",
-                        [sender.session_key, "wake-undeliverable:#{wake.wake_id}"]
+                        [sender_session_key, "wake-undeliverable:#{wake.wake_id}"]
                       ) == [[1]]
 
                result
