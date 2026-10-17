@@ -25,6 +25,7 @@ defmodule Tightbeam.Assignments do
   @completion_blocking_verdict_kinds ~w(blocked waiting)
   @completion_state_verdict_kinds @completion_blocking_verdict_kinds ++ ["cleared"]
   @review_conclusion_verdict_kinds ~w(reviewed-clean changes-requested)
+  @release_fact_match_predicate "releaseFactKind=?1 AND releaseFactScope=?2 AND releaseFactPrincipalRef=?3"
 
   defmodule TransitionRace do
     @moduledoc false
@@ -820,8 +821,7 @@ defmodule Tightbeam.Assignments do
         """
         SELECT id, assignmentId, decisionRequestId, decisionWakeId
         FROM assignment_cannot_proceed
-        WHERE state='standing' AND releaseFactKind=?1 AND releaseFactScope=?2
-          AND releaseFactPrincipalRef=?3
+        WHERE state='standing' AND #{@release_fact_match_predicate}
         ORDER BY createdAt, id
         """,
         [fact.kind, fact.scope, fact.origin]
@@ -2015,21 +2015,120 @@ defmodule Tightbeam.Assignments do
   defp assignment_get_result(db, call) do
     assignment_id = call.params[:assignment_id]
 
-    with :ok <- principal_allowed(call.principal, "assignment-get") do
+    with :ok <- principal_allowed(call.principal, "assignment-get"),
+         :ok <- valid_condition_fact_id(call.params[:fact_id]) do
       case DB.query(db, "SELECT #{columns()} FROM assignments WHERE id = ?1", [assignment_id]) do
         {:ok, [row]} ->
-          assignment(row)
-          |> Map.put(:reopenings, list_reopenings(db, assignment_id))
-          |> Map.put(
-            :commitRefCorrections,
-            Tightbeam.AssignmentCommitRefCorrections.list(db, assignment_id)
-          )
+          cannot_proceed = latest_cannot_proceed_for_assignment(db, assignment_id)
+
+          result =
+            assignment(row)
+            |> Map.put(:reopenings, list_reopenings(db, assignment_id))
+            |> Map.put(
+              :commitRefCorrections,
+              Tightbeam.AssignmentCommitRefCorrections.list(db, assignment_id)
+            )
+
+          result =
+            if is_map(cannot_proceed),
+              do: Map.put(result, :cannotProceed, cannot_proceed),
+              else: result
+
+          case call.params[:fact_id] do
+            nil ->
+              result
+
+            fact_id ->
+              Map.put(
+                result,
+                :releaseFactCheck,
+                release_fact_check(db, cannot_proceed, fact_id)
+              )
+          end
 
         {:ok, []} ->
           error("not_found", "unknown assignment: #{assignment_id}")
       end
     end
   end
+
+  defp latest_cannot_proceed_for_assignment(db, assignment_id) do
+    case DB.query(
+           db,
+           """
+           SELECT id, assignmentId, attestId, decisionRequestId, decisionWakeId, openerRef,
+                  disposerRef, reason,
+                  releaseFactKind, releaseFactScope, releaseFactPrincipalRef, state,
+                  createdAt, settledAt, settlementKind, settlementFactId, settledBy
+           FROM assignment_cannot_proceed
+           WHERE assignmentId=?1
+           ORDER BY createdAt DESC, id DESC
+           LIMIT 1
+           """,
+           [assignment_id]
+         ) do
+      {:ok, [row]} ->
+        row
+        |> cannot_proceed()
+        |> Map.take([
+          :id,
+          :assignmentId,
+          :decisionRequestId,
+          :releaseFactKind,
+          :releaseFactScope,
+          :releaseFactPrincipalRef,
+          :state,
+          :settledAt,
+          :settlementKind,
+          :settlementFactId,
+          :settledBy
+        ])
+
+      {:ok, []} ->
+        nil
+    end
+  end
+
+  defp release_fact_check(db, cannot_proceed, fact_id) do
+    fact = ConditionFacts.by_id(db, fact_id)
+
+    predicate_matches =
+      if is_map(cannot_proceed) and is_map(fact),
+        do: release_fact_predicate_matches?(db, cannot_proceed.id, fact),
+        else: nil
+
+    %{
+      exists: not is_nil(fact),
+      fact: fact,
+      matcherPredicate: predicate_matches,
+      eligible:
+        is_map(cannot_proceed) and cannot_proceed.state == "standing" and
+          predicate_matches == true
+    }
+  end
+
+  defp release_fact_predicate_matches?(db, condition_id, fact) do
+    {:ok, [[matches]]} =
+      DB.query(
+        db,
+        """
+        SELECT EXISTS(
+          SELECT 1 FROM assignment_cannot_proceed
+          WHERE id=?4 AND #{@release_fact_match_predicate}
+        )
+        """,
+        [fact.kind, fact.scope, fact.origin, condition_id]
+      )
+
+    matches == 1
+  end
+
+  defp valid_condition_fact_id(nil), do: :ok
+
+  defp valid_condition_fact_id(fact_id) when is_integer(fact_id) and fact_id > 0, do: :ok
+
+  defp valid_condition_fact_id(_fact_id),
+    do: error("invalid", "factId must be a positive integer")
 
   defp attests_result(db, call) do
     assignment_id = call.params[:assignment_id]

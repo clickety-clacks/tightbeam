@@ -6859,6 +6859,179 @@ defmodule Tightbeam.AssignmentsTest do
              DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE subject = 'committed'")
   end
 
+  test "assignment-get projects stored release tuple and exact fact matcher without effects",
+       ctx do
+    release_kind = "dependency-ready"
+    release_scope = "release-scope"
+    release_principal = "agent:holder"
+
+    file_fact = fn kind, scope, origin ->
+      {:ok, fact} =
+        DB.transaction(ctx.db, fn txn ->
+          ConditionFacts.file_in_txn(txn, %{kind: kind, scope: scope, origin: origin})
+        end)
+
+      fact
+    end
+
+    matching_before_request = file_fact.(release_kind, release_scope, release_principal)
+    wrong_kind = file_fact.("different-kind", release_scope, release_principal)
+    wrong_scope = file_fact.(release_kind, "different-scope", release_principal)
+    wrong_origin = file_fact.(release_kind, release_scope, "agent:other-session")
+
+    session(ctx.db, Org.personal_session_key("flynn"), "flynn")
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "inspect release condition"))
+
+    blocked =
+      attest_call({:session, "holder"}, assignment.id, "cannot-proceed")
+      |> put_in([:params, :note], "waiting for the release condition")
+      |> put_in([:params, :release_fact_kind], release_kind)
+      |> put_in([:params, :release_fact_scope], release_scope)
+      |> put_in([:params, :release_fact_principal_ref], release_principal)
+      |> then(&handle(ctx, "attest", &1))
+
+    cannot_proceed_id = blocked.cannotProceed.id
+    decision_request_id = blocked.cannotProceed.decisionRequestId
+
+    snapshot = fn ->
+      {:ok, cannot_proceed} =
+        DB.query(
+          ctx.db,
+          "SELECT * FROM assignment_cannot_proceed WHERE id=?1",
+          [cannot_proceed_id]
+        )
+
+      {:ok, request} =
+        DB.query(
+          ctx.db,
+          "SELECT * FROM decision_requests WHERE id=?1",
+          [decision_request_id]
+        )
+
+      {:ok, wakes} =
+        DB.query(
+          ctx.db,
+          "SELECT * FROM wakes WHERE assignmentId=?1 ORDER BY wakeId",
+          [assignment.id]
+        )
+
+      {:ok, assignment_row} =
+        DB.query(ctx.db, "SELECT * FROM assignments WHERE id=?1", [assignment.id])
+
+      {:ok, events} = DB.query(ctx.db, "SELECT * FROM events ORDER BY id")
+      {:ok, facts} = DB.query(ctx.db, "SELECT * FROM condition_facts ORDER BY id")
+      {:ok, attests} = DB.query(ctx.db, "SELECT * FROM attests ORDER BY id")
+
+      %{
+        cannotProceed: cannot_proceed,
+        decisionRequest: request,
+        assignment: assignment_row,
+        wakes: wakes,
+        events: events,
+        facts: facts,
+        attests: attests
+      }
+    end
+
+    before_reads = snapshot.()
+
+    for principal <- [{:session, "holder"}, {:user, "flynn"}] do
+      read =
+        assignment_get_call(principal, assignment.id)
+        |> put_in([:params, :fact_id], matching_before_request.fact_id)
+        |> then(&handle(ctx, "assignment-get", &1))
+
+      assert read.cannotProceed.decisionRequestId == decision_request_id
+      assert read.cannotProceed.releaseFactKind == release_kind
+      assert read.cannotProceed.releaseFactScope == release_scope
+      assert read.cannotProceed.releaseFactPrincipalRef == release_principal
+      assert read.cannotProceed.state == "standing"
+      assert read.cannotProceed.settledAt == nil
+
+      assert read.releaseFactCheck == %{
+               exists: true,
+               fact: %{
+                 id: matching_before_request.fact_id,
+                 ts: matching_before_request.ts,
+                 kind: release_kind,
+                 scope: release_scope,
+                 origin: release_principal
+               },
+               matcherPredicate: true,
+               eligible: true
+             }
+    end
+
+    for {fact, expected_kind, expected_scope, expected_origin} <- [
+          {wrong_kind, "different-kind", release_scope, release_principal},
+          {wrong_scope, release_kind, "different-scope", release_principal},
+          {wrong_origin, release_kind, release_scope, "agent:other-session"}
+        ] do
+      read =
+        assignment_get_call({:session, "holder"}, assignment.id)
+        |> put_in([:params, :fact_id], fact.fact_id)
+        |> then(&handle(ctx, "assignment-get", &1))
+
+      assert read.releaseFactCheck.fact == %{
+               id: fact.fact_id,
+               ts: fact.ts,
+               kind: expected_kind,
+               scope: expected_scope,
+               origin: expected_origin
+             }
+
+      assert read.releaseFactCheck.matcherPredicate == false
+      assert read.releaseFactCheck.eligible == false
+    end
+
+    missing_fact =
+      assignment_get_call({:session, "holder"}, assignment.id)
+      |> put_in([:params, :fact_id], 9_999_999)
+      |> then(&handle(ctx, "assignment-get", &1))
+
+    assert missing_fact.releaseFactCheck == %{
+             exists: false,
+             fact: nil,
+             matcherPredicate: nil,
+             eligible: false
+           }
+
+    assert snapshot.() == before_reads
+
+    assert %{code: "not_found"} =
+             handle(
+               ctx,
+               "assignment-get",
+               assignment_get_call({:session, "holder"}, "unknown-assignment")
+             )
+
+    assert %{code: "process_denied"} =
+             handle(
+               ctx,
+               "assignment-get",
+               assignment_get_call({:process, "worker"}, assignment.id)
+               |> put_in([:params, :fact_id], matching_before_request.fact_id)
+             )
+
+    assert snapshot.() == before_reads
+
+    settlement_fact = file_fact.(release_kind, release_scope, release_principal)
+    before_settled_reads = snapshot.()
+
+    settled =
+      assignment_get_call({:user, "flynn"}, assignment.id)
+      |> put_in([:params, :fact_id], settlement_fact.fact_id)
+      |> then(&handle(ctx, "assignment-get", &1))
+
+    assert settled.cannotProceed.state == "settled"
+    assert settled.cannotProceed.settlementKind == "release-fact"
+    assert settled.cannotProceed.settlementFactId == settlement_fact.fact_id
+    assert settled.cannotProceed.settledBy == release_principal
+    assert settled.releaseFactCheck.matcherPredicate == true
+    assert settled.releaseFactCheck.eligible == false
+    assert snapshot.() == before_settled_reads
+  end
+
   defp handle(ctx, verb, call)
        when verb in [
               "assign",
