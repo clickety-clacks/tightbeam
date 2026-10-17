@@ -861,7 +861,7 @@ defmodule Tightbeam.WorkItems do
                    AND (?3 IS NULL OR w.rowid>?3)
                ) ORDER BY wake_rowid LIMIT 100
                """,
-               [recipient_session_key, delivered_wake_id, after_wake_id]
+               [recipient_session_key, delivered_wake_id, after_rowid]
              )
 
            failures =
