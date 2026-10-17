@@ -1539,8 +1539,10 @@ defmodule Tightbeam.AssignmentsTest do
 
       before = accountable_disposition_snapshot(ctx.db)
       assert :appended = deliver_terminal_notice(ctx.db, stored)
+
       assert [[_seq, "notice-parent", "queued", _carrier_id]] =
                source_delivery_turns(ctx.db, wake.wake_id)
+
       assert accountable_disposition_snapshot(ctx.db) == before
     end
   end
