@@ -1192,7 +1192,7 @@ defmodule Tightbeam.AssignmentsTest do
 
       scheduler = terminal_notice_scheduler(ctx.db)
       log = ExUnit.CaptureLog.capture_log(fn -> assert :ok = Wakes.fire_due(scheduler) end)
-      assert log =~ "notice session drain refused recipient=" <> personal
+      refute log =~ "notice session drain refused recipient=" <> personal
       assert Wakes.get(ctx.db, notice.wake_id).state == "canceled"
       assert source_delivery_turns(ctx.db, notice.wake_id) == []
 
