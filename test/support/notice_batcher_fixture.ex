@@ -742,6 +742,7 @@ defmodule Tightbeam.NoticeBatcherFixture do
     assert_retired_tables_absent!(db)
     assert NoticeBatcher.recover(db, source.due_at) == []
     assert Wakes.get(db, source.wake_id).state == "canceled"
+
     assert {:ok, [["consumer_unavailable", "scheduler_delivery", "no_replacement"]]} =
              DB.query(
                db,
@@ -837,6 +838,7 @@ defmodule Tightbeam.NoticeBatcherFixture do
     assert NoticeBatcher.source_refs(db, overflow.wake_id) == []
     assert NoticeBatcher.recover(db, overflow.due_at) == []
     assert Wakes.get(db, overflow.wake_id).state == "canceled"
+
     assert {:ok, [["consumer_unavailable", "scheduler_delivery", "no_replacement"]]} =
              DB.query(
                db,

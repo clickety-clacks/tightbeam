@@ -207,5 +207,4 @@ defmodule Tightbeam.NoticeBatcherTest do
   } do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 46)
   end
-
 end
