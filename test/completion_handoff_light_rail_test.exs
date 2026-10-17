@@ -542,6 +542,37 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     assert reminder.session_key == "notice-parent"
   end
 
+  test "a malformed indexed candidate does not hide a later valid action", ctx do
+    {parent_assignment, child_assignment, root} = completed_child(ctx)
+    [source_kind, source_token] = terminal_source(root.prompt)
+
+    malformed =
+      "completion-handoff-action #{child_assignment.id} #{source_kind} #{source_token} " <>
+        "parked without the required colon and detail"
+
+    assert %{attest: %{kind: "progress"}} =
+             handle(
+               ctx,
+               "attest",
+               progress_call({:session, "notice-parent"}, parent_assignment.id, malformed)
+             )
+
+    valid = action_note(child_assignment.id, root, "retired", "retired the completed child")
+
+    assert %{attest: %{kind: "progress"}} =
+             handle(
+               ctx,
+               "attest",
+               progress_call({:session, "notice-parent"}, parent_assignment.id, valid)
+             )
+
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    root_carrier_id = assert_delivered_carrier(ctx.db, root.wake_id)
+    finish_carrier_turn!(ctx.db, root_carrier_id)
+
+    assert pending_reminders(ctx.db, root.wake_id) == []
+  end
+
   test "an action at the fallback boundary either stops the pending wake or cancels its successor",
        ctx do
     {parent_assignment, child_assignment, root} = completed_child(ctx)
