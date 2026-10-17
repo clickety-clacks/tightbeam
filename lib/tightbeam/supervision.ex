@@ -458,38 +458,43 @@ defmodule Tightbeam.Supervision do
              ]) do
           [[^origin_holder, "open", work_item_id]] ->
             case ladder_target(txn, origin_holder, rung) do
-              target when is_binary(target) and target not in visited ->
-                case next_notice_in_txn(
-                       txn,
-                       previous_wake_id,
-                       target,
-                       assignment_id,
-                       work_item_id,
-                       episode_ref,
-                       now
-                     ) do
-                  {:ok, notice_id} ->
-                    fire_internal_in_txn(txn, wake.wake_id, @climb_consumer, now)
+              target when is_binary(target) ->
+                if target in visited do
+                  fire_internal_in_txn(txn, wake.wake_id, @climb_consumer, now)
+                  :ok
+                else
+                  case next_notice_in_txn(
+                         txn,
+                         previous_wake_id,
+                         target,
+                         assignment_id,
+                         work_item_id,
+                         episode_ref,
+                         now
+                       ) do
+                    {:ok, notice_id} ->
+                      fire_internal_in_txn(txn, wake.wake_id, @climb_consumer, now)
 
-                    schedule_climb_in_txn(
-                      txn,
-                      assignment_id,
-                      origin_holder,
-                      work_item_id,
-                      episode_ref,
-                      rung + 1,
-                      interval_ms,
-                      notice_id,
-                      [target | visited],
-                      now + interval_ms
-                    )
+                      schedule_climb_in_txn(
+                        txn,
+                        assignment_id,
+                        origin_holder,
+                        work_item_id,
+                        episode_ref,
+                        rung + 1,
+                        interval_ms,
+                        notice_id,
+                        [target | visited],
+                        now + interval_ms
+                      )
 
-                    :ok
+                      :ok
 
-                  {:error, reason} ->
-                    Logger.warning("assignment notice climb deferred for #{assignment_id}: #{inspect(reason)}")
-                    fire_internal_in_txn(txn, wake.wake_id, @climb_consumer, now)
-                    :ok
+                    {:error, reason} ->
+                      Logger.warning("assignment notice climb deferred for #{assignment_id}: #{inspect(reason)}")
+                      fire_internal_in_txn(txn, wake.wake_id, @climb_consumer, now)
+                      :ok
+                  end
                 end
 
               _ ->
