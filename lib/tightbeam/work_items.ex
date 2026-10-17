@@ -866,8 +866,8 @@ defmodule Tightbeam.WorkItems do
 
            failures =
              Enum.reduce(rows, [], fn
-               [work_item_id, wake_id], failures
-               when is_binary(wake_id) and is_binary(work_item_id) ->
+               [work_item_id, wake_id, wake_rowid], failures
+               when is_binary(wake_id) and is_binary(work_item_id) and is_integer(wake_rowid) ->
                  :ok = Txn.exec(txn, "SAVEPOINT reconcile_work_item_bracket")
 
                  try do

@@ -1275,10 +1275,11 @@ defmodule Tightbeam.EffortCheckinTest do
     assert [prod] = Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == assigned.id))
     assert prod.state == "pending"
 
-    _ =
-      assignment(ctx, "revoke-assignment", {:session, "parent"}, nil, %{
-        assignment_id: assigned.id
-      })
+    assert %{state: "closed", outcome: "revoked"} =
+             assignment(ctx, "revoke-assignment", {:session, "parent"}, nil, %{
+               assignment_id: assigned.id,
+               reason: "dispose the assignment after its pending effort prompt"
+             })
 
     assert rows(ctx.db, "SELECT state FROM assignments WHERE id=?1", [assigned.id]) == [
              ["closed"]
