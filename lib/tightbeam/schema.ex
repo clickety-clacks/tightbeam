@@ -2577,6 +2577,7 @@ defmodule Tightbeam.Schema do
        ON lifecycle_events(subject, kind)
        """}
     ]
+
     case DB.migration_transaction(db, :lifecycle_runtime_indexes, [], [], fn txn ->
            Enum.each(indexes, fn {name, sql} ->
              started = System.monotonic_time(:millisecond)

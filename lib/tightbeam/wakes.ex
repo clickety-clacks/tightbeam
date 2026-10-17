@@ -628,11 +628,17 @@ defmodule Tightbeam.Wakes do
   @doc false
   @spec reconcile_delivered_sources(DB.server(), String.t() | nil, String.t() | nil) ::
           :ok | {:error, term()}
-  def reconcile_delivered_sources(db \\ DB, recipient_session_key \\ nil, delivered_wake_id \\ nil) do
+  def reconcile_delivered_sources(
+        db \\ DB,
+        recipient_session_key \\ nil,
+        delivered_wake_id \\ nil
+      ) do
     case DB.transaction(db, fn txn ->
            delivered_turn_seq =
              if is_binary(delivered_wake_id) do
-               case Txn.q(txn, "SELECT deliveredTurnSeq FROM wakes WHERE wakeId=?1", [delivered_wake_id]) do
+               case Txn.q(txn, "SELECT deliveredTurnSeq FROM wakes WHERE wakeId=?1", [
+                      delivered_wake_id
+                    ]) do
                  [[seq]] when is_integer(seq) -> seq
                  _ -> nil
                end
@@ -651,7 +657,12 @@ defmodule Tightbeam.Wakes do
                    OR substr(obligationRef,1,length(?4))=?4)
                ORDER BY deliveredTurnSeq,wakeId
                """,
-               [recipient_session_key, delivered_turn_seq, @terminal_notice_marker, @terminal_action_marker]
+               [
+                 recipient_session_key,
+                 delivered_turn_seq,
+                 @terminal_notice_marker,
+                 @terminal_action_marker
+               ]
              )
 
            delivery_failed =
@@ -680,9 +691,14 @@ defmodule Tightbeam.Wakes do
 
            :ok
          end) do
-      {:ok, :ok} -> :ok
+      {:ok, :ok} ->
+        :ok
+
       {:error, error} ->
-        Logger.warning("delivered notice source reconciliation deferred: #{Exception.message(error)}")
+        Logger.warning(
+          "delivered notice source reconciliation deferred: #{Exception.message(error)}"
+        )
+
         {:error, error}
     end
   end
@@ -727,7 +743,10 @@ defmodule Tightbeam.Wakes do
       error ->
         :ok = Txn.exec(txn, "ROLLBACK TO reconcile_notice_source")
         :ok = Txn.exec(txn, "RELEASE reconcile_notice_source")
-        Logger.warning("notice source action deferred for #{wake_id}: #{Exception.message(error)}")
+
+        Logger.warning(
+          "notice source action deferred for #{wake_id}: #{Exception.message(error)}"
+        )
     catch
       kind, reason ->
         :ok = Txn.exec(txn, "ROLLBACK TO reconcile_notice_source")
@@ -3767,7 +3786,8 @@ defmodule Tightbeam.Wakes do
   defp file_policy_skew(_txn, _wake), do: :ok
 
   @doc false
-  @spec readdress_pending_in_txn(Txn.t(), String.t(), String.t()) :: {:ok, wake()} | {:error, term()}
+  @spec readdress_pending_in_txn(Txn.t(), String.t(), String.t()) ::
+          {:ok, wake()} | {:error, term()}
   def readdress_pending_in_txn(%Txn{} = txn, wake_id, replacement_target)
       when is_binary(wake_id) and is_binary(replacement_target) do
     case Txn.q(
@@ -3966,7 +3986,8 @@ defmodule Tightbeam.Wakes do
   @reason_matrix %{
     "requester_withdrew" => {~w(verb_call), ~w(no_replacement)},
     "superseded" =>
-      {~w(wake progress_attest monitor_generation decision_request), ~w(replacement no_replacement)},
+      {~w(wake progress_attest monitor_generation decision_request),
+       ~w(replacement no_replacement)},
     "obligation_disposed" =>
       {~w(assignment_transition work_item_transition decision_request monitor_generation),
        ~w(disposition)},
@@ -4361,8 +4382,8 @@ defmodule Tightbeam.Wakes do
 
       requester_id == "tightbeam:supervision" ->
         if reason == "superseded" and source == "wake" and outcome == "replacement",
-           do: :ok,
-           else: :error
+          do: :ok,
+          else: :error
 
       true ->
         :ok
@@ -6105,7 +6126,7 @@ defmodule Tightbeam.Wakes do
                   undeliverable(db, wake, "unknown internal consumer #{inspect(consumer)}")
                   false
               end
-            end
+          end
 
         case {wake.consumer, delivery} do
           {_consumer, :deferred} ->
@@ -6463,14 +6484,23 @@ defmodule Tightbeam.Wakes do
   # retries it with an in-memory deadline rather than scanning it on a tick.
   defp attempt_internal_delivery(db, wake, internal_consumer) do
     case internal_consumer.(wake) do
-      {:error, reason} -> internal_delivery_failed(db, wake, inspect(reason))
-      {:ok, {:deferred, _reason}} -> :deferred
-      {:ok, :deferred} -> :deferred
-      result when result in [false, :retry] -> internal_delivery_failed(db, wake, inspect(result))
+      {:error, reason} ->
+        internal_delivery_failed(db, wake, inspect(reason))
+
+      {:ok, {:deferred, _reason}} ->
+        :deferred
+
+      {:ok, :deferred} ->
+        :deferred
+
+      result when result in [false, :retry] ->
+        internal_delivery_failed(db, wake, inspect(result))
+
       {:ok, result} when result in [false, :retry] ->
         internal_delivery_failed(db, wake, inspect(result))
 
-      _ -> true
+      _ ->
+        true
     end
   rescue
     error -> internal_delivery_failed(db, wake, Exception.message(error))

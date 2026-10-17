@@ -242,8 +242,11 @@ defmodule Tightbeam.Gateway do
     :ok = Wakes.activate_wait_recognition(db)
 
     case Supervision.migrate_open_assignments(db, supervision_interval_ms(config)) do
-      :ok -> :ok
-      {:error, error} -> Logger.error("assignment inactivity recovery deferred: #{Exception.message(error)}")
+      :ok ->
+        :ok
+
+      {:error, error} ->
+        Logger.error("assignment inactivity recovery deferred: #{Exception.message(error)}")
     end
 
     adapter_config = config |> Map.put(:cli_bin, cli_bin) |> Map.put(:db, db)
@@ -2380,15 +2383,23 @@ defmodule Tightbeam.Gateway do
     # in its own transaction; none of these source reads can veto the notice.
     if is_binary(opts[:wake_id]) do
       case Wakes.reconcile_delivered_sources(db, actual_session_key, opts[:wake_id]) do
-        :ok -> :ok
+        :ok ->
+          :ok
+
         {:error, error} ->
-          Logger.warning("wake source delivery reconciliation deferred: #{Exception.message(error)}")
+          Logger.warning(
+            "wake source delivery reconciliation deferred: #{Exception.message(error)}"
+          )
       end
 
       case WorkItems.reconcile_delivered_brackets(db, actual_session_key, opts[:wake_id]) do
-        :ok -> :ok
+        :ok ->
+          :ok
+
         {:error, error} ->
-          Logger.warning("work-item bracket delivery reconciliation deferred: #{Exception.message(error)}")
+          Logger.warning(
+            "work-item bracket delivery reconciliation deferred: #{Exception.message(error)}"
+          )
       end
     end
 

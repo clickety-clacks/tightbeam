@@ -157,9 +157,14 @@ defmodule Tightbeam.Productions.Bubble do
 
            :ok
          end) do
-      {:ok, :ok} -> :ok
+      {:ok, :ok} ->
+        :ok
+
       {:error, error} ->
-        Logger.warning("delivered bubble source reconciliation deferred: #{Exception.message(error)}")
+        Logger.warning(
+          "delivered bubble source reconciliation deferred: #{Exception.message(error)}"
+        )
+
         :ok
     end
   end

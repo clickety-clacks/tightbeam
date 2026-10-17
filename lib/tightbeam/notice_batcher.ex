@@ -248,22 +248,30 @@ defmodule Tightbeam.NoticeBatcher do
                "SELECT wakeId,sourceAttachments FROM wakes WHERE wakeId=?1 AND sourceAttachments IS NOT NULL",
                [wake_id]
              ) do
-          [[source_wake_id, encoded]] -> decode_source_attachments(source_wake_id, encoded)
-          [] -> []
+          [[source_wake_id, encoded]] ->
+            decode_source_attachments(source_wake_id, encoded)
+
+          [] ->
+            []
+
           rows ->
             Logger.warning(
               "notice attachments unavailable for carrier #{wake_id}: malformed source rows"
             )
+
             []
         end
 
       encoded_rows ->
         Enum.flat_map(encoded_rows, fn
-          [source_wake_id, encoded] -> decode_source_attachments(source_wake_id, encoded)
+          [source_wake_id, encoded] ->
+            decode_source_attachments(source_wake_id, encoded)
+
           _ ->
             Logger.warning(
               "notice attachments unavailable for carrier #{wake_id}: malformed source row"
             )
+
             []
         end)
     end
@@ -535,7 +543,9 @@ defmodule Tightbeam.NoticeBatcher do
         end
 
       case result do
-        :ok -> {:cont, :ok}
+        :ok ->
+          {:cont, :ok}
+
         {:error, reason} ->
           Logger.warning(
             "notice source #{source_wake_id} could not leave batch #{batch_id} for readdress: #{inspect(reason)}"

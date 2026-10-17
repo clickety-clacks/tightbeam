@@ -35,7 +35,8 @@ defmodule Tightbeam.SupervisionRecordedStateTest do
     db =
       start_supervised!(
         Supervisor.child_spec(
-          {DB, name: name, path: path, guard_inputs: [transition: transition], payload_root: payload},
+          {DB,
+           name: name, path: path, guard_inputs: [transition: transition], payload_root: payload},
           id: name
         )
       )

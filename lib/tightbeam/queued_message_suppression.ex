@@ -451,5 +451,4 @@ defmodule Tightbeam.QueuedMessageSuppression do
 
   defp decision_ref?(ref) when is_binary(ref), do: String.starts_with?(ref, "dr_")
   defp decision_ref?(_ref), do: false
-
 end

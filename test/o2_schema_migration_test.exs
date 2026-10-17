@@ -17,6 +17,7 @@ defmodule Tightbeam.O2SchemaMigrationTest do
     assert :ok = Schema.ensure_all(db)
     assert stamp(db) == "decision-request-row-schema-v2-019"
     seed_episode(db)
+
     columns =
       rows(db, "PRAGMA table_info(rail_remedy_episodes)")
       |> Enum.map(&Enum.at(&1, 1))
@@ -27,6 +28,7 @@ defmodule Tightbeam.O2SchemaMigrationTest do
     assert rows(db, "SELECT * FROM rail_remedy_episodes") == [
              ["fixture", "subject", "closed", nil, 1, 0, "claim", 1, nil]
            ]
+
     assert rows(db, "PRAGMA foreign_key_check") == []
     assert rows(db, "PRAGMA foreign_keys") == [[1]]
     assert_two_shapes(db)
@@ -271,6 +273,7 @@ defmodule Tightbeam.O2SchemaMigrationTest do
 
     assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
     assert stamp(db) == "row-driven-o2-pre-liveness-v1-019"
+
     columns =
       rows(db, "PRAGMA table_info(rail_remedy_episodes)")
       |> Enum.map(&Enum.at(&1, 1))
@@ -280,6 +283,7 @@ defmodule Tightbeam.O2SchemaMigrationTest do
     :ok = DB.execute(db, "DROP TRIGGER o2_test_refuse_activation")
     assert :ok = Schema.ensure_all(db)
     assert stamp(db) == "decision-request-row-schema-v2-019"
+
     columns =
       rows(db, "PRAGMA table_info(rail_remedy_episodes)")
       |> Enum.map(&Enum.at(&1, 1))

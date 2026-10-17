@@ -835,7 +835,9 @@ defmodule Tightbeam.WorkItems do
     case DB.transaction(db, fn txn ->
            delivered_turn_seq =
              if is_binary(delivered_wake_id) do
-               case Txn.q(txn, "SELECT deliveredTurnSeq FROM wakes WHERE wakeId=?1", [delivered_wake_id]) do
+               case Txn.q(txn, "SELECT deliveredTurnSeq FROM wakes WHERE wakeId=?1", [
+                      delivered_wake_id
+                    ]) do
                  [[seq]] when is_integer(seq) -> seq
                  _ -> nil
                end

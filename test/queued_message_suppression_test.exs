@@ -1136,5 +1136,4 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
 
     seq
   end
-
 end

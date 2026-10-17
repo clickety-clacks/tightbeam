@@ -65,7 +65,10 @@ defmodule Tightbeam.Supervision do
         :ok
       else
         _ ->
-          Logger.warning("assignment inactivity deadline unavailable for #{inspect(assignment_id)}")
+          Logger.warning(
+            "assignment inactivity deadline unavailable for #{inspect(assignment_id)}"
+          )
+
           :ok
       end
     end)
@@ -180,7 +183,9 @@ defmodule Tightbeam.Supervision do
 
            :ok
          end) do
-      {:ok, :ok} -> :ok
+      {:ok, :ok} ->
+        :ok
+
       {:error, error} ->
         Logger.error("assignment inactivity migration failed: #{Exception.message(error)}")
         {:error, error}
@@ -249,7 +254,10 @@ defmodule Tightbeam.Supervision do
     end
   rescue
     error ->
-      Logger.warning("assignment deadline unavailable for #{inspect(assignment_id)}: #{Exception.message(error)}")
+      Logger.warning(
+        "assignment deadline unavailable for #{inspect(assignment_id)}: #{Exception.message(error)}"
+      )
+
       :none
   end
 
@@ -264,7 +272,9 @@ defmodule Tightbeam.Supervision do
            """,
            [work_item_id]
          ) do
-      [[1]] -> {:ok, %{kind: "routing_bracket", id: work_item_id}}
+      [[1]] ->
+        {:ok, %{kind: "routing_bracket", id: work_item_id}}
+
       _ ->
         Txn.q(
           txn,
@@ -278,7 +288,10 @@ defmodule Tightbeam.Supervision do
     end
   rescue
     error ->
-      Logger.warning("work item deadline unavailable for #{inspect(work_item_id)}: #{Exception.message(error)}")
+      Logger.warning(
+        "work item deadline unavailable for #{inspect(work_item_id)}: #{Exception.message(error)}"
+      )
+
       :none
   end
 
@@ -305,7 +318,10 @@ defmodule Tightbeam.Supervision do
         nil
 
       other ->
-        Logger.warning("assignment notice holder session unreadable for #{inspect(holder_key)}: #{inspect(other)}")
+        Logger.warning(
+          "assignment notice holder session unreadable for #{inspect(holder_key)}: #{inspect(other)}"
+        )
+
         nil
     end
   rescue
@@ -491,7 +507,10 @@ defmodule Tightbeam.Supervision do
                       :ok
 
                     {:error, reason} ->
-                      Logger.warning("assignment notice climb deferred for #{assignment_id}: #{inspect(reason)}")
+                      Logger.warning(
+                        "assignment notice climb deferred for #{assignment_id}: #{inspect(reason)}"
+                      )
+
                       fire_internal_in_txn(txn, wake.wake_id, @climb_consumer, now)
                       :ok
                   end
@@ -515,7 +534,15 @@ defmodule Tightbeam.Supervision do
     end
   end
 
-  defp next_notice_in_txn(txn, previous_wake_id, target, assignment_id, work_item_id, episode_ref, now) do
+  defp next_notice_in_txn(
+         txn,
+         previous_wake_id,
+         target,
+         assignment_id,
+         work_item_id,
+         episode_ref,
+         now
+       ) do
     case Txn.q(
            txn,
            "SELECT state,deliveredTurnSeq,prompt FROM wakes WHERE wakeId=?1 AND consumer='prompt' AND assignmentId=?2 AND obligationRef=?3",
@@ -568,7 +595,10 @@ defmodule Tightbeam.Supervision do
         end
 
       [] ->
-        Logger.warning("assignment notice history missing for #{previous_wake_id}; stopping this climb")
+        Logger.warning(
+          "assignment notice history missing for #{previous_wake_id}; stopping this climb"
+        )
+
         {:error, :previous_notice_missing}
 
       _ ->
@@ -576,7 +606,14 @@ defmodule Tightbeam.Supervision do
     end
   end
 
-  defp schedule_deadline_in_txn(txn, assignment_id, holder, work_item_id, activity_at, interval_ms) do
+  defp schedule_deadline_in_txn(
+         txn,
+         assignment_id,
+         holder,
+         work_item_id,
+         activity_at,
+         interval_ms
+       ) do
     due_at = activity_at + interval_ms
 
     reusable_deadline_in_txn(
@@ -848,7 +885,10 @@ defmodule Tightbeam.Supervision do
     if is_integer(interval) do
       interval
     else
-      Logger.warning("assignment inactivity interval unavailable for #{assignment_id}; using default")
+      Logger.warning(
+        "assignment inactivity interval unavailable for #{assignment_id}; using default"
+      )
+
       @default_interval_ms
     end
   end
@@ -884,7 +924,8 @@ defmodule Tightbeam.Supervision do
     case Txn.q(txn, "SELECT MAX(ts) FROM assignment_reopenings WHERE assignmentId=?1", [
            assignment_id
          ]) do
-      [[at]] when is_integer(at) -> max(opened_at, at)
+      [[at]] when is_integer(at) ->
+        max(opened_at, at)
 
       [[nil]] ->
         opened_at
@@ -900,7 +941,8 @@ defmodule Tightbeam.Supervision do
 
   defp max_row(txn, sql, params) do
     case Txn.q(txn, sql, params) do
-      [[at]] when is_integer(at) -> at
+      [[at]] when is_integer(at) ->
+        at
 
       [[nil]] ->
         nil
@@ -914,10 +956,11 @@ defmodule Tightbeam.Supervision do
   defp interval_from_entitlement_in_txn(txn, assignment_id, default_interval_ms) do
     case Txn.q(
            txn,
-      "SELECT state,supervisionIntervalMs FROM supervision_entitlements WHERE assignmentId=?1",
+           "SELECT state,supervisionIntervalMs FROM supervision_entitlements WHERE assignmentId=?1",
            [assignment_id]
          ) do
-      [[state, interval]] when state in ["armed", "claimed"] and is_integer(interval) and interval > 0 ->
+      [[state, interval]]
+      when state in ["armed", "claimed"] and is_integer(interval) and interval > 0 ->
         interval
 
       [["terminus", nil]] ->
@@ -1005,7 +1048,10 @@ defmodule Tightbeam.Supervision do
     :ok
   rescue
     error ->
-      Logger.warning("legacy supervision controller migration deferred: #{Exception.message(error)}")
+      Logger.warning(
+        "legacy supervision controller migration deferred: #{Exception.message(error)}"
+      )
+
       :ok
   end
 
@@ -1036,10 +1082,10 @@ defmodule Tightbeam.Supervision do
 
   defp pending_deadline_wake_id(txn, assignment_id) do
     case Txn.q(
-      txn,
-      "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND consumer=?2 AND state='pending' ORDER BY dueAt,wakeId LIMIT 1",
-      [assignment_id, @deadline_consumer]
-    ) do
+           txn,
+           "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND consumer=?2 AND state='pending' ORDER BY dueAt,wakeId LIMIT 1",
+           [assignment_id, @deadline_consumer]
+         ) do
       [[wake_id]] when is_binary(wake_id) -> wake_id
       _ -> nil
     end
@@ -1055,7 +1101,11 @@ defmodule Tightbeam.Supervision do
   defp decode_payload(_wake, _consumer), do: {:error, :consumer_or_payload_mismatch}
 
   defp deadline_payload(
-         %{"assignmentId" => assignment_id, "intervalMs" => interval, "activityAt" => activity_at},
+         %{
+           "assignmentId" => assignment_id,
+           "intervalMs" => interval,
+           "activityAt" => activity_at
+         },
          wake
        )
        when is_binary(assignment_id) and is_integer(interval) and interval > 0 and
@@ -1084,11 +1134,12 @@ defmodule Tightbeam.Supervision do
               is_binary(previous_wake_id) and is_list(visited) do
     valid_visited? = Enum.all?(visited, &(is_binary(&1) and &1 != ""))
 
-    if assignment_id == wake.assignment_id and episode_ref == wake.obligation_ref and valid_visited?,
-      do:
-        {:ok, assignment_id, episode_ref, origin_holder, rung, interval, previous_wake_id,
-         Enum.uniq(visited)},
-      else: {:error, :climb_mismatch}
+    if assignment_id == wake.assignment_id and episode_ref == wake.obligation_ref and
+         valid_visited?,
+       do:
+         {:ok, assignment_id, episode_ref, origin_holder, rung, interval, previous_wake_id,
+          Enum.uniq(visited)},
+       else: {:error, :climb_mismatch}
   end
 
   defp climb_payload(_payload, _wake), do: {:error, :invalid_climb_fields}
@@ -1114,7 +1165,10 @@ defmodule Tightbeam.Supervision do
           Enum.reverse(acc)
 
         other ->
-          Logger.warning("assignment notice lineage unreadable for #{inspect(session_key)}: #{inspect(other)}")
+          Logger.warning(
+            "assignment notice lineage unreadable for #{inspect(session_key)}: #{inspect(other)}"
+          )
+
           Enum.reverse(acc)
       end
     end
@@ -1126,14 +1180,18 @@ defmodule Tightbeam.Supervision do
     key = Org.personal_session_key(owner)
 
     case query(db_or_txn, "SELECT 1 FROM sessions WHERE sessionKey=?1 AND state='active'", [key]) do
-      [[1]] -> key
+      [[1]] ->
+        key
 
       [] ->
         Logger.warning("assignment notice personal target unavailable for #{inspect(owner)}")
         nil
 
       other ->
-        Logger.warning("assignment notice personal target unreadable for #{inspect(owner)}: #{inspect(other)}")
+        Logger.warning(
+          "assignment notice personal target unreadable for #{inspect(owner)}: #{inspect(other)}"
+        )
+
         nil
     end
   end

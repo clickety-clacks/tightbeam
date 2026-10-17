@@ -110,6 +110,7 @@ defmodule Tightbeam.RailRemedyTest do
              )
 
     assert session_key == ctx.holder.session_key
+
     assert prompt ==
              "Coordinate independent review of assignment #{assignment.id}; preserve current evidence and direct staffing through its accountable owner."
 

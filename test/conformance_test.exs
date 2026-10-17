@@ -50,7 +50,7 @@ defmodule Tightbeam.ConformanceSupport do
     "dispatch-rule" => ~w(deny pass),
     "script-guard" => ~w(deny pass),
     "handler-refusal" => ~w(refuse pass),
-    "remedy" => ~w(run-remedy none escalate-halt escalate-open escalate-continue),
+    "remedy" => ~w(run-remedy none escalate-halt escalate-open escalate-continue)
   }
   @load_twins [
     ~w(remedy-target-missing remedy-target-present),
@@ -95,8 +95,7 @@ defmodule Tightbeam.ConformanceSupport do
     {"C6", "unbound-reviewer-remedy"} =>
       ~w(owner-main-fallback-refuses-loudly unknown-role-refuses-loudly bound-reviewer-dispatches unbound-is-legible),
     {"C6", "note-digest-exclusion"} =>
-      ~w(note-change-dedupes-same-action idempotency-key-change-dedupes material-change-gets-distinct-digest digest-dedupe-legible),
-
+      ~w(note-change-dedupes-same-action idempotency-key-change-dedupes material-change-gets-distinct-digest digest-dedupe-legible)
   }
 
   def corpus_root do
@@ -329,7 +328,6 @@ defmodule Tightbeam.ConformanceSupport do
       assert is_binary(get_in(call, ["params", "assignment_id"])),
              "#{path}: #{kind} case needs call.params.assignment_id"
     end
-
   end
 
   defp validate_world_row!("sessions", row, path) do
@@ -500,8 +498,6 @@ defmodule Tightbeam.ConformanceSupport do
 
       {"C6", _, "remedy-episode-idempotent"} ->
         run_remedy_episode_contract(fixture)
-
-
     end
   end
 

@@ -85,7 +85,10 @@ defmodule Tightbeam.RulesTest do
     }
 
     query = fn snapshot ->
-      DB.transaction(ctx.db, &Rules.select_policy_in_txn(&1, "wait-effort-relief", %{wait_facts: snapshot}))
+      DB.transaction(
+        ctx.db,
+        &Rules.select_policy_in_txn(&1, "wait-effort-relief", %{wait_facts: snapshot})
+      )
     end
 
     assert {:ok, {:ok, %{name: "justified-unresolved-dependency"}}} = query.(facts)
@@ -1487,6 +1490,7 @@ defmodule Tightbeam.RulesTest do
              )
 
     assert session_key == holder.session_key
+
     assert prompt ==
              "Coordinate independent review of assignment #{producer.id}; preserve current evidence and direct staffing through its accountable owner."
 

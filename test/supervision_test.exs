@@ -47,12 +47,12 @@ defmodule Tightbeam.SupervisionTest do
     assert {:ok, :ok} = Supervision.deadline(ctx.db, deadline)
 
     assert {:ok, [[notice_id, prompt, holder, episode_ref]]} =
-      DB.query(
-        ctx.db,
-        "SELECT wakeId,prompt,sessionKey,obligationRef FROM wakes " <>
-          "WHERE assignmentId='asg_inactive' AND consumer='prompt' " <>
-          "AND state='pending' AND obligationRef LIKE 'assignment-inactivity-episode-v1:%'"
-      )
+             DB.query(
+               ctx.db,
+               "SELECT wakeId,prompt,sessionKey,obligationRef FROM wakes " <>
+                 "WHERE assignmentId='asg_inactive' AND consumer='prompt' " <>
+                 "AND state='pending' AND obligationRef LIKE 'assignment-inactivity-episode-v1:%'"
+             )
 
     assert prompt =~ "asg_inactive"
     assert prompt =~ "ship it"
@@ -63,6 +63,7 @@ defmodule Tightbeam.SupervisionTest do
       Enum.find(Wakes.list_pending(ctx.db), &(&1.consumer == "assignment_inactivity_climb"))
 
     assert is_map(climb)
+
     assert {:ok, _} =
              DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1 AND state='pending'", [
                climb.wake_id
@@ -100,6 +101,7 @@ defmodule Tightbeam.SupervisionTest do
       Enum.find(Wakes.list_pending(ctx.db), &(&1.consumer == "assignment_inactivity_climb"))
 
     assert is_map(next_climb)
+
     assert {:ok, _} =
              DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1 AND state='pending'", [
                next_climb.wake_id
@@ -109,13 +111,13 @@ defmodule Tightbeam.SupervisionTest do
              Supervision.climb(ctx.db, Wakes.get(ctx.db, next_climb.wake_id))
 
     assert {:ok, [[successor_id, successor_prompt, main]]} =
-      DB.query(
-        ctx.db,
-        "SELECT wakeId,prompt,sessionKey FROM wakes " <>
-          "WHERE assignmentId='asg_inactive' AND consumer='prompt' " <>
-          "AND state='pending' AND obligationRef=?1",
-        [episode_ref]
-      )
+             DB.query(
+               ctx.db,
+               "SELECT wakeId,prompt,sessionKey FROM wakes " <>
+                 "WHERE assignmentId='asg_inactive' AND consumer='prompt' " <>
+                 "AND state='pending' AND obligationRef=?1",
+               [episode_ref]
+             )
 
     assert successor_id != notice_id
     assert successor_prompt == prompt
@@ -184,7 +186,11 @@ defmodule Tightbeam.SupervisionTest do
 
     assert {:ok, {:appended, _, _, _}} =
              DB.transaction(ctx.db, fn txn ->
-               Gateway.deliver_prompt_in_txn(txn, notice.session_key, notice.origin, notice.prompt,
+               Gateway.deliver_prompt_in_txn(
+                 txn,
+                 notice.session_key,
+                 notice.origin,
+                 notice.prompt,
                  wake_id: notice.wake_id,
                  fire_wake_in_txn: true
                )
@@ -201,6 +207,7 @@ defmodule Tightbeam.SupervisionTest do
       Enum.find(Wakes.list_pending(ctx.db), &(&1.consumer == "assignment_inactivity_climb"))
 
     assert is_map(climb)
+
     assert {:ok, _} =
              DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1 AND state='pending'", [
                climb.wake_id
@@ -230,12 +237,14 @@ defmodule Tightbeam.SupervisionTest do
     assert successor_holder == ctx.parent.session_key
   end
 
-  test "activity from an authenticated holder moves a pending deadline once at its event time", ctx do
+  test "activity from an authenticated holder moves a pending deadline once at its event time",
+       ctx do
     opened_at = System.system_time(:millisecond)
     interval_ms = 60_000
     open_deadline!(ctx.db, "asg_inactive", opened_at, interval_ms)
 
     event_at = System.system_time(:millisecond) + 10
+
     assert {:ok, :reset} =
              DB.transaction(ctx.db, fn txn ->
                Supervision.activity_in_txn(

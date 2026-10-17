@@ -1118,7 +1118,8 @@ defmodule Tightbeam.AssignmentsTest do
       assert Wakes.get(ctx.db, notice.wake_id) == notice
     end
 
-    test "a stored terminal notice still delivers after its assignment is reopened directly", ctx do
+    test "a stored terminal notice still delivers after its assignment is reopened directly",
+         ctx do
       {assignment, wake, _personal} = terminal_delivery_fixture(ctx, "completion")
 
       {:ok, _} =
@@ -1131,6 +1132,7 @@ defmodule Tightbeam.AssignmentsTest do
                Wakes.get(ctx.db, wake.wake_id)
 
       assert prompt == wake.prompt
+
       assert [[_seq, "notice-parent", "queued", carrier_id]] =
                source_delivery_turns(ctx.db, wake.wake_id)
 
@@ -1388,7 +1390,8 @@ defmodule Tightbeam.AssignmentsTest do
       end
     end
 
-    test "ordinary revocation stores a notice at Main when no accountable session is active", ctx do
+    test "ordinary revocation stores a notice at Main when no accountable session is active",
+         ctx do
       assignment = handle(ctx, "assign", terminal_notice_assign_call({:user, "flynn"}))
 
       assert %{state: "closed", outcome: "revoked"} =
@@ -1536,7 +1539,6 @@ defmodule Tightbeam.AssignmentsTest do
     end
   end
 
-
   defp revocation_notice_fixture(ctx) do
     session(ctx.db, "notice-parent", "flynn")
     personal = Org.personal_session_key("flynn")
@@ -1613,10 +1615,12 @@ defmodule Tightbeam.AssignmentsTest do
     assert wake.assignment_id == assignment_id
     assert wake.session_key == Org.personal_session_key("flynn")
     assert wake.obligation_ref == "terminal-child-owner-notification:" <> assignment_id
+
     assert {:ok, []} =
              DB.query(db, "SELECT wakeId FROM wake_cancellations WHERE wakeId=?1", [wake.wake_id])
 
     assert {:ok, []} = DB.query(db, "SELECT seq FROM turns WHERE wakeId=?1", [wake.wake_id])
+
     assert {:ok, []} =
              DB.query(
                db,
@@ -1634,13 +1638,15 @@ defmodule Tightbeam.AssignmentsTest do
     assert {:ok, []} = DB.query(db, "SELECT seq FROM turns WHERE wakeId=?1", [wake.wake_id])
 
     assert {:ok,
-            [[
-              "tightbeam:wake-scheduler",
-              "target_unresolvable",
-              "scheduler_delivery",
-              wake_id,
-              "no_replacement"
-            ]]} =
+            [
+              [
+                "tightbeam:wake-scheduler",
+                "target_unresolvable",
+                "scheduler_delivery",
+                wake_id,
+                "no_replacement"
+              ]
+            ]} =
              DB.query(
                db,
                "SELECT requesterId,reasonKind,causalSourceKind,causalSourceId,outcomeKind FROM wake_cancellations WHERE wakeId=?1",
