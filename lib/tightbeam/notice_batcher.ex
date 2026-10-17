@@ -1108,11 +1108,15 @@ defmodule Tightbeam.NoticeBatcher do
   defp update_source_lane_in_txn(txn, wake) do
     {address, scope} = recipient_lane(wake)
 
-    Txn.q(txn, "UPDATE wakes SET sourceVisibilityScope=?2,sourceAddress=?3 WHERE wakeId=?1", [
-      wake.wake_id,
-      scope,
-      address
-    ])
+    Txn.q(
+      txn,
+      "UPDATE wakes SET sourceVisibilityScope=COALESCE(sourceVisibilityScope,?2),sourceAddress=?3 WHERE wakeId=?1",
+      [
+        wake.wake_id,
+        scope,
+        address
+      ]
+    )
 
     :ok
   end
