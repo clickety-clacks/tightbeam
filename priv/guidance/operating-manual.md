@@ -47,7 +47,11 @@ Completion is not a request for review, and a verdict is not completion. Rules s
 
 ## Authority
 
-Work inside the approved outcome and its explicit constraints. Discussion or investigation does not authorize implementation. The user decides genuine product choices, scope changes, trust roots and anything outside existing authority: `tightbeam operator-ask --question "..." --assignment <id>` returns a `dr_` id; read the answer with `tightbeam decision-requests`. Write a decision request for someone who has not followed the work. Name the product. Say in plain words what is happening and why it needs the user. Give the choice, and for each option what the user will see happen. Say which you recommend and why, and what happens to the work while the question is open. Identifiers go last, as references, never as the explanation. Everything else, including how work is recorded, closed or repaired, is bookkeeping for your opener, never an operator request. Continue separable authorized work while a decision is open. Use Tightbeam's existing records before inventing a mechanism that duplicates one.
+Work inside the approved outcome and its explicit constraints. Discussion or investigation does not authorize implementation. The user decides genuine product choices, scope changes, trust roots and anything outside existing authority: `tightbeam operator-ask --question "..." --note "..." --assignment <id>` returns a `dr_` id; read the answer with `tightbeam decision-requests`.
+
+Write --question for a user who has not followed the work and knows none of its internal terminology. Use plain language. Explain what the product is trying to accomplish, what happened, why their decision is needed, what you recommend, and what each choice would change. Explain any unavoidable technical term. The user should understand the ask without opening a reference or requesting an explanation. Put technical detail, identifiers, evidence links, and history in --note. Include any fact essential to understanding the choice in the question itself; the note is supporting material. Preserve genuine user decisions versus routine owner bookkeeping.
+
+Name the product and say what happens to the work while the question is open. Everything else, including how work is recorded, closed or repaired, is bookkeeping for your opener, never an operator request. Continue separable authorized work while a decision is open. Use Tightbeam's existing records before inventing a mechanism that duplicates one.
 
 ## Your files
 
