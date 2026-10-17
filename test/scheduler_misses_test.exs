@@ -51,8 +51,8 @@ defmodule Tightbeam.SchedulerMissesTest do
     Tightbeam.SchedulerMisses.record(:lane_terminal, 43, 90_000)
     Tightbeam.SchedulerMisses.record(:lane, "lane")
     health = JSON.decode!(doctor.(true))["event_paths"]
-    assert health["byLoop"] == %{"wake" => 1, "recognition" => 1, "bubble" => 1, "lanes" => 2, "supervision" => 1}
-    assert health["count"] == 6
+    assert health["byLoop"] == %{"wake" => 1, "recognition" => 1, "bubble" => 1, "lanes" => 2}
+    assert health["count"] == 5
     assert doctor.(false) =~ "terminal session=recipient"
     IO.puts("event-path-doctor: ok")
     '''

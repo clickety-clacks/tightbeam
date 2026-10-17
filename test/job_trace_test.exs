@@ -46,15 +46,6 @@ defmodule Tightbeam.JobTraceTest do
         (id, subject, holderKey, openedBySession, openedAt, state, reviewsAssignmentId)
       VALUES ('asg_review', 'review', 'reviewer', 'reviewer', 4, 'open', 'asg_direct');
 
-      INSERT INTO supervision_entitlements
-        (assignmentId, generation, dueAt, state, lastAttemptGeneration, claimClock,
-         basisKind, basisId, terminusAt, cause, principal, supervisionIntervalMs)
-      VALUES
-        ('asg_direct', 1, 1000, 'armed', NULL, NULL, 'assignment_open',
-         'asg_direct', NULL, 'assignment_open', 'user:owner', 1000),
-        ('asg_bad', 1, 1000, 'armed', NULL, NULL, 'assignment_open',
-         'asg_bad', NULL, 'assignment_open', 'user:owner', 1000);
-
       INSERT INTO assignment_files (assignmentId, path)
       VALUES ('asg_direct', 'z.ex'), ('asg_direct', 'a.ex');
 
@@ -99,6 +90,19 @@ defmodule Tightbeam.JobTraceTest do
         ('dr_trace', 'statute', 'user:owner', 'owner', 'asg_direct', 100, 500,
          'trace-rule', 'trace-action', 'Choose', '{}', 'ruled', 'allow');
       """)
+
+    Enum.each([{"asg_direct", 2}, {"asg_bad", 3}, {"asg_review", 4}], fn
+      {assignment_id, opened_at} ->
+        assert {:ok, :ok} =
+                 DB.transaction(db, fn txn ->
+                   Tightbeam.Supervision.assignment_opened_in_txn(
+                     txn,
+                     assignment_id,
+                     opened_at,
+                     1_000
+                   )
+                 end)
+    end)
 
     %{db: db}
   end

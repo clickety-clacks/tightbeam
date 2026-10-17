@@ -2466,12 +2466,14 @@ defmodule Tightbeam.ConformanceTest do
     # artifact-backed-gate. The ten exact-mechanism skips are untouched.
     #
     # Legacy edge-controller fixtures are not part of the active contract set.
-    assert length(@fixtures) == 38
-    assert active_fixtures == 28
+    # The active fixture count includes one corpus entry for each of the ten
+    # paired load sets, in addition to the 38 ordinary fixtures.
+    assert length(@fixtures) == 48
+    assert active_fixtures == 38
     assert exact_skips == 10
-    assert activated_fixture_tests == 15
+    assert activated_fixture_tests == 25
     assert activated_class_tests == 3
-    assert activated_tests == 18
+    assert activated_tests == 28
     assert structured == 7
   end
 
@@ -2520,7 +2522,9 @@ defmodule Tightbeam.ConformanceTest do
     end)
 
     # C4/holder-verdict-wins remains one of the pending fixture annotations.
-    assert Enum.count(entries, &(&1.scope == "fixture")) == 25
+    # The ten load-set entries carry phase annotations alongside the ordinary
+    # fixture annotations.
+    assert Enum.count(entries, &(&1.scope == "fixture")) == 35
 
     assert %{
              scope: "case",
