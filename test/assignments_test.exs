@@ -3697,6 +3697,60 @@ defmodule Tightbeam.AssignmentsTest do
              )
   end
 
+  test "operator ruling refuses an open cannot-proceed request without side effects", ctx do
+    session(ctx.db, Org.personal_session_key("flynn"), "flynn")
+
+    assignment =
+      assign_call({:user, "flynn"}, "blocked card")
+      |> put_in([:params, :effect_kind], "coordination")
+      |> then(&handle(ctx, "assign", &1))
+
+    filed =
+      attest_call({:session, "holder"}, assignment.id, "cannot-proceed")
+      |> put_in([:params, :note], "awaiting the opener")
+      |> then(&handle(ctx, "attest", &1))
+
+    request_id = filed.decisionRequest.id
+    assert %{kind: "agent", status: "open", options: nil} = filed.decisionRequest
+
+    snapshot = fn ->
+      DB.query(
+        ctx.db,
+        """
+        SELECT status, decision, rationale, ruledBy, ruledViaPrincipal, ruledViaSessionKey,
+               ruledAt, rulingFactId, options,
+               (SELECT COUNT(*) FROM condition_facts),
+               (SELECT COUNT(*) FROM wakes),
+               (SELECT COUNT(*) FROM lifecycle_events)
+        FROM decision_requests WHERE id=?1
+        """,
+        [request_id]
+      )
+    end
+
+    before = snapshot.()
+
+    for params <- [%{decision: "resume"}, %{response: "resume the work"}] do
+      ruling =
+        call("operator-rule", {:user, "flynn"}, nil, Map.put(params, :request, request_id))
+        |> Map.put(:transport_session_key, "holder")
+
+      assert %{code: "invalid", message: "agent requests use answer or return"} =
+               Tightbeam.Escalation.operator_rule(ctx.db, ruling)
+
+      assert snapshot.() == before
+    end
+
+    assert {:ok, [["standing"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state FROM assignment_cannot_proceed WHERE assignmentId=?1",
+               [
+                 assignment.id
+               ]
+             )
+  end
+
   test "blocked and waiting verdicts refuse completion until explicitly cleared", ctx do
     for blocking_kind <- ["blocked", "waiting"] do
       assignment =
