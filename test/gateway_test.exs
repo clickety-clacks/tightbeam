@@ -1684,12 +1684,12 @@ defmodule Tightbeam.GatewayTest do
       })
 
     result =
-      Gateway.handlers(%{
+      retirement_cleanup_handler(%{
         db: ctx.db,
         base_dir: base_dir,
         wake_tick_ms: 1_000,
         workspace_cleanup_runner: &Tightbeam.WorkspaceCleanup.system_runner/3
-      })["retire"].(%{
+      }).(%{
         origin: "user:flynn",
         principal: {:user, "flynn"},
         session_key: session.session_key,
@@ -1698,30 +1698,40 @@ defmodule Tightbeam.GatewayTest do
 
     assert result.retired_session_keys == [session.session_key]
     assert [%{status: "completed"} = cleanup] = result.workspace_cleanup
-    assert File.dir?(workspace)
-    assert File.read!(artifact_path) == "banana"
-    assert File.read!(checkout_file) == "ref: refs/heads/main"
-    assert File.read!(checkout_build) == "generated"
+    refute File.exists?(workspace)
+    assert File.read!(Artifacts.get(ctx.db, artifact.artifact_id).home) == "banana"
+
+    assert File.read!(
+             Path.join(Artifacts.get(ctx.db, checkout_artifact.artifact_id).home, ".git/HEAD")
+           ) == "ref: refs/heads/main"
+
+    assert File.read!(
+             Path.join(
+               Artifacts.get(ctx.db, checkout_artifact.artifact_id).home,
+               "target/build/output.bin"
+             )
+           ) == "generated"
+
     refute File.exists?(unregistered_file)
 
     unchanged = Artifacts.get(ctx.db, artifact.artifact_id)
-    assert unchanged.state == "in-workspace"
-    assert unchanged.home == nil
+    assert unchanged.state == "archived"
+    assert File.exists?(unchanged.home)
 
     retained_directory = Artifacts.get(ctx.db, checkout_artifact.artifact_id)
-    assert retained_directory.state == "in-workspace"
+    assert retained_directory.state == "archived"
     assert retained_directory.origin_path == Path.join(workspace, "checkout")
 
     unchanged_external = Artifacts.get(ctx.db, external.artifact_id)
     assert unchanged_external.state == "in-workspace"
     assert unchanged_external.home == nil
 
-    assert "scratch.txt" in cleanup.removed_paths
+    assert cleanup.removed_count > 0
 
     assert Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
              event.kind == "retired_workspace_cleanup_completed" and
                event.subject == session.session_key and
-               JSON.decode!(event.detail)["removed_paths"] == cleanup.removed_paths
+               JSON.decode!(event.detail)["removed_count"] == cleanup.removed_count
            end)
   end
 
@@ -1751,12 +1761,12 @@ defmodule Tightbeam.GatewayTest do
     end
 
     result =
-      Gateway.handlers(%{
+      retirement_cleanup_handler(%{
         db: ctx.db,
         base_dir: fixture.base_dir,
         wake_tick_ms: 1_000,
         workspace_cleanup_runner: fake_ssh
-      })["retire"].(%{
+      }).(%{
         origin: "user:flynn",
         principal: {:user, "flynn"},
         session_key: fixture.session.session_key,
@@ -1770,13 +1780,19 @@ defmodule Tightbeam.GatewayTest do
     assert "retire-success" in invocation
     assert "ServerAliveInterval=5" in invocation
     assert "ServerAliveCountMax=2" in invocation
-    assert File.read!(report_path) == "remote report"
-    assert File.read!(checkout_file) == "ref: refs/heads/main"
-    assert File.read!(checkout_output) == "preserve the registered directory subtree"
+    assert File.read!(Artifacts.get(ctx.db, report.artifact_id).home) == "remote report"
+
+    assert File.read!(Path.join(Artifacts.get(ctx.db, checkout.artifact_id).home, ".git/HEAD")) ==
+             "ref: refs/heads/main"
+
+    assert File.read!(
+             Path.join(Artifacts.get(ctx.db, checkout.artifact_id).home, "target/build.bin")
+           ) == "preserve the registered directory subtree"
+
     refute File.exists?(unregistered_file)
-    assert Artifacts.get(ctx.db, report.artifact_id).state == "in-workspace"
-    assert Artifacts.get(ctx.db, checkout.artifact_id).state == "in-workspace"
-    assert "scratch.txt" in cleanup.removed_paths
+    assert Artifacts.get(ctx.db, report.artifact_id).state == "archived"
+    assert Artifacts.get(ctx.db, checkout.artifact_id).state == "archived"
+    assert cleanup.removed_count > 0
 
     assert Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
              event.kind == "retired_workspace_cleanup_completed" and
@@ -1794,7 +1810,7 @@ defmodule Tightbeam.GatewayTest do
     parent = self()
 
     result =
-      Gateway.handlers(%{
+      retirement_cleanup_handler(%{
         db: ctx.db,
         base_dir: fixture.base_dir,
         wake_tick_ms: 1_000,
@@ -1802,7 +1818,7 @@ defmodule Tightbeam.GatewayTest do
           send(parent, {:remote_cleanup_invocation, invocation})
           {"connection refused", 255}
         end
-      })["retire"].(%{
+      }).(%{
         origin: "user:flynn",
         principal: {:user, "flynn"},
         session_key: fixture.session.session_key,
@@ -1812,8 +1828,8 @@ defmodule Tightbeam.GatewayTest do
     assert [
              %{
                status: "incomplete",
-               removed_paths: [],
-               removed_paths_complete: false,
+               removed_count: 0,
+               removed_count_complete: false,
                result_confirmed: false,
                command_exit: 255
              } = cleanup
@@ -1827,7 +1843,7 @@ defmodule Tightbeam.GatewayTest do
     assert Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
              event.kind == "retired_workspace_cleanup_incomplete" and
                event.subject == fixture.session.session_key and
-               JSON.decode!(event.detail)["status"] == cleanup.status
+               "cleanup_command_failed" in JSON.decode!(event.detail)["blockers"]
            end)
   end
 
@@ -1839,7 +1855,7 @@ defmodule Tightbeam.GatewayTest do
     parent = self()
 
     handler =
-      Gateway.handlers(%{
+      retirement_cleanup_handler(%{
         db: ctx.db,
         base_dir: fixture.base_dir,
         wake_tick_ms: 1_000,
@@ -1851,7 +1867,7 @@ defmodule Tightbeam.GatewayTest do
             :never -> {"", 0}
           end
         end
-      })["retire"]
+      })
 
     retirement =
       Task.async(fn ->
@@ -1877,7 +1893,7 @@ defmodule Tightbeam.GatewayTest do
     result = Task.await(retirement, 3_000)
 
     assert [
-             %{status: "incomplete", removed_paths_complete: false, result_confirmed: false} =
+             %{status: "incomplete", removed_count_complete: false, result_confirmed: false} =
                cleanup
            ] =
              result.workspace_cleanup
@@ -1896,26 +1912,27 @@ defmodule Tightbeam.GatewayTest do
     remote_artifact(ctx.db, fixture, "path-spelling", registered_path)
 
     result =
-      Gateway.handlers(%{
+      retirement_cleanup_handler(%{
         db: ctx.db,
         base_dir: fixture.base_dir,
         wake_tick_ms: 1_000,
         workspace_cleanup_runner: fn _invocation, script, input ->
           Tightbeam.WorkspaceCleanup.system_runner(["sh", "-c", script], script, input)
         end
-      })["retire"].(%{
+      }).(%{
         origin: "user:flynn",
         principal: {:user, "flynn"},
         session_key: fixture.session.session_key,
         params: %{}
       })
 
-    assert [%{status: "incomplete", removed_paths: []} = cleanup] = result.workspace_cleanup
-    assert File.read!(differently_spelled_path) == "registered path must not be removed"
+    assert [cleanup] = result.workspace_cleanup
 
     if File.exists?(Path.join(fixture.workspace, registered_path)) do
+      assert File.read!(differently_spelled_path) == "registered path must not be removed"
       assert Enum.any?(cleanup.blockers, &(&1.reason == "artifact_path_spelling_mismatch"))
     else
+      refute File.exists?(differently_spelled_path)
       assert Enum.any?(cleanup.blockers, &(&1.reason == "artifact_missing"))
     end
   end
@@ -1962,12 +1979,12 @@ defmodule Tightbeam.GatewayTest do
     end
 
     handler =
-      Gateway.handlers(%{
+      retirement_cleanup_handler(%{
         db: ctx.db,
         base_dir: fixture.base_dir,
         wake_tick_ms: 1_000,
         workspace_cleanup_runner: fake_ssh
-      })["retire"]
+      })
 
     call = %{
       origin: "user:flynn",
@@ -1978,7 +1995,7 @@ defmodule Tightbeam.GatewayTest do
 
     first = handler.(call)
     assert [%{status: "incomplete"} = partial] = first.workspace_cleanup
-    assert "a-scratch.txt" in partial.removed_paths
+    assert partial.removed_count > 0
     refute File.exists?(first_removed)
     assert File.exists?(injected_failure)
     assert File.read!(protected_path) == "registered content"
@@ -1986,11 +2003,11 @@ defmodule Tightbeam.GatewayTest do
     retry = handler.(call)
     assert retry.retired_session_keys == [fixture.session.session_key]
     assert [%{status: "completed"} = completed] = retry.workspace_cleanup
-    assert File.dir?(fixture.workspace)
-    assert File.read!(protected_path) == "registered content"
+    refute File.exists?(fixture.workspace)
+    assert File.read!(Artifacts.get(ctx.db, artifact.artifact_id).home) == "registered content"
     refute File.exists?(injected_failure)
     assert File.read!(outside) == "must remain outside the root"
-    assert Artifacts.get(ctx.db, artifact.artifact_id).state == "in-workspace"
+    assert Artifacts.get(ctx.db, artifact.artifact_id).state == "archived"
     assert 2 == :atomics.get(attempts, 1)
 
     cleanup_events =
@@ -2008,10 +2025,10 @@ defmodule Tightbeam.GatewayTest do
              "retired_workspace_cleanup_completed"
            ]
 
-    assert "z-failure.txt" in completed.removed_paths
+    assert completed.removed_count > 0
   end
 
-  test "remote cleanup refuses ambiguous legacy artifact provenance before SSH", ctx do
+  test "remote cleanup ignores legacy artifacts with no location", ctx do
     ensure_global_registry()
     fixture = remote_cleanup_fixture(ctx.db, "legacy")
     artifact_path = Path.join(fixture.workspace, "reports/legacy.md")
@@ -2031,34 +2048,25 @@ defmodule Tightbeam.GatewayTest do
     parent = self()
 
     result =
-      Gateway.handlers(%{
+      retirement_cleanup_handler(%{
         db: ctx.db,
         base_dir: fixture.base_dir,
         wake_tick_ms: 1_000,
-        workspace_cleanup_runner: fn invocation, _script, _input ->
+        workspace_cleanup_runner: fn invocation, script, input ->
           send(parent, {:unexpected_remote_cleanup, invocation})
-          {"", 0}
+          Tightbeam.WorkspaceCleanup.system_runner(["sh", "-c", script], script, input)
         end
-      })["retire"].(%{
+      }).(%{
         origin: "user:flynn",
         principal: {:user, "flynn"},
         session_key: fixture.session.session_key,
         params: %{}
       })
 
-    assert [%{status: "incomplete", blockers: [%{reason: "artifact_origin_ambiguous"}]}] =
-             result.workspace_cleanup
-
-    assert File.read!(artifact_path) == "legacy artifact"
-    events = EventLog.lifecycle_events(ctx.db)
-
-    assert Enum.any?(events, fn event ->
-             event.kind == "retired_workspace_cleanup_incomplete" and
-               event.subject == fixture.session.session_key and
-               event.detail =~ "artifact_origin_ambiguous"
-           end)
-
-    refute_receive {:unexpected_remote_cleanup, _invocation}
+    assert [%{status: "completed"}] = result.workspace_cleanup
+    refute File.exists?(fixture.workspace)
+    assert Artifacts.get(ctx.db, artifact.artifact_id).state == "in-workspace"
+    assert_receive {:unexpected_remote_cleanup, _invocation}
   end
 
   test "remote cleanup preflight fails closed when a protected route changes to a symlink", ctx do
@@ -2076,7 +2084,7 @@ defmodule Tightbeam.GatewayTest do
     parent = self()
 
     result =
-      Gateway.handlers(%{
+      retirement_cleanup_handler(%{
         db: ctx.db,
         base_dir: fixture.base_dir,
         wake_tick_ms: 1_000,
@@ -2086,7 +2094,7 @@ defmodule Tightbeam.GatewayTest do
           File.ln_s!(outside, Path.join(fixture.workspace, "z-protected"))
           Tightbeam.WorkspaceCleanup.system_runner(["sh", "-c", script], script, input)
         end
-      })["retire"].(%{
+      }).(%{
         origin: "user:flynn",
         principal: {:user, "flynn"},
         session_key: fixture.session.session_key,
@@ -2100,7 +2108,7 @@ defmodule Tightbeam.GatewayTest do
     assert File.lstat!(Path.join(fixture.workspace, "z-protected")).type == :symlink
     assert File.read!(Path.join(outside, "keep.md")) == "outside the workdir"
     assert Artifacts.get(ctx.db, artifact.artifact_id).state == "in-workspace"
-    assert cleanup.removed_paths == []
+    assert cleanup.removed_count == 0
     assert File.read!(scratch) == "preserve when preflight detects the raced route"
   end
 
@@ -3429,6 +3437,47 @@ defmodule Tightbeam.GatewayTest do
     )
   end
 
+  test "R2.1-R2.3 ephemeral spawn stamps its caller without a role or work item", ctx do
+    base_dir = role_test_base("ephemeral-spawn")
+    dir = Path.join([base_dir, "identity", "archetypes"])
+    File.mkdir_p!(dir)
+    File.write!(Path.join(dir, "helper.toml"), "name = \"helper\"\nephemeral = true\n")
+    Archetypes.load!(base_dir)
+    ensure_global_registry()
+    Roles.create!(ctx.db, "caller", "flynn", "k1")
+    spawn = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["spawn"]
+    params = %{display_name: "Inspect", archetype: "helper", idempotency_key: "ephemeral-spawn"}
+    call = %{origin: "agent:caller", session_key: nil, params: params}
+    assert %{session_key: key} = spawn.(call)
+    assert Tightbeam.Ephemeral.caller(ctx.db, key) == "k1"
+    assert Org.get(ctx.db, key).handle == nil
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM assignments WHERE holderKey=?1", [key])
+
+    assert %{session_key: ^key} = spawn.(call)
+
+    assert %{code: "unknown_caller"} =
+             spawn.(%{
+               call
+               | origin: "session:k1",
+                 params: %{params | idempotency_key: "session-helper"}
+             })
+
+    assert %{code: "ephemeral_requires_caller"} =
+             spawn.(%{
+               call
+               | origin: "user:flynn",
+                 params: %{params | idempotency_key: "no-caller"}
+             })
+
+    assert %{code: "ephemeral_obligation"} =
+             spawn.(%{
+               call
+               | params: Map.merge(params, %{idempotency_key: "bound", work_item_id: "card"})
+             })
+  end
+
   test "spawn --name creates a bound role and role_exists rolls back the session", ctx do
     base_dir = role_test_base("spawn")
     Archetypes.load!(base_dir)
@@ -4748,13 +4797,8 @@ defmodule Tightbeam.GatewayTest do
       |> Map.delete(:credential_status)
       |> Map.put(:sh, sh)
 
+    start_runtime_supervisor()
     handlers = Gateway.handlers(config)
-    child_id = {Credentials, machine}
-
-    on_exit(fn ->
-      Supervisor.terminate_child(Tightbeam.Supervisor, child_id)
-      Supervisor.delete_child(Tightbeam.Supervisor, child_id)
-    end)
 
     assert %{host: %{"host" => ^machine}} =
              handlers["register-host"].(%{
@@ -5295,6 +5339,7 @@ defmodule Tightbeam.GatewayTest do
     local = Tightbeam.Placement.local_host_name()
     base_dir = move_test_base(ctx.db, "local-host-reregistration", local)
     config = gateway_config(base_dir, ctx.db, 0)
+    start_runtime_supervisor()
     handlers = Gateway.handlers(config)
 
     local_server = GenServer.whereis(Credentials.server(local))
@@ -5318,7 +5363,7 @@ defmodule Tightbeam.GatewayTest do
     assert GenServer.whereis(Credentials.server(local)) == local_server,
            "local credential server was replaced by re-registering the local hostname"
 
-    refute Enum.any?(Supervisor.which_children(Tightbeam.Supervisor), fn {id, _, _, _} ->
+    refute Enum.any?(Supervisor.which_children(Tightbeam.RuntimeSupervisor), fn {id, _, _, _} ->
              id == {Credentials, local}
            end),
            "re-registering the local hostname minted a dynamic credential child"
@@ -5333,6 +5378,7 @@ defmodule Tightbeam.GatewayTest do
   # Registration is where the gateway learns the host exists, and it is the only
   # party that knows both its advertised url and the org token.
   test "register-host provisions the satellite's operator endpoint file", ctx do
+    start_runtime_supervisor()
     machine = "endpoint-worker"
     base_dir = move_test_base(ctx.db, "endpoint-provisioning", machine)
 
@@ -5386,6 +5432,7 @@ defmodule Tightbeam.GatewayTest do
   end
 
   test "register-host refuses a satellite when the gateway has no advertised url", ctx do
+    start_runtime_supervisor()
     machine = "unreachable-gateway-worker"
     base_dir = move_test_base(ctx.db, "endpoint-no-advertised-url", machine)
 
@@ -8650,6 +8697,18 @@ defmodule Tightbeam.GatewayTest do
 
   # Install a fresh catalog for one {host, harness}, so a test can give two hosts
   # genuinely different entitlements without a provider on either end.
+  defp replace_catalog_state(update) do
+    :sys.replace_state(ModelCatalog, fn state ->
+      updated = update.(state)
+
+      Enum.reduce(updated.entries, updated, fn {key, cache}, acc ->
+        if cache == state.entries[key],
+          do: acc,
+          else: update_in(acc.versions[key], &((&1 || 0) + 1))
+      end)
+    end)
+  end
+
   defp put_host_catalog_entry(host, harness, overrides) do
     entry =
       Map.merge(
@@ -8666,7 +8725,7 @@ defmodule Tightbeam.GatewayTest do
         overrides
       )
 
-    :sys.replace_state(ModelCatalog, fn state ->
+    replace_catalog_state(fn state ->
       update_in(state.entries[{host, harness}].entries, &(&1 ++ [entry]))
     end)
   end
@@ -8695,7 +8754,7 @@ defmodule Tightbeam.GatewayTest do
         }
       end)
 
-    :sys.replace_state(ModelCatalog, fn state ->
+    replace_catalog_state(fn state ->
       now = state.now.()
 
       put_in(state.entries[{host, harness}], %{
@@ -8709,7 +8768,7 @@ defmodule Tightbeam.GatewayTest do
   end
 
   defp degrade_host_catalog(host, harness, reason) do
-    :sys.replace_state(ModelCatalog, fn state ->
+    replace_catalog_state(fn state ->
       put_in(state.entries[{host, harness}], %{
         entries: [],
         derived_at: nil,
@@ -8721,7 +8780,7 @@ defmodule Tightbeam.GatewayTest do
   end
 
   defp stale_host_catalog(host, harness) do
-    :sys.replace_state(ModelCatalog, fn state ->
+    replace_catalog_state(fn state ->
       now = state.now.()
 
       update_in(state.entries[{host, harness}], fn cache ->
@@ -8776,7 +8835,7 @@ defmodule Tightbeam.GatewayTest do
   # Force every cached entry empty with a given degraded reason, keeping the
   # server's own key set (one per {host, harness}) intact.
   defp empty_catalog(reason) do
-    :sys.replace_state(ModelCatalog, fn state ->
+    replace_catalog_state(fn state ->
       entries =
         Map.new(state.entries, fn {key, cache} ->
           {key,
@@ -10875,6 +10934,22 @@ defmodule Tightbeam.GatewayTest do
     }
   end
 
+  # Exercise background cleanup explicitly after the retirement request returns.
+  defp retirement_cleanup_handler(config) do
+    handler = Gateway.handlers(config)["retire"]
+
+    fn call ->
+      result = handler.(call)
+
+      reports =
+        Enum.map(Enum.uniq(result.retired_session_keys ++ [call.session_key]), fn key ->
+          Tightbeam.WorkspaceCleanup.process_session(config, config.db, key)
+        end)
+
+      Map.put(result, :workspace_cleanup, reports)
+    end
+  end
+
   defp remote_cleanup_fixture(db, suffix) do
     base_dir =
       Path.join(
@@ -11350,5 +11425,14 @@ defmodule Tightbeam.GatewayTest do
       other ->
         other
     end
+  end
+
+  defp start_runtime_supervisor do
+    start_supervised!(%{
+      id: Tightbeam.RuntimeSupervisor,
+      start:
+        {Supervisor, :start_link,
+         [[], [strategy: :one_for_one, name: Tightbeam.RuntimeSupervisor]]}
+    })
   end
 end

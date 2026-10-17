@@ -99,9 +99,9 @@ end
 
 # Configure only this synthetic application's canonical producer destination.
 db_owner = Process.whereis(DB)
-:ok = Supervisor.terminate_child(Tightbeam.Supervisor, Hub)
-:ok = Supervisor.delete_child(Tightbeam.Supervisor, Hub)
-{:ok, hub} = Supervisor.start_child(Tightbeam.Supervisor, {Hub, name: Hub, queue_limit: 2})
+:ok = Supervisor.terminate_child(Tightbeam.RuntimeSupervisor, Hub)
+:ok = Supervisor.delete_child(Tightbeam.RuntimeSupervisor, Hub)
+{:ok, hub} = Supervisor.start_child(Tightbeam.RuntimeSupervisor, {Hub, name: Hub, queue_limit: 2})
 ^db_owner = Process.whereis(DB)
 :ok = DB.assert_base_admitted!(DB, base)
 %{"cliToken" => token} = base |> Path.join("gateway.json") |> File.read!() |> JSON.decode!()

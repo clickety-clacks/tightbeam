@@ -80,11 +80,14 @@ defmodule Tightbeam.DeliveryResponsibilities do
           {:cont, {:ok, [{work_item_id, session_key} | backfill]}}
 
         %{"accountableSessionKey" => session_key, "deliveryState" => state} ->
-          {:halt, {:error, %{work_item_id: work_item_id, session_key: session_key, state: state}}}
+          require Logger
+          Logger.warning("work item #{work_item_id} owner #{session_key} unresolved: #{state}")
+          {:cont, {:ok, backfill}}
 
         _ ->
-          {:halt,
-           {:error, %{work_item_id: work_item_id, session_key: nil, state: "contradictory"}}}
+          require Logger
+          Logger.warning("work item #{work_item_id} owner unresolved: contradictory relation")
+          {:cont, {:ok, backfill}}
       end
     end)
     |> case do

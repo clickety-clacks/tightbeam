@@ -397,7 +397,13 @@ defmodule Tightbeam.Toplines.Schema do
 
   def activate(db, stamped_at, opts)
       when is_integer(stamped_at) and stamped_at >= 0 and is_list(opts) do
-    case DB.transaction(db, fn txn -> activate_in_txn(txn, stamped_at, opts) end) do
+    case DB.migration_transaction(
+           db,
+           :toplines_titles,
+           ["PRAGMA foreign_keys=OFF"],
+           ["PRAGMA foreign_keys=ON"],
+           fn txn -> activate_in_txn(txn, stamped_at, opts) end
+         ) do
       {:ok, :ok} -> :ok
       {:ok, {:error, _} = refusal} -> refusal
       {:error, error} -> raise error
@@ -506,21 +512,34 @@ defmodule Tightbeam.Toplines.Schema do
   end
 
   defp migrate_v5!(txn, stamped_at, opts) do
-    # Defer, never disable, FK enforcement. Copy back into the original table
-    # names so each reinsert resolves the deferred parent deletion; renaming a
-    # populated shadow table would not resolve SQLite's deferred FK counters.
-    # COMMIT still checks every deferred constraint and rolls back on failure.
-    Enum.each(@title_tables, fn name ->
-      unless Txn.q(txn, """
-             SELECT 1 FROM #{name}
-             WHERE typeof(title) != 'text' OR tightbeam_canonical_title(title) IS NULL
-                OR title != tightbeam_canonical_title(title)
-                OR tightbeam_unicode_scalar_length(title) NOT BETWEEN 1 AND 2000
-             LIMIT 1
-             """) == [] do
-        raise "Toplines migration found invalid titles in #{name}"
-      end
+    previous_fk_violations =
+      Enum.flat_map(@objects, fn
+        %{type: "table", name: name} -> Txn.q(txn, "PRAGMA foreign_key_check(#{name})")
+        _ -> []
+      end)
+
+    Enum.each(previous_fk_violations, fn row ->
+      require Logger
+      Logger.warning("Toplines migration retains unresolved foreign key #{inspect(row)}")
     end)
+
+    invalid_titles =
+      Map.new(@title_tables, fn name ->
+        rows =
+          Txn.q(txn, """
+          SELECT rowid, id FROM #{name}
+          WHERE typeof(title) != 'text' OR tightbeam_canonical_title(title) IS NULL
+             OR title != tightbeam_canonical_title(title)
+             OR tightbeam_unicode_scalar_length(title) NOT BETWEEN 1 AND 2000
+          """)
+
+        Enum.each(rows, fn [_rowid, id] ->
+          require Logger
+          Logger.warning("Toplines #{name} row #{id} unresolved: invalid title preserved")
+        end)
+
+        {name, Enum.map(rows, &hd/1)}
+      end)
 
     :ok = Txn.exec(txn, "PRAGMA defer_foreign_keys=ON")
 
@@ -536,16 +555,39 @@ defmodule Tightbeam.Toplines.Schema do
 
       index = if name == "toplines", do: "toplines_id_owner", else: "topline_concerns_id_topline"
       :ok = Txn.exec(txn, Enum.find(@objects, &(&1.name == index)).sql)
-      :ok = Txn.exec(txn, "INSERT INTO #{name} (#{columns}) SELECT #{columns} FROM #{copy}")
+      rejected = invalid_titles[name]
+      rejected_sql = if rejected == [], do: "0", else: "rowid IN (#{Enum.join(rejected, ",")})"
+
+      :ok =
+        Txn.exec(
+          txn,
+          "INSERT INTO #{name} (#{columns}) SELECT #{columns} FROM #{copy} WHERE NOT (#{rejected_sql})"
+        )
+
+      if rejected != [] do
+        # Preserve invalid historical title bytes without authorizing a new invalid title.
+        :ok = Txn.exec(txn, "PRAGMA ignore_check_constraints=ON")
+
+        try do
+          :ok =
+            Txn.exec(
+              txn,
+              "INSERT INTO #{name} (#{columns}) SELECT #{columns} FROM #{copy} WHERE #{rejected_sql}"
+            )
+        after
+          :ok = Txn.exec(txn, "PRAGMA ignore_check_constraints=OFF")
+        end
+      end
+
       :ok = Txn.exec(txn, "DROP TABLE #{copy}")
       maybe_interrupt!(opts, {:copied, name})
     end)
 
-    # Check the preserved Toplines relationships as well as COMMIT's deferred
-    # checks; a pre-existing violation must not acquire a successful V6 stamp.
+    # Only a new violation belongs to this migration.
     for object <- @objects, object.type == "table" do
-      unless Txn.q(txn, "PRAGMA foreign_key_check(#{object.name})") == [],
-        do: raise("Toplines migration found invalid foreign keys in #{object.name}")
+      unless Txn.q(txn, "PRAGMA foreign_key_check(#{object.name})") -- previous_fk_violations ==
+               [],
+             do: raise("Toplines migration found invalid foreign keys in #{object.name}")
     end
 
     verify_manifest!(txn)

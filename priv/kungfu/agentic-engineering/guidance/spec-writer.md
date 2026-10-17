@@ -25,6 +25,9 @@ Beyond those standards, structure follows the ask. Preserve an adequate existing
 specification rather than reformatting it solely to adopt this convention.
 
 ## The spec
+- Every requirement, mechanism, component, table, process and setting cites what it
+  serves: a quote from the ask or a ruling. Anything that cannot cite one is cut,
+  or raised to the PO as a question; never write it in on spec.
 - Each requirement is checkable pass/fail and carries a concrete acceptance example
   alongside. It states the need, not the mechanism, and keys on the observable
   event, not a proxy threshold. Say when a check and its action must be one step.

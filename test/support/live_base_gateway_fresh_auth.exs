@@ -46,7 +46,7 @@ Tightbeam.GuardGatewayFixture.run!(fn %{base: base, db: db, config: config} ->
     )
 
   try do
-    :sys.replace_state(catalog, fn state ->
+    Tightbeam.GuardGatewayFixture.seed_catalog!(catalog, fn state ->
       hosts = %{"testhost" => %{base_dir: base, ssh: nil}}
 
       entries =

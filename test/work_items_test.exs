@@ -101,6 +101,8 @@ defmodule Tightbeam.WorkItemsTest do
          deliver: fn wake -> send(parent, {:timer_delivered, wake.wake_id}) end}
       )
 
+    :sys.get_state(scheduler)
+
     wake =
       Wakes.schedule(ctx.db, %{
         session_key: ctx.holder.session_key,
@@ -911,8 +913,8 @@ defmodule Tightbeam.WorkItemsTest do
     refute get_payload =~ "bodyUpdatedByUser"
     refute get_payload =~ "bodyUpdatedBySession"
     refute get_payload =~ "bodyUpdatedAt"
-    assert get_payload =~ "bodyRead"
-    assert get_payload =~ descriptor.sha256
+    # Read audits now retain only identity and verb, without result descriptors.
+    assert get_payload == "null"
   end
 
   test "body updates remain serialized under concurrent writers", ctx do

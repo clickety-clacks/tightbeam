@@ -1,0 +1,182 @@
+{
+  "name": "ordinary-record-lifecycle",
+  "coverage": [
+    "ordinary_record"
+  ],
+  "period_seconds": 2,
+  "operation_budget_seconds": 60,
+  "eligible_after_seconds": 0,
+  "steps": [
+    {
+      "name": "create",
+      "method": "POST",
+      "path": "/agent/dispatch",
+      "body": {
+        "asUser": {
+          "$ref": "owner_user"
+        },
+        "verb": "work-item-create",
+        "params": {
+          "title": {
+            "$ref": "operation_id"
+          },
+          "idempotencyKey": {
+            "$ref": "operation_id"
+          }
+        }
+      },
+      "expect": {
+        "/result/state": "open",
+        "/result/title": {
+          "$ref": "operation_id"
+        },
+        "/result/ownerUserId": {
+          "$ref": "owner_user"
+        }
+      },
+      "timeout_seconds": 10,
+      "capture": {
+        "item_id": "/result/id"
+      },
+      "marks_eligible": true
+    },
+    {
+      "name": "get-created",
+      "method": "POST",
+      "path": "/agent/dispatch",
+      "body": {
+        "asUser": {
+          "$ref": "owner_user"
+        },
+        "verb": "work-item-get",
+        "params": {
+          "workItemId": {
+            "$ref": "item_id"
+          }
+        }
+      },
+      "expect": {
+        "/result/workItem/id": {
+          "$ref": "item_id"
+        },
+        "/result/workItem/state": "open",
+        "/result/workItem/title": {
+          "$ref": "operation_id"
+        },
+        "/result/workItem/ownerUserId": {
+          "$ref": "owner_user"
+        }
+      },
+      "timeout_seconds": 10
+    },
+    {
+      "name": "update",
+      "method": "POST",
+      "path": "/agent/dispatch",
+      "body": {
+        "asUser": {
+          "$ref": "owner_user"
+        },
+        "verb": "work-item-update",
+        "params": {
+          "workItemId": {
+            "$ref": "item_id"
+          },
+          "title": {
+            "$ref": "run_id"
+          }
+        }
+      },
+      "expect": {
+        "/result/id": {
+          "$ref": "item_id"
+        },
+        "/result/title": {
+          "$ref": "run_id"
+        },
+        "/result/ownerUserId": {
+          "$ref": "owner_user"
+        }
+      },
+      "timeout_seconds": 10
+    },
+    {
+      "name": "get-updated",
+      "method": "POST",
+      "path": "/agent/dispatch",
+      "body": {
+        "asUser": {
+          "$ref": "owner_user"
+        },
+        "verb": "work-item-get",
+        "params": {
+          "workItemId": {
+            "$ref": "item_id"
+          }
+        }
+      },
+      "expect": {
+        "/result/workItem/title": {
+          "$ref": "run_id"
+        },
+        "/result/workItem/id": {
+          "$ref": "item_id"
+        }
+      },
+      "timeout_seconds": 10
+    },
+    {
+      "name": "close",
+      "method": "POST",
+      "path": "/agent/dispatch",
+      "body": {
+        "asUser": {
+          "$ref": "owner_user"
+        },
+        "verb": "work-item-close",
+        "params": {
+          "workItemId": {
+            "$ref": "item_id"
+          }
+        }
+      },
+      "expect": {
+        "/result/ok": true,
+        "/result/workItem/state": "closed",
+        "/result/workItem/id": {
+          "$ref": "item_id"
+        }
+      },
+      "timeout_seconds": 10
+    },
+    {
+      "name": "get-closed",
+      "method": "POST",
+      "path": "/agent/dispatch",
+      "body": {
+        "asUser": {
+          "$ref": "owner_user"
+        },
+        "verb": "work-item-get",
+        "params": {
+          "workItemId": {
+            "$ref": "item_id"
+          }
+        }
+      },
+      "expect": {
+        "/result/workItem/state": "closed",
+        "/result/workItem/id": {
+          "$ref": "item_id"
+        },
+        "/result/workItem/title": {
+          "$ref": "run_id"
+        },
+        "/result/workItem/ownerUserId": {
+          "$ref": "owner_user"
+        }
+      },
+      "timeout_seconds": 10
+    }
+  ]
+}

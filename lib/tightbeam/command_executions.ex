@@ -226,12 +226,16 @@ defmodule Tightbeam.CommandExecutions do
     :ok = ensure_schema(db)
 
     unresolved(db)
-    |> Enum.each(fn row ->
+    |> Enum.each(fn [id] ->
       try do
+        row = get!(db, id)
         maybe_settle_terminal_turn(row, db)
         reconcile_row(db, get!(db, row.execution_id))
       rescue
-        error -> persist_reconciliation_error(db, row, error)
+        error ->
+          require Logger
+          Logger.warning("command execution #{id} recovery failed: #{Exception.message(error)}")
+          persist_reconciliation_error(db, %{execution_id: id}, error)
       end
     end)
 
@@ -243,14 +247,14 @@ defmodule Tightbeam.CommandExecutions do
       DB.query(
         db,
         """
-        SELECT #{@columns}
+        SELECT executionId
           FROM command_executions
          WHERE state IN ('prepared','started','started_unknown')
          ORDER BY preparedAt DESC
         """
       )
 
-    Enum.map(rows, &decode_row/1)
+    rows
   end
 
   defp maybe_settle_terminal_turn(%{state: "prepared", turn_seq: seq} = row, db)

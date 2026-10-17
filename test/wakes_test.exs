@@ -628,6 +628,122 @@ defmodule Tightbeam.WakesTest do
     assert replacement.delivery_rule == original.delivery_rule
   end
 
+  test "a delivery tick prepares each free recipient's source once and leaves a busy recipient's sources unprepared",
+       %{db: db} do
+    active_sessions!(db, ["free-a", "free-b", "busy-c"])
+    registry = :"registry_#{System.unique_integer([:positive])}"
+    lane = :"lane_#{System.unique_integer([:positive])}"
+    start_supervised!({Tightbeam.ConnRegistry, name: registry})
+    start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, lane})
+
+    {:ok, _seq} =
+      Tightbeam.Ledger.enqueue(db, %{
+        session_key: "busy-c",
+        message_id: "msg-#{System.unique_integer([:positive])}",
+        origin: "agent:fixture",
+        prompt: "work in progress"
+      })
+
+    {:ok, _turn} = Tightbeam.Ledger.claim_next(db, "busy-c", "fixture")
+    due_at = System.system_time(:millisecond)
+
+    sources =
+      for recipient <- ["free-a", "free-b", "busy-c"], n <- 1..3, into: %{} do
+        wake =
+          Wakes.schedule(db, %{
+            session_key: recipient,
+            origin: "system",
+            prompt: "notice #{n} for #{recipient}",
+            due_at: due_at,
+            sender_scheduled: true
+          })
+
+        {wake.wake_id, recipient}
+      end
+
+    # Count the batcher's own preparation path. Carrier admission keeps its
+    # separate, unchanged validation of each included source.
+    db_pid = Process.whereis(db)
+    traced = {NoticeBatcher, :prepared_source_in_txn, 2}
+    1 = :erlang.trace_pattern(traced, true, [:local])
+    1 = :erlang.trace(db_pid, true, [:call, {:tracer, self()}])
+
+    carriers =
+      try do
+        NoticeBatcher.recover(db, due_at + 1_000, conn_registry: registry, lane_manager: lane)
+      after
+        :erlang.trace(db_pid, false, [:call])
+        :erlang.trace_pattern(traced, false, [:local])
+      end
+
+    prepared = collect_prepared_sources(db_pid, [])
+    counts = Enum.frequencies(prepared)
+
+    assert length(carriers) == 2
+
+    for {wake_id, recipient} <- sources do
+      if recipient == "busy-c" do
+        assert Map.get(counts, wake_id, 0) == 0
+        assert NoticeBatcher.source_refs(db, wake_id) == []
+        assert Wakes.get(db, wake_id).state == "pending"
+      else
+        assert Map.get(counts, wake_id) == 1
+
+        assert [%{member_state: "included", delivery_wake_id: carrier}] =
+                 NoticeBatcher.source_refs(db, wake_id)
+
+        assert carrier in carriers
+      end
+    end
+  end
+
+  defp collect_prepared_sources(db_pid, acc) do
+    receive do
+      {:trace, ^db_pid, :call, {NoticeBatcher, :prepared_source_in_txn, [_txn, wake_id]}} ->
+        collect_prepared_sources(db_pid, [wake_id | acc])
+    after
+      200 -> acc
+    end
+  end
+
+  test "a busy wake scheduler does not turn a committed wake into an error response", %{db: db} do
+    active_sessions!(db, ["k1"])
+    scheduler = :"busy_scheduler_#{System.unique_integer([:positive])}"
+    test_pid = self()
+
+    # The scheduler never services its mailbox during this request.
+    busy =
+      spawn_link(fn ->
+        Process.register(self(), scheduler)
+        send(test_pid, :busy_ready)
+
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    assert_receive :busy_ready
+    on_exit(fn -> send(busy, :stop) end)
+
+    handler = Tightbeam.Gateway.handlers(%{db: db, wake_scheduler: scheduler})["wake"]
+
+    task =
+      Task.async(fn ->
+        handler.(%{
+          origin: "user:flynn",
+          principal: {:user, "flynn"},
+          session_key: "k1",
+          params: %{prompt: "committed before the nudge", after_ms: 0}
+        })
+      end)
+
+    response = Task.await(task, 2_000)
+
+    assert %{wake_id: wake_id} = response
+    assert %{state: "pending", prompt: "committed before the nudge"} = Wakes.get(db, wake_id)
+    assert Process.alive?(busy)
+  end
+
   defp active_sessions!(db, keys) do
     values =
       keys
@@ -850,7 +966,8 @@ defmodule Tightbeam.WakesTest do
     refute_receive {:delivered, _}
 
     assert :ok = Wakes.fire_due(scheduler)
-    assert_receive {:delivered, %{wake_id: probe_id, prompt: "callback retry control"}}
+    assert_receive {:delivered, %{wake_id: probe_id, prompt: "callback retry control"}}, 1_600
+    :sys.get_state(scheduler)
     assert probe_id == probe.wake_id
     assert Wakes.get(db, probe.wake_id).state == "fired"
     assert :ok = Wakes.fire_due(scheduler)
@@ -946,13 +1063,68 @@ defmodule Tightbeam.WakesTest do
     assert subject == wake.wake_id
     assert detail =~ "consumer_boom"
 
-    # One row per attempt, so the repetition is itself visible.
-    assert :ok = Wakes.fire_due(scheduler)
+    # The retry deadline starts the next attempt without another write.
+    Process.sleep(1_100)
+    :sys.get_state(scheduler)
 
     assert length(
              Enum.filter(EventLog.lifecycle_events(db), &(&1.kind == "wake_delivery_failed"))
            ) ==
              2
+  end
+
+  test "fire_matching replies after the eager step and runs the delivery pass afterwards", %{
+    db: db,
+    scheduler: scheduler
+  } do
+    test_pid = self()
+
+    start_supervised!({Wakes,
+     db: db,
+     name: scheduler,
+     tick_ms: 60_000,
+     deliver: fn _wake -> :ok end,
+     internal_consumers: %{
+       "blocking" => fn wake ->
+         # Runs in the scheduler process; block only the first pass.
+         unless Process.get(:blocked_once) do
+           Process.put(:blocked_once, true)
+           send(test_pid, {:consuming, wake.wake_id})
+
+           receive do
+             :release -> :ok
+           after
+             10_000 -> :ok
+           end
+         end
+
+         :ok
+       end
+     }})
+
+    wake =
+      Wakes.schedule(db, %{
+        session_key: "k1",
+        origin: "process:tightbeam",
+        consumer: "blocking",
+        due_at: System.system_time(:millisecond)
+      })
+
+    {:ok, [[fact_id]]} =
+      DB.query(
+        db,
+        "INSERT INTO condition_facts (ts, kind, scope, origin) VALUES (1, 'unmatched', NULL, 'process:ci') RETURNING id"
+      )
+
+    # The due wake's consumer blocks until released. A fact filer must get its
+    # reply without waiting for that pass.
+    assert :ok = Wakes.fire_matching(scheduler, fact_id)
+    assert_receive {:consuming, consumed}, 5_000
+    assert consumed == wake.wake_id
+
+    send(Process.whereis(scheduler), :release)
+    assert :ok = Wakes.fire_matching(scheduler, [fact_id, fact_id])
+    assert :ok = Wakes.fire_due(scheduler)
   end
 
   test "fire_due called inside the scheduler queues another pass without self-calling", %{

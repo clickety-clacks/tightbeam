@@ -227,15 +227,27 @@ defmodule Tightbeam.ToplinesSchemaTest do
     end
   end
 
-  test "invalid V5 title data refuses migration rather than legitimizing it" do
+  test "invalid V5 title remains unresolved while valid rows migrate" do
     db = base_db!()
     :ok = DB.execute(db, File.read!("test/fixtures/toplines_v5.sql"))
+    insert_topline!(db, "Valid")
     :ok = DB.execute(db, "PRAGMA ignore_check_constraints=ON")
     insert_topline!(db, " Cafe ")
     :ok = DB.execute(db, "PRAGMA ignore_check_constraints=OFF")
-    before = snapshot(db)
-    assert_raise RuntimeError, ~r/invalid titles/, fn -> ToplinesSchema.activate(db, 124) end
-    assert snapshot(db) == before
+    {:ok, before} = DB.query(db, "SELECT id,title FROM toplines ORDER BY id")
+    [[id]] = elem(DB.query(db, "SELECT id FROM toplines WHERE title=' Cafe '"), 1)
+
+    assert ExUnit.CaptureLog.capture_log(fn -> assert :ok = ToplinesSchema.activate(db, 124) end) =~
+             id
+
+    assert {:ok, ^before} = DB.query(db, "SELECT id,title FROM toplines ORDER BY id")
+
+    assert {:ok, [["standalone-toplines-v6"]]} =
+             DB.query(db, "SELECT shape FROM topline_schema_stamp")
+
+    assert {:ok, [[0]]} = DB.query(db, "PRAGMA ignore_check_constraints")
+    assert {:error, _} = DB.query(db, "UPDATE toplines SET state='invalid'")
+    assert :ok = ToplinesSchema.activate(db, 125)
   end
 
   test "a copied row constraint failure restores the entire V5 schema and data" do
@@ -268,13 +280,16 @@ defmodule Tightbeam.ToplinesSchemaTest do
       """)
 
     :ok = DB.execute(db, "PRAGMA foreign_keys=ON")
-    before = snapshot(db)
 
-    assert_raise RuntimeError, ~r/invalid foreign keys/, fn ->
-      ToplinesSchema.activate(db, 124)
-    end
+    assert ExUnit.CaptureLog.capture_log(fn -> assert :ok = ToplinesSchema.activate(db, 124) end) =~
+             "topline_concerns"
 
-    assert snapshot(db) == before
+    assert {:ok, [["tlc_orphan", "tl_missing"]]} =
+             DB.query(db, "SELECT id,toplineId FROM topline_concerns")
+
+    assert {:ok, [["standalone-toplines-v6"]]} =
+             DB.query(db, "SELECT shape FROM topline_schema_stamp")
+
     assert {:ok, [[1]]} = DB.query(db, "PRAGMA foreign_keys")
     assert {:ok, [[0]]} = DB.query(db, "PRAGMA defer_foreign_keys")
   end

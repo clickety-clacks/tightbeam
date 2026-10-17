@@ -902,6 +902,7 @@ fn spawn_send(
             prompt: frame.content,
             after_ms: None,
             at: None,
+            cron: None,
             condition_kind: None,
             condition_scope: None,
             predicate: None,

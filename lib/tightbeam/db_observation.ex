@@ -42,6 +42,18 @@ defmodule Tightbeam.DBObservation do
     end)
   end
 
+  def call(
+        server,
+        {:transaction_then, prepare, after_commit, opts} = payload,
+        operation,
+        budget,
+        mode
+      ) do
+    transaction_call(server, payload, operation, budget, mode, fn envelope ->
+      {:transaction_then, transaction_callback(envelope, prepare), after_commit, opts}
+    end)
+  end
+
   def call(server, payload, operation, budget, mode) do
     # Existing composition proxies keep their established wire protocol. The
     # envelope is between our client and the actual owner, never a new API for
@@ -71,10 +83,8 @@ defmodule Tightbeam.DBObservation do
   def transaction_metadata(_callback), do: :none
 
   defp owner?(server) do
-    with pid when is_pid(pid) <- GenServer.whereis(server),
-         {:dictionary, dictionary} <- Process.info(pid, :dictionary) do
-      Keyword.get(dictionary, :"$initial_call") == {Tightbeam.DB, :init, 1}
-    else
+    case GenServer.whereis(server) do
+      pid when is_pid(pid) -> :persistent_term.get({Tightbeam.DB, pid}, :not_owner) != :not_owner
       _ -> false
     end
   end
@@ -101,6 +111,12 @@ defmodule Tightbeam.DBObservation do
     started = System.monotonic_time()
 
     envelope = %{
+      publication: mode == :publication,
+      dispatch_audit:
+        if(Process.get(:tightbeam_dispatch_audited),
+          do: nil,
+          else: Process.get(:tightbeam_dispatch_audit)
+        ),
       request_id: context.request_id,
       db_call_id: RequestContext.id("dbc_"),
       operation: operation,
@@ -109,11 +125,18 @@ defmodule Tightbeam.DBObservation do
       principal_ref: context.principal_ref,
       timeout_source: "otp_db_call",
       budget_ms: budget,
+      deadline: System.monotonic_time(:millisecond) + budget,
       enqueued_monotonic: started
     }
 
     try do
-      {reply, timing} = GenServer.call(server, build_request.(envelope), budget)
+      request = build_request.(envelope)
+      {reply, timing} = send_request(server, request, envelope, budget)
+
+      with event_id when is_integer(event_id) <- Map.get(timing, :dispatch_audited),
+           true <- reply == :ok or match?({:ok, _}, reply) do
+        Process.put(:tightbeam_dispatch_audited, event_id)
+      end
 
       emit(
         envelope,
@@ -158,9 +181,88 @@ defmodule Tightbeam.DBObservation do
     end
   end
 
+  defp send_request(server, {:db_call, envelope, {:query, sql, params}} = request, _, budget) do
+    case Tightbeam.DB.reader(server, sql) do
+      nil ->
+        owner_request(server, request, envelope, budget)
+
+      reader ->
+        response = Tightbeam.DB.Reader.query(reader, sql, params, envelope)
+
+        case response do
+          {{:error, %{message: message}}, _} when is_binary(message) ->
+            if String.contains?(message, "readonly"),
+              do: owner_request(server, request, envelope, remaining(envelope)),
+              else: response
+
+          _ ->
+            response
+        end
+    end
+  end
+
+  defp send_request(server, request, envelope, budget),
+    do: owner_request(server, request, envelope, budget)
+
+  defp remaining(envelope),
+    do: max(0, envelope.deadline - System.monotonic_time(:millisecond))
+
+  defp owner_request(server, request, envelope, _budget) do
+    budget = remaining(envelope)
+
+    if not envelope.publication and Tightbeam.DB.overloaded?(server) do
+      {:reply, response, _} =
+        server(envelope, nil, fn ->
+          {:reply, {:error, %Tightbeam.DB.Overloaded{}}, nil}
+        end)
+
+      response
+    else
+      GenServer.call(server, request, budget)
+    end
+  end
+
   defp transaction_callback(envelope, original_callback) do
     capture = {@transaction_capture_tag, envelope, original_callback}
     fn transaction -> apply(elem(capture, 2), [transaction]) end
+  end
+
+  @doc false
+  def audit_active?, do: is_map(get_in(Process.get(@key, %{}), [:dispatch_audit]))
+
+  @doc false
+  # Remembers the id of the audit row a handler wrote in its own transaction,
+  # so the dispatcher completes that row instead of writing a second one.
+  def audit_recorded(verb, event_id) do
+    case Process.get(@key) do
+      %{dispatch_audit: %{verb: ^verb}, dispatch_audited: false} = observation ->
+        Process.put(@key, %{observation | dispatch_audited: event_id})
+
+      _ ->
+        :ok
+    end
+  end
+
+  @doc false
+  def audit_in_txn(txn, changed?) do
+    case Process.get(@key) do
+      %{dispatch_audit: audit, dispatch_audited: false} when is_map(audit) and changed? ->
+        Tightbeam.EventLog.append_event_in_txn(
+          txn,
+          "verb",
+          audit.verb,
+          audit.origin,
+          audit.session_key,
+          nil,
+          Map.get(audit, :principal),
+          System.system_time(:millisecond)
+        )
+
+      _ ->
+        :ok
+    end
+  rescue
+    _ -> Logger.warning("dispatch audit could not be recorded in primary transaction")
   end
 
   def server(envelope, sqlite_budget, fun) do
@@ -168,6 +270,8 @@ defmodule Tightbeam.DBObservation do
     previous = Process.get(@key)
 
     Process.put(@key, %{
+      dispatch_audit: Map.get(envelope, :dispatch_audit),
+      dispatch_audited: false,
       sql: 0,
       sql_observed: false,
       callback: 0,
@@ -183,7 +287,10 @@ defmodule Tightbeam.DBObservation do
     try do
       case fun.() do
         {:reply, reply, state} ->
-          timing = terminal(envelope, started, reply)
+          timing =
+            terminal(envelope, started, reply)
+            |> Map.put(:dispatch_audited, Process.get(@key).dispatch_audited)
+
           {:reply, {reply, timing}, state}
       end
     catch
@@ -352,6 +459,7 @@ defmodule Tightbeam.DBObservation do
   defp result_class(:ok, _, _), do: "ok"
   defp result_class({:ok, _}, _, _), do: "ok"
   defp result_class({:ok, _, _}, _, _), do: "ok"
+  defp result_class({:error, %Tightbeam.DB.DeadlineExceeded{}}, _, _), do: "deadline_exceeded"
 
   defp result_class({:error, error}, %{raised: {raised, _stack, class}}, _) do
     if same_observed_error?(error, raised), do: class

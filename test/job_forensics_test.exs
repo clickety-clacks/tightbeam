@@ -901,18 +901,24 @@ defmodule Tightbeam.JobForensicsTest do
 
     :ok = DB.execute(legacy_db, wakes_ddl <> ";")
 
+    # A predecessor fixture must exclude later delivery and cleanup columns too.
     :ok =
       DB.execute(legacy_db, """
       ALTER TABLE wakes DROP COLUMN sourceClientIdentity;
       ALTER TABLE wakes DROP COLUMN sourceAttachments;
       ALTER TABLE wakes DROP COLUMN sourceVisibilityScope;
       ALTER TABLE wakes DROP COLUMN sourceAddress;
+      ALTER TABLE wakes DROP COLUMN deliveredTurnSeq;
+      ALTER TABLE wakes DROP COLUMN idleCleanupObserved;
+      ALTER TABLE wakes DROP COLUMN idleCleanupGroup;
+      ALTER TABLE wakes DROP COLUMN idleCleanupRecorded;
       """)
 
     assert {:ok, []} =
              DB.query(legacy_db, """
              SELECT name FROM pragma_table_info('wakes')
-             WHERE name IN ('sourceClientIdentity','sourceAttachments','sourceVisibilityScope','sourceAddress')
+             WHERE name IN ('sourceClientIdentity','sourceAttachments','sourceVisibilityScope','sourceAddress',
+                            'deliveredTurnSeq','idleCleanupObserved','idleCleanupGroup','idleCleanupRecorded')
              """)
 
     :ok =
@@ -934,6 +940,10 @@ defmodule Tightbeam.JobForensicsTest do
 
     assert {:ok,
             [
+              ["deliveredTurnSeq"],
+              ["idleCleanupGroup"],
+              ["idleCleanupObserved"],
+              ["idleCleanupRecorded"],
               ["sourceAddress"],
               ["sourceAttachments"],
               ["sourceClientIdentity"],
@@ -941,7 +951,8 @@ defmodule Tightbeam.JobForensicsTest do
             ]} =
              DB.query(legacy_db, """
              SELECT name FROM pragma_table_info('wakes')
-             WHERE name IN ('sourceClientIdentity','sourceAttachments','sourceVisibilityScope','sourceAddress')
+             WHERE name IN ('sourceClientIdentity','sourceAttachments','sourceVisibilityScope','sourceAddress',
+                            'deliveredTurnSeq','idleCleanupObserved','idleCleanupGroup','idleCleanupRecorded')
              ORDER BY name
              """)
 

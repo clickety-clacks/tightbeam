@@ -203,7 +203,21 @@ defmodule Tightbeam.EventLog do
         [ts, kind, verb, origin, serialize_principal(principal), session_key, encode(payload)]
       )
 
+    Tightbeam.DBObservation.audit_recorded(verb, event_id)
     event_id
+  end
+
+  @doc "Complete an audit row written in the handler's transaction with the known outcome."
+  @spec complete_event_in_txn(Txn.t(), integer(), String.t(), term()) :: :ok
+  def complete_event_in_txn(%Txn{} = txn, event_id, kind, payload)
+      when kind in ~w(verb denied) and is_integer(event_id) do
+    Txn.q(txn, "UPDATE events SET kind=?2, payload=?3 WHERE id=?1", [
+      event_id,
+      kind,
+      encode(payload)
+    ])
+
+    :ok
   end
 
   @doc "Verb events with id > `after_id`, oldest first — the advance/inspect feed."

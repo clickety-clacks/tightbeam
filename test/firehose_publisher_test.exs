@@ -322,6 +322,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     }
 
     assert {:ok, %{wake_id: immediate_id}} = Dispatch.dispatch(db, handlers, immediate_wake)
+    assert :ok = Wakes.fire_due(scheduler)
     assert %{state: "fired"} = Wakes.get(db, immediate_id)
     wake_observed = observed_state_classes()
 
@@ -380,6 +381,8 @@ defmodule Tightbeam.Firehose.PublisherTest do
     }
 
     assert {:ok, %{kind: "effect-ready"}} = Dispatch.dispatch(db, handlers, condition)
+    # Wait for the delivery pass the condition nudge queued.
+    :sys.get_state(scheduler)
     assert_per_verb_effects!(config, "condition", observed_state_classes())
 
     {:ok, condition_turn} = Ledger.claim_next(db, "effect-target", "lane:effects")
@@ -865,6 +868,8 @@ defmodule Tightbeam.Firehose.PublisherTest do
          delivery
        end}
     )
+
+    :sys.get_state(delivery_scheduler)
 
     ask = %{
       verb: "operator-ask",

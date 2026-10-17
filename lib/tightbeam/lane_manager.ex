@@ -1,22 +1,24 @@
 defmodule Tightbeam.LaneManager do
   @moduledoc """
-  The Reconciler — the liveness guarantee. The doorbell (SessionLane.nudge)
-  is an optimization; THIS scan is the guarantee. At boot and every
-  `interval` ms it:
-  1. recovers running turns → failed_unknown (survives a crash that left a lane
-     mid-turn),
-  2. re-publishes any unpublished terminal rows (at-least-once publication),
-  3. ensures a SessionLane exists for every session with pending work and
-     nudges it.
-
-  Lanes are named in Tightbeam.LaneRegistry (unique per session), so "start a
-  lane if absent" is atomic and there is never more than one lane per session.
+  Maintains lanes from admission, lane state reports and process monitors.
+  Boot recovery and a slow consistency check repair work whose signal was lost.
   """
 
   use GenServer
   alias Tightbeam.{DB, HarnessHealth, Ledger, SessionLane}
 
-  defstruct [:db, :lane_sup, :task_sup, :runner, :interval, :terminal_publisher, :on_terminal]
+  defstruct [
+    :db,
+    :name,
+    :lane_sup,
+    :task_sup,
+    :runner,
+    :interval,
+    :terminal_publisher,
+    :on_terminal,
+    lanes: %{},
+    reaping: %{}
+  ]
 
   @doc """
   Start the reconciler. Required opts: `:lane_sup` (the lane
@@ -60,13 +62,14 @@ defmodule Tightbeam.LaneManager do
   @impl true
   def init(opts) do
     state = %__MODULE__{
+      name: Keyword.get(opts, :name, __MODULE__),
       db: Keyword.get(opts, :db, Tightbeam.DB),
       lane_sup: Keyword.fetch!(opts, :lane_sup),
       task_sup: Keyword.fetch!(opts, :task_sup),
       runner: Keyword.fetch!(opts, :runner),
       terminal_publisher: Keyword.get(opts, :terminal_publisher, fn _ -> :ok end),
       on_terminal: Keyword.get(opts, :on_terminal, fn _, _ -> :ok end),
-      interval: Keyword.get(opts, :interval, 5_000)
+      interval: Keyword.get(opts, :interval, 180_000)
     }
 
     # Boot recovery happens before the first scan starts nudging lanes.
@@ -123,46 +126,122 @@ defmodule Tightbeam.LaneManager do
   end
 
   @impl true
-  def handle_info(:tick, state) do
-    schedule(state.interval)
-    {:noreply, do_reconcile(state)}
+  def handle_cast({:lane_state, pid, session_key, seq}, state) do
+    {ref, _, _} =
+      Map.get_lazy(state.lanes, pid, fn -> {Process.monitor(pid), session_key, seq} end)
+
+    {:noreply, %{state | lanes: Map.put(state.lanes, pid, {ref, session_key, seq})}}
   end
 
-  defp do_reconcile(state) do
-    # Re-publish terminals whose publication may have been lost to a crash —
-    # to the WIRE, not just the ledger: without frames, a client whose turn
-    # died with the gateway keeps a stuck typing indicator forever.
-    for %{seq: seq} = row <- Ledger.unpublished_terminals(state.db) do
-      state.terminal_publisher.(row)
-      Ledger.mark_published(state.db, seq)
-      state.on_terminal.(row.session_key, seq)
-    end
+  def handle_cast({:ensure_lane, session_key}, state) do
+    ensure(state, session_key)
+    SessionLane.nudge(session_key)
+    {:noreply, state}
+  end
 
-    for session_key <- Ledger.pending_sessions(state.db) do
-      ensure(state, session_key)
-      SessionLane.reap_abandoned(session_key)
-      SessionLane.nudge(session_key)
-    end
+  @impl true
+  def handle_info(:tick, state) do
+    schedule(state.interval)
+    {:noreply, do_reconcile(state, true)}
+  end
 
-    state
+  def handle_info({ref, result}, state) when is_map_key(state.reaping, ref) do
+    Process.demonitor(ref, [:flush])
+    if match?({:ok, [_ | _]}, result), do: republish_terminals(state, false)
+    {:noreply, %{state | reaping: Map.delete(state.reaping, ref)}}
+  end
+
+  def handle_info({:DOWN, ref, :process, pid, _reason}, state) do
+    case Map.pop(state.lanes, pid) do
+      {{^ref, key, _seq}, lanes} ->
+        state = %{state | lanes: lanes}
+        {:noreply, repair_lane(state, key)}
+
+      _ ->
+        {:noreply, %{state | reaping: Map.delete(state.reaping, ref)}}
+    end
+  end
+
+  defp do_reconcile(state, detect \\ false) do
+    DB.background_pass(fn -> reconcile_pass(state, detect) end, state)
+  end
+
+  defp reconcile_pass(state, detect) do
+    republish_terminals(state, detect)
+
+    Enum.reduce(Ledger.pending_sessions(state.db), state, fn session_key, acc ->
+      active? =
+        Enum.any?(acc.lanes, fn {_pid, {_ref, key, seq}} ->
+          key == session_key and not is_nil(seq) and
+            match?(
+              {:ok, [["running"]]},
+              DB.query(state.db, "SELECT status FROM turns WHERE seq=?1", [seq])
+            )
+        end)
+
+      if detect and active? do
+        acc
+      else
+        repair_lane(acc, session_key, detect)
+      end
+    end)
+  end
+
+  defp republish_terminals(state, detect) do
+    DB.background_pass(fn ->
+      # Re-publish terminals whose publication may have been lost to a crash —
+      # to the WIRE, not just the ledger: without frames, a client whose turn
+      # died with the gateway keeps a stuck typing indicator forever.
+      for %{seq: seq} = row <- Ledger.unpublished_terminals(state.db),
+          not detect or System.system_time(:millisecond) - row.ended_at >= 10_000 do
+        state.terminal_publisher.(row)
+        Ledger.mark_published(state.db, seq)
+        state.on_terminal.(row.session_key, seq)
+
+        if detect,
+          do:
+            Tightbeam.SchedulerMisses.record(
+              :lane_terminal,
+              seq,
+              max(0, System.system_time(:millisecond) - row.ended_at)
+            )
+      end
+    end)
+  end
+
+  defp repair_lane(state, session_key, detect \\ false) do
+    ensure(state, session_key)
+
+    if Enum.any?(state.reaping, fn {_ref, key} -> key == session_key end) do
+      state
+    else
+      task =
+        Task.Supervisor.async_nolink(state.task_sup, fn ->
+          SessionLane.repair(session_key, detect)
+        end)
+
+      %{state | reaping: Map.put(state.reaping, task.ref, session_key)}
+    end
   end
 
   defp ensure(state, session_key) do
     case Registry.lookup(Tightbeam.LaneRegistry, session_key) do
-      [{_pid, _}] ->
-        :ok
+      [{pid, _}] ->
+        if not Process.alive?(pid), do: start_lane(state, session_key)
 
       [] ->
-        DynamicSupervisor.start_child(
-          state.lane_sup,
-          {SessionLane, lane_opts(state, session_key)}
-        )
+        start_lane(state, session_key)
     end
+  end
+
+  defp start_lane(state, session_key) do
+    DynamicSupervisor.start_child(state.lane_sup, {SessionLane, lane_opts(state, session_key)})
   end
 
   defp lane_opts(state, session_key, extra \\ []) do
     [
       session_key: session_key,
+      lane_manager: state.name,
       db: state.db,
       task_sup: state.task_sup,
       runner: state.runner,

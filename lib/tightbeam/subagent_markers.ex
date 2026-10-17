@@ -63,11 +63,13 @@ defmodule Tightbeam.SubagentMarkers do
               else: []
 
           {result, deliveries}
-        end
+        end,
+        fallback: fn result -> {result, []} end,
+        retry_deliveries: true
       )
 
     ConditionFacts.complete_deliveries(db, scheduler, deliveries)
-    if is_integer(result[:fact_id]), do: Wakes.fire_matching(scheduler, result.fact_id)
+    if is_integer(result[:fact_id]), do: Wakes.nudge_matching(scheduler, result.fact_id)
     result
   end
 
@@ -370,7 +372,8 @@ defmodule Tightbeam.SubagentMarkers do
   defp running_turn_assignment_in_txn(txn, principal) do
     case Txn.q(
            txn,
-           "SELECT assignmentId FROM turns WHERE sessionKey = ?1 AND status = 'running' LIMIT 1",
+           "SELECT assignmentId FROM turns WHERE sessionKey = ?1 AND status = 'running' " <>
+             "AND status IN ('queued','running') LIMIT 1",
            [principal]
          ) do
       [[assignment_id]] -> assignment_id

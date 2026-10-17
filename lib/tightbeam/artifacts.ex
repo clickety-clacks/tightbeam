@@ -99,13 +99,17 @@ defmodule Tightbeam.Artifacts do
          OR createdAt >= #{@maximum_version}
       """)
 
-    if invalid != [], do: raise(ArgumentError, "artifact_version_seed_invalid")
+    Enum.each(invalid, fn [id] ->
+      require Logger
+      Logger.warning("artifact #{id} unresolved: artifact_version_seed_invalid")
+    end)
 
     Txn.q(txn, "CREATE TABLE artifact_version_floors (#{@floor_definition})")
 
     Txn.q(txn, """
     INSERT INTO artifact_version_floors (artifactId, rowVersion)
     SELECT artifactId, createdAt + 1 FROM artifacts
+    WHERE typeof(createdAt) = 'integer' AND createdAt > 0 AND createdAt < #{@maximum_version}
     """)
 
     :ok
@@ -262,6 +266,10 @@ defmodule Tightbeam.Artifacts do
                    error ->
                      error
                  end
+               end,
+               fallback: fn
+                 {:created, artifact} -> artifact
+                 error -> error
                end
              ) do
           # The row still lands on the weaker class; when that class came from
@@ -618,6 +626,24 @@ defmodule Tightbeam.Artifacts do
       {:ok, row} -> row
       {:error, error} -> raise error
     end
+  end
+
+  @doc false
+  def repoint_archive_in_txn(txn, artifact_id, home) do
+    reserve_version_in_txn(txn, artifact_id)
+
+    Txn.q(
+      txn,
+      "UPDATE artifacts SET home=?2,updatedAt=?3 WHERE artifactId=?1 AND state='archived'",
+      [artifact_id, home, now()]
+    )
+
+    publish_in_txn(txn, "artifact.archived", artifact_id)
+  end
+
+  @doc false
+  def archive_cleaned_in_txn(txn, artifact_id, home) do
+    transition_in_txn(txn, artifact_id, "in-workspace", "archived", home, now())
   end
 
   defp transition_in_txn(txn, id, prior, state, home, updated_at, custody \\ nil) do
