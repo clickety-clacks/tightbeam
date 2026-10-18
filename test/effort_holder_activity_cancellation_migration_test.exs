@@ -83,6 +83,7 @@ defmodule Tightbeam.EffortHolderActivityCancellationMigrationTest do
     assert :ok = Schema.upgrade_effort_holder_activity_cancellation_v1(ctx.db)
     assert rows(ctx.db, "SELECT * FROM wake_cancellations ORDER BY wakeId") == ctx.before_rows
     assert_activity_route_is_admitted(ctx.db)
+    assert_source_clear_routes_are_admitted(ctx.db)
   end
 
   # Exercise the migrated SQLite CHECK constraints against a real canceled wake.
@@ -140,6 +141,42 @@ defmodule Tightbeam.EffortHolderActivityCancellationMigrationTest do
                "UPDATE wake_cancellations SET causalSourceKind='wake' WHERE wakeId=?1",
                [wake_id]
              )
+  end
+
+  defp assert_source_clear_routes_are_admitted(db) do
+    [[wake_id]] = rows(db, "SELECT wakeId FROM wake_cancellations ORDER BY wakeId LIMIT 1")
+
+    source_clear_routes = [
+      {"tightbeam:assignments", "assignment_transition", "assignment_transition",
+       "fixture-assignment"},
+      {"tightbeam:escalation", "decision_request", "decision_request_transition",
+       "fixture-decision-request"}
+    ]
+
+    Enum.each(source_clear_routes, fn {requester, source_kind, disposition_kind, source_id} ->
+      assert {:ok, []} =
+               DB.query(
+                 db,
+                 """
+                 UPDATE wake_cancellations
+                 SET requesterKind='process', requesterId=?2,
+                     reasonKind='obligation_disposed', causalSourceKind=?3,
+                     causalSourceId=?4, outcomeKind='disposition', replacementWakeId=NULL,
+                     dispositionKind=?5, dispositionId=?4, primaryWorkKind='assignment',
+                     primaryWorkId='fixture-open-assignment', workImpactKind='linked_work_open',
+                     livenessTriggerKind=NULL, livenessTriggerId=NULL, actionNeeded=0
+                 WHERE wakeId=?1
+                 """,
+                 [wake_id, requester, source_kind, source_id, disposition_kind]
+               )
+
+      assert {:error, _constraint_error} =
+               DB.query(
+                 db,
+                 "UPDATE wake_cancellations SET causalSourceKind='wake' WHERE wakeId=?1",
+                 [wake_id]
+               )
+    end)
   end
 
   defp rows(db, sql, params \\ []) do

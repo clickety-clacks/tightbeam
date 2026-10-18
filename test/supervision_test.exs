@@ -312,8 +312,8 @@ defmodule Tightbeam.SupervisionTest do
                ctx.db,
                """
                INSERT INTO wakes
-                 (wakeId,sessionKey,origin,consumer,dueAt,state,createdAt,obligationRef,deliveredTurnSeq)
-               VALUES (?1,?2,'process:tightbeam','prompt',1,'fired',1,
+                 (wakeId,sessionKey,origin,consumer,prompt,dueAt,state,createdAt,obligationRef,deliveredTurnSeq)
+               VALUES (?1,?2,'process:tightbeam','prompt','synthetic terminal child notice',1,'fired',1,
                        'terminal-child-owner-notification:synthetic',1)
                """,
                [direct_wake_id, ctx.holder.session_key]
