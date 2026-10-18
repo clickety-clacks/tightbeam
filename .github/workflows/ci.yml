@@ -52,12 +52,13 @@ jobs:
     runs-on: ${{ matrix.os }}
     # Changes land on the fast checks: pull requests, the merge queue and
     # branch pushes run source checks, the gate scripts, and a compile (which
-    # builds the Rust NIF, so the Rust toolchain stays). The 0.1.9+2857
-    # maintenance tag runs its directly affected Mix cases below. Full Mix and
-    # Cargo suites remain enabled on manual runs and every other version tag.
+    # builds the Rust NIF, so the Rust toolchain stays). The 0.1.9+2857 and
+    # 0.1.9+2883 maintenance tags run their directly affected Mix cases below.
+    # Full Mix and Cargo suites remain enabled on manual runs and every other
+    # version tag.
     env:
-      TARGETED_GUARD_RELEASE: ${{ github.event_name == 'push' && github.ref == 'refs/tags/v0.1.9+2857' }}
-      FULL_SUITE: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && github.ref != 'refs/tags/v0.1.9+2857') }}
+      TARGETED_GUARD_RELEASE: ${{ github.event_name == 'push' && (github.ref == 'refs/tags/v0.1.9+2857' || github.ref == 'refs/tags/v0.1.9+2883') }}
+      FULL_SUITE: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && github.ref != 'refs/tags/v0.1.9+2857' && github.ref != 'refs/tags/v0.1.9+2883') }}
     steps:
       - name: Validate exact source SHA
         shell: bash
@@ -198,9 +199,10 @@ jobs:
         run: mix compile
 
       - name: Run directly affected successor and wake checks
-        if: github.event_name == 'push' && github.ref == 'refs/tags/v0.1.9+2857'
+        if: github.event_name == 'push' && (github.ref == 'refs/tags/v0.1.9+2857' || github.ref == 'refs/tags/v0.1.9+2883')
         run: >-
           scripts/verify_mix.sh
+          test/assignments_test.exs
           test/late_ruling_handoff_test.exs
           test/row_driven_waits_test.exs:1297
           test/row_driven_waits_test.exs:305
