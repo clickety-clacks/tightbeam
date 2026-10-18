@@ -708,6 +708,8 @@ defmodule Tightbeam.NoticeBatcher do
   defp dispose_missing_role_in_txn(_txn, _wake, _at), do: :ok
 
   defp ready_sources_in_txn(txn, at, recipient \\ nil) do
+    Tightbeam.RowReactions.adopt_if_ready_in_txn(txn)
+
     Txn.q(
       txn,
       """
@@ -751,7 +753,9 @@ defmodule Tightbeam.NoticeBatcher do
         # A terminal notice can change recipient when prepared, so it is
         # grouped by its prepared recipient, not by stored routing.
         stored_target =
-          if Wakes.terminal_notice?(wake), do: nil, else: source_delivery_target(txn, wake)
+          if Tightbeam.RowReactions.notice_owned_in_txn?(txn, wake_id),
+            do: nil,
+            else: source_delivery_target(txn, wake)
 
         case stored_target do
           {target, _, _} ->
@@ -1051,6 +1055,12 @@ defmodule Tightbeam.NoticeBatcher do
   end
 
   defp prepare_due_source_in_txn(txn, wake_id) do
+    if Tightbeam.RowReactions.delivery_ready_in_txn?(txn, wake_id),
+      do: prepare_elected_source_in_txn(txn, wake_id),
+      else: false
+  end
+
+  defp prepare_elected_source_in_txn(txn, wake_id) do
     if Wakes.suppress_supervision_if_blocked_in_txn?(txn, wake_id) do
       false
     else
@@ -1078,12 +1088,15 @@ defmodule Tightbeam.NoticeBatcher do
         false
 
       [] ->
-        case Wakes.terminal_notice_delivery_in_txn(txn, wake_id) do
-          {:terminal_notice, wake} ->
+        case Tightbeam.RowReactions.prepare_notice_in_txn(txn, wake_id) do
+          {:notice, wake} ->
             update_source_lane_in_txn(txn, wake)
             prepare_liveness_source_in_txn(txn, wake_id)
 
-          {:terminal_notice_undeliverable, _evidence} ->
+          :skipped ->
+            false
+
+          {:undelivered, _} ->
             false
 
           :ordinary ->
@@ -1120,7 +1133,8 @@ defmodule Tightbeam.NoticeBatcher do
     end
   end
 
-  defp update_source_lane_in_txn(txn, wake) do
+  @doc false
+  def update_source_lane_in_txn(txn, wake) do
     {address, scope} = recipient_lane(wake)
 
     Txn.q(txn, "UPDATE wakes SET sourceVisibilityScope=?2,sourceAddress=?3 WHERE wakeId=?1", [

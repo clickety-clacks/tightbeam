@@ -581,6 +581,7 @@ defmodule Tightbeam.Assignments do
       end)
 
     Enum.each(assignments, fn %{assignment_id: assignment_id, work_item_id: work_item_id} ->
+      before = Tightbeam.RowReactions.Snapshot.assignment_row(txn, assignment_id)
       ts = now()
 
       reopening_id = current_reopening_id(txn, assignment_id)
@@ -638,7 +639,14 @@ defmodule Tightbeam.Assignments do
       # Incomplete notice cancellation must see the real remaining-work bracket.
       # Both the bracket and notice still roll back with this terminal transition.
       Tightbeam.WorkItems.arm_slate_in_txn(txn, work_item_id)
-      admit_revocation_notice!(txn, assignment_id, revocation_id)
+
+      Tightbeam.RowReactions.observe_assignment_in_txn(
+        txn,
+        before,
+        %{"kind" => "assignment_revocation", "id" => revocation_id},
+        principal,
+        ts
+      )
 
       append_substrate(txn, session_key, "[assignment interrupted by retire: #{assignment_id}]")
 
@@ -1729,6 +1737,7 @@ defmodule Tightbeam.Assignments do
           db,
           fn txn ->
             result = attest_in_txn(txn, call)
+            Tightbeam.RowReactions.observe_attest_result_in_txn(txn, result)
 
             cond do
               Map.get(result, :replayed, false) ->
@@ -2653,13 +2662,11 @@ defmodule Tightbeam.Assignments do
 
   defp insert_and_apply_lifecycle_attest(txn, call, assignment, holder) do
     attest = insert_attest(txn, call, assignment.id)
-    Wakes.record_terminal_handoff_action_in_txn(txn, holder, attest)
     result = apply_lifecycle_attest(txn, call, assignment, attest, holder)
     file_attest_condition_fact(txn, assignment, attest, result)
   end
 
   defp apply_lifecycle_attest(txn, %{params: %{kind: "progress"}}, assignment, attest, _holder) do
-    notify_assignment_opener_of_attest_in_txn(txn, assignment, attest)
     append_attest_marker(txn, attest)
     %{assignment: assignment, attest: attest}
   end
@@ -2674,6 +2681,8 @@ defmodule Tightbeam.Assignments do
        do: cannot_proceed_in_txn(txn, call, assignment, attest)
 
   defp apply_lifecycle_attest(txn, call, assignment, attest, holder) do
+    before = Tightbeam.RowReactions.Snapshot.assignment_row(txn, assignment.id)
+
     Txn.q(
       txn,
       """
@@ -2688,20 +2697,13 @@ defmodule Tightbeam.Assignments do
     closed_assignment = fetch_assignment!(txn, assignment.id)
     Tightbeam.WorkItems.arm_slate_in_txn(txn, closed_assignment.workItemId)
 
-    case Wakes.admit_terminal_notification_in_txn(txn, assignment.id) do
-      {:ok, wake} ->
-        # The typed terminal notice already reports this attest when it reaches
-        # the card opener. Preserve the separate source only when the canonical
-        # terminal route selects another currently accountable recipient.
-        if wake.session_key != assignment_opener_session(assignment) do
-          notify_assignment_opener_of_attest_in_txn(txn, assignment, attest)
-        end
-
-        :ok
-
-      {:error, refusal} ->
-        raise TerminalNotificationRefused, code: refusal.code, message: refusal.message
-    end
+    Tightbeam.RowReactions.observe_assignment_in_txn(
+      txn,
+      before,
+      %{"kind" => "attest", "id" => attest.id},
+      principal_id(call.principal),
+      attest.ts
+    )
 
     liveness_trigger = disposition_liveness_trigger!(txn, closed_assignment.workItemId)
 
@@ -2972,7 +2974,6 @@ defmodule Tightbeam.Assignments do
                      do: raise(TransitionRace)
 
                   attest = insert_attest(txn, call, assignment_id)
-                  notify_assignment_opener_of_attest_in_txn(txn, assignment, attest)
 
                   :ok =
                     Wakes.verification_verdict_in_txn(txn, %{
@@ -3064,7 +3065,8 @@ defmodule Tightbeam.Assignments do
 
   defp complete_attest_condition_fact_deliveries(_db, _scheduler, result), do: result
 
-  defp late_ruling_receipt_request_id(verdict_kind) when is_binary(verdict_kind) do
+  @doc false
+  def late_ruling_receipt_request_id(verdict_kind) when is_binary(verdict_kind) do
     case Regex.run(
            ~r/^ruling-consumed:(dr_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/u,
            verdict_kind
@@ -3074,7 +3076,7 @@ defmodule Tightbeam.Assignments do
     end
   end
 
-  defp late_ruling_receipt_request_id(_), do: :ordinary
+  def late_ruling_receipt_request_id(_), do: :ordinary
 
   defp late_ruling_receipt_in_txn(txn, call, assignment, request_id) do
     with :ok <-
@@ -3091,14 +3093,13 @@ defmodule Tightbeam.Assignments do
         [] ->
           resolved_call = put_in(call, [:params, :verdict_kind], verdict_kind)
           attest = insert_attest(txn, resolved_call, assignment.id, true)
-          notify_assignment_opener_of_attest_in_txn(txn, assignment, attest)
 
           append_attest_marker(txn, attest)
           %{assignment: assignment, attest: attest}
 
         [attest] ->
           if stored_late_ruling_receipt_target(attest) == target do
-            %{assignment: assignment, attest: attest}
+            %{assignment: assignment, attest: attest, replayed: true}
           else
             ruling_consumption_conflict()
           end
@@ -3217,6 +3218,7 @@ defmodule Tightbeam.Assignments do
   end
 
   defp revoke_open_assignment_in_txn(txn, call, assignment_id) do
+    before = Tightbeam.RowReactions.Snapshot.assignment_row(txn, assignment_id)
     {closed_user, closed_session} = opener(call.principal)
     closed_at = now()
     revocation_id = id("rev_")
@@ -3262,7 +3264,15 @@ defmodule Tightbeam.Assignments do
     if Txn.changes(txn) != 1, do: raise(TransitionRace)
     revoked_assignment = fetch_assignment!(txn, assignment_id)
     Tightbeam.WorkItems.arm_slate_in_txn(txn, revoked_assignment.workItemId)
-    admit_revocation_notice!(txn, assignment_id, revocation_id)
+
+    Tightbeam.RowReactions.observe_assignment_in_txn(
+      txn,
+      before,
+      %{"kind" => "assignment_revocation", "id" => revocation_id},
+      principal_id(call.principal),
+      closed_at
+    )
+
     liveness_trigger = disposition_liveness_trigger!(txn, revoked_assignment.workItemId)
 
     settle_cannot_proceed_by_disposition_in_txn(
@@ -3358,16 +3368,6 @@ defmodule Tightbeam.Assignments do
 
       [] ->
         :ok
-    end
-  end
-
-  defp admit_revocation_notice!(txn, assignment_id, revocation_id) do
-    case Wakes.admit_terminal_revocation_in_txn(txn, assignment_id, revocation_id) do
-      {:ok, _wake} ->
-        :ok
-
-      {:error, refusal} ->
-        raise TerminalNotificationRefused, code: refusal.code, message: refusal.message
     end
   end
 
@@ -3575,58 +3575,6 @@ defmodule Tightbeam.Assignments do
 
     append_substrate(txn, attest.bySession, text)
   end
-
-  defp notify_assignment_opener_of_attest_in_txn(txn, assignment, attest) do
-    recipient = assignment_opener_session(assignment)
-
-    recipient_exists? =
-      case assignment do
-        %{openedByUser: user} when is_binary(user) ->
-          Txn.q(
-            txn,
-            "SELECT 1 FROM sessions WHERE sessionKey=?1 AND ownerUserId=?2",
-            [recipient, user]
-          ) == [[1]]
-
-        _ ->
-          Txn.q(txn, "SELECT 1 FROM sessions WHERE sessionKey=?1", [recipient]) == [[1]]
-      end
-
-    if recipient_exists? and not same_attest_principal_as_opener?(assignment, attest) do
-      Wakes.schedule_in_txn(txn, %{
-        session_key: recipient,
-        origin: attest_notice_origin(attest),
-        creator_session_key: attest.bySession,
-        prompt: "Attest #{attest.id} (#{attest.kind}) was filed on assignment #{assignment.id}.",
-        due_at: attest.ts,
-        assignment_id: assignment.id,
-        work_item_id: assignment.workItemId
-      })
-    else
-      :ok
-    end
-  end
-
-  defp same_attest_principal_as_opener?(
-         %{openedByUser: opener, openedBySession: nil},
-         %{byUser: opener, bySession: nil}
-       )
-       when is_binary(opener),
-       do: true
-
-  defp same_attest_principal_as_opener?(
-         %{openedByUser: nil, openedBySession: opener},
-         %{byUser: nil, bySession: opener}
-       )
-       when is_binary(opener),
-       do: true
-
-  defp same_attest_principal_as_opener?(_assignment, _attest), do: false
-
-  defp attest_notice_origin(%{bySession: session}) when is_binary(session),
-    do: "agent:" <> session
-
-  defp attest_notice_origin(%{byUser: user}) when is_binary(user), do: "user:" <> user
 
   defp append_assignment_marker(txn, assignment, :opened) do
     append_substrate(txn, assignment.holderKey, "[assignment opened: #{assignment.id}]")
@@ -4500,7 +4448,7 @@ defmodule Tightbeam.Assignments do
       }
     }
 
-    if assignment.state == "closed" do
+    if assignment.state == "closed" and assignment.closingAttestId == attest.id do
       [
         attest_transition,
         assignment_transition(txn, assignment, call, "attest", %{

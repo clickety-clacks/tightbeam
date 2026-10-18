@@ -2,7 +2,7 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
   @moduledoc false
   import ExUnit.Assertions
   alias Tightbeam.{DB, NoticeBatcher, Schema}
-  @shape "decision-request-row-schema-v2-019"
+  @shape "row-reaction-notice-v1"
   @row_driven_rules_shape "row-driven-rules-v1-019"
   @identity_render_stamp_previous_shape "effort-request-exit-v1-019"
   @effort_request_exit_previous_shape "notice-batching-v1-019"
@@ -663,11 +663,65 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
     :ok
   end
 
+  # Reconstruct the exact previous cancellation carrier before relabeling it.
+  def downgrade_row_reaction_notices!(db) do
+    case DB.query(db, "SELECT shape FROM schema_stamp") do
+      {:ok, [["row-reaction-notice-v1"]]} ->
+        assert {:ok, [[sql]]} =
+                 DB.query(db, "SELECT sql FROM sqlite_master WHERE name='wake_cancellations'")
+
+        route =
+          ~r/\(requesterId = 'tightbeam:row-reactions' AND reasonKind = 'superseded' AND\s+causalSourceKind = 'wake' AND outcomeKind = 'no_replacement'\)\s+OR/
+
+        previous = Regex.replace(route, sql, "", global: false)
+        refute previous == sql
+
+        assert {:ok, triggers} =
+                 DB.query(
+                   db,
+                   "SELECT sql FROM sqlite_master WHERE type='trigger' AND name IN ('wake_cancellations_pending_insert','wakes_typed_cancellation_required') ORDER BY name"
+                 )
+
+        assert length(triggers) == 2
+
+        columns =
+          "wakeId,wakeState,canceledAt,requesterKind,requesterId,reasonKind," <>
+            "causalSourceKind,causalSourceId,outcomeKind,replacementWakeId," <>
+            "dispositionKind,dispositionId,primaryWorkKind,primaryWorkId,workImpactKind," <>
+            "livenessTriggerKind,livenessTriggerId,actionNeeded"
+
+        assert {:ok, :ok} =
+                 DB.migration_transaction(
+                   db,
+                   :fixture_reaction_predecessor,
+                   ["PRAGMA foreign_keys=OFF", "PRAGMA legacy_alter_table=ON"],
+                   ["PRAGMA legacy_alter_table=OFF", "PRAGMA foreign_keys=ON"],
+                   fn txn ->
+                     :ok =
+                       Tightbeam.DB.Txn.exec(txn, """
+                       DROP TRIGGER wake_cancellations_pending_insert;
+                       DROP TRIGGER wakes_typed_cancellation_required;
+                       ALTER TABLE wake_cancellations RENAME TO fixture_reaction_cancellations;
+                       #{previous};
+                       INSERT INTO wake_cancellations (#{columns}) SELECT #{columns} FROM fixture_reaction_cancellations;
+                       DROP TABLE fixture_reaction_cancellations;
+                       #{Enum.map_join(triggers, ";\n", &hd/1)};
+                       UPDATE schema_stamp SET shape='decision-request-row-schema-v2-019';
+                       """)
+                   end
+                 )
+
+      {:ok, [[_historical]]} ->
+        :ok
+    end
+  end
+
   def downgrade_notice_source_storage!(db) do
+    downgrade_row_reaction_notices!(db)
     downgrade_supervision_recorded_state!(db)
 
     case DB.query(db, "SELECT shape FROM schema_stamp") do
-      {:ok, [[@shape]]} ->
+      {:ok, [["decision-request-row-schema-v2-019"]]} ->
         # Reconstruct the known predecessor representation, including source
         # notices emitted while seeding association history; never erase them.
         assert {:ok, [[0]]} =
