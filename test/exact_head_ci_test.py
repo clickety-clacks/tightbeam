@@ -117,36 +117,54 @@ class ExactHeadCI(unittest.TestCase):
         self.assertIn('${CI_SOURCE_SHA::7}.tgz', job)
         self.assertNotIn('${GITHUB_SHA::7}.tgz', job)
 
-    def test_only_guard_release_uses_directly_affected_mix_checks(self):
+    def test_only_selected_maintenance_tags_use_directly_affected_mix_checks(self):
         test_job = self.jobs['test']
         targeted_release = re.search(
             r'(?m)^      TARGETED_GUARD_RELEASE: \$\{\{ (.*?) \}\}$', test_job).group(1)
+        quiet_release = re.search(
+            r'(?m)^      TARGETED_QUIET_RELEASE: \$\{\{ (.*?) \}\}$', test_job).group(1)
         full_suite = re.search(
             r'(?m)^      FULL_SUITE: \$\{\{ (.*?) \}\}$', test_job).group(1)
         targeted_step = re.search(
             r'(?ms)^      - name: Run directly affected successor and wake checks\n'
             r'(.*?)(?=^      - name:|\Z)', test_job).group(1)
+        quiet_step = re.search(
+            r'(?ms)^      - name: Run directly affected quiet progress checks\n'
+            r'(.*?)(?=^      - name:|\Z)', test_job).group(1)
+        quiet_condition = re.search(
+            r'(?m)^        if: (.*)$', quiet_step).group(1)
         targeted_condition = re.search(
             r'(?m)^        if: (.*)$', targeted_step).group(1)
 
         cases = [
-            ('push', 'refs/tags/v0.1.9+2857', False, True),
-            ('push', 'refs/tags/v0.1.9+2855', True, False),
-            ('push', 'refs/tags/v0.1.9+2856', True, False),
-            ('push', 'refs/tags/v0.1.9+2858', True, False),
-            ('push', 'refs/tags/v0.1.10+2857', True, False),
-            ('workflow_dispatch', 'refs/tags/v0.1.9+2857', True, False),
-            ('push', 'refs/heads/0.1.9', False, False),
-            ('pull_request', 'refs/tags/v0.1.9+2857', False, False),
+            ('push', 'refs/tags/v0.1.9+2857', False, True, False),
+            ('push', 'refs/tags/v0.1.9+2880', False, False, True),
+            ('push', 'refs/tags/v0.1.9+2855', True, False, False),
+            ('push', 'refs/tags/v0.1.9+2856', True, False, False),
+            ('push', 'refs/tags/v0.1.9+2858', True, False, False),
+            ('push', 'refs/tags/v0.1.9+2879', True, False, False),
+            ('push', 'refs/tags/v0.1.9+2881', True, False, False),
+            ('push', 'refs/tags/v0.1.10+2880', True, False, False),
+            ('push', 'refs/tags/v0.1.10+2857', True, False, False),
+            ('workflow_dispatch', 'refs/tags/v0.1.9+2857', True, False, False),
+            ('workflow_dispatch', 'refs/tags/v0.1.9+2880', True, False, False),
+            ('push', 'refs/heads/0.1.9', False, False, False),
+            ('pull_request', 'refs/tags/v0.1.9+2857', False, False, False),
+            ('pull_request', 'refs/tags/v0.1.9+2880', False, False, False),
+            ('merge_group', 'refs/tags/v0.1.9+2880', False, False, False),
         ]
-        for event, ref, expected_full_suite, expected_targeted in cases:
+        for event, ref, expected_full, expected_guard, expected_quiet in cases:
             context = {'github.event_name': event, 'github.ref': ref}
-            self.assertEqual(evaluate(targeted_release, context), expected_targeted,
-                             ('TARGETED_GUARD_RELEASE', event, ref))
-            self.assertEqual(evaluate(full_suite, context), expected_full_suite,
-                             ('FULL_SUITE', event, ref))
-            self.assertEqual(evaluate(targeted_condition, context), expected_targeted,
-                             ('targeted checks', event, ref))
+            self.assertEqual(evaluate(targeted_release, context), expected_guard)
+            self.assertEqual(evaluate(quiet_release, context), expected_quiet)
+            self.assertEqual(evaluate(full_suite, context), expected_full)
+            context.update({
+                'env.TARGETED_GUARD_RELEASE': str(expected_guard).lower(),
+                'env.TARGETED_QUIET_RELEASE': str(expected_quiet).lower(),
+            })
+            self.assertEqual(evaluate(targeted_condition, context),
+                             expected_guard or expected_quiet)
+            self.assertEqual(evaluate(quiet_condition, context), expected_quiet)
 
         for name in (
             'Toolchain versions (the parity record)',
@@ -159,15 +177,16 @@ class ExactHeadCI(unittest.TestCase):
                 r'(?ms)^      - name: ' + re.escape(name) +
                 r'\n(.*?)(?=^      - name:|\Z)', test_job).group(1)
             condition = re.search(r'(?m)^        if: (.*)$', step).group(1)
-            for event, ref, expected_full_suite, expected_targeted in cases:
+            for event, ref, expected_full_suite, expected_targeted, expected_quiet in cases:
                 context = {
                     'github.event_name': event,
                     'github.ref': ref,
                     'env.FULL_SUITE': 'true' if expected_full_suite else 'false',
                     'env.TARGETED_GUARD_RELEASE': 'true' if expected_targeted else 'false',
+                    'env.TARGETED_QUIET_RELEASE': 'true' if expected_quiet else 'false',
                 }
                 self.assertEqual(evaluate(condition, context),
-                                 expected_full_suite or expected_targeted,
+                                 expected_full_suite or expected_targeted or expected_quiet,
                                  (name, event, ref))
 
         for name in ('mix test', 'cargo test'):
@@ -191,6 +210,23 @@ class ExactHeadCI(unittest.TestCase):
             'test/verification_papertrail_test.exs:383',
         ):
             self.assertIn(selector, targeted_step)
+
+    def test_quiet_selectors_cover_the_affected_notice_and_upgrade_paths(self):
+        step = re.search(
+            r'(?ms)^      - name: Run directly affected quiet progress checks\n'
+            r'(.*?)(?=^      - name:|\Z)', self.jobs['test']).group(1)
+        expected = [
+            'row_reaction_expression', 'row_reaction_plan', 'row_reaction_store',
+            'row_reaction_notice', 'row_reaction_attest', 'row_reaction_request',
+            'row_reaction_start', 'row_reaction_handoff_snapshot',
+            'row_reaction_terminal_cutover', 'completion_handoff_light_rail',
+            'schema_shape',
+        ]
+        selectors = re.findall(r'test/[a-z_]+_test\.exs', step)
+        self.assertEqual(selectors, ['test/' + name + '_test.exs' for name in expected])
+        self.assertIn('scripts/verify_mix.sh', step)
+        for selector in selectors:
+            self.assertTrue((WORKFLOW.parents[2] / selector).is_file(), selector)
 
     def test_manual_tag_verification_cannot_publish_or_get_write_permission(self):
         release = self.jobs['release']

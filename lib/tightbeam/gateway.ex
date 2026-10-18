@@ -2046,7 +2046,7 @@ defmodule Tightbeam.Gateway do
   end
 
   defp deliver_resolved_prompt_in_txn(txn, session_key, origin, prompt, opts) do
-    case Wakes.terminal_notice_delivery_in_txn(txn, opts[:wake_id]) do
+    case Tightbeam.RowReactions.prepare_notice_in_txn(txn, opts[:wake_id]) do
       :ordinary ->
         case Supervision.idle_cleanup_delivery_in_txn(
                txn,
@@ -2073,9 +2073,9 @@ defmodule Tightbeam.Gateway do
             deliver_prompt_once_in_txn(txn, wake.session_key, wake.origin, wake.prompt, opts)
         end
 
-      {:terminal_notice, wake} ->
+      {:notice, wake} ->
         # Resolution and enqueue share this transaction. Only the persisted
-        # terminal event and its freshly authorized recipient may supply content
+        # notice and its elected recipient may supply content
         # and routing; the caller's stale gate/lineage/prompt cannot override them.
         opts =
           opts
@@ -2087,17 +2087,13 @@ defmodule Tightbeam.Gateway do
           |> Keyword.put(:role_fallback, false)
           |> Keyword.put(:fire_wake_in_txn, true)
 
-        case deliver_prompt_once_in_txn(txn, wake.session_key, wake.origin, wake.prompt, opts) do
-          {:appended, actual_session_key, _message, _delivery_opts} = delivered ->
-            Wakes.terminal_notice_delivered_in_txn(txn, wake.wake_id, actual_session_key)
-            delivered
+        deliver_prompt_once_in_txn(txn, wake.session_key, wake.origin, wake.prompt, opts)
 
-          other ->
-            other
-        end
+      :skipped ->
+        :skipped
 
-      {:terminal_notice_undeliverable, _} = incomplete ->
-        incomplete
+      {:undelivered, evidence} ->
+        {:terminal_notice_undeliverable, evidence}
     end
   end
 
@@ -2416,6 +2412,21 @@ defmodule Tightbeam.Gateway do
       {:appended, message} ->
         {assignment_id, job_ref} = turn_attribution(txn, opts)
 
+        # Capture each actual source before enqueue updates its delivery pointer.
+        # A carrier and its sources share the one successfully appended turn.
+        source_ids =
+          if is_binary(opts[:wake_id]),
+            do:
+              Enum.uniq([
+                opts[:wake_id] | NoticeBatcher.carrier_source_ids_in_txn(txn, opts[:wake_id])
+              ]),
+            else: []
+
+        reaction_before =
+          source_ids
+          |> Enum.map(&Tightbeam.RowReactions.Snapshot.wake(txn, &1))
+          |> Enum.reject(&is_nil/1)
+
         enqueued =
           Ledger.enqueue_in_txn(txn, %{
             session_key: target,
@@ -2487,6 +2498,23 @@ defmodule Tightbeam.Gateway do
             # No-ops for every non-bracket wake (the discriminator is the item's
             # routing/slate wake-id matching this wake).
             WorkItems.rearm_on_fire_in_txn(txn, opts[:wake_id], opts[:target_gate])
+            [[delivered_at]] = DB.Txn.q(txn, "SELECT createdAt FROM turns WHERE seq=?1", [seq])
+
+            Enum.each(reaction_before, fn before ->
+              Tightbeam.RowReactions.observe_wake_delivery_in_txn(
+                txn,
+                before,
+                %{
+                  "sessionKey" => target,
+                  "turnSeq" => seq,
+                  "carrierWakeId" =>
+                    if(before["wakeId"] == opts[:wake_id], do: nil, else: opts[:wake_id])
+                },
+                "process:tightbeam",
+                delivered_at
+              )
+            end)
+
             Tightbeam.Firehose.Publisher.message_in_txn(txn, target, message)
 
             {:appended, target, message, opts}
@@ -5347,11 +5375,15 @@ defmodule Tightbeam.Gateway do
   def load_law!(config, verbs \\ nil) do
     verbs = verbs || config |> handlers() |> Map.keys()
 
-    Identity.with_recovery_law!(config.base_dir, fn law_base, revision ->
-      Archetypes.load!(law_base)
-      Rails.load!(law_base)
-      Rules.load!(config.base_dir, verbs, law_base: law_base, revision: revision)
-    end)
+    rules =
+      Identity.with_recovery_law!(config.base_dir, fn law_base, revision ->
+        Archetypes.load!(law_base)
+        Rails.load!(law_base)
+        Rules.load!(config.base_dir, verbs, law_base: law_base, revision: revision)
+      end)
+
+    :ok = Tightbeam.RowReactions.recover(Map.get(config, :db, Tightbeam.DB))
+    rules
   end
 
   defp identity_status_result(config, db, call) do

@@ -28,6 +28,7 @@ defmodule Tightbeam.Boot do
     Tightbeam.Identity.init_after_admission!(base_dir, Tightbeam.DB)
     Tightbeam.Gateway.load_law!(config)
     :ok = Schema.ensure_all(Tightbeam.DB)
+    :ok = Tightbeam.RowReactions.recover(Tightbeam.DB)
     epoch = EventLog.boot()
     Application.put_env(:tightbeam, :boot_epoch, epoch)
     # Boot recovery: any 'running' turn from a prior life is UNKNOWN-terminal.

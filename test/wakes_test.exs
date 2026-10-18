@@ -1383,12 +1383,12 @@ defmodule Tightbeam.WakesTest do
 
   describe "accountable parent terminal relation" do
     test "user opener owns notice despite a distinct child owner", %{db: db} do
-      personal = parent_relation_fixture(db)
+      {personal, before_close} = parent_relation_fixture(db)
 
       assert {:ok, {:ok, wake}} =
                DB.transaction(
                  db,
-                 &Wakes.admit_terminal_notification_in_txn(&1, "asg_parent_relation")
+                 &observe_parent_relation_in_txn(&1, before_close)
                )
 
       assert wake.owner_user_id == "parent-owner"
@@ -1409,7 +1409,7 @@ defmodule Tightbeam.WakesTest do
       assert {:ok, {:ok, ^wake}} =
                DB.transaction(
                  db,
-                 &Wakes.admit_terminal_notification_in_txn(&1, "asg_parent_relation")
+                 &observe_parent_relation_in_txn(&1, before_close)
                )
 
       assert parent_relation_snapshot(db) == before
@@ -1418,7 +1418,7 @@ defmodule Tightbeam.WakesTest do
     test "session opener is preferred and fallback stays with parent owner, never child", %{
       db: db
     } do
-      personal = parent_relation_fixture(db)
+      {personal, before_close} = parent_relation_fixture(db)
 
       :ok =
         DB.execute(
@@ -1429,14 +1429,14 @@ defmodule Tightbeam.WakesTest do
       assert {:ok, {:ok, wake}} =
                DB.transaction(
                  db,
-                 &Wakes.admit_terminal_notification_in_txn(&1, "asg_parent_relation")
+                 &observe_parent_relation_in_txn(&1, before_close)
                )
 
       assert wake.session_key == "accountable-parent"
       assert wake.owner_user_id == "parent-owner"
 
-      assert {:ok, {:terminal_notice, preferred}} =
-               DB.transaction(db, &Wakes.terminal_notice_delivery_in_txn(&1, wake.wake_id))
+      assert {:ok, {:notice, preferred}} =
+               DB.transaction(db, &Tightbeam.RowReactions.prepare_notice_in_txn(&1, wake.wake_id))
 
       assert preferred.session_key == "accountable-parent"
 
@@ -1446,8 +1446,8 @@ defmodule Tightbeam.WakesTest do
           "UPDATE sessions SET state='retired' WHERE sessionKey='accountable-parent'"
         )
 
-      assert {:ok, {:terminal_notice, fallback}} =
-               DB.transaction(db, &Wakes.terminal_notice_delivery_in_txn(&1, wake.wake_id))
+      assert {:ok, {:notice, fallback}} =
+               DB.transaction(db, &Tightbeam.RowReactions.prepare_notice_in_txn(&1, wake.wake_id))
 
       assert fallback.session_key == personal
       assert fallback.prompt == wake.prompt
@@ -1482,7 +1482,7 @@ defmodule Tightbeam.WakesTest do
         assert {:ok, {:error, %{code: "invalid_terminal_notification_relation"}}} =
                  DB.transaction(
                    db,
-                   &Wakes.admit_terminal_notification_in_txn(&1, "asg_parent_relation")
+                   &Tightbeam.RowReactionFixtures.source_in_txn(&1, "asg_parent_relation")
                  )
 
         assert parent_relation_snapshot(db) == before
@@ -1490,7 +1490,7 @@ defmodule Tightbeam.WakesTest do
     end
 
     test "admin revocation preserves independent holder and actual opener authority", %{db: db} do
-      personal = parent_relation_fixture(db, false)
+      {personal, _before_close} = parent_relation_fixture(db, false)
 
       assert %{state: "closed", outcome: "revoked"} =
                Tightbeam.Assignments.__handle__(db, "revoke-assignment", %{
@@ -1517,7 +1517,11 @@ defmodule Tightbeam.WakesTest do
       assert {:ok, {:ok, wake}} =
                DB.transaction(
                  db,
-                 &Wakes.admit_terminal_revocation_in_txn(&1, "asg_parent_relation", token)
+                 &Tightbeam.RowReactionFixtures.replay_terminal_in_txn(
+                   &1,
+                   "asg_parent_relation",
+                   token
+                 )
                )
 
       assert wake.owner_user_id == "parent-owner"
@@ -1529,7 +1533,11 @@ defmodule Tightbeam.WakesTest do
       assert {:ok, {:ok, ^wake}} =
                DB.transaction(
                  db,
-                 &Wakes.admit_terminal_revocation_in_txn(&1, "asg_parent_relation", token)
+                 &Tightbeam.RowReactionFixtures.replay_terminal_in_txn(
+                   &1,
+                   "asg_parent_relation",
+                   token
+                 )
                )
 
       assert parent_relation_snapshot(db) == before
@@ -1537,6 +1545,7 @@ defmodule Tightbeam.WakesTest do
   end
 
   defp parent_relation_fixture(db, close \\ true) do
+    Tightbeam.RowReactionFixtures.elect_handoff(Map.keys(Tightbeam.Gateway.handlers(%{db: db})))
     personal = Tightbeam.Org.personal_session_key("parent-owner")
 
     :ok =
@@ -1550,6 +1559,12 @@ defmodule Tightbeam.WakesTest do
       INSERT INTO assignments (id,subject,holderKey,openedByUser,openedAt,workItemId) VALUES ('asg_parent_relation','independent child','independent-child','parent-owner',1,'wi_parent_relation');
       """)
 
+    {:ok, before_close} =
+      DB.transaction(
+        db,
+        &Tightbeam.RowReactions.Snapshot.assignment_row(&1, "asg_parent_relation")
+      )
+
     if close do
       :ok =
         DB.execute(db, """
@@ -1558,7 +1573,22 @@ defmodule Tightbeam.WakesTest do
         """)
     end
 
-    personal
+    {personal, before_close}
+  end
+
+  # This fixture captured its open row before writing the terminal source.
+  defp observe_parent_relation_in_txn(txn, before_close) do
+    with {:ok, source} <- Tightbeam.RowReactionFixtures.source_in_txn(txn, "asg_parent_relation") do
+      Tightbeam.RowReactions.observe_assignment_in_txn(
+        txn,
+        before_close,
+        %{"kind" => source.source_kind, "id" => source.source_token},
+        "session:independent-child",
+        source.terminal_at
+      )
+
+      Tightbeam.RowReactionFixtures.replay_terminal_in_txn(txn, "asg_parent_relation")
+    end
   end
 
   defp parent_relation_snapshot(db) do
