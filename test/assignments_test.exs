@@ -84,7 +84,7 @@ defmodule Tightbeam.AssignmentsTest do
                )
     end
 
-    test "session-opened cards retain one batchable source row for each new attest", ctx do
+    test "session-opened cards do not receive routine progress attest notices", ctx do
       session(ctx.db, "notice-parent", "flynn")
 
       assignment =
@@ -95,49 +95,14 @@ defmodule Tightbeam.AssignmentsTest do
       result = handle(ctx, "attest", attest_call({:session, "holder"}, assignment_id, "progress"))
       assert result.attest.assignmentId == assignment_id
 
-      assert {:ok,
-              [
-                [
-                  wake_id,
-                  "notice-parent",
-                  "agent:holder",
-                  "holder",
-                  prompt,
-                  ^assignment_id,
-                  "fyi",
-                  "classifier",
-                  "notice-batching-v1 r2",
-                  due_at
-                ]
-              ]} =
-               DB.query(
-                 ctx.db,
-                 """
-                 SELECT wakeId, sessionKey, origin, creatorSessionKey, prompt, assignmentId,
-                        class, classElection, deliveryRule, dueAt
-                 FROM wakes WHERE sessionKey='notice-parent' AND assignmentId=?1
-                 """,
-                 [assignment.id]
-               )
-
-      assert prompt =~ result.attest.id
-      assert prompt =~ "progress"
-      assert due_at == result.attest.ts
-
-      assert {:ok, [["pending", "prompt", 0, ^due_at]]} =
-               DB.query(
-                 ctx.db,
-                 "SELECT state,consumer,digest,dueAt FROM wakes WHERE wakeId=?1",
-                 [wake_id]
-               )
-
       assert {:ok, [[0]]} =
                DB.query(
                  ctx.db,
-                 "SELECT COUNT(*) FROM notice_batch_members WHERE sourceWakeId=?1",
-                 [
-                   wake_id
-                 ]
+                 """
+                 SELECT COUNT(*) FROM wakes
+                 WHERE sessionKey='notice-parent' AND assignmentId=?1 AND prompt LIKE 'Attest %'
+                 """,
+                 [assignment_id]
                )
     end
 
