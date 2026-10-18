@@ -1222,7 +1222,8 @@ defmodule Tightbeam.Productions.BubbleTest do
 
     expected_source_id = to_string(fact_id)
 
-    assert {:ok, [["cannot_proceed_released", "condition_fact", ^expected_source_id, "no_replacement"]]} =
+    assert {:ok,
+            [["cannot_proceed_released", "condition_fact", ^expected_source_id, "no_replacement"]]} =
              DB.query(
                ctx.db,
                "SELECT reasonKind,causalSourceKind,causalSourceId,outcomeKind FROM wake_cancellations WHERE wakeId=?1",
