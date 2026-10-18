@@ -571,6 +571,28 @@ mod tests {
     }
 
     #[test]
+    fn optional_subscription_metadata_never_invents_a_tier_or_discards_login() {
+        for metadata in [
+            "",
+            r#", "subscription_type":null"#,
+            r#", "subscription_type":"""#,
+        ] {
+            let body = format!(
+                r#"{{"access_token":"at","refresh_token":"rt","expires_in":60,
+                    "scope":"user:inference user:sessions:claude_code"{metadata}}}"#
+            );
+            let credential = parse_credential(&body).unwrap();
+            let written: serde_json::Value =
+                serde_json::from_str(&credentials_json(&credential)).unwrap();
+            let oauth = &written["claudeAiOauth"];
+            assert_eq!(oauth["accessToken"], "at");
+            assert_eq!(oauth["refreshToken"], "rt");
+            assert!(oauth["expiresAt"].as_i64().unwrap() > now_ms());
+            assert!(oauth.get("subscriptionType").is_none());
+        }
+    }
+
+    #[test]
     fn the_credential_file_has_the_shape_claude_code_reads() {
         let credential = parse_credential(
             r#"{"access_token":"at","refresh_token":"rt","expires_in":60,
