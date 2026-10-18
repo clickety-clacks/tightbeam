@@ -1197,7 +1197,7 @@ defmodule Tightbeam.Productions.BubbleTest do
     assert Exception.message(error) =~ "decision disposer changed"
     assert Tightbeam.Wakes.get(ctx.db, leaf).state == "pending"
 
-    assert {:ok, %{fact_id: _}} =
+    assert {:ok, %{fact_id: fact_id}} =
              DB.transaction(ctx.db, fn txn ->
                ConditionFacts.file_in_txn(txn, %{
                  kind: "reviewed",
@@ -1220,10 +1220,12 @@ defmodule Tightbeam.Productions.BubbleTest do
     assert prewrite_restore!(ctx.db, turn, false) == successors
     assert Tightbeam.Wakes.get(ctx.db, leaf).state == "canceled"
 
-    assert {:ok, [[1]]} =
+    expected_source_id = to_string(fact_id)
+
+    assert {:ok, [["cannot_proceed_released", "condition_fact", ^expected_source_id, "no_replacement"]]} =
              DB.query(
                ctx.db,
-               "SELECT count(*) FROM wake_cancellations WHERE wakeId=?1 AND reasonKind='cannot_proceed_released'",
+               "SELECT reasonKind,causalSourceKind,causalSourceId,outcomeKind FROM wake_cancellations WHERE wakeId=?1",
                [leaf]
              )
   end

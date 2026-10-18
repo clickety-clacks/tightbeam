@@ -834,14 +834,10 @@ defmodule Tightbeam.Assignments do
       )
 
       if Txn.changes(txn) == 1 do
-        :ok =
-          Escalation.settle_agent_request_in_txn(
-            txn,
-            request_id,
-            "process:tightbeam",
-            "cannot-proceed released by condition fact #{fact.fact_id}"
-          )
-
+        # Retract the active retry leaf under the clearing fact's provenance
+        # before settling the linked request. Settling the request also clears
+        # its stored notice, which would otherwise win first and hide the
+        # source-owned condition clear.
         wake_id = Tightbeam.NoticeAuthority.current!(txn, wake_id)
 
         case Txn.q(txn, "SELECT state FROM wakes WHERE wakeId=?1", [wake_id]) do
@@ -860,6 +856,14 @@ defmodule Tightbeam.Assignments do
           [[state]] when state in ["fired", "canceled"] ->
             :ok
         end
+
+        :ok =
+          Escalation.settle_agent_request_in_txn(
+            txn,
+            request_id,
+            "process:tightbeam",
+            "cannot-proceed released by condition fact #{fact.fact_id}"
+          )
 
         :ok = EffortCheckin.reconcile_wait_relief_in_txn(txn, assignment_id, fact.ts)
 
