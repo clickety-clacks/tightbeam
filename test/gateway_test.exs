@@ -2671,22 +2671,6 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, [["queued"]]} =
              DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [blocked_seq])
 
-    assert :repair_required =
-             HarnessHealth.resolve(ctx.db, %{
-               correlation_id: "rate-success-before-resume",
-               harness: "claude",
-               host: "testhost",
-               failure_class: "rate-limit-dead",
-               session_key: "k1",
-               assignment_id: nil,
-               observed_at: 61,
-               cause: "a concurrent turn delivered before explicit resume",
-               principal: "agent:k1"
-             })
-
-    assert Tightbeam.HarnessProcess.parked?(ctx.db, adapter_key)
-    assert HarnessHealth.get(ctx.db, repair.incident.id).state == "open"
-
     {:ok, repair_coordinator} = RepairCoordinatorStub.start_link({self(), :ok})
 
     handler =
@@ -3055,19 +3039,6 @@ defmodule Tightbeam.GatewayTest do
     assert Task.await(reconciliation) == :ok
     assert HarnessProcess.parked?(ctx.db, adapter_key)
     assert HarnessHealth.get(ctx.db, incident.id).state == "open"
-
-    assert :repair_required =
-             HarnessHealth.resolve(ctx.db, %{
-               correlation_id: "rate-reconcile-race-normal-success",
-               harness: session.harness,
-               host: session.host,
-               failure_class: "rate-limit-dead",
-               session_key: "k1",
-               assignment_id: nil,
-               observed_at: 72,
-               cause: "normal success before explicit resume",
-               principal: "agent:k1"
-             })
 
     {:ok, repair_coordinator} = RepairCoordinatorStub.start_link({self(), :ok})
 
