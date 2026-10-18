@@ -1622,7 +1622,9 @@ defmodule Tightbeam.Schema do
             String.replace(
               sql,
               disposition_fallback,
-              source_disposition_arms <> disposition_fallback, global: false)
+              source_disposition_arms <> disposition_fallback,
+              global: false
+            )
 
           no_replacement_marker =
             "(outcomeKind = 'no_replacement' AND replacementWakeId IS NULL AND"
