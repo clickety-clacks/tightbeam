@@ -2250,9 +2250,8 @@ defmodule Tightbeam.Assignments do
 
     predecessor = fetch_assignment(txn, predecessor_id)
 
-    if is_nil(predecessor) or
-         not successor_predecessor_visible?(txn, call.principal, predecessor),
-       do: successor_error!("unknown_assignment", "unknown assignment: #{supplied}")
+    if is_nil(predecessor),
+      do: successor_error!("unknown_assignment", "unknown assignment: #{supplied}")
 
     if predecessor.state != "closed",
       do:
@@ -2310,31 +2309,6 @@ defmodule Tightbeam.Assignments do
           :unknown
         end
     end
-  end
-
-  defp successor_predecessor_visible?(txn, principal, predecessor) do
-    work_owner =
-      case predecessor.workItemId do
-        nil ->
-          nil
-
-        work_item_id ->
-          case Txn.q(txn, "SELECT ownerUserId FROM work_items WHERE id = ?1", [work_item_id]) do
-            [[owner_user_id]] -> owner_user_id
-            [] -> nil
-          end
-      end
-
-    principal in Enum.reject(
-      [
-        {:session, predecessor.holderKey},
-        predecessor.openedBySession && {:session, predecessor.openedBySession},
-        predecessor.openedByUser && {:user, predecessor.openedByUser},
-        work_owner && {:user, work_owner},
-        work_owner && {:session, Org.personal_session_key(work_owner)}
-      ],
-      &is_nil/1
-    )
   end
 
   defp successor_chain_in_txn!(

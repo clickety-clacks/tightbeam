@@ -74,11 +74,12 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
   end
 
   test "the shipped bundle omits count-triggered mandatory diagnosis", ctx do
+    refute Enum.any?(ctx.rules, &(&1.name == "wake-obligation-registration-authority"))
+
     expected = [
       "completion-requires-review",
       "completion-requires-verification",
-      "completion-requires-results-artifact",
-      "wake-obligation-registration-authority"
+      "completion-requires-results-artifact"
     ]
 
     names =
