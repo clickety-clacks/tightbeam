@@ -1815,7 +1815,9 @@ defmodule Tightbeam.Placement do
         )
 
       {:error, {:credential_owner_exit, reason}} ->
-        Logger.error("credential owner unavailable for #{module.id()} on #{host}: #{inspect(reason)}")
+        Logger.error(
+          "credential owner unavailable for #{module.id()} on #{host}: #{inspect(reason)}"
+        )
 
       result ->
         try do
