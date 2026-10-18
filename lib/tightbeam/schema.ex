@@ -1593,7 +1593,7 @@ defmodule Tightbeam.Schema do
           # the source's own notice to be retracted.
           disposition_fallback =
             "(workImpactKind != 'linked_work_open' AND livenessTriggerKind IS NULL AND\n" <>
-              "             livenessTriggerId IS NULL AND actionNeeded = 0)))"
+              "       livenessTriggerId IS NULL AND actionNeeded = 0)))"
 
           source_disposition_arms = """
             (workImpactKind = 'linked_work_open' AND livenessTriggerKind IS NULL AND
@@ -1631,7 +1631,7 @@ defmodule Tightbeam.Schema do
 
           no_replacement_fallback =
             "(workImpactKind != 'linked_work_open' AND livenessTriggerKind IS NULL AND\n" <>
-              "             livenessTriggerId IS NULL AND actionNeeded = 0)))"
+              "       livenessTriggerId IS NULL AND actionNeeded = 0)))"
 
           no_replacement_source_arms = """
             (workImpactKind = 'linked_work_open' AND livenessTriggerKind IS NULL AND
