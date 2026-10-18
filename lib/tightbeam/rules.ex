@@ -393,7 +393,7 @@ defmodule Tightbeam.Rules do
               Enum.reduce(affected, unavailable, &Map.put(&2, &1, path))
             )
 
-            [{:reaction_error, path}]
+            []
         end
       end)
       |> Enum.map(fn
@@ -417,10 +417,7 @@ defmodule Tightbeam.Rules do
     rules = for {:rule, rule} <- entries, do: rule
     policies = for {:policy, policy} <- entries, do: policy
 
-    reactions = for {:reaction, reaction} <- entries, do: reaction
-    reaction_errors = for {:reaction_error, path} <- entries, do: path
-
-    named = rules ++ policies ++ reactions
+    named = rules ++ policies
 
     duplicates = named |> Enum.frequencies_by(& &1.name)
 
@@ -496,15 +493,6 @@ defmodule Tightbeam.Rules do
     :persistent_term.put(@persist_key, rules)
     :persistent_term.put(@policy_key, policies)
 
-    reaction_errors =
-      reaction_errors ++
-        for reaction <- reactions, duplicates[reaction.name] > 1, do: reaction.source
-
-    :persistent_term.put(
-      {__MODULE__, :reactions},
-      if(reaction_errors == [], do: {:ok, reactions}, else: {:error, Enum.uniq(reaction_errors)})
-    )
-
     RuleRuntime.install_admission(&evaluate/2)
 
     RuleRuntime.install(%{
@@ -515,17 +503,6 @@ defmodule Tightbeam.Rules do
     })
 
     rules
-  end
-
-  @doc false
-  def reactions do
-    case :persistent_term.get({__MODULE__, :reactions}, {:ok, []}) do
-      {:ok, reactions} ->
-        reactions
-
-      {:error, paths} ->
-        raise ArgumentError, "reaction election unavailable: #{Enum.join(paths, ", ")}"
-    end
   end
 
   @doc "Select the bytewise-smallest matching predicate-only policy for one snapshot."
@@ -1276,7 +1253,7 @@ defmodule Tightbeam.Rules do
         {:error, error} -> raise ArgumentError, "#{path}: invalid TOML: #{inspect(error)}"
       end
 
-    unknown = unknown_keys(manifest, MapSet.new(["rule", "policy", "reaction"]))
+    unknown = unknown_keys(manifest, MapSet.new(["rule", "policy"]))
 
     if unknown != [],
       do: raise(ArgumentError, "#{path}: unknown root keys: #{Enum.join(unknown, ", ")}")
@@ -1334,23 +1311,10 @@ defmodule Tightbeam.Rules do
           raise ArgumentError, "#{path}: [[policy]] must be a non-empty array of tables"
       end
 
-    reactions =
-      Tightbeam.RowReactions.Loader.compile!(
-        manifest,
-        path,
-        base_dir,
-        identity_manifest_sha,
-        contents
-      )
+    if rules == [] and policies == [],
+      do: raise(ArgumentError, "#{path}: must contain one or more [[rule]] or [[policy]] tables")
 
-    if rules == [] and policies == [] and reactions == [],
-      do:
-        raise(
-          ArgumentError,
-          "#{path}: must contain one or more [[rule]], [[policy]] or [[reaction]] tables"
-        )
-
-    rules ++ policies ++ reactions
+    rules ++ policies
   end
 
   defp validate_policy!(path, ordinal, policy, identity_manifest_sha) when is_map(policy) do

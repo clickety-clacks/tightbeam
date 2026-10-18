@@ -541,16 +541,6 @@ defmodule Tightbeam.Ledger do
                   [] -> {nil, nil, nil, nil}
                 end
 
-              before_claim =
-                case Txn.q(
-                       txn,
-                       "SELECT seq FROM turns WHERE sessionKey=?1 AND status='queued' ORDER BY seq LIMIT 1",
-                       [session_key]
-                     ) do
-                  [[seq]] -> Tightbeam.RowReactions.Snapshot.turn(txn, seq)
-                  [] -> nil
-                end
-
               Txn.q(
                 txn,
                 """
@@ -613,13 +603,6 @@ defmodule Tightbeam.Ledger do
                        "process:tightbeam"
                      ) do
                   DB.record_row_commit(txn, transition)
-
-                  Tightbeam.RowReactions.observe_turn_in_txn(
-                    txn,
-                    Map.put(transition, :reaction_before, before_claim),
-                    at: now,
-                    principal: "process:tightbeam"
-                  )
                 end
 
                 Publisher.turn_in_txn(txn, "turn.started", seq)

@@ -46,7 +46,7 @@ defmodule Tightbeam.AssignmentsTest do
     other = session(db, "other-session", "other")
     gateway_config = %{db: db, wake_tick_ms: 1_000}
     handlers = Gateway.handlers(gateway_config)
-    Tightbeam.RowReactionFixtures.elect_handoff(Map.keys(handlers))
+    Rules.load!(System.tmp_dir!(), Map.keys(handlers))
     %{db: db, holder: holder, other: other, handlers: handlers}
   end
 
@@ -84,43 +84,67 @@ defmodule Tightbeam.AssignmentsTest do
                )
     end
 
-    test "session-opened cards retain progress evidence without an automatic notice", ctx do
+    test "session-opened cards retain one batchable source row for each new attest", ctx do
       session(ctx.db, "notice-parent", "flynn")
 
       assignment =
-        handle(ctx, "assign", assign_call({:session, "notice-parent"}, "quiet progress"))
+        handle(ctx, "assign", assign_call({:session, "notice-parent"}, "attest notice"))
 
-      {:ok, before_wakes} =
-        DB.query(ctx.db, "SELECT wakeId FROM wakes WHERE assignmentId=?1 ORDER BY wakeId", [
-          assignment.id
-        ])
+      assignment_id = assignment.id
 
-      result = handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "progress"))
-      assert result.attest.assignmentId == assignment.id
+      result = handle(ctx, "attest", attest_call({:session, "holder"}, assignment_id, "progress"))
+      assert result.attest.assignmentId == assignment_id
 
-      assert {:ok, [["progress", "holder"]]} =
-               DB.query(ctx.db, "SELECT kind,bySession FROM attests WHERE id=?1", [
-                 result.attest.id
-               ])
-
-      assert {:ok, ^before_wakes} =
+      assert {:ok,
+              [
+                [
+                  wake_id,
+                  "notice-parent",
+                  "agent:holder",
+                  "holder",
+                  prompt,
+                  ^assignment_id,
+                  "fyi",
+                  "classifier",
+                  "notice-batching-v1 r2",
+                  due_at
+                ]
+              ]} =
                DB.query(
                  ctx.db,
-                 "SELECT wakeId FROM wakes WHERE assignmentId=?1 ORDER BY wakeId",
+                 """
+                 SELECT wakeId, sessionKey, origin, creatorSessionKey, prompt, assignmentId,
+                        class, classElection, deliveryRule, dueAt
+                 FROM wakes WHERE sessionKey='notice-parent' AND assignmentId=?1
+                 """,
+                 [assignment.id]
+               )
+
+      assert prompt =~ result.attest.id
+      assert prompt =~ "progress"
+      assert due_at == result.attest.ts
+
+      assert {:ok, [["pending", "prompt", 0, ^due_at]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT state,consumer,digest,dueAt FROM wakes WHERE wakeId=?1",
+                 [wake_id]
+               )
+
+      assert {:ok, [[0]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM notice_batch_members WHERE sourceWakeId=?1",
                  [
-                   assignment.id
+                   wake_id
                  ]
                )
     end
 
-    test "user-opened cards retain an ordinary verdict without an automatic notice", ctx do
-      session(ctx.db, Org.personal_session_key("flynn"), "flynn")
-      assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "quiet verdict"))
-
-      {:ok, before_wakes} =
-        DB.query(ctx.db, "SELECT wakeId FROM wakes WHERE assignmentId=?1 ORDER BY wakeId", [
-          assignment.id
-        ])
+    test "user-opened cards route a ruling notice to the opener's Main session", ctx do
+      personal = Org.personal_session_key("flynn")
+      session(ctx.db, personal, "flynn")
+      assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "user-opened card"))
 
       result =
         attest_call({:session, "other-session"}, assignment.id, "verdict")
@@ -129,18 +153,33 @@ defmodule Tightbeam.AssignmentsTest do
 
       assert result.attest.bySession == "other-session"
 
-      assert {:ok, [["verdict", "reviewed"]]} =
-               DB.query(ctx.db, "SELECT kind,verdictKind FROM attests WHERE id=?1", [
-                 result.attest.id
-               ])
-
-      assert {:ok, ^before_wakes} =
+      assert {:ok, [[wake_id, ^personal, "agent:other-session", "other-session", prompt]]} =
                DB.query(
                  ctx.db,
-                 "SELECT wakeId FROM wakes WHERE assignmentId=?1 ORDER BY wakeId",
+                 """
+                 SELECT wakeId, sessionKey, origin, creatorSessionKey, prompt
+                 FROM wakes WHERE sessionKey=?1 AND assignmentId=?2
+                 """,
+                 [personal, assignment.id]
+               )
+
+      assert prompt =~ result.attest.id
+      assert prompt =~ "verdict"
+
+      assert {:ok, [["pending", "prompt", 0, ^prompt]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT state,consumer,digest,prompt FROM wakes WHERE wakeId=?1",
                  [
-                   assignment.id
+                   wake_id
                  ]
+               )
+
+      assert {:ok, [[0]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM notice_batch_members WHERE sourceWakeId=?1",
+                 [wake_id]
                )
     end
   end
@@ -672,7 +711,7 @@ defmodule Tightbeam.AssignmentsTest do
         assert wake.due_at == closed.attest.ts
 
         before = terminal_notice_snapshot(ctx.db)
-        assert {:ok, {:ok, ^wake}} = replay_terminal_notice(ctx.db, assignment.id)
+        assert {:ok, {:ok, ^wake}} = admit_terminal_notice(ctx.db, assignment.id)
         assert terminal_notice_snapshot(ctx.db) == before
         assert [^wake] = terminal_notices(ctx.db)
 
@@ -726,36 +765,6 @@ defmodule Tightbeam.AssignmentsTest do
       notices = Map.new(terminal_notices(ctx.db), &{&1.assignment_id, &1})
       assert notices[delegated.id].session_key == "notice-parent"
       refute Map.has_key?(notices, sibling.id)
-    end
-
-    test "no elected handoff commits terminal commands without automatic intent", ctx do
-      Rules.load!(System.tmp_dir!(), Map.keys(ctx.handlers))
-      session(ctx.db, "notice-parent", "flynn")
-      first = handle(ctx, "assign", terminal_notice_assign_call({:session, "notice-parent"}))
-
-      assert %{assignment: %{state: "closed", outcome: "completed"}} =
-               handle(ctx, "attest", attest_call({:session, "holder"}, first.id, "completion"))
-
-      second = handle(ctx, "assign", terminal_notice_assign_call({:session, "notice-parent"}))
-
-      assert %{state: "closed", outcome: "revoked"} =
-               handle(
-                 ctx,
-                 "revoke-assignment",
-                 revoke_call({:session, "notice-parent"}, second.id)
-               )
-
-      assert terminal_notices(ctx.db) == []
-
-      assert {:ok, [[0]]} =
-               DB.query(
-                 ctx.db,
-                 "SELECT COUNT(*) FROM row_reaction_actions WHERE family='terminal-handoff'"
-               )
-
-      Tightbeam.RowReactionFixtures.elect_handoff(Map.keys(ctx.handlers))
-      assert :ok = Tightbeam.RowReactions.recover(ctx.db)
-      assert terminal_notices(ctx.db) == []
     end
 
     test "human opener without a work item admits to its durable owner's main", ctx do
@@ -837,10 +846,8 @@ defmodule Tightbeam.AssignmentsTest do
         {:ok, _} = DB.query(ctx.db, sql, params)
         before = terminal_notice_snapshot(ctx.db)
 
-        assert {:ok, :unresolved} =
-                 DB.transaction(ctx.db, fn txn ->
-                   Wakes.legacy_terminal_source_in_txn(txn, Wakes.get_in_txn(txn, wake.wake_id))
-                 end)
+        assert {:ok, {:error, %{code: "terminal_notification_conflict"}}} =
+                 admit_terminal_notice(ctx.db, assignment.id)
 
         assert terminal_notice_snapshot(ctx.db) == before
       end
@@ -860,7 +867,7 @@ defmodule Tightbeam.AssignmentsTest do
       before = terminal_notice_snapshot(ctx.db)
 
       assert {:ok, {:ok, %{state: "fired", fired_at: 123}}} =
-               replay_terminal_notice(ctx.db, assignment.id)
+               admit_terminal_notice(ctx.db, assignment.id)
 
       assert terminal_notice_snapshot(ctx.db) == before
     end
@@ -889,7 +896,7 @@ defmodule Tightbeam.AssignmentsTest do
       before = terminal_notice_snapshot(ctx.db)
 
       assert {:ok, {:error, %{code: "invalid_terminal_notification_relation"}}} =
-               replay_terminal_notice(ctx.db, assignment.id)
+               admit_terminal_notice(ctx.db, assignment.id)
 
       assert terminal_notice_snapshot(ctx.db) == before
       assert [] = terminal_notices(ctx.db)
@@ -1299,7 +1306,7 @@ defmodule Tightbeam.AssignmentsTest do
       restarted = terminal_notice_scheduler(ctx.db)
       assert :ok = Wakes.fire_due(restarted)
       assert {:terminal_notice_undeliverable, _} = deliver_terminal_notice(ctx.db, wake)
-      assert {:ok, {:ok, ^incomplete}} = replay_terminal_notice(ctx.db, assignment.id)
+      assert {:ok, {:ok, ^incomplete}} = admit_terminal_notice(ctx.db, assignment.id)
       assert terminal_notice_snapshot(ctx.db) == before
 
       assert {:ok, [[1]]} =
@@ -1350,7 +1357,7 @@ defmodule Tightbeam.AssignmentsTest do
       assert {:duplicate, %{turn_seq: ^seq}} =
                deliver_terminal_notice(ctx.db, Wakes.get(ctx.db, carrier_id))
 
-      assert {:ok, {:ok, replay}} = replay_terminal_notice(ctx.db, assignment.id)
+      assert {:ok, {:ok, replay}} = admit_terminal_notice(ctx.db, assignment.id)
       assert replay.wake_id == wake.wake_id
       assert replay.state == "fired"
 
@@ -1436,7 +1443,7 @@ defmodule Tightbeam.AssignmentsTest do
         assert %{outcome: "revoked"} =
                  handle(ctx, "revoke-assignment", revoke_call(principal, assignment.id))
 
-        assert {:ok, {:ok, ^wake}} = replay_terminal_notice(ctx.db, assignment.id)
+        assert {:ok, {:ok, ^wake}} = admit_terminal_notice(ctx.db, assignment.id)
         assert revocation_notice_snapshot(ctx.db) == before
       end
     end
@@ -1471,7 +1478,7 @@ defmodule Tightbeam.AssignmentsTest do
         assert {:ok, {:ok, replay}} =
                  DB.transaction(
                    ctx.db,
-                   &Tightbeam.RowReactionFixtures.replay_terminal_in_txn(&1, assignment.id, token)
+                   &Wakes.admit_terminal_revocation_in_txn(&1, assignment.id, token)
                  )
 
         assert replay.wake_id == wake.wake_id
@@ -1673,11 +1680,7 @@ defmodule Tightbeam.AssignmentsTest do
       assert {:ok, {:error, %{code: "invalid_terminal_notification_relation"}}} =
                DB.transaction(
                  ctx.db,
-                 &Tightbeam.RowReactionFixtures.replay_terminal_in_txn(
-                   &1,
-                   assignment.id,
-                   "rev_missing"
-                 )
+                 &Wakes.admit_terminal_revocation_in_txn(&1, assignment.id, "rev_missing")
                )
 
       assert revocation_notice_snapshot(ctx.db) == before
@@ -1691,10 +1694,11 @@ defmodule Tightbeam.AssignmentsTest do
 
       corrupt = revocation_notice_snapshot(ctx.db)
 
-      assert {:ok, :unresolved} =
-               DB.transaction(ctx.db, fn txn ->
-                 Wakes.legacy_terminal_source_in_txn(txn, Wakes.get_in_txn(txn, wake.wake_id))
-               end)
+      assert {:ok, {:error, %{code: "terminal_notification_conflict"}}} =
+               DB.transaction(
+                 ctx.db,
+                 &Wakes.admit_terminal_revocation_in_txn(&1, assignment.id, token)
+               )
 
       assert revocation_notice_snapshot(ctx.db) == corrupt
     end
@@ -1904,7 +1908,6 @@ defmodule Tightbeam.AssignmentsTest do
 
       assert [root] = terminal_notices(ctx.db)
       assert root.session_key == "notice-parent"
-      queue_companion_notice(ctx.db, root)
       assert {:appended, "notice-parent", _, _} = deliver_terminal_notice(ctx.db, root)
       assert {:ok, source} = Ledger.claim_next(ctx.db, "notice-parent", "fixture")
 
@@ -1963,7 +1966,6 @@ defmodule Tightbeam.AssignmentsTest do
 
       assert [root] = terminal_notices(ctx.db)
       assert root.session_key == "delivery-successor"
-      queue_companion_notice(ctx.db, root)
       assert {:appended, "delivery-successor", _, _} = deliver_terminal_notice(ctx.db, root)
       assert {:ok, source} = Ledger.claim_next(ctx.db, "delivery-successor", "fixture")
 
@@ -2261,7 +2263,7 @@ defmodule Tightbeam.AssignmentsTest do
         before = recovery_snapshot(ctx.db)
 
         for _ <- 1..2 do
-          assert {:ok, {:ok, ^root}} = replay_terminal_notice(ctx.db, assignment.id)
+          assert {:ok, {:ok, ^root}} = admit_terminal_notice(ctx.db, assignment.id)
 
           assert {:ok, {:error, %{code: "terminal_notification_recipient_unavailable"}}} =
                    recover_notice(ctx.db, root.wake_id)
@@ -2281,29 +2283,12 @@ defmodule Tightbeam.AssignmentsTest do
         assert successor.session_key == "notice-parent"
         assert successor.prompt == root.prompt
         assert successor.obligation_ref == root.obligation_ref
-
-        assert {:ok, [[action_id, "pending", action_result]]} =
-                 DB.query(
-                   ctx.db,
-                   "SELECT id,status,result FROM row_reaction_actions WHERE json_extract(result,'$.wake_id')=?1",
-                   [successor.wake_id]
-                 )
-
-        assert JSON.decode!(action_result)["previous_wake_ids"] == [root.wake_id]
-        assert Wakes.get(ctx.db, root.wake_id) == root
         replay_snapshot = recovery_snapshot(ctx.db)
 
         assert {:ok, {:ok, %{wake: ^successor, replay: true}}} =
                  recover_notice(ctx.db, root.wake_id)
 
         assert recovery_snapshot(ctx.db) == replay_snapshot
-
-        assert {:ok, [[^action_id, "pending", ^action_result]]} =
-                 DB.query(
-                   ctx.db,
-                   "SELECT id,status,result FROM row_reaction_actions WHERE json_extract(result,'$.wake_id')=?1",
-                   [successor.wake_id]
-                 )
 
         assert {:ok, [[nil, "canceled", successor_id]]} =
                  DB.query(
@@ -2563,9 +2548,10 @@ defmodule Tightbeam.AssignmentsTest do
              handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, kind))
 
     assert [wake] = terminal_notices(ctx.db)
-    # The elected terminal deadline is the observed close time and is already
-    # due. Keep it intact so pending reconciliation can preserve the whole row.
-    assert wake.due_at <= System.system_time(:millisecond)
+    # Scheduler-focused tests should exercise admission and delivery without a
+    # millisecond race between the terminal event and its immediate due time.
+    force_wake_due(ctx.db, wake.wake_id)
+    wake = Wakes.get(ctx.db, wake.wake_id)
     {assignment, wake, personal}
   end
 
@@ -2683,19 +2669,6 @@ defmodule Tightbeam.AssignmentsTest do
     {delegated, sibling, delegation}
   end
 
-  defp queue_companion_notice(db, root) do
-    # Exercise recovery of a real batch independently of association-notice
-    # policy: this fixture has no association reaction elected.
-    Wakes.schedule(db, %{
-      session_key: root.session_key,
-      owner_user_id: root.owner_user_id,
-      origin: "fixture:companion",
-      prompt: "Queued companion notice",
-      due_at: 0,
-      target_gate: 0
-    })
-  end
-
   defp deliver_terminal_notice(db, wake, overrides \\ []) do
     {:ok, result} =
       DB.transaction(db, fn txn ->
@@ -2796,8 +2769,8 @@ defmodule Tightbeam.AssignmentsTest do
     name
   end
 
-  defp replay_terminal_notice(db, id),
-    do: DB.transaction(db, &Tightbeam.RowReactionFixtures.replay_terminal_in_txn(&1, id))
+  defp admit_terminal_notice(db, id),
+    do: DB.transaction(db, &Wakes.admit_terminal_notification_in_txn(&1, id))
 
   defp terminal_notice_assign_call(
          principal,

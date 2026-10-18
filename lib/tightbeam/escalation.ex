@@ -617,10 +617,7 @@ defmodule Tightbeam.Escalation do
   # Older stamped migrations call arity two before rowVersion exists.
   def ensure_terminal_parity_in_txn(%Txn{} = txn, activated_at, versioned?) do
     current_schema? =
-      Txn.q(txn, "SELECT shape FROM schema_stamp") in [
-        [["decision-request-row-schema-v2-019"]],
-        [["row-reaction-notice-v1"]]
-      ]
+      Txn.q(txn, "SELECT shape FROM schema_stamp") == [["decision-request-row-schema-v2-019"]]
 
     invalid_version =
       if versioned?, do: "typeof(NEW.rowVersion) <> 'integer' OR NEW.rowVersion < 1 OR ", else: ""
@@ -845,25 +842,14 @@ defmodule Tightbeam.Escalation do
               # Transactional outbox: the owner notification is a durable wake
               # armed with the request itself. Only the winning insert arms one;
               # a conflict or replay arms none.
-              wake =
-                Wakes.schedule_in_txn(txn, %{
-                  session_key: Org.personal_session_key(request.owner_user_id),
-                  owner_user_id: request.owner_user_id,
-                  origin: "process:tightbeam",
-                  prompt: owner_notification(request),
-                  due_at: now,
-                  target_gate: 0
-                })
-
-              Tightbeam.RowReactions.observe_request_in_txn(
-                txn,
-                nil,
-                request,
-                principal_id(call),
-                "escalate",
-                now,
-                [wake]
-              )
+              Wakes.schedule_in_txn(txn, %{
+                session_key: Org.personal_session_key(request.owner_user_id),
+                owner_user_id: request.owner_user_id,
+                origin: "process:tightbeam",
+                prompt: owner_notification(request),
+                due_at: now,
+                target_gate: 0
+              })
             end
 
             # Observability only (see @summon_kind). Ordering does not depend on this
@@ -1381,16 +1367,6 @@ defmodule Tightbeam.Escalation do
           Map.get(firehose_call || %{}, :firehose_hub, Hub)
         )
 
-      Tightbeam.RowReactions.observe_request_in_txn(
-        txn,
-        nil,
-        request,
-        "session:" <> resolved_input.asker_session_key,
-        Map.get(input, :verb, "ask"),
-        raised_at,
-        [wake]
-      )
-
       %{request: request, wake: wake}
     else
       {:error, error} -> error
@@ -1414,16 +1390,7 @@ defmodule Tightbeam.Escalation do
 
     if Txn.changes(txn) == 1 do
       settled = request_in_txn(txn, request_id)
-      settled = publish_decision_transition_in_txn(txn, request, settled)
-
-      Tightbeam.RowReactions.observe_request_in_txn(
-        txn,
-        request,
-        settled,
-        by,
-        "withdraw",
-        settled_at
-      )
+      _settled = publish_decision_transition_in_txn(txn, request, settled)
 
       DB.record_row_commit(
         txn,
@@ -1478,14 +1445,13 @@ defmodule Tightbeam.Escalation do
 
           # Preserve the asker's existing prompt wake; the state notice below
           # is a separate best-effort snapshot for Firehose clients.
-          wake =
-            Wakes.schedule_in_txn(txn, %{
-              session_key: request.raiser_session_key,
-              origin: "process:tightbeam",
-              prompt: answer_notification(request, text, answered_by),
-              due_at: answered_at,
-              target_gate: 0
-            })
+          Wakes.schedule_in_txn(txn, %{
+            session_key: request.raiser_session_key,
+            origin: "process:tightbeam",
+            prompt: answer_notification(request, text, answered_by),
+            due_at: answered_at,
+            target_gate: 0
+          })
 
           answered = request_in_txn(txn, request.id)
           Publisher.maybe_accepted_in_txn(txn, call, answered)
@@ -1497,16 +1463,6 @@ defmodule Tightbeam.Escalation do
               answered,
               Map.get(call, :firehose_hub, Hub)
             )
-
-          Tightbeam.RowReactions.observe_request_in_txn(
-            txn,
-            before,
-            answered,
-            answered_by,
-            "answer",
-            answered_at,
-            [wake]
-          )
 
           answered
         else
@@ -2669,24 +2625,13 @@ defmodule Tightbeam.Escalation do
     # The existing outbox provides only the filing-time opportunity in this
     # bounded core. requestRef, reminder consumption, and terminal wake
     # cancellation land with their separately owned Wakes/Gateway integration.
-    wake =
-      Wakes.schedule_in_txn(txn, %{
-        session_key: Org.personal_session_key(owner_user_id),
-        origin: "process:tightbeam",
-        prompt: operator_notification(request),
-        due_at: raised_at,
-        target_gate: 0
-      })
-
-    Tightbeam.RowReactions.observe_request_in_txn(
-      txn,
-      nil,
-      request,
-      "session:" <> session_key,
-      "operator-ask",
-      raised_at,
-      [wake]
-    )
+    Wakes.schedule_in_txn(txn, %{
+      session_key: Org.personal_session_key(owner_user_id),
+      origin: "process:tightbeam",
+      prompt: operator_notification(request),
+      due_at: raised_at,
+      target_gate: 0
+    })
 
     request
   end
@@ -2810,17 +2755,16 @@ defmodule Tightbeam.Escalation do
           terminal_test_step(opts, :before_terminal_cas)
           ruled_at = now()
 
-          wake =
-            Wakes.schedule_in_txn(txn, %{
-              session_key: notification_session,
-              origin: "process:tightbeam",
-              prompt: terminal_notification(request.id),
-              due_at: ruled_at,
-              target_gate: 0,
-              creator_session_key: via,
-              condition_kind: @terminal_condition_kind,
-              condition_scope: request.id
-            })
+          Wakes.schedule_in_txn(txn, %{
+            session_key: notification_session,
+            origin: "process:tightbeam",
+            prompt: terminal_notification(request.id),
+            due_at: ruled_at,
+            target_gate: 0,
+            creator_session_key: via,
+            condition_kind: @terminal_condition_kind,
+            condition_scope: request.id
+          })
 
           terminal_test_step(opts, :after_schedule)
 
@@ -2878,17 +2822,6 @@ defmodule Tightbeam.Escalation do
           case validate_terminal_request_in_txn(txn, ruled) do
             %{failures: []} ->
               terminal_test_step(opts, :after_validate)
-
-              Tightbeam.RowReactions.observe_request_in_txn(
-                txn,
-                request,
-                ruled,
-                ruled_by,
-                "operator-rule",
-                ruled_at,
-                [wake]
-              )
-
               {terminal_projection(ruled), fact_id}
 
             %{failures: failures} ->
@@ -3325,8 +3258,6 @@ defmodule Tightbeam.Escalation do
       DB.transaction_then(
         db,
         fn txn ->
-          before = request_in_txn(txn, request.id)
-
           Txn.q(
             txn,
             "UPDATE decision_requests SET status = 'ruled', decision = ?2, rationale = ?3, ruledBy = ?4, ruledAt = ?5 WHERE id = ?1 AND status = 'open'",
@@ -3364,15 +3295,6 @@ defmodule Tightbeam.Escalation do
                 ruled,
                 Map.get(opts[:firehose_call] || %{}, :firehose_hub, Hub)
               )
-
-            Tightbeam.RowReactions.observe_request_in_txn(
-              txn,
-              before,
-              ruled,
-              principal_id(opts[:firehose_call]),
-              "rule",
-              ruled_at
-            )
 
             {ruled, fact_id, decision_transition(request, "open", "ruled", origin, "rule")}
           else
@@ -3472,15 +3394,6 @@ defmodule Tightbeam.Escalation do
                     "decision_request_ruled",
                     id,
                     "by=#{call.origin} decision=waived factId=#{fact_id}"
-                  )
-
-                  Tightbeam.RowReactions.observe_request_in_txn(
-                    txn,
-                    request,
-                    request_in_txn(txn, id),
-                    principal_id(call),
-                    "waive",
-                    granted_at
                   )
 
                   [{fact_id, decision_transition(request, "open", "ruled", call.origin, "waive")}]
@@ -4406,8 +4319,7 @@ defmodule Tightbeam.Escalation do
 
   defp valid_operator_options?(_options), do: false
 
-  @doc false
-  def terminal_notification(request_id) do
+  defp terminal_notification(request_id) do
     "Decision request #{request_id} was ruled. Read it with tightbeam decision-request --request #{request_id}."
   end
 
