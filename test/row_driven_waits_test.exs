@@ -1326,6 +1326,15 @@ defmodule Tightbeam.RowDrivenWaitsTest do
 
     assert current =~ "terminal.ownerLease=claim.ownerLease"
     assert current =~ "t.status='running'"
+    assert current =~ "creator.ownerUserId=w.ownerUserId"
+    refute current =~ "WITH RECURSIVE lineage"
+    assert :ok = Tightbeam.Schema.ensure_all(ctx.db)
+
+    assert {:ok, [[^current]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sql FROM sqlite_master WHERE name='supervision_liveness_sidecar_insert_coherent'"
+             )
 
     assert :ok =
              Ledger.finish(ctx.db, originating.seq, "delivered", nil,
@@ -1620,7 +1629,71 @@ defmodule Tightbeam.RowDrivenWaitsTest do
              )
   end
 
-  test "ancestor admission preserves the true creator and rechecks revoked lineage", ctx do
+  for mode <- [:dependency, :after_turn] do
+    test "gateway admits #{mode} from an unrelated same-owner session", ctx do
+      assert %{name: "resolver-role"} =
+               Roles.create!(ctx.db, "resolver-role", "owner-a", "resolver")
+
+      assert %{name: "intruder-role"} =
+               Roles.create!(ctx.db, "intruder-role", "owner-b", "intruder")
+
+      turn = running_turn(ctx.db, "resolver")
+      handler = Gateway.handlers(%{db: ctx.db, wake_scheduler: ctx.scheduler})["wake"]
+      shipped = File.read!("priv/kungfu/agentic-engineering/rules/verification.toml")
+      File.write!(Path.join(ctx.base, "identity/rules/verification.toml"), shipped)
+      Rules.load!(ctx.base, ~w(wake attest))
+
+      params = %{
+        prompt: "Continue the holder's work.",
+        after_ms: 60_000,
+        assignment_id: "A",
+        nudge: false
+      }
+
+      params =
+        if unquote(mode) == :after_turn,
+          do: params |> Map.delete(:after_ms) |> Map.put(:after_turn, true),
+          else: Map.put(params, :predicate, predicate("R"))
+
+      call = %{
+        origin: "agent:resolver-role",
+        principal: {:session, "resolver"},
+        session_key: "holder",
+        params: params
+      }
+
+      response = handler.(call)
+      wake = Wakes.get(ctx.db, response.wake_id)
+      assert wake.creator_session_key == "resolver"
+      assert wake.owner_user_id == "owner-a"
+      assert wake.session_key == "holder"
+      assert wake.obligation_ref == "A"
+      assert wake.originating_turn_seq == turn.seq
+      refute response.eligible
+      before_count = wake_count(ctx.db)
+
+      assert %{code: "unknown_assignment"} =
+               handler.(%{
+                 call
+                 | origin: "agent:intruder-role",
+                   principal: {:session, "intruder"}
+               })
+
+      assert %{code: "invalid_target"} = handler.(%{call | session_key: "verifier"})
+      assert wake_count(ctx.db) == before_count
+
+      assert %{assignment: _} = attest(ctx.db, "R", "resolver", "completion")
+
+      assert :ok =
+               Ledger.finish(ctx.db, turn.seq, "delivered", nil, owner_lease: turn.owner_lease)
+
+      assert :ok = Wakes.fire_due(ctx.scheduler)
+      assert Wakes.get(ctx.db, wake.wake_id).state == "fired"
+      assert turn_count(ctx.db, wake.wake_id) == 1
+    end
+  end
+
+  test "registration preserves the true creator without requiring ancestry", ctx do
     session(ctx.db, "supervisor", "owner-a")
 
     shipped =
@@ -1680,23 +1753,27 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assert {:ok, _} =
              DB.query(ctx.db, "UPDATE sessions SET spawnedBy=NULL WHERE sessionKey='holder'")
 
-    assert {:ok, {:error, %{code: "not_holder"}}} =
+    assert {:ok, unrelated_wait} =
              DB.transaction(ctx.db, &Wakes.register_wait_in_txn(&1, input))
 
-    assert {:ok, _} =
-             DB.query(
-               ctx.db,
-               "UPDATE sessions SET spawnedBy='supervisor' WHERE sessionKey='holder'"
-             )
+    assert unrelated_wait.creator_session_key == "supervisor"
+    assert unrelated_wait.session_key == "holder"
+    assert unrelated_wait.obligation_ref == "A"
 
+    # Owner scope still uses the actual registrant's owner at the command seam.
     assert {:ok, _} =
              DB.query(
                ctx.db,
                "UPDATE sessions SET ownerUserId='owner-b' WHERE sessionKey='supervisor'"
              )
 
-    assert {:ok, {:error, %{code: "not_holder"}}} =
-             DB.transaction(ctx.db, &Wakes.register_wait_in_txn(&1, input))
+    cross_owner = %{input | owner_user_id: "owner-b"}
+    before_count = wake_count(ctx.db)
+
+    assert {:ok, {:error, %{code: "unknown_assignment"}}} =
+             DB.transaction(ctx.db, &Wakes.register_wait_in_txn(&1, cross_owner))
+
+    assert wake_count(ctx.db) == before_count
   end
 
   test "missing relief runtime rolls back admission and schema initialization reinstalls it",

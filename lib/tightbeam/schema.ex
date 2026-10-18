@@ -3723,7 +3723,8 @@ defmodule Tightbeam.Schema do
     unless normalize_schema_sql(actual) in [
              normalize_schema_sql(previous.sql),
              normalize_schema_sql(current.sql),
-             normalize_schema_sql(recorded_continuation_retry_guard(previous).sql)
+             normalize_schema_sql(recorded_continuation_retry_guard(previous).sql),
+             normalize_schema_sql(owner_scoped_continuation_guard(previous).sql)
            ],
            do: incompatible_supervision_liveness!("malformed owned object #{previous.name}")
 
@@ -3734,6 +3735,27 @@ defmodule Tightbeam.Schema do
     continuation_retry_guard(previous, true)
   end
 
+  defp owner_scoped_continuation_guard(previous) do
+    recorded = recorded_continuation_retry_guard(previous)
+    # Remove only the rejected ancestry relation. The creator must still be an
+    # actual session of the wake's owner; all turn/retry and row checks remain.
+    ancestry =
+      ~r/AND EXISTS \(\s*WITH RECURSIVE lineage\(sessionKey,spawnedBy\) AS \(.*?SELECT 1 FROM lineage WHERE sessionKey=w.creatorSessionKey\s*\)/s
+
+    true = Regex.match?(ancestry, recorded.sql)
+
+    %{
+      recorded
+      | sql:
+          Regex.replace(ancestry, recorded.sql, """
+          AND EXISTS (
+            SELECT 1 FROM sessions creator
+            WHERE creator.sessionKey=w.creatorSessionKey AND creator.ownerUserId=w.ownerUserId
+          )
+          """)
+    }
+  end
+
   defp migrate_continuation_retry_guard(db) do
     previous =
       Enum.find(
@@ -3741,25 +3763,28 @@ defmodule Tightbeam.Schema do
         &(&1.name == "supervision_liveness_sidecar_insert_coherent")
       )
 
+    current = owner_scoped_continuation_guard(previous)
+
+    supported = [
+      previous,
+      continuation_retry_guard(previous),
+      recorded_continuation_retry_guard(previous),
+      current
+    ]
+
     case DB.transaction(db, fn txn ->
            [[actual]] =
              Txn.q(txn, "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1", [
                previous.name
              ])
 
-           if normalize_schema_sql(actual) == normalize_schema_sql(previous.sql) do
-             migrate_owned_liveness_trigger_in_txn(
-               txn,
-               continuation_retry_guard(previous),
-               previous.sql
-             )
-           end
+           predecessor =
+             Enum.find(supported, &(normalize_schema_sql(&1.sql) == normalize_schema_sql(actual)))
 
-           migrate_owned_liveness_trigger_in_txn(
-             txn,
-             recorded_continuation_retry_guard(previous),
-             continuation_retry_guard(previous).sql
-           )
+           if is_nil(predecessor),
+             do: incompatible_supervision_liveness!("malformed owned object #{previous.name}")
+
+           migrate_owned_liveness_trigger_in_txn(txn, current, predecessor.sql)
          end) do
       {:ok, :ok} -> :ok
       {:error, error} -> raise error
