@@ -887,7 +887,10 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
 
   defp owner_continuation_guard!() do
     current = current_continuation_guard!()
-    ancestry = ~r/AND EXISTS \(\s*WITH RECURSIVE lineage\(sessionKey,spawnedBy\).*?SELECT 1 FROM lineage WHERE sessionKey=w.creatorSessionKey\s*\)/s
+
+    ancestry =
+      ~r/AND EXISTS \(\s*WITH RECURSIVE lineage\(sessionKey,spawnedBy\).*?SELECT 1 FROM lineage WHERE sessionKey=w.creatorSessionKey\s*\)/s
+
     assert Regex.match?(ancestry, current)
 
     Regex.replace(ancestry, current, """
