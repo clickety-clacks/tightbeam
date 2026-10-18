@@ -91,8 +91,8 @@ defmodule Tightbeam.EffortHolderActivityCancellationMigrationTest do
   defp assert_activity_route_is_admitted(db) do
     [[wake_id]] = rows(db, "SELECT wakeId FROM wake_cancellations ORDER BY wakeId LIMIT 1")
 
-    assert :ok =
-             DB.execute(
+    assert {:ok, []} =
+             DB.query(
                db,
                """
                UPDATE wake_cancellations
@@ -135,7 +135,7 @@ defmodule Tightbeam.EffortHolderActivityCancellationMigrationTest do
              )
 
     assert {:error, _constraint_error} =
-             DB.execute(
+             DB.query(
                db,
                "UPDATE wake_cancellations SET causalSourceKind='wake' WHERE wakeId=?1",
                [wake_id]
