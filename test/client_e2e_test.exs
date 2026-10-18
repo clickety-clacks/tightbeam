@@ -906,7 +906,7 @@ defmodule Tightbeam.ClientE2ETest do
     # by construction, so the template's node_modules (native deps included)
     # and its relative .bin symlinks are valid as-is.
     @tag :selected_home_copy
-    test "provision! copies authoritative homes and adapters, never legacy auth or state.db" do
+    test "provision! copies the candidate CLI and fresh-leg inputs, excluding auth and state.db" do
       template =
         Path.join(
           System.tmp_dir!(),
@@ -914,8 +914,10 @@ defmodule Tightbeam.ClientE2ETest do
         )
 
       base_dir = template <> "-leg-client-e2e"
+      candidate_cli = template <> "-candidate-cli"
       on_exit(fn -> File.rm_rf!(template) end)
       on_exit(fn -> File.rm_rf!(base_dir) end)
+      on_exit(fn -> File.rm_rf!(candidate_cli) end)
 
       adapter = Path.join(["adapters", "node_modules", ".bin", "claude-agent-acp"])
 
@@ -934,11 +936,20 @@ defmodule Tightbeam.ClientE2ETest do
       # History must NOT ride along: a fresh leg with the template's state.db is
       # not a fresh leg.
       File.write!(Path.join(template, "state.db"), "history")
+      File.mkdir_p!(Path.join(template, "bin"))
+      File.write!(Path.join(template, "bin/tightbeam"), "stale template CLI")
+      File.write!(candidate_cli, "candidate CLI")
 
-      LegGateway.provision!(template, base_dir)
+      LegGateway.provision!(template, base_dir, candidate_cli)
 
       assert File.exists?(Path.join(base_dir, adapter)),
              "the template's installed adapters must ride into the leg"
+
+      assert File.read!(Path.join(base_dir, "bin/tightbeam")) == File.read!(candidate_cli),
+             "preflight must use the CLI built from the candidate under test"
+
+      cli_mode = File.stat!(Path.join(base_dir, "bin/tightbeam")).mode
+      assert Bitwise.band(cli_mode, 0o111) > 0
 
       for rel <- [
             "homes/testhost/claude/.credentials.json",
@@ -952,7 +963,7 @@ defmodule Tightbeam.ClientE2ETest do
       assert File.read!(Path.join(template, "auth/claude/token")) == "auth/claude/token"
 
       assert_raise RuntimeError, ~r/already exists/, fn ->
-        LegGateway.provision!(template, base_dir)
+        LegGateway.provision!(template, base_dir, candidate_cli)
       end
 
       refute File.exists?(Path.join(base_dir, "state.db"))

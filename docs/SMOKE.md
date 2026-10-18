@@ -162,14 +162,14 @@ on 2026-07-25:
   request away from the parent before it can rule, which loses the race on the
   slower codex leg every time.
 - **"Copy the org" means two DIFFERENT things depending on which harness you
-  are driving.** `ClientE2E.LegGateway.provision!/2` copies
-  `adapters/` and authoritative `homes/`, never legacy `auth/`
-  and `identity/` and deliberately OMITS `state.db`, because a client-e2e leg
+  are driving.** `ClientE2E.LegGateway.provision!/3` copies `adapters/`,
+  authoritative `homes/` and `identity/`, and adds the candidate-built
+  `bin/tightbeam`; it never copies legacy `auth/` and deliberately OMITS `state.db`, because a client-e2e leg
   must have no history and bootstraps its first user through the app's own J0
   pairing. `feature_smoke.exs` needs the opposite: a fully provisioned org
   whose `state.db` already holds the owner as an ADMIN, because it drives
   admin-only verbs (`identity-status`, `config`) as `--as-user` over HTTP with
-  no pairing step. Provisioning a feature-smoke org with `provision!/2` boots
+  no pairing step. Provisioning a feature-smoke org with `provision!/3` boots
   fine and then fails several checks in with `admin required`, which looks
   nothing like its cause. For feature smoke, copy the whole template org
   including `state.db` (minus logs and `work/`) and let `TIGHTBEAM_PORT`

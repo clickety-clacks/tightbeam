@@ -39,7 +39,7 @@ defmodule WorkItemBodySmoke do
         "R41 phase=provision template=#{template} base=#{base} work=#{Path.join(base, "work")} port=#{port} binary=#{binary} source=#{source_head} binarySha256=#{binary_sha}"
       )
 
-      LegGateway.provision!(template, base)
+      LegGateway.provision!(template, base, binary)
       File.mkdir_p!(Path.join(base, "work"))
       seed_disposable_state!(base)
 
