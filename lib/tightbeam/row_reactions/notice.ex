@@ -157,7 +157,6 @@ defmodule Tightbeam.RowReactions.Notice do
           at
         )
 
-
       {^id, _} ->
         case Wakes.revise_notice_in_txn(txn, id, input) do
           :updated -> record_scheduled(txn, action, result, id, value, at)
