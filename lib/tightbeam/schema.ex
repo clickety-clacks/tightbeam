@@ -1587,6 +1587,92 @@ defmodule Tightbeam.Schema do
               fallback_arm <>
               after_fallback
 
+          # The source owns these clears. They happen in the same transaction
+          # as an assignment completion or terminal decision transition, so
+          # open linked work must not require an inactivity deadline to permit
+          # the source's own notice to be retracted.
+          disposition_fallback =
+            "(workImpactKind != 'linked_work_open' AND livenessTriggerKind IS NULL AND\n" <>
+              "             livenessTriggerId IS NULL AND actionNeeded = 0)))"
+
+          source_disposition_arms = """
+            (workImpactKind = 'linked_work_open' AND livenessTriggerKind IS NULL AND
+             livenessTriggerId IS NULL AND actionNeeded = 0 AND requesterKind = 'process' AND
+             requesterId = 'tightbeam:assignments' AND reasonKind = 'obligation_disposed' AND
+             causalSourceKind = 'assignment_transition' AND dispositionKind = 'assignment_transition' AND
+             causalSourceId = dispositionId)
+            OR
+            (workImpactKind = 'linked_work_open' AND livenessTriggerKind IS NULL AND
+             livenessTriggerId IS NULL AND actionNeeded = 0 AND requesterKind = 'process' AND
+             requesterId = 'tightbeam:escalation' AND reasonKind = 'obligation_disposed' AND
+             causalSourceKind = 'decision_request' AND dispositionKind = 'decision_request_transition' AND
+             causalSourceId = dispositionId)
+            OR
+            (workImpactKind = 'linked_work_open' AND livenessTriggerKind IS NULL AND
+             livenessTriggerId IS NULL AND actionNeeded = 0 AND requesterKind = 'process' AND
+             requesterId = 'tightbeam:retirement' AND reasonKind = 'obligation_disposed' AND
+             causalSourceKind = 'assignment_transition' AND dispositionKind = 'assignment_transition' AND
+             causalSourceId = dispositionId)
+            OR
+          """
+
+          true = String.contains?(sql, disposition_fallback)
+          sql = String.replace(sql, disposition_fallback, source_disposition_arms <> disposition_fallback, global: false)
+
+          no_replacement_marker =
+            "(outcomeKind = 'no_replacement' AND replacementWakeId IS NULL AND"
+
+          no_replacement_fallback =
+            "(workImpactKind != 'linked_work_open' AND livenessTriggerKind IS NULL AND\n" <>
+              "             livenessTriggerId IS NULL AND actionNeeded = 0)))"
+
+          no_replacement_source_arms = """
+            (workImpactKind = 'linked_work_open' AND livenessTriggerKind IS NULL AND
+             livenessTriggerId IS NULL AND actionNeeded = 0 AND requesterKind = 'process' AND
+             requesterId = 'tightbeam:retirement' AND reasonKind = 'target_retired' AND
+             causalSourceKind = 'session_transition')
+            OR
+            (workImpactKind = 'linked_work_open' AND livenessTriggerKind IS NULL AND
+             livenessTriggerId IS NULL AND actionNeeded = 0 AND requesterKind = 'process' AND
+             requesterId = 'tightbeam:assignments' AND reasonKind = 'cannot_proceed_released' AND
+             causalSourceKind = 'condition_fact')
+            OR
+            (workImpactKind = 'linked_work_open' AND livenessTriggerKind IS NULL AND
+             livenessTriggerId IS NULL AND actionNeeded = 0 AND requesterKind = 'process' AND
+             requesterId = 'tightbeam:sentinel-supervisor' AND reasonKind = 'condition_cleared' AND
+             causalSourceKind = 'sentinel_transition')
+            OR
+          """
+
+          true = String.contains?(sql, no_replacement_marker)
+          [before_no_replacement, after_no_replacement] =
+            String.split(sql, no_replacement_marker, parts: 2)
+
+          [before_fallback, after_fallback] =
+            String.split(after_no_replacement, no_replacement_fallback, parts: 2)
+
+          sql =
+            before_no_replacement <>
+              no_replacement_marker <>
+              before_fallback <>
+              no_replacement_source_arms <>
+              no_replacement_fallback <>
+              after_fallback
+
+          # Older stamped cancellation DDL predates the sentinel's
+          # source-owned condition clear. Extend only the typed source grammar
+          # used by the already implemented callers.
+          reason_anchor = "'consumer_unavailable','target_unresolvable'\n        )),"
+          reason_extension =
+            "'consumer_unavailable','target_unresolvable','condition_cleared'\n        )),"
+          true = String.contains?(sql, reason_anchor)
+          sql = String.replace(sql, reason_anchor, reason_extension, global: false)
+
+          source_anchor = "'session_transition','scheduler_delivery'\n        )),"
+          source_extension = "'session_transition','scheduler_delivery','sentinel_transition'\n        )),"
+          true = String.contains?(sql, source_anchor)
+          sql = String.replace(sql, source_anchor, source_extension, global: false)
+
           requester_anchor =
             "(requesterId = 'tightbeam:supervision' AND reasonKind = 'superseded' AND"
 
@@ -1603,7 +1689,12 @@ defmodule Tightbeam.Schema do
                 String.replace(
                   sql,
                   requester_anchor,
-                  holder_activity_requester_route <> requester_anchor,
+                  holder_activity_requester_route <>
+                    "(requesterId = 'tightbeam:escalation' AND reasonKind = 'obligation_disposed' AND " <>
+                    "causalSourceKind = 'decision_request' AND outcomeKind = 'disposition')\n    OR\n    " <>
+                    "(requesterId = 'tightbeam:sentinel-supervisor' AND reasonKind = 'condition_cleared' AND " <>
+                    "causalSourceKind = 'sentinel_transition' AND outcomeKind = 'no_replacement')\n    OR\n    " <>
+                    requester_anchor,
                   global: false
                 )
           }
@@ -1615,6 +1706,13 @@ defmodule Tightbeam.Schema do
 
   @doc false
   def live_base_upgrade_predecessor, do: @operator_decision_shape
+
+  @doc false
+  def assignment_source_replacement_cancellation_ddl do
+    @assignment_source_replacement_liveness_objects
+    |> Enum.find(&(&1.name == "wake_cancellations"))
+    |> Map.fetch!(:sql)
+  end
 
   @doc false
   def guard_compatible_stamps do
@@ -2916,7 +3014,16 @@ defmodule Tightbeam.Schema do
       "CREATE INDEX IF NOT EXISTS assignment_reopenings_activity_source_order " <>
         "ON assignment_reopenings(assignmentId,ts DESC)",
       "CREATE INDEX IF NOT EXISTS wakes_pending_session_obligation " <>
-        "ON wakes(sessionKey,obligationRef) WHERE state='pending'"
+        "ON wakes(sessionKey,obligationRef) WHERE state='pending'",
+      "CREATE INDEX IF NOT EXISTS wakes_delivered_obligation " <>
+        "ON wakes(obligationRef,wakeId) WHERE deliveredTurnSeq IS NOT NULL",
+      "CREATE INDEX IF NOT EXISTS supervision_liveness_pending_holder " <>
+        "ON supervision_liveness_sidecar(wakeId) " <>
+        "WHERE controllerOrigin='holder_continuation' AND controllerState='pending'",
+      "CREATE INDEX IF NOT EXISTS work_items_open_routing_wake " <>
+        "ON work_items(routingWakeId) WHERE state='open' AND routingWakeId IS NOT NULL",
+      "CREATE INDEX IF NOT EXISTS work_items_open_slate_wake " <>
+        "ON work_items(slateWakeId) WHERE state='open' AND slateWakeId IS NOT NULL"
     ]
 
     case DB.migration_transaction(db, :supervision_source_indexes_v1, [], [], fn txn ->

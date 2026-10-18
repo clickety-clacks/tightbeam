@@ -835,6 +835,34 @@ defmodule Tightbeam.WorkItems do
     reconcile_delivered_bracket_batch(db, recipient_session_key, delivered_wake_id, nil, [])
   end
 
+  @doc false
+  @spec reconcile_delivered_brackets_page(DB.server(), non_neg_integer()) ::
+          {:ok, non_neg_integer(), non_neg_integer()} | {:error, term()}
+  def reconcile_delivered_brackets_page(db, after_rowid)
+      when is_integer(after_rowid) and after_rowid >= 0 do
+    case DB.transaction(db, fn txn ->
+           rows = delivered_bracket_sources_after(txn, after_rowid)
+           failures = reconcile_delivered_bracket_rows(txn, rows)
+
+           last_rowid =
+             case List.last(rows) do
+               [_work_item_id, _wake_id, rowid] when is_integer(rowid) -> rowid
+               _ -> after_rowid
+             end
+
+           {failures, length(rows), last_rowid}
+         end) do
+      {:ok, {[], count, last_rowid}} ->
+        {:ok, count, last_rowid}
+
+      {:ok, {failures, _count, _last_rowid}} ->
+        {:error, {:source_action_failed, failures}}
+
+      {:error, error} ->
+        {:error, error}
+    end
+  end
+
   defp reconcile_delivered_bracket_batch(
          db,
          recipient_session_key,
@@ -844,25 +872,13 @@ defmodule Tightbeam.WorkItems do
        ) do
     case DB.transaction(db, fn txn ->
            rows =
-             Txn.q(
-               txn,
-               """
-               SELECT item_id,wake_id,wake_rowid FROM (
-                 SELECT wi.id AS item_id,w.wakeId AS wake_id,w.rowid AS wake_rowid
-                 FROM work_items wi JOIN wakes w ON w.wakeId=wi.routingWakeId
-                 WHERE wi.state='open' AND w.deliveredTurnSeq IS NOT NULL
-                   AND (?1 IS NULL OR w.sessionKey=?1) AND (?2 IS NULL OR w.wakeId=?2)
-                   AND (?3 IS NULL OR w.rowid>?3)
-                 UNION ALL
-                 SELECT wi.id AS item_id,w.wakeId AS wake_id,w.rowid AS wake_rowid
-                 FROM work_items wi JOIN wakes w ON w.wakeId=wi.slateWakeId
-                 WHERE wi.state='open' AND w.deliveredTurnSeq IS NOT NULL
-                   AND (?1 IS NULL OR w.sessionKey=?1) AND (?2 IS NULL OR w.wakeId=?2)
-                   AND (?3 IS NULL OR w.rowid>?3)
-               ) ORDER BY wake_rowid LIMIT 100
-               """,
-               [recipient_session_key, delivered_wake_id, after_rowid]
-             )
+             case {recipient_session_key, delivered_wake_id} do
+               {session_key, wake_id} when is_binary(session_key) and is_binary(wake_id) ->
+                 delivered_bracket_sources_for_wake(txn, session_key, wake_id)
+
+               _ ->
+                 delivered_bracket_sources_after(txn, after_rowid || 0)
+             end
 
            failures =
              Enum.reduce(rows, [], fn
@@ -902,7 +918,7 @@ defmodule Tightbeam.WorkItems do
 
            {Enum.reverse(failures), length(rows), last_rowid}
          end) do
-      {:ok, {failures, 100, last_rowid}} ->
+      {:ok, {failures, 100, last_rowid}} when is_nil(delivered_wake_id) ->
         reconcile_delivered_bracket_batch(
           db,
           recipient_session_key,
@@ -920,6 +936,96 @@ defmodule Tightbeam.WorkItems do
       {:error, error} ->
         {:error, error}
     end
+  end
+
+  defp delivered_bracket_sources_for_wake(txn, session_key, wake_id) do
+    Txn.q(
+      txn,
+      """
+      SELECT item_id,wake_id,wake_rowid FROM (
+        SELECT wi.id AS item_id,w.wakeId AS wake_id,w.rowid AS wake_rowid
+        FROM work_items wi JOIN wakes w ON w.wakeId=wi.routingWakeId
+        WHERE wi.state='open' AND w.deliveredTurnSeq IS NOT NULL
+          AND w.sessionKey=?2 AND w.wakeId=?1
+        UNION ALL
+        SELECT wi.id AS item_id,w.wakeId AS wake_id,w.rowid AS wake_rowid
+        FROM work_items wi JOIN wakes w ON w.wakeId=wi.slateWakeId
+        WHERE wi.state='open' AND w.deliveredTurnSeq IS NOT NULL
+          AND w.sessionKey=?2 AND w.wakeId=?1
+        UNION ALL
+        SELECT wi.id AS item_id,w.wakeId AS wake_id,w.rowid AS wake_rowid
+        FROM notice_batches b
+        JOIN notice_batch_members m ON m.batchId=b.batchId AND m.state='included'
+        JOIN wakes w ON w.wakeId=m.sourceWakeId
+        JOIN work_items wi ON wi.routingWakeId=w.wakeId
+        WHERE b.deliveryWakeId=?1 AND b.state='delivered'
+          AND w.sessionKey=?2 AND w.deliveredTurnSeq IS NOT NULL AND wi.state='open'
+        UNION ALL
+        SELECT wi.id AS item_id,w.wakeId AS wake_id,w.rowid AS wake_rowid
+        FROM notice_batches b
+        JOIN notice_batch_members m ON m.batchId=b.batchId AND m.state='included'
+        JOIN wakes w ON w.wakeId=m.sourceWakeId
+        JOIN work_items wi ON wi.slateWakeId=w.wakeId
+        WHERE b.deliveryWakeId=?1 AND b.state='delivered'
+          AND w.sessionKey=?2 AND w.deliveredTurnSeq IS NOT NULL AND wi.state='open'
+      ) ORDER BY wake_rowid
+      """,
+      [wake_id, session_key]
+    )
+  end
+
+  defp delivered_bracket_sources_after(txn, after_rowid) do
+    {sql, params} = delivered_bracket_reconciliation_query(after_rowid)
+    Txn.q(txn, sql, params)
+  end
+
+  @doc false
+  def delivered_bracket_reconciliation_query(after_rowid \\ 0)
+      when is_integer(after_rowid) and after_rowid >= 0 do
+    {"""
+     SELECT item_id,wake_id,wake_rowid FROM (
+       SELECT wi.id AS item_id,w.wakeId AS wake_id,w.rowid AS wake_rowid
+       FROM work_items wi INDEXED BY work_items_open_routing_wake
+       JOIN wakes w ON w.wakeId=wi.routingWakeId
+       WHERE wi.state='open' AND wi.routingWakeId IS NOT NULL
+         AND w.deliveredTurnSeq IS NOT NULL AND w.rowid>?1
+       UNION ALL
+       SELECT wi.id AS item_id,w.wakeId AS wake_id,w.rowid AS wake_rowid
+       FROM work_items wi INDEXED BY work_items_open_slate_wake
+       JOIN wakes w ON w.wakeId=wi.slateWakeId
+       WHERE wi.state='open' AND wi.slateWakeId IS NOT NULL
+         AND w.deliveredTurnSeq IS NOT NULL AND w.rowid>?1
+     ) ORDER BY wake_rowid LIMIT 100
+     """, [after_rowid]}
+  end
+
+  defp reconcile_delivered_bracket_rows(txn, rows) do
+    Enum.reduce(rows, [], fn
+      [work_item_id, wake_id, wake_rowid], failures
+      when is_binary(wake_id) and is_binary(work_item_id) and is_integer(wake_rowid) ->
+        :ok = Txn.exec(txn, "SAVEPOINT reconcile_work_item_bracket")
+
+        try do
+          :ok = rearm_on_fire_in_txn(txn, wake_id, %{work_item_id: work_item_id})
+          :ok = Txn.exec(txn, "RELEASE reconcile_work_item_bracket")
+          failures
+        rescue
+          error ->
+            :ok = Txn.exec(txn, "ROLLBACK TO reconcile_work_item_bracket")
+            :ok = Txn.exec(txn, "RELEASE reconcile_work_item_bracket")
+
+            Logger.warning(
+              "work-item bracket action failed for #{wake_id}: #{Exception.message(error)}"
+            )
+
+            [wake_id | failures]
+        end
+
+      malformed, failures ->
+        Logger.warning("malformed delivered work-item bracket ignored: #{inspect(malformed)}")
+        failures
+    end)
+    |> Enum.reverse()
   end
 
   defp arm_routing_in_txn(txn, id, owner, title) do

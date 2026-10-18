@@ -1,7 +1,7 @@
 defmodule Tightbeam.SupervisionTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Gateway, Org, Supervision, Wakes}
+  alias Tightbeam.{DB, Gateway, Org, Supervision, Wakes, WorkItems}
   alias Tightbeam.Model
 
   setup do
@@ -226,9 +226,12 @@ defmodule Tightbeam.SupervisionTest do
                  UNION ALL
                  SELECT value + 1 FROM seq WHERE value < #{history_size}
                )
-               INSERT INTO wakes (wakeId,sessionKey,origin,consumer,dueAt,state,createdAt,assignmentId)
+               INSERT INTO wakes
+                 (wakeId,sessionKey,origin,consumer,dueAt,state,createdAt,assignmentId,
+                  obligationRef,deliveredTurnSeq)
                SELECT 'historical-deadline-' || printf('%08d',value),
-                      ?1,'process:tightbeam','assignment_inactivity_deadline',value,'fired',value,?2
+                      ?1,'process:tightbeam','assignment_inactivity_deadline',value,'fired',value,?2,
+                      'unrelated-history:' || printf('%08d',value),1
                FROM seq
                """,
                [ctx.holder.session_key, "asg_inactive"]
@@ -290,21 +293,32 @@ defmodule Tightbeam.SupervisionTest do
              String.contains?(detail, "assignment_reopenings_activity_source_order")
            end)
 
+    {reconciliation_sql, reconciliation_params} =
+      Wakes.source_reconciliation_query(:startup, 0, 100)
+
     assert {:ok, reconciliation_plan} =
-             DB.query(
-               ctx.db,
-               "EXPLAIN QUERY PLAN SELECT wakeId FROM wakes INDEXED BY wakes_delivered_turn " <>
-                 "WHERE deliveredTurnSeq IS NOT NULL AND " <>
-                 "(substr(obligationRef,1,length(?1))=?1 OR substr(obligationRef,1,length(?2))=?2)",
-               [
-                 "terminal-child-owner-notification:",
-                 "terminal-child-owner-action-reminder:"
-               ]
-             )
+             DB.query(ctx.db, "EXPLAIN QUERY PLAN " <> reconciliation_sql, reconciliation_params)
 
     assert Enum.any?(reconciliation_plan, fn [_, _, _, detail] ->
-             String.contains?(detail, "wakes_delivered_turn")
+             String.contains?(detail, "wakes_delivered_obligation")
            end)
+
+    assert {:ok, []} = DB.query(ctx.db, reconciliation_sql, reconciliation_params)
+
+    {bracket_sql, bracket_params} = WorkItems.delivered_bracket_reconciliation_query(0)
+
+    assert {:ok, bracket_plan} =
+             DB.query(ctx.db, "EXPLAIN QUERY PLAN " <> bracket_sql, bracket_params)
+
+    assert Enum.any?(bracket_plan, fn [_, _, _, detail] ->
+             String.contains?(detail, "work_items_open_routing_wake")
+           end)
+
+    assert Enum.any?(bracket_plan, fn [_, _, _, detail] ->
+             String.contains?(detail, "work_items_open_slate_wake")
+           end)
+
+    assert {:ok, []} = DB.query(ctx.db, bracket_sql, bracket_params)
 
     assert {:ok, terminal_action_plan} =
              DB.query(

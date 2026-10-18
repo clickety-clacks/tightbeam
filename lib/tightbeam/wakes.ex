@@ -592,21 +592,141 @@ defmodule Tightbeam.Wakes do
         recipient_session_key \\ nil,
         delivered_wake_id \\ nil
       ) do
+    if is_binary(delivered_wake_id) do
+      reconcile_exact_delivered_sources(db, recipient_session_key, delivered_wake_id)
+    else
+      case reconcile_startup_delivered_sources(db, 0) do
+        {:ok, _count, _last_rowid} -> :ok
+        error -> error
+      end
+    end
+  end
+
+  @doc false
+  def source_reconciliation_query(scope, after_rowid \\ 0, limit \\ 100)
+
+  def source_reconciliation_query(:startup, after_rowid, limit) do
+    root_upper = source_marker_upper_bound(@terminal_notice_marker)
+    action_upper = source_marker_upper_bound(@terminal_action_marker)
+
+    {"""
+     SELECT rowid,wakeId,outcome FROM (
+       SELECT w.rowid,w.wakeId,
+         CASE WHEN w.deliveredTurnSeq IS NOT NULL THEN 'delivered' ELSE 'delivery-failed' END AS outcome
+       FROM supervision_liveness_sidecar s
+       JOIN wakes w ON w.wakeId=s.wakeId
+       WHERE s.controllerOrigin='holder_continuation' AND s.controllerState='pending'
+         AND w.rowid>?1
+         AND (w.deliveredTurnSeq IS NOT NULL OR EXISTS (
+           SELECT 1 FROM wake_cancellations c WHERE c.wakeId=w.wakeId
+             AND c.causalSourceKind='scheduler_delivery'
+             AND c.reasonKind IN ('target_unresolvable','consumer_unavailable')
+         ))
+       UNION ALL
+       SELECT w.rowid,w.wakeId,'delivered' AS outcome
+       FROM wakes w INDEXED BY wakes_delivered_obligation
+       JOIN assignments terminal ON terminal.id=w.assignmentId
+       WHERE w.rowid>?1 AND w.state='fired' AND w.deliveredTurnSeq IS NOT NULL
+         AND w.obligationRef>=?2 AND w.obligationRef<?3
+         AND terminal.state='closed' AND terminal.outcome IN ('completed','surrendered')
+         AND EXISTS (SELECT 1 FROM assignments a
+           WHERE a.holderKey=w.sessionKey AND a.state='open')
+         AND NOT EXISTS (SELECT 1 FROM wakes reminder
+           WHERE reminder.obligationRef=?4 || w.wakeId)
+         AND NOT EXISTS (SELECT 1 FROM attests action
+           WHERE action.bySession=w.sessionKey AND action.kind='progress'
+             AND substr(action.note,1,length('completion-handoff-action ' || terminal.id ||
+                 ' attest ' || terminal.closingAttestId || ' '))=
+               'completion-handoff-action ' || terminal.id ||
+                 ' attest ' || terminal.closingAttestId || ' ')
+       UNION ALL
+       SELECT w.rowid,w.wakeId,'delivered' AS outcome
+       FROM wakes w INDEXED BY wakes_delivered_obligation
+       WHERE w.rowid>?1 AND w.state='fired' AND w.deliveredTurnSeq IS NOT NULL
+         AND w.obligationRef>=?5 AND w.obligationRef<?6
+         AND EXISTS (SELECT 1 FROM wakes root
+           JOIN assignments terminal ON terminal.id=root.assignmentId
+           WHERE root.wakeId=substr(w.obligationRef,length(?5)+1)
+             AND root.obligationRef>=?2 AND root.obligationRef<?3
+             AND terminal.state='closed' AND terminal.outcome IN ('completed','surrendered')
+             AND NOT EXISTS (SELECT 1 FROM attests action
+               WHERE action.bySession=w.sessionKey AND action.kind='progress'
+                 AND substr(action.note,1,length('completion-handoff-action ' || terminal.id ||
+                     ' attest ' || terminal.closingAttestId || ' '))=
+                   'completion-handoff-action ' || terminal.id ||
+                     ' attest ' || terminal.closingAttestId || ' '))
+         AND EXISTS (SELECT 1 FROM assignments a
+           WHERE a.holderKey=w.sessionKey AND a.state='open')
+         AND NOT EXISTS (SELECT 1 FROM wakes newer
+           WHERE newer.obligationRef=w.obligationRef AND newer.rowid>w.rowid)
+     )
+     ORDER BY rowid LIMIT ?7
+     """,
+     [after_rowid, @terminal_notice_marker, root_upper, @terminal_action_marker,
+      @terminal_action_marker, action_upper, limit]}
+  end
+
+  def source_reconciliation_query(
+        {:delivery, recipient_session_key, delivered_wake_id},
+        _after_rowid,
+        _limit
+      )
+      when is_binary(recipient_session_key) and is_binary(delivered_wake_id) do
+    direct_sql = """
+    SELECT rowid,wakeId,
+      CASE WHEN deliveredTurnSeq IS NOT NULL THEN 'delivered' ELSE 'delivery-failed' END
+    FROM wakes
+    WHERE wakeId=?1 AND sessionKey=?2
+      AND ((waitMode IS NOT NULL AND EXISTS (
+        SELECT 1 FROM supervision_liveness_sidecar s
+        WHERE s.wakeId=wakes.wakeId AND s.controllerOrigin='holder_continuation'
+          AND s.controllerState='pending'
+      )) OR (deliveredTurnSeq IS NOT NULL AND
+        ((obligationRef>=?3 AND obligationRef<?4) OR (obligationRef>=?5 AND obligationRef<?6))))
+      AND (deliveredTurnSeq IS NOT NULL OR EXISTS (
+        SELECT 1 FROM wake_cancellations c WHERE c.wakeId=wakes.wakeId
+          AND c.causalSourceKind='scheduler_delivery'
+          AND c.reasonKind IN ('target_unresolvable','consumer_unavailable')
+      ))
+    """
+
+    carrier_sql = """
+    SELECT w.rowid,w.wakeId,'delivered'
+    FROM notice_batches b
+    JOIN notice_batch_members m ON m.batchId=b.batchId
+    JOIN wakes w ON w.wakeId=m.sourceWakeId
+    WHERE b.deliveryWakeId=?1 AND b.state='delivered' AND m.state='included'
+      AND w.sessionKey=?2 AND w.deliveredTurnSeq IS NOT NULL
+      AND ((w.waitMode IS NOT NULL AND EXISTS (
+        SELECT 1 FROM supervision_liveness_sidecar s
+        WHERE s.wakeId=w.wakeId AND s.controllerOrigin='holder_continuation'
+          AND s.controllerState='pending'
+      )) OR (w.obligationRef>=?3 AND w.obligationRef<?4)
+        OR (w.obligationRef>=?5 AND w.obligationRef<?6))
+    """
+
+    params = [
+      delivered_wake_id,
+      recipient_session_key,
+      @terminal_notice_marker,
+      source_marker_upper_bound(@terminal_notice_marker),
+      @terminal_action_marker,
+      source_marker_upper_bound(@terminal_action_marker)
+    ]
+
+    {direct_sql <> " UNION ALL " <> carrier_sql, params}
+  end
+
+  defp source_marker_upper_bound(marker),
+    do: String.replace_suffix(marker, ":", ";")
+
+  defp reconcile_exact_delivered_sources(db, recipient_session_key, delivered_wake_id) do
     case DB.transaction(db, fn txn ->
-           rows = reconcilable_source_records(txn, recipient_session_key, delivered_wake_id)
+           {sql, params} =
+             source_reconciliation_query({:delivery, recipient_session_key, delivered_wake_id})
 
-           Enum.reduce(rows, [], fn
-             [wake_id, outcome], failures
-             when is_binary(wake_id) and outcome in ["delivered", "delivery-failed"] ->
-               case reconcile_source_delivery_in_savepoint(txn, wake_id, outcome) do
-                 {:ok, _effects} -> failures
-                 {:error, _reason} -> [wake_id | failures]
-               end
-
-             malformed, failures ->
-               Logger.warning("malformed delivered source record ignored: #{inspect(malformed)}")
-               failures
-           end)
+           rows = Txn.q(txn, sql, params)
+           reconcile_source_rows_in_txn(txn, rows)
          end) do
       {:ok, []} ->
         :ok
@@ -616,50 +736,57 @@ defmodule Tightbeam.Wakes do
 
       {:error, error} ->
         Logger.warning("delivered source actions unavailable: #{Exception.message(error)}")
-
         {:error, error}
     end
   end
 
-  defp reconcilable_source_records(txn, recipient_session_key, delivered_wake_id) do
-    filters = [recipient_session_key, delivered_wake_id]
+  defp reconcile_startup_delivered_sources(db, after_rowid) do
+    result =
+      DB.transaction(db, fn txn ->
+        {sql, params} = source_reconciliation_query(:startup, after_rowid, 100)
+        rows = Txn.q(txn, sql, params)
 
-    Txn.q(
-      txn,
-      """
-      SELECT wakeId,
-        CASE WHEN deliveredTurnSeq IS NOT NULL THEN 'delivered' ELSE 'delivery-failed' END
-      FROM wakes
-      WHERE (?1 IS NULL OR sessionKey=?1)
-        AND (
-          ?2 IS NULL OR wakeId=?2 OR EXISTS (
-            SELECT 1 FROM notice_batches b
-            JOIN notice_batch_members m ON m.batchId=b.batchId
-            WHERE b.deliveryWakeId=?2 AND b.state='delivered'
-              AND m.state='included' AND m.sourceWakeId=wakes.wakeId
-          )
-        )
-        AND (
-          (waitMode IS NOT NULL AND EXISTS (
-            SELECT 1 FROM supervision_liveness_sidecar s
-            WHERE s.wakeId=wakes.wakeId AND s.controllerOrigin='holder_continuation'
-              AND s.controllerState='pending'
-          ))
-          OR (deliveredTurnSeq IS NOT NULL AND substr(obligationRef,1,length(?3))=?3)
-          OR (deliveredTurnSeq IS NOT NULL AND substr(obligationRef,1,length(?4))=?4)
-        )
-        AND (
-          deliveredTurnSeq IS NOT NULL
-          OR EXISTS (
-            SELECT 1 FROM wake_cancellations c
-            WHERE c.wakeId=wakes.wakeId AND c.causalSourceKind='scheduler_delivery'
-              AND c.reasonKind IN ('target_unresolvable','consumer_unavailable')
-          )
-        )
-      ORDER BY COALESCE(deliveredTurnSeq, firedAt),wakeId
-      """,
-      filters ++ [@terminal_notice_marker, @terminal_action_marker]
-    )
+        {reconcile_source_rows_in_txn(txn, rows), length(rows),
+         rows |> List.last() |> case do
+           [rowid, _wake_id, _outcome] -> rowid
+           _ -> after_rowid
+         end}
+      end)
+
+    case result do
+      {:ok, {failures, count, last_rowid}} ->
+        case report_source_reconciliation_failures(failures) do
+          :ok -> {:ok, count, last_rowid}
+          {:error, reasons} ->
+            Logger.warning("startup source records remain unresolved: #{inspect(reasons)}")
+            {:error, {:source_actions_unavailable, reasons}}
+        end
+
+      {:error, error} ->
+        Logger.warning("startup delivered source recovery unavailable: #{Exception.message(error)}")
+        {:error, error}
+    end
+  end
+
+  defp reconcile_source_rows_in_txn(txn, rows) do
+    Enum.reduce(rows, [], fn
+      [_rowid, wake_id, outcome], failures
+      when is_binary(wake_id) and outcome in ["delivered", "delivery-failed"] ->
+        case reconcile_source_delivery_in_savepoint(txn, wake_id, outcome) do
+          {:ok, _effects} -> failures
+          {:error, _reason} -> [wake_id | failures]
+        end
+
+      malformed, failures ->
+        Logger.warning("malformed delivered source record ignored: #{inspect(malformed)}")
+        failures
+    end)
+  end
+
+  defp report_source_reconciliation_failures([]), do: :ok
+
+  defp report_source_reconciliation_failures(failures) do
+    {:error, {:source_actions_unavailable, Enum.reverse(failures)}}
   end
 
   defp reconcile_source_delivery_in_savepoint(txn, wake_id, wait_outcome) do
@@ -4632,7 +4759,9 @@ defmodule Tightbeam.Wakes do
         :error
 
       requester_id == "tightbeam:supervision" ->
-        if reason == "superseded" and source == "wake" and outcome == "replacement",
+        if reason == "superseded" and
+             ((source == "wake" and outcome == "replacement") or
+                (source == "progress_attest" and outcome == "no_replacement")),
           do: :ok,
           else: :error
 
@@ -6330,8 +6459,6 @@ defmodule Tightbeam.Wakes do
   end
 
   def handle_cast({:recipient_ready, session_key}, state) do
-    reconcile_delivery_source_records(state.db, session_key, nil)
-
     DB.background_pass(fn ->
       deliver_eligible_waits(state.db, state.delivery_opts, session_key)
       NoticeBatcher.recover(state.db, now(), state.delivery_opts, session_key)
@@ -6347,13 +6474,65 @@ defmodule Tightbeam.Wakes do
 
   @impl true
   def handle_info(:recover_notices, state) do
-    reconcile_delivery_source_records(state.db, nil, nil)
     # Recognize overdue conditions before recovery forms a carrier. Otherwise
     # a timed source can occupy the recipient ahead of its due condition peers.
     DB.background_pass(fn -> evaluate_conditions(state, :tick) end)
     # Release pre-crash, unclaimed memberships once. Later drains are driven
     # only by recipient readiness and due events.
     NoticeBatcher.recover(state.db, now(), state.delivery_opts)
+    # Reconcile only durable source records whose follow-through is still owed.
+    # Work one bounded page per scheduler message so this catch-up cannot hold
+    # recipient readiness behind all historical deliveries.
+    Process.send_after(self(), {:recover_delivered_sources, 0}, 0)
+    Process.send_after(self(), :recover_work_item_brackets, 0)
+    {:noreply, state}
+  end
+
+  def handle_info({:recover_delivered_sources, after_rowid}, state) do
+    case DB.background_pass(
+           fn -> reconcile_startup_delivered_sources(state.db, after_rowid) end,
+           :overloaded
+         ) do
+      {:ok, 100, last_rowid} when last_rowid > after_rowid ->
+        Process.send_after(self(), {:recover_delivered_sources, last_rowid}, 0)
+
+      {:ok, _count, _last_rowid} ->
+        :ok
+
+      {:error, error} ->
+        Logger.warning("startup source recovery stopped: #{Exception.message(error)}")
+        Process.send_after(self(), {:recover_delivered_sources, after_rowid}, 5_000)
+
+      :overloaded ->
+        Logger.debug("startup source recovery deferred while the database is busy")
+        Process.send_after(self(), {:recover_delivered_sources, after_rowid}, 5_000)
+    end
+
+    {:noreply, state}
+  end
+
+  def handle_info(:recover_work_item_brackets, state),
+    do: handle_info({:recover_work_item_brackets, 0}, state)
+
+  def handle_info({:recover_work_item_brackets, after_rowid}, state) do
+    case DB.background_pass(fn ->
+           WorkItems.reconcile_delivered_brackets_page(state.db, after_rowid)
+         end, :overloaded) do
+      {:ok, 100, last_rowid} when last_rowid > after_rowid ->
+        Process.send_after(self(), {:recover_work_item_brackets, last_rowid}, 0)
+
+      {:ok, _count, _last_rowid} ->
+        :ok
+
+      {:error, error} ->
+        Logger.warning("startup work-item source recovery stopped: #{Exception.message(error)}")
+        Process.send_after(self(), {:recover_work_item_brackets, after_rowid}, 5_000)
+
+      :overloaded ->
+        Logger.debug("startup work-item source recovery deferred while the database is busy")
+        Process.send_after(self(), {:recover_work_item_brackets, after_rowid}, 5_000)
+    end
+
     {:noreply, state}
   end
 

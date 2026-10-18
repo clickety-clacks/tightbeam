@@ -2244,6 +2244,8 @@ defmodule Tightbeam.SchemaShapeTest do
         ALTER TABLE effort_checkin_generations DROP COLUMN reliefStartedAt;
         ALTER TABLE effort_checkin_generations DROP COLUMN reliefExcludedMs;
         DROP INDEX wakes_wait_recognition;
+        DROP INDEX IF EXISTS wakes_pending_session_obligation;
+        DROP INDEX IF EXISTS wakes_delivered_obligation;
         DROP INDEX condition_facts_owner_match;
         ALTER TABLE condition_facts DROP COLUMN ownerUserId;
         ALTER TABLE wakes DROP COLUMN ownerUserId;
@@ -2279,6 +2281,7 @@ defmodule Tightbeam.SchemaShapeTest do
   end
 
   defp downgrade_assignment_source_replacement_cancellation!(db) do
+    Tightbeam.SchemaShapeRuntimeFixture.downgrade_effort_holder_activity_cancellation!(db)
     downgrade_notice_source_storage!(db)
 
     {:ok, [[current_ddl]]} =

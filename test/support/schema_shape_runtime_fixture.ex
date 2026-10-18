@@ -559,6 +559,8 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
         ALTER TABLE effort_checkin_generations DROP COLUMN reliefStartedAt;
         ALTER TABLE effort_checkin_generations DROP COLUMN reliefExcludedMs;
         DROP INDEX wakes_wait_recognition;
+        DROP INDEX IF EXISTS wakes_pending_session_obligation;
+        DROP INDEX IF EXISTS wakes_delivered_obligation;
         DROP INDEX condition_facts_owner_match;
         ALTER TABLE condition_facts DROP COLUMN ownerUserId;
         ALTER TABLE wakes DROP COLUMN ownerUserId;
@@ -591,7 +593,53 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
     end
   end
 
+  def downgrade_effort_holder_activity_cancellation!(db) do
+    if table?(db, "effort_holder_activity_cancellation_epoch") do
+      predecessor_ddl = Schema.assignment_source_replacement_cancellation_ddl()
+
+      {:ok, columns} = DB.query(db, "PRAGMA table_info(wake_cancellations)")
+      column_names = Enum.map_join(columns, ",", &Enum.at(&1, 1))
+
+      {:ok, trigger_rows} =
+        DB.query(
+          db,
+          "SELECT sql FROM sqlite_master WHERE type='trigger' AND name IN ('wake_cancellations_pending_insert','wakes_typed_cancellation_required') ORDER BY name"
+        )
+
+      assert length(trigger_rows) == 2
+      trigger_ddls = Enum.map_join(trigger_rows, ";\n", &hd/1)
+      {:ok, [[foreign_keys]]} = DB.query(db, "PRAGMA foreign_keys")
+      {:ok, [[legacy_alter_table]]} = DB.query(db, "PRAGMA legacy_alter_table")
+
+      assert :ok = DB.execute(db, "PRAGMA foreign_keys=OFF")
+      assert :ok = DB.execute(db, "PRAGMA legacy_alter_table=ON")
+
+      try do
+        assert :ok =
+                 DB.execute(db, """
+                 DROP TRIGGER wake_cancellations_pending_insert;
+                 DROP TRIGGER wakes_typed_cancellation_required;
+                 DROP TABLE effort_holder_activity_cancellation_epoch;
+                 ALTER TABLE wake_cancellations RENAME TO wake_cancellations_effort_activity_current;
+                 #{predecessor_ddl};
+                 INSERT INTO wake_cancellations (#{column_names})
+                   SELECT #{column_names} FROM wake_cancellations_effort_activity_current;
+                 DROP TABLE wake_cancellations_effort_activity_current;
+                 #{trigger_ddls};
+                 """)
+      after
+        assert :ok = DB.execute(db, "PRAGMA legacy_alter_table=#{legacy_alter_table}")
+        assert :ok = DB.execute(db, "PRAGMA foreign_keys=#{foreign_keys}")
+      end
+
+      assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
+    end
+
+    :ok
+  end
+
   def downgrade_assignment_source_replacement_cancellation!(db) do
+    downgrade_effort_holder_activity_cancellation!(db)
     downgrade_notice_source_storage!(db)
 
     {:ok, [[current_ddl]]} =
