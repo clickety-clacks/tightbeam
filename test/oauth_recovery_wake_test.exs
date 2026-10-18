@@ -303,9 +303,16 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
     onboard = onboard_handler(ctx, start_noop_scheduler!())
     lease = begin_and_stage!(onboard, "anthropic", "subscription")
 
-    assert %{code: "onboarding_cleanup_failed", recovery: recovery, diagnostic: diagnostic} =
+    assert %{
+             code: "onboarding_cleanup_failed",
+             message: message,
+             recovery: recovery,
+             diagnostic: diagnostic
+           } =
              finish(onboard, "anthropic", lease, "subscription")
 
+    assert message =~ "credential validity is unverified"
+    assert message =~ "retry onboarding"
     assert diagnostic["kind"] == "cleanup"
     assert diagnostic["credentialValidity"] == "unverified"
     assert recovery =~ "retry onboarding"
@@ -319,6 +326,9 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
 
     Agent.update(cleanup, fn _ -> :exited end)
+    stop_supervised!(Credentials)
+    start_credentials!(ctx, sh: fn _ -> {"", 0} end)
+    assert {:needs_onboarding, {:present_but_unverified, ^cause}} = Credentials.status(:anthropic)
     retry = begin_and_stage!(onboard, "anthropic", "subscription")
     assert %{status: "onboarded"} = finish(onboard, "anthropic", retry, "subscription")
     assert Credentials.status(:anthropic) == :onboarded
