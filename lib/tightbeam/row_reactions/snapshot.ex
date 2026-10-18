@@ -431,7 +431,15 @@ defmodule Tightbeam.RowReactions.Snapshot do
   # that relation without re-rendering today's prompt or electing a recipient.
   defp terminal_sources(txn, wake) do
     output_ids =
-      [wake["wakeId"] | Enum.map(Txn.q(txn, "SELECT rootWakeId FROM wake_retry_attempts WHERE wakeId=?1", [wake["wakeId"]]), &hd/1)]
+      [
+        wake["wakeId"]
+        | Enum.map(
+            Txn.q(txn, "SELECT rootWakeId FROM wake_retry_attempts WHERE wakeId=?1", [
+              wake["wakeId"]
+            ]),
+            &hd/1
+          )
+      ]
       |> Enum.uniq()
 
     events =
