@@ -1706,12 +1706,13 @@ defmodule Tightbeam.Schema do
               after_fallback
 
           # Older stamped cancellation DDL predates the sentinel's
-          # source-owned condition clear. Extend only the typed source grammar
-          # used by the already implemented callers.
+          # source-owned condition clear. Extend only the reason-kind whitelist;
+          # the scheduler's terminal-outcome rule uses the same values but is
+          # intentionally unchanged.
           sql =
             SourceSqlTemplate.replace_once!(
               sql,
-              ~r/'consumer_unavailable'\s*,\s*'target_unresolvable'/u,
+              ~r/(reasonKind TEXT NOT NULL CHECK\s*\(reasonKind IN\s*\([^)]*?'target_unresolvable')/u,
               fn matched -> matched <> ",'condition_cleared'" end
             )
 
