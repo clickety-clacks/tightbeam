@@ -976,7 +976,7 @@ defmodule Tightbeam.CredentialsTest do
     assert Credentials.status(:openai, server) == :onboarded
   end
 
-  test "an established Claude subscription still terminalizes a logged-out status", ctx do
+  test "an established Claude subscription terminalizes a provider-confirmed auth failure", ctx do
     owner = self()
 
     park_receiver =
@@ -993,6 +993,7 @@ defmodule Tightbeam.CredentialsTest do
         name: nil,
         base_dir: ctx.base,
         machine: "eezo",
+        sh: fn _ -> {JSON.encode!(%{status: 401}), 0} end,
         park_edge: Tightbeam.CommandEdge.request_to(park_receiver)
       )
 
@@ -1369,7 +1370,7 @@ defmodule Tightbeam.CredentialsTest do
       refute_receive :stop_refused
       File.write!(Path.join(staging, "auth.json"), ~S({"token":"candidate"}))
 
-      assert {:error, :runtime_stop_refused} =
+      assert {:error, {:credential_cleanup_failed, :runtime_stop_refused}} =
                Credentials.finish_onboard(:openai, :subscription, lease_id, server)
 
       assert_receive :stop_refused
@@ -1381,6 +1382,9 @@ defmodule Tightbeam.CredentialsTest do
                Credentials.status(:openai, server)
 
       assert cause["finish"] =~ "runtime_stop_refused"
+      assert cause["phase"] == "cleanup"
+      assert cause["recovery"] =~ "retry onboarding"
+      refute credential_metadata(ctx.base, "codex")["terminal"]
       refute credential_metadata(ctx.base, "codex", "eezo")["onboarded"]
       refute File.exists?(staging)
       refute_receive :forbidden_start

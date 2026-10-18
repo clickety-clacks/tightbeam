@@ -5811,11 +5811,49 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  # Every onboarding phase shares one public code; the phase and the native
+  # Credential failures share one public code; cleanup has its own code because
+  # it establishes no credential rejection. The phase and the native
   # reason ride in the diagnostic so they stay distinguishable. The message is
   # built from `inspect(reason)`, so its secret material is masked like the
   # diagnostic's.
-  defp onboard_failed(message, reason, provider, machine, phase, facts \\ []) do
+  defp onboard_failed(message, reason, provider, machine, phase, facts \\ [])
+
+  defp onboard_failed(
+         message,
+         {:credential_cleanup_failed, _} = reason,
+         provider,
+         machine,
+         phase,
+         facts
+       ) do
+    recovery =
+      "Allow the recorded harness process group to exit, then retry onboarding. " <>
+        "If it remains, inspect it with session-diagnose before operator cleanup; " <>
+        "do not signal an unverified process group."
+
+    ErrorDiagnostic.put(
+      %{
+        code: "onboarding_cleanup_failed",
+        message:
+          "Harness cleanup failed; credential validity is unverified. " <>
+            ErrorDiagnostic.redact_text(message) <> ". " <> recovery,
+        recovery: recovery
+      },
+      ErrorDiagnostic.new(
+        "cleanup",
+        [
+          operation: "onboard",
+          phase: phase,
+          provider: provider,
+          machine: machine,
+          reason: reason,
+          credential_validity: "unverified"
+        ] ++ facts
+      )
+    )
+  end
+
+  defp onboard_failed(message, reason, provider, machine, phase, facts) do
     ErrorDiagnostic.put(
       %{code: "needs_onboarding", message: ErrorDiagnostic.redact_text(message)},
       ErrorDiagnostic.with_facts(
