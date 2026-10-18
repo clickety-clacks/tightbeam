@@ -181,12 +181,23 @@ defmodule Tightbeam.CliIntegrationTest do
   end
 
   test "session reparent crosses the real CLI wire and preserves assignment continuity", ctx do
+    Tightbeam.RowReactionFixtures.elect_handoff(Map.keys(ctx.handlers))
     run = fn args -> System.cmd(ctx.binary, args, cd: ctx.workdir, stderr_to_stdout: true) end
 
     assert {created, 0} =
              run.(["work-item-create", "--title", "reparent wire", "--as-user", "flynn"])
 
     item = JSON.decode!(created)["id"]
+
+    assert {_, 0} =
+             run.([
+               "work-item-update",
+               item,
+               "--delivery-owner",
+               "cli-worker",
+               "--as-user",
+               "flynn"
+             ])
 
     assert {assigned, 0} =
              run.([
@@ -1110,6 +1121,8 @@ defmodule Tightbeam.CliIntegrationTest do
 
   test "session-auth --as-user attributes verdicts to the user and grants admin revocation",
        ctx do
+    Tightbeam.RowReactionFixtures.elect_handoff(Map.keys(ctx.handlers))
+
     {:ok, _} =
       DB.query(
         ctx.db,
@@ -1942,6 +1955,14 @@ defmodule Tightbeam.CliIntegrationTest do
       )
 
     item_id = JSON.decode!(created)["id"]
+
+    {_, 0} =
+      System.cmd(
+        ctx.binary,
+        ["work-item-update", item_id, "--delivery-owner", "cli-worker", "--as-user", "flynn"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
 
     {assigned, 0} =
       System.cmd(
