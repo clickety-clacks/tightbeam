@@ -1555,32 +1555,37 @@ defmodule Tightbeam.Schema do
           no_replacement_anchor =
             "(outcomeKind = 'no_replacement' AND replacementWakeId IS NULL AND"
 
-          no_replacement_arms =
-            ~r/\(\(\s*workImpactKind\s*=\s*'linked_work_open'\s+AND\s+livenessTriggerKind\s+IS\s+NOT\s+NULL\s+AND\s+livenessTriggerId\s+IS\s+NOT\s+NULL\s+AND\s+actionNeeded\s*=\s*1\s*\)\s+OR\s+\(\s*workImpactKind\s*!=\s*'linked_work_open'\s+AND\s+livenessTriggerKind\s+IS\s+NULL\s+AND\s+livenessTriggerId\s+IS\s+NULL\s+AND\s+actionNeeded\s*=\s*0\s*\)\)/
+          fallback_arm =
+            "(workImpactKind != 'linked_work_open' AND livenessTriggerKind IS NULL AND"
 
           holder_activity_arm =
-            "((workImpactKind = 'linked_work_open' AND livenessTriggerKind IS NOT NULL AND " <>
-              "livenessTriggerId IS NOT NULL AND actionNeeded = 1) OR " <>
-              "(workImpactKind = 'linked_work_open' AND livenessTriggerKind IS NULL AND " <>
+            "(workImpactKind = 'linked_work_open' AND livenessTriggerKind IS NULL AND " <>
               "livenessTriggerId IS NULL AND actionNeeded = 0 AND requesterKind = 'process' AND " <>
               "requesterId = 'tightbeam:effort-checkin' AND reasonKind = 'superseded' AND " <>
-              "causalSourceKind = 'progress_attest') OR " <>
-              "(workImpactKind != 'linked_work_open' AND livenessTriggerKind IS NULL AND " <>
-              "livenessTriggerId IS NULL AND actionNeeded = 0))"
+              "causalSourceKind = 'progress_attest')"
 
           true = String.contains?(sql, no_replacement_anchor)
 
           [before_no_replacement, after_no_replacement] =
             String.split(sql, no_replacement_anchor, parts: 2)
 
-          true = length(Regex.scan(no_replacement_arms, after_no_replacement)) == 1
+          [before_fallback, after_fallback] =
+            String.split(after_no_replacement, fallback_arm, parts: 2)
+
+          # The O2 predecessor adds a historical rail-remedy alternative before
+          # the ordinary no-linked-work fallback. Insert the new source route
+          # at that boundary, preserving both predecessor alternatives verbatim.
+          true = String.contains?(before_fallback, "requesterId = 'tightbeam:rail-remedy' AND")
+          false = String.contains?(after_fallback, fallback_arm)
 
           sql =
             before_no_replacement <>
               no_replacement_anchor <>
-              Regex.replace(no_replacement_arms, after_no_replacement, holder_activity_arm,
-                global: false
-              )
+              before_fallback <>
+              holder_activity_arm <>
+              " OR\n            " <>
+              fallback_arm <>
+              after_fallback
 
           requester_anchor =
             "(requesterId = 'tightbeam:supervision' AND reasonKind = 'superseded' AND"

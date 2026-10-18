@@ -80,6 +80,7 @@ defmodule Tightbeam.EffortHolderActivityCancellationMigrationTest do
 
     assert Regex.match?(@activity_route, table_sql)
     assert Regex.match?(@activity_requester_route, table_sql)
+    assert String.contains?(table_sql, "requesterId = 'tightbeam:rail-remedy' AND")
 
     assert rows(ctx.db, "SELECT shape FROM effort_holder_activity_cancellation_epoch WHERE id=0") ==
              [["effort-holder-activity-cancellation-v1-019"]]
@@ -101,6 +102,7 @@ defmodule Tightbeam.EffortHolderActivityCancellationMigrationTest do
       |> then(&Regex.replace(@activity_requester_route, &1, "", global: false))
 
     refute predecessor_sql == current_sql
+    assert String.contains?(predecessor_sql, "requesterId = 'tightbeam:rail-remedy' AND")
 
     assert {:ok, trigger_rows} =
              DB.query(
