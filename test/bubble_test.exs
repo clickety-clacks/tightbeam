@@ -1626,6 +1626,9 @@ defmodule Tightbeam.Productions.BubbleTest do
           assert main_notice.wake_id == main_carrier
 
           for {seq, blocked, _original_recipient} <- causes do
+            # Replaying the original failure after the next rung was admitted
+            # must not transfer disposal back to the previous recipient.
+            assert :ok = Bubble.recognize_terminal(ctx.db, seq)
             assert main_notice.prompt =~ "Turn #{seq}"
 
             assert {:ok, [[disposer]]} =

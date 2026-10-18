@@ -88,8 +88,6 @@ defmodule Tightbeam.Productions.Bubble do
   defp ordinary_cause?(turn), do: turn.status != "delivered"
 
   defp recognize(db, seq, "delivered", turn) do
-    reconcile_delivered_notice_disposers(db, seq, turn.session_key)
-
     # Retraction is observed, not declared: a delivered turn is proof the
     # owner has capacity. Guarded by the cheap any?/2 read because almost
     # every database has never filed a user-alerted fact and this runs on
@@ -107,66 +105,6 @@ defmodule Tightbeam.Productions.Bubble do
     end
 
     :ok
-  end
-
-  defp reconcile_delivered_notice_disposers(db, turn_seq, recipient) do
-    case DB.transaction(db, fn txn ->
-           sources =
-             DB.Txn.q(
-               txn,
-               """
-               WITH source_deliveries AS (#{NoticeBatcher.recorded_deliveries_sql()})
-               SELECT source.wakeId
-               FROM source_deliveries d
-               JOIN wakes source ON source.wakeId=d.sourceWakeId
-               WHERE d.turnSeq=?1 AND source.sessionKey=?2
-                 AND source.origin='process:tightbeam'
-               ORDER BY source.wakeId
-               """,
-               [turn_seq, recipient]
-             )
-
-           Enum.each(sources, fn
-             [source_wake_id] when is_binary(source_wake_id) ->
-               DB.Txn.exec(txn, "SAVEPOINT reconcile_bubble_delivery")
-
-               try do
-                 case resolved_bubble_source(txn, source_wake_id, recipient) do
-                   {:ok, cause_seq, ^recipient} ->
-                     assert_retry_disposer_in_txn!(txn, source_wake_id, recipient)
-                     transfer_cannot_proceed_disposers_for_cause_in_txn(txn, cause_seq, recipient)
-
-                   _ ->
-                     :ok
-                 end
-
-                 DB.Txn.exec(txn, "RELEASE reconcile_bubble_delivery")
-               rescue
-                 error ->
-                   DB.Txn.exec(txn, "ROLLBACK TO reconcile_bubble_delivery")
-                   DB.Txn.exec(txn, "RELEASE reconcile_bubble_delivery")
-
-                   Logger.warning(
-                     "bubble source reconciliation deferred for #{source_wake_id}: #{Exception.message(error)}"
-                   )
-               end
-
-             _malformed ->
-               Logger.warning("skipping malformed delivered bubble source")
-           end)
-
-           :ok
-         end) do
-      {:ok, :ok} ->
-        :ok
-
-      {:error, error} ->
-        Logger.warning(
-          "delivered bubble source reconciliation deferred: #{Exception.message(error)}"
-        )
-
-        :ok
-    end
   end
 
   @doc """
@@ -274,6 +212,9 @@ defmodule Tightbeam.Productions.Bubble do
     DB.Txn.exec(txn, "SAVEPOINT bubble_notice_member")
 
     try do
+      wake_id = "bubble:#{turn.cause_seq}:#{recipient}"
+      new_source? = DB.Txn.q(txn, "SELECT 1 FROM wakes WHERE wakeId=?1", [wake_id]) == []
+
       delivery =
         Gateway.deliver_prompt_in_txn(
           txn,
@@ -287,6 +228,15 @@ defmodule Tightbeam.Productions.Bubble do
           request_ref: "bubble:#{turn.cause_seq}",
           assignment_id: cause.assignment_id
         )
+
+      # The source owns disposition as soon as it sends to the next recipient,
+      # including while that recipient is busy. Commit the authority change with
+      # admission so restart or publication failure cannot strand it. Replaying
+      # an earlier rung must not reclaim authority from a later recipient.
+      if new_source? and
+           (match?({:staged, _}, delivery) or match?({:appended, _, _, _}, delivery)) do
+        transfer_cannot_proceed_disposers_for_cause_in_txn(txn, turn.cause_seq, recipient)
+      end
 
       DB.Txn.exec(txn, "RELEASE bubble_notice_member")
       delivery
