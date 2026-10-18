@@ -458,46 +458,94 @@ defmodule Tightbeam.RowReactionRequestTest do
       assert Wakes.list_pending(ctx.db) == pending
     end
   end
-  test "successive public interventions retain addressed provenance without nested histories", ctx do
+
+  test "successive public interventions retain addressed provenance without nested histories",
+       ctx do
     elect(ctx)
-    sizes = for n <- 1..32 do
-      request = ask(ctx)
-      [{raised, facts} | _] = Enum.filter(observations(ctx), fn {event, _} -> event["after"]["id"] == request.id end)
-      assert facts["related_actions"] == []
-      assert length(facts["sessions"]) <= 4
-      assert %{status: "answered"} = Escalation.answer(ctx.db, call("alternate", "answer", %{request: request.id, answer: "Resolved"}))
-      {_, resolved} = Enum.find(observations(ctx), fn {event, _} -> event["after"]["id"] == request.id and event["after"]["status"] == "answered" end)
-      assert [prior] = resolved["related_actions"]
-      assert prior["event"]["id"] == raised["id"]
-      assert prior["facts"] == %{"decision_request" => %{"id" => request.id}}
-      assert prior["source_ref"] == %{"org" => "owner", "event_id" => raised["id"]}
-      assert {:ok, [[saved]]} = DB.query(ctx.db, "SELECT facts FROM row_reaction_events WHERE org=?1 AND eventId=?2", [prior["source_ref"]["org"], prior["source_ref"]["event_id"]])
-      assert JSON.decode!(saved) == facts
-      # Settle this actual source's automatic outputs; growing settled history
-      # must not become recovery's current work set.
-      assert :ok = DB.execute(ctx.db, "UPDATE row_reaction_actions SET status='accepted'")
-      if n == 32 do
-        assert {:ok, plans} = DB.transaction(ctx.db, fn txn ->
-          Process.put(:request_queries, [])
-          traced = Tightbeam.DB.Txn.observe_queries(txn, fn {:sql_query,sql,params} -> Process.put(:request_queries, [{sql,params}|Process.get(:request_queries)]) end)
-          Tightbeam.RowReactions.Snapshot.current(traced, raised, %{})
-          for {sql,params} <- Process.delete(:request_queries) do
-            {sql,Tightbeam.DB.Txn.q(txn,"EXPLAIN QUERY PLAN " <> sql,params)}
+
+    sizes =
+      for n <- 1..32 do
+        request = ask(ctx)
+
+        [{raised, facts} | _] =
+          Enum.filter(observations(ctx), fn {event, _} -> event["after"]["id"] == request.id end)
+
+        assert facts["related_actions"] == []
+        assert length(facts["sessions"]) <= 4
+
+        assert %{status: "answered"} =
+                 Escalation.answer(
+                   ctx.db,
+                   call("alternate", "answer", %{request: request.id, answer: "Resolved"})
+                 )
+
+        {_, resolved} =
+          Enum.find(observations(ctx), fn {event, _} ->
+            event["after"]["id"] == request.id and event["after"]["status"] == "answered"
+          end)
+
+        assert [prior] = resolved["related_actions"]
+        assert prior["event"]["id"] == raised["id"]
+        assert prior["facts"] == %{"decision_request" => %{"id" => request.id}}
+        assert prior["source_ref"] == %{"org" => "owner", "event_id" => raised["id"]}
+
+        assert {:ok, [[saved]]} =
+                 DB.query(
+                   ctx.db,
+                   "SELECT facts FROM row_reaction_events WHERE org=?1 AND eventId=?2",
+                   [prior["source_ref"]["org"], prior["source_ref"]["event_id"]]
+                 )
+
+        assert JSON.decode!(saved) == facts
+        # Settle this actual source's automatic outputs; growing settled history
+        # must not become recovery's current work set.
+        assert :ok = DB.execute(ctx.db, "UPDATE row_reaction_actions SET status='accepted'")
+
+        if n == 32 do
+          assert {:ok, plans} =
+                   DB.transaction(ctx.db, fn txn ->
+                     Process.put(:request_queries, [])
+
+                     traced =
+                       Tightbeam.DB.Txn.observe_queries(txn, fn {:sql_query, sql, params} ->
+                         Process.put(:request_queries, [
+                           {sql, params} | Process.get(:request_queries)
+                         ])
+                       end)
+
+                     Tightbeam.RowReactions.Snapshot.current(traced, raised, %{})
+
+                     for {sql, params} <- Process.delete(:request_queries) do
+                       {sql, Tightbeam.DB.Txn.q(txn, "EXPLAIN QUERY PLAN " <> sql, params)}
+                     end
+                   end)
+
+          assert Enum.any?(plans, fn {_, plan} ->
+                   Enum.any?(plan, &(List.last(&1) =~ "row_reaction_request"))
+                 end)
+
+          for {_, plan} <- plans do
+            refute Regex.match?(
+                     ~r/SCAN (?:attests|sessions|e|a)(?:$|\s)/m,
+                     Enum.map_join(plan, "\n", &List.last/1)
+                   )
           end
-        end)
-        assert Enum.any?(plans, fn {_,plan} -> Enum.any?(plan, &(List.last(&1) =~ "row_reaction_request")) end)
-        for {_,plan} <- plans do
-          refute Regex.match?(~r/SCAN (?:attests|sessions|e|a)(?:$|\s)/m, Enum.map_join(plan,"\n",&List.last/1))
+
+          IO.puts("request_address_plans=#{inspect(plans)}")
         end
-        IO.puts("request_address_plans=#{inspect(plans)}")
+
+        size = byte_size(JSON.encode!(facts)) + byte_size(JSON.encode!(resolved))
+        if n in [8, 16, 32], do: IO.puts("intervention count=#{n} current_snapshot_bytes=#{size}")
+        size
       end
-      size = byte_size(JSON.encode!(facts)) + byte_size(JSON.encode!(resolved))
-      if n in [8,16,32], do: IO.puts("intervention count=#{n} current_snapshot_bytes=#{size}")
-      size
-    end
+
     assert Enum.max(sizes) < 2 * Enum.min(sizes)
     assert Enum.sum(sizes) < 32 * 20_000
-    assert {:ok, [[64]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM row_reaction_events WHERE json_extract(event,'$.kind')='decision_request'")
-  end
 
+    assert {:ok, [[64]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM row_reaction_events WHERE json_extract(event,'$.kind')='decision_request'"
+             )
+  end
 end

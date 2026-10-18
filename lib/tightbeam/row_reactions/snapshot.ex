@@ -145,7 +145,11 @@ defmodule Tightbeam.RowReactions.Snapshot do
     revocation_keys =
       ~w(id assignmentId revokedAt revokedBySession revokedByUser revokedByProcess)
 
-    item = one(txn, "SELECT #{Enum.join(item_keys, ",")} FROM work_items WHERE id=?1", item_keys, [row["workItemId"]])
+    item =
+      one(txn, "SELECT #{Enum.join(item_keys, ",")} FROM work_items WHERE id=?1", item_keys, [
+        row["workItemId"]
+      ])
+
     current_assignment = assignment_row(txn, row["id"])
 
     recorded
@@ -274,7 +278,10 @@ defmodule Tightbeam.RowReactions.Snapshot do
     |> addressed(txn, [event, request, current_assignment])
     |> Map.put("decision_request", request)
     |> Map.put("assignment", current_assignment)
-    |> Map.put("attests", Enum.uniq_by([row | first_receipt(txn, row["assignmentId"], request)], & &1["id"]))
+    |> Map.put(
+      "attests",
+      Enum.uniq_by([row | first_receipt(txn, row["assignmentId"], request)], & &1["id"])
+    )
     |> Map.put("explicit_notices", explicit_notices(txn, event, event["requestId"]))
     |> Map.put("related_actions", related_actions(txn, event["org"], event["requestId"]))
   end
@@ -368,9 +375,12 @@ defmodule Tightbeam.RowReactions.Snapshot do
   defp first_receipt(_txn, _assignment, nil), do: []
 
   defp first_receipt(txn, assignment_id, request) do
-    rows(txn,
+    rows(
+      txn,
       "SELECT #{Enum.join(@attest_keys, ",")} FROM attests WHERE assignmentId=?1 AND kind='verdict' AND verdictKind=?2 ORDER BY ts,id LIMIT 1",
-      @attest_keys, [assignment_id, "ruling-consumed:" <> request["id"]])
+      @attest_keys,
+      [assignment_id, "ruling-consumed:" <> request["id"]]
+    )
   end
 
   defp receipts(txn, recipient, sources) do
@@ -380,11 +390,17 @@ defmodule Tightbeam.RowReactions.Snapshot do
     |> Enum.map(&Map.take(&1, ~w(assignmentId sourceKind sourceToken)))
     |> Enum.uniq()
     |> Enum.flat_map(fn source ->
-      prefix = "completion-handoff-action #{source["assignmentId"]} #{source["sourceKind"]} #{source["sourceToken"]}"
+      prefix =
+        "completion-handoff-action #{source["assignmentId"]} #{source["sourceKind"]} #{source["sourceToken"]}"
+
       # An indexed exact-prefix range avoids fetching unrelated attest notes.
       # Parsing still checks the complete existing convention, including detail.
-      rows(txn, "SELECT #{Enum.join(keys, ",")} FROM attests WHERE bySession=?1 AND kind='progress' AND note>=?2 AND note<?3 ORDER BY ts,id",
-        keys, [recipient, prefix <> " ", prefix <> "!"])
+      rows(
+        txn,
+        "SELECT #{Enum.join(keys, ",")} FROM attests WHERE bySession=?1 AND kind='progress' AND note>=?2 AND note<?3 ORDER BY ts,id",
+        keys,
+        [recipient, prefix <> " ", prefix <> "!"]
+      )
       |> Enum.map(&Map.put(&1, "disposition", disposition(&1["note"])))
     end)
   end
@@ -462,16 +478,33 @@ defmodule Tightbeam.RowReactions.Snapshot do
     sessions = session_rows(txn, addresses)
     owner_ids = Enum.map(sessions, & &1["ownerUserId"])
     original_owners = Enum.map(Map.get(recorded, "sessions", []), & &1["ownerUserId"])
-    users = rows(txn, "SELECT userId,isAdmin,createdAt FROM users WHERE userId IN (SELECT value FROM json_each(?1))",
-      ~w(userId isAdmin createdAt), [JSON.encode!(Enum.uniq(addresses ++ owner_ids ++ original_owners))])
-      |> Enum.map(&Map.put(&1, "personalSessionKey", Tightbeam.Org.personal_session_key(&1["userId"])))
-    sessions = (sessions ++ session_rows(txn, Enum.map(users, & &1["personalSessionKey"]))) |> Enum.uniq_by(& &1["sessionKey"])
+
+    users =
+      rows(
+        txn,
+        "SELECT userId,isAdmin,createdAt FROM users WHERE userId IN (SELECT value FROM json_each(?1))",
+        ~w(userId isAdmin createdAt),
+        [JSON.encode!(Enum.uniq(addresses ++ owner_ids ++ original_owners))]
+      )
+      |> Enum.map(
+        &Map.put(&1, "personalSessionKey", Tightbeam.Org.personal_session_key(&1["userId"]))
+      )
+
+    sessions =
+      (sessions ++ session_rows(txn, Enum.map(users, & &1["personalSessionKey"])))
+      |> Enum.uniq_by(& &1["sessionKey"])
+
     recorded |> Map.put("sessions", sessions) |> Map.put("users", users)
   end
 
-  defp session_rows(txn, addresses), do: rows(txn,
-    "SELECT sessionKey,ownerUserId,state,identityRevision FROM sessions WHERE sessionKey IN (SELECT value FROM json_each(?1))",
-    ~w(sessionKey ownerUserId state identityRevision), [JSON.encode!(addresses)])
+  defp session_rows(txn, addresses),
+    do:
+      rows(
+        txn,
+        "SELECT sessionKey,ownerUserId,state,identityRevision FROM sessions WHERE sessionKey IN (SELECT value FROM json_each(?1))",
+        ~w(sessionKey ownerUserId state identityRevision),
+        [JSON.encode!(addresses)]
+      )
 
   defp strings(value) when is_binary(value), do: [value]
   defp strings(value) when is_list(value), do: Enum.flat_map(value, &strings/1)

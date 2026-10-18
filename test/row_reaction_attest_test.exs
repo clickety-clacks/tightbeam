@@ -365,23 +365,34 @@ defmodule Tightbeam.RowReactionAttestTest do
     assert Wakes.list_pending(ctx.db) == []
     assert attest_events(ctx) == []
   end
+
   test "growing quiet progress retains one raw source rather than assignment history", ctx do
     elect(ctx)
-    sizes = for n <- 1..64 do
-      result = file(ctx, "progress", %{note: "Work remains durable #{n}"})
-      assert {:ok, [[bytes]]} = DB.query(ctx.db, "SELECT facts FROM row_reaction_events WHERE eventId=?1", ["attest:" <> result.attest.id])
-      facts = JSON.decode!(bytes)
-      assert [%{"id" => id}] = facts["attests"]
-      assert id == result.attest.id
-      assert facts["related_actions"] == []
-      assert length(facts["sessions"]) <= 3
-      if n in [16,32,64], do: IO.puts("progress count=#{n} current_snapshot_bytes=#{byte_size(bytes)}")
-      byte_size(bytes)
-    end
+
+    sizes =
+      for n <- 1..64 do
+        result = file(ctx, "progress", %{note: "Work remains durable #{n}"})
+
+        assert {:ok, [[bytes]]} =
+                 DB.query(ctx.db, "SELECT facts FROM row_reaction_events WHERE eventId=?1", [
+                   "attest:" <> result.attest.id
+                 ])
+
+        facts = JSON.decode!(bytes)
+        assert [%{"id" => id}] = facts["attests"]
+        assert id == result.attest.id
+        assert facts["related_actions"] == []
+        assert length(facts["sessions"]) <= 3
+
+        if n in [16, 32, 64],
+          do: IO.puts("progress count=#{n} current_snapshot_bytes=#{byte_size(bytes)}")
+
+        byte_size(bytes)
+      end
+
     assert Enum.max(sizes) < 2 * Enum.min(sizes)
     assert Enum.sum(sizes) < 64 * 8_000
     assert Wakes.list_pending(ctx.db) == []
     assert {:ok, [[64]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM attests WHERE kind='progress'")
   end
-
 end

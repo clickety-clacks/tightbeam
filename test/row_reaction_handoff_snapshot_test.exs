@@ -400,50 +400,124 @@ defmodule Tightbeam.RowReactionHandoffSnapshotTest do
     assert [%{"outcome" => "revoked", "sourceKind" => "assignment_revocation"}] =
              delivery_facts["terminal_sources"]
   end
+
   test "addressed delivery and pending recovery ignore growing settled history", ctx do
     elect(ctx)
     assert {:ok, :ok} = close_in_txn(ctx)
     [root] = Wakes.list_pending(ctx.db)
-    assert {:ok, _} = DB.query(ctx.db, "INSERT INTO attests(id,assignmentId,kind,bySession,ts,note) VALUES('exact-receipt','assignment','progress','opener',110,'completion-handoff-action assignment attest closing kept: still needed')")
-    assert {:ok, _} = DB.query(ctx.db, "INSERT INTO assignments(id,subject,holderKey,openedByUser,openedAt,state) VALUES('current-work','current','opener','owner',1,'open')")
 
-    snapshots = for count <- [0,64,256] do
-      assert {:ok, :ok} = DB.transaction(ctx.db, fn txn ->
-        if count > 0 do
-          for n <- 1..count do
-            id = "history-#{count}-#{n}"
-            Txn.q(txn, "INSERT INTO sessions(sessionKey,displayName,ownerUserId,origin,archetype,harness,provider,model,createdAt,updatedAt) SELECT ?1,?1,ownerUserId,origin,archetype,harness,provider,model,1,1 FROM sessions WHERE sessionKey='holder'", [id])
-            Txn.q(txn, "INSERT INTO assignments(id,subject,holderKey,openedByUser,openedAt,state,outcome,closedAt) VALUES(?1,'settled','opener','owner',1,'closed','completed',2)", [id])
-            Txn.q(txn, "INSERT INTO attests(id,assignmentId,kind,bySession,ts,note) VALUES(?1,?1,'progress','opener',1,?2)", [id, String.duplicate("historical note ",100)])
-            Txn.q(txn, "INSERT INTO row_reaction_events(org,eventId,version,event,facts,admittedAt) VALUES('owner',?1,1,'{}','{}',1)", [id])
-            Txn.q(txn, "INSERT INTO row_reaction_actions(id,org,eventId,family,slot,plan,payloadDigest,status,updatedAt) VALUES(?1,'owner',?1,'settled','notice','{}','historical','accepted',1)", [id])
-          end
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO attests(id,assignmentId,kind,bySession,ts,note) VALUES('exact-receipt','assignment','progress','opener',110,'completion-handoff-action assignment attest closing kept: still needed')"
+             )
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO assignments(id,subject,holderKey,openedByUser,openedAt,state) VALUES('current-work','current','opener','owner',1,'open')"
+             )
+
+    snapshots =
+      for count <- [0, 64, 256] do
+        assert {:ok, :ok} =
+                 DB.transaction(ctx.db, fn txn ->
+                   if count > 0 do
+                     for n <- 1..count do
+                       id = "history-#{count}-#{n}"
+
+                       Txn.q(
+                         txn,
+                         "INSERT INTO sessions(sessionKey,displayName,ownerUserId,origin,archetype,harness,provider,model,createdAt,updatedAt) SELECT ?1,?1,ownerUserId,origin,archetype,harness,provider,model,1,1 FROM sessions WHERE sessionKey='holder'",
+                         [id]
+                       )
+
+                       Txn.q(
+                         txn,
+                         "INSERT INTO assignments(id,subject,holderKey,openedByUser,openedAt,state,outcome,closedAt) VALUES(?1,'settled','opener','owner',1,'closed','completed',2)",
+                         [id]
+                       )
+
+                       Txn.q(
+                         txn,
+                         "INSERT INTO attests(id,assignmentId,kind,bySession,ts,note) VALUES(?1,?1,'progress','opener',1,?2)",
+                         [id, String.duplicate("historical note ", 100)]
+                       )
+
+                       Txn.q(
+                         txn,
+                         "INSERT INTO row_reaction_events(org,eventId,version,event,facts,admittedAt) VALUES('owner',?1,1,'{}','{}',1)",
+                         [id]
+                       )
+
+                       Txn.q(
+                         txn,
+                         "INSERT INTO row_reaction_actions(id,org,eventId,family,slot,plan,payloadDigest,status,updatedAt) VALUES(?1,'owner',?1,'settled','notice','{}','historical','accepted',1)",
+                         [id]
+                       )
+                     end
+                   end
+
+                   :ok
+                 end)
+
+        assert {:ok, {facts, plans}} =
+                 DB.transaction(ctx.db, fn txn ->
+                   Process.put(:snapshot_queries, [])
+
+                   observed =
+                     Txn.observe_queries(txn, fn {:sql_query, sql, params} ->
+                       Process.put(:snapshot_queries, [
+                         {sql, params} | Process.get(:snapshot_queries)
+                       ])
+                     end)
+
+                   facts =
+                     Snapshot.current(
+                       observed,
+                       %{
+                         "kind" => "wake_delivery",
+                         "after" => Snapshot.wake(txn, root.wake_id),
+                         "delivery" => %{"sessionKey" => "opener"}
+                       },
+                       %{}
+                     )
+
+                   :ok = RowReactions.recover_in_txn(observed)
+
+                   plans =
+                     for {sql, params} <- Process.delete(:snapshot_queries),
+                         String.starts_with?(String.trim(sql), "SELECT") do
+                       {sql, Txn.q(txn, "EXPLAIN QUERY PLAN " <> sql, params)}
+                     end
+
+                   {facts, plans}
+                 end)
+
+        assert [%{"id" => "exact-receipt"}] = facts["attests"]
+        assert [%{"id" => "current-work"}] = facts["assignments"]
+        assert length(facts["sessions"]) <= 3
+
+        for {_sql, plan} <- plans do
+          details = Enum.map_join(plan, "\n", &List.last/1)
+          refute Regex.match?(~r/SCAN (?:attests|assignments|sessions|e|a)(?:$|\s)/m, details)
         end
-        :ok
-      end)
-      assert {:ok, {facts, plans}} = DB.transaction(ctx.db, fn txn ->
-        Process.put(:snapshot_queries, [])
-        observed = Txn.observe_queries(txn, fn {:sql_query, sql, params} -> Process.put(:snapshot_queries, [{sql,params}|Process.get(:snapshot_queries)]) end)
-        facts = Snapshot.current(observed, %{"kind" => "wake_delivery", "after" => Snapshot.wake(txn, root.wake_id), "delivery" => %{"sessionKey" => "opener"}}, %{})
-        :ok = RowReactions.recover_in_txn(observed)
-        plans = for {sql,params} <- Process.delete(:snapshot_queries), String.starts_with?(String.trim(sql), "SELECT") do
-          {sql, Txn.q(txn, "EXPLAIN QUERY PLAN " <> sql, params)}
-        end
-        {facts, plans}
-      end)
-      assert [%{"id" => "exact-receipt"}] = facts["attests"]
-      assert [%{"id" => "current-work"}] = facts["assignments"]
-      assert length(facts["sessions"]) <= 3
-      for {_sql, plan} <- plans do
-        details = Enum.map_join(plan, "\n", &List.last/1)
-        refute Regex.match?(~r/SCAN (?:attests|assignments|sessions|e|a)(?:$|\s)/m, details)
+
+        assert Enum.any?(plans, fn {_, plan} ->
+                 Enum.any?(plan, &(List.last(&1) =~ "reaction_disposition"))
+               end)
+
+        assert Enum.any?(plans, fn {_, plan} ->
+                 Enum.any?(plan, &(List.last(&1) =~ "row_reaction_pending"))
+               end)
+
+        IO.puts(
+          "settled_history=#{count} delivery_snapshot_bytes=#{byte_size(JSON.encode!(facts))} plans=#{inspect(plans)}"
+        )
+
+        facts
       end
-      assert Enum.any?(plans, fn {_,plan} -> Enum.any?(plan, &(List.last(&1) =~ "reaction_disposition")) end)
-      assert Enum.any?(plans, fn {_,plan} -> Enum.any?(plan, &(List.last(&1) =~ "row_reaction_pending")) end)
-      IO.puts("settled_history=#{count} delivery_snapshot_bytes=#{byte_size(JSON.encode!(facts))} plans=#{inspect(plans)}")
-      facts
-    end
+
     assert Enum.uniq(snapshots) |> length() == 1
   end
-
 end
