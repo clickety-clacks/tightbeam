@@ -1,8 +1,50 @@
+defmodule Tightbeam.Schema.SourceSqlTemplate do
+  @moduledoc false
+
+  # Schema migrations extend source-owned SQL templates. Match SQL tokens with
+  # whitespace-tolerant regular expressions, then splice using the exact source
+  # bytes that matched so historical clauses remain unchanged.
+  def split_once!(sql, pattern) do
+    case Regex.scan(pattern, sql, capture: :first) do
+      [[match]] ->
+        [before, after_match] = String.split(sql, match, parts: 2)
+        {before, match, after_match}
+
+      [] ->
+        raise ArgumentError, "expected one source SQL clause, found none"
+
+      matches ->
+        raise ArgumentError, "expected one source SQL clause, found #{length(matches)}"
+    end
+  end
+
+  def split_first!(sql, pattern) do
+    case Regex.run(pattern, sql, capture: :first) do
+      [match] ->
+        [before, after_match] = String.split(sql, match, parts: 2)
+        {before, match, after_match}
+
+      nil ->
+        raise ArgumentError, "expected source SQL clause, found none"
+    end
+  end
+
+  def replace_once!(sql, pattern, replacement) when is_binary(replacement) do
+    replace_once!(sql, pattern, fn _match -> replacement end)
+  end
+
+  def replace_once!(sql, pattern, replacement) when is_function(replacement, 1) do
+    _ = split_once!(sql, pattern)
+    Regex.replace(pattern, sql, replacement, global: false)
+  end
+end
+
 defmodule Tightbeam.Schema do
   @moduledoc "The single production-owned schema bootstrap for a Tightbeam database."
 
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
+  alias Tightbeam.Schema.SourceSqlTemplate
   require Logger
 
   @work_item_body_objects [
@@ -1384,28 +1426,25 @@ defmodule Tightbeam.Schema do
                                  OR
                            """
 
-                           old_arm = """
-                               (outcomeKind = 'no_replacement' AND replacementWakeId IS NULL AND
-                                dispositionKind IS NULL AND dispositionId IS NULL AND
-                                ((workImpactKind = 'linked_work_open' AND livenessTriggerKind IS NOT NULL AND
-                                  livenessTriggerId IS NOT NULL AND actionNeeded = 1)
-                                 OR
-                           """
+                           old_arm =
+                             ~r/\(outcomeKind\s*=\s*'no_replacement'\s+AND\s+replacementWakeId\s+IS\s+NULL\s+AND\s+dispositionKind\s+IS\s+NULL\s+AND\s+dispositionId\s+IS\s+NULL\s+AND\s+\(\(workImpactKind\s*=\s*'linked_work_open'\s+AND\s+livenessTriggerKind\s+IS\s+NOT\s+NULL\s+AND\s+livenessTriggerId\s+IS\s+NOT\s+NULL\s+AND\s+actionNeeded\s*=\s*1\)\s+OR\s+/u
 
-                           # Match source-owned DDL, never stored database DDL.
-                           true = String.contains?(sql, old_arm)
+                           # Match the source-owned branch by SQL tokens rather
+                           # than heredoc indentation; retain the matched legacy
+                           # alternative byte-for-byte before adding the O2 arm.
+                           sql =
+                             SourceSqlTemplate.replace_once!(sql, old_arm, fn matched ->
+                               matched <> outcome <> " OR\n"
+                             end)
+
+                           scheduler_requester =
+                             ~r/\(requesterId\s*=\s*'tightbeam:wake-scheduler'\s+AND/u
 
                            sql =
-                             String.replace(sql, old_arm, old_arm <> outcome <> " OR\n",
-                               global: false
-                             )
-
-                           sql =
-                             String.replace(
+                             SourceSqlTemplate.replace_once!(
                                sql,
-                               "(requesterId = 'tightbeam:wake-scheduler' AND",
-                               requester <> "(requesterId = 'tightbeam:wake-scheduler' AND",
-                               global: false
+                               scheduler_requester,
+                               fn matched -> requester <> matched end
                              )
 
                            %{object | sql: sql}
@@ -1420,13 +1459,13 @@ defmodule Tightbeam.Schema do
   @cannot_proceed_liveness_objects Enum.map(@o2_liveness_objects, fn
                                      %{name: "wake_cancellations", sql: sql} = object ->
                                        old_reason =
-                                         "'requester_withdrew','superseded','obligation_disposed',"
+                                         ~r/'requester_withdrew'\s*,\s*'superseded'\s*,\s*'obligation_disposed'\s*,/u
 
                                        new_reason =
                                          "'requester_withdrew','superseded','obligation_disposed','cannot_proceed_released',"
 
                                        old_requester =
-                                         ~r/\(requesterId = 'tightbeam:assignments' AND\s+reasonKind = 'obligation_disposed' AND causalSourceKind = 'assignment_transition' AND\s+outcomeKind = 'disposition'\)/
+                                         ~r/\(requesterId\s*=\s*'tightbeam:assignments'\s+AND\s+reasonKind\s*=\s*'obligation_disposed'\s+AND\s+causalSourceKind\s*=\s*'assignment_transition'\s+AND\s+outcomeKind\s*=\s*'disposition'\)/u
 
                                        new_requester = """
                                            (requesterId = 'tightbeam:assignments' AND
@@ -1437,15 +1476,14 @@ defmodule Tightbeam.Schema do
                                               causalSourceKind = 'condition_fact' AND outcomeKind = 'no_replacement')))
                                        """
 
-                                       true = String.contains?(sql, old_reason)
-                                       true = Regex.match?(old_requester, sql)
-
                                        sql =
                                          sql
-                                         |> String.replace(old_reason, new_reason, global: false)
+                                         |> SourceSqlTemplate.replace_once!(old_reason, new_reason)
                                          |> then(
-                                           &Regex.replace(old_requester, &1, new_requester,
-                                             global: false
+                                           &SourceSqlTemplate.replace_once!(
+                                             &1,
+                                             old_requester,
+                                             new_requester
                                            )
                                          )
 
@@ -1473,22 +1511,18 @@ defmodule Tightbeam.Schema do
     }
     | Enum.map(@cannot_proceed_liveness_objects, fn
         %{name: "wake_cancellations", sql: sql} = object ->
-          old_source_tail = "'session_transition','scheduler_delivery'"
+          old_source_tail = ~r/'session_transition'\s*,\s*'scheduler_delivery'/u
           new_source_tail = "'session_transition','scheduler_delivery','supervision_receipt'"
 
           new_supervision_route =
             "causalSourceKind IN ('progress_attest','supervision_receipt') AND outcomeKind = 'no_replacement')"
 
-          true = String.contains?(sql, old_source_tail)
-          true = String.contains?(sql, "causalSourceKind = 'progress_attest'")
-
           sql =
             sql
-            |> String.replace(old_source_tail, new_source_tail, global: false)
-            |> String.replace(
-              "causalSourceKind = 'progress_attest' AND outcomeKind = 'no_replacement')",
-              new_supervision_route,
-              global: false
+            |> SourceSqlTemplate.replace_once!(old_source_tail, new_source_tail)
+            |> SourceSqlTemplate.replace_once!(
+              ~r/causalSourceKind\s*=\s*'progress_attest'\s+AND\s+outcomeKind\s*=\s*'no_replacement'\)/u,
+              new_supervision_route
             )
 
           %{object | sql: sql}
@@ -1507,7 +1541,7 @@ defmodule Tightbeam.Schema do
                                                       %{name: "wake_cancellations", sql: sql} =
                                                           object ->
                                                         anchor =
-                                                          "(requesterId = 'tightbeam:effort-checkin' AND"
+                                                          ~r/\(requesterId\s*=\s*'tightbeam:effort-checkin'\s+AND/u
 
                                                         assignment_replacement = """
                                                         (requesterId = 'tightbeam:assignments' AND reasonKind = 'superseded' AND
@@ -1515,16 +1549,16 @@ defmodule Tightbeam.Schema do
                                                         OR
                                                         """
 
-                                                        true = String.contains?(sql, anchor)
-
                                                         %{
                                                           object
                                                           | sql:
-                                                              String.replace(
+                                                              SourceSqlTemplate.replace_once!(
                                                                 sql,
                                                                 anchor,
-                                                                assignment_replacement <> anchor,
-                                                                global: false
+                                                                fn matched ->
+                                                                  assignment_replacement <>
+                                                                    matched
+                                                                end
                                                               )
                                                         }
 
@@ -1553,10 +1587,10 @@ defmodule Tightbeam.Schema do
     | Enum.map(@assignment_source_replacement_liveness_objects, fn
         %{name: "wake_cancellations", sql: sql} = object ->
           no_replacement_anchor =
-            "(outcomeKind = 'no_replacement' AND replacementWakeId IS NULL AND"
+            ~r/\(outcomeKind\s*=\s*'no_replacement'\s+AND\s+replacementWakeId\s+IS\s+NULL\s+AND/u
 
           fallback_arm =
-            "(workImpactKind != 'linked_work_open' AND livenessTriggerKind IS NULL AND"
+            ~r/\(workImpactKind\s*!=\s*'linked_work_open'\s+AND\s+livenessTriggerKind\s+IS\s+NULL\s+AND/u
 
           holder_activity_arm =
             "(workImpactKind = 'linked_work_open' AND livenessTriggerKind IS NULL AND " <>
@@ -1564,36 +1598,39 @@ defmodule Tightbeam.Schema do
               "requesterId = 'tightbeam:effort-checkin' AND reasonKind = 'superseded' AND " <>
               "causalSourceKind = 'progress_attest')"
 
-          true = String.contains?(sql, no_replacement_anchor)
+          {before_no_replacement, no_replacement_marker, after_no_replacement} =
+            SourceSqlTemplate.split_once!(sql, no_replacement_anchor)
 
-          [before_no_replacement, after_no_replacement] =
-            String.split(sql, no_replacement_anchor, parts: 2)
-
-          [before_fallback, after_fallback] =
-            String.split(after_no_replacement, fallback_arm, parts: 2)
+          {before_fallback, fallback_match, after_fallback} =
+            SourceSqlTemplate.split_first!(after_no_replacement, fallback_arm)
 
           # The O2 predecessor adds a historical rail-remedy alternative before
           # the ordinary no-linked-work fallback. Insert the new source route
           # at that boundary, preserving both predecessor alternatives verbatim.
-          true = String.contains?(before_fallback, "requesterId = 'tightbeam:rail-remedy' AND")
-          false = String.contains?(after_fallback, fallback_arm)
+          true =
+            Regex.match?(
+              ~r/requesterId\s*=\s*'tightbeam:rail-remedy'\s+AND/u,
+              before_fallback
+            )
+          false = Regex.match?(fallback_arm, after_fallback)
 
           sql =
             before_no_replacement <>
-              no_replacement_anchor <>
+              no_replacement_marker <>
               before_fallback <>
               holder_activity_arm <>
               " OR\n            " <>
-              fallback_arm <>
+              fallback_match <>
               after_fallback
 
           # The source owns these clears. They happen in the same transaction
           # as an assignment completion or terminal decision transition, so
           # open linked work must not require an inactivity deadline to permit
           # the source's own notice to be retracted.
-          disposition_fallback =
-            "(workImpactKind != 'linked_work_open' AND livenessTriggerKind IS NULL AND\n" <>
-              "       livenessTriggerId IS NULL AND actionNeeded = 0)))"
+          disposition_arm = ~r/\(outcomeKind\s*=\s*'disposition'\s+AND/u
+
+          fallback_clause =
+            ~r/\(workImpactKind\s*!=\s*'linked_work_open'\s+AND\s+livenessTriggerKind\s+IS\s+NULL\s+AND\s+livenessTriggerId\s+IS\s+NULL\s+AND\s+actionNeeded\s*=\s*0\)\)\)/u
 
           source_disposition_arms = """
             (workImpactKind = 'linked_work_open' AND livenessTriggerKind IS NULL AND
@@ -1616,22 +1653,21 @@ defmodule Tightbeam.Schema do
             OR
           """
 
-          true = String.contains?(sql, disposition_fallback)
+          {before_disposition, disposition_marker, after_disposition} =
+            SourceSqlTemplate.split_once!(sql, disposition_arm)
+
+          {before_disposition_fallback, disposition_fallback, after_disposition_fallback} =
+            SourceSqlTemplate.split_first!(after_disposition, fallback_clause)
 
           sql =
-            String.replace(
-              sql,
-              disposition_fallback,
-              source_disposition_arms <> disposition_fallback,
-              global: false
-            )
+            before_disposition <>
+              disposition_marker <>
+              before_disposition_fallback <>
+              source_disposition_arms <>
+              disposition_fallback <>
+              after_disposition_fallback
 
-          no_replacement_marker =
-            "(outcomeKind = 'no_replacement' AND replacementWakeId IS NULL AND"
-
-          no_replacement_fallback =
-            "(workImpactKind != 'linked_work_open' AND livenessTriggerKind IS NULL AND\n" <>
-              "       livenessTriggerId IS NULL AND actionNeeded = 0)))"
+          no_replacement_marker = no_replacement_anchor
 
           no_replacement_source_arms = """
             (workImpactKind = 'linked_work_open' AND livenessTriggerKind IS NULL AND
@@ -1651,13 +1687,11 @@ defmodule Tightbeam.Schema do
             OR
           """
 
-          true = String.contains?(sql, no_replacement_marker)
+          {before_no_replacement, no_replacement_marker, after_no_replacement} =
+            SourceSqlTemplate.split_once!(sql, no_replacement_marker)
 
-          [before_no_replacement, after_no_replacement] =
-            String.split(sql, no_replacement_marker, parts: 2)
-
-          [before_fallback, after_fallback] =
-            String.split(after_no_replacement, no_replacement_fallback, parts: 2)
+          {before_fallback, no_replacement_fallback, after_fallback} =
+            SourceSqlTemplate.split_first!(after_no_replacement, fallback_clause)
 
           sql =
             before_no_replacement <>
@@ -1670,45 +1704,42 @@ defmodule Tightbeam.Schema do
           # Older stamped cancellation DDL predates the sentinel's
           # source-owned condition clear. Extend only the typed source grammar
           # used by the already implemented callers.
-          reason_anchor = "'consumer_unavailable','target_unresolvable'\n        )),"
+          sql =
+            SourceSqlTemplate.replace_once!(
+              sql,
+              ~r/'consumer_unavailable'\s*,\s*'target_unresolvable'/u,
+              fn matched -> matched <> ",'condition_cleared'" end
+            )
 
-          reason_extension =
-            "'consumer_unavailable','target_unresolvable','condition_cleared'\n        )),"
-
-          true = String.contains?(sql, reason_anchor)
-          sql = String.replace(sql, reason_anchor, reason_extension, global: false)
-
-          source_anchor = "'session_transition','scheduler_delivery'\n        )),"
-
-          source_extension =
-            "'session_transition','scheduler_delivery','sentinel_transition'\n        )),"
-
-          true = String.contains?(sql, source_anchor)
-          sql = String.replace(sql, source_anchor, source_extension, global: false)
+          sql =
+            SourceSqlTemplate.replace_once!(
+              sql,
+              ~r/'session_transition'\s*,\s*'scheduler_delivery'/u,
+              fn matched -> matched <> ",'sentinel_transition'" end
+            )
 
           requester_anchor =
-            "(requesterId = 'tightbeam:supervision' AND reasonKind = 'superseded' AND"
+            ~r/\(requesterId\s*=\s*'tightbeam:supervision'\s+AND\s+reasonKind\s*=\s*'superseded'\s+AND/u
 
           holder_activity_requester_route =
             "(requesterId = 'tightbeam:effort-checkin' AND reasonKind = 'superseded' AND\n" <>
               "     causalSourceKind = 'progress_attest' AND outcomeKind = 'no_replacement')\n" <>
               "    OR\n    "
 
-          true = String.contains?(sql, requester_anchor)
-
           %{
             object
             | sql:
-                String.replace(
+                SourceSqlTemplate.replace_once!(
                   sql,
                   requester_anchor,
-                  holder_activity_requester_route <>
-                    "(requesterId = 'tightbeam:escalation' AND reasonKind = 'obligation_disposed' AND " <>
-                    "causalSourceKind = 'decision_request' AND outcomeKind = 'disposition')\n    OR\n    " <>
-                    "(requesterId = 'tightbeam:sentinel-supervisor' AND reasonKind = 'condition_cleared' AND " <>
-                    "causalSourceKind = 'sentinel_transition' AND outcomeKind = 'no_replacement')\n    OR\n    " <>
-                    requester_anchor,
-                  global: false
+                  fn matched ->
+                    holder_activity_requester_route <>
+                      "(requesterId = 'tightbeam:escalation' AND reasonKind = 'obligation_disposed' AND " <>
+                      "causalSourceKind = 'decision_request' AND outcomeKind = 'disposition')\n    OR\n    " <>
+                      "(requesterId = 'tightbeam:sentinel-supervisor' AND reasonKind = 'condition_cleared' AND " <>
+                      "causalSourceKind = 'sentinel_transition' AND outcomeKind = 'no_replacement')\n    OR\n    " <>
+                      matched
+                  end
                 )
           }
 
