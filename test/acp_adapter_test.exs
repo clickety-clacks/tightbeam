@@ -3638,7 +3638,11 @@ defmodule Tightbeam.Acp.AdapterTest do
     # Age/timing and one-shot allowances cannot make a restart revoke a good login.
     metadata = metadata_path |> File.read!() |> JSON.decode!()
     File.write!(metadata_path, JSON.encode!(Map.put(metadata, "onboarded_at_ms", 1)))
-    GenServer.stop(adapter)
+    connection = :sys.get_state(adapter).conn
+    adapter_monitor = Process.monitor(adapter)
+    Adapter.request_close(adapter)
+    assert_receive {:DOWN, ^adapter_monitor, :process, ^adapter, :normal}
+    GenServer.stop(connection)
 
     {restarted, _} =
       start_adapter(
