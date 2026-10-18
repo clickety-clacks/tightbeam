@@ -434,7 +434,7 @@ defmodule Tightbeam.RowReactionHandoffSnapshotTest do
 
                        Txn.q(
                          txn,
-                         "INSERT INTO assignments(id,subject,holderKey,openedByUser,openedAt,state,outcome,closedAt,closedByUser) VALUES(?1,'settled','opener','owner',1,'closed','completed',2,'owner')",
+                         "INSERT INTO assignments(id,subject,holderKey,openedByUser,openedAt,state) VALUES(?1,'settled','opener','owner',1,'open')",
                          [id]
                        )
 
@@ -442,6 +442,18 @@ defmodule Tightbeam.RowReactionHandoffSnapshotTest do
                          txn,
                          "INSERT INTO attests(id,assignmentId,kind,bySession,ts,note) VALUES(?1,?1,'progress','opener',1,?2)",
                          [id, String.duplicate("historical note ", 100)]
+                       )
+
+                       Txn.q(
+                         txn,
+                         "INSERT INTO attests(id,assignmentId,kind,bySession,ts) VALUES(?1,?2,'completion','opener',2)",
+                         [id <> "-closed", id]
+                       )
+
+                       Txn.q(
+                         txn,
+                         "UPDATE assignments SET state='closed',outcome='completed',closedAt=2,closedBySession='opener',closingAttestId=?2 WHERE id=?1",
+                         [id, id <> "-closed"]
                        )
 
                        Txn.q(
