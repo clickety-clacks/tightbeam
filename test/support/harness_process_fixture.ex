@@ -1266,14 +1266,13 @@ defmodule Tightbeam.HarnessProcessFixture do
     parent = self()
     start_supervised!({Registry, keys: :unique, name: Tightbeam.LaneRegistry})
     task_sup = start_supervised!({Task.Supervisor, []})
-    lane_sup = start_supervised!({DynamicSupervisor, strategy: :one_for_one})
 
     manager =
       start_supervised!(
         {Tightbeam.LaneManager,
          name: :failed_park_recovery_manager,
          db: ctx.db,
-         lane_sup: lane_sup,
+         lane_sup: ctx.sup,
          task_sup: task_sup,
          runner: fn turn ->
            send(parent, {:recovered_turn, turn.seq})
@@ -1325,12 +1324,22 @@ defmodule Tightbeam.HarnessProcessFixture do
              HarnessProcess.park(ctx.db, parked)
 
     assert reason =~ "group left unsignalled"
+    serving_key = {:claude, "serving", "testhost"}
+    {_serving_port, serving} = launch_stubborn(ctx, serving_key)
     assert :ok = Tightbeam.LaneManager.reconcile(manager)
     assert HarnessProcess.parked?(ctx.db, key)
     assert {_, 0} = System.cmd("/bin/kill", ["-0", child], stderr_to_stdout: true)
 
-    assert [%{state: "kill_failed", resolved_at: nil, kill_sent_at: nil}] =
-             HarnessProcess.list(ctx.db)
+    assert %{state: "kill_failed", resolved_at: nil, kill_sent_at: nil} =
+             Enum.find(HarnessProcess.list(ctx.db), &(&1.launch_id == row.launch_id))
+
+    assert %{state: "running", resolved_at: nil} =
+             Enum.find(HarnessProcess.list(ctx.db), &(&1.launch_id == serving.launch_id))
+
+    assert {_, 0} =
+             System.cmd("/bin/kill", ["-0", Integer.to_string(serving.os_pid)],
+               stderr_to_stdout: true
+             )
 
     {:ok, seq} =
       Tightbeam.Ledger.enqueue(ctx.db, %{
@@ -1361,8 +1370,8 @@ defmodule Tightbeam.HarnessProcessFixture do
 
     assert Process.alive?(manager)
 
-    assert [%{launch_id: launch_id, state: "exited", resolved_at: resolved_at}] =
-             HarnessProcess.list(ctx.db)
+    assert %{launch_id: launch_id, state: "exited", resolved_at: resolved_at} =
+             Enum.find(HarnessProcess.list(ctx.db), &(&1.launch_id == row.launch_id))
 
     assert launch_id == row.launch_id
     assert is_integer(resolved_at)
@@ -1371,6 +1380,10 @@ defmodule Tightbeam.HarnessProcessFixture do
              EventLog.lifecycle_events(ctx.db),
              &(&1.kind == "harness_failed_park_reconciled")
            )
+
+    assert {:ok, serving_park} = HarnessProcess.begin_park(ctx.db, serving_key)
+    assert :ok = HarnessProcess.park(ctx.db, serving_park)
+    assert :ok = HarnessProcess.complete_park(ctx.db, serving_key)
   end
 
   defp launch_stubborn(ctx, key) do
