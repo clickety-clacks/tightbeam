@@ -703,6 +703,8 @@ defmodule Tightbeam.ArchetypesTest do
 
     cases = [
       {"name = \"bad\"\nware = [\"local\"]\n", ~r/unknown top-level archetype keys.*ware/},
+      {"name = \"bad\"\nowner_open_child_prod = true\n",
+       ~r/unknown top-level archetype keys.*owner_open_child_prod/},
       {"name = \"bad\"\n[defaults]\nharness = \"other\"\n",
        ~r/unknown harness "other"; expected one of: claude, codex, pi, fixture/},
       {"name = \"bad\"\n[references]\nrepo = { access = \"read\" }\n",
@@ -730,45 +732,6 @@ defmodule Tightbeam.ArchetypesTest do
       assert_raise ArgumentError, ~r/archetype idle_cleanup must be a boolean/, fn ->
         Archetypes.parse_manifest!("name = \"quiet\"\nidle_cleanup = #{value}\n", "quiet.toml")
       end
-    end
-  end
-
-  test "owner child prod marker is a default-off optional boolean" do
-    assert Archetypes.builtin_default().owner_open_child_prod == false
-
-    for {body, expected} <- [
-          {"name = \"quiet\"\n", false},
-          {"name = \"quiet\"\nowner_open_child_prod = false\n", false},
-          {"name = \"quiet\"\nowner_open_child_prod = true\n", true}
-        ] do
-      assert Archetypes.parse_manifest!(body, "quiet.toml").owner_open_child_prod ==
-               expected
-    end
-
-    for value <- ["\"false\"", "0", "[]"] do
-      assert_raise ArgumentError,
-                   ~r/archetype owner_open_child_prod must be a boolean/,
-                   fn ->
-                     Archetypes.parse_manifest!(
-                       "name = \"quiet\"\nowner_open_child_prod = #{value}\n",
-                       "quiet.toml"
-                     )
-                   end
-    end
-  end
-
-  test "shipped owner-role manifests opt into the child follow-up prod" do
-    for name <- ["product-owner", "pdo", "orchestrator"] do
-      path =
-        Application.app_dir(
-          :tightbeam,
-          "priv/kungfu/agentic-engineering/archetypes/#{name}.toml"
-        )
-
-      archetype = Archetypes.parse_manifest!(File.read!(path), path)
-
-      assert archetype.owner_open_child_prod == true
-      if name in ["product-owner", "pdo"], do: assert(archetype.idle_cleanup == false)
     end
   end
 
