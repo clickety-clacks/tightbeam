@@ -74,6 +74,73 @@ defmodule Tightbeam.LaneTest do
     end
   end
 
+  test "normal-turn success releases the shared rate-limit fence without restarting lanes", ctx do
+    key = {:claude, "shared", "testhost"}
+    at = System.system_time(:millisecond)
+
+    assert {:opened, incident} =
+             HarnessHealth.observe(ctx.db, %{
+               correlation_id: "rate-fence-open",
+               harness: "claude",
+               host: "testhost",
+               failure_class: "rate-limit-dead",
+               evidence_kind: "authoritative-provider",
+               session_key: "k1",
+               assignment_id: nil,
+               observed_at: at,
+               cause: "provider rate limit",
+               principal: "process:tightbeam"
+             })
+
+    assert Tightbeam.HarnessProcess.parked?(ctx.db, key)
+    parent = self()
+
+    manager =
+      start_supervised!(
+        {LaneManager,
+         db: ctx.db,
+         lane_sup: ctx.lane_sup,
+         task_sup: ctx.task_sup,
+         name: :rate_recovery_lane_manager,
+         runner: fn turn ->
+           send(parent, {:recovered_rate_turn, turn.seq})
+           {:ok, %{text: "done"}}
+         end}
+      )
+
+    seq = enqueue!(ctx.db, "k1", "held by quota")
+    assert :ok = LaneManager.ensure_lane(manager, "k1")
+    [{lane, _}] = Registry.lookup(Tightbeam.LaneRegistry, "k1")
+    :sys.get_state(lane)
+    assert {:ok, [["queued"]]} = DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [seq])
+    # The slow backstop cannot guess that an open quota incident has recovered.
+    assert :ok = LaneManager.reconcile(manager)
+    assert Tightbeam.HarnessProcess.parked?(ctx.db, key)
+    refute_receive {:recovered_rate_turn, _}, 100
+
+    resolution = %{
+      correlation_id: "concurrent-normal-turn-success",
+      harness: "claude",
+      host: "testhost",
+      failure_class: "rate-limit-dead",
+      session_key: "k2",
+      assignment_id: nil,
+      observed_at: at + 1,
+      cause: "normal turn delivered",
+      principal: "process:tightbeam"
+    }
+
+    assert {:resolved, resolved} = HarnessHealth.resolve(ctx.db, resolution)
+    assert resolved.id == incident.id
+    refute Tightbeam.HarnessProcess.parked?(ctx.db, key)
+    assert {:duplicate, _} = HarnessHealth.resolve(ctx.db, resolution)
+    send(manager, :tick)
+    assert_receive {:recovered_rate_turn, ^seq}, 5_000
+    assert Process.alive?(manager)
+    assert [{^lane, _}] = Registry.lookup(Tightbeam.LaneRegistry, "k1")
+    assert HarnessHealth.get(ctx.db, incident.id).state == "resolved"
+  end
+
   test "idle recovery workers do no database work on a short interval", ctx do
     manager =
       start_supervised!(

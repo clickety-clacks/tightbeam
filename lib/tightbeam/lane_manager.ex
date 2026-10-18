@@ -5,7 +5,7 @@ defmodule Tightbeam.LaneManager do
   """
 
   use GenServer
-  alias Tightbeam.{DB, HarnessHealth, Ledger, SessionLane}
+  alias Tightbeam.{DB, HarnessHealth, HarnessProcess, Ledger, SessionLane}
 
   defstruct [
     :db,
@@ -167,6 +167,7 @@ defmodule Tightbeam.LaneManager do
   end
 
   defp reconcile_pass(state, detect) do
+    :ok = HarnessProcess.reconcile_failed_parks(state.db)
     republish_terminals(state, detect)
 
     Enum.reduce(Ledger.pending_sessions(state.db), state, fn session_key, acc ->

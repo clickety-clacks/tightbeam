@@ -267,4 +267,9 @@ defmodule Tightbeam.HarnessProcessTest do
   } do
     Tightbeam.HarnessProcessFixture.run!(tmp, 32)
   end
+
+  test "a vanished leader survivor blocks claims until its group exits, without coordinator restart",
+       %{tmp_dir: tmp} do
+    Tightbeam.HarnessProcessFixture.run!(tmp, 33)
+  end
 end
