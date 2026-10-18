@@ -2659,7 +2659,6 @@ defmodule Tightbeam.Assignments do
   end
 
   defp apply_lifecycle_attest(txn, %{params: %{kind: "progress"}}, assignment, attest, _holder) do
-    notify_assignment_opener_of_attest_in_txn(txn, assignment, attest)
     append_attest_marker(txn, attest)
     %{assignment: assignment, attest: attest}
   end
