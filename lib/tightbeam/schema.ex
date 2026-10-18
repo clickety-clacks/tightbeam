@@ -1478,7 +1478,10 @@ defmodule Tightbeam.Schema do
 
                                        sql =
                                          sql
-                                         |> SourceSqlTemplate.replace_once!(old_reason, new_reason)
+                                         |> SourceSqlTemplate.replace_once!(
+                                           old_reason,
+                                           new_reason
+                                         )
                                          |> then(
                                            &SourceSqlTemplate.replace_once!(
                                              &1,
@@ -1612,6 +1615,7 @@ defmodule Tightbeam.Schema do
               ~r/requesterId\s*=\s*'tightbeam:rail-remedy'\s+AND/u,
               before_fallback
             )
+
           false = Regex.match?(fallback_arm, after_fallback)
 
           sql =
