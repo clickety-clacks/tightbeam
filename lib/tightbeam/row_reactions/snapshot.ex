@@ -430,18 +430,24 @@ defmodule Tightbeam.RowReactions.Snapshot do
   # New outputs carry their immutable source event in the action ledger. Read
   # that relation without re-rendering today's prompt or electing a recipient.
   defp terminal_sources(txn, wake) do
+    output_ids =
+      [wake["wakeId"] | Enum.map(Txn.q(txn, "SELECT rootWakeId FROM wake_retry_attempts WHERE wakeId=?1", [wake["wakeId"]]), &hd/1)]
+      |> Enum.uniq()
+
     events =
-      Txn.q(
-        txn,
-        """
-        SELECT DISTINCT e.event FROM row_reaction_actions a
-        JOIN row_reaction_events e ON e.org=a.org AND e.eventId=a.eventId
-        WHERE json_extract(a.result,'$.wake_id') IN
-          (SELECT ?1 UNION SELECT rootWakeId FROM wake_retry_attempts WHERE wakeId=?1)
-          AND json_extract(e.event,'$.kind')='assignment'
-        """,
-        [wake["wakeId"]]
-      )
+      Enum.flat_map(output_ids, fn output_id ->
+        Txn.q(
+          txn,
+          """
+          SELECT DISTINCT e.event FROM row_reaction_actions a
+          JOIN row_reaction_events e ON e.org=a.org AND e.eventId=a.eventId
+          WHERE json_extract(a.result,'$.wake_id')=?1
+            AND json_extract(e.event,'$.kind')='assignment'
+          """,
+          [output_id]
+        )
+      end)
+      |> Enum.uniq()
       |> Enum.map(fn [json] -> JSON.decode!(json) end)
 
     Enum.map(events, fn event ->
