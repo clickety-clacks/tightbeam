@@ -2774,9 +2774,13 @@ defmodule Tightbeam.HarnessHealth do
     unless observed_at <= accepted_at,
       do: raise(ArgumentError, "stale_other_evidence")
 
-    unless is_integer(valid_until) and valid_until > accepted_at and
-             valid_until <= observed_at + @other_max_validity_ms,
-           do: raise(ArgumentError, "invalid_other_evidence")
+    unless is_integer(valid_until) and valid_until > accepted_at,
+      do: raise(ArgumentError, "invalid_other_evidence")
+
+    if valid_until > observed_at + @other_max_validity_ms do
+      raise ArgumentError,
+            "invalid --valid-until: must be no more than 15 minutes after --observed-at (defaults to server acceptance time)"
+    end
 
     unless evidence_mode in ~w(exact_error probe_digest),
       do: raise(ArgumentError, "invalid_other_evidence")

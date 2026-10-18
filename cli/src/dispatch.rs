@@ -6319,6 +6319,26 @@ mod tests {
     }
 
     #[test]
+    fn observe_other_validity_refusal_names_the_limit_for_cli_users() {
+        let (human, machine) = readings(
+            &parse_response(
+                400,
+                r#"{"error":{"code":"invalid_other_evidence","message":"invalid --valid-until: must be no more than 15 minutes after --observed-at (defaults to server acceptance time)"}}"#,
+            )
+            .unwrap_err(),
+        );
+
+        assert_eq!(
+            human,
+            "invalid_other_evidence: invalid --valid-until: must be no more than 15 minutes after --observed-at (defaults to server acceptance time)"
+        );
+        assert_eq!(
+            machine["error"]["message"],
+            "invalid --valid-until: must be no more than 15 minutes after --observed-at (defaults to server acceptance time)"
+        );
+    }
+
+    #[test]
     fn a_refusal_keeps_its_status_and_every_field_of_the_error_envelope() {
         let body = serde_json::json!({
             "error": {

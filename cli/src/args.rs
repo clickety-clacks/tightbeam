@@ -704,9 +704,11 @@ COMMANDS:
       --source-session <session> --description <text> --evidence-mode exact_error|probe_digest
       [--exact-error <text> | --output-digest <sha256>]
       --observed-state <text> --exact-probe <text> --recovery-condition <text>
-      --not-known-class <text> --valid-until <epochMs> --world-status PROVEN|UNKNOWN
+      --not-known-class <text> [--observed-at <epochMs>] --valid-until <epochMs> --world-status PROVEN|UNKNOWN
       --redaction-confirmed --key <idempotencyKey>
       exact_error requires --exact-error; probe_digest requires --output-digest.
+      --valid-until must be within 15 minutes after --observed-at (defaults to server acceptance time).
+      UNKNOWN requires --evidence-mode exact_error.
       Admit a redacted, bounded evidence observation for a not-yet-named failure.
   harness-health-resolve-other --harness <harness> --host <host>
       --observed-state <text> --exact-probe <text> --output-digest <sha256>
@@ -1620,6 +1622,17 @@ fn number_coercion(text: &str) -> f64 {
     }
 }
 
+fn exceeds_other_validity_window(observed_at: &str, valid_until: &str) -> bool {
+    const MAX_VALIDITY_MS: f64 = 900_000.0;
+    let observed_at = number_coercion(observed_at);
+    let valid_until = number_coercion(valid_until);
+    observed_at.is_finite()
+        && valid_until.is_finite()
+        && observed_at.fract() == 0.0
+        && valid_until.fract() == 0.0
+        && valid_until > observed_at + MAX_VALIDITY_MS
+}
+
 fn js_number_json(value: f64) -> String {
     if !value.is_finite() {
         return "null".to_owned();
@@ -1940,7 +1953,7 @@ fn parse_with_optional_catalog(
             if parsed.positional.len() != 1
                 || flags.keys().any(|flag| !allowed.contains(&flag.as_str()))
             {
-                return Err("usage: tightbeam harness-health-observe-other --harness <harness> --host <host> --source-session <session> --description <text> --evidence-mode exact_error|probe_digest [--exact-error <text> | --output-digest <sha256>] --observed-state <text> --exact-probe <text> --recovery-condition <text> --not-known-class <text> --valid-until <ms> --world-status PROVEN|UNKNOWN --redaction-confirmed --key <idempotencyKey>".to_owned());
+                return Err("usage: tightbeam harness-health-observe-other --harness <harness> --host <host> --source-session <session> --description <text> --evidence-mode exact_error|probe_digest [--exact-error <text> | --output-digest <sha256>] --observed-state <text> --exact-probe <text> --recovery-condition <text> --not-known-class <text> [--observed-at <ms>] --valid-until <ms> (within 15 minutes after --observed-at, which defaults to server acceptance time) --world-status PROVEN|UNKNOWN --redaction-confirmed --key <idempotencyKey> (UNKNOWN requires exact_error evidence)".to_owned());
             }
             let evidence_mode = nonempty(flags, "evidence-mode")
                 .ok_or_else(|| "--evidence-mode is required".to_owned())?;
@@ -1959,6 +1972,22 @@ fn parse_with_optional_catalog(
             }
             if evidence_mode == "probe_digest" && output_digest.is_none() {
                 return Err("--output-digest is required for probe_digest evidence".to_owned());
+            }
+            if world_status == "UNKNOWN" && evidence_mode != "exact_error" {
+                return Err(
+                    "--world-status UNKNOWN requires --evidence-mode exact_error".to_owned(),
+                );
+            }
+            let observed_at = nonempty(flags, "observed-at");
+            let valid_until = nonempty(flags, "valid-until")
+                .ok_or_else(|| "--valid-until is required".to_owned())?;
+            if observed_at
+                .as_deref()
+                .is_some_and(|observed_at| exceeds_other_validity_window(observed_at, &valid_until))
+            {
+                return Err(
+                    "--valid-until must be no more than 15 minutes after --observed-at".to_owned(),
+                );
             }
             if !flags.contains_key("redaction-confirmed") {
                 return Err("--redaction-confirmed is required".to_owned());
@@ -1983,12 +2012,8 @@ fn parse_with_optional_catalog(
                     .ok_or_else(|| "--recovery-condition is required".to_owned())?,
                 not_known_class: nonempty(flags, "not-known-class")
                     .ok_or_else(|| "--not-known-class is required".to_owned())?,
-                observed_at: nonempty(flags, "observed-at")
-                    .map(|value| js_number_json(number_coercion(&value))),
-                valid_until: js_number_json(number_coercion(
-                    &nonempty(flags, "valid-until")
-                        .ok_or_else(|| "--valid-until is required".to_owned())?,
-                )),
+                observed_at: observed_at.map(|value| js_number_json(number_coercion(&value))),
+                valid_until: js_number_json(number_coercion(&valid_until)),
                 world_status,
                 redaction_confirmed: true,
                 idempotency_key: nonempty(flags, "key")
@@ -3900,7 +3925,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        let valid_until_ms = observed_at_ms + 600_000;
+        let valid_until_ms = observed_at_ms + 900_000;
         let observed_at_value = observed_at_ms.to_string();
         let valid_until = valid_until_ms.to_string();
         let command = parse(strings(&[
@@ -3969,7 +3994,57 @@ mod tests {
             assert!(help.contains("--exact-error <text>"));
             assert!(help.contains("--output-digest <sha256>"));
             assert!(help.contains("exact_error requires --exact-error"));
+            assert!(help.contains("within 15 minutes after --observed-at"));
+            assert!(help.contains("UNKNOWN requires --evidence-mode exact_error"));
         }
+    }
+
+    #[test]
+    fn harness_health_observe_other_rejects_unknown_probe_digest_evidence() {
+        let digest = "a".repeat(64);
+        let error = parse(strings(&[
+            "harness-health-observe-other",
+            "--evidence-mode",
+            "probe_digest",
+            "--output-digest",
+            &digest,
+            "--world-status",
+            "UNKNOWN",
+        ]))
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            "--world-status UNKNOWN requires --evidence-mode exact_error"
+        );
+    }
+
+    #[test]
+    fn harness_health_observe_other_rejects_valid_until_beyond_observed_window() {
+        let observed_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let valid_until = observed_at + 900_001;
+        let error = parse(strings(&[
+            "harness-health-observe-other",
+            "--evidence-mode",
+            "exact_error",
+            "--exact-error",
+            "provider refused the request",
+            "--world-status",
+            "UNKNOWN",
+            "--observed-at",
+            &observed_at.to_string(),
+            "--valid-until",
+            &valid_until.to_string(),
+        ]))
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            "--valid-until must be no more than 15 minutes after --observed-at"
+        );
     }
 
     #[test]

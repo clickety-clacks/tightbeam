@@ -2226,7 +2226,7 @@ mod tests {
         let failed_wake = json!({
             "wakeId": "w_failed",
             "sessionKey": session_key,
-            "origin": "process:tightbeam",
+            "origin": "process:test",
             "prompt": "retry the failed delivery",
             "state": "fired",
             "deliveryStatus": "failed",
