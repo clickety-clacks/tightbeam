@@ -3,9 +3,6 @@ defmodule Tightbeam.EffortHolderActivityCancellationMigrationTest do
 
   alias Tightbeam.{DB, Model, Org, Schema, Wakes}
 
-  @activity_route ~r/\n\s+OR\n\s+\(workImpactKind = 'linked_work_open' AND livenessTriggerKind IS NULL AND livenessTriggerId IS NULL AND actionNeeded = 0 AND\s+requesterKind = 'process' AND requesterId = 'tightbeam:effort-checkin' AND\s+reasonKind = 'superseded' AND causalSourceKind = 'progress_attest'\)/
-  @activity_requester_route ~r/\(requesterId = 'tightbeam:effort-checkin' AND reasonKind = 'superseded' AND\s+causalSourceKind = 'progress_attest' AND outcomeKind = 'no_replacement'\)\n\s+OR\n\s+/
-
   setup do
     db = :"effort_activity_migration_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
@@ -78,8 +75,6 @@ defmodule Tightbeam.EffortHolderActivityCancellationMigrationTest do
                "SELECT sql FROM sqlite_master WHERE type='table' AND name='wake_cancellations'"
              )
 
-    assert Regex.match?(@activity_route, table_sql)
-    assert Regex.match?(@activity_requester_route, table_sql)
     assert String.contains?(table_sql, "requesterId = 'tightbeam:rail-remedy' AND")
 
     assert rows(ctx.db, "SELECT shape FROM effort_holder_activity_cancellation_epoch WHERE id=0") ==
@@ -87,10 +82,68 @@ defmodule Tightbeam.EffortHolderActivityCancellationMigrationTest do
 
     assert :ok = Schema.upgrade_effort_holder_activity_cancellation_v1(ctx.db)
     assert rows(ctx.db, "SELECT * FROM wake_cancellations ORDER BY wakeId") == ctx.before_rows
+    assert_activity_route_is_admitted(ctx.db)
   end
 
-  defp rows(db, sql) do
-    assert {:ok, rows} = DB.query(db, sql)
+  # Exercise the migrated SQLite CHECK constraints against a real canceled wake.
+  # sqlite_master normalizes the source DDL's whitespace, so route behavior is
+  # the stable contract here rather than a layout-sensitive match on its text.
+  defp assert_activity_route_is_admitted(db) do
+    [[wake_id]] = rows(db, "SELECT wakeId FROM wake_cancellations ORDER BY wakeId LIMIT 1")
+
+    assert :ok =
+             DB.execute(
+               db,
+               """
+               UPDATE wake_cancellations
+               SET requesterKind='process', requesterId='tightbeam:effort-checkin',
+                   reasonKind='superseded', causalSourceKind='progress_attest',
+                   causalSourceId='fixture-attest', outcomeKind='no_replacement',
+                   replacementWakeId=NULL, dispositionKind=NULL, dispositionId=NULL,
+                   primaryWorkKind='assignment', primaryWorkId='fixture-open-assignment',
+                   workImpactKind='linked_work_open', livenessTriggerKind=NULL,
+                   livenessTriggerId=NULL, actionNeeded=0
+               WHERE wakeId=?1
+               """,
+               [wake_id]
+             )
+
+    assert [
+             [
+               "process",
+               "tightbeam:effort-checkin",
+               "superseded",
+               "progress_attest",
+               "no_replacement",
+               "assignment",
+               "fixture-open-assignment",
+               "linked_work_open",
+               nil,
+               nil,
+               0
+             ]
+           ] =
+             rows(
+               db,
+               """
+               SELECT requesterKind,requesterId,reasonKind,causalSourceKind,outcomeKind,
+                      primaryWorkKind,primaryWorkId,workImpactKind,livenessTriggerKind,
+                      livenessTriggerId,actionNeeded
+               FROM wake_cancellations WHERE wakeId=?1
+               """,
+               [wake_id]
+             )
+
+    assert {:error, _constraint_error} =
+             DB.execute(
+               db,
+               "UPDATE wake_cancellations SET causalSourceKind='wake' WHERE wakeId=?1",
+               [wake_id]
+             )
+  end
+
+  defp rows(db, sql, params \\ []) do
+    assert {:ok, rows} = DB.query(db, sql, params)
     rows
   end
 end
