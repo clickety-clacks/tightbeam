@@ -135,9 +135,12 @@ defmodule Tightbeam.RowReactionAttestTest do
 
   test "current notice schema never fabricates missing decision activation evidence", ctx do
     assert :ok = DB.execute(ctx.db, "DELETE FROM decision_request_terminal_epoch")
-    assert {:ok, :ok} = DB.transaction(ctx.db, fn txn ->
-      Escalation.ensure_terminal_parity_in_txn(txn, 99, true)
-    end)
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               Escalation.ensure_terminal_parity_in_txn(txn, 99, true)
+             end)
+
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM decision_request_terminal_epoch")
   end
 
