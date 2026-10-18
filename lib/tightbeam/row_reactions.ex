@@ -161,10 +161,16 @@ defmodule Tightbeam.RowReactions do
     if Process.get({__MODULE__, txn.conn}, false) do
       row = Snapshot.wake(txn, before["wakeId"])
       [kind, id] = String.split(principal, ":", parts: 2)
+      # Historical sources may predate wake ownership. The delivery's actual
+      # recipient establishes this event's organization; source rows stay raw.
+      [[owner]] =
+        Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [
+          delivery["sessionKey"]
+        ])
 
       observe_in_txn(txn, %{
         "id" => "wake_delivery:#{row["wakeId"]}:turn:#{delivery["turnSeq"]}",
-        "org" => row["ownerUserId"],
+        "org" => owner,
         "kind" => "wake_delivery",
         "at" => at,
         "principal" => %{"kind" => kind, "id" => id},

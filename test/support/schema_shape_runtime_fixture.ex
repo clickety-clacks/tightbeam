@@ -422,7 +422,8 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
     assert :ok = Schema.ensure_all(second)
     assert {:ok, [[@shape]]} = DB.query(second, "SELECT shape FROM schema_stamp")
     trigger = object_sql(second, "trigger", "supervision_liveness_sidecar_insert_coherent")
-    assert trigger =~ "withrecursivelineage"
+    refute trigger =~ "withrecursivelineage"
+    assert trigger =~ "creator.sessionkey=w.creatorsessionkeyandcreator.owneruserid=w.owneruserid"
     refute trigger =~ "w.creatorsessionkey=a.holderkey"
     assert trigger =~ "t.sessionkey=w.creatorsessionkey"
     assert :ok = Schema.ensure_all(second)
@@ -829,7 +830,8 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
     assert normalize_guard(sql) in [
              normalize_guard(previous),
              normalize_guard(current),
-             normalize_guard(historical_continuation_guard!())
+             normalize_guard(historical_continuation_guard!()),
+             normalize_guard(owner_continuation_guard!())
            ]
 
     assert {:ok, [[0]]} =
@@ -881,6 +883,19 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
       historical_continuation_guard!(),
       "AND old.deliveredTurnSeq=failed.seq"
     )
+  end
+
+  defp owner_continuation_guard!() do
+    current = current_continuation_guard!()
+    ancestry = ~r/AND EXISTS \(\s*WITH RECURSIVE lineage\(sessionKey,spawnedBy\).*?SELECT 1 FROM lineage WHERE sessionKey=w.creatorSessionKey\s*\)/s
+    assert Regex.match?(ancestry, current)
+
+    Regex.replace(ancestry, current, """
+    AND EXISTS (
+      SELECT 1 FROM sessions creator
+      WHERE creator.sessionKey=w.creatorSessionKey AND creator.ownerUserId=w.ownerUserId
+    )
+    """)
   end
 
   defp historical_continuation_guard!(),
