@@ -52,11 +52,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     # Changes land on the fast checks: pull requests, the merge queue and
     # branch pushes run source checks, the gate scripts, and a compile (which
-    # builds the Rust NIF, so the Rust toolchain stays). The full mix and cargo
-    # suites run once per release, on the version tag, before packaging, and on
-    # manual runs.
+    # builds the Rust NIF, so the Rust toolchain stays). The 0.1.9+2857
+    # maintenance tag runs its directly affected Mix cases below. Full Mix and
+    # Cargo suites remain enabled on manual runs and every other version tag.
     env:
-      FULL_SUITE: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+      TARGETED_GUARD_RELEASE: ${{ github.event_name == 'push' && github.ref == 'refs/tags/v0.1.9+2857' }}
+      FULL_SUITE: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && github.ref != 'refs/tags/v0.1.9+2857') }}
     steps:
       - name: Validate exact source SHA
         shell: bash
@@ -108,7 +109,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Toolchain versions (the parity record)
-        if: env.FULL_SUITE == 'true'
+        if: env.FULL_SUITE == 'true' || env.TARGETED_GUARD_RELEASE == 'true'
         run: |
           elixir --version
           rustc --version
@@ -126,7 +127,7 @@ jobs:
       # registered harness in the test registry (config/test.exs) and this is its
       # own CLI: nothing here imitates another harness's behaviour.
       - name: Put the in-repo harness CLI on PATH (suite prerequisite)
-        if: env.FULL_SUITE == 'true'
+        if: env.FULL_SUITE == 'true' || env.TARGETED_GUARD_RELEASE == 'true'
         run: echo "$GITHUB_WORKSPACE/priv/harness_cli" >> "$GITHUB_PATH"
 
       # The undeclared dependency that lied loudest: the identity suite commits
@@ -137,7 +138,7 @@ jobs:
       # nothing to resolve. Every dev mac has a global identity; shrdlu and the
       # runners have none, which is the whole 2-failure IdentityTest delta.
       - name: Declare a git identity (suite prerequisite)
-        if: env.FULL_SUITE == 'true'
+        if: env.FULL_SUITE == 'true' || env.TARGETED_GUARD_RELEASE == 'true'
         run: |
           git config --global user.name "tightbeam ci"
           git config --global user.email "ci@tightbeam.invalid"
@@ -158,12 +159,12 @@ jobs:
           key: cargo-registry-${{ matrix.name }}-${{ hashFiles('cli/Cargo.lock') }}
 
       - name: cargo build --release (suite prerequisite)
-        if: env.FULL_SUITE == 'true'
+        if: env.FULL_SUITE == 'true' || env.TARGETED_GUARD_RELEASE == 'true'
         working-directory: cli
         run: cargo build --release
 
       - name: Put the source-built Tightbeam CLI on PATH (suite prerequisite)
-        if: env.FULL_SUITE == 'true'
+        if: env.FULL_SUITE == 'true' || env.TARGETED_GUARD_RELEASE == 'true'
         run: echo "$GITHUB_WORKSPACE/cli/target/release" >> "$GITHUB_PATH"
 
       # Make the runner's containment environment VISIBLE. Three fleet hosts at one
@@ -195,6 +196,22 @@ jobs:
 
       - name: mix compile
         run: mix compile
+
+      - name: Run directly affected successor and wake checks
+        if: github.event_name == 'push' && github.ref == 'refs/tags/v0.1.9+2857'
+        run: >-
+          scripts/verify_mix.sh
+          test/late_ruling_handoff_test.exs
+          test/row_driven_waits_test.exs:1297
+          test/row_driven_waits_test.exs:305
+          test/row_driven_waits_test.exs:598
+          test/row_driven_waits_test.exs:771
+          test/row_driven_waits_test.exs:1028
+          test/row_driven_waits_test.exs:1633
+          test/row_driven_waits_test.exs:1696
+          test/session_reparent_test.exs:638
+          test/refix_requires_diagnosis_test.exs:76
+          test/verification_papertrail_test.exs:383
 
       - name: mix test
         if: env.FULL_SUITE == 'true'

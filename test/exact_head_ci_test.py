@@ -117,6 +117,81 @@ class ExactHeadCI(unittest.TestCase):
         self.assertIn('${CI_SOURCE_SHA::7}.tgz', job)
         self.assertNotIn('${GITHUB_SHA::7}.tgz', job)
 
+    def test_only_guard_release_uses_directly_affected_mix_checks(self):
+        test_job = self.jobs['test']
+        targeted_release = re.search(
+            r'(?m)^      TARGETED_GUARD_RELEASE: \$\{\{ (.*?) \}\}$', test_job).group(1)
+        full_suite = re.search(
+            r'(?m)^      FULL_SUITE: \$\{\{ (.*?) \}\}$', test_job).group(1)
+        targeted_step = re.search(
+            r'(?ms)^      - name: Run directly affected successor and wake checks\n'
+            r'(.*?)(?=^      - name:|\Z)', test_job).group(1)
+        targeted_condition = re.search(
+            r'(?m)^        if: (.*)$', targeted_step).group(1)
+
+        cases = [
+            ('push', 'refs/tags/v0.1.9+2857', False, True),
+            ('push', 'refs/tags/v0.1.9+2855', True, False),
+            ('push', 'refs/tags/v0.1.9+2856', True, False),
+            ('push', 'refs/tags/v0.1.9+2858', True, False),
+            ('push', 'refs/tags/v0.1.10+2857', True, False),
+            ('workflow_dispatch', 'refs/tags/v0.1.9+2857', True, False),
+            ('push', 'refs/heads/0.1.9', False, False),
+            ('pull_request', 'refs/tags/v0.1.9+2857', False, False),
+        ]
+        for event, ref, expected_full_suite, expected_targeted in cases:
+            context = {'github.event_name': event, 'github.ref': ref}
+            self.assertEqual(evaluate(targeted_release, context), expected_targeted,
+                             ('TARGETED_GUARD_RELEASE', event, ref))
+            self.assertEqual(evaluate(full_suite, context), expected_full_suite,
+                             ('FULL_SUITE', event, ref))
+            self.assertEqual(evaluate(targeted_condition, context), expected_targeted,
+                             ('targeted checks', event, ref))
+
+        for name in (
+            'Toolchain versions (the parity record)',
+            'Put the in-repo harness CLI on PATH (suite prerequisite)',
+            'Declare a git identity (suite prerequisite)',
+            'cargo build --release (suite prerequisite)',
+            'Put the source-built Tightbeam CLI on PATH (suite prerequisite)',
+        ):
+            step = re.search(
+                r'(?ms)^      - name: ' + re.escape(name) +
+                r'\n(.*?)(?=^      - name:|\Z)', test_job).group(1)
+            condition = re.search(r'(?m)^        if: (.*)$', step).group(1)
+            for event, ref, expected_full_suite, expected_targeted in cases:
+                context = {
+                    'github.event_name': event,
+                    'github.ref': ref,
+                    'env.FULL_SUITE': 'true' if expected_full_suite else 'false',
+                    'env.TARGETED_GUARD_RELEASE': 'true' if expected_targeted else 'false',
+                }
+                self.assertEqual(evaluate(condition, context),
+                                 expected_full_suite or expected_targeted,
+                                 (name, event, ref))
+
+        for name in ('mix test', 'cargo test'):
+            step = re.search(
+                r'(?ms)^      - name: ' + re.escape(name) +
+                r'\n(.*?)(?=^      - name:|\Z)', test_job).group(1)
+            condition = re.search(r'(?m)^        if: (.*)$', step).group(1)
+            self.assertEqual(condition, "env.FULL_SUITE == 'true'")
+
+        for selector in (
+            'test/late_ruling_handoff_test.exs',
+            'test/row_driven_waits_test.exs:1297',
+            'test/row_driven_waits_test.exs:305',
+            'test/row_driven_waits_test.exs:598',
+            'test/row_driven_waits_test.exs:771',
+            'test/row_driven_waits_test.exs:1028',
+            'test/row_driven_waits_test.exs:1633',
+            'test/row_driven_waits_test.exs:1696',
+            'test/session_reparent_test.exs:638',
+            'test/refix_requires_diagnosis_test.exs:76',
+            'test/verification_papertrail_test.exs:383',
+        ):
+            self.assertIn(selector, targeted_step)
+
     def test_manual_tag_verification_cannot_publish_or_get_write_permission(self):
         release = self.jobs['release']
         publish = self.jobs['publish-release']
