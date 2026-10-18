@@ -390,11 +390,12 @@ defmodule Tightbeam.VerificationPapertrailTest do
 
     loaded = Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
 
+    refute Enum.any?(loaded, &(&1.name == "wake-obligation-registration-authority"))
+
     expected = [
       "completion-requires-review",
       @verification_rule,
-      @artifact_rule,
-      "wake-obligation-registration-authority"
+      @artifact_rule
     ]
 
     assert loaded
