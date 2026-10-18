@@ -1617,7 +1617,12 @@ defmodule Tightbeam.Schema do
           """
 
           true = String.contains?(sql, disposition_fallback)
-          sql = String.replace(sql, disposition_fallback, source_disposition_arms <> disposition_fallback, global: false)
+
+          sql =
+            String.replace(
+              sql,
+              disposition_fallback,
+              source_disposition_arms <> disposition_fallback, global: false)
 
           no_replacement_marker =
             "(outcomeKind = 'no_replacement' AND replacementWakeId IS NULL AND"
@@ -1645,6 +1650,7 @@ defmodule Tightbeam.Schema do
           """
 
           true = String.contains?(sql, no_replacement_marker)
+
           [before_no_replacement, after_no_replacement] =
             String.split(sql, no_replacement_marker, parts: 2)
 
@@ -1663,13 +1669,18 @@ defmodule Tightbeam.Schema do
           # source-owned condition clear. Extend only the typed source grammar
           # used by the already implemented callers.
           reason_anchor = "'consumer_unavailable','target_unresolvable'\n        )),"
+
           reason_extension =
             "'consumer_unavailable','target_unresolvable','condition_cleared'\n        )),"
+
           true = String.contains?(sql, reason_anchor)
           sql = String.replace(sql, reason_anchor, reason_extension, global: false)
 
           source_anchor = "'session_transition','scheduler_delivery'\n        )),"
-          source_extension = "'session_transition','scheduler_delivery','sentinel_transition'\n        )),"
+
+          source_extension =
+            "'session_transition','scheduler_delivery','sentinel_transition'\n        )),"
+
           true = String.contains?(sql, source_anchor)
           sql = String.replace(sql, source_anchor, source_extension, global: false)
 

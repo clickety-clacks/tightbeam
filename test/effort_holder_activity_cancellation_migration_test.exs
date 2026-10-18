@@ -59,7 +59,11 @@ defmodule Tightbeam.EffortHolderActivityCancellationMigrationTest do
     before_rows = rows(db, "SELECT * FROM wake_cancellations ORDER BY wakeId")
     assert length(before_rows) == 1
 
-    assert :ok = Tightbeam.SchemaShapeRuntimeFixture.downgrade_effort_holder_activity_cancellation!(db)
+    assert :ok =
+             Tightbeam.SchemaShapeRuntimeFixture.downgrade_effort_holder_activity_cancellation!(
+               db
+             )
+
     %{db: db, before_rows: before_rows}
   end
 

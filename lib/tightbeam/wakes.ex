@@ -662,8 +662,15 @@ defmodule Tightbeam.Wakes do
      )
      ORDER BY rowid LIMIT ?7
      """,
-     [after_rowid, @terminal_notice_marker, root_upper, @terminal_action_marker,
-      @terminal_action_marker, action_upper, limit]}
+     [
+       after_rowid,
+       @terminal_notice_marker,
+       root_upper,
+       @terminal_action_marker,
+       @terminal_action_marker,
+       action_upper,
+       limit
+     ]}
   end
 
   def source_reconciliation_query(
@@ -747,7 +754,9 @@ defmodule Tightbeam.Wakes do
         rows = Txn.q(txn, sql, params)
 
         {reconcile_source_rows_in_txn(txn, rows), length(rows),
-         rows |> List.last() |> case do
+         rows
+         |> List.last()
+         |> case do
            [rowid, _wake_id, _outcome] -> rowid
            _ -> after_rowid
          end}
@@ -756,14 +765,19 @@ defmodule Tightbeam.Wakes do
     case result do
       {:ok, {failures, count, last_rowid}} ->
         case report_source_reconciliation_failures(failures) do
-          :ok -> {:ok, count, last_rowid}
+          :ok ->
+            {:ok, count, last_rowid}
+
           {:error, reasons} ->
             Logger.warning("startup source records remain unresolved: #{inspect(reasons)}")
             {:error, {:source_actions_unavailable, reasons}}
         end
 
       {:error, error} ->
-        Logger.warning("startup delivered source recovery unavailable: #{Exception.message(error)}")
+        Logger.warning(
+          "startup delivered source recovery unavailable: #{Exception.message(error)}"
+        )
+
         {:error, error}
     end
   end
@@ -4762,8 +4776,8 @@ defmodule Tightbeam.Wakes do
         if reason == "superseded" and
              ((source == "wake" and outcome == "replacement") or
                 (source == "progress_attest" and outcome == "no_replacement")),
-          do: :ok,
-          else: :error
+           do: :ok,
+           else: :error
 
       true ->
         :ok
@@ -6515,9 +6529,12 @@ defmodule Tightbeam.Wakes do
     do: handle_info({:recover_work_item_brackets, 0}, state)
 
   def handle_info({:recover_work_item_brackets, after_rowid}, state) do
-    case DB.background_pass(fn ->
-           WorkItems.reconcile_delivered_brackets_page(state.db, after_rowid)
-         end, :overloaded) do
+    case DB.background_pass(
+           fn ->
+             WorkItems.reconcile_delivered_brackets_page(state.db, after_rowid)
+           end,
+           :overloaded
+         ) do
       {:ok, 100, last_rowid} when last_rowid > after_rowid ->
         Process.send_after(self(), {:recover_work_item_brackets, last_rowid}, 0)
 

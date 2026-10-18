@@ -305,6 +305,37 @@ defmodule Tightbeam.SupervisionTest do
 
     assert {:ok, []} = DB.query(ctx.db, reconciliation_sql, reconciliation_params)
 
+    direct_wake_id = "delivery-history-target"
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO wakes
+                 (wakeId,sessionKey,origin,consumer,dueAt,state,createdAt,obligationRef,deliveredTurnSeq)
+               VALUES (?1,?2,'process:tightbeam','prompt',1,'fired',1,
+                       'terminal-child-owner-notification:synthetic',1)
+               """,
+               [direct_wake_id, ctx.holder.session_key]
+             )
+
+    {delivery_sql, delivery_params} =
+      Wakes.source_reconciliation_query({:delivery, ctx.holder.session_key, direct_wake_id})
+
+    assert {:ok, delivery_rows} = DB.query(ctx.db, delivery_sql, delivery_params)
+    assert Enum.map(delivery_rows, &Enum.at(&1, 1)) == [direct_wake_id]
+
+    assert {:ok, delivery_plan} =
+             DB.query(ctx.db, "EXPLAIN QUERY PLAN " <> delivery_sql, delivery_params)
+
+    assert Enum.any?(delivery_plan, fn [_, _, _, detail] ->
+             String.contains?(detail, "SEARCH wakes") and String.contains?(detail, "wakeId=?")
+           end)
+
+    refute Enum.any?(delivery_plan, fn [_, _, _, detail] ->
+             String.contains?(detail, "SCAN wakes")
+           end)
+
     {bracket_sql, bracket_params} = WorkItems.delivered_bracket_reconciliation_query(0)
 
     assert {:ok, bracket_plan} =
