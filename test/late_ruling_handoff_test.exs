@@ -271,12 +271,14 @@ defmodule Tightbeam.LateRulingHandoffTest do
     assert session_key == ctx.opener.session_key
     refute session_key == ctx.raiser.session_key
 
+    independent = session(ctx.db, "agent:independent:test", "flynn")
+
     replacement_item = work_item(ctx.db, ctx.opener.session_key, "replacement item")
 
     replacement =
       assign(
         ctx.db,
-        ctx.opener.session_key,
+        independent.session_key,
         ctx.replacement_holder.session_key,
         "replacement assignment",
         replacement_item.id,
@@ -310,7 +312,7 @@ defmodule Tightbeam.LateRulingHandoffTest do
     replayed_assignment =
       assign(
         ctx.db,
-        ctx.opener.session_key,
+        independent.session_key,
         ctx.replacement_holder.session_key,
         "ignored replay subject",
         replacement_item.id,
@@ -445,17 +447,26 @@ defmodule Tightbeam.LateRulingHandoffTest do
     ensure_main_session(ctx.db, "other")
     outsider = session(ctx.db, "agent:outsider:test", "other")
 
-    before_successor_refusals = mutation_counts(ctx.db)
+    # Ordinary assignment creation may link an existing terminal predecessor;
+    # no relationship to its holder, opener or work-item owner is required.
+    linked =
+      assign(
+        ctx.db,
+        outsider.session_key,
+        outsider.session_key,
+        "existing terminal predecessor",
+        nil,
+        succeeds: source.id
+      )
 
-    assert %{code: "unknown_assignment"} =
-             assign(
-               ctx.db,
-               outsider.session_key,
-               outsider.session_key,
-               "invisible predecessor",
-               nil,
-               succeeds: source.id
-             )
+    assert is_binary(linked.id)
+    assert linked.openedBySession == outsider.session_key
+
+    assert linked.subject ==
+             "existing terminal predecessor\n\n" <>
+               "Ruled-but-unconsumed decisions carried from #{source.id}: none"
+
+    before_successor_refusals = mutation_counts(ctx.db)
 
     assert %{code: "unknown_assignment"} =
              assign(
