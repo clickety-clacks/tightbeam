@@ -431,6 +431,30 @@ defmodule Tightbeam.HarnessProcess do
     :ok
   end
 
+  @doc "Retry failed parks and release completed orphan fences without replacing a coordinator."
+  @spec reconcile_failed_parks(DB.server()) :: {:ok, [String.t()]}
+  def reconcile_failed_parks(db) do
+    # Group exits have no BEAM monitor once the adapter and its leader are gone.
+    # The existing slow lane backstop revisits only failed cleanup, never a
+    # serving launch. The helper still proves signal authority and refuses a
+    # vanished leader with surviving group members.
+    for row <- unresolved(db), row.state == "kill_failed" do
+      :ok = ensure_fence(db, row.adapter_key)
+
+      if reconcile_row(db, row, "exited") == :ok do
+        :ok =
+          EventLog.lifecycle(
+            db,
+            "harness_failed_park_reconciled",
+            row.adapter_key,
+            inspect(%{launch_id: row.launch_id})
+          )
+      end
+    end
+
+    {:ok, clear_orphan_fence_names(db)}
+  end
+
   @doc "Reconcile the latest unresolved launch for one adapter after its BEAM owner goes down."
   @spec reconcile_key(DB.server(), tuple()) :: :ok | :already_resolved | {:error, term()}
   def reconcile_key(db, key) do
@@ -1241,9 +1265,14 @@ defmodule Tightbeam.HarnessProcess do
   end
 
   defp clear_orphan_fences(db) do
+    _released = clear_orphan_fence_names(db)
+    :ok
+  end
+
+  defp clear_orphan_fence_names(db) do
     incident_guard = rate_limit_incident_guard(db)
 
-    {:ok, _} =
+    {:ok, released} =
       DB.query(
         db,
         """
@@ -1256,10 +1285,11 @@ defmodule Tightbeam.HarnessProcess do
               AND resolvedAt IS NULL
          )
          #{incident_guard}
+         RETURNING adapterKey
         """
       )
 
-    :ok
+    Enum.map(released, fn [adapter_key] -> adapter_key end)
   end
 
   defp rate_limit_incident_guard(db) do

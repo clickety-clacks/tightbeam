@@ -334,6 +334,36 @@ defmodule Tightbeam.OAuthRecoveryWakeTest do
     assert Credentials.status(:anthropic) == :onboarded
   end
 
+  test "successful credential recovery releases an orphan fence with the same coordinator", ctx do
+    adapter_sup = start_supervised!({DynamicSupervisor, strategy: :one_for_one})
+
+    coordinator =
+      start_supervised!(
+        {Tightbeam.AdapterCoordinator,
+         adapter_sup: adapter_sup,
+         db: ctx.db,
+         name: Tightbeam.AdapterCoordinator,
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn _, _ -> flunk("no adapter launch is needed for this orphan park") end}
+      )
+
+    key = {:claude, "shared", @host}
+
+    start_credentials!(ctx,
+      sh: fn _ -> {"", 0} end,
+      stop: fn :anthropic -> Tightbeam.AdapterCoordinator.close_adapter(coordinator, key) end
+    )
+
+    assert {:ok, :no_launch} = Tightbeam.HarnessProcess.begin_park(ctx.db, key)
+    assert Tightbeam.HarnessProcess.parked?(ctx.db, key)
+    onboard = onboard_handler(ctx, start_noop_scheduler!())
+    lease = begin_and_stage!(onboard, "anthropic", "subscription")
+    assert %{status: "onboarded"} = finish(onboard, "anthropic", lease, "subscription")
+    refute Tightbeam.HarnessProcess.parked?(ctx.db, key)
+    assert Process.whereis(Tightbeam.AdapterCoordinator) == coordinator
+    assert Credentials.status(:anthropic) == :onboarded
+  end
+
   defp start_credentials!(ctx, opts \\ []) do
     start_supervised!(
       {Credentials,
