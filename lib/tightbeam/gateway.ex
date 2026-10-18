@@ -5375,11 +5375,15 @@ defmodule Tightbeam.Gateway do
   def load_law!(config, verbs \\ nil) do
     verbs = verbs || config |> handlers() |> Map.keys()
 
-    Identity.with_recovery_law!(config.base_dir, fn law_base, revision ->
-      Archetypes.load!(law_base)
-      Rails.load!(law_base)
-      Rules.load!(config.base_dir, verbs, law_base: law_base, revision: revision)
-    end)
+    rules =
+      Identity.with_recovery_law!(config.base_dir, fn law_base, revision ->
+        Archetypes.load!(law_base)
+        Rails.load!(law_base)
+        Rules.load!(config.base_dir, verbs, law_base: law_base, revision: revision)
+      end)
+
+    :ok = Tightbeam.RowReactions.recover(Map.get(config, :db, Tightbeam.DB))
+    rules
   end
 
   defp identity_status_result(config, db, call) do
