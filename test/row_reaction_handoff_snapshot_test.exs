@@ -434,7 +434,7 @@ defmodule Tightbeam.RowReactionHandoffSnapshotTest do
 
                        Txn.q(
                          txn,
-                         "INSERT INTO assignments(id,subject,holderKey,openedByUser,openedAt,state,outcome,closedAt) VALUES(?1,'settled','opener','owner',1,'closed','completed',2)",
+                         "INSERT INTO assignments(id,subject,holderKey,openedByUser,openedAt,state,outcome,closedAt,closedByUser) VALUES(?1,'settled','opener','owner',1,'closed','completed',2,'owner')",
                          [id]
                        )
 
