@@ -618,8 +618,8 @@ defmodule Tightbeam.Escalation do
   def ensure_terminal_parity_in_txn(%Txn{} = txn, activated_at, versioned?) do
     current_schema? =
       Txn.q(txn, "SELECT shape FROM schema_stamp") in [
-        ["decision-request-row-schema-v2-019"],
-        ["row-reaction-notice-v1"]
+        [["decision-request-row-schema-v2-019"]],
+        [["row-reaction-notice-v1"]]
       ]
 
     invalid_version =

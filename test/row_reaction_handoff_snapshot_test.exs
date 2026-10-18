@@ -39,6 +39,7 @@ defmodule Tightbeam.RowReactionHandoffSnapshotTest do
   defp elect(ctx, edit \\ &Function.identity/1) do
     path = Path.join(ctx.base, "identity/rules/row-reaction-handoff.toml")
     bytes = File.read!("priv/kungfu/agentic-engineering/rules/row-reaction-handoff.toml")
+    File.mkdir_p!(Path.dirname(path))
     File.write!(path, edit.(bytes))
     receipt = Path.join(ctx.base, "identity/kungfu/agentic-engineering/installed.toml")
     File.mkdir_p!(Path.dirname(receipt))

@@ -49,6 +49,7 @@ defmodule Tightbeam.RowReactionAttestTest do
   defp elect(ctx, edit \\ &Function.identity/1) do
     path = Path.join(ctx.base, "identity/rules/row-reaction-status.toml")
     bytes = File.read!("priv/kungfu/agentic-engineering/rules/row-reaction-status.toml")
+    File.mkdir_p!(Path.dirname(path))
     File.write!(path, edit.(bytes))
     receipt = Path.join(ctx.base, "identity/kungfu/agentic-engineering/installed.toml")
     File.mkdir_p!(Path.dirname(receipt))
@@ -115,6 +116,29 @@ defmodule Tightbeam.RowReactionAttestTest do
     VALUES('assignment',1,9999999999999,'armed',NULL,NULL,
            'assignment_open','assignment',NULL,'assignment_open','process:tightbeam',60000)
     """)
+  end
+
+  test "shipped engineering composition elects status and handoff declarations", ctx do
+    assert {:ok, candidate} = Identity.learn!(ctx.base, "agentic-engineering", "test")
+    assert {:ok, _revision} = Identity.publish_live!(ctx.base, candidate)
+    Gateway.load_law!(%{base_dir: ctx.base, db: ctx.db}, [])
+    names = Enum.map(Tightbeam.Rules.reactions(), & &1.name)
+    assert "assignment-first-start-notice" in names
+    assert "assignment-terminal-handoff" in names
+    assert "assignment-blocker-raised-notice" in names
+    progress = file(ctx, "progress")
+    assert progress.attest.kind == "progress"
+    assert Wakes.list_pending(ctx.db) == []
+    assert [{event, _facts}] = attest_events(ctx)
+    assert event["after"]["id"] == progress.attest.id
+  end
+
+  test "current notice schema never fabricates missing decision activation evidence", ctx do
+    assert :ok = DB.execute(ctx.db, "DELETE FROM decision_request_terminal_epoch")
+    assert {:ok, :ok} = DB.transaction(ctx.db, fn txn ->
+      Escalation.ensure_terminal_parity_in_txn(txn, 99, true)
+    end)
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM decision_request_terminal_epoch")
   end
 
   test "elected engineering keeps routine progress and ordinary verdicts durable and quiet",

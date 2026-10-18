@@ -241,6 +241,7 @@ defmodule Tightbeam.RowReactionStoreTest do
     effects = [{slot="notice",kind="notice",when=true,value={prompt="example"}}]
     """
 
+    File.mkdir_p!(Path.dirname(path))
     File.write!(path, bytes)
     assert [] == Rules.load!(ctx.root, [], revision: "published-one")
     assert [seed] = Rules.reactions()
@@ -264,6 +265,7 @@ defmodule Tightbeam.RowReactionStoreTest do
 
   test "malformed loaded reaction is unavailable rather than an empty election", ctx do
     path = Path.join(ctx.root, "identity/rules/bad.toml")
+    File.mkdir_p!(Path.dirname(path))
     File.mkdir_p!(Path.dirname(path))
     File.write!(path, "[[reaction]]\nname='incomplete'\n")
     Rules.load!(ctx.root, [])
