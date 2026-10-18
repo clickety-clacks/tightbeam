@@ -3203,11 +3203,12 @@ defmodule Tightbeam.GatewayTest do
            }
   end
 
-  test "process cancel-wake cancels only its own pending wakes", ctx do
+  test "sender cancel-wake retracts only its own pending notices", ctx do
     own =
       Wakes.schedule(ctx.db, %{
         session_key: "k1",
-        origin: "process:scheduler",
+        origin: "agent:role-at-send",
+        creator_session_key: "k1",
         prompt: "own wake",
         due_at: 1_000
       })
@@ -3215,7 +3216,7 @@ defmodule Tightbeam.GatewayTest do
     other =
       Wakes.schedule(ctx.db, %{
         session_key: "k1",
-        origin: "process:other",
+        origin: "session:k2",
         prompt: "other wake",
         due_at: 2_000
       })
@@ -3226,9 +3227,9 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, %{canceled: true}} =
              Dispatch.dispatch(ctx.db, handlers, %{
                verb: "wake",
-               origin: "process:scheduler",
-               principal: {:process, "scheduler"},
-               session_key: nil,
+               origin: "agent:role-after-rebind",
+               principal: {:session, "k1"},
+               session_key: "k1",
                params: %{cancel_wake_id: own.wake_id}
              })
 
@@ -3249,9 +3250,9 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, %{canceled: false}} =
              Dispatch.dispatch(ctx.db, handlers, %{
                verb: "wake",
-               origin: "process:scheduler",
-               principal: {:process, "scheduler"},
-               session_key: nil,
+               origin: "agent:role-after-rebind",
+               principal: {:session, "k1"},
+               session_key: "k1",
                params: %{cancel_wake_id: other.wake_id}
              })
 
@@ -3266,11 +3267,12 @@ defmodule Tightbeam.GatewayTest do
              )
   end
 
-  test "public cancel rolls its accepted event and carrier back with the wake transition", ctx do
+  test "public sender cancel rolls its accepted event and carrier back with the wake transition", ctx do
     wake =
       Wakes.schedule(ctx.db, %{
         session_key: "k1",
-        origin: "process:scheduler",
+        origin: "agent:role-at-send",
+        creator_session_key: "k1",
         prompt: "rollback wake",
         due_at: 1_000
       })
@@ -3294,9 +3296,9 @@ defmodule Tightbeam.GatewayTest do
     assert {:error, %{code: "server_error", message: message}} =
              Dispatch.dispatch(ctx.db, handlers, %{
                verb: "wake",
-               origin: "process:scheduler",
-               principal: {:process, "scheduler"},
-               session_key: nil,
+               origin: "agent:role-after-rebind",
+               principal: {:session, "k1"},
+               session_key: "k1",
                params: %{cancel_wake_id: wake.wake_id}
              })
 

@@ -4574,10 +4574,10 @@ defmodule Tightbeam.Wakes do
 
   defp authorize_cancel(
          %{requester: %{kind: "process", id: id}, reason_kind: reason} = command,
-         %{origin: origin}
+         _wake
        )
        when is_binary(id) and is_binary(reason) do
-    if Map.get(command, :expected_origin, origin) == origin and
+    if not Map.has_key?(command, :expected_origin) and
          reason in Map.get(@process_reasons, id, []),
        do: :ok,
        else: :error
