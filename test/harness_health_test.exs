@@ -563,11 +563,25 @@ defmodule Tightbeam.HarnessHealthTest do
 
     assert content =~ original_prompt
 
-    assert {:ok, [[0]]} =
-             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [expected_wake_id])
+    # Delivery persists the receipt but does not mutate the source owner's route.
+    # The boot recovery path must bind it even if no delivery callback survived.
+    assert Wakes.get(ctx.db, expected_wake_id).delivered_turn_seq == turn_seq
+
+    assert {:ok, [[nil]]} =
+             DB.query(
+               ctx.db,
+               "SELECT turnSeq FROM harness_health_other_routes WHERE noticeWakeId=?1",
+               [expected_wake_id]
+             )
 
     assert {:ok, before_turns} = DB.query(ctx.db, "SELECT * FROM turns ORDER BY seq")
     assert {:ok, before_messages} = DB.query(ctx.db, "SELECT * FROM messages ORDER BY seq")
+
+    assert :ok = HarnessHealth.resume_other_routes(ctx.db)
+    assert :ok = HarnessHealth.resume_other_routes(ctx.db)
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [expected_wake_id])
 
     assert {:ok, {:duplicate, %{wake_id: ^carrier_id, turn_seq: ^turn_seq}}} =
              DB.transaction(ctx.db, fn txn ->
