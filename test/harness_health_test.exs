@@ -436,9 +436,12 @@ defmodule Tightbeam.HarnessHealthTest do
                [opened.id, parent_session]
              )
 
-    # Restart reconciliation must not settle against the unrelated delivered turn.
+    # Restart reconciliation must not settle against the unrelated delivered turn
+    # or publish a later rung while the actual recipient still has queued work.
+    assert {:ok, queued_turns} = DB.query(ctx.db, "SELECT * FROM turns ORDER BY seq")
     assert :ok = HarnessHealth.resume_other_routes(ctx.db)
     assert :ok = HarnessHealth.resume_other_routes(ctx.db)
+    assert {:ok, ^queued_turns} = DB.query(ctx.db, "SELECT * FROM turns ORDER BY seq")
 
     assert {:ok, [["pending", ^turn_seq]]} =
              DB.query(

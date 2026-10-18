@@ -4230,10 +4230,20 @@ defmodule Tightbeam.HarnessHealth do
             end
           end)
 
+        # Unsent later rungs are not missing publications. Only recover the
+        # current rung; a terminal non-delivery explicitly advances routeOrdinal.
         fresh =
           Txn.q(
             txn,
-            "SELECT DISTINCT incidentId FROM harness_health_other_routes WHERE state='pending' AND noticeWakeId IS NULL AND turnSeq IS NULL AND settledAt IS NULL ORDER BY incidentId",
+            """
+            SELECT r.incidentId
+            FROM harness_health_other_reviews v
+            JOIN harness_health_other_routes r
+              ON r.incidentId=v.incidentId AND r.ordinal=v.routeOrdinal
+            WHERE v.state='pending' AND r.state='pending'
+              AND r.noticeWakeId IS NULL AND r.turnSeq IS NULL AND r.settledAt IS NULL
+            ORDER BY r.incidentId
+            """,
             []
           )
           |> Enum.flat_map(fn [incident_id] ->
