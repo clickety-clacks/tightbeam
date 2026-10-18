@@ -266,6 +266,7 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
 
     assert Wakes.get(ctx.db, pending.wake_id).state == "pending"
     assert pending_reminders(ctx.db, root.wake_id) == [pending]
+
     assert {:ok, [[0]]} =
              DB.query(
                ctx.db,
@@ -289,8 +290,16 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     assert pending_reminders(ctx.db, root.wake_id) == []
 
     assert {:ok,
-            [["obligation_disposed", "assignment_transition", assignment_id, "disposition",
-              "assignment_transition", disposition_id]]} =
+            [
+              [
+                "obligation_disposed",
+                "assignment_transition",
+                assignment_id,
+                "disposition",
+                "assignment_transition",
+                disposition_id
+              ]
+            ]} =
              DB.query(
                ctx.db,
                "SELECT reasonKind,causalSourceKind,causalSourceId,outcomeKind,dispositionKind,dispositionId FROM wake_cancellations WHERE wakeId=?1",
@@ -321,8 +330,16 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     assert pending_reminders(ctx.db, root.wake_id) == []
 
     assert {:ok,
-            [["obligation_disposed", "assignment_transition", assignment_id, "disposition",
-              "assignment_transition", disposition_id]]} =
+            [
+              [
+                "obligation_disposed",
+                "assignment_transition",
+                assignment_id,
+                "disposition",
+                "assignment_transition",
+                disposition_id
+              ]
+            ]} =
              DB.query(
                ctx.db,
                "SELECT reasonKind,causalSourceKind,causalSourceId,outcomeKind,dispositionKind,dispositionId FROM wake_cancellations WHERE wakeId=?1",
