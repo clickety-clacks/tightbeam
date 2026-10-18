@@ -105,6 +105,7 @@ defmodule Tightbeam.RowReactions.Store do
                  [System.system_time(:millisecond)]
                )
            end
+           :ok
          end) do
       {:ok, :ok} -> :ok
       {:error, error} -> raise error
