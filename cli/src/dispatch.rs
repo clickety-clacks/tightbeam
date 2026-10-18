@@ -3797,6 +3797,28 @@ mod tests {
     }
 
     #[test]
+    fn documented_work_item_body_invocation_keeps_a_prefixed_identity() {
+        let request: serde_json::Value = serde_json::from_str(&body(&[
+            "--as",
+            "coder",
+            "work-item-update",
+            "wi_1",
+            "--body",
+            "editable body",
+        ]))
+        .unwrap();
+
+        assert_eq!(
+            request,
+            serde_json::json!({
+                "as": "coder",
+                "verb": "work-item-update",
+                "params": {"workItemId": "wi_1", "body": "editable body"}
+            })
+        );
+    }
+
+    #[test]
     fn artifact_content_fetch_sends_only_id_and_authenticated_identity() {
         let request = build_request(&parse(&[
             "artifact-content-fetch",
