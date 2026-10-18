@@ -157,7 +157,7 @@ defmodule Tightbeam.LaneTest do
         {Tightbeam.Productions.BubbleSweeper, db: ctx.db, name: :idle_bubble_sweeper}
       )
 
-    :sys.get_state(manager)
+    assert eventually(fn -> :sys.get_state(manager).park_recovery == nil end)
     :sys.get_state(sweeper)
     db_pid = GenServer.whereis(ctx.db)
     :sys.get_state(:sys.get_state(ctx.db).retry)

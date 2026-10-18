@@ -1280,6 +1280,8 @@ defmodule Tightbeam.HarnessProcessFixture do
          end}
       )
 
+    assert eventually(fn -> :sys.get_state(manager).park_recovery == nil end)
+
     :ok =
       DB.execute(ctx.db, """
       INSERT INTO sessions
@@ -1327,6 +1329,7 @@ defmodule Tightbeam.HarnessProcessFixture do
     serving_key = {:claude, "serving", "testhost"}
     {_serving_port, serving} = launch_stubborn(ctx, serving_key)
     assert :ok = Tightbeam.LaneManager.reconcile(manager)
+    assert eventually(fn -> :sys.get_state(manager).park_recovery == nil end)
     assert HarnessProcess.parked?(ctx.db, key)
     assert {_, 0} = System.cmd("/bin/kill", ["-0", child], stderr_to_stdout: true)
 
@@ -1360,7 +1363,7 @@ defmodule Tightbeam.HarnessProcessFixture do
            end)
 
     assert :ok = Tightbeam.LaneManager.reconcile(manager)
-    refute HarnessProcess.parked?(ctx.db, key)
+    assert eventually(fn -> not HarnessProcess.parked?(ctx.db, key) end)
     assert_receive {:recovered_turn, ^seq}, 5_000
 
     assert eventually(fn ->
