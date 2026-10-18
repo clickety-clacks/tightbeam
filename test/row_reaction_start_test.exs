@@ -208,4 +208,24 @@ defmodule Tightbeam.RowReactionStartTest do
     assert claims(ctx) == []
     assert Wakes.list_pending(ctx.db) == []
   end
+  test "first start remains addressed with growing earlier holder turn history", ctx do
+    elect(ctx)
+    seq = enqueue(ctx)
+    assert {:ok, first} = Ledger.claim_next(ctx.db, "holder", "fixture")
+    assert first.seq == seq
+    assert :ok = Ledger.finish(ctx.db, seq, "delivered", nil, owner_lease: first.owner_lease)
+    [notice] = Wakes.list_pending(ctx.db)
+    assert {:ok, [[started_at]]} = DB.query(ctx.db, "SELECT startedAt FROM turns WHERE seq=?1", [seq])
+    assert {:ok, :ok} = DB.transaction(ctx.db, fn txn ->
+      for n <- 1..256 do
+        Tightbeam.DB.Txn.q(txn, "INSERT INTO turns(sessionKey,messageId,origin,prompt,status,createdAt,startedAt,endedAt,assignmentId) VALUES('holder',?1,'user:owner','history','delivered',?2,?2,?2,'assignment')", ["history-#{n}", started_at + n])
+      end
+      :ok
+    end)
+    enqueue(ctx)
+    assert {:ok, _} = Ledger.claim_next(ctx.db, "holder", "fixture")
+    assert Wakes.list_pending(ctx.db) == [notice]
+    for {_event,facts} <- claims(ctx), do: assert([%{"seq" => ^seq}] = facts["turns"])
+  end
+
 end

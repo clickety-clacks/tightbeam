@@ -78,6 +78,21 @@ defmodule Tightbeam.RowReactions.Store do
 
                :ok
            end
+           case Txn.q(txn, "SELECT 1 FROM supervision_liveness_migrations WHERE migrationId='row-reactions/addressed-snapshots-v1'") do
+             [[1]] -> :ok
+             [] ->
+               :ok = Txn.exec(txn, """
+               CREATE INDEX row_reaction_request ON row_reaction_events(org,
+                 COALESCE(json_extract(event,'$.requestId'),CASE WHEN json_extract(event,'$.kind')='decision_request' THEN json_extract(event,'$.after.id') END));
+               CREATE INDEX row_reaction_output ON row_reaction_actions(json_extract(result,'$.wake_id'));
+               CREATE INDEX row_reaction_source ON row_reaction_actions(org,eventId);
+               CREATE INDEX reaction_first_receipt ON attests(assignmentId,kind,verdictKind,ts,id);
+               CREATE INDEX reaction_disposition ON attests(bySession,kind,note);
+               CREATE INDEX reaction_first_start ON turns(assignmentId,sessionKey,startedAt,seq) WHERE startedAt IS NOT NULL;
+               CREATE INDEX reaction_open_assignments ON assignments(holderKey,state,workItemId,openedAt,id);
+               """)
+               Txn.q(txn, "INSERT INTO supervision_liveness_migrations(migrationId,appliedAt,affectedRows,cause,principal) VALUES('row-reactions/addressed-snapshots-v1',?1,0,'release_upgrade','process:tightbeam')", [System.system_time(:millisecond)])
+           end
          end) do
       {:ok, :ok} -> :ok
       {:error, error} -> raise error

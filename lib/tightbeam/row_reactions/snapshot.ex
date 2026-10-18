@@ -145,23 +145,23 @@ defmodule Tightbeam.RowReactions.Snapshot do
     revocation_keys =
       ~w(id assignmentId revokedAt revokedBySession revokedByUser revokedByProcess)
 
+    item = one(txn, "SELECT #{Enum.join(item_keys, ",")} FROM work_items WHERE id=?1", item_keys, [row["workItemId"]])
+    current_assignment = assignment_row(txn, row["id"])
+
     recorded
-    |> Map.put("sessions", sessions(txn))
-    |> Map.put("users", users(txn))
-    |> Map.put("assignment", assignment_row(txn, row["id"]))
+    |> addressed(txn, [row, current_assignment, item])
+    |> Map.put("assignment", current_assignment)
     |> Map.put(
       "work_item",
-      one(txn, "SELECT #{Enum.join(item_keys, ",")} FROM work_items WHERE id=?1", item_keys, [
-        row["workItemId"]
-      ])
+      item
     )
     |> Map.put(
       "assignments",
       rows(
         txn,
-        "SELECT #{Enum.join(@assignment_keys, ",")} FROM assignments WHERE workItemId=?1 ORDER BY openedAt,id",
+        "SELECT #{Enum.join(@assignment_keys, ",")} FROM assignments WHERE workItemId=?1 AND holderKey=?2 AND state='open' ORDER BY openedAt,id",
         @assignment_keys,
-        [row["workItemId"]]
+        [row["workItemId"], row["openedBySession"]]
       )
     )
     |> Map.put(
@@ -192,20 +192,10 @@ defmodule Tightbeam.RowReactions.Snapshot do
 
   def current(txn, %{"kind" => "wake_delivery", "after" => row, "delivery" => delivery}, recorded) do
     wakes = referenced_wakes(txn, [row["wakeId"]], MapSet.new(), [])
-    attest_keys = ~w(id assignmentId kind bySession byUser ts note)
-
-    attests =
-      rows(
-        txn,
-        "SELECT #{Enum.join(attest_keys, ",")} FROM attests WHERE bySession=?1 ORDER BY ts,id",
-        attest_keys,
-        [delivery["sessionKey"]]
-      )
-      |> Enum.map(&Map.put(&1, "disposition", disposition(&1["note"])))
+    sources = Enum.flat_map(wakes, &terminal_sources(txn, &1))
 
     recorded
-    |> Map.put("sessions", sessions(txn))
-    |> Map.put("users", users(txn))
+    |> addressed(txn, [row, delivery, wakes, sources])
     |> Map.put("wakes", wakes)
     |> Map.put(
       "wake_retries",
@@ -222,13 +212,13 @@ defmodule Tightbeam.RowReactions.Snapshot do
       "assignments",
       rows(
         txn,
-        "SELECT #{Enum.join(@assignment_keys, ",")} FROM assignments WHERE holderKey=?1 ORDER BY openedAt,id",
+        "SELECT #{Enum.join(@assignment_keys, ",")} FROM assignments WHERE holderKey=?1 AND state='open' ORDER BY openedAt,id",
         @assignment_keys,
         [delivery["sessionKey"]]
       )
     )
-    |> Map.put("attests", attests)
-    |> Map.put("terminal_sources", Enum.flat_map(wakes, &terminal_sources(txn, &1)))
+    |> Map.put("attests", receipts(txn, delivery["sessionKey"], sources))
+    |> Map.put("terminal_sources", sources)
   end
 
   def current(txn, %{"kind" => "decision_request", "after" => row} = event, recorded) do
@@ -256,18 +246,19 @@ defmodule Tightbeam.RowReactions.Snapshot do
         [condition && condition["settlementFactId"]]
       )
 
+    current_assignment = assignment(txn, assignment_id)
+
     recorded
+    |> addressed(txn, [event, request, current_assignment])
     |> Map.put("decision_request", request)
-    |> Map.put("assignment", assignment(txn, assignment_id))
-    |> Map.put("sessions", sessions(txn))
-    |> Map.put("users", users(txn))
+    |> Map.put("assignment", current_assignment)
     |> Map.put("cannot_proceed", condition)
     |> Map.put(
       "settlement_fact",
       if(fact, do: Map.update!(fact, "payload", &decode/1), else: nil)
     )
     |> Map.put("explicit_notices", explicit_notices(txn, event, request["id"]))
-    |> Map.put("related_actions", related_actions(txn, event["org"], assignment_id))
+    |> Map.put("related_actions", related_actions(txn, event["org"], request["id"]))
   end
 
   def current(txn, %{"kind" => "attest", "after" => row} = event, recorded) do
@@ -277,48 +268,24 @@ defmodule Tightbeam.RowReactions.Snapshot do
         id -> Tightbeam.Escalation.raw_by_id_in_txn(txn, id) |> request_row()
       end
 
+    current_assignment = assignment(txn, row["assignmentId"])
+
     recorded
+    |> addressed(txn, [event, request, current_assignment])
     |> Map.put("decision_request", request)
-    |> Map.put("assignment", assignment(txn, row["assignmentId"]))
-    |> Map.put("sessions", sessions(txn))
-    |> Map.put("users", users(txn))
-    |> Map.put(
-      "attests",
-      rows(
-        txn,
-        "SELECT #{Enum.join(@attest_keys, ",")} FROM attests WHERE assignmentId=?1",
-        @attest_keys,
-        [row["assignmentId"]]
-      )
-    )
+    |> Map.put("assignment", current_assignment)
+    |> Map.put("attests", Enum.uniq_by([row | first_receipt(txn, row["assignmentId"], request)], & &1["id"]))
     |> Map.put("explicit_notices", explicit_notices(txn, event, event["requestId"]))
-    |> Map.put("related_actions", related_actions(txn, event["org"], row["assignmentId"]))
+    |> Map.put("related_actions", related_actions(txn, event["org"], event["requestId"]))
   end
 
-  def current(txn, %{"kind" => "turn", "after" => row}, recorded) do
-    users =
-      rows(txn, "SELECT userId,isAdmin,createdAt FROM users", ~w(userId isAdmin createdAt))
-      |> Enum.map(
-        &Map.put(&1, "personalSessionKey", Tightbeam.Org.personal_session_key(&1["userId"]))
-      )
-
+  def current(txn, %{"kind" => "turn", "after" => row} = event, recorded) do
     {assignment, turns} = turn_relations(txn, row)
 
     recorded
+    |> addressed(txn, [event, assignment])
     |> Map.put("assignment", assignment)
-    |> Map.put(
-      "sessions",
-      rows(
-        txn,
-        "SELECT sessionKey,ownerUserId,state,identityRevision FROM sessions",
-        ~w(sessionKey ownerUserId state identityRevision)
-      )
-    )
-    |> Map.put(
-      "turns",
-      turns
-    )
-    |> Map.put("users", users)
+    |> Map.put("turns", turns)
   end
 
   def current(_txn, _event, recorded), do: recorded
@@ -329,7 +296,7 @@ defmodule Tightbeam.RowReactions.Snapshot do
     prior =
       Txn.q(
         txn,
-        "SELECT event FROM row_reaction_events WHERE org=?1 AND json_extract(event,'$.kind')='decision_request' AND json_extract(event,'$.after.id')=?2",
+        "SELECT event FROM row_reaction_events WHERE org=?1 AND COALESCE(json_extract(event,'$.requestId'),CASE WHEN json_extract(event,'$.kind')='decision_request' THEN json_extract(event,'$.after.id') END)=?2 AND json_extract(event,'$.kind')='decision_request' ",
         [event["org"], request_id]
       )
 
@@ -372,23 +339,53 @@ defmodule Tightbeam.RowReactions.Snapshot do
 
   defp related_actions(_txn, _org, nil), do: []
 
-  defp related_actions(txn, org, assignment_id) do
+  # Correlate only this request. Never embed another event's snapshot: it may
+  # itself refer to earlier actions. The event key preserves durable provenance.
+  defp related_actions(txn, org, request_id) do
     rows(
       txn,
       """
-      SELECT a.id,a.family,a.slot,a.status,a.result,a.plan,e.event,e.facts
-      FROM row_reaction_actions a JOIN row_reaction_events e ON e.org=a.org AND e.eventId=a.eventId
-      WHERE a.org=?1 AND json_extract(e.facts,'$.assignment.id')=?2
+      SELECT a.id,a.family,a.slot,a.status,a.result,a.plan,e.eventId,
+             json_extract(e.event,'$.kind')
+      FROM row_reaction_events e JOIN row_reaction_actions a ON e.org=a.org AND e.eventId=a.eventId
+      WHERE e.org=?1 AND COALESCE(json_extract(e.event,'$.requestId'),
+        CASE WHEN json_extract(e.event,'$.kind')='decision_request' THEN json_extract(e.event,'$.after.id') END)=?2
+      ORDER BY e.admittedAt,e.eventId,a.id
       """,
-      ~w(id family slot status result plan event facts),
-      [org, assignment_id]
+      ~w(id family slot status result plan eventId eventKind),
+      [org, request_id]
     )
     |> Enum.map(fn row ->
-      Enum.reduce(
-        ~w(result plan event facts),
-        row,
-        &Map.update!(&2, &1, fn value -> decode(value) end)
-      )
+      row
+      |> Map.update!("result", &decode/1)
+      |> Map.update!("plan", &decode/1)
+      |> Map.put("event", %{"id" => row["eventId"], "kind" => row["eventKind"]})
+      |> Map.put("facts", %{"decision_request" => %{"id" => request_id}})
+      |> Map.put("source_ref", %{"org" => org, "event_id" => row["eventId"]})
+    end)
+  end
+
+  defp first_receipt(_txn, _assignment, nil), do: []
+
+  defp first_receipt(txn, assignment_id, request) do
+    rows(txn,
+      "SELECT #{Enum.join(@attest_keys, ",")} FROM attests WHERE assignmentId=?1 AND kind='verdict' AND verdictKind=?2 ORDER BY ts,id LIMIT 1",
+      @attest_keys, [assignment_id, "ruling-consumed:" <> request["id"]])
+  end
+
+  defp receipts(txn, recipient, sources) do
+    keys = ~w(id assignmentId kind bySession byUser ts note)
+
+    sources
+    |> Enum.map(&Map.take(&1, ~w(assignmentId sourceKind sourceToken)))
+    |> Enum.uniq()
+    |> Enum.flat_map(fn source ->
+      prefix = "completion-handoff-action #{source["assignmentId"]} #{source["sourceKind"]} #{source["sourceToken"]}"
+      # An indexed exact-prefix range avoids fetching unrelated attest notes.
+      # Parsing still checks the complete existing convention, including detail.
+      rows(txn, "SELECT #{Enum.join(keys, ",")} FROM attests WHERE bySession=?1 AND kind='progress' AND note>=?2 AND note<?3 ORDER BY ts,id",
+        keys, [recipient, prefix <> " ", prefix <> "!"])
+      |> Enum.map(&Map.put(&1, "disposition", disposition(&1["note"])))
     end)
   end
 
@@ -457,20 +454,29 @@ defmodule Tightbeam.RowReactions.Snapshot do
     one(txn, "SELECT #{Enum.join(keys, ",")} FROM assignments WHERE id=?1", keys, [id])
   end
 
-  defp sessions(txn),
-    do:
-      rows(
-        txn,
-        "SELECT sessionKey,ownerUserId,state,identityRevision FROM sessions",
-        ~w(sessionKey ownerUserId state identityRevision)
-      )
-
-  defp users(txn) do
-    rows(txn, "SELECT userId,isAdmin,createdAt FROM users", ~w(userId isAdmin createdAt))
-    |> Enum.map(
-      &Map.put(&1, "personalSessionKey", Tightbeam.Org.personal_session_key(&1["userId"]))
-    )
+  # Read the addressed neighborhood, plus literal addresses in the elected
+  # declarations (so changing a rail's recipient remains dynamic). This depends
+  # on the current source and election size, never the session population.
+  defp addressed(recorded, txn, relations) do
+    addresses = strings([relations, Tightbeam.Rules.reactions()]) |> Enum.uniq()
+    sessions = session_rows(txn, addresses)
+    owner_ids = Enum.map(sessions, & &1["ownerUserId"])
+    original_owners = Enum.map(Map.get(recorded, "sessions", []), & &1["ownerUserId"])
+    users = rows(txn, "SELECT userId,isAdmin,createdAt FROM users WHERE userId IN (SELECT value FROM json_each(?1))",
+      ~w(userId isAdmin createdAt), [JSON.encode!(Enum.uniq(addresses ++ owner_ids ++ original_owners))])
+      |> Enum.map(&Map.put(&1, "personalSessionKey", Tightbeam.Org.personal_session_key(&1["userId"])))
+    sessions = (sessions ++ session_rows(txn, Enum.map(users, & &1["personalSessionKey"]))) |> Enum.uniq_by(& &1["sessionKey"])
+    recorded |> Map.put("sessions", sessions) |> Map.put("users", users)
   end
+
+  defp session_rows(txn, addresses), do: rows(txn,
+    "SELECT sessionKey,ownerUserId,state,identityRevision FROM sessions WHERE sessionKey IN (SELECT value FROM json_each(?1))",
+    ~w(sessionKey ownerUserId state identityRevision), [JSON.encode!(addresses)])
+
+  defp strings(value) when is_binary(value), do: [value]
+  defp strings(value) when is_list(value), do: Enum.flat_map(value, &strings/1)
+  defp strings(value) when is_map(value), do: value |> Map.values() |> Enum.flat_map(&strings/1)
+  defp strings(_), do: []
 
   defp one(txn, sql, keys, params), do: List.first(rows(txn, sql, keys, params))
 
@@ -486,22 +492,15 @@ defmodule Tightbeam.RowReactions.Snapshot do
     turns =
       rows(
         txn,
-        "SELECT seq,sessionKey,assignmentId,jobRef,status,startedAt FROM turns WHERE assignmentId=?1",
+        "SELECT seq,sessionKey,assignmentId,jobRef,status,startedAt FROM turns WHERE assignmentId=?1 AND sessionKey=?2 AND startedAt IS NOT NULL ORDER BY startedAt,seq LIMIT 1",
         ~w(seq sessionKey assignmentId workItemId status startedAt),
-        [id]
+        [id, assignment && assignment["holderKey"]]
       )
 
     {assignment, turns}
   end
 
-  defp turn_relations(txn, _row) do
-    {nil,
-     rows(
-       txn,
-       "SELECT sessionKey,MAX(startedAt) AS startedAt FROM turns GROUP BY sessionKey",
-       ~w(sessionKey startedAt)
-     )}
-  end
+  defp turn_relations(_txn, _row), do: {nil, []}
 
   defp rows(txn, sql, keys, params \\ []),
     do: Enum.map(Txn.q(txn, sql, params), &Map.new(Enum.zip(keys, &1)))

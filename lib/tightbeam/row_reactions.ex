@@ -64,8 +64,9 @@ defmodule Tightbeam.RowReactions do
 
     for [org, event_id, event_json, facts_json] <-
           Txn.q(txn, """
-          SELECT e.org,e.eventId,e.event,e.facts FROM row_reaction_events e
-          WHERE EXISTS (SELECT 1 FROM row_reaction_actions a WHERE a.org=e.org AND a.eventId=e.eventId AND a.status='pending')
+          SELECT e.org,e.eventId,e.event,e.facts FROM
+            (SELECT DISTINCT org,eventId FROM row_reaction_actions WHERE status='pending') p
+          JOIN row_reaction_events e ON e.org=p.org AND e.eventId=p.eventId
           ORDER BY e.admittedAt,e.eventId
           """) do
       :ok = Txn.exec(txn, "SAVEPOINT reaction_pending_recovery")
