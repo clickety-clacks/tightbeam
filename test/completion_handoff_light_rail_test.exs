@@ -234,7 +234,74 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     assert reminders(ctx.db, root.wake_id) == []
   end
 
-  test "a pending reminder is truthfully canceled if the parent's last open assignment closes",
+  test "a pending reminder remains until the recipient closes their last open assignment",
+       ctx do
+    {parent_assignment, _child_assignment, root} =
+      completed_child(ctx, parent_opener: "other-parent")
+
+    additional_item = create_work_item(ctx, "additional parent work")
+
+    additional_assignment =
+      handle(
+        ctx,
+        "assign",
+        assign_call(
+          {:session, "other-parent"},
+          "notice-parent",
+          "additional parent work",
+          additional_item.id,
+          effect_kind: "coordination"
+        )
+      )
+
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    [pending] = pending_reminders(ctx.db, root.wake_id)
+
+    assert %{assignment: %{state: "closed"}, attest: %{kind: "completion"}} =
+             handle(
+               ctx,
+               "attest",
+               attest_call({:session, "notice-parent"}, parent_assignment.id, "completion")
+             )
+
+    assert Wakes.get(ctx.db, pending.wake_id).state == "pending"
+    assert pending_reminders(ctx.db, root.wake_id) == [pending]
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM wake_cancellations WHERE wakeId=?1",
+               [pending.wake_id]
+             )
+
+    assert %{assignment: %{state: "closed"}, attest: %{kind: "completion"}} =
+             handle(
+               ctx,
+               "attest",
+               attest_call(
+                 {:session, "notice-parent"},
+                 additional_assignment.id,
+                 "completion"
+               )
+             )
+
+    assert Wakes.get(ctx.db, pending.wake_id).state == "canceled"
+    assert turn_count(ctx.db, pending.wake_id) == 0
+    assert pending_reminders(ctx.db, root.wake_id) == []
+
+    assert {:ok,
+            [["obligation_disposed", "assignment_transition", assignment_id, "disposition",
+              "assignment_transition", disposition_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT reasonKind,causalSourceKind,causalSourceId,outcomeKind,dispositionKind,dispositionId FROM wake_cancellations WHERE wakeId=?1",
+               [pending.wake_id]
+             )
+
+    assert assignment_id == additional_assignment.id
+    assert disposition_id == additional_assignment.id
+  end
+
+  test "a pending reminder is canceled in the transaction that closes the parent's only open assignment",
        ctx do
     {parent_assignment, _child_assignment, root} =
       completed_child(ctx, parent_opener: "other-parent")
@@ -249,26 +316,21 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
                attest_call({:session, "notice-parent"}, parent_assignment.id, "completion")
              )
 
-    set_due_now(ctx.db, pending.wake_id)
-    assert :ok = Wakes.fire_due(ctx.scheduler)
-
-    assert Wakes.get(ctx.db, pending.wake_id).state == "canceled",
-           inspect(
-             {root, pending, reminders(ctx.db, root.wake_id),
-              NoticeBatcher.source_refs(ctx.db, root.wake_id)}
-           )
-
+    assert Wakes.get(ctx.db, pending.wake_id).state == "canceled"
     assert turn_count(ctx.db, pending.wake_id) == 0
     assert pending_reminders(ctx.db, root.wake_id) == []
 
-    assert {:ok, [["target_unresolvable", "scheduler_delivery", wake_id, "no_replacement"]]} =
+    assert {:ok,
+            [["obligation_disposed", "assignment_transition", assignment_id, "disposition",
+              "assignment_transition", disposition_id]]} =
              DB.query(
                ctx.db,
-               "SELECT reasonKind,causalSourceKind,causalSourceId,outcomeKind FROM wake_cancellations WHERE wakeId=?1",
+               "SELECT reasonKind,causalSourceKind,causalSourceId,outcomeKind,dispositionKind,dispositionId FROM wake_cancellations WHERE wakeId=?1",
                [pending.wake_id]
              )
 
-    assert wake_id == pending.wake_id
+    assert assignment_id == parent_assignment.id
+    assert disposition_id == parent_assignment.id
   end
 
   test "a delivered reminder does not rearm after the parent loses its last open assignment",
@@ -294,9 +356,6 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
                "attest",
                attest_call({:session, "notice-parent"}, parent_assignment.id, "completion")
              )
-
-    set_due_now(ctx.db, successor.wake_id)
-    assert :ok = Wakes.fire_due(ctx.scheduler)
 
     assert Wakes.get(ctx.db, successor.wake_id).state == "canceled"
     assert turn_count(ctx.db, successor.wake_id) == 0

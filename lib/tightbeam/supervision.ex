@@ -82,6 +82,8 @@ defmodule Tightbeam.Supervision do
   @doc false
   def assignment_closed_in_txn(%Txn{} = txn, assignment_id)
       when is_binary(assignment_id) do
+    :ok = Wakes.assignment_closed_in_txn(txn, assignment_id)
+
     isolated_side_task(txn, assignment_id, "close", fn ->
       cancel_assignment_sources_in_txn(txn, assignment_id, :disposed)
       :ok

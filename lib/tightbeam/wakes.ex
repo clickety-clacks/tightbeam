@@ -1020,6 +1020,46 @@ defmodule Tightbeam.Wakes do
 
   def record_terminal_handoff_action_in_txn(%Txn{}, _holder, _attest), do: :ok
 
+  @doc false
+  # A terminal-action reminder is conditioned on its recipient still holding
+  # an open assignment. Retract it in the assignment's closing transaction
+  # when that was the recipient's last open assignment; delivered history stays
+  # intact, and the transaction may still roll back both changes together.
+  def assignment_closed_in_txn(%Txn{} = txn, assignment_id) when is_binary(assignment_id) do
+    case Txn.q(txn, "SELECT holderKey,state FROM assignments WHERE id=?1", [assignment_id]) do
+      [[holder, "closed"]] when is_binary(holder) ->
+        if not terminal_action_destination_available_in_txn?(txn, holder) do
+          txn
+          |> pending_terminal_action_reminders_for(holder)
+          |> Enum.each(fn wake ->
+            command = %{
+              wake_id: wake.wake_id,
+              requester: %{kind: "process", id: "tightbeam:assignments"},
+              reason_kind: "obligation_disposed",
+              causal_source: %{kind: "assignment_transition", id: assignment_id},
+              outcome: %{
+                kind: "disposition",
+                disposition_kind: "assignment_transition",
+                disposition_id: assignment_id
+              }
+            }
+
+            unless cancel_in_txn(txn, command) do
+              raise DB.Error,
+                message: "terminal-action reminder cancellation refused for #{wake.wake_id}"
+            end
+          end)
+        end
+
+        :ok
+
+      _ ->
+        :ok
+    end
+  end
+
+  def assignment_closed_in_txn(%Txn{}, _assignment_id), do: :ok
+
   defp schedule_terminal_action_reminder_in_txn(
          txn,
          root,
