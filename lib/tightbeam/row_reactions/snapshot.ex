@@ -436,9 +436,8 @@ defmodule Tightbeam.RowReactions.Snapshot do
         """
         SELECT DISTINCT e.event FROM row_reaction_actions a
         JOIN row_reaction_events e ON e.org=a.org AND e.eventId=a.eventId
-        WHERE (json_extract(a.result,'$.wake_id')=?1
-          OR json_extract(a.result,'$.wake_id') IN
-            (SELECT rootWakeId FROM wake_retry_attempts WHERE wakeId=?1))
+        WHERE json_extract(a.result,'$.wake_id') IN
+          (SELECT ?1 UNION SELECT rootWakeId FROM wake_retry_attempts WHERE wakeId=?1)
           AND json_extract(e.event,'$.kind')='assignment'
         """,
         [wake["wakeId"]]
