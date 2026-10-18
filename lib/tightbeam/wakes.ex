@@ -5403,29 +5403,36 @@ defmodule Tightbeam.Wakes do
   def delivery_projection_in_txn(%Txn{} = txn, wake_id) when is_binary(wake_id) do
     # One fixed selection for both absent and hidden wakes: a second lookup
     # conditional on finding the wake would disclose its existence in the trace.
-    carrier_columns =
-      ", (SELECT status FROM turns WHERE turns.wakeId=wakes.wakeId)" <>
-        ", (SELECT createdAt FROM turns WHERE turns.wakeId=wakes.wakeId)" <>
-        ", (SELECT startedAt FROM turns WHERE turns.wakeId=wakes.wakeId)" <>
-        ", (SELECT endedAt FROM turns WHERE turns.wakeId=wakes.wakeId)"
+    carrier_columns = delivery_projection_columns()
 
     case Txn.q(txn, select_wake_sql(carrier_columns) <> " WHERE wakeId=?1", [wake_id]) do
       [] ->
         nil
 
       [row] ->
-        {wake_columns, [status, created_at, started_at, ended_at]} = Enum.split(row, -4)
-        wake = to_wake(wake_columns)
-
-        # Keep the existing maximum-durable-timestamp version convention, now
-        # including the row from which this additive projection is derived.
-        version =
-          [wake.created_at, wake.fired_at, wake.canceled_at, created_at, started_at, ended_at]
-          |> Enum.filter(&is_integer/1)
-          |> Enum.max()
-
-        wake |> Map.put(:delivery_status, status) |> Map.put(:row_version, version)
+        wake_with_delivery_projection(row)
     end
+  end
+
+  defp delivery_projection_columns do
+    ", (SELECT status FROM turns WHERE turns.wakeId=wakes.wakeId)" <>
+      ", (SELECT createdAt FROM turns WHERE turns.wakeId=wakes.wakeId)" <>
+      ", (SELECT startedAt FROM turns WHERE turns.wakeId=wakes.wakeId)" <>
+      ", (SELECT endedAt FROM turns WHERE turns.wakeId=wakes.wakeId)"
+  end
+
+  defp wake_with_delivery_projection(row) do
+    {wake_columns, [status, created_at, started_at, ended_at]} = Enum.split(row, -4)
+    wake = to_wake(wake_columns)
+
+    # Keep the existing maximum-durable-timestamp version convention, now
+    # including the row from which this additive projection is derived.
+    version =
+      [wake.created_at, wake.fired_at, wake.canceled_at, created_at, started_at, ended_at]
+      |> Enum.filter(&is_integer/1)
+      |> Enum.max()
+
+    wake |> Map.put(:delivery_status, status) |> Map.put(:row_version, version)
   end
 
   @doc "Record a failed carrier's outcome in its sender's existing transcript, without a turn."
@@ -5605,7 +5612,7 @@ defmodule Tightbeam.Wakes do
 
   @doc "Return one bounded page of wakes targeting a session in stable creation order."
   def list_for_session_page(db, session_key, boundary, limit) do
-    select_from = select_wake_sql()
+    select_from = select_wake_sql(delivery_projection_columns())
 
     case DB.transaction(db, fn txn ->
            query = fn sql, params -> Txn.q(txn, sql, params) end
@@ -5622,7 +5629,8 @@ defmodule Tightbeam.Wakes do
              fn row -> [Enum.at(row, 8), hd(row)] end
            )
          end) do
-      {:ok, page} -> %{rows: Enum.map(page.rows, &to_wake/1), flags: page}
+      {:ok, page} ->
+        %{rows: Enum.map(page.rows, &wake_with_delivery_projection/1), flags: page}
       {:error, error} -> raise error
     end
   end
