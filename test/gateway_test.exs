@@ -3267,7 +3267,8 @@ defmodule Tightbeam.GatewayTest do
              )
   end
 
-  test "public sender cancel rolls its accepted event and carrier back with the wake transition", ctx do
+  test "public sender cancel rolls its accepted event and carrier back with the wake transition",
+       ctx do
     wake =
       Wakes.schedule(ctx.db, %{
         session_key: "k1",
