@@ -1537,20 +1537,20 @@ defmodule Tightbeam.CliIntegrationTest do
                stderr_to_stdout: true
              )
 
-    # Consume this exact notice turn before the next card's notice is eligible;
-    # filing an attest does not finish a recipient turn.
-    assert :ok = Wakes.fire_due(Tightbeam.WakeScheduler)
-
-    assert {:ok, [[topology_notice_id]]} =
+    # Ordinary verdicts remain evidence; they do not automatically notify the opener.
+    assert {:ok, [["topology-decided"]]} =
              DB.query(
                ctx.db,
-               "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND sessionKey='cli-holder' AND prompt LIKE 'Attest %'",
+               "SELECT verdictKind FROM attests WHERE assignmentId=?1 AND kind='verdict'",
                [topology_id]
              )
 
-    topology_delivery = assert_cli_source_delivery!(ctx.db, topology_notice_id, "cli-holder")
-    assert topology_delivery.source.prompt =~ topology_id
-    finish_cli_delivery!(ctx.db, "cli-holder", topology_delivery.seq)
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND sessionKey='cli-holder'",
+               [topology_id]
+             )
 
     # The posture gate refuses a coder card on an unpostured work item, so the
     # slice is ruled first, through the same real CLI.
@@ -1573,17 +1573,19 @@ defmodule Tightbeam.CliIntegrationTest do
         stderr_to_stdout: true
       )
 
-    # The posture verdict can now deliver before later CLI calls. Consume its
-    # carrier so the holder is ready for the implementation receipt notice.
-    assert {:ok, [[posture_notice_id]]} =
+    assert {:ok, [["posture-light"], ["topology-decided"]]} =
              DB.query(
                ctx.db,
-               "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND sessionKey='cli-holder' AND prompt LIKE 'Attest %' AND wakeId<>?2",
-               [topology_id, topology_notice_id]
+               "SELECT verdictKind FROM attests WHERE assignmentId=?1 AND kind='verdict' ORDER BY verdictKind",
+               [topology_id]
              )
 
-    posture_delivery = assert_cli_source_delivery!(ctx.db, posture_notice_id, "cli-holder")
-    finish_cli_delivery!(ctx.db, "cli-holder", posture_delivery.seq)
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND sessionKey='cli-holder'",
+               [topology_id]
+             )
 
     {assigned, 0} =
       System.cmd(
@@ -1721,16 +1723,19 @@ defmodule Tightbeam.CliIntegrationTest do
     assert verification_wake.prompt =~ "no verification verdict is filed"
     assert verification_wake.prompt =~ work_id
 
-    assert {:ok, [[receipt_notice_id]]} =
+    assert {:ok, [["tests-passed"]]} =
              DB.query(
                ctx.db,
-               "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND sessionKey='cli-holder' AND prompt LIKE 'Attest %'",
+               "SELECT verdictKind FROM attests WHERE assignmentId=?1 AND kind='verdict'",
                [work_id]
              )
 
-    receipt_delivery = assert_cli_source_delivery!(ctx.db, receipt_notice_id, "cli-holder")
-    assert receipt_delivery.source.prompt =~ "Attest "
-    finish_cli_delivery!(ctx.db, "cli-holder", receipt_delivery.seq)
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND sessionKey='cli-holder'",
+               [work_id]
+             )
 
     {_verified, 0} =
       System.cmd(
@@ -1761,16 +1766,32 @@ defmodule Tightbeam.CliIntegrationTest do
     assert denied_again_status != 0
     assert denied_again =~ "completion-requires-results-artifact"
 
-    assert {:ok, [[verified_notice_id]]} =
+    assert {:ok, [["tests-passed"], ["verified"]]} =
              DB.query(
                ctx.db,
-               "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND sessionKey='cli-holder' AND prompt LIKE 'Attest %' AND wakeId<>?2",
-               [work_id, receipt_notice_id]
+               "SELECT verdictKind FROM attests WHERE assignmentId=?1 AND kind='verdict' ORDER BY verdictKind",
+               [work_id]
              )
 
-    attest_delivery = assert_cli_source_delivery!(ctx.db, verified_notice_id, "cli-holder")
-    attest_batch = Wakes.get(ctx.db, attest_delivery.carrier_id)
-    assert attest_batch.prompt =~ "Attest "
+    # Completing the earlier delivery started the holder's first real turn, so
+    # its elected lifecycle notice may now exist. The verdict emits none.
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE assignmentId=?1 AND sessionKey='cli-holder' AND prompt LIKE 'Attest %'",
+               [work_id]
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT COUNT(*) FROM row_reaction_actions a JOIN row_reaction_events e ON e.org=a.org AND e.eventId=a.eventId
+               WHERE json_extract(e.event,'$.kind')='attest' AND json_extract(e.event,'$.after.assignmentId')=?1
+                 AND json_extract(e.event,'$.after.verdictKind')='verified'
+               """,
+               [work_id]
+             )
 
     assert %{status: "live", producer_key: artifact_source_id} =
              RailRemedy.episode(ctx.db, "completion-requires-results-artifact", work_id)

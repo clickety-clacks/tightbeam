@@ -53,7 +53,7 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
     start_supervised!({LaneDoorbell, self()})
     handlers = Gateway.handlers(%{db: db, wake_tick_ms: 60_000})
-    Rules.load!(System.tmp_dir!(), Map.keys(handlers))
+    rail_base = Tightbeam.RowReactionFixtures.elect_handoff(Map.keys(handlers))
 
     start_supervised!(
       Supervisor.child_spec(
@@ -62,7 +62,7 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
       )
     )
 
-    %{db: db, scheduler: scheduler, handlers: handlers}
+    %{db: db, scheduler: scheduler, handlers: handlers, rail_base: rail_base}
   end
 
   test "a delivered finish notice starts successive fallback reminders and survives restart",
@@ -83,8 +83,8 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     finish_carrier_turn!(ctx.db, root_carrier_id)
 
     [first] = pending_reminders(ctx.db, root.wake_id)
-    assert String.starts_with?(first.condition_kind, "terminal-child-owner-action-")
-    assert first.condition_scope == root.wake_id
+    assert first.condition_kind == nil
+    assert first.obligation_ref == "terminal-child-owner-action-reminder:" <> root.wake_id
     assert first.owner_user_id == "flynn"
     assert first.session_key == "notice-parent"
     assert first.assignment_id == nil
@@ -96,13 +96,13 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     assert {:ok, {:ok, replay}} =
              DB.transaction(
                ctx.db,
-               &Wakes.admit_terminal_notification_in_txn(&1, child_assignment.id)
+               &Tightbeam.RowReactionFixtures.replay_terminal_in_txn(&1, child_assignment.id)
              )
 
     assert replay.wake_id == root.wake_id
     assert [^first] = pending_reminders(ctx.db, root.wake_id)
 
-    set_due_now(ctx.db, first.wake_id)
+    set_due_now(ctx, first.wake_id)
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert Wakes.get(ctx.db, first.wake_id).state == "fired"
     first_carrier_id = assert_delivered_carrier(ctx.db, first.wake_id)
@@ -118,7 +118,7 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     assert :ok = Wakes.fire_due(restarted)
     assert Wakes.get(ctx.db, second.wake_id).state == "pending"
 
-    set_due_now(ctx.db, second.wake_id)
+    set_due_now(ctx, second.wake_id)
     assert :ok = Wakes.fire_due(restarted)
     assert Wakes.get(ctx.db, second.wake_id).state == "fired"
     assert assert_delivered_carrier(ctx.db, first.wake_id) == first_carrier_id
@@ -207,7 +207,7 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     assert {:ok, {:ok, replay}} =
              DB.transaction(
                ctx.db,
-               &Wakes.admit_terminal_notification_in_txn(&1, child_assignment.id)
+               &Tightbeam.RowReactionFixtures.replay_terminal_in_txn(&1, child_assignment.id)
              )
 
     assert replay.wake_id == root.wake_id
@@ -230,7 +230,7 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
                attest_call({:session, "notice-parent"}, parent_assignment.id, "completion")
              )
 
-    set_due_now(ctx.db, pending.wake_id)
+    set_due_now(ctx, pending.wake_id)
     assert :ok = Wakes.fire_due(ctx.scheduler)
 
     assert Wakes.get(ctx.db, pending.wake_id).state == "canceled",
@@ -261,7 +261,7 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     root_carrier_id = hd(NoticeBatcher.source_refs(ctx.db, root.wake_id)).delivery_wake_id
     finish_carrier_turn!(ctx.db, root_carrier_id)
     [first] = pending_reminders(ctx.db, root.wake_id)
-    set_due_now(ctx.db, first.wake_id)
+    set_due_now(ctx, first.wake_id)
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert Wakes.get(ctx.db, first.wake_id).state == "fired"
     assert_delivered_carrier(ctx.db, first.wake_id)
@@ -276,7 +276,7 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
                attest_call({:session, "notice-parent"}, parent_assignment.id, "completion")
              )
 
-    set_due_now(ctx.db, successor.wake_id)
+    set_due_now(ctx, successor.wake_id)
     assert :ok = Wakes.fire_due(ctx.scheduler)
 
     assert Wakes.get(ctx.db, successor.wake_id).state == "canceled"
@@ -309,10 +309,8 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
                attest_call({:session, "notice-parent"}, parent_assignment.id, "completion")
              )
 
-    assert {:ok, :ok} =
-             DB.transaction(ctx.db, fn txn ->
-               Wakes.terminal_notice_delivered_in_txn(txn, root.wake_id, "notice-parent")
-             end)
+    assert :ok = Tightbeam.RowReactions.recover(ctx.db)
+    assert :ok = Wakes.fire_due(ctx.scheduler)
 
     assert pending_reminders(ctx.db, root.wake_id) == []
 
@@ -383,7 +381,7 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     {parent_assignment, child_assignment, root} = completed_child(ctx)
     assert :ok = Wakes.fire_due(ctx.scheduler)
     [first] = pending_reminders(ctx.db, root.wake_id)
-    set_due_now(ctx.db, first.wake_id)
+    set_due_now(ctx, first.wake_id)
     assert :ok = Wakes.fire_due(ctx.scheduler)
     [pending] = pending_reminders(ctx.db, root.wake_id)
 
@@ -469,7 +467,7 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     root_carrier_id = hd(NoticeBatcher.source_refs(ctx.db, root.wake_id)).delivery_wake_id
     finish_carrier_turn!(ctx.db, root_carrier_id)
     [pending] = pending_reminders(ctx.db, root.wake_id)
-    set_due_now(ctx.db, pending.wake_id)
+    set_due_now(ctx, pending.wake_id)
 
     action = action_note(child_assignment.id, root, "kept", "kept the child for the next handoff")
 
@@ -493,7 +491,7 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     root_carrier_id = hd(NoticeBatcher.source_refs(ctx.db, root.wake_id)).delivery_wake_id
     finish_carrier_turn!(ctx.db, root_carrier_id)
     [pending] = pending_reminders(ctx.db, root.wake_id)
-    set_due_now(ctx.db, pending.wake_id)
+    set_due_now(ctx, pending.wake_id)
     assert :ok = Wakes.fire_due(ctx.scheduler)
     [successor] = pending_reminders(ctx.db, root.wake_id)
     assert_delivered_carrier(ctx.db, pending.wake_id)
@@ -606,8 +604,31 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     Enum.map(rows, fn [wake_id] -> Wakes.get(db, wake_id) end)
   end
 
-  defp set_due_now(db, wake_id) do
-    {:ok, _} = DB.query(db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [wake_id])
+  defp set_due_now(ctx, wake_id) do
+    # Exercise a changed elected deadline rather than overriding the output
+    # row that pending reconciliation correctly restores from its rail.
+    path = Path.join(ctx.rail_base, "identity/rules/row-reaction-terminal-action.toml")
+
+    assert {:ok, [[event_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT eventId FROM row_reaction_actions WHERE json_extract(result,'$.wake_id')=?1",
+               [wake_id]
+             )
+
+    delay =
+      ~s|{ op = "if", args = [{ op = "eq", args = [{ ref = "event.id" }, #{JSON.encode!(event_id)}] }, 0, 7200000] }|
+
+    bytes = File.read!("priv/kungfu/agentic-engineering/rules/row-reaction-terminal-action.toml")
+    File.write!(path, String.replace(bytes, "7200000", delay))
+    Rules.load!(ctx.rail_base, Map.keys(ctx.handlers))
+    :ok = Tightbeam.RowReactions.recover(ctx.db)
+
+    case Wakes.get(ctx.db, wake_id) do
+      %{state: "pending", due_at: due_at} -> assert due_at <= System.system_time(:millisecond)
+      %{state: "canceled"} -> :ok
+    end
+
     :ok
   end
 
