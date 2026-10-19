@@ -52,11 +52,12 @@ defmodule Tightbeam.HarnessProcessTest do
 
     args = File.read!(capture) |> String.split("\n", trim: true)
     group_command = Enum.drop_while(args, &(&1 != "harness-group"))
+    identity_path = row.identity_path
 
     assert [
              "harness-group",
              "4242",
-             row.identity_path,
+             ^identity_path,
              "satellite-boot",
              "satellite-launch",
              "tightbeam-harness-identity-v2"
