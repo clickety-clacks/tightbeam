@@ -700,9 +700,10 @@ defmodule Tightbeam.Supervision do
          interval_ms,
          due_at
        ) do
+    # The pending set is bounded by live work; an assignment's history is not.
     Txn.q(
       txn,
-      "SELECT wakeId,prompt,sessionKey,work_item_id,dueAt FROM wakes WHERE assignmentId=?1 AND consumer=?2 AND state='pending' ORDER BY createdAt DESC,wakeId DESC LIMIT 1",
+      "SELECT wakeId,prompt,sessionKey,work_item_id,dueAt FROM wakes INDEXED BY wakes_due WHERE state='pending' AND assignmentId=?1 AND consumer=?2 ORDER BY createdAt DESC,wakeId DESC LIMIT 1",
       [assignment_id, @deadline_consumer]
     )
     |> Enum.find_value(fn
@@ -910,11 +911,14 @@ defmodule Tightbeam.Supervision do
     end
   end
 
+  # The latest stored deadline is the latest inserted one. Walking the
+  # assignment index newest first stops at it instead of sorting the
+  # assignment's whole history.
   defp latest_deadline_state_in_txn(txn, assignment_id, activity_start) do
     rows =
       Txn.q(
         txn,
-        "SELECT prompt FROM wakes WHERE assignmentId=?1 AND consumer=?2 ORDER BY createdAt DESC,wakeId DESC LIMIT 1",
+        "SELECT prompt FROM wakes WHERE assignmentId=?1 AND consumer=?2 ORDER BY rowid DESC LIMIT 1",
         [assignment_id, @deadline_consumer]
       )
 

@@ -559,7 +559,6 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
         ALTER TABLE effort_checkin_generations DROP COLUMN reliefStartedAt;
         ALTER TABLE effort_checkin_generations DROP COLUMN reliefExcludedMs;
         DROP INDEX wakes_wait_recognition;
-        DROP INDEX IF EXISTS wakes_pending_session_obligation;
         DROP INDEX IF EXISTS wakes_delivered_obligation;
         DROP INDEX condition_facts_owner_match;
         ALTER TABLE condition_facts DROP COLUMN ownerUserId;

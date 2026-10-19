@@ -1153,12 +1153,14 @@ defmodule Tightbeam.Wakes do
 
   defp terminal_action_note_matches?(_, _), do: false
 
+  # Walk the pending set, which live work bounds, rather than the session's
+  # whole wake history.
   defp pending_terminal_action_reminders_for(txn, holder) do
     after_prefix = String.replace_suffix(@terminal_action_marker, ":", ";")
 
     Txn.q(
       txn,
-      "SELECT wakeId FROM wakes WHERE state='pending' AND sessionKey=?1 " <>
+      "SELECT wakeId FROM wakes INDEXED BY wakes_due WHERE state='pending' AND sessionKey=?1 " <>
         "AND obligationRef>=?2 AND obligationRef<?3 ORDER BY rowid",
       [holder, @terminal_action_marker, after_prefix]
     )
@@ -6414,7 +6416,6 @@ defmodule Tightbeam.Wakes do
     Process.send_after(self(), :detect_misses, @miss_detector_ms)
     send(self(), :recover_notices)
     Process.send_after(self(), :backfill_wake_delivery, 100)
-    Process.send_after(self(), :build_supervision_source_index, 100)
 
     {:ok, invalid} =
       DB.query(
@@ -6502,23 +6503,6 @@ defmodule Tightbeam.Wakes do
       :overloaded -> Process.send_after(self(), :backfill_wake_delivery, 5_000)
       :more -> Process.send_after(self(), :backfill_wake_delivery, 100)
       {:error, _error} -> Process.send_after(self(), :backfill_wake_delivery, 5_000)
-      :done -> :ok
-    end
-
-    {:noreply, state}
-  end
-
-  def handle_info(:build_supervision_source_index, state) do
-    result =
-      DB.background_pass(
-        fn -> Tightbeam.Schema.build_supervision_source_index(state.db) end,
-        :overloaded
-      )
-
-    case result do
-      :overloaded -> Process.send_after(self(), :build_supervision_source_index, 5_000)
-      :more -> Process.send_after(self(), :build_supervision_source_index, 100)
-      {:error, _error} -> Process.send_after(self(), :build_supervision_source_index, 60_000)
       :done -> :ok
     end
 

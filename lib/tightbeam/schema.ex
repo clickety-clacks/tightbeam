@@ -1817,13 +1817,6 @@ defmodule Tightbeam.Schema do
     # DDL, later migrations and final marker publication. Runtime handles and
     # SQLite busy_timeout are unaffected.
     db = DB.migration_context(db)
-
-    # The stamp table is the first object every boot creates, so its absence
-    # marks a database that has never booted.
-    {:ok, stamp_table} =
-      DB.query(db, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_stamp'")
-
-    fresh? = stamp_table == []
     :ok = ensure_stamp_table(db)
     :ok = ensure_fresh_owner_link_origin(db)
     :ok = check_shape(db)
@@ -1948,9 +1941,6 @@ defmodule Tightbeam.Schema do
     :ok = migrate_continuation_retry_guard(db)
     :ok = upgrade_decision_request_row_schema_revision(db)
     :ok = ensure_hot_query_indexes(db)
-
-    # An upgraded database builds these after boot, from the wake scheduler.
-    :ok = if fresh?, do: build_supervision_source_indexes_now(db), else: :ok
     :ok = migrate_retired_workspace_cleanup(db)
     :ok = Tightbeam.Ephemeral.migrate(db)
 
@@ -3051,85 +3041,6 @@ defmodule Tightbeam.Schema do
         )
 
         :ok
-    end
-  end
-
-  @supervision_source_indexes [
-    {"wakes_assignment_consumer_created_order",
-     "CREATE INDEX IF NOT EXISTS wakes_assignment_consumer_created_order " <>
-       "ON wakes(assignmentId,consumer,createdAt DESC,wakeId DESC)"},
-    {"wakes_assignment_consumer_pending_created",
-     "CREATE INDEX IF NOT EXISTS wakes_assignment_consumer_pending_created " <>
-       "ON wakes(assignmentId,consumer,createdAt DESC,wakeId DESC) WHERE state='pending'"},
-    {"wakes_pending_session_obligation",
-     "CREATE INDEX IF NOT EXISTS wakes_pending_session_obligation " <>
-       "ON wakes(sessionKey,obligationRef) WHERE state='pending'"}
-  ]
-
-  # Run once and recorded after the gateway serves: each pass builds at most one
-  # missing index in its own transaction, so ordinary work runs between them.
-  # Queries are correct without these indexes, only slower. A failed pass
-  # records nothing and the caller retries it.
-  @doc false
-  @spec build_supervision_source_index(DB.server()) :: :done | :more | {:error, term()}
-  def build_supervision_source_index(db) do
-    case DB.migration_transaction(db, :supervision_source_indexes_v1, [], [], fn txn ->
-           :ok =
-             Txn.exec(txn, """
-             CREATE TABLE IF NOT EXISTS supervision_source_indexes_migration (
-               id INTEGER PRIMARY KEY CHECK(id=0),
-               appliedAt INTEGER NOT NULL CHECK(appliedAt >= 0)
-             )
-             """)
-
-           case Txn.q(txn, "SELECT id,appliedAt FROM supervision_source_indexes_migration") do
-             [] ->
-               missing =
-                 Enum.find(@supervision_source_indexes, fn {name, _sql} ->
-                   Txn.q(txn, "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1", [
-                     name
-                   ]) == []
-                 end)
-
-               case missing do
-                 {_name, sql} ->
-                   :ok = Txn.exec(txn, sql)
-                   :more
-
-                 nil ->
-                   Txn.q(
-                     txn,
-                     "INSERT INTO supervision_source_indexes_migration(id,appliedAt) VALUES(0,?1)",
-                     [System.system_time(:millisecond)]
-                   )
-
-                   :done
-               end
-
-             [[0, applied_at]] when is_integer(applied_at) and applied_at >= 0 ->
-               :done
-
-             rows ->
-               raise ShapeError,
-                 message: "incompatible_supervision_source_indexes_migration: #{inspect(rows)}"
-           end
-         end) do
-      {:ok, result} ->
-        result
-
-      {:error, error} ->
-        Logger.warning("supervision source index build deferred: " <> Exception.message(error))
-
-        {:error, error}
-    end
-  end
-
-  # A fresh database has empty tables, so its first boot builds them at once.
-  defp build_supervision_source_indexes_now(db) do
-    case build_supervision_source_index(db) do
-      :more -> build_supervision_source_indexes_now(db)
-      :done -> :ok
-      {:error, error} -> raise error
     end
   end
 
