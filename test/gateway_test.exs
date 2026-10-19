@@ -3176,16 +3176,33 @@ defmodule Tightbeam.GatewayTest do
         owner_lease: claimed_turn.owner_lease
       )
 
-    Tightbeam.HarnessProcess.prepare_launch(
-      [
-        cmd: ["/bin/true"],
-        stderr_path: Path.join(ctx.catalog_base, "rate-reconcile-race.stderr"),
-        process_identity_dir: ctx.catalog_base,
-        process_helper: Path.expand("../cli/target/release/tightbeam", __DIR__)
-      ],
-      ctx.db,
-      adapter_key
-    )
+    # Reconciliation's cleanup-boundary fence delete runs only for a launch it
+    # must kill itself: a live identified group that settlement proof refuses
+    # (the process is alive) and the group kill then resolves. The bounded
+    # sleep keeps the group alive through the kill and self-terminates if a
+    # failed run leaks it.
+    launch_opts =
+      Tightbeam.HarnessProcess.prepare_launch(
+        [
+          cmd: [System.find_executable("sleep"), "120"],
+          stderr_path: Path.join(ctx.catalog_base, "rate-reconcile-race.stderr"),
+          process_identity_dir: ctx.catalog_base,
+          process_helper: Path.expand("../cli/target/release/tightbeam", __DIR__)
+        ],
+        ctx.db,
+        adapter_key
+      )
+
+    [launcher | launcher_args] = Keyword.fetch!(launch_opts, :cmd)
+
+    _port =
+      Port.open({:spawn_executable, launcher}, [:binary, :exit_status, {:args, launcher_args}])
+
+    :ok =
+      Tightbeam.HarnessProcess.capture_identity(
+        ctx.db,
+        Keyword.fetch!(launch_opts, :harness_process_launch_id)
+      )
 
     prior_wait = Application.get_env(:tightbeam, :harness_process_identity_wait_ms)
     Application.put_env(:tightbeam, :harness_process_identity_wait_ms, 0)
