@@ -4052,10 +4052,12 @@ defmodule Tightbeam.Assignments do
     verification = latest_verification_conclusion_in_txn(txn, assignment.id, assignment.holderKey)
 
     with [_ | _] <- refs,
-         %{kind: "reviewed-clean", holder: review_holder, refs: ^refs} <- review,
+         %{kind: "reviewed-clean", holder: review_holder, refs: review_refs} <- review,
          true <- review_holder != assignment.holderKey,
-         %{kind: "verified", holder: assignment_holder, refs: ^refs} <- verification,
-         true <- assignment_holder == assignment.holderKey do
+         true <- same_commit_ref_identity?(refs, review_refs),
+         %{kind: "verified", holder: assignment_holder, refs: verification_refs} <- verification,
+         true <- assignment_holder == assignment.holderKey,
+         true <- same_commit_ref_identity?(refs, verification_refs) do
       :ok
     else
       _ ->
@@ -4129,6 +4131,16 @@ defmodule Tightbeam.Assignments do
         nil
     end
   end
+
+  defp same_commit_ref_identity?(left, right) when is_list(left) and is_list(right) do
+    commit_identity = fn refs ->
+      refs |> Enum.map(& &1["commit"]) |> Enum.uniq() |> Enum.sort()
+    end
+
+    commit_identity.(left) == commit_identity.(right)
+  end
+
+  defp same_commit_ref_identity?(_left, _right), do: false
 
   defp run_git_cat_file(db, host, path, commit) do
     base_dir =
