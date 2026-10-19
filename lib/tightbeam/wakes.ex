@@ -3439,7 +3439,24 @@ defmodule Tightbeam.Wakes do
           ]
         )
 
-        if Txn.changes(txn) == 1 and is_binary(parent_session_key) do
+        inserted = Txn.changes(txn) == 1
+
+        if not inserted and failure_class == "adapter_unavailable" do
+          # A refused adapter redelivery has the same message ID as its source.
+          # Re-arm that exact row only when this failed turn was its redelivery.
+          Txn.q(
+            txn,
+            """
+            UPDATE health_redelivery_attempts
+            SET restorationTurnSeq=NULL,redeliveryTurnSeq=NULL
+            WHERE sessionKey=?1 AND sourceMessageId=?2 AND redeliveryTurnSeq=?3
+              AND parentSessionKey IS NULL
+            """,
+            [session_key, message_id, source_turn_seq]
+          )
+        end
+
+        if inserted and is_binary(parent_session_key) do
           ask_interrupted_redelivery_parent_in_txn(
             txn,
             parent_session_key,

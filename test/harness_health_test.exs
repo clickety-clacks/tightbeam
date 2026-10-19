@@ -2395,6 +2395,112 @@ defmodule Tightbeam.HarnessHealthTest do
   end
 
   @tag :adapter_unavailable_redelivery
+  test "an adapter refusal of a health redelivery re-arms its prompt", ctx do
+    [failed | _] = ctx.sessions
+    message_id = "refused-health-redelivery"
+    prompt = "continue after the refused redelivery"
+    adapter_unavailable = %{"code" => "adapter_unavailable"}
+    assignment_id = failed.assignment
+
+    first_refusal =
+      fail_health_turn!(
+        ctx.db,
+        failed.session,
+        message_id,
+        prompt,
+        adapter_unavailable,
+        assignment_id: assignment_id
+      )
+
+    first_restoration =
+      restore_health_turn!(ctx.db, failed.session, "restore-before-refused-redelivery")
+    first_source_seq = first_refusal.seq
+
+    assert {:ok, [[^first_source_seq, first_redelivery_seq]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sourceTurnSeq,redeliveryTurnSeq FROM health_redelivery_attempts " <>
+                 "WHERE sessionKey=?1 AND sourceMessageId=?2",
+               [failed.session, message_id]
+             )
+
+    {:ok, claimed_redelivery} =
+      Ledger.claim_next(ctx.db, failed.session, "health-redelivery-test")
+
+    refused_redelivery = Map.put(claimed_redelivery, :session_key, failed.session)
+    assert refused_redelivery.seq == first_redelivery_seq
+    assert refused_redelivery.message_id == message_id
+
+    failed_session = Org.get(ctx.db, failed.session)
+
+    assert {:ok, post_commit} =
+             DB.transaction(ctx.db, fn txn ->
+               assert Ledger.finish_in_txn(
+                        txn,
+                        refused_redelivery.seq,
+                        "failed",
+                        "adapter unavailable",
+                        owner_lease: refused_redelivery.owner_lease
+                      )
+
+               HarnessHealth.observe_turn_failure_in_txn(
+                 txn,
+                 failed_session,
+                 refused_redelivery,
+                 :prompt,
+                 adapter_unavailable
+               )
+             end)
+
+    if is_function(post_commit, 0), do: post_commit.()
+
+    assert {:ok, [[^first_source_seq, nil, nil]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sourceTurnSeq,restorationTurnSeq,redeliveryTurnSeq " <>
+                 "FROM health_redelivery_attempts WHERE sessionKey=?1 AND sourceMessageId=?2",
+               [failed.session, message_id]
+             )
+
+    next_restoration =
+      restore_health_turn!(ctx.db, failed.session, "restore-after-refused-redelivery")
+
+    assert {:ok, [[^first_source_seq, next_restoration_seq, next_redelivery_seq]]} =
+             DB.query(
+               ctx.db,
+               "SELECT a.sourceTurnSeq,a.restorationTurnSeq,a.redeliveryTurnSeq " <>
+                 "FROM health_redelivery_attempts a " <>
+                 "WHERE a.sessionKey=?1 AND a.sourceMessageId=?2",
+               [failed.session, message_id]
+             )
+
+    assert next_restoration_seq == next_restoration.seq
+    assert next_redelivery_seq > next_restoration.seq
+
+    {:ok, claimed_next_redelivery} =
+      Ledger.claim_next(ctx.db, failed.session, "health-redelivery-test")
+
+    next_redelivery = Map.put(claimed_next_redelivery, :session_key, failed.session)
+    assert next_redelivery.seq == next_redelivery_seq
+    assert next_redelivery.message_id == message_id
+    assert next_redelivery.prompt == prompt
+
+    next_session = Org.get(ctx.db, failed.session)
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               assert Ledger.finish_in_txn(txn, next_redelivery.seq, "delivered", nil,
+                        owner_lease: next_redelivery.owner_lease
+                      )
+
+               HarnessHealth.resolve_normal_turn_in_txn(txn, next_session, next_redelivery)
+             end)
+
+    assert {:ok, [["delivered"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [next_redelivery.seq])
+  end
+
+  @tag :adapter_unavailable_redelivery
   test "a fired wake is redelivered on its session's next turn after a route switch", ctx do
     [source, other | _] = ctx.sessions
     message_id = "fired-wake-route-switch"
