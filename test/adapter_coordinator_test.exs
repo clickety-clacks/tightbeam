@@ -500,7 +500,10 @@ defmodule Tightbeam.AdapterCoordinatorTest do
 
     assert :ok = Supervisor.stop(owner, :shutdown, 30_000)
 
-    assert_receive {:cleanup_command, "/usr/bin/sudo", args, _timeout}
+    # Identity capture probes the recorded process group through the same
+    # launcher ("cursor-exec check"), so skip probe commands and assert on the
+    # group cleanup itself.
+    args = receive_cursor_cleanup_group_args()
 
     assert [
              "-n",
@@ -1100,6 +1103,16 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     coordinator
     |> :sys.get_state()
     |> get_in([:adapters, key, :generation])
+  end
+
+  defp receive_cursor_cleanup_group_args do
+    assert_receive {:cleanup_command, "/usr/bin/sudo", args, _timeout}
+
+    if Enum.member?(args, "group") do
+      args
+    else
+      receive_cursor_cleanup_group_args()
+    end
   end
 
   defp wait_until(fun, tries \\ 200) do

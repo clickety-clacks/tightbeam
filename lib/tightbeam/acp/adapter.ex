@@ -464,16 +464,34 @@ defmodule Tightbeam.Acp.Adapter do
         env: Keyword.get(opts, :env, []),
         stderr_path: stderr_path,
         subscriber: self(),
-        connection_generation: Keyword.get(opts, :connection_generation)
+        connection_generation: Keyword.get(opts, :connection_generation),
+        harness_process_launch_id: Keyword.get(opts, :harness_process_launch_id),
+        harness_process_direct_launcher:
+          Keyword.get(opts, :harness_process_direct_launcher, false)
       )
 
     case Keyword.fetch(opts, :harness_process_launch_id) do
       {:ok, launch_id} ->
         db = Keyword.get(opts, :db, Tightbeam.DB)
 
-        case Tightbeam.HarnessProcess.capture_identity(db, launch_id, :infinity) do
-          :ok -> :ok
-          {:error, reason} -> raise "harness process identity unavailable: #{inspect(reason)}"
+        case Tightbeam.HarnessProcess.capture_identity(db, launch_id, 5_000, conn) do
+          :ok ->
+            :ok
+
+          {:error, reason} ->
+            row = Enum.find(Tightbeam.HarnessProcess.list(db), &(&1.launch_id == launch_id))
+            receipt = Conn.launch_exit(conn, 100)
+
+            _ =
+              Tightbeam.HarnessProcess.settle(
+                db,
+                launch_id,
+                row.adapter_key,
+                "adapter-boot",
+                receipt
+              )
+
+            raise "harness process identity unavailable: #{inspect(reason)}"
         end
 
       :error ->

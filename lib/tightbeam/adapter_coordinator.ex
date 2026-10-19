@@ -1085,6 +1085,11 @@ defmodule Tightbeam.AdapterCoordinator do
 
             :already_resolved ->
               :ok
+
+            {:error, reason} ->
+              Logger.error(
+                "adapter launch remains fenced for #{key_name(key)}: #{inspect(reason)}"
+              )
           end
 
           failures = entry.failures + 1

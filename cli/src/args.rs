@@ -577,6 +577,11 @@ pub enum Command {
         identity: Identity,
         session_key: String,
     },
+    HarnessProcessSettle {
+        identity: Identity,
+        launch_id: String,
+        adapter_key: String,
+    },
     HarnessProcesses {
         identity: Identity,
     },
@@ -1030,6 +1035,7 @@ COMMANDS:
       Replace the host's ordered toolchain directories. An empty array restores
       the inherited PATH. The result previews the PATH shape adapters will use.
   harness-process list
+  harness-process settle <launch-id> --adapter-key <key>
       List the durable harness launch ledger, newest launch first.
 
   session-diagnose --session EXACT --as-user USER [--json]
@@ -3494,7 +3500,16 @@ fn parse_harness_process(
         (Some("list"), None, None) => Ok(Command::HarnessProcesses {
             identity: identity(flags)?,
         }),
-        _ => Err("usage: tightbeam harness-process list".to_owned()),
+        (Some("settle"), Some(launch_id), None) => Ok(Command::HarnessProcessSettle {
+            identity: identity(flags)?,
+            launch_id: launch_id.clone(),
+            adapter_key: nonempty(flags, "adapter-key")
+                .ok_or_else(|| "harness-process settle requires --adapter-key".to_owned())?,
+        }),
+        _ => Err(
+            "usage: tightbeam harness-process list | settle <launch-id> --adapter-key <key>"
+                .to_owned(),
+        ),
     }
 }
 

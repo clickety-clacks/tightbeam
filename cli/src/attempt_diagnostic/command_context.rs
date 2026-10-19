@@ -141,6 +141,7 @@ impl CommandContext {
             HostEnvList { .. } => ("cli.host_env_list", DispatchPath),
             HostEnvUnset { .. } => ("cli.host_env_unset", DispatchPath),
             HostToolchainSet { .. } => ("cli.host_toolchain_set", DispatchPath),
+            HarnessProcessSettle { .. } => ("cli.harness_process_settle", DispatchPath),
             HarnessProcesses { .. } => ("cli.harness_processes", DispatchPath),
             UpdateClients { .. } => ("cli.update_clients", DispatchPath),
             Assimilate(_) => ("cli.assimilate", CatalogAndDispatch),
@@ -321,6 +322,11 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | HostEnvList { .. }
         | HarnessProcesses { .. }
         | UpdateClients { .. } => Read,
+
+        // Settlement resolves the launch row, may remove its park fence and
+        // records a lifecycle event. It carries no idempotency key; the
+        // guarded operation itself reports already-settled on a repeat.
+        HarnessProcessSettle { .. } => WriteWithoutIdempotency,
 
         Wake {
             idempotency_key, ..

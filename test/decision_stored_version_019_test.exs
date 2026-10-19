@@ -340,7 +340,7 @@ defmodule Tightbeam.DecisionStoredVersion019Test do
 
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["decision-request-row-schema-v2-019"]]} =
+    assert {:ok, [["launch-preparation-boot-v1-0110"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert {:ok, [[1], [1], [1]]} =
@@ -404,7 +404,7 @@ defmodule Tightbeam.DecisionStoredVersion019Test do
     :ok = DB.execute(db, "DROP TRIGGER reject_decision_revision_stamp")
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["decision-request-row-schema-v2-019"]]} =
+    assert {:ok, [["launch-preparation-boot-v1-0110"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert {:ok, [[1], [1]]} =

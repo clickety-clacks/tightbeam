@@ -204,7 +204,7 @@ defmodule Tightbeam.HarnessProcessTest do
     assert length(transactions) == 1
   end
 
-  test "identity capture accepts an unbounded wait", %{tmp_dir: tmp} do
+  test "identity capture refuses an unbounded wait", %{tmp_dir: tmp} do
     Tightbeam.HarnessProcessFixture.run!(tmp, 8)
   end
 
@@ -242,7 +242,7 @@ defmodule Tightbeam.HarnessProcessTest do
     Tightbeam.HarnessProcessFixture.run!(tmp, 16)
   end
 
-  test "proven-dead settlement resolves the captured missing-identity rows and is inert when repeated",
+  test "owner death leaves missing-identity rows unresolved without termination proof",
        %{tmp_dir: tmp} do
     Tightbeam.HarnessProcessFixture.run!(tmp, 17)
   end
@@ -263,7 +263,7 @@ defmodule Tightbeam.HarnessProcessTest do
     Tightbeam.HarnessProcessFixture.run!(tmp, 20)
   end
 
-  test "a proven-dead cleanup refusal records the failure and starts one successor", %{
+  test "a proven-dead cleanup refusal stays fenced and refuses a successor", %{
     tmp_dir: tmp
   } do
     Tightbeam.HarnessProcessFixture.run!(tmp, 21)
@@ -283,7 +283,7 @@ defmodule Tightbeam.HarnessProcessTest do
     Tightbeam.HarnessProcessFixture.run!(tmp, 24)
   end
 
-  test "a launch that never minted a process is resolved by reconciliation, not fenced", %{
+  test "a launch without identity or observed termination remains fenced", %{
     tmp_dir: tmp
   } do
     Tightbeam.HarnessProcessFixture.run!(tmp, 25)
@@ -301,7 +301,7 @@ defmodule Tightbeam.HarnessProcessTest do
     Tightbeam.HarnessProcessFixture.run!(tmp, 27)
   end
 
-  test "identity capture accepts an unresolved legacy four-field record", %{tmp_dir: tmp} do
+  test "identity capture refuses a legacy four-field record without authority", %{tmp_dir: tmp} do
     Tightbeam.HarnessProcessFixture.run!(tmp, 28)
   end
 
@@ -321,7 +321,7 @@ defmodule Tightbeam.HarnessProcessTest do
     Tightbeam.HarnessProcessFixture.run!(tmp, 31)
   end
 
-  test "an unreadable boot identity keeps the fence and records the helper's answer", %{
+  test "an unreadable preparation boot identity refuses before inserting a launch", %{
     tmp_dir: tmp
   } do
     Tightbeam.HarnessProcessFixture.run!(tmp, 32)

@@ -19,7 +19,7 @@ defmodule Tightbeam.TerminalCredentialCoreFixture do
   def proof!("current-stamped-readonly", db, base) do
     assert {:opened, incident} = open(db, "current-stamped-readonly")
 
-    assert {:ok, [["decision-request-row-schema-v2-019"]]} =
+    assert {:ok, [["launch-preparation-boot-v1-0110"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert [view] = TerminalCredentialFailure.views(db)
@@ -76,7 +76,7 @@ defmodule Tightbeam.TerminalCredentialCoreFixture do
     assert view.canonical_statement == expected
     assert view.redirect_destinations == ["alternate"]
 
-    assert {:ok, [["decision-request-row-schema-v2-019"]]} =
+    assert {:ok, [["launch-preparation-boot-v1-0110"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert [readonly] = TerminalCredentialFailure.readonly_views(base)
