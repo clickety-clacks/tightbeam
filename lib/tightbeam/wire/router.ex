@@ -59,6 +59,7 @@ defmodule Tightbeam.Wire.Router do
     ErrorDiagnostic,
     Org,
     Roles,
+    WorkItems,
     WorkState
   }
 
@@ -767,6 +768,10 @@ defmodule Tightbeam.Wire.Router do
 
   get "/api/work-items" do
     d1_collection(conn, Map.fetch!(@d1_resources, :work_items))
+  end
+
+  get "/api/work-items/:id/trace" do
+    d2c_work_item_trace(conn, id)
   end
 
   get "/api/execution-map" do
@@ -2163,6 +2168,27 @@ defmodule Tightbeam.Wire.Router do
       d1_error(conn, spec.resource, 500, "projection_invalid", nil)
   end
 
+  defp d2c_work_item_trace(conn, id) do
+    with {:ok, auth} <- d1_bearer_auth(conn),
+         {:ok, query} <- d1_query(conn.query_string),
+         {:ok, principal} <- d1_principal(auth, query, conn),
+         :ok <- d1_detail_request(query) do
+      case WorkItems.query_work_item_trace(db(conn), %{id: id, principal: principal}) do
+        {:error, status, code, message} ->
+          d1_error(conn, "work item trace", status, code, message)
+
+        trace ->
+          d1_send(conn, 200, d2c_work_item_trace_envelope(trace))
+      end
+    else
+      {:error, status, code, message} ->
+        d1_error(conn, "work item trace", status, code, message)
+    end
+  rescue
+    _error in [ArgumentError, KeyError, MatchError] ->
+      d1_error(conn, "work item trace", 500, "projection_invalid", nil)
+  end
+
   defp d1_bearer_auth(conn) do
     case bearer_token(conn) do
       token when is_binary(token) ->
@@ -2496,6 +2522,32 @@ defmodule Tightbeam.Wire.Router do
       "{\"schemaVersion\":1,\"resource\":" <>
         JSON.encode!(spec.resource) <>
         ",\"item\":" <> D1Read.encode(d1_resource(spec), item) <> "}"
+
+  defp d2c_work_item_trace_envelope(trace) do
+    encoded_assignments =
+      Enum.map_join(trace.assignments, ",", &StateResources.encode_item("assignments", &1))
+
+    attribution = trace.attribution
+
+    "{\"schemaVersion\":1,\"resource\":\"work item trace\",\"item\":{" <>
+      "\"workItem\":" <>
+      StateResources.encode_item("work items", trace.work_item) <>
+      ",\"assignments\":[" <>
+      encoded_assignments <>
+      "],\"causalChildren\":" <>
+      JSON.encode!(trace.causal_children) <>
+      ",\"attribution\":{" <>
+      "\"provenanceStatus\":" <>
+      JSON.encode!(attribution.provenance_status) <>
+      ",\"reasonKind\":" <>
+      JSON.encode!(attribution.reason_kind) <>
+      ",\"primaryWorkKind\":" <>
+      JSON.encode!(attribution.primary_work_kind) <>
+      ",\"primaryWorkId\":" <>
+      JSON.encode!(attribution.primary_work_id) <>
+      "},\"dependencyVersion\":" <>
+      JSON.encode!(trace.dependency_version) <> "}}"
+  end
 
   defp d1_send(conn, status, body),
     do:

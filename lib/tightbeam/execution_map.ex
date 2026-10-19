@@ -624,6 +624,24 @@ defmodule Tightbeam.ExecutionMap do
     Enum.max([max(item.created_at, world.cutoff) | ended ++ attested ++ disposed])
   end
 
+  @doc false
+  def work_item_trace_parent_data(items, assignments, turns)
+      when is_list(items) and is_list(assignments) and is_list(turns) do
+    assignments_by_id = Map.new(assignments, &{&1.id, &1})
+    items_by_id = Map.new(items, &{&1.id, &1})
+    turns_by_seq = Map.new(turns, &{&1.seq, &1})
+    resolved = resolve_all(assignments, assignments_by_id)
+    candidates = candidate_edges(items, items_by_id, turns_by_seq, resolved)
+    {linked, cycles} = retain_acyclic_with_cycles(items, candidates)
+
+    %{
+      resolved: resolved,
+      linked: linked,
+      parents: parents(items, linked),
+      cycles: cycles
+    }
+  end
+
   ## Parent derivation — total over missing, legacy and corrupt rows
 
   # The four statuses are exhaustive and mutually exclusive, and `linked` is the
@@ -715,6 +733,30 @@ defmodule Tightbeam.ExecutionMap do
         end
     end
   end
+
+  defp retain_acyclic_with_cycles(items, candidates) do
+    linked = retain_acyclic(items, candidates)
+
+    cycles =
+      candidates
+      |> Enum.reject(fn {child, _parent} -> Map.has_key?(linked, child) end)
+      |> Map.new(fn {child, parent} -> {child, cycle_members(child, parent, candidates)} end)
+
+    {linked, cycles}
+  end
+
+  defp cycle_members(id, id, _candidates, members), do: MapSet.put(members, id)
+
+  defp cycle_members(id, parent, candidates, members) do
+    if MapSet.member?(members, id) do
+      members
+    else
+      cycle_members(Map.fetch!(candidates, id), parent, candidates, MapSet.put(members, id))
+    end
+  end
+
+  defp cycle_members(id, parent, candidates),
+    do: cycle_members(id, parent, candidates, MapSet.new())
 
   ## REST D2 query path. Source admission happens before every derived map.
 
