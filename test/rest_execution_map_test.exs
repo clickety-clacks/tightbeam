@@ -124,7 +124,7 @@ defmodule Tightbeam.RestExecutionMapTest do
     assert linked_selection["noItem"] == []
   end
 
-  test "the public node serializer fixes wire bytes across 1,000 shuffled maps" do
+  test "the public node serializer fixes wire bytes across 1,000 shuffled maps and sets" do
     node = serializer_node_fixture()
 
     expected =
@@ -166,9 +166,12 @@ defmodule Tightbeam.RestExecutionMapTest do
     assert ExecutionMap.execution_map_node(tree_node) == expected_tree
 
     for seed <- 1..1_000 do
-      shuffled = shuffle_map_order(node, seed)
-      shuffled_child = shuffle_map_order(child, seed)
-      shuffled_tree = Map.put(shuffle_map_order(node, seed), :children, [shuffled_child])
+      shuffled = shuffle_execution_map_sets(shuffle_map_order(node, seed), seed)
+      shuffled_child = shuffle_execution_map_sets(shuffle_map_order(child, seed), seed)
+      shuffled_tree =
+        Map.put(shuffle_execution_map_sets(shuffle_map_order(node, seed), seed), :children, [
+          shuffled_child
+        ])
 
       assert ExecutionMap.execution_map_node(shuffled) == expected
       assert ExecutionMap.execution_map_node(shuffled_tree) == expected_tree
@@ -776,6 +779,16 @@ defmodule Tightbeam.RestExecutionMapTest do
     do: Enum.map(value, &shuffle_map_order(&1, seed))
 
   defp shuffle_map_order(value, _seed), do: value
+
+  defp shuffle_execution_map_sets(node, seed) do
+    node
+    |> Map.update!(:closing_attests, &shuffle_set_order(&1, seed))
+    |> Map.update!(:minds, &shuffle_set_order(&1, seed + 1_000))
+  end
+
+  defp shuffle_set_order(values, seed) do
+    Enum.sort_by(values, &{:erlang.phash2({seed, &1}), :erlang.term_to_binary(&1)})
+  end
 
   defp approved_device(db, device_id, name, user_id) do
     {:pending, _device} =

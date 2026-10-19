@@ -1438,7 +1438,9 @@ defmodule Tightbeam.ExecutionMap do
 
   defp execution_map_wire_value!(node, "closingAttests") when is_list(node.closing_attests) do
     "[" <>
-      Enum.map_join(node.closing_attests, ",", fn attest ->
+      (node.closing_attests
+       |> Enum.sort_by(&Map.get(&1, :assignmentId))
+       |> Enum.map_join(",", fn attest ->
         exact_execution_map_keys!(
           attest,
           [:assignmentId, :attestId, :commitRefs],
@@ -1480,7 +1482,7 @@ defmodule Tightbeam.ExecutionMap do
           ) <>
           "," <>
           execution_map_pair!("commitRefs", refs) <> "}"
-      end) <> "]"
+       end)) <> "]"
   end
 
   defp execution_map_wire_value!(_node, "closingAttests"),
@@ -1495,13 +1497,18 @@ defmodule Tightbeam.ExecutionMap do
 
   defp execution_map_wire_value!(node, "minds") when is_list(node.minds) do
     "[" <>
-      Enum.map_join(node.minds, ",", fn mind ->
+      (node.minds
+       |> Enum.sort_by(fn mind ->
+         {Map.get(mind, :model) || "", Map.get(mind, :context) || "",
+          Map.get(mind, :effort) || "", Map.get(mind, :harness) || ""}
+       end)
+       |> Enum.map_join(",", fn mind ->
         execution_map_object!(
           mind,
           [model: "model", context: "context", effort: "effort", harness: "harness"],
           "minds"
         )
-      end) <> "]"
+       end)) <> "]"
   end
 
   defp execution_map_wire_value!(_node, "minds"),
