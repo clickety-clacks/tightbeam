@@ -702,9 +702,13 @@ COMMANDS:
 
   harness-health-observe-other --harness <harness> --host <host>
       --source-session <session> --description <text> --evidence-mode exact_error|probe_digest
+      [--exact-error <text> | --output-digest <sha256>]
       --observed-state <text> --exact-probe <text> --recovery-condition <text>
-      --not-known-class <text> --valid-until <epochMs> --world-status PROVEN|UNKNOWN
+      --not-known-class <text> [--observed-at <epochMs>] --valid-until <epochMs> --world-status PROVEN|UNKNOWN
       --redaction-confirmed --key <idempotencyKey>
+      exact_error requires --exact-error; probe_digest requires --output-digest.
+      --valid-until must be within 15 minutes after --observed-at (defaults to server acceptance time).
+      UNKNOWN requires --evidence-mode exact_error.
       Admit a redacted, bounded evidence observation for a not-yet-named failure.
   harness-health-resolve-other --harness <harness> --host <host>
       --observed-state <text> --exact-probe <text> --output-digest <sha256>
@@ -764,6 +768,7 @@ COMMANDS:
 
   session-connect --session <sessionKey>
       Run the persistent NDJSON stdin/stdout connection for one selected session.
+      Its initial snapshot includes existing wake prompts and delivery status.
       Optional --as, --as-user, or --as-process flags affect ordinary wake
       attribution only; read authorization comes from the discovered bearer.
 
@@ -1154,10 +1159,7 @@ enum BodyUpdateOperation {
 }
 
 fn split_args(args: Vec<String>) -> Flags {
-    if args
-        .first()
-        .is_some_and(|command| command == "work-item-update")
-    {
+    if work_item_update_after_identity_prefix(&args) {
         return split_work_item_update_args(args);
     }
 
@@ -1199,6 +1201,21 @@ fn split_args(args: Vec<String>) -> Flags {
         missing_values,
         body_operations: Vec::new(),
     }
+}
+
+fn work_item_update_after_identity_prefix(args: &[String]) -> bool {
+    let mut index = 0;
+    while let Some(flag) = args.get(index).map(String::as_str) {
+        if matches!(flag, "--as" | "--as-user" | "--as-process") {
+            if args.get(index + 1).is_none() {
+                return false;
+            }
+            index += 2;
+        } else {
+            return flag == "work-item-update";
+        }
+    }
+    false
 }
 
 fn split_work_item_update_args(args: Vec<String>) -> Flags {
@@ -1605,6 +1622,17 @@ fn number_coercion(text: &str) -> f64 {
     }
 }
 
+fn exceeds_other_validity_window(observed_at: &str, valid_until: &str) -> bool {
+    const MAX_VALIDITY_MS: f64 = 900_000.0;
+    let observed_at = number_coercion(observed_at);
+    let valid_until = number_coercion(valid_until);
+    observed_at.is_finite()
+        && valid_until.is_finite()
+        && observed_at.fract() == 0.0
+        && valid_until.fract() == 0.0
+        && valid_until > observed_at + MAX_VALIDITY_MS
+}
+
 fn js_number_json(value: f64) -> String {
     if !value.is_finite() {
         return "null".to_owned();
@@ -1925,7 +1953,7 @@ fn parse_with_optional_catalog(
             if parsed.positional.len() != 1
                 || flags.keys().any(|flag| !allowed.contains(&flag.as_str()))
             {
-                return Err("usage: tightbeam harness-health-observe-other --harness <harness> --host <host> --source-session <session> --description <text> --evidence-mode exact_error|probe_digest --observed-state <text> --exact-probe <text> --recovery-condition <text> --not-known-class <text> --valid-until <ms> --world-status PROVEN|UNKNOWN --redaction-confirmed --key <idempotencyKey>".to_owned());
+                return Err("usage: tightbeam harness-health-observe-other --harness <harness> --host <host> --source-session <session> --description <text> --evidence-mode exact_error|probe_digest [--exact-error <text> | --output-digest <sha256>] --observed-state <text> --exact-probe <text> --recovery-condition <text> --not-known-class <text> [--observed-at <ms>] --valid-until <ms> (within 15 minutes after --observed-at, which defaults to server acceptance time) --world-status PROVEN|UNKNOWN --redaction-confirmed --key <idempotencyKey> (UNKNOWN requires exact_error evidence)".to_owned());
             }
             let evidence_mode = nonempty(flags, "evidence-mode")
                 .ok_or_else(|| "--evidence-mode is required".to_owned())?;
@@ -1944,6 +1972,22 @@ fn parse_with_optional_catalog(
             }
             if evidence_mode == "probe_digest" && output_digest.is_none() {
                 return Err("--output-digest is required for probe_digest evidence".to_owned());
+            }
+            if world_status == "UNKNOWN" && evidence_mode != "exact_error" {
+                return Err(
+                    "--world-status UNKNOWN requires --evidence-mode exact_error".to_owned(),
+                );
+            }
+            let observed_at = nonempty(flags, "observed-at");
+            let valid_until = nonempty(flags, "valid-until")
+                .ok_or_else(|| "--valid-until is required".to_owned())?;
+            if observed_at
+                .as_deref()
+                .is_some_and(|observed_at| exceeds_other_validity_window(observed_at, &valid_until))
+            {
+                return Err(
+                    "--valid-until must be no more than 15 minutes after --observed-at".to_owned(),
+                );
             }
             if !flags.contains_key("redaction-confirmed") {
                 return Err("--redaction-confirmed is required".to_owned());
@@ -1968,12 +2012,8 @@ fn parse_with_optional_catalog(
                     .ok_or_else(|| "--recovery-condition is required".to_owned())?,
                 not_known_class: nonempty(flags, "not-known-class")
                     .ok_or_else(|| "--not-known-class is required".to_owned())?,
-                observed_at: nonempty(flags, "observed-at")
-                    .map(|value| js_number_json(number_coercion(&value))),
-                valid_until: js_number_json(number_coercion(
-                    &nonempty(flags, "valid-until")
-                        .ok_or_else(|| "--valid-until is required".to_owned())?,
-                )),
+                observed_at: observed_at.map(|value| js_number_json(number_coercion(&value))),
+                valid_until: js_number_json(number_coercion(&valid_until)),
                 world_status,
                 redaction_confirmed: true,
                 idempotency_key: nonempty(flags, "key")
@@ -3877,6 +3917,134 @@ mod tests {
             assert!(help.contains("--cause <text> --key <idempotencyKey>"));
             assert!(help.contains("nonblank reason"));
         }
+    }
+
+    #[test]
+    fn harness_health_observe_other_preserves_complete_exact_error_evidence() {
+        let observed_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let valid_until_ms = observed_at_ms + 900_000;
+        let observed_at_value = observed_at_ms.to_string();
+        let valid_until = valid_until_ms.to_string();
+        let command = parse(strings(&[
+            "harness-health-observe-other",
+            "--harness",
+            "claude",
+            "--host",
+            "host-a",
+            "--source-session",
+            "agent:worker:session",
+            "--description",
+            "provider connection reset",
+            "--evidence-mode",
+            "exact_error",
+            "--observed-state",
+            "provider request failed",
+            "--exact-error",
+            "connection reset by peer",
+            "--exact-probe",
+            "provider health probe",
+            "--recovery-condition",
+            "a normal provider turn completes",
+            "--not-known-class",
+            "not one of the named failure classes",
+            "--observed-at",
+            &observed_at_value,
+            "--valid-until",
+            &valid_until,
+            "--world-status",
+            "UNKNOWN",
+            "--redaction-confirmed",
+            "--key",
+            "observation-1",
+        ]))
+        .unwrap();
+
+        assert!(matches!(
+            &command,
+            Command::HarnessHealthObserveOther {
+                evidence_mode,
+                exact_error: Some(exact_error),
+                output_digest: None,
+                observed_at: Some(command_observed_at),
+                world_status,
+                ..
+            } if evidence_mode == "exact_error"
+                && exact_error == "connection reset by peer"
+                && command_observed_at == &observed_at_value
+                && world_status == "UNKNOWN"
+        ));
+
+        let body = crate::dispatch::build_request(&command).unwrap().body_json;
+        let request: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            request["params"]["exactObservedError"],
+            "connection reset by peer"
+        );
+        assert_eq!(request["params"]["observedAt"], observed_at_ms);
+        assert_eq!(request["params"]["validUntil"], valid_until_ms);
+        assert!(request["params"].get("outputDigest").is_none());
+
+        for help in [
+            render_help(None),
+            render_command_help(None, "harness-health-observe-other").unwrap(),
+        ] {
+            assert!(help.contains("--exact-error <text>"));
+            assert!(help.contains("--output-digest <sha256>"));
+            assert!(help.contains("exact_error requires --exact-error"));
+            assert!(help.contains("within 15 minutes after --observed-at"));
+            assert!(help.contains("UNKNOWN requires --evidence-mode exact_error"));
+        }
+    }
+
+    #[test]
+    fn harness_health_observe_other_rejects_unknown_probe_digest_evidence() {
+        let digest = "a".repeat(64);
+        let error = parse(strings(&[
+            "harness-health-observe-other",
+            "--evidence-mode",
+            "probe_digest",
+            "--output-digest",
+            &digest,
+            "--world-status",
+            "UNKNOWN",
+        ]))
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            "--world-status UNKNOWN requires --evidence-mode exact_error"
+        );
+    }
+
+    #[test]
+    fn harness_health_observe_other_rejects_valid_until_beyond_observed_window() {
+        let observed_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let valid_until = observed_at + 900_001;
+        let error = parse(strings(&[
+            "harness-health-observe-other",
+            "--evidence-mode",
+            "exact_error",
+            "--exact-error",
+            "provider refused the request",
+            "--world-status",
+            "UNKNOWN",
+            "--observed-at",
+            &observed_at.to_string(),
+            "--valid-until",
+            &valid_until.to_string(),
+        ]))
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            "--valid-until must be no more than 15 minutes after --observed-at"
+        );
     }
 
     #[test]
@@ -6672,6 +6840,23 @@ mod tests {
         assert!(matches!(
             parse(strings(&["work-item-update", "wi_1", "--body", "alpha", "--as-user", "flynn"])),
             Ok(Command::WorkItemUpdate { body: Some(body), clear_body: false, .. }) if body == "alpha"
+        ));
+        assert!(matches!(
+            parse(strings(&[
+                "--as",
+                "coder",
+                "work-item-update",
+                "wi_1",
+                "--body",
+                "editable body",
+            ])),
+            Ok(Command::WorkItemUpdate {
+                identity: Identity::Role(role),
+                work_item_id,
+                body: Some(body),
+                clear_body: false,
+                ..
+            }) if role == "coder" && work_item_id == "wi_1" && body == "editable body"
         ));
         assert!(matches!(
             parse(strings(&["work-item-update", "wi_1", "--body", "", "--as-user", "flynn"])),

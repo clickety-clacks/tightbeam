@@ -2135,7 +2135,11 @@ mod tests {
         }
     }
 
-    fn respond_to_snapshot_request(stream: &mut TcpStream, request_number: usize) {
+    fn respond_to_snapshot_request(
+        stream: &mut TcpStream,
+        request_number: usize,
+        wake_items: Vec<Value>,
+    ) {
         let session = json!({
             "item": {
                 "sessionKey": "agent:main/example",
@@ -2149,8 +2153,13 @@ mod tests {
                 }
             }
         });
+        let items = if request_number == 2 {
+            wake_items
+        } else {
+            Vec::new()
+        };
         let collection = json!({
-            "items": [],
+            "items": items,
             "page": {"hasMoreAfter": false}
         });
         let body = if request_number == 0 || request_number == 4 {
@@ -2185,7 +2194,7 @@ mod tests {
             for index in 0..expected.len() {
                 let (mut stream, _) = listener.accept().unwrap();
                 let request = read_http_request(&mut stream);
-                respond_to_snapshot_request(&mut stream, index);
+                respond_to_snapshot_request(&mut stream, index, Vec::new());
                 requests.push(request);
             }
             (expected, requests)
@@ -2207,6 +2216,42 @@ mod tests {
         assert!(snapshot.messages.is_empty());
         assert!(snapshot.wakes.is_empty());
         assert!(snapshot.turns.is_empty());
+    }
+
+    #[test]
+    fn snapshot_reads_back_failed_wake_prompt_and_delivery_status() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = endpoint(&listener);
+        let session_key = "agent:main/example";
+        let failed_wake = json!({
+            "wakeId": "w_failed",
+            "sessionKey": session_key,
+            "origin": "process:test",
+            "prompt": "retry the failed delivery",
+            "state": "fired",
+            "deliveryStatus": "failed",
+            "createdAt": 100
+        });
+        let server_wake = failed_wake.clone();
+        let server = thread::spawn(move || {
+            for index in 0..5 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _request = read_http_request(&mut stream);
+                let wake_items = if index == 2 {
+                    vec![server_wake.clone()]
+                } else {
+                    Vec::new()
+                };
+                respond_to_snapshot_request(&mut stream, index, wake_items);
+            }
+        });
+
+        let snapshot = load_snapshot(&endpoint, session_key).unwrap();
+        server.join().unwrap();
+
+        assert_eq!(snapshot.wakes, vec![failed_wake]);
+        assert_eq!(snapshot.wakes[0]["prompt"], "retry the failed delivery");
+        assert_eq!(snapshot.wakes[0]["deliveryStatus"], "failed");
     }
 
     #[test]
@@ -3148,7 +3193,7 @@ mod tests {
                 let (mut stream, _) = listener.accept().unwrap();
                 let request = read_http_request(&mut stream);
                 assert_gateway_headers(&request);
-                respond_to_snapshot_request(&mut stream, request_number);
+                respond_to_snapshot_request(&mut stream, request_number, Vec::new());
                 requests.push(request);
             }
             let close = third.read().unwrap();

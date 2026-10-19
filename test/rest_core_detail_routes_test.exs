@@ -2250,6 +2250,25 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       refute terminal_response.resp_body =~ "private terminal detail"
       assert Enum.sort(Map.keys(item)) == Enum.sort(@r7_fields["wakes"])
 
+      encoded_session_key = URI.encode(ctx.wake.session_key, &URI.char_unreserved?/1)
+
+      session_wakes_response =
+        get(
+          ctx,
+          "/api/sessions/#{encoded_session_key}/wakes?sessionKey=#{encoded_session_key}&limit=500"
+        )
+
+      assert session_wakes_response.status == 200
+
+      session_wake =
+        session_wakes_response.resp_body
+        |> JSON.decode!()
+        |> Map.fetch!("items")
+        |> Enum.find(&(&1["wakeId"] == ctx.wake.wake_id))
+
+      assert session_wake["prompt"] == ctx.wake.prompt
+      assert session_wake["deliveryStatus"] == @carrier_terminal
+
       call = %{verb: "wake", origin: "user:flynn", principal: {:user, "flynn"}, params: %{}}
       notice = Publisher.state_notice(ctx.db, call, ctx.wake)
       assert notice["payload"]["deliveryStatus"] == @carrier_terminal

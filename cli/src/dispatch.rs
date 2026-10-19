@@ -3797,6 +3797,28 @@ mod tests {
     }
 
     #[test]
+    fn documented_work_item_body_invocation_keeps_a_prefixed_identity() {
+        let request: serde_json::Value = serde_json::from_str(&body(&[
+            "--as",
+            "coder",
+            "work-item-update",
+            "wi_1",
+            "--body",
+            "editable body",
+        ]))
+        .unwrap();
+
+        assert_eq!(
+            request,
+            serde_json::json!({
+                "as": "coder",
+                "verb": "work-item-update",
+                "params": {"workItemId": "wi_1", "body": "editable body"}
+            })
+        );
+    }
+
+    #[test]
     fn artifact_content_fetch_sends_only_id_and_authenticated_identity() {
         let request = build_request(&parse(&[
             "artifact-content-fetch",
@@ -6293,6 +6315,26 @@ mod tests {
                 "httpStatus": 200,
                 "error": {"code": "denied", "message": "no"}
             })
+        );
+    }
+
+    #[test]
+    fn observe_other_validity_refusal_names_the_limit_for_cli_users() {
+        let (human, machine) = readings(
+            &parse_response(
+                400,
+                r#"{"error":{"code":"invalid_other_evidence","message":"invalid --valid-until: must be no more than 15 minutes after --observed-at (defaults to server acceptance time)"}}"#,
+            )
+            .unwrap_err(),
+        );
+
+        assert_eq!(
+            human,
+            "invalid_other_evidence: invalid --valid-until: must be no more than 15 minutes after --observed-at (defaults to server acceptance time)"
+        );
+        assert_eq!(
+            machine["error"]["message"],
+            "invalid --valid-until: must be no more than 15 minutes after --observed-at (defaults to server acceptance time)"
         );
     }
 
