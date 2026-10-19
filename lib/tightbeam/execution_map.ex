@@ -46,6 +46,8 @@ defmodule Tightbeam.ExecutionMap do
 
   @edge_basis "concurrent_turn"
   @coverage_basis "conservative_shared"
+  @rest_assignment_batch_size 900
+  @rest_attest_page_size 2_000
   @terminal_states ~w(closed failed iceboxed)
   @execution_map_node_fields ~w(
     id title specRefName specRefSha256 state failReason bracket1Armed origin
@@ -719,7 +721,7 @@ defmodule Tightbeam.ExecutionMap do
   defp with_rest_world(db, call, fun) do
     principal = Map.fetch!(call, :principal)
 
-    case DB.transaction(db, fn txn ->
+    case DB.read_transaction(db, fn txn ->
            txn = Txn.observe_queries(txn, Map.get(principal, :core_detail_trace))
            world = rest_world(txn, call)
            fun.(world)
@@ -735,7 +737,6 @@ defmodule Tightbeam.ExecutionMap do
 
     items =
       StateResources.query_work_item(txn, %{}, %{rest_principal: principal})
-      |> Enum.filter(&StateVisibility.execution_map_node_visible?(txn, &1.id, principal))
       |> Enum.map(&rest_work_item/1)
       |> Enum.sort_by(&{&1.created_at, &1.id})
 
@@ -832,11 +833,51 @@ defmodule Tightbeam.ExecutionMap do
   end
 
   defp rest_visible_assignments(txn, principal) do
-    Txn.q(txn, "SELECT id FROM assignments ORDER BY id")
-    |> Enum.map(&hd/1)
-    |> Enum.map(&StateResources.query_assignment(txn, &1, %{rest_principal: principal}))
-    |> Enum.reject(&is_nil/1)
+    {kind, id, is_admin} = detail_principal(principal)
+
+    Txn.q(
+      txn,
+      """
+      SELECT a.id, a.workItemId, a.reviewsAssignmentId, a.holderKey,
+             a.state, a.outcome, a.openedAt, a.closingAttestId, a.closedAt
+      FROM assignments AS a
+      LEFT JOIN work_items AS wi ON wi.id = a.workItemId
+      WHERE ?1 = 1 OR
+            (?2 = 'session' AND (a.holderKey = ?3 OR a.openedBySession = ?3)) OR
+            (?2 = 'user' AND (wi.ownerUserId = ?3 OR a.openedByUser = ?3))
+      ORDER BY a.id
+      """,
+      [if(is_admin, do: 1, else: 0), kind, id]
+    )
+    |> Enum.map(&rest_assignment_query_row/1)
     |> Enum.map(&rest_assignment/1)
+  end
+
+  defp detail_principal(%{kind: kind, id: id, is_admin: is_admin}),
+    do: {kind, id, is_admin}
+
+  defp rest_assignment_query_row([
+         id,
+         work_item_id,
+         reviews_assignment_id,
+         holder_key,
+         state,
+         outcome,
+         opened_at,
+         closing_attest_id,
+         closed_at
+       ]) do
+    %{
+      id: id,
+      work_item_id: work_item_id,
+      reviews_assignment_id: reviews_assignment_id,
+      holder_key: holder_key,
+      state: state,
+      outcome: outcome,
+      opened_at: opened_at,
+      closing_attest_id: closing_attest_id,
+      closed_at: closed_at
+    }
   end
 
   defp rest_assignment(row) do
@@ -855,12 +896,77 @@ defmodule Tightbeam.ExecutionMap do
   end
 
   defp rest_visible_turns(txn, principal) do
-    Txn.q(txn, "SELECT seq FROM turns ORDER BY seq")
-    |> Enum.map(&hd/1)
-    |> Enum.map(&StateResources.query_turn_in_txn(txn, &1))
-    |> Enum.reject(&is_nil/1)
-    |> Enum.filter(&StateVisibility.core_detail_visible?(txn, "turns", &1, principal))
-    |> Enum.map(&rest_turn/1)
+    {kind, id, is_admin} = detail_principal(principal)
+
+    Txn.q(
+      txn,
+      """
+      SELECT t.seq, t.assignmentId, t.jobRef, t.sessionKey, t.status,
+             t.model, t.modelContext, t.thinkingLevel, t.harness, t.endedAt,
+             MAX(COALESCE(t.endedAt, 0), COALESCE(t.startedAt, 0), t.createdAt, t.seq)
+      FROM turns AS t
+      JOIN sessions AS s ON s.sessionKey = t.sessionKey
+      WHERE (?1 = 1 OR
+             (?2 = 'session' AND t.sessionKey = ?3) OR
+             (?2 = 'user' AND s.ownerUserId = ?3))
+        AND (
+          EXISTS (
+            SELECT 1 FROM work_items AS wi
+            WHERE wi.id = t.jobRef AND (
+              ?1 = 1 OR
+              (?2 = 'user' AND wi.ownerUserId = ?3) OR
+              (?2 = 'session' AND (
+                wi.createdBySession = ?3 OR EXISTS (
+                  SELECT 1 FROM assignments AS held
+                  WHERE held.workItemId = wi.id AND held.holderKey = ?3
+                )
+              ))
+            )
+          )
+          OR EXISTS (
+            SELECT 1
+            FROM assignments AS a
+            LEFT JOIN work_items AS wi ON wi.id = a.workItemId
+            WHERE a.id = t.assignmentId AND (
+              ?1 = 1 OR
+              (?2 = 'session' AND (a.holderKey = ?3 OR a.openedBySession = ?3)) OR
+              (?2 = 'user' AND (wi.ownerUserId = ?3 OR a.openedByUser = ?3))
+            )
+          )
+        )
+      ORDER BY t.seq
+      """,
+      [if(is_admin, do: 1, else: 0), kind, id]
+    )
+    |> Enum.map(&rest_turn_query_row/1)
+  end
+
+  defp rest_turn_query_row([
+         seq,
+         assignment_id,
+         job_ref,
+         session_key,
+         status,
+         model,
+         model_context,
+         thinking_level,
+         harness,
+         ended_at,
+         row_version
+       ]) do
+    %{
+      seq: seq,
+      assignment_id: assignment_id,
+      job_ref: job_ref,
+      session_key: session_key,
+      status: status,
+      model: model,
+      model_context: model_context,
+      thinking_level: thinking_level,
+      harness: harness,
+      ended_at: ended_at,
+      row_version: row_version
+    }
   end
 
   defp rest_turn(row) do
@@ -875,7 +981,7 @@ defmodule Tightbeam.ExecutionMap do
       effort: row.thinking_level,
       harness: row.harness,
       ended_at: row.ended_at,
-      row_version: StateResources.turn(row)["rowVersion"]
+      row_version: row.row_version
     }
   end
 
@@ -888,38 +994,36 @@ defmodule Tightbeam.ExecutionMap do
   defp rest_allowed_attests(_txn, _principal, []), do: []
 
   defp rest_allowed_attests(txn, principal, assignment_ids) do
-    Enum.flat_map(assignment_ids, fn assignment_id ->
-      rest_all_attests_for_assignment(txn, principal, assignment_id, :earliest, [])
-    end)
+    assignment_ids
+    |> Enum.sort()
+    |> Enum.chunk_every(@rest_assignment_batch_size)
+    |> Enum.flat_map(&rest_all_attests_for_assignments(txn, principal, &1, :earliest, []))
     |> Enum.sort_by(&{&1.ts, &1.id})
   end
 
-  defp rest_all_attests_for_assignment(txn, principal, assignment_id, boundary, acc) do
+  defp rest_all_attests_for_assignments(txn, principal, assignment_ids, boundary, acc) do
     page =
       Assignments.list_attests(txn, %{
-        assignment_id: assignment_id,
-        filters: %{},
+        filters: %{"assignmentId" => assignment_ids},
+        principal: principal,
         boundary: boundary,
-        limit: 500
+        limit: @rest_attest_page_size
       })
 
-    visible =
-      Enum.filter(page.rows, &StateVisibility.core_detail_visible?(txn, "attests", &1, principal))
-
-    acc = acc ++ Enum.map(visible, &rest_attest/1)
+    acc = Enum.reduce(page.rows, acc, fn row, rows -> [rest_attest(row) | rows] end)
 
     if page.has_more_after do
       last = List.last(page.rows)
 
-      rest_all_attests_for_assignment(
+      rest_all_attests_for_assignments(
         txn,
         principal,
-        assignment_id,
+        assignment_ids,
         {:after, [last.ts, last.id]},
         acc
       )
     else
-      acc
+      Enum.reverse(acc)
     end
   end
 
@@ -948,15 +1052,21 @@ defmodule Tightbeam.ExecutionMap do
     if holders == [] do
       {[], MapSet.new(), %{}}
     else
-      marks = Enum.map_join(holders, ",", fn _ -> "?" end)
+      holders
+      |> Enum.uniq()
+      |> Enum.sort()
+      |> Enum.chunk_every(@rest_assignment_batch_size)
+      |> Enum.flat_map(fn batch ->
+        marks = Enum.map_join(batch, ",", fn _ -> "?" end)
 
-      Txn.q(
-        txn,
-        "SELECT wakeId FROM wakes WHERE state = 'pending' AND consumer = 'prompt' AND sessionKey IN (" <>
-          marks <> ") ORDER BY wakeId",
-        holders
-      )
-      |> Enum.map(&hd/1)
+        Txn.q(
+          txn,
+          "SELECT wakeId FROM wakes WHERE state = 'pending' AND consumer = 'prompt' AND sessionKey IN (" <>
+            marks <> ") ORDER BY wakeId",
+          batch
+        )
+        |> Enum.map(&hd/1)
+      end)
       |> Enum.map(&Wakes.delivery_projection_in_txn(txn, &1))
       |> Enum.reject(&is_nil/1)
       |> Enum.filter(fn wake ->
@@ -988,16 +1098,21 @@ defmodule Tightbeam.ExecutionMap do
   defp rest_allowed_open_requests(_txn, _principal, []), do: {[], %{}}
 
   defp rest_allowed_open_requests(txn, principal, assignment_ids) do
-    marks = Enum.map_join(assignment_ids, ",", fn _ -> "?" end)
-
     rows =
-      Txn.q(
-        txn,
-        "SELECT id FROM decision_requests WHERE status = 'open' AND kind IN ('statute','effort') AND assignmentId IN (" <>
-          marks <> ") ORDER BY id",
-        assignment_ids
-      )
-      |> Enum.map(&hd/1)
+      assignment_ids
+      |> Enum.sort()
+      |> Enum.chunk_every(@rest_assignment_batch_size)
+      |> Enum.flat_map(fn batch ->
+        marks = Enum.map_join(batch, ",", fn _ -> "?" end)
+
+        Txn.q(
+          txn,
+          "SELECT id FROM decision_requests WHERE status = 'open' AND kind IN ('statute','effort') AND assignmentId IN (" <>
+            marks <> ") ORDER BY id",
+          batch
+        )
+        |> Enum.map(&hd/1)
+      end)
       |> Enum.map(&StateResources.query_decision_request_in_txn(txn, &1))
       |> Enum.reject(&is_nil/1)
       |> Enum.filter(fn wrapper ->
@@ -1025,17 +1140,22 @@ defmodule Tightbeam.ExecutionMap do
   defp rest_allowed_markers(_txn, []), do: {[], %{}}
 
   defp rest_allowed_markers(txn, assignment_ids) do
-    marks = Enum.map_join(assignment_ids, ",", fn _ -> "?" end)
-
     rows =
-      Txn.q(
-        txn,
-        "SELECT id, assignmentId, subagentRef FROM subagent_markers WHERE assignmentId IN (" <>
-          marks <> ") ORDER BY id",
-        assignment_ids
-      )
-      |> Enum.map(fn [id, assignment_id, ref] ->
-        %{id: id, assignment_id: assignment_id, subagent_ref: ref}
+      assignment_ids
+      |> Enum.sort()
+      |> Enum.chunk_every(@rest_assignment_batch_size)
+      |> Enum.flat_map(fn batch ->
+        marks = Enum.map_join(batch, ",", fn _ -> "?" end)
+
+        Txn.q(
+          txn,
+          "SELECT id, assignmentId, subagentRef FROM subagent_markers WHERE assignmentId IN (" <>
+            marks <> ") ORDER BY id",
+          batch
+        )
+        |> Enum.map(fn [id, assignment_id, ref] ->
+          %{id: id, assignment_id: assignment_id, subagent_ref: ref}
+        end)
       end)
 
     by_assignment =
@@ -1050,18 +1170,23 @@ defmodule Tightbeam.ExecutionMap do
     do: {[], %{}}
 
   defp rest_allowed_dispositions(txn, items_by_id) do
-    ids = Map.keys(items_by_id)
-    marks = Enum.map_join(ids, ",", fn _ -> "?" end)
-
     rows =
-      Txn.q(
-        txn,
-        "SELECT jobRef, seq, at, json_extract(detail, '$.toState') FROM causal_events " <>
-          "WHERE kind = 'disposition_transition' AND jobRef IN (" <> marks <> ") ORDER BY seq",
-        ids
-      )
-      |> Enum.map(fn [job_ref, seq, at, to_state] ->
-        %{job_ref: job_ref, seq: seq, at: at, to_state: to_state}
+      items_by_id
+      |> Map.keys()
+      |> Enum.sort()
+      |> Enum.chunk_every(@rest_assignment_batch_size)
+      |> Enum.flat_map(fn ids ->
+        marks = Enum.map_join(ids, ",", fn _ -> "?" end)
+
+        Txn.q(
+          txn,
+          "SELECT jobRef, seq, at, json_extract(detail, '$.toState') FROM causal_events " <>
+            "WHERE kind = 'disposition_transition' AND jobRef IN (" <> marks <> ") ORDER BY seq",
+          ids
+        )
+        |> Enum.map(fn [job_ref, seq, at, to_state] ->
+          %{job_ref: job_ref, seq: seq, at: at, to_state: to_state}
+        end)
       end)
 
     {rows, Enum.group_by(rows, & &1.job_ref)}
@@ -1083,27 +1208,29 @@ defmodule Tightbeam.ExecutionMap do
       raise ArgumentError, "execution-map principal user projection is missing"
     end
 
-    referenced_sessions =
+    referenced_session_keys =
       if principal.kind == "user" and not principal.is_admin do
-        Enum.map(turns, & &1.session_key) ++
-          Enum.flat_map(wakes, &[&1.session_key, &1.creator_session_key])
+        MapSet.new(
+          Enum.map(turns, & &1.session_key) ++
+            Enum.flat_map(wakes, &[&1.session_key, &1.creator_session_key])
+        )
       else
-        []
+        MapSet.new()
       end
 
     sessions =
-      ([principal_session] ++ referenced_sessions)
-      |> Enum.reject(&is_nil/1)
-      |> Enum.map(fn
-        session when is_map(session) -> session
-        session_key -> StateResources.query_session(txn, session_key)
-      end)
-      |> Enum.reject(&is_nil/1)
-      |> Enum.uniq_by(& &1.session_key)
-      |> Enum.filter(fn session ->
-        principal.kind != "user" or principal.is_admin or
-          session.owner_user_id == principal.id
-      end)
+      cond do
+        principal.kind == "session" ->
+          List.wrap(principal_session)
+
+        principal.kind == "user" and not principal.is_admin and
+            MapSet.size(referenced_session_keys) > 0 ->
+          StateResources.query_sessions(txn, principal)
+          |> Enum.filter(&MapSet.member?(referenced_session_keys, &1.session_key))
+
+        true ->
+          []
+      end
       |> Enum.uniq_by(& &1.session_key)
 
     %{principal_user: principal_user, sessions: sessions}

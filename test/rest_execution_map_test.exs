@@ -124,6 +124,62 @@ defmodule Tightbeam.RestExecutionMapTest do
     assert linked_selection["noItem"] == []
   end
 
+  test "file-backed read snapshots do not hold the single writer", _ctx do
+    base_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "tightbeam-execution-map-read-snapshot-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(base_dir)
+    on_exit(fn -> File.rm_rf!(base_dir) end)
+
+    db =
+      start_supervised!(
+        {DB,
+         path: Path.join(base_dir, "state.db"), name: nil, guard_inputs: []}
+      )
+
+    :ok = DB.execute(db, "CREATE TABLE read_snapshot_probe (value INTEGER NOT NULL)")
+    :ok = DB.execute(db, "INSERT INTO read_snapshot_probe (value) VALUES (1)")
+
+    parent = self()
+
+    reader =
+      Task.async(fn ->
+        DB.read_transaction(db, fn txn ->
+          before = Tightbeam.DB.Txn.q(txn, "SELECT value FROM read_snapshot_probe")
+          send(parent, {:read_snapshot_started, before})
+
+          receive do
+            :continue -> :ok
+          after
+            10_000 -> raise "read snapshot was not released"
+          end
+
+          after_write = Tightbeam.DB.Txn.q(txn, "SELECT value FROM read_snapshot_probe")
+          {before, after_write}
+        end)
+      end)
+
+    assert_receive {:read_snapshot_started, [[1]]}, 5_000
+
+    writer =
+      Task.async(fn ->
+        DB.transaction(db, fn txn ->
+          Tightbeam.DB.Txn.q(txn, "UPDATE read_snapshot_probe SET value = 2")
+          :written
+        end)
+      end)
+
+    write_result = Task.yield(writer, 2_000)
+    send(reader.pid, :continue)
+
+    assert {:ok, {:ok, :written}} = write_result
+    assert {:ok, {:ok, {[[1]], [[1]]}}} = Task.await(reader, 5_000)
+    assert {:ok, [[2]]} = DB.query(db, "SELECT value FROM read_snapshot_probe")
+  end
+
   test "the public node serializer fixes wire bytes across 1,000 shuffled maps and sets" do
     node = serializer_node_fixture()
 
