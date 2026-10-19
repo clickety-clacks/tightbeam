@@ -2308,7 +2308,9 @@ defmodule Tightbeam.GatewayTest do
         {%{supervision_interval_ms: 4_321}, "live_base_gateway_liveness_override.exs"}
       ] do
     @tag cold_gateway: true, gateway_cadence: true, tmp_dir: true
-    test "children backfills an inactivity deadline with interval #{inspect(override)}", %{tmp_dir: tmp} do
+    test "children backfills an inactivity deadline with interval #{inspect(override)}", %{
+      tmp_dir: tmp
+    } do
       Tightbeam.GuardRuntimeFixture.run!(tmp, unquote(script), "guarded-gateway-liveness: ok")
     end
   end

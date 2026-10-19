@@ -35,7 +35,6 @@ Tightbeam.GuardGatewayFixture.run!(fn %{db: db, config: config} ->
            WHERE assignmentId='asg_boot_recovery'
              AND consumer='assignment_inactivity_deadline' AND state='pending'
            """)
-
 end)
 
 IO.puts("guarded-gateway-liveness: ok")
