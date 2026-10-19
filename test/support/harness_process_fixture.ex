@@ -1439,10 +1439,52 @@ defmodule Tightbeam.HarnessProcessFixture do
     detached = File.read!(Path.join(ctx.test_dir, "detached-pid"))
     File.touch!(Path.join(ctx.test_dir, "leave-leader"))
     assert_receive {^port, {:exit_status, 0}}, 5_000
-    assert {:ok, parked} = HarnessProcess.begin_park(ctx.db, key)
-    assert parked.launch_id == row.launch_id
 
-    assert :ok = AdapterCoordinator.close_adapter_for_credential(coordinator, key)
+    {:ok, credentials} =
+      Tightbeam.Credentials.start_link(
+        name: Tightbeam.Credentials,
+        base_dir: ctx.test_dir,
+        machine: "testhost",
+        gate: fn _provider -> :ok end,
+        stop: fn :anthropic ->
+          AdapterCoordinator.close_adapter_for_credential(coordinator, key)
+        end,
+        start: fn :anthropic, :subscription -> :ok end,
+        resume: fn _provider -> :ok end,
+        capture_sessions: fn _provider -> [] end,
+        publish_sessions: fn _captured, _transition -> :ok end,
+        sh: fn _argv -> {"", 0} end
+      )
+
+    on_exit(fn ->
+      if Process.alive?(credentials), do: GenServer.stop(credentials)
+    end)
+
+    {:ok, staging, lease_id} =
+      Tightbeam.Credentials.begin_onboard(:anthropic, Tightbeam.Credentials)
+
+    File.write!(Path.join(staging, ".credentials.json"), "synthetic credential")
+
+    assert :ok =
+             Tightbeam.Credentials.finish_onboard(
+               :anthropic,
+               :subscription,
+               lease_id,
+               Tightbeam.Credentials
+             )
+
+    assert Tightbeam.Credentials.status(:anthropic, Tightbeam.Credentials) == :onboarded
+    assert Tightbeam.Credentials.kind(:anthropic, Tightbeam.Credentials) == :subscription
+    refute HarnessProcess.parked?(ctx.db, key)
+    refute HarnessProcess.fenced?(ctx.db, key)
+
+    metadata =
+      Path.join([ctx.test_dir, "homes", "testhost", "claude", ".tightbeam", "credential.json"])
+      |> File.read!()
+      |> JSON.decode!()
+
+    assert metadata["onboarded"]
+    refute Map.has_key?(metadata, "present_but_unverified")
 
     assert eventually(fn ->
              elem(System.cmd("/bin/kill", ["-0", same_group], stderr_to_stdout: true), 1) != 0
