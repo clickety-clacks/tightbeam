@@ -849,7 +849,10 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
 
     assert {:ok, [[0]]} =
-             DB.query(ctx.db, "SELECT COUNT(*) FROM messages WHERE clientMessageId='alias-post-1'")
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM messages WHERE clientMessageId='alias-post-1'"
+             )
 
     assert %{dedupe: "duplicate"} = post.(call)
 
@@ -860,7 +863,16 @@ defmodule Tightbeam.GatewayTest do
              )
 
     assert {:ok,
-            [[human_message_id, "user", "new direct post", "user:flynn", "alias-post-device", "alias-post-1"]]} =
+            [
+              [
+                human_message_id,
+                "user",
+                "new direct post",
+                "user:flynn",
+                "alias-post-device",
+                "alias-post-1"
+              ]
+            ]} =
              DB.query(
                ctx.db,
                "SELECT id,role,content,sender,deviceId,clientMessageId FROM messages WHERE clientMessageId='alias-post-1'"
@@ -886,7 +898,10 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, [[2]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
 
     assert {:ok, [[1]]} =
-             DB.query(ctx.db, "SELECT COUNT(*) FROM messages WHERE clientMessageId='alias-post-1'")
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM messages WHERE clientMessageId='alias-post-1'"
+             )
   end
 
   @tag recipient_readiness: true
