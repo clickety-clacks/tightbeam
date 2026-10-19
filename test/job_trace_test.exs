@@ -172,6 +172,53 @@ defmodule Tightbeam.JobTraceTest do
     assert {:ok, [[0]]} =
              DB.query(db, "SELECT COUNT(*) FROM wake_cancellations WHERE wakeId=?1", [notice_id])
 
+    # Holder attests replace inactivity deadlines; completion also closes its
+    # replacement. These source transitions precede the notice delivery attempt.
+    source_cancellations =
+      trace(db, {:user, "owner"}, "wi_trace").timeline
+      |> Enum.filter(&(&1.type == "wake_canceled"))
+
+    assert Enum.map(source_cancellations, &{&1.assignmentId, &1.reasonKind, &1.outcomeKind}) == [
+             {"asg_direct", "superseded", "replacement"},
+             {"asg_direct", "obligation_disposed", "disposition"},
+             {"asg_review", "superseded", "replacement"},
+             {"asg_review", "superseded", "replacement"}
+           ]
+
+    Enum.each(source_cancellations, fn entry ->
+      assignment_id = entry.assignmentId
+
+      assert %{consumer: "assignment_inactivity_deadline", assignment_id: ^assignment_id} =
+               Tightbeam.Wakes.get(db, entry.id)
+
+      assert entry.provenanceStatus == "proven"
+      assert entry.schedulingOrigin == "process:tightbeam"
+      assert {entry.requesterKind, entry.requesterId} == {"process", "tightbeam:assignments"}
+      assert entry.workImpactKind == "linked_work_open"
+      assert {entry.livenessTriggerKind, entry.livenessTriggerId, entry.actionNeeded} ==
+               {nil, nil, false}
+
+      case entry.outcomeKind do
+        "replacement" ->
+          assert {entry.causalSourceKind, entry.causalSourceId} ==
+                   {"wake", entry.replacementWakeId}
+
+          assert {entry.primaryWorkKind, entry.primaryWorkId} == {"assignment", assignment_id}
+
+          assert %{consumer: "assignment_inactivity_deadline", assignment_id: ^assignment_id} =
+                   Tightbeam.Wakes.get(db, entry.replacementWakeId)
+
+        "disposition" ->
+          assert {entry.causalSourceKind, entry.causalSourceId} ==
+                   {"assignment_transition", assignment_id}
+
+          assert {entry.dispositionKind, entry.dispositionId} ==
+                   {"assignment_transition", assignment_id}
+
+          assert {entry.primaryWorkKind, entry.primaryWorkId} == {"work_item", "wi_trace"}
+      end
+    end)
+
     assert [] =
              Tightbeam.NoticeBatcher.recover(db, System.system_time(:millisecond), [], personal)
 
@@ -260,7 +307,7 @@ defmodule Tightbeam.JobTraceTest do
     assert is_integer(canceled_at) and canceled_at >= completion.ts
 
     # Exact equality also excludes private prompt, attest and transcript fields.
-    assert Enum.filter(trace.timeline, &(&1.type == "wake_canceled")) == [
+    assert Enum.filter(trace.timeline, &(&1.type == "wake_canceled")) == source_cancellations ++ [
              %{
                assignmentId: "asg_direct",
                at: canceled_at,
