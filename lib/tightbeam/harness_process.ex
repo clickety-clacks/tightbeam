@@ -350,16 +350,6 @@ defmodule Tightbeam.HarnessProcess do
     end
   end
 
-  @doc "Kill only the gateway-recorded process group during credential replacement."
-  @spec park_credential_group(DB.server(), row()) :: :ok | :already_resolved | {:error, term()}
-  def park_credential_group(db, row) do
-    with {:ok, row} <- recover_identity_until(db, row, deadline(identity_wait_ms())) do
-      kill(db, row, "killed", :credential_group)
-    else
-      {:error, reason} -> unidentified(db, row, reason)
-    end
-  end
-
   @doc false
   @spec record_park_failure(DB.server(), row(), term()) :: :already_resolved | {:error, term()}
   def record_park_failure(db, row, reason), do: kill_failed(db, row, reason)
@@ -620,7 +610,7 @@ defmodule Tightbeam.HarnessProcess do
 
   defp unidentified(db, row, reason), do: kill_failed(db, row, reason)
 
-  defp kill(db, row, terminal_state \\ "killed", signal_scope \\ :process_tree) do
+  defp kill(db, row, terminal_state \\ "killed") do
     attempted_at = now()
 
     {:ok, _} =
@@ -634,7 +624,7 @@ defmodule Tightbeam.HarnessProcess do
         [row.launch_id, attempted_at]
       )
 
-    case send_sigkill(row, signal_scope) do
+    case send_sigkill(row) do
       :ok ->
         sent_at = now()
 
@@ -659,14 +649,8 @@ defmodule Tightbeam.HarnessProcess do
     end
   end
 
-  defp send_sigkill(row, signal_scope) do
-    command_result =
-      case signal_scope do
-        :process_tree -> run_group_command(row, command_timeout_ms())
-        :credential_group -> run_credential_group_command(row, command_timeout_ms())
-      end
-
-    case command_result do
+  defp send_sigkill(row) do
+    case run_group_command(row, command_timeout_ms()) do
       {_output, 0} ->
         :ok
 
@@ -851,13 +835,6 @@ defmodule Tightbeam.HarnessProcess do
       timeout_ms
     )
   end
-
-  # Keep the identity-fenced positional form shared by 0.1.10 and command 2908.
-  # The satellite validates the recorded boot and launch identity, then freezes
-  # and revalidates the tracked process tree before signalling it. A refusal is
-  # returned to the caller and leaves the durable park fence up.
-  defp run_credential_group_command(row, timeout_ms),
-    do: run_group_command(row, timeout_ms)
 
   defp run_cursor_group_command(row, timeout_ms) do
     bounded_command(

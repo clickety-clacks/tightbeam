@@ -42,13 +42,13 @@ defmodule Tightbeam.HarnessProcessTest do
     Tightbeam.HarnessProcessFixture.run!(tmp, 6)
   end
 
-  test "satellite credential parking uses the shared identity-fenced command", %{tmp_dir: tmp} do
+  test "satellite parking uses the shared identity-fenced command", %{tmp_dir: tmp} do
     db = start_process_db()
     capture = Path.join(tmp, "satellite-group-args-#{System.unique_integer([:positive])}")
     install_fake_ssh(tmp, capture, "exit 0")
     row = remote_park_row(db)
 
-    assert :ok = HarnessProcess.park_credential_group(db, row)
+    assert :ok = HarnessProcess.park(db, row)
 
     args = File.read!(capture) |> String.split("\n", trim: true)
     group_command = Enum.drop_while(args, &(&1 != "harness-group"))
@@ -90,7 +90,7 @@ defmodule Tightbeam.HarnessProcessTest do
     assert {:error,
             {:kill_failed,
              {:satellite_command_version_mismatch, "satellite-fixture", "harness-group"}}} =
-             HarnessProcess.park_credential_group(db, row)
+             HarnessProcess.park(db, row)
 
     assert HarnessProcess.fenced?(db, {:claude, "shared", "satellite-fixture"})
 
