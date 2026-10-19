@@ -252,8 +252,10 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
   defp authorized?(_txn, %{kind: "user", ref: user}, %{owner_user_id: owner}),
     do: user == owner
 
-  defp authorized?(txn, %{kind: "session", ref: caller},
-         %{holder: holder, opened_by_session: opened_by_session}) do
+  defp authorized?(txn, %{kind: "session", ref: caller}, %{
+         holder: holder,
+         opened_by_session: opened_by_session
+       }) do
     case {
       product_owner_lane(txn, caller),
       product_owner_lane(txn, holder),
@@ -262,7 +264,8 @@ defmodule Tightbeam.AssignmentCommitRefCorrections do
       {lane, holder_lane, opener_lane} when is_binary(lane) ->
         lane == holder_lane or lane == opener_lane
 
-      _ -> false
+      _ ->
+        false
     end
   end
 
