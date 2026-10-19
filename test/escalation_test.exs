@@ -1821,9 +1821,13 @@ defmodule Tightbeam.EscalationTest do
   end
 
   test "a failure after wake and fact creation rolls the full ruling back", ctx do
+    # The opening notice has its own delivery transaction, outside the ruling.
+    stop_supervised!(Wakes)
+
     request =
       Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "rollback?"}))
 
+    assert [%{wake_id: opening_id, state: "pending"}] = notification_wakes(ctx)
     before_events = EventLog.lifecycle_events(ctx.db)
 
     assert {:ok, [[wake_count, fact_count, event_count]]} =
@@ -1853,10 +1857,26 @@ defmodule Tightbeam.EscalationTest do
                "SELECT status,decision,ruledAt,rulingFactId, (SELECT COUNT(*) FROM wakes), (SELECT COUNT(*) FROM condition_facts), (SELECT COUNT(*) FROM lifecycle_events) FROM decision_requests WHERE id=?1",
                [request.id]
              )
+
+    # Independently delivering the already-committed opening notice explains
+    # the extra event without changing the rolled-back decision.
+    scheduler = start_gateway_scheduler(ctx)
+    assert :ok = Wakes.fire_due(scheduler)
+    assert Wakes.get(ctx.db, opening_id).state == "canceled"
+
+    assert [%{kind: "wake_undeliverable", subject: ^opening_id}] =
+             EventLog.lifecycle_events(ctx.db) -- before_events
+
+    assert {:ok, [["open", nil]]} =
+             DB.query(ctx.db, "SELECT status,ruledAt FROM decision_requests WHERE id=?1", [
+               request.id
+             ])
   end
 
   test "atomic ruling failures roll back every ordered step and recognition survives nudge loss",
        ctx do
+    stop_supervised!(Wakes)
+
     for step <- [
           :after_load,
           :after_schedule,
