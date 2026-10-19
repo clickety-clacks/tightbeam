@@ -497,8 +497,8 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
         ctx.admin_device.token
       )
 
-    assert wrong_principal.status == 404
-    assert JSON.decode!(wrong_principal.resp_body)["error"]["code"] == "not_found"
+    assert wrong_principal.status == 400
+    assert JSON.decode!(wrong_principal.resp_body)["error"]["code"] == "invalid_cursor"
 
     append_history = fn index, extra ->
       {:appended, row} =
