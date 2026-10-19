@@ -173,7 +173,7 @@ defmodule Tightbeam.EscalationTest do
   end
 
   test "owner delivery is one durable source notice armed with the open transaction", ctx do
-    stop_supervised!(ctx.scheduler)
+    stop_supervised!(Wakes)
     parent = self()
     call = call(ctx.raiser, %{assignment_id: "a-delivery", kind: "completion"})
     owner_session = Org.personal_session_key("flynn")
