@@ -127,6 +127,51 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     refute third.wake_id in [first.wake_id, second.wake_id]
   end
 
+  test "a parent action reminder waits for the delivered notice turn to end", ctx do
+    {_parent_assignment, _child_assignment, root} = completed_child(ctx)
+
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    root_carrier_id = assert_delivered_carrier(ctx.db, root.wake_id)
+    [reminder] = pending_reminders(ctx.db, root.wake_id)
+
+    assert {:ok, [[nil]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT t.endedAt
+               FROM wakes w
+               JOIN turns t ON t.seq=w.deliveredTurnSeq
+               WHERE w.wakeId=?1
+               """,
+               [root.wake_id]
+             )
+
+    set_due_now(ctx.db, reminder.wake_id)
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+
+    assert Wakes.get(ctx.db, reminder.wake_id).fired_at == nil
+    assert NoticeBatcher.source_refs(ctx.db, reminder.wake_id) == []
+
+    finish_carrier_turn!(ctx.db, root_carrier_id)
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT count(*)
+               FROM wakes w
+               JOIN turns t ON t.seq=w.deliveredTurnSeq
+               WHERE w.wakeId=?1 AND t.endedAt IS NOT NULL
+               """,
+               [root.wake_id]
+             )
+
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+
+    assert Wakes.get(ctx.db, reminder.wake_id).state == "fired"
+    assert_delivered_carrier(ctx.db, reminder.wake_id)
+  end
+
   test "a recovered finish notice without an action destination remains notice-only", ctx do
     item = create_work_item(ctx, "recovered completion")
 
