@@ -74,6 +74,7 @@ defmodule Tightbeam.HarnessProcessTest do
   } do
     db = start_process_db()
     capture = Path.join(tmp, "satellite-group-usage-#{System.unique_integer([:positive])}")
+
     usage =
       "usage: tightbeam harness-group <process-group-id> <identity-path> " <>
         "<boot-identity> <launch-id>"
