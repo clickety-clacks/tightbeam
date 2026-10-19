@@ -1004,6 +1004,19 @@ defmodule Tightbeam.Wakes do
     ) == [[1]]
   end
 
+  defp terminal_notice_has_finished_delivery_turn_in_txn?(txn, source_wake_id, session_key) do
+    Txn.q(
+      txn,
+      """
+      SELECT 1
+      FROM wakes w
+      JOIN turns t ON t.seq=w.deliveredTurnSeq
+      WHERE w.wakeId=?1 AND t.sessionKey=?2 AND t.endedAt IS NOT NULL
+      """,
+      [source_wake_id, session_key]
+    ) == [[1]]
+  end
+
   defp terminal_action_note_matches?(note, event) when is_binary(note) do
     case Regex.run(
            ~r/\Acompletion-handoff-action ([^\s]+) ([^\s]+) ([^\s]+) (kept|parked|retired): (.+)\z/u,
@@ -7546,6 +7559,9 @@ defmodule Tightbeam.Wakes do
         cancel_unresolvable_terminal_action_reminder_if_needed_in_txn(txn, wake) ->
           :noop
 
+        terminal_action_reminder_waiting_for_notice_turn?(txn, wake) ->
+          :noop
+
         true ->
           fired_at = now()
 
@@ -7633,6 +7649,25 @@ defmodule Tightbeam.Wakes do
   end
 
   defp supersede_completed_terminal_action_reminder_in_txn(_txn, _wake), do: false
+
+  defp terminal_action_reminder_waiting_for_notice_turn?(
+         txn,
+         %{obligation_ref: @terminal_action_marker <> _} = wake
+       ) do
+    case terminal_action_root_event_in_txn(txn, wake) do
+      {:ok, root, _event} ->
+        not terminal_notice_has_finished_delivery_turn_in_txn?(
+          txn,
+          root.wake_id,
+          root.session_key
+        )
+
+      :error ->
+        false
+    end
+  end
+
+  defp terminal_action_reminder_waiting_for_notice_turn?(_txn, _wake), do: false
 
   defp cancel_unresolvable_terminal_action_reminder_if_needed_in_txn(
          txn,
