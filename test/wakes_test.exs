@@ -1179,6 +1179,7 @@ defmodule Tightbeam.WakesTest do
 
            :ok = Wakes.fire_due(self())
            send(test_pid, {:self_fire_returned, wake.wake_id, nested.wake_id})
+
            assert {:accepted_in_txn, _event_id, %{canceled: true}} =
                     public_cancel(db, wake.wake_id, wake.origin, %{kind: "session", id: "k1"})
          end
