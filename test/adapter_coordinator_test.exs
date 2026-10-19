@@ -1241,7 +1241,10 @@ defmodule Tightbeam.AdapterCoordinatorTest do
              harness: :claude,
              cmd: [System.find_executable("node"), path],
              home: ctx.test_dir,
-             cwd: ctx.test_dir
+             cwd: ctx.test_dir,
+             stderr_path: Path.join(ctx.test_dir, "credential-park.stderr"),
+             process_identity_dir: ctx.test_dir,
+             process_helper: @process_helper
            ]
          end,
          db: ctx.db,
