@@ -5579,6 +5579,10 @@ defmodule Tightbeam.Wakes do
                 client_message_id: "wake-undelivered:#{seq}"
               })
 
+            if disposition == :appended do
+              Tightbeam.Firehose.Publisher.message_in_txn(txn, recipient, marker, owner)
+            end
+
             if disposition in [:appended, :duplicate],
               do: [{recipient, owner, marker}],
               else: raise("wake undelivered notice conflicts with delivery turn #{seq}")

@@ -139,6 +139,7 @@ defmodule Tightbeam.GatewayTest do
     Roles,
     Rules,
     SessionLane,
+    StateResources,
     Wakes,
     WorkItems
   }
@@ -2853,6 +2854,22 @@ defmodule Tightbeam.GatewayTest do
     start_supervised!({CoordinatorStub, candidate})
     start_lane!(ctx.db, "k1")
 
+    start_supervised!({Tightbeam.Firehose.Hub, name: Tightbeam.Firehose.Hub})
+
+    :ok =
+      Tightbeam.Firehose.Hub.register(Tightbeam.Firehose.Hub, self(), %{
+        mode: :subscribed,
+        db: ctx.db,
+        user_id: "flynn",
+        is_admin: false
+      })
+
+    :ok =
+      Tightbeam.Firehose.Hub.subscribe(Tightbeam.Firehose.Hub, self(), "initial-model-retune", %{
+        "classes" => ["message.created"],
+        "sessionKey" => "k1"
+      })
+
     assert %{ok: true, model: "claude-opus-5-5", projection_committed: true} =
              Gateway.handlers(config)["tune"].(%{
                origin: "user:flynn",
@@ -2864,6 +2881,13 @@ defmodule Tightbeam.GatewayTest do
                     %Model{family: "claude-opus-5-5", effort: nil, context: nil}}
 
     assert Org.get(ctx.db, "k1").model == Model.new("claude-opus-5-5")
+
+    assert_receive {:firehose_notice, %{"class" => "message.created"} = message_notice}
+    assert_message_notice_matches_rest!(ctx.db, message_notice)
+    assert message_notice["payload"]["marker"]["kind"] == "model-retune"
+    :ok = Tightbeam.Firehose.Hub.delivered(Tightbeam.Firehose.Hub, self())
+    :sys.get_state(Tightbeam.Firehose.Hub)
+    refute_receive {:firehose_notice, %{"class" => "message.created"}}, 0
   end
 
   test "an exact Claude id reaches the local client when remote inventory is unavailable", ctx do
@@ -3871,7 +3895,7 @@ defmodule Tightbeam.GatewayTest do
 
     :ok =
       Tightbeam.Firehose.Hub.subscribe(Tightbeam.Firehose.Hub, self(), "swapme", %{
-        "classes" => ["session."],
+        "classes" => ["session.", "message.created"],
         "sessionKey" => "swapme"
       })
 
@@ -3888,12 +3912,19 @@ defmodule Tightbeam.GatewayTest do
                       "payload" => harness_changed
                     }}
 
+    :ok = Tightbeam.Firehose.Hub.delivered(Tightbeam.Firehose.Hub, self())
+
+    assert_receive {:firehose_notice, %{"class" => "message.created"} = message_notice}
+    assert_message_notice_matches_rest!(ctx.db, message_notice)
+    assert message_notice["payload"]["marker"]["kind"] == "harness-switch"
+
     assert harness_changed["clearedThroughSeq"] == Org.get(ctx.db, "swapme").cleared_through_seq
 
     :ok = Tightbeam.Firehose.Hub.delivered(Tightbeam.Firehose.Hub, self())
     :sys.get_state(Tightbeam.Firehose.Hub)
     refute_receive {:firehose_notice, %{"class" => "session.harness_changed"}}, 0
     refute_receive {:firehose_notice, %{"class" => "session.updated"}}, 0
+    refute_receive {:firehose_notice, %{"class" => "message.created"}}, 0
 
     rest_opts =
       gateway_config(base_dir, ctx.db, 0)
@@ -5289,6 +5320,22 @@ defmodule Tightbeam.GatewayTest do
     assert [%{error: reason}] =
              ctx.db |> Ledger.unpublished_terminals() |> Enum.filter(&(&1.seq == seq))
 
+    start_supervised!({Tightbeam.Firehose.Hub, name: Tightbeam.Firehose.Hub})
+
+    :ok =
+      Tightbeam.Firehose.Hub.register(Tightbeam.Firehose.Hub, self(), %{
+        mode: :subscribed,
+        db: ctx.db,
+        user_id: "flynn",
+        is_admin: false
+      })
+
+    :ok =
+      Tightbeam.Firehose.Hub.subscribe(Tightbeam.Firehose.Hub, self(), "turn-failed-marker", %{
+        "classes" => ["message.created"],
+        "sessionKey" => "k1"
+      })
+
     publisher = Gateway.terminal_publisher_for_test(ctx.db)
     # The marker is appended before the wire publish; the publish leg needs a
     # live registry that this test does not care about.
@@ -5297,6 +5344,13 @@ defmodule Tightbeam.GatewayTest do
     catch
       :exit, _ -> :ok
     end
+
+    assert_receive {:firehose_notice, %{"class" => "message.created"} = notice}
+    assert_message_notice_matches_rest!(ctx.db, notice)
+    assert notice["payload"]["messageType"] == "substrate"
+    :ok = Tightbeam.Firehose.Hub.delivered(Tightbeam.Firehose.Hub, self())
+    :sys.get_state(Tightbeam.Firehose.Hub)
+    refute_receive {:firehose_notice, %{"class" => "message.created"}}, 0
 
     marker =
       ctx.db
@@ -5906,6 +5960,22 @@ defmodule Tightbeam.GatewayTest do
     Org.append_pointer(ctx.db, "k1", "existing-session", "created")
     start_lane!(ctx.db, "k1")
 
+    start_supervised!({Tightbeam.Firehose.Hub, name: Tightbeam.Firehose.Hub})
+
+    :ok =
+      Tightbeam.Firehose.Hub.register(Tightbeam.Firehose.Hub, self(), %{
+        mode: :subscribed,
+        db: ctx.db,
+        user_id: "flynn",
+        is_admin: false
+      })
+
+    :ok =
+      Tightbeam.Firehose.Hub.subscribe(Tightbeam.Firehose.Hub, self(), "model-retune", %{
+        "classes" => ["message.created"],
+        "sessionKey" => "k1"
+      })
+
     adapter = start_supervised!({TuneAdapterStub, {self(), resident: true}})
     start_supervised!({CoordinatorStub, {adapter, self()}})
     put_host_catalog(local_host, "claude", ["claude-sonnet-4-6"])
@@ -5938,6 +6008,13 @@ defmodule Tightbeam.GatewayTest do
     assert marker_facts.kind == "model-retune"
     assert marker_facts.from == "fable"
     assert marker_facts.to == "claude-sonnet-4-6"
+
+    assert_receive {:firehose_notice, %{"class" => "message.created"} = message_notice}
+    assert_message_notice_matches_rest!(ctx.db, message_notice)
+    assert message_notice["payload"]["marker"]["kind"] == "model-retune"
+    :ok = Tightbeam.Firehose.Hub.delivered(Tightbeam.Firehose.Hub, self())
+    :sys.get_state(Tightbeam.Firehose.Hub)
+    refute_receive {:firehose_notice, %{"class" => "message.created"}}, 0
   end
 
   test "set_model keeps a superseded session's failed close beside the committed switch", ctx do
@@ -11403,6 +11480,20 @@ defmodule Tightbeam.GatewayTest do
        do: "activity:#{active}"
 
   defp frame_name(%{"type" => "ack"}), do: "ack"
+
+  defp assert_message_notice_matches_rest!(db, notice) do
+    item =
+      db
+      |> StateResources.query_message(notice["payload"]["id"])
+      |> StateResources.message()
+
+    assert notice["payload"] == item
+    assert notice["refs"]["messageId"] == item["id"]
+    assert notice["refs"]["sessionKey"] == item["sessionKey"]
+    item_bytes = StateResources.encode_item("transcript messages", item)
+    wire_notice = Tightbeam.Firehose.Publisher.encode_wire_notice(notice)
+    assert String.contains?(wire_notice, "\"payload\":" <> item_bytes)
+  end
 
   defp put_skill!(base_dir, name, body) do
     Identity.init!(base_dir)
