@@ -1781,6 +1781,9 @@ defmodule Tightbeam.Wire.Router do
 
     case d1_resource(spec) do
       :artifacts ->
+        principal = core_detail_trace_principal(conn, principal)
+        core_detail_trace(conn, {:shared_lookup, spec.resource, :query_artifact})
+
         page =
           StateResources.query_artifact(db(conn), %{
             collection: %{
@@ -1792,7 +1795,11 @@ defmodule Tightbeam.Wire.Router do
           })
 
         result = %{
-          items: Enum.map(page.rows, &StateResources.artifact/1),
+          items:
+            Enum.map(page.rows, fn row ->
+              core_detail_trace(conn, {:serializer, spec.resource, :artifact})
+              StateResources.artifact(row)
+            end),
           flags: %{
             has_more_before: page.has_more_before,
             has_more_after: page.has_more_after
@@ -1803,6 +1810,9 @@ defmodule Tightbeam.Wire.Router do
         d1_send(conn, 200, d1_collection_envelope(spec, items, page))
 
       :assignment_attests ->
+        principal = core_detail_trace_principal(conn, principal)
+        core_detail_trace(conn, {:shared_lookup, spec.resource, :query_attest})
+
         case StateResources.query_attest(db(conn), %{
                collection: %{
                  parent_id: parent_id,
@@ -1817,7 +1827,11 @@ defmodule Tightbeam.Wire.Router do
 
           {:ok, page} ->
             result = %{
-              items: Enum.map(page.rows, &StateResources.attest/1),
+              items:
+                Enum.map(page.rows, fn row ->
+                  core_detail_trace(conn, {:serializer, spec.resource, :attest})
+                  StateResources.attest(row)
+                end),
               flags: %{
                 has_more_before: page.has_more_before,
                 has_more_after: page.has_more_after
