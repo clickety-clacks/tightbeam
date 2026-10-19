@@ -190,6 +190,7 @@ defmodule GuardSplitMessages do
             refute_receive {:push_message, _, _,
                             %{"role" => "assistant", "content" => "LATE ASSISTANT RESULT"}},
                            100
+
             :sys.get_state(Hub)
             refute_receive {:firehose_notice, %{"class" => "message.created"}}, 100
           after

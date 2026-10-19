@@ -1,7 +1,19 @@
 defmodule Tightbeam.Firehose.PublisherTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{ConnRegistry, DB, Dispatch, Escalation, Gateway, Ledger, Org, Projection, StateResources, Wakes}
+  alias Tightbeam.{
+    ConnRegistry,
+    DB,
+    Dispatch,
+    Escalation,
+    Gateway,
+    Ledger,
+    Org,
+    Projection,
+    StateResources,
+    Wakes
+  }
+
   alias Tightbeam.NoticeBatcher
   alias Tightbeam.Firehose.{Hub, Publisher}
 
@@ -692,7 +704,10 @@ defmodule Tightbeam.Firehose.PublisherTest do
     db = :firehose_substrate_append_db
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Tightbeam.Schema.ensure_all(db)
-    :ok = Hub.register(Hub, self(), %{mode: :subscribed, db: db, user_id: "flynn", is_admin: false})
+
+    :ok =
+      Hub.register(Hub, self(), %{mode: :subscribed, db: db, user_id: "flynn", is_admin: false})
+
     {:ok, _} = DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES ('flynn', 1, 1)")
     register_testhost(db)
 

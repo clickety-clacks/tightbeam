@@ -431,7 +431,14 @@ defmodule Tightbeam.Productions.BubbleTest do
     @delivery_status status
     test "#{status} names the carried wake and records one sender result without retry", ctx do
       start_supervised!({Hub, name: Hub})
-      :ok = Hub.register(Hub, self(), %{mode: :subscribed, db: ctx.db, user_id: "flynn", is_admin: false})
+
+      :ok =
+        Hub.register(Hub, self(), %{
+          mode: :subscribed,
+          db: ctx.db,
+          user_id: "flynn",
+          is_admin: false
+        })
 
       {wake, turn, sender} = fail_wake!(ctx, @delivery_status)
 
@@ -445,6 +452,7 @@ defmodule Tightbeam.Productions.BubbleTest do
       assert :ok = Bubble.recognize_terminal(ctx.db, turn.seq)
 
       assert_receive {:firehose_notice, %{"class" => "message.created"} = notice}
+
       item =
         ctx.db
         |> StateResources.query_message(notice["payload"]["id"])
