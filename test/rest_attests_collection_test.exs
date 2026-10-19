@@ -217,7 +217,9 @@ defmodule Tightbeam.RestAttestsCollectionTest do
            ) == ["test_attest_filter_verdict_reader"]
 
     assert Enum.map(
-             JSON.decode!(get(ctx, "/api/attests?bySession=#{ctx.reader_session.session_key}").resp_body)["items"],
+             JSON.decode!(
+               get(ctx, "/api/attests?bySession=#{ctx.reader_session.session_key}").resp_body
+             )["items"],
              & &1["id"]
            ) == ["test_attest_filter_progress"]
 
@@ -369,7 +371,10 @@ defmodule Tightbeam.RestAttestsCollectionTest do
 
   test "top-level paging omits a boundary attest after its parent grant becomes hidden", ctx do
     work_item = create_work_item(ctx.db, "reader", "Attest cursor visibility")
-    assignment = create_assignment(ctx.db, "other", ctx.other_session, work_item, "Owner-only grant")
+
+    assignment =
+      create_assignment(ctx.db, "other", ctx.other_session, work_item, "Owner-only grant")
+
     ids = attest_page_ids("test_attest_hidden_cursor_", 0, 3)
     insert_attest_rows(ctx, assignment.id, ids, 16_000)
 
