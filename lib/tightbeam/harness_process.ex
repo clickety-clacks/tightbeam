@@ -507,7 +507,11 @@ defmodule Tightbeam.HarnessProcess do
         row -> settle_proven_dead_row(db, row)
       end
 
-    if result == :ok, do: complete_park(db, key)
+    # :settled released the fence inside the settlement transaction; :ok and
+    # :already_resolved leave no unresolved launch behind, so the fence taken
+    # above must come back out or every untracked-launch death parks the key
+    # forever. Only an error keeps the key fenced.
+    if result in [:ok, :already_resolved], do: complete_park(db, key)
     if result == :settled, do: :ok, else: result
   end
 
