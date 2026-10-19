@@ -1109,8 +1109,8 @@ defmodule Tightbeam.WorkItems do
         turn ->
           if StateVisibility.core_detail_visible?(txn, "turns", turn, principal) and
                ExecutionMap.work_item_trace_turn_has_visible_link?(turn, resolution),
-            do: [turn],
-            else: []
+             do: [turn],
+             else: []
       end
     end)
   end

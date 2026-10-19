@@ -180,8 +180,21 @@ defmodule Tightbeam.WorkItemTraceRestTest do
              "dependencyVersion"
            ])
 
-    insert_attest!(ctx.db, "att_trace_invariant", base_assignment, ctx.owner_session.session_key, 60_000)
-    insert_pending_wake!(ctx.db, "wake_trace_invariant", ctx.owner_session.session_key, second_review, 60_000)
+    insert_attest!(
+      ctx.db,
+      "att_trace_invariant",
+      base_assignment,
+      ctx.owner_session.session_key,
+      60_000
+    )
+
+    insert_pending_wake!(
+      ctx.db,
+      "wake_trace_invariant",
+      ctx.owner_session.session_key,
+      second_review,
+      60_000
+    )
 
     invariant_response = get(ctx, "/api/work-items/#{root}/trace")
     assert invariant_response.resp_body == response.resp_body
@@ -248,8 +261,19 @@ defmodule Tightbeam.WorkItemTraceRestTest do
     child_before = get(ctx, "/api/work-items/#{child}/trace", ctx.owner_session.cli_token)
     child_before_trace = decode_trace!(child_before)
     assert child_before_trace["attribution"]["provenanceStatus"] == "from_turn"
-    assert_trace_parent_matches_execution_map!(ctx, root, before_trace, ctx.owner_session.cli_token)
-    assert_trace_parent_matches_execution_map!(ctx, child, child_before_trace, ctx.owner_session.cli_token)
+    assert_trace_parent_matches_execution_map!(
+      ctx,
+      root,
+      before_trace,
+      ctx.owner_session.cli_token
+    )
+
+    assert_trace_parent_matches_execution_map!(
+      ctx,
+      child,
+      child_before_trace,
+      ctx.owner_session.cli_token
+    )
 
     hidden_parent = insert_work_item!(ctx.db, "wi_trace_twin_hidden_parent", "other", 41_000)
 
@@ -269,7 +293,12 @@ defmodule Tightbeam.WorkItemTraceRestTest do
     assert after_trace["causalChildren"] == []
     child_after = get(ctx, "/api/work-items/#{child}/trace", ctx.owner_session.cli_token)
     assert child_after.resp_body == child_before.resp_body
-    assert_trace_parent_matches_execution_map!(ctx, child, decode_trace!(child_after), ctx.owner_session.cli_token)
+    assert_trace_parent_matches_execution_map!(
+      ctx,
+      child,
+      decode_trace!(child_after),
+      ctx.owner_session.cli_token
+    )
     refute after_response.resp_body =~ "asg_trace_twin_hidden_base"
     refute after_response.resp_body =~ "asg_trace_twin_review"
     refute after_response.resp_body =~ "wi_trace_twin_hidden_parent"
