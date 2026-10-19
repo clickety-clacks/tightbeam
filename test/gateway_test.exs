@@ -4635,15 +4635,15 @@ defmodule Tightbeam.GatewayTest do
   end
 
   test "spawn refusal relays each where host's catalog cause and remedy", ctx do
-    base_dir = placement_test_base("catalog-causes", ["eurisko", "racter"])
+    base_dir = placement_test_base("catalog-causes", ["eurisko", "testhost"])
 
     register_hosts(ctx.db, %{
       "eurisko" => %{ssh: "eurisko", base_dir: "/srv/eurisko", cli_bin: nil},
-      "racter" => %{ssh: "racter", base_dir: "/srv/racter", cli_bin: nil}
+      "testhost" => %{ssh: "testhost", base_dir: "/srv/testhost", cli_bin: nil}
     })
 
     await_host_catalog("eurisko", "codex")
-    await_host_catalog("racter", "codex")
+    await_host_catalog("testhost", "codex")
 
     degrade_host_catalog(
       "eurisko",
@@ -4651,7 +4651,7 @@ defmodule Tightbeam.GatewayTest do
       {:empty_catalog_for_client_version, "0.145.0"}
     )
 
-    degrade_host_catalog("racter", "codex", {:needs_onboarding, :missing})
+    degrade_host_catalog("testhost", "codex", {:needs_onboarding, :missing})
 
     config =
       gateway_config(base_dir, ctx.db, 0)
@@ -4671,8 +4671,8 @@ defmodule Tightbeam.GatewayTest do
 
     assert message =~ "eurisko: cannot route gpt-5.6-sol (effort medium) on eurisko"
     assert message =~ "upgrade codex on eurisko"
-    assert message =~ "racter: cannot route gpt-5.6-sol (effort medium) on racter"
-    assert message =~ "run tightbeam onboard openai --as-user <userId> on racter"
+    assert message =~ "testhost: cannot route gpt-5.6-sol (effort medium) on testhost"
+    assert message =~ "run tightbeam onboard openai --as-user <userId> on testhost"
   end
 
   test "spawn uses the next where host when the first fails live spinup", ctx do
