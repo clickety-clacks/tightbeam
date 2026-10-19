@@ -6916,7 +6916,7 @@ defmodule Tightbeam.AssignmentsTest do
              handle(ctx, "attest", completion)
   end
 
-  test "code completion rejects producer and review evidence for different commits", ctx do
+  test "code completion explains missing refs on the linked clean review", ctx do
     previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
 
     on_exit(fn ->
@@ -6929,13 +6929,65 @@ defmodule Tightbeam.AssignmentsTest do
       {"", 0}
     end)
 
-    producer_refs = [
-      %{"repo" => "testhost:/tmp/producer-checkout", "commit" => String.duplicate("a", 40)}
-    ]
+    candidate_commit = String.duplicate("a", 40)
+    candidate_refs = [%{"repo" => "testhost:/tmp/producer-checkout", "commit" => candidate_commit}]
 
-    review_refs = [
-      %{"repo" => "testhost:/tmp/reviewer-checkout", "commit" => String.duplicate("b", 40)}
-    ]
+    producer = handle(ctx, "assign", assign_call({:user, "other"}, "missing review refs producer"))
+
+    review =
+      assign_call({:user, "other"}, "missing review refs review")
+      |> Map.put(:session_key, "other-session")
+      |> put_in([:params, :reviews_assignment_id], producer.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    assert %{attest: %{verdictKind: "reviewed-clean"}} =
+             attest_call({:session, "other-session"}, review.id, "verdict")
+             |> put_in([:params, :verdict_kind], "reviewed-clean")
+             |> then(&handle(ctx, "attest", &1))
+
+    assert %{attest: %{verdictKind: "verified"}} =
+             attest_call({:session, "holder"}, producer.id, "verdict")
+             |> put_in([:params, :verdict_kind], "verified")
+             |> put_in([:params, :commit_refs], candidate_refs)
+             |> then(&handle(ctx, "attest", &1))
+
+    completion =
+      attest_call({:session, "holder"}, producer.id, "completion")
+      |> put_in([:params, :commit_refs], candidate_refs)
+
+    assert %{code: "inapplicable_code_evidence", message: message} =
+             handle(ctx, "attest", completion)
+
+    assert message =~ "missing commitRefs"
+    assert message =~ candidate_commit
+    assert message =~ "file a new independent reviewed-clean verdict"
+
+    assert %{state: "open", closingAttestId: nil} =
+             handle(
+               ctx,
+               "assignment-get",
+               assignment_get_call({:session, "holder"}, producer.id)
+             )
+  end
+
+  test "code completion explains a linked clean review for a different commit", ctx do
+    previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
+
+    on_exit(fn ->
+      if previous_runner,
+        do: Application.put_env(:tightbeam, :commit_ref_command, previous_runner),
+        else: Application.delete_env(:tightbeam, :commit_ref_command)
+    end)
+
+    Application.put_env(:tightbeam, :commit_ref_command, fn _executable, _args, _opts ->
+      {"", 0}
+    end)
+
+    candidate_commit = String.duplicate("a", 40)
+    review_commit = String.duplicate("b", 40)
+    producer_refs = [%{"repo" => "testhost:/tmp/producer-checkout", "commit" => candidate_commit}]
+
+    review_refs = [%{"repo" => "testhost:/tmp/reviewer-checkout", "commit" => review_commit}]
 
     producer = handle(ctx, "assign", assign_call({:user, "flynn"}, "different-commit producer"))
 
@@ -6961,7 +7013,13 @@ defmodule Tightbeam.AssignmentsTest do
       attest_call({:session, "holder"}, producer.id, "completion")
       |> put_in([:params, :commit_refs], producer_refs)
 
-    assert %{code: "inapplicable_code_evidence"} = handle(ctx, "attest", completion)
+    assert %{code: "inapplicable_code_evidence", message: message} =
+             handle(ctx, "attest", completion)
+
+    assert message =~ "do not match completion candidate"
+    assert message =~ candidate_commit
+    assert message =~ review_commit
+    assert message =~ "file a new independent reviewed-clean verdict"
 
     assert %{state: "open", closingAttestId: nil} =
              handle(
