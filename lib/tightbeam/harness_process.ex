@@ -192,6 +192,7 @@ defmodule Tightbeam.HarnessProcess do
       )
     )
     |> Keyword.put(:harness_process_launch_id, launch_id)
+    |> Keyword.put(:harness_process_satellite_host, if(is_binary(ssh), do: elem(key, 2)))
   end
 
   @doc "Read and persist the identity written by the launched process itself."
@@ -659,10 +660,19 @@ defmodule Tightbeam.HarnessProcess do
       {output, status} ->
         reason = one_line(output)
 
-        if String.starts_with?(reason, "harness ") do
-          {:refused, reason}
-        else
-          {:error, {:sigkill_not_delivered, status, reason}}
+        mismatch =
+          if is_binary(row.ssh) do
+            Tightbeam.Harness.Support.satellite_command_version_mismatch(
+              output,
+              row.host,
+              "harness-group"
+            )
+          end
+
+        cond do
+          mismatch -> {:error, mismatch}
+          String.starts_with?(reason, "harness ") -> {:refused, reason}
+          true -> {:error, {:sigkill_not_delivered, status, reason}}
         end
     end
   end
