@@ -168,11 +168,11 @@ defmodule Tightbeam.RestExecutionMapTest do
 
     parent = self()
 
-    reader =
+    reader_task =
       Task.async(fn ->
         DB.read_transaction(db, fn txn ->
           before = Tightbeam.DB.Txn.q(txn, "SELECT value FROM read_snapshot_probe")
-          send(parent, {:read_snapshot_started, before})
+          send(parent, {:read_snapshot_started, before, self()})
 
           receive do
             :continue -> :ok
@@ -185,7 +185,7 @@ defmodule Tightbeam.RestExecutionMapTest do
         end)
       end)
 
-    assert_receive {:read_snapshot_started, [[1]]}, 5_000
+    assert_receive {:read_snapshot_started, [[1]], reader_conn}, 5_000
 
     writer =
       Task.async(fn ->
@@ -196,10 +196,10 @@ defmodule Tightbeam.RestExecutionMapTest do
       end)
 
     write_result = Task.yield(writer, 2_000)
-    send(reader.pid, :continue)
+    send(reader_conn, :continue)
 
     assert {:ok, {:ok, :written}} = write_result
-    assert {:ok, {:ok, {[[1]], [[1]]}}} = Task.await(reader, 5_000)
+    assert {:ok, {:ok, {[[1]], [[1]]}}} = Task.await(reader_task, 5_000)
     assert {:ok, [[2]]} = DB.query(db, "SELECT value FROM read_snapshot_probe")
   end
 
