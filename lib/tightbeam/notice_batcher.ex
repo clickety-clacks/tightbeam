@@ -850,7 +850,8 @@ defmodule Tightbeam.NoticeBatcher do
     {human_posts, batch_sources} =
       Enum.split_with(sources_with_client_identity, fn source ->
         is_binary(source.origin) and String.starts_with?(source.origin, "user:") and
-          not is_nil(source.source_client_identity)
+          is_map(source.source_client_identity) and
+          Map.get(source.source_client_identity, "waitingForBusySession") == true
       end)
 
     human_deliveries =

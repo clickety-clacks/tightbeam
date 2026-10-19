@@ -2251,6 +2251,13 @@ defmodule Tightbeam.Gateway do
           case message_result do
             :new ->
               if not queued_human_post_delivery? and stage_for_queue?(txn, target, opts) do
+                opts =
+                  Keyword.put(
+                    opts,
+                    :waiting_for_busy_session,
+                    session_busy_in_txn?(txn, target)
+                  )
+
                 stage_prompt_in_txn(
                   txn,
                   target,
@@ -2305,6 +2312,14 @@ defmodule Tightbeam.Gateway do
         opts[:role_ref],
         opts[:wake_id]
       )
+  end
+
+  defp session_busy_in_txn?(txn, session_key) do
+    DB.Txn.q(
+      txn,
+      "SELECT 1 FROM turns WHERE sessionKey=?1 AND status IN ('queued','running') LIMIT 1",
+      [session_key]
+    ) != []
   end
 
   defp batch_carrier_wake?(_txn, wake_id) when not is_binary(wake_id), do: false
@@ -2414,14 +2429,21 @@ defmodule Tightbeam.Gateway do
 
     if is_binary(device_id) and device_id != "" and is_binary(client_message_id) and
          client_message_id != "" and is_binary(payload_sha256) do
-      NoticeBatcher.persist_source_client_in_txn(txn, wake.wake_id, %{
+      identity = %{
         "targetSessionKey" => target,
         "deviceId" => device_id,
         "clientMessageId" => client_message_id,
         "sourceWakeId" => wake.wake_id,
         "payloadSha256" => payload_sha256,
         "createdAt" => wake.created_at
-      })
+      }
+
+      identity =
+        if Keyword.get(opts, :waiting_for_busy_session) == true,
+          do: Map.put(identity, "waitingForBusySession", true),
+          else: identity
+
+      NoticeBatcher.persist_source_client_in_txn(txn, wake.wake_id, identity)
     end
 
     Wakes.publish_change_in_txn(txn, "wake.scheduled", wake.wake_id)
