@@ -4,7 +4,7 @@ defmodule Tightbeam.RestExecutionMapTest do
   import Plug.Conn
   import Plug.Test
 
-  alias Tightbeam.{Archetypes, DB, Devices, Identity, Ledger, Schema}
+  alias Tightbeam.{Archetypes, DB, Devices, ExecutionMap, Identity, Ledger, Schema}
   alias Tightbeam.Firehose.Hub
   alias Tightbeam.Wire.Router
 
@@ -13,6 +13,7 @@ defmodule Tightbeam.RestExecutionMapTest do
     creationContext parent finishedAt assignments jobs attests startedAt
     closingAttests openDecisionRequests turns minds fanOut active sinceProgressMs
   )
+  @envelope_fields ~w(schemaVersion resource edgeBasis coverage dependencyVersion)
 
   setup do
     base_dir =
@@ -61,6 +62,215 @@ defmodule Tightbeam.RestExecutionMapTest do
       owner_session: owner_session,
       other_session: other_session
     }
+  end
+
+  test "empty and populated modes use canonical no-store response envelopes", ctx do
+    empty_flat = get(ctx, "/api/execution-map", ctx.token)
+    flat = assert_execution_map_response(empty_flat, ~w(items page))
+    assert flat["items"] == []
+
+    assert flat["page"] == %{
+             "oldestCursor" => nil,
+             "newestCursor" => nil,
+             "hasMoreBefore" => false,
+             "hasMoreAfter" => false
+           }
+
+    assert flat["edgeBasis"] == "concurrent_turn"
+    assert flat["coverage"] == %{"attributionCutoff" => 1, "basis" => "conservative_shared"}
+    assert flat["dependencyVersion"] =~ ~r/^[0-9a-f]{64}$/
+
+    empty_tree = get(ctx, "/api/execution-map/tree", ctx.token)
+    assert assert_execution_map_response(empty_tree, ~w(roots))["roots"] == []
+
+    item = insert_work_item!(ctx.db, "wi_envelope", "owner", 40_000)
+
+    assignment =
+      insert_assignment!(ctx.db, "asg_envelope_no_item",
+        opener_user: "owner",
+        holder: ctx.owner_session.session_key
+      )
+
+    for {path, shape, field, expected, no_item_ids} <- [
+          {"/api/execution-map", ~w(items page), "items", [item], nil},
+          {"/api/execution-map/tree", ~w(roots), "roots", [item], nil},
+          {"/api/execution-map/subtrees/#{item}", ~w(roots), "roots", [item], nil},
+          {
+            "/api/execution-map/assignments?assignmentId=#{assignment}",
+            ~w(items noItem),
+            "items",
+            [],
+            [assignment]
+          }
+        ] do
+      decoded = get(ctx, path, ctx.token) |> assert_execution_map_response(shape)
+      assert Enum.map(decoded[field], & &1["id"]) == expected
+      assert decoded["edgeBasis"] == "concurrent_turn"
+      if no_item_ids, do: assert(decoded["noItem"] == no_item_ids)
+    end
+
+    linked_assignment =
+      insert_assignment!(ctx.db, "asg_envelope_linked",
+        opener_user: "owner",
+        holder: ctx.owner_session.session_key,
+        work_item_id: item
+      )
+
+    linked_selection =
+      get(ctx, "/api/execution-map/assignments?assignmentId=#{linked_assignment}", ctx.token)
+      |> assert_execution_map_response(~w(items noItem))
+
+    assert Enum.map(linked_selection["items"], & &1["id"]) == [item]
+    assert linked_selection["noItem"] == []
+  end
+
+  test "the public node serializer fixes wire bytes across 1,000 shuffled maps" do
+    node = serializer_node_fixture()
+
+    expected =
+      [
+        ~s({"id":"wi_serializer","title":"Stable node"),
+        ~s(,"specRefName":null,"specRefSha256":null),
+        ~s(,"state":"open","failReason":null,"bracket1Armed":false),
+        ~s(,"origin":{"principal":"user","createdBy":"owner"}),
+        ~s(,"creationContext":{"recorded":true,"turnSeq":7}),
+        ~s(,"parent":{"status":"from_turn","item":null},"finishedAt":null),
+        ~s(,"assignments":{"open":2,"closed":1),
+        ~s(,"byOutcome":{"completed":1,"surrendered":0,"revoked":0}}),
+        ~s(,"jobs":2),
+        ~s(,"attests":{"total":2,"byKind":{"completion":1,"progress":1}},),
+        ~s("byVerdictKind":{"landed":1}}),
+        ~s(,"startedAt":15),
+        ~s(,"closingAttests":[{"assignmentId":"asg_a","attestId":"att_a",),
+        ~s("commitRefs":[{"repo":"repo-a","commit":"abc"}]},),
+        ~s({"assignmentId":"asg_z","attestId":"att_z","commitRefs":null}]),
+        ~s(,"openDecisionRequests":1,"turns":{"total":3,"lastEndedAt":25}),
+        ~s(,"minds":[{"model":"claude","context":null,"effort":"high","harness":"claude"},),
+        ~s({"model":"gpt","context":"long","effort":"max","harness":"codex"}]),
+        ~s(,"fanOut":null),
+        ~s(,"active":{"runningTurn":false,"pendingSessionWake":true,),
+        ~s("pendingWakeClasses":{"fyi":2,"input-needed":1}}),
+        ~s(,"sinceProgressMs":10})
+      ]
+      |> Enum.join()
+
+    assert ExecutionMap.execution_map_node(node) == expected
+
+    child = Map.put(node, :id, "wi_child")
+    tree_node = Map.put(node, :children, [child])
+
+    expected_child = String.replace(expected, "wi_serializer", "wi_child", global: false)
+    expected_parent = binary_part(expected, 0, byte_size(expected) - 1)
+    expected_tree = expected_parent <> ",\"children\":[" <> expected_child <> "]}"
+
+    assert ExecutionMap.execution_map_node(tree_node) == expected_tree
+
+    for seed <- 1..1_000 do
+      shuffled = shuffle_map_order(node, seed)
+      shuffled_child = shuffle_map_order(child, seed)
+      shuffled_tree = Map.put(shuffle_map_order(node, seed), :children, [shuffled_child])
+
+      assert ExecutionMap.execution_map_node(shuffled) == expected
+      assert ExecutionMap.execution_map_node(shuffled_tree) == expected_tree
+    end
+  end
+
+  test "hidden-only state is byte-identical to its absence in the composed response", ctx do
+    before = get(ctx, "/api/execution-map", ctx.token)
+    assert decode_success(before)["items"] == []
+    assert get_resp_header(before, "cache-control") == ["no-store"]
+    assert {:ok, [[cutoff]]} = DB.query(ctx.db, "SELECT at FROM causal_events_epoch WHERE id=0")
+
+    hidden_item = insert_work_item!(ctx.db, "wi_hidden_twin", "other", 41_000)
+
+    hidden_assignment =
+      insert_assignment!(ctx.db, "asg_hidden_twin",
+        opener_user: "other",
+        holder: ctx.other_session.session_key,
+        work_item_id: hidden_item
+      )
+
+    assert :ok =
+             DB.execute(ctx.db, """
+             INSERT INTO attests (id, assignmentId, kind, bySession, ts)
+             VALUES ('att_hidden_twin', '#{hidden_assignment}', 'progress', 'other', 1)
+             """)
+
+    assert {:ok, _seq} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: ctx.other_session.session_key,
+               message_id: "execution-map-hidden-twin-turn",
+               origin: "user:other",
+               prompt: "hidden turn data",
+               job_ref: hidden_item
+             })
+
+    assert {:ok, _rows} =
+             DB.query(ctx.db, "UPDATE causal_events_epoch SET at=?1 WHERE id=0", [cutoff])
+
+    after_hidden = get(ctx, "/api/execution-map", ctx.token)
+    assert get_resp_header(after_hidden, "cache-control") == ["no-store"]
+    assert response_signature(after_hidden) == response_signature(before)
+  end
+
+  test "dependency versions change for visible sources and ignore hidden or unlisted changes",
+       ctx do
+    visible = insert_work_item!(ctx.db, "wi_dependency_visible", "owner", 42_000)
+    hidden = insert_work_item!(ctx.db, "wi_dependency_hidden", "other", 43_000)
+
+    baseline = get(ctx, "/api/execution-map", ctx.token) |> decode_success()
+    assert Enum.map(baseline["items"], & &1["id"]) == [visible]
+    baseline_version = baseline["dependencyVersion"]
+
+    assert {:ok, _rows} =
+             DB.query(
+               ctx.db,
+               "UPDATE work_items SET title='Visible changed' WHERE id=?1",
+               [visible]
+             )
+
+    visible_changed = get(ctx, "/api/execution-map", ctx.token) |> decode_success()
+    refute visible_changed["dependencyVersion"] == baseline_version
+
+    assert {:ok, _rows} =
+             DB.query(ctx.db, "UPDATE work_items SET title='Hidden changed' WHERE id=?1", [hidden])
+
+    hidden_changed = get(ctx, "/api/execution-map", ctx.token) |> decode_success()
+    assert hidden_changed["dependencyVersion"] == visible_changed["dependencyVersion"]
+
+    assert {:ok, _rows} =
+             DB.query(
+               ctx.db,
+               "UPDATE devices SET claimedName='Renamed device' WHERE deviceId=?1",
+               ["execution-map-owner-device"]
+             )
+
+    unlisted_changed = get(ctx, "/api/execution-map", ctx.token) |> decode_success()
+    assert unlisted_changed["dependencyVersion"] == hidden_changed["dependencyVersion"]
+  end
+
+  test "all unpaged routes reject each page parameter before the resource query", ctx do
+    item = insert_work_item!(ctx.db, "wi_unpaged", "owner", 44_000)
+
+    assignment =
+      insert_assignment!(ctx.db, "asg_unpaged",
+        opener_user: "owner",
+        holder: ctx.owner_session.session_key,
+        work_item_id: item
+      )
+
+    routes = [
+      "/api/execution-map/tree",
+      "/api/execution-map/subtrees/#{item}",
+      "/api/execution-map/assignments?assignmentId=#{assignment}"
+    ]
+
+    for route <- routes, parameter <- ["before=opaque", "after=opaque", "limit=1"] do
+      separator = if String.contains?(route, "?"), do: "&", else: "?"
+      {response, events} = traced_get(ctx, route <> separator <> parameter, ctx.token)
+      assert_error(response, 400, "invalid_filter")
+      refute Enum.any?(events, &match?({:shared_lookup, "execution map", _}, &1))
+    end
   end
 
   test "all four routes use the canonical node shape and filter hidden sources before linking",
@@ -494,6 +704,67 @@ defmodule Tightbeam.RestExecutionMapTest do
     refute router =~ "defp d2_cursor"
   end
 
+  defp serializer_node_fixture do
+    %{
+      id: "wi_serializer",
+      title: "Stable node",
+      spec_ref_name: nil,
+      spec_ref_sha256: nil,
+      state: "open",
+      fail_reason: nil,
+      bracket1_armed: false,
+      origin: %{principal: "user", created_by: "owner"},
+      creation_context: %{recorded: true, turn_seq: 7},
+      parent: %{status: "from_turn", item: nil},
+      finished_at: nil,
+      assignments: %{
+        open: 2,
+        closed: 1,
+        by_outcome: %{completed: 1, surrendered: 0, revoked: 0}
+      },
+      jobs: 2,
+      attests: %{
+        total: 2,
+        by_kind: %{"progress" => 1, "completion" => 1},
+        by_verdict_kind: %{"landed" => 1}
+      },
+      started_at: 15,
+      closing_attests: [
+        %{
+          assignmentId: "asg_a",
+          attestId: "att_a",
+          commitRefs: [%{"repo" => "repo-a", "commit" => "abc"}]
+        },
+        %{assignmentId: "asg_z", attestId: "att_z", commitRefs: nil}
+      ],
+      open_decision_requests: 1,
+      turns: %{total: 3, last_ended_at: 25},
+      minds: [
+        %{model: "claude", context: nil, effort: "high", harness: "claude"},
+        %{model: "gpt", context: "long", effort: "max", harness: "codex"}
+      ],
+      fan_out: nil,
+      active: %{
+        running_turn: false,
+        pending_session_wake: true,
+        pending_wake_classes: %{"fyi" => 2, "input-needed" => 1}
+      },
+      since_progress_ms: 10
+    }
+  end
+
+  defp shuffle_map_order(value, seed) when is_map(value) do
+    value
+    |> Enum.map(fn {key, child} -> {key, shuffle_map_order(child, :erlang.phash2({seed, key}))} end)
+    |> Enum.sort_by(fn {key, _child} -> {:erlang.phash2({seed, key}), key} end)
+    |> Map.new()
+  end
+
+  defp shuffle_map_order(value, seed) when is_list(value),
+    do: Enum.map(value, &shuffle_map_order(&1, seed))
+
+  defp shuffle_map_order(value, _seed), do: value
+
   defp approved_device(db, device_id, name, user_id) do
     {:pending, _device} =
       Devices.pair(db, %{device_id: device_id, claimed_name: name, platform: nil, model: nil})
@@ -613,6 +884,33 @@ defmodule Tightbeam.RestExecutionMapTest do
   defp decode_success(response) do
     assert response.status == 200, response.resp_body
     JSON.decode!(response.resp_body)
+  end
+
+  defp assert_execution_map_response(response, mode_fields) do
+    decoded = decode_success(response)
+    assert get_resp_header(response, "cache-control") == ["no-store"]
+    assert decoded["schemaVersion"] == 1
+    assert decoded["resource"] == "execution map"
+    assert decoded["edgeBasis"] == "concurrent_turn"
+    assert Enum.sort(Map.keys(decoded["coverage"])) == ~w(attributionCutoff basis)
+    assert is_integer(decoded["coverage"]["attributionCutoff"])
+    assert decoded["coverage"]["attributionCutoff"] > 0
+    assert decoded["coverage"]["basis"] == "conservative_shared"
+    assert decoded["dependencyVersion"] =~ ~r/^[0-9a-f]{64}$/
+
+    assert Enum.sort(Map.keys(decoded)) ==
+             Enum.sort(@envelope_fields ++ mode_fields)
+
+    decoded
+  end
+
+  defp response_signature(response) do
+    {
+      response.status,
+      get_resp_header(response, "content-type"),
+      get_resp_header(response, "cache-control"),
+      response.resp_body
+    }
   end
 
   defp assert_error(response, status, code) do
