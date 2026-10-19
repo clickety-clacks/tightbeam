@@ -648,12 +648,20 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert_per_verb_effects!(config, "reopen-assignment", reopen_effects)
     history = Tightbeam.Assignments.list_reopenings(db, assignment.id)
     assert [%{priorOutcome: "completed", reason: "continue the real assignment"}] = history
+
+    :ok = Wakes.fire_due(scheduler)
+
+    pending_publications =
+      assert_substrate_messages_created!(db, [], [assignment.id, review.id])
+
+    assert Enum.all?(notice_state_classes(pending_publications), &(&1 in asynchronous_delivery))
+
     assert {:error, %{code: "assignment_open"}} = Dispatch.dispatch(db, handlers, reopen)
     assert Tightbeam.Assignments.list_reopenings(db, assignment.id) == history
 
-    replay_publications =
-      assert_substrate_messages_created!(db, [], [assignment.id, review.id])
+    replay_publications = assert_substrate_messages_created!(db, [], [])
 
+    assert elem(replay_publications, 1) == []
     assert notice_state_classes(replay_publications) == []
   end
 
