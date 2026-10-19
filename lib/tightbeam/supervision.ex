@@ -120,7 +120,15 @@ defmodule Tightbeam.Supervision do
               interval_ms
             )
 
-          cancel_assignment_sources_in_txn(txn, assignment_id, {:replacement, deadline.wake_id})
+          # Stamp the replacement at the activity itself: cancellation also
+          # settles effort relief, which must start when a wait was registered.
+          cancel_assignment_sources_in_txn(
+            txn,
+            assignment_id,
+            {:replacement, deadline.wake_id},
+            fn -> at end
+          )
+
           :reset
 
         _ ->
@@ -804,7 +812,7 @@ defmodule Tightbeam.Supervision do
     })
   end
 
-  defp cancel_assignment_sources_in_txn(txn, assignment_id, disposition) do
+  defp cancel_assignment_sources_in_txn(txn, assignment_id, disposition, clock \\ &now/0) do
     replacement_id =
       case disposition do
         {:replacement, id} -> id
@@ -851,7 +859,7 @@ defmodule Tightbeam.Supervision do
               }
           end
 
-        unless Wakes.cancel_in_txn(txn, command) do
+        unless Wakes.cancel_in_txn(txn, command, clock) do
           Logger.warning("assignment inactivity wake #{wake_id} could not be retracted")
         end
 

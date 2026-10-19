@@ -328,16 +328,36 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     }
 
     assert {:ok, %{state: "open"}} = Tightbeam.Dispatch.dispatch(ctx.db, handlers, reopen)
-    assert_receive {:firehose_notice, %{"class" => "wake.canceled", "payload" => canceled}}
+
+    # The holder's reopen notice is a stored message, so its message.created
+    # arrives alongside the canceled wake and the verb's own notices.
+    notices =
+      Stream.repeatedly(fn ->
+        assert_receive {:firehose_notice, notice}
+        :ok = Hub.delivered(Hub, self())
+        notice
+      end)
+      |> Enum.reduce_while([], fn notice, seen ->
+        seen = [notice | seen]
+        if notice["class"] == "assignment.reopened", do: {:halt, seen}, else: {:cont, seen}
+      end)
+      |> Enum.group_by(& &1["class"])
+
+    assert %{
+             "wake.canceled" => [%{"payload" => canceled}],
+             "message.created" => [%{"payload" => message}],
+             "verb.accepted" => [_accepted],
+             "assignment.reopened" => [%{"payload" => payload, "refs" => refs}]
+           } = notices
+
+    assert map_size(notices) == 4
     assert canceled["workItemId"] == ctx.work_item.id
     assert canceled["state"] == "canceled"
-    :ok = Hub.delivered(Hub, self())
+    assert message["sessionKey"] == ctx.assignment.holderKey
+    assert message["messageType"] == "substrate"
 
-    assert_receive {:firehose_notice, %{"class" => "verb.accepted"}}
-    :ok = Hub.delivered(Hub, self())
-
-    assert_receive {:firehose_notice,
-                    %{"class" => "assignment.reopened", "payload" => payload, "refs" => refs}}
+    assert message["content"] ==
+             "[assignment reopened: #{ctx.assignment.id} by user:flynn — REST parity]"
 
     assert refs["assignmentId"] == ctx.assignment.id
     response = get(ctx, "/api/assignments/#{ctx.assignment.id}")
