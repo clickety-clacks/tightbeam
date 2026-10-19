@@ -1824,6 +1824,8 @@ defmodule Tightbeam.EscalationTest do
     request =
       Escalation.operator_ask(ctx.db, operator_call(ctx.raiser, %{question: "rollback?"}))
 
+    before_events = EventLog.lifecycle_events(ctx.db)
+
     assert {:ok, [[wake_count, fact_count, event_count]]} =
              DB.query(
                ctx.db,
@@ -1842,6 +1844,8 @@ defmodule Tightbeam.EscalationTest do
         owner_operator_rule(request.id, %{decision: "accept"})
       )
     end
+
+    assert EventLog.lifecycle_events(ctx.db) == before_events
 
     assert {:ok, [["open", nil, nil, nil, ^wake_count, ^fact_count, ^event_count]]} =
              DB.query(
@@ -1867,6 +1871,8 @@ defmodule Tightbeam.EscalationTest do
           operator_call(ctx.raiser, %{question: "ordered failure #{step}?"})
         )
 
+      before_events = EventLog.lifecycle_events(ctx.db)
+
       assert {:ok, [[wake_count, fact_count, event_count]]} =
                DB.query(
                  ctx.db,
@@ -1880,6 +1886,8 @@ defmodule Tightbeam.EscalationTest do
           transaction_step_hook: {:raise, step, "fixture #{step}"}
         )
       end
+
+      assert EventLog.lifecycle_events(ctx.db) == before_events
 
       assert {:ok, [["open", nil, nil, nil, ^wake_count, ^fact_count, ^event_count]]} =
                DB.query(
