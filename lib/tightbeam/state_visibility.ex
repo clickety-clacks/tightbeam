@@ -148,6 +148,26 @@ defmodule Tightbeam.StateVisibility do
 
   def artifact_collection_scope(_principal), do: {"0 = 1", []}
 
+  @doc "Return the AU4 scope that selects visible attest rows before filtering and paging."
+  def attest_collection_scope(principal) do
+    trace_core_detail(principal, {:au4_visibility, "attests"})
+
+    case principal do
+      %{kind: "user", id: user_id, is_admin: true} when is_binary(user_id) and user_id != "" ->
+        {"1 = 1", []}
+
+      %{kind: "user", id: user_id} when is_binary(user_id) and user_id != "" ->
+        {"(parent.openedByUser = ? OR wi.ownerUserId = ?)", [user_id, user_id]}
+
+      %{kind: "session", id: session_key}
+      when is_binary(session_key) and session_key != "" ->
+        {"(parent.holderKey = ? OR parent.openedBySession = ?)", [session_key, session_key]}
+
+      _ ->
+        {"0 = 1", []}
+    end
+  end
+
   defp do_core_detail_visible?(_db, resource, _row, _principal)
        when resource in ["work items", "assignments"],
        do: true

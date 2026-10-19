@@ -479,6 +479,10 @@ defmodule Tightbeam.Wire.Router do
     d1_collection(conn, Map.fetch!(@d1_resources, :assignment_attests), assignment_id)
   end
 
+  get "/api/attests" do
+    d2_attests_collection(conn)
+  end
+
   get "/api/attests/:attest_id" do
     core_detail(conn, Map.fetch!(@core_detail_specs, :attests), attest_id)
   end
@@ -1842,6 +1846,51 @@ defmodule Tightbeam.Wire.Router do
             d1_send(conn, 200, d1_collection_envelope(spec, items, page))
         end
     end
+  end
+
+  defp d2_attests_collection(conn) do
+    # The nested route binds its parent in this resource's cursor filter fingerprint.
+    spec = Map.fetch!(@d1_resources, :assignment_attests)
+
+    with {:ok, auth} <- d1_bearer_auth(conn),
+         {:ok, query} <- d1_query(conn.query_string),
+         {:ok, principal} <- d1_principal(auth, query, conn),
+         {:ok, request} <- d1_collection_request(query, spec),
+         :ok <- d1_d2_filter_validation(:assignment_attests, request.filters),
+         {:ok, boundary} <- d1_boundary(request, principal, spec, conn) do
+      principal = core_detail_trace_principal(conn, principal)
+      core_detail_trace(conn, {:shared_lookup, spec.resource, :query_attests})
+
+      page =
+        StateResources.query_attests(db(conn), %{
+          collection: %{
+            filters: request.filters,
+            principal: principal,
+            boundary: boundary,
+            limit: request.limit
+          }
+        })
+
+      result = %{
+        items:
+          Enum.map(page.rows, fn row ->
+            core_detail_trace(conn, {:serializer, spec.resource, :attest})
+            StateResources.attest(row)
+          end),
+        flags: %{
+          has_more_before: page.has_more_before,
+          has_more_after: page.has_more_after
+        }
+      }
+
+      {items, page} = d1_keyset_page(result, request, principal, spec, conn)
+      d1_send(conn, 200, d1_collection_envelope(spec, items, page))
+    else
+      {:error, status, code, message} -> d1_error(conn, "attests", status, code, message)
+    end
+  rescue
+    _error in [ArgumentError, KeyError, MatchError] ->
+      d1_error(conn, "attests", 500, "projection_invalid", nil)
   end
 
   defp d1_detail(conn, spec, id) do

@@ -860,6 +860,24 @@ defmodule Tightbeam.StateResources do
     end
   end
 
+  def query_attests(db, %{collection: request}) do
+    principal = request.principal
+
+    case DB.transaction(db, fn txn ->
+           txn = Txn.observe_queries(txn, Map.get(principal, :core_detail_trace))
+
+           Assignments.list_attests(txn, %{
+             filters: request.filters,
+             principal: principal,
+             boundary: request.boundary,
+             limit: request.limit
+           })
+         end) do
+      {:ok, page} -> page
+      {:error, error} -> raise error
+    end
+  end
+
   def query_attest(db, %{key: id, principal: principal}) do
     detail_selection(db, "attests", principal, fn txn -> query_attest(txn, id) end)
   end

@@ -1293,6 +1293,47 @@ defmodule Tightbeam.Assignments do
     |> then(fn page -> %{page | rows: Enum.map(page.rows, &attest_collection_row/1)} end)
   end
 
+  def list_attests(%Txn{} = txn, %{
+        filters: filters,
+        principal: principal,
+        boundary: boundary,
+        limit: limit
+      }) do
+    {visible_where, visible_params} = Tightbeam.StateVisibility.attest_collection_scope(principal)
+    {filter_where, filter_params} = attest_collection_where(nil, filters)
+    where = "(" <> visible_where <> ") AND (" <> filter_where <> ")"
+
+    select_from = """
+    SELECT att.id, att.assignmentId, att.kind, att.verdictKind, att.note,
+           att.bySession, att.byUser, att.producer, att.producerCommand,
+           att.byHarness, att.byProvider, att.commitRefs, att.ts
+    FROM attests AS att
+    JOIN assignments AS parent ON parent.id = att.assignmentId
+    LEFT JOIN work_items AS wi ON wi.id = parent.workItemId
+    """
+
+    probe_from = """
+    attests AS att
+    JOIN assignments AS parent ON parent.id = att.assignmentId
+    LEFT JOIN work_items AS wi ON wi.id = parent.workItemId
+    """
+
+    query = fn sql, query_params -> Txn.q(txn, sql, query_params) end
+
+    Tightbeam.Keyset.page(
+      query,
+      select_from,
+      probe_from,
+      where,
+      visible_params ++ filter_params,
+      ["att.ts", "att.id"],
+      boundary,
+      limit,
+      fn row -> [Enum.at(row, 12), hd(row)] end
+    )
+    |> then(fn page -> %{page | rows: Enum.map(page.rows, &attest_collection_row/1)} end)
+  end
+
   def list_attests(db, assignment_id) when is_binary(assignment_id) do
     {:ok, rows} =
       DB.query(
@@ -1305,8 +1346,12 @@ defmodule Tightbeam.Assignments do
   end
 
   defp attest_collection_where(assignment_id, filters) do
-    Enum.reduce(filters, {"att.assignmentId = ?", [assignment_id]}, fn {field, values},
-                                                                       {where, params} ->
+    initial =
+      if is_nil(assignment_id),
+        do: {"1 = 1", []},
+        else: {"att.assignmentId = ?", [assignment_id]}
+
+    Enum.reduce(filters, initial, fn {field, values}, {where, params} ->
       column =
         case field do
           "assignmentId" -> "att.assignmentId"
