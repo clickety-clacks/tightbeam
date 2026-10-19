@@ -2616,6 +2616,9 @@ defmodule Tightbeam.Assignments do
           not match?({:session, ^holder}, call.principal) ->
             error("not_holder", "assignment is held by session #{holder}")
 
+          assignment.state != "open" and call.params[:kind] == "cannot-proceed" ->
+            cannot_proceed_closed(assignment.outcome)
+
           assignment.state != "open" ->
             assignment_closed()
 
@@ -4467,6 +4470,14 @@ defmodule Tightbeam.Assignments do
   defp opener({:remedy, %{owner: owner}}), do: {owner, nil}
 
   defp assignment_closed, do: error("assignment_closed", "assignment is already closed")
+
+  defp cannot_proceed_closed(outcome),
+    do:
+      error(
+        "assignment_closed",
+        "cannot-proceed is refused because assignment is closed with outcome #{outcome}"
+      )
+
   defp error(code, message), do: %{code: code, message: message}
 
   defp notify(call, key, first, second) do
