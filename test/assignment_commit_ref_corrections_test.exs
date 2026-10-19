@@ -130,6 +130,35 @@ defmodule Tightbeam.AssignmentCommitRefCorrectionsTest do
     refute_received {:git_ran, _, _, _}
   end
 
+  test "a readable closed review assignment can be corrected from its opener's lane", ctx do
+    :ok =
+      DB.execute(ctx.db, """
+      INSERT INTO assignments
+        (id, subject, holderKey, openedBySession, openedAt, state, outcome,
+         closedAt, closedBySession, workItemId)
+      VALUES
+        ('asg_review', 'closed review', 'holder-other', 'holder-owner', 5,
+         'open', NULL, NULL, NULL, 'wi_history');
+
+      INSERT INTO attests (id, assignmentId, kind, bySession, ts)
+      VALUES ('att_review_close', 'asg_review', 'completion', 'holder-other', 6);
+
+      UPDATE assignments
+      SET state='closed', outcome='completed', closedAt=6,
+          closedBySession='holder-other', closingAttestId='att_review_close'
+      WHERE id='asg_review';
+      """)
+
+    assert %{id: "asg_review", state: "closed"} =
+             Assignments.__handle__(ctx.db, "assignment-get", %{
+               principal: {:session, "po-owner"},
+               params: %{assignment_id: "asg_review"}
+             })
+
+    review = with_param(ctx, :assignment_id, "asg_review")
+    assert %{correction: %{assignmentId: "asg_review"}} = correct(review, {:session, "po-owner"})
+  end
+
   test "open, absent, and unbound evidence refuse before git proof", ctx do
     parent = self()
     old_runner = Application.get_env(:tightbeam, :commit_ref_command)
