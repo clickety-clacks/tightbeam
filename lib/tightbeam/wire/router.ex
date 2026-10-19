@@ -2175,18 +2175,18 @@ defmodule Tightbeam.Wire.Router do
          :ok <- d1_detail_request(query) do
       case WorkItems.query_work_item_trace(db(conn), %{id: id, principal: principal}) do
         {:error, status, code, message} ->
-          d1_error(conn, "work item trace", status, code, message)
+          d1_error(conn, "work-item trace", status, code, message)
 
         trace ->
           d1_send(conn, 200, d2c_work_item_trace_envelope(trace))
       end
     else
       {:error, status, code, message} ->
-        d1_error(conn, "work item trace", status, code, message)
+        d1_error(conn, "work-item trace", status, code, message)
     end
   rescue
     _error in [ArgumentError, KeyError, MatchError] ->
-      d1_error(conn, "work item trace", 500, "projection_invalid", nil)
+      d1_error(conn, "work-item trace", 500, "projection_invalid", nil)
   end
 
   defp d1_bearer_auth(conn) do
@@ -2529,7 +2529,7 @@ defmodule Tightbeam.Wire.Router do
 
     attribution = trace.attribution
 
-    "{\"schemaVersion\":1,\"resource\":\"work item trace\",\"item\":{" <>
+    "{\"schemaVersion\":1,\"resource\":\"work-item trace\",\"item\":{" <>
       "\"workItem\":" <>
       StateResources.encode_item("work items", trace.work_item) <>
       ",\"assignments\":[" <>

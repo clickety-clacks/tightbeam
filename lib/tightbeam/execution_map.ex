@@ -627,20 +627,44 @@ defmodule Tightbeam.ExecutionMap do
   @doc false
   def work_item_trace_parent_data(items, assignments, turns)
       when is_list(items) and is_list(assignments) and is_list(turns) do
-    assignments_by_id = Map.new(assignments, &{&1.id, &1})
-    items_by_id = Map.new(items, &{&1.id, &1})
+    work_item_trace_parent_data(
+      items,
+      assignments,
+      turns,
+      work_item_trace_resolution(items, assignments)
+    )
+  end
+
+  @doc false
+  def work_item_trace_parent_data(items, assignments, turns, resolution)
+      when is_list(items) and is_list(assignments) and is_list(turns) and is_map(resolution) do
     turns_by_seq = Map.new(turns, &{&1.seq, &1})
-    resolved = resolve_all(assignments, assignments_by_id)
-    candidates = candidate_edges(items, items_by_id, turns_by_seq, resolved)
+    candidates = candidate_edges(items, resolution.items_by_id, turns_by_seq, resolution.resolved)
     {linked, cycles} = retain_acyclic_with_cycles(items, candidates)
 
     %{
-      resolved: resolved,
+      resolved: resolution.resolved,
       linked: linked,
       parents: parents(items, linked),
       cycles: cycles
     }
   end
+
+  @doc false
+  def work_item_trace_resolution(items, assignments)
+      when is_list(items) and is_list(assignments) do
+    assignments_by_id = Map.new(assignments, &{&1.id, &1})
+    items_by_id = Map.new(items, &{&1.id, &1})
+
+    %{
+      items_by_id: items_by_id,
+      resolved: resolve_all(assignments, assignments_by_id)
+    }
+  end
+
+  @doc false
+  def work_item_trace_turn_has_visible_link?(turn, resolution) when is_map(resolution),
+    do: turn_has_visible_link?(turn, resolution.resolved, resolution.items_by_id)
 
   ## Parent derivation — total over missing, legacy and corrupt rows
 

@@ -966,13 +966,17 @@ defmodule Tightbeam.WorkItems do
     items_by_id = Map.new(item_rows, &{&1.id, &1})
     assignment_rows = work_item_trace_visible_assignments(txn, principal)
     assignments_by_id = Map.new(assignment_rows, &{&1.id, &1})
-    turn_rows = work_item_trace_visible_turns(txn, item_rows, principal)
+    item_nodes = Enum.map(item_rows, &work_item_trace_item_node/1)
+    assignment_nodes = Enum.map(assignment_rows, &work_item_trace_assignment_node/1)
+    resolution = ExecutionMap.work_item_trace_resolution(item_nodes, assignment_nodes)
+    turn_rows = work_item_trace_visible_turns(txn, item_rows, principal, resolution)
 
     parent_data =
       ExecutionMap.work_item_trace_parent_data(
-        Enum.map(item_rows, &work_item_trace_item_node/1),
-        Enum.map(assignment_rows, &work_item_trace_assignment_node/1),
-        turn_rows
+        item_nodes,
+        assignment_nodes,
+        turn_rows,
+        resolution
       )
 
     emitted_assignments =
@@ -1091,7 +1095,7 @@ defmodule Tightbeam.WorkItems do
     end)
   end
 
-  defp work_item_trace_visible_turns(txn, item_rows, principal) do
+  defp work_item_trace_visible_turns(txn, item_rows, principal, resolution) do
     item_rows
     |> Enum.map(& &1.created_in_turn_seq)
     |> Enum.reject(&is_nil/1)
@@ -1103,7 +1107,8 @@ defmodule Tightbeam.WorkItems do
           []
 
         turn ->
-          if StateVisibility.core_detail_visible?(txn, "turns", turn, principal),
+          if StateVisibility.core_detail_visible?(txn, "turns", turn, principal) and
+               ExecutionMap.work_item_trace_turn_has_visible_link?(turn, resolution),
             do: [turn],
             else: []
       end

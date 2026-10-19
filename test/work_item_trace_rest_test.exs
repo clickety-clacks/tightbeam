@@ -111,6 +111,7 @@ defmodule Tightbeam.WorkItemTraceRestTest do
 
     response = get(ctx, "/api/work-items/#{root}/trace")
     trace = decode_trace!(response)
+    assert_trace_parent_matches_execution_map!(ctx, root, trace)
 
     assert get_resp_header(response, "cache-control") == ["no-store"]
     assert trace["workItem"]["id"] == root
@@ -178,6 +179,39 @@ defmodule Tightbeam.WorkItemTraceRestTest do
              "attribution",
              "dependencyVersion"
            ])
+
+    insert_attest!(ctx.db, "att_trace_invariant", base_assignment, ctx.owner_session.session_key, 60_000)
+    insert_pending_wake!(ctx.db, "wake_trace_invariant", ctx.owner_session.session_key, second_review, 60_000)
+
+    invariant_response = get(ctx, "/api/work-items/#{root}/trace")
+    assert invariant_response.resp_body == response.resp_body
+    assert decode_trace!(invariant_response)["dependencyVersion"] == trace["dependencyVersion"]
+
+    assert {:ok, _rows} =
+             DB.query(
+               ctx.db,
+               "UPDATE work_items SET ownerUserId='other' WHERE id=?1",
+               [parent]
+             )
+
+    hidden_parent_response = get(ctx, "/api/work-items/#{root}/trace")
+    hidden_parent_trace = decode_trace!(hidden_parent_response)
+    assert hidden_parent_trace["attribution"]["provenanceStatus"] == "from_turn"
+    assert hidden_parent_trace["attribution"]["primaryWorkId"] == nil
+    assert_trace_parent_matches_execution_map!(ctx, root, hidden_parent_trace)
+    refute hidden_parent_response.resp_body =~ parent
+
+    assert hidden_parent_trace["dependencyVersion"] ==
+             expected_dependency_version([
+               ["work items", root, item_version(ctx.db, root)],
+               ["work items", child, item_version(ctx.db, child)],
+               ["work items", review_child, item_version(ctx.db, review_child)],
+               ["assignments", base_assignment, assignment_version(ctx.db, base_assignment)],
+               ["assignments", review_assignment, assignment_version(ctx.db, review_assignment)],
+               ["assignments", second_review, assignment_version(ctx.db, second_review)],
+               ["turns", child_turn, turn_version(ctx.db, child_turn)],
+               ["turns", review_turn, turn_version(ctx.db, review_turn)]
+             ])
   end
 
   test "hidden turn and assignment-chain rows are indistinguishable from absent rows", ctx do
@@ -212,7 +246,10 @@ defmodule Tightbeam.WorkItemTraceRestTest do
     assert before_trace["causalChildren"] == []
     assert before_trace["attribution"]["provenanceStatus"] == "from_turn"
     child_before = get(ctx, "/api/work-items/#{child}/trace", ctx.owner_session.cli_token)
-    assert decode_trace!(child_before)["attribution"]["provenanceStatus"] == "from_turn"
+    child_before_trace = decode_trace!(child_before)
+    assert child_before_trace["attribution"]["provenanceStatus"] == "from_turn"
+    assert_trace_parent_matches_execution_map!(ctx, root, before_trace, ctx.owner_session.cli_token)
+    assert_trace_parent_matches_execution_map!(ctx, child, child_before_trace, ctx.owner_session.cli_token)
 
     hidden_parent = insert_work_item!(ctx.db, "wi_trace_twin_hidden_parent", "other", 41_000)
 
@@ -232,6 +269,7 @@ defmodule Tightbeam.WorkItemTraceRestTest do
     assert after_trace["causalChildren"] == []
     child_after = get(ctx, "/api/work-items/#{child}/trace", ctx.owner_session.cli_token)
     assert child_after.resp_body == child_before.resp_body
+    assert_trace_parent_matches_execution_map!(ctx, child, decode_trace!(child_after), ctx.owner_session.cli_token)
     refute after_response.resp_body =~ "asg_trace_twin_hidden_base"
     refute after_response.resp_body =~ "asg_trace_twin_review"
     refute after_response.resp_body =~ "wi_trace_twin_hidden_parent"
@@ -258,6 +296,7 @@ defmodule Tightbeam.WorkItemTraceRestTest do
     assert before["causalChildren"] == []
     assert before["attribution"]["provenanceStatus"] == "linked"
     assert before["attribution"]["primaryWorkId"] == middle
+    assert_trace_parent_matches_execution_map!(ctx, root, before)
 
     assert before["dependencyVersion"] ==
              expected_dependency_version([
@@ -272,6 +311,7 @@ defmodule Tightbeam.WorkItemTraceRestTest do
     tail_trace = get(ctx, "/api/work-items/#{tail}/trace") |> decode_trace!()
     assert tail_trace["attribution"]["provenanceStatus"] == "from_turn"
     assert tail_trace["dependencyVersion"] == before["dependencyVersion"]
+    assert_trace_parent_matches_execution_map!(ctx, tail, tail_trace)
 
     for cycle_member <- [middle, tail] do
       assert {:ok, _rows} =
@@ -330,11 +370,67 @@ defmodule Tightbeam.WorkItemTraceRestTest do
              "primaryWorkId" => nil
            }
 
+    assert_trace_parent_matches_execution_map!(ctx, unrecorded, unrecorded_trace)
+    assert_trace_parent_matches_execution_map!(ctx, no_turn, no_turn_trace)
+    assert_trace_parent_matches_execution_map!(ctx, from_turn, from_turn_trace)
+
     assert from_turn_trace["dependencyVersion"] ==
              expected_dependency_version([
-               ["work items", from_turn, item_version(ctx.db, from_turn)],
-               ["turns", visible_turn, turn_version(ctx.db, visible_turn)]
+               ["work items", from_turn, item_version(ctx.db, from_turn)]
              ])
+  end
+
+  test "a hidden middle assignment hop and an absent hop produce identical traces", ctx do
+    root = insert_work_item!(ctx.db, "wi_trace_hidden_middle_root", "owner", 53_000)
+    child = insert_work_item!(ctx.db, "wi_trace_hidden_middle_child", "owner", 54_000)
+
+    base =
+      insert_assignment!(ctx.db, "asg_trace_hidden_middle_base",
+        holder: ctx.owner_session.session_key,
+        opener_user: "owner",
+        work_item_id: root,
+        opened_at: 400
+      )
+
+    assert {:ok, _rows} = DB.query(ctx.db, "PRAGMA foreign_keys=OFF")
+
+    second_hop =
+      insert_assignment!(ctx.db, "asg_trace_hidden_middle_second",
+        holder: ctx.owner_session.session_key,
+        opener_user: "owner",
+        reviews_assignment_id: "asg_trace_hidden_middle_hidden",
+        opened_at: 500
+      )
+
+    assert {:ok, _rows} = DB.query(ctx.db, "PRAGMA foreign_keys=ON")
+
+    child_turn = insert_turn!(ctx, "trace-hidden-middle-child", assignment_id: second_hop)
+    set_creation_turn!(ctx.db, child, child_turn)
+
+    before = get(ctx, "/api/work-items/#{root}/trace")
+    before_trace = decode_trace!(before)
+    assert Enum.map(before_trace["assignments"], & &1["id"]) == [base]
+    assert before_trace["causalChildren"] == []
+
+    child_before = get(ctx, "/api/work-items/#{child}/trace")
+    child_before_trace = decode_trace!(child_before)
+    assert child_before_trace["attribution"]["provenanceStatus"] == "from_turn"
+    assert_trace_parent_matches_execution_map!(ctx, child, child_before_trace)
+
+    insert_assignment!(ctx.db, "asg_trace_hidden_middle_hidden",
+      holder: ctx.other_session.session_key,
+      opener_user: "other",
+      reviews_assignment_id: base,
+      opened_at: 450
+    )
+
+    after = get(ctx, "/api/work-items/#{root}/trace")
+    child_after = get(ctx, "/api/work-items/#{child}/trace")
+    assert after.resp_body == before.resp_body
+    assert child_after.resp_body == child_before.resp_body
+    assert_trace_parent_matches_execution_map!(ctx, child, decode_trace!(child_after))
+    refute after.resp_body =~ "asg_trace_hidden_middle_hidden"
+    refute after.resp_body =~ "asg_trace_hidden_middle_second"
   end
 
   test "rejects paging and gives hidden and unknown roots the same not-found response", ctx do
@@ -356,6 +452,47 @@ defmodule Tightbeam.WorkItemTraceRestTest do
       Devices.pair(db, %{device_id: device_id, claimed_name: name, platform: nil, model: nil})
 
     Devices.approve(db, device_id, user_id)
+  end
+
+  defp assert_trace_parent_matches_execution_map!(ctx, work_item_id, trace, bearer \\ nil) do
+    response = get(ctx, "/api/execution-map", bearer)
+    assert response.status == 200
+    execution_map = JSON.decode!(response.resp_body)
+    node = Enum.find(execution_map["items"], &(&1["id"] == work_item_id))
+    refute is_nil(node)
+    assert trace["attribution"]["provenanceStatus"] == node["parent"]["status"]
+    assert trace["attribution"]["primaryWorkId"] == node["parent"]["item"]
+  end
+
+  defp insert_attest!(db, id, assignment_id, by_session, ts) do
+    assert {:ok, _rows} =
+             DB.query(
+               db,
+               "INSERT INTO attests (id, assignmentId, kind, bySession, ts) VALUES (?1, ?2, 'progress', ?3, ?4)",
+               [id, assignment_id, by_session, ts]
+             )
+  end
+
+  defp insert_pending_wake!(db, id, session_key, assignment_id, created_at) do
+    assert {:ok, _rows} =
+             DB.query(
+               db,
+               """
+               INSERT INTO wakes
+                 (wakeId, sessionKey, origin, prompt, consumer, dueAt, state, createdAt,
+                  creatorSessionKey, assignmentId, class, classElection)
+               VALUES (?1, ?2, ?3, 'pending trace invariance fixture', 'prompt', ?4,
+                       'pending', ?5, ?2, ?6, 'fyi', 'sender')
+               """,
+               [
+                 id,
+                 session_key,
+                 "session:#{session_key}",
+                 created_at + 1_000,
+                 created_at,
+                 assignment_id
+               ]
+             )
   end
 
   defp insert_work_item!(db, id, owner, created_at, opts \\ []) do
@@ -510,14 +647,16 @@ defmodule Tightbeam.WorkItemTraceRestTest do
     assert get_resp_header(response, "content-type") == ["application/json; charset=utf-8"]
     decoded = JSON.decode!(response.resp_body)
     assert decoded["schemaVersion"] == 1
-    assert decoded["resource"] == "work item trace"
+    assert decoded["resource"] == "work-item trace"
     decoded["item"]
   end
 
   defp assert_error(response, status, code) do
     assert response.status == status
     assert get_resp_header(response, "cache-control") == ["no-store"]
-    assert JSON.decode!(response.resp_body)["error"]["code"] == code
+    decoded = JSON.decode!(response.resp_body)
+    assert decoded["resource"] == "work-item trace"
+    assert decoded["error"]["code"] == code
   end
 
   defp ordered_keys?(body, keys) do
