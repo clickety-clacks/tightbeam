@@ -655,6 +655,7 @@ defmodule Tightbeam.CliIntegrationTest do
     refute_receive {:cli_call, %{verb: "cancel"}}
 
     parent = self()
+
     runner = fn turn ->
       send(parent, {:cancel_target_started, turn.prompt})
       receive do: (:never -> {:ok, %{}})
@@ -677,6 +678,7 @@ defmodule Tightbeam.CliIntegrationTest do
     )
 
     assert_receive {:cancel_target_started, "unattributed turn"}
+
     assert {:ok, [[nil, "running"]]} =
              DB.query(
                ctx.db,
@@ -690,6 +692,7 @@ defmodule Tightbeam.CliIntegrationTest do
       )
 
     assert canceled_output =~ "\"ok\":true"
+
     assert_receive {:cli_call,
                     %{
                       verb: "cancel",
