@@ -25,7 +25,6 @@ defmodule Tightbeam.ConformanceSupport do
     Gateway,
     Ledger,
     ModelCatalog,
-    NoticeBatcher,
     Org,
     Placement,
     RailRemedy,
