@@ -215,18 +215,40 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
       END
       """)
 
+    assert {:ok, [[initial_deadline]]} =
+             DB.query(db, "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND consumer='assignment_inactivity_deadline' AND state='pending'", [assignment.id])
+
     assert_raise DB.Error, ~r/fixture rollback after decision creation/, fn ->
       Assignments.__handle__(db, "attest", call)
     end
 
     assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM decision_requests")
+    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM wake_cancellations")
+    assert %{state: "pending"} = Tightbeam.Wakes.get(db, initial_deadline)
 
     _ = Hub.connection_stats(hub, self())
-    refute_receive {:firehose_notice, %{"class" => "decision_request.opened"}}, 0
+    refute_receive {:firehose_notice, _}, 0
 
     :ok = DB.execute(db, "DROP TRIGGER reject_cannot_proceed")
 
     assert %{decisionRequest: request} = Assignments.__handle__(db, "attest", call)
+
+    # The attest, decision request and holder-authored wake each reset the deadline.
+    final_deadline =
+      Enum.reduce(1..3, initial_deadline, fn _, wake_id ->
+        assert_receive {:firehose_notice, cancellation}
+        assert cancellation["class"] == "wake.canceled"
+        assert cancellation["refs"]["wakeId"] == wake_id
+        assert cancellation["payload"]["state"] == "canceled"
+        assert {:ok, [[replacement]]} =
+                 DB.query(db, "SELECT c.replacementWakeId FROM wake_cancellations c JOIN wakes w ON w.wakeId=c.wakeId WHERE c.wakeId=?1 AND w.assignmentId=?2 AND w.consumer='assignment_inactivity_deadline' AND c.reasonKind='superseded' AND c.causalSourceKind='wake' AND c.causalSourceId=c.replacementWakeId AND c.outcomeKind='replacement'", [wake_id, assignment.id])
+        Hub.delivered(hub, self())
+        replacement
+      end)
+
+    assert %{state: "pending", assignment_id: assignment_id} = Tightbeam.Wakes.get(db, final_deadline)
+    assert assignment_id == assignment.id
+    assert {:ok, [[3]]} = DB.query(db, "SELECT COUNT(*) FROM wake_cancellations")
 
     assert_receive {:firehose_notice, notice}
     assert notice["class"] == "decision_request.opened"
