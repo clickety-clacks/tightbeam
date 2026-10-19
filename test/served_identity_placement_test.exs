@@ -144,6 +144,7 @@ defmodule Tightbeam.ServedIdentityPlacementTest do
   end
 
   test "remote session projection carries only reserved skills and no credentials", ctx do
+    :ok = Tightbeam.Schema.ensure_all(ctx.db)
     owner = self()
 
     sh = fn command ->

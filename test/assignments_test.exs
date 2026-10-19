@@ -4484,20 +4484,16 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert {:ok, true} =
              DB.transaction(ctx.db, fn txn ->
-               {:ok, trigger} =
-                 Tightbeam.Supervision.inactivity_deadline_trigger_in_txn(
-                   txn,
-                   {:work_item, canceled_item.id}
-                 )
-
                Wakes.cancel_in_txn(txn, %{
                  wake_id: canceled_wake_id,
                  requester: %{kind: "process", id: "tightbeam:wake-scheduler"},
                  reason_kind: "target_unresolvable",
                  causal_source: %{kind: "scheduler_delivery", id: canceled_wake_id},
-                 outcome: %{kind: "no_replacement", liveness_trigger: trigger}
+                 outcome: %{kind: "no_replacement"}
                })
              end)
+
+    assert Wakes.get(ctx.db, canceled_wake_id).state == "canceled"
 
     assert {:ok, []} =
              DB.query(
