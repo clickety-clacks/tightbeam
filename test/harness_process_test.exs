@@ -272,4 +272,8 @@ defmodule Tightbeam.HarnessProcessTest do
        %{tmp_dir: tmp} do
     Tightbeam.HarnessProcessFixture.run!(tmp, 33)
   end
+
+  test "credential cleanup kills only the tracked group after its leader exits", %{tmp_dir: tmp} do
+    Tightbeam.HarnessProcessFixture.run!(tmp, 34)
+  end
 end

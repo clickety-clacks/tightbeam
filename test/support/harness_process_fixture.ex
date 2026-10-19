@@ -1389,6 +1389,75 @@ defmodule Tightbeam.HarnessProcessFixture do
     assert :ok = HarnessProcess.complete_park(ctx.db, serving_key)
   end
 
+  defp scenario(34, ctx) do
+    key = {:claude, "shared", "testhost"}
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn _, _ -> [] end,
+         db: ctx.db,
+         name: nil}
+      )
+
+    script = Path.join(ctx.test_dir, "credential-cleanup-leader.js")
+
+    File.write!(script, ~S"""
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const { spawn } = require("node:child_process");
+    const [mode, root] = process.argv.slice(2);
+    if (mode === "leader") {
+      const sameGroup = spawn(process.execPath, [__filename, "same-group", root],
+        {stdio: "ignore"});
+      const detached = spawn(process.execPath, [__filename, "detached", root],
+        {stdio: "ignore", detached: true});
+      sameGroup.unref();
+      detached.unref();
+      fs.writeFileSync(path.join(root, "same-group-pid"), String(sameGroup.pid));
+      fs.writeFileSync(path.join(root, "detached-pid"), String(detached.pid));
+      setInterval(() => {
+        if (fs.existsSync(path.join(root, "leave-leader"))) process.exit(0);
+      }, 10);
+    } else {
+      fs.writeFileSync(path.join(root, `${mode}-ready`), "ready");
+      setInterval(() => {}, 1000);
+    }
+    """)
+
+    {port, row} =
+      launch(ctx, key, [System.find_executable("node"), script, "leader", ctx.test_dir])
+
+    assert eventually(fn ->
+             File.exists?(Path.join(ctx.test_dir, "same-group-ready")) and
+               File.exists?(Path.join(ctx.test_dir, "detached-ready"))
+           end)
+
+    same_group = File.read!(Path.join(ctx.test_dir, "same-group-pid"))
+    detached = File.read!(Path.join(ctx.test_dir, "detached-pid"))
+    File.touch!(Path.join(ctx.test_dir, "leave-leader"))
+    assert_receive {^port, {:exit_status, 0}}, 5_000
+    assert {:ok, parked} = HarnessProcess.begin_park(ctx.db, key)
+    assert parked.launch_id == row.launch_id
+
+    assert :ok = AdapterCoordinator.close_adapter_for_credential(coordinator, key)
+
+    assert eventually(fn ->
+             elem(System.cmd("/bin/kill", ["-0", same_group], stderr_to_stdout: true), 1) != 0
+           end)
+
+    assert {_, 0} = System.cmd("/bin/kill", ["-0", detached], stderr_to_stdout: true)
+    refute HarnessProcess.parked?(ctx.db, key)
+
+    assert %{state: "killed", resolved_at: resolved_at} =
+             Enum.find(HarnessProcess.list(ctx.db), &(&1.launch_id == row.launch_id))
+
+    assert is_integer(resolved_at)
+    System.cmd("/bin/kill", ["-KILL", detached], stderr_to_stdout: true)
+  end
+
   defp launch_stubborn(ctx, key) do
     launch(ctx, key, ["sh", "-c", "trap '' HUP TERM; while :; do sleep 1; done"])
   end
