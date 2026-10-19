@@ -265,7 +265,8 @@ defmodule Tightbeam.Wire.Router do
         with {:ok, verb} <- required_string(body["verb"]),
              :ok <- allowed_agent_verb(verb),
              {:ok, origin, principal} <- agent_identity(body, auth, conn),
-             {:ok, session_key, target_meta} <- typed_target(verb, body, conn) do
+             {:ok, session_key, target_meta} <- typed_target(verb, body, conn),
+             :ok <- visible_cancel_target(verb, session_key, principal, conn) do
           call = %{
             verb: verb,
             origin: origin,
@@ -2456,6 +2457,26 @@ defmodule Tightbeam.Wire.Router do
         {:error, 404, "not_found", nil}
     end
   end
+
+  defp visible_cancel_target("cancel", session_key, {:user, user_id}, conn)
+       when is_binary(session_key) do
+    case Devices.user(db(conn), user_id) do
+      %{is_admin: is_admin} ->
+        case visible_session(
+               session_key,
+               %{user_id: user_id, is_admin: is_admin},
+               conn
+             ) do
+          {:ok, _session} -> :ok
+          error -> error
+        end
+
+      nil ->
+        {:error, 404, "not_found", nil}
+    end
+  end
+
+  defp visible_cancel_target(_verb, _session_key, _principal, _conn), do: :ok
 
   defp visible_assignment_detail?(_detail, %{is_admin: true}, _conn), do: true
 

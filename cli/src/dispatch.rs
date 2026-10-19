@@ -844,6 +844,15 @@ fn build_unobserved_request(command: &Command) -> Result<RequestSpec, String> {
                 string_field("reason", reason),
             ],
         )),
+        Command::CancelTurn {
+            identity,
+            session_key,
+        } => Ok(request(
+            identity,
+            "cancel",
+            vec![string_field("sessionKey", session_key)],
+            vec![],
+        )),
         Command::RevokeAssignment {
             identity,
             assignment_id,
@@ -3541,6 +3550,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::DecisionRequests { identity, .. }
         | Command::DecisionRequest { identity, .. }
         | Command::AssignmentStopTurn { identity, .. }
+        | Command::CancelTurn { identity, .. }
         | Command::RevokeAssignment { identity, .. }
         | Command::ReopenAssignment { identity, .. }
         | Command::RepairAssignment { identity, .. }
@@ -4683,6 +4693,16 @@ mod tests {
                 "parent",
             ]),
             r#"{"as":"parent","verb":"cancel","params":{"assignmentId":"asg_1","reason":"replace the stale turn"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "cancel-turn",
+                "--session",
+                "worker s_1",
+                "--as-user",
+                "owner",
+            ]),
+            r#"{"asUser":"owner","verb":"cancel","sessionKey":"worker s_1","params":{}}"#
         );
         assert_eq!(
             body(&[

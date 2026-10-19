@@ -88,6 +88,7 @@ impl CommandContext {
             DecisionRequests { .. } => ("cli.decision_requests", DispatchPath),
             DecisionRequest { .. } => ("cli.decision_request", DispatchPath),
             AssignmentStopTurn { .. } => ("cli.assignment_stop_turn", DispatchPath),
+            CancelTurn { .. } => ("cli.cancel_turn", DispatchPath),
             RevokeAssignment { .. } => ("cli.revoke_assignment", DispatchPath),
             ReopenAssignment { .. } => ("cli.reopen_assignment", DispatchPath),
             RepairAssignment { .. } => ("cli.repair_assignment", DispatchPath),
@@ -411,6 +412,7 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | OperatorRule { .. }
         | OperatorWithdraw { .. }
         | AssignmentStopTurn { .. }
+        | CancelTurn { .. }
         | RevokeAssignment { .. }
         | ReopenAssignment { .. }
         | WorkItemUpdate { .. }
@@ -504,6 +506,29 @@ mod tests {
         assert!(!debug.contains("PRIVATE_USER"));
         assert!(!debug.contains("PRIVATE_ASSIGNMENT"));
         assert!(!debug.contains("PRIVATE_REASON"));
+    }
+
+    #[test]
+    fn cancel_turn_is_an_unkeyed_dispatch_write_without_retained_identity() {
+        let command = Command::CancelTurn {
+            identity: Identity::User("PRIVATE_USER".into()),
+            session_key: "PRIVATE_SESSION".into(),
+        };
+        let context = CommandContext::for_command(&command).unwrap();
+        assert_eq!(
+            context
+                .operation_for_request("POST", "/agent/dispatch")
+                .unwrap()
+                .as_str(),
+            "cli.cancel_turn"
+        );
+        assert_eq!(
+            effect(context, "POST", "/agent/dispatch"),
+            EffectContract::WriteWithoutIdempotency
+        );
+        let debug = format!("{context:?}");
+        assert!(!debug.contains("PRIVATE_USER"));
+        assert!(!debug.contains("PRIVATE_SESSION"));
     }
 
     #[test]

@@ -298,6 +298,10 @@ pub enum Command {
         assignment_id: String,
         reason: String,
     },
+    CancelTurn {
+        identity: Identity,
+        session_key: String,
+    },
     RevokeAssignment {
         identity: Identity,
         assignment_id: String,
@@ -886,6 +890,8 @@ COMMANDS:
       existing visibility rules.
   assignment-stop-turn <assignmentId> --reason "<why>"
       Stop the current turn only when you opened that assignment.
+  cancel-turn --session <key> --as-user <ownerUserId>
+      Stop a running turn in a session owned by that user.
   revoke-assignment <assignmentId> --reason "..."
       Revoke when the assignment handler already authorizes your principal.
   reopen-assignment <assignmentId> --reason <reason>
@@ -2549,6 +2555,23 @@ fn parse_with_optional_catalog(
                 reason,
             })
         }
+        "cancel-turn" => {
+            let usage = "usage: tightbeam cancel-turn --session <key> --as-user <ownerUserId>";
+            const ALLOWED: &[&str] = &["session", "as-user"];
+            if parsed.positional.len() != 1
+                || parsed.duplicates.contains("session")
+                || parsed.duplicates.contains("as-user")
+                || flags.keys().any(|flag| !ALLOWED.contains(&flag.as_str()))
+            {
+                return Err(usage.to_owned());
+            }
+            Ok(Command::CancelTurn {
+                identity: Identity::User(
+                    nonempty(flags, "as-user").ok_or_else(|| usage.to_owned())?,
+                ),
+                session_key: nonempty(flags, "session").ok_or_else(|| usage.to_owned())?,
+            })
+        }
         "revoke-assignment" => {
             let usage = "usage: tightbeam revoke-assignment <assignmentId> --reason \"...\"";
             if parsed.positional.len() != 2 || parsed.duplicates.contains("reason") {
@@ -3805,6 +3828,41 @@ mod tests {
     }
 
     #[test]
+    fn cancel_turn_requires_an_explicit_user_and_session() {
+        for args in [
+            strings(&["cancel-turn"]),
+            strings(&["cancel-turn", "--session", "s1"]),
+            strings(&["cancel-turn", "--as-user", "owner"]),
+            strings(&["cancel-turn", "--session", "s1", "--as", "owner"]),
+            strings(&[
+                "cancel-turn",
+                "--session",
+                "s1",
+                "--as-user",
+                "owner",
+                "--reason",
+                "extra",
+            ]),
+        ] {
+            assert!(parse(args).is_err());
+        }
+
+        assert_eq!(
+            parse(strings(&[
+                "cancel-turn",
+                "--session",
+                "agent:worker s_123",
+                "--as-user",
+                "owner",
+            ])),
+            Ok(Command::CancelTurn {
+                identity: Identity::User("owner".to_owned()),
+                session_key: "agent:worker s_123".to_owned(),
+            })
+        );
+    }
+
+    #[test]
     fn identity_current_rejects_other_session_overrides() {
         assert_eq!(
             super::parse(vec!["identity".into(), "current".into()]),
@@ -4966,6 +5024,7 @@ mod tests {
                 "repair-assignment",
                 "assignment-commitref-correct",
                 "assignment-stop-turn",
+                "cancel-turn",
                 "revoke-assignment",
                 "reopen-assignment",
                 "spawn",

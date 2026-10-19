@@ -606,6 +606,123 @@ defmodule Tightbeam.CliIntegrationTest do
     assert version == CliCompatibility.required_version()
   end
 
+  test "cancel-turn cancels an owned unattributed turn and refuses another user's session", ctx do
+    :ok = DB.execute(ctx.db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES('owner',0,1)")
+    :ok = DB.execute(ctx.db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES('other',0,1)")
+
+    make_session = fn session_key, owner_user_id ->
+      Org.create(ctx.db, %{
+        session_key: session_key,
+        display_name: session_key,
+        owner_user_id: owner_user_id,
+        origin: "user:#{owner_user_id}",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+    end
+
+    caller = make_session.("cancel-owner-main", "owner")
+    target = make_session.("cancel-owner-worker", "owner")
+    foreign = make_session.("cancel-other-worker", "other")
+    owner_root = Path.join(ctx.base_dir, "owner-cli")
+    owner_workdir = Path.join(owner_root, "work")
+    File.mkdir_p!(owner_workdir)
+
+    File.write!(
+      Path.join(owner_root, ".tightbeam-session"),
+      JSON.encode!(%{
+        url: "http://127.0.0.1:#{ctx.port}",
+        token: caller.cli_token,
+        sessionKey: caller.session_key
+      })
+    )
+
+    cancel_args = fn session_key ->
+      ["cancel-turn", "--session", session_key, "--as-user", "owner"]
+    end
+
+    {foreign_output, foreign_status} =
+      System.cmd(ctx.binary, cancel_args.(foreign.session_key),
+        cd: owner_workdir,
+        stderr_to_stdout: true
+      )
+
+    assert foreign_status != 0
+    assert foreign_output =~ "not_found"
+    refute_receive {:cli_call, %{verb: "cancel"}}
+
+    parent = self()
+
+    runner = fn turn ->
+      send(parent, {:cancel_target_started, turn.prompt})
+      receive do: (:never -> {:ok, %{}})
+    end
+
+    start_supervised!({Registry, keys: :unique, name: Tightbeam.LaneRegistry})
+    start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
+    start_supervised!({Task.Supervisor, name: Tightbeam.TurnTaskSupervisor})
+
+    {:ok, _seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: target.session_key,
+        message_id: "cancel-unattributed",
+        origin: "user:owner",
+        prompt: "unattributed turn"
+      })
+
+    start_supervised!(
+      {Tightbeam.SessionLane,
+       session_key: target.session_key,
+       db: ctx.db,
+       task_sup: Tightbeam.TurnTaskSupervisor,
+       runner: runner}
+    )
+
+    assert_receive {:cancel_target_started, "unattributed turn"}
+
+    assert {:ok, [[nil, "running"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT assignmentId,status FROM turns WHERE messageId='cancel-unattributed'"
+             )
+
+    {canceled_output, 0} =
+      System.cmd(ctx.binary, cancel_args.(target.session_key),
+        cd: owner_workdir,
+        stderr_to_stdout: true
+      )
+
+    assert JSON.decode!(canceled_output)["ok"]
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "cancel",
+                      origin: "user:owner",
+                      principal: {:user, "owner"},
+                      session_key: "cancel-owner-worker",
+                      params: %{}
+                    }}
+
+    assert {:ok, [[nil, "canceled"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT assignmentId,status FROM turns WHERE messageId='cancel-unattributed'"
+             )
+
+    {not_running_output, not_running_status} =
+      System.cmd(ctx.binary, cancel_args.(target.session_key),
+        cd: owner_workdir,
+        stderr_to_stdout: true
+      )
+
+    assert not_running_status != 0
+    assert not_running_output =~ "not_running"
+    assert not_running_output =~ "no turn in flight"
+  end
+
   test "real tune CLI uses session identity, typed fields, and structured refusals", ctx do
     {output, 1} =
       System.cmd(
