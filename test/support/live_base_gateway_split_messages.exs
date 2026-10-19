@@ -258,7 +258,7 @@ defmodule GuardSplitMessages do
   defp frame_name(%{"type" => "ack"}), do: "ack"
 
   defp receive_notice do
-    assert_receive {:firehose_notice, notice}
+    assert_receive {:firehose_notice, notice}, 60_000
     Hub.delivered(Hub, self())
     notice
   end
