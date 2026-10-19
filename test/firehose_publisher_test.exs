@@ -791,11 +791,15 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     assert {:ok, {:appended, marker}} =
              DB.transaction(db, fn txn ->
-               Projection.append_marker_in_txn(txn, session_key, %{
-                 kind: "session-restart",
-                 from: "old-session",
-                 to: "new-session"
-               })
+               assert {:appended, marker} =
+                        Projection.append_marker_in_txn(txn, session_key, %{
+                          kind: "session-restart",
+                          from: "old-session",
+                          to: "new-session"
+                        })
+
+               refute_receive {:firehose_notice, %{"class" => "message.created"}}, 0
+               {:appended, marker}
              end)
 
     notice = receive_notice()
