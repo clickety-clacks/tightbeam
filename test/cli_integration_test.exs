@@ -662,6 +662,7 @@ defmodule Tightbeam.CliIntegrationTest do
     end
 
     start_supervised!({Registry, keys: :unique, name: Tightbeam.LaneRegistry})
+    start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
     start_supervised!({Task.Supervisor, name: Tightbeam.TurnTaskSupervisor})
 
     {:ok, _seq} =
