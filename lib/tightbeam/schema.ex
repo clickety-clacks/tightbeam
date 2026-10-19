@@ -3801,8 +3801,11 @@ defmodule Tightbeam.Schema do
     end
   end
 
-  # Exactly one additive column, selected by the predecessor stamp. Historical
-  # rows remain NULL; a missing value is never backfilled as termination proof.
+  # Two additive columns, selected by the predecessor stamp: the launch row's
+  # preparation boot identity and the park fence's creation generation.
+  # Historical launch rows remain NULL; a missing value is never backfilled as
+  # termination proof. Existing fences each receive a distinct generation so
+  # settlement can tell a surviving fence instance from a replacement.
   defp upgrade_launch_preparation_boot(db) do
     case DB.transaction(db, fn txn ->
            case Txn.q(txn, "SELECT shape FROM schema_stamp") do
@@ -3829,6 +3832,30 @@ defmodule Tightbeam.Schema do
                      message: "incompatible launch preparation column: #{inspect(column)}"
                end
 
+               case Txn.q(
+                      txn,
+                      "SELECT type, \"notnull\", dflt_value, pk FROM pragma_table_info('harness_park_fences') WHERE name='generation'"
+                    ) do
+                 [] ->
+                   :ok =
+                     Txn.exec(
+                       txn,
+                       "ALTER TABLE harness_park_fences ADD COLUMN generation TEXT"
+                     )
+
+                 [["TEXT", 0, nil, 0]] ->
+                   :ok
+
+                 column ->
+                   raise ShapeError,
+                     message: "incompatible park fence generation column: #{inspect(column)}"
+               end
+
+               Txn.q(
+                 txn,
+                 "UPDATE harness_park_fences SET generation = lower(hex(randomblob(16))) WHERE generation IS NULL"
+               )
+
                Txn.q(txn, "UPDATE schema_stamp SET shape=?1,stampedAt=?2 WHERE shape=?3", [
                  @launch_preparation_boot_shape,
                  System.system_time(:millisecond),
@@ -3839,9 +3866,10 @@ defmodule Tightbeam.Schema do
                :ok
 
              [[@launch_preparation_boot_shape]] ->
-               # A stamped successor missing its required column is corruption, not a
+               # A stamped successor missing its required columns is corruption, not a
                # second opportunity to migrate an inferred shape.
                Txn.q(txn, "SELECT preparationBootIdentity FROM harness_processes LIMIT 0")
+               Txn.q(txn, "SELECT generation FROM harness_park_fences LIMIT 0")
                :ok
 
              rows ->

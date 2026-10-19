@@ -102,10 +102,14 @@ defmodule Tightbeam.HarnessProcess do
     ddl =
       if version == :current,
         do:
-          String.replace(
-            @ddl,
+          @ddl
+          |> String.replace(
             "lastError        TEXT",
             "lastError        TEXT,\n    preparationBootIdentity TEXT"
+          )
+          |> String.replace(
+            "requestedAt      INTEGER NOT NULL",
+            "requestedAt      INTEGER NOT NULL,\n    generation       TEXT"
           ),
         else: @ddl
 
@@ -247,8 +251,8 @@ defmodule Tightbeam.HarnessProcess do
             if DB.Txn.changes(txn) == 1 do
               DB.Txn.q(
                 txn,
-                "INSERT OR IGNORE INTO harness_park_fences(adapterKey,requestedAt) VALUES(?1,?2)",
-                [row.adapter_key, now()]
+                "INSERT OR IGNORE INTO harness_park_fences(adapterKey,requestedAt,generation) VALUES(?1,?2,?3)",
+                [row.adapter_key, now(), Id.ulid()]
               )
             end
 
@@ -302,8 +306,8 @@ defmodule Tightbeam.HarnessProcess do
 
     DB.Txn.q(
       txn,
-      "INSERT OR IGNORE INTO harness_park_fences (adapterKey, requestedAt) VALUES (?1, ?2)",
-      [adapter_key, at]
+      "INSERT OR IGNORE INTO harness_park_fences (adapterKey, requestedAt, generation) VALUES (?1, ?2, ?3)",
+      [adapter_key, at, Id.ulid()]
     )
 
     case latest_unresolved_in_txn(txn, adapter_key) do
@@ -1304,8 +1308,8 @@ defmodule Tightbeam.HarnessProcess do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT OR IGNORE INTO harness_park_fences (adapterKey, requestedAt) VALUES (?1, ?2)",
-        [adapter_key, now()]
+        "INSERT OR IGNORE INTO harness_park_fences (adapterKey, requestedAt, generation) VALUES (?1, ?2, ?3)",
+        [adapter_key, now(), Id.ulid()]
       )
 
     :ok

@@ -320,9 +320,13 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | SentinelEnvList { .. }
         | ConfigGet { .. }
         | HostEnvList { .. }
-        | HarnessProcessSettle { .. }
         | HarnessProcesses { .. }
         | UpdateClients { .. } => Read,
+
+        // Settlement resolves the launch row, may remove its park fence and
+        // records a lifecycle event. It carries no idempotency key; the
+        // guarded operation itself reports already-settled on a repeat.
+        HarnessProcessSettle { .. } => WriteWithoutIdempotency,
 
         Wake {
             idempotency_key, ..

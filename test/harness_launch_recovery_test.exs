@@ -279,7 +279,8 @@ defmodule Tightbeam.HarnessLaunchRecoveryTest do
     assert HarnessProcess.fenced?(ctx.db, @key)
   end
 
-  test "fence replacement and new fence writes wait for settlement then survive", ctx do
+  test "a fence write during proof commits at once and settlement detects the new instance",
+       ctx do
     for existing? <- [true, false] do
       {row, _} = prepare(ctx)
       File.write!(row.identity_path, "")
@@ -317,42 +318,46 @@ defmodule Tightbeam.HarnessLaunchRecoveryTest do
       recovery = Task.async(fn -> settle(ctx, row) end)
       assert eventually(fn -> File.exists?(signal) end)
       assert File.read!(signal) == "observed\n"
-      parent = self()
 
-      competing =
-        Task.async(fn ->
-          send(parent, :fence_write_attempted)
+      # Replace the fence with an identical-content row while the proof probe
+      # still runs: the write must commit immediately, not wait on the probe.
+      replacement = "replacement-#{row.launch_id}"
 
-          result =
-            DB.transaction(ctx.db, fn txn ->
-              DB.Txn.q(txn, "DELETE FROM harness_park_fences WHERE adapterKey=?1", [@key_name])
+      {:ok, _} =
+        DB.transaction(ctx.db, fn txn ->
+          DB.Txn.q(txn, "DELETE FROM harness_park_fences WHERE adapterKey=?1", [@key_name])
 
-              DB.Txn.q(
-                txn,
-                "INSERT INTO harness_park_fences(adapterKey,requestedAt) VALUES(?1,?2)",
-                [@key_name, at]
-              )
-            end)
-
-          send(parent, :fence_write_committed)
-          result
+          DB.Txn.q(
+            txn,
+            "INSERT INTO harness_park_fences(adapterKey,requestedAt,generation) VALUES(?1,?2,?3)",
+            [@key_name, at, replacement]
+          )
         end)
 
-      assert_receive :fence_write_attempted
-      refute_receive :fence_write_committed, 50
+      refute File.exists?(release)
       File.write!(release, "continue\n")
-      assert {:ok, %{proof: :reboot_since_preparation}} = Task.await(recovery)
-      assert {:ok, _} = Task.await(competing)
-      assert_receive :fence_write_committed
 
-      assert {:ok, [[^at]]} =
+      # Settlement detects the instance change even with equal contents,
+      # changes nothing, and names the failed guard. The launch stays
+      # unresolved and the replacement fence is left intact.
+      assert {:error, :fence_changed_since_observation} = Task.await(recovery)
+
+      assert [%{launch_id: launch_id}] =
+               Enum.filter(HarnessProcess.list(ctx.db), &is_nil(&1.resolved_at))
+
+      assert launch_id == row.launch_id
+
+      assert {:ok, [[^at, ^replacement]]} =
                DB.query(
                  ctx.db,
-                 "SELECT requestedAt FROM harness_park_fences WHERE adapterKey=?1",
+                 "SELECT requestedAt, generation FROM harness_park_fences WHERE adapterKey=?1",
                  [@key_name]
                )
 
-      HarnessProcess.complete_park(ctx.db, @key)
+      # A retry observes the current fence instance, proves the reboot again
+      # and settles, releasing the fence once no unresolved launch remains.
+      assert {:ok, %{proof: :reboot_since_preparation}} = settle(ctx, row)
+      refute HarnessProcess.fenced?(ctx.db, @key)
     end
   end
 
