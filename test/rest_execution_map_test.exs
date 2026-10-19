@@ -257,6 +257,239 @@ defmodule Tightbeam.RestExecutionMapTest do
     end
   end
 
+  test "case 12 grants all ExecutionMap modes to an admin user without borrowing into its session",
+       ctx do
+    admin_device = approved_device(ctx.db, "execution-map-case12-admin", "Admin", "admin")
+    admin_session = ensure_main_session(ctx.db, "admin")
+    item = insert_work_item!(ctx.db, "wi_case12_admin_item", "other", 40_001)
+
+    assignment =
+      insert_assignment!(ctx.db, "asg_case12_admin_item",
+        opener_user: "owner",
+        holder: ctx.owner_session.session_key,
+        work_item_id: item
+      )
+
+    for {path, fields, collection} <- [
+          {"/api/execution-map", ~w(items page), "items"},
+          {"/api/execution-map/tree", ~w(roots), "roots"},
+          {"/api/execution-map/subtrees/#{item}", ~w(roots), "roots"},
+          {
+            "/api/execution-map/assignments?assignmentId=#{assignment}",
+            ~w(items noItem),
+            "items"
+          }
+        ] do
+      response = get(ctx, path, admin_device.token)
+      decoded = assert_execution_map_response(response, fields)
+      assert Enum.map(decoded[collection], & &1["id"]) == [item]
+    end
+
+    admin_session_flat =
+      get(ctx, "/api/execution-map", admin_session.cli_token)
+      |> assert_execution_map_response(~w(items page))
+
+    assert admin_session_flat["items"] == []
+
+    admin_session_tree =
+      get(ctx, "/api/execution-map/tree", admin_session.cli_token)
+      |> assert_execution_map_response(~w(roots))
+
+    assert admin_session_tree["roots"] == []
+
+    assert_error(
+      get(ctx, "/api/execution-map/subtrees/#{item}", admin_session.cli_token),
+      404,
+      "not_found"
+    )
+
+    assert_error(
+      get(
+        ctx,
+        "/api/execution-map/assignments?assignmentId=#{assignment}",
+        admin_session.cli_token
+      ),
+      404,
+      "not_found"
+    )
+  end
+
+  test "case 16 emits only the allowlisted ExecutionMap fields for adversarial source values",
+       ctx do
+    private_values = [
+      "session-token-case16-private",
+      "device-token-case16-private",
+      "harness-identity-token-case16-private",
+      "credential-case16-private",
+      "mcp-command-case16-private",
+      "mcp-value-case16-private",
+      "-----BEGIN PRIVATE KEY-----case16-private-----END PRIVATE KEY-----",
+      "banked-secret-case16-private",
+      "/home/example/.config/provider/credentials-case16",
+      "/home/example/.tightbeam/identity/private-case16",
+      "/srv/example/application/.tightbeam/private-case16",
+      "../receipt-case16-private.json",
+      "manifest-case16-private.json",
+      "symlink-target-case16-private",
+      "unlisted-identity-content-case16-private"
+    ]
+
+    payload = Enum.join(private_values, "\n")
+    item = insert_work_item!(ctx.db, "wi_case16_safe_values", "owner", 40_002)
+
+    assignment =
+      insert_assignment!(ctx.db, "asg_case16_safe_values",
+        opener_user: "owner",
+        holder: ctx.owner_session.session_key,
+        work_item_id: item
+      )
+
+    assert {:ok, _rows} =
+             DB.query(
+               ctx.db,
+               "UPDATE assignments SET subject=?1 WHERE id=?2",
+               [payload, assignment]
+             )
+
+    insert_attest!(ctx.db, "att_case16_safe_values", assignment, ctx.owner_session.session_key, 1)
+
+    assert {:ok, _rows} =
+             DB.query(
+               ctx.db,
+               "UPDATE attests SET note=?1 WHERE id=?2",
+               [payload, "att_case16_safe_values"]
+             )
+
+    assert {:ok, _seq} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: ctx.owner_session.session_key,
+               message_id: "execution-map-case16-private-values",
+               origin: "session:#{ctx.owner_session.session_key}",
+               prompt: payload,
+               assignment_id: assignment,
+               job_ref: item
+             })
+
+    insert_pending_wake!(
+      ctx.db,
+      "wake_case16_safe_values",
+      ctx.owner_session.session_key,
+      assignment,
+      40_003
+    )
+
+    assert {:ok, _rows} =
+             DB.query(ctx.db, "UPDATE wakes SET prompt=?1 WHERE wakeId=?2", [
+               payload,
+               "wake_case16_safe_values"
+             ])
+
+    insert_open_statute_request!(ctx.db, "decision_case16_safe_values", assignment)
+
+    assert {:ok, _rows} =
+             DB.query(
+               ctx.db,
+               "UPDATE decision_requests SET question=?1, context=?2 WHERE id=?3",
+               [payload, JSON.encode!(%{"private" => payload}), "decision_case16_safe_values"]
+             )
+
+    insert_subagent_marker!(
+      ctx.db,
+      hd(private_values),
+      Enum.at(private_values, 1),
+      assignment,
+      ctx.owner_session.session_key
+    )
+
+    insert_disposition_event!(ctx.db, item, assignment)
+
+    assert {:ok, _rows} =
+             DB.query(
+               ctx.db,
+               "UPDATE causal_events SET detail=?1 WHERE jobRef=?2 AND assignmentId=?3 " <>
+                 "AND kind='disposition_transition'",
+               [
+                 JSON.encode!(%{
+                   "fromState" => "open",
+                   "toState" => "open",
+                   "private" => payload
+                 }),
+                 item,
+                 assignment
+               ]
+             )
+
+    assert {:ok, _rows} =
+             DB.query(
+               ctx.db,
+               "UPDATE sessions SET cliToken=?1, identityName=?2, overrides=?3 WHERE sessionKey=?4",
+               [
+                 Enum.at(private_values, 0),
+                 Enum.at(private_values, 14),
+                 JSON.encode!(%{
+                   "mcpCommand" => Enum.at(private_values, 4),
+                   "mcpValue" => Enum.at(private_values, 5)
+                 }),
+                 ctx.owner_session.session_key
+               ]
+             )
+
+    assert {:ok, _rows} =
+             DB.query(
+               ctx.db,
+               "UPDATE devices SET token=?1 WHERE deviceId=?2",
+               [Enum.at(private_values, 1), "execution-map-other-device"]
+             )
+
+    assert {:ok, _rows} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO harness_processes
+                 (launchId, adapterKey, harness, preset, host, helperPath, identityPath,
+                  launchSequence, identityToken, state, createdAt)
+               VALUES ('case16-harness-process', 'case16-adapter', 'claude', 'default',
+                       'testhost', ?1, ?2, 1, ?3, 'exited', 1)
+               """,
+               [
+                 Enum.at(private_values, 9),
+                 Enum.at(private_values, 10),
+                 Enum.at(private_values, 2)
+               ]
+             )
+
+    responses = [
+      {get(ctx, "/api/execution-map", ctx.token), ~w(items page), "items"},
+      {get(ctx, "/api/execution-map/tree", ctx.token), ~w(roots), "roots"},
+      {get(ctx, "/api/execution-map/subtrees/#{item}", ctx.token), ~w(roots), "roots"},
+      {
+        get(ctx, "/api/execution-map/assignments?assignmentId=#{assignment}", ctx.token),
+        ~w(items noItem),
+        "items"
+      }
+    ]
+
+    for {response, fields, collection} <- responses do
+      decoded = assert_execution_map_response(response, fields)
+      [node] = decoded[collection]
+      assert node["id"] == item
+
+      expected_node_fields =
+        if collection == "roots", do: @node_fields ++ ["children"], else: @node_fields
+
+      assert Enum.sort(Map.keys(node)) == Enum.sort(expected_node_fields)
+
+      for private_value <- private_values do
+        refute response.resp_body =~ private_value
+      end
+
+      for private_field <-
+            ~w(cliToken token identityToken command arguments environment originPath) do
+        refute response.resp_body =~ "\"#{private_field}\":"
+      end
+    end
+  end
+
   test "hidden activity linked to visible items leaves response bytes and nodes unchanged", ctx do
     user_visible_item = insert_work_item!(ctx.db, "wi_user_twin_visible", "owner", 41_000)
     filtered_tree_path = "/api/execution-map/tree?state=closed"

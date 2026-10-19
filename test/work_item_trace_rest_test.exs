@@ -236,6 +236,27 @@ defmodule Tightbeam.WorkItemTraceRestTest do
              ])
   end
 
+  test "case 12 grants work-item trace to an admin user without borrowing into its session",
+       ctx do
+    admin_device = approved_device(ctx.db, "work-item-trace-case12-admin", "Admin", "admin")
+    admin_session = ensure_main_session(ctx.db, "admin")
+    item = insert_work_item!(ctx.db, "wi_trace_case12_admin", "owner", 45_001)
+
+    admin_response = get(ctx, "/api/work-items/#{item}/trace", admin_device.token)
+    admin_trace = decode_trace!(admin_response)
+
+    assert get_resp_header(admin_response, "cache-control") == ["no-store"]
+    assert admin_trace["workItem"]["id"] == item
+
+    admin_session_response = get(ctx, "/api/work-items/#{item}/trace", admin_session.cli_token)
+
+    missing_response =
+      get(ctx, "/api/work-items/wi_trace_case12_missing/trace", admin_session.cli_token)
+
+    assert_error(admin_session_response, 404, "not_found")
+    assert admin_session_response.resp_body == missing_response.resp_body
+  end
+
   test "hidden turn and assignment-chain rows are indistinguishable from absent rows", ctx do
     root =
       insert_work_item!(ctx.db, "wi_trace_twin_root", "owner", 40_000,
