@@ -619,6 +619,9 @@ defmodule Tightbeam.Archetypes do
         "references",
         "model_preferences",
         "idle_cleanup",
+        # Shipped 0.1.9 identity manifests may still contain this retired key.
+        # Accept it for compatibility, but do not read it into archetype state.
+        "owner_open_child_prod",
         "guidance",
         "mcp",
         "containment"

@@ -703,8 +703,6 @@ defmodule Tightbeam.ArchetypesTest do
 
     cases = [
       {"name = \"bad\"\nware = [\"local\"]\n", ~r/unknown top-level archetype keys.*ware/},
-      {"name = \"bad\"\nowner_open_child_prod = true\n",
-       ~r/unknown top-level archetype keys.*owner_open_child_prod/},
       {"name = \"bad\"\n[defaults]\nharness = \"other\"\n",
        ~r/unknown harness "other"; expected one of: claude, codex, pi, fixture/},
       {"name = \"bad\"\n[references]\nrepo = { access = \"read\" }\n",
@@ -715,6 +713,17 @@ defmodule Tightbeam.ArchetypesTest do
       File.write!(path, body)
       assert_unavailable(message, fn -> Archetypes.load!(ctx.base_dir) end)
     end
+  end
+
+  test "legacy owner child prod manifest key is accepted and ignored" do
+    archetype =
+      Archetypes.parse_manifest!(
+        "name = \"legacy\"\nowner_open_child_prod = true\n",
+        "legacy.toml"
+      )
+
+    assert archetype.name == "legacy"
+    refute Map.has_key?(archetype, :owner_open_child_prod)
   end
 
   test "idle cleanup is an optional boolean with a true default" do
