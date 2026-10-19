@@ -1467,12 +1467,16 @@ defmodule Tightbeam.ExecutionMap do
         "{" <>
           execution_map_pair!(
             "assignmentId",
-            execution_map_string!(attest.assignmentId, "closingAttests.assignmentId")
+            JSON.encode!(
+              execution_map_string!(attest.assignmentId, "closingAttests.assignmentId")
+            )
           ) <>
           "," <>
           execution_map_pair!(
             "attestId",
-            execution_map_string!(attest.attestId, "closingAttests.attestId")
+            JSON.encode!(
+              execution_map_string!(attest.attestId, "closingAttests.attestId")
+            )
           ) <>
           "," <>
           execution_map_pair!("commitRefs", refs) <> "}"

@@ -190,11 +190,15 @@ defmodule Tightbeam.RestExecutionMapTest do
         work_item_id: hidden_item
       )
 
-    assert :ok =
-             DB.execute(ctx.db, """
-             INSERT INTO attests (id, assignmentId, kind, bySession, ts)
-             VALUES ('att_hidden_twin', '#{hidden_assignment}', 'progress', 'other', 1)
-             """)
+    assert {:ok, _rows} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO attests (id, assignmentId, kind, bySession, ts)
+               VALUES (?1, ?2, 'progress', ?3, ?4)
+               """,
+               ["att_hidden_twin", hidden_assignment, ctx.other_session.session_key, 1]
+             )
 
     assert {:ok, _seq} =
              Ledger.enqueue(ctx.db, %{
@@ -229,11 +233,19 @@ defmodule Tightbeam.RestExecutionMapTest do
                [visible]
              )
 
+    stamp_work_item_version!(ctx.db, visible, 42_001)
+
     visible_changed = get(ctx, "/api/execution-map", ctx.token) |> decode_success()
     refute visible_changed["dependencyVersion"] == baseline_version
 
     assert {:ok, _rows} =
-             DB.query(ctx.db, "UPDATE work_items SET title='Hidden changed' WHERE id=?1", [hidden])
+             DB.query(
+               ctx.db,
+               "UPDATE work_items SET title='Hidden changed' WHERE id=?1",
+               [hidden]
+             )
+
+    stamp_work_item_version!(ctx.db, hidden, 43_001)
 
     hidden_changed = get(ctx, "/api/execution-map", ctx.token) |> decode_success()
     assert hidden_changed["dependencyVersion"] == visible_changed["dependencyVersion"]
@@ -798,6 +810,15 @@ defmodule Tightbeam.RestExecutionMapTest do
              )
 
     id
+  end
+
+  defp stamp_work_item_version!(db, work_item_id, row_version) do
+    assert {:ok, _rows} =
+             DB.query(
+               db,
+               "INSERT INTO work_item_versions (workItemId, rowVersion) VALUES (?1, ?2)",
+               [work_item_id, row_version]
+             )
   end
 
   defp set_creation_turn!(db, work_item_id, turn_seq) do
