@@ -10,6 +10,7 @@ defmodule Tightbeam.RestReadPlaneD2ConformanceTest do
     Assignments,
     DB,
     Devices,
+    HarnessProcess,
     Identity,
     Wakes,
     WorkItems
@@ -28,6 +29,7 @@ defmodule Tightbeam.RestReadPlaneD2ConformanceTest do
     id assignmentId kind verdictKind note bySession byUser producer producerCommand
     byHarness byProvider commitRefs ts rowVersion
   )
+  @harness_process_fields ~w(id host harness pid state createdAt resolvedAt)
 
   setup do
     base_dir =
@@ -734,6 +736,166 @@ defmodule Tightbeam.RestReadPlaneD2ConformanceTest do
     assert Enum.count(attest_events, &match?({:serializer, "attests", _}, &1)) == 1
   end
 
+  test "HarnessProcesses collection follows the rev-5 launch-ledger contract", ctx do
+    assert :ok = HarnessProcess.ensure_schema(ctx.db)
+    insert_harness_process_rows(ctx)
+
+    first = get(ctx, "/api/harness-processes?limit=2&tail=false", ctx.admin_token)
+    assert first.status == 200, first.resp_body
+    assert Plug.Conn.get_resp_header(first, "cache-control") == ["no-store"]
+
+    first_page = JSON.decode!(first.resp_body)
+    assert first_page["resource"] == "harness processes"
+    assert Enum.map(first_page["items"], & &1["id"]) == ["launch-a", "launch-b"]
+    assert Enum.sort(Map.keys(hd(first_page["items"]))) == Enum.sort(@harness_process_fields)
+
+    assert first.resp_body =~
+             ~s({"id":"launch-a","host":"fixture-node-a","harness":"codex","pid":null,"state":"launching","createdAt":1000,"resolvedAt":null})
+
+    assert hd(first_page["items"]) == %{
+             "id" => "launch-a",
+             "host" => "fixture-node-a",
+             "harness" => "codex",
+             "pid" => nil,
+             "state" => "launching",
+             "createdAt" => 1_000,
+             "resolvedAt" => nil
+           }
+
+    assert Enum.map(first_page["items"], & &1["state"]) == ["launching", "running"]
+
+    assert first_page["page"]["hasMoreAfter"]
+    cursor_payload =
+      first_page["page"]["newestCursor"]
+      |> Base.url_decode64!(padding: false)
+      |> JSON.decode!()
+
+    assert cursor_payload["tuple"] == [1_000, "launch-b"]
+
+    second =
+      get(
+        ctx,
+        "/api/harness-processes?limit=2&after=" <>
+          URI.encode_www_form(first_page["page"]["newestCursor"]),
+        ctx.admin_token
+      )
+
+    assert second.status == 200, second.resp_body
+    second_page = JSON.decode!(second.resp_body)
+    assert second_page["page"]["hasMoreBefore"]
+    assert second_page["page"]["hasMoreAfter"]
+    assert Enum.map(second_page["items"], & &1["id"]) == ["launch-c", "launch-d"]
+
+    third =
+      get(
+        ctx,
+        "/api/harness-processes?limit=2&after=" <>
+          URI.encode_www_form(second_page["page"]["newestCursor"]),
+        ctx.admin_token
+      )
+
+    assert third.status == 200, third.resp_body
+    third_page = JSON.decode!(third.resp_body)
+    assert third_page["page"]["hasMoreBefore"]
+    assert third_page["page"]["hasMoreAfter"]
+    assert Enum.map(third_page["items"], & &1["id"]) == ["launch-e", "launch-f"]
+
+    fourth =
+      get(
+        ctx,
+        "/api/harness-processes?limit=2&after=" <>
+          URI.encode_www_form(third_page["page"]["newestCursor"]),
+        ctx.admin_token
+      )
+
+    assert fourth.status == 200, fourth.resp_body
+    fourth_page = JSON.decode!(fourth.resp_body)
+    refute fourth_page["page"]["hasMoreAfter"]
+    assert Enum.map(fourth_page["items"], & &1["id"]) == ["launch-g"]
+
+    all_items = first_page["items"] ++ second_page["items"] ++ third_page["items"] ++ fourth_page["items"]
+    item_ids = Enum.map(all_items, & &1["id"])
+    assert item_ids == ~w(launch-a launch-b launch-c launch-d launch-e launch-f launch-g)
+
+    assert Enum.map(all_items, & &1["state"]) == [
+             "launching",
+             "running",
+             "park_requested",
+             "kill_failed",
+             "closed_gracefully",
+             "killed",
+             "exited"
+           ]
+
+    assert Enum.at(all_items, 4)["resolvedAt"] == 4_000
+    assert Enum.at(all_items, 0)["resolvedAt"] == nil
+
+    host_filter = get(ctx, "/api/harness-processes?host=fixture-node-a", ctx.admin_token)
+    assert Enum.map(JSON.decode!(host_filter.resp_body)["items"], & &1["id"]) == [
+             "launch-a",
+             "launch-b",
+             "launch-c"
+           ]
+
+    harness_filter = get(ctx, "/api/harness-processes?harness=claude", ctx.admin_token)
+    assert Enum.map(JSON.decode!(harness_filter.resp_body)["items"], & &1["id"]) == [
+             "launch-c",
+             "launch-e",
+             "launch-f"
+           ]
+
+    state_filter = get(ctx, "/api/harness-processes?state=kill_failed", ctx.admin_token)
+    assert Enum.map(JSON.decode!(state_filter.resp_body)["items"], & &1["id"]) == ["launch-d"]
+
+    combined_filter =
+      get(
+        ctx,
+        "/api/harness-processes?host=fixture-node-b&harness=claude&state=closed_gracefully",
+        ctx.admin_token
+      )
+
+    assert Enum.map(JSON.decode!(combined_filter.resp_body)["items"], & &1["id"]) == [
+             "launch-e"
+           ]
+
+    assert_error(
+      get(ctx, "/api/harness-processes?state=unknown", ctx.admin_token),
+      400,
+      "harness processes",
+      "invalid_filter"
+    )
+
+    for unsupported <- ~w(sessionKey provider model) do
+      assert_error(
+        get(ctx, "/api/harness-processes?#{unsupported}=fixture-value", ctx.admin_token),
+        400,
+        "harness processes",
+        "invalid_filter"
+      )
+    end
+
+    non_admin = get(ctx, "/api/harness-processes", ctx.token)
+    assert non_admin.status == 200, non_admin.resp_body
+    assert JSON.decode!(non_admin.resp_body)["items"] == []
+
+    response_bytes = first.resp_body <> second.resp_body <> third.resp_body <> fourth.resp_body
+
+    for excluded <- [
+          "fixture-adapter-key",
+          "fixture-preset",
+          "fixture-ssh-destination",
+          "/fixture/private-helper",
+          "/fixture/private-identity",
+          "fixture-boot-identity",
+          "fixture-identity-token",
+          "fixture-last-error",
+          "fixture-preparation-boot",
+          "98765"
+        ] do
+      refute response_bytes =~ excluded
+    end
+  end
+
   test "collection routing reuses the shared cursor and public serialization seams" do
     router = File.read!("lib/tightbeam/wire/router.ex")
     resources = File.read!("lib/tightbeam/state_resources.ex")
@@ -849,6 +1011,42 @@ defmodule Tightbeam.RestReadPlaneD2ConformanceTest do
                    txn,
                    "INSERT INTO attests (id, assignmentId, kind, bySession, ts) VALUES (?1, ?2, 'progress', ?3, ?4)",
                    [id, assignment_id, ctx.flynn_session.session_key, ts]
+                 )
+               end)
+
+               :ok
+             end)
+  end
+
+  defp insert_harness_process_rows(ctx) do
+    rows = [
+      {"launch-a", "fixture-node-a", "codex", 1, nil, "launching", 1_000, nil},
+      {"launch-b", "fixture-node-a", "codex", 2, 101, "running", 1_000, nil},
+      {"launch-c", "fixture-node-a", "claude", 3, 102, "park_requested", 1_000, nil},
+      {"launch-d", "fixture-node-b", "codex", 4, 103, "kill_failed", 3_000, nil},
+      {"launch-e", "fixture-node-b", "claude", 5, 104, "closed_gracefully", 4_000, 4_000},
+      {"launch-f", "fixture-node-c", "claude", 6, 105, "killed", 5_000, 5_000},
+      {"launch-g", "fixture-node-c", "codex", 7, 106, "exited", 6_000, 6_000}
+    ]
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               Enum.each(rows, fn {id, host, harness, sequence, pid, state, created, resolved} ->
+                 Txn.q(
+                   txn,
+                   """
+                   INSERT INTO harness_processes
+                     (launchId, adapterKey, harness, preset, host, ssh, helperPath, identityPath,
+                      launchSequence, osPid, processGroupId, bootIdentity, identityToken, state,
+                      createdAt, resolvedAt, parkRequestedAt, killAttemptedAt, killSentAt,
+                      lastError, preparationBootIdentity)
+                   VALUES (?1, 'fixture-adapter-key', ?2, 'fixture-preset', ?3,
+                           'fixture-ssh-destination', '/fixture/private-helper',
+                           '/fixture/private-identity', ?4, ?5, 98765, 'fixture-boot-identity',
+                           'fixture-identity-token', ?6, ?7, ?8, 111, 222, 333,
+                           'fixture-last-error', 'fixture-preparation-boot')
+                   """,
+                   [id, harness, host, sequence, pid, state, created, resolved]
                  )
                end)
 
