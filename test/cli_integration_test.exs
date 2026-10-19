@@ -695,7 +695,7 @@ defmodule Tightbeam.CliIntegrationTest do
         stderr_to_stdout: true
       )
 
-    assert canceled_output =~ "\"ok\":true"
+    assert JSON.decode!(canceled_output)["ok"]
 
     assert_receive {:cli_call,
                     %{
