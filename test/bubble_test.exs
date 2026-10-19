@@ -10,9 +10,11 @@ defmodule Tightbeam.Productions.BubbleTest do
     Ledger,
     Model,
     NoticeBatcher,
-    Org
+    Org,
+    StateResources
   }
 
+  alias Tightbeam.Firehose.{Hub, Publisher}
   alias Tightbeam.Productions.Bubble
 
   defmodule LaneDoorbell do
@@ -428,9 +430,35 @@ defmodule Tightbeam.Productions.BubbleTest do
   for status <- ["failed", "failed_unknown"] do
     @delivery_status status
     test "#{status} names the carried wake and records one sender result without retry", ctx do
+      start_supervised!({Hub, name: Hub})
+      :ok = Hub.register(Hub, self(), %{mode: :subscribed, db: ctx.db, user_id: "flynn", is_admin: false})
+
       {wake, turn, sender} = fail_wake!(ctx, @delivery_status)
+
+      :ok =
+        Hub.subscribe(Hub, self(), "wake-sender-result", %{
+          "classes" => ["message.created"],
+          "sessionKey" => sender.session_key
+        })
+
       assert :ok = Bubble.recognize_terminal(ctx.db, turn.seq)
       assert :ok = Bubble.recognize_terminal(ctx.db, turn.seq)
+
+      assert_receive {:firehose_notice, %{"class" => "message.created"} = notice}
+      item =
+        ctx.db
+        |> StateResources.query_message(notice["payload"]["id"])
+        |> StateResources.message()
+
+      assert notice["payload"] == item
+      assert notice["payload"]["sessionKey"] == sender.session_key
+      assert notice["refs"]["messageId"] == item["id"]
+      item_bytes = StateResources.encode_item("transcript messages", item)
+      wire_notice = Publisher.encode_wire_notice(notice)
+      assert String.contains?(wire_notice, "\"payload\":" <> item_bytes)
+      :ok = Hub.delivered(Hub, self())
+      :sys.get_state(Hub)
+      refute_receive {:firehose_notice, %{"class" => "message.created"}}, 0
 
       assert [[_, _, _, _, prompt]] = notice_turn(ctx.db, ctx.supervisor.session_key)
       assert prompt =~ "carrying delivery wake #{turn.wake_id}"
