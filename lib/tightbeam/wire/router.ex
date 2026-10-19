@@ -135,6 +135,18 @@ defmodule Tightbeam.Wire.Router do
       filters: ~w(state ownerUserId createdBySession createdByUser isBug specRefName holderKey),
       order: ~w(createdAt id)
     },
+    artifacts: %{
+      resource: "artifacts",
+      route: "artifacts.collection",
+      filters: ~w(workItemId createdBySession kind state),
+      order: ~w(createdAt artifactId)
+    },
+    assignment_attests: %{
+      resource: "attests",
+      route: "assignment_attests.collection",
+      filters: ~w(assignmentId workItemId kind verdictKind bySession byUser),
+      order: ~w(ts id)
+    },
     decision_requests: %{
       resource: "decision requests",
       route: "decision_requests.collection",
@@ -463,6 +475,10 @@ defmodule Tightbeam.Wire.Router do
     core_detail(conn, Map.fetch!(@core_detail_specs, :assignments), assignment_id)
   end
 
+  get "/api/assignments/:assignment_id/attests" do
+    d1_collection(conn, Map.fetch!(@d1_resources, :assignment_attests), assignment_id)
+  end
+
   get "/api/attests/:attest_id" do
     core_detail(conn, Map.fetch!(@core_detail_specs, :attests), attest_id)
   end
@@ -543,6 +559,10 @@ defmodule Tightbeam.Wire.Router do
 
   get "/api/artifacts/:artifact_id" do
     core_detail(conn, Map.fetch!(@core_detail_specs, :artifacts), artifact_id)
+  end
+
+  get "/api/artifacts" do
+    d1_collection(conn, Map.fetch!(@d1_resources, :artifacts))
   end
 
   get "/api/read-markers/:scope_key" do
@@ -1622,60 +1642,79 @@ defmodule Tightbeam.Wire.Router do
   defp d1_row_tuple(:decision_requests, item),
     do: [Map.fetch!(item, "raisedAt"), Map.fetch!(item, "id")]
 
+  defp d1_row_tuple(:artifacts, item),
+    do: [Map.fetch!(item, "createdAt"), Map.fetch!(item, "artifactId")]
+
+  defp d1_row_tuple(:assignment_attests, item),
+    do: [Map.fetch!(item, "ts"), Map.fetch!(item, "id")]
+
   defp d1_row_tuple(resource, item), do: D1Read.tuple(resource, item)
   defp d1_encode(:work_items, item), do: StateResources.encode_item("work items", item, %{})
 
   defp d1_encode(:decision_requests, item),
     do: StateResources.encode_item("decision requests", item, %{})
 
+  defp d1_encode(:artifacts, item), do: StateResources.encode_item("artifacts", item, %{})
+
+  defp d1_encode(:assignment_attests, item), do: StateResources.encode_item("attests", item, %{})
+
   defp d1_encode(resource, item), do: D1Read.encode(resource, item)
 
-  defp d1_collection(conn, spec) do
+  defp d1_collection(conn, spec), do: d1_collection(conn, spec, nil)
+
+  defp d1_collection(conn, spec, parent_id) do
     with {:ok, auth} <- d1_bearer_auth(conn),
          {:ok, query} <- d1_query(conn.query_string),
          {:ok, principal} <- d1_principal(auth, query, conn),
          {:ok, request} <- d1_collection_request(query, spec),
+         {:ok, request} <- d1_collection_parent_scope(request, d1_resource(spec), parent_id),
+         :ok <- d1_d2_filter_validation(d1_resource(spec), request.filters),
          {:ok, boundary} <- d1_boundary(request, principal, spec, conn) do
-      if d1_resource(spec) == :decision_requests do
-        {items, page} = d1_decision_request_page(conn, request, boundary, principal, spec)
-        d1_send(conn, 200, d1_collection_envelope(spec, items, page))
-      else
-        result =
-          cond do
-            spec.resource == "work items" ->
-              page =
-                StateResources.query_work_item_page(
+      case d1_resource(spec) do
+        resource when resource in [:artifacts, :assignment_attests] ->
+          d1_d2_collection(conn, request, boundary, principal, spec, parent_id)
+
+        :decision_requests ->
+          {items, page} = d1_decision_request_page(conn, request, boundary, principal, spec)
+          d1_send(conn, 200, d1_collection_envelope(spec, items, page))
+
+        resource ->
+          result =
+            cond do
+              spec.resource == "work items" ->
+                page =
+                  StateResources.query_work_item_page(
+                    db(conn),
+                    request.filters,
+                    %{rest_principal: principal},
+                    boundary,
+                    request.limit
+                  )
+
+                %{
+                  items: Enum.map(page.rows, &StateResources.work_item/1),
+                  flags: %{
+                    has_more_before: page.has_more_before,
+                    has_more_after: page.has_more_after
+                  }
+                }
+
+              D1Read.visible?(resource, principal.is_admin) ->
+                D1Read.page(
                   db(conn),
+                  deps(conn).base_dir,
+                  resource,
                   request.filters,
-                  %{rest_principal: principal},
                   boundary,
                   request.limit
                 )
 
-              %{
-                items: Enum.map(page.rows, &StateResources.work_item/1),
-                flags: %{
-                  has_more_before: page.has_more_before,
-                  has_more_after: page.has_more_after
-                }
-              }
+              true ->
+                %{items: [], flags: %{has_more_before: false, has_more_after: false}}
+            end
 
-            D1Read.visible?(d1_resource(spec), principal.is_admin) ->
-              D1Read.page(
-                db(conn),
-                deps(conn).base_dir,
-                d1_resource(spec),
-                request.filters,
-                boundary,
-                request.limit
-              )
-
-            true ->
-              %{items: [], flags: %{has_more_before: false, has_more_after: false}}
-          end
-
-        {items, page} = d1_keyset_page(result, request, principal, spec, conn)
-        d1_send(conn, 200, d1_collection_envelope(spec, items, page))
+          {items, page} = d1_keyset_page(result, request, principal, spec, conn)
+          d1_send(conn, 200, d1_collection_envelope(spec, items, page))
       end
     else
       {:error, status, code, message} -> d1_error(conn, spec.resource, status, code, message)
@@ -1683,6 +1722,89 @@ defmodule Tightbeam.Wire.Router do
   rescue
     _error in [ArgumentError, KeyError, MatchError] ->
       d1_error(conn, spec.resource, 500, "projection_invalid", nil)
+  end
+
+  defp d1_collection_parent_scope(request, :assignment_attests, parent_id)
+       when is_binary(parent_id) and parent_id != "" do
+    {:ok, %{request | filters: Map.put(request.filters, "$parentAssignmentId", [parent_id])}}
+  end
+
+  defp d1_collection_parent_scope(request, :artifacts, nil), do: {:ok, request}
+  defp d1_collection_parent_scope(_request, :assignment_attests, _parent_id),
+    do: {:error, 404, "not_found", nil}
+  defp d1_collection_parent_scope(request, _resource, _parent_id), do: {:ok, request}
+
+  defp d1_d2_filter_validation(:artifacts, filters) do
+    valid? =
+      Enum.all?(Map.get(filters, "kind", []), &(&1 in ~w(spec report doc data other))) and
+        Enum.all?(Map.get(filters, "state", []), &(&1 in ~w(in-workspace archived released)))
+
+    if valid?, do: :ok, else: {:error, 400, "invalid_filter", nil}
+  end
+
+  defp d1_d2_filter_validation(:assignment_attests, filters) do
+    valid? =
+      Enum.all?(Map.get(filters, "kind", []), fn kind ->
+        kind in ~w(progress completion surrender cannot-proceed verdict)
+      end)
+
+    if valid?, do: :ok, else: {:error, 400, "invalid_filter", nil}
+  end
+
+  defp d1_d2_filter_validation(_resource, _filters), do: :ok
+
+  defp d1_d2_collection(conn, request, boundary, principal, spec, parent_id) do
+    filters = Map.delete(request.filters, "$parentAssignmentId")
+
+    case d1_resource(spec) do
+      :artifacts ->
+        page =
+          StateResources.query_artifact(db(conn), %{
+            collection: %{
+              filters: filters,
+              principal: principal,
+              boundary: boundary,
+              limit: request.limit
+            }
+          })
+
+        result = %{
+          items: Enum.map(page.rows, &StateResources.artifact/1),
+          flags: %{
+            has_more_before: page.has_more_before,
+            has_more_after: page.has_more_after
+          }
+        }
+
+        {items, page} = d1_keyset_page(result, request, principal, spec, conn)
+        d1_send(conn, 200, d1_collection_envelope(spec, items, page))
+
+      :assignment_attests ->
+        case StateResources.query_attest(db(conn), %{
+               collection: %{
+                 parent_id: parent_id,
+                 filters: filters,
+                 principal: principal,
+                 boundary: boundary,
+                 limit: request.limit
+               }
+             }) do
+          :not_found ->
+            d1_error(conn, spec.resource, 404, "not_found", nil)
+
+          {:ok, page} ->
+            result = %{
+              items: Enum.map(page.rows, &StateResources.attest/1),
+              flags: %{
+                has_more_before: page.has_more_before,
+                has_more_after: page.has_more_after
+              }
+            }
+
+            {items, page} = d1_keyset_page(result, request, principal, spec, conn)
+            d1_send(conn, 200, d1_collection_envelope(spec, items, page))
+        end
+    end
   end
 
   defp d1_detail(conn, spec, id) do
@@ -1896,10 +2018,14 @@ defmodule Tightbeam.Wire.Router do
          true <-
            payload["direction"] == direction and
              payload["filters"] == d1_filter_fingerprint(request.filters),
-         true <-
-           payload["principalKind"] == principal.kind and payload["principalId"] == principal.id,
+         true <- payload["principalKind"] in ["user", "session"],
+         true <- is_binary(payload["principalId"]) and payload["principalId"] != "",
          true <- d1_tuple?(payload["tuple"], d1_resource(spec)) do
-      {:ok, {String.to_atom(direction), payload["tuple"]}}
+      if payload["principalKind"] == principal.kind and payload["principalId"] == principal.id do
+        {:ok, {String.to_atom(direction), payload["tuple"]}}
+      else
+        {:error, 404, "not_found", nil}
+      end
     else
       _ -> {:error, 400, "invalid_cursor", nil}
     end
@@ -1914,6 +2040,16 @@ defmodule Tightbeam.Wire.Router do
     do: is_integer(raised_at) and is_binary(id) and id != ""
 
   defp d1_tuple?(_tuple, :decision_requests), do: false
+
+  defp d1_tuple?([created_at, artifact_id], :artifacts),
+    do: is_integer(created_at) and is_binary(artifact_id) and artifact_id != ""
+
+  defp d1_tuple?(_tuple, :artifacts), do: false
+
+  defp d1_tuple?([ts, id], :assignment_attests),
+    do: is_integer(ts) and is_binary(id) and id != ""
+
+  defp d1_tuple?(_tuple, :assignment_attests), do: false
 
   defp d1_tuple?(tuple, resource),
     do:

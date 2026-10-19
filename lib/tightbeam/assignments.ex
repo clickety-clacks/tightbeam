@@ -1253,8 +1253,47 @@ defmodule Tightbeam.Assignments do
   end
 
   @doc "List every attest filed against an assignment in deterministic order."
-  @spec list_attests(DB.server(), String.t()) :: [map()]
-  def list_attests(db, assignment_id) do
+  @spec list_attests(DB.server() | map(), String.t() | map()) :: [map()] | map()
+  def list_attests(%Txn{} = txn, %{
+        assignment_id: assignment_id,
+        filters: filters,
+        boundary: boundary,
+        limit: limit
+      }) do
+    {where, params} = attest_collection_where(assignment_id, filters)
+
+    select_from = """
+    SELECT att.id, att.assignmentId, att.kind, att.verdictKind, att.note,
+           att.bySession, att.byUser, att.producer, att.producerCommand,
+           att.byHarness, att.byProvider, att.commitRefs, att.ts
+    FROM attests AS att
+    JOIN assignments AS parent ON parent.id = att.assignmentId
+    LEFT JOIN work_items AS wi ON wi.id = parent.workItemId
+    """
+
+    probe_from = """
+    attests AS att
+    JOIN assignments AS parent ON parent.id = att.assignmentId
+    LEFT JOIN work_items AS wi ON wi.id = parent.workItemId
+    """
+
+    query = fn sql, query_params -> Txn.q(txn, sql, query_params) end
+
+    Tightbeam.Keyset.page(
+      query,
+      select_from,
+      probe_from,
+      where,
+      params,
+      ["att.ts", "att.id"],
+      boundary,
+      limit,
+      fn row -> [Enum.at(row, 12), hd(row)] end
+    )
+    |> then(fn page -> %{page | rows: Enum.map(page.rows, &attest_collection_row/1)} end)
+  end
+
+  def list_attests(db, assignment_id) when is_binary(assignment_id) do
     {:ok, rows} =
       DB.query(
         db,
@@ -1263,6 +1302,57 @@ defmodule Tightbeam.Assignments do
       )
 
     Enum.map(rows, &attest/1)
+  end
+
+  defp attest_collection_where(assignment_id, filters) do
+    Enum.reduce(filters, {"att.assignmentId = ?", [assignment_id]}, fn {field, values},
+                                                                         {where, params} ->
+      column =
+        case field do
+          "assignmentId" -> "att.assignmentId"
+          "workItemId" -> "parent.workItemId"
+          "kind" -> "att.kind"
+          "verdictKind" -> "att.verdictKind"
+          "bySession" -> "att.bySession"
+          "byUser" -> "att.byUser"
+          _ -> raise ArgumentError, "unsupported attest collection filter"
+        end
+
+      predicate = column <> " IN (" <> Enum.map_join(values, ", ", fn _ -> "?" end) <> ")"
+      {"(" <> where <> ") AND " <> predicate, params ++ values}
+    end)
+  end
+
+  defp attest_collection_row([
+         id,
+         assignment_id,
+         kind,
+         verdict_kind,
+         note,
+         by_session,
+         by_user,
+         producer,
+         producer_command,
+         by_harness,
+         by_provider,
+         commit_refs,
+         ts
+       ]) do
+    %{
+      id: id,
+      assignment_id: assignment_id,
+      kind: kind,
+      verdict_kind: verdict_kind,
+      note: note,
+      by_session: by_session,
+      by_user: by_user,
+      producer: producer,
+      producer_command: producer_command,
+      by_harness: by_harness,
+      by_provider: by_provider,
+      commit_refs: if(is_binary(commit_refs), do: Tightbeam.JSON.decode!(commit_refs), else: nil),
+      ts: ts
+    }
   end
 
   @spec list_reopenings(DB.server(), String.t()) :: [map()]
