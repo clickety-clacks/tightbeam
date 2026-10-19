@@ -1286,6 +1286,14 @@ defmodule Tightbeam.Gateway do
       end,
       {"config", ["config.updated"]} =>
         admin_call_handler(db, fn call -> config_result(db, call) end),
+      {"harness-process-settle", []} =>
+        admin_call_handler(db, fn call ->
+          case Tightbeam.HarnessProcess.settle(db, call.params.launch_id, call.params.adapter_key, call.origin) do
+            {:ok, result} -> result
+            :already_resolved -> %{launch_id: call.params.launch_id, status: "already_settled"}
+            {:error, reason} -> %{code: "launch_settlement_refused", message: inspect(reason)}
+          end
+        end),
       {"harness-processes", []} =>
         admin_handler(db, fn _params ->
           coordinator = Map.get(config, :adapter_coordinator, Tightbeam.AdapterCoordinator)

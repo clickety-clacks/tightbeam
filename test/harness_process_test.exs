@@ -145,7 +145,7 @@ defmodule Tightbeam.HarnessProcessTest do
     assert length(transactions) == 1
   end
 
-  test "identity capture accepts an unbounded wait", %{tmp_dir: tmp} do
+  test "identity capture refuses an unbounded wait", %{tmp_dir: tmp} do
     Tightbeam.HarnessProcessFixture.run!(tmp, 8)
   end
 
@@ -183,7 +183,7 @@ defmodule Tightbeam.HarnessProcessTest do
     Tightbeam.HarnessProcessFixture.run!(tmp, 16)
   end
 
-  test "proven-dead settlement resolves the captured missing-identity rows and is inert when repeated",
+  test "owner death leaves missing-identity rows unresolved without termination proof",
        %{tmp_dir: tmp} do
     Tightbeam.HarnessProcessFixture.run!(tmp, 17)
   end

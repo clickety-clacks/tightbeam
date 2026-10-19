@@ -281,7 +281,7 @@ defmodule Tightbeam.HarnessProcessFixture do
     # See the forged-pgid note above: 999999123 is unallocatable by construction.
     File.write!(row.identity_path, "999999123\t999999123\t0\t0\tboot-marker\t#{launch_id}\n")
 
-    assert :ok = HarnessProcess.capture_identity(ctx.db, launch_id, :infinity)
+    assert_raise FunctionClauseError, fn -> HarnessProcess.capture_identity(ctx.db, launch_id, :infinity) end
   end
 
   defp scenario(9, ctx) do
@@ -503,27 +503,15 @@ defmodule Tightbeam.HarnessProcessFixture do
           ]
         )
 
-      assert :ok = HarnessProcess.settle_proven_dead(ctx.db, key)
-      assert :already_resolved = HarnessProcess.settle_proven_dead(ctx.db, key)
-      refute HarnessProcess.fenced?(ctx.db, key)
+      assert {:error, {:kill_failed, _}} = HarnessProcess.settle_proven_dead(ctx.db, key)
+      assert HarnessProcess.fenced?(ctx.db, key)
+      unresolved = Enum.find(HarnessProcess.list(ctx.db), &(&1.launch_id == fixture["launch_id"]))
+      assert unresolved.resolved_at == nil
+      assert unresolved.os_pid == fixture["recorded_pid"]
+      assert unresolved.kill_attempted_at == fixture["kill_attempted_at"]
+      assert unresolved.kill_sent_at == fixture["kill_sent_at"]
+      assert unresolved.last_error =~ "identity_unavailable"
 
-      resolved = Enum.find(HarnessProcess.list(ctx.db), &(&1.launch_id == fixture["launch_id"]))
-      assert resolved.state == fixture["repaired_state"]
-      assert resolved.os_pid == fixture["recorded_pid"]
-      assert resolved.kill_attempted_at == fixture["kill_attempted_at"]
-      assert resolved.kill_sent_at == fixture["kill_sent_at"]
-      assert is_integer(resolved.resolved_at)
-      assert resolved.last_error =~ "identity_unavailable"
-
-      assert [event] =
-               Enum.filter(EventLog.lifecycle_events(ctx.db), fn event ->
-                 event.kind == "harness_cleanup_failed" and
-                   event.subject == fixture["adapter_key"]
-               end)
-
-      assert event.detail =~ fixture["launch_id"]
-      assert event.detail =~ "identity_recovery"
-      assert event.detail =~ "identity_unavailable"
     end
   end
 
@@ -578,7 +566,7 @@ defmodule Tightbeam.HarnessProcessFixture do
       #!/bin/sh
       # The reconciler asks for the current boot identity before it kills;
       # that call is not part of this race's choreography — pass it through.
-      [ "$1" = "boot-identity" ] && exec #{@helper} "$@"
+      case "$1" in boot-identity|harness-check) exec #{@helper} "$@" ;; esac
       if mkdir #{gate_dir}/first 2>/dev/null; then
         touch #{gate_dir}/first-started
         while [ ! -f #{gate_dir}/release-first ]; do sleep 0.01; done

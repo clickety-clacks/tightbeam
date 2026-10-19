@@ -7,6 +7,8 @@ use signal::BoundProcess;
 
 #[cfg(test)]
 mod identity_tests;
+#[cfg(test)]
+mod launch_tests;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io;
@@ -17,6 +19,7 @@ use std::os::darwin::fs::MetadataExt as DarwinMetadataExt;
 use std::os::unix::fs::MetadataExt as UnixMetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -62,52 +65,97 @@ fn session_exec_with_mode(
         .open(identity_path)
         .map_err(|error| format!("harness identity could not be opened: {error}"))?;
 
-    match unsafe { libc::fork() } {
+    // CLOEXEC keeps this channel in the launcher, never in the executed harness.
+    // Only a returned pre-publication error may authorize a terminal record.
+    let (mut parent_report, mut child_report) = UnixStream::pair()
+        .map_err(|error| format!("harness launch report channel failed: {error}"))?;
+    let fork_result = if launch_step("fork").is_err() { -1 } else { unsafe { libc::fork() } };
+    match fork_result {
         -1 => {
-            return Err(format!(
-                "harness session launcher could not fork: {}",
-                std::io::Error::last_os_error()
-            ));
+            let error = format!("harness session launcher could not fork: {}", io::Error::last_os_error());
+            write_terminal_failure(identity_path, &args[1], "fork", 1)?;
+            return Err(error);
         }
-        0 => {}
-        child => return wait_for_session_child(child),
+        0 => { drop(parent_report); }
+        child => {
+            drop(child_report);
+            let status = wait_for_session_child(child)?;
+            let mut step = String::new();
+            parent_report.read_to_string(&mut step)
+                .map_err(|error| format!("harness launch report could not be read: {error}"))?;
+            if let Some(step) = step.strip_suffix('\n').filter(|step| failure_step(step)) {
+                write_terminal_failure(identity_path, &args[1], step, status)?;
+            }
+            return Ok(status);
+        }
     }
 
-    if unsafe { libc::setsid() } == -1 {
-        return Err(format!(
-            "harness session could not be created: {}",
-            std::io::Error::last_os_error()
-        ));
+    if let Err((step, error)) = prepare_session_identity(identity_path, &mut identity, &args[1]) {
+        // The parent publishes this only after waitpid. A crash before this write
+        // leaves no proof and therefore cannot authorize recovery.
+        let _ = writeln!(child_report, "{step}");
+        return Err(error);
     }
-
-    let pid = unsafe { libc::getpid() };
-    let pgid = unsafe { libc::getpgrp() };
-
-    if pid != pgid {
-        return Err(format!(
-            "harness session leader mismatch: pid {pid}, process group {pgid}"
-        ));
-    }
-
-    let boot_identity = boot_identity()?;
-    let launch_id = &args[1];
-    let leader_start_time = read_process_start_time(pid)
-        .map_err(|error| format!("harness session leader start time could not be read: {error}"))?;
-
-    publish_session_identity(
-        identity_path,
-        &mut identity,
-        pid,
-        pgid,
-        leader_start_time,
-        &boot_identity,
-        launch_id,
-    )?;
+    drop(child_report);
 
     let mut command = child_command(&args[separator + 1], &args[separator + 2..], fixed_path);
     let error = command.exec();
 
     Err(format!("harness command could not be executed: {error}"))
+}
+
+fn launch_step(_step: &'static str) -> Result<(), (&'static str, String)> {
+    #[cfg(test)]
+    if std::env::var("TB_TEST_LAUNCH_FAILURE").ok().as_deref() == Some(_step) {
+        return Err((_step, format!("injected {_step} failure")));
+    }
+    Ok(())
+}
+
+fn failure_step(step: &str) -> bool {
+    matches!(step, "fork" | "session" | "leader" | "boot" | "start_time" | "write")
+}
+
+fn prepare_session_identity(path: &Path, identity: &mut fs::File, launch: &str)
+    -> Result<(), (&'static str, String)> {
+    launch_step("session")?;
+    if unsafe { libc::setsid() } == -1 {
+        return Err(("session", format!("harness session could not be created: {}", io::Error::last_os_error())));
+    }
+    let pid = unsafe { libc::getpid() };
+    let pgid = unsafe { libc::getpgrp() };
+    launch_step("leader")?;
+    if pid != pgid {
+        return Err(("leader", format!("harness session leader mismatch: pid {pid}, process group {pgid}")));
+    }
+    launch_step("boot")?;
+    let boot = boot_identity().map_err(|error| ("boot", error))?;
+    launch_step("start_time")?;
+    let start = read_process_start_time(pid)
+        .map_err(|error| ("start_time", format!("harness session leader start time could not be read: {error}")))?;
+    launch_step("write")?;
+    publish_session_identity(path, identity, pid, pgid, start, &boot, launch)
+        .map_err(|error| ("write", error))
+}
+
+fn write_terminal_failure(path: &Path, launch: &str, step: &str, status: i32) -> Result<(), String> {
+    let record = format!("tightbeam-launch-failed-v1\t{launch}\t{step}\t{status}\n");
+    use std::os::unix::fs::PermissionsExt;
+    let mut name = path.as_os_str().to_owned();
+    name.push(".failed");
+    let mode = fs::metadata(path).map(|m| m.permissions().mode()).unwrap_or(0o600);
+    atomic_record(&PathBuf::from(name), record.as_bytes(), mode)
+        .map_err(|error| format!("harness terminal pre-identity record could not be written ({step}, exit {status}): {error}"))
+}
+
+fn atomic_record(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
+    let mut pending_name = path.as_os_str().to_owned();
+    pending_name.push(".pending");
+    let pending = PathBuf::from(pending_name);
+    let mut file = OpenOptions::new().create_new(true).write(true).mode(mode).open(&pending)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    fs::rename(&pending, path)
 }
 
 /// Environment variables sudo exports into the target environment. The
@@ -159,8 +207,9 @@ fn publish_session_identity(
         boot_identity,
         launch_id,
     )?;
-    writeln!(identity, "{pid}\t{pgid}\t{boot_identity}\t{launch_id}")
-        .and_then(|_| identity.sync_all())
+    use std::os::unix::fs::PermissionsExt;
+    let mode = identity.metadata().map_err(|error| error.to_string())?.permissions().mode();
+    atomic_record(identity_path, format!("{pid}\t{pgid}\t{boot_identity}\t{launch_id}\n").as_bytes(), mode)
         .map_err(|error| format!("harness identity could not be written: {error}"))
 }
 
@@ -251,6 +300,20 @@ pub fn group(args: &[String]) -> Result<i32, String> {
         Some(sweep) => kill_harness_tree(&target, sweep),
         None => Ok(0),
     }
+}
+
+/// Read-only use of the same identity and live-instance authority as signalling.
+/// Exit 0 means absent; exit 3 means still live; errors never authorize settlement.
+pub fn check_group(args: &[String]) -> Result<i32, String> {
+    if args.len() != 4 && !(args.len() == 5 && args[4] == "recorded") { return Err("usage: tightbeam harness-check <pgid> <identity-path> <boot-identity> <launch-id>".into()); }
+    let pgid = args[0].parse::<i32>().ok().filter(|pid| *pid > 0)
+        .ok_or_else(|| "process group id must be a positive integer".to_string())?;
+    if args.len() == 5 {
+        read_identity_record(Path::new(&args[1]), pgid, &args[2], &args[3])?;
+        return Ok(0);
+    }
+    let target = HarnessTarget::load(pgid, &args[1], &args[2], &args[3])?;
+    Ok(match target.revalidate_authority()? { HarnessAuthority::Gone => 0, HarnessAuthority::Live => 3 })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1208,6 +1271,10 @@ fn authorize_group_signal(
         return Err("harness boot identity does not match the current boot".into());
     }
 
+    read_identity_record(path, pgid, expected_boot_identity, launch_id)
+}
+
+fn read_identity_record(path: &Path, pgid: libc::pid_t, expected_boot_identity: &str, launch_id: &str) -> Result<ProcessStartTime, String> {
     let mut identity = OpenOptions::new()
         .read(true)
         .open(path)
@@ -1217,6 +1284,7 @@ fn authorize_group_signal(
     identity
         .read_to_string(&mut recorded)
         .map_err(|error| format!("harness identity could not be read: {error}"))?;
+    if !recorded.ends_with('\n') { return Err("harness identity publication is incomplete".into()); }
     let fields = recorded.trim_end().split('\t').collect::<Vec<_>>();
     match fields.as_slice() {
         [pid, group, seconds, microseconds, boot, launch]
@@ -1292,6 +1360,7 @@ fn read_identity_authority(
     authority
         .read_to_string(&mut recorded)
         .map_err(|error| format!("harness identity authority could not be read: {error}"))?;
+    if !recorded.ends_with('\n') { return Err("harness identity publication is incomplete".into()); }
     let fields = recorded.trim_end().split('\t').collect::<Vec<_>>();
     match fields.as_slice() {
         [version, pid, group, seconds, microseconds, boot, launch]

@@ -47,6 +47,9 @@ defmodule Tightbeam.Acp.Conn do
             pending: %{},
             subscriber: nil,
             connection_generation: nil,
+            launch_id: nil,
+            direct_launcher: false,
+            launch_exit: nil,
             closed: false,
             # why the transport closed: {:exit, status} | :closed_by_client | :send_failed
             closed_by: nil,
@@ -145,6 +148,13 @@ defmodule Tightbeam.Acp.Conn do
   def probe_request(_conn, _request_id, _session_id, _generation, _timeout_ms),
     do: {:unknown, :uncorrelatable}
 
+  @doc false
+  def launch_exit(conn, timeout_ms) do
+    GenServer.call(conn, :launch_exit, timeout_ms)
+  catch
+    :exit, _ -> nil
+  end
+
   ## Server
 
   @impl true
@@ -181,9 +191,14 @@ defmodule Tightbeam.Acp.Conn do
      %__MODULE__{
        port: port,
        subscriber: Keyword.get(opts, :subscriber),
+       launch_id: Keyword.get(opts, :harness_process_launch_id),
+       direct_launcher: Keyword.get(opts, :harness_process_direct_launcher, false),
        connection_generation: Keyword.get(opts, :connection_generation)
      }}
   end
+
+  @impl true
+  def handle_call(:launch_exit, _from, state), do: {:reply, state.launch_exit, state}
 
   @impl true
   def handle_call({:request, method, params, opts}, {pid, _} = from, state) do
@@ -321,6 +336,8 @@ defmodule Tightbeam.Acp.Conn do
   end
 
   def handle_info({port, {:exit_status, status}}, %{port: port} = state) do
+    receipt = %{launch_id: state.launch_id, status: status, direct_launcher: state.direct_launcher}
+    state = %{state | launch_exit: receipt}
     emit(state, {:acp_exit, status})
     {:noreply, fail_all(%{state | closed: true, closed_by: {:exit, status}})}
   end

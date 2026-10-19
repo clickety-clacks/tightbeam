@@ -140,6 +140,7 @@ impl CommandContext {
             HostEnvList { .. } => ("cli.host_env_list", DispatchPath),
             HostEnvUnset { .. } => ("cli.host_env_unset", DispatchPath),
             HostToolchainSet { .. } => ("cli.host_toolchain_set", DispatchPath),
+            HarnessProcessSettle { .. } => ("cli.harness_process_settle", DispatchPath),
             HarnessProcesses { .. } => ("cli.harness_processes", DispatchPath),
             UpdateClients { .. } => ("cli.update_clients", DispatchPath),
             Assimilate(_) => ("cli.assimilate", CatalogAndDispatch),
@@ -318,6 +319,7 @@ fn dispatch_effect(command: &Command) -> EffectContract {
         | SentinelEnvList { .. }
         | ConfigGet { .. }
         | HostEnvList { .. }
+        | HarnessProcessSettle { .. }
         | HarnessProcesses { .. }
         | UpdateClients { .. } => Read,
 
