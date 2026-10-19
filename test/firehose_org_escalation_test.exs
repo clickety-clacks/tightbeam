@@ -222,12 +222,17 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
                [assignment.id]
              )
 
+    {:ok, [[cancellations_before]]} = DB.query(db, "SELECT COUNT(*) FROM wake_cancellations")
+
     assert_raise DB.Error, ~r/fixture rollback after decision creation/, fn ->
       Assignments.__handle__(db, "attest", call)
     end
 
     assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM decision_requests")
-    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM wake_cancellations")
+
+    assert {:ok, [[^cancellations_before]]} =
+             DB.query(db, "SELECT COUNT(*) FROM wake_cancellations")
+
     assert %{state: "pending"} = Tightbeam.Wakes.get(db, initial_deadline)
 
     _ = Hub.connection_stats(hub, self())
@@ -260,7 +265,10 @@ defmodule Tightbeam.FirehoseOrgEscalationTest do
              Tightbeam.Wakes.get(db, final_deadline)
 
     assert assignment_id == assignment.id
-    assert {:ok, [[3]]} = DB.query(db, "SELECT COUNT(*) FROM wake_cancellations")
+    expected_cancellations = cancellations_before + 3
+
+    assert {:ok, [[^expected_cancellations]]} =
+             DB.query(db, "SELECT COUNT(*) FROM wake_cancellations")
 
     assert_receive {:firehose_notice, notice}
     assert notice["class"] == "decision_request.opened"
