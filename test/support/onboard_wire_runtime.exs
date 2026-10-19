@@ -132,9 +132,9 @@ defmodule OnboardWireRuntime do
 
   defp request(port, provider_or_params, actor \\ "synthetic-admin") do
     params =
-      if is_binary(provider_or_params),
-        do: %{provider: provider_or_params},
-        else: provider_or_params
+      if is_map(provider_or_params),
+        do: provider_or_params,
+        else: %{provider: provider_or_params}
 
     body = JSON.encode!(%{verb: "onboard", asUser: actor, params: params})
 
