@@ -1,7 +1,7 @@
 defmodule Tightbeam.SupervisionTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Gateway, Org, Supervision, Wakes, WorkItems}
+  alias Tightbeam.{DB, Gateway, Org, Supervision, Wakes}
   alias Tightbeam.Model
 
   setup do
@@ -293,18 +293,6 @@ defmodule Tightbeam.SupervisionTest do
              String.contains?(detail, "assignment_reopenings_activity_source_order")
            end)
 
-    {reconciliation_sql, reconciliation_params} =
-      Wakes.source_reconciliation_query(:startup, 0, 100)
-
-    assert {:ok, reconciliation_plan} =
-             DB.query(ctx.db, "EXPLAIN QUERY PLAN " <> reconciliation_sql, reconciliation_params)
-
-    assert Enum.any?(reconciliation_plan, fn [_, _, _, detail] ->
-             String.contains?(detail, "wakes_delivered_obligation")
-           end)
-
-    assert {:ok, []} = DB.query(ctx.db, reconciliation_sql, reconciliation_params)
-
     direct_wake_id = "delivery-history-target"
 
     assert {:ok, []} =
@@ -335,21 +323,6 @@ defmodule Tightbeam.SupervisionTest do
     refute Enum.any?(delivery_plan, fn [_, _, _, detail] ->
              String.contains?(detail, "SCAN wakes")
            end)
-
-    {bracket_sql, bracket_params} = WorkItems.delivered_bracket_reconciliation_query(0)
-
-    assert {:ok, bracket_plan} =
-             DB.query(ctx.db, "EXPLAIN QUERY PLAN " <> bracket_sql, bracket_params)
-
-    assert Enum.any?(bracket_plan, fn [_, _, _, detail] ->
-             String.contains?(detail, "work_items_open_routing_wake")
-           end)
-
-    assert Enum.any?(bracket_plan, fn [_, _, _, detail] ->
-             String.contains?(detail, "work_items_open_slate_wake")
-           end)
-
-    assert {:ok, []} = DB.query(ctx.db, bracket_sql, bracket_params)
 
     assert {:ok, terminal_action_plan} =
              DB.query(
@@ -470,7 +443,7 @@ defmodule Tightbeam.SupervisionTest do
     assert {:ok, :ok} = Supervision.climb(ctx.db, Wakes.get(ctx.db, climb.wake_id))
     assert Wakes.get(ctx.db, notice.wake_id).session_key == ctx.parent.session_key
 
-    assert %{state: "retired"} = Org.retire(ctx.db, ctx.parent.session_key, "user:flynn")
+    assert %{state: "retired"} = Org.retire(ctx.db, ctx.parent.session_key, "user:flynn", 1_000)
 
     readdressed = Wakes.get(ctx.db, notice.wake_id)
     assert readdressed.state == "pending"

@@ -53,10 +53,18 @@ defmodule Tightbeam.Productions.Bubble do
   @lineage_hop_limit 32
 
   @doc "Recognize a terminal turn and carry an ordinary failure to an active parent."
-  @spec recognize_terminal(DB.server(), integer()) :: :ok
+  @spec recognize_terminal(DB.server(), integer()) :: :ok | {:error, term()}
   def recognize_terminal(db, seq) do
     Tightbeam.Wakes.report_failed_delivery(db, seq)
+    # Repairs source follow-through the delivery step's post-commit attempt
+    # missed, such as across a restart. An error lets the sweeper retry the
+    # turn; recognition below is idempotent, so it still runs every time.
+    sources = Wakes.reconcile_turn_delivered_sources(db, seq)
+    recognize_bubble(db, seq)
+    sources
+  end
 
+  defp recognize_bubble(db, seq) do
     if NoticeAuthority.restored_turn?(db, seq) do
       :ok
     else

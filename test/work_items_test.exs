@@ -350,7 +350,7 @@ defmodule Tightbeam.WorkItemsTest do
     assert {:ok, []} = DB.query(ctx.db, "PRAGMA foreign_key_check")
   end
 
-  test "source-owned recovery rearms a delivered routing bracket after its callback is missed",
+  test "turn-end recognition rearms a delivered routing bracket after its callback is missed",
        ctx do
     _main = ensure_main_session(ctx.db, "flynn")
     item = create(ctx, {:user, "flynn"}, %{title: "Recover delivered routing bracket"})
@@ -375,7 +375,21 @@ defmodule Tightbeam.WorkItemsTest do
              DB.query(ctx.db, "SELECT deliveredTurnSeq FROM wakes WHERE wakeId=?1", [wake_id])
 
     assert is_integer(delivered_turn_seq)
-    assert :ok = WorkItems.reconcile_delivered_brackets(ctx.db)
+
+    assert {:ok, [[routing_wake_id]]} =
+             DB.query(ctx.db, "SELECT routingWakeId FROM work_items WHERE id=?1", [item.id])
+
+    assert routing_wake_id == wake_id
+
+    assert {:ok, turn} = Tightbeam.Ledger.claim_next(ctx.db, wake.session_key, "work-items-test")
+    assert turn.seq == delivered_turn_seq
+
+    assert :ok =
+             Tightbeam.Ledger.finish(ctx.db, turn.seq, "delivered", nil,
+               owner_lease: turn.owner_lease
+             )
+
+    assert :ok = Tightbeam.Productions.Bubble.recognize_terminal(ctx.db, turn.seq)
 
     assert {:ok, [[replacement_id]]} =
              DB.query(ctx.db, "SELECT routingWakeId FROM work_items WHERE id=?1", [item.id])

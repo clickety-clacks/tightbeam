@@ -9479,6 +9479,7 @@ defmodule Tightbeam.Gateway do
                           {:user, id} -> "user:" <> id
                           {:session, key} -> "session:" <> key
                         end,
+                        supervision_interval_ms(config),
                         "retired: session retired before execution"
                       )
 
@@ -9623,6 +9624,7 @@ defmodule Tightbeam.Gateway do
          root_key,
          owner,
          principal,
+         supervision_interval_ms,
          drain_reason
        ) do
     # Invariant: this spawnedBy walk visits each active member of the target's
@@ -9648,6 +9650,7 @@ defmodule Tightbeam.Gateway do
               member.session_key,
               owner,
               principal,
+              supervision_interval_ms,
               drain_reason
             )
 
@@ -9709,10 +9712,11 @@ defmodule Tightbeam.Gateway do
          session_key,
          owner,
          principal,
+         supervision_interval_ms,
          drain_reason
        ) do
     assignments = Assignments.interrupt_for_retire_in_txn(txn, session_key, owner, principal)
-    Org.retire_in_txn(txn, session_key, principal)
+    Org.retire_in_txn(txn, session_key, principal, supervision_interval_ms)
     Ledger.drain_queued_for_retire_in_txn(txn, session_key, drain_reason)
     assignments
   end

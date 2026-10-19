@@ -27,6 +27,7 @@ defmodule Tightbeam.RailRemedy do
     subject     TEXT    NOT NULL,
     status      TEXT    NOT NULL CHECK (status IN ('claimed','dispatched','live','closed')),
     producerKey TEXT,
+    noticeState TEXT NULL,
     occurrence  INTEGER NOT NULL,
     rewakeCount INTEGER NOT NULL,
     claimToken  TEXT    NOT NULL,

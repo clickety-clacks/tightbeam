@@ -143,6 +143,8 @@ defmodule Tightbeam.WorkState do
           %{
             assignment: assignment,
             attests: attests(txn, assignment_id),
+            # Kept in the output shape; the per-assignment prod ledger is retired.
+            supervision: nil,
             holder: holder(txn, assignment.holderKey),
             cursor: cursor(txn, "work_state_events")
           }

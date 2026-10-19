@@ -611,6 +611,135 @@ defmodule Tightbeam.HarnessHealthTest do
              )
   end
 
+  for clearing <- [:resolved, :expired] do
+    test "a #{clearing} incident retracts its undelivered review notice", ctx do
+      registry = :"health_clear_registry_#{System.unique_integer([:positive])}"
+      lane = :"health_clear_lane_#{System.unique_integer([:positive])}"
+      start_supervised!({Tightbeam.ConnRegistry, name: registry})
+      start_supervised!({Tightbeam.NoticeBatcherFixture.LaneStub, lane})
+
+      [child, parent | _] = ctx.sessions
+      parent_session = parent.session
+      at = System.system_time(:millisecond)
+
+      assert {:ok, []} =
+               DB.query(ctx.db, "UPDATE sessions SET spawnedBy=?2 WHERE sessionKey=?1", [
+                 child.session,
+                 parent.session
+               ])
+
+      {:appended, current_message} =
+        Projection.append(ctx.db, %{
+          session_key: parent.session,
+          role: "user",
+          content: "current bounded work",
+          sender: "session:#{parent.session}"
+        })
+
+      {:ok, current_seq} =
+        Ledger.enqueue(ctx.db, %{
+          session_key: parent.session,
+          message_id: current_message.id,
+          origin: "session:#{parent.session}",
+          prompt: "current bounded work"
+        })
+
+      assert {:ok, %{seq: ^current_seq, owner_lease: lease}} =
+               Ledger.claim_next(ctx.db, parent.session, "other-route-clearing")
+
+      assert {:opened, opened} =
+               HarnessHealth.observe_other(ctx.db, %{
+                 harness: "claude",
+                 host: "gibson",
+                 source_session_key: child.session,
+                 principal: {:session, child.session},
+                 description: "clearing route evidence",
+                 evidence_mode: "exact_error",
+                 observed_state: "provider route failed",
+                 exact_observed_error: "clearing route reset",
+                 exact_probe: "provider health probe",
+                 recovery_condition: "a normal provider turn completes",
+                 not_known_class_reason: "not one of the named classes",
+                 observed_at: at,
+                 accepted_at: at,
+                 valid_until: at + 500,
+                 world_status: "UNKNOWN",
+                 redaction_confirmed: true,
+                 idempotency_key: "clearing-route"
+               })
+
+      wake_id = "other-review:#{opened.id}:#{parent_session}"
+      assert Wakes.get(ctx.db, wake_id).state == "pending"
+
+      case unquote(clearing) do
+        :resolved ->
+          probe = "normal turn #{at + 1} delivered"
+
+          assert {:resolved, _} =
+                   HarnessHealth.resolve_other(ctx.db, %{
+                     harness: "claude",
+                     host: "gibson",
+                     incident_id: opened.id,
+                     session_key: child.session,
+                     principal: {:session, child.session},
+                     observed_state: "normal turn delivered",
+                     exact_probe: probe,
+                     output_digest: :crypto.hash(:sha256, probe) |> Base.encode16(case: :lower),
+                     recovery_condition_digest:
+                       :crypto.hash(:sha256, "a normal provider turn completes")
+                       |> Base.encode16(case: :lower),
+                     recovery_satisfied: true,
+                     world_status: "PROVEN",
+                     redaction_confirmed: true,
+                     cause: "normal turn delivered",
+                     observed_at: at + 1,
+                     accepted_at: at + 1,
+                     idempotency_key: "clearing-route-recovery"
+                   })
+
+        :expired ->
+          assert {:ok, :available} =
+                   DB.transaction(ctx.db, fn txn ->
+                     HarnessHealth.prod_shape_gate_in_txn(txn, "claude", "gibson", at + 1_000)
+                   end)
+      end
+
+      assert Wakes.get(ctx.db, wake_id).state == "canceled"
+
+      assert {:ok,
+              [
+                [
+                  "tightbeam:harness-health",
+                  "condition_cleared",
+                  "harness_health_transition",
+                  causal_id
+                ]
+              ]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT requesterId,reasonKind,causalSourceKind,causalSourceId FROM wake_cancellations WHERE wakeId=?1",
+                 [wake_id]
+               )
+
+      assert causal_id == opened.id
+
+      assert :ok = Ledger.finish(ctx.db, current_seq, "delivered", nil, owner_lease: lease)
+
+      Tightbeam.NoticeBatcher.recover(ctx.db, at + 2_000,
+        conn_registry: registry,
+        lane_manager: lane
+      )
+
+      refute Enum.any?(
+               Tightbeam.NoticeBatcher.source_refs(ctx.db, wake_id),
+               &(&1.member_state == "included")
+             )
+
+      assert {:ok, [[0]]} =
+               DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [wake_id])
+    end
+  end
+
   test "non-delivered route settlement publishes the next rung once", ctx do
     [child, parent | _] = ctx.sessions
     at = System.system_time(:millisecond)

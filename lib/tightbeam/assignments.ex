@@ -842,7 +842,8 @@ defmodule Tightbeam.Assignments do
 
         case Txn.q(txn, "SELECT state FROM wakes WHERE wakeId=?1", [wake_id]) do
           [["pending"]] ->
-            trigger = liveness_trigger!(txn, {:assignment, assignment_id})
+            # A block held past ladder end leaves no pending trigger (SN12(e)).
+            trigger = optional_liveness_trigger(txn, {:assignment, assignment_id})
 
             true =
               Wakes.cancel_in_txn(txn, %{
@@ -4297,8 +4298,11 @@ defmodule Tightbeam.Assignments do
 
   defp disposition_liveness_trigger!(_txn, nil), do: nil
 
-  defp disposition_liveness_trigger!(txn, work_item_id) do
-    case Supervision.inactivity_deadline_trigger_in_txn(txn, {:work_item, work_item_id}) do
+  defp disposition_liveness_trigger!(txn, work_item_id),
+    do: optional_liveness_trigger(txn, {:work_item, work_item_id})
+
+  defp optional_liveness_trigger(txn, primary) do
+    case Supervision.inactivity_deadline_trigger_in_txn(txn, primary) do
       {:ok, trigger} when is_map(trigger) -> trigger
       :none -> nil
     end

@@ -300,13 +300,6 @@ defmodule Tightbeam.Supervision do
       [[wake_id]] when is_binary(wake_id) -> {:ok, %{kind: "pending_wake", id: wake_id}}
       _ -> :none
     end
-  rescue
-    error ->
-      Logger.warning(
-        "assignment deadline unavailable for #{inspect(assignment_id)}: #{Exception.message(error)}"
-      )
-
-      :none
   end
 
   def inactivity_deadline_trigger_in_txn(%Txn{} = txn, {:work_item, work_item_id})
@@ -334,16 +327,31 @@ defmodule Tightbeam.Supervision do
           _ -> :none
         end
     end
-  rescue
-    error ->
-      Logger.warning(
-        "work item deadline unavailable for #{inspect(work_item_id)}: #{Exception.message(error)}"
-      )
-
-      :none
   end
 
   def inactivity_deadline_trigger_in_txn(_txn, _primary), do: :none
+
+  @doc false
+  # When a climb stops at ladder end (SN12(e)), its open assignment keeps
+  # neither a pending deadline nor a pending climb until holder activity, a
+  # holder change or closure. Retracting a notice linked to that work then has
+  # no pending trigger to cite, and needs none.
+  def inactivity_ladder_ended_in_txn(%Txn{} = txn, {:assignment, assignment_id})
+      when is_binary(assignment_id) do
+    Txn.q(txn, "SELECT 1 FROM assignments WHERE id=?1 AND state='open'", [assignment_id]) ==
+      [[1]] and inactivity_deadline_trigger_in_txn(txn, {:assignment, assignment_id}) == :none
+  end
+
+  def inactivity_ladder_ended_in_txn(%Txn{} = txn, {:work_item, work_item_id})
+      when is_binary(work_item_id) do
+    Txn.q(
+      txn,
+      "SELECT 1 FROM assignments WHERE workItemId=?1 AND state='open' LIMIT 1",
+      [work_item_id]
+    ) == [[1]] and inactivity_deadline_trigger_in_txn(txn, {:work_item, work_item_id}) == :none
+  end
+
+  def inactivity_ladder_ended_in_txn(_txn, _primary), do: false
 
   @doc false
   def ladder_target(db_or_txn, holder_key, rung)
@@ -1100,13 +1108,6 @@ defmodule Tightbeam.Supervision do
     end)
 
     :ok
-  rescue
-    error ->
-      Logger.warning(
-        "legacy supervision controller migration deferred: #{Exception.message(error)}"
-      )
-
-      :ok
   end
 
   defp isolated_side_task(txn, subject, action, fun) do

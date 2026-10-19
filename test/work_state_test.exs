@@ -191,7 +191,7 @@ defmodule Tightbeam.WorkStateTest do
              displayName: "other-holder"
            }
 
-    refute Map.has_key?(detail, :supervision)
+    assert detail.supervision == nil
     assert [%{kind: "progress", verdictKind: nil}] = detail.attests
     assert WorkState.detail(ctx.db, "missing") == nil
     assert WorkState.item_detail(ctx.db, "missing") == nil

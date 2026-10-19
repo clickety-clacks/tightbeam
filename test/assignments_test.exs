@@ -1508,6 +1508,48 @@ defmodule Tightbeam.AssignmentsTest do
       end
     end
 
+    test "retirement disposes a pending notice for the assignment it revokes", ctx do
+      {assignment, _item, _personal} = revocation_notice_fixture(ctx)
+
+      wake =
+        Wakes.schedule(ctx.db, %{
+          session_key: "holder",
+          origin: "user:flynn",
+          prompt: "for the revoked assignment",
+          due_at: System.system_time(:millisecond) + 60_000,
+          assignment_id: assignment.id
+        })
+
+      assert {:ok, %{state: "retired"}} =
+               DB.transaction(ctx.db, fn txn ->
+                 Assignments.interrupt_for_retire_in_txn(txn, "holder", "flynn", "user:flynn")
+                 Org.retire_in_txn(txn, "holder", "user:flynn", 1_000)
+               end)
+
+      assert %{state: "canceled", session_key: "holder"} = Wakes.get(ctx.db, wake.wake_id)
+
+      assert {:ok,
+              [
+                [
+                  "tightbeam:retirement",
+                  "obligation_disposed",
+                  "assignment_transition",
+                  source_id,
+                  "disposition"
+                ]
+              ]} =
+               DB.query(
+                 ctx.db,
+                 """
+                 SELECT requesterId,reasonKind,causalSourceKind,causalSourceId,outcomeKind
+                 FROM wake_cancellations WHERE wakeId=?1
+                 """,
+                 [wake.wake_id]
+               )
+
+      assert source_id == assignment.id
+    end
+
     test "ordinary revocation stores a notice at Main when no accountable session is active",
          ctx do
       assignment = handle(ctx, "assign", terminal_notice_assign_call({:user, "flynn"}))
@@ -2655,6 +2697,89 @@ defmodule Tightbeam.AssignmentsTest do
              ])
 
     assert {:ok, []} = DB.query(ctx.db, "PRAGMA foreign_key_check")
+  end
+
+  test "a cannot-proceed block held past inactivity ladder end still releases on its fact",
+       ctx do
+    session(ctx.db, Org.personal_session_key("flynn"), "flynn")
+
+    blocked =
+      assign_call({:user, "flynn"}, "long blocked card")
+      |> put_in([:params, :effect_kind], "coordination")
+      |> then(&handle(ctx, "assign", &1))
+
+    filed =
+      attest_call({:session, "holder"}, blocked.id, "cannot-proceed")
+      |> put_in([:params, :note], "waiting on a slow dependency")
+      |> put_in([:params, :release_fact_kind], "dependency-ready")
+      |> put_in([:params, :release_fact_scope], blocked.id)
+      |> put_in([:params, :release_fact_principal_ref], "agent:holder")
+      |> then(&handle(ctx, "attest", &1))
+
+    # Nobody answers: the deadline fires and the climb runs until no rung remains.
+    Enum.reduce_while(1..20, nil, fn _, _ ->
+      if fire_inactivity_wake!(ctx.db, "assignment_inactivity_deadline", blocked.id) or
+           fire_inactivity_wake!(ctx.db, "assignment_inactivity_climb", blocked.id),
+         do: {:cont, nil},
+         else: {:halt, nil}
+    end)
+
+    assert {:ok, :none} =
+             DB.transaction(ctx.db, fn txn ->
+               Supervision.inactivity_deadline_trigger_in_txn(txn, {:assignment, blocked.id})
+             end)
+
+    assert Wakes.get(ctx.db, filed.decisionWake.wake_id).state == "pending"
+
+    assert {:ok, fact} =
+             DB.transaction(ctx.db, fn txn ->
+               ConditionFacts.file_in_txn(txn, %{
+                 kind: "dependency-ready",
+                 scope: blocked.id,
+                 origin: "agent:holder"
+               })
+             end)
+
+    fact_id = fact.fact_id
+
+    assert {:ok, [["settled", "release-fact", ^fact_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,settlementKind,settlementFactId FROM assignment_cannot_proceed WHERE assignmentId=?1",
+               [blocked.id]
+             )
+
+    assert Wakes.get(ctx.db, filed.decisionWake.wake_id).state == "canceled"
+
+    assert {:ok, [["cannot_proceed_released", 0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT reasonKind,actionNeeded FROM wake_cancellations WHERE wakeId=?1",
+               [filed.decisionWake.wake_id]
+             )
+  end
+
+  defp fire_inactivity_wake!(db, consumer, assignment_id) do
+    case DB.query(
+           db,
+           "SELECT wakeId FROM wakes WHERE consumer=?1 AND assignmentId=?2 AND state='pending' ORDER BY dueAt,wakeId LIMIT 1",
+           [consumer, assignment_id]
+         ) do
+      {:ok, [[wake_id]]} ->
+        assert {:ok, _} = DB.query(db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [wake_id])
+        wake = Wakes.get(db, wake_id)
+
+        assert {:ok, _} =
+                 if(consumer == "assignment_inactivity_deadline",
+                   do: Supervision.deadline(db, wake),
+                   else: Supervision.climb(db, wake)
+                 )
+
+        true
+
+      {:ok, []} ->
+        false
+    end
   end
 
   test "cannot-proceed is holder-only, idempotent, pauses one card, and releases on its exact fact",

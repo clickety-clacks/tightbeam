@@ -890,7 +890,7 @@ defmodule Tightbeam.EffortCheckin do
               decision_disposition_command(
                 txn,
                 winner,
-                inactivity_deadline_trigger_in_txn!(txn, winner.assignment_id)
+                decision_inactivity_deadline_trigger_in_txn(txn, winner.assignment_id)
               )
             end
 
@@ -1098,7 +1098,7 @@ defmodule Tightbeam.EffortCheckin do
               decision_disposition_command(
                 txn,
                 winner,
-                inactivity_deadline_trigger_in_txn!(txn, winner.assignment_id)
+                decision_inactivity_deadline_trigger_in_txn(txn, winner.assignment_id)
               )
             end
 
@@ -1372,18 +1372,6 @@ defmodule Tightbeam.EffortCheckin do
     end
   end
 
-  defp inactivity_deadline_trigger_in_txn!(txn, assignment_id) do
-    primary = decision_liveness_primary_in_txn(txn, assignment_id)
-
-    case primary do
-      nil ->
-        nil
-
-      primary ->
-        fetch_inactivity_deadline_trigger_in_txn!(txn, primary)
-    end
-  end
-
   defp decision_liveness_primary_in_txn(txn, assignment_id) do
     case Txn.q(
            txn,
@@ -1405,13 +1393,6 @@ defmodule Tightbeam.EffortCheckin do
 
       [] ->
         raise "decision request references missing assignment #{assignment_id}"
-    end
-  end
-
-  defp fetch_inactivity_deadline_trigger_in_txn!(txn, primary) do
-    case Supervision.inactivity_deadline_trigger_in_txn(txn, primary) do
-      {:ok, trigger} when is_map(trigger) -> trigger
-      :none -> raise "#{inspect(primary)} has no liveness trigger"
     end
   end
 

@@ -129,7 +129,8 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     refute third.wake_id in [first.wake_id, second.wake_id]
   end
 
-  test "startup recovers a terminal reminder when the gateway stops after root delivery", ctx do
+  test "the turn-end sweep recovers a terminal reminder when the gateway stops after root delivery",
+       ctx do
     stop_supervised!(ctx.scheduler)
     {_parent_assignment, _child_assignment, root} = completed_child(ctx)
     set_due_now(ctx.db, root.wake_id)
@@ -151,11 +152,23 @@ defmodule Tightbeam.CompletionHandoffLightRailTest do
     assert Wakes.get(ctx.db, root.wake_id).delivered_turn_seq != nil
     assert reminders(ctx.db, root.wake_id) == []
 
-    restarted = start_scheduler(ctx.db)
-    assert :ok = Wakes.fire_due(restarted)
+    # The stop lost the post-delivery action. After boot the recipient's turn
+    # ends and the turn-end sweep acts from the delivered record.
+    finish_carrier_turn!(ctx.db, root.wake_id)
+    assert reminders(ctx.db, root.wake_id) == []
 
-    assert [reminder] = await_pending_reminders(ctx.db, root.wake_id)
+    sweeper =
+      start_supervised!(
+        {Tightbeam.Productions.BubbleSweeper, db: ctx.db, name: :completion_handoff_sweeper}
+      )
+
+    Tightbeam.Productions.BubbleSweeper.sweep_now(sweeper)
+
+    assert [reminder] = pending_reminders(ctx.db, root.wake_id)
     assert reminder.session_key == "notice-parent"
+
+    Tightbeam.Productions.BubbleSweeper.sweep_now(sweeper)
+    assert [^reminder] = pending_reminders(ctx.db, root.wake_id)
   end
 
   test "a retired opener is routed to Main when the finish notice is stored", ctx do

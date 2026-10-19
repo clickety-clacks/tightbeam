@@ -585,99 +585,37 @@ defmodule Tightbeam.Wakes do
   end
 
   @doc false
-  @spec reconcile_delivered_sources(DB.server(), String.t() | nil, String.t() | nil) ::
+  @spec reconcile_delivered_sources(DB.server(), String.t(), String.t()) ::
           :ok | {:error, term()}
-  def reconcile_delivered_sources(
-        db \\ DB,
-        recipient_session_key \\ nil,
-        delivered_wake_id \\ nil
-      ) do
-    if is_binary(delivered_wake_id) do
-      reconcile_exact_delivered_sources(db, recipient_session_key, delivered_wake_id)
-    else
-      case reconcile_startup_delivered_sources(db, 0) do
-        {:ok, _count, _last_rowid} -> :ok
-        error -> error
-      end
+  def reconcile_delivered_sources(db, recipient_session_key, delivered_wake_id)
+      when is_binary(recipient_session_key) and is_binary(delivered_wake_id) do
+    reconcile_exact_delivered_sources(db, recipient_session_key, delivered_wake_id)
+  end
+
+  @doc """
+  Act on the delivered records a finished turn carried.
+
+  The turn-end sweeper calls this for every terminal turn, after the delivery
+  step's own post-commit attempt. Each source action is idempotent, so a turn
+  whose follow-through already ran is a no-op; a turn whose follow-through was
+  lost to a restart is repaired from its delivered records.
+  """
+  @spec reconcile_turn_delivered_sources(DB.server(), integer()) :: :ok | {:error, term()}
+  def reconcile_turn_delivered_sources(db, seq) when is_integer(seq) do
+    case DB.query(db, "SELECT wakeId,sessionKey FROM turns WHERE seq=?1", [seq]) do
+      {:ok, [[wake_id, session_key]]} when is_binary(wake_id) and is_binary(session_key) ->
+        reconcile_delivery_source_records(db, session_key, wake_id)
+
+      {:ok, _no_wake} ->
+        :ok
+
+      {:error, error} ->
+        {:error, error}
     end
   end
 
   @doc false
-  def source_reconciliation_query(scope, after_rowid \\ 0, limit \\ 100)
-
-  def source_reconciliation_query(:startup, after_rowid, limit) do
-    root_upper = source_marker_upper_bound(@terminal_notice_marker)
-    action_upper = source_marker_upper_bound(@terminal_action_marker)
-
-    {"""
-     SELECT rowid,wakeId,outcome FROM (
-       SELECT w.rowid,w.wakeId,
-         CASE WHEN w.deliveredTurnSeq IS NOT NULL THEN 'delivered' ELSE 'delivery-failed' END AS outcome
-       FROM supervision_liveness_sidecar s
-       JOIN wakes w ON w.wakeId=s.wakeId
-       WHERE s.controllerOrigin='holder_continuation' AND s.controllerState='pending'
-         AND w.rowid>?1
-         AND (w.deliveredTurnSeq IS NOT NULL OR EXISTS (
-           SELECT 1 FROM wake_cancellations c WHERE c.wakeId=w.wakeId
-             AND c.causalSourceKind='scheduler_delivery'
-             AND c.reasonKind IN ('target_unresolvable','consumer_unavailable')
-         ))
-       UNION ALL
-       SELECT w.rowid,w.wakeId,'delivered' AS outcome
-       FROM wakes w INDEXED BY wakes_delivered_obligation
-       JOIN assignments terminal ON terminal.id=w.assignmentId
-       WHERE w.rowid>?1 AND w.state='fired' AND w.deliveredTurnSeq IS NOT NULL
-         AND w.obligationRef>=?2 AND w.obligationRef<?3
-         AND terminal.state='closed' AND terminal.outcome IN ('completed','surrendered')
-         AND EXISTS (SELECT 1 FROM assignments a
-           WHERE a.holderKey=w.sessionKey AND a.state='open')
-         AND NOT EXISTS (SELECT 1 FROM wakes reminder
-           WHERE reminder.obligationRef=?4 || w.wakeId)
-         AND NOT EXISTS (SELECT 1 FROM attests action
-           WHERE action.bySession=w.sessionKey AND action.kind='progress'
-             AND substr(action.note,1,length('completion-handoff-action ' || terminal.id ||
-                 ' attest ' || terminal.closingAttestId || ' '))=
-               'completion-handoff-action ' || terminal.id ||
-                 ' attest ' || terminal.closingAttestId || ' ')
-       UNION ALL
-       SELECT w.rowid,w.wakeId,'delivered' AS outcome
-       FROM wakes w INDEXED BY wakes_delivered_obligation
-       WHERE w.rowid>?1 AND w.state='fired' AND w.deliveredTurnSeq IS NOT NULL
-         AND w.obligationRef>=?5 AND w.obligationRef<?6
-         AND EXISTS (SELECT 1 FROM wakes root
-           JOIN assignments terminal ON terminal.id=root.assignmentId
-           WHERE root.wakeId=substr(w.obligationRef,length(?5)+1)
-             AND root.obligationRef>=?2 AND root.obligationRef<?3
-             AND terminal.state='closed' AND terminal.outcome IN ('completed','surrendered')
-             AND NOT EXISTS (SELECT 1 FROM attests action
-               WHERE action.bySession=w.sessionKey AND action.kind='progress'
-                 AND substr(action.note,1,length('completion-handoff-action ' || terminal.id ||
-                     ' attest ' || terminal.closingAttestId || ' '))=
-                   'completion-handoff-action ' || terminal.id ||
-                     ' attest ' || terminal.closingAttestId || ' '))
-         AND EXISTS (SELECT 1 FROM assignments a
-           WHERE a.holderKey=w.sessionKey AND a.state='open')
-         AND NOT EXISTS (SELECT 1 FROM wakes newer
-           WHERE newer.obligationRef=w.obligationRef AND newer.rowid>w.rowid)
-     )
-     ORDER BY rowid LIMIT ?7
-     """,
-     [
-       after_rowid,
-       @terminal_notice_marker,
-       root_upper,
-       @terminal_action_marker,
-       @terminal_action_marker,
-       action_upper,
-       limit
-     ]}
-  end
-
-  def source_reconciliation_query(
-        {:delivery, recipient_session_key, delivered_wake_id},
-        _after_rowid,
-        _limit
-      )
+  def source_reconciliation_query({:delivery, recipient_session_key, delivered_wake_id})
       when is_binary(recipient_session_key) and is_binary(delivered_wake_id) do
     direct_sql = """
     SELECT rowid,wakeId,
@@ -742,42 +680,7 @@ defmodule Tightbeam.Wakes do
         {:error, {:source_actions_unavailable, Enum.reverse(failures)}}
 
       {:error, error} ->
-        Logger.warning("delivered source actions unavailable: #{Exception.message(error)}")
-        {:error, error}
-    end
-  end
-
-  defp reconcile_startup_delivered_sources(db, after_rowid) do
-    result =
-      DB.transaction(db, fn txn ->
-        {sql, params} = source_reconciliation_query(:startup, after_rowid, 100)
-        rows = Txn.q(txn, sql, params)
-
-        {reconcile_source_rows_in_txn(txn, rows), length(rows),
-         rows
-         |> List.last()
-         |> case do
-           [rowid, _wake_id, _outcome] -> rowid
-           _ -> after_rowid
-         end}
-      end)
-
-    case result do
-      {:ok, {failures, count, last_rowid}} ->
-        case report_source_reconciliation_failures(failures) do
-          :ok ->
-            {:ok, count, last_rowid}
-
-          {:error, reasons} ->
-            Logger.warning("startup source records remain unresolved: #{inspect(reasons)}")
-            {:error, {:source_actions_unavailable, reasons}}
-        end
-
-      {:error, error} ->
-        Logger.warning(
-          "startup delivered source recovery unavailable: #{Exception.message(error)}"
-        )
-
+        Logger.warning("delivered source actions unavailable: #{inspect(error)}")
         {:error, error}
     end
   end
@@ -795,12 +698,6 @@ defmodule Tightbeam.Wakes do
         Logger.warning("malformed delivered source record ignored: #{inspect(malformed)}")
         failures
     end)
-  end
-
-  defp report_source_reconciliation_failures([]), do: :ok
-
-  defp report_source_reconciliation_failures(failures) do
-    {:error, {:source_actions_unavailable, Enum.reverse(failures)}}
   end
 
   defp reconcile_source_delivery_in_savepoint(txn, wake_id, wait_outcome) do
@@ -4121,6 +4018,42 @@ defmodule Tightbeam.Wakes do
   def clear_sentinel_stop_notice_in_txn(%Txn{}, _host, _qualified), do: :ok
 
   @doc false
+  # A harness-health review notice asks for review of an open incident. When the
+  # incident recovers or expires, its undelivered review notices are retracted
+  # in the same transaction (SN8).
+  def clear_harness_health_review_notice_in_txn(%Txn{} = txn, incident_id)
+      when is_binary(incident_id) do
+    Txn.q(
+      txn,
+      """
+      SELECT w.wakeId
+      FROM harness_health_other_routes r
+      JOIN wakes w ON w.wakeId=r.noticeWakeId
+      WHERE r.incidentId=?1 AND w.state='pending' AND w.consumer='prompt'
+      ORDER BY r.ordinal,w.wakeId
+      """,
+      [incident_id]
+    )
+    |> Enum.each(fn [wake_id] ->
+      command = %{
+        wake_id: wake_id,
+        requester: %{kind: "process", id: "tightbeam:harness-health"},
+        reason_kind: "condition_cleared",
+        causal_source: %{kind: "harness_health_transition", id: incident_id},
+        outcome: %{kind: "no_replacement"}
+      }
+
+      unless cancel_in_txn(txn, command),
+        do:
+          raise(DB.Error,
+            message: "harness health review notice cancellation refused for #{wake_id}"
+          )
+    end)
+
+    :ok
+  end
+
+  @doc false
   @spec retarget_in_txn(Txn.t(), String.t(), String.t()) :: wake() | :error
   def retarget_in_txn(%Txn{} = txn, wake_id, replacement_target)
       when is_binary(wake_id) and is_binary(replacement_target) do
@@ -4249,7 +4182,7 @@ defmodule Tightbeam.Wakes do
 
   @requester_kinds ~w(user session process)
   @reason_kinds ~w(requester_withdrew superseded obligation_disposed cannot_proceed_released routing_bracket_satisfied target_retired production_unmatched consumer_unavailable target_unresolvable condition_cleared)
-  @source_kinds ~w(verb_call wake progress_attest condition_fact assignment_transition work_item_transition decision_request monitor_generation routing_bracket session_transition scheduler_delivery sentinel_transition)
+  @source_kinds ~w(verb_call wake progress_attest condition_fact assignment_transition work_item_transition decision_request monitor_generation routing_bracket session_transition scheduler_delivery sentinel_transition harness_health_transition)
   @disposition_kinds ~w(assignment_transition work_item_transition decision_request_transition monitor_generation_transition)
   @liveness_kinds ~w(pending_wake routing_bracket)
 
@@ -4260,6 +4193,7 @@ defmodule Tightbeam.Wakes do
     "tightbeam:assignments" => ~w(obligation_disposed cannot_proceed_released superseded),
     "tightbeam:escalation" => ~w(obligation_disposed),
     "tightbeam:sentinel-supervisor" => ~w(condition_cleared),
+    "tightbeam:harness-health" => ~w(condition_cleared),
     "tightbeam:effort-checkin" => ~w(superseded obligation_disposed),
     "tightbeam:supervision" => ~w(superseded),
     "tightbeam:retirement" => ~w(target_retired obligation_disposed),
@@ -4285,7 +4219,7 @@ defmodule Tightbeam.Wakes do
     "production_unmatched" => {~w(condition_fact), ~w(no_replacement)},
     "consumer_unavailable" => {~w(scheduler_delivery), ~w(no_replacement)},
     "target_unresolvable" => {~w(scheduler_delivery), ~w(replacement no_replacement)},
-    "condition_cleared" => {~w(sentinel_transition), ~w(no_replacement)}
+    "condition_cleared" => {~w(sentinel_transition harness_health_transition), ~w(no_replacement)}
   }
 
   @doc """
@@ -4831,6 +4765,14 @@ defmodule Tightbeam.Wakes do
   defp validate_source(txn, "session_transition", source_id, _wake),
     do: row_exists(txn, "SELECT 1 FROM sessions WHERE sessionKey=?1", source_id)
 
+  defp validate_source(txn, "harness_health_transition", source_id, _wake),
+    do:
+      row_exists(
+        txn,
+        "SELECT 1 FROM harness_health_incidents WHERE id=?1 AND state IN ('resolved','expired')",
+        source_id
+      )
+
   defp validate_source(txn, "sentinel_transition", source_id, _wake) do
     case JSON.decode(source_id) do
       {:ok, [host, qualified]} when is_binary(host) and is_binary(qualified) ->
@@ -4952,7 +4894,8 @@ defmodule Tightbeam.Wakes do
              exact_terminal_effort_request?(txn, command, outcome, wake, primary) or
              cleared_effort_holder_prod_without_liveness?(txn, command, outcome, wake, primary) or
              completed_assignment_without_liveness?(txn, command, outcome, wake, primary) or
-             cleared_decision_notice_without_liveness?(txn, command, outcome, wake, primary),
+             cleared_decision_notice_without_liveness?(txn, command, outcome, wake, primary) or
+             ladder_ended_source_cancellation?(txn, command, outcome, primary),
            do: {:ok, %{liveness_kind: nil, liveness_id: nil, action_needed: 0}},
            else: :error
 
@@ -4960,6 +4903,57 @@ defmodule Tightbeam.Wakes do
         :error
     end
   end
+
+  # Past inactivity ladder end (SN12(e)) open work has no pending trigger to
+  # cite. Only the source-owned shapes the stored cancellation CHECK admits
+  # without a trigger may cancel then.
+  defp ladder_ended_source_cancellation?(txn, command, outcome, primary) do
+    ladder_ended_source_shape?(command, outcome) and inactivity_ladder_ended?(txn, primary)
+  end
+
+  defp ladder_ended_source_shape?(
+         %{
+           requester: %{kind: "process", id: "tightbeam:assignments"},
+           reason_kind: "cannot_proceed_released",
+           causal_source: %{kind: "condition_fact"}
+         },
+         %{kind: "no_replacement"}
+       ),
+       do: true
+
+  defp ladder_ended_source_shape?(
+         %{
+           requester: %{kind: "process", id: "tightbeam:retirement"},
+           reason_kind: "obligation_disposed",
+           causal_source: %{kind: "assignment_transition", id: id}
+         },
+         %{kind: "disposition", disposition_kind: "assignment_transition", disposition_id: id}
+       ),
+       do: true
+
+  defp ladder_ended_source_shape?(
+         %{
+           requester: %{kind: "process", id: "tightbeam:effort-checkin"},
+           reason_kind: "obligation_disposed",
+           causal_source: %{kind: "decision_request", id: id}
+         },
+         %{
+           kind: "disposition",
+           disposition_kind: "decision_request_transition",
+           disposition_id: id
+         }
+       ),
+       do: true
+
+  defp ladder_ended_source_shape?(_command, _outcome), do: false
+
+  defp inactivity_ladder_ended?(txn, %{kind: "assignment", id: id}) when is_binary(id),
+    do: Supervision.inactivity_ladder_ended_in_txn(txn, {:assignment, id})
+
+  defp inactivity_ladder_ended?(txn, %{kind: "work_item", id: id}) when is_binary(id),
+    do: Supervision.inactivity_ladder_ended_in_txn(txn, {:work_item, id})
+
+  defp inactivity_ladder_ended?(_txn, _primary), do: false
 
   defp retirement_no_replacement_without_liveness?(
          %{
@@ -6364,6 +6358,7 @@ defmodule Tightbeam.Wakes do
 
       failures ->
         Logger.warning("source-owned delivered-record action failed: #{inspect(failures)}")
+        {:error, {:source_actions_unavailable, failures}}
     end
   end
 
@@ -6493,62 +6488,8 @@ defmodule Tightbeam.Wakes do
     # Release pre-crash, unclaimed memberships once. Later drains are driven
     # only by recipient readiness and due events.
     NoticeBatcher.recover(state.db, now(), state.delivery_opts)
-    # Reconcile only durable source records whose follow-through is still owed.
-    # Work one bounded page per scheduler message so this catch-up cannot hold
-    # recipient readiness behind all historical deliveries.
-    Process.send_after(self(), {:recover_delivered_sources, 0}, 0)
-    Process.send_after(self(), :recover_work_item_brackets, 0)
-    {:noreply, state}
-  end
-
-  def handle_info({:recover_delivered_sources, after_rowid}, state) do
-    case DB.background_pass(
-           fn -> reconcile_startup_delivered_sources(state.db, after_rowid) end,
-           :overloaded
-         ) do
-      {:ok, 100, last_rowid} when last_rowid > after_rowid ->
-        Process.send_after(self(), {:recover_delivered_sources, last_rowid}, 0)
-
-      {:ok, _count, _last_rowid} ->
-        :ok
-
-      {:error, error} ->
-        Logger.warning("startup source recovery stopped: #{Exception.message(error)}")
-        Process.send_after(self(), {:recover_delivered_sources, after_rowid}, 5_000)
-
-      :overloaded ->
-        Logger.debug("startup source recovery deferred while the database is busy")
-        Process.send_after(self(), {:recover_delivered_sources, after_rowid}, 5_000)
-    end
-
-    {:noreply, state}
-  end
-
-  def handle_info(:recover_work_item_brackets, state),
-    do: handle_info({:recover_work_item_brackets, 0}, state)
-
-  def handle_info({:recover_work_item_brackets, after_rowid}, state) do
-    case DB.background_pass(
-           fn ->
-             WorkItems.reconcile_delivered_brackets_page(state.db, after_rowid)
-           end,
-           :overloaded
-         ) do
-      {:ok, 100, last_rowid} when last_rowid > after_rowid ->
-        Process.send_after(self(), {:recover_work_item_brackets, last_rowid}, 0)
-
-      {:ok, _count, _last_rowid} ->
-        :ok
-
-      {:error, error} ->
-        Logger.warning("startup work-item source recovery stopped: #{Exception.message(error)}")
-        Process.send_after(self(), {:recover_work_item_brackets, after_rowid}, 5_000)
-
-      :overloaded ->
-        Logger.debug("startup work-item source recovery deferred while the database is busy")
-        Process.send_after(self(), {:recover_work_item_brackets, after_rowid}, 5_000)
-    end
-
+    # Follow-through missed across a restart is repaired by the turn-end
+    # sweeper from each finished turn's delivered records.
     {:noreply, state}
   end
 

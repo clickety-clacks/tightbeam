@@ -155,7 +155,7 @@ defmodule Tightbeam.NoticeDrainTest do
           'owner_topology_correction','user','user:owner','lineage-reparent','lineage-reparent',2);
         """)
 
-      assert %{state: "retired"} = Org.retire(ctx.db, "recipient", "user:owner")
+      assert %{state: "retired"} = Org.retire(ctx.db, "recipient", "user:owner", 1_000)
 
       assert %{state: "canceled"} = Wakes.get(ctx.db, wake.wake_id)
 

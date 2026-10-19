@@ -1304,6 +1304,93 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assert wake_count(ctx.db) == before_count
   end
 
+  @tag persistent: true
+  test "current-stamped continuation guard admits only the exact qualified retry migration",
+       ctx do
+    suspend_scheduler(ctx)
+    originating = running_turn(ctx.db, "holder")
+    original = after_turn_wait!(ctx.db, "A")
+
+    previous =
+      File.read!(Path.join(__DIR__, "fixtures/row_wakes/prewrite-continuation-21a4cb0e.sql"))
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               :ok = DB.Txn.exec(txn, "DROP TRIGGER supervision_liveness_sidecar_insert_coherent")
+               DB.Txn.exec(txn, previous)
+             end)
+
+    before = restoration_snapshot(ctx.db)
+    assert {:ok, stamp} = DB.query(ctx.db, "SELECT * FROM schema_stamp")
+    assert :ok = stop_supervised(DB)
+    start_supervised!({DB, ctx.db_opts})
+    assert :ok = Tightbeam.Schema.ensure_all(ctx.db)
+    assert restoration_snapshot(ctx.db) == before
+    assert {:ok, ^stamp} = DB.query(ctx.db, "SELECT * FROM schema_stamp")
+    assert {:ok, []} = DB.query(ctx.db, "PRAGMA foreign_key_check")
+
+    assert {:ok, [[current]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sql FROM sqlite_master WHERE name='supervision_liveness_sidecar_insert_coherent'"
+             )
+
+    assert current =~ "terminal.ownerLease=claim.ownerLease"
+    assert current =~ "t.status='running'"
+    assert current =~ "creator.ownerUserId=w.ownerUserId"
+    refute current =~ "WITH RECURSIVE lineage"
+    assert :ok = Tightbeam.Schema.ensure_all(ctx.db)
+
+    assert {:ok, [[^current]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sql FROM sqlite_master WHERE name='supervision_liveness_sidecar_insert_coherent'"
+             )
+
+    assert :ok =
+             Ledger.finish(ctx.db, originating.seq, "delivered", nil,
+               owner_lease: originating.owner_lease
+             )
+
+    unbound = Wakes.schedule(ctx.db, Map.put(original, :wake_id, "unbound-continuation"))
+    before = restoration_snapshot(ctx.db)
+
+    assert {:error, %DB.Error{message: refusal}} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO supervision_liveness_sidecar(wakeId,assignmentId,controllerOrigin,controllerState) VALUES (?1,'A','holder_continuation','pending')",
+               [unbound.wake_id]
+             )
+
+    assert refusal =~ "supervision sidecar requires coherent pending wake"
+    assert restoration_snapshot(ctx.db) == before
+
+    malformed = String.replace(previous, "t.status='running'", "t.status='delivered'")
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               :ok = DB.Txn.exec(txn, "DROP TRIGGER supervision_liveness_sidecar_insert_coherent")
+               DB.Txn.exec(txn, malformed)
+             end)
+
+    before = restoration_snapshot(ctx.db)
+
+    assert {:ok, ddl} =
+             DB.query(ctx.db, "SELECT type,name,sql FROM sqlite_master ORDER BY type,name")
+
+    assert_raise Tightbeam.Schema.ShapeError, ~r/malformed owned object/, fn ->
+      Tightbeam.Schema.ensure_all(ctx.db)
+    end
+
+    assert restoration_snapshot(ctx.db) == before
+
+    assert {:ok, ^ddl} =
+             DB.query(ctx.db, "SELECT type,name,sql FROM sqlite_master ORDER BY type,name")
+
+    assert {:ok, ^stamp} = DB.query(ctx.db, "SELECT * FROM schema_stamp")
+    assert {:ok, []} = DB.query(ctx.db, "PRAGMA foreign_key_check")
+  end
+
   test "missing relief runtime rolls back admission and schema initialization reinstalls it",
        ctx do
     qualification_policy(ctx)
@@ -1531,6 +1618,40 @@ defmodule Tightbeam.RowDrivenWaitsTest do
       assert {:ok, [["open", nil]]} =
                DB.query(ctx.db, "SELECT state,outcome FROM assignments WHERE id='A'")
     end
+  end
+
+  defp after_turn_wait!(db, assignment_id) do
+    assert {:ok, wake} =
+             DB.transaction(db, fn txn ->
+               Wakes.register_wait_in_txn(txn, %{
+                 session_key: "holder",
+                 origin: "agent:holder",
+                 prompt: "Resume #{assignment_id} exactly.",
+                 assignment_id: assignment_id,
+                 after_turn: true,
+                 registrant_session_key: "holder",
+                 owner_user_id: "owner-a"
+               })
+             end)
+
+    wake
+  end
+
+  defp restoration_snapshot(db) do
+    Map.new(
+      [
+        "turns",
+        "turn_lifecycle_events",
+        "wakes",
+        "wake_retry_attempts",
+        "supervision_liveness_sidecar",
+        "supervision_entitlements"
+      ],
+      fn table ->
+        {:ok, rows} = DB.query(db, "SELECT rowid,* FROM #{table} ORDER BY rowid")
+        {table, rows}
+      end
+    )
   end
 
   defp suspend_scheduler(ctx) do

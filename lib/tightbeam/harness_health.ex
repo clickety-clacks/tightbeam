@@ -3325,6 +3325,8 @@ defmodule Tightbeam.HarnessHealth do
 
         if Txn.changes(txn) != 1, do: raise("harness other incident resolution race")
 
+        :ok = Wakes.clear_harness_health_review_notice_in_txn(txn, incident.id)
+
         EventLog.lifecycle_in_txn(
           txn,
           "harness_health_incident_resolved",
@@ -3384,6 +3386,8 @@ defmodule Tightbeam.HarnessHealth do
         "UPDATE harness_health_incidents SET state='expired',expiredAt=?2,expiryFactId=?3 WHERE id=?1 AND state='open'",
         [incident.id, now, fact_id]
       )
+
+      :ok = Wakes.clear_harness_health_review_notice_in_txn(txn, incident.id)
 
       EventLog.lifecycle_in_txn(
         txn,

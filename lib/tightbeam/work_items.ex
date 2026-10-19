@@ -825,116 +825,18 @@ defmodule Tightbeam.WorkItems do
   def rearm_on_fire_in_txn(%Txn{} = _txn, _wake_id, _gate), do: :ok
 
   @doc false
-  @spec reconcile_delivered_brackets(DB.server(), String.t() | nil, String.t() | nil) ::
+  @spec reconcile_delivered_brackets(DB.server(), String.t(), String.t()) ::
           :ok | {:error, term()}
-  def reconcile_delivered_brackets(
-        db \\ DB,
-        recipient_session_key \\ nil,
-        delivered_wake_id \\ nil
-      ) do
-    reconcile_delivered_bracket_batch(db, recipient_session_key, delivered_wake_id, nil, [])
-  end
-
-  @doc false
-  @spec reconcile_delivered_brackets_page(DB.server(), non_neg_integer()) ::
-          {:ok, non_neg_integer(), non_neg_integer()} | {:error, term()}
-  def reconcile_delivered_brackets_page(db, after_rowid)
-      when is_integer(after_rowid) and after_rowid >= 0 do
+  def reconcile_delivered_brackets(db, recipient_session_key, delivered_wake_id)
+      when is_binary(recipient_session_key) and is_binary(delivered_wake_id) do
     case DB.transaction(db, fn txn ->
-           rows = delivered_bracket_sources_after(txn, after_rowid)
-           failures = reconcile_delivered_bracket_rows(txn, rows)
-
-           last_rowid =
-             case List.last(rows) do
-               [_work_item_id, _wake_id, rowid] when is_integer(rowid) -> rowid
-               _ -> after_rowid
-             end
-
-           {failures, length(rows), last_rowid}
+           txn
+           |> delivered_bracket_sources_for_wake(recipient_session_key, delivered_wake_id)
+           |> reconcile_delivered_bracket_rows(txn)
          end) do
-      {:ok, {[], count, last_rowid}} ->
-        {:ok, count, last_rowid}
-
-      {:ok, {failures, _count, _last_rowid}} ->
-        {:error, {:source_action_failed, failures}}
-
-      {:error, error} ->
-        {:error, error}
-    end
-  end
-
-  defp reconcile_delivered_bracket_batch(
-         db,
-         recipient_session_key,
-         delivered_wake_id,
-         after_rowid,
-         failures_so_far
-       ) do
-    case DB.transaction(db, fn txn ->
-           rows =
-             case {recipient_session_key, delivered_wake_id} do
-               {session_key, wake_id} when is_binary(session_key) and is_binary(wake_id) ->
-                 delivered_bracket_sources_for_wake(txn, session_key, wake_id)
-
-               _ ->
-                 delivered_bracket_sources_after(txn, after_rowid || 0)
-             end
-
-           failures =
-             Enum.reduce(rows, [], fn
-               [work_item_id, wake_id, wake_rowid], failures
-               when is_binary(wake_id) and is_binary(work_item_id) and is_integer(wake_rowid) ->
-                 :ok = Txn.exec(txn, "SAVEPOINT reconcile_work_item_bracket")
-
-                 try do
-                   :ok = rearm_on_fire_in_txn(txn, wake_id, %{work_item_id: work_item_id})
-                   :ok = Txn.exec(txn, "RELEASE reconcile_work_item_bracket")
-                   failures
-                 rescue
-                   error ->
-                     :ok = Txn.exec(txn, "ROLLBACK TO reconcile_work_item_bracket")
-                     :ok = Txn.exec(txn, "RELEASE reconcile_work_item_bracket")
-
-                     Logger.warning(
-                       "work-item bracket action failed for #{wake_id}: #{Exception.message(error)}"
-                     )
-
-                     [wake_id | failures]
-                 end
-
-               malformed, failures ->
-                 Logger.warning(
-                   "malformed delivered work-item bracket ignored: #{inspect(malformed)}"
-                 )
-
-                 failures
-             end)
-
-           last_rowid =
-             case List.last(rows) do
-               [_work_item_id, _wake_id, rowid] when is_integer(rowid) -> rowid
-               _ -> after_rowid
-             end
-
-           {Enum.reverse(failures), length(rows), last_rowid}
-         end) do
-      {:ok, {failures, 100, last_rowid}} when is_nil(delivered_wake_id) ->
-        reconcile_delivered_bracket_batch(
-          db,
-          recipient_session_key,
-          delivered_wake_id,
-          last_rowid,
-          failures_so_far ++ failures
-        )
-
-      {:ok, {failures, _count, _last_wake_id}} ->
-        case failures_so_far ++ failures do
-          [] -> :ok
-          all_failures -> {:error, {:source_action_failed, all_failures}}
-        end
-
-      {:error, error} ->
-        {:error, error}
+      {:ok, []} -> :ok
+      {:ok, failures} -> {:error, {:source_action_failed, failures}}
+      {:error, error} -> {:error, error}
     end
   end
 
@@ -974,32 +876,7 @@ defmodule Tightbeam.WorkItems do
     )
   end
 
-  defp delivered_bracket_sources_after(txn, after_rowid) do
-    {sql, params} = delivered_bracket_reconciliation_query(after_rowid)
-    Txn.q(txn, sql, params)
-  end
-
-  @doc false
-  def delivered_bracket_reconciliation_query(after_rowid \\ 0)
-      when is_integer(after_rowid) and after_rowid >= 0 do
-    {"""
-     SELECT item_id,wake_id,wake_rowid FROM (
-       SELECT wi.id AS item_id,w.wakeId AS wake_id,w.rowid AS wake_rowid
-       FROM work_items wi INDEXED BY work_items_open_routing_wake
-       JOIN wakes w ON w.wakeId=wi.routingWakeId
-       WHERE wi.state='open' AND wi.routingWakeId IS NOT NULL
-         AND w.deliveredTurnSeq IS NOT NULL AND w.rowid>?1
-       UNION ALL
-       SELECT wi.id AS item_id,w.wakeId AS wake_id,w.rowid AS wake_rowid
-       FROM work_items wi INDEXED BY work_items_open_slate_wake
-       JOIN wakes w ON w.wakeId=wi.slateWakeId
-       WHERE wi.state='open' AND wi.slateWakeId IS NOT NULL
-         AND w.deliveredTurnSeq IS NOT NULL AND w.rowid>?1
-     ) ORDER BY wake_rowid LIMIT 100
-     """, [after_rowid]}
-  end
-
-  defp reconcile_delivered_bracket_rows(txn, rows) do
+  defp reconcile_delivered_bracket_rows(rows, txn) do
     Enum.reduce(rows, [], fn
       [work_item_id, wake_id, wake_rowid], failures
       when is_binary(wake_id) and is_binary(work_item_id) and is_integer(wake_rowid) ->
