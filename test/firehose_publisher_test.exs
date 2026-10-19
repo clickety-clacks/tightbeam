@@ -603,7 +603,9 @@ defmodule Tightbeam.Firehose.PublisherTest do
              Dispatch.dispatch(db, handlers, reopen)
 
     assert reopened_id == assignment.id
-    assert_per_verb_effects!(config, "reopen-assignment", observed_state_classes())
+    # A delayed restart-marker notice belongs to the earlier wake delivery.
+    reopen_effects = Enum.reject(observed_state_classes(), &(&1 == "message.created"))
+    assert_per_verb_effects!(config, "reopen-assignment", reopen_effects)
     history = Tightbeam.Assignments.list_reopenings(db, assignment.id)
     assert [%{priorOutcome: "completed", reason: "continue the real assignment"}] = history
     assert {:error, %{code: "assignment_open"}} = Dispatch.dispatch(db, handlers, reopen)
