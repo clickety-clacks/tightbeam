@@ -254,7 +254,7 @@ defmodule Tightbeam.NoticeBatcher do
           [] ->
             []
 
-          rows ->
+          _rows ->
             Logger.warning(
               "notice attachments unavailable for carrier #{wake_id}: malformed source rows"
             )
@@ -897,6 +897,9 @@ defmodule Tightbeam.NoticeBatcher do
     end
   end
 
+  defp admit_session_snapshot_in_txn(_txn, _target, [], _at, _delivery_opts),
+    do: {:deliveries, [], []}
+
   defp admit_session_snapshot_in_txn(txn, target, sources, at, delivery_opts) do
     address = "session:" <> target
     scope = address <> ":readiness-v3"
@@ -987,9 +990,6 @@ defmodule Tightbeam.NoticeBatcher do
         end
     end
   end
-
-  defp admit_session_snapshot_in_txn(_txn, _target, [], _at, _delivery_opts),
-    do: {:deliveries, [], []}
 
   defp release_cause(boundary, first) do
     if is_integer(boundary) and boundary > first.created_at, do: "turn-boundary", else: "idle"

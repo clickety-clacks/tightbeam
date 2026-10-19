@@ -1750,25 +1750,6 @@ defmodule Tightbeam.AssignmentsTest do
              )
   end
 
-  defp assert_held_notice(db, wake) do
-    assert %{state: "pending", session_key: session_key, prompt: prompt} =
-             Wakes.get(db, wake.wake_id)
-
-    assert session_key == wake.session_key
-    assert prompt == wake.prompt
-    assert source_delivery_turns(db, wake.wake_id) == []
-
-    assert {:ok, []} =
-             DB.query(db, "SELECT wakeId FROM wake_cancellations WHERE wakeId=?1", [wake.wake_id])
-
-    assert {:ok, []} =
-             DB.query(
-               db,
-               "SELECT id FROM lifecycle_events WHERE kind='wake_undeliverable' AND subject=?1",
-               [wake.wake_id]
-             )
-  end
-
   defp accountable_disposition_snapshot(db) do
     for {table, columns} <- [
           {"assignments", "id,state,outcome,holderKey,closingAttestId,closedAt"},
@@ -1815,49 +1796,6 @@ defmodule Tightbeam.AssignmentsTest do
 
   defp force_wake_due(db, wake_id) do
     {:ok, _} = DB.query(db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [wake_id])
-  end
-
-  defp terminal_successor_fixture(ctx) do
-    session(ctx.db, "notice-parent", "flynn")
-    session(ctx.db, "terminal-po", "flynn")
-    session(ctx.db, "delivery-successor", "flynn")
-    Roles.create!(ctx.db, "product-owner:terminal", "flynn", "terminal-po")
-
-    for session_key <- ["notice-parent", "delivery-successor"] do
-      assert %{"changed" => true} =
-               SessionPoAssociations.handle(ctx.db, %{
-                 principal: {:user, "flynn"},
-                 params: %{
-                   session_key: session_key,
-                   po_role: "product-owner:terminal",
-                   idempotency_key: "terminal-association-" <> session_key
-                 }
-               })
-    end
-
-    item = create_work_item(ctx, "terminal successor")
-    set_delivery_owner(ctx, item.id, "notice-parent")
-
-    assignment =
-      handle(
-        ctx,
-        "assign",
-        terminal_notice_assign_call(
-          {:session, "notice-parent"},
-          "deliver to current accountable successor",
-          item.id
-        )
-      )
-
-    set_delivery_owner(ctx, item.id, "delivery-successor")
-
-    {:ok, _} =
-      DB.query(
-        ctx.db,
-        "UPDATE sessions SET state='retired' WHERE sessionKey='notice-parent'"
-      )
-
-    {assignment, item}
   end
 
   defp terminal_delegated_fixture(ctx) do

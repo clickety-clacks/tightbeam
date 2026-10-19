@@ -772,45 +772,6 @@ defmodule Tightbeam.Productions.Bubble do
     end
   end
 
-  defp next_active_ancestor_in_txn(txn, session_key, excluded),
-    do: next_active_ancestor_in_txn(txn, session_key, excluded, 0)
-
-  defp next_active_ancestor_in_txn(_txn, _session_key, _excluded, hops)
-       when hops > @lineage_hop_limit,
-       do: :exhausted
-
-  defp next_active_ancestor_in_txn(txn, session_key, excluded, hops) do
-    case DB.Txn.q(
-           txn,
-           "SELECT #{Tightbeam.Org.current_parent_sql("sessions")} FROM sessions WHERE sessionKey=?1",
-           [session_key]
-         ) do
-      [[parent]] when is_binary(parent) ->
-        case DB.Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey=?1", [parent]) do
-          [["active"]] ->
-            if MapSet.member?(excluded, parent),
-              do: exhausted_past_in_txn(txn, parent, excluded, hops),
-              else: {:ok, parent}
-
-          _ ->
-            exhausted_past_in_txn(txn, parent, excluded, hops)
-        end
-
-      _ when hops == 0 ->
-        :parentless
-
-      _ ->
-        :exhausted
-    end
-  end
-
-  defp exhausted_past_in_txn(txn, parent, excluded, hops) do
-    case next_active_ancestor_in_txn(txn, parent, excluded, hops + 1) do
-      :parentless -> :exhausted
-      other -> other
-    end
-  end
-
   # Climbing past a dead rung: whatever the rest of the walk answers, this
   # lineage EXISTS, so an empty tail is exhaustion, never parentlessness.
   defp exhausted_past(db, parent, hops) do

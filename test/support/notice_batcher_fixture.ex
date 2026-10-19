@@ -1453,7 +1453,6 @@ defmodule Tightbeam.NoticeBatcherFixture do
              )
 
     [carrier_id] = Wakes.materialize_digests(db, healthy.due_at)
-    carrier = Wakes.get(db, carrier_id)
     assert source_ids(db, carrier_id) == [malformed.wake_id, healthy.wake_id]
 
     {:ok, _} = DB.query(db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [carrier_id])
@@ -2085,18 +2084,6 @@ defmodule Tightbeam.NoticeBatcherFixture do
     clause = if where, do: " WHERE " <> where, else: ""
     {:ok, [[value]]} = DB.query(db, "SELECT COUNT(*) FROM #{table}#{clause}", params)
     value
-  end
-
-  defp eventually(fun, attempts \\ 100)
-  defp eventually(fun, 0), do: fun.()
-
-  defp eventually(fun, attempts) do
-    if fun.() do
-      true
-    else
-      Process.sleep(10)
-      eventually(fun, attempts - 1)
-    end
   end
 
   defp seed_session(db, session_key, owner) do

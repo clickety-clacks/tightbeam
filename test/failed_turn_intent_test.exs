@@ -168,7 +168,7 @@ defmodule Tightbeam.FailedTurnIntentTest do
     })
   end
 
-  defp terminal!(db, session_key, status, error, wake_id \\ nil, request_ref \\ nil) do
+  defp terminal!(db, session_key, status, error, wake_id) do
     created_at = System.unique_integer([:positive])
 
     {:ok, seq} =
@@ -178,7 +178,7 @@ defmodule Tightbeam.FailedTurnIntentTest do
         origin: "process:test",
         prompt: "intent prompt",
         wake_id: wake_id,
-        request_ref: request_ref
+        request_ref: nil
       })
 
     {:ok, turn} = Ledger.claim_next(db, session_key, "intent-test")

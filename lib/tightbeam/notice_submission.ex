@@ -10,7 +10,6 @@ defmodule Tightbeam.NoticeSubmission do
     NoticeBatcher,
     QueuedMessageSuppression,
     ReminderDelivery,
-    Supervision,
     Wakes
   }
 
@@ -206,7 +205,7 @@ defmodule Tightbeam.NoticeSubmission do
     :ok
   end
 
-  defp restore_source_in_txn(txn, source_id, turn, evidence) do
+  defp restore_source_in_txn(txn, source_id, turn, _evidence) do
     seq = turn.seq
 
     %{consumer: "prompt", digest: false, state: "fired"} =

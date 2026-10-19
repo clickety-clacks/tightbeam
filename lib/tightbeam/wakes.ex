@@ -1278,20 +1278,6 @@ defmodule Tightbeam.Wakes do
     })
   end
 
-  defp cancel_unresolvable_terminal_action_reminder_in_txn(txn, wake) do
-    # The session may still be active, but without an open holder assignment it
-    # has no lawful destination for the progress attest this reminder requires.
-    # The existing target-unresolvable cancellation records that limit without
-    # claiming the parent completed the action.
-    cancel_in_txn(txn, %{
-      wake_id: wake.wake_id,
-      requester: %{kind: "process", id: "tightbeam:wake-scheduler"},
-      reason_kind: "target_unresolvable",
-      causal_source: %{kind: "scheduler_delivery", id: wake.wake_id},
-      outcome: %{kind: "no_replacement"}
-    })
-  end
-
   # A run-boundary retry keeps a distinct transport wakeId; the retry row
   # identifies the original immutable semantic notification for source-owned
   # follow-through outside delivery.
@@ -1815,12 +1801,6 @@ defmodule Tightbeam.Wakes do
     schedule_changed_in_txn(txn, {:schedule_changed, wake.due_at})
     wake
   end
-
-  # A carrier turn serves several independently owned sources. Preserve each
-  # source's assignment identity when recognizing its delivery or recovery,
-  # rather than treating the carrier's transport wake as the semantic notice.
-  defp source_delivery_turns_in_txn(txn, wake_id),
-    do: NoticeBatcher.source_delivery_turns_in_txn(txn, wake_id)
 
   @doc false
   def consume_internal_in_txn(%Txn{} = txn, wake_id) when is_binary(wake_id) do
@@ -4147,6 +4127,8 @@ defmodule Tightbeam.Wakes do
     retarget_in_txn(txn, wake_id, replacement_target, [])
   end
 
+  def retarget_in_txn(%Txn{}, _wake_id, _replacement_target), do: :error
+
   @doc false
   @spec retarget_in_txn(Txn.t(), String.t(), String.t(), keyword()) :: wake() | :error
   def retarget_in_txn(%Txn{} = txn, wake_id, replacement_target, options)
@@ -4242,8 +4224,6 @@ defmodule Tightbeam.Wakes do
   end
 
   def retarget_in_txn(%Txn{}, _wake_id, _replacement_target, _options), do: :error
-
-  def retarget_in_txn(%Txn{}, _wake_id, _replacement_target), do: :error
 
   # O1 (HIGH, Law 2): `class`/`classElection`/`digest`/`summon` are the
   # SENDER's facts, not the batcher's — retarget is org.ex:688's unroutable
@@ -4348,7 +4328,6 @@ defmodule Tightbeam.Wakes do
     case Supervision.inactivity_deadline_trigger_in_txn(txn, {kind, primary.id}) do
       {:ok, trigger} -> %{kind: "no_replacement", liveness_trigger: trigger}
       :none -> %{kind: "no_replacement"}
-      {:error, _reason} -> %{kind: "no_replacement"}
     end
   end
 
@@ -7150,9 +7129,9 @@ defmodule Tightbeam.Wakes do
     end
   end
 
-  defp publish_undeliverable_notice_safely(effect), do: publish_undeliverable_notice(effect)
-
   def publish_undeliverable_notice(_), do: :ok
+
+  defp publish_undeliverable_notice_safely(effect), do: publish_undeliverable_notice(effect)
 
   # A wake nobody can deliver is still CONSUMED — leaving it pending would spin the
   # sweep forever on what is necessarily a code bug — but it is recorded as

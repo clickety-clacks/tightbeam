@@ -2,17 +2,14 @@ defmodule Tightbeam.Firehose.RetireCommitOrderTest do
   use Tightbeam.TestCase, async: false
 
   alias Tightbeam.{
-    Assignments,
     ConnRegistry,
     DB,
     Dispatch,
     Gateway,
-    Ledger,
     Model,
     Org,
     Schema,
     StateResources,
-    Supervision,
     Wakes
   }
 

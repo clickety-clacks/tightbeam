@@ -962,19 +962,6 @@ defmodule Tightbeam.Org do
     end
   end
 
-  @doc false
-  @spec retire_in_txn(Txn.t(), String.t(), String.t(), pos_integer()) :: session()
-  def retire_in_txn(%Txn{} = txn, session_key, principal, supervision_interval_ms)
-      when is_binary(principal) and principal != "" and is_integer(supervision_interval_ms) and
-             supervision_interval_ms > 0 do
-    retire_in_txn(txn, session_key, principal)
-  end
-
-  def retire_in_txn(%Txn{}, _session_key, _principal, _supervision_interval_ms) do
-    raise ArgumentError,
-          "retirement requires a non-empty principal and positive supervision interval"
-  end
-
   def retire_in_txn(%Txn{}, _session_key, _principal) do
     raise ArgumentError,
           "retirement requires a non-empty principal"

@@ -1593,51 +1593,6 @@ defmodule Tightbeam.RailRemedyTest do
     })
   end
 
-  # Model a committed terminal row before its downstream reconciliation. Keep the
-  # real audit and generation constraints; using the full revoke handler here
-  # would consume the callback race that these three tests exercise.
-  defp persist_terminal_race!(db, assignment_id, at) do
-    revocation_id = "rev_race_#{System.unique_integer([:positive])}"
-
-    assert {:ok, :ok} =
-             DB.transaction(db, fn txn ->
-               DB.Txn.q(
-                 txn,
-                 """
-                 INSERT INTO assignment_revocations
-                   (id, assignmentId, revokedAt, revokedByUser, reason)
-                 VALUES (?1, ?2, ?3, 'flynn', 'synthetic terminal race')
-                 """,
-                 [revocation_id, assignment_id, at]
-               )
-
-               DB.Txn.q(
-                 txn,
-                 """
-                 INSERT INTO assignment_revocation_generations
-                   (revocationId, assignmentId, reopeningId)
-                 VALUES (?1, ?2, NULL)
-                 """,
-                 [revocation_id, assignment_id]
-               )
-
-               DB.Txn.q(
-                 txn,
-                 """
-                 UPDATE assignments SET state='closed', outcome='revoked',
-                   closedAt=?2, closedByUser='flynn'
-                 WHERE id=?1 AND state='open'
-                 """,
-                 [assignment_id, at]
-               )
-
-               assert DB.Txn.changes(txn) == 1
-               :ok
-             end)
-
-    :ok
-  end
-
   defp spawn_handlers(ctx) do
     auth_dir =
       Tightbeam.Homes.home_path(ctx.base_dir, Tightbeam.Placement.local_host_name(), :codex)

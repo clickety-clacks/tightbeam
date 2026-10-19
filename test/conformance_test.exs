@@ -1505,56 +1505,6 @@ defmodule Tightbeam.ConformanceSupport do
     end
   end
 
-  defp start_wake_delivery_services do
-    [
-      start_named_service(ConnRegistry, fn ->
-        ConnRegistry.start_link(name: ConnRegistry)
-      end),
-      start_named_service(Tightbeam.LaneManager, fn ->
-        Tightbeam.ConformanceLaneManager.start_link()
-      end)
-    ]
-    |> Enum.reject(&is_nil/1)
-  end
-
-  defp deliver_condition_source!(db, source_wake_id) do
-    _ = NoticeBatcher.recover(db, System.system_time(:millisecond) + 60_000)
-
-    delivery_wake_id =
-      case NoticeBatcher.source_refs(db, source_wake_id) do
-        [%{delivery_wake_id: carrier_wake_id}] when is_binary(carrier_wake_id) ->
-          carrier_wake_id
-
-        [] ->
-          source_wake_id
-      end
-
-    case DB.query(db, "SELECT status FROM turns WHERE wakeId=?1", [delivery_wake_id]) do
-      {:ok, [[status]]} when status in ["queued", "running"] ->
-        :ok
-
-      {:ok, [[_status]]} ->
-        flunk("condition source already has a terminal turn: #{delivery_wake_id}")
-
-      {:ok, []} ->
-        wake = Wakes.get(db, delivery_wake_id)
-
-        assert {:ok, {:appended, _, _, _}} =
-                 DB.transaction(db, fn txn ->
-                   Gateway.deliver_prompt_in_txn(
-                     txn,
-                     wake.session_key,
-                     wake.origin,
-                     wake.prompt,
-                     wake_id: wake.wake_id,
-                     sender: wake.origin,
-                     target_gate: wake,
-                     fire_wake_in_txn: true
-                   )
-                 end)
-    end
-  end
-
   defp run_escalation_fold_contract(fixture) do
     base = temp_dir!("conformance-escalation-fold")
     prepare_rule_base!(base, fixture)

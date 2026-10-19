@@ -1187,16 +1187,6 @@ defmodule Tightbeam.JobForensicsTest do
       """)
   end
 
-  defp attest(db, id, assignment_id, ts \\ nil) do
-    ts = ts || System.system_time(:millisecond)
-
-    :ok =
-      DB.execute(db, """
-      INSERT INTO attests (id, assignmentId, kind, bySession, ts)
-      VALUES ('#{id}', '#{assignment_id}', 'completion', 'holder', #{ts})
-      """)
-  end
-
   defp session(db, key, spawned_by \\ nil) do
     Org.create(db, %{
       session_key: key,

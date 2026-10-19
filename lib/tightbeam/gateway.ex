@@ -2427,7 +2427,7 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  def delivery_target(txn, session_key, gate) do
+  def delivery_target(txn, session_key, _gate) do
     case DB.Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey = ?1", [session_key]) do
       [["active"]] ->
         {session_key, nil, false}

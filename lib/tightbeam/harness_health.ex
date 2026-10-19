@@ -4269,7 +4269,9 @@ defmodule Tightbeam.HarnessHealth do
 
   @doc false
   @spec reconcile_delivered_turn(DB.server(), integer()) :: :ok
-  def reconcile_delivered_turn(db \\ DB, turn_seq) when is_integer(turn_seq) and turn_seq > 0 do
+  def reconcile_delivered_turn(db \\ DB, turn_seq)
+
+  def reconcile_delivered_turn(db, turn_seq) when is_integer(turn_seq) and turn_seq > 0 do
     publications =
       transaction_with_row_commits!(db, fn txn ->
         Txn.q(

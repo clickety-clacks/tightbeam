@@ -4301,7 +4301,6 @@ defmodule Tightbeam.Assignments do
     case Supervision.inactivity_deadline_trigger_in_txn(txn, {:work_item, work_item_id}) do
       {:ok, trigger} when is_map(trigger) -> trigger
       :none -> nil
-      {:error, reason} -> raise "invalid liveness trigger: #{inspect(reason)}"
     end
   end
 
@@ -4309,7 +4308,6 @@ defmodule Tightbeam.Assignments do
     case Supervision.inactivity_deadline_trigger_in_txn(txn, primary) do
       {:ok, trigger} when is_map(trigger) -> trigger
       :none -> raise "#{inspect(primary)} has no liveness trigger"
-      {:error, reason} -> raise "invalid liveness trigger: #{inspect(reason)}"
     end
   end
 

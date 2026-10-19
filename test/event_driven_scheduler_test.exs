@@ -422,7 +422,7 @@ defmodule Tightbeam.EventDrivenSchedulerTest do
   end
 
   test "a deleted role is reported at its deadline while the former recipient is busy", ctx do
-    turn = busy(ctx.db)
+    busy(ctx.db)
     Tightbeam.Roles.create!(ctx.db, "reviewer", "owner", "recipient")
     pid = scheduler(ctx)
     source = wake(ctx.db, System.system_time(:millisecond) + 250, %{target_role: "reviewer"})
