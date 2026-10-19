@@ -181,10 +181,18 @@ defmodule Tightbeam.WorkItemTraceRestTest do
              "dependencyVersion"
            ])
 
+    unrelated_assignment =
+      insert_assignment!(ctx.db, "asg_trace_unrelated_invariant",
+        holder: ctx.owner_session.session_key,
+        opener_user: "owner",
+        work_item_id: other_parent,
+        opened_at: 60_000
+      )
+
     insert_attest!(
       ctx.db,
       "att_trace_invariant",
-      base_assignment,
+      unrelated_assignment,
       ctx.owner_session.session_key,
       60_000
     )
