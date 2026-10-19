@@ -203,14 +203,14 @@ defmodule Tightbeam.WorkItemTraceRestTest do
     insert_hidden_turn!(ctx.db, 777, ctx.other_session.session_key, hidden_parent)
     insert_hidden_turn!(ctx.db, 778, ctx.other_session.session_key, root)
 
-    after = get(ctx, "/api/work-items/#{root}/trace", ctx.owner_session.cli_token)
-    after_trace = decode_trace!(after)
-    assert after.resp_body == before.resp_body
+    after_response = get(ctx, "/api/work-items/#{root}/trace", ctx.owner_session.cli_token)
+    after_trace = decode_trace!(after_response)
+    assert after_response.resp_body == before.resp_body
     child_after = get(ctx, "/api/work-items/#{child}/trace", ctx.owner_session.cli_token)
     assert child_after.resp_body == child_before.resp_body
-    refute after.resp_body =~ "asg_trace_twin_hidden_base"
-    refute after.resp_body =~ "asg_trace_twin_review"
-    refute after.resp_body =~ "wi_trace_twin_hidden_parent"
+    refute after_response.resp_body =~ "asg_trace_twin_hidden_base"
+    refute after_response.resp_body =~ "asg_trace_twin_review"
+    refute after_response.resp_body =~ "wi_trace_twin_hidden_parent"
     assert after_trace["dependencyVersion"] == before_trace["dependencyVersion"]
   end
 
