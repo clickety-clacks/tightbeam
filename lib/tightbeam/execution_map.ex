@@ -40,11 +40,121 @@ defmodule Tightbeam.ExecutionMap do
      through any item-attributed carrier.
   """
 
-  alias Tightbeam.{CausalEvents, DB}
+  alias Tightbeam.{CausalEvents, DB, StateResources, StateVisibility}
+  alias Tightbeam.DB.Txn
+  alias Tightbeam.{Assignments, Wakes}
 
   @edge_basis "concurrent_turn"
   @coverage_basis "conservative_shared"
   @terminal_states ~w(closed failed iceboxed)
+  @execution_map_node_fields ~w(
+    id title specRefName specRefSha256 state failReason bracket1Armed origin
+    creationContext parent finishedAt assignments jobs attests startedAt
+    closingAttests openDecisionRequests turns minds fanOut active sinceProgressMs
+  )
+  @doc "The canonical D2 flat ExecutionMap collection query."
+  def list_execution_map(db, call) do
+    with_rest_world(db, call, fn world ->
+      appearing = execution_map_appearing(world, call.filters)
+      page = execution_map_page(appearing, call.boundary, call.limit)
+
+      %{
+        items: Enum.map(page.items, &rest_node(world, &1)),
+        flags: %{has_more_before: page.has_more_before, has_more_after: page.has_more_after},
+        dependency_version: world.dependency_version,
+        attribution_cutoff: world.cutoff
+      }
+    end)
+  end
+
+  @doc "The canonical D2 ExecutionMap forest query."
+  def query_execution_map_tree(db, call) do
+    with_rest_world(db, call, fn world ->
+      execution_map_forest(world, execution_map_appearing(world, call.filters))
+      |> Map.put(:dependency_version, world.dependency_version)
+      |> Map.put(:attribution_cutoff, world.cutoff)
+    end)
+  end
+
+  @doc "The canonical D2 visible ExecutionMap subtree query."
+  def query_execution_map_subtree(db, call) do
+    with_rest_world(db, call, fn world ->
+      case resolve_typed_prefix(call.work_item_id, "wi_", world.items) do
+        {:ok, item} ->
+          descendants = descendants(world, item.id)
+          scoped = Enum.filter(world.items, &MapSet.member?(descendants, &1.id))
+
+          execution_map_forest(
+            world,
+            execution_map_appearing(%{world | items: scoped}, call.filters)
+          )
+          |> Map.put(:dependency_version, world.dependency_version)
+          |> Map.put(:attribution_cutoff, world.cutoff)
+
+        {:error, :not_found} ->
+          {:error, 404, "not_found", nil}
+
+        {:error, :ambiguous, ids} ->
+          {:error, 400, "ambiguous_id", ids}
+      end
+    end)
+  end
+
+  @doc "The canonical D2 assignment-set ExecutionMap query."
+  def query_execution_map_assignments(db, call) do
+    with_rest_world(db, call, fn world ->
+      case resolve_assignment_selectors(world, call.assignment_ids, call.principal) do
+        {:error, :not_found} ->
+          {:error, 404, "not_found", nil}
+
+        {:error, :ambiguous, ids} ->
+          {:error, 400, "ambiguous_id", ids}
+
+        {:ok, selected_items, no_item} ->
+          selected_items =
+            world.items
+            |> Enum.filter(&MapSet.member?(MapSet.new(selected_items), &1.id))
+            |> Enum.filter(
+              &StateVisibility.execution_map_node_visible?(world.txn, &1.id, call.principal)
+            )
+            |> Enum.map(&rest_node(world, &1))
+
+          %{
+            items: selected_items,
+            no_item: Enum.sort(no_item),
+            dependency_version: world.dependency_version,
+            attribution_cutoff: world.cutoff
+          }
+      end
+    end)
+  end
+
+  @doc "The one closed-world public ExecutionMap node serializer."
+  def execution_map_node(node) when is_map(node) do
+    encoded =
+      Enum.map_join(@execution_map_node_fields, ",", fn field ->
+        value = execution_map_wire_value!(node, field)
+        JSON.encode!(field) <> ":" <> encode_execution_map_field!(field, value)
+      end)
+
+    children = Map.get(node, :children)
+
+    case children do
+      nil ->
+        "{" <> encoded <> "}"
+
+      values when is_list(values) ->
+        "{" <>
+          encoded <>
+          ",\"children\":[" <>
+          Enum.map_join(values, ",", &execution_map_node/1) <> "]}"
+
+      _ ->
+        raise ArgumentError, "execution-map children must be an array"
+    end
+  end
+
+  def execution_map_node(_node), do: raise(ArgumentError, "execution-map node must be an object")
 
   @doc """
   The `toplines` verb: the roster with full telemetry, or the caller-visible
@@ -603,6 +713,935 @@ defmodule Tightbeam.ExecutionMap do
         end
     end
   end
+
+  ## REST D2 query path. Source admission happens before every derived map.
+
+  defp with_rest_world(db, call, fun) do
+    principal = Map.fetch!(call, :principal)
+
+    case DB.transaction(db, fn txn ->
+           txn = Txn.observe_queries(txn, Map.get(principal, :core_detail_trace))
+           world = rest_world(txn, call)
+           fun.(world)
+         end) do
+      {:ok, result} -> result
+      {:error, error} -> raise error
+    end
+  end
+
+  defp rest_world(txn, call) do
+    principal = call.principal
+    cutoff = CausalEvents.epoch(txn)
+
+    items =
+      StateResources.query_work_item(txn, %{}, %{rest_principal: principal})
+      |> Enum.filter(&StateVisibility.execution_map_node_visible?(txn, &1.id, principal))
+      |> Enum.map(&rest_work_item/1)
+      |> Enum.sort_by(&{&1.created_at, &1.id})
+
+    items_by_id = Map.new(items, &{&1.id, &1})
+    assignments = rest_visible_assignments(txn, principal)
+    assignments_by_id = Map.new(assignments, &{&1.id, &1})
+    resolved = resolve_all(assignments, assignments_by_id)
+    by_item = membership(resolved, items_by_id)
+
+    visible_assignment_ids =
+      by_item |> Map.values() |> List.flatten() |> Enum.uniq() |> Enum.sort()
+
+    turns =
+      rest_visible_turns(txn, principal)
+      |> Enum.filter(&turn_has_visible_link?(&1, resolved, items_by_id))
+
+    turns_by_seq = Map.new(turns, &{&1.seq, &1})
+    linked = retain_acyclic(items, candidate_edges(items, items_by_id, turns_by_seq, resolved))
+    attests = rest_allowed_attests(txn, principal, visible_assignment_ids)
+
+    {wakes, pending_wake_sessions, pending_wake_classes_by_session} =
+      rest_allowed_pending_wakes(txn, principal, assignments_by_id, by_item)
+
+    {requests, open_requests} =
+      rest_allowed_open_requests(txn, principal, visible_assignment_ids)
+
+    {markers, markers_by_assignment} =
+      rest_allowed_markers(txn, visible_assignment_ids)
+
+    {disposition_rows, dispositions} = rest_allowed_dispositions(txn, items_by_id)
+
+    visibility_rows = rest_visibility_rows(txn, principal, turns, wakes)
+
+    dependency_entries =
+      rest_dependency_entries(
+        items,
+        assignments_by_id,
+        visible_assignment_ids,
+        attests,
+        turns,
+        wakes,
+        requests,
+        markers,
+        disposition_rows,
+        visibility_rows,
+        cutoff
+      )
+
+    %{
+      txn: txn,
+      now: Map.get(call, :now) || System.system_time(:millisecond),
+      principal: principal,
+      cutoff: cutoff,
+      items: items,
+      items_by_id: items_by_id,
+      assignments_by_id: assignments_by_id,
+      resolved: resolved,
+      by_item: by_item,
+      turns_by_job_ref: index_turns(turns, & &1.job_ref),
+      turns_by_assignment: index_turns(turns, & &1.assignment_id),
+      linked: linked,
+      parents: parents(items, linked),
+      attests_by_assignment: Enum.group_by(attests, & &1.assignment_id),
+      commit_refs:
+        Map.new(attests, fn attest ->
+          {attest.id, attest.commit_refs}
+        end),
+      markers_by_assignment: markers_by_assignment,
+      open_requests: open_requests,
+      pending_wake_sessions: pending_wake_sessions,
+      pending_wake_classes_by_session: pending_wake_classes_by_session,
+      dispositions: dispositions,
+      dependency_version: dependency_version(dependency_entries)
+    }
+  end
+
+  defp rest_work_item(row) do
+    %{
+      id: row.id,
+      title: row.title,
+      owner_user_id: row.owner_user_id,
+      state: row.state,
+      fail_reason: row.fail_reason,
+      spec_ref_name: row.spec_ref_name,
+      spec_ref_sha256: row.spec_ref_sha256,
+      routing_wake_id: row.routing_wake_id,
+      created_by_user: row.created_by_user,
+      created_by_session: row.created_by_session,
+      created_in_turn_seq: row.created_in_turn_seq,
+      context_known: row.created_context_known,
+      created_at: row.created_at,
+      row_version: row.row_version
+    }
+  end
+
+  defp rest_visible_assignments(txn, principal) do
+    Txn.q(txn, "SELECT id FROM assignments ORDER BY id")
+    |> Enum.map(&hd/1)
+    |> Enum.map(&StateResources.query_assignment(txn, &1, %{rest_principal: principal}))
+    |> Enum.reject(&is_nil/1)
+    |> Enum.map(&rest_assignment/1)
+  end
+
+  defp rest_assignment(row) do
+    %{
+      id: row.id,
+      work_item_id: row.work_item_id,
+      reviews_assignment_id: row.reviews_assignment_id,
+      holder_key: row.holder_key,
+      state: row.state,
+      outcome: row.outcome,
+      opened_at: row.opened_at,
+      closing_attest_id: row.closing_attest_id,
+      current_coordination_parent_ref: Map.get(row, :current_coordination_parent_ref),
+      row_version: StateResources.assignment(row)["rowVersion"]
+    }
+  end
+
+  defp rest_visible_turns(txn, principal) do
+    Txn.q(txn, "SELECT seq FROM turns ORDER BY seq")
+    |> Enum.map(&hd/1)
+    |> Enum.map(&StateResources.query_turn_in_txn(txn, &1))
+    |> Enum.reject(&is_nil/1)
+    |> Enum.filter(&StateVisibility.core_detail_visible?(txn, "turns", &1, principal))
+    |> Enum.map(&rest_turn/1)
+  end
+
+  defp rest_turn(row) do
+    %{
+      seq: row.seq,
+      assignment_id: row.assignment_id,
+      job_ref: row.job_ref,
+      session_key: row.session_key,
+      status: row.status,
+      model: row.model,
+      context: row.model_context,
+      effort: row.thinking_level,
+      harness: row.harness,
+      ended_at: row.ended_at,
+      row_version: StateResources.turn(row)["rowVersion"]
+    }
+  end
+
+  defp turn_has_visible_link?(turn, resolved, items_by_id) do
+    (is_binary(turn.job_ref) and Map.has_key?(items_by_id, turn.job_ref)) or
+      (is_binary(turn.assignment_id) and
+         Map.has_key?(items_by_id, Map.get(resolved, turn.assignment_id)))
+  end
+
+  defp rest_allowed_attests(_txn, _principal, []), do: []
+
+  defp rest_allowed_attests(txn, principal, assignment_ids) do
+    Enum.flat_map(assignment_ids, fn assignment_id ->
+      rest_all_attests_for_assignment(txn, principal, assignment_id, :earliest, [])
+    end)
+    |> Enum.sort_by(&{&1.ts, &1.id})
+  end
+
+  defp rest_all_attests_for_assignment(txn, principal, assignment_id, boundary, acc) do
+    page =
+      Assignments.list_attests(txn, %{
+        assignment_id: assignment_id,
+        filters: %{},
+        boundary: boundary,
+        limit: 500
+      })
+
+    visible =
+      Enum.filter(page.rows, &StateVisibility.core_detail_visible?(txn, "attests", &1, principal))
+
+    acc = acc ++ Enum.map(visible, &rest_attest/1)
+
+    if page.has_more_after do
+      last = List.last(page.rows)
+
+      rest_all_attests_for_assignment(
+        txn,
+        principal,
+        assignment_id,
+        {:after, [last.ts, last.id]},
+        acc
+      )
+    else
+      acc
+    end
+  end
+
+  defp rest_attest(row) do
+    public = StateResources.attest(row)
+
+    %{
+      id: row.id,
+      assignment_id: row.assignment_id,
+      kind: row.kind,
+      verdict_kind: row.verdict_kind,
+      ts: row.ts,
+      commit_refs: row.commit_refs,
+      row_version: public["rowVersion"]
+    }
+  end
+
+  defp rest_allowed_pending_wakes(txn, principal, assignments_by_id, by_item) do
+    holders =
+      assignments_by_id
+      |> rows_for(by_item |> Map.values() |> List.flatten() |> Enum.uniq())
+      |> Enum.filter(&(&1.state == "open"))
+      |> Enum.map(& &1.holder_key)
+      |> Enum.uniq()
+
+    if holders == [] do
+      {[], MapSet.new(), %{}}
+    else
+      marks = Enum.map_join(holders, ",", fn _ -> "?" end)
+
+      Txn.q(
+        txn,
+        "SELECT wakeId FROM wakes WHERE state = 'pending' AND consumer = 'prompt' AND sessionKey IN (" <>
+          marks <> ") ORDER BY wakeId",
+        holders
+      )
+      |> Enum.map(&hd/1)
+      |> Enum.map(&Wakes.delivery_projection_in_txn(txn, &1))
+      |> Enum.reject(&is_nil/1)
+      |> Enum.filter(fn wake ->
+        wake.state == "pending" and wake.consumer == "prompt" and
+          wake.session_key in holders and
+          StateVisibility.core_detail_visible?(txn, "wakes", wake, principal)
+      end)
+      |> then(fn wakes ->
+        sessions = MapSet.new(wakes, & &1.session_key)
+
+        classes =
+          Enum.reduce(wakes, %{}, fn wake, acc ->
+            if is_binary(wake.class) and wake.class != "" do
+              update_in(
+                acc,
+                [Access.key(wake.session_key, %{}), Access.key(wake.class, 0)],
+                &(&1 + 1)
+              )
+            else
+              acc
+            end
+          end)
+
+        {wakes, sessions, classes}
+      end)
+    end
+  end
+
+  defp rest_allowed_open_requests(_txn, _principal, []), do: {[], %{}}
+
+  defp rest_allowed_open_requests(txn, principal, assignment_ids) do
+    marks = Enum.map_join(assignment_ids, ",", fn _ -> "?" end)
+
+    rows =
+      Txn.q(
+        txn,
+        "SELECT id FROM decision_requests WHERE status = 'open' AND kind IN ('statute','effort') AND assignmentId IN (" <>
+          marks <> ") ORDER BY id",
+        assignment_ids
+      )
+      |> Enum.map(&hd/1)
+      |> Enum.map(&StateResources.query_decision_request_in_txn(txn, &1))
+      |> Enum.reject(&is_nil/1)
+      |> Enum.filter(fn wrapper ->
+        row = wrapper["item"] || wrapper[:item]
+
+        Map.get(row, :status) == "open" and Map.get(row, :kind) in ["statute", "effort"] and
+          StateVisibility.core_detail_visible?(txn, "decision requests", row, principal)
+      end)
+
+    requests =
+      Enum.map(rows, fn wrapper ->
+        public = StateResources.decision_request(wrapper)
+        row = wrapper["item"] || wrapper[:item]
+
+        %{
+          id: Map.get(row, :id),
+          assignment_id: Map.get(row, :assignment_id),
+          row_version: public["rowVersion"]
+        }
+      end)
+
+    {requests, Enum.frequencies_by(requests, & &1.assignment_id)}
+  end
+
+  defp rest_allowed_markers(_txn, []), do: {[], %{}}
+
+  defp rest_allowed_markers(txn, assignment_ids) do
+    marks = Enum.map_join(assignment_ids, ",", fn _ -> "?" end)
+
+    rows =
+      Txn.q(
+        txn,
+        "SELECT id, assignmentId, subagentRef FROM subagent_markers WHERE assignmentId IN (" <>
+          marks <> ") ORDER BY id",
+        assignment_ids
+      )
+      |> Enum.map(fn [id, assignment_id, ref] ->
+        %{id: id, assignment_id: assignment_id, subagent_ref: ref}
+      end)
+
+    by_assignment =
+      rows
+      |> Enum.group_by(& &1.assignment_id, & &1.subagent_ref)
+      |> Map.new(fn {assignment_id, refs} -> {assignment_id, Enum.uniq(refs)} end)
+
+    {rows, by_assignment}
+  end
+
+  defp rest_allowed_dispositions(_txn, items_by_id) when map_size(items_by_id) == 0,
+    do: {[], %{}}
+
+  defp rest_allowed_dispositions(txn, items_by_id) do
+    ids = Map.keys(items_by_id)
+    marks = Enum.map_join(ids, ",", fn _ -> "?" end)
+
+    rows =
+      Txn.q(
+        txn,
+        "SELECT jobRef, seq, at, json_extract(detail, '$.toState') FROM causal_events " <>
+          "WHERE kind = 'disposition_transition' AND jobRef IN (" <> marks <> ") ORDER BY seq",
+        ids
+      )
+      |> Enum.map(fn [job_ref, seq, at, to_state] ->
+        %{job_ref: job_ref, seq: seq, at: at, to_state: to_state}
+      end)
+
+    {rows, Enum.group_by(rows, & &1.job_ref)}
+  end
+
+  defp rest_visibility_rows(txn, principal, turns, wakes) do
+    principal_session =
+      if principal.kind == "session", do: StateResources.query_session(txn, principal.id)
+
+    principal_user_id =
+      if principal.kind == "user",
+        do: principal.id,
+        else: principal_session && principal_session.owner_user_id
+
+    principal_user =
+      if is_binary(principal_user_id), do: StateResources.query_user(txn, principal_user_id)
+
+    if is_nil(principal_user) do
+      raise ArgumentError, "execution-map principal user projection is missing"
+    end
+
+    referenced_sessions =
+      if principal.kind == "user" and not principal.is_admin do
+        Enum.map(turns, & &1.session_key) ++
+          Enum.flat_map(wakes, &[&1.session_key, &1.creator_session_key])
+      else
+        []
+      end
+
+    sessions =
+      ([principal_session] ++ referenced_sessions)
+      |> Enum.reject(&is_nil/1)
+      |> Enum.map(fn
+        session when is_map(session) -> session
+        session_key -> StateResources.query_session(txn, session_key)
+      end)
+      |> Enum.reject(&is_nil/1)
+      |> Enum.uniq_by(& &1.session_key)
+      |> Enum.filter(fn session ->
+        principal.kind != "user" or principal.is_admin or
+          session.owner_user_id == principal.id
+      end)
+      |> Enum.uniq_by(& &1.session_key)
+
+    %{principal_user: principal_user, sessions: sessions}
+  end
+
+  defp rest_dependency_entries(
+         items,
+         assignments_by_id,
+         assignment_ids,
+         attests,
+         turns,
+         wakes,
+         requests,
+         markers,
+         dispositions,
+         visibility_rows,
+         cutoff
+       ) do
+    resources =
+      Enum.map(items, &["work items", &1.id, &1.row_version]) ++
+        Enum.map(assignment_ids, fn id ->
+          ["assignments", id, Map.fetch!(assignments_by_id, id).row_version]
+        end) ++
+        Enum.map(attests, &["attests", &1.id, &1.row_version]) ++
+        Enum.map(turns, &["turns", &1.seq, &1.row_version]) ++
+        Enum.map(wakes, &["wakes", &1.wake_id, &1.row_version]) ++
+        Enum.map(requests, &["decision requests", &1.id, &1.row_version]) ++
+        Enum.map(visibility_rows.sessions, &["sessions", &1.session_key, &1.row_version]) ++
+        [
+          [
+            "users",
+            visibility_rows.principal_user.user_id,
+            visibility_rows.principal_user.row_version
+          ]
+        ]
+
+    evidence =
+      Enum.map(markers, &["subagent markers", &1.id, &1.id]) ++
+        Enum.map(dispositions, &["causal events", &1.seq, &1.seq]) ++
+        [["causal events epoch", "causal_events_epoch", cutoff]]
+
+    entries = resources ++ evidence
+
+    Enum.each(entries, fn
+      [_resource, _key, version] when is_integer(version) and version > 0 -> :ok
+      _ -> raise ArgumentError, "execution-map dependency entry has an invalid version"
+    end)
+
+    entries
+  end
+
+  defp dependency_version(entries) do
+    entries
+    |> Enum.sort_by(fn [resource, key, _version] -> {resource, JSON.encode!(key)} end)
+    |> JSON.encode!()
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.encode16(case: :lower)
+  end
+
+  defp execution_map_appearing(world, filters) do
+    Enum.filter(world.items, fn item ->
+      execution_map_origin_match?(item, Map.get(filters, "origin")) and
+        execution_map_exact_match?(item.owner_user_id, Map.get(filters, "ownerUserId")) and
+        execution_map_exact_match?(item.state, Map.get(filters, "state")) and
+        execution_map_spec_match?(item, filters) and
+        execution_map_exact_match?(item.created_by_session, Map.get(filters, "sessionKey")) and
+        execution_map_quiet_match?(world, item, Map.get(filters, "quietOverMs"))
+    end)
+  end
+
+  defp execution_map_origin_match?(_item, nil), do: true
+  defp execution_map_origin_match?(_item, "all"), do: true
+  defp execution_map_origin_match?(item, "user"), do: principal(item) == "user"
+  defp execution_map_origin_match?(item, "session"), do: principal(item) == "session"
+
+  defp execution_map_exact_match?(_value, nil), do: true
+  defp execution_map_exact_match?(value, expected), do: value == expected
+
+  defp execution_map_spec_match?(item, filters) do
+    name = Map.get(filters, "specRefName")
+    sha = Map.get(filters, "specRefSha256")
+
+    (is_nil(name) or item.spec_ref_name == name) and
+      (is_nil(sha) or item.spec_ref_sha256 == sha)
+  end
+
+  defp execution_map_quiet_match?(_world, _item, nil), do: true
+
+  defp execution_map_quiet_match?(world, item, bound) when is_integer(bound) do
+    telemetry = rest_node(world, item)
+
+    telemetry.since_progress_ms > bound and telemetry.active.running_turn == false and
+      telemetry.active.pending_session_wake == false
+  end
+
+  defp execution_map_quiet_match?(_world, _item, _bound), do: false
+
+  defp execution_map_page(items, boundary, limit) do
+    tuples = Enum.map(items, &{&1.created_at, &1.id})
+
+    {selected, has_more_before, has_more_after} =
+      case boundary do
+        :latest ->
+          selected = Enum.take(items, -limit)
+          {selected, length(items) > limit, false}
+
+        :earliest ->
+          selected = Enum.take(items, limit)
+          {selected, false, length(items) > limit}
+
+        {:before, [created_at, id]} ->
+          cursor = {created_at, id}
+          prior = Enum.filter(items, &({&1.created_at, &1.id} < cursor))
+          selected = Enum.take(prior, -limit)
+
+          newest =
+            if selected == [],
+              do: cursor,
+              else: {List.last(selected).created_at, List.last(selected).id}
+
+          {selected, length(prior) > limit, Enum.any?(tuples, &(&1 > newest))}
+
+        {:after, [created_at, id]} ->
+          cursor = {created_at, id}
+          later = Enum.filter(items, &({&1.created_at, &1.id} > cursor))
+          selected = Enum.take(later, limit)
+          oldest = if selected == [], do: cursor, else: {hd(selected).created_at, hd(selected).id}
+          {selected, Enum.any?(tuples, &(&1 < oldest)), length(later) > limit}
+      end
+
+    %{
+      items: selected,
+      has_more_before: has_more_before,
+      has_more_after: has_more_after
+    }
+  end
+
+  defp execution_map_forest(world, appearing) do
+    appearing_ids = MapSet.new(appearing, & &1.id)
+    nodes = Map.new(appearing, &{&1.id, rest_node(world, &1)})
+
+    children =
+      appearing
+      |> Enum.filter(fn item ->
+        parent = Map.get(world.linked, item.id)
+        not is_nil(parent) and MapSet.member?(appearing_ids, parent)
+      end)
+      |> Enum.group_by(&Map.get(world.linked, &1.id))
+
+    roots =
+      Enum.reject(appearing, fn item ->
+        parent = Map.get(world.linked, item.id)
+        not is_nil(parent) and MapSet.member?(appearing_ids, parent)
+      end)
+
+    %{roots: Enum.map(roots, &execution_map_nest(&1, nodes, children))}
+  end
+
+  defp execution_map_nest(item, nodes, children) do
+    kids = children |> Map.get(item.id, []) |> Enum.map(&execution_map_nest(&1, nodes, children))
+    Map.put(Map.fetch!(nodes, item.id), :children, kids)
+  end
+
+  defp rest_node(world, item) do
+    item
+    |> then(&node(world, &1))
+    |> Map.drop([:current_coordination])
+    |> Map.update!(:active, fn active ->
+      holder_classes =
+        current_holders(world, Map.get(world.by_item, item.id, []))
+        |> Enum.reduce(%{}, fn holder, acc ->
+          Enum.reduce(Map.get(world.pending_wake_classes_by_session, holder, %{}), acc, fn {class,
+                                                                                            count},
+                                                                                           classes ->
+            Map.update(classes, class, count, &(&1 + count))
+          end)
+        end)
+
+      Map.put(active, :pending_wake_classes, holder_classes)
+    end)
+    |> Map.put(:created_at, item.created_at)
+  end
+
+  defp resolve_assignment_selectors(world, selectors, principal) do
+    ids = Enum.uniq(selectors)
+
+    Enum.reduce_while(ids, {:ok, [], []}, fn selector, {:ok, item_ids, no_item} ->
+      case resolve_typed_prefix(selector, "asg_", Map.values(world.assignments_by_id)) do
+        {:error, :not_found} ->
+          {:halt, {:error, :not_found}}
+
+        {:error, :ambiguous, candidate_ids} ->
+          {:halt, {:error, :ambiguous, candidate_ids}}
+
+        {:ok, assignment} ->
+          if StateVisibility.execution_map_assignment_visible?(
+               world.txn,
+               assignment.id,
+               principal
+             ) do
+            case Map.get(world.resolved, assignment.id) do
+              nil ->
+                {:cont, {:ok, item_ids, [assignment.id | no_item]}}
+
+              item_id ->
+                if Map.has_key?(world.items_by_id, item_id) and
+                     StateVisibility.execution_map_node_visible?(world.txn, item_id, principal) do
+                  {:cont, {:ok, [item_id | item_ids], no_item}}
+                else
+                  {:halt, {:error, :not_found}}
+                end
+            end
+          else
+            {:halt, {:error, :not_found}}
+          end
+      end
+    end)
+    |> case do
+      {:ok, item_ids, no_item} -> {:ok, Enum.uniq(item_ids), Enum.uniq(no_item)}
+      error -> error
+    end
+  end
+
+  defp resolve_typed_prefix(value, prefix, candidates)
+       when is_binary(value) and is_binary(prefix) and is_list(candidates) do
+    if String.starts_with?(value, prefix) do
+      matches =
+        candidates
+        |> Enum.filter(&String.starts_with?(&1.id, value))
+        |> Enum.sort_by(& &1.id)
+
+      case matches do
+        [] -> {:error, :not_found}
+        [match] -> {:ok, match}
+        many -> {:error, :ambiguous, Enum.map(many, & &1.id)}
+      end
+    else
+      {:error, :not_found}
+    end
+  end
+
+  defp execution_map_wire_value!(node, "id"), do: execution_map_string!(node.id, "id")
+  defp execution_map_wire_value!(node, "title"), do: execution_map_string!(node.title, "title")
+
+  defp execution_map_wire_value!(node, "specRefName"),
+    do: execution_map_nullable_string!(node.spec_ref_name, "specRefName")
+
+  defp execution_map_wire_value!(node, "specRefSha256"),
+    do: execution_map_nullable_string!(node.spec_ref_sha256, "specRefSha256")
+
+  defp execution_map_wire_value!(node, "state") do
+    value = execution_map_string!(node.state, "state")
+
+    unless value in ~w(open iceboxed closed failed),
+      do: raise(ArgumentError, "invalid execution-map state")
+
+    value
+  end
+
+  defp execution_map_wire_value!(node, "failReason"),
+    do: execution_map_nullable_string!(node.fail_reason, "failReason")
+
+  defp execution_map_wire_value!(node, "bracket1Armed"),
+    do: execution_map_boolean!(node.bracket1_armed, "bracket1Armed")
+
+  defp execution_map_wire_value!(node, "origin") do
+    execution_map_object!(
+      node.origin,
+      [principal: "principal", created_by: "createdBy"],
+      "origin"
+    )
+  end
+
+  defp execution_map_wire_value!(node, "creationContext") do
+    execution_map_object!(
+      node.creation_context,
+      [recorded: "recorded", turn_seq: "turnSeq"],
+      "creationContext"
+    )
+  end
+
+  defp execution_map_wire_value!(node, "parent") do
+    execution_map_object!(node.parent, [status: "status", item: "item"], "parent")
+  end
+
+  defp execution_map_wire_value!(node, "finishedAt"),
+    do: execution_map_nullable_integer!(node.finished_at, "finishedAt")
+
+  defp execution_map_wire_value!(node, "assignments") do
+    value = node.assignments
+    exact_execution_map_keys!(value, [:open, :closed, :by_outcome], "assignments")
+    outcomes = value.by_outcome
+
+    "{" <>
+      execution_map_pair!("open", execution_map_encoded_count!(value.open, "assignments.open")) <>
+      "," <>
+      execution_map_pair!(
+        "closed",
+        execution_map_encoded_count!(value.closed, "assignments.closed")
+      ) <>
+      "," <>
+      execution_map_pair!(
+        "byOutcome",
+        execution_map_object!(
+          outcomes,
+          [completed: "completed", surrendered: "surrendered", revoked: "revoked"],
+          "assignments.byOutcome",
+          &execution_map_encoded_count!(&1, "assignments.byOutcome")
+        )
+      ) <> "}"
+  end
+
+  defp execution_map_wire_value!(node, "jobs"), do: execution_map_count!(node.jobs, "jobs")
+
+  defp execution_map_wire_value!(node, "attests") do
+    value = node.attests
+    exact_execution_map_keys!(value, [:total, :by_kind, :by_verdict_kind], "attests")
+
+    "{" <>
+      execution_map_pair!("total", execution_map_encoded_count!(value.total, "attests.total")) <>
+      "," <>
+      execution_map_pair!("byKind", execution_map_count_map!(value.by_kind, "attests.byKind")) <>
+      "," <>
+      execution_map_pair!(
+        "byVerdictKind",
+        execution_map_count_map!(value.by_verdict_kind, "attests.byVerdictKind")
+      ) <> "}"
+  end
+
+  defp execution_map_wire_value!(node, "startedAt"),
+    do: execution_map_nullable_integer!(node.started_at, "startedAt")
+
+  defp execution_map_wire_value!(node, "closingAttests") when is_list(node.closing_attests) do
+    "[" <>
+      Enum.map_join(node.closing_attests, ",", fn attest ->
+        exact_execution_map_keys!(
+          attest,
+          [:assignmentId, :attestId, :commitRefs],
+          "closingAttests"
+        )
+
+        refs =
+          case attest.commitRefs do
+            nil ->
+              "null"
+
+            rows when is_list(rows) ->
+              "[" <>
+                Enum.map_join(rows, ",", fn row ->
+                  encode_execution_map_string_object!(
+                    row,
+                    ~w(repo commit),
+                    "closingAttests.commitRefs"
+                  )
+                end) <> "]"
+
+            _ ->
+              raise ArgumentError, "closingAttests.commitRefs must be an array or null"
+          end
+
+        "{" <>
+          execution_map_pair!(
+            "assignmentId",
+            execution_map_string!(attest.assignmentId, "closingAttests.assignmentId")
+          ) <>
+          "," <>
+          execution_map_pair!(
+            "attestId",
+            execution_map_string!(attest.attestId, "closingAttests.attestId")
+          ) <>
+          "," <>
+          execution_map_pair!("commitRefs", refs) <> "}"
+      end) <> "]"
+  end
+
+  defp execution_map_wire_value!(_node, "closingAttests"),
+    do: raise(ArgumentError, "closingAttests must be an array")
+
+  defp execution_map_wire_value!(node, "openDecisionRequests"),
+    do: execution_map_count!(node.open_decision_requests, "openDecisionRequests")
+
+  defp execution_map_wire_value!(node, "turns") do
+    execution_map_object!(node.turns, [total: "total", last_ended_at: "lastEndedAt"], "turns")
+  end
+
+  defp execution_map_wire_value!(node, "minds") when is_list(node.minds) do
+    "[" <>
+      Enum.map_join(node.minds, ",", fn mind ->
+        execution_map_object!(
+          mind,
+          [model: "model", context: "context", effort: "effort", harness: "harness"],
+          "minds"
+        )
+      end) <> "]"
+  end
+
+  defp execution_map_wire_value!(_node, "minds"),
+    do: raise(ArgumentError, "minds must be an array")
+
+  defp execution_map_wire_value!(node, "fanOut"),
+    do: execution_map_nullable_integer!(node.fan_out, "fanOut")
+
+  defp execution_map_wire_value!(node, "active") do
+    value = node.active
+
+    exact_execution_map_keys!(
+      value,
+      [:running_turn, :pending_session_wake, :pending_wake_classes],
+      "active"
+    )
+
+    "{" <>
+      execution_map_pair!(
+        "runningTurn",
+        JSON.encode!(execution_map_boolean!(value.running_turn, "active.runningTurn"))
+      ) <>
+      "," <>
+      execution_map_pair!(
+        "pendingSessionWake",
+        JSON.encode!(
+          execution_map_boolean!(value.pending_session_wake, "active.pendingSessionWake")
+        )
+      ) <>
+      "," <>
+      execution_map_pair!(
+        "pendingWakeClasses",
+        execution_map_count_map!(value.pending_wake_classes, "active.pendingWakeClasses")
+      ) <> "}"
+  end
+
+  defp execution_map_wire_value!(node, "sinceProgressMs"),
+    do: execution_map_integer!(node.since_progress_ms, "sinceProgressMs")
+
+  defp execution_map_wire_value!(_node, field),
+    do: raise(ArgumentError, "unknown execution-map node field #{field}")
+
+  defp encode_execution_map_field!("id", value), do: JSON.encode!(value)
+  defp encode_execution_map_field!("title", value), do: JSON.encode!(value)
+  defp encode_execution_map_field!("specRefName", value), do: JSON.encode!(value)
+  defp encode_execution_map_field!("specRefSha256", value), do: JSON.encode!(value)
+  defp encode_execution_map_field!("state", value), do: JSON.encode!(value)
+  defp encode_execution_map_field!("failReason", value), do: JSON.encode!(value)
+  defp encode_execution_map_field!("bracket1Armed", value), do: JSON.encode!(value)
+  defp encode_execution_map_field!("origin", value), do: value
+  defp encode_execution_map_field!("creationContext", value), do: value
+  defp encode_execution_map_field!("parent", value), do: value
+  defp encode_execution_map_field!("finishedAt", value), do: JSON.encode!(value)
+  defp encode_execution_map_field!("assignments", value), do: value
+  defp encode_execution_map_field!("jobs", value), do: JSON.encode!(value)
+  defp encode_execution_map_field!("attests", value), do: value
+  defp encode_execution_map_field!("startedAt", value), do: JSON.encode!(value)
+  defp encode_execution_map_field!("closingAttests", value), do: value
+  defp encode_execution_map_field!("openDecisionRequests", value), do: JSON.encode!(value)
+  defp encode_execution_map_field!("turns", value), do: value
+  defp encode_execution_map_field!("minds", value), do: value
+  defp encode_execution_map_field!("fanOut", value), do: JSON.encode!(value)
+  defp encode_execution_map_field!("active", value), do: value
+  defp encode_execution_map_field!("sinceProgressMs", value), do: JSON.encode!(value)
+
+  defp execution_map_object!(value, fields, label, encode_value \\ &JSON.encode!/1) do
+    exact_execution_map_keys!(value, Keyword.keys(fields), label)
+
+    "{" <>
+      Enum.map_join(fields, ",", fn {key, wire} ->
+        execution_map_pair!(wire, encode_value.(Map.fetch!(value, key)))
+      end) <> "}"
+  end
+
+  defp encode_execution_map_string_object!(value, fields, label) when is_map(value) do
+    unless Enum.sort(Map.keys(value)) == Enum.sort(fields) do
+      raise ArgumentError, "#{label} has an extra or missing field"
+    end
+
+    "{" <>
+      Enum.map_join(fields, ",", fn field ->
+        execution_map_pair!(field, JSON.encode!(Map.fetch!(value, field)))
+      end) <> "}"
+  end
+
+  defp encode_execution_map_string_object!(_value, _fields, label),
+    do: raise(ArgumentError, "#{label} must be an object")
+
+  defp exact_execution_map_keys!(value, expected, label) when is_map(value) do
+    unless Enum.sort(Map.keys(value)) == Enum.sort(expected) do
+      raise ArgumentError, "#{label} has an extra or missing field"
+    end
+  end
+
+  defp exact_execution_map_keys!(_value, _expected, label),
+    do: raise(ArgumentError, "#{label} must be an object")
+
+  defp execution_map_count_map!(value, label) when is_map(value) do
+    unless Enum.all?(Map.keys(value), &(is_binary(&1) and &1 != "")) do
+      raise ArgumentError, "#{label} contains an invalid key"
+    end
+
+    "{" <>
+      (value
+       |> Enum.sort_by(&elem(&1, 0))
+       |> Enum.map_join(",", fn {key, count} ->
+         execution_map_pair!(key, execution_map_encoded_count!(count, label))
+       end)) <> "}"
+  end
+
+  defp execution_map_count_map!(_value, label),
+    do: raise(ArgumentError, "#{label} must be an object")
+
+  defp execution_map_pair!(key, encoded_value),
+    do: JSON.encode!(key) <> ":" <> encoded_value
+
+  defp execution_map_string!(value, _field) when is_binary(value) and value != "", do: value
+
+  defp execution_map_string!(_value, field),
+    do: raise(ArgumentError, "#{field} must be a nonempty string")
+
+  defp execution_map_nullable_string!(nil, _field), do: nil
+  defp execution_map_nullable_string!(value, field), do: execution_map_string!(value, field)
+
+  defp execution_map_boolean!(value, _field) when is_boolean(value), do: value
+
+  defp execution_map_boolean!(_value, field),
+    do: raise(ArgumentError, "#{field} must be a boolean")
+
+  defp execution_map_integer!(value, _field) when is_integer(value), do: value
+
+  defp execution_map_integer!(_value, field),
+    do: raise(ArgumentError, "#{field} must be an integer")
+
+  defp execution_map_nullable_integer!(nil, _field), do: nil
+  defp execution_map_nullable_integer!(value, field), do: execution_map_integer!(value, field)
+
+  defp execution_map_count!(value, _field) when is_integer(value) and value >= 0, do: value
+
+  defp execution_map_count!(_value, field),
+    do: raise(ArgumentError, "#{field} must be a nonnegative integer")
+
+  defp execution_map_encoded_count!(value, field),
+    do: JSON.encode!(execution_map_count!(value, field))
 
   ## The world — every row this read needs, loaded once
 
