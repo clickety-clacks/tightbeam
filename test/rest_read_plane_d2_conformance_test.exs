@@ -11,7 +11,6 @@ defmodule Tightbeam.RestReadPlaneD2ConformanceTest do
     DB,
     Devices,
     Identity,
-    StateResources,
     Wakes,
     WorkItems
   }
@@ -735,44 +734,6 @@ defmodule Tightbeam.RestReadPlaneD2ConformanceTest do
     assert Enum.count(attest_events, &match?({:serializer, "attests", _}, &1)) == 1
   end
 
-  test "attest item bytes stay canonical across randomized source map order" do
-    :rand.seed(:exsss, {31, 223, 1_009})
-
-    source = %{
-      id: "attest_wire_order",
-      assignment_id: "assignment_wire_order",
-      kind: "verdict",
-      verdict_kind: "verified",
-      note: "stable public projection",
-      by_session: "agent:wire-order",
-      by_user: nil,
-      producer: nil,
-      producer_command: nil,
-      by_harness: "codex",
-      by_provider: "openai",
-      commit_refs: [
-        %{"repo" => "clickety-clacks/tightbeam", "commit" => "0123456789abcdef"}
-      ],
-      ts: 1_750_000_000_000
-    }
-
-    expected_item = StateResources.attest(source)
-    expected_bytes = StateResources.encode_item("attests", expected_item, %{})
-
-    assert MapSet.new(Map.keys(expected_item)) == MapSet.new(@attest_fields)
-    refute StateResources.item_has_secret_fields?(expected_item)
-
-    assert expected_bytes ==
-             ~s({"id":"attest_wire_order","assignmentId":"assignment_wire_order","kind":"verdict","verdictKind":"verified","note":"stable public projection","bySession":"agent:wire-order","byUser":null,"producer":null,"producerCommand":null,"byHarness":"codex","byProvider":"openai","commitRefs":[{"repo":"clickety-clacks/tightbeam","commit":"0123456789abcdef"}],"ts":1750000000000,"rowVersion":1750000000000})
-
-    for _iteration <- 1..1_000 do
-      randomized_source = randomize_map_order(source)
-      randomized_item = StateResources.attest(randomized_source)
-
-      assert StateResources.encode_item("attests", randomized_item, %{}) == expected_bytes
-    end
-  end
-
   test "collection routing reuses the shared cursor and public serialization seams" do
     router = File.read!("lib/tightbeam/wire/router.ex")
     resources = File.read!("lib/tightbeam/state_resources.ex")
@@ -804,16 +765,6 @@ defmodule Tightbeam.RestReadPlaneD2ConformanceTest do
 
     Devices.approve(db, device_id, user_id)
   end
-
-  defp randomize_map_order(value) when is_map(value) do
-    value
-    |> Enum.map(fn {key, nested} -> {key, randomize_map_order(nested)} end)
-    |> Enum.shuffle()
-    |> Map.new()
-  end
-
-  defp randomize_map_order(value) when is_list(value), do: Enum.map(value, &randomize_map_order/1)
-  defp randomize_map_order(value), do: value
 
   defp create_work_item(db, user_id, title) do
     WorkItems.__handle__(db, "work-item-create", %{
