@@ -4199,14 +4199,51 @@ defmodule Tightbeam.Assignments do
       :ok
     else
       _ ->
-        error(
-          "inapplicable_code_evidence",
-          "code completion requires the latest independent clean review and holder verification to match its immutable commitRefs"
-        )
+        code_completion_evidence_error(refs, review, assignment)
     end
   end
 
   defp applicable_code_completion_in_txn(_txn, _assignment, _call), do: :ok
+
+  defp code_completion_evidence_error(
+         [_ | _] = candidate_refs,
+         %{kind: "reviewed-clean", holder: review_holder, refs: review_refs},
+         %{holderKey: assignment_holder}
+       )
+       when review_holder != assignment_holder do
+    cond do
+      review_refs in [nil, []] ->
+        error(
+          "inapplicable_code_evidence",
+          "the linked independent reviewed-clean verdict is missing commitRefs for completion candidate #{format_commit_refs(candidate_refs)}; file a new independent reviewed-clean verdict for the candidate commits, then retry completion"
+        )
+
+      not same_commit_ref_identity?(candidate_refs, review_refs) ->
+        error(
+          "inapplicable_code_evidence",
+          "the linked independent reviewed-clean verdict commitRefs #{format_commit_refs(review_refs)} do not match completion candidate #{format_commit_refs(candidate_refs)}; file a new independent reviewed-clean verdict for the candidate commits, then retry completion"
+        )
+
+      true ->
+        inapplicable_code_evidence_error()
+    end
+  end
+
+  defp code_completion_evidence_error(_refs, _review, _assignment),
+    do: inapplicable_code_evidence_error()
+
+  defp inapplicable_code_evidence_error do
+    error(
+      "inapplicable_code_evidence",
+      "code completion requires the latest independent clean review and holder verification to match its immutable commitRefs"
+    )
+  end
+
+  defp format_commit_refs(refs) do
+    Enum.map_join(refs, ", ", fn %{"repo" => repo, "commit" => commit} ->
+      "#{repo}@#{commit}"
+    end)
+  end
 
   defp latest_review_conclusion_in_txn(txn, assignment_id) do
     case Txn.q(

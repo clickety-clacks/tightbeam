@@ -159,7 +159,8 @@ defmodule Tightbeam.RailRemedyTest do
 
   test "an open review episode sleeps until readiness or a verdict", ctx do
     assignment = notice_assignment(ctx, "event reassessment")
-    %{producer_id: root} = fire_review_notice(ctx, assignment)
+    refs = [%{"repo" => "testhost:/tmp/reviewer-checkout", "commit" => String.duplicate("a", 40)}]
+    %{producer_id: root} = fire_review_notice(ctx, assignment, refs)
     mark_notice_turn(ctx.db, assignment.id, root, "delivered")
     parent = self()
 
@@ -197,6 +198,18 @@ defmodule Tightbeam.RailRemedyTest do
 
     refute_receive {:reassessed, _}, 0
     assert :sys.get_state(pid).timer == timer
+
+    for _ <- 1..3 do
+      assert %{outcome: "recurrence-suppressed"} = fire_review_notice(ctx, assignment, refs)
+    end
+
+    :sys.get_state(pid)
+    :sys.get_state(pid)
+    refute_receive {:reassessed, _}, 100
+
+    episode = RailRemedy.episode(ctx.db, "completion-requires-review", assignment.id)
+    assert episode.notice_state["reassessment"]["wakeId"] == parked
+    assert Wakes.get(ctx.db, parked).due_at == 253_402_300_799_000
 
     Wakes.recipient_ready(pid, ctx.holder.session_key)
     assert_receive {:reassessed, ^parked}, 1_000

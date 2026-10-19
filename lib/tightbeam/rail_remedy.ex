@@ -107,8 +107,6 @@ defmodule Tightbeam.RailRemedy do
 
     result =
       case DB.transaction(db, fn txn ->
-             Wakes.schedule_changed_in_txn(txn, :review_remedy_changed)
-
              row =
                Txn.q(
                  txn,
@@ -118,6 +116,8 @@ defmodule Tightbeam.RailRemedy do
 
              case row do
                [["live", _occurrence, nil]] ->
+                 Wakes.schedule_changed_in_txn(txn, :review_remedy_changed)
+
                  %{
                    outcome: "blocked-legacy-producer",
                    producer_id: nil
@@ -127,11 +127,17 @@ defmodule Tightbeam.RailRemedy do
                  state = decode_notice_state(encoded)
 
                  if state["need"]["state"] in ["withdrawn", "terminal"] do
+                   Wakes.schedule_changed_in_txn(txn, :review_remedy_changed)
+
                    %{
                      outcome: "notification-stopped",
                      producer_id: get_in(state, ["root", "wakeId"])
                    }
                  else
+                   unless same_result_commit_identity?(state["need"]["resultRefs"], refs) do
+                     Wakes.schedule_changed_in_txn(txn, {:review_remedy_changed, subject})
+                   end
+
                    state = put_in(state, ["need", "resultRefs"], refs)
                    state = put_in(state, ["need", "state"], "requested")
                    state = put_in(state, ["need", "changedAt"], now)
@@ -186,6 +192,8 @@ defmodule Tightbeam.RailRemedy do
   end
 
   defp open_review_notice(txn, statute, subject, occurrence, refs, now, interval) do
+    Wakes.schedule_changed_in_txn(txn, :review_remedy_changed)
+
     case Tightbeam.Gateway.review_notice_recipient_in_txn(txn, subject) do
       {:ok, recipient} ->
         root_id = notice_wake_id(statute, subject, occurrence, 0)
@@ -2024,6 +2032,17 @@ defmodule Tightbeam.RailRemedy do
 
   defp format_refs(refs) when refs in [nil, []], do: "the current result"
   defp format_refs(refs), do: Enum.map_join(refs, ", ", &"#{&1["repo"]}@#{&1["commit"]}")
+
+  defp same_result_commit_identity?(left, right)
+       when left in [nil, []] and right in [nil, []],
+       do: true
+
+  defp same_result_commit_identity?(left, right) when is_list(left) and is_list(right) do
+    commits = fn refs -> refs |> Enum.map(& &1["commit"]) |> Enum.uniq() |> Enum.sort() end
+    commits.(left) == commits.(right)
+  end
+
+  defp same_result_commit_identity?(_left, _right), do: false
 
   defp cas(db, sql, params) do
     case DB.transaction(db, fn txn ->
