@@ -45,6 +45,7 @@ defmodule Tightbeam.RestReadPlaneD2ConformanceTest do
     Devices.add_user(db, "flynn", false)
     Devices.add_user(db, "other", false)
     Devices.add_user(db, "outsider", false)
+    Devices.add_user(db, "docs", false)
 
     flynn_device = approved_device(db, "d2-flynn-device", "Flynn", "flynn")
     outsider_device = approved_device(db, "d2-outsider-device", "Outsider", "outsider")
@@ -53,12 +54,22 @@ defmodule Tightbeam.RestReadPlaneD2ConformanceTest do
     flynn_session = ensure_main_session(db, "flynn")
     other_session = ensure_main_session(db, "other")
     admin_session = ensure_main_session(db, "admin")
+    docs_session = ensure_main_session(db, "docs")
 
     work_item = create_work_item(db, "flynn", "D2 artifact and attest reads")
     assignment = create_assignment(db, "flynn", flynn_session, work_item, "visible assignment")
 
     artifact = record_artifact(db, flynn_session, work_item, "report", "Visible report")
-    artifact_doc = record_artifact(db, flynn_session, work_item, "doc", "Visible document")
+
+    artifact_doc =
+      record_artifact(
+        db,
+        docs_session,
+        work_item,
+        "doc",
+        "Visible document",
+        "remote.example:/reports/Visible-document.md"
+      )
 
     other_work_item = create_work_item(db, "other", "Other owner's item")
 
@@ -107,6 +118,7 @@ defmodule Tightbeam.RestReadPlaneD2ConformanceTest do
       flynn_session: flynn_session,
       other_session: other_session,
       admin_session: admin_session,
+      docs_session: docs_session,
       work_item: work_item,
       assignment: assignment,
       second_assignment: second_assignment,
@@ -122,7 +134,10 @@ defmodule Tightbeam.RestReadPlaneD2ConformanceTest do
 
   test "artifacts use canonical filters, visibility, keyset pages, and the closed public shape",
        ctx do
-    assert %{state: "released"} = Artifacts.release(ctx.db, ctx.artifact_doc.artifact_id)
+    assert :ok =
+             Artifacts.archive_session(ctx.db, ctx.docs_session.session_key, nil, "/unused")
+
+    assert %{state: "released"} = Artifacts.get(ctx.db, ctx.artifact_doc.artifact_id)
 
     assert {:ok, _rows} =
              DB.query(
@@ -134,7 +149,7 @@ defmodule Tightbeam.RestReadPlaneD2ConformanceTest do
     filtered =
       get(
         ctx,
-        "/api/artifacts?workItemId=#{ctx.work_item.id}&createdBySession=#{ctx.flynn_session.session_key}&kind=report&kind=doc&state=in-workspace&state=released"
+        "/api/artifacts?workItemId=#{ctx.work_item.id}&createdBySession=#{ctx.flynn_session.session_key}&createdBySession=#{ctx.docs_session.session_key}&kind=report&kind=doc&state=in-workspace&state=released"
       )
 
     assert filtered.status == 200, filtered.resp_body
@@ -405,14 +420,14 @@ defmodule Tightbeam.RestReadPlaneD2ConformanceTest do
     })
   end
 
-  defp record_artifact(db, session, work_item, kind, title) do
+  defp record_artifact(db, session, work_item, kind, title, origin_path \\ nil) do
     Artifacts.record(db, %{
       principal: {:session, session.session_key},
       session_key: session.session_key,
       params: %{
         kind: kind,
         title: title,
-        origin_path: "reports/#{String.replace(title, " ", "-")}.md",
+        origin_path: origin_path || "reports/#{String.replace(title, " ", "-")}.md",
         work_item_id: work_item.id
       }
     })
