@@ -1101,9 +1101,9 @@ defmodule Tightbeam.RestExecutionMapTest do
                """
                INSERT INTO wakes
                  (wakeId, sessionKey, origin, prompt, consumer, dueAt, state, createdAt,
-                  creatorSessionKey, assignmentId, class)
+                  creatorSessionKey, assignmentId, class, classElection)
                VALUES (?1, ?2, ?3, 'pending execution map fixture', 'prompt', ?4,
-                       'pending', ?5, ?2, ?6, 'fyi')
+                       'pending', ?5, ?2, ?6, 'fyi', 'sender')
                """,
                [
                  id,
