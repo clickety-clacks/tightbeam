@@ -3807,11 +3807,27 @@ defmodule Tightbeam.Schema do
     case DB.transaction(db, fn txn ->
            case Txn.q(txn, "SELECT shape FROM schema_stamp") do
              [[@decision_request_row_schema_shape]] ->
-               :ok =
-                 Txn.exec(
-                   txn,
-                   "ALTER TABLE harness_processes ADD COLUMN preparationBootIdentity TEXT"
-                 )
+               case Txn.q(
+                      txn,
+                      "SELECT type, \"notnull\", dflt_value, pk FROM pragma_table_info('harness_processes') WHERE name='preparationBootIdentity'"
+                    ) do
+                 [] ->
+                   :ok =
+                     Txn.exec(
+                       txn,
+                       "ALTER TABLE harness_processes ADD COLUMN preparationBootIdentity TEXT"
+                     )
+
+                 [["TEXT", 0, nil, 0]] ->
+                   # A rewound stamp re-runs this migration on a database that
+                   # already carries the column. The exact column this ALTER
+                   # would add is not corruption; any other shape is.
+                   :ok
+
+                 column ->
+                   raise ShapeError,
+                     message: "incompatible launch preparation column: #{inspect(column)}"
+               end
 
                Txn.q(txn, "UPDATE schema_stamp SET shape=?1,stampedAt=?2 WHERE shape=?3", [
                  @launch_preparation_boot_shape,
