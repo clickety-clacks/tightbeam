@@ -1,5 +1,4 @@
 name = "pdo"
-owner_open_child_prod = true
 idle_cleanup = false
 skills = ["repository-retirement", "human-communication", "landing", "delivery-bootstrap"]
 
