@@ -736,6 +736,54 @@ defmodule Tightbeam.RulesTest do
     assert [%{kind: "denied", verb: "attest"}] = EventLog.events_after(ctx.db, 0, 10)
   end
 
+  test "code completion refusal identifies expected and latest clean review refs", ctx do
+    :ok =
+      DB.execute(ctx.db, "INSERT INTO users (userId,createdAt) VALUES ('flynn',1),('reviewer',1)")
+
+    holder = session(ctx.db, "null-ref-review-author", "flynn", archetype: "coder")
+    reviewer = session(ctx.db, "null-ref-review-judge", "reviewer", archetype: "reviewer-code")
+    producer = assignment(ctx, holder.session_key, {:user, "flynn"})
+
+    review =
+      assignment(ctx, reviewer.session_key, {:user, "reviewer"}, reviews: producer.id)
+
+    assert %{attest: %{verdictKind: "reviewed-clean", commitRefs: nil}} =
+             verdict(ctx, reviewer.session_key, review.id, "reviewed-clean")
+
+    assert %{assignment: %{state: "closed"}} =
+             Assignments.__handle__(
+               ctx.db,
+               "attest",
+               p3_call("attest", {:session, reviewer.session_key}, %{
+                 assignment_id: review.id,
+                 kind: "completion"
+               })
+             )
+
+    stub_commit_ref_validation()
+    refs = gooarchy_commit_refs()
+
+    assert %{attest: %{verdictKind: "verified", commitRefs: ^refs}} =
+             commit_ref_verdict(ctx, holder.session_key, producer.id, "verified", refs)
+
+    Rules.load!(ctx.base_dir, [])
+
+    assert {:error, %{code: "inapplicable_code_evidence", message: message}} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               p3_call("attest", {:session, holder.session_key}, %{
+                 assignment_id: producer.id,
+                 kind: "completion",
+                 commit_refs: refs
+               })
+             )
+
+    assert message =~ "expected commitRefs=#{JSON.encode!(refs)}"
+    assert message =~ "6e3fc667ccf47013b3c5fb2d434ab5bd28559e0b"
+    assert message =~ "latest linked review conclusion=reviewed-clean commitRefs=null"
+  end
+
   test "matching a constitutional denial is monotonic and leaves domain state unchanged", ctx do
     config = %{
       db: ctx.db,

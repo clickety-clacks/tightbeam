@@ -4370,9 +4370,18 @@ defmodule Tightbeam.Assignments do
          (Map.get(call, :review_pending, false) or review_matches?) do
       :ok
     else
+      latest_review =
+        case review do
+          %{kind: kind, refs: review_refs} ->
+            "#{kind} commitRefs=#{JSON.encode!(review_refs)}"
+
+          nil ->
+            "none commitRefs=null"
+        end
+
       error(
         "inapplicable_code_evidence",
-        "code completion requires holder verification and, unless review is pending, the latest independent clean review to match its immutable commitRefs"
+        "code completion requires holder verification and, unless review is pending, the latest independent clean review to match its immutable commitRefs; expected commitRefs=#{JSON.encode!(refs)}; latest linked review conclusion=#{latest_review}"
       )
     end
   end
